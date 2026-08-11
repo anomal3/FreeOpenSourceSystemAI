@@ -74,6 +74,28 @@ pub fn firmware_dir(arch: Arch) -> PathBuf {
     build_dir().join("firmware").join(arch.name())
 }
 
+/// Каталог с исходным содержимым RAM-диска.
+///
+/// Всё, что здесь лежит, попадает в `initrd.img` рекурсивно и как есть: чтобы
+/// добавить файл в демонстрацию, достаточно положить его сюда, править xtask
+/// не требуется.
+pub fn initrd_source_dir() -> PathBuf {
+    workspace_root().join("initrd")
+}
+
+/// Готовый образ RAM-диска.
+///
+/// Лежит в корне `build/`, а не в `build/esp/<arch>/`: содержимое образа от
+/// архитектуры не зависит, и собирать его дважды смысла нет.
+pub fn initrd_image() -> PathBuf {
+    build_dir().join("initrd.img")
+}
+
+/// Слепок содержимого `initrd/`, по которому решается, нужна ли пересборка.
+pub fn initrd_stamp() -> PathBuf {
+    build_dir().join("initrd.stamp")
+}
+
 pub fn profile_dir_name(release: bool) -> &'static str {
     if release { "release" } else { "debug" }
 }

@@ -1,0 +1,50 @@
+FreeOS initrd manifest
+======================
+
+The name of this file is 28 characters long, so it cannot be stored in a
+classic 8.3 directory entry: reading it back correctly proves that the driver
+assembles VFAT long file name (LFN) entry chains and does not simply report
+the generated short name (something like INITRD~1.TXT).
+
+Layout of the image
+-------------------
+
+  /README.TXT                              short 8.3 name, control case
+  /initrd-manifest-long-name.txt           this file, LFN
+  /boot/                                   first directory level
+  /boot/boot-banner-with-a-long-name.txt   LFN inside a subdirectory
+  /boot/stage2/                            second directory level
+  /boot/stage2/deeply-nested-second-level.txt
+  /boot/stage2/zero-length-file.bin        exactly 0 bytes, no cluster at all
+  /data/                                   first directory level
+  /data/exactly-one-cluster-512-bytes.txt  exactly 512 bytes = one cluster
+  /data/large-cluster-chain-test.txt       exactly 65536 bytes = 128 clusters
+  /data/mixed Case Name With Spaces.txt    LFN with spaces and preserved case
+
+What each case is for
+---------------------
+
+zero-length-file.bin
+    A file whose directory entry carries size 0 and first cluster 0. A reader
+    that trusts the first cluster number without checking the size follows a
+    chain that starts at cluster 0 -- which is the media descriptor entry of
+    the FAT, not data. Correct behaviour: read() returns 0 bytes immediately.
+
+exactly-one-cluster-512-bytes.txt
+    The cluster size of this volume is 512 bytes, so this file occupies one
+    cluster with no slack. Off-by-one errors in "is there a next cluster"
+    logic surface here: the chain must terminate after the first link, and
+    exactly 512 bytes must come out -- not 511, not 1024.
+
+large-cluster-chain-test.txt
+    65536 bytes across 128 clusters. Every line is exactly 64 bytes including
+    the newline, so a cluster holds exactly 8 lines, and each line carries its
+    own line number and the number of the cluster it belongs to. A driver that
+    misreads the chain does not produce garbage -- it produces line numbers
+    that jump, which is immediately visible.
+
+mixed Case Name With Spaces.txt
+    Spaces and lower case letters are legal in a long file name and impossible
+    in a short one. The name must come back byte for byte.
+
+END-OF-FILE initrd-manifest-long-name.txt OK

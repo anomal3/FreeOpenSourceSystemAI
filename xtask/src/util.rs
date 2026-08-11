@@ -134,6 +134,33 @@ pub fn copy_file(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Копирует файл, только если получатель отличается от источника, и сообщает,
+/// понадобилось ли копирование.
+///
+/// Заведено ради `initrd.img`: он в десятки мегабайт, и переливать его в ESP на
+/// каждый запуск эмулятора — заметная пауза на ровном месте. Сравниваются
+/// размер и время правки: побайтовое сравнение стоило бы примерно столько же,
+/// сколько само копирование.
+pub fn copy_file_if_stale(src: &Path, dst: &Path) -> Result<bool> {
+    let up_to_date = match (fs::metadata(src), fs::metadata(dst)) {
+        (Ok(src_meta), Ok(dst_meta)) => {
+            src_meta.len() == dst_meta.len()
+                && matches!(
+                    (src_meta.modified(), dst_meta.modified()),
+                    (Ok(src_time), Ok(dst_time)) if dst_time >= src_time
+                )
+        }
+        _ => false,
+    };
+
+    if up_to_date {
+        return Ok(false);
+    }
+
+    copy_file(src, dst)?;
+    Ok(true)
+}
+
 pub fn file_len(path: &Path) -> Option<u64> {
     fs::metadata(path).ok().map(|meta| meta.len())
 }

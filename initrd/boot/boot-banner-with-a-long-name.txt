@@ -1,0 +1,12 @@
+   ___             ___  ___
+  | __| _ _  ___  / _ \/ __|
+  | _| | '_|/ -_)| (_) \__ \
+  |_|  |_|  \___| \___/|___/
+
+  free and open source system
+
+This banner lives one directory level down (/boot/) and has a 33 character
+name, so reaching it requires both directory traversal and long file name
+support at the same time.
+
+END-OF-FILE /boot/boot-banner-with-a-long-name.txt OK

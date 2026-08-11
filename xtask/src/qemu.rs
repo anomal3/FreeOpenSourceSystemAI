@@ -5,7 +5,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::arch::{Arch, Component};
+use crate::arch::{self, Arch, Component};
 use crate::build::Built;
 use crate::firmware;
 use crate::paths;
@@ -27,7 +27,8 @@ pub struct RunOptions {
 /// после каждой правки — и заметно ускоряет цикл «поправил → запустил».
 ///
 /// Раскладка: загрузчик уходит в `\EFI\BOOT\BOOT<MACHINE>.EFI` (путь диктует
-/// прошивка), ядро — в корень под именем `kernel.elf` (имя диктует загрузчик).
+/// прошивка), ядро — в корень под именем `kernel.elf`, образ RAM-диска — туда
+/// же под именем `initrd.img` (оба имени диктует загрузчик).
 pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
     let arch = built.arch;
     let esp = paths::esp_dir(arch);
@@ -51,6 +52,26 @@ pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
                         .with_context(|| format!("не удалось удалить {}", dst.display()))?;
                     println!("ESP: удалён устаревший {}", dst.display());
                 }
+            }
+        }
+    }
+
+    let initrd_dst = esp.join(arch::INITRD_ESP_FILE);
+    match built.initrd() {
+        Some(src) => {
+            if util::copy_file_if_stale(src, &initrd_dst)? {
+                println!("ESP: {} -> {}", src.display(), initrd_dst.display());
+            } else {
+                println!("ESP: {} уже актуален", initrd_dst.display());
+            }
+        }
+        // Ровно та же логика, что и с ядром: `--no-initrd` бессмыслен, если
+        // образ от прошлого запуска остаётся лежать на разделе.
+        None => {
+            if initrd_dst.is_file() {
+                std::fs::remove_file(&initrd_dst)
+                    .with_context(|| format!("не удалось удалить {}", initrd_dst.display()))?;
+                println!("ESP: удалён устаревший {}", initrd_dst.display());
             }
         }
     }

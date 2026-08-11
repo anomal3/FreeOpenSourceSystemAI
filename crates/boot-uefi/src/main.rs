@@ -4,13 +4,14 @@
 //!
 //!   1. Диагностика прошивки, GOP-фреймбуфер и тестовая картинка ([`graphics`]).
 //!   2. Чтение `\kernel.elf` с того же тома, с которого стартовал сам загрузчик
-//!      ([`kernel_image`]).
+//!      ([`volume`], [`kernel_image`]).
 //!   3. Разбор ELF64, размещение PIE-образа в физической памяти и применение
 //!      релокаций ([`elf`]).
-//!   4. Снятие карты памяти, `ExitBootServices` и прыжок в ядро ([`handoff`]).
+//!   4. Загрузка необязательного образа ФС `\initrd.img` ([`initrd`]).
+//!   5. Снятие карты памяти, `ExitBootServices` и прыжок в ядро ([`handoff`]).
 //!
-//! Шаги 1–3 полностью обратимы: при любой ошибке загрузчик печатает, что именно
-//! не сошлось, и возвращает управление прошивке. Шаг 4 — точка невозврата, и
+//! Шаги 1–4 полностью обратимы: при любой ошибке загрузчик печатает, что именно
+//! не сошлось, и возвращает управление прошивке. Шаг 5 — точка невозврата, и
 //! всё, что нужно сказать пользователю, сказано до неё.
 //!
 //! Весь текст, который уходит в консоль, намеренно ASCII: прошивка выводит
@@ -25,12 +26,14 @@ extern crate alloc;
 mod elf;
 mod graphics;
 mod handoff;
+mod initrd;
 mod kernel_image;
+mod volume;
 
 use core::convert::Infallible;
 use core::time::Duration;
 
-use boot_info::{Arch, BootInfo, KernelImage, KernelSegment, MemoryKind};
+use boot_info::{Arch, BootInfo, Initrd, KernelImage, KernelSegment, MemoryKind};
 use uefi::table::cfg::ConfigTableEntry;
 use uefi::{Status, boot, entry, println, system};
 
@@ -101,11 +104,21 @@ fn boot_kernel(mut info: BootInfo) -> Result<Infallible, Aborted> {
     println!("");
     println!("---- kernel load ------------------------------------------------");
 
+    // Том открывается один раз на оба файла и закрывается сразу, как только
+    // всё прочитано: держать хендлы до ExitBootServices незачем.
+    let mut volume = volume::BootVolume::open()?;
+
     // Образ читается в пул прошивки и живёт ровно до конца размещения: держать
     // его дольше — значит занимать место в карте памяти, которую увидит ядро.
-    let image = kernel_image::read()?;
+    let image = kernel_image::read(&mut volume)?;
     let kernel = elf::load(&image)?;
     drop(image);
+
+    // Образ ФС грузится после того, как пул из-под ELF освобождён: он на два
+    // порядка крупнее, и лишние мегабайты занятого пула тут заметны. Его
+    // отсутствие — не отказ, см. модуль `initrd`.
+    info.initrd = initrd::load(&mut volume)?;
+    drop(volume);
 
     // Куда лёг образ, ядро само выяснить не может: адрес выбрала прошивка, а
     // права сегментов остались в program headers, которых в памяти уже нет.
@@ -127,6 +140,10 @@ fn boot_kernel(mut info: BootInfo) -> Result<Infallible, Aborted> {
     // и без подмены выглядел бы для ядра как reclaimable-память, которую можно
     // затереть под собой. Пустые override'ы (например, при headless-загрузке)
     // на разбиение диапазонов не влияют.
+    //
+    // Образ ФС помечается Reserved, а не Kernel и не BootloaderReclaimable:
+    // ядро читает из него всё время работы, но памятью этой не владеет — ни
+    // выделять из неё кадры, ни возвращать её после разбора хэндоффа нельзя.
     let overrides = [
         Override::new(kernel.base, kernel.size, MemoryKind::Kernel),
         Override::new(
@@ -134,6 +151,7 @@ fn boot_kernel(mut info: BootInfo) -> Result<Infallible, Aborted> {
             info.framebuffer.size,
             MemoryKind::Framebuffer,
         ),
+        Override::new(info.initrd.base, info.initrd.size, MemoryKind::Reserved),
     ];
 
     println!("");
@@ -145,6 +163,7 @@ fn boot_kernel(mut info: BootInfo) -> Result<Infallible, Aborted> {
         kernel.end()
     );
     println!("  entry point     : {:#018x}", kernel.entry);
+    print_initrd(&info.initrd);
     print_kernel_segments(&handoff, kernel.segments());
     println!("  exiting boot services -- console output stops here");
     println!("-----------------------------------------------------------------");
@@ -222,6 +241,23 @@ fn print_boot_info(info: &BootInfo) {
     }
     println!("  device tree     : {:#018x}", info.device_tree);
     println!("-----------------------------------------------------------------");
+}
+
+/// Печатает диапазон образа ФС, который уходит в `BootInfo::initrd`.
+///
+/// Это единственное место, где его адрес виден человеку: после выхода из boot
+/// services консоли уже нет, а само ядро сообщит о нём далеко не сразу.
+fn print_initrd(initrd: &Initrd) {
+    if initrd.is_present() {
+        println!(
+            "  initrd image    : {:#018x}..{:#018x} -> MemoryKind::Reserved ({} bytes)",
+            initrd.base,
+            initrd.base + initrd.size,
+            initrd.size
+        );
+    } else {
+        println!("  initrd image    : absent -- the kernel will boot without a filesystem");
+    }
 }
 
 /// Печатает карту прав, которая уходит в `BootInfo::kernel`.

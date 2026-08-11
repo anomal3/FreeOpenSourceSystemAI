@@ -6,8 +6,23 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::arch::{Arch, Component};
+use crate::initrd;
 use crate::paths;
 use crate::util;
+
+/// Что именно собирать.
+///
+/// Отдельная структура, а не четыре аргумента подряд: `build` и `run` задают
+/// один и тот же набор, и при вызове было бы уже не разобрать, какой из голых
+/// булевых флагов что означает.
+pub struct BuildOptions {
+    pub arch: Arch,
+    pub release: bool,
+    /// Собирать ядро (`--no-kernel` выключает).
+    pub kernel: bool,
+    /// Собирать образ RAM-диска (`--no-initrd` выключает).
+    pub initrd: bool,
+}
 
 fn cargo() -> Command {
     // Cargo сообщает дочернему процессу путь к себе; так мы гарантированно
@@ -28,6 +43,9 @@ pub struct Built {
     pub arch: Arch,
     pub release: bool,
     items: Vec<(Component, PathBuf)>,
+    /// Образ RAM-диска. Не компонент: собирается не cargo и не зависит от
+    /// архитектуры, поэтому в общий список не помещается.
+    initrd: Option<PathBuf>,
 }
 
 impl Built {
@@ -48,24 +66,40 @@ impl Built {
             .find(|(item, _)| *item == component)
             .map(|(_, path)| path)
     }
+
+    /// Путь к образу RAM-диска, если он собирался в этот заход.
+    pub fn initrd(&self) -> Option<&Path> {
+        self.initrd.as_deref()
+    }
 }
 
-/// Собирает всё, что нужно для запуска: загрузчик и (если не отключено) ядро.
-pub fn build_all(arch: Arch, release: bool, with_kernel: bool) -> Result<Built> {
+/// Собирает всё, что нужно для запуска: загрузчик, ядро и образ RAM-диска.
+pub fn build_all(opts: &BuildOptions) -> Result<Built> {
     let mut items = Vec::with_capacity(Component::ALL.len());
 
     for component in Component::ALL {
-        if component == Component::Kernel && !with_kernel {
+        if component == Component::Kernel && !opts.kernel {
             println!("ядро пропущено (--no-kernel)");
             continue;
         }
-        items.push((component, build_component(component, arch, release)?));
+        items.push((
+            component,
+            build_component(component, opts.arch, opts.release)?,
+        ));
     }
 
+    let initrd = if opts.initrd {
+        Some(initrd::build()?)
+    } else {
+        println!("initrd пропущен (--no-initrd)");
+        None
+    };
+
     Ok(Built {
-        arch,
-        release,
+        arch: opts.arch,
+        release: opts.release,
         items,
+        initrd,
     })
 }
 

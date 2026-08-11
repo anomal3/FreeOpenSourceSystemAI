@@ -1,0 +1,13 @@
+Mixed case, and spaces
+======================
+
+The name of this file is "mixed Case Name With Spaces.txt". A short 8.3 entry
+cannot hold it: spaces are padding there, and letters are upper case only. The
+generated short name will look something like MIXEDC~1.TXT, and a driver that
+reports that instead of the real name has silently skipped the LFN entries
+that precede the short one.
+
+Case matters too. FAT lookups are case insensitive, but the stored long name
+keeps the case it was created with, and it must be handed back unchanged.
+
+END-OF-FILE /data/mixed Case Name With Spaces.txt OK

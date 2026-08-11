@@ -1,0 +1,18 @@
+Second directory level: /boot/stage2/
+
+Getting here means the driver walked the root directory, opened /boot, found
+its subdirectory entry, followed the first cluster recorded in that entry and
+parsed a directory that is NOT the root -- which on FAT32 is the same kind of
+object as the root, but reached through a different path.
+
+Two details worth checking while you are here:
+
+  * this directory also contains the "." and ".." entries that FAT stores in
+    every subdirectory; a listing that shows them is not wrong, a listing that
+    chokes on them is;
+
+  * ".." in a FAT32 subdirectory whose parent is the root holds first cluster
+    0, not the real root cluster number. Resolving ".." by cluster number
+    without special-casing zero lands nowhere.
+
+END-OF-FILE /boot/stage2/deeply-nested-second-level.txt OK

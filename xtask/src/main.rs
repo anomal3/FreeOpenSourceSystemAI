@@ -8,6 +8,7 @@
 mod arch;
 mod build;
 mod firmware;
+mod initrd;
 mod paths;
 mod qemu;
 mod util;
@@ -33,7 +34,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Собрать загрузчик и ядро под указанную архитектуру.
+    /// Собрать загрузчик, ядро и образ initrd под указанную архитектуру.
     Build(BuildArgs),
     /// Собрать всё, разложить по ESP и запустить в QEMU.
     Run(RunArgs),
@@ -56,6 +57,9 @@ struct BuildArgs {
     /// Не собирать ядро — только загрузчик.
     #[arg(long)]
     no_kernel: bool,
+    /// Не собирать образ RAM-диска initrd.img.
+    #[arg(long)]
+    no_initrd: bool,
 }
 
 #[derive(Args, Debug)]
@@ -70,6 +74,10 @@ struct RunArgs {
     /// в том числе его поведения, когда ядра на разделе нет.
     #[arg(long)]
     no_kernel: bool,
+    /// Не собирать образ RAM-диска и убрать initrd.img из ESP: проверка того,
+    /// что ядро поднимается и без файловой системы.
+    #[arg(long)]
+    no_initrd: bool,
     /// Поднять gdbstub на порту 1234 и остановиться до первой инструкции.
     #[arg(long)]
     gdb: bool,
@@ -119,12 +127,22 @@ fn real_main() -> Result<()> {
 
     match cli.command {
         Command::Build(args) => {
-            let built = build::build_all(args.arch, args.release, !args.no_kernel)?;
+            let built = build::build_all(&build::BuildOptions {
+                arch: args.arch,
+                release: args.release,
+                kernel: !args.no_kernel,
+                initrd: !args.no_initrd,
+            })?;
             print_built(&built);
         }
 
         Command::Run(args) => {
-            let built = build::build_all(args.arch, args.release, !args.no_kernel)?;
+            let built = build::build_all(&build::BuildOptions {
+                arch: args.arch,
+                release: args.release,
+                kernel: !args.no_kernel,
+                initrd: !args.no_initrd,
+            })?;
             print_built(&built);
             let opts = qemu::RunOptions {
                 gdb: args.gdb,
@@ -163,6 +181,9 @@ fn print_built(built: &build::Built) {
     for (component, path) in built.iter() {
         println!("  {:<10} {}", component.title(), path.display());
     }
+    if let Some(initrd) = built.initrd() {
+        println!("  {:<10} {}", "initrd", initrd.display());
+    }
     println!();
 }
 
@@ -174,8 +195,8 @@ fn print_image_stub(arch: Arch) {
 
 Настоящий загрузочный образ (GPT-таблица разделов + FAT32 ESP + записанный в него
 загрузчик) появится в Phase 8, вместе с графическим установщиком: раньше он просто
-некому нужен. Планируемая реализация — крейты `gpt` (разметка) и `fatfs`
-(файловая система) поверх обычного файла-образа.
+некому нужен. Планируемая реализация — крейт `gpt` (разметка) поверх того же
+`fatfs`, которым уже собирается initrd.img (см. xtask/src/initrd.rs).
 
 Что делать сейчас:
 
@@ -184,13 +205,14 @@ fn print_image_stub(arch: Arch) {
 `run` использует драйвер VVFAT в QEMU: каталог хоста build/esp/{arch} подключается
 как FAT-раздел напрямую (`-drive format=raw,file=fat:rw:...`). Файлы туда просто
 копируются, никакой пересборки образа между правками — dev-loop получается заметно
-короче, а прошивка и загрузчик видят ровно ту же структуру (\\EFI\\BOOT\\{boot_file}
-и \\{kernel_file}), что и на настоящем диске.
+короче, а прошивка и загрузчик видят ровно ту же структуру (\\EFI\\BOOT\\{boot_file},
+\\{kernel_file} и \\{initrd_file}), что и на настоящем диске.
 
 Ограничение, о котором стоит помнить: VVFAT — это эмуляция, а не реальный носитель.
 Проверить GPT-разметку, выравнивание разделов или работу самого установщика на нём
 нельзя. Именно поэтому Phase 8 и нужна.",
         boot_file = arch.removable_media_file(),
         kernel_file = arch::KERNEL_ESP_FILE,
+        initrd_file = arch::INITRD_ESP_FILE,
     );
 }

@@ -18,8 +18,8 @@ pub const BOOT_INFO_MAGIC: u64 = 0x4652_4545_4F53_0001;
 /// on a mismatch instead of silently reading garbage from an older bootloader.
 ///
 /// Revision 2 added [`BootInfo::kernel`], which the kernel needs to apply W^X
-/// to its own image.
-pub const BOOT_INFO_REVISION: u32 = 2;
+/// to its own image. Revision 3 added [`BootInfo::initrd`].
+pub const BOOT_INFO_REVISION: u32 = 3;
 
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
@@ -169,6 +169,8 @@ pub struct BootInfo {
     pub memory_map: MemoryMap,
     /// Where the kernel image was placed, and its per-segment permissions.
     pub kernel: KernelImage,
+    /// Filesystem image loaded alongside the kernel, if any.
+    pub initrd: Initrd,
     /// Physical address of the ACPI RSDP, or `0` if the firmware exposed none.
     pub acpi_rsdp: u64,
     /// Physical address of a flattened device tree, or `0` if none. Reserved
@@ -261,6 +263,34 @@ impl KernelImage {
     }
 }
 
+/// A filesystem image the bootloader loaded into memory alongside the kernel.
+///
+/// This is how the kernel gets files before it can drive a disk controller.
+/// Writing an AHCI or SD driver is the most platform-specific work left, and
+/// making "the kernel can open a file" wait on it would stall everything built
+/// on top. The image is read from the same volume the loader booted from, so
+/// no block driver is involved on the kernel side at all.
+///
+/// The memory holding it is marked [`MemoryKind::Reserved`], not
+/// bootloader-reclaimable: the kernel reads from it long after boot.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Initrd {
+    /// Physical address of the first byte, or `0` if no image was loaded.
+    pub base: u64,
+    /// Size in bytes.
+    pub size: u64,
+}
+
+impl Initrd {
+    pub const NONE: Self = Self { base: 0, size: 0 };
+
+    #[must_use]
+    pub const fn is_present(&self) -> bool {
+        self.base != 0 && self.size != 0
+    }
+}
+
 /// Сигнатура точки входа ядра.
 ///
 /// Загрузчик берёт адрес из ELF-заголовка ядра, приводит его к этому типу и
@@ -295,6 +325,7 @@ impl BootInfo {
             framebuffer: Framebuffer::NONE,
             memory_map: MemoryMap::EMPTY,
             kernel: KernelImage::EMPTY,
+            initrd: Initrd::NONE,
             acpi_rsdp: 0,
             device_tree: 0,
         }

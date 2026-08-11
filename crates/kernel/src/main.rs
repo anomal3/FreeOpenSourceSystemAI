@@ -41,12 +41,14 @@
 
 mod arch;
 mod console;
+mod fs;
 mod irq;
 mod mm;
 mod print;
 mod sched;
 mod serial;
 mod sync;
+mod vfs;
 
 extern crate alloc;
 
@@ -57,6 +59,7 @@ use core::panic::PanicInfo;
 use core::ptr;
 
 use crate::mm::{AddressSpace, VirtAddr};
+use crate::vfs::FileSystem;
 
 /// Точка входа ядра на x86-64.
 ///
@@ -288,8 +291,120 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
         kprintln!("  framebuffer : still reachable at {:#018x}", info.framebuffer.base);
     }
 
+    mount_initrd(&info);
+
     // Планировщик забирает управление насовсем: сюда исполнение уже не вернётся.
     sched::demo()
+}
+
+/// Насколько глубоко обходить дерево каталогов.
+///
+/// Ограничение обязательно, а не на всякий случай: испорченный образ может
+/// содержать каталог, ссылающийся на собственный кластер, и отличить это от
+/// законного подкаталога драйвер не в состоянии. Без предела обход уходит в
+/// бесконечную рекурсию и переполняет стек — то есть повреждённые данные
+/// роняют ядро.
+const MAX_TREE_DEPTH: usize = 8;
+
+/// Смонтировать образ RAM-диска и показать, что файловая система читается.
+fn mount_initrd(info: &BootInfo) {
+    kprintln!();
+    kprintln!("---- filesystem -------------------------------------------------");
+
+    if !info.initrd.is_present() {
+        kprintln!("  initrd      : absent -- booted without a filesystem");
+        return;
+    }
+
+    // SAFETY: прямое отображение активно (таблицы включены в `take_over_memory`),
+    // а память образа помечена загрузчиком как `Reserved`, поэтому ни аллокатор
+    // кадров, ни куча её не переиспользуют.
+    let disk = match unsafe { vfs::ramdisk::init(&info.initrd) } {
+        Ok(disk) => disk,
+        Err(err) => {
+            kprintln!("  initrd      : unusable image: {err:?}");
+            return;
+        }
+    };
+    kprintln!(
+        "  initrd      : {} KiB at {:#018x}",
+        info.initrd.size / 1024,
+        info.initrd.base
+    );
+
+    let fs = match fs::Fat32::mount(alloc::boxed::Box::new(disk)) {
+        Ok(fs) => fs,
+        Err(err) => {
+            kprintln!("  mount       : failed: {err}");
+            return;
+        }
+    };
+    kprintln!(
+        "  mounted     : {} volume '{}'",
+        fs.name(),
+        fs.label().as_deref().unwrap_or("<unlabelled>")
+    );
+
+    match fs.root() {
+        Ok(root) => print_tree(&*root, "/", 0),
+        Err(err) => kprintln!("  root        : unreadable: {err}"),
+    }
+
+    verify_file(&fs, "/data/large-cluster-chain-test.txt");
+}
+
+/// Напечатать дерево каталогов, не глубже [`MAX_TREE_DEPTH`].
+fn print_tree(node: &dyn vfs::Node, name: &str, depth: usize) {
+    let pad = depth * 2;
+    match node.metadata().kind {
+        vfs::NodeKind::Directory => {
+            kprintln!("  {:pad$}{}/", "", name, pad = pad + 2);
+            if depth >= MAX_TREE_DEPTH {
+                kprintln!("  {:pad$}... depth limit reached", "", pad = pad + 4);
+                return;
+            }
+            let Ok(entries) = node.list() else {
+                kprintln!("  {:pad$}... unreadable", "", pad = pad + 4);
+                return;
+            };
+            for entry in entries {
+                match node.lookup(&entry.name) {
+                    Ok(child) => print_tree(&*child, &entry.name, depth + 1),
+                    Err(err) => kprintln!("  {:pad$}{}: {err}", "", entry.name, pad = pad + 4),
+                }
+            }
+        }
+        vfs::NodeKind::File => {
+            kprintln!("  {:pad$}{} ({} bytes)", "", name, node.metadata().size, pad = pad + 2);
+        }
+    }
+}
+
+/// Прочитать файл целиком и убедиться, что дочитан именно до конца.
+///
+/// Файлы в образе заканчиваются известной строкой, поэтому обрыв цепочки
+/// кластеров виден сразу и не выглядит как «просто короткий файл».
+fn verify_file(fs: &dyn vfs::FileSystem, path: &str) {
+    let node = match fs.resolve(path) {
+        Ok(node) => node,
+        Err(err) => {
+            kprintln!("  read        : {path}: {err}");
+            return;
+        }
+    };
+
+    let size = node.metadata().size as usize;
+    let mut buf = alloc::vec![0u8; size];
+    match node.read_at(0, &mut buf) {
+        Ok(read) if read == size => {
+            let tail = core::str::from_utf8(&buf[size.saturating_sub(64)..]).unwrap_or("<not utf-8>");
+            let marker = tail.lines().rev().find(|line| !line.is_empty()).unwrap_or("");
+            kprintln!("  read        : {path}, {read} bytes");
+            kprintln!("  last line   : {marker}");
+        }
+        Ok(read) => kprintln!("  read        : {path}: short read, {read} of {size}"),
+        Err(err) => kprintln!("  read        : {path}: {err}"),
+    }
 }
 
 /// Поднять контроллер прерываний с таймером и убедиться, что тики доходят.

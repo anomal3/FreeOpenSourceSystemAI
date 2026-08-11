@@ -92,7 +92,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 2 | Frame allocator, kernel-owned page tables with W^X, heap, own stack | **done** |
 | 3 | Interrupts: IDT+APIC (x86), exception vectors+GIC (ARM), timer tick | **done** |
 | 4 | Cooperative scheduler, designed so preemption is an additive change | **done** |
-| 5 | RAM-disk, VFS traits, FAT32 reader | next |
+| 5 | RAM-disk, VFS traits, FAT32 reader | **done** |
 | 6 | Input & display: PS/2 first, then xHCI + USB HID boot protocol | |
 | 7 | Framebuffer compositor, minimal shell | |
 | 8 | Graphical UEFI installer (GPT, ESP, user account) | |
