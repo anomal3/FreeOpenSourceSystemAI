@@ -1,0 +1,22 @@
+[package]
+name = "ext2"
+description = "The ext2 on-disk format: formatter, writer and reader, shared by the installer and the kernel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Только ради трейта BlockDevice и типа Error: формат ext2 не должен знать,
+# лежит он в памяти, на разделе UEFI или на диске под драйвером ядра.
+disk = { path = "../disk" }
+
+[dev-dependencies]
+# Чужой читатель ext2 для тестов. Свой писатель, проверенный своим же
+# читателем, доказывает лишь внутреннюю согласованность, а нужна
+# согласованность со спецификацией — ровно та же причина, по которой образ FAT32
+# проверяется крейтом `fatfs`.
+ext4-view = "0.9"
+
+[lints]
+workspace = true

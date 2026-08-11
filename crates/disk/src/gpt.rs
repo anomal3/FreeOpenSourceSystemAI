@@ -292,6 +292,168 @@ pub fn write(dev: &mut dyn BlockDevice, disk_guid: Guid, parts: &[PartitionSpec]
     dev.flush()
 }
 
+/// Раздел, вычитанный с носителя.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Partition {
+    /// Номер записи в таблице, начиная с нуля.
+    pub index: u32,
+    pub type_guid: Guid,
+    pub unique_guid: Guid,
+    pub first_lba: u64,
+    pub last_lba: u64,
+    pub attributes: u64,
+    /// Имя раздела; лишнее за пределами массива отброшено.
+    pub name: [u8; 72],
+}
+
+impl Partition {
+    #[must_use]
+    pub const fn range(&self) -> Range {
+        Range {
+            first_lba: self.first_lba,
+            last_lba: self.last_lba,
+        }
+    }
+
+    /// Имя раздела строкой. UTF-16 на диске, поэтому пары байт склеиваются;
+    /// суррогатные пары не поддерживаются и заменяются вопросительным знаком.
+    #[must_use]
+    pub fn name_string(&self) -> alloc::string::String {
+        let units: Vec<u16> = self
+            .name
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        char::decode_utf16(units)
+            .map(|ch| ch.unwrap_or('?'))
+            .collect()
+    }
+}
+
+/// Прочитанная таблица разделов.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Table {
+    pub disk_guid: Guid,
+    pub first_usable_lba: u64,
+    pub last_usable_lba: u64,
+    pub partitions: Vec<Partition>,
+}
+
+impl Table {
+    /// Первый раздел заданного типа.
+    #[must_use]
+    pub fn find(&self, type_guid: Guid) -> Option<&Partition> {
+        self.partitions
+            .iter()
+            .find(|partition| partition.type_guid == type_guid)
+    }
+}
+
+/// Прочитать таблицу разделов.
+///
+/// Проверяются обе контрольные суммы — заголовка и массива записей. Это не
+/// формальность: заголовок приходит из-за границы доверия, а по его полям
+/// вычисляются адреса, по которым мы потом читаем. Заголовок с испорченным
+/// `partition_entry_lba` без проверки увёл бы чтение в произвольное место
+/// носителя.
+///
+/// Резервная копия при провале основной **не** используется. Восстановление
+/// разметки — операция, которая меняет диск, и делать её мимоходом внутри
+/// функции чтения нельзя; вызывающему честнее получить отказ.
+pub fn read(dev: &mut dyn BlockDevice) -> Result<Table> {
+    if dev.sector_size() as usize != SECTOR_SIZE {
+        return Err(Error::UnsupportedSectorSize(dev.sector_size()));
+    }
+    if dev.sector_count() <= FIRST_USABLE_LBA {
+        return Err(Error::TooSmall);
+    }
+
+    let mut header = [0u8; SECTOR_SIZE];
+    dev.read(1, &mut header)?;
+    if &header[0..8] != b"EFI PART" {
+        return Err(Error::NotPartitioned);
+    }
+
+    let header_size = u32_at(&header, 12) as usize;
+    // Заголовок короче обязательных 92 байт или длиннее сектора — это не наша
+    // ревизия формата, и считать по нему CRC бессмысленно.
+    if !(92..=SECTOR_SIZE).contains(&header_size) {
+        return Err(Error::NotPartitioned);
+    }
+    let stored_crc = u32_at(&header, 16);
+    let mut check = header;
+    check[16..20].fill(0);
+    let mut crc = Crc32::new();
+    crc.update(&check[..header_size]);
+    if crc.finish() != stored_crc {
+        return Err(Error::NotPartitioned);
+    }
+
+    let entry_size = u32_at(&header, 84) as usize;
+    let entry_count = u32_at(&header, 80);
+    // Запись меньше 128 байт формат запрещает; слишком большая таблица — это
+    // либо мусор, либо носитель, который мы всё равно не размечали.
+    if entry_size < ENTRY_SIZE as usize || entry_count > 4096 {
+        return Err(Error::NotPartitioned);
+    }
+    let entries_lba = u64_at(&header, 72);
+    let table_bytes = entry_size * entry_count as usize;
+    let table_sectors = table_bytes.div_ceil(SECTOR_SIZE);
+    if entries_lba + table_sectors as u64 > dev.sector_count() {
+        return Err(Error::OutOfRange);
+    }
+
+    let mut table = vec![0u8; table_sectors * SECTOR_SIZE];
+    dev.read(entries_lba, &mut table)?;
+    let mut crc = Crc32::new();
+    crc.update(&table[..table_bytes]);
+    if crc.finish() != u32_at(&header, 88) {
+        return Err(Error::NotPartitioned);
+    }
+
+    let mut partitions = Vec::new();
+    for index in 0..entry_count {
+        let at = index as usize * entry_size;
+        let slot = &table[at..at + ENTRY_SIZE as usize];
+        let type_guid = Guid::from_bytes(slot[0..16].try_into().expect("ровно 16 байт"));
+        // Нулевой тип означает пустую запись — их в таблице большинство.
+        if type_guid.is_zero() {
+            continue;
+        }
+        let mut name = [0u8; 72];
+        name.copy_from_slice(&slot[56..128]);
+        partitions.push(Partition {
+            index,
+            type_guid,
+            unique_guid: Guid::from_bytes(slot[16..32].try_into().expect("ровно 16 байт")),
+            first_lba: u64_at(slot, 32),
+            last_lba: u64_at(slot, 40),
+            attributes: u64_at(slot, 48),
+            name,
+        });
+    }
+
+    Ok(Table {
+        disk_guid: Guid::from_bytes(header[56..72].try_into().expect("ровно 16 байт")),
+        first_usable_lba: u64_at(&header, 40),
+        last_usable_lba: u64_at(&header, 48),
+        partitions,
+    })
+}
+
+#[inline]
+fn u32_at(buf: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+}
+
+#[inline]
+fn u64_at(buf: &[u8], at: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&buf[at..at + 8]);
+    u64::from_le_bytes(bytes)
+}
+
 /// Массив записей о разделах — 16 КиБ, как он лежит на диске.
 fn build_entries(parts: &[PartitionSpec]) -> Vec<u8> {
     let mut entries = vec![0u8; (ENTRY_COUNT * ENTRY_SIZE) as usize];
@@ -584,6 +746,66 @@ mod tests {
         // А данные между затираемыми областями трогать нельзя.
         let middle = read_sector(&mut dev, DISK_SECTORS / 2);
         assert!(middle.iter().any(|&byte| byte != 0));
+    }
+
+    /// Читатель обязан вернуть ровно то, что записал писатель: это
+    /// единственная связь между разметкой, которую делает установщик, и
+    /// разметкой, которую потом разбирает ядро.
+    #[test]
+    fn the_reader_recovers_what_the_writer_wrote() {
+        let mut dev = sample_disk();
+        let layout = write_sample(&mut dev);
+        let root = layout.root.expect("корневой раздел");
+
+        let table = read(&mut dev).expect("таблица читается");
+        assert_eq!(table.disk_guid, Guid::from_entropy([1; 16]));
+        assert_eq!(table.first_usable_lba, FIRST_USABLE_LBA);
+        assert_eq!(table.last_usable_lba, DISK_SECTORS - 1 - BACKUP_SECTORS);
+        assert_eq!(table.partitions.len(), 2);
+
+        let esp = &table.partitions[0];
+        assert_eq!(esp.index, 0);
+        assert_eq!(esp.type_guid, ESP_TYPE);
+        assert_eq!(esp.range(), layout.esp);
+        assert_eq!(esp.name_string(), "FreeOS ESP");
+
+        let found = table.find(FREEOS_ROOT_TYPE).expect("корневой раздел найден");
+        assert_eq!(found.range(), root);
+        assert_eq!(found.name_string(), "FreeOS root");
+        assert!(table.find(Guid::from_entropy([9; 16])).is_none());
+    }
+
+    /// Порча заголовка обязана приводить к отказу, а не к чтению по мусорным
+    /// адресам: контрольная сумма для того и считается.
+    #[test]
+    fn a_damaged_header_is_refused() {
+        let mut dev = sample_disk();
+        write_sample(&mut dev);
+
+        let mut header = read_sector(&mut dev, 1);
+        // Правим адрес таблицы записей, не трогая контрольную сумму.
+        header[72..80].copy_from_slice(&999_999u64.to_le_bytes());
+        dev.write(1, &header).expect("запись");
+        assert_eq!(read(&mut dev), Err(Error::NotPartitioned));
+    }
+
+    /// Порча самой таблицы записей ловится её собственной суммой.
+    #[test]
+    fn a_damaged_entry_table_is_refused() {
+        let mut dev = sample_disk();
+        write_sample(&mut dev);
+
+        let mut sector = read_sector(&mut dev, 2);
+        sector[40] ^= 0xFF;
+        dev.write(2, &sector).expect("запись");
+        assert_eq!(read(&mut dev), Err(Error::NotPartitioned));
+    }
+
+    #[test]
+    fn an_unpartitioned_disk_is_reported_as_such() {
+        let mut dev = sample_disk();
+        wipe(&mut dev).expect("затирание");
+        assert_eq!(read(&mut dev), Err(Error::NotPartitioned));
     }
 
     #[test]

@@ -5,6 +5,7 @@ members = [
     "crates/boot-info",
     "crates/boot-uefi",
     "crates/disk",
+    "crates/ext2",
     "crates/installer",
     "crates/kernel",
     "crates/mini-ui",

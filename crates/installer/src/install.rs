@@ -13,13 +13,17 @@
 //! прежнюю разметку, и дальше отменять нечего — поэтому подтверждение стоит
 //! прямо перед ним, а не где-то в середине.
 //!
-//! # Чего установщик не делает
+//! # Два раздела, две файловые системы
 //!
-//! Не создаёт файловую систему на корневом разделе. Своей корневой ФС у FreeOS
-//! ещё нет, а положить туда FAT32 значило бы закрепить формат без полей uid,
-//! gid и mode — ровно то, ради чего собственная ФС и планируется. Раздел
-//! создаётся, помечается своим типом и обнуляется в начале, чтобы прошивка не
-//! приняла остатки чужой ФС за настоящие.
+//! На системном разделе EFI обязана быть FAT32 — этого требует спецификация
+//! UEFI, и выбора здесь нет. На корневом стоит ext2, и там выбор был: FAT32 не
+//! хранит ни `uid`, ни `gid`, ни `mode`, а добавить права после того, как на
+//! диске появились пользовательские данные, значит менять формат и мигрировать.
+//!
+//! Отсюда и разделение содержимого. Загрузчик, ядро и образ RAM-диска лежат на
+//! ESP: их читает прошивка и загрузчик, то есть до того, как существует хоть
+//! какой-то драйвер FreeOS. Учётная запись и настройки лежат на корневом
+//! разделе с правильными правами: их читает уже система.
 
 use alloc::format;
 use alloc::string::String;
@@ -29,7 +33,7 @@ use disk::gpt::{self, PartitionSpec};
 use disk::guid::Guid;
 use disk::{BlockDevice, fat32};
 
-use crate::account::Draft;
+use crate::account::{self, Draft};
 use crate::disks::{Disk, UefiDisk};
 use crate::lang::Language;
 use crate::logln;
@@ -46,12 +50,8 @@ const WANTED_ESP: u64 = 512 * 1024 * 1024;
 /// ужать до размера полезной нагрузки.
 const ESP_SLACK: u64 = 32 * 1024 * 1024;
 
-/// Сколько байт в начале корневого раздела обнуляется.
-///
-/// Мегабайта хватает на суперблок любой существующей файловой системы. Без
-/// этого прошивка (или чужая утилита) нашла бы на новом разделе остатки
-/// прежней ФС и сочла бы их настоящими.
-const ROOT_WIPE_BYTES: u64 = 1024 * 1024;
+/// Метка корневого тома.
+const ROOT_LABEL: &str = "FreeOS";
 
 /// Куда и что ставим.
 #[derive(Clone, Copy)]
@@ -68,6 +68,8 @@ pub enum Error {
     TooSmall,
     /// Носитель отказал.
     Disk,
+    /// Не удалось создать корневую файловую систему.
+    RootFs,
     /// Не удалось прочитать переносимый файл.
     Payload(payload::Error),
 }
@@ -78,6 +80,16 @@ impl From<disk::Error> for Error {
         match err {
             disk::Error::TooSmall => Error::TooSmall,
             _ => Error::Disk,
+        }
+    }
+}
+
+impl From<ext2::Error> for Error {
+    fn from(err: ext2::Error) -> Self {
+        logln!("[install] the root filesystem failed: {err}");
+        match err {
+            ext2::Error::TooSmall => Error::TooSmall,
+            _ => Error::RootFs,
         }
     }
 }
@@ -119,15 +131,16 @@ impl Plan {
 pub enum Step {
     Wipe,
     Gpt,
-    Format,
+    FormatEsp,
     /// Перенос файла; несёт его роль, чтобы подписать строку.
     Copy(payload::What),
+    FormatRoot,
     Config,
     Flush,
 }
 
 /// Сколько всего шагов — для полосы хода работ.
-pub const TOTAL_STEPS: u32 = 6;
+pub const TOTAL_STEPS: u32 = 7;
 
 /// Настройки, которые установщик записывает на целевой диск.
 pub struct Settings<'a> {
@@ -136,12 +149,17 @@ pub struct Settings<'a> {
     pub timezone: &'a str,
     /// Источник соли и идентификаторов GPT.
     pub entropy: u64,
+    /// Текущее время в секундах эпохи Unix.
+    ///
+    /// Передаётся снаружи, а не берётся здесь: часы доступны только через
+    /// runtime-сервисы UEFI, о которых крейты разметки знать не должны.
+    pub unix_time: u32,
 }
 
-/// Путь на целевом ESP, куда ложится файл учётных записей.
-const PASSWD_PATH: &str = "FREEOS/PASSWD";
-/// Путь на целевом ESP, куда ложится файл настроек.
-const CONFIG_PATH: &str = "FREEOS/SYSTEM.CFG";
+/// Путь на корневом разделе, куда ложится файл учётных записей.
+const PASSWD_PATH: &str = "etc/passwd";
+/// Путь на корневом разделе, куда ложится файл настроек.
+const CONFIG_PATH: &str = "etc/system.cfg";
 
 /// Выполнить установку.
 ///
@@ -197,7 +215,7 @@ pub fn run(
         &partitions,
     )?;
 
-    progress(2, Step::Format);
+    progress(2, Step::FormatEsp);
     let mut volume = fat32::format(
         &mut dev,
         plan.layout.esp,
@@ -224,46 +242,74 @@ pub fn run(
         drop(data);
     }
 
-    progress(4, Step::Config);
-    volume.write_file_path(
+    volume.finish(&mut dev)?;
+
+    // Корневой раздел. Его отсутствие — не отказ: на диске, где под него не
+    // хватило места, система всё равно загрузится, просто учётной записи ей
+    // будет негде взять. Сказать об этом в журнале честнее, чем прервать
+    // установку, которая почти удалась.
+    let Some(root) = plan.layout.root else {
+        logln!("[install] no root partition: the account has nowhere to go");
+        progress(6, Step::Flush);
+        dev.flush()?;
+        return Ok(());
+    };
+
+    progress(4, Step::FormatRoot);
+    let ext2_options = ext2::FormatOptions {
+        label: ROOT_LABEL,
+        uuid: expand(settings.entropy, b"freeos-root-fs"),
+        time: settings.unix_time,
+    };
+    let mut fs = ext2::format(&mut dev, root.first_lba, root.sectors(), &ext2_options)?;
+    logln!(
+        "[install] root: ext2, {} blocks of {} bytes in {} group(s)",
+        fs.geometry().blocks,
+        fs.geometry().block_size.bytes(),
+        fs.geometry().groups,
+    );
+
+    progress(5, Step::Config);
+    // Права проставляются сразу и настоящие, хотя проверять их пока некому:
+    // выставить их позже значит на какое-то время оставить файл учётных
+    // записей открытым на чтение всем.
+    fs.create_dir_path(&mut dev, "etc", 0o755, 0, 0)?;
+    fs.write_file_path(
         &mut dev,
         PASSWD_PATH,
         account.to_passwd(settings.entropy).as_bytes(),
+        account::PASSWD_MODE,
+        0,
+        0,
     )?;
-    volume.write_file_path(&mut dev, CONFIG_PATH, config_text(settings).as_bytes())?;
+    fs.write_file_path(
+        &mut dev,
+        CONFIG_PATH,
+        config_text(settings).as_bytes(),
+        0o644,
+        0,
+        0,
+    )?;
 
-    progress(5, Step::Flush);
-    volume.finish(&mut dev)?;
+    // Домашний каталог принадлежит пользователю, а не root: иначе первое, что
+    // человек обнаружит в своей системе, — что ему некуда писать. А вот сам
+    // `/home` остаётся за root: иначе первый заведённый пользователь смог бы
+    // удалить домашний каталог второго.
+    fs.create_dir_path(&mut dev, "home", 0o755, 0, 0)?;
+    let home = alloc::format!("home/{}", account.name);
+    fs.create_dir_path(
+        &mut dev,
+        &home,
+        account::HOME_MODE,
+        account::FIRST_UID,
+        account::FIRST_UID,
+    )?;
+    logln!("[install] root: /etc/passwd, /etc/system.cfg and /{home}");
 
-    // Корневой раздел остаётся без файловой системы, но его начало обнуляется:
-    // иначе там осталась бы прежняя ФС, и всякий, кто посмотрит на диск,
-    // увидел бы раздел FreeOS с чужим содержимым.
-    if let Some(root) = plan.layout.root {
-        let sectors = (ROOT_WIPE_BYTES / disk::SECTOR_SIZE as u64).min(root.sectors());
-        logln!("[install] zeroing the first {sectors} sectors of the root partition");
-        zero(&mut dev, root.first_lba, sectors)?;
-    }
-
+    progress(6, Step::Flush);
+    fs.finish(&mut dev, &ext2_options)?;
     dev.flush()?;
     logln!("[install] finished");
-    Ok(())
-}
-
-/// Обнулить диапазон секторов.
-///
-/// Своя копия вместо `disk::zero_sectors`: та закрыта внутри крейта, и
-/// открывать её наружу ради одного вызова — значит расширять интерфейс
-/// разметки операцией, которая к разметке не относится.
-fn zero(dev: &mut dyn BlockDevice, lba: u64, count: u64) -> Result<(), Error> {
-    const CHUNK: usize = 16;
-    static ZEROS: [u8; CHUNK * disk::SECTOR_SIZE] = [0; CHUNK * disk::SECTOR_SIZE];
-
-    let mut done = 0u64;
-    while done < count {
-        let batch = ((count - done) as usize).min(CHUNK);
-        dev.write(lba + done, &ZEROS[..batch * disk::SECTOR_SIZE])?;
-        done += batch as u64;
-    }
     Ok(())
 }
 
@@ -280,8 +326,8 @@ fn config_text(settings: &Settings) -> String {
 /// Текущее время прошивки в виде метки FAT.
 ///
 /// Часы прошивки могут быть не выставлены — тогда метка окажется эпохой FAT.
-/// Это не повод прерывать установку: неверная дата у файла на ESP не мешает
-/// ничему, а отказ из-за неё был бы совершенно непропорционален.
+/// Это не повод прерывать установку: неверная дата у файла не мешает ничему, а
+/// отказ из-за неё был бы совершенно непропорционален.
 fn now() -> fat32::Timestamp {
     match uefi::runtime::get_time() {
         Ok(time) => fat32::Timestamp::new(
@@ -297,6 +343,44 @@ fn now() -> fat32::Timestamp {
             fat32::Timestamp::EPOCH
         }
     }
+}
+
+/// Текущее время в секундах эпохи Unix.
+///
+/// Ноль, если часов нет: файл с датой 1970 года выглядит странно, но это
+/// честнее выдуманной даты и не мешает ничему.
+#[must_use]
+pub fn unix_now() -> u32 {
+    let Ok(time) = uefi::runtime::get_time() else {
+        return 0;
+    };
+    let days = days_from_civil(i64::from(time.year()), time.month(), time.day());
+    let seconds = days * 86_400
+        + i64::from(time.hour()) * 3600
+        + i64::from(time.minute()) * 60
+        + i64::from(time.second());
+    u32::try_from(seconds).unwrap_or(0)
+}
+
+/// Число дней от 1970-01-01 до заданной даты.
+///
+/// Алгоритм Говарда Хиннанта (`days_from_civil`): год сдвигается так, чтобы
+/// март был первым месяцем, и високосный день оказывается в конце — после чего
+/// длина года становится выражаемой без ветвлений. Считать через таблицу
+/// длительностей месяцев было бы длиннее и куда легче ошибиться на високосных
+/// годах, а ошибка здесь тихая: неверная дата у файла ничего не ломает и
+/// потому никогда не всплывёт.
+fn days_from_civil(year: i64, month: u8, day: u8) -> i64 {
+    let month = i64::from(month.clamp(1, 12));
+    let day = i64::from(day.clamp(1, 31));
+    let year = year - i64::from(month <= 2);
+
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// Растянуть 64-битное зерно в 16 байт под GUID, подмешав назначение.

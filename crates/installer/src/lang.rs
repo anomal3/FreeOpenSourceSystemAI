@@ -103,8 +103,9 @@ pub struct Strings {
     pub install_heading: &'static str,
     pub step_wipe: &'static str,
     pub step_gpt: &'static str,
-    pub step_format: &'static str,
+    pub step_format_esp: &'static str,
     pub step_copy: &'static str,
+    pub step_format_root: &'static str,
     pub step_config: &'static str,
     pub step_flush: &'static str,
 
@@ -117,6 +118,7 @@ pub struct Strings {
     pub error_no_payload: &'static str,
     pub error_disk: &'static str,
     pub error_memory: &'static str,
+    pub error_root_fs: &'static str,
 }
 
 pub static ENGLISH: Strings = Strings {
@@ -149,7 +151,7 @@ pub static ENGLISH: Strings = Strings {
     confirm_warning: "The disk below will be erased completely. This cannot be undone.",
     confirm_scheme: "Partition layout:",
     confirm_esp: "EFI system partition, FAT32",
-    confirm_root: "FreeOS root partition, left unformatted",
+    confirm_root: "FreeOS root partition, ext2",
     confirm_no: "No, go back",
     confirm_yes: "Yes, erase this disk and install",
 
@@ -173,8 +175,9 @@ pub static ENGLISH: Strings = Strings {
     install_heading: "Installing",
     step_wipe: "Erasing the old partition table",
     step_gpt: "Writing the GPT partition table",
-    step_format: "Formatting the EFI system partition",
+    step_format_esp: "Formatting the EFI system partition",
     step_copy: "Copying",
+    step_format_root: "Creating the root filesystem",
     step_config: "Writing the account and the configuration",
     step_flush: "Flushing the disk",
 
@@ -188,6 +191,7 @@ pub static ENGLISH: Strings = Strings {
     error_no_payload: "The installation medium is incomplete: a required file is missing.",
     error_disk: "The disk refused the operation.",
     error_memory: "Not enough memory to read the file being installed.",
+    error_root_fs: "The root filesystem could not be created on that partition.",
 };
 
 pub static RUSSIAN: Strings = Strings {
@@ -222,7 +226,7 @@ pub static RUSSIAN: Strings = Strings {
     confirm_warning: "Диск ниже будет стерт полностью. Отменить это будет нельзя.",
     confirm_scheme: "Разметка:",
     confirm_esp: "системный раздел EFI, FAT32",
-    confirm_root: "корневой раздел FreeOS, без файловой системы",
+    confirm_root: "корневой раздел FreeOS, ext2",
     confirm_no: "Нет, вернуться назад",
     confirm_yes: "Да, стереть этот диск и установить",
 
@@ -246,8 +250,9 @@ pub static RUSSIAN: Strings = Strings {
     install_heading: "Установка",
     step_wipe: "Стирание прежней таблицы разделов",
     step_gpt: "Запись таблицы разделов GPT",
-    step_format: "Форматирование системного раздела EFI",
+    step_format_esp: "Форматирование системного раздела EFI",
     step_copy: "Копирование",
+    step_format_root: "Создание корневой файловой системы",
     step_config: "Запись учетной записи и настроек",
     step_flush: "Сброс данных на диск",
 
@@ -261,4 +266,5 @@ pub static RUSSIAN: Strings = Strings {
     error_no_payload: "Носитель установки неполон: нужного файла на нем нет.",
     error_disk: "Диск отказал в операции.",
     error_memory: "Не хватило памяти, чтобы прочитать устанавливаемый файл.",
+    error_root_fs: "Не удалось создать корневую файловую систему на этом разделе.",
 };

@@ -26,7 +26,7 @@ Design bias throughout: **prefer the boring, well-specified path over the clever
 | **64-bit only: ARM64 + x86-64** | No 32-bit x86, no instruction translation. A PE binary built for x64 runs on x64 hardware natively. |
 | **UEFI as the single boot protocol** | One bootloader source compiles to `BOOTX64.EFI` and `BOOTAA64.EFI`. On Raspberry Pi 4 this works via the [pftf/RPi4](https://github.com/pftf/RPi4) UEFI firmware. UEFI unifies the *software* interface — it does not erase hardware differences, which stay behind the HAL. |
 | **Framebuffer compositor, not X11/Wayland** | UEFI GOP hands us a linear framebuffer with the video mode already set. A compositor on top of that is a few thousand lines, not a few hundred thousand. |
-| **FAT32 for ESP, custom inode FS for root** | FAT32 on the EFI System Partition is mandated by the UEFI spec. It is unsuitable for root: its on-disk format has no uid/gid/mode fields, so unix permissions could never be added later without migrating user data. |
+| **FAT32 for ESP, ext2 for root** | FAT32 on the EFI System Partition is mandated by the UEFI spec. It is unsuitable for root: its on-disk format has no uid/gid/mode fields, so unix permissions could never be added later without migrating user data. ext2 has them, and — decisively — has independent implementations to check ours against. See [The root filesystem](#the-root-filesystem). |
 | **QEMU as the only dev target** | Built-in gdbstub, both architectures, fully scriptable. VMware Workstation on a Windows host cannot run ARM guests at all, so it would only ever cover half the project. |
 | **ESP32 explicitly excluded** | No MMU and ~520 KB SRAM. Virtual memory and process isolation — the foundation of this design — are not implementable there. It would also require a forked, non-mainline Rust toolchain. |
 
@@ -79,6 +79,36 @@ Without a framebuffer the same shell runs on the serial console alone; graphics 
 condition for the system to work. With nobody typing, the prompt gives up after twenty
 seconds so unattended runs still terminate.
 
+## The root filesystem
+
+**ext2**, implemented here rather than borrowed — we take the on-disk layout, not anyone's
+code. The plan originally called for a custom inode filesystem, and the argument that
+changed it was not about the filesystem at all. It was about what could check it.
+
+This project's standing rule is *check rather than assert*. The FAT32 writer is verified by
+reading its output back with the foreign `fatfs` crate, because a writer checked by its own
+reader proves only that both halves misread the format the same way. ext2 offers the same
+escape hatch and a custom format never could: the tests here read every image back with
+[`ext4-view`](https://crates.io/crates/ext4-view), and `e2fsck` plus an ordinary `mount`
+work on any Linux machine. A broken FreeOS install can be repaired from outside.
+
+The original reason FAT32 was rejected for root still holds and is satisfied: `uid`, `gid`
+and `mode` live in the on-disk inode, so the installer writes `/etc/passwd` as `0640
+root:root` and `/home/<user>` as `0750` owned by uid 1000 — real values, set at creation
+time, years before anything will enforce them.
+
+The cost, stated plainly: ext2 is a 1993 design with no checksums and no snapshots, and it
+needs fsck after a power cut. ext3 journaling is additive over the same on-disk format, so
+it can come later without migrating data.
+
+What is implemented: formatting, directories, files, indirect and doubly-indirect blocks,
+and reading all of it back. What is not: deletion, truncation, hard and symbolic links, and
+triple indirection — each absent because it has no consumer today, and unexercised code in
+something that writes to a disk is worse than missing code.
+
+Run `cargo xtask inspect` after an install to see what actually landed: our own code parses
+the partition table, and a foreign implementation reads the filesystem.
+
 ## The installer
 
 A separate UEFI application, not a first-boot wizard inside the system. Partitioning is a
@@ -101,20 +131,20 @@ the single point of no return; everything you might change your mind about is as
 it, not after. The medium the installer itself booted from is detected by device path and
 cannot be selected — an installation USB stick and a target disk look identical on screen.
 
-It writes a GPT with an ESP (FAT32, bootloader + kernel + initrd) and a FreeOS root
-partition, which is left **without a filesystem**: FreeOS has no root filesystem yet, and
-putting FAT32 there would freeze a format with no uid, gid or mode fields — the very thing
-the custom one exists to avoid. Its first megabyte is zeroed so no stale superblock is
-mistaken for real.
+It writes a GPT with two partitions: an ESP (FAT32 — the UEFI spec leaves no choice)
+carrying the bootloader, kernel and initrd, and a FreeOS root partition holding ext2. The
+split follows from who reads what: the ESP is read by firmware and the bootloader, before
+any FreeOS driver exists, while the root partition is read by the system itself and can
+therefore afford a format with permissions.
 
-The account lands on the ESP as `\FREEOS\PASSWD`, with `uid`, `gid` and `mode` fields from
-day one. The password digest is **not** produced by a key derivation function: no PBKDF2,
-scrypt or Argon2 exists in this project, and pulling a crypto dependency into a UEFI
-application is a decision to take deliberately, not in passing. What is stored is a salted,
-iterated FNV-1a, and the algorithm is named in the record itself (`fnv1a64-4096`) so a real
-KDF can be added later as a second tag without a migration. It keeps the password off the
-disk in plaintext; it is not protection against an attacker, and it is labelled as such
-rather than dressed up as one.
+The account lands at `/etc/passwd` on the root partition, `0640 root:root`, and the user
+gets `/home/<name>` at `0750` owned by uid 1000. The password digest is **not** produced by
+a key derivation function: no PBKDF2, scrypt or Argon2 exists in this project, and pulling
+a crypto dependency into a UEFI application is a decision to take deliberately, not in
+passing. What is stored is a salted, iterated FNV-1a, and the algorithm is named in the
+record itself (`fnv1a64-4096`) so a real KDF can be added later as a second tag without a
+migration. It keeps the password off the disk in plaintext; it is not protection against an
+attacker, and it is labelled as such rather than dressed up as one.
 
 The Cyrillic in the interface is hand-drawn: `font8x8` covers ASCII, Latin, Greek, box
 drawing and hiragana, and no Cyrillic at all, so `crates/mini-ui/src/font.rs` carries 66
@@ -126,6 +156,7 @@ glyphs written as 8x8 ASCII art — a form in which a typo is visible in the sou
 crates/boot-info/   Stable #[repr(C)] hand-off contract: bootloader → kernel
 crates/boot-uefi/   UEFI application: GOP probe, ELF loading, ExitBootServices
 crates/disk/        GPT and a FAT32 formatter, no_std: host image builder + installer
+crates/ext2/        The ext2 format: formatter, writer and reader, no_std
 crates/mini-ui/     Surfaces, 8x8 text (ASCII + Cyrillic), widgets: kernel + installer
 crates/installer/   UEFI application: disk selection, partitioning, account, install
 crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
@@ -187,6 +218,8 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 7 | Framebuffer compositor with damage tracking, shell in a window | **done** |
 | 8a | GPT + FAT32 writer, real bootable disk image instead of VVFAT | **done** |
 | 8b | Graphical UEFI installer (disk selection, partitioning, user account) | **done** |
+| 9a | ext2: formatter, writer and reader; the installer creates a real root | **done** |
+| 9b | virtio-blk driver; the kernel mounts the root partition it was installed on | |
 
 Phases 6 and 8 were both split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

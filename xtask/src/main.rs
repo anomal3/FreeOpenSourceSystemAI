@@ -10,6 +10,7 @@ mod build;
 mod firmware;
 mod image;
 mod initrd;
+mod inspect;
 mod paths;
 mod qemu;
 mod util;
@@ -43,6 +44,8 @@ enum Command {
     Image(ImageArgs),
     /// Запустить установщик в QEMU: установочный носитель плюс чистый диск.
     Install(InstallArgs),
+    /// Разобрать образ диска: разделы и содержимое корневой ФС.
+    Inspect(InspectArgs),
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -120,6 +123,16 @@ struct ImageArgs {
     /// Собрать установочный носитель, а не образ готовой системы.
     #[arg(long)]
     installer: bool,
+}
+
+#[derive(Args, Debug)]
+struct InspectArgs {
+    /// Целевая архитектура — по ней выбирается образ по умолчанию.
+    #[arg(long, short = 'a', value_enum, default_value = "x86_64")]
+    arch: Arch,
+    /// Разобрать конкретный файл вместо диска, на который ставил установщик.
+    #[arg(long)]
+    path: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -272,7 +285,22 @@ fn real_main() -> Result<()> {
 
             println!();
             println!("Проверить результат установки:");
-            println!("    cargo xtask run --arch {} --installed", args.arch);
+            println!("    cargo xtask inspect --arch {}   # что записано на диск", args.arch);
+            println!("    cargo xtask run --arch {} --installed   # загрузиться с него", args.arch);
+        }
+
+        Command::Inspect(args) => {
+            let path = args.path.unwrap_or_else(|| paths::target_disk(args.arch));
+            if !path.is_file() {
+                anyhow::bail!(
+                    "образа нет: {}\n\
+                     Сначала выполните установку:\n    \
+                     cargo xtask install --arch {}",
+                    path.display(),
+                    args.arch,
+                );
+            }
+            inspect::image(&path)?;
         }
 
         Command::Check(args) => {

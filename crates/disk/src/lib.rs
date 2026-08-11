@@ -80,6 +80,8 @@ pub enum Error {
     NotADirectory,
     /// Носитель только для чтения.
     ReadOnly,
+    /// На носителе нет действующей таблицы разделов GPT.
+    NotPartitioned,
 }
 
 impl fmt::Display for Error {
@@ -97,6 +99,7 @@ impl fmt::Display for Error {
             Error::BadName => f.write_str("the name cannot be expressed as a FAT 8.3 name"),
             Error::NotADirectory => f.write_str("a path component exists but is not a directory"),
             Error::ReadOnly => f.write_str("the block device is read-only"),
+            Error::NotPartitioned => f.write_str("no valid GPT partition table on this device"),
         }
     }
 }

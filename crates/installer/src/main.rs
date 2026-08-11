@@ -104,6 +104,7 @@ impl Failure {
             Failure::Install(install::Error::Payload(_)) => strings.error_no_payload,
             Failure::Install(install::Error::TooSmall) => strings.disk_too_small,
             Failure::Install(install::Error::Disk) => strings.error_disk,
+            Failure::Install(install::Error::RootFs) => strings.error_root_fs,
         }
     }
 }
@@ -446,6 +447,7 @@ fn perform(display: &mut Display, app: &mut App, payload: &mut Payload) {
         keyboard: ui::KEYBOARDS[app.keyboard.min(ui::KEYBOARDS.len() - 1)].0,
         timezone: &timezone,
         entropy: entropy(&target),
+        unix_time: install::unix_now(),
     };
 
     let result = install::run(

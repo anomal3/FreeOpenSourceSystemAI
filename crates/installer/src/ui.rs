@@ -261,8 +261,9 @@ fn progress_body(canvas: &mut Canvas, strings: &Strings, done: u32, step: Step) 
     let label = match step {
         Step::Wipe => strings.step_wipe.to_string(),
         Step::Gpt => strings.step_gpt.to_string(),
-        Step::Format => strings.step_format.to_string(),
+        Step::FormatEsp => strings.step_format_esp.to_string(),
         Step::Copy(what) => format!("{}: {}", strings.step_copy, file_name(what)),
+        Step::FormatRoot => strings.step_format_root.to_string(),
         Step::Config => strings.step_config.to_string(),
         Step::Flush => strings.step_flush.to_string(),
     };
