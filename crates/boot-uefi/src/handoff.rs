@@ -19,18 +19,22 @@
 //! указателям. Поэтому всё, что нужно сказать, говорится до выхода, а после —
 //! только запись в собственную заранее выделенную память и прыжок.
 //!
-//! # Где живут `BootInfo` и массив регионов
+//! # Где живут `BootInfo`, карта сегментов ядра и массив регионов
 //!
-//! В блоке страниц типа `LOADER_DATA`, выделенном до выхода. Такая память не
-//! исчезает при `ExitBootServices` — она просто перестаёт управляться
-//! прошивкой, — и в карте помечается как `BootloaderReclaimable`. Класть
-//! `BootInfo` на стек нельзя: ядро переключит стек, и структура будет затёрта
-//! раньше, чем оно её прочитает.
+//! В одном блоке страниц типа `LOADER_DATA`, выделенном до выхода. Такая память
+//! не исчезает при `ExitBootServices` — она просто перестаёт управляться
+//! прошивкой, — и в карте помечается как `BootloaderReclaimable`. Класть эти
+//! структуры на стек нельзя: ядро переключит стек на свой, и всё, на что
+//! `BootInfo` ссылается, будет затёрто раньше, чем ядро успеет прочитать. По
+//! той же причине массив [`boot_info::KernelSegment`] не может ехать из
+//! `elf::load` по ссылке на локальный буфер — он копируется сюда.
 
 use core::mem;
 use core::ptr::NonNull;
 
-use boot_info::{BootInfo, KernelEntry, MemoryKind, MemoryMap as BootMemoryMap, MemoryRegion};
+use boot_info::{
+    BootInfo, KernelEntry, KernelSegment, MemoryKind, MemoryMap as BootMemoryMap, MemoryRegion,
+};
 use uefi::boot::{self, AllocateType, MemoryType, PAGE_SIZE};
 use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
 use uefi::println;
@@ -82,10 +86,11 @@ impl Override {
     }
 }
 
-/// Блок памяти, переживающий `ExitBootServices`: [`BootInfo`] и массив
-/// [`MemoryRegion`] в одной аллокации.
+/// Блок памяти, переживающий `ExitBootServices`: [`BootInfo`], карта сегментов
+/// ядра и массив [`MemoryRegion`] в одной аллокации.
 pub struct Handoff {
     info: NonNull<BootInfo>,
+    segments: u64,
     regions: NonNull<MemoryRegion>,
     capacity: usize,
 }
@@ -111,10 +116,29 @@ impl Handoff {
         Ok(len * 2 + CAPACITY_SLACK)
     }
 
-    /// Выделяет блок под `BootInfo` и `capacity` регионов и копирует в него
-    /// подготовленный `BootInfo`.
-    pub fn allocate(info: &BootInfo, capacity: usize) -> Result<Self, Aborted> {
-        let regions_offset = mem::size_of::<BootInfo>().next_multiple_of(mem::align_of::<MemoryRegion>());
+    /// Выделяет блок под `BootInfo`, карту сегментов ядра и `capacity`
+    /// регионов, копирует туда подготовленный `BootInfo` вместе с сегментами и
+    /// проставляет в нём указатель на скопированную карту.
+    ///
+    /// Раскладка блока: `BootInfo`, затем сегменты, затем регионы. Регионы
+    /// последние, потому что заполняются уже после `ExitBootServices`, когда
+    /// печатать что-либо о переполнении будет некуда.
+    pub fn allocate(
+        info: &BootInfo,
+        capacity: usize,
+        segments: &[KernelSegment],
+    ) -> Result<Self, Aborted> {
+        let segments_offset =
+            mem::size_of::<BootInfo>().next_multiple_of(mem::align_of::<KernelSegment>());
+        let Some(regions_offset) = segments
+            .len()
+            .checked_mul(mem::size_of::<KernelSegment>())
+            .and_then(|arr| arr.checked_add(segments_offset))
+            .map(|end| end.next_multiple_of(mem::align_of::<MemoryRegion>()))
+        else {
+            println!("  [mem] hand-off block size overflows");
+            return Err(Aborted);
+        };
         let Some(bytes) = capacity
             .checked_mul(mem::size_of::<MemoryRegion>())
             .and_then(|arr| arr.checked_add(regions_offset))
@@ -150,6 +174,34 @@ impl Handoff {
             info_ptr.write(*info);
         }
 
+        // SAFETY: `segments_offset + segments.len() * size_of::<KernelSegment>()
+        // <= regions_offset <= pages * PAGE_SIZE`, значит и указатель, и весь
+        // массив остаются внутри аллокации.
+        let segments_ptr = unsafe { raw.add(segments_offset) }.cast::<KernelSegment>();
+
+        // Пустая карта передаётся как нулевой указатель: контракт `KernelImage`
+        // кодирует отсутствие именно так, а не длиной.
+        let segments_addr = if segments.is_empty() {
+            0
+        } else {
+            // SAFETY: приёмник — только что обнулённая память внутри нашего
+            // блока, места под `segments.len()` элементов хватает по расчёту
+            // выше, выравнивание обеспечено `segments_offset`. Источник — срез
+            // в стеке загрузчика, пересечься с блоком он не может.
+            unsafe {
+                core::ptr::copy_nonoverlapping(segments.as_ptr(), segments_ptr, segments.len());
+            }
+            segments_ptr as usize as u64
+        };
+
+        // SAFETY: `info_ptr` указывает на записанный выше `BootInfo` внутри
+        // нашего блока; поле дописывается по месту, потому что адрес карты
+        // становится известен только сейчас.
+        unsafe {
+            (*info_ptr).kernel.segments_ptr = segments_addr;
+            (*info_ptr).kernel.segments_len = segments.len() as u64;
+        }
+
         // SAFETY: `regions_offset + capacity * size_of::<MemoryRegion>() <=
         // pages * PAGE_SIZE`, значит указатель остаётся внутри аллокации.
         let regions_ptr = unsafe { raw.add(regions_offset) }.cast::<MemoryRegion>();
@@ -163,6 +215,7 @@ impl Handoff {
             // SAFETY: `allocate_pages` не возвращает нулевой адрес (крейт
             // отдельно это гарантирует), а смещение не выводит за аллокацию.
             info: unsafe { NonNull::new_unchecked(info_ptr) },
+            segments: segments_addr,
             regions: unsafe { NonNull::new_unchecked(regions_ptr) },
             capacity,
         })
@@ -171,6 +224,11 @@ impl Handoff {
     /// Адрес `BootInfo` в памяти, переживающей выход из boot services.
     pub fn info_address(&self) -> u64 {
         self.info.as_ptr() as usize as u64
+    }
+
+    /// Адрес скопированной карты сегментов, либо `0`, если она пуста.
+    pub fn segments_address(&self) -> u64 {
+        self.segments
     }
 }
 

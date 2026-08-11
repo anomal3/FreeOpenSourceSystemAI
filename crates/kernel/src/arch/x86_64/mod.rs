@@ -1,4 +1,8 @@
-//! x86_64: UART 16550 на COM1 и остановка процессора.
+//! x86_64: UART 16550 на COM1, остановка процессора и страничная трансляция.
+
+pub mod paging;
+
+pub use paging::{PageTable, build_kernel_address_space, switch_stack};
 
 use crate::serial::SerialDevice;
 use boot_info::Arch;

@@ -35,14 +35,20 @@
 
 mod arch;
 mod console;
+mod mm;
 mod print;
 mod serial;
 mod sync;
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use boot_info::{BOOT_INFO_MAGIC, BOOT_INFO_REVISION, BootInfo, MemoryKind, MemoryMap};
 use core::mem::{align_of, size_of};
 use core::panic::PanicInfo;
 use core::ptr;
+
+use crate::mm::{AddressSpace, VirtAddr};
 
 /// Точка входа ядра на x86-64.
 ///
@@ -97,9 +103,195 @@ fn start(boot_info: *const BootInfo) -> ! {
     banner(&info, boot_info as usize);
     dump_memory_map(&info.memory_map);
 
+    // С этого момента памятью распоряжается ядро, а не прошивка.
+    take_over_memory(&info);
+
+    // Переключение на собственный стек — последнее, что делается на стеке
+    // загрузчика. Дальше в `info` заглядывать нельзя: это копия, лежащая на
+    // покидаемом стеке. Поэтому продолжению уезжает физический адрес исходной
+    // структуры, а не ссылка на копию.
+    //
+    // SAFETY: `STACK_TOP` — вершина области, которую `build_kernel_address_space`
+    // только что отобразил на запись, а `resume_on_kernel_stack` — обычная
+    // функция ядра, лежащая в исполняемом сегменте.
+    unsafe {
+        arch::switch_stack(
+            VirtAddr::new(mm::STACK_TOP),
+            resume_on_kernel_stack,
+            boot_info as usize,
+        )
+    }
+}
+
+/// Забрать управление памятью у прошивки: пул кадров, собственные таблицы
+/// страниц с W^X и куча.
+///
+/// Порядок шагов здесь не переставляется. Пул кадров нужен раньше таблиц,
+/// потому что таблицы из него и строятся. Куча инициализируется последней:
+/// её диапазон становится доступным только после того, как процессор
+/// переключён на новые таблицы.
+fn take_over_memory(info: &BootInfo) {
     kprintln!();
-    kprintln!("Phase 1 complete: nothing left to do. CPU halted.");
+    kprintln!("---- memory subsystem -------------------------------------------");
+
+    // SAFETY: карта памяти приехала от загрузчика и уже проверена вместе с
+    // остальным хэндоффом; аллокатор инициализируется ровно один раз.
+    let stats = match unsafe { mm::frame::init(info) } {
+        Ok(stats) => stats,
+        Err(err) => {
+            kprintln!("FATAL: frame allocator init failed: {err:?}");
+            arch::halt();
+        }
+    };
+    kprintln!(
+        "  frames      : {} total, {} free ({} MiB usable)",
+        stats.total,
+        stats.free,
+        stats.free_bytes() / (1024 * 1024)
+    );
+
+    let space: Option<Result<arch::KernelSpace, arch::SpaceError>> =
+        mm::frame::with(|frames| arch::build_kernel_address_space(info, frames));
+    let space = match space {
+        Some(Ok(space)) => space,
+        Some(Err(err)) => {
+            kprintln!("FATAL: building the kernel address space failed: {err:?}");
+            arch::halt();
+        }
+        None => {
+            kprintln!("FATAL: frame allocator unavailable while building page tables");
+            arch::halt();
+        }
+    };
+    kprintln!("  page tables : root at {:?}", space.root());
+
+    // Точка невозврата номер два за загрузку: со следующей инструкции трансляцию
+    // адресов определяют наши таблицы, а не прошивочные. Если в них чего-то не
+    // хватает — кода, стека или UART, — отказ произойдёт молча и немедленно.
+    //
+    // SAFETY: адресное пространство содержит identity-отображение всей
+    // физической памяти, поэтому и текущий код, и текущий стек остаются
+    // доступными по тем же адресам.
+    unsafe { space.activate() };
+    kprintln!("  page tables : active, W^X applied to the kernel image");
+
+    probe_framebuffer(info);
+
+    // Физическая память теперь доступна и через прямое отображение; аллокатор
+    // переводится на него, чтобы пережить снятие identity в следующей фазе.
+    // SAFETY: `build_kernel_address_space` отобразил всю описанную картой
+    // физическую память по `PHYS_MAP_BASE`, а таблицы уже активны.
+    unsafe { mm::frame::use_direct_map() };
+
+    // SAFETY: диапазон кучи отображён на запись и подкреплён отдельными
+    // кадрами; вызывается однократно и только после активации таблиц.
+    match unsafe { mm::heap::init() } {
+        Ok(stats) => kprintln!(
+            "  heap        : {} MiB at {:#018x} ({} bytes free)",
+            mm::HEAP_SIZE / (1024 * 1024),
+            mm::HEAP_BASE,
+            stats.free
+        ),
+        Err(err) => {
+            kprintln!("FATAL: heap init failed: {err:?}");
+            arch::halt();
+        }
+    }
+}
+
+/// Убедиться, что фреймбуфер пережил переключение на собственные таблицы.
+///
+/// Проверка не декоративная: экранная консоль пишет по физическому адресу,
+/// который до активации давало отображение прошивки. Если новое отображение
+/// уводит этот адрес в другое место, записи будут молча уходить в никуда — на
+/// экране останется последний кадр, нарисованный до переключения, и выглядеть
+/// это будет как «ядро зависло», хотя serial продолжит работать.
+fn probe_framebuffer(info: &BootInfo) {
+    let fb = &info.framebuffer;
+    if !fb.is_present() {
+        return;
+    }
+    // Проверяются начало, середина и конец: если отображён лишь первый кусок
+    // буфера, запись в пиксель (0,0) пройдёт, а нижние строки экрана окажутся
+    // недостижимы — ровно тот случай, который выглядит как «консоль замерла».
+    let words = (fb.size / 4).max(1);
+    let probes = [0usize, (words / 2) as usize, (words - 1) as usize];
+    let mut failures = 0;
+
+    for offset in probes {
+        let ptr = unsafe { (fb.base as *mut u32).add(offset) };
+        // SAFETY: смещение лежит внутри буфера, длину которого сообщил
+        // загрузчик, а диапазон только что отображён на запись. Значение
+        // восстанавливается, поэтому картинка не портится. `volatile`
+        // обязателен: это память устройства.
+        let readback = unsafe {
+            let saved = ptr.read_volatile();
+            ptr.write_volatile(0x00FF_00FF);
+            let readback = ptr.read_volatile();
+            ptr.write_volatile(saved);
+            readback
+        };
+        if readback != 0x00FF_00FF {
+            failures += 1;
+            kprintln!("  framebuffer : word {offset} unreachable (read {readback:#010x})");
+        }
+    }
+
+    if failures == 0 {
+        kprintln!("  framebuffer : writable end to end after the switch");
+    }
+}
+
+/// Продолжение, исполняемое уже на собственном стеке ядра.
+///
+/// Стек загрузчика к этому моменту покинут: он лежит в памяти, помеченной
+/// `BootloaderReclaimable`, и ядро вправе её переиспользовать.
+extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
+    // Копия `BootInfo` осталась на старом стеке, поэтому структура читается
+    // заново по исходному физическому адресу — он по-прежнему отображён.
+    // SAFETY: адрес прошёл полную проверку в `validate` до переключения стека,
+    // а память под ним отображена как `BootloaderReclaimable` и пока цела.
+    let info = unsafe { ptr::read(boot_info as *const BootInfo) };
+
+    kprintln!();
+    kprintln!("---- running on the kernel's own stack --------------------------");
+    kprintln!("  stack top   : {:#018x}", mm::STACK_TOP);
+    kprintln!("  guard page  : {:#018x} (unmapped)", mm::STACK_TOP - mm::STACK_SIZE - mm::PAGE_SIZE);
+
+    verify_heap();
+
+    let stats = mm::frame::stats();
+    kprintln!();
+    kprintln!(
+        "  frames used : {} of {} ({} MiB still free)",
+        stats.used(),
+        stats.total,
+        stats.free_bytes() / (1024 * 1024)
+    );
+    if info.framebuffer.is_present() {
+        kprintln!("  framebuffer : still reachable at {:#018x}", info.framebuffer.base);
+    }
+
+    kprintln!();
+    kprintln!("Phase 2 complete: memory is under kernel control. CPU halted.");
     arch::halt();
+}
+
+/// Проверить, что куча действительно работает.
+///
+/// Аллокации здесь не декоративные: до этого момента ни одна строчка ядра не
+/// пользовалась `alloc`, и первая же настоящая аллокация — самый дешёвый способ
+/// убедиться, что диапазон кучи отображён на разные физические кадры, а не на
+/// один и тот же.
+fn verify_heap() {
+    let mut values: Vec<u64> = Vec::new();
+    for i in 0..1024 {
+        values.push(i * i);
+    }
+    let sum: u64 = values.iter().sum();
+
+    let text = alloc::format!("{} values, checksum {:#x}", values.len(), sum);
+    kprintln!("  heap check  : {text}");
 }
 
 /// Проверить хэндофф и вернуть **копию** [`BootInfo`].
@@ -165,7 +357,7 @@ fn validate(raw: *const BootInfo) -> Option<BootInfo> {
 /// Баннер: кто стартовал и что именно приехало в `BootInfo`.
 fn banner(info: &BootInfo, addr: usize) {
     kprintln!("================================================================");
-    kprintln!(" FreeOS kernel v{} - Phase 1 bring-up", env!("CARGO_PKG_VERSION"));
+    kprintln!(" FreeOS kernel v{} - Phase 2 bring-up", env!("CARGO_PKG_VERSION"));
     kprintln!(" architecture : {}", arch::ARCH_NAME);
     kprintln!("================================================================");
     kprintln!("BootInfo @ {addr:#018x}");

@@ -16,7 +16,10 @@ pub const BOOT_INFO_MAGIC: u64 = 0x4652_4545_4F53_0001;
 
 /// Incremented whenever [`BootInfo`] changes shape. The kernel refuses to boot
 /// on a mismatch instead of silently reading garbage from an older bootloader.
-pub const BOOT_INFO_REVISION: u32 = 1;
+///
+/// Revision 2 added [`BootInfo::kernel`], which the kernel needs to apply W^X
+/// to its own image.
+pub const BOOT_INFO_REVISION: u32 = 2;
 
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
@@ -164,11 +167,98 @@ pub struct BootInfo {
     pub arch: Arch,
     pub framebuffer: Framebuffer,
     pub memory_map: MemoryMap,
+    /// Where the kernel image was placed, and its per-segment permissions.
+    pub kernel: KernelImage,
     /// Physical address of the ACPI RSDP, or `0` if the firmware exposed none.
     pub acpi_rsdp: u64,
     /// Physical address of a flattened device tree, or `0` if none. Reserved
     /// for ARM platforms whose firmware provides DTB instead of ACPI.
     pub device_tree: u64,
+}
+
+/// Segment is readable.
+pub const SEG_READ: u32 = 1 << 0;
+/// Segment is writable.
+pub const SEG_WRITE: u32 = 1 << 1;
+/// Segment holds executable code.
+pub const SEG_EXEC: u32 = 1 << 2;
+
+/// One loaded segment of the kernel image, with the permissions the ELF asked
+/// for.
+///
+/// The kernel cannot derive these itself: it is linked without a linker script,
+/// so it has no `__text_start`-style symbols to consult. The bootloader, on the
+/// other hand, has already parsed the program headers and knows exactly which
+/// bytes are code and which are data — so it passes that knowledge along rather
+/// than making the kernel rediscover it.
+///
+/// Without this, the only way to build page tables would be to map the whole
+/// image writable *and* executable, which is precisely the W^X violation the
+/// mapping is supposed to prevent.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct KernelSegment {
+    /// Address in memory after placement and relocation, rounded down to a page.
+    pub base: u64,
+    /// Length in bytes, rounded up to a whole number of pages.
+    pub len: u64,
+    /// Any combination of [`SEG_READ`], [`SEG_WRITE`], [`SEG_EXEC`].
+    pub flags: u32,
+    _reserved: u32,
+}
+
+impl KernelSegment {
+    #[must_use]
+    pub const fn new(base: u64, len: u64, flags: u32) -> Self {
+        Self { base, len, flags, _reserved: 0 }
+    }
+
+    #[must_use]
+    pub const fn is_executable(&self) -> bool {
+        self.flags & SEG_EXEC != 0
+    }
+
+    #[must_use]
+    pub const fn is_writable(&self) -> bool {
+        self.flags & SEG_WRITE != 0
+    }
+}
+
+/// Where the kernel image ended up, and how its segments want to be protected.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct KernelImage {
+    /// Lowest address of the placed image.
+    pub base: u64,
+    /// Total span in bytes, covering every segment and any padding between them.
+    pub size: u64,
+    /// Physical address of a [`KernelSegment`] array, or `0` if none was passed.
+    pub segments_ptr: u64,
+    /// Number of entries in that array.
+    pub segments_len: u64,
+}
+
+impl KernelImage {
+    pub const EMPTY: Self = Self { base: 0, size: 0, segments_ptr: 0, segments_len: 0 };
+
+    /// # Safety
+    ///
+    /// Same conditions as [`MemoryMap::as_slice`]: the array must still be
+    /// mapped at `segments_ptr` and its memory not yet reclaimed.
+    #[must_use]
+    pub unsafe fn segments(&self) -> &[KernelSegment] {
+        if self.segments_ptr == 0 || self.segments_len == 0 {
+            return &[];
+        }
+        // SAFETY: the caller guarantees the array is still live and correctly
+        // aligned for `segments_len` entries.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.segments_ptr as *const KernelSegment,
+                self.segments_len as usize,
+            )
+        }
+    }
 }
 
 /// Сигнатура точки входа ядра.
@@ -204,6 +294,7 @@ impl BootInfo {
             arch,
             framebuffer: Framebuffer::NONE,
             memory_map: MemoryMap::EMPTY,
+            kernel: KernelImage::EMPTY,
             acpi_rsdp: 0,
             device_tree: 0,
         }

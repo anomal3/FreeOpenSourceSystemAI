@@ -16,6 +16,7 @@
 //! `.rela.dyn` — без их применения оно разыменует нули и упадёт на первой же
 //! статической структуре.
 
+use boot_info::{KernelSegment, SEG_EXEC, SEG_READ, SEG_WRITE};
 use uefi::boot::{self, AllocateType, MemoryType, PAGE_SIZE};
 use uefi::println;
 
@@ -56,6 +57,14 @@ const RELA_SIZE: usize = 24;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 
+// Биты `p_flags`. Порядок обратен привычному по `readelf` написанию «RWX»:
+// младший бит — исполнение, старший — чтение. Перепутать их легко, а цена
+// ошибки высока: `.text` уехал бы в ядро как записываемый, а `.data` — как
+// исполняемый, то есть W^X превратился бы в свою противоположность.
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
+
 const DT_NULL: i64 = 0;
 const DT_RELA: i64 = 7;
 const DT_RELASZ: i64 = 8;
@@ -70,7 +79,7 @@ const DT_RELR: i64 = 36;
 const MAX_REPORTED_RELOCS: usize = 8;
 
 /// Результат размещения ядра в памяти.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct LoadedKernel {
     /// Физический адрес начала выделенного блока (кратен странице).
     pub base: u64,
@@ -78,6 +87,8 @@ pub struct LoadedKernel {
     pub size: u64,
     /// Точка входа: `load_bias + e_entry`.
     pub entry: u64,
+    /// Карта прав на образ: по записи на страничный диапазон.
+    segments: SegmentList,
 }
 
 impl LoadedKernel {
@@ -85,15 +96,22 @@ impl LoadedKernel {
     pub const fn end(&self) -> u64 {
         self.base + self.size
     }
+
+    /// Сегменты образа с правами из ELF, отсортированные и без пересечений.
+    pub fn segments(&self) -> &[KernelSegment] {
+        self.segments.as_slice()
+    }
 }
 
-/// Разобранный program header, из которого нам интересно всё, кроме флагов.
+/// Разобранный program header.
 #[derive(Debug, Clone, Copy)]
 struct ProgramHeader {
     /// Номер в таблице исходного файла — чтобы диагностика указывала на то же
     /// место, что и `readelf -l`.
     index: usize,
     ty: u32,
+    /// `p_flags`: комбинация [`PF_R`], [`PF_W`], [`PF_X`].
+    flags: u32,
     offset: u64,
     vaddr: u64,
     filesz: u64,
@@ -136,6 +154,8 @@ pub fn load(image: &[u8]) -> Result<LoadedKernel, Aborted> {
     copy_segments(image, &segments, bias)?;
     apply_relocations(&segments, bias, base, size)?;
 
+    let permissions = build_segments(&segments, bias, base, size)?;
+
     let entry = bias.wrapping_add(header.entry);
     if entry < base || entry >= base + size {
         println!(
@@ -146,7 +166,7 @@ pub fn load(image: &[u8]) -> Result<LoadedKernel, Aborted> {
 
     println!("  [elf] entry point {entry:#018x} (e_entry {:#x} + bias)", header.entry);
 
-    Ok(LoadedKernel { base, size, entry })
+    Ok(LoadedKernel { base, size, entry, segments: permissions })
 }
 
 /// То, что нам нужно из `Elf64_Ehdr`.
@@ -237,6 +257,7 @@ fn parse_program_headers(image: &[u8], header: &Header) -> Result<PhdrList, Abor
         let ph = ProgramHeader {
             index,
             ty: u32_at(raw, 0).ok_or(Aborted)?,
+            flags: u32_at(raw, 4).ok_or(Aborted)?,
             offset: u64_at(raw, 8).ok_or(Aborted)?,
             vaddr: u64_at(raw, 16).ok_or(Aborted)?,
             filesz: u64_at(raw, 32).ok_or(Aborted)?,
@@ -561,6 +582,232 @@ fn read_image(addr: u64, len: u64, base: u64, size: u64) -> Option<&'static [u8]
     Some(unsafe { core::slice::from_raw_parts(addr as *const u8, len) })
 }
 
+// --- Карта прав на образ ----------------------------------------------------
+
+/// Строковое представление прав сегмента в порядке `RWX`.
+///
+/// Индекс собирается из битов `SEG_READ | SEG_WRITE | SEG_EXEC`, которые как
+/// раз равны 1, 2 и 4, поэтому таблица индексируется значением флагов напрямую.
+pub fn perms(flags: u32) -> &'static str {
+    const NAMES: [&str; 8] = ["---", "R--", "-W-", "RW-", "--X", "R-X", "-WX", "RWX"];
+    NAMES[(flags & (SEG_READ | SEG_WRITE | SEG_EXEC)) as usize]
+}
+
+/// Переводит `p_flags` program header'а в флаги [`KernelSegment`].
+fn seg_flags(p_flags: u32) -> u32 {
+    let mut flags = 0;
+    if p_flags & PF_R != 0 {
+        flags |= SEG_READ;
+    }
+    if p_flags & PF_W != 0 {
+        flags |= SEG_WRITE;
+    }
+    if p_flags & PF_X != 0 {
+        flags |= SEG_EXEC;
+    }
+    flags
+}
+
+/// Строит карту прав на размещённый образ: по записи на каждый `PT_LOAD`,
+/// с адресами после релокации и границами, выровненными на страницу.
+///
+/// # Почему выравнивание на страницу — опасное место
+///
+/// Права в таблицах страниц применяются только целыми страницами, поэтому
+/// начало сегмента приходится округлять вниз, а конец — вверх. Если после
+/// такого округления хвост `.text` и начало `.data` попадают на одну и ту же
+/// страницу, никакой набор битов не удовлетворит обоих: страница обязана быть
+/// одновременно исполняемой и записываемой. Объединение прав («так точно
+/// заработает») даёт ровно RWX — то есть W^X молча вырождается именно там, где
+/// он нужнее всего, и никто об этом не узнает.
+///
+/// Развести такие сегменты загрузчик не может: сдвиг одного из них относительно
+/// остальных сломал бы PC-относительные ссылки внутри образа, а они уже
+/// зафиксированы компилятором. Поэтому конфликт разрешается явно: пересечение
+/// выделяется в отдельную запись с объединёнными правами, а в консоль уходит
+/// предупреждение с точным диапазоном страниц.
+///
+/// На практике конфликта нет: `-z max-page-size=4096` заставляет lld разносить
+/// `PT_LOAD` с разными правами по разным страницам (соседние сегменты стыкуются
+/// ровно по границе). Проверка оставлена потому, что это свойство раскладки
+/// линкера, а не гарантия формата: смена флагов линковки способна вернуть
+/// конфликт, и тогда он должен быть виден, а не подразумеваться.
+fn build_segments(
+    headers: &PhdrList,
+    bias: u64,
+    base: u64,
+    size: u64,
+) -> Result<SegmentList, Aborted> {
+    let page = PAGE_SIZE as u64;
+    let mut raw = SegmentList::new();
+
+    for ph in headers.iter().filter(|ph| ph.ty == PT_LOAD) {
+        let index = ph.index;
+        if ph.memsz == 0 {
+            continue;
+        }
+
+        let start = bias.wrapping_add(ph.vaddr);
+        let Some(end) = start
+            .checked_add(ph.memsz)
+            .and_then(|end| end.checked_next_multiple_of(page))
+        else {
+            println!("  [elf] segment {index}: end address overflows when rounded up to a page");
+            return Err(Aborted);
+        };
+        let start = start & !(page - 1);
+
+        // Округление не имеет права вывести сегмент за пределы блока: и
+        // `span()`, и `allocate()` уже работают в страничных границах, так что
+        // нарушение здесь означало бы ошибку в расчёте `bias`.
+        if start < base || end > base + size {
+            println!(
+                "  [elf] segment {index}: page range {start:#018x}..{end:#018x} escapes the image {base:#018x}..{:#018x}",
+                base + size
+            );
+            return Err(Aborted);
+        }
+
+        if raw.push(KernelSegment::new(start, end - start, seg_flags(ph.flags))).is_err() {
+            println!("  [elf] more than {} loadable segments", SegmentList::CAPACITY);
+            return Err(Aborted);
+        }
+    }
+
+    // Program headers обычно уже идут по возрастанию p_vaddr, но формат этого
+    // не требует, а весь дальнейший разбор пересечений опирается на порядок.
+    raw.as_mut_slice().sort_unstable_by_key(|seg| seg.base);
+
+    resolve_overlaps(raw.as_slice(), page)
+}
+
+/// Сливает соседей с одинаковыми правами и разбирает страницы, на которые
+/// претендуют сегменты с разными правами. Вход обязан быть отсортирован.
+fn resolve_overlaps(sorted: &[KernelSegment], page: u64) -> Result<SegmentList, Aborted> {
+    let mut out = SegmentList::new();
+
+    for &seg in sorted {
+        let seg_end = seg.base + seg.len;
+
+        let Some(last) = out.last() else {
+            out.push(seg).map_err(|()| overflow())?;
+            continue;
+        };
+        let last_end = last.base + last.len;
+
+        // Одинаковые права — одна запись, если сегменты стыкуются или
+        // пересекаются: ядру проще пройти по короткому списку, а разбиение
+        // данных на несколько `PT_LOAD` линкер делает регулярно. Через дырку
+        // не сливаем: страницы между сегментами прав получать не должны.
+        if last.flags == seg.flags && seg.base <= last_end {
+            out.set_last_end(last_end.max(seg_end));
+            continue;
+        }
+
+        if seg.base >= last_end {
+            out.push(seg).map_err(|()| overflow())?;
+            continue;
+        }
+
+        let shared_end = last_end.min(seg_end);
+        let merged = last.flags | seg.flags;
+        println!(
+            "  [elf] WARNING: pages {:#018x}..{shared_end:#018x} are claimed by both a {} and a {} segment",
+            seg.base,
+            perms(last.flags),
+            perms(seg.flags)
+        );
+        println!(
+            "  [elf] WARNING: {} page(s) must become {} -- W^X does not hold there; relink with -z max-page-size=4096",
+            (shared_end - seg.base) / page,
+            perms(merged)
+        );
+
+        // Предыдущая запись усекается до начала общих страниц; если от неё
+        // ничего не осталось, она целиком поглощена пересечением.
+        out.set_last_end(seg.base);
+        out.push(KernelSegment::new(seg.base, shared_end - seg.base, merged))
+            .map_err(|()| overflow())?;
+
+        // Хвост той из двух записей, что кончается позже. Из
+        // `shared_end = min(last_end, seg_end)` следует, что продолжение
+        // существует не более чем у одной из них, так что порядок по адресу
+        // сохраняется сам собой.
+        let tail = if last_end > shared_end {
+            KernelSegment::new(shared_end, last_end - shared_end, last.flags)
+        } else {
+            KernelSegment::new(shared_end, seg_end.saturating_sub(shared_end), seg.flags)
+        };
+        out.push(tail).map_err(|()| overflow())?;
+    }
+
+    Ok(out)
+}
+
+fn overflow() -> Aborted {
+    println!(
+        "  [elf] the segment map does not fit into {} entries",
+        SegmentList::CAPACITY
+    );
+    Aborted
+}
+
+/// Карта прав фиксированной ёмкости.
+///
+/// Ёмкость с запасом вдвое от числа program headers: разбор конфликта прав
+/// заменяет две записи на три.
+#[derive(Clone, Copy)]
+struct SegmentList {
+    items: [KernelSegment; Self::CAPACITY],
+    len: usize,
+}
+
+impl SegmentList {
+    const CAPACITY: usize = PhdrList::CAPACITY * 2;
+
+    const fn new() -> Self {
+        const EMPTY: KernelSegment = KernelSegment::new(0, 0, 0);
+        Self { items: [EMPTY; Self::CAPACITY], len: 0 }
+    }
+
+    fn push(&mut self, seg: KernelSegment) -> Result<(), ()> {
+        if seg.len == 0 {
+            return Ok(());
+        }
+        if self.len == Self::CAPACITY {
+            return Err(());
+        }
+        self.items[self.len] = seg;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn last(&self) -> Option<KernelSegment> {
+        self.len.checked_sub(1).map(|i| self.items[i])
+    }
+
+    /// Двигает конец последней записи. Запись нулевой длины выбрасывается:
+    /// ядру такие отдавать незачем, а пустой диапазон легко принять за ошибку.
+    fn set_last_end(&mut self, end: u64) {
+        let Some(i) = self.len.checked_sub(1) else {
+            return;
+        };
+        if end <= self.items[i].base {
+            self.len -= 1;
+        } else {
+            self.items[i].len = end - self.items[i].base;
+        }
+    }
+
+    fn as_slice(&self) -> &[KernelSegment] {
+        &self.items[..self.len]
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [KernelSegment] {
+        &mut self.items[..self.len]
+    }
+}
+
 // --- Чтение полей фиксированного размера -----------------------------------
 //
 // Через `get` + `from_le_bytes`, а не через приведение указателя к `*const
@@ -604,6 +851,7 @@ impl PhdrList {
         const EMPTY: ProgramHeader = ProgramHeader {
             index: 0,
             ty: 0,
+            flags: 0,
             offset: 0,
             vaddr: 0,
             filesz: 0,

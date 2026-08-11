@@ -82,6 +82,7 @@ pub fn build_component(component: Component, arch: Arch, release: bool) -> Resul
         // подействовал бы на весь workspace и сломал бы сборку самого xtask.
         .arg("--target")
         .arg(triple);
+    apply_build_std(&mut cmd, component);
     if release {
         cmd.arg("--release");
     }
@@ -90,6 +91,28 @@ pub fn build_component(component: Component, arch: Arch, release: bool) -> Resul
 
     let dir = paths::artifact_dir(triple, release);
     locate_artifact(&dir, component)
+}
+
+/// Досыпает `-Z build-std` при сборке ядра.
+///
+/// Ядро линкуется как PIE, а `core`/`alloc`, которые rustup поставляет уже
+/// собранными, собраны со `static` relocation-model. На aarch64 это упирается в
+/// отказ линкера: `relocation R_AARCH64_ABS64 cannot be used against local
+/// symbol` — абсолютные релокации из чужого объектника невозможно уложить в
+/// позиционно-независимый образ. Пересборка стандартных крейтов теми же
+/// rustflags, что и само ядро, снимает расхождение.
+///
+/// Флаг живёт здесь, а не в `.cargo/config.toml`, по той же причине, что и
+/// `--target`: секция `[unstable]` глобальна для workspace и применилась бы к
+/// хостовой сборке самого xtask.
+fn apply_build_std(cmd: &mut Command, component: Component) {
+    if component != Component::Kernel {
+        return;
+    }
+    cmd.arg("-Zbuild-std=core,alloc,compiler_builtins")
+        // memcpy и соседи в freestanding-окружении взять неоткуда: их даёт
+        // compiler_builtins, но только с этой фичей.
+        .arg("-Zbuild-std-features=compiler-builtins-mem");
 }
 
 /// Запускает cargo и, если он упал, дописывает к его ошибке разбор причины.
@@ -224,6 +247,7 @@ pub fn check(arches: &[Arch]) -> Result<()> {
                 .arg(package)
                 .arg("--target")
                 .arg(triple);
+            apply_build_std(&mut cmd, component);
             run_cargo(&mut cmd, "check", component, triple)?;
         }
     }

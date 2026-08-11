@@ -1,4 +1,14 @@
-//! aarch64: UART PL011 через MMIO и остановка процессора.
+//! aarch64: UART PL011 через MMIO, страничная трансляция и остановка процессора.
+
+pub mod paging;
+
+// Имена, которые `arch::mod` должен отдать наружу вместе с `ARCH_NAME`, `Serial`
+// и `halt`. Пока интеграции нет, внутри крейта их никто не читает — отсюда и
+// `allow`; снять, как только `main.rs` начнёт строить адресное пространство.
+#[allow(unused_imports)]
+pub use paging::{
+    PageTables, StackEntry, build_kernel_address_space, kernel_stack_top, switch_stack,
+};
 
 use crate::serial::SerialDevice;
 use boot_info::Arch;

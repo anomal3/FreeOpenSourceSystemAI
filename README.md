@@ -56,8 +56,19 @@ cargo xtask run --arch x86_64 --gdb   # halt before first instruction, gdbstub o
 crates/boot-info/   Stable #[repr(C)] hand-off contract: bootloader → kernel
 crates/boot-uefi/   UEFI application: GOP probe, ELF loading, ExitBootServices
 crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
+  src/mm/           Frame allocator, page-table contract, kernel heap
+  src/arch/         Everything that differs between x86-64 and AArch64
 xtask/              Host-side build / image / QEMU orchestration
 ```
+
+The kernel does **not** yet execute from the upper half. It is a PIE whose
+relocations the bootloader already applied against a physical base, so a real
+higher-half move needs either relocations computed from a virtual base (making
+page-table setup the bootloader's job) or a self-relocation pass over
+`.rela.dyn`. What exists today is a direct map of all physical memory at
+`PHYS_MAP_BASE`, in the spirit of Linux's `PAGE_OFFSET`: kernel code keeps
+running identity-mapped where its relocations are valid, while the heap, the
+stack and access to arbitrary physical pages live in the upper half.
 
 Crates arrive as the roadmap advances. The intended shape keeps every
 architecture- and board-specific decision behind a trait boundary:
@@ -78,8 +89,8 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 |---|---|---|
 | 0 | Workspace, toolchain, UEFI app boots and prints on both arches | **done** |
 | 1 | `BootInfo` hand-off, `ExitBootServices`, jump to kernel | **done** |
-| 2 | Physical frame allocator, higher-half paging with W^X, kernel heap | next |
-| 3 | Interrupts: IDT+APIC (x86), exception vectors+GIC (ARM), timer tick | |
+| 2 | Frame allocator, kernel-owned page tables with W^X, heap, own stack | **done** |
+| 3 | Interrupts: IDT+APIC (x86), exception vectors+GIC (ARM), timer tick | next |
 | 4 | Cooperative scheduler, designed so preemption is an additive change | |
 | 5 | RAM-disk, VFS traits, FAT32 reader | |
 | 6 | Input & display: PS/2 first, then xHCI + USB HID boot protocol | |

@@ -30,7 +30,7 @@ mod kernel_image;
 use core::convert::Infallible;
 use core::time::Duration;
 
-use boot_info::{Arch, BootInfo, MemoryKind};
+use boot_info::{Arch, BootInfo, KernelImage, KernelSegment, MemoryKind};
 use uefi::table::cfg::ConfigTableEntry;
 use uefi::{Status, boot, entry, println, system};
 
@@ -83,7 +83,7 @@ fn main() -> Status {
 
     print_boot_info(&info);
 
-    match boot_kernel(&info) {
+    match boot_kernel(info) {
         // Ok несёт `Infallible`: успешный путь заканчивается прыжком в ядро.
         Ok(never) => match never {},
         Err(Aborted) => {
@@ -97,7 +97,7 @@ fn main() -> Status {
 
 /// Загружает ядро и передаёт ему управление. Возвращается только при ошибке:
 /// успешный путь заканчивается прыжком, поэтому `Ok` несёт [`Infallible`].
-fn boot_kernel(info: &BootInfo) -> Result<Infallible, Aborted> {
+fn boot_kernel(mut info: BootInfo) -> Result<Infallible, Aborted> {
     println!("");
     println!("---- kernel load ------------------------------------------------");
 
@@ -107,10 +107,21 @@ fn boot_kernel(info: &BootInfo) -> Result<Infallible, Aborted> {
     let kernel = elf::load(&image)?;
     drop(image);
 
+    // Куда лёг образ, ядро само выяснить не может: адрес выбрала прошивка, а
+    // права сегментов остались в program headers, которых в памяти уже нет.
+    // Указатель на карту сегментов проставит `Handoff::allocate` — она же её и
+    // копирует в память, переживающую ExitBootServices.
+    info.kernel = KernelImage {
+        base: kernel.base,
+        size: kernel.size,
+        segments_ptr: 0,
+        segments_len: 0,
+    };
+
     // Карта памяти оценивается до выделения hand-off блока, но снимается
     // окончательно только внутри ExitBootServices — см. модуль `handoff`.
     let capacity = Handoff::estimate_capacity()?;
-    let handoff = Handoff::allocate(info, capacity)?;
+    let handoff = Handoff::allocate(&info, capacity, kernel.segments())?;
 
     // Диапазоны, тип которых прошивка не знает. Образ ядра лежит в LOADER_DATA
     // и без подмены выглядел бы для ядра как reclaimable-память, которую можно
@@ -134,6 +145,7 @@ fn boot_kernel(info: &BootInfo) -> Result<Infallible, Aborted> {
         kernel.end()
     );
     println!("  entry point     : {:#018x}", kernel.entry);
+    print_kernel_segments(&handoff, kernel.segments());
     println!("  exiting boot services -- console output stops here");
     println!("-----------------------------------------------------------------");
 
@@ -210,6 +222,44 @@ fn print_boot_info(info: &BootInfo) {
     }
     println!("  device tree     : {:#018x}", info.device_tree);
     println!("-----------------------------------------------------------------");
+}
+
+/// Печатает карту прав, которая уходит в `BootInfo::kernel`.
+///
+/// Это единственное место, где видно, что именно ядро получит для W^X: после
+/// выхода из boot services консоли уже нет, а ядро на этом этапе умеет
+/// печатать далеко не сразу.
+fn print_kernel_segments(handoff: &Handoff, segments: &[KernelSegment]) {
+    if segments.is_empty() {
+        println!("  kernel segments : none -- the kernel will not be able to apply W^X");
+        return;
+    }
+
+    println!(
+        "  kernel segments : {} at {:#018x}",
+        segments.len(),
+        handoff.segments_address()
+    );
+    for (index, seg) in segments.iter().enumerate() {
+        println!(
+            "    seg {index}        : {:#018x}..{:#018x} {} ({} bytes)",
+            seg.base,
+            seg.base + seg.len,
+            elf::perms(seg.flags),
+            seg.len
+        );
+    }
+
+    // Страница, оказавшаяся одновременно записываемой и исполняемой, сводит
+    // W^X на нет. Причины и разбор конфликта — в `elf::build_segments`; здесь
+    // остаётся только итог, чтобы он не потерялся среди строк выше.
+    let violations = segments
+        .iter()
+        .filter(|seg| seg.is_writable() && seg.is_executable())
+        .count();
+    if violations > 0 {
+        println!("  !! {violations} segment(s) are both writable and executable -- W^X is degraded");
+    }
 }
 
 /// Держит сообщение об ошибке на экране, не блокируя автоматический прогон.
