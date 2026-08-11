@@ -2,10 +2,10 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 8a done — bring-up.** The kernel boots on both architectures, owns its
-> memory, schedules tasks, reads files from a FAT32 RAM disk, takes input from a USB
-> keyboard and runs a shell in a window of its own compositor, and the system now boots
-> from a real GPT-partitioned disk image this repo writes itself. There is no userspace
+> **Status: Phase 8 done — the MVP is complete.** A graphical installer partitions a disk
+> and installs the system onto it; the installed system boots, owns its memory, schedules
+> tasks, reads files from a FAT32 RAM disk, takes input from a USB keyboard and runs a
+> shell in a window of its own compositor — on both architectures. There is no userspace
 > yet: everything above runs in the kernel. See [Roadmap](#roadmap).
 
 ## Why
@@ -51,6 +51,9 @@ cargo xtask run --arch aarch64    # same source, ARM64
 cargo xtask run --arch x86_64 --gdb     # halt before first instruction, gdbstub on :1234
 cargo xtask run --arch x86_64 --image   # boot from a real GPT disk image, not VVFAT
 cargo xtask image --arch x86_64         # just write build/freeos-x86_64-debug.img
+
+cargo xtask install --arch x86_64       # run the installer against a blank 1 GiB disk
+cargo xtask run --arch x86_64 --installed   # boot what the installer just wrote
 ```
 
 `xtask` locates QEMU and its UEFI firmware automatically; override with the
@@ -76,12 +79,55 @@ Without a framebuffer the same shell runs on the serial console alone; graphics 
 condition for the system to work. With nobody typing, the prompt gives up after twenty
 seconds so unattended runs still terminate.
 
+## The installer
+
+A separate UEFI application, not a first-boot wizard inside the system. Partitioning is a
+pre-OS operation, and doing it from the kernel would mean trusting other people's data to
+our own not-yet-debugged disk code at the one moment when no debugger exists. Out here the
+firmware is still alive and provides Block I/O for the media, Simple Text Input for the
+keyboard and GOP for the screen.
+
+The practical consequence matters more than the principle: **the installer's readiness does
+not depend on the kernel's drivers.** Its keyboard comes from the firmware, so it would have
+worked before the kernel had USB at all.
+
+The one thing it does itself is partitioning, and that goes through `crates/disk` — the same
+code `xtask image` runs on the host under `cargo test`. Code that erases someone's disk has
+to be debugged before it reaches someone's disk.
+
+Seven screens: language (English or Russian), what will happen, target disk, account,
+keyboard layout, time zone, and only then confirmation. Confirmation is last because it is
+the single point of no return; everything you might change your mind about is asked before
+it, not after. The medium the installer itself booted from is detected by device path and
+cannot be selected — an installation USB stick and a target disk look identical on screen.
+
+It writes a GPT with an ESP (FAT32, bootloader + kernel + initrd) and a FreeOS root
+partition, which is left **without a filesystem**: FreeOS has no root filesystem yet, and
+putting FAT32 there would freeze a format with no uid, gid or mode fields — the very thing
+the custom one exists to avoid. Its first megabyte is zeroed so no stale superblock is
+mistaken for real.
+
+The account lands on the ESP as `\FREEOS\PASSWD`, with `uid`, `gid` and `mode` fields from
+day one. The password digest is **not** produced by a key derivation function: no PBKDF2,
+scrypt or Argon2 exists in this project, and pulling a crypto dependency into a UEFI
+application is a decision to take deliberately, not in passing. What is stored is a salted,
+iterated FNV-1a, and the algorithm is named in the record itself (`fnv1a64-4096`) so a real
+KDF can be added later as a second tag without a migration. It keeps the password off the
+disk in plaintext; it is not protection against an attacker, and it is labelled as such
+rather than dressed up as one.
+
+The Cyrillic in the interface is hand-drawn: `font8x8` covers ASCII, Latin, Greek, box
+drawing and hiragana, and no Cyrillic at all, so `crates/mini-ui/src/font.rs` carries 66
+glyphs written as 8x8 ASCII art — a form in which a typo is visible in the source.
+
 ## Layout
 
 ```
 crates/boot-info/   Stable #[repr(C)] hand-off contract: bootloader → kernel
 crates/boot-uefi/   UEFI application: GOP probe, ELF loading, ExitBootServices
 crates/disk/        GPT and a FAT32 formatter, no_std: host image builder + installer
+crates/mini-ui/     Surfaces, 8x8 text (ASCII + Cyrillic), widgets: kernel + installer
+crates/installer/   UEFI application: disk selection, partitioning, account, install
 crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/mm/           Frame allocator, page tables, kernel heap, DMA-coherent arena
   src/sched/        Cooperative round-robin scheduler and tasks
@@ -140,7 +186,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 6b | PCIe enumeration, xHCI host controller, USB HID boot protocol | **done** |
 | 7 | Framebuffer compositor with damage tracking, shell in a window | **done** |
 | 8a | GPT + FAT32 writer, real bootable disk image instead of VVFAT | **done** |
-| 8b | Graphical UEFI installer (disk selection, partitioning, user account) | |
+| 8b | Graphical UEFI installer (disk selection, partitioning, user account) | **done** |
 
 Phases 6 and 8 were both split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

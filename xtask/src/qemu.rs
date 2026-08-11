@@ -15,10 +15,22 @@ pub struct RunOptions {
     pub gdb: bool,
     pub serial_only: bool,
     pub reset_nvram: bool,
-    /// Грузиться с настоящего образа диска, а не с каталога через VVFAT.
-    pub image: bool,
     pub memory: String,
     pub extra: Vec<String>,
+    /// Носители машины в порядке подключения.
+    pub drives: Vec<Drive>,
+}
+
+/// Носитель, подключаемый к машине.
+pub enum Drive {
+    /// Каталог хоста, выдаваемый за FAT-раздел драйвером VVFAT.
+    ///
+    /// Никакой таблицы разделов не существует — QEMU синтезирует её на лету.
+    /// Для цикла «поправил — запустил» это лучший вариант: между правками
+    /// ничего не пересобирается.
+    HostDirectory(PathBuf),
+    /// Настоящий образ: наша разметка, наша файловая система.
+    Image(PathBuf),
 }
 
 /// Раскладывает собранные артефакты по структуре ESP и возвращает корень раздела.
@@ -38,7 +50,10 @@ pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
     std::fs::create_dir_all(&esp)
         .with_context(|| format!("не удалось создать каталог ESP {}", esp.display()))?;
 
-    for component in Component::ALL {
+    // Только компоненты системы: установщик кладётся по тому же пути, что и
+    // загрузчик (`\EFI\BOOT\BOOT*.EFI`), и попал бы сюда как «его не собирали,
+    // удалить устаревший» — то есть стёр бы только что скопированный загрузчик.
+    for component in Component::SYSTEM {
         let dst = esp.join(component.esp_path(arch));
         match built.get(component) {
             Some(src) => {
@@ -79,6 +94,14 @@ pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
     }
 
     Ok(esp)
+}
+
+/// Аргумент `file=` для носителя.
+fn drive_file(drive: &Drive) -> Result<String> {
+    match drive {
+        Drive::HostDirectory(path) => Ok(format!("fat:rw:{}", util::qemu_path(path)?)),
+        Drive::Image(path) => util::qemu_path(path),
+    }
 }
 
 /// Ищет бинарник qemu-system-* и объясняет, что делать, если его нет.
@@ -149,27 +172,18 @@ pub fn run(opts: &RunOptions, built: &Built) -> Result<()> {
     let fw = firmware::prepare(arch, &fw, opts.reset_nvram)?;
     println!("прошивка: {}", fw.description);
 
-    // Два разных носителя, и разница между ними принципиальна. VVFAT — это
-    // эмуляция: QEMU на лету выдаёт каталог хоста за FAT-раздел, никакой
-    // таблицы разделов не существует, и проверить на нём нечего, кроме самой
-    // системы. Настоящий образ проходит через нашу разметку и наш FAT, и
-    // прошивка читает именно их — то есть заодно проверяется крейт `disk`.
-    let esp_arg = if opts.image {
-        let path = crate::image::build(built)?;
-        util::qemu_path(&path)?
-    } else {
-        format!("fat:rw:{}", util::qemu_path(&prepare_esp(built)?)?)
-    };
-
     let mut cmd = Command::new(&qemu);
     cmd.current_dir(paths::workspace_root());
 
     match arch {
         Arch::X86_64 => {
             cmd.args(["-machine", "q35"]);
-            // Без if= драйв уезжает на дефолтный интерфейс машины (для q35 это
-            // AHCI) — классическая и хорошо проверенная связка OVMF + VVFAT.
-            cmd.arg("-drive").arg(format!("format=raw,file={esp_arg}"));
+            for drive in &opts.drives {
+                // Без if= драйв уезжает на дефолтный интерфейс машины (для q35
+                // это AHCI) — классическая и хорошо проверенная связка.
+                cmd.arg("-drive")
+                    .arg(format!("format=raw,file={}", drive_file(drive)?));
+            }
             // Видео на q35 есть по умолчанию (stdvga), а QemuVideoDxe в OVMF
             // отдаёт по нему GOP с честным линейным framebuffer'ом — именно то,
             // что загрузчик кладёт в boot-info. Отдельное -device не нужно.
@@ -181,11 +195,15 @@ pub fn run(opts: &RunOptions, built: &Built) -> Result<()> {
             cmd.args(["-cpu", "cortex-a72"]);
             // У virt нет ни IDE, ни AHCI: block_default_type у машины остаётся
             // IF_IDE, и голый `-drive format=raw,...` завершился бы ошибкой
-            // «machine type does not support if=ide». Поэтому подключаем диск
+            // «machine type does not support if=ide». Поэтому подключаем диски
             // явно через virtio-blk-pci (VirtioBlkDxe есть в ArmVirtQemu).
-            cmd.arg("-drive")
-                .arg(format!("if=none,id=esp,format=raw,file={esp_arg}"));
-            cmd.args(["-device", "virtio-blk-pci,drive=esp"]);
+            for (index, drive) in opts.drives.iter().enumerate() {
+                cmd.arg("-drive").arg(format!(
+                    "if=none,id=disk{index},format=raw,file={}",
+                    drive_file(drive)?
+                ));
+                cmd.args(["-device", &format!("virtio-blk-pci,drive=disk{index}")]);
+            }
             // Графика: на virt по умолчанию НЕТ видеоустройства вообще.
             //
             // Выбран ramfb, а не virtio-gpu-pci, и вот почему. В edk2 обе

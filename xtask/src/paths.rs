@@ -101,17 +101,26 @@ pub fn initrd_stamp() -> PathBuf {
 /// Профиль входит в имя: образ содержит собранные бинарники, и debug-образ
 /// рядом с release-образом под одним именем означал бы, что запуск с `-r` и без
 /// него молча подсовывают друг другу чужое ядро.
-pub fn disk_image(arch: Arch, release: bool) -> PathBuf {
+pub fn disk_image(slug: &str, arch: Arch, release: bool) -> PathBuf {
     build_dir().join(format!(
-        "freeos-{}-{}.img",
+        "{slug}-{}-{}.img",
         arch.name(),
         profile_dir_name(release)
     ))
 }
 
 /// Слепок содержимого образа, по которому решается, нужна ли пересборка.
-pub fn disk_image_stamp(arch: Arch, release: bool) -> PathBuf {
-    disk_image(arch, release).with_extension("stamp")
+pub fn disk_image_stamp(slug: &str, arch: Arch, release: bool) -> PathBuf {
+    disk_image(slug, arch, release).with_extension("stamp")
+}
+
+/// Чистый диск, на который ставит установщик.
+///
+/// В слепок не входит и не пересобирается: это носитель, а не артефакт
+/// сборки. Стереть его — отдельное осознанное действие (`--fresh`), потому что
+/// именно на нём остаётся результат прошлой установки.
+pub fn target_disk(arch: Arch) -> PathBuf {
+    build_dir().join(format!("target-{}.img", arch.name()))
 }
 
 pub fn profile_dir_name(release: bool) -> &'static str {

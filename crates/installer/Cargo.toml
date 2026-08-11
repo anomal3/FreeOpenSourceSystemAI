@@ -1,0 +1,25 @@
+[package]
+name = "installer"
+description = "Graphical UEFI installer: picks a disk, writes GPT, formats the ESP and installs FreeOS onto it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "installer"
+path = "src/main.rs"
+# Причина та же, что у boot-uefi: тестового окружения на UEFI-таргете нет.
+test = false
+bench = false
+
+[dependencies]
+boot-info = { path = "../boot-info" }
+# Разметка носителя. Тот же крейт, которым `xtask image` собирает образ на
+# хосте, — и это главное: то, что проверено `cargo test`, здесь исполняется.
+disk = { path = "../disk" }
+mini-ui = { path = "../mini-ui" }
+uefi = { version = "0.39", features = ["alloc", "global_allocator", "panic_handler"] }
+
+[lints]
+workspace = true

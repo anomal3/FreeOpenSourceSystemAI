@@ -22,6 +22,9 @@ pub struct BuildOptions {
     pub kernel: bool,
     /// Собирать образ RAM-диска (`--no-initrd` выключает).
     pub initrd: bool,
+    /// Собирать установщик. Обычному запуску он не нужен, а сборка его стоит
+    /// времени, поэтому по умолчанию выключен.
+    pub installer: bool,
 }
 
 fn cargo() -> Command {
@@ -80,6 +83,9 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
     for component in Component::ALL {
         if component == Component::Kernel && !opts.kernel {
             println!("ядро пропущено (--no-kernel)");
+            continue;
+        }
+        if component == Component::Installer && !opts.installer {
             continue;
         }
         items.push((

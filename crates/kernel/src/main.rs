@@ -43,7 +43,6 @@ mod acpi;
 mod arch;
 mod console;
 mod fs;
-mod gfx;
 mod input;
 mod irq;
 mod mm;
@@ -641,7 +640,7 @@ fn validate(raw: *const BootInfo) -> Option<BootInfo> {
 /// Баннер: кто стартовал и что именно приехало в `BootInfo`.
 fn banner(info: &BootInfo, addr: usize) {
     kprintln!("================================================================");
-    kprintln!(" FreeOS kernel v{} - Phase 7 bring-up", env!("CARGO_PKG_VERSION"));
+    kprintln!(" FreeOS kernel v{} - Phase 8 bring-up", env!("CARGO_PKG_VERSION"));
     kprintln!(" architecture : {}", arch::ARCH_NAME);
     kprintln!("================================================================");
     kprintln!("BootInfo @ {addr:#018x}");

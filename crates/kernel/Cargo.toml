@@ -17,8 +17,14 @@ bench = false
 [dependencies]
 boot-info = { path = "../boot-info" }
 # `default-features = false` drops the `std` and `unicode` features; what remains
-# is `font8x8::legacy`, a dependency-free table of `[u8; 8]` glyph rows.
+# is `font8x8::legacy`, a dependency-free table of `[u8; 8]` glyph rows. The
+# kernel still uses it directly for the boot console, which draws into the
+# framebuffer before the compositor exists.
 font8x8 = { version = "0.3.1", default-features = false }
+# Рисование: поверхности, текст и композиция. Тот же крейт использует
+# установщик — интерфейс системы и интерфейс её установки обязаны выглядеть
+# одинаково, а два набора примитивов рисования разошлись бы.
+mini-ui = { path = "../mini-ui" }
 # Куча ядра. `default-features = false` выключает `use_spin`, а с ним и
 # зависимость `spinning_top`: замок ядро ставит своё (см. `sync::Racy`), и второй
 # внутри аллокатора был бы лишним. Остаётся сам `Heap` — свободные блоки в

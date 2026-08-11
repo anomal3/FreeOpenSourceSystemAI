@@ -1,10 +1,9 @@
 //! Текст на поверхности: глифы и сетка символов с прокруткой.
 //!
-//! Растровый шрифт — тот же `font8x8`, что и у загрузочной консоли
-//! ([`crate::console`]): массив `[[u8; 8]; 128]`, по байту на строку глифа. Здесь
-//! он рисуется не в фреймбуфер, а в [`Surface`], и из этого следует всё
-//! остальное — прокрутку можно сделать сдвигом пикселей, потому что поверхность,
-//! в отличие от экрана, читается.
+//! Растровый шрифт — [`crate::font`]: массив из восьми байт на глиф, по байту
+//! на строку. Рисуется он не в фреймбуфер, а в [`Surface`], и из этого следует
+//! всё остальное — прокрутку можно сделать сдвигом пикселей, потому что
+//! поверхность, в отличие от экрана, читается.
 //!
 //! # Учёт изменённого
 //!
@@ -14,14 +13,24 @@
 //! 900×520 — разница в тридцать раз на каждое нажатие клавиши. Разница
 //! чувствуется руками: экран — память устройства, и запись в него стоит дорого.
 
-use font8x8::legacy::BASIC_LEGACY;
-
-use super::{Color, Rect, Surface};
 use alloc::vec::Vec;
 
+use crate::font;
+use crate::{Color, Rect, Surface};
+
 /// Размер глифа в таблице шрифта.
-pub const GLYPH_W: u32 = 8;
-pub const GLYPH_H: u32 = 8;
+pub const GLYPH_W: u32 = font::GLYPH_W;
+pub const GLYPH_H: u32 = font::GLYPH_H;
+
+/// Ширина строки в пикселях при заданном масштабе.
+///
+/// Считается по символам, а не по байтам: в UTF-8 кириллическая буква занимает
+/// два байта, и надпись, отцентрованная по длине строки в байтах, уехала бы
+/// ровно вдвое.
+#[must_use]
+pub fn width_of(text: &str, scale: u32) -> u32 {
+    text.chars().count() as u32 * GLYPH_W * scale
+}
 
 /// Нарисовать один глиф.
 ///
@@ -33,21 +42,18 @@ pub fn draw_glyph(
     surface: &mut Surface,
     x: u32,
     y: u32,
-    byte: u8,
+    ch: char,
     scale: u32,
     fg: Color,
     bg: Option<Color>,
 ) {
-    // Таблица покрывает только ASCII; всё прочее показываем как '?', чтобы не
-    // молчать о потерянном символе.
-    let index = if byte < 0x80 { byte } else { b'?' };
-    let glyph = BASIC_LEGACY[index as usize];
+    let glyph = font::glyph(ch);
     let fg = fg.pixel();
     let bg = bg.map(Color::pixel);
 
     for (gy, bits) in glyph.iter().copied().enumerate() {
         for gx in 0..GLYPH_W {
-            // В font8x8 младший бит байта — самый ЛЕВЫЙ пиксель строки (формат
+            // Младший бит байта — самый ЛЕВЫЙ пиксель строки (формат
             // унаследован от C-заголовка font8x8_basic.h), поэтому сдвигаем
             // вправо на номер столбца, а не на 7 - столбец.
             let lit = (bits >> gx) & 1 != 0;
@@ -80,8 +86,7 @@ pub fn draw_text(
 ) -> Rect {
     let mut cursor = x;
     for ch in text.chars() {
-        let byte = if (0x20..0x7F).contains(&(ch as u32)) { ch as u8 } else { b'?' };
-        draw_glyph(surface, cursor, y, byte, scale, fg, bg);
+        draw_glyph(surface, cursor, y, ch, scale, fg, bg);
         cursor += GLYPH_W * scale;
     }
     Rect::new(x as i32, y as i32, cursor - x, GLYPH_H * scale)
@@ -96,6 +101,10 @@ pub struct TextGrid {
     scale: u32,
     /// Что сейчас в каждой ячейке. Нужно для прокрутки и для восстановления
     /// того, что было под курсором.
+    ///
+    /// Байты, а не символы: сетку заполняет терминал, а он работает с потоком
+    /// ASCII. Байт на ячейку вместо четырёх — это не экономия ради экономии, а
+    /// разница в теневом буфере на экран 200×60.
     cells: Vec<u8>,
     col: u32,
     row: u32,
@@ -214,7 +223,10 @@ impl TextGrid {
     /// Подчёркивание, а не заливка ячейки: блок скрыл бы символ под собой, а
     /// курсор стоит именно там, где только что напечатан символ.
     fn draw_cursor(&mut self, surface: &mut Surface) {
-        if !self.cursor_enabled || self.cursor_drawn || self.col >= self.cols || self.row >= self.rows
+        if !self.cursor_enabled
+            || self.cursor_drawn
+            || self.col >= self.cols
+            || self.row >= self.rows
         {
             return;
         }
@@ -246,7 +258,7 @@ impl TextGrid {
             surface,
             cell.x as u32,
             cell.y as u32,
-            byte,
+            char::from(byte),
             self.scale,
             self.fg,
             Some(self.bg),

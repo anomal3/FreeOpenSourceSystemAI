@@ -10,7 +10,7 @@
 //! # Что делает композитор
 //!
 //! Три вещи, и все три — следствие того, что экран дорог на запись и невозможен
-//! на чтение (см. [`crate::gfx`]):
+//! на чтение (см. [`mini_ui`]):
 //!
 //! * **порядок**: окна лежат списком снизу вверх, и то, что выше, закрывает то,
 //!   что ниже;
@@ -35,8 +35,9 @@
 
 use alloc::vec::Vec;
 
-use crate::gfx::text::{self, TextGrid};
-use crate::gfx::{Color, Rect, Screen, Surface};
+use mini_ui::text::{self, TextGrid};
+use mini_ui::{Color, Rect, Screen, Surface};
+
 use crate::sync::SpinLock;
 
 // ---------------------------------------------------------------------------

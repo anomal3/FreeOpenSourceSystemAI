@@ -160,18 +160,31 @@ pub const INITRD_ESP_FILE: &str = "initrd.img";
 pub enum Component {
     BootUefi,
     Kernel,
+    Installer,
 }
 
 impl Component {
     /// Порядок важен: загрузчик собирается первым, потому что без него нечего
     /// запускать, и его ошибки пользователь увидит раньше.
-    pub const ALL: [Component; 2] = [Component::BootUefi, Component::Kernel];
+    pub const ALL: [Component; 3] = [
+        Component::BootUefi,
+        Component::Kernel,
+        Component::Installer,
+    ];
+
+    /// Компоненты, из которых состоит установленная система.
+    ///
+    /// Установщик в неё не входит: он живёт только на установочном носителе, и
+    /// класть его на целевой диск значило бы предлагать переустановку с уже
+    /// установленной системы.
+    pub const SYSTEM: [Component; 2] = [Component::BootUefi, Component::Kernel];
 
     /// Имя пакета для `cargo --package`.
     pub fn package(self) -> &'static str {
         match self {
             Component::BootUefi => "boot-uefi",
             Component::Kernel => "kernel",
+            Component::Installer => "installer",
         }
     }
 
@@ -180,14 +193,15 @@ impl Component {
         match self {
             Component::BootUefi => "загрузчик",
             Component::Kernel => "ядро",
+            Component::Installer => "установщик",
         }
     }
 
     /// Единственная таблица «(компонент, архитектура) -> триплет» в крейте.
     pub fn triple(self, arch: Arch) -> &'static str {
         match (self, arch) {
-            (Component::BootUefi, Arch::X86_64) => "x86_64-unknown-uefi",
-            (Component::BootUefi, Arch::Aarch64) => "aarch64-unknown-uefi",
+            (Component::BootUefi | Component::Installer, Arch::X86_64) => "x86_64-unknown-uefi",
+            (Component::BootUefi | Component::Installer, Arch::Aarch64) => "aarch64-unknown-uefi",
             (Component::Kernel, Arch::X86_64) => "x86_64-unknown-none",
             // Именно softfloat-вариант: обычный `aarch64-unknown-none` объявлен
             // hardfloat, и компилятор вправе эмитить SIMD, которую обработчик
@@ -207,19 +221,44 @@ impl Component {
         match self {
             Component::BootUefi => "boot-uefi.efi",
             Component::Kernel => "kernel",
+            Component::Installer => "installer.efi",
         }
     }
 
     /// Путь внутри ESP относительно корня раздела.
     pub fn esp_path(self, arch: Arch) -> PathBuf {
         match self {
-            Component::BootUefi => Path::new("EFI")
+            Component::BootUefi | Component::Installer => Path::new("EFI")
                 .join("BOOT")
                 .join(arch.removable_media_file()),
             Component::Kernel => PathBuf::from(KERNEL_ESP_FILE),
         }
     }
+
+    /// Путь внутри установочного носителя, откуда установщик берёт этот
+    /// компонент.
+    ///
+    /// Загрузчик лежит не по стандартному пути, потому что тот занят самим
+    /// установщиком: прошивка запускает `\EFI\BOOT\BOOT*.EFI`, и там обязан
+    /// быть тот, кто ставит систему, а не тот, кого ставят. Имена в верхнем
+    /// регистре — контракт с установщиком, который открывает ровно эти пути.
+    pub fn payload_path(self, arch: Arch) -> Option<String> {
+        match self {
+            Component::BootUefi => Some(format!(
+                "{PAYLOAD_DIR}/{}",
+                arch.removable_media_file()
+            )),
+            Component::Kernel => Some(format!("{PAYLOAD_DIR}/KERNEL.ELF")),
+            Component::Installer => None,
+        }
+    }
 }
+
+/// Каталог на установочном носителе, где лежит переносимая система.
+pub const PAYLOAD_DIR: &str = "FREEOS";
+
+/// Имя образа RAM-диска в каталоге полезной нагрузки.
+pub const PAYLOAD_INITRD: &str = "FREEOS/INITRD.IMG";
 
 impl fmt::Display for Component {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

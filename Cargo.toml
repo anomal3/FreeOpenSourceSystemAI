@@ -5,7 +5,9 @@ members = [
     "crates/boot-info",
     "crates/boot-uefi",
     "crates/disk",
+    "crates/installer",
     "crates/kernel",
+    "crates/mini-ui",
 ]
 
 # Bare-metal crates cannot be built for the host triple. A bare `cargo build`

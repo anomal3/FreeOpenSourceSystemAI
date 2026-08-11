@@ -34,15 +34,40 @@ use crate::build::Built;
 use crate::paths;
 use crate::util;
 
+/// Что за образ собирается.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Готовая система: прошивка запускает загрузчик, тот поднимает ядро.
+    System,
+    /// Установочный носитель: прошивка запускает установщик, а система лежит
+    /// рядом полезной нагрузкой.
+    Installer,
+}
+
+impl Kind {
+    /// Часть имени файла образа.
+    const fn slug(self) -> &'static str {
+        match self {
+            Kind::System => "freeos",
+            Kind::Installer => "freeos-install",
+        }
+    }
+
+    /// Метка тома ESP.
+    const fn label(self) -> &'static str {
+        match self {
+            Kind::System => "FREEOS ESP",
+            Kind::Installer => "FREEOS INST",
+        }
+    }
+}
+
 /// Ревизия способа сборки образа; входит в слепок.
 ///
 /// Слепок отслеживает содержимое, но не код этого модуля: правка геометрии
 /// меняет байты образа, не меняя ни одного входного файла, и без явного
 /// признака устаревший образ так и остался бы лежать в `build/`.
 const FORMAT_REVISION: u32 = 1;
-
-/// Метка тома ESP.
-const VOLUME_LABEL: &str = "FREEOS ESP";
 
 /// Запас на ESP сверх полезной нагрузки.
 ///
@@ -79,13 +104,13 @@ struct Payload {
 }
 
 /// Собирает образ, если он устарел, и возвращает путь к нему.
-pub fn build(built: &Built) -> Result<PathBuf> {
+pub fn build(built: &Built, kind: Kind) -> Result<PathBuf> {
     let arch = built.arch;
-    let payload = collect(built)?;
+    let payload = collect(built, kind)?;
 
-    let image_path = paths::disk_image(arch, built.release);
-    let stamp_path = paths::disk_image_stamp(arch, built.release);
-    let stamp = stamp_text(&payload);
+    let image_path = paths::disk_image(kind.slug(), arch, built.release);
+    let stamp_path = paths::disk_image_stamp(kind.slug(), arch, built.release);
+    let stamp = stamp_text(&payload, kind);
 
     // Пересборка только по изменению содержимого: образ — десятки мегабайт, и
     // формировать его на каждый запуск значит платить паузу за файлы, которые
@@ -97,7 +122,7 @@ pub fn build(built: &Built) -> Result<PathBuf> {
         return Ok(image_path);
     }
 
-    let bytes = assemble(&payload)?;
+    let bytes = assemble(&payload, kind)?;
 
     if let Some(parent) = image_path.parent() {
         fs::create_dir_all(parent)
@@ -126,25 +151,61 @@ pub fn build(built: &Built) -> Result<PathBuf> {
 }
 
 /// Читает всё, что должно попасть на ESP.
-fn collect(built: &Built) -> Result<Vec<Payload>> {
+fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
     let arch = built.arch;
     let mut payload = Vec::new();
 
-    for component in Component::ALL {
-        let Some(source) = built.get(component) else {
-            // Компонент не собирался (`--no-kernel`) — на образе его просто не
-            // будет. Это законный сценарий: ядро обязано отсутствовать так же
-            // осмысленно, как присутствовать.
-            continue;
-        };
-        payload.push(read_payload(
-            &esp_path_string(component.esp_path(arch)),
-            source,
-        )?);
-    }
+    // Разница между образами вся здесь, в путях. У системного образа загрузчик
+    // лежит по стандартному пути removable media, и прошивка запускает его. У
+    // установочного этот путь занимает установщик, а система уезжает в каталог
+    // полезной нагрузки — откуда установщик её и читает.
+    match kind {
+        Kind::System => {
+            for component in Component::SYSTEM {
+                let Some(source) = built.get(component) else {
+                    // Компонент не собирался (`--no-kernel`) — на образе его
+                    // просто не будет. Это законный сценарий: ядро обязано
+                    // отсутствовать так же осмысленно, как присутствовать.
+                    continue;
+                };
+                payload.push(read_payload(
+                    &esp_path_string(component.esp_path(arch)),
+                    source,
+                )?);
+            }
+            if let Some(source) = built.initrd() {
+                payload.push(read_payload(arch::INITRD_ESP_FILE, source)?);
+            }
+        }
+        Kind::Installer => {
+            let installer = built.get(Component::Installer).ok_or_else(|| {
+                anyhow::anyhow!("установщик не собран, а без него установочный носитель бессмыслен")
+            })?;
+            payload.push(read_payload(
+                &esp_path_string(Component::Installer.esp_path(arch)),
+                installer,
+            )?);
 
-    if let Some(source) = built.initrd() {
-        payload.push(read_payload(arch::INITRD_ESP_FILE, source)?);
+            // Установщик открывает ровно эти пути и отказывается работать,
+            // если хоть одного нет, — поэтому здесь они обязательны, в отличие
+            // от системного образа.
+            for component in Component::SYSTEM {
+                let path = component
+                    .payload_path(arch)
+                    .expect("у компонентов системы путь полезной нагрузки есть всегда");
+                let source = built.get(component).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{} не собран, а установочный носитель без него неполон",
+                        component.title()
+                    )
+                })?;
+                payload.push(read_payload(&path, source)?);
+            }
+            let initrd = built.initrd().ok_or_else(|| {
+                anyhow::anyhow!("initrd не собран, а установочный носитель без него неполон")
+            })?;
+            payload.push(read_payload(arch::PAYLOAD_INITRD, initrd)?);
+        }
     }
 
     if payload.is_empty() {
@@ -176,7 +237,7 @@ fn esp_path_string(path: PathBuf) -> String {
 }
 
 /// Формирует образ в памяти.
-fn assemble(payload: &[Payload]) -> Result<Vec<u8>> {
+fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
     let content: u64 = payload.iter().map(|file| file.data.len() as u64).sum();
     let esp_bytes = esp_size(content);
     let disk_bytes = 2 * GPT_MARGIN_BYTES + esp_bytes;
@@ -216,7 +277,7 @@ fn assemble(payload: &[Payload]) -> Result<Vec<u8>> {
         &mut dev,
         layout.esp,
         &fat32::FormatOptions {
-            label: VOLUME_LABEL,
+            label: kind.label(),
             volume_id: (seed >> 32) as u32 ^ seed as u32,
             // Фиксированная метка времени — та же причина, что и у initrd:
             // одно и то же содержимое обязано давать один и тот же образ.
@@ -302,11 +363,12 @@ fn expand(seed: u64, salt: &[u8]) -> [u8; 16] {
 /// Хранится текстом, а не одним числом, намеренно: когда образ вдруг
 /// пересобирается (или, наоборот, не пересобирается), файл слепка можно просто
 /// открыть и увидеть, что именно разошлось.
-fn stamp_text(payload: &[Payload]) -> String {
+fn stamp_text(payload: &[Payload], kind: Kind) -> String {
     let content: u64 = payload.iter().map(|file| file.data.len() as u64).sum();
     let mut text = format!(
-        "rev={FORMAT_REVISION} esp={} label={VOLUME_LABEL}\n",
-        esp_size(content)
+        "rev={FORMAT_REVISION} esp={} label={}\n",
+        esp_size(content),
+        kind.label(),
     );
     for file in payload {
         text.push_str(&format!(
@@ -319,13 +381,48 @@ fn stamp_text(payload: &[Payload]) -> String {
     text
 }
 
+/// Готовит чистый диск, на который будет ставить установщик.
+///
+/// Файл создаётся разрежённым (`set_len` не пишет ни байта) — гигабайт нулей
+/// на диске хоста ради того, чтобы установщик их перезаписал, никому не нужен.
+pub fn prepare_target(arch: Arch, size_mib: u64, fresh: bool) -> Result<PathBuf> {
+    let path = paths::target_disk(arch);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
+    }
+
+    let size = size_mib * 1024 * 1024;
+    let exists = util::file_len(&path).is_some();
+    if exists && !fresh {
+        println!("целевой диск: {} (как есть)", path.display());
+        return Ok(path);
+    }
+
+    // Пересоздание — единственная операция во всём xtask, которая уничтожает
+    // данные, поэтому она делается только по явному `--fresh` (или когда
+    // диска ещё нет) и обязательно сообщает о себе.
+    if exists {
+        println!("целевой диск: {} пересоздаётся (--fresh)", path.display());
+    }
+    let file = fs::File::create(&path)
+        .with_context(|| format!("не удалось создать целевой диск {}", path.display()))?;
+    file.set_len(size)
+        .with_context(|| format!("не удалось задать размер {size} байт для {}", path.display()))?;
+    println!("целевой диск: {} ({size_mib} МиБ, пустой)", path.display());
+    Ok(path)
+}
+
 /// Печатает, что лежит в образе и как его записать на настоящий носитель.
-pub fn describe(arch: Arch, path: &Path) {
+pub fn describe(arch: Arch, path: &Path, kind: Kind) {
     println!();
     println!("образ готов: {}", path.display());
     println!();
     println!("Запустить в эмуляторе:");
-    println!("    cargo xtask run --arch {arch} --image");
+    match kind {
+        Kind::System => println!("    cargo xtask run --arch {arch} --image"),
+        Kind::Installer => println!("    cargo xtask install --arch {arch}"),
+    }
     println!();
     println!("Записать на USB-носитель (всё, что на нём было, будет уничтожено):");
     if cfg!(windows) {
@@ -338,8 +435,15 @@ pub fn describe(arch: Arch, path: &Path) {
         );
     }
     println!();
-    println!(
-        "Образ содержит одну таблицу GPT и один раздел ESP; корневого раздела в нём нет —\n\
-         корневой ФС у системы пока тоже нет. Разметку с корневым разделом делает установщик."
-    );
+    match kind {
+        Kind::System => println!(
+            "Образ содержит одну таблицу GPT и один раздел ESP; корневого раздела в нём нет —\n\
+             корневой ФС у системы пока тоже нет. Разметку с корневым разделом делает установщик."
+        ),
+        Kind::Installer => println!(
+            "На образе лежит установщик (по стандартному пути \\EFI\\BOOT) и переносимая им\n\
+             система (в каталоге \\FREEOS). Прошивка запускает установщик, он размечает\n\
+             выбранный диск и переносит систему туда."
+        ),
+    }
 }

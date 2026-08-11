@@ -41,6 +41,8 @@ enum Command {
     Run(RunArgs),
     /// Собрать загрузочный образ диска: GPT + FAT32 ESP.
     Image(ImageArgs),
+    /// Запустить установщик в QEMU: установочный носитель плюс чистый диск.
+    Install(InstallArgs),
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -61,6 +63,9 @@ struct BuildArgs {
     /// Не собирать образ RAM-диска initrd.img.
     #[arg(long)]
     no_initrd: bool,
+    /// Собрать ещё и установщик.
+    #[arg(long)]
+    installer: bool,
 }
 
 #[derive(Args, Debug)]
@@ -92,6 +97,10 @@ struct RunArgs {
     /// хоста через VVFAT: медленнее на пересборке, но проверяет разметку.
     #[arg(long)]
     image: bool,
+    /// Грузиться с диска, на который ставил установщик, — то есть проверить
+    /// результат его работы.
+    #[arg(long, conflicts_with = "image")]
+    installed: bool,
     /// Объём памяти виртуальной машины.
     #[arg(long, default_value = "512M")]
     memory: String,
@@ -108,6 +117,34 @@ struct ImageArgs {
     /// Собирать с профилем release.
     #[arg(long, short = 'r')]
     release: bool,
+    /// Собрать установочный носитель, а не образ готовой системы.
+    #[arg(long)]
+    installer: bool,
+}
+
+#[derive(Args, Debug)]
+struct InstallArgs {
+    /// Целевая архитектура.
+    #[arg(long, short = 'a', value_enum, default_value = "x86_64")]
+    arch: Arch,
+    /// Собирать с профилем release.
+    #[arg(long, short = 'r')]
+    release: bool,
+    /// Headless-режим: только серийная консоль, без окна QEMU (для CI).
+    #[arg(long)]
+    serial_only: bool,
+    /// Пересоздать целевой диск, стерев результат прошлой установки.
+    #[arg(long)]
+    fresh: bool,
+    /// Размер целевого диска в мегабайтах.
+    #[arg(long, default_value_t = 1024)]
+    target_size: u64,
+    /// Объём памяти виртуальной машины.
+    #[arg(long, default_value = "512M")]
+    memory: String,
+    /// Дополнительные аргументы для QEMU.
+    #[arg(last = true, allow_hyphen_values = true)]
+    qemu_args: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -140,6 +177,7 @@ fn real_main() -> Result<()> {
                 release: args.release,
                 kernel: !args.no_kernel,
                 initrd: !args.no_initrd,
+                installer: args.installer,
             })?;
             print_built(&built);
         }
@@ -150,29 +188,91 @@ fn real_main() -> Result<()> {
                 release: args.release,
                 kernel: !args.no_kernel,
                 initrd: !args.no_initrd,
+                installer: false,
             })?;
             print_built(&built);
+
+            // Три источника загрузки, и разница между ними принципиальна.
+            // VVFAT — эмуляция: таблицы разделов не существует, проверить на
+            // ней нечего, кроме самой системы. Образ проходит через нашу
+            // разметку. Установленный диск не собирается вовсе — это результат
+            // работы установщика, и его загрузка проверяет именно её.
+            let drive = if args.installed {
+                let target = paths::target_disk(args.arch);
+                if !target.is_file() {
+                    anyhow::bail!(
+                        "установленного диска нет: {}\n\
+                         Сначала выполните установку:\n    \
+                         cargo xtask install --arch {}",
+                        target.display(),
+                        args.arch,
+                    );
+                }
+                qemu::Drive::Image(target)
+            } else if args.image {
+                qemu::Drive::Image(image::build(&built, image::Kind::System)?)
+            } else {
+                qemu::Drive::HostDirectory(qemu::prepare_esp(&built)?)
+            };
+
             let opts = qemu::RunOptions {
                 gdb: args.gdb,
                 serial_only: args.serial_only,
                 reset_nvram: args.reset_nvram,
-                image: args.image,
                 memory: args.memory,
                 extra: args.qemu_args,
+                drives: vec![drive],
             };
             qemu::run(&opts, &built)?;
         }
 
         Command::Image(args) => {
+            let kind = if args.installer {
+                image::Kind::Installer
+            } else {
+                image::Kind::System
+            };
             let built = build::build_all(&build::BuildOptions {
                 arch: args.arch,
                 release: args.release,
                 kernel: true,
                 initrd: true,
+                installer: args.installer,
             })?;
             print_built(&built);
-            let path = image::build(&built)?;
-            image::describe(args.arch, &path);
+            let path = image::build(&built, kind)?;
+            image::describe(args.arch, &path, kind);
+        }
+
+        Command::Install(args) => {
+            let built = build::build_all(&build::BuildOptions {
+                arch: args.arch,
+                release: args.release,
+                kernel: true,
+                initrd: true,
+                installer: true,
+            })?;
+            print_built(&built);
+
+            let media = image::build(&built, image::Kind::Installer)?;
+            let target = image::prepare_target(args.arch, args.target_size, args.fresh)?;
+
+            let opts = qemu::RunOptions {
+                gdb: false,
+                serial_only: args.serial_only,
+                reset_nvram: false,
+                memory: args.memory,
+                extra: args.qemu_args,
+                // Порядок важен: прошивка перебирает носители в порядке
+                // подключения, и загрузочный раздел есть только у первого —
+                // целевой диск на этот момент пуст.
+                drives: vec![qemu::Drive::Image(media), qemu::Drive::Image(target)],
+            };
+            qemu::run(&opts, &built)?;
+
+            println!();
+            println!("Проверить результат установки:");
+            println!("    cargo xtask run --arch {} --installed", args.arch);
         }
 
         Command::Check(args) => {
