@@ -96,6 +96,24 @@ pub fn initrd_stamp() -> PathBuf {
     build_dir().join("initrd.stamp")
 }
 
+/// Готовый загрузочный образ диска (GPT + FAT32 ESP).
+///
+/// Профиль входит в имя: образ содержит собранные бинарники, и debug-образ
+/// рядом с release-образом под одним именем означал бы, что запуск с `-r` и без
+/// него молча подсовывают друг другу чужое ядро.
+pub fn disk_image(arch: Arch, release: bool) -> PathBuf {
+    build_dir().join(format!(
+        "freeos-{}-{}.img",
+        arch.name(),
+        profile_dir_name(release)
+    ))
+}
+
+/// Слепок содержимого образа, по которому решается, нужна ли пересборка.
+pub fn disk_image_stamp(arch: Arch, release: bool) -> PathBuf {
+    disk_image(arch, release).with_extension("stamp")
+}
+
 pub fn profile_dir_name(release: bool) -> &'static str {
     if release { "release" } else { "debug" }
 }

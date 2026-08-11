@@ -284,6 +284,20 @@ pub fn check(arches: &[Arch]) -> Result<()> {
             apply_build_std(&mut cmd, component);
             run_cargo(&mut cmd, "check", component, triple)?;
         }
+
+        // `disk` собирается и хостом (сборщик образа), и UEFI-приложением
+        // установщика. Хостовую сборку проверяет `cargo check` ниже, а вот
+        // ошибку, которая проявляется только под `*-unknown-uefi` (скажем,
+        // случайную зависимость от `std`), надо ловить здесь: иначе она
+        // всплывёт при сборке установщика, то есть далеко от причины.
+        let triple = Component::BootUefi.triple(arch);
+        let mut cmd = cargo();
+        cmd.arg("check")
+            .arg("--package")
+            .arg("disk")
+            .arg("--target")
+            .arg(triple);
+        util::run(&mut cmd, &format!("cargo check (disk, {triple})"))?;
     }
 
     // Хост-часть workspace (сам xtask) проверяется без --target.

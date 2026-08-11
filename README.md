@@ -2,10 +2,11 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 7 done — bring-up.** The kernel boots on both architectures, owns its
+> **Status: Phase 8a done — bring-up.** The kernel boots on both architectures, owns its
 > memory, schedules tasks, reads files from a FAT32 RAM disk, takes input from a USB
-> keyboard and runs a shell in a window of its own compositor. There is no userspace yet:
-> everything above runs in the kernel. See [Roadmap](#roadmap).
+> keyboard and runs a shell in a window of its own compositor, and the system now boots
+> from a real GPT-partitioned disk image this repo writes itself. There is no userspace
+> yet: everything above runs in the kernel. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -47,11 +48,21 @@ winget install SoftwareFreedomConservancy.QEMU
 ```bash
 cargo xtask run --arch x86_64     # build + boot in QEMU
 cargo xtask run --arch aarch64    # same source, ARM64
-cargo xtask run --arch x86_64 --gdb   # halt before first instruction, gdbstub on :1234
+cargo xtask run --arch x86_64 --gdb     # halt before first instruction, gdbstub on :1234
+cargo xtask run --arch x86_64 --image   # boot from a real GPT disk image, not VVFAT
+cargo xtask image --arch x86_64         # just write build/freeos-x86_64-debug.img
 ```
 
 `xtask` locates QEMU and its UEFI firmware automatically; override with the
 `FREEOS_OVMF_X86_64` / `FREEOS_OVMF_AARCH64` environment variables.
+
+By default `run` hands QEMU a host directory through its VVFAT driver, which fakes a FAT
+partition — no image is rebuilt between edits, so the loop stays short. `--image` instead
+writes a genuine disk: protective MBR, GPT with both header copies, a 1 MiB-aligned ESP and
+a FAT32 volume, all produced by `crates/disk` — the same code the installer will run against
+a physical disk. What the firmware then reads is our partition table and our filesystem, so
+booting that image is itself the test. The image is byte-reproducible: identical inputs give
+an identical file, which is why "the image changed" means the content changed.
 
 Once the boot log settles, the screen turns into a desktop with two windows and the shell
 takes the keyboard: `help` lists what it answers, `ls` and `cat` read the mounted FAT32
@@ -70,6 +81,7 @@ seconds so unattended runs still terminate.
 ```
 crates/boot-info/   Stable #[repr(C)] hand-off contract: bootloader → kernel
 crates/boot-uefi/   UEFI application: GOP probe, ELF loading, ExitBootServices
+crates/disk/        GPT and a FAT32 formatter, no_std: host image builder + installer
 crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/mm/           Frame allocator, page tables, kernel heap, DMA-coherent arena
   src/sched/        Cooperative round-robin scheduler and tasks
@@ -127,12 +139,16 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 6a | Input core, PS/2 keyboard on x86-64, serial-line input on both, line editing | **done** |
 | 6b | PCIe enumeration, xHCI host controller, USB HID boot protocol | **done** |
 | 7 | Framebuffer compositor with damage tracking, shell in a window | **done** |
-| 8 | Graphical UEFI installer (GPT, ESP, user account) | |
+| 8a | GPT + FAT32 writer, real bootable disk image instead of VVFAT | **done** |
+| 8b | Graphical UEFI installer (disk selection, partitioning, user account) | |
 
-Phase 6 was split because its two halves are not the same size. PS/2 is two I/O ports and a
-scancode table; a host-side USB stack is PCIe enumeration, DMA-coherent allocation, transfer
-rings and device enumeration. Keeping them in one commit would have meant shipping a first
-half nobody could run.
+Phases 6 and 8 were both split, for the same reason: their halves are not the same size.
+PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe
+enumeration, DMA-coherent allocation, transfer rings and device enumeration. Likewise, the
+installer's disk work can be developed and unit-tested on the host, where `cargo test`
+exists, while the installer itself only ever runs under firmware. Keeping either pair in one
+commit would have meant shipping a first half nobody could run — and, worse, debugging the
+partitioning code inside a UEFI application instead of in a test.
 
 Deliberately out of scope for now, but not architecturally blocked: userspace
 isolation with an ELF loader, then a PE loader and a Wine-style Win32

@@ -15,6 +15,8 @@ pub struct RunOptions {
     pub gdb: bool,
     pub serial_only: bool,
     pub reset_nvram: bool,
+    /// Грузиться с настоящего образа диска, а не с каталога через VVFAT.
+    pub image: bool,
     pub memory: String,
     pub extra: Vec<String>,
 }
@@ -142,13 +144,22 @@ fn find_qemu(arch: Arch) -> Result<PathBuf> {
 pub fn run(opts: &RunOptions, built: &Built) -> Result<()> {
     let arch = built.arch;
     let qemu = find_qemu(arch)?;
-    let esp = prepare_esp(built)?;
 
     let fw = firmware::resolve(arch, Some(qemu.as_path()))?;
     let fw = firmware::prepare(arch, &fw, opts.reset_nvram)?;
     println!("прошивка: {}", fw.description);
 
-    let esp_arg = format!("fat:rw:{}", util::qemu_path(&esp)?);
+    // Два разных носителя, и разница между ними принципиальна. VVFAT — это
+    // эмуляция: QEMU на лету выдаёт каталог хоста за FAT-раздел, никакой
+    // таблицы разделов не существует, и проверить на нём нечего, кроме самой
+    // системы. Настоящий образ проходит через нашу разметку и наш FAT, и
+    // прошивка читает именно их — то есть заодно проверяется крейт `disk`.
+    let esp_arg = if opts.image {
+        let path = crate::image::build(built)?;
+        util::qemu_path(&path)?
+    } else {
+        format!("fat:rw:{}", util::qemu_path(&prepare_esp(built)?)?)
+    };
 
     let mut cmd = Command::new(&qemu);
     cmd.current_dir(paths::workspace_root());

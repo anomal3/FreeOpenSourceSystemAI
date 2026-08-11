@@ -4,6 +4,7 @@ members = [
     "xtask",
     "crates/boot-info",
     "crates/boot-uefi",
+    "crates/disk",
     "crates/kernel",
 ]
 

@@ -1,0 +1,18 @@
+[package]
+name = "disk"
+description = "GPT partitioning and a FAT32 formatter shared by the host image builder and the UEFI installer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+# Только для тестов: образ, собранный нашим форматтером, читается обратно
+# посторонней реализацией FAT. Проверять свой писатель своим же читателем
+# бессмысленно — общая ошибка в понимании формата осталась бы незамеченной.
+fatfs = { version = "0.3.6", default-features = false, features = ["std", "alloc"] }
+
+[lints]
+workspace = true

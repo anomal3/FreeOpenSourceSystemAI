@@ -6,6 +6,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "boot-uefi"
+path = "src/main.rs"
+# Тестового окружения на UEFI-таргете нет: `cargo test` попытался бы
+# слинковать libtest вместе с std, а обработчик паники крейта `uefi` уже занял
+# соответствующий lang item. Отключение обоих харнессов оставляет
+# `cargo test --workspace` рабочей командой — ровно так же поступает `kernel`.
+test = false
+bench = false
+
 [dependencies]
 boot-info = { path = "../boot-info" }
 uefi = { version = "0.39", features = ["alloc", "global_allocator", "panic_handler"] }

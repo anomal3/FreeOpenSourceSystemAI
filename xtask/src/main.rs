@@ -8,6 +8,7 @@
 mod arch;
 mod build;
 mod firmware;
+mod image;
 mod initrd;
 mod paths;
 mod qemu;
@@ -38,7 +39,7 @@ enum Command {
     Build(BuildArgs),
     /// Собрать всё, разложить по ESP и запустить в QEMU.
     Run(RunArgs),
-    /// Собрать загрузочный образ диска (появится в Phase 8).
+    /// Собрать загрузочный образ диска: GPT + FAT32 ESP.
     Image(ImageArgs),
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
@@ -87,6 +88,10 @@ struct RunArgs {
     /// Пересоздать хранилище UEFI-переменных из шаблона прошивки.
     #[arg(long)]
     reset_nvram: bool,
+    /// Грузиться с настоящего образа диска (GPT + FAT32), а не с каталога
+    /// хоста через VVFAT: медленнее на пересборке, но проверяет разметку.
+    #[arg(long)]
+    image: bool,
     /// Объём памяти виртуальной машины.
     #[arg(long, default_value = "512M")]
     memory: String,
@@ -100,6 +105,9 @@ struct ImageArgs {
     /// Целевая архитектура.
     #[arg(long, short = 'a', value_enum, default_value = "x86_64")]
     arch: Arch,
+    /// Собирать с профилем release.
+    #[arg(long, short = 'r')]
+    release: bool,
 }
 
 #[derive(Args, Debug)]
@@ -148,13 +156,24 @@ fn real_main() -> Result<()> {
                 gdb: args.gdb,
                 serial_only: args.serial_only,
                 reset_nvram: args.reset_nvram,
+                image: args.image,
                 memory: args.memory,
                 extra: args.qemu_args,
             };
             qemu::run(&opts, &built)?;
         }
 
-        Command::Image(args) => print_image_stub(args.arch),
+        Command::Image(args) => {
+            let built = build::build_all(&build::BuildOptions {
+                arch: args.arch,
+                release: args.release,
+                kernel: true,
+                initrd: true,
+            })?;
+            print_built(&built);
+            let path = image::build(&built)?;
+            image::describe(args.arch, &path);
+        }
 
         Command::Check(args) => {
             let arches: Vec<Arch> = match args.arch {
@@ -187,32 +206,3 @@ fn print_built(built: &build::Built) {
     println!();
 }
 
-/// Честная заглушка вместо полусобранного образа.
-fn print_image_stub(arch: Arch) {
-    println!(
-        "\
-`xtask image --arch {arch}` пока не реализована — и это осознанное решение.
-
-Настоящий загрузочный образ (GPT-таблица разделов + FAT32 ESP + записанный в него
-загрузчик) появится в Phase 8, вместе с графическим установщиком: раньше он просто
-некому нужен. Планируемая реализация — крейт `gpt` (разметка) поверх того же
-`fatfs`, которым уже собирается initrd.img (см. xtask/src/initrd.rs).
-
-Что делать сейчас:
-
-    cargo xtask run --arch {arch}
-
-`run` использует драйвер VVFAT в QEMU: каталог хоста build/esp/{arch} подключается
-как FAT-раздел напрямую (`-drive format=raw,file=fat:rw:...`). Файлы туда просто
-копируются, никакой пересборки образа между правками — dev-loop получается заметно
-короче, а прошивка и загрузчик видят ровно ту же структуру (\\EFI\\BOOT\\{boot_file},
-\\{kernel_file} и \\{initrd_file}), что и на настоящем диске.
-
-Ограничение, о котором стоит помнить: VVFAT — это эмуляция, а не реальный носитель.
-Проверить GPT-разметку, выравнивание разделов или работу самого установщика на нём
-нельзя. Именно поэтому Phase 8 и нужна.",
-        boot_file = arch.removable_media_file(),
-        kernel_file = arch::KERNEL_ESP_FILE,
-        initrd_file = arch::INITRD_ESP_FILE,
-    );
-}
