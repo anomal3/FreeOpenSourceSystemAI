@@ -65,6 +65,15 @@ pub struct Console {
     /// поэтому сравнивать с ним нельзя; первая же прокрутка перерисует экран
     /// целиком и приведёт их в соответствие.
     stale: bool,
+    /// Показывать ли курсор. Пока ядро только печатает, он не нужен и мешает:
+    /// мигающая или просто лишняя черта под последней строкой лога выглядит как
+    /// артефакт. Включается тогда, когда появляется ввод.
+    cursor: bool,
+    /// Нарисован ли курсор прямо сейчас. Отдельно от [`Console::cursor`], потому
+    /// что перед каждой записью его надо снять, а после — вернуть, и путать
+    /// «включён» с «на экране» значило бы оставлять след при каждом переводе
+    /// строки.
+    cursor_drawn: bool,
 }
 
 // SAFETY: единственное, что мешает вывести `Send` автоматически, — сырой
@@ -126,6 +135,8 @@ impl Console {
             bg: encode(fb.format, BG),
             cells: None,
             stale: false,
+            cursor: false,
+            cursor_drawn: false,
         };
         console.clear();
         Some(console)
@@ -147,6 +158,7 @@ impl Console {
             cells.fill(b' ');
         }
         self.stale = false;
+        self.cursor_drawn = false;
     }
 
     /// Выделить теневой буфер и включить прокрутку.
@@ -314,6 +326,57 @@ impl Console {
         }
     }
 
+    /// Нарисовать курсор: подчёркивание под текущей ячейкой.
+    ///
+    /// Подчёркивание, а не заливка ячейки: блок скрыл бы символ под собой, а
+    /// курсор в редакторе строки стоит именно там, где только что напечатан
+    /// символ, — и видеть его полезнее, чем видеть курсор.
+    fn draw_cursor(&mut self) {
+        if !self.cursor || self.cursor_drawn || self.row >= self.rows || self.col >= self.cols {
+            return;
+        }
+        let x0 = MARGIN + self.col * GLYPH_W * self.scale;
+        let y0 = MARGIN + (self.row + 1) * GLYPH_H * self.scale - self.scale;
+        for y in 0..self.scale {
+            for x in 0..GLYPH_W * self.scale {
+                self.put_pixel(x0 + x, y0 + y, self.fg);
+            }
+        }
+        self.cursor_drawn = true;
+    }
+
+    /// Убрать курсор, восстановив то, что было под ним.
+    fn erase_cursor(&mut self) {
+        if !self.cursor_drawn {
+            return;
+        }
+        self.cursor_drawn = false;
+        if self.row >= self.rows || self.col >= self.cols {
+            return;
+        }
+        match self.cells.as_ref() {
+            // Буфер знает, какой символ стоит в ячейке, — перерисовываем её
+            // целиком, и след курсора исчезает вместе с фоном.
+            Some(cells) => {
+                let idx = (self.row as usize) * (self.cols as usize) + (self.col as usize);
+                let byte = cells[idx];
+                self.draw_cell(self.col, self.row, byte);
+            }
+            // Буфера нет: что было под курсором, неизвестно. Затираем только саму
+            // полоску фоном — нижний ряд пикселей глифа при этом пострадает, но
+            // это единственный вариант, не стирающий символ целиком.
+            None => {
+                let x0 = MARGIN + self.col * GLYPH_W * self.scale;
+                let y0 = MARGIN + (self.row + 1) * GLYPH_H * self.scale - self.scale;
+                for y in 0..self.scale {
+                    for x in 0..GLYPH_W * self.scale {
+                        self.put_pixel(x0 + x, y0 + y, self.bg);
+                    }
+                }
+            }
+        }
+    }
+
     fn write_char_raw(&mut self, ch: char) {
         match ch {
             '\n' => {
@@ -326,6 +389,14 @@ impl Console {
             }
             '\t' => {
                 self.tab();
+                return;
+            }
+            // Возврат на позицию. Символ под курсором не стирается — так же, как
+            // в любом терминале: стирание делает последовательность
+            // «возврат, пробел, возврат», и решать, стирать ли, обязан тот, кто
+            // печатает, а не консоль.
+            '\u{8}' => {
+                self.col = self.col.saturating_sub(1);
                 return;
             }
             _ => {}
@@ -431,6 +502,35 @@ pub fn _print(args: fmt::Arguments<'_>) {
         return;
     };
     if let Some(console) = console.as_mut() {
+        // Курсор снимается до вывода и возвращается после. Иначе он остался бы
+        // нарисованным там, где текст уже уехал дальше, — и на экране копилась
+        // бы дорожка подчёркиваний.
+        console.erase_cursor();
         let _ = console.write_fmt(args);
+        console.draw_cursor();
+    }
+}
+
+/// Показывать или не показывать курсор.
+///
+/// Вызывается, когда ядро начинает ждать ввод, и снимается, когда перестаёт: до
+/// появления ввода курсор под последней строкой лога — просто артефакт.
+pub fn set_cursor(visible: bool) {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    // `try_lock`, а не `lock`: функция вызывается из обычного кода, но замок
+    // консоли может быть занят выводом из обработчика. Не показать курсор —
+    // косметическая потеря, ждать освобождения в такой ситуации дороже.
+    let Some(mut console) = CONSOLE.try_lock() else {
+        return;
+    };
+    if let Some(console) = console.as_mut() {
+        console.cursor = visible;
+        if visible {
+            console.draw_cursor();
+        } else {
+            console.erase_cursor();
+        }
     }
 }

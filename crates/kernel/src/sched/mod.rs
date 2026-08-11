@@ -448,7 +448,7 @@ pub fn run() -> ! {
     dump();
 
     kprintln!();
-    kprintln!("Phase 4 complete: tasks ran and finished. CPU halted.");
+    kprintln!("All tasks finished, nothing left to schedule. CPU halted.");
     arch::halt();
 }
 
@@ -476,6 +476,16 @@ pub fn switch_count() -> u64 {
 #[must_use]
 pub fn is_running() -> bool {
     SCHED.lock().running
+}
+
+/// Сколько задач ещё не завершились, не считая холостой.
+///
+/// Нужно задачам, которым важно не мешать другим: приглашение ядра ждёт, пока
+/// остальные договорят, прежде чем печатать первый символ, — иначе их вывод и
+/// набираемая строка перемешались бы в одной консоли.
+#[must_use]
+pub fn alive() -> usize {
+    SCHED.lock().alive()
 }
 
 /// Компактный список задач с состояниями.
@@ -584,14 +594,15 @@ fn demo_task() {
     }
 }
 
-/// Показать работу планировщика: несколько задач по очереди печатают себя,
-/// после чего ядро останавливается.
+/// Создать демонстрационные задачи: несколько задач по очереди печатают себя и
+/// завершаются.
 ///
-/// Возврата нет, потому что его нет у [`run`].
-pub fn demo() -> ! {
-    kprintln!();
-    kprintln!("---- scheduler --------------------------------------------------");
-
+/// Планирование при этом **не** запускается — [`run`] вызывает тот, кто уже
+/// добавил все свои задачи. Разделение появилось на Phase 6: приглашение ядра —
+/// такая же задача, и создавать её надо до запуска, а не вместо демонстрации.
+///
+/// Возвращает число созданных задач.
+pub fn spawn_demo_tasks() -> usize {
     let mut spawned = 0;
     for name in ["alpha", "beta", "gamma"] {
         match spawn(name, demo_task) {
@@ -599,11 +610,5 @@ pub fn demo() -> ! {
             Err(err) => kprintln!("  spawn {name} failed: {err}"),
         }
     }
-    kprintln!(
-        "  spawned    : {spawned} tasks, {} KiB stack + {} KiB guard band each",
-        TASK_STACK_SIZE / 1024,
-        STACK_GUARD_SIZE / 1024
-    );
-
-    run()
+    spawned
 }

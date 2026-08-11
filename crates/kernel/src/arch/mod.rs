@@ -55,6 +55,19 @@ pub use x86_64::interrupts;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::interrupts;
 
+/// Устройства ввода. Обе реализации выставляют одно имя — `init(&BootInfo) ->
+/// crate::input::Sources` — и складывают события в общую очередь
+/// [`crate::input`].
+///
+/// Содержимое у них при этом разное настолько, насколько вообще возможно: на
+/// x86-64 это i8042 с маршрутизацией через I/O APIC и разбором ACPI, на AArch64 —
+/// приём по PL011, потому что клавиатуры на этой машине не существует. Ровно для
+/// того граница здесь и проведена.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::input;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::input;
+
 /// Переключение контекста задач: тип сохранённого состояния и сам примитив.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::context::{Context, switch_context};

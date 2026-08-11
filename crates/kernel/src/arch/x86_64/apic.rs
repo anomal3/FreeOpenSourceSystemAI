@@ -33,13 +33,23 @@ use super::paging;
 use super::{cpuid, inb, io_wait, outb, rdmsr, wrmsr};
 use crate::irq::TIMER_HZ;
 use crate::kprintln;
-use crate::mm::{AddressSpace, PageFlags, PhysAddr};
+use crate::mm::PhysAddr;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // --- Назначенные ядром векторы ------------------------------------------------
 
 /// Системный таймер. Первый вектор за пределами архитектурных исключений.
 pub const VECTOR_TIMER: u8 = 0x20;
+
+/// Клавиатура PS/2 (IRQ 1 шины ISA, обычно вход 1 у I/O APIC).
+pub const VECTOR_KEYBOARD: u8 = 0x21;
+
+/// Приём по COM1 (IRQ 4 шины ISA).
+///
+/// Отдельный вектор, а не общий с клавиатурой: у них разные источники, и общий
+/// вектор потребовал бы опрашивать оба устройства на каждом прерывании — то
+/// есть читать регистры незанятого контроллера, у чего бывают побочные эффекты.
+pub const VECTOR_SERIAL: u8 = 0x22;
 
 /// Спурьёзное прерывание.
 ///
@@ -194,6 +204,22 @@ pub fn eoi() {
     write_reg(REG_EOI, 0);
 }
 
+/// Идентификатор локального APIC этого процессора.
+///
+/// Нужен I/O APIC: в физическом режиме адресации получателя запись таблицы
+/// переадресации содержит именно этот номер. Ноль, если APIC не поднят — и это
+/// не догадка, а следствие того, что `read_reg` без окна и без x2APIC отдаёт
+/// ноль; маршрутизировать в такой ситуации всё равно некуда.
+///
+/// Ширина у поля разная: в xAPIC идентификатор лежит в битах 31:24 регистра, в
+/// x2APIC — это все 32 бита. Приводить одно к другому обязан этот модуль, потому
+/// что только он знает, в каком режиме работает.
+#[must_use]
+pub fn local_id() -> u32 {
+    let id = read_reg(REG_ID);
+    if X2APIC.load(Ordering::Relaxed) { id } else { id >> 24 }
+}
+
 // --- Выбор режима -------------------------------------------------------------
 
 /// Лист CPUID с основными флагами возможностей.
@@ -269,33 +295,15 @@ fn enable_apic() -> bool {
 /// Адрес берётся из прямого отображения, а не identity: identity исчезнет
 /// вместе с переездом ядра в верхнюю половину, а прямое — нет.
 fn map_apic_window(phys: PhysAddr) -> Option<usize> {
-    if !phys.is_page_aligned() {
-        return None;
-    }
-    let virt = phys.to_direct_map();
-
     // SAFETY: функция вызывается из `init`, то есть уже после того, как ядро
     // переключилось на собственные таблицы (Phase 2 делает это до всего
-    // остального). Полученный экземпляр живёт только внутри этого вызова, и
-    // другого кода, правящего те же таблицы, в это время нет: ядро однопоточно,
-    // а прерывания ещё запрещены.
-    let mut space = unsafe { paging::active_address_space() };
-
-    let flags = PageFlags::READ | PageFlags::WRITE | PageFlags::DEVICE;
-    // SAFETY: страница по этому виртуальному адресу либо ещё не отображена,
-    // либо отображена на тот же самый физический кадр (прямое отображение по
-    // построению взаимно однозначно), поэтому запись не может увести из-под ног
-    // работающий код. `map` сам откажет с `AlreadyMapped`, если это не так.
-    let result = crate::mm::frame::with(|frames| unsafe { space.map(virt, phys, flags, frames) });
-
-    match result {
-        Some(Ok(())) => Some(virt.as_usize()),
-        Some(Err(error)) => {
+    // остального), и другого кода, правящего те же таблицы, в это время нет:
+    // ядро однопоточно, а прерывания ещё запрещены. Адрес — окно регистров
+    // локального APIC, то есть Device-семантика отображения ему и нужна.
+    match unsafe { paging::map_device_page(phys) } {
+        Ok(virt) => Some(virt),
+        Err(error) => {
             kprintln!("  apic        : mapping the xAPIC window failed: {error}");
-            None
-        }
-        None => {
-            kprintln!("  apic        : frame allocator unavailable, cannot map the xAPIC window");
             None
         }
     }

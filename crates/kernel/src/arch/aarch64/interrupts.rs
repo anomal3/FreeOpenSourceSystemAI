@@ -72,7 +72,7 @@
 // TODO(интеграция): снять, когда `main.rs` начнёт поднимать прерывания.
 #![allow(dead_code)]
 
-use super::{gic, timer};
+use super::{gic, input, timer};
 use crate::irq::fault::{self, Fault, TrapContext};
 use crate::kprintln;
 use crate::sync::Racy;
@@ -458,6 +458,10 @@ fn handle_irq() {
         // SAFETY: таймер инициализирован (иначе INTID 30 не был бы разрешён).
         unsafe { timer::rearm() };
         crate::irq::on_timer_tick();
+    } else if intid == input::UART_INTID {
+        // Ровно та же логика, что у таймера: линия UART уровневая, и `EOI` до
+        // вычитывания FIFO вернул бы нас сюда немедленно.
+        super::drain_uart_rx();
     } else {
         let seen = UNKNOWN_IRQS.fetch_add(1, Ordering::Relaxed);
         if seen < UNKNOWN_IRQ_REPORTS {

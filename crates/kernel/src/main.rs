@@ -42,6 +42,7 @@
 mod arch;
 mod console;
 mod fs;
+mod input;
 mod irq;
 mod mm;
 mod print;
@@ -293,8 +294,192 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
 
     mount_initrd(&info);
 
+    let have_input = start_input(&info);
+
     // Планировщик забирает управление насовсем: сюда исполнение уже не вернётся.
-    sched::demo()
+    run_session(have_input)
+}
+
+/// Поднять устройства ввода.
+///
+/// Возвращает `true`, если хотя бы один источник событий заработал: приглашение
+/// без источника событий — это просто бесконечное ожидание, и запускать его в
+/// такой ситуации незачем.
+fn start_input(info: &BootInfo) -> bool {
+    kprintln!();
+    kprintln!("---- input ------------------------------------------------------");
+
+    let sources = arch::input::init(info);
+    if !sources.any() {
+        kprintln!("  input       : no source of key events on this machine");
+    }
+    sources.any()
+}
+
+/// Создать задачи и отдать управление планировщику.
+fn run_session(have_input: bool) -> ! {
+    kprintln!();
+    kprintln!("---- scheduler --------------------------------------------------");
+
+    let spawned = sched::spawn_demo_tasks();
+    kprintln!(
+        "  spawned    : {spawned} tasks, {} KiB stack + {} KiB guard band each",
+        sched::TASK_STACK_SIZE / 1024,
+        sched::STACK_GUARD_SIZE / 1024
+    );
+
+    if have_input {
+        if let Err(err) = sched::spawn("prompt", prompt_task) {
+            kprintln!("  spawn prompt failed: {err}");
+        }
+    }
+
+    sched::run()
+}
+
+// ---- приглашение ------------------------------------------------------------
+
+/// Приглашение к вводу.
+const PROMPT: &str = "freeos> ";
+
+/// Сколько секунд ждать ввода, прежде чем закончить сеанс.
+///
+/// Предел обязателен, а не удобен: без него запуск в CI (где никто ничего не
+/// набирает) висел бы вечно, и «ядро ждёт ввод» стало бы неотличимо от «ядро
+/// зависло». Двадцати секунд достаточно, чтобы человек успел напечатать
+/// команду, и мало настолько, чтобы автоматический прогон завершался сам.
+const INPUT_IDLE_SECONDS: u64 = 20;
+
+/// Задача-приглашение: читает события ввода, собирает строки и отвечает на
+/// команды.
+///
+/// Задача, а не цикл в конце `resume_on_kernel_stack`, по двум причинам. Она
+/// обязана уступать процессор — иначе ни одна другая задача не исполнится, пока
+/// пользователь думает; и она обязана уметь закончиться — на этом заканчивается
+/// вся загрузка.
+fn prompt_task() {
+    // Дать демонстрационным задачам договорить: их вывод и набираемая строка
+    // идут в одну консоль, и перемешивать их незачем. Условие — «жива только
+    // эта задача», то есть счётчик равен единице.
+    while sched::alive() > 1 {
+        sched::yield_now();
+    }
+
+    kprintln!();
+    kprintln!("---- interactive ------------------------------------------------");
+    kprintln!("  type 'help' for the list of commands, 'exit' to finish the boot");
+    // Перечисляем только то, что действительно поднялось. Обещать клавиатуру на
+    // машине, где её нет, — это заставить человека искать неисправность там, где
+    // её не бывает.
+    let sources = input::sources();
+    match (sources.keyboard, sources.serial) {
+        (true, true) => kprintln!("  keys come from the keyboard and from the serial line"),
+        (true, false) => kprintln!("  keys come from the keyboard"),
+        (false, true) => kprintln!("  keys come from the serial line -- type into QEMU's terminal"),
+        (false, false) => kprintln!("  no input device is available"),
+    }
+    kprintln!();
+
+    console::set_cursor(true);
+    kprint!("{PROMPT}");
+
+    let mut editor = input::line::LineEditor::new();
+    let mut idle_since = irq::uptime_ms();
+
+    loop {
+        while let Some(event) = input::next_event() {
+            idle_since = irq::uptime_ms();
+            match editor.handle(event) {
+                input::line::Edit::Submitted => {
+                    let done = command(editor.as_str());
+                    editor.clear();
+                    if done {
+                        console::set_cursor(false);
+                        return;
+                    }
+                    kprint!("{PROMPT}");
+                }
+                input::line::Edit::Cancelled => kprint!("{PROMPT}"),
+                input::line::Edit::EndOfInput => {
+                    kprintln!("  end of input");
+                    console::set_cursor(false);
+                    return;
+                }
+                input::line::Edit::Full => {
+                    kprintln!();
+                    kprintln!("  the line is full ({} bytes)", input::line::MAX_LINE);
+                    kprint!("{PROMPT}{}", editor.as_str());
+                }
+                // Клавиши, которые редактор не обрабатывает: показываем имя.
+                // Это и есть проверка того, что до ядра доезжают не только
+                // символы, но и позиции клавиш.
+                input::line::Edit::Unhandled(code) => {
+                    kprintln!();
+                    kprintln!("  key: {} ({:?})", code.name(), event.mods);
+                    kprint!("{PROMPT}{}", editor.as_str());
+                }
+                input::line::Edit::Ignored | input::line::Edit::Inserted
+                | input::line::Edit::Erased => {}
+            }
+        }
+
+        let idle = irq::uptime_ms().saturating_sub(idle_since);
+        if idle >= INPUT_IDLE_SECONDS * 1000 {
+            kprintln!();
+            kprintln!("  no input for {INPUT_IDLE_SECONDS} s, finishing the session");
+            console::set_cursor(false);
+            return;
+        }
+
+        // Уступаем, а не крутимся: пока пользователь думает, процессор должен
+        // достаться остальным задачам.
+        sched::yield_now();
+    }
+}
+
+/// Выполнить набранную команду. Возвращает `true`, если сеанс пора закончить.
+fn command(line: &str) -> bool {
+    let line = line.trim();
+    match line {
+        "" => {}
+        "help" => {
+            kprintln!("  help     this list");
+            kprintln!("  uptime   time since the timer started");
+            kprintln!("  mem      physical frames and heap");
+            kprintln!("  input    key event counters");
+            kprintln!("  tasks    scheduler state");
+            kprintln!("  exit     finish the boot and halt");
+        }
+        "uptime" => kprintln!("  {} ms, {} timer ticks", irq::uptime_ms(), irq::ticks()),
+        "mem" => {
+            let frames = mm::frame::stats();
+            kprintln!(
+                "  frames   {} of {} used, {} MiB free",
+                frames.used(),
+                frames.total,
+                frames.free_bytes() / (1024 * 1024)
+            );
+            let heap = mm::heap::stats();
+            kprintln!("  heap     {} bytes free of {}", heap.free, mm::HEAP_SIZE);
+        }
+        "input" => {
+            let stats = input::stats();
+            kprintln!(
+                "  events   {} posted, {} dropped, {} queued; modifiers {:?}",
+                stats.posted,
+                stats.dropped,
+                stats.queued,
+                input::modifiers()
+            );
+        }
+        "tasks" => sched::dump(),
+        "exit" | "quit" => {
+            kprintln!("  finishing the session");
+            return true;
+        }
+        other => kprintln!("  unknown command '{other}'; try 'help'"),
+    }
+    false
 }
 
 /// Насколько глубоко обходить дерево каталогов.
@@ -524,7 +709,7 @@ fn validate(raw: *const BootInfo) -> Option<BootInfo> {
 /// Баннер: кто стартовал и что именно приехало в `BootInfo`.
 fn banner(info: &BootInfo, addr: usize) {
     kprintln!("================================================================");
-    kprintln!(" FreeOS kernel v{} - Phase 3 bring-up", env!("CARGO_PKG_VERSION"));
+    kprintln!(" FreeOS kernel v{} - Phase 6 bring-up", env!("CARGO_PKG_VERSION"));
     kprintln!(" architecture : {}", arch::ARCH_NAME);
     kprintln!("================================================================");
     kprintln!("BootInfo @ {addr:#018x}");

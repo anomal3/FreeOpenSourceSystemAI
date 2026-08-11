@@ -3,6 +3,7 @@
 
 pub mod context;
 pub mod gic;
+pub mod input;
 pub mod interrupts;
 pub mod paging;
 pub mod timer;
@@ -58,7 +59,18 @@ const REG_CR: usize = 0x30; // Control
 const REG_IMSC: usize = 0x38; // Interrupt Mask Set/Clear
 const REG_ICR: usize = 0x44; // Interrupt Clear
 
+const FR_RXFE: u32 = 1 << 4; // приёмное FIFO пусто
 const FR_TXFF: u32 = 1 << 5; // передающее FIFO заполнено
+
+/// `IMSC`/`ICR`, бит 4: приёмное FIFO дошло до порога заполнения.
+const INT_RX: u32 = 1 << 4;
+/// Бит 6: тайм-аут приёма — в FIFO что-то лежит, но до порога не дошло и новых
+/// байт не приходит. Без этого прерывания одиночное нажатие клавиши осталось бы
+/// в FIFO до тех пор, пока пользователь не наберёт ещё несколько символов.
+const INT_RX_TIMEOUT: u32 = 1 << 6;
+
+/// Все биты регистров прерываний PL011: одиннадцать источников.
+const INT_ALL: u32 = 0x7FF;
 
 const LCRH_FEN: u32 = 1 << 4; // включить FIFO
 const LCRH_WLEN_8: u32 = 0b11 << 5; // 8 бит данных
@@ -120,7 +132,7 @@ impl SerialDevice for Serial {
         // формат, замаскировать прерывания, включить обратно.
         unsafe {
             self.write(REG_CR, 0);
-            self.write(REG_ICR, 0x7FF);
+            self.write(REG_ICR, INT_ALL);
             self.write(REG_IBRD, IBRD_115200);
             self.write(REG_FBRD, FBRD_115200);
             self.write(REG_LCRH, LCRH_FEN | LCRH_WLEN_8);
@@ -146,6 +158,52 @@ impl SerialDevice for Serial {
         // в очередь на передачу и не затрагивает ничего другого.
         unsafe { self.write(REG_DR, u32::from(byte)) };
     }
+}
+
+/// Разрешить прерывания приёма на PL011.
+///
+/// Работа с портом идёт напрямую, минуя [`crate::serial`], по той же причине,
+/// что и на x86-64: тот держит UART под локом ради целостности вывода, а приём —
+/// независимый путь, и брать в обработчике прерывания лок, который может быть
+/// занят, нельзя. Копия `Serial::PLATFORM` на стеке безопасна — тип не хранит
+/// ничего, кроме адреса окна регистров.
+///
+/// # Safety
+///
+/// Окно PL011 должно быть отображено как Device-память (это делает
+/// [`paging::build_kernel_address_space`]), а INTID [`input::UART_INTID`] —
+/// разрешён в GIC уже после того, как обработчик готов его принять.
+pub unsafe fn enable_uart_rx() {
+    let uart = Serial::PLATFORM;
+    // SAFETY: адрес — задокументированное окно PL011 на QEMU virt; условия
+    // делегированы вызывающему контрактом функции. Сначала снимаются все
+    // висящие флаги: прошивка могла оставить свои, и первый же размаскированный
+    // источник выдал бы прерывание без причины.
+    unsafe {
+        uart.write(REG_ICR, INT_ALL);
+        uart.write(REG_IMSC, INT_RX | INT_RX_TIMEOUT);
+    }
+}
+
+/// Забрать из приёмника PL011 всё, что там есть, и отдать подсистеме ввода.
+pub fn drain_uart_rx() {
+    let uart = Serial::PLATFORM;
+    for _ in 0..32 {
+        // SAFETY: чтение регистра флагов побочных эффектов не имеет.
+        if unsafe { uart.read(REG_FR) } & FR_RXFE != 0 {
+            break;
+        }
+        // SAFETY: FIFO не пусто; чтение `DR` извлекает байт — побочный эффект
+        // ожидаемый и необходимый. Старшие биты слова несут признаки ошибок
+        // кадрирования и чётности; данные — только младшие восемь.
+        let byte = unsafe { uart.read(REG_DR) } as u8;
+        crate::input::ascii::feed(byte);
+    }
+    // Флаги снимаются после вычитывания. `RXRIS` опускается и сам, когда FIFO
+    // опустошено, но `RTRIS` (тайм-аут) — только записью в `ICR`, и без неё
+    // прерывание пришло бы снова немедленно.
+    // SAFETY: см. выше.
+    unsafe { uart.write(REG_ICR, INT_RX | INT_RX_TIMEOUT) };
 }
 
 /// Остановить процессор навсегда.
