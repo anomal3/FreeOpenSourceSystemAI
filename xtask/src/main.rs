@@ -149,6 +149,13 @@ struct InstallArgs {
     /// Пересоздать целевой диск, стерев результат прошлой установки.
     #[arg(long)]
     fresh: bool,
+    /// Пересоздать хранилище UEFI-переменных из шаблона прошивки.
+    ///
+    /// Нужно, когда меняется способ подключения носителя: в NVRAM остаётся
+    /// запись загрузки со старым путём устройства, прошивка пытается пойти по
+    /// ней и, не найдя, уходит в свою оболочку вместо установщика.
+    #[arg(long)]
+    reset_nvram: bool,
     /// Размер целевого диска в мегабайтах.
     #[arg(long, default_value_t = 1024)]
     target_size: u64,
@@ -273,7 +280,7 @@ fn real_main() -> Result<()> {
             let opts = qemu::RunOptions {
                 gdb: false,
                 serial_only: args.serial_only,
-                reset_nvram: false,
+                reset_nvram: args.reset_nvram,
                 memory: args.memory,
                 extra: args.qemu_args,
                 // Порядок важен: прошивка перебирает носители в порядке

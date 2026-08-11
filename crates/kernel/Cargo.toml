@@ -16,6 +16,11 @@ bench = false
 
 [dependencies]
 boot-info = { path = "../boot-info" }
+# Разбор таблицы разделов. Тот же код, которым размечает диск установщик, — то
+# есть ядро читает разметку ровно так, как её писали.
+disk = { path = "../disk" }
+# Корневая файловая система, тот же крейт, что у установщика.
+ext2 = { path = "../ext2" }
 # `default-features = false` drops the `std` and `unicode` features; what remains
 # is `font8x8::legacy`, a dependency-free table of `[u8; 8]` glyph rows. The
 # kernel still uses it directly for the boot console, which draws into the

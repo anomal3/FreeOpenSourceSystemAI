@@ -54,8 +54,14 @@ const CFG_REVISION: usize = 0x08;
 const CFG_PROG_IF: usize = 0x09;
 const CFG_SUBCLASS: usize = 0x0A;
 const CFG_CLASS: usize = 0x0B;
+const CFG_STATUS: usize = 0x06;
 const CFG_HEADER_TYPE: usize = 0x0E;
 const CFG_BAR0: usize = 0x10;
+/// Смещение указателя на первую запись списка возможностей.
+const CFG_CAPABILITIES_PTR: usize = 0x34;
+
+/// `Status`, бит 4: у функции есть список возможностей.
+const STATUS_CAPABILITIES: u16 = 1 << 4;
 /// Номер шины за мостом (только у header type 1).
 const CFG_SECONDARY_BUS: usize = 0x19;
 
@@ -90,6 +96,20 @@ const BAR_MEMORY_ADDR_MASK: u32 = !0xF;
 // ---------------------------------------------------------------------------
 // Классы устройств
 // ---------------------------------------------------------------------------
+
+/// Изготовитель, под которым выступают все устройства virtio.
+pub const VENDOR_VIRTIO: u16 = 0x1AF4;
+/// Идентификатор virtio-blk в переходном (transitional) виде — именно такой
+/// создаёт QEMU по `-device virtio-blk-pci`. Переходное устройство понимает и
+/// старый интерфейс через порты ввода-вывода, и современный через возможности
+/// PCI; мы пользуемся только вторым, потому что портов на AArch64 не бывает.
+pub const DEVICE_VIRTIO_BLK_LEGACY: u16 = 0x1001;
+/// Он же в современном виде: 0x1040 плюс номер типа устройства (2 — блочное).
+pub const DEVICE_VIRTIO_BLK_MODERN: u16 = 0x1042;
+
+/// Идентификатор возможности «vendor specific» — под ним virtio описывает, где
+/// лежат его структуры.
+pub const CAP_ID_VENDOR: u8 = 0x09;
 
 /// Базовый класс «Serial Bus Controller».
 pub const CLASS_SERIAL_BUS: u8 = 0x0C;
@@ -318,6 +338,64 @@ impl Device {
         unsafe { self.write16(CFG_COMMAND, wanted) };
     }
 
+    /// Байт конфигурационного пространства.
+    ///
+    /// Безопасная обёртка: устройство получено перебором, значит его страница
+    /// отображена, а смещение проверяется здесь. Нужна драйверам, которые
+    /// разбирают список возможностей, — у virtio там лежат адреса всех его
+    /// структур.
+    #[must_use]
+    pub fn config8(&self, offset: usize) -> u8 {
+        if offset >= PAGE_SIZE {
+            return 0;
+        }
+        // SAFETY: страница отображена при перечислении, смещение проверено.
+        unsafe { self.read8(offset) }
+    }
+
+    /// Слово конфигурационного пространства. Невыровненное смещение даёт ноль:
+    /// невыровненное обращение к регистрам PCI — ошибка вызывающего, но ронять
+    /// из-за неё ядро незачем.
+    #[must_use]
+    pub fn config32(&self, offset: usize) -> u32 {
+        if offset % 4 != 0 || offset + 4 > PAGE_SIZE {
+            return 0;
+        }
+        // SAFETY: см. `config8`.
+        unsafe { self.read32(offset) }
+    }
+
+    /// Пройти список возможностей, вызывая `visit(id, offset)`.
+    ///
+    /// Обход прекращается, когда `visit` возвращает `false`.
+    pub fn for_each_capability(&self, mut visit: impl FnMut(u8, usize) -> bool) {
+        // SAFETY: страница отображена при перечислении.
+        let status = unsafe { self.read16(CFG_STATUS) };
+        if status & STATUS_CAPABILITIES == 0 {
+            return;
+        }
+
+        // Предел обхода обязателен: список — это односвязная цепочка внутри
+        // конфигурационного пространства, и запись, ссылающаяся сама на себя,
+        // увела бы ядро в вечный цикл. 48 записей — больше, чем помещается в
+        // 256 байт стандартного заголовка при минимальном размере записи.
+        const MAX_CAPABILITIES: usize = 48;
+
+        let mut offset = usize::from(self.config8(CFG_CAPABILITIES_PTR)) & !0b11;
+        for _ in 0..MAX_CAPABILITIES {
+            // Нулевое смещение — конец списка. Указатель внутрь первых 64 байт
+            // заголовка невозможен: там стандартные регистры.
+            if offset < 0x40 || offset + 2 > PAGE_SIZE {
+                return;
+            }
+            let id = self.config8(offset);
+            if !visit(id, offset) {
+                return;
+            }
+            offset = usize::from(self.config8(offset + 1)) & !0b11;
+        }
+    }
+
     /// Текущее значение регистра `Command` — для диагностики.
     #[must_use]
     pub fn command(&self) -> u16 {
@@ -486,6 +564,31 @@ unsafe fn walk_bus(
 pub unsafe fn for_each(ecam: &Ecam, mut visit: impl FnMut(&Device) -> bool) {
     // SAFETY: контракт функции.
     unsafe { walk_bus(ecam, ecam.start_bus, 0, &mut visit) };
+}
+
+/// Найти первое устройство заданного изготовителя с одним из перечисленных
+/// идентификаторов.
+///
+/// Список, а не одно значение: у virtio переходное и современное устройства —
+/// это два разных идентификатора при одном и том же программном интерфейсе, и
+/// какой из них создаст QEMU, зависит от версии и ключей запуска.
+///
+/// # Safety
+///
+/// См. [`for_each`].
+pub unsafe fn find_by_id(ecam: &Ecam, vendor: u16, devices: &[u16]) -> Option<Device> {
+    let mut found = None;
+    // SAFETY: контракт функции.
+    unsafe {
+        for_each(ecam, |device| {
+            if device.vendor == vendor && devices.contains(&device.device) {
+                found = Some(*device);
+                return false;
+            }
+            true
+        });
+    }
+    found
 }
 
 /// Найти первое устройство с заданными классом, подклассом и интерфейсом.

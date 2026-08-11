@@ -52,6 +52,7 @@ mod sched;
 mod serial;
 mod shell;
 mod sync;
+mod virtio;
 mod ui;
 mod usb;
 mod vfs;
@@ -298,6 +299,7 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     }
 
     mount_initrd(&info);
+    mount_disk_root(&info);
 
     let have_input = start_input(&info);
     start_graphics(&info);
@@ -470,6 +472,141 @@ fn mount_initrd(info: &BootInfo) {
 }
 
 /// Напечатать дерево каталогов, не глубже [`MAX_TREE_DEPTH`].
+/// Найти диск, разобрать на нём таблицу разделов и смонтировать корень.
+///
+/// # Что здесь происходит и почему именно так
+///
+/// Ядро не получает от загрузчика никакого указания, с какого носителя оно
+/// пришло, и добавлять такое поле в hand-off не потребовалось: раздел
+/// **опознаётся по своему типу в GPT**. Тип `FREEOS_ROOT_TYPE` придуман нами и
+/// записан установщиком — этого достаточно, чтобы отличить свой корень от
+/// чужих разделов, и не нужно ни нового контракта, ни угадывания по порядку.
+///
+/// Отсутствие диска, таблицы разделов или нужного раздела — не отказ. Запуск
+/// без установки (`xtask run`) — обычный режим работы: там корнем остаётся
+/// образ RAM-диска, и система обязана в нём работать.
+fn mount_disk_root(info: &BootInfo) {
+    use disk::gpt;
+
+    kprintln!();
+    kprintln!("---- root filesystem --------------------------------------------");
+
+    if info.acpi_rsdp == 0 {
+        kprintln!("  disk        : no ACPI tables, so no PCI: keeping the initrd as root");
+        return;
+    }
+
+    // SAFETY: ядро давно работает на собственных таблицах страниц (см.
+    // `take_over_memory` выше по ходу загрузки), а RSDP пришёл от прошивки
+    // через hand-off.
+    let ecam = match unsafe { pci::find_ecam(info.acpi_rsdp) } {
+        Ok(ecam) => ecam,
+        Err(err) => {
+            kprintln!("  disk        : no PCI window ({err:?}): keeping the initrd as root");
+            return;
+        }
+    };
+
+    // SAFETY: см. выше.
+    let mut device = match unsafe { virtio::blk::VirtioBlk::probe(&ecam) } {
+        Ok(device) => device,
+        Err(err) => {
+            kprintln!("  disk        : no virtio-blk ({err}): keeping the initrd as root");
+            return;
+        }
+    };
+    kprintln!(
+        "  disk        : virtio-blk, {} sectors ({} MiB)",
+        device.sectors(),
+        device.sectors() / 2048
+    );
+
+    let table = match gpt::read(&mut device) {
+        Ok(table) => table,
+        Err(err) => {
+            kprintln!("  partitions  : {err}: keeping the initrd as root");
+            return;
+        }
+    };
+    kprintln!("  partitions  : GPT {}, {} entries", table.disk_guid, table.partitions.len());
+    for partition in &table.partitions {
+        kprintln!(
+            "    part {}     : {} MiB at LBA {}, '{}'",
+            partition.index + 1,
+            partition.range().bytes() / (1024 * 1024),
+            partition.first_lba,
+            partition.name_string(),
+        );
+    }
+
+    let Some(root) = table.find(gpt::FREEOS_ROOT_TYPE) else {
+        kprintln!("  root        : no FreeOS root partition: keeping the initrd as root");
+        return;
+    };
+    let first_lba = root.first_lba;
+
+    let mount = match fs::Ext2Fs::mount(device, first_lba) {
+        Ok(mount) => mount,
+        Err(err) => {
+            kprintln!("  root        : cannot mount ext2 at LBA {first_lba}: {err}");
+            return;
+        }
+    };
+
+    // Корень с диска заменяет образ RAM-диска: точка монтирования пока одна, и
+    // притворяться, что их две, значило бы заводить таблицу монтирования, у
+    // которой нет второго потребителя. initrd при этом не пропал зря — он
+    // остаётся тем, чем был, средством поднять систему до появления диска.
+    let (blocks, block_size, groups, requests) = mount.stats();
+    kprintln!(
+        "  root        : ext2 at LBA {first_lba}, {blocks} blocks of {block_size} B in {groups} group(s)"
+    );
+    kprintln!("  root        : replacing the initrd as /, {requests} disk request(s) so far");
+    fs::set_root(alloc::boxed::Box::new(mount));
+
+    verify_root();
+}
+
+/// Показать, что корень действительно читается, и что права на нём настоящие.
+///
+/// Не украшение вывода: это единственное место, где видно, что путь
+/// «virtio-blk → GPT → ext2 → VFS» работает целиком. Файл выбран тот, который
+/// записал установщик, — совпадение содержимого доказывает всю цепочку разом.
+fn verify_root() {
+    const PASSWD: &str = "/etc/passwd";
+
+    match fs::list("/") {
+        Some(Ok(entries)) => {
+            for entry in entries {
+                kprintln!(
+                    "    /{:<12} {:04o} {}:{} {} bytes",
+                    entry.name,
+                    entry.mode,
+                    entry.uid,
+                    entry.gid,
+                    entry.size
+                );
+            }
+        }
+        Some(Err(err)) => kprintln!("  root        : cannot list /: {err}"),
+        None => {}
+    }
+
+    match fs::read(PASSWD, 512) {
+        Some(Ok((data, size))) => {
+            kprintln!("  account     : {PASSWD}, {size} bytes");
+            // Показывается последняя содержательная строка: первые в файле —
+            // комментарии, а интересна сама запись.
+            let text = alloc::string::String::from_utf8_lossy(&data);
+            if let Some(line) = text.lines().filter(|line| !line.starts_with('#')).next_back() {
+                kprintln!("    {line}");
+            }
+        }
+        Some(Err(err)) => kprintln!("  account     : {PASSWD}: {err}"),
+        None => {}
+    }
+}
+
 fn print_tree(node: &dyn vfs::Node, name: &str, depth: usize) {
     let pad = depth * 2;
     match node.metadata().kind {

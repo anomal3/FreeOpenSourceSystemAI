@@ -363,11 +363,23 @@ fn list(path: &str) {
                 sprintln!("  {path}: empty");
                 return;
             }
+            // Права и владелец печатаются всегда, а не только там, где они
+            // настоящие: на FAT32 они выдуманы значениями по умолчанию, и
+            // одинаковые числа во всех строках — это и есть видимая разница
+            // между двумя файловыми системами.
             for entry in entries {
-                match entry.kind {
-                    NodeKind::Directory => sprintln!("  {}/", entry.name),
-                    NodeKind::File => sprintln!("  {:<40} {} bytes", entry.name, entry.size),
-                }
+                let name = match entry.kind {
+                    NodeKind::Directory => alloc::format!("{}/", entry.name),
+                    NodeKind::File => entry.name.clone(),
+                };
+                sprintln!(
+                    "  {:04o} {:>4}:{:<4} {:>9}  {}",
+                    entry.mode,
+                    entry.uid,
+                    entry.gid,
+                    entry.size,
+                    name,
+                );
             }
         }
         Some(Err(err)) => sprintln!("  {path}: {err}"),

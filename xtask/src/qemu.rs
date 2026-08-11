@@ -178,11 +178,19 @@ pub fn run(opts: &RunOptions, built: &Built) -> Result<()> {
     match arch {
         Arch::X86_64 => {
             cmd.args(["-machine", "q35"]);
-            for drive in &opts.drives {
-                // Без if= драйв уезжает на дефолтный интерфейс машины (для q35
-                // это AHCI) — классическая и хорошо проверенная связка.
-                cmd.arg("-drive")
-                    .arg(format!("format=raw,file={}", drive_file(drive)?));
+            // Носители подключаются через virtio-blk, а не через штатный для
+            // q35 контроллер AHCI, и это ради ядра, а не ради прошивки.
+            // Драйвер диска в FreeOS один на обе архитектуры (см.
+            // `kernel::virtio`), а AHCI на машине `virt` не существует вовсе;
+            // оставить здесь AHCI значило бы, что на x86-64 ядро своего диска
+            // не видит. Прошивка при этом ничего не теряет: VirtioBlkDxe есть
+            // и в OVMF, и в ArmVirtQemu.
+            for (index, drive) in opts.drives.iter().enumerate() {
+                cmd.arg("-drive").arg(format!(
+                    "if=none,id=disk{index},format=raw,file={}",
+                    drive_file(drive)?
+                ));
+                cmd.args(["-device", &format!("virtio-blk-pci,drive=disk{index}")]);
             }
             // Видео на q35 есть по умолчанию (stdvga), а QemuVideoDxe в OVMF
             // отдаёт по нему GOP с честным линейным framebuffer'ом — именно то,

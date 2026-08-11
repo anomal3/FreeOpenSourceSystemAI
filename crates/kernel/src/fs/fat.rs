@@ -983,10 +983,17 @@ impl Node for FatNode {
             entries
                 .try_reserve(1)
                 .map_err(|_| VfsError::OutOfMemory)?;
+            // Права подставляются значениями по умолчанию: FAT32 их не
+            // хранит. См. `Metadata::defaults` — там же объяснено, почему поля
+            // всё равно есть.
+            let defaults = crate::vfs::Metadata::defaults(entry.kind(), entry.size());
             entries.push(DirEntry {
                 name: entry.name.clone(),
                 kind: entry.kind(),
                 size: entry.size(),
+                mode: defaults.mode,
+                uid: defaults.uid,
+                gid: defaults.gid,
             });
             Ok(Flow::Continue)
         })?;

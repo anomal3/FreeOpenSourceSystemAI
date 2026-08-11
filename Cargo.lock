@@ -231,6 +231,8 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "boot-info",
+ "disk",
+ "ext2",
  "font8x8",
  "linked_list_allocator",
  "mini-ui",

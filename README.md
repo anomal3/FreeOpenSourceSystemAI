@@ -2,11 +2,11 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 8 done — the MVP is complete.** A graphical installer partitions a disk
-> and installs the system onto it; the installed system boots, owns its memory, schedules
-> tasks, reads files from a FAT32 RAM disk, takes input from a USB keyboard and runs a
-> shell in a window of its own compositor — on both architectures. There is no userspace
-> yet: everything above runs in the kernel. See [Roadmap](#roadmap).
+> **Status: Phase 9 done.** A graphical installer partitions a disk, creates an ext2 root
+> filesystem on it and installs the system; the installed system boots, finds its own disk
+> over virtio-blk, reads the partition table, mounts that root and serves it to the shell
+> with real uid/gid/mode — on both architectures. There is no userspace yet: everything
+> above runs in the kernel. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -109,6 +109,15 @@ something that writes to a disk is worse than missing code.
 Run `cargo xtask inspect` after an install to see what actually landed: our own code parses
 the partition table, and a foreign implementation reads the filesystem.
 
+The kernel reaches that partition over **virtio-blk**, for the same reason the keyboard
+comes over xHCI: one driver for both architectures. AHCI exists only where SATA does — on
+`q35` and not on `virt` — while virtio-blk works identically on both. On a real Raspberry
+Pi 4 there is no virtio at all; the disk there will arrive over USB mass storage on top of
+the xHCI stack that already exists, and that work is named in the roadmap rather than
+quietly assumed. Nothing tells the kernel which disk it booted from and no hand-off field
+was added for it: the partition is recognised by its GPT type GUID, which the installer
+wrote and only we use.
+
 ## The installer
 
 A separate UEFI application, not a first-boot wizard inside the system. Partitioning is a
@@ -170,6 +179,7 @@ crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/acpi.rs       Table lookup by signature (MADT on x86-64, MCFG everywhere)
   src/pci.rs        ECAM configuration space, bus walk across bridges
   src/usb/          xHCI host controller, HID boot protocol
+  src/virtio/       virtio over PCI: split virtqueue, virtio-blk
   src/arch/         Everything that differs between x86-64 and AArch64
 xtask/              Host-side build / image / QEMU orchestration
 ```
@@ -219,7 +229,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 8a | GPT + FAT32 writer, real bootable disk image instead of VVFAT | **done** |
 | 8b | Graphical UEFI installer (disk selection, partitioning, user account) | **done** |
 | 9a | ext2: formatter, writer and reader; the installer creates a real root | **done** |
-| 9b | virtio-blk driver; the kernel mounts the root partition it was installed on | |
+| 9b | virtio-blk driver; the kernel mounts the root partition it was installed on | **done** |
 
 Phases 6 and 8 were both split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

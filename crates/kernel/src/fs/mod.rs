@@ -16,8 +16,10 @@
 //! испорченный образ приводил к [`VfsError::Corrupt`](crate::vfs::VfsError), а
 //! не к панике или зацикливанию ядра.
 
+pub mod ext2fs;
 pub mod fat;
 
+pub use ext2fs::Ext2Fs;
 pub use fat::Fat32;
 
 use alloc::boxed::Box;
