@@ -8,6 +8,7 @@
 mod arch;
 mod build;
 mod firmware;
+mod harness;
 mod image;
 mod initrd;
 mod inspect;
@@ -46,6 +47,8 @@ enum Command {
     Install(InstallArgs),
     /// Разобрать образ диска: разделы и содержимое корневой ФС.
     Inspect(InspectArgs),
+    /// Прогнать систему в QEMU по сценариям стенда — без человека за клавиатурой.
+    Test(TestArgs),
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -168,6 +171,29 @@ struct InstallArgs {
 }
 
 #[derive(Args, Debug)]
+struct TestArgs {
+    /// Прогнать только одну архитектуру (по умолчанию — обе).
+    #[arg(long, short = 'a', value_enum)]
+    arch: Option<Arch>,
+    /// Прогнать в release вместо debug.
+    #[arg(long, short = 'r', conflicts_with = "full")]
+    release: bool,
+    /// Оба профиля на обеих архитектурах — та самая планка, которую фаза обязана
+    /// взять перед коммитом.
+    #[arg(long)]
+    full: bool,
+    /// Прогнать один сценарий по имени.
+    #[arg(long, short = 's')]
+    scenario: Option<String>,
+    /// Показать список сценариев и выйти.
+    #[arg(long)]
+    list: bool,
+    /// Показывать окно QEMU. Снимки экрана делаются и без него.
+    #[arg(long)]
+    windowed: bool,
+}
+
+#[derive(Args, Debug)]
 struct CheckArgs {
     /// Проверить только одну архитектуру (по умолчанию — обе).
     #[arg(long, short = 'a', value_enum)]
@@ -242,6 +268,7 @@ fn real_main() -> Result<()> {
                 memory: args.memory,
                 extra: args.qemu_args,
                 drives: vec![drive],
+                ..qemu::RunOptions::default()
             };
             qemu::run(&opts, &built)?;
         }
@@ -287,6 +314,7 @@ fn real_main() -> Result<()> {
                 // подключения, и загрузочный раздел есть только у первого —
                 // целевой диск на этот момент пуст.
                 drives: vec![qemu::Drive::Image(media), qemu::Drive::Image(target)],
+                ..qemu::RunOptions::default()
             };
             qemu::run(&opts, &built)?;
 
@@ -308,6 +336,28 @@ fn real_main() -> Result<()> {
                 );
             }
             inspect::image(&path)?;
+        }
+
+        Command::Test(args) => {
+            if args.list {
+                harness::list();
+                return Ok(());
+            }
+            let arches = match args.arch {
+                Some(arch) => vec![arch],
+                None => Arch::ALL.to_vec(),
+            };
+            let profiles = if args.full {
+                vec![false, true]
+            } else {
+                vec![args.release]
+            };
+            harness::run(&harness::TestOptions {
+                arches,
+                profiles,
+                only: args.scenario,
+                windowed: args.windowed,
+            })?;
         }
 
         Command::Check(args) => {

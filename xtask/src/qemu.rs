@@ -1,5 +1,6 @@
 //! Подготовка ESP и запуск QEMU.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -19,6 +20,45 @@ pub struct RunOptions {
     pub extra: Vec<String>,
     /// Носители машины в порядке подключения.
     pub drives: Vec<Drive>,
+    /// Куда уходит серийная консоль.
+    pub serial: Serial,
+    /// Адрес, на котором стенд ждёт подключения монитора QEMU (HMP).
+    ///
+    /// `None` — монитора нет вовсе; так запускается обычный `run`, где им
+    /// управляет человек через окно эмулятора.
+    pub monitor: Option<SocketAddr>,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            gdb: false,
+            serial_only: false,
+            reset_nvram: false,
+            memory: "512M".to_string(),
+            extra: Vec::new(),
+            drives: Vec::new(),
+            serial: Serial::Stdio,
+            monitor: None,
+        }
+    }
+}
+
+/// Куда QEMU выводит серийную консоль.
+pub enum Serial {
+    /// В тот же терминал, из которого запущен xtask.
+    Stdio,
+    /// В сокет, к которому QEMU **подключается сам**.
+    ///
+    /// Клиентский режим, а не серверный, выбран сознательно: слушает стенд,
+    /// поэтому порт можно занять заранее (`127.0.0.1:0`) и узнать его номер у
+    /// ядра ОС. Серверный режим потребовал бы выбрать номер заранее и надеяться,
+    /// что он свободен, — то есть гонку с любым другим процессом на машине.
+    ///
+    /// Сокет вместо канала (pipe) — тоже не деталь: канал на Windows съедает
+    /// возврат каретки (0x0D), и путь «CR как Enter» через него не проверить
+    /// вовсе. Через сокет байты доходят как есть.
+    Socket(SocketAddr),
 }
 
 /// Носитель, подключаемый к машине.
@@ -164,7 +204,14 @@ fn find_qemu(arch: Arch) -> Result<PathBuf> {
     bail!("{msg}");
 }
 
-pub fn run(opts: &RunOptions, built: &Built) -> Result<()> {
+/// Собрать командную строку QEMU, но не запускать.
+///
+/// Отделено от [`run`] ради стенда ([`crate::harness`]): ему нужен тот же
+/// процесс, но с перехваченными потоками и подключённым монитором. Две
+/// независимые сборки командной строки означали бы, что стенд проверяет не ту
+/// машину, которую видит человек, — и расхождение обнаружилось бы в тот день,
+/// когда тесты зелёные, а система не грузится.
+pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     let arch = built.arch;
     let qemu = find_qemu(arch)?;
 
@@ -247,7 +294,13 @@ pub fn run(opts: &RunOptions, built: &Built) -> Result<()> {
     cmd.args(&fw.args);
     // Вывод ядра/загрузчика идёт в серийный порт: он одинаково работает на обеих
     // архитектурах и в headless-режиме CI.
-    cmd.args(["-serial", "stdio"]);
+    match &opts.serial {
+        Serial::Stdio => cmd.args(["-serial", "stdio"]),
+        Serial::Socket(addr) => cmd.args(["-serial", &format!("tcp:{addr}")]),
+    };
+    if let Some(addr) = opts.monitor {
+        cmd.args(["-monitor", &format!("tcp:{addr}")]);
+    }
     // Тройная ошибка не должна уводить VM в бесконечный цикл перезагрузок.
     cmd.arg("-no-reboot");
     // Сеть на Phase 0 не нужна, а её отсутствие ещё и экономит время на попытках
@@ -264,6 +317,12 @@ pub fn run(opts: &RunOptions, built: &Built) -> Result<()> {
     }
 
     cmd.args(&opts.extra);
+    Ok(cmd)
+}
+
+pub fn run(opts: &RunOptions, built: &Built) -> Result<()> {
+    let arch = built.arch;
+    let mut cmd = command(opts, built)?;
 
     if opts.gdb {
         print_gdb_hint(arch);

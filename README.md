@@ -54,6 +54,11 @@ cargo xtask image --arch x86_64         # just write build/freeos-x86_64-debug.i
 
 cargo xtask install --arch x86_64       # run the installer against a blank 1 GiB disk
 cargo xtask run --arch x86_64 --installed   # boot what the installer just wrote
+
+cargo xtask test                        # the whole bench, both architectures, nobody at the keyboard
+cargo xtask test --list                 # what the bench checks
+cargo xtask test -a x86_64 -s boot      # one scenario on one architecture
+cargo xtask test --full                 # both profiles on both architectures
 ```
 
 `xtask` locates QEMU and its UEFI firmware automatically; override with the
@@ -78,6 +83,27 @@ shell prints goes there as well.
 Without a framebuffer the same shell runs on the serial console alone; graphics is not a
 condition for the system to work. With nobody typing, the prompt gives up after twenty
 seconds so unattended runs still terminate.
+
+## The test bench
+
+`cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
+it waits for lines on the serial console, presses real keys through the QEMU monitor and
+takes screenshots. A scenario passes only if the guest said what it was supposed to say —
+screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
+shows the last painted frame and after a crash that frame can be three screens stale.
+
+Six scenarios today: the system boots and the shell answers (`boot`); keys arrive over
+xHCI and USB HID rather than PS/2 (`keyboard`, which switches `i8042` off, since `sendkey`
+reaches exactly one keyboard and QEMU picks PS/2 when both are attached); a terminal that
+sends a lone carriage return works as Enter (`serial-cr`); the system boots off a disk this
+repo partitioned (`image`); the installer walks all seven screens and writes a disk
+(`install`); and that disk boots, mounts its ext2 root and reads `/etc` (`installed`).
+
+The bench lives in `xtask/src/harness/` and shares one QEMU command line with `run` —
+a second, independent one would mean the tests check a machine the developer never sees.
+It talks to the guest over TCP sockets that QEMU connects *to*, which is what makes the
+carriage-return path testable at all: the Windows pipe used by the previous, out-of-tree
+PowerShell version swallowed `0x0D` outright.
 
 ## The root filesystem
 
