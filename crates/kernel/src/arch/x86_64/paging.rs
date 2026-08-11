@@ -345,6 +345,12 @@ fn leaf_bits(phys: PhysAddr, flags: PageFlags) -> u64 {
         // кешируемой из-за MTRR: тогда она хотя бы будет сквозной.
         bits |= ENTRY_CACHE_DISABLE | ENTRY_WRITE_THROUGH;
     }
+    // `PageFlags::DMA` здесь намеренно ни во что не превращается, и это не
+    // упущение. Когерентность DMA на x86-64 обеспечивает сама шина: устройство,
+    // читающее память, получает данные из кеша процессора (snooping), а запись
+    // устройства инвалидирует строку. Выставить `PCD` было бы не осторожностью,
+    // а замедлением каждого обращения к кольцу дескрипторов без всякой пользы.
+    // На AArch64 тот же флаг делает настоящую работу — там обещания нет.
     if !flags.contains(PageFlags::EXEC) && NX_ENABLED.load(Ordering::Relaxed) {
         bits |= ENTRY_NO_EXECUTE;
     }
@@ -419,6 +425,39 @@ pub unsafe fn active_address_space() -> PageTable {
     PageTable { root: read_cr3(), phys_offset: Cell::new(PHYS_MAP_BASE) }
 }
 
+/// Добавить отображение в **уже активное** адресное пространство ядра.
+///
+/// Нужно всему, что появляется после инициализации памяти: окнам регистров
+/// устройств, буферам DMA, диапазонам конфигурационного пространства PCI. От
+/// [`AddressSpace::map_range`] отличается только тем, что не требует держать
+/// экземпляр [`PageTable`]: тот локален для запуска и до этих потребителей не
+/// доживает.
+///
+/// # Safety
+///
+/// Те же требования, что у [`active_address_space`]: собственные таблицы ядра
+/// должны быть активны, и никто другой не должен править их в это время.
+/// Отображаемый диапазон не должен пересекаться с тем, по чему ядро сейчас
+/// исполняется.
+pub unsafe fn map_active(
+    virt: VirtAddr,
+    phys: PhysAddr,
+    len: usize,
+    flags: PageFlags,
+) -> Result<(), MapError> {
+    // SAFETY: условия делегированы вызывающему контрактом этой функции.
+    let mut space = unsafe { active_address_space() };
+    // SAFETY: см. выше; `map_range` сам проверяет выравнивание и W^X.
+    let result =
+        crate::mm::frame::with(|frames| unsafe { space.map_range(virt, phys, len, flags, frames) });
+    match result {
+        Some(result) => result,
+        // Аллокатора кадров нет — значит взять кадр под промежуточную таблицу
+        // неоткуда, что для вызывающего неотличимо от исчерпания пула.
+        None => Err(MapError::OutOfFrames),
+    }
+}
+
 /// Доотобразить одну страницу регистров устройства и вернуть её виртуальный
 /// адрес в прямом отображении.
 ///
@@ -441,24 +480,15 @@ pub unsafe fn map_device_page(phys: PhysAddr) -> Result<usize, MapError> {
         return Err(MapError::Misaligned);
     }
     let virt = phys.to_direct_map();
-
-    // SAFETY: условия делегированы вызывающему контрактом этой функции.
-    let mut space = unsafe { active_address_space() };
     let flags = PageFlags::READ | PageFlags::WRITE | PageFlags::DEVICE;
 
-    // SAFETY: страница по этому виртуальному адресу либо ещё не отображена, либо
-    // отображена на тот же самый физический кадр — прямое отображение по
-    // построению взаимно однозначно, поэтому запись не может увести из-под ног
-    // работающий код. `map` сам откажет с `AlreadyMapped`, если это не так.
-    let result = crate::mm::frame::with(|frames| unsafe { space.map(virt, phys, flags, frames) });
-
-    match result {
-        Some(Ok(())) => Ok(virt.as_usize()),
-        Some(Err(error)) => Err(error),
-        // Аллокатора кадров нет — значит взять кадр под промежуточную таблицу
-        // неоткуда, что для вызывающего неотличимо от исчерпания пула.
-        None => Err(MapError::OutOfFrames),
-    }
+    // SAFETY: условия делегированы вызывающему; страница по этому виртуальному
+    // адресу либо ещё не отображена, либо отображена на тот же самый физический
+    // кадр — прямое отображение по построению взаимно однозначно, поэтому
+    // запись не может увести из-под ног работающий код. `map` сам откажет с
+    // `AlreadyMapped`, если это не так.
+    unsafe { map_active(virt, phys, PAGE_SIZE, flags) }?;
+    Ok(virt.as_usize())
 }
 
 /// Убрать из TLB трансляцию одной страницы.

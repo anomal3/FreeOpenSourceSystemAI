@@ -39,16 +39,19 @@
 #![no_std]
 #![no_main]
 
+mod acpi;
 mod arch;
 mod console;
 mod fs;
 mod input;
 mod irq;
 mod mm;
+mod pci;
 mod print;
 mod sched;
 mod serial;
 mod sync;
+mod usb;
 mod vfs;
 
 extern crate alloc;
@@ -310,6 +313,24 @@ fn start_input(info: &BootInfo) -> bool {
     kprintln!("---- input ------------------------------------------------------");
 
     let sources = arch::input::init(info);
+
+    // USB поднимается после арх-специфичного ввода, и порядок здесь имеет
+    // значение только один раз: на x86-64 PS/2-клавиатура к этому моменту уже
+    // работает, поэтому отказ USB не оставляет машину без ввода и не обязан быть
+    // фатальным. На AArch64 наоборот — USB там единственный путь к настоящей
+    // клавиатуре, но и там отказ не смертелен: остаётся серийный порт.
+    //
+    // SAFETY: ядро исполняется на собственных таблицах, прерывания разрешены
+    // (`start_interrupts` вызван раньше — ожидания внутри драйвера опираются на
+    // таймер), таблицы ACPI не переиспользованы, и ни один лок не удерживается.
+    let usb_keyboard = unsafe { usb::xhci::init(info.acpi_rsdp) };
+
+    let sources = input::Sources {
+        keyboard: sources.keyboard || usb_keyboard,
+        serial: sources.serial,
+    };
+    input::set_sources(sources);
+
     if !sources.any() {
         kprintln!("  input       : no source of key events on this machine");
     }
@@ -387,6 +408,12 @@ fn prompt_task() {
     let mut idle_since = irq::uptime_ms();
 
     loop {
+        // Опрос контроллера USB живёт здесь, а не в обработчике таймера, и это
+        // осознанно: обработчик обязан быть коротким и не имеет права ждать
+        // занятый лок, а разбор кольца событий делает и то, и другое. Задача же
+        // и без того просыпается на каждом витке планировщика.
+        usb::xhci::service();
+
         while let Some(event) = input::next_event() {
             idle_since = irq::uptime_ms();
             match editor.handle(event) {
@@ -447,6 +474,7 @@ fn command(line: &str) -> bool {
             kprintln!("  uptime   time since the timer started");
             kprintln!("  mem      physical frames and heap");
             kprintln!("  input    key event counters");
+            kprintln!("  usb      xHCI controller state");
             kprintln!("  tasks    scheduler state");
             kprintln!("  exit     finish the boot and halt");
         }
@@ -472,6 +500,16 @@ fn command(line: &str) -> bool {
                 input::modifiers()
             );
         }
+        "usb" => match usb::xhci::summary() {
+            Some((slot, port, reports, events, errors)) => {
+                kprintln!(
+                    "  xhci     slot {slot} on port {port}, {reports} reports, {events} events, {errors} transfer errors"
+                );
+                let (used, total) = mm::dma::stats();
+                kprintln!("  dma      {used} of {total} bytes of the DMA window in use");
+            }
+            None => kprintln!("  xhci     no controller"),
+        },
         "tasks" => sched::dump(),
         "exit" | "quit" => {
             kprintln!("  finishing the session");

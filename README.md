@@ -2,9 +2,10 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 6a — bring-up.** The kernel boots on both architectures, owns its memory,
-> schedules tasks, reads files from a FAT32 RAM disk and accepts keyboard input, but there is
-> no userspace and no shell worth the name yet. See [Roadmap](#roadmap).
+> **Status: Phase 6 done — bring-up.** The kernel boots on both architectures, owns its
+> memory, schedules tasks, reads files from a FAT32 RAM disk and takes input from a USB
+> keyboard, but there is no userspace and no shell worth the name yet.
+> See [Roadmap](#roadmap).
 
 ## Why
 
@@ -53,10 +54,11 @@ cargo xtask run --arch x86_64 --gdb   # halt before first instruction, gdbstub o
 `FREEOS_OVMF_X86_64` / `FREEOS_OVMF_AARCH64` environment variables.
 
 Once the boot log settles, the kernel offers a prompt: `help` lists what it answers,
-`exit` ends the session and halts. Type into the QEMU window (PS/2 keyboard, x86-64 only)
-or into the terminal QEMU was started from — the serial line is an input device too, and it
-is the only one on AArch64 until the USB stack exists. With nobody typing, the prompt gives
-up after twenty seconds so unattended runs still terminate.
+`exit` ends the session and halts. Type into the QEMU window — `xtask` attaches a USB
+keyboard (`qemu-xhci` + `usb-kbd`) on both architectures, and on x86-64 the PS/2 keyboard
+works alongside it — or into the terminal QEMU was started from, because the serial line is
+an input device too. With nobody typing, the prompt gives up after twenty seconds so
+unattended runs still terminate.
 
 ## Layout
 
@@ -64,19 +66,23 @@ up after twenty seconds so unattended runs still terminate.
 crates/boot-info/   Stable #[repr(C)] hand-off contract: bootloader → kernel
 crates/boot-uefi/   UEFI application: GOP probe, ELF loading, ExitBootServices
 crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
-  src/mm/           Frame allocator, page-table contract, kernel heap
+  src/mm/           Frame allocator, page tables, kernel heap, DMA-coherent arena
   src/sched/        Cooperative round-robin scheduler and tasks
   src/vfs/ src/fs/  VFS traits, RAM disk, FAT32 reader
   src/input/        Key codes, event queue, US keymap, line editor
+  src/acpi.rs       Table lookup by signature (MADT on x86-64, MCFG everywhere)
+  src/pci.rs        ECAM configuration space, bus walk across bridges
+  src/usb/          xHCI host controller, HID boot protocol
   src/arch/         Everything that differs between x86-64 and AArch64
 xtask/              Host-side build / image / QEMU orchestration
 ```
 
-Device drivers live under `src/arch/` for now rather than in a `drivers/` crate, and that is a
-statement about what they are, not a shortcut. The i8042 is not an x86 driver that happens to
-run on PCs: it *is* the PC platform, addressed through instructions that exist nowhere else.
-The parts that are genuinely portable — key codes, the keymap, line editing — are already
-outside `arch/`, and that is the split that will still hold when a USB keyboard shows up.
+Where a driver lives says what it is. The i8042 sits under `src/arch/x86_64/` because it is not
+an x86 driver that happens to run on PCs — it *is* the PC platform, addressed through
+instructions that exist nowhere else. The xHCI driver sits outside `arch/` for the same reason
+read backwards: it talks to a PCIe device through memory, and nothing in it can tell which
+architecture it is running on. That claim is checked rather than asserted — the same code
+drives the keyboard on `q35` and on `virt`.
 
 The kernel does **not** yet execute from the upper half. It is a PIE whose
 relocations the bootloader already applied against a physical base, so a real
@@ -111,14 +117,14 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 4 | Cooperative scheduler, designed so preemption is an additive change | **done** |
 | 5 | RAM-disk, VFS traits, FAT32 reader | **done** |
 | 6a | Input core, PS/2 keyboard on x86-64, serial-line input on both, line editing | **done** |
-| 6b | xHCI + USB HID boot protocol — the only input path on RPi 4 and on modern x86 | |
+| 6b | PCIe enumeration, xHCI host controller, USB HID boot protocol | **done** |
 | 7 | Framebuffer compositor, minimal shell | |
 | 8 | Graphical UEFI installer (GPT, ESP, user account) | |
 
-Phase 6 is split because its two halves are not the same size. PS/2 is two I/O ports and a
-scancode table; a host-side USB stack means transfer rings, DMA-capable allocation and device
-enumeration, and is measured in weeks. Keeping them in one phase would mean one commit whose
-first half nobody could run.
+Phase 6 was split because its two halves are not the same size. PS/2 is two I/O ports and a
+scancode table; a host-side USB stack is PCIe enumeration, DMA-coherent allocation, transfer
+rings and device enumeration. Keeping them in one commit would have meant shipping a first
+half nobody could run.
 
 Deliberately out of scope for now, but not architecturally blocked: userspace
 isolation with an ELF loader, then a PE loader and a Wine-style Win32

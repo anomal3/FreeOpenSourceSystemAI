@@ -153,14 +153,26 @@ const MAIR_ATTR_DEVICE_NGNRNE: u64 = 0x00;
 /// именно он используется для PL011 и фреймбуфера.
 const MAIR_ATTR_DEVICE_NGNRE: u64 = 0x04;
 
+/// Normal Non-Cacheable: обычная память (выровненность не требуется, доступы
+/// можно объединять), но без кеша между процессором и устройством.
+///
+/// Нужна для буферов DMA. Device-память для них не подходит: у неё запрещено
+/// невыровненное обращение, а кольцо дескрипторов xHCI — это структуры с полями
+/// разной ширины. Кешируемая обычная память не подходит тоже: без IOMMU и без
+/// обещания когерентности от платформы устройство читало бы память, пока
+/// записанное процессором лежит в кеше.
+const MAIR_ATTR_NORMAL_NC: u64 = 0x44;
+
 const ATTR_IDX_NORMAL: u64 = 0;
 const ATTR_IDX_DEVICE_NGNRNE: u64 = 1;
 const ATTR_IDX_DEVICE_NGNRE: u64 = 2;
+const ATTR_IDX_NORMAL_NC: u64 = 3;
 
 /// Готовое значение `MAIR_EL1`: восемь байт, по байту на индекс атрибута.
 const MAIR_EL1_VALUE: u64 = (MAIR_ATTR_NORMAL_WB << (ATTR_IDX_NORMAL * 8))
     | (MAIR_ATTR_DEVICE_NGNRNE << (ATTR_IDX_DEVICE_NGNRNE * 8))
-    | (MAIR_ATTR_DEVICE_NGNRE << (ATTR_IDX_DEVICE_NGNRE * 8));
+    | (MAIR_ATTR_DEVICE_NGNRE << (ATTR_IDX_DEVICE_NGNRE * 8))
+    | (MAIR_ATTR_NORMAL_NC << (ATTR_IDX_NORMAL_NC * 8));
 
 // ---------------------------------------------------------------------------
 // TCR_EL1: геометрия трансляции
@@ -330,7 +342,20 @@ fn leaf_descriptor(phys: PhysAddr, flags: PageFlags) -> u64 {
     // а в дескрипторе создаст видимость разрешения.
     let exec = flags.contains(PageFlags::EXEC) && !device;
 
-    let attr_index = if device { ATTR_IDX_DEVICE_NGNRE } else { ATTR_IDX_NORMAL };
+    // Порядок проверок важен: `DEVICE` сильнее `DMA`. Оба флага одновременно
+    // осмысленны (регистры устройства, к которым обращается и оно само), и
+    // Device-семантика из них строже.
+    let attr_index = if device {
+        ATTR_IDX_DEVICE_NGNRE
+    } else if flags.contains(PageFlags::DMA) {
+        ATTR_IDX_NORMAL_NC
+    } else {
+        ATTR_IDX_NORMAL
+    };
+    // Для Non-Cacheable памяти архитектура и так трактует любое отображение как
+    // outer shareable, поэтому поле здесь не имеет значения; оставляем то же,
+    // что у обычной памяти, чтобы дескрипторы отличались одним полем, а не
+    // двумя.
     let shareability = if device { SH_NON_SHAREABLE } else { SH_INNER_SHAREABLE };
     // Отдельного «запрета чтения» на AArch64 нет: любая валидная запись
     // читаема, и `PageFlags::READ` влияет только на выбор AP через отсутствие
@@ -730,6 +755,92 @@ const KIND_FRAMEBUFFER: u32 = MemoryKind::Framebuffer as u32;
 ///
 /// Возвращённое пространство ещё не активировано: это отдельный шаг
 /// [`AddressSpace::activate`].
+/// Взять в работу уже активное дерево таблиц, прочитав его корни из `TTBR0_EL1`
+/// и `TTBR1_EL1`.
+///
+/// Нужно тем частям ядра, которые доотображают что-то уже после инициализации
+/// памяти: окна регистров устройств (xHCI, контроллер PCI) и буферы DMA.
+/// Экземпляр, построенный [`build_kernel_address_space`], до них не доживает —
+/// он локален для запуска.
+///
+/// Смещение доступа сразу выставлено в [`PHYS_MAP_BASE`]: функция по контракту
+/// вызывается только когда собственные таблицы ядра уже активны, а значит прямое
+/// отображение работает. Владения дерево не получает.
+///
+/// # Safety
+///
+/// * процессор должен исполняться на таблицах, построенных этим модулем (у
+///   чужих таблиц прошивки нет прямого отображения по [`PHYS_MAP_BASE`], и
+///   первое же обращение к записи ушло бы в никуда);
+/// * пока полученный экземпляр жив, никто другой не должен править то же
+///   дерево: два `&mut` на одни и те же таблицы дадут гонку записей.
+pub unsafe fn active_address_space() -> PageTables {
+    let (low, high): (u64, u64);
+    // SAFETY: чтение `TTBR0_EL1`/`TTBR1_EL1` с EL1 разрешено и побочных эффектов
+    // не имеет.
+    unsafe {
+        asm!(
+            "mrs {low}, ttbr0_el1",
+            "mrs {high}, ttbr1_el1",
+            low = out(reg) low,
+            high = out(reg) high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    // Младшие биты TTBRx несут ASID и CnP, а не часть адреса.
+    PageTables {
+        low: PhysAddr::new(low & DESC_ADDR_MASK),
+        high: PhysAddr::new(high & DESC_ADDR_MASK),
+        access_offset: AtomicUsize::new(PHYS_MAP_BASE),
+    }
+}
+
+/// Добавить отображение в **уже активное** адресное пространство ядра.
+///
+/// Двойник одноимённой функции x86-64: ядро вызывает `arch::map_active` и не
+/// знает, из чего собрано дерево под ним.
+///
+/// # Safety
+///
+/// Те же требования, что у [`active_address_space`]. Отображаемый диапазон не
+/// должен пересекаться с тем, по чему ядро сейчас исполняется.
+pub unsafe fn map_active(
+    virt: VirtAddr,
+    phys: PhysAddr,
+    len: usize,
+    flags: PageFlags,
+) -> Result<(), MapError> {
+    // SAFETY: условия делегированы вызывающему контрактом этой функции.
+    let mut space = unsafe { active_address_space() };
+    // SAFETY: см. выше; `map_range` сам проверяет выравнивание и W^X.
+    let result =
+        crate::mm::frame::with(|frames| unsafe { space.map_range(virt, phys, len, flags, frames) });
+    match result {
+        Some(result) => result,
+        None => Err(MapError::OutOfFrames),
+    }
+}
+
+/// Доотобразить страницу регистров устройства и вернуть её виртуальный адрес в
+/// прямом отображении.
+///
+/// # Safety
+///
+/// См. [`map_active`]; `phys` обязан быть адресом регистров устройства —
+/// отображение получает семантику Device-памяти.
+pub unsafe fn map_device_page(phys: PhysAddr) -> Result<usize, MapError> {
+    if !phys.is_page_aligned() {
+        return Err(MapError::Misaligned);
+    }
+    let virt = phys.to_direct_map();
+    let flags = PageFlags::READ | PageFlags::WRITE | PageFlags::DEVICE;
+    // SAFETY: условия делегированы вызывающему; прямое отображение взаимно
+    // однозначно, поэтому повторное отображение того же кадра не может увести
+    // из-под ног работающий код.
+    unsafe { map_active(virt, phys, PAGE_SIZE, flags) }?;
+    Ok(virt.as_usize())
+}
+
 pub fn build_kernel_address_space(
     info: &BootInfo,
     alloc: &mut impl FrameAllocator,

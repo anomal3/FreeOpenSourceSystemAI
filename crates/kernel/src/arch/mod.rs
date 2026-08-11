@@ -48,6 +48,18 @@ pub use x86_64::build_kernel_address_space;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::build_kernel_address_space;
 
+/// Добавить отображение в уже активное адресное пространство ядра.
+///
+/// Всё, что появляется после инициализации памяти, отображается через эту точку:
+/// окна регистров PCI и xHCI, буферы DMA. Экземпляр [`KernelSpace`], собранный
+/// при запуске, до этих потребителей не доживает — он локален для инициализации
+/// памяти, а хранить его глобально означало бы завести ещё один изменяемый
+/// синглтон ради нескольких записей в таблицу.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::paging::map_active;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::paging::map_active;
+
 /// Прерывания и исключения. Обе реализации выставляют один набор имён:
 /// `init`, `enable`, `disable`, `enabled`, `without_interrupts`.
 #[cfg(target_arch = "x86_64")]
