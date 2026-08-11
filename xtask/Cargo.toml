@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Host-side build/run orchestrator: builds the UEFI bootloader per architecture and boots it under QEMU."
+description = "Host-side build/run orchestrator: builds the UEFI bootloader and the kernel per architecture, lays them out on an ESP and boots it under QEMU."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -54,7 +54,8 @@ cargo xtask run --arch x86_64 --gdb   # halt before first instruction, gdbstub o
 
 ```
 crates/boot-info/   Stable #[repr(C)] hand-off contract: bootloader → kernel
-crates/boot-uefi/   UEFI application; one source, both architectures
+crates/boot-uefi/   UEFI application: GOP probe, ELF loading, ExitBootServices
+crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
 xtask/              Host-side build / image / QEMU orchestration
 ```
 
@@ -75,9 +76,9 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 
 | Phase | Scope | State |
 |---|---|---|
-| 0 | Workspace, toolchain, UEFI app boots and prints on both arches | in progress |
-| 1 | `BootInfo` hand-off, `ExitBootServices`, jump to kernel | |
-| 2 | Physical frame allocator, higher-half paging with W^X, kernel heap | |
+| 0 | Workspace, toolchain, UEFI app boots and prints on both arches | **done** |
+| 1 | `BootInfo` hand-off, `ExitBootServices`, jump to kernel | **done** |
+| 2 | Physical frame allocator, higher-half paging with W^X, kernel heap | next |
 | 3 | Interrupts: IDT+APIC (x86), exception vectors+GIC (ARM), timer tick | |
 | 4 | Cooperative scheduler, designed so preemption is an additive change | |
 | 5 | RAM-disk, VFS traits, FAT32 reader | |

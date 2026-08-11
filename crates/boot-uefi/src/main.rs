@@ -1,13 +1,17 @@
-//! FreeOS UEFI bootloader — Phase 0.
+//! FreeOS UEFI bootloader.
 //!
-//! Задача этой фазы: доказать, что образ грузится обеими прошивками (OVMF на
-//! x86-64 и pftf/RPi4 на ARM64), что консоль и графика доступны, и что
-//! [`boot_info::BootInfo`] можно собрать целиком, кроме карты памяти.
+//! Загрузчик доводит машину от прошивки до первой инструкции ядра:
 //!
-//! Ядра ещё не существует, поэтому `ExitBootServices` здесь НЕ вызывается:
-//! после выхода из boot services нет ни консоли, ни аллокатора, ни куда
-//! передать управление — приложение просто вернуло бы `Status::SUCCESS` в
-//! мёртвом окружении. Место, где это появится, помечено ниже как Phase 1.
+//!   1. Диагностика прошивки, GOP-фреймбуфер и тестовая картинка ([`graphics`]).
+//!   2. Чтение `\kernel.elf` с того же тома, с которого стартовал сам загрузчик
+//!      ([`kernel_image`]).
+//!   3. Разбор ELF64, размещение PIE-образа в физической памяти и применение
+//!      релокаций ([`elf`]).
+//!   4. Снятие карты памяти, `ExitBootServices` и прыжок в ядро ([`handoff`]).
+//!
+//! Шаги 1–3 полностью обратимы: при любой ошибке загрузчик печатает, что именно
+//! не сошлось, и возвращает управление прошивке. Шаг 4 — точка невозврата, и
+//! всё, что нужно сказать пользователю, сказано до неё.
 //!
 //! Весь текст, который уходит в консоль, намеренно ASCII: прошивка выводит
 //! stdout ещё и на последовательный порт, преобразуя UCS-2 в однобайтовую
@@ -16,12 +20,21 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod elf;
+mod graphics;
+mod handoff;
+mod kernel_image;
+
+use core::convert::Infallible;
 use core::time::Duration;
 
-use boot_info::{Arch, BootInfo, Framebuffer, PixelFormat};
-use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
+use boot_info::{Arch, BootInfo, MemoryKind};
 use uefi::table::cfg::ConfigTableEntry;
-use uefi::{Status, boot, entry, print, println, system};
+use uefi::{Status, boot, entry, println, system};
+
+use handoff::{Handoff, Override};
 
 /// Единственная арх-специфичная строчка в крейте: всё остальное обязано быть
 /// общим для `x86_64-unknown-uefi` и `aarch64-unknown-uefi`.
@@ -38,25 +51,19 @@ const _: () = assert!(
     "boot-uefi supports only the x86_64-unknown-uefi and aarch64-unknown-uefi targets"
 );
 
-/// UEFI GOP всегда отдаёт 32 бита на пиксель для форматов Rgb/Bgr.
-const BYTES_PER_PIXEL: usize = 4;
+/// Сколько секунд держать сообщение об ошибке на экране, прежде чем вернуть
+/// управление прошивке: иначе меню boot manager'а затрёт диагностику мгновенно.
+const ERROR_LINGER_SECONDS: u32 = 10;
 
-/// Толщина рамки по краю экрана, в пикселях.
-const BORDER: usize = 4;
+/// Короткая пауза перед точкой невозврата, чтобы тестовая картинка и сводка
+/// успели попасться на глаза. Держать здесь десятки секунд больше незачем —
+/// загрузка должна идти дальше, а не ждать человека.
+const HANDOFF_LINGER: Duration = Duration::from_millis(1500);
 
-/// Классические цветные полосы в логическом порядке (r, g, b). Набор подобран
-/// так, чтобы перепутанный порядок каналов бросался в глаза: при подмене
-/// R и B жёлтый станет голубым, а красный — синим.
-const BARS: [(u8, u8, u8); 8] = [
-    (255, 255, 255), // white
-    (255, 255, 0),   // yellow
-    (0, 255, 255),   // cyan
-    (0, 255, 0),     // green
-    (255, 0, 255),   // magenta
-    (255, 0, 0),     // red
-    (0, 0, 255),     // blue
-    (0, 0, 0),       // black
-];
+/// Провал шага загрузки. Значение намеренно пустое: подробности уже напечатаны
+/// там, где они были известны, а вызывающему остаётся только свернуть загрузку.
+#[derive(Debug, Clone, Copy)]
+pub struct Aborted;
 
 #[entry]
 fn main() -> Status {
@@ -71,35 +78,68 @@ fn main() -> Status {
     print_banner();
 
     let mut info = BootInfo::new(ARCH);
-    info.framebuffer = probe_framebuffer();
+    info.framebuffer = graphics::probe_framebuffer();
     info.acpi_rsdp = find_acpi_rsdp();
 
     print_boot_info(&info);
 
-    // ─────────────────────────── Phase 1 ────────────────────────────────────
-    // TODO(Phase 1): здесь появляется настоящая передача управления ядру.
-    // Порядок строго такой, и всё это должно уместиться между последним
-    // выводом в консоль и первой инструкцией ядра:
-    //
-    //   1. Загрузить образ ядра (SimpleFileSystem) и разметить его сегменты.
-    //   2. `boot::memory_map(MemoryType::LOADER_DATA)` — снимок карты памяти.
-    //      Буфер выделяется boot services, поэтому он сам попадает в карту как
-    //      LOADER_DATA => MemoryKind::BootloaderReclaimable.
-    //   3. Сконвертировать `MemoryDescriptor` -> `boot_info::MemoryRegion`
-    //      (слияние соседних одинаковых диапазонов, сортировка по `start`) и
-    //      записать `info.memory_map = MemoryMap { ptr, len }`.
-    //   4. `unsafe { boot::exit_boot_services(Some(MemoryType::LOADER_DATA)) }`.
-    //      После этого вызова консоль, аллокатор и любые протоколы мертвы —
-    //      ничего из uefi::boot/uefi::system больше вызывать нельзя.
-    //   5. Прыжок: `kernel_main(&info)` по загруженному entry point.
-    //
-    // До появления ядра ничего из этого делать нельзя: без п.5 выход из boot
-    // services оставил бы машину без единственного способа что-либо сообщить.
-    // ────────────────────────────────────────────────────────────────────────
+    match boot_kernel(&info) {
+        // Ok несёт `Infallible`: успешный путь заканчивается прыжком в ядро.
+        Ok(never) => match never {},
+        Err(Aborted) => {
+            println!("");
+            println!("!! boot aborted: the kernel was NOT started, returning to firmware");
+            linger(ERROR_LINGER_SECONDS);
+            Status::LOAD_ERROR
+        }
+    }
+}
 
-    pause(10);
+/// Загружает ядро и передаёт ему управление. Возвращается только при ошибке:
+/// успешный путь заканчивается прыжком, поэтому `Ok` несёт [`Infallible`].
+fn boot_kernel(info: &BootInfo) -> Result<Infallible, Aborted> {
+    println!("");
+    println!("---- kernel load ------------------------------------------------");
 
-    Status::SUCCESS
+    // Образ читается в пул прошивки и живёт ровно до конца размещения: держать
+    // его дольше — значит занимать место в карте памяти, которую увидит ядро.
+    let image = kernel_image::read()?;
+    let kernel = elf::load(&image)?;
+    drop(image);
+
+    // Карта памяти оценивается до выделения hand-off блока, но снимается
+    // окончательно только внутри ExitBootServices — см. модуль `handoff`.
+    let capacity = Handoff::estimate_capacity()?;
+    let handoff = Handoff::allocate(info, capacity)?;
+
+    // Диапазоны, тип которых прошивка не знает. Образ ядра лежит в LOADER_DATA
+    // и без подмены выглядел бы для ядра как reclaimable-память, которую можно
+    // затереть под собой. Пустые override'ы (например, при headless-загрузке)
+    // на разбиение диапазонов не влияют.
+    let overrides = [
+        Override::new(kernel.base, kernel.size, MemoryKind::Kernel),
+        Override::new(
+            info.framebuffer.base,
+            info.framebuffer.size,
+            MemoryKind::Framebuffer,
+        ),
+    ];
+
+    println!("");
+    println!("---- hand-off ---------------------------------------------------");
+    println!("  BootInfo        : {:#018x}", handoff.info_address());
+    println!(
+        "  kernel image    : {:#018x}..{:#018x} -> MemoryKind::Kernel",
+        kernel.base,
+        kernel.end()
+    );
+    println!("  entry point     : {:#018x}", kernel.entry);
+    println!("  exiting boot services -- console output stops here");
+    println!("-----------------------------------------------------------------");
+
+    boot::stall(HANDOFF_LINGER);
+
+    handoff::exit_and_jump(handoff, kernel.entry, &overrides)
 }
 
 fn arch_name() -> &'static str {
@@ -111,175 +151,13 @@ fn arch_name() -> &'static str {
 
 fn print_banner() {
     println!("================================================================");
-    println!("  FreeOS bootloader (boot-uefi) -- Phase 0 bring-up");
+    println!("  FreeOS bootloader (boot-uefi)");
     println!("================================================================");
     println!("  target arch     : {}", arch_name());
     println!("  UEFI revision   : {}", system::uefi_revision());
     println!("  firmware vendor : {}", system::firmware_vendor());
     println!("  firmware rev    : {:#010x}", system::firmware_revision());
     println!("");
-}
-
-/// Открывает GOP, описывает текущий режим и рисует тестовую картинку.
-///
-/// Headless-машина (или прошивка без GOP) — не ошибка на этой фазе: возвращаем
-/// [`Framebuffer::NONE`], ядро потом само решит, что делать без экрана.
-fn probe_framebuffer() -> Framebuffer {
-    let handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
-        Ok(handle) => handle,
-        Err(err) => {
-            println!("  [gop] no GraphicsOutput handle ({err:?}) -- headless boot");
-            return Framebuffer::NONE;
-        }
-    };
-
-    let mut gop = match boot::open_protocol_exclusive::<GraphicsOutput>(handle) {
-        Ok(gop) => gop,
-        Err(err) => {
-            println!("  [gop] cannot open GraphicsOutput ({err:?}) -- headless boot");
-            return Framebuffer::NONE;
-        }
-    };
-
-    let mode = gop.current_mode_info();
-    let (width, height) = mode.resolution();
-    // stride может быть больше width: прошивка выравнивает начало строки, и
-    // невидимый «хвост» каждой строки всё равно занимает память.
-    let stride = mode.stride();
-
-    // Порядок здесь принципиален: у uefi-rs `frame_buffer()` паникует в
-    // Blt-only режиме, поэтому формат проверяем ДО обращения к памяти. Это не
-    // теоретический случай — именно так ведёт себя virtio-gpu на QEMU virt.
-    // Bitmask потребовал бы разбора масок каналов, чего контракт BootInfo не
-    // передаёт; оба режима означают «линейного фреймбуфера нет».
-    let format = match mode.pixel_format() {
-        GopPixelFormat::Rgb => PixelFormat::Rgb,
-        GopPixelFormat::Bgr => PixelFormat::Bgr,
-        GopPixelFormat::Bitmask => {
-            println!("  [gop] {width}x{height} px, channel-mask format -- no linear framebuffer");
-            return Framebuffer::NONE;
-        }
-        GopPixelFormat::BltOnly => {
-            println!("  [gop] {width}x{height} px, Blt-only mode -- no linear framebuffer");
-            return Framebuffer::NONE;
-        }
-    };
-
-    let mut raw = gop.frame_buffer();
-    let base = raw.as_mut_ptr();
-    let size = raw.size();
-
-    let framebuffer = Framebuffer {
-        base: base as usize as u64,
-        size: size as u64,
-        width: width as u32,
-        height: height as u32,
-        stride: stride as u32,
-        format,
-    };
-
-    println!(
-        "  [gop] {}x{} px, stride {} px, {} bytes @ {:#018x}",
-        framebuffer.width, framebuffer.height, framebuffer.stride, framebuffer.size, framebuffer.base
-    );
-
-    println!("  [gop] drawing test pattern: bars are white/yellow/cyan/green/magenta/red/blue/black");
-    // SAFETY: `base`/`size` только что получены у живого GOP, описывают
-    // линейный фреймбуфер текущего режима и остаются валидными, пока `raw`
-    // и `gop` не уронены — а роняются они ниже по стеку. Формат к этому месту
-    // заведомо Rgb или Bgr, то есть 32-битные пиксели; геометрия из того же `mode`.
-    unsafe { draw_test_pattern(base, &framebuffer) };
-
-    // `raw` ронять отдельно не нужно: FrameBuffer ничем не владеет, а
-    // заимствование `gop` заканчивается на последнем обращении к нему.
-    // Протокол закрываем явно — дальше фреймбуфер адресуется физически.
-    drop(gop);
-
-    framebuffer
-}
-
-/// Рисует цветные полосы с градиентом сверху и рамку по периметру экрана.
-///
-/// # Safety
-///
-/// `base` должен указывать на доступный для записи линейный фреймбуфер длиной
-/// не менее `fb.size` байт, геометрия которого в точности описана `fb`
-/// (32 бита на пиксель, `fb.stride` пикселей на строку). `fb.format` не должен
-/// быть [`PixelFormat::Unknown`].
-unsafe fn draw_test_pattern(base: *mut u8, fb: &Framebuffer) {
-    let width = fb.width as usize;
-    let height = fb.height as usize;
-    if width == 0 || height == 0 {
-        return;
-    }
-
-    // Полоса сверху: достаточно заметная, но не закрывающая консольный текст.
-    let band = (height / 4).clamp(16, 160).min(height);
-    let bars_end = band / 2;
-
-    for y in 0..band {
-        for x in 0..width {
-            let (r, g, b) = if y < bars_end {
-                BARS[(x * BARS.len() / width).min(BARS.len() - 1)]
-            } else {
-                let level = (x * 255 / width) as u8;
-                (level, level, level)
-            };
-            // SAFETY: требования делегированы вызывающему (см. контракт этой
-            // функции); `put_pixel` дополнительно отсекает запись за `fb.size`.
-            unsafe { put_pixel(base, fb, x, y, r, g, b) };
-        }
-    }
-
-    // Рамка доказывает, что видны настоящие границы экрана, а не первые
-    // несколько строк памяти.
-    let thickness = BORDER.min(height / 2).min(width / 2).max(1);
-    for y in 0..height {
-        if y < thickness || y + thickness >= height {
-            for x in 0..width {
-                // SAFETY: см. выше.
-                unsafe { put_pixel(base, fb, x, y, 0, 255, 128) };
-            }
-        } else {
-            for x in 0..thickness {
-                // SAFETY: см. выше.
-                unsafe { put_pixel(base, fb, x, y, 0, 255, 128) };
-                // SAFETY: см. выше; `thickness <= width / 2`, поэтому
-                // `width - 1 - x` не уходит в underflow.
-                unsafe { put_pixel(base, fb, width - 1 - x, y, 0, 255, 128) };
-            }
-        }
-    }
-}
-
-/// # Safety
-///
-/// Те же требования, что и у [`draw_test_pattern`].
-#[inline]
-unsafe fn put_pixel(base: *mut u8, fb: &Framebuffer, x: usize, y: usize, r: u8, g: u8, b: u8) {
-    // Адресация идёт через stride, а не через width. Строки фреймбуфера часто
-    // дополнены невидимыми пикселями, и `y * width + x` на таком мониторе даёт
-    // характерный «косой» сдвиг картинки с каждой следующей строкой.
-    let offset = (y * fb.stride as usize + x) * BYTES_PER_PIXEL;
-    if offset + BYTES_PER_PIXEL > fb.size as usize {
-        return;
-    }
-
-    // Порядок байт канала задаёт прошивка, и ошибиться здесь — значит получить
-    // синее вместо красного; конвертируем явно, а не полагаясь на «обычно BGR».
-    let pixel: [u8; 4] = match fb.format {
-        PixelFormat::Bgr => [b, g, r, 0],
-        _ => [r, g, b, 0],
-    };
-
-    // SAFETY: проверка выше гарантирует `offset + 4 <= fb.size`, поэтому запись
-    // целиком попадает внутрь фреймбуфера, валидность которого гарантирует
-    // вызывающий. У `[u8; 4]` выравнивание 1, так что любое смещение корректно
-    // выровнено. `write_volatile` не даёт оптимизатору выбросить запись в
-    // память устройства, которую он считает никем не читаемой.
-    unsafe {
-        core::ptr::write_volatile(base.add(offset).cast::<[u8; 4]>(), pixel);
-    }
 }
 
 /// Физический адрес ACPI RSDP из UEFI configuration table, либо `0`.
@@ -300,28 +178,6 @@ fn find_acpi_rsdp() -> u64 {
         }
         legacy
     })
-}
-
-// --- Заглушки, которые требует кодогенерация -------------------------------
-
-/// Реализация `wcslen` для оптимизатора.
-///
-/// В release-сборке LLVM распознаёт цикл вычисления длины UTF-16 строки (крейт
-/// `uefi` повсеместно работает с `CStr16`) и заменяет его вызовом libc-функции
-/// `wcslen`. В bare-metal окружении libc нет, и линковка падает с `undefined
-/// symbol: wcslen` — причём только в release, debug эту замену не делает.
-/// В UEFI символ строки всегда 16-битный, поэтому реализация тривиальна.
-#[unsafe(no_mangle)]
-extern "C" fn wcslen(s: *const u16) -> usize {
-    let mut len = 0;
-    // SAFETY: контракт C-функции обязывает вызывающего передать указатель на
-    // нуль-терминированную строку; за терминатор мы не читаем.
-    unsafe {
-        while *s.add(len) != 0 {
-            len += 1;
-        }
-    }
-    len
 }
 
 fn print_boot_info(info: &BootInfo) {
@@ -353,35 +209,34 @@ fn print_boot_info(info: &BootInfo) {
         println!("  ACPI RSDP       : not found");
     }
     println!("  device tree     : {:#018x}", info.device_tree);
-    println!(
-        "  memory map      : {} regions @ {:#018x} (filled in Phase 1)",
-        info.memory_map.len, info.memory_map.ptr
-    );
     println!("-----------------------------------------------------------------");
 }
 
-/// Держит картинку на экране `seconds` секунд, прерываясь на первой клавише.
-///
-/// Опрос вместо ожидания события: `read_key` возвращает `Ok(None)` вместо
-/// блокировки, поэтому пауза гарантированно заканчивается сама и не вешает
-/// автоматический прогон в QEMU, где клавиши нажимать некому.
-fn pause(seconds: u32) {
+/// Держит сообщение об ошибке на экране, не блокируя автоматический прогон.
+fn linger(seconds: u32) {
     println!("");
-    print!("Holding for {seconds}s (press any key to continue)");
-
-    'outer: for _ in 0..seconds {
-        for _ in 0..10 {
-            if key_pressed() {
-                break 'outer;
-            }
-            boot::stall(Duration::from_millis(100));
-        }
-        print!(".");
-    }
-
-    println!("");
+    println!("Returning to the firmware in {seconds}s");
+    boot::stall(Duration::from_secs(u64::from(seconds)));
 }
 
-fn key_pressed() -> bool {
-    system::with_stdin(|stdin| matches!(stdin.read_key(), Ok(Some(_))))
+// --- Заглушки, которые требует кодогенерация -------------------------------
+
+/// Реализация `wcslen` для оптимизатора.
+///
+/// В release-сборке LLVM распознаёт цикл вычисления длины UTF-16 строки (крейт
+/// `uefi` повсеместно работает с `CStr16`) и заменяет его вызовом libc-функции
+/// `wcslen`. В bare-metal окружении libc нет, и линковка падает с `undefined
+/// symbol: wcslen` — причём только в release, debug эту замену не делает.
+/// В UEFI символ строки всегда 16-битный, поэтому реализация тривиальна.
+#[unsafe(no_mangle)]
+extern "C" fn wcslen(s: *const u16) -> usize {
+    let mut len = 0;
+    // SAFETY: контракт C-функции обязывает вызывающего передать указатель на
+    // нуль-терминированную строку; за терминатор мы не читаем.
+    unsafe {
+        while *s.add(len) != 0 {
+            len += 1;
+        }
+    }
+    len
 }

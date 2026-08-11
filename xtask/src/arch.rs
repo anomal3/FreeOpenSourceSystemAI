@@ -1,6 +1,7 @@
 //! Описание поддерживаемых архитектур и всего, что от них зависит.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 
@@ -24,24 +25,6 @@ impl Arch {
         match self {
             Arch::X86_64 => "x86_64",
             Arch::Aarch64 => "aarch64",
-        }
-    }
-
-    /// Таргет для UEFI-приложений (загрузчик, будущий установщик).
-    pub fn uefi_triple(self) -> &'static str {
-        match self {
-            Arch::X86_64 => "x86_64-unknown-uefi",
-            Arch::Aarch64 => "aarch64-unknown-uefi",
-        }
-    }
-
-    /// Таргет для freestanding-ядра. Пока не используется, но держим рядом,
-    /// чтобы соответствие arch -> triple было в одном месте.
-    #[allow(dead_code)]
-    pub fn bare_triple(self) -> &'static str {
-        match self {
-            Arch::X86_64 => "x86_64-unknown-none",
-            Arch::Aarch64 => "aarch64-unknown-none",
         }
     }
 
@@ -148,5 +131,88 @@ impl Arch {
 impl fmt::Display for Arch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+/// Имя файла ядра в корне ESP.
+///
+/// Значение — часть контракта с загрузчиком: он открывает на своём ESP ровно
+/// `\kernel.elf`, без поиска по маске и без вариантов. Менять только вместе с
+/// загрузчиком.
+pub const KERNEL_ESP_FILE: &str = "kernel.elf";
+
+/// Собираемый компонент ОС.
+///
+/// Заведён ради одного: чтобы соответствие (компонент, архитектура) -> триплет
+/// жило в единственном месте — в [`Component::triple`]. Триплет зависит не
+/// только от архитектуры: загрузчик — это PE-приложение, которое вызывает
+/// прошивка, ему нужен `*-unknown-uefi` со всем UEFI-ABI; ядро же получает
+/// управление после ExitBootServices, когда прошивки уже нет, и собирается под
+/// freestanding-таргет `*-unknown-none`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Component {
+    BootUefi,
+    Kernel,
+}
+
+impl Component {
+    /// Порядок важен: загрузчик собирается первым, потому что без него нечего
+    /// запускать, и его ошибки пользователь увидит раньше.
+    pub const ALL: [Component; 2] = [Component::BootUefi, Component::Kernel];
+
+    /// Имя пакета для `cargo --package`.
+    pub fn package(self) -> &'static str {
+        match self {
+            Component::BootUefi => "boot-uefi",
+            Component::Kernel => "kernel",
+        }
+    }
+
+    /// Как компонент называется в сообщениях пользователю.
+    pub fn title(self) -> &'static str {
+        match self {
+            Component::BootUefi => "загрузчик",
+            Component::Kernel => "ядро",
+        }
+    }
+
+    /// Единственная таблица «(компонент, архитектура) -> триплет» в крейте.
+    pub fn triple(self, arch: Arch) -> &'static str {
+        match (self, arch) {
+            (Component::BootUefi, Arch::X86_64) => "x86_64-unknown-uefi",
+            (Component::BootUefi, Arch::Aarch64) => "aarch64-unknown-uefi",
+            (Component::Kernel, Arch::X86_64) => "x86_64-unknown-none",
+            (Component::Kernel, Arch::Aarch64) => "aarch64-unknown-none",
+        }
+    }
+
+    /// Ожидаемое имя файла в `target/<triple>/<profile>/`.
+    ///
+    /// Расширение задаётся спецификацией таргета (поле `exe_suffix`), а не
+    /// cargo: у `*-unknown-uefi` это `.efi`, потому что прошивка грузит PE; у
+    /// `*-unknown-none` суффикса нет вовсе, и артефакт ядра лежит просто как
+    /// `kernel`, без расширения. Переименование в `kernel.elf` происходит уже
+    /// при раскладке ESP.
+    pub fn artifact_file(self) -> &'static str {
+        match self {
+            Component::BootUefi => "boot-uefi.efi",
+            Component::Kernel => "kernel",
+        }
+    }
+
+    /// Путь внутри ESP относительно корня раздела.
+    pub fn esp_path(self, arch: Arch) -> PathBuf {
+        match self {
+            Component::BootUefi => Path::new("EFI")
+                .join("BOOT")
+                .join(arch.removable_media_file()),
+            Component::Kernel => PathBuf::from(KERNEL_ESP_FILE),
+        }
+    }
+}
+
+impl fmt::Display for Component {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.package())
     }
 }

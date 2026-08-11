@@ -1,15 +1,13 @@
 //! Вызовы cargo для крейтов, которые нельзя собрать под host-триплет.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::arch::Arch;
+use crate::arch::{Arch, Component};
 use crate::paths;
 use crate::util;
-
-pub const BOOT_PACKAGE: &str = "boot-uefi";
 
 fn cargo() -> Command {
     // Cargo сообщает дочернему процессу путь к себе; так мы гарантированно
@@ -22,14 +20,64 @@ fn cargo() -> Command {
     cmd
 }
 
-/// Собирает UEFI-загрузчик и возвращает путь к готовому `.efi`.
-pub fn build_boot_uefi(arch: Arch, release: bool) -> Result<PathBuf> {
-    let triple = arch.uefi_triple();
+/// Результат сборки: какие компоненты собраны и где лежат их артефакты.
+///
+/// Хранится списком, а не полями, чтобы раскладка ESP умела пройти по нему
+/// циклом и не знала заранее, из скольких файлов состоит система.
+pub struct Built {
+    pub arch: Arch,
+    pub release: bool,
+    items: Vec<(Component, PathBuf)>,
+}
+
+impl Built {
+    pub fn iter(&self) -> impl Iterator<Item = (Component, &Path)> {
+        self.items
+            .iter()
+            .map(|(component, path)| (*component, path.as_path()))
+    }
+
+    /// Имя профиля так, как его называет cargo.
+    pub fn profile(&self) -> &'static str {
+        paths::profile_dir_name(self.release)
+    }
+
+    /// Путь к артефакту компонента, если он собирался в этот заход.
+    pub fn get(&self, component: Component) -> Option<&Path> {
+        self.iter()
+            .find(|(item, _)| *item == component)
+            .map(|(_, path)| path)
+    }
+}
+
+/// Собирает всё, что нужно для запуска: загрузчик и (если не отключено) ядро.
+pub fn build_all(arch: Arch, release: bool, with_kernel: bool) -> Result<Built> {
+    let mut items = Vec::with_capacity(Component::ALL.len());
+
+    for component in Component::ALL {
+        if component == Component::Kernel && !with_kernel {
+            println!("ядро пропущено (--no-kernel)");
+            continue;
+        }
+        items.push((component, build_component(component, arch, release)?));
+    }
+
+    Ok(Built {
+        arch,
+        release,
+        items,
+    })
+}
+
+/// Собирает один компонент и возвращает путь к готовому артефакту.
+pub fn build_component(component: Component, arch: Arch, release: bool) -> Result<PathBuf> {
+    let package = component.package();
+    let triple = component.triple(arch);
 
     let mut cmd = cargo();
     cmd.arg("build")
         .arg("--package")
-        .arg(BOOT_PACKAGE)
+        .arg(package)
         // --target обязателен здесь, а не в .cargo/config.toml: там [build] target
         // подействовал бы на весь workspace и сломал бы сборку самого xtask.
         .arg("--target")
@@ -38,42 +86,146 @@ pub fn build_boot_uefi(arch: Arch, release: bool) -> Result<PathBuf> {
         cmd.arg("--release");
     }
 
-    util::run(&mut cmd, &format!("cargo build ({BOOT_PACKAGE}, {triple})")).with_context(|| {
-        format!(
-            "не удалось собрать {BOOT_PACKAGE} под {triple}.\n\
-             Если cargo жалуется на отсутствующий таргет, выполните:\n    \
-             rustup target add {triple}"
-        )
-    })?;
+    run_cargo(&mut cmd, "build", component, triple)?;
 
-    let artifact = paths::target_dir()
-        .join(triple)
-        .join(paths::profile_dir_name(release))
-        .join(format!("{BOOT_PACKAGE}.efi"));
+    let dir = paths::artifact_dir(triple, release);
+    locate_artifact(&dir, component)
+}
 
-    if !artifact.is_file() {
-        bail!(
-            "cargo отработал успешно, но артефакт не найден: {}\n\
-             Ожидалось, что крейт {BOOT_PACKAGE} собирается в бинарный таргет \
-             с тем же именем (для *-unknown-uefi cargo даёт расширение .efi).",
-            artifact.display()
+/// Запускает cargo и, если он упал, дописывает к его ошибке разбор причины.
+///
+/// Подсказка идёт отдельным абзацем, а не через `with_context`: anyhow
+/// склеивает цепочку контекстов через «: », и многострочный совет в такой
+/// строке читается плохо.
+fn run_cargo(cmd: &mut Command, verb: &str, component: Component, triple: &str) -> Result<()> {
+    let package = component.package();
+    match util::run(cmd, &format!("cargo {verb} ({package}, {triple})")) {
+        Ok(()) => Ok(()),
+        Err(err) => bail!("{err:#}\n\n{}", failure_hint(component, triple)),
+    }
+}
+
+/// Разбор типовых причин, по которым cargo не собрал компонент.
+fn failure_hint(component: Component, triple: &str) -> String {
+    let package = component.package();
+    let manifest = paths::crate_manifest(package);
+
+    if !manifest.is_file() {
+        let mut msg = format!("крейта {package} нет: не найден {}", manifest.display());
+        if component == Component::Kernel {
+            msg.push_str(
+                "\nПока ядро не написано, загрузчик собирается и запускается отдельно:\n    \
+                 cargo xtask run --no-kernel",
+            );
+        }
+        return msg;
+    }
+
+    if !paths::is_workspace_member(package) {
+        return format!(
+            "крейт {package} существует, но не подключён к workspace — отсюда и \
+             «did not match any packages».\n\
+             Добавьте \"crates/{package}\" в members корневого Cargo.toml."
         );
     }
 
-    Ok(artifact)
+    format!(
+        "не удалось собрать {package} ({}) под {triple}.\n\
+         Если cargo жалуется на отсутствующий таргет, выполните:\n    \
+         rustup target add {triple}",
+        component.title(),
+    )
+}
+
+/// Ищет артефакт компонента в `target/<triple>/<profile>/`.
+///
+/// Имя проверяется фактическое, а не предполагаемое: расширение задаёт
+/// спецификация таргета (`exe_suffix`), и оно разное — `boot-uefi.efi` у
+/// UEFI-таргетов против `kernel` без расширения у `*-unknown-none`. Если
+/// ожидаемого файла нет, перебираем каталог по имени пакета, отбрасывая
+/// побочные продукты сборки (`.d`, `.pdb`, ...), чтобы вместо «файл не найден»
+/// дать либо настоящий артефакт, либо внятный список того, что там лежит.
+fn locate_artifact(dir: &Path, component: Component) -> Result<PathBuf> {
+    let expected = dir.join(component.artifact_file());
+    if expected.is_file() {
+        return Ok(expected);
+    }
+
+    // cargo нормализует дефисы в имени пакета в подчёркивания для файлов,
+    // но не для бинарных таргетов; проверяем оба варианта.
+    let stems = [
+        component.package().to_string(),
+        component.package().replace('-', "_"),
+    ];
+    // Всё, что cargo кладёт рядом с бинарником и что бинарником не является.
+    const SIDE_PRODUCTS: [&str; 6] = ["d", "pdb", "rlib", "rmeta", "dwp", "o"];
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut listing: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let stem_matches = path
+                .file_stem()
+                .is_some_and(|stem| stems.iter().any(|want| stem == want.as_str()));
+            if !stem_matches {
+                continue;
+            }
+            let is_side_product = path.extension().is_some_and(|ext| {
+                SIDE_PRODUCTS
+                    .iter()
+                    .any(|bad| ext.eq_ignore_ascii_case(bad))
+            });
+            listing.push(entry.file_name().to_string_lossy().into_owned());
+            if !is_side_product {
+                found.push(path);
+            }
+        }
+    }
+
+    if let Some(actual) = found.first() {
+        println!(
+            "внимание: ожидался артефакт {}, найден {} — использую его",
+            component.artifact_file(),
+            actual.display()
+        );
+        return Ok(actual.clone());
+    }
+
+    let seen = if listing.is_empty() {
+        "ничего похожего в каталоге нет".to_string()
+    } else {
+        format!("рядом лежат: {}", listing.join(", "))
+    };
+    bail!(
+        "cargo отработал успешно, но артефакт не найден: {}\n\
+         Ожидалось, что крейт {} собирается в бинарный таргет с тем же именем; {seen}.",
+        expected.display(),
+        component.package(),
+    );
 }
 
 /// `cargo check` для указанных архитектур — быстрая проверка без линковки.
+///
+/// Целей четыре (два компонента на две архитектуры) плюс host-крейт xtask:
+/// одна ошибка в общем коде должна вылезать здесь, а не при сборке конкретного
+/// таргета.
 pub fn check(arches: &[Arch]) -> Result<()> {
     for &arch in arches {
-        let triple = arch.uefi_triple();
-        let mut cmd = cargo();
-        cmd.arg("check")
-            .arg("--package")
-            .arg(BOOT_PACKAGE)
-            .arg("--target")
-            .arg(triple);
-        util::run(&mut cmd, &format!("cargo check ({BOOT_PACKAGE}, {triple})"))?;
+        for component in Component::ALL {
+            let package = component.package();
+            let triple = component.triple(arch);
+            let mut cmd = cargo();
+            cmd.arg("check")
+                .arg("--package")
+                .arg(package)
+                .arg("--target")
+                .arg(triple);
+            run_cargo(&mut cmd, "check", component, triple)?;
+        }
     }
 
     // Хост-часть workspace (сам xtask) проверяется без --target.

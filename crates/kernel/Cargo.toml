@@ -1,0 +1,24 @@
+[package]
+name = "kernel"
+description = "Freestanding FreeOS kernel: Phase 1 bring-up (serial, framebuffer console, BootInfo dump)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+# There is no test harness on a bare-metal target: `cargo test` would try to
+# link libtest against std. Disabling both keeps `cargo test --workspace` sane.
+test = false
+bench = false
+
+[dependencies]
+boot-info = { path = "../boot-info" }
+# `default-features = false` drops the `std` and `unicode` features; what remains
+# is `font8x8::legacy`, a dependency-free table of `[u8; 8]` glyph rows.
+font8x8 = { version = "0.3.1", default-features = false }
+
+[lints]
+workspace = true

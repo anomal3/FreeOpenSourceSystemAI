@@ -1,0 +1,9 @@
+# Normalise to LF in the repository. The project targets bare metal and is
+# built on Windows and Linux alike; a mixed working tree produces diffs that
+# are entirely line-ending noise.
+* text=auto eol=lf
+
+# Binary assets, if any land here later.
+*.png binary
+*.fd  binary
+*.img binary

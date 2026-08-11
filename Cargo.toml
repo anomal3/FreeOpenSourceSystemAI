@@ -4,6 +4,7 @@ members = [
     "xtask",
     "crates/boot-info",
     "crates/boot-uefi",
+    "crates/kernel",
 ]
 
 # Bare-metal crates cannot be built for the host triple. A bare `cargo build`

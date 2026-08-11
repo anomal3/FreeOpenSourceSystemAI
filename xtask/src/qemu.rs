@@ -1,17 +1,17 @@
 //! Подготовка ESP и запуск QEMU.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::arch::Arch;
+use crate::arch::{Arch, Component};
+use crate::build::Built;
 use crate::firmware;
 use crate::paths;
 use crate::util;
 
 pub struct RunOptions {
-    pub arch: Arch,
     pub gdb: bool,
     pub serial_only: bool,
     pub reset_nvram: bool,
@@ -19,26 +19,42 @@ pub struct RunOptions {
     pub extra: Vec<String>,
 }
 
-/// Раскладывает собранный `.efi` по структуре ESP и возвращает корень раздела.
+/// Раскладывает собранные артефакты по структуре ESP и возвращает корень раздела.
 ///
-/// Настоящий загрузочный образ (GPT + FAT32) на Phase 0 не собирается: QEMU
-/// умеет представлять обычный каталог хоста как FAT-раздел (драйвер VVFAT,
+/// Настоящий загрузочный образ (GPT + FAT32) пока не собирается: QEMU умеет
+/// представлять обычный каталог хоста как FAT-раздел (драйвер VVFAT,
 /// `file=fat:rw:<dir>`). Это убирает из dev-loop целый шаг — пересборку образа
 /// после каждой правки — и заметно ускоряет цикл «поправил → запустил».
-pub fn prepare_esp(arch: Arch, efi: &Path) -> Result<PathBuf> {
+///
+/// Раскладка: загрузчик уходит в `\EFI\BOOT\BOOT<MACHINE>.EFI` (путь диктует
+/// прошивка), ядро — в корень под именем `kernel.elf` (имя диктует загрузчик).
+pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
+    let arch = built.arch;
     let esp = paths::esp_dir(arch);
-    let boot_dir = esp.join("EFI").join("BOOT");
 
-    std::fs::create_dir_all(&boot_dir)
-        .with_context(|| format!("не удалось создать каталог ESP {}", boot_dir.display()))?;
+    std::fs::create_dir_all(&esp)
+        .with_context(|| format!("не удалось создать каталог ESP {}", esp.display()))?;
 
-    // Имя фиксировано спецификацией UEFI (removable media path): прошивка сама,
-    // без единой записи в NVRAM, ищет \EFI\BOOT\BOOTX64.EFI (или BOOTAA64.EFI
-    // на ARM64) на каждом найденном FAT-разделе.
-    let dst = boot_dir.join(arch.removable_media_file());
-    util::copy_file(efi, &dst)?;
+    for component in Component::ALL {
+        let dst = esp.join(component.esp_path(arch));
+        match built.get(component) {
+            Some(src) => {
+                util::copy_file(src, &dst)?;
+                println!("ESP: {} -> {}", src.display(), dst.display());
+            }
+            // Компонент не собирался (--no-kernel). Файл от прошлого запуска
+            // надо убрать: иначе загрузчик подхватит устаревшее ядро, и то, что
+            // мы собирались проверить без ядра, проверено не будет.
+            None => {
+                if dst.is_file() {
+                    std::fs::remove_file(&dst)
+                        .with_context(|| format!("не удалось удалить {}", dst.display()))?;
+                    println!("ESP: удалён устаревший {}", dst.display());
+                }
+            }
+        }
+    }
 
-    println!("ESP: {} -> {}", efi.display(), dst.display());
     Ok(esp)
 }
 
@@ -102,10 +118,10 @@ fn find_qemu(arch: Arch) -> Result<PathBuf> {
     bail!("{msg}");
 }
 
-pub fn run(opts: &RunOptions, efi: &Path) -> Result<()> {
-    let arch = opts.arch;
+pub fn run(opts: &RunOptions, built: &Built) -> Result<()> {
+    let arch = built.arch;
     let qemu = find_qemu(arch)?;
-    let esp = prepare_esp(arch, efi)?;
+    let esp = prepare_esp(built)?;
 
     let fw = firmware::resolve(arch, Some(qemu.as_path()))?;
     let fw = firmware::prepare(arch, &fw, opts.reset_nvram)?;
@@ -210,6 +226,12 @@ fn print_gdb_hint(arch: Arch) {
         "Символы: .efi — это PE, и прошивка перемещает его по произвольному адресу.\n\
          Загрузчик печатает свой image base в серийную консоль; когда увидите адрес:\n\
              (gdb) add-symbol-file target/<triple>/<profile>/boot-uefi.efi <base + .text RVA>"
+    );
+    println!();
+    println!(
+        "Ядро — ELF (и файл без расширения: так устроены таргеты *-unknown-none),\n\
+         но собрано как PIE, поэтому адрес тоже берётся из вывода загрузчика:\n\
+             (gdb) add-symbol-file target/<triple>/<profile>/kernel <load addr>"
     );
     println!("---------------");
 }

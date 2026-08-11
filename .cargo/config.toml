@@ -7,3 +7,65 @@
 
 [alias]
 xtask = "run --package xtask --"
+
+# --- Kernel targets -----------------------------------------------------------
+#
+# Оба freestanding-таргета используются ровно одним крейтом — `kernel`, поэтому
+# target-specific rustflags здесь безопасны: на `xtask` (хост) и на
+# `boot-uefi` (*-unknown-uefi) они не распространяются.
+#
+# Зачем всё это: загрузчик размещает ядро по адресу, который вернёт
+# `AllocatePages`, — заранее он неизвестен и от машины к машине меняется.
+# Значит, образ обязан быть position-independent (ELF-тип `ET_DYN`), а
+# оставшиеся абсолютные адреса — приезжать в `.rela.dyn` как
+# `R_X86_64_RELATIVE` / `R_AARCH64_RELATIVE`, чтобы загрузчик прибавил к ним
+# базу. Без этого ядро корректно работало бы только по одному конкретному
+# адресу линковки.
+#
+# Общее для обеих архитектур:
+#   relocation-model=pic  — генерировать PC-относительный код;
+#   link-arg=-pie         — просить lld собрать ET_DYN, а не ET_EXEC;
+#   --no-dynamic-linker   — не проставлять PT_INTERP: динамического линкера в
+#                           ядре нет и не будет, relocations применяет сам
+#                           загрузчик;
+#   --entry=kernel_main   — e_entry ELF-заголовка должен указывать на точку
+#                           входа ядра (иначе lld ищет `_start` и ругается);
+#   --export-dynamic-symbol=kernel_main
+#                         — продублировать точку входа в .dynsym, чтобы
+#                           загрузчик мог найти её и по имени, а не только
+#                           через e_entry;
+#   -z max-page-size=4096 — иначе lld выравнивает сегменты на 64 КиБ (aarch64) /
+#                           4 КиБ (x86_64), раздувая образ и разъезжаясь с тем,
+#                           как загрузчик считает страницы.
+
+[target.x86_64-unknown-none]
+rustflags = [
+    # code-model НЕ переопределяем. У таргета он равен `kernel` (расчёт на
+    # верхние 2 ГиБ адресного пространства), и попытка выставить `small` ломает
+    # release-сборку: предсобранный rustup'ом `core` собран с `kernel`, и при
+    # LTO ("linking module flags 'Code Model': IDs have conflicting values")
+    # модули отказываются сливаться. Пересобирать core через build-std ради
+    # этого нельзя — `[unstable] build-std` глобален и сломал бы host-крейт
+    # xtask. Практического риска нет: под `relocation-model=pic` x86-64
+    # адресует и код, и данные RIP-относительно независимо от code-model, а
+    # абсолютных адресов в образе не остаётся — что подтверждается отсутствием
+    # R_X86_64_32/32S в `llvm-readelf --relocations` (там только RELATIVE).
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=--no-dynamic-linker",
+    "-C", "link-arg=--entry=kernel_main",
+    "-C", "link-arg=--export-dynamic-symbol=kernel_main",
+    "-C", "link-arg=-zmax-page-size=4096",
+]
+
+[target.aarch64-unknown-none]
+rustflags = [
+    # У этого таргета relocation-model по умолчанию — static, то есть ET_EXEC.
+    # Переопределяем явно.
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=--no-dynamic-linker",
+    "-C", "link-arg=--entry=kernel_main",
+    "-C", "link-arg=--export-dynamic-symbol=kernel_main",
+    "-C", "link-arg=-zmax-page-size=4096",
+]

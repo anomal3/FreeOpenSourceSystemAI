@@ -30,6 +30,32 @@ pub fn target_dir() -> PathBuf {
     }
 }
 
+/// Каталог, куда cargo кладёт артефакты конкретной пары (триплет, профиль).
+pub fn artifact_dir(triple: &str, release: bool) -> PathBuf {
+    target_dir().join(triple).join(profile_dir_name(release))
+}
+
+/// Манифест крейта из `crates/`. Нужен только для диагностики: по его наличию
+/// отличаем «крейт ещё не написан» от «крейт есть, но не собрался».
+pub fn crate_manifest(package: &str) -> PathBuf {
+    workspace_root()
+        .join("crates")
+        .join(package)
+        .join("Cargo.toml")
+}
+
+/// Упомянут ли `crates/<package>` в корневом Cargo.toml.
+///
+/// Тоже чистая диагностика, поэтому хватает поиска подстроки вместо разбора
+/// TOML: цена ошибки — неточная подсказка, а не неверная сборка. При любых
+/// сомнениях (файл не читается) отвечаем «да», чтобы не сбивать с толку.
+pub fn is_workspace_member(package: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(workspace_root().join("Cargo.toml")) else {
+        return true;
+    };
+    text.contains(&format!("crates/{package}"))
+}
+
 /// Каталог артефактов xtask (ESP, копии прошивок, будущие образы дисков).
 /// Он в .gitignore и полностью удаляется командой `clean`.
 pub fn build_dir() -> PathBuf {

@@ -33,9 +33,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Собрать UEFI-загрузчик под указанную архитектуру.
+    /// Собрать загрузчик и ядро под указанную архитектуру.
     Build(BuildArgs),
-    /// Собрать загрузчик и запустить его в QEMU.
+    /// Собрать всё, разложить по ESP и запустить в QEMU.
     Run(RunArgs),
     /// Собрать загрузочный образ диска (появится в Phase 8).
     Image(ImageArgs),
@@ -53,6 +53,9 @@ struct BuildArgs {
     /// Собирать с профилем release.
     #[arg(long, short = 'r')]
     release: bool,
+    /// Не собирать ядро — только загрузчик.
+    #[arg(long)]
+    no_kernel: bool,
 }
 
 #[derive(Args, Debug)]
@@ -63,6 +66,10 @@ struct RunArgs {
     /// Собирать с профилем release.
     #[arg(long, short = 'r')]
     release: bool,
+    /// Не собирать ядро и убрать kernel.elf из ESP: отладка самого загрузчика,
+    /// в том числе его поведения, когда ядра на разделе нет.
+    #[arg(long)]
+    no_kernel: bool,
     /// Поднять gdbstub на порту 1234 и остановиться до первой инструкции.
     #[arg(long)]
     gdb: bool,
@@ -112,21 +119,21 @@ fn real_main() -> Result<()> {
 
     match cli.command {
         Command::Build(args) => {
-            let efi = build::build_boot_uefi(args.arch, args.release)?;
-            println!("готово: {}", efi.display());
+            let built = build::build_all(args.arch, args.release, !args.no_kernel)?;
+            print_built(&built);
         }
 
         Command::Run(args) => {
-            let efi = build::build_boot_uefi(args.arch, args.release)?;
+            let built = build::build_all(args.arch, args.release, !args.no_kernel)?;
+            print_built(&built);
             let opts = qemu::RunOptions {
-                arch: args.arch,
                 gdb: args.gdb,
                 serial_only: args.serial_only,
                 reset_nvram: args.reset_nvram,
                 memory: args.memory,
                 extra: args.qemu_args,
             };
-            qemu::run(&opts, &efi)?;
+            qemu::run(&opts, &built)?;
         }
 
         Command::Image(args) => print_image_stub(args.arch),
@@ -144,6 +151,19 @@ fn real_main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Печатает, что собрано и где лежит.
+///
+/// Пути нужны не для красоты: их копируют в `add-symbol-file` при отладке и в
+/// команды копирования на настоящую флешку.
+fn print_built(built: &build::Built) {
+    println!();
+    println!("готово ({}, {}):", built.arch, built.profile());
+    for (component, path) in built.iter() {
+        println!("  {:<10} {}", component.title(), path.display());
+    }
+    println!();
 }
 
 /// Честная заглушка вместо полусобранного образа.
@@ -164,12 +184,13 @@ fn print_image_stub(arch: Arch) {
 `run` использует драйвер VVFAT в QEMU: каталог хоста build/esp/{arch} подключается
 как FAT-раздел напрямую (`-drive format=raw,file=fat:rw:...`). Файлы туда просто
 копируются, никакой пересборки образа между правками — dev-loop получается заметно
-короче, а прошивка видит ровно ту же структуру \\EFI\\BOOT\\{boot_file}, что и на
-настоящем диске.
+короче, а прошивка и загрузчик видят ровно ту же структуру (\\EFI\\BOOT\\{boot_file}
+и \\{kernel_file}), что и на настоящем диске.
 
 Ограничение, о котором стоит помнить: VVFAT — это эмуляция, а не реальный носитель.
 Проверить GPT-разметку, выравнивание разделов или работу самого установщика на нём
 нельзя. Именно поэтому Phase 8 и нужна.",
         boot_file = arch.removable_media_file(),
+        kernel_file = arch::KERNEL_ESP_FILE,
     );
 }
