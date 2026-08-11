@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "xtask",
+    "crates/boot-info",
+    "crates/boot-uefi",
+]
+
+# Bare-metal crates cannot be built for the host triple. A bare `cargo build`
+# therefore only builds the host-side tooling; kernel/bootloader crates are
+# built through `cargo xtask build --arch <arch>`, which passes --target.
+default-members = ["xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+lto = true
+opt-level = "s"
+codegen-units = 1

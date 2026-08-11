@@ -1,0 +1,9 @@
+# Intentionally minimal.
+#
+# No [build] target and no [unstable] build-std here: both are global to the
+# workspace and would break the host-side `xtask` binary. All four targets we
+# use (*-unknown-uefi, *-unknown-none) ship precompiled core/alloc via rustup,
+# so build-std is not needed. xtask passes --target explicitly per arch.
+
+[alias]
+xtask = "run --package xtask --"

@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+description = "Host-side build/run orchestrator: builds the UEFI bootloader per architecture and boots it under QEMU."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Версии сверены с crates.io (crates.io/api/v1/crates/{clap,anyhow}) на 2026-08-11.
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+
+[lints]
+workspace = true

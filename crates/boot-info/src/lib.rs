@@ -1,0 +1,193 @@
+//! The hand-off contract between the UEFI bootloader and the kernel.
+//!
+//! This crate is deliberately dependency-free and `#![no_std]`. It is linked
+//! into two binaries that are compiled for *different targets* (a UEFI
+//! application and a freestanding kernel), so every type crossing the boundary
+//! is `#[repr(C)]` with explicit padding and no Rust-layout-dependent types
+//! (no `Option`, no references, no enums without `repr`).
+//!
+//! Absent values are encoded as sentinel `0` addresses rather than `Option`,
+//! because `Option<T>` has no guaranteed C layout for the types used here.
+
+#![no_std]
+
+/// Identifies a valid [`BootInfo`] hand-off. Spells "FREEOS" plus a tag.
+pub const BOOT_INFO_MAGIC: u64 = 0x4652_4545_4F53_0001;
+
+/// Incremented whenever [`BootInfo`] changes shape. The kernel refuses to boot
+/// on a mismatch instead of silently reading garbage from an older bootloader.
+pub const BOOT_INFO_REVISION: u32 = 1;
+
+/// Which instruction set the bootloader was built for.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    X86_64 = 1,
+    AArch64 = 2,
+}
+
+/// Byte order of the colour channels within a 32-bit framebuffer pixel.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// Byte 0 red, byte 1 green, byte 2 blue, byte 3 reserved.
+    Rgb = 0,
+    /// Byte 0 blue, byte 1 green, byte 2 red, byte 3 reserved.
+    Bgr = 1,
+    /// A format we could not translate; treat the framebuffer as unusable.
+    Unknown = 2,
+}
+
+/// A linear framebuffer obtained from the UEFI Graphics Output Protocol.
+///
+/// Check [`Framebuffer::is_present`] before use: a machine booted headless has
+/// no GOP and reports `base == 0`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Framebuffer {
+    /// Physical address of the first pixel. `0` means "no framebuffer".
+    pub base: u64,
+    /// Total size of the framebuffer in bytes.
+    pub size: u64,
+    /// Visible width in pixels.
+    pub width: u32,
+    /// Visible height in pixels.
+    pub height: u32,
+    /// Pixels per scanline. May exceed `width`: rows can be padded, so address
+    /// a pixel as `base + (y * stride + x) * 4`, never `y * width + x`.
+    pub stride: u32,
+    pub format: PixelFormat,
+}
+
+impl Framebuffer {
+    /// A sentinel meaning the firmware exposed no usable GOP framebuffer.
+    pub const NONE: Self = Self {
+        base: 0,
+        size: 0,
+        width: 0,
+        height: 0,
+        stride: 0,
+        format: PixelFormat::Unknown,
+    };
+
+    #[must_use]
+    pub const fn is_present(&self) -> bool {
+        self.base != 0
+    }
+}
+
+/// How the kernel may treat a physical memory range.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryKind {
+    /// Free for the kernel's frame allocator.
+    Usable = 0,
+    /// Firmware-reserved or MMIO. Never allocate from this.
+    Reserved = 1,
+    /// ACPI tables; reclaimable once the kernel has parsed them.
+    AcpiReclaimable = 2,
+    /// ACPI non-volatile storage; must be preserved.
+    AcpiNvs = 3,
+    /// Holds the bootloader itself, the memory map, and `BootInfo`. Reclaimable
+    /// once the kernel has copied out everything it needs.
+    BootloaderReclaimable = 4,
+    /// The loaded kernel image.
+    Kernel = 5,
+    /// Backing store of the framebuffer.
+    Framebuffer = 6,
+}
+
+/// One physical memory range. Regions are sorted by `start` and never overlap.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryRegion {
+    pub start: u64,
+    /// Length in bytes. Always a multiple of 4 KiB.
+    pub len: u64,
+    pub kind: MemoryKind,
+    _reserved: u32,
+}
+
+impl MemoryRegion {
+    #[must_use]
+    pub const fn new(start: u64, len: u64, kind: MemoryKind) -> Self {
+        Self { start, len, kind, _reserved: 0 }
+    }
+
+    /// One past the last byte of this region.
+    #[must_use]
+    pub const fn end(&self) -> u64 {
+        self.start + self.len
+    }
+}
+
+/// Points at the array of [`MemoryRegion`]s the bootloader built.
+///
+/// The array lives in [`MemoryKind::BootloaderReclaimable`] memory, so the
+/// kernel must copy it before reclaiming that memory.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryMap {
+    /// Physical address of the first `MemoryRegion`.
+    pub ptr: u64,
+    /// Number of entries.
+    pub len: u64,
+}
+
+impl MemoryMap {
+    pub const EMPTY: Self = Self { ptr: 0, len: 0 };
+
+    /// # Safety
+    ///
+    /// Only valid while the region array is still mapped and identity-mapped at
+    /// `ptr`, and before the bootloader-reclaimable memory has been reused.
+    #[must_use]
+    pub unsafe fn as_slice(&self) -> &[MemoryRegion] {
+        if self.ptr == 0 || self.len == 0 {
+            return &[];
+        }
+        // SAFETY: the caller guarantees `ptr` still points at `len` initialised,
+        // properly aligned `MemoryRegion`s for the lifetime of the borrow.
+        unsafe { core::slice::from_raw_parts(self.ptr as *const MemoryRegion, self.len as usize) }
+    }
+}
+
+/// Everything the bootloader hands the kernel at `ExitBootServices` time.
+///
+/// The kernel receives this by pointer and must validate [`BootInfo::is_valid`]
+/// before touching any other field.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BootInfo {
+    pub magic: u64,
+    pub revision: u32,
+    pub arch: Arch,
+    pub framebuffer: Framebuffer,
+    pub memory_map: MemoryMap,
+    /// Physical address of the ACPI RSDP, or `0` if the firmware exposed none.
+    pub acpi_rsdp: u64,
+    /// Physical address of a flattened device tree, or `0` if none. Reserved
+    /// for ARM platforms whose firmware provides DTB instead of ACPI.
+    pub device_tree: u64,
+}
+
+impl BootInfo {
+    #[must_use]
+    pub const fn new(arch: Arch) -> Self {
+        Self {
+            magic: BOOT_INFO_MAGIC,
+            revision: BOOT_INFO_REVISION,
+            arch,
+            framebuffer: Framebuffer::NONE,
+            memory_map: MemoryMap::EMPTY,
+            acpi_rsdp: 0,
+            device_tree: 0,
+        }
+    }
+
+    /// True when this really is a `BootInfo` of a revision the kernel understands.
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.magic == BOOT_INFO_MAGIC && self.revision == BOOT_INFO_REVISION
+    }
+}
