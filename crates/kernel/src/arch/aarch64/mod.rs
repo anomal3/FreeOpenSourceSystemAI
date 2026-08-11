@@ -1,6 +1,10 @@
-//! aarch64: UART PL011 через MMIO, страничная трансляция и остановка процессора.
+//! aarch64: UART PL011 через MMIO, страничная трансляция, исключения и
+//! прерывания, остановка процессора.
 
+pub mod gic;
+pub mod interrupts;
 pub mod paging;
+pub mod timer;
 
 // Имена, которые `arch::mod` должен отдать наружу вместе с `ARCH_NAME`, `Serial`
 // и `halt`. Пока интеграции нет, внутри крейта их никто не читает — отсюда и
@@ -9,6 +13,14 @@ pub mod paging;
 pub use paging::{
     PageTables, StackEntry, build_kernel_address_space, kernel_stack_top, switch_stack,
 };
+
+// Управление прерываниями отдаётся наружу модулем целиком: `interrupts::init`
+// ставит `VBAR_EL1` и поднимает GIC с таймером, `enable`/`disable`/`enabled`
+// управляют маской `I` в `DAIF`, `without_interrupts` нужен примитивам
+// синхронизации. Размаскирование — отдельный шаг, за который отвечает
+// вызывающий: `init` его сознательно не делает.
+#[allow(unused_imports)]
+pub use interrupts::{disable, enable, enabled, without_interrupts};
 
 use crate::serial::SerialDevice;
 use boot_info::Arch;

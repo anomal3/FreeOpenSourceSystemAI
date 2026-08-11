@@ -90,8 +90,8 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 0 | Workspace, toolchain, UEFI app boots and prints on both arches | **done** |
 | 1 | `BootInfo` hand-off, `ExitBootServices`, jump to kernel | **done** |
 | 2 | Frame allocator, kernel-owned page tables with W^X, heap, own stack | **done** |
-| 3 | Interrupts: IDT+APIC (x86), exception vectors+GIC (ARM), timer tick | next |
-| 4 | Cooperative scheduler, designed so preemption is an additive change | |
+| 3 | Interrupts: IDT+APIC (x86), exception vectors+GIC (ARM), timer tick | **done** |
+| 4 | Cooperative scheduler, designed so preemption is an additive change | next |
 | 5 | RAM-disk, VFS traits, FAT32 reader | |
 | 6 | Input & display: PS/2 first, then xHCI + USB HID boot protocol | |
 | 7 | Framebuffer compositor, minimal shell | |

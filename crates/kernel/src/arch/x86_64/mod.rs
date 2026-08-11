@@ -1,8 +1,17 @@
-//! x86_64: UART 16550 на COM1, остановка процессора и страничная трансляция.
+//! x86_64: UART 16550 на COM1, остановка процессора, страничная трансляция,
+//! таблицы дескрипторов и прерывания.
 
+pub mod apic;
+pub mod gdt;
+pub mod interrupts;
 pub mod paging;
 
 pub use paging::{PageTable, build_kernel_address_space, switch_stack};
+
+// Управление прерываниями наружу отдаёт модуль [`interrupts`]: там же лежат
+// `init`, `enable`, `disable`, `enabled` и `without_interrupts`. Отдельных
+// псевдонимов здесь нет намеренно — `interrupts::enable()` читается однозначно,
+// а `enable_interrupts()` в общем пространстве имён арх-модуля — нет.
 
 use crate::serial::SerialDevice;
 use boot_info::Arch;
@@ -72,6 +81,96 @@ unsafe fn inb(port: u16) -> u8 {
         asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
     }
     value
+}
+
+/// Переждать такт шины ввода-вывода.
+///
+/// Старые контроллеры (в первую очередь 8259) не успевают принять следующую
+/// команду сразу за предыдущей: между записями в их регистры нужна пауза
+/// порядка микросекунды. Канонический для PC способ её получить — запись в
+/// порт 0x80, который на всех машинах отдан под POST-код и не имеет побочных
+/// эффектов; сама запись стоит примерно один цикл шины.
+fn io_wait() {
+    // SAFETY: порт 0x80 (диагностический POST-код) на PC-совместимых машинах
+    // никем не читается, и запись в него ни на что не влияет.
+    unsafe { outb(0x80, 0) };
+}
+
+/// Результат инструкции `CPUID`.
+#[derive(Clone, Copy)]
+struct Cpuid {
+    eax: u32,
+    #[allow(dead_code)] // нужен не всем листам, но выкидывать поле — терять смысл
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+}
+
+/// `CPUID` для листа `leaf` с подлистом `subleaf`.
+fn cpuid(leaf: u32, subleaf: u32) -> Cpuid {
+    let (eax, ebx, ecx, edx);
+    // SAFETY: `cpuid` — инструкция без побочных эффектов, доступная на любом
+    // x86-64 и в любом кольце. Единственная тонкость — `RBX`: Rust не отдаёт
+    // этот регистр inline-ассемблеру (LLVM держит его как возможный base
+    // pointer), поэтому его значение сохраняется в свободный регистр и
+    // возвращается на место через `xchg`. Так обходимся без стека, в отличие от
+    // варианта с `push rbx`/`pop rbx`.
+    unsafe {
+        asm!(
+            "mov {tmp:r}, rbx",
+            "cpuid",
+            "xchg {tmp:r}, rbx",
+            tmp = out(reg) ebx,
+            inlateout("eax") leaf => eax,
+            inlateout("ecx") subleaf => ecx,
+            lateout("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    Cpuid { eax, ebx, ecx, edx }
+}
+
+/// Чтение MSR.
+///
+/// # Safety
+///
+/// Номер регистра должен быть реализован на этом процессоре: чтение
+/// несуществующего MSR даёт #GP.
+unsafe fn rdmsr(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: инструкция читает MSR в EDX:EAX, память и стек не затрагивает,
+    // флаги не меняет; корректность номера — на вызывающем.
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Запись MSR.
+///
+/// # Safety
+///
+/// Помимо требований [`rdmsr`]: записываемое значение должно быть допустимым
+/// для этого MSR (резервированные биты дают #GP), а изменение — не ломать
+/// работающий код. `IA32_EFER` управляет режимом трансляции целиком, а
+/// `IA32_APIC_BASE` — местом и режимом работы локального APIC.
+unsafe fn wrmsr(msr: u32, value: u64) {
+    // SAFETY: см. контракт функции.
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
 }
 
 /// UART 16550, адресуемый через порты ввода-вывода.

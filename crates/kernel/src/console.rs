@@ -6,11 +6,21 @@
 //! незачем, а тянуть `noto-sans-mono-bitmap` на Phase 1 избыточно: он на два
 //! порядка больше и умеет то, что нам пока не нужно (несколько кеглей, Unicode).
 //!
-//! Скролла нет намеренно: вывод Phase 1 умещается в экран, а корректный скролл
-//! требует чтения из фреймбуфера, которое на write-combining памяти
-//! катастрофически медленное. Строки, не поместившиеся на экран, отбрасываются.
+//! Прокрутка сделана без единого чтения из фреймбуфера. Сдвинуть картинку
+//! «как есть» нельзя: чтение write-combining памяти устройства катастрофически
+//! медленное, и именно поэтому скролла долго не было. Вместо этого консоль
+//! держит теневой буфер символов в обычной памяти и перерисовывает экран из
+//! него — фреймбуфер по-прежнему только пишется.
+//!
+//! Буфер живёт в куче, а `init` вызывается раньше, чем куча появляется: ядро
+//! печатает баннер и карту памяти до того, как возьмёт память под контроль.
+//! Поэтому режима два: до [`enable_scroll`] строки, не поместившиеся на экран,
+//! отбрасываются, после — экран прокручивается. Если выделить буфер не
+//! удалось, консоль остаётся в первом режиме: терять диагностику на экране
+//! из-за нехватки памяти хуже, чем не иметь прокрутки.
 
 use crate::sync::Racy;
+use alloc::vec::Vec;
 use boot_info::{Framebuffer, PixelFormat};
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +29,9 @@ use font8x8::legacy::BASIC_LEGACY;
 /// Размер глифа в таблице `BASIC_LEGACY`.
 const GLYPH_W: u32 = 8;
 const GLYPH_H: u32 = 8;
+
+/// Шаг табуляции в символах.
+const TAB_STOP: u32 = 8;
 
 /// Отступ от края экрана, чтобы текст не лип к рамке монитора.
 const MARGIN: u32 = 8;
@@ -43,6 +56,15 @@ pub struct Console {
     row: u32,
     fg: u32,
     bg: u32,
+    /// Теневая копия экрана: `rows * cols` символов в обычной памяти. `None` —
+    /// кучи ещё нет, прокрутка недоступна. Буфер существует ровно затем, чтобы
+    /// при сдвиге строк не читать фреймбуфер.
+    cells: Option<Vec<u8>>,
+    /// На экране есть текст, которого нет в буфере — всё, что напечатано до
+    /// [`Console::enable_scroll`]. Пока флаг взведён, буфер не описывает экран,
+    /// поэтому сравнивать с ним нельзя; первая же прокрутка перерисует экран
+    /// целиком и приведёт их в соответствие.
+    stale: bool,
 }
 
 impl Console {
@@ -96,6 +118,8 @@ impl Console {
             row: 0,
             fg: encode(fb.format, FG),
             bg: encode(fb.format, BG),
+            cells: None,
+            stale: false,
         };
         console.clear();
         Some(console)
@@ -113,6 +137,93 @@ impl Console {
         }
         self.col = 0;
         self.row = 0;
+        if let Some(cells) = self.cells.as_mut() {
+            cells.fill(b' ');
+        }
+        self.stale = false;
+    }
+
+    /// Выделить теневой буфер и включить прокрутку.
+    ///
+    /// Возвращает `false`, если памяти не хватило: консоль при этом остаётся
+    /// работоспособной в режиме без прокрутки.
+    fn enable_scroll(&mut self) -> bool {
+        if self.cells.is_some() {
+            return true;
+        }
+        let len = (self.rows as usize) * (self.cols as usize);
+        let mut cells = Vec::new();
+        // `try_reserve_exact` вместо `vec![]`: отказ аллокатора обязан вернуться
+        // ошибкой, а не уйти в `handle_alloc_error` и уронить ядро.
+        if cells.try_reserve_exact(len).is_err() {
+            return false;
+        }
+        cells.resize(len, b' ');
+        self.cells = Some(cells);
+        // Текст, напечатанный до этого момента, в буфер не попал.
+        self.stale = self.row != 0 || self.col != 0;
+        // Экран мог уже кончиться (в режиме без прокрутки `row` вырастает до
+        // `rows` и служит признаком «дальше не рисуем»); возвращаем курсор в
+        // последнюю строку, иначе прокручивать будет нечего.
+        self.row = self.row.min(self.rows - 1);
+        true
+    }
+
+    /// Сдвинуть экран на строку вверх; курсор остаётся в последней строке.
+    ///
+    /// Прокрутка стоит дорого: на 1280x800 при `scale = 2` экран — это 79x49
+    /// ячеек по 16x16 пикселей, то есть около миллиона записей в фреймбуфер на
+    /// полную перерисовку. Поэтому перерисовываются только ячейки, содержимое
+    /// которых после сдвига изменилось; на типичном выводе ядра (короткие
+    /// строки, много пробелов справа) это примерно половина экрана.
+    fn scroll(&mut self) {
+        // Буфер вынимается из `self` на время работы: одолженная ссылка на поле
+        // не даёт вызывать методы рисования, которым нужен весь `&self`.
+        let Some(mut cells) = self.cells.take() else {
+            return;
+        };
+        let cols = self.cols as usize;
+        let rows = self.rows as usize;
+        let last = (rows - 1) * cols;
+
+        if self.stale {
+            // Сравнивать не с чем: на экране есть символы, которых буфер не
+            // знает. Единственный корректный вариант — перерисовать всё.
+            cells.copy_within(cols.., 0);
+            cells[last..].fill(b' ');
+            for row in 0..rows {
+                for col in 0..cols {
+                    self.draw_cell(col as u32, row as u32, cells[row * cols + col]);
+                }
+            }
+            self.stale = false;
+        } else {
+            // Сдвиг и отрисовка одним проходом сверху вниз: строка `row` читает
+            // строку `row + 1`, до которой проход ещё не дошёл. В фреймбуфер
+            // уходят только те ячейки, содержимое которых действительно
+            // изменилось, — сравнение идёт в обычной памяти и стоит на порядки
+            // дешевле лишней записи в память устройства.
+            for row in 0..rows - 1 {
+                for col in 0..cols {
+                    let src = cells[(row + 1) * cols + col];
+                    let dst = row * cols + col;
+                    if cells[dst] != src {
+                        cells[dst] = src;
+                        self.draw_cell(col as u32, row as u32, src);
+                    }
+                }
+            }
+            for col in 0..cols {
+                if cells[last + col] != b' ' {
+                    cells[last + col] = b' ';
+                    self.draw_cell(col as u32, (rows - 1) as u32, b' ');
+                }
+            }
+        }
+
+        self.cells = Some(cells);
+        self.col = 0;
+        self.row = self.rows - 1;
     }
 
     fn put_pixel(&self, x: u32, y: u32, color: u32) {
@@ -128,10 +239,10 @@ impl Console {
         unsafe { self.base.add(offset).write_volatile(color) };
     }
 
-    fn draw_glyph(&mut self, byte: u8) {
+    fn draw_cell(&self, col: u32, row: u32, byte: u8) {
         let glyph = BASIC_LEGACY[byte as usize];
-        let x0 = MARGIN + self.col * GLYPH_W * self.scale;
-        let y0 = MARGIN + self.row * GLYPH_H * self.scale;
+        let x0 = MARGIN + col * GLYPH_W * self.scale;
+        let y0 = MARGIN + row * GLYPH_H * self.scale;
         for (gy, bits) in glyph.iter().copied().enumerate() {
             for gx in 0..GLYPH_W {
                 // В font8x8 младший бит байта — самый ЛЕВЫЙ пиксель строки
@@ -150,33 +261,81 @@ impl Console {
         }
     }
 
-    fn newline(&mut self) {
-        self.col = 0;
-        self.row += 1;
+    /// Положить символ в ячейку экрана и в теневой буфер.
+    ///
+    /// Если ячейка уже показывает этот символ, запись в фреймбуфер не делается
+    /// вовсе — при прокрутке совпадений набирается много.
+    fn put_cell(&mut self, col: u32, row: u32, byte: u8) {
+        if let Some(cells) = self.cells.as_mut() {
+            let idx = (row as usize) * (self.cols as usize) + (col as usize);
+            if !self.stale && cells[idx] == byte {
+                return;
+            }
+            cells[idx] = byte;
+        }
+        self.draw_cell(col, row, byte);
     }
 
-    fn write_char_raw(&mut self, ch: char) {
-        if ch == '\n' {
-            self.newline();
-            return;
+    fn newline(&mut self) {
+        self.col = 0;
+        if self.row + 1 < self.rows {
+            self.row += 1;
+        } else if self.cells.is_some() {
+            self.scroll();
+        } else {
+            // Буфера нет — прокручивать нечем. `row == rows` означает
+            // «экран кончился»: остаток вывода виден только на serial.
+            self.row = self.rows;
         }
-        if ch == '\r' {
-            self.col = 0;
+    }
+
+    /// Табуляция до следующей позиции, кратной [`TAB_STOP`].
+    ///
+    /// Рисуется пробелами: иначе `\t` ушёл бы в таблицу шрифта как код 0x09 и
+    /// превратился в случайный глиф.
+    fn tab(&mut self) {
+        let stop = (self.col / TAB_STOP + 1) * TAB_STOP;
+        if stop >= self.cols {
+            self.newline();
             return;
         }
         if self.row >= self.rows {
-            return; // экран кончился, скролла нет
+            return;
         }
-        if self.col >= self.cols {
-            self.newline();
-            if self.row >= self.rows {
+        while self.col < stop {
+            self.put_cell(self.col, self.row, b' ');
+            self.col += 1;
+        }
+    }
+
+    fn write_char_raw(&mut self, ch: char) {
+        match ch {
+            '\n' => {
+                self.newline();
                 return;
             }
+            '\r' => {
+                self.col = 0;
+                return;
+            }
+            '\t' => {
+                self.tab();
+                return;
+            }
+            _ => {}
+        }
+        // Перенос по правому краю: строка длиннее экрана продолжается снизу и
+        // может утащить за собой прокрутку, поэтому проверка идёт до `row`.
+        if self.col >= self.cols {
+            self.newline();
+        }
+        if self.row >= self.rows {
+            return;
         }
         // Таблица покрывает только ASCII; всё остальное показываем как '?',
         // чтобы не молчать о потерянном символе.
         let byte = if (0x20..0x7F).contains(&(ch as u32)) { ch as u8 } else { b'?' };
-        self.draw_glyph(byte);
+        self.put_cell(self.col, self.row, byte);
         self.col += 1;
     }
 }
@@ -219,6 +378,25 @@ pub fn init(fb: &Framebuffer) -> bool {
     unsafe { *CONSOLE.get() = Some(console) };
     READY.store(true, Ordering::Release);
     true
+}
+
+/// Включить прокрутку экранной консоли.
+///
+/// Вызывается ядром один раз, сразу после инициализации кучи: до неё выделить
+/// теневой буфер не из чего. Повторные вызовы безвредны. Возвращает `true`,
+/// если прокрутка работает, и `false`, если экрана нет или память под буфер
+/// выделить не удалось — во втором случае консоль продолжает печатать в старом
+/// режиме, отбрасывая строки за нижним краем.
+///
+/// Текст, напечатанный до вызова, в буфере не отражён и исчезнет при первой
+/// прокрутке (он остаётся в логе serial).
+pub fn enable_scroll() -> bool {
+    if !READY.load(Ordering::Acquire) {
+        return false;
+    }
+    // SAFETY: см. `init`.
+    let slot = unsafe { &mut *CONSOLE.get() };
+    slot.as_mut().is_some_and(Console::enable_scroll)
 }
 
 /// Точка входа макросов вывода. Не вызывать напрямую.

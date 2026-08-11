@@ -48,6 +48,13 @@ pub use x86_64::build_kernel_address_space;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::build_kernel_address_space;
 
+/// Прерывания и исключения. Обе реализации выставляют один набор имён:
+/// `init`, `enable`, `disable`, `enabled`, `without_interrupts`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::interrupts;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::interrupts;
+
 /// Продолжение, получающее управление уже на собственном стеке ядра.
 ///
 /// Аргумент — физический адрес `BootInfo`, а не ссылка: всё, что лежало на

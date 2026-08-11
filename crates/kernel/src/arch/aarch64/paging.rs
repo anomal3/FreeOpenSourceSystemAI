@@ -916,6 +916,23 @@ fn map_devices(
         space.map_range(uart.to_direct_map(), uart, PAGE_SIZE, KERNEL_DEVICE, alloc)?;
     }
 
+    // Окна контроллера прерываний — по той же причине, что и UART, и с той же
+    // проверкой в конце пути. В карте памяти UEFI их, как правило, нет вовсе:
+    // GetMemoryMap описывает память, а не MMIO, а те регионы `Reserved`, что в
+    // ней встречаются, отсеиваются здесь же по размеру (см. `MMIO_SPAN_LIMIT`).
+    // Полагаться на случайное попадание нельзя: первое обращение к
+    // неотображённому distributor'у дало бы data abort ровно в тот момент,
+    // когда обработчика отказов ещё нет.
+    for (base, size) in super::gic::MMIO_WINDOWS {
+        let phys = PhysAddr::new(base as u64);
+        // SAFETY: те же условия, что и для UART: пространство не активировано,
+        // а окна устройств не пересекаются с памятью ядра.
+        unsafe {
+            space.map_range(VirtAddr::new(base), phys, size, KERNEL_DEVICE, alloc)?;
+            space.map_range(phys.to_direct_map(), phys, size, KERNEL_DEVICE, alloc)?;
+        }
+    }
+
     if info.framebuffer.is_present() {
         let fb = PhysAddr::new(info.framebuffer.base).page_align_down();
         let len = (info.framebuffer.base - fb.as_u64() + info.framebuffer.size) as usize;

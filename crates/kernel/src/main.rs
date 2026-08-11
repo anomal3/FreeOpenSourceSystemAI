@@ -1,4 +1,10 @@
-//! Ядро FreeOS, Phase 1: приём управления от UEFI-загрузчика.
+//! Ядро FreeOS: приём управления от UEFI-загрузчика и запуск подсистем.
+//!
+//! Порядок запуска задан жёстко и переставлять его нельзя: serial раньше всего
+//! остального (иначе первая же ошибка останется невидимой), проверка хэндоффа
+//! раньше обращения к его полям, память раньше кучи, куча раньше прокрутки
+//! консоли, и прерывания последними — когда всё, что они могут прервать, уже
+//! в согласованном состоянии.
 //!
 //! # Как ядро сюда попадает
 //!
@@ -35,6 +41,7 @@
 
 mod arch;
 mod console;
+mod irq;
 mod mm;
 mod print;
 mod serial;
@@ -260,6 +267,14 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
 
     verify_heap();
 
+    // Куча готова — консоль может завести теневой буфер и начать прокручиваться.
+    // До этого момента строки за нижним краем экрана просто терялись.
+    if console::enable_scroll() {
+        kprintln!("  console     : scrollback enabled");
+    }
+
+    start_interrupts();
+
     let stats = mm::frame::stats();
     kprintln!();
     kprintln!(
@@ -273,8 +288,45 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     }
 
     kprintln!();
-    kprintln!("Phase 2 complete: memory is under kernel control. CPU halted.");
+    kprintln!("Phase 3 complete: interrupts are live. CPU halted.");
     arch::halt();
+}
+
+/// Поднять контроллер прерываний с таймером и убедиться, что тики доходят.
+///
+/// Установка обработчиков и разрешение прерываний — намеренно два разных шага.
+/// Между ними ядро уже способно объяснить отказ, но ещё не может быть прервано:
+/// если что-то в настройке контроллера пойдёт не так, диагностика об этом
+/// успеет напечататься.
+fn start_interrupts() {
+    kprintln!();
+    kprintln!("---- interrupts -------------------------------------------------");
+
+    arch::interrupts::init();
+    arch::interrupts::enable();
+    kprintln!("  interrupts  : enabled, timer at {} Hz", irq::TIMER_HZ);
+
+    // Ожидание тиков — единственное прямое доказательство, что прерывания
+    // действительно доходят до процессора. Настроенный, но молчащий контроллер
+    // выглядит снаружи ровно так же, как работающий.
+    let start = irq::ticks();
+    let target = start + u64::from(irq::TIMER_HZ) / 2;
+    let mut spins: u64 = 0;
+    while irq::ticks() < target {
+        core::hint::spin_loop();
+        spins += 1;
+        // Страховка от вечного ожидания: если тики не идут, ядро обязано
+        // сказать об этом, а не выглядеть зависшим.
+        if spins > 2_000_000_000 {
+            kprintln!("  timer       : NO TICKS -- interrupts are not reaching the CPU");
+            return;
+        }
+    }
+    kprintln!(
+        "  timer       : {} ticks in {} ms of uptime",
+        irq::ticks(),
+        irq::uptime_ms()
+    );
 }
 
 /// Проверить, что куча действительно работает.
@@ -357,7 +409,7 @@ fn validate(raw: *const BootInfo) -> Option<BootInfo> {
 /// Баннер: кто стартовал и что именно приехало в `BootInfo`.
 fn banner(info: &BootInfo, addr: usize) {
     kprintln!("================================================================");
-    kprintln!(" FreeOS kernel v{} - Phase 2 bring-up", env!("CARGO_PKG_VERSION"));
+    kprintln!(" FreeOS kernel v{} - Phase 3 bring-up", env!("CARGO_PKG_VERSION"));
     kprintln!(" architecture : {}", arch::ARCH_NAME);
     kprintln!("================================================================");
     kprintln!("BootInfo @ {addr:#018x}");

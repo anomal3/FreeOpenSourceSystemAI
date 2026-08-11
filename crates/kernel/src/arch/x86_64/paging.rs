@@ -51,6 +51,7 @@
 //! момент загрузки `CR3`. Аллокатор кадров устроен так же — иначе он не смог бы
 //! обнулять выдаваемые кадры.
 
+use super::{cpuid, rdmsr, wrmsr};
 use crate::mm::{
     AddressSpace, FrameAllocator, HEAP_BASE, HEAP_SIZE, MapError, PAGE_SIZE, PHYS_MAP_BASE,
     PageFlags, PhysAddr, STACK_SIZE, STACK_TOP, VirtAddr,
@@ -352,70 +353,6 @@ fn leaf_bits(phys: PhysAddr, flags: PageFlags) -> u64 {
 
 // --- Работа с регистрами ------------------------------------------------------
 
-/// `CPUID` с обнулённым подлистом. Возвращает `(EAX, EDX)`.
-fn cpuid(leaf: u32) -> (u32, u32) {
-    let (eax, edx);
-    // SAFETY: `cpuid` — инструкция без побочных эффектов, доступная на любом
-    // x86-64 и в любом кольце. `RBX` она перезаписывает, а Rust не отдаёт этот
-    // регистр inline-ассемблеру (LLVM держит его как возможный base pointer),
-    // поэтому сохраняем и восстанавливаем сами; из-за push/pop опция `nostack`
-    // здесь недопустима.
-    unsafe {
-        asm!(
-            "push rbx",
-            "cpuid",
-            "pop rbx",
-            inlateout("eax") leaf => eax,
-            inlateout("ecx") 0u32 => _,
-            lateout("edx") edx,
-            options(preserves_flags),
-        );
-    }
-    (eax, edx)
-}
-
-/// Чтение MSR.
-///
-/// # Safety
-///
-/// Номер регистра должен быть реализован на этом процессоре: чтение
-/// несуществующего MSR даёт #GP.
-unsafe fn rdmsr(msr: u32) -> u64 {
-    let (low, high): (u32, u32);
-    // SAFETY: инструкция читает MSR в EDX:EAX, память и стек не затрагивает,
-    // флаги не меняет; корректность номера — на вызывающем.
-    unsafe {
-        asm!(
-            "rdmsr",
-            in("ecx") msr,
-            out("eax") low,
-            out("edx") high,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    (u64::from(high) << 32) | u64::from(low)
-}
-
-/// Запись MSR.
-///
-/// # Safety
-///
-/// Помимо требований [`rdmsr`]: записываемое значение должно быть допустимым
-/// для этого MSR (резервированные биты дают #GP), а изменение — не ломать
-/// работающий код. `IA32_EFER` управляет режимом трансляции целиком.
-unsafe fn wrmsr(msr: u32, value: u64) {
-    // SAFETY: см. контракт функции.
-    unsafe {
-        asm!(
-            "wrmsr",
-            in("ecx") msr,
-            in("eax") value as u32,
-            in("edx") (value >> 32) as u32,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-}
-
 fn read_cr0() -> u64 {
     let value: u64;
     // SAFETY: чтение CR0 в ring 0 всегда разрешено и не имеет побочных
@@ -444,6 +381,42 @@ unsafe fn write_cr3(root: PhysAddr) {
     // SAFETY: см. контракт функции. `nomem` здесь был бы ложью: инструкция
     // меняет смысл вообще всех обращений к памяти.
     unsafe { asm!("mov cr3, {}", in(reg) root.as_u64(), options(nostack)) };
+}
+
+/// Физический адрес корневой таблицы, на которой процессор работает сейчас.
+fn read_cr3() -> PhysAddr {
+    let value: u64;
+    // SAFETY: чтение CR3 в ring 0 разрешено и побочных эффектов не имеет.
+    // `preserves_flags` не заявляем: SDM объявляет флаги после `mov ..., cr3`
+    // неопределёнными.
+    unsafe { asm!("mov {}, cr3", out(reg) value, options(nomem, nostack)) };
+    // Младшие биты CR3 — это PCD/PWT (или PCID при CR4.PCIDE), а не часть
+    // адреса.
+    PhysAddr::new(value & ENTRY_ADDR_MASK)
+}
+
+/// Взять в работу уже активное дерево таблиц, прочитав его корень из `CR3`.
+///
+/// Нужно тем частям ядра, которые доотображают что-то уже после запуска —
+/// например окно MMIO локального APIC, которого нет в карте памяти прошивки.
+/// Экземпляр, построенный [`build_kernel_address_space`], до них не доживает:
+/// он локален для инициализации памяти, а хранить его глобально означало бы
+/// заводить ещё один изменяемый синглтон ради двух записей в таблицу.
+///
+/// Возвращаемый [`PageTable`] сразу настроен на прямое отображение: функция по
+/// контракту вызывается только когда собственные таблицы ядра уже активны, а
+/// значит `PHYS_MAP_BASE` работает. Владения дерево не получает — `PageTable`
+/// не реализует `Drop` и при уничтожении ничего не освобождает.
+///
+/// # Safety
+///
+/// * процессор должен исполняться на таблицах, построенных этим модулем
+///   (у чужих таблиц прошивки нет прямого отображения по [`PHYS_MAP_BASE`],
+///   и первое же обращение к записи ушло бы в никуда);
+/// * пока полученный экземпляр жив, никто другой не должен править то же
+///   дерево: два `&mut` на одни и те же таблицы дадут гонку записей.
+pub unsafe fn active_address_space() -> PageTable {
+    PageTable { root: read_cr3(), phys_offset: Cell::new(PHYS_MAP_BASE) }
 }
 
 /// Убрать из TLB трансляцию одной страницы.
@@ -475,9 +448,9 @@ fn enable_nx() {
     // Записывать `NXE` вслепую нельзя: на процессоре без поддержки NX бит в
     // EFER зарезервирован и `wrmsr` даст #GP — то есть тройную ошибку, ведь
     // обработчиков исключений ещё нет.
-    let (max_leaf, _) = cpuid(CPUID_EXT_MAX);
+    let max_leaf = cpuid(CPUID_EXT_MAX, 0).eax;
     let supported =
-        max_leaf >= CPUID_EXT_FEATURES && cpuid(CPUID_EXT_FEATURES).1 & CPUID_EDX_NX != 0;
+        max_leaf >= CPUID_EXT_FEATURES && cpuid(CPUID_EXT_FEATURES, 0).edx & CPUID_EDX_NX != 0;
     if !supported {
         crate::kprintln!("WARNING: CPU reports no NX support; W^X will not be enforced");
         return;
