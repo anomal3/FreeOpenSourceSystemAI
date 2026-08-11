@@ -2,10 +2,10 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 6 done — bring-up.** The kernel boots on both architectures, owns its
-> memory, schedules tasks, reads files from a FAT32 RAM disk and takes input from a USB
-> keyboard, but there is no userspace and no shell worth the name yet.
-> See [Roadmap](#roadmap).
+> **Status: Phase 7 done — bring-up.** The kernel boots on both architectures, owns its
+> memory, schedules tasks, reads files from a FAT32 RAM disk, takes input from a USB
+> keyboard and runs a shell in a window of its own compositor. There is no userspace yet:
+> everything above runs in the kernel. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -53,12 +53,17 @@ cargo xtask run --arch x86_64 --gdb   # halt before first instruction, gdbstub o
 `xtask` locates QEMU and its UEFI firmware automatically; override with the
 `FREEOS_OVMF_X86_64` / `FREEOS_OVMF_AARCH64` environment variables.
 
-Once the boot log settles, the kernel offers a prompt: `help` lists what it answers,
-`exit` ends the session and halts. Type into the QEMU window — `xtask` attaches a USB
-keyboard (`qemu-xhci` + `usb-kbd`) on both architectures, and on x86-64 the PS/2 keyboard
-works alongside it — or into the terminal QEMU was started from, because the serial line is
-an input device too. With nobody typing, the prompt gives up after twenty seconds so
-unattended runs still terminate.
+Once the boot log settles, the screen turns into a desktop with two windows and the shell
+takes the keyboard: `help` lists what it answers, `ls` and `cat` read the mounted FAT32
+image, `Tab` raises the window underneath, `exit` ends the session and halts. Type into the
+QEMU window — `xtask` attaches a USB keyboard (`qemu-xhci` + `usb-kbd`) on both
+architectures, and on x86-64 the PS/2 keyboard works alongside it — or into the terminal
+QEMU was started from, because the serial line is an input device too and every line the
+shell prints goes there as well.
+
+Without a framebuffer the same shell runs on the serial console alone; graphics is not a
+condition for the system to work. With nobody typing, the prompt gives up after twenty
+seconds so unattended runs still terminate.
 
 ## Layout
 
@@ -70,6 +75,9 @@ crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/sched/        Cooperative round-robin scheduler and tasks
   src/vfs/ src/fs/  VFS traits, RAM disk, FAT32 reader
   src/input/        Key codes, event queue, US keymap, line editor
+  src/gfx/          Rects, surfaces in RAM, the screen, bitmap text
+  src/ui/           Compositor: windows, z-order, damage tracking
+  src/shell.rs      Prompt, commands, output that works with or without a screen
   src/acpi.rs       Table lookup by signature (MADT on x86-64, MCFG everywhere)
   src/pci.rs        ECAM configuration space, bus walk across bridges
   src/usb/          xHCI host controller, HID boot protocol
@@ -118,7 +126,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 5 | RAM-disk, VFS traits, FAT32 reader | **done** |
 | 6a | Input core, PS/2 keyboard on x86-64, serial-line input on both, line editing | **done** |
 | 6b | PCIe enumeration, xHCI host controller, USB HID boot protocol | **done** |
-| 7 | Framebuffer compositor, minimal shell | |
+| 7 | Framebuffer compositor with damage tracking, shell in a window | **done** |
 | 8 | Graphical UEFI installer (GPT, ESP, user account) | |
 
 Phase 6 was split because its two halves are not the same size. PS/2 is two I/O ports and a

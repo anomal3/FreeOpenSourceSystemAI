@@ -1,6 +1,6 @@
 [package]
 name = "kernel"
-description = "Freestanding FreeOS kernel: memory, interrupts, tasks, FAT32 read-only and keyboard input."
+description = "Freestanding FreeOS kernel: memory, interrupts, tasks, FAT32, USB input, compositor and shell."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

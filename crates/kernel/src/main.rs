@@ -43,6 +43,7 @@ mod acpi;
 mod arch;
 mod console;
 mod fs;
+mod gfx;
 mod input;
 mod irq;
 mod mm;
@@ -50,7 +51,9 @@ mod pci;
 mod print;
 mod sched;
 mod serial;
+mod shell;
 mod sync;
+mod ui;
 mod usb;
 mod vfs;
 
@@ -298,9 +301,53 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     mount_initrd(&info);
 
     let have_input = start_input(&info);
+    start_graphics(&info);
 
     // Планировщик забирает управление насовсем: сюда исполнение уже не вернётся.
     run_session(have_input)
+}
+
+/// Поднять композитор и отдать ему экран.
+///
+/// # Почему экран отдаётся до запуска композитора, а не после
+///
+/// Так пришлось сделать после того, как обратный порядок дал вполне наглядную
+/// картинку: окна нарисованы, а поверх них — весь загрузочный лог целиком.
+/// Причина в прокрутке. Консоль хранит теневой буфер экрана и при прокрутке
+/// перерисовывает из него **весь** экран (иначе сдвинуть картинку было бы
+/// нечем — фреймбуфер не читается). Достаточно одной строки, напечатанной после
+/// того, как композитор нарисовал окна, — и если эта строка вызвала прокрутку,
+/// консоль возвращает на экран всё, что помнит.
+///
+/// Поэтому: сначала консоль перестаёт рисовать, потом рисует композитор. Если
+/// композитор не поднялся, экран возвращается консоли — с очисткой, потому что
+/// восстановить то, что на нём было, нечем.
+fn start_graphics(info: &BootInfo) {
+    kprintln!();
+    kprintln!("---- display ----------------------------------------------------");
+
+    if !info.framebuffer.is_present() {
+        kprintln!("  compositor  : no framebuffer; the shell will run on the serial console");
+        return;
+    }
+
+    console::release_screen();
+
+    if !ui::init(&info.framebuffer) {
+        console::reclaim_screen();
+        kprintln!("  compositor  : could not take the screen; staying on the boot console");
+        return;
+    }
+
+    // Дальше `kprintln!` пишет только в serial — экран уже не его.
+    let (cols, rows) = ui::shell_size();
+    let (_, _, windows) = ui::stats();
+    kprintln!(
+        "  compositor  : {}x{} screen, {windows} windows, shell {cols}x{rows} characters",
+        info.framebuffer.width,
+        info.framebuffer.height
+    );
+    kprintln!("  console     : screen handed over; the boot log continues on serial only");
 }
 
 /// Поднять устройства ввода.
@@ -350,174 +397,17 @@ fn run_session(have_input: bool) -> ! {
     );
 
     if have_input {
-        if let Err(err) = sched::spawn("prompt", prompt_task) {
-            kprintln!("  spawn prompt failed: {err}");
+        if let Err(err) = sched::spawn("shell", shell::task) {
+            kprintln!("  spawn shell failed: {err}");
         }
+    } else {
+        // Оболочка без источника событий — это бесконечное ожидание. Сказать об
+        // этом надо здесь: иначе загрузка закончится молча, и будет непонятно,
+        // почему приглашения нет.
+        kprintln!("  shell      : not started, there is no way to type into it");
     }
 
     sched::run()
-}
-
-// ---- приглашение ------------------------------------------------------------
-
-/// Приглашение к вводу.
-const PROMPT: &str = "freeos> ";
-
-/// Сколько секунд ждать ввода, прежде чем закончить сеанс.
-///
-/// Предел обязателен, а не удобен: без него запуск в CI (где никто ничего не
-/// набирает) висел бы вечно, и «ядро ждёт ввод» стало бы неотличимо от «ядро
-/// зависло». Двадцати секунд достаточно, чтобы человек успел напечатать
-/// команду, и мало настолько, чтобы автоматический прогон завершался сам.
-const INPUT_IDLE_SECONDS: u64 = 20;
-
-/// Задача-приглашение: читает события ввода, собирает строки и отвечает на
-/// команды.
-///
-/// Задача, а не цикл в конце `resume_on_kernel_stack`, по двум причинам. Она
-/// обязана уступать процессор — иначе ни одна другая задача не исполнится, пока
-/// пользователь думает; и она обязана уметь закончиться — на этом заканчивается
-/// вся загрузка.
-fn prompt_task() {
-    // Дать демонстрационным задачам договорить: их вывод и набираемая строка
-    // идут в одну консоль, и перемешивать их незачем. Условие — «жива только
-    // эта задача», то есть счётчик равен единице.
-    while sched::alive() > 1 {
-        sched::yield_now();
-    }
-
-    kprintln!();
-    kprintln!("---- interactive ------------------------------------------------");
-    kprintln!("  type 'help' for the list of commands, 'exit' to finish the boot");
-    // Перечисляем только то, что действительно поднялось. Обещать клавиатуру на
-    // машине, где её нет, — это заставить человека искать неисправность там, где
-    // её не бывает.
-    let sources = input::sources();
-    match (sources.keyboard, sources.serial) {
-        (true, true) => kprintln!("  keys come from the keyboard and from the serial line"),
-        (true, false) => kprintln!("  keys come from the keyboard"),
-        (false, true) => kprintln!("  keys come from the serial line -- type into QEMU's terminal"),
-        (false, false) => kprintln!("  no input device is available"),
-    }
-    kprintln!();
-
-    console::set_cursor(true);
-    kprint!("{PROMPT}");
-
-    let mut editor = input::line::LineEditor::new();
-    let mut idle_since = irq::uptime_ms();
-
-    loop {
-        // Опрос контроллера USB живёт здесь, а не в обработчике таймера, и это
-        // осознанно: обработчик обязан быть коротким и не имеет права ждать
-        // занятый лок, а разбор кольца событий делает и то, и другое. Задача же
-        // и без того просыпается на каждом витке планировщика.
-        usb::xhci::service();
-
-        while let Some(event) = input::next_event() {
-            idle_since = irq::uptime_ms();
-            match editor.handle(event) {
-                input::line::Edit::Submitted => {
-                    let done = command(editor.as_str());
-                    editor.clear();
-                    if done {
-                        console::set_cursor(false);
-                        return;
-                    }
-                    kprint!("{PROMPT}");
-                }
-                input::line::Edit::Cancelled => kprint!("{PROMPT}"),
-                input::line::Edit::EndOfInput => {
-                    kprintln!("  end of input");
-                    console::set_cursor(false);
-                    return;
-                }
-                input::line::Edit::Full => {
-                    kprintln!();
-                    kprintln!("  the line is full ({} bytes)", input::line::MAX_LINE);
-                    kprint!("{PROMPT}{}", editor.as_str());
-                }
-                // Клавиши, которые редактор не обрабатывает: показываем имя.
-                // Это и есть проверка того, что до ядра доезжают не только
-                // символы, но и позиции клавиш.
-                input::line::Edit::Unhandled(code) => {
-                    kprintln!();
-                    kprintln!("  key: {} ({:?})", code.name(), event.mods);
-                    kprint!("{PROMPT}{}", editor.as_str());
-                }
-                input::line::Edit::Ignored | input::line::Edit::Inserted
-                | input::line::Edit::Erased => {}
-            }
-        }
-
-        let idle = irq::uptime_ms().saturating_sub(idle_since);
-        if idle >= INPUT_IDLE_SECONDS * 1000 {
-            kprintln!();
-            kprintln!("  no input for {INPUT_IDLE_SECONDS} s, finishing the session");
-            console::set_cursor(false);
-            return;
-        }
-
-        // Уступаем, а не крутимся: пока пользователь думает, процессор должен
-        // достаться остальным задачам.
-        sched::yield_now();
-    }
-}
-
-/// Выполнить набранную команду. Возвращает `true`, если сеанс пора закончить.
-fn command(line: &str) -> bool {
-    let line = line.trim();
-    match line {
-        "" => {}
-        "help" => {
-            kprintln!("  help     this list");
-            kprintln!("  uptime   time since the timer started");
-            kprintln!("  mem      physical frames and heap");
-            kprintln!("  input    key event counters");
-            kprintln!("  usb      xHCI controller state");
-            kprintln!("  tasks    scheduler state");
-            kprintln!("  exit     finish the boot and halt");
-        }
-        "uptime" => kprintln!("  {} ms, {} timer ticks", irq::uptime_ms(), irq::ticks()),
-        "mem" => {
-            let frames = mm::frame::stats();
-            kprintln!(
-                "  frames   {} of {} used, {} MiB free",
-                frames.used(),
-                frames.total,
-                frames.free_bytes() / (1024 * 1024)
-            );
-            let heap = mm::heap::stats();
-            kprintln!("  heap     {} bytes free of {}", heap.free, mm::HEAP_SIZE);
-        }
-        "input" => {
-            let stats = input::stats();
-            kprintln!(
-                "  events   {} posted, {} dropped, {} queued; modifiers {:?}",
-                stats.posted,
-                stats.dropped,
-                stats.queued,
-                input::modifiers()
-            );
-        }
-        "usb" => match usb::xhci::summary() {
-            Some((slot, port, reports, events, errors)) => {
-                kprintln!(
-                    "  xhci     slot {slot} on port {port}, {reports} reports, {events} events, {errors} transfer errors"
-                );
-                let (used, total) = mm::dma::stats();
-                kprintln!("  dma      {used} of {total} bytes of the DMA window in use");
-            }
-            None => kprintln!("  xhci     no controller"),
-        },
-        "tasks" => sched::dump(),
-        "exit" | "quit" => {
-            kprintln!("  finishing the session");
-            return true;
-        }
-        other => kprintln!("  unknown command '{other}'; try 'help'"),
-    }
-    false
 }
 
 /// Насколько глубоко обходить дерево каталогов.
@@ -574,6 +464,10 @@ fn mount_initrd(info: &BootInfo) {
     }
 
     verify_file(&fs, "/data/large-cluster-chain-test.txt");
+
+    // Смонтированная ФС становится корневой: с этого момента её видит оболочка,
+    // и `ls` с `cat` работают по тем же путям, что напечатаны выше.
+    fs::set_root(alloc::boxed::Box::new(fs));
 }
 
 /// Напечатать дерево каталогов, не глубже [`MAX_TREE_DEPTH`].
@@ -747,7 +641,7 @@ fn validate(raw: *const BootInfo) -> Option<BootInfo> {
 /// Баннер: кто стартовал и что именно приехало в `BootInfo`.
 fn banner(info: &BootInfo, addr: usize) {
     kprintln!("================================================================");
-    kprintln!(" FreeOS kernel v{} - Phase 6 bring-up", env!("CARGO_PKG_VERSION"));
+    kprintln!(" FreeOS kernel v{} - Phase 7 bring-up", env!("CARGO_PKG_VERSION"));
     kprintln!(" architecture : {}", arch::ARCH_NAME);
     kprintln!("================================================================");
     kprintln!("BootInfo @ {addr:#018x}");
@@ -899,6 +793,12 @@ fn dump_memory_map(map: &MemoryMap) {
 /// оказывается видимой.
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
+    // Если экран отдан композитору, забираем его обратно и очищаем. Диагностика
+    // поверх окон уехала бы туда, где кончился загрузочный лог, и смешалась бы с
+    // рамками; а сообщение о панике — последнее, что покажет машина, и важнее,
+    // чтобы его было видно, чем сохранить картинку, которая больше не изменится.
+    console::reclaim_screen();
+
     kprintln!();
     kprintln!("*** KERNEL PANIC ***");
     if let Some(location) = info.location() {

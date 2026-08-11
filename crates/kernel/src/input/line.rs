@@ -16,6 +16,14 @@
 //! Эхо отключаемо ([`LineEditor::without_echo`]) — ввод пароля в будущем
 //! установщике потребует именно этого.
 //!
+//! # Куда именно идёт эхо
+//!
+//! Редактор этого не знает: приёмник передаётся аргументом в
+//! [`LineEditor::handle`]. Не абстракция ради абстракции — до появления
+//! композитора эхо печаталось прямо в консоль ядра, и с окном в композиторе тот
+//! же код должен печатать в поверхность окна. Приёмник аргументом делает выбор
+//! делом вызывающего, а редактор — одинаковым в обоих случаях.
+//!
 //! # Почему буфер фиксированный
 //!
 //! Строку набирает внешний источник, а его скорость ядро не контролирует.
@@ -23,8 +31,9 @@
 //! серийный порт) съедает кучу до отказа аллокатора. Фиксированные 256 байт
 //! невозможно переполнить: лишний символ отвергается, и об этом слышно.
 
+use core::fmt::Write;
+
 use super::{KeyCode, KeyEvent};
-use crate::kprint;
 
 /// Сколько байт помещается в строку.
 ///
@@ -101,8 +110,8 @@ impl LineEditor {
         self.len = 0;
     }
 
-    /// Обработать событие клавиатуры.
-    pub fn handle(&mut self, event: KeyEvent) -> Edit {
+    /// Обработать событие клавиатуры, отправляя эхо в `out`.
+    pub fn handle(&mut self, event: KeyEvent, out: &mut impl Write) -> Edit {
         if !event.pressed {
             return Edit::Ignored;
         }
@@ -111,11 +120,16 @@ impl LineEditor {
             KeyCode::Enter | KeyCode::KeypadEnter => {
                 // Перевод строки печатается всегда, даже без эха: иначе вывод
                 // потребителя приклеился бы к приглашению.
-                kprint!("\n");
+                let _ = out.write_str("\n");
                 return Edit::Submitted;
             }
-            KeyCode::Backspace => return self.erase(),
-            KeyCode::Escape
+            KeyCode::Backspace => return self.erase(out),
+            // Tab отдаётся наружу: в оболочке за ним обычно стоит дополнение
+            // имён, и решать, что он значит, — не дело редактора строки. Внутрь
+            // строки он всё равно не годится, потому что его ширина на экране
+            // переменная, а значит подсчёт символов для стирания разъезжается.
+            KeyCode::Tab
+            | KeyCode::Escape
             | KeyCode::Up
             | KeyCode::Down
             | KeyCode::Left
@@ -139,7 +153,7 @@ impl LineEditor {
             // оставить её висеть значило бы показывать текст, которого больше
             // нет ни в одном буфере.
             '\u{3}' => {
-                kprint!("^C\n");
+                let _ = out.write_str("^C\n");
                 self.len = 0;
                 return Edit::Cancelled;
             }
@@ -149,7 +163,7 @@ impl LineEditor {
             // здесь он просто игнорируется.
             '\u{4}' => {
                 if self.len == 0 {
-                    kprint!("^D\n");
+                    let _ = out.write_str("^D\n");
                     return Edit::EndOfInput;
                 }
                 return Edit::Ignored;
@@ -157,22 +171,22 @@ impl LineEditor {
             // Ctrl+U — стереть строку целиком; классическая привычка из tty.
             '\u{15}' => {
                 while self.len > 0 {
-                    self.erase();
+                    self.erase(out);
                 }
                 return Edit::Erased;
             }
-            // Табуляция в строке ядра пользы не приносит, а ширину на экране
-            // имеет переменную — то есть ломает подсчёт символов для стирания.
+            // Сюда попадает Ctrl+I: у него тот же код, что у табуляции, но
+            // клавиша другая, и до ветки `KeyCode::Tab` выше он не доходит.
             '\t' => return Edit::Ignored,
             // Прочие управляющие символы: в текст им нельзя, эхом — тем более.
             _ if (ch as u32) < 0x20 => return Edit::Ignored,
             _ => {}
         }
 
-        self.insert(ch)
+        self.insert(ch, out)
     }
 
-    fn insert(&mut self, ch: char) -> Edit {
+    fn insert(&mut self, ch: char, out: &mut impl Write) -> Edit {
         let mut utf8 = [0u8; 4];
         let encoded = ch.encode_utf8(&mut utf8).as_bytes();
         if self.len + encoded.len() > MAX_LINE {
@@ -181,12 +195,12 @@ impl LineEditor {
         self.buf[self.len..self.len + encoded.len()].copy_from_slice(encoded);
         self.len += encoded.len();
         if self.echo {
-            kprint!("{ch}");
+            let _ = out.write_char(ch);
         }
         Edit::Inserted
     }
 
-    fn erase(&mut self) -> Edit {
+    fn erase(&mut self, out: &mut impl Write) -> Edit {
         if self.len == 0 {
             return Edit::Ignored;
         }
@@ -200,7 +214,7 @@ impl LineEditor {
         if self.echo {
             // Возврат-пробел-возврат: сам возврат каретки курсор двигает, но
             // символ на экране не стирает.
-            kprint!("\u{8} \u{8}");
+            let _ = out.write_str("\u{8} \u{8}");
         }
         Edit::Erased
     }
