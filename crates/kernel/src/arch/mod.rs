@@ -55,6 +55,12 @@ pub use x86_64::interrupts;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::interrupts;
 
+/// Переключение контекста задач: тип сохранённого состояния и сам примитив.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::context::{Context, switch_context};
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::context::{Context, switch_context};
+
 /// Продолжение, получающее управление уже на собственном стеке ядра.
 ///
 /// Аргумент — физический адрес `BootInfo`, а не ссылка: всё, что лежало на

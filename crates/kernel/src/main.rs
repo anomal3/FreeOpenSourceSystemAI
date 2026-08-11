@@ -44,6 +44,7 @@ mod console;
 mod irq;
 mod mm;
 mod print;
+mod sched;
 mod serial;
 mod sync;
 
@@ -287,9 +288,8 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
         kprintln!("  framebuffer : still reachable at {:#018x}", info.framebuffer.base);
     }
 
-    kprintln!();
-    kprintln!("Phase 3 complete: interrupts are live. CPU halted.");
-    arch::halt();
+    // Планировщик забирает управление насовсем: сюда исполнение уже не вернётся.
+    sched::demo()
 }
 
 /// Поднять контроллер прерываний с таймером и убедиться, что тики доходят.

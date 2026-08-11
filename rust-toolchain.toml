@@ -7,6 +7,14 @@ targets = [
     "x86_64-unknown-uefi",
     "aarch64-unknown-uefi",
     # Runtime stage: freestanding kernel.
+    #
+    # AArch64 uses the softfloat variant deliberately. The plain
+    # aarch64-unknown-none target is declared hardfloat, which lets the compiler
+    # keep live values in v8-v15 and emit SIMD in memset - and the interrupt
+    # handler saves no FP state, so any of that would be corrupted by a timer
+    # tick. The softfloat target settles it at the ABI level ("abi": "softfloat",
+    # features "-neon") instead of fighting the target with -Ctarget-feature.
+    # x86_64-unknown-none already declares +soft-float on its own.
     "x86_64-unknown-none",
-    "aarch64-unknown-none",
+    "aarch64-unknown-none-softfloat",
 ]

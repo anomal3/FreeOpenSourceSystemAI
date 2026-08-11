@@ -182,7 +182,10 @@ impl Component {
             (Component::BootUefi, Arch::X86_64) => "x86_64-unknown-uefi",
             (Component::BootUefi, Arch::Aarch64) => "aarch64-unknown-uefi",
             (Component::Kernel, Arch::X86_64) => "x86_64-unknown-none",
-            (Component::Kernel, Arch::Aarch64) => "aarch64-unknown-none",
+            // Именно softfloat-вариант: обычный `aarch64-unknown-none` объявлен
+            // hardfloat, и компилятор вправе эмитить SIMD, которую обработчик
+            // прерывания не сохраняет. Подробности — в `.cargo/config.toml`.
+            (Component::Kernel, Arch::Aarch64) => "aarch64-unknown-none-softfloat",
         }
     }
 

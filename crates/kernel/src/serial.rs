@@ -5,7 +5,7 @@
 //! инициализации со стороны ОС не требует и работает даже когда фреймбуфера нет.
 
 use crate::arch;
-use crate::sync::Racy;
+use crate::sync::SpinLock;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,7 +20,7 @@ pub trait SerialDevice {
     fn write_byte(&mut self, byte: u8);
 }
 
-static SERIAL: Racy<arch::Serial> = Racy::new(arch::Serial::PLATFORM);
+static SERIAL: SpinLock<arch::Serial> = SpinLock::new(arch::Serial::PLATFORM);
 
 /// Пока порт не проинициализирован, вывод отбрасывается: писать в неготовый
 /// UART бессмысленно, а на некоторых платформах ещё и опасно.
@@ -28,33 +28,40 @@ static READY: AtomicBool = AtomicBool::new(false);
 
 /// Инициализировать порт. Вызывается один раз, самым первым делом в ядре.
 pub fn init() {
-    // SAFETY: единственный поток исполнения, прерывания выключены, повторных
-    // входов нет — эксклюзивность ссылки обеспечена структурой запуска ядра.
-    let device = unsafe { &mut *SERIAL.get() };
-    device.init();
+    SERIAL.lock().init();
     READY.store(true, Ordering::Release);
 }
 
-struct Port;
+/// Адаптер `fmt::Write` над устройством: добавляет к побайтовой записи перевод
+/// `\n` в CRLF. Одалживает устройство, а не берёт его из глобального состояния
+/// сам, — чтобы вся строка уходила в порт под одним захватом лока.
+struct Port<'a>(&'a mut arch::Serial);
 
-impl Write for Port {
+impl Write for Port<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        // SAFETY: см. `init` — доступ к глобальному порту не пересекается сам с
-        // собой, потому что исполнение однопоточное и невытесняемое.
-        let device = unsafe { &mut *SERIAL.get() };
         for byte in s.bytes() {
             // Терминалы, к которым QEMU подключает последовательный порт,
             // ожидают CRLF: без '\r' строки уезжают лесенкой.
             if byte == b'\n' {
-                device.write_byte(b'\r');
+                self.0.write_byte(b'\r');
             }
-            device.write_byte(byte);
+            self.0.write_byte(byte);
         }
         Ok(())
     }
 }
 
 /// Точка входа макросов вывода. Не вызывать напрямую.
+///
+/// # Почему здесь `try_lock`, а не `lock`
+///
+/// Serial — единственный канал, по которому ядро может сообщить о собственной
+/// поломке, и обработчик отказа печатает из произвольной точки: в том числе из
+/// середины уже начатого вывода. Обычный `lock` в этом случае ждал бы
+/// освобождения, которого не будет никогда — держатель лока не продолжится,
+/// пока обработчик не завершится, а обработчик не завершится, пока не
+/// напечатает. Получилось бы тихое зависание вместо диагностики, то есть ровно
+/// та потеря, против которой весь этот модуль и написан.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
     if !READY.load(Ordering::Acquire) {
@@ -63,5 +70,19 @@ pub fn _print(args: fmt::Arguments<'_>) {
     // Ошибка форматирования в UART невозможна: `write_byte` не возвращает
     // ошибок, — но `write_fmt` обязан вернуть Result, и игнорировать его здесь
     // корректно.
-    let _ = Port.write_fmt(args);
+    match SERIAL.try_lock() {
+        Some(mut device) => {
+            let _ = Port(&mut device).write_fmt(args);
+        }
+        None => {
+            // Лок занят — значит мы вклинились в чужой вывод. Пишем мимо лока:
+            // `arch::Serial` не хранит состояния, которое можно порвать, — это
+            // адрес порта и ничего больше, а `write_byte` укладывается в одну
+            // запись регистра. Поэтому копия `PLATFORM` на стеке адресует тот
+            // же самый UART и не создаёт второй ссылки на глобальное значение.
+            // Цена — перемешанные символы двух сообщений; молчание дороже.
+            let mut fallback = arch::Serial::PLATFORM;
+            let _ = Port(&mut fallback).write_fmt(args);
+        }
+    }
 }

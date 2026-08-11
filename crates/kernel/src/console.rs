@@ -19,7 +19,7 @@
 //! удалось, консоль остаётся в первом режиме: терять диагностику на экране
 //! из-за нехватки памяти хуже, чем не иметь прокрутки.
 
-use crate::sync::Racy;
+use crate::sync::SpinLock;
 use alloc::vec::Vec;
 use boot_info::{Framebuffer, PixelFormat};
 use core::fmt::{self, Write};
@@ -66,6 +66,12 @@ pub struct Console {
     /// целиком и приведёт их в соответствие.
     stale: bool,
 }
+
+// SAFETY: единственное, что мешает вывести `Send` автоматически, — сырой
+// указатель `base`. Он адресует фреймбуфер: память устройства, не привязанную
+// ни к какому потоку и не имеющую владельца, которого можно было бы бросить.
+// Всё остальное состояние (`Vec` теневого буфера, счётчики) уже `Send`.
+unsafe impl Send for Console {}
 
 impl Console {
     /// Создать консоль по описанию фреймбуфера от загрузчика.
@@ -365,7 +371,7 @@ const fn encode(format: PixelFormat, (r, g, b): (u8, u8, u8)) -> u32 {
     }
 }
 
-static CONSOLE: Racy<Option<Console>> = Racy::new(None);
+static CONSOLE: SpinLock<Option<Console>> = SpinLock::new(None);
 static READY: AtomicBool = AtomicBool::new(false);
 
 /// Инициализировать экранную консоль. Возвращает `true`, если экран доступен.
@@ -373,9 +379,7 @@ pub fn init(fb: &Framebuffer) -> bool {
     let Some(console) = Console::new(fb) else {
         return false;
     };
-    // SAFETY: однопоточное исполнение с выключенными прерываниями, повторных
-    // входов нет — эксклюзивность доступа к глобальной консоли обеспечена.
-    unsafe { *CONSOLE.get() = Some(console) };
+    *CONSOLE.lock() = Some(console);
     READY.store(true, Ordering::Release);
     true
 }
@@ -394,20 +398,39 @@ pub fn enable_scroll() -> bool {
     if !READY.load(Ordering::Acquire) {
         return false;
     }
-    // SAFETY: см. `init`.
-    let slot = unsafe { &mut *CONSOLE.get() };
-    slot.as_mut().is_some_and(Console::enable_scroll)
+    // Единственное место, где под локом консоли выделяется память, то есть
+    // берётся ещё и лок кучи. Порядок захвата здесь только такой — консоль,
+    // затем куча; обратного не существует, потому что куча печатает свою
+    // диагностику уже после того, как отпустит себя (см. `mm::heap`). А если
+    // памяти не хватит, сообщение об этом уйдёт в serial и молча пропустит
+    // экран: `_print` ниже не ждёт занятого лока.
+    let mut console = CONSOLE.lock();
+    console.as_mut().is_some_and(Console::enable_scroll)
 }
 
 /// Точка входа макросов вывода. Не вызывать напрямую.
+///
+/// # Почему занятый лок означает отказ от вывода, а не ожидание
+///
+/// Обработчик отказа печатает откуда угодно, в том числе из кода, который прямо
+/// сейчас держит лок консоли (например из-под [`enable_scroll`]). `lock()`
+/// подвесил бы такой обработчик навсегда. Обойти лок, как это делает serial,
+/// здесь нельзя: у консоли есть настоящее изменяемое состояние — позиция
+/// курсора и теневой буфер, — и вторая ссылка на него была бы не «перемешанным
+/// выводом», а неопределённым поведением с испорченным экраном впридачу.
+///
+/// Поэтому при занятом локе экранная копия просто теряется. Тот же текст уже
+/// ушёл в serial — основной канал диагностики, — и потерять его дубликат
+/// несопоставимо дешевле, чем зависнуть.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
     if !READY.load(Ordering::Acquire) {
         return;
     }
-    // SAFETY: см. `init`.
-    let slot = unsafe { &mut *CONSOLE.get() };
-    if let Some(console) = slot.as_mut() {
+    let Some(mut console) = CONSOLE.try_lock() else {
+        return;
+    };
+    if let Some(console) = console.as_mut() {
         let _ = console.write_fmt(args);
     }
 }

@@ -29,7 +29,7 @@
 
 use crate::kprintln;
 use crate::mm::{HEAP_BASE, HEAP_SIZE, PAGE_SIZE};
-use crate::sync::Racy;
+use crate::sync::SpinLock;
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt;
 use core::ptr::{self, NonNull};
@@ -74,84 +74,102 @@ pub struct HeapStats {
 
 /// Обёртка над [`Heap`], которую можно положить в `static`.
 ///
-/// `Racy` вместо спинлока — по той же причине, что и во всём ядре на этом
-/// этапе: исполнение однопоточное, прерывания выключены, вторичные ядра не
-/// стартовали. Как только это перестанет быть верным, обёртка обязана стать
-/// настоящим замком, иначе две параллельные аллокации порвут список блоков.
+/// Замок настоящий, а не `Racy`: глобальный аллокатор вызывается из
+/// произвольной точки ядра, включая обработчик прерывания, а список свободных
+/// блоков две одновременные аллокации порвут. [`SpinLock`] запрещает прерывания
+/// на время удержания, поэтому обработчик не может вклиниться в середину
+/// правки списка и рекурсивно войти в аллокатор.
 struct KernelHeap {
-    inner: Racy<Option<Heap>>,
+    inner: SpinLock<Option<Heap>>,
 }
 
 /// Глобальный аллокатор ядра.
 #[global_allocator]
-static HEAP: KernelHeap = KernelHeap { inner: Racy::new(None) };
+static HEAP: KernelHeap = KernelHeap { inner: SpinLock::new(None) };
+
+/// Чем кончилась попытка выделения.
+///
+/// Отдельное значение нужно ровно затем, чтобы диагностика печаталась уже после
+/// освобождения лока кучи. `kprintln!` сегодня не аллоцирует — но печатать
+/// из-под удерживаемого аллокатора значит держать наготове зависание
+/// `alloc → вывод → alloc`, в котором второй захват ждал бы первого. Стоимость
+/// развязки — три `usize`, скопированных на стек.
+enum Outcome {
+    Block(*mut u8),
+    NotInitialised,
+    Exhausted(HeapStats),
+}
 
 // SAFETY: реализация возвращает либо null, либо блок, выделенный `Heap` под
 // запрошенные размер и выравнивание и не пересекающийся ни с одним другим
 // живым блоком; `dealloc` возвращает блок тому же экземпляру `Heap` с тем же
-// `Layout`. Гонок нет: см. комментарий к `KernelHeap`.
+// `Layout`. Гонок нет: доступ к `Heap` возможен только через `SpinLock`.
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: однопоточное невытесняемое исполнение, поэтому второй ссылки
-        // на содержимое `inner` в этот момент не существует. Диагностика ниже
-        // печатает в serial и во фреймбуфер, а они не аллоцируют — рекурсии
-        // через `alloc` не возникает.
-        let slot = unsafe { &mut *self.inner.get() };
-        let Some(heap) = slot.as_mut() else {
-            kprintln!(
-                "mm: allocation of {} bytes (align {}) before heap::init",
-                layout.size(),
-                layout.align()
-            );
-            return ptr::null_mut();
+        let outcome = {
+            let mut slot = self.inner.lock();
+            match slot.as_mut() {
+                None => Outcome::NotInitialised,
+                Some(heap) => match heap.allocate_first_fit(layout) {
+                    Ok(block) => Outcome::Block(block.as_ptr()),
+                    Err(()) => Outcome::Exhausted(HeapStats {
+                        size: heap.size(),
+                        used: heap.used(),
+                        free: heap.free(),
+                    }),
+                },
+            }
         };
 
-        match heap.allocate_first_fit(layout) {
-            Ok(block) => block.as_ptr(),
-            Err(()) => {
-                // Возврат null означает OOM, и стандартный обработчик тут же
-                // запаникует сообщением вида «memory allocation of N bytes
-                // failed», в котором нет ни состояния кучи, ни выравнивания.
-                // Поэтому всё, что мы знаем, печатается здесь и сейчас.
-                kprintln!("mm: KERNEL HEAP EXHAUSTED");
+        // Ниже лок уже отпущен, и печатать можно свободно.
+        let stats = match outcome {
+            Outcome::Block(block) => return block,
+            Outcome::NotInitialised => {
                 kprintln!(
-                    "  requested : {} bytes, align {}",
+                    "mm: allocation of {} bytes (align {}) before heap::init",
                     layout.size(),
                     layout.align()
                 );
-                kprintln!(
-                    "  heap      : {} KiB total, {} KiB used, {} KiB free",
-                    heap.size() / 1024,
-                    heap.used() / 1024,
-                    heap.free() / 1024
-                );
-                kprintln!(
-                    "  range     : {:#018x}..{:#018x}",
-                    HEAP_BASE,
-                    HEAP_BASE + HEAP_SIZE
-                );
-                if heap.free() >= layout.size() {
-                    kprintln!("  cause     : free memory is fragmented, no single block fits");
-                }
-                ptr::null_mut()
+                return ptr::null_mut();
             }
+            Outcome::Exhausted(stats) => stats,
+        };
+
+        // Возврат null означает OOM, и стандартный обработчик тут же
+        // запаникует сообщением вида «memory allocation of N bytes failed», в
+        // котором нет ни состояния кучи, ни выравнивания. Поэтому всё, что мы
+        // знаем, печатается здесь и сейчас.
+        kprintln!("mm: KERNEL HEAP EXHAUSTED");
+        kprintln!("  requested : {} bytes, align {}", layout.size(), layout.align());
+        kprintln!(
+            "  heap      : {} KiB total, {} KiB used, {} KiB free",
+            stats.size / 1024,
+            stats.used / 1024,
+            stats.free / 1024
+        );
+        kprintln!("  range     : {:#018x}..{:#018x}", HEAP_BASE, HEAP_BASE + HEAP_SIZE);
+        if stats.free >= layout.size() {
+            kprintln!("  cause     : free memory is fragmented, no single block fits");
         }
+        ptr::null_mut()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let Some(block) = NonNull::new(ptr) else {
             return;
         };
-        // SAFETY: см. `alloc`.
-        let slot = unsafe { &mut *self.inner.get() };
-        let Some(heap) = slot.as_mut() else {
-            kprintln!("mm: deallocation before heap::init, ignored");
-            return;
-        };
-        // SAFETY: контракт `GlobalAlloc::dealloc` обязывает вызывающего передать
-        // блок, выданный `alloc` этого же аллокатора, с тем же `Layout`, — а
-        // выдавал его именно этот экземпляр `Heap`.
-        unsafe { heap.deallocate(block, layout) };
+        {
+            let mut slot = self.inner.lock();
+            if let Some(heap) = slot.as_mut() {
+                // SAFETY: контракт `GlobalAlloc::dealloc` обязывает вызывающего
+                // передать блок, выданный `alloc` этого же аллокатора, с тем же
+                // `Layout`, — а выдавал его именно этот экземпляр `Heap`.
+                unsafe { heap.deallocate(block, layout) };
+                return;
+            }
+        }
+        // Печать — уже без лока, по той же причине, что и в `alloc`.
+        kprintln!("mm: deallocation before heap::init, ignored");
     }
 }
 
@@ -164,9 +182,12 @@ unsafe impl GlobalAlloc for KernelHeap {
 /// активны. Память должна принадлежать только куче: `init` немедленно начинает
 /// писать по этим адресам.
 pub unsafe fn init() -> Result<HeapStats, HeapError> {
-    // SAFETY: однопоточное невытесняемое исполнение — эксклюзивность доступа к
-    // глобальному состоянию обеспечена структурой запуска ядра.
-    let slot = unsafe { &mut *HEAP.inner.get() };
+    // Лок держится и через `verify_backing`: проверка обязана застать диапазон
+    // ровно в том состоянии, в котором его получит `Heap::new`, а чужая
+    // аллокация между ними означала бы, что мы затираем узором уже выданную
+    // память. Обходится это дорого — тысячи записей с запрещёнными
+    // прерываниями, — но `init` вызывается один раз и до запуска таймера.
+    let mut slot = HEAP.inner.lock();
     if slot.is_some() {
         return Err(HeapError::AlreadyInitialised);
     }
@@ -226,17 +247,13 @@ unsafe fn verify_backing() -> Result<(), HeapError> {
 /// Поднята ли куча.
 #[must_use]
 pub fn is_ready() -> bool {
-    // SAFETY: однопоточное невытесняемое исполнение.
-    let slot = unsafe { &*HEAP.inner.get() };
-    slot.is_some()
+    HEAP.inner.lock().is_some()
 }
 
 /// Занятость кучи. Нули, если [`init`] ещё не вызывали.
 #[must_use]
 pub fn stats() -> HeapStats {
-    // SAFETY: однопоточное невытесняемое исполнение; ссылка только на чтение и
-    // не переживает эту функцию.
-    let slot = unsafe { &*HEAP.inner.get() };
+    let slot = HEAP.inner.lock();
     match slot.as_ref() {
         Some(heap) => HeapStats { size: heap.size(), used: heap.used(), free: heap.free() },
         None => HeapStats::default(),

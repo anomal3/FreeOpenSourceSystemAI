@@ -58,7 +58,14 @@ rustflags = [
     "-C", "link-arg=-zmax-page-size=4096",
 ]
 
-[target.aarch64-unknown-none]
+# Ядро собирается под softfloat-вариант таргета намеренно: обычный
+# `aarch64-unknown-none` объявлен hardfloat, и компилятор вправе держать живое
+# значение в `v8`–`v15` или собрать `memset` через `dup v0.16b`. Обработчик
+# прерывания FP-состояние не сохраняет, поэтому любой тик таймера такое значение
+# испортил бы. Softfloat-вариант закрывает это на уровне ABI (`"abi":
+# "softfloat"`, `features: "-neon"`), а не борьбой с таргетом через
+# `-C target-feature`, на которую rustc справедливо ругается.
+[target.aarch64-unknown-none-softfloat]
 rustflags = [
     # У этого таргета relocation-model по умолчанию — static, то есть ET_EXEC.
     # Переопределяем явно.

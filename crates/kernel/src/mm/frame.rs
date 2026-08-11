@@ -42,7 +42,7 @@ use crate::kprintln;
 use crate::mm::{
     FrameAllocator, FrameStats, PAGE_SHIFT, PAGE_SIZE, PHYS_MAP_BASE, PhysAddr, VirtAddr,
 };
-use crate::sync::Racy;
+use crate::sync::SpinLock;
 use boot_info::{BootInfo, MemoryKind};
 use core::fmt;
 use core::mem::{align_of, size_of};
@@ -513,11 +513,7 @@ fn align_up_u64(value: u64, align: u64) -> u64 {
 }
 
 /// Глобальный аллокатор кадров. `None`, пока не вызван [`init`].
-static FRAMES: Racy<Option<BitmapFrameAllocator>> = Racy::new(None);
-
-/// Защита от повторного входа в [`with`]: два одновременно живых `&mut` на
-/// глобальный аллокатор — это UB, и поймать его лучше на месте.
-static BUSY: Racy<bool> = Racy::new(false);
+static FRAMES: SpinLock<Option<BitmapFrameAllocator>> = SpinLock::new(None);
 
 /// Поднять глобальный аллокатор кадров по карте памяти загрузчика.
 ///
@@ -528,14 +524,10 @@ static BUSY: Racy<bool> = Racy::new(false);
 /// Требования [`BitmapFrameAllocator::new`]: проверенный `info`, действующее
 /// identity-отображение, ровно один вызов за время жизни ядра.
 pub unsafe fn init(info: &BootInfo) -> Result<FrameStats, FrameInitError> {
-    // SAFETY: условия делегированы вызывающему; исполнение однопоточное с
-    // выключенными прерываниями, поэтому эксклюзивность доступа к `FRAMES`
-    // обеспечена структурой запуска ядра.
-    let slot = unsafe { &mut *FRAMES.get() };
     // SAFETY: см. контракт функции.
     let allocator = unsafe { BitmapFrameAllocator::new(info) }?;
     let stats = allocator.stats();
-    *slot = Some(allocator);
+    *FRAMES.lock() = Some(allocator);
     Ok(stats)
 }
 
@@ -546,21 +538,22 @@ pub unsafe fn init(info: &BootInfo) -> Result<FrameStats, FrameInitError> {
 /// нельзя, а тихо вернуть `None` — значит превратить ошибку в загадочную
 /// нехватку памяти где-то дальше.
 pub fn with<R>(f: impl FnOnce(&mut BitmapFrameAllocator) -> R) -> Option<R> {
-    // SAFETY: однопоточное невытесняемое исполнение — чтение и запись флага не
-    // с чем чередовать.
-    let busy = unsafe { &mut *BUSY.get() };
-    assert!(!*busy, "mm::frame::with is not re-entrant");
-    *busy = true;
-
-    // SAFETY: флаг выше гарантирует, что второй ссылки на `FRAMES` сейчас не
-    // существует, а однопоточность — что она и не появится до сброса флага.
-    let slot = unsafe { &mut *FRAMES.get() };
-    let result = slot.as_mut().map(f);
-
-    // SAFETY: см. выше. `f` мог запаниковать — тогда сюда не дойдёт, но ядро в
-    // этот момент уже останавливается, и состояние флага значения не имеет.
-    unsafe { *BUSY.get() = false };
-    result
+    // `try_lock`, а не `lock`, и это не оптимизация. Пока процессор один, а
+    // прерывания на время удержания запрещены, занятый лок означает ровно одно:
+    // мы уже внутри `with` и пришли сюда из `f`. Обычный `lock` в этом случае
+    // стал бы ждать сам себя — не паника, а вечное молчание, что заметно хуже
+    // прежнего флага повторного входа. `try_lock` возвращает ту же внятную
+    // диагностику, что была до перехода на локи.
+    //
+    // TODO(SMP): на нескольких ядрах занятый лок станет обычной конкуренцией.
+    // Тогда ждать придётся честным `lock`, а рекурсию отличать по отметке
+    // владельца (номеру ядра) внутри самого лока.
+    let Some(mut frames) = FRAMES.try_lock() else {
+        panic!("mm::frame::with is not re-entrant");
+    };
+    // `f` вправе печатать: вывод берёт свои локи (serial, консоль) и никогда не
+    // просит кадров, поэтому цикла ожидания через диагностику здесь не выходит.
+    frames.as_mut().map(f)
 }
 
 /// Состояние пула кадров. Нули, если аллокатор ещё не поднят.

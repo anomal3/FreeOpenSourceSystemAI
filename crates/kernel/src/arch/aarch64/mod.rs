@@ -1,6 +1,7 @@
 //! aarch64: UART PL011 через MMIO, страничная трансляция, исключения и
 //! прерывания, остановка процессора.
 
+pub mod context;
 pub mod gic;
 pub mod interrupts;
 pub mod paging;

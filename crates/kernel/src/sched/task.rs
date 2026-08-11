@@ -1,0 +1,357 @@
+//! Задача планировщика: идентификатор, состояние, стек и сохранённый контекст.
+//!
+//! # Откуда берётся стек
+//!
+//! Из кучи ядра, а не из [`crate::mm::FrameAllocator`] напрямую. Причина
+//! практическая: чтобы выдать задаче кадры, их нужно ещё и отобразить, а для
+//! этого нужен живой дескриптор адресного пространства ядра — которого сейчас
+//! нет. `main.rs` строит [`crate::arch::KernelSpace`] локально, активирует его и
+//! теряет: после `activate()` таблицы живут в CR3/TTBR, а править их из кода
+//! ядра нечем (в трейте [`crate::mm::AddressSpace`] нет ни `unmap`, ни доступа к
+//! активному дереву). Куча же уже поднята, отображена на запись и умеет
+//! сообщать об исчерпании вместо паники.
+//!
+//! # Про страницу-ловушку — честно
+//!
+//! Настоящей ловушки (неотображённой страницы под стеком, как у стека ядра)
+//! здесь **нет** и дёшево получиться не может: она требует ровно той операции
+//! над активными таблицами, которой ядро пока не умеет. Делать вид, что
+//! проблемы нет, хуже всего: переполнение стека задачи молча испортит соседний
+//! блок кучи, и разбираться придётся по последствиям за тысячи инструкций от
+//! причины.
+//!
+//! Поэтому вместо ловушки — **полоса-сторож**: страница в начале блока,
+//! заполненная известным узором, которую планировщик проверяет на каждом
+//! переключении ([`Stack::guard_intact`]). Это не защита, а детектор: порча
+//! уже произошла, но она обнаруживается на ближайшем переключении и с точным
+//! указанием, чей стек переполнился, а не спустя произвольное время в чужом
+//! коде.
+//!
+//! TODO(Phase 5): когда у ядра появится дескриптор активного адресного
+//! пространства с `map`/`unmap`, заменить полосу-сторож на настоящую
+//! неотображённую страницу — тогда переполнение будет ловиться в момент записи
+//! обработчиком отказов, а не постфактум.
+
+use core::alloc::Layout;
+use core::fmt;
+use core::mem::MaybeUninit;
+use core::ptr;
+
+use alloc::alloc::{alloc as heap_alloc, dealloc as heap_dealloc};
+use alloc::boxed::Box;
+
+use crate::arch::Context;
+use crate::mm::{PAGE_SIZE, VirtAddr};
+
+/// Полезный размер стека задачи. Вчетверо меньше стека ядра: задачи здесь
+/// мелкие, а каждая лишняя страница на задачу — это страница, которой не
+/// хватит следующей.
+pub const TASK_STACK_SIZE: usize = 16 * 1024;
+
+/// Размер полосы-сторожа под стеком. Ровно страница — чтобы замена на
+/// настоящую неотображённую страницу свелась к смене способа защиты, а не
+/// раскладки.
+pub const STACK_GUARD_SIZE: usize = PAGE_SIZE;
+
+/// Требование System V (x86-64) и AAPCS64: вершина стека кратна 16.
+const STACK_ALIGN: usize = 16;
+
+const _: () = assert!(TASK_STACK_SIZE % STACK_ALIGN == 0);
+const _: () = assert!(STACK_GUARD_SIZE % STACK_ALIGN == 0);
+
+/// Узор полосы-сторожа. В слово `i` пишется `GUARD_PATTERN ^ i`: одинаковое во
+/// всех словах значение не отличить от случайно совпавшего мусора, а
+/// зависящее от индекса — практически можно.
+const GUARD_PATTERN: u64 = 0x5461_736B_4775_6172; // "TaskGuar"
+
+/// Сколько слов проверять у нижней границы полосы.
+const GUARD_LOW_PROBES: usize = 8;
+
+/// Сколько слов проверять у верхней границы полосы — той, которую растущий вниз
+/// стек пересекает первой.
+const GUARD_HIGH_PROBES: usize = 32;
+
+/// Идентификатор задачи. Ноль зарезервирован за холостой задачей, которая
+/// представляет контекст, вызвавший [`crate::sched::run`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaskId(u32);
+
+impl TaskId {
+    /// Холостая задача: тот самый контекст, из которого запущено планирование.
+    pub const IDLE: Self = Self(0);
+
+    #[must_use]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
+impl fmt::Debug for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "task#{}", self.0)
+    }
+}
+
+/// Состояние задачи.
+///
+/// Состояния «заблокирована» здесь нет намеренно: блокировки появятся вместе с
+/// тем, обо что можно заблокироваться (семафоры, ввод-вывод), и добавятся сюда
+/// одним вариантом — выбор следующей задачи отбирает по `Ready`, а не по
+/// «не `Finished`», поэтому новое состояние само выпадет из ротации.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TaskState {
+    /// Готова исполняться, ждёт своей очереди.
+    Ready,
+    /// Исполняется прямо сейчас. Ровно одна такая задача на процессор.
+    Running,
+    /// Вернулась из `entry`. Стек уже освобождён или будет освобождён уборщиком.
+    Finished,
+}
+
+impl fmt::Display for TaskState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `pad`, а не `write_str`: иначе ширина поля в `{:<9}` молча
+        // игнорируется, и колонки в диагностике разъезжаются.
+        f.pad(match self {
+            Self::Ready => "ready",
+            Self::Running => "running",
+            Self::Finished => "finished",
+        })
+    }
+}
+
+/// Почему не удалось создать задачу.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnError {
+    /// Кончилась куча — не хватило под стек или под саму структуру задачи.
+    /// Это ошибка, а не паника: не сумев создать задачу, ядро вполне способно
+    /// продолжать работу с уже существующими.
+    OutOfMemory,
+    /// Все слоты таблицы задач заняты.
+    TooManyTasks,
+}
+
+impl fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::OutOfMemory => "kernel heap exhausted",
+            Self::TooManyTasks => "task table is full",
+        })
+    }
+}
+
+/// Стек задачи вместе с полосой-сторожем под ним.
+///
+/// Раскладка блока (адреса растут вниз по тексту, стек растёт вверх по тексту):
+///
+/// ```text
+///   base + total  +-----------------+ <- вершина, кратна 16
+///                 |                 |
+///                 |  TASK_STACK_SIZE|    рабочая часть, растёт вниз
+///                 |                 |
+///   base + guard  +-----------------+
+///                 | STACK_GUARD_SIZE|    полоса-сторож, заполнена узором
+///   base          +-----------------+
+/// ```
+///
+/// Все поля скалярные намеренно: структура живёт под [`crate::sync::SpinLock`],
+/// а сырой указатель сделал бы её `!Send` и потребовал бы отдельного
+/// обоснования там, где обоснование по сути одно — «этим владеет планировщик».
+pub struct Stack {
+    base: usize,
+    layout: Layout,
+}
+
+impl Stack {
+    /// Выделить стек из кучи ядра. `None` — куча исчерпана.
+    pub fn allocate(usable: usize) -> Option<Self> {
+        let total = STACK_GUARD_SIZE.checked_add(usable)?;
+        let layout = Layout::from_size_align(total, STACK_ALIGN).ok()?;
+
+        // SAFETY: `total >= STACK_GUARD_SIZE > 0`, чего и требует `alloc`.
+        // Глобальный аллокатор ядра при нехватке памяти возвращает null (и сам
+        // печатает состояние кучи), поэтому проверки указателя достаточно —
+        // паники здесь не будет.
+        let raw = unsafe { heap_alloc(layout) };
+        if raw.is_null() {
+            return None;
+        }
+
+        let stack = Self { base: raw as usize, layout };
+        stack.paint_guard();
+        Some(stack)
+    }
+
+    /// Вершина стека — то, что уезжает в [`Context::new`].
+    #[must_use]
+    pub fn top(&self) -> VirtAddr {
+        VirtAddr::new(self.base + self.layout.size())
+    }
+
+    /// Полезный размер без полосы-сторожа.
+    #[must_use]
+    pub fn usable_size(&self) -> usize {
+        self.layout.size() - STACK_GUARD_SIZE
+    }
+
+    fn guard_words(&self) -> usize {
+        STACK_GUARD_SIZE / size_of::<u64>()
+    }
+
+    fn paint_guard(&self) {
+        let base = self.base as *mut u64;
+        for i in 0..self.guard_words() {
+            // SAFETY: `i` меньше числа слов полосы, а полоса лежит в начале
+            // только что выделенного блока размером `STACK_GUARD_SIZE + usable`;
+            // выравнивание на 8 следует из выравнивания блока на 16.
+            unsafe { ptr::write_volatile(base.add(i), GUARD_PATTERN ^ i as u64) };
+        }
+    }
+
+    /// Цела ли полоса-сторож.
+    ///
+    /// Проверяются не все слова, а окно у верхней границы полосы (растущий вниз
+    /// стек пересекает её первой) плюс несколько слов у нижней — на случай
+    /// переполнения, «перепрыгнувшего» полосу разом большим кадром. Полный
+    /// проход по 4 КиБ на каждом переключении контекста не окупается.
+    #[must_use]
+    pub fn guard_intact(&self) -> bool {
+        let words = self.guard_words();
+        let base = self.base as *const u64;
+        let probe = |i: usize| -> bool {
+            // `volatile` обязателен: с точки зрения компилятора эту память после
+            // `paint_guard` никто не менял, и обычное чтение он вправе свернуть
+            // в константу — то есть выбросить ровно ту проверку, ради которой
+            // всё написано. Переполнение стека происходит вне модели, о которой
+            // он знает.
+            //
+            // SAFETY: `i < words`, полоса лежит в начале живого блока, стек
+            // жив, пока жив `self`.
+            let value = unsafe { ptr::read_volatile(base.add(i)) };
+            value == GUARD_PATTERN ^ i as u64
+        };
+
+        let high_from = words.saturating_sub(GUARD_HIGH_PROBES);
+        (0..GUARD_LOW_PROBES.min(words)).all(probe) && (high_from..words).all(probe)
+    }
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        // Единственная точка освобождения стека. Кто и когда её достигает —
+        // расписано в `sched::Scheduler::reap`: освобождать стек может только
+        // тот, кто на нём не исполняется.
+        //
+        // SAFETY: `base` получен из `alloc` с этим же `layout` и с тех пор не
+        // менялся; `Stack` владеет блоком единолично, копий не существует
+        // (тип не `Copy` и не `Clone`).
+        unsafe { heap_dealloc(self.base as *mut u8, self.layout) };
+    }
+}
+
+/// Задача: всё, что нужно, чтобы приостановить её и потом продолжить.
+pub struct Task {
+    pub id: TaskId,
+    pub name: &'static str,
+    pub state: TaskState,
+    /// Сколько раз задача получала процессор.
+    pub switches: u64,
+
+    /// Сохранённое состояние регистров.
+    ///
+    /// `MaybeUninit` не из лени, а из-за холостой задачи: она представляет уже
+    /// исполняющийся контекст, у которого нет и не может быть «начального»
+    /// [`Context`] — его впервые запишет сама `switch_context` при первом
+    /// переключении. Требовать от арх-слоя `Default for Context` ради этого
+    /// значило бы расширять контракт под одну задачу из всех.
+    ///
+    /// Инвариант: содержимое валидно для чтения (то есть годится как аргумент
+    /// `to`) начиная с момента, когда задача хотя бы раз была аргументом `from`
+    /// — либо сразу, если контекст построил [`Context::new`]. Для холостой
+    /// задачи это означает «после первого `schedule()`», а первым `schedule()`
+    /// она может быть только `from`.
+    pub context: MaybeUninit<Context>,
+
+    /// `None` у холостой задачи (её стек — стек ядра, планировщик им не
+    /// владеет) и у завершённой, стек которой уже забрал уборщик.
+    pub stack: Option<Stack>,
+}
+
+// Задача переезжает под `SpinLock`, а тот требует `Send`. Проверка тут, а не в
+// виде `unsafe impl`: если арх-слой однажды положит в `Context` что-нибудь
+// `!Send`, это должно стать ошибкой компиляции с внятным местом, а не
+// обещанием, которое некому проверить.
+const fn assert_send<T: Send>() {}
+const _: () = assert_send::<Task>();
+
+impl Task {
+    /// Холостая задача — контекст, из которого вызвали `run()`.
+    #[must_use]
+    pub fn idle() -> Self {
+        Self {
+            id: TaskId::IDLE,
+            name: "idle",
+            state: TaskState::Running,
+            switches: 0,
+            context: MaybeUninit::uninit(),
+            stack: None,
+        }
+    }
+
+    /// Новая задача, которая при первом переключении уйдёт в `entry(arg)`.
+    #[must_use]
+    pub fn new(
+        id: TaskId,
+        name: &'static str,
+        stack: Stack,
+        entry: extern "C" fn(usize) -> !,
+        arg: usize,
+    ) -> Self {
+        let context = Context::new(stack.top(), entry, arg);
+        Self {
+            id,
+            name,
+            state: TaskState::Ready,
+            switches: 0,
+            context: MaybeUninit::new(context),
+            stack: Some(stack),
+        }
+    }
+}
+
+/// Положить задачу в кучу, не паникуя при её нехватке.
+///
+/// `Box::new` здесь не годится: при отказе выделения он вызывает
+/// `handle_alloc_error`, то есть панику, а [`SpawnError::OutOfMemory`] обязан
+/// быть возвращаемым значением.
+#[must_use]
+pub fn box_task(task: Task) -> Option<Box<Task>> {
+    let layout = Layout::new::<Task>();
+    // SAFETY: `Task` непустой, поэтому `layout.size() > 0`.
+    let raw = unsafe { heap_alloc(layout) }.cast::<Task>();
+    if raw.is_null() {
+        // `task` уничтожается здесь — вместе с уже выделенным стеком, который
+        // иначе утёк бы ровно в тот момент, когда памяти и так нет.
+        return None;
+    }
+    // SAFETY: `raw` — свежий блок под `Task` с нужными размером и
+    // выравниванием; он не инициализирован, поэтому `write` ничего не роняет.
+    // `Box::from_raw` получает указатель от того же глобального аллокатора и с
+    // тем самым `Layout::new::<Task>()`, который `Box` использует при
+    // освобождении.
+    unsafe {
+        ptr::write(raw, task);
+        Some(Box::from_raw(raw))
+    }
+}
