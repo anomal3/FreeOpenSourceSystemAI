@@ -1,40 +1,50 @@
 //! Пользовательское пространство: программы, исполняющиеся вне ядра.
 //!
-//! # Что здесь появилось
+//! # Что здесь есть
 //!
-//! До этой фазы всё, что делала система, исполнялось в самом привилегированном
-//! режиме процессора: оболочка, файловый менеджер, драйверы — один уровень
-//! доверия на всё. Теперь есть второй: программа читается с файловой системы,
-//! раскладывается по страницам, помеченным доступными из третьего кольца
-//! (EL0 на AArch64), и запускается там. Из этого режима нельзя ни прочитать
-//! память ядра, ни выполнить его код, ни обратиться к устройству — единственная
-//! дверь наружу это системный вызов.
+//! Программа читается с файловой системы, раскладывается по страницам,
+//! помеченным доступными из третьего кольца (EL0 на AArch64), и запускается там.
+//! Из этого режима нельзя ни прочитать память ядра, ни выполнить его код, ни
+//! обратиться к устройству — единственная дверь наружу это системный вызов.
+//!
+//! С Phase 12b у каждого запуска **своё адресное пространство**: корень таблиц
+//! страниц копируется с ядерного, окно программы живёт в отдельной записи этого
+//! корня (см. [`space`]), а по завершении программы всё окно возвращается в пул
+//! кадров. Отсюда три следствия, которых не было раньше:
+//!
+//! * в таблицах ядра память программы не отображена вовсе — не «отображена, но
+//!   недоступна», а отсутствует; проверяется это обходом таблиц при каждом
+//!   запуске, а не рассуждением;
+//! * память программы не переживает её саму: страницы возвращаются в пул, а не
+//!   остаются висеть окном на всю работу системы;
+//! * две программы не делят ничего, даже когда живут по одним и тем же
+//!   виртуальным адресам.
 //!
 //! # Чего здесь пока нет
 //!
-//! **Отдельного адресного пространства.** Программа живёт в тех же таблицах
-//! страниц, что и ядро, просто в своей их части: младшая половина уже занята —
-//! образ ядра исполняется identity-отображённым, рядом лежит отображение всей
-//! физической памяти, — и всё это помещается в первую запись корневой таблицы.
-//! Программа занимает вторую, начиная с 512 ГиБ.
+//! **Настоящего процесса.** Программа исполняется внутри вызова [`run`]:
+//! оболочка ждёт её завершения, планировщик о ней ничего не знает, и запустить
+//! вторую, не дождавшись первой, нельзя — попытка отвергается
+//! [`Error::AlreadyRunning`]. Отсюда же и тонкость с `yield`: уступив процессор
+//! системным вызовом, программа отдаёт его задачам ядра, а те продолжают
+//! работать, пока в регистре страниц стоит **её** корень. Это безопасно ровно
+//! потому, что копия содержит все отображения ядра, а всё, что ядро отображает
+//! на ходу, идёт в его собственное дерево (см. `arch::kernel_root`).
 //!
-//! Что это даёт и чего не даёт, стоит сказать прямо. Даёт: программа физически
-//! не может дотянуться до ядра — записи её страниц помечены пользовательскими,
-//! а ядерные нет, и проверку делает блок управления памятью, а не код. Не даёт:
-//! две программы, запущенные подряд, живут по одним адресам, и разделения между
-//! ними нет — потому что одновременно их не бывает. Своё пространство на
-//! программу — следующая фаза, и она про переключение `CR3`/`TTBR0`, а не про
-//! привилегии.
+//! **Файловых системных вызовов и проверки прав.** Это Phase 12c; `mode`,
+//! `uid` и `gid` пишутся установщиком и видны в файловом менеджере, но пока
+//! никем не проверяются.
 //!
-//! # Почему окно памяти постоянное
+//! # Почему окно ограничено сверху
 //!
-//! Кадры под программу выделяются один раз и дальше переиспользуются. Причина
-//! прозаическая: снимать отображение таблицы страниц не умеют — функции
-//! `unmap` в них нет, — и каждый запуск, выделяющий новые кадры, утекал бы
-//! памятью. Окно фиксированного размера с обнулением перед загрузкой честнее:
-//! оно ограничивает программу сверху и не течёт.
+//! Размер окна фиксирован ([`IMAGE_PAGES`] страниц под образ и [`STACK_PAGES`]
+//! под стек), а не выведен из файла программы. Причина — не в простоте
+//! реализации: фиксированный размер ограничивает программу сверху известным
+//! числом, а сегмент, не поместившийся в окно, отвергается загрузчиком до
+//! первой записи в память, а не после.
 
 pub mod elf;
+pub mod space;
 pub mod syscall;
 
 use alloc::vec::Vec;
@@ -43,11 +53,17 @@ use crate::mm::{FrameAllocator, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 use crate::sync::SpinLock;
 use crate::{arch, kprintln};
 
+use space::Space;
+
 /// Начало окна программы: 512 ГиБ.
 ///
 /// Тот же адрес записан в компоновочном сценарии `crates/user-progs/user.ld`;
 /// разъехаться они не могут незаметно — сегмент за пределами окна отвергается
 /// загрузчиком с [`elf::ElfError::OutOfWindow`].
+///
+/// Выравнено на границу записи корневой таблицы намеренно: вся память программы
+/// обязана лежать под одной такой записью, иначе освобождение пространства
+/// перестало бы быть обходом одного поддерева (см. [`space::WINDOW_SLOT`]).
 pub const WINDOW_BASE: usize = 0x0000_0080_0000_0000;
 
 /// Сколько страниц отведено под образ программы.
@@ -82,10 +98,12 @@ pub enum Error {
     Elf(elf::ElfError),
     /// Не хватило кадров под окно программы.
     OutOfMemory,
-    /// Не удалось отобразить страницу окна.
+    /// Не удалось построить адресное пространство или отобразить страницу.
     Map(crate::mm::MapError),
     /// Страница получилась одновременно записываемой и исполняемой.
     WriteExecute(usize),
+    /// Программа уже исполняется.
+    AlreadyRunning,
 }
 
 impl core::fmt::Display for Error {
@@ -95,98 +113,44 @@ impl core::fmt::Display for Error {
             Self::Read(err) => write!(f, "{err}"),
             Self::Elf(err) => write!(f, "{err}"),
             Self::OutOfMemory => f.write_str("not enough memory for the program window"),
-            Self::Map(err) => write!(f, "mapping the program window failed: {err}"),
+            Self::Map(err) => write!(f, "building the address space failed: {err}"),
             Self::WriteExecute(page) => write!(
                 f,
                 "page {page} of the image would be writable and executable at once"
             ),
+            Self::AlreadyRunning => f.write_str("another program is already running"),
         }
     }
 }
-
-/// Кадры окна программы. Выделяются при первом запуске и живут дальше.
-struct Window {
-    image: Vec<PhysAddr>,
-    stack: Vec<PhysAddr>,
-}
-
-static WINDOW: SpinLock<Option<Window>> = SpinLock::new(None);
 
 /// Исполняется ли сейчас пользовательская программа.
 ///
-/// Нужно обработчику отказов: исключение из третьего кольца снимает программу,
-/// но только если она действительно запущена. Отказ «из третьего кольца» в
-/// момент, когда никакой программы нет, означает испорченное состояние
-/// процессора, и возвращаться в этом случае некуда.
+/// Нужно двоим. Обработчику отказов: исключение из третьего кольца снимает
+/// программу, но только если она действительно запущена, — отказ «из третьего
+/// кольца» в момент, когда никакой программы нет, означает испорченное
+/// состояние процессора, и возвращаться в этом случае некуда. И самому [`run`]:
+/// вход в третье кольцо вложенным не бывает, потому что вершина стека ядра
+/// запоминается в одном месте на всю систему, и второй вход затёр бы её.
 static RUNNING: SpinLock<bool> = SpinLock::new(false);
-
-/// Выделить кадры окна, если их ещё нет.
-fn ensure_window() -> Result<(), Error> {
-    let mut guard = WINDOW.lock();
-    if guard.is_some() {
-        return Ok(());
-    }
-
-    let mut image = Vec::new();
-    let mut stack = Vec::new();
-    image.try_reserve_exact(IMAGE_PAGES).map_err(|_| Error::OutOfMemory)?;
-    stack.try_reserve_exact(STACK_PAGES).map_err(|_| Error::OutOfMemory)?;
-
-    let filled = crate::mm::frame::with(|alloc| {
-        for _ in 0..IMAGE_PAGES {
-            match alloc.allocate() {
-                Some(frame) => image.push(frame),
-                None => return false,
-            }
-        }
-        for _ in 0..STACK_PAGES {
-            match alloc.allocate() {
-                Some(frame) => stack.push(frame),
-                None => return false,
-            }
-        }
-        true
-    });
-
-    // Кадры, успевшие выделиться до отказа, не возвращаются: аллокатор их
-    // отдаст обратно только по `free`, а вызывать его на половине списка —
-    // отдельный путь ради случая «памяти нет вовсе», в котором система всё
-    // равно доживает последние секунды.
-    if filled != Some(true) {
-        return Err(Error::OutOfMemory);
-    }
-
-    *guard = Some(Window { image, stack });
-    Ok(())
-}
 
 /// Виртуальный адрес кадра в прямом отображении — через него ядро пишет в
 /// память программы.
+///
+/// Пишет именно так, а не по адресам самой программы: её окно в таблицах ядра
+/// не отображено, и обращение к [`WINDOW_BASE`] из ядра — это отказ страницы, а
+/// не запись в образ.
 fn frame_bytes(frame: PhysAddr) -> *mut u8 {
     frame.to_direct_map().as_mut_ptr::<u8>()
 }
 
-/// Заполнить окно образа нулями.
-///
-/// Обязательно перед каждой загрузкой, и по двум причинам сразу: `.bss`
-/// программы обязан быть нулевым, а память от предыдущей программы не должна
-/// доставаться следующей.
-fn zero_image(window: &Window) {
-    for frame in &window.image {
-        // SAFETY: кадр выделен аллокатором и отображён в прямое отображение
-        // ядра; пишем ровно страницу от его начала.
-        unsafe { core::ptr::write_bytes(frame_bytes(*frame), 0, PAGE_SIZE) };
-    }
-}
-
-/// Скопировать данные в окно образа по смещению от [`WINDOW_BASE`].
-fn write_image(window: &Window, offset: usize, data: &[u8]) {
+/// Скопировать данные в образ по смещению от [`WINDOW_BASE`].
+fn write_image(frames: &[PhysAddr], offset: usize, data: &[u8]) {
     let mut written = 0;
     while written < data.len() {
         let at = offset + written;
         let page = at / PAGE_SIZE;
         let in_page = at % PAGE_SIZE;
-        let Some(frame) = window.image.get(page) else {
+        let Some(frame) = frames.get(page) else {
             return;
         };
         let chunk = (PAGE_SIZE - in_page).min(data.len() - written);
@@ -204,21 +168,31 @@ fn write_image(window: &Window, offset: usize, data: &[u8]) {
     }
 }
 
-/// Разложить программу по окну и вернуть точку входа.
-fn load(bytes: &[u8]) -> Result<usize, Error> {
-    let image = elf::Image::parse(bytes).map_err(Error::Elf)?;
+/// Выделить кадр под страницу программы.
+fn take_frame() -> Result<PhysAddr, Error> {
+    crate::mm::frame::with(|frames| frames.allocate())
+        .flatten()
+        .ok_or(Error::OutOfMemory)
+}
 
-    ensure_window()?;
-    let guard = WINDOW.lock();
-    let Some(window) = guard.as_ref() else {
-        return Err(Error::OutOfMemory);
-    };
+/// Вернуть в пул кадр, который не попал в таблицы программы.
+///
+/// Нужно ровно на одном пути: отображение отказало уже после выделения кадра.
+/// Такой кадр не принадлежит ни одному дереву, и разбор адресного пространства
+/// его не найдёт — вернуть его может только тот, кто его взял.
+fn return_frame(frame: PhysAddr) {
+    crate::mm::frame::with(|pool| {
+        // SAFETY: кадр выдан этим же аллокатором, отображения на него не
+        // создано (иначе он сюда не попал бы), и больше его никто не держит.
+        unsafe { pool.free(frame) };
+    });
+}
 
-    zero_image(window);
-
-    // Права страницы — объединение прав сегментов, которые её задевают.
-    // Страница, не задетая ни одним сегментом, остаётся доступной только на
-    // чтение: она внутри окна, и оставлять её записываемой незачем.
+/// Права страниц образа: объединение прав сегментов, которые их задевают.
+///
+/// Страница, не задетая ни одним сегментом, остаётся доступной только на
+/// чтение: она внутри окна, и оставлять её записываемой незачем.
+fn image_flags(image: &elf::Image<'_>) -> Result<[PageFlags; IMAGE_PAGES], Error> {
     let mut flags = [PageFlags::READ.union(PageFlags::USER); IMAGE_PAGES];
     let mut segments = 0usize;
 
@@ -227,13 +201,9 @@ fn load(bytes: &[u8]) -> Result<usize, Error> {
         segments += 1;
 
         let offset = segment.vaddr - WINDOW_BASE;
-        let source = &image.bytes()[segment.file_offset..segment.file_offset + segment.filesz];
-        write_image(window, offset, source);
-
         let first = offset / PAGE_SIZE;
         let last = (offset + segment.memsz - 1) / PAGE_SIZE;
-        let segment_flags =
-            PageFlags::from_segment_flags(segment.flags).union(PageFlags::USER);
+        let segment_flags = PageFlags::from_segment_flags(segment.flags).union(PageFlags::USER);
         for page in first..=last.min(IMAGE_PAGES - 1) {
             flags[page] = flags[page].union(segment_flags);
         }
@@ -243,70 +213,138 @@ fn load(bytes: &[u8]) -> Result<usize, Error> {
         return Err(Error::Elf(elf::ElfError::NoSegments));
     }
 
-    for (page, frame) in window.image.iter().enumerate() {
-        let page_flags = flags[page];
+    // Проверка до первого отображения, а не после: `map` откажет и сам, но
+    // отказать на середине окна значит оставить половину страниц с правами, о
+    // которых уже никто не спрашивал.
+    for (page, page_flags) in flags.iter().enumerate() {
         if page_flags.contains(PageFlags::WRITE) && page_flags.contains(PageFlags::EXEC) {
             return Err(Error::WriteExecute(page));
         }
-        // SAFETY: адрес внутри окна программы, которое ядро ни под что другое
-        // не использует; кадр принадлежит окну. Переотображение того же кадра с
-        // другими правами разрешено — именно так окно переиспользуется между
-        // запусками.
-        unsafe {
-            arch::map_active(
-                VirtAddr::new(WINDOW_BASE + page * PAGE_SIZE),
-                *frame,
-                PAGE_SIZE,
-                page_flags,
-            )
-        }
-        .map_err(Error::Map)?;
     }
 
-    for (page, frame) in window.stack.iter().enumerate() {
-        // SAFETY: см. выше; стек — обычная память программы на чтение и запись.
-        unsafe {
-            arch::map_active(
-                VirtAddr::new(STACK_BASE + page * PAGE_SIZE),
-                *frame,
-                PAGE_SIZE,
-                PageFlags::READ
-                    .union(PageFlags::WRITE)
-                    .union(PageFlags::USER),
-            )
+    Ok(flags)
+}
+
+/// Разложить программу по её адресному пространству и вернуть точку входа.
+fn load(space: &mut Space, bytes: &[u8]) -> Result<usize, Error> {
+    let image = elf::Image::parse(bytes).map_err(Error::Elf)?;
+    let flags = image_flags(&image)?;
+
+    let mut pages = Vec::new();
+    pages.try_reserve_exact(IMAGE_PAGES).map_err(|_| Error::OutOfMemory)?;
+
+    // Кадры не обнуляются здесь: аллокатор выдаёт их чистыми по контракту, и это
+    // ровно то, что требуется в двух местах сразу — `.bss` программы обязан быть
+    // нулевым, а память от чего бы то ни было предыдущего не должна ей достаться.
+    for page in 0..IMAGE_PAGES {
+        // Кадры, уже попавшие в таблицы, возвращать здесь не надо: они внутри
+        // окна, и `Drop` пространства вернёт их вместе с ним.
+        let frame = take_frame()?;
+        // SAFETY: кадр только что выделен под эту программу и больше никому не
+        // принадлежит; при разборе пространства он вернётся в пул.
+        let mapped = unsafe {
+            space.map(VirtAddr::new(WINDOW_BASE + page * PAGE_SIZE), frame, flags[page])
+        };
+        if let Err(err) = mapped {
+            // Отображения не появилось — значит поддерево окна этот кадр не
+            // содержит, и вернуть его надо здесь.
+            return_frame(frame);
+            return Err(Error::Map(err));
         }
-        .map_err(Error::Map)?;
+        pages.push(frame);
+    }
+
+    for page in 0..STACK_PAGES {
+        let frame = take_frame()?;
+        // SAFETY: см. выше; стек — обычная память программы на чтение и запись.
+        let mapped = unsafe {
+            space.map(
+                VirtAddr::new(STACK_BASE + page * PAGE_SIZE),
+                frame,
+                PageFlags::READ.union(PageFlags::WRITE).union(PageFlags::USER),
+            )
+        };
+        if let Err(err) = mapped {
+            return_frame(frame);
+            return Err(Error::Map(err));
+        }
+    }
+
+    // Содержимое пишется последним и через прямое отображение: права страницы в
+    // пространстве программы к этому моменту уже выставлены, и сегмент кода там
+    // на запись недоступен.
+    for segment in image.segments((WINDOW_BASE, WINDOW_BASE + IMAGE_BYTES)) {
+        let segment = segment.map_err(Error::Elf)?;
+        let source = &image.bytes()[segment.file_offset..segment.file_offset + segment.filesz];
+        write_image(&pages, segment.vaddr - WINDOW_BASE, source);
     }
 
     Ok(image.entry)
+}
+
+/// Напечатать то, ради чего фаза затевалась: где лежит программа и чего о ней
+/// не знает ядро.
+///
+/// Строки читает не только человек — их читает стенд (`cargo xtask test`).
+/// Утверждение «окно программы в таблицах ядра отсутствует» иначе нечем
+/// проверить: снимок экрана его не покажет, а отсутствие отказа доказывает
+/// только то, что ядро туда не обращалось.
+fn report(space: &Space, entry: usize) {
+    match space.translate(VirtAddr::new(entry)) {
+        Some((frame, flags)) => kprintln!(
+            "  user        : space {:?}, entry maps to {frame:?} {flags:?}",
+            space.root()
+        ),
+        None => kprintln!("  user        : WARNING: the entry point is not mapped in its own space"),
+    }
+
+    match space::kernel_maps(VirtAddr::new(entry)) {
+        None => kprintln!("  user        : the kernel space maps nothing at {entry:#018x}"),
+        Some((frame, flags)) => kprintln!(
+            "  user        : WARNING: the kernel space maps {entry:#018x} to {frame:?} {flags:?}"
+        ),
+    }
 }
 
 /// Загрузить программу по пути и исполнить её.
 ///
 /// Возвращает код, с которым программа завершилась.
 pub fn run(path: &str) -> Result<i64, Error> {
+    if is_running() {
+        return Err(Error::AlreadyRunning);
+    }
+
     let bytes = match crate::fs::read(path, MAX_FILE) {
         Some(Ok((bytes, _))) => bytes,
         Some(Err(err)) => return Err(Error::Read(err)),
         None => return Err(Error::NoFilesystem),
     };
 
-    let entry = load(&bytes)?;
+    // Пространство живёт до конца функции и разбирается своим `Drop` — на обоих
+    // путях выхода, включая тот, которым возвращается снятая отказом программа.
+    let mut space = Space::new().map_err(Error::Map)?;
+    let entry = load(&mut space, &bytes)?;
 
     // Вершина стека выравнивается на 16: этого требуют оба соглашения о
     // вызовах, и невыровненный стек ломается не сразу, а на первой же операции
     // с вектором.
     let stack = STACK_TOP - 16;
 
-    kprintln!(
-        "  user        : '{path}', entry {entry:#018x}, stack {stack:#018x}",
-    );
+    kprintln!("  user        : '{path}', entry {entry:#018x}, stack {stack:#018x}");
+    report(&space, entry);
 
     *RUNNING.lock() = true;
+    // SAFETY: возврат на таблицы ядра — следующая же строка после выхода из
+    // программы, то есть до того, как `space` будет разобрано.
+    unsafe { space.activate() };
     // SAFETY: точка входа и стек лежат в окне, только что отображённом
     // доступным из пользовательского режима; `TSS.RSP0` (x86-64) выставлен при
     // инициализации GDT, `SP_EL1` (AArch64) — при настройке векторов.
     let code = unsafe { arch::enter_user(entry, stack) };
+    // Сюда возвращаются оба пути: и `exit`, и снятие программы после отказа.
+    // SAFETY: таблицы ядра активированы при запуске системы и никуда не делись
+    // — пространство программы построено их копией.
+    unsafe { Space::leave() };
     *RUNNING.lock() = false;
 
     Ok(code)
@@ -318,6 +356,10 @@ pub fn run(path: &str) -> Result<i64, Error> {
 /// быть проверен. Проверка не про безопасность программы, а про безопасность
 /// ядра — иначе `write` с адресом ядерной структуры заставил бы ядро самому
 /// прочитать то, до чего программа не дотянулась бы.
+///
+/// Диапазоны заданы константами, а не спрошены у таблиц: обращение к таблицам
+/// на каждом системном вызове стоило бы обхода четырёх уровней, а окно у всех
+/// программ одно и то же по построению.
 #[must_use]
 pub fn owns(ptr: usize, len: usize) -> bool {
     let Some(end) = ptr.checked_add(len) else {
@@ -338,7 +380,8 @@ pub fn is_running() -> bool {
 ///
 /// Вызывается обработчиком исключений, когда отказ пришёл из пользовательского
 /// режима. Не возвращается: управление уходит в точку, из которой программа
-/// была запущена.
+/// была запущена, — то есть в [`run`], который вернёт процессор на таблицы ядра
+/// и разберёт её адресное пространство.
 ///
 /// # Safety
 ///

@@ -43,7 +43,7 @@ use boot_info::{BootInfo, MemoryKind, MemoryMap};
 use core::arch::asm;
 use core::mem::{align_of, size_of};
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // Формат дескриптора трансляции (ARM ARM, VMSAv8-64, D8.3)
@@ -683,6 +683,13 @@ impl AddressSpace for PageTables {
             );
         }
 
+        // Корни ядра запоминаются здесь и больше не читаются из TTBRx: пока
+        // работает пользовательская программа, в `TTBR0_EL1` стоит её корень
+        // (см. [`activate_space`]), и «активное пространство» перестаёт
+        // означать «пространство ядра».
+        KERNEL_TTBR0.store(self.low.as_u64(), Ordering::Release);
+        KERNEL_TTBR1.store(self.high.as_u64(), Ordering::Release);
+
         // С этого момента identity-отображения прошивки больше нет, и до
         // таблиц надо добираться через прямое отображение.
         self.access_offset.store(PHYS_MAP_BASE, Ordering::Release);
@@ -775,6 +782,26 @@ const KIND_FRAMEBUFFER: u32 = MemoryKind::Framebuffer as u32;
 /// * пока полученный экземпляр жив, никто другой не должен править то же
 ///   дерево: два `&mut` на одни и те же таблицы дадут гонку записей.
 pub unsafe fn active_address_space() -> PageTables {
+    // Корни берутся из [`kernel_roots`], а не из TTBRx: пока исполняется
+    // пользовательская программа, в `TTBR0_EL1` стоит её корень, и правкой
+    // «активного» дерева ядро добавило бы отображение устройства в таблицы,
+    // которые будут разобраны при завершении программы.
+    let (low, high) = kernel_roots();
+    PageTables { low, high, access_offset: AtomicUsize::new(PHYS_MAP_BASE) }
+}
+
+// --- Адресные пространства программ -------------------------------------------
+
+/// Физический адрес корня нижней половины (`TTBR0_EL1`) у **ядра**.
+///
+/// Ноль, пока [`AddressSpace::activate`] не вызван; см. [`kernel_roots`].
+static KERNEL_TTBR0: AtomicU64 = AtomicU64::new(0);
+/// То же для верхней половины (`TTBR1_EL1`). Она у ядра и у программ общая:
+/// переключается только `TTBR0_EL1`.
+static KERNEL_TTBR1: AtomicU64 = AtomicU64::new(0);
+
+/// Прочитать TTBRx напрямую. Нужно ровно до первой активации таблиц ядра.
+fn read_ttbrs() -> (PhysAddr, PhysAddr) {
     let (low, high): (u64, u64);
     // SAFETY: чтение `TTBR0_EL1`/`TTBR1_EL1` с EL1 разрешено и побочных эффектов
     // не имеет.
@@ -788,11 +815,278 @@ pub unsafe fn active_address_space() -> PageTables {
         );
     }
     // Младшие биты TTBRx несут ASID и CnP, а не часть адреса.
-    PageTables {
-        low: PhysAddr::new(low & DESC_ADDR_MASK),
-        high: PhysAddr::new(high & DESC_ADDR_MASK),
-        access_offset: AtomicUsize::new(PHYS_MAP_BASE),
+    (PhysAddr::new(low & DESC_ADDR_MASK), PhysAddr::new(high & DESC_ADDR_MASK))
+}
+
+/// Корни обеих половин адресного пространства ядра.
+#[must_use]
+pub fn kernel_roots() -> (PhysAddr, PhysAddr) {
+    let low = KERNEL_TTBR0.load(Ordering::Acquire);
+    let high = KERNEL_TTBR1.load(Ordering::Acquire);
+    if low == 0 || high == 0 {
+        // Таблицы ядра ещё не активированы: в регистрах стоит дерево прошивки,
+        // и другого ответа не существует.
+        return read_ttbrs();
     }
+    (PhysAddr::new(low), PhysAddr::new(high))
+}
+
+/// Корень нижней половины у ядра — тот, что копируется под программу.
+#[must_use]
+pub fn kernel_root() -> PhysAddr {
+    kernel_roots().0
+}
+
+/// Взять в работу дерево с заданным корнем нижней половины.
+///
+/// Верхняя половина берётся ядерная: адреса `0xFFFF_...` транслируются через
+/// `TTBR1_EL1`, который при запуске программы не меняется, и заводить под них
+/// второе дерево было бы не изоляцией, а копией одного и того же.
+///
+/// # Safety
+///
+/// Те же требования, что у [`active_address_space`], плюс `root` обязан быть
+/// корнем дерева, построенного этим модулем.
+pub unsafe fn space_at(root: PhysAddr) -> PageTables {
+    let (_, high) = kernel_roots();
+    PageTables { low: root, high, access_offset: AtomicUsize::new(PHYS_MAP_BASE) }
+}
+
+/// Указатель на запись `index` таблицы `table` в прямом отображении.
+fn table_entry(table: PhysAddr, index: usize) -> *mut u64 {
+    debug_assert!(index < ENTRIES_PER_TABLE);
+    ((table.as_u64() as usize + PHYS_MAP_BASE) as *mut u64).wrapping_add(index)
+}
+
+/// Создать адресное пространство программы поверх ядерного.
+///
+/// Копируется корень **нижней** половины, из которого вычеркнута запись
+/// `window_slot` — та, под которой будет лежать память программы. Копия нужна
+/// потому, что ядро исполняется identity-отображённым, то есть через тот же
+/// `TTBR0_EL1`: сменив его на пустое дерево, мы выбили бы из-под себя и код, и
+/// обработчик `svc`. Прав программе это не даёт — записи ядра не помечены
+/// доступными из EL0.
+///
+/// Нижележащие таблицы у ядра и программы общие (копируются значения записей),
+/// поэтому отображение, потребовавшее бы от ядра **новой** записи верхнего
+/// уровня, в уже созданных пространствах не появится. Все окна ядра заводятся
+/// при загрузке, задолго до первого запуска программы.
+///
+/// # Safety
+///
+/// Таблицы ядра должны быть активны: обе таблицы адресуются через прямое
+/// отображение.
+pub unsafe fn new_user_space(
+    window_slot: usize,
+    alloc: &mut impl FrameAllocator,
+) -> Result<PhysAddr, MapError> {
+    if window_slot >= ENTRIES_PER_TABLE {
+        return Err(MapError::Misaligned);
+    }
+    let root = alloc.allocate().ok_or(MapError::OutOfFrames)?;
+    let kernel = kernel_root();
+
+    for index in 0..ENTRIES_PER_TABLE {
+        // Запись окна обнуляется, а не копируется: если она вдруг окажется в
+        // дереве ядра, программа получила бы чужую память вместо своей.
+        let desc = if index == window_slot {
+            0
+        } else {
+            // SAFETY: обе таблицы — целые кадры, доступные через прямое
+            // отображение; индекс меньше числа записей.
+            unsafe { ptr::read_volatile(table_entry(kernel, index)) }
+        };
+        // SAFETY: см. выше; кадр только что выдан аллокатором.
+        unsafe { ptr::write_volatile(table_entry(root, index), desc) };
+    }
+    // Записи должны быть видны table walker'у раньше, чем корень попадёт в
+    // `TTBR0_EL1`.
+    dsb_ishst();
+
+    Ok(root)
+}
+
+/// Чем отображён адрес в дереве с корнем `root`, если он вообще отображён.
+///
+/// `root` обязан быть корнем той половины, которой принадлежит `virt`: выбор
+/// дерева по старшим битам здесь не делается, потому что вызывающий и так знает,
+/// какое пространство спрашивает.
+#[must_use]
+pub fn translate(root: PhysAddr, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
+    let mut table = root;
+    let mut level = ROOT_LEVEL;
+    while level > LEAF_LEVEL {
+        // SAFETY: на первой итерации это корень переданного дерева, дальше —
+        // адрес из его же записи; таблицы видны через прямое отображение.
+        let desc = unsafe { ptr::read_volatile(table_entry(table, virt.table_index(level))) };
+        if desc & DESC_VALID == 0 || desc & DESC_TABLE == 0 {
+            // Блочных отображений этот модуль не создаёт, а разбирать чужое как
+            // цепочку таблиц нельзя.
+            return None;
+        }
+        table = PhysAddr::new(desc & DESC_ADDR_MASK);
+        level -= 1;
+    }
+    // SAFETY: `table` — таблица L3, полученная спуском выше.
+    let leaf = unsafe { ptr::read_volatile(table_entry(table, virt.table_index(LEAF_LEVEL))) };
+    if leaf & DESC_VALID == 0 {
+        return None;
+    }
+    Some((PhysAddr::new(leaf & DESC_ADDR_MASK), leaf_flags(leaf)))
+}
+
+/// Права дескриптора страницы в терминах, не зависящих от архитектуры.
+fn leaf_flags(desc: u64) -> PageFlags {
+    // Читаема любая валидная страница: запретить чтение, разрешив запись, здесь
+    // нечем — таких кодировок в `AP` нет.
+    let mut flags = PageFlags::READ;
+    let ap = (desc >> DESC_AP_SHIFT) & 0b11;
+    if ap == AP_EL1_RW || ap == AP_EL1_RW_EL0_RW {
+        flags |= PageFlags::WRITE;
+    }
+    let user = ap == AP_EL1_RW_EL0_RW || ap == AP_EL1_RO_EL0_RO;
+    if user {
+        flags |= PageFlags::USER;
+    }
+    // Исполняемость спрашивается у того уровня привилегий, которому страница
+    // вообще доступна: UXN для пользовательской, PXN для ядерной.
+    let executable =
+        if user { desc & DESC_UXN == 0 } else { desc & DESC_PXN == 0 };
+    if executable {
+        flags |= PageFlags::EXEC;
+    }
+    match (desc >> DESC_ATTR_INDX_SHIFT) & 0b111 {
+        ATTR_IDX_DEVICE_NGNRNE | ATTR_IDX_DEVICE_NGNRE => flags |= PageFlags::DEVICE,
+        ATTR_IDX_NORMAL_NC => flags |= PageFlags::DMA,
+        _ => {}
+    }
+    flags
+}
+
+/// Переключить нижнюю половину на дерево программы.
+///
+/// # Safety
+///
+/// `root` обязан быть корнем из [`new_user_space`], то есть содержать
+/// identity-отображение ядра: следующая инструкция выбирается уже через него.
+pub unsafe fn activate_space(root: PhysAddr) {
+    // SAFETY: условие делегировано вызывающему. `tlbi vmalle1` сбрасывает
+    // трансляции EL1&0 целиком, включая глобальные: ASID мы не раздаём, и
+    // отличить по нему старое пространство от нового было бы нечем.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "msr ttbr0_el1, {root}",
+            "isb",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            root = in(reg) root.as_u64(),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Вернуть нижнюю половину на таблицы ядра.
+///
+/// # Safety
+///
+/// Вызывать только после [`AddressSpace::activate`].
+pub unsafe fn activate_kernel_space() {
+    // SAFETY: дерево ядра отображает исполняющийся код по тем же адресам, что и
+    // покидаемое, — оно и есть источник этих записей.
+    unsafe { activate_space(kernel_root()) };
+}
+
+/// Разобрать адресное пространство программы: вернуть в пул поддерево
+/// `window_slot` и саму корневую таблицу.
+///
+/// Остальные записи корня — копии ядерных, и таблицы под ними общие с ядром;
+/// освобождать их нельзя. Возвращает `(таблицы, страницы)`.
+///
+/// # Safety
+///
+/// * `root` получен из [`new_user_space`] и больше не стоит в `TTBR0_EL1`;
+/// * таблицы ядра активны.
+pub unsafe fn free_user_space(
+    root: PhysAddr,
+    window_slot: usize,
+    alloc: &mut impl FrameAllocator,
+) -> (usize, usize) {
+    let mut tables = 0usize;
+    let mut pages = 0usize;
+
+    if window_slot < ENTRIES_PER_TABLE {
+        let slot = table_entry(root, window_slot);
+        // SAFETY: корень — целый кадр в прямом отображении, индекс проверен.
+        let desc = unsafe { ptr::read_volatile(slot) };
+        if desc & DESC_VALID != 0 && desc & DESC_TABLE != 0 {
+            // SAFETY: запись создана `map` этого же модуля, значит указывает на
+            // таблицу следующего уровня.
+            unsafe {
+                free_subtree(
+                    PhysAddr::new(desc & DESC_ADDR_MASK),
+                    ROOT_LEVEL - 1,
+                    alloc,
+                    &mut tables,
+                    &mut pages,
+                );
+            }
+        }
+        // SAFETY: тот же слот того же кадра. Ссылка стирается до возврата
+        // кадров в пул: «почти правильная» запись в таблице страниц опаснее
+        // отсутствующей.
+        unsafe { ptr::write_volatile(slot, 0) };
+        dsb_ishst();
+    }
+
+    // SAFETY: корень выдан аллокатором в `new_user_space`, в регистрах больше
+    // не стоит и ни одно дерево на него не ссылается.
+    unsafe { alloc.free(root) };
+    tables += 1;
+
+    (tables, pages)
+}
+
+/// Рекурсивно освободить таблицу уровня `level` и всё, что под ней.
+///
+/// # Safety
+///
+/// `table` — таблица указанного уровня в разбираемом дереве, никем больше не
+/// разделяемая.
+unsafe fn free_subtree(
+    table: PhysAddr,
+    level: usize,
+    alloc: &mut impl FrameAllocator,
+    tables: &mut usize,
+    pages: &mut usize,
+) {
+    for index in 0..ENTRIES_PER_TABLE {
+        // SAFETY: таблица — целый кадр в прямом отображении.
+        let desc = unsafe { ptr::read_volatile(table_entry(table, index)) };
+        if desc & DESC_VALID == 0 {
+            continue;
+        }
+        let target = PhysAddr::new(desc & DESC_ADDR_MASK);
+        if level == LEAF_LEVEL {
+            // SAFETY: страница окна выделена под программу и больше нигде не
+            // используется.
+            unsafe { alloc.free(target) };
+            *pages += 1;
+        } else if desc & DESC_TABLE == 0 {
+            // Блочное отображение: этот модуль их не создаёт, значит запись
+            // чужая, и возвращать в пул мегабайты неизвестно чего нельзя.
+            crate::kprintln!("mm: refusing to free a block mapping at level {level} of a user space");
+        } else {
+            // SAFETY: запись указывает на таблицу следующего уровня того же
+            // дерева.
+            unsafe { free_subtree(target, level - 1, alloc, tables, pages) };
+        }
+    }
+    // SAFETY: все ссылки из таблицы обработаны; ссылку на неё саму вызывающий
+    // стирает сразу после возврата.
+    unsafe { alloc.free(table) };
+    *tables += 1;
 }
 
 /// Добавить отображение в **уже активное** адресное пространство ядра.

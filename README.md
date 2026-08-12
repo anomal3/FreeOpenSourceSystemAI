@@ -2,13 +2,14 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 12a done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 12b done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
-> windows you can drag and close, a terminal, a file manager, a system monitor. And it now
-> runs **programs outside the kernel**: `run /bin/hello` loads an ELF, maps it into pages
-> reachable only from ring 3 (EL0) and jumps there; the program talks back through system
-> calls, and when it faults the kernel kills it and keeps going. On both architectures.
-> Each program does not yet get an address space of its own — see [Roadmap](#roadmap).
+> windows you can drag and close, a terminal, a file manager, a system monitor. And it runs
+> **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
+> loads an ELF into page tables built for that run alone, jumps to ring 3 (EL0), and takes
+> the whole space apart when the program ends — including when it ends by faulting. The
+> kernel's own tables never map the program at all. On both architectures.
+> Files still have permissions nobody checks — see [Roadmap](#roadmap).
 
 ## Why
 
@@ -142,28 +143,51 @@ kernel memory, execute a kernel instruction or touch a device. The only door is 
 and `uptime`. `uptime` exists to show that data crosses the boundary *inward* too, not only
 out.
 
-`run /bin/crash` writes to address zero. Before this phase that was a kernel panic and a
-stopped machine; now it prints one line, kills the program and returns to the shell. That
-difference is the phase.
+`run /bin/crash` writes to address zero. Before Phase 12a that was a kernel panic and a
+stopped machine; now it prints one line, kills the program and returns to the shell.
 
-Three things are deliberately not there yet, and each is a separate piece of work:
+### An address space per program
 
-- **An address space per program.** The program lives in the kernel's own page tables, in a
-  part of them the kernel does not use: the low half is taken (the kernel image runs
-  identity-mapped, with all of physical memory mapped beside it) and all of it fits in the
-  first entry of the root table, so the program gets the second — 512 GiB up. What that
-  gives is real: the CPU refuses the program access to anything not marked user. What it
-  does not give is separation *between* programs — but only one runs at a time.
+Every run builds its own page tables. The root table is a **copy** of the kernel's, with one
+entry blanked: the one the program's memory goes under. A copy, not an empty tree, because
+the kernel executes through those same tables — `CR3` describes both halves at once, and on
+ARM the kernel image is identity-mapped through `TTBR0_EL1`, the very register being switched.
+An empty tree would pull the kernel's own code out from under it, and the first trap out of
+the program would be a triple fault rather than a system call. Copying gives the program no
+rights: the kernel's entries are not marked user-accessible, and it is the MMU that refuses,
+not a check in code.
+
+Two consequences follow, and both are printed on the serial line at every run rather than
+asserted in prose:
+
+- **The kernel's own tables do not map the program at all.** Not "map it inaccessibly" —
+  there is no translation. The kernel walks both trees and says so:
+  `the kernel space maps nothing at 0x0000008000000260`.
+- **The program's memory does not outlive it.** Everything belonging to a program sits under
+  a single root entry, so tearing the space down is a walk of one subtree — which is why
+  there is no `unmap` anywhere in this kernel and no need for one. All 136 pages and the 4
+  tables holding them go back to the pool, on both exit paths: `exit`, and the fault that
+  kills the program from a place it never returned from. Run a program three times and its
+  root table lands on the same physical frame each time — that repetition *is* the proof the
+  frames came back.
+
+`run /bin/peek` reads kernel memory at an address its own page tables describe. It gets a
+fault, and that fault is the one worth having: not "no such page", but "a kernel page is not
+handed to ring 3". It is the check that copying the root did not hand out permissions along
+with the mappings.
+
+Two things are deliberately not there yet:
+
 - **Permission checks.** `mode`, `uid` and `gid` are written to disk, shown by the file
   manager and enforced by nobody. That needs file syscalls first, so that there is someone
   to check *against*.
-- **Programs as tasks.** A program runs inside the `run` call; the shell waits for it. A
-  process with state of its own, that can be preempted and resumed, comes with the address
-  space.
+- **Programs as tasks.** A program runs inside the `run` call; the shell waits for it, and a
+  second `run` before the first returns is refused. A process with state of its own, that can
+  be preempted and resumed, is still ahead.
 
-The program window is a fixed set of frames, allocated once and reused, wiped before each
-load. Not an optimisation — the page tables have no `unmap`, so allocating fresh frames per
-run would leak them. A fixed window bounds the program and does not leak.
+The window is a fixed size (512 KiB of image, 32 KiB of stack) rather than derived from the
+file. That is a bound, not a shortcut: a segment that does not fit is rejected before the
+first byte is written anywhere.
 
 ## The test bench
 
@@ -173,8 +197,9 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Nine scenarios today: a program runs outside the kernel and a faulting one is killed without
-taking the system with it (`userspace`); the system boots and the shell answers (`boot`); keys arrive over
+Nine scenarios today: a program runs in an address space of its own, one that faults is killed
+without taking the system with it, one that reaches for kernel memory is refused, and every
+run's pages go back to the pool (`userspace`); the system boots and the shell answers (`boot`); keys arrive over
 xHCI and USB HID rather than PS/2 (`keyboard`, which switches `i8042` off, since `sendkey`
 reaches exactly one keyboard and QEMU picks PS/2 when both are attached); the start menu
 opens a program, the window moves and closes and focus comes back (`desktop`); the pointer
@@ -349,21 +374,23 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 10 | Desktop: wallpaper, taskbar, start menu, window manager, file manager | **done** |
 | 11 | USB HID mouse on a multi-device xHCI: pointer, click to focus, drag, close | **done** |
 | 12a | Userspace: ELF loader, ring 3 / EL0, system calls, a faulting program is killed | **done** |
-| 12b | An address space per program, and permission checks with something to enforce | next |
+| 12b | An address space per program: the kernel root cloned, switched, and torn down at exit | **done** |
+| 12c | File system calls, and `mode`/`uid`/`gid` checked against the program asking | next |
 
-Phases 6 and 8 were both split, for the same reason: their halves are not the same size.
+Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe
 enumeration, DMA-coherent allocation, transfer rings and device enumeration. Likewise, the
 installer's disk work can be developed and unit-tested on the host, where `cargo test`
 exists, while the installer itself only ever runs under firmware. Keeping either pair in one
 commit would have meant shipping a first half nobody could run — and, worse, debugging the
-partitioning code inside a UEFI application instead of in a test.
+partitioning code inside a UEFI application instead of in a test. Phase 12 split the same
+way: address spaces are page-table work in two architecture modules, permissions are
+filesystem work along the whole VFS path, and they share nothing but the phase number.
 
-Deliberately out of scope for now, but not architecturally blocked: userspace
-isolation with an ELF loader, then a PE loader and a Wine-style Win32
-compatibility layer. The kernel avoids ELF/Unix-only assumptions — loaders sit
-behind a trait, kernel objects are handle-based, and page protection flags are
-an open bitflag set rather than a three-bit Unix enum.
+Deliberately out of scope for now, but not architecturally blocked: a PE loader and a
+Wine-style Win32 compatibility layer. The kernel avoids ELF/Unix-only assumptions — loaders
+sit behind a trait, kernel objects are handle-based, and page protection flags are an open
+bitflag set rather than a three-bit Unix enum.
 
 ## Licence
 

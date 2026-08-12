@@ -66,6 +66,32 @@ pub use x86_64::paging::map_active;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::paging::map_active;
 
+/// Адресные пространства программ. Один и тот же набор имён на обеих
+/// архитектурах, за которым скрываются довольно разные вещи: на x86-64
+/// переключается `CR3` и вместе с ним обе половины адресного пространства, на
+/// AArch64 — только `TTBR0_EL1`, потому что верхняя половина у ядра и программы
+/// общая по построению.
+///
+/// | имя                      | что делает                                      |
+/// |--------------------------|-------------------------------------------------|
+/// | [`kernel_root`]          | корень таблиц ядра                              |
+/// | [`new_user_space`]       | клон корня ядра с пустым окном под программу    |
+/// | [`space_at`]             | дерево с заданным корнем — чтобы его наполнить  |
+/// | [`translate`]            | чем отображён адрес в дереве, и отображён ли    |
+/// | [`activate_space`]       | переключить процессор на дерево программы       |
+/// | [`activate_kernel_space`]| вернуться на дерево ядра                        |
+/// | [`free_user_space`]      | разобрать окно программы и вернуть кадры в пул  |
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::paging::{
+    activate_kernel_space, activate_space, free_user_space, kernel_root, new_user_space, space_at,
+    translate,
+};
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::paging::{
+    activate_kernel_space, activate_space, free_user_space, kernel_root, new_user_space, space_at,
+    translate,
+};
+
 /// Прерывания и исключения. Обе реализации выставляют один набор имён:
 /// `init`, `enable`, `disable`, `enabled`, `without_interrupts`.
 #[cfg(target_arch = "x86_64")]
