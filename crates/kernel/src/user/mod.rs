@@ -73,7 +73,7 @@ use core::fmt::Write as _;
 use alloc::vec::Vec;
 
 use crate::mm::{FrameAllocator, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
-use crate::sync::SpinLock;
+use crate::sync::Mutex;
 use crate::vfs::perm::Access;
 use crate::{arch, kprintln, sched};
 
@@ -186,8 +186,8 @@ pub struct Program {
 /// программы нужны три машинных числа ([`sched::UserMachine`]), которые он
 /// обязан переставлять сам, а всё остальное — дело этого модуля, и знать о нём
 /// планировщику незачем.
-static PROGRAMS: SpinLock<[Option<Program>; sched::MAX_TASKS]> =
-    SpinLock::new([const { None }; sched::MAX_TASKS]);
+static PROGRAMS: Mutex<[Option<Program>; sched::MAX_TASKS]> =
+    Mutex::new([const { None }; sched::MAX_TASKS]);
 
 /// Сделать что-нибудь с программой текущей задачи.
 ///

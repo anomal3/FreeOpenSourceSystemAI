@@ -16,7 +16,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::sync::SpinLock;
+use crate::sync::Mutex;
 use crate::vfs::{DirEntry, FileSystem, Metadata, Node, NodeKind, VfsError, VfsResult};
 use crate::virtio::blk::VirtioBlk;
 
@@ -35,7 +35,7 @@ struct Inner {
 
 /// Смонтированный том.
 pub struct Ext2Fs {
-    inner: SpinLock<Inner>,
+    inner: Mutex<Inner>,
 }
 
 /// То, что отдаётся в [`crate::fs::set_root`].
@@ -92,7 +92,7 @@ impl Ext2Fs {
         let fs = ext2::Ext2::mount(&mut disk, first_lba).map_err(convert)?;
         let editor = ext2::Editor::open(&mut disk, first_lba).map_err(convert)?;
         Ok(Ext2Mount(Arc::new(Self {
-            inner: SpinLock::new(Inner { disk, fs, editor }),
+            inner: Mutex::new(Inner { disk, fs, editor }),
         })))
     }
 

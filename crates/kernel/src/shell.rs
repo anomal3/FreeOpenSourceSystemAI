@@ -25,7 +25,7 @@ use alloc::string::String;
 
 use crate::input::line::{Edit, LineEditor};
 use crate::input::{self, KeyCode};
-use crate::sync::SpinLock;
+use crate::sync::Mutex;
 use crate::vfs::perm::Access;
 use crate::vfs::{NodeKind, VfsError};
 use crate::{fs, irq, kprint, mm, sched, ui, usb, user};
@@ -72,7 +72,7 @@ const CAT_LIMIT: usize = 4096;
 /// Лок закрывает ровно то, что зависит от ядра. Программа, печатающая строку
 /// шестью системными вызовами, по-прежнему может быть вытеснена между ними — и
 /// это правильно: в Unix `write` атомарен сам по себе, а не в компании соседних.
-static OUT: SpinLock<()> = SpinLock::new(());
+static OUT: Mutex<()> = Mutex::new(());
 
 /// Приёмник вывода оболочки.
 ///

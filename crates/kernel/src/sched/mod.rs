@@ -542,6 +542,44 @@ pub fn block_on_input(until: u64, changed: impl FnOnce() -> bool) {
     schedule();
 }
 
+/// Заблокироваться до освобождения лока по адресу `address`.
+///
+/// `free` вызывается **под локом планировщика**: если он отвечает `true`, лок
+/// уже свободен и засыпать нельзя. Проверка именно здесь и закрывает гонку: пока
+/// этот лок удерживается, прерывания запрещены, а держатель мьютекса — другая
+/// задача, которой в это время не дадут ни такта. Состояние между проверкой и
+/// засыпанием измениться не может.
+///
+/// Срока у ожидания нет намеренно — см. [`Wait::Lock`].
+pub fn block_on_lock(address: usize, free: impl FnOnce() -> bool) {
+    {
+        let mut sched = SCHED.lock();
+        if !sched.running || free() {
+            return;
+        }
+        let current = sched.current;
+        if let Some(task) = sched.tasks[current].as_mut() {
+            task.state = TaskState::Blocked(Wait::Lock(address));
+        }
+    }
+    schedule();
+}
+
+/// Разбудить тех, кто ждёт лок по адресу `address`.
+///
+/// Будятся **все** ждущие, а не один: выбрать одного значило бы завести очередь
+/// и порядок в ней, а с ними и вопрос о справедливости. Проснувшиеся попробуют
+/// захватить лок по очереди, и не сумевшие уснут снова — лишний виток дешевле
+/// структуры данных, которой пока нечего упорядочивать.
+pub fn wake_lock(address: usize) {
+    let mut sched = SCHED.lock();
+    for task in sched.tasks.iter_mut().flatten() {
+        if task.state == TaskState::Blocked(Wait::Lock(address)) {
+            task.state = TaskState::Ready;
+        }
+    }
+}
+
 /// Разбудить всех, кто ждёт ввода.
 ///
 /// Вызывается драйвером, положившим событие в очередь, — как правило из

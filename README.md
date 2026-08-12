@@ -301,7 +301,9 @@ the code below is about to hand those very frames back to the pool.
 
 Everything else was already safe, and by construction rather than by luck: every shared
 structure in the kernel lives behind a spinlock that disables interrupts while it is held, so
-a timer tick cannot arrive in the middle of one.
+a timer tick cannot arrive in the middle of one. That is still how everything an interrupt
+handler touches is protected; the locks that were held *long* have since moved to a mutex
+that stops the task instead of the machine — see [Two kinds of lock](#two-kinds-of-lock).
 
 One thing did break, and it broke the way this sort of thing does — in the log rather than in
 the machine. A `write!` with a substitution in it is several calls under the hood, and a task
@@ -449,6 +451,44 @@ editor's memory, and a machine that reboots before the flush would come back wit
 free-block count that is too high — and then hand a new file a block an old one is using. That
 is not a lost counter, it is lost data, so the flush is not optional and its cost is not worth
 arguing about.
+
+### Two kinds of lock
+
+Until now the kernel had one lock, and it bought its safety by disabling interrupts for as
+long as it was held. For a short critical section that is exactly right: an interrupt handler
+that needed the same lock would otherwise deadlock the machine against itself. But long
+sections pay the same price, and by now there are some. Repainting a window in a debug build
+holds the compositor for tens of milliseconds. Editing ext2 is dozens of trips to the disk,
+each one a wait on a device.
+
+While such a section is held, the machine is deaf. The timer does not advance: the local APIC
+and the GIC keep one pending interrupt per vector, so extra ticks are simply lost, and with
+them both the clock and everyone's quantum. The UART is not drained: a PL011 receive FIFO
+holds 32 bytes and drops the rest in silence, which is how the one external diagnostic channel
+starts tearing commands in half. And preemption — the whole point of Phase 13b — does not
+happen at all.
+
+So there is a second primitive. A task that cannot take a `Mutex` goes to `Blocked(Wait::Lock)`
+keyed by the address of the lock itself, and whoever releases it wakes everyone waiting on that
+address; the losers try again and go back to sleep. Interrupts stay enabled throughout. The
+race that usually haunts this — the lock being released between "it is busy" and "I am asleep"
+— is closed by doing the re-check inside the scheduler, under the scheduler's own spinlock:
+while that is held interrupts are off, so the holder is a task that cannot be running, and the
+state cannot change underneath the decision.
+
+Two rules come with it. A mutex may not protect anything an interrupt handler touches, because
+a handler has nowhere to block — it runs on the stack of whatever task it interrupted, and
+sleeping would put *that* task to sleep instead of itself. And having taken a spinlock you must
+not reach for a mutex: interrupts are off, so the mutex's holder will never be scheduled and
+never let go. That is why chains convert whole, not link by link — shell output, the root
+filesystem, the ext2 volume and the program table all moved together. The desktop deliberately
+did not: `with_desktop` already lifts the compositor out from under its lock and draws outside
+it, which solves the same problem a different way.
+
+One honest caveat, because the bench cannot say otherwise: this improvement is argued from the
+code, not demonstrated by a test. There is no new line in the log proving "interrupts are no
+longer held off for tens of milliseconds" — the 56 passing scenarios establish only that
+nothing broke on the way.
 
 ## The test bench
 
@@ -675,6 +715,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 13d | Waiting stops burning the processor: blocked tasks, `sleep`, an idle CPU | **done** |
 | 14a | ext2 can be changed in place: create, write, truncate, delete, one writer | **done** |
 | 14b | The kernel writes: `open` for writing, `write`, `mkdir`, `rm`, files that survive a reboot | **done** |
+| 15 | A mutex that stops the task, not the machine: long locks no longer hold interrupts off | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

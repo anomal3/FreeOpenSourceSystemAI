@@ -36,7 +36,7 @@ pub use fat::Fat32;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::sync::SpinLock;
+use crate::sync::Mutex;
 use crate::vfs::perm::{Access, Credentials, permits};
 use crate::vfs::{DirEntry, FileSystem, Node, NodeKind, VfsError, VfsResult};
 
@@ -47,7 +47,7 @@ use crate::vfs::{DirEntry, FileSystem, Node, NodeKind, VfsError, VfsResult};
 /// как именно будет устроено пространство имён (`/`, `/boot`, что-то ещё) —
 /// решение, которое незачем принимать заранее. Что нужно уже сейчас — чтобы
 /// оболочка могла читать файлы, не получая ФС аргументом через полкода.
-static ROOT: SpinLock<Option<Box<dyn FileSystem>>> = SpinLock::new(None);
+static ROOT: Mutex<Option<Box<dyn FileSystem>>> = Mutex::new(None);
 
 /// Запомнить смонтированную ФС как корневую.
 pub fn set_root(fs: Box<dyn FileSystem>) {
