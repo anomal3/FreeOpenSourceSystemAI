@@ -49,6 +49,15 @@ pub struct Built {
     /// Образ RAM-диска. Не компонент: собирается не cargo и не зависит от
     /// архитектуры, поэтому в общий список не помещается.
     initrd: Option<PathBuf>,
+    /// Пользовательские программы: имя и путь к собранному файлу.
+    ///
+    /// Нужны дважды и по-разному. В образ RAM-диска они попадают файлами
+    /// `/bin/<имя>` — так их запускает система, загруженная с носителя. На
+    /// установочный носитель они кладутся отдельными файлами, потому что
+    /// установщик переносит их на **корневой раздел**, а читать их из образа
+    /// RAM-диска он не умеет: это потребовало бы от него FAT-читалки, которой у
+    /// него нет и заводить которую ради этого незачем.
+    programs: Vec<(&'static str, PathBuf)>,
 }
 
 impl Built {
@@ -74,6 +83,13 @@ impl Built {
     pub fn initrd(&self) -> Option<&Path> {
         self.initrd.as_deref()
     }
+
+    /// Пользовательские программы, собранные в этот заход.
+    pub fn programs(&self) -> impl Iterator<Item = (&'static str, &Path)> {
+        self.programs
+            .iter()
+            .map(|(name, path)| (*name, path.as_path()))
+    }
 }
 
 /// Собирает всё, что нужно для запуска: загрузчик, ядро и образ RAM-диска.
@@ -94,15 +110,24 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
         ));
     }
 
-    let initrd = if opts.initrd {
-        // Программы попадают в образ как `/bin/<имя>` — оттуда их и запускает
-        // оболочка. Собираются они вместе с ядром: программа и ядро связаны
-        // номерами системных вызовов, и собранная порознь пара разъезжается.
-        let programs = build_user_programs(opts.arch, opts.release)?;
-        let extra: Vec<(String, std::path::PathBuf)> = USER_PROGRAMS
+    // Программы собираются вместе с ядром: программа и ядро связаны номерами
+    // системных вызовов, и собранная порознь пара разъезжается молча.
+    let programs: Vec<(&'static str, PathBuf)> = if opts.kernel || opts.initrd {
+        USER_PROGRAMS
             .iter()
-            .zip(programs)
-            .map(|(name, path)| (format!("bin/{name}"), path))
+            .copied()
+            .zip(build_user_programs(opts.arch, opts.release)?)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let initrd = if opts.initrd {
+        // В образ они попадают как `/bin/<имя>` — оттуда их запускает система,
+        // загруженная с носителя.
+        let extra: Vec<(String, PathBuf)> = programs
+            .iter()
+            .map(|(name, path)| (format!("bin/{name}"), path.clone()))
             .collect();
         Some(initrd::build(&extra)?)
     } else {
@@ -115,6 +140,7 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
         release: opts.release,
         items,
         initrd,
+        programs,
     })
 }
 
@@ -143,7 +169,7 @@ pub fn build_component(component: Component, arch: Arch, release: bool) -> Resul
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 3] = ["hello", "crash", "peek"];
+pub const USER_PROGRAMS: [&str; 4] = ["hello", "crash", "peek", "perms"];
 
 /// Собрать программы, исполняющиеся вне ядра.
 ///

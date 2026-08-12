@@ -302,6 +302,13 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     mount_initrd(&info);
     mount_disk_root(&info);
 
+    // Личность сеанса читается после того, как определился корень: на
+    // установленной системе она приходит из `/etc/passwd`, а на загруженной с
+    // носителя её взять неоткуда, и сеанс остаётся root. Печатается это в обоих
+    // случаях — «проверки прав сегодня никому не откажут» обязано быть видно, а
+    // не подразумеваться.
+    user::session::adopt_account();
+
     let have_input = start_input(&info);
     start_graphics(&info);
 

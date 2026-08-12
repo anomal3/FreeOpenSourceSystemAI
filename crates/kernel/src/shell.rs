@@ -311,6 +311,7 @@ fn run_command(line: &str) -> bool {
             }
         }
         "echo" => sprintln!("  {argument}"),
+        "whoami" => whoami(),
         "run" => {
             if argument.is_empty() {
                 sprintln!("  usage: run <path>");
@@ -338,6 +339,7 @@ fn help() {
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
     sprintln!("  cat <path>    print a file, up to {CAT_LIMIT} bytes");
     sprintln!("  echo <text>   print the text back");
+    sprintln!("  whoami        the identity programs are run with");
     sprintln!("  run <path>    load an ELF and run it outside the kernel");
     sprintln!("  clear         clear the window");
     sprintln!("  exit          finish the boot and halt");
@@ -398,6 +400,25 @@ fn tasks() {
     // команды — менять контракт планировщика под оболочку.
     sprintln!("  (task list goes to the serial console)");
     sched::dump();
+}
+
+/// От чьего имени система запускает программы.
+///
+/// Оболочка при этом исполняется в кольце ноль, и её собственные `cat` и `ls`
+/// никаких прав не спрашивают. Так и должно быть: проверять код, который в
+/// любом случае может прочитать диск сектор за сектором, значит изображать
+/// границу там, где её нет. Настоящая граница — системный вызов, и она видна по
+/// тому, что `run /bin/perms` получает отказы там, где `cat` их не получает.
+fn whoami() {
+    let cred = user::session::credentials();
+    user::session::with_name(|name| {
+        if name.is_empty() {
+            sprintln!("  root ({cred}); no account was read from /etc/passwd");
+        } else {
+            sprintln!("  {name} ({cred})");
+        }
+    });
+    sprintln!("  programs run with these credentials; the shell itself runs in the kernel");
 }
 
 /// Загрузить и запустить программу вне ядра.

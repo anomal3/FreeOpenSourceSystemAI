@@ -19,7 +19,10 @@
 
 use core::panic::PanicInfo;
 
-use user_abi::{FD_STDOUT, SYS_EXIT, SYS_UPTIME, SYS_WRITE, SYS_YIELD};
+use user_abi::{
+    FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETUID, SYS_OPEN, SYS_READ, SYS_STAT,
+    SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+};
 
 /// Выполнить системный вызов.
 ///
@@ -95,6 +98,99 @@ pub fn print_u64(mut value: u64) {
     }
     // SAFETY: в буфер записаны только цифры ASCII.
     print(unsafe { core::str::from_utf8_unchecked(&buffer[index..]) });
+}
+
+/// Напечатать знаковое число.
+pub fn print_i64(value: i64) {
+    if value < 0 {
+        print("-");
+        // `unsigned_abs`, а не `-value`: у самого младшего `i64`
+        // противоположного значения не существует, и обычное отрицание было бы
+        // переполнением.
+        print_u64(value.unsigned_abs());
+    } else {
+        print_u64(value as u64);
+    }
+}
+
+/// Напечатать число в восьмеричной записи с ведущими нулями до четырёх знаков —
+/// то, как принято показывать права.
+pub fn print_octal(value: u32) {
+    let mut buffer = [b'0'; 11];
+    let mut index = buffer.len();
+    let mut rest = value;
+    loop {
+        index -= 1;
+        buffer[index] = b'0' + (rest % 8) as u8;
+        rest /= 8;
+        if rest == 0 {
+            break;
+        }
+    }
+    // Ведущие нули: `644` и `0644` — одно и то же число, но второе сразу
+    // сообщает, что запись восьмеричная.
+    let start = index.min(buffer.len() - 4);
+    // SAFETY: в буфер записаны только цифры ASCII.
+    print(unsafe { core::str::from_utf8_unchecked(&buffer[start..]) });
+}
+
+/// Открыть файл на чтение. Отрицательный результат — код ошибки из `user_abi`.
+///
+/// Обёртки возвращают числа договора, а не `Result`: перевод кода в тип — это
+/// уже библиотека, а здесь тридцать строк, целиком видимых глазом. Программа,
+/// которой понадобится `Result`, построит его сама и там, где ей удобно.
+pub fn open(path: &str) -> i64 {
+    // SAFETY: срез живёт в памяти программы, длина — его собственная.
+    unsafe { syscall(SYS_OPEN, path.as_ptr() as usize, path.len(), 0) }
+}
+
+/// Прочитать в буфер. Ноль означает конец файла.
+pub fn read(fd: i64, buffer: &mut [u8]) -> i64 {
+    if fd < 0 {
+        return fd;
+    }
+    // SAFETY: буфер принадлежит программе и доступен ей на запись; ядро
+    // проверит это ещё раз по своим таблицам.
+    unsafe { syscall(SYS_READ, fd as usize, buffer.as_mut_ptr() as usize, buffer.len()) }
+}
+
+/// Закрыть дескриптор.
+pub fn close(fd: i64) -> i64 {
+    if fd < 0 {
+        return fd;
+    }
+    // SAFETY: аргумент — число.
+    unsafe { syscall(SYS_CLOSE, fd as usize, 0, 0) }
+}
+
+/// Спросить о файле, не открывая его.
+pub fn stat(path: &str, out: &mut Stat) -> i64 {
+    // SAFETY: и путь, и приёмник лежат в памяти программы; выравнивание `Stat`
+    // обеспечено типом.
+    unsafe {
+        syscall(
+            SYS_STAT,
+            path.as_ptr() as usize,
+            path.len(),
+            core::ptr::from_mut(out) as usize,
+        )
+    }
+}
+
+/// От чьего имени исполняется программа.
+#[must_use]
+pub fn uid() -> u32 {
+    // SAFETY: аргументов у вызова нет.
+    let value = unsafe { syscall(SYS_GETUID, 0, 0, 0) };
+    value.max(0) as u32
+}
+
+/// Группа, от имени которой исполняется программа.
+#[must_use]
+pub fn gid() -> u32 {
+    // SAFETY: аргументов у вызова нет.
+    let value = unsafe { syscall(SYS_GETGID, 0, 0, 0) };
+    value.max(0) as u32
 }
 
 /// Уступить процессор.

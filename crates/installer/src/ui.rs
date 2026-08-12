@@ -289,6 +289,10 @@ const fn file_name(what: What) -> &'static str {
         What::Bootloader => crate::payload::BOOT_FILE,
         What::Kernel => "kernel.elf",
         What::Initrd => "initrd.img",
+        // Программ несколько, и показывать их по одной значило бы мелькать
+        // именами быстрее, чем человек успевает прочесть. Каталог назван
+        // целиком: он и есть то, что появляется на диске.
+        What::Program => "/bin",
     }
 }
 

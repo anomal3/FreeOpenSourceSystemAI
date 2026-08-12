@@ -234,6 +234,11 @@ pub fn run(
             let item = &payload.items[index];
             (item.what, item.target, item.size)
         };
+        // Программы на ESP не едут: их место на корневом разделе, где есть
+        // права. Они переносятся ниже, после того как он отформатирован.
+        if what == payload::What::Program {
+            continue;
+        }
         progress(3, Step::Copy(what));
         logln!("[install] copying {} -> \\{target_path} ({size} bytes)", what.tag());
         let data = payload.read(index).map_err(Error::Payload)?;
@@ -285,7 +290,7 @@ pub fn run(
     fs.write_file_path(
         &mut dev,
         CONFIG_PATH,
-        config_text(settings).as_bytes(),
+        config_text(settings, account).as_bytes(),
         0o644,
         0,
         0,
@@ -304,7 +309,58 @@ pub fn run(
         account::FIRST_UID,
         account::FIRST_UID,
     )?;
-    logln!("[install] root: /etc/passwd, /etc/system.cfg and /{home}");
+    // Файл в домашнем каталоге принадлежит человеку и закрыт от всех
+    // остальных. Он здесь не ради содержимого: это первый файл в системе,
+    // который читается по классу владельца, — и единственный способ увидеть,
+    // что этот класс вообще работает.
+    fs.write_file_path(
+        &mut dev,
+        &format!("{home}/notes.txt"),
+        notes_text(&account.name).as_bytes(),
+        0o600,
+        account::FIRST_UID,
+        account::FIRST_UID,
+    )?;
+
+    // Домашний каталог суперпользователя, закрытый от всех: `0700`, владелец
+    // root. Файл внутри намеренно оставлен читаемым всем — `0644`. Пара
+    // существует затем, чтобы разница между «проверили файл» и «прошли по
+    // пути» была видна: права файла разрешают чтение, а каталог не пускает,
+    // и правильный ответ системы — отказ.
+    fs.create_dir_path(&mut dev, "root", 0o700, 0, 0)?;
+    fs.write_file_path(
+        &mut dev,
+        "root/notes.txt",
+        b"This file is world-readable and lives in a directory that is not.\n",
+        0o644,
+        0,
+        0,
+    )?;
+
+    logln!("[install] root: /etc/passwd, /etc/system.cfg, /{home} and /root");
+
+    // Программы. `/bin` принадлежит root и открыт всем на чтение и проход, сами
+    // программы — `0755`: запускать их вправе кто угодно, менять — никто, кроме
+    // root. Ровно так же выглядит любой Unix, и не по традиции: право менять
+    // исполняемый файл — это право исполнять что угодно от чужого имени.
+    fs.create_dir_path(&mut dev, "bin", 0o755, 0, 0)?;
+    let mut programs = 0usize;
+    for index in 0..payload.items.len() {
+        let (what, name, size) = {
+            let item = &payload.items[index];
+            (item.what, item.target, item.size)
+        };
+        if what != payload::What::Program {
+            continue;
+        }
+        progress(5, Step::Copy(what));
+        logln!("[install] copying program -> /bin/{name} ({size} bytes)");
+        let data = payload.read(index).map_err(Error::Payload)?;
+        fs.write_file_path(&mut dev, &format!("bin/{name}"), &data, 0o755, 0, 0)?;
+        drop(data);
+        programs += 1;
+    }
+    logln!("[install] root: {programs} program(s) in /bin");
 
     progress(6, Step::Flush);
     fs.finish(&mut dev, &ext2_options)?;
@@ -314,13 +370,29 @@ pub fn run(
 }
 
 /// Содержимое файла настроек.
-fn config_text(settings: &Settings) -> String {
+fn config_text(settings: &Settings, account: &Draft) -> String {
     let mut out = String::new();
     out.push_str("# FreeOS system configuration, written by the installer\n");
     out.push_str(&format!("language={}\n", settings.language.tag()));
     out.push_str(&format!("keyboard={}\n", settings.keyboard));
     out.push_str(&format!("timezone={}\n", settings.timezone));
+    // Имя и домашний каталог лежат и в `/etc/passwd`, но тот закрыт от всех,
+    // кроме root: в нём отпечаток пароля. Программе, которой нужно знать, где
+    // её домашний каталог, читать файл с паролями незачем — потому эти две
+    // строки и продублированы в открытом файле настроек. Так же разведены
+    // `/etc/passwd` и общедоступные настройки в любом Unix.
+    out.push_str(&format!("user={}\n", account.name));
+    out.push_str(&format!("home=/home/{}\n", account.name));
     out
+}
+
+/// Содержимое файла в домашнем каталоге.
+fn notes_text(name: &str) -> String {
+    format!(
+        "Hello, {name}.\n\
+         This file belongs to you and to nobody else: mode 0600.\n\
+         A program running as you can read it; one running as anyone else cannot.\n"
+    )
 }
 
 /// Текущее время прошивки в виде метки FAT.

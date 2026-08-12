@@ -2,14 +2,15 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 12b done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 12c done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
-> windows you can drag and close, a terminal, a file manager, a system monitor. And it runs
+> windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
 > loads an ELF into page tables built for that run alone, jumps to ring 3 (EL0), and takes
-> the whole space apart when the program ends — including when it ends by faulting. The
-> kernel's own tables never map the program at all. On both architectures.
-> Files still have permissions nobody checks — see [Roadmap](#roadmap).
+> the whole space apart when the program ends — including when it ends by faulting. And
+> those programs now **open files under the account the system was installed with**: the
+> `mode`, `uid` and `gid` on disk decide what they may read, path component by path
+> component. On both architectures.
 
 ## Why
 
@@ -176,18 +177,58 @@ fault, and that fault is the one worth having: not "no such page", but "a kernel
 handed to ring 3". It is the check that copying the root did not hand out permissions along
 with the mappings.
 
-Two things are deliberately not there yet:
-
-- **Permission checks.** `mode`, `uid` and `gid` are written to disk, shown by the file
-  manager and enforced by nobody. That needs file syscalls first, so that there is someone
-  to check *against*.
-- **Programs as tasks.** A program runs inside the `run` call; the shell waits for it, and a
-  second `run` before the first returns is refused. A process with state of its own, that can
-  be preempted and resumed, is still ahead.
-
 The window is a fixed size (512 KiB of image, 32 KiB of stack) rather than derived from the
 file. That is a bound, not a shortcut: a segment that does not fit is rejected before the
 first byte is written anywhere.
+
+### Files, and permissions with someone to check
+
+Ten system calls now: `write`, `exit`, `yield`, `uptime`, `open`, `read`, `close`, `stat`,
+`getuid`, `getgid`. Enough for a program to read a file, and that is exactly what makes the
+`mode`, `uid` and `gid` fields — carried since Phase 9, enforced by nobody until now — start
+to mean something.
+
+The system takes its identity from `/etc/passwd`, the file its own installer wrote: `whoami`
+answers `roman (uid 1000 gid 1000)`, and every program runs with those credentials. There is
+no login: no password is asked, and nothing switches users. That is stated rather than
+disguised — the file carries a password digest, and the code that verifies one belongs with
+the code that can read a password without echoing it, which does not exist yet. Booted from
+the install medium there is no `/etc/passwd` at all, the session is root, and the boot log
+says so, because "the checks are on" and "the checks have nothing to deny" must not look the
+same.
+
+`run /bin/perms` runs as that user and reports four files:
+
+```
+perms: /etc/system.cfg: mode 0644 owner 0:0 -> read 64 bytes
+perms: /etc/passwd:     mode 0640 owner 0:0 -> permission denied
+perms: /home/roman/notes.txt: mode 0600 owner 1000:1000 -> read 64 bytes
+perms: /root/notes.txt: permission denied
+```
+
+Each answer arrives for its own reason, and the last is the one that matters. `/root/notes.txt`
+is mode `0644` — readable by everyone — inside a directory that is `0700` and owned by root.
+A check that looks at the file says yes; a check that walks the path says no, because you
+cannot search `/root`. The installer lays permissions out the way Unix does, which only works
+if the walk is the thing being checked. So it is: every directory on the way is asked for its
+search bit before the next name is looked up, and it is asked *before* the lookup, so that
+"no such file" never reports on the contents of a directory you were not allowed to enter.
+
+Two boundaries are worth stating plainly:
+
+- The checks stand at the **system call**, not in front of every filesystem call in the
+  kernel. The shell's `cat /etc/passwd` still prints it. That is not an oversight: the shell
+  runs in ring 0, and checking code that could read the disk sector by sector would draw a
+  border where there is none. The border is the trap instruction, and it is visible in that
+  `run /bin/perms` is refused exactly where `cat` is not.
+- The kernel writing into a program's buffer is checked against the **program's** page
+  tables, not the kernel's. Ring 0 may write a page the program may only read, so `read`
+  into its own code would have faulted inside the kernel — a program stopping the machine.
+  Every user pointer is now resolved through the tables from Phase 12b before a byte moves.
+
+Still ahead: **programs as tasks**. A program runs inside the `run` call; the shell waits for
+it, and a second `run` before the first returns is refused. A process with state of its own,
+that can be preempted and resumed, is the next piece.
 
 ## The test bench
 
@@ -206,7 +247,8 @@ opens a program, the window moves and closes and focus comes back (`desktop`); t
 drives all of it with clicks and a drag (`mouse`); a terminal that sends a lone carriage
 return works as Enter (`serial-cr`); the system boots off a disk this repo partitioned
 (`image`); the installer walks all seven screens and writes a disk (`install`); and that
-disk boots, mounts its ext2 root and reads `/etc` (`installed`).
+disk boots, mounts its ext2 root, takes its identity from the `/etc/passwd` it was installed
+with, and gets four different answers to four files whose permissions differ (`installed`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -288,7 +330,12 @@ any FreeOS driver exists, while the root partition is read by the system itself 
 therefore afford a format with permissions.
 
 The account lands at `/etc/passwd` on the root partition, `0640 root:root`, and the user
-gets `/home/<name>` at `0750` owned by uid 1000. The password digest is **not** produced by
+gets `/home/<name>` at `0750` owned by uid 1000. The programs go to `/bin` at `0755
+root:root` — an installed system that cannot run a program is not an installed system, and
+they are copied from the medium as separate files rather than dug out of the initrd image,
+because reading FAT would be a whole reader the installer otherwise has no use for. Those
+permissions are not decoration: from Phase 12c they are what programs are actually measured
+against. The password digest is **not** produced by
 a key derivation function: no PBKDF2, scrypt or Argon2 exists in this project, and pulling
 a crypto dependency into a UEFI application is a decision to take deliberately, not in
 passing. What is stored is a salted, iterated FNV-1a, and the algorithm is named in the
@@ -375,7 +422,8 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 11 | USB HID mouse on a multi-device xHCI: pointer, click to focus, drag, close | **done** |
 | 12a | Userspace: ELF loader, ring 3 / EL0, system calls, a faulting program is killed | **done** |
 | 12b | An address space per program: the kernel root cloned, switched, and torn down at exit | **done** |
-| 12c | File system calls, and `mode`/`uid`/`gid` checked against the program asking | next |
+| 12c | File system calls, and `mode`/`uid`/`gid` checked against the program asking | **done** |
+| 13 | Programs as tasks: state of their own, preemption, more than one at a time | next |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

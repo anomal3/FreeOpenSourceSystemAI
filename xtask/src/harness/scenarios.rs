@@ -359,6 +359,13 @@ pub const ALL: &[Scenario] = &[
             Step::Await("about to read kernel memory", 30_000),
             Step::Await("user        : killed by", 15_000),
             Step::Await("killed by the kernel", 15_000),
+            // На системе, загруженной с носителя, учётных записей нет вовсе:
+            // корень — образ initrd. Сеанс идёт от root, и проверки прав никому
+            // ни в чём не отказывают. Это состояние обязано быть видно, а не
+            // подразумеваться, — иначе «права работают» и «права молчат»
+            // выглядят одинаково.
+            Step::Line("whoami"),
+            Step::Await("root (uid 0 gid 0)", 15_000),
             // И главное: после всего этого система жива и отвечает.
             Step::Line("echo still-alive"),
             Step::Await("still-alive", 15_000),
@@ -463,7 +470,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "installed",
-        about: "Установленная система находит свой диск, монтирует ext2 и читает /etc.",
+        about: "Установленная система находит свой диск, монтирует ext2, читает /etc и проверяет права.",
         target: Target::Installed,
         usb_only: false,
         arches: &[],
@@ -478,6 +485,26 @@ pub const ALL: &[Scenario] = &[
             Step::Await("etc/", 15_000),
             Step::Line("cat /etc/system.cfg"),
             Step::Await("language=", 15_000),
+            // Личность сеанса пришла из /etc/passwd, который написал
+            // установщик: это первый раз, когда система работает не от root.
+            Step::Line("whoami"),
+            Step::Await("roman (uid 1000 gid 1000)", 15_000),
+            // И то, ради чего фаза: программа, запущенная от имени этого
+            // пользователя, получает разные ответы на разные файлы — и каждый
+            // ответ приходит по своей причине.
+            Step::Line("run /bin/perms"),
+            Step::Await("perms: uid 1000 gid 1000", 30_000),
+            // Открыто всем — читается.
+            Step::Await("/etc/system.cfg: mode 0644 owner 0:0 -> read", 15_000),
+            // Права 0640 у root: «остальным» не разрешено ничего.
+            Step::Await("/etc/passwd: mode 0640 owner 0:0 -> permission denied", 15_000),
+            // Свой файл — по классу владельца. Путь программа взяла из
+            // /etc/system.cfg, то есть добралась до него открытием и чтением.
+            Step::Await("/home/roman/notes.txt: mode 0600 owner 1000:1000 -> read", 15_000),
+            // Главный случай: сам файл открыт всем, а каталог вокруг — нет.
+            // Проверка, которая смотрит только на файл, здесь ответила бы «да».
+            Step::Await("/root/notes.txt: permission denied", 15_000),
+            Step::Await("perms: done", 15_000),
             Step::Shot("installed"),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),

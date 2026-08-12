@@ -7,6 +7,11 @@
 //! Из этого режима нельзя ни прочитать память ядра, ни выполнить его код, ни
 //! обратиться к устройству — единственная дверь наружу это системный вызов.
 //!
+//! С Phase 12c у программы есть чем пользоваться и чьё имя носить: файловые
+//! вызовы ([`syscall`], таблица дескрипторов в [`files`]) и личность сеанса
+//! ([`session`]), от имени которой проверяются права на каждый открываемый
+//! файл. До этого `mode`, `uid` и `gid` лежали на диске и не значили ничего.
+//!
 //! С Phase 12b у каждого запуска **своё адресное пространство**: корень таблиц
 //! страниц копируется с ядерного, окно программы живёт в отдельной записи этого
 //! корня (см. [`space`]), а по завершении программы всё окно возвращается в пул
@@ -31,9 +36,10 @@
 //! потому, что копия содержит все отображения ядра, а всё, что ядро отображает
 //! на ходу, идёт в его собственное дерево (см. `arch::kernel_root`).
 //!
-//! **Файловых системных вызовов и проверки прав.** Это Phase 12c; `mode`,
-//! `uid` и `gid` пишутся установщиком и видны в файловом менеджере, но пока
-//! никем не проверяются.
+//! **Настоящего входа в систему.** Личность сеанса берётся из `/etc/passwd`
+//! ([`session`]) и не проверяется паролем: спросить пароль, не показав его на
+//! экране, пока нечем. Права при этом проверяются по-настоящему — см.
+//! [`crate::vfs::perm`].
 //!
 //! # Почему окно ограничено сверху
 //!
@@ -44,6 +50,8 @@
 //! первой записи в память, а не после.
 
 pub mod elf;
+pub mod files;
+pub mod session;
 pub mod space;
 pub mod syscall;
 
@@ -51,6 +59,7 @@ use alloc::vec::Vec;
 
 use crate::mm::{FrameAllocator, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 use crate::sync::SpinLock;
+use crate::vfs::perm::Access;
 use crate::{arch, kprintln};
 
 use space::Space;
@@ -225,6 +234,30 @@ fn image_flags(image: &elf::Image<'_>) -> Result<[PageFlags; IMAGE_PAGES], Error
     Ok(flags)
 }
 
+/// Прочитать образ программы целиком.
+///
+/// Читает **ядро**, а не программа, и права на чтение файла для этого не
+/// требуются — так же, как в Unix, где `execve` довольствуется битом `x`.
+/// Разница осмысленная: содержимое исполняемого файла не отдаётся тому, кто его
+/// запустил, оно отдаётся процессору.
+fn read_image(node: &dyn crate::vfs::Node) -> Result<Vec<u8>, Error> {
+    let meta = node.metadata();
+    if meta.kind != crate::vfs::NodeKind::File {
+        return Err(Error::Read(crate::vfs::VfsError::WrongKind));
+    }
+    let want = (meta.size as usize).min(MAX_FILE);
+
+    let mut bytes = Vec::new();
+    // `try_reserve_exact`, а не `vec![]`: размер пришёл с носителя, и отказ
+    // аллокатора обязан стать ошибкой, а не паникой.
+    bytes.try_reserve_exact(want).map_err(|_| Error::OutOfMemory)?;
+    bytes.resize(want, 0);
+
+    let read = node.read_at(0, &mut bytes).map_err(Error::Read)?;
+    bytes.truncate(read);
+    Ok(bytes)
+}
+
 /// Разложить программу по её адресному пространству и вернуть точку входа.
 fn load(space: &mut Space, bytes: &[u8]) -> Result<usize, Error> {
     let image = elf::Image::parse(bytes).map_err(Error::Elf)?;
@@ -314,11 +347,18 @@ pub fn run(path: &str) -> Result<i64, Error> {
         return Err(Error::AlreadyRunning);
     }
 
-    let bytes = match crate::fs::read(path, MAX_FILE) {
-        Some(Ok((bytes, _))) => bytes,
+    // Право исполнить спрашивается до чтения файла, и спрашивается от имени
+    // сеанса. Это тот же вопрос, который в Unix задаёт `execve`, и задавать его
+    // обязано ядро: программа, которой не дали бы прочитать файл, не должна
+    // получать его в виде исполняемого кода. Отсюда же и [`Access::SEARCH`] на
+    // самом файле — бит `x`, а не `r`.
+    let cred = session::credentials();
+    let node = match crate::fs::resolve_as(cred, path, Access::SEARCH) {
+        Some(Ok(node)) => node,
         Some(Err(err)) => return Err(Error::Read(err)),
         None => return Err(Error::NoFilesystem),
     };
+    let bytes = read_image(&*node)?;
 
     // Пространство живёт до конца функции и разбирается своим `Drop` — на обоих
     // путях выхода, включая тот, которым возвращается снятая отказом программа.
@@ -330,7 +370,9 @@ pub fn run(path: &str) -> Result<i64, Error> {
     // с вектором.
     let stack = STACK_TOP - 16;
 
-    kprintln!("  user        : '{path}', entry {entry:#018x}, stack {stack:#018x}");
+    kprintln!(
+        "  user        : '{path}' as {cred}, entry {entry:#018x}, stack {stack:#018x}"
+    );
     report(&space, entry);
 
     *RUNNING.lock() = true;
@@ -346,6 +388,15 @@ pub fn run(path: &str) -> Result<i64, Error> {
     // — пространство программы построено их копией.
     unsafe { Space::leave() };
     *RUNNING.lock() = false;
+
+    // Дескрипторы закрываются здесь, а не там, где программа их открывала:
+    // закрыть их сама она не обязана, а снятая отказом — и не могла. Открытый
+    // файл, доставшийся следующей программе, был бы доступом, права на который
+    // проверялись не для неё.
+    let leaked = files::close_all();
+    if leaked > 0 {
+        kprintln!("  user        : closed {leaked} file(s) the program left open");
+    }
 
     Ok(code)
 }

@@ -45,7 +45,8 @@ const _: () = assert!(
 pub struct Item {
     /// Путь на установочном носителе.
     source: &'static CStr16,
-    /// Путь на целевом ESP, разделитель — `/`.
+    /// Путь назначения, разделитель — `/`. Куда именно он ведёт, решает
+    /// [`Item::what`]: система едет на ESP, программы — на корневой раздел.
     pub target: &'static str,
     /// Что это, для показа человеку.
     pub what: What,
@@ -58,6 +59,10 @@ pub enum What {
     Bootloader,
     Kernel,
     Initrd,
+    /// Пользовательская программа. Едет в `/bin` корневого раздела, а не на
+    /// ESP: программу запускает система, а не прошивка, и лежать ей полагается
+    /// там, где есть права.
+    Program,
 }
 
 /// Открытый установочный носитель вместе с описью.
@@ -88,6 +93,7 @@ impl What {
             What::Bootloader => "bootloader",
             What::Kernel => "kernel",
             What::Initrd => "initrd",
+            What::Program => "program",
         }
     }
 }
@@ -132,8 +138,34 @@ pub fn probe() -> Result<Payload, Error> {
         items.push(Item { source, target, what, size });
     }
 
+    // Программы. Их отсутствие установку не срывает: система без `/bin`
+    // загрузится и будет работать, просто запускать ей будет нечего. Прервать
+    // из-за них установку значило бы оценить программы дороже учётной записи и
+    // настроек, ради которых всё и затевалось.
+    for (source, target) in PROGRAMS {
+        match stat(&mut root, source, What::Program) {
+            Ok(size) => {
+                logln!("[payload] program {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Program, size });
+            }
+            Err(_) => logln!("[payload] program {source} is missing; /bin will lack it"),
+        }
+    }
+
     Ok(Payload { root, _fs: fs, items })
 }
+
+/// Пользовательские программы на носителе и их имена в `/bin`.
+///
+/// Список обязан совпадать с `USER_PROGRAMS` в `xtask/src/build.rs` — это тот
+/// же комплект, разложенный по носителю. Расхождение не остаётся незамеченным:
+/// установленная система без `/bin/perms` валит сценарий `installed` на стенде.
+const PROGRAMS: [(&CStr16, &str); 4] = [
+    (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
+    (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
+    (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
+    (cstr16!("\\FREEOS\\BIN\\PERMS"), "perms"),
+];
 
 /// Размер файла по данным файловой системы.
 fn stat(root: &mut Directory, path: &CStr16, what: What) -> Result<u64, Error> {

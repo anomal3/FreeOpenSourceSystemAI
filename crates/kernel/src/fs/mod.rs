@@ -15,6 +15,17 @@
 //! Всё, что читается с носителя, — внешние данные. Разбор устроен так, чтобы
 //! испорченный образ приводил к [`VfsError::Corrupt`](crate::vfs::VfsError), а
 //! не к панике или зацикливанию ядра.
+//!
+//! # Два входа: с проверкой прав и без
+//!
+//! [`resolve_as`] спрашивает права у каждого каталога на пути и у самого узла;
+//! [`read`] и [`list`] не спрашивают ничего. Это не две степени аккуратности, а
+//! два разных вызывающих. Первый — системный вызов пользовательской программы,
+//! то есть недоверенная сторона. Второй — код ядра: оболочка, файловый
+//! менеджер, чтение `/etc/passwd` при загрузке. Проверять код ядра значило бы
+//! проверять того, кто в любом случае может прочитать диск сектор за сектором;
+//! граница проходит по кольцу привилегий, а не по слою кода. Подробнее — в
+//! [`crate::vfs::perm`].
 
 pub mod ext2fs;
 pub mod fat;
@@ -26,7 +37,8 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::sync::SpinLock;
-use crate::vfs::{DirEntry, FileSystem, NodeKind, VfsError, VfsResult};
+use crate::vfs::perm::{Access, Credentials, permits};
+use crate::vfs::{DirEntry, FileSystem, Node, NodeKind, VfsError, VfsResult};
 
 /// Единственная смонтированная файловая система.
 ///
@@ -50,6 +62,42 @@ pub fn set_root(fs: Box<dyn FileSystem>) {
 pub fn with_root<R>(f: impl FnOnce(&dyn FileSystem) -> R) -> Option<R> {
     let guard = ROOT.lock();
     guard.as_ref().map(|fs| f(&**fs))
+}
+
+/// Найти узел по пути, проверяя права на каждом шаге.
+///
+/// Проверяется не только сам файл. Чтобы дойти до `/root/notes.txt`, нужно
+/// пройти сквозь `/` и `/root`, а для этого нужен бит поиска
+/// ([`Access::SEARCH`]) на каждом из них. Каталог `0700`, принадлежащий чужому,
+/// закрывает всё, что внутри, — сколько бы прав ни стояло на самих файлах. Без
+/// прохода по каталогам проверка выглядела бы работающей и не работала бы:
+/// установщик выставляет права именно так, как это принято в Unix, то есть
+/// рассчитывая на такую семантику.
+///
+/// Внешний `None` означает «ничего не смонтировано»: это не отказ в правах и не
+/// отсутствие файла, и путать их нельзя.
+pub fn resolve_as(
+    cred: Credentials,
+    path: &str,
+    want: Access,
+) -> Option<VfsResult<Box<dyn Node>>> {
+    with_root(|fs| {
+        let mut node = fs.root()?;
+        for component in crate::vfs::path::components(path)? {
+            // Право пройти спрашивается у каталога, в котором мы стоим, — до
+            // того, как станет известно, есть ли там такое имя. Иначе ответ
+            // «нет такого файла» рассказывал бы о содержимом каталога, в
+            // который спрашивающему не дали заглянуть.
+            if !permits(cred, &node.metadata(), Access::SEARCH) {
+                return Err(VfsError::PermissionDenied);
+            }
+            node = node.lookup(component)?;
+        }
+        if !permits(cred, &node.metadata(), want) {
+            return Err(VfsError::PermissionDenied);
+        }
+        Ok(node)
+    })
 }
 
 /// Перечислить каталог корневой ФС.

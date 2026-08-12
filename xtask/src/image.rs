@@ -205,6 +205,16 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                 anyhow::anyhow!("initrd не собран, а установочный носитель без него неполон")
             })?;
             payload.push(read_payload(arch::PAYLOAD_INITRD, initrd)?);
+
+            // Пользовательские программы — их установщик кладёт не на ESP, а на
+            // корневой раздел, в `/bin`. Список имён здесь и в
+            // `crates/installer/src/payload.rs` обязан совпадать; расходится он
+            // не молча — установленная система без `/bin/perms` валит сценарий
+            // `installed`.
+            for (name, path) in built.programs() {
+                let target = format!("{}/{}", arch::PAYLOAD_BIN_DIR, name.to_uppercase());
+                payload.push(read_payload(&target, path)?);
+            }
         }
     }
 
