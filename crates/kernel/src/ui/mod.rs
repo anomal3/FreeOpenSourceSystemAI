@@ -235,6 +235,7 @@ fn about_text(desktop: &Compositor) -> String {
 fn status_now() -> Status {
     let frames = mm::frame::stats();
     Status {
+        clock: crate::time::clock_text(),
         uptime_ms: crate::irq::uptime_ms(),
         free_mib: (frames.free_bytes() / (1024 * 1024)) as u64,
         total_mib: (frames.total_bytes() / (1024 * 1024)) as u64,

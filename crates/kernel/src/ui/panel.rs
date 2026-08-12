@@ -29,6 +29,13 @@ const BRAND: &str = "FreeOS";
 
 /// Что панель показывает справа.
 pub struct Status {
+    /// Местное время `ЧЧ:ММ`, если система его знает.
+    ///
+    /// Готовой строкой, а не числом: панель рисует то, что ей дали, и знать о
+    /// часовых поясах ей незачем. Время работы при этом остаётся на месте — оно
+    /// отвечает на другой вопрос («давно ли эта машина включена»), и заменить
+    /// им часы было нельзя, как нельзя и наоборот.
+    pub clock: Option<String>,
     pub uptime_ms: u64,
     pub free_mib: u64,
     pub total_mib: u64,
@@ -142,12 +149,20 @@ impl Panel {
         }
 
         // Состояние справа.
-        let right = alloc::format!(
-            "up {}   mem {} of {} MiB",
-            uptime_text(status.uptime_ms),
-            status.free_mib,
-            status.total_mib
-        );
+        let right = match &status.clock {
+            Some(clock) => alloc::format!(
+                "{clock}   up {}   mem {} of {} MiB",
+                uptime_text(status.uptime_ms),
+                status.free_mib,
+                status.total_mib
+            ),
+            None => alloc::format!(
+                "up {}   mem {} of {} MiB",
+                uptime_text(status.uptime_ms),
+                status.free_mib,
+                status.total_mib
+            ),
+        };
         let right_w = text::width_of(&right, scale);
         if right_w + pad < bounds.w {
             let right_x = bounds.w - right_w - pad;

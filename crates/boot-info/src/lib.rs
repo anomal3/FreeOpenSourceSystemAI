@@ -18,8 +18,9 @@ pub const BOOT_INFO_MAGIC: u64 = 0x4652_4545_4F53_0001;
 /// on a mismatch instead of silently reading garbage from an older bootloader.
 ///
 /// Revision 2 added [`BootInfo::kernel`], which the kernel needs to apply W^X
-/// to its own image. Revision 3 added [`BootInfo::initrd`].
-pub const BOOT_INFO_REVISION: u32 = 3;
+/// to its own image. Revision 3 added [`BootInfo::initrd`]. Revision 4 added
+/// [`BootInfo::wall_clock`]: the kernel has no clock of its own to ask.
+pub const BOOT_INFO_REVISION: u32 = 4;
 
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
@@ -176,6 +177,19 @@ pub struct BootInfo {
     /// Physical address of a flattened device tree, or `0` if none. Reserved
     /// for ARM platforms whose firmware provides DTB instead of ACPI.
     pub device_tree: u64,
+    /// Seconds since the Unix epoch, UTC, read from the firmware clock just
+    /// before `ExitBootServices`. `0` means the firmware had no clock to ask.
+    ///
+    /// The kernel cannot obtain this by itself without a per-platform RTC
+    /// driver — CMOS on x86-64, PL031 on the QEMU `virt` board, and nothing at
+    /// all on a Raspberry Pi 4, which ships without a battery-backed clock.
+    /// UEFI already abstracts all three behind `GetTime`, and this is the last
+    /// moment at which it can be called: boot services are about to go away.
+    ///
+    /// It is a starting point, not a clock. The kernel adds its own uptime to
+    /// it, so the pair drifts exactly as much as the timer does, and a machine
+    /// that stays up for a month will show that drift.
+    pub wall_clock: u64,
 }
 
 /// Segment is readable.
@@ -328,6 +342,7 @@ impl BootInfo {
             initrd: Initrd::NONE,
             acpi_rsdp: 0,
             device_tree: 0,
+            wall_clock: 0,
         }
     }
 

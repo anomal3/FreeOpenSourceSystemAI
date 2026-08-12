@@ -130,6 +130,10 @@ pub struct Metadata {
     pub mode: u16,
     pub uid: u32,
     pub gid: u32,
+    /// Время последнего изменения, секунды эпохи Unix, UTC. Ноль означает
+    /// «неизвестно» — так помечены и файлы на ФС, которая времени не хранит, и
+    /// файлы, созданные системой, у которой не было часов.
+    pub mtime: u32,
 }
 
 impl Metadata {
@@ -145,7 +149,7 @@ impl Metadata {
     /// запретил, а потому, что разрешать было нечему.
     #[must_use]
     pub const fn defaults(kind: NodeKind, size: u64) -> Self {
-        Self { kind, size, mode: 0o755, uid: 0, gid: 0 }
+        Self { kind, size, mode: 0o755, uid: 0, gid: 0, mtime: 0 }
     }
 }
 
@@ -163,6 +167,8 @@ pub struct DirEntry {
     pub mode: u16,
     pub uid: u32,
     pub gid: u32,
+    /// Время последнего изменения — см. [`Metadata::mtime`].
+    pub mtime: u32,
 }
 
 /// Узел файловой системы — файл или каталог.

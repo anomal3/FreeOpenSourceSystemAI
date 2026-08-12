@@ -421,38 +421,24 @@ fn now() -> fat32::Timestamp {
 ///
 /// Ноль, если часов нет: файл с датой 1970 года выглядит странно, но это
 /// честнее выдуманной даты и не мешает ничему.
+/// Календарная арифметика вынесена в крейт `calendar`, потому что теперь она
+/// нужна и ядру: время суток система получает от прошивки через загрузчик.
+/// Копия этих тридцати строк в третьем месте разошлась бы с остальными ровно в
+/// той мере, в какой её потом правили бы порознь.
 #[must_use]
 pub fn unix_now() -> u32 {
     let Ok(time) = uefi::runtime::get_time() else {
         return 0;
     };
-    let days = days_from_civil(i64::from(time.year()), time.month(), time.day());
-    let seconds = days * 86_400
-        + i64::from(time.hour()) * 3600
-        + i64::from(time.minute()) * 60
-        + i64::from(time.second());
-    u32::try_from(seconds).unwrap_or(0)
-}
-
-/// Число дней от 1970-01-01 до заданной даты.
-///
-/// Алгоритм Говарда Хиннанта (`days_from_civil`): год сдвигается так, чтобы
-/// март был первым месяцем, и високосный день оказывается в конце — после чего
-/// длина года становится выражаемой без ветвлений. Считать через таблицу
-/// длительностей месяцев было бы длиннее и куда легче ошибиться на високосных
-/// годах, а ошибка здесь тихая: неверная дата у файла ничего не ломает и
-/// потому никогда не всплывёт.
-fn days_from_civil(year: i64, month: u8, day: u8) -> i64 {
-    let month = i64::from(month.clamp(1, 12));
-    let day = i64::from(day.clamp(1, 31));
-    let year = year - i64::from(month <= 2);
-
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let day_of_era =
-        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+    let civil = calendar::DateTime::new(
+        i32::from(time.year()),
+        time.month(),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second(),
+    );
+    u32::try_from(civil.to_unix()).unwrap_or(0)
 }
 
 /// Растянуть 64-битное зерно в 16 байт под GUID, подмешав назначение.

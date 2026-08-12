@@ -39,7 +39,7 @@ mod shot;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
@@ -343,6 +343,43 @@ fn play(
                     .with_context(|| format!("шаг {index}"))?;
                 println!("  [{at:>6} мс] шаг {index}: запомнено {value:?}");
                 captured = Some(value);
+            }
+            Step::Clock(prefix, tolerance_s, timeout_ms) => {
+                println!("  [{at:>6} мс] шаг {index}: сверяем часы гостя с часами хоста");
+                let value = line
+                    .capture_number(prefix, Duration::from_millis(*timeout_ms))
+                    .with_context(|| format!("шаг {index}"))?;
+                let guest: i64 = value
+                    .parse()
+                    .with_context(|| format!("шаг {index}: {value:?} — не число секунд"))?;
+                let host = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("часы хоста до 1970 года")?
+                    .as_secs() as i64;
+                let drift = guest - host;
+                println!(
+                    "             гость {guest} с, хост {host} с, расхождение {drift} с (допуск ±{tolerance_s})"
+                );
+                if drift.unsigned_abs() > *tolerance_s {
+                    bail!(
+                        "шаг {index}: часы гостя разошлись с часами хоста на {drift} с \
+                         (гость {guest}, хост {host}); допуск ±{tolerance_s} с. \
+                         Расхождение, кратное часу, — это ошибка в часовом поясе, а не в часах"
+                    );
+                }
+            }
+            Step::AtMost(prefix, limit, timeout_ms) => {
+                println!("  [{at:>6} мс] шаг {index}: ждём число за {prefix:?}, не больше {limit}");
+                let value = line
+                    .capture_number(prefix, Duration::from_millis(*timeout_ms))
+                    .with_context(|| format!("шаг {index}"))?;
+                let number: u64 = value
+                    .parse()
+                    .with_context(|| format!("шаг {index}: {value:?} — не число"))?;
+                println!("             получено {number}");
+                if number > *limit {
+                    bail!("шаг {index}: за {prefix:?} стоит {number}, а предел {limit}");
+                }
             }
             Step::Expect(needle) => {
                 let needle = fill(needle, &captured);

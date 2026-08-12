@@ -28,7 +28,7 @@ use crate::input::{self, KeyCode};
 use crate::sync::Mutex;
 use crate::vfs::perm::Access;
 use crate::vfs::{NodeKind, VfsError};
-use crate::{fs, irq, kprint, mm, sched, ui, usb, user};
+use crate::{fs, irq, kprint, mm, sched, time, ui, usb, user};
 
 /// Приглашение к вводу.
 const PROMPT: &str = "freeos> ";
@@ -340,6 +340,7 @@ fn run_command(line: &str) -> bool {
         "" => {}
         "help" => help(),
         "uptime" => sprintln!("  {} ms, {} timer ticks", irq::uptime_ms(), irq::ticks()),
+        "date" => date(),
         "mem" => memory(),
         "input" => {
             let stats = input::stats();
@@ -361,6 +362,13 @@ fn run_command(line: &str) -> bool {
             }
         }
         "ls" => list(if argument.is_empty() { "/" } else { argument }),
+        "stat" => {
+            if argument.is_empty() {
+                sprintln!("  usage: stat <path>");
+            } else {
+                stat(argument);
+            }
+        }
         "cat" => {
             if argument.is_empty() {
                 sprintln!("  usage: cat <path>");
@@ -427,12 +435,14 @@ fn run_command(line: &str) -> bool {
 fn help() {
     sprintln!("  help          this list");
     sprintln!("  uptime        time since the timer started");
+    sprintln!("  date          the wall clock, local and UTC");
     sprintln!("  mem           physical frames, heap and DMA window");
     sprintln!("  input         key event counters");
     sprintln!("  usb           xHCI controller state");
     sprintln!("  ui            compositor state");
     sprintln!("  tasks         scheduler state");
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
+    sprintln!("  stat <path>   size, mode, owner and modification time");
     sprintln!("  cat <path>    print a file, up to {CAT_LIMIT} bytes");
     sprintln!("  echo <text>   print the text back; 'echo t > path' writes a file");
     sprintln!("  mkdir <path>  create a directory");
@@ -442,6 +452,27 @@ fn help() {
     sprintln!("  kill <task>   stop a running program by its task number");
     sprintln!("  clear         clear the window");
     sprintln!("  exit          finish the boot and halt");
+}
+
+/// Который час.
+///
+/// Печатается и местное время, и UTC с числом секунд эпохи. Первое нужно
+/// человеку, второе — тому, кто сверяет часы системы с внешними: строка со
+/// смещением и строка без него позволяют отличить неверно выставленные часы от
+/// неверно прочитанного часового пояса, а число секунд не зависит ни от того,
+/// ни от другого.
+fn date() {
+    match time::now_local() {
+        Some(local) => {
+            let utc = time::now_utc().unwrap_or(local);
+            sprintln!("  local  {local} UTC{}", time::offset_text());
+            sprintln!("  utc    {utc}");
+            sprintln!("  epoch  {} s", time::now_unix().unwrap_or(0));
+        }
+        // Часы прошивки не ответили. Выдумывать дату здесь нечем и незачем:
+        // система работает и без неё, а файлы честно помечаются нулём.
+        None => sprintln!("  the wall clock is unknown: the firmware had no clock to read"),
+    }
 }
 
 fn memory() {
@@ -652,11 +683,12 @@ fn list(path: &str) {
                     NodeKind::File => entry.name.clone(),
                 };
                 sprintln!(
-                    "  {:04o} {:>4}:{:<4} {:>9}  {}",
+                    "  {:04o} {:>4}:{:<4} {:>9}  {}  {}",
                     entry.mode,
                     entry.uid,
                     entry.gid,
                     entry.size,
+                    time::stamp_text(entry.mtime),
                     name,
                 );
             }
@@ -667,6 +699,50 @@ fn list(path: &str) {
 }
 
 /// Напечатать файл.
+/// Метаданные одного файла — то же, что показывает `ls`, но по одному имени и
+/// с временем в обоих видах.
+///
+/// Секунды эпохи печатаются рядом с датой не для человека: дату можно
+/// напечатать правдоподобной, не зная времени, а число сверяется с внешними
+/// часами. Ровно это и делает стенд с файлом, созданным секунду назад.
+fn stat(path: &str) {
+    let node = match fs::resolve_as(user::session::credentials(), path, Access::NONE) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => {
+            sprintln!("  {path}: {err}");
+            return;
+        }
+        None => {
+            sprintln!("  no filesystem is mounted");
+            return;
+        }
+    };
+
+    let meta = node.metadata();
+    let kind = match meta.kind {
+        NodeKind::Directory => "directory",
+        NodeKind::File => "file",
+    };
+    sprintln!("  path   {path}");
+    sprintln!("  kind   {kind}, {} bytes", meta.size);
+    sprintln!("  mode   {:04o}, uid {}, gid {}", meta.mode, meta.uid, meta.gid);
+    if meta.mtime == 0 {
+        // Ноль — не 1970 год. Так помечены файлы на ФС, которая времени не
+        // хранит, и файлы, созданные системой, у которой не было часов.
+        sprintln!("  mtime  unknown");
+    } else {
+        sprintln!("  mtime  {} s = {}", meta.mtime, time::stamp_text(meta.mtime));
+        // Возраст — то же самое, сказанное так, чтобы не зависеть от внешних
+        // часов. Именно он отвечает на вопрос «файл помечен временем своего
+        // создания или временем, доставшимся от установщика»: у только что
+        // созданного файла здесь ноль, а у файла с диска, помеченного меткой
+        // тома, — минуты. Часы хоста для такого сравнения не нужны.
+        if let Some(now) = time::now_unix() {
+            sprintln!("  age    {} s", now.saturating_sub(u64::from(meta.mtime)));
+        }
+    }
+}
+
 fn show(path: &str) {
     match fs::read(path, CAT_LIMIT) {
         Some(Ok((bytes, total))) => {

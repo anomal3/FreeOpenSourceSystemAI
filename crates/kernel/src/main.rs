@@ -52,6 +52,7 @@ mod sched;
 mod serial;
 mod shell;
 mod sync;
+mod time;
 mod virtio;
 mod ui;
 mod usb;
@@ -299,8 +300,18 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
         kprintln!("  framebuffer : still reachable at {:#018x}", info.framebuffer.base);
     }
 
+    // Время суток запоминается сразу после запуска таймера: до этого момента
+    // складывать точку отсчёта не с чем, а после — счётчик тиков уже идёт, и
+    // задержка попадёт в поправку, а не в ошибку.
+    time::adopt_boot_clock(info.wall_clock);
+
     mount_initrd(&info);
     mount_disk_root(&info);
+
+    // Часовой пояс лежит в том же файле настроек, что язык и раскладка, и
+    // читается там же, где личность сеанса, — как только стало известно, какая
+    // ФС корневая.
+    time::adopt_timezone();
 
     // Личность сеанса читается после того, как определился корень: на
     // установленной системе она приходит из `/etc/passwd`, а на загруженной с

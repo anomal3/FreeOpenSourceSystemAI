@@ -83,6 +83,7 @@ fn metadata_of(inode: &ext2::Inode) -> Metadata {
         mode: inode.mode,
         uid: inode.uid,
         gid: inode.gid,
+        mtime: inode.mtime,
     }
 }
 
@@ -106,6 +107,14 @@ impl Ext2Fs {
     /// место, где такую цену стоит платить не глядя.
     fn change<R>(&self, action: impl FnOnce(&mut Inner) -> VfsResult<R>) -> VfsResult<R> {
         let mut guard = self.inner.lock();
+        // Штамп времени обновляется перед **каждой** правкой, а не один раз при
+        // монтировании. [`ext2::Editor::open`] берёт его из суперблока — из
+        // времени последней записи тома, то есть из момента установки, — и до
+        // этой фазы все созданные системой файлы получали именно его: одну и ту
+        // же дату, не двигавшуюся месяцами. Часы у системы теперь есть, и
+        // спросить их дешевле, чем объяснять потом, почему файл создан раньше,
+        // чем машина включилась.
+        guard.editor.set_time(crate::time::now_unix_u32());
         let result = action(&mut guard)?;
         let Inner { disk, editor, .. } = &mut *guard;
         editor.flush(disk).map_err(convert)?;
@@ -189,6 +198,7 @@ impl Node for Ext2Node {
                 mode: node.mode,
                 uid: node.uid,
                 gid: node.gid,
+                mtime: node.mtime,
             });
         }
         Ok(out)

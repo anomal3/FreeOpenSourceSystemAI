@@ -83,6 +83,7 @@ fn main() -> Status {
     let mut info = BootInfo::new(ARCH);
     info.framebuffer = graphics::probe_framebuffer();
     info.acpi_rsdp = find_acpi_rsdp();
+    info.wall_clock = firmware_clock();
 
     print_boot_info(&info);
 
@@ -191,6 +192,43 @@ fn print_banner() {
     println!("");
 }
 
+/// Время прошивки в секундах эпохи Unix, UTC. Ноль, если часов нет.
+///
+/// Это единственный источник времени суток для всей системы: своего драйвера
+/// часов у ядра нет, а был бы — их пришлось бы писать три (CMOS на x86-64,
+/// PL031 на плате `virt`, и ничего на Raspberry Pi 4, где батарейных часов нет
+/// вовсе). Прошивка все три уже спрятала за `GetTime`.
+///
+/// Часы могут быть не выставлены — тогда ноль, и система скажет, что времени
+/// суток не знает. Выдуманная дата была бы хуже отсутствующей: файлы получили
+/// бы правдоподобные, но неверные метки, а отличить их потом не по чему.
+///
+/// # Про часовой пояс прошивки
+///
+/// `EFI_TIME` описывает **местное** время и отдельно сообщает смещение в
+/// минутах; по спецификации UTC получается прибавлением этого смещения. Когда
+/// прошивка отвечает `EFI_UNSPECIFIED_TIMEZONE`, смещение неизвестно, и время
+/// принимается за UTC — так поступают и Linux, и GRUB, и так же настроен QEMU
+/// по умолчанию (`-rtc base=utc`). Ошибка в этом месте не осталась бы
+/// незамеченной: сценарий `clock` сверяет время гостя с часами хоста, и сдвиг
+/// на целый час провалил бы его.
+fn firmware_clock() -> u64 {
+    let Ok(time) = uefi::runtime::get_time() else {
+        return 0;
+    };
+    let civil = calendar::DateTime::new(
+        i32::from(time.year()),
+        time.month(),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second(),
+    );
+    let offset_minutes = i64::from(time.time_zone().unwrap_or(0));
+    let seconds = civil.to_unix() + offset_minutes * 60;
+    u64::try_from(seconds).unwrap_or(0)
+}
+
 /// Физический адрес ACPI RSDP из UEFI configuration table, либо `0`.
 ///
 /// ACPI 2.0+ RSDP предпочтительнее: он содержит XSDT с 64-битными указателями,
@@ -240,6 +278,15 @@ fn print_boot_info(info: &BootInfo) {
         println!("  ACPI RSDP       : not found");
     }
     println!("  device tree     : {:#018x}", info.device_tree);
+    if info.wall_clock != 0 {
+        println!(
+            "  firmware clock  : {} UTC ({} s)",
+            calendar::DateTime::from_unix(info.wall_clock as i64),
+            info.wall_clock
+        );
+    } else {
+        println!("  firmware clock  : unavailable, the system will not know the date");
+    }
     println!("-----------------------------------------------------------------");
 }
 

@@ -132,17 +132,41 @@ impl SerialLine {
     ///
     /// Число обязано начинаться сразу за подстрокой: у `"started as #"` за ним
     /// идут цифры, и никакого разбора формата тут не нужно.
+    ///
+    /// # Почему число дожидается отдельно
+    ///
+    /// Потому что строка приходит по линии не целиком. Подстрока может
+    /// оказаться в буфере на одном чтении сокета, а цифры за ней — на
+    /// следующем, и тогда «прочитать сразу после `wait_for`» означает прочитать
+    /// пустоту. Ловилось это ровно так: `date` печатает `epoch  <число>`, и
+    /// стенд падал с «за "epoch  " не оказалось числа» при том, что число в
+    /// журнале было. Ждать надо оба события — и подстроку, и то, что за ней.
+    ///
+    /// Ждать конца числа — тоже обязательно, и по той же причине: буфер может
+    /// застать `17865` от `1786551504`, и сценарий получил бы правдоподобное,
+    /// но неверное число. Признак конца — любой не-цифровой байт после цифр;
+    /// у всех, кто это печатает, за числом идёт пробел или перевод строки.
     pub fn capture_number(&mut self, prefix: &str, timeout: Duration) -> Result<String> {
+        let deadline = Instant::now() + timeout;
         self.wait_for(prefix, timeout)?;
-        let guard = self.buffer.lock().expect("буфер линии");
-        let digits: String = guard.text[self.cursor..]
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        if digits.is_empty() {
-            bail!("за {prefix:?} не оказалось числа");
+        loop {
+            {
+                let guard = self.buffer.lock().expect("буфер линии");
+                let tail = &guard.text[self.cursor..];
+                let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+                // Число считается дочитанным, когда за ним видно что-то ещё.
+                if !digits.is_empty() && tail.len() > digits.len() {
+                    return Ok(digits);
+                }
+                if guard.closed {
+                    bail!("серийная линия закрылась, не дождавшись числа за {prefix:?}");
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("за {prefix:?} не оказалось числа");
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
-        Ok(digits)
     }
 
     /// Встречалась ли подстрока во всём выводе.

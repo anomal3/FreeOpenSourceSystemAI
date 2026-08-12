@@ -1,0 +1,14 @@
+[package]
+name = "calendar"
+description = "Gregorian calendar arithmetic: Unix seconds to a civil date and back, shared by the bootloader, the installer and the kernel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Зависимостей нет намеренно. Этот крейт линкуется в четыре двоичных файла на
+# трёх целях (`*-unknown-uefi`, `*-unknown-none` и хост), и всё, что он умеет, —
+# арифметика над числами.
+
+[lints]
+workspace = true

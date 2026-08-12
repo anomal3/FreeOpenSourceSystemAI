@@ -18,6 +18,8 @@ bench = false
 
 [dependencies]
 boot-info = { path = "../boot-info" }
+# Прошивка отдаёт время разложенным на поля календаря, а ядру нужно одно число.
+calendar = { path = "../calendar" }
 uefi = { version = "0.39", features = ["alloc", "global_allocator", "panic_handler"] }
 
 [lints]

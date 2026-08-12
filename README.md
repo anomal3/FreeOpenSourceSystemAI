@@ -108,9 +108,9 @@ event to a process", not a rewritten window manager.
 
 Three things are worth knowing about how it behaves:
 
-- **The clock counts uptime, not time of day.** There is no RTC driver, and the firmware
-  stops answering after `ExitBootServices`. A made-up wall clock is an interface that lies,
-  so the panel says `up 0:01:23`.
+- **The panel shows both the time and the uptime.** They answer different questions — what
+  time it is, and how long this machine has been on — and neither substitutes for the other.
+  Where the wall clock comes from, and what it costs, is [its own section](#the-clock).
 - **Compositing does not run under the lock.** `SpinLock` is held with interrupts disabled,
   and a full repaint is a million-odd writes to device memory. Drawing under it delayed
   interrupts long enough that input events arrived out of the order they happened in — the
@@ -452,6 +452,39 @@ free-block count that is too high — and then hand a new file a block an old on
 is not a lost counter, it is lost data, so the flush is not optional and its cost is not worth
 arguing about.
 
+### The clock
+
+The kernel has no clock of its own, and it is not going to grow one. Every target keeps the
+time somewhere different — CMOS behind two I/O ports on x86-64, a PL031 at an address from
+the firmware tables on the QEMU `virt` board, and nothing whatsoever on a Raspberry Pi 4,
+which ships without a battery-backed clock. UEFI already abstracts all three behind
+`GetTime`, so the bootloader asks it once, as its last act before boot services disappear,
+and hands the answer over in `BootInfo`. From then on the time of day is *that number plus
+the uptime*, and everything internal — file stamps, comparisons, the log — is UTC. The
+offset appears only where a human reads it, and comes from `/etc/system.cfg`, which the
+installer wrote after asking on its own screen.
+
+What this bought is the thing that was quietly wrong before: **file timestamps**. `Editor`
+takes its stamp from the superblock's last-write time, so until now every file the system
+created was marked with the moment of installation — the same date, unmoving, for as long as
+the install lived. Now the stamp is read from the clock on every change, `ls` shows it, and
+`stat` prints it twice: as a date, and as a number that can be checked against something
+outside the machine.
+
+Two things are worth saying plainly, because both are visible on the bench:
+
+- **The clock keeps time, but it starts in debt.** The uptime is counted in delivered timer
+  ticks, and ticks are lost whenever interrupts stay disabled — which is most of what a boot
+  is. Measured: about twenty seconds of debt on x86-64 by the time the shell appears, and
+  under ten on AArch64. After that it runs true; ten idle seconds on the bench cost the
+  guest exactly ten. The fix is not more locking discipline but a counter that does not
+  depend on interrupts arriving at all (`CNTVCT_EL0`, or the TSC calibrated against the ACPI
+  timer) — which is a phase of its own.
+- **There is no way to set it.** `SetTime` lives in boot services, and they are gone by the
+  time anything could ask. A machine whose firmware clock is wrong will be wrong until it is
+  fixed in firmware; a machine whose firmware has no clock at all says so, marks its files
+  with zero, and prints `unknown` rather than inventing a date.
+
 ### Two kinds of lock
 
 Until now the kernel had one lock, and it bought its safety by disabling interrupts for as
@@ -498,14 +531,16 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Fourteen scenarios today: a program runs in an address space of its own, one that faults is
+Fifteen scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
 (`preempt`); a program that never ends is stopped by name and its window returns to the pool,
 while the shell and a task that is not a program are refused (`kill`); a sleeping program
 shows up as `blocked` rather than `ready` and the machine reports time with nothing to run
-(`sleep`);
+(`sleep`); the wall clock the firmware handed over matches the *host's* clock, still matches
+it ten seconds later, and a file on a filesystem that stores no time says so instead of
+showing an invented date (`clock`);
 the system boots and the shell answers (`boot`); keys arrive over
 xHCI and USB HID rather than PS/2 (`keyboard`, which switches `i8042` off, since `sendkey`
 reaches exactly one keyboard and QEMU picks PS/2 when both are attached); the start menu
@@ -515,7 +550,8 @@ return works as Enter (`serial-cr`); the system boots off a disk this repo parti
 (`image`); the installer walks all seven screens and writes a disk (`install`); and that
 disk boots, mounts its ext2 root, takes its identity from the `/etc/passwd` it was installed
 with, and gets four different answers to four files whose permissions differ (`installed`);
-the shell and a ring-3 program both write to that root, and a directory that is not empty
+the shell and a ring-3 program both write to that root, a file created a moment ago reports
+an age of zero seconds rather than the installation date, and a directory that is not empty
 refuses to be deleted (`write`); and a second boot of the same disk finds what was written,
 does not find what was deleted, and still has the installer's files (`persist`).
 
@@ -638,6 +674,7 @@ glyphs written as 8x8 ASCII art — a form in which a typo is visible in the sou
 ```
 crates/boot-info/   Stable #[repr(C)] hand-off contract: bootloader → kernel
 crates/boot-uefi/   UEFI application: GOP probe, ELF loading, ExitBootServices
+crates/calendar/    Unix seconds ↔ a civil date, no_std: bootloader + installer + kernel
 crates/disk/        GPT and a FAT32 formatter, no_std: host image builder + installer
 crates/ext2/        The ext2 format: formatter, writer and reader, no_std
 crates/mini-ui/     Surfaces, 8x8 text (ASCII + Cyrillic), widgets: kernel + installer
@@ -650,6 +687,7 @@ crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/gfx/          Rects, surfaces in RAM, the screen, bitmap text
   src/ui/           Compositor: windows, z-order, damage tracking
   src/shell.rs      Prompt, commands, output that works with or without a screen
+  src/time.rs       The wall clock: the firmware's answer plus uptime, and the time zone
   src/acpi.rs       Table lookup by signature (MADT on x86-64, MCFG everywhere)
   src/pci.rs        ECAM configuration space, bus walk across bridges
   src/usb/          xHCI host controller, HID boot protocol
@@ -716,6 +754,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 14a | ext2 can be changed in place: create, write, truncate, delete, one writer | **done** |
 | 14b | The kernel writes: `open` for writing, `write`, `mkdir`, `rm`, files that survive a reboot | **done** |
 | 15 | A mutex that stops the task, not the machine: long locks no longer hold interrupts off | **done** |
+| 16 | The time of day: the firmware clock, a time zone, and files stamped with when they were written | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe
