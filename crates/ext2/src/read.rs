@@ -126,6 +126,20 @@ impl Ext2 {
         Ok(u16_at(&sb, 58) == 1)
     }
 
+    /// Когда том записывали в последний раз, по данным суперблока.
+    ///
+    /// Нужно редактору: часов у крейта нет, а новые файлы обязаны получить
+    /// какое-то время. Время последней записи — единственное осмысленное
+    /// значение, которое можно взять, ничего не спрашивая у платформы.
+    pub fn write_time(dev: &mut dyn BlockDevice, first_lba: u64) -> Result<u32> {
+        let mut sb = [0u8; SUPERBLOCK_SIZE];
+        dev.read(first_lba + SUPERBLOCK_OFFSET / 512, &mut sb)?;
+        if u16_at(&sb, 56) != MAGIC {
+            return Err(Error::Corrupt);
+        }
+        Ok(u32_at(&sb, 48))
+    }
+
     /// Метка тома.
     pub fn label(dev: &mut dyn BlockDevice, first_lba: u64) -> Result<String> {
         let mut sb = [0u8; SUPERBLOCK_SIZE];

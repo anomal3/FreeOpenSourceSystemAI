@@ -464,9 +464,26 @@ needs fsck after a power cut. ext3 journaling is additive over the same on-disk 
 it can come later without migrating data.
 
 What is implemented: formatting, directories, files, indirect and doubly-indirect blocks,
-and reading all of it back. What is not: deletion, truncation, hard and symbolic links, and
-triple indirection — each absent because it has no consumer today, and unexercised code in
-something that writes to a disk is worse than missing code.
+reading all of it back, and — since Phase 14a — changing a volume that already exists:
+creating and deleting files and directories, writing at any offset, truncating, and handing
+freed space back out. What is not: hard and symbolic links, and triple indirection — absent
+because they have no consumer today, and unexercised code in something that writes to a disk
+is worse than missing code.
+
+There used to be two writers of this format. One formatted a volume and filled it, and could
+do nothing else; the other did not exist yet, and would have been the one the kernel needed.
+There is one now: `format` lays out an empty volume and hands back an `Editor`, and the
+installer fills the root partition with the same code the kernel will write with. The path
+that matters is therefore exercised by every install, not only by `cargo test`.
+
+The two differ in exactly one way, and it is the interesting one. Formatting keeps both
+bitmaps in memory and writes them once at the end — a volume that does not exist yet cannot
+be lost, and an interrupted format simply means no filesystem. An editor may not do that: on
+a live volume every allocation and release goes to disk immediately, because what is written
+on disk is all that protects the files already there. Only the counters — free blocks, free
+inodes, directories per group — stay in memory until `flush`, and losing power before that
+costs exactly what ext2 costs anyway: `e2fsck` says "free blocks count wrong" and fixes it,
+with the data intact. Promising more without a journal would be a lie.
 
 Run `cargo xtask inspect` after an install to see what actually landed: our own code parses
 the partition table, and a foreign implementation reads the filesystem.
@@ -606,6 +623,8 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 13b | Preemption: a program that never yields no longer owns the machine | **done** |
 | 13c | `kill`: a program that never ends can be stopped, and its memory comes back | **done** |
 | 13d | Waiting stops burning the processor: blocked tasks, `sleep`, an idle CPU | **done** |
+| 14a | ext2 can be changed in place: create, write, truncate, delete, one writer | **done** |
+| 14b | The kernel writes: `open` for writing, `write`, `mkdir`, `rm`, files that survive a reboot | next |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

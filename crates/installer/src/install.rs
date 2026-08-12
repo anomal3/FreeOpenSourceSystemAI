@@ -363,7 +363,7 @@ pub fn run(
     logln!("[install] root: {programs} program(s) in /bin");
 
     progress(6, Step::Flush);
-    fs.finish(&mut dev, &ext2_options)?;
+    fs.flush(&mut dev)?;
     dev.flush()?;
     logln!("[install] finished");
     Ok(())

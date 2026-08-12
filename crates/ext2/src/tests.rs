@@ -17,7 +17,8 @@ use ext4_view::Ext4;
 
 use crate::layout::BlockSize;
 use crate::read::{Ext2, FileType};
-use crate::write::{FormatOptions, Writer, format_with};
+use crate::edit::Editor;
+use crate::write::{FormatOptions, format_with};
 use crate::{Error, ROOT_INODE};
 
 /// 512 МиБ — примерно тот корневой раздел, который создаёт установщик.
@@ -36,7 +37,7 @@ fn options() -> FormatOptions<'static> {
 }
 
 /// Отформатировать образ в памяти и вернуть его вместе с писателем.
-fn formatted(sectors: u64, block_size: BlockSize) -> (MemDisk, Writer) {
+fn formatted(sectors: u64, block_size: BlockSize) -> (MemDisk, Editor) {
     let mut dev = MemDisk::new(sectors).expect("образ размещается");
     let writer = format_with(&mut dev, 0, sectors, block_size, &options())
         .expect("форматирование удаётся");
@@ -53,7 +54,7 @@ fn foreign(dev: &MemDisk) -> Ext4 {
 fn foreign_reader_mounts_a_freshly_formatted_volume() {
     for block_size in [BlockSize::B1024, BlockSize::B4096] {
         let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, block_size);
-        writer.finish(&mut dev, &options()).expect("завершение");
+        writer.flush(&mut dev).expect("завершение");
 
         let fs = foreign(&dev);
         assert!(fs.exists("/").expect("корень существует"), "{block_size:?}");
@@ -93,7 +94,7 @@ fn files_and_directories_survive_a_round_trip_through_a_foreign_reader() {
             1000,
         )
         .expect("файл пользователя");
-    writer.finish(&mut dev, &options()).expect("завершение");
+    writer.flush(&mut dev).expect("завершение");
 
     let fs = foreign(&dev);
     assert_eq!(
@@ -134,7 +135,7 @@ fn large_files_use_indirect_blocks() {
     writer
         .write_file_path(&mut dev, "big.bin", &payload, 0o644, 0, 0)
         .expect("большой файл");
-    writer.finish(&mut dev, &options()).expect("завершение");
+    writer.flush(&mut dev).expect("завершение");
 
     let fs = foreign(&dev);
     let read = fs.read("/big.bin").expect("большой файл читается");
@@ -154,7 +155,7 @@ fn directories_grow_past_one_block() {
             .write_file_path(&mut dev, &format!("many/{name}"), b"x", 0o644, 0, 0)
             .expect("файл");
     }
-    writer.finish(&mut dev, &options()).expect("завершение");
+    writer.flush(&mut dev).expect("завершение");
 
     let fs = foreign(&dev);
     let listed: Vec<String> = fs
@@ -183,7 +184,7 @@ fn our_reader_agrees_with_the_foreign_one() {
     writer
         .write_file_path(&mut dev, "home/roman/data.bin", &payload, 0o600, 1000, 1000)
         .expect("файл");
-    writer.finish(&mut dev, &options()).expect("завершение");
+    writer.flush(&mut dev).expect("завершение");
 
     let ours = Ext2::mount(&mut dev, 0).expect("свой драйвер монтирует том");
     let theirs = foreign(&dev);
@@ -229,7 +230,7 @@ fn partial_reads_land_where_they_should() {
     writer
         .write_file_path(&mut dev, "data.bin", &payload, 0o644, 0, 0)
         .expect("файл");
-    writer.finish(&mut dev, &options()).expect("завершение");
+    writer.flush(&mut dev).expect("завершение");
 
     let fs = Ext2::mount(&mut dev, 0).expect("монтирование");
     let inode = fs.resolve(&mut dev, "/data.bin").expect("файл");
@@ -263,7 +264,7 @@ fn a_volume_at_an_offset_is_self_consistent() {
     writer
         .write_file_path(&mut dev, "etc/passwd", b"roman", 0o640, 0, 0)
         .expect("файл");
-    writer.finish(&mut dev, &options()).expect("завершение");
+    writer.flush(&mut dev).expect("завершение");
 
     // Сектор перед разделом обязан остаться нетронутым.
     let mut before = [0u8; 512];
@@ -289,7 +290,7 @@ fn metadata_of_the_root_directory_is_sane() {
     writer
         .create_dir_path(&mut dev, "home", 0o755, 0, 0)
         .expect("каталог");
-    writer.finish(&mut dev, &options()).expect("завершение");
+    writer.flush(&mut dev).expect("завершение");
 
     let fs = Ext2::mount(&mut dev, 0).expect("монтирование");
     let root = fs.root(&mut dev).expect("корень");
@@ -350,7 +351,7 @@ fn geometry_survives_a_round_trip_through_the_superblock() {
     ] {
         let (mut dev, mut writer) = formatted(sectors, block_size);
         let written = writer.geometry();
-        writer.finish(&mut dev, &options()).expect("завершение");
+        writer.flush(&mut dev).expect("завершение");
 
         let fs = Ext2::mount(&mut dev, 0).expect("монтирование");
         let read = fs.geometry();
@@ -370,7 +371,7 @@ fn geometry_survives_a_round_trip_through_the_superblock() {
 #[test]
 fn a_volume_with_unknown_features_is_refused() {
     let (mut dev, mut writer) = formatted(64 * 1024 * 1024 / 512, BlockSize::B1024);
-    writer.finish(&mut dev, &options()).expect("завершение");
+    writer.flush(&mut dev).expect("завершение");
 
     // Выставляем несуществующую у нас возможность прямо в суперблоке.
     let mut sb = [0u8; 1024];
@@ -386,7 +387,265 @@ fn a_volume_with_unknown_features_is_refused() {
 #[test]
 fn label_and_state_are_readable() {
     let (mut dev, mut writer) = formatted(64 * 1024 * 1024 / 512, BlockSize::B1024);
-    writer.finish(&mut dev, &options()).expect("завершение");
+    writer.flush(&mut dev).expect("завершение");
     assert_eq!(Ext2::label(&mut dev, 0).as_deref(), Ok("FreeOS"));
     assert_eq!(Ext2::is_clean(&mut dev, 0), Ok(true));
+}
+
+// ---------------------------------------------------------------------------
+// Правка живого тома
+// ---------------------------------------------------------------------------
+//
+// Проверки ниже сначала **закрывают** том и открывают его заново
+// ([`Editor::open`]), и это не формальность: ядро именно так с ним и работает —
+// оно этот раздел не размечало и о его счётчиках знает только то, что прочитало
+// с диска. Правка редактором, доставшимся от форматирования, проверяла бы
+// совсем другой путь.
+
+/// Открыть том заново — как это делает ядро при монтировании.
+fn reopened(dev: &mut MemDisk) -> Editor {
+    Editor::open(dev, 0).expect("том открывается на правку")
+}
+
+#[test]
+fn a_file_written_after_remount_is_visible_to_a_foreign_reader() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B4096);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    let dir = editor
+        .mkdir(&mut dev, ROOT_INODE, "notes", 0o755, 1000, 1000)
+        .expect("каталог");
+    let file = editor
+        .create(&mut dev, dir, "today.txt", 0o644, 1000, 1000)
+        .expect("файл");
+    editor
+        .write_at(&mut dev, file, 0, b"written by the kernel")
+        .expect("запись");
+    editor.flush(&mut dev).expect("сброс");
+
+    let fs = foreign(&dev);
+    assert_eq!(
+        fs.read_to_string("/notes/today.txt").expect("файл читается"),
+        "written by the kernel"
+    );
+    let meta = fs.metadata("/notes/today.txt").expect("метаданные");
+    assert_eq!(meta.mode() & 0o777, 0o644);
+    assert_eq!(meta.uid(), 1000);
+}
+
+#[test]
+fn writing_past_the_end_extends_the_file_and_the_gap_reads_as_zeroes() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    let file = editor
+        .create(&mut dev, ROOT_INODE, "sparse.bin", 0o644, 0, 0)
+        .expect("файл");
+    editor.write_at(&mut dev, file, 0, b"head").expect("начало");
+    // Смещение за концом: между «head» и «tail» остаётся дыра в несколько
+    // блоков, которой на диске не существует.
+    editor.write_at(&mut dev, file, 5000, b"tail").expect("хвост");
+    editor.flush(&mut dev).expect("сброс");
+
+    let fs = foreign(&dev);
+    let data = fs.read("/sparse.bin").expect("файл читается");
+    assert_eq!(data.len(), 5004);
+    assert_eq!(&data[..4], b"head");
+    assert!(data[4..5000].iter().all(|byte| *byte == 0), "дыра читается нулями");
+    assert_eq!(&data[5000..], b"tail");
+}
+
+#[test]
+fn rewriting_the_middle_of_a_file_leaves_the_rest_alone() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    let file = editor
+        .create_file(&mut dev, ROOT_INODE, "log.txt", b"aaaabbbbcccc", 0o644, 0, 0)
+        .expect("файл");
+    editor.write_at(&mut dev, file, 4, b"BBBB").expect("правка");
+    editor.flush(&mut dev).expect("сброс");
+
+    assert_eq!(
+        foreign(&dev).read_to_string("/log.txt").expect("читается"),
+        "aaaaBBBBcccc"
+    );
+}
+
+/// Файл длиннее двенадцати прямых блоков — то есть с косвенностью, — дописанный
+/// по кускам. Именно здесь ошибка в таблицах указателей и проявляется.
+#[test]
+fn appending_across_indirect_blocks_produces_a_readable_file() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    let file = editor
+        .create(&mut dev, ROOT_INODE, "big.bin", 0o644, 0, 0)
+        .expect("файл");
+
+    // 400 КиБ при блоке в килобайт: двенадцать прямых, дальше одинарная
+    // косвенность целиком (256 указателей) и начало двойной.
+    let chunk: Vec<u8> = (0..1000u32).map(|value| value as u8).collect();
+    for round in 0..400u64 {
+        let at = round * chunk.len() as u64;
+        editor.write_at(&mut dev, file, at, &chunk).expect("дозапись");
+    }
+    editor.flush(&mut dev).expect("сброс");
+
+    let data = foreign(&dev).read("/big.bin").expect("файл читается");
+    assert_eq!(data.len(), 400 * chunk.len());
+    for round in 0..400 {
+        let at = round * chunk.len();
+        assert_eq!(&data[at..at + chunk.len()], &chunk[..], "кусок {round}");
+    }
+}
+
+#[test]
+fn truncating_returns_the_blocks_and_clears_the_tail() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let before = reopened(&mut dev).free_bytes();
+
+    let mut editor = reopened(&mut dev);
+    let file = editor
+        .create(&mut dev, ROOT_INODE, "shrink.bin", 0o644, 0, 0)
+        .expect("файл");
+    let data = vec![0xAB; 100 * 1024];
+    editor.write_at(&mut dev, file, 0, &data).expect("запись");
+    assert!(editor.free_bytes() < before, "запись занимает место");
+
+    editor.truncate(&mut dev, file, 10).expect("усечение");
+    editor.flush(&mut dev).expect("сброс");
+
+    let fs = foreign(&dev);
+    assert_eq!(fs.read("/shrink.bin").expect("читается").len(), 10);
+
+    // Место вернулось: под десять байт остался ровно один блок.
+    let mut editor = reopened(&mut dev);
+    assert_eq!(before - editor.free_bytes(), 1024, "занят ровно один блок");
+
+    // А выросший обратно файл не показывает прежнее содержимое.
+    editor.write_at(&mut dev, file, 20, b"x").expect("дозапись");
+    editor.flush(&mut dev).expect("сброс");
+    let data = foreign(&dev).read("/shrink.bin").expect("читается");
+    assert!(data[10..20].iter().all(|byte| *byte == 0), "хвост обнулён");
+}
+
+#[test]
+fn deleting_a_file_frees_everything_it_held() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let free_at_start = reopened(&mut dev).free_bytes();
+
+    let mut editor = reopened(&mut dev);
+    editor
+        .create_file(&mut dev, ROOT_INODE, "temp.bin", &vec![7u8; 60 * 1024], 0o644, 0, 0)
+        .expect("файл");
+    editor.flush(&mut dev).expect("сброс");
+    assert!(reopened(&mut dev).free_bytes() < free_at_start);
+
+    let mut editor = reopened(&mut dev);
+    editor.unlink(&mut dev, ROOT_INODE, "temp.bin").expect("удаление");
+    editor.flush(&mut dev).expect("сброс");
+
+    // Место вернулось всё, до байта: и данные, и блок косвенности.
+    assert_eq!(reopened(&mut dev).free_bytes(), free_at_start);
+
+    let fs = foreign(&dev);
+    assert!(!fs.exists("/temp.bin").expect("вопрос допустим"));
+}
+
+#[test]
+fn directories_are_created_and_removed_only_when_empty() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    let dir = editor
+        .mkdir(&mut dev, ROOT_INODE, "work", 0o755, 0, 0)
+        .expect("каталог");
+    editor
+        .create_file(&mut dev, dir, "draft.txt", b"...", 0o644, 0, 0)
+        .expect("файл внутри");
+
+    assert_eq!(editor.rmdir(&mut dev, ROOT_INODE, "work"), Err(Error::NotEmpty));
+    // И наоборот: удалять каталог как файл нельзя.
+    assert_eq!(
+        editor.unlink(&mut dev, ROOT_INODE, "work"),
+        Err(Error::IsADirectory)
+    );
+
+    editor.unlink(&mut dev, dir, "draft.txt").expect("файл удаляется");
+    editor
+        .rmdir(&mut dev, ROOT_INODE, "work")
+        .expect("пустой каталог удаляется");
+    editor.flush(&mut dev).expect("сброс");
+
+    let fs = foreign(&dev);
+    assert!(!fs.exists("/work").expect("вопрос допустим"));
+    // Ссылка «..» удалённого каталога снята с корня: остались «.» и «..».
+    let root = Ext2::mount(&mut dev, 0)
+        .expect("монтирование")
+        .root(&mut dev)
+        .expect("корень");
+    assert_eq!(root.links, 2);
+}
+
+/// Место, освобождённое удалением, достаётся следующему файлу. Без второго
+/// прохода поиска свободного блока том «кончился» бы, имея половину пустоты.
+#[test]
+fn freed_space_is_handed_out_again() {
+    let (mut dev, mut writer) = formatted(8 * 1024 * 1024 / 512, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    let big = vec![1u8; 3 * 1024 * 1024];
+    editor
+        .create_file(&mut dev, ROOT_INODE, "first.bin", &big, 0o644, 0, 0)
+        .expect("первый файл");
+    editor
+        .create_file(&mut dev, ROOT_INODE, "second.bin", &big, 0o644, 0, 0)
+        .expect("второй файл");
+    editor
+        .unlink(&mut dev, ROOT_INODE, "first.bin")
+        .expect("удаление");
+    // Третий помещается только в место, освободившееся от первого.
+    editor
+        .create_file(&mut dev, ROOT_INODE, "third.bin", &big, 0o644, 0, 0)
+        .expect("третий файл");
+    editor.flush(&mut dev).expect("сброс");
+
+    let fs = foreign(&dev);
+    assert_eq!(fs.read("/third.bin").expect("читается").len(), big.len());
+    assert_eq!(fs.read("/second.bin").expect("читается").len(), big.len());
+}
+
+/// Занятое имя занято — и файлом, и каталогом.
+#[test]
+fn names_are_not_reused_silently() {
+    let (mut dev, mut writer) = formatted(64 * 1024 * 1024 / 512, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    editor
+        .create(&mut dev, ROOT_INODE, "same", 0o644, 0, 0)
+        .expect("файл");
+    assert_eq!(
+        editor.create(&mut dev, ROOT_INODE, "same", 0o644, 0, 0),
+        Err(Error::Exists)
+    );
+    assert_eq!(
+        editor.mkdir(&mut dev, ROOT_INODE, "same", 0o755, 0, 0),
+        Err(Error::Exists)
+    );
+    assert_eq!(
+        editor.unlink(&mut dev, ROOT_INODE, "missing"),
+        Err(Error::NotFound)
+    );
 }

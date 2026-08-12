@@ -50,6 +50,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod edit;
 mod layout;
 mod read;
 #[cfg(test)]
@@ -58,7 +59,8 @@ mod write;
 
 pub use layout::{BlockSize, Geometry, ROOT_INODE};
 pub use read::{DirEntry, Ext2, FileType, Inode};
-pub use write::{FormatOptions, Writer, format, format_with};
+pub use edit::Editor;
+pub use write::{FormatOptions, format, format_with};
 
 use core::fmt;
 
@@ -85,6 +87,12 @@ pub enum Error {
     BadName,
     /// Такое имя в каталоге уже есть.
     Exists,
+    /// Каталог не пуст, а удалять содержимое за вызывающего этот крейт не
+    /// станет: обход дерева с освобождением — то место, где ошибка стирает не
+    /// то, что просили.
+    NotEmpty,
+    /// Операция для файла, а имя оказалось каталогом.
+    IsADirectory,
     /// Файл использует возможность, которой здесь нет (тройная косвенность,
     /// расширения ext3/ext4).
     Unsupported,
@@ -113,6 +121,8 @@ impl fmt::Display for Error {
             Error::NotADirectory => "a path component is not a directory",
             Error::BadName => "the name is empty, too long or contains a slash",
             Error::Exists => "the name already exists in this directory",
+            Error::NotEmpty => "the directory is not empty",
+            Error::IsADirectory => "the name is a directory",
             Error::Unsupported => "the filesystem uses a feature this implementation lacks",
             Error::NoMemory => "out of memory",
         };
