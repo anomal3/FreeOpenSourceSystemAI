@@ -29,9 +29,10 @@ use alloc::vec::Vec;
 
 use mini_ui::{Rect, Screen, Surface};
 
-use super::panel::{Menu, Panel, Status};
+use super::panel::{Menu, Panel, PanelHit, Status};
+use super::pointer::Pointer;
 use super::theme;
-use super::window::{App, Window};
+use super::window::{App, Hit, Window};
 
 /// Сколько прямоугольников изменений композитор согласен помнить.
 ///
@@ -55,6 +56,13 @@ pub struct Compositor {
     focus: usize,
     panel: Option<Panel>,
     menu: Option<Menu>,
+    /// Указатель мыши — верхний слой кадра.
+    pointer: Pointer,
+    /// Окно, которое сейчас тащат за заголовок.
+    ///
+    /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
+    /// запомненный до щелчка, после него указывал бы на соседнее окно.
+    drag: Option<App>,
     /// Масштаб глифа для новых окон.
     scale: u32,
     damage: [Rect; MAX_DAMAGE],
@@ -67,12 +75,15 @@ pub struct Compositor {
 
 impl Compositor {
     pub fn new(screen: Screen, scale: u32) -> Self {
+        let pointer = Pointer::new(screen.width(), screen.height());
         let mut compositor = Self {
             screen,
             windows: Vec::new(),
             focus: 0,
             panel: None,
             menu: None,
+            pointer,
+            drag: None,
             scale,
             damage: [Rect::EMPTY; MAX_DAMAGE],
             damage_count: 0,
@@ -130,6 +141,21 @@ impl Compositor {
         self.windows.iter_mut().find(|window| window.app == app)
     }
 
+    /// Где стоит окно программы.
+    #[must_use]
+    pub fn rect_of(&self, app: App) -> Option<Rect> {
+        self.windows
+            .iter()
+            .find(|window| window.app == app)
+            .map(|window| window.rect)
+    }
+
+    /// Какая программа живёт в окне с этим номером.
+    #[must_use]
+    pub fn app_at(&self, index: usize) -> Option<App> {
+        self.windows.get(index).map(|window| window.app)
+    }
+
     /// Номер окна программы в порядке по глубине.
     pub fn index_of(&self, app: App) -> Option<usize> {
         self.windows.iter().position(|window| window.app == app)
@@ -147,7 +173,7 @@ impl Compositor {
     ///
     /// Именно порядок создания: кнопка, переезжающая с места на место при каждом
     /// переключении окон, — это кнопка, в которую нельзя попасть.
-    pub fn buttons(&self) -> super::panel::Buttons {
+    pub fn buttons(&self) -> super::panel::Windows {
         self.windows
             .iter()
             .enumerate()
@@ -209,6 +235,114 @@ impl Compositor {
         // куска по краям.
         self.mark(before);
         self.mark(after);
+    }
+
+    // -----------------------------------------------------------------------
+    // Указатель
+    // -----------------------------------------------------------------------
+
+    /// Сдвинуть указатель и пометить изменившееся.
+    ///
+    /// Помечаются **два** прямоугольника — откуда стрелка ушла и куда пришла.
+    /// Один объединяющий при быстром движении накрыл бы полэкрана, тогда как
+    /// настоящих изменений два пятна размером с курсор.
+    pub fn move_pointer(&mut self, dx: i32, dy: i32) {
+        let (width, height) = (self.screen.width(), self.screen.height());
+        let before = self.pointer.rect();
+        let moved = self.pointer.move_by(dx, dy, width, height);
+        let appeared = self.pointer.show();
+        if !moved && !appeared {
+            return;
+        }
+        if moved {
+            self.mark(before);
+        }
+        let after = self.pointer.rect();
+        self.mark(after);
+    }
+
+    #[must_use]
+    pub const fn pointer_position(&self) -> (i32, i32) {
+        self.pointer.position()
+    }
+
+    #[must_use]
+    pub const fn pointer_visible(&self) -> bool {
+        self.pointer.is_visible()
+    }
+
+    /// Верхнее окно под точкой и то, во что она попала.
+    #[must_use]
+    pub fn window_at(&self, x: i32, y: i32) -> Option<(usize, Hit)> {
+        // Сверху вниз: перекрытое окно щелчок получать не должно.
+        self.windows
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, window)| window.hit(x, y).map(|hit| (index, hit)))
+    }
+
+    /// Попадание в панель задач.
+    #[must_use]
+    pub fn panel_at(&self, x: i32, y: i32) -> Option<PanelHit> {
+        let panel = self.panel.as_ref()?;
+        if !panel.rect.contains(x, y) {
+            return None;
+        }
+        panel.hit(x, y)
+    }
+
+    /// Начать или закончить перетаскивание окна.
+    pub fn set_drag(&mut self, app: Option<App>) {
+        self.drag = app;
+    }
+
+    #[must_use]
+    pub const fn dragging(&self) -> Option<App> {
+        self.drag
+    }
+
+    /// Сдвинуть окно, которое тащат.
+    pub fn drag_by(&mut self, dx: i32, dy: i32) {
+        let Some(app) = self.drag else {
+            return;
+        };
+        let Some(index) = self.index_of(app) else {
+            // Окно закрыли, не отпустив кнопку. Такое бывает, и тащить дальше
+            // нечего.
+            self.drag = None;
+            return;
+        };
+        let width = self.screen.width();
+        let bottom = self.work_bottom();
+        let Some(window) = self.windows.get_mut(index) else {
+            return;
+        };
+        let before = window.rect;
+        window.move_within(dx, dy, width, bottom);
+        if window.rect == before {
+            return;
+        }
+        let after = window.rect;
+        self.mark(before);
+        self.mark(after);
+    }
+
+    /// Закрыть окно программы. Возвращает `true`, если оно было.
+    pub fn close(&mut self, app: App) -> bool {
+        let Some(index) = self.index_of(app) else {
+            return false;
+        };
+        let window = self.windows.remove(index);
+        if self.focus >= self.windows.len() {
+            self.focus = self.windows.len().saturating_sub(1);
+        }
+        self.refresh_decorations();
+        self.mark(window.rect);
+        if self.drag == Some(app) {
+            self.drag = None;
+        }
+        true
     }
 
     /// Перерисовать украшения всех окон по текущему фокусу.
@@ -359,6 +493,10 @@ impl Compositor {
                 }
             }
         }
+        // Курсор — последним и без проверки пересечения: он мал, а обрезка
+        // однобитной картинки уже сделана внутри `draw_bitmap`. Проверка
+        // «попадает ли он в прямоугольник» стоила бы больше, чем экономила.
+        self.pointer.draw(&self.screen);
     }
 
     /// Вывести часть поверхности слоя, попадающую в `rect` (координаты экрана).

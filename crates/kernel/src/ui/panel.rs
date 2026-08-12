@@ -40,6 +40,15 @@ pub struct Panel {
     pub rect: Rect,
     scale: u32,
     damage: Rect,
+    /// Кнопка меню в координатах поверхности панели.
+    brand: Rect,
+    /// Кнопки окон там же.
+    ///
+    /// Запоминаются при рисовании, а не считаются заново при попадании мышью.
+    /// Две независимые раскладки — рисующая и проверяющая — расходятся молча, и
+    /// расхождение выглядит как «кнопка не нажимается», хотя нажимается
+    /// соседняя.
+    buttons: Buttons,
 }
 
 impl Panel {
@@ -54,7 +63,29 @@ impl Panel {
         let height = Self::height(scale);
         let surface = Surface::new(screen_w, height, theme::PANEL_BG)?;
         let rect = Rect::new(0, (screen_h - height) as i32, screen_w, height);
-        Some(Self { surface, rect, scale, damage: Rect::EMPTY })
+        Some(Self {
+            surface,
+            rect,
+            scale,
+            damage: Rect::EMPTY,
+            brand: Rect::EMPTY,
+            buttons: Buttons::new(),
+        })
+    }
+
+    /// Во что попадает точка панели (координаты экрана).
+    #[must_use]
+    pub fn hit(&self, x: i32, y: i32) -> Option<PanelHit> {
+        let local = (x - self.rect.x, y - self.rect.y);
+        if self.brand.contains(local.0, local.1) {
+            return Some(PanelHit::Menu);
+        }
+        for (app, rect) in &self.buttons {
+            if rect.contains(local.0, local.1) {
+                return Some(PanelHit::Window(*app));
+            }
+        }
+        Some(PanelHit::Empty)
     }
 
     /// Перерисовать панель целиком.
@@ -63,6 +94,7 @@ impl Panel {
     /// точек, и вычисление изменившегося куска стоило бы дороже перерисовки.
     pub fn redraw(&mut self, windows: &[(App, bool)], menu_open: bool, status: &Status) {
         let scale = self.scale;
+        self.buttons.clear();
         let bounds = self.surface.bounds();
         self.surface.fill(bounds, theme::PANEL_BG);
         // Светлая линия по верхнему краю: панель и фон стола оба тёмные, и без
@@ -83,6 +115,7 @@ impl Panel {
         };
         self.surface.fill(brand_rect, brand_bg);
         text::draw_text(&mut self.surface, pad, text_y, BRAND, scale, brand_fg, None);
+        self.brand = brand_rect;
 
         // Кнопки окон.
         let mut x = brand_w + pad;
@@ -100,6 +133,11 @@ impl Panel {
             };
             self.surface.fill(button, bg);
             text::draw_text(&mut self.surface, x + pad, text_y, label, scale, fg, None);
+            // Промах мимо кнопки на пару точек читается как «не нажалось»,
+            // поэтому попадание проверяется по всей высоте панели, а не по
+            // нарисованному прямоугольнику с отступами.
+            self.buttons
+                .push((*app, Rect::new(x as i32, 0, width, bounds.h)));
             x += width + theme::PADDING;
         }
 
@@ -190,6 +228,34 @@ impl Menu {
         self.open = false;
     }
 
+    /// Пункт меню под точкой (координаты экрана).
+    #[must_use]
+    pub fn index_at(&self, x: i32, y: i32) -> Option<usize> {
+        if !self.rect.contains(x, y) {
+            return None;
+        }
+        let row_h = GLYPH_H * self.scale + theme::PADDING * 3;
+        let top = theme::PADDING + theme::BORDER + row_h;
+        let local = (y - self.rect.y) as u32;
+        if local < top {
+            return None;
+        }
+        // Пункт занимает две строки — название и описание, — поэтому попадание
+        // считается по паре: щелчок по описанию обязан открывать ту же
+        // программу, что и щелчок по названию.
+        let index = ((local - top) / (row_h * 2)) as usize;
+        (index < App::LAUNCHABLE.len()).then_some(index)
+    }
+
+    /// Поставить выделение на пункт под указателем.
+    pub fn select(&mut self, index: usize) {
+        if index >= App::LAUNCHABLE.len() || index == self.selected {
+            return;
+        }
+        self.selected = index;
+        self.redraw();
+    }
+
     pub fn move_selection(&mut self, forward: bool) {
         let count = App::LAUNCHABLE.len();
         self.selected = if forward {
@@ -265,4 +331,18 @@ fn uptime_text(ms: u64) -> String {
 }
 
 /// Список окон для панели: программа и признак «активно».
-pub type Buttons = Vec<(App, bool)>;
+pub type Windows = Vec<(App, bool)>;
+
+/// Кнопки панели вместе с их местом.
+type Buttons = Vec<(App, Rect)>;
+
+/// Во что попал указатель на панели.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PanelHit {
+    /// Кнопка меню.
+    Menu,
+    /// Кнопка окна.
+    Window(App),
+    /// Пустое место панели: щелчок туда не должен доставаться окну под ней.
+    Empty,
+}

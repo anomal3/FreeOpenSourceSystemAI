@@ -13,6 +13,7 @@
 //! Формат файла пришлось бы разбирать и проверять, а его ошибки вылезали бы во
 //! время прогона; здесь опечатку в имени клавиши ловит компилятор.
 
+use super::aim::{self, Aim};
 use crate::arch::Arch;
 
 /// Носитель, с которого грузится сценарий.
@@ -66,6 +67,16 @@ pub enum Step {
     Line(&'static str),
     /// Отправить в серийную линию байты как есть.
     Raw(&'static [u8]),
+    /// Сдвинуть мышь на приращение. Абсолютных координат у мыши нет.
+    Move(i32, i32),
+    /// Навести мышь на то, что гость сам описал в журнале.
+    Aim(aim::Aim),
+    /// Нажать левую кнопку и отпустить её там же.
+    Click,
+    /// Нажать левую кнопку и **не** отпускать — начало перетаскивания.
+    Press,
+    /// Отпустить все кнопки.
+    Release,
     /// Подождать (мс).
     Wait(u64),
     /// Снять экран.
@@ -236,6 +247,65 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("windows,", 30_000),
             Step::Shot("05-desktop"),
+            Step::Type("exit"),
+            Step::Key("ret"),
+            Step::Await("finishing the session", 30_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "mouse",
+        about: "Курсор ездит, щелчок поднимает окно, окно тащится за заголовок и закрывается кнопкой.",
+        target: Target::Live,
+        usb_only: false,
+        arches: &[],
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Мышь — второе устройство на контроллере. Строка ниже доказывает,
+            // что перечисление портов дошло до неё, а не остановилось на
+            // клавиатуре.
+            Step::Expect("boot mouse on interface"),
+            Step::Expect("Mouse: click to focus"),
+            // Доехать до угла можно только упёршись в край: если ограничение
+            // не работает, курсор уедет за экран и следующие наводки промажут.
+            Step::Aim(Aim::Corner),
+            Step::Line("ui"),
+            Step::Await("pointer  0,0 visible", 15_000),
+            // Кнопка меню — в левом нижнем углу, где панель начинается на любом
+            // экране.
+            Step::Aim(Aim::MenuButton),
+            Step::Click,
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("01-menu"),
+            Step::Click,
+            Step::Await("desktop     : menu closed", 15_000),
+            // Щелчок по заголовку нижнего окна поднимает его и передаёт ему
+            // ввод: до этой фазы того и другого можно было добиться только
+            // клавишей Tab.
+            Step::Aim(Aim::Title("System")),
+            Step::Click,
+            Step::Await("desktop     : focus 'System'", 15_000),
+            // Перетаскивание: нажать, провезти, отпустить. Куда окно приехало,
+            // говорит сам гость — снимок экрана этого не доказывает.
+            Step::Press,
+            Step::Await("desktop     : drag 'System'", 15_000),
+            Step::Move(-160, 120),
+            Step::Release,
+            Step::Await("desktop     : moved 'System' to ", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("02-dragged"),
+            // Кнопка закрытия — у правого края заголовка. Прицел считается от
+            // нового положения окна: строка о перетаскивании его и сообщила.
+            Step::Aim(Aim::Close("System")),
+            Step::Click,
+            Step::Await("desktop     : closed 'System'", 15_000),
+            Step::Aim(Aim::Middle("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : focus 'Terminal'", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("03-desktop"),
             Step::Type("exit"),
             Step::Key("ret"),
             Step::Await("finishing the session", 30_000),

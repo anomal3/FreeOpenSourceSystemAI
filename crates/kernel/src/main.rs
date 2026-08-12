@@ -360,7 +360,7 @@ fn start_input(info: &BootInfo) -> bool {
     kprintln!();
     kprintln!("---- input ------------------------------------------------------");
 
-    let sources = arch::input::init(info);
+    arch::input::init(info);
 
     // USB поднимается после арх-специфичного ввода, и порядок здесь имеет
     // значение только один раз: на x86-64 PS/2-клавиатура к этому моменту уже
@@ -371,13 +371,11 @@ fn start_input(info: &BootInfo) -> bool {
     // SAFETY: ядро исполняется на собственных таблицах, прерывания разрешены
     // (`start_interrupts` вызван раньше — ожидания внутри драйвера опираются на
     // таймер), таблицы ACPI не переиспользованы, и ни один лок не удерживается.
-    let usb_keyboard = unsafe { usb::xhci::init(info.acpi_rsdp) };
+    // Драйвер сам дописывает поднятые им источники: клавиатура и мышь приходят
+    // с одной шины, и решать за него, что именно нашлось, здесь нечем.
+    unsafe { usb::xhci::init(info.acpi_rsdp) };
 
-    let sources = input::Sources {
-        keyboard: sources.keyboard || usb_keyboard,
-        serial: sources.serial,
-    };
-    input::set_sources(sources);
+    let sources = input::sources();
 
     if !sources.any() {
         kprintln!("  input       : no source of key events on this machine");

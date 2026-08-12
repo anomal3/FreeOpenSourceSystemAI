@@ -116,6 +116,21 @@ impl Monitor {
         self.command_silent(&format!("sendkey {keys}"))
     }
 
+    /// Сдвинуть мышь на заданное приращение.
+    ///
+    /// Именно приращение: подключена обычная мышь, а не планшет, и абсолютных
+    /// координат у неё нет. Стенд поэтому не «ставит курсор в точку», а везёт
+    /// его туда — как это делает рука.
+    pub fn mouse_move(&mut self, dx: i32, dy: i32) -> Result<()> {
+        self.command_silent(&format!("mouse_move {dx} {dy}"))
+    }
+
+    /// Нажать или отпустить кнопки мыши. Битовая карта: 1 — левая, 2 — правая,
+    /// 4 — средняя; ноль означает «все отпущены».
+    pub fn mouse_button(&mut self, mask: u32) -> Result<()> {
+        self.command_silent(&format!("mouse_button {mask}"))
+    }
+
     /// Снять экран в файл PPM.
     pub fn screendump(&mut self, path: &Path) -> Result<()> {
         // Прямая косая работает и на Windows, а обратная в HMP выглядит как

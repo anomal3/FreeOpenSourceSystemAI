@@ -1,4 +1,4 @@
-//! Ввод на AArch64: приём по PL011 как единственный источник событий.
+﻿//! Ввод на AArch64: приём по PL011 как единственный источник событий.
 //!
 //! # Почему здесь нет клавиатуры
 //!
@@ -73,7 +73,7 @@ pub fn init(_info: &BootInfo) -> Sources {
     kprintln!("  serial in   : PL011 receive on INTID {UART_INTID}");
     kprintln!("  keyboard    : no PS/2 on this machine; the keyboard arrives over USB");
 
-    let sources = Sources { keyboard: false, serial: true };
+    let sources = Sources { keyboard: false, serial: true, mouse: false };
     crate::input::set_sources(sources);
     sources
 }

@@ -400,6 +400,43 @@ impl Screen {
         }
     }
 
+    /// Нарисовать однобитную картинку: точка ставится там, где в маске единица.
+    ///
+    /// Заведено ради указателя мыши, и другого способа его нарисовать нет.
+    /// [`Surface`] выводится прямоугольником целиком, а курсор обязан пропускать
+    /// сквозь себя то, что под ним: непрозрачный прямоугольник вокруг стрелки
+    /// закрывал бы текст, над которым она стоит.
+    ///
+    /// Строка маски — `u16`, старший используемый бит слева; ширина не больше 16
+    /// точек. Ограничение не мешает: курсор шире шестнадцати точек не бывает, а
+    /// произвольная ширина потребовала бы срезов срезов ради одной картинки.
+    pub fn draw_bitmap(&self, at: (i32, i32), rows: &[u16], width: u32, color: Color) {
+        let width = width.min(16);
+        let pixel = color.pixel();
+        let bounds = self.bounds();
+
+        for (row, bits) in rows.iter().copied().enumerate() {
+            let y = at.1 + row as i32;
+            if y < 0 || y >= bounds.h as i32 {
+                continue;
+            }
+            for column in 0..width {
+                if bits & (1 << (width - 1 - column)) == 0 {
+                    continue;
+                }
+                let x = at.0 + column as i32;
+                if x < 0 || x >= bounds.w as i32 {
+                    continue;
+                }
+                let offset = (y as usize) * (self.stride as usize) + x as usize;
+                // SAFETY: координаты обрезаны по границам экрана, а `stride *
+                // height` пикселей проверено в `new` против заявленного размера
+                // буфера. `write_volatile` — как и в `fill`.
+                unsafe { self.base.add(offset).write_volatile(pixel) };
+            }
+        }
+    }
+
     /// Вывести часть поверхности на экран.
     ///
     /// `dst` задаёт, куда на экране попадёт начало `src_rect` поверхности. Всё,

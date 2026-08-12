@@ -59,6 +59,8 @@ pub const CLASS_HID: u8 = 3;
 pub const SUBCLASS_BOOT: u8 = 1;
 /// Протокол «клавиатура».
 pub const PROTOCOL_KEYBOARD: u8 = 1;
+/// Протокол «мышь».
+pub const PROTOCOL_MOUSE: u8 = 2;
 
 /// Длина дескриптора устройства.
 pub const DEVICE_DESC_LEN: usize = 18;
@@ -103,9 +105,15 @@ impl DeviceDescriptor {
     }
 }
 
-/// Найденный интерфейс HID-клавиатуры и её конечная точка прерываний.
+/// Найденный интерфейс HID boot-протокола и его конечная точка прерываний.
 #[derive(Clone, Copy, Debug)]
-pub struct KeyboardInterface {
+pub struct BootInterface {
+    /// [`PROTOCOL_KEYBOARD`] или [`PROTOCOL_MOUSE`] — что это за устройство.
+    ///
+    /// Поле появилось вместе с мышью и заменило собой знание «здесь всегда
+    /// клавиатура». Разница между двумя устройствами для драйвера контроллера
+    /// ровно в одном байте дескриптора и в том, кто разбирает отчёт.
+    pub protocol: u8,
     /// Значение `bConfigurationValue`, которое надо выставить `SET_CONFIGURATION`.
     pub configuration: u8,
     /// Номер интерфейса — он же `wIndex` в запросах класса HID.
@@ -120,20 +128,27 @@ pub struct KeyboardInterface {
     pub interval: u8,
 }
 
-/// Найти в дескрипторе конфигурации интерфейс boot-клавиатуры.
+/// Найти в дескрипторе конфигурации интерфейс boot-протокола HID.
+///
+/// Берётся первый подходящий интерфейс — клавиатура или мышь; что именно
+/// попалось, сообщает [`BootInterface::protocol`]. Составные устройства (одна
+/// «мышь» с клавиатурным интерфейсом внутри) при этом обслуживаются только
+/// первым из них: второй интерфейс потребовал бы второго кольца на том же
+/// слоте, а проверить это на QEMU нечем — там клавиатура и мышь всегда
+/// отдельные устройства. Ограничение названо вслух, а не обойдено молча.
 ///
 /// `bytes` — конфигурация целиком, вместе с вложенными дескрипторами
 /// интерфейсов и конечных точек: устройство отдаёт их одним куском, и разбирать
 /// их надо тоже одним проходом.
 #[must_use]
-pub fn find_keyboard(bytes: &[u8]) -> Option<KeyboardInterface> {
+pub fn find_boot_hid(bytes: &[u8]) -> Option<BootInterface> {
     if bytes.len() < CONFIG_DESC_LEN || bytes[1] != DESC_CONFIGURATION {
         return None;
     }
     let configuration = bytes[5];
 
     let mut offset = usize::from(bytes[0]);
-    let mut current: Option<KeyboardInterface> = None;
+    let mut current: Option<BootInterface> = None;
 
     while offset + 2 <= bytes.len() {
         let length = usize::from(bytes[offset]);
@@ -150,9 +165,10 @@ pub fn find_keyboard(bytes: &[u8]) -> Option<KeyboardInterface> {
                 let protocol = bytes[offset + 7];
                 current = if class == CLASS_HID
                     && subclass == SUBCLASS_BOOT
-                    && protocol == PROTOCOL_KEYBOARD
+                    && (protocol == PROTOCOL_KEYBOARD || protocol == PROTOCOL_MOUSE)
                 {
-                    Some(KeyboardInterface {
+                    Some(BootInterface {
+                        protocol,
                         configuration,
                         interface: bytes[offset + 2],
                         endpoint: 0,
@@ -170,9 +186,9 @@ pub fn find_keyboard(bytes: &[u8]) -> Option<KeyboardInterface> {
                     let address = bytes[offset + 2];
                     let attributes = bytes[offset + 3];
                     // Нужна точка типа Interrupt (биты 1:0 = 11) и направления
-                    // IN (бит 7 адреса). Клавиатура может объявлять и OUT-точку
-                    // — для светодиодов, — и перепутать их значит ждать отчёты
-                    // оттуда, откуда они не приходят.
+                    // IN (бит 7 адреса). Устройство может объявлять и OUT-точку
+                    // — у клавиатуры это светодиоды, — и перепутать их значит
+                    // ждать отчёты оттуда, откуда они не приходят.
                     if attributes & 0b11 == 0b11 && address & REQ_DIR_IN != 0 {
                         found.endpoint = address & 0x0F;
                         found.max_packet_size =

@@ -58,31 +58,36 @@ use crate::sync::SpinLock;
 /// любую клавишу» на AArch64 без USB было бы неправдой.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sources {
-    /// Настоящая клавиатура (PS/2 сейчас, USB HID позже).
+    /// Настоящая клавиатура (PS/2 или USB HID).
     pub keyboard: bool,
     /// Приём по последовательному порту.
     pub serial: bool,
+    /// Мышь (USB HID, boot protocol).
+    pub mouse: bool,
 }
 
 impl Sources {
     const BIT_KEYBOARD: u8 = 1 << 0;
     const BIT_SERIAL: u8 = 1 << 1;
+    const BIT_MOUSE: u8 = 1 << 2;
 
     /// Есть ли хоть один источник событий.
     #[must_use]
     pub const fn any(self) -> bool {
-        self.keyboard || self.serial
+        self.keyboard || self.serial || self.mouse
     }
 
     const fn bits(self) -> u8 {
         (if self.keyboard { Self::BIT_KEYBOARD } else { 0 })
             | (if self.serial { Self::BIT_SERIAL } else { 0 })
+            | (if self.mouse { Self::BIT_MOUSE } else { 0 })
     }
 
     const fn from_bits(bits: u8) -> Self {
         Self {
             keyboard: bits & Self::BIT_KEYBOARD != 0,
             serial: bits & Self::BIT_SERIAL != 0,
+            mouse: bits & Self::BIT_MOUSE != 0,
         }
     }
 }
@@ -524,4 +529,189 @@ pub fn stats() -> Stats {
         dropped: queue.dropped + DROPPED_LOCKED_OUT.load(Ordering::Relaxed),
         queued: queue.len,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Указатель
+// ---------------------------------------------------------------------------
+
+/// Кнопки указателя.
+///
+/// Тот же приём, что и с [`Modifiers`]: набор битов, а не три `bool`. Драйвер
+/// получает их именно битовой картой (байт 0 отчёта boot-протокола), и разбирать
+/// её на поля, чтобы тут же собрать обратно, незачем.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct Buttons(u8);
+
+impl Buttons {
+    pub const NONE: Self = Self(0);
+    pub const LEFT: Self = Self(1 << 0);
+    pub const RIGHT: Self = Self(1 << 1);
+    pub const MIDDLE: Self = Self(1 << 2);
+
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits & 0b111)
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0 && other.0 != 0
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Какие биты различаются — то есть какие кнопки изменили состояние.
+    #[must_use]
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 ^ other.0)
+    }
+}
+
+impl core::fmt::Debug for Buttons {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == 0 {
+            return f.write_str("-");
+        }
+        let mut first = true;
+        for (name, flag) in [("left", Self::LEFT), ("right", Self::RIGHT), ("middle", Self::MIDDLE)]
+        {
+            if self.contains(flag) {
+                if !first {
+                    f.write_str("+")?;
+                }
+                first = false;
+                f.write_str(name)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Событие указателя.
+///
+/// Несёт **приращение**, а не позицию, потому что именно это сообщает мышь:
+/// абсолютных координат у неё нет, и где находится курсор — знает не драйвер, а
+/// тот, кто его рисует. Позиция в событии означала бы, что драйвер должен знать
+/// размер экрана.
+#[derive(Clone, Copy, Debug)]
+pub struct PointerEvent {
+    pub dx: i32,
+    pub dy: i32,
+    /// Колесо: положительное — от себя.
+    pub wheel: i32,
+    /// Состояние кнопок после этого отчёта.
+    pub buttons: Buttons,
+    /// Кнопки, изменившие состояние. По той же причине, что и снимок
+    /// модификаторов в [`KeyEvent`]: потребитель разбирает очередь позже, чем
+    /// она наполняется, и «нажата ли сейчас кнопка» — ответ про другое время.
+    pub changed: Buttons,
+}
+
+impl PointerEvent {
+    const EMPTY: Self = Self {
+        dx: 0,
+        dy: 0,
+        wheel: 0,
+        buttons: Buttons::NONE,
+        changed: Buttons::NONE,
+    };
+
+    /// Нажата ли эта кнопка именно этим событием.
+    #[must_use]
+    pub const fn pressed(self, button: Buttons) -> bool {
+        self.changed.contains(button) && self.buttons.contains(button)
+    }
+
+    /// Отпущена ли эта кнопка именно этим событием.
+    #[must_use]
+    pub const fn released(self, button: Buttons) -> bool {
+        self.changed.contains(button) && !self.buttons.contains(button)
+    }
+}
+
+/// Сколько событий указателя помещается в очередь.
+///
+/// Меньше, чем у клавиатуры, и это осознанно: мышь при движении шлёт отчёт
+/// каждые несколько миллисекунд, и хранить их секунду смысла нет — устаревшее
+/// перемещение курсора никому не нужно. Тридцать два отчёта — это примерно
+/// четверть секунды движения.
+const POINTER_CAPACITY: usize = 32;
+
+struct PointerQueue {
+    events: [PointerEvent; POINTER_CAPACITY],
+    head: usize,
+    len: usize,
+    posted: u64,
+    dropped: u64,
+    buttons: Buttons,
+}
+
+impl PointerQueue {
+    const fn new() -> Self {
+        Self {
+            events: [PointerEvent::EMPTY; POINTER_CAPACITY],
+            head: 0,
+            len: 0,
+            posted: 0,
+            dropped: 0,
+            buttons: Buttons::NONE,
+        }
+    }
+}
+
+static POINTER: SpinLock<PointerQueue> = SpinLock::new(PointerQueue::new());
+
+/// Положить отчёт мыши в очередь. Вызывается драйвером.
+///
+/// При переполнении **сливается** движение: приращения складываются в последнее
+/// событие вместо того, чтобы потеряться. Курсор от этого не отстаёт и не
+/// перескакивает — в отличие от клавиатуры, где сложить два нажатия нельзя.
+pub fn post_pointer(dx: i32, dy: i32, wheel: i32, buttons: Buttons) {
+    let Some(mut queue) = POINTER.try_lock() else {
+        return;
+    };
+    queue.posted += 1;
+    let changed = queue.buttons.difference(buttons);
+    queue.buttons = buttons;
+
+    if queue.len == POINTER_CAPACITY {
+        // Кнопки терять нельзя, движение — можно сложить.
+        let tail = (queue.head + queue.len - 1) % POINTER_CAPACITY;
+        let last = &mut queue.events[tail];
+        last.dx += dx;
+        last.dy += dy;
+        last.wheel += wheel;
+        last.buttons = buttons;
+        last.changed = Buttons(last.changed.0 | changed.0);
+        queue.dropped += 1;
+        return;
+    }
+
+    let tail = (queue.head + queue.len) % POINTER_CAPACITY;
+    queue.events[tail] = PointerEvent { dx, dy, wheel, buttons, changed };
+    queue.len += 1;
+}
+
+/// Забрать следующее событие указателя.
+#[must_use]
+pub fn next_pointer() -> Option<PointerEvent> {
+    let mut queue = POINTER.lock();
+    if queue.len == 0 {
+        return None;
+    }
+    let event = queue.events[queue.head];
+    queue.head = (queue.head + 1) % POINTER_CAPACITY;
+    queue.len -= 1;
+    Some(event)
+}
+
+/// Счётчики указателя: сколько отчётов пришло и сколько слито при переполнении.
+#[must_use]
+pub fn pointer_stats() -> (u64, u64) {
+    let queue = POINTER.lock();
+    (queue.posted, queue.dropped)
 }

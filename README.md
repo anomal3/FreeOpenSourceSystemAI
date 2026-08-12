@@ -2,12 +2,13 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 10 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 11 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root — and comes up as a **desktop**: wallpaper, a taskbar with a clock, a start
-> menu, windows with title bars and close buttons, and a window manager that decides who
-> gets each keypress. Programs so far: a terminal, a file manager over the mounted root, a
-> system monitor and an about box. On both architectures. There is no userspace yet:
-> everything above runs in the kernel. See [Roadmap](#roadmap).
+> menu, windows with title bars and close buttons, and a window manager that routes every
+> keypress and every click. It has a **mouse**: click to focus, drag by the title bar, close
+> by the button. Programs so far: a terminal, a file manager over the mounted root, a system
+> monitor and an about box. On both architectures. There is no userspace yet: everything
+> above runs in the kernel. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -73,8 +74,9 @@ a physical disk. What the firmware then reads is our partition table and our fil
 booting that image is itself the test. The image is byte-reproducible: identical inputs give
 an identical file, which is why "the image changed" means the content changed.
 
-Once the boot log settles, the screen turns into a desktop: **Meta** (or **F1**) opens the
-start menu, **Tab** moves between windows, **Ctrl+W** closes one, **Ctrl+arrows** moves it.
+Once the boot log settles, the screen turns into a desktop. The mouse does what a mouse
+does; from the keyboard, **Meta** (or **F1**) opens the start menu, **Tab** moves between
+windows, **Ctrl+W** closes one, **Ctrl+arrows** moves it.
 The terminal answers `help`, reads the mounted filesystem with `ls` and `cat`, and ends the
 session with `exit`. Type into the QEMU window — `xtask` attaches a USB keyboard
 (`qemu-xhci` + `usb-kbd`) on both architectures, and on x86-64 the PS/2 keyboard works
@@ -116,10 +118,19 @@ Three things are worth knowing about how it behaves:
   release waiting for the next poll can lose the race to bytes from the UART. From a single
   device the order always holds, which is what a person actually uses.
 
-There is no mouse: there is no mouse driver. The cursor is one more layer in the compositor
-and click routing is one more branch in the manager — but writing either without a source of
-events would be writing code nobody can run. USB HID delivers a mouse over the same boot
-protocol as the keyboard, so this is the next phase, not a redesign.
+**The mouse** arrived in Phase 11 and works the way one expects: click a window to raise and
+focus it, drag it by the title bar, close it with the button in the corner, click the taskbar
+to switch windows or open the start menu, click a menu entry to launch it. The pointer is a
+layer the compositor draws last, as two one-bit masks — a dark outline and a light fill,
+because a white arrow vanishes on a light title bar and a dark one vanishes on the desktop.
+Nothing is saved from underneath it: the framebuffer cannot be read, so a move marks two
+rectangles (where the arrow was, where it now is) and both are composed again from the
+background and the windows.
+
+The work was not in the UI. The xHCI driver held exactly one device — one slot, one
+interrupt ring, one report parser — and a mouse is a second of each. Events for every device
+arrive in one ring, so a transfer is now matched to its device by the slot id in the event
+itself; without that, mouse movement would be parsed as keystrokes.
 
 ## The test bench
 
@@ -129,13 +140,20 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Seven scenarios today: the system boots and the shell answers (`boot`); keys arrive over
+Eight scenarios today: the system boots and the shell answers (`boot`); keys arrive over
 xHCI and USB HID rather than PS/2 (`keyboard`, which switches `i8042` off, since `sendkey`
 reaches exactly one keyboard and QEMU picks PS/2 when both are attached); the start menu
-opens a program, the window moves and closes and focus comes back (`desktop`); a terminal
-that sends a lone carriage return works as Enter (`serial-cr`); the system boots off a disk
-this repo partitioned (`image`); the installer walks all seven screens and writes a disk
-(`install`); and that disk boots, mounts its ext2 root and reads `/etc` (`installed`).
+opens a program, the window moves and closes and focus comes back (`desktop`); the pointer
+drives all of it with clicks and a drag (`mouse`); a terminal that sends a lone carriage
+return works as Enter (`serial-cr`); the system boots off a disk this repo partitioned
+(`image`); the installer walks all seven screens and writes a disk (`install`); and that
+disk boots, mounts its ext2 root and reads `/etc` (`installed`).
+
+The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
+the cursor anywhere, only to drive it — and the two machines do not even have the same
+screen (1280×800 from OVMF, 800×600 from `ramfb`). So the bench aims at meaning ("the title
+bar of the `System` window") and reads the pixels out of the guest's own log, which prints
+the screen size and every window's rectangle for exactly this purpose.
 
 The bench lives in `xtask/src/harness/` and shares one QEMU command line with `run` —
 a second, independent one would mean the tests check a machine the developer never sees.
@@ -295,7 +313,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 9a | ext2: formatter, writer and reader; the installer creates a real root | **done** |
 | 9b | virtio-blk driver; the kernel mounts the root partition it was installed on | **done** |
 | 10 | Desktop: wallpaper, taskbar, start menu, window manager, file manager | **done** |
-| 11 | USB HID mouse: pointer layer, click to focus, drag by the title bar | next |
+| 11 | USB HID mouse on a multi-device xHCI: pointer, click to focus, drag, close | **done** |
 
 Phases 6 and 8 were both split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

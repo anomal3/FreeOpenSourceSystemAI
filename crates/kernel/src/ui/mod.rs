@@ -40,6 +40,7 @@
 pub mod compositor;
 pub mod files;
 pub mod panel;
+pub mod pointer;
 pub mod theme;
 pub mod window;
 
@@ -48,14 +49,14 @@ use core::fmt::Write as _;
 
 use mini_ui::{Rect, Screen};
 
-use crate::input::{KeyCode, KeyEvent, Modifiers};
+use crate::input::{Buttons, KeyCode, KeyEvent, Modifiers, PointerEvent};
 use crate::sync::SpinLock;
 use crate::{arch, kprintln, mm};
 
 use compositor::Compositor;
-use panel::Status;
+use panel::{PanelHit, Status};
 pub use window::App;
-use window::Window;
+use window::{Hit, Window};
 
 /// Насколько сдвигается окно за одно нажатие Ctrl+стрелка.
 ///
@@ -109,11 +110,7 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
         desktop.screen_height() as i32 - desktop.work_bottom(),
     );
     for (app, focused) in desktop.buttons() {
-        kprintln!(
-            "  window      : '{}'{}",
-            app.title(),
-            if focused { " (focused)" } else { "" }
-        );
+        log_window(&desktop, app, focused);
     }
 
     *DESKTOP.lock() = Some(desktop);
@@ -294,6 +291,20 @@ pub fn shell_size() -> (u32, u32) {
     .unwrap_or((0, 0))
 }
 
+/// Где сейчас указатель и виден ли он.
+///
+/// `None`, если графики нет. Существует ради команды `ui` в оболочке, и это не
+/// украшение вывода: положение курсора — единственное, что мышь меняет в
+/// системе видимым снаружи образом, и без этой строки проверить драйвер можно
+/// было бы только глазами по снимку экрана.
+#[must_use]
+pub fn pointer_state() -> Option<(i32, i32, bool)> {
+    with_desktop(|desktop| {
+        let (x, y) = desktop.pointer_position();
+        (x, y, desktop.pointer_visible())
+    })
+}
+
 /// Кадры, прямоугольники и число окон.
 #[must_use]
 pub fn stats() -> (u64, u64, usize) {
@@ -388,6 +399,130 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
     route(desktop, event)
 }
 
+/// Разобрать отчёт мыши.
+///
+/// Отдельный вход, а не общий с клавиатурой, потому что событие принципиально
+/// другое: у клавиши есть код и адресат — активное окно, у указателя есть место
+/// на экране, и адресата он выбирает сам, попадая в него. Общая точка входа
+/// заставила бы одну из двух моделей притворяться другой.
+pub fn dispatch_pointer(event: PointerEvent) {
+    let status = status_now();
+    with_desktop(|desktop| pointer_on(desktop, event, &status));
+}
+
+fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
+    if event.dx != 0 || event.dy != 0 {
+        desktop.move_pointer(event.dx, event.dy);
+        // Перетаскивание — это движение окна вслед за указателем на то же
+        // приращение. Запоминать смещение точки захвата не нужно: приращения
+        // складываются сами, а окно, упёршееся в край экрана, отстаёт от
+        // курсора ровно на столько, на сколько его не пустили.
+        if desktop.dragging().is_some() && event.buttons.contains(Buttons::LEFT) {
+            desktop.drag_by(event.dx, event.dy);
+        }
+    }
+
+    let (x, y) = desktop.pointer_position();
+
+    if event.pressed(Buttons::LEFT) {
+        press(desktop, x, y, status);
+    }
+    if event.released(Buttons::LEFT) {
+        // Где окно оказалось — в журнал: это единственное видимое снаружи
+        // последствие перетаскивания, и без него проверить его можно было бы
+        // только глазами по снимку экрана.
+        if let Some(app) = desktop.dragging() {
+            if let Some(rect) = desktop.rect_of(app) {
+                kprintln!(
+                    "  desktop     : moved '{}' to {},{}",
+                    app.title(),
+                    rect.x,
+                    rect.y
+                );
+            }
+        }
+        desktop.set_drag(None);
+    }
+
+    desktop.present();
+}
+
+/// Разобрать нажатие левой кнопки.
+///
+/// Порядок проверок — сверху вниз по слоям кадра, и он обязан совпадать с
+/// порядком рисования: щелчок должен доставаться тому, кого человек видит под
+/// стрелкой. Обратный порядок означал бы, что кнопка, накрытая меню,
+/// срабатывает сквозь него.
+fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
+    // 1. Открытое меню.
+    if desktop.menu_open() {
+        let index = desktop.menu_mut().and_then(|menu| menu.index_at(x, y));
+        match index {
+            Some(index) => {
+                if let Some(menu) = desktop.menu_mut() {
+                    menu.select(index);
+                    menu.close();
+                }
+                kprintln!("  desktop     : menu closed");
+                desktop.mark_menu_area();
+                launch(desktop, App::LAUNCHABLE[index]);
+                desktop.refresh_panel(status);
+                return;
+            }
+            // Щелчок мимо меню закрывает его и на этом заканчивается: это то,
+            // чего человек ждёт от щелчка вне открытого меню, и заодно
+            // единственный способ закрыть его мышью.
+            None => {
+                if let Some(menu) = desktop.menu_mut() {
+                    menu.close();
+                }
+                kprintln!("  desktop     : menu closed");
+                desktop.mark_menu_area();
+                desktop.refresh_panel(status);
+                return;
+            }
+        }
+    }
+
+    // 2. Панель задач.
+    if let Some(hit) = desktop.panel_at(x, y) {
+        match hit {
+            PanelHit::Menu => toggle_menu(desktop, status),
+            PanelHit::Window(app) => {
+                launch(desktop, app);
+                desktop.refresh_panel(status);
+            }
+            PanelHit::Empty => {}
+        }
+        return;
+    }
+
+    // 3. Окна.
+    if let Some((index, hit)) = desktop.window_at(x, y) {
+        let app = desktop.app_at(index);
+        desktop.raise(index);
+        log_focus(desktop);
+        match hit {
+            Hit::Close => {
+                if let Some(app) = app {
+                    if desktop.close(app) {
+                        kprintln!("  desktop     : closed '{}'", app.title());
+                    }
+                    log_focus(desktop);
+                }
+            }
+            Hit::Title => {
+                desktop.set_drag(app);
+                if let Some(app) = app {
+                    kprintln!("  desktop     : drag '{}'", app.title());
+                }
+            }
+            Hit::Body => {}
+        }
+        desktop.refresh_panel(status);
+    }
+}
+
 /// Отдать событие активному окну.
 fn route(desktop: &mut Compositor, event: KeyEvent) -> Option<KeyEvent> {
     match desktop.focused_app() {
@@ -474,6 +609,7 @@ fn launch(desktop: &mut Compositor, app: App) {
     if let Some(window) = build(desktop, app) {
         desktop.push(window);
         kprintln!("  desktop     : opened '{}'", app.title());
+        log_window(desktop, app, true);
         log_focus(desktop);
     } else {
         kprintln!("  desktop     : not enough memory for '{}'", app.title());
@@ -490,4 +626,25 @@ fn log_focus(desktop: &Compositor) {
     if let Some(app) = desktop.focused_app() {
         kprintln!("  desktop     : focus '{}'", app.title());
     }
+}
+
+/// Записать в журнал, где стоит окно.
+///
+/// Координаты нужны не человеку: по ним автоматический прогон наводит мышь.
+/// Без них сценарий с мышью пришлось бы писать в числах, подобранных под один
+/// размер экрана, — то есть отдельно под каждую архитектуру, потому что OVMF
+/// даёт 1280×800, а ramfb на `virt` — 800×600.
+fn log_window(desktop: &Compositor, app: App, focused: bool) {
+    let Some(rect) = desktop.rect_of(app) else {
+        return;
+    };
+    kprintln!(
+        "  window      : '{}' at {},{} {}x{}{}",
+        app.title(),
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        if focused { " (focused)" } else { "" }
+    );
 }

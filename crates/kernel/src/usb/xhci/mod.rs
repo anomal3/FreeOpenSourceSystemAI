@@ -1,4 +1,4 @@
-//! Драйвер контроллера xHCI: от поиска на шине PCI до отчётов клавиатуры.
+﻿//! Драйвер контроллера xHCI: от поиска на шине PCI до отчётов клавиатуры.
 //!
 //! # Почему события опрашиваются, а не приходят прерыванием
 //!
@@ -16,14 +16,17 @@
 //! незаметно (задержка самого USB на full-speed устройстве — те же единицы
 //! миллисекунд).
 //!
-//! # Почему одно устройство
+//! # Сколько устройств
 //!
-//! Драйвер обслуживает первую найденную boot-клавиатуру и на этом
-//! останавливается. Это не ограничение архитектуры, а отсутствие второго
-//! потребителя: мыши в ядре пока нет, хабов на пути к клавиатуре в QEMU и на
-//! Raspberry Pi 4 тоже (VL805 — корневой хаб). Обобщение до таблицы устройств —
-//! замена трёх полей структуры массивом, и делать её вслепую значит угадывать,
-//! как будет устроена мышь.
+//! Все, что висят на корневых портах и понимают boot-протокол HID: сейчас это
+//! клавиатура и мышь, каждая в своём слоте, со своим кольцом точки прерываний и
+//! своим разборщиком отчётов. События приходят в одно кольцо на весь
+//! контроллер, поэтому передача опознаётся по номеру слота из самого события —
+//! иначе отчёт мыши достался бы клавиатуре.
+//!
+//! Хабов драйвер не проходит: на пути к устройствам их нет ни в QEMU, ни на
+//! Raspberry Pi 4, где VL805 сам является корневым хабом. Устройство за
+//! внешним хабом видно не будет, и это сказано вслух, а не обойдено.
 //!
 //! # Порядок инициализации
 //!
@@ -47,7 +50,9 @@ use crate::mm::dma::{self, DmaBuffer, DmaError};
 use crate::mm::{MapError, PAGE_SIZE, PhysAddr};
 use crate::pci;
 use crate::usb::hid::{self, REPORT_LEN};
-use crate::usb::{self, KeyboardInterface};
+use crate::usb::{self, BootInterface};
+
+use alloc::vec::Vec;
 
 use regs::Registers;
 use ring::{EventRing, Ring, Trb};
@@ -59,9 +64,11 @@ const RING_ENTRIES: usize = PAGE_SIZE / ring::TRB_LEN;
 
 /// Сколько слотов устройств ядро просит у контроллера.
 ///
-/// Один: обслуживается одна клавиатура. Просить больше не вредно, но каждый слот
-/// — это указатель в массиве контекстов, а массив контроллер читает целиком.
-const SLOTS_WANTED: u8 = 1;
+/// Четыре: клавиатура и мышь занимают по слоту, и запас на пару устройств
+/// оставлен затем, чтобы подключение третьего не требовало правки драйвера.
+/// Просить много не вредно, но каждый слот — это указатель в массиве
+/// контекстов, а массив контроллер читает целиком.
+const SLOTS_WANTED: u8 = 4;
 
 /// Минимальная версия интерфейса. `0x0090` — это xHCI 0.9, черновик, который
 /// встречался в первых чипсетах Intel и отличается расположением части полей.
@@ -135,6 +142,12 @@ pub enum XhciError {
     /// Команда завершилась ошибкой.
     CommandFailed { command: u32, code: u32 },
     /// Ни на одном порту нет подключённого устройства.
+    ///
+    /// Больше не возвращается перечислением: пустой перебор портов — это не
+    /// ошибка, а машина без устройств, и говорит об этом строка журнала.
+    /// Вариант оставлен потому, что подключение устройства на ходу (событие
+    /// изменения порта) будет отвечать именно им.
+    #[allow(dead_code)]
     NoDevice,
     /// Порт не вышел из сброса.
     PortResetTimeout(u8),
@@ -185,7 +198,40 @@ impl From<DmaError> for XhciError {
     }
 }
 
-/// Подключённая клавиатура.
+/// Кто разбирает отчёты этого устройства.
+///
+/// Разница между клавиатурой и мышью для драйвера контроллера ровно в этом:
+/// один байт дескриптора интерфейса решает, какой разборщик получит отчёт.
+/// Всё остальное — слот, адресация, кольца, дверной звонок — у них общее.
+enum Reader {
+    Keyboard(hid::Keyboard),
+    Mouse(hid::Mouse),
+}
+
+impl Reader {
+    fn handle_report(&mut self, report: &[u8]) {
+        match self {
+            Reader::Keyboard(keyboard) => keyboard.handle_report(report),
+            Reader::Mouse(mouse) => mouse.handle_report(report),
+        }
+    }
+
+    const fn reports(&self) -> u64 {
+        match self {
+            Reader::Keyboard(keyboard) => keyboard.reports(),
+            Reader::Mouse(mouse) => mouse.reports(),
+        }
+    }
+
+    const fn name(&self) -> &'static str {
+        match self {
+            Reader::Keyboard(_) => "keyboard",
+            Reader::Mouse(_) => "mouse",
+        }
+    }
+}
+
+/// Подключённое устройство.
 struct Device {
     slot: u8,
     /// Корневой порт, к которому она подключена.
@@ -205,12 +251,16 @@ struct Device {
     /// Размер отчёта, который запрашивается у устройства.
     report_len: u16,
     /// Разбор отчётов в события.
-    keyboard: hid::Keyboard,
+    ///
+    /// `None` до тех пор, пока не прочитаны дескрипторы: до этого момента ещё
+    /// неизвестно, клавиатура это или мышь, а буфер уже используется — под сами
+    /// дескрипторы. Отчёты в это время не запрашиваются.
+    reader: Option<Reader>,
     /// Ждёт ли сейчас устройство отчёта (дескриптор в кольце).
     queued: bool,
 }
 
-/// Контроллер и его единственное устройство.
+/// Контроллер и подключённые к нему устройства.
 pub struct Controller {
     regs: Registers,
     /// Массив адресов контекстов устройств.
@@ -224,7 +274,9 @@ pub struct Controller {
     /// Таблица сегментов кольца событий. Контроллер читает её при старте, но
     /// адрес должен оставаться действительным всё время работы.
     erst: DmaBuffer,
-    device: Option<Device>,
+    /// Устройства в порядке подключения. Вектор, а не одно поле: клавиатура и
+    /// мышь — это два слота, два кольца прерываний и два разбора отчётов.
+    devices: Vec<Device>,
     /// Сколько событий разобрано — диагностика.
     events_seen: u64,
     /// Сколько передач завершилось ошибкой.
@@ -310,7 +362,7 @@ impl Controller {
             command: Ring::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?),
             events: EventRing::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?),
             erst: dma::alloc(16)?,
-            device: None,
+            devices: Vec::new(),
             events_seen: 0,
             transfer_errors: 0,
         };
@@ -574,13 +626,17 @@ impl Controller {
         }
     }
 
-    /// Найти порт с подключённым устройством.
+    /// Найти следующий порт с подключённым устройством, начиная с `from`.
+    ///
+    /// Начало перебора — параметр, а не единица: перечисление устройств идёт по
+    /// портам подряд, и без него поиск после первого найденного возвращал бы его
+    /// же вечно.
     ///
     /// # Safety
     ///
     /// Окно регистров должно быть отображено.
-    unsafe fn find_device_port(&mut self) -> Option<(u8, u32)> {
-        for port in 1..=self.regs.max_ports {
+    unsafe fn find_device_port(&mut self, from: u8) -> Option<(u8, u32)> {
+        for port in from.max(1)..=self.regs.max_ports {
             // SAFETY: номер порта в пределах, сообщённых контроллером.
             let status = unsafe { self.regs.read_portsc(port) };
             if status & regs::PORTSC_CONNECTED == 0 {
@@ -659,15 +715,47 @@ impl Controller {
         }
     }
 
-    /// Подключить клавиатуру: слот, адрес, дескрипторы, конфигурация.
+    /// Перечислить корневые порты и подключить всё, что понимает boot-протокол.
+    ///
+    /// Отказ на одном порте не прекращает перебор: мышь не должна пропадать
+    /// оттого, что на соседнем порту висит устройство неизвестного класса.
+    /// Возвращает набор поднятых источников ввода.
     ///
     /// # Safety
     ///
     /// Контроллер должен работать.
-    pub unsafe fn attach_keyboard(&mut self) -> Result<(), XhciError> {
+    pub unsafe fn attach_devices(&mut self) -> (bool, bool) {
+        let (mut keyboard, mut mouse) = (false, false);
+        let mut next = 1u8;
+
+        while next <= self.regs.max_ports {
+            // SAFETY: контракт функции.
+            let Some((port, _)) = (unsafe { self.find_device_port(next) }) else {
+                break;
+            };
+            next = port.saturating_add(1);
+
+            // SAFETY: см. выше.
+            match unsafe { self.attach_one(port) } {
+                Ok(usb::PROTOCOL_KEYBOARD) => keyboard = true,
+                Ok(usb::PROTOCOL_MOUSE) => mouse = true,
+                Ok(_) => {}
+                Err(err) => kprintln!("  usb         : port {port}: {err}"),
+            }
+        }
+
+        (keyboard, mouse)
+    }
+
+    /// Подключить одно устройство: слот, адрес, дескрипторы, конфигурация.
+    ///
+    /// Возвращает протокол HID, по которому устройство опознано.
+    ///
+    /// # Safety
+    ///
+    /// Контроллер должен работать, а порт — иметь подключённое устройство.
+    unsafe fn attach_one(&mut self, port: u8) -> Result<u8, XhciError> {
         // SAFETY: контракт функции.
-        let (port, _) = unsafe { self.find_device_port() }.ok_or(XhciError::NoDevice)?;
-        // SAFETY: см. выше.
         let speed = unsafe { self.reset_port(port) }?;
         kprintln!(
             "  usb         : device on root port {port}, {}",
@@ -711,7 +799,7 @@ impl Controller {
             interrupt_target: 0,
             report,
             report_len: REPORT_LEN as u16,
-            keyboard: hid::Keyboard::new(),
+            reader: None,
             queued: false,
         };
 
@@ -720,27 +808,35 @@ impl Controller {
         kprintln!("  usb         : slot {slot} addressed");
 
         // SAFETY: устройство отвечает на управляющей точке.
-        let keyboard = unsafe { self.describe_device(&mut device, speed) }?;
-        let micros = interval_micros(endpoint_interval(speed, keyboard.interval));
+        let found = unsafe { self.describe_device(&mut device, speed) }?;
+        let micros = interval_micros(endpoint_interval(speed, found.interval));
+        let reader = match found.protocol {
+            usb::PROTOCOL_MOUSE => Reader::Mouse(hid::Mouse::new()),
+            _ => Reader::Keyboard(hid::Keyboard::new()),
+        };
         kprintln!(
-            "  usb         : boot keyboard on interface {}, endpoint {} IN, {}-byte reports every {}.{:03} ms",
-            keyboard.interface,
-            keyboard.endpoint,
-            keyboard.max_packet_size,
+            "  usb         : boot {} on interface {}, endpoint {} IN, {}-byte reports every {}.{:03} ms",
+            reader.name(),
+            found.interface,
+            found.endpoint,
+            found.max_packet_size,
             micros / 1000,
             micros % 1000
         );
 
-        device.report_len = keyboard.max_packet_size.min(PAGE_SIZE as u16);
+        device.report_len = found.max_packet_size.min(PAGE_SIZE as u16);
         // SAFETY: см. выше.
-        unsafe { self.configure_endpoint(&mut device, &keyboard, speed) }?;
+        unsafe { self.configure_endpoint(&mut device, &found, speed) }?;
         // SAFETY: см. выше.
-        unsafe { self.enable_reports(&mut device, &keyboard) }?;
+        unsafe { self.enable_reports(&mut device, &found) }?;
 
-        self.device = Some(device);
+        // Разборщик ставится последним: до этого момента буфер занят
+        // дескрипторами, и отчёт в него ещё не запрашивался.
+        device.reader = Some(reader);
+        self.devices.push(device);
         // SAFETY: устройство настроено, кольцо точки прерываний готово.
-        unsafe { self.queue_report() };
-        Ok(())
+        unsafe { self.queue_reports() };
+        Ok(found.protocol)
     }
 
     /// Записать слово в контекст.
@@ -843,7 +939,7 @@ impl Controller {
         &mut self,
         device: &mut Device,
         speed: u32,
-    ) -> Result<KeyboardInterface, XhciError> {
+    ) -> Result<BootInterface, XhciError> {
         // Первые восемь байт дескриптора устройства: больше читать нельзя, пока
         // неизвестен размер пакета управляющей точки, — а он лежит именно в этих
         // восьми байтах (байт 7). Классическая курица с яйцом, решённая
@@ -896,7 +992,7 @@ impl Controller {
         let read = unsafe { self.get_descriptor(device, usb::DESC_CONFIGURATION, 0, total) }?;
         // SAFETY: см. выше.
         let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
-        usb::find_keyboard(bytes).ok_or(XhciError::NoKeyboard)
+        usb::find_boot_hid(bytes).ok_or(XhciError::NoKeyboard)
     }
 
     /// Сообщить контроллеру настоящий размер пакета управляющей точки.
@@ -936,12 +1032,12 @@ impl Controller {
     unsafe fn configure_endpoint(
         &mut self,
         device: &mut Device,
-        keyboard: &KeyboardInterface,
+        found: &BootInterface,
         speed: u32,
     ) -> Result<(), XhciError> {
         // Идентификатор контекста точки: `2 * номер + 1` для направления IN. Он
         // же — цель дверного звонка.
-        let target = keyboard.endpoint * 2 + 1;
+        let target = found.endpoint * 2 + 1;
         device.interrupt_target = target;
         let context_index = usize::from(target);
 
@@ -965,8 +1061,8 @@ impl Controller {
             let entries = context_index as u32;
             self.write_context(&device.input, 1, 0, (slot0 & !(0x1F << 27)) | (entries << 27));
 
-            let interval = endpoint_interval(speed, keyboard.interval);
-            let max_packet = u32::from(keyboard.max_packet_size);
+            let interval = endpoint_interval(speed, found.interval);
+            let max_packet = u32::from(found.max_packet_size);
             // Тип точки 7 — Interrupt IN. `CErr = 3` — см. `address_device`.
             self.write_context(&device.input, context_index + 1, 0, u32::from(interval) << 16);
             self.write_context(
@@ -1004,7 +1100,7 @@ impl Controller {
     unsafe fn enable_reports(
         &mut self,
         device: &mut Device,
-        keyboard: &KeyboardInterface,
+        found: &BootInterface,
     ) -> Result<(), XhciError> {
         // SET_CONFIGURATION: до него устройство не отвечает ни на одном
         // интерфейсе, кроме нулевой точки.
@@ -1012,7 +1108,7 @@ impl Controller {
         unsafe {
             self.control_transfer(
                 device,
-                [0, usb::REQ_SET_CONFIGURATION, keyboard.configuration, 0, 0, 0, 0, 0],
+                [0, usb::REQ_SET_CONFIGURATION, found.configuration, 0, 0, 0, 0, 0],
                 0,
                 false,
             )
@@ -1032,7 +1128,7 @@ impl Controller {
                     usb::REQ_HID_SET_PROTOCOL,
                     usb::HID_PROTOCOL_BOOT as u8,
                     0,
-                    keyboard.interface,
+                    found.interface,
                     0,
                     0,
                     0,
@@ -1055,7 +1151,7 @@ impl Controller {
         let idle = unsafe {
             self.control_transfer(
                 device,
-                [request, usb::REQ_HID_SET_IDLE, 0, 0, keyboard.interface, 0, 0, 0],
+                [request, usb::REQ_HID_SET_IDLE, 0, 0, found.interface, 0, 0, 0],
                 0,
                 false,
             )
@@ -1186,32 +1282,41 @@ impl Controller {
     /// # Safety
     ///
     /// Точка прерываний должна быть настроена.
-    unsafe fn queue_report(&mut self) {
-        let Some(device) = self.device.as_mut() else {
-            return;
-        };
-        if device.queued {
-            return;
+    unsafe fn queue_reports(&mut self) {
+        for index in 0..self.devices.len() {
+            let Some(device) = self.devices.get_mut(index) else {
+                continue;
+            };
+            // Пока разборщика нет, устройство ещё описывается, и его буфер занят
+            // дескрипторами: запрос отчёта затёр бы их на полпути.
+            if device.queued || device.reader.is_none() {
+                continue;
+            }
+            device.interrupt.push(Trb {
+                parameter: device.report.phys().as_u64(),
+                status: u32::from(device.report_len),
+                control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT)
+                    | ring::TRB_IOC
+                    // Короткий пакет тоже должен породить событие: устройство
+                    // вправе ответить меньше запрошенного, и без этого флага
+                    // такой отчёт остался бы незамеченным.
+                    | (1 << 2),
+            });
+            device.queued = true;
+            let (slot, target) = (device.slot, device.interrupt_target);
+            // SAFETY: дескриптор записан целиком до звонка.
+            unsafe { self.regs.ring_doorbell(slot, target) };
         }
-        device.interrupt.push(Trb {
-            parameter: device.report.phys().as_u64(),
-            status: u32::from(device.report_len),
-            control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT)
-                | ring::TRB_IOC
-                // Короткий пакет тоже должен породить событие: клавиатура вправе
-                // ответить меньше запрошенного, и без этого флага такой отчёт
-                // остался бы незамеченным.
-                | (1 << 2),
-        });
-        device.queued = true;
-        let (slot, target) = (device.slot, device.interrupt_target);
-        // SAFETY: дескриптор записан целиком до звонка.
-        unsafe { self.regs.ring_doorbell(slot, target) };
     }
 
     /// Разобрать событие о завершении передачи.
     fn handle_transfer_event(&mut self, event: &Trb) {
-        let Some(device) = self.device.as_mut() else {
+        // Слот — единственное, что отличает отчёт мыши от отчёта клавиатуры:
+        // кольцо событий у контроллера одно на все устройства. Пока устройство
+        // было одно, номер слота можно было не смотреть; теперь его пропуск
+        // означал бы, что движение мыши разбирается как нажатие клавиш.
+        let slot = event.slot_id();
+        let Some(device) = self.devices.iter_mut().find(|device| device.slot == slot) else {
             return;
         };
         // Событие относится к точке прерываний? Идентификатор точки — биты 20:16
@@ -1239,10 +1344,12 @@ impl Controller {
         // сообщил контроллер. `volatile` не нужен — передача уже завершена, и
         // содержимое больше не меняется, а отображение некешируемое.
         let report = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), received) };
-        device.keyboard.handle_report(report);
+        if let Some(reader) = device.reader.as_mut() {
+            reader.handle_report(report);
+        }
     }
 
-    /// Разобрать накопившиеся события и снова запросить отчёт.
+    /// Разобрать накопившиеся события и снова запросить отчёты.
     ///
     /// Вызывается из задачи. Когда появятся прерывания от контроллера, её будет
     /// вызывать обработчик — больше в драйвере не изменится ничего.
@@ -1250,19 +1357,46 @@ impl Controller {
         // SAFETY: окно регистров отображено на всё время жизни контроллера.
         unsafe {
             self.drain_events(None);
-            self.queue_report();
+            self.queue_reports();
         }
     }
 
-    /// Сводка для диагностики: слот, порт, отчёты, ошибки.
+    /// Сводка для диагностики: устройства, отчёты, события, ошибки.
     #[must_use]
-    pub fn summary(&self) -> (u8, u8, u64, u64, u64) {
-        let (slot, port, reports) = match self.device.as_ref() {
-            Some(device) => (device.slot, device.port, device.keyboard.reports()),
-            None => (0, 0, 0),
-        };
-        (slot, port, reports, self.events_seen, self.transfer_errors)
+    pub fn summary(&self) -> Summary {
+        let mut reports = 0;
+        for device in &self.devices {
+            reports += device.reader.as_ref().map_or(0, Reader::reports);
+        }
+        Summary {
+            devices: self.devices.len(),
+            slot: self.devices.first().map_or(0, |device| device.slot),
+            port: self.devices.first().map_or(0, |device| device.port),
+            reports,
+            events: self.events_seen,
+            errors: self.transfer_errors,
+        }
     }
+}
+
+/// Что драйвер сообщает о себе наружу.
+///
+/// Структура, а не кортеж из шести чисел: с появлением второго устройства
+/// читать `summary().3` стало нельзя без подглядывания в объявление.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Summary {
+    /// Сколько устройств поднято.
+    pub devices: usize,
+    /// Слот первого из них.
+    pub slot: u8,
+    /// Порт первого из них.
+    pub port: u8,
+    /// Сколько отчётов разобрано суммарно.
+    pub reports: u64,
+    /// Сколько событий пришло от контроллера.
+    pub events: u64,
+    /// Сколько передач завершилось ошибкой.
+    pub errors: u64,
 }
 
 /// Перевести `bInterval` из дескриптора в поле `Interval` контекста точки.
@@ -1352,22 +1486,23 @@ pub unsafe fn init(rsdp: u64) -> bool {
     };
 
     // SAFETY: контроллер работает.
-    let attached = match unsafe { controller.attach_keyboard() } {
-        Ok(()) => true,
-        Err(err) => {
-            // Контроллер при этом остаётся поднятым, и это не упрямство: он
-            // продолжает складывать в кольцо события об изменении портов, то есть
-            // остаётся способом узнать о подключении устройства позже.
-            kprintln!("  usb         : no keyboard: {err}");
-            false
-        }
-    };
-
-    if attached {
-        input::set_sources(input::Sources { keyboard: true, ..input::sources() });
+    //
+    // Контроллер остаётся поднятым, даже если ничего не нашлось, и это не
+    // упрямство: он продолжает складывать в кольцо события об изменении портов,
+    // то есть остаётся способом узнать о подключении устройства позже.
+    let (keyboard, mouse) = unsafe { controller.attach_devices() };
+    if !keyboard && !mouse {
+        kprintln!("  usb         : no boot-protocol device on any root port");
     }
+
+    let sources = input::sources();
+    input::set_sources(input::Sources {
+        keyboard: sources.keyboard || keyboard,
+        mouse: sources.mouse || mouse,
+        ..sources
+    });
     *CONTROLLER.lock() = Some(controller);
-    attached
+    keyboard || mouse
 }
 
 /// Разобрать накопившиеся события контроллера.
@@ -1380,8 +1515,8 @@ pub fn service() {
     }
 }
 
-/// Сводка для диагностики: слот, порт, отчёты, события, ошибки передач.
+/// Сводка для диагностики.
 #[must_use]
-pub fn summary() -> Option<(u8, u8, u64, u64, u64)> {
+pub fn summary() -> Option<Summary> {
     CONTROLLER.lock().as_ref().map(Controller::summary)
 }

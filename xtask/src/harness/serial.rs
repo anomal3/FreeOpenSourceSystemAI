@@ -90,6 +90,14 @@ impl SerialLine {
         Ok(Self { writer: stream, buffer, stop, reader: Some(reader), cursor: 0 })
     }
 
+    /// Весь вывод гостя с начала прогона.
+    ///
+    /// Нужен наведению мыши: цели берутся из строк, которые ядро само напечатало
+    /// про размер экрана и положение окон.
+    pub fn text(&self) -> String {
+        self.buffer.lock().expect("буфер линии").text.clone()
+    }
+
     /// Дождаться подстроки после места, где закончилось прошлое ожидание.
     pub fn wait_for(&mut self, needle: &str, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;

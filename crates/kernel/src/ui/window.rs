@@ -57,6 +57,17 @@ impl App {
     }
 }
 
+/// Во что попадает указатель внутри окна.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hit {
+    /// Кнопка закрытия.
+    Close,
+    /// Полоса заголовка: за неё окно таскают.
+    Title,
+    /// Всё остальное.
+    Body,
+}
+
 /// Содержимое окна.
 pub enum Content {
     /// Сетка символов: терминал и всё, что печатает строки.
@@ -147,6 +158,26 @@ impl Window {
             size,
             size,
         )
+    }
+
+    /// Во что попадает точка экрана. `None` — мимо окна.
+    ///
+    /// Кнопка закрытия проверяется первой: она лежит внутри полосы заголовка, и
+    /// обратный порядок означал бы, что окно за неё таскают, а не закрывается.
+    #[must_use]
+    pub fn hit(&self, x: i32, y: i32) -> Option<Hit> {
+        if !self.rect.contains(x, y) {
+            return None;
+        }
+        let local = (x - self.rect.x, y - self.rect.y);
+        if self.close_button().contains(local.0, local.1) {
+            return Some(Hit::Close);
+        }
+        let title_bottom = (theme::BORDER + Self::title_height(self.title_scale)) as i32;
+        if local.1 < title_bottom {
+            return Some(Hit::Title);
+        }
+        Some(Hit::Body)
     }
 
     /// Нарисовать рамку, заголовок и кнопку закрытия.

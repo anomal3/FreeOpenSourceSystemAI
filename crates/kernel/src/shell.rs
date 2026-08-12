@@ -119,6 +119,14 @@ pub fn task() {
             update_status();
         }
 
+        // Отчёты мыши разбираются перед клавишами: они меняют, какое окно
+        // активно, и разобрать их после значило бы отдать нажатие тому окну,
+        // которое было активным до щелчка.
+        while let Some(event) = input::next_pointer() {
+            idle_since = irq::uptime_ms();
+            ui::dispatch_pointer(event);
+        }
+
         while let Some(event) = input::next_event() {
             idle_since = irq::uptime_ms();
             // Рабочий стол смотрит на событие первым: меню, переключение и
@@ -191,6 +199,9 @@ fn banner() {
         (false, true) => sprintln!("Input: serial line."),
         (false, false) => sprintln!("Input: none available."),
     }
+    if sources.mouse {
+        sprintln!("Mouse: click to focus, drag the title bar to move.");
+    }
     sprintln!();
 }
 
@@ -232,8 +243,16 @@ fn update_status() {
         events.posted,
         events.dropped,
     );
-    if let Some((slot, port, reports, _, errors)) = usb::xhci::summary() {
-        let _ = write!(text, "usb     slot {slot} port {port}, {reports} reports, {errors} err\n");
+    if let Some(usb) = usb::xhci::summary() {
+        let _ = write!(
+            text,
+            "usb     {} devices, {} reports, {} err\n",
+            usb.devices, usb.reports, usb.errors
+        );
+    }
+    let (moves, merged) = input::pointer_stats();
+    if moves > 0 {
+        let _ = write!(text, "pointer {moves} reports, {merged} merged\n");
     }
     let _ = write!(
         text,
@@ -332,9 +351,15 @@ fn memory() {
 
 fn usb_status() {
     match usb::xhci::summary() {
-        Some((slot, port, reports, events, errors)) => {
-            sprintln!("  xhci     slot {slot} on port {port}, {reports} reports");
-            sprintln!("  events   {events} seen, {errors} transfer errors");
+        Some(usb) => {
+            sprintln!(
+                "  xhci     {} devices, first slot {} on port {}",
+                usb.devices,
+                usb.slot,
+                usb.port
+            );
+            sprintln!("  reports  {} parsed", usb.reports);
+            sprintln!("  events   {} seen, {} transfer errors", usb.events, usb.errors);
         }
         None => sprintln!("  xhci     no controller"),
     }
@@ -349,6 +374,13 @@ fn ui_status() {
     let (cols, rows) = ui::shell_size();
     sprintln!("  ui       {windows} windows, {composed} frames, {rects} rects");
     sprintln!("  shell    {cols}x{rows} characters");
+    if let Some((x, y, visible)) = ui::pointer_state() {
+        let (moves, merged) = input::pointer_stats();
+        sprintln!(
+            "  pointer  {x},{y} {}, {moves} reports, {merged} merged",
+            if visible { "visible" } else { "hidden" }
+        );
+    }
 }
 
 fn tasks() {

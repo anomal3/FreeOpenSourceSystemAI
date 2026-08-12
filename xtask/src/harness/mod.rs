@@ -29,6 +29,7 @@
 //!    у `run`. Отдельная сборка аргументов означала бы, что проверяется не та
 //!    машина, которую видит человек.
 
+mod aim;
 mod keys;
 mod monitor;
 mod scenarios;
@@ -65,6 +66,40 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// теряются, и сценарий падает на проверке введённого текста, хотя система
 /// исправна.
 const KEY_DELAY: Duration = Duration::from_millis(250);
+
+/// Пауза между отчётами мыши.
+///
+/// Короче клавиатурной: движение — это серия отчётов, и пауза в четверть
+/// секунды на каждый превратила бы проезд курсора через экран в полминуты.
+/// Терять отчёты не страшно так, как терять символы: очередь указателя при
+/// переполнении складывает приращения, а не выбрасывает их.
+const POINTER_DELAY: Duration = Duration::from_millis(60);
+
+/// Наибольшее приращение в одном отчёте boot-протокола мыши.
+///
+/// Байт на ось, знаковый. Взято с запасом от 127: пограничное значение не даёт
+/// ничего, кроме шанса ошибиться на единицу.
+const POINTER_STEP: i32 = 100;
+
+/// Разбить перемещение на отчёты, помещающиеся в байт.
+fn split_move(dx: i32, dy: i32) -> Vec<(i32, i32)> {
+    let steps = (dx.abs().max(dy.abs()) + POINTER_STEP - 1) / POINTER_STEP;
+    let steps = steps.max(1);
+    let mut out = Vec::with_capacity(steps as usize);
+    let (mut left_x, mut left_y) = (dx, dy);
+    for index in 0..steps {
+        let remaining = steps - index;
+        // Деление с округлением к нулю плюс вычитание остатка: сумма шагов
+        // обязана в точности равняться заказанному перемещению, иначе курсор
+        // приезжает не туда, куда его звали.
+        let step_x = left_x / remaining;
+        let step_y = left_y / remaining;
+        left_x -= step_x;
+        left_y -= step_y;
+        out.push((step_x, step_y));
+    }
+    out
+}
 
 pub struct TestOptions {
     /// Архитектуры прогона.
@@ -277,6 +312,11 @@ fn play(
     shots: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let started = Instant::now();
+    // Где сейчас указатель. Мышь относительная, абсолютных координат у неё нет,
+    // поэтому «навести на цель» — это посчитать разницу и проехать её. Начальное
+    // положение — середина экрана: так его ставит ядро.
+    let mut pointer: Option<(i32, i32)> = None;
+
     for (index, step) in scenario.steps.iter().enumerate() {
         let at = started.elapsed().as_millis();
         match step {
@@ -323,6 +363,59 @@ fn play(
             Step::Raw(bytes) => {
                 println!("  [{at:>6} мс] шаг {index}: в линию {bytes:02x?}");
                 line.write_raw(bytes).with_context(|| format!("шаг {index}"))?;
+            }
+            Step::Aim(target) => {
+                let log = line.text();
+                let (width, height) = aim::screen(&log).with_context(|| format!("шаг {index}"))?;
+                let from = *pointer.get_or_insert((width / 2, height / 2));
+                let to = aim::resolve(*target, &log).with_context(|| format!("шаг {index}"))?;
+                println!(
+                    "  [{at:>6} мс] шаг {index}: наводим на {target:?} — {:?} -> {to:?}",
+                    from
+                );
+                for (step_x, step_y) in split_move(to.0 - from.0, to.1 - from.1) {
+                    hmp.mouse_move(step_x, step_y)
+                        .with_context(|| format!("шаг {index}"))?;
+                    std::thread::sleep(POINTER_DELAY);
+                }
+                pointer = Some(to);
+                // Гость разбирает отчёты в своём такте: не дав ему догнать,
+                // следующий щелчок пришёлся бы по старому положению курсора.
+                std::thread::sleep(KEY_DELAY);
+            }
+            Step::Move(dx, dy) => {
+                println!("  [{at:>6} мс] шаг {index}: мышь на {dx},{dy}");
+                if let Some(position) = pointer.as_mut() {
+                    position.0 += dx;
+                    position.1 += dy;
+                }
+                // Движение разбивается на шаги: отчёт boot-протокола несёт
+                // знаковый байт на ось, и приращение больше 127 точек за раз
+                // либо обрежется, либо переполнится в обратную сторону.
+                // Крупный скачок курсора при этом и в жизни не встречается —
+                // мышь шлёт отчёт каждые несколько миллисекунд.
+                for (step_x, step_y) in split_move(*dx, *dy) {
+                    hmp.mouse_move(step_x, step_y)
+                        .with_context(|| format!("шаг {index}"))?;
+                    std::thread::sleep(POINTER_DELAY);
+                }
+            }
+            Step::Click => {
+                println!("  [{at:>6} мс] шаг {index}: щелчок");
+                hmp.mouse_button(1).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(POINTER_DELAY);
+                hmp.mouse_button(0).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(KEY_DELAY);
+            }
+            Step::Press => {
+                println!("  [{at:>6} мс] шаг {index}: кнопка нажата");
+                hmp.mouse_button(1).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(KEY_DELAY);
+            }
+            Step::Release => {
+                println!("  [{at:>6} мс] шаг {index}: кнопка отпущена");
+                hmp.mouse_button(0).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(KEY_DELAY);
             }
             Step::Wait(ms) => {
                 println!("  [{at:>6} мс] шаг {index}: пауза {ms} мс");
