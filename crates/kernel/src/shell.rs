@@ -361,6 +361,13 @@ fn run_command(line: &str) -> bool {
                 run_program(argument);
             }
         }
+        "kill" => {
+            if argument.is_empty() {
+                sprintln!("  usage: kill <task>");
+            } else {
+                kill(argument);
+            }
+        }
         "exit" | "quit" => {
             sprintln!("  finishing the session");
             return true;
@@ -383,6 +390,7 @@ fn help() {
     sprintln!("  echo <text>   print the text back");
     sprintln!("  whoami        the identity programs are run with");
     sprintln!("  run [-b] <p>  run a program outside the kernel; -b does not wait");
+    sprintln!("  kill <task>   stop a running program by its task number");
     sprintln!("  clear         clear the window");
     sprintln!("  exit          finish the boot and halt");
 }
@@ -491,6 +499,29 @@ fn run_program(argument: &str) {
             }
         }
         Err(err) => sprintln!("  {path}: {err}"),
+    }
+}
+
+/// Снять программу по номеру задачи.
+///
+/// Номер принимается и с решёткой, и без: `tasks` печатает `#5`, и требовать от
+/// человека стирать символ, который система сама же и показала, — придирка.
+///
+/// Оболочка сообщает только о том, что просьба принята. О том, что программа
+/// снята, скажет ядро, и скажет тогда, когда это действительно произойдёт: между
+/// просьбой и снятием — возврат снимаемой задачи в третье кольцо, то есть
+/// событие, которого оболочка не ждёт.
+fn kill(argument: &str) {
+    let text = argument.strip_prefix('#').unwrap_or(argument);
+    let Ok(raw) = text.parse::<u32>() else {
+        sprintln!("  kill: '{argument}' is not a task number");
+        return;
+    };
+
+    let id = sched::TaskId::new(raw);
+    match user::request_kill(id) {
+        Ok(()) => sprintln!("  kill: {id} asked to stop"),
+        Err(err) => sprintln!("  kill: task {id} {err}"),
     }
 }
 

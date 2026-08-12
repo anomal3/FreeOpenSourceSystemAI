@@ -443,6 +443,51 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "kill",
+        about: "Программу, которая сама не кончится, снимают командой — и её память возвращается в пул.",
+        target: Target::Live,
+        usb_only: false,
+        arches: &[],
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Line("run -b /bin/forever"),
+            // Номер задачи проверяется явно, а не подставляется вслепую:
+            // холостая, три демонстрационных, оболочка, дальше первая
+            // программа. Поедет нумерация — сценарий упадёт здесь, а не снимет
+            // молча чужую задачу.
+            Step::Await("started as #5", 15_000),
+            Step::Await("this program never ends on its own", 30_000),
+            // Система жива, пока программа крутится: это уже доказано сценарием
+            // `preempt`, но здесь важно сравнение с тем, что будет после kill.
+            Step::Line("echo alive-before-kill"),
+            Step::Await("  alive-before-kill", 30_000),
+            Step::Line("kill 5"),
+            // Оболочка отвечает только «просьба принята». О самом снятии
+            // говорит ядро, и говорит из другой задачи — той, которую снимают.
+            Step::Await("  kill: #5 asked to stop", 15_000),
+            Step::Await("user        : killed by request, task #5", 15_000),
+            // Память вернулась в пул целиком, тем же путём, что и после отказа:
+            // 128 страниц образа, 8 стека и четыре таблицы.
+            Step::Await("space released, 136 pages and 4 tables returned", 15_000),
+            Step::Await("#5 /bin/forever: killed by request", 15_000),
+            // Снять её второй раз нельзя, и отказ объясняет почему.
+            Step::Line("kill 5"),
+            Step::Await("kill: task #5 has already finished", 15_000),
+            // Оболочка — задача, но не программа: возвращаться ядру некуда, и
+            // делать вид, что можно, было бы хуже отказа.
+            Step::Line("kill 4"),
+            Step::Await("kill: task #4 is not running a program", 15_000),
+            Step::Line("kill 99"),
+            Step::Await("kill: task #99 does not exist", 15_000),
+            Step::Line("echo still-alive"),
+            Step::Await("  still-alive", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "serial-cr",
         about: "Терминал, присылающий один возврат каретки, работает как Enter.",
         target: Target::Live,

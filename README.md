@@ -311,9 +311,44 @@ now takes one lock for the whole line. A program's line is not covered by it and
 be — a program prints in six separate system calls, and `write` is atomic by itself, not in
 company with its neighbours, exactly as in Unix.
 
-Still missing: a way to *stop* a program. Preemption means a runaway program no longer owns
-the machine, not that you can get rid of it — `kill` needs to unwind someone else's entry into
-ring 3, and that is its own piece of work.
+### Stopping a program
+
+Preemption means a runaway program no longer owns the machine. It does not mean you can get
+rid of it, and `/bin/forever` is the program that makes the difference obvious: one assembly
+instruction jumping to itself, no system calls, no end. Until this phase the only way to be
+rid of it was to switch the machine off.
+
+```
+freeos> run -b /bin/forever
+  /bin/forever: started as #5
+forever 5: this program never ends on its own
+freeos> kill 5
+  kill: #5 asked to stop
+  user        : killed by request, task #5
+  user        : space released, 136 pages and 4 tables returned
+  #5 /bin/forever: killed by request
+```
+
+The shell only says the request was taken. The killing happens elsewhere and later — at the
+program's next return to ring 3, which the timer guarantees within a tick. That delay is the
+design, not a shortcut: `return_to_kernel` throws away the handler's stack whole, so anything
+that was on it goes with it. Done at an arbitrary point inside the kernel that would include
+the guard of a held lock, and the system would deadlock at the next `lock()` on a lock nobody
+can release. At the trap boundary there is nothing on that stack to lose — the handler has
+finished its work, and the only frame below is the one `enter_user` left.
+
+Which is also the boundary of what `kill` can do, and it is worth stating rather than
+papering over: only a program can be stopped, because only a program has a place for the
+kernel to return *to*. Ask to kill the shell and you get told no. A program stuck inside a
+system call is not killable either, until it comes back out — no system call in this kernel
+blocks, so today it always does, but that is a property of what exists so far and not a
+promise.
+
+Everything after the decision was already written. `kill` lands in the same place a fault
+lands, and from there the Phase 12b teardown runs unchanged: the address space goes back to
+the pool page by page, the file table closes what the program left open, and the task ends
+with a code of its own — `-13`, distinct from the `-1` of a program the kernel killed for
+misbehaving. The two are not the same event and should not print the same line.
 
 ## The test bench
 
@@ -323,10 +358,12 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Ten scenarios today: a program runs in an address space of its own, one that faults is killed
-without taking the system with it, one that reaches for kernel memory is refused, and every
-run's pages go back to the pool (`userspace`); a program that makes no system call at all is
-taken off the CPU anyway, and the shell answers a command between its two lines (`preempt`);
+Eleven scenarios today: a program runs in an address space of its own, one that faults is
+killed without taking the system with it, one that reaches for kernel memory is refused, and
+every run's pages go back to the pool (`userspace`); a program that makes no system call at
+all is taken off the CPU anyway, and the shell answers a command between its two lines
+(`preempt`); a program that never ends is stopped by name and its window returns to the pool,
+while the shell and a task that is not a program are refused (`kill`);
 the system boots and the shell answers (`boot`); keys arrive over
 xHCI and USB HID rather than PS/2 (`keyboard`, which switches `i8042` off, since `sendkey`
 reaches exactly one keyboard and QEMU picks PS/2 when both are attached); the start menu
@@ -512,6 +549,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 12c | File system calls, and `mode`/`uid`/`gid` checked against the program asking | **done** |
 | 13a | A program is a task: its own kernel stack, address space and files; two at once | **done** |
 | 13b | Preemption: a program that never yields no longer owns the machine | **done** |
+| 13c | `kill`: a program that never ends can be stopped, and its memory comes back | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe
