@@ -34,7 +34,7 @@ use user_abi::{
 use crate::mm::PageFlags;
 use crate::vfs::perm::Access;
 use crate::vfs::{NodeKind, VfsError};
-use crate::{irq, sched};
+use crate::{sched, time};
 
 use super::files::FileError;
 use super::space;
@@ -75,7 +75,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
             sched::yield_now();
             0
         }
-        SYS_UPTIME => irq::uptime_ms() as i64,
+        SYS_UPTIME => time::uptime_ms() as i64,
         SYS_OPEN => open(a0, a1, a2),
         SYS_READ => read(a0, a1, a2),
         SYS_CLOSE => close(a0),

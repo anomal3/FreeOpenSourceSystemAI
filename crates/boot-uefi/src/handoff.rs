@@ -252,6 +252,25 @@ pub fn exit_and_jump(handoff: Handoff, entry: u64, overrides: &[Override]) -> ! 
     let regions = handoff.regions.as_ptr();
     let capacity = handoff.capacity;
 
+    // Часы прошивки — последним действием перед выходом, вместе со счётчиком
+    // тактов. Всё, что происходит дальше и до первого тика ядра, оно теперь
+    // умеет измерить и вычесть; раньше этот промежуток становился постоянным
+    // отставанием часов, и под эмуляцией он равнялся семи секундам.
+    //
+    // SAFETY: `info` указывает на инициализированный `BootInfo` внутри
+    // выделенного блока, а runtime-сервисы ещё отвечают по физическим адресам.
+    let wall_clock = unsafe { crate::clock::record(info) };
+    if wall_clock != 0 {
+        println!(
+            "  firmware clock  : {} UTC ({} s)",
+            calendar::DateTime::from_unix(wall_clock as i64),
+            wall_clock
+        );
+    } else {
+        println!("  firmware clock  : unavailable, the system will not know the date");
+    }
+    println!("  exiting boot services -- console output stops here");
+
     // ─────────────── Точка невозврата ───────────────
     // SAFETY: к этому моменту все протоколы закрыты (GOP уронен в
     // `graphics`, файловые хендлы — вместе с `volume::BootVolume`), пул из-под

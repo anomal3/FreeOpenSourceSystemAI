@@ -471,19 +471,34 @@ the install lived. Now the stamp is read from the clock on every change, `ls` sh
 `stat` prints it twice: as a date, and as a number that can be checked against something
 outside the machine.
 
-Two things are worth saying plainly, because both are visible on the bench:
+**What makes it keep time** is that it is not counted in timer ticks. A tick counter counts
+*delivered interrupts*, and interrupts are lost whenever they are disabled — the controller
+keeps one pending per vector and drops the rest — which is most of what a boot is. Measured
+against the host's clock when this was first built: the guest was 23 seconds behind by the
+time the shell appeared on x86-64 debug, 3 behind in release, and the gap was the
+repainting. So time is read from a counter that runs on its own instead: `CNTPCT_EL0` on
+AArch64, whose frequency the firmware puts in `CNTFRQ_EL0`, and the TSC on x86-64, whose
+frequency nobody will tell you — `CPUID` often declines — so it is measured against the ACPI
+timer, whose 3.579545 MHz is fixed by the spec. Ticks stay where they belong: counting
+scheduler quanta, which are *defined* in ticks.
 
-- **The clock keeps time, but it starts in debt.** The uptime is counted in delivered timer
-  ticks, and ticks are lost whenever interrupts stay disabled — which is most of what a boot
-  is. Measured: about twenty seconds of debt on x86-64 by the time the shell appears, and
-  under ten on AArch64. After that it runs true; ten idle seconds on the bench cost the
-  guest exactly ten. The fix is not more locking discipline but a counter that does not
-  depend on interrupts arriving at all (`CNTVCT_EL0`, or the TSC calibrated against the ACPI
-  timer) — which is a phase of its own.
-- **There is no way to set it.** `SetTime` lives in boot services, and they are gone by the
-  time anything could ask. A machine whose firmware clock is wrong will be wrong until it is
-  fixed in firmware; a machine whose firmware has no clock at all says so, marks its files
-  with zero, and prints `unknown` rather than inventing a date.
+The second half is knowing *when* the firmware clock was read. Everything between that
+reading and the kernel's first tick — `ExitBootServices`, the jump, page tables, the heap —
+used to become permanent lag, and it was seconds. So the bootloader samples the monotonic
+counter in the same breath as the clock and passes both; the counter is the same register on
+both sides of the hand-off, so the kernel can subtract an interval it would otherwise have
+no way to measure. It prints what it subtracted (`boot lag : 3717 ms`), because a correction
+nobody can see is indistinguishable from a fudge factor.
+
+Together that is the whole difference: −23 s before, **−1 to −2 s after**, and no longer
+growing. The scenario asserts it with a ±10 s tolerance, tight enough that the old behaviour
+would fail it.
+
+One limit stands, and it is not going away: **there is no way to set the clock.** `SetTime`
+lives in boot services and they are gone by the time anything could ask. A machine whose
+firmware clock is wrong stays wrong until it is fixed in firmware; a machine whose firmware
+has no clock at all says so, marks its files with zero, and prints `unknown` rather than
+inventing a date.
 
 ### Two kinds of lock
 
@@ -539,8 +554,9 @@ all is taken off the CPU anyway, and the shell answers a command between its two
 while the shell and a task that is not a program are refused (`kill`); a sleeping program
 shows up as `blocked` rather than `ready` and the machine reports time with nothing to run
 (`sleep`); the wall clock the firmware handed over matches the *host's* clock, still matches
-it ten seconds later, and a file on a filesystem that stores no time says so instead of
-showing an invented date (`clock`);
+it ten seconds later — within ten seconds, which the tick-counted clock it replaced would
+not have managed — and a file on a filesystem that stores no time says so instead of showing
+an invented date (`clock`);
 the system boots and the shell answers (`boot`); keys arrive over
 xHCI and USB HID rather than PS/2 (`keyboard`, which switches `i8042` off, since `sendkey`
 reaches exactly one keyboard and QEMU picks PS/2 when both are attached); the start menu
@@ -755,6 +771,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 14b | The kernel writes: `open` for writing, `write`, `mkdir`, `rm`, files that survive a reboot | **done** |
 | 15 | A mutex that stops the task, not the machine: long locks no longer hold interrupts off | **done** |
 | 16 | The time of day: the firmware clock, a time zone, and files stamped with when they were written | **done** |
+| 17 | Time that does not depend on interrupts arriving: a monotonic counter, and the boot lag subtracted | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

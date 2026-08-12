@@ -101,7 +101,7 @@ pub fn handle(fault: Fault, ctx: TrapContext) -> ! {
     if ctx.error != 0 {
         kprintln!("  error code  : {:#x}", ctx.error);
     }
-    kprintln!("  uptime      : {} ms", crate::irq::uptime_ms());
+    kprintln!("  uptime      : {} ms", crate::time::uptime_ms());
     kprintln!();
     kprintln!("FreeOS kernel: halted by an unrecoverable fault.");
     arch::halt();

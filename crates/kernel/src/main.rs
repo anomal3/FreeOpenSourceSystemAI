@@ -288,6 +288,16 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
 
     start_interrupts();
 
+    // Монотонный счётчик — сразу за таймером и раньше всех, кто меряет время.
+    // На x86-64 это измерение длиной в 50 мс, на AArch64 — чтение регистра;
+    // до него время работы считается тиками, то есть неточно, поэтому чем
+    // раньше, тем меньше отрезок, посчитанный плохо.
+    //
+    // SAFETY: `acpi_rsdp` приехал в проверенном `BootInfo`; ноль там означает
+    // «таблиц нет» и обрабатывается внутри.
+    unsafe { arch::monotonic::calibrate(info.acpi_rsdp) };
+    time::adopt_monotonic();
+
     let stats = mm::frame::stats();
     kprintln!();
     kprintln!(
@@ -303,7 +313,7 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     // Время суток запоминается сразу после запуска таймера: до этого момента
     // складывать точку отсчёта не с чем, а после — счётчик тиков уже идёт, и
     // задержка попадёт в поправку, а не в ошибку.
-    time::adopt_boot_clock(info.wall_clock);
+    time::adopt_boot_clock(info.wall_clock, info.wall_clock_counter);
 
     mount_initrd(&info);
     mount_disk_root(&info);
@@ -729,7 +739,7 @@ fn start_interrupts() {
     kprintln!(
         "  timer       : {} ticks in {} ms of uptime",
         irq::ticks(),
-        irq::uptime_ms()
+        time::uptime_ms()
     );
 }
 

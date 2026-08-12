@@ -10,6 +10,7 @@ pub mod input;
 pub mod interrupts;
 pub mod ioapic;
 pub mod paging;
+pub mod tsc;
 pub mod user;
 
 pub use paging::{PageTable, build_kernel_address_space, switch_stack};
@@ -91,6 +92,22 @@ unsafe fn inb(port: u16) -> u8 {
     // SAFETY: те же условия, что и в `outb`.
     unsafe {
         asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Чтение двойного слова из порта ввода-вывода.
+///
+/// # Safety
+///
+/// См. [`inb`]. Ширина обращения обязана совпадать с той, которую объявляет
+/// устройство: таймер ACPI — единственный, кто читается так, и его регистр
+/// ровно четырёхбайтовый.
+unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    // SAFETY: те же условия, что и в `outb`.
+    unsafe {
+        asm!("in eax, dx", out("eax") value, in("dx") port, options(nomem, nostack, preserves_flags));
     }
     value
 }

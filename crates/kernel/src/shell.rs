@@ -155,7 +155,7 @@ pub fn task() {
     sprint!("{PROMPT}");
 
     let mut editor = LineEditor::new();
-    let mut idle_since = irq::uptime_ms();
+    let mut idle_since = time::uptime_ms();
     let mut status_at = 0u64;
 
     loop {
@@ -165,7 +165,7 @@ pub fn task() {
         // событие уже пришло, а спящий его проспал.
         let seen = input::sequence();
 
-        let now = irq::uptime_ms();
+        let now = time::uptime_ms();
         if now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
             status_at = now;
             update_status();
@@ -175,12 +175,12 @@ pub fn task() {
         // активно, и разобрать их после значило бы отдать нажатие тому окну,
         // которое было активным до щелчка.
         while let Some(event) = input::next_pointer() {
-            idle_since = irq::uptime_ms();
+            idle_since = time::uptime_ms();
             ui::dispatch_pointer(event);
         }
 
         while let Some(event) = input::next_event() {
-            idle_since = irq::uptime_ms();
+            idle_since = time::uptime_ms();
             // Рабочий стол смотрит на событие первым: меню, переключение и
             // перемещение окон, а также ввод в окно другой программы — всё это
             // до оболочки не доходит. Оболочка — одна из программ, а не хозяин
@@ -217,7 +217,7 @@ pub fn task() {
             }
         }
 
-        if irq::uptime_ms().saturating_sub(idle_since) >= IDLE_TIMEOUT_SECONDS * 1000 {
+        if time::uptime_ms().saturating_sub(idle_since) >= IDLE_TIMEOUT_SECONDS * 1000 {
             sprintln!();
             sprintln!("  no input for {IDLE_TIMEOUT_SECONDS} s, finishing the session");
             ui::set_cursor(false);
@@ -296,7 +296,7 @@ fn update_status() {
          frames  {composed} composed, {rects} rects\n\
          windows {windows}\n\
          keys    {} posted, {} dropped\n",
-        irq::uptime_ms(),
+        time::uptime_ms(),
         irq::ticks(),
         events.posted,
         events.dropped,
@@ -339,7 +339,7 @@ fn run_command(line: &str) -> bool {
     match command {
         "" => {}
         "help" => help(),
-        "uptime" => sprintln!("  {} ms, {} timer ticks", irq::uptime_ms(), irq::ticks()),
+        "uptime" => sprintln!("  {} ms, {} timer ticks", time::uptime_ms(), irq::ticks()),
         "date" => date(),
         "mem" => memory(),
         "input" => {

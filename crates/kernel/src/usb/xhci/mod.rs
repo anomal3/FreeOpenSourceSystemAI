@@ -44,7 +44,7 @@ pub mod ring;
 
 use crate::acpi::AcpiError;
 use crate::input;
-use crate::irq;
+use crate::time;
 use crate::kprintln;
 use crate::mm::dma::{self, DmaBuffer, DmaError};
 use crate::mm::{MapError, PAGE_SIZE, PhysAddr};
@@ -101,14 +101,14 @@ struct Timeout {
 
 impl Timeout {
     fn new(ms: u64) -> Self {
-        Self { until_ms: irq::uptime_ms().saturating_add(ms), spins: 0 }
+        Self { until_ms: time::uptime_ms().saturating_add(ms), spins: 0 }
     }
 
     /// `true`, если ждать больше нельзя.
     fn expired(&mut self) -> bool {
         self.spins = self.spins.saturating_add(1);
         core::hint::spin_loop();
-        irq::uptime_ms() >= self.until_ms || self.spins >= SPIN_LIMIT
+        time::uptime_ms() >= self.until_ms || self.spins >= SPIN_LIMIT
     }
 }
 

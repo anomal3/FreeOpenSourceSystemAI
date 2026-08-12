@@ -20,7 +20,9 @@ pub const BOOT_INFO_MAGIC: u64 = 0x4652_4545_4F53_0001;
 /// Revision 2 added [`BootInfo::kernel`], which the kernel needs to apply W^X
 /// to its own image. Revision 3 added [`BootInfo::initrd`]. Revision 4 added
 /// [`BootInfo::wall_clock`]: the kernel has no clock of its own to ask.
-pub const BOOT_INFO_REVISION: u32 = 4;
+/// Revision 5 added [`BootInfo::wall_clock_counter`], which says *when* that
+/// clock was read.
+pub const BOOT_INFO_REVISION: u32 = 5;
 
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
@@ -190,6 +192,18 @@ pub struct BootInfo {
     /// it, so the pair drifts exactly as much as the timer does, and a machine
     /// that stays up for a month will show that drift.
     pub wall_clock: u64,
+    /// The monotonic counter — the TSC on x86-64, `CNTPCT_EL0` on AArch64 —
+    /// sampled in the same breath as [`BootInfo::wall_clock`]. Zero if the
+    /// clock was unavailable.
+    ///
+    /// Without it the kernel knows *what* the time was but not *when* that was
+    /// true, and everything between the reading and the kernel's first tick —
+    /// `ExitBootServices`, the jump, memory setup, the heap — becomes a
+    /// permanent lag. Under emulation that is seconds, and it was measured:
+    /// seven of them. With it, the kernel subtracts the interval it can now
+    /// see, because the counter is the same hardware register on both sides of
+    /// the hand-off and does not restart in between.
+    pub wall_clock_counter: u64,
 }
 
 /// Segment is readable.
@@ -343,6 +357,7 @@ impl BootInfo {
             acpi_rsdp: 0,
             device_tree: 0,
             wall_clock: 0,
+            wall_clock_counter: 0,
         }
     }
 
