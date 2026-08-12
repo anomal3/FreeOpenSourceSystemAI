@@ -123,6 +123,28 @@ impl SerialLine {
         }
     }
 
+    /// Дождаться подстроки и прочитать десятичное число сразу за ней.
+    ///
+    /// Нужно там, где сценарий должен сослаться на то, что система назвала сама:
+    /// номер задачи у запущенной программы. Проверять его константой нельзя —
+    /// нумерация меняется от одной служебной задачи, заведённой в ядре, и
+    /// сценарий начинает снимать не ту задачу либо падать на ровном месте.
+    ///
+    /// Число обязано начинаться сразу за подстрокой: у `"started as #"` за ним
+    /// идут цифры, и никакого разбора формата тут не нужно.
+    pub fn capture_number(&mut self, prefix: &str, timeout: Duration) -> Result<String> {
+        self.wait_for(prefix, timeout)?;
+        let guard = self.buffer.lock().expect("буфер линии");
+        let digits: String = guard.text[self.cursor..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if digits.is_empty() {
+            bail!("за {prefix:?} не оказалось числа");
+        }
+        Ok(digits)
+    }
+
     /// Встречалась ли подстрока во всём выводе.
     pub fn seen(&self, needle: &str) -> bool {
         self.buffer.lock().expect("буфер линии").text.contains(needle)

@@ -21,7 +21,7 @@ use core::panic::PanicInfo;
 
 use user_abi::{
     FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN, SYS_READ,
-    SYS_STAT, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    SYS_SLEEP, SYS_STAT, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
 };
 
 /// Выполнить системный вызов.
@@ -201,11 +201,23 @@ pub fn gid() -> u32 {
     value.max(0) as u32
 }
 
-/// Уступить процессор.
+/// Уступить процессор, оставаясь готовой к исполнению.
 pub fn yield_now() {
     // SAFETY: аргументов у вызова нет.
     unsafe {
         syscall(SYS_YIELD, 0, 0, 0);
+    }
+}
+
+/// Уснуть на указанное число миллисекунд.
+///
+/// В отличие от [`yield_now`], спящая программа выходит из очереди на
+/// исполнение: пока она спит, процессор достаётся другим — или не достаётся
+/// никому, и тогда машина простаивает по-настоящему.
+pub fn sleep_ms(ms: u64) {
+    // SAFETY: аргумент — число.
+    unsafe {
+        syscall(SYS_SLEEP, ms as usize, 0, 0);
     }
 }
 

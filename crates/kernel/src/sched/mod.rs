@@ -92,7 +92,9 @@
 
 mod task;
 
-pub use task::{SpawnError, TaskId, TaskState, UserMachine, STACK_GUARD_SIZE, TASK_STACK_SIZE};
+pub use task::{
+    SpawnError, TaskId, TaskState, UserMachine, Wait, STACK_GUARD_SIZE, TASK_STACK_SIZE,
+};
 
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -165,6 +167,8 @@ struct Scheduler {
     switches: u64,
     /// Сколько из них произошло не по воле задачи, а по истёкшему кванту.
     forced: u64,
+    /// Сколько тиков таймера застали холостую задачу, то есть прошли впустую.
+    idle_ticks: u64,
     /// Сколько тиков осталось текущей задаче до конца кванта.
     slice_left: u32,
     /// Запущено ли планирование. До [`run`] переключаться не на что и не с чего.
@@ -181,6 +185,7 @@ impl Scheduler {
             next_id: 1,
             switches: 0,
             forced: 0,
+            idle_ticks: 0,
             slice_left: SLICE_TICKS,
             running: false,
         }
@@ -236,6 +241,39 @@ impl Scheduler {
         if self.current == IDLE_SLOT { None } else { Some(IDLE_SLOT) }
     }
 
+    /// Разбудить всех, чей срок ожидания вышел.
+    ///
+    /// Проход по всей таблице на каждом переключении — это тридцать два
+    /// сравнения, то есть заметно дешевле одного обращения к памяти мимо кеша.
+    /// Очередь по срокам здесь была бы структурой данных ради структуры данных:
+    /// её пришлось бы поддерживать в каждом пробуждении, а выигрыш начинается с
+    /// сотен задач.
+    ///
+    /// Возвращает `true`, если кто-то проснулся.
+    fn wake_expired(&mut self, now: u64) -> bool {
+        let mut woke = false;
+        for task in self.tasks.iter_mut().flatten() {
+            let due = match task.state {
+                TaskState::Blocked(Wait::Until(tick) | Wait::Input(tick)) => now >= tick,
+                _ => false,
+            };
+            if due {
+                task.state = TaskState::Ready;
+                woke = true;
+            }
+        }
+        woke
+    }
+
+    /// Разбудить тех, кто ждал завершения задачи `id`.
+    fn wake_waiters(&mut self, id: TaskId) {
+        for task in self.tasks.iter_mut().flatten() {
+            if task.state == TaskState::Blocked(Wait::Task(id)) {
+                task.state = TaskState::Ready;
+            }
+        }
+    }
+
     /// Освободить стеки завершённых задач.
     ///
     /// Текущая задача пропускается — и это не оптимизация, а условие
@@ -263,14 +301,21 @@ impl Scheduler {
         freed
     }
 
-    /// Сколько задач (не считая холостой) ещё не завершились.
+    /// Сколько задач (не считая холостой и служебных) ещё не завершились.
+    ///
+    /// Служебные не считаются, и это не деталь учёта: по этому числу [`run`]
+    /// решает, что работы больше нет и машину пора остановить. Задача опроса
+    /// USB не заканчивается никогда — считай её, и `exit` перестал бы
+    /// останавливать систему.
     fn alive(&self) -> usize {
         self.tasks
             .iter()
             .enumerate()
             .filter(|(slot, entry)| {
                 *slot != IDLE_SLOT
-                    && entry.as_ref().is_some_and(|t| t.state != TaskState::Finished)
+                    && entry
+                        .as_ref()
+                        .is_some_and(|t| !t.daemon && t.state != TaskState::Finished)
             })
             .count()
     }
@@ -290,6 +335,24 @@ pub fn spawn(name: &'static str, entry: fn()) -> Result<TaskId, SpawnError> {
     // Точка входа уезжает батуту аргументом: `Context::new` умеет передать
     // ровно одно машинное слово, а `fn()` в него помещается целиком.
     spawn_raw(name, TASK_STACK_SIZE, trampoline, entry as usize)
+}
+
+/// Создать служебную задачу — ту, которая работает, пока работает система, и
+/// сама по себе поводом ей работать не является.
+///
+/// Отличается от [`spawn`] ровно этим: [`alive`] её не считает, и `exit`
+/// останавливает машину, не дожидаясь её завершения — которого и не будет.
+///
+/// # Ошибки
+///
+/// Те же, что у [`spawn`].
+pub fn spawn_daemon(name: &'static str, entry: fn()) -> Result<TaskId, SpawnError> {
+    let id = spawn(name, entry)?;
+    let mut sched = SCHED.lock();
+    if let Some(task) = sched.tasks.iter_mut().flatten().find(|task| task.id == id) {
+        task.daemon = true;
+    }
+    Ok(id)
 }
 
 /// Создать задачу с собственной точкой входа и своим размером стека.
@@ -393,17 +456,107 @@ pub fn result_of(id: TaskId) -> Option<i64> {
 
 /// Дождаться завершения задачи и вернуть её код.
 ///
-/// Ожидание — уступка процессора в цикле, а не блокировка: состояния
-/// «заблокирована» у задач пока нет, и заводить его ради одного ожидающего
-/// значило бы построить половину механизма сна без второй половины —
-/// пробуждения. Цена честная: ждущая задача остаётся в ротации и тратит на
-/// проверку одно сравнение за квант.
-pub fn wait(id: TaskId) -> i64 {
+/// `None` означает, что ждать нечего: задачи с таким номером в таблице нет —
+/// либо не было, либо её слот уже переиспользован. Раньше этот случай выглядел
+/// как вечная уступка процессора, то есть был неотличим от «задача ещё
+/// работает»; с блокировкой он стал бы вечным сном, и потому назван.
+pub fn wait(id: TaskId) -> Option<i64> {
     loop {
-        if let Some(code) = result_of(id) {
-            return code;
+        // Проверка результата и блокировка — под одним локом. Между ними задача
+        // успела бы завершиться, и разбудить ждущего стало бы некому: тот, кто
+        // будит, проходит по таблице ровно один раз, в момент завершения.
+        {
+            let mut sched = SCHED.lock();
+            let found = sched
+                .tasks
+                .iter()
+                .flatten()
+                .find(|task| task.id == id)
+                .map(|task| (task.state, task.result));
+            match found {
+                Some((TaskState::Finished, code)) => return Some(code),
+                None => return None,
+                Some(_) => {
+                    let current = sched.current;
+                    if let Some(task) = sched.tasks[current].as_mut() {
+                        task.state = TaskState::Blocked(Wait::Task(id));
+                    }
+                }
+            }
         }
-        yield_now();
+        schedule();
+    }
+}
+
+/// Уснуть на указанное число миллисекунд.
+///
+/// Округление вверх — до целого тика: вернуться раньше срока хуже, чем
+/// проспать лишние девять миллисекунд. Ноль означает «не спать вовсе», а не
+/// «уступить»: для уступки есть [`yield_now`], и подменять одно другим значит
+/// сделать `sleep(0)` тихо неотличимым от неё.
+pub fn sleep_ms(ms: u64) {
+    if ms == 0 {
+        return;
+    }
+    let hz = u64::from(crate::irq::TIMER_HZ);
+    let ticks = ms.saturating_mul(hz).div_ceil(1000).max(1);
+    sleep_until(crate::irq::ticks().saturating_add(ticks));
+}
+
+/// Уснуть до тика с указанным номером.
+pub fn sleep_until(tick: u64) {
+    {
+        let mut sched = SCHED.lock();
+        if !sched.running {
+            // До запуска планирования спать не на чем и некому: уснувшая
+            // задача — единственная, и будить её будет нечем.
+            return;
+        }
+        let current = sched.current;
+        if let Some(task) = sched.tasks[current].as_mut() {
+            task.state = TaskState::Blocked(Wait::Until(tick));
+        }
+    }
+    schedule();
+}
+
+/// Заблокироваться до события ввода, но не дольше тика `until`.
+///
+/// `changed` вызывается **под локом планировщика**: если он отвечает `true`,
+/// блокировки не происходит. Это и есть защита от потерянного пробуждения:
+/// событие, пришедшее между «очередь пуста» и «я заснул», иначе разбудило бы
+/// того, кто ещё не спит, и ждущий проспал бы до срока. Проверка под локом
+/// закрывает окно целиком — прерывания в нём запрещены, а значит и положить
+/// событие в этот момент некому.
+pub fn block_on_input(until: u64, changed: impl FnOnce() -> bool) {
+    {
+        let mut sched = SCHED.lock();
+        if !sched.running || changed() {
+            return;
+        }
+        let current = sched.current;
+        if let Some(task) = sched.tasks[current].as_mut() {
+            task.state = TaskState::Blocked(Wait::Input(until));
+        }
+    }
+    schedule();
+}
+
+/// Разбудить всех, кто ждёт ввода.
+///
+/// Вызывается драйвером, положившим событие в очередь, — как правило из
+/// обработчика прерывания. Поэтому `try_lock`: обработчик не имеет права ждать
+/// освобождения лока. Неудача здесь не теряет событие, а лишь откладывает
+/// пробуждение до срока, который в [`Wait::Input`] есть всегда именно ради
+/// этого случая.
+pub fn wake_input() {
+    let Some(mut sched) = SCHED.try_lock() else {
+        return;
+    };
+    for task in sched.tasks.iter_mut().flatten() {
+        if matches!(task.state, TaskState::Blocked(Wait::Input(_))) {
+            task.state = TaskState::Ready;
+        }
     }
 }
 
@@ -441,6 +594,11 @@ fn schedule_with(cause: Cause) {
         let mut sched = SCHED.lock();
         if sched.running {
             sched.reap();
+            // Сроки проверяются здесь, а не в обработчике таймера, и это тот же
+            // приём, что и с вытеснением: обработчик обязан быть коротким и не
+            // имеет права ждать лока, а переключение и так происходит на каждом
+            // тике, у которого кончился квант.
+            sched.wake_expired(crate::irq::ticks());
 
             if let Some(next) = sched.pick_next() {
                 let current = sched.current;
@@ -580,6 +738,12 @@ pub fn on_timer_tick() {
         if !sched.running {
             return;
         }
+        // Тик засчитывается той задаче, которую он застал. Холостая считается
+        // отдельно: доля её тиков — единственная мера того, ради чего затевалась
+        // Phase 13d, и мерить её снаружи нечем.
+        if sched.current == IDLE_SLOT {
+            sched.idle_ticks += 1;
+        }
         let left = sched.slice_left.saturating_sub(1);
         if left == 0 {
             sched.slice_left = SLICE_TICKS;
@@ -659,9 +823,15 @@ pub fn run() -> ! {
         sched.running = true;
     }
 
-    // Холостая задача крутится здесь. `schedule()` уводит управление в готовую
-    // задачу и возвращает его сюда только когда готовых больше нет, — то есть
-    // цикл делает столько витков, сколько раз система полностью пустела.
+    // Холостая задача живёт здесь. `schedule()` уводит управление в готовую
+    // задачу и возвращает его сюда только когда готовых больше нет.
+    //
+    // И вот тогда — с Phase 13d — процессор **останавливается** до ближайшего
+    // прерывания, вместо того чтобы крутить этот цикл на полной скорости. Пока
+    // ждать было нечего (все ожидания были уступками в цикле), разница была
+    // незаметна: готовые задачи находились всегда. Теперь спящая задача не
+    // готова, и без остановки холостой цикл жёг бы процессор ровно за тем,
+    // чтобы тридцать два раза в такт убедиться, что делать нечего.
     loop {
         let alive = {
             let sched = SCHED.lock();
@@ -671,6 +841,15 @@ pub fn run() -> ! {
             break;
         }
         schedule();
+
+        // Сюда управление вернулось потому, что готовых задач нет. Гонка между
+        // этой проверкой и остановкой безобидна: прерывание, пришедшее в
+        // промежутке, разбудит задачу, но `wfi`/`hlt` уже начнётся — и
+        // закончится на ближайшем тике таймера, то есть не позже чем через
+        // 10 мс. Закрывать это окно запретом прерываний значило бы городить
+        // `sti; hlt` в одной архитектуре и `wfi` с маской в другой ради
+        // задержки, которой всё равно не видно.
+        arch::wait_for_interrupt();
     }
 
     // Последняя завершившаяся задача уступила процессор холостой, и её стек
@@ -758,6 +937,15 @@ pub fn dump() {
         SLICE_MS,
         sched.forced
     );
+    // Доля простоя — то, ради чего затевалась Phase 13d. До неё она была нулём
+    // при любой нагрузке: ждущие задачи уступали процессор, а не спали, и
+    // готовая задача находилась всегда.
+    let ticks = crate::irq::ticks();
+    let percent = if ticks == 0 { 0 } else { sched.idle_ticks * 100 / ticks };
+    kprintln!(
+        "  idle       : {}% of {ticks} tick(s) with nothing to run",
+        percent
+    );
 }
 
 /// Батут, с которого начинается любая задача.
@@ -796,15 +984,21 @@ pub fn exit_current_with(result: i64) -> ! {
     {
         let mut sched = SCHED.lock();
         let current = sched.current;
+        let mut id = TaskId::IDLE;
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Finished;
             task.result = result;
+            id = task.id;
             // Программы у завершившейся задачи больше нет, и её адресное
             // пространство разобрано вызывающим. Отметку надо снять здесь же:
             // иначе ближайшее переключение попыталось бы поставить процессору
             // корень, которого уже не существует.
             task.user = UserMachine::default();
         }
+        // Разбудить тех, кто ждал именно эту задачу. Проход по таблице ровно
+        // один и ровно здесь: другого момента, когда задача становится
+        // завершённой, не существует.
+        sched.wake_waiters(id);
     }
 
     schedule();

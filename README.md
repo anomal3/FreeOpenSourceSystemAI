@@ -350,6 +350,59 @@ the pool page by page, the file table closes what the program left open, and the
 with a code of its own — `-13`, distinct from the `-1` of a program the kernel killed for
 misbehaving. The two are not the same event and should not print the same line.
 
+### Waiting
+
+Up to here nothing in the system actually waited. Every wait was a loop that gave up the
+processor and got it straight back: `wait` for a task, the shell between keystrokes,
+`/bin/count` measuring out a pause. The machine was busy at all times, and the only reason
+that looked acceptable is that there was never anyone else to give the time to.
+
+`/bin/nap` asks to sleep for three seconds and `tasks` answers with the point of the phase:
+
+```
+nap 6: sleeping 3000 ms, asking for nothing
+freeos> tasks
+  #4 usb      blocked    20 switches (0 forced), stack held
+  #5 shell    running   112 switches (3 forced), stack held
+  #6 program  blocked     3 switches (2 forced), stack held
+  idle       : 34% of 288 tick(s) with nothing to run
+```
+
+`blocked`, not `ready` — the task is out of the rotation until its tick comes round, and the
+line under it says what that buys: a third of all ticks (61% on ARM, 80% in a release build)
+found the machine with nothing to run, where before the number would have been zero by
+construction. What is left is mostly the compositor: the status window redraws twice a second,
+and in a debug build under emulation that is not cheap.
+
+`TaskState` gained the one variant a comment in it has been promising since Phase 4, and
+picking the next task did not change a line — it selects `Ready`, so a blocked task fell out
+of the rotation by itself. Three things can be waited for: a tick (`sleep`), another task
+ending, an input event.
+
+Every wait but one carries a deadline, and that is a safety property rather than a
+convenience. A sleeper is woken by the timer, a waiter by the task it waits on — both by code
+that can take the scheduler's lock. Input arrives in an interrupt handler, which may not wait
+for a lock and so may fail to wake anyone. Without a deadline a lost wakeup is a task that
+hangs for good; with one it is a delay no longer than the deadline.
+
+The other half of that problem is the wakeup that arrives *before* the sleep. Between "the
+queue is empty" and "I am asleep" an interrupt can deliver a key, wake nobody, and leave the
+shell asleep with a keystroke already waiting. So the input path counts every event, and the
+shell reads that counter before draining the queue and hands the scheduler a check to run
+under its lock: if the count moved, do not sleep. Inside that lock interrupts are disabled,
+so there is no third case.
+
+Two consequences fell out that were not in the plan. The first: xHCI has no interrupt here,
+its reports are polled — and the polling lived in the shell. A shell that sleeps until input
+arrives would have been waiting for events that only its own polling could produce. Polling
+moved into a task of its own with its own clock. The second: that task never ends, and `run`
+stops the machine when no task is left — so tasks now say whether they are the reason the
+system keeps running. The USB poller says no, and `exit` still halts.
+
+The idle task itself no longer spins either. When nothing is ready it stops the processor
+(`hlt`, `wfi`) until an interrupt, which is what makes all of the above visible from outside
+the emulator rather than only in a counter.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -358,12 +411,14 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Eleven scenarios today: a program runs in an address space of its own, one that faults is
+Twelve scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
 (`preempt`); a program that never ends is stopped by name and its window returns to the pool,
-while the shell and a task that is not a program are refused (`kill`);
+while the shell and a task that is not a program are refused (`kill`); a sleeping program
+shows up as `blocked` rather than `ready` and the machine reports time with nothing to run
+(`sleep`);
 the system boots and the shell answers (`boot`); keys arrive over
 xHCI and USB HID rather than PS/2 (`keyboard`, which switches `i8042` off, since `sendkey`
 reaches exactly one keyboard and QEMU picks PS/2 when both are attached); the start menu
@@ -550,6 +605,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 13a | A program is a task: its own kernel stack, address space and files; two at once | **done** |
 | 13b | Preemption: a program that never yields no longer owns the machine | **done** |
 | 13c | `kill`: a program that never ends can be stopped, and its memory comes back | **done** |
+| 13d | Waiting stops burning the processor: blocked tasks, `sleep`, an idle CPU | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

@@ -403,6 +403,15 @@ fn run_session(have_input: bool) -> ! {
         sched::STACK_GUARD_SIZE / 1024
     );
 
+    // Опрос xHCI — отдельная задача: оболочка, научившаяся спать в ожидании
+    // ввода, больше не может опрашивать контроллер, который этот ввод и
+    // порождает (см. `usb::xhci::poll_task`).
+    if usb::xhci::is_present() {
+        if let Err(err) = sched::spawn_daemon("usb", usb::xhci::poll_task) {
+            kprintln!("  spawn usb poll failed: {err}");
+        }
+    }
+
     if have_input {
         if let Err(err) = sched::spawn("shell", shell::task) {
             kprintln!("  spawn shell failed: {err}");

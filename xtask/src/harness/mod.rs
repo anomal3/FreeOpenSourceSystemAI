@@ -317,23 +317,44 @@ fn play(
     // положение — середина экрана: так его ставит ядро.
     let mut pointer: Option<(i32, i32)> = None;
 
+    // Число, захваченное `Step::Capture`, — например номер задачи, который
+    // система назвала сама. Подставляется вместо `{}` в текст последующих шагов.
+    let mut captured: Option<String> = None;
+    let fill = |text: &str, captured: &Option<String>| -> String {
+        match captured {
+            Some(value) => text.replace("{}", value),
+            None => text.to_string(),
+        }
+    };
+
     for (index, step) in scenario.steps.iter().enumerate() {
         let at = started.elapsed().as_millis();
         match step {
             Step::Await(needle, timeout_ms) => {
+                let needle = fill(needle, &captured);
                 println!("  [{at:>6} мс] шаг {index}: ждём {needle:?}");
-                line.wait_for(needle, Duration::from_millis(*timeout_ms))
+                line.wait_for(&needle, Duration::from_millis(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
             }
+            Step::Capture(prefix, timeout_ms) => {
+                println!("  [{at:>6} мс] шаг {index}: ждём {prefix:?} и запоминаем число за ним");
+                let value = line
+                    .capture_number(prefix, Duration::from_millis(*timeout_ms))
+                    .with_context(|| format!("шаг {index}"))?;
+                println!("  [{at:>6} мс] шаг {index}: запомнено {value:?}");
+                captured = Some(value);
+            }
             Step::Expect(needle) => {
+                let needle = fill(needle, &captured);
                 println!("  [{at:>6} мс] шаг {index}: проверяем {needle:?}");
-                if !line.seen(needle) {
+                if !line.seen(&needle) {
                     bail!("шаг {index}: в выводе нет {needle:?}");
                 }
             }
             Step::Absent(needle) => {
+                let needle = fill(needle, &captured);
                 println!("  [{at:>6} мс] шаг {index}: проверяем отсутствие {needle:?}");
-                if line.seen(needle) {
+                if line.seen(&needle) {
                     bail!("шаг {index}: в выводе встретилось {needle:?}, чего быть не должно");
                 }
             }
@@ -357,8 +378,9 @@ fn play(
                 }
             }
             Step::Line(text) => {
+                let text = fill(text, &captured);
                 println!("  [{at:>6} мс] шаг {index}: в линию {text:?}");
-                line.write_line(text).with_context(|| format!("шаг {index}"))?;
+                line.write_line(&text).with_context(|| format!("шаг {index}"))?;
             }
             Step::Raw(bytes) => {
                 println!("  [{at:>6} мс] шаг {index}: в линию {bytes:02x?}");

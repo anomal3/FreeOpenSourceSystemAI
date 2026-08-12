@@ -27,7 +27,7 @@ use user_abi::{
     ERR_BAD_ADDRESS, ERR_BAD_FD, ERR_BAD_PATH, ERR_IO, ERR_NOT_FOUND, ERR_NO_FILESYSTEM,
     ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_PERMISSION, ERR_TOO_MANY_FILES, ERR_UNSUPPORTED, FD_STDOUT,
     KIND_DIRECTORY, KIND_FILE, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN,
-    SYS_READ, SYS_STAT, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    SYS_READ, SYS_SLEEP, SYS_STAT, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
 };
 
 use crate::mm::PageFlags;
@@ -58,17 +58,19 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
             // SAFETY: контракт функции.
             unsafe { crate::arch::return_to_kernel(a0 as i64) }
         }
+        SYS_SLEEP => {
+            // Спящая программа выходит из ротации до срока. Ограничения на
+            // длительность нет намеренно: программа, попросившая проспать год,
+            // не занимает ничего, кроме своего слота в таблице, — а слот у неё
+            // и так есть.
+            sched::sleep_ms(a0 as u64);
+            0
+        }
         SYS_YIELD => {
-            // Планировщик кооперативный: без этого вызова программа, считающая
-            // в цикле, не отдала бы процессор никому.
-            //
-            // Задачи ядра, которым он достаётся, продолжают работать, пока в
-            // регистре страниц стоит корень **программы**: своей задачи у неё
-            // нет, а переключать адресное пространство при смене задач было бы
-            // нечему. Это безопасно ровно потому, что корень программы —
-            // копия ядерного и содержит все его отображения; а всё, что ядро
-            // отображает на ходу, идёт в его собственное дерево, а не в
-            // активное (см. `arch::kernel_root`).
+            // Уступка оставляет программу готовой к исполнению, в отличие от
+            // `SYS_SLEEP`: она отдаёт очередь, а не выходит из неё. Своего
+            // адресного пространства это не касается — с Phase 13a его
+            // переставляет само переключение задач.
             sched::yield_now();
             0
         }
