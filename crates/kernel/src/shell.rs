@@ -314,7 +314,7 @@ fn run_command(line: &str) -> bool {
         "whoami" => whoami(),
         "run" => {
             if argument.is_empty() {
-                sprintln!("  usage: run <path>");
+                sprintln!("  usage: run [-b] <path>");
             } else {
                 run_program(argument);
             }
@@ -340,7 +340,7 @@ fn help() {
     sprintln!("  cat <path>    print a file, up to {CAT_LIMIT} bytes");
     sprintln!("  echo <text>   print the text back");
     sprintln!("  whoami        the identity programs are run with");
-    sprintln!("  run <path>    load an ELF and run it outside the kernel");
+    sprintln!("  run [-b] <p>  run a program outside the kernel; -b does not wait");
     sprintln!("  clear         clear the window");
     sprintln!("  exit          finish the boot and halt");
 }
@@ -421,19 +421,31 @@ fn whoami() {
     sprintln!("  programs run with these credentials; the shell itself runs in the kernel");
 }
 
-/// Загрузить и запустить программу вне ядра.
+/// Запустить программу вне ядра.
 ///
-/// Оболочка на время работы программы стоит: планировщик кооперативный, и
-/// «запустить в фоне» означало бы сначала завести настоящий процесс со своим
-/// состоянием. Программа при этом уступает процессор системным вызовом, так что
-/// остальные задачи не останавливаются.
-fn run_program(path: &str) {
-    match user::run(path) {
-        Ok(code) => {
-            if code == user_abi::EXIT_FAULTED {
-                sprintln!("  {path}: killed by the kernel, see the serial log");
+/// Программа исполняется отдельной задачей, поэтому «в фоне» — это не режим, а
+/// просто отсутствие ожидания: с `-b` оболочка возвращает приглашение сразу и
+/// продолжает отвечать, пока программа считает. Без `-b` она ждёт завершения,
+/// уступая процессор, — то есть ждёт так же, как ждала бы любая другая задача.
+///
+/// Строку об окончании печатает сама задача программы, а не оболочка: у
+/// фоновой программы к тому моменту никакой оболочки может уже и не быть.
+fn run_program(argument: &str) {
+    let (path, background) = match argument.strip_prefix("-b ") {
+        Some(rest) => (rest.trim(), true),
+        None => (argument, false),
+    };
+    if path.is_empty() {
+        sprintln!("  usage: run [-b] <path>");
+        return;
+    }
+
+    match user::spawn(path) {
+        Ok(id) => {
+            if background {
+                sprintln!("  {path}: started as {id}");
             } else {
-                sprintln!("  {path}: exited with code {code}");
+                sched::wait(id);
             }
         }
         Err(err) => sprintln!("  {path}: {err}"),

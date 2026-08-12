@@ -27,9 +27,9 @@ use core::fmt::Write as _;
 
 use user_abi::{
     ERR_BAD_ADDRESS, ERR_BAD_FD, ERR_BAD_PATH, ERR_IO, ERR_NOT_FOUND, ERR_NO_FILESYSTEM,
-    ERR_NO_SYSCALL, ERR_PERMISSION, ERR_TOO_MANY_FILES, ERR_UNSUPPORTED, FD_STDOUT, KIND_DIRECTORY,
-    KIND_FILE, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETUID, SYS_OPEN, SYS_READ, SYS_STAT,
-    SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_PERMISSION, ERR_TOO_MANY_FILES, ERR_UNSUPPORTED, FD_STDOUT,
+    KIND_DIRECTORY, KIND_FILE, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN,
+    SYS_READ, SYS_STAT, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
 };
 
 use crate::mm::PageFlags;
@@ -37,7 +37,7 @@ use crate::vfs::perm::Access;
 use crate::vfs::{NodeKind, VfsError};
 use crate::{irq, sched};
 
-use super::files::{self, FileError};
+use super::files::FileError;
 use super::space;
 
 /// Самый длинный путь, который ядро согласно принять от программы.
@@ -81,6 +81,11 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_STAT => stat(a0, a1, a2),
         SYS_GETUID => i64::from(super::session::credentials().uid),
         SYS_GETGID => i64::from(super::session::credentials().gid),
+        // Программа — это задача, и её номер тот же, что видит `tasks` в
+        // оболочке. Отдельного пространства номеров процессов не заводится:
+        // второе пространство имён для тех же объектов пришлось бы всё время
+        // сопоставлять с первым.
+        SYS_GETPID => i64::from(sched::current().as_u32()),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -123,9 +128,11 @@ fn open(ptr: usize, len: usize) -> i64 {
         Err(err) => return err,
     };
 
-    match files::open(path) {
-        Ok(fd) => fd as i64,
-        Err(err) => errno(err),
+    let cred = super::session::credentials();
+    match super::with_current(|program| program.files.open(cred, path)) {
+        Some(Ok(fd)) => fd as i64,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
     }
 }
 
@@ -145,17 +152,19 @@ fn read(fd: usize, ptr: usize, len: usize) -> i64 {
     // только ядро, а оно сейчас здесь.
     let buffer = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
 
-    match files::read(fd, buffer) {
-        Ok(read) => read as i64,
-        Err(err) => errno(err),
+    match super::with_current(|program| program.files.read(fd, buffer)) {
+        Some(Ok(read)) => read as i64,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
     }
 }
 
 /// `close(fd)`.
 fn close(fd: usize) -> i64 {
-    match files::close(fd) {
-        Ok(()) => 0,
-        Err(err) => errno(err),
+    match super::with_current(|program| program.files.close(fd)) {
+        Some(Ok(())) => 0,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
     }
 }
 

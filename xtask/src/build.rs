@@ -169,7 +169,7 @@ pub fn build_component(component: Component, arch: Arch, release: bool) -> Resul
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 4] = ["hello", "crash", "peek", "perms"];
+pub const USER_PROGRAMS: [&str; 5] = ["hello", "crash", "peek", "perms", "count"];
 
 /// Собрать программы, исполняющиеся вне ядра.
 ///

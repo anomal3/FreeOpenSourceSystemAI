@@ -49,10 +49,27 @@ pub use x86_64::build_kernel_address_space;
 pub use aarch64::build_kernel_address_space;
 
 /// Уйти в пользовательский режим и вернуться с кодом завершения программы.
+///
+/// [`swap_user_return_stack`] переставляет то, что процессор помнит о
+/// возвращении из третьего кольца: значение принадлежит задаче, и планировщик
+/// меняет его вместе с ней.
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::user::{enter_user, return_to_kernel};
+pub use x86_64::user::{enter_user, return_to_kernel, swap_user_return_stack};
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::user::{enter_user, return_to_kernel};
+pub use aarch64::user::{enter_user, return_to_kernel, swap_user_return_stack};
+
+/// Куда процессор переключит стек при входе в ядро из третьего кольца.
+///
+/// На x86-64 это поле `RSP0` в TSS. На AArch64 отдельного поля нет вовсе:
+/// ловушка приходит на `SP_EL1`, а он и есть стек текущей задачи в кольце ядра,
+/// и переставляет его само переключение контекста. Поэтому здесь пусто — но имя
+/// существует, чтобы планировщик не знал об этой разнице.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::gdt::set_trap_stack;
+
+/// См. документацию x86-64 варианта выше.
+#[cfg(target_arch = "aarch64")]
+pub fn set_trap_stack(_top: usize) {}
 
 /// Добавить отображение в уже активное адресное пространство ядра.
 ///

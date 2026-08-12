@@ -8,9 +8,10 @@ An open operating system written from scratch in Rust, targeting **ARM64** and *
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
 > loads an ELF into page tables built for that run alone, jumps to ring 3 (EL0), and takes
 > the whole space apart when the program ends — including when it ends by faulting. And
-> those programs now **open files under the account the system was installed with**: the
+> those programs **open files under the account the system was installed with**: the
 > `mode`, `uid` and `gid` on disk decide what they may read, path component by path
-> component. On both architectures.
+> component. A program is a scheduler task, so several run at once while the shell keeps
+> answering. On both architectures.
 
 ## Why
 
@@ -226,9 +227,41 @@ Two boundaries are worth stating plainly:
   into its own code would have faulted inside the kernel — a program stopping the machine.
   Every user pointer is now resolved through the tables from Phase 12b before a byte moves.
 
-Still ahead: **programs as tasks**. A program runs inside the `run` call; the shell waits for
-it, and a second `run` before the first returns is refused. A process with state of its own,
-that can be preempted and resumed, is the next piece.
+### A program is a task
+
+`run -b /bin/count` twice, and the log interleaves:
+
+```
+count 8: tick 1 of 5 at 4200 ms
+count 9: tick 1 of 5 at 4600 ms
+count 8: tick 2 of 5 at 5090 ms
+count 9: tick 2 of 5 at 5400 ms
+```
+
+Two programs, each in its own address space, at the same virtual addresses, taking turns —
+and the shell answers commands while they run. The number each prints is its task id, the
+one `tasks` shows: a program *is* a scheduler task, so a second namespace for the same
+objects was not invented.
+
+Everything that used to exist once per system is now state of a task: the kernel stack, the
+page-table root, the table of open files, and the stack a trap from ring 3 lands on. That
+last one is why this phase touched both architecture layers. On x86-64 `TSS.RSP0` used to
+point at one global stack; two programs would have put one trap frame on top of another, so
+it now points into the running task's own kernel stack. On ARM the kernel ran on `SP_EL0`
+with `SP_EL1` reserved for handlers, which stopped working for a subtler reason: switching
+tasks from inside a trap handler would write one task's `SP_EL0` into `SP_EL1`. The kernel
+now runs on `SP_EL1` throughout, exactly as Linux does on arm64, and `SP_EL0` belongs to the
+program alone — which also means it had to become part of the saved context.
+
+That trade cost something, and it is worth naming: the ARM handler no longer starts on a
+stack of its own, so an overflow of the *boot* stack — the only one with a genuinely
+unmapped guard page — will now fault while trying to report the fault, and hang instead of
+printing. Task stacks are unaffected (their overflow is caught by a painted guard band at
+the next context switch), and on x86-64 the same case is still covered by the IST.
+
+Still ahead: **preemption**. The scheduler is cooperative, so a program that never makes a
+system call runs until it finishes. The timer already ticks and the scheduler has had the
+hook since Phase 4.
 
 ## The test bench
 
@@ -423,7 +456,8 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 12a | Userspace: ELF loader, ring 3 / EL0, system calls, a faulting program is killed | **done** |
 | 12b | An address space per program: the kernel root cloned, switched, and torn down at exit | **done** |
 | 12c | File system calls, and `mode`/`uid`/`gid` checked against the program asking | **done** |
-| 13 | Programs as tasks: state of their own, preemption, more than one at a time | next |
+| 13a | A program is a task: its own kernel stack, address space and files; two at once | **done** |
+| 13b | Preemption: a program that never yields no longer owns the machine | next |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

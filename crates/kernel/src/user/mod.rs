@@ -25,16 +25,20 @@
 //! * две программы не делят ничего, даже когда живут по одним и тем же
 //!   виртуальным адресам.
 //!
+//! С Phase 13a программа — это **задача планировщика**. У неё свой стек ядра,
+//! своё адресное пространство, своя таблица открытых файлов и свой номер, тот
+//! же, что показывает `tasks`. Программ поэтому бывает несколько сразу: пока
+//! одна считает, вторая печатает, а оболочка отвечает на команды. Всё, что
+//! раньше существовало в одном экземпляре на систему, стало состоянием задачи —
+//! от таблицы дескрипторов до стека, на который приходит ловушка из третьего
+//! кольца (см. [`sched::UserMachine`]).
+//!
 //! # Чего здесь пока нет
 //!
-//! **Настоящего процесса.** Программа исполняется внутри вызова [`run`]:
-//! оболочка ждёт её завершения, планировщик о ней ничего не знает, и запустить
-//! вторую, не дождавшись первой, нельзя — попытка отвергается
-//! [`Error::AlreadyRunning`]. Отсюда же и тонкость с `yield`: уступив процессор
-//! системным вызовом, программа отдаёт его задачам ядра, а те продолжают
-//! работать, пока в регистре страниц стоит **её** корень. Это безопасно ровно
-//! потому, что копия содержит все отображения ядра, а всё, что ядро отображает
-//! на ходу, идёт в его собственное дерево (см. `arch::kernel_root`).
+//! **Вытеснения.** Планировщик кооперативный: программа отдаёт процессор
+//! системным вызовом, и программа, которая не делает ни одного, считает, пока
+//! не кончится. Таймер при этом тикает, и вытеснение — следующая фаза, а не
+//! отдельная конструкция: планировщик к нему готов с Phase 4.
 //!
 //! **Настоящего входа в систему.** Личность сеанса берётся из `/etc/passwd`
 //! ([`session`]) и не проверяется паролем: спросить пароль, не показав его на
@@ -55,12 +59,14 @@ pub mod session;
 pub mod space;
 pub mod syscall;
 
+use core::fmt::Write as _;
+
 use alloc::vec::Vec;
 
 use crate::mm::{FrameAllocator, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 use crate::sync::SpinLock;
 use crate::vfs::perm::Access;
-use crate::{arch, kprintln};
+use crate::{arch, kprintln, sched};
 
 use space::Space;
 
@@ -111,8 +117,11 @@ pub enum Error {
     Map(crate::mm::MapError),
     /// Страница получилась одновременно записываемой и исполняемой.
     WriteExecute(usize),
-    /// Программа уже исполняется.
+    /// Задача уже исполняет программу. Вложенного входа в третье кольцо не
+    /// бывает: стек возврата у задачи один, и второй вход затёр бы его.
     AlreadyRunning,
+    /// В таблице планировщика нет места под ещё одну задачу.
+    TooManyTasks,
 }
 
 impl core::fmt::Display for Error {
@@ -127,20 +136,59 @@ impl core::fmt::Display for Error {
                 f,
                 "page {page} of the image would be writable and executable at once"
             ),
-            Self::AlreadyRunning => f.write_str("another program is already running"),
+            Self::AlreadyRunning => f.write_str("this task already runs a program"),
+            Self::TooManyTasks => f.write_str("the task table is full"),
         }
     }
 }
 
-/// Исполняется ли сейчас пользовательская программа.
+/// Программа, привязанная к задаче планировщика.
 ///
-/// Нужно двоим. Обработчику отказов: исключение из третьего кольца снимает
-/// программу, но только если она действительно запущена, — отказ «из третьего
-/// кольца» в момент, когда никакой программы нет, означает испорченное
-/// состояние процессора, и возвращаться в этом случае некуда. И самому [`run`]:
-/// вход в третье кольцо вложенным не бывает, потому что вершина стека ядра
-/// запоминается в одном месте на всю систему, и второй вход затёр бы её.
-static RUNNING: SpinLock<bool> = SpinLock::new(false);
+/// Всё, что раньше существовало в одном экземпляре на систему: адресное
+/// пространство, таблица открытых файлов и признак «сейчас исполняется код в
+/// третьем кольце». Каждое из них — состояние программы, а программ теперь
+/// столько же, сколько задач, которые их запустили.
+pub struct Program {
+    space: Space,
+    /// Открытые файлы. Публично, потому что ими распоряжаются системные вызовы
+    /// ([`syscall`]), а прятать таблицу за парой одинаковых методов означало бы
+    /// переписать её интерфейс дважды.
+    pub files: files::Table,
+    /// Исполняется ли прямо сейчас код в третьем кольце.
+    ///
+    /// Нужно обработчику отказов: исключение «из третьего кольца» снимает
+    /// программу, но только если она действительно там. Отказ в момент, когда
+    /// программы нет, означает испорченное состояние процессора, и возвращаться
+    /// в этом случае некуда.
+    running: bool,
+}
+
+/// Программы по слотам задач планировщика.
+///
+/// Таблица, а не поле задачи, и это разделение обязанностей: планировщику от
+/// программы нужны три машинных числа ([`sched::UserMachine`]), которые он
+/// обязан переставлять сам, а всё остальное — дело этого модуля, и знать о нём
+/// планировщику незачем.
+static PROGRAMS: SpinLock<[Option<Program>; sched::MAX_TASKS]> =
+    SpinLock::new([const { None }; sched::MAX_TASKS]);
+
+/// Сделать что-нибудь с программой текущей задачи.
+///
+/// `None`, если задача программы не исполняет, — например, когда системный
+/// вызов пришёл неизвестно откуда.
+pub fn with_current<R>(f: impl FnOnce(&mut Program) -> R) -> Option<R> {
+    // Слот спрашивается до захвата лока: так два лока никогда не удерживаются
+    // одновременно, и порядок их взятия перестаёт быть вопросом.
+    let slot = sched::current_slot();
+    let mut table = PROGRAMS.lock();
+    table.get_mut(slot).and_then(Option::as_mut).map(f)
+}
+
+/// Корень таблиц страниц программы текущей задачи.
+#[must_use]
+pub fn current_space_root() -> Option<PhysAddr> {
+    with_current(|program| program.space.root())
+}
 
 /// Виртуальный адрес кадра в прямом отображении — через него ядро пишет в
 /// память программы.
@@ -339,14 +387,10 @@ fn report(space: &Space, entry: usize) {
     }
 }
 
-/// Загрузить программу по пути и исполнить её.
+/// Загрузить программу по пути и исполнить её в текущей задаче.
 ///
 /// Возвращает код, с которым программа завершилась.
-pub fn run(path: &str) -> Result<i64, Error> {
-    if is_running() {
-        return Err(Error::AlreadyRunning);
-    }
-
+fn run(path: &str) -> Result<i64, Error> {
     // Право исполнить спрашивается до чтения файла, и спрашивается от имени
     // сеанса. Это тот же вопрос, который в Unix задаёт `execve`, и задавать его
     // обязано ядро: программа, которой не дали бы прочитать файл, не должна
@@ -360,45 +404,213 @@ pub fn run(path: &str) -> Result<i64, Error> {
     };
     let bytes = read_image(&*node)?;
 
-    // Пространство живёт до конца функции и разбирается своим `Drop` — на обоих
-    // путях выхода, включая тот, которым возвращается снятая отказом программа.
     let mut space = Space::new().map_err(Error::Map)?;
     let entry = load(&mut space, &bytes)?;
+    let root = space.root();
 
     // Вершина стека выравнивается на 16: этого требуют оба соглашения о
     // вызовах, и невыровненный стек ломается не сразу, а на первой же операции
     // с вектором.
     let stack = STACK_TOP - 16;
 
+    let id = sched::current();
     kprintln!(
-        "  user        : '{path}' as {cred}, entry {entry:#018x}, stack {stack:#018x}"
+        "  user        : {id} '{path}' as {cred}, entry {entry:#018x}, stack {stack:#018x}"
     );
     report(&space, entry);
 
-    *RUNNING.lock() = true;
-    // SAFETY: возврат на таблицы ядра — следующая же строка после выхода из
-    // программы, то есть до того, как `space` будет разобрано.
-    unsafe { space.activate() };
+    let slot = sched::current_slot();
+    {
+        let mut table = PROGRAMS.lock();
+        let Some(entry) = table.get_mut(slot) else {
+            return Err(Error::AlreadyRunning);
+        };
+        if entry.is_some() {
+            // Задача уже исполняет программу. Вложенного входа в третье кольцо
+            // не бывает: стек возврата у задачи один, и второй вход затёр бы
+            // его.
+            return Err(Error::AlreadyRunning);
+        }
+        *entry = Some(Program { space, files: files::Table::new(), running: true });
+    }
+
+    // Планировщик узнаёт о пространстве до того, как процессор на него
+    // переключится: между этими двумя строками задача не сменится (переключение
+    // происходит только по её собственной уступке), а порядок «сначала знание,
+    // потом действие» переживёт появление вытеснения.
+    sched::set_current_space(Some(root));
+    // SAFETY: корень построен копией ядерного и содержит все его отображения;
+    // возврат на таблицы ядра — сразу после выхода из программы, до того как
+    // пространство будет разобрано.
+    unsafe { arch::activate_space(root) };
+
     // SAFETY: точка входа и стек лежат в окне, только что отображённом
-    // доступным из пользовательского режима; `TSS.RSP0` (x86-64) выставлен при
-    // инициализации GDT, `SP_EL1` (AArch64) — при настройке векторов.
+    // доступным из пользовательского режима; стек ловушки выставит сам вход в
+    // третье кольцо.
     let code = unsafe { arch::enter_user(entry, stack) };
+
     // Сюда возвращаются оба пути: и `exit`, и снятие программы после отказа.
     // SAFETY: таблицы ядра активированы при запуске системы и никуда не делись
     // — пространство программы построено их копией.
-    unsafe { Space::leave() };
-    *RUNNING.lock() = false;
+    unsafe { arch::activate_kernel_space() };
+    sched::set_current_space(None);
 
-    // Дескрипторы закрываются здесь, а не там, где программа их открывала:
-    // закрыть их сама она не обязана, а снятая отказом — и не могла. Открытый
-    // файл, доставшийся следующей программе, был бы доступом, права на который
-    // проверялись не для неё.
-    let leaked = files::close_all();
+    // Программа забирается из таблицы и уничтожается здесь: `Drop` её
+    // пространства возвращает окно в пул кадров, а таблица дескрипторов
+    // закрывает всё, что программа не закрыла сама. Снятая отказом закрыть их и
+    // не могла.
+    let leaked = {
+        let mut table = PROGRAMS.lock();
+        table.get_mut(slot).and_then(Option::take)
+    }
+    .map_or(0, |program| program.files.open_count());
     if leaked > 0 {
         kprintln!("  user        : closed {leaked} file(s) the program left open");
     }
 
     Ok(code)
+}
+
+/// Сколько стека ядра отводится задаче, исполняющей программу.
+///
+/// Вдвое больше обычной задачи, и не про запас. На этом стеке лежит всё сразу:
+/// разбор ELF, кадр входа в третье кольцо, кадр ловушки от каждого системного
+/// вызова и весь путь вывода — от `write` до перерисовки окна оболочки. Раньше
+/// последние два жили на отдельном общем стеке ловушек; с появлением второй
+/// программы общий стек перестал быть возможен (см. [`sched::UserMachine`]), и
+/// глубина переехала сюда.
+const PROGRAM_STACK_SIZE: usize = 64 * 1024;
+
+/// Путь к программе в том виде, в каком его получает новая задача.
+///
+/// Массив, а не `String`: аргумент задачи — одно машинное слово, значит путь
+/// уезжает через кучу, а выделение под него обязано уметь отказать вместо
+/// паники. `String::into_boxed_str` этого не умеет.
+#[repr(C)]
+struct Request {
+    path: [u8; MAX_PATH],
+    len: usize,
+}
+
+/// Самый длинный путь, который принимает [`spawn`].
+const MAX_PATH: usize = 255;
+
+/// Запустить программу отдельной задачей.
+///
+/// Возвращает идентификатор задачи — по нему её можно дождаться
+/// ([`sched::wait`]) или просто оставить работать. Именно здесь программа
+/// перестала быть вызовом внутри оболочки: у неё своя задача, свой стек ядра,
+/// своё адресное пространство и свои открытые файлы, и пока она считает,
+/// оболочка отвечает.
+pub fn spawn(path: &str) -> Result<sched::TaskId, Error> {
+    if path.len() > MAX_PATH {
+        return Err(Error::Read(crate::vfs::VfsError::BadPath));
+    }
+
+    let layout = core::alloc::Layout::new::<Request>();
+    // SAFETY: `Request` непустой, поэтому размер положителен. Глобальный
+    // аллокатор ядра при нехватке памяти возвращает null, а не паникует.
+    let raw = unsafe { alloc::alloc::alloc(layout) }.cast::<Request>();
+    if raw.is_null() {
+        return Err(Error::OutOfMemory);
+    }
+    let mut request = Request { path: [0; MAX_PATH], len: path.len() };
+    request.path[..path.len()].copy_from_slice(path.as_bytes());
+    // SAFETY: блок только что выделен под `Request` с нужными размером и
+    // выравниванием и никому больше не принадлежит.
+    unsafe { core::ptr::write(raw, request) };
+
+    match sched::spawn_raw("program", PROGRAM_STACK_SIZE, program_entry, raw as usize) {
+        Ok(id) => Ok(id),
+        Err(err) => {
+            // Задачи не будет — значит некому и разобрать запрос.
+            // SAFETY: блок выделен этим же аллокатором и этим же `Layout`,
+            // ссылок на него больше нет.
+            unsafe { alloc::alloc::dealloc(raw.cast::<u8>(), layout) };
+            Err(match err {
+                sched::SpawnError::OutOfMemory => Error::OutOfMemory,
+                sched::SpawnError::TooManyTasks => Error::TooManyTasks,
+            })
+        }
+    }
+}
+
+/// Точка входа задачи, исполняющей программу.
+extern "C" fn program_entry(arg: usize) -> ! {
+    // Задача начинает исполняться с запрещёнными прерываниями: их запретил
+    // планировщик перед переключением, и вернуть «как было» здесь некому. Тот
+    // же инвариант, что у обычного батута задач.
+    arch::interrupts::enable();
+
+    // SAFETY: `arg` — указатель, выделенный в `spawn` и переданный ровно один
+    // раз ровно этой задаче.
+    let request = unsafe { alloc::boxed::Box::from_raw(arg as *mut Request) };
+    let path = core::str::from_utf8(&request.path[..request.len]).unwrap_or("");
+
+    let code = match run(path) {
+        Ok(code) => {
+            if code == user_abi::EXIT_FAULTED {
+                report_line(path, "killed by the kernel, see the serial log");
+            } else {
+                let text = CodeText::new(code);
+                report_line(path, text.as_str());
+            }
+            code
+        }
+        Err(err) => {
+            let _ = write!(&mut crate::shell::Out, "  {} {path}: {err}\n", sched::current());
+            user_abi::EXIT_FAULTED
+        }
+    };
+
+    sched::exit_current_with(code)
+}
+
+/// Напечатать в окно оболочки строку об окончании программы.
+fn report_line(path: &str, what: &str) {
+    let _ = write!(&mut crate::shell::Out, "  {} {path}: {what}\n", sched::current());
+}
+
+/// Текст «exited with code N» без выделения памяти.
+///
+/// Печатать код возврата приходится из задачи программы, а форматирование в
+/// `String` требовало бы кучи ровно там, где программа только что могла её
+/// исчерпать.
+struct CodeText {
+    buffer: [u8; 32],
+    len: usize,
+}
+
+impl CodeText {
+    fn new(code: i64) -> Self {
+        let mut this = Self { buffer: [0; 32], len: 0 };
+        let mut out = CodeWriter { text: &mut this };
+        let _ = write!(&mut out, "exited with code {code}");
+        this
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buffer[..self.len]).unwrap_or("exited")
+    }
+}
+
+/// Приёмник для `write!`, складывающий байты в [`CodeText`].
+struct CodeWriter<'a> {
+    text: &'a mut CodeText,
+}
+
+impl core::fmt::Write for CodeWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for byte in s.bytes() {
+            if self.text.len == self.text.buffer.len() {
+                return Err(core::fmt::Error);
+            }
+            let at = self.text.len;
+            self.text.buffer[at] = byte;
+            self.text.len += 1;
+        }
+        Ok(())
+    }
 }
 
 /// Границы памяти, доступной программе.
@@ -421,10 +633,10 @@ pub fn owns(ptr: usize, len: usize) -> bool {
     in_image || in_stack
 }
 
-/// Исполняется ли сейчас программа.
+/// Исполняет ли текущая задача код в третьем кольце.
 #[must_use]
 pub fn is_running() -> bool {
-    *RUNNING.lock()
+    with_current(|program| program.running).unwrap_or(false)
 }
 
 /// Снять программу после отказа.
@@ -438,10 +650,14 @@ pub fn is_running() -> bool {
 ///
 /// Вызывать только тогда, когда [`is_running`] отвечает `true`.
 pub unsafe fn faulted(what: &str, at: usize, addr: usize) -> ! {
+    // Номер задачи стоит в конце строки, а не в начале, и это не вкус: начало
+    // строки читает стенд, и сдвинуть его значит переписать проверки, которые
+    // про номер задачи ничего не спрашивают.
     kprintln!(
-        "  user        : killed by {what} at {at:#018x} (address {addr:#018x})",
+        "  user        : killed by {what} at {at:#018x} (address {addr:#018x}), task {}",
+        sched::current()
     );
-    *RUNNING.lock() = false;
+    with_current(|program| program.running = false);
     // SAFETY: контракт функции — программа запущена, значит `enter_user`
     // действительно исполняется и его кадр на стеке ядра цел.
     unsafe { arch::return_to_kernel(user_abi::EXIT_FAULTED) }

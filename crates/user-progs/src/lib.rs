@@ -20,8 +20,8 @@
 use core::panic::PanicInfo;
 
 use user_abi::{
-    FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETUID, SYS_OPEN, SYS_READ, SYS_STAT,
-    SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN, SYS_READ,
+    SYS_STAT, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
 };
 
 /// Выполнить системный вызов.
@@ -183,6 +183,14 @@ pub fn uid() -> u32 {
     // SAFETY: аргументов у вызова нет.
     let value = unsafe { syscall(SYS_GETUID, 0, 0, 0) };
     value.max(0) as u32
+}
+
+/// Номер этой программы — он же номер её задачи в ядре.
+#[must_use]
+pub fn pid() -> u64 {
+    // SAFETY: аргументов у вызова нет.
+    let value = unsafe { syscall(SYS_GETPID, 0, 0, 0) };
+    value.max(0) as u64
 }
 
 /// Группа, от имени которой исполняется программа.

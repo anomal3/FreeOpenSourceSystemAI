@@ -74,7 +74,7 @@
 
 mod task;
 
-pub use task::{SpawnError, TaskId, TaskState, STACK_GUARD_SIZE, TASK_STACK_SIZE};
+pub use task::{SpawnError, TaskId, TaskState, UserMachine, STACK_GUARD_SIZE, TASK_STACK_SIZE};
 
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -94,7 +94,7 @@ use crate::sync::SpinLock;
 /// задач — и, что важнее, `Vec::push` паникует при нехватке памяти, тогда как
 /// [`spawn`] обязан вернуть ошибку. `Box` внутри слота решает первую проблему
 /// (переезжает указатель, а не сама задача), фиксированный размер — вторую.
-const MAX_TASKS: usize = 32;
+pub const MAX_TASKS: usize = 32;
 
 /// Слот холостой задачи.
 const IDLE_SLOT: usize = 0;
@@ -140,9 +140,26 @@ impl Scheduler {
         }
     }
 
+    /// Куда положить новую задачу.
+    ///
+    /// Сначала пустой слот, потом — самый давний из завершённых. Второй проход
+    /// появился вместе с программами-задачами: раньше задачи заводились по
+    /// одному разу при загрузке, а теперь каждая команда `run` создаёт новую, и
+    /// таблица из тридцати двух слотов кончилась бы на тридцать второй
+    /// программе. Завершённая задача при этом теряется из списка `tasks` — цена
+    /// за то, чтобы система не переставала запускать программы.
     fn free_slot(&self) -> Option<usize> {
         // Слот 0 не предлагается: он принадлежит холостой задаче.
-        (1..MAX_TASKS).find(|&i| self.tasks[i].is_none())
+        if let Some(empty) = (1..MAX_TASKS).find(|&i| self.tasks[i].is_none()) {
+            return Some(empty);
+        }
+        (1..MAX_TASKS)
+            .filter(|&i| {
+                self.tasks[i]
+                    .as_ref()
+                    .is_some_and(|task| task.state == TaskState::Finished)
+            })
+            .min_by_key(|&i| self.tasks[i].as_ref().map_or(u32::MAX, |task| task.id.as_u32()))
     }
 
     /// Кого исполнять следующим.
@@ -224,10 +241,33 @@ impl Scheduler {
 /// [`SpawnError::TooManyTasks`] при исчерпании таблицы. Паники нет ни в одном из
 /// путей: не сумев создать задачу, ядро продолжает работать с уже созданными.
 pub fn spawn(name: &'static str, entry: fn()) -> Result<TaskId, SpawnError> {
+    // Точка входа уезжает батуту аргументом: `Context::new` умеет передать
+    // ровно одно машинное слово, а `fn()` в него помещается целиком.
+    spawn_raw(name, TASK_STACK_SIZE, trampoline, entry as usize)
+}
+
+/// Создать задачу с собственной точкой входа и своим размером стека.
+///
+/// Нужно программам вне ядра: их точка входа не возвращается вовсе (она сама
+/// завершает задачу), а стека им требуется заметно больше — на нём лежит и
+/// разбор ELF, и кадр входа в третье кольцо, и весь системный вызов вместе с
+/// выводом в окно оболочки.
+///
+/// # Ошибки
+///
+/// [`SpawnError::OutOfMemory`] при нехватке кучи (под стек или под саму задачу),
+/// [`SpawnError::TooManyTasks`] при исчерпании таблицы. Паники нет ни в одном из
+/// путей.
+pub fn spawn_raw(
+    name: &'static str,
+    stack_size: usize,
+    entry: extern "C" fn(usize) -> !,
+    arg: usize,
+) -> Result<TaskId, SpawnError> {
     // Стек выделяется до захвата лока: аллокатор кучи при отказе печатает
     // многострочную диагностику, и делать это, удерживая лок планировщика,
     // значит растягивать критическую секцию на скорость UART.
-    let stack = Stack::allocate(TASK_STACK_SIZE).ok_or(SpawnError::OutOfMemory)?;
+    let stack = Stack::allocate(stack_size).ok_or(SpawnError::OutOfMemory)?;
 
     let mut sched = SCHED.lock();
     let Some(slot) = sched.free_slot() else {
@@ -237,14 +277,66 @@ pub fn spawn(name: &'static str, entry: fn()) -> Result<TaskId, SpawnError> {
     };
 
     let id = TaskId::new(sched.next_id);
-    // Точка входа уезжает батуту аргументом: `Context::new` умеет передать
-    // ровно одно машинное слово, а `fn()` в него помещается целиком.
-    let task = Task::new(id, name, stack, trampoline, entry as usize);
+    let task = Task::new(id, name, stack, entry, arg);
     let boxed = box_task(task).ok_or(SpawnError::OutOfMemory)?;
 
     sched.next_id += 1;
     sched.tasks[slot] = Some(boxed);
     Ok(id)
+}
+
+/// Номер слота исполняющейся задачи.
+///
+/// Слот, а не идентификатор: по нему индексируются таблицы, которые ведут о
+/// задаче другие модули — адресное пространство программы и её открытые файлы
+/// (см. [`crate::user`]). Идентификатор для этого не годится, он растёт без
+/// предела.
+#[must_use]
+pub fn current_slot() -> usize {
+    SCHED.lock().current
+}
+
+/// Объявить, в каком адресном пространстве исполняется текущая задача.
+///
+/// `None` возвращает её в пространство ядра. Значение переставляет процессор не
+/// здесь, а на ближайшем переключении задач; сам переход выполняет вызывающий,
+/// потому что он же и знает, в какой момент это безопасно.
+pub fn set_current_space(root: Option<crate::mm::PhysAddr>) {
+    let mut sched = SCHED.lock();
+    let current = sched.current;
+    if let Some(task) = sched.tasks[current].as_mut() {
+        task.user.space_root = root;
+    }
+}
+
+/// Завершилась ли задача, и с каким кодом.
+///
+/// `None` — задача ещё жива либо её слот уже переиспользован под другую.
+#[must_use]
+pub fn result_of(id: TaskId) -> Option<i64> {
+    let sched = SCHED.lock();
+    sched
+        .tasks
+        .iter()
+        .flatten()
+        .find(|task| task.id == id && task.state == TaskState::Finished)
+        .map(|task| task.result)
+}
+
+/// Дождаться завершения задачи и вернуть её код.
+///
+/// Ожидание — уступка процессора в цикле, а не блокировка: состояния
+/// «заблокирована» у задач пока нет, и заводить его ради одного ожидающего
+/// значило бы построить половину механизма сна без второй половины —
+/// пробуждения. Цена честная: ждущая задача остаётся в ротации и тратит на
+/// проверку одно сравнение за квант.
+pub fn wait(id: TaskId) -> i64 {
+    loop {
+        if let Some(code) = result_of(id) {
+            return code;
+        }
+        yield_now();
+    }
 }
 
 /// Добровольно уступить процессор.
@@ -301,6 +393,40 @@ pub fn schedule() {
                 }
                 if let Some(source) = sched.tasks[current].as_mut() {
                     from = source.context.as_mut_ptr();
+                }
+
+                // Машинное состояние программы переставляется здесь же, под
+                // локом и с запрещёнными прерываниями: между «стек возврата уже
+                // чужой» и «контекст ещё свой» не должно быть ни одного
+                // наблюдателя. Порядок — сохранить своё, поставить чужое.
+                if !from.is_null() && !to.is_null() {
+                    let next_user = sched.tasks[next].as_ref().map_or_else(
+                        task::UserMachine::default,
+                        |task| task.user,
+                    );
+                    let saved = arch::swap_user_return_stack(next_user.return_stack);
+                    if let Some(task) = sched.tasks[current].as_mut() {
+                        task.user.return_stack = saved;
+                    }
+                    // Стек ловушки и стек возврата — один и тот же адрес: кадр
+                    // ловушки ложится прямо под кадром, который оставил вход в
+                    // третье кольцо.
+                    arch::set_trap_stack(next_user.return_stack);
+
+                    // Адресное пространство. У задачи без программы его нет, и
+                    // тогда процессор возвращается на таблицы ядра: оставить
+                    // чужие означало бы, что задача ядра работает в дереве,
+                    // которое вот-вот разберут.
+                    // SAFETY: любой корень программы построен копией ядерного и
+                    // содержит все его отображения, поэтому переключение не
+                    // уводит из-под ног ни код, ни стек — оба лежат в памяти
+                    // ядра.
+                    unsafe {
+                        match next_user.space_root {
+                            Some(root) => arch::activate_space(root),
+                            None => arch::activate_kernel_space(),
+                        }
+                    }
                 }
 
                 // Состояние правится последним и только если переключение
@@ -535,20 +661,26 @@ extern "C" fn trampoline(arg: usize) -> ! {
 
     entry();
 
-    exit_current()
+    exit_current_with(0)
 }
 
-/// Завершить текущую задачу.
+/// Завершить текущую задачу с кодом возврата.
 ///
 /// Освободить здесь стек нельзя — на нём в этот момент исполняется вот этот
 /// самый код. Поэтому задача лишь помечается завершённой и уступает процессор;
 /// стек заберёт следующая задача в `Scheduler::reap`.
-fn exit_current() -> ! {
+pub fn exit_current_with(result: i64) -> ! {
     {
         let mut sched = SCHED.lock();
         let current = sched.current;
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Finished;
+            task.result = result;
+            // Программы у завершившейся задачи больше нет, и её адресное
+            // пространство разобрано вызывающим. Отметку надо снять здесь же:
+            // иначе ближайшее переключение попыталось бы поставить процессору
+            // корень, которого уже не существует.
+            task.user = UserMachine::default();
         }
     }
 
