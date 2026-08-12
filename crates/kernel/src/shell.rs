@@ -1,4 +1,4 @@
-//! Оболочка ядра: приглашение, разбор команд, вывод.
+﻿//! Оболочка ядра: приглашение, разбор команд, вывод.
 //!
 //! # Одна оболочка на два экрана
 //!
@@ -26,7 +26,7 @@ use alloc::string::String;
 use crate::input::line::{Edit, LineEditor};
 use crate::input::{self, KeyCode};
 use crate::vfs::NodeKind;
-use crate::{fs, irq, kprint, mm, sched, ui, usb};
+use crate::{fs, irq, kprint, mm, sched, ui, usb, user};
 
 /// Приглашение к вводу.
 const PROMPT: &str = "freeos> ";
@@ -311,6 +311,13 @@ fn run_command(line: &str) -> bool {
             }
         }
         "echo" => sprintln!("  {argument}"),
+        "run" => {
+            if argument.is_empty() {
+                sprintln!("  usage: run <path>");
+            } else {
+                run_program(argument);
+            }
+        }
         "exit" | "quit" => {
             sprintln!("  finishing the session");
             return true;
@@ -331,6 +338,7 @@ fn help() {
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
     sprintln!("  cat <path>    print a file, up to {CAT_LIMIT} bytes");
     sprintln!("  echo <text>   print the text back");
+    sprintln!("  run <path>    load an ELF and run it outside the kernel");
     sprintln!("  clear         clear the window");
     sprintln!("  exit          finish the boot and halt");
 }
@@ -390,6 +398,25 @@ fn tasks() {
     // команды — менять контракт планировщика под оболочку.
     sprintln!("  (task list goes to the serial console)");
     sched::dump();
+}
+
+/// Загрузить и запустить программу вне ядра.
+///
+/// Оболочка на время работы программы стоит: планировщик кооперативный, и
+/// «запустить в фоне» означало бы сначала завести настоящий процесс со своим
+/// состоянием. Программа при этом уступает процессор системным вызовом, так что
+/// остальные задачи не останавливаются.
+fn run_program(path: &str) {
+    match user::run(path) {
+        Ok(code) => {
+            if code == user_abi::EXIT_FAULTED {
+                sprintln!("  {path}: killed by the kernel, see the serial log");
+            } else {
+                sprintln!("  {path}: exited with code {code}");
+            }
+        }
+        Err(err) => sprintln!("  {path}: {err}"),
+    }
 }
 
 /// Перечислить каталог.

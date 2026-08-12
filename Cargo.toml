@@ -9,6 +9,8 @@ members = [
     "crates/installer",
     "crates/kernel",
     "crates/mini-ui",
+    "crates/user-abi",
+    "crates/user-progs",
 ]
 
 # Bare-metal crates cannot be built for the host triple. A bare `cargo build`

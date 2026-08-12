@@ -1,0 +1,18 @@
+[package]
+name = "user-progs"
+description = "Programs that run outside the kernel: the syscall shim and the first two binaries."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+user-abi = { path = "../user-abi" }
+
+[lints]
+workspace = true
+
+# Раскрутка стека здесь не отключается отдельно: у таргетов `*-unknown-none`
+# стратегия паники — abort по самой спецификации таргета. Обработчик паники в
+# программе свой и заканчивается системным вызовом.

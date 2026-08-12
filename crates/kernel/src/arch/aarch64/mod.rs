@@ -1,4 +1,4 @@
-//! aarch64: UART PL011 через MMIO, страничная трансляция, исключения и
+﻿//! aarch64: UART PL011 через MMIO, страничная трансляция, исключения и
 //! прерывания, остановка процессора.
 
 pub mod context;
@@ -7,6 +7,7 @@ pub mod input;
 pub mod interrupts;
 pub mod paging;
 pub mod timer;
+pub mod user;
 
 // Имена, которые `arch::mod` должен отдать наружу вместе с `ARCH_NAME`, `Serial`
 // и `halt`. Пока интеграции нет, внутри крейта их никто не читает — отсюда и

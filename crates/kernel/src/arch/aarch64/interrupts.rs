@@ -343,6 +343,21 @@ unsafe extern "C" {
 // Обработчик
 // ---------------------------------------------------------------------------
 
+/// Человекочитаемое имя класса исключения — для сообщения о снятой программе.
+fn exception_name(ec: u64) -> &'static str {
+    match ec {
+        EC_UNKNOWN => "an unknown instruction",
+        EC_ILLEGAL_STATE => "an illegal execution state",
+        EC_INSTRUCTION_ABORT_LOWER | EC_INSTRUCTION_ABORT_CURRENT => "an instruction abort",
+        EC_PC_ALIGNMENT => "a misaligned program counter",
+        EC_DATA_ABORT_LOWER | EC_DATA_ABORT_CURRENT => "a data abort",
+        EC_SP_ALIGNMENT => "a misaligned stack pointer",
+        EC_FP_EXCEPTION => "a floating-point exception",
+        EC_BRK => "a breakpoint",
+        _ => "an exception",
+    }
+}
+
 /// Точка входа из ассемблерной заглушки.
 ///
 /// `kind` — номер записи таблицы (0…15), `frame` — сохранённый контекст на
@@ -356,6 +371,42 @@ extern "C" fn trap_handler(kind: u64, frame: *mut TrapFrame) {
     let frame = unsafe { &mut *frame };
 
     let source = kind >> KIND_SOURCE_SHIFT;
+
+    // Синхронное исключение из EL0 — это либо системный вызов, либо отказ
+    // программы. И то, и другое разбирается здесь, до общего обработчика:
+    // тот не возвращается, потому что для ядра любое такое исключение
+    // окончательно, а для программы — нет.
+    if source == SOURCE_LOWER_AARCH64 && kind & KIND_TYPE_MASK == TYPE_SYNC {
+        let ec = (frame.esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
+        if ec == EC_SVC64 {
+            // Номер вызова в x8, аргументы в x0..x2, результат в x0 — то же
+            // соглашение, что на x86-64, только другими регистрами.
+            //
+            // SAFETY: исключение пришло из EL0, значит `enter_user`
+            // действительно исполняется и вернуться есть куда.
+            let result = unsafe {
+                crate::user::syscall::handle(
+                    frame.x[8] as usize,
+                    frame.x[0] as usize,
+                    frame.x[1] as usize,
+                    frame.x[2] as usize,
+                )
+            };
+            frame.x[0] = result as u64;
+            return;
+        }
+        if crate::user::is_running() {
+            // SAFETY: `is_running` подтвердил, что кадр `enter_user` цел.
+            unsafe {
+                crate::user::faulted(
+                    exception_name(ec),
+                    frame.elr as usize,
+                    frame.far as usize,
+                )
+            };
+        }
+    }
+
     match kind & KIND_TYPE_MASK {
         TYPE_SYNC => handle_sync(source, frame),
         TYPE_IRQ => handle_irq(),

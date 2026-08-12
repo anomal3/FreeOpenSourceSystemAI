@@ -313,6 +313,37 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "userspace",
+        about: "Программа исполняется вне ядра, а её отказ снимает её, а не систему.",
+        target: Target::Live,
+        usb_only: false,
+        arches: &[],
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Line("ls /bin"),
+            Step::Await("hello", 15_000),
+            // Первая программа: печатает через системный вызов, спрашивает у
+            // ядра время работы и завершается своим кодом.
+            Step::Line("run /bin/hello"),
+            Step::Await("hello from userspace", 30_000),
+            Step::Await("uptime as the kernel sees it:", 15_000),
+            Step::Await("exited with code 0", 15_000),
+            // Вторая ломается нарочно. До этой фазы обращение по нулевому
+            // адресу означало панику ядра и остановку машины.
+            Step::Line("run /bin/crash"),
+            Step::Await("user        : killed by", 30_000),
+            Step::Await("killed by the kernel", 15_000),
+            // И главное: после этого система жива и отвечает.
+            Step::Line("echo still-alive"),
+            Step::Await("still-alive", 15_000),
+            Step::Shot("userspace"),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "serial-cr",
         about: "Терминал, присылающий один возврат каретки, работает как Enter.",
         target: Target::Live,

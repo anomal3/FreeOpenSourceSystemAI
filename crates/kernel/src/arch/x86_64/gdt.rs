@@ -63,6 +63,14 @@ pub const KERNEL_CODE_SELECTOR: u16 = 1 << 3;
 pub const KERNEL_DATA_SELECTOR: u16 = 2 << 3;
 /// Селектор TSS: запись 3 (дескриптор системный и занимает две записи).
 const TSS_SELECTOR: u16 = 3 << 3;
+/// Селектор сегмента данных пользователя: запись 5, RPL 3.
+///
+/// Младшие два бита селектора — запрошенный уровень привилегий, и тройка в них
+/// обязательна: `iretq` отказывается уходить в третье кольцо по селектору с
+/// RPL 0, а `SS` с RPL, не равным уровню кода, даёт #GP.
+pub const USER_DATA_SELECTOR: u16 = (5 << 3) | 3;
+/// Селектор сегмента кода пользователя: запись 6, RPL 3.
+pub const USER_CODE_SELECTOR: u16 = (6 << 3) | 3;
 
 /// Номер IST для двойной ошибки. Значение попадает в поле `IST` дескриптора
 /// вектора и индексирует `TSS.IST1..IST7` начиная с единицы; ноль означает
@@ -108,6 +116,47 @@ const KERNEL_CODE_DESCRIPTOR: u64 =
 /// (база, предел, разрядность) в long mode для данных игнорируется, но `P` и
 /// `S` обязаны стоять, иначе загрузка селектора в `SS` даёт #GP.
 const KERNEL_DATA_DESCRIPTOR: u64 = DESC_ACCESSED | DESC_RW | DESC_CODE_DATA | DESC_PRESENT;
+
+/// `DPL = 3` — сегмент доступен из третьего кольца.
+const DESC_DPL3: u64 = 3 << 45;
+
+/// Сегмент данных пользователя: ring 3, записываемый.
+const USER_DATA_DESCRIPTOR: u64 =
+    DESC_ACCESSED | DESC_RW | DESC_CODE_DATA | DESC_PRESENT | DESC_DPL3;
+
+/// Сегмент кода пользователя: ring 3, 64-битный.
+const USER_CODE_DESCRIPTOR: u64 = DESC_ACCESSED
+    | DESC_RW
+    | DESC_EXECUTABLE
+    | DESC_CODE_DATA
+    | DESC_PRESENT
+    | DESC_LONG_MODE
+    | DESC_DPL3;
+
+/// Стек, на который процессор переключается при входе в ядро из третьего
+/// кольца.
+///
+/// Отдельный, а не «текущий стек ядра», и это требование архитектуры: при смене
+/// уровня привилегий процессор берёт `RSP` из `TSS.RSP0` и не имеет никакого
+/// способа узнать, где был стек ядра до входа в пользовательский режим.
+/// Пользовательскому стеку доверять нельзя — программа вправе выставить `RSP`
+/// куда угодно, в том числе в чужую память, и ловушка на нём означала бы, что
+/// ядро пишет свой кадр по адресу, который выбрал не он.
+///
+/// Размер тот же, что у стека задачи: по этому стеку идёт весь системный вызов,
+/// включая печать в окно, то есть довольно глубокий путь.
+const SYSCALL_STACK_SIZE: usize = 8 * PAGE_SIZE;
+
+#[repr(C, align(16))]
+struct SyscallStack([u8; SYSCALL_STACK_SIZE]);
+
+static SYSCALL_STACK: Racy<SyscallStack> = Racy::new(SyscallStack([0; SYSCALL_STACK_SIZE]));
+
+/// Вершина стека системных вызовов.
+fn syscall_stack_top() -> u64 {
+    let base = SYSCALL_STACK.get() as usize;
+    (base + SYSCALL_STACK_SIZE) as u64
+}
 
 // --- Стеки IST ----------------------------------------------------------------
 
@@ -213,8 +262,9 @@ fn tss_descriptor_low(base: u64, limit: u32) -> u64 {
 
 // --- GDT ----------------------------------------------------------------------
 
-/// Записей в GDT: нулевая, код, данные и две под системный дескриптор TSS.
-const GDT_ENTRIES: usize = 5;
+/// Записей в GDT: нулевая, код и данные ядра, две под системный дескриптор TSS,
+/// затем данные и код пользователя.
+const GDT_ENTRIES: usize = 7;
 
 /// GDT выровнена на 16 не по требованию архитектуры, а ради того, чтобы ни один
 /// дескриптор не пересекал границу строки кеша.
@@ -266,6 +316,10 @@ pub fn init() {
                 .write_unaligned(stack_top(&DOUBLE_FAULT_STACK));
             (&raw mut (*tss).ist[usize::from(IST_PAGE_FAULT) - 1])
                 .write_unaligned(stack_top(&PAGE_FAULT_STACK));
+            // `RSP0` — стек, на который процессор переключится при входе в ядро
+            // из третьего кольца. Ставится один раз здесь, а не перед каждым
+            // запуском программы: он не зависит ни от программы, ни от задачи.
+            (&raw mut (*tss).rsp[0]).write_unaligned(syscall_stack_top());
         }
 
         let tss_base = tss as u64;
@@ -278,6 +332,12 @@ pub fn init() {
             (*gdt).0[2] = KERNEL_DATA_DESCRIPTOR;
             (*gdt).0[3] = tss_descriptor_low(tss_base, TSS_SIZE as u32 - 1);
             (*gdt).0[4] = tss_base >> 32;
+            // Порядок «сначала данные, потом код» соответствует тому, которого
+            // требует `sysret`. Сам `sysret` здесь не используется — системные
+            // вызовы приходят ловушкой, — но раскладка, совместимая с ним,
+            // ничего не стоит и снимает будущую перестановку таблицы.
+            (*gdt).0[5] = USER_DATA_DESCRIPTOR;
+            (*gdt).0[6] = USER_CODE_DESCRIPTOR;
         }
 
         let pointer = DescriptorTablePointer {

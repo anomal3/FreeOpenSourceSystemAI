@@ -1,4 +1,4 @@
-//! x86_64: UART 16550 на COM1, остановка процессора, страничная трансляция,
+﻿//! x86_64: UART 16550 на COM1, остановка процессора, страничная трансляция,
 //! таблицы дескрипторов, прерывания и ввод с клавиатуры.
 
 pub mod acpi;
@@ -10,6 +10,7 @@ pub mod input;
 pub mod interrupts;
 pub mod ioapic;
 pub mod paging;
+pub mod user;
 
 pub use paging::{PageTable, build_kernel_address_space, switch_stack};
 

@@ -95,7 +95,16 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
     }
 
     let initrd = if opts.initrd {
-        Some(initrd::build()?)
+        // Программы попадают в образ как `/bin/<имя>` — оттуда их и запускает
+        // оболочка. Собираются они вместе с ядром: программа и ядро связаны
+        // номерами системных вызовов, и собранная порознь пара разъезжается.
+        let programs = build_user_programs(opts.arch, opts.release)?;
+        let extra: Vec<(String, std::path::PathBuf)> = USER_PROGRAMS
+            .iter()
+            .zip(programs)
+            .map(|(name, path)| (format!("bin/{name}"), path))
+            .collect();
+        Some(initrd::build(&extra)?)
     } else {
         println!("initrd пропущен (--no-initrd)");
         None
@@ -131,6 +140,84 @@ pub fn build_component(component: Component, arch: Arch, release: bool) -> Resul
 
     let dir = paths::artifact_dir(triple, release);
     locate_artifact(&dir, component)
+}
+
+/// Имена пользовательских программ. Они же — имена файлов в `/bin`.
+pub const USER_PROGRAMS: [&str; 2] = ["hello", "crash"];
+
+/// Собрать программы, исполняющиеся вне ядра.
+///
+/// Отдельная функция, а не ещё один [`Component`]: компонент — это один
+/// артефакт, попадающий на ESP по своему пути, а здесь два бинарника, которые
+/// уезжают в файловую систему как обычные файлы.
+///
+/// Компоновочный сценарий подаётся через `RUSTFLAGS` этого запуска, а не через
+/// `.cargo/config.toml`: там он подействовал бы на весь workspace, включая
+/// ядро, у которого раскладка своя.
+pub fn build_user_programs(arch: Arch, release: bool) -> Result<Vec<PathBuf>> {
+    let triple = Component::Kernel.triple(arch);
+    let script = paths::workspace_root().join("crates/user-progs/user.ld");
+    if !script.is_file() {
+        bail!("нет компоновочного сценария программ: {}", script.display());
+    }
+
+    let mut cmd = cargo();
+    cmd.arg("build")
+        .arg("--package")
+        .arg("user-progs")
+        .arg("--bins")
+        .arg("--target")
+        .arg(triple);
+    if release {
+        cmd.arg("--release");
+    }
+    // Стандартные крейты пересобираются теми же флагами, что и программа.
+    // Иначе не сходится модель кода: rustup поставляет `core`, собранный под
+    // малую модель (адреса влезают в 32 бита со знаком), а программа живёт по
+    // адресу 512 ГиБ. Ошибка выглядит как «relocation R_X86_64_32S out of
+    // range» в чужом объектнике и никак не связана с нашим кодом.
+    cmd.arg("-Zbuild-std=core,compiler_builtins")
+        .arg("-Zbuild-std-features=compiler-builtins-mem");
+
+    // `-C link-arg=-T<файл>` доходит до компоновщика как есть. Максимальный
+    // размер страницы задаётся явно: без него lld выравнивает сегменты по 2 МиБ
+    // и раздувает крошечную программу до мегабайтов нулей в файле.
+    // Отладочная информация из образа выбрасывается, и это не про размер.
+    // Ядро читает файл программы целиком в кучу, прежде чем разобрать его
+    // заголовки; с отладочными секциями крошечная программа весит два с
+    // половиной мегабайта, и сегмент, уехавший за предел чтения, выглядел бы
+    // как испорченный файл.
+    let mut flags = format!(
+        "-C link-arg=-T{} -C link-arg=-z -C link-arg=max-page-size=0x1000 \
+         -C relocation-model=static -C strip=debuginfo",
+        script.display()
+    );
+    if arch == Arch::X86_64 {
+        // Большая модель кода: обращения к своим же данным по абсолютному
+        // 64-битному адресу. На AArch64 этого не нужно — там адрес собирается
+        // парой `adrp`/`add` относительно счётчика команд, и абсолютное
+        // положение программы значения не имеет.
+        flags.push_str(" -C code-model=large");
+    }
+    cmd.env("RUSTFLAGS", flags);
+
+    run_cargo(&mut cmd, "build", Component::Kernel, triple)?;
+
+    let dir = paths::artifact_dir(triple, release);
+    let mut built = Vec::new();
+    for name in USER_PROGRAMS {
+        let path = dir.join(name);
+        if !path.is_file() {
+            bail!(
+                "программа {name} не собралась: нет {}\n\
+                 Ожидались бинарники: {}",
+                path.display(),
+                USER_PROGRAMS.join(", ")
+            );
+        }
+        built.push(path);
+    }
+    Ok(built)
 }
 
 /// Досыпает `-Z build-std` при сборке ядра.

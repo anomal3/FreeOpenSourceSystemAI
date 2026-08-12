@@ -1,0 +1,13 @@
+[package]
+name = "user-abi"
+description = "The contract between the kernel and user programs: syscall numbers and nothing else."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

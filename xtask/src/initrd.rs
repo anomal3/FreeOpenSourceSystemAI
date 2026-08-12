@@ -124,7 +124,12 @@ struct Entry {
 }
 
 /// Собирает `initrd.img`, если он устарел, и возвращает путь к нему.
-pub fn build() -> Result<PathBuf> {
+/// Собирает `initrd.img`, добавляя к содержимому `initrd/` собранные файлы.
+///
+/// `extra` — пары «путь внутри образа, путь на хосте». Через них в образ
+/// попадают пользовательские программы: держать собранные бинарники в
+/// `initrd/` нельзя, они артефакты сборки, а не исходники.
+pub fn build(extra: &[(String, PathBuf)]) -> Result<PathBuf> {
     let source = paths::initrd_source_dir();
     if !source.is_dir() {
         bail!(
@@ -137,6 +142,19 @@ pub fn build() -> Result<PathBuf> {
 
     let mut entries = Vec::new();
     collect(&source, "", &mut entries)?;
+
+    // Каталоги под добавляемые файлы заводятся по пути: `bin/hello` требует,
+    // чтобы `bin` уже существовал в образе, а форматтер каталоги сам не создаёт.
+    for (rel, path) in extra {
+        if let Some((dir, _)) = rel.rsplit_once('/') {
+            if !entries.iter().any(|entry| entry.rel == dir) {
+                entries.push(Entry { rel: dir.to_string(), node: Node::Dir });
+            }
+        }
+        let data = fs::read(path)
+            .with_context(|| format!("не удалось прочитать {}", path.display()))?;
+        entries.push(Entry { rel: rel.clone(), node: Node::File(data) });
+    }
 
     let image = paths::initrd_image();
     let stamp_path = paths::initrd_stamp();

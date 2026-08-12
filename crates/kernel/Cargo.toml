@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "kernel"
 description = "Freestanding FreeOS kernel: memory, interrupts, tasks, FAT32, USB input, compositor and shell."
 version.workspace = true
@@ -30,6 +30,9 @@ font8x8 = { version = "0.3.1", default-features = false }
 # установщик — интерфейс системы и интерфейс её установки обязаны выглядеть
 # одинаково, а два набора примитивов рисования разошлись бы.
 mini-ui = { path = "../mini-ui" }
+# Номера системных вызовов. Тот же крейт подключают пользовательские программы:
+# две таблицы констант разошлись бы молча.
+user-abi = { path = "../user-abi" }
 # Куча ядра. `default-features = false` выключает `use_spin`, а с ним и
 # зависимость `spinning_top`: замок ядро ставит своё (см. `sync::Racy`), и второй
 # внутри аллокатора был бы лишним. Остаётся сам `Heap` — свободные блоки в

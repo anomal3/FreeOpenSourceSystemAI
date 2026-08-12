@@ -2,13 +2,13 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 11 done.** The system installs itself onto a disk, boots from it, mounts
-> its ext2 root — and comes up as a **desktop**: wallpaper, a taskbar with a clock, a start
-> menu, windows with title bars and close buttons, and a window manager that routes every
-> keypress and every click. It has a **mouse**: click to focus, drag by the title bar, close
-> by the button. Programs so far: a terminal, a file manager over the mounted root, a system
-> monitor and an about box. On both architectures. There is no userspace yet: everything
-> above runs in the kernel. See [Roadmap](#roadmap).
+> **Status: Phase 12a done.** The system installs itself onto a disk, boots from it, mounts
+> its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
+> windows you can drag and close, a terminal, a file manager, a system monitor. And it now
+> runs **programs outside the kernel**: `run /bin/hello` loads an ELF, maps it into pages
+> reachable only from ring 3 (EL0) and jumps there; the program talks back through system
+> calls, and when it faults the kernel kills it and keeps going. On both architectures.
+> Each program does not yet get an address space of its own — see [Roadmap](#roadmap).
 
 ## Why
 
@@ -132,6 +132,39 @@ interrupt ring, one report parser — and a mouse is a second of each. Events fo
 arrive in one ring, so a transfer is now matched to its device by the slot id in the event
 itself; without that, mouse movement would be parsed as keystrokes.
 
+## Userspace
+
+`run /bin/hello` reads an ELF off the mounted filesystem, copies its `PT_LOAD` segments into
+pages marked reachable from ring 3 (EL0 on ARM), and jumps there. From that moment the code
+is on the far side of a wall the CPU enforces, not the kernel: it cannot read a byte of
+kernel memory, execute a kernel instruction or touch a device. The only door is a trap —
+`int 0x80` on x86-64, `svc #0` on ARM — and behind it four calls: `write`, `exit`, `yield`
+and `uptime`. `uptime` exists to show that data crosses the boundary *inward* too, not only
+out.
+
+`run /bin/crash` writes to address zero. Before this phase that was a kernel panic and a
+stopped machine; now it prints one line, kills the program and returns to the shell. That
+difference is the phase.
+
+Three things are deliberately not there yet, and each is a separate piece of work:
+
+- **An address space per program.** The program lives in the kernel's own page tables, in a
+  part of them the kernel does not use: the low half is taken (the kernel image runs
+  identity-mapped, with all of physical memory mapped beside it) and all of it fits in the
+  first entry of the root table, so the program gets the second — 512 GiB up. What that
+  gives is real: the CPU refuses the program access to anything not marked user. What it
+  does not give is separation *between* programs — but only one runs at a time.
+- **Permission checks.** `mode`, `uid` and `gid` are written to disk, shown by the file
+  manager and enforced by nobody. That needs file syscalls first, so that there is someone
+  to check *against*.
+- **Programs as tasks.** A program runs inside the `run` call; the shell waits for it. A
+  process with state of its own, that can be preempted and resumed, comes with the address
+  space.
+
+The program window is a fixed set of frames, allocated once and reused, wiped before each
+load. Not an optimisation — the page tables have no `unmap`, so allocating fresh frames per
+run would leak them. A fixed window bounds the program and does not leak.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -140,7 +173,8 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Eight scenarios today: the system boots and the shell answers (`boot`); keys arrive over
+Nine scenarios today: a program runs outside the kernel and a faulting one is killed without
+taking the system with it (`userspace`); the system boots and the shell answers (`boot`); keys arrive over
 xHCI and USB HID rather than PS/2 (`keyboard`, which switches `i8042` off, since `sendkey`
 reaches exactly one keyboard and QEMU picks PS/2 when both are attached); the start menu
 opens a program, the window moves and closes and focus comes back (`desktop`); the pointer
@@ -314,6 +348,8 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 9b | virtio-blk driver; the kernel mounts the root partition it was installed on | **done** |
 | 10 | Desktop: wallpaper, taskbar, start menu, window manager, file manager | **done** |
 | 11 | USB HID mouse on a multi-device xHCI: pointer, click to focus, drag, close | **done** |
+| 12a | Userspace: ELF loader, ring 3 / EL0, system calls, a faulting program is killed | **done** |
+| 12b | An address space per program, and permission checks with something to enforce | next |
 
 Phases 6 and 8 were both split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe
