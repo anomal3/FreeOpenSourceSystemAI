@@ -27,7 +27,8 @@ use user_abi::{
     ERR_BAD_ADDRESS, ERR_BAD_FD, ERR_BAD_PATH, ERR_IO, ERR_NOT_FOUND, ERR_NO_FILESYSTEM,
     ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_PERMISSION, ERR_TOO_MANY_FILES, ERR_UNSUPPORTED, FD_STDOUT,
     KIND_DIRECTORY, KIND_FILE, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN,
-    SYS_READ, SYS_SLEEP, SYS_STAT, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    ERR_EXISTS, ERR_NOT_EMPTY, ERR_NO_SPACE, SYS_MKDIR, SYS_READ, SYS_REMOVE, SYS_SLEEP,
+    SYS_STAT, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
 };
 
 use crate::mm::PageFlags;
@@ -75,10 +76,12 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
             0
         }
         SYS_UPTIME => irq::uptime_ms() as i64,
-        SYS_OPEN => open(a0, a1),
+        SYS_OPEN => open(a0, a1, a2),
         SYS_READ => read(a0, a1, a2),
         SYS_CLOSE => close(a0),
         SYS_STAT => stat(a0, a1, a2),
+        SYS_MKDIR => mkdir(a0, a1, a2),
+        SYS_REMOVE => remove(a0, a1),
         SYS_GETUID => i64::from(super::session::credentials().uid),
         SYS_GETGID => i64::from(super::session::credentials().gid),
         // Программа — это задача, и её номер тот же, что видит `tasks` в
@@ -92,9 +95,6 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
 
 /// `write(fd, ptr, len)`.
 fn write(fd: usize, ptr: usize, len: usize) -> i64 {
-    if fd != FD_STDOUT {
-        return ERR_NO_SYSCALL;
-    }
     if len == 0 {
         return 0;
     }
@@ -108,6 +108,17 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
     // чтения некому.
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
 
+    if fd != FD_STDOUT {
+        // В файл уходят байты как есть: это данные, а не текст, и требовать от
+        // них UTF-8 значило бы запретить программе сохранить что угодно, кроме
+        // строки.
+        return match super::with_current(|program| program.files.write(fd, bytes)) {
+            Some(Ok(written)) => written as i64,
+            Some(Err(err)) => errno(err),
+            None => ERR_NO_PROGRAM,
+        };
+    }
+
     // Двоичный мусор в окно оболочки не выводится: управляющие байты испортили
     // бы и сетку символов, и терминал на другом конце линии. Это ограничение
     // вывода, а не проверка программы, — поэтому не ошибка.
@@ -120,8 +131,8 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
     }
 }
 
-/// `open(ptr, len) -> fd`.
-fn open(ptr: usize, len: usize) -> i64 {
+/// `open(ptr, len, flags) -> fd`.
+fn open(ptr: usize, len: usize, flags: usize) -> i64 {
     let mut buffer = [0u8; MAX_PATH];
     let path = match copy_path(ptr, len, &mut buffer) {
         Ok(path) => path,
@@ -129,10 +140,42 @@ fn open(ptr: usize, len: usize) -> i64 {
     };
 
     let cred = super::session::credentials();
-    match super::with_current(|program| program.files.open(cred, path)) {
+    match super::with_current(|program| program.files.open(cred, path, flags)) {
         Some(Ok(fd)) => fd as i64,
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `mkdir(ptr, len, mode) -> 0`.
+fn mkdir(ptr: usize, len: usize, mode: usize) -> i64 {
+    let mut buffer = [0u8; MAX_PATH];
+    let path = match copy_path(ptr, len, &mut buffer) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    // Права обрезаются до девяти бит: тип узла задаёт ядро, и программа,
+    // приславшая в этом аргументе что угодно, не должна получить каталог,
+    // притворяющийся устройством.
+    let mode = (mode as u16) & 0o777;
+    match crate::fs::mkdir_as(super::session::credentials(), path, mode) {
+        Some(Ok(())) => 0,
+        Some(Err(err)) => vfs_errno(err),
+        None => ERR_NO_FILESYSTEM,
+    }
+}
+
+/// `remove(ptr, len) -> 0`.
+fn remove(ptr: usize, len: usize) -> i64 {
+    let mut buffer = [0u8; MAX_PATH];
+    let path = match copy_path(ptr, len, &mut buffer) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    match crate::fs::remove_as(super::session::credentials(), path) {
+        Some(Ok(())) => 0,
+        Some(Err(err)) => vfs_errno(err),
+        None => ERR_NO_FILESYSTEM,
     }
 }
 
@@ -249,6 +292,9 @@ fn vfs_errno(err: VfsError) -> i64 {
         VfsError::PermissionDenied => ERR_PERMISSION,
         VfsError::BadPath => ERR_BAD_PATH,
         VfsError::WrongKind | VfsError::Unsupported => ERR_UNSUPPORTED,
+        VfsError::Exists => ERR_EXISTS,
+        VfsError::NotEmpty => ERR_NOT_EMPTY,
+        VfsError::NoSpace => ERR_NO_SPACE,
         // Испорченная структура на диске, чтение за концом устройства и отказ
         // самого устройства для программы — одно и то же: носитель не отдал
         // данные. Подробности ушли в журнал ядра, где им и место.

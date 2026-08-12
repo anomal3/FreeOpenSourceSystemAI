@@ -100,6 +100,76 @@ pub fn resolve_as(
     })
 }
 
+/// Разделить путь на «каталог» и «последнее имя».
+///
+/// Создание и удаление работают не с путём целиком, а с именем внутри
+/// каталога: право спрашивается у **каталога**, а не у того, чего в нём пока
+/// нет либо уже не будет.
+fn split_parent(path: &str) -> VfsResult<(&str, &str)> {
+    let trimmed = path.trim_end_matches('/');
+    let (parent, name) = match trimmed.rsplit_once('/') {
+        Some((parent, name)) => (parent, name),
+        None => ("", trimmed),
+    };
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(VfsError::BadPath);
+    }
+    Ok((if parent.is_empty() { "/" } else { parent }, name))
+}
+
+/// Создать файл по пути от имени `cred`.
+///
+/// Право писать спрашивается у каталога — там, где появляется новая запись.
+/// Прав на сам файл не существует: его ещё нет.
+pub fn create_as(cred: Credentials, path: &str, mode: u16) -> Option<VfsResult<Box<dyn Node>>> {
+    let (parent, name) = match split_parent(path) {
+        Ok(pair) => pair,
+        Err(err) => return Some(Err(err)),
+    };
+    let dir = match resolve_as(cred, parent, Access::WRITE)? {
+        Ok(dir) => dir,
+        Err(err) => return Some(Err(err)),
+    };
+    Some(dir.create(name, mode, cred.uid, cred.gid))
+}
+
+/// Создать каталог по пути от имени `cred`.
+pub fn mkdir_as(cred: Credentials, path: &str, mode: u16) -> Option<VfsResult<()>> {
+    let (parent, name) = match split_parent(path) {
+        Ok(pair) => pair,
+        Err(err) => return Some(Err(err)),
+    };
+    let dir = match resolve_as(cred, parent, Access::WRITE)? {
+        Ok(dir) => dir,
+        Err(err) => return Some(Err(err)),
+    };
+    Some(dir.mkdir(name, mode, cred.uid, cred.gid).map(|_| ()))
+}
+
+/// Удалить файл или пустой каталог по пути от имени `cred`.
+///
+/// Что именно удалять, решает не вызывающий, а тип того, что нашлось: два
+/// вызова на одно действие означали бы, что `rm` каталога отказывает не потому,
+/// что каталог не пуст, а потому, что человек выбрал не ту команду.
+pub fn remove_as(cred: Credentials, path: &str) -> Option<VfsResult<()>> {
+    let (parent, name) = match split_parent(path) {
+        Ok(pair) => pair,
+        Err(err) => return Some(Err(err)),
+    };
+    let dir = match resolve_as(cred, parent, Access::WRITE)? {
+        Ok(dir) => dir,
+        Err(err) => return Some(Err(err)),
+    };
+    let kind = match dir.lookup(name) {
+        Ok(node) => node.metadata().kind,
+        Err(err) => return Some(Err(err)),
+    };
+    Some(match kind {
+        NodeKind::Directory => dir.rmdir(name),
+        NodeKind::File => dir.unlink(name),
+    })
+}
+
 /// Перечислить каталог корневой ФС.
 ///
 /// Внешний `None` означает «ничего не смонтировано» — это не ошибка пути, и

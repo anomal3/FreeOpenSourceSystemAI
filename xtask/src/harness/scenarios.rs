@@ -512,6 +512,13 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run -b /bin/nap"),
             Step::Await("started as #", 15_000),
             Step::Await("asking for nothing", 30_000),
+            // Пауза обязательна: строку программа печатает **до** того, как
+            // уснуть, и между этими двумя событиями её успевает вытеснить
+            // разбуженная вводом оболочка. Без паузы `tasks` заставал программу
+            // ещё готовой к исполнению — и сценарий падал, доказывая ровно
+            // обратное тому, что проверяет. Полсекунды из трёх, которые она
+            // спит, ничего не стоят.
+            Step::Wait(500),
             // Вот и вся фаза одной строкой: спящая программа не `ready`, а
             // `blocked`. До Phase 13d ждущая программа была неотличима от
             // считающей — она и была считающей, просто уступала процессор.
@@ -663,6 +670,96 @@ pub const ALL: &[Scenario] = &[
             Step::Await("/root/notes.txt: permission denied", 15_000),
             Step::Await("perms: done", 15_000),
             Step::Shot("installed"),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "write",
+        about: "Система пишет в корневой раздел: оболочка из кольца ноль, программа — из третьего.",
+        target: Target::Installed,
+        usb_only: false,
+        arches: &[],
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Сценарий начинается с уборки, и это не аккуратность: диск
+            // переживает прогон, а записанное — переживает диск. Без уборки
+            // повторный запуск этого сценария падал бы на «имя уже занято», то
+            // есть ровно из-за того, что фаза и доказывает. Отказы уборки не
+            // проверяются: на свежеустановленной системе удалять нечего.
+            //
+            // Между строками стоит ожидание приглашения, и это обязательно, а
+            // не для порядка: две команды подряд не помещаются в приёмный FIFO
+            // гостя (у PL011 он 32 байта), пока тот занят перерисовкой окна с
+            // запрещёнными прерываниями. Хвост строки теряется, эхо обрывается
+            // на середине, и сеанс встаёт навсегда — оболочка ждёт конца
+            // строки, стенд ждёт ответа. Ровно так это и выглядело на обеих
+            // сборках AArch64, прежде чем сюда добавились эти два шага.
+            Step::Line("rm /home/roman/notes/first.txt"),
+            Step::Await("freeos> ", 15_000),
+            Step::Line("rm /home/roman/notes"),
+            Step::Await("freeos> ", 15_000),
+            // Каталог, файл и его содержимое — всё создаётся здесь и сейчас, на
+            // том самом разделе, который записал установщик.
+            Step::Line("mkdir /home/roman/notes"),
+            Step::Await("created /home/roman/notes", 15_000),
+            Step::Line("echo persisted-by-the-shell > /home/roman/notes/first.txt"),
+            // Двадцать три байта — двадцать два текста и перевод строки,
+            // который дописывает `echo`. Точное число здесь намеренно: «что-то
+            // записалось» выглядело бы так же, как «записалось не то».
+            Step::Await("wrote 23 bytes", 15_000),
+            Step::Line("cat /home/roman/notes/first.txt"),
+            Step::Await("persisted-by-the-shell", 15_000),
+            // То же самое, но из третьего кольца: программа открывает файл на
+            // запись системным вызовом и читает его обратно.
+            Step::Line("run /bin/save"),
+            Step::Await("save: wrote 20 bytes", 30_000),
+            Step::Await("save: read back: written from ring 3", 15_000),
+            Step::Await("save: done", 15_000),
+            // Удаление — тоже запись. Файл `/etc/system.cfg` не трогаем: он
+            // нужен следующему прогону.
+            Step::Line("echo temporary > /home/roman/scratch.txt"),
+            Step::Await("wrote 10 bytes", 15_000),
+            Step::Line("rm /home/roman/scratch.txt"),
+            Step::Await("removed /home/roman/scratch.txt", 15_000),
+            Step::Line("cat /home/roman/scratch.txt"),
+            Step::Await("no such file or directory", 15_000),
+            // Непустой каталог не удаляется, и отказ объясняет причину.
+            Step::Line("rm /home/roman/notes"),
+            Step::Await("the directory is not empty", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "persist",
+        about: "Записанное переживает выключение: та же машина, тот же диск, новая загрузка.",
+        target: Target::Installed,
+        usb_only: false,
+        arches: &[],
+        extra: &[],
+        steps: &[
+            // Это отдельная загрузка того же диска. Всё, что проверяется ниже,
+            // записал предыдущий сценарий и с тех пор машина была выключена, —
+            // то есть проверяется носитель, а не память.
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 30_000),
+            Step::Line("cat /home/roman/notes/first.txt"),
+            Step::Await("persisted-by-the-shell", 15_000),
+            Step::Line("cat /home/roman/from-a-program.txt"),
+            Step::Await("written from ring 3", 15_000),
+            // А удалённого нет: удаление тоже пережило выключение.
+            Step::Line("cat /home/roman/scratch.txt"),
+            Step::Await("no such file or directory", 15_000),
+            // И то, что записал установщик, на месте: новая запись ничего не
+            // испортила в чужих файлах.
+            Step::Line("cat /etc/system.cfg"),
+            Step::Await("language=", 15_000),
+            Step::Line("whoami"),
+            Step::Await("roman (uid 1000 gid 1000)", 15_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

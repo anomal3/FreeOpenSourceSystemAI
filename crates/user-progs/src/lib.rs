@@ -21,7 +21,8 @@ use core::panic::PanicInfo;
 
 use user_abi::{
     FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN, SYS_READ,
-    SYS_SLEEP, SYS_STAT, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_REMOVE, SYS_SLEEP, SYS_STAT, SYS_UPTIME, SYS_WRITE,
+    SYS_YIELD, Stat,
 };
 
 /// Выполнить системный вызов.
@@ -132,6 +133,44 @@ pub fn print_octal(value: u32) {
     let start = index.min(buffer.len() - 4);
     // SAFETY: в буфер записаны только цифры ASCII.
     print(unsafe { core::str::from_utf8_unchecked(&buffer[start..]) });
+}
+
+/// Открыть файл на запись, при необходимости создав или обрезав его.
+///
+/// Два булевых аргумента вместо битовой маски: их здесь ровно столько, сколько
+/// различает договор, и разбирать маску в каждой программе значило бы написать
+/// тридцать строк библиотеки ради того, чтобы спрятать два вопроса.
+pub fn open_write(path: &str, create: bool, truncate: bool) -> i64 {
+    let mut flags = O_WRITE;
+    if create {
+        flags |= O_CREATE;
+    }
+    if truncate {
+        flags |= O_TRUNC;
+    }
+    // SAFETY: срез живёт в памяти программы, длина — его собственная.
+    unsafe { syscall(SYS_OPEN, path.as_ptr() as usize, path.len(), flags) }
+}
+
+/// Записать в дескриптор. Возвращает, сколько записано.
+pub fn write(fd: i64, data: &[u8]) -> i64 {
+    if fd < 0 {
+        return fd;
+    }
+    // SAFETY: срез живёт в памяти программы, длина — его собственная.
+    unsafe { syscall(SYS_WRITE, fd as usize, data.as_ptr() as usize, data.len()) }
+}
+
+/// Создать каталог.
+pub fn mkdir(path: &str, mode: u32) -> i64 {
+    // SAFETY: срез живёт в памяти программы, длина — его собственная.
+    unsafe { syscall(SYS_MKDIR, path.as_ptr() as usize, path.len(), mode as usize) }
+}
+
+/// Удалить файл или пустой каталог.
+pub fn remove(path: &str) -> i64 {
+    // SAFETY: срез живёт в памяти программы, длина — его собственная.
+    unsafe { syscall(SYS_REMOVE, path.as_ptr() as usize, path.len(), 0) }
 }
 
 /// Открыть файл на чтение. Отрицательный результат — код ошибки из `user_abi`.

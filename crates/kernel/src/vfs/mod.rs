@@ -64,12 +64,21 @@ pub enum VfsError {
     /// файла за «нет такого» имеет смысл там, где важнее секретность, а здесь
     /// важнее, чтобы человек понял, что делать дальше.
     PermissionDenied,
+    /// Такое имя уже занято.
+    Exists,
+    /// Каталог не пуст.
+    NotEmpty,
+    /// На носителе кончилось место — блоки либо inode.
+    NoSpace,
 }
 
 impl fmt::Display for VfsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
             Self::NotFound => "no such file or directory",
+            Self::Exists => "the name already exists",
+            Self::NotEmpty => "the directory is not empty",
+            Self::NoSpace => "no space left on the device",
             Self::WrongKind => "path component is not of the expected kind",
             Self::BadPath => "malformed path",
             Self::Corrupt => "on-disk structure is inconsistent",
@@ -175,6 +184,48 @@ pub trait Node: Send + Sync {
     /// Найти запись по имени в этом каталоге. Имя — один компонент пути, без
     /// разделителей.
     fn lookup(&self, name: &str) -> VfsResult<Box<dyn Node>>;
+
+    // --- запись ------------------------------------------------------------
+    //
+    // У всего, что ниже, есть реализация по умолчанию, и она отказывает. Это не
+    // заглушка: файловая система на чтение — не недоделанная, а другая. Образ
+    // initrd лежит в оперативной памяти и исчезает с выключением, писать в него
+    // бессмысленно; RAM-диск существует ради проверки самого VFS. Требовать от
+    // них методов записи значило бы заставить их отказывать вручную — то есть
+    // то же самое, но в трёх местах вместо одного.
+
+    /// Записать байты, начиная со смещения. Возвращает, сколько записано.
+    ///
+    /// Смещение за концом файла допустимо: промежуток остаётся дырой и читается
+    /// нулями.
+    fn write_at(&self, _offset: u64, _data: &[u8]) -> VfsResult<usize> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Изменить длину файла.
+    fn truncate(&self, _size: u64) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Создать в этом каталоге пустой файл и вернуть его.
+    fn create(&self, _name: &str, _mode: u16, _uid: u32, _gid: u32) -> VfsResult<Box<dyn Node>> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Создать в этом каталоге подкаталог.
+    fn mkdir(&self, _name: &str, _mode: u16, _uid: u32, _gid: u32) -> VfsResult<Box<dyn Node>> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Удалить файл по имени. Каталог этим не удаляется — см. [`Node::rmdir`].
+    fn unlink(&self, _name: &str) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Удалить пустой подкаталог.
+    fn rmdir(&self, _name: &str) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
 }
 
 /// Смонтированная файловая система.

@@ -403,6 +403,53 @@ The idle task itself no longer spins either. When nothing is ready it stops the 
 (`hlt`, `wfi`) until an interrupt, which is what makes all of the above visible from outside
 the emulator rather than only in a counter.
 
+### Writing
+
+Until here the system could read a disk and nothing else. Now it can keep something:
+
+```
+freeos> mkdir /home/roman/notes
+  created /home/roman/notes
+freeos> echo persisted-by-the-shell > /home/roman/notes/first.txt
+  wrote 23 bytes to /home/roman/notes/first.txt
+freeos> run /bin/save
+save: wrote 20 bytes
+save: read back: written from ring 3
+```
+
+...and after the machine is switched off and booted again, both files are still there, the one
+that was deleted is still gone, and the installer's own files are untouched. That is the whole
+claim, and the bench makes it in the only way that means anything: two scenarios, one boot
+each, on the same disk.
+
+`Node` grew six write methods, and every one has a default implementation that refuses. That
+is not a stub. A read-only filesystem is not an unfinished one — the initrd image lives in RAM
+and vanishes with the power, so writing to it is meaningless, and the RAM disk exists to
+exercise the VFS itself. Making them refuse by hand would be the same refusal written in three
+places instead of one.
+
+Permission checks moved to where the new entry appears: creating and deleting ask the
+**directory** for write access, because the file either does not exist yet or is about to stop
+existing, and asking it anything is asking the wrong object. Everything else follows the rule
+Phase 12c set — the walk is checked, one directory at a time, before the name is looked up.
+
+Two decisions worth naming:
+
+- The shell writes as the **session user**, not as the kernel. It runs in ring 0 and could
+  write straight past every check; then `echo > /root/x` would succeed for an ordinary user
+  exactly where `run /bin/save` is refused, and the permission system would be a decoration on
+  one path out of two.
+- `echo t > path` is the only redirection there is, and it lives inside the `echo` command
+  rather than in the parser. Real redirection means a command's output is a descriptor the
+  shell can replace; commands here print directly and have no descriptors. Promising `>`
+  everywhere while implementing it once would be worse than not promising it.
+
+The counters get flushed to the superblock after **every** operation. They live in the
+editor's memory, and a machine that reboots before the flush would come back with a
+free-block count that is too high — and then hand a new file a block an old one is using. That
+is not a lost counter, it is lost data, so the flush is not optional and its cost is not worth
+arguing about.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -411,7 +458,7 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Twelve scenarios today: a program runs in an address space of its own, one that faults is
+Fourteen scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
@@ -427,7 +474,10 @@ drives all of it with clicks and a drag (`mouse`); a terminal that sends a lone 
 return works as Enter (`serial-cr`); the system boots off a disk this repo partitioned
 (`image`); the installer walks all seven screens and writes a disk (`install`); and that
 disk boots, mounts its ext2 root, takes its identity from the `/etc/passwd` it was installed
-with, and gets four different answers to four files whose permissions differ (`installed`).
+with, and gets four different answers to four files whose permissions differ (`installed`);
+the shell and a ring-3 program both write to that root, and a directory that is not empty
+refuses to be deleted (`write`); and a second boot of the same disk finds what was written,
+does not find what was deleted, and still has the installer's files (`persist`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -624,7 +674,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 13c | `kill`: a program that never ends can be stopped, and its memory comes back | **done** |
 | 13d | Waiting stops burning the processor: blocked tasks, `sleep`, an idle CPU | **done** |
 | 14a | ext2 can be changed in place: create, write, truncate, delete, one writer | **done** |
-| 14b | The kernel writes: `open` for writing, `write`, `mkdir`, `rm`, files that survive a reboot | next |
+| 14b | The kernel writes: `open` for writing, `write`, `mkdir`, `rm`, files that survive a reboot | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

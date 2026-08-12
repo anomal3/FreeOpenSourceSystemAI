@@ -21,9 +21,16 @@ use crate::vfs::{DirEntry, FileSystem, Metadata, Node, NodeKind, VfsError, VfsRe
 use crate::virtio::blk::VirtioBlk;
 
 /// Диск вместе с разобранной на нём файловой системой.
+///
+/// Читатель и редактор держатся оба и намеренно: они смотрят на один том с
+/// разных сторон и ничего друг у друга не кэшируют. Читатель помнит только
+/// расположение таблиц inode, которое не меняется никогда; редактор — счётчики
+/// свободного, которые меняет он сам. Общей изменяемой памяти у них нет, а
+/// значит нет и вопроса, кто чью копию не обновил.
 struct Inner {
     disk: VirtioBlk,
     fs: ext2::Ext2,
+    editor: ext2::Editor,
 }
 
 /// Смонтированный том.
@@ -51,6 +58,10 @@ fn convert(err: ext2::Error) -> VfsError {
         ext2::Error::BadName => VfsError::BadPath,
         ext2::Error::NoMemory => VfsError::OutOfMemory,
         ext2::Error::Unsupported => VfsError::Unsupported,
+        ext2::Error::Exists => VfsError::Exists,
+        ext2::Error::NotEmpty => VfsError::NotEmpty,
+        ext2::Error::IsADirectory => VfsError::WrongKind,
+        ext2::Error::NoSpace | ext2::Error::NoInodes => VfsError::NoSpace,
         _ => VfsError::Corrupt,
     }
 }
@@ -79,14 +90,31 @@ impl Ext2Fs {
     /// Смонтировать том, начинающийся с сектора `first_lba`.
     pub fn mount(mut disk: VirtioBlk, first_lba: u64) -> VfsResult<Ext2Mount> {
         let fs = ext2::Ext2::mount(&mut disk, first_lba).map_err(convert)?;
+        let editor = ext2::Editor::open(&mut disk, first_lba).map_err(convert)?;
         Ok(Ext2Mount(Arc::new(Self {
-            inner: SpinLock::new(Inner { disk, fs }),
+            inner: SpinLock::new(Inner { disk, fs, editor }),
         })))
+    }
+
+    /// Выполнить изменение тома и записать счётчики.
+    ///
+    /// Сброс после **каждой** операции, а не по закрытию файла: счётчики
+    /// свободного живут в памяти редактора, и уйди машина в перезагрузку до
+    /// сброса — новый редактор прочитал бы с диска устаревшие числа и выдал бы
+    /// под новый файл блок, уже занятый старым. Не потеря счётчиков, а потеря
+    /// данных. Цена — с десяток записей блоков на операцию, и это ровно то
+    /// место, где такую цену стоит платить не глядя.
+    fn change<R>(&self, action: impl FnOnce(&mut Inner) -> VfsResult<R>) -> VfsResult<R> {
+        let mut guard = self.inner.lock();
+        let result = action(&mut guard)?;
+        let Inner { disk, editor, .. } = &mut *guard;
+        editor.flush(disk).map_err(convert)?;
+        Ok(result)
     }
 
     fn root_inode(&self) -> VfsResult<ext2::Inode> {
         let mut guard = self.inner.lock();
-        let Inner { disk, fs } = &mut *guard;
+        let Inner { disk, fs, .. } = &mut *guard;
         fs.root(disk).map_err(convert)
     }
 }
@@ -136,13 +164,13 @@ impl Node for Ext2Node {
             return Err(VfsError::WrongKind);
         }
         let mut guard = self.fs.inner.lock();
-        let Inner { disk, fs } = &mut *guard;
+        let Inner { disk, fs, .. } = &mut *guard;
         fs.read_at(disk, &self.inode, offset, buf).map_err(convert)
     }
 
     fn list(&self) -> VfsResult<Vec<DirEntry>> {
         let mut guard = self.fs.inner.lock();
-        let Inner { disk, fs } = &mut *guard;
+        let Inner { disk, fs, .. } = &mut *guard;
         let entries = fs.list(disk, &self.inode).map_err(convert)?;
 
         let mut out = Vec::new();
@@ -169,12 +197,90 @@ impl Node for Ext2Node {
     fn lookup(&self, name: &str) -> VfsResult<Box<dyn Node>> {
         let inode = {
             let mut guard = self.fs.inner.lock();
-            let Inner { disk, fs } = &mut *guard;
+            let Inner { disk, fs, .. } = &mut *guard;
             let entry = fs
                 .lookup(disk, &self.inode, name)
                 .map_err(convert)?
                 .ok_or(VfsError::NotFound)?;
             fs.inode(disk, entry.inode).map_err(convert)?
+        };
+        Ok(Box::new(Ext2Node { fs: Arc::clone(&self.fs), inode }))
+    }
+
+    fn write_at(&self, offset: u64, data: &[u8]) -> VfsResult<usize> {
+        if self.inode.kind != ext2::FileType::Regular {
+            return Err(VfsError::WrongKind);
+        }
+        self.fs.change(|inner| {
+            inner
+                .editor
+                .write_at(&mut inner.disk, self.inode.number, offset, data)
+                .map_err(convert)
+        })
+    }
+
+    fn truncate(&self, size: u64) -> VfsResult<()> {
+        if self.inode.kind != ext2::FileType::Regular {
+            return Err(VfsError::WrongKind);
+        }
+        self.fs.change(|inner| {
+            inner
+                .editor
+                .truncate(&mut inner.disk, self.inode.number, size)
+                .map_err(convert)
+        })
+    }
+
+    fn create(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
+        let number = self.fs.change(|inner| {
+            inner
+                .editor
+                .create(&mut inner.disk, self.inode.number, name, mode, uid, gid)
+                .map_err(convert)
+        })?;
+        self.child(number)
+    }
+
+    fn mkdir(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
+        let number = self.fs.change(|inner| {
+            inner
+                .editor
+                .mkdir(&mut inner.disk, self.inode.number, name, mode, uid, gid)
+                .map_err(convert)
+        })?;
+        self.child(number)
+    }
+
+    fn unlink(&self, name: &str) -> VfsResult<()> {
+        self.fs.change(|inner| {
+            inner
+                .editor
+                .unlink(&mut inner.disk, self.inode.number, name)
+                .map_err(convert)
+        })
+    }
+
+    fn rmdir(&self, name: &str) -> VfsResult<()> {
+        self.fs.change(|inner| {
+            inner
+                .editor
+                .rmdir(&mut inner.disk, self.inode.number, name)
+                .map_err(convert)
+        })
+    }
+}
+
+impl Ext2Node {
+    /// Узел по номеру inode — то, что возвращают создающие операции.
+    ///
+    /// Inode перечитывается с диска, а не собирается из того, что мы только что
+    /// записали: так возвращённый узел описывает том, а не наши намерения
+    /// насчёт него.
+    fn child(&self, number: u32) -> VfsResult<Box<dyn Node>> {
+        let inode = {
+            let mut guard = self.fs.inner.lock();
+            let Inner { disk, fs, .. } = &mut *guard;
+            fs.inode(disk, number).map_err(convert)?
         };
         Ok(Box::new(Ext2Node { fs: Arc::clone(&self.fs), inode }))
     }

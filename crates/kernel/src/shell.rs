@@ -26,7 +26,8 @@ use alloc::string::String;
 use crate::input::line::{Edit, LineEditor};
 use crate::input::{self, KeyCode};
 use crate::sync::SpinLock;
-use crate::vfs::NodeKind;
+use crate::vfs::perm::Access;
+use crate::vfs::{NodeKind, VfsError};
 use crate::{fs, irq, kprint, mm, sched, ui, usb, user};
 
 /// Приглашение к вводу.
@@ -367,7 +368,38 @@ fn run_command(line: &str) -> bool {
                 show(argument);
             }
         }
-        "echo" => sprintln!("  {argument}"),
+        // `echo текст > путь` — единственное перенаправление, какое здесь
+        // есть, и оно живёт внутри команды, а не в разборе строки. Настоящее
+        // перенаправление означает, что вывод команды — это дескриптор, который
+        // оболочка вправе подменить; дескрипторов у команд оболочки нет, они
+        // печатают напрямую. Обещать `>` для всех команд, сделав его для одной,
+        // было бы хуже, чем не обещать вовсе.
+        "echo" => match argument.split_once('>') {
+            Some((text, path)) => save(path.trim(), text.trim_end()),
+            None => sprintln!("  {argument}"),
+        },
+        "mkdir" => {
+            if argument.is_empty() {
+                sprintln!("  usage: mkdir <path>");
+            } else {
+                match fs::mkdir_as(user::session::credentials(), argument, 0o755) {
+                    Some(Ok(())) => sprintln!("  created {argument}"),
+                    Some(Err(err)) => sprintln!("  mkdir {argument}: {err}"),
+                    None => sprintln!("  no filesystem is mounted"),
+                }
+            }
+        }
+        "rm" => {
+            if argument.is_empty() {
+                sprintln!("  usage: rm <path>");
+            } else {
+                match fs::remove_as(user::session::credentials(), argument) {
+                    Some(Ok(())) => sprintln!("  removed {argument}"),
+                    Some(Err(err)) => sprintln!("  rm {argument}: {err}"),
+                    None => sprintln!("  no filesystem is mounted"),
+                }
+            }
+        }
         "whoami" => whoami(),
         "run" => {
             if argument.is_empty() {
@@ -402,7 +434,9 @@ fn help() {
     sprintln!("  tasks         scheduler state");
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
     sprintln!("  cat <path>    print a file, up to {CAT_LIMIT} bytes");
-    sprintln!("  echo <text>   print the text back");
+    sprintln!("  echo <text>   print the text back; 'echo t > path' writes a file");
+    sprintln!("  mkdir <path>  create a directory");
+    sprintln!("  rm <path>     delete a file or an empty directory");
     sprintln!("  whoami        the identity programs are run with");
     sprintln!("  run [-b] <p>  run a program outside the kernel; -b does not wait");
     sprintln!("  kill <task>   stop a running program by its task number");
@@ -513,6 +547,66 @@ fn run_program(argument: &str) {
                 sched::wait(id);
             }
         }
+        Err(err) => sprintln!("  {path}: {err}"),
+    }
+}
+
+/// Записать строку в файл, создав его или заменив содержимое.
+///
+/// Права проверяются как у программы — от имени сеанса, а не от имени ядра.
+/// Оболочка исполняется в кольце ноль и могла бы писать мимо проверок; делать
+/// так значило бы, что `echo > /root/x` от обычного пользователя проходит там,
+/// где `run /bin/save` получает отказ.
+fn save(path: &str, text: &str) {
+    if path.is_empty() {
+        sprintln!("  usage: echo <text> > <path>");
+        return;
+    }
+    let cred = user::session::credentials();
+
+    // Существующий файл открывается и обрезается, отсутствующий создаётся.
+    // Порядок именно такой: `create` на существующем имени — это отказ
+    // «занято», и подменять им «перезаписать» значило бы врать про причину.
+    let node = match fs::resolve_as(cred, path, Access::WRITE) {
+        Some(Ok(node)) => Some(node),
+        Some(Err(VfsError::NotFound)) => None,
+        Some(Err(err)) => {
+            sprintln!("  {path}: {err}");
+            return;
+        }
+        None => {
+            sprintln!("  no filesystem is mounted");
+            return;
+        }
+    };
+
+    let node = match node {
+        Some(node) => match node.truncate(0) {
+            Ok(()) => node,
+            Err(err) => {
+                sprintln!("  {path}: {err}");
+                return;
+            }
+        },
+        None => match fs::create_as(cred, path, 0o644) {
+            Some(Ok(node)) => node,
+            Some(Err(err)) => {
+                sprintln!("  {path}: {err}");
+                return;
+            }
+            None => {
+                sprintln!("  no filesystem is mounted");
+                return;
+            }
+        },
+    };
+
+    // Перевод строки дописывается: файл без него — это строка, которую всякая
+    // читающая программа склеит со следующей.
+    let mut line = String::from(text);
+    line.push('\n');
+    match node.write_at(0, line.as_bytes()) {
+        Ok(written) => sprintln!("  wrote {written} bytes to {path}"),
         Err(err) => sprintln!("  {path}: {err}"),
     }
 }

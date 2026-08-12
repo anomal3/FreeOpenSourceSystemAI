@@ -20,15 +20,28 @@
 
 use alloc::boxed::Box;
 
-use user_abi::{FD_FIRST, MAX_OPEN_FILES};
+use user_abi::{FD_FIRST, MAX_OPEN_FILES, O_CREATE, O_TRUNC, O_WRITE};
+
+/// Права, с которыми создаётся файл по [`O_CREATE`].
+///
+/// Постоянная, а не аргумент вызова: `umask` и режим создания — это уже
+/// политика, а её место там, где есть кому её задавать. Читать всем, писать
+/// владельцу — то же, что даёт `touch` под обычным `umask` 022.
+const DEFAULT_MODE: u16 = 0o644;
 
 use crate::vfs::perm::{Access, Credentials};
 use crate::vfs::{Node, NodeKind, VfsError};
 
-/// Открытый файл: узел и то, докуда программа его дочитала.
+/// Открытый файл: узел, то, докуда программа его дочитала, и можно ли в него
+/// писать.
 struct Open {
     node: Box<dyn Node>,
     offset: u64,
+    /// Право писать спрошено при открытии и запомнено здесь. Перепроверять его
+    /// на каждой записи не нужно и неверно: в Unix смена прав не отбирает уже
+    /// открытый файл, и ровно на это рассчитывает всякий, кто держит файл
+    /// открытым дольше одной операции.
+    writable: bool,
 }
 
 /// Почему не получилось.
@@ -61,10 +74,23 @@ impl Table {
     /// Права проверяются здесь и только здесь: дальше дескриптор уже открыт, и
     /// перепроверять его на каждом чтении не нужно — ровно так же, как в Unix,
     /// где смена прав не отбирает уже открытый файл.
-    pub fn open(&mut self, cred: Credentials, path: &str) -> Result<usize, FileError> {
-        let node = crate::fs::resolve_as(cred, path, Access::READ)
-            .ok_or(FileError::NoFilesystem)?
-            .map_err(FileError::Vfs)?;
+    pub fn open(&mut self, cred: Credentials, path: &str, flags: usize) -> Result<usize, FileError> {
+        let writable = flags & O_WRITE != 0;
+        let want = if writable { Access::WRITE } else { Access::READ };
+
+        let node = match crate::fs::resolve_as(cred, path, want) {
+            Some(Ok(node)) => node,
+            // Файла нет, но просили создать. Создаём — от имени того же
+            // сеанса и в том каталоге, который назвал путь; право писать в этот
+            // каталог спросит `create_as`.
+            Some(Err(VfsError::NotFound)) if flags & O_CREATE != 0 => {
+                crate::fs::create_as(cred, path, DEFAULT_MODE)
+                    .ok_or(FileError::NoFilesystem)?
+                    .map_err(FileError::Vfs)?
+            }
+            Some(Err(err)) => return Err(FileError::Vfs(err)),
+            None => return Err(FileError::NoFilesystem),
+        };
 
         // Каталог открывать нечем: вызова, который вернул бы список имён, в
         // договоре нет. Отказать здесь честнее, чем отдать дескриптор, любое
@@ -72,14 +98,29 @@ impl Table {
         if node.metadata().kind != NodeKind::File {
             return Err(FileError::Vfs(VfsError::WrongKind));
         }
+        if flags & O_TRUNC != 0 && writable {
+            node.truncate(0).map_err(FileError::Vfs)?;
+        }
 
         let slot = self
             .slots
             .iter()
             .position(Option::is_none)
             .ok_or(FileError::TooManyFiles)?;
-        self.slots[slot] = Some(Open { node, offset: 0 });
+        self.slots[slot] = Some(Open { node, offset: 0, writable });
         Ok(slot + FD_FIRST)
+    }
+
+    /// Записать в дескриптор. Возвращает, сколько записано.
+    pub fn write(&mut self, fd: usize, data: &[u8]) -> Result<usize, FileError> {
+        let index = index_of(fd)?;
+        let open = self.slots[index].as_mut().ok_or(FileError::BadFd)?;
+        if !open.writable {
+            return Err(FileError::Vfs(VfsError::PermissionDenied));
+        }
+        let written = open.node.write_at(open.offset, data).map_err(FileError::Vfs)?;
+        open.offset += written as u64;
+        Ok(written)
     }
 
     /// Прочитать из дескриптора в буфер. Возвращает, сколько прочитано; ноль —
