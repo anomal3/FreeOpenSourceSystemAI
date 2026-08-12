@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 18 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 19 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -501,6 +501,38 @@ firmware clock is wrong stays wrong until it is fixed in firmware; a machine who
 has no clock at all says so, marks its files with zero, and prints `unknown` rather than
 inventing a date.
 
+### What a program is given
+
+Until now a program received nothing. It could print, read a file whose path was compiled
+into it, and ask how long the machine had been up — and that was the whole of it. Three
+things were missing, and each of them is small on its own; together they are the difference
+between a demo and a program someone would write.
+
+**Arguments.** The kernel writes them into the program's own stack before entering ring 3 —
+the strings, then an array of pointers to them — and passes the count and the array address
+in registers. Registers rather than a stack layout, because System V and AAPCS64 disagree
+about the layout and agree about the first two arguments; the entry point is `extern "C"`,
+so the program declares `_start(argc, argv)` and the compiler does the rest. Argument zero
+is the path the program was launched with, as everywhere in Unix — a program printing its
+own name in an error message has nowhere else to get it.
+
+**`seek`.** The descriptor always had a position; nothing could move it. So a file could
+only be read straight through, and a program wanting the last line of a log, or merely its
+size, had to read everything else first. `SEEK_END` with an offset of zero is now how you
+ask how big a file is — asked of the descriptor, not of the name, because a name can point
+somewhere else by the time you ask.
+
+**The time of day.** The kernel has had a wall clock since Phase 16 and kept it to itself.
+Zero means "the system does not know", not 1970, and the distinction is in the contract
+because a program stamping a file must be able to tell those apart.
+
+`/bin/wc` uses all three: it counts lines, words and bytes of the file named on the command
+line, and checks its own answer — the size from `seek` must equal the bytes it read. Two
+numbers by two different routes; they agree only if `seek` really moves the position. The
+bench asserts the exact counts (18 lines, 143 words, 853 bytes of this repository's
+`initrd/README.TXT`), because "something was counted" reads the same as "the wrong thing was
+counted".
+
 ### Interrupts instead of polling
 
 The USB controller could always interrupt the processor; the kernel just never asked it to,
@@ -811,6 +843,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 16 | The time of day: the firmware clock, a time zone, and files stamped with when they were written | **done** |
 | 17 | Time that does not depend on interrupts arriving: a monotonic counter, and the boot lag subtracted | **done** |
 | 18 | Interrupts instead of polling: MSI-X on both architectures, and a driver that sleeps until something happens | **done** |
+| 19 | Programs get told what to do: arguments, `seek`, and the time of day | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

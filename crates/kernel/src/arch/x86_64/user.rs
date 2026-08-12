@@ -65,7 +65,8 @@ global_asm!(
     ".globl x86_enter_user",
     ".hidden x86_enter_user",
     "x86_enter_user:",
-    // rdi — точка входа, rsi — вершина пользовательского стека.
+    // rdi — точка входа, rsi — вершина пользовательского стека, rdx — argc,
+    // rcx — адрес массива argv в памяти программы.
     "push rbx",
     "push rbp",
     "push r12",
@@ -90,13 +91,13 @@ global_asm!(
     "mov ax, {user_ss}",
     "mov ds, ax",
     "mov es, ax",
-    // Стереть всё, что могло остаться от ядра.
+    // Стереть всё, что могло остаться от ядра. Порядок здесь не произвольный:
+    // `rdx` и `rcx` несут аргументы программы и потому переставляются в `rdi` и
+    // `rsi` (первые два аргумента System V) **после** того, как всё остальное
+    // обнулено, и стираются сами уже за ними. Обнулить их вместе с прочими
+    // значило бы передать программе два нуля вместо аргументов.
     "xor eax, eax",
     "xor ebx, ebx",
-    "xor ecx, ecx",
-    "xor edx, edx",
-    "xor esi, esi",
-    "xor edi, edi",
     "xor ebp, ebp",
     "xor r8d, r8d",
     "xor r9d, r9d",
@@ -106,6 +107,10 @@ global_asm!(
     "xor r13d, r13d",
     "xor r14d, r14d",
     "xor r15d, r15d",
+    "mov rdi, rdx",
+    "mov rsi, rcx",
+    "xor edx, edx",
+    "xor ecx, ecx",
     "iretq",
 
     ".balign 16",
@@ -136,7 +141,7 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    fn x86_enter_user(entry: usize, stack: usize) -> i64;
+    fn x86_enter_user(entry: usize, stack: usize, argc: usize, argv: usize) -> i64;
     fn x86_return_to_kernel(code: i64) -> !;
 }
 
@@ -148,9 +153,9 @@ unsafe extern "C" {
 /// `entry` и `stack` должны указывать в отображённую и доступную из третьего
 /// кольца память, а `TSS.RSP0` — быть выставленным (это делает
 /// [`super::gdt::init`]).
-pub unsafe fn enter_user(entry: usize, stack: usize) -> i64 {
+pub unsafe fn enter_user(entry: usize, stack: usize, argc: usize, argv: usize) -> i64 {
     // SAFETY: контракт функции.
-    unsafe { x86_enter_user(entry, stack) }
+    unsafe { x86_enter_user(entry, stack, argc, argv) }
 }
 
 /// Вернуться в ядро из обработчика, бросив пользовательский контекст.

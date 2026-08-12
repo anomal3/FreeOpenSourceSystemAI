@@ -55,6 +55,20 @@ pub enum FileError {
     TooManyFiles,
     /// Отказала файловая система — включая отказ в правах.
     Vfs(VfsError),
+    /// Позиция ушла за пределы того, что представимо: до начала файла или за
+    /// границу 64 бит.
+    BadOffset,
+}
+
+/// От чего считается смещение в [`Table::seek`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Whence {
+    /// От начала файла.
+    Set,
+    /// От текущей позиции.
+    Current,
+    /// От конца файла.
+    End,
 }
 
 /// Таблица дескрипторов одной программы. Место `i` — это дескриптор
@@ -133,6 +147,33 @@ impl Table {
         // это разные числа, и второе увело бы следующее чтение за конец.
         open.offset += read as u64;
         Ok(read)
+    }
+
+    /// Передвинуть позицию и вернуть новую.
+    ///
+    /// Позиция за концом файла разрешена: так делают все, кто пишет разрежённые
+    /// файлы, и запрещать это на уровне дескриптора нельзя — вопрос, что
+    /// произойдёт при записи туда, решает файловая система, а не таблица.
+    /// Отрицательная позиция запрещена: она не значит ничего, и её молчаливое
+    /// обрезание до нуля превратило бы ошибку в счёте программы в тихо неверные
+    /// данные.
+    pub fn seek(&mut self, fd: usize, offset: i64, whence: Whence) -> Result<u64, FileError> {
+        let index = index_of(fd)?;
+        let open = self.slots[index].as_mut().ok_or(FileError::BadFd)?;
+        let base = match whence {
+            Whence::Set => 0,
+            Whence::Current => open.offset,
+            // Размер спрашивается у узла, а не запоминается при открытии: файл
+            // мог вырасти с тех пор — в том числе от записи через этот же
+            // дескриптор.
+            Whence::End => open.node.metadata().size,
+        };
+
+        let Some(position) = base.checked_add_signed(offset) else {
+            return Err(FileError::BadOffset);
+        };
+        open.offset = position;
+        Ok(position)
     }
 
     /// Закрыть дескриптор.

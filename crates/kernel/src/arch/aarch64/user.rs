@@ -40,7 +40,8 @@ global_asm!(
 .globl aarch64_enter_user
 .hidden aarch64_enter_user
 aarch64_enter_user:
-    // x0 — точка входа, x1 — вершина пользовательского стека.
+    // x0 — точка входа, x1 — вершина пользовательского стека, x2 — argc,
+    // x3 — адрес массива argv в памяти программы.
     sub     sp, sp, #96
     stp     x19, x20, [sp, #0]
     stp     x21, x22, [sp, #16]
@@ -63,8 +64,11 @@ aarch64_enter_user:
 
     // Стереть всё, что могло остаться от ядра: в регистрах лежат адреса его
     // структур, и отдать их программе значило бы отдать раскладку памяти.
-    mov     x0, xzr
-    mov     x1, xzr
+    // Аргументы программы переставляются в x0/x1 — первые два по AAPCS64 — и
+    // только потом стираются их исходные регистры. Обнулить x2/x3 вместе со
+    // всеми значило бы передать программе два нуля вместо аргументов.
+    mov     x0, x2
+    mov     x1, x3
     mov     x2, xzr
     mov     x3, xzr
     mov     x4, xzr
@@ -129,7 +133,7 @@ aarch64_return_to_kernel:
 );
 
 unsafe extern "C" {
-    fn aarch64_enter_user(entry: usize, stack: usize) -> i64;
+    fn aarch64_enter_user(entry: usize, stack: usize, argc: usize, argv: usize) -> i64;
     fn aarch64_return_to_kernel(code: i64) -> !;
 }
 
@@ -138,9 +142,9 @@ unsafe extern "C" {
 /// # Safety
 ///
 /// `entry` и `stack` должны указывать в память, отображённую доступной из EL0.
-pub unsafe fn enter_user(entry: usize, stack: usize) -> i64 {
+pub unsafe fn enter_user(entry: usize, stack: usize, argc: usize, argv: usize) -> i64 {
     // SAFETY: контракт функции.
-    unsafe { aarch64_enter_user(entry, stack) }
+    unsafe { aarch64_enter_user(entry, stack, argc, argv) }
 }
 
 /// Вернуться в ядро из обработчика, бросив контекст программы.

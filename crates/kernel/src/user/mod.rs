@@ -242,6 +242,84 @@ fn write_image(frames: &[PhysAddr], offset: usize, data: &[u8]) {
     }
 }
 
+/// Разложить аргументы в верхней странице стека программы.
+///
+/// Возвращает `(argc, адрес массива argv, новую вершину стека)` — всё в
+/// адресах программы.
+///
+/// # Раскладка
+///
+/// Сверху вниз: сначала сами строки (каждая с завершающим нулём), под ними
+/// массив указателей на них, и всё это — выше новой вершины стека. Программа
+/// получает `argc` и адрес массива регистрами, а не находит их на стеке: у двух
+/// архитектур это были бы два разных соглашения, а регистры одинаковы —
+/// System V и AAPCS64 передают первые два аргумента одинаково по смыслу.
+///
+/// Строки заканчиваются нулём, потому что иначе их длину пришлось бы передавать
+/// отдельным массивом: программе нужен `&str`, а `&str` — это адрес и длина.
+/// Ноль в конце — тот же способ, которым это решает C, и здесь он выбран не из
+/// уважения к традиции, а потому что второй массив пришлось бы держать в том же
+/// стеке и объяснять его формат в договоре.
+///
+/// # Что если не помещается
+///
+/// Лишние аргументы отбрасываются, а не роняют запуск. Ограничение — одна
+/// страница на всё; аргумент, который в неё не влез, — это командная строка в
+/// четыре килобайта, и она встречается там, где кто-то её подставил, а не там,
+/// где человек её набрал.
+fn place_args(frame: PhysAddr, args: &[&str]) -> (usize, usize, usize) {
+    /// Сколько места отдано аргументам: вся верхняя страница стека.
+    const AREA: usize = PAGE_SIZE;
+    /// Выравнивание вершины стека, которого требуют оба соглашения о вызовах.
+    const ALIGN: usize = 16;
+
+    // Смещение внутри страницы; растёт сверху вниз, как и сам стек.
+    let mut top = AREA;
+    // Кадр принадлежит стеку этой программы и доступен через прямое отображение
+    // ядра; писать в него до входа в третье кольцо некому больше.
+    let page = frame_bytes(frame);
+
+    let mut pointers = Vec::new();
+    if pointers.try_reserve_exact(args.len()).is_err() {
+        return (0, 0, STACK_TOP - ALIGN);
+    }
+
+    for arg in args {
+        let needed = arg.len() + 1;
+        // Место под массив указателей резервируется здесь же: без этой проверки
+        // строки могли бы занять страницу целиком, и массиву не осталось бы
+        // ничего.
+        let reserved = (pointers.len() + 1) * size_of::<usize>() + ALIGN;
+        if top < needed + reserved {
+            break;
+        }
+        top -= needed;
+        // SAFETY: `top` и длина проверены выше — запись целиком внутри страницы.
+        unsafe {
+            core::ptr::copy_nonoverlapping(arg.as_ptr(), page.add(top), arg.len());
+            page.add(top + arg.len()).write(0);
+        }
+        pointers.push(STACK_TOP - AREA + top);
+    }
+
+    // Массив указателей — под строками, выровненный по размеру указателя.
+    top &= !(size_of::<usize>() - 1);
+    let array_bytes = pointers.len() * size_of::<usize>();
+    top -= array_bytes;
+    for (index, pointer) in pointers.iter().enumerate() {
+        // SAFETY: место под массив зарезервировано в цикле выше.
+        unsafe {
+            page.add(top + index * size_of::<usize>())
+                .cast::<usize>()
+                .write_unaligned(*pointer);
+        }
+    }
+
+    let argv = STACK_TOP - AREA + top;
+    let stack = (argv - ALIGN) & !(ALIGN - 1);
+    (pointers.len(), argv, stack)
+}
+
 /// Выделить кадр под страницу программы.
 fn take_frame() -> Result<PhysAddr, Error> {
     crate::mm::frame::with(|frames| frames.allocate())
@@ -323,8 +401,19 @@ fn read_image(node: &dyn crate::vfs::Node) -> Result<Vec<u8>, Error> {
     Ok(bytes)
 }
 
+/// Что получилось из разложенного образа: точка входа и верхняя страница стека.
+///
+/// Кадр стека нужен снаружи, чтобы записать туда аргументы. Писать их через
+/// адреса программы было бы нельзя: к моменту, когда пространство активно, и
+/// возможно только через прямое отображение — тем же способом, каким сюда
+/// попадает содержимое сегментов.
+struct Loaded {
+    entry: usize,
+    stack_top_frame: PhysAddr,
+}
+
 /// Разложить программу по её адресному пространству и вернуть точку входа.
-fn load(space: &mut Space, bytes: &[u8]) -> Result<usize, Error> {
+fn load(space: &mut Space, bytes: &[u8]) -> Result<Loaded, Error> {
     let image = elf::Image::parse(bytes).map_err(Error::Elf)?;
     let flags = image_flags(&image)?;
 
@@ -352,8 +441,14 @@ fn load(space: &mut Space, bytes: &[u8]) -> Result<usize, Error> {
         pages.push(frame);
     }
 
+    let mut stack_top_frame = PhysAddr::new(0);
     for page in 0..STACK_PAGES {
         let frame = take_frame()?;
+        // Верхняя страница — та, в которую упирается `STACK_TOP`, и именно в
+        // неё лягут аргументы.
+        if page == STACK_PAGES - 1 {
+            stack_top_frame = frame;
+        }
         // SAFETY: см. выше; стек — обычная память программы на чтение и запись.
         let mapped = unsafe {
             space.map(
@@ -377,7 +472,7 @@ fn load(space: &mut Space, bytes: &[u8]) -> Result<usize, Error> {
         write_image(&pages, segment.vaddr - WINDOW_BASE, source);
     }
 
-    Ok(image.entry)
+    Ok(Loaded { entry: image.entry, stack_top_frame })
 }
 
 /// Напечатать то, ради чего фаза затевалась: где лежит программа и чего о ней
@@ -407,7 +502,7 @@ fn report(space: &Space, entry: usize) {
 /// Загрузить программу по пути и исполнить её в текущей задаче.
 ///
 /// Возвращает код, с которым программа завершилась.
-fn run(path: &str) -> Result<i64, Error> {
+fn run(path: &str, args: &[&str]) -> Result<i64, Error> {
     // Право исполнить спрашивается до чтения файла, и спрашивается от имени
     // сеанса. Это тот же вопрос, который в Unix задаёт `execve`, и задавать его
     // обязано ядро: программа, которой не дали бы прочитать файл, не должна
@@ -422,13 +517,15 @@ fn run(path: &str) -> Result<i64, Error> {
     let bytes = read_image(&*node)?;
 
     let mut space = Space::new().map_err(Error::Map)?;
-    let entry = load(&mut space, &bytes)?;
+    let loaded = load(&mut space, &bytes)?;
+    let entry = loaded.entry;
     let root = space.root();
 
-    // Вершина стека выравнивается на 16: этого требуют оба соглашения о
-    // вызовах, и невыровненный стек ломается не сразу, а на первой же операции
-    // с вектором.
-    let stack = STACK_TOP - 16;
+    // Аргументы кладутся в стек программы до входа в третье кольцо. Вершина
+    // стека при этом опускается под них и выравнивается на 16: этого требуют
+    // оба соглашения о вызовах, и невыровненный стек ломается не сразу, а на
+    // первой же операции с вектором.
+    let (argc, argv, stack) = place_args(loaded.stack_top_frame, args);
 
     let id = sched::current();
     kprintln!(
@@ -470,7 +567,7 @@ fn run(path: &str) -> Result<i64, Error> {
     // SAFETY: точка входа и стек лежат в окне, только что отображённом
     // доступным из пользовательского режима; стек ловушки выставит сам вход в
     // третье кольцо.
-    let code = unsafe { arch::enter_user(entry, stack) };
+    let code = unsafe { arch::enter_user(entry, stack, argc, argv) };
 
     // Сюда возвращаются оба пути: и `exit`, и снятие программы после отказа.
     //
@@ -510,19 +607,30 @@ fn run(path: &str) -> Result<i64, Error> {
 /// глубина переехала сюда.
 const PROGRAM_STACK_SIZE: usize = 64 * 1024;
 
-/// Путь к программе в том виде, в каком его получает новая задача.
+/// Командная строка в том виде, в каком её получает новая задача.
 ///
-/// Массив, а не `String`: аргумент задачи — одно машинное слово, значит путь
-/// уезжает через кучу, а выделение под него обязано уметь отказать вместо
-/// паники. `String::into_boxed_str` этого не умеет.
+/// Массив, а не `String`: аргумент задачи — одно машинное слово, значит строка
+/// уезжает через кучу, а выделение под неё обязано уметь отказать вместо паники.
+/// `String::into_boxed_str` этого не умеет.
+///
+/// Хранится целиком, вместе с аргументами, и разбирается уже в новой задаче.
+/// Разобрать её здесь и передать `&[&str]` было бы нельзя: срезы указывали бы в
+/// память вызывающего, а он к моменту запуска давно вернулся из `spawn`.
 #[repr(C)]
 struct Request {
-    path: [u8; MAX_PATH],
+    line: [u8; MAX_LINE],
     len: usize,
 }
 
-/// Самый длинный путь, который принимает [`spawn`].
-const MAX_PATH: usize = 255;
+/// Самая длинная командная строка, которую принимает [`spawn`].
+const MAX_LINE: usize = 255;
+
+/// Сколько аргументов программа получает самое большее.
+///
+/// Восемь — не свойство программы, а предел на разбор: аргументы разбираются в
+/// массив на стеке ядра, и брать его длину из того, что набрал человек, значило
+/// бы отдать ему глубину этого стека.
+const MAX_ARGS: usize = 8;
 
 /// Запустить программу отдельной задачей.
 ///
@@ -531,8 +639,8 @@ const MAX_PATH: usize = 255;
 /// перестала быть вызовом внутри оболочки: у неё своя задача, свой стек ядра,
 /// своё адресное пространство и свои открытые файлы, и пока она считает,
 /// оболочка отвечает.
-pub fn spawn(path: &str) -> Result<sched::TaskId, Error> {
-    if path.len() > MAX_PATH {
+pub fn spawn(line: &str) -> Result<sched::TaskId, Error> {
+    if line.len() > MAX_LINE {
         return Err(Error::Read(crate::vfs::VfsError::BadPath));
     }
 
@@ -543,8 +651,8 @@ pub fn spawn(path: &str) -> Result<sched::TaskId, Error> {
     if raw.is_null() {
         return Err(Error::OutOfMemory);
     }
-    let mut request = Request { path: [0; MAX_PATH], len: path.len() };
-    request.path[..path.len()].copy_from_slice(path.as_bytes());
+    let mut request = Request { line: [0; MAX_LINE], len: line.len() };
+    request.line[..line.len()].copy_from_slice(line.as_bytes());
     // SAFETY: блок только что выделен под `Request` с нужными размером и
     // выравниванием и никому больше не принадлежит.
     unsafe { core::ptr::write(raw, request) };
@@ -574,9 +682,30 @@ extern "C" fn program_entry(arg: usize) -> ! {
     // SAFETY: `arg` — указатель, выделенный в `spawn` и переданный ровно один
     // раз ровно этой задаче.
     let request = unsafe { alloc::boxed::Box::from_raw(arg as *mut Request) };
-    let path = core::str::from_utf8(&request.path[..request.len]).unwrap_or("");
+    let line = core::str::from_utf8(&request.line[..request.len]).unwrap_or("");
 
-    let code = match run(path) {
+    // Разбор здесь, а не в `spawn`: срезы указывают внутрь `request`, который
+    // живёт ровно столько, сколько эта задача. Первое слово — путь, остальные —
+    // аргументы программы; кавычек и экранирования нет, и обещать их, сделав
+    // разбиение по пробелам, было бы хуже, чем не обещать.
+    let mut words = line.split_whitespace();
+    let path = words.next().unwrap_or("");
+    let mut args: [&str; MAX_ARGS] = [""; MAX_ARGS];
+    let mut argc = 0;
+    // Нулевым аргументом идёт сам путь — так его видит всякая программа в Unix,
+    // и программе, печатающей своё имя в сообщении об ошибке, взять его больше
+    // неоткуда.
+    args[argc] = path;
+    argc += 1;
+    for word in words {
+        if argc == MAX_ARGS {
+            break;
+        }
+        args[argc] = word;
+        argc += 1;
+    }
+
+    let code = match run(path, &args[..argc]) {
         Ok(code) => {
             if code == user_abi::EXIT_KILLED {
                 report_line(path, "killed by request");

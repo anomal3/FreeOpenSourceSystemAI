@@ -29,6 +29,19 @@ pub extern "C" fn _start() -> ! {
         yield_now();
     }
 
+    // Время суток — не то же, что время работы: одно говорит, который час,
+    // другое — сколько машина включена. Ноль означал бы, что часов не было ни у
+    // прошивки, ни у платы, и программа обязана различать этот случай, а не
+    // печатать 1970 год с уверенным видом.
+    let now = user_progs::time_now();
+    if now == 0 {
+        println("the system does not know the time of day");
+    } else {
+        print("hello: epoch ");
+        print_u64(now);
+        println(" s");
+    }
+
     println("done, exiting with code 0");
     exit(0)
 }

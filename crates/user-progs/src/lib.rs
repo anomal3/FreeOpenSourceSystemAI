@@ -21,9 +21,11 @@ use core::panic::PanicInfo;
 
 use user_abi::{
     FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN, SYS_READ,
-    O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_REMOVE, SYS_SLEEP, SYS_STAT, SYS_UPTIME, SYS_WRITE,
-    SYS_YIELD, Stat,
+    O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_REMOVE, SYS_SEEK, SYS_SLEEP, SYS_STAT, SYS_TIME,
+    SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
 };
+
+pub use user_abi::{SEEK_CUR, SEEK_END, SEEK_SET};
 
 /// Выполнить системный вызов.
 ///
@@ -265,6 +267,121 @@ pub fn sleep_ms(ms: u64) {
 pub fn uptime_ms() -> u64 {
     // SAFETY: аргументов у вызова нет; результат — беззнаковое число.
     let value = unsafe { syscall(SYS_UPTIME, 0, 0, 0) };
+    value.max(0) as u64
+}
+
+/// Аргументы командной строки в том виде, в каком их передало ядро.
+///
+/// Программа получает их первыми двумя аргументами `_start`: число и адрес
+/// массива указателей на строки с завершающим нулём. Строки лежат в её
+/// собственном стеке — их положило туда ядро до входа в третье кольцо, — то
+/// есть читаются как обычная память, без единого системного вызова.
+///
+/// Нулевой аргумент — путь, которым программу запустили; так это устроено во
+/// всяком Unix, и программе, которая печатает своё имя в сообщении об ошибке,
+/// взять его больше неоткуда.
+pub struct Args {
+    argc: usize,
+    argv: *const *const u8,
+}
+
+impl Args {
+    /// Обернуть то, что пришло в `_start`.
+    ///
+    /// # Safety
+    ///
+    /// Вызывать можно только с теми значениями, которые ядро передало в
+    /// `_start`: указатель обязан вести на массив из `argc` строк, завершённых
+    /// нулём. Сочинить их самому и получить чтение чужой памяти — ровно то, от
+    /// чего эта пометка предостерегает.
+    #[must_use]
+    pub const unsafe fn new(argc: usize, argv: *const *const u8) -> Self {
+        Self { argc, argv }
+    }
+
+    /// Сколько аргументов, включая нулевой.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.argc
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.argc == 0
+    }
+
+    /// Аргумент по номеру. `None`, если такого нет.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&str> {
+        if index >= self.argc || self.argv.is_null() {
+            return None;
+        }
+        // SAFETY: индекс проверен, массив построен ядром по контракту `new`.
+        let pointer = unsafe { self.argv.add(index).read_unaligned() };
+        if pointer.is_null() {
+            return None;
+        }
+
+        // Длина ищется по завершающему нулю — с потолком: строка, у которой его
+        // почему-то не оказалось, иначе увела бы поиск за пределы стека.
+        let mut len = 0;
+        while len < MAX_ARG_LEN {
+            // SAFETY: читаем внутри строки, положенной ядром в стек этой
+            // программы; предел не даёт выйти за него, даже если нуля нет.
+            if unsafe { pointer.add(len).read() } == 0 {
+                break;
+            }
+            len += 1;
+        }
+
+        // SAFETY: адрес и длина получены выше; строки приходят от ядра, которое
+        // взяло их из командной строки — то есть из UTF-8.
+        let bytes = unsafe { core::slice::from_raw_parts(pointer, len) };
+        core::str::from_utf8(bytes).ok()
+    }
+}
+
+/// Предел длины одного аргумента при поиске завершающего нуля.
+const MAX_ARG_LEN: usize = 255;
+
+/// Передвинуть позицию в открытом файле, вернуть новую.
+///
+/// `whence` — [`SEEK_SET`], [`SEEK_CUR`] или [`SEEK_END`]. Смещение знаковое:
+/// `seek(fd, -16, SEEK_END)` — это «шестнадцать байт с конца», и именно так
+/// читают хвост файла, не читая всего остального.
+pub fn seek(fd: i64, offset: i64, whence: usize) -> i64 {
+    if fd < 0 {
+        return fd;
+    }
+    // SAFETY: аргументы — числа; ядро проверит дескриптор само.
+    unsafe { syscall(SYS_SEEK, fd as usize, offset as usize, whence) }
+}
+
+/// Размер открытого файла в байтах.
+///
+/// Написано через `seek`, а не через `stat`: `stat` спрашивает про имя, а имя
+/// могло к этому моменту указывать уже на другой файл. Дескриптор указывает на
+/// тот файл, который открыли.
+pub fn file_size(fd: i64) -> i64 {
+    let saved = seek(fd, 0, SEEK_CUR);
+    if saved < 0 {
+        return saved;
+    }
+    let size = seek(fd, 0, SEEK_END);
+    // Позиция возвращается на место: измерение не должно менять состояние того,
+    // что измеряют.
+    seek(fd, saved, SEEK_SET);
+    size
+}
+
+/// Текущее время в секундах эпохи Unix, UTC.
+///
+/// Ноль означает «система не знает, который час», а не 1970 год: часов не было
+/// ни у прошивки, ни у платы. Программе, ставящей метку, эти два случая
+/// различать обязательно.
+pub fn time_now() -> u64 {
+    // SAFETY: аргументов у вызова нет; результат — беззнаковое число.
+    let value = unsafe { syscall(SYS_TIME, 0, 0, 0) };
     value.max(0) as u64
 }
 

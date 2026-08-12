@@ -27,8 +27,8 @@ use user_abi::{
     ERR_BAD_ADDRESS, ERR_BAD_FD, ERR_BAD_PATH, ERR_IO, ERR_NOT_FOUND, ERR_NO_FILESYSTEM,
     ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_PERMISSION, ERR_TOO_MANY_FILES, ERR_UNSUPPORTED, FD_STDOUT,
     KIND_DIRECTORY, KIND_FILE, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN,
-    ERR_EXISTS, ERR_NOT_EMPTY, ERR_NO_SPACE, SYS_MKDIR, SYS_READ, SYS_REMOVE, SYS_SLEEP,
-    SYS_STAT, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    ERR_EXISTS, ERR_NOT_EMPTY, ERR_NO_SPACE, SEEK_CUR, SEEK_END, SEEK_SET, SYS_MKDIR, SYS_READ,
+    SYS_REMOVE, SYS_SEEK, SYS_SLEEP, SYS_STAT, SYS_TIME, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
 };
 
 use crate::mm::PageFlags;
@@ -36,7 +36,7 @@ use crate::vfs::perm::Access;
 use crate::vfs::{NodeKind, VfsError};
 use crate::{sched, time};
 
-use super::files::FileError;
+use super::files::{self, FileError};
 use super::space;
 
 /// Самый длинный путь, который ядро согласно принять от программы.
@@ -76,8 +76,12 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
             0
         }
         SYS_UPTIME => time::uptime_ms() as i64,
+        // Ноль — это «времени суток система не знает», а не 1970 год. Разница
+        // видна только тому, кто её проверяет, поэтому она названа в договоре.
+        SYS_TIME => time::now_unix().unwrap_or(0) as i64,
         SYS_OPEN => open(a0, a1, a2),
         SYS_READ => read(a0, a1, a2),
+        SYS_SEEK => seek(a0, a1 as i64, a2),
         SYS_CLOSE => close(a0),
         SYS_STAT => stat(a0, a1, a2),
         SYS_MKDIR => mkdir(a0, a1, a2),
@@ -202,6 +206,28 @@ fn read(fd: usize, ptr: usize, len: usize) -> i64 {
     }
 }
 
+/// `seek(fd, offset, whence)`.
+///
+/// Возвращает новую позицию. Смещение знаковое: назад двигаться можно, и
+/// именно это отличает `seek` от «пропустить вперёд, читая в никуда».
+fn seek(fd: usize, offset: i64, whence: usize) -> i64 {
+    let whence = match whence {
+        SEEK_SET => files::Whence::Set,
+        SEEK_CUR => files::Whence::Current,
+        SEEK_END => files::Whence::End,
+        // Неизвестное значение — не «возьмём начало по умолчанию»: программа
+        // просила не то, что получила бы, и молчаливая подстановка превратила
+        // бы её ошибку в тихо неверные данные.
+        _ => return ERR_UNSUPPORTED,
+    };
+
+    match super::with_current(|program| program.files.seek(fd, offset, whence)) {
+        Some(Ok(position)) => position as i64,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
 /// `close(fd)`.
 fn close(fd: usize) -> i64 {
     match super::with_current(|program| program.files.close(fd)) {
@@ -283,6 +309,7 @@ fn errno(err: FileError) -> i64 {
         FileError::BadFd => ERR_BAD_FD,
         FileError::TooManyFiles => ERR_TOO_MANY_FILES,
         FileError::Vfs(err) => vfs_errno(err),
+        FileError::BadOffset => ERR_BAD_ADDRESS,
     }
 }
 

@@ -411,7 +411,7 @@ fn run_command(line: &str) -> bool {
         "whoami" => whoami(),
         "run" => {
             if argument.is_empty() {
-                sprintln!("  usage: run [-b] <path>");
+                sprintln!("  usage: run [-b] <path> [args]");
             } else {
                 run_program(argument);
             }
@@ -448,7 +448,7 @@ fn help() {
     sprintln!("  mkdir <path>  create a directory");
     sprintln!("  rm <path>     delete a file or an empty directory");
     sprintln!("  whoami        the identity programs are run with");
-    sprintln!("  run [-b] <p>  run a program outside the kernel; -b does not wait");
+    sprintln!("  run [-b] <p>  run a program with arguments; -b does not wait");
     sprintln!("  kill <task>   stop a running program by its task number");
     sprintln!("  clear         clear the window");
     sprintln!("  exit          finish the boot and halt");
@@ -572,16 +572,20 @@ fn whoami() {
 /// Строку об окончании печатает сама задача программы, а не оболочка: у
 /// фоновой программы к тому моменту никакой оболочки может уже и не быть.
 fn run_program(argument: &str) {
-    let (path, background) = match argument.strip_prefix("-b ") {
+    let (line, background) = match argument.strip_prefix("-b ") {
         Some(rest) => (rest.trim(), true),
         None => (argument, false),
     };
-    if path.is_empty() {
-        sprintln!("  usage: run [-b] <path>");
+    if line.is_empty() {
+        sprintln!("  usage: run [-b] <path> [args]");
         return;
     }
+    // Всё, что после пути, уезжает программе как аргументы; разбирает строку
+    // сама задача, которой предстоит их получить. Оболочка здесь ничего не
+    // разбирает намеренно: путь ей нужен только для сообщения об ошибке.
+    let path = line.split_whitespace().next().unwrap_or(line);
 
-    match user::spawn(path) {
+    match user::spawn(line) {
         Ok(id) => {
             if background {
                 sprintln!("  {path}: started as {id}");
