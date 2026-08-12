@@ -2,11 +2,12 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 9 done.** A graphical installer partitions a disk, creates an ext2 root
-> filesystem on it and installs the system; the installed system boots, finds its own disk
-> over virtio-blk, reads the partition table, mounts that root and serves it to the shell
-> with real uid/gid/mode — on both architectures. There is no userspace yet: everything
-> above runs in the kernel. See [Roadmap](#roadmap).
+> **Status: Phase 10 done.** The system installs itself onto a disk, boots from it, mounts
+> its ext2 root — and comes up as a **desktop**: wallpaper, a taskbar with a clock, a start
+> menu, windows with title bars and close buttons, and a window manager that decides who
+> gets each keypress. Programs so far: a terminal, a file manager over the mounted root, a
+> system monitor and an about box. On both architectures. There is no userspace yet:
+> everything above runs in the kernel. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -72,17 +73,53 @@ a physical disk. What the firmware then reads is our partition table and our fil
 booting that image is itself the test. The image is byte-reproducible: identical inputs give
 an identical file, which is why "the image changed" means the content changed.
 
-Once the boot log settles, the screen turns into a desktop with two windows and the shell
-takes the keyboard: `help` lists what it answers, `ls` and `cat` read the mounted FAT32
-image, `Tab` raises the window underneath, `exit` ends the session and halts. Type into the
-QEMU window — `xtask` attaches a USB keyboard (`qemu-xhci` + `usb-kbd`) on both
-architectures, and on x86-64 the PS/2 keyboard works alongside it — or into the terminal
-QEMU was started from, because the serial line is an input device too and every line the
-shell prints goes there as well.
+Once the boot log settles, the screen turns into a desktop: **Meta** (or **F1**) opens the
+start menu, **Tab** moves between windows, **Ctrl+W** closes one, **Ctrl+arrows** moves it.
+The terminal answers `help`, reads the mounted filesystem with `ls` and `cat`, and ends the
+session with `exit`. Type into the QEMU window — `xtask` attaches a USB keyboard
+(`qemu-xhci` + `usb-kbd`) on both architectures, and on x86-64 the PS/2 keyboard works
+alongside it — or into the terminal QEMU was started from, because the serial line is an
+input device too and every line the shell prints goes there as well.
 
 Without a framebuffer the same shell runs on the serial console alone; graphics is not a
 condition for the system to work. With nobody typing, the prompt gives up after twenty
 seconds so unattended runs still terminate.
+
+## The desktop
+
+Four layers, and their order is the whole thing: a background that costs no memory at all
+(a gradient computed from the row number, with a sparse dot grid over it), then windows
+bottom-to-top, then the taskbar, then the start menu when it is open. Only rectangles that
+actually changed are pushed to the screen — typing a character in the terminal repaints one
+cell, not 1.02 million pixels.
+
+The part that is new in kind, rather than in looks, is the **window manager**. Until Phase
+10 every keypress went to the shell and "switching windows" only reordered them by depth;
+the shell owned the keyboard. Now the desktop sees each event first and decides: the start
+menu takes everything while it is open, then the manager's own chords, then the focused
+window if it handles keys (the file manager does), and only then the shell — and only if
+its window is the focused one. When userspace arrives, that last step becomes "deliver the
+event to a process", not a rewritten window manager.
+
+Three things are worth knowing about how it behaves:
+
+- **The clock counts uptime, not time of day.** There is no RTC driver, and the firmware
+  stops answering after `ExitBootServices`. A made-up wall clock is an interface that lies,
+  so the panel says `up 0:01:23`.
+- **Compositing does not run under the lock.** `SpinLock` is held with interrupts disabled,
+  and a full repaint is a million-odd writes to device memory. Drawing under it delayed
+  interrupts long enough that input events arrived out of the order they happened in — the
+  symptom was Ctrl staying "held" after Ctrl+W. The desktop is now lifted out of the lock
+  for the duration of the work.
+- **Input from two devices can still be reordered under load.** The USB keyboard is polled
+  by a task, the serial line arrives on an interrupt. While a debug build repaints, a key
+  release waiting for the next poll can lose the race to bytes from the UART. From a single
+  device the order always holds, which is what a person actually uses.
+
+There is no mouse: there is no mouse driver. The cursor is one more layer in the compositor
+and click routing is one more branch in the manager — but writing either without a source of
+events would be writing code nobody can run. USB HID delivers a mouse over the same boot
+protocol as the keyboard, so this is the next phase, not a redesign.
 
 ## The test bench
 
@@ -92,11 +129,12 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Six scenarios today: the system boots and the shell answers (`boot`); keys arrive over
+Seven scenarios today: the system boots and the shell answers (`boot`); keys arrive over
 xHCI and USB HID rather than PS/2 (`keyboard`, which switches `i8042` off, since `sendkey`
-reaches exactly one keyboard and QEMU picks PS/2 when both are attached); a terminal that
-sends a lone carriage return works as Enter (`serial-cr`); the system boots off a disk this
-repo partitioned (`image`); the installer walks all seven screens and writes a disk
+reaches exactly one keyboard and QEMU picks PS/2 when both are attached); the start menu
+opens a program, the window moves and closes and focus comes back (`desktop`); a terminal
+that sends a lone carriage return works as Enter (`serial-cr`); the system boots off a disk
+this repo partitioned (`image`); the installer walks all seven screens and writes a disk
 (`install`); and that disk boots, mounts its ext2 root and reads `/etc` (`installed`).
 
 The bench lives in `xtask/src/harness/` and shares one QEMU command line with `run` —
@@ -256,6 +294,8 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 8b | Graphical UEFI installer (disk selection, partitioning, user account) | **done** |
 | 9a | ext2: formatter, writer and reader; the installer creates a real root | **done** |
 | 9b | virtio-blk driver; the kernel mounts the root partition it was installed on | **done** |
+| 10 | Desktop: wallpaper, taskbar, start menu, window manager, file manager | **done** |
+| 11 | USB HID mouse: pointer layer, click to focus, drag by the title bar | next |
 
 Phases 6 and 8 were both split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe
