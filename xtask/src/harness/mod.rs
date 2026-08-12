@@ -381,6 +381,19 @@ fn play(
                     bail!("шаг {index}: за {prefix:?} стоит {number}, а предел {limit}");
                 }
             }
+            Step::AtLeast(prefix, limit, timeout_ms) => {
+                println!("  [{at:>6} мс] шаг {index}: ждём число за {prefix:?}, не меньше {limit}");
+                let value = line
+                    .capture_number(prefix, Duration::from_millis(*timeout_ms))
+                    .with_context(|| format!("шаг {index}"))?;
+                let number: u64 = value
+                    .parse()
+                    .with_context(|| format!("шаг {index}: {value:?} — не число"))?;
+                println!("             получено {number}");
+                if number < *limit {
+                    bail!("шаг {index}: за {prefix:?} стоит {number}, а нужно не меньше {limit}");
+                }
+            }
             Step::Expect(needle) => {
                 let needle = fill(needle, &captured);
                 println!("  [{at:>6} мс] шаг {index}: проверяем {needle:?}");

@@ -172,6 +172,15 @@ pub const IR_ERSTSZ: usize = 0x08;
 pub const IR_ERSTBA: usize = 0x10;
 pub const IR_ERDP: usize = 0x18;
 
+/// `IMAN`, бит 0: Interrupt Pending. RW1C — прерыватель выставляет его, подав
+/// прерывание, и держит, пока обработчик не запишет туда единицу. Пока бит
+/// стоит, следующего прерывания не будет.
+pub const IMAN_INTERRUPT_PENDING: u32 = 1 << 0;
+
+/// `IMAN`, бит 1: Interrupt Enable. Без него прерыватель считает события, но
+/// процессор не трогает.
+pub const IMAN_INTERRUPT_ENABLE: u32 = 1 << 1;
+
 /// `ERDP`, бит 3: Event Handler Busy. RW1C — снимается записью единицы вместе с
 /// новым значением указателя.
 pub const ERDP_EVENT_HANDLER_BUSY: u64 = 1 << 3;

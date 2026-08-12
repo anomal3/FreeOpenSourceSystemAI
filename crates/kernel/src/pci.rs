@@ -111,6 +111,44 @@ pub const DEVICE_VIRTIO_BLK_MODERN: u16 = 0x1042;
 /// лежат его структуры.
 pub const CAP_ID_VENDOR: u8 = 0x09;
 
+/// Идентификатор возможности MSI-X.
+pub const CAP_ID_MSIX: u8 = 0x11;
+
+/// `Message Control` возможности MSI-X: смещение от её начала.
+const MSIX_CONTROL: usize = 0x02;
+/// `Table Offset / BIR`: смещение таблицы внутри BAR и номер самого BAR.
+const MSIX_TABLE: usize = 0x04;
+/// Бит 15 `Message Control`: MSI-X включён.
+const MSIX_CONTROL_ENABLE: u16 = 1 << 15;
+/// Бит 14: все векторы замаскированы независимо от их собственных масок.
+const MSIX_CONTROL_FUNCTION_MASK: u16 = 1 << 14;
+/// Биты 10:0 `Message Control`: число векторов **минус один**.
+const MSIX_CONTROL_SIZE_MASK: u16 = 0x07FF;
+/// Младшие три бита `Table Offset / BIR`: номер BAR, в котором лежит таблица.
+const MSIX_TABLE_BIR_MASK: u32 = 0b111;
+
+/// Где у устройства лежит таблица MSI-X.
+///
+/// Сама таблица живёт не в конфигурационном пространстве, а в памяти
+/// устройства, поэтому здесь только адрес адреса: номер BAR и смещение внутри
+/// него. Отображает BAR драйвер — он же и так это делает ради регистров.
+#[derive(Debug, Clone, Copy)]
+pub struct MsiX {
+    /// Смещение самой возможности в конфигурационном пространстве.
+    pub capability: usize,
+    /// Номер BAR, в котором лежит таблица.
+    pub bir: usize,
+    /// Смещение таблицы внутри этого BAR.
+    pub table_offset: u32,
+    /// Сколько векторов устройство поддерживает.
+    pub vectors: u16,
+}
+
+/// Размер одной записи таблицы MSI-X, байт: адрес (8), данные (4), управление (4).
+pub const MSIX_ENTRY_SIZE: usize = 16;
+/// Бит 0 поля `Vector Control`: вектор замаскирован.
+const MSIX_VECTOR_MASKED: u32 = 1 << 0;
+
 /// Базовый класс «Serial Bus Controller».
 pub const CLASS_SERIAL_BUS: u8 = 0x0C;
 /// Подкласс «USB Controller».
@@ -336,6 +374,83 @@ impl Device {
         let wanted = command | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER | COMMAND_INTX_DISABLE;
         // SAFETY: см. выше.
         unsafe { self.write16(CFG_COMMAND, wanted) };
+    }
+
+    /// Найти возможность MSI-X, если устройство её объявляет.
+    #[must_use]
+    pub fn msix(&self) -> Option<MsiX> {
+        let mut found = None;
+        self.for_each_capability(|id, offset| {
+            if id == CAP_ID_MSIX {
+                found = Some(offset);
+                return false;
+            }
+            true
+        });
+        let capability = found?;
+
+        // SAFETY: смещение получено обходом списка возможностей, который уже
+        // проверил, что оно внутри отображённой страницы.
+        let control = unsafe { self.read16(capability + MSIX_CONTROL) };
+        let table = self.config32(capability + MSIX_TABLE);
+
+        Some(MsiX {
+            capability,
+            bir: (table & MSIX_TABLE_BIR_MASK) as usize,
+            // Младшие три бита заняты номером BAR: таблица выровнена на восемь
+            // байт, и место под них взяли оттуда.
+            table_offset: table & !MSIX_TABLE_BIR_MASK,
+            // В поле лежит число векторов минус один — нуля векторов у MSI-X не
+            // бывает по определению.
+            vectors: (control & MSIX_CONTROL_SIZE_MASK) + 1,
+        })
+    }
+
+    /// Записать вектор в таблицу MSI-X и разрешить доставку.
+    ///
+    /// `table` — виртуальный адрес начала таблицы (BAR, отображённый драйвером,
+    /// плюс [`MsiX::table_offset`]). `address` и `data` описывают, куда и что
+    /// устройство запишет, чтобы прервать процессор: это не «номер линии», а
+    /// самая обычная запись в память, которую перехватывает контроллер
+    /// прерываний. Что именно туда класть, знает арх-часть.
+    ///
+    /// Маска снимается **после** записи адреса и данных: замаскированный вектор
+    /// — единственный способ гарантировать, что устройство не прервёт процессор
+    /// по недописанной записи.
+    ///
+    /// # Safety
+    ///
+    /// `table` обязан указывать на отображённую таблицу MSI-X этого устройства,
+    /// а `index` — быть меньше [`MsiX::vectors`]. Обработчик по указанному
+    /// адресу и данным должен быть установлен до вызова: прерывание может
+    /// прийти немедленно.
+    pub unsafe fn set_msix_vector(&self, msix: &MsiX, table: usize, index: usize, address: u64, data: u32) {
+        let entry = table + index * MSIX_ENTRY_SIZE;
+        // SAFETY: контракт функции; запись 32-битная, как требует спецификация —
+        // таблица не обязана поддерживать обращения другой ширины.
+        unsafe {
+            core::ptr::write_volatile(entry as *mut u32, address as u32);
+            core::ptr::write_volatile((entry + 4) as *mut u32, (address >> 32) as u32);
+            core::ptr::write_volatile((entry + 8) as *mut u32, data);
+            core::ptr::write_volatile((entry + 12) as *mut u32, 0); // маска снята
+        }
+
+        // SAFETY: смещение внутри возможности, найденной обходом списка.
+        let control = unsafe { self.read16(msix.capability + MSIX_CONTROL) };
+        let wanted = (control | MSIX_CONTROL_ENABLE) & !MSIX_CONTROL_FUNCTION_MASK;
+        // SAFETY: см. выше.
+        unsafe { self.write16(msix.capability + MSIX_CONTROL, wanted) };
+    }
+
+    /// Замаскировать вектор — например, при остановке драйвера.
+    ///
+    /// # Safety
+    ///
+    /// Те же требования к `table` и `index`, что и у [`Device::set_msix_vector`].
+    pub unsafe fn mask_msix_vector(table: usize, index: usize) {
+        let entry = table + index * MSIX_ENTRY_SIZE;
+        // SAFETY: контракт функции.
+        unsafe { core::ptr::write_volatile((entry + 12) as *mut u32, MSIX_VECTOR_MASKED) };
     }
 
     /// Байт конфигурационного пространства.

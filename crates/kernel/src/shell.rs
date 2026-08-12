@@ -500,6 +500,17 @@ fn usb_status() {
             );
             sprintln!("  reports  {} parsed", usb.reports);
             sprintln!("  events   {} seen, {} transfer errors", usb.events, usb.errors);
+            // Ноль здесь при работающей клавиатуре означает опрос: контроллер
+            // либо не объявил MSI-X, либо на этой машине их некуда направить.
+            if usb.interrupts == 0 {
+                sprintln!("  irqs     none, events are polled on a timer");
+            } else {
+                sprintln!("  irqs     {} delivered", usb.interrupts);
+            }
+            // Пробуждения — цена опроса, выраженная числом. При опросе их сто в
+            // секунду, независимо от того, происходит ли что-нибудь; по
+            // прерываниям — ровно столько, сколько было событий.
+            sprintln!("  wakeups  {} of the service task", usb.services);
         }
         None => sprintln!("  xhci     no controller"),
     }

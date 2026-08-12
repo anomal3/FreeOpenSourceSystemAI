@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 12c done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 18 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -116,10 +116,10 @@ Three things are worth knowing about how it behaves:
   interrupts long enough that input events arrived out of the order they happened in — the
   symptom was Ctrl staying "held" after Ctrl+W. The desktop is now lifted out of the lock
   for the duration of the work.
-- **Input from two devices can still be reordered under load.** The USB keyboard is polled
-  by a task, the serial line arrives on an interrupt. While a debug build repaints, a key
-  release waiting for the next poll can lose the race to bytes from the UART. From a single
-  device the order always holds, which is what a person actually uses.
+- **Input from two devices can still be reordered under load.** Both the USB keyboard and
+  the serial line now arrive on interrupts, but they are different interrupts taking
+  different paths, and a debug build repainting can still let one overtake the other. From a
+  single device the order always holds, which is what a person actually uses.
 
 **The mouse** arrived in Phase 11 and works the way one expects: click a window to raise and
 focus it, drag it by the title bar, close it with the button in the corner, click the taskbar
@@ -394,12 +394,13 @@ shell reads that counter before draining the queue and hands the scheduler a che
 under its lock: if the count moved, do not sleep. Inside that lock interrupts are disabled,
 so there is no third case.
 
-Two consequences fell out that were not in the plan. The first: xHCI has no interrupt here,
-its reports are polled — and the polling lived in the shell. A shell that sleeps until input
-arrives would have been waiting for events that only its own polling could produce. Polling
-moved into a task of its own with its own clock. The second: that task never ends, and `run`
-stops the machine when no task is left — so tasks now say whether they are the reason the
-system keeps running. The USB poller says no, and `exit` still halts.
+Two consequences fell out that were not in the plan. The first: xHCI reports were polled
+back then — and the polling lived in the shell. A shell that sleeps until input arrives would
+have been waiting for events that only its own polling could produce. Polling moved into a
+task of its own with its own clock; [Phase 18](#interrupts-instead-of-polling) later gave
+that task an interrupt to wait for instead. The second: that task never ends, and `run` stops
+the machine when no task is left — so tasks now say whether they are the reason the system
+keeps running. The USB task says no, and `exit` still halts.
 
 The idle task itself no longer spins either. When nothing is ready it stops the processor
 (`hlt`, `wfi`) until an interrupt, which is what makes all of the above visible from outside
@@ -499,6 +500,43 @@ lives in boot services and they are gone by the time anything could ask. A machi
 firmware clock is wrong stays wrong until it is fixed in firmware; a machine whose firmware
 has no clock at all says so, marks its files with zero, and prints `unknown` rather than
 inventing a date.
+
+### Interrupts instead of polling
+
+The USB controller could always interrupt the processor; the kernel just never asked it to,
+because the path from a PCIe device to a handler is a subsystem of its own on each
+architecture and none of it is about USB. So reports were polled a hundred times a second.
+That works — the latency was never the problem — but the task woke on a timer whether
+anything had happened or not: about two thousand wake-ups per twenty seconds, each one a
+context switch, a walk of the event ring and a handful of MMIO reads. On interrupts, over
+the same stretch: **fifty**.
+
+The path is MSI-X, and the reason is worth stating because it is not the obvious one. A PCIe
+device has no interrupt line to raise; it *writes to an address*, and what that write does is
+up to the interrupt controller. On x86-64 the address is recognised by the local APIC and the
+data carries a vector already sitting in the IDT — which means no `_PRT` parsing, which means
+no AML interpreter, which is exactly why MSI-X was chosen over INTx. On AArch64 the write is
+caught by the GICv2m frame and turned into an ordinary SPI. So the architecture layer answers
+one question — where to write and what — and the driver contains no `cfg` at all.
+
+One detail there cost a debugging session and is the kind that does not announce itself: an
+MSI is a *pulse*, not a level. The SPI has to be configured edge-triggered, and QEMU's `virt`
+defaults every SPI to level, which is correct for the rest of its peripherals. Left level, the
+interrupt is not delivered at all — not misrouted, not spurious, simply absent. Everything
+looks configured: the table is written, the capability is enabled, the controller reports the
+vector. The keyboard just stops working, and no handler runs to say why.
+
+The driver itself did not change shape. The handler acknowledges the interrupt at the
+controller and wakes the task; the ring is still walked by that task, through the same
+`service()` the timer used to call. Doing the walk inside the handler would mean hundreds of
+microseconds with interrupts disabled — the very disease interrupts are the cure for. Waiting
+is a new scheduler state (`Wait::Irq`), built like the mutex wait from Phase 15: the
+"has anything arrived" check happens under the scheduler's lock, so an interrupt landing
+between the check and the sleep cannot be lost.
+
+A machine without MSI-X keeps polling, and `usb` says so — `irqs none`. That is not a
+safety net nobody will hit: a controller whose vector table lives in an unmapped BAR is a
+real thing, and its keyboard should still work.
 
 ### Two kinds of lock
 
@@ -772,6 +810,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 15 | A mutex that stops the task, not the machine: long locks no longer hold interrupts off | **done** |
 | 16 | The time of day: the firmware clock, a time zone, and files stamped with when they were written | **done** |
 | 17 | Time that does not depend on interrupts arriving: a monotonic counter, and the boot lag subtracted | **done** |
+| 18 | Interrupts instead of polling: MSI-X on both architectures, and a driver that sleeps until something happens | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe
