@@ -25,6 +25,7 @@ use alloc::string::String;
 
 use crate::input::line::{Edit, LineEditor};
 use crate::input::{self, KeyCode};
+use crate::sync::SpinLock;
 use crate::vfs::NodeKind;
 use crate::{fs, irq, kprint, mm, sched, ui, usb, user};
 
@@ -49,31 +50,72 @@ const STATUS_PERIOD_MS: u64 = 500;
 /// мегабайт занял бы машину надолго и вытеснил бы из окна всё остальное.
 const CAT_LIMIT: usize = 4096;
 
+/// Лок вывода оболочки: то, что напечатано одним вызовом, печатается целиком.
+///
+/// До Phase 13b он был не нужен: задача, начавшая печатать строку, доводила её
+/// до конца, потому что процессор у неё никто не отбирал. С вытеснением
+/// `write!` из нескольких кусков (а таков любой `write!` с подстановкой) стал
+/// разрываться посередине чужим выводом — в журнале появлялись строки вида
+/// `freeos> echo shell-count 9: tick 2 of 5`. Читать такой журнал неприятно
+/// человеку и невозможно стенду, который ищет в нём подстроки.
+///
+/// Лок закрывает ровно то, что зависит от ядра. Программа, печатающая строку
+/// шестью системными вызовами, по-прежнему может быть вытеснена между ними — и
+/// это правильно: в Unix `write` атомарен сам по себе, а не в компании соседних.
+static OUT: SpinLock<()> = SpinLock::new(());
+
 /// Приёмник вывода оболочки.
 ///
 /// Реализует [`fmt::Write`], поэтому годится и для `write!`, и для эха редактора
-/// строки.
+/// строки. Каждый вызов атомарен; чтобы был атомарен `write!` целиком, есть
+/// [`print`].
 pub struct Out;
 
 impl fmt::Write for Out {
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        if ui::is_active() {
-            // Композитор поднят: на экране окна, и загрузочная консоль экран уже
-            // отдала. В serial при этом пишем сами — `kprint!` туда бы написал,
-            // но заодно попытался бы рисовать.
-            crate::serial::_print(format_args!("{text}"));
-            ui::write(text);
-        } else {
-            kprint!("{text}");
-        }
+        let _guard = OUT.lock();
+        write_raw(text);
         Ok(())
+    }
+}
+
+/// Напечатать в оболочку одним куском.
+///
+/// Аргумент — уже собранный `format_args!`, поэтому лок берётся один раз на всю
+/// строку, а не на каждую её часть. `SpinLock` не перевходим, поэтому внутри
+/// работает [`Raw`], который не запирается повторно.
+pub fn print(args: fmt::Arguments<'_>) {
+    let _guard = OUT.lock();
+    let _ = Raw.write_fmt(args);
+}
+
+/// Тот же приёмник, но без лока — для использования под уже взятым [`OUT`].
+struct Raw;
+
+impl fmt::Write for Raw {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        write_raw(text);
+        Ok(())
+    }
+}
+
+/// Куда на самом деле уходит вывод оболочки.
+fn write_raw(text: &str) {
+    if ui::is_active() {
+        // Композитор поднят: на экране окна, и загрузочная консоль экран уже
+        // отдала. В serial при этом пишем сами — `kprint!` туда бы написал,
+        // но заодно попытался бы рисовать.
+        crate::serial::_print(format_args!("{text}"));
+        ui::write(text);
+    } else {
+        kprint!("{text}");
     }
 }
 
 /// Напечатать в оболочку.
 macro_rules! sprint {
     ($($arg:tt)*) => {{
-        let _ = ::core::write!(&mut $crate::shell::Out, $($arg)*);
+        $crate::shell::print(::core::format_args!($($arg)*));
     }};
 }
 

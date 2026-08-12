@@ -259,9 +259,61 @@ unmapped guard page — will now fault while trying to report the fault, and han
 printing. Task stacks are unaffected (their overflow is caught by a painted guard band at
 the next context switch), and on x86-64 the same case is still covered by the IST.
 
-Still ahead: **preemption**. The scheduler is cooperative, so a program that never makes a
-system call runs until it finishes. The timer already ticks and the scheduler has had the
-hook since Phase 4.
+### Preemption
+
+`/bin/spin` counts to a billion in a two-instruction assembly loop. Between its first line
+and its last it makes no system call at all — no `yield`, no `write`, not even a look at the
+clock. Run it in the background and the shell still answers:
+
+```
+freeos> run -b /bin/spin
+  /bin/spin: started as #5
+spin 5: no system calls from here on
+echo preempted-ok
+  preempted-ok
+spin 5: done after 1490 ms, never yielded once
+```
+
+That middle line is the whole phase. A cooperative scheduler could not have printed it: the
+shell would not have received a single cycle until the count was over. `tasks` says the same
+thing in numbers — that run ended with `#5 program finished 31 switches (30 forced)`, and a
+forced switch is one the task did not ask for.
+
+The scheduler needed one new reason to switch and nothing else — that separation was designed
+in at Phase 4 and it held. What did need care was *where* the switch happens. The obvious
+place, the timer handler itself, is wrong on both architectures for the same reason: until
+the interrupt is acknowledged it stays active and masks everything at or below its priority.
+Switching before the acknowledgement would hand the CPU to a task whose timer is silent —
+which is to say, a task nothing can preempt — and the acknowledgement itself would wait for
+control to wander back into the abandoned handler. So the tick only counts the slice and
+raises a flag; the switch happens at a preemption point the architecture layer calls at the
+end of the interrupt, after `EOI` on x86-64 and after `end_of_interrupt` on ARM.
+
+Preemption from ring 3 works because of Phase 13a and would not have worked before it: the
+trap from the running program lands on that task's own kernel stack, so the interrupt frame
+sitting there is saved and resumed along with everything else.
+
+Two things had to be reordered to survive it. Running a program tells the scheduler about its
+address space *before* switching the CPU to it, and returning from one tells the scheduler
+*before* switching back — knowledge first, action second. The reverse order has a window in
+which a preempted task comes back with the program's page-table root in the register while
+the code below is about to hand those very frames back to the pool.
+
+Everything else was already safe, and by construction rather than by luck: every shared
+structure in the kernel lives behind a spinlock that disables interrupts while it is held, so
+a timer tick cannot arrive in the middle of one.
+
+One thing did break, and it broke the way this sort of thing does — in the log rather than in
+the machine. A `write!` with a substitution in it is several calls under the hood, and a task
+that used to finish its line before yielding now gets stopped between them: the serial console
+started producing `freeos> echo shell-count 9: tick 2 of 5`. Kernel output through the shell
+now takes one lock for the whole line. A program's line is not covered by it and should not
+be — a program prints in six separate system calls, and `write` is atomic by itself, not in
+company with its neighbours, exactly as in Unix.
+
+Still missing: a way to *stop* a program. Preemption means a runaway program no longer owns
+the machine, not that you can get rid of it — `kill` needs to unwind someone else's entry into
+ring 3, and that is its own piece of work.
 
 ## The test bench
 
@@ -271,9 +323,11 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Nine scenarios today: a program runs in an address space of its own, one that faults is killed
+Ten scenarios today: a program runs in an address space of its own, one that faults is killed
 without taking the system with it, one that reaches for kernel memory is refused, and every
-run's pages go back to the pool (`userspace`); the system boots and the shell answers (`boot`); keys arrive over
+run's pages go back to the pool (`userspace`); a program that makes no system call at all is
+taken off the CPU anyway, and the shell answers a command between its two lines (`preempt`);
+the system boots and the shell answers (`boot`); keys arrive over
 xHCI and USB HID rather than PS/2 (`keyboard`, which switches `i8042` off, since `sendkey`
 reaches exactly one keyboard and QEMU picks PS/2 when both are attached); the start menu
 opens a program, the window moves and closes and focus comes back (`desktop`); the pointer
@@ -391,7 +445,7 @@ crates/mini-ui/     Surfaces, 8x8 text (ASCII + Cyrillic), widgets: kernel + ins
 crates/installer/   UEFI application: disk selection, partitioning, account, install
 crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/mm/           Frame allocator, page tables, kernel heap, DMA-coherent arena
-  src/sched/        Cooperative round-robin scheduler and tasks
+  src/sched/        Preemptive round-robin scheduler and tasks
   src/vfs/ src/fs/  VFS traits, RAM disk, FAT32 reader
   src/input/        Key codes, event queue, US keymap, line editor
   src/gfx/          Rects, surfaces in RAM, the screen, bitmap text
@@ -457,7 +511,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 12b | An address space per program: the kernel root cloned, switched, and torn down at exit | **done** |
 | 12c | File system calls, and `mode`/`uid`/`gid` checked against the program asking | **done** |
 | 13a | A program is a task: its own kernel stack, address space and files; two at once | **done** |
-| 13b | Preemption: a program that never yields no longer owns the machine | next |
+| 13b | Preemption: a program that never yields no longer owns the machine | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

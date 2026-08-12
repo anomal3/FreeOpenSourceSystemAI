@@ -414,6 +414,16 @@ fn run_session(have_input: bool) -> ! {
         kprintln!("  shell      : not started, there is no way to type into it");
     }
 
+    // Вытеснение включается здесь, а не при инициализации таймера: до этой
+    // строки ядро — один поток управления, которому не с кем делить процессор, и
+    // прерывание, снимающее его с самого себя, только удлинило бы загрузку.
+    sched::set_preemption(true);
+    kprintln!(
+        "  preemption : on, {} ms slice at {} Hz",
+        sched::SLICE_MS,
+        irq::TIMER_HZ
+    );
+
     sched::run()
 }
 

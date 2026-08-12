@@ -23,8 +23,6 @@
 //! перевод отказов в числа договора: ядро не рассказывает программе, какая
 //! именно структура на диске ей не понравилась.
 
-use core::fmt::Write as _;
-
 use user_abi::{
     ERR_BAD_ADDRESS, ERR_BAD_FD, ERR_BAD_PATH, ERR_IO, ERR_NOT_FOUND, ERR_NO_FILESYSTEM,
     ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_PERMISSION, ERR_TOO_MANY_FILES, ERR_UNSUPPORTED, FD_STDOUT,
@@ -113,7 +111,7 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
     // вывода, а не проверка программы, — поэтому не ошибка.
     match core::str::from_utf8(bytes) {
         Ok(text) => {
-            let _ = write!(&mut crate::shell::Out, "{text}");
+            crate::shell::print(format_args!("{text}"));
             len as i64
         }
         Err(_) => ERR_BAD_ADDRESS,

@@ -276,6 +276,12 @@ pub struct Task {
     pub state: TaskState,
     /// Сколько раз задача получала процессор.
     pub switches: u64,
+    /// Сколько раз задачу снимали с процессора не по её воле — по истёкшему
+    /// кванту. Считается отдельно от [`Task::switches`], потому что отвечает на
+    /// другой вопрос: уступает ли задача сама. У программы, не делающей ни
+    /// одного системного вызова, других поводов сменить задачу не бывает вовсе,
+    /// и этот счётчик — единственное, чем её вытеснение видно снаружи.
+    pub preempted: u64,
 
     /// Сохранённое состояние регистров.
     ///
@@ -346,6 +352,7 @@ impl Task {
             name: "idle",
             state: TaskState::Running,
             switches: 0,
+            preempted: 0,
             context: MaybeUninit::uninit(),
             stack: None,
             user: UserMachine::default(),
@@ -368,6 +375,7 @@ impl Task {
             name,
             state: TaskState::Ready,
             switches: 0,
+            preempted: 0,
             context: MaybeUninit::new(context),
             stack: Some(stack),
             user: UserMachine::default(),
