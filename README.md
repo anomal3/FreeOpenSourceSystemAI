@@ -972,6 +972,45 @@ now made by two more drivers. The bench runs `nvme` the same way as `ahci`: the 
 the way it always does, the installed disk is attached over NVMe as a second device, and the
 kernel must find its root on it — `root : found on nvme #0`.
 
+### The sector stops being a constant
+
+Both drivers above ask the disk for its sector size, and until Phase 26c both
+then refused anything but 512 — with an honest note in the code saying why: the
+rest of the stack knew the number by heart, so accepting a 4Kn disk would have
+meant partitioning it as if it were 512-byte, which is not a bug but data loss.
+The note ended with "and there is no way to test this, since in QEMU the disk is
+always 512". That stopped being true in the previous phase: `-device
+nvme,logical_block_size=4096` presents exactly such a disk, so the argument the
+limit rested on was gone and the limit went with it.
+
+What moved is arithmetic, in every place that had a 512 written into it. The GPT
+entry table is 16 KiB either way, but that is 32 sectors on one disk and 4 on
+the other, so the first usable LBA moves from 34 to 6; alignment stays a
+megabyte rather than a fixed 2048 sectors; FAT32 writes its real `BytsPerSec`
+and counts four-byte FAT entries per whatever a sector holds. The ext2 side had
+the subtlest one: the superblock lives at **byte** offset 1024 from the start of
+the volume, which on a 512-byte disk is exactly two sectors — so `1024 / 512`
+was right by coincidence. On a 4Kn disk that offset falls *inside the first
+sector*, and the same formula reads the eighth one, which is somebody else's
+data with a confident look.
+
+Three checks run on the host, where a wrong address costs milliseconds instead
+of an evening: a 4Kn disk is partitioned and read back, the MBR signature is
+verified to sit at byte 510 of the medium with `EFI PART` at byte 4096, and —
+the ones that matter most — a FAT32 volume and an ext2 volume built on a 4Kn
+medium are read by **foreign implementations**, `fatfs` and `ext4-view`. In
+QEMU, `install4k` walks the installer against a 4096-byte NVMe disk and
+`sector4k` boots with the root on it: `partitions : nvme #0: GPT …, 4096-byte
+sectors`.
+
+The phase found one real defect, and it is the same mistake it exists to
+correct. The FAT writer batched its writes in **sectors** — 64 of them — which
+was 32 KiB on a 512-byte disk and 256 KiB on a 4Kn one. Installing onto a 4Kn
+disk failed on the very first file with `the block device reported a failure`,
+because neither the firmware's driver nor the installer's staging buffer takes
+that much at once. Host tests could not catch it: an image in memory does not
+care how large the chunk is. The batch is counted in bytes now.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -980,7 +1019,7 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Twenty-one scenarios today: a program runs in an address space of its own, one that faults is
+Twenty-three scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
@@ -1006,7 +1045,9 @@ refuses to be deleted (`write`); a second boot of the same disk finds what was w
 does not find what was deleted, and still has the installer's files (`persist`); and that
 same disk, attached over **SATA** instead of virtio, is found by the AHCI driver, named as
 the disk the root was found on, read from and written to (`ahci`) — and the same again over
-**NVMe**, where the controller is driven by queues in memory rather than by ports (`nvme`).
+**NVMe**, where the controller is driven by queues in memory rather than by ports (`nvme`);
+and the installer writes, then the system boots from, a disk whose sectors are 4096 bytes
+rather than 512 (`install4k`, `sector4k`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -1224,7 +1265,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 25 | Memory that comes back: the DMA window becomes a pool instead of a counter | **done** |
 | 26a | A block-device layer and an AHCI driver: the root is found on a machine with no virtio | **done** |
 | 26b | NVMe, which is what the disk in a laptop bought this decade is attached by | **done** |
-| 26c | The sector stops being a constant: 4Kn disks, now that QEMU can present one to test against | planned |
+| 26c | The sector stops being a constant: 4Kn disks, now that QEMU can present one to test against | **done** |
 | 27 | Power: shut down and reboot, from the menu and from the power button, and a volume closed cleanly behind us | planned |
 | 28a | `fsck`: the volume is repaired from inside the system, not from someone else's Linux | planned |
 | 28b | Safe mode and a boot menu: a recovery console in the initrd, so no failure needs a second computer | planned |

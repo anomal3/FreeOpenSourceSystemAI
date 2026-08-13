@@ -81,12 +81,20 @@ const ATTR_LONG_NAME: u8 = 0x0F;
 const CASE_BASE_LOWER: u8 = 0x08;
 const CASE_EXT_LOWER: u8 = 0x10;
 
-/// Сколько секторов писать за один вызов носителя.
+/// Сколько **байт** писать за один вызов носителя.
 ///
 /// 32 КиБ — достаточно, чтобы запись 40-мегабайтного образа не превратилась в
 /// восемьдесят тысяч отдельных обращений к диску, и достаточно мало, чтобы
 /// буфер не пришлось выделять: данные пишутся прямо из среза вызывающего.
-const MAX_BATCH_SECTORS: usize = 64;
+///
+/// Считается в байтах, а не в секторах, и это не косметика. Раньше здесь стояло
+/// «64 сектора», что на 512-байтном носителе давало ровно 32 КиБ; на 4Kn-диске
+/// то же число превратилось в 256 КиБ — и установка на такой диск в QEMU
+/// падала с «the block device reported a failure» на первом же файле, потому
+/// что столько за раз не принимает ни драйвер прошивки, ни промежуточный буфер
+/// установщика, заведённый на 32 КиБ. Тесты на хосте этого поймать не могли:
+/// образу в памяти всё равно, каким куском в него пишут.
+const MAX_BATCH_BYTES: usize = 32 * 1024;
 
 /// Дата и время для записей каталога.
 ///
@@ -649,7 +657,7 @@ impl Volume {
         let full_sectors = data.len() / sector_bytes;
         let mut done = 0usize;
         while done < full_sectors {
-            let batch = (full_sectors - done).min(MAX_BATCH_SECTORS);
+            let batch = (full_sectors - done).min((MAX_BATCH_BYTES / sector_bytes).max(1));
             dev.write(
                 start + done as u64,
                 &data[done * sector_bytes..(done + batch) * sector_bytes],
@@ -1274,5 +1282,76 @@ mod tests {
         dev.read(geometry.fat_lba(0), &mut first).expect("FAT #0");
         dev.read(geometry.fat_lba(1), &mut second).expect("FAT #1");
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod sector4k_tests {
+    use super::*;
+    use crate::mem::MemDisk;
+    use alloc::vec::Vec;
+    use std::io::{Cursor, Read};
+
+    /// Раздел на 512 МиБ, выраженный в секторах по 4096 байт.
+    const PART_SECTORS_4K: u64 = 512 * 1024 * 1024 / 4096;
+    const SECTOR_4K: usize = 4096;
+
+    /// Отформатировать том FAT32 на носителе с сектором 4096.
+    fn formatted_4k() -> (MemDisk, Volume) {
+        let mut dev =
+            MemDisk::with_sector_size(PART_SECTORS_4K + 64, SECTOR_4K).expect("образ 4Kn");
+        let volume = format(
+            &mut dev,
+            Range { first_lba: 64, last_lba: 64 + PART_SECTORS_4K - 1 },
+            &FormatOptions {
+                label: "FREEOS ESP",
+                volume_id: 0x1234_5678,
+                timestamp: Timestamp::EPOCH,
+            },
+        )
+        .expect("форматирование 4Kn");
+        (dev, volume)
+    }
+
+    /// Том, отформатированный на 4Kn-носителе, читается чужой реализацией — и
+    /// сообщает о себе сектор 4096, а не 512.
+    #[test]
+    fn foreign_driver_reads_a_4kn_volume() {
+        let (dev, _) = formatted_4k();
+        let partition = dev.as_bytes()[64 * SECTOR_4K..].to_vec();
+        let fs = fatfs::FileSystem::new(Cursor::new(partition), fatfs::FsOptions::new())
+            .expect("чужой драйвер монтирует том на 4Kn");
+        assert_eq!(fs.fat_type(), fatfs::FatType::Fat32);
+        assert_eq!(fs.volume_label(), "FREEOS ESP");
+    }
+
+    /// Файл размером с загрузчик пишется и читается обратно чужим драйвером.
+    ///
+    /// Именно этот путь упал на 4Kn-диске в QEMU при установке, и проверка
+    /// здесь отвечает на вопрос, чей это отказ: наш код или прошивка.
+    #[test]
+    fn a_bootloader_sized_file_survives_a_foreign_reader() {
+        let (mut dev, mut volume) = formatted_4k();
+
+        // Столько же байт, сколько у настоящего загрузчика.
+        let payload: Vec<u8> = (0..245_760u32).map(|index| (index % 251) as u8).collect();
+        volume
+            .create_dir_path(&mut dev, "EFI/BOOT")
+            .expect("каталоги создаются");
+        volume
+            .write_file_path(&mut dev, "EFI/BOOT/BOOTX64.EFI", &payload)
+            .expect("файл записывается");
+        volume.finish(&mut dev).expect("завершение тома");
+
+        let partition = dev.as_bytes()[64 * SECTOR_4K..].to_vec();
+        let fs = fatfs::FileSystem::new(Cursor::new(partition), fatfs::FsOptions::new())
+            .expect("чужой драйвер монтирует том");
+        let mut file = fs
+            .root_dir()
+            .open_file("EFI/BOOT/BOOTX64.EFI")
+            .expect("файл виден снаружи");
+        let mut read_back = Vec::new();
+        file.read_to_end(&mut read_back).expect("файл читается");
+        assert_eq!(read_back, payload);
     }
 }

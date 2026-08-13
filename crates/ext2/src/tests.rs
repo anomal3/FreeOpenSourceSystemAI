@@ -649,3 +649,43 @@ fn names_are_not_reused_silently() {
         Err(Error::NotFound)
     );
 }
+
+/// Том на носителе с сектором 4096 — и его читает чужая реализация.
+///
+/// Проверка нужна из-за одного места, которое до Phase 26c было верным по
+/// совпадению: суперблок ext2 лежит по **байтовому** смещению 1024 от начала
+/// тома, и на 512-байтном диске это ровно два сектора. На 4Kn-диске то же
+/// смещение попадает внутрь первого сектора — формула «смещение делить на 512»
+/// прочитала бы восьмой сектор, то есть чужие данные.
+///
+/// Судья здесь тот же, что и во всех остальных проверках этого файла, и в этом
+/// весь смысл: `ext4-view` ничего не знает про наши сектора и читает том по
+/// спецификации.
+#[test]
+fn a_volume_on_a_4kn_medium_is_read_by_the_foreign_driver() {
+    /// 512 МиБ, выраженные в секторах по 4096 байт.
+    const SECTORS_4K: u64 = 512 * 1024 * 1024 / 4096;
+
+    let mut dev = MemDisk::with_sector_size(SECTORS_4K, 4096).expect("образ 4Kn размещается");
+    let mut writer = format_with(&mut dev, 0, SECTORS_4K, BlockSize::B4096, &options())
+        .expect("форматирование 4Kn удаётся");
+
+    let inode = writer
+        .create(&mut dev, ROOT_INODE, "on-4kn.txt", 0o644, 1000, 1000)
+        .expect("файл создаётся");
+    writer
+        .write_at(&mut dev, inode, 0, b"written on a 4Kn medium")
+        .expect("запись удаётся");
+    writer.flush(&mut dev).expect("завершение");
+
+    // Свой читатель: том монтируется, блок ext2 равен четырём секторам.
+    let fs = Ext2::mount(&mut dev, 0).expect("свой читатель монтирует том");
+    assert_eq!(fs.geometry().sector_size, 4096);
+    assert_eq!(fs.geometry().sectors_per_block(), 1);
+
+    // Чужой: он про наши сектора не знает вовсе и читает по спецификации.
+    let foreign = foreign(&dev);
+    assert!(foreign.exists("/on-4kn.txt").expect("файл виден снаружи"));
+    let content = foreign.read("/on-4kn.txt").expect("файл читается снаружи");
+    assert_eq!(content, b"written on a 4Kn medium");
+}
