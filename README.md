@@ -1118,24 +1118,27 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 25 | Memory that comes back: the DMA window becomes a pool instead of a counter | **done** |
 | 26a | A block-device layer and an AHCI driver: the root is found on a machine with no virtio | planned |
 | 26b | NVMe, which is what the disk in a laptop bought this decade is attached by | planned |
-| 27 | Power: shut down and reboot, from the menu and from the power button | planned |
-| 28 | A keyboard for a program: descriptor 0, and a terminal that understands ANSI | planned |
-| 29 | `mc`: a two-pane file manager that is a program, not a part of the kernel | planned |
-| 30 | Packages and a record of them: a format, a database, install and remove | planned |
-| 31 | Updating the system with a way back: two slots on the ESP, and a rollback nobody has to ask for | planned |
-| 32 | virtio-net, Ethernet, ARP, IPv4, ICMP: the machine answers a ping | planned |
-| 33 | UDP, DHCP, DNS: the machine gets its own address | planned |
-| 34 | TCP, and sockets for programs | planned |
-| 35 | SSH transport (RFC 4253): key exchange and encryption a real `ssh` agrees with | planned |
-| 36 | SSH authentication and a session (RFC 4252, 4254): a shell over the network | planned |
-| 37 | Updating over the network, with signatures checked before anything is written | planned |
-| 38 | A window belongs to a program: surfaces and events across the system-call boundary | planned |
-| 39 | Settings, and icons on the desktop | planned |
-| 40 | btrfs, read-only: a volume `mkfs.btrfs` made, checksums verified | planned |
-| 41 | btrfs, written: copy-on-write, and a third partition the installer creates | planned |
-| 42 | DeviceTree beside ACPI, and the HAL split this README has promised since Phase 0 | planned |
-| 43 | A Raspberry Pi 4: the first machine that is not an emulator | planned |
-| 44+ | A phone: an Android boot image, no UEFI, no ACPI, and a framebuffer left by the bootloader | planned |
+| 27 | Power: shut down and reboot, from the menu and from the power button, and a volume closed cleanly behind us | planned |
+| 28a | `fsck`: the volume is repaired from inside the system, not from someone else's Linux | planned |
+| 28b | Safe mode and a boot menu: a recovery console in the initrd, so no failure needs a second computer | planned |
+| 29 | A keyboard for a program: descriptor 0, and a terminal that understands ANSI | planned |
+| 30 | `mc`: a two-pane file manager that is a program, not a part of the kernel | planned |
+| 31 | Packages and a record of them: a format, a database, install and remove | planned |
+| 32 | Updating the system by slots: two roots, state on its own partition, and a rollback nobody has to ask for | planned |
+| 33 | Services: `spawn`/`wait` and a supervisor, so a crashed daemon comes back and the system never notices | planned |
+| 34 | virtio-net, Ethernet, ARP, IPv4, ICMP: the machine answers a ping | planned |
+| 35 | UDP, DHCP, DNS: the machine gets its own address, and the DHCP client is a service | planned |
+| 36 | TCP, and sockets for programs | planned |
+| 37 | SSH transport (RFC 4253): key exchange and encryption a real `ssh` agrees with | planned |
+| 38 | SSH authentication and a session (RFC 4252, 4254): a shell over the network | planned |
+| 39 | Updating over the network, with signatures checked before anything is written | planned |
+| 40 | A window belongs to a program: surfaces and events across the system-call boundary | planned |
+| 41 | Settings, and icons on the desktop | planned |
+| 42 | btrfs, read-only: a volume `mkfs.btrfs` made, checksums verified | planned |
+| 43 | btrfs, written: copy-on-write, and the state partition moves onto it | planned |
+| 44 | DeviceTree beside ACPI, and the HAL split this README has promised since Phase 0 | planned |
+| 45 | A Raspberry Pi 4: the first machine that is not an emulator | planned |
+| 46+ | A phone: an Android boot image, no UEFI, no ACPI, and a framebuffer left by the bootloader | planned |
 
 The reasoning behind that order — what each phase is for, what checks it, what is known to
 be waiting to go wrong in it, and how large it is — is in [ROADMAP.md](ROADMAP.md), along
