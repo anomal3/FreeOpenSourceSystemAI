@@ -38,6 +38,7 @@ extern crate std;
 pub mod crc32;
 pub mod fat32;
 pub mod gpt;
+pub mod iso9660;
 pub mod guid;
 mod mem;
 

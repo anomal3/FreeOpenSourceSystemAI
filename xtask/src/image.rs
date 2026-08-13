@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use disk::gpt::{self, PartitionSpec};
 use disk::guid::Guid;
-use disk::{MemDisk, SECTOR_SIZE, fat32};
+use disk::{MemDisk, SECTOR_SIZE, fat32, iso9660};
 
 use crate::arch::{self, Arch, Component};
 use crate::build::Built;
@@ -421,6 +421,133 @@ pub fn prepare_target(arch: Arch, size_mib: u64, fresh: bool) -> Result<PathBuf>
         .with_context(|| format!("не удалось задать размер {size} байт для {}", path.display()))?;
     println!("целевой диск: {} ({size_mib} МиБ, пустой)", path.display());
     Ok(path)
+}
+
+/// Собрать загрузочный ISO и вернуть путь к нему.
+///
+/// Отличается от [`build`] не содержимым, а упаковкой: те же файлы, тот же том
+/// FAT32, но вместо таблицы разделов вокруг него — ISO 9660 с записью El Torito.
+/// Разница в том, что делает с этим человек: образ диска надо записать на
+/// носитель целиком, а ISO — подключить одним пунктом меню гипервизора.
+pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
+    let arch = built.arch;
+    let payload = collect(built, kind)?;
+
+    let path = paths::iso_image(kind.slug(), arch, built.release);
+    let stamp_path = path.with_extension("iso.stamp");
+    // Ревизия формата входит в слепок, и это не перестраховка: правка самого
+    // генератора ISO содержимого не меняет, поэтому образ считался бы
+    // актуальным и не пересобирался. Ровно так и вышло при переходе каталога
+    // El Torito на секционную раскладку — исправленный код собрал тот же файл,
+    // и загрузка «по-прежнему» не работала.
+    const ISO_FORMAT_REVISION: u32 = 2;
+    let stamp = format!("iso-format={ISO_FORMAT_REVISION}
+{}", stamp_text(&payload, kind));
+
+    if util::file_len(&path).is_some()
+        && fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str())
+    {
+        println!("iso: актуален, пересборка не нужна ({})", path.display());
+        return Ok(path);
+    }
+
+    // Том FAT32 собирается без разметки вокруг: внутри ISO он не раздел, а
+    // просто образ, который прошивка монтирует целиком. Ровно то же делает
+    // «суперфлоппи» — носитель без таблицы разделов.
+    let boot = assemble_fat(&payload)?;
+
+    let readme = iso_readme(arch, kind);
+    let bytes = iso9660::build(&iso9660::Options {
+        label: "FREEOS",
+        boot_image: &boot,
+        files: &[("README.TXT", readme.as_bytes())],
+    });
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
+    }
+    let _ = fs::remove_file(&stamp_path);
+    fs::write(&path, &bytes)
+        .with_context(|| format!("не удалось записать образ {}", path.display()))?;
+    fs::write(&stamp_path, &stamp)
+        .with_context(|| format!("не удалось записать слепок {}", stamp_path.display()))?;
+
+    println!(
+        "iso: {} файл(ов) -> {} ({} МиБ, ISO 9660 + El Torito/EFI)",
+        payload.len(),
+        path.display(),
+        bytes.len() / (1024 * 1024),
+    );
+    Ok(path)
+}
+
+/// Том FAT32 целиком, без таблицы разделов: то, что уедет внутрь ISO.
+fn assemble_fat(payload: &[Payload]) -> Result<Vec<u8>> {
+    let content: u64 = payload.iter().map(|file| file.data.len() as u64).sum();
+    let bytes = esp_size(content);
+    let sectors = bytes / SECTOR_SIZE as u64;
+
+    let mut dev = MemDisk::new(sectors)
+        .with_context(|| format!("не удалось разместить том на {} МиБ", bytes / (1024 * 1024)))?;
+
+    let seed = content_hash(payload);
+    let range = gpt::Range { first_lba: 0, last_lba: sectors - 1 };
+    let mut volume = fat32::format(
+        &mut dev,
+        range,
+        &fat32::FormatOptions {
+            label: "FREEOS",
+            volume_id: (seed >> 32) as u32 ^ seed as u32,
+            timestamp: fat32::Timestamp::EPOCH,
+        },
+    )
+    .map_err(|err| anyhow::anyhow!("не удалось отформатировать загрузочный том: {err}"))?;
+
+    for file in payload {
+        volume
+            .write_file_path(&mut dev, &file.path, &file.data)
+            .map_err(|err| anyhow::anyhow!("не удалось записать в том {}: {err}", file.path))?;
+    }
+    volume
+        .finish(&mut dev)
+        .map_err(|err| anyhow::anyhow!("не удалось завершить том FAT32: {err}"))?;
+
+    Ok(dev.into_vec())
+}
+
+/// Текст, который человек увидит, открыв образ файловым менеджером.
+///
+/// Существует потому, что ISO попадает к людям, а не только на стенд: носитель
+/// без единого читаемого файла выглядит пустым, и первое, что делает
+/// получивший его, — проверяет, не скачался ли он битым.
+fn iso_readme(arch: Arch, kind: Kind) -> String {
+    let what = match kind {
+        Kind::System => "the live system: it boots and runs from this medium, writing nothing",
+        Kind::Installer => "the installer: it partitions a disk and installs the system onto it",
+    };
+    format!(
+        "FreeOS bootable image ({arch})
+
+         
+
+         This is {what}.
+
+         
+
+         Boot it in a virtual machine with EFI enabled, or write it to a USB stick.
+
+         The bootloader lives inside an EFI System Partition image referenced by the
+
+         El Torito boot catalog; there is no BIOS boot path, by design.
+
+         
+
+         https://github.com/anomal3/FreeOpenSourseSystemAI
+
+",
+        arch = arch.name(),
+    )
 }
 
 /// Печатает, что лежит в образе и как его записать на настоящий носитель.

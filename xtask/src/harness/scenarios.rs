@@ -28,6 +28,9 @@ pub enum Target {
     Installer,
     /// Диск, на который ставил установщик.
     Installed,
+    /// Загрузочный ISO, подключённый приводом — ровно так, как его подключит
+    /// человек в VirtualBox.
+    Iso,
 }
 
 impl Target {
@@ -41,6 +44,7 @@ impl Target {
             Target::Image => "образ диска GPT + FAT32",
             Target::Installer => "установочный носитель и чистый диск",
             Target::Installed => "диск после установки",
+            Target::Iso => "загрузочный ISO в приводе",
         }
     }
 }
@@ -655,6 +659,36 @@ pub const ALL: &[Scenario] = &[
             // эпоху FAT, выдав её за метку файла, было бы хуже.
             Step::Line("stat /bin/hello"),
             Step::Await("  mtime  unknown", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "iso",
+        about: "Система грузится с загрузочного ISO — того же файла, что отдают человеку.",
+        target: Target::Iso,
+        usb_only: false,
+        arches: &[],
+        extra: &[],
+        steps: &[
+            // Это утверждение фазы целиком: прошивка нашла на носителе
+            // загрузочную запись El Torito и пошла по ней. Проверить его иначе
+            // нечем — ISO, который читается, но не грузится, выглядит точно так
+            // же, как рабочий, вплоть до этой строки. Ровно так и выяснилось,
+            // что двух записей в каталоге мало: носитель виделся как `FS0:
+            // CDROM`, а прошивка уходила в UEFI Shell.
+            Step::Await("FreeOS bootloader", BOOT),
+            Step::Await("FreeOS kernel v", 60_000),
+            Step::Await("freeos> ", 60_000),
+            // Система работает целиком, а не «дошла до приглашения»: initrd
+            // смонтирован, файлы читаются. Диска у неё при этом нет вовсе —
+            // носитель только для чтения, и это тот самый режим, в котором её
+            // будут пробовать.
+            Step::Line("ls /bin"),
+            Step::Await("hello", 15_000),
+            Step::Line("run /bin/hello"),
+            Step::Await("hello from userspace", 30_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

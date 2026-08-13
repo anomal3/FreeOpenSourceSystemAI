@@ -45,6 +45,9 @@ enum Command {
     Image(ImageArgs),
     /// Запустить установщик в QEMU: установочный носитель плюс чистый диск.
     Install(InstallArgs),
+    /// Собрать загрузочный ISO — то, что можно отдать человеку или подключить
+    /// к виртуальной машине.
+    Iso(ImageArgs),
     /// Разобрать образ диска: разделы и содержимое корневой ФС.
     Inspect(InspectArgs),
     /// Прогнать систему в QEMU по сценариям стенда — без человека за клавиатурой.
@@ -289,6 +292,26 @@ fn real_main() -> Result<()> {
             print_built(&built);
             let path = image::build(&built, kind)?;
             image::describe(args.arch, &path, kind);
+        }
+
+        Command::Iso(args) => {
+            let kind = if args.installer {
+                image::Kind::Installer
+            } else {
+                image::Kind::System
+            };
+            let built = build::build_all(&build::BuildOptions {
+                arch: args.arch,
+                release: args.release,
+                kernel: true,
+                initrd: true,
+                installer: args.installer,
+            })?;
+            print_built(&built);
+            let path = image::build_iso(&built, kind)?;
+            println!();
+            println!("Подключите этот файл приводом к виртуальной машине с включённым EFI:");
+            println!("  {}", path.display());
         }
 
         Command::Install(args) => {

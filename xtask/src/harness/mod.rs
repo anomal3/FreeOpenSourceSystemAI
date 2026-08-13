@@ -519,6 +519,7 @@ fn prepare_drives(target: Target, built: &build::Built, arch: Arch) -> Result<Ve
             Drive::Image(image::build(built, image::Kind::Installer)?),
             Drive::Image(image::prepare_target(arch, 1024, true)?),
         ],
+        Target::Iso => vec![Drive::Cdrom(image::build_iso(built, image::Kind::System)?)],
         Target::Installed => {
             let disk = paths::target_disk(arch);
             if !disk.is_file() {

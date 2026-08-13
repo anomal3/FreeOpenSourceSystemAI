@@ -671,6 +671,16 @@ impl Volume {
                     if entry[0] == 0xE5 || entry[11] & ATTR_LONG_NAME == ATTR_LONG_NAME {
                         continue;
                     }
+                    // Метка тома лежит в корневом каталоге такой же записью, как
+                    // файл, и по имени совпадает с ним ровно так же. Пропускать
+                    // её обязательно: том с меткой `FREEOS` иначе не даёт
+                    // создать каталог `FREEOS`, и отказ выглядит бессмысленно —
+                    // «компонент пути существует, но не каталог» про имя,
+                    // которого в каталоге не видно. Ровно на этом и споткнулась
+                    // сборка установочного ISO.
+                    if entry[11] & ATTR_VOLUME_ID != 0 {
+                        continue;
+                    }
                     if &entry[..11] != short {
                         continue;
                     }
@@ -1035,6 +1045,42 @@ mod tests {
         let (name, flags) = short_name("BOOTX64.EFI").expect("допустимое имя");
         assert_eq!(&name, b"BOOTX64 EFI");
         assert_eq!(flags, 0);
+    }
+
+    /// Метка тома не должна мешать созданию каталога с тем же именем.
+    ///
+    /// Проверка появилась после того, как сборка установочного ISO упала на
+    /// томе с меткой `FREEOS`, в котором надо было создать каталог `FREEOS`:
+    /// поиск пути находил запись метки и объявлял её не-каталогом.
+    #[test]
+    fn a_volume_label_is_not_a_directory_entry() {
+        let mut dev = junk_disk(PART_SECTORS).expect("образ");
+        let mut volume = format(
+            &mut dev,
+            Range { first_lba: 0, last_lba: PART_SECTORS - 1 },
+            &FormatOptions {
+                // Метка совпадает с именем каталога, который создаётся ниже, —
+                // в этом вся суть проверки.
+                label: "FREEOS",
+                volume_id: 0x1234_5678,
+                timestamp: Timestamp::EPOCH,
+            },
+        )
+        .expect("форматирование");
+
+        volume
+            .write_file_path(&mut dev, "FREEOS/KERNEL.ELF", b"kernel")
+            .expect("каталог с именем метки тома");
+        volume.finish(&mut dev).expect("завершение тома");
+
+        // И чужой читатель обязан увидеть то же самое: каталог, а не метку.
+        let fs = mount(&dev);
+        let dir = fs.root_dir().open_dir("FREEOS").expect("каталога FREEOS нет");
+        let names: Vec<String> = dir
+            .iter()
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .collect();
+        assert!(names.iter().any(|name| name == "KERNEL.ELF"), "файл не найден: {names:?}");
     }
 
     #[test]

@@ -118,6 +118,15 @@ pub fn disk_image(slug: &str, arch: Arch, release: bool) -> PathBuf {
     ))
 }
 
+/// Загрузочный образ ISO — то, что отдают человеку.
+pub fn iso_image(slug: &str, arch: Arch, release: bool) -> PathBuf {
+    build_dir().join(format!(
+        "{slug}-{}-{}.iso",
+        arch.name(),
+        profile_dir_name(release)
+    ))
+}
+
 /// Слепок содержимого образа, по которому решается, нужна ли пересборка.
 pub fn disk_image_stamp(slug: &str, arch: Arch, release: bool) -> PathBuf {
     disk_image(slug, arch, release).with_extension("stamp")

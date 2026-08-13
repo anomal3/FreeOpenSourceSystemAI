@@ -71,6 +71,13 @@ pub enum Drive {
     HostDirectory(PathBuf),
     /// Настоящий образ: наша разметка, наша файловая система.
     Image(PathBuf),
+    /// Загрузочный ISO, подключаемый приводом.
+    ///
+    /// Отдельно от [`Drive::Image`], потому что подключается иначе: не
+    /// virtio-blk, а привод — тот же способ, каким его подключит человек в
+    /// VirtualBox. Смысл проверки в этом и состоит: прошивка обязана найти на
+    /// нём загрузочную запись El Torito, а не файловую систему.
+    Cdrom(PathBuf),
 }
 
 /// Раскладывает собранные артефакты по структуре ESP и возвращает корень раздела.
@@ -140,7 +147,7 @@ pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
 fn drive_file(drive: &Drive) -> Result<String> {
     match drive {
         Drive::HostDirectory(path) => Ok(format!("fat:rw:{}", util::qemu_path(path)?)),
-        Drive::Image(path) => util::qemu_path(path),
+        Drive::Image(path) | Drive::Cdrom(path) => util::qemu_path(path),
     }
 }
 
@@ -233,6 +240,12 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
             // не видит. Прошивка при этом ничего не теряет: VirtioBlkDxe есть
             // и в OVMF, и в ArmVirtQemu.
             for (index, drive) in opts.drives.iter().enumerate() {
+                if let Drive::Cdrom(path) = drive {
+                    // Привод, а не virtio-blk: так его подключает человек, и так
+                    // прошивка ищет на нём загрузочную запись El Torito.
+                    cmd.args(["-cdrom", &util::qemu_path(path)?]);
+                    continue;
+                }
                 cmd.arg("-drive").arg(format!(
                     "if=none,id=disk{index},format=raw,file={}",
                     drive_file(drive)?
@@ -253,6 +266,19 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
             // «machine type does not support if=ide». Поэтому подключаем диски
             // явно через virtio-blk-pci (VirtioBlkDxe есть в ArmVirtQemu).
             for (index, drive) in opts.drives.iter().enumerate() {
+                if let Drive::Cdrom(path) = drive {
+                    // На `virt` привода нет вовсе, поэтому ISO подключается как
+                    // устройство SCSI CD-ROM. Для прошивки разницы нет: она
+                    // ищет El Torito на любом блочном устройстве, объявившем
+                    // себя оптическим.
+                    cmd.arg("-drive").arg(format!(
+                        "if=none,id=cd{index},format=raw,media=cdrom,file={}",
+                        util::qemu_path(path)?
+                    ));
+                    cmd.args(["-device", "virtio-scsi-pci,id=scsi"]);
+                    cmd.args(["-device", &format!("scsi-cd,drive=cd{index}")]);
+                    continue;
+                }
                 cmd.arg("-drive").arg(format!(
                     "if=none,id=disk{index},format=raw,file={}",
                     drive_file(drive)?

@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 20 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 21 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -64,7 +64,28 @@ cargo xtask test                        # the whole bench, both architectures, n
 cargo xtask test --list                 # what the bench checks
 cargo xtask test -a x86_64 -s boot      # one scenario on one architecture
 cargo xtask test --full                 # both profiles on both architectures
+
+cargo xtask iso --arch x86_64           # bootable ISO: build/freeos-x86_64-debug.iso
+cargo xtask iso --arch x86_64 --installer   # the installer as an ISO
 ```
+
+### Trying it in a virtual machine
+
+The ISO needs no QEMU and no spare machine. In VirtualBox: create a VM of type
+*Other/Unknown (64-bit)*, **turn on EFI** (Settings → System → Enable EFI), attach the `.iso`
+to the optical drive, start it. VMware and Hyper-V work the same way; on Hyper-V pick
+*Generation 2*, which is the EFI one. There is no BIOS boot path at all, by design, so a
+machine left on legacy boot will simply not find the medium.
+
+Two honest limits:
+
+- **The live ISO writes nothing.** It boots, mounts its initrd and gives you the desktop and
+  the shell. That is the whole of it, and it is the point — nothing on the host is touched.
+- **The installer ISO can install, but the result will not boot yet.** The installer writes
+  through UEFI Block I/O, so the firmware's own SATA or NVMe driver does the work and the
+  disk really does get written. The kernel, however, mounts its root through virtio-blk,
+  which exists in QEMU and not in VirtualBox. The driver that closes this — NVMe — is the
+  next phase, and until it lands, installing into a hypervisor is a one-way trip.
 
 `xtask` locates QEMU and its UEFI firmware automatically; override with the
 `FREEOS_OVMF_X86_64` / `FREEOS_OVMF_AARCH64` environment variables.
@@ -547,6 +568,37 @@ bench asserts the exact counts (18 lines, 143 words, 853 bytes of this repositor
 `initrd/README.TXT`), because "something was counted" reads the same as "the wrong thing was
 counted".
 
+### The bootable ISO
+
+A disk image has to be written somewhere; an ISO is attached. That is the whole difference,
+and it decides who can try the system: a hypervisor takes an ISO from a menu, and nothing on
+the host is touched.
+
+It does not boot *through* ISO 9660. The firmware reads **El Torito** — a boot catalogue
+invented for CDs — finds the entry whose platform is `0xEF` ("EFI"), and mounts the image it
+points at as an ordinary FAT partition. So what sits inside the ISO is a complete FAT32
+volume, written by the same `crates/disk` code that formats an ESP; the ISO 9660 around it
+exists so the medium counts as a medium — a volume descriptor, a path table, a root
+directory.
+
+Two things went wrong on the way, and both are the kind that leave no trace:
+
+- **Two catalogue entries are not enough.** With a validation entry marked `0xEF` and a boot
+  entry after it, OVMF *saw* the medium — it appeared in the UEFI Shell as `FS0: CDROM`,
+  meaning the ISO 9660 parsed fine — and then booted the Shell instead. No error, no log
+  line. EFI is bolted onto El Torito as a *section*, not as a replacement: the layout has to
+  be validation entry, default entry (a BIOS one, marked non-bootable here), section header
+  with platform `0xEF`, section entry. The temptation to drop the default entry is strong
+  and wrong — the section header is specified to follow it, not replace it.
+- **The volume label is a directory entry.** FAT32 stores it in the root directory as a
+  record shaped like a file, so a volume labelled `FREEOS` made it impossible to create a
+  directory named `FREEOS` — which is exactly what the installer medium needs. The error read
+  "a path component exists but is not a directory" about a name nothing had created. Fixed in
+  the FAT writer, where it belongs, with a test.
+
+The bench boots the ISO on both architectures, attached the way a person would attach it —
+as a drive on x86-64, as a SCSI CD-ROM on `virt`, which has no optical drive at all.
+
 ### Interrupts instead of polling
 
 The USB controller could always interrupt the processor; the kernel just never asked it to,
@@ -859,6 +911,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 18 | Interrupts instead of polling: MSI-X on both architectures, and a driver that sleeps until something happens | **done** |
 | 19 | Programs get told what to do: arguments, `seek`, and the time of day | **done** |
 | 20 | A program can read a directory: `readdir`, and `ls` moves out of the kernel | **done** |
+| 21 | A bootable ISO: ISO 9660 with an El Torito EFI catalog, so the system can be handed to someone | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe
