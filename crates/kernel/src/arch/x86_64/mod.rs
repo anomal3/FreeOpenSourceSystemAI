@@ -2,6 +2,7 @@
 //! таблицы дескрипторов, прерывания и ввод с клавиатуры.
 
 pub mod acpi;
+mod power;
 pub mod apic;
 pub mod context;
 pub mod gdt;
@@ -77,6 +78,20 @@ unsafe fn outb(port: u16, value: u8) {
     // на совести вызывающего, см. контракт функции.
     unsafe {
         asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Запись слова в порт ввода-вывода.
+///
+/// # Safety
+///
+/// См. [`outb`]. Регистры ACPI шириной в слово (`PM1_CNT`) обязаны писаться
+/// одним обращением: два байтовых дадут два разных состояния регистра, из
+/// которых первое может оказаться командой.
+unsafe fn outw(port: u16, value: u16) {
+    // SAFETY: те же условия, что и в `outb`.
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags));
     }
 }
 
@@ -396,3 +411,5 @@ pub fn halt() -> ! {
         unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
     }
 }
+
+pub use power::{power_off, reboot};

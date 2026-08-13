@@ -462,6 +462,14 @@ fn run_command(line: &str) -> bool {
                 kill(argument);
             }
         }
+        "shutdown" | "poweroff" => {
+            power_down(false);
+            return true;
+        }
+        "reboot" | "restart" => {
+            power_down(true);
+            return true;
+        }
         "exit" | "quit" => {
             sprintln!("  finishing the session");
             return true;
@@ -469,6 +477,41 @@ fn run_command(line: &str) -> bool {
         other => sprintln!("  unknown command '{other}'; try 'help'"),
     }
     false
+}
+
+/// Погасить или перезагрузить машину.
+///
+/// Порядок обязателен и он же — весь смысл: сначала на диск уходит всё, что
+/// держится в памяти, и только потом машина теряет питание. Обратный порядок
+/// означает файловую систему, которую придётся чинить после каждого штатного
+/// выключения, — то есть ровно то, чего фаза 27 избегает.
+fn power_down(restart: bool) {
+    sprintln!("  {}", if restart { "restarting" } else { "shutting down" });
+
+    // Счётчики ext2 живут в памяти редактора; без сброса том останется с
+    // неверным числом свободных блоков — это чинится `fsck`, но чинить нечего,
+    // если сбросить вовремя.
+    if let Some(result) = crate::fs::sync_root() {
+        match result {
+            Ok(()) => sprintln!("  root        : flushed"),
+            Err(err) => sprintln!("  root        : flush failed: {err}"),
+        }
+    }
+
+    let rsdp = crate::acpi::rsdp();
+    // SAFETY: всё, что нужно сохранить, сохранено выше; возврат из удавшегося
+    // выключения не предусмотрен, а из неудавшегося — обязателен, и он ниже.
+    unsafe {
+        if restart {
+            crate::arch::reboot(rsdp);
+        } else {
+            crate::arch::power_off(rsdp);
+        }
+    }
+
+    // Сюда попадаем только если способ не сработал: машина осталась включённой,
+    // и сказать об этом честнее, чем молча остановить процессор.
+    sprintln!("  power       : the machine refused to go down; halting instead");
 }
 
 fn help() {
@@ -490,6 +533,8 @@ fn help() {
     sprintln!("  run [-b] <p>  run a program with arguments; -b does not wait");
     sprintln!("  kill <task>   stop a running program by its task number");
     sprintln!("  clear         clear the window");
+    sprintln!("  shutdown      switch the machine off");
+    sprintln!("  reboot        restart the machine");
     sprintln!("  exit          finish the boot and halt");
 }
 
