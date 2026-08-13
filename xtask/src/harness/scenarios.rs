@@ -172,7 +172,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         extra: &[],
         steps: &[
-            Step::Await("FreeOS kernel v", BOOT),
+            Step::Await(crate::version::KERNEL_BANNER, BOOT),
             Step::Await("FreeOS shell.", 60_000),
             Step::Await("freeos> ", 10_000),
             Step::Line("uptime"),
@@ -679,7 +679,7 @@ pub const ALL: &[Scenario] = &[
             // что двух записей в каталоге мало: носитель виделся как `FS0:
             // CDROM`, а прошивка уходила в UEFI Shell.
             Step::Await("FreeOS bootloader", BOOT),
-            Step::Await("FreeOS kernel v", 60_000),
+            Step::Await(crate::version::KERNEL_BANNER, 60_000),
             Step::Await("freeos> ", 60_000),
             // Система работает целиком, а не «дошла до приглашения»: initrd
             // смонтирован, файлы читаются. Диска у неё при этом нет вовсе —
@@ -692,6 +692,38 @@ pub const ALL: &[Scenario] = &[
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "gicv3",
+        about: "Прерывания работают и на GICv3: адреса берутся из MADT, а не из констант.",
+        target: Target::Live,
+        usb_only: false,
+        // Только AArch64: на x86-64 GIC не существует.
+        arches: &[Arch::Aarch64],
+        // Свойство накапливается к уже заданной машине `virt`. Версия по
+        // умолчанию — та, что выбрал QEMU; здесь она задана явно, потому что
+        // проверяется именно другая ветка кода.
+        extra: &["-machine", "gic-version=3"],
+        steps: &[
+            // Первое: версия опознана и распечатана. До Phase 22 здесь стояло
+            // «unsupported interrupt controller (Unknown)» — ровно то, что
+            // увидел человек, запустивший систему в VirtualBox на Apple Silicon.
+            Step::Await("interrupts  : GICv3", BOOT),
+            // Второе, и главное: прерывания доходят. Тик таймера — единственное,
+            // чем это проверяется: без него планировщик стоит, а оболочка не
+            // отвечает вовсе.
+            Step::Await("freeos> ", BOOT),
+            Step::Line("uptime"),
+            Step::Await("timer ticks", 15_000),
+            // Ввод по UART тоже приходит прерыванием, и то, что оболочка
+            // ответила на команду выше, это и доказывает.
+            Step::Line("echo gicv3-ok"),
+            Step::Await("gicv3-ok", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+            Step::Absent("NO TICKS"),
         ],
     },
     Scenario {
@@ -722,7 +754,7 @@ pub const ALL: &[Scenario] = &[
         steps: &[
             // На VVFAT таблицы разделов не существует вовсе — QEMU синтезирует
             // её на лету. Значит, разметку проверяет только этот сценарий.
-            Step::Await("FreeOS kernel v", BOOT),
+            Step::Await(crate::version::KERNEL_BANNER, BOOT),
             Step::Await("freeos> ", 60_000),
             Step::Line("echo image-ok"),
             Step::Await("image-ok", 15_000),

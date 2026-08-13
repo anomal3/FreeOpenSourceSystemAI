@@ -128,6 +128,30 @@ fn checksum(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0u8, |acc, byte| acc.wrapping_add(*byte))
 }
 
+/// Физический адрес RSDP, запомненный при разборе хэндоффа.
+///
+/// Статик, а не аргумент, потому что таблицы нужны в местах, куда `BootInfo` не
+/// доезжает: инициализация прерываний вызывается из общего кода, а адрес нужен
+/// арх-части. Ноль означает «прошивка таблиц не дала».
+static RSDP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Запомнить адрес RSDP. Вызывается один раз при загрузке.
+pub fn set_rsdp(address: u64) {
+    RSDP.store(address, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Физический адрес RSDP; ноль, если таблиц нет.
+///
+/// Читает его пока только aarch64 — там из MADT берутся адреса контроллера
+/// прерываний. На x86-64 то же самое делает разбор `BootInfo` на месте, поэтому
+/// функция там законно не вызывается; помечать это надо явно, иначе
+/// предупреждение о мёртвом коде видно ровно в одной из двух сборок.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[must_use]
+pub fn rsdp() -> u64 {
+    RSDP.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 #[must_use]
 pub fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])

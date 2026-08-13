@@ -500,6 +500,13 @@ fn usb_status() {
             );
             sprintln!("  reports  {} parsed", usb.reports);
             sprintln!("  events   {} seen, {} transfer errors", usb.events, usb.errors);
+            // Печатается только когда случилось: строка «floods 0» ничего не
+            // сообщает, а вот отличное от нуля значение означает, что контроллер
+            // отдаёт события быстрее, чем драйвер успевает их забирать, — или
+            // что кольцо испорчено и разбор не сходится сам.
+            if usb.event_floods != 0 {
+                sprintln!("  events   {} drains hit the per-pass limit", usb.event_floods);
+            }
             // Ноль здесь при работающей клавиатуре означает опрос: контроллер
             // либо не объявил MSI-X, либо на этой машине их некуда направить.
             if usb.interrupts == 0 {

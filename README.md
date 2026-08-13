@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 21 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 22 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -55,7 +55,7 @@ cargo xtask run --arch x86_64     # build + boot in QEMU
 cargo xtask run --arch aarch64    # same source, ARM64
 cargo xtask run --arch x86_64 --gdb     # halt before first instruction, gdbstub on :1234
 cargo xtask run --arch x86_64 --image   # boot from a real GPT disk image, not VVFAT
-cargo xtask image --arch x86_64         # just write build/freeos-x86_64-debug.img
+cargo xtask image --arch x86_64         # just write build/FreeOS_0.1.<build>_x86_64_debug.img
 
 cargo xtask install --arch x86_64       # run the installer against a blank 1 GiB disk
 cargo xtask run --arch x86_64 --installed   # boot what the installer just wrote
@@ -65,7 +65,7 @@ cargo xtask test --list                 # what the bench checks
 cargo xtask test -a x86_64 -s boot      # one scenario on one architecture
 cargo xtask test --full                 # both profiles on both architectures
 
-cargo xtask iso --arch x86_64           # bootable ISO: build/freeos-x86_64-debug.iso
+cargo xtask iso --arch x86_64           # bootable ISO: build/ISO/FreeOS_0.1.<build>_x86_64_debug.iso
 cargo xtask iso --arch x86_64 --installer   # the installer as an ISO
 ```
 
@@ -76,6 +76,28 @@ The ISO needs no QEMU and no spare machine. In VirtualBox: create a VM of type
 to the optical drive, start it. VMware and Hyper-V work the same way; on Hyper-V pick
 *Generation 2*, which is the EFI one. There is no BIOS boot path at all, by design, so a
 machine left on legacy boot will simply not find the medium.
+
+One setting is worth changing before you start: the **pointing device**. VirtualBox defaults
+to a *USB Tablet*, which reports absolute coordinates and declares no HID boot protocol —
+and this system reads boot-protocol devices only, so a tablet leaves you with no cursor at
+all. Set Settings → System → Motherboard → Pointing Device to **USB Mouse**. (A PS/2 mouse
+will not help: the second i8042 port has no driver here, on purpose, because the other
+architecture has no such port to share the code with.) When a mouse is found, the boot log
+says so: `usb : boot mouse on interface 0, ...`.
+
+The last number in the file name is the build counter, and it describes **the state of the
+source**, not the individual file: every image built from one state of the tree carries the
+same number, across both architectures and both profiles. Debug and release are one build
+shown two ways. Change the code — fix something in the ARM64 path, say — and all four
+images move to the next number together. The version ahead of it is bumped by hand, in
+`[workspace.package]`, because what counts as new functionality is a decision, not a
+counter.
+
+The number is not stored inside the image. It is a property of this build directory's
+history, so putting it in a volume label or a banner would mean identical sources produce
+different bytes on a different machine — and byte-reproducibility is deliberate here. The
+kernel therefore prints the version at boot, but not the build number; that one lives in
+the file name, which is where you pick the file anyway.
 
 Two honest limits:
 
@@ -568,6 +590,40 @@ bench asserts the exact counts (18 lines, 143 words, 853 bytes of this repositor
 `initrd/README.TXT`), because "something was counted" reads the same as "the wrong thing was
 counted".
 
+### Finding the interrupt controller
+
+The ARM side had its GIC addresses as constants, correct for QEMU `virt` and for nothing
+else. The bill arrived the first time someone booted the ISO on a different machine —
+VirtualBox on Apple Silicon — and the kernel printed `unsupported interrupt controller
+(Unknown) at 0x08000000`, then ran with no timer and no keyboard. Everything else worked:
+memory, the clock, initrd, PCI, xHCI. The one part whose address had been *guessed* was the
+one part that failed.
+
+Addresses now come from the MADT, and with them the version — which turned out to matter,
+because GICv3 is not a bigger GICv2. Its CPU interface is not memory at all but system
+registers (`ICC_*`), and private interrupts (the timer among them) are enabled through a
+per-core redistributor rather than the distributor. Both versions are supported; which one
+is in front of us the firmware says.
+
+Three things this cost, each worth naming:
+
+- **ACPI cannot be read that early.** Parsing the MADT before the kernel takes over memory
+  crashes into the *firmware's* exception handler, before the kernel has installed its own —
+  an `ASSERT [ArmCpuDxe]` and nothing else. The lookup now happens where every other ACPI
+  lookup happens, after the switch to our own tables, and the GIC windows are mapped
+  individually at that point rather than up front.
+- **A nested `kprintln!` deadlocks.** Printing inside the arguments of another print
+  re-enters the output lock. It killed the first attempt in a way that looked identical to
+  the problem above.
+- **v2m does not exist on GICv3.** Its place is taken by the ITS, which we do not implement,
+  and touching the v2m address there is not a read of garbage but an external abort from the
+  bus. The system died with `page fault at 0x08020008` while setting up xHCI, and the address
+  was the only clue. On GICv3 the driver stays on polling — the same path it takes on
+  machines with no MSI-X at all, which is exactly what VirtualBox turned out to be.
+
+The bench runs a scenario with `-machine gic-version=3` and asserts what actually matters:
+the version is recognised, ticks arrive, and the shell answers a typed command.
+
 ### The bootable ISO
 
 A disk image has to be written somewhere; an ISO is attached. That is the whole difference,
@@ -912,6 +968,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 19 | Programs get told what to do: arguments, `seek`, and the time of day | **done** |
 | 20 | A program can read a directory: `readdir`, and `ls` moves out of the kernel | **done** |
 | 21 | A bootable ISO: ISO 9660 with an El Torito EFI catalog, so the system can be handed to someone | **done** |
+| 22 | The interrupt controller is read from ACPI, not guessed, and GICv3 works | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

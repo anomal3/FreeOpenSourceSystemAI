@@ -70,6 +70,17 @@ use core::ptr;
 use crate::mm::{AddressSpace, VirtAddr};
 use crate::vfs::FileSystem;
 
+/// Версия системы: мажор и минор из `[workspace.package]`.
+///
+/// Ровно то же значение и тем же способом собирает `xtask` для имени файла
+/// образа и метки тома (`xtask/src/version.rs`). Патч-версия отброшена там и
+/// здесь: две записи одной версии, различающиеся на глаз, — это уже две версии.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION_MAJOR"),
+    ".",
+    env!("CARGO_PKG_VERSION_MINOR")
+);
+
 /// Точка входа ядра на x86-64.
 ///
 /// ABI указан явно и `extern "C"` здесь был бы ошибкой. Загрузчик собран под
@@ -120,8 +131,21 @@ fn start(boot_info: *const BootInfo) -> ! {
         console::init(&info.framebuffer);
     }
 
+    // Проверка адреса порта — сразу, как только карта памяти прошла проверку.
+    // Раньше нельзя (карте ещё нельзя верить), позже незачем: дальше начинается
+    // раздача кадров, и первый же выданный кадр по этому адресу превратил бы
+    // диагностический вывод в порчу чужих данных.
+    if serial_lands_in_ram(&info.memory_map) {
+        serial::silence();
+    }
+
     banner(&info, boot_info as usize);
     dump_memory_map(&info.memory_map);
+
+    // Адрес таблиц запоминается до всего остального: он нужен и арх-части при
+    // поиске контроллера прерываний, и драйверам, а `BootInfo` до них не
+    // доезжает.
+    acpi::set_rsdp(info.acpi_rsdp);
 
     // С этого момента памятью распоряжается ядро, а не прошивка.
     take_over_memory(&info);
@@ -824,7 +848,12 @@ fn validate(raw: *const BootInfo) -> Option<BootInfo> {
 /// Баннер: кто стартовал и что именно приехало в `BootInfo`.
 fn banner(info: &BootInfo, addr: usize) {
     kprintln!("================================================================");
-    kprintln!(" FreeOS kernel v{} - Phase 8 bring-up", env!("CARGO_PKG_VERSION"));
+    // Версия совпадает с той, что стоит в имени файла образа и в метке тома:
+    // строка на экране — единственный способ узнать, что за образ подключён к
+    // машине, когда имя файла уже не видно. «Phase 8 bring-up» здесь стояло с
+    // восьмой фазы и врало все следующие тринадцать — номер фазы держится в
+    // README и в истории, а не в баннере.
+    kprintln!(" FreeOS {} kernel", VERSION);
     kprintln!(" architecture : {}", arch::ARCH_NAME);
     kprintln!("================================================================");
     kprintln!("BootInfo @ {addr:#018x}");
@@ -907,6 +936,51 @@ const MAX_REGIONS: u64 = 1024;
 
 /// Сколько регионов показать подробно — остальные сворачиваются в счётчик.
 const REGIONS_SHOWN: usize = 8;
+
+/// Попадает ли предполагаемый адрес последовательного порта в оперативную
+/// память.
+///
+/// Если да — порта там нет. Прошивка описывает MMIO как `Reserved` либо не
+/// описывает вовсе, а всё, из чего ядро потом раздаёт кадры, — это память, и
+/// регистров устройства в ней быть не может.
+///
+/// Стоило это дорого: на VirtualBox 7.2.14 (Apple Silicon) PL011 не существует,
+/// а память начинается с `0x08000000` и покрывает `0x09000000`, куда ядро
+/// писало каждый печатаемый символ. Порча памяти от вывода диагностики — отказ,
+/// который ищут не там, где он происходит.
+///
+/// Ноль в [`arch::SERIAL_MMIO`] означает «порт не адресуется памятью» (x86-64 с
+/// его пространством ввода-вывода) — там проверять нечего.
+fn serial_lands_in_ram(map: &MemoryMap) -> bool {
+    let probe = arch::SERIAL_MMIO;
+    if probe == 0 || map.ptr == 0 || map.len == 0 {
+        return false;
+    }
+    if map.ptr % align_of::<RawRegion>() as u64 != 0 {
+        // Карта нечитаема — и отнимать единственный канал диагностики на этом
+        // основании нельзя: непригодная карта как раз тот случай, когда о ней
+        // надо суметь рассказать.
+        return false;
+    }
+
+    let count = map.len.min(MAX_REGIONS);
+    let base = map.ptr as *const RawRegion;
+    for index in 0..count {
+        // SAFETY: те же соображения, что и в [`dump_memory_map`]: массив
+        // построен загрузчиком, ещё не переиспользован, индекс в пределах
+        // заявленной длины, выравнивание проверено выше.
+        let region = unsafe { ptr::read(base.add(index as usize)) };
+        let holds_memory = matches!(
+            region.kind,
+            KIND_USABLE | KIND_ACPI_RECLAIM | KIND_ACPI_NVS | KIND_BOOTLOADER | KIND_KERNEL
+        );
+        if holds_memory && region.start <= probe && probe < region.start.saturating_add(region.len)
+        {
+            return true;
+        }
+    }
+    false
+}
 
 fn dump_memory_map(map: &MemoryMap) {
     kprintln!();

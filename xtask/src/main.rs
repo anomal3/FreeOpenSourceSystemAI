@@ -15,6 +15,7 @@ mod inspect;
 mod paths;
 mod qemu;
 mod util;
+mod version;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};

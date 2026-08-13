@@ -110,6 +110,9 @@ const PORT_RECOVERY_MS: u64 = 20;
 /// частоте оно исчерпывалось позже, чем истекает время.
 const SPIN_LIMIT: u32 = 200_000_000;
 
+/// Через сколько витков спрашивать часы. См. [`Timeout::expired`].
+const CLOCK_EVERY: u32 = 64;
+
 /// Ожидание с двумя независимыми пределами.
 struct Timeout {
     until_ms: u64,
@@ -122,10 +125,30 @@ impl Timeout {
     }
 
     /// `true`, если ждать больше нельзя.
+    ///
+    /// # Почему часы читаются не на каждом витке
+    ///
+    /// Потому что чтение часов не везде стоит одинаково. На железе `CNTPCT_EL0`
+    /// — это несколько тактов; под гипервизором доступ к нему с EL1 может быть
+    /// перехвачен, и тогда каждое чтение стоит выхода в монитор. VirtualBox на
+    /// Apple Silicon именно таков: `CNTHCTL_EL2.EL1PCTEN` у него сброшен, и
+    /// цикл, спрашивавший время на каждом витке, состоял из выходов в
+    /// гипервизор целиком — измерено отладчиком, счётчик команд гостя стоял на
+    /// инструкции `mrs cntpct_el0` во всех выборках подряд.
+    ///
+    /// Раз в [`CLOCK_EVERY`] витков достаточно: ожидания здесь измеряются
+    /// миллисекундами, а витков в миллисекунде тысячи. Точность предела от
+    /// этого не страдает, а цена ожидания падает на два порядка.
     fn expired(&mut self) -> bool {
         self.spins = self.spins.saturating_add(1);
         core::hint::spin_loop();
-        time::uptime_ms() >= self.until_ms || self.spins >= SPIN_LIMIT
+        if self.spins >= SPIN_LIMIT {
+            return true;
+        }
+        if self.spins % CLOCK_EVERY != 0 {
+            return false;
+        }
+        time::uptime_ms() >= self.until_ms
     }
 }
 
@@ -296,6 +319,10 @@ pub struct Controller {
     devices: Vec<Device>,
     /// Сколько событий разобрано — диагностика.
     events_seen: u64,
+    /// Сколько раз разбор кольца упёрся в предел за один проход. Отличен от нуля
+    /// означает, что контроллер отдаёт события быстрее, чем драйвер их забирает,
+    /// — либо что кольцо испорчено и цикл не сходится.
+    event_floods: u64,
     /// Сколько передач завершилось ошибкой.
     transfer_errors: u64,
     /// Устройство на шине: нужно после инициализации, чтобы настроить MSI-X —
@@ -398,6 +425,7 @@ impl Controller {
             erst: dma::alloc(16)?,
             devices: Vec::new(),
             events_seen: 0,
+            event_floods: 0,
             transfer_errors: 0,
             device,
             msix_table: None,
@@ -611,10 +639,22 @@ impl Controller {
     unsafe fn drain_events(&mut self, awaited: Option<u64>) -> Option<Trb> {
         let mut result = None;
         let mut moved = false;
+        // Предел на один проход. Кольцо конечно, и честный контроллер отдаст
+        // не больше событий, чем в нём мест; но здесь единственный цикл во всём
+        // драйвере, который не ограничен ничем, кроме доброй воли устройства, —
+        // а поведение чужого контроллера это ровно то, чего мы не знаем. Без
+        // предела отказ выглядит как молчаливое зависание загрузки, то есть
+        // самый дорогой в диагностике вид отказа.
+        let mut left = RING_ENTRIES * 2;
 
         while let Some(event) = self.events.pop() {
             self.events_seen += 1;
             moved = true;
+            left -= 1;
+            if left == 0 {
+                self.event_floods += 1;
+                break;
+            }
 
             match event.kind() {
                 ring::TRB_COMMAND_COMPLETION | ring::TRB_TRANSFER_EVENT => {
@@ -773,6 +813,23 @@ impl Controller {
         let (mut keyboard, mut mouse) = (false, false);
         let mut next = 1u8;
 
+        // Карта занятых портов — одной строкой, до первой попытки с ними
+        // что-нибудь сделать. Без неё «перечисление ничего не нашло» и
+        // «перечисление не дошло до первого порта» выглядят одинаково: молчание.
+        // На чужой машине с четырнадцатью портами это первое, что хочется
+        // знать, и стоит оно одного чтения на порт.
+        let mut connected = 0u32;
+        for port in 1..=self.regs.max_ports.min(32) {
+            // SAFETY: номер порта в пределах, сообщённых контроллером.
+            if unsafe { self.regs.read_portsc(port) } & regs::PORTSC_CONNECTED != 0 {
+                connected |= 1 << (port - 1);
+            }
+        }
+        kprintln!(
+            "  usb         : {} root port(s), connected mask {connected:#010x}",
+            self.regs.max_ports
+        );
+
         while next <= self.regs.max_ports {
             // SAFETY: контракт функции.
             let Some((port, _)) = (unsafe { self.find_device_port(next) }) else {
@@ -800,6 +857,12 @@ impl Controller {
     ///
     /// Контроллер должен работать, а порт — иметь подключённое устройство.
     unsafe fn attach_one(&mut self, port: u8) -> Result<u8, XhciError> {
+        // Строка **до** сброса, а не после. Сброс порта — первое, что драйвер
+        // делает с чужим устройством, и первое, что на чужой машине может не
+        // вернуться; отчёт после него сообщает об успехе, а нужен признак
+        // попытки. Разница между «не дошли до порта» и «застряли на порте»
+        // стоит одной строки.
+        kprintln!("  usb         : root port {port} occupied, resetting");
         // SAFETY: контракт функции.
         let speed = unsafe { self.reset_port(port) }?;
         kprintln!(
@@ -1508,6 +1571,7 @@ impl Controller {
             reports,
             events: self.events_seen,
             errors: self.transfer_errors,
+            event_floods: self.event_floods,
             interrupts: self.interrupts,
             services: self.services,
         }
@@ -1532,6 +1596,9 @@ pub struct Summary {
     pub events: u64,
     /// Сколько передач завершилось ошибкой.
     pub errors: u64,
+    /// Сколько раз разбор кольца событий упёрся в предел за один проход.
+    /// Отличное от нуля значение — признак, ради которого предел и введён.
+    pub event_floods: u64,
     /// Сколько прерываний пришло от контроллера. Ноль при работающей
     /// клавиатуре означает, что события забирает опрос.
     pub interrupts: u64,

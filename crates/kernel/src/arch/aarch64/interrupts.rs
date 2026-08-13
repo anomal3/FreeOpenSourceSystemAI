@@ -575,7 +575,18 @@ const XHCI_PRIORITY: u8 = 0x80;
 /// не отказ загрузки.
 #[must_use]
 pub fn setup_xhci_msi() -> Option<(u64, u32)> {
-    // SAFETY: окно v2m входит в `gic::MMIO_WINDOWS` и отображено вместе с
+    // Приставка v2m существует только у GICv2. На GICv3 её место занимает ITS
+    // с таблицами устройств и командной очередью, которых у нас нет, — и
+    // обращение по адресу v2m там даёт не мусор, а внешний abort от шины.
+    // Обошлось это дорого: при первом запуске на GICv3 система падала с
+    // «page fault at 0x08020008» в момент настройки xHCI, и адрес был
+    // единственной подсказкой. Драйвер в этом случае остаётся на опросе — тот
+    // же путь, которым он идёт на машинах без MSI-X вовсе.
+    if gic::version() != Some(gic::Version::V2) {
+        return None;
+    }
+
+    // SAFETY: окно v2m входит в `gic::mmio_windows()` и отображено вместе с
     // остальными окнами контроллера.
     let (base, _count) = unsafe { gic::v2m_spi_range() }?;
 
@@ -617,25 +628,46 @@ fn init_locked() {
     // обработчиков — статический массив в данных ядра, отображённый на запись.
     unsafe { select_kernel_stack() };
 
-    // SAFETY: окна GIC отображены как Device-память при построении адресного
-    // пространства; параллельного доступа к контроллеру нет.
+    // Где контроллер — выясняется здесь, из MADT, и здесь же отображаются его
+    // окна: адреса зависят от машины, а не от того, что было верно для QEMU.
+    //
+    // SAFETY: таблицы ядра активны, вызов единственный.
+    unsafe { super::probe_gic(crate::acpi::rsdp()) };
+
+    // SAFETY: окна GIC отображены выше; параллельного доступа к контроллеру нет.
     let version = unsafe { gic::init() };
     match version {
         gic::Version::V2 => {
-            kprintln!("  interrupts  : GICv2, distributor {:#010x}", gic::GICD_BASE);
+            kprintln!("  interrupts  : GICv2, distributor {:#010x}", gic::gicd());
+        }
+        gic::Version::V3 => {
+            kprintln!(
+                "  interrupts  : GICv3, distributor {:#010x}, redistributor {:#010x}",
+                gic::gicd(),
+                gic::gicr()
+            );
+            // У v3 приватные прерывания — а таймер именно приватное — включаются
+            // в redistributor'е этого ядра, и больше нигде. Без его адреса
+            // разрешение уходит в distributor, где для номеров меньше 32 просто
+            // не действует: контроллер опознан, настроен, и таймер молчит.
+            // Отказ, у которого нет ни одного сообщения, ищут часами.
+            if gic::gicr() == 0 {
+                kprintln!("WARNING: GICv3 without a redistributor address in MADT");
+                kprintln!("         private interrupts, the timer among them, cannot be enabled");
+            }
         }
         other => {
             kprintln!(
                 "WARNING: unsupported interrupt controller ({other:?}) at {:#010x}",
-                gic::GICD_BASE
+                gic::gicd()
             );
             kprintln!("         no timer and no device interrupts will be delivered");
-            kprintln!("         on QEMU this is fixed by -machine virt,gic-version=2");
+            kprintln!("         the address came from ACPI MADT if the firmware provided one");
             return;
         }
     }
 
-    // SAFETY: контроллер — GICv2 и уже включён.
+    // SAFETY: контроллер опознан и уже включён.
     unsafe { gic::enable_interrupt(timer::TIMER_INTID, TIMER_PRIORITY) };
 
     // SAFETY: векторы установлены, прерывание таймера разрешено в контроллере.

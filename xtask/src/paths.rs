@@ -105,31 +105,65 @@ pub fn initrd_stamp() -> PathBuf {
     build_dir().join("initrd.stamp")
 }
 
-/// Готовый загрузочный образ диска (GPT + FAT32 ESP).
+/// Имя файла образа: `FreeOS_0.1.4_aarch64_release.iso` и подобные.
 ///
-/// Профиль входит в имя: образ содержит собранные бинарники, и debug-образ
-/// рядом с release-образом под одним именем означал бы, что запуск с `-r` и без
-/// него молча подсовывают друг другу чужое ядро.
-pub fn disk_image(slug: &str, arch: Arch, release: bool) -> PathBuf {
-    build_dir().join(format!(
-        "{slug}-{}-{}.img",
+/// Все поля обязательны, и каждое отвечает за свой способ перепутать образы.
+/// Версия — потому что файл уезжает к человеку и живёт у него дольше одной
+/// сборки. Номер сборки — потому что версия за вечер не меняется, а образ
+/// пересобирается пятикратно (см. [`crate::version`]). Архитектура — потому что
+/// `BOOTAA64.EFI` и `BOOTX64.EFI` в одинаково названных файлах не различить
+/// ничем, кроме попытки загрузиться. Профиль — потому что образ содержит
+/// собранные бинарники, и debug рядом с release под одним именем означал бы, что
+/// запуск с `-r` и без него молча подсовывают друг другу чужое ядро.
+fn image_name(slug: &str, build: u32, arch: Arch, release: bool, extension: &str) -> String {
+    format!(
+        "{slug}_{}.{build}_{}_{}.{extension}",
+        crate::version::VERSION,
         arch.name(),
-        profile_dir_name(release)
-    ))
+        profile_dir_name(release),
+    )
+}
+
+/// Готовый загрузочный образ диска (GPT + FAT32 ESP).
+pub fn disk_image(slug: &str, build: u32, arch: Arch, release: bool) -> PathBuf {
+    build_dir().join(image_name(slug, build, arch, release, "img"))
+}
+
+/// Каталог с загрузочными ISO — и только с ними.
+///
+/// Отдельный каталог потому, что ISO — единственное, что уезжает с этой машины
+/// к человеку. Всё остальное в `build/` (образы дисков, целевой диск, прошивки,
+/// журналы стенда, слепки) существует ради сборки и проверки, и искать среди
+/// этого один нужный файл — лишняя возможность взять соседний.
+pub fn iso_dir() -> PathBuf {
+    build_dir().join("ISO")
 }
 
 /// Загрузочный образ ISO — то, что отдают человеку.
-pub fn iso_image(slug: &str, arch: Arch, release: bool) -> PathBuf {
-    build_dir().join(format!(
-        "{slug}-{}-{}.iso",
-        arch.name(),
-        profile_dir_name(release)
-    ))
+pub fn iso_image(slug: &str, build: u32, arch: Arch, release: bool) -> PathBuf {
+    iso_dir().join(image_name(slug, build, arch, release, "iso"))
 }
 
-/// Слепок содержимого образа, по которому решается, нужна ли пересборка.
+/// Слепок содержимого образа диска, по которому решается, нужна ли пересборка.
+///
+/// Номера сборки в имени слепка нет намеренно: слепок обязан пережить смену
+/// номера, иначе сравнивать будет не с чем и каждая сборка окажется первой.
+/// Версии тоже нет — по той же причине.
 pub fn disk_image_stamp(slug: &str, arch: Arch, release: bool) -> PathBuf {
-    disk_image(slug, arch, release).with_extension("stamp")
+    build_dir().join(stamp_name(slug, arch, release, "img"))
+}
+
+/// Слепок содержимого ISO. Лежит рядом со своим образом, в [`iso_dir`].
+pub fn iso_stamp(slug: &str, arch: Arch, release: bool) -> PathBuf {
+    iso_dir().join(stamp_name(slug, arch, release, "iso"))
+}
+
+fn stamp_name(slug: &str, arch: Arch, release: bool, extension: &str) -> String {
+    format!(
+        "{slug}_{}_{}.{extension}.stamp",
+        arch.name(),
+        profile_dir_name(release),
+    )
 }
 
 /// Чистый диск, на который ставит установщик.

@@ -51,7 +51,23 @@ const UART_PRIORITY: u8 = 0xA0;
 /// для поиска I/O APIC. Аргумент присутствует ради единой подписи: ядро вызывает
 /// `arch::input::init(&info)` и не должно знать, кому из архитектур он полезен.
 pub fn init(_info: &BootInfo) -> Sources {
-    if gic::version() != Some(gic::Version::V2) {
+    // Обе версии годятся: разница между ними — в том, как разрешается прерывание
+    // (у v3 приватные живут в redistributor'е), и это уже спрятано внутри
+    // `gic::enable_interrupt`. Отказывать здесь по версии значило бы оставить
+    // машину с GICv3 без ввода при полностью рабочем контроллере.
+    // Порта на этой машине нет вовсе — по его предполагаемому адресу
+    // оперативная память (см. [`crate::serial::silence`]). Разрешать приём
+    // означало бы настраивать несуществующее устройство записями в чужую память
+    // и разрешать в контроллере линию, которая принадлежит другому устройству:
+    // на VirtualBox `INTID 33` — это GPIO, а не порт.
+    if crate::serial::absent() {
+        kprintln!("  serial in   : no serial port on this machine");
+        let sources = Sources::default();
+        crate::input::set_sources(sources);
+        return sources;
+    }
+
+    if !matches!(gic::version(), Some(gic::Version::V2 | gic::Version::V3)) {
         kprintln!("  input       : no usable GIC, the UART interrupt cannot be enabled");
         let sources = Sources::default();
         crate::input::set_sources(sources);

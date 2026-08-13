@@ -33,6 +33,7 @@ use crate::arch::{self, Arch, Component};
 use crate::build::Built;
 use crate::paths;
 use crate::util;
+use crate::version;
 
 /// Что за образ собирается.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,8 +49,8 @@ impl Kind {
     /// Часть имени файла образа.
     const fn slug(self) -> &'static str {
         match self {
-            Kind::System => "freeos",
-            Kind::Installer => "freeos-install",
+            Kind::System => "FreeOS",
+            Kind::Installer => "FreeOS-Installer",
         }
     }
 
@@ -60,6 +61,18 @@ impl Kind {
             Kind::Installer => "FREEOS INST",
         }
     }
+}
+
+/// Метка загрузочного тома ISO — то, чем носитель подписан для человека,
+/// открывшего его файловым менеджером хоста.
+///
+/// Версия в ней ровно затем же, зачем и в имени файла: подключённый в
+/// гипервизоре образ имени файла уже не показывает, а метку — показывает.
+/// В одиннадцать байт метки FAT32 `FREEOS 0.1` помещается; более длинную
+/// запись форматирование обрежет само, и это не потеря — рядом лежит
+/// `README.TXT`, где версия написана целиком.
+fn volume_label() -> String {
+    format!("FREEOS {}", crate::version::VERSION)
 }
 
 /// Ревизия способа сборки образа; входит в слепок.
@@ -108,17 +121,17 @@ pub fn build(built: &Built, kind: Kind) -> Result<PathBuf> {
     let arch = built.arch;
     let payload = collect(built, kind)?;
 
-    let image_path = paths::disk_image(kind.slug(), arch, built.release);
     let stamp_path = paths::disk_image_stamp(kind.slug(), arch, built.release);
     let stamp = stamp_text(&payload, kind);
+    let build = version::resolve_build(&stamp_path, &stamp)?;
+    let image_path = paths::disk_image(kind.slug(), build.number, arch, built.release);
 
     // Пересборка только по изменению содержимого: образ — десятки мегабайт, и
     // формировать его на каждый запуск значит платить паузу за файлы, которые
     // меняются реже кода.
-    if util::file_len(&image_path).is_some()
-        && fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str())
-    {
-        println!("образ: актуален, пересборка не нужна ({})", image_path.display());
+    if reuse(&build, &image_path, &stamp_path, &stamp, "образ", |number| {
+        paths::disk_image(kind.slug(), number, arch, built.release)
+    })? {
         return Ok(image_path);
     }
 
@@ -134,7 +147,7 @@ pub fn build(built: &Built, kind: Kind) -> Result<PathBuf> {
     let _ = fs::remove_file(&stamp_path);
     fs::write(&image_path, &bytes)
         .with_context(|| format!("не удалось записать образ {}", image_path.display()))?;
-    fs::write(&stamp_path, &stamp)
+    fs::write(&stamp_path, version::stamp_with_build(build.number, &stamp))
         .with_context(|| format!("не удалось записать слепок {}", stamp_path.display()))?;
 
     println!(
@@ -143,6 +156,9 @@ pub fn build(built: &Built, kind: Kind) -> Result<PathBuf> {
         image_path.display(),
         bytes.len() / (1024 * 1024),
     );
+    retire(build.previous, build.number, |number| {
+        paths::disk_image(kind.slug(), number, arch, built.release)
+    });
     for file in &payload {
         println!("  \\{:<24} {}", file.path.replace('/', "\\"), file.source.display());
     }
@@ -376,7 +392,8 @@ fn expand(seed: u64, salt: &[u8]) -> [u8; 16] {
 fn stamp_text(payload: &[Payload], kind: Kind) -> String {
     let content: u64 = payload.iter().map(|file| file.data.len() as u64).sum();
     let mut text = format!(
-        "rev={FORMAT_REVISION} esp={} label={}\n",
+        "rev={FORMAT_REVISION} version={} esp={} label={}\n",
+        crate::version::VERSION,
         esp_size(content),
         kind.label(),
     );
@@ -433,8 +450,7 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     let arch = built.arch;
     let payload = collect(built, kind)?;
 
-    let path = paths::iso_image(kind.slug(), arch, built.release);
-    let stamp_path = path.with_extension("iso.stamp");
+    let stamp_path = paths::iso_stamp(kind.slug(), arch, built.release);
     // Ревизия формата входит в слепок, и это не перестраховка: правка самого
     // генератора ISO содержимого не меняет, поэтому образ считался бы
     // актуальным и не пересобирался. Ровно так и вышло при переходе каталога
@@ -443,11 +459,12 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     const ISO_FORMAT_REVISION: u32 = 2;
     let stamp = format!("iso-format={ISO_FORMAT_REVISION}
 {}", stamp_text(&payload, kind));
+    let build = version::resolve_build(&stamp_path, &stamp)?;
+    let path = paths::iso_image(kind.slug(), build.number, arch, built.release);
 
-    if util::file_len(&path).is_some()
-        && fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str())
-    {
-        println!("iso: актуален, пересборка не нужна ({})", path.display());
+    if reuse(&build, &path, &stamp_path, &stamp, "iso", |number| {
+        paths::iso_image(kind.slug(), number, arch, built.release)
+    })? {
         return Ok(path);
     }
 
@@ -457,8 +474,9 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     let boot = assemble_fat(&payload)?;
 
     let readme = iso_readme(arch, kind);
+    let label = volume_label();
     let bytes = iso9660::build(&iso9660::Options {
-        label: "FREEOS",
+        label: &label,
         boot_image: &boot,
         files: &[("README.TXT", readme.as_bytes())],
     });
@@ -470,7 +488,7 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     let _ = fs::remove_file(&stamp_path);
     fs::write(&path, &bytes)
         .with_context(|| format!("не удалось записать образ {}", path.display()))?;
-    fs::write(&stamp_path, &stamp)
+    fs::write(&stamp_path, version::stamp_with_build(build.number, &stamp))
         .with_context(|| format!("не удалось записать слепок {}", stamp_path.display()))?;
 
     println!(
@@ -479,7 +497,86 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
         path.display(),
         bytes.len() / (1024 * 1024),
     );
+    retire(build.previous, build.number, |number| {
+        paths::iso_image(kind.slug(), number, arch, built.release)
+    });
     Ok(path)
+}
+
+/// Можно ли обойтись без пересборки — и если да, довести дело до конца.
+///
+/// Два разных «не надо пересобирать». Первое очевидно: файл уже лежит там, где
+/// нужно. Второе тоньше и появилось вместе с общим номером сборки: содержимое
+/// то же, а номер новый — потому что правка была в чужой архитектуре или в
+/// другом профиле, и состояние кода изменилось, хотя байты этого образа нет.
+/// Тогда файл достаточно **переименовать**: собирать заново семьдесят
+/// мегабайт, чтобы получить те же семьдесят мегабайт, незачем.
+///
+/// Возвращает `true`, если образ уже готов и лежит по нужному пути.
+fn reuse(
+    build: &version::Build,
+    path: &Path,
+    stamp_path: &Path,
+    stamp: &str,
+    what: &str,
+    path_of: impl Fn(u32) -> PathBuf,
+) -> Result<bool> {
+    if !build.unchanged {
+        return Ok(false);
+    }
+    if util::file_len(path).is_some() {
+        println!("{what}: актуален, пересборка не нужна ({})", path.display());
+        return Ok(true);
+    }
+
+    let Some(previous) = build.previous.filter(|number| *number != build.number) else {
+        return Ok(false);
+    };
+    let old_path = path_of(previous);
+    if util::file_len(&old_path).is_none() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
+    }
+    // Неудача переименования — не отказ: вызывающий просто соберёт образ
+    // заново, и результат будет тот же самый, только дороже.
+    if fs::rename(&old_path, path).is_err() {
+        return Ok(false);
+    }
+    fs::write(stamp_path, version::stamp_with_build(build.number, stamp))
+        .with_context(|| format!("не удалось записать слепок {}", stamp_path.display()))?;
+    println!(
+        "{what}: содержимое то же, сборка {previous} -> {} ({})",
+        build.number,
+        path.display()
+    );
+    Ok(true)
+}
+
+/// Убрать образ предыдущей сборки — тот, который только что заменили.
+///
+/// Иначе каталог сборки набирает по семьдесят мегабайт на каждую правку, а в
+/// нём копятся загрузочные образы, отличающиеся только номером, и подключить
+/// вчерашний становится так же легко, как сегодняшний. Устаревший образ — это
+/// не история, это ловушка: история хранится в git, а образ, собранный из кода,
+/// которого больше нет, не подтверждает ничего.
+///
+/// Занятый файл (например, подключённый к работающей машине) — не отказ сборки:
+/// новый образ уже записан, а о лишнем сказано вслух.
+fn retire(previous: Option<u32>, current: u32, path_of: impl Fn(u32) -> PathBuf) {
+    let Some(previous) = previous.filter(|number| *number != current) else {
+        return;
+    };
+    let path = path_of(previous);
+    if util::file_len(&path).is_none() {
+        return;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => println!("  заменяет сборку {previous} ({})", path.display()),
+        Err(err) => println!("  сборка {previous} осталась лежать: {err}"),
+    }
 }
 
 /// Том FAT32 целиком, без таблицы разделов: то, что уедет внутрь ISO.
@@ -493,11 +590,12 @@ fn assemble_fat(payload: &[Payload]) -> Result<Vec<u8>> {
 
     let seed = content_hash(payload);
     let range = gpt::Range { first_lba: 0, last_lba: sectors - 1 };
+    let label = volume_label();
     let mut volume = fat32::format(
         &mut dev,
         range,
         &fat32::FormatOptions {
-            label: "FREEOS",
+            label: &label,
             volume_id: (seed >> 32) as u32 ^ seed as u32,
             timestamp: fat32::Timestamp::EPOCH,
         },
@@ -527,9 +625,9 @@ fn iso_readme(arch: Arch, kind: Kind) -> String {
         Kind::Installer => "the installer: it partitions a disk and installs the system onto it",
     };
     format!(
-        "FreeOS bootable image ({arch})
+        "FreeOS {version} bootable image ({arch})
 
-         
+
 
          This is {what}.
 
@@ -546,6 +644,7 @@ fn iso_readme(arch: Arch, kind: Kind) -> String {
          https://github.com/anomal3/FreeOpenSourseSystemAI
 
 ",
+        version = crate::version::VERSION,
         arch = arch.name(),
     )
 }

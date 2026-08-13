@@ -219,7 +219,7 @@ fn about_text(desktop: &Compositor) -> String {
          Tab           next window\n\
          Ctrl+W        close window\n\
          Ctrl+arrows   move window\n",
-        env!("CARGO_PKG_VERSION"),
+        crate::VERSION,
         arch::ARCH_NAME,
         desktop.screen_width(),
         desktop.screen_height(),

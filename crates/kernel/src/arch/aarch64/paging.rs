@@ -1144,6 +1144,7 @@ pub fn build_kernel_address_space(
             "WARNING: ID_AA64MMFR0_EL1 reports no 4 KiB granule support; mapping anyway"
         );
     }
+
     let el = current_el();
     if el != 1 {
         // Регистры EL1 доступны и с более высокого уровня, но исполнение при
@@ -1307,18 +1308,25 @@ fn map_devices(
     // В карте памяти UEFI его может не быть вовсе, а без него ядро теряет
     // единственный канал диагностики ровно в момент переключения таблиц —
     // отказ выглядит как «ядро молча умерло на activate».
-    let uart = PhysAddr::new(super::QEMU_VIRT_PL011 as u64);
-    // SAFETY: пространство не активировано; страница регистров PL011 не
-    // пересекается с кодом или стеком ядра.
-    unsafe {
-        space.map_range(
-            VirtAddr::new(super::QEMU_VIRT_PL011),
-            uart,
-            PAGE_SIZE,
-            KERNEL_DEVICE,
-            alloc,
-        )?;
-        space.map_range(uart.to_direct_map(), uart, PAGE_SIZE, KERNEL_DEVICE, alloc)?;
+    // ...если он на этой машине есть. Порт, оказавшийся оперативной памятью,
+    // отображать как Device нельзя вдвойне: мало того что там нет регистров, —
+    // прямое отображение уже описывает ту же страницу как обычную память, а два
+    // разных типа памяти на один физический адрес архитектура объявляет
+    // непредсказуемым поведением.
+    if !crate::serial::absent() {
+        let uart = PhysAddr::new(super::QEMU_VIRT_PL011 as u64);
+        // SAFETY: пространство не активировано; страница регистров PL011 не
+        // пересекается с кодом или стеком ядра.
+        unsafe {
+            space.map_range(
+                VirtAddr::new(super::QEMU_VIRT_PL011),
+                uart,
+                PAGE_SIZE,
+                KERNEL_DEVICE,
+                alloc,
+            )?;
+            space.map_range(uart.to_direct_map(), uart, PAGE_SIZE, KERNEL_DEVICE, alloc)?;
+        }
     }
 
     // Окна контроллера прерываний — по той же причине, что и UART, и с той же
@@ -1328,7 +1336,14 @@ fn map_devices(
     // Полагаться на случайное попадание нельзя: первое обращение к
     // неотображённому distributor'у дало бы data abort ровно в тот момент,
     // когда обработчика отказов ещё нет.
-    for (base, size) in super::gic::MMIO_WINDOWS {
+    for (base, size) in super::gic::mmio_windows() {
+        // Нулевой адрес означает «такого окна на этой машине нет» — так
+        // отсутствует redistributor у GICv2. Отображать нулевую страницу как
+        // устройство нельзя: она законная память, и разметить её Device-флагами
+        // значит испортить чужие обращения к ней.
+        if base == 0 {
+            continue;
+        }
         let phys = PhysAddr::new(base as u64);
         // SAFETY: те же условия, что и для UART: пространство не активировано,
         // а окна устройств не пересекаются с памятью ядра.
