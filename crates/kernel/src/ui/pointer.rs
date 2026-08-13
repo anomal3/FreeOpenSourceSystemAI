@@ -100,6 +100,22 @@ impl Pointer {
         true
     }
 
+    /// Поставить указатель в точку, оставив его на экране.
+    ///
+    /// Существует ради планшета: он сообщает не сдвиг, а положение, и «навести»
+    /// для него — это буквально поставить, а не привезти. Возвращает `true`,
+    /// если положение изменилось, по той же причине, что и [`Pointer::move_by`].
+    pub fn move_to(&mut self, x: i32, y: i32, width: u32, height: u32) -> bool {
+        let x = x.clamp(0, width.saturating_sub(1) as i32);
+        let y = y.clamp(0, height.saturating_sub(1) as i32);
+        if x == self.x && y == self.y {
+            return false;
+        }
+        self.x = x;
+        self.y = y;
+        true
+    }
+
     /// Показать курсор. Возвращает `true`, если он был скрыт до этого.
     pub fn show(&mut self) -> bool {
         if self.visible {

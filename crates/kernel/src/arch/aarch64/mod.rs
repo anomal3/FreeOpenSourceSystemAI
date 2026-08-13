@@ -75,6 +75,64 @@ pub unsafe fn probe_gic(rsdp: u64) {
         ),
     }
 }
+/// Найти консольный порт там, где его объявила прошивка.
+///
+/// Вызывается вместе с [`probe_gic`] и по той же причине: адрес UART на ARM
+/// ничем не закреплён, и до этого момента ядро пользуется умолчанием QEMU. На
+/// машине с другим адресом это умолчание означает молчание — в лучшем случае
+/// (порт отключён проверкой [`crate::serial_lands_in_ram`]), а в худшем запись
+/// в чужую память.
+///
+/// Молчание обошлось дорого: на VirtualBox системе нечем было сообщить, почему
+/// не поднялась клавиатура, и оставались только снимки экрана, на которых
+/// журнал загрузки уже затёрт рабочим столом.
+///
+/// # Safety
+///
+/// Вызывать на активных таблицах ядра, один раз.
+pub unsafe fn probe_serial(rsdp: u64) {
+    // SAFETY: контракт функции; ноль означает «таблиц нет».
+    let Some(base) = (unsafe { acpi::find_uart(rsdp) }) else {
+        // Молчать об этом нельзя ровно там, где ядро и так молчит: если порт не
+        // заработает, строка ниже — единственное, что объяснит почему. Она,
+        // впрочем, уйдёт в тот самый порт, которого может не быть; на машине с
+        // экраном её видно на нём.
+        crate::kprintln!(
+            "  serial      : no console UART in ACPI; keeping {QEMU_VIRT_PL011:#010x} (QEMU virt)"
+        );
+        return;
+    };
+    // Совпадение с умолчанием — тоже результат, и печатается он по той же
+    // причине, по которой печатается версия GIC: иначе не отличить «прошивка
+    // подтвердила адрес» от «разбор не работает, а повезло».
+    if base == QEMU_VIRT_PL011 && !crate::serial::absent() {
+        crate::kprintln!("  serial      : ACPI confirms the console UART at {base:#010x}");
+        return;
+    }
+
+    let phys = crate::mm::PhysAddr::new(base as u64);
+    // SAFETY: адрес пришёл из таблицы прошивки и описывает регистры UART;
+    // Device-семантика для них обязательна.
+    let mapped = unsafe {
+        crate::arch::map_active(
+            crate::mm::VirtAddr::new(base),
+            phys,
+            crate::mm::PAGE_SIZE,
+            crate::mm::PageFlags::READ
+                .union(crate::mm::PageFlags::WRITE)
+                .union(crate::mm::PageFlags::DEVICE),
+        )
+    };
+    if let Err(err) = mapped {
+        crate::kprintln!("WARNING: cannot map the SPCR UART at {base:#010x}: {err:?}");
+        return;
+    }
+
+    // SAFETY: окно отображено выше, адрес взят из SPCR.
+    unsafe { crate::serial::adopt(Serial::at(base)) };
+    crate::kprintln!("  serial      : SPCR puts the console UART at {base:#010x}");
+}
+
 pub mod context;
 pub mod gic;
 pub mod input;
@@ -185,6 +243,36 @@ const FBRD_115200: u32 = 1;
 /// повиснуть в единственном канале диагностики хуже, чем потерять байт.
 const TX_SPIN_LIMIT: u32 = 100_000;
 
+/// Есть ли на этой платформе доступ к PCI через порты ввода-вывода.
+///
+/// Нет, и не может быть: пространства ввода-вывода у AArch64 не существует как
+/// понятия. Конфигурационное пространство здесь бывает только окном в памяти, и
+/// машина без MCFG — это машина без PCI вовсе.
+pub const HAS_PCI_PORTS: bool = false;
+
+/// Заглушка ради общего интерфейса: на этой архитектуре её никто не вызывает,
+/// потому что доступ через порты недоступен ([`HAS_PCI_PORTS`]).
+///
+/// Возвращает то же, что вернула бы шина, на которой никого нет, — так ошибка
+/// в вызывающем коде выглядит как «устройств не найдено», а не как случайные
+/// данные.
+///
+/// # Safety
+///
+/// Требований нет: функция ничего не делает.
+#[allow(dead_code)] // общий интерфейс с x86-64; вызывается только там
+pub unsafe fn pci_config_read32(_address: u32) -> u32 {
+    u32::MAX
+}
+
+/// См. [`pci_config_read32`].
+///
+/// # Safety
+///
+/// Требований нет: функция ничего не делает.
+#[allow(dead_code)] // общий интерфейс с x86-64
+pub unsafe fn pci_config_write32(_address: u32, _value: u32) {}
+
 /// UART PL011, отображённый в память.
 pub struct Serial {
     base: usize,
@@ -193,6 +281,17 @@ pub struct Serial {
 impl Serial {
     /// UART, с которого ядро начинает говорить на этой платформе.
     pub const PLATFORM: Self = Self { base: QEMU_VIRT_PL011 };
+
+    /// UART по адресу, который назвала прошивка.
+    ///
+    /// # Safety
+    ///
+    /// `base` обязан быть адресом настоящего PL011 в уже отображённом окне с
+    /// Device-семантикой.
+    #[must_use]
+    pub const unsafe fn at(base: usize) -> Self {
+        Self { base }
+    }
 
     /// # Safety
     ///

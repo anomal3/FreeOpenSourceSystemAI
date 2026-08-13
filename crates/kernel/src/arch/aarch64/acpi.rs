@@ -1,4 +1,4 @@
-//! Разбор MADT: где на этой машине контроллер прерываний и какой он.
+//! Разбор таблиц ACPI, нужных ARM: где контроллер прерываний и где консоль.
 //!
 //! # Почему это понадобилось
 //!
@@ -123,4 +123,157 @@ pub unsafe fn find_gic(rsdp: u64) -> Option<GicLayout> {
         return None;
     }
     Some(layout)
+}
+
+// ---------------------------------------------------------------------------
+// SPCR: где на этой машине консольный порт
+// ---------------------------------------------------------------------------
+
+/// Смещение поля `Interface Type` в SPCR.
+const SPCR_INTERFACE: usize = 36;
+/// Смещение структуры `Base Address` (Generic Address Structure).
+const SPCR_BASE: usize = 40;
+/// Внутри GAS: идентификатор адресного пространства и сам адрес.
+const GAS_SPACE_ID: usize = 0;
+const GAS_ADDRESS: usize = 4;
+/// Адресное пространство «системная память».
+const GAS_SPACE_MEMORY: u8 = 0;
+
+/// Типы интерфейса, которые понимает драйвер PL011.
+///
+/// `0x03` — сам PL011; `0x0D` и `0x0E` — SBSA-вариант того же регистрового
+/// набора (полный и 32-разрядный), совместимый с ним по всем регистрам, которые
+/// этот драйвер трогает. Всё остальное (16550, DCC, MediaTek) — другое
+/// устройство, и молча считать его PL011 значило бы писать байты в чужие
+/// регистры.
+const INTERFACE_PL011: u8 = 0x03;
+const INTERFACE_SBSA_32: u8 = 0x0D;
+const INTERFACE_SBSA: u8 = 0x0E;
+
+/// Физический адрес консольного порта из SPCR.
+///
+/// # Зачем это ядру
+///
+/// Затем же, зачем MADT: адрес UART на ARM ничем не закреплён. У QEMU `virt`
+/// это `0x0900_0000`, у VirtualBox на Apple Silicon — `0xffdd_f000`, и ядро,
+/// знающее только первый, на второй машине немо. Немо буквально: там не было ни
+/// одной строки журнала, и единственный способ понять, почему не работает
+/// клавиатура, — снимок экрана, на котором журнал уже затёрт рабочим столом.
+///
+/// SPCR (Serial Port Console Redirection) — та самая таблица, в которой прошивка
+/// говорит, куда она сама выводит консоль. Прошивка VirtualBox туда и пишет: её
+/// вывод виден в файле, к которому подключён порт, — а ядро молчало.
+///
+/// `None` означает «таблицы нет либо описан не наш порт» — тогда остаётся
+/// умолчание QEMU, и это состояние печатается вслух.
+///
+/// # Safety
+///
+/// См. [`find_gic`].
+pub unsafe fn find_uart(rsdp: u64) -> Option<usize> {
+    if rsdp == 0 {
+        return None;
+    }
+    // SAFETY: контракт функции.
+    if let Some(base) = unsafe { uart_from_spcr(rsdp) } {
+        return Some(base);
+    }
+    // SAFETY: см. выше.
+    unsafe { uart_from_dbg2(rsdp) }
+}
+
+/// Порт из SPCR — таблицы, которой прошивка объявляет консоль.
+///
+/// # Safety
+///
+/// См. [`find_gic`].
+unsafe fn uart_from_spcr(rsdp: u64) -> Option<usize> {
+    // SAFETY: контракт функции.
+    let spcr = unsafe { acpi::find_table(rsdp, b"SPCR") }.ok()?;
+    if spcr.len() < SPCR_BASE + 12 {
+        return None;
+    }
+
+    let interface = spcr[SPCR_INTERFACE];
+    if !matches!(interface, INTERFACE_PL011 | INTERFACE_SBSA | INTERFACE_SBSA_32) {
+        return None;
+    }
+    // Порт в пространстве ввода-вывода на ARM невозможен физически: такого
+    // пространства у архитектуры нет. Значение, отличное от «памяти», означает
+    // испорченную таблицу либо порт, до которого этому драйверу не дотянуться.
+    if spcr[SPCR_BASE + GAS_SPACE_ID] != GAS_SPACE_MEMORY {
+        return None;
+    }
+
+    let base = acpi::read_u64(spcr, SPCR_BASE + GAS_ADDRESS) as usize;
+    if base == 0 { None } else { Some(base) }
+}
+
+/// Порт из DBG2 — таблицы отладочных портов.
+///
+/// Она существует отдельно от SPCR и описывает то же самое устройство с другой
+/// целью: SPCR отвечает на вопрос «куда прошивка выводит консоль», DBG2 — «какие
+/// порты пригодны для отладки». Прошивка вправе объявить одну из них, обе или ни
+/// одной, поэтому смотреть надо в обе: молчание системы стоит дороже двух
+/// разборов по тридцать строк.
+///
+/// # Safety
+///
+/// См. [`find_gic`].
+unsafe fn uart_from_dbg2(rsdp: u64) -> Option<usize> {
+    /// Смещение списка устройств и их число в заголовке DBG2.
+    const DBG2_LIST_OFFSET: usize = 36;
+    const DBG2_LIST_COUNT: usize = 40;
+    /// Поля записи Debug Device Information.
+    const DEVICE_LENGTH: usize = 1;
+    const DEVICE_REGISTER_COUNT: usize = 3;
+    const DEVICE_PORT_TYPE: usize = 12;
+    const DEVICE_PORT_SUBTYPE: usize = 14;
+    const DEVICE_REGISTERS_OFFSET: usize = 18;
+    /// Тип порта «последовательный».
+    const PORT_TYPE_SERIAL: u16 = 0x8000;
+    /// Подтипы, которые понимает драйвер PL011 (те же, что у SPCR).
+    const SUBTYPE_PL011: u16 = 0x0003;
+    const SUBTYPE_SBSA_32: u16 = 0x000D;
+    const SUBTYPE_SBSA: u16 = 0x000E;
+
+    // SAFETY: контракт функции.
+    let dbg2 = unsafe { acpi::find_table(rsdp, b"DBG2") }.ok()?;
+    if dbg2.len() < DBG2_LIST_COUNT + 4 {
+        return None;
+    }
+
+    let mut at = acpi::read_u32(dbg2, DBG2_LIST_OFFSET) as usize;
+    let count = acpi::read_u32(dbg2, DBG2_LIST_COUNT) as usize;
+
+    for _ in 0..count.min(8) {
+        if at + DEVICE_REGISTERS_OFFSET + 2 > dbg2.len() {
+            break;
+        }
+        let length = usize::from(acpi::read_u16(dbg2, at + DEVICE_LENGTH));
+        // Нулевая длина — испорченная таблица, а не пустая запись: без проверки
+        // обход зациклился бы навсегда.
+        if length < 22 || at + length > dbg2.len() {
+            break;
+        }
+
+        let port_type = acpi::read_u16(dbg2, at + DEVICE_PORT_TYPE);
+        let subtype = acpi::read_u16(dbg2, at + DEVICE_PORT_SUBTYPE);
+        let registers = usize::from(acpi::read_u16(dbg2, at + DEVICE_REGISTERS_OFFSET));
+
+        if port_type == PORT_TYPE_SERIAL
+            && matches!(subtype, SUBTYPE_PL011 | SUBTYPE_SBSA | SUBTYPE_SBSA_32)
+            && dbg2[at + DEVICE_REGISTER_COUNT] > 0
+            && at + registers + 12 <= dbg2.len()
+            && dbg2[at + registers + GAS_SPACE_ID] == GAS_SPACE_MEMORY
+        {
+            let base = acpi::read_u64(dbg2, at + registers + GAS_ADDRESS) as usize;
+            if base != 0 {
+                return Some(base);
+            }
+        }
+
+        at += length;
+    }
+    None
 }

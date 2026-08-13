@@ -136,6 +136,16 @@ pub struct Scenario {
     /// до одной клавиатуры — QEMU выбирает PS/2. Без отключения i8042 сценарий
     /// «проверяем USB HID» молча проверял бы совсем другой драйвер.
     pub usb_only: bool,
+    /// Вместо мыши к машине подключён планшет.
+    ///
+    /// Это другое устройство, а не та же мышь другими словами: планшет не
+    /// объявляет boot-протокола и сообщает координаты вместо приращений. Ровно
+    /// такой манипулятор VirtualBox предлагает по умолчанию, поэтому путь через
+    /// разбор дескриптора отчётов проверяется здесь, а не на чужой машине.
+    ///
+    /// Заодно меняется способ управления: абсолютное событие посылается через
+    /// QMP, потому что в HMP такой команды нет (см. [`super::qmp`]).
+    pub tablet: bool,
     /// Архитектуры, на которых сценарий имеет смысл. Пусто — все.
     pub arches: &'static [Arch],
 }
@@ -169,6 +179,7 @@ pub const ALL: &[Scenario] = &[
         about: "Ядро грузится, композитор поднимается, оболочка отвечает на команды.",
         target: Target::Live,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -197,6 +208,7 @@ pub const ALL: &[Scenario] = &[
         about: "Клавиши доходят до ядра через xHCI и USB HID, а не через PS/2.",
         target: Target::Live,
         usb_only: true,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -204,6 +216,11 @@ pub const ALL: &[Scenario] = &[
             // Ядро перечисляет только поднявшиеся источники. PS/2 на этой машине
             // выключен, значит клавиатура здесь может быть только USB.
             Step::Expect("Input: keyboard"),
+            // Клавиатура тоже читается по дескриптору отчётов: модификаторы и
+            // список клавиш найдены в нём, а не взяты из boot-протокола. Это
+            // ровно тот разбор, которым будет читаться клавиатура на железе,
+            // где boot-протокола нет.
+            Step::Expect("keyboard, modifiers, 6-key array"),
             Step::Type("echo usb-ok"),
             Step::Key("ret"),
             Step::Await("usb-ok", 15_000),
@@ -240,6 +257,7 @@ pub const ALL: &[Scenario] = &[
         about: "Меню запуска открывает программу, окно двигается и закрывается, фокус возвращается.",
         target: Target::Live,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -311,6 +329,7 @@ pub const ALL: &[Scenario] = &[
         about: "Курсор ездит, щелчок поднимает окно, окно тащится за заголовок и закрывается кнопкой.",
         target: Target::Live,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -318,7 +337,11 @@ pub const ALL: &[Scenario] = &[
             // Мышь — второе устройство на контроллере. Строка ниже доказывает,
             // что перечисление портов дошло до неё, а не остановилось на
             // клавиатуре.
-            Step::Expect("boot mouse on interface"),
+            Step::Expect("slot 2 is a mouse"),
+            // И то, что она читается по собственному дескриптору, а не по
+            // boot-протоколу: boot остался запасным путём, и ходить по нему
+            // здесь нечего — иначе он проверялся бы, а основной нет.
+            Step::Expect("pointer, relative"),
             Step::Expect("Mouse: click to focus"),
             // Доехать до угла можно только упёршись в край: если ограничение
             // не работает, курсор уедет за экран и следующие наводки промажут.
@@ -366,10 +389,99 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "tablet",
+        about: "Манипулятор без boot-протокола: планшет разобран по дескриптору отчётов и ставит курсор в точку.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: true,
+        arches: &[],
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Планшет не объявляет boot-протокола вовсе, и единственный способ
+            // узнать, что в его отчёте, — прочитать дескриптор. Строка ниже и
+            // есть доказательство того, что он прочитан и понят: и то, что
+            // координаты абсолютные, и границы их диапазона.
+            Step::Expect("pointer, absolute 0..32767"),
+            Step::Expect("is a mouse"),
+            Step::Expect("Mouse: click to focus"),
+            // Абсолютный указатель ставится в точку, а не привозится в неё. Если
+            // разбор соврал в разрядности поля или в границах, курсор окажется
+            // не там, и следующая же наводка промахнётся мимо окна.
+            Step::Aim(Aim::Corner),
+            Step::Line("ui"),
+            Step::Await("pointer  0,0 visible", 15_000),
+            Step::Aim(Aim::MenuButton),
+            Step::Click,
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("01-menu"),
+            Step::Click,
+            Step::Await("desktop     : menu closed", 15_000),
+            Step::Aim(Aim::Title("System")),
+            Step::Click,
+            Step::Await("desktop     : focus 'System'", 15_000),
+            // Перетаскивание абсолютным указателем: окно обязано ехать за
+            // точкой, хотя приращений устройство не сообщает вовсе — их считает
+            // ядро, по разнице положений курсора.
+            Step::Press,
+            Step::Await("desktop     : drag 'System'", 15_000),
+            Step::Move(-160, 120),
+            Step::Release,
+            Step::Await("desktop     : moved 'System' to ", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("02-dragged"),
+            Step::Aim(Aim::Close("System")),
+            Step::Click,
+            Step::Await("desktop     : closed 'System'", 15_000),
+            Step::Aim(Aim::Middle("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : focus 'Terminal'", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("03-desktop"),
+            Step::Type("exit"),
+            Step::Key("ret"),
+            Step::Await("finishing the session", 30_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "pmtimer",
+        about: "Машина, на которой не удалось измерить частоту по PIT: её меряют по таймеру ACPI, и время идёт.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        arches: &[Arch::X86_64],
+        // Свойство накапливается к уже заданной машине `q35`, как и `i8042=off`
+        // у `usb_only`. Так воспроизводится VirtualBox: там PIT существует, но
+        // измерить по нему частоту локального APIC не удаётся, и система
+        // оставалась без таймера — то есть без всего, что зависит от времени.
+        extra: &["-machine", "pit=off"],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Первый источник обязан отказать: иначе сценарий проверяет не то,
+            // ради чего заведён.
+            Step::Expect("calibration against the PIT failed"),
+            Step::Expect("measured against the ACPI timer"),
+            Step::Absent("timer disabled"),
+            // И главное: таймер после этого работает. Тик — это доставленное
+            // прерывание, и ненулевое их число означает, что счётчик заряжен
+            // осмысленным значением, а вектор доходит.
+            Step::Line("uptime"),
+            Step::AtLeast(" ms, ", 1, 15_000),
+            Step::Line("echo pmtimer-ok"),
+            Step::Await("  pmtimer-ok", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "userspace",
         about: "Программа исполняется в своём адресном пространстве, а её отказ снимает её, а не систему.",
         target: Target::Live,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -489,6 +601,7 @@ pub const ALL: &[Scenario] = &[
         about: "Программа без единого системного вызова больше не владеет машиной.",
         target: Target::Live,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -529,6 +642,7 @@ pub const ALL: &[Scenario] = &[
         about: "Программу, которая сама не кончится, снимают командой — и её память возвращается в пул.",
         target: Target::Live,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -576,6 +690,7 @@ pub const ALL: &[Scenario] = &[
         about: "Ждущая программа выходит из очереди на исполнение, и машине становится нечего делать.",
         target: Target::Live,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -620,6 +735,7 @@ pub const ALL: &[Scenario] = &[
         about: "Система знает время суток: часы прошивки доезжают до ядра и идут дальше сами.",
         target: Target::Live,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -669,6 +785,7 @@ pub const ALL: &[Scenario] = &[
         about: "Система грузится с загрузочного ISO — того же файла, что отдают человеку.",
         target: Target::Iso,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -699,6 +816,7 @@ pub const ALL: &[Scenario] = &[
         about: "Прерывания работают и на GICv3: адреса берутся из MADT, а не из констант.",
         target: Target::Live,
         usb_only: false,
+        tablet: false,
         // Только AArch64: на x86-64 GIC не существует.
         arches: &[Arch::Aarch64],
         // Свойство накапливается к уже заданной машине `virt`. Версия по
@@ -731,6 +849,7 @@ pub const ALL: &[Scenario] = &[
         about: "Терминал, присылающий один возврат каретки, работает как Enter.",
         target: Target::Live,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -749,6 +868,7 @@ pub const ALL: &[Scenario] = &[
         about: "Система грузится с диска, размеченного нашим же кодом: GPT и FAT32.",
         target: Target::Image,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -768,6 +888,7 @@ pub const ALL: &[Scenario] = &[
         about: "Установщик проходит все экраны и пишет систему на чистый диск.",
         target: Target::Installer,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -819,6 +940,7 @@ pub const ALL: &[Scenario] = &[
         about: "Установленная система находит свой диск, монтирует ext2, читает /etc и проверяет права.",
         target: Target::Installed,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -881,6 +1003,7 @@ pub const ALL: &[Scenario] = &[
         about: "Система пишет в корневой раздел: оболочка из кольца ноль, программа — из третьего.",
         target: Target::Installed,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -957,6 +1080,7 @@ pub const ALL: &[Scenario] = &[
         about: "Записанное переживает выключение: та же машина, тот же диск, новая загрузка.",
         target: Target::Installed,
         usb_only: false,
+        tablet: false,
         arches: &[],
         extra: &[],
         steps: &[

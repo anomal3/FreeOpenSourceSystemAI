@@ -277,6 +277,7 @@ dependencies = [
  "font8x8",
  "linked_list_allocator",
  "mini-ui",
+ "usb-hid",
  "user-abi",
 ]
 
@@ -458,6 +459,10 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "usb-hid"
+version = "0.1.0"
 
 [[package]]
 name = "user-abi"

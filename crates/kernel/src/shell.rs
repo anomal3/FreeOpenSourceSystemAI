@@ -260,6 +260,30 @@ fn banner() {
     if sources.mouse {
         sprintln!("Mouse: click to focus, drag the title bar to move.");
     }
+    // Чем ядро сочло каждое устройство на шине — здесь, а не только в журнале.
+    //
+    // Причина конкретная: на машине без последовательного порта журнала нет
+    // вовсе, а экранная консоль к этому моменту уже закрыта рабочим столом. На
+    // VirtualBox ARM это выглядело так: «Input: none available» при двух
+    // поднятых USB-устройствах, и понять, чем они оказались, было нечем — ни
+    // одной строки диагностики человек в этот момент не видит.
+    if let Some(usb) = usb::xhci::summary() {
+        if usb.occupied > 0 {
+            sprintln!(
+                "USB: {} of {} port(s) brought up, {} keyboard(s), {} pointer(s).",
+                usb.devices,
+                usb.occupied,
+                usb.keyboards,
+                usb.mice
+            );
+            // Причина отказа — тут же. «Порт занят, а устройства нет» без неё
+            // означает ровно одно: садиться разбираться заново, уже с журналом,
+            // которого на этой машине не бывает.
+            if let Some((port, stage, err)) = usb.last_error {
+                sprintln!("     port {port} stopped while {stage}: {err}");
+            }
+        }
+    }
     sprintln!();
 }
 

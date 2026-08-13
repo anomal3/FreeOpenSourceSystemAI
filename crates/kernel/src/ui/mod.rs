@@ -412,14 +412,25 @@ pub fn dispatch_pointer(event: PointerEvent) {
 }
 
 fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
-    if event.dx != 0 || event.dy != 0 {
-        desktop.move_pointer(event.dx, event.dy);
+    // На сколько сдвинулся курсор. У мыши это приехало в отчёте, у планшета
+    // приходится вычесть одно положение из другого: устройство сообщило точку,
+    // а окно можно тащить только на разницу.
+    let (dx, dy) = match event.absolute {
+        Some((x, y)) => desktop.move_pointer_to(x, y),
+        None if event.dx != 0 || event.dy != 0 => {
+            desktop.move_pointer(event.dx, event.dy);
+            (event.dx, event.dy)
+        }
+        None => (0, 0),
+    };
+
+    if dx != 0 || dy != 0 {
         // Перетаскивание — это движение окна вслед за указателем на то же
         // приращение. Запоминать смещение точки захвата не нужно: приращения
         // складываются сами, а окно, упёршееся в край экрана, отстаёт от
         // курсора ровно на столько, на сколько его не пустили.
         if desktop.dragging().is_some() && event.buttons.contains(Buttons::LEFT) {
-            desktop.drag_by(event.dx, event.dy);
+            desktop.drag_by(dx, dy);
         }
     }
 

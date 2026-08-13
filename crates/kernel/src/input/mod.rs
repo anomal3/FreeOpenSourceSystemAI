@@ -627,14 +627,26 @@ impl core::fmt::Debug for Buttons {
 
 /// Событие указателя.
 ///
-/// Несёт **приращение**, а не позицию, потому что именно это сообщает мышь:
-/// абсолютных координат у неё нет, и где находится курсор — знает не драйвер, а
-/// тот, кто его рисует. Позиция в событии означала бы, что драйвер должен знать
-/// размер экрана.
+/// Обычно несёт **приращение**, а не позицию, потому что именно это сообщает
+/// мышь: абсолютных координат у неё нет, и где находится курсор — знает не
+/// драйвер, а тот, кто его рисует.
+///
+/// Планшет — устройство, которое VirtualBox предлагает вместо мыши, — сообщает
+/// противоположное: не сдвиг, а точку. Свести одно к другому в драйвере
+/// невозможно (чтобы получить сдвиг, надо знать, где курсор), поэтому событие
+/// умеет нести и то и другое, а выбирает — устройство.
 #[derive(Clone, Copy, Debug)]
 pub struct PointerEvent {
     pub dx: i32,
     pub dy: i32,
+    /// Положение в **долях** экрана: 0 — левый верхний угол, 65535 — правый
+    /// нижний. `None` у мыши, которая сообщила приращение.
+    ///
+    /// Доли, а не точки, по той же причине, по которой в событии нет позиции
+    /// курсора: драйвер не знает размера экрана и знать его не должен. Диапазон
+    /// же у планшета свой — у одного 0..32767, у другого 0..4095, — и приводить
+    /// его к общему виду обязан тот, кто читает устройство.
+    pub absolute: Option<(u16, u16)>,
     /// Колесо: положительное — от себя.
     pub wheel: i32,
     /// Состояние кнопок после этого отчёта.
@@ -649,6 +661,7 @@ impl PointerEvent {
     const EMPTY: Self = Self {
         dx: 0,
         dy: 0,
+        absolute: None,
         wheel: 0,
         buttons: Buttons::NONE,
         changed: Buttons::NONE,
@@ -700,11 +713,39 @@ impl PointerQueue {
 static POINTER: SpinLock<PointerQueue> = SpinLock::new(PointerQueue::new());
 
 /// Положить отчёт мыши в очередь. Вызывается драйвером.
+pub fn post_pointer(dx: i32, dy: i32, wheel: i32, buttons: Buttons) {
+    enqueue_pointer(PointerEvent {
+        dx,
+        dy,
+        absolute: None,
+        wheel,
+        buttons,
+        // Заполняется в [`enqueue_pointer`]: какие кнопки изменились, знает
+        // очередь — только она помнит их прошлое состояние.
+        changed: Buttons::NONE,
+    });
+}
+
+/// Положить отчёт планшета в очередь: положение вместо приращения.
+///
+/// Координаты — доли экрана, см. [`PointerEvent::absolute`].
+pub fn post_pointer_at(x: u16, y: u16, wheel: i32, buttons: Buttons) {
+    enqueue_pointer(PointerEvent {
+        dx: 0,
+        dy: 0,
+        absolute: Some((x, y)),
+        wheel,
+        buttons,
+        changed: Buttons::NONE,
+    });
+}
+
+/// Общая часть обоих путей: состояние кнопок и место в очереди.
 ///
 /// При переполнении **сливается** движение: приращения складываются в последнее
 /// событие вместо того, чтобы потеряться. Курсор от этого не отстаёт и не
 /// перескакивает — в отличие от клавиатуры, где сложить два нажатия нельзя.
-pub fn post_pointer(dx: i32, dy: i32, wheel: i32, buttons: Buttons) {
+fn enqueue_pointer(event: PointerEvent) {
     // См. [`post`]: отметка о событии не зависит от того, поместилось ли оно в
     // очередь.
     announce();
@@ -713,24 +754,30 @@ pub fn post_pointer(dx: i32, dy: i32, wheel: i32, buttons: Buttons) {
         return;
     };
     queue.posted += 1;
-    let changed = queue.buttons.difference(buttons);
-    queue.buttons = buttons;
+    let changed = queue.buttons.difference(event.buttons);
+    queue.buttons = event.buttons;
 
     if queue.len == POINTER_CAPACITY {
         // Кнопки терять нельзя, движение — можно сложить.
         let tail = (queue.head + queue.len - 1) % POINTER_CAPACITY;
         let last = &mut queue.events[tail];
-        last.dx += dx;
-        last.dy += dy;
-        last.wheel += wheel;
-        last.buttons = buttons;
+        last.dx += event.dx;
+        last.dy += event.dy;
+        last.wheel += event.wheel;
+        // А вот положение не складывается: оно не приращение, и последнее
+        // сказанное устройством и есть текущее. Сложение здесь дало бы курсор,
+        // улетающий в правый нижний угол при первом же переполнении.
+        if event.absolute.is_some() {
+            last.absolute = event.absolute;
+        }
+        last.buttons = event.buttons;
         last.changed = Buttons(last.changed.0 | changed.0);
         queue.dropped += 1;
         return;
     }
 
     let tail = (queue.head + queue.len) % POINTER_CAPACITY;
-    queue.events[tail] = PointerEvent { dx, dy, wheel, buttons, changed };
+    queue.events[tail] = PointerEvent { changed, ..event };
     queue.len += 1;
 }
 

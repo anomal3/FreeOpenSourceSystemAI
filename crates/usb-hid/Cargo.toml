@@ -1,0 +1,14 @@
+[package]
+name = "usb-hid"
+description = "HID report descriptors: reading what a device says about its own reports, so devices without a boot protocol still work."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Зависимостей нет намеренно. Крейт линкуется в ядро на двух целях
+# (`*-unknown-none`) и собирается хостом ради тестов; всё, что он делает, —
+# арифметика над байтами, которые прислало устройство.
+
+[lints]
+workspace = true

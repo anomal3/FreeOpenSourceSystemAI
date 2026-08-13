@@ -18,12 +18,18 @@ use crate::mm::VirtAddr;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{ARCH_ID, ARCH_NAME, SERIAL_MMIO, Serial, halt, wait_for_interrupt};
+pub use x86_64::{
+    ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, halt, pci_config_read32,
+    pci_config_write32, wait_for_interrupt,
+};
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::{ARCH_ID, ARCH_NAME, SERIAL_MMIO, Serial, halt, wait_for_interrupt};
+pub use aarch64::{
+    ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, halt, pci_config_read32,
+    pci_config_write32, wait_for_interrupt,
+};
 
 /// Адресное пространство ядра — реализация [`crate::mm::AddressSpace`] для
 /// текущей архитектуры. На x86-64 это дерево от PML4, на AArch64 — пара

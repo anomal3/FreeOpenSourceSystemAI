@@ -32,6 +32,7 @@
 mod aim;
 mod keys;
 mod monitor;
+mod qmp;
 mod scenarios;
 mod serial;
 mod shot;
@@ -46,7 +47,7 @@ use anyhow::{Context, Result, bail};
 use crate::arch::Arch;
 use crate::build::{self, BuildOptions};
 use crate::paths;
-use crate::qemu::{self, Drive, RunOptions};
+use crate::qemu::{self, Drive, Pointer, RunOptions};
 use crate::{image, util};
 
 pub use scenarios::{Scenario, Step, Target};
@@ -250,6 +251,18 @@ fn execute(
     let serial_addr = serial_listener.local_addr()?;
     let monitor_addr = monitor_listener.local_addr()?;
 
+    // Третий сокет открывается только там, где он нужен. Лишний порт на каждый
+    // прогон — это лишний способ отказать, а сценариям с мышью QMP не нужен
+    // вовсе: приращения умеет и HMP.
+    let qmp_listener = match scenario.tablet {
+        true => Some(TcpListener::bind("127.0.0.1:0").context("не удалось занять порт под QMP")?),
+        false => None,
+    };
+    let qmp_addr = match &qmp_listener {
+        Some(listener) => Some(listener.local_addr()?),
+        None => None,
+    };
+
     let mut extra: Vec<String> = scenario.qemu_args(arch).iter().map(|s| (*s).to_string()).collect();
     extra.extend(scenario.extra.iter().map(|s| (*s).to_string()));
 
@@ -264,6 +277,8 @@ fn execute(
         extra,
         serial: qemu::Serial::Socket(serial_addr),
         monitor: Some(monitor_addr),
+        qmp: qmp_addr,
+        pointer: if scenario.tablet { Pointer::Tablet } else { Pointer::Mouse },
         ..RunOptions::default()
     };
 
@@ -287,8 +302,15 @@ fn execute(
         Ok(hmp) => hmp,
         Err(err) => return Err(with_qemu_output(child, err)),
     };
+    let mut qmp = match &qmp_listener {
+        Some(listener) => match qmp::Qmp::accept(listener, CONNECT_TIMEOUT) {
+            Ok(qmp) => Some(qmp),
+            Err(err) => return Err(with_qemu_output(child, err)),
+        },
+        None => None,
+    };
 
-    let result = play(scenario, &mut line, &mut hmp, prefix, shots);
+    let result = play(scenario, &mut line, &mut hmp, qmp.as_mut(), prefix, shots);
 
     // Гость не выключает машину сам: `arch::halt()` — это остановка процессора,
     // а не выключение. Процесс приходится снимать, и делать это надо в любом
@@ -308,6 +330,7 @@ fn play(
     scenario: &Scenario,
     line: &mut serial::SerialLine,
     hmp: &mut monitor::Monitor,
+    mut qmp: Option<&mut qmp::Qmp>,
     prefix: &str,
     shots: &mut Vec<PathBuf>,
 ) -> Result<()> {
@@ -315,6 +338,10 @@ fn play(
     // Где сейчас указатель. Мышь относительная, абсолютных координат у неё нет,
     // поэтому «навести на цель» — это посчитать разницу и проехать её. Начальное
     // положение — середина экрана: так его ставит ядро.
+    //
+    // У планшета положение известно и без счёта, но храним его всё равно:
+    // [`Step::Move`] задан приращением («провезти окно на столько»), и от чего
+    // это приращение считать, знает только стенд.
     let mut pointer: Option<(i32, i32)> = None;
 
     // Число, захваченное `Step::Capture`, — например номер задачи, который
@@ -445,48 +472,42 @@ fn play(
                     "  [{at:>6} мс] шаг {index}: наводим на {target:?} — {:?} -> {to:?}",
                     from
                 );
-                for (step_x, step_y) in split_move(to.0 - from.0, to.1 - from.1) {
-                    hmp.mouse_move(step_x, step_y)
-                        .with_context(|| format!("шаг {index}"))?;
-                    std::thread::sleep(POINTER_DELAY);
-                }
+                move_pointer(qmp.as_deref_mut(), hmp, from, to, width, height)
+                    .with_context(|| format!("шаг {index}"))?;
                 pointer = Some(to);
                 // Гость разбирает отчёты в своём такте: не дав ему догнать,
                 // следующий щелчок пришёлся бы по старому положению курсора.
                 std::thread::sleep(KEY_DELAY);
             }
             Step::Move(dx, dy) => {
-                println!("  [{at:>6} мс] шаг {index}: мышь на {dx},{dy}");
-                if let Some(position) = pointer.as_mut() {
-                    position.0 += dx;
-                    position.1 += dy;
-                }
-                // Движение разбивается на шаги: отчёт boot-протокола несёт
-                // знаковый байт на ось, и приращение больше 127 точек за раз
-                // либо обрежется, либо переполнится в обратную сторону.
-                // Крупный скачок курсора при этом и в жизни не встречается —
-                // мышь шлёт отчёт каждые несколько миллисекунд.
-                for (step_x, step_y) in split_move(*dx, *dy) {
-                    hmp.mouse_move(step_x, step_y)
-                        .with_context(|| format!("шаг {index}"))?;
-                    std::thread::sleep(POINTER_DELAY);
-                }
+                println!("  [{at:>6} мс] шаг {index}: указатель на {dx},{dy}");
+                let log = line.text();
+                let (width, height) = aim::screen(&log).with_context(|| format!("шаг {index}"))?;
+                let from = *pointer.get_or_insert((width / 2, height / 2));
+                let to = (from.0 + dx, from.1 + dy);
+                move_pointer(qmp.as_deref_mut(), hmp, from, to, width, height)
+                    .with_context(|| format!("шаг {index}"))?;
+                pointer = Some(to);
             }
             Step::Click => {
                 println!("  [{at:>6} мс] шаг {index}: щелчок");
-                hmp.mouse_button(1).with_context(|| format!("шаг {index}"))?;
+                press_button(qmp.as_deref_mut(), hmp, true)
+                    .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(POINTER_DELAY);
-                hmp.mouse_button(0).with_context(|| format!("шаг {index}"))?;
+                press_button(qmp.as_deref_mut(), hmp, false)
+                    .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
             Step::Press => {
                 println!("  [{at:>6} мс] шаг {index}: кнопка нажата");
-                hmp.mouse_button(1).with_context(|| format!("шаг {index}"))?;
+                press_button(qmp.as_deref_mut(), hmp, true)
+                    .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
             Step::Release => {
                 println!("  [{at:>6} мс] шаг {index}: кнопка отпущена");
-                hmp.mouse_button(0).with_context(|| format!("шаг {index}"))?;
+                press_button(qmp.as_deref_mut(), hmp, false)
+                    .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
             Step::Wait(ms) => {
@@ -506,6 +527,48 @@ fn play(
         }
     }
     Ok(())
+}
+
+/// Переместить указатель из точки в точку.
+///
+/// Два пути, и это не выбор между удобным и неудобным. Мышь **нельзя** поставить
+/// в точку: у неё нет координат, есть только приращения, и стенд везёт курсор
+/// так же, как это делает рука. Планшет, наоборот, нельзя сдвинуть: приращение,
+/// посланное машине, у которой из указателей один планшет, не доходит ни до
+/// кого — гипервизор доставляет относительные события только тем устройствам,
+/// которые объявили, что понимают их.
+fn move_pointer(
+    qmp: Option<&mut qmp::Qmp>,
+    hmp: &mut monitor::Monitor,
+    from: (i32, i32),
+    to: (i32, i32),
+    width: i32,
+    height: i32,
+) -> Result<()> {
+    if let Some(qmp) = qmp {
+        return qmp.move_to(to.0, to.1, width, height);
+    }
+    // Движение разбивается на шаги: отчёт boot-протокола несёт знаковый байт на
+    // ось, и приращение больше 127 точек за раз либо обрежется, либо
+    // переполнится в обратную сторону. Крупный скачок курсора при этом и в жизни
+    // не встречается — мышь шлёт отчёт каждые несколько миллисекунд.
+    for (step_x, step_y) in split_move(to.0 - from.0, to.1 - from.1) {
+        hmp.mouse_move(step_x, step_y)?;
+        std::thread::sleep(POINTER_DELAY);
+    }
+    Ok(())
+}
+
+/// Нажать или отпустить левую кнопку.
+///
+/// Кнопки планшет как раз понимает и через HMP, но путь всё равно один: события
+/// одного устройства обязаны идти одним потоком, иначе щелчок обгоняет
+/// перемещение, которое его вызвало.
+fn press_button(qmp: Option<&mut qmp::Qmp>, hmp: &mut monitor::Monitor, down: bool) -> Result<()> {
+    match qmp {
+        Some(qmp) => qmp.button(qmp::BUTTON_LEFT, down),
+        None => hmp.mouse_button(if down { 1 } else { 0 }),
+    }
 }
 
 /// Носители машины для сценария.

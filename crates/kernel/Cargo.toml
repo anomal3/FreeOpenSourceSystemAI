@@ -24,6 +24,10 @@ calendar = { path = "../calendar" }
 disk = { path = "../disk" }
 # Корневая файловая система, тот же крейт, что у установщика.
 ext2 = { path = "../ext2" }
+# Разбор HID Report Descriptor. Отдельный крейт потому, что ошибаются в нём
+# битовыми смещениями, а такую ошибку ловят тестом на хосте, а не курсором,
+# который ездит наискось в эмуляторе.
+usb-hid = { path = "../usb-hid" }
 # `default-features = false` drops the `std` and `unicode` features; what remains
 # is `font8x8::legacy`, a dependency-free table of `[u8; 8]` glyph rows. The
 # kernel still uses it directly for the boot console, which draws into the

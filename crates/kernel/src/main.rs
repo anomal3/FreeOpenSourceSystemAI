@@ -570,16 +570,16 @@ fn mount_disk_root(info: &BootInfo) {
     // SAFETY: ядро давно работает на собственных таблицах страниц (см.
     // `take_over_memory` выше по ходу загрузки), а RSDP пришёл от прошивки
     // через hand-off.
-    let ecam = match unsafe { pci::find_ecam(info.acpi_rsdp) } {
-        Ok(ecam) => ecam,
+    let root = match unsafe { pci::Root::discover(info.acpi_rsdp) } {
+        Ok(root) => root,
         Err(err) => {
-            kprintln!("  disk        : no PCI window ({err:?}): keeping the initrd as root");
+            kprintln!("  disk        : no PCI at all ({err}): keeping the initrd as root");
             return;
         }
     };
 
     // SAFETY: см. выше.
-    let mut device = match unsafe { virtio::blk::VirtioBlk::probe(&ecam) } {
+    let mut device = match unsafe { virtio::blk::VirtioBlk::probe(&root) } {
         Ok(device) => device,
         Err(err) => {
             kprintln!("  disk        : no virtio-blk ({err}): keeping the initrd as root");

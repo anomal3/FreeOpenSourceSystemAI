@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 22 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 23 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -77,13 +77,17 @@ to the optical drive, start it. VMware and Hyper-V work the same way; on Hyper-V
 *Generation 2*, which is the EFI one. There is no BIOS boot path at all, by design, so a
 machine left on legacy boot will simply not find the medium.
 
-One setting is worth changing before you start: the **pointing device**. VirtualBox defaults
-to a *USB Tablet*, which reports absolute coordinates and declares no HID boot protocol —
-and this system reads boot-protocol devices only, so a tablet leaves you with no cursor at
-all. Set Settings → System → Motherboard → Pointing Device to **USB Mouse**. (A PS/2 mouse
-will not help: the second i8042 port has no driver here, on purpose, because the other
-architecture has no such port to share the code with.) When a mouse is found, the boot log
-says so: `usb : boot mouse on interface 0, ...`.
+Neither the chipset nor the pointing device needs changing any more: the system was made to
+work with VirtualBox's defaults (PIIX3 and a USB tablet), not the other way round.
+
+The **pointing device** needs no setting any more. VirtualBox defaults to a *USB Tablet*,
+which reports absolute coordinates and declares no HID boot protocol; until Phase 23 that
+left you with no cursor at all, and the advice here was to switch the setting to *USB
+Mouse*. The kernel now reads the device's own report descriptor, so either one works — as
+does anything else that describes itself, which is every USB pointing device made. What was
+found is in the boot log: `usb : report descriptor 74 bytes: pointer, absolute 0..32767, 5
+buttons, wheel`. (A PS/2 mouse still will not work: the second i8042 port has no driver
+here, on purpose, because the other architecture has no such port to share the code with.)
 
 The last number in the file name is the build counter, and it describes **the state of the
 source**, not the individual file: every image built from one state of the tree carries the
@@ -624,6 +628,90 @@ Three things this cost, each worth naming:
 The bench runs a scenario with `-machine gic-version=3` and asserts what actually matters:
 the version is recognised, ticks arrive, and the shell answers a typed command.
 
+### Letting the device describe itself
+
+The same lesson, one layer up. The USB stack read *boot protocol* only: three bytes from a
+mouse, eight from a keyboard, formats fixed by specification so that a BIOS could use them
+without knowing anything about the device. Every device in QEMU speaks it, so for a long
+time nothing else seemed necessary.
+
+VirtualBox offers a **tablet** as its default pointing device, and a tablet declares no boot
+protocol at all — it reports where the pen is, not how far it moved, and there is nothing to
+agree on in three bytes. So there was no cursor, and the README told people to go and change
+a setting in their hypervisor.
+
+Every USB device carries a *report descriptor*: a stream of items that says which bits of
+its report mean what. Parsing it is the general answer, and it replaces the special case
+rather than sitting beside it — pointer and keyboard are both read through the descriptor
+now, with boot protocol kept only for a device whose descriptor made no sense. Keeping it
+the other way round would have meant a path the system takes only on machines where nobody
+can debug it.
+
+Two consequences worth naming:
+
+- **Absolute pointing needed a new kind of event.** A mouse reports a delta; the driver can
+  hand it straight on. A tablet reports a position, and turning that into a delta requires
+  knowing where the cursor is — which the driver must not know, since it would mean knowing
+  the screen size. So the event carries the position as a *fraction* of the device's own
+  range, and the compositor, which owns the screen, turns it into pixels and computes the
+  delta that a dragged window follows.
+- **The parser is its own crate, with tests.** `crates/usb-hid` is `no_std` and has no
+  dependencies, so `cargo test -p usb-hid` runs it on the host against descriptors taken
+  from QEMU and VirtualBox sources, plus ones QEMU has no device for: a report with an ID,
+  a joystick that must *not* become a cursor, truncated and garbage input. The failure mode
+  here is a field offset out by one bit, which looks like a cursor drifting diagonally —
+  hours to find through an emulator, seconds to find through a test.
+
+The bench got a `tablet` scenario: same desktop, same drags and clicks, but the machine has
+`usb-tablet` instead of `usb-mouse`. It also needed a second control channel. HMP's
+`mouse_move` sends a *relative* event, and QEMU delivers those only to devices that declare
+they understand them — send one to a machine whose only pointer is a tablet and it reaches
+nobody, silently. Absolute events exist in QMP, so the harness now speaks both protocols.
+
+### Two more addresses that were never ours to guess
+
+Testing the above on the real hypervisor turned up two more of the same defect, and they
+are worth naming because both looked like missing hardware and were nothing of the kind.
+
+**No MCFG, no bus.** VirtualBox with its default chipset (PIIX3) publishes no `MCFG` table,
+so the kernel printed `no 'MCFG' table` and saw *no PCI devices at all* — no USB controller,
+no disk. The devices were there; what was missing was a way to ask. ECAM is a PCI Express
+mechanism, and a machine can simply not have it. The historical mechanism does: ports
+`0xCF8`/`0xCFC`, which predate PCI Express and work on anything PC-shaped. That is now the
+fallback on x86-64, and the boot log says which path is in use. On ARM there is no fallback
+and cannot be — the architecture has no I/O port space — so there a machine without MCFG is
+a machine without PCI, and the kernel says so instead of pretending.
+
+**No SPCR, no voice.** The UART address on ARM is not fixed by anything: QEMU `virt` puts
+PL011 at `0x0900_0000`, VirtualBox at `0xffdd_f000`. The kernel knew only the first, so on
+VirtualBox it printed nothing at all — and debugging why a keyboard did not come up, with no
+log and a boot console already painted over by the desktop, is not debugging. The address
+now comes from ACPI: `SPCR` first (the table that says where the firmware's own console is),
+then `DBG2`. QEMU publishes SPCR and confirms the address it was already using, which is how
+that path gets exercised on every run.
+
+For the machine that publishes neither — VirtualBox on ARM is one — the shell now prints
+what USB enumeration found: how many occupied ports were brought up, how many keyboards and
+pointers came out of it, and where the last failure stopped. On a machine with no serial
+port that line is the only diagnosis available, and it is the line that turned "the mouse
+does not work" into a specific answer.
+
+### A second opinion about the clock
+
+`-machine pit=off` is not a hypothetical. On VirtualBox the x86-64 side came up with no
+timer at all: calibrating the local APIC against the PIT reads bit 5 of port 0x61, the
+channel-2 output, and that bit never moved. The system printed `calibration against the PIT
+failed` and sat at 0% CPU waiting for an interrupt that could not arrive.
+
+The ACPI timer runs at a rate fixed by specification, and the kernel was already using it —
+to calibrate `rdtsc`, since Phase 17. So the fallback is not new code so much as new
+plumbing: the same FADT lookup, the same measurement loop, pointed at the APIC's counter
+instead. It runs only when the PIT has failed, because the PIT needs nothing found or
+parsed, and fewer lookups mean fewer addresses to get wrong.
+
+The bench runs the whole thing with the PIT switched off and asserts all three steps: that
+the first source failed, that the second was used, and that ticks then arrive.
+
 ### The bootable ISO
 
 A disk image has to be written somewhere; an ISO is attached. That is the whole difference,
@@ -886,6 +974,7 @@ crates/calendar/    Unix seconds ↔ a civil date, no_std: bootloader + installe
 crates/disk/        GPT and a FAT32 formatter, no_std: host image builder + installer
 crates/ext2/        The ext2 format: formatter, writer and reader, no_std
 crates/mini-ui/     Surfaces, 8x8 text (ASCII + Cyrillic), widgets: kernel + installer
+crates/usb-hid/     HID report descriptors: what a device says about its own reports
 crates/installer/   UEFI application: disk selection, partitioning, account, install
 crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/mm/           Frame allocator, page tables, kernel heap, DMA-coherent arena
@@ -898,7 +987,7 @@ crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/time.rs       The wall clock: the firmware's answer plus uptime, and the time zone
   src/acpi.rs       Table lookup by signature (MADT on x86-64, MCFG everywhere)
   src/pci.rs        ECAM configuration space, bus walk across bridges
-  src/usb/          xHCI host controller, HID boot protocol
+  src/usb/          xHCI host controller, HID reports to input events
   src/virtio/       virtio over PCI: split virtqueue, virtio-blk
   src/arch/         Everything that differs between x86-64 and AArch64
 xtask/              Host-side build / image / QEMU orchestration
@@ -969,6 +1058,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 20 | A program can read a directory: `readdir`, and `ls` moves out of the kernel | **done** |
 | 21 | A bootable ISO: ISO 9660 with an El Torito EFI catalog, so the system can be handed to someone | **done** |
 | 22 | The interrupt controller is read from ACPI, not guessed, and GICv3 works | **done** |
+| 23 | The device describes itself: HID report descriptors, so a tablet is a mouse; PCI without MCFG, the UART from ACPI, and a second source for the clock | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

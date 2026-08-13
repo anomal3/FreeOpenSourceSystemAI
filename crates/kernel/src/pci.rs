@@ -1,14 +1,23 @@
 //! Шина PCI Express: найти устройство и узнать, где его регистры.
 //!
-//! # Почему только ECAM и никаких портов ввода-вывода
+//! # Сначала ECAM, а если его нет — порты
 //!
-//! Исторический способ добраться до конфигурационного пространства на PC — пара
-//! портов `0xCF8`/`0xCFC`. Он здесь не реализован, и это не упущение: портов
-//! ввода-вывода на AArch64 не существует вовсе, а весь смысл этого модуля в том,
-//! чтобы драйвер xHCI был один на обе архитектуры. ECAM (Enhanced Configuration
-//! Access Mechanism) — отображённое в память конфигурационное пространство,
-//! введённое вместе с PCI Express, — работает одинаково всюду и вдобавок
-//! адресует 4096 байт на функцию вместо 256.
+//! ECAM (Enhanced Configuration Access Mechanism) — отображённое в память
+//! конфигурационное пространство, введённое вместе с PCI Express. Оно работает
+//! одинаково на обеих архитектурах и адресует 4096 байт на функцию вместо 256,
+//! поэтому это основной путь.
+//!
+//! Долгое время он был единственным, и рассуждение звучало так: портов
+//! ввода-вывода на AArch64 не существует, значит общий драйвер должен обходиться
+//! без них. Рассуждение верное, а вывод из него — нет. Порты нужны не ради
+//! симметрии, а потому что **MCFG есть не у всех**: VirtualBox с чипсетом PIIX3
+//! (его умолчание) таблицы не публикует, и ядро печатало «no 'MCFG' table»,
+//! после чего на машине не было ни USB, ни диска — при исправных устройствах.
+//!
+//! Поэтому на x86-64 есть запасной путь: механизм конфигурации №1, пара портов
+//! `0xCF8`/`0xCFC`. Он старше PCI Express и работает на всём, что притворяется
+//! PC. На AArch64 его нет и быть не может — там машина без MCFG это машина без
+//! PCI, и сказать об этом честно лучше, чем изображать поддержку.
 //!
 //! Где лежит окно ECAM, сообщает таблица ACPI `MCFG`. Ни на одной из наших
 //! машин этот адрес не совпадает с чужим: у QEMU `q35` это `0xB000_0000`, у
@@ -41,6 +50,7 @@
 
 use crate::acpi::{self, AcpiError, SDT_HEADER_LEN, read_u16, read_u64};
 use crate::arch;
+use crate::kprintln;
 use crate::mm::{MapError, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 
 // ---------------------------------------------------------------------------
@@ -209,6 +219,88 @@ impl Ecam {
     }
 }
 
+/// Как ядро добирается до конфигурационного пространства.
+///
+/// # Почему способов два
+///
+/// Потому что MCFG — таблица необязательная. У PCIe она есть почти всегда, и
+/// окно ECAM даёт все 4096 байт пространства каждой функции; у машины с
+/// «обычным» PCI её нет вовсе, и остаются порты 0xCF8/0xCFC — механизм, который
+/// старше самой шины PCIe и работает на всём, что притворяется PC.
+///
+/// Цена вопроса выяснилась на VirtualBox: его чипсет по умолчанию (PIIX3) MCFG
+/// не публикует, и ядро, знавшее только ECAM, печатало «no 'MCFG' table» и не
+/// видело ни контроллера USB, ни диска. Устройства были на месте — не было
+/// способа их спросить.
+///
+/// Разница между способами не только в наличии: через порты доступны первые 256
+/// байт, то есть заголовок и обычный список возможностей. Расширенные
+/// возможности PCIe (со смещения 0x100) остаются недостижимыми — но всё, чем
+/// пользуется это ядро, включая MSI-X, лежит ниже.
+#[derive(Clone, Copy)]
+pub enum Root {
+    /// Окно ECAM, описанное в MCFG.
+    Ecam(Ecam),
+    /// Порты ввода-вывода. Существует только там, где есть само пространство
+    /// ввода-вывода, то есть на x86-64.
+    Ports,
+}
+
+impl Root {
+    /// Выбрать способ: сначала ECAM, при его отсутствии — порты.
+    ///
+    /// Порядок именно такой. ECAM даёт больше и не требует записи в порт перед
+    /// каждым чтением; порты — запасной путь, и уходить на него, когда прошивка
+    /// описала окно, значило бы менять проверенное на редко исполняемое.
+    ///
+    /// # Safety
+    ///
+    /// Требования те же, что у [`acpi::find_table`].
+    pub unsafe fn discover(rsdp: u64) -> Result<Self, AcpiError> {
+        // SAFETY: контракт функции.
+        match unsafe { find_ecam(rsdp) } {
+            Ok(ecam) => Ok(Self::Ecam(ecam)),
+            Err(err) if arch::HAS_PCI_PORTS => {
+                kprintln!("  pci         : no ECAM window ({err}); falling back to ports 0xCF8/0xCFC");
+                Ok(Self::Ports)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Первая и последняя шина, которые имеет смысл обходить.
+    const fn buses(&self) -> (u8, u8) {
+        match self {
+            Self::Ecam(ecam) => (ecam.start_bus, ecam.end_bus),
+            // Через порты доступны все 256 шин: номер шины — часть адреса, и
+            // ограничивать его нечем, кроме мостов, за которыми никого нет.
+            Self::Ports => (0, 255),
+        }
+    }
+
+    /// Номер сегмента. У портов сегмент всегда нулевой: сегменты — понятие
+    /// PCIe, а механизм №1 о них не знает.
+    const fn segment(&self) -> u16 {
+        match self {
+            Self::Ecam(ecam) => ecam.segment,
+            Self::Ports => 0,
+        }
+    }
+}
+
+impl core::fmt::Display for Root {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Ecam(ecam) => write!(
+                f,
+                "ECAM at {:#012x}, segment {}, buses {}..={}",
+                ecam.base, ecam.segment, ecam.start_bus, ecam.end_bus
+            ),
+            Self::Ports => f.write_str("configuration ports 0xCF8/0xCFC, no ECAM window"),
+        }
+    }
+}
+
 /// Найти окно ECAM в таблице MCFG.
 ///
 /// Берётся первая запись: несколько записей означают несколько сегментов, а
@@ -312,8 +404,30 @@ pub struct Device {
     pub subclass: u8,
     pub prog_if: u8,
     pub revision: u8,
-    /// Виртуальный адрес начала конфигурационного пространства этой функции.
-    config: VirtAddr,
+    /// Чем читается конфигурационное пространство этой функции.
+    config: Access,
+}
+
+/// Способ добраться до конфигурационного пространства одной функции.
+#[derive(Clone, Copy)]
+enum Access {
+    /// Виртуальный адрес начала пространства в окне ECAM.
+    Memory(VirtAddr),
+    /// Через порты: адрес собирается из номеров шины, устройства и функции.
+    Ports,
+}
+
+/// Собрать значение для порта 0xCF8.
+///
+/// Бит 31 — «обращение разрешено», дальше шина, устройство, функция и смещение.
+/// Два младших бита смещения обнуляются: механизм №1 адресует двойными словами,
+/// и невыровненный адрес читает соседний регистр, а не тот, который просили.
+const fn port_address(address: Address, offset: usize) -> u32 {
+    0x8000_0000
+        | ((address.bus as u32) << 16)
+        | ((address.device as u32) << 11)
+        | ((address.function as u32) << 8)
+        | ((offset as u32) & 0xFC)
 }
 
 impl Device {
@@ -323,8 +437,19 @@ impl Device {
     /// смещение — лежать внутри неё (4096 байт).
     unsafe fn read8(&self, offset: usize) -> u8 {
         debug_assert!(offset < PAGE_SIZE);
-        // SAFETY: контракт функции. `volatile` обязателен: это регистры.
-        unsafe { (self.config.as_usize() as *const u8).add(offset).read_volatile() }
+        match self.config {
+            // SAFETY: контракт функции. `volatile` обязателен: это регистры.
+            Access::Memory(base) => unsafe {
+                (base.as_usize() as *const u8).add(offset).read_volatile()
+            },
+            // Порты отдают только двойные слова, поэтому нужный байт вырезается
+            // сдвигом. Читать «поменьше» механизм №1 не умеет вовсе.
+            // SAFETY: см. выше.
+            Access::Ports => {
+                let word = unsafe { arch::pci_config_read32(port_address(self.address, offset)) };
+                (word >> ((offset & 3) * 8)) as u8
+            }
+        }
     }
 
     /// # Safety
@@ -332,8 +457,17 @@ impl Device {
     /// См. [`Device::read8`]; смещение обязано быть кратно 2.
     unsafe fn read16(&self, offset: usize) -> u16 {
         debug_assert!(offset + 1 < PAGE_SIZE && offset % 2 == 0);
-        // SAFETY: контракт функции.
-        unsafe { (self.config.as_usize() as *const u16).byte_add(offset).read_volatile() }
+        match self.config {
+            // SAFETY: контракт функции.
+            Access::Memory(base) => unsafe {
+                (base.as_usize() as *const u16).byte_add(offset).read_volatile()
+            },
+            // SAFETY: см. выше.
+            Access::Ports => {
+                let word = unsafe { arch::pci_config_read32(port_address(self.address, offset)) };
+                (word >> ((offset & 2) * 8)) as u16
+            }
+        }
     }
 
     /// # Safety
@@ -341,8 +475,16 @@ impl Device {
     /// См. [`Device::read8`]; смещение обязано быть кратно 4.
     unsafe fn read32(&self, offset: usize) -> u32 {
         debug_assert!(offset + 3 < PAGE_SIZE && offset % 4 == 0);
-        // SAFETY: контракт функции.
-        unsafe { (self.config.as_usize() as *const u32).byte_add(offset).read_volatile() }
+        match self.config {
+            // SAFETY: контракт функции.
+            Access::Memory(base) => unsafe {
+                (base.as_usize() as *const u32).byte_add(offset).read_volatile()
+            },
+            // SAFETY: см. выше.
+            Access::Ports => unsafe {
+                arch::pci_config_read32(port_address(self.address, offset))
+            },
+        }
     }
 
     /// # Safety
@@ -350,8 +492,24 @@ impl Device {
     /// См. [`Device::read16`]. Запись меняет поведение устройства на шине.
     unsafe fn write16(&self, offset: usize, value: u16) {
         debug_assert!(offset + 1 < PAGE_SIZE && offset % 2 == 0);
-        // SAFETY: контракт функции.
-        unsafe { (self.config.as_usize() as *mut u16).byte_add(offset).write_volatile(value) };
+        match self.config {
+            // SAFETY: контракт функции.
+            Access::Memory(base) => unsafe {
+                (base.as_usize() as *mut u16).byte_add(offset).write_volatile(value);
+            },
+            // Через порты слово нельзя записать иначе как в составе двойного:
+            // читаем соседнюю половину, подставляем свою, пишем обратно. Гонки
+            // здесь нет — ядро однопоточно, а обработчики прерываний в
+            // конфигурационное пространство не лезут.
+            // SAFETY: см. выше.
+            Access::Ports => unsafe {
+                let address = port_address(self.address, offset);
+                let word = arch::pci_config_read32(address);
+                let shift = (offset & 2) * 8;
+                let merged = (word & !(0xFFFF << shift)) | (u32::from(value) << shift);
+                arch::pci_config_write32(address, merged);
+            },
+        }
     }
 
     /// Разрешить устройству отвечать на обращения к памяти и быть инициатором
@@ -574,23 +732,34 @@ const MAX_BRIDGE_DEPTH: usize = 8;
 /// # Safety
 ///
 /// См. [`map_bus`].
-unsafe fn probe(ecam: &Ecam, bus: u8, device: u8, function: u8) -> Option<Device> {
-    // SAFETY: контракт функции.
-    unsafe { map_bus(ecam, bus) }.ok()?;
-    let phys = ecam.config_phys(bus, device, function)?;
+unsafe fn probe(root: &Root, bus: u8, device: u8, function: u8) -> Option<Device> {
+    if device >= 32 || function >= 8 {
+        return None;
+    }
+    let access = match root {
+        Root::Ecam(ecam) => {
+            // SAFETY: контракт функции.
+            unsafe { map_bus(ecam, bus) }.ok()?;
+            Access::Memory(ecam.config_phys(bus, device, function)?.to_direct_map())
+        }
+        // Портам отображать нечего: конфигурационное пространство здесь не
+        // память, а пара регистров, доступных всегда.
+        Root::Ports => Access::Ports,
+    };
 
     let probe = Device {
-        address: Address { segment: ecam.segment, bus, device, function },
+        address: Address { segment: root.segment(), bus, device, function },
         vendor: 0,
         device: 0,
         class: 0,
         subclass: 0,
         prog_if: 0,
         revision: 0,
-        config: phys.to_direct_map(),
+        config: access,
     };
 
-    // SAFETY: страница шины отображена вызовом `map_bus` выше.
+    // SAFETY: страница шины отображена вызовом `map_bus` выше — либо доступ идёт
+    // через порты, которым отображение не нужно.
     let vendor = unsafe { probe.read16(CFG_VENDOR_ID) };
     if vendor == VENDOR_ID_NONE {
         return None;
@@ -618,14 +787,14 @@ unsafe fn probe(ecam: &Ecam, bus: u8, device: u8, function: u8) -> Option<Device
 ///
 /// См. [`map_bus`].
 unsafe fn walk_bus(
-    ecam: &Ecam,
+    root: &Root,
     bus: u8,
     depth: usize,
     visit: &mut impl FnMut(&Device) -> bool,
 ) -> bool {
     for device in 0..32u8 {
         // SAFETY: контракт функции.
-        let Some(first) = (unsafe { probe(ecam, bus, device, 0) }) else {
+        let Some(first) = (unsafe { probe(root, bus, device, 0) }) else {
             // Функция 0 отсутствует — значит устройства нет вовсе. Так требует
             // спецификация: остальные функции без нулевой не существуют, и
             // перебирать их незачем.
@@ -641,7 +810,7 @@ unsafe fn walk_bus(
                 Some(first)
             } else {
                 // SAFETY: контракт функции.
-                unsafe { probe(ecam, bus, device, function) }
+                unsafe { probe(root, bus, device, function) }
             };
             let Some(found) = found else {
                 continue;
@@ -661,7 +830,7 @@ unsafe fn walk_bus(
                 // конечной, помимо предела глубины.
                 if secondary > bus {
                     // SAFETY: контракт функции.
-                    if !unsafe { walk_bus(ecam, secondary, depth + 1, visit) } {
+                    if !unsafe { walk_bus(root, secondary, depth + 1, visit) } {
                         return false;
                     }
                 }
@@ -676,9 +845,9 @@ unsafe fn walk_bus(
 /// # Safety
 ///
 /// Ядро должно исполняться на собственных таблицах страниц.
-pub unsafe fn for_each(ecam: &Ecam, mut visit: impl FnMut(&Device) -> bool) {
+pub unsafe fn for_each(root: &Root, mut visit: impl FnMut(&Device) -> bool) {
     // SAFETY: контракт функции.
-    unsafe { walk_bus(ecam, ecam.start_bus, 0, &mut visit) };
+    unsafe { walk_bus(root, root.buses().0, 0, &mut visit) };
 }
 
 /// Найти первое устройство заданного изготовителя с одним из перечисленных
@@ -691,11 +860,11 @@ pub unsafe fn for_each(ecam: &Ecam, mut visit: impl FnMut(&Device) -> bool) {
 /// # Safety
 ///
 /// См. [`for_each`].
-pub unsafe fn find_by_id(ecam: &Ecam, vendor: u16, devices: &[u16]) -> Option<Device> {
+pub unsafe fn find_by_id(root: &Root, vendor: u16, devices: &[u16]) -> Option<Device> {
     let mut found = None;
     // SAFETY: контракт функции.
     unsafe {
-        for_each(ecam, |device| {
+        for_each(root, |device| {
             if device.vendor == vendor && devices.contains(&device.device) {
                 found = Some(*device);
                 return false;
@@ -712,7 +881,7 @@ pub unsafe fn find_by_id(ecam: &Ecam, vendor: u16, devices: &[u16]) -> Option<De
 ///
 /// См. [`for_each`].
 pub unsafe fn find_by_class(
-    ecam: &Ecam,
+    root: &Root,
     class: u8,
     subclass: u8,
     prog_if: u8,
@@ -720,7 +889,7 @@ pub unsafe fn find_by_class(
     let mut found = None;
     // SAFETY: контракт функции.
     unsafe {
-        for_each(ecam, |device| {
+        for_each(root, |device| {
             if device.class == class && device.subclass == subclass && device.prog_if == prog_if {
                 found = Some(*device);
                 return false;

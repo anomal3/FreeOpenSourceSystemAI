@@ -80,11 +80,11 @@ impl VirtioBlk {
     /// # Safety
     ///
     /// Ядро должно исполняться на собственных таблицах страниц.
-    pub unsafe fn probe(ecam: &pci::Ecam) -> Result<Self, VirtioError> {
+    pub unsafe fn probe(root: &pci::Root) -> Result<Self, VirtioError> {
         // SAFETY: контракт функции.
         let device = unsafe {
             pci::find_by_id(
-                ecam,
+                root,
                 pci::VENDOR_VIRTIO,
                 &[pci::DEVICE_VIRTIO_BLK_LEGACY, pci::DEVICE_VIRTIO_BLK_MODERN],
             )

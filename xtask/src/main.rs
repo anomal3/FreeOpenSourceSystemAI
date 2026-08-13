@@ -111,6 +111,14 @@ struct RunArgs {
     /// результат его работы.
     #[arg(long, conflicts_with = "image")]
     installed: bool,
+    /// Подключить планшет вместо мыши — так, как это делает VirtualBox.
+    ///
+    /// Планшет не объявляет boot-протокола и сообщает координаты, а не
+    /// приращения; ядро читает его, разобрав дескриптор отчётов. Флаг нужен,
+    /// чтобы посмотреть на это глазами, не заводя виртуальную машину в другом
+    /// гипервизоре.
+    #[arg(long)]
+    tablet: bool,
     /// Объём памяти виртуальной машины.
     #[arg(long, default_value = "512M")]
     memory: String,
@@ -272,6 +280,7 @@ fn real_main() -> Result<()> {
                 memory: args.memory,
                 extra: args.qemu_args,
                 drives: vec![drive],
+                pointer: if args.tablet { qemu::Pointer::Tablet } else { qemu::Pointer::Mouse },
                 ..qemu::RunOptions::default()
             };
             qemu::run(&opts, &built)?;

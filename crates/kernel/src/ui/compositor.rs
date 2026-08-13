@@ -261,6 +261,38 @@ impl Compositor {
         self.mark(after);
     }
 
+    /// Поставить указатель туда, куда показало устройство, и пометить
+    /// изменившееся. Возвращает **фактическое** приращение положения.
+    ///
+    /// Приращение возвращается не для симметрии: за курсором тащится окно, а
+    /// планшет о приращениях ничего не сообщает — единственный, кто их знает,
+    /// это тот, кто хранит прежнее положение. Заодно из ответа исчезает та
+    /// часть движения, которую съел край экрана.
+    pub fn move_pointer_to(&mut self, x_fraction: u16, y_fraction: u16) -> (i32, i32) {
+        let (width, height) = (self.screen.width(), self.screen.height());
+        let (from_x, from_y) = self.pointer.position();
+        let before = self.pointer.rect();
+
+        let moved = self.pointer.move_to(
+            scale_fraction(x_fraction, width),
+            scale_fraction(y_fraction, height),
+            width,
+            height,
+        );
+        let appeared = self.pointer.show();
+        if !moved && !appeared {
+            return (0, 0);
+        }
+        if moved {
+            self.mark(before);
+        }
+        let after = self.pointer.rect();
+        self.mark(after);
+
+        let (to_x, to_y) = self.pointer.position();
+        (to_x - from_x, to_y - from_y)
+    }
+
     #[must_use]
     pub const fn pointer_position(&self) -> (i32, i32) {
         self.pointer.position()
@@ -541,6 +573,17 @@ impl Compositor {
     pub fn stats(&self) -> (u64, u64, usize) {
         (self.frames, self.rects, self.windows.len())
     }
+}
+
+/// Доля экрана (0..65535) → точка на нём.
+///
+/// Считается по **последней** точке, а не по размеру: доля 65535 обязана давать
+/// правый край, а не первую точку за ним. Ошибка на единицу здесь означала бы
+/// недостижимый последний столбец экрана — то, что человек замечает первым,
+/// когда не может попасть в кнопку закрытия развёрнутого окна.
+fn scale_fraction(fraction: u16, extent: u32) -> i32 {
+    let last = extent.saturating_sub(1);
+    ((u64::from(fraction) * u64::from(last)) / u64::from(u16::MAX)) as i32
 }
 
 /// Ближайшая сверху координата, кратная шагу разметки.

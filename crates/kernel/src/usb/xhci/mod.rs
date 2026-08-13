@@ -67,7 +67,7 @@ use crate::mm::dma::{self, DmaBuffer, DmaError};
 use crate::mm::{MapError, PAGE_SIZE, PhysAddr};
 use crate::pci;
 use crate::usb::hid::{self, REPORT_LEN};
-use crate::usb::{self, BootInterface};
+use crate::usb::{self, HidInterface};
 
 use alloc::vec::Vec;
 
@@ -197,8 +197,16 @@ pub enum XhciError {
     TransferTimeout,
     /// Дескриптор пришёл короче, чем должен быть.
     ShortDescriptor,
-    /// Устройство есть, но boot-клавиатуры среди его интерфейсов нет.
-    NoKeyboard,
+    /// Устройство есть, но интерфейса HID с точкой прерываний среди его
+    /// интерфейсов нет.
+    NoHid,
+    /// Интерфейс HID есть, но понять его нечем: boot-протокола он не объявляет,
+    /// а из дескриптора отчётов ничего пригодного не вышло.
+    ///
+    /// Отдельная ошибка, а не молчание: устройство при этом исправно, и разница
+    /// между «на порту ничего нет» и «на порту есть то, чего мы не понимаем» —
+    /// это разница между «купите мышь» и «допишите разбор».
+    UnknownHid,
 }
 
 impl core::fmt::Display for XhciError {
@@ -227,7 +235,11 @@ impl core::fmt::Display for XhciError {
             }
             Self::TransferTimeout => f.write_str("a control transfer never completed"),
             Self::ShortDescriptor => f.write_str("the device returned a truncated descriptor"),
-            Self::NoKeyboard => f.write_str("the device has no boot-protocol keyboard interface"),
+            Self::NoHid => f.write_str("the device has no HID interface with an interrupt endpoint"),
+            Self::UnknownHid => f.write_str(
+                "the HID interface declares no boot protocol and its report descriptor \
+                 describes neither a pointer nor a keyboard",
+            ),
         }
     }
 }
@@ -235,6 +247,37 @@ impl core::fmt::Display for XhciError {
 impl From<DmaError> for XhciError {
     fn from(err: DmaError) -> Self {
         Self::Dma(err)
+    }
+}
+
+/// На каком шаге перечисления остановилось устройство.
+///
+/// Нужен ровно там, где нет журнала: на машине без последовательного порта
+/// «устройство не поднялось» — это всё, что видит человек, а шагов между
+/// «порт занят» и «устройство работает» шесть, и лечатся они по-разному.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Сброс порта.
+    Reset,
+    /// Выделение слота и выдача адреса.
+    Address,
+    /// Чтение дескрипторов устройства и конфигурации.
+    Describe,
+    /// Настройка точки прерываний у контроллера.
+    Configure,
+    /// Выбор конфигурации, чтение дескриптора отчётов, протокол.
+    Enable,
+}
+
+impl core::fmt::Display for Stage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Reset => "resetting the port",
+            Self::Address => "addressing the device",
+            Self::Describe => "reading its descriptors",
+            Self::Configure => "configuring the interrupt endpoint",
+            Self::Enable => "enabling reports",
+        })
     }
 }
 
@@ -267,6 +310,18 @@ impl Reader {
         match self {
             Reader::Keyboard(_) => "keyboard",
             Reader::Mouse(_) => "mouse",
+        }
+    }
+
+    /// Чем устройство оказалось на самом деле.
+    ///
+    /// Именно на самом деле, а не по байту дескриптора интерфейса: планшет
+    /// объявляет протокол ноль, и поверив дескриптору, ядро сообщило бы, что
+    /// указателя в системе нет, — при работающем указателе.
+    const fn protocol(&self) -> u8 {
+        match self {
+            Reader::Keyboard(_) => usb::PROTOCOL_KEYBOARD,
+            Reader::Mouse(_) => usb::PROTOCOL_MOUSE,
         }
     }
 }
@@ -342,6 +397,16 @@ pub struct Controller {
     /// каждый его шаг — это переключение контекста, перебор кольца и обращения
     /// к регистрам контроллера.
     services: u64,
+    /// Сколько корневых портов оказались занятыми при перечислении.
+    ///
+    /// Хранится затем, чтобы отличить «устройства нет» от «устройство есть, но
+    /// поднять его не удалось». На машине без последовательного порта это
+    /// единственный способ такое различить: журнала там не существует, а числа
+    /// видны в оболочке.
+    occupied: usize,
+    /// Чем закончилась последняя неудачная попытка поднять устройство: порт,
+    /// шаг и сама ошибка.
+    last_error: Option<(u8, Stage, XhciError)>,
 }
 
 impl Controller {
@@ -354,18 +419,12 @@ impl Controller {
     /// — оставаться нетронутой.
     pub unsafe fn init(rsdp: u64) -> Result<Self, XhciError> {
         // SAFETY: контракт функции.
-        let ecam = unsafe { pci::find_ecam(rsdp) }.map_err(XhciError::Acpi)?;
-        kprintln!(
-            "  pci         : ECAM at {:#012x}, segment {}, buses {}..={}",
-            ecam.base(),
-            ecam.segment(),
-            ecam.buses().0,
-            ecam.buses().1
-        );
+        let root = unsafe { pci::Root::discover(rsdp) }.map_err(XhciError::Acpi)?;
+        kprintln!("  pci         : {root}");
 
         // SAFETY: контракт функции.
         let device = unsafe {
-            pci::find_by_class(&ecam, pci::CLASS_SERIAL_BUS, pci::SUBCLASS_USB, pci::PROG_IF_XHCI)
+            pci::find_by_class(&root, pci::CLASS_SERIAL_BUS, pci::SUBCLASS_USB, pci::PROG_IF_XHCI)
         }
         .ok_or(XhciError::NoController)?;
         kprintln!(
@@ -431,6 +490,8 @@ impl Controller {
             msix_table: None,
             interrupts: 0,
             services: 0,
+            occupied: 0,
+            last_error: None,
         };
 
         // SAFETY: окно регистров отображено, кольца выделены и обнулены.
@@ -825,6 +886,7 @@ impl Controller {
                 connected |= 1 << (port - 1);
             }
         }
+        self.occupied = connected.count_ones() as usize;
         kprintln!(
             "  usb         : {} root port(s), connected mask {connected:#010x}",
             self.regs.max_ports
@@ -842,7 +904,10 @@ impl Controller {
                 Ok(usb::PROTOCOL_KEYBOARD) => keyboard = true,
                 Ok(usb::PROTOCOL_MOUSE) => mouse = true,
                 Ok(_) => {}
-                Err(err) => kprintln!("  usb         : port {port}: {err}"),
+                Err((stage, err)) => {
+                    kprintln!("  usb         : port {port} failed while {stage}: {err}");
+                    self.last_error = Some((port, stage, err));
+                }
             }
         }
 
@@ -851,12 +916,16 @@ impl Controller {
 
     /// Подключить одно устройство: слот, адрес, дескрипторы, конфигурация.
     ///
-    /// Возвращает протокол HID, по которому устройство опознано.
+    /// Возвращает протокол HID, по которому устройство опознано, либо шаг, на
+    /// котором всё остановилось, вместе с ошибкой. Шаг возвращается наружу, а не
+    /// только печатается, потому что на машине без последовательного порта
+    /// печать некуда девать — а разница между «не ответило на сброс» и «не
+    /// отдало дескриптор» решает, куда смотреть дальше.
     ///
     /// # Safety
     ///
     /// Контроллер должен работать, а порт — иметь подключённое устройство.
-    unsafe fn attach_one(&mut self, port: u8) -> Result<u8, XhciError> {
+    unsafe fn attach_one(&mut self, port: u8) -> Result<u8, (Stage, XhciError)> {
         // Строка **до** сброса, а не после. Сброс порта — первое, что драйвер
         // делает с чужим устройством, и первое, что на чужой машине может не
         // вернуться; отчёт после него сообщает об успехе, а нужен признак
@@ -864,7 +933,7 @@ impl Controller {
         // стоит одной строки.
         kprintln!("  usb         : root port {port} occupied, resetting");
         // SAFETY: контракт функции.
-        let speed = unsafe { self.reset_port(port) }?;
+        let speed = unsafe { self.reset_port(port) }.map_err(|err| (Stage::Reset, err))?;
         kprintln!(
             "  usb         : device on root port {port}, {}",
             regs::speed_name(speed)
@@ -877,14 +946,16 @@ impl Controller {
                 status: 0,
                 control: ring::TRB_ENABLE_SLOT << ring::TRB_TYPE_SHIFT,
             })
-        }?;
+        }
+        .map_err(|err| (Stage::Address, err))?;
         let slot = event.slot_id();
 
-        let context = dma::alloc(self.regs.context_size * 32)?;
-        let input = dma::alloc(self.regs.context_size * 33)?;
-        let ep0 = Ring::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?);
-        let interrupt = Ring::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?);
-        let report = dma::alloc(PAGE_SIZE)?;
+        let allocate = |bytes| dma::alloc(bytes).map_err(|err| (Stage::Address, err.into()));
+        let context = allocate(self.regs.context_size * 32)?;
+        let input = allocate(self.regs.context_size * 33)?;
+        let ep0 = Ring::new(allocate(RING_ENTRIES * ring::TRB_LEN)?);
+        let interrupt = Ring::new(allocate(RING_ENTRIES * ring::TRB_LEN)?);
+        let report = allocate(PAGE_SIZE)?;
 
         // Массив контекстов: контроллер узнаёт из него, где лежит состояние
         // устройства этого слота.
@@ -912,31 +983,32 @@ impl Controller {
         };
 
         // SAFETY: контракт функции; контексты выделены и обнулены.
-        unsafe { self.address_device(&mut device, speed) }?;
+        unsafe { self.address_device(&mut device, speed) }.map_err(|err| (Stage::Address, err))?;
         kprintln!("  usb         : slot {slot} addressed");
 
         // SAFETY: устройство отвечает на управляющей точке.
-        let found = unsafe { self.describe_device(&mut device, speed) }?;
+        let found = unsafe { self.describe_device(&mut device, speed) }
+            .map_err(|err| (Stage::Describe, err))?;
         let micros = interval_micros(endpoint_interval(speed, found.interval));
-        let reader = match found.protocol {
-            usb::PROTOCOL_MOUSE => Reader::Mouse(hid::Mouse::new()),
-            _ => Reader::Keyboard(hid::Keyboard::new()),
-        };
         kprintln!(
-            "  usb         : boot {} on interface {}, endpoint {} IN, {}-byte reports every {}.{:03} ms",
-            reader.name(),
+            "  usb         : HID interface {}, endpoint {} IN, {}-byte reports every {}.{:03} ms{}",
             found.interface,
             found.endpoint,
             found.max_packet_size,
             micros / 1000,
-            micros % 1000
+            micros % 1000,
+            if found.boot { ", boot protocol offered" } else { "" }
         );
 
         device.report_len = found.max_packet_size.min(PAGE_SIZE as u16);
         // SAFETY: см. выше.
-        unsafe { self.configure_endpoint(&mut device, &found, speed) }?;
+        unsafe { self.configure_endpoint(&mut device, &found, speed) }
+            .map_err(|err| (Stage::Configure, err))?;
         // SAFETY: см. выше.
-        unsafe { self.enable_reports(&mut device, &found) }?;
+        let reader =
+            unsafe { self.enable_reports(&mut device, &found) }.map_err(|err| (Stage::Enable, err))?;
+        let protocol = reader.protocol();
+        kprintln!("  usb         : slot {slot} is a {}", reader.name());
 
         // Разборщик ставится последним: до этого момента буфер занят
         // дескрипторами, и отчёт в него ещё не запрашивался.
@@ -944,7 +1016,7 @@ impl Controller {
         self.devices.push(device);
         // SAFETY: устройство настроено, кольцо точки прерываний готово.
         unsafe { self.queue_reports() };
-        Ok(found.protocol)
+        Ok(protocol)
     }
 
     /// Записать слово в контекст.
@@ -1047,7 +1119,7 @@ impl Controller {
         &mut self,
         device: &mut Device,
         speed: u32,
-    ) -> Result<BootInterface, XhciError> {
+    ) -> Result<HidInterface, XhciError> {
         // Первые восемь байт дескриптора устройства: больше читать нельзя, пока
         // неизвестен размер пакета управляющей точки, — а он лежит именно в этих
         // восьми байтах (байт 7). Классическая курица с яйцом, решённая
@@ -1100,7 +1172,7 @@ impl Controller {
         let read = unsafe { self.get_descriptor(device, usb::DESC_CONFIGURATION, 0, total) }?;
         // SAFETY: см. выше.
         let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
-        usb::find_boot_hid(bytes).ok_or(XhciError::NoKeyboard)
+        usb::find_hid(bytes).ok_or(XhciError::NoHid)
     }
 
     /// Сообщить контроллеру настоящий размер пакета управляющей точки.
@@ -1140,7 +1212,7 @@ impl Controller {
     unsafe fn configure_endpoint(
         &mut self,
         device: &mut Device,
-        found: &BootInterface,
+        found: &HidInterface,
         speed: u32,
     ) -> Result<(), XhciError> {
         // Идентификатор контекста точки: `2 * номер + 1` для направления IN. Он
@@ -1200,7 +1272,9 @@ impl Controller {
         Ok(())
     }
 
-    /// Выбрать конфигурацию и попросить у клавиатуры boot protocol.
+    /// Выбрать конфигурацию, понять устройство и включить нужный протокол.
+    ///
+    /// Возвращает разборщик, которому достанутся отчёты.
     ///
     /// # Safety
     ///
@@ -1208,10 +1282,11 @@ impl Controller {
     unsafe fn enable_reports(
         &mut self,
         device: &mut Device,
-        found: &BootInterface,
-    ) -> Result<(), XhciError> {
+        found: &HidInterface,
+    ) -> Result<Reader, XhciError> {
         // SET_CONFIGURATION: до него устройство не отвечает ни на одном
-        // интерфейсе, кроме нулевой точки.
+        // интерфейсе, кроме нулевой точки. Дескриптор отчётов адресован именно
+        // интерфейсу, поэтому читать его раньше этого запроса нельзя.
         // SAFETY: контракт функции.
         unsafe {
             self.control_transfer(
@@ -1222,34 +1297,46 @@ impl Controller {
             )
         }?;
 
-        // Boot protocol запрашивается явно. Большинство клавиатур в нём и
-        // просыпаются, но «большинство» — не «все», а разница фатальна: в report
-        // protocol формат отчёта задаётся HID Report Descriptor, которого этот
-        // драйвер не разбирает.
+        // SAFETY: устройство сконфигурировано, буфер отчётов ещё свободен —
+        // разборщик поставят после возврата отсюда.
+        let described = unsafe { self.read_report_descriptor(device, found) };
+        let (reader, boot) = choose_reader(found, &described).ok_or(XhciError::UnknownHid)?;
+
+        // Протокол запрашивается явно, и именно тот, на котором собрались
+        // читать. Запрос имеет смысл только у интерфейса с boot-подклассом: у
+        // остальных протокол один, менять нечего, и устройство законно ответит
+        // отказом.
         let request = usb::REQ_TYPE_CLASS | usb::REQ_RECIPIENT_INTERFACE;
-        // SAFETY: см. выше.
-        let protocol = unsafe {
-            self.control_transfer(
-                device,
-                [
-                    request,
-                    usb::REQ_HID_SET_PROTOCOL,
-                    usb::HID_PROTOCOL_BOOT as u8,
+        if found.boot {
+            let wanted = if boot { usb::HID_PROTOCOL_BOOT } else { usb::HID_PROTOCOL_REPORT };
+            // SAFETY: см. выше.
+            let protocol = unsafe {
+                self.control_transfer(
+                    device,
+                    [
+                        request,
+                        usb::REQ_HID_SET_PROTOCOL,
+                        wanted as u8,
+                        0,
+                        found.interface,
+                        0,
+                        0,
+                        0,
+                    ],
                     0,
-                    found.interface,
-                    0,
-                    0,
-                    0,
-                ],
-                0,
-                false,
-            )
-        };
-        if protocol.is_err() {
-            // Отказ не смертелен: устройство могло не поддерживать запрос,
-            // оставаясь при этом в boot protocol. Молчать об этом нельзя — если
-            // отчёты потом окажутся бессмысленными, причина будет здесь.
-            kprintln!("  usb         : SET_PROTOCOL(boot) refused; assuming boot protocol anyway");
+                    false,
+                )
+            };
+            if protocol.is_err() {
+                // Отказ не смертелен: устройство могло не поддерживать запрос,
+                // оставаясь при этом в нужном протоколе (report — состояние по
+                // умолчанию после сброса). Молчать нельзя: если отчёты потом
+                // окажутся бессмыслицей, причина будет здесь.
+                kprintln!(
+                    "  usb         : SET_PROTOCOL({}) refused; assuming the device is in it anyway",
+                    if boot { "boot" } else { "report" }
+                );
+            }
         }
 
         // SET_IDLE с нулевой длительностью означает «сообщать только об
@@ -1267,7 +1354,89 @@ impl Controller {
         if idle.is_err() {
             kprintln!("  usb         : SET_IDLE refused; reports may repeat");
         }
-        Ok(())
+        Ok(reader)
+    }
+
+    /// Прочитать и разобрать дескриптор отчётов.
+    ///
+    /// Неудача здесь не является отказом: у устройства с boot-подклассом
+    /// остаётся запасной формат, и разбор превращается в необязательное
+    /// улучшение. Поэтому функция ничего не возвращает в виде ошибки — она
+    /// возвращает то, что удалось понять, и печатает это.
+    ///
+    /// # Safety
+    ///
+    /// Устройство должно быть сконфигурировано, а буфер отчётов — свободен.
+    unsafe fn read_report_descriptor(
+        &mut self,
+        device: &mut Device,
+        found: &HidInterface,
+    ) -> usb_hid::Descriptor {
+        if found.report_len == 0 {
+            kprintln!("  usb         : the interface declares no report descriptor");
+            return usb_hid::Descriptor::default();
+        }
+
+        let length = found.report_len.min(PAGE_SIZE as u16);
+        // Получатель — **интерфейс**, а не устройство: дескриптор отчётов
+        // принадлежит интерфейсу, и запрос к устройству вернёт отказ. Номер
+        // интерфейса едет в `wIndex`, тип — в старшем байте `wValue`.
+        let setup = [
+            usb::REQ_DIR_IN | usb::REQ_RECIPIENT_INTERFACE,
+            usb::REQ_GET_DESCRIPTOR,
+            0,
+            usb::DESC_REPORT,
+            found.interface,
+            0,
+            length as u8,
+            (length >> 8) as u8,
+        ];
+        // SAFETY: контракт функции.
+        let read = match unsafe { self.control_transfer(device, setup, length, true) } {
+            Ok(read) => read,
+            Err(err) => {
+                kprintln!("  usb         : the report descriptor could not be read: {err}");
+                return usb_hid::Descriptor::default();
+            }
+        };
+
+        // SAFETY: буфер выделен на страницу, читается ровно столько, сколько
+        // сообщил контроллер.
+        let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
+        let parsed = usb_hid::parse(bytes);
+
+        // Разобранное печатается целиком, и это не многословность. Дескриптор
+        // приходит от чужого устройства, а ошибка разбора выглядит как «курсор
+        // ездит наискось» — то есть как неисправная мышь. Строка ниже отвечает
+        // на вопрос «что именно ядро поняло» до того, как его зададут.
+        match parsed.pointer {
+            Some(map) if map.is_absolute() => {
+                let (min, max) = map.range();
+                kprintln!(
+                    "  usb         : report descriptor {read} bytes: pointer, absolute {min}..{max}, {} buttons{}",
+                    map.button_count(),
+                    if map.has_wheel() { ", wheel" } else { "" }
+                );
+            }
+            Some(map) => kprintln!(
+                "  usb         : report descriptor {read} bytes: pointer, relative, {} buttons{}",
+                map.button_count(),
+                if map.has_wheel() { ", wheel" } else { "" }
+            ),
+            None => {}
+        }
+        if let Some(map) = parsed.keyboard {
+            kprintln!(
+                "  usb         : report descriptor {read} bytes: keyboard, {}, {}-key array",
+                if map.has_modifiers() { "modifiers" } else { "no modifiers" },
+                map.key_slots()
+            );
+        }
+        if parsed.pointer.is_none() && parsed.keyboard.is_none() {
+            kprintln!("  usb         : report descriptor {read} bytes: nothing the kernel can use");
+        }
+
+        parsed
     }
 
     /// Прочитать дескриптор. Возвращает число полученных байт; данные лежат в
@@ -1564,8 +1733,22 @@ impl Controller {
         for device in &self.devices {
             reports += device.reader.as_ref().map_or(0, Reader::reports);
         }
+        let keyboards = self
+            .devices
+            .iter()
+            .filter(|device| matches!(device.reader, Some(Reader::Keyboard(_))))
+            .count();
+        let mice = self
+            .devices
+            .iter()
+            .filter(|device| matches!(device.reader, Some(Reader::Mouse(_))))
+            .count();
         Summary {
             devices: self.devices.len(),
+            keyboards,
+            mice,
+            occupied: self.occupied,
+            last_error: self.last_error,
             slot: self.devices.first().map_or(0, |device| device.slot),
             port: self.devices.first().map_or(0, |device| device.port),
             reports,
@@ -1586,6 +1769,20 @@ impl Controller {
 pub struct Summary {
     /// Сколько устройств поднято.
     pub devices: usize,
+    /// Сколько из них разбираются как клавиатуры.
+    ///
+    /// Отдельно от [`Summary::devices`] потому, что «устройство поднялось» и
+    /// «устройство опознано тем, чем оно является» — разные утверждения, и
+    /// расхождение между ними это самый частый отказ на чужой машине.
+    pub keyboards: usize,
+    /// Сколько из них разбираются как указатели.
+    pub mice: usize,
+    /// Сколько корневых портов заняты. Больше, чем [`Summary::devices`], —
+    /// значит устройство на порту есть, а поднять его не удалось.
+    pub occupied: usize,
+    /// Чем закончилась последняя неудачная попытка: порт, шаг и ошибка.
+    /// `None` — неудач не было.
+    pub last_error: Option<(u8, Stage, XhciError)>,
     /// Слот первого из них.
     pub slot: u8,
     /// Порт первого из них.
@@ -1604,6 +1801,50 @@ pub struct Summary {
     pub interrupts: u64,
     /// Сколько раз задача просыпалась разбирать кольцо.
     pub services: u64,
+}
+
+/// Кто будет разбирать отчёты и на каком протоколе.
+///
+/// Возвращает разборщик и признак «на boot-протоколе»; `None` означает, что
+/// устройство понять нечем.
+///
+/// # Почему дескриптор предпочтительнее boot-протокола
+///
+/// Не из любви к новому. Boot-протокол — упрощение, придуманное ради BIOS:
+/// три байта у мыши, восемь у клавиатуры. Дескриптор описывает то, что
+/// устройство шлёт **на самом деле**, и только он работает с теми, кто
+/// boot-протокола не объявляет вовсе.
+///
+/// Держать его запасным путём и ходить по нему только на чужих машинах было бы
+/// хуже всего: путь, по которому система ходит лишь там, где её некому чинить,
+/// — это путь, который никто не проверял. Поэтому основной здесь он, а
+/// boot-протокол остаётся для устройства, чей дескриптор разобрать не удалось.
+fn choose_reader(found: &HidInterface, described: &usb_hid::Descriptor) -> Option<(Reader, bool)> {
+    // Байт протокола главнее дескриптора ровно в одном: он решает, кем
+    // устройство себя объявило. Клавиатура, у которой в дескрипторе нашлись
+    // ещё и оси (такое бывает у клавиатур с тачпадом), не должна стать мышью.
+    if found.protocol != usb::PROTOCOL_KEYBOARD {
+        if let Some(map) = described.pointer {
+            return Some((Reader::Mouse(hid::Mouse::described(map)), false));
+        }
+    }
+    if let Some(map) = described.keyboard {
+        return Some((Reader::Keyboard(hid::Keyboard::described(map)), false));
+    }
+    if let Some(map) = described.pointer {
+        return Some((Reader::Mouse(hid::Mouse::described(map)), false));
+    }
+
+    if !found.boot {
+        return None;
+    }
+    match found.protocol {
+        usb::PROTOCOL_MOUSE => Some((Reader::Mouse(hid::Mouse::boot()), true)),
+        usb::PROTOCOL_KEYBOARD => Some((Reader::Keyboard(hid::Keyboard::boot()), true)),
+        // Boot-подкласс без протокола клавиатуры или мыши: спецификация такого
+        // не описывает, и угадывать формат отчёта не по чему.
+        _ => None,
+    }
 }
 
 /// Перевести `bInterval` из дескриптора в поле `Interval` контекста точки.
