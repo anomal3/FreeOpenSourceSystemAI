@@ -181,6 +181,14 @@ pub fn list(path: &str) -> Option<VfsResult<Vec<DirEntry>>> {
     })
 }
 
+/// Сбросить корневую ФС на носитель.
+///
+/// `None` означает «ничего не смонтировано» — это не отказ, а обычное
+/// состояние живого ISO, и путать его с ошибкой нельзя.
+pub fn sync_root() -> Option<VfsResult<()>> {
+    with_root(|fs| fs.sync())
+}
+
 /// Прочитать не более `limit` байт файла. Возвращает прочитанное и полный размер
 /// файла — чтобы вызывающий мог сказать, что показал не всё.
 pub fn read(path: &str, limit: usize) -> Option<VfsResult<(Vec<u8>, u64)>> {

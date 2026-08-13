@@ -17,6 +17,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::block::Counted;
+use disk::BlockDevice as _;
 use crate::sync::Mutex;
 use crate::vfs::{DirEntry, FileSystem, Metadata, Node, NodeKind, VfsError, VfsResult};
 
@@ -164,6 +165,18 @@ impl FileSystem for Ext2Mount {
     fn root(&self) -> VfsResult<Box<dyn Node>> {
         let inode = self.0.root_inode()?;
         Ok(Box::new(Ext2Node { fs: Arc::clone(&self.0), inode }))
+    }
+
+    /// Сбросить счётчики и довести записи до носителя.
+    ///
+    /// `flush` устройства здесь не менее важен, чем сброс счётчиков: у диска
+    /// SATA есть кеш записи, и «записано» без него означает «лежит в
+    /// микросхеме диска», что переживает не всякое выключение питания.
+    fn sync(&self) -> VfsResult<()> {
+        let mut guard = self.0.inner.lock();
+        let Inner { disk, editor, .. } = &mut *guard;
+        editor.flush(disk).map_err(convert)?;
+        disk.flush().map_err(|_| VfsError::Io)
     }
 }
 

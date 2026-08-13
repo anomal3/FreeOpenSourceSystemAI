@@ -138,6 +138,7 @@ pub mod gic;
 pub mod input;
 pub mod interrupts;
 pub mod paging;
+mod power;
 pub mod timer;
 pub mod user;
 
@@ -435,3 +436,5 @@ pub fn halt() -> ! {
         unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
     }
 }
+
+pub use power::{power_off, reboot};
