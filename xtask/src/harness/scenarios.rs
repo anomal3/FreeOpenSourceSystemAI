@@ -1387,7 +1387,7 @@ pub const ALL: &[Scenario] = &[
             // Следующая загрузка обязана заметить и проверить — сама, без
             // единой команды. Порядок строк тоже проверяется: сначала «том
             // закрыт не был», потом проверка, и только потом монтирование.
-            Step::Await("fsck        : the volume was not closed cleanly, checking it", BOOT),
+            Step::Await("fsck        : checking the root volume (it was not closed cleanly)", BOOT),
             Step::Await("fsck        : ", 60_000),
             Step::Await("root        : ext2 at LBA", 60_000),
             Step::Await("freeos> ", 30_000),
@@ -1404,6 +1404,62 @@ pub const ALL: &[Scenario] = &[
             // Проверка обязана быть беззвучной там, где она не нужна: на
             // чистом томе её не запускают вовсе.
             Step::Absent("fsck        : the check itself failed"),
+        ],
+    },
+    Scenario {
+        name: "recovery",
+        about: "Меню загрузчика: безопасный режим с проверкой диска и корнем только на чтение.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        arches: &[],
+        reboots: false,
+        extra: &[],
+        steps: &[
+            // Клавиши жмутся **заранее**: прошивка копит нажатия в буфере, а
+            // окно ожидания у загрузчика короткое — полсекунды, потому что эти
+            // полсекунды платит каждая загрузка. Попасть в него нажатием «в
+            // нужный момент» нельзя, и это не недостаток стенда: человек за
+            // клавиатурой попадает в меню ровно тем же способом — держит
+            // клавишу с самого включения.
+            Step::Repeat("s", 4),
+            // ...и второй раз — уже после того, как загрузчик заговорил. На
+            // x86-64 хватает первых: нажатия копит контроллер клавиатуры. На
+            // машине, где клавиатура приходит по USB, до её инициализации
+            // прошивкой нажимать некуда, поэтому нужны вторые — их ловит
+            // поздний опрос, тот, что идёт перед самой передачей управления.
+            Step::Await("FreeOS bootloader", BOOT),
+            Step::Repeat("s", 8),
+            Step::Await("---- boot menu", 120_000),
+            // Четвёртый пункт: безопасный режим **и** проверка тома. Проверяем
+            // оба флага разом — иначе пришлось бы грузиться дважды ради двух
+            // битов в одном поле.
+            Step::Key("4"),
+            Step::Await("  safe mode with a disk check", 15_000),
+            // Ядро обязано сказать, каким режимом грузится: пропавший рабочий
+            // стол иначе выглядит поломкой.
+            Step::Await("boot        : safe mode, no desktop, root read-only", BOOT),
+            Step::Await("boot        : the root volume will be checked before mounting", 15_000),
+            // Проверка идёт даже на чистом томе — об этом и просили.
+            Step::Await("fsck        : checking the root volume (asked for", 60_000),
+            Step::Await("root        : mounted read-only", 60_000),
+            Step::Await("compositor  : not started, safe mode", 30_000),
+            Step::Await("freeos> ", 30_000),
+            // Читать можно всё.
+            Step::Line("cat /etc/system.cfg"),
+            Step::Await("language=", 15_000),
+            // А писать — нельзя, и отказ называет причину, а не притворяется
+            // нехваткой прав или поломкой носителя.
+            Step::Line("echo no > /home/roman/x.txt"),
+            Step::Await("the volume is mounted read-only", 15_000),
+            // Проверка тома работает и здесь: это и есть консоль
+            // восстановления — оболочка и `fsck` на месте, том не тронут.
+            Step::Line("fsck"),
+            Step::Await("  the volume is consistent", 60_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
         ],
     },
     Scenario {

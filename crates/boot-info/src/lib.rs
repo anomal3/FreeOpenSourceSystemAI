@@ -21,8 +21,24 @@ pub const BOOT_INFO_MAGIC: u64 = 0x4652_4545_4F53_0001;
 /// to its own image. Revision 3 added [`BootInfo::initrd`]. Revision 4 added
 /// [`BootInfo::wall_clock`]: the kernel has no clock of its own to ask.
 /// Revision 5 added [`BootInfo::wall_clock_counter`], which says *when* that
-/// clock was read.
-pub const BOOT_INFO_REVISION: u32 = 5;
+/// clock was read. Revision 6 added [`BootInfo::boot_flags`]: what the person
+/// in front of the machine chose in the bootloader menu.
+pub const BOOT_INFO_REVISION: u32 = 6;
+
+/// Boot without the desktop, without services, and with the root filesystem
+/// mounted read-only.
+///
+/// The minimum that starts: whatever broke is usually one of the things safe
+/// mode leaves out, and a read-only root cannot be damaged further by a system
+/// that is already misbehaving.
+pub const BOOT_SAFE_MODE: u64 = 1 << 0;
+
+/// Check the root volume before mounting it, even if it claims to be clean.
+///
+/// The automatic check runs only on a volume that was not closed cleanly. This
+/// is the way to ask for it anyway — after a crash whose damage the flag did
+/// not capture, or simply to be sure.
+pub const BOOT_CHECK_DISK: u64 = 1 << 1;
 
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
@@ -204,6 +220,13 @@ pub struct BootInfo {
     /// see, because the counter is the same hardware register on both sides of
     /// the hand-off and does not restart in between.
     pub wall_clock_counter: u64,
+    /// What was chosen in the bootloader menu: [`BOOT_SAFE_MODE`],
+    /// [`BOOT_CHECK_DISK`], or zero for an ordinary boot.
+    ///
+    /// A field in the stable contract rather than a file the kernel would have
+    /// to find and parse: the choice is made before there is a filesystem to
+    /// read it from, and by the one component that has the person's attention.
+    pub boot_flags: u64,
 }
 
 /// Segment is readable.
@@ -358,6 +381,7 @@ impl BootInfo {
             device_tree: 0,
             wall_clock: 0,
             wall_clock_counter: 0,
+            boot_flags: 0,
         }
     }
 
@@ -365,5 +389,18 @@ impl BootInfo {
     #[must_use]
     pub const fn is_valid(&self) -> bool {
         self.magic == BOOT_INFO_MAGIC && self.revision == BOOT_INFO_REVISION
+    }
+
+    /// Whether the machine was asked to boot without the desktop and with a
+    /// read-only root.
+    #[must_use]
+    pub const fn safe_mode(&self) -> bool {
+        self.boot_flags & BOOT_SAFE_MODE != 0
+    }
+
+    /// Whether the root volume must be checked even if it says it is clean.
+    #[must_use]
+    pub const fn check_disk(&self) -> bool {
+        self.boot_flags & BOOT_CHECK_DISK != 0
     }
 }

@@ -29,6 +29,7 @@ mod graphics;
 mod handoff;
 mod initrd;
 mod kernel_image;
+mod menu;
 mod volume;
 
 use core::convert::Infallible;
@@ -82,6 +83,10 @@ fn main() -> Status {
     print_banner();
 
     let mut info = BootInfo::new(ARCH);
+    // Спрашивается до всего остального: если что-то не так с диском или с
+    // графикой, человек обязан успеть сказать об этом раньше, чем загрузчик
+    // до них доберётся.
+    info.boot_flags = menu::choose();
     info.framebuffer = graphics::probe_framebuffer();
     info.acpi_rsdp = find_acpi_rsdp();
 
@@ -131,6 +136,14 @@ fn boot_kernel(mut info: BootInfo) -> Result<Infallible, Aborted> {
         segments_ptr: 0,
         segments_len: 0,
     };
+
+    // Последний шанс попросить меню. Нажатие, сделанное **пока грузилось
+    // ядро**, до сих пор лежало бы в буфере прошивки невостребованным: на
+    // машине с USB-клавиатурой нажать раньше нашего первого опроса просто
+    // некуда. Стоит этот шанс одного чтения буфера.
+    if info.boot_flags == 0 {
+        info.boot_flags = menu::choose_late();
+    }
 
     // Карта памяти оценивается до выделения hand-off блока, но снимается
     // окончательно только внутри ExitBootServices — см. модуль `handoff`.

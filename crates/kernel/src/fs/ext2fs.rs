@@ -37,7 +37,13 @@ struct Inner {
     /// `&mut dyn BlockDevice` — расходилось с ним только ядро.
     disk: Counted,
     fs: ext2::Ext2,
-    editor: ext2::Editor,
+    /// Редактор — только у тома, смонтированного на запись.
+    ///
+    /// `None` — это не «редактор пока не создан», а «его не будет»: том открыт
+    /// только на чтение, и записать в него нельзя даже по ошибке, потому что
+    /// писать нечем. Флаг `read_only` рядом с редактором позволял бы забыть
+    /// проверку в одном из путей записи; отсутствующий редактор — не позволяет.
+    editor: Option<ext2::Editor>,
 }
 
 /// Смонтированный том.
@@ -99,10 +105,20 @@ impl Ext2Fs {
     pub fn mount(
         device: alloc::boxed::Box<dyn disk::BlockDevice + Send>,
         first_lba: u64,
+        writable: bool,
     ) -> VfsResult<Ext2Mount> {
         let mut disk = Counted::new(device);
         let fs = ext2::Ext2::mount(&mut disk, first_lba).map_err(convert)?;
-        let editor = ext2::Editor::open(&mut disk, first_lba).map_err(convert)?;
+        // На томе только для чтения редактор не открывается вовсе — и не
+        // только потому, что писать не собираемся: само открытие помечает том
+        // используемым, то есть **пишет** в суперблок. Безопасный режим,
+        // трогающий том, которого он обещал не трогать, был бы издевательством
+        // над словом «безопасный».
+        let editor = if writable {
+            Some(ext2::Editor::open(&mut disk, first_lba).map_err(convert)?)
+        } else {
+            None
+        };
         Ok(Ext2Mount(Arc::new(Self {
             inner: Mutex::new(Inner { disk, fs, editor }),
         })))
@@ -116,7 +132,10 @@ impl Ext2Fs {
     /// под новый файл блок, уже занятый старым. Не потеря счётчиков, а потеря
     /// данных. Цена — с десяток записей блоков на операцию, и это ровно то
     /// место, где такую цену стоит платить не глядя.
-    fn change<R>(&self, action: impl FnOnce(&mut Inner) -> VfsResult<R>) -> VfsResult<R> {
+    fn change<R>(
+        &self,
+        action: impl FnOnce(&mut Counted, &mut ext2::Editor) -> VfsResult<R>,
+    ) -> VfsResult<R> {
         let mut guard = self.inner.lock();
         // Штамп времени обновляется перед **каждой** правкой, а не один раз при
         // монтировании. [`ext2::Editor::open`] берёт его из суперблока — из
@@ -125,18 +144,20 @@ impl Ext2Fs {
         // же дату, не двигавшуюся месяцами. Часы у системы теперь есть, и
         // спросить их дешевле, чем объяснять потом, почему файл создан раньше,
         // чем машина включилась.
-        guard.editor.set_time(crate::time::now_unix_u32());
+        // Тому только для чтения редактора нет вовсе, и запись отказывает
+        // здесь — до того, как что-нибудь на диске изменится.
+        let Inner { disk, editor, .. } = &mut *guard;
+        let Some(editor) = editor.as_mut() else {
+            return Err(VfsError::ReadOnly);
+        };
+        editor.set_time(crate::time::now_unix_u32());
         // Признак «том используется» ставится **до** правки. Обычно он уже
         // стоит с самого монтирования и это ничего не стоит; смысл в другом
         // случае — если том успели пометить чистым (`sync` перед выключением),
         // а потом система продолжила работать, признак надо вернуть, и вернуть
         // до того, как на диске что-то изменится.
-        {
-            let Inner { disk, editor, .. } = &mut *guard;
-            editor.mark_dirty(disk).map_err(convert)?;
-        }
-        let result = action(&mut guard)?;
-        let Inner { disk, editor, .. } = &mut *guard;
+        editor.mark_dirty(disk).map_err(convert)?;
+        let result = action(disk, editor)?;
         editor.flush(disk).map_err(convert)?;
         Ok(result)
     }
@@ -244,6 +265,11 @@ impl FileSystem for Ext2Mount {
     fn sync(&self) -> VfsResult<()> {
         let mut guard = self.0.inner.lock();
         let Inner { disk, editor, .. } = &mut *guard;
+        // Тому, открытому на чтение, сбрасывать нечего: он не менялся и не
+        // помечался используемым, а значит и закрывать его не надо.
+        let Some(editor) = editor.as_mut() else {
+            return Ok(());
+        };
         editor.flush(disk).map_err(convert)?;
         disk.flush().map_err(|_| VfsError::Io)?;
         editor.mark_clean(disk).map_err(convert)
@@ -314,10 +340,9 @@ impl Node for Ext2Node {
         if self.inode.kind != ext2::FileType::Regular {
             return Err(VfsError::WrongKind);
         }
-        self.fs.change(|inner| {
-            inner
-                .editor
-                .write_at(&mut inner.disk, self.inode.number, offset, data)
+        self.fs.change(|disk, editor| {
+            editor
+                .write_at(disk, self.inode.number, offset, data)
                 .map_err(convert)
         })
     }
@@ -326,48 +351,43 @@ impl Node for Ext2Node {
         if self.inode.kind != ext2::FileType::Regular {
             return Err(VfsError::WrongKind);
         }
-        self.fs.change(|inner| {
-            inner
-                .editor
-                .truncate(&mut inner.disk, self.inode.number, size)
+        self.fs.change(|disk, editor| {
+            editor
+                .truncate(disk, self.inode.number, size)
                 .map_err(convert)
         })
     }
 
     fn create(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
-        let number = self.fs.change(|inner| {
-            inner
-                .editor
-                .create(&mut inner.disk, self.inode.number, name, mode, uid, gid)
+        let number = self.fs.change(|disk, editor| {
+            editor
+                .create(disk, self.inode.number, name, mode, uid, gid)
                 .map_err(convert)
         })?;
         self.child(number)
     }
 
     fn mkdir(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
-        let number = self.fs.change(|inner| {
-            inner
-                .editor
-                .mkdir(&mut inner.disk, self.inode.number, name, mode, uid, gid)
+        let number = self.fs.change(|disk, editor| {
+            editor
+                .mkdir(disk, self.inode.number, name, mode, uid, gid)
                 .map_err(convert)
         })?;
         self.child(number)
     }
 
     fn unlink(&self, name: &str) -> VfsResult<()> {
-        self.fs.change(|inner| {
-            inner
-                .editor
-                .unlink(&mut inner.disk, self.inode.number, name)
+        self.fs.change(|disk, editor| {
+            editor
+                .unlink(disk, self.inode.number, name)
                 .map_err(convert)
         })
     }
 
     fn rmdir(&self, name: &str) -> VfsResult<()> {
-        self.fs.change(|inner| {
-            inner
-                .editor
-                .rmdir(&mut inner.disk, self.inode.number, name)
+        self.fs.change(|disk, editor| {
+            editor
+                .rmdir(disk, self.inode.number, name)
                 .map_err(convert)
         })
     }

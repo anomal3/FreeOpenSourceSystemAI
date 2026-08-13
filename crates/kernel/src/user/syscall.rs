@@ -378,7 +378,10 @@ fn vfs_errno(err: VfsError) -> i64 {
         VfsError::NotFound => ERR_NOT_FOUND,
         VfsError::PermissionDenied => ERR_PERMISSION,
         VfsError::BadPath => ERR_BAD_PATH,
-        VfsError::WrongKind | VfsError::Unsupported => ERR_UNSUPPORTED,
+        // «Том только на чтение» для программы — тот же отказ, что и «эта ФС
+        // так не умеет»: сделать с этим она всё равно ничего не может, а
+        // объяснение, почему именно, уже напечатано ядром при загрузке.
+        VfsError::WrongKind | VfsError::Unsupported | VfsError::ReadOnly => ERR_UNSUPPORTED,
         VfsError::Exists => ERR_EXISTS,
         VfsError::NotEmpty => ERR_NOT_EMPTY,
         VfsError::NoSpace => ERR_NO_SPACE,
