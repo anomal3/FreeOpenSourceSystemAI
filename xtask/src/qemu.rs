@@ -49,6 +49,15 @@ pub enum DiskBus {
     Virtio,
     Ahci,
     Nvme,
+    /// NVMe с сектором 4096 байт — «4Kn».
+    ///
+    /// Не настройка эмулятора ради разнообразия: такой диск ломает всё, где
+    /// размер сектора был вписан числом. Заголовок GPT лежит по другому
+    /// адресу, суперблок ext2 попадает внутрь первого сектора, а FAT обязан
+    /// объявить `BytsPerSec = 4096`. Ровно поэтому ограничение «только 512»
+    /// держалось до Phase 26c с пометкой «проверить нечем» — а проверить, как
+    /// выяснилось, есть чем.
+    Nvme4k,
 }
 
 /// Манипулятор виртуальной машины.
@@ -290,9 +299,16 @@ fn attach_disk(
     drive: &Drive,
     bus: DiskBus,
     ahci_port: &mut usize,
+    multiple: bool,
 ) -> Result<()> {
     let bus = match drive {
+        // Каталог хоста подключается virtio всегда: с него грузится прошивка,
+        // а `ArmVirtQemu` не умеет ни SATA, ни 4Kn-носитель.
         Drive::HostDirectory(_) => DiskBus::Virtio,
+        // Первый носитель из нескольких — тоже загрузочный (установочный
+        // образ), и его шину менять нельзя по той же причине. Проверяемый диск
+        // в таких сценариях всегда последний.
+        _ if index == 0 && multiple => DiskBus::Virtio,
         _ => bus,
     };
     cmd.arg("-drive").arg(format!(
@@ -325,6 +341,12 @@ fn attach_disk(
                 &format!("nvme,drive=disk{index},serial=freeos{index}"),
             ]);
         }
+        DiskBus::Nvme4k => {
+            let device = format!(
+                "nvme,drive=disk{index},serial=freeos{index},logical_block_size=4096,physical_block_size=4096"
+            );
+            cmd.args(["-device", &device]);
+        }
     }
     Ok(())
 }
@@ -352,6 +374,7 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
             // и в OVMF, и в ArmVirtQemu.
             add_ahci_controller(&mut cmd, opts);
             let mut ahci_port = 0usize;
+            let multiple_disks = opts.drives.len() > 1;
             for (index, drive) in opts.drives.iter().enumerate() {
                 if let Drive::Cdrom(path) = drive {
                     // Привод, а не virtio-blk: так его подключает человек, и так
@@ -359,7 +382,7 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
                     cmd.args(["-cdrom", &util::qemu_path(path)?]);
                     continue;
                 }
-                attach_disk(&mut cmd, index, drive, opts.disk_bus, &mut ahci_port)?;
+                attach_disk(&mut cmd, index, drive, opts.disk_bus, &mut ahci_port, multiple_disks)?;
             }
             // Видео на q35 есть по умолчанию (stdvga), а QemuVideoDxe в OVMF
             // отдаёт по нему GOP с честным линейным framebuffer'ом — именно то,
@@ -376,6 +399,7 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
             // явно через virtio-blk-pci (VirtioBlkDxe есть в ArmVirtQemu).
             add_ahci_controller(&mut cmd, opts);
             let mut ahci_port = 0usize;
+            let multiple_disks = opts.drives.len() > 1;
             for (index, drive) in opts.drives.iter().enumerate() {
                 if let Drive::Cdrom(path) = drive {
                     // На `virt` привода нет вовсе, поэтому ISO подключается как
@@ -390,7 +414,7 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
                     cmd.args(["-device", &format!("scsi-cd,drive=cd{index}")]);
                     continue;
                 }
-                attach_disk(&mut cmd, index, drive, opts.disk_bus, &mut ahci_port)?;
+                attach_disk(&mut cmd, index, drive, opts.disk_bus, &mut ahci_port, multiple_disks)?;
             }
             // Графика: на virt по умолчанию НЕТ видеоустройства вообще.
             //

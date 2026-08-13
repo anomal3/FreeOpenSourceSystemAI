@@ -254,8 +254,8 @@ pub unsafe fn probe(root: &pci::Root) -> Vec<Nvme> {
             kprintln!(
                 "  nvme        : {} blocks of {} B ({} MiB)",
                 disk.blocks,
-                SECTOR_SIZE,
-                disk.blocks * SECTOR_SIZE as u64 / (1024 * 1024),
+                disk.block_size,
+                disk.blocks * disk.block_size as u64 / (1024 * 1024),
             );
             disks.push(disk);
         }

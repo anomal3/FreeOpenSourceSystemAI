@@ -80,7 +80,10 @@ pub fn format(
     if first_lba + sectors > dev.sector_count() {
         return Err(Error::TooSmall);
     }
-    let geometry = Geometry::plan(first_lba, sectors)?;
+    // Размер сектора берётся у носителя: он решает, сколько секторов занимает
+    // блок файловой системы и по какому LBA лежит каждый из них. Догадка здесь
+    // означала бы том, у которого все адреса смещены в восемь раз.
+    let geometry = Geometry::plan_on(first_lba, sectors, dev.sector_size())?;
     Writer::create(dev, geometry, options)?.into_editor(dev, options)
 }
 
@@ -93,7 +96,7 @@ pub fn format_with(
     options: &FormatOptions,
 ) -> Result<Editor> {
     disk::check_device(dev)?;
-    let geometry = Geometry::plan_with(first_lba, sectors, block_size)?;
+    let geometry = Geometry::plan_with_on(first_lba, sectors, block_size, dev.sector_size())?;
     Writer::create(dev, geometry, options)?.into_editor(dev, options)
 }
 
