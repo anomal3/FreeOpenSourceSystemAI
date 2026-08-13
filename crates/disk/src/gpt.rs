@@ -910,3 +910,92 @@ mod tests {
         assert_eq!(result, Err(Error::OutOfRange));
     }
 }
+
+#[cfg(test)]
+mod sector4k_tests {
+    use super::*;
+    use crate::mem::MemDisk;
+
+    /// Диск на 64 МиБ с сектором 4096.
+    const SECTORS_4K: u64 = 16 * 1024;
+    const SECTOR_4K: usize = 4096;
+
+    fn disk_4k() -> MemDisk {
+        MemDisk::with_sector_size(SECTORS_4K, SECTOR_4K).expect("образ 64 МиБ")
+    }
+
+    /// Таблица на 4Kn-диске занимает вчетверо меньше секторов — те же 16 КиБ.
+    #[test]
+    fn table_occupies_the_same_bytes_in_fewer_sectors() {
+        assert_eq!(entry_sectors(512), 32);
+        assert_eq!(entry_sectors(SECTOR_4K), 4);
+        assert_eq!(entry_sectors(512) * 512, entry_sectors(SECTOR_4K) * 4096);
+        // Первый доступный сектор сдвигается вместе с ней.
+        assert_eq!(first_usable_lba(512), 34);
+        assert_eq!(first_usable_lba(SECTOR_4K), 6);
+        // Выравнивание — мегабайт в обоих случаях, а не «2048 секторов».
+        assert_eq!(alignment_sectors(512) * 512, 1024 * 1024);
+        assert_eq!(alignment_sectors(SECTOR_4K) * 4096, 1024 * 1024);
+    }
+
+    /// Разметка 4Kn-диска: заголовок читается обратно, разделы на месте.
+    #[test]
+    fn partitions_a_4kn_disk() {
+        let mut dev = disk_4k();
+        let layout = plan(SECTORS_4K, SECTOR_4K, 16 * 1024 * 1024, true).expect("раскладка");
+        let root = layout.root.expect("корневой раздел");
+        // Границы выровнены на мегабайт, а не на 2048 секторов.
+        assert_eq!(layout.esp.first_lba % alignment_sectors(SECTOR_4K), 0);
+        assert_eq!(layout.esp.bytes(SECTOR_4K), 16 * 1024 * 1024);
+
+        wipe(&mut dev).expect("затирание");
+        write(
+            &mut dev,
+            Guid::new(0x1234_5678, 0x9ABC, 0xDEF0, [1, 2, 3, 4, 5, 6, 7, 8]),
+            &[
+                PartitionSpec {
+                    type_guid: ESP_TYPE,
+                    unique_guid: Guid::new(1, 2, 3, [0; 8]),
+                    first_lba: layout.esp.first_lba,
+                    last_lba: layout.esp.last_lba,
+                    attributes: 0,
+                    name: "EFI",
+                },
+                PartitionSpec {
+                    type_guid: FREEOS_ROOT_TYPE,
+                    unique_guid: Guid::new(4, 5, 6, [0; 8]),
+                    first_lba: root.first_lba,
+                    last_lba: root.last_lba,
+                    attributes: 0,
+                    name: "FreeOS",
+                },
+            ],
+        )
+        .expect("запись таблицы");
+
+        let table = read(&mut dev).expect("таблица читается обратно");
+        assert_eq!(table.partitions.len(), 2);
+        assert_eq!(table.first_usable_lba, first_usable_lba(SECTOR_4K));
+        assert_eq!(table.last_usable_lba, SECTORS_4K - 1 - backup_sectors(SECTOR_4K));
+        assert_eq!(table.find(FREEOS_ROOT_TYPE).expect("корень").first_lba, root.first_lba);
+    }
+
+    /// Подпись MBR стоит по 510-му **байту**, а не в конце сектора.
+    ///
+    /// На 4Kn-диске за ней остаётся ещё три с половиной килобайта нулей, и
+    /// утилита, ищущая подпись в конце сектора, такой диск не опознает — но
+    /// спецификация говорит именно про байт 510 от начала носителя.
+    #[test]
+    fn mbr_signature_sits_at_byte_510() {
+        let mut dev = disk_4k();
+        wipe(&mut dev).expect("затирание");
+        write(&mut dev, Guid::new(1, 2, 3, [0; 8]), &[]).expect("пустая таблица");
+
+        let bytes = dev.as_bytes();
+        assert_eq!(bytes[510], 0x55);
+        assert_eq!(bytes[511], 0xAA);
+        assert!(bytes[512..SECTOR_4K].iter().all(|&b| b == 0));
+        // Заголовок GPT лежит в секторе 1, то есть по байту 4096.
+        assert_eq!(&bytes[SECTOR_4K..SECTOR_4K + 8], b"EFI PART");
+    }
+}
