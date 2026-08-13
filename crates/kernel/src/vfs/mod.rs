@@ -70,6 +70,13 @@ pub enum VfsError {
     NotEmpty,
     /// На носителе кончилось место — блоки либо inode.
     NoSpace,
+    /// Том смонтирован только на чтение.
+    ///
+    /// Отдельно от [`VfsError::Unsupported`] намеренно: там «эта файловая
+    /// система так не умеет», здесь «умеет, но ей сейчас не дают». Первое —
+    /// свойство формата, второе — решение человека, и человек должен видеть
+    /// разницу.
+    ReadOnly,
 }
 
 impl fmt::Display for VfsError {
@@ -78,6 +85,7 @@ impl fmt::Display for VfsError {
             Self::NotFound => "no such file or directory",
             Self::Exists => "the name already exists",
             Self::NotEmpty => "the directory is not empty",
+            Self::ReadOnly => "the volume is mounted read-only",
             Self::NoSpace => "no space left on the device",
             Self::WrongKind => "path component is not of the expected kind",
             Self::BadPath => "malformed path",

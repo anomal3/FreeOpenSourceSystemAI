@@ -341,6 +341,8 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     // задержка попадёт в поправку, а не в ошибку.
     time::adopt_boot_clock(info.wall_clock, info.wall_clock_counter);
 
+    announce_boot_mode(&info);
+
     mount_initrd(&info);
     mount_disk_root(&info);
 
@@ -381,6 +383,15 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
 fn start_graphics(info: &BootInfo) {
     kprintln!();
     kprintln!("---- display ----------------------------------------------------");
+
+    // Безопасный режим — это в первую очередь **меньше**. Композитор занимает
+    // мегабайты под поверхности и рисует в память устройства, а ломается на
+    // чужой машине чаще всего именно графика: не завестись должно то, что
+    // может не завестись.
+    if info.safe_mode() {
+        kprintln!("  compositor  : not started, safe mode; the shell runs on the boot console");
+        return;
+    }
 
     if !info.framebuffer.is_present() {
         kprintln!("  compositor  : no framebuffer; the shell will run on the serial console");
@@ -620,9 +631,12 @@ fn mount_disk_root(info: &BootInfo) {
     // из-под себя: редактор держит счётчики свободного в памяти, и починка под
     // ним оставила бы его с числами, которых на диске уже нет.
     let mut device = partition.device;
-    check_root(&mut *device, first_lba);
+    check_root(&mut *device, first_lba, info.check_disk());
 
-    let mount = match fs::Ext2Fs::mount(device, first_lba) {
+    // Безопасный режим монтирует корень только на чтение — и это, вместе с
+    // отсутствующим рабочим столом, и есть весь безопасный режим: система, у
+    // которой меньше всего возможностей что-нибудь испортить.
+    let mount = match fs::Ext2Fs::mount(device, first_lba, !info.safe_mode()) {
         Ok(mount) => mount,
         Err(err) => {
             kprintln!("  root        : cannot mount ext2 at LBA {first_lba}: {err}");
@@ -647,10 +661,31 @@ fn mount_disk_root(info: &BootInfo) {
     } else {
         kprintln!("  root        : volume was NOT unmounted cleanly, counters may be stale");
     }
+    if info.safe_mode() {
+        kprintln!("  root        : mounted read-only, nothing will be written to it");
+    }
     kprintln!("  root        : replacing the initrd as /, {requests} disk request(s) so far");
     fs::set_root(alloc::boxed::Box::new(mount));
 
     verify_root();
+}
+
+/// Сказать вслух, каким режимом грузимся.
+///
+/// Строка есть всегда, а не только в безопасном режиме. Человек, приславший
+/// журнал, не должен доказывать, что грузился обычным образом; а система, не
+/// сказавшая о безопасном режиме, объяснила бы «пропавший» рабочий стол
+/// поломкой.
+fn announce_boot_mode(info: &BootInfo) {
+    kprintln!();
+    if info.safe_mode() {
+        kprintln!("  boot        : safe mode, no desktop, root read-only");
+    } else {
+        kprintln!("  boot        : normal mode");
+    }
+    if info.check_disk() {
+        kprintln!("  boot        : the root volume will be checked before mounting");
+    }
 }
 
 /// Проверить корневой том, если прошлый сеанс закрыл его не по-человечески.
@@ -659,19 +694,30 @@ fn mount_disk_root(info: &BootInfo) {
 /// обход стоит чтения всех таблиц inode и всех каталогов, то есть секунд на
 /// каждой загрузке. Признак чистого размонтирования (фаза 27) существует ровно
 /// затем, чтобы знать, когда это оправдано.
-fn check_root(device: &mut dyn disk::BlockDevice, first_lba: u64) {
-    match ext2::Ext2::is_clean(device, first_lba) {
-        Ok(true) => return,
-        Ok(false) => {}
+fn check_root(device: &mut dyn disk::BlockDevice, first_lba: u64, forced: bool) {
+    let clean = match ext2::Ext2::is_clean(device, first_lba) {
+        // Чистый том проверяется только по просьбе из меню загрузчика: цена
+        // полного обхода — секунды, и платить их на каждой загрузке незачем.
+        Ok(true) if !forced => return,
+        Ok(clean) => clean,
         Err(err) => {
             // Суперблок не читается вовсе. Проверка тут бессильна, а
             // монтирование ниже скажет о том же своими словами.
             kprintln!("  fsck        : cannot read the superblock: {err}");
             return;
         }
-    }
+    };
 
-    kprintln!("  fsck        : the volume was not closed cleanly, checking it");
+    // Причина названа в той же строке, что и сам факт проверки: «почему она
+    // идёт» — первый вопрос человека, увидевшего задержку на загрузке, и
+    // ответы на него разные.
+    if forced && clean {
+        kprintln!("  fsck        : checking the root volume (asked for in the boot menu)");
+    } else if forced {
+        kprintln!("  fsck        : checking the root volume (asked for, and it is dirty too)");
+    } else {
+        kprintln!("  fsck        : checking the root volume (it was not closed cleanly)");
+    }
     let report = match ext2::check(device, first_lba, ext2::Fix::Safe) {
         Ok(report) => report,
         Err(err) => {

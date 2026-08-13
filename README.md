@@ -1074,6 +1074,92 @@ something that had not happened once in twenty-six phases. `powerbtn` presses th
 button through the monitor and expects the same ending, and `desktop` walks the start menu
 into the confirmation window, checks that `N` really means no, and then answers `Y`.
 
+### Repairing the volume from inside
+
+ext2 has no journal — the crate header says so — and after a power cut its free
+counters can drift from its bitmaps, or a block can be marked used while
+belonging to no file at all. Until phase 28a the only cure was another computer
+running `e2fsck`, which is the same sentence as "reinstall Windows": it works,
+and it means the system cannot repair itself.
+
+The check follows e2fsck's order, and the order *is* the design. Inodes first:
+every in-use inode is decoded and its blocks collected, which yields the block
+bitmap as it ought to look. Then directories, where each entry must point at a
+live inode and every entry — including `.` and `..` — counts as one reference,
+which is exactly what `i_links_count` is supposed to hold. Then reachability
+from the root, which turns "has links" into "has a path". Then link counts. And
+only then the bitmaps and the free counters, because until that point there is
+nothing to compare them against. Repairing the bitmaps first would mean
+recomputing them after every later fix.
+
+What is repaired without asking is what is unambiguous: bitmaps, free counters,
+link counts, and the residue of an interrupted create — an inode marked in use
+with no links and no directory entry, which no path can reach and whose blocks
+belong to nobody. Everything that needs judgement is named and left alone: an
+entry pointing at a free inode (deleting it loses a name), a block claimed by
+two inodes, a pointer past the end of the volume. A file that lost its name is
+the case in between: it is neither deleted nor left invisible but moved to
+`/lost+found` under its inode number, which is what `e2fsck` does and for the
+same reason.
+
+It runs in two places. Automatically at mount — and only when the clean-unmount
+flag says it is warranted, since a full walk reads every inode table and every
+directory, which is seconds of every boot. And as `fsck` in the shell, which
+only looks: repairing under a live editor would leave that editor holding
+counters the disk no longer has, so the command says out loud that repairs
+happen at the next boot. The roadmap asked for `/bin/fsck` as a program; a
+ring-3 program cannot reach a block device, because no system call exposes one,
+so it is a shell command until it can be an honest program.
+
+Eight host tests corrupt an image deliberately — with the same crate that writes
+it — and check the repair, including one that zeroes a directory entry and then
+reads the rescued file back **through the foreign driver** as `/lost+found/#N`
+with its content intact. There is no real `e2fsck` on the development machine,
+which runs Windows, so the foreign verifier here is a reader (`ext4-view`): it
+catches anything that makes a volume unreadable but will not pronounce counters
+clean. That limit is written in the test module rather than papered over.
+
+### A menu, a safe mode, and a way back in
+
+A system that will not boot has to be repairable from itself. Phase 28b adds
+the ladder: boot parameters in the hand-off contract, a menu in the bootloader,
+and a mode that starts as little as possible.
+
+The menu waits half a second for a keypress, and that half-second is the whole
+design constraint — it is paid by *every* boot for the rest of time. Nothing
+else is spent: the choice is polled again, without waiting at all, just before
+the point of no return, which catches a key pressed while the kernel was
+loading. That second poll is not a nicety. On x86-64 the keyboard controller
+buffers a keystroke made before our code runs; on a machine whose keyboard
+arrives over USB there is nowhere to press until the firmware has enumerated
+it, and that finishes after our first window has closed. The keyboard is the
+firmware's own `Simple Text Input`, the one the installer already uses, so the
+menu works even where our USB stack does not come up at all.
+
+Safe mode is defined by what it leaves out: no desktop — the compositor is
+megabytes of surfaces and the thing most likely to fail on a strange machine —
+and a root mounted **read-only**. Read-only here means no editor is constructed
+at all, not a flag that every write path must remember to check: opening the
+editor is itself a write, since it marks the volume in use, and a safe mode that
+writes to the volume it promised not to touch would be a joke. Writes fail with
+"the volume is mounted read-only", which is deliberately a different error from
+"this filesystem cannot do that" — one is a property of the format, the other a
+decision a person made, and the person should be able to tell them apart.
+
+The recovery console is what falls out of the above rather than a fourth
+component: the shell and `fsck` live in the kernel and the initrd, which is on
+the ESP, so they work on a machine whose root volume will not mount at all.
+"Check the root volume" is its own menu entry, because the automatic check runs
+only on a volume that admits it is dirty, and damage does not always announce
+itself.
+
+One part of the roadmap's plan for this phase is not here: entering the menu
+automatically after repeated failed boots. It needs a counter that the
+bootloader writes and the kernel clears, and neither side can reach the other's
+storage yet — the kernel has no FAT writer for the ESP, and the bootloader has
+no ext2 reader. It lands with phase 32, where the same file gains its second
+consumer, and until then the menu is entered by hand.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -1082,7 +1168,7 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Twenty-six scenarios today: a program runs in an address space of its own, one that faults is
+Twenty-eight scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
@@ -1113,7 +1199,12 @@ and the installer writes, then the system boots from, a disk whose sectors are 4
 rather than 512 (`install4k`, `sector4k`); and the machine is reset without warning, then
 rebooted by command, then switched off — the volume calling itself dirty after the first and
 clean after the second, and the QEMU process ending on its own after the third (`power`),
-which it also does when the power button is pressed through the monitor (`powerbtn`).
+which it also does when the power button is pressed through the monitor (`powerbtn`); the
+machine is reset while it runs and the next boot checks the volume by itself before mounting
+it, with the file written before the reset still there afterwards (`fsck`); and the
+bootloader menu is entered from the keyboard, safe mode comes up with no desktop and a
+read-only root that refuses a write in so many words, and the volume is checked because the
+menu asked (`recovery`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -1333,8 +1424,8 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 26b | NVMe, which is what the disk in a laptop bought this decade is attached by | **done** |
 | 26c | The sector stops being a constant: 4Kn disks, now that QEMU can present one to test against | **done** |
 | 27 | Power: shut down and reboot, from the menu and from the power button, and a volume closed cleanly behind us | **done** |
-| 28a | `fsck`: the volume is repaired from inside the system, not from someone else's Linux | planned |
-| 28b | Safe mode and a boot menu: a recovery console in the initrd, so no failure needs a second computer | planned |
+| 28a | `fsck`: the volume is repaired from inside the system, not from someone else's Linux | **done** |
+| 28b | Safe mode and a boot menu: a recovery console in the initrd, so no failure needs a second computer | **done** |
 | 29 | A keyboard for a program: descriptor 0, and a terminal that understands ANSI | planned |
 | 29a | Vector and FP registers belong to a task, so two computing programs cannot see each other's numbers | planned |
 | 30 | `mc`: a two-pane file manager that is a program, not a part of the kernel | planned |
