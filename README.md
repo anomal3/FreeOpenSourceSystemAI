@@ -1285,13 +1285,17 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 41 | A file mapped into memory, paged in on demand — a model larger than RAM | planned |
 | 42 | Huge pages: a gigabyte of data stops costing a quarter of a million TLB entries | planned |
 | 43 | A second core: SMP, and every assumption that held because there was one | planned |
-| 44 | A window belongs to a program: surfaces and events across the system-call boundary | planned |
-| 45 | Settings, and icons on the desktop | planned |
-| 46 | btrfs, read-only: a volume `mkfs.btrfs` made, checksums verified | planned |
-| 47 | btrfs, written: copy-on-write, and the state partition moves onto it | planned |
-| 48 | DeviceTree beside ACPI, and the HAL split this README has promised since Phase 0 | planned |
-| 49 | A Raspberry Pi 4: the first machine that is not an emulator | planned |
-| 50+ | A phone: an Android boot image, no UEFI, no ACPI, and a framebuffer left by the bootloader | planned |
+| 44 | The system calls a C library needs, and the ABI fixed as a contract | planned |
+| 45 | A libc in the spirit of newlib — ours underneath, not Linux's | planned |
+| 46 | A toolchain: somebody else's project builds for FreeOS without patching its source | planned |
+| 47 | `llama.cpp`, rebuilt for FreeOS, answers a question typed into the terminal | planned |
+| 48 | A window belongs to a program: surfaces and events across the system-call boundary | planned |
+| 49 | Settings, and icons on the desktop | planned |
+| 50 | btrfs, read-only: a volume `mkfs.btrfs` made, checksums verified | planned |
+| 51 | btrfs, written: copy-on-write, and the state partition moves onto it | planned |
+| 52 | DeviceTree beside ACPI, and the HAL split this README has promised since Phase 0 | planned |
+| 53 | A Raspberry Pi 4: the first machine that is not an emulator | planned |
+| 54+ | A phone: an Android boot image, no UEFI, no ACPI, and a framebuffer left by the bootloader | planned |
 
 The reasoning behind that order — what each phase is for, what checks it, what is known to
 be waiting to go wrong in it, and how large it is — is in [ROADMAP.md](ROADMAP.md), along
@@ -1307,7 +1311,15 @@ partitioning code inside a UEFI application instead of in a test. Phase 12 split
 way: address spaces are page-table work in two architecture modules, permissions are
 filesystem work along the whole VFS path, and they share nothing but the phase number.
 
-Deliberately out of scope for now, but not architecturally blocked: a PE loader and a
+Binary compatibility with Linux is deliberately **not** a goal, and the reasoning is in
+[ROADMAP.md](ROADMAP.md): everything one would want it for — `llama.cpp`, .NET, the JVM,
+Wine — is open source and gets rebuilt rather than emulated, which a native POSIX-shaped
+ABI and a libc are enough for. What it uniquely buys is running closed Linux binaries, and
+the price is that system-call semantics stop being ours. It stays addable later beside the
+native ABI, the way FreeBSD's Linuxulator is, if some specific closed binary ever justifies
+it.
+
+Also deliberately out of scope for now, but not architecturally blocked: a PE loader and a
 Wine-style Win32 compatibility layer. The kernel avoids ELF/Unix-only assumptions — loaders
 sit behind a trait, kernel objects are handle-based, and page protection flags are an open
 bitflag set rather than a three-bit Unix enum.
