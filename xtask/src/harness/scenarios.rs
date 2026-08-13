@@ -146,6 +146,26 @@ pub enum Step {
     Wait(u64),
     /// Снять экран.
     Shot(&'static str),
+    /// Сбросить машину, ничего не спрашивая у гостя (`system_reset` монитора).
+    ///
+    /// Это и есть «выдернули шнур»: система не получает ни уведомления, ни
+    /// возможности что-нибудь дописать. Единственный способ проверить, что
+    /// брошенный том действительно объявляется грязным при следующей загрузке —
+    /// корректное выключение проверяет ровно противоположное утверждение.
+    Reset,
+    /// Нажать кнопку питания (`system_powerdown` монитора).
+    ///
+    /// Не то же самое, что команда `shutdown`: команду выполняет оболочка, а
+    /// кнопку — обработчик прерывания и служебная задача, и путь от чипсета до
+    /// сброса тома на диск проверяется только так.
+    PowerButton,
+    /// Дождаться, пока **процесс QEMU завершится сам** (мс).
+    ///
+    /// Самая сильная проверка выключения из возможных: до этой фазы стенд
+    /// всегда снимал QEMU принудительно, потому что гость не умел гаснуть. Если
+    /// процесс ушёл сам — значит гость действительно выполнил команду ACPI (или
+    /// PSCI), а не просто напечатал, что собирается.
+    Exits(u64),
 }
 
 pub struct Scenario {
@@ -183,6 +203,14 @@ pub struct Scenario {
     pub disk_bus: DiskBus,
     /// Архитектуры, на которых сценарий имеет смысл. Пусто — все.
     pub arches: &'static [Arch],
+    /// Сценарий **намеренно** перезагружает машину.
+    ///
+    /// Обычно стенд запускает QEMU с `-no-reboot`, и это правильно: перезагрузка
+    /// в сценарии, который её не заказывал, означает тройную ошибку, а без флага
+    /// она превратилась бы в бесконечный цикл загрузок вместо внятного отказа.
+    /// Ровно один сценарий проверяет саму перезагрузку — ему флаг мешает, потому
+    /// что с ним QEMU завершается там, где машина должна подняться заново.
+    pub reboots: bool,
 }
 
 impl Scenario {
@@ -217,6 +245,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await(crate::version::KERNEL_BANNER, BOOT),
@@ -247,6 +276,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -297,6 +327,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -356,9 +387,34 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("windows,", 30_000),
             Step::Shot("05-desktop"),
-            Step::Type("exit"),
+            // Меню умеет не только запускать. Пятый пункт — «Shut down», и он
+            // открывает не выключение, а вопрос: подтверждение сделано обычным
+            // окном, потому что человек уже знает, как закрываются окна.
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Repeat("down", 4),
             Step::Key("ret"),
-            Step::Await("finishing the session", 30_000),
+            Step::Await("desktop     : opened 'Shut down'", 15_000),
+            Step::Wait(2_500),
+            Step::Shot("06-shutdown"),
+            // «Нет» обязано означать «нет»: машина остаётся работать, окно
+            // закрывается, и об отказе сказано вслух.
+            Step::Key("n"),
+            Step::Await("desktop     : 'Shut down' cancelled", 15_000),
+            Step::Absent("shutting down"),
+            // А «да» гасит машину. Путь тут другой, чем у команды `shutdown`:
+            // ответ разбирается под замком рабочего стола, где ни ждать диск,
+            // ни ждать прерывание нельзя, поэтому окно только поднимает
+            // просьбу — а гасит систему служебная задача.
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Repeat("down", 4),
+            Step::Key("ret"),
+            Step::Await("desktop     : opened 'Shut down'", 15_000),
+            Step::Key("y"),
+            Step::Await("power       : confirmed in the start menu", 15_000),
+            Step::Await("shutting down", 15_000),
+            Step::Exits(30_000),
             Step::Absent("KERNEL PANIC"),
         ],
     },
@@ -370,6 +426,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -435,6 +492,7 @@ pub const ALL: &[Scenario] = &[
         tablet: true,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -493,6 +551,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -549,6 +608,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[Arch::X86_64],
+        reboots: false,
         // Свойство накапливается к уже заданной машине `q35`, как и `i8042=off`
         // у `usb_only`. Так воспроизводится VirtualBox: там PIT существует, но
         // измерить по нему частоту локального APIC не удаётся, и система
@@ -581,6 +641,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -708,6 +769,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -750,6 +812,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -799,6 +862,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -845,6 +909,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             // Время системы считает счётчик, который идёт сам, а не тики
@@ -896,6 +961,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             // Это утверждение фазы целиком: прошивка нашла на носителе
@@ -929,6 +995,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         // Только AArch64: на x86-64 GIC не существует.
         arches: &[Arch::Aarch64],
+        reboots: false,
         // Свойство накапливается к уже заданной машине `virt`. Версия по
         // умолчанию — та, что выбрал QEMU; здесь она задана явно, потому что
         // проверяется именно другая ветка кода.
@@ -962,6 +1029,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -982,6 +1050,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             // На VVFAT таблицы разделов не существует вовсе — QEMU синтезирует
@@ -1003,6 +1072,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("FreeOS installer", BOOT),
@@ -1056,9 +1126,15 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
+            // Первая загрузка после установки обязана застать том закрытым:
+            // установщик помечает его используемым на время работы и чистым в
+            // конце. Строка здесь проверяет вторую половину — а первую проверять
+            // нечем, кроме прерванной установки, которой стенд не умеет.
+            Step::Await("root        : volume was unmounted cleanly", 15_000),
             // Это и есть доказательство цепочки virtio-blk → GPT → ext2 → VFS:
             // ядро читает файл, который записал установщик.
             Step::Await("account     : /etc/passwd", 30_000),
@@ -1120,6 +1196,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1198,6 +1275,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             // Это отдельная загрузка того же диска. Всё, что проверяется ниже,
@@ -1224,6 +1302,93 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "power",
+        about: "Машину можно выключить и перезагрузить, и том закрывается за собой чисто.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        arches: &[],
+        // Единственный сценарий, в котором перезагрузка — цель, а не симптом.
+        reboots: true,
+        extra: &[],
+        steps: &[
+            // Первая загрузка. Каким том был до неё, не утверждаем: предыдущий
+            // сценарий закончился снятием QEMU, но порядок сценариев — не то, на
+            // чём стоит строить проверку. Обе интересные ситуации сценарий
+            // создаёт сам, ниже.
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 30_000),
+
+            // --- случай первый: машину бросили ---------------------------
+            //
+            // Запись меняет счётчики свободного, а признак «том используется»
+            // стоит на диске с самого монтирования. Дальше машина сбрасывается
+            // без предупреждения — это и есть пропавшее питание.
+            Step::Line("echo before-the-crash > /home/roman/crash.txt"),
+            Step::Await("wrote 17 bytes", 15_000),
+            Step::Reset,
+            // Вторая загрузка обязана сказать, что том закрыт не был. Строка
+            // печатается при монтировании и до всякой оболочки.
+            Step::Await("root        : volume was NOT unmounted cleanly", BOOT),
+            Step::Await("freeos> ", 30_000),
+            // Данные при этом целы: том грязный — это про счётчики, а не про
+            // содержимое файлов.
+            Step::Line("cat /home/roman/crash.txt"),
+            Step::Await("before-the-crash", 15_000),
+
+            // --- случай второй: машину перезагрузили командой -------------
+            Step::Line("reboot"),
+            Step::Await("restarting", 15_000),
+            Step::Await("root        : flushed and marked clean", 30_000),
+            Step::Await("power       : ", 15_000),
+            // Третья загрузка — и вот теперь том обязан быть чистым. Это и есть
+            // всё утверждение фазы 27, целиком и в одной строке.
+            Step::Await("root        : volume was unmounted cleanly", BOOT),
+            Step::Await("freeos> ", 30_000),
+
+            // --- случай третий: машину выключили --------------------------
+            //
+            // Здесь проверяется то, чего не случалось ни разу за двадцать шесть
+            // фаз: процесс QEMU заканчивается сам, потому что гость снял
+            // питание.
+            Step::Line("shutdown"),
+            Step::Await("shutting down", 15_000),
+            Step::Await("root        : flushed and marked clean", 30_000),
+            Step::Exits(30_000),
+            Step::Absent("KERNEL PANIC"),
+            Step::Absent("the machine refused to go down"),
+        ],
+    },
+    Scenario {
+        name: "powerbtn",
+        about: "Кнопка питания: событие ACPI доходит до системы, и она гаснет по-настоящему.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        // Только x86-64, и это не упущение. В QEMU `virt` кнопку приносит ACPI
+        // GED, описанный в AML: без интерпретатора событие не разобрать, и ядро
+        // говорит об этом вслух при загрузке. Проверяем то, что работает.
+        arches: &[Arch::X86_64],
+        reboots: false,
+        extra: &[],
+        steps: &[
+            // Кнопка заведена при загрузке — и сказано, каким вектором и с
+            // какого входа. Без этой строки «нажали и выключилось» не отличить
+            // от «нажали, а выключил кто-то другой».
+            Step::Await("power       : power button on vector", BOOT),
+            Step::Await("freeos> ", 30_000),
+            Step::PowerButton,
+            // Нажатие видит обработчик прерывания, а печатает задача: строка
+            // приходит уже из неё.
+            Step::Await("power       : power button pressed", 30_000),
+            Step::Await("root        : flushed and marked clean", 30_000),
+            Step::Exits(30_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "ahci",
         about: "Тот же установленный диск, подключённый по SATA: корень находится через AHCI.",
         target: Target::LiveAndDisk,
@@ -1231,6 +1396,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Ahci,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             // Сначала — что найден именно контроллер AHCI, а не что-то, что
@@ -1275,6 +1441,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Nvme,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             // Версия и шаг звонков читаются из регистров контроллера: получить
@@ -1313,6 +1480,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Nvme4k,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             Step::Await("FreeOS installer", BOOT),
@@ -1356,6 +1524,7 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Nvme4k,
         arches: &[],
+        reboots: false,
         extra: &[],
         steps: &[
             // Диск объявляет свой блок сам, и ядро его принимает, а не

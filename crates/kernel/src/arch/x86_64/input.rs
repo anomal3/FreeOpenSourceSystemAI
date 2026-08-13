@@ -19,7 +19,7 @@
 
 use boot_info::BootInfo;
 
-use super::{acpi, apic, i8042, ioapic};
+use super::{acpi, apic, i8042, ioapic, power};
 use crate::input::Sources;
 use crate::kprintln;
 use crate::mm::PhysAddr;
@@ -70,6 +70,12 @@ pub fn init(info: &BootInfo) -> Sources {
         // кодом, которого нет на второй архитектуре.
         mouse: false,
     };
+
+    // Кнопка питания заводится здесь по той же причине, по которой здесь стоит
+    // клавиатура: это единственное место, где в руках одновременно и I/O APIC,
+    // и MADT, и получатель прерываний. Кнопка — тоже устройство ввода, просто с
+    // одной клавишей и одним последствием.
+    start_power_button(&io_apic, madt.as_ref(), destination, info.acpi_rsdp);
 
     *IO_APIC.lock() = Some(io_apic);
     crate::input::set_sources(sources);
@@ -227,6 +233,56 @@ fn start_serial(
         kprintln!("  serial in   : COM1 receive interrupt could not be routed");
     }
     routed
+}
+
+/// Завести кнопку питания.
+///
+/// Возвращает `true`, если нажатие действительно дойдёт до системы. Отказ не
+/// фатален и не молчалив: на машине без работающей кнопки остаются команда
+/// `shutdown` и пункт меню, а вот тихо считать кнопку рабочей нельзя — человек
+/// нажмёт её и решит, что сломана система.
+fn start_power_button(
+    io_apic: &ioapic::IoApic,
+    madt: Option<&acpi::Madt>,
+    destination: Option<Destination>,
+    rsdp: u64,
+) -> bool {
+    // SAFETY: вызывается однократно, до размаскирования входа; RSDP пришёл от
+    // прошивки через hand-off.
+    let Some(gsi) = (unsafe { power::prepare_button(rsdp) }) else {
+        // Молчать здесь нельзя. Отсутствие строки о кнопке человек прочитает
+        // как «наверное, работает», нажмёт её и решит, что сломалась система, —
+        // а сломан всего лишь один путь из трёх.
+        kprintln!("  power       : no working power button; use 'shutdown' or the start menu");
+        return false;
+    };
+    let Some(Destination(destination)) = destination else {
+        kprintln!("  power       : the power button cannot be routed to this processor");
+        return false;
+    };
+
+    // `SCI_INT` — это уже номер GSI, а не IRQ шины ISA, поэтому переопределение
+    // ищется по нему, а не по источнику. Умолчание для SCI своё: спецификация
+    // описывает эту линию как срабатывающую по уровню и разделяемую, тогда как
+    // для ISA принят фронт. Прошивка QEMU переопределение объявляет, и в дело
+    // идут её флаги; умолчание остаётся для машин, которые молчат.
+    let over = madt.and_then(|madt| madt.overrides().iter().copied().find(|entry| entry.gsi == gsi));
+    let level = over.is_none_or(|entry| entry.level_triggered());
+    let active_low = over.is_some_and(|entry| entry.active_low());
+
+    // SAFETY: обработчик вектора установлен `interrupts::init`, событие в
+    // чипсете уже разрешено `prepare_button`.
+    if unsafe { io_apic.route(gsi, apic::VECTOR_SCI, destination, level, active_low) } {
+        kprintln!(
+            "  power       : power button on vector {:#04x} (ACPI SCI, GSI {gsi}, {})",
+            apic::VECTOR_SCI,
+            if level { "level" } else { "edge" }
+        );
+        true
+    } else {
+        kprintln!("  power       : ACPI SCI is GSI {gsi}, which this I/O APIC does not serve");
+        false
+    }
 }
 
 /// Направить IRQ шины ISA в вектор, учитывая переопределение из MADT.

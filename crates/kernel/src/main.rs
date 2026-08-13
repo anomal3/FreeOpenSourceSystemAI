@@ -48,6 +48,7 @@ mod input;
 mod irq;
 mod mm;
 mod pci;
+mod power;
 mod print;
 mod sched;
 mod serial;
@@ -459,6 +460,11 @@ fn run_session(have_input: bool) -> ! {
         }
     }
 
+    // Задача, гасящая машину по просьбе кнопки. Заводится всегда, а не только
+    // там, где кнопка есть: она же исполняет просьбу от рабочего стола, а её
+    // отсутствие означало бы нажатие, о котором некому вспомнить.
+    power::start();
+
     if have_input {
         if let Err(err) = sched::spawn("shell", shell::task) {
             kprintln!("  spawn shell failed: {err}");
@@ -626,6 +632,15 @@ fn mount_disk_root(info: &BootInfo) {
     kprintln!(
         "  root        : ext2 at LBA {first_lba}, {blocks} blocks of {block_size} B in {groups} group(s)"
     );
+    // Состояние тома из суперблока — первое, что стоит сказать о найденном
+    // корне. «Грязный» том не мешает загрузке и не должен мешать: система,
+    // отказывающаяся включаться после пропажи питания, хуже той, что честно
+    // говорит о том, чего не знает.
+    if mount.was_clean() {
+        kprintln!("  root        : volume was unmounted cleanly");
+    } else {
+        kprintln!("  root        : volume was NOT unmounted cleanly, counters may be stale");
+    }
     kprintln!("  root        : replacing the initrd as /, {requests} disk request(s) so far");
     fs::set_root(alloc::boxed::Box::new(mount));
 
