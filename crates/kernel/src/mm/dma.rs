@@ -18,17 +18,35 @@
 //! кешируемая память, и переотобразить их иначе нельзя — это задело бы чужие
 //! аллокации, живущие на той же странице.
 //!
-//! # Почему нет освобождения
+//! # Окно выделяется целиком и один раз
 //!
-//! Аллокатор — счётчик, растущий в одну сторону. Так сделано осознанно: всё, что
-//! ядро сейчас выделяет под DMA, живёт до конца работы (кольца контроллера,
-//! контексты устройств, буферы отчётов), а освобождение потребовало бы либо
-//! списка свободных блоков, либо снятия отображений — то есть кода, у которого
-//! пока нет ни одного вызывающего. Появится горячее подключение устройств —
-//! появится и он; проектировать его заранее значит угадывать.
+//! Сначала аллокатор был счётчиком, растущим в одну сторону: всё, что ядро
+//! выделяло под DMA, жило до конца работы. Горячее подключение устройств это
+//! допущение отменило — устройство, воткнутое и вынутое сто раз, исчерпало бы
+//! окно.
 //!
-//! Утечка при этом не бесшумна: окно ограничено [`DMA_SIZE`], и исчерпание
-//! возвращает ошибку, а не тихо портит соседние страницы.
+//! Освобождение сделано не списком блоков и не снятием отображений, а проще:
+//! **весь [`DMA_SIZE`] берётся из пула одним непрерывным куском при первом
+//! запросе и отображается целиком**. Дальше выделение и освобождение — это
+//! пометки в битовой карте страниц окна, без единого обращения ни к пулу
+//! кадров, ни к таблицам страниц.
+//!
+//! Так получаются три свойства сразу, и каждое из них иначе стоило бы кода:
+//!
+//! * **физическая непрерывность любого буфера** — весь регион непрерывен по
+//!   построению, поэтому и любой его отрезок тоже;
+//! * **никаких висячих отображений** — страницы окна отображены на свои кадры
+//!   всё время работы, и освобождение буфера ничего не переотображает. Снятие
+//!   отображения потребовало бы сброса TLB на обеих архитектурах, а ошибка в
+//!   нём — это чтение памяти, отданной кому-то другому;
+//! * **кадр не возвращается в общий пул и не может быть выдан дважды** — что
+//!   особенно важно на AArch64, где второй псевдоним той же страницы с другим
+//!   атрибутом кеширования запрещён архитектурой.
+//!
+//! Цена — два мегабайта, занятые под окно даже тогда, когда используется
+//! килобайт. На машине, которой ядро требует хотя бы 64 МиБ, это три процента,
+//! и они окупаются тем, что «кончилась память под DMA» больше не зависит от
+//! истории подключений.
 //!
 //! # Двойное отображение и AArch64
 //!
@@ -41,10 +59,14 @@
 //! [`DmaBuffer`] знает только свой некешируемый. Так же устроен
 //! `dma_alloc_coherent` в Linux на arm64.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::arch;
 use crate::mm::{DMA_BASE, DMA_SIZE, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr, frame};
+use crate::sync::SpinLock;
+
+/// Сколько страниц в окне.
+const PAGES: usize = DMA_SIZE / PAGE_SIZE;
+/// Сколько слов в битовой карте занятости.
+const WORDS: usize = PAGES.div_ceil(64);
 
 /// Почему буфер не удалось выделить.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,8 +96,61 @@ impl core::fmt::Display for DmaError {
     }
 }
 
-/// Сколько байт окна уже роздано.
-static USED: AtomicUsize = AtomicUsize::new(0);
+/// Состояние окна: где оно в физической памяти и какие страницы заняты.
+struct Window {
+    /// Физический адрес начала; `None` — окно ещё не создано.
+    base: Option<PhysAddr>,
+    /// По биту на страницу: единица — страница занята.
+    used: [u64; WORDS],
+    /// Сколько страниц занято сейчас.
+    busy: usize,
+    /// Сколько было занято в пике. Освобождение прячет утечку от глаз —
+    /// счётчик занятых снова падает до прежнего, — а пик показывает, сколько
+    /// окна на самом деле нужно этой машине.
+    peak: usize,
+}
+
+impl Window {
+    const fn new() -> Self {
+        Self { base: None, used: [0; WORDS], busy: 0, peak: 0 }
+    }
+
+    /// Свободна ли страница.
+    const fn is_free(&self, page: usize) -> bool {
+        self.used[page / 64] & (1 << (page % 64)) == 0
+    }
+
+    fn set(&mut self, page: usize, busy: bool) {
+        let mask = 1u64 << (page % 64);
+        if busy {
+            self.used[page / 64] |= mask;
+        } else {
+            self.used[page / 64] &= !mask;
+        }
+    }
+
+    /// Найти `count` подряд идущих свободных страниц.
+    ///
+    /// Первый подходящий отрезок, а не наименьший: буферы здесь либо страница,
+    /// либо страницы кольца, и разница между стратегиями на пятистах страницах
+    /// не окупает кода, который её реализует.
+    fn find_run(&self, count: usize) -> Option<usize> {
+        let mut run = 0;
+        for page in 0..PAGES {
+            if self.is_free(page) {
+                run += 1;
+                if run == count {
+                    return Some(page + 1 - count);
+                }
+            } else {
+                run = 0;
+            }
+        }
+        None
+    }
+}
+
+static WINDOW: SpinLock<Window> = SpinLock::new(Window::new());
 
 /// Буфер, к которому обращаются и процессор, и устройство.
 ///
@@ -156,35 +231,105 @@ pub fn alloc(bytes: usize) -> Result<DmaBuffer, DmaError> {
     let len = bytes.next_multiple_of(PAGE_SIZE);
     let pages = len / PAGE_SIZE;
 
-    // Место в окне занимается до выделения кадров: если окно кончилось, кадры
-    // трогать незачем.
-    let offset = USED.fetch_add(len, Ordering::Relaxed);
-    if offset + len > DMA_SIZE {
-        // Счётчик не откатывается: конкурентный вызов мог уже занять место за
-        // нами, и «вернуть» его значит отдать чужое. Окно всё равно исчерпано, а
-        // потерянные байты в исчерпанном окне ничего не меняют.
-        return Err(DmaError::WindowExhausted { requested: len, left: DMA_SIZE.saturating_sub(offset) });
+    let mut window = WINDOW.lock();
+    let base = ensure_window(&mut window)?;
+
+    let start = window.find_run(pages).ok_or(DmaError::WindowExhausted {
+        requested: len,
+        left: (PAGES - window.busy) * PAGE_SIZE,
+    })?;
+    for page in start..start + pages {
+        window.set(page, true);
     }
+    window.busy += pages;
+    window.peak = window.peak.max(window.busy);
 
-    let phys = frame::with(|frames| frames.allocate_contiguous(pages))
-        .ok_or(DmaError::NoFrameAllocator)?
-        .ok_or(DmaError::NoContiguousFrames { pages })?;
-
-    let virt = VirtAddr::new(DMA_BASE + offset);
-    let flags = PageFlags::READ | PageFlags::WRITE | PageFlags::DMA;
-    // SAFETY: ядро исполняется на собственных таблицах (буферы DMA выделяются
-    // сильно позже `take_over_memory`), а диапазон окна DMA не пересекается ни с
-    // кодом, ни со стеком, ни с кучей — он отведён под это и только под это, и
-    // каждый адрес в нём выдаётся ровно один раз.
-    unsafe { arch::map_active(virt, phys, len, flags) }.map_err(DmaError::MapFailed)?;
-
-    let buffer = DmaBuffer { virt, phys, len };
+    let offset = start * PAGE_SIZE;
+    let buffer = DmaBuffer {
+        virt: VirtAddr::new(DMA_BASE + offset),
+        phys: PhysAddr::new(base.as_u64() + offset as u64),
+        len,
+    };
+    // Обнуление — вне лока не выйдет: буфер уже наш, но лок держится с
+    // запрещёнными прерываниями, и заполнение мегабайтного кольца под ним
+    // задержало бы таймер. Кольца здесь по странице, поэтому это допустимо; при
+    // буферах в сотни килобайт лок пришлось бы отпускать.
     buffer.zero();
     Ok(buffer)
 }
 
-/// Сколько байт окна роздано и сколько всего.
+/// Вернуть буфер в окно.
+///
+/// Отображение при этом не снимается — страницы окна остаются отображёнными на
+/// свои кадры навсегда, см. заголовок модуля. Возвращается только право их
+/// занимать.
+///
+/// # Safety
+///
+/// Устройство не должно больше обращаться к этому буферу. Освободить кольцо,
+/// адрес которого всё ещё лежит в регистре контроллера, — значит отдать его
+/// содержимое следующему, кто попросит память под DMA, а контроллер продолжит
+/// читать оттуда дескрипторы.
+pub unsafe fn free(buffer: &DmaBuffer) {
+    if buffer.len == 0 {
+        return;
+    }
+    let Some(offset) = buffer.virt.as_usize().checked_sub(DMA_BASE) else {
+        return;
+    };
+    let start = offset / PAGE_SIZE;
+    let pages = buffer.len / PAGE_SIZE;
+    if start + pages > PAGES {
+        return;
+    }
+
+    let mut window = WINDOW.lock();
+    for page in start..start + pages {
+        // Двойное освобождение — ошибка вызывающего, но молчать о ней нельзя:
+        // страница, освобождённая дважды, будет выдана двоим.
+        if window.is_free(page) {
+            crate::kprintln!("WARNING: DMA page {page} freed twice");
+            continue;
+        }
+        window.set(page, false);
+        window.busy -= 1;
+    }
+}
+
+/// Создать окно, если его ещё нет, и вернуть его физический адрес.
+fn ensure_window(window: &mut Window) -> Result<PhysAddr, DmaError> {
+    if let Some(base) = window.base {
+        return Ok(base);
+    }
+
+    let base = frame::with(|frames| frames.allocate_contiguous(PAGES))
+        .ok_or(DmaError::NoFrameAllocator)?
+        .ok_or(DmaError::NoContiguousFrames { pages: PAGES })?;
+
+    let flags = PageFlags::READ | PageFlags::WRITE | PageFlags::DMA;
+    // SAFETY: ядро исполняется на собственных таблицах (буферы DMA выделяются
+    // сильно позже `take_over_memory`), а диапазон окна DMA не пересекается ни с
+    // кодом, ни со стеком, ни с кучей — он отведён под это и только под это, и
+    // отображается ровно один раз за всё время работы.
+    unsafe { arch::map_active(VirtAddr::new(DMA_BASE), base, DMA_SIZE, flags) }
+        .map_err(DmaError::MapFailed)?;
+
+    window.base = Some(base);
+    Ok(base)
+}
+
+/// Сколько байт окна занято и сколько всего.
 #[must_use]
 pub fn stats() -> (usize, usize) {
-    (USED.load(Ordering::Relaxed).min(DMA_SIZE), DMA_SIZE)
+    (WINDOW.lock().busy * PAGE_SIZE, DMA_SIZE)
+}
+
+/// Наибольшая занятость окна за всё время, в байтах.
+///
+/// Отличается от [`stats`] тем, что не забывает: буфер, выделенный и
+/// освобождённый, из первого счётчика исчезает, а из этого — нет. Именно по
+/// нему видно, хватает ли окна машине, на которой устройства втыкают и вынимают.
+#[must_use]
+pub fn peak() -> usize {
+    WINDOW.lock().peak * PAGE_SIZE
 }

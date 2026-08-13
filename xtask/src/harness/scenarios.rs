@@ -479,6 +479,26 @@ pub const ALL: &[Scenario] = &[
             Step::Await("is gone, freeing slot", 20_000),
             Step::Line("usb"),
             Step::Await("  xhci     2 devices", 15_000),
+            // И память вернулась. Проверяется числом, а не словом: до фазы 25
+            // окно DMA умело только расти, и десять подключений подряд его
+            // исчерпывали. Значение снимается сейчас, а сверяется после ещё
+            // трёх кругов — если освобождение не работает, оно вырастет.
+            Step::Line("mem"),
+            Step::Capture("  dma      ", 15_000),
+            Step::Plug("usb-tablet,bus=xhci.0,id=again1"),
+            Step::Await("usb         : now 3 device(s)", 20_000),
+            Step::Unplug("again1"),
+            Step::Await("is gone, freeing slot", 20_000),
+            Step::Plug("usb-tablet,bus=xhci.0,id=again2"),
+            Step::Await("usb         : now 3 device(s)", 20_000),
+            Step::Unplug("again2"),
+            Step::Await("is gone, freeing slot", 20_000),
+            Step::Plug("usb-tablet,bus=xhci.0,id=again3"),
+            Step::Await("usb         : now 3 device(s)", 20_000),
+            Step::Unplug("again3"),
+            Step::Await("is gone, freeing slot", 20_000),
+            Step::Line("mem"),
+            Step::Await("  dma      {} of", 15_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 24 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 25 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -729,6 +729,27 @@ it up and parses its descriptor, then pulls it with `device_del` and asserts the
 back. Both paths are exercised: x86-64 has MSI-X and finds out by event, ARM has no MSI-X
 here and finds out by the mask.
 
+### Memory that comes back
+
+The DMA allocator was a counter that only went up. That was honest while everything it
+handed out lived until shutdown, and hot-plug ended it: a device plugged and pulled enough
+times would exhaust the window.
+
+Freeing could have meant a list of blocks, or unmapping pages and shooting down TLB entries
+on two architectures. It means neither. The whole window is taken from the frame pool in
+one contiguous piece at the first request and mapped once; allocation and freeing are bits
+in a bitmap over its pages. Three properties fall out of that rather than being coded:
+any buffer is physically contiguous because the whole region is; nothing is ever unmapped,
+so no stale mapping can outlive its buffer; and a frame is never returned to the general
+pool, which matters on AArch64 where a second alias of the same page with a different
+cacheability attribute is architecturally forbidden.
+
+The cost is two megabytes reserved whether or not they are used. The shell prints current
+and peak occupancy side by side, because it is the gap between them that answers "is this
+leaking" — a buffer taken and returned leaves the first number where it was and the second
+one higher. The bench plugs and pulls a tablet three times and asserts the first number is
+exactly what it was before.
+
 ### A second opinion about the clock
 
 `-machine pit=off` is not a hypothetical. On VirtualBox the x86-64 side came up with no
@@ -1093,6 +1114,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 22 | The interrupt controller is read from ACPI, not guessed, and GICv3 works | **done** |
 | 23 | The device describes itself: HID report descriptors, so a tablet is a mouse; PCI without MCFG, the UART from ACPI, and a second source for the clock | **done** |
 | 24 | Devices arrive after the kernel does: hot-plug, and a slot that comes back when one leaves | **done** |
+| 25 | Memory that comes back: the DMA window becomes a pool instead of a counter | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

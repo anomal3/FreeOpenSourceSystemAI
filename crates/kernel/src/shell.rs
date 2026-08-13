@@ -525,7 +525,13 @@ fn memory() {
     let heap = mm::heap::stats();
     sprintln!("  heap     {} bytes free of {}", heap.free, mm::HEAP_SIZE);
     let (used, total) = mm::dma::stats();
-    sprintln!("  dma      {used} of {total} bytes in use");
+    // Пик печатается рядом с текущим потому, что именно их расхождение
+    // отвечает на вопрос «течёт ли»: устройство, воткнутое и вынутое десять
+    // раз, оставляет текущее значение прежним, а пик — нет.
+    sprintln!(
+        "  dma      {used} of {total} bytes in use, {} peak",
+        crate::mm::dma::peak()
+    );
 }
 
 fn usb_status() {

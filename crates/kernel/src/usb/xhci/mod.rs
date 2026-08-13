@@ -1046,7 +1046,22 @@ impl Controller {
             kprintln!("  usb         : device on root port {port} is gone, freeing slot {slot}");
             // SAFETY: слот выдан контроллером этому устройству.
             unsafe { self.release_slot(slot) };
-            self.devices.remove(index);
+            let device = self.devices.remove(index);
+            // Память возвращается **после** освобождения слота, и порядок здесь
+            // не формальность: пока слот жив, контроллер вправе читать контекст
+            // устройства и его кольца. Вернув буферы раньше, мы отдали бы их
+            // следующему просителю, а контроллер продолжал бы разбирать
+            // дескрипторы в чужой памяти.
+            //
+            // SAFETY: слот освобождён, дверной звонок этому устройству больше не
+            // звонит, и никаких дескрипторов в его кольцах не осталось.
+            unsafe {
+                dma::free(&device.context);
+                dma::free(&device.input);
+                dma::free(device.ep0.buffer());
+                dma::free(device.interrupt.buffer());
+                dma::free(&device.report);
+            }
         }
 
         // SAFETY: см. выше.
