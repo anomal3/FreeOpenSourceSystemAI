@@ -47,7 +47,7 @@ use anyhow::{Context, Result, bail};
 use crate::arch::Arch;
 use crate::build::{self, BuildOptions};
 use crate::paths;
-use crate::qemu::{self, DiskBus, Drive, Pointer, RunOptions};
+use crate::qemu::{self, Drive, Pointer, RunOptions};
 use crate::{image, util};
 
 pub use scenarios::{Scenario, Step, Target};
@@ -279,7 +279,7 @@ fn execute(
         monitor: Some(monitor_addr),
         qmp: qmp_addr,
         pointer: if scenario.tablet { Pointer::Tablet } else { Pointer::Mouse },
-        disk_bus: if scenario.ahci { DiskBus::Ahci } else { DiskBus::Virtio },
+        disk_bus: scenario.disk_bus,
         ..RunOptions::default()
     };
 

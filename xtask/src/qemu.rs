@@ -48,6 +48,7 @@ pub struct RunOptions {
 pub enum DiskBus {
     Virtio,
     Ahci,
+    Nvme,
 }
 
 /// Манипулятор виртуальной машины.
@@ -315,6 +316,14 @@ fn attach_disk(
                 &format!("ide-hd,drive=disk{index},bus=ahci.{ahci_port}"),
             ]);
             *ahci_port += 1;
+        }
+        // Серийный номер обязателен: без него QEMU предупреждает, а некоторые
+        // прошивки отказываются перечислять устройство вовсе.
+        DiskBus::Nvme => {
+            cmd.args([
+                "-device",
+                &format!("nvme,drive=disk{index},serial=freeos{index}"),
+            ]);
         }
     }
     Ok(())

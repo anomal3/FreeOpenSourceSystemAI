@@ -31,6 +31,7 @@
 //! правилу дома непроверенный код, который пишет на диск, хуже отсутствующего.
 
 pub mod ahci;
+pub mod nvme;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -48,6 +49,7 @@ use crate::virtio;
 pub enum Kind {
     VirtioBlk,
     Ahci,
+    Nvme,
 }
 
 impl Kind {
@@ -56,6 +58,7 @@ impl Kind {
         match self {
             Self::VirtioBlk => "virtio-blk",
             Self::Ahci => "ahci",
+            Self::Nvme => "nvme",
         }
     }
 }
@@ -104,6 +107,15 @@ pub unsafe fn probe_all(root: &pci::Root) -> Vec<Disk> {
         disks.push(Disk {
             kind: Kind::Ahci,
             unit: device.port_index(),
+            device: device.into_block_device(),
+        });
+    }
+
+    // SAFETY: контракт функции.
+    for device in unsafe { nvme::probe(root) } {
+        disks.push(Disk {
+            kind: Kind::Nvme,
+            unit: 0,
             device: device.into_block_device(),
         });
     }

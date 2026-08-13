@@ -930,6 +930,48 @@ than a silently stopped kernel. And this is verified **in QEMU on both architect
 the VirtualBox run that motivated the whole phase has not been done yet, and will be said
 out loud when it is.
 
+### NVMe, which is how a laptop attaches its disk
+
+AHCI covers the hypervisor and the older machine. The disk in anything bought in the last
+eight years is attached differently, and NVMe has nothing in common with SATA except the
+result — a sector in a buffer.
+
+There are barely any registers, and almost all of them are about starting up. The work goes
+through **queue pairs in memory**: a submission queue of 64-byte commands and a completion
+queue of 16-byte answers. Two pairs exist: the admin pair, used to create the others and to
+ask what the disk is, and the I/O pair through which reads and writes travel. That split is
+not ceremony — admin commands are slow and rare, and sharing one queue with them would mean
+stalling the disk to ask a question about it.
+
+Three details carry the design, and each replaces something a driver would otherwise have to
+do by hand:
+
+- **A doorbell instead of a "go" bit.** The command is written into the queue, then the new
+  tail index goes into a register. The controller fetches the command itself.
+- **A phase bit instead of clearing the queue.** Every completion entry carries a bit that
+  flips each time the queue wraps. That is how a fresh answer is told from last round's,
+  with no zeroing after each command and no comparison against previous contents.
+- **PRP instead of a pointer and a length.** NVMe has no notion of a contiguous buffer: it
+  takes physical page addresses — one field for the first page, and the second either the
+  next page or a list of the rest. Which is what memory actually is, and what the DMA window
+  from Phase 25 hands out for free, since it is one physically contiguous region.
+
+The one place that quietly punishes a shortcut is the block size. It is not a number in the
+namespace record; it is a reference — `FLBAS` names which of sixteen formats is in use, and
+that format holds the base-2 logarithm of the block size. Reading the *first* format instead
+of the one in use gives a plausible and wrong answer on any disk formatted away from the
+default, and 4096-byte blocks are ordinary on NVMe rather than exotic. A block that is not
+512 bytes is refused with a message instead of being silently treated as 512 — the failure
+mode there is not a crash but every write landing somewhere other than intended.
+
+This one worked on the first run on both architectures, which is worth recording as
+evidence rather than luck: the driver contains no `cfg` at all, and neither does AHCI. Both
+talk to a PCIe device through memory, so there is nothing in them that can tell which
+architecture is underneath — the same claim the xHCI driver has been making since Phase 6b,
+now made by two more drivers. The bench runs `nvme` the same way as `ahci`: the machine boots
+the way it always does, the installed disk is attached over NVMe as a second device, and the
+kernel must find its root on it — `root : found on nvme #0`.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -938,7 +980,7 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Twenty scenarios today: a program runs in an address space of its own, one that faults is
+Twenty-one scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
@@ -963,7 +1005,8 @@ an age of zero seconds rather than the installation date, and a directory that i
 refuses to be deleted (`write`); a second boot of the same disk finds what was written,
 does not find what was deleted, and still has the installer's files (`persist`); and that
 same disk, attached over **SATA** instead of virtio, is found by the AHCI driver, named as
-the disk the root was found on, read from and written to (`ahci`).
+the disk the root was found on, read from and written to (`ahci`) — and the same again over
+**NVMe**, where the controller is driven by queues in memory rather than by ports (`nvme`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -1106,7 +1149,7 @@ crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/pci.rs        ECAM configuration space, bus walk across bridges
   src/usb/          xHCI host controller, HID reports to input events
   src/virtio/       virtio over PCI: split virtqueue, virtio-blk
-  src/block/        Block devices: the list of them, and an AHCI driver
+  src/block/        Block devices: the list of them, plus AHCI and NVMe drivers
   src/arch/         Everything that differs between x86-64 and AArch64
 xtask/              Host-side build / image / QEMU orchestration
 ```
@@ -1180,7 +1223,8 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 24 | Devices arrive after the kernel does: hot-plug, and a slot that comes back when one leaves | **done** |
 | 25 | Memory that comes back: the DMA window becomes a pool instead of a counter | **done** |
 | 26a | A block-device layer and an AHCI driver: the root is found on a machine with no virtio | **done** |
-| 26b | NVMe, which is what the disk in a laptop bought this decade is attached by | planned |
+| 26b | NVMe, which is what the disk in a laptop bought this decade is attached by | **done** |
+| 26c | The sector stops being a constant: 4Kn disks, now that QEMU can present one to test against | planned |
 | 27 | Power: shut down and reboot, from the menu and from the power button, and a volume closed cleanly behind us | planned |
 | 28a | `fsck`: the volume is repaired from inside the system, not from someone else's Linux | planned |
 | 28b | Safe mode and a boot menu: a recovery console in the initrd, so no failure needs a second computer | planned |

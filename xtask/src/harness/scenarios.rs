@@ -15,6 +15,7 @@
 
 use super::aim::{self, Aim};
 use crate::arch::Arch;
+use crate::qemu::DiskBus;
 
 /// Носитель, с которого грузится сценарий.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -162,16 +163,16 @@ pub struct Scenario {
     /// Заодно меняется способ управления: абсолютное событие посылается через
     /// QMP, потому что в HMP такой команды нет (см. [`super::qmp`]).
     pub tablet: bool,
-    /// Диски подключены контроллером AHCI, а не virtio.
+    /// Чем подключён диск сценария.
     ///
     /// Проверяется этим не эмулятор, а **другой драйвер в ядре**. Пока в
     /// FreeOS был один дисковый драйвер, вся цепочка «система находит свой
     /// корень» проверялась исключительно на virtio-blk — то есть на
     /// контроллере, которого нет ни в VirtualBox по умолчанию, ни в настоящем
-    /// компьютере. Сценарий с этим флагом берёт тот же самый установленный
-    /// диск и подключает его по SATA: образ не меняется ни на байт, меняется
-    /// только то, чем ядро до него добирается.
-    pub ahci: bool,
+    /// компьютере. Сценарий с другой шиной берёт тот же самый установленный
+    /// диск и подключает его по SATA или по NVMe: образ не меняется ни на байт,
+    /// меняется только то, чем ядро до него добирается.
+    pub disk_bus: DiskBus,
     /// Архитектуры, на которых сценарий имеет смысл. Пусто — все.
     pub arches: &'static [Arch],
 }
@@ -206,7 +207,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -236,7 +237,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: true,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -286,7 +287,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -359,7 +360,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -424,7 +425,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: true,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -482,7 +483,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -538,7 +539,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[Arch::X86_64],
         // Свойство накапливается к уже заданной машине `q35`, как и `i8042=off`
         // у `usb_only`. Так воспроизводится VirtualBox: там PIT существует, но
@@ -570,7 +571,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -691,7 +692,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -733,7 +734,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -782,7 +783,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -828,7 +829,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -879,7 +880,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Iso,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -911,7 +912,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         // Только AArch64: на x86-64 GIC не существует.
         arches: &[Arch::Aarch64],
         // Свойство накапливается к уже заданной машине `virt`. Версия по
@@ -945,7 +946,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -965,7 +966,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Image,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -986,7 +987,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Installer,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -1039,7 +1040,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Installed,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -1103,7 +1104,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Installed,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -1181,7 +1182,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Installed,
         usb_only: false,
         tablet: false,
-        ahci: false,
+        disk_bus: DiskBus::Virtio,
         arches: &[],
         extra: &[],
         steps: &[
@@ -1214,7 +1215,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::LiveAndDisk,
         usb_only: false,
         tablet: false,
-        ahci: true,
+        disk_bus: DiskBus::Ahci,
         arches: &[],
         extra: &[],
         steps: &[
@@ -1245,6 +1246,44 @@ pub const ALL: &[Scenario] = &[
             Step::Await("wrote 18 bytes", 15_000),
             Step::Line("cat /home/roman/sata.txt"),
             Step::Await("written-over-sata", 15_000),
+            Step::Line("whoami"),
+            Step::Await("roman (uid 1000 gid 1000)", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "nvme",
+        about: "Тот же диск на шине PCI Express: очереди, звонок и бит фазы вместо портов.",
+        target: Target::LiveAndDisk,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Nvme,
+        arches: &[],
+        extra: &[],
+        steps: &[
+            // Версия и шаг звонков читаются из регистров контроллера: получить
+            // их и не иметь контроллера нельзя.
+            Step::Await("nvme        : version", BOOT),
+            // Ёмкость пришла из Identify Namespace, то есть административная
+            // очередь работает: команда дошла, ответ разобран по биту фазы.
+            Step::Await("nvme        : ", 30_000),
+            Step::Await("disk        : nvme #0", 30_000),
+            // Корень найден именно на нём. Диска два — VVFAT, с которого
+            // грузилась прошивка, и этот; строка называет, где нашёлся раздел.
+            Step::Await("root        : found on nvme #0", 30_000),
+            Step::Await("root        : ext2 at LBA", 30_000),
+            Step::Await("account     : /etc/passwd", 30_000),
+            Step::Await("freeos> ", 30_000),
+            // Чтение через очередь ввода-вывода — она отдельная от
+            // административной, и до этой строки ни одной команды в ней не было.
+            Step::Line("cat /etc/system.cfg"),
+            Step::Await("language=", 15_000),
+            Step::Line("echo written-over-nvme > /home/roman/nvme.txt"),
+            Step::Await("wrote 18 bytes", 15_000),
+            Step::Line("cat /home/roman/nvme.txt"),
+            Step::Await("written-over-nvme", 15_000),
             Step::Line("whoami"),
             Step::Await("roman (uid 1000 gid 1000)", 15_000),
             Step::Line("exit"),
