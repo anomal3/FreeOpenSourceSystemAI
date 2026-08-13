@@ -110,8 +110,9 @@ Two honest limits:
 - **The installer ISO can install, but the result will not boot yet.** The installer writes
   through UEFI Block I/O, so the firmware's own SATA or NVMe driver does the work and the
   disk really does get written. The kernel, however, mounts its root through virtio-blk,
-  which exists in QEMU and not in VirtualBox. The driver that closes this — NVMe — is the
-  next phase, and until it lands, installing into a hypervisor is a one-way trip.
+  which exists in QEMU and not in VirtualBox. The drivers that close this — AHCI, then
+  NVMe — are the next phase, and until they land, installing into a hypervisor is a one-way
+  trip.
 
 `xtask` locates QEMU and its UEFI firmware automatically; override with the
 `FREEOS_OVMF_X86_64` / `FREEOS_OVMF_AARCH64` environment variables.
@@ -1115,6 +1116,30 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 23 | The device describes itself: HID report descriptors, so a tablet is a mouse; PCI without MCFG, the UART from ACPI, and a second source for the clock | **done** |
 | 24 | Devices arrive after the kernel does: hot-plug, and a slot that comes back when one leaves | **done** |
 | 25 | Memory that comes back: the DMA window becomes a pool instead of a counter | **done** |
+| 26a | A block-device layer and an AHCI driver: the root is found on a machine with no virtio | planned |
+| 26b | NVMe, which is what the disk in a laptop bought this decade is attached by | planned |
+| 27 | Power: shut down and reboot, from the menu and from the power button | planned |
+| 28 | A keyboard for a program: descriptor 0, and a terminal that understands ANSI | planned |
+| 29 | `mc`: a two-pane file manager that is a program, not a part of the kernel | planned |
+| 30 | Packages and a record of them: a format, a database, install and remove | planned |
+| 31 | Updating the system with a way back: two slots on the ESP, and a rollback nobody has to ask for | planned |
+| 32 | virtio-net, Ethernet, ARP, IPv4, ICMP: the machine answers a ping | planned |
+| 33 | UDP, DHCP, DNS: the machine gets its own address | planned |
+| 34 | TCP, and sockets for programs | planned |
+| 35 | SSH transport (RFC 4253): key exchange and encryption a real `ssh` agrees with | planned |
+| 36 | SSH authentication and a session (RFC 4252, 4254): a shell over the network | planned |
+| 37 | Updating over the network, with signatures checked before anything is written | planned |
+| 38 | A window belongs to a program: surfaces and events across the system-call boundary | planned |
+| 39 | Settings, and icons on the desktop | planned |
+| 40 | btrfs, read-only: a volume `mkfs.btrfs` made, checksums verified | planned |
+| 41 | btrfs, written: copy-on-write, and a third partition the installer creates | planned |
+| 42 | DeviceTree beside ACPI, and the HAL split this README has promised since Phase 0 | planned |
+| 43 | A Raspberry Pi 4: the first machine that is not an emulator | planned |
+| 44+ | A phone: an Android boot image, no UEFI, no ACPI, and a framebuffer left by the bootloader | planned |
+
+The reasoning behind that order — what each phase is for, what checks it, what is known to
+be waiting to go wrong in it, and how large it is — is in [ROADMAP.md](ROADMAP.md), along
+with the three decisions taken by default there.
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe
