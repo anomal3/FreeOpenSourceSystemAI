@@ -30,7 +30,7 @@
 
 use crate::gpt::Range;
 use crate::{
-    BlockDevice, Error, Result, SECTOR_SIZE, check_device, put_u16, put_u32, zero_sectors,
+    BlockDevice, Error, MAX_SECTOR_SIZE, Result, check_device, put_u16, put_u32, zero_sectors,
 };
 
 /// Зарезервированных секторов в начале тома.
@@ -51,9 +51,6 @@ const BACKUP_BOOT_SECTOR: u32 = 6;
 /// Первый кластер данных. У FAT32 корневой каталог — обычная цепочка
 /// кластеров, и начинается она здесь.
 const ROOT_CLUSTER: u32 = 2;
-
-/// Записей FAT в одном секторе: 512 / 4.
-const FAT_ENTRIES_PER_SECTOR: u32 = SECTOR_SIZE as u32 / 4;
 
 /// Конец цепочки кластеров.
 const END_OF_CHAIN: u32 = 0x0FFF_FFFF;
@@ -135,11 +132,32 @@ pub struct Geometry {
     pub sectors_per_fat: u32,
     /// Число кластеров данных.
     pub cluster_count: u32,
+    /// Размер сектора носителя, на котором лежит том.
+    ///
+    /// Часть геометрии, а не глобальная константа: у FAT это поле в
+    /// загрузочной записи (`BytsPerSec`), и том, размеченный с одним значением,
+    /// нельзя читать с другим. Держать его рядом с остальными числами тома —
+    /// единственный способ не дать им разъехаться.
+    pub sector_size: usize,
 }
 
 impl Geometry {
-    /// Рассчитать геометрию тома длиной `total_sectors`.
+    /// Рассчитать геометрию тома длиной `total_sectors` секторов по 512 байт.
     pub fn plan(first_lba: u64, total_sectors: u64) -> Result<Self> {
+        Self::plan_with_sector_size(first_lba, total_sectors, crate::DEFAULT_SECTOR_SIZE)
+    }
+
+    /// Рассчитать геометрию тома на носителе с заданным размером сектора.
+    pub fn plan_with_sector_size(
+        first_lba: u64,
+        total_sectors: u64,
+        sector_size: usize,
+    ) -> Result<Self> {
+        if !crate::sector_size_supported(u32::try_from(sector_size).unwrap_or(0)) {
+            return Err(Error::UnsupportedSectorSize(
+                u32::try_from(sector_size).unwrap_or(0),
+            ));
+        }
         let total_sectors = u32::try_from(total_sectors).map_err(|_| Error::OutOfRange)?;
         if total_sectors <= RESERVED_SECTORS {
             return Err(Error::TooSmall);
@@ -151,7 +169,8 @@ impl Geometry {
         // перебора от крупного к мелкому означает «самый дешёвый из
         // допустимых».
         for &sectors_per_cluster in &[64u32, 32, 16, 8, 4, 2, 1] {
-            let Some(candidate) = Self::try_geometry(first_lba, total_sectors, sectors_per_cluster)
+            let Some(candidate) =
+                Self::try_geometry(first_lba, total_sectors, sectors_per_cluster, sector_size)
             else {
                 continue;
             };
@@ -162,13 +181,18 @@ impl Geometry {
         Err(Error::TooSmall)
     }
 
-    fn try_geometry(first_lba: u64, total_sectors: u32, sectors_per_cluster: u32) -> Option<Self> {
+    fn try_geometry(
+        first_lba: u64,
+        total_sectors: u32,
+        sectors_per_cluster: u32,
+        sector_size: usize,
+    ) -> Option<Self> {
         // Формула из Microsoft FAT specification («FAT Size Determination»).
         // Она даёт лёгкий перебор в размере таблицы — это допустимо и
         // безопасно; недобор означал бы, что последним кластерам не хватило
         // записей.
         let tmp1 = total_sectors.checked_sub(RESERVED_SECTORS)?;
-        let tmp2 = ((SECTOR_SIZE as u32 / 2) * sectors_per_cluster + FAT_COUNT) / 2;
+        let tmp2 = ((sector_size as u32 / 2) * sectors_per_cluster + FAT_COUNT) / 2;
         let sectors_per_fat = tmp1.div_ceil(tmp2.max(1));
 
         let overhead = RESERVED_SECTORS.checked_add(FAT_COUNT.checked_mul(sectors_per_fat)?)?;
@@ -179,7 +203,10 @@ impl Geometry {
         }
 
         // Таблица обязана вмещать записи для всех кластеров плюс две служебные.
-        if sectors_per_fat.checked_mul(FAT_ENTRIES_PER_SECTOR)? < cluster_count + 2 {
+        // Записей в секторе тем больше, чем крупнее сектор: по четыре байта на
+        // кластер.
+        let entries_per_sector = (sector_size / 4) as u32;
+        if sectors_per_fat.checked_mul(entries_per_sector)? < cluster_count + 2 {
             return None;
         }
 
@@ -189,6 +216,7 @@ impl Geometry {
             sectors_per_cluster,
             sectors_per_fat,
             cluster_count,
+            sector_size,
         })
     }
 
@@ -223,7 +251,13 @@ impl Geometry {
 
     #[must_use]
     pub const fn cluster_bytes(&self) -> u32 {
-        self.sectors_per_cluster * SECTOR_SIZE as u32
+        self.sectors_per_cluster * self.sector_size as u32
+    }
+
+    /// Сколько записей таблицы FAT помещается в один сектор носителя.
+    #[must_use]
+    pub const fn fat_entries_per_sector(&self) -> u32 {
+        (self.sector_size / 4) as u32
     }
 }
 
@@ -253,7 +287,14 @@ pub fn format(dev: &mut dyn BlockDevice, range: Range, options: &FormatOptions) 
         return Err(Error::OutOfRange);
     }
 
-    let geometry = Geometry::plan(range.first_lba, range.sectors())?;
+    // Размер сектора берётся у носителя и уходит в геометрию, а оттуда — в поле
+    // `BytsPerSec` загрузочной записи. Том, размеченный с одним значением, с
+    // другим не читается вовсе, поэтому догадка здесь недопустима.
+    let geometry = Geometry::plan_with_sector_size(
+        range.first_lba,
+        range.sectors(),
+        dev.sector_size() as usize,
+    )?;
 
     // Таблицы FAT и зарезервированная область обнуляются целиком: в них
     // значение по умолчанию — ноль («кластер свободен»), а на носителе после
@@ -266,22 +307,23 @@ pub fn format(dev: &mut dyn BlockDevice, range: Range, options: &FormatOptions) 
         u64::from(RESERVED_SECTORS + FAT_COUNT * geometry.sectors_per_fat),
     )?;
 
+    let sector = geometry.sector_size;
     let boot = boot_sector(&geometry, options);
-    dev.write(geometry.first_lba, &boot)?;
-    dev.write(geometry.first_lba + u64::from(BACKUP_BOOT_SECTOR), &boot)?;
+    dev.write(geometry.first_lba, &boot[..sector])?;
+    dev.write(geometry.first_lba + u64::from(BACKUP_BOOT_SECTOR), &boot[..sector])?;
 
     let fsinfo = fsinfo_sector(geometry.cluster_count - 1, ROOT_CLUSTER + 1);
-    dev.write(geometry.first_lba + 1, &fsinfo)?;
-    dev.write(geometry.first_lba + u64::from(BACKUP_BOOT_SECTOR) + 1, &fsinfo)?;
+    dev.write(geometry.first_lba + 1, &fsinfo[..sector])?;
+    dev.write(geometry.first_lba + u64::from(BACKUP_BOOT_SECTOR) + 1, &fsinfo[..sector])?;
 
     // Первые две записи FAT служебные: нулевая повторяет байт носителя, первая
     // хранит признаки состояния тома. Третья — корневой каталог, он уже занят.
-    let mut first_fat = [0u8; SECTOR_SIZE];
+    let mut first_fat = [0u8; MAX_SECTOR_SIZE];
     put_u32(&mut first_fat, 0, 0x0FFF_FF00 | 0xF8);
     put_u32(&mut first_fat, 4, END_OF_CHAIN);
     put_u32(&mut first_fat, 8, END_OF_CHAIN);
     for index in 0..FAT_COUNT {
-        dev.write(geometry.fat_lba(index), &first_fat)?;
+        dev.write(geometry.fat_lba(index), &first_fat[..sector])?;
     }
 
     // Кластер корневого каталога обязан быть нулевым: ненулевой первый байт
@@ -447,10 +489,13 @@ impl Volume {
         put_u16(&mut dotdot, 20, (parent_link >> 16) as u16);
         put_u16(&mut dotdot, 26, (parent_link & 0xFFFF) as u16);
 
-        let mut sector = [0u8; SECTOR_SIZE];
+        let mut sector = [0u8; MAX_SECTOR_SIZE];
         sector[..DIR_ENTRY_SIZE].copy_from_slice(&dot);
         sector[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot);
-        dev.write(self.geometry.cluster_lba(cluster), &sector)?;
+        dev.write(
+            self.geometry.cluster_lba(cluster),
+            &sector[..self.geometry.sector_size],
+        )?;
 
         let mut entry = [0u8; DIR_ENTRY_SIZE];
         entry[..11].copy_from_slice(&short);
@@ -477,11 +522,12 @@ impl Volume {
         } else {
             self.next_free
         };
+        let sector = self.geometry.sector_size;
         let fsinfo = fsinfo_sector(self.free_clusters, next);
-        dev.write(self.geometry.first_lba + 1, &fsinfo)?;
+        dev.write(self.geometry.first_lba + 1, &fsinfo[..sector])?;
         dev.write(
             self.geometry.first_lba + u64::from(BACKUP_BOOT_SECTOR) + 1,
-            &fsinfo,
+            &fsinfo[..sector],
         )?;
         dev.flush()
     }
@@ -509,19 +555,23 @@ impl Volume {
         // Записи FAT правятся посекторно, а не по одной: цепочка из десяти
         // тысяч кластеров (сорокамегабайтный initrd) иначе превратилась бы в
         // десятки тысяч отдельных чтений-записей носителя.
+        let per_sector = self.geometry.fat_entries_per_sector();
+        let sector_bytes = self.geometry.sector_size;
         let mut cluster = first;
         while cluster <= last {
-            let sector_index = cluster / FAT_ENTRIES_PER_SECTOR;
-            let sector_last =
-                ((sector_index + 1) * FAT_ENTRIES_PER_SECTOR - 1).min(last);
+            let sector_index = cluster / per_sector;
+            let sector_last = ((sector_index + 1) * per_sector - 1).min(last);
 
-            let mut buf = [0u8; SECTOR_SIZE];
+            let mut buf = [0u8; MAX_SECTOR_SIZE];
             // Сектор читается, а не собирается с нуля: в него могли попасть
             // записи ранее выделенных кластеров.
-            dev.read(self.geometry.fat_lba(0) + u64::from(sector_index), &mut buf)?;
+            dev.read(
+                self.geometry.fat_lba(0) + u64::from(sector_index),
+                &mut buf[..sector_bytes],
+            )?;
             for current in cluster..=sector_last {
                 let value = if current == last { END_OF_CHAIN } else { current + 1 };
-                let at = ((current % FAT_ENTRIES_PER_SECTOR) * 4) as usize;
+                let at = ((current % per_sector) * 4) as usize;
                 let reserved = u32::from_le_bytes([
                     buf[at],
                     buf[at + 1],
@@ -531,7 +581,10 @@ impl Volume {
                 put_u32(&mut buf, at, reserved | (value & ENTRY_MASK));
             }
             for index in 0..FAT_COUNT {
-                dev.write(self.geometry.fat_lba(index) + u64::from(sector_index), &buf)?;
+                dev.write(
+                    self.geometry.fat_lba(index) + u64::from(sector_index),
+                    &buf[..sector_bytes],
+                )?;
             }
 
             cluster = sector_last + 1;
@@ -547,16 +600,24 @@ impl Volume {
         if cluster < ROOT_CLUSTER || cluster > self.geometry.max_cluster() {
             return Err(Error::OutOfRange);
         }
-        let sector_index = cluster / FAT_ENTRIES_PER_SECTOR;
-        let at = ((cluster % FAT_ENTRIES_PER_SECTOR) * 4) as usize;
+        let per_sector = self.geometry.fat_entries_per_sector();
+        let sector_bytes = self.geometry.sector_size;
+        let sector_index = cluster / per_sector;
+        let at = ((cluster % per_sector) * 4) as usize;
 
-        let mut buf = [0u8; SECTOR_SIZE];
-        dev.read(self.geometry.fat_lba(0) + u64::from(sector_index), &mut buf)?;
+        let mut buf = [0u8; MAX_SECTOR_SIZE];
+        dev.read(
+            self.geometry.fat_lba(0) + u64::from(sector_index),
+            &mut buf[..sector_bytes],
+        )?;
         let reserved =
             u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) & !ENTRY_MASK;
         put_u32(&mut buf, at, reserved | (value & ENTRY_MASK));
         for index in 0..FAT_COUNT {
-            dev.write(self.geometry.fat_lba(index) + u64::from(sector_index), &buf)?;
+            dev.write(
+                self.geometry.fat_lba(index) + u64::from(sector_index),
+                &buf[..sector_bytes],
+            )?;
         }
         Ok(())
     }
@@ -566,10 +627,14 @@ impl Volume {
         if cluster < ROOT_CLUSTER || cluster > self.geometry.max_cluster() {
             return Err(Error::OutOfRange);
         }
-        let sector_index = cluster / FAT_ENTRIES_PER_SECTOR;
-        let at = ((cluster % FAT_ENTRIES_PER_SECTOR) * 4) as usize;
-        let mut buf = [0u8; SECTOR_SIZE];
-        dev.read(self.geometry.fat_lba(0) + u64::from(sector_index), &mut buf)?;
+        let per_sector = self.geometry.fat_entries_per_sector();
+        let sector_index = cluster / per_sector;
+        let at = ((cluster % per_sector) * 4) as usize;
+        let mut buf = [0u8; MAX_SECTOR_SIZE];
+        dev.read(
+            self.geometry.fat_lba(0) + u64::from(sector_index),
+            &mut buf[..self.geometry.sector_size],
+        )?;
         Ok(u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) & ENTRY_MASK)
     }
 
@@ -580,24 +645,25 @@ impl Volume {
         // нужно.
         let start = self.geometry.cluster_lba(first);
 
-        let full_sectors = data.len() / SECTOR_SIZE;
+        let sector_bytes = self.geometry.sector_size;
+        let full_sectors = data.len() / sector_bytes;
         let mut done = 0usize;
         while done < full_sectors {
             let batch = (full_sectors - done).min(MAX_BATCH_SECTORS);
             dev.write(
                 start + done as u64,
-                &data[done * SECTOR_SIZE..(done + batch) * SECTOR_SIZE],
+                &data[done * sector_bytes..(done + batch) * sector_bytes],
             )?;
             done += batch;
         }
 
         // Хвост короче сектора дописывается через буфер: носитель принимает
         // только целые сектора.
-        let rest = data.len() % SECTOR_SIZE;
+        let rest = data.len() % sector_bytes;
         if rest != 0 {
-            let mut tail = [0u8; SECTOR_SIZE];
-            tail[..rest].copy_from_slice(&data[full_sectors * SECTOR_SIZE..]);
-            dev.write(start + full_sectors as u64, &tail)?;
+            let mut tail = [0u8; MAX_SECTOR_SIZE];
+            tail[..rest].copy_from_slice(&data[full_sectors * sector_bytes..]);
+            dev.write(start + full_sectors as u64, &tail[..sector_bytes])?;
         }
         Ok(())
     }
@@ -613,16 +679,17 @@ impl Volume {
         loop {
             let base = self.geometry.cluster_lba(cluster);
             for sector in 0..self.geometry.sectors_per_cluster {
-                let mut buf = [0u8; SECTOR_SIZE];
-                dev.read(base + u64::from(sector), &mut buf)?;
-                for slot in 0..(SECTOR_SIZE / DIR_ENTRY_SIZE) {
+                let sector_bytes = self.geometry.sector_size;
+                let mut buf = [0u8; MAX_SECTOR_SIZE];
+                dev.read(base + u64::from(sector), &mut buf[..sector_bytes])?;
+                for slot in 0..(sector_bytes / DIR_ENTRY_SIZE) {
                     let at = slot * DIR_ENTRY_SIZE;
                     // 0x00 — «дальше записей нет», 0xE5 — «запись удалена».
                     if buf[at] != 0x00 && buf[at] != 0xE5 {
                         continue;
                     }
                     buf[at..at + DIR_ENTRY_SIZE].copy_from_slice(entry);
-                    dev.write(base + u64::from(sector), &buf)?;
+                    dev.write(base + u64::from(sector), &buf[..sector_bytes])?;
                     return Ok(());
                 }
             }
@@ -659,9 +726,10 @@ impl Volume {
         loop {
             let base = self.geometry.cluster_lba(cluster);
             for sector in 0..self.geometry.sectors_per_cluster {
-                let mut buf = [0u8; SECTOR_SIZE];
-                dev.read(base + u64::from(sector), &mut buf)?;
-                for slot in 0..(SECTOR_SIZE / DIR_ENTRY_SIZE) {
+                let sector_bytes = self.geometry.sector_size;
+                let mut buf = [0u8; MAX_SECTOR_SIZE];
+                dev.read(base + u64::from(sector), &mut buf[..sector_bytes])?;
+                for slot in 0..(sector_bytes / DIR_ENTRY_SIZE) {
                     let at = slot * DIR_ENTRY_SIZE;
                     let entry = &buf[at..at + DIR_ENTRY_SIZE];
                     if entry[0] == 0x00 {
@@ -710,8 +778,8 @@ struct Found {
 }
 
 /// Загрузочный сектор с BPB.
-fn boot_sector(geometry: &Geometry, options: &FormatOptions) -> [u8; SECTOR_SIZE] {
-    let mut sector = [0u8; SECTOR_SIZE];
+fn boot_sector(geometry: &Geometry, options: &FormatOptions) -> [u8; MAX_SECTOR_SIZE] {
+    let mut sector = [0u8; MAX_SECTOR_SIZE];
 
     // Переход через BPB. Кода за ним нет — грузит прошивка, а не этот сектор, —
     // но сама последовательность обязана присутствовать: часть драйверов
@@ -723,7 +791,7 @@ fn boot_sector(geometry: &Geometry, options: &FormatOptions) -> [u8; SECTOR_SIZE
     // драйверы придирчивы к нему; "MSWIN4.1" — то, что пишет Windows.
     sector[3..11].copy_from_slice(b"MSWIN4.1");
 
-    put_u16(&mut sector, 11, SECTOR_SIZE as u16);
+    put_u16(&mut sector, 11, geometry.sector_size as u16);
     sector[13] = geometry.sectors_per_cluster as u8;
     put_u16(&mut sector, 14, RESERVED_SECTORS as u16);
     sector[16] = FAT_COUNT as u8;
@@ -766,8 +834,8 @@ fn boot_sector(geometry: &Geometry, options: &FormatOptions) -> [u8; SECTOR_SIZE
 }
 
 /// Сектор FSInfo.
-fn fsinfo_sector(free_clusters: u32, next_free: u32) -> [u8; SECTOR_SIZE] {
-    let mut sector = [0u8; SECTOR_SIZE];
+fn fsinfo_sector(free_clusters: u32, next_free: u32) -> [u8; MAX_SECTOR_SIZE] {
+    let mut sector = [0u8; MAX_SECTOR_SIZE];
     put_u32(&mut sector, 0, 0x4161_5252); // "RRaA"
     put_u32(&mut sector, 484, 0x6141_7272); // "rrAa"
     put_u32(&mut sector, 488, free_clusters);
@@ -1146,7 +1214,7 @@ mod tests {
         volume.finish(&mut dev).expect("завершение");
 
         // Проверяем, что раздел вообще не вышел за свои границы.
-        let mut before = [0u8; SECTOR_SIZE];
+        let mut before = [0u8; crate::DEFAULT_SECTOR_SIZE];
         dev.read(OFFSET - 1, &mut before).expect("сектор перед томом");
         assert!(
             before.iter().any(|&byte| byte != 0),
@@ -1155,7 +1223,7 @@ mod tests {
 
         // И что содержимое раздела читается чужим драйвером, если вырезать его
         // из носителя.
-        let partition = dev.as_bytes()[(OFFSET as usize * SECTOR_SIZE)..].to_vec();
+        let partition = dev.as_bytes()[(OFFSET as usize * crate::DEFAULT_SECTOR_SIZE)..].to_vec();
         let fs = fatfs::FileSystem::new(Cursor::new(partition), fatfs::FsOptions::new())
             .expect("том со смещением");
         let mut read = Vec::new();
@@ -1167,7 +1235,7 @@ mod tests {
         assert_eq!(read, b"payload");
 
         // Поле скрытых секторов обязано указывать на начало раздела.
-        let mut boot = [0u8; SECTOR_SIZE];
+        let mut boot = [0u8; crate::DEFAULT_SECTOR_SIZE];
         dev.read(OFFSET, &mut boot).expect("загрузочный сектор");
         assert_eq!(
             u32::from_le_bytes(boot[28..32].try_into().unwrap()) as u64,
@@ -1180,8 +1248,8 @@ mod tests {
     #[test]
     fn backup_boot_sector_matches() {
         let (mut dev, _) = formatted();
-        let mut primary = [0u8; SECTOR_SIZE];
-        let mut backup = [0u8; SECTOR_SIZE];
+        let mut primary = [0u8; crate::DEFAULT_SECTOR_SIZE];
+        let mut backup = [0u8; crate::DEFAULT_SECTOR_SIZE];
         dev.read(0, &mut primary).expect("основной");
         dev.read(u64::from(BACKUP_BOOT_SECTOR), &mut backup)
             .expect("резервный");
@@ -1201,7 +1269,7 @@ mod tests {
         volume.finish(&mut dev).expect("завершение");
 
         let geometry = volume.geometry();
-        let mut first = vec![0u8; geometry.sectors_per_fat as usize * SECTOR_SIZE];
+        let mut first = vec![0u8; geometry.sectors_per_fat as usize * crate::DEFAULT_SECTOR_SIZE];
         let mut second = first.clone();
         dev.read(geometry.fat_lba(0), &mut first).expect("FAT #0");
         dev.read(geometry.fat_lba(1), &mut second).expect("FAT #1");

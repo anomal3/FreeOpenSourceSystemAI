@@ -67,15 +67,42 @@ pub struct Ext2 {
     inode_tables: Vec<u32>,
 }
 
+
+/// Прочитать суперблок тома, начинающегося с сектора `first_lba`.
+///
+/// Суперблок ext2 лежит по **байтовому** смещению 1024 от начала тома, и это
+/// смещение не зависит ни от размера блока, ни от размера сектора. На носителе
+/// с сектором 512 оно равно ровно двум секторам, и до Phase 26c формула
+/// `first_lba + 1024 / 512` была верна по совпадению. На 4Kn-диске то же
+/// смещение попадает **внутрь первого сектора**, и та же формула прочитала бы
+/// восьмой сектор — то есть чужие данные с уверенным видом.
+fn read_superblock(
+    dev: &mut dyn BlockDevice,
+    first_lba: u64,
+) -> Result<[u8; SUPERBLOCK_SIZE]> {
+    let sector = dev.sector_size() as u64;
+    if sector == 0 {
+        return Err(Error::Unsupported);
+    }
+    let lba = first_lba + SUPERBLOCK_OFFSET / sector;
+    let within = (SUPERBLOCK_OFFSET % sector) as usize;
+    // Сколько секторов накрывает суперблок вместе со смещением внутри первого.
+    let span = (within + SUPERBLOCK_SIZE).div_ceil(sector as usize);
+
+    let mut raw = crate::write::try_zeroed(span * sector as usize)?;
+    dev.read(lba, &mut raw)?;
+
+    let mut sb = [0u8; SUPERBLOCK_SIZE];
+    sb.copy_from_slice(&raw[within..within + SUPERBLOCK_SIZE]);
+    Ok(sb)
+}
+
 impl Ext2 {
     /// Смонтировать том, начинающийся с сектора `first_lba`.
     pub fn mount(dev: &mut dyn BlockDevice, first_lba: u64) -> Result<Self> {
-        let mut sb = [0u8; SUPERBLOCK_SIZE];
-        // Суперблок лежит по фиксированному смещению 1024 от начала тома, то
-        // есть на два сектора дальше его начала, — независимо от размера блока.
-        dev.read(first_lba + SUPERBLOCK_OFFSET / 512, &mut sb)?;
+        let sb = read_superblock(dev, first_lba)?;
 
-        let geometry = Geometry::from_superblock(first_lba, &sb)?;
+        let geometry = Geometry::from_superblock(first_lba, &sb, dev.sector_size())?;
         // Состояние тома читается, но монтирование не запрещается: «грязный»
         // том после сбоя всё ещё читается, а отказ смонтировать корень
         // означал бы систему, которая не загружается из-за отключения питания.
@@ -118,8 +145,7 @@ impl Ext2 {
 
     /// «Чистый» ли том по данным суперблока.
     pub fn is_clean(dev: &mut dyn BlockDevice, first_lba: u64) -> Result<bool> {
-        let mut sb = [0u8; SUPERBLOCK_SIZE];
-        dev.read(first_lba + SUPERBLOCK_OFFSET / 512, &mut sb)?;
+        let sb = read_superblock(dev, first_lba)?;
         if u16_at(&sb, 56) != MAGIC {
             return Err(Error::Corrupt);
         }
@@ -132,8 +158,7 @@ impl Ext2 {
     /// какое-то время. Время последней записи — единственное осмысленное
     /// значение, которое можно взять, ничего не спрашивая у платформы.
     pub fn write_time(dev: &mut dyn BlockDevice, first_lba: u64) -> Result<u32> {
-        let mut sb = [0u8; SUPERBLOCK_SIZE];
-        dev.read(first_lba + SUPERBLOCK_OFFSET / 512, &mut sb)?;
+        let sb = read_superblock(dev, first_lba)?;
         if u16_at(&sb, 56) != MAGIC {
             return Err(Error::Corrupt);
         }
@@ -142,8 +167,7 @@ impl Ext2 {
 
     /// Метка тома.
     pub fn label(dev: &mut dyn BlockDevice, first_lba: u64) -> Result<String> {
-        let mut sb = [0u8; SUPERBLOCK_SIZE];
-        dev.read(first_lba + SUPERBLOCK_OFFSET / 512, &mut sb)?;
+        let sb = read_superblock(dev, first_lba)?;
         if u16_at(&sb, 56) != MAGIC {
             return Err(Error::Corrupt);
         }

@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use disk::gpt::{self, PartitionSpec};
 use disk::guid::Guid;
-use disk::{MemDisk, SECTOR_SIZE, fat32, iso9660};
+use disk::{DEFAULT_SECTOR_SIZE as SECTOR_SIZE, MemDisk, fat32, iso9660};
 
 use crate::arch::{self, Arch, Component};
 use crate::build::Built;
@@ -276,7 +276,7 @@ fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
         )
     })?;
 
-    let layout = gpt::plan(sectors, esp_bytes, false)
+    let layout = gpt::plan(sectors, SECTOR_SIZE, esp_bytes, false)
         .map_err(|err| anyhow::anyhow!("не удалось спланировать разметку образа: {err}"))?;
 
     // Хеш содержимого служит источником «случайности» для GUID: настоящая

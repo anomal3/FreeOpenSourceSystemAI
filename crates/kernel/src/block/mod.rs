@@ -205,8 +205,9 @@ pub fn find_partition(disks: Vec<Disk>, type_guid: disk::guid::Guid) -> Option<P
                 continue;
             }
         };
+        let sector = candidate.device.sector_size() as usize;
         kprintln!(
-            "  partitions  : {name} #{}: GPT {}, {} entries",
+            "  partitions  : {name} #{}: GPT {}, {} entries, {sector}-byte sectors",
             candidate.unit,
             table.disk_guid,
             table.partitions.len(),
@@ -215,7 +216,7 @@ pub fn find_partition(disks: Vec<Disk>, type_guid: disk::guid::Guid) -> Option<P
             kprintln!(
                 "    part {}     : {} MiB at LBA {}, '{}'",
                 partition.index + 1,
-                partition.range().bytes() / (1024 * 1024),
+                partition.range().bytes(sector) / (1024 * 1024),
                 partition.first_lba,
                 partition.name_string(),
             );

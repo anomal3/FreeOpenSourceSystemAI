@@ -227,6 +227,8 @@ pub struct Nvme {
     /// (фаза 25).
     prp_list: DmaBuffer,
     blocks: u64,
+    /// Размер блока, объявленный самим пространством имён.
+    block_size: usize,
     /// Номер команды. Растёт, чтобы ответ можно было сопоставить с запросом.
     next_id: u16,
 }
@@ -354,6 +356,7 @@ impl Nvme {
             data,
             prp_list,
             blocks: 0,
+            block_size: SECTOR_SIZE,
             next_id: 0,
         };
 
@@ -433,11 +436,18 @@ impl Nvme {
         let format = formats[usize::from(flbas & 0x0F)];
         // Биты 16–23 — двоичный логарифм размера блока.
         let block_size = 1u32 << ((format >> 16) & 0xFF);
-        if block_size as usize != SECTOR_SIZE {
+        // Размер блока принимается таким, каким его назвал диск. До Phase 26c
+        // здесь стоял отказ на всём, кроме 512, и он был честен: выше по стеку
+        // размер сектора был константой, так что 4Kn-диск пришлось бы разметить
+        // как 512-байтный — то есть потерять на нём данные. Теперь разметка
+        // считается в секторах носителя, и отвергать остаётся только то, с чем
+        // не работает арифметика выравнивания.
+        if !disk::sector_size_supported(block_size) {
             return Err(NvmeError::UnsupportedSectorSize(block_size));
         }
 
         self.blocks = blocks;
+        self.block_size = block_size as usize;
         Ok(())
     }
 
@@ -475,13 +485,13 @@ impl Nvme {
 
     /// Прочитать блоки в буфер вызывающего.
     pub fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), NvmeError> {
-        if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+        if buf.is_empty() || buf.len() % self.block_size != 0 {
             return Err(NvmeError::BadTransfer);
         }
         let mut done = 0usize;
         while done < buf.len() {
             let chunk = (buf.len() - done).min(MAX_TRANSFER);
-            self.transfer(IO_READ, lba + (done / SECTOR_SIZE) as u64, chunk)?;
+            self.transfer(IO_READ, lba + (done / self.block_size) as u64, chunk)?;
             // SAFETY: буфер выделен на MAX_TRANSFER байт, `chunk` не больше.
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -497,7 +507,7 @@ impl Nvme {
 
     /// Записать блоки.
     pub fn write_blocks(&mut self, lba: u64, buf: &[u8]) -> Result<(), NvmeError> {
-        if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+        if buf.is_empty() || buf.len() % self.block_size != 0 {
             return Err(NvmeError::BadTransfer);
         }
         let mut done = 0usize;
@@ -511,7 +521,7 @@ impl Nvme {
                     chunk,
                 );
             }
-            self.transfer(IO_WRITE, lba + (done / SECTOR_SIZE) as u64, chunk)?;
+            self.transfer(IO_WRITE, lba + (done / self.block_size) as u64, chunk)?;
             done += chunk;
         }
         Ok(())
@@ -527,7 +537,7 @@ impl Nvme {
         command[11] = (lba >> 32) as u32;
         // Число блоков хранится «на единицу меньше»: ноль означает один блок, а
         // не пустую передачу.
-        command[12] = (bytes / SECTOR_SIZE - 1) as u32;
+        command[12] = (bytes / self.block_size - 1) as u32;
         self.submit_io(&command).map(|_| ())
     }
 
@@ -733,7 +743,7 @@ unsafe fn write64(base: VirtAddr, offset: usize, value: u64) {
 /// Мост к крейту `disk`: тот же трейт, что у virtio-blk и AHCI.
 impl disk::BlockDevice for Nvme {
     fn sector_size(&self) -> u32 {
-        SECTOR_SIZE as u32
+        self.block_size as u32
     }
 
     fn sector_count(&self) -> u64 {
@@ -741,7 +751,7 @@ impl disk::BlockDevice for Nvme {
     }
 
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> disk::Result<()> {
-        if lba + (buf.len() / SECTOR_SIZE) as u64 > self.blocks {
+        if lba + (buf.len() / self.block_size) as u64 > self.blocks {
             return Err(disk::Error::OutOfRange);
         }
         self.read_blocks(lba, buf).map_err(|err| {
@@ -751,7 +761,7 @@ impl disk::BlockDevice for Nvme {
     }
 
     fn write(&mut self, lba: u64, buf: &[u8]) -> disk::Result<()> {
-        if lba + (buf.len() / SECTOR_SIZE) as u64 > self.blocks {
+        if lba + (buf.len() / self.block_size) as u64 > self.blocks {
             return Err(disk::Error::OutOfRange);
         }
         self.write_blocks(lba, buf).map_err(|err| {

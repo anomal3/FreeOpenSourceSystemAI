@@ -166,20 +166,47 @@ pub struct Geometry {
     pub group_desc_blocks: u32,
     /// Блоков под таблицу inode в одной группе.
     pub inode_table_blocks: u32,
+    /// Размер сектора носителя, на котором лежит том.
+    ///
+    /// Блок ext2 адресуется в блоках, носитель — в секторах, и перевод между
+    /// ними — единственное место, где размер сектора вообще важен. До Phase 26c
+    /// он был вписан числом 512 в двух методах ниже; на 4Kn-диске это означало
+    /// бы чтение в восемь раз дальше от нужного места.
+    pub sector_size: u32,
 }
 
 impl Geometry {
     /// Рассчитать геометрию тома длиной `sectors` секторов по 512 байт.
     pub fn plan(first_lba: u64, sectors: u64) -> Result<Self> {
-        let bytes = sectors * 512;
+        Self::plan_on(first_lba, sectors, 512)
+    }
+
+    /// То же, но на носителе с заданным размером сектора.
+    pub fn plan_on(first_lba: u64, sectors: u64, sector_size: u32) -> Result<Self> {
+        let bytes = sectors * u64::from(sector_size);
         let block_size = BlockSize::for_volume(bytes);
-        Self::plan_with(first_lba, sectors, block_size)
+        Self::plan_with_on(first_lba, sectors, block_size, sector_size)
     }
 
     /// То же, но с заданным размером блока — нужно тестам, которые обязаны
     /// проверить обе ветки выбора.
     pub fn plan_with(first_lba: u64, sectors: u64, block_size: BlockSize) -> Result<Self> {
-        let bytes = sectors * 512;
+        Self::plan_with_on(first_lba, sectors, block_size, 512)
+    }
+
+    /// Полная форма: и размер блока, и размер сектора заданы.
+    pub fn plan_with_on(
+        first_lba: u64,
+        sectors: u64,
+        block_size: BlockSize,
+        sector_size: u32,
+    ) -> Result<Self> {
+        // Блок файловой системы обязан быть кратен сектору носителя: иначе
+        // блок начинается в середине сектора, а прочитать полсектора нечем.
+        if sector_size == 0 || block_size.bytes() % sector_size != 0 {
+            return Err(Error::Unsupported);
+        }
+        let bytes = sectors * u64::from(sector_size);
         let block_bytes = u64::from(block_size.bytes());
 
         let blocks = u32::try_from(bytes / block_bytes).map_err(|_| Error::TooSmall)?;
@@ -209,6 +236,7 @@ impl Geometry {
         let geometry = Self {
             first_lba,
             block_size,
+            sector_size,
             blocks,
             first_data_block,
             blocks_per_group,
@@ -230,7 +258,7 @@ impl Geometry {
     }
 
     /// Восстановить геометрию из прочитанного суперблока.
-    pub(crate) fn from_superblock(first_lba: u64, sb: &[u8]) -> Result<Self> {
+    pub(crate) fn from_superblock(first_lba: u64, sb: &[u8], sector_size: u32) -> Result<Self> {
         let magic = u16_at(sb, 56);
         if magic != MAGIC {
             return Err(Error::Corrupt);
@@ -271,6 +299,7 @@ impl Geometry {
         Ok(Self {
             first_lba,
             block_size,
+            sector_size,
             blocks,
             first_data_block,
             blocks_per_group,
@@ -355,13 +384,13 @@ impl Geometry {
     /// Где на носителе лежит блок файловой системы.
     #[must_use]
     pub const fn block_lba(&self, block: u32) -> u64 {
-        self.first_lba + block as u64 * (self.block_size.bytes() as u64 / 512)
+        self.first_lba + block as u64 * self.sectors_per_block() as u64
     }
 
-    /// Сколько секторов занимает один блок.
+    /// Сколько секторов носителя занимает один блок.
     #[must_use]
     pub const fn sectors_per_block(&self) -> u32 {
-        self.block_size.bytes() / 512
+        self.block_size.bytes() / self.sector_size
     }
 
     /// В какой группе и под каким номером лежит inode.

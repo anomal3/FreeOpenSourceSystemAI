@@ -279,14 +279,21 @@ impl Writer {
     }
 
     fn zero_blocks(&self, dev: &mut dyn BlockDevice, block: u32, count: u32) -> Result<()> {
-        const CHUNK: usize = 16 * 512;
+        /// Размер источника нулей в байтах, а не в секторах: при секторе 4096
+        /// шестнадцать секторов — это уже 64 КиБ статической памяти впустую.
+        const CHUNK: usize = 8 * 1024;
         static ZEROS: [u8; CHUNK] = [0; CHUNK];
 
+        let sector = self.geometry.sector_size as usize;
+        let per_write = (CHUNK / sector).max(1);
         let sectors = u64::from(count) * u64::from(self.geometry.sectors_per_block());
         let mut done = 0u64;
         while done < sectors {
-            let batch = ((sectors - done) as usize).min(CHUNK / 512);
-            dev.write(self.geometry.block_lba(block) + done, &ZEROS[..batch * 512])?;
+            let batch = ((sectors - done) as usize).min(per_write);
+            dev.write(
+                self.geometry.block_lba(block) + done,
+                &ZEROS[..batch * sector],
+            )?;
             done += batch as u64;
         }
         Ok(())

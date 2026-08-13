@@ -28,7 +28,7 @@ use alloc::vec::Vec;
 
 use crate::crc32::Crc32;
 use crate::guid::Guid;
-use crate::{BlockDevice, Error, Result, SECTOR_SIZE, check_device, put_u32, put_u64, zero_sectors};
+use crate::{BlockDevice, Error, Result, check_device, put_u32, put_u64, zero_sectors};
 
 /// Число записей в таблице.
 ///
@@ -41,23 +41,46 @@ pub const ENTRY_COUNT: u32 = 128;
 /// меньше.
 pub const ENTRY_SIZE: u32 = 128;
 
-/// Сколько секторов занимает массив записей: 128 * 128 / 512 = 32.
-pub const ENTRY_SECTORS: u64 = (ENTRY_COUNT as u64 * ENTRY_SIZE as u64) / SECTOR_SIZE as u64;
+/// Сколько байт занимает массив записей: 128 * 128 = 16 КиБ.
+const TABLE_BYTES: u64 = ENTRY_COUNT as u64 * ENTRY_SIZE as u64;
+
+/// Сколько секторов занимает массив записей.
+///
+/// Зависит от носителя, а не от формата: 32 сектора по 512 байт и 4 сектора по
+/// 4096 — это одни и те же шестнадцать килобайт. С Phase 26c это функция, а не
+/// константа, и именно здесь раскладка 4Kn-диска расходится с обычной: у него
+/// таблица кончается на четвёртом секторе, а не на тридцать третьем.
+#[must_use]
+pub const fn entry_sectors(sector: usize) -> u64 {
+    let sector = sector as u64;
+    (TABLE_BYTES + sector - 1) / sector
+}
 
 /// Первый сектор, доступный разделам: MBR + заголовок + таблица.
-pub const FIRST_USABLE_LBA: u64 = 2 + ENTRY_SECTORS;
+#[must_use]
+pub const fn first_usable_lba(sector: usize) -> u64 {
+    2 + entry_sectors(sector)
+}
 
 /// Сколько секторов в хвосте носителя занимает резервная копия.
-pub const BACKUP_SECTORS: u64 = ENTRY_SECTORS + 1;
+#[must_use]
+pub const fn backup_sectors(sector: usize) -> u64 {
+    entry_sectors(sector) + 1
+}
 
-/// Выравнивание начала разделов — 1 МиБ.
+/// Выравнивание начала разделов — 1 МиБ, выраженный в секторах носителя.
 ///
 /// Это не эстетика. Накопитель с физическим сектором 4 КиБ (а таковы все
 /// современные) на невыровненном разделе выполняет каждую запись как
 /// «прочитать-изменить-записать», теряя кратно в скорости; у SSD то же
 /// касается страницы стирания. 1 МиБ кратен любому реально существующему
 /// физическому сектору и странице, поэтому его и выбрали стандартом де-факто.
-pub const ALIGNMENT_SECTORS: u64 = (1024 * 1024) / SECTOR_SIZE as u64;
+/// Выравнивание считается в **мегабайте**, а не в числе секторов: на 4Kn-диске
+/// те же 2048 секторов были бы восемью мегабайтами.
+#[must_use]
+pub const fn alignment_sectors(sector: usize) -> u64 {
+    (1024 * 1024 / sector) as u64
+}
 
 /// Тип раздела: EFI System Partition (спецификация UEFI).
 pub const ESP_TYPE: Guid = Guid::new(
@@ -119,9 +142,15 @@ impl Range {
         self.last_lba - self.first_lba + 1
     }
 
+    /// Размер раздела в байтах.
+    ///
+    /// Размер сектора приходится передавать: диапазон измеряется в секторах
+    /// носителя, а сколько это байт — свойство носителя, а не диапазона.
+    /// Догадаться неоткуда, и молчаливое «наверное, 512» здесь ошиблось бы
+    /// ровно в восемь раз.
     #[must_use]
-    pub const fn bytes(&self) -> u64 {
-        self.sectors() * SECTOR_SIZE as u64
+    pub const fn bytes(&self, sector: usize) -> u64 {
+        self.sectors() * sector as u64
     }
 }
 
@@ -141,16 +170,20 @@ pub struct Layout {
 /// носитель с одним ESP — так устроен образ, который собирает `xtask image`:
 /// корневой ФС у системы пока нет, и пустой раздел под неё в образе,
 /// предназначенном для запуска, был бы враньём.
-pub fn plan(sector_count: u64, esp_bytes: u64, want_root: bool) -> Result<Layout> {
-    if sector_count <= FIRST_USABLE_LBA + BACKUP_SECTORS + ALIGNMENT_SECTORS {
+pub fn plan(sector_count: u64, sector: usize, esp_bytes: u64, want_root: bool) -> Result<Layout> {
+    let first_usable = first_usable_lba(sector);
+    let backup = backup_sectors(sector);
+    let alignment = alignment_sectors(sector);
+
+    if sector_count <= first_usable + backup + alignment {
         return Err(Error::TooSmall);
     }
-    let last_usable = sector_count - 1 - BACKUP_SECTORS;
+    let last_usable = sector_count - 1 - backup;
 
     // Начало первого раздела выравнивается вверх, а не просто ставится в
-    // FIRST_USABLE_LBA: см. ALIGNMENT_SECTORS.
-    let esp_first = align_up(FIRST_USABLE_LBA, ALIGNMENT_SECTORS);
-    let esp_sectors = align_up(esp_bytes.div_ceil(SECTOR_SIZE as u64), ALIGNMENT_SECTORS);
+    // первый доступный сектор: см. `alignment_sectors`.
+    let esp_first = align_up(first_usable, alignment);
+    let esp_sectors = align_up(esp_bytes.div_ceil(sector as u64), alignment);
     let esp_last = esp_first
         .checked_add(esp_sectors)
         .ok_or(Error::TooSmall)?
@@ -161,11 +194,11 @@ pub fn plan(sector_count: u64, esp_bytes: u64, want_root: bool) -> Result<Layout
     }
 
     let root = if want_root {
-        let root_first = align_up(esp_last + 1, ALIGNMENT_SECTORS);
+        let root_first = align_up(esp_last + 1, alignment);
         // Раздел меньше выравнивания смысла не имеет: под ФС там всё равно
         // ничего не разместить, а запись в таблице появится и будет вводить в
         // заблуждение.
-        if root_first + ALIGNMENT_SECTORS <= last_usable {
+        if root_first + alignment <= last_usable {
             Some(Range {
                 first_lba: root_first,
                 last_lba: last_usable,
@@ -198,12 +231,13 @@ const fn align_up(value: u64, alignment: u64) -> u64 {
 /// таблицу — диск «сам собой» вернул бы старые разделы.
 pub fn wipe(dev: &mut dyn BlockDevice) -> Result<()> {
     check_device(dev)?;
+    let sector = dev.sector_size() as usize;
     let sectors = dev.sector_count();
 
-    let head = ALIGNMENT_SECTORS.min(sectors);
+    let head = alignment_sectors(sector).min(sectors);
     zero_sectors(dev, 0, head)?;
 
-    let tail = BACKUP_SECTORS.min(sectors);
+    let tail = backup_sectors(sector).min(sectors);
     zero_sectors(dev, sectors - tail, tail)?;
 
     dev.flush()
@@ -216,16 +250,17 @@ pub fn wipe(dev: &mut dyn BlockDevice) -> Result<()> {
 /// раздела прошивка вполне может принять за настоящие.
 pub fn write(dev: &mut dyn BlockDevice, disk_guid: Guid, parts: &[PartitionSpec]) -> Result<()> {
     check_device(dev)?;
+    let sector = dev.sector_size() as usize;
     let sectors = dev.sector_count();
-    if sectors <= FIRST_USABLE_LBA + BACKUP_SECTORS {
+    if sectors <= first_usable_lba(sector) + backup_sectors(sector) {
         return Err(Error::TooSmall);
     }
     if parts.len() > ENTRY_COUNT as usize {
         return Err(Error::NoSpace);
     }
 
-    let first_usable = FIRST_USABLE_LBA;
-    let last_usable = sectors - 1 - BACKUP_SECTORS;
+    let first_usable = first_usable_lba(sector);
+    let last_usable = sectors - 1 - backup_sectors(sector);
 
     // Проверяем раскладку до первой записи: половина размеченного диска хуже,
     // чем неразмеченный.
@@ -253,7 +288,7 @@ pub fn write(dev: &mut dyn BlockDevice, disk_guid: Guid, parts: &[PartitionSpec]
         crc.finish()
     };
 
-    let backup_entries_lba = sectors - BACKUP_SECTORS;
+    let backup_entries_lba = sectors - backup_sectors(sector);
     let backup_header_lba = sectors - 1;
 
     // Порядок записи выбран так, чтобы носитель как можно меньше времени
@@ -270,6 +305,7 @@ pub fn write(dev: &mut dyn BlockDevice, disk_guid: Guid, parts: &[PartitionSpec]
         first_usable,
         last_usable,
         entries_crc,
+        sector,
     );
     let backup = header(
         disk_guid,
@@ -279,15 +315,16 @@ pub fn write(dev: &mut dyn BlockDevice, disk_guid: Guid, parts: &[PartitionSpec]
         first_usable,
         last_usable,
         entries_crc,
+        sector,
     );
 
     // Резервный заголовок пишется раньше основного. Если запись оборвётся
     // между ними, диск останется без действующей разметки — и это лучше, чем
     // основной заголовок, ссылающийся на несуществующую копию: такой диск
     // прошивка считает размеченным и пытается им пользоваться.
-    dev.write(backup_header_lba, &backup)?;
-    dev.write(0, &protective_mbr(sectors))?;
-    dev.write(1, &primary)?;
+    dev.write(backup_header_lba, &backup[..sector])?;
+    dev.write(0, &protective_mbr(sectors, sector)[..sector])?;
+    dev.write(1, &primary[..sector])?;
 
     dev.flush()
 }
@@ -362,27 +399,34 @@ impl Table {
 /// разметки — операция, которая меняет диск, и делать её мимоходом внутри
 /// функции чтения нельзя; вызывающему честнее получить отказ.
 pub fn read(dev: &mut dyn BlockDevice) -> Result<Table> {
-    if dev.sector_size() as usize != SECTOR_SIZE {
+    if !crate::sector_size_supported(dev.sector_size()) {
         return Err(Error::UnsupportedSectorSize(dev.sector_size()));
     }
-    if dev.sector_count() <= FIRST_USABLE_LBA {
+    let sector = dev.sector_size() as usize;
+    if dev.sector_count() <= first_usable_lba(sector) {
         return Err(Error::TooSmall);
     }
 
-    let mut header = [0u8; SECTOR_SIZE];
-    dev.read(1, &mut header)?;
+    // Буфер по наибольшему сектору, читается ровно один сектор носителя.
+    // Массив на стеке, а не `Vec`: чтение таблицы бывает и в установщике, где
+    // куча есть, но лишняя аллокация в коде, который разбирает чужие данные, —
+    // это ещё один путь отказа там, где он не нужен.
+    let mut buffer = [0u8; crate::MAX_SECTOR_SIZE];
+    let header = &mut buffer[..sector];
+    dev.read(1, header)?;
     if &header[0..8] != b"EFI PART" {
         return Err(Error::NotPartitioned);
     }
 
-    let header_size = u32_at(&header, 12) as usize;
+    let header_size = u32_at(header, 12) as usize;
     // Заголовок короче обязательных 92 байт или длиннее сектора — это не наша
     // ревизия формата, и считать по нему CRC бессмысленно.
-    if !(92..=SECTOR_SIZE).contains(&header_size) {
+    if !(92..=sector).contains(&header_size) {
         return Err(Error::NotPartitioned);
     }
-    let stored_crc = u32_at(&header, 16);
-    let mut check = header;
+    let stored_crc = u32_at(header, 16);
+    let mut check = [0u8; crate::MAX_SECTOR_SIZE];
+    check[..sector].copy_from_slice(header);
     check[16..20].fill(0);
     let mut crc = Crc32::new();
     crc.update(&check[..header_size]);
@@ -390,25 +434,26 @@ pub fn read(dev: &mut dyn BlockDevice) -> Result<Table> {
         return Err(Error::NotPartitioned);
     }
 
-    let entry_size = u32_at(&header, 84) as usize;
-    let entry_count = u32_at(&header, 80);
+    let entry_size = u32_at(header, 84) as usize;
+    let entry_count = u32_at(header, 80);
     // Запись меньше 128 байт формат запрещает; слишком большая таблица — это
     // либо мусор, либо носитель, который мы всё равно не размечали.
     if entry_size < ENTRY_SIZE as usize || entry_count > 4096 {
         return Err(Error::NotPartitioned);
     }
-    let entries_lba = u64_at(&header, 72);
+    let entries_lba = u64_at(header, 72);
     let table_bytes = entry_size * entry_count as usize;
-    let table_sectors = table_bytes.div_ceil(SECTOR_SIZE);
+    let table_sectors = table_bytes.div_ceil(sector);
     if entries_lba + table_sectors as u64 > dev.sector_count() {
         return Err(Error::OutOfRange);
     }
 
-    let mut table = vec![0u8; table_sectors * SECTOR_SIZE];
+    let entries_crc = u32_at(header, 88);
+    let mut table = vec![0u8; table_sectors * sector];
     dev.read(entries_lba, &mut table)?;
     let mut crc = Crc32::new();
     crc.update(&table[..table_bytes]);
-    if crc.finish() != u32_at(&header, 88) {
+    if crc.finish() != entries_crc {
         return Err(Error::NotPartitioned);
     }
 
@@ -436,8 +481,8 @@ pub fn read(dev: &mut dyn BlockDevice) -> Result<Table> {
 
     Ok(Table {
         disk_guid: Guid::from_bytes(header[56..72].try_into().expect("ровно 16 байт")),
-        first_usable_lba: u64_at(&header, 40),
-        last_usable_lba: u64_at(&header, 48),
+        first_usable_lba: u64_at(header, 40),
+        last_usable_lba: u64_at(header, 48),
         partitions,
     })
 }
@@ -490,12 +535,16 @@ fn header(
     first_usable: u64,
     last_usable: u64,
     entries_crc: u32,
-) -> [u8; SECTOR_SIZE] {
-    /// Длина заголовка по спецификации. Именно это число, а не 512: CRC
-    /// считается по первым 92 байтам, и хвост сектора в неё не входит.
+    sector_size: usize,
+) -> [u8; crate::MAX_SECTOR_SIZE] {
+    /// Длина заголовка по спецификации. Именно это число, а не размер сектора:
+    /// CRC считается по первым 92 байтам, и хвост сектора в неё не входит.
+    /// Ровно поэтому заголовок 4Kn-диска отличается от обычного только тем,
+    /// **где он лежит**, а не тем, что в нём написано.
     const HEADER_SIZE: u32 = 92;
 
-    let mut sector = [0u8; SECTOR_SIZE];
+    debug_assert!(sector_size <= crate::MAX_SECTOR_SIZE);
+    let mut sector = [0u8; crate::MAX_SECTOR_SIZE];
     sector[0..8].copy_from_slice(b"EFI PART");
     // Ревизия 1.0 записывается как 0x00010000.
     put_u32(&mut sector, 8, 0x0001_0000);
@@ -520,8 +569,13 @@ fn header(
 }
 
 /// Защитный MBR: одна запись типа 0xEE на весь носитель.
-fn protective_mbr(sectors: u64) -> [u8; SECTOR_SIZE] {
-    let mut sector = [0u8; SECTOR_SIZE];
+///
+/// Подпись `0x55AA` стоит на 510-м байте **сектора**, а не в его конце: у
+/// 4Kn-диска после неё остаётся ещё три с половиной килобайта нулей, и это
+/// правильно — MBR описан в байтах от начала носителя, а не долями сектора.
+fn protective_mbr(sectors: u64, sector_size: usize) -> [u8; crate::MAX_SECTOR_SIZE] {
+    debug_assert!(sector_size <= crate::MAX_SECTOR_SIZE);
+    let mut sector = [0u8; crate::MAX_SECTOR_SIZE];
     let entry = &mut sector[446..462];
 
     entry[0] = 0x00; // не загрузочный: грузит прошивка, а не код MBR
@@ -553,19 +607,21 @@ mod tests {
     use crate::mem::{MemDisk, junk_disk};
 
     const DISK_SECTORS: u64 = 128 * 1024; // 64 МиБ
+    /// Размер сектора образа, на котором стоят эти проверки.
+    const SECTOR: usize = crate::DEFAULT_SECTOR_SIZE;
 
     fn sample_disk() -> MemDisk {
         junk_disk(DISK_SECTORS).expect("образ на 64 МиБ должен размещаться")
     }
 
-    fn read_sector(dev: &mut MemDisk, lba: u64) -> [u8; SECTOR_SIZE] {
-        let mut sector = [0u8; SECTOR_SIZE];
+    fn read_sector(dev: &mut MemDisk, lba: u64) -> [u8; crate::DEFAULT_SECTOR_SIZE] {
+        let mut sector = [0u8; crate::DEFAULT_SECTOR_SIZE];
         dev.read(lba, &mut sector).expect("сектор в пределах образа");
         sector
     }
 
     fn write_sample(dev: &mut MemDisk) -> Layout {
-        let layout = plan(dev.sector_count(), 16 * 1024 * 1024, true).expect("раскладка");
+        let layout = plan(dev.sector_count(), SECTOR, 16 * 1024 * 1024, true).expect("раскладка");
         let root = layout.root.expect("корневой раздел помещается");
         wipe(dev).expect("затирание");
         write(
@@ -596,27 +652,27 @@ mod tests {
 
     #[test]
     fn layout_is_aligned_and_ordered() {
-        let layout = plan(DISK_SECTORS, 16 * 1024 * 1024, true).expect("раскладка");
+        let layout = plan(DISK_SECTORS, SECTOR, 16 * 1024 * 1024, true).expect("раскладка");
         let root = layout.root.expect("корневой раздел");
-        assert_eq!(layout.esp.first_lba % ALIGNMENT_SECTORS, 0);
-        assert_eq!(root.first_lba % ALIGNMENT_SECTORS, 0);
+        assert_eq!(layout.esp.first_lba % alignment_sectors(SECTOR), 0);
+        assert_eq!(root.first_lba % alignment_sectors(SECTOR), 0);
         assert!(layout.esp.last_lba < root.first_lba);
-        assert_eq!(root.last_lba, DISK_SECTORS - 1 - BACKUP_SECTORS);
-        assert_eq!(layout.esp.bytes(), 16 * 1024 * 1024);
+        assert_eq!(root.last_lba, DISK_SECTORS - 1 - backup_sectors(SECTOR));
+        assert_eq!(layout.esp.bytes(SECTOR), 16 * 1024 * 1024);
     }
 
     #[test]
     fn single_partition_layout_has_no_root() {
-        let layout = plan(DISK_SECTORS, 16 * 1024 * 1024, false).expect("раскладка");
+        let layout = plan(DISK_SECTORS, SECTOR, 16 * 1024 * 1024, false).expect("раскладка");
         assert!(layout.root.is_none());
     }
 
     #[test]
     fn tiny_disk_is_rejected() {
-        assert_eq!(plan(64, 1024 * 1024, false), Err(Error::TooSmall));
+        assert_eq!(plan(64, SECTOR, 1024 * 1024, false), Err(Error::TooSmall));
         // Носитель есть, но ESP запрошен больше него.
         assert_eq!(
-            plan(DISK_SECTORS, 512 * 1024 * 1024, false),
+            plan(DISK_SECTORS, SECTOR, 512 * 1024 * 1024, false),
             Err(Error::TooSmall)
         );
     }
@@ -679,7 +735,7 @@ mod tests {
         assert_eq!(u64::from_le_bytes(primary[72..80].try_into().unwrap()), 2);
         assert_eq!(
             u64::from_le_bytes(backup[72..80].try_into().unwrap()),
-            DISK_SECTORS - BACKUP_SECTORS
+            DISK_SECTORS - backup_sectors(SECTOR)
         );
     }
 
@@ -719,7 +775,7 @@ mod tests {
 
         // Резервная копия обязана быть побайтово той же.
         let mut backup = vec![0u8; table.len()];
-        dev.read(DISK_SECTORS - BACKUP_SECTORS, &mut backup)
+        dev.read(DISK_SECTORS - backup_sectors(SECTOR), &mut backup)
             .expect("резервная таблица");
         assert_eq!(backup, table);
     }
@@ -735,7 +791,7 @@ mod tests {
 
         wipe(&mut dev).expect("затирание");
 
-        for lba in [0, 1, 2, ALIGNMENT_SECTORS - 1, DISK_SECTORS - BACKUP_SECTORS, DISK_SECTORS - 1]
+        for lba in [0, 1, 2, alignment_sectors(SECTOR) - 1, DISK_SECTORS - backup_sectors(SECTOR), DISK_SECTORS - 1]
         {
             let sector = read_sector(&mut dev, lba);
             assert!(
@@ -759,8 +815,8 @@ mod tests {
 
         let table = read(&mut dev).expect("таблица читается");
         assert_eq!(table.disk_guid, Guid::from_entropy([1; 16]));
-        assert_eq!(table.first_usable_lba, FIRST_USABLE_LBA);
-        assert_eq!(table.last_usable_lba, DISK_SECTORS - 1 - BACKUP_SECTORS);
+        assert_eq!(table.first_usable_lba, first_usable_lba(SECTOR));
+        assert_eq!(table.last_usable_lba, DISK_SECTORS - 1 - backup_sectors(SECTOR));
         assert_eq!(table.partitions.len(), 2);
 
         let esp = &table.partitions[0];

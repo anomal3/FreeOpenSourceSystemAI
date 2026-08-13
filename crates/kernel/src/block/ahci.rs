@@ -154,7 +154,11 @@ const FIS_TYPE_H2D: u8 = 0x27;
 /// Бит в байте 1 FIS: это команда, а не обновление регистров.
 const FIS_H2D_COMMAND: u8 = 1 << 7;
 
-/// Размер сектора, который поддерживается. Диски с 4096 существуют, и молча
+/// Сколько байт возвращает команда IDENTIFY — всегда 512, независимо от того,
+/// какие сектора у диска: это размер ответа, а не носителя.
+const IDENTIFY_BYTES: usize = 512;
+
+/// Размер сектора по умолчанию, пока диск не сказал иного. Диски с 4096 существуют, и молча
 /// считать их 512-байтными — способ потерять данные; такой диск отвергается с
 /// сообщением.
 pub const SECTOR_SIZE: usize = 512;
@@ -240,6 +244,8 @@ pub struct AhciDisk {
     /// Номер порта — он же имя диска в журнале.
     port_index: usize,
     sectors: u64,
+    /// Размер логического сектора, объявленный самим диском.
+    sector_size: usize,
 }
 
 /// Найти контроллеры AHCI и поднять все диски, какие за ними есть.
@@ -331,9 +337,10 @@ unsafe fn attach(device: &Device, disks: &mut Vec<AhciDisk>) -> Result<(), AhciE
         match unsafe { AhciDisk::start(port, index) } {
             Ok(disk) => {
                 kprintln!(
-                    "  ahci        : port {index}: {} sectors ({} MiB)",
+                    "  ahci        : port {index}: {} sectors of {} B ({} MiB)",
                     disk.sectors,
-                    disk.sectors / 2048,
+                    disk.sector_size,
+                    disk.sectors * disk.sector_size as u64 / (1024 * 1024),
                 );
                 disks.push(disk);
             }
@@ -426,6 +433,7 @@ impl AhciDisk {
             data,
             port_index,
             sectors: 0,
+            sector_size: SECTOR_SIZE,
         };
         disk.identify()?;
         Ok(disk)
@@ -444,7 +452,7 @@ impl AhciDisk {
     /// слова 106 и пары 117–118 — поле, которого у старых дисков нет, и тогда
     /// сектор равен 512 по умолчанию.
     fn identify(&mut self) -> Result<(), AhciError> {
-        self.run(ATA_IDENTIFY, 0, 0, SECTOR_SIZE, false)?;
+        self.run(ATA_IDENTIFY, 0, 0, IDENTIFY_BYTES, false)?;
 
         // SAFETY: буфер выделен на MAX_TRANSFER байт, читаются первые 512.
         let words: [u16; 256] = unsafe {
@@ -471,11 +479,15 @@ impl AhciDisk {
         } else {
             SECTOR_SIZE as u32
         };
-        if sector_size as usize != SECTOR_SIZE {
+        // Размер сектора принимается таким, каким его назвал диск: с Phase 26c
+        // вся разметка считается в секторах носителя, и подгонять 4Kn под 512
+        // больше не нужно — а именно подгонка и была бы потерей данных.
+        if !disk::sector_size_supported(sector_size) {
             return Err(AhciError::UnsupportedSectorSize(sector_size));
         }
 
         self.sectors = sectors;
+        self.sector_size = sector_size as usize;
         Ok(())
     }
 
@@ -611,16 +623,16 @@ impl AhciDisk {
     /// сообщается физический адрес. Ровно то же самое и по той же причине
     /// делает virtio-blk.
     pub fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), AhciError> {
-        if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+        if buf.is_empty() || buf.len() % self.sector_size != 0 {
             return Err(AhciError::BadTransfer);
         }
         let mut done = 0usize;
         while done < buf.len() {
             let chunk = (buf.len() - done).min(MAX_TRANSFER);
-            let sectors = chunk / SECTOR_SIZE;
+            let sectors = chunk / self.sector_size;
             self.run(
                 ATA_READ_DMA_EXT,
-                lba + (done / SECTOR_SIZE) as u64,
+                lba + (done / self.sector_size) as u64,
                 sectors as u16,
                 chunk,
                 false,
@@ -640,7 +652,7 @@ impl AhciDisk {
 
     /// Записать сектора.
     pub fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), AhciError> {
-        if buf.is_empty() || buf.len() % SECTOR_SIZE != 0 {
+        if buf.is_empty() || buf.len() % self.sector_size != 0 {
             return Err(AhciError::BadTransfer);
         }
         let mut done = 0usize;
@@ -656,8 +668,8 @@ impl AhciDisk {
             }
             self.run(
                 ATA_WRITE_DMA_EXT,
-                lba + (done / SECTOR_SIZE) as u64,
-                (chunk / SECTOR_SIZE) as u16,
+                lba + (done / self.sector_size) as u64,
+                (chunk / self.sector_size) as u16,
                 chunk,
                 true,
             )?;
@@ -833,7 +845,7 @@ unsafe fn write32(base: VirtAddr, offset: usize, value: u32) {
 /// одинаковыми независимо от того, каким проводом подключён диск.
 impl disk::BlockDevice for AhciDisk {
     fn sector_size(&self) -> u32 {
-        SECTOR_SIZE as u32
+        self.sector_size as u32
     }
 
     fn sector_count(&self) -> u64 {
@@ -841,7 +853,7 @@ impl disk::BlockDevice for AhciDisk {
     }
 
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> disk::Result<()> {
-        if lba + (buf.len() / SECTOR_SIZE) as u64 > self.sectors {
+        if lba + (buf.len() / self.sector_size) as u64 > self.sectors {
             return Err(disk::Error::OutOfRange);
         }
         self.read_sectors(lba, buf).map_err(|err| {
@@ -851,7 +863,7 @@ impl disk::BlockDevice for AhciDisk {
     }
 
     fn write(&mut self, lba: u64, buf: &[u8]) -> disk::Result<()> {
-        if lba + (buf.len() / SECTOR_SIZE) as u64 > self.sectors {
+        if lba + (buf.len() / self.sector_size) as u64 > self.sectors {
             return Err(disk::Error::OutOfRange);
         }
         self.write_sectors(lba, buf).map_err(|err| {

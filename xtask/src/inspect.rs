@@ -25,7 +25,7 @@ use ext4_view::Ext4;
 pub fn image(path: &Path) -> Result<()> {
     let data = fs::read(path)
         .with_context(|| format!("не удалось прочитать образ {}", path.display()))?;
-    let sectors = data.len() as u64 / disk::SECTOR_SIZE as u64;
+    let sectors = data.len() as u64 / disk::DEFAULT_SECTOR_SIZE as u64;
     let mut dev = disk::MemDisk::from_vec(data)
         .ok_or_else(|| anyhow::anyhow!("длина образа не кратна сектору"))?;
 
@@ -41,7 +41,7 @@ pub fn image(path: &Path) -> Result<()> {
     );
 
     for partition in &table.partitions {
-        let size = partition.range().bytes();
+        let size = partition.range().bytes(disk::DEFAULT_SECTOR_SIZE);
         let kind = if partition.type_guid == gpt::ESP_TYPE {
             "ESP"
         } else if partition.type_guid == gpt::FREEOS_ROOT_TYPE {
@@ -68,8 +68,8 @@ pub fn image(path: &Path) -> Result<()> {
         return Ok(());
     };
 
-    let first = root.first_lba as usize * disk::SECTOR_SIZE;
-    let last = (root.last_lba as usize + 1) * disk::SECTOR_SIZE;
+    let first = root.first_lba as usize * disk::DEFAULT_SECTOR_SIZE;
+    let last = (root.last_lba as usize + 1) * disk::DEFAULT_SECTOR_SIZE;
     let bytes = dev.as_bytes();
     if last > bytes.len() {
         bail!("корневой раздел выходит за пределы образа");
