@@ -616,7 +616,13 @@ fn mount_disk_root(info: &BootInfo) {
         partition.unit,
     );
 
-    let mount = match fs::Ext2Fs::mount(partition.device, first_lba) {
+    // Проверка идёт **до** монтирования и в одиночку — иначе она чинила бы том
+    // из-под себя: редактор держит счётчики свободного в памяти, и починка под
+    // ним оставила бы его с числами, которых на диске уже нет.
+    let mut device = partition.device;
+    check_root(&mut *device, first_lba);
+
+    let mount = match fs::Ext2Fs::mount(device, first_lba) {
         Ok(mount) => mount,
         Err(err) => {
             kprintln!("  root        : cannot mount ext2 at LBA {first_lba}: {err}");
@@ -645,6 +651,62 @@ fn mount_disk_root(info: &BootInfo) {
     fs::set_root(alloc::boxed::Box::new(mount));
 
     verify_root();
+}
+
+/// Проверить корневой том, если прошлый сеанс закрыл его не по-человечески.
+///
+/// Проверка не запускается на томе, закрытом чисто, и это не экономия: полный
+/// обход стоит чтения всех таблиц inode и всех каталогов, то есть секунд на
+/// каждой загрузке. Признак чистого размонтирования (фаза 27) существует ровно
+/// затем, чтобы знать, когда это оправдано.
+fn check_root(device: &mut dyn disk::BlockDevice, first_lba: u64) {
+    match ext2::Ext2::is_clean(device, first_lba) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(err) => {
+            // Суперблок не читается вовсе. Проверка тут бессильна, а
+            // монтирование ниже скажет о том же своими словами.
+            kprintln!("  fsck        : cannot read the superblock: {err}");
+            return;
+        }
+    }
+
+    kprintln!("  fsck        : the volume was not closed cleanly, checking it");
+    let report = match ext2::check(device, first_lba, ext2::Fix::Safe) {
+        Ok(report) => report,
+        Err(err) => {
+            kprintln!("  fsck        : the check itself failed: {err}");
+            return;
+        }
+    };
+
+    // Печатается не всё: на разбитом вдребезги томе список находок длиннее
+    // экрана, а первые несколько всё равно объясняют, что произошло.
+    const SHOWN: usize = 8;
+    for problem in report.problems.iter().take(SHOWN) {
+        kprintln!("  fsck        : {problem}");
+    }
+    let hidden = report.problems.len().saturating_sub(SHOWN) + report.dropped;
+    if hidden > 0 {
+        kprintln!("  fsck        : and {hidden} more");
+    }
+
+    if report.is_clean() {
+        kprintln!("  fsck        : nothing to repair, the volume is consistent");
+    } else {
+        kprintln!(
+            "  fsck        : {} problem(s) found, {} repaired, {} file(s) moved to /lost+found",
+            report.problems.len() + report.dropped,
+            report.fixed,
+            report.rescued
+        );
+    }
+    if report.needs_attention() {
+        // Честность важнее бодрости: то, что чинится только решением человека,
+        // так и остаётся, и система обязана это сказать, а не отчитаться
+        // «починено» и замолчать.
+        kprintln!("  fsck        : some of it needs a decision and was left alone");
+    }
 }
 
 /// Показать, что корень действительно читается, и что права на нём настоящие.

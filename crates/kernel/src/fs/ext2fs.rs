@@ -174,6 +174,47 @@ impl Ext2Mount {
     pub fn was_clean(&self) -> bool {
         self.0.inner.lock().fs.was_clean()
     }
+
+    /// То же, но словами общего интерфейса — для оболочки.
+    fn summary(&self) -> VfsResult<crate::vfs::CheckSummary> {
+        let report = self.scan()?;
+        let mut problems = Vec::new();
+        problems
+            .try_reserve_exact(report.problems.len())
+            .map_err(|_| VfsError::OutOfMemory)?;
+        for problem in &report.problems {
+            let mut text = alloc::string::String::new();
+            // Строка собирается здесь, а не в крейте `ext2`: там нет ни
+            // аллокатора по умолчанию, ни причины знать, кому это показывают.
+            core::fmt::Write::write_fmt(&mut text, format_args!("{problem}"))
+                .map_err(|_| VfsError::OutOfMemory)?;
+            problems.push(text);
+        }
+        Ok(crate::vfs::CheckSummary {
+            problems,
+            dropped: report.dropped,
+            needs_attention: report.needs_attention(),
+            inodes_used: report.inodes_used,
+            blocks_used: report.blocks_used,
+        })
+    }
+
+    /// Проверить смонтированный том, ничего не меняя.
+    ///
+    /// Только чтение, и это не осторожность, а необходимость: счётчики
+    /// свободного живут в памяти редактора, и починка под ним оставила бы его с
+    /// устаревшими числами — он выдал бы под новый файл только что
+    /// освобождённый блок. Чинит система при монтировании, до того как редактор
+    /// появился на свет.
+    ///
+    /// Замок держится всю проверку: без него другая задача успела бы записать
+    /// файл посреди обхода, и «находка» описывала бы не том, а гонку.
+    pub fn scan(&self) -> VfsResult<ext2::Report> {
+        let mut guard = self.0.inner.lock();
+        let first_lba = guard.fs.geometry().first_lba;
+        let Inner { disk, .. } = &mut *guard;
+        ext2::check(disk, first_lba, ext2::Fix::Nothing).map_err(convert)
+    }
 }
 
 impl FileSystem for Ext2Mount {
@@ -196,6 +237,10 @@ impl FileSystem for Ext2Mount {
     /// последним, потому что он утверждает, что предыдущие два состоялись;
     /// поставленный раньше, он обещал бы следующей загрузке то, чего на диске
     /// ещё нет.
+    fn check(&self) -> Option<VfsResult<crate::vfs::CheckSummary>> {
+        Some(self.summary())
+    }
+
     fn sync(&self) -> VfsResult<()> {
         let mut guard = self.0.inner.lock();
         let Inner { disk, editor, .. } = &mut *guard;

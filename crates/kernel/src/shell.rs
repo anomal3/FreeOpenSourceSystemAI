@@ -462,6 +462,7 @@ fn run_command(line: &str) -> bool {
                 kill(argument);
             }
         }
+        "fsck" => fsck(),
         "shutdown" | "poweroff" => {
             crate::power::shut_down(false);
             // Сюда возвращаются, только если машина отказалась гаснуть: она
@@ -480,6 +481,50 @@ fn run_command(line: &str) -> bool {
         other => sprintln!("  unknown command '{other}'; try 'help'"),
     }
     false
+}
+
+/// Проверить корневой том и рассказать, что нашлось.
+///
+/// Только смотрит. Чинит система при монтировании — до того, как у тома
+/// появился редактор со счётчиками в памяти; починка из-под работающей системы
+/// оставила бы его с числами, которых на диске уже нет. Сказать это человеку
+/// важнее, чем предложить кнопку «починить»: он должен знать, что для ремонта
+/// машину надо перезагрузить.
+fn fsck() {
+    let Some(result) = crate::fs::check_root() else {
+        sprintln!("  nothing is mounted");
+        return;
+    };
+    let Some(result) = result else {
+        sprintln!("  the root filesystem does not know how to check itself");
+        return;
+    };
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(err) => {
+            sprintln!("  fsck failed: {err}");
+            return;
+        }
+    };
+
+    for problem in &summary.problems {
+        sprintln!("  {problem}");
+    }
+    if summary.dropped > 0 {
+        sprintln!("  and {} more", summary.dropped);
+    }
+    sprintln!(
+        "  {} inode(s) and {} block(s) in use",
+        summary.inodes_used,
+        summary.blocks_used
+    );
+    if summary.problems.is_empty() && summary.dropped == 0 {
+        sprintln!("  the volume is consistent");
+    } else if summary.needs_attention {
+        sprintln!("  some of it needs a decision; the rest is repaired at the next boot");
+    } else {
+        sprintln!("  all of it is repaired automatically at the next boot");
+    }
 }
 
 fn help() {
@@ -501,6 +546,7 @@ fn help() {
     sprintln!("  run [-b] <p>  run a program with arguments; -b does not wait");
     sprintln!("  kill <task>   stop a running program by its task number");
     sprintln!("  clear         clear the window");
+    sprintln!("  fsck          check the root volume");
     sprintln!("  shutdown      switch the machine off");
     sprintln!("  reboot        restart the machine");
     sprintln!("  exit          finish the boot and halt");
