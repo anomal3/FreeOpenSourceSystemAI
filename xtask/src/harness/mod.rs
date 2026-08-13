@@ -47,7 +47,7 @@ use anyhow::{Context, Result, bail};
 use crate::arch::Arch;
 use crate::build::{self, BuildOptions};
 use crate::paths;
-use crate::qemu::{self, Drive, Pointer, RunOptions};
+use crate::qemu::{self, DiskBus, Drive, Pointer, RunOptions};
 use crate::{image, util};
 
 pub use scenarios::{Scenario, Step, Target};
@@ -279,6 +279,7 @@ fn execute(
         monitor: Some(monitor_addr),
         qmp: qmp_addr,
         pointer: if scenario.tablet { Pointer::Tablet } else { Pointer::Mouse },
+        disk_bus: if scenario.ahci { DiskBus::Ahci } else { DiskBus::Virtio },
         ..RunOptions::default()
     };
 
@@ -579,6 +580,20 @@ fn press_button(qmp: Option<&mut qmp::Qmp>, hmp: &mut monitor::Monitor, down: bo
     }
 }
 
+/// Диск, на который ставил установщик.
+fn prepare_installed_disk(arch: Arch) -> Result<PathBuf> {
+    let disk = paths::target_disk(arch);
+    if !disk.is_file() {
+        bail!(
+            "нет диска, на который ставил установщик: {}\n\
+             Сценарии 'installed', 'write', 'persist' и 'ahci' идут после 'install' \
+             и опираются на его результат.",
+            disk.display()
+        );
+    }
+    Ok(disk)
+}
+
 /// Носители машины для сценария.
 fn prepare_drives(target: Target, built: &build::Built, arch: Arch) -> Result<Vec<Drive>> {
     let drives = match target {
@@ -591,17 +606,13 @@ fn prepare_drives(target: Target, built: &build::Built, arch: Arch) -> Result<Ve
             Drive::Image(image::prepare_target(arch, 1024, true)?),
         ],
         Target::Iso => vec![Drive::Cdrom(image::build_iso(built, image::Kind::System)?)],
-        Target::Installed => {
-            let disk = paths::target_disk(arch);
-            if !disk.is_file() {
-                bail!(
-                    "нет диска, на который ставил установщик: {}\n\
-                     Сценарий 'installed' идёт после 'install' и опирается на его результат.",
-                    disk.display()
-                );
-            }
-            vec![Drive::Image(disk)]
-        }
+        Target::Installed => vec![Drive::Image(prepare_installed_disk(arch)?)],
+        // Порядок обязателен: прошивка грузится с первого носителя, а второй —
+        // тот, ради которого сценарий существует.
+        Target::LiveAndDisk => vec![
+            Drive::HostDirectory(qemu::prepare_esp(built)?),
+            Drive::Image(prepare_installed_disk(arch)?),
+        ],
     };
     Ok(drives)
 }

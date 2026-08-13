@@ -16,9 +16,9 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::block::Counted;
 use crate::sync::Mutex;
 use crate::vfs::{DirEntry, FileSystem, Metadata, Node, NodeKind, VfsError, VfsResult};
-use crate::virtio::blk::VirtioBlk;
 
 /// Диск вместе с разобранной на нём файловой системой.
 ///
@@ -28,7 +28,13 @@ use crate::virtio::blk::VirtioBlk;
 /// свободного, которые меняет он сам. Общей изменяемой памяти у них нет, а
 /// значит нет и вопроса, кто чью копию не обновил.
 struct Inner {
-    disk: VirtioBlk,
+    /// Носитель — любой, лишь бы умел сектора.
+    ///
+    /// До Phase 26a здесь стоял `VirtioBlk`, и это было не упрощение, а
+    /// ограничение: том, лежащий на диске SATA, смонтировать было нечем, потому
+    /// что тип не совпадал. Крейт `ext2` всегда работал через
+    /// `&mut dyn BlockDevice` — расходилось с ним только ядро.
+    disk: Counted,
     fs: ext2::Ext2,
     editor: ext2::Editor,
 }
@@ -89,7 +95,11 @@ fn metadata_of(inode: &ext2::Inode) -> Metadata {
 
 impl Ext2Fs {
     /// Смонтировать том, начинающийся с сектора `first_lba`.
-    pub fn mount(mut disk: VirtioBlk, first_lba: u64) -> VfsResult<Ext2Mount> {
+    pub fn mount(
+        device: alloc::boxed::Box<dyn disk::BlockDevice + Send>,
+        first_lba: u64,
+    ) -> VfsResult<Ext2Mount> {
+        let mut disk = Counted::new(device);
         let fs = ext2::Ext2::mount(&mut disk, first_lba).map_err(convert)?;
         let editor = ext2::Editor::open(&mut disk, first_lba).map_err(convert)?;
         Ok(Ext2Mount(Arc::new(Self {

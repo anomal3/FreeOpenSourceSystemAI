@@ -107,12 +107,13 @@ Two honest limits:
 
 - **The live ISO writes nothing.** It boots, mounts its initrd and gives you the desktop and
   the shell. That is the whole of it, and it is the point — nothing on the host is touched.
-- **The installer ISO can install, but the result will not boot yet.** The installer writes
-  through UEFI Block I/O, so the firmware's own SATA or NVMe driver does the work and the
-  disk really does get written. The kernel, however, mounts its root through virtio-blk,
-  which exists in QEMU and not in VirtualBox. The drivers that close this — AHCI, then
-  NVMe — are the next phase, and until they land, installing into a hypervisor is a one-way
-  trip.
+- **The installer ISO can install, and the result should now boot — on SATA.** The
+  installer writes through UEFI Block I/O, so the firmware's own driver does the work. The
+  kernel used to mount its root through virtio-blk alone, which exists in QEMU and not in
+  VirtualBox; since Phase 26a it also speaks **AHCI**, the controller VirtualBox presents by
+  default, and looks for its root partition on every disk rather than on the first one. That
+  is verified in QEMU on both architectures; the VirtualBox run itself has not been done
+  yet, and NVMe — the way a laptop attaches its disk — is the next phase.
 
 `xtask` locates QEMU and its UEFI firmware automatically; override with the
 `FREEOS_OVMF_X86_64` / `FREEOS_OVMF_AARCH64` environment variables.
@@ -873,6 +874,62 @@ code, not demonstrated by a test. There is no new line in the log proving "inter
 longer held off for tens of milliseconds" — the 56 passing scenarios establish only that
 nothing broke on the way.
 
+### Disks that are not virtio
+
+For nine phases the words "disk" and "virtio-blk" meant the same thing in this kernel. That
+was not a shortcut while the system lived in QEMU — there is no other disk there — but it
+stopped being true the moment the system was carried anywhere else. VirtualBox gives a SATA
+controller by default; a laptop has NVMe. In both cases the installer writes the disk
+perfectly well, because it goes through the firmware's Block I/O, and then the installed
+system does not find its own root: no driver. Installing into a hypervisor was a one-way
+trip, and it was named as such in this README rather than papered over.
+
+What changed is smaller than it sounds, because most of it was already right. The trait
+`disk::BlockDevice` has existed since Phase 8a and is checked by host tests; `ext2` has
+always worked through `&mut dyn BlockDevice`. Only the kernel disagreed: `Ext2Fs::mount`
+took a `VirtioBlk` by value, so a volume on any other kind of disk could not be mounted
+because *the type did not match*. So the phase is two things in the plural — a list of
+disks instead of one device, and a search for the root partition across **all** of them
+instead of on the one that happened to be there — plus a driver.
+
+The driver is AHCI: the controller behind every SATA port, the one VirtualBox presents by
+default, and a PCI device like any other. Its shape is worth one paragraph because it
+explains the failure below. Commands do not go through registers; they go through memory.
+The port has a list of 32 command headers, each pointing at a command table holding a
+twenty-byte FIS — the ATA command, the sector, the count — and a table describing where the
+data goes. Starting a command means setting its bit in `PxCI`; the controller clears that
+bit when it is done. All of it lives in the DMA window from Phase 25, which hands out
+page-aligned buffers and therefore satisfies AHCI's alignment rules for free.
+
+One defect is worth naming, because it is exactly the class this project keeps meeting:
+**a state that the firmware happened to leave behind, mistaken for a state of the hardware.**
+On x86-64 the driver worked immediately. On `virt` the same disk reported signature
+`0xFFFFFFFF` — "there is no device here" — while `PxSSTS` said the link was up and a device
+was present. The signature register is filled from the frame a device sends when it
+introduces itself, which happens on link reset and only if the receive area is already
+enabled. OVMF has a SATA driver and had done all of that before the kernel ran, so the
+answer was simply sitting there; `ArmVirtQemu` has no SATA driver at all and had touched
+nothing. The driver now resets the link itself (`PxSCTL.DET`), which makes the port's state
+the same in all three cases — firmware set it up, firmware ignored it, firmware left it
+half-configured — and only then reads the signature.
+
+The bench got a scenario named `ahci`, and its shape follows from the same asymmetry.
+Booting *from* SATA works on x86-64 and cannot work on `virt`, where the firmware has no
+driver for it and lands in its own shell with `map: No mapping found`. But what needs
+checking is the driver in the kernel, not the one in the firmware — so the machine boots the
+way it always does, and the installed disk is attached **as a second device, over AHCI**.
+The kernel is then required to find its root on it, which also exercises the other half of
+the phase: two disks, and the partition recognised on the right one. The log says which:
+`root : found on ahci #0`.
+
+Two limits stated plainly. Completion is polled rather than waited for on an interrupt —
+the same as virtio-blk, and for the same reason: an interrupt would not make the disk
+faster, and the first thing needed was a path to the root at all. The timeout is real,
+measured on the monotonic counter from Phase 17, so a dead disk produces a message rather
+than a silently stopped kernel. And this is verified **in QEMU on both architectures**;
+the VirtualBox run that motivated the whole phase has not been done yet, and will be said
+out loud when it is.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -881,7 +938,7 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Fifteen scenarios today: a program runs in an address space of its own, one that faults is
+Twenty scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
@@ -903,8 +960,10 @@ disk boots, mounts its ext2 root, takes its identity from the `/etc/passwd` it w
 with, and gets four different answers to four files whose permissions differ (`installed`);
 the shell and a ring-3 program both write to that root, a file created a moment ago reports
 an age of zero seconds rather than the installation date, and a directory that is not empty
-refuses to be deleted (`write`); and a second boot of the same disk finds what was written,
-does not find what was deleted, and still has the installer's files (`persist`).
+refuses to be deleted (`write`); a second boot of the same disk finds what was written,
+does not find what was deleted, and still has the installer's files (`persist`); and that
+same disk, attached over **SATA** instead of virtio, is found by the AHCI driver, named as
+the disk the root was found on, read from and written to (`ahci`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -965,14 +1024,17 @@ with the data intact. Promising more without a journal would be a lie.
 Run `cargo xtask inspect` after an install to see what actually landed: our own code parses
 the partition table, and a foreign implementation reads the filesystem.
 
-The kernel reaches that partition over **virtio-blk**, for the same reason the keyboard
-comes over xHCI: one driver for both architectures. AHCI exists only where SATA does — on
-`q35` and not on `virt` — while virtio-blk works identically on both. On a real Raspberry
-Pi 4 there is no virtio at all; the disk there will arrive over USB mass storage on top of
-the xHCI stack that already exists, and that work is named in the roadmap rather than
-quietly assumed. Nothing tells the kernel which disk it booted from and no hand-off field
-was added for it: the partition is recognised by its GPT type GUID, which the installer
-wrote and only we use.
+The kernel reaches that partition over **virtio-blk or AHCI**, and until Phase 26a it was
+the first of those and nothing else. virtio-blk was the right first driver — one driver for
+both architectures, where AHCI exists only where SATA does — but "the only driver" and "the
+first driver" are different things, and the difference showed up the moment the system was
+carried to a machine nobody wrote it on. See [Disks that are not
+virtio](#disks-that-are-not-virtio). On a real Raspberry Pi 4 there is neither: the disk
+there will arrive over USB mass storage on top of the xHCI stack that already exists, and
+that work is named in the roadmap rather than quietly assumed. Nothing tells the kernel
+which disk it booted from and no hand-off field was added for it: the partition is
+recognised by its GPT type GUID, which the installer wrote and only we use — now searched
+for across **every** disk the machine has rather than on the one that happened to be first.
 
 ## The installer
 
@@ -1044,6 +1106,7 @@ crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/pci.rs        ECAM configuration space, bus walk across bridges
   src/usb/          xHCI host controller, HID reports to input events
   src/virtio/       virtio over PCI: split virtqueue, virtio-blk
+  src/block/        Block devices: the list of them, and an AHCI driver
   src/arch/         Everything that differs between x86-64 and AArch64
 xtask/              Host-side build / image / QEMU orchestration
 ```
@@ -1116,7 +1179,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 23 | The device describes itself: HID report descriptors, so a tablet is a mouse; PCI without MCFG, the UART from ACPI, and a second source for the clock | **done** |
 | 24 | Devices arrive after the kernel does: hot-plug, and a slot that comes back when one leaves | **done** |
 | 25 | Memory that comes back: the DMA window becomes a pool instead of a counter | **done** |
-| 26a | A block-device layer and an AHCI driver: the root is found on a machine with no virtio | planned |
+| 26a | A block-device layer and an AHCI driver: the root is found on a machine with no virtio | **done** |
 | 26b | NVMe, which is what the disk in a laptop bought this decade is attached by | planned |
 | 27 | Power: shut down and reboot, from the menu and from the power button, and a volume closed cleanly behind us | planned |
 | 28a | `fsck`: the volume is repaired from inside the system, not from someone else's Linux | planned |

@@ -70,8 +70,6 @@ pub struct VirtioBlk {
     /// Буфер данных.
     data: DmaBuffer,
     sectors: u64,
-    /// Диагностика: сколько запросов выполнено.
-    requests: u64,
 }
 
 impl VirtioBlk {
@@ -151,20 +149,7 @@ impl VirtioBlk {
             control,
             data,
             sectors,
-            requests: 0,
         })
-    }
-
-    /// Ёмкость в секторах по 512 байт.
-    #[must_use]
-    pub const fn sectors(&self) -> u64 {
-        self.sectors
-    }
-
-    /// Сколько запросов выполнено — диагностика.
-    #[must_use]
-    pub const fn requests(&self) -> u64 {
-        self.requests
     }
 
     /// Выполнить один запрос к устройству.
@@ -206,7 +191,6 @@ impl VirtioBlk {
         if status != STATUS_OK {
             return Err(VirtioError::RequestFailed(status));
         }
-        self.requests += 1;
         Ok(())
     }
 

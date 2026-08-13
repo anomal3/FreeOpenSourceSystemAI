@@ -31,6 +31,17 @@ pub enum Target {
     /// Загрузочный ISO, подключённый приводом — ровно так, как его подключит
     /// человек в VirtualBox.
     Iso,
+    /// Система грузится с каталога хоста, а рядом подключён диск, на который
+    /// ставил установщик.
+    ///
+    /// Нужно там, где проверяется **драйвер диска**, а не загрузка с него.
+    /// Прошивка `ArmVirtQemu` не умеет SATA вовсе (`map: No mapping found`), так
+    /// что подключить установленный диск по AHCI и ждать, что она с него
+    /// стартует, можно только на x86-64 — а драйвер в ядре один на обе
+    /// архитектуры, и проверять его надо на обеих. Здесь загрузка идёт тем
+    /// путём, который прошивка умеет всегда, а проверяемый диск оказывается
+    /// вторым носителем: ядро обязано найти корень **на нём**, перебрав оба.
+    LiveAndDisk,
 }
 
 impl Target {
@@ -45,6 +56,7 @@ impl Target {
             Target::Installer => "установочный носитель и чистый диск",
             Target::Installed => "диск после установки",
             Target::Iso => "загрузочный ISO в приводе",
+            Target::LiveAndDisk => "каталог хоста плюс диск после установки",
         }
     }
 }
@@ -150,6 +162,16 @@ pub struct Scenario {
     /// Заодно меняется способ управления: абсолютное событие посылается через
     /// QMP, потому что в HMP такой команды нет (см. [`super::qmp`]).
     pub tablet: bool,
+    /// Диски подключены контроллером AHCI, а не virtio.
+    ///
+    /// Проверяется этим не эмулятор, а **другой драйвер в ядре**. Пока в
+    /// FreeOS был один дисковый драйвер, вся цепочка «система находит свой
+    /// корень» проверялась исключительно на virtio-blk — то есть на
+    /// контроллере, которого нет ни в VirtualBox по умолчанию, ни в настоящем
+    /// компьютере. Сценарий с этим флагом берёт тот же самый установленный
+    /// диск и подключает его по SATA: образ не меняется ни на байт, меняется
+    /// только то, чем ядро до него добирается.
+    pub ahci: bool,
     /// Архитектуры, на которых сценарий имеет смысл. Пусто — все.
     pub arches: &'static [Arch],
 }
@@ -184,6 +206,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -213,6 +236,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: true,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -262,6 +286,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -334,6 +359,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -398,6 +424,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: true,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -455,6 +482,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -510,6 +538,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[Arch::X86_64],
         // Свойство накапливается к уже заданной машине `q35`, как и `i8042=off`
         // у `usb_only`. Так воспроизводится VirtualBox: там PIT существует, но
@@ -541,6 +570,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -661,6 +691,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -702,6 +733,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -750,6 +782,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -795,6 +828,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -845,6 +879,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Iso,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -876,6 +911,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         // Только AArch64: на x86-64 GIC не существует.
         arches: &[Arch::Aarch64],
         // Свойство накапливается к уже заданной машине `virt`. Версия по
@@ -909,6 +945,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Live,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -928,6 +965,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Image,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -948,6 +986,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Installer,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -1000,6 +1039,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Installed,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -1063,6 +1103,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Installed,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -1140,6 +1181,7 @@ pub const ALL: &[Scenario] = &[
         target: Target::Installed,
         usb_only: false,
         tablet: false,
+        ahci: false,
         arches: &[],
         extra: &[],
         steps: &[
@@ -1159,6 +1201,50 @@ pub const ALL: &[Scenario] = &[
             // испортила в чужих файлах.
             Step::Line("cat /etc/system.cfg"),
             Step::Await("language=", 15_000),
+            Step::Line("whoami"),
+            Step::Await("roman (uid 1000 gid 1000)", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "ahci",
+        about: "Тот же установленный диск, подключённый по SATA: корень находится через AHCI.",
+        target: Target::LiveAndDisk,
+        usb_only: false,
+        tablet: false,
+        ahci: true,
+        arches: &[],
+        extra: &[],
+        steps: &[
+            // Сначала — что найден именно контроллер AHCI, а не что-то, что
+            // сработало по случайности. Версия и маска портов приходят из его
+            // собственных регистров: прочитать их и не иметь контроллера нельзя.
+            Step::Await("ahci        : version", BOOT),
+            Step::Await("ahci        : port 0:", 30_000),
+            // Диск найден слоем блочных устройств и назван своим именем. До
+            // Phase 26a эта строка была бы «virtio-blk» при любом контроллере,
+            // потому что другого драйвера не существовало.
+            Step::Await("disk        : ahci #0", 30_000),
+            // И главное: корень найден **на нём**. Раздел ищется по типу GUID
+            // среди всех носителей, поэтому строка называет, на каком именно он
+            // нашёлся, — иначе проверка не отличила бы AHCI от virtio.
+            Step::Await("root        : found on ahci #0", 30_000),
+            Step::Await("root        : ext2 at LBA", 30_000),
+            // Дальше — обычная жизнь системы, но каждое обращение к диску идёт
+            // через новый драйвер: чтение файла установщика...
+            Step::Await("account     : /etc/passwd", 30_000),
+            Step::Await("freeos> ", 30_000),
+            Step::Line("cat /etc/system.cfg"),
+            Step::Await("language=", 15_000),
+            // ...и запись, которой у драйвера свой путь. Файл читается обратно
+            // в этой же загрузке: чтение после записи проверяет, что записано
+            // именно то и именно туда.
+            Step::Line("echo written-over-sata > /home/roman/sata.txt"),
+            Step::Await("wrote 18 bytes", 15_000),
+            Step::Line("cat /home/roman/sata.txt"),
+            Step::Await("written-over-sata", 15_000),
             Step::Line("whoami"),
             Step::Await("roman (uid 1000 gid 1000)", 15_000),
             Step::Line("exit"),

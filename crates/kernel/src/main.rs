@@ -41,6 +41,7 @@
 
 mod acpi;
 mod arch;
+mod block;
 mod console;
 mod fs;
 mod input;
@@ -579,44 +580,37 @@ fn mount_disk_root(info: &BootInfo) {
     };
 
     // SAFETY: см. выше.
-    let mut device = match unsafe { virtio::blk::VirtioBlk::probe(&root) } {
-        Ok(device) => device,
-        Err(err) => {
-            kprintln!("  disk        : no virtio-blk ({err}): keeping the initrd as root");
-            return;
-        }
-    };
-    kprintln!(
-        "  disk        : virtio-blk, {} sectors ({} MiB)",
-        device.sectors(),
-        device.sectors() / 2048
-    );
-
-    let table = match gpt::read(&mut device) {
-        Ok(table) => table,
-        Err(err) => {
-            kprintln!("  partitions  : {err}: keeping the initrd as root");
-            return;
-        }
-    };
-    kprintln!("  partitions  : GPT {}, {} entries", table.disk_guid, table.partitions.len());
-    for partition in &table.partitions {
+    let disks = unsafe { block::probe_all(&root) };
+    if disks.is_empty() {
+        kprintln!("  disk        : no block device at all: keeping the initrd as root");
+        return;
+    }
+    for found in &disks {
         kprintln!(
-            "    part {}     : {} MiB at LBA {}, '{}'",
-            partition.index + 1,
-            partition.range().bytes() / (1024 * 1024),
-            partition.first_lba,
-            partition.name_string(),
+            "  disk        : {} #{}, {} sectors ({} MiB)",
+            found.kind.name(),
+            found.unit,
+            found.sectors(),
+            found.sectors() / 2048,
         );
     }
 
-    let Some(root) = table.find(gpt::FREEOS_ROOT_TYPE) else {
+    // Раздел опознаётся по типу GUID и ищется на **всех** носителях сразу.
+    // Порядок дисков при этом ничего не значит, и это важнее, чем кажется: на
+    // чужой машине наш диск не обязан быть первым, а машина с двумя системами —
+    // обычное дело.
+    let Some(partition) = block::find_partition(disks, gpt::FREEOS_ROOT_TYPE) else {
         kprintln!("  root        : no FreeOS root partition: keeping the initrd as root");
         return;
     };
-    let first_lba = root.first_lba;
+    let first_lba = partition.first_lba;
+    kprintln!(
+        "  root        : found on {} #{} at LBA {first_lba}",
+        partition.source,
+        partition.unit,
+    );
 
-    let mount = match fs::Ext2Fs::mount(device, first_lba) {
+    let mount = match fs::Ext2Fs::mount(partition.device, first_lba) {
         Ok(mount) => mount,
         Err(err) => {
             kprintln!("  root        : cannot mount ext2 at LBA {first_lba}: {err}");

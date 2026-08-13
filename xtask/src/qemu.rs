@@ -32,6 +32,22 @@ pub struct RunOptions {
     pub qmp: Option<SocketAddr>,
     /// Какой манипулятор подключён к машине.
     pub pointer: Pointer,
+    /// Чем подключены диски.
+    pub disk_bus: DiskBus,
+}
+
+/// Каким контроллером подключены носители.
+///
+/// Выбор проверяет ядро, а не QEMU. До Phase 26a дисковый драйвер в FreeOS был
+/// один — virtio-blk, — и стенд подключал диски только им; это означало, что
+/// путь «система находит свой корень» проверялся ровно на том контроллере,
+/// которого нет ни в VirtualBox по умолчанию, ни в реальном компьютере. AHCI
+/// здесь — не другая настройка эмулятора, а другой драйвер в ядре, и сценарии с
+/// ним проверяют именно его.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DiskBus {
+    Virtio,
+    Ahci,
 }
 
 /// Манипулятор виртуальной машины.
@@ -60,6 +76,7 @@ impl Default for RunOptions {
             monitor: None,
             qmp: None,
             pointer: Pointer::Mouse,
+            disk_bus: DiskBus::Virtio,
         }
     }
 }
@@ -238,6 +255,71 @@ fn find_qemu(arch: Arch) -> Result<PathBuf> {
 /// независимые сборки командной строки означали бы, что стенд проверяет не ту
 /// машину, которую видит человек, — и расхождение обнаружилось бы в тот день,
 /// когда тесты зелёные, а система не грузится.
+/// Добавить контроллер AHCI, если диски подключаются им.
+///
+/// Контроллер один на все диски: у него 32 порта, и второй экземпляр
+/// понадобился бы только чтобы проверить, что мы умеем искать по двум
+/// контроллерам, — а этого сегодня никто не обещает.
+///
+/// `ich9-ahci` — то же устройство, что стоит на настоящей материнской плате с
+/// чипсетом ICH9, и то же, что VirtualBox показывает как контроллер SATA.
+/// На `virt` его нет по умолчанию, но шина PCIe там есть, поэтому он
+/// подключается одинаково на обеих архитектурах.
+fn add_ahci_controller(cmd: &mut Command, opts: &RunOptions) {
+    if opts.disk_bus != DiskBus::Ahci {
+        return;
+    }
+    if opts.drives.iter().all(|drive| matches!(drive, Drive::Cdrom(_))) {
+        return;
+    }
+    cmd.args(["-device", "ich9-ahci,id=ahci"]);
+}
+
+/// Подключить носитель выбранным контроллером.
+///
+/// Каталог хоста (VVFAT) подключается virtio всегда, каким бы ни был выбор.
+/// Это не исключение ради удобства: с него грузится **прошивка**, а
+/// `ArmVirtQemu` не умеет SATA вовсе — диск на AHCI она не видит и уходит в свою
+/// оболочку с `map: No mapping found`. Драйвер же, который мы проверяем, живёт в
+/// ядре, а не в прошивке, поэтому загрузка идёт тем путём, который работает
+/// везде, а проверяемый диск подключается тем контроллером, который проверяется.
+fn attach_disk(
+    cmd: &mut Command,
+    index: usize,
+    drive: &Drive,
+    bus: DiskBus,
+    ahci_port: &mut usize,
+) -> Result<()> {
+    let bus = match drive {
+        Drive::HostDirectory(_) => DiskBus::Virtio,
+        _ => bus,
+    };
+    cmd.arg("-drive").arg(format!(
+        "if=none,id=disk{index},format=raw,file={}",
+        drive_file(drive)?
+    ));
+    match bus {
+        DiskBus::Virtio => {
+            cmd.args(["-device", &format!("virtio-blk-pci,drive=disk{index}")]);
+        }
+        // `ide-hd` на шине AHCI — это диск SATA: контроллер тот же, что у
+        // человека, и прошивка находит на нём ESP своим собственным драйвером,
+        // а ядро — своим новым.
+        //
+        // Порт считается отдельно от номера носителя: занятыми должны быть
+        // порты с нулевого подряд, иначе сценарий, который ждёт «port 0»,
+        // зависел бы от того, сколько дисков подключено другим контроллером.
+        DiskBus::Ahci => {
+            cmd.args([
+                "-device",
+                &format!("ide-hd,drive=disk{index},bus=ahci.{ahci_port}"),
+            ]);
+            *ahci_port += 1;
+        }
+    }
+    Ok(())
+}
+
 pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     let arch = built.arch;
     let qemu = find_qemu(arch)?;
@@ -259,6 +341,8 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
             // оставить здесь AHCI значило бы, что на x86-64 ядро своего диска
             // не видит. Прошивка при этом ничего не теряет: VirtioBlkDxe есть
             // и в OVMF, и в ArmVirtQemu.
+            add_ahci_controller(&mut cmd, opts);
+            let mut ahci_port = 0usize;
             for (index, drive) in opts.drives.iter().enumerate() {
                 if let Drive::Cdrom(path) = drive {
                     // Привод, а не virtio-blk: так его подключает человек, и так
@@ -266,11 +350,7 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
                     cmd.args(["-cdrom", &util::qemu_path(path)?]);
                     continue;
                 }
-                cmd.arg("-drive").arg(format!(
-                    "if=none,id=disk{index},format=raw,file={}",
-                    drive_file(drive)?
-                ));
-                cmd.args(["-device", &format!("virtio-blk-pci,drive=disk{index}")]);
+                attach_disk(&mut cmd, index, drive, opts.disk_bus, &mut ahci_port)?;
             }
             // Видео на q35 есть по умолчанию (stdvga), а QemuVideoDxe в OVMF
             // отдаёт по нему GOP с честным линейным framebuffer'ом — именно то,
@@ -285,6 +365,8 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
             // IF_IDE, и голый `-drive format=raw,...` завершился бы ошибкой
             // «machine type does not support if=ide». Поэтому подключаем диски
             // явно через virtio-blk-pci (VirtioBlkDxe есть в ArmVirtQemu).
+            add_ahci_controller(&mut cmd, opts);
+            let mut ahci_port = 0usize;
             for (index, drive) in opts.drives.iter().enumerate() {
                 if let Drive::Cdrom(path) = drive {
                     // На `virt` привода нет вовсе, поэтому ISO подключается как
@@ -299,11 +381,7 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
                     cmd.args(["-device", &format!("scsi-cd,drive=cd{index}")]);
                     continue;
                 }
-                cmd.arg("-drive").arg(format!(
-                    "if=none,id=disk{index},format=raw,file={}",
-                    drive_file(drive)?
-                ));
-                cmd.args(["-device", &format!("virtio-blk-pci,drive=disk{index}")]);
+                attach_disk(&mut cmd, index, drive, opts.disk_bus, &mut ahci_port)?;
             }
             // Графика: на virt по умолчанию НЕТ видеоустройства вообще.
             //
