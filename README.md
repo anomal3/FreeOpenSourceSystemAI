@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 19 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 20 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -522,6 +522,20 @@ size, had to read everything else first. `SEEK_END` with an offset of zero is no
 ask how big a file is — asked of the descriptor, not of the name, because a name can point
 somewhere else by the time you ask.
 
+**Directories.** Phase 20 finished the set. `open` on a directory used to be refused, because
+a descriptor you cannot read from is worse than an error; now it yields one that `readdir`
+walks, one entry per call, and `ls` became a program rather than a kernel command. The list is
+snapshotted when the directory is opened — the same promise POSIX makes, for the same reason:
+an enumeration that changes under the reader can neither be finished nor explained. It also
+removes a quadratic trap, since every entry would otherwise cost a full re-listing, and every
+listing an inode read per name.
+
+Both `ls` still exist, deliberately. The kernel one is needed where `/bin` is not mounted —
+typically while working out *why* it is not mounted. The program one is the interesting one:
+nobody hands it the filesystem, so it sees exactly what the account it runs as is allowed to
+see. `ls /root` as an ordinary user fails at `open` rather than printing an empty directory,
+because an empty listing would report on contents the caller was not permitted to see.
+
 **The time of day.** The kernel has had a wall clock since Phase 16 and kept it to itself.
 Zero means "the system does not know", not 1970, and the distinction is in the contract
 because a program stamping a file must be able to tell those apart.
@@ -844,6 +858,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 17 | Time that does not depend on interrupts arriving: a monotonic counter, and the boot lag subtracted | **done** |
 | 18 | Interrupts instead of polling: MSI-X on both architectures, and a driver that sleeps until something happens | **done** |
 | 19 | Programs get told what to do: arguments, `seek`, and the time of day | **done** |
+| 20 | A program can read a directory: `readdir`, and `ls` moves out of the kernel | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

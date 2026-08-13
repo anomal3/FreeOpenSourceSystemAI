@@ -19,6 +19,7 @@
 //! программа, и предела у неё нет.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 use user_abi::{FD_FIRST, MAX_OPEN_FILES, O_CREATE, O_TRUNC, O_WRITE};
 
@@ -30,7 +31,7 @@ use user_abi::{FD_FIRST, MAX_OPEN_FILES, O_CREATE, O_TRUNC, O_WRITE};
 const DEFAULT_MODE: u16 = 0o644;
 
 use crate::vfs::perm::{Access, Credentials};
-use crate::vfs::{Node, NodeKind, VfsError};
+use crate::vfs::{DirEntry, Node, NodeKind, VfsError};
 
 /// Открытый файл: узел, то, докуда программа его дочитала, и можно ли в него
 /// писать.
@@ -42,6 +43,15 @@ struct Open {
     /// открытый файл, и ровно на это рассчитывает всякий, кто держит файл
     /// открытым дольше одной операции.
     writable: bool,
+    /// Снимок каталога, если открыт каталог. У файла — `None`.
+    ///
+    /// Список читается один раз, при открытии, и дальше не обновляется. Это не
+    /// экономия, а обещание, записанное в договоре: перечисление, которое
+    /// меняется под руками у того, кто его читает, невозможно ни закончить, ни
+    /// объяснить — POSIX решает это тем же снимком. Заодно исчезает
+    /// квадратичность: иначе каждая запись стоила бы полного перечисления, а
+    /// каждое перечисление — чтения inode на каждое имя.
+    entries: Option<Vec<DirEntry>>,
 }
 
 /// Почему не получилось.
@@ -106,12 +116,23 @@ impl Table {
             None => return Err(FileError::NoFilesystem),
         };
 
-        // Каталог открывать нечем: вызова, который вернул бы список имён, в
-        // договоре нет. Отказать здесь честнее, чем отдать дескриптор, любое
-        // чтение из которого — ошибка.
-        if node.metadata().kind != NodeKind::File {
+        // Каталог открывается на перечисление, и только на него: писать в
+        // каталог программе нечем — имена в нём заводит `mkdir`, а не запись
+        // байтов, — и открытый на запись каталог был бы дескриптором, любое
+        // использование которого ошибка.
+        let directory = node.metadata().kind == NodeKind::Directory;
+        if directory && writable {
             return Err(FileError::Vfs(VfsError::WrongKind));
         }
+
+        // Список читается сразу: снимок фиксируется в момент открытия. См.
+        // `Open::entries` — там же сказано, почему это обещание, а не экономия.
+        let entries = if directory {
+            Some(node.list().map_err(FileError::Vfs)?)
+        } else {
+            None
+        };
+
         if flags & O_TRUNC != 0 && writable {
             node.truncate(0).map_err(FileError::Vfs)?;
         }
@@ -121,7 +142,7 @@ impl Table {
             .iter()
             .position(Option::is_none)
             .ok_or(FileError::TooManyFiles)?;
-        self.slots[slot] = Some(Open { node, offset: 0, writable });
+        self.slots[slot] = Some(Open { node, offset: 0, writable, entries });
         Ok(slot + FD_FIRST)
     }
 
@@ -137,11 +158,35 @@ impl Table {
         Ok(written)
     }
 
+    /// Взять очередную запись каталога. `None` — записи кончились.
+    ///
+    /// Позиция та же, что у файла: перечисление проходит каталог один раз, и
+    /// заводить для него второй счётчик значило бы объяснять, какой из двух
+    /// двигает `seek`.
+    pub fn next_entry(&mut self, fd: usize) -> Result<Option<DirEntry>, FileError> {
+        let index = index_of(fd)?;
+        let open = self.slots[index].as_mut().ok_or(FileError::BadFd)?;
+        let entries = open.entries.as_ref().ok_or(FileError::Vfs(VfsError::WrongKind))?;
+
+        let at = open.offset as usize;
+        let Some(entry) = entries.get(at) else {
+            return Ok(None);
+        };
+        open.offset += 1;
+        Ok(Some(entry.clone()))
+    }
+
     /// Прочитать из дескриптора в буфер. Возвращает, сколько прочитано; ноль —
     /// это конец файла, а не ошибка.
     pub fn read(&mut self, fd: usize, buf: &mut [u8]) -> Result<usize, FileError> {
         let index = index_of(fd)?;
         let open = self.slots[index].as_mut().ok_or(FileError::BadFd)?;
+        // У каталога байтов нет: читать его как файл — это вопрос не к правам, а
+        // к тому, что такое каталог. Программа, спутавшая одно с другим, узнает
+        // об этом здесь, а не получит содержимое чужого формата.
+        if open.entries.is_some() {
+            return Err(FileError::Vfs(VfsError::WrongKind));
+        }
         let read = open.node.read_at(open.offset, buf).map_err(FileError::Vfs)?;
         // Смещение двигается на прочитанное, а не на запрошенное: у конца файла
         // это разные числа, и второе увело бы следующее чтение за конец.

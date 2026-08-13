@@ -21,11 +21,11 @@ use core::panic::PanicInfo;
 
 use user_abi::{
     FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN, SYS_READ,
-    O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_REMOVE, SYS_SEEK, SYS_SLEEP, SYS_STAT, SYS_TIME,
-    SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_READDIR, SYS_REMOVE, SYS_SEEK, SYS_SLEEP, SYS_STAT,
+    SYS_TIME, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
 };
 
-pub use user_abi::{SEEK_CUR, SEEK_END, SEEK_SET};
+pub use user_abi::{Dirent, KIND_DIRECTORY, KIND_FILE, SEEK_CUR, SEEK_END, SEEK_SET};
 
 /// Выполнить системный вызов.
 ///
@@ -372,6 +372,33 @@ pub fn file_size(fd: i64) -> i64 {
     // что измеряют.
     seek(fd, saved, SEEK_SET);
     size
+}
+
+/// Прочитать очередную запись открытого каталога.
+///
+/// `true` — запись записана в `out`, `false` — каталог кончился. Отрицательный
+/// код от ядра тоже даёт `false`: программе, перечисляющей каталог, отличать
+/// «кончилось» от «сломалось» обычно нечем и незачем — а той, которой нужно,
+/// доступен `readdir_raw`.
+pub fn readdir(fd: i64, out: &mut Dirent) -> bool {
+    readdir_raw(fd, out) == 1
+}
+
+/// То же, но с кодом ядра как есть: `1`, `0` или ошибка.
+pub fn readdir_raw(fd: i64, out: &mut Dirent) -> i64 {
+    if fd < 0 {
+        return fd;
+    }
+    // SAFETY: структура принадлежит программе и доступна ей на запись; ядро
+    // проверит это ещё раз по своим таблицам.
+    unsafe {
+        syscall(
+            SYS_READDIR,
+            fd as usize,
+            core::ptr::from_mut(out) as usize,
+            size_of::<Dirent>(),
+        )
+    }
 }
 
 /// Текущее время в секундах эпохи Unix, UTC.

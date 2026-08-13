@@ -27,8 +27,9 @@ use user_abi::{
     ERR_BAD_ADDRESS, ERR_BAD_FD, ERR_BAD_PATH, ERR_IO, ERR_NOT_FOUND, ERR_NO_FILESYSTEM,
     ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_PERMISSION, ERR_TOO_MANY_FILES, ERR_UNSUPPORTED, FD_STDOUT,
     KIND_DIRECTORY, KIND_FILE, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN,
-    ERR_EXISTS, ERR_NOT_EMPTY, ERR_NO_SPACE, SEEK_CUR, SEEK_END, SEEK_SET, SYS_MKDIR, SYS_READ,
-    SYS_REMOVE, SYS_SEEK, SYS_SLEEP, SYS_STAT, SYS_TIME, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    Dirent, ERR_EXISTS, ERR_NOT_EMPTY, ERR_NO_SPACE, MAX_NAME, SEEK_CUR, SEEK_END, SEEK_SET,
+    SYS_MKDIR, SYS_READ, SYS_READDIR, SYS_REMOVE, SYS_SEEK, SYS_SLEEP, SYS_STAT, SYS_TIME,
+    SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
 };
 
 use crate::mm::PageFlags;
@@ -82,6 +83,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_OPEN => open(a0, a1, a2),
         SYS_READ => read(a0, a1, a2),
         SYS_SEEK => seek(a0, a1 as i64, a2),
+        SYS_READDIR => readdir(a0, a1, a2),
         SYS_CLOSE => close(a0),
         SYS_STAT => stat(a0, a1, a2),
         SYS_MKDIR => mkdir(a0, a1, a2),
@@ -226,6 +228,64 @@ fn seek(fd: usize, offset: i64, whence: usize) -> i64 {
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
     }
+}
+
+/// `readdir(fd, ptr, len) -> 1 | 0`.
+///
+/// Единица — запись положена по `ptr`, ноль — каталог кончился.
+fn readdir(fd: usize, ptr: usize, len: usize) -> i64 {
+    // Длина проверяется до всего остального: программа, приславшая буфер
+    // меньше структуры, получит отказ, а не запись, обрезанную по чужой памяти.
+    if len < size_of::<Dirent>() {
+        return ERR_BAD_ADDRESS;
+    }
+    // Именно `WRITE`: сюда пишет ядро. И именно по таблицам программы — тем же
+    // правом, которое спросил бы процессор, если бы писала она сама.
+    if !space::user_can(ptr, size_of::<Dirent>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+
+    let entry = match super::with_current(|program| program.files.next_entry(fd)) {
+        Some(Ok(Some(entry))) => entry,
+        // Каталог кончился. Ноль, а не ошибка: конец перечисления — обычное
+        // событие, ровно как ноль байт в конце файла.
+        Some(Ok(None)) => return 0,
+        Some(Err(err)) => return errno(err),
+        None => return ERR_NO_PROGRAM,
+    };
+
+    let mut out = Dirent {
+        size: entry.size,
+        mtime: entry.mtime,
+        mode: u32::from(entry.mode),
+        uid: entry.uid,
+        gid: entry.gid,
+        kind: match entry.kind {
+            NodeKind::Directory => KIND_DIRECTORY,
+            NodeKind::File => KIND_FILE,
+        },
+        name_len: 0,
+        name: [0; MAX_NAME],
+    };
+
+    // Имя длиннее буфера обрезается, а не роняет вызов: предел здесь тот же,
+    // что у имени в ext2, поэтому обрезать на самом деле нечего — но полагаться
+    // на это в коде, который пишет в чужую память, нельзя.
+    let name = entry.name.as_bytes();
+    let copy = name.len().min(MAX_NAME);
+    out.name[..copy].copy_from_slice(&name[..copy]);
+    out.name_len = copy as u32;
+
+    // Запись невыровненная — в отличие от `stat`, который требует выравнивания и
+    // отказывает без него. Разница в том, что `Dirent` вчетверо крупнее и
+    // программа, скорее всего, держит его в массиве или на стеке, где
+    // выравнивание получится само; требовать его отдельно значило бы отказывать
+    // из-за того, с чем ядро прекрасно справляется одной инструкцией.
+    //
+    // SAFETY: диапазон проверен по таблицам программы и доступен ей на запись;
+    // пока исполняется вызов, отображение менять некому — ядро сейчас здесь.
+    unsafe { core::ptr::write_unaligned(ptr as *mut Dirent, out) };
+    1
 }
 
 /// `close(fd)`.
