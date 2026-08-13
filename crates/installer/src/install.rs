@@ -102,6 +102,7 @@ impl Plan {
     /// желаемого.
     pub fn for_disk(disk: &Disk, payload: u64) -> Result<Self, Error> {
         let sectors = disk.sectors;
+        let sector = disk.block_size as usize;
         let usable = disk.bytes();
 
         // Половина диска — верхняя граница для ESP. Диск, у которого системный
@@ -111,8 +112,8 @@ impl Plan {
         let needed = payload + ESP_SLACK;
         let esp_bytes = wanted.max(needed);
 
-        let layout = gpt::plan(sectors, esp_bytes, true)?;
-        let esp_bytes = layout.esp.bytes();
+        let layout = gpt::plan(sectors, sector, esp_bytes, true)?;
+        let esp_bytes = layout.esp.bytes(sector);
         if esp_bytes < needed {
             logln!(
                 "[install] the disk is too small: ESP would be {} bytes, {needed} needed",
@@ -121,7 +122,7 @@ impl Plan {
             return Err(Error::TooSmall);
         }
 
-        let root_bytes = layout.root.map_or(0, |root| root.bytes());
+        let root_bytes = layout.root.map_or(0, |root| root.bytes(sector));
         Ok(Self { layout, esp_bytes, root_bytes })
     }
 }

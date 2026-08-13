@@ -46,16 +46,32 @@ pub use mem::MemDisk;
 
 use core::fmt;
 
-/// Размер сектора, с которым работает крейт.
+/// Размер сектора, который был единственным до Phase 26c.
 ///
-/// Жёстко 512, и это осознанное ограничение, а не упущение. Носители с сектором
-/// 4096 («4Kn») существуют, но поддержать их вслепую нельзя: FAT32 с
-/// `BytsPerSec = 4096` формально законен, а на практике часть прошивок его не
-/// читает, и проверить это в QEMU (где диск всегда 512) невозможно. Код,
-/// который нельзя прогнать, хуже отсутствующего — он выглядит рабочим.
-/// Поэтому носитель с другим сектором отвергается с внятной ошибкой
-/// [`Error::UnsupportedSectorSize`].
-pub const SECTOR_SIZE: usize = 512;
+/// Остаётся как значение по умолчанию там, где носитель придумываем мы сами:
+/// образ в памяти для тестов, расчёты «сколько это в секторах» для случая, где
+/// устройства ещё нет. Кодом, работающим с настоящим носителем, **не
+/// используется**: там размер спрашивается у него самого.
+pub const DEFAULT_SECTOR_SIZE: usize = 512;
+
+/// Наибольший размер сектора, который крейт готов обслуживать.
+///
+/// Существует не как предел возможностей, а как размер буфера: заголовок GPT,
+/// загрузочная запись и запись каталога FAT читаются в массив на стеке, и в
+/// UEFI-приложении, где стека около сотни килобайт, этот массив обязан иметь
+/// известный размер. Четыре килобайта покрывают всё, что бывает у дисков
+/// сегодня: 512, 520 (отвергается — не степень двойки), 4096.
+pub const MAX_SECTOR_SIZE: usize = 4096;
+
+/// Годится ли такой размер сектора.
+///
+/// Требуется степень двойки от 512 до [`MAX_SECTOR_SIZE`]. Не «любое число»:
+/// вся арифметика разметки — деления и выравнивания, и на размере, не кратном
+/// степени двойки, она перестаёт быть точной там, где этого никто не заметит.
+#[must_use]
+pub const fn sector_size_supported(size: u32) -> bool {
+    size >= 512 && size as usize <= MAX_SECTOR_SIZE && size.is_power_of_two()
+}
 
 /// Отказ операции над носителем.
 ///
@@ -67,7 +83,7 @@ pub enum Error {
     Io,
     /// Обращение за границы носителя.
     OutOfRange,
-    /// Носитель отдаёт сектор не 512 байт.
+    /// Размер сектора носителя не из тех, что крейт умеет.
     UnsupportedSectorSize(u32),
     /// Длина буфера не кратна размеру сектора.
     Unaligned,
@@ -92,7 +108,7 @@ impl fmt::Display for Error {
             Error::OutOfRange => f.write_str("access past the end of the device"),
             Error::UnsupportedSectorSize(size) => write!(
                 f,
-                "{size}-byte sectors are not supported, only 512-byte ones are"
+                "{size}-byte sectors are not supported: a power of two from 512 to {MAX_SECTOR_SIZE} is required"
             ),
             Error::Unaligned => f.write_str("buffer length is not a multiple of the sector size"),
             Error::TooSmall => f.write_str("the device or partition is too small"),
@@ -113,9 +129,13 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// сектора» и «сбросить кэш». Всё, что сложнее (частичные сектора, буферизация,
 /// упреждающее чтение), — забота реализации, если она вообще ей нужна.
 pub trait BlockDevice {
-    /// Размер сектора носителя. Всё, кроме [`SECTOR_SIZE`], крейт отвергает,
-    /// но спросить обязан: ошибиться здесь молча — значит разметить 4Kn-диск
-    /// так, будто он 512-байтный, и потерять на нём данные.
+    /// Размер сектора носителя, в байтах.
+    ///
+    /// Спрашивается у устройства и используется во всей арифметике разметки —
+    /// с Phase 26c по-настоящему, а не для проверки. Ошибиться здесь значит
+    /// разметить 4Kn-диск так, будто он 512-байтный: заголовок GPT окажется не
+    /// там, где его будет искать чужая система, а FAT — не там, где его будет
+    /// искать прошивка.
     fn sector_size(&self) -> u32;
 
     /// Число секторов носителя.
@@ -141,7 +161,7 @@ pub trait BlockDevice {
 /// Вызывается в начале каждой публичной операции: лучше отказать до первой
 /// записи, чем на середине разметки.
 pub fn check_device(dev: &dyn BlockDevice) -> Result<()> {
-    if dev.sector_size() as usize != SECTOR_SIZE {
+    if !sector_size_supported(dev.sector_size()) {
         return Err(Error::UnsupportedSectorSize(dev.sector_size()));
     }
     if dev.is_read_only() {
@@ -159,18 +179,29 @@ pub fn check_device(dev: &dyn BlockDevice) -> Result<()> {
 /// иначе мусор в первом байте выглядит как имя файла) и при затирании чужой
 /// разметки.
 pub(crate) fn zero_sectors(dev: &mut dyn BlockDevice, lba: u64, count: u64) -> Result<()> {
-    /// Сколько секторов писать за один вызов.
-    const CHUNK_SECTORS: usize = 16;
+    /// Сколько байт писать за один вызов.
+    ///
+    /// Считается в байтах, а не в секторах: при секторе 4096 шестнадцать
+    /// секторов — это уже 64 КиБ, и заводить статический буфер такого размера
+    /// ради нулей незачем. Восьми килобайт хватает и на шестнадцать секторов по
+    /// 512, и на два по 4096.
+    const CHUNK_BYTES: usize = 8 * 1024;
     /// Источник нулей — `static`, а не массив на стеке. У UEFI-приложения стек
     /// порядка сотни килобайт, и локальный буфер такого размера — прямая
     /// дорога к его переполнению, которое проявится не отказом, а порчей
     /// соседнего кадра.
-    static ZEROS: [u8; CHUNK_SECTORS * SECTOR_SIZE] = [0; CHUNK_SECTORS * SECTOR_SIZE];
+    static ZEROS: [u8; CHUNK_BYTES] = [0; CHUNK_BYTES];
+
+    let sector = dev.sector_size() as usize;
+    if sector == 0 || sector > CHUNK_BYTES {
+        return Err(Error::UnsupportedSectorSize(dev.sector_size()));
+    }
+    let chunk_sectors = CHUNK_BYTES / sector;
 
     let mut written = 0u64;
     while written < count {
-        let batch = ((count - written) as usize).min(CHUNK_SECTORS);
-        dev.write(lba + written, &ZEROS[..batch * SECTOR_SIZE])?;
+        let batch = ((count - written) as usize).min(chunk_sectors);
+        dev.write(lba + written, &ZEROS[..batch * sector])?;
         written += batch as u64;
     }
     Ok(())

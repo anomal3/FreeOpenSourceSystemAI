@@ -27,7 +27,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use disk::{BlockDevice, SECTOR_SIZE};
+use disk::{BlockDevice, sector_size_supported};
 use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol};
 use uefi::proto::device_path::DevicePath;
 use uefi::proto::loaded_image::LoadedImage;
@@ -85,7 +85,11 @@ impl Disk {
     /// Можно ли на него устанавливать.
     #[must_use]
     pub fn is_usable(&self) -> bool {
-        !self.read_only && !self.is_install_media && self.block_size as usize == SECTOR_SIZE
+        // Размер сектора больше не обязан быть 512: с Phase 26c разметка
+        // считается в секторах носителя, каковы бы они ни были. Проверка
+        // осталась, потому что «любое число» всё же не годится — арифметика
+        // выравнивания требует степени двойки.
+        !self.read_only && !self.is_install_media && sector_size_supported(self.block_size)
     }
 }
 
@@ -245,7 +249,7 @@ fn bus_name(path: Option<&[u8]>) -> &'static str {
 
 /// Наибольшая передача, которую крейт `disk` выполняет за раз (32 КиБ при
 /// записи данных файла). Промежуточный буфер заводится сразу на неё.
-const MAX_TRANSFER: usize = 64 * SECTOR_SIZE;
+const MAX_TRANSFER: usize = 32 * 1024;
 
 /// Носитель прошивки, представленный как [`BlockDevice`] для крейта `disk`.
 pub struct UefiDisk {
