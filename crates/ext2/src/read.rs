@@ -49,6 +49,19 @@ pub struct Inode {
     blocks: [u32; BLOCK_POINTERS],
 }
 
+impl Inode {
+    /// Первый блок содержимого.
+    ///
+    /// Существует ради тестов, которые портят том по месту: испортить запись
+    /// каталога можно только зная, в каком блоке она лежит, а искать её по
+    /// всему образу значит проверять поиск, а не починку.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn first_block(&self) -> u32 {
+        self.blocks[0]
+    }
+}
+
 /// Запись каталога.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -144,6 +157,19 @@ impl Ext2 {
     #[must_use]
     pub const fn geometry(&self) -> Geometry {
         self.geometry
+    }
+
+    /// Где на диске лежит `number`-й inode: блок таблицы и смещение в нём.
+    ///
+    /// Нужно проверке тома ([`crate::check`]), которая читает inode до всякого
+    /// монтирования, и тестам, которые том намеренно ломают.
+    #[must_use]
+    pub fn inode_place(geometry: &Geometry, number: u32) -> Result<(u32, usize)> {
+        let (group, index) = geometry.locate_inode(number)?;
+        let block_bytes = geometry.block_size.bytes() as usize;
+        let byte_offset = index as usize * INODE_SIZE;
+        let block = geometry.inode_table_block(group) + (byte_offset / block_bytes) as u32;
+        Ok((block, byte_offset % block_bytes))
     }
 
     /// Закрыли ли том в прошлый раз чисто.

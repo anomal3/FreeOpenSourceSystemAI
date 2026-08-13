@@ -1361,6 +1361,52 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "fsck",
+        about: "Том, брошенный без выключения, проверяется и чинится самой системой при загрузке.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        arches: &[],
+        // Сброс посреди работы — это и есть та поломка, ради которой фаза
+        // существует; после него машина обязана подняться сама.
+        reboots: true,
+        extra: &[],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 30_000),
+            // Проверка живого тома: она ничего не чинит и на исправной системе
+            // обязана молчать. Если бы она находила «поломки» на работающей
+            // машине, всё остальное в этом сценарии ничего не значило бы.
+            Step::Line("fsck"),
+            Step::Await("  the volume is consistent", 60_000),
+            // Теперь ломаем: пишем файл и выдёргиваем шнур.
+            Step::Line("echo written-before-the-crash > /home/roman/crash.txt"),
+            Step::Await("wrote 25 bytes", 15_000),
+            Step::Reset,
+            // Следующая загрузка обязана заметить и проверить — сама, без
+            // единой команды. Порядок строк тоже проверяется: сначала «том
+            // закрыт не был», потом проверка, и только потом монтирование.
+            Step::Await("fsck        : the volume was not closed cleanly, checking it", BOOT),
+            Step::Await("fsck        : ", 60_000),
+            Step::Await("root        : ext2 at LBA", 60_000),
+            Step::Await("freeos> ", 30_000),
+            // Данные на месте: проверка чинит счётчики, а не выбрасывает файлы.
+            Step::Line("cat /home/roman/crash.txt"),
+            Step::Await("written-before-the-crash", 15_000),
+            // И том после починки согласован — это говорит уже живая проверка.
+            Step::Line("fsck"),
+            Step::Await("  the volume is consistent", 60_000),
+            Step::Line("shutdown"),
+            Step::Await("root        : flushed and marked clean", 30_000),
+            Step::Exits(30_000),
+            Step::Absent("KERNEL PANIC"),
+            // Проверка обязана быть беззвучной там, где она не нужна: на
+            // чистом томе её не запускают вовсе.
+            Step::Absent("fsck        : the check itself failed"),
+        ],
+    },
+    Scenario {
         name: "powerbtn",
         about: "Кнопка питания: событие ACPI доходит до системы, и она гаснет по-настоящему.",
         target: Target::Installed,

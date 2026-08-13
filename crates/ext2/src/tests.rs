@@ -37,7 +37,7 @@ fn options() -> FormatOptions<'static> {
 }
 
 /// Отформатировать образ в памяти и вернуть его вместе с писателем.
-fn formatted(sectors: u64, block_size: BlockSize) -> (MemDisk, Editor) {
+pub(crate) fn formatted(sectors: u64, block_size: BlockSize) -> (MemDisk, Editor) {
     let mut dev = MemDisk::new(sectors).expect("образ размещается");
     let writer = format_with(&mut dev, 0, sectors, block_size, &options())
         .expect("форматирование удаётся");
@@ -45,7 +45,7 @@ fn formatted(sectors: u64, block_size: BlockSize) -> (MemDisk, Editor) {
 }
 
 /// Смонтировать образ посторонней реализацией ext2.
-fn foreign(dev: &MemDisk) -> Ext4 {
+pub(crate) fn foreign(dev: &MemDisk) -> Ext4 {
     Ext4::load(std::boxed::Box::new(dev.as_bytes().to_vec()))
         .expect("чужой драйвер монтирует том")
 }

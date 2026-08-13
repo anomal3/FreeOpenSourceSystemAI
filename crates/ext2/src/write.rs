@@ -596,12 +596,12 @@ pub(crate) fn try_vec<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
 ///
 /// Порядок бит внутри байта — от младшего к старшему; перепутать его значит
 /// пометить занятым не тот блок, причём том всё равно смонтируется.
-fn set_bit(bitmaps: &mut [u8], block_bytes: usize, group: u32, index: u32) {
+pub(crate) fn set_bit(bitmaps: &mut [u8], block_bytes: usize, group: u32, index: u32) {
     let at = group as usize * block_bytes + (index / 8) as usize;
     bitmaps[at] |= 1 << (index % 8);
 }
 
-fn test_bit(bitmaps: &[u8], block_bytes: usize, group: u32, index: u32) -> bool {
+pub(crate) fn test_bit(bitmaps: &[u8], block_bytes: usize, group: u32, index: u32) -> bool {
     let at = group as usize * block_bytes + (index / 8) as usize;
     bitmaps[at] & (1 << (index % 8)) != 0
 }

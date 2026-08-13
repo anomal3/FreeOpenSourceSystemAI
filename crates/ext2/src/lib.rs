@@ -50,13 +50,17 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod check;
 mod edit;
 mod layout;
 mod read;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_fsck;
 mod write;
 
+pub use check::{Fix, Problem, Report, check};
 pub use layout::{BlockSize, Geometry, ROOT_INODE};
 pub use read::{DirEntry, Ext2, FileType, Inode};
 pub use edit::Editor;
