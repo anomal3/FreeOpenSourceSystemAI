@@ -364,6 +364,12 @@ fn play(
                 line.wait_for(&needle, Duration::from_millis(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
             }
+            Step::AwaitAny(needle, timeout_ms) => {
+                let needle = fill(needle, &captured);
+                println!("  [{at:>6} мс] шаг {index}: ждём {needle:?} где угодно в выводе");
+                line.wait_seen(&needle, Duration::from_millis(*timeout_ms))
+                    .with_context(|| format!("шаг {index}"))?;
+            }
             Step::Capture(prefix, timeout_ms) => {
                 println!("  [{at:>6} мс] шаг {index}: ждём {prefix:?} и запоминаем число за ним");
                 let value = line
