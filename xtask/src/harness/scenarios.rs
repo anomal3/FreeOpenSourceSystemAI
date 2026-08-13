@@ -117,6 +117,10 @@ pub enum Step {
     Press,
     /// Отпустить все кнопки.
     Release,
+    /// Подключить устройство к работающей машине (аргументы `device_add`).
+    Plug(&'static str),
+    /// Выдернуть устройство по его идентификатору.
+    Unplug(&'static str),
     /// Подождать (мс).
     Wait(u64),
     /// Снять экран.
@@ -442,6 +446,41 @@ pub const ALL: &[Scenario] = &[
             Step::Type("exit"),
             Step::Key("ret"),
             Step::Await("finishing the session", 30_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "hotplug",
+        about: "Устройство, воткнутое на ходу, поднимается само; выдернутое — освобождает слот.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        arches: &[],
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // На старте машина знает про два устройства: клавиатуру и мышь.
+            Step::Line("usb"),
+            Step::Await("  xhci     2 devices", 15_000),
+            // Третье втыкается уже на работающей системе — как это делает
+            // человек. До этой фазы ядро перечисляло порты один раз и такое
+            // устройство не существовало для него вовсе.
+            Step::Plug("usb-tablet,bus=xhci.0,id=hotplugged"),
+            Step::Await("usb         : now 3 device(s)", 20_000),
+            // И оно именно поднято, а не просто замечено: указатель разобран по
+            // своему дескриптору отчётов.
+            Step::Expect("pointer, absolute"),
+            Step::Line("usb"),
+            Step::Await("  xhci     3 devices", 15_000),
+            // Обратная сторона: выдернутое устройство обязано вернуть слот.
+            // Слотов у контроллера четыре, и не вернуть слот — значит потерять
+            // его до перезагрузки.
+            Step::Unplug("hotplugged"),
+            Step::Await("is gone, freeing slot", 20_000),
+            Step::Line("usb"),
+            Step::Await("  xhci     2 devices", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
         ],
     },

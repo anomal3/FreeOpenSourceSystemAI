@@ -43,6 +43,9 @@ pub const TRB_DATA_STAGE: u32 = 3;
 pub const TRB_STATUS_STAGE: u32 = 4;
 pub const TRB_LINK: u32 = 6;
 pub const TRB_ENABLE_SLOT: u32 = 9;
+/// Освободить слот. Нужен, когда устройство вынули: слотов у контроллера
+/// конечное число, и не вернуть слот значит потерять его до перезагрузки.
+pub const TRB_DISABLE_SLOT: u32 = 10;
 pub const TRB_ADDRESS_DEVICE: u32 = 11;
 pub const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 pub const TRB_EVALUATE_CONTEXT: u32 = 13;

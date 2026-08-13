@@ -279,6 +279,21 @@ fn banner() {
             // Причина отказа — тут же. «Порт занят, а устройства нет» без неё
             // означает ровно одно: садиться разбираться заново, уже с журналом,
             // которого на этой машине не бывает.
+            for device in usb.attached.iter().filter(|device| device.port != 0) {
+                sprintln!(
+                    "     port {}: {:04x}:{:04x} {} on interface {} of {}, {}",
+                    device.port,
+                    device.vendor,
+                    device.product,
+                    device.kind,
+                    device.interface,
+                    device.interfaces,
+                    match device.descriptor {
+                        0 => "boot protocol",
+                        _ => "own report descriptor",
+                    }
+                );
+            }
             if let Some((port, stage, err)) = usb.last_error {
                 sprintln!("     port {port} stopped while {stage}: {err}");
             }

@@ -115,13 +115,27 @@ const CLOCK_EVERY: u32 = 64;
 
 /// Ожидание с двумя независимыми пределами.
 struct Timeout {
+    started_ms: u64,
     until_ms: u64,
     spins: u32,
 }
 
 impl Timeout {
     fn new(ms: u64) -> Self {
-        Self { until_ms: time::uptime_ms().saturating_add(ms), spins: 0 }
+        Self { started_ms: time::uptime_ms(), until_ms: time::uptime_ms().saturating_add(ms), spins: 0 }
+    }
+
+    /// Сколько ждали и упёрлись ли в предел витков вместо часов.
+    ///
+    /// Различать это обязательно. «Часы отсчитали полсекунды» — значит
+    /// устройство молчит; «кончились витки» — значит часы стоят, и настоящая
+    /// неисправность совсем в другом месте. На машине без журнала эти два
+    /// случая выглядят одинаково: «a control transfer never completed».
+    fn report(&self) -> (u64, bool) {
+        (
+            time::uptime_ms().saturating_sub(self.started_ms),
+            self.spins >= SPIN_LIMIT,
+        )
     }
 
     /// `true`, если ждать больше нельзя.
@@ -194,7 +208,10 @@ pub enum XhciError {
     /// Передача по управляющей точке не удалась.
     TransferFailed { code: u32 },
     /// Передача не завершилась за отведённое время.
-    TransferTimeout,
+    ///
+    /// Несёт, сколько ядро прождало и по какому пределу вышло: часы и витки —
+    /// два разных отказа, а выглядят они одинаково.
+    TransferTimeout { waited_ms: u64, spun_out: bool },
     /// Дескриптор пришёл короче, чем должен быть.
     ShortDescriptor,
     /// Устройство есть, но интерфейса HID с точкой прерываний среди его
@@ -233,7 +250,11 @@ impl core::fmt::Display for XhciError {
             Self::TransferFailed { code } => {
                 write!(f, "control transfer failed: {} ({code})", ring::completion_name(*code))
             }
-            Self::TransferTimeout => f.write_str("a control transfer never completed"),
+            Self::TransferTimeout { waited_ms, spun_out } => write!(
+                f,
+                "a control transfer never completed ({} after {waited_ms} ms)",
+                if *spun_out { "ran out of spins" } else { "timed out by the clock" }
+            ),
             Self::ShortDescriptor => f.write_str("the device returned a truncated descriptor"),
             Self::NoHid => f.write_str("the device has no HID interface with an interrupt endpoint"),
             Self::UnknownHid => f.write_str(
@@ -353,6 +374,23 @@ struct Device {
     reader: Option<Reader>,
     /// Ждёт ли сейчас устройство отчёта (дескриптор в кольце).
     queued: bool,
+    /// Кто изготовитель и что за модель — из дескриптора устройства.
+    ///
+    /// Хранится ради одного вопроса, на который иначе нечем ответить на машине
+    /// без последовательного порта: «а это вообще разные устройства?». Два
+    /// одинаковых идентификатора на двух портах означают одно устройство,
+    /// увиденное дважды, и это совсем другая неисправность, чем «клавиатура
+    /// разобрана как указатель».
+    identity: (u16, u16),
+    /// Длина дескриптора отчётов, по которому устройство разобрано; ноль —
+    /// разбирали не по нему, а по boot-протоколу.
+    described_by: u16,
+    /// Номер поднятого интерфейса и сколько их всего у устройства.
+    ///
+    /// Второе число важнее первого: составное устройство — «мышь» с
+    /// клавиатурой внутри — драйвер обслуживает только наполовину, и без этого
+    /// числа вторая половина невидима.
+    interface: (u8, u8),
 }
 
 /// Контроллер и подключённые к нему устройства.
@@ -407,6 +445,17 @@ pub struct Controller {
     /// Чем закончилась последняя неудачная попытка поднять устройство: порт,
     /// шаг и сама ошибка.
     last_error: Option<(u8, Stage, XhciError)>,
+    /// Состав портов изменился: либо контроллер сообщил событием, либо это
+    /// заметила сверка маски. Разбирает признак задача, а не тот, кто его
+    /// поставил.
+    ports_changed: bool,
+    /// Какие порты были заняты при последней сверке — по биту на порт.
+    ///
+    /// Событию об изменении состояния порта верить можно, но нельзя **только**
+    /// ему: гипервизор вправе подключить устройство так, что событие до нас не
+    /// доедет, а маска всё равно изменится. Сверка стоит одного чтения регистра
+    /// на порт и закрывает этот случай.
+    connected: u32,
 }
 
 impl Controller {
@@ -492,6 +541,8 @@ impl Controller {
             services: 0,
             occupied: 0,
             last_error: None,
+            ports_changed: false,
+            connected: 0,
         };
 
         // SAFETY: окно регистров отображено, кольца выделены и обнулены.
@@ -727,10 +778,12 @@ impl Controller {
                         self.handle_transfer_event(&event);
                     }
                 }
-                // Изменение состояния порта. Само событие ничего не требует —
-                // состояние всё равно читается из `PORTSC`, — но его надо забрать
-                // из кольца, иначе оно останется навсегда.
-                ring::TRB_PORT_STATUS_CHANGE => {}
+                // Изменение состояния порта: что-то воткнули или вынули.
+                // Разбирать прямо здесь нельзя — перечисление длится сотни
+                // миллисекунд, а мы внутри лока с запрещёнными прерываниями.
+                // Поэтому только признак; работу делает задача (см.
+                // [`poll_hotplug`]).
+                ring::TRB_PORT_STATUS_CHANGE => self.ports_changed = true,
                 _ => {}
             }
         }
@@ -821,11 +874,25 @@ impl Controller {
 
         // SAFETY: см. выше.
         let status = unsafe { self.regs.read_portsc(port) };
-        if status & regs::PORTSC_ENABLED != 0 {
-            // Порт уже работает: у USB 3 обучение линии контроллер проводит сам,
-            // и сброс здесь только сломал бы уже установленное соединение.
-            return Ok((status >> regs::PORTSC_SPEED_SHIFT) & regs::PORTSC_SPEED_MASK);
+        let speed = (status >> regs::PORTSC_SPEED_SHIFT) & regs::PORTSC_SPEED_MASK;
+        if status & regs::PORTSC_ENABLED != 0 && speed >= regs::SPEED_SUPER {
+            // SuperSpeed: обучение линии контроллер проводит сам, порт включается
+            // без участия драйвера, и сброс здесь только сломал бы уже
+            // установленное соединение.
+            return Ok(speed);
         }
+
+        // А вот включённый порт USB 2 сбрасывать **обязательно**, и это стоило
+        // отдельного вечера. Прошивка пользуется клавиатурой в своём загрузочном
+        // меню и оставляет её адресованной; сброс контроллера (`HCRST`) обнуляет
+        // состояние **контроллера**, но не устройства. Пропустив сброс порта, мы
+        // выдаём устройству новый адрес командой `Address Device`, а оно
+        // продолжает слушать прежний — и молчит. Выглядит это как «управляющая
+        // передача не завершилась за 500 мс» на исправном устройстве, причём
+        // через раз: смотря трогала ли прошивка эту клавиатуру в этот раз.
+        //
+        // Сброс порта — единственное, что возвращает устройство USB 2 в
+        // состояние Default с адресом 0.
 
         // SAFETY: см. выше; вместе со сбросом снимаем признак изменения
         // подключения — он уже разобран, и оставлять его незачем.
@@ -871,14 +938,28 @@ impl Controller {
     ///
     /// Контроллер должен работать.
     pub unsafe fn attach_devices(&mut self) -> (bool, bool) {
-        let (mut keyboard, mut mouse) = (false, false);
-        let mut next = 1u8;
-
         // Карта занятых портов — одной строкой, до первой попытки с ними
         // что-нибудь сделать. Без неё «перечисление ничего не нашло» и
         // «перечисление не дошло до первого порта» выглядят одинаково: молчание.
         // На чужой машине с четырнадцатью портами это первое, что хочется
         // знать, и стоит оно одного чтения на порт.
+        // SAFETY: контракт функции.
+        let connected = unsafe { self.connected_mask() };
+        kprintln!(
+            "  usb         : {} root port(s), connected mask {connected:#010x}",
+            self.regs.max_ports
+        );
+
+        // SAFETY: см. выше.
+        unsafe { self.attach_missing() }
+    }
+
+    /// Битовая карта занятых портов: по биту на порт, начиная с первого.
+    ///
+    /// # Safety
+    ///
+    /// Окно регистров должно быть отображено.
+    unsafe fn connected_mask(&mut self) -> u32 {
         let mut connected = 0u32;
         for port in 1..=self.regs.max_ports.min(32) {
             // SAFETY: номер порта в пределах, сообщённых контроллером.
@@ -886,11 +967,21 @@ impl Controller {
                 connected |= 1 << (port - 1);
             }
         }
+        self.connected = connected;
         self.occupied = connected.count_ones() as usize;
-        kprintln!(
-            "  usb         : {} root port(s), connected mask {connected:#010x}",
-            self.regs.max_ports
-        );
+        connected
+    }
+
+    /// Поднять всё, что занимает порт и ещё не обслуживается.
+    ///
+    /// Возвращает, появились ли клавиатура и указатель — **среди новых**.
+    ///
+    /// # Safety
+    ///
+    /// Контроллер должен работать.
+    unsafe fn attach_missing(&mut self) -> (bool, bool) {
+        let (mut keyboard, mut mouse) = (false, false);
+        let mut next = 1u8;
 
         while next <= self.regs.max_ports {
             // SAFETY: контракт функции.
@@ -898,6 +989,12 @@ impl Controller {
                 break;
             };
             next = port.saturating_add(1);
+
+            // Порт, который уже обслуживается, трогать нельзя: повторный сброс
+            // отобрал бы у работающего устройства адрес.
+            if self.devices.iter().any(|device| device.port == port) {
+                continue;
+            }
 
             // SAFETY: см. выше.
             match unsafe { self.attach_one(port) } {
@@ -912,6 +1009,90 @@ impl Controller {
         }
 
         (keyboard, mouse)
+    }
+
+    /// Перечислить порты заново: поднять появившиеся устройства и забыть
+    /// исчезнувшие.
+    ///
+    /// Возвращает, изменился ли состав.
+    ///
+    /// # Почему это делает задача, а не обработчик события
+    ///
+    /// Потому что перечисление — это сбросы портов и управляющие передачи, то
+    /// есть сотни миллисекунд ожиданий. Обработчик исполняется с запрещёнными
+    /// прерываниями, и на это время остановились бы и часы, и планировщик —
+    /// включая тот самый таймер, по которому ожидания и отсчитываются.
+    ///
+    /// # Safety
+    ///
+    /// Контроллер должен работать, и вызывать это можно только из задачи.
+    pub unsafe fn rescan(&mut self) -> bool {
+        self.ports_changed = false;
+        let before = self.devices.len();
+
+        // SAFETY: контракт функции.
+        let connected = unsafe { self.connected_mask() };
+
+        // Сначала — исчезнувшие: их слоты нужны тем, кто пришёл на их место, а
+        // слотов у контроллера всего четыре.
+        let mut index = 0;
+        while index < self.devices.len() {
+            let port = self.devices[index].port;
+            if connected & (1 << (port - 1)) != 0 {
+                index += 1;
+                continue;
+            }
+            let slot = self.devices[index].slot;
+            kprintln!("  usb         : device on root port {port} is gone, freeing slot {slot}");
+            // SAFETY: слот выдан контроллером этому устройству.
+            unsafe { self.release_slot(slot) };
+            self.devices.remove(index);
+        }
+
+        // SAFETY: см. выше.
+        let (keyboard, mouse) = unsafe { self.attach_missing() };
+        if keyboard || mouse {
+            let sources = input::sources();
+            input::set_sources(input::Sources {
+                keyboard: sources.keyboard || keyboard,
+                mouse: sources.mouse || mouse,
+                ..sources
+            });
+        }
+
+        before != self.devices.len()
+    }
+
+    /// Вернуть слот контроллеру и убрать его из массива контекстов.
+    ///
+    /// Память под кольца и контексты при этом не освобождается: окно DMA у
+    /// ядра пока одностороннее — выделять умеет, возвращать нет. Устройство,
+    /// воткнутое и вынутое сто раз, исчерпает его; это названо вслух, а не
+    /// обойдено молча, и лечится общим освобождением DMA, а не здесь.
+    ///
+    /// # Safety
+    ///
+    /// Слот должен принадлежать устройству, которого больше нет на шине.
+    unsafe fn release_slot(&mut self, slot: u8) {
+        // SAFETY: контракт функции; команда освобождает слот у контроллера.
+        let result = unsafe {
+            self.command_execute(Trb {
+                parameter: 0,
+                status: 0,
+                control: (ring::TRB_DISABLE_SLOT << ring::TRB_TYPE_SHIFT)
+                    | (u32::from(slot) << 24),
+            })
+        };
+        if let Err(err) = result {
+            kprintln!("  usb         : freeing slot {slot} failed: {err}");
+        }
+        // Ссылка на контекст убирается в любом случае: слот, о котором
+        // контроллер продолжает читать контекст выброшенного устройства, —
+        // это чтение памяти, которую ядро вправе раздать заново.
+        // SAFETY: слот в пределах массива, выделенного под `SLOTS_WANTED + 1`.
+        unsafe {
+            self.dcbaa.as_ptr::<u64>().add(usize::from(slot)).write_volatile(0);
+        }
     }
 
     /// Подключить одно устройство: слот, адрес, дескрипторы, конфигурация.
@@ -980,6 +1161,9 @@ impl Controller {
             report_len: REPORT_LEN as u16,
             reader: None,
             queued: false,
+            identity: (0, 0),
+            described_by: 0,
+            interface: (0, 0),
         };
 
         // SAFETY: контракт функции; контексты выделены и обнулены.
@@ -1001,6 +1185,8 @@ impl Controller {
         );
 
         device.report_len = found.max_packet_size.min(PAGE_SIZE as u16);
+        device.described_by = found.report_len;
+        device.interface = (found.interface, found.interfaces);
         // SAFETY: см. выше.
         unsafe { self.configure_endpoint(&mut device, &found, speed) }
             .map_err(|err| (Stage::Configure, err))?;
@@ -1151,6 +1337,21 @@ impl Controller {
         if u16::from(max_packet) != regs::default_max_packet_size(speed) {
             // SAFETY: см. выше.
             unsafe { self.update_max_packet(device, u16::from(max_packet)) }?;
+        }
+
+        // Полный дескриптор устройства — ради одних только идентификаторов.
+        // Читается отдельной передачей, потому что первые восемь байт их не
+        // содержат, а знать, кто перед нами, надо на любой машине: на той, где
+        // журнала нет, это единственный способ отличить два разных устройства
+        // от одного, увиденного дважды. Отказ здесь не смертелен — устройство
+        // останется безымянным, и только.
+        // SAFETY: см. выше.
+        if let Ok(read) = unsafe { self.get_descriptor(device, usb::DESC_DEVICE, 0, 18) } {
+            // SAFETY: см. выше.
+            let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
+            if let Some(full) = usb::DeviceDescriptor::parse(bytes) {
+                device.identity = (full.vendor, full.product);
+            }
         }
 
         // Дескриптор конфигурации: сначала девять байт, чтобы узнать полную
@@ -1549,7 +1750,8 @@ impl Controller {
                 return Ok((u32::from(length) - residual) as usize);
             }
             if timeout.expired() {
-                return Err(XhciError::TransferTimeout);
+                let (waited_ms, spun_out) = timeout.report();
+                return Err(XhciError::TransferTimeout { waited_ms, spun_out });
             }
         }
     }
@@ -1726,6 +1928,31 @@ impl Controller {
         }
     }
 
+    /// Не изменился ли состав портов с прошлой сверки.
+    ///
+    /// Дёшево (чтение одного регистра на порт) и сознательно дублирует событие
+    /// об изменении состояния порта: событие может не дойти — например, потому
+    /// что прерывания от контроллера на этой машине не работают вовсе и кольцо
+    /// разбирается опросом с задержкой, — а маска не соврёт никогда.
+    ///
+    /// # Safety
+    ///
+    /// Окно регистров должно быть отображено.
+    unsafe fn ports_differ(&mut self, compare_mask: bool) -> bool {
+        // Признак от события проверяется первым и без всяких условий: он уже
+        // стоит, читать ради него регистры незачем, а отложить его до срока
+        // сверки значит потерять — сверка обнулит маску и разницы не увидит.
+        if self.ports_changed {
+            return true;
+        }
+        if !compare_mask {
+            return false;
+        }
+        let known = self.connected;
+        // SAFETY: контракт функции.
+        known != unsafe { self.connected_mask() }
+    }
+
     /// Сводка для диагностики: устройства, отчёты, события, ошибки.
     #[must_use]
     pub fn summary(&self) -> Summary {
@@ -1733,6 +1960,19 @@ impl Controller {
         for device in &self.devices {
             reports += device.reader.as_ref().map_or(0, Reader::reports);
         }
+        let mut attached = [Attached::default(); SLOTS_WANTED as usize];
+        for (slot, device) in attached.iter_mut().zip(self.devices.iter()) {
+            *slot = Attached {
+                port: device.port,
+                vendor: device.identity.0,
+                product: device.identity.1,
+                kind: device.reader.as_ref().map_or("unknown", Reader::name),
+                descriptor: device.described_by,
+                interface: device.interface.0,
+                interfaces: device.interface.1,
+            };
+        }
+
         let keyboards = self
             .devices
             .iter()
@@ -1749,6 +1989,7 @@ impl Controller {
             mice,
             occupied: self.occupied,
             last_error: self.last_error,
+            attached,
             slot: self.devices.first().map_or(0, |device| device.slot),
             port: self.devices.first().map_or(0, |device| device.port),
             reports,
@@ -1759,6 +2000,24 @@ impl Controller {
             services: self.services,
         }
     }
+}
+
+/// Одно поднятое устройство в сводке.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Attached {
+    /// Корневой порт; ноль означает пустую запись.
+    pub port: u8,
+    /// Изготовитель и модель из дескриптора устройства.
+    pub vendor: u16,
+    pub product: u16,
+    /// Чем ядро его сочло: `"keyboard"` или `"mouse"`.
+    pub kind: &'static str,
+    /// Длина дескриптора отчётов; ноль — устройство его не объявило.
+    pub descriptor: u16,
+    /// Номер интерфейса, который драйвер поднял.
+    pub interface: u8,
+    /// Сколько интерфейсов HID у устройства всего.
+    pub interfaces: u8,
 }
 
 /// Что драйвер сообщает о себе наружу.
@@ -1783,6 +2042,12 @@ pub struct Summary {
     /// Чем закончилась последняя неудачная попытка: порт, шаг и ошибка.
     /// `None` — неудач не было.
     pub last_error: Option<(u8, Stage, XhciError)>,
+    /// По записи на поднятое устройство, в порядке портов.
+    ///
+    /// Массив, а не вектор: сводку спрашивают в том числе из мест, где нельзя
+    /// выделять память, и четырёх записей хватает — столько же слотов драйвер
+    /// просит у контроллера.
+    pub attached: [Attached; SLOTS_WANTED as usize],
     /// Слот первого из них.
     pub slot: u8,
     /// Порт первого из них.
@@ -1996,6 +2261,46 @@ pub fn service() {
     }
 }
 
+/// Появилось ли на портах что-то новое (или исчезло старое).
+fn ports_changed(compare_mask: bool) -> bool {
+    match CONTROLLER.lock().as_mut() {
+        // SAFETY: контроллер существует, значит окно его регистров отображено.
+        Some(controller) => unsafe { controller.ports_differ(compare_mask) },
+        None => false,
+    }
+}
+
+/// Перечислить порты заново — то, что делает «воткнули на ходу» работающим.
+///
+/// # Почему контроллер забирается из глобала целиком
+///
+/// Потому что перечисление длится сотни миллисекунд, а [`crate::sync::SpinLock`]
+/// держится с запрещёнными прерываниями: провести под ним сброс порта значило бы
+/// остановить на это время часы и планировщик — то есть те самые часы, по
+/// которым перечисление отсчитывает свои ожидания.
+///
+/// Пока контроллер «в руках», обработчик прерывания и опрос видят пустое место и
+/// ничего не делают. Потерять этим нечего: события копятся в кольце, а разберёт
+/// их первый же вызов [`service`] после возврата.
+pub fn poll_hotplug() {
+    let taken = CONTROLLER.lock().take();
+    let Some(mut controller) = taken else {
+        return;
+    };
+    // SAFETY: контроллер работает, вызов идёт из задачи.
+    let changed = unsafe { controller.rescan() };
+    if changed {
+        let summary = controller.summary();
+        kprintln!(
+            "  usb         : now {} device(s), {} keyboard(s), {} pointer(s)",
+            summary.devices,
+            summary.keyboards,
+            summary.mice
+        );
+    }
+    *CONTROLLER.lock() = Some(controller);
+}
+
 /// Поднялся ли контроллер.
 ///
 /// Нужно тому, кто решает, заводить ли задачу опроса: на машине без xHCI она
@@ -2010,6 +2315,13 @@ pub fn is_present() -> bool {
 /// Десять миллисекунд — это период опроса конечной точки прерываний у обеих
 /// загрузочных устройств: чаще бессмысленно, реже — заметно пальцам.
 const POLL_PERIOD_MS: u64 = 10;
+
+/// Как часто сверять состав портов.
+///
+/// Полсекунды: человек, воткнувший мышь, не замечает такой задержки, а чтение
+/// четырнадцати регистров дважды в секунду не стоит ничего. Чаще незачем — это
+/// страховка на случай, когда событие от контроллера не пришло.
+const PORT_CHECK_PERIOD_MS: u64 = 500;
 
 /// Настроены ли прерывания. Решает, ждать задаче события или часов.
 fn interrupts_enabled() -> bool {
@@ -2035,12 +2347,39 @@ fn interrupts_enabled() -> bool {
 /// незанятом BAR, существует, и клавиатура на нём должна работать.
 pub fn service_task() {
     let by_interrupt = interrupts_enabled();
+    let mut next_port_check = 0u64;
+
     loop {
         service();
+
+        // Порты сверяются по часам, а не только по событию, и период у сверки
+        // свой — она стоит чтения регистра на порт, тогда как разбор кольца
+        // происходит на каждое прерывание.
+        //
+        // Зачем вообще сверять, если контроллер обязан прислать событие: затем,
+        // что «обязан» — это про исправную машину. На той, где мышь работает, а
+        // клавиатура появляется на шине через несколько секунд после загрузки,
+        // событие до драйвера так и не дошло, и устройство не существовало для
+        // системы до перезагрузки.
+        let now = time::uptime_ms();
+        let compare_mask = now >= next_port_check;
+        if compare_mask {
+            next_port_check = now.saturating_add(PORT_CHECK_PERIOD_MS);
+        }
+        if ports_changed(compare_mask) {
+            poll_hotplug();
+        }
+
         if by_interrupt {
             // Признак проверяется **под локом планировщика** — в этом весь
             // смысл `block_on_irq`. Прерывание, пришедшее между «проверил» и
             // «уснул», иначе не разбудило бы никого: будить было бы ещё некого.
+            //
+            // Здесь сон без срока, и это осознанно: машина с работающими
+            // прерываниями присылает событие об изменении состояния порта, и
+            // именно оно разбудит задачу. Сверка по часам остаётся страховкой
+            // для машин на опросе — а это ровно те машины, где событие и не
+            // доходило.
             crate::sched::block_on_irq(IRQ_SOURCE, || {
                 EVENT_PENDING.swap(false, Ordering::AcqRel)
             });

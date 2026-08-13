@@ -510,6 +510,14 @@ fn play(
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
+            Step::Plug(spec) => {
+                println!("  [{at:>6} мс] шаг {index}: подключаем {spec}");
+                hmp.device_add(spec).with_context(|| format!("шаг {index}"))?;
+            }
+            Step::Unplug(id) => {
+                println!("  [{at:>6} мс] шаг {index}: выдёргиваем {id}");
+                hmp.device_del(id).with_context(|| format!("шаг {index}"))?;
+            }
             Step::Wait(ms) => {
                 println!("  [{at:>6} мс] шаг {index}: пауза {ms} мс");
                 std::thread::sleep(Duration::from_millis(*ms));

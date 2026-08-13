@@ -131,6 +131,20 @@ impl Monitor {
         self.command_silent(&format!("mouse_button {mask}"))
     }
 
+    /// Подключить устройство к работающей машине.
+    ///
+    /// Тот же путь, каким человек втыкает мышь: контроллер видит появление
+    /// устройства на порту и сообщает о нём событием. Проверить это иначе
+    /// нечем — перечисление при загрузке разбирает то, что уже воткнуто.
+    pub fn device_add(&mut self, spec: &str) -> Result<()> {
+        self.command_silent(&format!("device_add {spec}"))
+    }
+
+    /// Выдернуть устройство.
+    pub fn device_del(&mut self, id: &str) -> Result<()> {
+        self.command_silent(&format!("device_del {id}"))
+    }
+
     /// Снять экран в файл PPM.
     pub fn screendump(&mut self, path: &Path) -> Result<()> {
         // Прямая косая работает и на Windows, а обратная в HMP выглядит как

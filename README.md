@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 23 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 24 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -696,6 +696,39 @@ pointers came out of it, and where the last failure stopped. On a machine with n
 port that line is the only diagnosis available, and it is the line that turned "the mouse
 does not work" into a specific answer.
 
+### Devices arrive after the kernel does
+
+Enumeration ran once, at boot, and whatever was plugged in by then was all the machine
+would ever have. That is not how anyone uses USB, and it showed up as a keyboard that
+"kept falling off" on VirtualBox for ARM: the tablet came up every time, the keyboard about
+half the time. It was not falling off — it had never arrived. The hypervisor attaches its
+keyboard a few seconds into the guest's life, by which point the kernel had already looked
+at the ports and stopped caring.
+
+The controller does report this: a Port Status Change event lands in the same ring as
+everything else, and the driver was reading it and throwing it away. It now means what it
+says, and there is a second path as well — the mask of occupied ports is re-read twice a
+second — because "the controller is obliged to send an event" describes a working machine,
+and the machines that need this are the ones behaving oddly.
+
+Two details that decide whether this works at all:
+
+- **Enumeration cannot run in the handler.** Resetting a port and reading descriptors is
+  hundreds of milliseconds of waiting, and a `SpinLock` is held with interrupts disabled —
+  which would stop the clock those waits are measured against. So the task takes the whole
+  controller out of its global, works on it, and puts it back; meanwhile events pile up in
+  the ring, which is what a ring is for.
+- **A device that leaves must return its slot.** There are four, and a slot never released
+  is a slot lost until reboot. Unplugging now issues Disable Slot and clears the entry in
+  the context array — that second part matters even when the command fails, since a
+  controller reading a context for a device that is gone is reading memory the kernel may
+  hand out again.
+
+The bench plugs a tablet into a running machine with `device_add`, asserts the kernel brings
+it up and parses its descriptor, then pulls it with `device_del` and asserts the slot comes
+back. Both paths are exercised: x86-64 has MSI-X and finds out by event, ARM has no MSI-X
+here and finds out by the mask.
+
 ### A second opinion about the clock
 
 `-machine pit=off` is not a hypothetical. On VirtualBox the x86-64 side came up with no
@@ -1059,6 +1092,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 21 | A bootable ISO: ISO 9660 with an El Torito EFI catalog, so the system can be handed to someone | **done** |
 | 22 | The interrupt controller is read from ACPI, not guessed, and GICv3 works | **done** |
 | 23 | The device describes itself: HID report descriptors, so a tablet is a mouse; PCI without MCFG, the UART from ACPI, and a second source for the clock | **done** |
+| 24 | Devices arrive after the kernel does: hot-plug, and a slot that comes back when one leaves | **done** |
 
 Phases 6, 8, 9 and 12 were all split, for the same reason: their halves are not the same size.
 PS/2 is two I/O ports and a scancode table, whereas a host-side USB stack is PCIe

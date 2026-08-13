@@ -151,6 +151,13 @@ pub struct HidInterface {
     /// Длина дескриптора отчётов из дескриптора HID; ноль — устройство его не
     /// объявило, и читать нечего.
     pub report_len: u16,
+    /// Сколько всего интерфейсов класса HID у этой конфигурации.
+    ///
+    /// Больше одного означает составное устройство — «мышь», внутри которой
+    /// живёт ещё и клавиатура. Драйвер поднимает только первый, и это число
+    /// существует затем, чтобы такое устройство было **видно**: иначе половина
+    /// его молчит, а понять, что она вообще есть, нечем.
+    pub interfaces: u8,
 }
 
 /// Найти в дескрипторе конфигурации интерфейс HID.
@@ -174,6 +181,10 @@ pub fn find_hid(bytes: &[u8]) -> Option<HidInterface> {
         return None;
     }
     let configuration = bytes[5];
+
+    // Сколько всего интерфейсов HID — считается отдельным проходом, до поиска:
+    // ответ нужен уже в той записи, которую вернёт первый же найденный.
+    let interfaces = hid_interfaces(bytes);
 
     let mut offset = usize::from(bytes[0]);
     let mut current: Option<HidInterface> = None;
@@ -201,6 +212,7 @@ pub fn find_hid(bytes: &[u8]) -> Option<HidInterface> {
                         max_packet_size: 0,
                         interval: 0,
                         report_len: 0,
+                        interfaces,
                     })
                 } else {
                     // Не наш интерфейс: его конечные точки нас не касаются, и
@@ -240,6 +252,27 @@ pub fn find_hid(bytes: &[u8]) -> Option<HidInterface> {
         offset += length;
     }
     None
+}
+
+/// Сколько интерфейсов класса HID объявляет конфигурация.
+///
+/// Считаются именно интерфейсы, а не альтернативные их настройки: у HID
+/// альтернативных настроек не бывает, поэтому различать их незачем.
+#[must_use]
+pub fn hid_interfaces(bytes: &[u8]) -> u8 {
+    let mut found = 0u8;
+    let mut offset = usize::from(bytes[0]);
+    while offset + 2 <= bytes.len() {
+        let length = usize::from(bytes[offset]);
+        if length < 2 || offset + length > bytes.len() {
+            break;
+        }
+        if bytes[offset + 1] == DESC_INTERFACE && length >= 9 && bytes[offset + 5] == CLASS_HID {
+            found = found.saturating_add(1);
+        }
+        offset += length;
+    }
+    found
 }
 
 /// Длина дескриптора отчётов из дескриптора HID.
