@@ -1288,14 +1288,13 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 44 | The system calls a C library needs, and the ABI fixed as a contract | planned |
 | 45 | A libc in the spirit of newlib — ours underneath, not Linux's | planned |
 | 46 | A toolchain: somebody else's project builds for FreeOS without patching its source | planned |
-| 47 | `llama.cpp`, rebuilt for FreeOS, answers a question typed into the terminal | planned |
-| 48 | A window belongs to a program: surfaces and events across the system-call boundary | planned |
-| 49 | Settings, and icons on the desktop | planned |
-| 50 | btrfs, read-only: a volume `mkfs.btrfs` made, checksums verified | planned |
-| 51 | btrfs, written: copy-on-write, and the state partition moves onto it | planned |
-| 52 | DeviceTree beside ACPI, and the HAL split this README has promised since Phase 0 | planned |
-| 53 | A Raspberry Pi 4: the first machine that is not an emulator | planned |
-| 54+ | A phone: an Android boot image, no UEFI, no ACPI, and a framebuffer left by the bootloader | planned |
+| 47 | A window belongs to a program: surfaces and events across the system-call boundary | planned |
+| 48 | Settings, and icons on the desktop | planned |
+| 49 | btrfs, read-only: a volume `mkfs.btrfs` made, checksums verified | planned |
+| 50 | btrfs, written: copy-on-write, and the state partition moves onto it | planned |
+| 51 | DeviceTree beside ACPI, and the HAL split this README has promised since Phase 0 | planned |
+| 52 | A Raspberry Pi 4: the first machine that is not an emulator | planned |
+| 53+ | A phone: an Android boot image, no UEFI, no ACPI, and a framebuffer left by the bootloader | planned |
 
 The reasoning behind that order — what each phase is for, what checks it, what is known to
 be waiting to go wrong in it, and how large it is — is in [ROADMAP.md](ROADMAP.md), along
