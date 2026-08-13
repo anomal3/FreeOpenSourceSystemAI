@@ -52,6 +52,12 @@ pub struct Editor {
     inode_hint: u32,
     /// Штамп времени для создаваемых inode.
     time: u32,
+    /// Что о состоянии тома сейчас написано **на диске**: `true` — «закрыт
+    /// чисто». Держится в памяти, чтобы не читать суперблок ради ответа на
+    /// вопрос, который редактор сам себе и задал: [`Editor::mark_dirty`]
+    /// вызывается перед каждой правкой и обязан быть бесплатным, когда том уже
+    /// помечен.
+    clean_on_disk: bool,
 }
 
 impl Editor {
@@ -70,8 +76,16 @@ impl Editor {
             block_hint: geometry.first_data_block,
             inode_hint: FIRST_INODE,
             time,
+            clean_on_disk: fs.was_clean(),
         };
         editor.load_group_descriptors(dev)?;
+        // Том помечается используемым **сразу**, до первой правки, и это
+        // единственный порядок, который что-то значит. Пометь мы его при первой
+        // записи — между началом записи и пометкой оставалось бы окно, в
+        // котором пропажа питания даёт том с устаревшими счётчиками и с
+        // признаком «закрыт чисто» на диске: следующая загрузка поверила бы
+        // счётчикам и выдала бы под новый файл уже занятый блок.
+        editor.mark_dirty(dev)?;
         Ok(editor)
     }
 
@@ -95,6 +109,9 @@ impl Editor {
             block_hint: geometry.first_data_block,
             inode_hint: FIRST_INODE,
             time,
+            // Разметка только что записала суперблок с признаком «чистый»;
+            // первая же правка через [`Editor::mark_dirty`] его снимет.
+            clean_on_disk: true,
         }
     }
 
@@ -439,6 +456,59 @@ impl Editor {
 
         self.truncate(dev, number, 0)?;
         self.free_inode(dev, number, false)
+    }
+
+    // --- состояние тома ----------------------------------------------------
+
+    /// Пометить том используемым — до того, как что-нибудь на нём изменится.
+    ///
+    /// Дёшево, когда том уже помечен: признак хранится в памяти, и повторный
+    /// вызов не трогает диск вовсе. Поэтому его можно ставить перед каждой
+    /// правкой, не думая о цене.
+    pub fn mark_dirty(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if !self.clean_on_disk {
+            return Ok(());
+        }
+        self.write_state(dev, STATE_MOUNTED)?;
+        self.clean_on_disk = false;
+        Ok(())
+    }
+
+    /// Пометить том закрытым чисто.
+    ///
+    /// Вызывать **после** [`Editor::flush`] и только тогда, когда всё
+    /// записанное действительно на носителе: этот признак — обещание
+    /// следующей загрузке, что счётчикам можно верить.
+    pub fn mark_clean(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if self.clean_on_disk {
+            return Ok(());
+        }
+        self.write_state(dev, STATE_CLEAN)?;
+        self.clean_on_disk = true;
+        Ok(())
+    }
+
+    /// Записать `s_state` в **основной** суперблок.
+    ///
+    /// Резервные копии не трогаются намеренно. Их читают только тогда, когда
+    /// основной суперблок уничтожен, и в этом случае состояние тома — далеко
+    /// не первый вопрос; зато записывать их пришлось бы при каждом
+    /// монтировании, по одной записи блока на группу.
+    fn write_state(&mut self, dev: &mut dyn BlockDevice, state: u16) -> Result<()> {
+        let geometry = self.geometry;
+        let block = geometry.group_first_block(0);
+        let within = if geometry.block_size == BlockSize::B1024 {
+            0
+        } else {
+            SUPERBLOCK_OFFSET as usize
+        };
+        let mut buf = self.read_block(dev, block)?;
+        put_u16(&mut buf, within + SUPERBLOCK_STATE, state);
+        self.write_block(dev, block, &buf)?;
+        // Признак обязан дойти до пластин, а не остаться в кеше записи диска:
+        // весь его смысл в том, чтобы пережить пропажу питания.
+        dev.flush()?;
+        Ok(())
     }
 
     // --- сброс на диск -----------------------------------------------------

@@ -88,6 +88,12 @@ pub fn init(_info: &BootInfo) -> Sources {
 
     kprintln!("  serial in   : PL011 receive on INTID {UART_INTID}");
     kprintln!("  keyboard    : no PS/2 on this machine; the keyboard arrives over USB");
+    // Сказано вслух намеренно. На x86-64 кнопка питания — фиксированное событие
+    // ACPI, то есть пара битов в регистре чипсета. На этой машине её приносит
+    // ACPI GED, а GED описан в AML — байт-коде, интерпретатора которого у нас
+    // нет и в этой фазе не будет. Выключение по команде здесь работает, по
+    // кнопке — нет, и «работает везде» было бы неправдой.
+    kprintln!("  power       : no power button here; it arrives through ACPI GED, described in AML");
 
     let sources = Sources { keyboard: false, serial: true, mouse: false };
     crate::input::set_sources(sources);

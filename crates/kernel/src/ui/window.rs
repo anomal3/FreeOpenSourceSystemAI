@@ -28,11 +28,44 @@ pub enum App {
     Files,
     /// Что это за система.
     About,
+    /// Подтверждение выключения.
+    ///
+    /// Окно, а не отдельная сущность: подтверждение ведёт себя как всё
+    /// остальное на столе — его видно в панели задач, его можно отодвинуть и
+    /// закрыть привычным Ctrl+W, и «закрыть» здесь означает «передумал». Это
+    /// дешевле собственного модального слоя и понятнее человеку, который уже
+    /// знает, как закрываются окна.
+    Shutdown,
+    /// Подтверждение перезагрузки.
+    Restart,
 }
 
 impl App {
     /// Порядок в меню запуска.
-    pub const LAUNCHABLE: [App; 4] = [App::Terminal, App::Files, App::System, App::About];
+    pub const LAUNCHABLE: [App; 6] = [
+        App::Terminal,
+        App::Files,
+        App::System,
+        App::About,
+        App::Shutdown,
+        App::Restart,
+    ];
+
+    /// Спрашивает ли это окно «точно?» — и о чём именно.
+    ///
+    /// `Some(true)` — перезагрузка, `Some(false)` — выключение, `None` — обычное
+    /// окно. Один ответ на оба вопроса, а не два предиката: «спрашивает ли» и
+    /// «о чём именно» нельзя разнести так, чтобы вызывающий проверил первое и
+    /// забыл второе, — а перепутать выключение с перезагрузкой дороже, чем
+    /// набрать лишний `match`.
+    #[must_use]
+    pub const fn confirms_power(self) -> Option<bool> {
+        match self {
+            App::Shutdown => Some(false),
+            App::Restart => Some(true),
+            _ => None,
+        }
+    }
 
     /// Заголовок окна и подпись в панели задач.
     #[must_use]
@@ -42,6 +75,8 @@ impl App {
             App::System => "System",
             App::Files => "Files",
             App::About => "About",
+            App::Shutdown => "Shut down",
+            App::Restart => "Restart",
         }
     }
 
@@ -53,6 +88,8 @@ impl App {
             App::Files => "browse the mounted root",
             App::System => "memory, tasks, input counters",
             App::About => "what this system is",
+            App::Shutdown => "close the volume and switch off",
+            App::Restart => "close the volume and start again",
         }
     }
 }

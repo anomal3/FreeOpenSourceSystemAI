@@ -169,23 +169,19 @@ pub fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(value)
 }
 
-/// Найти таблицу по сигнатуре и вернуть её целиком, с уже проверенной суммой.
-///
-/// `rsdp` — физический адрес RSDP из [`boot_info::BootInfo::acpi_rsdp`].
-///
-/// # Safety
-///
-/// Требования те же, что у [`phys_slice`]: прямое отображение активно, а память
-/// с таблицами ACPI ещё не переиспользована.
 /// Прочитать таблицу, физический адрес которой уже известен.
 ///
 /// Нужно для DSDT: её нет в корневой таблице, на неё ссылается поле в FADT.
 /// Проверки те же, что и при поиске, — подпись и контрольная сумма: адрес
 /// пришёл из таблицы, то есть снаружи, и доверять ему без проверки нельзя.
 ///
+/// Читает её сегодня разбор `\_S5` на x86-64 — единственное место, где ядру
+/// нужен AML, и то как байты (см. `arch::x86_64::power`).
+///
 /// # Safety
 ///
 /// См. [`find_table`].
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub unsafe fn table_at(address: u64, signature: &[u8; 4]) -> Result<&'static [u8], AcpiError> {
     // SAFETY: контракт функции.
     let len = unsafe { table_length(address) }.ok_or(AcpiError::NotFound(*signature))?;
@@ -200,6 +196,14 @@ pub unsafe fn table_at(address: u64, signature: &[u8; 4]) -> Result<&'static [u8
     Ok(bytes)
 }
 
+/// Найти таблицу по сигнатуре и вернуть её целиком, с уже проверенной суммой.
+///
+/// `rsdp` — физический адрес RSDP из [`boot_info::BootInfo::acpi_rsdp`].
+///
+/// # Safety
+///
+/// Требования те же, что у [`phys_slice`]: прямое отображение активно, а память
+/// с таблицами ACPI ещё не переиспользована.
 pub unsafe fn find_table(rsdp: u64, signature: &[u8; 4]) -> Result<&'static [u8], AcpiError> {
     // SAFETY: контракт функции.
     let (root, entry_size) = unsafe { root_table(rsdp) }?;

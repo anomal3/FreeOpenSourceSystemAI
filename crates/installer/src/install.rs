@@ -268,6 +268,11 @@ pub fn run(
         time: settings.unix_time,
     };
     let mut fs = ext2::format(&mut dev, root.first_lba, root.sectors(), &ext2_options)?;
+    // Том помечается используемым на всё время установки. Прерванная установка
+    // — это ровно тот случай, ради которого признак существует: файлов на томе
+    // не хватает, счётчики не сброшены, и следующая загрузка обязана об этом
+    // знать, а не считать полуготовый раздел исправным.
+    fs.mark_dirty(&mut dev)?;
     logln!(
         "[install] root: ext2, {} blocks of {} bytes in {} group(s)",
         fs.geometry().blocks,
@@ -366,6 +371,9 @@ pub fn run(
     progress(6, Step::Flush);
     fs.flush(&mut dev)?;
     dev.flush()?;
+    // И только теперь — «закрыт чисто»: признак ставится последним, потому что
+    // он утверждает, что всё предыдущее состоялось.
+    fs.mark_clean(&mut dev)?;
     logln!("[install] finished");
     Ok(())
 }

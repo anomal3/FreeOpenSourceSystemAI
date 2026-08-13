@@ -34,6 +34,14 @@ pub struct RunOptions {
     pub pointer: Pointer,
     /// Чем подключены диски.
     pub disk_bus: DiskBus,
+    /// Разрешить машине перезагружаться.
+    ///
+    /// По умолчанию QEMU запускается с `-no-reboot`, и это защита: перезагрузка,
+    /// которую никто не заказывал, — это тройная ошибка, и без флага она
+    /// превратилась бы в бесконечный цикл загрузок вместо внятного отказа.
+    /// Сценарию, который проверяет саму перезагрузку, флаг мешает: с ним QEMU
+    /// завершается ровно там, где машина должна подняться заново.
+    pub allow_reboot: bool,
 }
 
 /// Каким контроллером подключены носители.
@@ -87,6 +95,7 @@ impl Default for RunOptions {
             qmp: None,
             pointer: Pointer::Mouse,
             disk_bus: DiskBus::Virtio,
+            allow_reboot: false,
         }
     }
 }
@@ -475,7 +484,9 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
         cmd.args(["-qmp", &format!("tcp:{addr}")]);
     }
     // Тройная ошибка не должна уводить VM в бесконечный цикл перезагрузок.
-    cmd.arg("-no-reboot");
+    if !opts.allow_reboot {
+        cmd.arg("-no-reboot");
+    }
     // Сеть на Phase 0 не нужна, а её отсутствие ещё и экономит время на попытках
     // PXE-загрузки в UEFI.
     cmd.args(["-net", "none"]);

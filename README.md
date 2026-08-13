@@ -1011,6 +1011,69 @@ because neither the firmware's driver nor the installer's staging buffer takes
 that much at once. Host tests could not catch it: an image in memory does not
 care how large the chunk is. The batch is counted in bytes now.
 
+### Switching the machine off
+
+For twenty-six phases this system could be started but not stopped. `exit` halted the
+processor, which looks like a shutdown from across the room and is nothing of the sort: the
+machine still draws power, the disk still holds whatever was in memory, and QEMU had to be
+killed by the bench every single time. Phase 27 makes the machine go down — and, more
+importantly, makes it **close the volume behind itself**.
+
+**x86-64 goes through ACPI, and the interesting part is what it avoids.** The canonical
+place for the shutdown command is the object `\_S5` in the DSDT, which is AML: byte code
+needing an interpreter about half the size of this kernel. ACPI 5.0 added
+`SLEEP_CONTROL_REG` to the FADT — one byte, no AML — and firmware that fills it in is
+everything built for hardware-reduced platforms. Where it is absent the old path remains:
+`PM1a_CNT` with the sleep type parsed out of the DSDT **as bytes** — find the name `_S5_`,
+expect a package, read two constants. A package built from anything but constants is refused
+rather than guessed at. QEMU's q35 turns out to take the second path and answer `S5 types
+0/0`, which is correct for ICH9 and would have been very hard to invent.
+
+**AArch64 has no chipset to write to.** Powering off is a request to firmware living at a
+higher exception level, made through PSCI. Which instruction carries it — `SMC` or `HVC` —
+depends on where that firmware sits, and guessing gives an undefined exception instead of a
+shutdown; the answer is in the FADT (`ARM_BOOT_ARCH`), so it is read rather than assumed.
+
+**The power button is a fixed event**, the one thing an ACPI chipset can report without a
+line of AML: `SCI_INT` from the FADT becomes an ordinary interrupt through the I/O APIC,
+`PWRBTN_EN` is set in `PM1a_EVT_BLK`, and pressing the button sets a bit. Two conditions
+have to hold first, and both are checked rather than hoped for. ACPI mode must be on —
+until `SCI_EN` is set the button goes to firmware as an SMI and never reaches us, so the
+kernel writes `ACPI_ENABLE` to `SMI_CMD` and *waits by the clock* for the bit to appear. And
+every other source of that interrupt must be silent: the line is level-triggered, so an
+event nobody can clear returns immediately and forever. GPEs are described in AML we do not
+read, so they are disabled outright instead of being left to the firmware's taste.
+
+The handler itself does two things and nothing else: it clears the chipset's flag and raises
+a request. The shutdown proper — flushing the filesystem, waiting for the disk to answer —
+belongs to a task, because both take locks and both wait for interrupts, which is exactly
+what an interrupt handler cannot do. The same request is what the desktop raises: the menu
+entry opens a confirmation *window* (an ordinary window, so it lives in the taskbar and
+closes with Ctrl+W like everything else), and answering `Y` runs under the desktop's own
+lock, where waiting for a disk would deadlock the machine it is trying to switch off.
+
+On ARM under QEMU the button arrives through an ACPI GED, which is described in AML — so on
+that machine there is shutdown by command and no button, and the kernel says so during boot
+rather than leaving it to be discovered.
+
+**The clean-unmount flag** is the part that outlives the power. ext2 has a field for it
+(`s_state`): mounting clears it, a proper close sets it back, and `e2fsck` reads it to
+decide whether to trust the volume's counters. Ours is written at mount time — *before* the
+first change, since a flag set afterwards leaves a window where power loss yields stale
+counters under a volume claiming to be clean — and set again only after the counters are
+flushed and the disk has acknowledged them. The next boot prints which one it found. The
+installer does the same across an installation, so an interrupted install leaves a volume
+that admits it.
+
+The bench can now assert all of it in one run of one machine, which was not possible before
+either: `power` writes a file and then **resets the machine from the monitor** — the digital
+equivalent of pulling the cord — and the next boot must say `volume was NOT unmounted
+cleanly` while the file is still readable; then `reboot` must produce `flushed and marked
+clean` and a boot that says so; then `shutdown` must make **the QEMU process end by itself**,
+something that had not happened once in twenty-six phases. `powerbtn` presses the power
+button through the monitor and expects the same ending, and `desktop` walks the start menu
+into the confirmation window, checks that `N` really means no, and then answers `Y`.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -1019,7 +1082,7 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Twenty-three scenarios today: a program runs in an address space of its own, one that faults is
+Twenty-six scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
@@ -1047,7 +1110,10 @@ same disk, attached over **SATA** instead of virtio, is found by the AHCI driver
 the disk the root was found on, read from and written to (`ahci`) — and the same again over
 **NVMe**, where the controller is driven by queues in memory rather than by ports (`nvme`);
 and the installer writes, then the system boots from, a disk whose sectors are 4096 bytes
-rather than 512 (`install4k`, `sector4k`).
+rather than 512 (`install4k`, `sector4k`); and the machine is reset without warning, then
+rebooted by command, then switched off — the volume calling itself dirty after the first and
+clean after the second, and the QEMU process ending on its own after the third (`power`),
+which it also does when the power button is pressed through the monitor (`powerbtn`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -1266,7 +1332,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 26a | A block-device layer and an AHCI driver: the root is found on a machine with no virtio | **done** |
 | 26b | NVMe, which is what the disk in a laptop bought this decade is attached by | **done** |
 | 26c | The sector stops being a constant: 4Kn disks, now that QEMU can present one to test against | **done** |
-| 27 | Power: shut down and reboot, from the menu and from the power button, and a volume closed cleanly behind us | planned |
+| 27 | Power: shut down and reboot, from the menu and from the power button, and a volume closed cleanly behind us | **done** |
 | 28a | `fsck`: the volume is repaired from inside the system, not from someone else's Linux | planned |
 | 28b | Safe mode and a boot menu: a recovery console in the initrd, so no failure needs a second computer | planned |
 | 29 | A keyboard for a program: descriptor 0, and a terminal that understands ANSI | planned |

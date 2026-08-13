@@ -184,6 +184,19 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
                 h,
             )
         }
+        // Подтверждение встаёт по центру и заметно меньше остальных: это вопрос
+        // на две строки ответа, и окно размером с терминал выглядело бы как
+        // ещё одна программа, а не как «система ждёт от вас слова».
+        App::Shutdown | App::Restart => {
+            let w = (width / 2).max(360).min(width);
+            let h = (work / 3).max(180);
+            Rect::new(
+                ((width.saturating_sub(w)) / 2) as i32,
+                ((work.saturating_sub(h)) / 2) as i32,
+                w,
+                h,
+            )
+        }
     }
 }
 
@@ -198,8 +211,41 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
             window.write_str(&about_text(desktop));
             Some(window)
         }
+        App::Shutdown | App::Restart => {
+            let mut window = Window::text(app, rect, scale)?;
+            window.write_str(&confirm_text(app));
+            Some(window)
+        }
         other => Window::text(other, rect, scale),
     }
+}
+
+/// Текст окна подтверждения.
+///
+/// Оно объясняет не только выбор, но и последствие: «том будет закрыт» — это
+/// то, ради чего порядок действий при выключении вообще существует, и человеку
+/// стоит знать, что систему нельзя гасить кнопкой на корпусе просто так.
+fn confirm_text(app: App) -> String {
+    let mut text = String::new();
+    // Строки короткие не случайно: окно подтверждения вдвое уже терминала, а
+    // перенос посреди фразы выглядит как испорченный вывод. Тридцать восемь
+    // знаков помещаются и на 800×600, и на 1280×800 — то есть при обоих
+    // масштабах глифа, которые выбирает стол.
+    let (what, then) = if app == App::Restart {
+        ("Restart the machine?", "It starts again from the same disk.")
+    } else {
+        ("Switch the machine off?", "Power it on by hand afterwards.")
+    };
+    let _ = write!(
+        text,
+        "{what}\n\n\
+         The root volume is closed first,\n\
+         so the next boot finds it clean.\n\
+         {then}\n\n\
+         Y   yes, do it\n\
+         N   no, forget it (Esc, Ctrl+W)\n",
+    );
+    text
 }
 
 /// Текст окна «о системе».
@@ -347,7 +393,7 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
     // Пропускать их дальше всё равно нужно — редактор строки различает нажатие
     // и отпускание сам, и молчаливая потеря половины событий однажды вылезет.
     if !event.pressed {
-        return route(desktop, event);
+        return route(desktop, event, status);
     }
 
     if desktop.menu_open() {
@@ -397,7 +443,7 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         _ => {}
     }
 
-    route(desktop, event)
+    route(desktop, event, status)
 }
 
 /// Разобрать отчёт мыши.
@@ -535,8 +581,51 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     }
 }
 
+/// Ответить на вопрос окна подтверждения.
+///
+/// Возвращает `true`, если клавиша была ответом: всё остальное окно
+/// подтверждения игнорирует — набирать в нём нечего.
+///
+/// Само выключение здесь **не** происходит. Эта функция работает под замком
+/// рабочего стола, взятым с запрещёнными прерываниями, а выключение сбрасывает
+/// том на диск и ждёт ответа контроллера — то есть ждёт прерывания, которого в
+/// этом состоянии не будет. Поэтому здесь поднимается просьба, а гасит систему
+/// задача (см. [`crate::power`]).
+fn confirm_key(desktop: &mut Compositor, app: App, restart: bool, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Y => {
+            if desktop.close(app) {
+                kprintln!("  desktop     : closed '{}'", app.title());
+            }
+            crate::power::request(restart, crate::power::Source::Desktop);
+            true
+        }
+        KeyCode::N | KeyCode::Escape => {
+            if desktop.close(app) {
+                kprintln!("  desktop     : closed '{}'", app.title());
+            }
+            kprintln!("  desktop     : '{}' cancelled", app.title());
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Отдать событие активному окну.
-fn route(desktop: &mut Compositor, event: KeyEvent) -> Option<KeyEvent> {
+fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
+    // Окно подтверждения разбирает клавиши само и раньше остальных: у него нет
+    // содержимого, которое стоило бы прокручивать, зато есть ровно два ответа.
+    if let Some(app) = desktop.focused_app() {
+        if let Some(restart) = app.confirms_power() {
+            if event.pressed && confirm_key(desktop, app, restart, event.code) {
+                log_focus(desktop);
+                desktop.refresh_panel(status);
+                desktop.present();
+            }
+            return None;
+        }
+    }
+
     match desktop.focused_app() {
         // Окна оболочки может не быть вовсе (его закрыли) — тогда ввод всё
         // равно уходит ей: иначе система осталась бы без единственного места,

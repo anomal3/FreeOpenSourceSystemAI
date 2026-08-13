@@ -280,6 +280,7 @@ fn execute(
         qmp: qmp_addr,
         pointer: if scenario.tablet { Pointer::Tablet } else { Pointer::Mouse },
         disk_bus: scenario.disk_bus,
+        allow_reboot: scenario.reboots,
         ..RunOptions::default()
     };
 
@@ -311,11 +312,13 @@ fn execute(
         None => None,
     };
 
-    let result = play(scenario, &mut line, &mut hmp, qmp.as_mut(), prefix, shots);
+    let result = play(scenario, &mut child, &mut line, &mut hmp, qmp.as_mut(), prefix, shots);
 
-    // Гость не выключает машину сам: `arch::halt()` — это остановка процессора,
-    // а не выключение. Процесс приходится снимать, и делать это надо в любом
-    // случае — иначе провалившийся сценарий оставил бы висеть QEMU.
+    // Обычно гость машину не выключает: `arch::halt()` — это остановка
+    // процессора, а не снятие питания, и процесс приходится снимать. С фазы 27
+    // есть и второй случай — сценарий, в котором гость гаснет сам; там к этому
+    // моменту снимать уже некого, и `kill` просто не находит процесса. Звать его
+    // надо всё равно: провалившийся сценарий иначе оставил бы висеть QEMU.
     child.kill().ok();
     let output = child.wait_with_output().ok();
     let text = line.finish();
@@ -329,6 +332,7 @@ fn execute(
 /// Проиграть шаги сценария.
 fn play(
     scenario: &Scenario,
+    child: &mut Child,
     line: &mut serial::SerialLine,
     hmp: &mut monitor::Monitor,
     mut qmp: Option<&mut qmp::Qmp>,
@@ -528,6 +532,45 @@ fn play(
             Step::Wait(ms) => {
                 println!("  [{at:>6} мс] шаг {index}: пауза {ms} мс");
                 std::thread::sleep(Duration::from_millis(*ms));
+            }
+            Step::Reset => {
+                println!("  [{at:>6} мс] шаг {index}: сброс машины без предупреждения гостя");
+                hmp.system_reset().with_context(|| format!("шаг {index}"))?;
+            }
+            Step::PowerButton => {
+                println!("  [{at:>6} мс] шаг {index}: кнопка питания");
+                hmp.system_powerdown().with_context(|| format!("шаг {index}"))?;
+            }
+            Step::Exits(timeout_ms) => {
+                println!("  [{at:>6} мс] шаг {index}: ждём, что QEMU завершится сам");
+                let deadline = Instant::now() + Duration::from_millis(*timeout_ms);
+                loop {
+                    match child.try_wait().with_context(|| format!("шаг {index}"))? {
+                        Some(status) => {
+                            println!("             QEMU завершился сам: {status}");
+                            // Ненулевой код — не «выключилось как-то не так», а
+                            // отказ эмулятора: гость, снявший питание, всегда
+                            // даёт ноль. Разница важна, потому что первое
+                            // означало бы работающее выключение.
+                            if !status.success() {
+                                bail!(
+                                    "шаг {index}: QEMU завершился с {status}, \
+                                     а выключение гостя даёт нулевой код"
+                                );
+                            }
+                            break;
+                        }
+                        None if Instant::now() >= deadline => bail!(
+                            "шаг {index}: QEMU всё ещё работает через {timeout_ms} мс — \
+                             машина не выключилась"
+                        ),
+                        None => std::thread::sleep(Duration::from_millis(100)),
+                    }
+                }
+                // Последним словам гостя надо дать доехать: питание снято, но
+                // байты ещё в сокете, а следующие шаги (`Absent`, `Expect`)
+                // читают именно то, что стенд успел принять.
+                std::thread::sleep(Duration::from_millis(300));
             }
             Step::Shot(name) => {
                 println!("  [{at:>6} мс] шаг {index}: снимок '{name}'");

@@ -407,6 +407,47 @@ fn reopened(dev: &mut MemDisk) -> Editor {
     Editor::open(dev, 0).expect("том открывается на правку")
 }
 
+/// Признак чистого размонтирования ведёт себя так, как обещано: том, который
+/// открыли и закрыли, чист; том, который открыли и бросили, — нет.
+///
+/// Проверка на том же уровне, на котором это работает у ядра: «бросили» здесь
+/// — это просто потерянный редактор, ровно то, что остаётся от системы после
+/// пропажи питания.
+#[test]
+fn a_volume_is_marked_used_while_open_and_clean_only_when_closed() {
+    let (mut dev, mut writer) = formatted(64 * 1024 * 1024 / 512, BlockSize::B1024);
+    writer.flush(&mut dev).expect("завершение");
+    assert_eq!(Ext2::is_clean(&mut dev, 0), Ok(true), "свежий том чист");
+
+    // Открытие помечает том используемым **сразу**, а не при первой записи.
+    let mut editor = reopened(&mut dev);
+    assert_eq!(
+        Ext2::is_clean(&mut dev, 0),
+        Ok(false),
+        "открытый на правку том не может считаться закрытым"
+    );
+    editor.flush(&mut dev).expect("сброс");
+    editor.mark_clean(&mut dev).expect("закрытие");
+    assert_eq!(Ext2::is_clean(&mut dev, 0), Ok(true), "закрыли — стал чист");
+
+    // А теперь то же самое, но том бросают на середине работы.
+    let mut editor = reopened(&mut dev);
+    editor
+        .create(&mut dev, ROOT_INODE, "half-written.txt", 0o644, 0, 0)
+        .expect("файл");
+    drop(editor);
+    assert_eq!(
+        Ext2::is_clean(&mut dev, 0),
+        Ok(false),
+        "брошенный том обязан остаться помеченным"
+    );
+
+    // И следующее монтирование это видит — то самое знание, ради которого
+    // признак и существует.
+    let fs = Ext2::mount(&mut dev, 0).expect("монтирование");
+    assert!(!fs.was_clean(), "монтирующий узнаёт о прошлом сеансе");
+}
+
 #[test]
 fn a_file_written_after_remount_is_visible_to_a_foreign_reader() {
     let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B4096);

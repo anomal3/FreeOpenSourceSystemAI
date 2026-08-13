@@ -36,6 +36,17 @@ pub(crate) const MAGIC: u16 = 0xEF53;
 pub(crate) const SUPERBLOCK_OFFSET: u64 = 1024;
 pub(crate) const SUPERBLOCK_SIZE: usize = 1024;
 
+/// Смещение поля `s_state` в суперблоке и два его значения.
+///
+/// Поле штатное и понимается всеми: `e2fsck` по нему решает, проверять том или
+/// поверить ему на слово. Смысл ровно один — «том закрывали или бросили»:
+/// монтирование сбрасывает признак, корректное завершение ставит обратно.
+pub(crate) const SUPERBLOCK_STATE: usize = 58;
+/// `EXT2_VALID_FS` — том закрыт чисто.
+pub(crate) const STATE_CLEAN: u16 = 1;
+/// Ноль — том смонтирован (или брошен смонтированным).
+pub(crate) const STATE_MOUNTED: u16 = 0;
+
 /// Размер записи в таблице дескрипторов групп.
 pub(crate) const GROUP_DESC_SIZE: usize = 32;
 

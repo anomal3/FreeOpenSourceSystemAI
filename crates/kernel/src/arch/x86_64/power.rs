@@ -29,14 +29,26 @@
 //! который на заре PC умел дёргать линию сброса процессора. Он существует на
 //! всём, что называется PC, и это единственная причина, по которой он здесь.
 
-use crate::acpi::{self, read_u32, read_u64};
+use core::sync::atomic::{AtomicU16, Ordering};
+
+use crate::acpi::{self, read_u16, read_u32, read_u64};
 use crate::kprintln;
 
-use super::{inb, outb, outw};
+use super::{inb, inw, outb, outw};
 
 /// Смещения в FADT, все из спецификации ACPI.
+const FADT_SCI_INT: usize = 46;
+const FADT_SMI_CMD: usize = 48;
+const FADT_ACPI_ENABLE: usize = 52;
+const FADT_PM1A_EVT_BLK: usize = 56;
+const FADT_PM1B_EVT_BLK: usize = 60;
 const FADT_PM1A_CNT_BLK: usize = 64;
 const FADT_PM1B_CNT_BLK: usize = 68;
+const FADT_GPE0_BLK: usize = 80;
+const FADT_GPE1_BLK: usize = 84;
+const FADT_PM1_EVT_LEN: usize = 88;
+const FADT_GPE0_BLK_LEN: usize = 92;
+const FADT_GPE1_BLK_LEN: usize = 93;
 const FADT_RESET_REG: usize = 116;
 const FADT_RESET_VALUE: usize = 128;
 const FADT_SLEEP_CONTROL_REG: usize = 244;
@@ -51,6 +63,14 @@ const GAS_ADDRESS: usize = 4;
 const GAS_SPACE_IO: u8 = 1;
 /// Пространство адресов «память».
 const GAS_SPACE_MEMORY: u8 = 0;
+
+/// `PM1_CNT.SCI_EN` — «машина в режиме ACPI»: события уходят операционной
+/// системе прерыванием, а не прошивке через SMI.
+const SCI_EN: u16 = 1 << 0;
+
+/// Кнопка питания в регистрах фиксированных событий: признак в `PM1_STS` и
+/// разрешение в `PM1_EN` стоят на одном и том же бите.
+const PWRBTN: u16 = 1 << 8;
 
 /// `PM1_CNT.SLP_EN` — «выполнить переход в сон», бит 13.
 const SLP_EN: u16 = 1 << 13;
@@ -246,6 +266,213 @@ unsafe fn sleep_type_from_dsdt(fadt: &[u8]) -> Option<(u8, u8)> {
         at += 1;
     }
     None
+}
+
+// --- кнопка питания -----------------------------------------------------------
+//
+// Кнопка на корпусе — «фиксированное событие» ACPI: единственное событие, о
+// котором чипсет умеет сообщать сам, без единой строчки AML. Механика простая:
+// в `PM1_EN` разрешается бит `PWRBTN`, чипсет при нажатии выставляет тот же бит
+// в `PM1_STS` и дёргает линию SCI, а её номер (`SCI_INT`) записан в FADT.
+//
+// Два условия, без которых ничего этого не произойдёт:
+//
+// * **Режим ACPI должен быть включён.** Пока `SCI_EN` сброшен, кнопка идёт в
+//   прошивку через SMI, и до нас не доходит вовсе. Включается он записью
+//   `ACPI_ENABLE` в порт `SMI_CMD` — и на некоторых машинах не мгновенно,
+//   поэтому его ждут, а не предполагают.
+// * **Чужие источники SCI должны молчать.** Линия заведена по уровню: событие,
+//   которое некому снять, вернётся прерыванием немедленно и навсегда. Всё, что
+//   мы снимать не умеем, — то есть GPE, описанные в AML, — поэтому запрещается
+//   явно, а не оставляется на усмотрение прошивки.
+
+/// Порты, из которых читается и в которые пишется признак события. Ноль
+/// означает «блока нет»: `PM1b` есть далеко не на всякой машине.
+///
+/// Атомики, а не замок: читает их обработчик прерывания, которому ждать нельзя.
+static PM1A_STS_PORT: AtomicU16 = AtomicU16::new(0);
+static PM1B_STS_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Подготовить кнопку питания и вернуть номер входа (GSI), в который она
+/// приходит.
+///
+/// Прерывание после возврата ещё **не** размаскировано — этим занимается тот,
+/// кто владеет I/O APIC. Порядок обязателен: разреши мы событие после
+/// размаскирования, первое же нажатие пришло бы в вектор, для которого ещё не
+/// записаны порты, и обработчик не смог бы снять признак.
+///
+/// # Safety
+///
+/// Вызывать один раз, до размаскирования входа, с действующим RSDP.
+pub unsafe fn prepare_button(rsdp: u64) -> Option<u32> {
+    // SAFETY: контракт функции.
+    let fadt = unsafe { acpi::find_table(rsdp, b"FACP") }.ok()?;
+    if fadt.len() <= FADT_PM1_EVT_LEN {
+        return None;
+    }
+
+    let evt_len = usize::from(fadt[FADT_PM1_EVT_LEN]);
+    let pm1a_evt = u16::try_from(read_u32(fadt, FADT_PM1A_EVT_BLK)).unwrap_or(0);
+    let pm1b_evt = u16::try_from(read_u32(fadt, FADT_PM1B_EVT_BLK)).unwrap_or(0);
+    // Блок событий делится пополам: первая половина — признаки, вторая —
+    // разрешения. Длина меньше четырёх байт означает блок, в котором такой пары
+    // просто нет, — то есть машину, которую мы не понимаем.
+    if pm1a_evt == 0 || evt_len < 4 {
+        kprintln!("  power       : FADT declares no PM1 event block, no power button");
+        return None;
+    }
+    let half = (evt_len / 2) as u16;
+
+    // SAFETY: порты прочитаны из FADT, режим ACPI включается предписанным
+    // спецификацией способом.
+    if !unsafe { enable_acpi_mode(fadt) } {
+        return None;
+    }
+
+    // SAFETY: см. выше.
+    unsafe {
+        silence_gpes(fadt);
+
+        // Признак сбрасывается **до** разрешения: кнопку могли нажать до нашей
+        // загрузки, и прошивка могла оставить признак выставленным. Разреши мы
+        // событие первым — машина выключилась бы сразу после загрузки, и
+        // причину этого пришлось бы искать долго.
+        for (evt, port) in [(pm1a_evt, &PM1A_STS_PORT), (pm1b_evt, &PM1B_STS_PORT)] {
+            if evt == 0 {
+                continue;
+            }
+            outw(evt, inw(evt));
+            port.store(evt, Ordering::Relaxed);
+            let enable = evt + half;
+            outw(enable, inw(enable) | PWRBTN);
+        }
+    }
+
+    Some(u32::from(read_u16(fadt, FADT_SCI_INT)))
+}
+
+/// Включить режим ACPI, если он ещё не включён.
+///
+/// Возвращает `false`, если включить не удалось: молча продолжать нельзя —
+/// разрешённое событие в этом случае никуда не придёт, а система будет считать,
+/// что кнопка работает.
+///
+/// # Safety
+///
+/// `fadt` — настоящая таблица; запись в `SMI_CMD` предписана спецификацией.
+unsafe fn enable_acpi_mode(fadt: &[u8]) -> bool {
+    let pm1a_cnt = u16::try_from(read_u32(fadt, FADT_PM1A_CNT_BLK)).unwrap_or(0);
+    if pm1a_cnt == 0 {
+        return false;
+    }
+    // SAFETY: порт из FADT.
+    if unsafe { inw(pm1a_cnt) } & SCI_EN != 0 {
+        return true;
+    }
+
+    let smi_cmd = read_u32(fadt, FADT_SMI_CMD);
+    let acpi_enable = fadt[FADT_ACPI_ENABLE];
+    // Ноль в обоих полях — законное «переключать нечего»: так объявляют себя
+    // машины, у которых режима SMI нет вовсе. Но `SCI_EN` при этом обязан быть
+    // уже взведён, а он не взведён — значит перед нами машина, чью схему
+    // событий мы не понимаем.
+    let Ok(port) = u16::try_from(smi_cmd) else {
+        return false;
+    };
+    if port == 0 || acpi_enable == 0 {
+        kprintln!("  power       : ACPI mode is off and the firmware offers no way to turn it on");
+        return false;
+    }
+
+    // SAFETY: порт и значение — из FADT, это и есть предписанный способ.
+    unsafe { outb(port, acpi_enable) };
+
+    // Переход занимает у чипсета время; спецификация не называет предела, но
+    // говорит ждать. Ждём по часам, а не по числу оборотов: цикл, откалиброванный
+    // на эмуляторе, на живой машине означал бы совсем другой срок.
+    let deadline = crate::time::uptime_ms() + 1000;
+    while crate::time::uptime_ms() < deadline {
+        // SAFETY: порт из FADT.
+        if unsafe { inw(pm1a_cnt) } & SCI_EN != 0 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    kprintln!("  power       : ACPI mode did not come up, the power button would not arrive");
+    false
+}
+
+/// Запретить и погасить все GPE.
+///
+/// Не «на всякий случай»: событие GPE описано в AML, снять его признак
+/// правильно мы не умеем, а линия SCI заведена по уровню. Одно разрешённое
+/// прошивкой событие превратило бы машину в бесконечный поток прерываний.
+///
+/// # Safety
+///
+/// `fadt` — настоящая таблица; порты берутся из неё.
+unsafe fn silence_gpes(fadt: &[u8]) {
+    if fadt.len() <= FADT_GPE1_BLK_LEN {
+        return;
+    }
+    for (block, len) in [
+        (FADT_GPE0_BLK, FADT_GPE0_BLK_LEN),
+        (FADT_GPE1_BLK, FADT_GPE1_BLK_LEN),
+    ] {
+        let Ok(base) = u16::try_from(read_u32(fadt, block)) else {
+            continue;
+        };
+        let bytes = u16::from(fadt[len]);
+        if base == 0 || bytes < 2 {
+            continue;
+        }
+        // Блок GPE устроен как блок PM1: половина признаков, половина
+        // разрешений. Сначала запрещаем, потом гасим — обратный порядок
+        // оставил бы окно, в котором событие успело бы прийти.
+        let half = bytes / 2;
+        for offset in 0..half {
+            // SAFETY: порты из FADT, запись единиц в регистр признаков — это
+            // предписанный способ их снять.
+            unsafe {
+                outb(base + half + offset, 0);
+                outb(base + offset, 0xFF);
+            }
+        }
+    }
+}
+
+/// Обработчик события ACPI.
+///
+/// Вызывается из обработчика прерывания, поэтому не делает ничего, кроме двух
+/// вещей: снимает признак у чипсета и поднимает просьбу выключиться. Сброс
+/// файловой системы и снятие питания — работа задачи (см. [`crate::power`]):
+/// здесь она означала бы захват замков в обработчике.
+pub fn on_event() {
+    let mut pressed = false;
+    for port in [&PM1A_STS_PORT, &PM1B_STS_PORT] {
+        let port = port.load(Ordering::Relaxed);
+        if port == 0 {
+            continue;
+        }
+        // SAFETY: порт записан `prepare_button` из FADT и с тех пор не менялся.
+        let status = unsafe { inw(port) };
+        if status == 0 {
+            continue;
+        }
+        if status & PWRBTN != 0 {
+            pressed = true;
+        }
+        // Снимаются **все** увиденные признаки, а не только наш. Оставленный
+        // чужой признак на линии по уровню — это прерывание, которое повторится
+        // сразу же и уже не прекратится.
+        // SAFETY: см. выше; запись единицы в бит признака — предписанный способ
+        // его снять.
+        unsafe { outw(port, status) };
+    }
+
+    if pressed {
+        crate::power::request(false, crate::power::Source::PowerButton);
+    }
 }
 
 /// Прочитать одну константу AML: `Zero`, `One` или байт с префиксом.

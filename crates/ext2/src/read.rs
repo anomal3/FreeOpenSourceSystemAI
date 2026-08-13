@@ -65,6 +65,10 @@ pub struct Ext2 {
     /// а без неё нельзя добраться ни до одного inode, то есть её пришлось бы
     /// перечитывать при каждом обращении к любому файлу.
     inode_tables: Vec<u32>,
+    /// Каким том был **до** этого монтирования. Спрашивать об этом диск позже
+    /// бессмысленно: редактор, открывая том, тут же помечает его используемым,
+    /// и ответ станет одним и тем же при любой предыстории.
+    was_clean: bool,
 }
 
 
@@ -106,7 +110,7 @@ impl Ext2 {
         // Состояние тома читается, но монтирование не запрещается: «грязный»
         // том после сбоя всё ещё читается, а отказ смонтировать корень
         // означал бы систему, которая не загружается из-за отключения питания.
-        let state = u16_at(&sb, 58);
+        let was_clean = u16_at(&sb, SUPERBLOCK_STATE) == STATE_CLEAN;
 
         let block_bytes = geometry.block_size.bytes() as usize;
         let mut inode_tables = try_vec(geometry.groups as usize, 0u32)?;
@@ -127,14 +131,13 @@ impl Ext2 {
             }
         }
 
-        let fs = Self { geometry, inode_tables };
+        let fs = Self { geometry, inode_tables, was_clean };
         // Проверяем, а не верим: корневой inode обязан быть каталогом, и это
         // самая дешёвая проверка того, что мы разобрали геометрию верно.
         let root = fs.inode(dev, ROOT_INODE)?;
         if root.kind != FileType::Directory {
             return Err(Error::Corrupt);
         }
-        let _ = state;
         Ok(fs)
     }
 
@@ -143,13 +146,24 @@ impl Ext2 {
         self.geometry
     }
 
+    /// Закрыли ли том в прошлый раз чисто.
+    ///
+    /// Ответ снят в момент монтирования и с тех пор не менялся — см. поле
+    /// [`Ext2::was_clean`]. Ложь означает не поломку, а незнание: счётчики
+    /// свободного могли не успеть уехать на диск, и верить им нельзя, пока их
+    /// не пересчитает `fsck`.
+    #[must_use]
+    pub const fn was_clean(&self) -> bool {
+        self.was_clean
+    }
+
     /// «Чистый» ли том по данным суперблока.
     pub fn is_clean(dev: &mut dyn BlockDevice, first_lba: u64) -> Result<bool> {
         let sb = read_superblock(dev, first_lba)?;
         if u16_at(&sb, 56) != MAGIC {
             return Err(Error::Corrupt);
         }
-        Ok(u16_at(&sb, 58) == 1)
+        Ok(u16_at(&sb, SUPERBLOCK_STATE) == STATE_CLEAN)
     }
 
     /// Когда том записывали в последний раз, по данным суперблока.
