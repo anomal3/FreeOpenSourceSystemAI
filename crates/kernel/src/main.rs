@@ -53,6 +53,7 @@ mod print;
 mod sched;
 mod serial;
 mod shell;
+mod slot;
 mod sync;
 mod time;
 mod tty;
@@ -368,6 +369,15 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     let have_input = start_input(&info);
     start_graphics(&info);
 
+    // Подтверждение загрузки — здесь, и это самое позднее место, до которого
+    // ядро вообще доходит перед тем, как отдать управление планировщику. Раньше
+    // было бы нельзя: слот с целым ядром и разрушенным корнем стартует
+    // прекрасно, и подтверждение сразу после старта означало бы «ядро
+    // запустилось», а не «система работает». К этому моменту корень
+    // смонтирован, учётная запись прочитана и экран отдан композитору.
+    slot::confirm(info.came_back());
+    start_services();
+
     // Планировщик забирает управление насовсем: сюда исполнение уже не вернётся.
     run_session(have_input)
 }
@@ -619,17 +629,31 @@ fn mount_disk_root(info: &BootInfo) {
         );
     }
 
-    // Раздел опознаётся по типу GUID и ищется на **всех** носителях сразу.
+    // Разделы опознаются по типу GUID и ищутся на **всех** носителях сразу.
     // Порядок дисков при этом ничего не значит, и это важнее, чем кажется: на
     // чужой машине наш диск не обязан быть первым, а машина с двумя системами —
     // обычное дело.
-    let Some(partition) = block::find_partition(disks, gpt::FREEOS_ROOT_TYPE) else {
+    let found = block::scan(disks);
+
+    // Какой слот грузился, сказал загрузчик. Спрашивать об этом диск было бы
+    // нельзя: на диске оба слота выглядят одинаково пригодными, а знает, какой
+    // из них выбран, только тот, кто выбирал.
+    let slot = slots::slot_from_code(info.boot_slot);
+    let root_type = match slot {
+        Some(slots::Slot::B) => gpt::FREEOS_ROOT_B_TYPE,
+        // Система без слотов ищет тот же тип, что и слот A: диск, размеченный
+        // прежним установщиком, обязан продолжать грузиться.
+        Some(slots::Slot::A) | None => gpt::FREEOS_ROOT_TYPE,
+    };
+
+    let Some(partition) = block::take(&found, root_type) else {
         kprintln!("  root        : no FreeOS root partition: keeping the initrd as root");
         return;
     };
     let first_lba = partition.first_lba;
     kprintln!(
-        "  root        : found on {} #{} at LBA {first_lba}",
+        "  root        : slot {} on {} #{} at LBA {first_lba}",
+        slot.map_or("none", slots::Slot::name),
         partition.source,
         partition.unit,
     );
@@ -638,12 +662,18 @@ fn mount_disk_root(info: &BootInfo) {
     // из-под себя: редактор держит счётчики свободного в памяти, и починка под
     // ним оставила бы его с числами, которых на диске уже нет.
     let mut device = partition.device;
-    check_root(&mut *device, first_lba, info.check_disk());
+    check_volume("root", &mut device, first_lba, info.check_disk());
 
-    // Безопасный режим монтирует корень только на чтение — и это, вместе с
-    // отсутствующим рабочим столом, и есть весь безопасный режим: система, у
-    // которой меньше всего возможностей что-нибудь испортить.
-    let mount = match fs::Ext2Fs::mount(device, first_lba, !info.safe_mode()) {
+    // Корень системы со слотами монтируется **только на чтение**, и это не
+    // осторожность, а условие, при котором обновление слотами вообще имеет
+    // смысл: система, которая пишет в свой корень, отличается от образа,
+    // который в него положили, — и откат к предыдущему слоту перестаёт быть
+    // возвратом к известному состоянию. Всё, что пишется, живёт на разделе
+    // состояния (ниже).
+    //
+    // Безопасный режим делает то же самое по другой причине — см. фазу 28b.
+    let writable = slot.is_none() && !info.safe_mode();
+    let mount = match fs::Ext2Fs::mount(alloc::boxed::Box::new(device), first_lba, writable) {
         Ok(mount) => mount,
         Err(err) => {
             kprintln!("  root        : cannot mount ext2 at LBA {first_lba}: {err}");
@@ -651,10 +681,6 @@ fn mount_disk_root(info: &BootInfo) {
         }
     };
 
-    // Корень с диска заменяет образ RAM-диска: точка монтирования пока одна, и
-    // притворяться, что их две, значило бы заводить таблицу монтирования, у
-    // которой нет второго потребителя. initrd при этом не пропал зря — он
-    // остаётся тем, чем был, средством поднять систему до появления диска.
     let (blocks, block_size, groups, requests) = mount.stats();
     kprintln!(
         "  root        : ext2 at LBA {first_lba}, {blocks} blocks of {block_size} B in {groups} group(s)"
@@ -668,13 +694,120 @@ fn mount_disk_root(info: &BootInfo) {
     } else {
         kprintln!("  root        : volume was NOT unmounted cleanly, counters may be stale");
     }
-    if info.safe_mode() {
+    if !writable {
         kprintln!("  root        : mounted read-only, nothing will be written to it");
     }
     kprintln!("  root        : replacing the initrd as /, {requests} disk request(s) so far");
     fs::set_root(alloc::boxed::Box::new(mount));
 
+    mount_state(&found, info);
+    // Разметка запоминается целиком: подтверждение загрузки и `sysupdate`
+    // спросят о ней позже и из другого места.
+    slot::remember(&found, slot);
     verify_root();
+}
+
+/// Путь к описанию служб.
+const SERVICES: &str = "/etc/services";
+
+/// Запустить супервизор служб, если в системе есть что запускать.
+///
+/// # Почему это делает ядро, а не оболочка
+///
+/// Потому что службы обязаны работать и там, где оболочки нет вовсе: на машине
+/// без единого устройства ввода приглашение не запускается (см.
+/// [`run_session`]), а сеть, SSH и всё, что придёт следом, работать обязаны —
+/// иначе к такой машине нельзя даже подключиться, чтобы это исправить.
+///
+/// Супервизор объявляется **служебной** задачей, и его дети наследуют это
+/// свойство. Без этого первая же служба сломала бы две вещи сразу: оболочка
+/// ждёт, пока договорят остальные задачи, прежде чем напечатать приглашение, а
+/// `exit` останавливает машину, когда живых задач не осталось.
+fn start_services() {
+    kprintln!();
+    kprintln!("---- services ---------------------------------------------------");
+
+    // Файла нет — значит служб не заказывали. Это обычное состояние живого
+    // носителя, а не поломка.
+    if fs::read(SERVICES, 1).is_none_or(|result| result.is_err()) {
+        kprintln!("  services    : no {SERVICES}, nothing to supervise");
+        return;
+    }
+
+    // Супервизор исполняется от root — иначе он не смог бы запустить службу от
+    // чужого имени. От чьего имени работает сама служба, решает её описание.
+    match user::spawn_with(
+        "/bin/init",
+        crate::vfs::perm::Credentials::ROOT,
+        true,
+    ) {
+        Ok(id) => kprintln!("  services    : /bin/init started as {id}, reading {SERVICES}"),
+        Err(err) => kprintln!("  services    : /bin/init did not start: {err}"),
+    }
+}
+
+/// Ветки, которые обслуживает раздел состояния.
+///
+/// Именно эти пять, и ни одной больше. `/etc` — настройки, `/home` — данные
+/// человека, `/root` — то же самое для суперпользователя, `/var` — то, что
+/// система пишет о себе, `/opt` — пакеты, поставленные поверх системы. Всё
+/// остальное принадлежит образу и заменяется вместе с ним.
+///
+/// Список общий с установщиком: он создаёт эти каталоги и на разделе состояния,
+/// и пустыми на корне — точками монтирования. Расхождение между двумя списками
+/// выглядело бы как пропавший каталог, поэтому оба короткие и оба на виду.
+const STATE_BRANCHES: [&str; 5] = ["/etc", "/home", "/root", "/var", "/opt"];
+
+/// Найти и смонтировать раздел состояния.
+///
+/// Его отсутствие — не отказ: система, установленная прежним установщиком, живёт
+/// одним корнем, и объявлять её сломанной незачем. Сказать об этом надо, потому
+/// что дальше `/home` окажется на корне, а не там, где его ищут.
+fn mount_state(found: &[block::Partition], info: &BootInfo) {
+    use disk::gpt;
+
+    let Some(partition) = block::take(found, gpt::FREEOS_STATE_TYPE) else {
+        kprintln!("  state       : no state partition; /etc and /home stay on the root volume");
+        return;
+    };
+    let first_lba = partition.first_lba;
+    let mut device = partition.device;
+    check_volume("state", &mut device, first_lba, info.check_disk());
+
+    // Раздел состояния — единственный, куда система пишет. В безопасном режиме
+    // он тоже открывается только на чтение: смысл режима в том, чтобы у системы
+    // было как можно меньше возможностей что-нибудь испортить.
+    let writable = !info.safe_mode();
+    let mount = match fs::Ext2Fs::mount(alloc::boxed::Box::new(device), first_lba, writable) {
+        Ok(mount) => mount,
+        Err(err) => {
+            kprintln!("  state       : cannot mount ext2 at LBA {first_lba}: {err}");
+            kprintln!("  state       : /etc and /home stay on the root volume");
+            return;
+        }
+    };
+    let (blocks, block_size, _, _) = mount.stats();
+    kprintln!(
+        "  state       : ext2 at LBA {first_lba}, {blocks} blocks of {block_size} B"
+    );
+    if mount.was_clean() {
+        kprintln!("  state       : volume was unmounted cleanly");
+    } else {
+        kprintln!("  state       : volume was NOT unmounted cleanly, counters may be stale");
+    }
+
+    // Одна файловая система на пять веток, и **одна ссылка** на неё: клонируется
+    // `Arc`, а не том. Пять отдельных объектов поверх одного диска означали бы
+    // пять редакторов со своими счётчиками свободного — и пять «разных» томов
+    // для всякого, кто их пересчитывает: `fsck` проверял бы один том пятикратно.
+    let shared: alloc::sync::Arc<dyn crate::vfs::FileSystem> = alloc::sync::Arc::new(mount);
+    for branch in STATE_BRANCHES {
+        fs::mount_at(branch, alloc::sync::Arc::clone(&shared));
+        kprintln!("  state       : {branch} comes from the state partition");
+    }
+    if !writable {
+        kprintln!("  state       : mounted read-only, nothing will be written to it");
+    }
 }
 
 /// Сказать вслух, каким режимом грузимся.
@@ -701,7 +834,12 @@ fn announce_boot_mode(info: &BootInfo) {
 /// обход стоит чтения всех таблиц inode и всех каталогов, то есть секунд на
 /// каждой загрузке. Признак чистого размонтирования (фаза 27) существует ровно
 /// затем, чтобы знать, когда это оправдано.
-fn check_root(device: &mut dyn disk::BlockDevice, first_lba: u64, forced: bool) {
+fn check_volume(
+    what: &str,
+    device: &mut dyn disk::BlockDevice,
+    first_lba: u64,
+    forced: bool,
+) {
     let clean = match ext2::Ext2::is_clean(device, first_lba) {
         // Чистый том проверяется только по просьбе из меню загрузчика: цена
         // полного обхода — секунды, и платить их на каждой загрузке незачем.
@@ -710,7 +848,7 @@ fn check_root(device: &mut dyn disk::BlockDevice, first_lba: u64, forced: bool) 
         Err(err) => {
             // Суперблок не читается вовсе. Проверка тут бессильна, а
             // монтирование ниже скажет о том же своими словами.
-            kprintln!("  fsck        : cannot read the superblock: {err}");
+            kprintln!("  fsck        : {what}: cannot read the superblock: {err}");
             return;
         }
     };
@@ -719,16 +857,16 @@ fn check_root(device: &mut dyn disk::BlockDevice, first_lba: u64, forced: bool) 
     // идёт» — первый вопрос человека, увидевшего задержку на загрузке, и
     // ответы на него разные.
     if forced && clean {
-        kprintln!("  fsck        : checking the root volume (asked for in the boot menu)");
+        kprintln!("  fsck        : checking the {what} volume (asked for in the boot menu)");
     } else if forced {
-        kprintln!("  fsck        : checking the root volume (asked for, and it is dirty too)");
+        kprintln!("  fsck        : checking the {what} volume (asked for, and it is dirty too)");
     } else {
-        kprintln!("  fsck        : checking the root volume (it was not closed cleanly)");
+        kprintln!("  fsck        : checking the {what} volume (it was not closed cleanly)");
     }
     let report = match ext2::check(device, first_lba, ext2::Fix::Safe) {
         Ok(report) => report,
         Err(err) => {
-            kprintln!("  fsck        : the check itself failed: {err}");
+            kprintln!("  fsck        : {what}: the check itself failed: {err}");
             return;
         }
     };
@@ -737,7 +875,7 @@ fn check_root(device: &mut dyn disk::BlockDevice, first_lba: u64, forced: bool) 
     // экрана, а первые несколько всё равно объясняют, что произошло.
     const SHOWN: usize = 8;
     for problem in report.problems.iter().take(SHOWN) {
-        kprintln!("  fsck        : {problem}");
+        kprintln!("  fsck        : {what}: {problem}");
     }
     let hidden = report.problems.len().saturating_sub(SHOWN) + report.dropped;
     if hidden > 0 {
@@ -745,7 +883,7 @@ fn check_root(device: &mut dyn disk::BlockDevice, first_lba: u64, forced: bool) 
     }
 
     if report.is_clean() {
-        kprintln!("  fsck        : nothing to repair, the volume is consistent");
+        kprintln!("  fsck        : {what}: nothing to repair, the volume is consistent");
     } else {
         kprintln!(
             "  fsck        : {} problem(s) found, {} repaired, {} file(s) moved to /lost+found",

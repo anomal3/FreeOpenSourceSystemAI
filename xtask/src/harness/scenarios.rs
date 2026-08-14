@@ -211,6 +211,17 @@ pub struct Scenario {
     /// Ровно один сценарий проверяет саму перезагрузку — ему флаг мешает, потому
     /// что с ним QEMU завершается там, где машина должна подняться заново.
     pub reboots: bool,
+    /// Положить в образ установленной системы контейнеры обновления.
+    ///
+    /// Стенд делает это **до** запуска и на хосте: открывает корневой раздел
+    /// того же образа, на который ставил установщик, и кладёт в `/media` два
+    /// файла — годное обновление и заведомо неисправное. Ровно то же сделал бы
+    /// человек, принёсший обновление на флешке.
+    ///
+    /// Через установочный носитель это стоило бы двух лишних переносов
+    /// шестидесяти мегабайт на каждой установке — ради файла, который нужен
+    /// двум сценариям из тридцати.
+    pub updates: bool,
 }
 
 impl Scenario {
@@ -246,6 +257,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await(crate::version::KERNEL_BANNER, BOOT),
@@ -277,6 +289,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -328,6 +341,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -427,6 +441,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -493,6 +508,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -552,6 +568,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -609,6 +626,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[Arch::X86_64],
         reboots: false,
+        updates: false,
         // Свойство накапливается к уже заданной машине `q35`, как и `i8042=off`
         // у `usb_only`. Так воспроизводится VirtualBox: там PIT существует, но
         // измерить по нему частоту локального APIC не удаётся, и система
@@ -642,6 +660,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -776,6 +795,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -841,6 +861,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         // `-cpu max` — не украшение. С процессором по умолчанию QEMU не
         // объявляет `XSAVE`, и ядро уходит на путь `FXSAVE`: проверялась бы
         // ровно та половина, которой на современной машине не бывает. Здесь
@@ -882,6 +903,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -925,6 +947,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -975,6 +998,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1022,6 +1046,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             // Время системы считает счётчик, который идёт сам, а не тики
@@ -1074,6 +1099,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             // Это утверждение фазы целиком: прошивка нашла на носителе
@@ -1108,6 +1134,7 @@ pub const ALL: &[Scenario] = &[
         // Только AArch64: на x86-64 GIC не существует.
         arches: &[Arch::Aarch64],
         reboots: false,
+        updates: false,
         // Свойство накапливается к уже заданной машине `virt`. Версия по
         // умолчанию — та, что выбрал QEMU; здесь она задана явно, потому что
         // проверяется именно другая ветка кода.
@@ -1142,6 +1169,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1163,6 +1191,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             // На VVFAT таблицы разделов не существует вовсе — QEMU синтезирует
@@ -1185,6 +1214,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("FreeOS installer", BOOT),
@@ -1225,7 +1255,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("down"),
             Step::Key("ret"),
             Step::Await("[install] finished", 240_000),
-            Step::Expect("[install] root: /etc/passwd"),
+            Step::Expect("[install] state: /etc/passwd"),
             Step::Wait(1_000),
             Step::Shot("09-done"),
         ],
@@ -1239,6 +1269,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
@@ -1309,6 +1340,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1388,6 +1420,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1487,6 +1520,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             // Это отдельная загрузка того же диска. Всё, что проверяется ниже,
@@ -1522,6 +1556,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         // Единственный сценарий, в котором перезагрузка — цель, а не симптом.
         reboots: true,
+        updates: false,
         extra: &[],
         steps: &[
             // Первая загрузка. Каким том был до неё, не утверждаем: предыдущий
@@ -1541,7 +1576,7 @@ pub const ALL: &[Scenario] = &[
             Step::Reset,
             // Вторая загрузка обязана сказать, что том закрыт не был. Строка
             // печатается при монтировании и до всякой оболочки.
-            Step::Await("root        : volume was NOT unmounted cleanly", BOOT),
+            Step::Await("state       : volume was NOT unmounted cleanly", BOOT),
             Step::Await("freeos> ", 30_000),
             // Данные при этом целы: том грязный — это про счётчики, а не про
             // содержимое файлов.
@@ -1551,11 +1586,11 @@ pub const ALL: &[Scenario] = &[
             // --- случай второй: машину перезагрузили командой -------------
             Step::Line("reboot"),
             Step::Await("restarting", 15_000),
-            Step::Await("root        : flushed and marked clean", 30_000),
+            Step::Await("volume      : / flushed and marked clean", 30_000),
             Step::Await("power       : ", 15_000),
             // Третья загрузка — и вот теперь том обязан быть чистым. Это и есть
             // всё утверждение фазы 27, целиком и в одной строке.
-            Step::Await("root        : volume was unmounted cleanly", BOOT),
+            Step::Await("state       : volume was unmounted cleanly", BOOT),
             Step::Await("freeos> ", 30_000),
 
             // --- случай третий: машину выключили --------------------------
@@ -1565,7 +1600,7 @@ pub const ALL: &[Scenario] = &[
             // питание.
             Step::Line("shutdown"),
             Step::Await("shutting down", 15_000),
-            Step::Await("root        : flushed and marked clean", 30_000),
+            Step::Await("volume      : / flushed and marked clean", 30_000),
             Step::Exits(30_000),
             Step::Absent("KERNEL PANIC"),
             Step::Absent("the machine refused to go down"),
@@ -1582,6 +1617,7 @@ pub const ALL: &[Scenario] = &[
         // Сброс посреди работы — это и есть та поломка, ради которой фаза
         // существует; после него машина обязана подняться сама.
         reboots: true,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
@@ -1590,7 +1626,7 @@ pub const ALL: &[Scenario] = &[
             // обязана молчать. Если бы она находила «поломки» на работающей
             // машине, всё остальное в этом сценарии ничего не значило бы.
             Step::Line("fsck"),
-            Step::Await("  the volume is consistent", 60_000),
+            Step::Await(": the volume is consistent", 60_000),
             // Теперь ломаем: пишем файл и выдёргиваем шнур.
             Step::Line("echo written-before-the-crash > /home/roman/crash.txt"),
             Step::Await("wrote 25 bytes", 15_000),
@@ -1598,18 +1634,23 @@ pub const ALL: &[Scenario] = &[
             // Следующая загрузка обязана заметить и проверить — сама, без
             // единой команды. Порядок строк тоже проверяется: сначала «том
             // закрыт не был», потом проверка, и только потом монтирование.
-            Step::Await("fsck        : checking the root volume (it was not closed cleanly)", BOOT),
-            Step::Await("fsck        : ", 60_000),
-            Step::Await("root        : ext2 at LBA", 60_000),
+            // Порядок шагов повторяет порядок **строк**: корень монтируется
+            // раньше, чем проверяется том состояния, потому что состояние
+            // монтируется вторым. Ожидание ищет только вперёд, и шаг,
+            // поставленный по порядку событий в голове, а не в журнале, ждал бы
+            // строку, которая уже проехала.
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("fsck        : checking the state volume (it was not closed cleanly)", 60_000),
+            Step::Await("fsck        : state: ", 60_000),
             Step::Await("freeos> ", 30_000),
             // Данные на месте: проверка чинит счётчики, а не выбрасывает файлы.
             Step::Line("cat /home/roman/crash.txt"),
             Step::Await("written-before-the-crash", 15_000),
             // И том после починки согласован — это говорит уже живая проверка.
             Step::Line("fsck"),
-            Step::Await("  the volume is consistent", 60_000),
+            Step::Await(": the volume is consistent", 60_000),
             Step::Line("shutdown"),
-            Step::Await("root        : flushed and marked clean", 30_000),
+            Step::Await("volume      : / flushed and marked clean", 30_000),
             Step::Exits(30_000),
             Step::Absent("KERNEL PANIC"),
             // Проверка обязана быть беззвучной там, где она не нужна: на
@@ -1626,6 +1667,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Virtio,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             // Клавиши жмутся **заранее**: прошивка копит нажатия в буфере, а
@@ -1667,7 +1709,7 @@ pub const ALL: &[Scenario] = &[
             // Проверка тома работает и здесь: это и есть консоль
             // восстановления — оболочка и `fsck` на месте, том не тронут.
             Step::Line("fsck"),
-            Step::Await("  the volume is consistent", 60_000),
+            Step::Await(": the volume is consistent", 60_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
@@ -1685,6 +1727,7 @@ pub const ALL: &[Scenario] = &[
         // говорит об этом вслух при загрузке. Проверяем то, что работает.
         arches: &[Arch::X86_64],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             // Кнопка заведена при загрузке — и сказано, каким вектором и с
@@ -1696,7 +1739,7 @@ pub const ALL: &[Scenario] = &[
             // Нажатие видит обработчик прерывания, а печатает задача: строка
             // приходит уже из неё.
             Step::Await("power       : power button pressed", 30_000),
-            Step::Await("root        : flushed and marked clean", 30_000),
+            Step::Await("volume      : / flushed and marked clean", 30_000),
             Step::Exits(30_000),
             Step::Absent("KERNEL PANIC"),
         ],
@@ -1710,6 +1753,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Ahci,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             // Сначала — что найден именно контроллер AHCI, а не что-то, что
@@ -1724,7 +1768,7 @@ pub const ALL: &[Scenario] = &[
             // И главное: корень найден **на нём**. Раздел ищется по типу GUID
             // среди всех носителей, поэтому строка называет, на каком именно он
             // нашёлся, — иначе проверка не отличила бы AHCI от virtio.
-            Step::Await("root        : found on ahci #0", 30_000),
+            Step::Await("on ahci #0 at LBA", 30_000),
             Step::Await("root        : ext2 at LBA", 30_000),
             // Дальше — обычная жизнь системы, но каждое обращение к диску идёт
             // через новый драйвер: чтение файла установщика...
@@ -1755,6 +1799,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Nvme,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             // Версия и шаг звонков читаются из регистров контроллера: получить
@@ -1766,7 +1811,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("disk        : nvme #0", 30_000),
             // Корень найден именно на нём. Диска два — VVFAT, с которого
             // грузилась прошивка, и этот; строка называет, где нашёлся раздел.
-            Step::Await("root        : found on nvme #0", 30_000),
+            Step::Await("on nvme #0 at LBA", 30_000),
             Step::Await("root        : ext2 at LBA", 30_000),
             Step::Await("account     : /etc/passwd", 30_000),
             Step::Await("freeos> ", 30_000),
@@ -1786,6 +1831,271 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "pkg",
+        about: "Пакет ставится с носителя, запускается из /opt, проверяется и сносится без следа.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Уборка перед началом — по той же причине, что в сценарии `write`:
+            // диск переживает прогон, и второй запуск иначе падал бы на «уже
+            // установлен». Отказы уборки не проверяются: на свежей системе
+            // сносить нечего.
+            Step::Line("run /bin/pkg remove extra"),
+            Step::Await("freeos> ", 30_000),
+            Step::Line("run /bin/pkg remove hello"),
+            Step::Await("freeos> ", 30_000),
+
+            // Зависимость проверяется **до** первой записи: пакет, которому
+            // нужен `hello`, обязан не встать, пока того нет.
+            Step::Line("run /bin/pkg install /media/extra-1.0.fpk"),
+            Step::Await("requires hello, which is not installed", 30_000),
+
+            // Теперь сам пакет. Число файлов в строке точное: «что-то
+            // поставилось» выглядело бы так же, как «поставилось не то».
+            Step::Line("run /bin/pkg install /media/hello-1.0.fpk"),
+            Step::Await("pkg: installed hello 1.0, 2 file(s)", 60_000),
+
+            // Главное утверждение фазы: программа, которой в системе не было,
+            // приехала пакетом и работает. `/bin/greet` не существует — она
+            // попадает в систему единственным способом.
+            Step::Line("run /opt/hello/bin/greet"),
+            Step::Await("greet: installed from a package", 30_000),
+            // И файл рядом с ней распаковался целиком, а не «появился».
+            Step::Line("cat /opt/hello/share/readme.txt"),
+            Step::Await("unpacked by pkg install", 15_000),
+
+            // Проверка на нетронутом пакете обязана молчать.
+            Step::Line("run /bin/pkg verify hello"),
+            Step::Await("2 file(s) intact, 0 changed", 30_000),
+
+            // Зависимый пакет теперь ставится.
+            Step::Line("run /bin/pkg install /media/extra-1.0.fpk"),
+            Step::Await("pkg: installed extra 1.0", 60_000),
+            Step::Line("run /bin/pkg list"),
+            Step::Await("pkg: 2 package(s) installed", 30_000),
+
+            // Порча файла обязана быть замечена. Меняется именно программа:
+            // подменённый исполняемый файл — то, ради чего проверка и нужна.
+            Step::Line("echo x > /opt/hello/bin/greet"),
+            Step::Await("wrote 2 bytes", 15_000),
+            Step::Line("run /bin/pkg verify hello"),
+            Step::Await("greet: size differs", 30_000),
+            Step::Await("1 file(s) intact, 1 changed", 15_000),
+
+            // Удаление убирает ровно то, что положило.
+            Step::Line("run /bin/pkg remove hello"),
+            Step::Await("pkg: removed hello, 2 file(s)", 30_000),
+            Step::Line("cat /opt/hello/share/readme.txt"),
+            Step::Await("no such file or directory", 15_000),
+            // Чужого не тронуто: одноимённая программа из `/bin` на месте.
+            Step::Line("run /bin/hello"),
+            Step::Await("hello from userspace", 30_000),
+            // И соседний пакет тоже цел.
+            Step::Line("run /bin/pkg verify extra"),
+            Step::Await("1 file(s) intact, 0 changed", 30_000),
+
+            // Вторая половина проверки, и она важнее первой: подмена **той же
+            // длины**. Размер такую не ловит вовсе, и проверка, состоящая из
+            // одного размера, пропустила бы подменённую программу.
+            Step::Line("echo tampered-11 > /opt/extra/share/extra.txt"),
+            Step::Await("wrote 12 bytes", 15_000),
+            Step::Line("run /bin/pkg verify extra"),
+            Step::Await("contents changed", 30_000),
+            Step::Await("0 file(s) intact, 1 changed", 15_000),
+
+            Step::Line("run /bin/pkg remove extra"),
+            Step::Await("pkg: removed extra", 30_000),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "services",
+        about: "Убитая служба поднимается сама; падающая по кругу — останавливается, а система жива.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        extra: &[],
+        steps: &[
+            // Супервизор поднимается **при загрузке**, без единой команды: это
+            // и есть разница между «есть программа init» и «в системе есть
+            // службы».
+            Step::Await("services    : /bin/init started", BOOT),
+            Step::Capture("init: started 'logger' as #", 60_000),
+            Step::Await("svclog: up as #", 30_000),
+            Step::Await("freeos> ", 30_000),
+
+            // Убиваем службу. Номер её задачи взят из журнала, а не написан
+            // константой: одна служебная задача, заведённая в ядре, сдвинула бы
+            // нумерацию и превратила бы проверку в лотерею.
+            Step::Line("kill {}"),
+            Step::Await("killed by request", 30_000),
+            // Супервизор обязан заметить, сказать и поднять заново.
+            Step::Await("init: 'logger' ended with code", 30_000),
+            Step::Await("init: restarting 'logger' in 500 ms", 15_000),
+            Step::Await("init: started 'logger' as #", 30_000),
+            // И поднятая служба снова отзывается — то есть работает, а не
+            // «числится запущенной».
+            Step::Await("svclog: up as #", 30_000),
+
+            // Вторая половина: служба, падающая при каждом старте. Описание
+            // пишется прямо здесь, командой оболочки, — так проверяется и то,
+            // что супервизор читает файл, а не зашитый список.
+            Step::Line("echo bad /bin/svcbad > /home/roman/s"),
+            Step::Await("wrote 16 bytes", 15_000),
+            Step::Line("run -b /bin/init /home/roman/s"),
+            Step::Await("init: supervising 1 service(s)", 30_000),
+            Step::Await("svcbad: failing with code 3", 30_000),
+            // Три попытки подряд — и остановка с записью в журнал. Именно это
+            // отличает устойчивость от сокрытия поломки.
+            Step::Await("init: 'bad' failed 3 time(s) in a row, giving up", 60_000),
+            Step::Await("init: nothing left to supervise", 30_000),
+
+            // Система при этом жива и отвечает — ради этого всё и затевалось.
+            Step::Line("uptime"),
+            Step::Await("timer ticks", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "rollback",
+        about: "Заведомо неисправная система в слоте: попытки кончаются, машина возвращается назад.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        arches: &[],
+        // Четыре загрузки в одном процессе QEMU: три неудачные попытки и
+        // возврат.
+        reboots: true,
+        updates: true,
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Файл, который обязан пережить всё происходящее. Он на разделе
+            // состояния, а слоты меняют только систему — но утверждать это надо
+            // проверкой, а не рассуждением.
+            Step::Line("echo keep-me > /home/roman/k.txt"),
+            Step::Await("wrote 8 bytes", 15_000),
+
+            // Обновление, у которого испорчен корень. Контейнер при этом цел:
+            // суммы сходятся, `sysupdate` его принимает и записывает. Ровно та
+            // неисправность, ради которой существует откат, — отвергни мы его
+            // на входе, откатывать было бы нечего.
+            Step::Line("sysupdate apply /media/freeos-broken.fpk"),
+            Step::Await("sysupdate   : root image written", 420_000),
+            Step::Await("slot B is active from the next boot", 420_000),
+
+            // Попытка первая. Загрузчик тратит попытку, ядро стартует, а корень
+            // слота не монтируется — значит подтверждать нечего.
+            Step::Line("reboot"),
+            Step::Await("[slot] booting slot B", BOOT),
+            Step::Await("root        : cannot mount ext2", 60_000),
+            Step::Await("freeos> ", 60_000),
+            // Дальше шнур выдёргивается дважды: система не подтвердилась, и
+            // каждая загрузка тратит попытку.
+            Step::Reset,
+            Step::Await("[slot] booting slot B", BOOT),
+            Step::Await("root        : cannot mount ext2", 60_000),
+            Step::Reset,
+            Step::Await("[slot] booting slot B", BOOT),
+            Step::Await("root        : cannot mount ext2", 60_000),
+            Step::Reset,
+
+            // И вот теперь — то, ради чего фаза. Попытки кончились, загрузчик
+            // сам вернулся на прежний слот, и система об этом сказала.
+            Step::Await("used up its attempts", BOOT),
+            Step::Await("[slot] booting slot A after a rollback", 30_000),
+            // Порядок шагов повторяет порядок строк, а не порядок событий, как
+            // их представляет себе человек: корень монтируется **до** того, как
+            // система говорит об откате, потому что подтверждать загрузку
+            // раньше, чем нашёлся корень, было бы нечем.
+            Step::Await("root        : ext2 at LBA", 180_000),
+            Step::Await("slot        : this boot came back to the previous slot", 60_000),
+            Step::Await("freeos> ", 60_000),
+            // Файлы человека на месте: раздел состояния слоты не трогают.
+            Step::Line("cat /home/roman/k.txt"),
+            Step::Await("keep-me", 15_000),
+            // И слот A снова подтверждён — то есть следующая загрузка обычная.
+            Step::Line("slots"),
+            Step::Await("booted from slot A", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "update",
+        about: "Обновление слотами: новая система в свободном слоте, перезагрузка — и версия другая.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        arches: &[],
+        // Две загрузки в одном процессе: до обновления и после.
+        reboots: true,
+        updates: true,
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // На старте — прежняя версия и прежний слот.
+            Step::Line("slots"),
+            Step::Await("booted from slot A", 15_000),
+            Step::Line("cat /os-release"),
+            Step::Await("version=0.1", 15_000),
+            // Файл человека, который обязан пережить смену системы целиком.
+            Step::Line("echo keep-me > /home/roman/k.txt"),
+            Step::Await("wrote 8 bytes", 15_000),
+
+            Step::Line("sysupdate apply /media/freeos-0.2.fpk"),
+            Step::Await("sysupdate   : root image written", 420_000),
+            Step::Await("sysupdate   : kernel written", 300_000),
+            Step::Await("sysupdate   : initrd written", 420_000),
+            Step::Await("slot B is active from the next boot", 120_000),
+
+            Step::Line("reboot"),
+            // Загрузка со второго слота: другое ядро, другой initrd, другой
+            // корень — и всё это заказано одним файлом.
+            Step::Await("[slot] booting slot B", BOOT),
+            Step::Await("root        : slot B on", 60_000),
+            Step::Await("root        : ext2 at LBA", 60_000),
+            // Подтверждение — то, из-за отсутствия которого система откатилась
+            // бы обратно.
+            Step::Await("slot        : slot B confirmed", 60_000),
+            Step::Await("freeos> ", 60_000),
+            // Версия новая: это и есть «система обновилась».
+            Step::Line("cat /os-release"),
+            Step::Await("version=0.2", 15_000),
+            Step::Line("slots"),
+            Step::Await("booted from slot B", 15_000),
+            // А состояние — прежнее: и учётная запись, и файл, записанный до
+            // обновления.
+            Step::Line("whoami"),
+            Step::Await("roman (uid 1000 gid 1000)", 15_000),
+            Step::Line("cat /home/roman/k.txt"),
+            Step::Await("keep-me", 15_000),
+            Step::Shot("update-slot-b"),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "install4k",
         about: "Установщик размечает диск с сектором 4096 — раскладка считается в его секторах.",
         target: Target::Installer,
@@ -1794,6 +2104,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Nvme4k,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             Step::Await("FreeOS installer", BOOT),
@@ -1824,7 +2135,7 @@ pub const ALL: &[Scenario] = &[
             // Установка на 4Kn-диск проходит целиком: разметка, ESP с
             // BytsPerSec = 4096 и корень ext2, у которого блок равен сектору.
             Step::Await("[install] finished", 240_000),
-            Step::Expect("[install] root: /etc/passwd"),
+            Step::Expect("[install] state: /etc/passwd"),
             Step::Wait(1_000),
             Step::Shot("03-done-4k"),
         ],
@@ -1838,6 +2149,7 @@ pub const ALL: &[Scenario] = &[
         disk_bus: DiskBus::Nvme4k,
         arches: &[],
         reboots: false,
+        updates: false,
         extra: &[],
         steps: &[
             // Диск объявляет свой блок сам, и ядро его принимает, а не
@@ -1848,7 +2160,7 @@ pub const ALL: &[Scenario] = &[
             // Строка, ради которой заведён сценарий: таблица разделов прочитана
             // на носителе, у которого сектор вчетверо больше обычного.
             Step::Await("4096-byte sectors", 30_000),
-            Step::Await("root        : found on nvme #0", 30_000),
+            Step::Await("on nvme #0 at LBA", 30_000),
             Step::Await("root        : ext2 at LBA", 30_000),
             // Файл, записанный установщиком, читается: значит и суперблок, и
             // таблицы inode найдены по верным адресам, а не по формуле,

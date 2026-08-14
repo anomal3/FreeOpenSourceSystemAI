@@ -494,6 +494,9 @@ fn run_command(line: &str) -> bool {
             }
         }
         "fsck" => fsck(),
+        "mounts" => mounts(),
+        "slots" => slots(),
+        "sysupdate" => sysupdate(argument),
         "shutdown" | "poweroff" => {
             crate::power::shut_down(false);
             // Сюда возвращаются, только если машина отказалась гаснуть: она
@@ -522,39 +525,100 @@ fn run_command(line: &str) -> bool {
 /// важнее, чем предложить кнопку «починить»: он должен знать, что для ремонта
 /// машину надо перезагрузить.
 fn fsck() {
-    let Some(result) = crate::fs::check_root() else {
+    let volumes = crate::fs::check_all();
+    if volumes.is_empty() {
         sprintln!("  nothing is mounted");
         return;
-    };
-    let Some(result) = result else {
-        sprintln!("  the root filesystem does not know how to check itself");
+    }
+
+    // Проверяются **все** тома, а не один корень. С фазы 32 корень смонтирован
+    // только на чтение, а всё, что пишется, живёт на разделе состояния: проверка,
+    // смотрящая только на корень, с этого момента смотрит ровно на тот том, с
+    // которым ничего не может случиться.
+    for (where_at, result) in volumes {
+        let Some(result) = result else {
+            sprintln!("  {where_at}: this filesystem does not know how to check itself");
+            continue;
+        };
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(err) => {
+                sprintln!("  {where_at}: fsck failed: {err}");
+                continue;
+            }
+        };
+
+        for problem in &summary.problems {
+            sprintln!("  {where_at}: {problem}");
+        }
+        if summary.dropped > 0 {
+            sprintln!("  {where_at}: and {} more", summary.dropped);
+        }
+        sprintln!(
+            "  {where_at}: {} inode(s) and {} block(s) in use",
+            summary.inodes_used,
+            summary.blocks_used
+        );
+        if summary.problems.is_empty() && summary.dropped == 0 {
+            sprintln!("  {where_at}: the volume is consistent");
+        } else if summary.needs_attention {
+            sprintln!("  {where_at}: some of it needs a decision; the rest is repaired at the next boot");
+        } else {
+            sprintln!("  {where_at}: all of it is repaired automatically at the next boot");
+        }
+    }
+}
+
+/// Что откуда взялось: точки монтирования и файловые системы под ними.
+///
+/// Нужна потому, что с фазы 32 «файл прочитался» перестало означать «файл на
+/// корневом томе»: `/home` и `/etc` живут на разделе состояния, и человек,
+/// выясняющий, что переживёт обновление, обязан видеть это списком.
+fn mounts() {
+    let list = crate::fs::mounted();
+    if list.is_empty() {
+        sprintln!("  nothing is mounted");
+        return;
+    }
+    for (prefix, name) in list {
+        sprintln!("  {:<8} {name}", if prefix.is_empty() { "/" } else { prefix });
+    }
+}
+
+/// Состояние слотов системы.
+fn slots() {
+    for line in crate::slot::describe() {
+        sprintln!("  {line}");
+    }
+}
+
+/// Применить обновление системы.
+///
+/// Команда оболочки, а не программа, и по той же причине, что `fsck`: она пишет
+/// в сектора неактивного раздела и правит FAT-том ESP, которого никто не
+/// монтировал. Отдать это программе значило бы отдать программе блочное
+/// устройство.
+fn sysupdate(argument: &str) {
+    let Some(path) = argument.strip_prefix("apply ").map(str::trim) else {
+        sprintln!("  usage: sysupdate apply <file.fpk>");
+        sprintln!("  the new system goes into the inactive slot; reboot to try it");
         return;
     };
-    let summary = match result {
-        Ok(summary) => summary,
-        Err(err) => {
-            sprintln!("  fsck failed: {err}");
-            return;
-        }
-    };
+    if path.is_empty() {
+        sprintln!("  usage: sysupdate apply <file.fpk>");
+        return;
+    }
 
-    for problem in &summary.problems {
-        sprintln!("  {problem}");
-    }
-    if summary.dropped > 0 {
-        sprintln!("  and {} more", summary.dropped);
-    }
-    sprintln!(
-        "  {} inode(s) and {} block(s) in use",
-        summary.inodes_used,
-        summary.blocks_used
-    );
-    if summary.problems.is_empty() && summary.dropped == 0 {
-        sprintln!("  the volume is consistent");
-    } else if summary.needs_attention {
-        sprintln!("  some of it needs a decision; the rest is repaired at the next boot");
-    } else {
-        sprintln!("  all of it is repaired automatically at the next boot");
+    sprintln!("  applying {path}, this takes a while");
+    match crate::slot::apply(path) {
+        Ok(slot) => {
+            sprintln!("  sysupdate: slot {} is active from the next boot", slot.name());
+            // Про счётчик попыток сказано отдельно и намеренно: человек должен
+            // знать, что система вернётся на прежний слот сама, если новый не
+            // поднимется, — иначе откат выглядит как «обновление пропало».
+            sprintln!("  sysupdate: if it does not come up, the previous slot returns by itself");
+        }
+        Err(err) => sprintln!("  sysupdate: {err}"),
     }
 }
 
@@ -577,7 +641,10 @@ fn help() {
     sprintln!("  run [-b] <p>  run a program with arguments; -b does not wait");
     sprintln!("  kill <task>   stop a running program by its task number");
     sprintln!("  clear         clear the window");
-    sprintln!("  fsck          check the root volume");
+    sprintln!("  fsck          check every mounted volume");
+    sprintln!("  mounts        what is mounted where");
+    sprintln!("  slots         which system slot booted, and its state");
+    sprintln!("  sysupdate a <f>  apply a system update into the free slot");
     sprintln!("  shutdown      switch the machine off");
     sprintln!("  reboot        restart the machine");
     sprintln!("  exit          finish the boot and halt");
@@ -727,7 +794,7 @@ fn run_program(argument: &str) {
     // разбирает намеренно: путь ей нужен только для сообщения об ошибке.
     let path = line.split_whitespace().next().unwrap_or(line);
 
-    match user::spawn(line) {
+    match user::spawn(line, user::session::credentials()) {
         Ok(id) => {
             if background {
                 sprintln!("  {path}: started as {id}");

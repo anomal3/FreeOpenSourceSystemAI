@@ -287,12 +287,15 @@ fn failed(canvas: &mut Canvas, app: &App, strings: &Strings) {
 const fn file_name(what: What) -> &'static str {
     match what {
         What::Bootloader => crate::payload::BOOT_FILE,
-        What::Kernel => "kernel.elf",
-        What::Initrd => "initrd.img",
+        What::Kernel => "kernel-a.elf",
+        What::Initrd => "initrd-a.img",
         // Программ несколько, и показывать их по одной значило бы мелькать
         // именами быстрее, чем человек успевает прочесть. Каталог назван
         // целиком: он и есть то, что появляется на диске.
         What::Program => "/bin",
+        // То же соображение, что и у программ: пакетов несколько, и каталог
+        // называет то, что появляется на диске, точнее любого одного имени.
+        What::Package => "/media",
     }
 }
 

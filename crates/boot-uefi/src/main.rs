@@ -30,6 +30,7 @@ mod handoff;
 mod initrd;
 mod kernel_image;
 mod menu;
+mod slot;
 mod volume;
 
 use core::convert::Infallible;
@@ -114,16 +115,24 @@ fn boot_kernel(mut info: BootInfo) -> Result<Infallible, Aborted> {
     // всё прочитано: держать хендлы до ExitBootServices незачем.
     let mut volume = volume::BootVolume::open()?;
 
+    // Слот выбирается **до** чтения ядра: от него зависит, какое ядро читать, а
+    // счётчик попыток обязан уменьшиться даже тогда, когда прочитать не удастся.
+    let choice = slot::choose(&mut volume)?;
+    info.boot_slot = choice.slot.map_or(0, slots::Slot::code);
+    info.slot_tries = choice.tries_left;
+    info.rolled_back = u8::from(choice.rolled_back);
+    print_slot(&info);
+
     // Образ читается в пул прошивки и живёт ровно до конца размещения: держать
     // его дольше — значит занимать место в карте памяти, которую увидит ядро.
-    let image = kernel_image::read(&mut volume)?;
+    let image = kernel_image::read(&mut volume, kernel_image::path_for(choice.slot))?;
     let kernel = elf::load(&image)?;
     drop(image);
 
     // Образ ФС грузится после того, как пул из-под ELF освобождён: он на два
     // порядка крупнее, и лишние мегабайты занятого пула тут заметны. Его
     // отсутствие — не отказ, см. модуль `initrd`.
-    info.initrd = initrd::load(&mut volume)?;
+    info.initrd = initrd::load(&mut volume, initrd::path_for(choice.slot))?;
     drop(volume);
 
     // Куда лёг образ, ядро само выяснить не может: адрес выбрала прошивка, а
@@ -256,6 +265,22 @@ fn print_boot_info(info: &BootInfo) {
     }
     println!("  device tree     : {:#018x}", info.device_tree);
     println!("-----------------------------------------------------------------");
+}
+
+/// Печатает выбранный слот — строкой, которую читает и человек, и стенд.
+///
+/// Отдельно от [`print_boot_info`] потому, что печатается **после** выбора: до
+/// него в структуре стоят нули, и напечатать их значило бы сообщить «слотов
+/// нет» на машине, где они есть.
+fn print_slot(info: &BootInfo) {
+    match slots::slot_from_code(info.boot_slot) {
+        None => println!("  [slot] no A/B slots on this volume"),
+        Some(slot) => println!(
+            "  [slot] booting slot {}{}",
+            slot.name(),
+            if info.came_back() { " after a rollback" } else { "" }
+        ),
+    }
 }
 
 /// Печатает диапазон образа ФС, который уходит в `BootInfo::initrd`.

@@ -5,13 +5,18 @@
 //! [`crate::layout`], где живёт разбор геометрии и смещения полей. Разойтись
 //! они не могут.
 //!
-//! # Ничего не кэшируется
+//! # Ничего не кэшируется между вызовами
 //!
-//! Каждое обращение читает блок с носителя заново. Кэш здесь был бы
-//! преждевременным: сегодняшний потребитель — оболочка, выводящая содержимое
-//! файла по команде человека, а страничный кэш — это отдельная подсистема со
-//! своей политикой вытеснения, и делать её мимоходом внутри драйвера ФС
-//! неправильно.
+//! Каждое обращение читает блок с носителя заново. Страничный кэш — отдельная
+//! подсистема со своей политикой вытеснения, и делать её мимоходом внутри
+//! драйвера ФС неправильно.
+//!
+//! Единственное исключение живёт **внутри одного** [`Ext2::read_at`] и кэшем не
+//! является: таблица косвенности, из которой взят указатель на блок, переживает
+//! виток цикла, потому что следующая тысяча блоков файла описана ею же. Без
+//! этого чтение подряд стоило втрое дороже, чем должно, и упиралось в это
+//! обновление системы. Соседняя оптимизация того же места — чтение подряд
+//! идущих блоков одним запросом вместо двадцати пяти тысяч отдельных.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -112,6 +117,49 @@ fn read_superblock(
     let mut sb = [0u8; SUPERBLOCK_SIZE];
     sb.copy_from_slice(&raw[within..within + SUPERBLOCK_SIZE]);
     Ok(sb)
+}
+
+/// Одна запомненная таблица косвенности.
+///
+/// Не кеш файловой системы и не заявка на него: время жизни — один вызов
+/// [`Ext2::read_at`], и никакой согласованности с диском она не обещает. Смысл
+/// ровно один: тысяча подряд идущих блоков файла описана указателями из **одной**
+/// таблицы, и перечитывать её тысячу раз — значит платить втрое за одно и то же.
+struct Pointers {
+    /// Номер блока таблицы; ноль означает, что ничего не прочитано.
+    table: u32,
+    data: Vec<u8>,
+}
+
+impl Pointers {
+    const fn new() -> Self {
+        Self { table: 0, data: Vec::new() }
+    }
+
+    /// Указатель под номером `slot` в таблице `table`.
+    fn pointer_at(
+        &mut self,
+        fs: &Ext2,
+        dev: &mut dyn BlockDevice,
+        table: u32,
+        slot: usize,
+    ) -> Result<u32> {
+        if table == 0 {
+            return Ok(0);
+        }
+        if table >= fs.geometry.blocks {
+            return Err(Error::Corrupt);
+        }
+        if self.table != table {
+            let block_bytes = fs.geometry.block_size.bytes() as usize;
+            if self.data.len() != block_bytes {
+                self.data = try_zeroed(block_bytes)?;
+            }
+            dev.read(fs.geometry.block_lba(table), &mut self.data)?;
+            self.table = table;
+        }
+        Ok(u32_at(&self.data, slot * 4))
+    }
 }
 
 impl Ext2 {
@@ -369,25 +417,85 @@ impl Ext2 {
 
         let mut done = 0usize;
         let mut block_buf = try_zeroed(block_bytes as usize)?;
+        // Разобранная таблица косвенности переживает виток цикла. Без этого
+        // чтение стомегабайтного файла обходилось в три обращения к носителю на
+        // каждый блок данных: сам блок плюс две таблицы, перечитываемые заново
+        // ради соседнего указателя. В эмуляторе это была минута на десять
+        // мегабайт, и именно в неё упёрлось обновление системы.
+        let mut cache = Pointers::new();
         while done < want {
             let position = offset + done as u64;
             let index = (position / block_bytes) as u32;
             let within = (position % block_bytes) as usize;
-            let take = (block_bytes as usize - within).min(want - done);
 
-            match self.block_of(dev, inode, index)? {
-                Some(block) => {
-                    dev.read(self.geometry.block_lba(block), &mut block_buf)?;
-                    buf[done..done + take].copy_from_slice(&block_buf[within..within + take]);
-                }
+            let Some(block) = self.block_of_cached(dev, inode, index, &mut cache)? else {
                 // Дыра в файле: не выделенный блок читается нулями. Файлов с
                 // дырами наш писатель не создаёт, но формат их допускает, и
                 // ошибка здесь была бы неверна.
-                None => buf[done..done + take].fill(0),
+                let take = (block_bytes as usize - within).min(want - done);
+                buf[done..done + take].fill(0);
+                done += take;
+                continue;
+            };
+
+            // Целые блоки читаются **прямо в буфер вызывающего** и отрезком
+            // подряд идущих: наш писатель раздаёт блоки последовательно, и файл
+            // в сто мегабайт — это один-два отрезка, а не двадцать пять тысяч
+            // отдельных запросов. Копия через промежуточный буфер остаётся
+            // только для хвостов, не выровненных по границе блока.
+            if within == 0 && want - done >= block_bytes as usize {
+                let mut run = 1u32;
+                let limit = ((want - done) as u64 / block_bytes) as u32;
+                while run < limit {
+                    match self.block_of_cached(dev, inode, index + run, &mut cache)? {
+                        Some(next) if next == block + run => run += 1,
+                        _ => break,
+                    }
+                }
+                let bytes = run as usize * block_bytes as usize;
+                dev.read(self.geometry.block_lba(block), &mut buf[done..done + bytes])?;
+                done += bytes;
+                continue;
             }
+
+            let take = (block_bytes as usize - within).min(want - done);
+            dev.read(self.geometry.block_lba(block), &mut block_buf)?;
+            buf[done..done + take].copy_from_slice(&block_buf[within..within + take]);
             done += take;
         }
         Ok(done)
+    }
+
+    /// То же, что [`Ext2::block_of`], но с запомненной таблицей косвенности.
+    fn block_of_cached(
+        &self,
+        dev: &mut dyn BlockDevice,
+        inode: &Inode,
+        index: u32,
+        cache: &mut Pointers,
+    ) -> Result<Option<u32>> {
+        let pointers = self.geometry.block_size.pointers_per_block() as usize;
+        let index = index as usize;
+
+        let direct_limit = DIRECT_BLOCKS;
+        let single_limit = direct_limit + pointers;
+        let double_limit = single_limit + pointers * pointers;
+
+        let block = if index < direct_limit {
+            inode.blocks[index]
+        } else if index < single_limit {
+            let table = inode.blocks[INDIRECT_INDEX];
+            cache.pointer_at(self, dev, table, index - direct_limit)?
+        } else if index < double_limit {
+            let offset = index - single_limit;
+            let table = inode.blocks[DOUBLE_INDIRECT_INDEX];
+            let leaf = cache.pointer_at(self, dev, table, offset / pointers)?;
+            cache.pointer_at(self, dev, leaf, offset % pointers)?
+        } else {
+            return Err(Error::Unsupported);
+        };
+
+        Ok(if block == 0 { None } else { Some(block) })
     }
 
     /// Прочитать файл целиком.
@@ -437,6 +545,10 @@ impl Ext2 {
     }
 
     /// Указатель под номером `slot` в блоке косвенности.
+    ///
+    /// Читает таблицу каждый раз заново. Годится там, где указатель нужен один
+    /// (`block_of` на отдельном блоке); чтение файла подряд пользуется
+    /// [`Pointers`], потому что там соседние указатели лежат в одной таблице.
     fn pointer_at(&self, dev: &mut dyn BlockDevice, table: u32, slot: usize) -> Result<u32> {
         if table == 0 {
             return Ok(0);

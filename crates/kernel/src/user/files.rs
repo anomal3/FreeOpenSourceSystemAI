@@ -146,6 +146,34 @@ impl Table {
         Ok(slot + FD_FIRST)
     }
 
+    /// Создать файл с заданными правами и открыть его на запись.
+    ///
+    /// Отличается от [`Table::open`] с `O_CREATE` двумя вещами, и обе намеренны:
+    /// права берутся у вызывающего, а занятое имя — отказ, а не «обрежу». См.
+    /// `SYS_CREATE` в договоре, где сказано, кому это нужно и почему.
+    ///
+    /// Права обрезаются до девяти бит **здесь**, а не у вызывающего: число
+    /// пришло из третьего кольца, и тип узла задаёт файловая система, а не
+    /// программа.
+    pub fn create(
+        &mut self,
+        cred: Credentials,
+        path: &str,
+        mode: u16,
+    ) -> Result<usize, FileError> {
+        let node = crate::fs::create_as(cred, path, mode & 0o777)
+            .ok_or(FileError::NoFilesystem)?
+            .map_err(FileError::Vfs)?;
+
+        let slot = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .ok_or(FileError::TooManyFiles)?;
+        self.slots[slot] = Some(Open { node, offset: 0, writable: true, entries: None });
+        Ok(slot + FD_FIRST)
+    }
+
     /// Записать в дескриптор. Возвращает, сколько записано.
     pub fn write(&mut self, fd: usize, data: &[u8]) -> Result<usize, FileError> {
         let index = index_of(fd)?;

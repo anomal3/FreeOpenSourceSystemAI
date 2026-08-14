@@ -19,18 +19,24 @@
 //! # Права файлов
 //!
 //! Проверка `mode`/`uid`/`gid` живёт не здесь, а в [`crate::fs::resolve_as`],
-//! и вызывается отсюда с личностью сеанса ([`super::session`]). Здесь остаётся
-//! перевод отказов в числа договора: ядро не рассказывает программе, какая
-//! именно структура на диске ей не понравилась.
+//! и вызывается отсюда с личностью **программы** ([`super::credentials`]).
+//! Здесь остаётся перевод отказов в числа договора: ядро не рассказывает
+//! программе, какая именно структура на диске ей не понравилась.
+//!
+//! Личность программы, а не сеанса, — с Phase 33: службу запускает супервизор
+//! от root, а исполняется она от своего пользователя, и общая на всех личность
+//! сеанса означала бы, что описание службы врёт о том, от чьего имени она
+//! работает.
 
 use user_abi::{
-    ERR_BAD_ADDRESS, ERR_BAD_FD, ERR_BAD_PATH, ERR_IO, ERR_NOT_FOUND, ERR_NO_FILESYSTEM,
-    ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_PERMISSION, ERR_TOO_MANY_FILES, ERR_UNSUPPORTED, FD_STDERR,
-    FD_STDIN, FD_STDOUT, KIND_DIRECTORY, KIND_FILE, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID,
+    ERR_AGAIN, ERR_BAD_ADDRESS, ERR_BAD_FD, ERR_BAD_PATH, ERR_IO, ERR_NOT_FOUND,
+    ERR_NO_FILESYSTEM, ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_NO_TASK, ERR_PERMISSION,
+    ERR_TOO_MANY_FILES, ERR_TOO_MANY_TASKS, ERR_UNSUPPORTED, FD_STDERR, FD_STDIN, FD_STDOUT,
+    KIND_DIRECTORY, KIND_FILE, SYS_CLOSE, SYS_CREATE, SYS_EXIT, SYS_GETGID, SYS_GETPID,
     SYS_GETUID, SYS_OPEN, Dirent, ERR_EXISTS, ERR_NOT_EMPTY, ERR_NO_SPACE, MAX_NAME, SEEK_CUR,
-    SEEK_END, SEEK_SET, SYS_MKDIR, SYS_READ, SYS_READDIR, SYS_REMOVE, SYS_RENAME, SYS_SEEK,
-    SYS_SLEEP, SYS_STAT, SYS_TIME, SYS_TTYMODE, SYS_UPTIME, SYS_WINSIZE, SYS_WRITE, SYS_YIELD,
-    Stat, TTY_RAW,
+    SEEK_END, SEEK_SET, SPAWN_INHERIT, SYS_MKDIR, SYS_READ, SYS_READDIR, SYS_REMOVE, SYS_RENAME,
+    SYS_SEEK, SYS_SLEEP, SYS_SPAWN, SYS_STAT, SYS_TIME, SYS_TTYMODE, SYS_UPTIME, SYS_WAIT,
+    SYS_WINSIZE, SYS_WRITE, SYS_YIELD, Stat, TTY_RAW, WAIT_NOHANG,
 };
 
 use crate::mm::PageFlags;
@@ -82,6 +88,9 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         // видна только тому, кто её проверяет, поэтому она названа в договоре.
         SYS_TIME => time::now_unix().unwrap_or(0) as i64,
         SYS_OPEN => open(a0, a1, a2),
+        SYS_CREATE => create(a0, a1, a2),
+        SYS_SPAWN => spawn(a0, a1, a2),
+        SYS_WAIT => wait(a0, a1),
         SYS_READ => read(a0, a1, a2),
         SYS_SEEK => seek(a0, a1 as i64, a2),
         SYS_READDIR => readdir(a0, a1, a2),
@@ -101,8 +110,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
             crate::tty::set_raw(a0 == TTY_RAW);
             0
         }
-        SYS_GETUID => i64::from(super::session::credentials().uid),
-        SYS_GETGID => i64::from(super::session::credentials().gid),
+        SYS_GETUID => i64::from(super::credentials().uid),
+        SYS_GETGID => i64::from(super::credentials().gid),
         // Программа — это задача, и её номер тот же, что видит `tasks` в
         // оболочке. Отдельного пространства номеров процессов не заводится:
         // второе пространство имён для тех же объектов пришлось бы всё время
@@ -179,12 +188,103 @@ fn open(ptr: usize, len: usize, flags: usize) -> i64 {
         Err(err) => return err,
     };
 
-    let cred = super::session::credentials();
+    let cred = super::credentials();
     match super::with_current(|program| program.files.open(cred, path, flags)) {
         Some(Ok(fd)) => fd as i64,
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
     }
+}
+
+/// `create(ptr, len, mode) -> fd`.
+fn create(ptr: usize, len: usize, mode: usize) -> i64 {
+    let mut buffer = [0u8; MAX_PATH];
+    let path = match copy_path(ptr, len, &mut buffer) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+
+    let cred = super::credentials();
+    match super::with_current(|program| program.files.create(cred, path, mode as u16)) {
+        Some(Ok(fd)) => fd as i64,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `spawn(ptr, len, кто) -> номер задачи`.
+///
+/// # Почему проверка прав здесь, а не в [`super::spawn_with`]
+///
+/// Потому что здесь известно, **кто просит**. Понижение прав разрешено всем,
+/// повышение — никому, кроме root, и вопрос «а кто такой этот root» имеет
+/// смысл только на границе третьего кольца: внутри ядра эту функцию вызывает и
+/// оболочка, которой проверять нечего.
+fn spawn(ptr: usize, len: usize, who: usize) -> i64 {
+    let mut buffer = [0u8; MAX_PATH];
+    let line = match copy_path(ptr, len, &mut buffer) {
+        Ok(line) => line,
+        Err(err) => return err,
+    };
+
+    let mine = super::credentials();
+    let cred = if who == SPAWN_INHERIT {
+        mine
+    } else {
+        let asked = crate::vfs::perm::Credentials::new((who >> 32) as u32, who as u32);
+        // Тот же uid — не «повышение», даже если группа другая: сменить себе
+        // группу вправе кто угодно, потому что чужих прав это не даёт.
+        if !mine.is_root() && asked.uid != mine.uid {
+            return ERR_PERMISSION;
+        }
+        asked
+    };
+
+    // Служба, запущенная службой, — тоже служба. Иначе перезапущенный
+    // супервизором демон стал бы обычной задачей и начал бы удерживать систему
+    // от остановки, хотя его родитель этого не делал.
+    let daemon = sched::is_daemon();
+
+    match super::spawn_with(line, cred, daemon) {
+        Ok(id) => i64::from(id.as_u32()),
+        Err(super::Error::TooManyTasks) => ERR_TOO_MANY_TASKS,
+        Err(super::Error::OutOfMemory) => ERR_NO_SPACE,
+        // Всё остальное — отказ разбора строки: она длиннее предела либо пуста.
+        Err(_) => ERR_BAD_PATH,
+    }
+}
+
+/// `wait(id, флаги) -> код возврата`.
+///
+/// # Почему ожидание не блокирует ничего, кроме спрашивающего
+///
+/// Потому что оно устроено сном планировщика, а не циклом: задача выходит из
+/// очереди и возвращается в неё, когда ждущаяся закончится. Программа,
+/// уснувшая на `wait`, не занимает процессор — в отличие от той, что спрашивала
+/// бы `WAIT_NOHANG` в цикле.
+fn wait(id: usize, flags: usize) -> i64 {
+    let Ok(raw) = u32::try_from(id) else {
+        return ERR_NO_TASK;
+    };
+    let task = sched::TaskId::new(raw);
+
+    if flags & WAIT_NOHANG != 0 {
+        return match sched::lookup(task) {
+            Some((_, sched::TaskState::Finished)) => {
+                sched::result_of(task).unwrap_or(ERR_NO_TASK)
+            }
+            Some(_) => ERR_AGAIN,
+            None => ERR_NO_TASK,
+        };
+    }
+
+    // Программу могли попросить остановиться, пока она ждала чужую. Проверка
+    // до сна, а не после: снятие происходит на возврате в третье кольцо, а
+    // ожидание задачи, которая не кончится, туда не возвращается никогда.
+    if super::kill_pending() {
+        return ERR_NO_TASK;
+    }
+    sched::wait(task).unwrap_or(ERR_NO_TASK)
 }
 
 /// `mkdir(ptr, len, mode) -> 0`.
@@ -198,7 +298,7 @@ fn mkdir(ptr: usize, len: usize, mode: usize) -> i64 {
     // приславшая в этом аргументе что угодно, не должна получить каталог,
     // притворяющийся устройством.
     let mode = (mode as u16) & 0o777;
-    match crate::fs::mkdir_as(super::session::credentials(), path, mode) {
+    match crate::fs::mkdir_as(super::credentials(), path, mode) {
         Some(Ok(())) => 0,
         Some(Err(err)) => vfs_errno(err),
         None => ERR_NO_FILESYSTEM,
@@ -212,7 +312,7 @@ fn remove(ptr: usize, len: usize) -> i64 {
         Ok(path) => path,
         Err(err) => return err,
     };
-    match crate::fs::remove_as(super::session::credentials(), path) {
+    match crate::fs::remove_as(super::credentials(), path) {
         Some(Ok(())) => 0,
         Some(Err(err)) => vfs_errno(err),
         None => ERR_NO_FILESYSTEM,
@@ -308,7 +408,7 @@ fn rename(ptr: usize, old_len: usize, total: usize) -> i64 {
         return ERR_BAD_PATH;
     };
 
-    match crate::fs::rename_as(super::session::credentials(), old, new) {
+    match crate::fs::rename_as(super::credentials(), old, new) {
         Some(Ok(())) => 0,
         Some(Err(err)) => vfs_errno(err),
         None => ERR_NO_FILESYSTEM,
@@ -427,7 +527,7 @@ fn stat(ptr: usize, len: usize, out: usize) -> i64 {
     // прочитать его содержимое — разные вещи. Что скрывает каталог, тем не
     // менее скрыто: [`crate::fs::resolve_as`] спрашивает право пройти у каждого
     // каталога на пути.
-    let node = match crate::fs::resolve_as(super::session::credentials(), path, Access::NONE) {
+    let node = match crate::fs::resolve_as(super::credentials(), path, Access::NONE) {
         Some(Ok(node)) => node,
         Some(Err(err)) => return vfs_errno(err),
         None => return ERR_NO_FILESYSTEM,

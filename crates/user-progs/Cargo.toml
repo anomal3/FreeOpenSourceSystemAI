@@ -9,6 +9,9 @@ publish = false
 
 [dependencies]
 user-abi = { path = "../user-abi" }
+# Разбор контейнера `.fpk` — тот же код, которым его собирает `xtask` и читает
+# ядро. Разбирается без кучи, поэтому годится и здесь.
+fpk = { path = "../fpk" }
 
 [lints]
 workspace = true

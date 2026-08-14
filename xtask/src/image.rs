@@ -231,6 +231,20 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                 let target = format!("{}/{}", arch::PAYLOAD_BIN_DIR, name.to_uppercase());
                 payload.push(read_payload(&target, path)?);
             }
+
+            // Образцовые пакеты. Имена на носителе — короткие 8.3, потому что
+            // это FAT; настоящие имена (`hello-1.0.fpk`) знает установщик и
+            // ставит файлы под ними в `/media`.
+            for package in crate::package::build_samples(arch, built.release)? {
+                let short = package
+                    .file_name
+                    .split('-')
+                    .next()
+                    .unwrap_or("PKG")
+                    .to_uppercase();
+                let target = format!("{}/{short}.FPK", arch::PAYLOAD_PKG_DIR);
+                payload.push(read_payload(&target, &package.path)?);
+            }
         }
     }
 
@@ -276,7 +290,7 @@ fn assemble(payload: &[Payload], kind: Kind) -> Result<Vec<u8>> {
         )
     })?;
 
-    let layout = gpt::plan(sectors, SECTOR_SIZE, esp_bytes, false)
+    let layout = gpt::plan(sectors, SECTOR_SIZE, esp_bytes, gpt::Scheme::EspOnly)
         .map_err(|err| anyhow::anyhow!("не удалось спланировать разметку образа: {err}"))?;
 
     // Хеш содержимого служит источником «случайности» для GUID: настоящая

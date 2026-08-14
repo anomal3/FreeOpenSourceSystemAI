@@ -1,0 +1,13 @@
+[package]
+name = "slots"
+description = "The A/B slot record on the ESP: which system boots next, how many attempts are left, and where to fall back."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

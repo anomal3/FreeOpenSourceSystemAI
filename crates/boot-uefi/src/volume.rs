@@ -79,6 +79,40 @@ impl BootVolume {
             }
         }
     }
+
+    /// Открывает существующий файл на чтение **и запись**.
+    ///
+    /// Создавать ничего не умеет намеренно: единственный файл, который
+    /// загрузчик правит, — запись о слотах, и создаёт её установщик. Загрузчик,
+    /// умеющий её завести, однажды завёл бы её на томе, где её нет, — то есть
+    /// объявил бы слоты там, где их не существует.
+    ///
+    /// `Ok(None)` — файла нет; это обычное состояние живого носителя.
+    pub fn open_read_write(&mut self, path: &CStr16) -> Result<Option<RegularFile>, Aborted> {
+        let handle = match self.root.open(path, FileMode::ReadWrite, FileAttribute::empty()) {
+            Ok(handle) => handle,
+            Err(err) if err.status() == Status::NOT_FOUND => return Ok(None),
+            Err(err) => {
+                // Том мог быть открыт прошивкой только на чтение — на ISO это
+                // штатное состояние, а не поломка. Сказать надо, отказываться —
+                // нет: слоты на таком носителе просто не работают.
+                println!("  [fs ] cannot open {path} for writing ({err:?})");
+                return Ok(None);
+            }
+        };
+
+        match handle.into_type() {
+            Ok(FileType::Regular(file)) => Ok(Some(file)),
+            Ok(FileType::Dir(_)) => {
+                println!("  [fs ] {path} is a directory, not a file");
+                Err(Aborted)
+            }
+            Err(err) => {
+                println!("  [fs ] cannot classify {path} ({err:?})");
+                Err(Aborted)
+            }
+        }
+    }
 }
 
 /// Размер файла по данным файловой системы.

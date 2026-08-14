@@ -24,6 +24,8 @@ disk = { path = "../disk" }
 # Корневая файловая система. Тот же крейт потом читает ядро — одна реализация
 # формата на запись и на чтение.
 ext2 = { path = "../ext2" }
+# Запись о слотах: установщик её создаёт, загрузчик правит, ядро подтверждает.
+slots = { path = "../slots" }
 mini-ui = { path = "../mini-ui" }
 uefi = { version = "0.39", features = ["alloc", "global_allocator", "panic_handler"] }
 

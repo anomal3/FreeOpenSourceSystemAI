@@ -63,6 +63,11 @@ pub enum What {
     /// ESP: программу запускает система, а не прошивка, и лежать ей полагается
     /// там, где есть права.
     Program,
+    /// Образцовый пакет `.fpk`. Едет в `/media` корневого раздела — туда же,
+    /// куда его положил бы человек, подключив носитель, с которого пакет
+    /// пришёл. Отсутствие пакетов установку не срывает: система без них
+    /// работает, просто ставить нечего.
+    Package,
 }
 
 /// Открытый установочный носитель вместе с описью.
@@ -94,6 +99,7 @@ impl What {
             What::Kernel => "kernel",
             What::Initrd => "initrd",
             What::Program => "program",
+            What::Package => "package",
         }
     }
 }
@@ -152,6 +158,16 @@ pub fn probe() -> Result<Payload, Error> {
         }
     }
 
+    for (source, target) in PACKAGES {
+        match stat(&mut root, source, What::Package) {
+            Ok(size) => {
+                logln!("[payload] package {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Package, size });
+            }
+            Err(_) => logln!("[payload] package {source} is missing; /media will lack it"),
+        }
+    }
+
     Ok(Payload { root, _fs: fs, items })
 }
 
@@ -160,7 +176,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// Список обязан совпадать с `USER_PROGRAMS` в `xtask/src/build.rs` — это тот
 /// же комплект, разложенный по носителю. Расхождение не остаётся незамеченным:
 /// установленная система без `/bin/perms` валит сценарий `installed` на стенде.
-const PROGRAMS: [(&CStr16, &str); 14] = [
+const PROGRAMS: [(&CStr16, &str); 18] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -175,6 +191,19 @@ const PROGRAMS: [(&CStr16, &str); 14] = [
     (cstr16!("\\FREEOS\\BIN\\ASK"), "ask"),
     (cstr16!("\\FREEOS\\BIN\\VEC"), "vec"),
     (cstr16!("\\FREEOS\\BIN\\MC"), "mc"),
+    (cstr16!("\\FREEOS\\BIN\\PKG"), "pkg"),
+    (cstr16!("\\FREEOS\\BIN\\INIT"), "init"),
+    (cstr16!("\\FREEOS\\BIN\\SVCLOG"), "svclog"),
+    (cstr16!("\\FREEOS\\BIN\\SVCBAD"), "svcbad"),
+];
+
+/// Образцовые пакеты на носителе и их имена в `/media`.
+///
+/// Их отсутствие — не отказ: пакеты собирает `xtask`, и носитель, собранный без
+/// них, остаётся годным установочным носителем.
+const PACKAGES: [(&CStr16, &str); 2] = [
+    (cstr16!("\\FREEOS\\PKG\\HELLO.FPK"), "hello-1.0.fpk"),
+    (cstr16!("\\FREEOS\\PKG\\EXTRA.FPK"), "extra-1.0.fpk"),
 ];
 
 /// Размер файла по данным файловой системы.

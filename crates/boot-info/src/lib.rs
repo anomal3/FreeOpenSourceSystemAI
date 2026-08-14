@@ -22,8 +22,10 @@ pub const BOOT_INFO_MAGIC: u64 = 0x4652_4545_4F53_0001;
 /// [`BootInfo::wall_clock`]: the kernel has no clock of its own to ask.
 /// Revision 5 added [`BootInfo::wall_clock_counter`], which says *when* that
 /// clock was read. Revision 6 added [`BootInfo::boot_flags`]: what the person
-/// in front of the machine chose in the bootloader menu.
-pub const BOOT_INFO_REVISION: u32 = 6;
+/// in front of the machine chose in the bootloader menu. Revision 7 added the
+/// A/B slot fields — which system this boot came from, how many attempts it has
+/// left, and whether the bootloader had already given up on the other one.
+pub const BOOT_INFO_REVISION: u32 = 7;
 
 /// Boot without the desktop, without services, and with the root filesystem
 /// mounted read-only.
@@ -227,6 +229,28 @@ pub struct BootInfo {
     /// to find and parse: the choice is made before there is a filesystem to
     /// read it from, and by the one component that has the person's attention.
     pub boot_flags: u64,
+    /// Which system slot this boot came from: `0` none, `1` slot A, `2` slot B.
+    ///
+    /// Zero is not a failure. It is what a live image says — booted from an
+    /// ISO or from a single-root install there is no A/B pair, nothing to roll
+    /// back to, and nothing to confirm. The kernel must tell the two apart:
+    /// confirming a boot that has no slot record would mean writing to an ESP
+    /// that never asked for it.
+    pub boot_slot: u8,
+    /// How many attempts the active slot has left after this one.
+    ///
+    /// Meaningful only while the slot is unconfirmed; a confirmed slot carries
+    /// the full count and does not spend it.
+    pub slot_tries: u8,
+    /// Set when the bootloader gave up on the active slot and came back to the
+    /// previous one.
+    ///
+    /// The kernel says this out loud, and it is the bootloader that must pass
+    /// it: by the time the system is up, the record on the ESP has already been
+    /// rewritten, and "we are on slot A" no longer distinguishes an ordinary
+    /// boot from a rollback.
+    pub rolled_back: u8,
+    _reserved: [u8; 5],
 }
 
 /// Segment is readable.
@@ -382,7 +406,26 @@ impl BootInfo {
             wall_clock: 0,
             wall_clock_counter: 0,
             boot_flags: 0,
+            boot_slot: 0,
+            slot_tries: 0,
+            rolled_back: 0,
+            _reserved: [0; 5],
         }
+    }
+
+    /// Whether this boot came from an A/B slot at all.
+    ///
+    /// A live image has none, and the difference matters: a system with no slot
+    /// record has nothing to confirm and nothing to fall back to.
+    #[must_use]
+    pub const fn has_slot(&self) -> bool {
+        self.boot_slot != 0
+    }
+
+    /// Whether the bootloader fell back to the previous slot before this boot.
+    #[must_use]
+    pub const fn came_back(&self) -> bool {
+        self.rolled_back != 0
     }
 
     /// True when this really is a `BootInfo` of a revision the kernel understands.

@@ -348,11 +348,34 @@ pub fn spawn(name: &'static str, entry: fn()) -> Result<TaskId, SpawnError> {
 /// Те же, что у [`spawn`].
 pub fn spawn_daemon(name: &'static str, entry: fn()) -> Result<TaskId, SpawnError> {
     let id = spawn(name, entry)?;
+    mark_daemon(id);
+    Ok(id)
+}
+
+/// Объявить уже созданную задачу служебной.
+///
+/// Отдельно от [`spawn_daemon`] потому, что задачу программы создаёт не
+/// `spawn`, а [`spawn_raw`] (см. [`crate::user::spawn_with`]): у неё своя точка
+/// входа и свой размер стека, и повторять их здесь ради одного флага было бы
+/// третьей копией тех же аргументов.
+pub fn mark_daemon(id: TaskId) {
     let mut sched = SCHED.lock();
     if let Some(task) = sched.tasks.iter_mut().flatten().find(|task| task.id == id) {
         task.daemon = true;
     }
-    Ok(id)
+}
+
+/// Служебная ли задача исполняется сейчас.
+///
+/// Спрашивает [`crate::user::syscall`]: службу запускает служба, и ребёнок
+/// супервизора обязан унаследовать это свойство. Иначе первая же перезапущенная
+/// служба стала бы обычной задачей — то есть начала бы удерживать систему от
+/// остановки, хотя её родитель этого не делал.
+#[must_use]
+pub fn is_daemon() -> bool {
+    let sched = SCHED.lock();
+    let current = sched.current;
+    sched.tasks[current].as_ref().is_some_and(|task| task.daemon)
 }
 
 /// Создать задачу с собственной точкой входа и своим размером стека.
@@ -633,6 +656,34 @@ pub fn wake_input() {
     };
     for task in sched.tasks.iter_mut().flatten() {
         if matches!(task.state, TaskState::Blocked(Wait::Input(_))) {
+            task.state = TaskState::Ready;
+        }
+    }
+}
+
+/// Разбудить задачу, что бы она ни ждала.
+///
+/// # Зачем это нужно снятию программы
+///
+/// Программу снимает [`crate::user::check_kill`] — на возврате в третье кольцо.
+/// До возврата надо ещё дойти, а спящая программа не вернётся туда до конца
+/// сна: `kill` службы, отзывающейся раз в полминуты, вступал бы в силу через
+/// полминуты. Выглядит это как «команда не сработала», и ровно так это и
+/// выглядело, пока сюда не добавилась эта функция.
+///
+/// # Почему пробуждение не ломает того, кого разбудили
+///
+/// Потому что всякое ожидание в этом планировщике — цикл с перепроверкой
+/// условия, а не однократное «усни и проснись готовым». `sleep_ms` спит до
+/// срока и просыпается раньше только затем, чтобы снова уснуть; `wait` заново
+/// смотрит на состояние задачи; `block_on_lock` заново пробует лок. Лишнее
+/// пробуждение стоит одного витка и ничего не меняет.
+pub fn wake(id: TaskId) {
+    let Some(mut sched) = SCHED.try_lock() else {
+        return;
+    };
+    if let Some(task) = sched.tasks.iter_mut().flatten().find(|task| task.id == id) {
+        if matches!(task.state, TaskState::Blocked(_)) {
             task.state = TaskState::Ready;
         }
     }

@@ -20,6 +20,9 @@ bench = false
 boot-info = { path = "../boot-info" }
 # Прошивка отдаёт время разложенным на поля календаря, а ядру нужно одно число.
 calendar = { path = "../calendar" }
+# Запись о слотах: тот же разбор, что у ядра и установщика. Три копии одного
+# формата разъехались бы, и разъехались бы молча.
+slots = { path = "../slots" }
 uefi = { version = "0.39", features = ["alloc", "global_allocator", "panic_handler"] }
 
 [lints]

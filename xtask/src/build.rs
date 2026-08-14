@@ -125,10 +125,18 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
     let initrd = if opts.initrd {
         // В образ они попадают как `/bin/<имя>` — оттуда их запускает система,
         // загруженная с носителя.
-        let extra: Vec<(String, PathBuf)> = programs
+        let mut extra: Vec<(String, PathBuf)> = programs
             .iter()
             .map(|(name, path)| (format!("bin/{name}"), path.clone()))
             .collect();
+        // Образцовые пакеты — в `/media`, туда же, куда их кладёт установщик.
+        // Живая система обязана уметь ставить пакеты так же, как установленная:
+        // иначе проверить `pkg` было бы можно только после установки.
+        if !programs.is_empty() {
+            for package in crate::package::build_samples(opts.arch, opts.release)? {
+                extra.push((format!("media/{}", package.file_name), package.path));
+            }
+        }
         Some(initrd::build(&extra)?)
     } else {
         println!("initrd пропущен (--no-initrd)");
@@ -187,10 +195,19 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 14] = [
+pub const USER_PROGRAMS: [&str; 18] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
-    "ask", "vec", "mc",
+    "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad",
 ];
+
+/// Программы, которые в `/bin` **не** едут.
+///
+/// Они попадают в систему единственным способом — внутри пакета, — и в этом всё
+/// их назначение: «пакет положил программу, и она работает» невозможно доказать
+/// программой, которая и так лежит на диске. Собираются они вместе со всеми
+/// (`cargo build --bins` строит их в любом случае), а вот в initrd и на
+/// установочный носитель не попадают.
+pub const PACKAGED_PROGRAMS: [&str; 1] = ["greet"];
 
 /// Собрать программы, исполняющиеся вне ядра.
 ///
@@ -258,7 +275,7 @@ pub fn build_user_programs(arch: Arch, release: bool) -> Result<Vec<PathBuf>> {
 
     let dir = paths::artifact_dir(triple, release);
     let mut built = Vec::new();
-    for name in USER_PROGRAMS {
+    for name in USER_PROGRAMS.iter().chain(PACKAGED_PROGRAMS.iter()) {
         let path = dir.join(name);
         if !path.is_file() {
             bail!(
@@ -268,9 +285,25 @@ pub fn build_user_programs(arch: Arch, release: bool) -> Result<Vec<PathBuf>> {
                 USER_PROGRAMS.join(", ")
             );
         }
-        built.push(path);
+        if USER_PROGRAMS.contains(name) {
+            built.push(path);
+        }
     }
     Ok(built)
+}
+
+/// Путь к собранной программе, которая едет только внутри пакета.
+///
+/// Отдельная функция, а не ещё один элемент возвращаемого списка: список
+/// [`USER_PROGRAMS`] совпадает с содержимым `/bin` один к одному, и подмешивать
+/// в него то, чего в `/bin` нет, значило бы завести исключение в трёх местах
+/// сразу — в initrd, в установщике и в сценариях стенда.
+pub fn packaged_program(arch: Arch, release: bool, name: &str) -> Result<PathBuf> {
+    let path = paths::artifact_dir(user_triple(arch), release).join(name);
+    if !path.is_file() {
+        bail!("программа {name} не собрана: нет {}", path.display());
+    }
+    Ok(path)
 }
 
 /// Досыпает `-Z build-std` при сборке ядра.
@@ -459,6 +492,33 @@ pub fn check(arches: &[Arch]) -> Result<()> {
     let mut cmd = cargo();
     cmd.arg("test").arg("--package").arg("usb-hid");
     util::run(&mut cmd, "cargo test (usb-hid)")?;
+
+    // Формат пакета и запись о слотах — то же самое рассуждение, что у HID.
+    // Откат по счётчику попыток и разбор порванной записи проверяются здесь за
+    // секунды; в эмуляторе то же утверждение стоило бы четырёх загрузок и
+    // получаса, а поймать в нём арифметику счётчика всё равно нечем.
+    for package in ["fpk", "slots"] {
+        let mut cmd = cargo();
+        cmd.arg("test").arg("--package").arg(package);
+        util::run(&mut cmd, &format!("cargo test ({package})"))?;
+    }
+
+    // Пользовательские программы собираются под обе архитектуры вместе с ядром
+    // (см. `build_user_programs`), но `check` их до сих пор не трогал: ошибка в
+    // программе всплывала только при полной сборке образа. С появлением `pkg`,
+    // `init` и служб программ стало восемнадцать, и это перестало быть мелочью.
+    for &arch in arches {
+        let mut cmd = cargo();
+        cmd.arg("check")
+            .arg("--package")
+            .arg("user-progs")
+            .arg("--bins")
+            .arg("--target")
+            .arg(user_triple(arch))
+            .arg("-Zbuild-std=core,compiler_builtins")
+            .arg("-Zbuild-std-features=compiler-builtins-mem");
+        util::run(&mut cmd, &format!("cargo check (user-progs, {})", user_triple(arch)))?;
+    }
 
     Ok(())
 }

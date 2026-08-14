@@ -240,7 +240,7 @@ fn execute(
         initrd: true,
         installer: scenario.target.needs_installer(),
     })?;
-    let drives = prepare_drives(scenario.target, &built, arch)?;
+    let drives = prepare_drives(scenario, &built, arch)?;
 
     // Слушаем мы, подключается QEMU: порт 0 отдаёт свободный номер, и гонки за
     // фиксированный порт с другим процессом на машине не существует.
@@ -629,6 +629,17 @@ fn press_button(qmp: Option<&mut qmp::Qmp>, hmp: &mut monitor::Monitor, down: bo
     }
 }
 
+/// Размер диска, который стенд подсовывает установщику.
+///
+/// Два гигабайта, а не один: с фазы 32 разделов четыре — ESP на полгигабайта и
+/// три равные доли под два корневых слота и состояние. На гигабайтном диске
+/// слоты вышли бы по полторы сотни мегабайт, то есть меньше образа системы,
+/// который в них предстоит записать.
+///
+/// Файл разрежённый: `set_len` не занимает места, пока в него не пишут, и
+/// лишний гигабайт ничего не стоит ни на диске, ни во времени прогона.
+const TARGET_DISK_MIB: u64 = 2048;
+
 /// Диск, на который ставил установщик.
 fn prepare_installed_disk(arch: Arch) -> Result<PathBuf> {
     let disk = paths::target_disk(arch);
@@ -644,18 +655,47 @@ fn prepare_installed_disk(arch: Arch) -> Result<PathBuf> {
 }
 
 /// Носители машины для сценария.
-fn prepare_drives(target: Target, built: &build::Built, arch: Arch) -> Result<Vec<Drive>> {
-    let drives = match target {
+fn prepare_drives(
+    scenario: &Scenario,
+    built: &build::Built,
+    arch: Arch,
+) -> Result<Vec<Drive>> {
+    let drives = match scenario.target {
         Target::Live => vec![Drive::HostDirectory(qemu::prepare_esp(built)?)],
         Target::Image => vec![Drive::Image(image::build(built, image::Kind::System)?)],
         Target::Installer => vec![
             // Порядок важен: прошивка перебирает носители в порядке подключения,
             // и загрузочный раздел на этот момент есть только у первого.
             Drive::Image(image::build(built, image::Kind::Installer)?),
-            Drive::Image(image::prepare_target(arch, 1024, true)?),
+            Drive::Image(image::prepare_target(arch, TARGET_DISK_MIB, true)?),
         ],
         Target::Iso => vec![Drive::Cdrom(image::build_iso(built, image::Kind::System)?)],
-        Target::Installed => vec![Drive::Image(prepare_installed_disk(arch)?)],
+        Target::Installed => {
+            let disk = prepare_installed_disk(arch)?;
+            // Обновление кладётся в образ **до** запуска — так же, как человек
+            // положил бы его туда с флешки. Почему не через установочный
+            // носитель, сказано в заголовке `crate::diskfile`.
+            if scenario.updates {
+                let (Some(kernel), Some(initrd)) =
+                    (built.get(crate::arch::Component::Kernel), built.initrd())
+                else {
+                    bail!("сценарию с обновлением нужны собранные ядро и initrd");
+                };
+                let programs: Vec<(&'static str, PathBuf)> = built
+                    .programs()
+                    .map(|(name, path)| (name, path.to_path_buf()))
+                    .collect();
+                crate::package::place_updates(
+                    &disk,
+                    arch,
+                    built.release,
+                    kernel,
+                    initrd,
+                    &programs,
+                )?;
+            }
+            vec![Drive::Image(disk)]
+        }
         // Порядок обязателен: прошивка грузится с первого носителя, а второй —
         // тот, ради которого сценарий существует.
         Target::LiveAndDisk => vec![

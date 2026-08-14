@@ -103,6 +103,39 @@ pub const FREEOS_ROOT_TYPE: Guid = Guid::new(
     [0x9E, 0x6A, 0x1B, 0x84, 0xC2, 0xD5, 0xA7, 0x30],
 );
 
+/// Тип раздела: второй слот корневой ФС.
+///
+/// **Отдельный тип, а не имя раздела.** Слоты можно было бы различать по полю
+/// `name` в записи GPT — так делает спецификация Discoverable Partitions, — но
+/// имя там 36 символов UTF-16, то есть строка, которую надо разбирать, сравнивать
+/// без учёта регистра и объяснять. Тип — шестнадцать байт, которые либо совпали,
+/// либо нет; ядро уже умеет искать раздел по типу, и второй слот не потребовал
+/// ни строчки нового кода поиска.
+///
+/// Цена решения названа честно: слотов ровно два и третьего не будет без нового
+/// GUID. Третий слот никому не нужен — A/B существует затем, чтобы всегда был
+/// **один** проверенный запасной, а не архив версий.
+pub const FREEOS_ROOT_B_TYPE: Guid = Guid::new(
+    0x0F7B_3A4E,
+    0x2C58,
+    0x4D92,
+    [0x9E, 0x6A, 0x1B, 0x84, 0xC2, 0xD5, 0xA7, 0x30],
+);
+
+/// Тип раздела: состояние системы — `/etc`, `/home`, `/var`, `/opt`.
+///
+/// Отдельный раздел, а не каталог внутри корня, и это главное решение фазы 32:
+/// система заменяется целиком и откатывается целиком, а состояние обязано
+/// пережить обе операции. Пока `/etc` лежал внутри корня, «обновить систему»
+/// означало «потерять настройки», и никакой аккуратностью обновления это не
+/// лечится — лечится только тем, что обновлению нечего там перезаписывать.
+pub const FREEOS_STATE_TYPE: Guid = Guid::new(
+    0x0F7B_3A4E,
+    0x2C58,
+    0x4D93,
+    [0x9E, 0x6A, 0x1B, 0x84, 0xC2, 0xD5, 0xA7, 0x30],
+);
+
 /// Атрибут записи: «не трогать» (bit 0, Required Partition).
 pub const ATTR_REQUIRED: u64 = 1 << 0;
 
@@ -154,23 +187,47 @@ impl Range {
     }
 }
 
+/// Какую раскладку планировать.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheme {
+    /// Один системный раздел EFI и больше ничего.
+    ///
+    /// Так устроен образ, который собирает `xtask image`: корневой ФС у него
+    /// нет, и пустой раздел под неё был бы враньём.
+    EspOnly,
+    /// ESP и один корень — раскладка установленной системы до фазы 32.
+    ///
+    /// Остаётся ради того, чтобы её можно было прочитать: диск, размеченный
+    /// прежним установщиком, никуда не делся, и планировать такую заново незачем
+    /// — а вот проверять планировщик на ней есть чем.
+    SingleRoot,
+    /// ESP, два корневых слота и раздел состояния.
+    ///
+    /// Разделение — по «система против состояния», а не по «одна ФС против
+    /// другой»: система заменяется и откатывается целиком, состояние переживает
+    /// обе операции. Корни равны по размеру намеренно: образ, поместившийся в
+    /// один слот, обязан помещаться и во второй, иначе откат оказался бы
+    /// возможен не всегда.
+    Slots,
+}
+
 /// Раскладка разделов на носителе.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub esp: Range,
-    /// Корневой раздел. `None`, если места на него не осталось или он не
+    /// Корневой раздел — он же слот A. `None`, если места не осталось или он не
     /// запрашивался.
     pub root: Option<Range>,
+    /// Второй слот. `None` во всех схемах, кроме [`Scheme::Slots`].
+    pub root_b: Option<Range>,
+    /// Раздел состояния. `None` во всех схемах, кроме [`Scheme::Slots`].
+    pub state: Option<Range>,
 }
 
-/// Спланировать раскладку: ESP заданного размера, следом — корневой раздел на
-/// всё оставшееся место.
+/// Спланировать раскладку: ESP заданного размера, следом — то, что просит схема.
 ///
-/// `esp_bytes` округляется вверх до выравнивания. `want_root` = `false` даёт
-/// носитель с одним ESP — так устроен образ, который собирает `xtask image`:
-/// корневой ФС у системы пока нет, и пустой раздел под неё в образе,
-/// предназначенном для запуска, был бы враньём.
-pub fn plan(sector_count: u64, sector: usize, esp_bytes: u64, want_root: bool) -> Result<Layout> {
+/// `esp_bytes` округляется вверх до выравнивания.
+pub fn plan(sector_count: u64, sector: usize, esp_bytes: u64, scheme: Scheme) -> Result<Layout> {
     let first_usable = first_usable_lba(sector);
     let backup = backup_sectors(sector);
     let alignment = alignment_sectors(sector);
@@ -193,34 +250,55 @@ pub fn plan(sector_count: u64, sector: usize, esp_bytes: u64, want_root: bool) -
         return Err(Error::TooSmall);
     }
 
-    let root = if want_root {
-        let root_first = align_up(esp_last + 1, alignment);
-        // Раздел меньше выравнивания смысла не имеет: под ФС там всё равно
-        // ничего не разместить, а запись в таблице появится и будет вводить в
-        // заблуждение.
-        if root_first + alignment <= last_usable {
-            Some(Range {
-                first_lba: root_first,
-                last_lba: last_usable,
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let esp = Range { first_lba: esp_first, last_lba: esp_last };
+    let mut layout = Layout { esp, root: None, root_b: None, state: None };
 
-    Ok(Layout {
-        esp: Range {
-            first_lba: esp_first,
-            last_lba: esp_last,
-        },
-        root,
-    })
+    match scheme {
+        Scheme::EspOnly => {}
+        Scheme::SingleRoot => {
+            let first = align_up(esp_last + 1, alignment);
+            // Раздел меньше выравнивания смысла не имеет: под ФС там всё равно
+            // ничего не разместить, а запись в таблице появится и будет вводить
+            // в заблуждение.
+            if first + alignment <= last_usable {
+                layout.root = Some(Range { first_lba: first, last_lba: last_usable });
+            }
+        }
+        Scheme::Slots => {
+            let first = align_up(esp_last + 1, alignment);
+            if first + alignment > last_usable {
+                return Err(Error::TooSmall);
+            }
+            let available = last_usable - first + 1;
+            // Треть на каждый корень, остаток — состоянию. Не поровну на три:
+            // остаток от выравнивания обязан достаться **состоянию**, потому
+            // что корни должны быть равны друг другу, а состояние — никому.
+            let slot = align_down(available / 3, alignment);
+            if slot < alignment {
+                return Err(Error::TooSmall);
+            }
+            let root_a = Range { first_lba: first, last_lba: first + slot - 1 };
+            let b_first = root_a.last_lba + 1;
+            let root_b = Range { first_lba: b_first, last_lba: b_first + slot - 1 };
+            let state_first = root_b.last_lba + 1;
+            if state_first + alignment > last_usable {
+                return Err(Error::TooSmall);
+            }
+            layout.root = Some(root_a);
+            layout.root_b = Some(root_b);
+            layout.state = Some(Range { first_lba: state_first, last_lba: last_usable });
+        }
+    }
+
+    Ok(layout)
 }
 
 const fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
+}
+
+const fn align_down(value: u64, alignment: u64) -> u64 {
+    value / alignment * alignment
 }
 
 /// Затереть всё, что на носителе выглядело разметкой.
@@ -621,7 +699,8 @@ mod tests {
     }
 
     fn write_sample(dev: &mut MemDisk) -> Layout {
-        let layout = plan(dev.sector_count(), SECTOR, 16 * 1024 * 1024, true).expect("раскладка");
+        let layout = plan(dev.sector_count(), SECTOR, 16 * 1024 * 1024, Scheme::SingleRoot)
+            .expect("раскладка");
         let root = layout.root.expect("корневой раздел помещается");
         wipe(dev).expect("затирание");
         write(
@@ -652,7 +731,7 @@ mod tests {
 
     #[test]
     fn layout_is_aligned_and_ordered() {
-        let layout = plan(DISK_SECTORS, SECTOR, 16 * 1024 * 1024, true).expect("раскладка");
+        let layout = plan(DISK_SECTORS, SECTOR, 16 * 1024 * 1024, Scheme::SingleRoot).expect("раскладка");
         let root = layout.root.expect("корневой раздел");
         assert_eq!(layout.esp.first_lba % alignment_sectors(SECTOR), 0);
         assert_eq!(root.first_lba % alignment_sectors(SECTOR), 0);
@@ -663,16 +742,50 @@ mod tests {
 
     #[test]
     fn single_partition_layout_has_no_root() {
-        let layout = plan(DISK_SECTORS, SECTOR, 16 * 1024 * 1024, false).expect("раскладка");
+        let layout = plan(DISK_SECTORS, SECTOR, 16 * 1024 * 1024, Scheme::EspOnly).expect("раскладка");
         assert!(layout.root.is_none());
+    }
+
+    /// Слоты обязаны быть **равны**: образ, поместившийся в один, обязан
+    /// помещаться и во второй, иначе откат оказался бы возможен не всегда — и
+    /// выяснилось бы это ровно тогда, когда откатываться уже нужно.
+    #[test]
+    fn both_slots_are_the_same_size() {
+        let layout = plan(DISK_SECTORS, SECTOR, 8 * 1024 * 1024, Scheme::Slots).expect("раскладка");
+        let (a, b, state) = (
+            layout.root.expect("слот A"),
+            layout.root_b.expect("слот B"),
+            layout.state.expect("состояние"),
+        );
+        assert_eq!(a.sectors(), b.sectors());
+        // Разделы идут подряд и не перекрываются: перекрытие означало бы, что
+        // запись во второй слот портит первый — то есть что откатываться некуда.
+        assert!(layout.esp.last_lba < a.first_lba);
+        assert_eq!(a.last_lba + 1, b.first_lba);
+        assert_eq!(b.last_lba + 1, state.first_lba);
+        assert_eq!(state.last_lba, DISK_SECTORS - 1 - backup_sectors(SECTOR));
+        for range in [a, b] {
+            assert_eq!(range.first_lba % alignment_sectors(SECTOR), 0);
+        }
+    }
+
+    /// Диск, на котором слотам не хватает места, отвергается **до** записи, а
+    /// не даёт раскладку с крошечным вторым слотом: половина схемы A/B хуже её
+    /// отсутствия, потому что выглядит работающей.
+    #[test]
+    fn a_disk_too_small_for_slots_is_rejected() {
+        assert_eq!(
+            plan(DISK_SECTORS, SECTOR, 60 * 1024 * 1024, Scheme::Slots),
+            Err(Error::TooSmall)
+        );
     }
 
     #[test]
     fn tiny_disk_is_rejected() {
-        assert_eq!(plan(64, SECTOR, 1024 * 1024, false), Err(Error::TooSmall));
+        assert_eq!(plan(64, SECTOR, 1024 * 1024, Scheme::EspOnly), Err(Error::TooSmall));
         // Носитель есть, но ESP запрошен больше него.
         assert_eq!(
-            plan(DISK_SECTORS, SECTOR, 512 * 1024 * 1024, false),
+            plan(DISK_SECTORS, SECTOR, 512 * 1024 * 1024, Scheme::EspOnly),
             Err(Error::TooSmall)
         );
     }
@@ -942,7 +1055,7 @@ mod sector4k_tests {
     #[test]
     fn partitions_a_4kn_disk() {
         let mut dev = disk_4k();
-        let layout = plan(SECTORS_4K, SECTOR_4K, 16 * 1024 * 1024, true).expect("раскладка");
+        let layout = plan(SECTORS_4K, SECTOR_4K, 16 * 1024 * 1024, Scheme::SingleRoot).expect("раскладка");
         let root = layout.root.expect("корневой раздел");
         // Границы выровнены на мегабайт, а не на 2048 секторов.
         assert_eq!(layout.esp.first_lba % alignment_sectors(SECTOR_4K), 0);

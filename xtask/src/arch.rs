@@ -272,6 +272,12 @@ pub const PAYLOAD_INITRD: &str = "FREEOS/INITRD.IMG";
 /// остальной полезной нагрузки: он открывает ровно эти пути.
 pub const PAYLOAD_BIN_DIR: &str = "FREEOS/BIN";
 
+/// Каталог образцовых пакетов на установочном носителе.
+///
+/// Отдельно от `/bin`: пакеты не программы, их не запускают, а ставят — и на
+/// целевом диске они ложатся в `/media`, а не в `/bin`.
+pub const PAYLOAD_PKG_DIR: &str = "FREEOS/PKG";
+
 impl fmt::Display for Component {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.package())

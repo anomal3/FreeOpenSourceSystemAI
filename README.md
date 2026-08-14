@@ -1296,6 +1296,118 @@ POSIX `rename` silently replacing the destination is exactly where a program
 loses a file it did not know about, and it refuses to move a *directory* to a
 different parent, because `..` lives inside it.
 
+### Packages
+
+`.fpk` is a container: a header with a fixed place for a signature, a text
+manifest, and the payload. The signature slot is empty and will stay empty until
+there is something to check it with — but it is in the header **now**, because
+adding it later would move the manifest, and that is a second format rather than
+a new field.
+
+`pkg install /media/hello-1.0.fpk` is a program, not a shell command, and that is
+the whole argument for where the line between the two runs. Installing a package
+needs no device register, no sector outside a filesystem and no privilege beyond
+the one the person at the terminal already has: it reads a file and lays its
+contents out in directories. `fsck` and `sysupdate` live in the shell for the
+opposite reason — they work past the filesystem, on raw partitions and on an ESP
+nobody mounted.
+
+Packages go to `/opt/<name>`, never into `/bin` or `/usr`. From Phase 32 the root
+is mounted read-only and is replaced wholesale by an update; a package written
+inside it would disappear at the first update, silently. `/opt` lives on the
+state partition, which updates do not touch. The record of what was installed
+lives beside it in `/var/lib/pkg/<name>.pkg`, and it is the **manifest verbatim**
+— not a digest of it. Removing and verifying have to act on exactly what was put
+there, and a second description of the same thing drifts from the first by
+exactly as much as the two get edited separately.
+
+`pkg verify` checks length and CRC of every file. Length alone would be a
+comforting lie: the interesting tampering is a program replaced by another
+program, which is the same size often enough. The bench proves both halves — one
+file is changed to a different length, another to the *same* length.
+
+Two things are deliberately absent. There is no compression: it would mean a
+decompressor inside a program with no heap, for containers that today are copied
+from a stick rather than fetched over a link that does not exist yet. And there
+is no dependency resolution — the manifest carries `requires`, `install` refuses
+to lay a package on top of missing ones, but there is nowhere to look for them.
+
+### Two systems on one disk
+
+The disk stopped being "ESP plus root". It is now ESP, **two** roots and state:
+
+```
+ESP (FAT32)      bootloader, kernel-a/-b, initrd-a/-b, the slot record
+root_a (ext2)    the system; mounted read-only while it runs
+root_b (ext2)    the other slot, the same size to the sector
+state  (ext2)    /etc, /home, /root, /var, /opt
+```
+
+The split is by "system versus state", not by "one filesystem versus another".
+The system is replaced whole and rolls back whole; state survives both. While
+`/etc` lived inside the root, "update the system" meant "lose the settings", and
+no amount of care in the updater fixes that — only having nothing there to
+overwrite does.
+
+The root being read-only is not caution either. A system that writes into its own
+root differs from the image that was put there, and rolling back to the previous
+slot stops being a return to a known state.
+
+`\FREEOS\SLOTS.CFG` on the ESP says which slot is active, how many attempts it
+has left, and which one to come back to. The bootloader reads it, spends an
+attempt and writes it back **before** loading anything: a counter decremented
+after the kernel starts would not be decremented at all in the one case it exists
+for. The system confirms the boot late — after the root is mounted and the screen
+is handed to the compositor — because a slot with an intact kernel and a ruined
+root starts perfectly well and is a system with nothing in it.
+
+The roadmap asked for that record to be updated by writing a temporary file and
+renaming it. It is written in place instead, and the reasoning is in
+`crates/slots/src/lib.rs`: renaming on FAT32 touches two directory entries, the
+FAT and FSInfo, so a power cut in the middle damages the *filesystem*, not just
+our file. The file is two sectors — a record and its spare, each with its own
+checksum — and updating it writes the spare, flushes, then writes the primary.
+Whatever the moment power goes, at least one copy is whole and describes either
+the old state or the new one, never a mixture. Both halves of that are proven by
+`cargo test -p slots`, without an emulator: three failed attempts and a rollback
+are arithmetic, and arithmetic is cheaper to check in a test than in four boots.
+
+`sysupdate apply <file>` writes the root image into the **inactive** partition,
+then the kernel and initrd into that slot's files on the ESP, and only then moves
+the pointer. Every step before the last can be interrupted at no cost. The
+initrd travels with the kernel rather than being shared, because programs in
+`/bin` and the kernel are bound by system-call numbers, and a rollback that left
+the new programs beside the old kernel would break silently.
+
+### Services
+
+Two things were missing before a service could exist, and the ideology section
+explains why they had to come before the network rather than after it.
+
+The first is starting a program from a program: `SYS_SPAWN` and `SYS_WAIT`. No
+`fork` — the only reason to copy an address space is to `exec` over it, and
+`exec` is the whole of this call. The child inherits no file descriptors either,
+which avoids having to decide what a shared file offset means for two tasks.
+
+The second is `/bin/init`, which reads `/etc/services` and puts back what dies.
+It restarts after half a second, because a service that crashes instantly would
+otherwise eat the machine, and it **stops** after three consecutive failures,
+because restarting a broken service forever is not resilience — it is hiding the
+fault behind a log line that repeats. The counter resets once a service has been
+alive for ten seconds: three crashes in a minute and three crashes in three
+months are different events.
+
+A service runs as whoever its description says, not as whoever started it.
+`SYS_SPAWN` lets anyone lower privilege and nobody raise it, so the supervisor —
+which runs as root, or it could start nothing but its own — cannot smuggle root
+into a service that asked for a user. A line with no `uid` means "the same as the
+supervisor", which is not the same as root, and the difference shows the moment a
+person runs `init` themselves.
+
+`SYS_WAIT` has a non-blocking form, and that is not a convenience. Blocking waits
+on **one** task; a supervisor asleep on the first service would not notice the
+second one dying until the first did.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -1565,9 +1677,9 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 29 | A keyboard for a program: descriptor 0, and a terminal that understands ANSI | **done** |
 | 29a | Vector and FP registers belong to a task, so two computing programs cannot see each other's numbers | **done** |
 | 30 | `mc`: a two-pane file manager that is a program, not a part of the kernel | **done** |
-| 31 | Packages and a record of them: a format, a database, install and remove | planned |
-| 32 | Updating the system by slots: two roots, state on its own partition, and a rollback nobody has to ask for | planned |
-| 33 | Services: `spawn`/`wait` and a supervisor, so a crashed daemon comes back and the system never notices | planned |
+| 31 | Packages and a record of them: a format, a database, install and remove | **done** |
+| 32 | Updating the system by slots: two roots, state on its own partition, and a rollback nobody has to ask for | **done** |
+| 33 | Services: `spawn`/`wait` and a supervisor, so a crashed daemon comes back and the system never notices | **done** |
 | 34 | virtio-net, Ethernet, ARP, IPv4, ICMP: the machine answers a ping | planned |
 | 35 | UDP, DHCP, DNS: the machine gets its own address, and the DHCP client is a service | planned |
 | 36 | TCP, and sockets for programs | planned |

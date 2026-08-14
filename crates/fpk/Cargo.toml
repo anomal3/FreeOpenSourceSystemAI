@@ -1,0 +1,20 @@
+[package]
+name = "fpk"
+description = "The FreeOS package container: header, manifest and payload, parsed the same way by the tooling, the installer, the kernel and the programs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[features]
+# Сборка пакета нужна только `xtask`, и она единственная требует кучи. Разбор
+# обходится без неё намеренно: разбирать пакет приходится программе вне ядра, а
+# там аллокатора нет вовсе.
+default = []
+build = []
+
+[lints]
+workspace = true

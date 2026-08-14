@@ -99,6 +99,13 @@ pub enum Error {
     ReadOnly,
     /// На носителе нет действующей таблицы разделов GPT.
     NotPartitioned,
+    /// Том не похож на FAT32: подпись, поля BPB или число кластеров не те.
+    NotFat32,
+    /// Такого файла или каталога на томе нет.
+    NotFound,
+    /// Структуры тома противоречат сами себе: цепочка кластеров уводит за
+    /// пределы тома либо в служебные записи.
+    Corrupt,
 }
 
 impl fmt::Display for Error {
@@ -117,6 +124,9 @@ impl fmt::Display for Error {
             Error::NotADirectory => f.write_str("a path component exists but is not a directory"),
             Error::ReadOnly => f.write_str("the block device is read-only"),
             Error::NotPartitioned => f.write_str("no valid GPT partition table on this device"),
+            Error::NotFat32 => f.write_str("this volume is not FAT32"),
+            Error::NotFound => f.write_str("no such file or directory on the volume"),
+            Error::Corrupt => f.write_str("the volume structures contradict each other"),
         }
     }
 }
@@ -178,7 +188,7 @@ pub fn check_device(dev: &dyn BlockDevice) -> Result<()> {
 /// Нужно в двух местах: под каталоги FAT (запись каталога обязана быть нулевой,
 /// иначе мусор в первом байте выглядит как имя файла) и при затирании чужой
 /// разметки.
-pub(crate) fn zero_sectors(dev: &mut dyn BlockDevice, lba: u64, count: u64) -> Result<()> {
+pub fn zero_sectors(dev: &mut dyn BlockDevice, lba: u64, count: u64) -> Result<()> {
     /// Сколько байт писать за один вызов.
     ///
     /// Считается в байтах, а не в секторах: при секторе 4096 шестнадцать

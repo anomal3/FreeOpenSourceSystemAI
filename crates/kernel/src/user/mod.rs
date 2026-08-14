@@ -74,7 +74,7 @@ use alloc::vec::Vec;
 
 use crate::mm::{FrameAllocator, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 use crate::sync::Mutex;
-use crate::vfs::perm::Access;
+use crate::vfs::perm::{Access, Credentials};
 use crate::{arch, kprintln, sched};
 
 use space::Space;
@@ -178,6 +178,15 @@ pub struct Program {
     /// — на границе возврата в третье кольцо, где заведомо нет ни удерживаемого
     /// лока, ни половины начатой работы.
     kill_requested: bool,
+    /// От чьего имени исполняется **эта** программа.
+    ///
+    /// С Phase 33 личность перестала быть свойством системы и стала свойством
+    /// программы. Причина конкретная: супервизор служб исполняется от root, а
+    /// служба — от того, кто записан в её описании, и общая на всех личность
+    /// сеанса сделала бы это описание украшением. Отсюда же следует, что
+    /// проверка прав в системном вызове обязана спрашивать **программу**, а не
+    /// сеанс, — см. [`credentials`].
+    cred: Credentials,
 }
 
 /// Программы по слотам задач планировщика.
@@ -205,6 +214,23 @@ pub fn with_current<R>(f: impl FnOnce(&mut Program) -> R) -> Option<R> {
 #[must_use]
 pub fn current_space_root() -> Option<PhysAddr> {
     with_current(|program| program.space.root())
+}
+
+/// От чьего имени исполняется то, что просит ядро прямо сейчас.
+///
+/// Личность **программы**, а не сеанса, и это разные вещи с Phase 33: службу
+/// запускает супервизор от root, а исполняется она от своего пользователя. Все
+/// проверки прав в системных вызовах спрашивают отсюда.
+///
+/// Сеанс остаётся ответом по умолчанию — для задач ядра, у которых программы
+/// нет вовсе: оболочка, чтение `/etc/passwd` при загрузке, файловый менеджер до
+/// того, как стал программой. Личность сеанса тоже спрашивается, а не
+/// подставляется root: у кода в кольце ноль права всё равно ничего не отнимут,
+/// но `echo > /root/x` от имени обычного пользователя обязан получить тот же
+/// отказ, что и программа.
+#[must_use]
+pub fn credentials() -> Credentials {
+    with_current(|program| program.cred).unwrap_or_else(session::credentials)
 }
 
 /// Виртуальный адрес кадра в прямом отображении — через него ядро пишет в
@@ -502,13 +528,17 @@ fn report(space: &Space, entry: usize) {
 /// Загрузить программу по пути и исполнить её в текущей задаче.
 ///
 /// Возвращает код, с которым программа завершилась.
-fn run(path: &str, args: &[&str]) -> Result<i64, Error> {
+fn run(path: &str, args: &[&str], cred: Credentials) -> Result<i64, Error> {
     // Право исполнить спрашивается до чтения файла, и спрашивается от имени
-    // сеанса. Это тот же вопрос, который в Unix задаёт `execve`, и задавать его
-    // обязано ядро: программа, которой не дали бы прочитать файл, не должна
-    // получать его в виде исполняемого кода. Отсюда же и [`Access::SEARCH`] на
-    // самом файле — бит `x`, а не `r`.
-    let cred = session::credentials();
+    // **той личности, с которой программа будет исполняться**. Это тот же
+    // вопрос, который в Unix задаёт `execve`, и задавать его обязано ядро:
+    // программа, которой не дали бы прочитать файл, не должна получать его в
+    // виде исполняемого кода. Отсюда же и [`Access::SEARCH`] на самом файле —
+    // бит `x`, а не `r`.
+    //
+    // Порядок здесь имеет значение: спросить от имени запускающего, а
+    // исполнить от имени другого — это ровно та дыра, ради закрытия которой
+    // права запуска и стали свойством программы.
     let node = match crate::fs::resolve_as(cred, path, Access::SEARCH) {
         Some(Ok(node)) => node,
         Some(Err(err)) => return Err(Error::Read(err)),
@@ -550,6 +580,7 @@ fn run(path: &str, args: &[&str]) -> Result<i64, Error> {
             files: files::Table::new(),
             running: true,
             kill_requested: false,
+            cred,
         });
     }
 
@@ -620,6 +651,12 @@ const PROGRAM_STACK_SIZE: usize = 64 * 1024;
 struct Request {
     line: [u8; MAX_LINE],
     len: usize,
+    /// От чьего имени исполнять. Едет вместе со строкой, а не спрашивается в
+    /// новой задаче: спросить там значило бы спросить у **её** программы,
+    /// которой ещё нет, и получить личность сеанса вместо заказанной.
+    cred: Credentials,
+    /// Считать ли новую задачу служебной — см. [`spawn_with`].
+    daemon: bool,
 }
 
 /// Самая длинная командная строка, которую принимает [`spawn`].
@@ -639,7 +676,22 @@ const MAX_ARGS: usize = 8;
 /// перестала быть вызовом внутри оболочки: у неё своя задача, свой стек ядра,
 /// своё адресное пространство и свои открытые файлы, и пока она считает,
 /// оболочка отвечает.
-pub fn spawn(line: &str) -> Result<sched::TaskId, Error> {
+pub fn spawn(line: &str, cred: Credentials) -> Result<sched::TaskId, Error> {
+    spawn_with(line, cred, false)
+}
+
+/// То же, но задача объявляется служебной.
+///
+/// Служебная задача не считается [`sched::alive`] — то есть не удерживает
+/// систему от остановки и не заставляет оболочку ждать. Ровно это и есть
+/// служба: она работает, пока работает система, и сама по себе поводом ей
+/// работать не является.
+///
+/// Без этого различия первая же служба сломала бы две вещи сразу: оболочка
+/// ждёт, пока договорят остальные задачи, прежде чем напечатать приглашение, а
+/// `exit` останавливает машину, когда живых задач не осталось. Служба,
+/// работающая вечно, отменила бы и то и другое.
+pub fn spawn_with(line: &str, cred: Credentials, daemon: bool) -> Result<sched::TaskId, Error> {
     if line.len() > MAX_LINE {
         return Err(Error::Read(crate::vfs::VfsError::BadPath));
     }
@@ -651,14 +703,19 @@ pub fn spawn(line: &str) -> Result<sched::TaskId, Error> {
     if raw.is_null() {
         return Err(Error::OutOfMemory);
     }
-    let mut request = Request { line: [0; MAX_LINE], len: line.len() };
+    let mut request = Request { line: [0; MAX_LINE], len: line.len(), cred, daemon };
     request.line[..line.len()].copy_from_slice(line.as_bytes());
     // SAFETY: блок только что выделен под `Request` с нужными размером и
     // выравниванием и никому больше не принадлежит.
     unsafe { core::ptr::write(raw, request) };
 
     match sched::spawn_raw("program", PROGRAM_STACK_SIZE, program_entry, raw as usize) {
-        Ok(id) => Ok(id),
+        Ok(id) => {
+            if daemon {
+                sched::mark_daemon(id);
+            }
+            Ok(id)
+        }
         Err(err) => {
             // Задачи не будет — значит некому и разобрать запрос.
             // SAFETY: блок выделен этим же аллокатором и этим же `Layout`,
@@ -682,6 +739,15 @@ extern "C" fn program_entry(arg: usize) -> ! {
     // SAFETY: `arg` — указатель, выделенный в `spawn` и переданный ровно один
     // раз ровно этой задаче.
     let request = unsafe { alloc::boxed::Box::from_raw(arg as *mut Request) };
+    let cred = request.cred;
+    // Задача помечает себя служебной сама, хотя это же сделал и [`spawn_with`].
+    // Дублирование не лишнее: пометка снаружи успевает не всегда — между
+    // возвратом `spawn_raw` и ней задачу могут вытеснить, — а всё, что эта
+    // задача запустит дальше, наследует признак по **её** состоянию. Пометка
+    // изнутри стоит одного взятия лока и закрывает эту щель целиком.
+    if request.daemon {
+        sched::mark_daemon(sched::current());
+    }
     let line = core::str::from_utf8(&request.line[..request.len]).unwrap_or("");
 
     // Разбор здесь, а не в `spawn`: срезы указывают внутрь `request`, который
@@ -705,7 +771,7 @@ extern "C" fn program_entry(arg: usize) -> ! {
         argc += 1;
     }
 
-    let code = match run(path, &args[..argc]) {
+    let code = match run(path, &args[..argc], cred) {
         Ok(code) => {
             if code == user_abi::EXIT_KILLED {
                 report_line(path, "killed by request");
@@ -849,12 +915,19 @@ pub fn request_kill(id: sched::TaskId) -> Result<(), KillError> {
     match table.get_mut(slot).and_then(Option::as_mut) {
         Some(program) => {
             program.kill_requested = true;
-            // Программа могла спать в чтении с терминала, а снятие происходит
-            // на возврате в третье кольцо — то есть спящая не снялась бы, пока
-            // кто-нибудь не наберёт ей строку. Пробуждение здесь и делает
-            // `Ctrl+C` работающим на программе, которая ничего не ждёт, кроме
-            // ввода.
+            // Программа могла спать, а снятие происходит на возврате в третье
+            // кольцо — то есть спящая не снялась бы, пока не проснётся сама.
+            // Пробуждение здесь и делает `kill` работающим на программе,
+            // которая ничего не делает.
+            //
+            // Двух вызовов, а не одного: `wake_input` будит **всех**, кто ждёт
+            // ввода, — это нужно оболочке, чтобы она разобрала очередь и
+            // заметила снятие. `wake` будит именно снимаемую, чем бы она ни
+            // была занята: `sleep_ms` в службе, отзывающейся раз в полминуты,
+            // иначе откладывал бы снятие на полминуты, и `kill` выглядел бы как
+            // команда, которая не работает. Ровно так это и выглядело.
             sched::wake_input();
+            sched::wake(id);
             Ok(())
         }
         None => Err(KillError::NotAProgram),

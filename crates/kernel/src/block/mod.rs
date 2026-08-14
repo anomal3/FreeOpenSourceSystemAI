@@ -25,19 +25,25 @@
 //! # Чего здесь нет
 //!
 //! Ни кеша, ни очереди запросов, ни разделения на «устройство» и «раздел» как
-//! на отдельные объекты. Раздел здесь — это пара «носитель и его первый
-//! сектор», и этого достаточно, пока смонтированная файловая система одна.
-//! Заготовка под таблицу монтирования была бы кодом без потребителя — а по
-//! правилу дома непроверенный код, который пишет на диск, хуже отсутствующего.
+//! на отдельные объекты. Раздел здесь — это тройка «носитель, его первый сектор
+//! и тип из GPT».
+//!
+//! Единственное, что появилось с фазы 32, — [`Shared`]: носитель больше не
+//! достаётся первому нашедшему целиком. На одном диске теперь живут корень
+//! слота, раздел состояния и ESP, и все три нужны системе одновременно.
 
 pub mod ahci;
 pub mod nvme;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+use disk::BlockDevice as _;
 
 use crate::kprintln;
 use crate::pci;
+use crate::sync::Mutex;
 use crate::virtio;
 
 /// Каким проводом подключён носитель.
@@ -176,10 +182,81 @@ impl disk::BlockDevice for Counted {
     }
 }
 
+/// Носитель, которым пользуются несколько потребителей сразу.
+///
+/// # Зачем понадобился
+///
+/// С фазы 32 на одном диске живут четыре раздела, и три из них нужны системе
+/// одновременно: корень слота, раздел состояния и ESP, куда пишется
+/// подтверждение загрузки. Прежний порядок — «нашли раздел, забрали диск себе»
+/// — работал ровно до тех пор, пока раздел был один.
+///
+/// Отдавать каждому потребителю свой драйвер нельзя: у контроллера одна очередь
+/// запросов, и две независимые копии драйвера поверх неё — это два хозяина у
+/// одного кольца дескрипторов. Поэтому драйвер один, а замок вокруг него общий.
+///
+/// # Порядок замков
+///
+/// Всегда «сначала файловая система, потом носитель». Цикла не возникает,
+/// потому что обратного порядка не существует: носитель не знает ни об одной
+/// файловой системе и ничего у них не спрашивает.
+pub struct Shared {
+    inner: Arc<Mutex<Counted>>,
+}
+
+impl Shared {
+    #[must_use]
+    pub fn new(device: Box<dyn disk::BlockDevice + Send>) -> Self {
+        Self { inner: Arc::new(Mutex::new(Counted::new(device))) }
+    }
+
+    /// Сколько раз обращались к носителю — суммарно, всеми, кто его делит.
+    #[must_use]
+    pub fn requests(&self) -> u64 {
+        self.inner.lock().requests()
+    }
+}
+
+impl Clone for Shared {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+impl disk::BlockDevice for Shared {
+    fn sector_size(&self) -> u32 {
+        self.inner.lock().sector_size()
+    }
+
+    fn sector_count(&self) -> u64 {
+        self.inner.lock().sector_count()
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.inner.lock().is_read_only()
+    }
+
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> disk::Result<()> {
+        self.inner.lock().read(lba, buf)
+    }
+
+    fn write(&mut self, lba: u64, buf: &[u8]) -> disk::Result<()> {
+        self.inner.lock().write(lba, buf)
+    }
+
+    fn flush(&mut self) -> disk::Result<()> {
+        self.inner.lock().flush()
+    }
+}
+
 /// Раздел: носитель и сектор, с которого он начинается.
 pub struct Partition {
-    pub device: Box<dyn disk::BlockDevice + Send>,
+    pub device: Shared,
     pub first_lba: u64,
+    /// Сколько секторов занимает раздел.
+    pub sectors: u64,
+    /// Тип раздела из GPT — по нему его и опознали.
+    pub type_guid: disk::guid::Guid,
     /// Откуда он взялся — для журнала.
     pub source: &'static str,
     pub unit: usize,
@@ -195,20 +272,26 @@ pub struct Partition {
 /// ошибка: у установочного носителя её и не должно быть. Сама причина при этом
 /// печатается — молчаливый пропуск и есть то, из-за чего «система не видит
 /// диск» превращается в вечер отладки.
-pub fn find_partition(disks: Vec<Disk>, type_guid: disk::guid::Guid) -> Option<Partition> {
-    for mut candidate in disks {
+pub fn scan(disks: Vec<Disk>) -> Vec<Partition> {
+    let mut found = Vec::new();
+
+    for candidate in disks {
         let name = candidate.kind.name();
-        let table = match disk::gpt::read(candidate.device.as_mut()) {
+        let unit = candidate.unit;
+        // Носитель оборачивается в общий замок **до** чтения таблицы: с этого
+        // момента им пользуются все, кому достанется хоть один его раздел.
+        let mut device = Shared::new(candidate.device);
+
+        let table = match disk::gpt::read(&mut device) {
             Ok(table) => table,
             Err(err) => {
-                kprintln!("  partitions  : {name} #{}: {err}", candidate.unit);
+                kprintln!("  partitions  : {name} #{unit}: {err}");
                 continue;
             }
         };
-        let sector = candidate.device.sector_size() as usize;
+        let sector = device.sector_size() as usize;
         kprintln!(
-            "  partitions  : {name} #{}: GPT {}, {} entries, {sector}-byte sectors",
-            candidate.unit,
+            "  partitions  : {name} #{unit}: GPT {}, {} entries, {sector}-byte sectors",
             table.disk_guid,
             table.partitions.len(),
         );
@@ -220,15 +303,37 @@ pub fn find_partition(disks: Vec<Disk>, type_guid: disk::guid::Guid) -> Option<P
                 partition.first_lba,
                 partition.name_string(),
             );
-        }
-        if let Some(found) = table.find(type_guid) {
-            return Some(Partition {
-                first_lba: found.first_lba,
+            if found.try_reserve(1).is_err() {
+                kprintln!("  partitions  : out of memory while listing partitions");
+                return found;
+            }
+            found.push(Partition {
+                first_lba: partition.first_lba,
+                sectors: partition.range().sectors(),
+                type_guid: partition.type_guid,
                 source: name,
-                unit: candidate.unit,
-                device: candidate.device,
+                unit,
+                device: device.clone(),
             });
         }
     }
-    None
+
+    found
+}
+
+/// Взять из списка раздел заданного типа.
+///
+/// Клон, а не изъятие: один и тот же диск обслуживает несколько разделов, и
+/// забрать его целиком под первый найденный — это ровно то, что перестало
+/// работать с появлением четырёх разделов.
+#[must_use]
+pub fn take(found: &[Partition], type_guid: disk::guid::Guid) -> Option<Partition> {
+    found.iter().find(|part| part.type_guid == type_guid).map(|part| Partition {
+        device: part.device.clone(),
+        first_lba: part.first_lba,
+        sectors: part.sectors,
+        type_guid: part.type_guid,
+        source: part.source,
+        unit: part.unit,
+    })
 }

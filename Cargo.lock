@@ -92,6 +92,7 @@ version = "0.1.0"
 dependencies = [
  "boot-info",
  "calendar",
+ "slots",
  "uefi",
 ]
 
@@ -243,6 +244,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
+name = "fpk"
+version = "0.1.0"
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -257,6 +262,7 @@ dependencies = [
  "disk",
  "ext2",
  "mini-ui",
+ "slots",
  "uefi",
 ]
 
@@ -275,8 +281,10 @@ dependencies = [
  "disk",
  "ext2",
  "font8x8",
+ "fpk",
  "linked_list_allocator",
  "mini-ui",
+ "slots",
  "usb-hid",
  "user-abi",
 ]
@@ -373,6 +381,10 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "slots"
+version = "0.1.0"
 
 [[package]]
 name = "strsim"
@@ -472,6 +484,7 @@ version = "0.1.0"
 name = "user-progs"
 version = "0.1.0"
 dependencies = [
+ "fpk",
  "user-abi",
 ]
 
@@ -503,7 +516,9 @@ dependencies = [
  "anyhow",
  "clap",
  "disk",
+ "ext2",
  "ext4-view",
  "fatfs",
+ "fpk",
  "png",
 ]

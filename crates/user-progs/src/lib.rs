@@ -22,11 +22,14 @@ use core::panic::PanicInfo;
 use user_abi::{
     ERR_BAD_PATH, FD_STDERR, FD_STDIN, FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID,
     SYS_GETUID, SYS_OPEN, SYS_READ, O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_READDIR,
-    SYS_REMOVE, SYS_RENAME, SYS_SEEK, SYS_SLEEP, SYS_STAT, SYS_TIME, SYS_TTYMODE, SYS_UPTIME,
-    SYS_WINSIZE, SYS_WRITE, SYS_YIELD, Stat, TTY_LINE, TTY_RAW,
+    SYS_REMOVE, SYS_RENAME, SYS_SEEK, SYS_SLEEP, SYS_SPAWN, SYS_STAT, SYS_TIME, SYS_TTYMODE,
+    SYS_UPTIME, SYS_WAIT, SYS_WINSIZE, SYS_WRITE, SYS_YIELD, SPAWN_INHERIT, Stat, TTY_LINE,
+    TTY_RAW, WAIT_NOHANG,
 };
 
-pub use user_abi::{Dirent, KIND_DIRECTORY, KIND_FILE, SEEK_CUR, SEEK_END, SEEK_SET};
+pub use user_abi::{
+    Dirent, ERR_AGAIN, ERR_NO_TASK, KIND_DIRECTORY, KIND_FILE, SEEK_CUR, SEEK_END, SEEK_SET,
+};
 
 /// Выполнить системный вызов.
 ///
@@ -174,6 +177,24 @@ pub fn mkdir(path: &str, mode: u32) -> i64 {
 pub fn remove(path: &str) -> i64 {
     // SAFETY: срез живёт в памяти программы, длина — его собственная.
     unsafe { syscall(SYS_REMOVE, path.as_ptr() as usize, path.len(), 0) }
+}
+
+/// Создать файл с заданными правами и открыть его на запись.
+///
+/// Отличается от [`open_write`] тем, что права выбирает программа, а не ядро, и
+/// тем, что занятое имя — отказ, а не «обрежу и открою». Нужно тому, кто
+/// раскладывает чужие файлы: программа, положенная без бита исполнения, не
+/// запустится, а положенная поверх существующей — испортит систему.
+pub fn create(path: &str, mode: u16) -> i64 {
+    // SAFETY: срез живёт в памяти программы, длина — его собственная.
+    unsafe {
+        syscall(
+            user_abi::SYS_CREATE,
+            path.as_ptr() as usize,
+            path.len(),
+            mode as usize,
+        )
+    }
 }
 
 /// Открыть файл на чтение. Отрицательный результат — код ошибки из `user_abi`.
@@ -553,6 +574,144 @@ pub fn time_now() -> u64 {
     // SAFETY: аргументов у вызова нет; результат — беззнаковое число.
     let value = unsafe { syscall(SYS_TIME, 0, 0, 0) };
     value.max(0) as u64
+}
+
+/// Запустить программу отдельной задачей и вернуть её номер.
+///
+/// `line` — путь и аргументы одной строкой, как их набирают в оболочке. Права
+/// достаются те же, что у запускающего; чтобы отдать другие, есть
+/// [`spawn_as`].
+pub fn spawn(line: &str) -> i64 {
+    // SAFETY: строка живёт в памяти программы, длина — её собственная.
+    unsafe { syscall(SYS_SPAWN, line.as_ptr() as usize, line.len(), SPAWN_INHERIT) }
+}
+
+/// То же, но от имени указанных `uid`/`gid`.
+///
+/// Снизить права вправе кто угодно, повысить — никто: ядро отвечает
+/// `ERR_PERMISSION`, если запускающий не root, а просят чужие.
+pub fn spawn_as(line: &str, uid: u32, gid: u32) -> i64 {
+    let who = ((uid as usize) << 32) | gid as usize;
+    // SAFETY: строка живёт в памяти программы, длина — её собственная.
+    unsafe { syscall(SYS_SPAWN, line.as_ptr() as usize, line.len(), who) }
+}
+
+/// Дождаться конца задачи и узнать её код возврата.
+///
+/// Останавливает программу до тех пор, пока та не закончится. `ERR_NO_TASK`
+/// означает, что ждать нечего: такой задачи нет — и это не то же самое, что
+/// «ещё работает».
+pub fn wait(task: i64) -> i64 {
+    if task < 0 {
+        return task;
+    }
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(SYS_WAIT, task as usize, 0, 0) }
+}
+
+/// Спросить, не закончилась ли задача, **не** дожидаясь этого.
+///
+/// `ERR_AGAIN` — ещё работает. Именно так супервизор присматривает за
+/// несколькими службами сразу: ожидание остановило бы его на первой.
+pub fn wait_now(task: i64) -> i64 {
+    if task < 0 {
+        return task;
+    }
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(SYS_WAIT, task as usize, WAIT_NOHANG, 0) }
+}
+
+/// Прочитать кусок файла с указанного смещения.
+///
+/// Написано через [`seek`], а не отдельным вызовом: `pread` в ядре сегодня нет,
+/// а программе, читающей контейнер по частям, эти две строки всё равно
+/// пришлось бы писать у себя.
+pub fn read_at(fd: i64, offset: u64, buffer: &mut [u8]) -> i64 {
+    let moved = seek(fd, offset as i64, SEEK_SET);
+    if moved < 0 {
+        return moved;
+    }
+    read(fd, buffer)
+}
+
+/// Путь, собираемый по кусочкам в буфере на стеке.
+///
+/// Существует потому, что кучи у программы нет, а склеивать пути приходится
+/// всем, кто ходит по дереву: `/opt` + имя пакета + путь внутри него. Своя
+/// длина у каждого куска, общий предел — тот же, что принимает ядро.
+pub struct Path {
+    buffer: [u8; MAX_PATH],
+    len: usize,
+}
+
+/// Самый длинный путь, который принимает ядро.
+pub const MAX_PATH: usize = 255;
+
+impl Path {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { buffer: [0; MAX_PATH], len: 0 }
+    }
+
+    /// Начать путь с готовой строки. `None`, если она длиннее предела.
+    #[must_use]
+    pub fn from(text: &str) -> Option<Self> {
+        let mut path = Self::new();
+        path.push(text).then_some(path)
+    }
+
+    /// Дописать в конец. `false` означает, что не поместилось, — и путь при
+    /// этом остаётся прежним, а не обрезанным: обрезанный путь указывает на
+    /// другой файл, и работать с ним хуже, чем отказаться.
+    pub fn push(&mut self, text: &str) -> bool {
+        if self.len + text.len() > MAX_PATH {
+            return false;
+        }
+        self.buffer[self.len..self.len + text.len()].copy_from_slice(text.as_bytes());
+        self.len += text.len();
+        true
+    }
+
+    /// Дописать компонент, поставив перед ним `/`, если его там ещё нет.
+    pub fn join(&mut self, name: &str) -> bool {
+        if self.len > 0 && self.buffer[self.len - 1] != b'/' && !self.push("/") {
+            return false;
+        }
+        self.push(name)
+    }
+
+    /// Сколько байт занято — чтобы потом вернуться к этой длине.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Отбросить всё после указанной длины.
+    ///
+    /// Так путь переиспользуется в цикле: собрали `/opt/hello/bin/greet`,
+    /// поработали, вернулись к `/opt/hello` и собрали следующий.
+    pub fn truncate(&mut self, len: usize) {
+        if len <= self.len {
+            self.len = len;
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // SAFETY: в буфер попадают только байты из `&str`, то есть UTF-8.
+        unsafe { core::str::from_utf8_unchecked(&self.buffer[..self.len]) }
+    }
+}
+
+impl Default for Path {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Завершить программу.

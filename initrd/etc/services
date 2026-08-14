@@ -1,0 +1,8 @@
+# FreeOS services, read by /bin/init at boot.
+# One service per line: <name> <path> [uid] [gid]
+# A service that keeps failing is stopped, and the log says so.
+#
+# This copy serves the live image. The installed system gets its own from
+# crates/installer/src/install.rs, written onto the state partition -- the two
+# describe the same set and are meant to stay identical.
+logger /bin/svclog 0 0

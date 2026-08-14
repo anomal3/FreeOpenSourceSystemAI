@@ -142,10 +142,16 @@ pub fn shut_down(restart: bool) {
     // неверным числом свободных блоков — это чинится `fsck`, но чинить нечего,
     // если сбросить вовремя. `None` означает «корень не с диска» (живой ISO), и
     // это не отказ.
-    match crate::fs::sync_root() {
-        Some(Ok(())) => announce!("  root        : flushed and marked clean"),
-        Some(Err(err)) => announce!("  root        : flush failed: {err}"),
-        None => {}
+    //
+    // Сбрасываются **все** тома, а не один корень: с фазы 32 корень смонтирован
+    // только на чтение, а всё, что пишется, живёт на разделе состояния. Сброс
+    // одного корня с этого момента сбрасывал бы ровно тот том, в который никто
+    // не писал.
+    for (where_at, result) in crate::fs::sync_all() {
+        match result {
+            Ok(()) => announce!("  volume      : {where_at} flushed and marked clean"),
+            Err(err) => announce!("  volume      : {where_at} flush failed: {err}"),
+        }
     }
 
     // Дальше процессор не отдаётся никому. Это и есть «задачи останавливаются»

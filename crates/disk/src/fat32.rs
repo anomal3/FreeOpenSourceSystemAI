@@ -364,10 +364,469 @@ pub fn format(dev: &mut dyn BlockDevice, range: Range, options: &FormatOptions) 
     Ok(volume)
 }
 
+/// Открыть **готовый** том: прочитать BPB и восстановить геометрию.
+///
+/// # Зачем это понадобилось
+///
+/// Ради подтверждения загрузки (фаза 32). Систему, поднявшуюся с нового слота,
+/// надо отметить работающей, а отметка живёт файлом на ESP — том, который эта
+/// система не форматировала и никогда не увидит целиком. До сих пор весь
+/// FAT32-писатель существовал только для свежих томов, где всё известно с
+/// момента разметки.
+///
+/// # Чего этот том не умеет
+///
+/// Выделять место. Курсор свободных кластеров восстановлению не подлежит:
+/// FSInfo хранит **подсказку**, а не истину, и полагаться на неё при выделении
+/// значило бы затереть чужой файл на томе, размеченном не нами. Поэтому
+/// открытый том умеет ровно две вещи — прочитать файл и переписать его, не
+/// меняя длины. Ровно столько, сколько нужно записи о слотах, и ни одной
+/// операцией больше.
+pub fn open(dev: &mut dyn BlockDevice, first_lba: u64) -> Result<Volume> {
+    check_device(dev)?;
+    let sector_size = dev.sector_size() as usize;
+    let mut boot = [0u8; MAX_SECTOR_SIZE];
+    dev.read(first_lba, &mut boot[..sector_size])?;
+
+    // Подпись сектора проверяется до всего остального: без неё дальше читались
+    // бы поля мусора, и «том с кластером в ноль секторов» выглядел бы как
+    // ошибка деления, а не как «здесь не FAT».
+    if boot[510] != 0x55 || boot[511] != 0xAA {
+        return Err(Error::NotFat32);
+    }
+    let bytes_per_sector = u16::from_le_bytes([boot[11], boot[12]]) as usize;
+    if bytes_per_sector != sector_size {
+        // Том размечен под другой сектор. Читать его этим кодом нельзя: все
+        // адреса разъедутся кратно отношению размеров.
+        return Err(Error::NotFat32);
+    }
+    let sectors_per_cluster = u32::from(boot[13]);
+    let reserved = u32::from(u16::from_le_bytes([boot[14], boot[15]]));
+    let fat_count = u32::from(boot[16]);
+    let sectors_per_fat = u32::from_le_bytes([boot[36], boot[37], boot[38], boot[39]]);
+    let total_sectors = u32::from_le_bytes([boot[32], boot[33], boot[34], boot[35]]);
+    let root_cluster = u32::from_le_bytes([boot[44], boot[45], boot[46], boot[47]]);
+
+    if sectors_per_cluster == 0
+        || sectors_per_fat == 0
+        || fat_count != FAT_COUNT
+        || reserved != RESERVED_SECTORS
+        || root_cluster != ROOT_CLUSTER
+        || total_sectors <= reserved + fat_count * sectors_per_fat
+    {
+        return Err(Error::NotFat32);
+    }
+
+    let data_sectors = total_sectors - reserved - fat_count * sectors_per_fat;
+    let cluster_count = data_sectors / sectors_per_cluster;
+    // Тип FAT определяется числом кластеров, и только им (Microsoft FAT
+    // specification, «FAT Type Determination»). Том с меньшим числом — это
+    // FAT16 или FAT12, у которых другая ширина записи таблицы, и разбирать его
+    // здешним кодом нельзя.
+    if cluster_count < 65_525 {
+        return Err(Error::NotFat32);
+    }
+
+    Ok(Volume {
+        geometry: Geometry {
+            first_lba,
+            total_sectors,
+            sectors_per_cluster,
+            sectors_per_fat,
+            cluster_count,
+            sector_size,
+        },
+        // Курсор выделения намеренно поставлен за конец: любая попытка
+        // выделить кластер на открытом томе обязана окончиться отказом, а не
+        // записью поверх чужого файла. См. заголовок [`open`].
+        next_free: u32::MAX,
+        free_clusters: 0,
+        timestamp: Timestamp::EPOCH,
+    })
+}
+
 impl Volume {
     #[must_use]
     pub const fn geometry(&self) -> Geometry {
         self.geometry
+    }
+
+    /// Прочитать файл по пути вида `FREEOS/SLOTS.CFG`.
+    ///
+    /// Возвращает, сколько байт прочитано: у файла короче буфера это меньше
+    /// запрошенного, и это не ошибка. Файла нет — [`Error::NotFound`].
+    ///
+    /// Читает **по цепочке кластеров**, а не подряд: файл, записанный этим же
+    /// крейтом, лежит одним отрезком, но том мог размечать кто-то другой, и
+    /// «наверное, подряд» здесь означало бы прочитать чужие данные вместо
+    /// своих.
+    pub fn read_file_path(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        let (parent, name) = self.walk(dev, path)?;
+        let (short, _) = short_name(name)?;
+        let found = self.dir_find(dev, parent, &short)?.ok_or(Error::NotFound)?;
+        if found.attributes & ATTR_DIRECTORY != 0 {
+            return Err(Error::NotADirectory);
+        }
+        let want = (found.size as usize).min(out.len());
+
+        let sector_bytes = self.geometry.sector_size;
+        let cluster_bytes = self.geometry.cluster_bytes() as usize;
+        let mut cluster = found.cluster;
+        let mut done = 0usize;
+        let mut buf = [0u8; MAX_SECTOR_SIZE];
+
+        while done < want {
+            if cluster < ROOT_CLUSTER || cluster > self.geometry.max_cluster() {
+                return Err(Error::Corrupt);
+            }
+            let base = self.geometry.cluster_lba(cluster);
+            let mut in_cluster = 0usize;
+            while in_cluster < cluster_bytes && done < want {
+                dev.read(base + (in_cluster / sector_bytes) as u64, &mut buf[..sector_bytes])?;
+                let chunk = (want - done).min(sector_bytes);
+                out[done..done + chunk].copy_from_slice(&buf[..chunk]);
+                done += chunk;
+                in_cluster += sector_bytes;
+            }
+            if done < want {
+                cluster = self.fat_get(dev, cluster)?;
+            }
+        }
+        Ok(want)
+    }
+
+    /// Переписать существующий файл, **не меняя его длины**.
+    ///
+    /// Ровно то, что нужно записи о слотах, и ровно то, что безопасно на чужом
+    /// томе: не трогается ни таблица FAT, ни запись каталога, ни FSInfo.
+    /// Обновление сводится к записи тех же секторов, в которых файл и лежал, —
+    /// операции, которую носитель либо выполняет, либо нет. Почему это лучше
+    /// переименования временного файла, сказано в заголовке крейта `slots`.
+    ///
+    /// Длина, отличная от нынешней, — отказ [`Error::OutOfRange`]. Молчаливо
+    /// дописать было бы нельзя (потребовалось бы выделение), а молчаливо
+    /// обрезать — значит соврать про то, что записано.
+    pub fn overwrite_file_path(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        let (parent, name) = self.walk(dev, path)?;
+        let (short, _) = short_name(name)?;
+        let found = self.dir_find(dev, parent, &short)?.ok_or(Error::NotFound)?;
+        if found.attributes & ATTR_DIRECTORY != 0 {
+            return Err(Error::NotADirectory);
+        }
+        if found.size as usize != data.len() {
+            return Err(Error::OutOfRange);
+        }
+
+        let sector_bytes = self.geometry.sector_size;
+        let cluster_bytes = self.geometry.cluster_bytes() as usize;
+        let mut cluster = found.cluster;
+        let mut done = 0usize;
+        let mut buf = [0u8; MAX_SECTOR_SIZE];
+
+        while done < data.len() {
+            if cluster < ROOT_CLUSTER || cluster > self.geometry.max_cluster() {
+                return Err(Error::Corrupt);
+            }
+            let base = self.geometry.cluster_lba(cluster);
+            let mut in_cluster = 0usize;
+            while in_cluster < cluster_bytes && done < data.len() {
+                let chunk = (data.len() - done).min(sector_bytes);
+                if chunk == sector_bytes {
+                    dev.write(base + (in_cluster / sector_bytes) as u64, &data[done..done + chunk])?;
+                } else {
+                    // Хвост короче сектора: остаток сектора читается и
+                    // пишется обратно как есть — за концом файла лежит не наше.
+                    dev.read(base + (in_cluster / sector_bytes) as u64, &mut buf[..sector_bytes])?;
+                    buf[..chunk].copy_from_slice(&data[done..done + chunk]);
+                    dev.write(base + (in_cluster / sector_bytes) as u64, &buf[..sector_bytes])?;
+                }
+                done += chunk;
+                in_cluster += sector_bytes;
+            }
+            if done < data.len() {
+                cluster = self.fat_get(dev, cluster)?;
+            }
+        }
+        dev.flush()
+    }
+
+    /// Заменить файл целиком: другое содержимое, другая длина.
+    ///
+    /// Существует ради обновления системы: ядро и образ RAM-диска нового слота
+    /// не совпадают по размеру ни с прежними, ни между собой, и переписать их
+    /// «на месте» невозможно в принципе.
+    ///
+    /// # Как выделяется место
+    ///
+    /// Прежняя цепочка освобождается **до** поиска нового места, и это не
+    /// экономия: заменяемый файл — самый крупный на томе, и без освобождения
+    /// вторая его копия просто не поместилась бы.
+    ///
+    /// Место ищется **одним непрерывным отрезком**. Разрывную цепочку этот
+    /// крейт не строит нигде, и заводить её здесь значило бы написать второй
+    /// способ разложить файл по тому — тот, который в отличие от первого никто
+    /// не проверял чужим драйвером. Цена решения названа прямо: том, на котором
+    /// свободного места хватает, а непрерывного отрезка нет, получит
+    /// [`Error::NoSpace`]. На ESP, где лежат четыре файла и половина раздела
+    /// свободна, это состояние недостижимо; когда станет достижимо — отказ
+    /// скажет об этом словами, а не тихо разложит файл так, как никто не
+    /// проверял.
+    ///
+    /// # Что при этом рвётся, если выключить питание
+    ///
+    /// Файл. Именно он, и только он: запись каталога обновляется последней, то
+    /// есть до неё файл виден прежним (со старой, уже освобождённой цепочкой —
+    /// это чинит `chkdsk`), а после — новым и целым. Ради этого A/B и
+    /// придуманы: слот, чьё ядро записалось наполовину, не подтвердится, и
+    /// следующая загрузка вернётся на другой.
+    pub fn replace_file_path(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        let reservation = self.reserve_file(dev, path, data.len() as u64)?;
+        if reservation.first_cluster != 0 {
+            self.write_data(dev, reservation.first_cluster, data)?;
+        }
+        self.commit_file(dev, path, &reservation, data.len() as u64)
+    }
+
+    /// Отвести место под файл, ничего в него не записав.
+    ///
+    /// Существует ради того, кто **не может** держать файл в памяти. Ядро,
+    /// раскладывающее обновление, переливает сорокамегабайтный образ RAM-диска
+    /// из контейнера на ESP через буфер в несколько килобайт: кучи у него
+    /// шестнадцать мегабайт, и `&[u8]` со всем файлом — это отказ выделения там,
+    /// где отказывать нечему.
+    ///
+    /// Отрезок непрерывный (см. [`Volume::replace_file_path`]), поэтому
+    /// вызывающему достаточно первого сектора: дальше он пишет подряд.
+    ///
+    /// Файл до [`Volume::commit_file`] остаётся прежним: запись каталога ещё не
+    /// тронута. Прежняя цепочка при этом уже освобождена — иначе новая копия
+    /// самого крупного файла на томе не поместилась бы рядом со старой.
+    pub fn reserve_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        size: u64,
+    ) -> Result<Reservation> {
+        let (parent, name) = self.walk(dev, path)?;
+        let (short, _) = short_name(name)?;
+        if let Some(found) = self.dir_find(dev, parent, &short)? {
+            if found.attributes & ATTR_DIRECTORY != 0 {
+                return Err(Error::NotADirectory);
+            }
+            if found.cluster >= ROOT_CLUSTER {
+                self.free_chain(dev, found.cluster)?;
+            }
+        }
+
+        let cluster_bytes = u64::from(self.geometry.cluster_bytes());
+        let needed = u32::try_from(size.div_ceil(cluster_bytes.max(1)))
+            .map_err(|_| Error::NoSpace)?;
+        if needed == 0 {
+            return Ok(Reservation { first_cluster: 0, first_lba: 0, sectors: 0 });
+        }
+        let first = self.find_free_run(dev, needed)?;
+        self.link_run(dev, first, needed)?;
+        Ok(Reservation {
+            first_cluster: first,
+            first_lba: self.geometry.cluster_lba(first),
+            sectors: u64::from(needed) * u64::from(self.geometry.sectors_per_cluster),
+        })
+    }
+
+    /// Объявить отведённое место содержимым файла.
+    ///
+    /// Запись каталога правится здесь и только здесь — последним действием.
+    /// До него файл виден прежним, после него новым; половины не существует.
+    pub fn commit_file(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        path: &str,
+        reservation: &Reservation,
+        size: u64,
+    ) -> Result<()> {
+        let (parent, name) = self.walk(dev, path)?;
+        let (short, case) = short_name(name)?;
+        let size = u32::try_from(size).map_err(|_| Error::NoSpace)?;
+        self.dir_update(dev, parent, &short, case, reservation.first_cluster, size)?;
+        dev.flush()
+    }
+
+    /// Освободить цепочку кластеров, начиная с `first`.
+    ///
+    /// Идёт по цепочке, а не по отрезку: файл мог быть записан не этим крейтом.
+    /// Предел на длину обхода обязателен — испорченная таблица с петлёй иначе
+    /// крутила бы этот цикл вечно.
+    fn free_chain(&mut self, dev: &mut dyn BlockDevice, first: u32) -> Result<u32> {
+        let mut cluster = first;
+        let mut freed = 0u32;
+        while cluster >= ROOT_CLUSTER && cluster <= self.geometry.max_cluster() {
+            let next = self.fat_get(dev, cluster)?;
+            self.fat_set(dev, cluster, 0)?;
+            freed += 1;
+            self.free_clusters = self.free_clusters.saturating_add(1);
+            if freed > self.geometry.cluster_count {
+                return Err(Error::Corrupt);
+            }
+            cluster = next;
+        }
+        Ok(freed)
+    }
+
+    /// Найти `count` свободных кластеров подряд.
+    ///
+    /// Читает таблицу FAT посекторно: перебор по одной записи означал бы чтение
+    /// сектора на каждый кластер, то есть десятки тысяч обращений к носителю
+    /// ради одного файла.
+    fn find_free_run(&mut self, dev: &mut dyn BlockDevice, count: u32) -> Result<u32> {
+        let per_sector = self.geometry.fat_entries_per_sector();
+        let sector_bytes = self.geometry.sector_size;
+        let max = self.geometry.max_cluster();
+
+        let mut run_start = 0u32;
+        let mut run_len = 0u32;
+        let mut cluster = ROOT_CLUSTER + 1;
+        let mut buf = [0u8; MAX_SECTOR_SIZE];
+
+        while cluster <= max {
+            let sector_index = cluster / per_sector;
+            dev.read(
+                self.geometry.fat_lba(0) + u64::from(sector_index),
+                &mut buf[..sector_bytes],
+            )?;
+            let sector_last = ((sector_index + 1) * per_sector - 1).min(max);
+            while cluster <= sector_last {
+                let at = ((cluster % per_sector) * 4) as usize;
+                let entry =
+                    u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+                        & ENTRY_MASK;
+                if entry == 0 {
+                    if run_len == 0 {
+                        run_start = cluster;
+                    }
+                    run_len += 1;
+                    if run_len == count {
+                        return Ok(run_start);
+                    }
+                } else {
+                    run_len = 0;
+                }
+                cluster += 1;
+            }
+        }
+        Err(Error::NoSpace)
+    }
+
+    /// Связать `count` кластеров подряд, начиная с `first`, в одну цепочку.
+    fn link_run(&mut self, dev: &mut dyn BlockDevice, first: u32, count: u32) -> Result<()> {
+        let last = first
+            .checked_add(count - 1)
+            .filter(|last| *last <= self.geometry.max_cluster())
+            .ok_or(Error::NoSpace)?;
+        for cluster in first..=last {
+            let value = if cluster == last { END_OF_CHAIN } else { cluster + 1 };
+            self.fat_set(dev, cluster, value)?;
+            self.free_clusters = self.free_clusters.saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    /// Переписать запись каталога: первый кластер и длину.
+    ///
+    /// Создаёт запись, если её не было. Обе ветки нужны одному вызывающему:
+    /// обновление кладёт в неактивный слот файлы, которых там может и не быть —
+    /// например, при первом же обновлении системы, установленной без слота B.
+    fn dir_update(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        parent: u32,
+        short: &[u8; 11],
+        case: u8,
+        cluster: u32,
+        size: u32,
+    ) -> Result<()> {
+        let mut dir = parent;
+        loop {
+            let base = self.geometry.cluster_lba(dir);
+            for sector in 0..self.geometry.sectors_per_cluster {
+                let sector_bytes = self.geometry.sector_size;
+                let mut buf = [0u8; MAX_SECTOR_SIZE];
+                dev.read(base + u64::from(sector), &mut buf[..sector_bytes])?;
+                for slot in 0..(sector_bytes / DIR_ENTRY_SIZE) {
+                    let at = slot * DIR_ENTRY_SIZE;
+                    if buf[at] == 0x00 || buf[at] == 0xE5 {
+                        continue;
+                    }
+                    if buf[at + 11] & ATTR_LONG_NAME == ATTR_LONG_NAME
+                        || buf[at + 11] & ATTR_VOLUME_ID != 0
+                    {
+                        continue;
+                    }
+                    if &buf[at..at + 11] != short {
+                        continue;
+                    }
+                    put_u16(&mut buf[at..at + DIR_ENTRY_SIZE], 20, (cluster >> 16) as u16);
+                    put_u16(&mut buf[at..at + DIR_ENTRY_SIZE], 26, (cluster & 0xFFFF) as u16);
+                    put_u32(&mut buf[at..at + DIR_ENTRY_SIZE], 28, size);
+                    dev.write(base + u64::from(sector), &buf[..sector_bytes])?;
+                    return Ok(());
+                }
+            }
+
+            let next = self.fat_get(dev, dir)?;
+            if next >= ROOT_CLUSTER && next <= self.geometry.max_cluster() {
+                dir = next;
+                continue;
+            }
+            break;
+        }
+
+        // Записи не было — заводим новую.
+        let mut entry = [0u8; DIR_ENTRY_SIZE];
+        entry[..11].copy_from_slice(short);
+        entry[11] = ATTR_ARCHIVE;
+        entry[12] = case;
+        self.stamp(&mut entry);
+        put_u16(&mut entry, 20, (cluster >> 16) as u16);
+        put_u16(&mut entry, 26, (cluster & 0xFFFF) as u16);
+        put_u32(&mut entry, 28, size);
+        self.dir_add_entry(dev, parent, &entry)
+    }
+
+    /// Пройти по каталогам пути и вернуть кластер последнего вместе с именем.
+    ///
+    /// В отличие от [`Volume::create_dir_path`], ничего не создаёт: на чужом
+    /// томе отсутствующий каталог — это ответ «файла нет», а не повод его
+    /// завести.
+    fn walk<'a>(&mut self, dev: &mut dyn BlockDevice, path: &'a str) -> Result<(u32, &'a str)> {
+        let (parents, name) = match path.rsplit_once('/') {
+            Some((parents, name)) => (parents, name),
+            None => ("", path),
+        };
+        let mut dir = ROOT_CLUSTER;
+        for component in parents.split('/').filter(|part| !part.is_empty()) {
+            let (short, _) = short_name(component)?;
+            let found = self.dir_find(dev, dir, &short)?.ok_or(Error::NotFound)?;
+            if found.attributes & ATTR_DIRECTORY == 0 {
+                return Err(Error::NotADirectory);
+            }
+            dir = found.cluster;
+        }
+        Ok((dir, name))
     }
 
     /// Кластер корневого каталога.
@@ -765,6 +1224,9 @@ impl Volume {
                     return Ok(Some(Found {
                         cluster: (high << 16) | low,
                         attributes: entry[11],
+                        size: u32::from_le_bytes([
+                            entry[28], entry[29], entry[30], entry[31],
+                        ]),
                     }));
                 }
             }
@@ -779,10 +1241,28 @@ impl Volume {
     }
 }
 
+/// Место, отведённое под файл на томе.
+///
+/// Отрезок непрерывный, поэтому описывается тремя числами и не требует ни
+/// обхода цепочки, ни знания о FAT у того, кто в него пишет.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reservation {
+    /// Первый кластер цепочки; ноль означает пустой файл.
+    pub first_cluster: u32,
+    /// Первый сектор носителя — сюда и пишет вызывающий.
+    pub first_lba: u64,
+    /// Сколько секторов отведено. Больше или равно тому, что нужно под длину:
+    /// последний кластер занимается целиком.
+    pub sectors: u64,
+}
+
 /// Найденная запись каталога.
 struct Found {
     cluster: u32,
     attributes: u8,
+    /// Длина файла из записи каталога. У каталога она всегда нулевая — это
+    /// требование формата, а не упущение: длину каталога задаёт его цепочка.
+    size: u32,
 }
 
 /// Загрузочный сектор с BPB.
@@ -997,6 +1477,112 @@ mod tests {
         let fs = mount(&dev);
         assert_eq!(fs.fat_type(), fatfs::FatType::Fat32);
         assert_eq!(fs.volume_label(), "FREEOS ESP");
+    }
+
+    /// Обновление системы переписывает на ESP файлы другого размера — и чужой
+    /// драйвер обязан видеть после этого целый том и новое содержимое.
+    ///
+    /// Проверяются оба случая сразу: файл, который был (ядро слота), и файл,
+    /// которого не было (ядро второго слота при первом обновлении).
+    #[test]
+    fn a_file_is_replaced_with_one_of_a_different_size() {
+        let (mut dev, mut volume) = formatted();
+        let short: Vec<u8> = (0..40_000u32).map(|index| (index % 251) as u8).collect();
+        volume
+            .write_file_path(&mut dev, "kernel-a.elf", &short)
+            .expect("исходное ядро");
+        volume.finish(&mut dev).expect("завершение");
+        drop(volume);
+
+        let mut reopened = open(&mut dev, 0).expect("том открывается заново");
+        // Новое ядро **крупнее** прежнего: без освобождения старой цепочки оно
+        // не поместилось бы на место, и проверка ловит именно это.
+        let long: Vec<u8> = (0..300_000u32).map(|index| (index % 97) as u8).collect();
+        reopened
+            .replace_file_path(&mut dev, "kernel-a.elf", &long)
+            .expect("замена существующего файла");
+        // И файл, которого на томе не было вовсе.
+        reopened
+            .replace_file_path(&mut dev, "kernel-b.elf", &short)
+            .expect("создание отсутствующего файла");
+
+        let fs = mount(&dev);
+        let root = fs.root_dir();
+        let mut seen = Vec::new();
+        root.open_file("kernel-a.elf")
+            .expect("ядро A на месте")
+            .read_to_end(&mut seen)
+            .expect("чтение чужим драйвером");
+        assert_eq!(seen, long);
+
+        seen.clear();
+        root.open_file("kernel-b.elf")
+            .expect("ядро B на месте")
+            .read_to_end(&mut seen)
+            .expect("чтение чужим драйвером");
+        assert_eq!(seen, short);
+    }
+
+    /// Том, размеченный однажды, открывается заново — и файл переписывается на
+    /// месте, не задев ни таблицы FAT, ни записи каталога.
+    ///
+    /// Проверяется это чужим драйвером: после перезаписи `fatfs` обязан видеть
+    /// **новое** содержимое, ту же длину и целый том. Своим же читателем такое
+    /// проверять бессмысленно — общая ошибка в понимании формата осталась бы
+    /// незамеченной.
+    #[test]
+    fn an_existing_volume_reopens_and_a_file_is_rewritten_in_place() {
+        let (mut dev, mut volume) = formatted();
+        let original = [b'A'; 1024];
+        volume
+            .write_file_path(&mut dev, "FREEOS/SLOTS.CFG", &original)
+            .expect("запись файла состояния");
+        volume.finish(&mut dev).expect("завершение");
+        drop(volume);
+
+        let mut reopened = open(&mut dev, 0).expect("том обязан открываться заново");
+        let mut read = [0u8; 1024];
+        let got = reopened
+            .read_file_path(&mut dev, "FREEOS/SLOTS.CFG", &mut read)
+            .expect("чтение файла состояния");
+        assert_eq!(got, original.len());
+        assert_eq!(read, original);
+
+        let mut replacement = [b'B'; 1024];
+        replacement[512..].fill(b'C');
+        reopened
+            .overwrite_file_path(&mut dev, "FREEOS/SLOTS.CFG", &replacement)
+            .expect("перезапись на месте");
+
+        // Длина, отличная от нынешней, — отказ, а не молчаливое усечение.
+        assert_eq!(
+            reopened.overwrite_file_path(&mut dev, "FREEOS/SLOTS.CFG", b"short"),
+            Err(Error::OutOfRange)
+        );
+        // Файла нет — тоже отказ, а не создание: открытый том ничего не
+        // выделяет, см. заголовок `open`.
+        assert_eq!(
+            reopened.overwrite_file_path(&mut dev, "FREEOS/NOSUCH.CFG", &replacement),
+            Err(Error::NotFound)
+        );
+
+        let fs = mount(&dev);
+        let mut seen = Vec::new();
+        fs.root_dir()
+            .open_file("FREEOS/SLOTS.CFG")
+            .expect("файл на месте")
+            .read_to_end(&mut seen)
+            .expect("чтение чужим драйвером");
+        assert_eq!(seen, replacement);
+    }
+
+    /// Том, которого нет, не должен «открываться» с выдуманной геометрией:
+    /// мусор в BPB даёт кластер в ноль секторов, то есть деление на ноль в
+    /// первом же обращении.
+    #[test]
+    fn garbage_does_not_open_as_a_volume() {
+        let mut dev = junk_disk(PART_SECTORS).expect("образ");
+        assert!(matches!(open(&mut dev, 0), Err(Error::NotFat32)));
     }
 
     #[test]

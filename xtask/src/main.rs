@@ -7,11 +7,13 @@
 
 mod arch;
 mod build;
+mod diskfile;
 mod firmware;
 mod harness;
 mod image;
 mod initrd;
 mod inspect;
+mod package;
 mod paths;
 mod qemu;
 mod util;

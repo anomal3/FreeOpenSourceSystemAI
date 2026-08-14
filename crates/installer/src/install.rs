@@ -58,7 +58,10 @@ const ROOT_LABEL: &str = "FreeOS";
 pub struct Plan {
     pub layout: gpt::Layout,
     pub esp_bytes: u64,
+    /// Размер **одного** корневого слота. Второй такой же по построению.
     pub root_bytes: u64,
+    /// Размер раздела состояния: `/etc`, `/home`, `/var`, `/opt`, `/root`.
+    pub state_bytes: u64,
 }
 
 /// Отказ установки.
@@ -100,6 +103,14 @@ impl Plan {
     /// `payload` — суммарный объём переносимого: ESP обязан вместить его в
     /// любом случае, даже если ради этого раздел придётся сделать меньше
     /// желаемого.
+    ///
+    /// # Почему на ESP закладывается вдвое
+    ///
+    /// Потому что слотов два, и у каждого своё ядро и свой образ RAM-диска.
+    /// Обновление кладёт их в файлы неактивного слота — на тот же ESP, рядом с
+    /// работающими. Раздел, вмещающий ровно один комплект, сделал бы обновление
+    /// невозможным, и выяснилось бы это в момент, когда обновляться уже
+    /// понадобилось.
     pub fn for_disk(disk: &Disk, payload: u64) -> Result<Self, Error> {
         let sectors = disk.sectors;
         let sector = disk.block_size as usize;
@@ -109,10 +120,10 @@ impl Plan {
         // раздел больше корневого, выглядит как ошибка установщика, и на малых
         // носителях именно ей бы и был.
         let wanted = WANTED_ESP.min(usable / 2);
-        let needed = payload + ESP_SLACK;
+        let needed = payload * 2 + ESP_SLACK;
         let esp_bytes = wanted.max(needed);
 
-        let layout = gpt::plan(sectors, sector, esp_bytes, true)?;
+        let layout = gpt::plan(sectors, sector, esp_bytes, gpt::Scheme::Slots)?;
         let esp_bytes = layout.esp.bytes(sector);
         if esp_bytes < needed {
             logln!(
@@ -123,7 +134,8 @@ impl Plan {
         }
 
         let root_bytes = layout.root.map_or(0, |root| root.bytes(sector));
-        Ok(Self { layout, esp_bytes, root_bytes })
+        let state_bytes = layout.state.map_or(0, |state| state.bytes(sector));
+        Ok(Self { layout, esp_bytes, root_bytes, state_bytes })
     }
 }
 
@@ -207,7 +219,27 @@ pub fn run(
             first_lba: root.first_lba,
             last_lba: root.last_lba,
             attributes: 0,
-            name: "FreeOS root",
+            name: "FreeOS root A",
+        });
+    }
+    if let Some(root_b) = plan.layout.root_b {
+        partitions.push(PartitionSpec {
+            type_guid: gpt::FREEOS_ROOT_B_TYPE,
+            unique_guid: Guid::from_entropy(expand(settings.entropy, b"freeos-root-b")),
+            first_lba: root_b.first_lba,
+            last_lba: root_b.last_lba,
+            attributes: 0,
+            name: "FreeOS root B",
+        });
+    }
+    if let Some(state) = plan.layout.state {
+        partitions.push(PartitionSpec {
+            type_guid: gpt::FREEOS_STATE_TYPE,
+            unique_guid: Guid::from_entropy(expand(settings.entropy, b"freeos-state")),
+            first_lba: state.first_lba,
+            last_lba: state.last_lba,
+            attributes: 0,
+            name: "FreeOS state",
         });
     }
     gpt::write(
@@ -235,11 +267,20 @@ pub fn run(
             let item = &payload.items[index];
             (item.what, item.target, item.size)
         };
-        // Программы на ESP не едут: их место на корневом разделе, где есть
-        // права. Они переносятся ниже, после того как он отформатирован.
-        if what == payload::What::Program {
+        // На ESP едет только то, что читает прошивка. Программы и пакеты —
+        // ниже, на разделы, где есть права.
+        if what == payload::What::Program || what == payload::What::Package {
             continue;
         }
+        // Ядро и образ RAM-диска ложатся под именем **слота A**, а не под
+        // общим. Общее имя означало бы, что обновление, положившее второй
+        // комплект, вынуждено переписать первый, — то есть что откатываться
+        // некуда.
+        let target_path = match what {
+            payload::What::Kernel => KERNEL_A,
+            payload::What::Initrd => INITRD_A,
+            _ => target_path,
+        };
         progress(3, Step::Copy(what));
         logln!("[install] copying {} -> \\{target_path} ({size} bytes)", what.tag());
         let data = payload.read(index).map_err(Error::Payload)?;
@@ -247,6 +288,18 @@ pub fn run(
         // Освобождаем сразу: следующий файл может оказаться крупнее.
         drop(data);
     }
+
+    // Запись о слотах. Создаётся здесь и только здесь: загрузчик её правит, но
+    // завести не вправе — система, у которой запись появилась сама, объявила бы
+    // слоты там, где их не размечали.
+    //
+    // Свежая установка помечена подтверждённой: возвращаться ей некуда, второй
+    // слот пуст, и счётчик попыток без запасного слота был бы обещанием отката,
+    // которого не существует.
+    let mut record = [0u8; slots::FILE_SIZE];
+    slots::State::fresh().write(&mut record);
+    volume.write_file_path(&mut dev, slots::PATH_UNIX, &record)?;
+    logln!("[install] slots: {} written, slot A active and confirmed", slots::PATH_UNIX);
 
     volume.finish(&mut dev)?;
 
@@ -281,69 +334,26 @@ pub fn run(
     );
 
     progress(5, Step::Config);
-    // Права проставляются сразу и настоящие, хотя проверять их пока некому:
-    // выставить их позже значит на какое-то время оставить файл учётных
-    // записей открытым на чтение всем.
-    fs.create_dir_path(&mut dev, "etc", 0o755, 0, 0)?;
+
+    // Точки монтирования. Пустые каталоги на корне, за которыми при работе
+    // системы стоит раздел состояния — ровно так же, как в любом Unix. Без них
+    // `ls /` не показал бы ни `/etc`, ни `/home`: смонтированная ветка видна
+    // потому, что каталог под ней существует.
+    for branch in STATE_BRANCHES {
+        fs.create_dir_path(&mut dev, branch, 0o755, 0, 0)?;
+    }
+
+    // Версия образа. Лежит в корне, а не в `/etc`, и это не небрежность:
+    // `/etc` принадлежит состоянию и переживает обновление, а этот файл
+    // описывает **образ** и обязан заменяться вместе с ним.
     fs.write_file_path(
         &mut dev,
-        PASSWD_PATH,
-        account.to_passwd(settings.entropy).as_bytes(),
-        account::PASSWD_MODE,
-        0,
-        0,
-    )?;
-    fs.write_file_path(
-        &mut dev,
-        CONFIG_PATH,
-        config_text(settings, account).as_bytes(),
+        OS_RELEASE_PATH,
+        os_release_text().as_bytes(),
         0o644,
         0,
         0,
     )?;
-
-    // Домашний каталог принадлежит пользователю, а не root: иначе первое, что
-    // человек обнаружит в своей системе, — что ему некуда писать. А вот сам
-    // `/home` остаётся за root: иначе первый заведённый пользователь смог бы
-    // удалить домашний каталог второго.
-    fs.create_dir_path(&mut dev, "home", 0o755, 0, 0)?;
-    let home = alloc::format!("home/{}", account.name);
-    fs.create_dir_path(
-        &mut dev,
-        &home,
-        account::HOME_MODE,
-        account::FIRST_UID,
-        account::FIRST_UID,
-    )?;
-    // Файл в домашнем каталоге принадлежит человеку и закрыт от всех
-    // остальных. Он здесь не ради содержимого: это первый файл в системе,
-    // который читается по классу владельца, — и единственный способ увидеть,
-    // что этот класс вообще работает.
-    fs.write_file_path(
-        &mut dev,
-        &format!("{home}/notes.txt"),
-        notes_text(&account.name).as_bytes(),
-        0o600,
-        account::FIRST_UID,
-        account::FIRST_UID,
-    )?;
-
-    // Домашний каталог суперпользователя, закрытый от всех: `0700`, владелец
-    // root. Файл внутри намеренно оставлен читаемым всем — `0644`. Пара
-    // существует затем, чтобы разница между «проверили файл» и «прошли по
-    // пути» была видна: права файла разрешают чтение, а каталог не пускает,
-    // и правильный ответ системы — отказ.
-    fs.create_dir_path(&mut dev, "root", 0o700, 0, 0)?;
-    fs.write_file_path(
-        &mut dev,
-        "root/notes.txt",
-        b"This file is world-readable and lives in a directory that is not.\n",
-        0o644,
-        0,
-        0,
-    )?;
-
-    logln!("[install] root: /etc/passwd, /etc/system.cfg, /{home} and /root");
 
     // Программы. `/bin` принадлежит root и открыт всем на чтение и проход, сами
     // программы — `0755`: запускать их вправе кто угодно, менять — никто, кроме
@@ -368,14 +378,227 @@ pub fn run(
     }
     logln!("[install] root: {programs} program(s) in /bin");
 
-    progress(6, Step::Flush);
+    // Образцовые пакеты — в `/media`, на корне. Читаются они только на чтение,
+    // и место им именно здесь: пакет — это часть комплекта, с которым система
+    // приехала, а не состояние машины.
+    fs.create_dir_path(&mut dev, "media", 0o755, 0, 0)?;
+    let mut packages = 0usize;
+    for index in 0..payload.items.len() {
+        let (what, name, size) = {
+            let item = &payload.items[index];
+            (item.what, item.target, item.size)
+        };
+        if what != payload::What::Package {
+            continue;
+        }
+        progress(5, Step::Copy(what));
+        logln!("[install] copying package -> /media/{name} ({size} bytes)");
+        let data = payload.read(index).map_err(Error::Payload)?;
+        fs.write_file_path(&mut dev, &format!("media/{name}"), &data, 0o644, 0, 0)?;
+        drop(data);
+        packages += 1;
+    }
+    logln!("[install] root: {packages} package(s) in /media");
+
     fs.flush(&mut dev)?;
-    dev.flush()?;
-    // И только теперь — «закрыт чисто»: признак ставится последним, потому что
-    // он утверждает, что всё предыдущее состоялось.
     fs.mark_clean(&mut dev)?;
+
+    // Раздел состояния. Всё, что переживает обновление системы, живёт здесь —
+    // и именно поэтому учётная запись, настройки и домашний каталог пишутся
+    // сюда, а не в корень.
+    if let Some(state) = plan.layout.state {
+        write_state(&mut dev, state, account, settings, &mut progress)?;
+    } else {
+        logln!("[install] no state partition: /etc and /home stay on the root volume");
+    }
+
+    // Второй слот. Не форматируется — обновлению всё равно предстоит записать
+    // туда образ целиком, — но затирается его суперблок: раздел, на котором
+    // лежат остатки чужой файловой системы, система при откате приняла бы за
+    // свою и попыталась бы смонтировать.
+    if let Some(root_b) = plan.layout.root_b {
+        wipe_superblock(&mut dev, root_b)?;
+        logln!("[install] slot B: reserved and left empty until the first update");
+    }
+
+    progress(6, Step::Flush);
+    dev.flush()?;
     logln!("[install] finished");
     Ok(())
+}
+
+/// Ветки, которые обслуживает раздел состояния.
+///
+/// Список обязан совпадать с `STATE_BRANCHES` в ядре: там он говорит, куда
+/// направлять пути, здесь — где эти каталоги создать. Оба короткие и оба на
+/// виду, потому что расхождение выглядело бы как пропавший каталог.
+const STATE_BRANCHES: [&str; 5] = ["etc", "home", "var", "opt", "root"];
+
+/// Путь к файлу с версией образа.
+const OS_RELEASE_PATH: &str = "os-release";
+
+/// Имена ядра и образа RAM-диска слота A на ESP.
+const KERNEL_A: &str = "kernel-a.elf";
+const INITRD_A: &str = "initrd-a.img";
+
+/// Заполнить раздел состояния.
+fn write_state(
+    dev: &mut UefiDisk,
+    range: gpt::Range,
+    account: &Draft,
+    settings: &Settings,
+    progress: &mut impl FnMut(u32, Step),
+) -> Result<(), Error> {
+    progress(5, Step::Config);
+    let options = ext2::FormatOptions {
+        label: STATE_LABEL,
+        uuid: expand(settings.entropy, b"freeos-state-fs"),
+        time: settings.unix_time,
+    };
+    let mut fs = ext2::format(dev, range.first_lba, range.sectors(), &options)?;
+    fs.mark_dirty(dev)?;
+    logln!(
+        "[install] state: ext2, {} blocks of {} bytes",
+        fs.geometry().blocks,
+        fs.geometry().block_size.bytes(),
+    );
+
+    // Права проставляются сразу и настоящие, хотя проверять их пока некому:
+    // выставить их позже значит на какое-то время оставить файл учётных
+    // записей открытым на чтение всем.
+    fs.create_dir_path(dev, "etc", 0o755, 0, 0)?;
+    fs.write_file_path(
+        dev,
+        PASSWD_PATH,
+        account.to_passwd(settings.entropy).as_bytes(),
+        account::PASSWD_MODE,
+        0,
+        0,
+    )?;
+    fs.write_file_path(
+        dev,
+        CONFIG_PATH,
+        config_text(settings, account).as_bytes(),
+        0o644,
+        0,
+        0,
+    )?;
+    // Описание служб. Одна служба, и та ничего не делает, кроме как живёт, —
+    // но она настоящая: её видно в журнале, её можно снять и увидеть
+    // перезапуск. Настоящие службы придут с сетью (фаза 35), и придут они в
+    // мир, где падение уже перезапускается.
+    fs.write_file_path(dev, SERVICES_PATH, SERVICES_TEXT.as_bytes(), 0o644, 0, 0)?;
+
+    // Домашний каталог принадлежит пользователю, а не root: иначе первое, что
+    // человек обнаружит в своей системе, — что ему некуда писать. А вот сам
+    // `/home` остаётся за root: иначе первый заведённый пользователь смог бы
+    // удалить домашний каталог второго.
+    fs.create_dir_path(dev, "home", 0o755, 0, 0)?;
+    let home = alloc::format!("home/{}", account.name);
+    fs.create_dir_path(
+        dev,
+        &home,
+        account::HOME_MODE,
+        account::FIRST_UID,
+        account::FIRST_UID,
+    )?;
+    // Файл в домашнем каталоге принадлежит человеку и закрыт от всех
+    // остальных. Он здесь не ради содержимого: это первый файл в системе,
+    // который читается по классу владельца, — и единственный способ увидеть,
+    // что этот класс вообще работает.
+    fs.write_file_path(
+        dev,
+        &format!("{home}/notes.txt"),
+        notes_text(&account.name).as_bytes(),
+        0o600,
+        account::FIRST_UID,
+        account::FIRST_UID,
+    )?;
+
+    // Домашний каталог суперпользователя, закрытый от всех: `0700`, владелец
+    // root. Файл внутри намеренно оставлен читаемым всем — `0644`. Пара
+    // существует затем, чтобы разница между «проверили файл» и «прошли по
+    // пути» была видна: права файла разрешают чтение, а каталог не пускает,
+    // и правильный ответ системы — отказ.
+    fs.create_dir_path(dev, "root", 0o700, 0, 0)?;
+    fs.write_file_path(
+        dev,
+        "root/notes.txt",
+        b"This file is world-readable and lives in a directory that is not.\n",
+        0o644,
+        0,
+        0,
+    )?;
+
+    // `/var/lib/pkg` — реестр установленного, `/opt` — сами пакеты. Владелец у
+    // обоих не root, а заведённая учётная запись, и это осознанное решение: в
+    // этой системе нет ни `su`, ни входа под другим именем, то есть человек за
+    // терминалом — это и есть тот единственный, кто вправе ставить пакеты.
+    // Оставить каталоги за root значило бы, что `pkg install` не работает
+    // вообще ни у кого.
+    fs.create_dir_path(dev, "var", 0o755, 0, 0)?;
+    fs.create_dir_path(dev, "var/lib", 0o755, 0, 0)?;
+    fs.create_dir_path(
+        dev,
+        "var/lib/pkg",
+        0o755,
+        account::FIRST_UID,
+        account::FIRST_UID,
+    )?;
+    fs.create_dir_path(dev, "opt", 0o755, account::FIRST_UID, account::FIRST_UID)?;
+
+    logln!("[install] state: /etc/passwd, /etc/system.cfg, /etc/services, /{home}, /opt");
+
+    fs.flush(dev)?;
+    fs.mark_clean(dev)?;
+    Ok(())
+}
+
+/// Затереть суперблок раздела.
+///
+/// Два сектора по смещению 1024 — там лежит суперблок ext2. Не форматирование:
+/// слот B всё равно получит образ целиком при первом обновлении, и тратить на
+/// него минуты записи inode-таблиц незачем. А вот остатки чужой файловой
+/// системы стереть обязательно — иначе откат на пустой слот выглядел бы как
+/// откат на систему.
+fn wipe_superblock(dev: &mut UefiDisk, range: gpt::Range) -> Result<(), Error> {
+    let sector = dev.sector_size() as u64;
+    let offset = 1024 / sector;
+    let count = (2048 / sector).max(1);
+    disk::zero_sectors(dev, range.first_lba + offset, count)?;
+    Ok(())
+}
+
+/// Метка тома состояния.
+const STATE_LABEL: &str = "FreeOS state";
+
+/// Путь к описанию служб на разделе состояния.
+const SERVICES_PATH: &str = "etc/services";
+
+/// Что запускать при загрузке.
+///
+/// Формат — по строке на службу: имя, путь, uid, gid. Комментарий сверху не
+/// украшение: файл правит человек, и он должен видеть формат, не открывая
+/// исходников.
+///
+/// Такой же файл лежит в `initrd/etc/services` — его читает система,
+/// загруженная с носителя. Два экземпляра описывают один и тот же набор
+/// намеренно: живая система и установленная обязаны вести себя одинаково, а
+/// собрать текст в одном месте нельзя — установщик работает в `no_std` и файлов
+/// репозитория не видит.
+const SERVICES_TEXT: &str = "\
+# FreeOS services, read by /bin/init at boot.
+# One service per line: <name> <path> [uid] [gid]
+# A service that keeps failing is stopped, and the log says so.
+logger /bin/svclog 0 0
+";
+
+/// Содержимое `/os-release`.
+fn os_release_text() -> String {
+    let mut out = String::new();
+    out.push_str("# FreeOS release, written by the installer\n");
+    out.push_str(&format!("version={}\n", env!("CARGO_PKG_VERSION")));
+    out
 }
 
 /// Содержимое файла настроек.
