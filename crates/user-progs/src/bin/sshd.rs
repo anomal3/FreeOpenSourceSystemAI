@@ -630,7 +630,7 @@ fn accept_service(client: i64, transport: &mut Transport, payload: &[u8]) -> boo
     };
     // Служба у нас одна. Подтвердить чужое имя значило бы согласиться на
     // разговор, которого мы не понимаем.
-    if service != auth::SERVICE.as_bytes() {
+    if service != auth::SERVICE_USERAUTH.as_bytes() {
         error("sshd: the client asked for a service we do not have\n");
         disconnect(
             client,
@@ -644,7 +644,7 @@ fn accept_service(client: i64, transport: &mut Transport, payload: &[u8]) -> boo
     let out = unsafe { &mut *(&raw mut OUTPUT) };
     let mut writer = Writer::new(out);
     writer.byte(ssh::MSG_SERVICE_ACCEPT);
-    writer.string(auth::SERVICE.as_bytes());
+    writer.string(auth::SERVICE_USERAUTH.as_bytes());
     if !writer.ok() {
         return false;
     }

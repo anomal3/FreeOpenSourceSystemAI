@@ -202,9 +202,10 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 22] = [
+pub const USER_PROGRAMS: [&str; 23] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sshd",
+    "cat",
 ];
 
 /// Программы, которые в `/bin` **не** едут.
@@ -275,6 +276,14 @@ pub fn build_user_programs(arch: Arch, release: bool) -> Result<Vec<PathBuf>> {
         // вовсе; без этой строки проверка «две программы не видят чисел друг
         // друга» проверяла бы код, в котором векторов нет ни одного.
         flags.push_str(" -C target-feature=+sse,+sse2,-soft-float");
+        // Тот же выбор backend'а, что у ядра (см. `.cargo/config.toml`), и по
+        // другой причине. Векторы программе разрешены, но векторный backend
+        // `curve25519-dalek` держит свои таблицы на стеке, а стека у программы
+        // 64 КиБ: `sshd` на проверке подписи уходил за его нижнюю границу.
+        // Заодно исчезает расхождение между архитектурами — на AArch64
+        // векторного backend'а у этого крейта нет вовсе, и до сих пор две
+        // машины считали одну и ту же подпись разным кодом.
+        flags.push_str(" --cfg curve25519_dalek_backend=\"serial\"");
     }
     cmd.env("RUSTFLAGS", flags);
 
