@@ -272,9 +272,12 @@ pub fn run(
             let item = &payload.items[index];
             (item.what, item.target, item.size)
         };
-        // На ESP едет только то, что читает прошивка. Программы и пакеты —
-        // ниже, на разделы, где есть права.
-        if what == payload::What::Program || what == payload::What::Package {
+        // На ESP едет только то, что читает прошивка. Программы, пакеты и
+        // ключи — ниже, на разделы, где есть права.
+        if matches!(
+            what,
+            payload::What::Program | payload::What::Package | payload::What::Keys
+        ) {
             continue;
         }
         // Ядро и образ RAM-диска ложатся под именем **слота A**, а не под
@@ -359,6 +362,20 @@ pub fn run(
         0,
         0,
     )?;
+
+    // Доверенные ключи обновления. Лежат в корне рядом с `/os-release` и по той
+    // же причине: оба описывают образ, а не машину, и оба заменяются вместе с
+    // ним. На разделе состояния им не место — он переживает обновление, и новая
+    // версия не смогла бы принести новый ключ.
+    for index in 0..payload.items.len() {
+        if payload.items[index].what != payload::What::Keys {
+            continue;
+        }
+        progress(5, Step::Copy(payload::What::Keys));
+        let data = payload.read(index).map_err(Error::Payload)?;
+        logln!("[install] copying update keys -> /os-keys ({} bytes)", data.len());
+        fs.write_file_path(&mut dev, "os-keys", &data, 0o644, 0, 0)?;
+    }
 
     // Программы. `/bin` принадлежит root и открыт всем на чтение и проход, сами
     // программы — `0755`: запускать их вправе кто угодно, менять — никто, кроме

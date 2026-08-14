@@ -188,6 +188,16 @@ pub enum Error {
     Disk(disk::Error),
     /// Неактивного слота на диске нет — система размечена без второго корня.
     NoTargetSlot,
+    /// Контейнер не подписан вовсе.
+    Unsigned,
+    /// Машина не знает ни одного доверенного ключа.
+    NoKeys,
+    /// Подпись не сошлась ни с одним доверенным ключом.
+    BadSignature,
+    /// Хеш куска не сошёлся с тем, что назван в подписанном манифесте.
+    Tampered(&'static str),
+    /// Версия не новее установленной.
+    NotNewer { have: alloc::string::String, offered: alloc::string::String },
 }
 
 impl core::fmt::Display for Error {
@@ -209,6 +219,20 @@ impl core::fmt::Display for Error {
             Self::NoTargetSlot => {
                 f.write_str("there is no second root partition to write the new system into")
             }
+            Self::Unsigned => f.write_str("this update carries no signature; refusing it"),
+            Self::NoKeys => f.write_str(
+                "this system trusts no update keys (/os-keys is missing or empty); refusing",
+            ),
+            Self::BadSignature => {
+                f.write_str("the signature does not match any key this system trusts")
+            }
+            Self::Tampered(what) => {
+                write!(f, "the {what} does not match the hash in the signed manifest")
+            }
+            Self::NotNewer { have, offered } => write!(
+                f,
+                "this system runs {have} and the update offers {offered}; refusing to go back"
+            ),
         }
     }
 }
@@ -261,10 +285,52 @@ pub fn apply(path: &str) -> Result<Slot, Error> {
     read_exact(&*node, header.manifest_offset(), &mut manifest_bytes)?;
     let manifest = Manifest::parse(&header, &manifest_bytes).map_err(Error::Container)?;
 
+    // --- шаг 0: кто это принёс -------------------------------------------
+    //
+    // Проверка стоит **до** всего остального и стоит дёшево: подписан хеш
+    // заголовка и манифеста, то есть сотня-другая байт, уже прочитанных. Всё,
+    // что дальше, — запись в раздел, и начинать её, не зная, чьё это, значит
+    // писать себе в корень что попало.
+    if !header.is_signed() {
+        return Err(Error::Unsigned);
+    }
+    if header.signature_algorithm != fpk::SIGNATURE_ED25519 {
+        return Err(Error::Container(fpk::Error::UnknownSignature(
+            header.signature_algorithm,
+        )));
+    }
+    let keys = crate::trust::keys();
+    if keys.is_empty() {
+        return Err(Error::NoKeys);
+    }
+    let digest = fpk::signed_digest(&head, &manifest_bytes);
+    if !crate::trust::verifies(
+        &digest,
+        &header.signature[..header.signature_len as usize],
+        &keys,
+    ) {
+        return Err(Error::BadSignature);
+    }
+    kprintln!(
+        "  sysupdate   : signature checks out against one of {} trusted key(s)",
+        keys.len()
+    );
+
     let image = manifest.blob("image").map_err(Error::Container)?;
     let kernel = manifest.blob("kernel").map_err(Error::Container)?;
     let initrd = manifest.blob("initrd").map_err(Error::Container)?;
     let version = manifest.version().unwrap_or("<unversioned>");
+    if let Some(installed) = installed_version() {
+        // Откат по версии запрещён: подменённое зеркало иначе возвращает машину
+        // на дырявую, но **подлинно подписанную** старую версию — подпись на ней
+        // настоящая, и ни один ключ такой обман не ловит.
+        if !newer(version, &installed) {
+            return Err(Error::NotNewer {
+                have: installed,
+                offered: alloc::string::String::from(version),
+            });
+        }
+    }
 
     let mut guard = LAYOUT.lock();
     let layout = guard.as_mut().ok_or(Error::NoSlots)?;
@@ -300,7 +366,7 @@ pub fn apply(path: &str) -> Result<Slot, Error> {
         // системы, которую мы переносим.
         return Err(Error::Corrupt("root image"));
     }
-    stream(&*node, header.payload_offset() + image.offset, image.size, image.crc, "root image", |offset, chunk| {
+    stream(&*node, header.payload_offset() + image.offset, &image, "root image", |offset, chunk| {
         root_device
             .write(root_lba + offset / sector, chunk)
             .map_err(Error::Disk)
@@ -368,7 +434,7 @@ fn write_esp_file(
     // лежит то, что осталось от прежнего владельца, и отдавать это прошивке
     // незачем.
     let mut tail = [0u8; disk::MAX_SECTOR_SIZE];
-    stream(node, header.payload_offset() + blob.offset, blob.size, blob.crc, what, |offset, chunk| {
+    stream(node, header.payload_offset() + blob.offset, &blob, what, |offset, chunk| {
         let mut written = 0usize;
         while written < chunk.len() {
             let left = chunk.len() - written;
@@ -404,17 +470,22 @@ fn write_esp_file(
 fn stream(
     node: &dyn Node,
     mut offset: u64,
-    size: u64,
-    expected: u32,
+    blob: &Blob,
     what: &'static str,
     mut sink: impl FnMut(u64, &[u8]) -> Result<(), Error>,
 ) -> Result<(), Error> {
+    let size = blob.size;
+    let expected = blob.crc;
     let mut buffer = Vec::new();
     buffer.try_reserve_exact(CHUNK).map_err(|_| Error::Unreadable)?;
     buffer.resize(CHUNK, 0);
 
     let mut done = 0u64;
     let mut crc = fpk::CRC32_INIT;
+    // Хеш считается по той же дороге, что и сумма: второй проход по образу
+    // означал бы прочитать семьдесят мегабайт дважды — то есть удвоить самую
+    // долгую операцию системы ради того, что помещается в тот же цикл.
+    let mut hasher = fpk::Hasher::new();
     while done < size {
         let want = (size - done).min(CHUNK as u64) as usize;
         let read = node.read_at(offset, &mut buffer[..want]).map_err(|_| Error::Unreadable)?;
@@ -423,15 +494,62 @@ fn stream(
         }
         let chunk = &buffer[..read];
         crc = fpk::crc32_update(crc, chunk);
+        hasher.update(chunk);
         sink(done, chunk)?;
         done += read as u64;
         offset += read as u64;
     }
 
+    // Сумма проверяется первой: она ловит порчу и обрыв, и её отказ значит
+    // «файл повреждён», а не «файл подменили». Разные слова — разные действия.
     if crc != expected {
         return Err(Error::Corrupt(what));
     }
+    if let Some(expected) = blob.hash {
+        if hasher.finish() != expected {
+            return Err(Error::Tampered(what));
+        }
+    }
     Ok(())
+}
+
+/// Версия, с которой машина работает сейчас, — из `/os-release` её образа.
+fn installed_version() -> Option<alloc::string::String> {
+    let Some(Ok((bytes, _))) = fs::read("/os-release", 4096) else {
+        return None;
+    };
+    let text = core::str::from_utf8(&bytes).ok()?;
+    for line in text.lines() {
+        if let Some(value) = line.trim().strip_prefix("version=") {
+            return Some(alloc::string::String::from(value.trim()));
+        }
+    }
+    None
+}
+
+/// Новее ли `offered`, чем `have`.
+///
+/// Сравнение почисловое, по точкам: `0.1.9` меньше `0.1.10`, хотя строкой это
+/// не так. Кусок, который не разбирается числом, сравнивается как строка — иначе
+/// версия вида `0.2.0-rc1` останавливала бы обновления вовсе.
+fn newer(offered: &str, have: &str) -> bool {
+    let mut left = offered.split('.');
+    let mut right = have.split('.');
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return false,
+            (Some(_), None) => return true,
+            (None, Some(_)) => return false,
+            (Some(a), Some(b)) => {
+                match (a.parse::<u64>(), b.parse::<u64>()) {
+                    (Ok(a), Ok(b)) if a != b => return a > b,
+                    (Ok(_), Ok(_)) => {}
+                    _ if a != b => return a > b,
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 /// Прочитать ровно столько, сколько просили.

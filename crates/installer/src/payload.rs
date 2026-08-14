@@ -63,6 +63,9 @@ pub enum What {
     /// ESP: программу запускает система, а не прошивка, и лежать ей полагается
     /// там, где есть права.
     Program,
+    /// Доверенные ключи обновления. Едут в корень как `/os-keys`: они
+    /// описывают **образ**, а не машину, и заменяются вместе с ним.
+    Keys,
     /// Образцовый пакет `.fpk`. Едет в `/media` корневого раздела — туда же,
     /// куда его положил бы человек, подключив носитель, с которого пакет
     /// пришёл. Отсутствие пакетов установку не срывает: система без них
@@ -100,6 +103,7 @@ impl What {
             What::Initrd => "initrd",
             What::Program => "program",
             What::Package => "package",
+            What::Keys => "update keys",
         }
     }
 }
@@ -156,6 +160,21 @@ pub fn probe() -> Result<Payload, Error> {
             }
             Err(_) => logln!("[payload] program {source} is missing; /bin will lack it"),
         }
+    }
+
+    // Ключи обновления. Их отсутствие установку не срывает — система без них
+    // работает, просто обновиться не сможет, и скажет об этом словами.
+    match stat(&mut root, cstr16!("\\FREEOS\\OSKEYS"), What::Keys) {
+        Ok(size) => {
+            logln!("[payload] update keys: {size} bytes");
+            items.push(Item {
+                source: cstr16!("\\FREEOS\\OSKEYS"),
+                target: "os-keys",
+                what: What::Keys,
+                size,
+            });
+        }
+        Err(_) => logln!("[payload] no update keys on the medium; the system will refuse updates"),
     }
 
     for (source, target) in PACKAGES {

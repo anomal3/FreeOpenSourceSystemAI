@@ -137,7 +137,14 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
                 extra.push((format!("media/{}", package.file_name), package.path));
             }
         }
-        Some(initrd::build(&extra)?)
+        // Доверенные ключи обновления кладутся и сюда: у живой системы корень —
+        // это образ initrd, и читать `/os-keys` ей больше неоткуда. Обновиться
+        // она всё равно не может (слотов у носителя нет), но отказ обязан
+        // звучать «здесь нет слотов», а не «здесь нет ключей».
+        Some(initrd::build_with(&extra, &[(
+            String::from("os-keys"),
+            crate::keys::trusted_text()?.into_bytes(),
+        )])?)
     } else {
         println!("initrd пропущен (--no-initrd)");
         None

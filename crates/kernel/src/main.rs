@@ -56,6 +56,7 @@ mod sched;
 mod serial;
 mod shell;
 mod slot;
+mod trust;
 mod sync;
 mod time;
 mod tty;

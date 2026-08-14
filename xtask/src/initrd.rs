@@ -129,7 +129,14 @@ struct Entry {
 /// `extra` — пары «путь внутри образа, путь на хосте». Через них в образ
 /// попадают пользовательские программы: держать собранные бинарники в
 /// `initrd/` нельзя, они артефакты сборки, а не исходники.
-pub fn build(extra: &[(String, PathBuf)]) -> Result<PathBuf> {
+/// `generated` — файлы, у которых нет источника на диске: их содержимое
+/// собирается на месте. Так попадают в образ доверенные ключи обновления: они
+/// выводятся из ключа в `build/keys/`, а не лежат файлом, который можно было бы
+/// случайно закоммитить.
+pub fn build_with(
+    extra: &[(String, PathBuf)],
+    generated: &[(String, Vec<u8>)],
+) -> Result<PathBuf> {
     let source = paths::initrd_source_dir();
     if !source.is_dir() {
         bail!(
@@ -154,6 +161,15 @@ pub fn build(extra: &[(String, PathBuf)]) -> Result<PathBuf> {
         let data = fs::read(path)
             .with_context(|| format!("не удалось прочитать {}", path.display()))?;
         entries.push(Entry { rel: rel.clone(), node: Node::File(data) });
+    }
+
+    for (rel, data) in generated {
+        if let Some((dir, _)) = rel.rsplit_once('/') {
+            if !entries.iter().any(|entry| entry.rel == dir) {
+                entries.push(Entry { rel: dir.to_string(), node: Node::Dir });
+            }
+        }
+        entries.push(Entry { rel: rel.clone(), node: Node::File(data.clone()) });
     }
 
     let image = paths::initrd_image();

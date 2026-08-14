@@ -2465,7 +2465,19 @@ pub const ALL: &[Scenario] = &[
             Step::Line("echo keep-me > /home/roman/k.txt"),
             Step::Await("wrote 8 bytes", 15_000),
 
+            // Сначала — чужая подпись. Проверка, без которой все остальные
+            // ничего не значат: система, ставящая что угодно, проходит «годное
+            // обновление поставилось» ровно так же успешно, как правильная.
+            // Образ при этом целый и отличается от годного **только ключом**.
+            Step::Line("sysupdate apply /media/freeos-forged.fpk"),
+            Step::Await("does not match any key this system trusts", 60_000),
+            // И ни байта не записано: отказ случился до первой записи в раздел.
+            Step::Absent("sysupdate   : root image written"),
+            Step::Wait(2_000),
+
             Step::Line("sysupdate apply /media/freeos-0.2.fpk"),
+            // Подпись годного сходится, и система говорит об этом словами.
+            Step::Await("signature checks out against one of", 60_000),
             Step::Await("sysupdate   : root image written", 420_000),
             Step::Await("sysupdate   : kernel written", 300_000),
             Step::Await("sysupdate   : initrd written", 420_000),

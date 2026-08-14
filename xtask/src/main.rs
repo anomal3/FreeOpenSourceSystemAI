@@ -13,6 +13,7 @@ mod harness;
 mod image;
 mod initrd;
 mod inspect;
+mod keys;
 mod package;
 mod paths;
 mod qemu;

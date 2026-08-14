@@ -149,6 +149,24 @@ const UPDATE_ROOT_BYTES: u64 = 24 * 1024 * 1024;
 /// загрузка со слота не удаётся. Ровно та неисправность, ради которой
 /// существует откат: если бы обновление отвергалось на входе, откатывать было
 /// бы нечего.
+/// Каким собирается образ обновления.
+///
+/// Три варианта, и два последних существуют ради проверок, без которых первый
+/// ничего не доказывает: система, принимающая что угодно, ставит годный образ
+/// ровно так же успешно, как правильная.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Flavour {
+    /// Годный: подписан ключом, которому система доверяет.
+    Good,
+    /// **Подписан верно**, но внутри — испорченный том. Так и задумано: подпись
+    /// удостоверяет происхождение, а не исправность, и слот с таким образом
+    /// обязан отвергнуться на **загрузке**, а не при установке, — иначе
+    /// проверять откат было бы нечем.
+    Broken,
+    /// Целый, но подписан чужим ключом. Обязан быть отвергнут при `apply`.
+    Forged,
+}
+
 pub fn build_system(
     arch: Arch,
     release: bool,
@@ -156,9 +174,9 @@ pub fn build_system(
     kernel: &Path,
     initrd: &Path,
     programs: &[(&'static str, PathBuf)],
-    broken: bool,
+    flavour: Flavour,
 ) -> Result<Package> {
-    let root = build_root_image(version, programs, broken)?;
+    let root = build_root_image(version, programs, flavour == Flavour::Broken)?;
     let kernel_bytes = fs::read(kernel)
         .with_context(|| format!("не удалось прочитать ядро {}", kernel.display()))?;
     let initrd_bytes = fs::read(initrd)
@@ -177,20 +195,31 @@ pub fn build_system(
     let dir = output_dir();
     fs::create_dir_all(&dir)
         .with_context(|| format!("не удалось создать каталог {}", dir.display()))?;
-    let file_name = if broken {
-        String::from("freeos-broken.fpk")
-    } else {
-        system_file_name(version)
+    let file_name = match flavour {
+        Flavour::Good => system_file_name(version),
+        Flavour::Broken => String::from("freeos-broken.fpk"),
+        Flavour::Forged => String::from("freeos-forged.fpk"),
     };
     let path = dir.join(&file_name);
-    let bytes = system.finish();
+    let mut bytes = system.finish();
+    // Подпись ставится последней: она считается по готовому заголовку и
+    // манифесту, то есть по тому, что уже собрано.
+    let key = match flavour {
+        Flavour::Forged => crate::keys::stranger()?,
+        _ => crate::keys::release()?,
+    };
+    crate::keys::sign(&mut bytes, &key);
     fs::write(&path, &bytes)
         .with_context(|| format!("не удалось записать {}", path.display()))?;
     println!(
         "обновление: {} ({} МиБ{})",
         path.display(),
         bytes.len() / (1024 * 1024),
-        if broken { ", заведомо неисправное" } else { "" }
+        match flavour {
+            Flavour::Good => "",
+            Flavour::Broken => ", заведомо неисправное внутри",
+            Flavour::Forged => ", подписано чужим ключом",
+        }
     );
     let _ = release;
     Ok(Package { file_name, path })
@@ -249,6 +278,15 @@ fn build_root_image(
         .write_file_path(&mut disk, "os-release", release_text.as_bytes(), 0o644, 0, 0)
         .map_err(|err| anyhow::anyhow!("не удалось записать /os-release: {err}"))?;
 
+    // Доверенные ключи обновления. Лежат рядом с версией и по той же причине:
+    // они описывают **образ**, а не машину, и обязаны заменяться вместе с ним —
+    // иначе новая версия не смогла бы принести новый ключ, а старая узнала бы о
+    // смене ключа только тем, что перестала обновляться.
+    let keys_text = crate::keys::trusted_text()?;
+    fs_image
+        .write_file_path(&mut disk, "os-keys", keys_text.as_bytes(), 0o644, 0, 0)
+        .map_err(|err| anyhow::anyhow!("не удалось записать /os-keys: {err}"))?;
+
     fs_image
         .create_dir_path(&mut disk, "bin", 0o755, 0, 0)
         .map_err(|err| anyhow::anyhow!("не удалось создать /bin в образе: {err}"))?;
@@ -303,8 +341,9 @@ pub fn place_updates(
 ) -> Result<()> {
     use disk::BlockDevice as _;
 
-    let good = build_system(arch, release, UPDATE_VERSION, kernel, initrd, programs, false)?;
-    let broken = build_system(arch, release, UPDATE_VERSION, kernel, initrd, programs, true)?;
+    let good = build_system(arch, release, UPDATE_VERSION, kernel, initrd, programs, Flavour::Good)?;
+    let broken = build_system(arch, release, UPDATE_VERSION, kernel, initrd, programs, Flavour::Broken)?;
+    let forged = build_system(arch, release, UPDATE_VERSION, kernel, initrd, programs, Flavour::Forged)?;
 
     let mut dev = crate::diskfile::DiskFile::open(disk_path, 512)?;
     let table = disk::gpt::read(&mut dev)
@@ -322,7 +361,7 @@ pub fn place_updates(
     fs.mark_dirty(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось пометить том используемым: {err}"))?;
 
-    for package in [&good, &broken] {
+    for package in [&good, &broken, &forged] {
         let data = fs::read(&package.path)
             .with_context(|| format!("не удалось прочитать {}", package.path.display()))?;
         let target = format!("media/{}", package.file_name);
