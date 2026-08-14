@@ -36,6 +36,7 @@ mod qmp;
 mod scenarios;
 mod serial;
 mod shot;
+mod sshkeys;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -649,28 +650,39 @@ fn play(
                 }
                 println!("             {} байт совпали до последнего", echoed.len());
             }
-            Step::Ssh(expected, command, timeout_ms) => {
+            Step::Ssh(run) => {
                 let Some(port) = hostfwd else {
                     bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
                 };
-                println!("  [{at:>6} мс] шаг {index}: ssh -v на 127.0.0.1:{port}");
-                let output = run_ssh(port, command, *timeout_ms, prefix)
+                let what = match run.command {
+                    "" => "оболочка",
+                    command => command,
+                };
+                println!("  [{at:>6} мс] шаг {index}: ssh -v на 127.0.0.1:{port} — {what}");
+                let output = run_ssh(port, run, prefix, index)
                     .with_context(|| format!("шаг {index}"))?;
                 for line in output.lines().filter(|line| {
-                    // В отчёт попадает только то, что говорит о протоколе:
-                    // полный вывод `ssh -v` — это сотня строк про файлы
+                    // В отчёт попадает только то, что говорит о протоколе и о
+                    // входе: полный вывод `ssh -v` — это сотня строк про файлы
                     // настроек, которых на этой машине нет.
                     line.contains("kex")
                         || line.contains("host key")
                         || line.contains("Authentications")
                         || line.contains("Server accepts")
+                        || line.contains("Permission denied")
+                        || line.contains("Authenticated")
                         || line.starts_with("debug1: Remote protocol")
                 }) {
                     println!("             {}", line.trim());
                 }
-                for needle in *expected {
+                for needle in run.expect {
                     if !output.contains(needle) {
                         bail!("шаг {index}: в выводе ssh нет \"{needle}\"");
+                    }
+                }
+                for needle in run.absent {
+                    if output.contains(needle) {
+                        bail!("шаг {index}: в выводе ssh есть \"{needle}\", а его быть не должно");
                     }
                 }
             }
@@ -695,9 +707,10 @@ fn play(
 /// хоста у гостя новый на каждом прогоне, а файл известных хостов уводится в
 /// никуда. Иначе второй прогон встречал бы предупреждение о подмене ключа и
 /// отказ подключаться — то есть проверял бы аккуратность клиента, а не нас.
-fn run_ssh(port: u16, command: &str, timeout_ms: u64, prefix: &str) -> Result<String> {
+fn run_ssh(port: u16, run: &scenarios::SshRun, prefix: &str, index: usize) -> Result<String> {
     use std::process::Command;
 
+    let timeout_ms = run.timeout_ms;
     let known_hosts = paths::test_dir().join("ssh-known-hosts");
     std::fs::create_dir_all(paths::test_dir()).ok();
     // Файл известных хостов пересоздаётся пустым: ключ гостя меняется от
@@ -720,11 +733,36 @@ fn run_ssh(port: u16, command: &str, timeout_ms: u64, prefix: &str) -> Result<St
         .arg(format!("ConnectTimeout={}", (timeout_ms / 1000).max(5)))
         .arg("-o")
         .arg("PreferredAuthentications=publickey")
-        .arg(format!("roman@127.0.0.1"));
-    if !command.is_empty() {
-        cmd.arg(command);
+        // Ни агента, ни ключей «по умолчанию». Иначе прогон зависел бы от того,
+        // какие ключи лежат у разработчика в `~/.ssh`, — то есть у одного шёл
+        // бы иначе, чем у другого.
+        .arg("-o")
+        .arg("IdentityAgent=none")
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        // Псевдотерминал не запрашивается: его здесь нет, и запрос кончился бы
+        // строкой про неудавшийся pty в каждом прогоне.
+        .arg("-T");
+    match run.identity {
+        scenarios::Identity::None => {}
+        scenarios::Identity::Authorized => {
+            cmd.arg("-i").arg(sshkeys::authorized()?);
+        }
+        scenarios::Identity::Stranger => {
+            cmd.arg("-i").arg(sshkeys::stranger()?);
+        }
     }
-    cmd.stdin(Stdio::null());
+    cmd.arg(format!("{}@127.0.0.1", sshkeys::ACCOUNT));
+    if !run.command.is_empty() {
+        cmd.arg(run.command);
+    }
+    // Ввод подаётся каналом, а не с терминала: терминала у прогона нет вовсе, и
+    // клиент, увидев его отсутствие, сам не стал бы просить псевдотерминал.
+    cmd.stdin(if run.stdin.is_empty() {
+        Stdio::null()
+    } else {
+        Stdio::piped()
+    });
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -735,6 +773,26 @@ fn run_ssh(port: u16, command: &str, timeout_ms: u64, prefix: &str) -> Result<St
     let mut child = cmd
         .spawn()
         .context("не удалось запустить ssh; он нужен для этой проверки")?;
+
+    // Ввод отдаётся сразу и целиком, после чего канал закрывается. Закрытие —
+    // половина проверки: оно доезжает до гостя как `CHANNEL_EOF`, и построчный
+    // сеанс обязан на нём закончиться, как заканчивается всякая оболочка на
+    // `Ctrl-D`. Клиент, у которого вход остался открытым, ждал бы до таймаута.
+    if !run.stdin.is_empty() {
+        use std::io::Write as _;
+        let mut input = child
+            .stdin
+            .take()
+            .context("у ssh не оказалось входного канала")?;
+        input
+            .write_all(run.stdin.as_bytes())
+            .context("не удалось отдать ssh его ввод")?;
+    }
+
+    // Журнал у каждого запуска свой: в одном сценарии их несколько, и общий
+    // файл сохранил бы только последний — то есть как раз не тот, на котором
+    // сценарий упал.
+    let log = paths::test_dir().join(format!("{prefix}-ssh-{index}.log"));
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         match child.try_wait()? {
@@ -747,7 +805,6 @@ fn run_ssh(port: u16, command: &str, timeout_ms: u64, prefix: &str) -> Result<St
                 let output = child.wait_with_output()?;
                 let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
                 text.push_str(&String::from_utf8_lossy(&output.stdout));
-                let log = paths::test_dir().join(format!("{prefix}-ssh.log"));
                 std::fs::create_dir_all(paths::test_dir()).ok();
                 std::fs::write(&log, text.as_bytes()).ok();
                 bail!(
@@ -767,7 +824,6 @@ fn run_ssh(port: u16, command: &str, timeout_ms: u64, prefix: &str) -> Result<St
     // Полный вывод клиента ложится рядом с журналом гостя. Он и есть вторая
     // половина картины: гость рассказывает, что делал он, а `ssh -v` — что из
     // этого понял тот, кто с ним разговаривал.
-    let log = paths::test_dir().join(format!("{prefix}-ssh.log"));
     std::fs::write(&log, text.as_bytes()).ok();
     println!("             вывод ssh: {}", log.display());
 
@@ -1003,6 +1059,12 @@ fn prepare_drives(
                     initrd,
                     &programs,
                 )?;
+            }
+            // Ключ — тем же приёмом и до запуска: так же, как человек положил бы
+            // его в `~/.ssh/authorized_keys`, сидя за этой машиной. Почему не
+            // через образ initrd, сказано в заголовке `sshkeys`.
+            if scenario.ssh_key {
+                sshkeys::place_authorized_key(&disk, &sshkeys::authorized()?)?;
             }
             vec![Drive::Image(disk)]
         }

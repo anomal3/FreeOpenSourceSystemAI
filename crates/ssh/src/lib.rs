@@ -40,6 +40,15 @@
 
 #![no_std]
 
+// Тесты живут на хосте. Объявление обязательно: в `no_std`-крейте `std` не
+// подключается сам даже там, где он доступен.
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod tests;
+
+pub mod auth;
 pub mod cipher;
 pub mod wire;
 
@@ -109,6 +118,11 @@ pub const MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
 pub const MSG_CHANNEL_OPEN_FAILURE: u8 = 92;
 pub const MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
 pub const MSG_CHANNEL_DATA: u8 = 94;
+/// Второй поток канала. Единственный код, который бывает у сеанса, — `1`,
+/// «поток ошибок»: то, что на локальной машине ушло бы в stderr.
+pub const MSG_CHANNEL_EXTENDED_DATA: u8 = 95;
+/// Код потока ошибок в [`MSG_CHANNEL_EXTENDED_DATA`] (RFC 4254 §5.2).
+pub const EXTENDED_DATA_STDERR: u32 = 1;
 pub const MSG_CHANNEL_EOF: u8 = 96;
 pub const MSG_CHANNEL_CLOSE: u8 = 97;
 pub const MSG_CHANNEL_REQUEST: u8 = 98;
@@ -119,6 +133,17 @@ pub const MSG_CHANNEL_FAILURE: u8 = 100;
 pub const DISCONNECT_KEY_EXCHANGE_FAILED: u32 = 3;
 /// Причина разрыва: протокол нарушен.
 pub const DISCONNECT_PROTOCOL_ERROR: u32 = 2;
+/// Причина разрыва: способов войти не осталось.
+///
+/// Именно её ждёт клиент после нескольких неудачных попыток: разрыв без причины
+/// он покажет человеку как «connection closed by remote host», то есть как сбой
+/// сети, а не как отказ во входе.
+pub const DISCONNECT_NO_MORE_AUTH: u32 = 14;
+
+/// Отказ открыть канал: такого типа канала здесь нет (RFC 4254 §5.1).
+pub const OPEN_UNKNOWN_CHANNEL_TYPE: u32 = 3;
+/// Отказ открыть канал: нечем обслужить ещё один.
+pub const OPEN_RESOURCE_SHORTAGE: u32 = 4;
 
 // --- имена алгоритмов --------------------------------------------------------
 

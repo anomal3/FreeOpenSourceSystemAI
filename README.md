@@ -58,6 +58,20 @@ An open operating system written from scratch in Rust, targeting **ARM64** and *
 > dependencies here); the packet layer, the exchange hash and the OpenSSH cipher construction
 > are ours. Keys need randomness, so the kernel grew a source of it: `RDRAND`/`RNDR` where the
 > CPU has one, interrupt-timing jitter where it does not — and it says which in the boot log.
+>
+> **Phase 38 done: a key logs in, and a command runs.** `ssh -i key roman@host uptime` gets
+> its answer back and the right exit status; `ssh -i key roman@host` opens a session that
+> reads commands from the channel. The key is checked the way OpenSSH checks it — the
+> signature covers the session id, so a recorded one gets nobody in anywhere else, and the
+> `authorized_keys` file is refused if it or the directories above it are writable by anyone
+> else. Accounts come from `/etc/passwd`, which means two things on purpose: a live image
+> lets nobody in at all (there are no accounts on it, and putting one there would ship it
+> inside the ISO), and `root` never logs in over the network. Commands run inside `sshd`
+> for now, so `sshd` checks every path itself against the account that logged in: over the
+> network you see exactly what that person sees at the machine's own terminal, and the bench
+> proves it by reading a file that is world-readable inside a directory that is not — and
+> getting a refusal. Running real programs from `/bin` needs pipes, which is phase 38b, and
+> `help` says so in its first line rather than pretending otherwise.
 
 ## Getting it
 
@@ -1510,7 +1524,10 @@ name server the lease named (`dns` — the one scenario here that needs the deve
 to reach the internet); and an echo server inside the system talks to a real `TcpStream` on
 the host, in both directions and over eight kilobytes (`tcp`); and a real `ssh` client reaches
 key exchange and encryption against `/bin/sshd`, naming the algorithms in its own log
-(`ssh-kex`).
+(`ssh-kex`); and that same client logs in with a key on the installed system, runs a command
+and gets its output and exit status back, is refused when the key is one the machine does not
+know, and is refused again — without a byte of the file — when it asks for one this account
+may not read (`ssh-shell`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -1637,7 +1654,7 @@ crates/boot-uefi/   UEFI application: GOP probe, ELF loading, ExitBootServices
 crates/calendar/    Unix seconds ↔ a civil date, no_std: bootloader + installer + kernel
 crates/disk/        GPT and a FAT32 formatter, no_std: host image builder + installer
 crates/ext2/        The ext2 format: formatter, writer and reader, no_std
-crates/ssh/         SSH transport: packets, curve25519 exchange, chacha20-poly1305
+crates/ssh/         SSH: packets, curve25519 exchange, chacha20-poly1305, public-key login
 crates/mini-ui/     Surfaces, 8x8 text (ASCII + Cyrillic), widgets: kernel + installer
 crates/usb-hid/     HID report descriptors: what a device says about its own reports
 crates/installer/   UEFI application: disk selection, partitioning, account, install
@@ -1744,8 +1761,11 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 35 | UDP, DHCP, DNS: the machine gets its own address, and the DHCP client is a service | **done** |
 | 36 | TCP, and sockets for programs | **done** |
 | 37 | SSH transport (RFC 4253): key exchange and encryption a real `ssh` agrees with | **done** |
-| 38 | SSH authentication and a session (RFC 4252, 4254): a shell over the network | planned |
+| 38 | SSH authentication and a session (RFC 4252, 4254): a key logs in, a command runs, output comes back | **done** |
+| 38a | Somebody else's machine: USB input beyond xHCI, and a boot entry the firmware honours | planned |
+| 38b | Pipes, and a real shell over the network: programs from `/bin` run as the account that logged in | planned |
 | 39 | Updating over the network, with signatures checked before anything is written | planned |
+| 39a | TLS, and a second update channel: the same update from GitHub Releases when the first server is silent | planned |
 | 40 | Memory on request: `mmap`, so a program is no longer a fixed 512 KiB window | planned |
 | 41 | A file mapped into memory, paged in on demand — a model larger than RAM | planned |
 | 42 | Huge pages: a gigabyte of data stops costing a quarter of a million TLB entries | planned |

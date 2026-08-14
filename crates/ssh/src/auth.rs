@@ -109,6 +109,13 @@ pub fn verify(
     session_id: &[u8; 32],
     scratch: &mut [u8],
 ) -> bool {
+    // Имя алгоритма в самой попытке входа. Оно едет отдельно от ключа и
+    // попадает в подписанное как есть, поэтому проверяется тоже: имя, не
+    // совпадающее с тем, что внутри ключа, — это либо чужой клиент, либо
+    // попытка провести нас мимо разбора.
+    if request.algorithm != KEY_ALGORITHM.as_bytes() {
+        return false;
+    }
     let Some(key) = key_from_blob(request.key_blob) else {
         return false;
     };

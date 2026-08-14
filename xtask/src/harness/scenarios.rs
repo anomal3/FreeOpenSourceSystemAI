@@ -178,14 +178,10 @@ pub enum Step {
     TcpBulk(usize, u64),
     /// Позвать **настоящий** `ssh` с хоста и проверить, что он сказал.
     ///
-    /// Аргументы: что должно найтись в его выводе (`ssh -v` пишет в поток
-    /// ошибок), команда для удалённой стороны (пустая строка — не давать
-    /// команду) и предел ожидания.
-    ///
     /// Самая честная проверка SSH, какая существует: клиент OpenSSH придирчив к
     /// деталям формата, и всё, в чём мы ошиблись, он назовёт вслух и оборвёт
     /// соединение. Никакой наш код в этой проверке не участвует.
-    Ssh(&'static [&'static str], &'static str, u64),
+    Ssh(SshRun),
     /// Дождаться, пока **процесс QEMU завершится сам** (мс).
     ///
     /// Самая сильная проверка выключения из возможных: до этой фазы стенд
@@ -193,6 +189,48 @@ pub enum Step {
     /// процесс ушёл сам — значит гость действительно выполнил команду ACPI (или
     /// PSCI), а не просто напечатал, что собирается.
     Exits(u64),
+}
+
+/// С каким ключом стенд стучится к гостю.
+///
+/// Ключи делает `ssh-keygen` на машине разработчика при первом прогоне, а
+/// открытая половина `Authorized` попадает в `authorized_keys` гостя — см.
+/// [`super::sshkeys`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Identity {
+    /// Ключа нет вовсе: клиент дойдёт до отказа во входе и там остановится.
+    None,
+    /// Ключ, записанный в `authorized_keys` гостя.
+    Authorized,
+    /// Ключ, которого гость не знает.
+    ///
+    /// Без этой проверки все остальные ничего не доказывают: сервер, пускающий
+    /// по любому ключу, проходит проверку «вошли с правильным ключом» ровно так
+    /// же успешно, как правильный.
+    Stranger,
+}
+
+/// Один запуск настоящего `ssh` с хоста.
+///
+/// Полями, а не позициями: их шесть, и строка вида `Ssh(&[...], "", "", &[], 60_000)`
+/// читалась бы гаданием.
+pub struct SshRun {
+    pub identity: Identity,
+    /// Команда для удалённой стороны. Пусто — сеанс без команды, то есть
+    /// оболочка.
+    pub command: &'static str,
+    /// Что подать клиенту на вход. Построчный сеанс читает это как команды —
+    /// так проверяется оболочка, которой некому набирать.
+    pub stdin: &'static str,
+    /// Что обязано найтись в выводе `ssh` (он пишет диагностику в поток ошибок,
+    /// а вывод удалённой команды — в обычный; проверяются оба).
+    pub expect: &'static [&'static str],
+    /// Чего в выводе быть не должно.
+    ///
+    /// Проверка отказа состоит из двух половин, и вторая здесь: мало увидеть
+    /// слово «отказано» — надо убедиться, что содержимого файла в ответе нет.
+    pub absent: &'static [&'static str],
+    pub timeout_ms: u64,
 }
 
 pub struct Scenario {
@@ -269,6 +307,14 @@ pub struct Scenario {
     /// шестидесяти мегабайт на каждой установке — ради файла, который нужен
     /// двум сценариям из тридцати.
     pub updates: bool,
+    /// Положить открытый ключ стенда в `authorized_keys` гостя.
+    ///
+    /// Тем же приёмом и по той же причине, что [`Scenario::updates`]: файл
+    /// пишется на **раздел состояния** уже установленного образа, а не в
+    /// initrd. Ключ, попавший в initrd, уехал бы в выпущенный ISO — и всякий,
+    /// кто его скачал, получил бы систему, пускающую владельца ключа из
+    /// `build/test/`. Подробности — в [`super::sshkeys`].
+    pub ssh_key: bool,
 }
 
 impl Scenario {
@@ -308,6 +354,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await(crate::version::KERNEL_BANNER, BOOT),
@@ -343,6 +390,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -398,6 +446,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -501,6 +550,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -571,6 +621,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -634,6 +685,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -695,6 +747,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[Arch::X86_64],
         reboots: false,
         updates: false,
+        ssh_key: false,
         // Свойство накапливается к уже заданной машине `q35`, как и `i8042=off`
         // у `usb_only`. Так воспроизводится VirtualBox: там PIT существует, но
         // измерить по нему частоту локального APIC не удаётся, и система
@@ -732,6 +785,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -870,6 +924,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -939,6 +994,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         // `-cpu max` — не украшение. С процессором по умолчанию QEMU не
         // объявляет `XSAVE`, и ядро уходит на путь `FXSAVE`: проверялась бы
         // ровно та половина, которой на современной машине не бывает. Здесь
@@ -984,6 +1040,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1031,6 +1088,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1092,6 +1150,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1143,6 +1202,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Время системы считает счётчик, который идёт сам, а не тики
@@ -1199,6 +1259,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Это утверждение фазы целиком: прошивка нашла на носителе
@@ -1237,6 +1298,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[Arch::Aarch64],
         reboots: false,
         updates: false,
+        ssh_key: false,
         // Свойство накапливается к уже заданной машине `virt`. Версия по
         // умолчанию — та, что выбрал QEMU; здесь она задана явно, потому что
         // проверяется именно другая ветка кода.
@@ -1275,6 +1337,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1300,6 +1363,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // На VVFAT таблицы разделов не существует вовсе — QEMU синтезирует
@@ -1326,6 +1390,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("FreeOS installer", BOOT),
@@ -1384,6 +1449,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
@@ -1458,6 +1524,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1541,6 +1608,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1644,6 +1712,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Это отдельная загрузка того же диска. Всё, что проверяется ниже,
@@ -1683,6 +1752,7 @@ pub const ALL: &[Scenario] = &[
         // Единственный сценарий, в котором перезагрузка — цель, а не симптом.
         reboots: true,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Первая загрузка. Каким том был до неё, не утверждаем: предыдущий
@@ -1747,6 +1817,7 @@ pub const ALL: &[Scenario] = &[
         // существует; после него машина обязана подняться сама.
         reboots: true,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
@@ -1800,6 +1871,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Клавиши жмутся **заранее**: прошивка копит нажатия в буфере, а
@@ -1863,6 +1935,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[Arch::X86_64],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Кнопка заведена при загрузке — и сказано, каким вектором и с
@@ -1892,6 +1965,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Сначала — что найден именно контроллер AHCI, а не что-то, что
@@ -1941,6 +2015,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Версия и шаг звонков читаются из регистров контроллера: получить
@@ -1984,6 +2059,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -2087,6 +2163,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Супервизор поднимается **при загрузке**, без единой команды: это
@@ -2144,6 +2221,122 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "ssh-shell",
+        about: "Вход по ключу: чужой ssh выполняет команду в установленной системе и видит ровно то, что видит этот человек.",
+        // Установленная система, а не живая, и это главное решение сценария.
+        // Вход по ключу требует учётной записи, домашнего каталога и настоящих
+        // прав на файлах — всего того, чего на образе initrd нет и быть не
+        // должно. На FAT, где всё `root:root 0755`, проверка прав ничего не
+        // проверяла бы.
+        //
+        // Отсюда и место в списке: после `install`, который делает этот диск, и
+        // до `install4k`, который пересоздаёт его с сектором 4096.
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        guest_port: 22,
+        host_echo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        ssh_key: true,
+        extra: &[],
+        steps: &[
+            Step::AwaitAny("account     : /etc/passwd", BOOT),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 90_000),
+            Step::AwaitAny("sshd: listening on port 22", 90_000),
+            // Учётные записи у сервера есть — на живой системе этой строки не
+            // бывает, и разница между двумя системами видна сразу.
+            Step::AwaitAny("sshd: accounts come from /etc/passwd", 15_000),
+            Step::Wait(1_000),
+
+            // 1. Чужой ключ. Проверка, без которой все остальные ничего не
+            // значат: сервер, пускающий кого угодно, прошёл бы их все.
+            Step::Ssh(SshRun {
+                identity: Identity::Stranger,
+                command: "uptime",
+                stdin: "",
+                expect: &["Permission denied"],
+                // И ответа команды при этом нет: отказ настоящий, а не «пустили
+                // и ничего не дали».
+                absent: &["up "],
+                timeout_ms: 60_000,
+            }),
+            Step::AwaitAny("sshd: this key is not in /home/roman/.ssh/authorized_keys", 30_000),
+
+            // 2. Свой ключ — вход и команда. Подпись клиента привязана к
+            // идентификатору сеанса, то есть годится ровно для этого
+            // соединения; проверяет её чужая библиотека по чужому же формату.
+            Step::Ssh(SshRun {
+                identity: Identity::Authorized,
+                command: "uptime",
+                stdin: "",
+                expect: &["up ", " ms"],
+                absent: &["Permission denied"],
+                timeout_ms: 60_000,
+            }),
+            Step::AwaitAny(
+                "sshd: roman authenticated with a key from /home/roman/.ssh/authorized_keys",
+                30_000,
+            ),
+            Step::AwaitAny("sshd: exec 'uptime' for roman", 15_000),
+            // Код завершения доехал: `ssh` в чужом скрипте проверяет именно его,
+            // и команда, отработавшая с ошибкой, не должна выглядеть удачной.
+            Step::AwaitAny("sshd: session closed with status 0", 15_000),
+
+            // 3. Сеанс знает, кого впустили, — а не «кого-нибудь».
+            Step::Ssh(SshRun {
+                identity: Identity::Authorized,
+                command: "id",
+                stdin: "",
+                expect: &["uid=1000(roman)", "home=/home/roman"],
+                absent: &[],
+                timeout_ms: 60_000,
+            }),
+
+            // 4. Файл `0600` в домашнем каталоге читается — по классу владельца.
+            // Его положил установщик ровно для этой проверки.
+            Step::Ssh(SshRun {
+                identity: Identity::Authorized,
+                command: "cat notes.txt",
+                stdin: "",
+                expect: &["This file belongs to you and to nobody else"],
+                absent: &["permission denied"],
+                timeout_ms: 60_000,
+            }),
+
+            // 5. И главное утверждение фазы: по сети видно ровно то же, что
+            // видно этому человеку за терминалом. `/root/notes.txt` — файл
+            // `0644` в каталоге `0700`, то есть права файла разрешают, а путь
+            // не пускает. Правильный ответ — отказ, и текста файла в ответе нет.
+            Step::Ssh(SshRun {
+                identity: Identity::Authorized,
+                command: "cat /root/notes.txt",
+                stdin: "",
+                expect: &["permission denied: /root/notes.txt"],
+                absent: &["world-readable"],
+                timeout_ms: 60_000,
+            }),
+
+            // 6. Сеанс без команды — оболочка, читающая канал построчно.
+            // Клиенту нечем набирать, поэтому команды подаются ему на вход, как
+            // это делает всякий скрипт с `ssh`.
+            Step::Ssh(SshRun {
+                identity: Identity::Authorized,
+                command: "",
+                stdin: "whoami\nuptime\nexit\n",
+                expect: &["freeos-ssh> ", "roman", "up "],
+                absent: &["Permission denied"],
+                timeout_ms: 60_000,
+            }),
+            Step::AwaitAny("sshd: interactive session for roman", 30_000),
+
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "rollback",
         about: "Заведомо неисправная система в слоте: попытки кончаются, машина возвращается назад.",
         target: Target::Installed,
@@ -2158,6 +2351,7 @@ pub const ALL: &[Scenario] = &[
         // возврат.
         reboots: true,
         updates: true,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -2233,6 +2427,7 @@ pub const ALL: &[Scenario] = &[
         // Две загрузки в одном процессе: до обновления и после.
         reboots: true,
         updates: true,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -2297,6 +2492,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::Await("FreeOS installer", BOOT),
@@ -2345,6 +2541,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Диск объявляет свой блок сам, и ядро его принимает, а не
@@ -2386,6 +2583,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Карта найдена и назвала свой аппаратный адрес. Адрес приехал из
@@ -2452,6 +2650,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
@@ -2464,20 +2663,29 @@ pub const ALL: &[Scenario] = &[
             // каждому полю формата, и всё, в чём мы ошиблись, назовёт вслух.
             // Проверяются три утверждения: договорились об обмене ключами,
             // приняли ключ хоста ed25519, договорились о шифре в обе стороны.
-            Step::Ssh(
-                &[
+            Step::Ssh(SshRun {
+                // Без ключа: этот сценарий проверяет транспорт, а не вход.
+                identity: Identity::None,
+                command: "",
+                stdin: "",
+                expect: &[
                     "kex: algorithm: curve25519-sha256",
                     "kex: host key algorithm: ssh-ed25519",
                     "chacha20-poly1305@openssh.com",
-                    // Аутентификация обязана быть отвергнута — её механизм это
-                    // следующая фаза. Отказ здесь — успех сценария: он
-                    // означает, что зашифрованный канал работает и по нему
-                    // прошёл разбор сообщений.
+                    // Аутентификация обязана быть отвергнута, и здесь это
+                    // успех сценария: отказ означает, что зашифрованный канал
+                    // работает и по нему прошёл разбор сообщений.
+                    //
+                    // На живой системе она отвергается **всегда**, кем бы ни
+                    // был клиент: учётных записей на образе initrd нет, а
+                    // класть их туда нельзя — этот образ уезжает в выпуск.
                     "Authentications that can continue: publickey",
                 ],
-                "",
-                60_000,
-            ),
+                absent: &[],
+                timeout_ms: 60_000,
+            }),
+            // И гость называет причину своими словами.
+            Step::AwaitAny("sshd: no /etc/passwd here, so nobody can log in", 30_000),
 
             // Гость видел то же самое со своей стороны.
             Step::AwaitAny("sshd: encrypted, curve25519-sha256 with chacha20-poly1305", 30_000),
@@ -2499,6 +2707,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Адрес берётся у DHCP: сервер, которому его задали руками, проверял
@@ -2567,6 +2776,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Адрес и сервер имён приезжают от DHCP — руками здесь не задаётся
@@ -2615,6 +2825,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        ssh_key: false,
         extra: &[],
         steps: &[
             // Служба поднимается супервизором при загрузке, без единой команды.
