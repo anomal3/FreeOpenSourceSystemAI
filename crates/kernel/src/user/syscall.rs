@@ -41,8 +41,8 @@ use user_abi::{
 use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
-    SYS_NETINFO, SYS_PEER, SYS_RECV, SYS_RESOLVE, SYS_SEND, SYS_SHUTDOWN, SYS_SOCKET,
-    SYS_STREAMSTATE,
+    SYS_NETINFO, SYS_PEER, SYS_RANDOM, SYS_RECV, SYS_RESOLVE, SYS_SEND, SYS_SHUTDOWN,
+    SYS_SOCKET, SYS_STREAMSTATE,
 };
 
 use crate::net::{self, NetError};
@@ -140,6 +140,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_NETCONF => netconf(a0, a1),
         SYS_NETINFO => netinfo(a0, a1),
         SYS_RESOLVE => resolve(a0, a1, a2),
+        SYS_RANDOM => random(a0, a1),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -873,6 +874,24 @@ fn resolve(ptr: usize, len: usize, out: usize) -> i64 {
         }
         Err(err) => net_errno(err),
     }
+}
+
+/// `random(ptr, len) -> len`.
+///
+/// Ограничения на длину нет: программа, попросившая мегабайт случайности,
+/// потратит его сама, а пул от этого не истощается — он не расходуемый запас,
+/// а состояние, которое прокручивается.
+fn random(ptr: usize, len: usize) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    if !space::user_can(ptr, len, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: диапазон проверен по таблицам программы на запись.
+    let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+    crate::random::fill(out);
+    len as i64
 }
 
 fn net_errno(err: NetError) -> i64 {

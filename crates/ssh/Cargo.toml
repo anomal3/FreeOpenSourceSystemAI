@@ -1,0 +1,30 @@
+[package]
+name = "ssh"
+description = "SSH transport layer (RFC 4253): binary packet protocol, curve25519 key exchange, chacha20-poly1305."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Криптография — чужая, и это решение записано в ROADMAP (фаза 37). Своя
+# реализация Curve25519 без постоянного времени исполнения — не упражнение, а
+# дыра: ключ вытекает через время работы умножения, и заметить это по тестам
+# невозможно.
+#
+# Все четыре крейта — `no_std` без кучи, из набора RustCrypto и dalek. Они же
+# лежат в основе большинства чужих реализаций SSH на Rust.
+sha2 = { version = "0.10", default-features = false }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+ed25519-dalek = { version = "2", default-features = false }
+# ChaCha20 и Poly1305 берутся по отдельности, а не готовой конструкцией AEAD.
+# Причина в том, что `chacha20-poly1305@openssh.com` — **не** RFC 8439: там два
+# независимых ключа (один шифрует длину, другой содержимое), счётчик блока
+# начинается с единицы, а ключ Poly1305 берётся из нулевого блока второго
+# потока. Готовый AEAD собран по другим правилам и подошёл бы только внешне.
+chacha20 = { version = "0.9", default-features = false }
+poly1305 = { version = "0.8", default-features = false }
+
+[lints]
+workspace = true

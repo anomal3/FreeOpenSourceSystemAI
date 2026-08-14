@@ -649,6 +649,31 @@ fn play(
                 }
                 println!("             {} байт совпали до последнего", echoed.len());
             }
+            Step::Ssh(expected, command, timeout_ms) => {
+                let Some(port) = hostfwd else {
+                    bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
+                };
+                println!("  [{at:>6} мс] шаг {index}: ssh -v на 127.0.0.1:{port}");
+                let output = run_ssh(port, command, *timeout_ms, prefix)
+                    .with_context(|| format!("шаг {index}"))?;
+                for line in output.lines().filter(|line| {
+                    // В отчёт попадает только то, что говорит о протоколе:
+                    // полный вывод `ssh -v` — это сотня строк про файлы
+                    // настроек, которых на этой машине нет.
+                    line.contains("kex")
+                        || line.contains("host key")
+                        || line.contains("Authentications")
+                        || line.contains("Server accepts")
+                        || line.starts_with("debug1: Remote protocol")
+                }) {
+                    println!("             {}", line.trim());
+                }
+                for needle in *expected {
+                    if !output.contains(needle) {
+                        bail!("шаг {index}: в выводе ssh нет \"{needle}\"");
+                    }
+                }
+            }
             Step::Shot(name) => {
                 println!("  [{at:>6} мс] шаг {index}: снимок '{name}'");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
@@ -662,6 +687,91 @@ fn play(
         }
     }
     Ok(())
+}
+
+/// Позвать штатный `ssh` и вернуть всё, что он написал.
+///
+/// Проверка знания хоста выключена намеренно и двумя способами сразу: ключ
+/// хоста у гостя новый на каждом прогоне, а файл известных хостов уводится в
+/// никуда. Иначе второй прогон встречал бы предупреждение о подмене ключа и
+/// отказ подключаться — то есть проверял бы аккуратность клиента, а не нас.
+fn run_ssh(port: u16, command: &str, timeout_ms: u64, prefix: &str) -> Result<String> {
+    use std::process::Command;
+
+    let known_hosts = paths::test_dir().join("ssh-known-hosts");
+    std::fs::create_dir_all(paths::test_dir()).ok();
+    // Файл известных хостов пересоздаётся пустым: ключ гостя меняется от
+    // прогона к прогону, и запись от прошлого раза — это гарантированный отказ.
+    std::fs::write(&known_hosts, b"").ok();
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-v")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        // Пароль спрашивать некому: прогон идёт без человека, а клиент, дойдя
+        // до запроса пароля, повис бы до таймаута.
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", (timeout_ms / 1000).max(5)))
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg(format!("roman@127.0.0.1"));
+    if !command.is_empty() {
+        cmd.arg(command);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // Запуск с ожиданием по часам, а не `output()`. У `ssh` нет предела на
+    // время рукопожатия: сервер, замолчавший после согласования алгоритмов,
+    // держит клиента бесконечно, и стенд вместе с ним. Ровно это и случилось
+    // на первом же прогоне — прогон встал насмерть, а причина была в госте.
+    let mut child = cmd
+        .spawn()
+        .context("не удалось запустить ssh; он нужен для этой проверки")?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match child.try_wait()? {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                child.kill().ok();
+                // Даже у зависшего клиента есть что рассказать: он успел
+                // напечатать всё, что понял до молчания, и именно эти строки
+                // объясняют, чего он ждал.
+                let output = child.wait_with_output()?;
+                let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+                text.push_str(&String::from_utf8_lossy(&output.stdout));
+                let log = paths::test_dir().join(format!("{prefix}-ssh.log"));
+                std::fs::create_dir_all(paths::test_dir()).ok();
+                std::fs::write(&log, text.as_bytes()).ok();
+                bail!(
+                    "ssh не ответил за {timeout_ms} мс — гость молчит после рукопожатия;                      что успел сказать клиент: {}",
+                    log.display()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let output = child.wait_with_output()?;
+    // Оба потока вместе: `ssh -v` пишет диагностику в поток ошибок, а вывод
+    // удалённой команды — в обычный, и проверять приходится и то и другое.
+    let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stdout));
+
+    // Полный вывод клиента ложится рядом с журналом гостя. Он и есть вторая
+    // половина картины: гость рассказывает, что делал он, а `ssh -v` — что из
+    // этого понял тот, кто с ним разговаривал.
+    let log = paths::test_dir().join(format!("{prefix}-ssh.log"));
+    std::fs::write(&log, text.as_bytes()).ok();
+    println!("             вывод ssh: {}", log.display());
+
+    Ok(text)
 }
 
 /// Порт, на котором стенд поднимает эхо-сервер для гостя.

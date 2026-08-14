@@ -12,6 +12,7 @@ members = [
     "crates/kernel",
     "crates/mini-ui",
     "crates/slots",
+    "crates/ssh",
     "crates/usb-hid",
     "crates/user-abi",
     "crates/user-progs",

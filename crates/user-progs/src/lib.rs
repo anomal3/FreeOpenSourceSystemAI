@@ -30,7 +30,7 @@ use user_abi::{
 use user_abi::{
     SOCK_TCP, SOCK_UDP, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN,
     SYS_NETCONF, SYS_NETINFO, SYS_PEER, SYS_RECV, SYS_RESOLVE, SYS_SEND, SYS_SHUTDOWN,
-    SYS_SOCKET, SYS_STREAMSTATE,
+    SYS_RANDOM, SYS_SOCKET, SYS_STREAMSTATE,
 };
 
 pub use user_abi::{
@@ -818,6 +818,19 @@ pub fn netconf(config: &NetConfig) -> i64 {
             0,
         )
     }
+}
+
+/// Заполнить буфер случайными байтами.
+///
+/// Возвращает `false`, только если ядро отказалось: с буфером программы этого
+/// не случается, но проверять всё равно надо — ключ, собранный из
+/// неинициализированного массива, выглядит как ключ.
+pub fn random(buffer: &mut [u8]) -> bool {
+    // SAFETY: буфер живёт в памяти программы, длина — его собственная.
+    let result = unsafe {
+        syscall(SYS_RANDOM, buffer.as_mut_ptr() as usize, buffer.len(), 0)
+    };
+    result == buffer.len() as i64
 }
 
 /// Спросить, что система знает о своей сети.

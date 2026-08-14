@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 36 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 37 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -49,6 +49,15 @@ An open operating system written from scratch in Rust, targeting **ARM64** and *
 > system and an ordinary `TcpStream` on the host talks to it through a forwarded port —
 > short strings, then eight kilobytes with a pattern that would expose a reordered byte.
 > `/bin/echoc` proves the other half: the guest opens the connection and the host answers.
+>
+> **Phase 37 done: `ssh -v` gets all the way to encryption.** A real OpenSSH client on Windows
+> exchanges versions with `/bin/sshd`, agrees on `curve25519-sha256`, accepts an `ssh-ed25519`
+> host key this machine made for itself, switches to `chacha20-poly1305@openssh.com`, and
+> talks over the encrypted channel — where it is politely refused, because authentication is
+> the next phase. The cryptography is borrowed (dalek and RustCrypto, the first outside
+> dependencies here); the packet layer, the exchange hash and the OpenSSH cipher construction
+> are ours. Keys need randomness, so the kernel grew a source of it: `RDRAND`/`RNDR` where the
+> CPU has one, interrupt-timing jitter where it does not — and it says which in the boot log.
 
 ## Getting it
 
@@ -1456,7 +1465,7 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Thirty-nine scenarios today: a program runs in an address space of its own, one that faults is
+Forty scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
@@ -1499,7 +1508,9 @@ we got wrong (`net`); the address itself is then taken by a service rather than 
 taken again after that service is killed (`dhcp`); and a name becomes an address, asked of the
 name server the lease named (`dns` — the one scenario here that needs the developer's machine
 to reach the internet); and an echo server inside the system talks to a real `TcpStream` on
-the host, in both directions and over eight kilobytes (`tcp`).
+the host, in both directions and over eight kilobytes (`tcp`); and a real `ssh` client reaches
+key exchange and encryption against `/bin/sshd`, naming the algorithms in its own log
+(`ssh-kex`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -1626,6 +1637,7 @@ crates/boot-uefi/   UEFI application: GOP probe, ELF loading, ExitBootServices
 crates/calendar/    Unix seconds ↔ a civil date, no_std: bootloader + installer + kernel
 crates/disk/        GPT and a FAT32 formatter, no_std: host image builder + installer
 crates/ext2/        The ext2 format: formatter, writer and reader, no_std
+crates/ssh/         SSH transport: packets, curve25519 exchange, chacha20-poly1305
 crates/mini-ui/     Surfaces, 8x8 text (ASCII + Cyrillic), widgets: kernel + installer
 crates/usb-hid/     HID report descriptors: what a device says about its own reports
 crates/installer/   UEFI application: disk selection, partitioning, account, install
@@ -1731,7 +1743,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 34 | virtio-net, Ethernet, ARP, IPv4, ICMP: a ping leaves the machine and comes back | **done** |
 | 35 | UDP, DHCP, DNS: the machine gets its own address, and the DHCP client is a service | **done** |
 | 36 | TCP, and sockets for programs | **done** |
-| 37 | SSH transport (RFC 4253): key exchange and encryption a real `ssh` agrees with | planned |
+| 37 | SSH transport (RFC 4253): key exchange and encryption a real `ssh` agrees with | **done** |
 | 38 | SSH authentication and a session (RFC 4252, 4254): a shell over the network | planned |
 | 39 | Updating over the network, with signatures checked before anything is written | planned |
 | 40 | Memory on request: `mmap`, so a program is no longer a fixed 512 KiB window | planned |
