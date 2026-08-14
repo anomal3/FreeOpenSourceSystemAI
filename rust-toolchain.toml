@@ -17,4 +17,13 @@ targets = [
     # x86_64-unknown-none already declares +soft-float on its own.
     "x86_64-unknown-none",
     "aarch64-unknown-none-softfloat",
+    # Programs that run outside the kernel, on AArch64. This is the hardfloat
+    # target on purpose, and it is the exact opposite decision from the kernel
+    # above - for the exact same reason, read the other way round. The kernel
+    # must not touch vector registers because its interrupt handler saves no FP
+    # state. A program may: since Phase 29a the scheduler saves and restores the
+    # whole NEON file across task switches, so vector state belongs to the task.
+    # x86-64 has no separate hardfloat "none" target, so there the same thing is
+    # done with -Ctarget-feature (see xtask::build::build_user_programs).
+    "aarch64-unknown-none",
 ]

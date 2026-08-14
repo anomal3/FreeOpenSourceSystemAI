@@ -302,6 +302,69 @@ impl Window {
         self.damage = self.damage.union(&grid.take_damage());
     }
 
+    /// Поставить курсор в заданную ячейку. Нумерация с нуля.
+    ///
+    /// Дальше идут пять методов, которыми пользуется разбор управляющих
+    /// последовательностей ([`super::term`]). Каждый — одна строка делегирования,
+    /// и это не бесполезная прослойка: содержимое окна бывает не только текстом,
+    /// а разбор ANSI обязан молча ничего не делать над списком файлов, а не
+    /// разбираться, что там внутри.
+    pub fn term_move_to(&mut self, row: u32, col: u32) {
+        let Content::Text(grid) = &mut self.content else {
+            return;
+        };
+        grid.move_to(&mut self.surface, row, col);
+        self.damage = self.damage.union(&grid.take_damage());
+    }
+
+    /// Сдвинуть курсор на заданное число строк и столбцов.
+    pub fn term_move_by(&mut self, rows: i32, cols: i32) {
+        let Content::Text(grid) = &mut self.content else {
+            return;
+        };
+        grid.move_by(&mut self.surface, rows, cols);
+        self.damage = self.damage.union(&grid.take_damage());
+    }
+
+    /// Стереть часть экрана: `0` — вниз от курсора, `1` — вверх, `2` — весь.
+    pub fn term_erase_display(&mut self, mode: u8) {
+        let Content::Text(grid) = &mut self.content else {
+            return;
+        };
+        grid.erase_display(&mut self.surface, mode);
+        self.damage = self.damage.union(&grid.take_damage());
+    }
+
+    /// Стереть часть строки.
+    pub fn term_erase_line(&mut self, mode: u8) {
+        let Content::Text(grid) = &mut self.content else {
+            return;
+        };
+        grid.erase_line(&mut self.surface, mode);
+        self.damage = self.damage.union(&grid.take_damage());
+    }
+
+    /// Цвет текста для последующего вывода.
+    pub fn term_set_fg(&mut self, index: u8) {
+        if let Content::Text(grid) = &mut self.content {
+            grid.set_fg(index);
+        }
+    }
+
+    /// Цвет фона для последующего вывода.
+    pub fn term_set_bg(&mut self, index: u8) {
+        if let Content::Text(grid) = &mut self.content {
+            grid.set_bg(index);
+        }
+    }
+
+    /// Вернуть цвета окна.
+    pub fn term_reset_attr(&mut self) {
+        if let Content::Text(grid) = &mut self.content {
+            grid.reset_attr();
+        }
+    }
+
     /// Размер сетки в символах. Для нетекстовых окон — нули.
     #[must_use]
     pub fn size_in_cells(&self) -> (u32, u32) {

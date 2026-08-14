@@ -5,6 +5,7 @@ pub mod acpi;
 mod power;
 pub mod apic;
 pub mod context;
+pub mod fpu;
 pub mod gdt;
 pub mod i8042;
 pub mod input;

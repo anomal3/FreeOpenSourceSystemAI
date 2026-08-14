@@ -25,11 +25,12 @@
 
 use user_abi::{
     ERR_BAD_ADDRESS, ERR_BAD_FD, ERR_BAD_PATH, ERR_IO, ERR_NOT_FOUND, ERR_NO_FILESYSTEM,
-    ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_PERMISSION, ERR_TOO_MANY_FILES, ERR_UNSUPPORTED, FD_STDOUT,
-    KIND_DIRECTORY, KIND_FILE, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN,
-    Dirent, ERR_EXISTS, ERR_NOT_EMPTY, ERR_NO_SPACE, MAX_NAME, SEEK_CUR, SEEK_END, SEEK_SET,
-    SYS_MKDIR, SYS_READ, SYS_READDIR, SYS_REMOVE, SYS_SEEK, SYS_SLEEP, SYS_STAT, SYS_TIME,
-    SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_PERMISSION, ERR_TOO_MANY_FILES, ERR_UNSUPPORTED, FD_STDERR,
+    FD_STDIN, FD_STDOUT, KIND_DIRECTORY, KIND_FILE, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID,
+    SYS_GETUID, SYS_OPEN, Dirent, ERR_EXISTS, ERR_NOT_EMPTY, ERR_NO_SPACE, MAX_NAME, SEEK_CUR,
+    SEEK_END, SEEK_SET, SYS_MKDIR, SYS_READ, SYS_READDIR, SYS_REMOVE, SYS_RENAME, SYS_SEEK,
+    SYS_SLEEP, SYS_STAT, SYS_TIME, SYS_TTYMODE, SYS_UPTIME, SYS_WINSIZE, SYS_WRITE, SYS_YIELD,
+    Stat, TTY_RAW,
 };
 
 use crate::mm::PageFlags;
@@ -88,6 +89,18 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_STAT => stat(a0, a1, a2),
         SYS_MKDIR => mkdir(a0, a1, a2),
         SYS_REMOVE => remove(a0, a1),
+        SYS_RENAME => rename(a0, a1, a2),
+        // Размер окна — два числа в одном: столбцы в старшей половине, строки в
+        // младшей. Нули означают, что окна нет, и это честный ответ, а не
+        // ошибка: система работает и в серийной консоли.
+        SYS_WINSIZE => {
+            let (cols, rows) = crate::ui::shell_size();
+            ((i64::from(cols)) << 32) | i64::from(rows)
+        }
+        SYS_TTYMODE => {
+            crate::tty::set_raw(a0 == TTY_RAW);
+            0
+        }
         SYS_GETUID => i64::from(super::session::credentials().uid),
         SYS_GETGID => i64::from(super::session::credentials().gid),
         // Программа — это задача, и её номер тот же, что видит `tasks` в
@@ -114,7 +127,7 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
     // чтения некому.
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
 
-    if fd != FD_STDOUT {
+    if fd != FD_STDOUT && fd != FD_STDERR {
         // В файл уходят байты как есть: это данные, а не текст, и требовать от
         // них UTF-8 значило бы запретить программе сохранить что угодно, кроме
         // строки.
@@ -122,6 +135,27 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
             Some(Ok(written)) => written as i64,
             Some(Err(err)) => errno(err),
             None => ERR_NO_PROGRAM,
+        };
+    }
+
+    // Диагностика уходит в журнал, минуя окно. Это не оформление, а разделение
+    // каналов: программа, рисующая весь экран, обязана иметь место, куда сказать
+    // слово, не испортив картинку, — а проверить её снаружи можно только по
+    // журналу.
+    if fd == FD_STDERR {
+        return match core::str::from_utf8(bytes) {
+            Ok(text) => {
+                if crate::ui::is_active() {
+                    crate::serial::_print(format_args!("{text}"));
+                } else {
+                    // Графики нет — значит и картинки, которую надо беречь, нет
+                    // тоже, а экранная консоль остаётся единственным местом, где
+                    // человек это увидит.
+                    crate::kprint!("{text}");
+                }
+                len as i64
+            }
+            Err(_) => ERR_BAD_ADDRESS,
         };
     }
 
@@ -201,10 +235,83 @@ fn read(fd: usize, ptr: usize, len: usize) -> i64 {
     // только ядро, а оно сейчас здесь.
     let buffer = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
 
+    if fd == FD_STDIN {
+        return read_input(buffer);
+    }
+
     match super::with_current(|program| program.files.read(fd, buffer)) {
         Some(Ok(read)) => read as i64,
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `read(0, …)`: чтение с терминала.
+///
+/// # Почему здесь есть цикл со сном
+///
+/// Потому что у ввода, в отличие от файла, нет содержимого, которое можно
+/// отдать прямо сейчас. Программа, спросившая строку, обязана остановиться до
+/// тех пор, пока человек её не наберёт, — и остановиться **правильно**: выйти из
+/// очереди планировщика, а не крутиться, спрашивая. Уступка в цикле занимала бы
+/// процессор ровно столько же, сколько занимал бы счёт.
+///
+/// Буфер наполняет задача оболочки (см. [`crate::tty`]), она же и будит эту.
+/// Гонка «байт пришёл раньше, чем задача уснула» закрыта тем же счётчиком
+/// событий, что и в оболочке: [`sched::block_on_input`] проверяет условие под
+/// своим локом.
+fn read_input(buffer: &mut [u8]) -> i64 {
+    loop {
+        let read = crate::tty::read(buffer);
+        if read > 0 {
+            return read as i64;
+        }
+        // Ноль байт при законченном вводе — это конец, а не «подожди ещё».
+        if crate::tty::at_eof() {
+            return 0;
+        }
+        // Программу могли попросить остановиться, пока она спала. Проверка
+        // именно здесь: снимает её [`super::check_kill`] на возврате в третье
+        // кольцо, а до возврата надо ещё дойти — то есть выйти из этого цикла.
+        if super::kill_pending() {
+            return 0;
+        }
+
+        // Срок у сна есть всегда, и это не перестраховка: событие ввода кладёт
+        // в очередь обработчик прерывания, а он не имеет права ждать лока
+        // планировщика — то есть пробуждение можно потерять. Со сроком потеря
+        // стоит десятой доли секунды, без срока — всей программы.
+        let deadline = crate::irq::ticks() + u64::from(crate::irq::TIMER_HZ) / 10;
+        sched::block_on_input(deadline, crate::tty::ready);
+    }
+}
+
+/// `rename(ptr, old_len, total_len)`.
+///
+/// Оба пути приходят одним буфером — см. `SYS_RENAME` в договоре.
+fn rename(ptr: usize, old_len: usize, total: usize) -> i64 {
+    if old_len == 0 || old_len >= total || total > 2 * MAX_PATH {
+        return ERR_BAD_PATH;
+    }
+    if !space::user_can(ptr, total, PageFlags::READ) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: диапазон проверен по таблицам программы и доступен ей на чтение.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, total) };
+
+    let mut buffer = [0u8; 2 * MAX_PATH];
+    buffer[..total].copy_from_slice(bytes);
+    let (Ok(old), Ok(new)) = (
+        core::str::from_utf8(&buffer[..old_len]),
+        core::str::from_utf8(&buffer[old_len..total]),
+    ) else {
+        return ERR_BAD_PATH;
+    };
+
+    match crate::fs::rename_as(super::session::credentials(), old, new) {
+        Some(Ok(())) => 0,
+        Some(Err(err)) => vfs_errno(err),
+        None => ERR_NO_FILESYSTEM,
     }
 }
 

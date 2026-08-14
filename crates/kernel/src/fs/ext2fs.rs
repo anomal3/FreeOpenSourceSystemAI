@@ -79,6 +79,23 @@ fn convert(err: ext2::Error) -> VfsError {
     }
 }
 
+/// Разбить путь на каталог и последнее имя.
+///
+/// Свой, а не общий с [`crate::fs`]: там он частный и разбирает путь для узла, а
+/// здесь нужен ровно тот же ответ, но внутри реализации файловой системы.
+/// Вынести один на двоих значило бы сделать частное решение общим интерфейсом.
+fn split_parent(path: &str) -> VfsResult<(&str, &str)> {
+    let trimmed = path.trim_end_matches('/');
+    let (parent, name) = match trimmed.rsplit_once('/') {
+        Some((parent, name)) => (parent, name),
+        None => ("", trimmed),
+    };
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(VfsError::BadPath);
+    }
+    Ok((if parent.is_empty() { "/" } else { parent }, name))
+}
+
 fn kind_of(kind: ext2::FileType) -> NodeKind {
     match kind {
         ext2::FileType::Directory => NodeKind::Directory,
@@ -166,6 +183,21 @@ impl Ext2Fs {
         let mut guard = self.inner.lock();
         let Inner { disk, fs, .. } = &mut *guard;
         fs.root(disk).map_err(convert)
+    }
+
+    /// Номер inode каталога по абсолютному пути.
+    ///
+    /// Нужен переименованию, и только ему: остальные операции работают с узлом,
+    /// который у них уже есть, а этой нужны **два** каталога сразу — и нужны
+    /// именно номерами, потому что крейт `ext2` адресует каталоги ими.
+    fn directory_number(&self, path: &str) -> VfsResult<u32> {
+        let mut guard = self.inner.lock();
+        let Inner { disk, fs, .. } = &mut *guard;
+        let inode = fs.resolve(disk, path).map_err(convert)?;
+        if inode.kind != ext2::FileType::Directory {
+            return Err(VfsError::WrongKind);
+        }
+        Ok(inode.number)
     }
 }
 
@@ -260,6 +292,23 @@ impl FileSystem for Ext2Mount {
     /// ещё нет.
     fn check(&self) -> Option<VfsResult<crate::vfs::CheckSummary>> {
         Some(self.summary())
+    }
+
+    /// Переименовать: то же содержимое под другим именем.
+    ///
+    /// Номера каталогов выясняются **до** захвата редактора: разбор пути сам
+    /// берёт замок тома, и держать его вложенно нельзя.
+    fn rename(&self, old: &str, new: &str) -> VfsResult<()> {
+        let (old_parent, old_name) = split_parent(old)?;
+        let (new_parent, new_name) = split_parent(new)?;
+        let old_dir = self.0.directory_number(old_parent)?;
+        let new_dir = self.0.directory_number(new_parent)?;
+
+        self.0.change(|disk, editor| {
+            editor
+                .rename(disk, old_dir, old_name, new_dir, new_name)
+                .map_err(convert)
+        })
     }
 
     fn sync(&self) -> VfsResult<()> {

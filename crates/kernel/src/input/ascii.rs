@@ -50,6 +50,8 @@ enum State {
     Escape,
     /// Получен `ESC [`, копим параметр до финального байта.
     Csi,
+    /// Получен `ESC O`: следующий байт — клавиша VT100 (F1–F4).
+    Ss3,
 }
 
 struct Decoder {
@@ -127,12 +129,31 @@ impl Decoder {
                     self.state = State::Csi;
                     self.param = 0;
                     Action::None
+                } else if byte == b'O' {
+                    // `ESC O …` — клавиши PF1–PF4 из VT100, которыми всякий
+                    // терминал по сей день присылает F1–F4.
+                    self.state = State::Ss3;
+                    Action::None
                 } else {
                     self.state = State::Ground;
                     Action::EscapeThen(byte)
                 }
             }
             State::Csi => self.csi(byte),
+            State::Ss3 => {
+                self.state = State::Ground;
+                let code = match byte {
+                    b'P' => KeyCode::F1,
+                    b'Q' => KeyCode::F2,
+                    b'R' => KeyCode::F3,
+                    b'S' => KeyCode::F4,
+                    // Прочее в этой последовательности — клавиши цифрового
+                    // блока в «прикладном» режиме; событий по ним не порождаем,
+                    // но последовательность съедена целиком.
+                    _ => return Action::None,
+                };
+                Action::Tap(code, false, false)
+            }
         }
     }
 
@@ -207,6 +228,16 @@ impl Decoder {
                         4 | 8 => KeyCode::End,
                         5 => KeyCode::PageUp,
                         6 => KeyCode::PageDown,
+                        // F5–F12 из VT220. Дыры в нумерации (16 и 22) не наши:
+                        // их оставил DEC, и всякий терминал их повторяет.
+                        15 => KeyCode::F5,
+                        17 => KeyCode::F6,
+                        18 => KeyCode::F7,
+                        19 => KeyCode::F8,
+                        20 => KeyCode::F9,
+                        21 => KeyCode::F10,
+                        23 => KeyCode::F11,
+                        24 => KeyCode::F12,
                         _ => return Action::None,
                     },
                     _ => return Action::None,

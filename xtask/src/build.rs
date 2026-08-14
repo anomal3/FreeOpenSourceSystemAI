@@ -168,9 +168,29 @@ pub fn build_component(component: Component, arch: Arch, release: bool) -> Resul
     locate_artifact(&dir, component)
 }
 
+/// Триплет пользовательских программ.
+///
+/// Отличается от ядерного на AArch64, и отличается намеренно. Ядро собрано под
+/// `softfloat`: обработчик прерывания там не имеет права трогать векторные
+/// регистры, потому что сохранять их посреди прерывания дорого и незачем.
+/// Программа — наоборот: с Phase 29a её векторное состояние принадлежит задаче
+/// и переживает переключение, поэтому запрещать компилятору NEON стало нечем.
+///
+/// На x86-64 таргет тот же, что у ядра, но векторы включаются флагом (см.
+/// [`build_user_programs`]): отдельного «none-hardfloat» варианта у этой
+/// архитектуры не существует.
+fn user_triple(arch: Arch) -> &'static str {
+    match arch {
+        Arch::X86_64 => "x86_64-unknown-none",
+        Arch::Aarch64 => "aarch64-unknown-none",
+    }
+}
+
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 11] =
-    ["hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls"];
+pub const USER_PROGRAMS: [&str; 14] = [
+    "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
+    "ask", "vec", "mc",
+];
 
 /// Собрать программы, исполняющиеся вне ядра.
 ///
@@ -182,7 +202,7 @@ pub const USER_PROGRAMS: [&str; 11] =
 /// `.cargo/config.toml`: там он подействовал бы на весь workspace, включая
 /// ядро, у которого раскладка своя.
 pub fn build_user_programs(arch: Arch, release: bool) -> Result<Vec<PathBuf>> {
-    let triple = Component::Kernel.triple(arch);
+    let triple = user_triple(arch);
     let script = paths::workspace_root().join("crates/user-progs/user.ld");
     if !script.is_file() {
         bail!("нет компоновочного сценария программ: {}", script.display());
@@ -225,6 +245,12 @@ pub fn build_user_programs(arch: Arch, release: bool) -> Result<Vec<PathBuf>> {
         // парой `adrp`/`add` относительно счётчика команд, и абсолютное
         // положение программы значения не имеет.
         flags.push_str(" -C code-model=large");
+        // Векторные регистры программе разрешены — с Phase 29a ядро сохраняет
+        // их при переключении задач. Таргет `x86_64-unknown-none` объявляет
+        // `-sse,+soft-float`, то есть запрещает компилятору их использовать
+        // вовсе; без этой строки проверка «две программы не видят чисел друг
+        // друга» проверяла бы код, в котором векторов нет ни одного.
+        flags.push_str(" -C target-feature=+sse,+sse2,-soft-float");
     }
     cmd.env("RUSTFLAGS", flags);
 

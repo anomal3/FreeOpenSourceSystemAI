@@ -110,6 +110,22 @@ impl LineEditor {
         self.len = 0;
     }
 
+    /// Дописать уже набранное, **не показывая его повторно**.
+    ///
+    /// Нужно оболочке: пока работала программа переднего плана, человек набирал
+    /// следующую команду, и эхо этих байтов на экране уже есть. Показать их
+    /// второй раз значило бы удвоить строку на глазах у того, кто её набирал.
+    ///
+    /// Возвращает, сколько байт принято: лишнее в буфер не помещается и
+    /// отбрасывается — так же, как отбрасывается лишний символ при наборе.
+    pub fn preload(&mut self, bytes: &[u8]) -> usize {
+        let room = MAX_LINE - self.len;
+        let take = bytes.len().min(room);
+        self.buf[self.len..self.len + take].copy_from_slice(&bytes[..take]);
+        self.len += take;
+        take
+    }
+
     /// Обработать событие клавиатуры, отправляя эхо в `out`.
     pub fn handle(&mut self, event: KeyEvent, out: &mut impl Write) -> Edit {
         if !event.pressed {

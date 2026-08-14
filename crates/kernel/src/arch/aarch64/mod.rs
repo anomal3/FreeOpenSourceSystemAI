@@ -134,6 +134,7 @@ pub unsafe fn probe_serial(rsdp: u64) {
 }
 
 pub mod context;
+pub mod fpu;
 pub mod gic;
 pub mod input;
 pub mod interrupts;
