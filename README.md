@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 33 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 34 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -28,6 +28,13 @@ An open operating system written from scratch in Rust, targeting **ARM64** and *
 > puts back what dies: a service that is killed comes back in half a second, one that
 > crashes on every start is stopped after three attempts and says so, and the rest of the
 > system does not notice either way.
+>
+> **Phase 34 done: the machine is on a network.** A `virtio-net` card comes up and names its
+> hardware address, `ip 10.0.2.15/24 10.0.2.2` gives the interface an address, and `ping`
+> reaches the gateway and gets an answer back. Everything under that is ours: Ethernet
+> frames through a virtqueue, ARP with a cache that expires, IPv4 with its header checksum,
+> ICMP with a different one. Everything on the other side is not — the answering stack is
+> QEMU's SLIRP, which drops in silence anything we got wrong instead of forgiving it.
 
 ## Getting it
 
@@ -1435,7 +1442,7 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Twenty-eight scenarios today: a program runs in an address space of its own, one that faults is
+Thirty-six scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
@@ -1471,7 +1478,10 @@ machine is reset while it runs and the next boot checks the volume by itself bef
 it, with the file written before the reset still there afterwards (`fsck`); and the
 bootloader menu is entered from the keyboard, safe mode comes up with no desktop and a
 read-only root that refuses a write in so many words, and the volume is checked because the
-menu asked (`recovery`).
+menu asked (`recovery`); and a network card comes up, an address is given to it by hand, ARP
+finds the gateway's hardware address, and an echo request leaves the machine and comes back
+answered — by QEMU's SLIRP, which is somebody else's IP stack and drops silently everything
+we got wrong (`net`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -1613,7 +1623,8 @@ crates/kernel/      Freestanding kernel; PIE, loaded and relocated by boot-uefi
   src/acpi.rs       Table lookup by signature (MADT on x86-64, MCFG everywhere)
   src/pci.rs        ECAM configuration space, bus walk across bridges
   src/usb/          xHCI host controller, HID reports to input events
-  src/virtio/       virtio over PCI: split virtqueue, virtio-blk
+  src/virtio/       virtio over PCI: split virtqueue, virtio-blk, virtio-net
+  src/net/          Ethernet, ARP with a cache, IPv4, ICMP echo
   src/block/        Block devices: the list of them, plus AHCI and NVMe drivers
   src/arch/         Everything that differs between x86-64 and AArch64
 xtask/              Host-side build / image / QEMU orchestration
@@ -1699,7 +1710,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 31 | Packages and a record of them: a format, a database, install and remove | **done** |
 | 32 | Updating the system by slots: two roots, state on its own partition, and a rollback nobody has to ask for | **done** |
 | 33 | Services: `spawn`/`wait` and a supervisor, so a crashed daemon comes back and the system never notices | **done** |
-| 34 | virtio-net, Ethernet, ARP, IPv4, ICMP: the machine answers a ping | planned |
+| 34 | virtio-net, Ethernet, ARP, IPv4, ICMP: a ping leaves the machine and comes back | **done** |
 | 35 | UDP, DHCP, DNS: the machine gets its own address, and the DHCP client is a service | planned |
 | 36 | TCP, and sockets for programs | planned |
 | 37 | SSH transport (RFC 4253): key exchange and encryption a real `ssh` agrees with | planned |

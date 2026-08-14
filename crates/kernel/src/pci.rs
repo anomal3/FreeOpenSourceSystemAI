@@ -116,6 +116,10 @@ pub const VENDOR_VIRTIO: u16 = 0x1AF4;
 pub const DEVICE_VIRTIO_BLK_LEGACY: u16 = 0x1001;
 /// Он же в современном виде: 0x1040 плюс номер типа устройства (2 — блочное).
 pub const DEVICE_VIRTIO_BLK_MODERN: u16 = 0x1042;
+/// virtio-net в переходном виде — то, что создаёт `-device virtio-net-pci`.
+pub const DEVICE_VIRTIO_NET_LEGACY: u16 = 0x1000;
+/// Он же в современном виде: 0x1040 плюс единица (1 — сетевое устройство).
+pub const DEVICE_VIRTIO_NET_MODERN: u16 = 0x1041;
 
 /// Идентификатор возможности «vendor specific» — под ним virtio описывает, где
 /// лежат его структуры.

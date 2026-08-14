@@ -280,6 +280,7 @@ fn execute(
         qmp: qmp_addr,
         pointer: if scenario.tablet { Pointer::Tablet } else { Pointer::Mouse },
         disk_bus: scenario.disk_bus,
+        network: scenario.network,
         allow_reboot: scenario.reboots,
         ..RunOptions::default()
     };

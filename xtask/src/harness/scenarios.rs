@@ -201,6 +201,12 @@ pub struct Scenario {
     /// диск и подключает его по SATA или по NVMe: образ не меняется ни на байт,
     /// меняется только то, чем ядро до него добирается.
     pub disk_bus: DiskBus,
+    /// Подключить к машине сетевую карту в пользовательскую сеть QEMU.
+    ///
+    /// По умолчанию карты нет, и это не экономия: машина без сети — это ещё и
+    /// проверка того, что система без карты поднимается молча и без жалоб. Сеть
+    /// включается там, где её проверяют.
+    pub network: bool,
     /// Архитектуры, на которых сценарий имеет смысл. Пусто — все.
     pub arches: &'static [Arch],
     /// Сценарий **намеренно** перезагружает машину.
@@ -255,6 +261,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -287,6 +294,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: true,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -339,6 +347,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -439,6 +448,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -506,6 +516,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: true,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -566,6 +577,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -624,6 +636,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[Arch::X86_64],
         reboots: false,
         updates: false,
@@ -658,6 +671,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -793,6 +807,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -859,6 +874,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -901,6 +917,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -945,6 +962,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -996,6 +1014,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1044,6 +1063,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1097,6 +1117,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1131,6 +1152,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         // Только AArch64: на x86-64 GIC не существует.
         arches: &[Arch::Aarch64],
         reboots: false,
@@ -1167,6 +1189,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1189,6 +1212,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1212,6 +1236,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1267,6 +1292,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1338,6 +1364,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1418,6 +1445,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1518,6 +1546,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1553,6 +1582,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         // Единственный сценарий, в котором перезагрузка — цель, а не симптом.
         reboots: true,
@@ -1613,6 +1643,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         // Сброс посреди работы — это и есть та поломка, ради которой фаза
         // существует; после него машина обязана подняться сама.
@@ -1665,6 +1696,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1722,6 +1754,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         // Только x86-64, и это не упущение. В QEMU `virt` кнопку приносит ACPI
         // GED, описанный в AML: без интерпретатора событие не разобрать, и ядро
         // говорит об этом вслух при загрузке. Проверяем то, что работает.
@@ -1751,6 +1784,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Ahci,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1797,6 +1831,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Nvme,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1837,6 +1872,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1937,6 +1973,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2003,6 +2040,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         // Четыре загрузки в одном процессе QEMU: три неудачные попытки и
         // возврат.
@@ -2076,6 +2114,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Virtio,
+        network: false,
         arches: &[],
         // Две загрузки в одном процессе: до обновления и после.
         reboots: true,
@@ -2138,6 +2177,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Nvme4k,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2183,6 +2223,7 @@ pub const ALL: &[Scenario] = &[
         usb_only: false,
         tablet: false,
         disk_bus: DiskBus::Nvme4k,
+        network: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2209,6 +2250,70 @@ pub const ALL: &[Scenario] = &[
             Step::Await("wrote 15 bytes", 15_000),
             Step::Line("cat /home/roman/sector4k.txt"),
             Step::Await("written-on-4kn", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "net",
+        about: "Карта поднимается, ARP находит шлюз, ping доходит до чужого стека и возвращается.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        extra: &[],
+        steps: &[
+            // Карта найдена и назвала свой аппаратный адрес. Адрес приехал из
+            // конфигурации устройства, то есть возможность `VIRTIO_NET_F_MAC`
+            // действительно согласована, а не пропущена.
+            Step::Await("network     : virtio-net, hardware address ", BOOT),
+            Step::Await("network     : receive task ", 30_000),
+            Step::Await("freeos> ", 60_000),
+
+            // Адреса не выдуманы: это раскладка пользовательской сети QEMU.
+            // Гость — .15, шлюз — .2, и оба заданы не нами.
+            Step::Line("ip 10.0.2.15/24 10.0.2.2"),
+            Step::Await("address 10.0.2.15/24 set", 15_000),
+
+            // Главное утверждение фазы. Чтобы эта строка появилась, обязаны
+            // сработать все четыре слоя подряд: кадр Ethernet уехал через
+            // очередь virtio, ARP нашёл аппаратный адрес шлюза, заголовок IPv4
+            // сошёлся по контрольной сумме, эхо сошлось по своей — **другой** —
+            // сумме, и ответ вернулся через приёмную очередь в задачу.
+            //
+            // Отвечает при этом чужая реализация: стек SLIRP внутри QEMU. Любую
+            // нашу ошибку в суммах или в порядке байт он молча отбрасывает, а не
+            // прощает, — ради этого сеть и проверяется им, а не собой.
+            Step::Line("ping 10.0.2.2 2"),
+            Step::Await("reply from 10.0.2.2, seq 1", 30_000),
+            Step::Await("reply from 10.0.2.2, seq 2", 30_000),
+            Step::Await("2 of 2 answered", 15_000),
+
+            // Шлюз попал в таблицу ARP — то есть ответ на запрос разобран, а не
+            // «как-то само доехало».
+            Step::Line("arp"),
+            Step::Await("10.0.2.2", 15_000),
+
+            // Счётчики сходятся с тем, что произошло: два запроса ушли, два
+            // ответа пришли. Ноль в любом из них означал бы систему, которая
+            // печатает правильные слова, ничего не отправляя.
+            //
+            // Порядок проверок повторяет порядок строк вывода: ожидание ищет
+            // вперёд от того места, где остановилось прошлое, и строка адреса,
+            // напечатанная выше строки `icmp`, для него уже позади.
+            Step::Line("ip"),
+            Step::Await("address  10.0.2.15/24", 15_000),
+            // И обратная сторона: ни один кадр не потерян на приёме. Приёмная
+            // очередь, из которой забыли вернуть буфер, кончается молча — и
+            // видно это только здесь.
+            Step::Await("0 dropped in", 15_000),
+            Step::AtLeast("  icmp     ", 2, 15_000),
+
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

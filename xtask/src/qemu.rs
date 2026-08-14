@@ -34,6 +34,8 @@ pub struct RunOptions {
     pub pointer: Pointer,
     /// Чем подключены диски.
     pub disk_bus: DiskBus,
+    /// Подключена ли к машине сетевая карта.
+    pub network: bool,
     /// Разрешить машине перезагружаться.
     ///
     /// По умолчанию QEMU запускается с `-no-reboot`, и это защита: перезагрузка,
@@ -95,6 +97,7 @@ impl Default for RunOptions {
             qmp: None,
             pointer: Pointer::Mouse,
             disk_bus: DiskBus::Virtio,
+            network: false,
             allow_reboot: false,
         }
     }
@@ -487,9 +490,26 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     if !opts.allow_reboot {
         cmd.arg("-no-reboot");
     }
-    // Сеть на Phase 0 не нужна, а её отсутствие ещё и экономит время на попытках
-    // PXE-загрузки в UEFI.
-    cmd.args(["-net", "none"]);
+    if opts.network {
+        // Пользовательская сеть (SLIRP): полноценный стек хоста, живущий внутри
+        // процесса QEMU. Ценность его именно в том, что он **чужой** — ARP,
+        // IPv4 и ICMP разбирает не наш код, и всё, в чём мы ошиблись, он молча
+        // отбрасывает, а не прощает.
+        //
+        // Раскладка сети задана QEMU и постоянна: гость — `10.0.2.15`, шлюз и
+        // он же ответчик на `ping` — `10.0.2.2`, сервер имён — `10.0.2.3`.
+        // Именно эти адреса стоят в сценариях, и это не выдуманные числа, а
+        // чужой договор, который мы обязаны соблюсти.
+        //
+        // Оговорка, которую стоит держать в голове: снаружи внутрь ICMP через
+        // SLIRP не проходит вовсе, поэтому пропинговать гостя с хоста нельзя ни
+        // при каких настройках. Проверяется поэтому обратное направление.
+        cmd.args(["-netdev", "user,id=net0"]);
+        cmd.args(["-device", "virtio-net-pci,netdev=net0"]);
+    } else {
+        // Без сети машина не тратит время на попытки PXE-загрузки в UEFI.
+        cmd.args(["-net", "none"]);
+    }
 
     if opts.serial_only {
         cmd.args(["-display", "none"]);

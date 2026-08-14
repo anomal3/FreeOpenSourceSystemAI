@@ -121,6 +121,13 @@ struct RunArgs {
     /// гипервизоре.
     #[arg(long)]
     tablet: bool,
+    /// Подключить сетевую карту virtio-net в пользовательскую сеть QEMU.
+    ///
+    /// Гость получает адрес `10.0.2.15`, шлюз и ответчик на `ping` —
+    /// `10.0.2.2`, сервер имён — `10.0.2.3`. Адрес система пока не запрашивает
+    /// сама: задайте его командой `ip 10.0.2.15/24 10.0.2.2`.
+    #[arg(long)]
+    net: bool,
     /// Объём памяти виртуальной машины.
     #[arg(long, default_value = "512M")]
     memory: String,
@@ -283,6 +290,7 @@ fn real_main() -> Result<()> {
                 extra: args.qemu_args,
                 drives: vec![drive],
                 pointer: if args.tablet { qemu::Pointer::Tablet } else { qemu::Pointer::Mouse },
+                network: args.net,
                 ..qemu::RunOptions::default()
             };
             qemu::run(&opts, &built)?;

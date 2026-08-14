@@ -31,6 +31,7 @@
 //! к остановке системы.
 
 pub mod blk;
+pub mod net;
 
 use core::sync::atomic::{Ordering, fence};
 
@@ -119,6 +120,12 @@ pub enum VirtioError {
     BadTransfer,
     /// Устройство объявило нулевую ёмкость — носителя за ним нет.
     NoMedium,
+    /// Все дескрипторы очереди в полёте: устройство не успевает.
+    QueueFull,
+    /// Устройство не сообщило свой аппаратный адрес.
+    NoMac,
+    /// Кадр не помещается в буфер очереди.
+    TooLong(usize),
 }
 
 impl core::fmt::Display for VirtioError {
@@ -134,6 +141,9 @@ impl core::fmt::Display for VirtioError {
             Self::RequestFailed(status) => write!(f, "the device failed the request ({status})"),
             Self::BadTransfer => f.write_str("transfer length is zero or not a multiple of 512"),
             Self::NoMedium => f.write_str("the device reports zero capacity"),
+            Self::QueueFull => f.write_str("every descriptor is still in flight"),
+            Self::NoMac => f.write_str("the device does not report a MAC address"),
+            Self::TooLong(len) => write!(f, "{len} bytes do not fit in a queue buffer"),
         }
     }
 }
@@ -287,6 +297,23 @@ impl Transport {
         self.write_status(STATUS_FAILED);
     }
 
+
+    /// Прочитать байт конфигурации, специфичной для типа устройства.
+    ///
+    /// Байт, а не слово: MAC-адрес у virtio-net объявлен массивом из шести
+    /// байт, и читать его 32-битными обращениями значило бы выйти за поле на
+    /// два байта и зависеть от того, что лежит следом.
+    ///
+    /// # Safety
+    ///
+    /// Смещение должно лежать внутри окна, объявленного возможностью.
+    pub unsafe fn device_config8(&self, offset: usize) -> u8 {
+        let Some(base) = self.device else {
+            return 0;
+        };
+        // SAFETY: контракт функции; окно отображено в `open`.
+        unsafe { read8(base, offset) }
+    }
 
     /// Прочитать поле конфигурации, специфичной для типа устройства.
     ///
@@ -447,10 +474,13 @@ const DESC_F_WRITE: u16 = 2;
 
 /// Сколько дескрипторов заводится в очереди.
 ///
-/// Шестнадцать при том, что одновременно используется три: запрос состоит из
-/// заголовка, данных и байта состояния, и в полёте всегда ровно один запрос
-/// (см. заголовок модуля про опрос). Меньше делать нельзя — размер обязан быть
-/// степенью двойки, — а больше незачем.
+/// Диску хватило бы трёх: запрос состоит из заголовка, данных и байта
+/// состояния, и в полёте у него всегда ровно один запрос (см. заголовок модуля
+/// про опрос). Шестнадцать здесь ради сети: у приёмной очереди буферы выставлены
+/// заранее и все сразу, и их число — это то, сколько кадров устройство успеет
+/// сложить между двумя обходами очереди задачей-приёмником. Размер обязан быть
+/// степенью двойки, а битовая маска свободных дескрипторов ниже — `u16`, и это
+/// же её предел.
 const QUEUE_SIZE: u16 = 16;
 
 /// Разделённая очередь: таблица дескрипторов и два кольца.
@@ -458,6 +488,10 @@ pub struct Queue {
     /// Общая память с устройством: дескрипторы, кольцо `avail`, кольцо `used`.
     memory: DmaBuffer,
     size: u16,
+    /// Номер очереди у устройства. Он же уезжает в окно уведомлений: там ждут
+    /// **номер очереди**, а не ноль, и у устройства с одной очередью эти два
+    /// значения совпадают ровно по случайности.
+    index: u16,
     /// Смещения внутри [`Queue::memory`].
     avail_offset: usize,
     used_offset: usize,
@@ -469,6 +503,13 @@ pub struct Queue {
     avail_index: u16,
     /// Сколько завершений уже забрано из `used`.
     used_index: u16,
+    /// По биту на дескриптор: единица — свободен.
+    ///
+    /// Диск обходится без него (он всегда занимает дескрипторы 0, 1 и 2), а сети
+    /// он необходим: у неё в полёте столько буферов, сколько влезло, и вернуть
+    /// дескриптор в оборот можно только тогда, когда устройство сообщило о нём в
+    /// кольце `used`.
+    free: u16,
 }
 
 impl Queue {
@@ -541,6 +582,23 @@ impl Queue {
             transport.notify.as_usize() + usize::try_from(within).unwrap_or(0),
         );
 
+        // Прерываний от очереди не ждём и просим их не присылать: завершения
+        // забираются опросом (см. заголовок модуля), а незамаскированное
+        // прерывание от устройства, обработчика которому никто не ставил, — это
+        // в лучшем случае шум, а на level-triggered линии PCI и вовсе поток,
+        // который некому погасить. Бит `VIRTQ_AVAIL_F_NO_INTERRUPT` — просьба, а
+        // не запрет: устройство вправе её проигнорировать, поэтому `INTx` в
+        // регистре команд PCI выключается отдельно (`enable_bus_master`).
+        // SAFETY: смещение внутри выделенного буфера, кольцо ещё не отдано
+        // устройству — `QUEUE_ENABLE` ниже.
+        unsafe {
+            memory
+                .as_ptr::<u8>()
+                .add(avail_offset)
+                .cast::<u16>()
+                .write_volatile(1);
+        }
+
         // SAFETY: см. выше.
         unsafe { write16(transport.common, COMMON_QUEUE_ENABLE, 1) };
 
@@ -559,16 +617,47 @@ impl Queue {
         Ok(Self {
             memory,
             size,
+            index,
             avail_offset,
             used_offset,
             notify,
             avail_index: 0,
             used_index: 0,
+            // Свободны все, что существуют. Дескрипторы сверх `size` помечены
+            // занятыми навсегда: очередь, которую устройство урезало до восьми,
+            // не должна выдать девятый.
+            free: if size >= 16 { u16::MAX } else { (1u16 << size) - 1 },
         })
     }
 
+    /// Сколько дескрипторов в очереди.
+    pub fn size(&self) -> u16 {
+        self.size
+    }
+
+    /// Занять свободный дескриптор.
+    pub fn alloc_descriptor(&mut self) -> Option<u16> {
+        if self.free == 0 {
+            return None;
+        }
+        let index = self.free.trailing_zeros() as u16;
+        self.free &= !(1 << index);
+        Some(index)
+    }
+
+    /// Вернуть дескриптор в оборот.
+    ///
+    /// Вызывается только после того, как устройство сообщило о нём в кольце
+    /// `used`: вернуть раньше значит отдать под новый запрос буфер, в который
+    /// устройство ещё пишет.
+    pub fn free_descriptor(&mut self, index: u16) {
+        if index < self.size {
+            self.free |= 1 << index;
+        }
+    }
+
     /// Записать дескриптор.
-    fn set_descriptor(&self, index: u16, phys: u64, len: u32, flags: u16, next: u16) {
+    pub fn set_descriptor(&self, index: u16, phys: u64, len: u32, flags: u16, next: u16) {
         let at = usize::from(index) * DESC_SIZE;
         // SAFETY: `index` меньше размера очереди, буфер выделен под неё целиком.
         unsafe {
@@ -580,12 +669,8 @@ impl Queue {
         }
     }
 
-    /// Отдать устройству цепочку дескрипторов, начинающуюся с нулевого, и
-    /// дождаться завершения.
-    ///
-    /// `deadline` — сколько раз опрашивать кольцо, прежде чем признать
-    /// устройство зависшим.
-    fn submit_and_wait(&mut self, polls: u32) -> Result<(), VirtioError> {
+    /// Положить голову цепочки в кольцо `avail`, ничего не дожидаясь.
+    pub fn offer(&mut self, head: u16) {
         // Кольцо `avail`: сначала положить номер головного дескриптора в его
         // ячейку, и только потом увеличить индекс. Обратный порядок означал бы,
         // что устройство вправе прочитать ячейку, которую мы ещё не заполнили.
@@ -593,7 +678,7 @@ impl Queue {
         // SAFETY: смещение внутри выделенного буфера.
         unsafe {
             let ring = self.memory.as_ptr::<u8>().add(self.avail_offset + 4 + usize::from(slot) * 2);
-            ring.cast::<u16>().write_volatile(0);
+            ring.cast::<u16>().write_volatile(head);
         }
         // Барьер между заполнением ячейки и публикацией индекса — то же
         // требование, что и в любой очереди без блокировок.
@@ -609,22 +694,65 @@ impl Queue {
                 .write_volatile(self.avail_index);
         }
         fence(Ordering::SeqCst);
+    }
 
+    /// Толкнуть устройство: в окно уведомлений пишется номер очереди.
+    pub fn kick(&self) {
         // SAFETY: адрес получен из возможности `notify` и отображён.
-        unsafe { write16(self.notify, 0, 0) };
+        unsafe { write16(self.notify, 0, self.index) };
+    }
+
+    /// Забрать одно завершение, если оно есть.
+    ///
+    /// Возвращает номер головного дескриптора и число байт, которые устройство
+    /// в него записало. Для отправки длина не значит ничего, для приёма это
+    /// длина кадра вместе с заголовком virtio.
+    pub fn take_used(&mut self) -> Option<(u16, u32)> {
+        fence(Ordering::SeqCst);
+        // SAFETY: смещение внутри выделенного буфера.
+        let published = unsafe {
+            self.memory
+                .as_ptr::<u8>()
+                .add(self.used_offset + 2)
+                .cast::<u16>()
+                .read_volatile()
+        };
+        if published == self.used_index {
+            return None;
+        }
+        let slot = usize::from(self.used_index % self.size);
+        // SAFETY: смещение внутри выделенного буфера; элемент кольца `used` —
+        // это пара 32-битных полей, так его задаёт спецификация.
+        let (id, len) = unsafe {
+            let entry = self.memory.as_ptr::<u8>().add(self.used_offset + 4 + slot * 8);
+            (
+                entry.cast::<u32>().read_volatile(),
+                entry.add(4).cast::<u32>().read_volatile(),
+            )
+        };
+        self.used_index = self.used_index.wrapping_add(1);
+        // Номер дескриптора приходит от устройства, то есть из-за границы
+        // доверия. Значение вне таблицы означало бы освобождение чужого бита в
+        // маске и выдачу того же буфера дважды — поэтому оно отбрасывается
+        // здесь, а не проверяется каждым вызывающим.
+        let id = u16::try_from(id).ok()?;
+        if id >= self.size {
+            return None;
+        }
+        Some((id, len))
+    }
+
+    /// Отдать устройству цепочку дескрипторов, начинающуюся с нулевого, и
+    /// дождаться завершения.
+    ///
+    /// `polls` — сколько раз опрашивать кольцо, прежде чем признать устройство
+    /// зависшим.
+    fn submit_and_wait(&mut self, polls: u32) -> Result<(), VirtioError> {
+        self.offer(0);
+        self.kick();
 
         for _ in 0..polls {
-            fence(Ordering::SeqCst);
-            // SAFETY: смещение внутри выделенного буфера.
-            let used = unsafe {
-                self.memory
-                    .as_ptr::<u8>()
-                    .add(self.used_offset + 2)
-                    .cast::<u16>()
-                    .read_volatile()
-            };
-            if used != self.used_index {
-                self.used_index = used;
+            if self.take_used().is_some() {
                 return Ok(());
             }
             core::hint::spin_loop();

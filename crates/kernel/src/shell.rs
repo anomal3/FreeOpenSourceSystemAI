@@ -493,6 +493,15 @@ fn run_command(line: &str) -> bool {
                 kill(argument);
             }
         }
+        "ip" => ip(argument),
+        "ping" => {
+            if argument.is_empty() {
+                sprintln!("  usage: ping <address> [count]");
+            } else {
+                ping(argument);
+            }
+        }
+        "arp" => arp_table(),
         "fsck" => fsck(),
         "mounts" => mounts(),
         "slots" => slots(),
@@ -515,6 +524,169 @@ fn run_command(line: &str) -> bool {
         other => sprintln!("  unknown command '{other}'; try 'help'"),
     }
     false
+}
+
+/// Показать интерфейс или задать ему адрес.
+///
+/// Адрес задаётся командой, а не берётся откуда-то сам: DHCP появится службой в
+/// следующей фазе, и до тех пор единственный способ сказать системе, кто она в
+/// этой сети, — сказать это руками.
+fn ip(argument: &str) {
+    use crate::net::ipv4::Ipv4;
+
+    if !crate::net::is_present() {
+        sprintln!("  no network card in this machine");
+        return;
+    }
+
+    if !argument.is_empty() {
+        let mut parts = argument.split_whitespace();
+        let Some(address) = parts.next() else {
+            sprintln!("  usage: ip <address>/<bits> [gateway]");
+            return;
+        };
+        // Маска записывается длиной префикса, а не четырьмя числами: `/24`
+        // невозможно написать так, чтобы получилась дырявая маска, а
+        // `255.255.0.255` — можно, и обнаруживается такое потом и не сразу.
+        let (address, bits) = match address.split_once('/') {
+            Some((address, bits)) => (address, bits),
+            None => {
+                sprintln!("  usage: ip <address>/<bits> [gateway]  (for example 10.0.2.15/24)");
+                return;
+            }
+        };
+        let (Some(address), Ok(bits)) = (Ipv4::parse(address), bits.parse::<u32>()) else {
+            sprintln!("  that is not an address: {argument}");
+            return;
+        };
+        let Some(netmask) = Ipv4::from_prefix(bits) else {
+            sprintln!("  a prefix is 0 to 32 bits, not {bits}");
+            return;
+        };
+        let gateway = match parts.next() {
+            Some(text) => match Ipv4::parse(text) {
+                Some(gateway) => gateway,
+                None => {
+                    sprintln!("  that is not a gateway address: {text}");
+                    return;
+                }
+            },
+            None => Ipv4::UNSPECIFIED,
+        };
+        match crate::net::configure(address, netmask, gateway) {
+            Ok(()) => sprintln!("  address {address}/{bits} set"),
+            Err(err) => {
+                sprintln!("  ip: {err}");
+                return;
+            }
+        }
+    }
+
+    let Some(status) = crate::net::status() else {
+        sprintln!("  no network card in this machine");
+        return;
+    };
+    sprintln!("  link     virtio-net {}", crate::net::eth::Display(status.mac));
+    if status.address.is_unspecified() {
+        sprintln!("  address  none yet");
+    } else {
+        sprintln!(
+            "  address  {}/{}",
+            status.address,
+            status.netmask.prefix().unwrap_or(0)
+        );
+    }
+    if status.gateway.is_unspecified() {
+        sprintln!("  gateway  none");
+    } else {
+        sprintln!("  gateway  {}", status.gateway);
+    }
+    sprintln!(
+        "  frames   {} in, {} out, {} dropped in, {} dropped out",
+        status.link.rx_frames,
+        status.link.tx_frames,
+        status.link.rx_dropped,
+        status.link.tx_dropped
+    );
+    sprintln!(
+        "  arp      {} requests out, {} replies in, {} requests in, {} replies out",
+        status.counters.arp_requests_out,
+        status.counters.arp_replies_in,
+        status.counters.arp_requests_in,
+        status.counters.arp_replies_out
+    );
+    sprintln!(
+        "  icmp     {} echo out, {} replies in, {} echo in, {} replies out",
+        status.counters.echo_requests_out,
+        status.counters.echo_replies_in,
+        status.counters.echo_requests_in,
+        status.counters.echo_replies_out
+    );
+}
+
+/// Отправить эхо-запросы и подождать ответы.
+fn ping(argument: &str) {
+    use crate::net::ipv4::Ipv4;
+
+    /// Сколько ждать одного ответа.
+    const TIMEOUT_MS: u64 = 3_000;
+    /// Сколько запросов по умолчанию.
+    const DEFAULT_COUNT: u16 = 3;
+    /// Предел на число запросов: оболочка на время `ping` занята, и запрос,
+    /// повторяемый тысячу раз, — это тысяча раз по три секунды ожидания.
+    const MAX_COUNT: u16 = 16;
+
+    let mut parts = argument.split_whitespace();
+    let Some(target) = parts.next().and_then(Ipv4::parse) else {
+        sprintln!("  that is not an address: {argument}");
+        return;
+    };
+    let count = match parts.next() {
+        Some(text) => match text.parse::<u16>() {
+            Ok(count) if count >= 1 && count <= MAX_COUNT => count,
+            _ => {
+                sprintln!("  the count is 1 to {MAX_COUNT}, not '{text}'");
+                return;
+            }
+        },
+        None => DEFAULT_COUNT,
+    };
+
+    let mut answered = 0u16;
+    for sequence in 1..=count {
+        match crate::net::ping(target, sequence, TIMEOUT_MS) {
+            Ok(rtt) => {
+                answered += 1;
+                sprintln!("  reply from {target}, seq {sequence}, {rtt} ms");
+            }
+            // Отдельной строкой на каждую попытку, а не одной в конце: молчание
+            // на третьем запросе после двух ответов и молчание на всех трёх —
+            // разные неисправности.
+            Err(err) => sprintln!("  no reply from {target}, seq {sequence}: {err}"),
+        }
+    }
+    sprintln!("  {answered} of {count} answered");
+}
+
+/// Кого система знает в лицо.
+fn arp_table() {
+    if !crate::net::is_present() {
+        sprintln!("  no network card in this machine");
+        return;
+    }
+    let table = crate::net::arp_table();
+    if table.is_empty() {
+        sprintln!("  nobody yet");
+        return;
+    }
+    for (ip, mac, left_ms) in table {
+        sprintln!(
+            "  {:<15} {} valid for {} s",
+            alloc::format!("{ip}"),
+            crate::net::eth::Display(mac),
+            left_ms / 1000
+        );
+    }
 }
 
 /// Проверить корневой том и рассказать, что нашлось.
@@ -641,6 +813,9 @@ fn help() {
     sprintln!("  run [-b] <p>  run a program with arguments; -b does not wait");
     sprintln!("  kill <task>   stop a running program by its task number");
     sprintln!("  clear         clear the window");
+    sprintln!("  ip [a/b [gw]] show the interface, or give it an address");
+    sprintln!("  ping <addr>   send an echo request and wait for the answer");
+    sprintln!("  arp           addresses learned from the wire");
     sprintln!("  fsck          check every mounted volume");
     sprintln!("  mounts        what is mounted where");
     sprintln!("  slots         which system slot booted, and its state");
