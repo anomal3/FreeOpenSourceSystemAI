@@ -591,6 +591,7 @@ const SERVICES_TEXT: &str = "\
 # One service per line: <name> <path> [uid] [gid]
 # A service that keeps failing is stopped, and the log says so.
 logger /bin/svclog 0 0
+dhcp /bin/dhcp 0 0
 ";
 
 /// Содержимое `/os-release`.

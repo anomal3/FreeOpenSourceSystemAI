@@ -38,6 +38,14 @@ use user_abi::{
     SYS_SEEK, SYS_SLEEP, SYS_SPAWN, SYS_STAT, SYS_TIME, SYS_TTYMODE, SYS_UPTIME, SYS_WAIT,
     SYS_WINSIZE, SYS_WRITE, SYS_YIELD, Stat, TTY_RAW, WAIT_NOHANG,
 };
+use user_abi::{
+    ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_UDP, SYS_BIND,
+    SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_NETCONF, SYS_NETINFO, SYS_PEER, SYS_RECV, SYS_RESOLVE,
+    SYS_SEND, SYS_SOCKET,
+};
+
+use crate::net::{self, NetError};
+use crate::net::ipv4::Ipv4;
 
 use crate::mm::PageFlags;
 use crate::vfs::perm::Access;
@@ -117,6 +125,16 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         // второе пространство имён для тех же объектов пришлось бы всё время
         // сопоставлять с первым.
         SYS_GETPID => i64::from(sched::current().as_u32()),
+        SYS_SOCKET => socket(a0),
+        SYS_BIND => bind(a0, a1),
+        SYS_CONNECT => connect(a0, a1, a2),
+        SYS_SEND => send(a0, a1, a2),
+        SYS_RECV => recv(a0, a1, a2),
+        SYS_PEER => peer(a0, a1),
+        SYS_CLOSE_SOCKET => close_socket(a0),
+        SYS_NETCONF => netconf(a0, a1),
+        SYS_NETINFO => netinfo(a0, a1),
+        SYS_RESOLVE => resolve(a0, a1, a2),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -570,6 +588,210 @@ fn copy_path<'a>(ptr: usize, len: usize, buffer: &'a mut [u8; MAX_PATH]) -> Resu
 }
 
 /// Перевести отказ файловой системы в код договора.
+// ---------------------------------------------------------------------------
+// Сеть
+// ---------------------------------------------------------------------------
+
+/// `socket(kind) -> номер сокета`.
+fn socket(kind: usize) -> i64 {
+    if kind != SOCK_UDP {
+        // TCP появится в следующей фазе, и до тех пор честный отказ лучше
+        // сокета, который заведётся и не будет работать.
+        return ERR_UNSUPPORTED;
+    }
+    match net::socket_open(sched::current()) {
+        Ok(index) => index as i64,
+        Err(err) => net_errno(err),
+    }
+}
+
+/// `bind(сокет, порт) -> назначенный порт`.
+fn bind(index: usize, port: usize) -> i64 {
+    let Ok(port) = u16::try_from(port) else {
+        return ERR_BAD_ADDRESS;
+    };
+    match net::socket_bind(sched::current(), index, port) {
+        Ok(port) => i64::from(port),
+        Err(err) => net_errno(err),
+    }
+}
+
+/// `connect(сокет, адрес, порт) -> локальный порт`.
+fn connect(index: usize, address: usize, port: usize) -> i64 {
+    let (Ok(address), Ok(port)) = (u32::try_from(address), u16::try_from(port)) else {
+        return ERR_BAD_ADDRESS;
+    };
+    match net::socket_connect(sched::current(), index, Ipv4(address), port) {
+        Ok(local) => i64::from(local),
+        Err(err) => net_errno(err),
+    }
+}
+
+/// `send(сокет, ptr, len) -> len`.
+fn send(index: usize, ptr: usize, len: usize) -> i64 {
+    if !space::user_can(ptr, len, PageFlags::READ) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: диапазон проверен по таблицам самой программы; ядро и программа
+    // исполняются по очереди на одном процессоре, поэтому менять эти байты во
+    // время чтения некому.
+    let data = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    match net::socket_send(sched::current(), index, data) {
+        Ok(sent) => sent as i64,
+        Err(err) => net_errno(err),
+    }
+}
+
+/// `recv(сокет, ptr, len) -> сколько байт`.
+fn recv(index: usize, ptr: usize, len: usize) -> i64 {
+    if !space::user_can(ptr, len, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    let received = match net::socket_recv(sched::current(), index) {
+        // Пустая очередь — это «ещё не сейчас», а не ошибка: программа сама
+        // решит, спать ей или сдаться.
+        Ok(None) => return ERR_AGAIN,
+        Ok(Some(received)) => received,
+        Err(err) => return net_errno(err),
+    };
+
+    // Датаграмма, не поместившаяся в буфер, **обрезается**, а не откладывается:
+    // границы у неё есть, и вторая половина без первой не значит ничего. Так же
+    // ведёт себя `recvfrom` везде, где он есть.
+    let copied = received.data.len().min(len);
+    // SAFETY: диапазон проверен по таблицам программы на запись; копируется не
+    // больше, чем в него влезает.
+    unsafe {
+        core::ptr::copy_nonoverlapping(received.data.as_ptr(), ptr as *mut u8, copied);
+    }
+    copied as i64
+}
+
+/// `peer(сокет, out) -> 0`.
+fn peer(index: usize, out: usize) -> i64 {
+    if !space::user_can(out, size_of::<Peer>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    let peer = match net::socket_peer(sched::current(), index) {
+        Ok(Some(peer)) => peer,
+        // Ни одной датаграммы ещё не забрано — спрашивать не о ком.
+        Ok(None) => return ERR_AGAIN,
+        Err(err) => return net_errno(err),
+    };
+    let value = Peer { address: peer.0.0, port: peer.1, _reserved: 0 };
+    // SAFETY: диапазон проверен на запись и вмещает структуру целиком.
+    unsafe { core::ptr::write_unaligned(out as *mut Peer, value) };
+    0
+}
+
+/// `close_socket(сокет) -> 0`.
+fn close_socket(index: usize) -> i64 {
+    match net::socket_close(sched::current(), index) {
+        Ok(()) => 0,
+        Err(err) => net_errno(err),
+    }
+}
+
+/// `netconf(ptr, len) -> 0`.
+///
+/// Только root: адрес интерфейса — решение о машине целиком, а не о программе,
+/// которая его сообщает. Клиент DHCP работает от root именно поэтому, и это
+/// записано в описании службы, а не подразумевается.
+fn netconf(ptr: usize, len: usize) -> i64 {
+    if super::credentials().uid != 0 {
+        return ERR_PERMISSION;
+    }
+    if len != size_of::<NetConfig>() || !space::user_can(ptr, len, PageFlags::READ) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: диапазон проверен по таблицам программы и вмещает структуру.
+    let config = unsafe { core::ptr::read_unaligned(ptr as *const NetConfig) };
+    match net::configure_all(
+        Ipv4(config.address),
+        Ipv4(config.netmask),
+        Ipv4(config.gateway),
+        Ipv4(config.dns),
+    ) {
+        Ok(()) => 0,
+        Err(err) => net_errno(err),
+    }
+}
+
+/// `netinfo(ptr, len) -> 0`.
+///
+/// Читать состояние сети вправе любая программа: аппаратный адрес карты и так
+/// написан в каждом кадре, который она отправляет, а прятать от программы то,
+/// что видно всей подсети, значит усложнять без выгоды.
+fn netinfo(ptr: usize, len: usize) -> i64 {
+    if len != size_of::<NetInfo>() || !space::user_can(ptr, len, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    let info = match net::status() {
+        Some(status) => NetInfo {
+            mac: status.mac,
+            present: 1,
+            _reserved: 0,
+            address: status.address.0,
+            netmask: status.netmask.0,
+            gateway: status.gateway.0,
+            dns: status.dns.0,
+        },
+        // Карты нет — это не ошибка вызова, а ответ на него: программа обязана
+        // уметь отличить «сети нет» от «спросить не получилось».
+        None => NetInfo::default(),
+    };
+    // SAFETY: диапазон проверен на запись и вмещает структуру целиком.
+    unsafe { core::ptr::write_unaligned(ptr as *mut NetInfo, info) };
+    0
+}
+
+/// `resolve(ptr, len, out) -> 0`.
+fn resolve(ptr: usize, len: usize, out: usize) -> i64 {
+    /// Сколько ждать ответа сервера имён.
+    const TIMEOUT_MS: u64 = 3_000;
+
+    let mut buffer = [0u8; MAX_PATH];
+    let name = match copy_path(ptr, len, &mut buffer) {
+        Ok(name) => name,
+        Err(err) => return err,
+    };
+    if !space::user_can(out, 4, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    match net::resolve(name, TIMEOUT_MS) {
+        Ok(address) => {
+            // SAFETY: четыре байта проверены на запись.
+            unsafe {
+                core::ptr::copy_nonoverlapping(address.to_bytes().as_ptr(), out as *mut u8, 4);
+            }
+            0
+        }
+        Err(err) => net_errno(err),
+    }
+}
+
+fn net_errno(err: NetError) -> i64 {
+    match err {
+        NetError::NoDevice | NetError::NoAddress | NetError::NoRoute => ERR_NO_NETWORK,
+        // «Адрес получателя ещё выясняется» и «в очереди пусто» для программы —
+        // одно и то же указание: подождать и спросить снова.
+        NetError::Pending => ERR_AGAIN,
+        NetError::Timeout => ERR_AGAIN,
+        NetError::BadName => ERR_BAD_PATH,
+        NetError::NoSuchName => ERR_NOT_FOUND,
+        NetError::Device(_) => ERR_IO,
+        NetError::Socket(err) => match err {
+            crate::net::socket::SocketError::TooMany => ERR_TOO_MANY_FILES,
+            crate::net::socket::SocketError::BadSocket => ERR_BAD_SOCKET,
+            crate::net::socket::SocketError::PortTaken(_) => ERR_EXISTS,
+            crate::net::socket::SocketError::NoPort => ERR_TOO_MANY_FILES,
+            crate::net::socket::SocketError::NotBound
+            | crate::net::socket::SocketError::NoPeer
+            | crate::net::socket::SocketError::TooLong(_) => ERR_BAD_ADDRESS,
+        },
+    }
+}
+
 fn errno(err: FileError) -> i64 {
     match err {
         FileError::NoFilesystem => ERR_NO_FILESYSTEM,

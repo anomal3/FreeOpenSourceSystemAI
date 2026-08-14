@@ -6,3 +6,7 @@
 # crates/installer/src/install.rs, written onto the state partition -- the two
 # describe the same set and are meant to stay identical.
 logger /bin/svclog 0 0
+# Клиент DHCP работает от root: адрес интерфейса — решение о машине целиком, и
+# ядро принимает его только от нулевого uid. На машине без сетевой карты служба
+# говорит об этом и завершается с нулём — супервизор не считает это падением.
+dhcp /bin/dhcp 0 0

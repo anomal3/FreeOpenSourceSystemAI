@@ -27,8 +27,14 @@ use user_abi::{
     TTY_RAW, WAIT_NOHANG,
 };
 
+use user_abi::{
+    SOCK_UDP, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_NETCONF, SYS_NETINFO, SYS_PEER,
+    SYS_RECV, SYS_RESOLVE, SYS_SEND, SYS_SOCKET,
+};
+
 pub use user_abi::{
-    Dirent, ERR_AGAIN, ERR_NO_TASK, KIND_DIRECTORY, KIND_FILE, SEEK_CUR, SEEK_END, SEEK_SET,
+    Dirent, ERR_AGAIN, ERR_NO_NETWORK, ERR_NO_TASK, KIND_DIRECTORY, KIND_FILE, NetConfig, NetInfo,
+    Peer, SEEK_CUR, SEEK_END, SEEK_SET,
 };
 
 /// Выполнить системный вызов.
@@ -632,6 +638,141 @@ pub fn read_at(fd: i64, offset: u64, buffer: &mut [u8]) -> i64 {
         return moved;
     }
     read(fd, buffer)
+}
+
+// ---------------------------------------------------------------------------
+// Сеть
+// ---------------------------------------------------------------------------
+
+/// Завести сокет UDP. Возвращает его номер или отрицательный код ошибки.
+pub fn socket() -> i64 {
+    // SAFETY: аргумент — число.
+    unsafe { syscall(SYS_SOCKET, SOCK_UDP, 0, 0) }
+}
+
+/// Привязать сокет к порту; ноль означает «любой свободный».
+pub fn bind(socket: i64, port: u16) -> i64 {
+    if socket < 0 {
+        return socket;
+    }
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(SYS_BIND, socket as usize, usize::from(port), 0) }
+}
+
+/// Запомнить, кому этот сокет отправляет.
+pub fn connect(socket: i64, address: u32, port: u16) -> i64 {
+    if socket < 0 {
+        return socket;
+    }
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(SYS_CONNECT, socket as usize, address as usize, usize::from(port)) }
+}
+
+/// Отправить датаграмму. `ERR_AGAIN` означает «ещё выясняется адрес соседа».
+pub fn send(socket: i64, data: &[u8]) -> i64 {
+    if socket < 0 {
+        return socket;
+    }
+    // SAFETY: срез живёт в памяти программы, длина — его собственная.
+    unsafe { syscall(SYS_SEND, socket as usize, data.as_ptr() as usize, data.len()) }
+}
+
+/// Отправить датаграмму, повторяя попытки, пока выясняется адрес соседа.
+///
+/// Отдельно от [`send`] потому, что `ERR_AGAIN` при первой же отправке —
+/// обычное дело (ARP ещё не ответил), и писать этот цикл у себя пришлось бы
+/// каждому.
+pub fn send_waiting(socket: i64, data: &[u8], attempts: u32) -> i64 {
+    for _ in 0..attempts {
+        let sent = send(socket, data);
+        if sent != ERR_AGAIN {
+            return sent;
+        }
+        sleep_ms(5);
+    }
+    ERR_AGAIN
+}
+
+/// Забрать датаграмму. `ERR_AGAIN` — очереди пока нет.
+pub fn recv(socket: i64, buffer: &mut [u8]) -> i64 {
+    if socket < 0 {
+        return socket;
+    }
+    // SAFETY: буфер живёт в памяти программы, длина — его собственная.
+    unsafe { syscall(SYS_RECV, socket as usize, buffer.as_mut_ptr() as usize, buffer.len()) }
+}
+
+/// Ждать датаграмму до `timeout_ms` миллисекунд.
+pub fn recv_waiting(socket: i64, buffer: &mut [u8], timeout_ms: u64) -> i64 {
+    let deadline = uptime_ms() + timeout_ms;
+    loop {
+        let got = recv(socket, buffer);
+        if got != ERR_AGAIN {
+            return got;
+        }
+        if uptime_ms() >= deadline {
+            return ERR_AGAIN;
+        }
+        sleep_ms(5);
+    }
+}
+
+/// Кто прислал последнюю принятую датаграмму.
+pub fn peer(socket: i64) -> Option<Peer> {
+    if socket < 0 {
+        return None;
+    }
+    let mut out = Peer::default();
+    // SAFETY: структура живёт в памяти программы.
+    let result = unsafe {
+        syscall(SYS_PEER, socket as usize, (&raw mut out) as usize, 0)
+    };
+    (result == 0).then_some(out)
+}
+
+/// Закрыть сокет.
+pub fn close_socket(socket: i64) -> i64 {
+    if socket < 0 {
+        return socket;
+    }
+    // SAFETY: аргумент — число.
+    unsafe { syscall(SYS_CLOSE_SOCKET, socket as usize, 0, 0) }
+}
+
+/// Задать настройки интерфейса. Только root.
+pub fn netconf(config: &NetConfig) -> i64 {
+    // SAFETY: структура живёт в памяти программы, длина — её собственная.
+    unsafe {
+        syscall(
+            SYS_NETCONF,
+            (config as *const NetConfig) as usize,
+            core::mem::size_of::<NetConfig>(),
+            0,
+        )
+    }
+}
+
+/// Спросить, что система знает о своей сети.
+pub fn netinfo(out: &mut NetInfo) -> i64 {
+    // SAFETY: структура живёт в памяти программы, длина — её собственная.
+    unsafe {
+        syscall(
+            SYS_NETINFO,
+            (out as *mut NetInfo) as usize,
+            core::mem::size_of::<NetInfo>(),
+            0,
+        )
+    }
+}
+
+/// Узнать адрес по имени.
+pub fn resolve(name: &str) -> Option<u32> {
+    let mut out = [0u8; 4];
+    // SAFETY: имя и буфер живут в памяти программы.
+    let result = unsafe {
+        syscall(SYS_RESOLVE, name.as_ptr() as usize, name.len(), out.as_mut_ptr() as usize)
+    };
+    (result == 0).then(|| u32::from_be_bytes(out))
 }
 
 /// Путь, собираемый по кусочкам в буфере на стеке.

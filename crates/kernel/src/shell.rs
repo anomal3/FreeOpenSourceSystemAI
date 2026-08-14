@@ -502,6 +502,13 @@ fn run_command(line: &str) -> bool {
             }
         }
         "arp" => arp_table(),
+        "resolve" => {
+            if argument.is_empty() {
+                sprintln!("  usage: resolve <name>");
+            } else {
+                resolve(argument);
+            }
+        }
         "fsck" => fsck(),
         "mounts" => mounts(),
         "slots" => slots(),
@@ -601,6 +608,11 @@ fn ip(argument: &str) {
     } else {
         sprintln!("  gateway  {}", status.gateway);
     }
+    if status.dns.is_unspecified() {
+        sprintln!("  dns      none");
+    } else {
+        sprintln!("  dns      {}", status.dns);
+    }
     sprintln!(
         "  frames   {} in, {} out, {} dropped in, {} dropped out",
         status.link.rx_frames,
@@ -622,6 +634,31 @@ fn ip(argument: &str) {
         status.counters.echo_requests_in,
         status.counters.echo_replies_out
     );
+    // Датаграммы, пришедшие на порт, который никто не слушает, считаются
+    // отдельно от непонятых кадров: это разные неисправности. Первая — служба
+    // не запустилась, вторая — стек чего-то не умеет.
+    sprintln!(
+        "  udp      {} in, {} out, {} with nobody listening",
+        status.counters.udp_in,
+        status.counters.udp_out,
+        status.counters.udp_no_listener
+    );
+    sprintln!(
+        "  sockets  {} open, {} datagram(s) dropped by a slow reader",
+        status.sockets.0,
+        status.sockets.1
+    );
+}
+
+/// Спросить у сервера имён адрес.
+fn resolve(name: &str) {
+    /// Сколько ждать ответа.
+    const TIMEOUT_MS: u64 = 5_000;
+
+    match crate::net::resolve(name, TIMEOUT_MS) {
+        Ok(address) => sprintln!("  {name} is {address}"),
+        Err(err) => sprintln!("  {name}: {err}"),
+    }
 }
 
 /// Отправить эхо-запросы и подождать ответы.
@@ -816,6 +853,7 @@ fn help() {
     sprintln!("  ip [a/b [gw]] show the interface, or give it an address");
     sprintln!("  ping <addr>   send an echo request and wait for the answer");
     sprintln!("  arp           addresses learned from the wire");
+    sprintln!("  resolve <n>   ask the name server for an address");
     sprintln!("  fsck          check every mounted volume");
     sprintln!("  mounts        what is mounted where");
     sprintln!("  slots         which system slot booted, and its state");

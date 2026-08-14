@@ -625,6 +625,15 @@ fn run(path: &str, args: &[&str], cred: Credentials) -> Result<i64, Error> {
         kprintln!("  user        : closed {leaked} file(s) the program left open");
     }
 
+    // Сокеты закрываются здесь же и по той же причине: программа, снятая по
+    // `kill` или отказавшая, ничего не закрывает сама, а незакрытый сокет
+    // держит за собой порт — и следующая попытка запустить ту же службу
+    // упёрлась бы в «порт занят» тем, кого уже нет.
+    let sockets = crate::net::close_owner(sched::current());
+    if sockets > 0 {
+        kprintln!("  user        : closed {sockets} socket(s) the program left open");
+    }
+
     Ok(code)
 }
 

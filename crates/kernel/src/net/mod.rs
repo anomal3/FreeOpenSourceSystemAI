@@ -28,10 +28,14 @@
 //! свободного дескриптора в передающей очереди.
 
 pub mod arp;
+pub mod dns;
 pub mod eth;
 pub mod icmp;
 pub mod ipv4;
+pub mod socket;
+pub mod udp;
 
+use crate::sched::TaskId;
 use crate::sync::SpinLock;
 use crate::virtio::net::{FRAME_MAX, Stats, VirtioNet};
 use crate::virtio::VirtioError;
@@ -69,6 +73,17 @@ pub enum NetError {
     Timeout,
     /// Устройство отказалось отправлять.
     Device(VirtioError),
+    /// Не получилось с сокетом.
+    Socket(socket::SocketError),
+    /// Имя не годится: пустое, слишком длинное или с пустой меткой.
+    BadName,
+    /// Сервер имён ответил, и ответ — «такого имени нет».
+    ///
+    /// Отдельно от [`NetError::Timeout`] намеренно: молчание сервера означает
+    /// «спросите ещё раз», а этот ответ — «перестаньте спрашивать». Слить их в
+    /// одно значило бы превратить опечатку в имени в загадочную неисправность
+    /// сети.
+    NoSuchName,
 }
 
 impl core::fmt::Display for NetError {
@@ -80,6 +95,9 @@ impl core::fmt::Display for NetError {
             Self::Pending => f.write_str("the hardware address is not known yet"),
             Self::Timeout => f.write_str("no answer"),
             Self::Device(err) => write!(f, "the card refused the frame: {err}"),
+            Self::Socket(err) => write!(f, "{err}"),
+            Self::BadName => f.write_str("that name cannot be asked about"),
+            Self::NoSuchName => f.write_str("the name server says there is no such name"),
         }
     }
 }
@@ -98,6 +116,10 @@ pub struct Counters {
     pub echo_replies_out: u64,
     pub echo_requests_out: u64,
     pub echo_replies_in: u64,
+    pub udp_in: u64,
+    pub udp_out: u64,
+    /// Датаграммы, пришедшие на порт, который никто не слушает.
+    pub udp_no_listener: u64,
 }
 
 /// Пришедший эхо-ответ: кто ответил и когда.
@@ -117,7 +139,10 @@ struct Interface {
     netmask: Ipv4,
     gateway: Ipv4,
     table: arp::Table,
+    sockets: socket::Table,
     counters: Counters,
+    /// Адрес сервера имён — от DHCP или заданный руками.
+    dns: Ipv4,
     /// Последний пришедший эхо-ответ. Одно место, а не очередь: `ping` в
     /// системе один и спрашивает про конкретный номер.
     last_reply: Option<Reply>,
@@ -177,7 +202,9 @@ pub unsafe fn init(rsdp: u64) {
         netmask: Ipv4::UNSPECIFIED,
         gateway: Ipv4::UNSPECIFIED,
         table: arp::Table::new(),
+        sockets: socket::Table::new(),
         counters: Counters::default(),
+        dns: Ipv4::UNSPECIFIED,
         last_reply: None,
         next_id: 1,
     });
@@ -204,8 +231,11 @@ pub struct Status {
     pub address: Ipv4,
     pub netmask: Ipv4,
     pub gateway: Ipv4,
+    pub dns: Ipv4,
     pub link: Stats,
     pub counters: Counters,
+    /// Сколько сокетов открыто и сколько датаграмм они потеряли.
+    pub sockets: (usize, u64),
 }
 
 pub fn status() -> Option<Status> {
@@ -216,8 +246,10 @@ pub fn status() -> Option<Status> {
         address: iface.address,
         netmask: iface.netmask,
         gateway: iface.gateway,
+        dns: iface.dns,
         link: iface.device.stats(),
         counters: iface.counters,
+        sockets: iface.sockets.stats(),
     })
 }
 
@@ -236,6 +268,128 @@ pub fn configure(address: Ipv4, netmask: Ipv4, gateway: Ipv4) -> Result<(), NetE
     iface.netmask = netmask;
     iface.gateway = gateway;
     Ok(())
+}
+
+/// Задать настройки целиком — то, что приносит клиент DHCP.
+///
+/// Отличается от [`configure`] только сервером имён: ноль в нём означает «не
+/// менять», потому что аренда без предложенного сервера имён — обычное дело, а
+/// стереть уже известный из-за этого было бы потерей.
+pub fn configure_all(
+    address: Ipv4,
+    netmask: Ipv4,
+    gateway: Ipv4,
+    dns: Ipv4,
+) -> Result<(), NetError> {
+    configure(address, netmask, gateway)?;
+    if !dns.is_unspecified() {
+        let mut guard = INTERFACE.lock();
+        guard.as_mut().ok_or(NetError::NoDevice)?.dns = dns;
+    }
+    Ok(())
+}
+
+/// Адрес сервера имён, если он известен.
+pub fn dns_server() -> Option<Ipv4> {
+    let guard = INTERFACE.lock();
+    let dns = guard.as_ref()?.dns;
+    (!dns.is_unspecified()).then_some(dns)
+}
+
+// ---------------------------------------------------------------------------
+// Сокеты
+// ---------------------------------------------------------------------------
+
+/// Завести сокет для задачи.
+pub fn socket_open(owner: TaskId) -> Result<usize, NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    iface.sockets.open(owner).map_err(NetError::Socket)
+}
+
+/// Привязать сокет к порту; ноль — «любой свободный».
+pub fn socket_bind(owner: TaskId, index: usize, port: u16) -> Result<u16, NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    iface.sockets.bind(owner, index, port).map_err(NetError::Socket)
+}
+
+/// Запомнить собеседника.
+pub fn socket_connect(
+    owner: TaskId,
+    index: usize,
+    address: Ipv4,
+    port: u16,
+) -> Result<u16, NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    iface
+        .sockets
+        .connect(owner, index, address, port)
+        .map_err(NetError::Socket)
+}
+
+/// Отправить датаграмму собеседнику.
+///
+/// [`NetError::Pending`] означает, что ушёл запрос ARP и повторить стоит через
+/// несколько миллисекунд. Ждать здесь нельзя: лок держит прерывания
+/// запрещёнными, а ответ придёт задаче-приёмнику, которой для этого надо дать
+/// поработать.
+pub fn socket_send(owner: TaskId, index: usize, data: &[u8]) -> Result<usize, NetError> {
+    if data.len() > socket::MAX_DATAGRAM {
+        return Err(NetError::Socket(socket::SocketError::TooLong(data.len())));
+    }
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    let (local_port, destination, remote_port) =
+        iface.sockets.route(owner, index).map_err(NetError::Socket)?;
+
+    let source = iface.address;
+    let mut message = [0u8; udp::HEADER + socket::MAX_DATAGRAM];
+    let len = udp::write(
+        &mut message,
+        source,
+        destination,
+        local_port,
+        remote_port,
+        data,
+    );
+    send_ipv4(iface, destination, ipv4::PROTOCOL_UDP, &message[..len])?;
+    iface.counters.udp_out += 1;
+    Ok(data.len())
+}
+
+/// Забрать принятую датаграмму, если она есть.
+pub fn socket_recv(owner: TaskId, index: usize) -> Result<Option<socket::Received>, NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    iface.sockets.take(owner, index).map_err(NetError::Socket)
+}
+
+/// Кто прислал последнюю забранную датаграмму.
+pub fn socket_peer(owner: TaskId, index: usize) -> Result<Option<(Ipv4, u16)>, NetError> {
+    let guard = INTERFACE.lock();
+    let iface = guard.as_ref().ok_or(NetError::NoDevice)?;
+    iface.sockets.last_peer(owner, index).map_err(NetError::Socket)
+}
+
+/// Закрыть сокет.
+pub fn socket_close(owner: TaskId, index: usize) -> Result<(), NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    iface.sockets.close(owner, index).map_err(NetError::Socket)
+}
+
+/// Закрыть всё, что осталось от задачи.
+///
+/// Вызывается на **всех** путях выхода программы, включая снятие по отказу:
+/// порт, оставшийся занятым после падения, не освободится уже никогда.
+pub fn close_owner(owner: TaskId) -> usize {
+    let mut guard = INTERFACE.lock();
+    match guard.as_mut() {
+        Some(iface) => iface.sockets.close_owner(owner),
+        None => 0,
+    }
 }
 
 /// Перебрать живые записи таблицы ARP.
@@ -357,15 +511,26 @@ fn handle_ipv4(iface: &mut Interface, payload: &[u8]) {
     let ours = packet.destination == iface.address
         || packet.destination.is_broadcast()
         || (!iface.netmask.is_unspecified()
-            && packet.destination == iface.address.network_broadcast(iface.netmask));
+            && packet.destination == iface.address.network_broadcast(iface.netmask))
+        // Пока адреса нет, «наш» — это любой пакет, который карта нам отдала:
+        // она уже отфильтровала кадры по аппаратному адресу, а сервер DHCP
+        // вправе ответить на предлагаемый адрес, которого у нас ещё нет.
+        // Отбросить такой ответ значит никогда не получить адрес и остаться в
+        // этом состоянии навсегда.
+        || iface.address.is_unspecified();
     if !ours {
         iface.counters.ignored += 1;
         return;
     }
 
+    if packet.protocol == ipv4::PROTOCOL_UDP {
+        handle_udp(iface, packet.source, packet.destination, packet.payload);
+        return;
+    }
+
     if packet.protocol != ipv4::PROTOCOL_ICMP {
-        // UDP и TCP появятся в следующих фазах. Пока честнее сосчитать пакет
-        // как непонятый, чем промолчать.
+        // TCP появится в следующей фазе. Пока честнее сосчитать пакет как
+        // непонятый, чем промолчать.
         iface.counters.ignored += 1;
         return;
     }
@@ -410,6 +575,26 @@ fn handle_ipv4(iface: &mut Interface, payload: &[u8]) {
     }
 }
 
+fn handle_udp(iface: &mut Interface, source: Ipv4, destination: Ipv4, payload: &[u8]) {
+    let Some(datagram) = udp::parse(source, destination, payload) else {
+        iface.counters.ignored += 1;
+        return;
+    };
+    iface.counters.udp_in += 1;
+
+    if !iface.sockets.deliver(
+        datagram.destination_port,
+        source,
+        datagram.source_port,
+        datagram.payload,
+    ) {
+        // Никто не слушает. Полагалось бы ответить ICMP «порт недостижим», и
+        // когда-нибудь мы это сделаем; пока — счётчик, потому что молчание в
+        // ответ на датаграмму и молчание из-за поломки выглядят одинаково.
+        iface.counters.udp_no_listener += 1;
+    }
+}
+
 /// Отправить пакет IPv4.
 ///
 /// Возвращает [`NetError::Pending`], если аппаратный адрес получателя ещё
@@ -422,7 +607,12 @@ fn send_ipv4(
     protocol: u8,
     payload: &[u8],
 ) -> Result<(), NetError> {
-    if iface.address.is_unspecified() {
+    // Отправлять, не имея адреса, вообще-то нельзя: ответ пришёл бы на
+    // `0.0.0.0`. Ровно одно исключение — широковещательный пакет, и оно не
+    // придумано для удобства: клиент DHCP обязан спросить адрес **до** того, как
+    // адрес у него появится, и делает это с `0.0.0.0` на `255.255.255.255`. Так
+    // написано в RFC 2131, и без этого исключения аренду взять невозможно.
+    if iface.address.is_unspecified() && !destination.is_broadcast() {
         return Err(NetError::NoAddress);
     }
 
@@ -495,6 +685,89 @@ fn request_arp(iface: &mut Interface, target: Ipv4) {
     if iface.device.send(&buffer).is_ok() {
         iface.counters.arp_requests_out += 1;
     }
+}
+
+/// Спросить у сервера имён адрес.
+///
+/// Работает поверх тех же сокетов, что и программы, и от имени той задачи,
+/// которая спрашивает: отдельного пути «для ядра» здесь нет намеренно — сокет,
+/// который никому не принадлежит, некому закрыть, если спрашивающего снимут
+/// посреди ожидания.
+pub fn resolve(name: &str, timeout_ms: u64) -> Result<Ipv4, NetError> {
+    /// Сколько раз переспросить, если ответа нет. UDP не обещает доставки, и
+    /// один потерянный запрос не повод объявлять имя несуществующим.
+    const ATTEMPTS: u32 = 3;
+
+    // Имя, записанное адресом, не спрашивают: `ping 10.0.2.2` не должен зависеть
+    // от того, поднялся ли сервер имён.
+    if let Some(address) = Ipv4::parse(name) {
+        return Ok(address);
+    }
+    if name.is_empty() || name.len() > dns::MAX_NAME {
+        return Err(NetError::BadName);
+    }
+
+    let server = dns_server().ok_or(NetError::NoAddress)?;
+    let owner = crate::sched::current();
+    let index = socket_open(owner)?;
+
+    // Дальше — только через `finish`: сокет обязан закрыться на любом пути,
+    // включая отказ, иначе эфемерный порт останется занятым до конца работы
+    // задачи.
+    let result = resolve_with(owner, index, server, name, timeout_ms, ATTEMPTS);
+    let _ = socket_close(owner, index);
+    result
+}
+
+fn resolve_with(
+    owner: TaskId,
+    index: usize,
+    server: Ipv4,
+    name: &str,
+    timeout_ms: u64,
+    attempts: u32,
+) -> Result<Ipv4, NetError> {
+    socket_bind(owner, index, 0)?;
+    socket_connect(owner, index, server, dns::PORT)?;
+
+    // Идентификатор запроса берётся из часов: случайности в системе пока нет, а
+    // постоянный идентификатор означал бы, что ответ на прошлый вопрос сходит за
+    // ответ на новый.
+    let id = (crate::time::uptime_ms() as u16) | 1;
+
+    let mut query = [0u8; dns::MAX_NAME + 32];
+    let len = dns::write_query(&mut query, id, name).ok_or(NetError::BadName)?;
+
+    for _ in 0..attempts {
+        // Отправка может не удаться, пока выясняется адрес шлюза.
+        let deadline = crate::time::uptime_ms() + timeout_ms;
+        loop {
+            match socket_send(owner, index, &query[..len]) {
+                Ok(_) => break,
+                Err(NetError::Pending) if crate::time::uptime_ms() < deadline => {
+                    crate::sched::sleep_ms(POLL_INTERVAL_MS);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        while crate::time::uptime_ms() < deadline {
+            if let Some(answer) = socket_recv(owner, index)? {
+                // Ответ не от того, кого спрашивали, не считается — на
+                // эфемерный порт может прийти что угодно.
+                if answer.from == server && answer.port == dns::PORT {
+                    if let Some(address) = dns::parse_answer(&answer.data, id) {
+                        return Ok(address);
+                    }
+                    // Ответ разобран и говорит «нет такого имени» — переспрашивать
+                    // бессмысленно, это ответ, а не потеря.
+                    return Err(NetError::NoSuchName);
+                }
+            }
+            crate::sched::sleep_ms(2);
+        }
+    }
+    Err(NetError::Timeout)
 }
 
 /// Отправить эхо-запрос и дождаться ответа.
