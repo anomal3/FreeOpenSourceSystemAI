@@ -655,8 +655,12 @@ fn read_registry<'a>(name: &str, buffer: &'a mut [u8]) -> Option<Manifest<'a>> {
         payload_len: 0,
         manifest_crc: fpk::crc32(&buffer[..filled]),
         payload_crc: 0,
+        // Подписи у записи реестра нет и быть не может: это не контейнер, а
+        // сохранённый манифест уже установленного пакета. Заголовок здесь —
+        // способ переиспользовать разбор, а не описание файла.
         signature_algorithm: 0,
         signature_len: 0,
+        signature: [0u8; fpk::SIGNATURE_SIZE],
     };
     Manifest::parse(&header, &buffer[..filled]).ok()
 }

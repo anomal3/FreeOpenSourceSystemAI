@@ -8,13 +8,29 @@
 //! место под подпись у них общие — и держать под это два формата значило бы
 //! чинить в двух местах всякую ошибку разбора.
 //!
-//! # Место под подпись есть с самого начала
+//! # Подпись: что именно подписано и почему так
 //!
-//! Подписи пока нет: проверять её нечем — ни ключей в системе, ни кода
-//! асимметричной криптографии. Но поле под неё в заголовке стоит **уже сейчас**,
-//! и это не задел «на будущее», а решение о совместимости: добавить подпись
+//! Место под подпись стояло в заголовке с первого дня, пустое: добавить её
 //! потом означало бы сдвинуть манифест, то есть выпустить второй формат и
-//! научить систему читать оба. Шестьдесят четыре байта нулей стоят дешевле.
+//! научить систему читать оба. С фазы 39 оно заполняется — Ed25519 по
+//! **SHA-256 от заголовка (с обнулённой подписью) и манифеста**.
+//!
+//! Полезная нагрузка в подписанное не входит, и это не упрощение. Она — десятки
+//! мегабайт, а читается ровно один раз, отрезками, прямо в раздел слота:
+//! посчитать по ней хеш до записи значило бы прочитать её дважды с того же
+//! носителя, то есть удвоить самую долгую операцию в системе. Вместо этого
+//! **каждый кусок нагрузки назван в манифесте своим SHA-256**, а манифест
+//! подписан. Цепочка получается такая же прочная и укладывается в один проход:
+//! подпись → манифест → хеш куска, считаемый по дороге.
+//!
+//! Отсюда правило, которое проверяется при разборе: **у подписанного контейнера
+//! хеш обязателен у каждого куска**. Контейнер, где подпись есть, а хеша нет, —
+//! это контейнер, у которого подписана только опись; принимать такой значит
+//! оставить дверь, ради которой всё и затевалось.
+//!
+//! Контрольные суммы CRC-32 при этом остаются и никуда не денутся: они ловят
+//! **порчу**, а не подмену, и ловят её дешевле — оборванная загрузка видна на
+//! первом же куске, не дожидаясь хеша.
 //!
 //! # Что этот формат не обещает
 //!
@@ -58,6 +74,15 @@ pub const HEADER_SIZE: usize = 128;
 
 /// Сколько байт отведено под подпись.
 pub const SIGNATURE_SIZE: usize = 64;
+
+/// Где в заголовке лежит подпись.
+pub const SIGNATURE_OFFSET: usize = 40;
+
+/// Алгоритм подписи: Ed25519 по SHA-256 заголовка и манифеста.
+///
+/// Ноль означает «подписи нет» и остаётся значением по умолчанию: пакет,
+/// собранный на этой машине для этой машины, подписывать нечем и незачем.
+pub const SIGNATURE_ED25519: u16 = 1;
 
 /// Самый длинный манифест, который согласны разбирать.
 ///
@@ -126,6 +151,12 @@ pub enum Error {
     MissingField,
     /// Строка манифеста не разбирается.
     BadLine,
+    /// Контейнер подписан, а у куска нагрузки нет хеша.
+    MissingHash,
+    /// Подпись не сошлась ни с одним из доверенных ключей.
+    BadSignature,
+    /// Алгоритм подписи не тот, который умеет эта система.
+    UnknownSignature(u16),
 }
 
 impl Error {
@@ -143,6 +174,9 @@ impl Error {
             Self::ManifestUnreadable => "the manifest is too long or not valid UTF-8",
             Self::MissingField => "the manifest lacks a required field",
             Self::BadLine => "the manifest has a line that does not parse",
+            Self::MissingHash => "the container is signed but a payload part carries no hash",
+            Self::BadSignature => "the signature does not match any key this system trusts",
+            Self::UnknownSignature(_) => "the signature algorithm is not one this system knows",
         }
     }
 }
@@ -166,6 +200,8 @@ pub struct Header {
     /// Алгоритм подписи; ноль означает «подписи нет».
     pub signature_algorithm: u16,
     pub signature_len: u16,
+    /// Сама подпись — столько байт, сколько назвал `signature_len`.
+    pub signature: [u8; SIGNATURE_SIZE],
 }
 
 impl Header {
@@ -240,6 +276,8 @@ impl Header {
         if signature_len as usize > SIGNATURE_SIZE {
             return Err(Error::BadLength);
         }
+        let mut signature = [0u8; SIGNATURE_SIZE];
+        signature.copy_from_slice(&bytes[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE]);
 
         Ok(Self {
             kind,
@@ -249,7 +287,69 @@ impl Header {
             payload_crc: read_u32(bytes, 28),
             signature_algorithm: read_u16(bytes, 32),
             signature_len,
+            signature,
         })
+    }
+}
+
+/// Что именно подписывается: SHA-256 заголовка (с обнулённой подписью) и
+/// манифеста.
+///
+/// Живёт здесь, а не у подписывающего и не у проверяющего, по одной причине:
+/// это **общее знание двух сторон**, и разойтись оно может только молча —
+/// подпись просто перестанет сходиться, и виноватым будет выглядеть ключ.
+///
+/// Обнуляется не только подпись, но и её длина с алгоритмом: иначе подписанное
+/// зависело бы от того, подписан ли уже контейнер, а это круг.
+#[must_use]
+pub fn signed_digest(head: &[u8], manifest: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
+    let head = &head[..HEADER_SIZE.min(head.len())];
+    for (at, byte) in head.iter().enumerate() {
+        let blanked = (32..36).contains(&at)
+            || (SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE).contains(&at);
+        hash.update([if blanked { 0 } else { *byte }]);
+    }
+    hash.update(manifest);
+    let digest = hash.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// SHA-256 куска нагрузки, посчитанный по частям.
+///
+/// Обёртка вокруг чужого типа существует затем, чтобы у ядра, у программы и у
+/// сборщика был один и тот же способ считать хеш по дороге, а не три похожих.
+pub struct Hasher(sha2::Sha256);
+
+impl Hasher {
+    #[must_use]
+    pub fn new() -> Self {
+        use sha2::Digest;
+        Self(sha2::Sha256::new())
+    }
+
+    pub fn update(&mut self, chunk: &[u8]) {
+        use sha2::Digest;
+        self.0.update(chunk);
+    }
+
+    #[must_use]
+    pub fn finish(self) -> [u8; 32] {
+        use sha2::Digest;
+        let digest = self.0.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+}
+
+impl Default for Hasher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -261,6 +361,8 @@ impl Header {
 #[derive(Debug, Clone, Copy)]
 pub struct Manifest<'a> {
     text: &'a str,
+    /// Контейнер подписан — значит у каждого куска обязан быть хеш.
+    signed: bool,
 }
 
 impl<'a> Manifest<'a> {
@@ -277,7 +379,7 @@ impl<'a> Manifest<'a> {
             return Err(Error::ManifestCorrupt);
         }
         let text = core::str::from_utf8(bytes).map_err(|_| Error::ManifestUnreadable)?;
-        Ok(Self { text })
+        Ok(Self { text, signed: header.is_signed() })
     }
 
     /// Значение поля `ключ=значение`. Первое вхождение, без пробелов по краям.
@@ -333,7 +435,14 @@ impl<'a> Manifest<'a> {
 
     /// Кусок полезной нагрузки, названный ключом: `image`, `kernel`, `initrd`.
     pub fn blob(&self, key: &str) -> Result<Blob, Error> {
-        Blob::parse(self.required(key)?)
+        let blob = Blob::parse(self.required(key)?)?;
+        // Требование проверяется здесь, а не у вызывающего: забыть его значит
+        // принять контейнер, у которого подписана одна опись, — а именно так
+        // поступил бы всякий, кто про это требование не знает.
+        if self.signed && blob.hash.is_none() {
+            return Err(Error::MissingHash);
+        }
+        Ok(blob)
     }
 
     /// То же, но отсутствие — не ошибка.
@@ -403,19 +512,52 @@ pub struct Blob {
     pub offset: u64,
     pub size: u64,
     pub crc: u32,
+    /// SHA-256 содержимого. `None` — у неподписанного контейнера.
+    ///
+    /// Именно он связывает подписанный манифест с нагрузкой; CRC рядом ловит
+    /// порчу и обрыв, а не подмену (см. заголовок крейта).
+    pub hash: Option<[u8; 32]>,
 }
 
 impl Blob {
-    /// `<смещение> <длина> <crc>`.
+    /// `<смещение> <длина> <crc>` и, если контейнер подписан, `<sha256>`.
     fn parse(value: &str) -> Result<Self, Error> {
         let mut fields = value.trim().split_whitespace();
         let offset = parse_u64(next(&mut fields)?)?;
         let size = parse_u64(next(&mut fields)?)?;
         let crc = u32::from_str_radix(next(&mut fields)?, 16).map_err(|_| Error::BadLine)?;
+        let hash = match fields.next() {
+            Some(text) => Some(parse_hash(text)?),
+            None => None,
+        };
         if offset.checked_add(size).is_none() {
             return Err(Error::BadLine);
         }
-        Ok(Self { offset, size, crc })
+        Ok(Self { offset, size, crc, hash })
+    }
+}
+
+/// Разобрать SHA-256, записанный шестнадцатеричными цифрами.
+fn parse_hash(text: &str) -> Result<[u8; 32], Error> {
+    if text.len() != 64 {
+        return Err(Error::BadLine);
+    }
+    let bytes = text.as_bytes();
+    let mut out = [0u8; 32];
+    for (at, pair) in bytes.chunks_exact(2).enumerate() {
+        let high = digit(pair[0])?;
+        let low = digit(pair[1])?;
+        out[at] = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+const fn digit(byte: u8) -> Result<u8, Error> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(Error::BadLine),
     }
 }
 
@@ -533,6 +675,76 @@ mod tests {
             partial = crc32_update(partial, chunk);
         }
         assert_eq!(whole, partial);
+    }
+
+    /// Хеш из манифеста читается ровно теми же байтами, какими его записали.
+    #[test]
+    fn a_blob_line_carries_its_hash() {
+        let blob = Blob::parse(
+            "0 1024 deadbeef \
+             e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+        .expect("строка разбирается");
+        assert_eq!(blob.offset, 0);
+        assert_eq!(blob.size, 1024);
+        assert_eq!(blob.crc, 0xdead_beef);
+        let hash = blob.hash.expect("хеш есть");
+        assert_eq!(hash[0], 0xe3);
+        assert_eq!(hash[31], 0x55);
+    }
+
+    /// Строка без хеша разбирается — так выглядят пакеты, собранные до подписи
+    /// и без неё.
+    #[test]
+    fn a_blob_line_without_a_hash_still_parses() {
+        let blob = Blob::parse("16 32 00000000").expect("строка разбирается");
+        assert!(blob.hash.is_none());
+    }
+
+    /// Хеш не той длины или не из шестнадцатеричных цифр — отказ, а не
+    /// молчаливое «прочитали, сколько было».
+    #[test]
+    fn a_hash_that_is_not_a_hash_is_refused() {
+        assert!(Blob::parse("0 1 0 abcd").is_err());
+        assert!(
+            Blob::parse(
+                "0 1 0 zzb0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            )
+            .is_err()
+        );
+    }
+
+    /// Подписанное не должно зависеть от того, подписан ли уже контейнер:
+    /// поля подписи в хеш не входят.
+    #[test]
+    fn the_signature_fields_do_not_change_what_is_signed() {
+        let mut head = [7u8; HEADER_SIZE];
+        let manifest = b"name=freeos\n";
+        let before = signed_digest(&head, manifest);
+        head[32..36].copy_from_slice(&[1, 0, 64, 0]);
+        for byte in &mut head[SIGNATURE_OFFSET..SIGNATURE_OFFSET + SIGNATURE_SIZE] {
+            *byte = 0xAB;
+        }
+        assert_eq!(before, signed_digest(&head, manifest));
+
+        // А вот всё остальное входит: правка длины манифеста обязана менять
+        // хеш, иначе подпись не защищает ничего.
+        head[12] ^= 1;
+        assert_ne!(before, signed_digest(&head, manifest));
+    }
+
+    /// Счёт по частям обязан давать то же, что счёт целиком: нагрузка
+    /// считается по дороге, отрезками по четверти мегабайта.
+    #[test]
+    fn hashing_by_chunks_equals_hashing_at_once() {
+        let data: [u8; 500] = core::array::from_fn(|index| (index * 7) as u8);
+        let mut whole = Hasher::new();
+        whole.update(&data);
+        let mut partial = Hasher::new();
+        for chunk in data.chunks(64) {
+            partial.update(chunk);
+        }
+        assert_eq!(whole.finish(), partial.finish());
     }
 
     #[test]

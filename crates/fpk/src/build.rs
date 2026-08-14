@@ -89,13 +89,20 @@ impl Builder {
     }
 
     /// Уложить именованный кусок: образ корня, ядро, initrd.
+    ///
+    /// Хеш куска пишется **всегда**, а не только у подписываемого контейнера:
+    /// шестьдесят четыре знака в манифесте стоят ничего, а собранный без хеша
+    /// контейнер нельзя было бы подписать задним числом, не пересобрав его.
     pub fn blob(&mut self, key: &str, data: &[u8]) -> &mut Self {
         let offset = self.payload.len() as u64;
         self.payload.extend_from_slice(data);
+        let mut hasher = crate::Hasher::new();
+        hasher.update(data);
         self.placed.push(alloc::format!(
-            "{key}={offset} {} {:08x}",
+            "{key}={offset} {} {:08x} {}",
             data.len(),
             crc32(data),
+            hex(&hasher.finish()),
         ));
         self
     }
@@ -130,15 +137,63 @@ impl Builder {
         out.extend_from_slice(&(self.payload.len() as u64).to_le_bytes());
         out.extend_from_slice(&crc32(&manifest).to_le_bytes());
         out.extend_from_slice(&crc32(&self.payload).to_le_bytes());
-        // Алгоритм подписи и её длина — нули: подписи нет. Место под неё
-        // всё равно занято, см. заголовок крейта.
+        // Алгоритм подписи и её длина — нули: подписывает не сборщик, а тот, у
+        // кого есть ключ, и делает он это отдельным шагом (`sign`). Место под
+        // подпись занято всегда, см. заголовок крейта.
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
-        out.resize(40 + SIGNATURE_SIZE, 0);
+        out.resize(crate::SIGNATURE_OFFSET + SIGNATURE_SIZE, 0);
         out.resize(HEADER_SIZE, 0);
         out.extend_from_slice(&manifest);
         out.extend_from_slice(&self.payload);
         out
     }
+}
+
+/// Шестнадцатеричная запись — та, которую читает разбор манифеста.
+fn hex(bytes: &[u8]) -> String {
+    let digits = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(digits[(byte >> 4) as usize] as char);
+        out.push(digits[(byte & 0xF) as usize] as char);
+    }
+    out
+}
+
+/// Что подписывать в готовом контейнере и куда класть подпись.
+///
+/// Возвращает то, что надо подписать (SHA-256 заголовка и манифеста), — сам
+/// ключ сюда не приезжает: подписывающий живёт на хосте, а этот крейт собирается
+/// и для ядра, которому закрытые ключи не нужны и не должны быть доступны.
+///
+/// # Паника
+///
+/// Паникует на контейнере короче заголовка: это сборка на хосте, и такой
+/// контейнер собрал бы только сам сборщик — то есть это его ошибка, а не входные
+/// данные.
+#[must_use]
+pub fn digest_of(container: &[u8]) -> [u8; 32] {
+    assert!(container.len() >= HEADER_SIZE, "контейнер короче заголовка");
+    let manifest_len = u32::from_le_bytes([
+        container[12],
+        container[13],
+        container[14],
+        container[15],
+    ]) as usize;
+    crate::signed_digest(
+        &container[..HEADER_SIZE],
+        &container[HEADER_SIZE..HEADER_SIZE + manifest_len],
+    )
+}
+
+/// Вписать подпись в готовый контейнер.
+pub fn seal(container: &mut [u8], algorithm: u16, signature: &[u8]) {
+    assert!(container.len() >= HEADER_SIZE, "контейнер короче заголовка");
+    assert!(signature.len() <= SIGNATURE_SIZE, "подпись длиннее отведённого места");
+    container[32..34].copy_from_slice(&algorithm.to_le_bytes());
+    container[34..36].copy_from_slice(&(signature.len() as u16).to_le_bytes());
+    container[crate::SIGNATURE_OFFSET..crate::SIGNATURE_OFFSET + signature.len()]
+        .copy_from_slice(signature);
 }
