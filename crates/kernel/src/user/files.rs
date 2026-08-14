@@ -33,6 +33,8 @@ const DEFAULT_MODE: u16 = 0o644;
 use crate::vfs::perm::{Access, Credentials};
 use crate::vfs::{DirEntry, Node, NodeKind, VfsError};
 
+use super::pipe::{self, PipeError};
+
 /// Открытый файл: узел, то, докуда программа его дочитала, и можно ли в него
 /// писать.
 struct Open {
@@ -54,6 +56,21 @@ struct Open {
     entries: Option<Vec<DirEntry>>,
 }
 
+/// Что лежит в месте таблицы.
+///
+/// Файл или конец канала — и это единственное место, где они различаются.
+/// Дальше по коду дескриптор остаётся числом, а `read` и `write` спрашивают у
+/// таблицы, куда именно идти. Иначе программе пришлось бы знать, чем её
+/// стандартный ввод оказался сегодня, — а весь смысл канала в том, что не
+/// приходится.
+enum Slot {
+    File(Open),
+    /// Читающий конец: из него берёт `read`.
+    PipeRead(pipe::Reader),
+    /// Пишущий конец: в него отдаёт `write`.
+    PipeWrite(pipe::Writer),
+}
+
 /// Почему не получилось.
 #[derive(Debug, Clone, Copy)]
 pub enum FileError {
@@ -68,6 +85,11 @@ pub enum FileError {
     /// Позиция ушла за пределы того, что представимо: до начала файла или за
     /// границу 64 бит.
     BadOffset,
+    /// У конца канала нет ни позиции, ни списка имён: `seek` и перечисление к
+    /// нему не относятся.
+    NotSeekable,
+    /// Канал сказал своё: писать некому либо прямо сейчас нечего читать.
+    Pipe(PipeError),
 }
 
 /// От чего считается смещение в [`Table::seek`].
@@ -84,7 +106,7 @@ pub enum Whence {
 /// Таблица дескрипторов одной программы. Место `i` — это дескриптор
 /// `i + FD_FIRST`.
 pub struct Table {
-    slots: [Option<Open>; MAX_OPEN_FILES],
+    slots: [Option<Slot>; MAX_OPEN_FILES],
 }
 
 impl Table {
@@ -142,7 +164,7 @@ impl Table {
             .iter()
             .position(Option::is_none)
             .ok_or(FileError::TooManyFiles)?;
-        self.slots[slot] = Some(Open { node, offset: 0, writable, entries });
+        self.slots[slot] = Some(Slot::File(Open { node, offset: 0, writable, entries }));
         Ok(slot + FD_FIRST)
     }
 
@@ -170,20 +192,31 @@ impl Table {
             .iter()
             .position(Option::is_none)
             .ok_or(FileError::TooManyFiles)?;
-        self.slots[slot] = Some(Open { node, offset: 0, writable: true, entries: None });
+        self.slots[slot] =
+            Some(Slot::File(Open { node, offset: 0, writable: true, entries: None }));
         Ok(slot + FD_FIRST)
     }
 
     /// Записать в дескриптор. Возвращает, сколько записано.
     pub fn write(&mut self, fd: usize, data: &[u8]) -> Result<usize, FileError> {
         let index = index_of(fd)?;
-        let open = self.slots[index].as_mut().ok_or(FileError::BadFd)?;
-        if !open.writable {
-            return Err(FileError::Vfs(VfsError::PermissionDenied));
+        match self.slots[index].as_mut().ok_or(FileError::BadFd)? {
+            Slot::File(open) => {
+                if !open.writable {
+                    return Err(FileError::Vfs(VfsError::PermissionDenied));
+                }
+                let written = open.node.write_at(open.offset, data).map_err(FileError::Vfs)?;
+                open.offset += written as u64;
+                Ok(written)
+            }
+            // Запись в канал через дескриптор **не ждёт** места, и это не
+            // упрощение. Таблица дескрипторов лежит под локом всей программы:
+            // задача, уснувшая с ним в руках, останавливает вместе с собой
+            // всякого, кто в эту таблицу заглянет. Ждать умеет стандартный
+            // вывод (см. `Program::stdout`) — он живёт не в таблице.
+            Slot::PipeWrite(writer) => writer.write(data, false).map_err(FileError::Pipe),
+            Slot::PipeRead(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
-        let written = open.node.write_at(open.offset, data).map_err(FileError::Vfs)?;
-        open.offset += written as u64;
-        Ok(written)
     }
 
     /// Взять очередную запись каталога. `None` — записи кончились.
@@ -193,7 +226,7 @@ impl Table {
     /// двигает `seek`.
     pub fn next_entry(&mut self, fd: usize) -> Result<Option<DirEntry>, FileError> {
         let index = index_of(fd)?;
-        let open = self.slots[index].as_mut().ok_or(FileError::BadFd)?;
+        let open = Self::as_file(self.slots[index].as_mut())?;
         let entries = open.entries.as_ref().ok_or(FileError::Vfs(VfsError::WrongKind))?;
 
         let at = open.offset as usize;
@@ -208,18 +241,26 @@ impl Table {
     /// это конец файла, а не ошибка.
     pub fn read(&mut self, fd: usize, buf: &mut [u8]) -> Result<usize, FileError> {
         let index = index_of(fd)?;
-        let open = self.slots[index].as_mut().ok_or(FileError::BadFd)?;
-        // У каталога байтов нет: читать его как файл — это вопрос не к правам, а
-        // к тому, что такое каталог. Программа, спутавшая одно с другим, узнает
-        // об этом здесь, а не получит содержимое чужого формата.
-        if open.entries.is_some() {
-            return Err(FileError::Vfs(VfsError::WrongKind));
+        match self.slots[index].as_mut().ok_or(FileError::BadFd)? {
+            Slot::File(open) => {
+                // У каталога байтов нет: читать его как файл — это вопрос не к
+                // правам, а к тому, что такое каталог. Программа, спутавшая одно
+                // с другим, узнает об этом здесь, а не получит содержимое чужого
+                // формата.
+                if open.entries.is_some() {
+                    return Err(FileError::Vfs(VfsError::WrongKind));
+                }
+                let read = open.node.read_at(open.offset, buf).map_err(FileError::Vfs)?;
+                // Смещение двигается на прочитанное, а не на запрошенное: у
+                // конца файла это разные числа, и второе увело бы следующее
+                // чтение за конец.
+                open.offset += read as u64;
+                Ok(read)
+            }
+            // Не ждёт по той же причине, что и запись выше.
+            Slot::PipeRead(reader) => reader.read(buf, false).map_err(FileError::Pipe),
+            Slot::PipeWrite(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
-        let read = open.node.read_at(open.offset, buf).map_err(FileError::Vfs)?;
-        // Смещение двигается на прочитанное, а не на запрошенное: у конца файла
-        // это разные числа, и второе увело бы следующее чтение за конец.
-        open.offset += read as u64;
-        Ok(read)
     }
 
     /// Передвинуть позицию и вернуть новую.
@@ -232,7 +273,7 @@ impl Table {
     /// данные.
     pub fn seek(&mut self, fd: usize, offset: i64, whence: Whence) -> Result<u64, FileError> {
         let index = index_of(fd)?;
-        let open = self.slots[index].as_mut().ok_or(FileError::BadFd)?;
+        let open = Self::as_file(self.slots[index].as_mut())?;
         let base = match whence {
             Whence::Set => 0,
             Whence::Current => open.offset,
@@ -255,6 +296,60 @@ impl Table {
         match self.slots[index].take() {
             Some(_) => Ok(()),
             None => Err(FileError::BadFd),
+        }
+    }
+
+    /// Занять место под читающий конец канала.
+    ///
+    /// Отдельно от [`Table::open`] потому, что открывать нечего: канал уже
+    /// существует, таблице нужно только место под его конец.
+    pub fn install_read(&mut self, reader: pipe::Reader) -> Result<usize, FileError> {
+        let slot = self.free_slot()?;
+        self.slots[slot] = Some(Slot::PipeRead(reader));
+        Ok(slot + FD_FIRST)
+    }
+
+    /// То же для пишущего конца.
+    pub fn install_write(&mut self, writer: pipe::Writer) -> Result<usize, FileError> {
+        let slot = self.free_slot()?;
+        self.slots[slot] = Some(Slot::PipeWrite(writer));
+        Ok(slot + FD_FIRST)
+    }
+
+    /// Копия читающего конца из этого дескриптора.
+    ///
+    /// Копия, а не изъятие: тот, кто отдаёт конец запускаемой задаче, свой
+    /// дескриптор сохраняет — и обязан закрыть его сам. Правило неудобное, но
+    /// честное: закрыть чужой дескриптор внутри `launch` значило бы сделать то,
+    /// о чём программа не просила. Цена ошибки при этом названа в договоре:
+    /// незакрытый конец — это конец файла, который не наступит никогда.
+    pub fn read_end(&self, fd: usize) -> Result<pipe::Reader, FileError> {
+        let index = index_of(fd)?;
+        match self.slots[index].as_ref().ok_or(FileError::BadFd)? {
+            Slot::PipeRead(reader) => Ok(reader.clone()),
+            _ => Err(FileError::Vfs(VfsError::WrongKind)),
+        }
+    }
+
+    /// Копия пишущего конца из этого дескриптора.
+    pub fn write_end(&self, fd: usize) -> Result<pipe::Writer, FileError> {
+        let index = index_of(fd)?;
+        match self.slots[index].as_ref().ok_or(FileError::BadFd)? {
+            Slot::PipeWrite(writer) => Ok(writer.clone()),
+            _ => Err(FileError::Vfs(VfsError::WrongKind)),
+        }
+    }
+
+    /// Свободное место или отказ.
+    fn free_slot(&self) -> Result<usize, FileError> {
+        self.slots.iter().position(Option::is_none).ok_or(FileError::TooManyFiles)
+    }
+
+    /// Место таблицы как файл.
+    fn as_file(slot: Option<&mut Slot>) -> Result<&mut Open, FileError> {
+        match slot.ok_or(FileError::BadFd)? {
+            Slot::File(open) => Ok(open),
+            _ => Err(FileError::NotSeekable),
         }
     }
 

@@ -38,6 +38,7 @@ use user_abi::{
     SYS_SEEK, SYS_SLEEP, SYS_SPAWN, SYS_STAT, SYS_TIME, SYS_TTYMODE, SYS_UPTIME, SYS_WAIT,
     SYS_WINSIZE, SYS_WRITE, SYS_YIELD, Stat, TTY_RAW, WAIT_NOHANG,
 };
+use user_abi::{ERR_BROKEN_PIPE, LAUNCH_KEEP, Launch, SYS_LAUNCH, SYS_PIPE};
 use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
@@ -99,6 +100,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_OPEN => open(a0, a1, a2),
         SYS_CREATE => create(a0, a1, a2),
         SYS_SPAWN => spawn(a0, a1, a2),
+        SYS_PIPE => make_pipe(),
+        SYS_LAUNCH => launch(a0),
         SYS_WAIT => wait(a0, a1),
         SYS_READ => read(a0, a1, a2),
         SYS_SEEK => seek(a0, a1 as i64, a2),
@@ -192,6 +195,25 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
         };
     }
 
+    // Вывод перенаправлен в канал — значит уходит туда целиком и как есть.
+    // Байты, а не текст: на другом конце может стоять программа, которой нужны
+    // именно байты, и требовать от них UTF-8 значило бы запретить `cat`
+    // двоичный файл.
+    //
+    // Писатель берётся копией и лок программы отпускается до записи: запись в
+    // полный канал **ждёт**, а ждать, удерживая таблицу программ, значит
+    // остановить всех, кто в неё заглянет, — включая того, кто должен этот
+    // канал вычерпать.
+    if let Some(Some(stdout)) = super::with_current(|program| program.stdout.clone()) {
+        return match stdout.write(bytes, true) {
+            Ok(written) => written as i64,
+            // Читателя не стало: программа пишет в никуда. Это тот самый
+            // `EPIPE`, и молчать о нём нельзя — иначе вывод исчезает, а
+            // программа считает, что напечатала.
+            Err(_) => ERR_BROKEN_PIPE,
+        };
+    }
+
     // Двоичный мусор в окно оболочки не выводится: управляющие байты испортили
     // бы и сетку символов, и терминал на другом конце линии. Это ограничение
     // вывода, а не проверка программы, — поэтому не ошибка.
@@ -251,17 +273,9 @@ fn spawn(ptr: usize, len: usize, who: usize) -> i64 {
         Err(err) => return err,
     };
 
-    let mine = super::credentials();
-    let cred = if who == SPAWN_INHERIT {
-        mine
-    } else {
-        let asked = crate::vfs::perm::Credentials::new((who >> 32) as u32, who as u32);
-        // Тот же uid — не «повышение», даже если группа другая: сменить себе
-        // группу вправе кто угодно, потому что чужих прав это не даёт.
-        if !mine.is_root() && asked.uid != mine.uid {
-            return ERR_PERMISSION;
-        }
-        asked
+    let cred = match requested_credentials(who) {
+        Ok(cred) => cred,
+        Err(err) => return err,
     };
 
     // Служба, запущенная службой, — тоже служба. Иначе перезапущенный
@@ -276,6 +290,122 @@ fn spawn(ptr: usize, len: usize, who: usize) -> i64 {
         // Всё остальное — отказ разбора строки: она длиннее предела либо пуста.
         Err(_) => ERR_BAD_PATH,
     }
+}
+
+/// `pipe() -> (читающий << 32) | пишущий`.
+///
+/// Два дескриптора одним вызовом: канал с одним концом — это не канал, а
+/// программа, которая успела получить только половину, не смогла бы даже
+/// закрыть вторую.
+fn make_pipe() -> i64 {
+    let (reader, writer) = match super::pipe::create() {
+        Ok(ends) => ends,
+        Err(_) => return ERR_NO_SPACE,
+    };
+    // Оба места занимаются под одним взятием лока: между двумя вызовами
+    // программу могут вытеснить, и второй мог бы не найти места — а первый уже
+    // отдал бы дескриптор на конец канала, у которого нет пары.
+    let result = super::with_current(|program| {
+        let read_fd = program.files.install_read(reader)?;
+        match program.files.install_write(writer) {
+            Ok(write_fd) => Ok((read_fd, write_fd)),
+            Err(err) => {
+                // Место под первый конец возвращается: полканала в таблице —
+                // это утечка, которую программе нечем даже заметить.
+                let _ = program.files.close(read_fd);
+                Err(err)
+            }
+        }
+    });
+    match result {
+        Some(Ok((read_fd, write_fd))) => ((read_fd as i64) << 32) | write_fd as i64,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `launch(ptr) -> номер задачи`.
+///
+/// # Почему структурой, а не аргументами
+///
+/// Потому что назвать надо пять вещей — строку, её длину, личность и два
+/// дескриптора, — а аргументов у системного вызова три на обеих архитектурах.
+/// Расширять соглашение ради одного вызова пришлось бы в четырёх местах, из
+/// них два — вставки на ассемблере.
+fn launch(ptr: usize) -> i64 {
+    let size = core::mem::size_of::<Launch>();
+    if !space::user_can(ptr, size, PageFlags::READ) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: диапазон проверен по таблицам самой программы и доступен ей на
+    // чтение; `Launch` — `repr(C)` из полей по восемь байт, поэтому чтение
+    // невыровненным быть не может, а любое содержимое для него законно.
+    let request = unsafe { (ptr as *const Launch).read_unaligned() };
+
+    let Ok(command) = usize::try_from(request.command) else {
+        return ERR_BAD_ADDRESS;
+    };
+    let Ok(command_len) = usize::try_from(request.command_len) else {
+        return ERR_BAD_PATH;
+    };
+    let mut buffer = [0u8; MAX_PATH];
+    let line = match copy_path(command, command_len, &mut buffer) {
+        Ok(line) => line,
+        Err(err) => return err,
+    };
+
+    let cred = match requested_credentials(request.who as usize) {
+        Ok(cred) => cred,
+        Err(err) => return err,
+    };
+
+    // Концы берутся копиями: дескрипторы остаются у того, кто запускает, и
+    // закрывает их он сам. См. договор `SYS_PIPE` — там же сказано, чем грозит
+    // забывчивость.
+    let ends = super::with_current(|program| {
+        let stdin = if request.stdin == LAUNCH_KEEP {
+            Ok(None)
+        } else {
+            program.files.read_end(request.stdin as usize).map(Some)
+        };
+        let stdout = if request.stdout == LAUNCH_KEEP {
+            Ok(None)
+        } else {
+            program.files.write_end(request.stdout as usize).map(Some)
+        };
+        stdin.and_then(|stdin| stdout.map(|stdout| (stdin, stdout)))
+    });
+    let (stdin, stdout) = match ends {
+        Some(Ok(ends)) => ends,
+        Some(Err(err)) => return errno(err),
+        None => return ERR_NO_PROGRAM,
+    };
+
+    match super::spawn_streams(line, cred, sched::is_daemon(), stdin, stdout) {
+        Ok(id) => i64::from(id.as_u32()),
+        Err(super::Error::TooManyTasks) => ERR_TOO_MANY_TASKS,
+        Err(super::Error::OutOfMemory) => ERR_NO_SPACE,
+        Err(_) => ERR_BAD_PATH,
+    }
+}
+
+/// От чьего имени запускать: разбор поля `кто` у [`SYS_SPAWN`] и [`SYS_LAUNCH`].
+///
+/// Правило одно на оба вызова и живёт в одном месте намеренно: два места, где
+/// решается «можно ли этому uid», — это два места, где можно ошибиться, и одно
+/// из них станет дырой.
+fn requested_credentials(who: usize) -> Result<crate::vfs::perm::Credentials, i64> {
+    let mine = super::credentials();
+    if who == SPAWN_INHERIT {
+        return Ok(mine);
+    }
+    let asked = crate::vfs::perm::Credentials::new((who >> 32) as u32, who as u32);
+    // Тот же uid — не «повышение», даже если группа другая: сменить себе
+    // группу вправе кто угодно, потому что чужих прав это не даёт.
+    if !mine.is_root() && asked.uid != mine.uid {
+        return Err(ERR_PERMISSION);
+    }
+    Ok(asked)
 }
 
 /// `wait(id, флаги) -> код возврата`.
@@ -360,6 +490,14 @@ fn read(fd: usize, ptr: usize, len: usize) -> i64 {
     let buffer = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
 
     if fd == FD_STDIN {
+        // Ввод перенаправлен в канал — читаем оттуда и **ждём**, как ждал бы
+        // терминал. Ноль означает конец: писателей у канала не осталось.
+        if let Some(Some(stdin)) = super::with_current(|program| program.stdin.clone()) {
+            return match stdin.read(buffer, true) {
+                Ok(read) => read as i64,
+                Err(_) => 0,
+            };
+        }
         return read_input(buffer);
     }
 
@@ -935,6 +1073,10 @@ fn errno(err: FileError) -> i64 {
         FileError::TooManyFiles => ERR_TOO_MANY_FILES,
         FileError::Vfs(err) => vfs_errno(err),
         FileError::BadOffset => ERR_BAD_ADDRESS,
+        FileError::NotSeekable => ERR_UNSUPPORTED,
+        FileError::Pipe(super::pipe::PipeError::Broken) => ERR_BROKEN_PIPE,
+        FileError::Pipe(super::pipe::PipeError::WouldBlock) => ERR_AGAIN,
+        FileError::Pipe(super::pipe::PipeError::OutOfMemory) => ERR_NO_SPACE,
     }
 }
 

@@ -20,12 +20,14 @@
 use core::panic::PanicInfo;
 
 use user_abi::{
-    ERR_BAD_PATH, FD_STDERR, FD_STDIN, FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID,
+    ERR_BAD_PATH, FD_STDERR, FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID,
     SYS_GETUID, SYS_OPEN, SYS_READ, O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_READDIR,
     SYS_REMOVE, SYS_RENAME, SYS_SEEK, SYS_SLEEP, SYS_SPAWN, SYS_STAT, SYS_TIME, SYS_TTYMODE,
     SYS_UPTIME, SYS_WAIT, SYS_WINSIZE, SYS_WRITE, SYS_YIELD, SPAWN_INHERIT, Stat, TTY_LINE,
     TTY_RAW, WAIT_NOHANG,
 };
+
+use user_abi::{LAUNCH_KEEP, Launch, SYS_LAUNCH, SYS_PIPE};
 
 use user_abi::{
     SOCK_TCP, SOCK_UDP, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN,
@@ -34,8 +36,9 @@ use user_abi::{
 };
 
 pub use user_abi::{
-    Dirent, ERR_AGAIN, ERR_NO_NETWORK, ERR_NO_TASK, KIND_DIRECTORY, KIND_FILE, NetConfig, NetInfo,
-    Peer, SEEK_CUR, SEEK_END, SEEK_SET, StreamState,
+    Dirent, ERR_AGAIN, ERR_BROKEN_PIPE, ERR_NOT_FOUND, ERR_NO_NETWORK, ERR_NO_TASK, ERR_PERMISSION,
+    FD_STDIN, KIND_DIRECTORY, KIND_FILE, NetConfig, NetInfo, Peer, SEEK_CUR, SEEK_END, SEEK_SET,
+    StreamState,
 };
 
 /// Выполнить системный вызов.
@@ -602,6 +605,49 @@ pub fn spawn_as(line: &str, uid: u32, gid: u32) -> i64 {
     // SAFETY: строка живёт в памяти программы, длина — её собственная.
     unsafe { syscall(SYS_SPAWN, line.as_ptr() as usize, line.len(), who) }
 }
+
+/// Завести канал. Возвращает пару `(читающий, пишущий)` или отказ.
+///
+/// Канал — это байты от одной задачи к другой. Тому, кто отдаёт конец
+/// запускаемой программе, придётся закрыть свою копию: пока она жива, на другом
+/// конце не наступит конца файла — живой писатель есть, значит данные ещё
+/// могут прийти.
+pub fn pipe() -> Result<(i64, i64), i64> {
+    // SAFETY: аргументов нет, возврат — число.
+    let packed = unsafe { syscall(SYS_PIPE, 0, 0, 0) };
+    if packed < 0 {
+        return Err(packed);
+    }
+    Ok((packed >> 32, packed & 0xFFFF_FFFF))
+}
+
+/// Запустить программу, назвав ей стандартный ввод и вывод.
+///
+/// `stdin`/`stdout` — дескрипторы концов канала либо [`LAUNCH_KEEP`], если поток
+/// оставить как есть. `uid`/`gid` — от чьего имени; `None` означает «от того же,
+/// от кого запускают».
+///
+/// Дескрипторы **не закрываются**: закрыть их — дело вызывающего, и сделать это
+/// надо сразу после запуска, иначе конец файла не наступит никогда.
+pub fn launch(line: &str, who: Option<(u32, u32)>, stdin: i64, stdout: i64) -> i64 {
+    let who = match who {
+        Some((uid, gid)) => (u64::from(uid) << 32) | u64::from(gid),
+        None => SPAWN_INHERIT as u64,
+    };
+    let request = Launch {
+        command: line.as_ptr() as u64,
+        command_len: line.len() as u64,
+        who,
+        stdin,
+        stdout,
+    };
+    // SAFETY: структура лежит в памяти этой программы и живёт до конца вызова;
+    // ядро прочитает её и проверит адреса по своим таблицам.
+    unsafe { syscall(SYS_LAUNCH, core::ptr::addr_of!(request) as usize, 0, 0) }
+}
+
+/// Оставить поток программы как есть — см. [`launch`].
+pub const KEEP: i64 = LAUNCH_KEEP;
 
 /// Дождаться конца задачи и узнать её код возврата.
 ///

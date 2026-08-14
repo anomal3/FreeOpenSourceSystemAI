@@ -485,6 +485,44 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "pipe",
+        about: "Канал: вывод одной программы считает другая, и обе видят конец файла.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        ssh_key: false,
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Главное утверждение: `wc` считает **чужой** вывод и доходит до
+            // конца файла. Не дойти до него — самый вероятный отказ этой фазы:
+            // забытый где-нибудь конец канала оставляет `wc` ждать вечно, и
+            // выглядит это как зависшая команда, а не как ошибка.
+            Step::Line("run /bin/hello | /bin/wc"),
+            Step::Await("wc: ", 60_000),
+            // Ждём, а не проверяем по буферу: числа печатаются шестью
+            // системными вызовами, и хвост строки приходит позже её начала.
+            Step::Await("lines,", 30_000),
+            Step::Await("bytes in standard input", 30_000),
+            // И обратная сторона: программа, чей вывод никто не читает, об этом
+            // узнаёт. `run` без канала печатает в окно — значит счётчик строк
+            // получил ровно то, что напечатал бы человек.
+            Step::Line("run /bin/hello"),
+            Step::Await("hello from userspace", 30_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "desktop",
         about: "Меню запуска открывает программу, окно двигается и закрывается, фокус возвращается.",
         target: Target::Live,
@@ -863,12 +901,17 @@ pub const ALL: &[Scenario] = &[
             // число, которое программа могла бы напечатать, ничего не зная:
             // сверяется оно с часами хоста, тем же допуском, что и в `clock`.
             Step::Clock("hello: epoch ", 10, 15_000),
-            // Окно возвращается в пул целиком: 128 страниц образа, 8 страниц
-            // стека и четыре таблицы, включая корень. Точное число здесь
-            // намеренно — «часть окна вернулась» выглядело бы так же, как «всё».
+            // Окно возвращается в пул целиком: 384 страницы образа плюс 16
+            // страниц стека и четыре таблицы, включая корень. Точное число
+            // здесь намеренно — «часть окна вернулась» выглядело бы так же,
+            // как «всё», — и оно связывает сценарий с двумя константами ядра
+            // (`user::IMAGE_PAGES` и `user::STACK_PAGES`). Менять его вместе с
+            // ними правильно: «сколько памяти держит программа» обязано
+            // меняться заметно, а не молча. Число 136 стояло здесь с тех пор,
+            // когда окно было в три раза меньше, и сценарий с ним не проходил.
             // Строка приходит раньше отчёта оболочки: пространство разбирается
             // внутри `run`, а не после него.
-            Step::Await("space released, 136 pages and 4 tables returned", 15_000),
+            Step::Await("space released, 400 pages and 4 tables returned", 15_000),
             Step::Await("exited with code 0", 15_000),
             // Программа, которой сказали, что делать: путь приходит аргументом,
             // а не зашит в неё. Числа точные и это намеренно — «что-то
@@ -880,10 +923,12 @@ pub const ALL: &[Scenario] = &[
             // числом прочитанных байт. Два числа получены разными путями, и
             // сходятся они только если `seek` действительно двигает позицию.
             Step::Await("wc: size from seek matches the bytes read", 15_000),
-            // Без аргумента программа объясняет, как её звать, а не падает и не
-            // делает вид, что всё в порядке.
-            Step::Line("run /bin/wc"),
-            Step::Await("usage: wc <path>", 30_000),
+            // Без аргумента программа считает стандартный ввод — с фазы 38b
+            // это не заглушка «usage», а вторая половина её смысла. Здесь она
+            // получает его из канала: «сколько строк напечатала другая
+            // программа» — вопрос, на который до каналов ответить было нечем.
+            Step::Line("run /bin/hello | /bin/wc"),
+            Step::Await("bytes in standard input", 30_000),
             // Перечисление каталога — тоже из третьего кольца. До Phase 20
             // `open` на каталоге отказывал, и `ls` мог существовать только
             // внутри ядра; теперь это программа, видящая ровно то, что
@@ -908,7 +953,7 @@ pub const ALL: &[Scenario] = &[
             // Снятая отказом программа возвращается в ядро не оттуда, откуда
             // уходила, и уборку на этом пути легко потерять — поэтому та же
             // строка проверяется и здесь.
-            Step::Await("space released, 136 pages and 4 tables returned", 15_000),
+            Step::Await("space released, 400 pages and 4 tables returned", 15_000),
             Step::Await("killed by the kernel", 15_000),
             // Третья читает память ядра по адресу, который в её собственных
             // таблицах есть: корень программы — копия ядерного. Отказ здесь
@@ -1178,7 +1223,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("user        : killed by request, task #{}", 15_000),
             // Память вернулась в пул целиком, тем же путём, что и после отказа:
             // 128 страниц образа, 8 стека и четыре таблицы.
-            Step::Await("space released, 136 pages and 4 tables returned", 15_000),
+            Step::Await("space released, 400 pages and 4 tables returned", 15_000),
             Step::Await("#{} /bin/forever: killed by request", 15_000),
             // Снять её второй раз нельзя, и отказ объясняет почему.
             Step::Line("kill {}"),
@@ -2397,10 +2442,13 @@ pub const ALL: &[Scenario] = &[
             }),
 
             // 4. Файл `0600` в домашнем каталоге читается — по классу владельца.
-            // Его положил установщик ровно для этой проверки.
+            // Его положил установщик ровно для этой проверки. С фазы 38b это
+            // делает **программа** `/bin/cat`, запущенная от имени вошедшего;
+            // путь абсолютный, потому что текущего каталога в этой системе ещё
+            // нет и подставлять его сервером значило бы выдумать его на ходу.
             Step::Ssh(SshRun {
                 identity: Identity::Authorized,
-                command: "cat notes.txt",
+                command: "cat /home/roman/notes.txt",
                 stdin: "",
                 expect: &["This file belongs to you and to nobody else"],
                 absent: &["permission denied"],
@@ -2415,7 +2463,7 @@ pub const ALL: &[Scenario] = &[
                 identity: Identity::Authorized,
                 command: "cat /root/notes.txt",
                 stdin: "",
-                expect: &["permission denied: /root/notes.txt"],
+                expect: &["cat: /root/notes.txt: permission denied"],
                 absent: &["world-readable"],
                 timeout_ms: 60_000,
             }),
@@ -2432,6 +2480,76 @@ pub const ALL: &[Scenario] = &[
                 timeout_ms: 60_000,
             }),
             Step::AwaitAny("sshd: interactive session for roman", 30_000),
+
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "ssh-exec",
+        about: "По сети исполняются программы из /bin — от имени вошедшего, с правами от ядра.",
+        // Та же установленная система и то же место в списке, что у
+        // `ssh-shell`: нужны настоящие права на файлах, то есть ext2, который
+        // записал установщик.
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        guest_port: 22,
+        host_echo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        ssh_key: true,
+        extra: &[],
+        steps: &[
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
+            Step::AwaitAny("sshd: listening on port 22", 90_000),
+            Step::Wait(1_000),
+
+            // 1. Программа из `/bin`, а не команда внутри сервера. Строка
+            // «user : #N '/bin/ls' as 1000:1000» печатается ядром при запуске —
+            // и она же доказывает, от чьего имени всё происходит.
+            Step::Ssh(SshRun {
+                identity: Identity::Authorized,
+                command: "ls /etc",
+                stdin: "",
+                expect: &["passwd", "system.cfg"],
+                absent: &["Permission denied"],
+                timeout_ms: 60_000,
+            }),
+            // Строку печатает ядро при запуске программы, и в ней главное —
+            // личность: `uid 1000`, а не `uid 0`. Сервер исполняется от root,
+            // и если бы он запускал программы от себя, здесь стоял бы ноль.
+            Step::AwaitAny("'/bin/ls' as uid 1000 gid 1000", 30_000),
+
+            // 2. Отказ приходит **от ядра**: `cat` спрашивает `open`, а не
+            // сервер — свои таблицы. Проверка та же, что за терминалом, и
+            // текста файла в ответе нет.
+            Step::Ssh(SshRun {
+                identity: Identity::Authorized,
+                command: "cat /root/notes.txt",
+                stdin: "",
+                expect: &["cat: /root/notes.txt: permission denied"],
+                absent: &["world-readable"],
+                timeout_ms: 60_000,
+            }),
+
+            // 3. Свой файл читается той же программой — то есть отказ выше был
+            // про права, а не про то, что `cat` не работает вовсе.
+            Step::Ssh(SshRun {
+                identity: Identity::Authorized,
+                command: "cat /home/roman/notes.txt",
+                stdin: "",
+                expect: &["This file belongs to you and to nobody else"],
+                absent: &["permission denied"],
+                timeout_ms: 60_000,
+            }),
+
+            // 4. Код возврата программы доезжает до клиента: `ssh` в чужом
+            // скрипте проверяет именно его.
+            Step::AwaitAny("sshd: session closed with status 1", 30_000),
 
             Step::Absent("KERNEL PANIC"),
         ],

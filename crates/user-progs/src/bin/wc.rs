@@ -8,12 +8,19 @@
 //! Печатает три числа и путь, как это делает `wc` в Unix. Сходство не ради
 //! сходства: формат, который человек уже знает, не нужно объяснять, а стенду
 //! всё равно, что искать.
+//!
+//! # Без аргумента — из стандартного ввода
+//!
+//! С фазы 38b это не заглушка «usage», а вторая половина смысла программы:
+//! `run /bin/hello | /bin/wc` считает то, что напечатала другая программа. Двух
+//! разных счётчиков при этом нет — считает тот же цикл, меняется только
+//! дескриптор, из которого он читает.
 
 #![no_std]
 #![no_main]
 
 use user_progs::{
-    Args, SEEK_SET, close, exit, file_size, open, print, print_u64, println, read, seek,
+    Args, FD_STDIN, SEEK_SET, close, exit, file_size, open, print, print_u64, println, read, seek,
 };
 
 /// Сколько байт читается за раз.
@@ -28,24 +35,30 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // программы.
     let args = unsafe { Args::new(argc, argv) };
 
-    let Some(path) = args.get(1) else {
-        println("usage: wc <path>");
-        exit(2);
+    // Ноль — это стандартный ввод, и он не открывается: он уже открыт. Так же
+    // устроен `wc` в Unix, и по той же причине — программа не должна знать,
+    // откуда её кормят.
+    let (path, fd) = match args.get(1) {
+        Some(path) => {
+            let fd = open(path);
+            if fd < 0 {
+                print("wc: cannot open ");
+                print(path);
+                println("");
+                exit(1);
+            }
+            (path, fd)
+        }
+        None => ("standard input", FD_STDIN as i64),
     };
 
-    let fd = open(path);
-    if fd < 0 {
-        print("wc: cannot open ");
-        print(path);
-        println("");
-        exit(1);
-    }
-
-    // Размер — одним `seek`, без чтения. Это и есть разница, которую фаза
-    // принесла: раньше единственным способом узнать длину файла было прочитать
-    // его целиком.
-    let size = file_size(fd);
-    if size < 0 {
+    // Размер — одним `seek`, без чтения. Это и есть разница, которую принесла
+    // фаза 22: раньше единственным способом узнать длину файла было прочитать
+    // его целиком. У стандартного ввода размера нет и быть не может — канал не
+    // файл, у него нет ни конца, который уже написан, ни начала, к которому
+    // можно вернуться.
+    let size = if fd == FD_STDIN as i64 { -1 } else { file_size(fd) };
+    if size < 0 && fd != FD_STDIN as i64 {
         println("wc: cannot measure the file");
         close(fd);
         exit(1);
@@ -54,7 +67,9 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // Позиция ставится в начало явно, а не подразумевается: `file_size` её
     // возвращает на место, но полагаться на чужую аккуратность в программе,
     // которая печатает числа, не стоит.
-    seek(fd, 0, SEEK_SET);
+    if fd != FD_STDIN as i64 {
+        seek(fd, 0, SEEK_SET);
+    }
 
     let mut lines = 0u64;
     let mut words = 0u64;
@@ -92,7 +107,9 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         }
     }
 
-    close(fd);
+    if fd != FD_STDIN as i64 {
+        close(fd);
+    }
 
     print("wc: ");
     print_u64(lines);
@@ -106,7 +123,10 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // Размер, измеренный `seek`-ом, обязан совпасть с числом прочитанных байт.
     // Проверяет это сама программа, а не стенд: два числа получены разными
     // путями, и расхождение между ними — единственный признак того, что `seek`
-    // врёт.
+    // врёт. У стандартного ввода второго пути нет, и сверять нечего.
+    if fd == FD_STDIN as i64 {
+        exit(0);
+    }
     if size as u64 == bytes {
         println("wc: size from seek matches the bytes read");
     } else {

@@ -1097,6 +1097,16 @@ fn run_program(argument: &str) {
         sprintln!("  usage: run [-b] <path> [args]");
         return;
     }
+
+    // Вертикальная черта — это канал, и разбирает её оболочка, а не ядро:
+    // ядру предъявляют уже готовые концы. Одна черта, а не сколько угодно:
+    // конвейер из трёх звеньев потребовал бы держать список задач и их концов,
+    // а проверять его было бы нечем — вторая черта не добавляет ни одного
+    // нового вопроса к первой.
+    if let Some((left, right)) = line.split_once('|') {
+        run_pipeline(left.trim(), right.trim(), background);
+        return;
+    }
     // Всё, что после пути, уезжает программе как аргументы; разбирает строку
     // сама задача, которой предстоит их получить. Оболочка здесь ничего не
     // разбирает намеренно: путь ей нужен только для сообщения об ошибке.
@@ -1112,6 +1122,64 @@ fn run_program(argument: &str) {
         }
         Err(err) => sprintln!("  {path}: {err}"),
     }
+}
+
+/// Запустить две программы, соединив вывод первой со вводом второй.
+///
+/// # Почему оболочка не держит концов
+///
+/// Потому что конец канала жив, пока жив хоть один его дескриптор. Оболочка,
+/// оставившая себе пишущий конец, была бы тем самым живым писателем, которого
+/// ждёт `wc`, — и `wc` не дождался бы конца файла никогда. Здесь концы
+/// **отдаются** задачам целиком, поэтому забыть их закрыть невозможно: у
+/// оболочки их просто нет.
+fn run_pipeline(left: &str, right: &str, background: bool) {
+    if left.is_empty() || right.is_empty() {
+        sprintln!("  usage: run <path> [args] | <path> [args]");
+        return;
+    }
+
+    let (reader, writer) = match user::pipe::create() {
+        Ok(ends) => ends,
+        Err(_) => {
+            sprintln!("  pipe: not enough memory");
+            return;
+        }
+    };
+
+    let cred = user::session::credentials();
+    let producer = match user::spawn_streams(left, cred, false, None, Some(writer)) {
+        Ok(id) => id,
+        Err(err) => {
+            sprintln!("  {}: {err}", first_word(left));
+            return;
+        }
+    };
+    let consumer = match user::spawn_streams(right, cred, false, Some(reader), None) {
+        Ok(id) => id,
+        Err(err) => {
+            // Первая уже запущена и пишет в канал, у которого не стало
+            // читателя. Она об этом узнает — запись вернёт ей отказ, — и это
+            // лучше, чем оставить её писать в пустоту молча.
+            sprintln!("  {}: {err}", first_word(right));
+            sprintln!("  {producer}: its output has nowhere to go now");
+            return;
+        }
+    };
+
+    if background {
+        sprintln!("  pipeline: {producer} | {consumer}");
+        return;
+    }
+    // Ждём **вторую**: она печатает то, ради чего конвейер и запущен. Первая
+    // закончится сама — либо дописав, либо получив отказ, когда читателя не
+    // станет.
+    foreground(consumer);
+}
+
+/// Первое слово строки — для сообщения об ошибке.
+fn first_word(line: &str) -> &str {
+    line.split_whitespace().next().unwrap_or(line)
 }
 
 /// Дождаться программы переднего плана, отдавая ей всё, что набирают.

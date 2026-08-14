@@ -64,6 +64,7 @@
 
 pub mod elf;
 pub mod files;
+pub mod pipe;
 pub mod session;
 pub mod space;
 pub mod syscall;
@@ -210,6 +211,16 @@ pub struct Program {
     /// проверка прав в системном вызове обязана спрашивать **программу**, а не
     /// сеанс, — см. [`credentials`].
     cred: Credentials,
+    /// Откуда программа читает стандартный ввод.
+    ///
+    /// `None` — с терминала, как было всегда. `Some` — из канала: так её
+    /// запустил тот, кто хочет кормить её сам. Поле здесь, а не в таблице
+    /// дескрипторов, по двум причинам: программа не должна знать, чем её ввод
+    /// оказался сегодня, и чтение из канала обязано **ждать**, а ждать под
+    /// локом таблицы нельзя.
+    pub stdin: Option<pipe::Reader>,
+    /// Куда уходит стандартный вывод. `None` — в окно оболочки.
+    pub stdout: Option<pipe::Writer>,
 }
 
 /// Программы по слотам задач планировщика.
@@ -551,7 +562,13 @@ fn report(space: &Space, entry: usize) {
 /// Загрузить программу по пути и исполнить её в текущей задаче.
 ///
 /// Возвращает код, с которым программа завершилась.
-fn run(path: &str, args: &[&str], cred: Credentials) -> Result<i64, Error> {
+fn run(
+    path: &str,
+    args: &[&str],
+    cred: Credentials,
+    stdin: Option<pipe::Reader>,
+    stdout: Option<pipe::Writer>,
+) -> Result<i64, Error> {
     // Право исполнить спрашивается до чтения файла, и спрашивается от имени
     // **той личности, с которой программа будет исполняться**. Это тот же
     // вопрос, который в Unix задаёт `execve`, и задавать его обязано ядро:
@@ -604,6 +621,8 @@ fn run(path: &str, args: &[&str], cred: Credentials) -> Result<i64, Error> {
             running: true,
             kill_requested: false,
             cred,
+            stdin,
+            stdout,
         });
     }
 
@@ -689,6 +708,11 @@ struct Request {
     cred: Credentials,
     /// Считать ли новую задачу служебной — см. [`spawn_with`].
     daemon: bool,
+    /// Концы каналов, которые новая задача получит стандартным вводом и
+    /// выводом. Едут в самой заявке: передать их иначе нечем — задача
+    /// принимает одно машинное слово, и это слово уже занято заявкой.
+    stdin: Option<pipe::Reader>,
+    stdout: Option<pipe::Writer>,
 }
 
 /// Самая длинная командная строка, которую принимает [`spawn`].
@@ -724,6 +748,21 @@ pub fn spawn(line: &str, cred: Credentials) -> Result<sched::TaskId, Error> {
 /// `exit` останавливает машину, когда живых задач не осталось. Служба,
 /// работающая вечно, отменила бы и то и другое.
 pub fn spawn_with(line: &str, cred: Credentials, daemon: bool) -> Result<sched::TaskId, Error> {
+    spawn_streams(line, cred, daemon, None, None)
+}
+
+/// То же, но стандартный ввод и вывод новой задачи привязаны к каналам.
+///
+/// `None` означает «как было»: ввод с терминала, вывод в окно оболочки. Это и
+/// есть вся разница между `run /bin/ls` и `ssh … /bin/ls` — сама программа о
+/// ней не знает и знать не должна.
+pub fn spawn_streams(
+    line: &str,
+    cred: Credentials,
+    daemon: bool,
+    stdin: Option<pipe::Reader>,
+    stdout: Option<pipe::Writer>,
+) -> Result<sched::TaskId, Error> {
     if line.len() > MAX_LINE {
         return Err(Error::Read(crate::vfs::VfsError::BadPath));
     }
@@ -735,7 +774,8 @@ pub fn spawn_with(line: &str, cred: Credentials, daemon: bool) -> Result<sched::
     if raw.is_null() {
         return Err(Error::OutOfMemory);
     }
-    let mut request = Request { line: [0; MAX_LINE], len: line.len(), cred, daemon };
+    let mut request =
+        Request { line: [0; MAX_LINE], len: line.len(), cred, daemon, stdin, stdout };
     request.line[..line.len()].copy_from_slice(line.as_bytes());
     // SAFETY: блок только что выделен под `Request` с нужными размером и
     // выравниванием и никому больше не принадлежит.
@@ -770,7 +810,10 @@ extern "C" fn program_entry(arg: usize) -> ! {
 
     // SAFETY: `arg` — указатель, выделенный в `spawn` и переданный ровно один
     // раз ровно этой задаче.
-    let request = unsafe { alloc::boxed::Box::from_raw(arg as *mut Request) };
+    let mut request = unsafe { alloc::boxed::Box::from_raw(arg as *mut Request) };
+    // Концы каналов вынимаются сразу, до разбора строки: дальше `request`
+    // остаётся заимствованным строкой аргументов и тронуть его будет нельзя.
+    let (stdin, stdout) = (request.stdin.take(), request.stdout.take());
     let cred = request.cred;
     // Задача помечает себя служебной сама, хотя это же сделал и [`spawn_with`].
     // Дублирование не лишнее: пометка снаружи успевает не всегда — между
@@ -803,7 +846,11 @@ extern "C" fn program_entry(arg: usize) -> ! {
         argc += 1;
     }
 
-    let code = match run(path, &args[..argc], cred) {
+    // Концы здесь **перемещаются**, а не копируются, и это не мелочь: копия
+    // осталась бы в заявке, а заявка живёт до конца задачи, которая уже не
+    // вернётся из `exit_current_with`. Пока жив хоть один писатель, читатель на
+    // другом конце не видит конца файла — то есть ждёт вечно.
+    let code = match run(path, &args[..argc], cred, stdin, stdout) {
         Ok(code) => {
             if code == user_abi::EXIT_KILLED {
                 report_line(path, "killed by request");

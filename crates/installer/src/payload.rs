@@ -201,7 +201,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// после этого **перестал собираться** — и это лучший исход из возможных,
 /// потому что собравшийся установщик поставил бы систему без `/bin/sshd`, а
 /// узналось бы это только по не запустившейся службе.
-const PROGRAMS: [(&CStr16, &str); 22] = [
+const PROGRAMS: [(&CStr16, &str); 23] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -224,6 +224,7 @@ const PROGRAMS: [(&CStr16, &str); 22] = [
     (cstr16!("\\FREEOS\\BIN\\ECHOD"), "echod"),
     (cstr16!("\\FREEOS\\BIN\\ECHOC"), "echoc"),
     (cstr16!("\\FREEOS\\BIN\\SSHD"), "sshd"),
+    (cstr16!("\\FREEOS\\BIN\\CAT"), "cat"),
 ];
 
 /// Образцовые пакеты на носителе и их имена в `/media`.

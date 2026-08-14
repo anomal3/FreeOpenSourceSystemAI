@@ -84,9 +84,9 @@ use ssh::wire::{Reader, Writer};
 use ssh::{Error, Transport};
 use user_abi::Stat;
 use user_progs::{
-    Dirent, ERR_AGAIN, KIND_DIRECTORY, KIND_FILE, Path, accept, bind, close, close_socket, create,
-    error, error_num, exit, listen, open, random, read, readdir, recv, send, shutdown, sleep_ms,
-    stat, stream, stream_state, uptime_ms, write,
+    ERR_AGAIN, KIND_DIRECTORY, KIND_FILE, Path, accept, bind, close, close_socket, create, error,
+    error_num, exit, launch, listen, open, pipe, random, read, recv, send, shutdown, sleep_ms, stat,
+    stream, stream_state, uptime_ms, wait, write,
 };
 
 /// Порт, на котором ждёт сервер.
@@ -631,7 +631,16 @@ fn accept_service(client: i64, transport: &mut Transport, payload: &[u8]) -> boo
     // Служба у нас одна. Подтвердить чужое имя значило бы согласиться на
     // разговор, которого мы не понимаем.
     if service != auth::SERVICE_USERAUTH.as_bytes() {
-        error("sshd: the client asked for a service we do not have\n");
+        // Имя печатается целиком, а не «не та служба»: клиент вправе спросить
+        // что угодно, и разница между «спросил чужое» и «мы прочитали не то»
+        // видна только по самому имени.
+        error("sshd: the client asked for a service we do not have: '");
+        for byte in service.iter().take(64) {
+            let shown = [if byte.is_ascii_graphic() || *byte == b' ' { *byte } else { b'?' }];
+            // SAFETY: подставляется либо печатный ASCII, либо '?'.
+            error(unsafe { core::str::from_utf8_unchecked(&shown) });
+        }
+        error("'\n");
         disconnect(
             client,
             transport,
@@ -644,6 +653,8 @@ fn accept_service(client: i64, transport: &mut Transport, payload: &[u8]) -> boo
     let out = unsafe { &mut *(&raw mut OUTPUT) };
     let mut writer = Writer::new(out);
     writer.byte(ssh::MSG_SERVICE_ACCEPT);
+    // В подтверждении называется та же служба, о которой спросили: клиент
+    // сверяет имя и разрывает соединение, если ему подтвердили не то.
     writer.string(auth::SERVICE_USERAUTH.as_bytes());
     if !writer.ok() {
         return false;
@@ -1101,12 +1112,6 @@ impl<'a> Sink<'a> {
         self.push(text.as_bytes());
     }
 
-    fn err_bytes(&mut self, data: &[u8]) {
-        self.switch(ssh::EXTENDED_DATA_STDERR);
-        self.push(data);
-    }
-
-    /// Число в текущий поток.
     fn num(&mut self, value: u64) {
         let mut digits = [0u8; 20];
         let mut at = digits.len();
@@ -1123,24 +1128,6 @@ impl<'a> Sink<'a> {
     }
 
     /// Права восьмеричной записью, как их показывает `ls`.
-    fn octal(&mut self, value: u32) {
-        let mut digits = [b'0'; 11];
-        let mut at = digits.len();
-        let mut rest = value;
-        loop {
-            at -= 1;
-            digits[at] = b'0' + (rest % 8) as u8;
-            rest /= 8;
-            if rest == 0 {
-                break;
-            }
-        }
-        let start = at.min(digits.len() - 4);
-        self.push(&digits[start..]);
-    }
-
-    /// Сменить поток. Смена — это граница пакета: смешивать в одном пакете
-    /// вывод и ошибки нечем, у них разные типы сообщений.
     fn switch(&mut self, stream: u32) {
         if self.stream != stream {
             self.flush();
@@ -1261,254 +1248,130 @@ fn run_command(line: &[u8], user: &User, sink: &mut Sink<'_>) -> u32 {
             sink.out("\n");
             0
         }
-        b"ls" => list(rest, user, sink),
-        b"cat" => concatenate(rest, user, sink),
         b"exit" | b"logout" => 0,
-        other => {
-            sink.err("sshd: no such command: ");
-            sink.err_bytes(other);
-            sink.err("\ntry 'help'\n");
-            // Тот же код, которым отвечает всякий Unix на ненайденную команду.
-            127
-        }
+        // Всё остальное — программа из `/bin`, запущенная от имени вошедшего.
+        // Это и есть фаза 38b: `ls` и `cat` больше не живут внутри сервера со
+        // своей проверкой прав, а являются теми же самыми программами, которые
+        // человек запускает за терминалом.
+        _ => run_program(line, user, sink),
     }
+}
+
+/// Запустить программу из `/bin` и переложить её вывод в канал SSH.
+///
+/// # Кто проверяет права
+///
+/// Ядро. Программа исполняется от имени вошедшего (`uid`/`gid` из `passwd`), и
+/// каждый её `open` спрашивается у файловой системы так же, как спрашивается за
+/// терминалом. До этой фазы права проверял сам `sshd` — своим кодом, второй в
+/// системе проверкой, — и это было главным, что фаза убрала: две проверки
+/// расходятся молча, а расходятся они всегда.
+///
+/// # Почему стандартный ввод — закрытый канал
+///
+/// Потому что альтернатива хуже. Оставить программе терминал машины значило бы
+/// отдать ей нажатия человека, который сидит за этой машиной; кормить её из
+/// сети — переписать разбор пакетов так, чтобы он шёл **во время** работы
+/// программы. Закрытый канал даёт честный конец файла на первом же чтении: это
+/// то же самое, что `< /dev/null`, и об этом сказано в `help`.
+fn run_program(line: &[u8], user: &User, sink: &mut Sink<'_>) -> u32 {
+    let Ok(text) = core::str::from_utf8(line) else {
+        sink.err("sshd: the command is not valid UTF-8\n");
+        return 2;
+    };
+    let text = text.trim();
+
+    // Имя без косой черты — программа из `/bin`. Это весь наш поиск программ, и
+    // он назван вслух: одного каталога достаточно, а переменная окружения
+    // потребовала бы окружения, которого в этой системе пока нет.
+    let mut command = Path::new();
+    let placed = if text.starts_with('/') {
+        command.push(text)
+    } else {
+        command.push("/bin/") && command.push(text)
+    };
+    if !placed {
+        sink.err("sshd: the command line is too long\n");
+        return 2;
+    }
+
+    // Два канала: по одному программа отдаёт вывод, второй закрывается сразу и
+    // служит ей стандартным вводом — то есть концом файла.
+    let Ok((out_read, out_write)) = pipe() else {
+        sink.err("sshd: out of memory for a pipe\n");
+        return 1;
+    };
+    let Ok((in_read, in_write)) = pipe() else {
+        close(out_read);
+        close(out_write);
+        sink.err("sshd: out of memory for a pipe\n");
+        return 1;
+    };
+
+    let task = launch(command.as_str(), Some((user.uid, user.gid)), in_read, out_write);
+
+    // Свои копии концов закрываются **сразу после запуска** и до первого
+    // чтения. Пока сервер держит пишущий конец, он сам является тем живым
+    // писателем, которого ждёт читатель, — и конца файла не наступит никогда,
+    // а выглядеть это будет как зависшая команда.
+    close(out_write);
+    close(in_read);
+    close(in_write);
+
+    if task < 0 {
+        close(out_read);
+        sink.err("sshd: cannot run ");
+        sink.err(command.as_str());
+        sink.err("\n");
+        // 127 — тот же код, которым отвечает на ненайденную команду всякий Unix.
+        return 127;
+    }
+
+    let mut buffer = [0u8; 512];
+    loop {
+        let got = read(out_read, &mut buffer);
+        if got > 0 {
+            sink.out_bytes(&buffer[..got as usize]);
+            continue;
+        }
+        if got == 0 {
+            // Конец файла: писателей у канала не осталось, то есть программа
+            // закончилась и её вывод забран весь.
+            break;
+        }
+        if got == ERR_AGAIN {
+            // Программе пока нечего сказать. Уступка, а не сон на канале:
+            // ждать здесь нельзя — на другом конце сокет, и сеанс обязан
+            // оставаться живым.
+            sleep_ms(2);
+            continue;
+        }
+        sink.err("sshd: reading the program's output failed\n");
+        break;
+    }
+    close(out_read);
+
+    let code = wait(task);
+    if code < 0 { 1 } else { code as u32 }
 }
 
 fn help(sink: &mut Sink<'_>) {
     sink.out(
-        "These commands run inside sshd itself, as root, with this account's\n\
-         permissions checked on every path. Programs in /bin are not reachable\n\
-         over the network yet: that needs pipes, and pipes are a phase of their own.\n\
+        "Anything that is not listed below runs as a program from /bin, started\n\
+         under this account. Its permissions are checked by the kernel, not by\n\
+         this server -- 'cat /root/notes.txt' is refused by the same code that\n\
+         refuses it at the terminal. Standard input is an empty pipe: a program\n\
+         reads end-of-file at once, as if it were started with < /dev/null.\n\
          \n  help            this list\
          \n  whoami          the account this session belongs to\
          \n  id              its uid, gid and home directory\
          \n  uptime          milliseconds since the machine started\
          \n  echo <text>     the text back\
-         \n  ls [path]       a directory, home by default\
-         \n  cat <path>      a file, if this account may read it\
-         \n  exit            end the session\n",
+         \n  exit            end the session\
+         \n\
+         \n  ls /etc         a directory, by the program in /bin\
+         \n  cat <path>      a file, if the kernel lets this account read it\n",
     );
-}
-
-/// `ls`: перечислить каталог.
-fn list(argument: &[u8], user: &User, sink: &mut Sink<'_>) -> u32 {
-    let mut path = Path::new();
-    if !resolve(argument, user, &mut path) {
-        sink.err("sshd: bad path\n");
-        return 2;
-    }
-    if let Err(denial) = check_path(path.as_str(), user, WANT_READ) {
-        return complain(sink, denial, path.as_str());
-    }
-
-    let fd = open(path.as_str());
-    if fd < 0 {
-        sink.err("sshd: cannot open ");
-        sink.err(path.as_str());
-        sink.err("\n");
-        return 1;
-    }
-
-    let mut entry = Dirent::default();
-    let mut files = 0u64;
-    let mut directories = 0u64;
-    // Столбцы те же, что у `/bin/ls`: права, владелец, размер, имя. Совпадение
-    // не эстетическое — два вывода одного и того же, расходящиеся в мелочах,
-    // заставляют читателя гадать, какой он видит.
-    while readdir(fd, &mut entry) {
-        let Some(name) = entry.name() else {
-            continue;
-        };
-        sink.out("  ");
-        sink.octal(entry.mode);
-        sink.out(" ");
-        sink.num(u64::from(entry.uid));
-        sink.out(":");
-        sink.num(u64::from(entry.gid));
-        sink.out(" ");
-        sink.num(entry.size);
-        sink.out("  ");
-        sink.out(name);
-        if entry.kind == KIND_DIRECTORY {
-            sink.out("/");
-            directories += 1;
-        } else {
-            files += 1;
-        }
-        sink.out("\n");
-    }
-    close(fd);
-
-    sink.out("ls: ");
-    sink.num(files);
-    sink.out(" files, ");
-    sink.num(directories);
-    sink.out(" directories in ");
-    sink.out(path.as_str());
-    sink.out("\n");
-    0
-}
-
-/// `cat`: отдать файл.
-fn concatenate(argument: &[u8], user: &User, sink: &mut Sink<'_>) -> u32 {
-    if argument.is_empty() {
-        sink.err("sshd: cat needs a path\n");
-        return 2;
-    }
-    let mut path = Path::new();
-    if !resolve(argument, user, &mut path) {
-        sink.err("sshd: bad path\n");
-        return 2;
-    }
-    if let Err(denial) = check_path(path.as_str(), user, WANT_READ) {
-        return complain(sink, denial, path.as_str());
-    }
-
-    let mut meta = Stat::default();
-    if stat(path.as_str(), &mut meta) < 0 {
-        return complain(sink, Denial::Missing, path.as_str());
-    }
-    if meta.kind != KIND_FILE {
-        sink.err("sshd: ");
-        sink.err(path.as_str());
-        sink.err(" is not a file\n");
-        return 1;
-    }
-
-    let fd = open(path.as_str());
-    if fd < 0 {
-        sink.err("sshd: cannot open ");
-        sink.err(path.as_str());
-        sink.err("\n");
-        return 1;
-    }
-    // Порциями, а не целиком: файл может быть каким угодно, а памяти у
-    // программы — окно и стек.
-    let mut buffer = [0u8; 512];
-    loop {
-        let got = read(fd, &mut buffer);
-        if got <= 0 {
-            break;
-        }
-        sink.out_bytes(&buffer[..got as usize]);
-    }
-    close(fd);
-    0
-}
-
-/// Сказать в канал, почему не вышло.
-fn complain(sink: &mut Sink<'_>, denial: Denial, path: &str) -> u32 {
-    match denial {
-        Denial::Missing => sink.err("sshd: no such file: "),
-        // Отказ назван отказом, а не «файла нет». Прятать разницу имеет смысл
-        // там, где имя файла — секрет; здесь спрашивает тот, кого мы уже
-        // впустили, и вводить его в заблуждение незачем.
-        Denial::Forbidden => sink.err("sshd: permission denied: "),
-    }
-    sink.err(path);
-    sink.err("\n");
-    1
-}
-
-/// Достроить путь: пустой — домашний каталог, относительный — от него же.
-///
-/// Текущего каталога в системе нет вовсе (см. `/bin/ls`), поэтому «от чего
-/// считать относительный путь» — решение сеанса. Домашний каталог выбран
-/// потому, что именно туда попадает человек, вошедший по SSH в любую систему.
-fn resolve(argument: &[u8], user: &User, path: &mut Path) -> bool {
-    let Ok(text) = core::str::from_utf8(argument) else {
-        return false;
-    };
-    let text = text.trim();
-    if text.is_empty() {
-        return path.push(user.home());
-    }
-    if text.starts_with('/') {
-        return path.push(text);
-    }
-    path.push(user.home()) && path.join(text)
-}
-
-// --- права -------------------------------------------------------------------
-
-/// Право прочитать: тот же бит, что в ext2.
-const WANT_READ: u32 = 0b100;
-/// Право пройти сквозь каталог.
-const WANT_SEARCH: u32 = 0b001;
-
-/// Почему нельзя.
-enum Denial {
-    Missing,
-    Forbidden,
-}
-
-/// Вправе ли вошедший добраться до этого пути и сделать с ним `want`.
-///
-/// Проверяется **каждое** звено пути, а не только последний файл. Иначе
-/// каталог `0700` перестал бы быть непроницаемым: файл `0644` внутри него виден
-/// по правам самого файла, и разница между «права файла разрешают» и «до файла
-/// не дойти» — это ровно то, ради чего установщик кладёт `/root/notes.txt`.
-///
-/// Между проверкой и открытием файл, вообще говоря, может смениться. В этой
-/// системе смена имени требует прав на каталог — то есть того же, что здесь
-/// проверяется, — а настоящий ответ на такую гонку один: открывать от имени
-/// пользователя, а не проверять за него. Это и появится вместе с каналами.
-fn check_path(path: &str, user: &User, want: u32) -> Result<(), Denial> {
-    let mut meta = Stat::default();
-    if user.uid == 0 {
-        // Суперпользователю разрешено всё; проверить остаётся только, что файл
-        // существует.
-        return if stat(path, &mut meta) < 0 {
-            Err(Denial::Missing)
-        } else {
-            Ok(())
-        };
-    }
-
-    // Корень дерева: он общий для всех путей, и без права пройти сквозь него не
-    // виден ни один файл.
-    if stat("/", &mut meta) >= 0 && !allows(&meta, user, WANT_SEARCH) {
-        return Err(Denial::Forbidden);
-    }
-
-    let mut walked = Path::new();
-    if !walked.push("/") {
-        return Err(Denial::Missing);
-    }
-    let mut components = path.split('/').filter(|part| !part.is_empty()).peekable();
-    while let Some(component) = components.next() {
-        if !walked.join(component) {
-            return Err(Denial::Missing);
-        }
-        if stat(walked.as_str(), &mut meta) < 0 {
-            return Err(Denial::Missing);
-        }
-        let last = components.peek().is_none();
-        let needed = if last { want } else { WANT_SEARCH };
-        if !allows(&meta, user, needed) {
-            return Err(Denial::Forbidden);
-        }
-    }
-    Ok(())
-}
-
-/// Разрешает ли режим этому пользователю то, что он хочет.
-///
-/// Класс выбирается **первым совпавшим**, а не объединением — так устроен Unix
-/// и так устроена проверка в ядре (`vfs::perm`). Разойтись с ней здесь значило
-/// бы пускать по сети туда, куда не пускают за терминалом, или наоборот.
-fn allows(meta: &Stat, user: &User, want: u32) -> bool {
-    if user.uid == 0 {
-        return true;
-    }
-    let shift = if user.uid == meta.uid {
-        6
-    } else if user.gid == meta.gid {
-        3
-    } else {
-        0
-    };
-    (meta.mode >> shift) & want == want
 }
 
 // --- учётные записи ----------------------------------------------------------
