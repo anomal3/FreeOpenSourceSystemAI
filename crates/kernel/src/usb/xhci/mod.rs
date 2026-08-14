@@ -66,8 +66,8 @@ use crate::kprintln;
 use crate::mm::dma::{self, DmaBuffer, DmaError};
 use crate::mm::{MapError, PAGE_SIZE, PhysAddr};
 use crate::pci;
-use crate::usb::hid::{self, REPORT_LEN};
-use crate::usb::{self, HidInterface};
+use crate::usb::hid::{REPORT_LEN, Reader, choose_reader};
+use crate::usb::{self, Attached, HidInterface, Stage, Timeout, sleep_ms};
 
 use alloc::vec::Vec;
 
@@ -102,75 +102,6 @@ const PORT_RESET_TIMEOUT_MS: u64 = 500;
 /// Пауза после сброса порта: спецификация USB требует дать устройству время на
 /// восстановление, прежде чем обращаться к нему.
 const PORT_RECOVERY_MS: u64 = 20;
-
-/// Предел витков холостого ожидания.
-///
-/// Страховка на случай остановившегося таймера: без неё отказ таймера превратил
-/// бы любое ожидание в вечное. Значение подобрано так, чтобы на любой мыслимой
-/// частоте оно исчерпывалось позже, чем истекает время.
-const SPIN_LIMIT: u32 = 200_000_000;
-
-/// Через сколько витков спрашивать часы. См. [`Timeout::expired`].
-const CLOCK_EVERY: u32 = 64;
-
-/// Ожидание с двумя независимыми пределами.
-struct Timeout {
-    started_ms: u64,
-    until_ms: u64,
-    spins: u32,
-}
-
-impl Timeout {
-    fn new(ms: u64) -> Self {
-        Self { started_ms: time::uptime_ms(), until_ms: time::uptime_ms().saturating_add(ms), spins: 0 }
-    }
-
-    /// Сколько ждали и упёрлись ли в предел витков вместо часов.
-    ///
-    /// Различать это обязательно. «Часы отсчитали полсекунды» — значит
-    /// устройство молчит; «кончились витки» — значит часы стоят, и настоящая
-    /// неисправность совсем в другом месте. На машине без журнала эти два
-    /// случая выглядят одинаково: «a control transfer never completed».
-    fn report(&self) -> (u64, bool) {
-        (
-            time::uptime_ms().saturating_sub(self.started_ms),
-            self.spins >= SPIN_LIMIT,
-        )
-    }
-
-    /// `true`, если ждать больше нельзя.
-    ///
-    /// # Почему часы читаются не на каждом витке
-    ///
-    /// Потому что чтение часов не везде стоит одинаково. На железе `CNTPCT_EL0`
-    /// — это несколько тактов; под гипервизором доступ к нему с EL1 может быть
-    /// перехвачен, и тогда каждое чтение стоит выхода в монитор. VirtualBox на
-    /// Apple Silicon именно таков: `CNTHCTL_EL2.EL1PCTEN` у него сброшен, и
-    /// цикл, спрашивавший время на каждом витке, состоял из выходов в
-    /// гипервизор целиком — измерено отладчиком, счётчик команд гостя стоял на
-    /// инструкции `mrs cntpct_el0` во всех выборках подряд.
-    ///
-    /// Раз в [`CLOCK_EVERY`] витков достаточно: ожидания здесь измеряются
-    /// миллисекундами, а витков в миллисекунде тысячи. Точность предела от
-    /// этого не страдает, а цена ожидания падает на два порядка.
-    fn expired(&mut self) -> bool {
-        self.spins = self.spins.saturating_add(1);
-        core::hint::spin_loop();
-        if self.spins >= SPIN_LIMIT {
-            return true;
-        }
-        if self.spins % CLOCK_EVERY != 0 {
-            return false;
-        }
-        time::uptime_ms() >= self.until_ms
-    }
-}
-
-/// Подождать `ms` миллисекунд.
-fn sleep_ms(ms: u64) {
-    let mut timeout = Timeout::new(ms);
-    while !timeout.expired() {}
-}
 
 /// Почему контроллер или устройство не заработали.
 #[derive(Debug, Clone, Copy)]
@@ -278,82 +209,6 @@ impl core::fmt::Display for XhciError {
 impl From<DmaError> for XhciError {
     fn from(err: DmaError) -> Self {
         Self::Dma(err)
-    }
-}
-
-/// На каком шаге перечисления остановилось устройство.
-///
-/// Нужен ровно там, где нет журнала: на машине без последовательного порта
-/// «устройство не поднялось» — это всё, что видит человек, а шагов между
-/// «порт занят» и «устройство работает» шесть, и лечатся они по-разному.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stage {
-    /// Сброс порта.
-    Reset,
-    /// Выделение слота и выдача адреса.
-    Address,
-    /// Чтение дескрипторов устройства и конфигурации.
-    Describe,
-    /// Настройка точки прерываний у контроллера.
-    Configure,
-    /// Выбор конфигурации, чтение дескриптора отчётов, протокол.
-    Enable,
-}
-
-impl core::fmt::Display for Stage {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::Reset => "resetting the port",
-            Self::Address => "addressing the device",
-            Self::Describe => "reading its descriptors",
-            Self::Configure => "configuring the interrupt endpoint",
-            Self::Enable => "enabling reports",
-        })
-    }
-}
-
-/// Кто разбирает отчёты этого устройства.
-///
-/// Разница между клавиатурой и мышью для драйвера контроллера ровно в этом:
-/// один байт дескриптора интерфейса решает, какой разборщик получит отчёт.
-/// Всё остальное — слот, адресация, кольца, дверной звонок — у них общее.
-enum Reader {
-    Keyboard(hid::Keyboard),
-    Mouse(hid::Mouse),
-}
-
-impl Reader {
-    fn handle_report(&mut self, report: &[u8]) {
-        match self {
-            Reader::Keyboard(keyboard) => keyboard.handle_report(report),
-            Reader::Mouse(mouse) => mouse.handle_report(report),
-        }
-    }
-
-    const fn reports(&self) -> u64 {
-        match self {
-            Reader::Keyboard(keyboard) => keyboard.reports(),
-            Reader::Mouse(mouse) => mouse.reports(),
-        }
-    }
-
-    const fn name(&self) -> &'static str {
-        match self {
-            Reader::Keyboard(_) => "keyboard",
-            Reader::Mouse(_) => "mouse",
-        }
-    }
-
-    /// Чем устройство оказалось на самом деле.
-    ///
-    /// Именно на самом деле, а не по байту дескриптора интерфейса: планшет
-    /// объявляет протокол ноль, и поверив дескриптору, ядро сообщило бы, что
-    /// указателя в системе нет, — при работающем указателе.
-    const fn protocol(&self) -> u8 {
-        match self {
-            Reader::Keyboard(_) => usb::PROTOCOL_KEYBOARD,
-            Reader::Mouse(_) => usb::PROTOCOL_MOUSE,
-        }
     }
 }
 
@@ -2041,24 +1896,6 @@ impl Controller {
     }
 }
 
-/// Одно поднятое устройство в сводке.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Attached {
-    /// Корневой порт; ноль означает пустую запись.
-    pub port: u8,
-    /// Изготовитель и модель из дескриптора устройства.
-    pub vendor: u16,
-    pub product: u16,
-    /// Чем ядро его сочло: `"keyboard"` или `"mouse"`.
-    pub kind: &'static str,
-    /// Длина дескриптора отчётов; ноль — устройство его не объявило.
-    pub descriptor: u16,
-    /// Номер интерфейса, который драйвер поднял.
-    pub interface: u8,
-    /// Сколько интерфейсов HID у устройства всего.
-    pub interfaces: u8,
-}
-
 /// Что драйвер сообщает о себе наружу.
 ///
 /// Структура, а не кортеж из шести чисел: с появлением второго устройства
@@ -2105,50 +1942,6 @@ pub struct Summary {
     pub interrupts: u64,
     /// Сколько раз задача просыпалась разбирать кольцо.
     pub services: u64,
-}
-
-/// Кто будет разбирать отчёты и на каком протоколе.
-///
-/// Возвращает разборщик и признак «на boot-протоколе»; `None` означает, что
-/// устройство понять нечем.
-///
-/// # Почему дескриптор предпочтительнее boot-протокола
-///
-/// Не из любви к новому. Boot-протокол — упрощение, придуманное ради BIOS:
-/// три байта у мыши, восемь у клавиатуры. Дескриптор описывает то, что
-/// устройство шлёт **на самом деле**, и только он работает с теми, кто
-/// boot-протокола не объявляет вовсе.
-///
-/// Держать его запасным путём и ходить по нему только на чужих машинах было бы
-/// хуже всего: путь, по которому система ходит лишь там, где её некому чинить,
-/// — это путь, который никто не проверял. Поэтому основной здесь он, а
-/// boot-протокол остаётся для устройства, чей дескриптор разобрать не удалось.
-fn choose_reader(found: &HidInterface, described: &usb_hid::Descriptor) -> Option<(Reader, bool)> {
-    // Байт протокола главнее дескриптора ровно в одном: он решает, кем
-    // устройство себя объявило. Клавиатура, у которой в дескрипторе нашлись
-    // ещё и оси (такое бывает у клавиатур с тачпадом), не должна стать мышью.
-    if found.protocol != usb::PROTOCOL_KEYBOARD {
-        if let Some(map) = described.pointer {
-            return Some((Reader::Mouse(hid::Mouse::described(map)), false));
-        }
-    }
-    if let Some(map) = described.keyboard {
-        return Some((Reader::Keyboard(hid::Keyboard::described(map)), false));
-    }
-    if let Some(map) = described.pointer {
-        return Some((Reader::Mouse(hid::Mouse::described(map)), false));
-    }
-
-    if !found.boot {
-        return None;
-    }
-    match found.protocol {
-        usb::PROTOCOL_MOUSE => Some((Reader::Mouse(hid::Mouse::boot()), true)),
-        usb::PROTOCOL_KEYBOARD => Some((Reader::Keyboard(hid::Keyboard::boot()), true)),
-        // Boot-подкласс без протокола клавиатуры или мыши: спецификация такого
-        // не описывает, и угадывать формат отчёта не по чему.
-        _ => None,
-    }
 }
 
 /// Перевести `bInterval` из дескриптора в поле `Interval` контекста точки.

@@ -1762,7 +1762,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 36 | TCP, and sockets for programs | **done** |
 | 37 | SSH transport (RFC 4253): key exchange and encryption a real `ssh` agrees with | **done** |
 | 38 | SSH authentication and a session (RFC 4252, 4254): a key logs in, a command runs, output comes back | **done** |
-| 38a | Somebody else's machine: a boot entry the firmware honours and a census of USB controllers — **done**; the driver for controllers that are not xHCI waits for what that census reports from a real machine | half |
+| 38a | Somebody else's machine: a boot entry the firmware honours, a census of USB controllers, and the OHCI driver that census asked for — input works in VirtualBox as it ships | **done** |
 | 38b | Pipes, and a real shell over the network: programs from `/bin` run as the account that logged in | planned |
 | 39 | Updating over the network, with signatures checked before anything is written | planned |
 | 39a | TLS, and a second update channel: the same update from GitHub Releases when the first server is silent | planned |

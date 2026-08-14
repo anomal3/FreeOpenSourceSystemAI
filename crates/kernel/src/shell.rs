@@ -316,6 +316,39 @@ fn banner() {
             }
         }
     }
+    // То же самое про OHCI, и по той же причине: на машине, где ввод не
+    // заработал, единственный доступный человеку ответ — эта строка. Драйверов
+    // два, и молчать о втором значило бы вернуть ровно ту неисправность, из-за
+    // которой писалась перепись.
+    if let Some(usb) = usb::ohci::summary() {
+        if usb.occupied > 0 {
+            sprintln!(
+                "OHCI: {} of {} port(s) brought up, {} keyboard(s), {} pointer(s).",
+                usb.devices,
+                usb.occupied,
+                usb.keyboards,
+                usb.mice
+            );
+            for device in usb.attached.iter().filter(|device| device.port != 0) {
+                sprintln!(
+                    "     port {}: {:04x}:{:04x} {} on interface {} of {}, {}",
+                    device.port,
+                    device.vendor,
+                    device.product,
+                    device.kind,
+                    device.interface,
+                    device.interfaces,
+                    match device.descriptor {
+                        0 => "boot protocol",
+                        _ => "own report descriptor",
+                    }
+                );
+            }
+            if let Some((port, stage, err)) = usb.last_error {
+                sprintln!("     port {port} stopped while {stage}: {err}");
+            }
+        }
+    }
     sprintln!();
 }
 
@@ -975,6 +1008,28 @@ fn usb_status() {
             sprintln!("  wakeups  {} of the service task", usb.services);
         }
         None => sprintln!("  xhci     no controller"),
+    }
+    match usb::ohci::summary() {
+        Some(usb) => {
+            sprintln!(
+                "  ohci     {} devices on {} of {} port(s)",
+                usb.devices,
+                usb.occupied,
+                usb.ports
+            );
+            sprintln!("  reports  {} parsed, {} transfer errors", usb.reports, usb.errors);
+            // Пробуждения — цена опроса, выраженная числом. Прерываний у этого
+            // драйвера нет вовсе, поэтому строки «irqs» здесь и не будет: она
+            // сообщала бы ноль всегда.
+            sprintln!("  wakeups  {} of the ohci service task", usb.services);
+            if usb.unrecoverable {
+                sprintln!("  ohci     the controller reported an unrecoverable error");
+            }
+            if let Some((port, stage, err)) = usb.last_error {
+                sprintln!("  ohci     port {port} stopped while {stage}: {err}");
+            }
+        }
+        None => sprintln!("  ohci     no controller"),
     }
 }
 

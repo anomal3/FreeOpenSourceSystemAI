@@ -477,6 +477,15 @@ fn start_input(info: &BootInfo) -> bool {
     // с одной шины, и решать за него, что именно нашлось, здесь нечем.
     unsafe { usb::xhci::init(info.acpi_rsdp) };
 
+    // OHCI поднимается **всегда**, а не «если xHCI не нашёлся». Условие
+    // выглядело бы разумно и было бы неверным: контроллеры сосуществуют, и на
+    // машине с обоими устройство висит на одном из них — на каком именно,
+    // заранее не известно никому. Цена безусловной попытки — одна строка в
+    // журнале на машине без OHCI (перепись его не нашла — драйвер молчит).
+    //
+    // SAFETY: те же условия, что у xHCI выше.
+    unsafe { usb::ohci::init(info.acpi_rsdp) };
+
     let sources = input::sources();
 
     if !sources.any() {
@@ -504,6 +513,15 @@ fn run_session(have_input: bool) -> ! {
     if usb::xhci::is_present() {
         if let Err(err) = sched::spawn_daemon("usb", usb::xhci::service_task) {
             kprintln!("  spawn usb service failed: {err}");
+        }
+    }
+
+    // У OHCI задача своя: контроллеры независимы, и одна задача на двоих
+    // означала бы, что отчёт одного ждёт опроса другого. Просыпается она по
+    // часам — прерываний у этого драйвера нет, см. шапку `usb::ohci`.
+    if usb::ohci::is_present() {
+        if let Err(err) = sched::spawn_daemon("ohci", usb::ohci::service_task) {
+            kprintln!("  spawn ohci service failed: {err}");
         }
     }
 

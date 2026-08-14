@@ -18,7 +18,107 @@
 use usb_hid::{KeyboardMap, Motion, PointerMap};
 
 use crate::input::{Buttons, KeyCode, post, post_pointer, post_pointer_at};
-use crate::usb::key_for_usage;
+use crate::usb::{self, HidInterface, key_for_usage};
+
+/// Кто разбирает отчёты этого устройства.
+///
+/// Разница между клавиатурой и мышью для драйвера контроллера ровно в этом:
+/// один байт дескриптора интерфейса решает, какой разборщик получит отчёт.
+/// Всё остальное — слот, адресация, кольца, дверной звонок — у них общее.
+///
+/// Тип живёт здесь, а не в драйвере, с появлением второго контроллера: OHCI и
+/// xHCI доставляют одни и те же байты, и два разных выбора разборщика означали
+/// бы, что одна и та же мышь на разных машинах опознаётся по-разному.
+pub enum Reader {
+    Keyboard(Keyboard),
+    Mouse(Mouse),
+}
+
+impl Reader {
+    pub fn handle_report(&mut self, report: &[u8]) {
+        match self {
+            Reader::Keyboard(keyboard) => keyboard.handle_report(report),
+            Reader::Mouse(mouse) => mouse.handle_report(report),
+        }
+    }
+
+    #[must_use]
+    pub const fn reports(&self) -> u64 {
+        match self {
+            Reader::Keyboard(keyboard) => keyboard.reports(),
+            Reader::Mouse(mouse) => mouse.reports(),
+        }
+    }
+
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Reader::Keyboard(_) => "keyboard",
+            Reader::Mouse(_) => "mouse",
+        }
+    }
+
+    /// Чем устройство оказалось на самом деле.
+    ///
+    /// Именно на самом деле, а не по байту дескриптора интерфейса: планшет
+    /// объявляет протокол ноль, и поверив дескриптору, ядро сообщило бы, что
+    /// указателя в системе нет, — при работающем указателе.
+    #[must_use]
+    pub const fn protocol(&self) -> u8 {
+        match self {
+            Reader::Keyboard(_) => usb::PROTOCOL_KEYBOARD,
+            Reader::Mouse(_) => usb::PROTOCOL_MOUSE,
+        }
+    }
+}
+
+/// Кто будет разбирать отчёты и на каком протоколе.
+///
+/// Возвращает разборщик и признак «на boot-протоколе»; `None` означает, что
+/// устройство понять нечем.
+///
+/// # Почему дескриптор предпочтительнее boot-протокола
+///
+/// Не из любви к новому. Boot-протокол — упрощение, придуманное ради BIOS:
+/// три байта у мыши, восемь у клавиатуры. Дескриптор описывает то, что
+/// устройство шлёт **на самом деле**, и только он работает с теми, кто
+/// boot-протокола не объявляет вовсе.
+///
+/// Держать его запасным путём и ходить по нему только на чужих машинах было бы
+/// хуже всего: путь, по которому система ходит лишь там, где её некому чинить,
+/// — это путь, который никто не проверял. Поэтому основной здесь он, а
+/// boot-протокол остаётся для устройства, чей дескриптор разобрать не удалось.
+#[must_use]
+pub fn choose_reader(
+    found: &HidInterface,
+    described: &usb_hid::Descriptor,
+) -> Option<(Reader, bool)> {
+    // Байт протокола главнее дескриптора ровно в одном: он решает, кем
+    // устройство себя объявило. Клавиатура, у которой в дескрипторе нашлись
+    // ещё и оси (такое бывает у клавиатур с тачпадом), не должна стать мышью.
+    if found.protocol != usb::PROTOCOL_KEYBOARD {
+        if let Some(map) = described.pointer {
+            return Some((Reader::Mouse(Mouse::described(map)), false));
+        }
+    }
+    if let Some(map) = described.keyboard {
+        return Some((Reader::Keyboard(Keyboard::described(map)), false));
+    }
+    if let Some(map) = described.pointer {
+        return Some((Reader::Mouse(Mouse::described(map)), false));
+    }
+
+    if !found.boot {
+        return None;
+    }
+    match found.protocol {
+        usb::PROTOCOL_MOUSE => Some((Reader::Mouse(Mouse::boot()), true)),
+        usb::PROTOCOL_KEYBOARD => Some((Reader::Keyboard(Keyboard::boot()), true)),
+        // Boot-подкласс без протокола клавиатуры или мыши: спецификация такого
+        // не описывает, и угадывать формат отчёта не по чему.
+        _ => None,
+    }
+}
 
 /// Длина отчёта boot-протокола клавиатуры.
 pub const REPORT_LEN: usize = 8;

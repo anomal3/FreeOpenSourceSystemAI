@@ -48,7 +48,7 @@ use anyhow::{Context, Result, bail};
 use crate::arch::Arch;
 use crate::build::{self, BuildOptions};
 use crate::paths;
-use crate::qemu::{self, Drive, Pointer, RunOptions};
+use crate::qemu::{self, Drive, Pointer, RunOptions, UsbController};
 use crate::{image, util};
 
 pub use scenarios::{Scenario, Step, Target};
@@ -305,6 +305,7 @@ fn execute(
         monitor: Some(monitor_addr),
         qmp: qmp_addr,
         pointer: if scenario.tablet { Pointer::Tablet } else { Pointer::Mouse },
+        usb: if scenario.ohci { UsbController::Ohci } else { UsbController::Xhci },
         disk_bus: scenario.disk_bus,
         network: scenario.network,
         hostfwd,

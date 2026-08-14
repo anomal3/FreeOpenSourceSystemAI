@@ -32,6 +32,8 @@ pub struct RunOptions {
     pub qmp: Option<SocketAddr>,
     /// Какой манипулятор подключён к машине.
     pub pointer: Pointer,
+    /// Каким контроллером подключены клавиатура и манипулятор.
+    pub usb: UsbController,
     /// Чем подключены диски.
     pub disk_bus: DiskBus,
     /// Подключена ли к машине сетевая карта.
@@ -89,6 +91,37 @@ pub enum Pointer {
     Tablet,
 }
 
+/// Каким контроллером подключены устройства ввода.
+///
+/// Выбор проверяет ядро, а не эмулятор: это два разных драйвера. Появился он не
+/// ради полноты — у VirtualBox по умолчанию включён **только** OHCI, и система,
+/// умеющая один xHCI, на машине читателя не слушается ни клавиатуры, ни мыши.
+/// `pci-ohci` в QEMU — тот же класс контроллера, что там эмулируется, поэтому
+/// драйвер отлаживается здесь, а не на чужой машине без журнала.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UsbController {
+    Xhci,
+    Ohci,
+}
+
+impl UsbController {
+    /// Имя шины QEMU, к которой подключаются устройства.
+    const fn bus(self) -> &'static str {
+        match self {
+            Self::Xhci => "xhci.0",
+            Self::Ohci => "ohci.0",
+        }
+    }
+
+    /// Само устройство контроллера.
+    const fn device(self) -> &'static str {
+        match self {
+            Self::Xhci => "qemu-xhci,id=xhci",
+            Self::Ohci => "pci-ohci,id=ohci",
+        }
+    }
+}
+
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
@@ -102,6 +135,7 @@ impl Default for RunOptions {
             monitor: None,
             qmp: None,
             pointer: Pointer::Mouse,
+            usb: UsbController::Xhci,
             disk_bus: DiskBus::Virtio,
             network: false,
             hostfwd: None,
@@ -463,8 +497,8 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     // добавляется тоже, и не ради симметрии, а чтобы драйвер проверялся на обеих
     // архитектурах: PS/2 там продолжает работать рядом, и оба источника событий
     // складывают их в одну очередь.
-    cmd.args(["-device", "qemu-xhci,id=xhci"]);
-    cmd.args(["-device", "usb-kbd,bus=xhci.0"]);
+    cmd.args(["-device", opts.usb.device()]);
+    cmd.args(["-device", &format!("usb-kbd,bus={}", opts.usb.bus())]);
     // Манипулятор — второе устройство на том же контроллере, и именно поэтому
     // он здесь: он занимает **свой** слот и своё кольцо. Одно устройство на
     // контроллер драйвер обслуживал бы вдвое меньшим кодом — и молча отдавал бы
@@ -475,8 +509,8 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     // — то есть проверяет совсем другой путь в драйвере, тот самый, которым
     // система живёт в VirtualBox.
     match opts.pointer {
-        Pointer::Mouse => cmd.args(["-device", "usb-mouse,bus=xhci.0"]),
-        Pointer::Tablet => cmd.args(["-device", "usb-tablet,bus=xhci.0"]),
+        Pointer::Mouse => cmd.args(["-device", &format!("usb-mouse,bus={}", opts.usb.bus())]),
+        Pointer::Tablet => cmd.args(["-device", &format!("usb-tablet,bus={}", opts.usb.bus())]),
     };
 
     cmd.arg("-m").arg(&opts.memory);

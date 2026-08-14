@@ -122,6 +122,14 @@ struct RunArgs {
     /// гипервизоре.
     #[arg(long)]
     tablet: bool,
+    /// Подключить клавиатуру и манипулятор через OHCI, а не через xHCI.
+    ///
+    /// Так устроена машина VirtualBox с настройками по умолчанию: там нет ни
+    /// xHCI, ни PS/2 на ARM, и весь ввод идёт через контроллер USB 1.1. Флаг
+    /// позволяет посмотреть на это глазами, не заводя виртуальную машину в
+    /// другом гипервизоре.
+    #[arg(long)]
+    ohci: bool,
     /// Подключить сетевую карту virtio-net в пользовательскую сеть QEMU.
     ///
     /// Гость получает адрес `10.0.2.15`, шлюз и ответчик на `ping` —
@@ -291,6 +299,11 @@ fn real_main() -> Result<()> {
                 extra: args.qemu_args,
                 drives: vec![drive],
                 pointer: if args.tablet { qemu::Pointer::Tablet } else { qemu::Pointer::Mouse },
+                usb: if args.ohci {
+                    qemu::UsbController::Ohci
+                } else {
+                    qemu::UsbController::Xhci
+                },
                 network: args.net,
                 ..qemu::RunOptions::default()
             };
