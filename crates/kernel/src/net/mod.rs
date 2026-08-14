@@ -33,6 +33,8 @@ pub mod eth;
 pub mod icmp;
 pub mod ipv4;
 pub mod socket;
+pub mod stream;
+pub mod tcp;
 pub mod udp;
 
 use crate::sched::TaskId;
@@ -75,6 +77,8 @@ pub enum NetError {
     Device(VirtioError),
     /// Не получилось с сокетом.
     Socket(socket::SocketError),
+    /// Не получилось с соединением.
+    Stream(stream::StreamError),
     /// Имя не годится: пустое, слишком длинное или с пустой меткой.
     BadName,
     /// Сервер имён ответил, и ответ — «такого имени нет».
@@ -96,6 +100,7 @@ impl core::fmt::Display for NetError {
             Self::Timeout => f.write_str("no answer"),
             Self::Device(err) => write!(f, "the card refused the frame: {err}"),
             Self::Socket(err) => write!(f, "{err}"),
+            Self::Stream(err) => write!(f, "{err}"),
             Self::BadName => f.write_str("that name cannot be asked about"),
             Self::NoSuchName => f.write_str("the name server says there is no such name"),
         }
@@ -120,6 +125,13 @@ pub struct Counters {
     pub udp_out: u64,
     /// Датаграммы, пришедшие на порт, который никто не слушает.
     pub udp_no_listener: u64,
+    pub tcp_in: u64,
+    pub tcp_out: u64,
+    /// Сегменты, отправленные повторно, — мера того, сколько теряется.
+    pub tcp_retransmits: u64,
+    /// Соединения, оборванные молчанием собеседника.
+    pub tcp_timeouts: u64,
+    pub tcp_resets: u64,
 }
 
 /// Пришедший эхо-ответ: кто ответил и когда.
@@ -140,6 +152,7 @@ struct Interface {
     gateway: Ipv4,
     table: arp::Table,
     sockets: socket::Table,
+    streams: stream::Streams,
     counters: Counters,
     /// Адрес сервера имён — от DHCP или заданный руками.
     dns: Ipv4,
@@ -203,6 +216,7 @@ pub unsafe fn init(rsdp: u64) {
         gateway: Ipv4::UNSPECIFIED,
         table: arp::Table::new(),
         sockets: socket::Table::new(),
+        streams: stream::Streams::new(),
         counters: Counters::default(),
         dns: Ipv4::UNSPECIFIED,
         last_reply: None,
@@ -236,6 +250,8 @@ pub struct Status {
     pub counters: Counters,
     /// Сколько сокетов открыто и сколько датаграмм они потеряли.
     pub sockets: (usize, u64),
+    /// Сколько соединений живо и сколько из них установлено.
+    pub streams: (usize, usize),
 }
 
 pub fn status() -> Option<Status> {
@@ -250,6 +266,7 @@ pub fn status() -> Option<Status> {
         link: iface.device.stats(),
         counters: iface.counters,
         sockets: iface.sockets.stats(),
+        streams: iface.streams.summary(),
     })
 }
 
@@ -366,6 +383,208 @@ pub fn socket_recv(owner: TaskId, index: usize) -> Result<Option<socket::Receive
     iface.sockets.take(owner, index).map_err(NetError::Socket)
 }
 
+// ---------------------------------------------------------------------------
+// Соединения TCP — то, чем пользуются программы
+// ---------------------------------------------------------------------------
+
+/// Завести соединение (пока ни к кому не подключённое).
+pub fn stream_open(owner: TaskId) -> Result<usize, NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    iface.streams.open(owner).map_err(NetError::Stream)
+}
+
+/// Привязать к порту.
+pub fn stream_bind(owner: TaskId, index: usize, port: u16) -> Result<u16, NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    iface.streams.bind(owner, index, port).map_err(NetError::Stream)
+}
+
+/// Начать слушать входящие соединения.
+pub fn stream_listen(owner: TaskId, index: usize) -> Result<(), NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    iface.streams.listen(owner, index).map_err(NetError::Stream)
+}
+
+/// Забрать установленное соединение из очереди слушающего.
+///
+/// Не ждёт: пустая очередь — это `None`, и программа сама решает, спать ей или
+/// заняться другим.
+pub fn stream_accept(owner: TaskId, index: usize) -> Result<Option<usize>, NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    iface.streams.accept(owner, index).map_err(NetError::Stream)
+}
+
+/// Начать соединение.
+pub fn stream_connect(
+    owner: TaskId,
+    index: usize,
+    address: Ipv4,
+    port: u16,
+) -> Result<(), NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    if iface.address.is_unspecified() {
+        return Err(NetError::NoAddress);
+    }
+
+    let now = crate::time::uptime_ms();
+    // Локальный порт назначается из эфемерного диапазона тем же счётчиком, что
+    // и у датаграмм: два диапазона на одну машину означали бы, что один и тот же
+    // номер занят дважды разными протоколами — законно, но объяснять это себе
+    // через полгода никому не нужно.
+    let local = iface.sockets.pick_port().map_err(NetError::Socket)?;
+
+    {
+        let conn = iface.streams.get_mut(owner, index).map_err(NetError::Stream)?;
+        let iss = stream::initial_sequence(now);
+        conn.local_port = local;
+        conn.remote = address;
+        conn.remote_port = port;
+        conn.snd_una = iss;
+        conn.snd_nxt = iss;
+        // Окно собеседника ещё неизвестно; до его `SYN` мы всё равно ничего не
+        // отправим, кроме самого `SYN`.
+        conn.snd_wnd = 0;
+        conn.state = stream::State::SynSent;
+    }
+    tcp_pump(iface, index);
+    Ok(())
+}
+
+/// В каком состоянии соединение.
+pub fn stream_state(owner: TaskId, index: usize) -> Result<(stream::State, bool, bool), NetError> {
+    let guard = INTERFACE.lock();
+    let iface = guard.as_ref().ok_or(NetError::NoDevice)?;
+    let conn = iface.streams.get(owner, index).map_err(NetError::Stream)?;
+    Ok((conn.state, conn.peer_closed, conn.reset))
+}
+
+/// Отдать байты на отправку. Возвращает, сколько принято.
+pub fn stream_send(owner: TaskId, index: usize, data: &[u8]) -> Result<usize, NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    let taken = {
+        let conn = iface.streams.get_mut(owner, index).map_err(NetError::Stream)?;
+        if conn.reset {
+            return Err(NetError::Stream(stream::StreamError::Reset));
+        }
+        if !conn.state.is_open() {
+            return Err(NetError::Stream(stream::StreamError::NotConnected));
+        }
+        if conn.closing {
+            return Err(NetError::Stream(stream::StreamError::Closed));
+        }
+        // Буфер отправки — это ещё и окно повторной передачи: пока байт не
+        // подтверждён, он обязан лежать здесь. Поэтому его размер и есть предел
+        // того, сколько программа может отдать вперёд.
+        let room = stream::SEND_BUFFER.saturating_sub(conn.send.len());
+        if room == 0 {
+            return Err(NetError::Stream(stream::StreamError::WouldBlock));
+        }
+        let taken = data.len().min(room);
+        conn.send.extend(&data[..taken]);
+        taken
+    };
+    tcp_pump(iface, index);
+    Ok(taken)
+}
+
+/// Забрать принятые байты.
+///
+/// Ноль означает «пока ничего»; конец потока программа узнаёт по
+/// [`stream_state`], где `peer_closed` — это чужой `FIN`.
+pub fn stream_recv(owner: TaskId, index: usize, out: &mut [u8]) -> Result<usize, NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    let (taken, need_window_update) = {
+        let conn = iface.streams.get_mut(owner, index).map_err(NetError::Stream)?;
+        if conn.reset && conn.recv.is_empty() {
+            return Err(NetError::Stream(stream::StreamError::Reset));
+        }
+        let was_full = conn.window() == 0;
+        let mut taken = 0;
+        while taken < out.len() {
+            match conn.recv.pop_front() {
+                Some(byte) => {
+                    out[taken] = byte;
+                    taken += 1;
+                }
+                None => break,
+            }
+        }
+        // Освободившееся место надо объявить: собеседник, которому мы когда-то
+        // сказали «окно ноль», сам не догадается, что оно открылось, и будет
+        // молчать до своего таймера.
+        (taken, was_full && taken > 0)
+    };
+    if need_window_update {
+        if let Some(conn) = iface.streams.at(index) {
+            conn.need_ack = true;
+        }
+        tcp_pump(iface, index);
+    }
+    Ok(taken)
+}
+
+/// Закрыть свою половину: отправить `FIN`, когда кончатся данные.
+pub fn stream_shutdown(owner: TaskId, index: usize) -> Result<(), NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    {
+        let conn = iface.streams.get_mut(owner, index).map_err(NetError::Stream)?;
+        conn.closing = true;
+    }
+    tcp_pump(iface, index);
+    Ok(())
+}
+
+/// Закрыть соединение и освободить слот.
+pub fn stream_close(owner: TaskId, index: usize) -> Result<(), NetError> {
+    let mut guard = INTERFACE.lock();
+    let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    // Проверка владельца обязательна и здесь: закрыть чужое соединение —
+    // это разорвать чужую связь.
+    iface.streams.get(owner, index).map_err(NetError::Stream)?;
+    {
+        let conn = iface.streams.get_mut(owner, index).map_err(NetError::Stream)?;
+        conn.closing = true;
+    }
+    tcp_pump(iface, index);
+
+    // Слот освобождается сразу, а не после завершения рукопожатия закрытия:
+    // держать его до `TIME_WAIT` при восьми слотах на систему означало бы, что
+    // три закрытых подряд соединения исчерпывают её.
+    let finished = iface.streams.at(index).is_some_and(|conn| {
+        matches!(
+            conn.state,
+            stream::State::Closed | stream::State::TimeWait | stream::State::Listen
+        ) || conn.reset
+    });
+    if finished {
+        iface.streams.close(index);
+    }
+    Ok(())
+}
+
+/// Что показывает команда оболочки.
+pub fn stream_table() -> alloc::vec::Vec<(usize, &'static str, u16, Ipv4, u16, usize, usize)> {
+    let guard = INTERFACE.lock();
+    match guard.as_ref() {
+        Some(iface) => iface
+            .streams
+            .describe()
+            .map(|(index, state, local, remote, port, send, recv)| {
+                (index, state.name(), local, remote, port, send, recv)
+            })
+            .collect(),
+        None => alloc::vec::Vec::new(),
+    }
+}
+
 /// Кто прислал последнюю забранную датаграмму.
 pub fn socket_peer(owner: TaskId, index: usize) -> Result<Option<(Ipv4, u16)>, NetError> {
     let guard = INTERFACE.lock();
@@ -387,7 +606,11 @@ pub fn socket_close(owner: TaskId, index: usize) -> Result<(), NetError> {
 pub fn close_owner(owner: TaskId) -> usize {
     let mut guard = INTERFACE.lock();
     match guard.as_mut() {
-        Some(iface) => iface.sockets.close_owner(owner),
+        // Соединения TCP закрываются здесь же и грубо — слот освобождается без
+        // прощального `FIN`. Это правильно: программы, которая могла бы
+        // договориться о закрытии, больше нет, а собеседник узнает об обрыве по
+        // `RST` на первый же свой сегмент.
+        Some(iface) => iface.sockets.close_owner(owner) + iface.streams.close_owner(owner),
         None => 0,
     }
 }
@@ -429,6 +652,17 @@ pub fn service_task() {
             // «ответили на него» незачем.
             handle(iface, &frame[..len]);
         }
+
+        // Таймеры TCP крутятся здесь же, а не отдельной задачей: повторная
+        // передача — это отправка, и делать её из второго места значило бы
+        // второй лок или второй порядок его захвата.
+        {
+            let mut guard = INTERFACE.lock();
+            if let Some(iface) = guard.as_mut() {
+                tcp_tick(iface);
+            }
+        }
+
         crate::sched::sleep_ms(POLL_INTERVAL_MS);
     }
 }
@@ -493,7 +727,26 @@ fn handle_arp(iface: &mut Interface, payload: &[u8]) {
                 iface.counters.arp_replies_out += 1;
             }
         }
-        arp::REPLY => iface.counters.arp_replies_in += 1,
+        arp::REPLY => {
+            iface.counters.arp_replies_in += 1;
+            // Соединения, которые упёрлись в неизвестный аппаратный адрес,
+            // будятся сразу, а не по своему таймеру. Разница — десятки
+            // миллисекунд на каждом первом обращении к новому собеседнику, и
+            // она видна: без этого первый же сегмент к нему всегда «теряется».
+            let waiting: alloc::vec::Vec<usize> = iface
+                .streams
+                .indices()
+                .filter(|index| {
+                    iface
+                        .streams
+                        .peek(*index)
+                        .is_some_and(|conn| conn.remote == packet.sender_ip)
+                })
+                .collect();
+            for index in waiting {
+                tcp_pump(iface, index);
+            }
+        }
         _ => iface.counters.ignored += 1,
     }
 }
@@ -528,9 +781,20 @@ fn handle_ipv4(iface: &mut Interface, payload: &[u8]) {
         return;
     }
 
+    if packet.protocol == ipv4::PROTOCOL_TCP {
+        // Сегмент копируется на стек: разбор одалживает кадр приёмного буфера,
+        // а ответ на этот же сегмент уйдёт через тот же буфер, и держать
+        // заимствование до отправки нельзя.
+        let mut segment = [0u8; FRAME_MAX];
+        let len = packet.payload.len().min(FRAME_MAX);
+        segment[..len].copy_from_slice(&packet.payload[..len]);
+        let source = packet.source;
+        let destination = packet.destination;
+        handle_tcp(iface, source, destination, len, &segment);
+        return;
+    }
+
     if packet.protocol != ipv4::PROTOCOL_ICMP {
-        // TCP появится в следующей фазе. Пока честнее сосчитать пакет как
-        // непонятый, чем промолчать.
         iface.counters.ignored += 1;
         return;
     }
@@ -592,6 +856,404 @@ fn handle_udp(iface: &mut Interface, source: Ipv4, destination: Ipv4, payload: &
         // когда-нибудь мы это сделаем; пока — счётчик, потому что молчание в
         // ответ на датаграмму и молчание из-за поломки выглядят одинаково.
         iface.counters.udp_no_listener += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TCP
+// ---------------------------------------------------------------------------
+
+/// Разобрать сегмент и продвинуть автомат соединения.
+fn handle_tcp(
+    iface: &mut Interface,
+    source: Ipv4,
+    destination: Ipv4,
+    len: usize,
+    buffer: &[u8; FRAME_MAX],
+) {
+    let Some(segment) = tcp::parse(source, destination, &buffer[..len]) else {
+        iface.counters.ignored += 1;
+        return;
+    };
+    iface.counters.tcp_in += 1;
+
+    let now = crate::time::uptime_ms();
+    let existing = iface
+        .streams
+        .lookup(segment.destination_port, source, segment.source_port);
+
+    let Some(index) = existing else {
+        // Соединения нет. Либо это `SYN` кому-то слушающему, либо сегмент,
+        // адресованный никому.
+        if segment.has(tcp::SYN) && !segment.has(tcp::ACK) {
+            if let Some(listener) = iface.streams.listener_for(segment.destination_port) {
+                let iss = stream::initial_sequence(now);
+                if let Some(index) = iface.streams.accept_syn(
+                    listener,
+                    source,
+                    segment.source_port,
+                    segment.sequence,
+                    segment.window,
+                    segment.mss,
+                    iss,
+                ) {
+                    tcp_pump(iface, index);
+                    return;
+                }
+                // Очередь слушателя переполнена или слотов не осталось. Отказ
+                // сегментом `RST` честнее молчания: клиент узнает сразу, а не
+                // будет повторять `SYN` до своего таймаута.
+            }
+        }
+        if !segment.has(tcp::RST) {
+            tcp_reject(iface, source, &segment);
+        }
+        return;
+    };
+
+    // Сегмент, оборвавший связь, — это конец без переписки: ни подтверждений,
+    // ни ответного `RST`, иначе два стека забросают друг друга ими.
+    if segment.has(tcp::RST) {
+        if let Some(conn) = iface.streams.at(index) {
+            conn.reset = true;
+            conn.state = stream::State::Closed;
+        }
+        return;
+    }
+
+    let mut hand_over = false;
+    let mut send_reset = false;
+
+    if let Some(conn) = iface.streams.at(index) {
+        conn.snd_wnd = segment.window;
+        if let Some(mss) = segment.mss {
+            conn.peer_mss = mss.clamp(536, tcp::MSS as u16);
+        }
+
+        match conn.state {
+            stream::State::SynSent => {
+                if segment.has(tcp::SYN) && segment.has(tcp::ACK) {
+                    // Подтверждение обязано покрывать наш `SYN` и ничего сверх:
+                    // всё прочее означает собеседника, отвечающего не нам.
+                    if segment.acknowledgement == conn.snd_nxt {
+                        conn.rcv_nxt = segment.sequence.wrapping_add(1);
+                        conn.acknowledge(segment.acknowledgement);
+                        conn.state = stream::State::Established;
+                        conn.need_ack = true;
+                    } else {
+                        send_reset = true;
+                    }
+                } else if segment.has(tcp::SYN) {
+                    // Одновременное открытие: оба послали `SYN`. Редкость, но
+                    // законная, и без этой ветки соединение зависло бы.
+                    conn.rcv_nxt = segment.sequence.wrapping_add(1);
+                    conn.state = stream::State::SynReceived;
+                    conn.need_ack = true;
+                }
+            }
+            stream::State::SynReceived => {
+                if segment.has(tcp::ACK) && segment.acknowledgement == conn.snd_nxt {
+                    conn.acknowledge(segment.acknowledgement);
+                    conn.state = stream::State::Established;
+                    hand_over = conn.listener.is_some();
+                    // Данные могли приехать вместе с подтверждением.
+                    conn.accept_data(segment.sequence, segment.payload);
+                }
+            }
+            stream::State::Established
+            | stream::State::FinWait1
+            | stream::State::FinWait2
+            | stream::State::CloseWait
+            | stream::State::Closing
+            | stream::State::LastAck => {
+                if segment.has(tcp::ACK) {
+                    conn.acknowledge(segment.acknowledgement);
+                }
+                conn.accept_data(segment.sequence, segment.payload);
+
+                // `FIN` считается принятым, только если он ровно на границе
+                // потока: закрытие, признанное раньше пропущенных данных, — это
+                // потерянный хвост файла.
+                let fin_here = segment.has(tcp::FIN)
+                    && segment.sequence.wrapping_add(segment.payload.len() as u32)
+                        == conn.rcv_nxt;
+                if fin_here && !conn.peer_closed {
+                    conn.peer_closed = true;
+                    conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+                    conn.need_ack = true;
+                }
+
+                // Наш `FIN` подтверждён, если подтверждение дошло до `snd_nxt`,
+                // а `FIN` занимает последний номер.
+                let our_fin_acked = conn.fin_sent && conn.snd_una == conn.snd_nxt;
+
+                conn.state = match (conn.state, fin_here || conn.peer_closed, our_fin_acked) {
+                    (stream::State::Established, true, _) => stream::State::CloseWait,
+                    (stream::State::FinWait1, true, true) => {
+                        conn.expires_at = stream::time_wait_until(now);
+                        stream::State::TimeWait
+                    }
+                    (stream::State::FinWait1, true, false) => stream::State::Closing,
+                    (stream::State::FinWait1, false, true) => stream::State::FinWait2,
+                    (stream::State::FinWait2, true, _) => {
+                        conn.expires_at = stream::time_wait_until(now);
+                        stream::State::TimeWait
+                    }
+                    (stream::State::Closing, _, true) => {
+                        conn.expires_at = stream::time_wait_until(now);
+                        stream::State::TimeWait
+                    }
+                    (stream::State::LastAck, _, true) => stream::State::Closed,
+                    (state, _, _) => state,
+                };
+            }
+            stream::State::TimeWait => {
+                // Запоздавший сегмент старого соединения: подтверждаем и
+                // продлеваем ожидание, чтобы собеседник успел закончить.
+                conn.need_ack = true;
+                conn.expires_at = stream::time_wait_until(now);
+            }
+            stream::State::Closed | stream::State::Listen => {}
+        }
+    }
+
+    if send_reset {
+        tcp_reject(iface, source, &segment);
+        iface.streams.close(index);
+        return;
+    }
+    if hand_over {
+        iface.streams.hand_to_listener(index);
+    }
+    tcp_pump(iface, index);
+
+    // Закрытое соединение, которое никто не забирал (его не отдали программе),
+    // убирается сразу: слот дороже истории.
+    let orphan = iface
+        .streams
+        .at(index)
+        .is_some_and(|conn| conn.state == stream::State::Closed && conn.listener.is_some());
+    if orphan {
+        iface.streams.close(index);
+    }
+}
+
+/// Ответить `RST` на сегмент, которому некуда прийти.
+fn tcp_reject(iface: &mut Interface, source: Ipv4, segment: &tcp::Segment<'_>) {
+    // Номера в отказе выбираются по правилу RFC 793: если подтверждения не
+    // было, отказ несёт нулевой номер и подтверждает всё, что пришло; иначе
+    // берётся номер из подтверждения. Промах здесь означает `RST`, который
+    // собеседник законно проигнорирует.
+    let (sequence, acknowledgement, flags) = if segment.has(tcp::ACK) {
+        (segment.acknowledgement, 0, tcp::RST)
+    } else {
+        (
+            0,
+            segment.sequence.wrapping_add(segment.span()),
+            tcp::RST | tcp::ACK,
+        )
+    };
+
+    let out = tcp::Outgoing {
+        source_port: segment.destination_port,
+        destination_port: segment.source_port,
+        sequence,
+        acknowledgement,
+        flags,
+        window: 0,
+        with_mss: false,
+        payload: &[],
+    };
+    let mut buffer = [0u8; tcp::HEADER + 4];
+    let len = tcp::write(&mut buffer, iface.address, source, &out);
+    if send_ipv4(iface, source, ipv4::PROTOCOL_TCP, &buffer[..len]).is_ok() {
+        iface.counters.tcp_out += 1;
+        iface.counters.tcp_resets += 1;
+    }
+}
+
+/// Отправить всё, что соединение задолжало: `SYN`, данные, `FIN`, подтверждение.
+fn tcp_pump(iface: &mut Interface, index: usize) {
+    let now = crate::time::uptime_ms();
+
+    loop {
+        // Решение принимается по копии полей: дальше начнётся отправка, а она
+        // одалживает интерфейс целиком.
+        let Some(conn) = iface.streams.at(index) else { return };
+        if conn.reset {
+            return;
+        }
+
+        let state = conn.state;
+        let mut flags = 0u8;
+        let mut with_mss = false;
+        let mut take = 0usize;
+        let mut fin = false;
+
+        match state {
+            stream::State::SynSent if conn.snd_nxt == conn.snd_una => {
+                flags = tcp::SYN;
+                with_mss = true;
+            }
+            stream::State::SynReceived if conn.snd_nxt == conn.snd_una => {
+                flags = tcp::SYN | tcp::ACK;
+                with_mss = true;
+            }
+            stream::State::Established | stream::State::CloseWait => {
+                take = conn.sendable();
+                if take > 0 {
+                    flags = tcp::ACK | tcp::PSH;
+                } else if conn.closing && !conn.fin_sent && conn.in_flight() == 0 {
+                    flags = tcp::ACK | tcp::FIN;
+                    fin = true;
+                } else if conn.need_ack {
+                    flags = tcp::ACK;
+                } else {
+                    return;
+                }
+            }
+            stream::State::FinWait1
+            | stream::State::Closing
+            | stream::State::LastAck
+            | stream::State::FinWait2
+            | stream::State::TimeWait => {
+                if conn.closing && !conn.fin_sent && conn.in_flight() == 0 {
+                    flags = tcp::ACK | tcp::FIN;
+                    fin = true;
+                } else if conn.need_ack {
+                    flags = tcp::ACK;
+                } else {
+                    return;
+                }
+            }
+            _ => return,
+        }
+
+        // Данные берутся из очереди отправки начиная с того места, докуда уже
+        // дошли: `send` хранит всё от `snd_una`, а отправлять надо от `snd_nxt`.
+        let mut payload = [0u8; tcp::MSS];
+        let offset = conn.in_flight() as usize;
+        for (at, byte) in conn.send.iter().skip(offset).take(take).enumerate() {
+            payload[at] = *byte;
+        }
+
+        let out_seq = conn.snd_nxt;
+        let out_ack = conn.rcv_nxt;
+        let window = conn.window();
+        let local_port = conn.local_port;
+        let remote = conn.remote;
+        let remote_port = conn.remote_port;
+
+        let out = tcp::Outgoing {
+            source_port: local_port,
+            destination_port: remote_port,
+            sequence: out_seq,
+            acknowledgement: out_ack,
+            flags,
+            window,
+            with_mss,
+            payload: &payload[..take],
+        };
+        let mut buffer = [0u8; tcp::HEADER + 4 + tcp::MSS];
+        let source = iface.address;
+        let len = tcp::write(&mut buffer, source, remote, &out);
+
+        match send_ipv4(iface, remote, ipv4::PROTOCOL_TCP, &buffer[..len]) {
+            Ok(()) => {}
+            Err(NetError::Pending) => {
+                // Адрес соседа ещё выясняется. Ничего не потеряно: таймер
+                // повторной передачи пришлёт нас сюда снова.
+                if let Some(conn) = iface.streams.at(index) {
+                    conn.arm(now);
+                    if conn.retransmit_at == 0 {
+                        conn.retransmit_at = now + 50;
+                    }
+                }
+                return;
+            }
+            Err(_) => return,
+        }
+        iface.counters.tcp_out += 1;
+
+        let Some(conn) = iface.streams.at(index) else { return };
+        conn.need_ack = false;
+        let mut span = take as u32;
+        if flags & tcp::SYN != 0 || fin {
+            span += 1;
+        }
+        conn.snd_nxt = conn.snd_nxt.wrapping_add(span);
+        if fin {
+            conn.fin_sent = true;
+            conn.state = match conn.state {
+                stream::State::CloseWait => stream::State::LastAck,
+                stream::State::Established => stream::State::FinWait1,
+                state => state,
+            };
+        }
+        if span > 0 {
+            conn.arm(now);
+        }
+        // Больше отправлять нечего — выходим; иначе цикл продолжит выгребать
+        // очередь по сегменту за виток.
+        if span == 0 {
+            return;
+        }
+    }
+}
+
+/// Тик таймеров: повторная передача и `TIME_WAIT`.
+fn tcp_tick(iface: &mut Interface) {
+    let now = crate::time::uptime_ms();
+    let indices: alloc::vec::Vec<usize> = iface.streams.indices().collect();
+
+    for index in indices {
+        if iface.streams.expired(index, now) {
+            iface.streams.close(index);
+            continue;
+        }
+
+        let mut retransmit = false;
+        let mut dead = false;
+        // Повтор ли это на самом деле. Сегмент, который **не ушёл** (адрес
+        // соседа выяснялся, и отправка вернула `Pending`), приходит сюда по
+        // тому же таймеру, но повторной передачей не является: первая попытка
+        // просто состоится сейчас. Считать её повтором значит завести счётчик,
+        // который на исправной сети никогда не ноль, — то есть бесполезный.
+        let mut counted = false;
+        if let Some(conn) = iface.streams.at(index) {
+            if conn.timed_out(now) {
+                if conn.gave_up() {
+                    dead = true;
+                } else {
+                    counted = conn.snd_nxt != conn.snd_una;
+                    conn.back_off(now);
+                    // Go-Back-N: всё неподтверждённое отправляется заново с
+                    // головы окна. Выборочного повтора у нас нет, потому что
+                    // нет и выборочных подтверждений.
+                    conn.snd_nxt = conn.snd_una;
+                    conn.fin_sent = false;
+                    retransmit = true;
+                }
+            }
+        }
+
+        if dead {
+            // Собеседник молчит столько, сколько мы согласны ждать. Соединение
+            // объявляется оборванным, а не остаётся висеть: программа должна
+            // получить отказ, а не ждать вечно.
+            if let Some(conn) = iface.streams.at(index) {
+                conn.reset = true;
+                conn.state = stream::State::Closed;
+            }
+            iface.counters.tcp_timeouts += 1;
+            continue;
+        }
+        if retransmit {
+            if counted {
+                iface.counters.tcp_retransmits += 1;
+            }
+            tcp_pump(iface, index);
+        }
     }
 }
 

@@ -263,6 +263,31 @@ fn execute(
         None => None,
     };
 
+    // Порт под проброс выбирается тем же приёмом, что и остальные: ядро
+    // операционной системы выдаёт свободный номер, сокет тут же закрывается, и
+    // номер уезжает в командную строку QEMU. Окно между закрытием и запуском
+    // теоретически даёт гонку с чужим процессом, но выбирать номер заранее — это
+    // гонка гарантированная, а не теоретическая.
+    let hostfwd = match scenario.guest_port {
+        0 => None,
+        guest => {
+            let probe = TcpListener::bind("127.0.0.1:0")
+                .context("не удалось занять порт под проброс")?;
+            let port = probe.local_addr()?.port();
+            drop(probe);
+            Some((port, guest))
+        }
+    };
+
+    // Эхо-сервер хоста поднимается до запуска гостя: гость подключается к нему
+    // в первые же секунды, и сервер, поднятый позже, встретил бы его отказом.
+    // Слушающий сокет живёт до конца сценария и закрывается вместе с ним.
+    let _host_echo = if scenario.host_echo {
+        Some(start_host_echo()?)
+    } else {
+        None
+    };
+
     let mut extra: Vec<String> = scenario.qemu_args(arch).iter().map(|s| (*s).to_string()).collect();
     extra.extend(scenario.extra.iter().map(|s| (*s).to_string()));
 
@@ -281,6 +306,7 @@ fn execute(
         pointer: if scenario.tablet { Pointer::Tablet } else { Pointer::Mouse },
         disk_bus: scenario.disk_bus,
         network: scenario.network,
+        hostfwd,
         allow_reboot: scenario.reboots,
         ..RunOptions::default()
     };
@@ -313,7 +339,16 @@ fn execute(
         None => None,
     };
 
-    let result = play(scenario, &mut child, &mut line, &mut hmp, qmp.as_mut(), prefix, shots);
+    let result = play(
+        scenario,
+        &mut child,
+        &mut line,
+        &mut hmp,
+        qmp.as_mut(),
+        prefix,
+        shots,
+        hostfwd.map(|(host, _)| host),
+    );
 
     // Обычно гость машину не выключает: `arch::halt()` — это остановка
     // процессора, а не снятие питания, и процесс приходится снимать. С фазы 27
@@ -339,6 +374,8 @@ fn play(
     mut qmp: Option<&mut qmp::Qmp>,
     prefix: &str,
     shots: &mut Vec<PathBuf>,
+    // Порт на хосте, проброшенный в гостя, — если сценарий его просил.
+    hostfwd: Option<u16>,
 ) -> Result<()> {
     let started = Instant::now();
     // Где сейчас указатель. Мышь относительная, абсолютных координат у неё нет,
@@ -573,6 +610,45 @@ fn play(
                 // читают именно то, что стенд успел принять.
                 std::thread::sleep(Duration::from_millis(300));
             }
+            Step::TcpEcho(text, timeout_ms) => {
+                let Some(port) = hostfwd else {
+                    bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
+                };
+                println!("  [{at:>6} мс] шаг {index}: с хоста на 127.0.0.1:{port} — \"{text}\"");
+                let echoed = tcp_echo(port, text.as_bytes(), *timeout_ms)
+                    .with_context(|| format!("шаг {index}"))?;
+                if echoed != text.as_bytes() {
+                    bail!(
+                        "шаг {index}: вернулось не то: {:?}",
+                        String::from_utf8_lossy(&echoed)
+                    );
+                }
+                println!("             вернулось {} байт, совпало", echoed.len());
+            }
+            Step::TcpBulk(kilobytes, timeout_ms) => {
+                let Some(port) = hostfwd else {
+                    bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
+                };
+                println!("  [{at:>6} мс] шаг {index}: {kilobytes} КиБ туда и обратно");
+                // Узор, а не нули: одинаковые байты сошлись бы и при
+                // перепутанном порядке сегментов, а такой — нет.
+                let payload: Vec<u8> = (0..kilobytes * 1024)
+                    .map(|i| (i % 251) as u8)
+                    .collect();
+                let echoed = tcp_echo(port, &payload, *timeout_ms)
+                    .with_context(|| format!("шаг {index}"))?;
+                if echoed.len() != payload.len() {
+                    bail!(
+                        "шаг {index}: отправлено {} байт, вернулось {}",
+                        payload.len(),
+                        echoed.len()
+                    );
+                }
+                if let Some(at) = echoed.iter().zip(&payload).position(|(a, b)| a != b) {
+                    bail!("шаг {index}: байт {at} вернулся изменённым");
+                }
+                println!("             {} байт совпали до последнего", echoed.len());
+            }
             Step::Shot(name) => {
                 println!("  [{at:>6} мс] шаг {index}: снимок '{name}'");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
@@ -586,6 +662,129 @@ fn play(
         }
     }
     Ok(())
+}
+
+/// Порт, на котором стенд поднимает эхо-сервер для гостя.
+///
+/// Фиксированный, а не выданный ядром ОС: адрес и порт записаны строкой в
+/// команде сценария (`echoc 10.0.2.2 2001 ...`), и подставить туда случайное
+/// число нечем. Занятый порт даст внятный отказ при запуске, а не загадочное
+/// поведение в середине прогона.
+const HOST_ECHO_PORT: u16 = 2001;
+
+/// Поднять на хосте эхо-сервер, к которому будет подключаться гость.
+///
+/// Возвращает поток, который живёт, пока идёт сценарий, и завершается сам, когда
+/// стенд закрывает слушающий сокет. Обслуживает соединения по одному: гость в
+/// сценарии подключается последовательно, а параллельный сервер потребовал бы
+/// пула потоков ради проверки, которой он не нужен.
+fn start_host_echo() -> Result<std::net::TcpListener> {
+    // Порт может быть ещё занят предыдущим прогоном: соединения, закрытые
+    // секунду назад, держат его в `TIME_WAIT` на стороне хоста, и два прогона
+    // подряд — обычное дело. Ждём и повторяем, а не падаем: отказ здесь
+    // выглядел бы как поломка сети в госте, которой нет.
+    let mut listener = None;
+    for attempt in 0..10 {
+        match std::net::TcpListener::bind(("127.0.0.1", HOST_ECHO_PORT)) {
+            Ok(bound) => {
+                listener = Some(bound);
+                break;
+            }
+            Err(err) if attempt == 9 => {
+                return Err(err).with_context(|| {
+                    format!("не удалось занять порт {HOST_ECHO_PORT} под эхо-сервер хоста")
+                });
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(300)),
+        }
+    }
+    let listener = listener.expect("цикл выше либо занял порт, либо вернул ошибку");
+    let worker = listener.try_clone().context("не удалось раздвоить слушающий сокет")?;
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for stream in worker.incoming() {
+            let Ok(mut stream) = stream else { break };
+            stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if stream.write_all(&buffer[..read]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Гость дочитывает эхо и ждёт нашего `FIN`: без него он просидит до
+            // своего таймаута, и сценарий увидит «ответ не пришёл» там, где
+            // ответ пришёл весь.
+            stream.shutdown(std::net::Shutdown::Both).ok();
+        }
+    });
+    Ok(listener)
+}
+
+/// Отправить гостю байты по проброшенному порту и собрать ответ.
+///
+/// Клиент здесь — обычный `TcpStream` стандартной библиотеки, и это главное:
+/// протокол на той стороне разговаривает не сам с собой. Отправка и приём
+/// разведены по двум потокам не ради скорости, а ради тупика, который иначе
+/// неизбежен: эхо-сервер отвечает по ходу, и отправитель, не читающий ответ,
+/// упирается в переполненное окно ровно тогда, когда получатель ждёт, пока он
+/// закончит отправлять.
+fn tcp_echo(port: u16, payload: &[u8], timeout_ms: u64) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let deadline = Duration::from_millis(timeout_ms);
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&address, deadline)
+        .with_context(|| format!("не удалось подключиться к 127.0.0.1:{port}"))?;
+    stream.set_read_timeout(Some(deadline))?;
+    stream.set_write_timeout(Some(deadline))?;
+    // Отключаем алгоритм Нейгла: он придерживает мелкие отправки, а мы меряем
+    // не пропускную способность, а то, что байты дошли.
+    stream.set_nodelay(true).ok();
+
+    let mut writer = stream.try_clone().context("не удалось раздвоить сокет")?;
+    let outgoing = payload.to_vec();
+    let sender = std::thread::spawn(move || -> std::io::Result<()> {
+        writer.write_all(&outgoing)?;
+        writer.flush()?;
+        // Половина закрывается сразу после отправки: так гость узнаёт, что
+        // продолжения не будет, и отвечает своим `FIN`. Без этого приём ниже
+        // ждал бы до таймаута даже при исправном обмене.
+        //
+        // Ошибка здесь **игнорируется**, и это не небрежность: гость успевает
+        // ответить эхом и закрыться раньше, чем мы дойдём до этой строки, и
+        // тогда Windows отвечает `WSAENOTCONN` на закрытие уже закрытого
+        // соединения. Успешность обмена проверяется сравнением байт ниже, а не
+        // тем, кто первым положил трубку.
+        let _ = writer.shutdown(std::net::Shutdown::Write);
+        Ok(())
+    });
+
+    let mut echoed = Vec::with_capacity(payload.len());
+    let mut chunk = [0u8; 4096];
+    while echoed.len() < payload.len() {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => echoed.extend_from_slice(&chunk[..read]),
+            Err(err) => {
+                sender.join().ok();
+                return Err(err).context("чтение эха оборвалось");
+            }
+        }
+    }
+
+    match sender.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err).context("отправка оборвалась"),
+        Err(_) => bail!("поток отправки упал"),
+    }
+    Ok(echoed)
 }
 
 /// Переместить указатель из точки в точку.

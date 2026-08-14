@@ -36,6 +36,12 @@ pub struct RunOptions {
     pub disk_bus: DiskBus,
     /// Подключена ли к машине сетевая карта.
     pub network: bool,
+    /// Проброс порта: `(порт на хосте, порт в госте)`.
+    ///
+    /// Единственный способ достучаться до гостя снаружи через SLIRP: сеть за
+    /// трансляцией адресов, и входящих соединений в ней не бывает — кроме тех,
+    /// о которых попросили заранее.
+    pub hostfwd: Option<(u16, u16)>,
     /// Разрешить машине перезагружаться.
     ///
     /// По умолчанию QEMU запускается с `-no-reboot`, и это защита: перезагрузка,
@@ -98,6 +104,7 @@ impl Default for RunOptions {
             pointer: Pointer::Mouse,
             disk_bus: DiskBus::Virtio,
             network: false,
+            hostfwd: None,
             allow_reboot: false,
         }
     }
@@ -504,7 +511,13 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
         // Оговорка, которую стоит держать в голове: снаружи внутрь ICMP через
         // SLIRP не проходит вовсе, поэтому пропинговать гостя с хоста нельзя ни
         // при каких настройках. Проверяется поэтому обратное направление.
-        cmd.args(["-netdev", "user,id=net0"]);
+        let netdev = match opts.hostfwd {
+            Some((host, guest)) => {
+                format!("user,id=net0,hostfwd=tcp:127.0.0.1:{host}-:{guest}")
+            }
+            None => "user,id=net0".to_string(),
+        };
+        cmd.args(["-netdev", &netdev]);
         cmd.args(["-device", "virtio-net-pci,netdev=net0"]);
     } else {
         // Без сети машина не тратит время на попытки PXE-загрузки в UEFI.

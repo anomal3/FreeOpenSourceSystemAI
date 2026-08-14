@@ -39,9 +39,10 @@ use user_abi::{
     SYS_WINSIZE, SYS_WRITE, SYS_YIELD, Stat, TTY_RAW, WAIT_NOHANG,
 };
 use user_abi::{
-    ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_UDP, SYS_BIND,
-    SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_NETCONF, SYS_NETINFO, SYS_PEER, SYS_RECV, SYS_RESOLVE,
-    SYS_SEND, SYS_SOCKET,
+    ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
+    StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
+    SYS_NETINFO, SYS_PEER, SYS_RECV, SYS_RESOLVE, SYS_SEND, SYS_SHUTDOWN, SYS_SOCKET,
+    SYS_STREAMSTATE,
 };
 
 use crate::net::{self, NetError};
@@ -131,6 +132,10 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_SEND => send(a0, a1, a2),
         SYS_RECV => recv(a0, a1, a2),
         SYS_PEER => peer(a0, a1),
+        SYS_LISTEN => listen(a0),
+        SYS_ACCEPT => accept(a0),
+        SYS_SHUTDOWN => shutdown(a0),
+        SYS_STREAMSTATE => streamstate(a0, a1),
         SYS_CLOSE_SOCKET => close_socket(a0),
         SYS_NETCONF => netconf(a0, a1),
         SYS_NETINFO => netinfo(a0, a1),
@@ -592,16 +597,23 @@ fn copy_path<'a>(ptr: usize, len: usize, buffer: &'a mut [u8; MAX_PATH]) -> Resu
 // Сеть
 // ---------------------------------------------------------------------------
 
+/// Номер соединения TCP, если это он.
+fn as_stream(index: usize) -> Option<usize> {
+    index.checked_sub(STREAM_FIRST)
+}
+
 /// `socket(kind) -> номер сокета`.
 fn socket(kind: usize) -> i64 {
-    if kind != SOCK_UDP {
-        // TCP появится в следующей фазе, и до тех пор честный отказ лучше
-        // сокета, который заведётся и не будет работать.
-        return ERR_UNSUPPORTED;
-    }
-    match net::socket_open(sched::current()) {
-        Ok(index) => index as i64,
-        Err(err) => net_errno(err),
+    match kind {
+        SOCK_UDP => match net::socket_open(sched::current()) {
+            Ok(index) => index as i64,
+            Err(err) => net_errno(err),
+        },
+        SOCK_TCP => match net::stream_open(sched::current()) {
+            Ok(index) => (index + STREAM_FIRST) as i64,
+            Err(err) => net_errno(err),
+        },
+        _ => ERR_UNSUPPORTED,
     }
 }
 
@@ -610,21 +622,93 @@ fn bind(index: usize, port: usize) -> i64 {
     let Ok(port) = u16::try_from(port) else {
         return ERR_BAD_ADDRESS;
     };
-    match net::socket_bind(sched::current(), index, port) {
+    let result = match as_stream(index) {
+        Some(stream) => net::stream_bind(sched::current(), stream, port),
+        None => net::socket_bind(sched::current(), index, port),
+    };
+    match result {
         Ok(port) => i64::from(port),
         Err(err) => net_errno(err),
     }
 }
 
-/// `connect(сокет, адрес, порт) -> локальный порт`.
+/// `connect(сокет, адрес, порт) -> локальный порт или 0`.
 fn connect(index: usize, address: usize, port: usize) -> i64 {
     let (Ok(address), Ok(port)) = (u32::try_from(address), u16::try_from(port)) else {
         return ERR_BAD_ADDRESS;
     };
+    if let Some(stream) = as_stream(index) {
+        // У потока `connect` только начинает рукопожатие: установления связи
+        // придётся подождать, и узнать о нём — через `SYS_STREAMSTATE`.
+        // Возвращать «готово» здесь значило бы соврать.
+        return match net::stream_connect(sched::current(), stream, Ipv4(address), port) {
+            Ok(()) => 0,
+            Err(err) => net_errno(err),
+        };
+    }
     match net::socket_connect(sched::current(), index, Ipv4(address), port) {
         Ok(local) => i64::from(local),
         Err(err) => net_errno(err),
     }
+}
+
+/// `listen(сокет) -> 0`.
+fn listen(index: usize) -> i64 {
+    let Some(stream) = as_stream(index) else {
+        // Датаграммы не слушают: у них нет соединений, которые можно было бы
+        // принимать.
+        return ERR_UNSUPPORTED;
+    };
+    match net::stream_listen(sched::current(), stream) {
+        Ok(()) => 0,
+        Err(err) => net_errno(err),
+    }
+}
+
+/// `accept(сокет) -> номер нового соединения`.
+fn accept(index: usize) -> i64 {
+    let Some(stream) = as_stream(index) else {
+        return ERR_UNSUPPORTED;
+    };
+    match net::stream_accept(sched::current(), stream) {
+        Ok(Some(accepted)) => (accepted + STREAM_FIRST) as i64,
+        Ok(None) => ERR_AGAIN,
+        Err(err) => net_errno(err),
+    }
+}
+
+/// `shutdown(сокет) -> 0`.
+fn shutdown(index: usize) -> i64 {
+    let Some(stream) = as_stream(index) else {
+        return ERR_UNSUPPORTED;
+    };
+    match net::stream_shutdown(sched::current(), stream) {
+        Ok(()) => 0,
+        Err(err) => net_errno(err),
+    }
+}
+
+/// `streamstate(сокет, out) -> 0`.
+fn streamstate(index: usize, out: usize) -> i64 {
+    let Some(stream) = as_stream(index) else {
+        return ERR_UNSUPPORTED;
+    };
+    if !space::user_can(out, size_of::<StreamState>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    let (state, peer_closed, reset) = match net::stream_state(sched::current(), stream) {
+        Ok(state) => state,
+        Err(err) => return net_errno(err),
+    };
+    let value = StreamState {
+        open: u8::from(state.is_open()),
+        peer_closed: u8::from(peer_closed),
+        reset: u8::from(reset),
+        _reserved: 0,
+    };
+    // SAFETY: диапазон проверен на запись и вмещает структуру целиком.
+    unsafe { core::ptr::write_unaligned(out as *mut StreamState, value) };
+    0
 }
 
 /// `send(сокет, ptr, len) -> len`.
@@ -636,7 +720,11 @@ fn send(index: usize, ptr: usize, len: usize) -> i64 {
     // исполняются по очереди на одном процессоре, поэтому менять эти байты во
     // время чтения некому.
     let data = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-    match net::socket_send(sched::current(), index, data) {
+    let result = match as_stream(index) {
+        Some(stream) => net::stream_send(sched::current(), stream, data),
+        None => net::socket_send(sched::current(), index, data),
+    };
+    match result {
         Ok(sent) => sent as i64,
         Err(err) => net_errno(err),
     }
@@ -647,6 +735,19 @@ fn recv(index: usize, ptr: usize, len: usize) -> i64 {
     if !space::user_can(ptr, len, PageFlags::WRITE) {
         return ERR_BAD_ADDRESS;
     }
+
+    if let Some(stream) = as_stream(index) {
+        // SAFETY: диапазон проверен по таблицам программы на запись.
+        let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+        return match net::stream_recv(sched::current(), stream, out) {
+            // Ноль означает «пока ничего»; конец потока программа узнаёт
+            // отдельным вызовом, потому что это другое утверждение.
+            Ok(0) => ERR_AGAIN,
+            Ok(taken) => taken as i64,
+            Err(err) => net_errno(err),
+        };
+    }
+
     let received = match net::socket_recv(sched::current(), index) {
         // Пустая очередь — это «ещё не сейчас», а не ошибка: программа сама
         // решит, спать ей или сдаться.
@@ -686,7 +787,11 @@ fn peer(index: usize, out: usize) -> i64 {
 
 /// `close_socket(сокет) -> 0`.
 fn close_socket(index: usize) -> i64 {
-    match net::socket_close(sched::current(), index) {
+    let result = match as_stream(index) {
+        Some(stream) => net::stream_close(sched::current(), stream),
+        None => net::socket_close(sched::current(), index),
+    };
+    match result {
         Ok(()) => 0,
         Err(err) => net_errno(err),
     }
@@ -780,6 +885,18 @@ fn net_errno(err: NetError) -> i64 {
         NetError::BadName => ERR_BAD_PATH,
         NetError::NoSuchName => ERR_NOT_FOUND,
         NetError::Device(_) => ERR_IO,
+        NetError::Stream(err) => match err {
+            crate::net::stream::StreamError::TooMany => ERR_TOO_MANY_FILES,
+            crate::net::stream::StreamError::BadStream => ERR_BAD_SOCKET,
+            crate::net::stream::StreamError::PortTaken(_) => ERR_EXISTS,
+            // «Ещё не установлено», «буфер полон» и «нечего принимать» — это
+            // всё «спросите позже», и программа поступает с ними одинаково.
+            crate::net::stream::StreamError::NotConnected
+            | crate::net::stream::StreamError::WouldBlock => ERR_AGAIN,
+            crate::net::stream::StreamError::Reset => ERR_IO,
+            crate::net::stream::StreamError::NotListening
+            | crate::net::stream::StreamError::Closed => ERR_UNSUPPORTED,
+        },
         NetError::Socket(err) => match err {
             crate::net::socket::SocketError::TooMany => ERR_TOO_MANY_FILES,
             crate::net::socket::SocketError::BadSocket => ERR_BAD_SOCKET,

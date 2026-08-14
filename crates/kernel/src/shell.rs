@@ -502,6 +502,7 @@ fn run_command(line: &str) -> bool {
             }
         }
         "arp" => arp_table(),
+        "tcp" => connections(),
         "resolve" => {
             if argument.is_empty() {
                 sprintln!("  usage: resolve <name>");
@@ -648,6 +649,45 @@ fn ip(argument: &str) {
         status.sockets.0,
         status.sockets.1
     );
+    sprintln!(
+        "  tcp      {} in, {} out, {} retransmitted, {} reset, {} timed out",
+        status.counters.tcp_in,
+        status.counters.tcp_out,
+        status.counters.tcp_retransmits,
+        status.counters.tcp_resets,
+        status.counters.tcp_timeouts
+    );
+    sprintln!(
+        "  streams  {} open, {} established",
+        status.streams.0,
+        status.streams.1
+    );
+}
+
+/// Соединения TCP и их состояния.
+///
+/// Нужна ровно затем, зачем в чужих системах нужен `netstat`: «программа не
+/// отвечает» и «соединение висит в `close-wait`» — это один и тот же симптом с
+/// двумя разными причинами, и различить их можно только списком.
+fn connections() {
+    if !crate::net::is_present() {
+        sprintln!("  no network card in this machine");
+        return;
+    }
+    let table = crate::net::stream_table();
+    if table.is_empty() {
+        sprintln!("  no connections");
+        return;
+    }
+    for (index, state, local, remote, port, send, recv) in table {
+        if remote.is_unspecified() {
+            sprintln!("  #{index:<2} {state:<14} port {local}");
+        } else {
+            sprintln!(
+                "  #{index:<2} {state:<14} port {local} <-> {remote}:{port}, {send} to send, {recv} to read"
+            );
+        }
+    }
 }
 
 /// Спросить у сервера имён адрес.

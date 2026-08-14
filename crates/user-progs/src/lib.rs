@@ -28,13 +28,14 @@ use user_abi::{
 };
 
 use user_abi::{
-    SOCK_UDP, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_NETCONF, SYS_NETINFO, SYS_PEER,
-    SYS_RECV, SYS_RESOLVE, SYS_SEND, SYS_SOCKET,
+    SOCK_TCP, SOCK_UDP, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN,
+    SYS_NETCONF, SYS_NETINFO, SYS_PEER, SYS_RECV, SYS_RESOLVE, SYS_SEND, SYS_SHUTDOWN,
+    SYS_SOCKET, SYS_STREAMSTATE,
 };
 
 pub use user_abi::{
     Dirent, ERR_AGAIN, ERR_NO_NETWORK, ERR_NO_TASK, KIND_DIRECTORY, KIND_FILE, NetConfig, NetInfo,
-    Peer, SEEK_CUR, SEEK_END, SEEK_SET,
+    Peer, SEEK_CUR, SEEK_END, SEEK_SET, StreamState,
 };
 
 /// Выполнить системный вызов.
@@ -648,6 +649,73 @@ pub fn read_at(fd: i64, offset: u64, buffer: &mut [u8]) -> i64 {
 pub fn socket() -> i64 {
     // SAFETY: аргумент — число.
     unsafe { syscall(SYS_SOCKET, SOCK_UDP, 0, 0) }
+}
+
+/// Завести соединение TCP.
+pub fn stream() -> i64 {
+    // SAFETY: аргумент — число.
+    unsafe { syscall(SYS_SOCKET, SOCK_TCP, 0, 0) }
+}
+
+/// Начать слушать входящие соединения.
+pub fn listen(socket: i64) -> i64 {
+    if socket < 0 {
+        return socket;
+    }
+    // SAFETY: аргумент — число.
+    unsafe { syscall(SYS_LISTEN, socket as usize, 0, 0) }
+}
+
+/// Забрать установленное соединение. `ERR_AGAIN` — очередь пуста.
+pub fn accept(socket: i64) -> i64 {
+    if socket < 0 {
+        return socket;
+    }
+    // SAFETY: аргумент — число.
+    unsafe { syscall(SYS_ACCEPT, socket as usize, 0, 0) }
+}
+
+/// Закрыть свою половину соединения: читать можно, писать больше нет.
+pub fn shutdown(socket: i64) -> i64 {
+    if socket < 0 {
+        return socket;
+    }
+    // SAFETY: аргумент — число.
+    unsafe { syscall(SYS_SHUTDOWN, socket as usize, 0, 0) }
+}
+
+/// Состояние соединения.
+pub fn stream_state(socket: i64) -> Option<StreamState> {
+    if socket < 0 {
+        return None;
+    }
+    let mut out = StreamState::default();
+    // SAFETY: структура живёт в памяти программы.
+    let result = unsafe {
+        syscall(SYS_STREAMSTATE, socket as usize, (&raw mut out) as usize, 0)
+    };
+    (result == 0).then_some(out)
+}
+
+/// Дождаться, пока соединение установится.
+///
+/// Возвращает `false`, если за отведённое время связь не поднялась или была
+/// оборвана. Ожидание здесь, а не в ядре, намеренно: сколько ждать — решение
+/// программы, и она же решает, чем заняться, пока ждёт.
+pub fn wait_connected(socket: i64, timeout_ms: u64) -> bool {
+    let deadline = uptime_ms() + timeout_ms;
+    loop {
+        match stream_state(socket) {
+            Some(state) if state.reset != 0 => return false,
+            Some(state) if state.open != 0 => return true,
+            Some(_) => {}
+            None => return false,
+        }
+        if uptime_ms() >= deadline {
+            return false;
+        }
+        sleep_ms(5);
+    }
 }
 
 /// Привязать сокет к порту; ноль означает «любой свободный».

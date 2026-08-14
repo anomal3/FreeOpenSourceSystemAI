@@ -277,6 +277,16 @@ impl Table {
             .ok_or(SocketError::BadSocket)
     }
 
+    /// Выдать свободный эфемерный порт наружу — соединениям TCP.
+    ///
+    /// Счётчик один на оба протокола. Порты у TCP и UDP формально независимы, и
+    /// два счётчика были бы законны; но тогда одно и то же число оказывалось бы
+    /// занято дважды разными протоколами, и в журнале это выглядело бы как
+    /// путаница, которую надо каждый раз распутывать заново.
+    pub fn pick_port(&mut self) -> Result<u16, SocketError> {
+        self.pick_ephemeral()
+    }
+
     /// Выдать свободный порт из эфемерного диапазона.
     fn pick_ephemeral(&mut self) -> Result<u16, SocketError> {
         let taken = |slots: &[Option<Socket>; MAX_SOCKETS], port: u16| {

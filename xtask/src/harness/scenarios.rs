@@ -159,6 +159,23 @@ pub enum Step {
     /// кнопку — обработчик прерывания и служебная задача, и путь от чипсета до
     /// сброса тома на диск проверяется только так.
     PowerButton,
+    /// Подключиться к гостю **с хоста** по проброшенному порту, отправить текст
+    /// и убедиться, что он вернулся тем же.
+    ///
+    /// Это единственная проверка стенда, которая ничего не читает в серийной
+    /// линии, и в этом весь смысл: сюда стучится обычный клиент TCP из обычной
+    /// стандартной библиотеки — то есть чужая реализация протокола, ничего не
+    /// знающая о том, как он написан у нас. Сойдётся окно, номера, контрольные
+    /// суммы и закрытие — обмен состоится; ошибёмся в любом из них — соединение
+    /// либо не установится, либо повиснет.
+    TcpEcho(&'static str, u64),
+    /// То же, но большим потоком: сколько килобайт отправить туда и обратно.
+    ///
+    /// Отдельным шагом, потому что проверяет другое. Короткая строка проходит
+    /// одним сегментом, и на ней не видно ни окна, ни продолжения потока;
+    /// килобайты идут несколькими сегментами, требуют подтверждений по ходу и
+    /// упираются в буфер приёма на той стороне.
+    TcpBulk(usize, u64),
     /// Дождаться, пока **процесс QEMU завершится сам** (мс).
     ///
     /// Самая сильная проверка выключения из возможных: до этой фазы стенд
@@ -207,6 +224,20 @@ pub struct Scenario {
     /// проверка того, что система без карты поднимается молча и без жалоб. Сеть
     /// включается там, где её проверяют.
     pub network: bool,
+    /// Порт гостя, который стенд пробрасывает с хоста. Ноль — не пробрасывать.
+    ///
+    /// Нужен там, где проверяется **входящее** соединение. Через SLIRP иначе
+    /// никак: сеть за трансляцией адресов, и снаружи внутрь не проходит ничего,
+    /// о чём не попросили заранее.
+    pub guest_port: u16,
+    /// Поднять на хосте эхо-сервер, к которому подключается **гость**.
+    ///
+    /// Обратное направление к [`Scenario::guest_port`], и оно проверяет другую
+    /// половину автомата: активное открытие, где `SYN` посылаем мы. Гость видит
+    /// хост как `10.0.2.2` — так устроена пользовательская сеть QEMU, и порт
+    /// здесь фиксированный (2001), потому что команда в сценарии записана
+    /// строкой и подставить в неё случайный номер нечем.
+    pub host_echo: bool,
     /// Архитектуры, на которых сценарий имеет смысл. Пусто — все.
     pub arches: &'static [Arch],
     /// Сценарий **намеренно** перезагружает машину.
@@ -262,6 +293,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -295,6 +328,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -348,6 +383,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -449,6 +486,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -517,6 +556,8 @@ pub const ALL: &[Scenario] = &[
         tablet: true,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -578,6 +619,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -637,6 +680,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[Arch::X86_64],
         reboots: false,
         updates: false,
@@ -672,6 +717,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -808,6 +855,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -875,6 +924,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -918,6 +969,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -963,6 +1016,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1022,6 +1077,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1071,6 +1128,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1125,6 +1184,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1160,6 +1221,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         // Только AArch64: на x86-64 GIC не существует.
         arches: &[Arch::Aarch64],
         reboots: false,
@@ -1197,6 +1260,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1220,6 +1285,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1244,6 +1311,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1300,6 +1369,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1372,6 +1443,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1453,6 +1526,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1554,6 +1629,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1590,6 +1667,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         // Единственный сценарий, в котором перезагрузка — цель, а не симптом.
         reboots: true,
@@ -1651,6 +1730,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         // Сброс посреди работы — это и есть та поломка, ради которой фаза
         // существует; после него машина обязана подняться сама.
@@ -1704,6 +1785,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1762,6 +1845,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         // Только x86-64, и это не упущение. В QEMU `virt` кнопку приносит ACPI
         // GED, описанный в AML: без интерпретатора событие не разобрать, и ядро
         // говорит об этом вслух при загрузке. Проверяем то, что работает.
@@ -1792,6 +1877,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Ahci,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1839,6 +1926,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Nvme,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1880,6 +1969,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1981,6 +2072,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2048,6 +2141,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         // Четыре загрузки в одном процессе QEMU: три неудачные попытки и
         // возврат.
@@ -2122,6 +2217,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         // Две загрузки в одном процессе: до обновления и после.
         reboots: true,
@@ -2185,6 +2282,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Nvme4k,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2231,6 +2330,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Nvme4k,
         network: false,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2270,6 +2371,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: true,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2327,6 +2430,74 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "tcp",
+        about: "Эхо-сервер в системе: чужой клиент с хоста шлёт байты и получает их обратно.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        guest_port: 2000,
+        host_echo: true,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        extra: &[],
+        steps: &[
+            // Адрес берётся у DHCP: сервер, которому его задали руками, проверял
+            // бы меньше.
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
+            Step::Wait(2_000),
+
+            Step::Line("run -b /bin/echod"),
+            Step::AwaitAny("echod: listening on port 2000", 30_000),
+
+            // Первое соединение. Всё, что должно сработать, срабатывает разом:
+            // рукопожатие из трёх сегментов, подтверждения, закрытие с обеих
+            // сторон. Клиент — обычный `TcpStream` с хоста, то есть чужая
+            // реализация протокола.
+            Step::TcpEcho("hello from the host", 20_000),
+            Step::AwaitAny("echod: client accepted", 15_000),
+
+            // Второе соединение подряд — проверка того, что первое закрылось
+            // по-настоящему: слот вернулся, порт остался слушающим.
+            Step::TcpEcho("and again", 20_000),
+
+            // А теперь поток, который не помещается в один сегмент и в одно
+            // окно: восемь килобайт туда и обратно, с узором, по которому видно
+            // перестановку байт. Здесь работают и продолжение потока, и
+            // подтверждения по ходу, и приёмный буфер на той стороне.
+            Step::TcpBulk(8, 60_000),
+
+            // Обратное направление: теперь `SYN` посылаем мы. Это другая
+            // половина автомата (`SYN_SENT` и ожидание `SYN+ACK`), и без неё
+            // она осталась бы написанной, но непроверенной. Отвечает эхо-сервер
+            // **на хосте**: гость видит его как `10.0.2.2` — так устроена
+            // пользовательская сеть QEMU.
+            Step::Line("run /bin/echoc 10.0.2.2 2001 outbound-hello"),
+            Step::Await("echoc: got back 14 bytes: outbound-hello", 30_000),
+
+            // Соединений после обмена не осталось — ни одного повисшего.
+            Step::Line("tcp"),
+            Step::Await("listen", 15_000),
+
+            // И счётчики: сегменты ходили, повторных передач не потребовалось.
+            // Ненулевой повтор в эмуляторе означал бы, что мы теряем сегменты
+            // сами — сеть здесь идеальная.
+            Step::Line("ip"),
+            Step::AtLeast("  tcp      ", 20, 15_000),
+            // Ожидание, а не мгновенная проверка: строка длинная, и к моменту,
+            // когда стенд прочитал из неё число, хвост ещё дописывался. `Expect`
+            // смотрит на то, что уже пришло, и падал здесь через раз — на
+            // «0 retransmitte».
+            Step::Await("0 retransmitted", 15_000),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "dns",
         about: "Имя превращается в адрес: запрос уходит серверу, которого назвал DHCP.",
         target: Target::Live,
@@ -2334,6 +2505,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: true,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2380,6 +2553,8 @@ pub const ALL: &[Scenario] = &[
         tablet: false,
         disk_bus: DiskBus::Virtio,
         network: true,
+        guest_port: 0,
+        host_echo: false,
         arches: &[],
         reboots: false,
         updates: false,
