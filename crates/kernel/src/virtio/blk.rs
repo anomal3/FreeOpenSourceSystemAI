@@ -15,6 +15,9 @@
 //! страниц, ни про кеш. Копирование через [`crate::mm::dma`] — единственный
 //! способ дать ему адрес, по которому лежит именно то, что мы имели в виду.
 
+use alloc::vec::Vec;
+
+use crate::kprintln;
 use core::sync::atomic::{Ordering, fence};
 
 use super::{
@@ -91,6 +94,58 @@ impl VirtioBlk {
 
         // SAFETY: контракт функции.
         unsafe { Self::attach(&device) }
+    }
+
+    /// Поднять **все** контроллеры virtio-blk, какие есть на шине.
+    ///
+    /// # Почему это не то же самое, что [`VirtioBlk::probe`]
+    ///
+    /// Потому что дисков бывает больше одного, и это не редкий случай, а
+    /// обычный: сразу после установки в машине стоят два — тот, на который
+    /// поставили, и тот, с которого ставили. Ядро, поднимавшее только первый,
+    /// находило на нём один лишь ESP установочного носителя, не находило
+    /// корневого раздела и оставалось на initrd. Со стороны это выглядит как
+    /// «установка не сработала», хотя сработала она полностью: система на
+    /// диске есть, просто ядро на неё не посмотрело.
+    ///
+    /// Отказ отдельного устройства пропускается, а не прекращает перебор:
+    /// неисправный диск не должен отменять исправный.
+    ///
+    /// # Safety
+    ///
+    /// См. [`VirtioBlk::probe`].
+    pub unsafe fn probe_all(root: &pci::Root) -> Vec<Self> {
+        let mut found = Vec::new();
+        let mut devices = Vec::new();
+
+        // Устройства сначала собираются, и только потом поднимаются: `attach`
+        // трогает конфигурационное пространство и BAR, а перебор шины идёт по
+        // тем же окнам. Смешивать одно с другим — значит менять то, по чему
+        // идёшь.
+        //
+        // SAFETY: контракт функции.
+        unsafe {
+            pci::for_each(root, |device| {
+                if device.vendor == pci::VENDOR_VIRTIO
+                    && (device.device == pci::DEVICE_VIRTIO_BLK_LEGACY
+                        || device.device == pci::DEVICE_VIRTIO_BLK_MODERN)
+                {
+                    devices.push(*device);
+                }
+                true
+            });
+        }
+
+        for device in devices {
+            // SAFETY: контракт функции.
+            match unsafe { Self::attach(&device) } {
+                Ok(disk) => found.push(disk),
+                Err(err) => {
+                    kprintln!("  disk        : virtio-blk at {} unusable: {err}", device.address);
+                }
+            }
+        }
+        found
     }
 
     /// Подготовить найденное устройство.

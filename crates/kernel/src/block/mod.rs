@@ -98,14 +98,23 @@ impl Disk {
 pub unsafe fn probe_all(root: &pci::Root) -> Vec<Disk> {
     let mut disks = Vec::new();
 
+    // Все, а не первый. Машина сразу после установки — это два диска: тот, на
+    // который поставили, и тот, с которого ставили; корневой раздел есть
+    // только на одном из них, и который из них первый на шине, не решает
+    // никто. Ядро, смотревшее только на первый, оставалось на initrd и
+    // выглядело так, будто установка не удалась.
+    //
     // SAFETY: контракт функции.
-    match unsafe { virtio::blk::VirtioBlk::probe(root) } {
-        Ok(device) => disks.push(Disk {
+    let virtio_disks = unsafe { virtio::blk::VirtioBlk::probe_all(root) };
+    if virtio_disks.is_empty() {
+        kprintln!("  disk        : no virtio-blk on this machine");
+    }
+    for (unit, device) in virtio_disks.into_iter().enumerate() {
+        disks.push(Disk {
             kind: Kind::VirtioBlk,
-            unit: 0,
+            unit,
             device: Box::new(device),
-        }),
-        Err(err) => kprintln!("  disk        : no virtio-blk ({err})"),
+        });
     }
 
     // SAFETY: контракт функции.
