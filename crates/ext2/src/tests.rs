@@ -730,3 +730,112 @@ fn a_volume_on_a_4kn_medium_is_read_by_the_foreign_driver() {
     let content = foreign.read("/on-4kn.txt").expect("файл читается снаружи");
     assert_eq!(content, b"written on a 4Kn medium");
 }
+
+/// Переименование — это переезд **записи каталога**, а не копирование
+/// содержимого. Проверяется это чужой реализацией: она читает том по имени и
+/// обязана найти те же байты под новым именем и ничего под старым.
+#[test]
+fn renaming_moves_the_name_and_not_the_contents() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    editor
+        .create_file(&mut dev, ROOT_INODE, "before.txt", b"payload", 0o644, 0, 0)
+        .expect("файл");
+    editor
+        .rename(&mut dev, ROOT_INODE, "before.txt", ROOT_INODE, "after.txt")
+        .expect("переименование");
+    editor.flush(&mut dev).expect("сброс");
+
+    let fs = foreign(&dev);
+    assert_eq!(fs.read_to_string("/after.txt").expect("новое имя"), "payload");
+    assert!(fs.read("/before.txt").is_err(), "старого имени больше нет");
+}
+
+/// Переезд файла в другой каталог — то же самое, только запись появляется не
+/// там, где исчезла.
+#[test]
+fn renaming_moves_a_file_between_directories() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    let target = editor
+        .mkdir(&mut dev, ROOT_INODE, "sub", 0o755, 0, 0)
+        .expect("каталог");
+    editor
+        .create_file(&mut dev, ROOT_INODE, "moving.txt", b"contents", 0o644, 0, 0)
+        .expect("файл");
+    editor
+        .rename(&mut dev, ROOT_INODE, "moving.txt", target, "moved.txt")
+        .expect("переезд");
+    editor.flush(&mut dev).expect("сброс");
+
+    let fs = foreign(&dev);
+    assert_eq!(
+        fs.read_to_string("/sub/moved.txt").expect("новое место"),
+        "contents"
+    );
+    assert!(fs.read("/moving.txt").is_err(), "по старому пути пусто");
+}
+
+/// Занятое имя не перезаписывается молча. `rename` в POSIX заменяет приёмник —
+/// и это ровно то место, где программа теряет файл, о котором не знала.
+#[test]
+fn renaming_onto_an_existing_name_is_refused() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    editor
+        .create_file(&mut dev, ROOT_INODE, "one.txt", b"first", 0o644, 0, 0)
+        .expect("первый");
+    editor
+        .create_file(&mut dev, ROOT_INODE, "two.txt", b"second", 0o644, 0, 0)
+        .expect("второй");
+
+    assert!(matches!(
+        editor.rename(&mut dev, ROOT_INODE, "one.txt", ROOT_INODE, "two.txt"),
+        Err(Error::Exists)
+    ));
+    editor.flush(&mut dev).expect("сброс");
+
+    // Оба файла на месте и не перепутаны.
+    let fs = foreign(&dev);
+    assert_eq!(fs.read_to_string("/one.txt").expect("первый"), "first");
+    assert_eq!(fs.read_to_string("/two.txt").expect("второй"), "second");
+}
+
+/// Каталог не переезжает к другому родителю: внутри него лежит «..», и оставить
+/// его указывающим на прежнего родителя значило бы испортить дерево.
+#[test]
+fn renaming_a_directory_across_parents_is_refused() {
+    let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
+    writer.flush(&mut dev).expect("сброс");
+
+    let mut editor = reopened(&mut dev);
+    let target = editor
+        .mkdir(&mut dev, ROOT_INODE, "target", 0o755, 0, 0)
+        .expect("приёмник");
+    editor
+        .mkdir(&mut dev, ROOT_INODE, "moving", 0o755, 0, 0)
+        .expect("каталог");
+
+    assert!(matches!(
+        editor.rename(&mut dev, ROOT_INODE, "moving", target, "moved"),
+        Err(Error::Unsupported)
+    ));
+
+    // А на месте — можно: родитель тот же, «..» не меняется.
+    editor
+        .rename(&mut dev, ROOT_INODE, "moving", ROOT_INODE, "renamed")
+        .expect("переименование на месте");
+    editor.flush(&mut dev).expect("сброс");
+
+    // Проверяет это чужой драйвер, а не наш: каталог обязан быть виден под
+    // новым именем и не виден под старым.
+    let fs = foreign(&dev);
+    assert!(fs.exists("/renamed").expect("новое имя читается"));
+    assert!(!fs.exists("/moving").expect("старое имя читается"));
+}

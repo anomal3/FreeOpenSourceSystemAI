@@ -28,7 +28,7 @@ use crate::input::{self, KeyCode};
 use crate::sync::Mutex;
 use crate::vfs::perm::Access;
 use crate::vfs::{NodeKind, VfsError};
-use crate::{fs, irq, kprint, mm, sched, time, ui, usb, user};
+use crate::{fs, irq, kprint, mm, sched, time, tty, ui, usb, user};
 
 /// Приглашение к вводу.
 const PROMPT: &str = "freeos> ";
@@ -111,7 +111,11 @@ impl fmt::Write for Raw {
 
 /// Куда на самом деле уходит вывод оболочки.
 fn write_raw(text: &str) {
-    if ui::is_active() {
+    // Условие — «есть ли графика вообще», а не «свободен ли стол прямо сейчас».
+    // Разница появилась в Phase 29: разбор управляющих последовательностей
+    // живёт за [`ui::write`], и пропускать его потому, что в этот момент
+    // рисовался кадр, значит терять команды терминала через раз.
+    if ui::graphics() {
         // Композитор поднят: на экране окна, и загрузочная консоль экран уже
         // отдала. В serial при этом пишем сами — `kprint!` туда бы написал,
         // но заодно попытался бы рисовать.
@@ -197,7 +201,20 @@ pub fn task() {
                         ui::set_cursor(false);
                         return;
                     }
-                    sprint!("{PROMPT}");
+                    // Программа переднего плана могла оставить в терминале
+                    // начало следующей команды — забрать его надо **здесь**, а
+                    // не на следующем витке. Разбор очереди событий продолжится
+                    // сразу за этой строкой, и хвост той же команды приехал бы
+                    // в пустой редактор: `run /bin/crash` разъезжался на
+                    // `run /bin` и `/crash`, и выполнялся второй.
+                    match replay_pending(&mut editor) {
+                        Replay::Finished => {
+                            ui::set_cursor(false);
+                            return;
+                        }
+                        Replay::Ran => {}
+                        Replay::Nothing => sprint!("{PROMPT}"),
+                    }
                 }
                 Edit::Cancelled => sprint!("{PROMPT}"),
                 Edit::EndOfInput => {
@@ -389,6 +406,20 @@ fn run_command(line: &str) -> bool {
                 stats.dropped,
                 stats.queued,
                 input::modifiers()
+            );
+            // Вторая строка отвечает на другой вопрос: сколько ввода дошло до
+            // **программ**. Событие, доехавшее до ядра, и байт, прочитанный
+            // третьим кольцом, — разные утверждения, и различать их нужно ровно
+            // тогда, когда программа «не видит клавиатуру».
+            sprintln!(
+                "  terminal {} mode, {} byte(s) read by programs, {} dropped, foreground {}",
+                if tty::is_raw() { "raw" } else { "line" },
+                tty::read_bytes(),
+                tty::dropped(),
+                match tty::foreground() {
+                    Some(id) => alloc::format!("{id}"),
+                    None => alloc::string::String::from("none"),
+                }
             );
         }
         "usb" => usb_status(),
@@ -701,11 +732,204 @@ fn run_program(argument: &str) {
             if background {
                 sprintln!("  {path}: started as {id}");
             } else {
-                sched::wait(id);
+                foreground(id);
             }
         }
         Err(err) => sprintln!("  {path}: {err}"),
     }
+}
+
+/// Дождаться программы переднего плана, отдавая ей всё, что набирают.
+///
+/// # Почему нельзя просто `sched::wait`
+///
+/// Потому что ждущая задача не разбирает очередь ввода, а разбирает её только
+/// оболочка. Уснув на завершении программы, она перестала бы доставлять
+/// нажатия — и программа, попросившая строку, не получила бы ни байта. До этой
+/// фазы это было незаметно ровно потому, что читать программа не умела.
+///
+/// Поэтому оболочка остаётся на посту: разбирает очередь, отдаёт разобранное
+/// терминалу и засыпает — но на **вводе**, а не на задаче, и с коротким сроком,
+/// чтобы заметить, что программа закончилась.
+///
+/// # Кому достаётся нажатие
+///
+/// Сначала рабочему столу: его сочетания (`Tab`, `Ctrl+W`, меню) работают и
+/// поверх программы, потому что окна — это система, а не собственность
+/// программы. Дальше — только если фокус на окне терминала: клавиша, набранная
+/// в окне файлового менеджера, к программе отношения не имеет.
+fn foreground(id: sched::TaskId) {
+    tty::set_foreground(Some(id));
+    // Строка редактора нужна только в построчном режиме; в прямом байты уезжают
+    // в терминал сразу.
+    let mut editor = LineEditor::new();
+    let mut status_at = 0u64;
+
+    while running(id) {
+        let seen = input::sequence();
+
+        let now = time::uptime_ms();
+        if now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
+            status_at = now;
+            update_status();
+        }
+
+        while let Some(event) = input::next_pointer() {
+            ui::dispatch_pointer(event);
+        }
+
+        while let Some(event) = input::next_event() {
+            let Some(event) = ui::dispatch(event) else {
+                continue;
+            };
+            // Ctrl+C проверяется до всего остального и в обоих режимах:
+            // полноэкранная программа, ушедшая в цикл, иначе не снималась бы
+            // ничем, кроме перезагрузки.
+            if tty::is_interrupt(event) {
+                sprintln!("^C");
+                let _ = user::request_kill(id);
+                continue;
+            }
+
+            if tty::is_raw() {
+                let mut bytes = [0u8; tty::MAX_ENCODED];
+                let len = tty::encode(event, &mut bytes);
+                if len > 0 {
+                    tty::push(&bytes[..len]);
+                }
+                continue;
+            }
+
+            match editor.handle(event, &mut Out) {
+                Edit::Submitted => {
+                    // Перевод строки уезжает вместе со строкой: программа,
+                    // читающая построчно, отличает конец строки именно по нему,
+                    // а не по тому, что байты кончились.
+                    let mut line = [0u8; input::line::MAX_LINE + 1];
+                    let text = editor.as_str().as_bytes();
+                    line[..text.len()].copy_from_slice(text);
+                    line[text.len()] = b'\n';
+                    tty::push(&line[..text.len() + 1]);
+                    editor.clear();
+                }
+                Edit::EndOfInput => tty::push_eof(),
+                Edit::Full => {
+                    sprintln!();
+                    sprintln!("  the line is full ({} bytes)", input::line::MAX_LINE);
+                }
+                Edit::Cancelled | Edit::Unhandled(_) | Edit::Ignored | Edit::Inserted
+                | Edit::Erased => {}
+            }
+        }
+
+        // Срок сна короткий и намеренно: программа могла закончиться, пока
+        // никто ничего не набирал, и узнать об этом можно только проснувшись.
+        //
+        // Условие спрашивает **только** про ввод, хотя проснуться хочется и на
+        // завершении программы. Причина жёсткая: замыкание исполняется под
+        // локом планировщика, а `running` берёт тот же лок — и `SpinLock` здесь
+        // не перевходим, то есть это была бы не задержка, а вечное зависание с
+        // запрещёнными прерываниями. Цена отказа — до `POLL_PERIOD_MS`
+        // задержки перед возвратом приглашения, и она незаметна.
+        let deadline = irq::ticks() + POLL_PERIOD_MS * u64::from(irq::TIMER_HZ) / 1000;
+        sched::block_on_input(deadline, || input::sequence() != seen);
+    }
+
+    // Строка, набранная наполовину к моменту, когда программа закончилась,
+    // уезжает в терминал — оттуда её заберёт оболочка и допишет то, что человек
+    // ещё набирает. Редактор здесь свой, локальный, и бросить его вместе с
+    // набранным значило бы съесть начало следующей команды: хвост приехал бы
+    // уже в редактор оболочки, и `run /bin/crash` превратился бы в `/crash`.
+    // Ровно это и происходило.
+    if !editor.is_empty() {
+        tty::push(editor.as_str().as_bytes());
+    }
+    tty::set_foreground(None);
+}
+
+/// Чем кончился разбор остатка терминала.
+enum Replay {
+    /// Ничего не осталось — приглашение печатает вызывающий.
+    Nothing,
+    /// Что-то выполнено, приглашение уже напечатано.
+    Ran,
+    /// Одна из команд закончила сеанс.
+    Finished,
+}
+
+/// Разобрать то, что осталось в терминале от программы переднего плана.
+///
+/// Законченные строки исполняются как команды, незаконченный хвост уезжает в
+/// редактор — без повторного эха: на экране эти байты уже есть, их напечатал
+/// редактор, когда человек их набирал.
+/// # Почему это цикл
+///
+/// Отложенная команда может сама оказаться программой переднего плана, и пока
+/// та работает, в терминал успевает лечь следующая строка. Разобрав остаток
+/// один раз, оболочка оставила бы её лежать до ближайшего Enter — которого
+/// человек уже нажал, а стенд не нажмёт вовсе. Поэтому после каждой выполненной
+/// команды терминал спрашивается заново.
+fn replay_pending(editor: &mut LineEditor) -> Replay {
+    let mut ran = false;
+
+    loop {
+        let mut pending = [0u8; input::line::MAX_LINE];
+        let taken = tty::take_all(&mut pending);
+        if taken == 0 {
+            break;
+        }
+
+        let mut executed = false;
+        let mut start = 0;
+        for at in 0..taken {
+            if pending[at] != b'\n' {
+                continue;
+            }
+            // Хвост, набранный до этой строки, — её начало: человек набирал
+            // одну команду, а прервало её только то, что программа в этот
+            // момент закончилась.
+            let head = editor.as_str();
+            let mut line = [0u8; input::line::MAX_LINE];
+            let mut len = head.len().min(line.len());
+            line[..len].copy_from_slice(&head.as_bytes()[..len]);
+            let tail = &pending[start..at];
+            let room = line.len() - len;
+            let copy = tail.len().min(room);
+            line[len..len + copy].copy_from_slice(&tail[..copy]);
+            len += copy;
+            editor.clear();
+
+            let text = core::str::from_utf8(&line[..len]).unwrap_or("");
+            executed = true;
+            if run_command(text) {
+                return Replay::Finished;
+            }
+            sprint!("{PROMPT}");
+            start = at + 1;
+        }
+
+        // Незаконченный хвост уезжает в редактор: следующий виток либо допишет
+        // его набранным, либо снова возьмёт отсюда, если команда была
+        // выполнена и терминал успел наполниться заново.
+        editor.preload(&pending[start..taken]);
+        if !executed {
+            break;
+        }
+        ran = true;
+    }
+
+    if ran { Replay::Ran } else { Replay::Nothing }
+}
+
+/// Исполняется ли ещё задача с этим номером.
+///
+/// Отсутствие задачи считается завершением: слот мог быть уже переиспользован,
+/// и ждать её дольше значило бы ждать вечно.
+fn running(id: sched::TaskId) -> bool {
+    matches!(
+        sched::lookup(id),
+        Some((_, state)) if state != sched::TaskState::Finished
+    )
 }
 
 /// Записать строку в файл, создав его или заменив содержимое.

@@ -160,7 +160,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// Список обязан совпадать с `USER_PROGRAMS` в `xtask/src/build.rs` — это тот
 /// же комплект, разложенный по носителю. Расхождение не остаётся незамеченным:
 /// установленная система без `/bin/perms` валит сценарий `installed` на стенде.
-const PROGRAMS: [(&CStr16, &str); 11] = [
+const PROGRAMS: [(&CStr16, &str); 14] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -172,6 +172,9 @@ const PROGRAMS: [(&CStr16, &str); 11] = [
     (cstr16!("\\FREEOS\\BIN\\SAVE"), "save"),
     (cstr16!("\\FREEOS\\BIN\\WC"), "wc"),
     (cstr16!("\\FREEOS\\BIN\\LS"), "ls"),
+    (cstr16!("\\FREEOS\\BIN\\ASK"), "ask"),
+    (cstr16!("\\FREEOS\\BIN\\VEC"), "vec"),
+    (cstr16!("\\FREEOS\\BIN\\MC"), "mc"),
 ];
 
 /// Размер файла по данным файловой системы.

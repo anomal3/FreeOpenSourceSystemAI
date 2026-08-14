@@ -92,6 +92,40 @@ pub fn draw_text(
     Rect::new(x as i32, y as i32, cursor - x, GLYPH_H * scale)
 }
 
+/// Шестнадцать цветов терминала — те самые, которые ANSI нумерует от 30 до 37 и
+/// от 90 до 97.
+///
+/// Значения взяты не из спецификации (её в этой части нет вовсе — цвета там
+/// названы словами), а подобраны под тёмный фон системы: «чёрный» чуть светлее
+/// фона окна, иначе текст им напечатанный исчезал бы совсем, а яркая половина
+/// действительно ярче тусклой, а не просто другая.
+pub const PALETTE: [Color; 16] = [
+    Color::rgb(0x14, 0x20, 0x2C), // 0 чёрный
+    Color::rgb(0xC0, 0x4C, 0x50), // 1 красный
+    Color::rgb(0x5E, 0xA8, 0x74), // 2 зелёный
+    Color::rgb(0xC0, 0xA0, 0x50), // 3 жёлтый
+    Color::rgb(0x3C, 0x8C, 0xC8), // 4 синий
+    Color::rgb(0xA0, 0x70, 0xB8), // 5 пурпурный
+    Color::rgb(0x50, 0xA8, 0xB0), // 6 голубой
+    Color::rgb(0xD8, 0xE2, 0xEC), // 7 белый
+    Color::rgb(0x4A, 0x5C, 0x70), // 8 яркий чёрный (серый)
+    Color::rgb(0xE0, 0x70, 0x74), // 9 яркий красный
+    Color::rgb(0x86, 0xD0, 0x9C), // 10 яркий зелёный
+    Color::rgb(0xE8, 0xC8, 0x78), // 11 яркий жёлтый
+    Color::rgb(0x6C, 0xB4, 0xE8), // 12 яркий синий
+    Color::rgb(0xC8, 0x98, 0xE0), // 13 яркий пурпурный
+    Color::rgb(0x7C, 0xD0, 0xD8), // 14 яркий голубой
+    Color::rgb(0xFF, 0xFF, 0xFF), // 15 яркий белый
+];
+
+/// Атрибут ячейки, означающий «цвета окна, а не палитры».
+///
+/// Отдельное значение, а не пара индексов, потому что цвет окна задаётся темой и
+/// не обязан совпадать ни с одним из шестнадцати. Ячейка, которой никто не
+/// назначал цвета, обязана перекрашиваться вместе с темой, а не остаться серой
+/// навсегда.
+const ATTR_DEFAULT: u8 = 0xFF;
+
 /// Сетка символов внутри поверхности: то, что делает из окна терминал.
 pub struct TextGrid {
     /// Где в поверхности начинается сетка.
@@ -106,6 +140,15 @@ pub struct TextGrid {
     /// ASCII. Байт на ячейку вместо четырёх — это не экономия ради экономии, а
     /// разница в теневом буфере на экран 200×60.
     cells: Vec<u8>,
+    /// Цвет каждой ячейки: индекс палитры в младших четырёх битах для текста, в
+    /// старших — для фона, либо [`ATTR_DEFAULT`].
+    ///
+    /// Байт на ячейку, как и у символа: терминалу шестнадцати цветов больше не
+    /// нужно, а хранить два `Color` на ячейку значило бы платить шесть байт за
+    /// экран, где почти все ячейки одного цвета.
+    attrs: Vec<u8>,
+    /// Цвет, которым печатается следующий символ.
+    attr: u8,
     col: u32,
     row: u32,
     fg: Color,
@@ -141,6 +184,9 @@ impl TextGrid {
         let mut cells = Vec::new();
         cells.try_reserve_exact(len).ok()?;
         cells.resize(len, b' ');
+        let mut attrs = Vec::new();
+        attrs.try_reserve_exact(len).ok()?;
+        attrs.resize(len, ATTR_DEFAULT);
 
         Some(Self {
             origin: (area.x as u32, area.y as u32),
@@ -148,6 +194,8 @@ impl TextGrid {
             rows,
             scale,
             cells,
+            attrs,
+            attr: ATTR_DEFAULT,
             col: 0,
             row: 0,
             fg,
@@ -200,12 +248,131 @@ impl TextGrid {
     /// Очистить сетку и залить её область фоном.
     pub fn clear(&mut self, surface: &mut Surface) {
         self.cells.fill(b' ');
+        self.attrs.fill(ATTR_DEFAULT);
         self.col = 0;
         self.row = 0;
         self.cursor_drawn = false;
         let area = self.area();
         surface.fill(area, self.bg);
         self.mark(area);
+    }
+
+    /// Цвета ячейки по её атрибуту: текст и фон.
+    fn colors(&self, attr: u8) -> (Color, Color) {
+        if attr == ATTR_DEFAULT {
+            return (self.fg, self.bg);
+        }
+        (
+            PALETTE[(attr & 0x0F) as usize],
+            PALETTE[(attr >> 4) as usize],
+        )
+    }
+
+    /// Поставить цвет текста для последующего вывода.
+    ///
+    /// Индекс — из шестнадцати цветов [`PALETTE`]. Фон при этом сохраняется тот,
+    /// что был: `ESC [ 31 m` в терминале означает «красный текст», а не
+    /// «красный текст на чёрном».
+    pub fn set_fg(&mut self, index: u8) {
+        let bg = if self.attr == ATTR_DEFAULT {
+            // У ячейки, не имевшей цвета, фон был цветом окна; ближайший к нему
+            // в палитре — «чёрный», он для того и подобран.
+            0
+        } else {
+            self.attr >> 4
+        };
+        self.attr = (index & 0x0F) | (bg << 4);
+    }
+
+    /// Поставить цвет фона для последующего вывода.
+    pub fn set_bg(&mut self, index: u8) {
+        let fg = if self.attr == ATTR_DEFAULT { 7 } else { self.attr & 0x0F };
+        self.attr = fg | ((index & 0x0F) << 4);
+    }
+
+    /// Вернуть цвета окна — то, что делает `ESC [ 0 m`.
+    pub fn reset_attr(&mut self) {
+        self.attr = ATTR_DEFAULT;
+    }
+
+    /// Где стоит курсор: строка и столбец, считая с нуля.
+    #[must_use]
+    pub const fn cursor_at(&self) -> (u32, u32) {
+        (self.row, self.col)
+    }
+
+    /// Поставить курсор в заданную ячейку.
+    ///
+    /// Координаты за пределами сетки прижимаются к её краю, а не отвергаются:
+    /// так же ведёт себя всякий терминал, а программа, попросившая
+    /// восьмидесятую строку у окна из двадцати четырёх, обычно просто не знала
+    /// размера.
+    pub fn move_to(&mut self, surface: &mut Surface, row: u32, col: u32) {
+        let had_cursor = self.cursor_drawn;
+        self.erase_cursor(surface);
+        self.row = row.min(self.rows - 1);
+        self.col = col.min(self.cols - 1);
+        if had_cursor || self.cursor_enabled {
+            self.draw_cursor(surface);
+        }
+    }
+
+    /// Сдвинуть курсор на заданное число строк и столбцов.
+    pub fn move_by(&mut self, surface: &mut Surface, rows: i32, cols: i32) {
+        let row = (self.row as i32 + rows).max(0) as u32;
+        let col = (self.col as i32 + cols).max(0) as u32;
+        self.move_to(surface, row, col);
+    }
+
+    /// Стереть часть экрана: `0` — от курсора вниз, `1` — сверху до курсора,
+    /// `2` — весь.
+    ///
+    /// Курсор при этом **не** двигается — в отличие от [`TextGrid::clear`]. Это
+    /// не тонкость: программы очищают экран последовательностью из двух команд,
+    /// вторая из которых ставит курсор, и очистка, двигающая его сама, ломала бы
+    /// вывод тех, кто обходится одной.
+    pub fn erase_display(&mut self, surface: &mut Surface, mode: u8) {
+        let position = (self.row * self.cols + self.col) as usize;
+        let total = self.cells.len();
+        let (from, to) = match mode {
+            0 => (position, total),
+            1 => (0, position + 1),
+            _ => (0, total),
+        };
+        self.erase_range(surface, from, to.min(total));
+    }
+
+    /// Стереть часть строки: `0` — от курсора вправо, `1` — слева до курсора,
+    /// `2` — всю строку.
+    pub fn erase_line(&mut self, surface: &mut Surface, mode: u8) {
+        let start = (self.row * self.cols) as usize;
+        let position = start + self.col as usize;
+        let end = start + self.cols as usize;
+        let (from, to) = match mode {
+            0 => (position, end),
+            1 => (start, position + 1),
+            _ => (start, end),
+        };
+        self.erase_range(surface, from, to.min(end));
+    }
+
+    /// Залить диапазон ячеек пробелами цвета окна.
+    fn erase_range(&mut self, surface: &mut Surface, from: usize, to: usize) {
+        let had_cursor = self.cursor_drawn;
+        self.erase_cursor(surface);
+        for index in from..to {
+            let col = (index as u32) % self.cols;
+            let row = (index as u32) / self.cols;
+            if self.cells[index] == b' ' && self.attrs[index] == ATTR_DEFAULT {
+                continue;
+            }
+            self.cells[index] = b' ';
+            self.attrs[index] = ATTR_DEFAULT;
+            self.draw_cell(surface, col, row, b' ');
+        }
+        if had_cursor || self.cursor_enabled {
+            self.draw_cursor(surface);
+        }
     }
 
     /// Показывать или не показывать курсор.
@@ -254,24 +421,28 @@ impl TextGrid {
 
     fn draw_cell(&mut self, surface: &mut Surface, col: u32, row: u32, byte: u8) {
         let cell = self.cell_rect(col, row);
+        let (fg, bg) = self.colors(self.attrs[(row * self.cols + col) as usize]);
         draw_glyph(
             surface,
             cell.x as u32,
             cell.y as u32,
             char::from(byte),
             self.scale,
-            self.fg,
-            Some(self.bg),
+            fg,
+            Some(bg),
         );
         self.mark(cell);
     }
 
     fn put_cell(&mut self, surface: &mut Surface, col: u32, row: u32, byte: u8) {
         let index = (row * self.cols + col) as usize;
-        if self.cells[index] == byte {
+        // Сравнивается и символ, и цвет: ячейка, перекрашенная под тем же
+        // символом, изменилась ровно так же, как ячейка с новым символом.
+        if self.cells[index] == byte && self.attrs[index] == self.attr {
             return;
         }
         self.cells[index] = byte;
+        self.attrs[index] = self.attr;
         self.draw_cell(surface, col, row, byte);
     }
 
@@ -279,8 +450,13 @@ impl TextGrid {
     fn scroll(&mut self, surface: &mut Surface) {
         let cols = self.cols as usize;
         self.cells.copy_within(cols.., 0);
+        self.attrs.copy_within(cols.., 0);
         let last = (self.rows as usize - 1) * cols;
         self.cells[last..].fill(b' ');
+        // Освободившаяся строка получает цвета окна, а не последний
+        // назначенный: `scroll_up` заливает её именно фоном окна, и разойтись с
+        // ним значило бы, что теневой буфер описывает не то, что на экране.
+        self.attrs[last..].fill(ATTR_DEFAULT);
 
         // Пиксели сдвигаются сдвигом, а не перерисовкой глифов: копирование
         // внутри обычной памяти на порядок дешевле, чем нарисовать заново

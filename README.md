@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 25 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 30 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -11,7 +11,12 @@ An open operating system written from scratch in Rust, targeting **ARM64** and *
 > those programs **open files under the account the system was installed with**: the
 > `mode`, `uid` and `gid` on disk decide what they may read, path component by path
 > component. A program is a scheduler task, so several run at once while the shell keeps
-> answering. On both architectures.
+> answering. Since Phase 29 a program also **reads the keyboard**: `read(0, …)` blocks until
+> someone types, the terminal understands a subset of ANSI, and `Ctrl+C` removes the
+> foreground program. Since Phase 29a the **vector registers belong to the task**, so two
+> programs doing SIMD arithmetic cannot see each other's numbers. What all of it adds up to
+> is `/bin/mc`: a two-panel file manager, outside the kernel, driven from the keyboard.
+> On both architectures.
 
 ## Why
 
@@ -1160,6 +1165,137 @@ storage yet — the kernel has no FAT writer for the ESP, and the bootloader has
 no ext2 reader. It lands with phase 32, where the same file gains its second
 consumer, and until then the menu is entered by hand.
 
+### A program that can read the keyboard
+
+Until Phase 29 a program had an exit and no entrance: it could print anything
+and could not learn a single keystroke. `read(0, …)` closes that, and the
+interesting part is not the system call but **who delivers the bytes**.
+
+The input queue is one per system, and only the shell task drains it. So the
+shell no longer sleeps on the program it started: it stays at its post,
+dispatching the desktop's own shortcuts first, then handing what is left to the
+terminal — and only when the focused window is the terminal, because a key typed
+into the file manager has nothing to do with the program. That is what "input
+goes to the focused task" means here in practice; it is the window manager's
+existing knowledge finally meaning delivery rather than the colour of a border.
+
+The terminal has two modes, the same two every Unix has. In **line** mode the
+line editor collects a line with echo and the program gets it on Enter. In
+**raw** mode each keypress becomes bytes immediately and with no echo, encoded as
+the escape sequences a real terminal would send — `ESC [ A` for the up arrow,
+`ESC [ 21 ~` for F10. That last choice matters more than it looks: the other
+source of input is the serial line, where an arrow key *already* arrives as
+`ESC [ A`, so both roads meet in one byte stream before the program, and a
+full-screen program behaves identically in a window and over a wire.
+
+`Ctrl+C` stays with the terminal in both modes: a program that has stopped
+asking the kernel for anything is otherwise unremovable except by reboot.
+
+The other direction is ANSI. The terminal understands a deliberately small
+subset — cursor movement, erasing, sixteen colours, showing and hiding the
+cursor — and **says in the log what it understood**: `term : CSI 2J`. Without
+that line "the terminal executed the command" and "the terminal printed its text
+as garbage" would look identical from outside, and a screenshot is not evidence.
+It names the first thirty-two sequences and then goes quiet, because a
+full-screen program sends hundreds a second and a log nobody can read is worse
+than no log. Sequences it does not implement are swallowed whole rather than
+printed: an unimplemented command that shows up as text looks like a broken
+program, not like an unknown command.
+
+One subtlety cost a debugging session and is worth writing down. The desktop is
+taken out from under its lock while a frame is drawn, so "is the desktop
+available right now" and "does this machine have graphics" are different
+questions. Parsing hangs off the second: a sequence that arrived while a frame
+was being painted still has to be understood, or the next one looks corrupt.
+
+A second one cost another. What you type while a program is running belongs to
+**that program** — that is what a terminal is — and if the program never reads
+it, it goes to the next reader, which is the shell. Getting that wrong is not
+subtle at all from the outside: a command typed a moment before the prompt
+returned came back cut in half, `run /bin/crash` arriving as `/crash`. Two
+places had to agree on it. The half-typed line in the foreground loop's own
+editor is pushed back into the terminal when the program ends, and the shell
+picks up what the terminal holds **immediately after the command returns**, not
+on its next turn round the loop — because the very next thing it does is drain
+the event queue, where the rest of that same line is already waiting.
+
+### Registers that belong to the task
+
+Two programs doing vector arithmetic must not see each other's numbers. Until
+Phase 29a they would have, and nobody could tell: the kernel is built without
+floating point, and programs were built for targets where the compiler has no
+vector registers at all. The first program compiled with SSE or NEON exposes what
+was already wrong — context switching saved the integer registers and nothing
+else.
+
+So the scheduler now saves and restores the whole vector file across a task
+switch, **eagerly**: always, rather than lazily on the first use through a trap.
+The lazy trick pays off where vectors are the exception; with SSE on, the
+compiler copies memory through `xmm`, so every program is the rule.
+
+On x86-64 the area is not a fixed size — it is a function of what is enabled in
+`XCR0`, which is what `CPUID.0D` reports: 576 bytes with SSE alone, 832 with AVX,
+past two and a half thousand with AVX-512. A hardcoded number breaks on the first
+processor with a different feature set, and breaks by writing past the end of a
+buffer. Alignment is 64 bytes, or `#GP` on every switch. And `xsaveopt` is free
+not to write components the program never touched, so the area is opaque bytes to
+the kernel: saved and restored whole, never read as a struct.
+
+On AArch64 there is nothing to ask: thirty-two 128-bit registers plus `FPCR` and
+`FPSR`, 528 bytes. What did need doing is turning it on — `CPACR_EL1.FPEN` was
+never touched before, and "it works because edk2 left it enabled" fails on the
+first board with different firmware.
+
+The proof is a test that **had to be red before the phase**: `/bin/vec` fills
+eight vector registers with a constant it got as an argument, yields, and
+compares. Two copies with different constants run at once. With the save removed
+it fails immediately; with it, four thousand checks pass. That is the only shape
+of test that shows a phase changed something, as opposed to showing that nothing
+broke.
+
+Three things fell out of enabling vectors, all real bugs that were invisible
+before. Program stacks entered `_start` 16-byte aligned, where System V says a
+function starts at `RSP ≡ 8 (mod 16)` — harmless until the first `movaps`. The
+ELF loader passed `p_flags` straight into a permission helper that numbers its
+bits the other way round, so read-only segments were being mapped
+**executable**. And the linker script matched `.text`/`.rodata`/`.bss` but not
+`.ltext`/`.lrodata`/`.lbss`, which is where the large code model — the one
+x86-64 programs are built with — actually puts everything; unmatched sections
+become orphans the linker places by its own rules, and in an optimized build it
+put read-only data and `.bss` on the same page as code. The kernel refused to
+load such a program, saying the page would be writable and executable at once.
+It was right; the script was wrong. All three surfaced through the same door:
+the first program with a writable segment.
+
+### `mc`
+
+A two-panel file manager, and the point of it is that there is not one line of it
+in the kernel: `/bin/mc` is an ordinary program using the same system calls as
+`hello`. It proves Phases 29 and 20 are enough for a real interactive
+application — two panels, walking directories, copy, rename, delete, mkdir, view,
+F10 to quit.
+
+It is **not** Midnight Commander, and the name is not a promise. The real one is
+a hundred thousand lines with an editor, virtual filesystems and networking; this
+is a two-panel manager with its layout and its keys. It has no heap either — all
+buffers are fixed arrays whose limits are visible in the source, and a directory
+that does not fit says so on screen rather than silently showing fewer files.
+
+Its diagnostics go to descriptor 2, which the kernel routes to the log without
+touching the window. A full-screen program needs somewhere to put words that is
+not the picture, and the bench needs somewhere to read them: `mc : copied
+/home/roman/mcdir/one.txt -> /home/roman/one.txt` names both sides, so
+"copied" and "copied the wrong thing" do not look alike.
+
+Rename is the one thing it needed that the ABI did not have. It is a rename, not
+a copy-and-delete: the contents are never read, the directory entry moves. New
+name first, old name second — the reverse order can leave an inode with no name
+at all after a power cut, while this order can at worst leave a file visible
+twice, which `fsck` repairs. It refuses to overwrite an existing name, because
+POSIX `rename` silently replacing the destination is exactly where a program
+loses a file it did not know about, and it refuses to move a *directory* to a
+different parent, because `..` lives inside it.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -1242,10 +1378,10 @@ it can come later without migrating data.
 
 What is implemented: formatting, directories, files, indirect and doubly-indirect blocks,
 reading all of it back, and — since Phase 14a — changing a volume that already exists:
-creating and deleting files and directories, writing at any offset, truncating, and handing
-freed space back out. What is not: hard and symbolic links, and triple indirection — absent
-because they have no consumer today, and unexercised code in something that writes to a disk
-is worse than missing code.
+creating and deleting files and directories, writing at any offset, truncating, handing
+freed space back out, and (Phase 30) renaming. What is not: hard and symbolic links, and
+triple indirection — absent because they have no consumer today, and unexercised code in
+something that writes to a disk is worse than missing code.
 
 There used to be two writers of this format. One formatted a volume and filled it, and could
 do nothing else; the other did not exist yet, and would have been the one the kernel needed.
@@ -1426,9 +1562,9 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 27 | Power: shut down and reboot, from the menu and from the power button, and a volume closed cleanly behind us | **done** |
 | 28a | `fsck`: the volume is repaired from inside the system, not from someone else's Linux | **done** |
 | 28b | Safe mode and a boot menu: a recovery console in the initrd, so no failure needs a second computer | **done** |
-| 29 | A keyboard for a program: descriptor 0, and a terminal that understands ANSI | planned |
-| 29a | Vector and FP registers belong to a task, so two computing programs cannot see each other's numbers | planned |
-| 30 | `mc`: a two-pane file manager that is a program, not a part of the kernel | planned |
+| 29 | A keyboard for a program: descriptor 0, and a terminal that understands ANSI | **done** |
+| 29a | Vector and FP registers belong to a task, so two computing programs cannot see each other's numbers | **done** |
+| 30 | `mc`: a two-pane file manager that is a program, not a part of the kernel | **done** |
 | 31 | Packages and a record of them: a format, a database, install and remove | planned |
 | 32 | Updating the system by slots: two roots, state on its own partition, and a rollback nobody has to ask for | planned |
 | 33 | Services: `spawn`/`wait` and a supervisor, so a crashed daemon comes back and the system never notices | planned |

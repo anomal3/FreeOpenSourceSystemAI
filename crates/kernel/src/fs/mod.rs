@@ -170,6 +170,38 @@ pub fn remove_as(cred: Credentials, path: &str) -> Option<VfsResult<()>> {
     })
 }
 
+/// Переименовать файл или каталог от имени `cred`.
+///
+/// Право писать спрашивается у **обоих** каталогов: имя исчезает в одном и
+/// появляется в другом, и каждое из этих действий — запись в свой каталог. Прав
+/// на сам файл не требуется, ровно как в Unix: переименование меняет запись
+/// каталога, а не содержимое.
+///
+/// Оба вопроса задаются до того, как файловая система что-нибудь сделает.
+/// Порядок обязателен: отказ на середине оставил бы файл видимым под двумя
+/// именами или ни под одним.
+pub fn rename_as(cred: Credentials, old: &str, new: &str) -> Option<VfsResult<()>> {
+    let (old_parent, _) = match split_parent(old) {
+        Ok(pair) => pair,
+        Err(err) => return Some(Err(err)),
+    };
+    let (new_parent, _) = match split_parent(new) {
+        Ok(pair) => pair,
+        Err(err) => return Some(Err(err)),
+    };
+
+    // Узлы каталогов дальше не нужны — нужен ответ «пустят ли». Сама операция
+    // идёт через файловую систему, потому что затрагивает оба каталога сразу.
+    if let Err(err) = resolve_as(cred, old_parent, Access::WRITE)? {
+        return Some(Err(err));
+    }
+    if let Err(err) = resolve_as(cred, new_parent, Access::WRITE)? {
+        return Some(Err(err));
+    }
+
+    with_root(|fs| fs.rename(old, new))
+}
+
 /// Перечислить каталог корневой ФС.
 ///
 /// Внешний `None` означает «ничего не смонтировано» — это не ошибка пути, и

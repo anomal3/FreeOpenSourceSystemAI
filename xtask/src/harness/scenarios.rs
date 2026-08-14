@@ -694,6 +694,12 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run /bin/ls /"),
             Step::Await("bin/", 30_000),
             Step::Await("ls: ", 15_000),
+            // Приглашения ждём отдельно, а не шлём команду сразу за последней
+            // строкой программы: пока та не закончилась, набранное достаётся
+            // **ей**, и разбирать его будет уже оболочка — правильно, но на
+            // такт позже. Ожидание убирает лишний источник неопределённости из
+            // сценария, который проверяет не это.
+            Step::Await("freeos> ", 15_000),
             // Вторая ломается нарочно. До Phase 12a обращение по нулевому
             // адресу означало панику ядра и остановку машины.
             Step::Line("run /bin/crash"),
@@ -759,6 +765,112 @@ pub const ALL: &[Scenario] = &[
             // окно программы в своих таблицах.
             Step::Absent("the read succeeded"),
             Step::Absent("user        : WARNING"),
+        ],
+    },
+    Scenario {
+        name: "stdin",
+        about: "Программа читает набранное, управляет терминалом и снимается по Ctrl+C.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        arches: &[],
+        reboots: false,
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Line("run /bin/ask"),
+            // Размер окна пришёл из ядра, а не выдуман программой: она не знает
+            // ни размера экрана, ни размера глифа, ни того, есть ли графика.
+            Step::Await("ask: window is ", 30_000),
+            // Ядро назвало разобранные последовательности. Без этих строк
+            // «терминал выполнил команду» и «терминал напечатал её текстом»
+            // выглядели бы одинаково — а снимок экрана доказательством не
+            // является (правило дома).
+            Step::Await("term        : CSI 2J", 15_000),
+            Step::Await("term        : CSI 1;1H", 15_000),
+            Step::Await("ask: name?", 15_000),
+            // Вот оно, главное утверждение фазы: набранная строка ушла не в
+            // редактор оболочки, а **в программу**, и вернулась её ответом.
+            Step::Line("roman"),
+            Step::Await("ask: hello, roman", 15_000),
+            Step::Await("ask: say something?", 15_000),
+            // Второе чтение из того же потока: позиция в нём не теряется между
+            // вызовами, и число байт точное — «что-то прочиталось» выглядело бы
+            // так же, как «прочиталось не то».
+            Step::Line("still here"),
+            Step::Await("ask: heard 10 bytes: still here", 15_000),
+            Step::Await("ask: done", 15_000),
+            Step::Await("exited with code 0", 15_000),
+            // Ввод вернулся оболочке: программа закончилась, и терминал больше
+            // никому не принадлежит.
+            Step::Await("tty         : foreground released", 15_000),
+            Step::Line("echo shell-has-input"),
+            Step::Await("  shell-has-input", 15_000),
+            // Счётчик прочитанного программами — не украшение: он отличает
+            // «программа получила байты» от «программа напечатала то, что и так
+            // знала».
+            Step::Line("input"),
+            // Семнадцать байт — «roman\n» и «still here\n»; предел ниже с
+            // запасом, потому что проверяется не арифметика, а то, что счётчик
+            // вообще двигается.
+            Step::AtLeast("  terminal line mode, ", 15, 15_000),
+            // Ctrl+C снимает программу переднего плана. `/bin/forever` не делает
+            // ни одного системного вызова после первой строки, то есть ждать
+            // его добровольного возврата бессмысленно.
+            Step::Line("run /bin/forever"),
+            Step::Await("this program never ends on its own", 30_000),
+            Step::Raw(&[3]),
+            Step::Await("killed by request", 30_000),
+            // И система жива: снятие программы переднего плана вернуло оболочке
+            // и ввод, и приглашение.
+            Step::Line("echo still-alive"),
+            Step::Await("still-alive", 15_000),
+            Step::Shot("stdin"),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "vector",
+        about: "Векторные регистры принадлежат задаче: две программы не видят чисел друг друга.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        arches: &[],
+        reboots: false,
+        // `-cpu max` — не украшение. С процессором по умолчанию QEMU не
+        // объявляет `XSAVE`, и ядро уходит на путь `FXSAVE`: проверялась бы
+        // ровно та половина, которой на современной машине не бывает. Здесь
+        // объявлено всё, что эмулятор умеет, — то есть тот путь, по которому
+        // пойдёт настоящее железо.
+        extra: &["-cpu", "max"],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Ядро обязано сказать, чем именно оно сохраняет состояние: на
+            // машине без XSAVE это FXSAVE, и размер области там другой.
+            // Строка заодно доказывает, что фаза вообще включена.
+            Step::Expect("  fpu         : "),
+            // Две копии одной программы с разными константами. Проверка внутри
+            // каждой: записать восемь векторных регистров, уступить процессор,
+            // сверить. До этой фазы такой тест красный — переключение задач
+            // сохраняло целочисленный контекст и не сохраняло ничего больше.
+            Step::Line("run -b /bin/vec 1111111111"),
+            Step::Capture("started as #", 15_000),
+            Step::Line("run -b /bin/vec 2222222222"),
+            Step::Await("started as #", 15_000),
+            Step::AwaitAny("vec 1111111111: 2000 checks passed", 120_000),
+            Step::Await("vec 2222222222: 2000 checks passed", 120_000),
+            Step::Line("echo still-alive"),
+            Step::Await("still-alive", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+            // Единственная строка, которую программа печатает при расхождении.
+            // Её отсутствие и есть результат фазы.
+            Step::Absent("MISMATCH"),
         ],
     },
     Scenario {
@@ -1262,6 +1374,105 @@ pub const ALL: &[Scenario] = &[
             // Непустой каталог не удаляется, и отказ объясняет причину.
             Step::Line("rm /home/roman/notes"),
             Step::Await("the directory is not empty", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "mc",
+        about: "Двухпанельный менеджер: ходьба по каталогам, копирование, удаление — всё вне ядра.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        disk_bus: DiskBus::Virtio,
+        arches: &[],
+        reboots: false,
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Уборка перед началом — по той же причине, что и в сценарии
+            // `write`: диск переживает прогон, и второй запуск иначе падал бы
+            // на «имя уже занято». Между строками ждём приглашения: приёмный
+            // FIFO гостя не держит две команды подряд, пока тот перерисовывает
+            // окно.
+            Step::Line("rm /home/roman/one.txt"),
+            Step::Await("freeos> ", 15_000),
+            Step::Line("rm /home/roman/mcdir/one.txt"),
+            Step::Await("freeos> ", 15_000),
+            Step::Line("rm /home/roman/mcdir/two.txt"),
+            Step::Await("freeos> ", 15_000),
+            Step::Line("rm /home/roman/mcdir"),
+            Step::Await("freeos> ", 15_000),
+            // Каталог с одним предсказуемым файлом. Проверять `mc` на `/bin`
+            // было бы нельзя: порядок записей каталога — тот, в котором они
+            // лежат на носителе, и «второй сверху» означало бы разное на разных
+            // сборках.
+            Step::Line("mkdir /home/roman/mcdir"),
+            Step::Await("created /home/roman/mcdir", 15_000),
+            Step::Line("echo mc-payload > /home/roman/mcdir/one.txt"),
+            Step::Await("wrote 11 bytes", 15_000),
+            // Панели указаны аргументами: программа не знает, где что лежит, и
+            // знать не должна.
+            Step::Line("run /bin/mc /home/roman/mcdir /home/roman"),
+            Step::Await("mc: started", 30_000),
+            // Прямой режим — то, ради чего в фазе 29 появился второй режим
+            // терминала: без него стрелки приезжали бы четырьмя видимыми
+            // символами, а Enter требовался бы после каждой клавиши. Проверка
+            // по всему выводу, а не ожиданием вперёд: строку печатает ядро в
+            // ответ на системный вызов, и она оказывается позади курсора.
+            Step::Expect("tty         : raw mode"),
+            // Вниз на одну строку: первая — «..», вторая — единственный файл.
+            // Клавиша идёт по серийной линии той же последовательностью,
+            // которую прислал бы настоящий терминал, и возвращается программе
+            // ею же.
+            Step::Raw(b"\x1b[B"),
+            Step::Wait(500),
+            Step::Shot("mc"),
+            // F5 копирует файл под курсором в каталог другой панели. Строка
+            // называет обе стороны целиком: «скопировалось» и «скопировалось не
+            // то» иначе выглядели бы одинаково.
+            Step::Raw(b"\x1b[15~"),
+            Step::Await(
+                "mc: copied /home/roman/mcdir/one.txt -> /home/roman/one.txt",
+                20_000,
+            ),
+            // F6 переименовывает — и это не «скопировать и удалить»: содержимое
+            // не читается вовсе, меняется запись каталога. Имя набирается в
+            // строке внизу, то есть программа читает ввод и в прямом режиме
+            // тоже, посимвольно и со своим эхом.
+            Step::Raw(b"\x1b[17~"),
+            Step::Wait(500),
+            Step::Raw(b"two.txt\n"),
+            Step::Await(
+                "mc: renamed /home/roman/mcdir/one.txt -> /home/roman/mcdir/two.txt",
+                20_000,
+            ),
+            // После переименования курсор снова на «..»: панель перечитана.
+            // Спускаемся к переименованному файлу и удаляем его.
+            Step::Raw(b"\x1b[B"),
+            Step::Wait(500),
+            Step::Raw(b"\x1b[19~"),
+            Step::Await("mc: removed /home/roman/mcdir/two.txt", 20_000),
+            // F10 — выход. Программа возвращает построчный режим и убирает за
+            // собой экран.
+            Step::Raw(b"\x1b[21~"),
+            Step::Await("mc: quit", 20_000),
+            Step::Expect("tty         : canonical mode"),
+            Step::Await("mc: done", 15_000),
+            // Приглашения ждём отдельно, и это не формальность: пока терминал
+            // числится за программой, набранное уходит **ей**, а не оболочке.
+            // Так же ведёт себя всякий tty, и команда, отправленная в этот
+            // промежуток, пропала бы — что и происходило, пока этой строки
+            // здесь не было.
+            Step::Await("tty         : foreground released", 15_000),
+            Step::Await("freeos> ", 15_000),
+            // И главное: сделанное программой пережило её саму. Проверяет это
+            // оболочка — другой код, другая задача, ядро вместо третьего кольца.
+            Step::Line("cat /home/roman/one.txt"),
+            Step::Await("mc-payload", 20_000),
+            Step::Line("cat /home/roman/mcdir/two.txt"),
+            Step::Await("no such file or directory", 15_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

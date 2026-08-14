@@ -40,6 +40,12 @@ const MACHINE: u16 = 183;
 /// Тип заголовка программы: загружаемый сегмент.
 const PT_LOAD: u32 = 1;
 
+/// Биты `p_flags` program header'а. Порядок обратен привычному по `readelf`
+/// написанию «RWX» и обратен конвенции [`boot_info`] — см. [`Segment::flags`].
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
+
 /// Длина заголовка файла.
 const EHDR_LEN: usize = 64;
 /// Длина одного заголовка программы.
@@ -88,8 +94,36 @@ pub struct Segment {
     /// Что копировать: срез внутри файла.
     pub file_offset: usize,
     pub filesz: usize,
-    /// Права: биты `PF_X`, `PF_W`, `PF_R` как в ELF.
+    /// Права в конвенции [`boot_info`]: `SEG_READ`, `SEG_WRITE`, `SEG_EXEC`.
+    ///
+    /// **Не** `p_flags` из файла, хотя разбираются они именно оттуда. Обе
+    /// конвенции — по три бита, и обе называют их одинаковыми словами, но
+    /// порядок битов у них обратный: в ELF `PF_X = 1`, а в `boot_info`
+    /// `SEG_READ = 1`. Отдать наружу сырое число значило бы разложить сегмент
+    /// «только чтение» исполняемым, а сегмент «чтение и запись» — исполняемым и
+    /// записываемым одновременно. Перевод делает [`seg_flags`], и делает его
+    /// один раз — здесь, на границе разбора.
     pub flags: u32,
+}
+
+/// Перевести `p_flags` в конвенцию [`boot_info`].
+///
+/// Тот же перевод делает загрузчик для сегментов ядра (`boot-uefi::elf`), и по
+/// той же причине: две трёхбитные записи, называющие биты одинаковыми словами в
+/// разном порядке, — это ошибка, которую не видно глазом и которую нечем
+/// поймать, кроме проверки прав в момент отображения.
+const fn seg_flags(p_flags: u32) -> u32 {
+    let mut flags = 0;
+    if p_flags & PF_R != 0 {
+        flags |= boot_info::SEG_READ;
+    }
+    if p_flags & PF_W != 0 {
+        flags |= boot_info::SEG_WRITE;
+    }
+    if p_flags & PF_X != 0 {
+        flags |= boot_info::SEG_EXEC;
+    }
+    flags
 }
 
 /// Разобранный файл.
@@ -182,7 +216,13 @@ impl<'a> Image<'a> {
                 return Some(Err(ElfError::OutOfWindow));
             }
 
-            Some(Ok(Segment { vaddr, memsz, file_offset, filesz, flags }))
+            Some(Ok(Segment {
+                vaddr,
+                memsz,
+                file_offset,
+                filesz,
+                flags: seg_flags(flags),
+            }))
         })
     }
 

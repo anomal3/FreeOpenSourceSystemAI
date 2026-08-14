@@ -20,9 +20,10 @@
 use core::panic::PanicInfo;
 
 use user_abi::{
-    FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_OPEN, SYS_READ,
-    O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_READDIR, SYS_REMOVE, SYS_SEEK, SYS_SLEEP, SYS_STAT,
-    SYS_TIME, SYS_UPTIME, SYS_WRITE, SYS_YIELD, Stat,
+    ERR_BAD_PATH, FD_STDERR, FD_STDIN, FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID,
+    SYS_GETUID, SYS_OPEN, SYS_READ, O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_READDIR,
+    SYS_REMOVE, SYS_RENAME, SYS_SEEK, SYS_SLEEP, SYS_STAT, SYS_TIME, SYS_TTYMODE, SYS_UPTIME,
+    SYS_WINSIZE, SYS_WRITE, SYS_YIELD, Stat, TTY_LINE, TTY_RAW,
 };
 
 pub use user_abi::{Dirent, KIND_DIRECTORY, KIND_FILE, SEEK_CUR, SEEK_END, SEEK_SET};
@@ -193,6 +194,148 @@ pub fn read(fd: i64, buffer: &mut [u8]) -> i64 {
     // SAFETY: буфер принадлежит программе и доступен ей на запись; ядро
     // проверит это ещё раз по своим таблицам.
     unsafe { syscall(SYS_READ, fd as usize, buffer.as_mut_ptr() as usize, buffer.len()) }
+}
+
+/// Прочитать из потока ввода. Ноль означает конец ввода, а не ошибку.
+///
+/// Вызов **останавливает программу** до тех пор, пока человек чего-нибудь не
+/// наберёт: в этом и разница между потоком ввода и файлом, у которого конец
+/// наступает сам. Неблокирующего чтения здесь нет, и обещать его сейчас значило
+/// бы обещать поведение, которого не существует.
+pub fn read_stdin(buffer: &mut [u8]) -> i64 {
+    // SAFETY: буфер принадлежит программе и доступен ей на запись; ядро
+    // проверит это ещё раз по своим таблицам.
+    unsafe {
+        syscall(
+            SYS_READ,
+            FD_STDIN,
+            buffer.as_mut_ptr() as usize,
+            buffer.len(),
+        )
+    }
+}
+
+/// Прочитать один байт ввода. `None` — ввод кончился.
+///
+/// Существует ради полноэкранных программ: в прямом режиме клавиша приезжает
+/// последовательностью байтов, и разбирать её приходится по одному.
+pub fn read_key() -> Option<u8> {
+    let mut byte = [0u8; 1];
+    match read_stdin(&mut byte) {
+        1 => Some(byte[0]),
+        _ => None,
+    }
+}
+
+/// Прочитать строку без завершающего перевода.
+///
+/// `None` означает конец ввода до первого байта — это не то же самое, что
+/// пустая строка, и различать их обязана программа: одно значит «человек нажал
+/// Enter», другое — «спрашивать больше некого».
+pub fn read_line(buffer: &mut [u8]) -> Option<&str> {
+    let mut len = 0;
+    while len < buffer.len() {
+        let mut byte = [0u8; 1];
+        if read_stdin(&mut byte) != 1 {
+            // Ввод кончился. Если что-то уже набрано — это строка, и её надо
+            // отдать; если нет — отдавать нечего.
+            if len == 0 {
+                return None;
+            }
+            break;
+        }
+        if byte[0] == b'\n' || byte[0] == b'\r' {
+            break;
+        }
+        buffer[len] = byte[0];
+        len += 1;
+    }
+    // Не-UTF-8 в строке — это байты, которых не набирала клавиатура: отдать их
+    // как текст нельзя, а заменить вопросительными знаками значило бы соврать
+    // про то, что было набрано.
+    core::str::from_utf8(&buffer[..len]).ok()
+}
+
+/// Размер окна в знаках: столбцы и строки.
+///
+/// Нули означают, что окна нет вовсе — система работает в серийной консоли.
+/// Программа, рисующая рамку, обязана этот случай различать: рамка шириной ноль
+/// не рисуется, а не рисуется криво.
+#[must_use]
+pub fn window_size() -> (u32, u32) {
+    // SAFETY: аргументов у вызова нет.
+    let packed = unsafe { syscall(SYS_WINSIZE, 0, 0, 0) };
+    if packed < 0 {
+        return (0, 0);
+    }
+    let packed = packed as u64;
+    ((packed >> 32) as u32, packed as u32)
+}
+
+/// Переключить терминал в прямой режим или вернуть в построчный.
+///
+/// В прямом режиме клавиша приезжает немедленно и без эха — так читает
+/// клавиатуру всякая полноэкранная программа. Вернуть режим стоит самой
+/// программе; ядро вернёт его и само, когда программа закончится, но полагаться
+/// на уборку за собой — не то же самое, что убрать.
+pub fn set_raw(raw: bool) -> i64 {
+    let mode = if raw { TTY_RAW } else { TTY_LINE };
+    // SAFETY: аргумент — число.
+    unsafe { syscall(SYS_TTYMODE, mode, 0, 0) }
+}
+
+/// Напечатать в поток диагностики.
+///
+/// Отличается от [`print`] адресатом, а не оформлением: второй дескриптор идёт
+/// в журнал системы, минуя окно. Полноэкранной программе это единственный
+/// способ сказать слово, не испортив картинку.
+pub fn error(text: &str) {
+    // SAFETY: срез живёт в памяти программы, длина — его собственная.
+    unsafe {
+        syscall(SYS_WRITE, FD_STDERR, text.as_ptr() as usize, text.len());
+    }
+}
+
+/// Напечатать число в поток диагностики.
+pub fn error_num(value: i64) {
+    let negative = value < 0;
+    let mut buffer = [0u8; 21];
+    let mut index = buffer.len();
+    let mut rest = value.unsigned_abs();
+    loop {
+        index -= 1;
+        buffer[index] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    if negative {
+        index -= 1;
+        buffer[index] = b'-';
+    }
+    // SAFETY: в буфер записаны только цифры ASCII и знак.
+    error(unsafe { core::str::from_utf8_unchecked(&buffer[index..]) });
+}
+
+/// Переименовать файл или каталог.
+///
+/// Оба пути уезжают одним буфером: у системного вызова три аргумента, а нужно
+/// четыре значения — два адреса и две длины. Почему выбрана склейка, а не
+/// расширение соглашения о вызовах, сказано в договоре у `SYS_RENAME`.
+pub fn rename(old: &str, new: &str) -> i64 {
+    /// Столько же, сколько принимает ядро.
+    const MAX_PATH: usize = 255;
+
+    let mut buffer = [0u8; 2 * MAX_PATH];
+    let total = old.len() + new.len();
+    if old.is_empty() || new.is_empty() || total > buffer.len() {
+        return ERR_BAD_PATH;
+    }
+    buffer[..old.len()].copy_from_slice(old.as_bytes());
+    buffer[old.len()..total].copy_from_slice(new.as_bytes());
+    // SAFETY: буфер живёт в памяти программы, длины — его собственные.
+    unsafe { syscall(SYS_RENAME, buffer.as_ptr() as usize, old.len(), total) }
 }
 
 /// Закрыть дескриптор.
