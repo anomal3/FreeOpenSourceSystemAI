@@ -178,7 +178,7 @@ fn boot_device_path() -> Option<Vec<u8>> {
 }
 
 /// Байты пути устройства для хендла.
-fn device_path_bytes(handle: Handle) -> Option<Vec<u8>> {
+pub fn device_path_bytes(handle: Handle) -> Option<Vec<u8>> {
     let path = peek::<DevicePath>(handle)?;
     Some(path.as_bytes().to_vec())
 }

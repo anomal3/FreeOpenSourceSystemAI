@@ -30,6 +30,7 @@
 extern crate alloc;
 
 mod account;
+mod bootentry;
 mod disks;
 mod install;
 mod keys;

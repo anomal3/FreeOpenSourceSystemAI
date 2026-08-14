@@ -27,6 +27,7 @@
 //! чинить.
 
 pub mod hid;
+pub mod survey;
 pub mod xhci;
 
 use crate::input::KeyCode;

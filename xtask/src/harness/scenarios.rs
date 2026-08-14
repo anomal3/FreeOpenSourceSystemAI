@@ -1379,7 +1379,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "install",
-        about: "Установщик проходит все экраны и пишет систему на чистый диск.",
+        about: "Установщик проходит все экраны, пишет систему на чистый диск и заводит загрузочную запись.",
         target: Target::Installer,
         usb_only: false,
         tablet: false,
@@ -1388,7 +1388,9 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         arches: &[],
-        reboots: false,
+        // Сценарий **намеренно** перезагружает машину: проверяется, куда она
+        // пойдёт после установки, а с `-no-reboot` она вместо этого погасла бы.
+        reboots: true,
         updates: false,
         ssh_key: false,
         extra: &[],
@@ -1430,10 +1432,27 @@ pub const ALL: &[Scenario] = &[
             // происходить от случайного Enter.
             Step::Key("down"),
             Step::Key("ret"),
-            Step::Await("[install] finished", 240_000),
+            // Загрузочная запись заводится в самом конце, до строки «finished»:
+            // порядок шагов повторяет порядок строк, а не порядок событий.
+            Step::Await("[install] boot entry Boot", 240_000),
+            Step::Await("[install] BootOrder: FreeOS first", 15_000),
+            Step::Await("[install] finished", 30_000),
             Step::Expect("[install] state: /etc/passwd"),
             Step::Wait(1_000),
             Step::Shot("09-done"),
+
+            // И главное утверждение про запись: машина, перезагруженная с
+            // **подключённым** установочным носителем, поднимается в
+            // установленную систему, а не в установщик снова. Без записи
+            // прошивка нашла бы носитель первым — ровно это и случилось в
+            // релизе v0.1.57 на VirtualBox.
+            Step::Key("ret"),
+            Step::Await(crate::version::KERNEL_BANNER, BOOT),
+            // Строка, которой у живой системы не бывает: корень на ext2 есть
+            // только у установленной.
+            Step::Await("root        : ext2 at LBA", 90_000),
+            Step::Await("account     : /etc/passwd", 60_000),
+            Step::Absent("KERNEL PANIC"),
         ],
     },
     Scenario {

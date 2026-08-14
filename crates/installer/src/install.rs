@@ -204,9 +204,14 @@ pub fn run(
 
     progress(1, Step::Gpt);
     let mut partitions = Vec::new();
+    // GUID системного раздела нужен дважды: здесь — в таблице разделов, и в
+    // самом конце — в загрузочной записи, которая называет раздел именно им.
+    // Прошивка ищет раздел по этому числу, а не по номеру: номер меняется от
+    // того, что кто-то переразметил диск, а GUID нет.
+    let esp_guid = Guid::from_entropy(expand(settings.entropy, b"freeos-esp"));
     partitions.push(PartitionSpec {
         type_guid: gpt::ESP_TYPE,
-        unique_guid: Guid::from_entropy(expand(settings.entropy, b"freeos-esp")),
+        unique_guid: esp_guid,
         first_lba: plan.layout.esp.first_lba,
         last_lba: plan.layout.esp.last_lba,
         attributes: 0,
@@ -423,6 +428,16 @@ pub fn run(
 
     progress(6, Step::Flush);
     dev.flush()?;
+
+    // Запись о загрузке заводится **после** того, как всё записано и сброшено:
+    // прошивка, перечитавшая её раньше времени, указывала бы на раздел, которого
+    // ещё нет. Отказ здесь установку не отменяет — почему, сказано в заголовке
+    // `crate::bootentry`.
+    let registered = crate::bootentry::register(target, plan.layout.esp, esp_guid).is_some();
+    if !registered {
+        logln!("[install] no boot entry: eject the medium, or the firmware will find it first");
+    }
+
     logln!("[install] finished");
     Ok(())
 }

@@ -179,6 +179,13 @@ pub enum XhciError {
     Acpi(AcpiError),
     /// На шине нет контроллера с классом xHCI.
     NoController,
+    /// Контроллеры USB есть, но все — не xHCI.
+    ///
+    /// Отдельно от [`XhciError::NoController`] потому, что лечится по-другому:
+    /// там машина без шины USB, здесь — машина, которой нужен драйвер, которого
+    /// у нас нет. Ровно это и случилось на VirtualBox, где по умолчанию дают
+    /// OHCI; перепись выше уже назвала каждый найденный контроллер поимённо.
+    OtherController,
     /// У контроллера не заполнен BAR0 — прошивка не выделила ему окно.
     NoBar,
     /// Окно регистров не удалось отобразить.
@@ -231,6 +238,9 @@ impl core::fmt::Display for XhciError {
         match self {
             Self::Acpi(err) => write!(f, "{err}"),
             Self::NoController => f.write_str("no xHCI controller on the PCI bus"),
+            Self::OtherController => {
+                f.write_str("the USB controllers here are not xHCI; see the list above")
+            }
             Self::NoBar => f.write_str("the controller has no memory BAR assigned"),
             Self::Map(err) => write!(f, "mapping the register window failed: {err}"),
             Self::Version(version) => {
@@ -471,11 +481,25 @@ impl Controller {
         let root = unsafe { pci::Root::discover(rsdp) }.map_err(XhciError::Acpi)?;
         kprintln!("  pci         : {root}");
 
+        // Перепись идёт **до** поиска своего контроллера и печатается всегда.
+        // Машина, на которой ввода нет, обязана сказать почему: «есть OHCI,
+        // драйвера нет» и «шины USB нет вовсе» — разные болезни, а выглядят они
+        // одинаково — мёртвой клавиатурой.
+        //
+        // SAFETY: контракт функции.
+        let census = unsafe { super::survey::take(&root) };
+
         // SAFETY: контракт функции.
         let device = unsafe {
             pci::find_by_class(&root, pci::CLASS_SERIAL_BUS, pci::SUBCLASS_USB, pci::PROG_IF_XHCI)
         }
-        .ok_or(XhciError::NoController)?;
+        .ok_or_else(|| {
+            if census.found > 0 {
+                XhciError::OtherController
+            } else {
+                XhciError::NoController
+            }
+        })?;
         kprintln!(
             "  xhci        : {} vendor {:#06x} device {:#06x} rev {:#04x}",
             device.address,
