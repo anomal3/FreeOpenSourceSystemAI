@@ -2,7 +2,7 @@
 
 An open operating system written from scratch in Rust, targeting **ARM64** and **x86-64**.
 
-> **Status: Phase 30 done.** The system installs itself onto a disk, boots from it, mounts
+> **Status: Phase 33 done.** The system installs itself onto a disk, boots from it, mounts
 > its ext2 root, and comes up as a **desktop** with a mouse: wallpaper, taskbar, start menu,
 > windows you can drag and close, a terminal, a file manager, a system monitor. It runs
 > **programs outside the kernel, each in an address space of its own**: `run /bin/hello`
@@ -17,6 +17,25 @@ An open operating system written from scratch in Rust, targeting **ARM64** and *
 > programs doing SIMD arithmetic cannot see each other's numbers. What all of it adds up to
 > is `/bin/mc`: a two-panel file manager, outside the kernel, driven from the keyboard.
 > On both architectures.
+>
+> **Phases 31–33 done as well.** Programs arrive in **packages** — `pkg install
+> /media/hello-1.0.fpk` lays one out under `/opt`, `pkg verify` catches a file that
+> changed even when its length did not, `pkg remove` takes away exactly what was put
+> there. The disk is now **ESP, two root slots and a state partition**: `sysupdate apply`
+> writes a whole new system into the free slot, and if that system does not come up, the
+> bootloader spends three attempts and **returns to the previous one by itself** — no
+> console, no second computer, and not one file of `/home` lost. And a **supervisor**
+> puts back what dies: a service that is killed comes back in half a second, one that
+> crashes on every start is stopped after three attempts and says so, and the rest of the
+> system does not notice either way.
+
+## Getting it
+
+Ready images are on the [releases page](https://github.com/anomal3/FreeOpenSourceSystemAI/releases).
+Take `FreeOS-Installer_*.iso` to install onto a disk — that is the one that gives you the
+A/B slots and the state partition — or `FreeOS_*.iso` to boot the running system without
+touching any disk at all. `x86_64` for a PC or an ordinary virtual machine, `aarch64` for
+ARM64. UEFI only: there is no BIOS boot path and there will not be one.
 
 ## Why
 
