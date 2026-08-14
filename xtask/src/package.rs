@@ -74,7 +74,7 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     extra.field("summary", "A package that is useless without hello");
     extra.requires("hello");
     extra.file(&Entry {
-        path: String::from("share/extra.txt"),
+        path: String::from("x.txt"),
         mode: 0o644,
         uid: 0,
         gid: 0,
@@ -112,6 +112,12 @@ const README: &str =
 /// **той же длины**, чтобы проверить контрольную сумму, а не размер. Проверка,
 /// ловящая только другой размер, пропустила бы подменённую программу — то есть
 /// ровно тот случай, ради которого сумма и считается.
+///
+/// Лежит он в корне пакета, а не в подкаталоге, и тоже не из лени: команда
+/// подмены уезжает в гостя по серийной линии, а у PL011 на AArch64 приёмный
+/// FIFO — 32 байта. `echo ... > /opt/extra/share/extra.txt` обрывался ровно на
+/// тридцать втором знаке, пока оболочка перерисовывала окно. Подкаталог, чтобы
+/// проверить уборку каталогов при удалении, есть у пакета `hello`.
 const EXTRA: &str = "packaged-ok\n";
 
 /// Точки монтирования раздела состояния.
