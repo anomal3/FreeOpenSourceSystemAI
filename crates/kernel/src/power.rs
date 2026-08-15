@@ -31,9 +31,10 @@ use crate::{kprintln, sched};
 /// консоль. [`crate::shell::print`] знает про оба случая — и про окно, и про
 /// линию.
 macro_rules! announce {
+    // Один вызов, а не два: перевод строки, отправленный отдельно, оставляет
+    // между собой и строкой щель, в которую попадает чужой вывод.
     ($($arg:tt)*) => {{
-        $crate::shell::print(::core::format_args!($($arg)*));
-        $crate::shell::print(::core::format_args!("\n"));
+        $crate::shell::print(::core::format_args!("{}\n", ::core::format_args!($($arg)*)));
     }};
 }
 
