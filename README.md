@@ -284,7 +284,7 @@ asserted in prose:
   `the kernel space maps nothing at 0x0000008000000260`.
 - **The program's memory does not outlive it.** Everything belonging to a program sits under
   a single root entry, so tearing the space down is a walk of one subtree — which is why
-  there is no `unmap` anywhere in this kernel and no need for one. All 136 pages and the 4
+  there is no `unmap` anywhere in this kernel and no need for one. All 784 pages and the 4
   tables holding them go back to the pool, on both exit paths: `exit`, and the fault that
   kills the program from a place it never returned from. Run a program three times and its
   root table lands on the same physical frame each time — that repetition *is* the proof the
@@ -444,7 +444,7 @@ forever 5: this program never ends on its own
 freeos> kill 5
   kill: #5 asked to stop
   user        : killed by request, task #5
-  user        : space released, 136 pages and 4 tables returned
+  user        : space released, 784 pages and 4 tables returned
   #5 /bin/forever: killed by request
 ```
 
@@ -1471,6 +1471,55 @@ person runs `init` themselves.
 on **one** task; a supervisor asleep on the first service would not notice the
 second one dying until the first did.
 
+### HTTPS, and a spare channel
+
+Updates arrive signed (Ed25519, checked by the kernel before a byte reaches a slot), and that
+did not change. What changed is *where they can arrive from*. A system with one update server
+is a promise resting on one machine, and the obvious spare — GitHub Releases, where every
+build already goes — speaks HTTPS and nothing else.
+
+So there is a TLS 1.3 client now, in ring 3, in two crates: `x509` reads certificates and
+walks chains; `tls` does the handshake. Both are deliberately narrow, and the narrowness is
+stated rather than discovered:
+
+- **One cipher suite** — `TLS_CHACHA20_POLY1305_SHA256` — and **one group**, X25519. Both
+  arrived with SSH in Phase 37. AES would be a second cipher with nothing to check it against
+  but somebody else's server. A server that cannot speak ChaCha20 will not talk to us.
+- **No session tickets, no 0-RTT, no client certificates.** A ticket is state to keep between
+  runs; 0-RTT is data sent before the other side has said who it is.
+- **No revocation checking**, neither CRL nor OCSP — and this is the one that deserves saying
+  out loud. Both require reaching the network *before* the network is known to work, which is
+  exactly the moment we are in. Trust in an update does not rest on TLS here; it rests on the
+  signature, and that check happens later and in the kernel.
+- **Certificates: ECDSA on P-256 and P-384, RSA (PKCS#1 v1.5 for certificates, PSS for
+  `CertificateVerify` — TLS 1.3 forbids v1.5 there, and that is where a day goes if you miss
+  it), SHA-256/384/512.** No SHA-1: a collision for it has been computable since 2017.
+
+The RSA arithmetic is ours — Montgomery multiplication over fixed-size limbs, no allocator,
+no division — because the public exponent is seventeen bits and the whole operation is
+seventeen modular squarings. Constant time is not attempted and does not need to be: every
+number involved is public. The elliptic curves are not ours, for the opposite reason.
+
+The root store is a file, `/usr/share/defaults/etc/ca.pem`, for the same reason `/os-keys` is
+a file — it belongs to the image and is replaced with it. Six roots, not four hundred: every
+authority in a store is one more party who can issue a certificate for any name, and the
+other three hundred and ninety-four are never used here. Put your own `/etc/ca.pem` beside it
+and an update will never touch it.
+
+`update.cfg` now lists as many `server=` lines as you like and tries them in order. The old
+three-line form (`server=` plus `port=` and `path=`) still works and always goes first —
+that file lives on the state partition of every already-installed machine, and an update
+cannot reach in to rewrite it.
+
+Redirects are followed now, up to four, which Phase 39 refused to do. The refusal was right
+while trust came from the channel; it does not survive the move to signatures, and GitHub
+serves release assets through two of them. The one redirect still refused is `https://` down
+to `http://`: a channel that degrades mid-conversation is somebody interfering.
+
+`/bin/fetch` came out of all this and stays: `fetch <url>` prints a page, `fetch <url> <file>`
+saves it, `fetch <url> -` counts the bytes and throws them away. It answers "does this machine
+reach that server, and how fast" without anyone having to attempt an update to find out.
+
 ## The test bench
 
 `cargo xtask test` boots the system in QEMU and drives it with nobody at the keyboard:
@@ -1479,7 +1528,7 @@ takes screenshots. A scenario passes only if the guest said what it was supposed
 screenshots are evidence of *how it looked*, never of *what happened*, because a screendump
 shows the last painted frame and after a crash that frame can be three screens stale.
 
-Forty scenarios today: a program runs in an address space of its own, one that faults is
+Forty-six scenarios today: a program runs in an address space of its own, one that faults is
 killed without taking the system with it, one that reaches for kernel memory is refused, and
 every run's pages go back to the pool (`userspace`); a program that makes no system call at
 all is taken off the CPU anyway, and the shell answers a command between its two lines
@@ -1527,7 +1576,14 @@ key exchange and encryption against `/bin/sshd`, naming the algorithms in its ow
 (`ssh-kex`); and that same client logs in with a key on the installed system, runs a command
 and gets its output and exit status back, is refused when the key is one the machine does not
 know, and is refused again — without a byte of the file — when it asks for one this account
-may not read (`ssh-shell`).
+may not read (`ssh-shell`); and the machine updates itself off a server on the host —
+refusing an index signed by a key it does not trust, then taking the signed one, checking the
+SHA-256 of seventy-seven megabytes as they arrive, writing the free slot and rebooting into a
+version that came over the wire (`update-net`); and it does the same over **HTTPS**, where the
+first repository has nothing, the second presents a certificate from a root the guest was
+never told about and is refused by name, and the third — whose root is in `/etc/ca.pem`, and
+whose certificate names an *address* rather than a name — hands over the signed index and then
+half a megabyte through the same connection (`update-tls`).
 
 The mouse scenario never names a coordinate. A mouse is relative — there is no way to *put*
 the cursor anywhere, only to drive it — and the two machines do not even have the same
@@ -1765,7 +1821,7 @@ filesystem and compositor stay untouched. That is the entire point of the split.
 | 38a | Somebody else's machine: a boot entry the firmware honours, a census of USB controllers, and the OHCI driver that census asked for — input works in VirtualBox as it ships | **done** |
 | 38b | Pipes, and a real shell over the network: programs from `/bin` run as the account that logged in, with permissions checked by the kernel | **done** |
 | 39 | Updating over the network, with signatures checked before anything is written | **done** |
-| 39a | TLS, and a second update channel: the same update from GitHub Releases when the first server is silent | planned |
+| 39a | TLS 1.3, X.509 and a second update channel: the same update from GitHub Releases when the first server is silent | **done** |
 | 40 | Memory on request: `mmap`, so a program is no longer a fixed 512 KiB window | planned |
 | 41 | A file mapped into memory, paged in on demand — a model larger than RAM | planned |
 | 42 | Huge pages: a gigabyte of data stops costing a quarter of a million TLB entries | planned |

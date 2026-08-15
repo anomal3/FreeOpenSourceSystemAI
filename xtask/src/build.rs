@@ -202,10 +202,10 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 24] = [
+pub const USER_PROGRAMS: [&str; 25] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sshd",
-    "cat", "sysupdate",
+    "cat", "sysupdate", "fetch",
 ];
 
 /// Программы, которые в `/bin` **не** едут.
@@ -515,6 +515,23 @@ pub fn check(arches: &[Arch]) -> Result<()> {
     // утверждение стоило бы загрузок и получаса, а ошибка в раскладке подписи
     // выглядела бы у клиента неотличимо от чужого ключа.
     for package in ["fpk", "slots", "ssh"] {
+        let mut cmd = cargo();
+        cmd.arg("test").arg("--package").arg(package);
+        util::run(&mut cmd, &format!("cargo test ({package})"))?;
+    }
+
+    // X.509 и TLS — то же рассуждение, доведённое до предела. Разбор ASN.1
+    // ошибается **смещениями**, а расписание ключей TLS — метками, и обе ошибки
+    // в эмуляторе выглядят одинаково: «сервер прислал чужой сертификат». Здесь
+    // они стоят секунды и называются по имени:
+    //
+    // * `x509` проверяется настоящими цепочками, снятыми с живых серверов
+    //   (`crates/x509/tests/certs/`), — ECDSA на P-256 и P-384 и RSA на 2048 и
+    //   4096 битах;
+    // * `tls` — векторами из RFC 8448 (расписание ключей целиком) и живым
+    //   рукопожатием с `rustls`. Последнее — единственное, что отличает
+    //   «клиент работает» от «две наши половины согласны друг с другом».
+    for package in ["x509", "tls"] {
         let mut cmd = cargo();
         cmd.arg("test").arg("--package").arg(package);
         util::run(&mut cmd, &format!("cargo test ({package})"))?;

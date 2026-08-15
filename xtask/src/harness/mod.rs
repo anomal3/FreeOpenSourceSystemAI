@@ -37,6 +37,7 @@ mod scenarios;
 mod serial;
 mod shot;
 mod sshkeys;
+mod tlskeys;
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -291,8 +292,23 @@ fn execute(
 
     // Сервер обновлений — тем же приёмом и по той же причине: гость идёт к нему
     // сам, в первые же секунды после того, как поднялась сеть.
+    //
+    // Их сразу три, и это не расточительство. Обычный HTTP — то, чем машина
+    // обновляется сегодня; HTTPS с корнем, который гость знает, — запасной
+    // канал фазы 39a; HTTPS с корнем, которого он не знает, — единственное,
+    // что отличает «мы соединились по TLS» от «мы проверили, с кем». Клиент,
+    // принимающий любой сертификат, проходит первые две проверки так же
+    // успешно, как правильный.
     let _host_repo = if scenario.host_repo {
-        Some(start_host_repo(repo_dir(arch))?)
+        Some((
+            start_host_repo(repo_dir(arch))?,
+            start_host_tls_repo(repo_dir(arch), HOST_TLS_PORT, tlskeys::trusted()?)?,
+            start_host_tls_repo(
+                repo_dir(arch),
+                HOST_TLS_STRANGER_PORT,
+                tlskeys::stranger()?,
+            )?,
+        ))
     } else {
         None
     };
@@ -855,6 +871,186 @@ const HOST_ECHO_PORT: u16 = 2001;
 /// `ext2::Editor` перезаписывать не умеет.
 const HOST_REPO_PORT: u16 = 2002;
 
+/// Порт HTTPS-сервера, которому гость доверяет.
+const HOST_TLS_PORT: u16 = 2003;
+
+/// Порт HTTPS-сервера, чей корень гостю неизвестен.
+const HOST_TLS_STRANGER_PORT: u16 = 2004;
+
+/// Поднять на хосте тот же репозиторий, но по HTTPS.
+///
+/// Реализация TLS здесь **чужая** (`rustls`), и это главное свойство проверки:
+/// наш клиент, проверенный нашим же сервером, доказывал бы только то, что две
+/// половины одной ошибки согласны друг с другом. Расписание ключей, разбор
+/// расширений, порядок сообщений — всё это `rustls` делает по стандарту, а не
+/// так, как поняли его мы.
+fn start_host_tls_repo(
+    root: PathBuf,
+    port: u16,
+    material: tlskeys::Material,
+) -> Result<std::net::TcpListener> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::Arc;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(material.leaf_der)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(material.key_der)),
+        )
+        .context("rustls не принял сертификат стенда")?;
+    let config = Arc::new(config);
+
+    let listener = bind_with_patience(port, "сервер обновлений по HTTPS")?;
+    let worker = listener.try_clone().context("не удалось раздвоить слушающий сокет")?;
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+
+        for stream in worker.incoming() {
+            let Ok(stream) = stream else { break };
+            stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+            // Срока на запись нет по той же причине, что у обычного сервера:
+            // гость вычитывает поток медленно, и любой срок здесь означает, что
+            // сервер обрывает исправную загрузку.
+            stream.set_write_timeout(None).ok();
+
+            let Ok(mut connection) = rustls::ServerConnection::new(config.clone()) else {
+                continue;
+            };
+            let mut stream = stream;
+
+            // Обмен ведётся руками, а не через `StreamOwned`, и это не вкусовое
+            // решение — на нём стенд встал на двадцать секунд.
+            //
+            // Дефект виден только в записи трафика: клиент присылает `Finished`
+            // и запрос двумя сегментами через три миллисекунды, а сервер
+            // успевает прочитать оба **одним** `read_tls`. Рукопожатие при этом
+            // заканчивается, `complete_io` возвращается — и следующий вызов
+            // снова идёт читать сокет, хотя запись с запросом уже лежит
+            // разобранной в буфере. Читать нечего, и сервер стоит, пока клиент
+            // не закроет соединение по своему сроку. Со стороны это выглядит
+            // как «сервер не отвечает», и искать причину идут в клиента.
+            //
+            // Лекарство — порядок: **сначала разобрать то, что уже прочитано**,
+            // и только потом блокироваться на сокете.
+            let mut request = Vec::new();
+            let mut broken = false;
+            loop {
+                if let Err(err) = connection.process_new_packets() {
+                    eprintln!("[tls:{port}] разбор не удался: {err}");
+                    broken = true;
+                    break;
+                }
+                while connection.wants_write() {
+                    if connection.write_tls(&mut stream).is_err() {
+                        broken = true;
+                        break;
+                    }
+                }
+                if broken {
+                    break;
+                }
+                let mut chunk = [0u8; 4096];
+                match connection.reader().read(&mut chunk) {
+                    Ok(0) => {}
+                    Ok(got) => request.extend_from_slice(&chunk[..got]),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        broken = true;
+                        break;
+                    }
+                }
+                // Запрос кончается пустой строкой; тела у GET нет.
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+                match connection.read_tls(&mut stream) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(err) => {
+                        eprintln!("[tls:{port}] чтение оборвалось: {err}");
+                        broken = true;
+                        break;
+                    }
+                }
+            }
+            if broken {
+                continue;
+            }
+
+            let request = String::from_utf8_lossy(&request).to_string();
+            let first = request.lines().next().unwrap_or("");
+            let mut fields = first.split_whitespace();
+            let method = fields.next().unwrap_or("");
+            let target = fields.next().unwrap_or("/");
+            let body = if method == "GET" { file_for(&root, target) } else { None };
+
+            let response = match &body {
+                Some(data) => format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                    data.len()
+                ),
+                None => String::from(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+            };
+            let mut answer = response.into_bytes();
+            if let Some(data) = body {
+                answer.extend_from_slice(&data);
+            }
+            let mut sent = 0usize;
+            let mut failed = false;
+            while sent < answer.len() {
+                let took = match connection.writer().write(&answer[sent..]) {
+                    Ok(0) => break,
+                    Ok(took) => took,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                };
+                sent += took;
+                while connection.wants_write() {
+                    if connection.write_tls(&mut stream).is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed {
+                    break;
+                }
+            }
+            // `close_notify` и `FIN`: гость дочитывает тело по длине, но сказать
+            // «это конец, а не обрыв» обязан именно TLS — иначе оборванное
+            // соединение неотличимо от законченного.
+            connection.send_close_notify();
+            while connection.wants_write() {
+                if connection.write_tls(&mut stream).is_err() {
+                    break;
+                }
+            }
+            stream.flush().ok();
+            stream.shutdown(std::net::Shutdown::Write).ok();
+        }
+    });
+    println!("стенд: сервер обновлений по HTTPS слушает {port}");
+    Ok(listener)
+}
+
+/// Занять порт, повторяя попытки: он мог остаться в `TIME_WAIT`.
+fn bind_with_patience(port: u16, what: &str) -> Result<std::net::TcpListener> {
+    for attempt in 0..10 {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(bound) => return Ok(bound),
+            Err(err) if attempt == 9 => {
+                return Err(err).with_context(|| format!("не удалось занять порт {port} под {what}"));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(300)),
+        }
+    }
+    unreachable!("цикл выше либо занял порт, либо вернул ошибку")
+}
+
 /// Поднять на хосте сервер, раздающий каталог репозитория по HTTP.
 ///
 /// Настоящий HTTP, а не заглушка, отвечающая одним и тем же: клиент в госте
@@ -1177,8 +1373,25 @@ fn prepare_repo(arch: Arch, release: bool) -> Result<()> {
     // настройках. Путь короткий (`/x/`) намеренно — он уезжает в гостя строкой
     // по серийной линии, а длинная строка на aarch64 теряет хвост.
     crate::repo::build_untrusted(&dir, NET_UPDATE_VERSION, arch, &dir.join("x"))?;
+
+    // Файл под проверку объёмной загрузки. Полмегабайта, а не образ системы: по
+    // TLS в отладочной сборке под эмуляцией семьдесят семь мегабайт означали бы
+    // сценарий на полдня, а доказать надо другое — что через рукопожатие
+    // проходит не одна запись, а сотни: со сменой счётчика записей и с
+    // границами записей, которые не совпадают ни с границами кусков TCP, ни с
+    // границами чтений программы.
+    //
+    // Содержимое считаемое, а не случайное: сценарий сверяет длину, и файл,
+    // меняющийся от прогона к прогону, не дал бы ничего.
+    let blob: Vec<u8> = (0..BLOB_SIZE).map(|index| (index % 251) as u8).collect();
+    let path = dir.join("blob");
+    std::fs::write(&path, &blob)
+        .with_context(|| format!("не удалось записать {}", path.display()))?;
     Ok(())
 }
+
+/// Размер файла, который сценарий качает по HTTPS.
+pub const BLOB_SIZE: usize = 512 * 1024;
 
 /// Версия, которую предлагает сервер обновлений стенда.
 ///
@@ -1197,10 +1410,17 @@ fn place_update_config(disk_path: &std::path::Path) -> Result<()> {
     use disk::BlockDevice as _;
 
     let text = format!(
-        "# Written by the harness: the update server lives on the host.\n\
+        "# Written by the harness: the update servers live on the host.\n\
+         #\n\
+         # Three of them, and the order is the point. The first is plain HTTP --\n\
+         # what a machine updates over today. The second is HTTPS with a\n\
+         # certificate from a root this guest has never heard of, and it has to\n\
+         # be refused. The third is HTTPS with the root in /etc/ca.pem.\n\
          server=10.0.2.2\n\
          port={HOST_REPO_PORT}\n\
-         path=/\n"
+         path=/\n\
+         server=https://10.0.2.2:{HOST_TLS_STRANGER_PORT}/\n\
+         server=https://10.0.2.2:{HOST_TLS_PORT}/\n"
     );
 
     let mut dev = crate::diskfile::DiskFile::open(disk_path, 512)?;
@@ -1221,6 +1441,18 @@ fn place_update_config(disk_path: &std::path::Path) -> Result<()> {
         Err(ext2::Error::Exists) => println!("стенд: /etc/update.cfg у гостя уже лежит"),
         Err(err) => bail!("не удалось записать /etc/update.cfg: {err}"),
     }
+
+    // Корень, которому гость будет доверять. Кладётся правкой человека, в
+    // `/etc`, а не в образ: корень стенда выписан на машине разработчика, и в
+    // выпущенном ISO ему делать нечего — ровно то же рассуждение, что у ключа
+    // SSH (см. заголовок `sshkeys`).
+    let ca = tlskeys::trusted()?.root_pem;
+    match fs.write_file_path(&mut dev, "etc/ca.pem", ca.as_bytes(), 0o644, 0, 0) {
+        Ok(_) => println!("стенд: гостю положен /etc/ca.pem с корнем стенда"),
+        Err(ext2::Error::Exists) => println!("стенд: /etc/ca.pem у гостя уже лежит"),
+        Err(err) => bail!("не удалось записать /etc/ca.pem: {err}"),
+    }
+
     fs.flush(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось сбросить раздел состояния: {err}"))?;
     fs.mark_clean(&mut dev)

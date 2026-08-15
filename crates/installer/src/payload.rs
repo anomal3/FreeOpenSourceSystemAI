@@ -220,7 +220,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// после этого **перестал собираться** — и это лучший исход из возможных,
 /// потому что собравшийся установщик поставил бы систему без `/bin/sshd`, а
 /// узналось бы это только по не запустившейся службе.
-const PROGRAMS: [(&CStr16, &str); 24] = [
+const PROGRAMS: [(&CStr16, &str); 25] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -247,6 +247,7 @@ const PROGRAMS: [(&CStr16, &str); 24] = [
     // Имя на носителе короче настоящего: FAT здесь без длинных имён, а
     // `SYSUPDATE` — девять знаков. В `/bin` файл ложится полным именем.
     (cstr16!("\\FREEOS\\BIN\\SYSUPD"), "sysupdate"),
+    (cstr16!("\\FREEOS\\BIN\\FETCH"), "fetch"),
 ];
 
 /// Эталонные настройки на носителе и их пути в корневом образе.
@@ -255,7 +256,7 @@ const PROGRAMS: [(&CStr16, &str); 24] = [
 /// же комплект, разложенный по носителю. Расхождение видно не сразу: система
 /// установится и заработает, а обнаружится пропажа тем, что нужная настройка не
 /// имеет умолчания — то есть службой, которая не запустилась.
-const DEFAULTS: [(&CStr16, &str); 2] = [
+const DEFAULTS: [(&CStr16, &str); 3] = [
     (
         cstr16!("\\FREEOS\\DEF\\SERVICES"),
         "usr/share/defaults/etc/services",
@@ -263,6 +264,13 @@ const DEFAULTS: [(&CStr16, &str); 2] = [
     (
         cstr16!("\\FREEOS\\DEF\\UPDATE.CFG"),
         "usr/share/defaults/etc/update.cfg",
+    ),
+    // Корни, которым доверяет `sysupdate`, — фаза 39a. Без них система
+    // установится и заработает, но запасной канал обновлений (GitHub, только
+    // HTTPS) окажется недоступен, и сказано об этом будет вслух.
+    (
+        cstr16!("\\FREEOS\\DEF\\CA.PEM"),
+        "usr/share/defaults/etc/ca.pem",
     ),
 ];
 

@@ -924,7 +924,7 @@ pub const ALL: &[Scenario] = &[
             // число, которое программа могла бы напечатать, ничего не зная:
             // сверяется оно с часами хоста, тем же допуском, что и в `clock`.
             Step::Clock("hello: epoch ", 10, 15_000),
-            // Окно возвращается в пул целиком: 384 страницы образа плюс 16
+            // Окно возвращается в пул целиком: 768 страниц образа плюс 16
             // страниц стека и четыре таблицы, включая корень. Точное число
             // здесь намеренно — «часть окна вернулась» выглядело бы так же,
             // как «всё», — и оно связывает сценарий с двумя константами ядра
@@ -934,7 +934,7 @@ pub const ALL: &[Scenario] = &[
             // когда окно было в три раза меньше, и сценарий с ним не проходил.
             // Строка приходит раньше отчёта оболочки: пространство разбирается
             // внутри `run`, а не после него.
-            Step::Await("space released, 400 pages and 4 tables returned", 15_000),
+            Step::Await("space released, 784 pages and 4 tables returned", 15_000),
             Step::Await("exited with code 0", 15_000),
             // Программа, которой сказали, что делать: путь приходит аргументом,
             // а не зашит в неё. Числа точные и это намеренно — «что-то
@@ -976,7 +976,7 @@ pub const ALL: &[Scenario] = &[
             // Снятая отказом программа возвращается в ядро не оттуда, откуда
             // уходила, и уборку на этом пути легко потерять — поэтому та же
             // строка проверяется и здесь.
-            Step::Await("space released, 400 pages and 4 tables returned", 15_000),
+            Step::Await("space released, 784 pages and 4 tables returned", 15_000),
             Step::Await("killed by the kernel", 15_000),
             // Третья читает память ядра по адресу, который в её собственных
             // таблицах есть: корень программы — копия ядерного. Отказ здесь
@@ -1250,7 +1250,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("user        : killed by request, task #{}", 15_000),
             // Память вернулась в пул целиком, тем же путём, что и после отказа:
             // 128 страниц образа, 8 стека и четыре таблицы.
-            Step::Await("space released, 400 pages and 4 tables returned", 15_000),
+            Step::Await("space released, 784 pages and 4 tables returned", 15_000),
             Step::Await("#{} /bin/forever: killed by request", 15_000),
             // Снять её второй раз нельзя, и отказ объясняет почему.
             Step::Line("kill {}"),
@@ -2845,6 +2845,86 @@ pub const ALL: &[Scenario] = &[
             Step::Line("cat /etc/update.cfg"),
             Step::Await("server=10.0.2.2", 15_000),
             Step::Shot("update-net"),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "update-tls",
+        about: "Запасной канал: первый сервер молчит, чужому корню отказано, а свой отдаёт индекс по HTTPS.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        guest_port: 0,
+        host_echo: false,
+        // Тот же комплект, что у `update-net`: репозиторий на хосте, `/etc`
+        // гостя с тремя адресами и корнем стенда. Серверов при этом поднимается
+        // три — обычный и два по HTTPS, с разными корнями.
+        host_repo: true,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        ssh_key: false,
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 120_000),
+            Step::Wait(2_000),
+
+            // Самое простое утверждение первым: одна страница по HTTPS,
+            // руками. Если сломано рукопожатие или проверка цепочки, дальше
+            // читать журнал незачем — отказ назван здесь.
+            Step::Line("run /bin/fetch https://10.0.2.2:2003/index"),
+            // Число байт здесь не пишется: индекс у каждой архитектуры свой и
+            // длиной отличается. Проверяется то, что важно, — что программа
+            // дошла до отчёта об успехе, а не до отказа.
+            Step::Await(" bytes in ", 120_000),
+            Step::Wait(1_000),
+
+            // Главная строка сценария. Путь `/nothing/` относится **только** к
+            // первому серверу — тому, что задан старой записью `server=` без
+            // схемы; у записей, заданных полным адресом, путь входит в адрес.
+            // Значит первый обязан ответить «нет такого файла», второй —
+            // отказать по сертификату, а третий отдать индекс.
+            Step::Line("sysupdate check /nothing/"),
+            // Все три адреса названы вслух, и в том порядке, в котором их
+            // пробуют: молча выбранный сервер — это отказ, причину которого
+            // потом не найти.
+            Step::Await("repository http://10.0.2.2:2002/nothing/", 60_000),
+            Step::Await("repository https://10.0.2.2:2004/", 30_000),
+            Step::Await("repository https://10.0.2.2:2003/", 30_000),
+            Step::Await("https is available; the roots come from ca.pem", 30_000),
+            // Первый: файла нет.
+            Step::Await("index: the server refused the request (404)", 90_000),
+            // Второй: рукопожатие состоялось, а цепочка — нет. Это и есть
+            // проверка, ради которой стенд держит второй корень: клиент,
+            // принимающий любой сертификат, дошёл бы здесь до индекса.
+            Step::Await("the chain leads to nobody this system trusts", 120_000),
+            // Третий: TLS 1.3 с сертификатом на **адрес** (iPAddress в SAN),
+            // проверенной цепочкой и подписанным индексом.
+            Step::Await("the index is signed by a key this system trusts", 120_000),
+            Step::Await("the server offers FreeOS 0.3", 30_000),
+            Step::Wait(1_000),
+
+            // И объёмная загрузка по тому же каналу: полмегабайта — это сотни
+            // записей TLS, то есть счётчик, сменившийся много раз, и границы
+            // записей, не совпадающие ни с чем. Одного индекса в две тысячи
+            // байт для этого мало: он умещается в одну запись.
+            Step::Line("run /bin/fetch https://10.0.2.2:2003/blob -"),
+            Step::Await("fetch: 524288 bytes in", 300_000),
+            Step::Line("cat /os-release"),
+            Step::Await("version=", 15_000),
+            Step::Shot("update-tls"),
+
+            // Чужой корень отдельной строкой — чтобы отказ был виден и тогда,
+            // когда сценарий смотрят глазами.
+            Step::Line("run /bin/fetch https://10.0.2.2:2004/index"),
+            Step::Await("fetch: the chain leads to nobody this system trusts", 120_000),
+
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

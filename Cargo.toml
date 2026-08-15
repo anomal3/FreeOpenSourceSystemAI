@@ -14,9 +14,11 @@ members = [
     "crates/osupdate",
     "crates/slots",
     "crates/ssh",
+    "crates/tls",
     "crates/usb-hid",
     "crates/user-abi",
     "crates/user-progs",
+    "crates/x509",
 ]
 
 # Bare-metal crates cannot be built for the host triple. A bare `cargo build`

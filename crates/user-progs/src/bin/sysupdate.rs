@@ -31,19 +31,23 @@
 //! поймает только в конце, потратив полчаса и место на разделе. Ключи для этой
 //! проверки те же самые, `/os-keys`, и разбор тот же (`osupdate`).
 //!
-//! # Транспорт — HTTP, и это решение
+//! # Серверов теперь несколько, и это главное в фазе 39a
 //!
-//! Доверие даёт подпись, а не канал: так устроен Debian тридцать лет. TLS сверх
-//! подписи скрывает лишь то, какую версию качают, а стоит X.509, цепочек и
-//! хранилища корней — фазы размером с TCP. Прямое следствие: **с GitHub эта
-//! программа качать не умеет**, он отдаёт только по HTTPS. Появится это в 39a.
+//! `update.cfg` содержит столько строк `server=`, сколько нужно; первый не
+//! ответил — берём следующий. Второй канал — GitHub Releases, и он **обязан**
+//! идти по HTTPS: другого GitHub не отдаёт. Отсюда весь TLS (крейты `tls` и
+//! `x509`) и хранилище корней `ca.pem` рядом с этим файлом.
 //!
-//! # Откуда берётся адрес сервера
+//! Транспорт при этом ничего не решает: доверие как держалось на подписи
+//! Ed25519, так и держится. TLS нужен затем, чтобы GitHub вообще ответил, а не
+//! затем, чтобы ему поверить.
 //!
-//! Из `update.cfg` — сначала `/etc`, потом эталон образа (см. `config_path`).
-//! Ровно тот случай, ради которого умолчания и заведены: адрес репозитория
-//! приезжает с образом, а машина, которой нужен другой, кладёт свой файл в
-//! `/etc`, и обновление образа его не трогает.
+//! # Откуда берутся настройки
+//!
+//! Из `update.cfg` и `ca.pem` — сначала `/etc`, потом эталон образа (см.
+//! `config_path`). Ровно тот случай, ради которого умолчания и заведены: адреса
+//! репозиториев и набор корней приезжают с образом, а машина, которой нужны
+//! другие, кладёт свои файлы в `/etc`, и обновление образа их не трогает.
 
 #![no_std]
 #![no_main]
@@ -52,11 +56,14 @@ use osupdate::index::{self, Index};
 use osupdate::keys::{self, Trusted};
 use user_progs::{
     Args, ERR_UPDATE_REFUSED, SLOT_B, apply_update, close, config_path, error, error_num, exit,
-    http, open, print, print_u64, println, read, resolve, uid, write,
+    http, open, print, print_u64, println, read, time_now, uid, write,
 };
 
 /// Имя файла настроек.
 const CONFIG: &str = "update.cfg";
+
+/// Имя файла с доверенными корнями.
+const CA: &str = "ca.pem";
 
 /// Куда кладётся скачанное.
 ///
@@ -74,6 +81,12 @@ const KEYS: &str = "/os-keys";
 /// Версия, с которой машина работает сейчас.
 const OS_RELEASE: &str = "/os-release";
 
+/// Сколько репозиториев помещается в список.
+///
+/// Четыре при двух используемых (свой сервер и GitHub). Предел существует
+/// потому, что список лежит в массиве, а не потому, что больше не бывает.
+const MAX_SERVERS: usize = 4;
+
 /// Для какой архитектуры собрана эта программа.
 ///
 /// Строка та же, что пишет в манифест и в индекс `xtask` (`Arch::name`), и та
@@ -84,18 +97,37 @@ const ARCH: &str = "x86_64";
 #[cfg(target_arch = "aarch64")]
 const ARCH: &str = "aarch64";
 
-/// Рабочий буфер загрузки.
+/// Рабочий буфер: сюда читается тело ответа.
 ///
 /// Статик, а не массив на стеке: стека у программы 64 КиБ, и восьмикилобайтный
 /// буфер в кадре — это восьмая его часть на всю глубину вызовов, включая
 /// проверку подписи, которая и так близко ко дну (фаза 38, дефект 4).
 static mut SCRATCH: [u8; 8 * 1024] = [0; 8 * 1024];
 
+/// Буфер под байты **с провода**.
+///
+/// Отдельный от `SCRATCH` потому, что при HTTPS их два разных потока: в этом
+/// лежит зашифрованное, только что прочитанное из сокета, в том —
+/// расшифрованное. При обычном HTTP он не используется вовсе.
+static mut WIRE: [u8; 4 * 1024] = [0; 4 * 1024];
+
 /// Буфер под индекс и его подпись.
 static mut TEXT: [u8; index::LIMIT] = [0; index::LIMIT];
 
 /// Буфер под файл ключей.
 static mut KEYFILE: [u8; keys::LIMIT] = [0; keys::LIMIT];
+
+/// Буферы соединения TLS — почти шестьдесят килобайт.
+///
+/// В статике, а не на стеке, по той же причине, что и всё остальное здесь: стек
+/// программы — 64 КиБ, и одно рукопожатие целиком его бы и заняло.
+static mut TLS_IO: tls::Buffers = tls::Buffers::new();
+
+/// Текст `ca.pem`, как он прочитан с диска.
+static mut CA_TEXT: [u8; 16 * 1024] = [0; 16 * 1024];
+
+/// Он же, разобранный в DER: сюда указывают корни хранилища.
+static mut CA_DER: [u8; 12 * 1024] = [0; 12 * 1024];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
@@ -122,29 +154,22 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
 fn usage() {
     println("usage: sysupdate check|get [repository path]");
     println("       sysupdate apply [file]");
-    println("  the server is named in /etc/update.cfg, or in the image defaults");
+    println("  the servers are named in /etc/update.cfg, or in the image defaults");
 }
 
-/// Где лежит репозиторий: адрес, порт и путь.
-struct Server {
-    address: u32,
-    port: u16,
-    /// Всегда начинается и кончается косой чертой.
-    path: Path,
-}
-
-/// Путь репозитория — короткая строка на стеке.
+/// Строка адреса, собираемая по кусочкам.
 ///
 /// Своя, а не [`user_progs::Path`]: тот собирается под предел путей файловой
-/// системы, а здесь предел другой и другой смысл — это кусок запроса HTTP.
-struct Path {
-    buffer: [u8; 128],
+/// системы, а здесь предел другой и другой смысл — это адрес целиком, и у
+/// GitHub он с подписью в тысячу знаков.
+struct Text {
+    buffer: [u8; http::MAX_URL],
     len: usize,
 }
 
-impl Path {
+impl Text {
     const fn new() -> Self {
-        Self { buffer: [0; 128], len: 0 }
+        Self { buffer: [0; http::MAX_URL], len: 0 }
     }
 
     fn push(&mut self, text: &str) -> bool {
@@ -156,18 +181,54 @@ impl Path {
         true
     }
 
+    fn push_u16(&mut self, mut value: u16) -> bool {
+        let mut digits = [0u8; 5];
+        let mut at = digits.len();
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        // SAFETY: в `digits` записаны только цифры ASCII.
+        self.push(unsafe { core::str::from_utf8_unchecked(&digits[at..]) })
+    }
+
     fn as_str(&self) -> &str {
         // SAFETY: в буфер попадают только байты из `&str`, то есть UTF-8.
         unsafe { core::str::from_utf8_unchecked(&self.buffer[..self.len]) }
     }
 }
 
-/// Прочитать настройки и разобрать адрес.
+/// Один репозиторий: адрес, оканчивающийся косой чертой.
+struct Server {
+    base: Text,
+}
+
+impl Server {
+    /// Собрать полный адрес файла в этом репозитории.
+    fn url(&self, name: &str, out: &mut Text) -> bool {
+        out.len = 0;
+        out.push(self.base.as_str()) && out.push(name)
+    }
+}
+
+/// Список репозиториев в том порядке, в котором их пробовать.
+struct Servers {
+    list: [Server; MAX_SERVERS],
+    len: usize,
+}
+
+/// Прочитать настройки и собрать список репозиториев.
 ///
 /// `override_path` — второй аргумент командной строки. Он **не** заменяет
 /// сервер, только путь на нём: адрес репозитория — это решение о машине, и
-/// принимать его из строки, набранной в чужой оболочке, не стоит.
-fn server(override_path: Option<&str>) -> Option<Server> {
+/// принимать его из строки, набранной в чужой оболочке, не стоит. Применяется он
+/// только к записям, заданным старым способом (`server=` без схемы): у записи,
+/// заданной полным адресом, путь — часть адреса.
+fn servers(override_path: Option<&str>) -> Option<Servers> {
     let Some(path) = config_path(CONFIG) else {
         error("sysupdate: no ");
         error(CONFIG);
@@ -195,9 +256,18 @@ fn server(override_path: Option<&str>) -> Option<Server> {
         return None;
     };
 
+    let mut out = Servers {
+        list: [const { Server { base: Text::new() } }; MAX_SERVERS],
+        len: 0,
+    };
+    // Старая запись — три строки: `server=` с именем, `port=` и `path=`. Она
+    // осталась рабочей намеренно: этот файл лежит на разделе состояния у каждой
+    // уже установленной машины, и обновление до него не дотягивается. Ломать
+    // его — значит выключить обновления ровно тем, кто уже обновлялся.
     let mut host: Option<&str> = None;
     let mut port = 80u16;
     let mut repo: Option<&str> = None;
+
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -206,52 +276,110 @@ fn server(override_path: Option<&str>) -> Option<Server> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
+        let value = value.trim();
         match key.trim() {
-            "server" => host = Some(value.trim()),
-            "port" => port = value.trim().parse::<u16>().unwrap_or(80),
-            "path" => repo = Some(value.trim()),
+            "server" => {
+                if value.starts_with("http://") || value.starts_with("https://") {
+                    // Полный адрес — сам себе репозиторий.
+                    if out.len == MAX_SERVERS {
+                        error("sysupdate: more server= lines than this system will hold\n");
+                        continue;
+                    }
+                    let entry = &mut out.list[out.len];
+                    entry.base.len = 0;
+                    if !entry.base.push(value) {
+                        error("sysupdate: that repository address is too long\n");
+                        continue;
+                    }
+                    if !value.ends_with('/') && !entry.base.push("/") {
+                        continue;
+                    }
+                    out.len += 1;
+                } else {
+                    // Старая запись: собирается после того, как прочитаны все
+                    // строки, — `port=` и `path=` вправе стоять после неё.
+                    host = Some(value);
+                }
+            }
+            "port" => port = value.parse::<u16>().unwrap_or(80),
+            "path" => repo = Some(value),
             _ => {}
         }
     }
 
-    let Some(host) = host else {
+    if let Some(host) = host {
+        // Старая запись становится **первой** в списке: до фазы 39a она была
+        // единственной, и машина, у которой в `/etc` лежит своя, обязана
+        // по-прежнему ходить туда в первую очередь.
+        let mut entry = Server { base: Text::new() };
+        let mut ok = entry.base.push("http://") && entry.base.push(host);
+        if port != 80 {
+            ok = ok && entry.base.push(":") && entry.base.push_u16(port);
+        }
+        let wanted = override_path.or(repo).unwrap_or("/");
+        if !wanted.starts_with('/') {
+            ok = ok && entry.base.push("/");
+        }
+        ok = ok && entry.base.push(wanted);
+        if !wanted.ends_with('/') {
+            ok = ok && entry.base.push("/");
+        }
+        if !ok {
+            error("sysupdate: that repository path is too long\n");
+            return None;
+        }
+        if out.len == MAX_SERVERS {
+            out.len -= 1;
+        }
+        out.list[..out.len + 1].rotate_right(1);
+        out.list[0] = entry;
+        out.len += 1;
+    }
+
+    if out.len == 0 {
         error("sysupdate: no server= line in the configuration\n");
         return None;
-    };
-    // Адрес либо записан числами, либо спрашивается у резолвера ядра. Второе —
-    // это ещё одна причина не ответить, поэтому в умолчаниях стоит адрес.
-    let address = match parse_ip(host) {
-        Some(address) => address,
-        None => match resolve(host) {
-            Some(address) => address,
-            None => {
-                error("sysupdate: cannot resolve ");
-                error(host);
-                error("\n");
-                return None;
-            }
-        },
-    };
+    }
+    for index in 0..out.len {
+        print("sysupdate: repository ");
+        println(out.list[index].base.as_str());
+    }
+    Some(out)
+}
 
-    let mut path = Path::new();
-    let wanted = override_path.or(repo).unwrap_or("/");
-    if !wanted.starts_with('/') && !path.push("/") {
+/// Прочитать `ca.pem` и построить хранилище корней.
+///
+/// Отсутствие файла — не ошибка: репозиторий по обычному HTTP работает и без
+/// него. Ошибка — молчание об этом, поэтому здесь строка в журнал.
+fn trusted_roots() -> Option<x509::Store<'static>> {
+    let path = config_path(CA)?;
+    let fd = open(path.as_str());
+    if fd < 0 {
         return None;
     }
-    if !path.push(wanted) {
-        error("sysupdate: that repository path is too long\n");
+    // SAFETY: статик принадлежит этой задаче, см. пояснение в `servers`.
+    let text_buffer = unsafe { &mut *core::ptr::addr_of_mut!(CA_TEXT) };
+    let got = read(fd, text_buffer);
+    close(fd);
+    let Ok(text) = core::str::from_utf8(&text_buffer[..got.max(0) as usize]) else {
+        error("sysupdate: ca.pem is not text\n");
         return None;
+    };
+    // SAFETY: статик принадлежит этой задаче, см. пояснение в `servers`.
+    let der = unsafe { &mut *core::ptr::addr_of_mut!(CA_DER) };
+    match x509::Store::parse_pem(text, der) {
+        Ok(store) if store.is_empty() => {
+            error("sysupdate: ca.pem holds no certificate\n");
+            None
+        }
+        Ok(store) => Some(store),
+        Err(err) => {
+            error("sysupdate: ca.pem: ");
+            error(err.text());
+            error("\n");
+            None
+        }
     }
-    if !wanted.ends_with('/') && !path.push("/") {
-        return None;
-    }
-
-    print("sysupdate: repository ");
-    print_ip(address);
-    print(":");
-    print_u64(u64::from(port));
-    println(path.as_str());
-    Some(Server { address, port, path })
 }
 
 /// Что предлагает сервер.
@@ -262,6 +390,8 @@ struct Offer {
     file_len: usize,
     size: u64,
     sha256: [u8; 32],
+    /// Который из репозиториев ответил.
+    server: usize,
 }
 
 impl Offer {
@@ -276,73 +406,85 @@ impl Offer {
     }
 }
 
-/// Забрать индекс, проверить его подпись и вынуть из него запись для этой машины.
+/// Обойти репозитории по очереди и взять предложение у первого, кто ответил.
 ///
 /// Порядок обязателен: **сначала подпись, потом содержимое**. Разобрать сначала,
 /// а проверить потом — значит принять решение по неподписанным данным и
 /// объяснять потом, почему машина полезла качать файл, которого никто не
 /// подписывал.
-fn offer(server: &Server) -> Option<Offer> {
+fn offer(servers: &Servers, trust: &mut Option<http::Trust<'static>>) -> Option<Offer> {
     let trusted = trusted_keys()?;
 
-    let index_text = fetch_text(server, "index")?;
-    // Подпись читается **после** индекса и в тот же буфер нельзя: индекс нужен
-    // целиком, чтобы посчитать по нему хеш. Поэтому под подпись — стек: она
-    // короткая, строка на 140 знаков.
-    let mut signature_text = [0u8; 256];
-    let signature_len = fetch_into(server, "index.sig", &mut signature_text)?;
-    let Ok(signature_text) = core::str::from_utf8(&signature_text[..signature_len]) else {
-        error("sysupdate: index.sig is not text\n");
-        return None;
-    };
-    let Some(signature) = index::parse_signature(signature_text) else {
-        error("sysupdate: index.sig does not hold an ed25519 signature\n");
-        return None;
-    };
+    for index in 0..servers.len {
+        let server = &servers.list[index];
+        let Some(index_text) = fetch_text(server, "index", trust) else {
+            continue;
+        };
+        // Подпись читается **после** индекса и в тот же буфер нельзя: индекс
+        // нужен целиком, чтобы посчитать по нему хеш. Поэтому под подпись —
+        // стек: она короткая, строка на 140 знаков.
+        let mut signature_text = [0u8; 256];
+        let Some(signature_len) = fetch_into(server, "index.sig", &mut signature_text, trust)
+        else {
+            continue;
+        };
+        let Ok(signature_text) = core::str::from_utf8(&signature_text[..signature_len]) else {
+            error("sysupdate: index.sig is not text\n");
+            continue;
+        };
+        let Some(signature) = index::parse_signature(signature_text) else {
+            error("sysupdate: index.sig does not hold an ed25519 signature\n");
+            continue;
+        };
 
-    let digest = index::digest(index_text.as_bytes());
-    if !trusted.verifies(&digest, &signature) {
-        error("sysupdate: the index signature does not match any key this system trusts\n");
-        return None;
-    }
-    println("sysupdate: the index is signed by a key this system trusts");
-
-    let index = match Index::parse(index_text) {
-        Ok(index) => index,
-        Err(err) => {
-            error("sysupdate: ");
-            error(err.text());
-            error("\n");
-            return None;
+        let digest = index::digest(index_text.as_bytes());
+        if !trusted.verifies(&digest, &signature) {
+            error("sysupdate: the index signature does not match any key this system trusts\n");
+            continue;
         }
-    };
-    let image = match index.image(ARCH) {
-        Ok(image) => image,
-        Err(err) => {
-            error("sysupdate: ");
-            error(err.text());
-            error("\n");
-            return None;
-        }
-    };
+        println("sysupdate: the index is signed by a key this system trusts");
 
-    let mut offer = Offer {
-        version: [0; 32],
-        version_len: 0,
-        file: [0; 64],
-        file_len: 0,
-        size: image.size,
-        sha256: image.sha256,
-    };
-    if image.version.len() > offer.version.len() || image.file.len() > offer.file.len() {
-        error("sysupdate: the index entry names things too long to be real\n");
-        return None;
+        let parsed = match Index::parse(index_text) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                error("sysupdate: ");
+                error(err.text());
+                error("\n");
+                continue;
+            }
+        };
+        let image = match parsed.image(ARCH) {
+            Ok(image) => image,
+            Err(err) => {
+                error("sysupdate: ");
+                error(err.text());
+                error("\n");
+                continue;
+            }
+        };
+
+        let mut offer = Offer {
+            version: [0; 32],
+            version_len: 0,
+            file: [0; 64],
+            file_len: 0,
+            size: image.size,
+            sha256: image.sha256,
+            server: index,
+        };
+        if image.version.len() > offer.version.len() || image.file.len() > offer.file.len() {
+            error("sysupdate: the index entry names things too long to be real\n");
+            continue;
+        }
+        offer.version_len = image.version.len();
+        offer.version[..offer.version_len].copy_from_slice(image.version.as_bytes());
+        offer.file_len = image.file.len();
+        offer.file[..offer.file_len].copy_from_slice(image.file.as_bytes());
+        return Some(offer);
     }
-    offer.version_len = image.version.len();
-    offer.version[..offer.version_len].copy_from_slice(image.version.as_bytes());
-    offer.file_len = image.file.len();
-    offer.file[..offer.file_len].copy_from_slice(image.file.as_bytes());
-    Some(offer)
+
+    println("sysupdate: no repository in the configuration offered an update");
+    None
 }
 
 /// Прочитать `/os-keys` — те же ключи, которыми ядро проверяет контейнер.
@@ -354,7 +496,7 @@ fn trusted_keys() -> Option<Trusted> {
         error("); refusing\n");
         return None;
     }
-    // SAFETY: статик принадлежит этой задаче, см. пояснение в `server`.
+    // SAFETY: статик принадлежит этой задаче, см. пояснение в `servers`.
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(KEYFILE) };
     let got = read(fd, buffer);
     close(fd);
@@ -374,10 +516,14 @@ fn trusted_keys() -> Option<Trusted> {
 }
 
 /// Скачать небольшой текстовый файл в общий буфер и вернуть его как строку.
-fn fetch_text(server: &Server, name: &str) -> Option<&'static str> {
-    // SAFETY: статик принадлежит этой задаче, см. пояснение в `server`.
+fn fetch_text(
+    server: &Server,
+    name: &str,
+    trust: &mut Option<http::Trust<'static>>,
+) -> Option<&'static str> {
+    // SAFETY: статик принадлежит этой задаче, см. пояснение в `servers`.
     let buffer = unsafe { &mut *core::ptr::addr_of_mut!(TEXT) };
-    let len = fetch_into(server, name, buffer)?;
+    let len = fetch_into(server, name, buffer, trust)?;
     match core::str::from_utf8(&buffer[..len]) {
         Ok(text) => Some(text),
         Err(_) => {
@@ -388,23 +534,21 @@ fn fetch_text(server: &Server, name: &str) -> Option<&'static str> {
 }
 
 /// Скачать небольшой файл в буфер вызывающего. Возвращает длину.
-fn fetch_into(server: &Server, name: &str, out: &mut [u8]) -> Option<usize> {
-    let mut path = Path::new();
-    if !path.push(server.path.as_str()) || !path.push(name) {
+fn fetch_into(
+    server: &Server,
+    name: &str,
+    out: &mut [u8],
+    trust: &mut Option<http::Trust<'static>>,
+) -> Option<usize> {
+    let mut url = Text::new();
+    if !server.url(name, &mut url) {
         error("sysupdate: that path is too long\n");
         return None;
     }
     let mut filled = 0usize;
     let mut overflow = false;
-    // SAFETY: статик принадлежит этой задаче, см. пояснение в `server`.
-    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
-    let result = http::get(
-        server.address,
-        server.port,
-        "freeos-updates",
-        path.as_str(),
-        scratch,
-        &mut |chunk: &[u8]| {
+    let result = with_buffers(|io| {
+        http::get(url.as_str(), trust.as_mut(), io, &mut |chunk: &[u8]| {
             if filled + chunk.len() > out.len() {
                 overflow = true;
                 return false;
@@ -412,8 +556,8 @@ fn fetch_into(server: &Server, name: &str, out: &mut [u8]) -> Option<usize> {
             out[filled..filled + chunk.len()].copy_from_slice(chunk);
             filled += chunk.len();
             true
-        },
-    );
+        })
+    });
     match result {
         Ok(_) => Some(filled),
         Err(err) => {
@@ -427,6 +571,19 @@ fn fetch_into(server: &Server, name: &str, out: &mut [u8]) -> Option<usize> {
             None
         }
     }
+}
+
+/// Одолжить оба рабочих буфера тому, кто качает.
+///
+/// Замыканием, а не двумя ссылками наружу: статики берутся в одном месте, и
+/// одно место проще проверить глазами, чем шесть.
+fn with_buffers<T>(body: impl FnOnce(&mut http::Buffers<'_>) -> T) -> T {
+    // SAFETY: статики принадлежат этой задаче, см. пояснение в `servers`.
+    let wire = unsafe { &mut *core::ptr::addr_of_mut!(WIRE) };
+    // SAFETY: то же самое.
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
+    let mut io = http::Buffers { wire, body: scratch };
+    body(&mut io)
 }
 
 /// Сказать про отказ HTTP вслух и с числом там, где число есть.
@@ -450,10 +607,33 @@ fn complain(name: &str, err: http::Error) {
     error("\n");
 }
 
+/// Собрать всё, что нужно для похода в сеть: список серверов и доверие.
+fn prepare(path: Option<&str>) -> Option<(Servers, Option<http::Trust<'static>>)> {
+    let servers = servers(path)?;
+    let roots = trusted_roots();
+    let trust = roots.map(|roots| {
+        println("sysupdate: https is available; the roots come from ca.pem");
+        // SAFETY: статик принадлежит этой задаче, см. пояснение в `servers`.
+        let buffers = unsafe { &mut *core::ptr::addr_of_mut!(TLS_IO) };
+        // Часы нужны, чтобы проверять сроки действия сертификатов. Ноль
+        // означает «часы неизвестны», и тогда сроки не проверяются — сказать об
+        // этом надо вслух, а не молча пропустить проверку.
+        let now = time_now() as i64;
+        if now == 0 {
+            println("sysupdate: this system does not know the date; certificate dates unchecked");
+        }
+        http::Trust { buffers, roots, now }
+    });
+    if trust.is_none() {
+        println("sysupdate: no ca.pem, so https repositories will be skipped");
+    }
+    Some((servers, trust))
+}
+
 /// `check`: что предлагает сервер и новее ли оно нашего.
 fn check(path: Option<&str>) -> i64 {
-    let Some(server) = server(path) else { return 1 };
-    let Some(offer) = offer(&server) else { return 1 };
+    let Some((servers, mut trust)) = prepare(path) else { return 1 };
+    let Some(offer) = offer(&servers, &mut trust) else { return 1 };
 
     print("sysupdate: the server offers FreeOS ");
     print(offer.version());
@@ -496,8 +676,8 @@ fn get(path: Option<&str>) -> i64 {
         println("sysupdate: only root downloads updates");
         return 1;
     }
-    let Some(server) = server(path) else { return 1 };
-    let Some(offer) = offer(&server) else { return 1 };
+    let Some((servers, mut trust)) = prepare(path) else { return 1 };
+    let Some(offer) = offer(&servers, &mut trust) else { return 1 };
 
     match installed_version() {
         Some(installed) if !osupdate::newer(offer.version(), installed.as_str()) => {
@@ -529,8 +709,11 @@ fn get(path: Option<&str>) -> i64 {
         return 1;
     }
 
-    let mut path_buffer = Path::new();
-    if !path_buffer.push(server.path.as_str()) || !path_buffer.push(offer.file()) {
+    let mut url = Text::new();
+    // Образ берётся у **того же** репозитория, который отдал подписанный индекс:
+    // взять индекс у одного, а файл у другого значило бы проверять хеш не того,
+    // что качали.
+    if !servers.list[offer.server].url(offer.file(), &mut url) {
         error("sysupdate: that path is too long\n");
         close(fd);
         return 1;
@@ -549,15 +732,8 @@ fn get(path: Option<&str>) -> i64 {
     // программа неотличима от повисшей, а мерить надо тем, что видно снаружи:
     // строкой в журнале.
     let mut reported = 0u64;
-    // SAFETY: статик принадлежит этой задаче, см. пояснение в `server`.
-    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(SCRATCH) };
-    let result = http::get(
-        server.address,
-        server.port,
-        "freeos-updates",
-        path_buffer.as_str(),
-        scratch,
-        &mut |chunk: &[u8]| {
+    let result = with_buffers(|io| {
+        http::get(url.as_str(), trust.as_mut(), io, &mut |chunk: &[u8]| {
             // Хеш считается **по дороге**, а не по записанному файлу: второй
             // проход означал бы прочитать двадцать пять мегабайт ещё раз — и
             // проверить не то, что приехало, а то, что прочиталось со своего же
@@ -582,8 +758,8 @@ fn get(path: Option<&str>) -> i64 {
                 println(" MiB");
             }
             true
-        },
-    );
+        })
+    });
     close(fd);
 
     if let Err(err) = result {
@@ -693,29 +869,4 @@ fn installed_version() -> Option<Version> {
 /// загрузка, и она нам не нужна.
 fn create_truncated(path: &str) -> i64 {
     user_progs::open_write(path, true, true)
-}
-
-/// Разобрать адрес вида `10.0.2.2`.
-fn parse_ip(text: &str) -> Option<u32> {
-    let mut bytes = [0u8; 4];
-    let mut seen = 0;
-    for (index, part) in text.split('.').enumerate() {
-        if index >= 4 {
-            return None;
-        }
-        bytes[index] = part.parse::<u8>().ok()?;
-        seen = index + 1;
-    }
-    (seen == 4).then(|| u32::from_be_bytes(bytes))
-}
-
-/// Напечатать адрес числами.
-fn print_ip(address: u32) {
-    let bytes = address.to_be_bytes();
-    for (at, byte) in bytes.iter().enumerate() {
-        if at != 0 {
-            print(".");
-        }
-        print_u64(u64::from(*byte));
-    }
 }

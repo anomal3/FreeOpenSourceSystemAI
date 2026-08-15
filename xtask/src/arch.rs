@@ -282,8 +282,8 @@ pub const PAYLOAD_DEFAULTS_DIR: &str = "FREEOS/DEF";
 /// носителе: том там пишется без длинных имён (см. заголовок `disk::fat32`), то
 /// есть 8.3. Список обязан совпадать с `DEFAULTS` в
 /// `crates/installer/src/payload.rs` — установщик открывает ровно эти пути.
-pub const PAYLOAD_DEFAULTS: [(&str, &str); 2] =
-    [("services", "SERVICES"), ("update.cfg", "UPDATE.CFG")];
+pub const PAYLOAD_DEFAULTS: [(&str, &str); 3] =
+    [("services", "SERVICES"), ("update.cfg", "UPDATE.CFG"), ("ca.pem", "CA.PEM")];
 
 /// Каталог с пользовательскими программами на установочном носителе.
 ///
