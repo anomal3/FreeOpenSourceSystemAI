@@ -202,10 +202,10 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 23] = [
+pub const USER_PROGRAMS: [&str; 24] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sshd",
-    "cat",
+    "cat", "sysupdate",
 ];
 
 /// Программы, которые в `/bin` **не** едут.
@@ -519,6 +519,15 @@ pub fn check(arches: &[Arch]) -> Result<()> {
         cmd.arg("test").arg("--package").arg(package);
         util::run(&mut cmd, &format!("cargo test ({package})"))?;
     }
+
+    // Формат репозитория обновлений — то же рассуждение. Составляет индекс
+    // машина сборки, а разбирает программа на чужой машине по сети; разойдись
+    // они на байт, это выглядело бы как «сервер отдаёт испорченный файл», и
+    // искать причину пришлось бы там, где её нет. Проверки требуют кучи (собрать
+    // текст индекса), поэтому идут с возможностью `build`.
+    let mut cmd = cargo();
+    cmd.arg("test").arg("--package").arg("osupdate").arg("--features").arg("build");
+    util::run(&mut cmd, "cargo test (osupdate)")?;
 
     // Пользовательские программы собираются под обе архитектуры вместе с ядром
     // (см. `build_user_programs`), но `check` их до сих пор не трогал: ошибка в

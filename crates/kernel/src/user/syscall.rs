@@ -39,6 +39,7 @@ use user_abi::{
     SYS_WINSIZE, SYS_WRITE, SYS_YIELD, Stat, TTY_RAW, WAIT_NOHANG,
 };
 use user_abi::{ERR_BROKEN_PIPE, LAUNCH_KEEP, Launch, SYS_LAUNCH, SYS_PIPE};
+use user_abi::{ERR_UPDATE_REFUSED, SYS_UPDATE};
 use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
@@ -144,6 +145,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_NETINFO => netinfo(a0, a1),
         SYS_RESOLVE => resolve(a0, a1, a2),
         SYS_RANDOM => random(a0, a1),
+        SYS_UPDATE => update(a0, a1),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -729,6 +731,42 @@ fn copy_path<'a>(ptr: usize, len: usize, buffer: &'a mut [u8; MAX_PATH]) -> Resu
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
     buffer[..len].copy_from_slice(bytes);
     core::str::from_utf8(&buffer[..len]).map_err(|_| ERR_BAD_PATH)
+}
+
+/// `update(ptr, len) -> номер слота`.
+///
+/// Вся работа — в [`crate::slot::apply`]: та же функция, которую зовёт команда
+/// оболочки, с той же проверкой подписи внутри. Здесь только два решения,
+/// которых у оболочки нет.
+///
+/// Первое: **только root**. Обновление — это запись в чужой раздел и смена
+/// того, с чего машина загрузится; программа, работающая от имени человека, не
+/// вправе такого заказывать, даже если файл ей читать разрешено.
+///
+/// Второе: причина отказа печатается **здесь**, а программе уходит один код.
+/// Причину знает ядро, и знает целиком — вплоть до имени куска, чей хеш не
+/// сошёлся; превращать её в число значило бы завести второй словарь отказов
+/// ради того, чтобы программа перевела его обратно в слова, но хуже.
+fn update(ptr: usize, len: usize) -> i64 {
+    if !super::credentials().is_root() {
+        return ERR_PERMISSION;
+    }
+    let mut buffer = [0u8; MAX_PATH];
+    let path = match copy_path(ptr, len, &mut buffer) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    match crate::slot::apply(path) {
+        // Номер, а не буква: через регистр результата уезжает число. Обратно в
+        // букву его переводит программа — тем же соответствием, что записано в
+        // договоре.
+        Ok(slots::Slot::A) => 0,
+        Ok(slots::Slot::B) => 1,
+        Err(err) => {
+            crate::kprintln!("  sysupdate   : {err}");
+            ERR_UPDATE_REFUSED
+        }
+    }
 }
 
 /// Перевести отказ файловой системы в код договора.

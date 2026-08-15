@@ -57,8 +57,14 @@ use user_progs::{
 };
 use user_abi::ERR_AGAIN;
 
-/// Откуда берутся описания служб, если не сказано иначе.
-const SERVICES: &str = "/etc/services";
+/// Имя файла с описаниями служб.
+///
+/// Не путь: с фазы 39 настройка ищется сначала в `/etc`, а потом в эталоне,
+/// приехавшем с образом (`user_progs::config_path`). Именно этот файл и был
+/// причиной, по которой механизм понадобился: `/etc` живёт на разделе
+/// состояния, обновление до него не дотягивается — и служба, дописанная в новой
+/// версии, не запускалась бы ни на одной обновившейся машине.
+const SERVICES: &str = "services";
 
 /// Сколько служб супервизор согласен вести.
 ///
@@ -155,7 +161,19 @@ static mut CONFIG: [u8; 4096] = [0; 4096];
 pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // SAFETY: значения пришли от ядра в том виде, в каком их описывает договор.
     let args = unsafe { Args::new(argc, argv) };
-    let path = args.get(1).unwrap_or(SERVICES);
+    // Аргумент перекрывает поиск целиком: он для того и есть, чтобы можно было
+    // подсунуть супервизору другой файл, не трогая систему.
+    let found = user_progs::config_path(SERVICES);
+    let path = match args.get(1) {
+        Some(given) => given,
+        None => match &found {
+            Some(path) => path.as_str(),
+            None => {
+                log("init: no services file in /etc nor in the image defaults\n");
+                exit(0);
+            }
+        },
+    };
 
     let mut services = [const { Service::empty() }; MAX_SERVICES];
     let count = match load(path, &mut services) {

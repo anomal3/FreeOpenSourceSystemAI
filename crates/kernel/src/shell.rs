@@ -197,6 +197,13 @@ pub fn task() {
                 Edit::Submitted => {
                     let done = run_command(editor.as_str());
                     editor.clear();
+                    // Отсчёт простоя начинается **после** команды, а не до неё.
+                    // Иначе долгая программа переднего плана съедает весь срок
+                    // сама: `sysupdate get` качает образ двадцать семь минут, и
+                    // сеанс заканчивался ровно в тот миг, когда оболочка
+                    // возвращала себе терминал, — «никто ничего не набирал»
+                    // засчитывалось за время, когда набирать было некуда.
+                    idle_since = time::uptime_ms();
                     if done {
                         ui::set_cursor(false);
                         return;
@@ -874,33 +881,53 @@ fn slots() {
     }
 }
 
-/// Применить обновление системы.
+/// Где живёт программа обновления.
+const SYSUPDATE: &str = "/bin/sysupdate";
+
+/// Обновление системы: запустить [`SYSUPDATE`] от имени root.
 ///
-/// Команда оболочки, а не программа, и по той же причине, что `fsck`: она пишет
-/// в сектора неактивного раздела и правит FAT-том ESP, которого никто не
-/// монтировал. Отдать это программе значило бы отдать программе блочное
-/// устройство.
+/// # Почему команда есть, хотя вся работа в программе
+///
+/// Потому что права. Обновление — это запись в чужой раздел и смена того, с
+/// чего машина загрузится; ядро принимает такой заказ только от root
+/// (`SYS_UPDATE`), а сеанс за терминалом идёт от имени человека, у которого
+/// `uid` не нулевой. Без этой команды владелец машины не смог бы обновить её
+/// вовсе — притом что `fsck`, `shutdown` и разметка ему доступны прямо здесь.
+///
+/// # Почему это не дыра
+///
+/// Потому что от имени root запускается **ровно одна** программа, названная
+/// здесь строкой, а не любая по выбору набравшего. И потому что этот терминал и
+/// так распоряжается машиной целиком: входа в систему в ней нет, а `sysupdate`
+/// до фазы 39 был встроенной командой, то есть кодом ядра, — те же самые права
+/// с тем же самым доступом. По сети сюда не попасть: `sshd` исполняет команды
+/// сам и от имени вошедшего, до оболочки ядра они не доходят.
+///
+/// # Почему сама работа уехала в программу
+///
+/// Скачивание — это HTTP, разбор чужого текста и ожидание сети; место такому в
+/// третьем кольце. А запись в слот идёт мимо файловой системы и осталась в ядре
+/// — просто вызывается теперь системным вызовом, а не отсюда напрямую. Путь
+/// один, и его проверяет каждый сценарий стенда, а не только сетевой.
 fn sysupdate(argument: &str) {
-    let Some(path) = argument.strip_prefix("apply ").map(str::trim) else {
-        sprintln!("  usage: sysupdate apply <file.fpk>");
+    let argument = argument.trim();
+    if argument.is_empty() {
+        sprintln!("  usage: sysupdate check|get [repository path]");
+        sprintln!("         sysupdate apply [file.fpk]");
         sprintln!("  the new system goes into the inactive slot; reboot to try it");
-        return;
-    };
-    if path.is_empty() {
-        sprintln!("  usage: sysupdate apply <file.fpk>");
         return;
     }
 
-    sprintln!("  applying {path}, this takes a while");
-    match crate::slot::apply(path) {
-        Ok(slot) => {
-            sprintln!("  sysupdate: slot {} is active from the next boot", slot.name());
-            // Про счётчик попыток сказано отдельно и намеренно: человек должен
-            // знать, что система вернётся на прежний слот сама, если новый не
-            // поднимется, — иначе откат выглядит как «обновление пропало».
-            sprintln!("  sysupdate: if it does not come up, the previous slot returns by itself");
+    let mut line = alloc::string::String::from(SYSUPDATE);
+    line.push(' ');
+    line.push_str(argument);
+
+    match user::spawn(&line, crate::vfs::perm::Credentials::ROOT) {
+        Ok(id) => foreground(id),
+        Err(err) => {
+            sprintln!("  sysupdate: {SYSUPDATE}: {err}");
+            sprintln!("  sysupdate: this system image has no update program");
         }
-        Err(err) => sprintln!("  sysupdate: {err}"),
     }
 }
 
@@ -930,7 +957,7 @@ fn help() {
     sprintln!("  fsck          check every mounted volume");
     sprintln!("  mounts        what is mounted where");
     sprintln!("  slots         which system slot booted, and its state");
-    sprintln!("  sysupdate a <f>  apply a system update into the free slot");
+    sprintln!("  sysupdate <cmd>  check, get or apply a system update (runs as root)");
     sprintln!("  shutdown      switch the machine off");
     sprintln!("  reboot        restart the machine");
     sprintln!("  exit          finish the boot and halt");

@@ -95,8 +95,24 @@ const PORT: u16 = 22;
 /// Где лежит ключ хоста.
 const HOST_KEY_PATH: &str = "/etc/ssh_host_ed25519_key";
 
-/// Где лежат учётные записи.
-const PASSWD_PATH: &str = "/etc/passwd";
+/// Имя файла учётных записей.
+///
+/// Не путь: настройки с фазы 39 ищутся сначала в `/etc`, потом в эталоне образа
+/// (см. [`user_progs::config_path`]). Эталонного `passwd` система не выпускает
+/// намеренно — учётная запись это не умолчание, — но искать настройку особым
+/// способом ради одного файла значило бы завести второе правило, которое рано
+/// или поздно разойдётся с первым.
+const PASSWD: &str = "passwd";
+
+/// Где лежат учётные записи на этой машине.
+///
+/// Спрашивается каждый раз, а не запоминается при старте: два вызова `stat`
+/// стоят пренебрежимо мало, а запомненный путь означал бы, что положенный позже
+/// `/etc/passwd` не замечается до перезапуска службы.
+fn passwd_path() -> user_progs::Path {
+    user_progs::config_path(PASSWD)
+        .unwrap_or_else(|| user_progs::Path::from("/etc/passwd").unwrap_or_default())
+}
 
 /// Размер приёмного и передающего буферов.
 const BUFFER: usize = 8192;
@@ -255,16 +271,15 @@ fn host_key() -> Option<[u8; 32]> {
 
 /// Сказать в журнал, есть ли вообще кого пускать.
 fn announce_accounts() {
-    match read_file(PASSWD_PATH) {
+    let path = passwd_path();
+    match read_file(path.as_str()) {
         Some(len) if len > 0 => {
             error("sshd: accounts come from ");
-            error(PASSWD_PATH);
+            error(path.as_str());
             error("\n");
         }
         _ => {
-            error("sshd: no ");
-            error(PASSWD_PATH);
-            error(" here, so nobody can log in (this is a live image)\n");
+            error("sshd: no account file here, so nobody can log in (this is a live image)\n");
         }
     }
 }
@@ -713,7 +728,7 @@ fn authenticate(client: i64, transport: &mut Transport, payload: &[u8]) -> Attem
         error("sshd: no account named ");
         error_bytes(request.user);
         error(" in ");
-        error(PASSWD_PATH);
+        error(passwd_path().as_str());
         error("\n");
         return finish_refusal(client, transport);
     };
@@ -1413,7 +1428,7 @@ fn find_user(name: &[u8]) -> Option<User> {
     if name.is_empty() || name.len() > MAX_NAME {
         return None;
     }
-    let len = read_file(PASSWD_PATH)?;
+    let len = read_file(passwd_path().as_str())?;
     // SAFETY: буфер статический, программа однопоточная, и `find_user` не
     // вызывается изнутри работы с ним.
     let text = unsafe { &(&raw const FILE_BUFFER).as_ref().unwrap()[..len] };
@@ -1439,7 +1454,7 @@ fn find_user(name: &[u8]) -> Option<User> {
         // сеансу прав суперпользователя.
         if uid == 0 {
             error("sshd: refusing a root account from ");
-            error(PASSWD_PATH);
+            error(passwd_path().as_str());
             error("\n");
             return None;
         }

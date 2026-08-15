@@ -276,7 +276,10 @@ pub fn run(
         // ключи — ниже, на разделы, где есть права.
         if matches!(
             what,
-            payload::What::Program | payload::What::Package | payload::What::Keys
+            payload::What::Program
+                | payload::What::Package
+                | payload::What::Keys
+                | payload::What::Defaults
         ) {
             continue;
         }
@@ -375,6 +378,26 @@ pub fn run(
         let data = payload.read(index).map_err(Error::Payload)?;
         logln!("[install] copying update keys -> /os-keys ({} bytes)", data.len());
         fs.write_file_path(&mut dev, "os-keys", &data, 0o644, 0, 0)?;
+    }
+
+    // Эталонные настройки. Лежат в корневом образе, а не на разделе состояния,
+    // и это главное решение фазы 39 про настройки: `/etc` живёт на состоянии,
+    // обновление до него не дотягивается — умолчание, положенное туда,
+    // осталось бы там навсегда, и новая служба не запустилась бы ни у кого.
+    // Читается это так: сначала `/etc/<имя>`, потом отсюда.
+    fs.create_dir_path(&mut dev, "usr", 0o755, 0, 0)?;
+    fs.create_dir_path(&mut dev, "usr/share", 0o755, 0, 0)?;
+    fs.create_dir_path(&mut dev, "usr/share/defaults", 0o755, 0, 0)?;
+    fs.create_dir_path(&mut dev, "usr/share/defaults/etc", 0o755, 0, 0)?;
+    for index in 0..payload.items.len() {
+        if payload.items[index].what != payload::What::Defaults {
+            continue;
+        }
+        let target = payload.items[index].target;
+        progress(5, Step::Copy(payload::What::Defaults));
+        let data = payload.read(index).map_err(Error::Payload)?;
+        logln!("[install] copying default settings -> /{target} ({} bytes)", data.len());
+        fs.write_file_path(&mut dev, target, &data, 0o644, 0, 0)?;
     }
 
     // Программы. `/bin` принадлежит root и открыт всем на чтение и проход, сами
@@ -515,11 +538,12 @@ fn write_state(
         0,
         0,
     )?;
-    // Описание служб. Одна служба, и та ничего не делает, кроме как живёт, —
-    // но она настоящая: её видно в журнале, её можно снять и увидеть
-    // перезапуск. Настоящие службы придут с сетью (фаза 35), и придут они в
-    // мир, где падение уже перезапускается.
-    fs.write_file_path(dev, SERVICES_PATH, SERVICES_TEXT.as_bytes(), 0o644, 0, 0)?;
+    // Описания служб здесь **нет** — с фазы 39 оно приезжает с образом, в
+    // `/usr/share/defaults/etc/services`. Раньше установщик писал его сюда, на
+    // раздел состояния, и это было ошибкой ровно того рода, которую видно
+    // только через обновление: список служб замирал на версии, которую
+    // поставили, и новая служба не запускалась ни у кого. Человек по-прежнему
+    // может положить свой `/etc/services` — он читается первым.
 
     // Домашний каталог принадлежит пользователю, а не root: иначе первое, что
     // человек обнаружит в своей системе, — что ему некуда писать. А вот сам
@@ -579,7 +603,7 @@ fn write_state(
     )?;
     fs.create_dir_path(dev, "opt", 0o755, account::FIRST_UID, account::FIRST_UID)?;
 
-    logln!("[install] state: /etc/passwd, /etc/system.cfg, /etc/services, /{home}, /opt");
+    logln!("[install] state: /etc/passwd, /etc/system.cfg, /{home}, /opt");
 
     fs.flush(dev)?;
     fs.mark_clean(dev)?;
@@ -604,28 +628,13 @@ fn wipe_superblock(dev: &mut UefiDisk, range: gpt::Range) -> Result<(), Error> {
 /// Метка тома состояния.
 const STATE_LABEL: &str = "FreeOS state";
 
-/// Путь к описанию служб на разделе состояния.
-const SERVICES_PATH: &str = "etc/services";
-
-/// Что запускать при загрузке.
+/// Текста служб здесь больше нет.
 ///
-/// Формат — по строке на службу: имя, путь, uid, gid. Комментарий сверху не
-/// украшение: файл правит человек, и он должен видеть формат, не открывая
-/// исходников.
-///
-/// Такой же файл лежит в `initrd/etc/services` — его читает система,
-/// загруженная с носителя. Два экземпляра описывают один и тот же набор
-/// намеренно: живая система и установленная обязаны вести себя одинаково, а
-/// собрать текст в одном месте нельзя — установщик работает в `no_std` и файлов
-/// репозитория не видит.
-const SERVICES_TEXT: &str = "\
-# FreeOS services, read by /bin/init at boot.
-# One service per line: <name> <path> [uid] [gid]
-# A service that keeps failing is stopped, and the log says so.
-logger /bin/svclog 0 0
-dhcp /bin/dhcp 0 0
-sshd /bin/sshd 0 0
-";
+/// До фазы 39 он лежал константой в этом файле — второй копией того, что
+/// хранится в `initrd/usr/share/defaults/etc/services`, — и обе копии полагалось
+/// держать одинаковыми вручную. Теперь установщик **переносит** тот самый файл с
+/// носителя (`\FREEOS\SERVICES`) в корневой образ, и копия ровно одна.
+const _: () = ();
 
 /// Содержимое `/os-release`.
 fn os_release_text() -> String {

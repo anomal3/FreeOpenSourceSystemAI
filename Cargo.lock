@@ -419,6 +419,7 @@ dependencies = [
  "fpk",
  "linked_list_allocator",
  "mini-ui",
+ "osupdate",
  "slots",
  "usb-hid",
  "user-abi",
@@ -471,6 +472,14 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "osupdate"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "fpk",
+]
 
 [[package]]
 name = "png"
@@ -714,6 +723,7 @@ name = "user-progs"
 version = "0.1.0"
 dependencies = [
  "fpk",
+ "osupdate",
  "ssh",
  "user-abi",
 ]
@@ -767,5 +777,6 @@ dependencies = [
  "ext4-view",
  "fatfs",
  "fpk",
+ "osupdate",
  "png",
 ]

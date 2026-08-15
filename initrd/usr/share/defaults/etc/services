@@ -2,9 +2,14 @@
 # One service per line: <name> <path> [uid] [gid]
 # A service that keeps failing is stopped, and the log says so.
 #
-# This copy serves the live image. The installed system gets its own from
-# crates/installer/src/install.rs, written onto the state partition -- the two
-# describe the same set and are meant to stay identical.
+# This is the reference copy: it arrives with the system image and is replaced
+# with it. Edits belong in /etc/services, which is read first and which an
+# update never touches -- and which therefore freezes this list on the version
+# where the edit was made. Deleting /etc/services goes back to this file.
+#
+# There is exactly one copy of it in the repository, this one. It reaches a
+# live system inside the initrd, an installed system through the installer
+# (FREEOS/SERVICES on the medium), and an updated system inside the container.
 logger /bin/svclog 0 0
 # Клиент DHCP работает от root: адрес интерфейса — решение о машине целиком, и
 # ядро принимает его только от нулевого uid. На машине без сетевой карты служба

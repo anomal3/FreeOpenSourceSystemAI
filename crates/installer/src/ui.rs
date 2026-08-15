@@ -297,6 +297,7 @@ const fn file_name(what: What) -> &'static str {
         // называет то, что появляется на диске, точнее любого одного имени.
         What::Package => "/media",
         What::Keys => "/os-keys",
+        What::Defaults => "/usr/share/defaults/etc",
     }
 }
 

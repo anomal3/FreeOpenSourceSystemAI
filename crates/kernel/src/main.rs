@@ -42,6 +42,7 @@
 mod acpi;
 mod arch;
 mod block;
+mod config;
 mod console;
 mod fs;
 mod input;
@@ -744,8 +745,14 @@ fn mount_disk_root(info: &BootInfo) {
     verify_root();
 }
 
-/// Путь к описанию служб.
-const SERVICES: &str = "/etc/services";
+/// Имя файла с описанием служб.
+///
+/// Не путь: с фазы 39 настройка ищется сначала в `/etc`, а потом в эталоне,
+/// приехавшем с образом (см. [`config`]). Именно этот файл и был причиной, по
+/// которой механизм понадобился: `/etc` живёт на разделе состояния, обновление
+/// до него не дотягивается — и служба, дописанная в новой версии, не
+/// запускалась бы ни на одной обновившейся машине.
+const SERVICES: &str = "services";
 
 /// Запустить супервизор служб, если в системе есть что запускать.
 ///
@@ -766,10 +773,14 @@ fn start_services() {
 
     // Файла нет — значит служб не заказывали. Это обычное состояние живого
     // носителя, а не поломка.
-    if fs::read(SERVICES, 1).is_none_or(|result| result.is_err()) {
-        kprintln!("  services    : no {SERVICES}, nothing to supervise");
+    let Some(source) = config::exists(SERVICES) else {
+        kprintln!("  services    : no service file anywhere, nothing to supervise");
         return;
-    }
+    };
+    // Откуда взято, говорится вслух: «служба не запустилась» и «список служб
+    // заморожен правкой в /etc» — разные неисправности, и различает их ровно
+    // эта строка.
+    kprintln!("  services    : described by {}", config::path(SERVICES, source));
 
     // Супервизор исполняется от root — иначе он не смог бы запустить службу от
     // чужого имени. От чьего имени работает сама служба, решает её описание.
@@ -943,7 +954,8 @@ fn check_volume(
 /// «virtio-blk → GPT → ext2 → VFS» работает целиком. Файл выбран тот, который
 /// записал установщик, — совпадение содержимого доказывает всю цепочку разом.
 fn verify_root() {
-    const PASSWD: &str = "/etc/passwd";
+    /// Имя файла учётных записей; ищется он как всякая настройка (см. [`config`]).
+    const PASSWD: &str = "passwd";
 
     match fs::list("/") {
         Some(Ok(entries)) => {
@@ -962,9 +974,13 @@ fn verify_root() {
         None => {}
     }
 
-    match fs::read(PASSWD, 512) {
-        Some(Ok((data, size))) => {
-            kprintln!("  account     : {PASSWD}, {size} bytes");
+    match config::read(PASSWD, 512) {
+        Some((data, source)) => {
+            kprintln!(
+                "  account     : {}, {} bytes",
+                config::path(PASSWD, source),
+                data.len()
+            );
             // Показывается последняя содержательная строка: первые в файле —
             // комментарии, а интересна сама запись.
             let text = alloc::string::String::from_utf8_lossy(&data);
@@ -972,7 +988,6 @@ fn verify_root() {
                 kprintln!("    {line}");
             }
         }
-        Some(Err(err)) => kprintln!("  account     : {PASSWD}: {err}"),
         None => {}
     }
 }

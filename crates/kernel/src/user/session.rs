@@ -21,12 +21,19 @@
 //! печатается при загрузке, потому что «проверки есть, но сегодня они молчат»
 //! обязано быть видно, а не подразумеваться.
 
+use crate::config;
 use crate::sync::SpinLock;
 use crate::vfs::perm::Credentials;
-use crate::{fs, kprintln};
+use crate::kprintln;
 
-/// Путь к файлу учётных записей.
-const PASSWD: &str = "/etc/passwd";
+/// Имя файла учётных записей.
+///
+/// Ищется он не только в `/etc`: с фазы 39 настройка берётся сначала оттуда, а
+/// потом из эталона образа — см. [`crate::config`]. Эталонного `passwd` система
+/// не выпускает намеренно (учётная запись — это не умолчание, а решение о
+/// машине), но путь чтения один на все настройки: второй, «особенный», рано или
+/// поздно разошёлся бы с первым.
+const PASSWD: &str = "passwd";
 
 /// Сколько байт файла ядро согласно прочитать.
 const PASSWD_LIMIT: usize = 8 * 1024;
@@ -68,22 +75,16 @@ pub fn with_name<R>(f: impl FnOnce(&str) -> R) -> R {
 /// спрашивает, а `/etc/passwd` с правами `0640` и владельцем root иначе не
 /// прочитал бы никто.
 pub fn adopt_account() {
-    let Some(result) = fs::read(PASSWD, PASSWD_LIMIT) else {
-        kprintln!("  session     : root, no filesystem to read {PASSWD} from");
+    let Some((bytes, source)) = config::read(PASSWD, PASSWD_LIMIT) else {
+        kprintln!("  session     : root, no account file to read");
+        kprintln!("  session     : permission checks will deny nothing");
         return;
     };
-    let bytes = match result {
-        Ok((bytes, _)) => bytes,
-        Err(err) => {
-            kprintln!("  session     : root, cannot read {PASSWD}: {err}");
-            kprintln!("  session     : permission checks will deny nothing");
-            return;
-        }
-    };
+    let from = config::path(PASSWD, source);
 
     let text = core::str::from_utf8(&bytes).unwrap_or("");
     let Some(account) = text.lines().filter_map(parse_line).next() else {
-        kprintln!("  session     : root, {PASSWD} has no usable account line");
+        kprintln!("  session     : root, {from} has no usable account line");
         kprintln!("  session     : permission checks will deny nothing");
         return;
     };
@@ -97,7 +98,7 @@ pub fn adopt_account() {
     }
 
     kprintln!(
-        "  session     : {} (uid {}, gid {}) from {PASSWD}",
+        "  session     : {} (uid {}, gid {}) from {from}",
         account.name,
         account.uid,
         account.gid

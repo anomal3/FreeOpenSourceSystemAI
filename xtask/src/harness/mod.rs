@@ -289,6 +289,14 @@ fn execute(
         None
     };
 
+    // Сервер обновлений — тем же приёмом и по той же причине: гость идёт к нему
+    // сам, в первые же секунды после того, как поднялась сеть.
+    let _host_repo = if scenario.host_repo {
+        Some(start_host_repo(repo_dir(arch))?)
+    } else {
+        None
+    };
+
     let mut extra: Vec<String> = scenario.qemu_args(arch).iter().map(|s| (*s).to_string()).collect();
     extra.extend(scenario.extra.iter().map(|s| (*s).to_string()));
 
@@ -839,6 +847,135 @@ fn run_ssh(port: u16, run: &scenarios::SshRun, prefix: &str, index: usize) -> Re
 /// поведение в середине прогона.
 const HOST_ECHO_PORT: u16 = 2001;
 
+/// Порт, на котором стенд раздаёт репозиторий обновлений.
+///
+/// Фиксированный, как и у эха, и по той же причине: адрес уезжает в файл
+/// настроек гостя, который пишется **до** запуска, — подставить туда случайный
+/// номер было бы можно, но тогда файл менялся бы от прогона к прогону, а
+/// `ext2::Editor` перезаписывать не умеет.
+const HOST_REPO_PORT: u16 = 2002;
+
+/// Поднять на хосте сервер, раздающий каталог репозитория по HTTP.
+///
+/// Настоящий HTTP, а не заглушка, отвечающая одним и тем же: клиент в госте
+/// разбирает строку состояния, заголовки и длину, и проверять его подделкой
+/// значило бы проверять согласие двух наших же реализаций. Здесь сервер пишет
+/// ответ по букве RFC 9112 — со строкой состояния, `Content-Length` и
+/// `Connection: close`, — и отвечает `404` на то, чего нет: отказ гость обязан
+/// понимать так же уверенно, как успех.
+fn start_host_repo(root: PathBuf) -> Result<std::net::TcpListener> {
+    let mut listener = None;
+    for attempt in 0..10 {
+        match std::net::TcpListener::bind(("127.0.0.1", HOST_REPO_PORT)) {
+            Ok(bound) => {
+                listener = Some(bound);
+                break;
+            }
+            Err(err) if attempt == 9 => {
+                return Err(err).with_context(|| {
+                    format!("не удалось занять порт {HOST_REPO_PORT} под сервер обновлений")
+                });
+            }
+            // Порт может ещё держаться в `TIME_WAIT` после прошлого прогона.
+            Err(_) => std::thread::sleep(Duration::from_millis(300)),
+        }
+    }
+    let listener = listener.expect("цикл выше либо занял порт, либо вернул ошибку");
+    let worker = listener.try_clone().context("не удалось раздвоить слушающий сокет")?;
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+
+        for stream in worker.incoming() {
+            let Ok(mut stream) = stream else { break };
+            // Срок на **запрос** — короткий: клиент, подключившийся и
+            // замолчавший, не должен занимать сервер, который обслуживает по
+            // одному.
+            stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+            // А на **ответ** срока нет вовсе, и это не небрежность. Гость
+            // вычитывает поток медленно: отладочное ядро под эмуляцией пишет
+            // каждый кусок в ext2 и на это время не читает из сокета. Наш
+            // передающий буфер тогда заполняется, `write_all` ждёт — и любой
+            // срок на этом месте означает, что сервер обрывает исправную
+            // загрузку. Ровно так первый прогон и упал: шестидесяти секунд
+            // хватило на треть мегабайта, дальше пришёл `RST`, а выглядело это
+            // как обрыв связи в госте.
+            stream.set_write_timeout(None).ok();
+
+            let mut reader = BufReader::new(match stream.try_clone() {
+                Ok(clone) => clone,
+                Err(_) => continue,
+            });
+            let mut request = String::new();
+            if reader.read_line(&mut request).is_err() {
+                continue;
+            }
+            // Остаток заголовка вычитывается и выбрасывается: тела у GET нет, а
+            // непрочитанные байты в сокете мешают закрытию.
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) if line == "\r\n" || line == "\n" => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+
+            let mut fields = request.split_whitespace();
+            let method = fields.next().unwrap_or("");
+            let target = fields.next().unwrap_or("/");
+            let body = if method == "GET" { file_for(&root, target) } else { None };
+
+            let response = match &body {
+                Some(data) => format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                    data.len()
+                ),
+                None => String::from(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+            };
+            if stream.write_all(response.as_bytes()).is_err() {
+                continue;
+            }
+            if let Some(data) = body {
+                if stream.write_all(&data).is_err() {
+                    continue;
+                }
+            }
+            stream.flush().ok();
+            // Гость дочитывает тело по длине и закрывается сам; наш `FIN` нужен
+            // ему только затем, чтобы не ждать своего таймаута на прощание.
+            stream.shutdown(std::net::Shutdown::Write).ok();
+        }
+    });
+    println!("стенд: сервер обновлений слушает {HOST_REPO_PORT}, каталог отдаётся гостю");
+    Ok(listener)
+}
+
+/// Найти файл, который просят, — и не выпустить запрос за пределы каталога.
+///
+/// Проверка здесь не формальность: путь приходит из гостя, а раздаётся каталог
+/// на машине разработчика. `..` в запросе означал бы, что сценарий, ошибившийся
+/// в одной строке, читает что угодно на хосте.
+fn file_for(root: &std::path::Path, target: &str) -> Option<Vec<u8>> {
+    let target = target.split('?').next().unwrap_or(target);
+    let mut path = root.to_path_buf();
+    for part in target.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." || part.contains('\\') {
+            return None;
+        }
+        path.push(part);
+    }
+    if !path.is_file() {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
 /// Поднять на хосте эхо-сервер, к которому будет подключаться гость.
 ///
 /// Возвращает поток, который живёт, пока идёт сценарий, и завершается сам, когда
@@ -1021,6 +1158,78 @@ fn prepare_installed_disk(arch: Arch) -> Result<PathBuf> {
     Ok(disk)
 }
 
+/// Каталог, который стенд раздаёт как репозиторий обновлений.
+fn repo_dir(arch: Arch) -> PathBuf {
+    paths::test_dir().join(format!("repo-{}", arch.name()))
+}
+
+/// Собрать репозиторий для стенда: годный и, подкаталогом, с чужой подписью.
+///
+/// Версия — [`NET_UPDATE_VERSION`], и она **выше** той, что несёт обновление в
+/// `/media`. Иначе сценарий зависел бы от того, шёл ли перед ним `update`:
+/// после него система работает под `0.2`, и предложенная `0.2` была бы отвергнута
+/// запретом отката — то есть проверка сети утонула бы в проверке версий.
+fn prepare_repo(arch: Arch, release: bool) -> Result<()> {
+    let dir = repo_dir(arch);
+    crate::repo::build(&[arch], release, NET_UPDATE_VERSION, &dir)?;
+    // Репозиторий с чужой подписью лежит **внутри** годного, подкаталогом:
+    // сервер раздаёт дерево, и второй каталог рядом означал бы второй адрес в
+    // настройках. Путь короткий (`/x/`) намеренно — он уезжает в гостя строкой
+    // по серийной линии, а длинная строка на aarch64 теряет хвост.
+    crate::repo::build_untrusted(&dir, NET_UPDATE_VERSION, arch, &dir.join("x"))?;
+    Ok(())
+}
+
+/// Версия, которую предлагает сервер обновлений стенда.
+///
+/// Заведомо новее и установленной (`0.1.<сборка>`), и той, что лежит в `/media`
+/// (`package::UPDATE_VERSION`, `0.2`): сценарии, меняющие слот, идут друг за
+/// другом, и обновление обязано быть новее в любом порядке.
+pub const NET_UPDATE_VERSION: &str = "0.3";
+
+/// Положить гостю `/etc/update.cfg` с адресом сервера стенда.
+///
+/// Гость видит хост как `10.0.2.2` — так устроена пользовательская сеть QEMU.
+/// Файл пишется на раздел состояния, то есть оказывается **правкой человека**, и
+/// это часть проверки: в образе лежит эталон с другим адресом, и взять систему
+/// обязана правку.
+fn place_update_config(disk_path: &std::path::Path) -> Result<()> {
+    use disk::BlockDevice as _;
+
+    let text = format!(
+        "# Written by the harness: the update server lives on the host.\n\
+         server=10.0.2.2\n\
+         port={HOST_REPO_PORT}\n\
+         path=/\n"
+    );
+
+    let mut dev = crate::diskfile::DiskFile::open(disk_path, 512)?;
+    let table = disk::gpt::read(&mut dev)
+        .map_err(|err| anyhow::anyhow!("на образе {} нет GPT: {err}", disk_path.display()))?;
+    let state = table
+        .find(disk::gpt::FREEOS_STATE_TYPE)
+        .ok_or_else(|| anyhow::anyhow!("на образе нет раздела состояния"))?;
+
+    let mut fs = ext2::Editor::open(&mut dev, state.first_lba)
+        .map_err(|err| anyhow::anyhow!("раздел состояния не открывается: {err}"))?;
+    fs.mark_dirty(&mut dev)
+        .map_err(|err| anyhow::anyhow!("не удалось пометить том используемым: {err}"))?;
+    match fs.write_file_path(&mut dev, "etc/update.cfg", text.as_bytes(), 0o644, 0, 0) {
+        Ok(_) => println!("стенд: гостю положен /etc/update.cfg на 10.0.2.2:{HOST_REPO_PORT}"),
+        // Уже лежит с прошлого прогона, и содержимое то же самое: адрес и порт
+        // здесь постоянные. Перезаписи `ext2::Editor` не умеет.
+        Err(ext2::Error::Exists) => println!("стенд: /etc/update.cfg у гостя уже лежит"),
+        Err(err) => bail!("не удалось записать /etc/update.cfg: {err}"),
+    }
+    fs.flush(&mut dev)
+        .map_err(|err| anyhow::anyhow!("не удалось сбросить раздел состояния: {err}"))?;
+    fs.mark_clean(&mut dev)
+        .map_err(|err| anyhow::anyhow!("не удалось пометить том чистым: {err}"))?;
+    dev.flush()
+        .map_err(|err| anyhow::anyhow!("не удалось сбросить образ: {err}"))?;
+    Ok(())
+}
+
 /// Носители машины для сценария.
 fn prepare_drives(
     scenario: &Scenario,
@@ -1066,6 +1275,14 @@ fn prepare_drives(
             // через образ initrd, сказано в заголовке `sshkeys`.
             if scenario.ssh_key {
                 sshkeys::place_authorized_key(&disk, &sshkeys::authorized()?)?;
+            }
+            // Репозиторий обновлений: собрать каталог на хосте и сказать гостю,
+            // где его искать. Файл настроек ложится на раздел состояния — то
+            // есть проверяется заодно и главное правило фазы: правка в `/etc`
+            // читается **раньше** эталона, приехавшего с образом.
+            if scenario.host_repo {
+                prepare_repo(arch, built.release)?;
+                place_update_config(&disk)?;
             }
             vec![Drive::Image(disk)]
         }

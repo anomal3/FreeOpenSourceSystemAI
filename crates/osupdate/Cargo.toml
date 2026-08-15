@@ -1,0 +1,27 @@
+[package]
+name = "osupdate"
+description = "What an update is trusted by and where it is taken from: the /os-keys file and the repository index, parsed identically by the kernel, the program and the tooling."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Ed25519: тот же крейт, которым подписывает `xtask`, которым ядро проверяет
+# контейнер и которым SSH проверяет обмен ключами. Вторая реализация разошлась
+# бы с первой молча, а выглядело бы это как испорченный файл обновления.
+ed25519-dalek = { version = "2", default-features = false }
+# SHA-256 — через `fpk`, где он уже настроен так, как этому дереву нужно
+# (`force-soft`, см. заголовок `fpk/Cargo.toml`). Второй экземпляр настройки
+# означал бы, что один из двух однажды соберут не тем путём.
+fpk = { path = "../fpk" }
+
+[features]
+# Собирает индекс тот, кто выкладывает репозиторий, то есть `xtask`, и только
+# ему нужна куча. Разбор её не требует: индекс читает программа вне ядра.
+default = []
+build = []
+
+[lints]
+workspace = true

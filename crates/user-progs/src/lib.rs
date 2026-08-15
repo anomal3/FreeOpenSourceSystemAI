@@ -17,6 +17,8 @@
 
 #![no_std]
 
+pub mod http;
+
 use core::panic::PanicInfo;
 
 use user_abi::{
@@ -29,6 +31,8 @@ use user_abi::{
 
 use user_abi::{LAUNCH_KEEP, Launch, SYS_LAUNCH, SYS_PIPE};
 
+use user_abi::SYS_UPDATE;
+
 use user_abi::{
     SOCK_TCP, SOCK_UDP, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN,
     SYS_NETCONF, SYS_NETINFO, SYS_PEER, SYS_RECV, SYS_RESOLVE, SYS_SEND, SYS_SHUTDOWN,
@@ -37,8 +41,8 @@ use user_abi::{
 
 pub use user_abi::{
     Dirent, ERR_AGAIN, ERR_BROKEN_PIPE, ERR_NOT_FOUND, ERR_NO_NETWORK, ERR_NO_TASK, ERR_PERMISSION,
-    FD_STDIN, KIND_DIRECTORY, KIND_FILE, NetConfig, NetInfo, Peer, SEEK_CUR, SEEK_END, SEEK_SET,
-    StreamState,
+    ERR_UPDATE_REFUSED, FD_STDIN, KIND_DIRECTORY, KIND_FILE, NetConfig, NetInfo, Peer, SEEK_CUR,
+    SEEK_END, SEEK_SET, SLOT_A, SLOT_B, StreamState,
 };
 
 /// Выполнить системный вызов.
@@ -900,6 +904,49 @@ pub fn resolve(name: &str) -> Option<u32> {
         syscall(SYS_RESOLVE, name.as_ptr() as usize, name.len(), out.as_mut_ptr() as usize)
     };
     (result == 0).then(|| u32::from_be_bytes(out))
+}
+
+/// Где лежат правки человека.
+pub const CONFIG_ETC: &str = "/etc";
+
+/// Где лежит эталон настроек, приехавший с образом.
+pub const CONFIG_DEFAULTS: &str = "/usr/share/defaults/etc";
+
+/// Найти настройку: сначала правку в `/etc`, потом эталон образа.
+///
+/// Возвращает **готовый путь**, а не открытый дескриптор: читают настройки
+/// по-разному (кто целиком, кто построчно), а сказать человеку, откуда файл
+/// взят, обязаны все — и для этого нужен именно путь.
+///
+/// Ровно то же делает ядро (`kernel/src/config.rs`), и по той же причине живёт
+/// отдельно: правило одно, а сторон границы две. Зачем правило нужно, сказано
+/// там же — `/etc` лежит на разделе состояния, обновление до него не
+/// дотягивается, и умолчание, приехавшее с новым образом, иначе не досталось бы
+/// никому.
+#[must_use]
+pub fn config_path(name: &str) -> Option<Path> {
+    for prefix in [CONFIG_ETC, CONFIG_DEFAULTS] {
+        let mut path = Path::from(prefix)?;
+        if !path.join(name) {
+            continue;
+        }
+        let mut info = Stat::default();
+        if stat(path.as_str(), &mut info) == 0 && info.kind == user_abi::KIND_FILE {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Поставить обновление системы из контейнера.
+///
+/// Возвращает [`user_abi::SLOT_A`] или [`user_abi::SLOT_B`] — слот, который
+/// станет активным, — либо отрицательный код. Работает **минутами**: внутри
+/// перелив десятков мегабайт в чужой раздел, и задача всё это время стоит в
+/// ядре.
+pub fn apply_update(path: &str) -> i64 {
+    // SAFETY: путь живёт в памяти программы, длина — его собственная.
+    unsafe { syscall(SYS_UPDATE, path.as_ptr() as usize, path.len(), 0) }
 }
 
 /// Путь, собираемый по кусочкам в буфере на стеке.

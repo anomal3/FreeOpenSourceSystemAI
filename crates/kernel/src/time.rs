@@ -43,10 +43,12 @@ use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use calendar::DateTime;
 
-use crate::{arch, fs, irq, kprintln};
+use crate::{arch, config, irq, kprintln};
 
-/// Путь к файлу настроек, который написал установщик.
-const CONFIG: &str = "/etc/system.cfg";
+/// Имя файла настроек, который написал установщик.
+///
+/// Ищется сначала в `/etc`, потом в эталоне образа — см. [`crate::config`].
+const CONFIG: &str = "system.cfg";
 
 /// Сколько байт файла ядро согласно прочитать. Файл маленький и свой, но пришёл
 /// с носителя — то есть из-за границы доверия.
@@ -342,7 +344,7 @@ pub fn stamp_text(seconds: u32) -> alloc::string::String {
 /// Отсутствие файла — обычное дело, а не отказ: на системе, загруженной с
 /// установочного носителя, корень это образ initrd, и настроек там нет.
 pub fn adopt_timezone() {
-    let Some(Ok((bytes, _))) = fs::read(CONFIG, CONFIG_LIMIT) else {
+    let Some((bytes, source)) = config::read(CONFIG, CONFIG_LIMIT) else {
         return;
     };
     let text = core::str::from_utf8(&bytes).unwrap_or("");
@@ -351,7 +353,11 @@ pub fn adopt_timezone() {
     };
 
     OFFSET_MINUTES.store(minutes, Ordering::Relaxed);
-    kprintln!("  timezone    : UTC{} from {CONFIG}", offset_text());
+    kprintln!(
+        "  timezone    : UTC{} from {}",
+        offset_text(),
+        config::path(CONFIG, source)
+    );
 }
 
 /// Разобрать строку `timezone=UTC+03:00`.

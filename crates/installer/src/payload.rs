@@ -66,6 +66,12 @@ pub enum What {
     /// Доверенные ключи обновления. Едут в корень как `/os-keys`: они
     /// описывают **образ**, а не машину, и заменяются вместе с ним.
     Keys,
+    /// Эталонные настройки. Едут в корневой образ, в
+    /// `/usr/share/defaults/etc/`, и по той же причине, что ключи: умолчание
+    /// принадлежит образу. На разделе состояния ему не место — обновление до
+    /// него не дотягивается, и служба, дописанная в новой версии, не
+    /// запустилась бы ни на одной обновившейся машине.
+    Defaults,
     /// Образцовый пакет `.fpk`. Едет в `/media` корневого раздела — туда же,
     /// куда его положил бы человек, подключив носитель, с которого пакет
     /// пришёл. Отсутствие пакетов установку не срывает: система без них
@@ -104,6 +110,7 @@ impl What {
             What::Program => "program",
             What::Package => "package",
             What::Keys => "update keys",
+            What::Defaults => "default settings",
         }
     }
 }
@@ -177,6 +184,18 @@ pub fn probe() -> Result<Payload, Error> {
         Err(_) => logln!("[payload] no update keys on the medium; the system will refuse updates"),
     }
 
+    // Эталонные настройки. Их отсутствие установку не срывает: система без
+    // описания служб загрузится и скажет, что супервизировать нечего.
+    for (source, target) in DEFAULTS {
+        match stat(&mut root, source, What::Defaults) {
+            Ok(size) => {
+                logln!("[payload] default settings {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Defaults, size });
+            }
+            Err(_) => logln!("[payload] {source} is missing; that setting will have no default"),
+        }
+    }
+
     for (source, target) in PACKAGES {
         match stat(&mut root, source, What::Package) {
             Ok(size) => {
@@ -201,7 +220,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// после этого **перестал собираться** — и это лучший исход из возможных,
 /// потому что собравшийся установщик поставил бы систему без `/bin/sshd`, а
 /// узналось бы это только по не запустившейся службе.
-const PROGRAMS: [(&CStr16, &str); 23] = [
+const PROGRAMS: [(&CStr16, &str); 24] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -225,6 +244,26 @@ const PROGRAMS: [(&CStr16, &str); 23] = [
     (cstr16!("\\FREEOS\\BIN\\ECHOC"), "echoc"),
     (cstr16!("\\FREEOS\\BIN\\SSHD"), "sshd"),
     (cstr16!("\\FREEOS\\BIN\\CAT"), "cat"),
+    // Имя на носителе короче настоящего: FAT здесь без длинных имён, а
+    // `SYSUPDATE` — девять знаков. В `/bin` файл ложится полным именем.
+    (cstr16!("\\FREEOS\\BIN\\SYSUPD"), "sysupdate"),
+];
+
+/// Эталонные настройки на носителе и их пути в корневом образе.
+///
+/// Список обязан совпадать с `PAYLOAD_DEFAULTS` в `xtask/src/arch.rs` — это тот
+/// же комплект, разложенный по носителю. Расхождение видно не сразу: система
+/// установится и заработает, а обнаружится пропажа тем, что нужная настройка не
+/// имеет умолчания — то есть службой, которая не запустилась.
+const DEFAULTS: [(&CStr16, &str); 2] = [
+    (
+        cstr16!("\\FREEOS\\DEF\\SERVICES"),
+        "usr/share/defaults/etc/services",
+    ),
+    (
+        cstr16!("\\FREEOS\\DEF\\UPDATE.CFG"),
+        "usr/share/defaults/etc/update.cfg",
+    ),
 ];
 
 /// Образцовые пакеты на носителе и их имена в `/media`.

@@ -78,6 +78,24 @@ pub fn trusted_text() -> Result<String> {
     Ok(text)
 }
 
+/// Подписать индекс репозитория тем же рабочим ключом.
+///
+/// Подписывается **файл целиком**, а не запись в нём: индекс — это утверждение
+/// «вот что предлагается сейчас», и подпись по отдельной записи позволила бы
+/// собрать из подписанных кусков индекс, которого никто не подписывал.
+pub fn sign_index(index: &[u8]) -> Result<[u8; 64]> {
+    let key = release()?;
+    Ok(key.sign(&osupdate::index::digest(index)).to_bytes())
+}
+
+/// Подписать индекс ключом, которого система не знает.
+///
+/// Только для стенда: им подписывается индекс, который обязан быть отвергнут.
+pub fn sign_index_with_stranger(index: &[u8]) -> Result<[u8; 64]> {
+    let key = stranger()?;
+    Ok(key.sign(&osupdate::index::digest(index)).to_bytes())
+}
+
 /// Подписать готовый контейнер: посчитать, что подписывается, и вписать подпись.
 pub fn sign(container: &mut [u8], key: &SigningKey) {
     let digest = fpk::build::digest_of(container);

@@ -11,6 +11,7 @@ members = [
     "crates/installer",
     "crates/kernel",
     "crates/mini-ui",
+    "crates/osupdate",
     "crates/slots",
     "crates/ssh",
     "crates/usb-hid",

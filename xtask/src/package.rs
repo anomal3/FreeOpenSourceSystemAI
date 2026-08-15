@@ -287,6 +287,32 @@ fn build_root_image(
         .write_file_path(&mut disk, "os-keys", keys_text.as_bytes(), 0o644, 0, 0)
         .map_err(|err| anyhow::anyhow!("не удалось записать /os-keys: {err}"))?;
 
+    // Эталонные настройки. Обновление их **обязано** нести: `/etc` живёт на
+    // разделе состояния, до которого обновление не дотягивается, и без эталона
+    // в образе новая версия не смогла бы принести ни одной новой настройки. Файл
+    // берётся тот же самый, что уезжает в initrd и на установочный носитель, —
+    // копия в дереве ровно одна.
+    for dir in ["usr", "usr/share", "usr/share/defaults", "usr/share/defaults/etc"] {
+        fs_image
+            .create_dir_path(&mut disk, dir, 0o755, 0, 0)
+            .map_err(|err| anyhow::anyhow!("не удалось создать /{dir} в образе: {err}"))?;
+    }
+    for (name, _) in crate::arch::PAYLOAD_DEFAULTS {
+        let source = paths::defaults_dir().join(name);
+        let data = fs::read(&source)
+            .with_context(|| format!("не удалось прочитать {}", source.display()))?;
+        fs_image
+            .write_file_path(
+                &mut disk,
+                &format!("usr/share/defaults/etc/{name}"),
+                &data,
+                0o644,
+                0,
+                0,
+            )
+            .map_err(|err| anyhow::anyhow!("не удалось записать эталон {name}: {err}"))?;
+    }
+
     fs_image
         .create_dir_path(&mut disk, "bin", 0o755, 0, 0)
         .map_err(|err| anyhow::anyhow!("не удалось создать /bin в образе: {err}"))?;

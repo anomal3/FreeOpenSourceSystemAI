@@ -198,7 +198,19 @@ pub enum Error {
     Tampered(&'static str),
     /// Версия не новее установленной.
     NotNewer { have: alloc::string::String, offered: alloc::string::String },
+    /// Образ собран для другой архитектуры.
+    WrongArch { image: alloc::string::String },
 }
+
+/// Для какой архитектуры собрано это ядро.
+///
+/// Строка та же, что пишет в манифест `xtask` (`Arch::name`), и та же, которой
+/// программа обновления спрашивает индекс репозитория. Разъехавшись, они дали бы
+/// отказ «это для другой машины» на своём же образе.
+#[cfg(target_arch = "x86_64")]
+const ARCH: &str = "x86_64";
+#[cfg(target_arch = "aarch64")]
+const ARCH: &str = "aarch64";
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -232,6 +244,10 @@ impl core::fmt::Display for Error {
             Self::NotNewer { have, offered } => write!(
                 f,
                 "this system runs {have} and the update offers {offered}; refusing to go back"
+            ),
+            Self::WrongArch { image } => write!(
+                f,
+                "this update is built for {image} and this machine is {ARCH}"
             ),
         }
     }
@@ -316,6 +332,17 @@ pub fn apply(path: &str) -> Result<Slot, Error> {
         keys.len()
     );
 
+    // Архитектура. Проверка дешёвая и стоит рядом с подписью, потому что
+    // отвечает на тот же вопрос — «это вообще для нас?». Подпись её не
+    // заменяет: образ для другой машины бывает подписан совершенно честно, а
+    // записанный в слот он даёт систему, которая не грузится. Спас бы откат, но
+    // ценой перезагрузки в никуда и трёх потерянных попыток.
+    if let Some(arch) = manifest.field("arch") {
+        if arch != ARCH {
+            return Err(Error::WrongArch { image: alloc::string::String::from(arch) });
+        }
+    }
+
     let image = manifest.blob("image").map_err(Error::Container)?;
     let kernel = manifest.blob("kernel").map_err(Error::Container)?;
     let initrd = manifest.blob("initrd").map_err(Error::Container)?;
@@ -324,7 +351,7 @@ pub fn apply(path: &str) -> Result<Slot, Error> {
         // Откат по версии запрещён: подменённое зеркало иначе возвращает машину
         // на дырявую, но **подлинно подписанную** старую версию — подпись на ней
         // настоящая, и ни один ключ такой обман не ловит.
-        if !newer(version, &installed) {
+        if !osupdate::newer(version, &installed) {
             return Err(Error::NotNewer {
                 have: installed,
                 offered: alloc::string::String::from(version),
@@ -525,31 +552,6 @@ fn installed_version() -> Option<alloc::string::String> {
         }
     }
     None
-}
-
-/// Новее ли `offered`, чем `have`.
-///
-/// Сравнение почисловое, по точкам: `0.1.9` меньше `0.1.10`, хотя строкой это
-/// не так. Кусок, который не разбирается числом, сравнивается как строка — иначе
-/// версия вида `0.2.0-rc1` останавливала бы обновления вовсе.
-fn newer(offered: &str, have: &str) -> bool {
-    let mut left = offered.split('.');
-    let mut right = have.split('.');
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return false,
-            (Some(_), None) => return true,
-            (None, Some(_)) => return false,
-            (Some(a), Some(b)) => {
-                match (a.parse::<u64>(), b.parse::<u64>()) {
-                    (Ok(a), Ok(b)) if a != b => return a > b,
-                    (Ok(_), Ok(_)) => {}
-                    _ if a != b => return a > b,
-                    _ => {}
-                }
-            }
-        }
-    }
 }
 
 /// Прочитать ровно столько, сколько просили.

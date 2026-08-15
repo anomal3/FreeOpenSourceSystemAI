@@ -241,8 +241,18 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // не молча — установленная система без `/bin/perms` валит сценарий
             // `installed`.
             for (name, path) in built.programs() {
-                let target = format!("{}/{}", arch::PAYLOAD_BIN_DIR, name.to_uppercase());
+                let target = format!("{}/{}", arch::PAYLOAD_BIN_DIR, medium_name(name));
                 payload.push(read_payload(&target, path)?);
+            }
+
+            // Эталонные настройки. Единственный экземпляр этих файлов лежит в
+            // репозитории (`initrd/usr/share/defaults/etc/`), и на установленную
+            // систему они попадают отсюда — установщик кладёт их в корневой
+            // образ, а не на раздел состояния. Почему именно так, сказано у
+            // `arch::PAYLOAD_DEFAULTS_DIR`.
+            for (name, medium) in arch::PAYLOAD_DEFAULTS {
+                let target = format!("{}/{medium}", arch::PAYLOAD_DEFAULTS_DIR);
+                payload.push(read_payload(&target, &paths::defaults_dir().join(name))?);
             }
 
             // Образцовые пакеты. Имена на носителе — короткие 8.3, потому что
@@ -269,6 +279,20 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
     }
 
     Ok(payload)
+}
+
+/// Как программа называется на установочном носителе.
+///
+/// Том носителя пишется без длинных имён (см. заголовок `disk::fat32`), то есть
+/// имена там только 8.3. Почти все программы в восемь знаков укладываются;
+/// `sysupdate` — нет, и укоротить его молча нельзя: имя обязано совпадать с тем,
+/// что открывает установщик (`PROGRAMS` в `crates/installer/src/payload.rs`).
+/// Поэтому исключение записано явно, а не выводится усечением.
+fn medium_name(name: &str) -> String {
+    match name {
+        "sysupdate" => String::from("SYSUPD"),
+        other => other.to_uppercase(),
+    }
 }
 
 fn read_payload(path: &str, source: &Path) -> Result<Payload> {

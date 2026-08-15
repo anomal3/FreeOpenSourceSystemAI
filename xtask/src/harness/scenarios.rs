@@ -293,6 +293,19 @@ pub struct Scenario {
     /// здесь фиксированный (2001), потому что команда в сценарии записана
     /// строкой и подставить в неё случайный номер нечем.
     pub host_echo: bool,
+    /// Поднять на хосте **сервер обновлений** и подготовить гостю его адрес.
+    ///
+    /// Три вещи разом, и порознь они бессмысленны: собрать каталог репозитория
+    /// (образы, индекс, подпись), раздавать его по HTTP на фиксированном порту и
+    /// положить гостю `/etc/update.cfg`, где этот адрес назван. Последнее — на
+    /// раздел состояния и до запуска, тем же приёмом, что [`Scenario::ssh_key`]:
+    /// набирать адрес по серийной линии значило бы проверять, как гость
+    /// принимает длинную строку, а не как он обновляется.
+    ///
+    /// Рядом с годным репозиторием кладётся подкаталог `x/` — тот же образ,
+    /// подписанный чужим ключом, с правильно подписанным индексом. Без него
+    /// проверка «обновление поставилось» ничего не доказывает.
+    pub host_repo: bool,
     /// Архитектуры, на которых сценарий имеет смысл. Пусто — все.
     pub arches: &'static [Arch],
     /// Сценарий **намеренно** перезагружает машину.
@@ -359,6 +372,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -396,6 +410,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -453,6 +468,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -495,6 +511,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -533,6 +550,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -638,6 +656,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -710,6 +729,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -775,6 +795,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -838,6 +859,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[Arch::X86_64],
         reboots: false,
         updates: false,
@@ -877,6 +899,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1024,6 +1047,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1095,6 +1119,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1142,6 +1167,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1191,6 +1217,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1254,6 +1281,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1307,6 +1335,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1365,6 +1394,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1404,6 +1434,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         // Только AArch64: на x86-64 GIC не существует.
         arches: &[Arch::Aarch64],
         reboots: false,
@@ -1445,6 +1476,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1472,6 +1504,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1500,6 +1533,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         // Сценарий **намеренно** перезагружает машину: проверяется, куда она
         // пойдёт после установки, а с `-no-reboot` она вместо этого погасла бы.
@@ -1579,6 +1613,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1655,6 +1690,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1740,6 +1776,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1845,6 +1882,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1885,6 +1923,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         // Единственный сценарий, в котором перезагрузка — цель, а не симптом.
         reboots: true,
@@ -1950,6 +1989,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         // Сброс посреди работы — это и есть та поломка, ради которой фаза
         // существует; после него машина обязана подняться сама.
@@ -2007,6 +2047,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2069,6 +2110,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         // Только x86-64, и это не упущение. В QEMU `virt` кнопку приносит ACPI
         // GED, описанный в AML: без интерпретатора событие не разобрать, и ядро
         // говорит об этом вслух при загрузке. Проверяем то, что работает.
@@ -2103,6 +2145,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2154,6 +2197,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2199,6 +2243,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2304,6 +2349,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2383,6 +2429,7 @@ pub const ALL: &[Scenario] = &[
         network: true,
         guest_port: 22,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2498,6 +2545,7 @@ pub const ALL: &[Scenario] = &[
         network: true,
         guest_port: 22,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2565,6 +2613,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         // Четыре загрузки в одном процессе QEMU: три неудачные попытки и
         // возврат.
@@ -2643,6 +2692,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         // Две загрузки в одном процессе: до обновления и после.
         reboots: true,
@@ -2712,6 +2762,95 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "update-net",
+        about: "Обновление берётся с сервера по сети: индекс, подпись, загрузка, слот — и другая версия после перезагрузки.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        guest_port: 0,
+        host_echo: false,
+        // Сервер обновлений на хосте, репозиторий и `/etc/update.cfg` гостю.
+        host_repo: true,
+        arches: &[],
+        // Две загрузки в одном процессе: до обновления и после.
+        reboots: true,
+        updates: false,
+        ssh_key: false,
+        extra: &[],
+        steps: &[
+            // Строка про службы печатается **до** приглашения, и ждать её после
+            // него значит ждать вечно: ожидание ищет вперёд от курсора. Порядок
+            // шагов повторяет порядок строк, а не порядок событий, как их
+            // представляет себе человек.
+            //
+            // Сама строка — половина фазы про умолчания: список служб взят из
+            // образа, потому что установщик его в `/etc` больше не пишет.
+            Step::Await("services    : described by /usr/share/defaults/etc/services", BOOT),
+            Step::Await("freeos> ", 120_000),
+            // Сеть поднимает служба, без единой команды.
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 120_000),
+            Step::Wait(2_000),
+
+            // Сначала — чужая подпись индекса. Отказать обязана **программа**, и
+            // до единого скачанного байта: индекс говорит, что качать и сколько,
+            // и верить неподписанному значило бы тащить по сети что попало.
+            Step::Line("sysupdate check /x/"),
+            Step::Await("index signature does not match any key this system trusts", 90_000),
+            Step::Wait(2_000),
+
+            // Теперь настоящий репозиторий. Три строки — три утверждения:
+            // индекс подписан своим ключом, в нём есть запись для этой машины, и
+            // она новее установленного.
+            Step::Line("sysupdate check"),
+            Step::Await("the index is signed by a key this system trusts", 90_000),
+            Step::Await("the server offers FreeOS 0.3", 30_000),
+            Step::Await("that is newer", 30_000),
+            Step::Wait(2_000),
+
+            // Загрузка. Проверяется тем же, чем проверял бы человек: размер
+            // сошёлся с обещанным в подписанном индексе и SHA-256 сошёлся тоже.
+            Step::Line("sysupdate get"),
+            Step::Await("sysupdate: downloading", 60_000),
+            // Срок велик не от неуверенности: образ — семьдесят семь мегабайт,
+            // и каждый из них проходит через сокет, SHA-256 и запись в ext2 в
+            // отладочном ядре под эмуляцией. Программа печатает ход каждые
+            // четыре мегабайта — по журналу видно, что она движется, а не
+            // висит.
+            Step::Await("downloaded and verified 0.3", 2_400_000),
+            Step::Wait(2_000),
+
+            // И установка — тем самым системным вызовом, ради которого фаза
+            // завела `SYS_UPDATE`. Подпись контейнера проверяет ядро, а не
+            // качавшая программа: она в третьем кольце, а в слот пишет ядро.
+            Step::Line("sysupdate apply"),
+            Step::Await("signature checks out against one of", 120_000),
+            Step::Await("sysupdate   : root image written", 900_000),
+            Step::Await("sysupdate   : kernel written", 600_000),
+            Step::Await("sysupdate   : initrd written", 900_000),
+            Step::Await("is active from the next boot", 120_000),
+
+            Step::Line("reboot"),
+            // Загрузка с другого слота — и версия, приехавшая по сети.
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 120_000),
+            Step::Line("cat /os-release"),
+            Step::Await("version=0.3", 15_000),
+            // Умолчания приехали вместе с образом.
+            Step::Expect("services    : described by /usr/share/defaults/etc/services"),
+            // А правка человека пережила смену системы целиком: она на разделе
+            // состояния, которого обновление не касается.
+            Step::Line("cat /etc/update.cfg"),
+            Step::Await("server=10.0.2.2", 15_000),
+            Step::Shot("update-net"),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "install4k",
         about: "Установщик размечает диск с сектором 4096 — раскладка считается в его секторах.",
         target: Target::Installer,
@@ -2722,6 +2861,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2772,6 +2912,7 @@ pub const ALL: &[Scenario] = &[
         network: false,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2815,6 +2956,7 @@ pub const ALL: &[Scenario] = &[
         network: true,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2883,6 +3025,7 @@ pub const ALL: &[Scenario] = &[
         network: true,
         guest_port: 22,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2941,6 +3084,7 @@ pub const ALL: &[Scenario] = &[
         network: true,
         guest_port: 2000,
         host_echo: true,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -3011,6 +3155,7 @@ pub const ALL: &[Scenario] = &[
         network: true,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -3061,6 +3206,7 @@ pub const ALL: &[Scenario] = &[
         network: true,
         guest_port: 0,
         host_echo: false,
+        host_repo: false,
         arches: &[],
         reboots: false,
         updates: false,

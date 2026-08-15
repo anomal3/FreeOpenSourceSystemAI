@@ -17,6 +17,7 @@ mod keys;
 mod package;
 mod paths;
 mod qemu;
+mod repo;
 mod util;
 mod version;
 
@@ -56,6 +57,8 @@ enum Command {
     Inspect(InspectArgs),
     /// Прогнать систему в QEMU по сценариям стенда — без человека за клавиатурой.
     Test(TestArgs),
+    /// Собрать каталог репозитория обновлений: образы, индекс и его подпись.
+    Repo(RepoArgs),
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -221,6 +224,28 @@ struct TestArgs {
     /// Показывать окно QEMU. Снимки экрана делаются и без него.
     #[arg(long)]
     windowed: bool,
+}
+
+#[derive(Args, Debug)]
+struct RepoArgs {
+    /// Какие архитектуры выложить (по умолчанию — обе).
+    ///
+    /// Обе не из аккуратности: индекс один на репозиторий, и собранный по одной
+    /// архитектуре он **заменит** прежний, оставив вторую машину без
+    /// предложения. Заметить это можно только с той машины.
+    #[arg(long, short = 'a', value_enum)]
+    arch: Option<Arch>,
+    /// Собирать образы с профилем release.
+    ///
+    /// Для настоящего выпуска — да: в репозиторий уезжает то же, что в ISO.
+    #[arg(long, short = 'r')]
+    release: bool,
+    /// Версия, которую понесут образы. По умолчанию — версия рабочего дерева.
+    #[arg(long)]
+    version: Option<String>,
+    /// Куда сложить готовое. По умолчанию `build/repo`.
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -424,6 +449,26 @@ fn real_main() -> Result<()> {
             };
             build::check(&arches)?;
             println!("проверка пройдена");
+        }
+
+        Command::Repo(args) => {
+            let arches: Vec<Arch> = match args.arch {
+                Some(arch) => vec![arch],
+                None => Arch::ALL.to_vec(),
+            };
+            // Версия по умолчанию — та же, что в имени образов: мажор, минор и
+            // номер сборки. Обновление, у которого версия не отличается от
+            // установленной, машина отвергнет — и правильно сделает, поэтому
+            // номер сборки входит в неё обязательно.
+            let version = match args.version {
+                Some(version) => version,
+                None => format!("{}.{}", version::VERSION, version::build_number()?),
+            };
+            let dir = args.out.unwrap_or_else(repo::default_dir);
+            let dir = repo::build(&arches, args.release, &version, &dir)?;
+            println!();
+            println!("репозиторий собран: {}", dir.display());
+            println!("выложите этот каталог на сервер как есть; система читает index, index.sig и образ");
         }
 
         Command::Clean => build::clean()?,
