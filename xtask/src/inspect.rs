@@ -29,13 +29,13 @@ pub fn image(path: &Path) -> Result<()> {
     let mut dev = disk::MemDisk::from_vec(data)
         .ok_or_else(|| anyhow::anyhow!("длина образа не кратна сектору"))?;
 
-    println!();
-    println!("образ: {} ({} МиБ)", path.display(), sectors / 2048);
+    say!();
+    say!("образ: {} ({} МиБ)", path.display(), sectors / 2048);
 
     let table = gpt::read(&mut dev)
         .map_err(|err| anyhow::anyhow!("таблица разделов не читается: {err}"))?;
-    println!("  GPT   : {}", table.disk_guid);
-    println!(
+    say!("  GPT   : {}", table.disk_guid);
+    say!(
         "  диапазон: LBA {}..{}",
         table.first_usable_lba, table.last_usable_lba
     );
@@ -49,22 +49,22 @@ pub fn image(path: &Path) -> Result<()> {
         } else {
             "неизвестный"
         };
-        println!();
-        println!(
+        say!();
+        say!(
             "  раздел {}: {kind}, {} МиБ, LBA {}..{}",
             partition.index + 1,
             size / (1024 * 1024),
             partition.first_lba,
             partition.last_lba,
         );
-        println!("    имя  : {}", partition.name_string());
-        println!("    тип  : {}", partition.type_guid);
-        println!("    GUID : {}", partition.unique_guid);
+        say!("    имя  : {}", partition.name_string());
+        say!("    тип  : {}", partition.type_guid);
+        say!("    GUID : {}", partition.unique_guid);
     }
 
     let Some(root) = table.find(gpt::FREEOS_ROOT_TYPE) else {
-        println!();
-        println!("корневого раздела FreeOS на образе нет");
+        say!();
+        say!("корневого раздела FreeOS на образе нет");
         return Ok(());
     };
 
@@ -82,8 +82,8 @@ fn print_root(partition: &[u8]) -> Result<()> {
     let fs = Ext4::load(Box::new(partition.to_vec()))
         .map_err(|err| anyhow::anyhow!("сторонний читатель не смонтировал ext2: {err}"))?;
 
-    println!();
-    println!("корневая файловая система (читает крейт ext4-view):");
+    say!();
+    say!("корневая файловая система (читает крейт ext4-view):");
     walk(&fs, "/", 1)
 }
 
@@ -109,7 +109,7 @@ fn walk(fs: &Ext4, path: &str, depth: usize) -> Result<()> {
         let indent = "  ".repeat(depth);
         // Права, владелец и группа печатаются всегда: они и есть причина, по
         // которой корневая ФС не FAT32, и их отсутствие обязано быть заметно.
-        println!(
+        say!(
             "  {indent}{name}{}  {:04o}  uid {} gid {}  {} байт",
             if meta.is_dir() { "/" } else { "" },
             meta.mode() & 0o7777,
@@ -126,7 +126,7 @@ fn walk(fs: &Ext4, path: &str, depth: usize) -> Result<()> {
                 .read(child.as_str())
                 .map_err(|err| anyhow::anyhow!("файл {child} не читается: {err}"))?;
             for line in String::from_utf8_lossy(&data).lines() {
-                println!("  {indent}  | {line}");
+                say!("  {indent}  | {line}");
             }
         }
     }

@@ -69,7 +69,7 @@ fn ensure(prefix: &str, authority: &str) -> Result<Material> {
             .with_context(|| format!("не удалось записать {}", leaf_path.display()))?;
         std::fs::write(&key_path, &made.key_der)
             .with_context(|| format!("не удалось записать {}", key_path.display()))?;
-        println!("стенд: выписан комплект TLS {prefix} в {}", dir.display());
+        say!("стенд: выписан комплект TLS {prefix} в {}", dir.display());
     }
 
     Ok(Material {

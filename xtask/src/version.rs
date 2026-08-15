@@ -145,6 +145,18 @@ pub fn build_number() -> Result<u32> {
         return Ok(*number);
     }
 
+    // Замок здесь появился вместе с параллельным стендом. Без него два воркера,
+    // не нашедшие числа в ячейке, считают отпечаток одновременно, оба видят в
+    // файле старый номер и оба записывают **один и тот же** следующий — то есть
+    // счётчик, который обязан отличать состояния кода, теряет шаг. Ячейку всё
+    // равно проверяем ещё раз под замком: пока мы его ждали, сосед мог уже
+    // всё посчитать.
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(number) = CACHE.get() {
+        return Ok(*number);
+    }
+
     let fingerprint = fingerprint()?;
     let path = counter();
     let recorded = fs::read_to_string(&path).unwrap_or_default();
@@ -163,8 +175,6 @@ pub fn build_number() -> Result<u32> {
         next
     };
 
-    // Гонки здесь нет: xtask однопоточен, а `set` при занятой ячейке просто
-    // вернёт ошибку, и мы возьмём то, что уже лежит.
     let _ = CACHE.set(number);
     Ok(number)
 }

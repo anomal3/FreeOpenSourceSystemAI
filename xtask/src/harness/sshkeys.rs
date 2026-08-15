@@ -99,7 +99,7 @@ fn ensure_key(name: &str, comment: &str) -> Result<PathBuf> {
     if !status.success() {
         bail!("ssh-keygen отказался делать пару в {}", private.display());
     }
-    println!("стенд: сделана пара ключей {}", private.display());
+    say!("стенд: сделана пара ключей {}", private.display());
     Ok(private)
 }
 
@@ -137,11 +137,11 @@ pub fn place_authorized_key(disk_path: &Path, private: &Path) -> Result<()> {
 
     let target = format!("{ssh_dir}/authorized_keys");
     match fs.write_file_path(&mut dev, &target, &line, 0o600, FIRST_UID, FIRST_UID) {
-        Ok(_) => println!("стенд: ключ положен в /{target} ({} байт)", line.len()),
+        Ok(_) => say!("стенд: ключ положен в /{target} ({} байт)", line.len()),
         // Уже лежит с прошлого прогона: пара переживает прогоны, значит и файл
         // тот же самый. Перезаписи ext2-редактор не умеет, а класть второй раз
         // то же самое незачем.
-        Err(ext2::Error::Exists) => println!("стенд: ключ в /{target} уже лежит"),
+        Err(ext2::Error::Exists) => say!("стенд: ключ в /{target} уже лежит"),
         Err(err) => bail!("не удалось записать /{target}: {err}"),
     }
 
@@ -169,7 +169,7 @@ mod check {
     /// она поэтому не входит — запускается руками (`cargo test -p xtask`).
     #[test]
     fn places_the_key() {
-        let disk = crate::paths::target_disk(crate::arch::Arch::X86_64);
+        let disk = crate::paths::target_disk(crate::arch::Arch::X86_64, false);
         if !disk.is_file() {
             eprintln!("нет образа {}, проверка пропущена", disk.display());
             return;

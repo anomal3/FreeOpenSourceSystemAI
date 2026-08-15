@@ -98,7 +98,7 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
 
     for component in Component::ALL {
         if component == Component::Kernel && !opts.kernel {
-            println!("ядро пропущено (--no-kernel)");
+            say!("ядро пропущено (--no-kernel)");
             continue;
         }
         if component == Component::Installer && !opts.installer {
@@ -141,12 +141,12 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
         // это образ initrd, и читать `/os-keys` ей больше неоткуда. Обновиться
         // она всё равно не может (слотов у носителя нет), но отказ обязан
         // звучать «здесь нет слотов», а не «здесь нет ключей».
-        Some(initrd::build_with(&extra, &[(
+        Some(initrd::build_with(opts.arch, opts.release, &extra, &[(
             String::from("os-keys"),
             crate::keys::trusted_text()?.into_bytes(),
         )])?)
     } else {
-        println!("initrd пропущен (--no-initrd)");
+        say!("initrd пропущен (--no-initrd)");
         None
     };
 
@@ -439,7 +439,7 @@ fn locate_artifact(dir: &Path, component: Component) -> Result<PathBuf> {
     }
 
     if let Some(actual) = found.first() {
-        println!(
+        say!(
             "внимание: ожидался артефакт {}, найден {} — использую его",
             component.artifact_file(),
             actual.display()
@@ -572,7 +572,7 @@ pub fn clean() -> Result<()> {
     if build.exists() {
         std::fs::remove_dir_all(&build)
             .with_context(|| format!("не удалось удалить {}", build.display()))?;
-        println!("удалён {}", build.display());
+        say!("удалён {}", build.display());
     }
 
     let mut cmd = cargo();

@@ -10,7 +10,7 @@ use clap::ValueEnum;
 /// откажется стартовать.
 pub const ARM_VIRT_FLASH_SIZE: u64 = 64 * 1024 * 1024;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, ValueEnum)]
 pub enum Arch {
     #[value(name = "x86_64", alias = "x64")]
     X86_64,

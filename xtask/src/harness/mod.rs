@@ -114,31 +114,92 @@ pub struct TestOptions {
     /// Показывать окно QEMU. По умолчанию прогон идёт вслепую — снимки экрана
     /// от этого не страдают, а всплывающее окно на каждый сценарий мешает.
     pub windowed: bool,
+    /// Сколько прогонов вести одновременно. Ноль — выбрать по числу ядер.
+    pub jobs: usize,
 }
 
 /// Результат одного сценария.
 struct Outcome {
+    /// Место в порядке, в котором прогон вывел бы результаты, будь он
+    /// последовательным. Воркеры заканчивают вразнобой, а итоговая таблица
+    /// обязана читаться одинаково — иначе два прогона не сравнить глазами.
+    order: usize,
     scenario: &'static str,
     arch: Arch,
     release: bool,
     error: Option<String>,
     log: PathBuf,
     shots: Vec<PathBuf>,
+    elapsed: Duration,
+}
+
+/// Один прогон: сценарий на конкретной машине с конкретным профилем.
+struct Run {
+    order: usize,
+    scenario: &'static Scenario,
+    arch: Arch,
+    release: bool,
+}
+
+/// Пачка прогонов, которую обязан отработать **один** воркер и **подряд**.
+///
+/// Единица планирования здесь не сценарий, а пачка, и вот почему. Половина
+/// сценариев работает с диском, на который записал установщик: `install` его
+/// пишет, `installed`, `write`, `ssh-shell` и ещё дюжина с него грузятся,
+/// `rollback` и `update` меняют на нём активный слот, `install4k` пересоздаёт
+/// его с другим размером сектора. Разложить их по разным воркерам нельзя ни в
+/// каком порядке: диск у воркера свой, и сценарий, приехавший к соседу,
+/// прочитал бы либо чужой диск, либо пустоту.
+struct Unit {
+    arch: Arch,
+    release: bool,
+    /// Чем эта пачка занята — для строки о начале работы.
+    what: &'static str,
+    runs: Vec<Run>,
 }
 
 /// Напечатать список сценариев.
 pub fn list() {
-    println!();
-    println!("сценарии стенда:");
+    say!();
+    say!("сценарии стенда:");
     for scenario in scenarios::ALL {
-        println!("  {:<12} {}", scenario.name, scenario.about);
-        println!("               носитель: {}", scenario.target.title());
+        say!("  {:<12} {}", scenario.name, scenario.about);
+        say!("               носитель: {}", scenario.target.title());
     }
-    println!();
+    say!();
+}
+
+/// Сколько прогонов вести одновременно, если человек не сказал.
+///
+/// Половина ядер, но не больше трёх. Половина — потому что один прогон это не
+/// один поток: у QEMU под TCG есть поток процессора и поток ввода-вывода, а
+/// рядом работает сам стенд.
+///
+/// # Почему потолок именно три, а не «сколько ядер выдержит»
+///
+/// Выигрыша выше трёх почти нет: цепочка сценариев установленной системы
+/// неделима и она же самая длинная, так что общее время упирается в неё, а не
+/// в число воркеров. Полный прогон в четыре потока уложил 142 минуты работы в
+/// 59 минут по часам — и то же самое сделал бы третий воркер, потому что
+/// одиночные сценарии кончаются задолго до цепочек.
+///
+/// А вот **цена** четвёртого измерима, и она не в процентах. При четырёх
+/// гостях сразу два прогона из восьмидесяти девяти упали не по делу: прошивка
+/// ARM не дождалась ответа NVMe (`NvmExpressPassThru: Timeout occurs`) и
+/// сбросила машину сторожевым таймером посреди установки, а на x86-64 оболочка
+/// гостя закончила сеанс по своему двадцатисекундному пределу простоя —
+/// часы гостя идут по часам хоста и тогда, когда гостю не досталось процессора.
+/// Ни то ни другое не говорит ничего о системе; и то и другое означает, что
+/// прогон надо повторять. Три воркера дают то же время и не платят этим.
+pub fn default_jobs() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(2);
+    (cores / 2).clamp(1, 3)
 }
 
 pub fn run(opts: &TestOptions) -> Result<()> {
-    let selected: Vec<&Scenario> = match &opts.only {
+    let selected: Vec<&'static Scenario> = match &opts.only {
         Some(name) => scenarios::ALL.iter().filter(|s| s.name == *name).collect(),
         None => scenarios::ALL.iter().collect(),
     };
@@ -151,98 +212,390 @@ pub fn run(opts: &TestOptions) -> Result<()> {
         );
     }
 
-    let mut outcomes: Vec<Outcome> = Vec::new();
+    let plan = schedule(&selected, opts)?;
+    let total: usize = plan.iter().map(|unit| unit.runs.len()).sum();
+    if total == 0 {
+        bail!(
+            "сценарий '{}' не идёт ни на одной из выбранных архитектур",
+            opts.only.as_deref().unwrap_or("")
+        );
+    }
+
+    // Воркеров не больше, чем пачек: пять потоков на четыре цепочки — это пятый
+    // каталог сборки, заведённый ради того, чтобы простоять весь прогон пустым.
+    let jobs = opts.jobs.clamp(1, plan.len());
+
+    // Всё общее готовится **до** развилки и дальше только читается. Собери
+    // воркеры это сами — и они делали бы одну и ту же работу вчетвером, а на
+    // общих файлах (образ initrd, ключи, счётчик сборок) ещё и мешали бы друг
+    // другу.
+    let built = prebuild(&plan)?;
+    if jobs > 1 {
+        prepare_shared_material(&plan)?;
+    }
+
+    let started = Instant::now();
+    let outcomes = if jobs == 1 {
+        let mut outcomes = Vec::with_capacity(total);
+        for unit in &plan {
+            play_unit(unit, &built, opts, &mut outcomes);
+        }
+        outcomes
+    } else {
+        say!();
+        say!(
+            "стенд: {total} прогон(ов) в {jobs} потока(ов); пачек {}, \
+             у каждого воркера свой каталог сборки",
+            plan.len()
+        );
+        run_parallel(plan, &built, opts, jobs)
+    };
+
+    report(&outcomes, started.elapsed(), jobs)
+}
+
+/// Разложить выбранные сценарии по пачкам.
+///
+/// Порядок — тот же, в котором их гнал бы последовательный прогон
+/// (профиль, архитектура, порядок объявления), и это не только ради читаемого
+/// итога: цепочка установленного диска держится именно на порядке объявления.
+fn schedule(selected: &[&'static Scenario], opts: &TestOptions) -> Result<Vec<Unit>> {
+    // Порты серверов обновлений закреплены за конфигурацией, а не за воркером
+    // (почему — в [`HostPorts`]), и держится это на одном свойстве: с этими
+    // серверами работают только сценарии установленного диска, то есть все они
+    // попадают в одну цепочку. Сценарий, которому сервер понадобится вне
+    // цепочки, это свойство сломает — и сломает молчаливо: два прогона одной
+    // конфигурации возьмутся за один порт, а выглядеть это будет как
+    // «репозиторий вдруг отдаёт чужую архитектуру». Поэтому — вслух и сразу.
+    if let Some(stray) = selected
+        .iter()
+        .find(|scenario| scenario.host_repo && !scenario.target.shares_target_disk())
+    {
+        bail!(
+            "сценарий '{}' просит сервер обновлений, но не работает с установленным диском.\n\
+             Порт сервера закреплён за конфигурацией и достаётся цепочке; вне её \
+             два прогона возьмутся за один номер.\n\
+             Либо переведите сценарий на Target::Installed, либо раздайте порты иначе \
+             (см. HostPorts в xtask/src/harness/mod.rs).",
+            stray.name
+        );
+    }
+
+    let mut chains: Vec<Unit> = Vec::new();
+    let mut singles: Vec<Unit> = Vec::new();
+    let mut order = 0usize;
 
     for &release in &opts.profiles {
         for &arch in &opts.arches {
-            for scenario in &selected {
+            let mut chain = Vec::new();
+            for scenario in selected {
                 if !scenario.runs_on(arch) {
                     continue;
                 }
-                println!();
-                println!(
-                    "=== {} / {arch} / {} ===",
-                    scenario.name,
-                    paths::profile_dir_name(release)
-                );
-                println!("{}", scenario.about);
-                outcomes.push(run_scenario(scenario, arch, release, opts.windowed));
+                let run = Run { order, scenario, arch, release };
+                order += 1;
+                if scenario.target.shares_target_disk() {
+                    chain.push(run);
+                } else {
+                    singles.push(Unit {
+                        arch,
+                        release,
+                        what: scenario.name,
+                        runs: vec![run],
+                    });
+                }
+            }
+            if !chain.is_empty() {
+                chains.push(Unit { arch, release, what: "цепочка установленной системы", runs: chain });
             }
         }
     }
 
-    report(&outcomes)
+    // Цепочки — в начало очереди, и это единственное место, где расписание
+    // вообще что-то решает. Цепочка длиннее любого одиночного сценария в
+    // двадцать раз; начатая последней, она одна доработала бы уже после того,
+    // как остальные воркеры разошлись.
+    chains.extend(singles);
+    Ok(chains)
 }
 
-fn report(outcomes: &[Outcome]) -> Result<()> {
-    println!();
-    println!("--- итог ---");
+/// Собрать всё, что понадобится прогону, — по разу на конфигурацию.
+///
+/// Раньше это делал каждый сценарий сам, и в последовательном прогоне разницы
+/// не было: cargo на втором вызове отвечает «пересобирать нечего» за секунду.
+/// В параллельном разница принципиальная. Во-первых, `cargo build` берёт замок
+/// на каталог `target/`, и четыре воркера выстроились бы в очередь на ровном
+/// месте. Во-вторых — и это важнее — образ initrd собирается **в файл**, и
+/// воркер, пересобирающий его посреди чужого прогона, подменил бы систему,
+/// которую сосед в этот момент грузит.
+fn prebuild(plan: &[Unit]) -> Result<std::collections::HashMap<(Arch, bool), build::Built>> {
+    use std::collections::{HashMap, HashSet};
+
+    // Установщик собирается только там, где он кому-то нужен: это отдельный
+    // крейт под UEFI, и в прогоне из одного сценария платить за него незачем.
+    let mut needed: Vec<(Arch, bool)> = Vec::new();
+    let mut with_installer: HashSet<(Arch, bool)> = HashSet::new();
+    for unit in plan {
+        let key = (unit.arch, unit.release);
+        if !needed.contains(&key) {
+            needed.push(key);
+        }
+        if unit.runs.iter().any(|run| run.scenario.target.needs_installer()) {
+            with_installer.insert(key);
+        }
+    }
+
+    let mut built = HashMap::new();
+    for (arch, release) in needed {
+        say!();
+        say!(
+            "=== сборка {arch} / {} ===",
+            paths::profile_dir_name(release)
+        );
+        built.insert(
+            (arch, release),
+            build::build_all(&BuildOptions {
+                arch,
+                release,
+                kernel: true,
+                initrd: true,
+                installer: with_installer.contains(&(arch, release)),
+            })?,
+        );
+    }
+    Ok(built)
+}
+
+/// Завести общий материал прогона: ключи SSH и комплекты TLS.
+///
+/// Тоже до развилки, и по причине, которая дороже времени: и то и другое
+/// заводится «если файла ещё нет», а два воркера, не нашедшие файла
+/// одновременно, зовут `ssh-keygen` на одно и то же имя. Один из них получит
+/// отказ, а второй — пару, половина которой уже уехала в чужой образ.
+fn prepare_shared_material(plan: &[Unit]) -> Result<()> {
+    let needs_ssh = plan
+        .iter()
+        .flat_map(|unit| &unit.runs)
+        .any(|run| run.scenario.ssh_key || run.scenario.guest_port != 0);
+    let needs_tls = plan
+        .iter()
+        .flat_map(|unit| &unit.runs)
+        .any(|run| run.scenario.host_repo);
+
+    if needs_ssh {
+        sshkeys::authorized()?;
+        sshkeys::stranger()?;
+    }
+    if needs_tls {
+        tlskeys::trusted()?;
+        tlskeys::stranger()?;
+    }
+    // Номер сборки считается по всему дереву исходников и кладётся в имена
+    // образов. Посчитанный один раз здесь, он гарантированно один на прогон.
+    crate::version::build_number()?;
+    Ok(())
+}
+
+/// Раздать пачки воркерам и дождаться всех.
+fn run_parallel(
+    plan: Vec<Unit>,
+    built: &std::collections::HashMap<(Arch, bool), build::Built>,
+    opts: &TestOptions,
+    jobs: usize,
+) -> Vec<Outcome> {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    let queue: Mutex<VecDeque<Unit>> = Mutex::new(plan.into());
+    let collected: Mutex<Vec<Outcome>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for index in 1..=jobs {
+            let queue = &queue;
+            let collected = &collected;
+            scope.spawn(move || {
+                // Два признака воркера, и оба — свойства потока: каталог, в
+                // который он строит, и метка, с которой он говорит.
+                paths::set_worker(index as u16);
+                crate::out::set_tag(format!("[w{index}] "));
+
+                loop {
+                    let Some(unit) = queue
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop_front()
+                    else {
+                        break;
+                    };
+                    let mut mine = Vec::with_capacity(unit.runs.len());
+                    play_unit(&unit, built, opts, &mut mine);
+                    collected
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend(mine);
+                }
+            });
+        }
+    });
+
+    let mut outcomes = collected.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+    outcomes.sort_by_key(|outcome| outcome.order);
+    outcomes
+}
+
+/// Отработать пачку целиком, по сценарию за раз.
+fn play_unit(
+    unit: &Unit,
+    built: &std::collections::HashMap<(Arch, bool), build::Built>,
+    opts: &TestOptions,
+    outcomes: &mut Vec<Outcome>,
+) {
+    let profile = paths::profile_dir_name(unit.release);
+    say!();
+    say!(
+        "=== пачка: {} / {} / {profile} ({} шт.) ===",
+        unit.what,
+        unit.arch,
+        unit.runs.len()
+    );
+
+    for run in &unit.runs {
+        say!();
+        say!("=== {} / {} / {profile} ===", run.scenario.name, run.arch);
+        say!("{}", run.scenario.about);
+
+        let Some(built) = built.get(&(run.arch, run.release)) else {
+            // Случиться не может: набор собранного строится по тому же плану.
+            // Но молчаливый пропуск сценария хуже внятного провала.
+            outcomes.push(Outcome {
+                order: run.order,
+                scenario: run.scenario.name,
+                arch: run.arch,
+                release: run.release,
+                error: Some(String::from("для этой конфигурации ничего не собрано")),
+                log: paths::test_dir().join("нет"),
+                shots: Vec::new(),
+                elapsed: Duration::ZERO,
+            });
+            continue;
+        };
+
+        let started = Instant::now();
+        let mut outcome = run_scenario(run, built, opts.windowed);
+        outcome.elapsed = started.elapsed();
+        say!(
+            "--- {} / {} / {profile}: {} за {}",
+            run.scenario.name,
+            run.arch,
+            match outcome.error {
+                Some(_) => "ПРОВАЛ",
+                None => "ок",
+            },
+            render_duration(outcome.elapsed)
+        );
+        outcomes.push(outcome);
+    }
+}
+
+/// Время в виде «7 мин 12 с» — секунды в четырёхзначных числах не читаются.
+fn render_duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        return format!("{seconds} с");
+    }
+    format!("{} мин {:02} с", seconds / 60, seconds % 60)
+}
+
+fn report(outcomes: &[Outcome], wall: Duration, jobs: usize) -> Result<()> {
+    say!();
+    say!("--- итог ---");
     let mut failed = 0usize;
+    let mut work = Duration::ZERO;
     for outcome in outcomes {
+        work += outcome.elapsed;
         let mark = if outcome.error.is_some() { "ПРОВАЛ" } else { "ок    " };
-        println!(
-            "{mark}  {:<12} {:<8} {:<7}  {}",
+        say!(
+            "{mark}  {:<12} {:<8} {:<7} {:>10}  {}",
             outcome.scenario,
             outcome.arch.name(),
             paths::profile_dir_name(outcome.release),
+            render_duration(outcome.elapsed),
             outcome.log.display()
         );
         for shot in &outcome.shots {
-            println!("        снимок: {}", shot.display());
+            say!("        снимок: {}", shot.display());
         }
         if let Some(error) = &outcome.error {
             failed += 1;
             for line in error.lines() {
-                println!("        {line}");
+                say!("        {line}");
             }
         }
     }
-    println!();
+    say!();
+    if jobs > 1 {
+        // Отношение — единственное честное число про выигрыш: «во столько раз
+        // прогон короче того же прогона в один поток» посчитать нельзя, не
+        // прогнав его в один поток, а вот сколько работы уложилось в это
+        // время — видно прямо здесь.
+        say!(
+            "работы {} в {jobs} потока(ов), по часам {}",
+            render_duration(work),
+            render_duration(wall)
+        );
+    } else {
+        say!("по часам {}", render_duration(wall));
+    }
 
     if failed > 0 {
         bail!("сценариев провалено: {failed} из {}", outcomes.len());
     }
-    println!("все сценарии пройдены: {}", outcomes.len());
+    say!("все сценарии пройдены: {}", outcomes.len());
     Ok(())
 }
 
 /// Прогнать один сценарий. Ошибка сценария не прерывает прогон — она попадает в
 /// итог: результат остальных проверок нужен ровно тогда, когда одна упала.
-fn run_scenario(scenario: &Scenario, arch: Arch, release: bool, windowed: bool) -> Outcome {
+fn run_scenario(run: &Run, built: &build::Built, windowed: bool) -> Outcome {
     let prefix = format!(
         "{}-{}-{}",
-        scenario.name,
-        arch.name(),
-        paths::profile_dir_name(release)
+        run.scenario.name,
+        run.arch.name(),
+        paths::profile_dir_name(run.release)
     );
     let log = paths::test_dir().join(format!("{prefix}.log"));
     let mut shots = Vec::new();
 
-    let error = match execute(scenario, arch, release, windowed, &prefix, &log, &mut shots) {
+    let error = match execute(run.scenario, built, windowed, &prefix, &log, &mut shots) {
         Ok(()) => None,
         Err(err) => Some(format!("{err:#}")),
     };
 
-    Outcome { scenario: scenario.name, arch, release, error, log, shots }
+    Outcome {
+        order: run.order,
+        scenario: run.scenario.name,
+        arch: run.arch,
+        release: run.release,
+        error,
+        log,
+        shots,
+        elapsed: Duration::ZERO,
+    }
 }
 
 fn execute(
     scenario: &Scenario,
-    arch: Arch,
-    release: bool,
+    built: &build::Built,
     windowed: bool,
     prefix: &str,
     log_path: &std::path::Path,
     shots: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    let built = build::build_all(&BuildOptions {
-        arch,
-        release,
-        kernel: true,
-        initrd: true,
-        installer: scenario.target.needs_installer(),
-    })?;
-    let drives = prepare_drives(scenario, &built, arch)?;
+    let arch = built.arch;
+    // Порты серверов хоста: три закреплены за конфигурацией, четвёртый
+    // (эхо-сервер) появится ниже, когда его выдаст ядро ОС.
+    let mut ports = HostPorts::for_config(arch, built.release);
+    let drives = prepare_drives(scenario, built, arch, ports)?;
 
     // Слушаем мы, подключается QEMU: порт 0 отдаёт свободный номер, и гонки за
     // фиксированный порт с другим процессом на машине не существует.
@@ -285,7 +638,9 @@ fn execute(
     // в первые же секунды, и сервер, поднятый позже, встретил бы его отказом.
     // Слушающий сокет живёт до конца сценария и закрывается вместе с ним.
     let _host_echo = if scenario.host_echo {
-        Some(start_host_echo()?)
+        let (listener, port) = start_host_echo()?;
+        ports.echo = port;
+        Some(listener)
     } else {
         None
     };
@@ -300,14 +655,11 @@ fn execute(
     // принимающий любой сертификат, проходит первые две проверки так же
     // успешно, как правильный.
     let _host_repo = if scenario.host_repo {
+        let root = paths::test_repo_dir(arch, built.release);
         Some((
-            start_host_repo(repo_dir(arch))?,
-            start_host_tls_repo(repo_dir(arch), HOST_TLS_PORT, tlskeys::trusted()?)?,
-            start_host_tls_repo(
-                repo_dir(arch),
-                HOST_TLS_STRANGER_PORT,
-                tlskeys::stranger()?,
-            )?,
+            start_host_repo(root.clone(), ports.repo)?,
+            start_host_tls_repo(root.clone(), ports.tls, tlskeys::trusted()?)?,
+            start_host_tls_repo(root, ports.stranger, tlskeys::stranger()?)?,
         ))
     } else {
         None
@@ -337,11 +689,11 @@ fn execute(
         ..RunOptions::default()
     };
 
-    let mut cmd = qemu::command(&opts, &built)?;
+    let mut cmd = qemu::command(&opts, built)?;
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    println!("> {}", util::render_command(&cmd));
+    say!("> {}", util::render_command(&cmd));
 
     let mut child = cmd.spawn().context("не удалось запустить QEMU")?;
 
@@ -374,6 +726,7 @@ fn execute(
         prefix,
         shots,
         hostfwd.map(|(host, _)| host),
+        ports,
     );
 
     // Обычно гость машину не выключает: `arch::halt()` — это остановка
@@ -386,7 +739,7 @@ fn execute(
     let text = line.finish();
 
     write_log(log_path, &text, output.as_ref());
-    println!("журнал: {}", log_path.display());
+    say!("журнал: {}", log_path.display());
 
     result
 }
@@ -402,6 +755,7 @@ fn play(
     shots: &mut Vec<PathBuf>,
     // Порт на хосте, проброшенный в гостя, — если сценарий его просил.
     hostfwd: Option<u16>,
+    ports: HostPorts,
 ) -> Result<()> {
     let started = Instant::now();
     // Где сейчас указатель. Мышь относительная, абсолютных координат у неё нет,
@@ -415,12 +769,26 @@ fn play(
 
     // Число, захваченное `Step::Capture`, — например номер задачи, который
     // система назвала сама. Подставляется вместо `{}` в текст последующих шагов.
+    //
+    // Тем же приёмом в текст попадают номера портов хоста (`{echo}`, `{repo}`,
+    // `{tls}`, `{stranger}`). Писать их в сценарии числом было можно, пока
+    // прогон был один: теперь у каждого воркера своя четвёрка, и `2002`,
+    // набранное в команде гостю, увело бы его к соседу — к серверу, который
+    // раздаёт образы **другой** архитектуры. Ошибка при этом выглядела бы как
+    // испорченный образ обновления.
     let mut captured: Option<String> = None;
-    let fill = |text: &str, captured: &Option<String>| -> String {
-        match captured {
+    let fill = move |text: &str, captured: &Option<String>| -> String {
+        let text = match captured {
             Some(value) => text.replace("{}", value),
             None => text.to_string(),
+        };
+        if !text.contains('{') {
+            return text;
         }
+        text.replace("{echo}", &ports.echo.to_string())
+            .replace("{repo}", &ports.repo.to_string())
+            .replace("{tls}", &ports.tls.to_string())
+            .replace("{stranger}", &ports.stranger.to_string())
     };
 
     for (index, step) in scenario.steps.iter().enumerate() {
@@ -428,26 +796,26 @@ fn play(
         match step {
             Step::Await(needle, timeout_ms) => {
                 let needle = fill(needle, &captured);
-                println!("  [{at:>6} мс] шаг {index}: ждём {needle:?}");
+                say!("  [{at:>6} мс] шаг {index}: ждём {needle:?}");
                 line.wait_for(&needle, Duration::from_millis(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
             }
             Step::AwaitAny(needle, timeout_ms) => {
                 let needle = fill(needle, &captured);
-                println!("  [{at:>6} мс] шаг {index}: ждём {needle:?} где угодно в выводе");
+                say!("  [{at:>6} мс] шаг {index}: ждём {needle:?} где угодно в выводе");
                 line.wait_seen(&needle, Duration::from_millis(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
             }
             Step::Capture(prefix, timeout_ms) => {
-                println!("  [{at:>6} мс] шаг {index}: ждём {prefix:?} и запоминаем число за ним");
+                say!("  [{at:>6} мс] шаг {index}: ждём {prefix:?} и запоминаем число за ним");
                 let value = line
                     .capture_number(prefix, Duration::from_millis(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
-                println!("  [{at:>6} мс] шаг {index}: запомнено {value:?}");
+                say!("  [{at:>6} мс] шаг {index}: запомнено {value:?}");
                 captured = Some(value);
             }
             Step::Clock(prefix, tolerance_s, timeout_ms) => {
-                println!("  [{at:>6} мс] шаг {index}: сверяем часы гостя с часами хоста");
+                say!("  [{at:>6} мс] шаг {index}: сверяем часы гостя с часами хоста");
                 let value = line
                     .capture_number(prefix, Duration::from_millis(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
@@ -459,7 +827,7 @@ fn play(
                     .context("часы хоста до 1970 года")?
                     .as_secs() as i64;
                 let drift = guest - host;
-                println!(
+                say!(
                     "             гость {guest} с, хост {host} с, расхождение {drift} с (допуск ±{tolerance_s})"
                 );
                 if drift.unsigned_abs() > *tolerance_s {
@@ -471,59 +839,59 @@ fn play(
                 }
             }
             Step::AtMost(prefix, limit, timeout_ms) => {
-                println!("  [{at:>6} мс] шаг {index}: ждём число за {prefix:?}, не больше {limit}");
+                say!("  [{at:>6} мс] шаг {index}: ждём число за {prefix:?}, не больше {limit}");
                 let value = line
                     .capture_number(prefix, Duration::from_millis(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
                 let number: u64 = value
                     .parse()
                     .with_context(|| format!("шаг {index}: {value:?} — не число"))?;
-                println!("             получено {number}");
+                say!("             получено {number}");
                 if number > *limit {
                     bail!("шаг {index}: за {prefix:?} стоит {number}, а предел {limit}");
                 }
             }
             Step::AtLeast(prefix, limit, timeout_ms) => {
-                println!("  [{at:>6} мс] шаг {index}: ждём число за {prefix:?}, не меньше {limit}");
+                say!("  [{at:>6} мс] шаг {index}: ждём число за {prefix:?}, не меньше {limit}");
                 let value = line
                     .capture_number(prefix, Duration::from_millis(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
                 let number: u64 = value
                     .parse()
                     .with_context(|| format!("шаг {index}: {value:?} — не число"))?;
-                println!("             получено {number}");
+                say!("             получено {number}");
                 if number < *limit {
                     bail!("шаг {index}: за {prefix:?} стоит {number}, а нужно не меньше {limit}");
                 }
             }
             Step::Expect(needle) => {
                 let needle = fill(needle, &captured);
-                println!("  [{at:>6} мс] шаг {index}: проверяем {needle:?}");
+                say!("  [{at:>6} мс] шаг {index}: проверяем {needle:?}");
                 if !line.seen(&needle) {
                     bail!("шаг {index}: в выводе нет {needle:?}");
                 }
             }
             Step::Absent(needle) => {
                 let needle = fill(needle, &captured);
-                println!("  [{at:>6} мс] шаг {index}: проверяем отсутствие {needle:?}");
+                say!("  [{at:>6} мс] шаг {index}: проверяем отсутствие {needle:?}");
                 if line.seen(&needle) {
                     bail!("шаг {index}: в выводе встретилось {needle:?}, чего быть не должно");
                 }
             }
             Step::Key(name) => {
-                println!("  [{at:>6} мс] шаг {index}: клавиша {name}");
+                say!("  [{at:>6} мс] шаг {index}: клавиша {name}");
                 hmp.sendkey(name).with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
             Step::Repeat(name, times) => {
-                println!("  [{at:>6} мс] шаг {index}: клавиша {name} ×{times}");
+                say!("  [{at:>6} мс] шаг {index}: клавиша {name} ×{times}");
                 for _ in 0..*times {
                     hmp.sendkey(name).with_context(|| format!("шаг {index}"))?;
                     std::thread::sleep(KEY_DELAY);
                 }
             }
             Step::Type(text) => {
-                println!("  [{at:>6} мс] шаг {index}: набираем {text:?}");
+                say!("  [{at:>6} мс] шаг {index}: набираем {text:?}");
                 for name in keys::spell(text).with_context(|| format!("шаг {index}"))? {
                     hmp.sendkey(&name).with_context(|| format!("шаг {index}"))?;
                     std::thread::sleep(KEY_DELAY);
@@ -531,11 +899,11 @@ fn play(
             }
             Step::Line(text) => {
                 let text = fill(text, &captured);
-                println!("  [{at:>6} мс] шаг {index}: в линию {text:?}");
+                say!("  [{at:>6} мс] шаг {index}: в линию {text:?}");
                 line.write_line(&text).with_context(|| format!("шаг {index}"))?;
             }
             Step::Raw(bytes) => {
-                println!("  [{at:>6} мс] шаг {index}: в линию {bytes:02x?}");
+                say!("  [{at:>6} мс] шаг {index}: в линию {bytes:02x?}");
                 line.write_raw(bytes).with_context(|| format!("шаг {index}"))?;
             }
             Step::Aim(target) => {
@@ -543,7 +911,7 @@ fn play(
                 let (width, height) = aim::screen(&log).with_context(|| format!("шаг {index}"))?;
                 let from = *pointer.get_or_insert((width / 2, height / 2));
                 let to = aim::resolve(*target, &log).with_context(|| format!("шаг {index}"))?;
-                println!(
+                say!(
                     "  [{at:>6} мс] шаг {index}: наводим на {target:?} — {:?} -> {to:?}",
                     from
                 );
@@ -555,7 +923,7 @@ fn play(
                 std::thread::sleep(KEY_DELAY);
             }
             Step::Move(dx, dy) => {
-                println!("  [{at:>6} мс] шаг {index}: указатель на {dx},{dy}");
+                say!("  [{at:>6} мс] шаг {index}: указатель на {dx},{dy}");
                 let log = line.text();
                 let (width, height) = aim::screen(&log).with_context(|| format!("шаг {index}"))?;
                 let from = *pointer.get_or_insert((width / 2, height / 2));
@@ -565,7 +933,7 @@ fn play(
                 pointer = Some(to);
             }
             Step::Click => {
-                println!("  [{at:>6} мс] шаг {index}: щелчок");
+                say!("  [{at:>6} мс] шаг {index}: щелчок");
                 press_button(qmp.as_deref_mut(), hmp, true)
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(POINTER_DELAY);
@@ -574,44 +942,44 @@ fn play(
                 std::thread::sleep(KEY_DELAY);
             }
             Step::Press => {
-                println!("  [{at:>6} мс] шаг {index}: кнопка нажата");
+                say!("  [{at:>6} мс] шаг {index}: кнопка нажата");
                 press_button(qmp.as_deref_mut(), hmp, true)
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
             Step::Release => {
-                println!("  [{at:>6} мс] шаг {index}: кнопка отпущена");
+                say!("  [{at:>6} мс] шаг {index}: кнопка отпущена");
                 press_button(qmp.as_deref_mut(), hmp, false)
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
             Step::Plug(spec) => {
-                println!("  [{at:>6} мс] шаг {index}: подключаем {spec}");
+                say!("  [{at:>6} мс] шаг {index}: подключаем {spec}");
                 hmp.device_add(spec).with_context(|| format!("шаг {index}"))?;
             }
             Step::Unplug(id) => {
-                println!("  [{at:>6} мс] шаг {index}: выдёргиваем {id}");
+                say!("  [{at:>6} мс] шаг {index}: выдёргиваем {id}");
                 hmp.device_del(id).with_context(|| format!("шаг {index}"))?;
             }
             Step::Wait(ms) => {
-                println!("  [{at:>6} мс] шаг {index}: пауза {ms} мс");
+                say!("  [{at:>6} мс] шаг {index}: пауза {ms} мс");
                 std::thread::sleep(Duration::from_millis(*ms));
             }
             Step::Reset => {
-                println!("  [{at:>6} мс] шаг {index}: сброс машины без предупреждения гостя");
+                say!("  [{at:>6} мс] шаг {index}: сброс машины без предупреждения гостя");
                 hmp.system_reset().with_context(|| format!("шаг {index}"))?;
             }
             Step::PowerButton => {
-                println!("  [{at:>6} мс] шаг {index}: кнопка питания");
+                say!("  [{at:>6} мс] шаг {index}: кнопка питания");
                 hmp.system_powerdown().with_context(|| format!("шаг {index}"))?;
             }
             Step::Exits(timeout_ms) => {
-                println!("  [{at:>6} мс] шаг {index}: ждём, что QEMU завершится сам");
+                say!("  [{at:>6} мс] шаг {index}: ждём, что QEMU завершится сам");
                 let deadline = Instant::now() + Duration::from_millis(*timeout_ms);
                 loop {
                     match child.try_wait().with_context(|| format!("шаг {index}"))? {
                         Some(status) => {
-                            println!("             QEMU завершился сам: {status}");
+                            say!("             QEMU завершился сам: {status}");
                             // Ненулевой код — не «выключилось как-то не так», а
                             // отказ эмулятора: гость, снявший питание, всегда
                             // даёт ноль. Разница важна, потому что первое
@@ -640,7 +1008,7 @@ fn play(
                 let Some(port) = hostfwd else {
                     bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
                 };
-                println!("  [{at:>6} мс] шаг {index}: с хоста на 127.0.0.1:{port} — \"{text}\"");
+                say!("  [{at:>6} мс] шаг {index}: с хоста на 127.0.0.1:{port} — \"{text}\"");
                 let echoed = tcp_echo(port, text.as_bytes(), *timeout_ms)
                     .with_context(|| format!("шаг {index}"))?;
                 if echoed != text.as_bytes() {
@@ -649,13 +1017,13 @@ fn play(
                         String::from_utf8_lossy(&echoed)
                     );
                 }
-                println!("             вернулось {} байт, совпало", echoed.len());
+                say!("             вернулось {} байт, совпало", echoed.len());
             }
             Step::TcpBulk(kilobytes, timeout_ms) => {
                 let Some(port) = hostfwd else {
                     bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
                 };
-                println!("  [{at:>6} мс] шаг {index}: {kilobytes} КиБ туда и обратно");
+                say!("  [{at:>6} мс] шаг {index}: {kilobytes} КиБ туда и обратно");
                 // Узор, а не нули: одинаковые байты сошлись бы и при
                 // перепутанном порядке сегментов, а такой — нет.
                 let payload: Vec<u8> = (0..kilobytes * 1024)
@@ -673,7 +1041,7 @@ fn play(
                 if let Some(at) = echoed.iter().zip(&payload).position(|(a, b)| a != b) {
                     bail!("шаг {index}: байт {at} вернулся изменённым");
                 }
-                println!("             {} байт совпали до последнего", echoed.len());
+                say!("             {} байт совпали до последнего", echoed.len());
             }
             Step::Ssh(run) => {
                 let Some(port) = hostfwd else {
@@ -683,7 +1051,7 @@ fn play(
                     "" => "оболочка",
                     command => command,
                 };
-                println!("  [{at:>6} мс] шаг {index}: ssh -v на 127.0.0.1:{port} — {what}");
+                say!("  [{at:>6} мс] шаг {index}: ssh -v на 127.0.0.1:{port} — {what}");
                 let output = run_ssh(port, run, prefix, index)
                     .with_context(|| format!("шаг {index}"))?;
                 for line in output.lines().filter(|line| {
@@ -698,7 +1066,7 @@ fn play(
                         || line.contains("Authenticated")
                         || line.starts_with("debug1: Remote protocol")
                 }) {
-                    println!("             {}", line.trim());
+                    say!("             {}", line.trim());
                 }
                 for needle in run.expect {
                     if !output.contains(needle) {
@@ -712,13 +1080,13 @@ fn play(
                 }
             }
             Step::Shot(name) => {
-                println!("  [{at:>6} мс] шаг {index}: снимок '{name}'");
+                say!("  [{at:>6} мс] шаг {index}: снимок '{name}'");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
                 let png = ppm.with_extension("png");
                 std::fs::create_dir_all(paths::test_dir()).ok();
                 hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
                 let (w, h) = shot::ppm_to_png(&ppm, &png).with_context(|| format!("шаг {index}"))?;
-                println!("             {w}x{h} -> {}", png.display());
+                say!("             {w}x{h} -> {}", png.display());
                 shots.push(png);
             }
         }
@@ -736,7 +1104,10 @@ fn run_ssh(port: u16, run: &scenarios::SshRun, prefix: &str, index: usize) -> Re
     use std::process::Command;
 
     let timeout_ms = run.timeout_ms;
-    let known_hosts = paths::test_dir().join("ssh-known-hosts");
+    // Файл известных хостов — свой у каждого прогона, а не один на стенд:
+    // прогонов теперь может идти несколько сразу, и общий файл они бы
+    // пересоздавали друг у друга под ногами.
+    let known_hosts = paths::test_dir().join(format!("{prefix}-known-hosts"));
     std::fs::create_dir_all(paths::test_dir()).ok();
     // Файл известных хостов пересоздаётся пустым: ключ гостя меняется от
     // прогона к прогону, и запись от прошлого раза — это гарантированный отказ.
@@ -850,32 +1221,131 @@ fn run_ssh(port: u16, run: &scenarios::SshRun, prefix: &str, index: usize) -> Re
     // половина картины: гость рассказывает, что делал он, а `ssh -v` — что из
     // этого понял тот, кто с ним разговаривал.
     std::fs::write(&log, text.as_bytes()).ok();
-    println!("             вывод ssh: {}", log.display());
+    say!("             вывод ssh: {}", log.display());
 
     Ok(text)
 }
 
-/// Порт, на котором стенд поднимает эхо-сервер для гостя.
+/// Порты, которые стенд занимает на хосте под один прогон.
 ///
-/// Фиксированный, а не выданный ядром ОС: адрес и порт записаны строкой в
-/// команде сценария (`echoc 10.0.2.2 2001 ...`), и подставить туда случайное
-/// число нечем. Занятый порт даст внятный отказ при запуске, а не загадочное
-/// поведение в середине прогона.
-const HOST_ECHO_PORT: u16 = 2001;
-
-/// Порт, на котором стенд раздаёт репозиторий обновлений.
+/// # Три из них закреплены за конфигурацией
 ///
-/// Фиксированный, как и у эха, и по той же причине: адрес уезжает в файл
-/// настроек гостя, который пишется **до** запуска, — подставить туда случайный
-/// номер было бы можно, но тогда файл менялся бы от прогона к прогону, а
-/// `ext2::Editor` перезаписывать не умеет.
-const HOST_REPO_PORT: u16 = 2002;
+/// Адреса серверов обновлений уезжают гостю в `/etc/update.cfg` — файл на
+/// разделе состояния, который пишется **до** запуска машины и переживает
+/// запуск команды. Спросить свободный номер у ядра ОС, как это делается для
+/// серийной линии, здесь негде: к моменту, когда номер стал бы известен, файл
+/// уже записан. Номер, привязанный к **воркеру**, тоже не годится — при
+/// следующем запуске цепочка достанется другому воркеру, а на диске останется
+/// прежний адрес, и гость пошёл бы туда, где никто не слушает.
+///
+/// Поэтому номер закреплён за конфигурацией: `x86_64/debug` получает 2002–2004
+/// (те же, что были всегда), `x86_64/release` — 2012–2014, и так далее. Занять
+/// их одновременно два прогона не могут: с сервером обновлений работают только
+/// сценарии, читающие установленный диск, а они собраны в одну неделимую
+/// цепочку, и цепочка у конфигурации одна.
+///
+/// # Четвёртый выдаёт ядро ОС
+///
+/// Эхо-серверу такой привязки не нужно: его адрес попадает в гостя строкой
+/// команды, которую стенд набирает **во время** прогона (`echoc 10.0.2.2
+/// {echo} ...`), и подставить туда можно что угодно. Значит и незачем: порт,
+/// выданный ядром из свободных, не конфликтует ни с чем и никогда.
+#[derive(Clone, Copy)]
+struct HostPorts {
+    /// Эхо-сервер, к которому подключается гость. Ноль — сценарию он не нужен.
+    echo: u16,
+    /// Репозиторий обновлений по обычному HTTP.
+    repo: u16,
+    /// Он же по HTTPS, с корнем, который гость знает.
+    tls: u16,
+    /// Он же по HTTPS, с корнем, которого гость не знает.
+    stranger: u16,
+}
 
-/// Порт HTTPS-сервера, которому гость доверяет.
-const HOST_TLS_PORT: u16 = 2003;
+impl HostPorts {
+    fn for_config(arch: Arch, release: bool) -> Self {
+        let slot = match arch {
+            Arch::X86_64 => 0,
+            Arch::Aarch64 => 2,
+        } + u16::from(release);
+        let base = 2000 + 10 * slot;
+        Self {
+            echo: 0,
+            repo: base + 2,
+            tls: base + 3,
+            stranger: base + 4,
+        }
+    }
+}
 
-/// Порт HTTPS-сервера, чей корень гостю неизвестен.
-const HOST_TLS_STRANGER_PORT: u16 = 2004;
+/// Сервер стенда, живущий ровно столько, сколько идёт сценарий.
+///
+/// # Зачем понадобилась остановка
+///
+/// Раньше сервер запускался потоком, которому отдавали **копию** слушающего
+/// сокета, и поток крутился в `incoming()` до конца процесса. Пока сценарии с
+/// сервером обновлений гоняли по одному, это сходило с рук: процесс кончался
+/// вместе с прогоном. Первый же полный прогон показал цену — `update-tls`
+/// пришёл следом за `update-net`, порт 2002 всё ещё держал поток предыдущего
+/// сценария, и проверка HTTPS упала на «адрес занят», не начавшись.
+///
+/// Закрыть сокет, уронив свою копию, нельзя: копия в потоке держит его сама, а
+/// `accept` в ней спит. Поэтому сокет здесь неблокирующий, поток просыпается
+/// раз в полсотни миллисекунд и смотрит на флаг, а [`Drop`] флаг поднимает и
+/// дожидается потока — то есть возврат из сценария означает освобождённый порт,
+/// а не «когда-нибудь освободится».
+struct HostServer {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for HostServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Обслуживать соединения, пока сценарий не кончится.
+///
+/// Соединения обслуживаются по одному и намеренно: гость подключается
+/// последовательно, а пул потоков ради этого — лишний способ отказать.
+fn serve<F>(listener: std::net::TcpListener, handle: F) -> Result<HostServer>
+where
+    F: Fn(std::net::TcpStream) + Send + 'static,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    listener
+        .set_nonblocking(true)
+        .context("не удалось сделать слушающий сокет неблокирующим")?;
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let worker = std::thread::spawn(move || {
+        while !flag.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // Принятый сокет наследует режим слушающего, а весь обмен
+                    // ниже написан на блокирующих чтениях: без этой строки
+                    // сервер отвечал бы «данных пока нет» на каждый запрос.
+                    if stream.set_nonblocking(false).is_err() {
+                        continue;
+                    }
+                    handle(stream);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+        // Сокет уезжает вместе с потоком и закрывается здесь — в этом весь
+        // смысл: порт свободен ровно тогда, когда поток кончился.
+    });
+    Ok(HostServer { stop, worker: Some(worker) })
+}
 
 /// Поднять на хосте тот же репозиторий, но по HTTPS.
 ///
@@ -888,7 +1358,7 @@ fn start_host_tls_repo(
     root: PathBuf,
     port: u16,
     material: tlskeys::Material,
-) -> Result<std::net::TcpListener> {
+) -> Result<HostServer> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::sync::Arc;
 
@@ -902,12 +1372,10 @@ fn start_host_tls_repo(
     let config = Arc::new(config);
 
     let listener = bind_with_patience(port, "сервер обновлений по HTTPS")?;
-    let worker = listener.try_clone().context("не удалось раздвоить слушающий сокет")?;
-    std::thread::spawn(move || {
+    let server = serve(listener, move |stream| {
         use std::io::{Read, Write};
 
-        for stream in worker.incoming() {
-            let Ok(stream) = stream else { break };
+        {
             stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
             // Срока на запись нет по той же причине, что у обычного сервера:
             // гость вычитывает поток медленно, и любой срок здесь означает, что
@@ -915,7 +1383,7 @@ fn start_host_tls_repo(
             stream.set_write_timeout(None).ok();
 
             let Ok(mut connection) = rustls::ServerConnection::new(config.clone()) else {
-                continue;
+                return;
             };
             let mut stream = stream;
 
@@ -975,7 +1443,7 @@ fn start_host_tls_repo(
                 }
             }
             if broken {
-                continue;
+                return;
             }
 
             let request = String::from_utf8_lossy(&request).to_string();
@@ -1032,9 +1500,9 @@ fn start_host_tls_repo(
             stream.flush().ok();
             stream.shutdown(std::net::Shutdown::Write).ok();
         }
-    });
-    println!("стенд: сервер обновлений по HTTPS слушает {port}");
-    Ok(listener)
+    })?;
+    say!("стенд: сервер обновлений по HTTPS слушает {port}");
+    Ok(server)
 }
 
 /// Занять порт, повторяя попытки: он мог остаться в `TIME_WAIT`.
@@ -1059,30 +1527,15 @@ fn bind_with_patience(port: u16, what: &str) -> Result<std::net::TcpListener> {
 /// ответ по букве RFC 9112 — со строкой состояния, `Content-Length` и
 /// `Connection: close`, — и отвечает `404` на то, чего нет: отказ гость обязан
 /// понимать так же уверенно, как успех.
-fn start_host_repo(root: PathBuf) -> Result<std::net::TcpListener> {
-    let mut listener = None;
-    for attempt in 0..10 {
-        match std::net::TcpListener::bind(("127.0.0.1", HOST_REPO_PORT)) {
-            Ok(bound) => {
-                listener = Some(bound);
-                break;
-            }
-            Err(err) if attempt == 9 => {
-                return Err(err).with_context(|| {
-                    format!("не удалось занять порт {HOST_REPO_PORT} под сервер обновлений")
-                });
-            }
-            // Порт может ещё держаться в `TIME_WAIT` после прошлого прогона.
-            Err(_) => std::thread::sleep(Duration::from_millis(300)),
-        }
-    }
-    let listener = listener.expect("цикл выше либо занял порт, либо вернул ошибку");
-    let worker = listener.try_clone().context("не удалось раздвоить слушающий сокет")?;
-    std::thread::spawn(move || {
+fn start_host_repo(root: PathBuf, port: u16) -> Result<HostServer> {
+    // Порт может ещё держаться в `TIME_WAIT` после прошлого прогона — ждём и
+    // повторяем, а не падаем.
+    let listener = bind_with_patience(port, "сервер обновлений")?;
+    let server = serve(listener, move |stream| {
         use std::io::{BufRead, BufReader, Write};
 
-        for stream in worker.incoming() {
-            let Ok(mut stream) = stream else { break };
+        {
+            let mut stream = stream;
             // Срок на **запрос** — короткий: клиент, подключившийся и
             // замолчавший, не должен занимать сервер, который обслуживает по
             // одному.
@@ -1099,11 +1552,11 @@ fn start_host_repo(root: PathBuf) -> Result<std::net::TcpListener> {
 
             let mut reader = BufReader::new(match stream.try_clone() {
                 Ok(clone) => clone,
-                Err(_) => continue,
+                Err(_) => return,
             });
             let mut request = String::new();
             if reader.read_line(&mut request).is_err() {
-                continue;
+                return;
             }
             // Остаток заголовка вычитывается и выбрасывается: тела у GET нет, а
             // непрочитанные байты в сокете мешают закрытию.
@@ -1132,11 +1585,11 @@ fn start_host_repo(root: PathBuf) -> Result<std::net::TcpListener> {
                 ),
             };
             if stream.write_all(response.as_bytes()).is_err() {
-                continue;
+                return;
             }
             if let Some(data) = body {
                 if stream.write_all(&data).is_err() {
-                    continue;
+                    return;
                 }
             }
             stream.flush().ok();
@@ -1144,9 +1597,9 @@ fn start_host_repo(root: PathBuf) -> Result<std::net::TcpListener> {
             // ему только затем, чтобы не ждать своего таймаута на прощание.
             stream.shutdown(std::net::Shutdown::Write).ok();
         }
-    });
-    println!("стенд: сервер обновлений слушает {HOST_REPO_PORT}, каталог отдаётся гостю");
-    Ok(listener)
+    })?;
+    say!("стенд: сервер обновлений слушает {port}, каталог отдаётся гостю");
+    Ok(server)
 }
 
 /// Найти файл, который просят, — и не выпустить запрос за пределы каталога.
@@ -1174,36 +1627,20 @@ fn file_for(root: &std::path::Path, target: &str) -> Option<Vec<u8>> {
 
 /// Поднять на хосте эхо-сервер, к которому будет подключаться гость.
 ///
-/// Возвращает поток, который живёт, пока идёт сценарий, и завершается сам, когда
-/// стенд закрывает слушающий сокет. Обслуживает соединения по одному: гость в
-/// сценарии подключается последовательно, а параллельный сервер потребовал бы
-/// пула потоков ради проверки, которой он не нужен.
-fn start_host_echo() -> Result<std::net::TcpListener> {
-    // Порт может быть ещё занят предыдущим прогоном: соединения, закрытые
-    // секунду назад, держат его в `TIME_WAIT` на стороне хоста, и два прогона
-    // подряд — обычное дело. Ждём и повторяем, а не падаем: отказ здесь
-    // выглядел бы как поломка сети в госте, которой нет.
-    let mut listener = None;
-    for attempt in 0..10 {
-        match std::net::TcpListener::bind(("127.0.0.1", HOST_ECHO_PORT)) {
-            Ok(bound) => {
-                listener = Some(bound);
-                break;
-            }
-            Err(err) if attempt == 9 => {
-                return Err(err).with_context(|| {
-                    format!("не удалось занять порт {HOST_ECHO_PORT} под эхо-сервер хоста")
-                });
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(300)),
-        }
-    }
-    let listener = listener.expect("цикл выше либо занял порт, либо вернул ошибку");
-    let worker = listener.try_clone().context("не удалось раздвоить слушающий сокет")?;
-    std::thread::spawn(move || {
+/// Возвращает сервер, живущий столько же, сколько сценарий (см. [`HostServer`]).
+///
+/// Номер порта возвращается вторым: его выбирает ядро ОС, и узнать его можно
+/// только после того, как сокет занят. В команду гостю он попадает подстановкой
+/// `{echo}` — этим и снята прежняя необходимость держать здесь константу,
+/// которую нельзя было занять дважды.
+fn start_host_echo() -> Result<(HostServer, u16)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("не удалось занять порт под эхо-сервер хоста")?;
+    let port = listener.local_addr()?.port();
+    let server = serve(listener, |stream| {
         use std::io::{Read, Write};
-        for stream in worker.incoming() {
-            let Ok(mut stream) = stream else { break };
+        {
+            let mut stream = stream;
             stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
             let mut buffer = [0u8; 4096];
             loop {
@@ -1222,8 +1659,9 @@ fn start_host_echo() -> Result<std::net::TcpListener> {
             // ответ пришёл весь.
             stream.shutdown(std::net::Shutdown::Both).ok();
         }
-    });
-    Ok(listener)
+    })?;
+    say!("стенд: эхо-сервер хоста слушает {port}");
+    Ok((server, port))
 }
 
 /// Отправить гостю байты по проброшенному порту и собрать ответ.
@@ -1341,8 +1779,8 @@ fn press_button(qmp: Option<&mut qmp::Qmp>, hmp: &mut monitor::Monitor, down: bo
 const TARGET_DISK_MIB: u64 = 2048;
 
 /// Диск, на который ставил установщик.
-fn prepare_installed_disk(arch: Arch) -> Result<PathBuf> {
-    let disk = paths::target_disk(arch);
+fn prepare_installed_disk(arch: Arch, release: bool) -> Result<PathBuf> {
+    let disk = paths::target_disk(arch, release);
     if !disk.is_file() {
         bail!(
             "нет диска, на который ставил установщик: {}\n\
@@ -1354,20 +1792,16 @@ fn prepare_installed_disk(arch: Arch) -> Result<PathBuf> {
     Ok(disk)
 }
 
-/// Каталог, который стенд раздаёт как репозиторий обновлений.
-fn repo_dir(arch: Arch) -> PathBuf {
-    paths::test_dir().join(format!("repo-{}", arch.name()))
-}
-
 /// Собрать репозиторий для стенда: годный и, подкаталогом, с чужой подписью.
 ///
 /// Версия — [`NET_UPDATE_VERSION`], и она **выше** той, что несёт обновление в
 /// `/media`. Иначе сценарий зависел бы от того, шёл ли перед ним `update`:
 /// после него система работает под `0.2`, и предложенная `0.2` была бы отвергнута
 /// запретом отката — то есть проверка сети утонула бы в проверке версий.
-fn prepare_repo(arch: Arch, release: bool) -> Result<()> {
-    let dir = repo_dir(arch);
-    crate::repo::build(&[arch], release, NET_UPDATE_VERSION, &dir)?;
+fn prepare_repo(built: &build::Built) -> Result<()> {
+    let (arch, release) = (built.arch, built.release);
+    let dir = paths::test_repo_dir(arch, release);
+    crate::repo::build(&[built], NET_UPDATE_VERSION, &dir)?;
     // Репозиторий с чужой подписью лежит **внутри** годного, подкаталогом:
     // сервер раздаёт дерево, и второй каталог рядом означал бы второй адрес в
     // настройках. Путь короткий (`/x/`) намеренно — он уезжает в гостя строкой
@@ -1406,7 +1840,7 @@ pub const NET_UPDATE_VERSION: &str = "0.3";
 /// Файл пишется на раздел состояния, то есть оказывается **правкой человека**, и
 /// это часть проверки: в образе лежит эталон с другим адресом, и взять систему
 /// обязана правку.
-fn place_update_config(disk_path: &std::path::Path) -> Result<()> {
+fn place_update_config(disk_path: &std::path::Path, ports: HostPorts) -> Result<()> {
     use disk::BlockDevice as _;
 
     let text = format!(
@@ -1417,10 +1851,11 @@ fn place_update_config(disk_path: &std::path::Path) -> Result<()> {
          # certificate from a root this guest has never heard of, and it has to\n\
          # be refused. The third is HTTPS with the root in /etc/ca.pem.\n\
          server=10.0.2.2\n\
-         port={HOST_REPO_PORT}\n\
+         port={}\n\
          path=/\n\
-         server=https://10.0.2.2:{HOST_TLS_STRANGER_PORT}/\n\
-         server=https://10.0.2.2:{HOST_TLS_PORT}/\n"
+         server=https://10.0.2.2:{}/\n\
+         server=https://10.0.2.2:{}/\n",
+        ports.repo, ports.stranger, ports.tls
     );
 
     let mut dev = crate::diskfile::DiskFile::open(disk_path, 512)?;
@@ -1435,10 +1870,10 @@ fn place_update_config(disk_path: &std::path::Path) -> Result<()> {
     fs.mark_dirty(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось пометить том используемым: {err}"))?;
     match fs.write_file_path(&mut dev, "etc/update.cfg", text.as_bytes(), 0o644, 0, 0) {
-        Ok(_) => println!("стенд: гостю положен /etc/update.cfg на 10.0.2.2:{HOST_REPO_PORT}"),
+        Ok(_) => say!("стенд: гостю положен /etc/update.cfg на 10.0.2.2:{}", ports.repo),
         // Уже лежит с прошлого прогона, и содержимое то же самое: адрес и порт
         // здесь постоянные. Перезаписи `ext2::Editor` не умеет.
-        Err(ext2::Error::Exists) => println!("стенд: /etc/update.cfg у гостя уже лежит"),
+        Err(ext2::Error::Exists) => say!("стенд: /etc/update.cfg у гостя уже лежит"),
         Err(err) => bail!("не удалось записать /etc/update.cfg: {err}"),
     }
 
@@ -1448,8 +1883,8 @@ fn place_update_config(disk_path: &std::path::Path) -> Result<()> {
     // SSH (см. заголовок `sshkeys`).
     let ca = tlskeys::trusted()?.root_pem;
     match fs.write_file_path(&mut dev, "etc/ca.pem", ca.as_bytes(), 0o644, 0, 0) {
-        Ok(_) => println!("стенд: гостю положен /etc/ca.pem с корнем стенда"),
-        Err(ext2::Error::Exists) => println!("стенд: /etc/ca.pem у гостя уже лежит"),
+        Ok(_) => say!("стенд: гостю положен /etc/ca.pem с корнем стенда"),
+        Err(ext2::Error::Exists) => say!("стенд: /etc/ca.pem у гостя уже лежит"),
         Err(err) => bail!("не удалось записать /etc/ca.pem: {err}"),
     }
 
@@ -1467,6 +1902,7 @@ fn prepare_drives(
     scenario: &Scenario,
     built: &build::Built,
     arch: Arch,
+    ports: HostPorts,
 ) -> Result<Vec<Drive>> {
     let drives = match scenario.target {
         Target::Live => vec![Drive::HostDirectory(qemu::prepare_esp(built)?)],
@@ -1475,11 +1911,11 @@ fn prepare_drives(
             // Порядок важен: прошивка перебирает носители в порядке подключения,
             // и загрузочный раздел на этот момент есть только у первого.
             Drive::Image(image::build(built, image::Kind::Installer)?),
-            Drive::Image(image::prepare_target(arch, TARGET_DISK_MIB, true)?),
+            Drive::Image(image::prepare_target(arch, built.release, TARGET_DISK_MIB, true)?),
         ],
         Target::Iso => vec![Drive::Cdrom(image::build_iso(built, image::Kind::System)?)],
         Target::Installed => {
-            let disk = prepare_installed_disk(arch)?;
+            let disk = prepare_installed_disk(arch, built.release)?;
             // Обновление кладётся в образ **до** запуска — так же, как человек
             // положил бы его туда с флешки. Почему не через установочный
             // носитель, сказано в заголовке `crate::diskfile`.
@@ -1513,8 +1949,8 @@ fn prepare_drives(
             // есть проверяется заодно и главное правило фазы: правка в `/etc`
             // читается **раньше** эталона, приехавшего с образом.
             if scenario.host_repo {
-                prepare_repo(arch, built.release)?;
-                place_update_config(&disk)?;
+                prepare_repo(built)?;
+                place_update_config(&disk, ports)?;
             }
             vec![Drive::Image(disk)]
         }
@@ -1522,7 +1958,7 @@ fn prepare_drives(
         // тот, ради которого сценарий существует.
         Target::LiveAndDisk => vec![
             Drive::HostDirectory(qemu::prepare_esp(built)?),
-            Drive::Image(prepare_installed_disk(arch)?),
+            Drive::Image(prepare_installed_disk(arch, built.release)?),
         ],
     };
     Ok(drives)

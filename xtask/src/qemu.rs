@@ -205,7 +205,7 @@ pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
         match built.get(component) {
             Some(src) => {
                 util::copy_file(src, &dst)?;
-                println!("ESP: {} -> {}", src.display(), dst.display());
+                say!("ESP: {} -> {}", src.display(), dst.display());
             }
             // Компонент не собирался (--no-kernel). Файл от прошлого запуска
             // надо убрать: иначе загрузчик подхватит устаревшее ядро, и то, что
@@ -214,7 +214,7 @@ pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
                 if dst.is_file() {
                     std::fs::remove_file(&dst)
                         .with_context(|| format!("не удалось удалить {}", dst.display()))?;
-                    println!("ESP: удалён устаревший {}", dst.display());
+                    say!("ESP: удалён устаревший {}", dst.display());
                 }
             }
         }
@@ -224,9 +224,9 @@ pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
     match built.initrd() {
         Some(src) => {
             if util::copy_file_if_stale(src, &initrd_dst)? {
-                println!("ESP: {} -> {}", src.display(), initrd_dst.display());
+                say!("ESP: {} -> {}", src.display(), initrd_dst.display());
             } else {
-                println!("ESP: {} уже актуален", initrd_dst.display());
+                say!("ESP: {} уже актуален", initrd_dst.display());
             }
         }
         // Ровно та же логика, что и с ядром: `--no-initrd` бессмыслен, если
@@ -235,7 +235,7 @@ pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
             if initrd_dst.is_file() {
                 std::fs::remove_file(&initrd_dst)
                     .with_context(|| format!("не удалось удалить {}", initrd_dst.display()))?;
-                println!("ESP: удалён устаревший {}", initrd_dst.display());
+                say!("ESP: удалён устаревший {}", initrd_dst.display());
             }
         }
     }
@@ -410,7 +410,7 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
 
     let fw = firmware::resolve(arch, Some(qemu.as_path()))?;
     let fw = firmware::prepare(arch, &fw, opts.reset_nvram)?;
-    println!("прошивка: {}", fw.description);
+    say!("прошивка: {}", fw.description);
 
     let mut cmd = Command::new(&qemu);
     cmd.current_dir(paths::workspace_root());
@@ -579,7 +579,7 @@ pub fn run(opts: &RunOptions, built: &Built) -> Result<()> {
         print_gdb_hint(arch);
     }
 
-    println!();
+    say!();
     util::run(&mut cmd, &format!("QEMU ({arch})"))?;
     Ok(())
 }
@@ -594,25 +594,25 @@ fn print_gdb_hint(arch: Arch) {
         Arch::Aarch64 => "set architecture aarch64",
     };
 
-    println!();
-    println!("--- отладка ---");
-    println!("QEMU остановлен до первой инструкции, gdbstub слушает tcp::1234.");
-    println!("В другом терминале:");
-    println!("    {gdb}");
-    println!("    (gdb) {arch_cmd}");
-    println!("    (gdb) target remote localhost:1234");
-    println!("    (gdb) continue");
-    println!();
-    println!(
+    say!();
+    say!("--- отладка ---");
+    say!("QEMU остановлен до первой инструкции, gdbstub слушает tcp::1234.");
+    say!("В другом терминале:");
+    say!("    {gdb}");
+    say!("    (gdb) {arch_cmd}");
+    say!("    (gdb) target remote localhost:1234");
+    say!("    (gdb) continue");
+    say!();
+    say!(
         "Символы: .efi — это PE, и прошивка перемещает его по произвольному адресу.\n\
          Загрузчик печатает свой image base в серийную консоль; когда увидите адрес:\n\
              (gdb) add-symbol-file target/<triple>/<profile>/boot-uefi.efi <base + .text RVA>"
     );
-    println!();
-    println!(
+    say!();
+    say!(
         "Ядро — ELF (и файл без расширения: так устроены таргеты *-unknown-none),\n\
          но собрано как PIE, поэтому адрес тоже берётся из вывода загрузчика:\n\
              (gdb) add-symbol-file target/<triple>/<profile>/kernel <load addr>"
     );
-    println!("---------------");
+    say!("---------------");
 }

@@ -228,7 +228,7 @@ pub fn prepare(arch: Arch, firmware: &Firmware, reset_nvram: bool) -> Result<Pre
                     let dst = dir.join("code.fd");
                     if util::file_len(&dst) != Some(size) {
                         util::write_padded(code, &dst, size)?;
-                        println!(
+                        say!(
                             "прошивка: {} дополнена нулями до {} MiB -> {}",
                             code.display(),
                             size / (1024 * 1024),
@@ -250,7 +250,7 @@ pub fn prepare(arch: Arch, firmware: &Firmware, reset_nvram: bool) -> Result<Pre
                     Some(size) => util::write_padded(vars, &vars_path, size)?,
                     None => util::copy_file(vars, &vars_path)?,
                 }
-                println!(
+                say!(
                     "прошивка: NVRAM инициализирована из {} -> {}",
                     vars.display(),
                     vars_path.display()

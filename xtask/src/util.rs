@@ -36,13 +36,33 @@ fn quote(value: &str) -> String {
 /// Наследование потоков (поведение `Command::status` по умолчанию) обязательно:
 /// иначе вывод компилятора и серийной консоли QEMU не доходил бы до пользователя
 /// в реальном времени.
+///
+/// Исключение — параллельный прогон стенда. Там потоков-воркеров несколько, а
+/// stdout один: унаследованный вывод четырёх cargo сразу приходит вперемешку и
+/// **без метки**, то есть непонятно, чей он. Поэтому под меткой вывод
+/// перехватывается и печатается целиком, когда процесс закончил. Живого
+/// «прямо сейчас компилируется» при этом не видно — и это не потеря: к моменту
+/// развилки всё уже собрано, а cargo в воркере только подтверждает, что
+/// пересобирать нечего.
 pub fn run(cmd: &mut Command, what: &str) -> Result<()> {
     let rendered = render_command(cmd);
-    println!("> {rendered}");
+    say!("> {rendered}");
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("не удалось запустить {what}\n  команда: {rendered}"))?;
+    let status = if crate::out::tagged() {
+        let output = cmd
+            .output()
+            .with_context(|| format!("не удалось запустить {what}\n  команда: {rendered}"))?;
+        for stream in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(stream);
+            if !text.trim().is_empty() {
+                say!("{}", text.trim_end());
+            }
+        }
+        output.status
+    } else {
+        cmd.status()
+            .with_context(|| format!("не удалось запустить {what}\n  команда: {rendered}"))?
+    };
 
     if !status.success() {
         let code = match status.code() {

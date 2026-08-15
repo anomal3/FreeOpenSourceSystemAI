@@ -133,7 +133,12 @@ struct Entry {
 /// собирается на месте. Так попадают в образ доверенные ключи обновления: они
 /// выводятся из ключа в `build/keys/`, а не лежат файлом, который можно было бы
 /// случайно закоммитить.
+/// `arch` и `release` в имя файла и только туда: содержимое образа зависит от
+/// них через программы в `/bin`, и четыре конфигурации обязаны получить четыре
+/// файла (см. [`paths::initrd_image`]).
 pub fn build_with(
+    arch: crate::arch::Arch,
+    release: bool,
     extra: &[(String, PathBuf)],
     generated: &[(String, Vec<u8>)],
 ) -> Result<PathBuf> {
@@ -172,8 +177,8 @@ pub fn build_with(
         entries.push(Entry { rel: rel.clone(), node: Node::File(data.clone()) });
     }
 
-    let image = paths::initrd_image();
-    let stamp_path = paths::initrd_stamp();
+    let image = paths::initrd_image(arch, release);
+    let stamp_path = paths::initrd_stamp(arch, release);
     let stamp = stamp_text(&entries);
 
     // Пересборка только по изменению содержимого. Образ — десятки мегабайт, и
@@ -184,7 +189,7 @@ pub fn build_with(
     let fresh = util::file_len(&image) == Some(IMAGE_SIZE as u64)
         && fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str());
     if fresh {
-        println!(
+        say!(
             "initrd: образ актуален, пересборка не нужна ({})",
             image.display()
         );
@@ -211,7 +216,7 @@ pub fn build_with(
         .filter(|e| matches!(e.node, Node::Dir))
         .count();
     let files = entries.len() - dirs;
-    println!(
+    say!(
         "initrd: {files} файл(ов), {dirs} каталог(ов) из {} -> {} ({} MiB, FAT32, кластер {BYTES_PER_CLUSTER} Б)",
         source.display(),
         image.display(),

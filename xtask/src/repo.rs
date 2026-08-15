@@ -39,23 +39,24 @@ pub fn default_dir() -> PathBuf {
     paths::build_dir().join("repo")
 }
 
-/// Собрать репозиторий из перечисленных архитектур.
+/// Собрать репозиторий из уже собранных систем.
 ///
 /// Возвращает путь к каталогу. `version` — версия, которую понесут образы: она
 /// же попадает в имя файла, в `/os-release` внутри образа и в индекс.
-pub fn build(arches: &[Arch], release: bool, version: &str, dir: &Path) -> Result<PathBuf> {
+///
+/// Собранное передаётся готовым, а не собирается здесь, и это требование
+/// параллельного стенда: репозиторий ему нужен посреди прогона, в потоке
+/// воркера, а `build_all` в этот момент позвал бы cargo (замок на `target/`) и
+/// потрогал бы образ initrd — общий файл, который в этот самый миг читает
+/// соседний прогон.
+pub fn build(builds: &[&build::Built], version: &str, dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(dir)
         .with_context(|| format!("не удалось создать каталог {}", dir.display()))?;
 
     let mut files: Vec<(String, String, u64, [u8; 32])> = Vec::new();
-    for &arch in arches {
-        let built = build::build_all(&build::BuildOptions {
-            arch,
-            release,
-            kernel: true,
-            initrd: true,
-            installer: false,
-        })?;
+    for built in builds {
+        let arch = built.arch;
+        let release = built.release;
         let (Some(kernel), Some(initrd)) = (built.get(crate::arch::Component::Kernel), built.initrd())
         else {
             anyhow::bail!("для репозитория нужны собранные ядро и initrd ({arch})");
@@ -89,7 +90,7 @@ pub fn build(arches: &[Arch], release: bool, version: &str, dir: &Path) -> Resul
             bytes.len() as u64,
             hash(&bytes),
         ));
-        println!("репозиторий: {} ({} МиБ)", target.display(), bytes.len() / (1024 * 1024));
+        say!("репозиторий: {} ({} МиБ)", target.display(), bytes.len() / (1024 * 1024));
     }
 
     let offers: Vec<Offer<'_>> = files
@@ -116,7 +117,7 @@ pub fn build(arches: &[Arch], release: bool, version: &str, dir: &Path) -> Resul
     fs::write(&sig_path, render_signature(&signature).as_bytes())
         .with_context(|| format!("не удалось записать {}", sig_path.display()))?;
 
-    println!("репозиторий: {} и {}", index_path.display(), sig_path.display());
+    say!("репозиторий: {} и {}", index_path.display(), sig_path.display());
     Ok(dir.to_path_buf())
 }
 
@@ -156,6 +157,6 @@ pub fn build_untrusted(good: &Path, version: &str, arch: Arch, dir: &Path) -> Re
     fs::write(&index_path, index.as_bytes())?;
     let signature = keys::sign_index_with_stranger(&fs::read(&index_path)?)?;
     fs::write(dir.join("index.sig"), render_signature(&signature).as_bytes())?;
-    println!("стенд: рядом положен репозиторий с чужой подписью индекса ({})", dir.display());
+    say!("стенд: рядом положен репозиторий с чужой подписью индекса ({})", dir.display());
     Ok(dir.to_path_buf())
 }

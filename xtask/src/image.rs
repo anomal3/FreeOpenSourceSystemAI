@@ -150,7 +150,7 @@ pub fn build(built: &Built, kind: Kind) -> Result<PathBuf> {
     fs::write(&stamp_path, version::stamp_with_build(build.number, &stamp))
         .with_context(|| format!("не удалось записать слепок {}", stamp_path.display()))?;
 
-    println!(
+    say!(
         "образ: {} файл(ов) -> {} ({} МиБ, GPT + FAT32 ESP)",
         payload.len(),
         image_path.display(),
@@ -160,7 +160,7 @@ pub fn build(built: &Built, kind: Kind) -> Result<PathBuf> {
         paths::disk_image(kind.slug(), number, arch, built.release)
     });
     for file in &payload {
-        println!("  \\{:<24} {}", file.path.replace('/', "\\"), file.source.display());
+        say!("  \\{:<24} {}", file.path.replace('/', "\\"), file.source.display());
     }
 
     Ok(image_path)
@@ -463,8 +463,8 @@ fn stamp_text(payload: &[Payload], kind: Kind) -> String {
 ///
 /// Файл создаётся разрежённым (`set_len` не пишет ни байта) — гигабайт нулей
 /// на диске хоста ради того, чтобы установщик их перезаписал, никому не нужен.
-pub fn prepare_target(arch: Arch, size_mib: u64, fresh: bool) -> Result<PathBuf> {
-    let path = paths::target_disk(arch);
+pub fn prepare_target(arch: Arch, release: bool, size_mib: u64, fresh: bool) -> Result<PathBuf> {
+    let path = paths::target_disk(arch, release);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
@@ -473,7 +473,7 @@ pub fn prepare_target(arch: Arch, size_mib: u64, fresh: bool) -> Result<PathBuf>
     let size = size_mib * 1024 * 1024;
     let exists = util::file_len(&path).is_some();
     if exists && !fresh {
-        println!("целевой диск: {} (как есть)", path.display());
+        say!("целевой диск: {} (как есть)", path.display());
         return Ok(path);
     }
 
@@ -481,13 +481,13 @@ pub fn prepare_target(arch: Arch, size_mib: u64, fresh: bool) -> Result<PathBuf>
     // данные, поэтому она делается только по явному `--fresh` (или когда
     // диска ещё нет) и обязательно сообщает о себе.
     if exists {
-        println!("целевой диск: {} пересоздаётся (--fresh)", path.display());
+        say!("целевой диск: {} пересоздаётся (--fresh)", path.display());
     }
     let file = fs::File::create(&path)
         .with_context(|| format!("не удалось создать целевой диск {}", path.display()))?;
     file.set_len(size)
         .with_context(|| format!("не удалось задать размер {size} байт для {}", path.display()))?;
-    println!("целевой диск: {} ({size_mib} МиБ, пустой)", path.display());
+    say!("целевой диск: {} ({size_mib} МиБ, пустой)", path.display());
     Ok(path)
 }
 
@@ -542,7 +542,7 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     fs::write(&stamp_path, version::stamp_with_build(build.number, &stamp))
         .with_context(|| format!("не удалось записать слепок {}", stamp_path.display()))?;
 
-    println!(
+    say!(
         "iso: {} файл(ов) -> {} ({} МиБ, ISO 9660 + El Torito/EFI)",
         payload.len(),
         path.display(),
@@ -576,7 +576,7 @@ fn reuse(
         return Ok(false);
     }
     if util::file_len(path).is_some() {
-        println!("{what}: актуален, пересборка не нужна ({})", path.display());
+        say!("{what}: актуален, пересборка не нужна ({})", path.display());
         return Ok(true);
     }
 
@@ -598,7 +598,7 @@ fn reuse(
     }
     fs::write(stamp_path, version::stamp_with_build(build.number, stamp))
         .with_context(|| format!("не удалось записать слепок {}", stamp_path.display()))?;
-    println!(
+    say!(
         "{what}: содержимое то же, сборка {previous} -> {} ({})",
         build.number,
         path.display()
@@ -625,8 +625,8 @@ fn retire(previous: Option<u32>, current: u32, path_of: impl Fn(u32) -> PathBuf)
         return;
     }
     match fs::remove_file(&path) {
-        Ok(()) => println!("  заменяет сборку {previous} ({})", path.display()),
-        Err(err) => println!("  сборка {previous} осталась лежать: {err}"),
+        Ok(()) => say!("  заменяет сборку {previous} ({})", path.display()),
+        Err(err) => say!("  сборка {previous} осталась лежать: {err}"),
     }
 }
 
@@ -702,32 +702,32 @@ fn iso_readme(arch: Arch, kind: Kind) -> String {
 
 /// Печатает, что лежит в образе и как его записать на настоящий носитель.
 pub fn describe(arch: Arch, path: &Path, kind: Kind) {
-    println!();
-    println!("образ готов: {}", path.display());
-    println!();
-    println!("Запустить в эмуляторе:");
+    say!();
+    say!("образ готов: {}", path.display());
+    say!();
+    say!("Запустить в эмуляторе:");
     match kind {
-        Kind::System => println!("    cargo xtask run --arch {arch} --image"),
-        Kind::Installer => println!("    cargo xtask install --arch {arch}"),
+        Kind::System => say!("    cargo xtask run --arch {arch} --image"),
+        Kind::Installer => say!("    cargo xtask install --arch {arch}"),
     }
-    println!();
-    println!("Записать на USB-носитель (всё, что на нём было, будет уничтожено):");
+    say!();
+    say!("Записать на USB-носитель (всё, что на нём было, будет уничтожено):");
     if cfg!(windows) {
-        println!("    любым записывателем образов в режиме посекторной записи —");
-        println!("    Rufus (режим DD), balenaEtcher, USBImager.");
+        say!("    любым записывателем образов в режиме посекторной записи —");
+        say!("    Rufus (режим DD), balenaEtcher, USBImager.");
     } else {
-        println!(
+        say!(
             "    sudo dd if={} of=/dev/sdX bs=4M status=progress conv=fsync",
             path.display()
         );
     }
-    println!();
+    say!();
     match kind {
-        Kind::System => println!(
+        Kind::System => say!(
             "Образ содержит одну таблицу GPT и один раздел ESP; корневого раздела в нём нет —\n\
              корневой ФС у системы пока тоже нет. Разметку с корневым разделом делает установщик."
         ),
-        Kind::Installer => println!(
+        Kind::Installer => say!(
             "На образе лежит установщик (по стандартному пути \\EFI\\BOOT) и переносимая им\n\
              система (в каталоге \\FREEOS). Прошивка запускает установщик, он размечает\n\
              выбранный диск и переносит систему туда."

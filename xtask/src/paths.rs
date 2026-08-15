@@ -3,9 +3,54 @@
 //! Всё считается от `CARGO_MANIFEST_DIR` самого xtask, а не от текущей рабочей
 //! директории: `cargo xtask` можно запустить из любого подкаталога workspace.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use crate::arch::Arch;
+
+thread_local! {
+    /// Номер воркера, которому принадлежит этот поток.
+    ///
+    /// `None` — обычный однопоточный запуск: все пути такие же, какими были до
+    /// появления параллельного прогона.
+    static WORKER: Cell<Option<u16>> = const { Cell::new(None) };
+}
+
+/// Отдать текущий поток воркеру с этим номером.
+///
+/// Зовётся один раз, первым делом в потоке воркера. Номер хранится в потоке, а
+/// не передаётся аргументом, и это осознанный размен: путь к образу диска
+/// вычисляют полтора десятка функций в пяти модулях, и протащить номер через
+/// все их подписи означало бы дописать по аргументу в каждую — включая те, что
+/// к стенду отношения не имеют вовсе (`cargo xtask image`). Принадлежность
+/// потоку здесь настоящая: воркер — это и есть поток, а всё, что он строит,
+/// строится **для него**.
+pub fn set_worker(index: u16) {
+    WORKER.with(|slot| slot.set(Some(index)));
+}
+
+/// Номер воркера этого потока.
+pub fn worker() -> Option<u16> {
+    WORKER.with(Cell::get)
+}
+
+/// Каталог изменяемых артефактов **этого** воркера.
+///
+/// Всё, что прогон переписывает — ESP, NVRAM, образы дисков, целевой диск,
+/// контейнеры обновлений, — обязано лежать здесь, а не в общем `build/`.
+/// Причина простая: два воркера, пишущие в один файл, дают не «медленно», а
+/// «сценарий проверил чужой образ», и заметить это по журналу нельзя.
+///
+/// Что остаётся общим и почему: собранные cargo бинарники и `initrd-*.img`
+/// (в параллельном прогоне они только читаются — собраны до его начала),
+/// журналы и снимки стенда (имена уникальны: сценарий-арх-профиль), ключи
+/// подписи и SSH/TLS (заводятся до развилки), счётчик сборок.
+pub fn work_dir() -> PathBuf {
+    match worker() {
+        Some(index) => build_dir().join(format!("w{index}")),
+        None => build_dir(),
+    }
+}
 
 /// Корень workspace: каталог на уровень выше `xtask/`.
 pub fn workspace_root() -> PathBuf {
@@ -75,12 +120,12 @@ pub fn test_dir() -> PathBuf {
 /// Разделён по архитектурам, чтобы `BOOTX64.EFI` от прошлой сборки не оставался
 /// рядом с `BOOTAA64.EFI` и не путал ни прошивку, ни пользователя.
 pub fn esp_dir(arch: Arch) -> PathBuf {
-    build_dir().join("esp").join(arch.name())
+    work_dir().join("esp").join(arch.name())
 }
 
 /// Каталог для изменяемых копий прошивки (NVRAM, дополненные до 64 MiB образы).
 pub fn firmware_dir(arch: Arch) -> PathBuf {
-    build_dir().join("firmware").join(arch.name())
+    work_dir().join("firmware").join(arch.name())
 }
 
 /// Каталог с исходным содержимым RAM-диска.
@@ -94,10 +139,20 @@ pub fn initrd_source_dir() -> PathBuf {
 
 /// Готовый образ RAM-диска.
 ///
-/// Лежит в корне `build/`, а не в `build/esp/<arch>/`: содержимое образа от
-/// архитектуры не зависит, и собирать его дважды смысла нет.
-pub fn initrd_image() -> PathBuf {
-    build_dir().join("initrd.img")
+/// Лежит в корне `build/`, но **имя несёт архитектуру и профиль**, и это не
+/// украшение. В образ уезжает `/bin` — программы, собранные под конкретную
+/// машину конкретным профилем; общее имя `initrd.img` означало, что четыре
+/// разных образа по очереди затирают друг друга. Пока стенд собирал их прямо
+/// перед каждым сценарием, это лишь стоило пересборки на каждой смене
+/// конфигурации. Прогон в несколько потоков собирает всё заранее и потом
+/// только читает — и вот там общее имя стало бы прямым дефектом: сценарий на
+/// x86-64 получил бы `/bin` от ARM.
+pub fn initrd_image(arch: Arch, release: bool) -> PathBuf {
+    build_dir().join(format!(
+        "initrd-{}-{}.img",
+        arch.name(),
+        profile_dir_name(release)
+    ))
 }
 
 /// Каталог эталонных настроек — единственный экземпляр в дереве.
@@ -112,8 +167,14 @@ pub fn defaults_dir() -> PathBuf {
 }
 
 /// Слепок содержимого `initrd/`, по которому решается, нужна ли пересборка.
-pub fn initrd_stamp() -> PathBuf {
-    build_dir().join("initrd.stamp")
+///
+/// Лежит рядом со своим образом и назван так же — по той же причине.
+pub fn initrd_stamp(arch: Arch, release: bool) -> PathBuf {
+    build_dir().join(format!(
+        "initrd-{}-{}.stamp",
+        arch.name(),
+        profile_dir_name(release)
+    ))
 }
 
 /// Имя файла образа: `FreeOS_0.1.4_aarch64_release.iso` и подобные.
@@ -137,7 +198,7 @@ fn image_name(slug: &str, build: u32, arch: Arch, release: bool, extension: &str
 
 /// Готовый загрузочный образ диска (GPT + FAT32 ESP).
 pub fn disk_image(slug: &str, build: u32, arch: Arch, release: bool) -> PathBuf {
-    build_dir().join(image_name(slug, build, arch, release, "img"))
+    work_dir().join(image_name(slug, build, arch, release, "img"))
 }
 
 /// Каталог с загрузочными ISO — и только с ними.
@@ -161,7 +222,7 @@ pub fn iso_image(slug: &str, build: u32, arch: Arch, release: bool) -> PathBuf {
 /// номера, иначе сравнивать будет не с чем и каждая сборка окажется первой.
 /// Версии тоже нет — по той же причине.
 pub fn disk_image_stamp(slug: &str, arch: Arch, release: bool) -> PathBuf {
-    build_dir().join(stamp_name(slug, arch, release, "img"))
+    work_dir().join(stamp_name(slug, arch, release, "img"))
 }
 
 /// Слепок содержимого ISO. Лежит рядом со своим образом, в [`iso_dir`].
@@ -182,8 +243,35 @@ fn stamp_name(slug: &str, arch: Arch, release: bool, extension: &str) -> String 
 /// В слепок не входит и не пересобирается: это носитель, а не артефакт
 /// сборки. Стереть его — отдельное осознанное действие (`--fresh`), потому что
 /// именно на нём остаётся результат прошлой установки.
-pub fn target_disk(arch: Arch) -> PathBuf {
-    build_dir().join(format!("target-{}.img", arch.name()))
+///
+/// # Почему в имени профиль, а не номер воркера
+///
+/// Диск переживает запуск команды: человек гоняет `test -s install`, а потом
+/// `test -s ssh-shell`, и второй сценарий обязан найти то, что записал первый.
+/// Номер воркера для этого не годится — при следующем запуске цепочка попадёт к
+/// другому воркеру. Профиль годится: диск трогают только сценарии одной
+/// цепочки (см. `Target::shares_target_disk`), а цепочка у конфигурации одна,
+/// и две сразу её не запускают. Раньше профиля в имени не было, и debug с
+/// release молча пользовались одним диском по очереди — теперь их два.
+pub fn target_disk(arch: Arch, release: bool) -> PathBuf {
+    build_dir().join(format!(
+        "target-{}-{}.img",
+        arch.name(),
+        profile_dir_name(release)
+    ))
+}
+
+/// Каталог репозитория обновлений, который стенд раздаёт гостю по сети.
+///
+/// Ключ тот же, что у целевого диска, и по той же причине: внутри лежат образы
+/// системы под конкретную машину и профиль, а раздаёт их сервер, чей адрес
+/// записан на этом самом диске.
+pub fn test_repo_dir(arch: Arch, release: bool) -> PathBuf {
+    test_dir().join(format!(
+        "repo-{}-{}",
+        arch.name(),
+        profile_dir_name(release)
+    ))
 }
 
 pub fn profile_dir_name(release: bool) -> &'static str {

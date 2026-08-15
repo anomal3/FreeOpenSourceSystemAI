@@ -5,6 +5,12 @@
 //! `[unstable] build-std`: обе настройки глобальны для workspace и сломали бы
 //! сборку этого бинарника. Все `--target` передаются отсюда, явно и по одному.
 
+// Первым и с `macro_use`: макрос `say!` объявлен внутри и должен быть виден
+// всем модулям ниже. Он же — единственная причина, по которой порядок этих
+// строк имеет значение.
+#[macro_use]
+mod out;
+
 mod arch;
 mod build;
 mod diskfile;
@@ -166,6 +172,13 @@ struct InspectArgs {
     /// Целевая архитектура — по ней выбирается образ по умолчанию.
     #[arg(long, short = 'a', value_enum, default_value = "x86_64")]
     arch: Arch,
+    /// Разобрать диск, на который ставил прогон профиля release.
+    ///
+    /// Дисков теперь два, по одному на профиль (`target-<арх>-<профиль>.img`):
+    /// release ставит систему, собранную из другого кода, и общий файл означал
+    /// бы, что `inspect` показывает результат не того прогона.
+    #[arg(long, short = 'r')]
+    release: bool,
     /// Разобрать конкретный файл вместо диска, на который ставил установщик.
     #[arg(long)]
     path: Option<std::path::PathBuf>,
@@ -224,6 +237,15 @@ struct TestArgs {
     /// Показывать окно QEMU. Снимки экрана делаются и без него.
     #[arg(long)]
     windowed: bool,
+    /// Сколько прогонов вести одновременно. По умолчанию — половина ядер, но
+    /// не больше четырёх; `-j 1` возвращает последовательный прогон.
+    ///
+    /// У каждого воркера свой каталог сборки (`build/w<N>/`) и своя четвёрка
+    /// портов на хосте, поэтому прогоны не мешают друг другу ни файлами, ни
+    /// сетью. Сценарии, работающие с установленным диском, идут одной
+    /// неделимой цепочкой — они передают диск друг другу.
+    #[arg(long, short = 'j')]
+    jobs: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -299,14 +321,15 @@ fn real_main() -> Result<()> {
             // разметку. Установленный диск не собирается вовсе — это результат
             // работы установщика, и его загрузка проверяет именно её.
             let drive = if args.installed {
-                let target = paths::target_disk(args.arch);
+                let target = paths::target_disk(args.arch, args.release);
                 if !target.is_file() {
                     anyhow::bail!(
                         "установленного диска нет: {}\n\
                          Сначала выполните установку:\n    \
-                         cargo xtask install --arch {}",
+                         cargo xtask install --arch {}{}",
                         target.display(),
                         args.arch,
+                        if args.release { " --release" } else { "" },
                     );
                 }
                 qemu::Drive::Image(target)
@@ -368,9 +391,9 @@ fn real_main() -> Result<()> {
             })?;
             print_built(&built);
             let path = image::build_iso(&built, kind)?;
-            println!();
-            println!("Подключите этот файл приводом к виртуальной машине с включённым EFI:");
-            println!("  {}", path.display());
+            say!();
+            say!("Подключите этот файл приводом к виртуальной машине с включённым EFI:");
+            say!("  {}", path.display());
         }
 
         Command::Install(args) => {
@@ -384,7 +407,8 @@ fn real_main() -> Result<()> {
             print_built(&built);
 
             let media = image::build(&built, image::Kind::Installer)?;
-            let target = image::prepare_target(args.arch, args.target_size, args.fresh)?;
+            let target =
+                image::prepare_target(args.arch, args.release, args.target_size, args.fresh)?;
 
             let opts = qemu::RunOptions {
                 gdb: false,
@@ -400,14 +424,16 @@ fn real_main() -> Result<()> {
             };
             qemu::run(&opts, &built)?;
 
-            println!();
-            println!("Проверить результат установки:");
-            println!("    cargo xtask inspect --arch {}   # что записано на диск", args.arch);
-            println!("    cargo xtask run --arch {} --installed   # загрузиться с него", args.arch);
+            say!();
+            say!("Проверить результат установки:");
+            say!("    cargo xtask inspect --arch {}   # что записано на диск", args.arch);
+            say!("    cargo xtask run --arch {} --installed   # загрузиться с него", args.arch);
         }
 
         Command::Inspect(args) => {
-            let path = args.path.unwrap_or_else(|| paths::target_disk(args.arch));
+            let path = args
+                .path
+                .unwrap_or_else(|| paths::target_disk(args.arch, args.release));
             if !path.is_file() {
                 anyhow::bail!(
                     "образа нет: {}\n\
@@ -434,11 +460,22 @@ fn real_main() -> Result<()> {
             } else {
                 vec![args.release]
             };
+            // Окно и параллельность несовместимы, и это не запрет ради
+            // запрета: `--windowed` человек включает, чтобы **смотреть**, а
+            // четыре окна, всплывающих вперемешку, смотреть нельзя. К тому же
+            // на полном прогоне GUI хоста замедляет TCG до срабатывания
+            // таймаутов.
+            let jobs = match (args.jobs, args.windowed) {
+                (Some(jobs), _) => jobs.max(1),
+                (None, true) => 1,
+                (None, false) => harness::default_jobs(),
+            };
             harness::run(&harness::TestOptions {
                 arches,
                 profiles,
                 only: args.scenario,
                 windowed: args.windowed,
+                jobs,
             })?;
         }
 
@@ -448,7 +485,7 @@ fn real_main() -> Result<()> {
                 None => Arch::ALL.to_vec(),
             };
             build::check(&arches)?;
-            println!("проверка пройдена");
+            say!("проверка пройдена");
         }
 
         Command::Repo(args) => {
@@ -465,10 +502,20 @@ fn real_main() -> Result<()> {
                 None => format!("{}.{}", version::VERSION, version::build_number()?),
             };
             let dir = args.out.unwrap_or_else(repo::default_dir);
-            let dir = repo::build(&arches, args.release, &version, &dir)?;
-            println!();
-            println!("репозиторий собран: {}", dir.display());
-            println!("выложите этот каталог на сервер как есть; система читает index, index.sig и образ");
+            let mut builds = Vec::with_capacity(arches.len());
+            for arch in arches {
+                builds.push(build::build_all(&build::BuildOptions {
+                    arch,
+                    release: args.release,
+                    kernel: true,
+                    initrd: true,
+                    installer: false,
+                })?);
+            }
+            let dir = repo::build(&builds.iter().collect::<Vec<_>>(), &version, &dir)?;
+            say!();
+            say!("репозиторий собран: {}", dir.display());
+            say!("выложите этот каталог на сервер как есть; система читает index, index.sig и образ");
         }
 
         Command::Clean => build::clean()?,
@@ -482,14 +529,14 @@ fn real_main() -> Result<()> {
 /// Пути нужны не для красоты: их копируют в `add-symbol-file` при отладке и в
 /// команды копирования на настоящую флешку.
 fn print_built(built: &build::Built) {
-    println!();
-    println!("готово ({}, {}):", built.arch, built.profile());
+    say!();
+    say!("готово ({}, {}):", built.arch, built.profile());
     for (component, path) in built.iter() {
-        println!("  {:<10} {}", component.title(), path.display());
+        say!("  {:<10} {}", component.title(), path.display());
     }
     if let Some(initrd) = built.initrd() {
-        println!("  {:<10} {}", "initrd", initrd.display());
+        say!("  {:<10} {}", "initrd", initrd.display());
     }
-    println!();
+    say!();
 }
 

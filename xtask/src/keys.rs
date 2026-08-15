@@ -151,7 +151,7 @@ fn ensure_entropy(name: &str) -> Result<PathBuf> {
         }
         bail!("ssh-keygen отказался делать пару в {}", path.display());
     }
-    println!("подпись: заведён источник ключа {}", path.display());
+    say!("подпись: заведён источник ключа {}", path.display());
     Ok(path)
 }
 

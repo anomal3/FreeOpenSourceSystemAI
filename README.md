@@ -128,10 +128,11 @@ cargo xtask image --arch x86_64         # just write build/FreeOS_0.1.<build>_x8
 cargo xtask install --arch x86_64       # run the installer against a blank 1 GiB disk
 cargo xtask run --arch x86_64 --installed   # boot what the installer just wrote
 
-cargo xtask test                        # the whole bench, both architectures, nobody at the keyboard
+cargo xtask test                        # the whole bench, both architectures, four scenarios at a time
 cargo xtask test --list                 # what the bench checks
 cargo xtask test -a x86_64 -s boot      # one scenario on one architecture
 cargo xtask test --full                 # both profiles on both architectures
+cargo xtask test -j 1                   # one at a time, the way it ran before
 
 cargo xtask iso --arch x86_64           # bootable ISO: build/ISO/FreeOS_0.1.<build>_x86_64_debug.iso
 cargo xtask iso --arch x86_64 --installer   # the installer as an ISO
@@ -1590,6 +1591,48 @@ the cursor anywhere, only to drive it — and the two machines do not even have 
 screen (1280×800 from OVMF, 800×600 from `ramfb`). So the bench aims at meaning ("the title
 bar of the `System` window") and reads the pixels out of the guest's own log, which prints
 the screen size and every window's rectangle for exactly this purpose.
+
+### Three at a time
+
+A full pass is a hundred and eighty runs of an emulator, and they used to go one after
+another — hours during which fifteen of sixteen cores had nothing to do. The bench now runs
+three at once (`-j N` to change it, `-j 1` for the old behaviour); a debug pass over both
+architectures went from a hundred and forty-two minutes of work to fifty-nine on the clock.
+The speed-up is the point, but not the substance: what had to happen first was to give every
+file and every port a single owner.
+
+Three things are shared and read-only for the duration — what cargo built, the initrd image,
+the signing keys — and all of them are made *before* the fork, one build per
+architecture-and-profile rather than one per scenario. That also takes cargo out of the
+parallel phase entirely; four `cargo build` invocations would otherwise queue on one lock
+over one `target/`.
+
+Everything a run *writes* belongs to the worker that runs it: `build/w<N>/` holds its ESP
+directory, its NVRAM, its disk images, its update containers. Two emulators sharing an ESP
+directory do not fail loudly — they fail as a scenario whose kernel was replaced underneath
+it, with a log that says nothing about why.
+
+Two things are keyed to the *configuration* instead, because they outlive the command: the
+disk the installer wrote (`build/target-<arch>-<profile>.img` — debug and release quietly
+shared one file until now) and the ports of the update servers. `test -s install` today and
+`test -s ssh-shell` tomorrow are two invocations, and a worker number would be a different
+number by then. The server's address is written *into* that disk before the machine boots,
+so it has to be the same number every time: 2002-2004 for `x86_64/debug`, 2012-2014 for
+`x86_64/release`, and so on. The echo server needs none of that — its address reaches the
+guest as a command typed during the run — so it takes whatever port the OS hands out.
+
+What cannot be parallelised is the chain. Twenty-one of the forty-six scenarios work on the
+disk the installer wrote: `install` writes it, `persist` checks by a separate boot what
+`write` left behind, `rollback` and `update` move the active slot, `install4k` recreates the
+whole thing with 4096-byte sectors. They go to one worker as one indivisible unit, in
+declaration order, and they are queued first because that chain is twenty times longer than
+anything else. A full pass now takes about as long as its longest chain, which is also why
+the default is three workers and not sixteen — and why the fourth was taken back out. With
+four guests at once, two runs out of eighty-nine failed for reasons that say nothing about
+the system: edk2's NVMe driver timed out mid-install and the watchdog reset the machine, and
+on the other architecture the guest's shell ended its session on the twenty-second of
+idleness — the guest's clock follows the host's, and it keeps running while the guest waits
+for a core. Three workers finish in the same time and do not pay that.
 
 The bench lives in `xtask/src/harness/` and shares one QEMU command line with `run` —
 a second, independent one would mean the tests check a machine the developer never sees.

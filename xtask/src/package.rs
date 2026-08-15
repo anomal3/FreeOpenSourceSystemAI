@@ -29,8 +29,13 @@ use crate::arch::Arch;
 use crate::{build, paths};
 
 /// Куда складываются собранные контейнеры.
+///
+/// В каталог воркера, а не в общий `build/pkg`: имя файла несёт версию, но не
+/// архитектуру (`freeos-0.2.fpk`), а внутри — образ корня с программами под
+/// конкретную машину. Два прогона разных архитектур, пишущие сюда
+/// одновременно, обменялись бы содержимым молча.
 fn output_dir() -> PathBuf {
-    paths::build_dir().join("pkg")
+    paths::work_dir().join("pkg")
 }
 
 /// Собранный контейнер: имя файла и путь к нему.
@@ -93,7 +98,7 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
         let path = dir.join(file_name);
         fs::write(&path, &bytes)
             .with_context(|| format!("не удалось записать {}", path.display()))?;
-        println!("пакет: {} ({} байт)", path.display(), bytes.len());
+        say!("пакет: {} ({} байт)", path.display(), bytes.len());
         built.push(Package { file_name: String::from(file_name), path });
     }
     Ok(built)
@@ -211,7 +216,7 @@ pub fn build_system(
     crate::keys::sign(&mut bytes, &key);
     fs::write(&path, &bytes)
         .with_context(|| format!("не удалось записать {}", path.display()))?;
-    println!(
+    say!(
         "обновление: {} ({} МиБ{})",
         path.display(),
         bytes.len() / (1024 * 1024),
@@ -405,7 +410,7 @@ pub fn place_updates(
                 return Err(anyhow::anyhow!("не удалось записать /{target}: {err}"));
             }
         }
-        println!("обновление положено в образ: /{target} ({} байт)", data.len());
+        say!("обновление положено в образ: /{target} ({} байт)", data.len());
     }
 
     fs.flush_everywhere(&mut dev)
