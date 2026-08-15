@@ -238,7 +238,7 @@ pub fn run(opts: &TestOptions) -> Result<()> {
     let outcomes = if jobs == 1 {
         let mut outcomes = Vec::with_capacity(total);
         for unit in &plan {
-            play_unit(unit, &built, opts, &mut outcomes);
+            play_unit(unit, &built, opts, 1, &mut outcomes);
         }
         outcomes
     } else {
@@ -428,7 +428,7 @@ fn run_parallel(
                         break;
                     };
                     let mut mine = Vec::with_capacity(unit.runs.len());
-                    play_unit(&unit, built, opts, &mut mine);
+                    play_unit(&unit, built, opts, jobs as u16, &mut mine);
                     collected
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -448,6 +448,7 @@ fn play_unit(
     unit: &Unit,
     built: &std::collections::HashMap<(Arch, bool), build::Built>,
     opts: &TestOptions,
+    workers: u16,
     outcomes: &mut Vec<Outcome>,
 ) {
     let profile = paths::profile_dir_name(unit.release);
@@ -481,7 +482,7 @@ fn play_unit(
         };
 
         let started = Instant::now();
-        let mut outcome = run_scenario(run, built, opts.windowed);
+        let mut outcome = run_scenario(run, built, opts.windowed, workers);
         outcome.elapsed = started.elapsed();
         say!(
             "--- {} / {} / {profile}: {} за {}",
@@ -576,7 +577,7 @@ static GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// Прогнать один сценарий. Ошибка сценария не прерывает прогон — она попадает в
 /// итог: результат остальных проверок нужен ровно тогда, когда одна упала.
-fn run_scenario(run: &Run, built: &build::Built, windowed: bool) -> Outcome {
+fn run_scenario(run: &Run, built: &build::Built, windowed: bool, workers: u16) -> Outcome {
     let prefix = format!(
         "{}-{}-{}",
         run.scenario.name,
@@ -596,7 +597,7 @@ fn run_scenario(run: &Run, built: &build::Built, windowed: bool) -> Outcome {
         Box::new(GATE.read().unwrap_or_else(|poisoned| poisoned.into_inner()))
     };
 
-    let error = match execute(run.scenario, built, windowed, &prefix, &log, &mut shots) {
+    let error = match execute(run.scenario, built, windowed, workers, &prefix, &log, &mut shots) {
         Ok(()) => None,
         Err(err) => Some(format!("{err:#}")),
     };
@@ -617,6 +618,7 @@ fn execute(
     scenario: &Scenario,
     built: &build::Built,
     windowed: bool,
+    workers: u16,
     prefix: &str,
     log_path: &std::path::Path,
     shots: &mut Vec<PathBuf>,
@@ -757,6 +759,7 @@ fn execute(
         shots,
         hostfwd.map(|(host, _)| host),
         ports,
+        workers,
     );
 
     // Обычно гость машину не выключает: `arch::halt()` — это остановка
@@ -786,6 +789,8 @@ fn play(
     // Порт на хосте, проброшенный в гостя, — если сценарий его просил.
     hostfwd: Option<u16>,
     ports: HostPorts,
+    // Сколько прогонов идёт одновременно: от этого зависят сроки ожидания.
+    workers: u16,
 ) -> Result<()> {
     let started = Instant::now();
     // Где сейчас указатель. Мышь относительная, абсолютных координат у неё нет,
@@ -806,6 +811,22 @@ fn play(
     // набранное в команде гостю, увело бы его к соседу — к серверу, который
     // раздаёт образы **другой** архитектуры. Ошибка при этом выглядела бы как
     // испорченный образ обновления.
+    // Сколько ждать на самом деле.
+    //
+    // Все сроки в сценариях написаны для машины, на которой один гость. Они
+    // отвечают на вопрос «не повисло ли», и запас в них есть — но запас,
+    // рассчитанный на одного. При трёх гостях сразу всё, что делает гость,
+    // идёт втрое дольше, и сроки начинают срабатывать на исправной работе:
+    // `kill 11` не успел напечатать ответ за пятнадцать секунд, потому что
+    // оболочка в этот момент перерисовывала окно после очередной попытки
+    // `init` поднять `sshd`.
+    //
+    // Поэтому терпение растёт вместе с числом воркеров. Цена честная и
+    // названа вслух: настоящее зависание будет объявлено втрое позже. Ложный
+    // провал на исправной системе стоит дороже — его нельзя отличить от
+    // настоящего, не прогнав сценарий заново.
+    let patience = |ms: u64| Duration::from_millis(ms * u64::from(workers.max(1)));
+
     let mut captured: Option<String> = None;
     let mut captured2: Option<String> = None;
     let fill = move |text: &str, captured: &Option<String>, second: &Option<String>| -> String {
@@ -832,19 +853,19 @@ fn play(
             Step::Await(needle, timeout_ms) => {
                 let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: ждём {needle:?}");
-                line.wait_for(&needle, Duration::from_millis(*timeout_ms))
+                line.wait_for(&needle, patience(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
             }
             Step::AwaitAny(needle, timeout_ms) => {
                 let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: ждём {needle:?} где угодно в выводе");
-                line.wait_seen(&needle, Duration::from_millis(*timeout_ms))
+                line.wait_seen(&needle, patience(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
             }
             Step::Capture(prefix, timeout_ms) => {
                 say!("  [{at:>6} мс] шаг {index}: ждём {prefix:?} и запоминаем число за ним");
                 let value = line
-                    .capture_number(prefix, Duration::from_millis(*timeout_ms))
+                    .capture_number(prefix, patience(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
                 say!("  [{at:>6} мс] шаг {index}: запомнено {value:?}");
                 captured = Some(value);
@@ -852,7 +873,7 @@ fn play(
             Step::Capture2(prefix, timeout_ms) => {
                 say!("  [{at:>6} мс] шаг {index}: ждём {prefix:?} и запоминаем второе число");
                 let value = line
-                    .capture_number(prefix, Duration::from_millis(*timeout_ms))
+                    .capture_number(prefix, patience(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
                 say!("  [{at:>6} мс] шаг {index}: запомнено вторым {value:?}");
                 captured2 = Some(value);
@@ -860,7 +881,7 @@ fn play(
             Step::Clock(prefix, tolerance_s, timeout_ms) => {
                 say!("  [{at:>6} мс] шаг {index}: сверяем часы гостя с часами хоста");
                 let value = line
-                    .capture_number(prefix, Duration::from_millis(*timeout_ms))
+                    .capture_number(prefix, patience(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
                 let guest: i64 = value
                     .parse()
@@ -884,7 +905,7 @@ fn play(
             Step::AtMost(prefix, limit, timeout_ms) => {
                 say!("  [{at:>6} мс] шаг {index}: ждём число за {prefix:?}, не больше {limit}");
                 let value = line
-                    .capture_number(prefix, Duration::from_millis(*timeout_ms))
+                    .capture_number(prefix, patience(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
                 let number: u64 = value
                     .parse()
@@ -897,7 +918,7 @@ fn play(
             Step::AtLeast(prefix, limit, timeout_ms) => {
                 say!("  [{at:>6} мс] шаг {index}: ждём число за {prefix:?}, не меньше {limit}");
                 let value = line
-                    .capture_number(prefix, Duration::from_millis(*timeout_ms))
+                    .capture_number(prefix, patience(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
                 let number: u64 = value
                     .parse()
@@ -1018,7 +1039,7 @@ fn play(
             }
             Step::Exits(timeout_ms) => {
                 say!("  [{at:>6} мс] шаг {index}: ждём, что QEMU завершится сам");
-                let deadline = Instant::now() + Duration::from_millis(*timeout_ms);
+                let deadline = Instant::now() + patience(*timeout_ms);
                 loop {
                     match child.try_wait().with_context(|| format!("шаг {index}"))? {
                         Some(status) => {
@@ -1052,7 +1073,7 @@ fn play(
                     bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
                 };
                 say!("  [{at:>6} мс] шаг {index}: с хоста на 127.0.0.1:{port} — \"{text}\"");
-                let echoed = tcp_echo(port, text.as_bytes(), *timeout_ms)
+                let echoed = tcp_echo(port, text.as_bytes(), patience(*timeout_ms).as_millis() as u64)
                     .with_context(|| format!("шаг {index}"))?;
                 if echoed != text.as_bytes() {
                     bail!(
@@ -1072,7 +1093,7 @@ fn play(
                 let payload: Vec<u8> = (0..kilobytes * 1024)
                     .map(|i| (i % 251) as u8)
                     .collect();
-                let echoed = tcp_echo(port, &payload, *timeout_ms)
+                let echoed = tcp_echo(port, &payload, patience(*timeout_ms).as_millis() as u64)
                     .with_context(|| format!("шаг {index}"))?;
                 if echoed.len() != payload.len() {
                     bail!(
@@ -1095,7 +1116,7 @@ fn play(
                     command => command,
                 };
                 say!("  [{at:>6} мс] шаг {index}: ssh -v на 127.0.0.1:{port} — {what}");
-                let output = run_ssh(port, run, prefix, index)
+                let output = run_ssh(port, run, prefix, index, patience(run.timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
                 for line in output.lines().filter(|line| {
                     // В отчёт попадает только то, что говорит о протоколе и о
@@ -1143,10 +1164,17 @@ fn play(
 /// хоста у гостя новый на каждом прогоне, а файл известных хостов уводится в
 /// никуда. Иначе второй прогон встречал бы предупреждение о подмене ключа и
 /// отказ подключаться — то есть проверял бы аккуратность клиента, а не нас.
-fn run_ssh(port: u16, run: &scenarios::SshRun, prefix: &str, index: usize) -> Result<String> {
+fn run_ssh(
+    port: u16,
+    run: &scenarios::SshRun,
+    prefix: &str,
+    index: usize,
+    // Срок — уже с поправкой на число воркеров (см. `patience` в `play`).
+    timeout: Duration,
+) -> Result<String> {
     use std::process::Command;
 
-    let timeout_ms = run.timeout_ms;
+    let timeout_ms = timeout.as_millis() as u64;
     // Файл известных хостов — свой у каждого прогона, а не один на стенд:
     // прогонов теперь может идти несколько сразу, и общий файл они бы
     // пересоздавали друг у друга под ногами.
