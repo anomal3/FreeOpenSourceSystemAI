@@ -554,6 +554,26 @@ fn report(outcomes: &[Outcome], wall: Duration, jobs: usize) -> Result<()> {
     Ok(())
 }
 
+/// Сценарии, которым нужна машина целиком.
+///
+/// Список короткий и, надеюсь, таким останется. Попадают в него не «медленные»
+/// сценарии — медленных много, и они прекрасно уживаются, — а те, чей отказ под
+/// нагрузкой приходит **не от нашего срока**.
+///
+/// `install4k` ставит систему на диск с сектором 4096, а такой диск умеет
+/// изображать только `nvme`, и добирается до него прошивка своим драйвером. Срок
+/// ожидания у этого драйвера внутри edk2: при трёх гостях сразу он не
+/// дожидается ответа (`NvmExpressPassThru: Timeout occurs`), объявляет отказ
+/// блочного уровня, и сторожевой таймер сбрасывает машину посреди установки.
+/// Поднять этот срок из стенда нельзя ничем — можно только не мешать. В
+/// одиночку сценарий проходит за полминуты, так что стоит это ожидание
+/// недорого, а без него падают три конфигурации из четырёх и утаскивают за
+/// собой `sector4k`, которому нужен записанный ими диск.
+const ALONE: &[&str] = &["install4k"];
+
+/// Пропуск на прогон: обычные сценарии проходят вместе, одиночные — одни.
+static GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// Прогнать один сценарий. Ошибка сценария не прерывает прогон — она попадает в
 /// итог: результат остальных проверок нужен ровно тогда, когда одна упала.
 fn run_scenario(run: &Run, built: &build::Built, windowed: bool) -> Outcome {
@@ -565,6 +585,16 @@ fn run_scenario(run: &Run, built: &build::Built, windowed: bool) -> Outcome {
     );
     let log = paths::test_dir().join(format!("{prefix}.log"));
     let mut shots = Vec::new();
+
+    // Пропуск берётся на всё время прогона: одиночный сценарий ждёт, пока
+    // разойдутся остальные, и не пускает новых, пока идёт сам.
+    let alone = ALONE.contains(&run.scenario.name);
+    let _pass: Box<dyn std::any::Any> = if alone {
+        say!("ждём, пока освободится машина: {} идёт один", run.scenario.name);
+        Box::new(GATE.write().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    } else {
+        Box::new(GATE.read().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    };
 
     let error = match execute(run.scenario, built, windowed, &prefix, &log, &mut shots) {
         Ok(()) => None,

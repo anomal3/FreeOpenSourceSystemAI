@@ -1319,7 +1319,13 @@ pub const ALL: &[Scenario] = &[
             Step::Await("freeos> ", BOOT),
             Step::Line("run -b /bin/nap"),
             Step::Await("started as #", 15_000),
-            Step::Await("asking for nothing", 30_000),
+            // Поиск по всему выводу, а не вперёд от курсора: программа запущена
+            // фоном, и печатает она **сама**, не спросив оболочку. Чья строка
+            // ляжет раньше — «started as #» оболочки или «sleeping…»
+            // программы, — решает планировщик. Под нагрузкой это оказалась
+            // программа, её строка ушла за курсор, и сценарий упал, требуя
+            // порядка, которого система не обещает.
+            Step::AwaitAny("asking for nothing", 30_000),
             // Пауза обязательна: строку программа печатает **до** того, как
             // уснуть, и между этими двумя событиями её успевает вытеснить
             // разбуженная вводом оболочка. Без паузы `tasks` заставал программу
@@ -2757,9 +2763,16 @@ pub const ALL: &[Scenario] = &[
             Step::Line("sysupdate apply /media/freeos-0.2.fpk"),
             // Подпись годного сходится, и система говорит об этом словами.
             Step::Await("signature checks out against one of", 60_000),
-            Step::Await("sysupdate   : root image written", 420_000),
-            Step::Await("sysupdate   : kernel written", 300_000),
-            Step::Await("sysupdate   : initrd written", 420_000),
+            // Сроки те же, что у `update-net`, и подняты по той же причине:
+            // они отвечают на вопрос «не повисло ли», а не «сколько это должно
+            // занимать». Двадцать четыре мегабайта корня, ядро и сорок
+            // мегабайт initrd пишутся в слот отладочным ядром под эмуляцией, и
+            // на машине, где рядом идут ещё два гостя, семи минут на initrd не
+            // хватило: сценарий упал на исправной записи, которая шла себе
+            // дальше.
+            Step::Await("sysupdate   : root image written", 900_000),
+            Step::Await("sysupdate   : kernel written", 600_000),
+            Step::Await("sysupdate   : initrd written", 900_000),
             Step::Await("slot B is active from the next boot", 120_000),
 
             Step::Line("reboot"),

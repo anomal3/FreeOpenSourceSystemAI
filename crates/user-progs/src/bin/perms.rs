@@ -29,8 +29,7 @@
 #![no_main]
 
 use user_abi::{ERR_PERMISSION, KIND_DIRECTORY, Stat};
-use user_progs::{close, exit, gid, open, print, print_i64, print_octal, print_u64, println, read,
-    stat, uid};
+use user_progs::{Line, close, exit, gid, open, println, read, stat, uid};
 
 /// Сколько байт файла настроек программа согласна прочитать.
 const CONFIG_LIMIT: usize = 512;
@@ -46,11 +45,16 @@ const NOTES: &[u8] = b"/notes.txt";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    print("perms: uid ");
-    print_u64(u64::from(uid()));
-    print(" gid ");
-    print_u64(u64::from(gid()));
-    println("");
+    // Каждая строка собирается целиком и уходит ядру одним вызовом. Иначе её
+    // разрывает вывод соседней программы — а `init` в первые секунды после
+    // загрузки как раз заводит службы, и стенд запускает эту программу тогда
+    // же. Подробности в заголовке [`Line`].
+    Line::new()
+        .str("perms: uid ")
+        .num(u64::from(uid()))
+        .str(" gid ")
+        .num(u64::from(gid()))
+        .end();
 
     try_path("/etc/system.cfg");
     try_path("/etc/passwd");
@@ -69,33 +73,34 @@ pub extern "C" fn _start() -> ! {
 
 /// Прочитать файл и рассказать, чем это кончилось.
 fn try_path(path: &str) {
-    print("perms: ");
-    print(path);
-    print(": ");
+    // Строка копится здесь и уходит одним вызовом в конце — в каждой ветке
+    // своим `end()`.
+    let mut line = Line::new();
+    line.str("perms: ").str(path).str(": ");
 
     let mut info = Stat::default();
     let code = stat(path, &mut info);
     if code < 0 {
-        report_error(code);
+        report_error(&mut line, code);
         return;
     }
 
-    print("mode ");
-    print_octal(info.mode & 0o7777);
-    print(" owner ");
-    print_u64(u64::from(info.uid));
-    print(":");
-    print_u64(u64::from(info.gid));
-    print(" -> ");
+    line.str("mode ")
+        .octal(info.mode & 0o7777)
+        .str(" owner ")
+        .num(u64::from(info.uid))
+        .str(":")
+        .num(u64::from(info.gid))
+        .str(" -> ");
 
     if info.kind == KIND_DIRECTORY {
-        println("directory, not read");
+        line.str("directory, not read").end();
         return;
     }
 
     let fd = open(path);
     if fd < 0 {
-        report_error(fd);
+        report_error(&mut line, fd);
         return;
     }
 
@@ -106,12 +111,10 @@ fn try_path(path: &str) {
     close(fd);
 
     if got < 0 {
-        report_error(got);
+        report_error(&mut line, got);
         return;
     }
-    print("read ");
-    print_u64(got as u64);
-    println(" bytes");
+    line.str("read ").num(got as u64).str(" bytes").end();
 }
 
 /// Напечатать причину отказа.
@@ -119,13 +122,11 @@ fn try_path(path: &str) {
 /// Отдельно выделен только отказ в правах: остальные коды печатаются числом.
 /// Разница не косметическая — «нельзя» и «нет такого» требуют от человека
 /// разных действий, и стенд ждёт именно слова.
-fn report_error(code: i64) {
+fn report_error(line: &mut Line, code: i64) {
     if code == ERR_PERMISSION {
-        println("permission denied");
+        line.str("permission denied").end();
     } else {
-        print("error ");
-        print_i64(code);
-        println("");
+        line.str("error ").signed(code).end();
     }
 }
 

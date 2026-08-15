@@ -96,10 +96,16 @@ pub fn print(text: &str) {
     }
 }
 
-/// Напечатать строку и перевести строку.
+/// Напечатать строку и перевести строку — **одним** системным вызовом.
+///
+/// Через [`Line`], а не двумя `print`, и это не мелочь: между двумя вызовами
+/// успевает напечататься соседняя программа, и перевод строки приклеивается к
+/// её строке, а наша срастается со следующей. Читающему журнал это стоит
+/// доверия к нему, а стенду — проверки, которая ищет строку целиком.
 pub fn println(text: &str) {
-    print(text);
-    print("\n");
+    let mut line = Line::new();
+    line.str(text);
+    line.end();
 }
 
 /// Напечатать беззнаковое число.
@@ -153,6 +159,126 @@ pub fn print_octal(value: u32) {
     let start = index.min(buffer.len() - 4);
     // SAFETY: в буфер записаны только цифры ASCII.
     print(unsafe { core::str::from_utf8_unchecked(&buffer[start..]) });
+}
+
+/// Строка, которая уходит ядру **одним** системным вызовом.
+///
+/// # Зачем
+///
+/// `write` атомарен сам по себе — и только сам по себе. Строка, собранная из
+/// пяти вызовов (`print("perms: ")`, путь, `": "`, права, перевод строки),
+/// между вызовами разрывается выводом соседней программы:
+///
+/// ```text
+/// perms: /root/notes.txt: init: started 'sshd' as #12
+/// permission denied
+/// ```
+///
+/// Ни ядро, ни планировщик тут ни при чём: в Unix атомарен один `write`, и
+/// правильный ответ — писать строку одним. Стенд ловит такое как «система не
+/// сказала того, что сказала», и это худший род провала: доказательство
+/// испорчено, а поведение исправно.
+///
+/// # Почему буфер, а не `write!`
+///
+/// Кучи у программы нет, а `core::fmt` тянет за собой килобайты кода ради одной
+/// десятичной записи — по той же причине здесь своё [`print_u64`].
+///
+/// Переполнение не теряется: полный буфер уходит ядру досрочно. Строка при этом
+/// снова становится разрываемой, но строк длиннее [`Line::MAX`] у нас нет.
+pub struct Line {
+    buffer: [u8; Self::MAX],
+    used: usize,
+}
+
+impl Default for Line {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Line {
+    pub const MAX: usize = 192;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            buffer: [0; Self::MAX],
+            used: 0,
+        }
+    }
+
+    /// Дописать текст.
+    pub fn str(&mut self, text: &str) -> &mut Self {
+        for &byte in text.as_bytes() {
+            if self.used == Self::MAX {
+                self.flush();
+            }
+            self.buffer[self.used] = byte;
+            self.used += 1;
+        }
+        self
+    }
+
+    /// Дописать десятичное число.
+    pub fn num(&mut self, value: u64) -> &mut Self {
+        let mut digits = [0u8; 20];
+        let mut index = digits.len();
+        let mut rest = value;
+        loop {
+            index -= 1;
+            digits[index] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        // SAFETY: в буфер записаны только цифры ASCII.
+        self.str(unsafe { core::str::from_utf8_unchecked(&digits[index..]) })
+    }
+
+    /// Дописать знаковое число.
+    pub fn signed(&mut self, value: i64) -> &mut Self {
+        if value < 0 {
+            self.str("-");
+            // `unsigned_abs`, а не `-value`: у самого младшего `i64`
+            // противоположного значения не существует.
+            return self.num(value.unsigned_abs());
+        }
+        self.num(value as u64)
+    }
+
+    /// Дописать восьмеричную запись прав с ведущими нулями до четырёх знаков.
+    pub fn octal(&mut self, value: u32) -> &mut Self {
+        let mut digits = [b'0'; 11];
+        let mut index = digits.len();
+        let mut rest = value;
+        loop {
+            index -= 1;
+            digits[index] = b'0' + (rest % 8) as u8;
+            rest /= 8;
+            if rest == 0 {
+                break;
+            }
+        }
+        let start = index.min(digits.len() - 4);
+        // SAFETY: в буфер записаны только цифры ASCII.
+        self.str(unsafe { core::str::from_utf8_unchecked(&digits[start..]) })
+    }
+
+    /// Дописать перевод строки и отдать всё ядру одним вызовом.
+    pub fn end(&mut self) {
+        self.str("\n");
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        if self.used > 0 {
+            // SAFETY: в буфер попадают только куски `&str` и цифры ASCII.
+            print(unsafe { core::str::from_utf8_unchecked(&self.buffer[..self.used]) });
+            self.used = 0;
+        }
+    }
 }
 
 /// Открыть файл на запись, при необходимости создав или обрезав его.
