@@ -777,10 +777,15 @@ fn play(
     // раздаёт образы **другой** архитектуры. Ошибка при этом выглядела бы как
     // испорченный образ обновления.
     let mut captured: Option<String> = None;
-    let fill = move |text: &str, captured: &Option<String>| -> String {
+    let mut captured2: Option<String> = None;
+    let fill = move |text: &str, captured: &Option<String>, second: &Option<String>| -> String {
         let text = match captured {
             Some(value) => text.replace("{}", value),
             None => text.to_string(),
+        };
+        let text = match second {
+            Some(value) => text.replace("{2}", value),
+            None => text,
         };
         if !text.contains('{') {
             return text;
@@ -795,13 +800,13 @@ fn play(
         let at = started.elapsed().as_millis();
         match step {
             Step::Await(needle, timeout_ms) => {
-                let needle = fill(needle, &captured);
+                let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: ждём {needle:?}");
                 line.wait_for(&needle, Duration::from_millis(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
             }
             Step::AwaitAny(needle, timeout_ms) => {
-                let needle = fill(needle, &captured);
+                let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: ждём {needle:?} где угодно в выводе");
                 line.wait_seen(&needle, Duration::from_millis(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
@@ -813,6 +818,14 @@ fn play(
                     .with_context(|| format!("шаг {index}"))?;
                 say!("  [{at:>6} мс] шаг {index}: запомнено {value:?}");
                 captured = Some(value);
+            }
+            Step::Capture2(prefix, timeout_ms) => {
+                say!("  [{at:>6} мс] шаг {index}: ждём {prefix:?} и запоминаем второе число");
+                let value = line
+                    .capture_number(prefix, Duration::from_millis(*timeout_ms))
+                    .with_context(|| format!("шаг {index}"))?;
+                say!("  [{at:>6} мс] шаг {index}: запомнено вторым {value:?}");
+                captured2 = Some(value);
             }
             Step::Clock(prefix, tolerance_s, timeout_ms) => {
                 say!("  [{at:>6} мс] шаг {index}: сверяем часы гостя с часами хоста");
@@ -865,14 +878,14 @@ fn play(
                 }
             }
             Step::Expect(needle) => {
-                let needle = fill(needle, &captured);
+                let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: проверяем {needle:?}");
                 if !line.seen(&needle) {
                     bail!("шаг {index}: в выводе нет {needle:?}");
                 }
             }
             Step::Absent(needle) => {
-                let needle = fill(needle, &captured);
+                let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: проверяем отсутствие {needle:?}");
                 if line.seen(&needle) {
                     bail!("шаг {index}: в выводе встретилось {needle:?}, чего быть не должно");
@@ -898,7 +911,7 @@ fn play(
                 }
             }
             Step::Line(text) => {
-                let text = fill(text, &captured);
+                let text = fill(text, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: в линию {text:?}");
                 line.write_line(&text).with_context(|| format!("шаг {index}"))?;
             }
