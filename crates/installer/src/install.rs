@@ -445,7 +445,7 @@ pub fn run(
     }
     logln!("[install] root: {packages} package(s) in /media");
 
-    fs.flush(&mut dev)?;
+    fs.flush_everywhere(&mut dev)?;
     fs.mark_clean(&mut dev)?;
 
     // Раздел состояния. Всё, что переживает обновление системы, живёт здесь —
@@ -605,7 +605,7 @@ fn write_state(
 
     logln!("[install] state: /etc/passwd, /etc/system.cfg, /{home}, /opt");
 
-    fs.flush(dev)?;
+    fs.flush_everywhere(dev)?;
     fs.mark_clean(dev)?;
     Ok(())
 }

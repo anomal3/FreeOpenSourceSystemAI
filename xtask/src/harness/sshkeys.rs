@@ -145,7 +145,7 @@ pub fn place_authorized_key(disk_path: &Path, private: &Path) -> Result<()> {
         Err(err) => bail!("не удалось записать /{target}: {err}"),
     }
 
-    fs.flush(&mut dev)
+    fs.flush_everywhere(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось сбросить раздел состояния: {err}"))?;
     fs.mark_clean(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось пометить том чистым: {err}"))?;

@@ -331,7 +331,10 @@ impl FileSystem for Ext2Mount {
         let Some(editor) = editor.as_mut() else {
             return Ok(());
         };
-        editor.flush(disk).map_err(convert)?;
+        // Закрытие тома — единственное место, где резервные копии
+        // суперблока имеет смысл догонять: здесь это стоит полсотни блоков
+        // один раз, а не на каждую запись файла.
+        editor.flush_everywhere(disk).map_err(convert)?;
         disk.flush().map_err(|_| VfsError::Io)?;
         editor.mark_clean(disk).map_err(convert)
     }

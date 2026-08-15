@@ -1453,7 +1453,7 @@ fn place_update_config(disk_path: &std::path::Path) -> Result<()> {
         Err(err) => bail!("не удалось записать /etc/ca.pem: {err}"),
     }
 
-    fs.flush(&mut dev)
+    fs.flush_everywhere(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось сбросить раздел состояния: {err}"))?;
     fs.mark_clean(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось пометить том чистым: {err}"))?;

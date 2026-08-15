@@ -981,7 +981,7 @@ impl Checker {
             self.report.rescued += 1;
             self.report.fixed += 1;
         }
-        editor.flush(dev)?;
+        editor.flush_everywhere(dev)?;
         editor.mark_clean(dev)?;
         Ok(())
     }

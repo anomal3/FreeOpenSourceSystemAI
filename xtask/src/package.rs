@@ -325,7 +325,7 @@ fn build_root_image(
     }
 
     fs_image
-        .flush(&mut disk)
+        .flush_everywhere(&mut disk)
         .map_err(|err| anyhow::anyhow!("не удалось сбросить образ корня: {err}"))?;
     // Том закрывается чисто: система, поднявшаяся с нового слота, не должна
     // объявлять его грязным и проверять целиком на первой же загрузке.
@@ -408,7 +408,7 @@ pub fn place_updates(
         println!("обновление положено в образ: /{target} ({} байт)", data.len());
     }
 
-    fs.flush(&mut dev)
+    fs.flush_everywhere(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось сбросить корневой раздел: {err}"))?;
     fs.mark_clean(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось пометить том чистым: {err}"))?;

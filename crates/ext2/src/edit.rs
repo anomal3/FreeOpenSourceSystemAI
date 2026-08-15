@@ -50,6 +50,19 @@ pub struct Editor {
     /// файла в квадратичную операцию.
     block_hint: u32,
     inode_hint: u32,
+    /// Последняя битовая карта, которую мы читали или писали, — вместе с
+    /// номером её блока.
+    ///
+    /// Это кэш **чтения**, и только чтения: каждое изменение по-прежнему
+    /// уходит на диск сразу, потому что на этом держится обещание из заголовка
+    /// модуля. Сэкономлено ровно одно — перечитывание блока, который мы сами
+    /// же секунду назад записали, а при последовательной записи файла это
+    /// каждое второе обращение к диску: одна карта покрывает восемь тысяч
+    /// блоков, то есть восемь мегабайт подряд.
+    ///
+    /// Измерено: запись полумегабайтного файла из сети шла 73 КиБ/с при
+    /// 412 КиБ/с «в никуда».
+    bitmap_cache: Option<(u32, Vec<u8>)>,
     /// Штамп времени для создаваемых inode.
     time: u32,
     /// Что о состоянии тома сейчас написано **на диске**: `true` — «закрыт
@@ -75,6 +88,7 @@ impl Editor {
             used_dirs_in_group: crate::write::try_vec(groups, 0)?,
             block_hint: geometry.first_data_block,
             inode_hint: FIRST_INODE,
+            bitmap_cache: None,
             time,
             clean_on_disk: fs.was_clean(),
         };
@@ -108,6 +122,7 @@ impl Editor {
             used_dirs_in_group,
             block_hint: geometry.first_data_block,
             inode_hint: FIRST_INODE,
+            bitmap_cache: None,
             time,
             // Разметка только что записала суперблок с признаком «чистый»;
             // первая же правка через [`Editor::mark_dirty`] его снимет.
@@ -203,7 +218,7 @@ impl Editor {
         }
 
         let number = self.alloc_inode(dev)?;
-        let block = self.alloc_block(dev)?;
+        let block = self.alloc_block(dev, true)?;
         self.init_directory_block(dev, block, number, parent)?;
 
         let mut inode = InodeData::new(MODE_DIRECTORY | (mode & 0o7777), uid, gid, self.time);
@@ -434,8 +449,13 @@ impl Editor {
             let within = (position % block_bytes as u64) as usize;
             let take = (block_bytes - within).min(data.len() - done);
 
-            let block = self.block_for_write(dev, &mut inode, index)?;
-            if take == block_bytes {
+            // Блок, который сейчас будет записан **целиком**, обнулять незачем:
+            // старое содержимое исчезнет через строчку. Обнуление стоит ровно
+            // одной лишней записи блока на каждый выделенный, то есть удваивает
+            // цену последовательной записи файла, — и ничего не даёт.
+            let whole = take == block_bytes;
+            let block = self.block_for_write(dev, &mut inode, index, !whole)?;
+            if whole {
                 self.write_block(dev, block, &data[done..done + take])?;
             } else {
                 // Частичный блок читается перед записью: остальное в нём —
@@ -574,7 +594,7 @@ impl Editor {
 
     // --- сброс на диск -----------------------------------------------------
 
-    /// Записать счётчики в суперблок и дескрипторы групп.
+    /// Записать счётчики в **основной** суперблок и его дескрипторы групп.
     ///
     /// Обязателен после правок: до него на диске лежат счётчики от предыдущего
     /// сброса, и `e2fsck` объявит том требующим починки — данные при этом
@@ -585,7 +605,37 @@ impl Editor {
     /// монтирований и всё прочее принадлежат тому, а не редактору, и
     /// пересобирать их из того, что редактор о томе знает, значило бы потерять
     /// остальное.
+    ///
+    /// # Почему резервные копии здесь не трогаются
+    ///
+    /// Потому что их цена — не абстрактная. Копий суперблока у гигабайтного
+    /// тома девять, и у каждой своя копия таблицы дескрипторов; на блоке в
+    /// килобайт это полсотни блочных операций **на каждый вызов `write`**.
+    /// Измерено на живой системе: та же половина мегабайта по сети уходила
+    /// «в никуда» со скоростью 412 КиБ/с и в файл — со скоростью 73 КиБ/с,
+    /// и разница почти вся здесь. Семидесятисемимегабайтное обновление
+    /// качалось из-за этого двадцать семь минут.
+    ///
+    /// Резервная копия существует ровно для одного случая: основной суперблок
+    /// не читается, и человек говорит `e2fsck -b 8193`. Счётчики в ней при
+    /// этом всё равно проверяются и чинятся — их устарелость не то, ради чего
+    /// копия заводится. Держать их посекундно в согласии с основным — это
+    /// платить постоянную цену за случай, в котором платить всё равно
+    /// придётся другим.
+    ///
+    /// Полный сброс, со всеми копиями, делает [`Editor::flush_everywhere`], и
+    /// он вызывается там, где том закрывают: при `sync`, при размонтировании и
+    /// при сборке образа.
     pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        self.write_counters(dev, false)
+    }
+
+    /// То же самое, но и во все резервные копии суперблока.
+    pub fn flush_everywhere(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        self.write_counters(dev, true)
+    }
+
+    fn write_counters(&mut self, dev: &mut dyn BlockDevice, backups: bool) -> Result<()> {
         let geometry = self.geometry;
         let block_bytes = geometry.block_size.bytes() as usize;
         let free_blocks: u32 = self.free_blocks_in_group.iter().sum();
@@ -605,6 +655,9 @@ impl Editor {
         for group in 0..geometry.groups {
             if !geometry.group_has_super(group) {
                 continue;
+            }
+            if group != 0 && !backups {
+                break;
             }
             let block = geometry.group_first_block(group);
             // Смещение суперблока внутри блока ненулевое ровно в одном случае:
@@ -628,7 +681,15 @@ impl Editor {
                 self.write_block(dev, table_start + index as u32, &buf)?;
             }
         }
-        dev.flush()?;
+        // Барьер записи ставится **только** при полном сбросе, то есть при
+        // закрытии тома. Ставить его после каждой правки файла означало бы
+        // требовать от носителя настоящей фиксации на диске десятки тысяч раз
+        // за одну загрузку файла — а обещать этим нечего: журнала у ext2 нет,
+        // и после пропажи питания том всё равно проверяется `fsck`, потому что
+        // признак «используется» стоит с монтирования.
+        if backups {
+            dev.flush()?;
+        }
         Ok(())
     }
 
@@ -661,7 +722,7 @@ impl Editor {
     ///
     /// Битовая карта читается и пишется на каждом выделении — см. заголовок
     /// модуля о том, почему это не оптимизируется.
-    fn alloc_block(&mut self, dev: &mut dyn BlockDevice) -> Result<u32> {
+    fn alloc_block(&mut self, dev: &mut dyn BlockDevice, zero: bool) -> Result<u32> {
         let geometry = self.geometry;
         // Два прохода: от подсказки до конца тома и от начала до подсказки.
         // Второй нужен после удалений — освободившиеся блоки лежат позади, и
@@ -672,7 +733,9 @@ impl Editor {
             if self.take_bit(dev, geometry.block_bitmap_block(group), index)? {
                 self.free_blocks_in_group[group as usize] -= 1;
                 self.block_hint = block + 1;
-                self.zero_block(dev, block)?;
+                if zero {
+                    self.zero_block(dev, block)?;
+                }
                 return Ok(block);
             }
         }
@@ -737,38 +800,60 @@ impl Editor {
 
     /// Занять бит. `false` — он уже был занят.
     fn take_bit(&mut self, dev: &mut dyn BlockDevice, bitmap: u32, index: u32) -> Result<bool> {
-        let mut buf = self.read_block(dev, bitmap)?;
+        let mut buf = self.read_bitmap(dev, bitmap)?;
         let at = (index / 8) as usize;
         let mask = 1u8 << (index % 8);
         if buf[at] & mask != 0 {
+            self.bitmap_cache = Some((bitmap, buf));
             return Ok(false);
         }
         buf[at] |= mask;
         self.write_block(dev, bitmap, &buf)?;
+        self.bitmap_cache = Some((bitmap, buf));
         Ok(true)
+    }
+
+    /// Битовая карта: из кэша, если это она же, иначе с диска.
+    fn read_bitmap(&mut self, dev: &mut dyn BlockDevice, bitmap: u32) -> Result<Vec<u8>> {
+        if let Some((cached, buf)) = &self.bitmap_cache {
+            if *cached == bitmap {
+                return crate::write::try_clone(buf);
+            }
+        }
+        self.read_block(dev, bitmap)
     }
 
     /// Освободить бит. `false` — он уже был свободен, и счётчик трогать нельзя.
     fn clear_bit(&mut self, dev: &mut dyn BlockDevice, bitmap: u32, index: u32) -> Result<bool> {
-        let mut buf = self.read_block(dev, bitmap)?;
+        let mut buf = self.read_bitmap(dev, bitmap)?;
         let at = (index / 8) as usize;
         let mask = 1u8 << (index % 8);
         if buf[at] & mask == 0 {
+            self.bitmap_cache = Some((bitmap, buf));
             return Ok(false);
         }
         buf[at] &= !mask;
         self.write_block(dev, bitmap, &buf)?;
+        self.bitmap_cache = Some((bitmap, buf));
         Ok(true)
     }
 
     // --- блоки файла -------------------------------------------------------
 
     /// Номер `index`-го блока файла, выделяя его и таблицы косвенности.
+    /// Найти или выделить блок файла под запись.
+    ///
+    /// `zero` относится только к **блоку данных**: таблицы косвенности
+    /// обнуляются всегда и безусловно. Незанулённая таблица — это указатели,
+    /// собранные из чужих данных, то есть файл, читающий чужие блоки; блок
+    /// данных, который вызывающий немедленно перезапишет целиком, ничем таким
+    /// не грозит.
     fn block_for_write(
         &mut self,
         dev: &mut dyn BlockDevice,
         inode: &mut InodeData,
         index: usize,
+        zero: bool,
     ) -> Result<u32> {
         let pointers = self.geometry.block_size.pointers_per_block() as usize;
         let single_limit = DIRECT_BLOCKS + pointers;
@@ -776,19 +861,19 @@ impl Editor {
 
         if index < DIRECT_BLOCKS {
             if inode.blocks[index] == 0 {
-                inode.blocks[index] = self.alloc_data_block(dev, inode)?;
+                inode.blocks[index] = self.alloc_data_block(dev, inode, zero)?;
             }
             return Ok(inode.blocks[index]);
         }
         if index < single_limit {
             let table = self.ensure_table(dev, inode, INDIRECT_INDEX)?;
-            return self.ensure_pointer(dev, inode, table, index - DIRECT_BLOCKS);
+            return self.ensure_pointer(dev, inode, table, index - DIRECT_BLOCKS, zero);
         }
         if index < double_limit {
             let offset = index - single_limit;
             let outer = self.ensure_table(dev, inode, DOUBLE_INDIRECT_INDEX)?;
             let leaf = self.ensure_leaf(dev, inode, outer, offset / pointers)?;
-            return self.ensure_pointer(dev, inode, leaf, offset % pointers);
+            return self.ensure_pointer(dev, inode, leaf, offset % pointers, zero);
         }
         // Тройная косвенность нужна файлам больше четырёх гигабайт при блоке
         // 4 КиБ. Такого потребителя нет, а ветка, которую нечем проверить, в
@@ -801,8 +886,9 @@ impl Editor {
         &mut self,
         dev: &mut dyn BlockDevice,
         inode: &mut InodeData,
+        zero: bool,
     ) -> Result<u32> {
-        let block = self.alloc_block(dev)?;
+        let block = self.alloc_block(dev, zero)?;
         inode.sectors += self.geometry.sectors_per_block();
         Ok(block)
     }
@@ -817,7 +903,7 @@ impl Editor {
         if inode.blocks[slot] == 0 {
             // Блок косвенности тоже занимает место, и `i_blocks` обязан его
             // учитывать: `e2fsck` сверяет это поле с фактическим числом блоков.
-            inode.blocks[slot] = self.alloc_data_block(dev, inode)?;
+            inode.blocks[slot] = self.alloc_data_block(dev, inode, true)?;
         }
         Ok(inode.blocks[slot])
     }
@@ -835,7 +921,7 @@ impl Editor {
         if existing != 0 {
             return Ok(existing);
         }
-        let leaf = self.alloc_data_block(dev, inode)?;
+        let leaf = self.alloc_data_block(dev, inode, true)?;
         put_u32(&mut buf, slot * 4, leaf);
         self.write_block(dev, table, &buf)?;
         Ok(leaf)
@@ -848,13 +934,14 @@ impl Editor {
         inode: &mut InodeData,
         table: u32,
         slot: usize,
+        zero: bool,
     ) -> Result<u32> {
         let mut buf = self.read_block(dev, table)?;
         let existing = u32_at(&buf, slot * 4);
         if existing != 0 {
             return Ok(existing);
         }
-        let block = self.alloc_data_block(dev, inode)?;
+        let block = self.alloc_data_block(dev, inode, zero)?;
         put_u32(&mut buf, slot * 4, block);
         self.write_block(dev, table, &buf)?;
         Ok(block)
@@ -1179,7 +1266,9 @@ impl Editor {
         if blocks >= DIRECT_BLOCKS + self.geometry.block_size.pointers_per_block() as usize {
             return Err(Error::Unsupported);
         }
-        let block = self.block_for_write(dev, &mut inode, blocks)?;
+        // Новый блок каталога тут же переписывается целиком, поэтому обнулять
+        // его при выделении незачем.
+        let block = self.block_for_write(dev, &mut inode, blocks, false)?;
         let mut buf = try_zeroed(block_bytes)?;
         write_entry(&mut buf, 0, target, block_bytes, name, file_type);
         self.write_block(dev, block, &buf)?;

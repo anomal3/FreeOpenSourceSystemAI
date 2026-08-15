@@ -582,6 +582,14 @@ pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>> {
     try_vec(len, 0u8)
 }
 
+/// Копия буфера, возвращающая ошибку вместо паники при нехватке памяти.
+pub(crate) fn try_clone(source: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(source.len()).map_err(|_| Error::NoMemory)?;
+    out.extend_from_slice(source);
+    Ok(out)
+}
+
 pub(crate) fn try_vec<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
     let mut out = Vec::new();
     out.try_reserve_exact(len).map_err(|_| Error::NoMemory)?;
