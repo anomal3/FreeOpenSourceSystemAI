@@ -1005,6 +1005,15 @@ fn play(
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
+            Step::RightClick => {
+                say!("  [{at:>6} мс] шаг {index}: щелчок правой");
+                press_right(qmp.as_deref_mut(), hmp, true)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(POINTER_DELAY);
+                press_right(qmp.as_deref_mut(), hmp, false)
+                    .with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(KEY_DELAY);
+            }
             Step::Press => {
                 say!("  [{at:>6} мс] шаг {index}: кнопка нажата");
                 press_button(qmp.as_deref_mut(), hmp, true)
@@ -1835,6 +1844,18 @@ fn press_button(qmp: Option<&mut qmp::Qmp>, hmp: &mut monitor::Monitor, down: bo
     match qmp {
         Some(qmp) => qmp.button(qmp::BUTTON_LEFT, down),
         None => hmp.mouse_button(if down { 1 } else { 0 }),
+    }
+}
+
+/// Правая кнопка — тем же путём, что и левая.
+///
+/// Отдельная функция, а не флаг у [`press_button`]: у HMP правая кнопка это
+/// другая маска, и перепутать их значит проверять контекстное меню щелчком,
+/// который его не открывает.
+fn press_right(qmp: Option<&mut qmp::Qmp>, hmp: &mut monitor::Monitor, down: bool) -> Result<()> {
+    match qmp {
+        Some(qmp) => qmp.button(qmp::BUTTON_RIGHT, down),
+        None => hmp.mouse_button(if down { 2 } else { 0 }),
     }
 }
 

@@ -38,9 +38,12 @@
 //! доставка события процессу — а не переписанный оконный менеджер.
 
 pub mod compositor;
+pub mod context;
 pub mod files;
+pub mod icons;
 pub mod panel;
 pub mod pointer;
+pub mod settings;
 pub mod term;
 pub mod theme;
 pub mod window;
@@ -66,7 +69,35 @@ use window::{Hit, Window};
 /// перерисовки, то есть цена тоже не нулевая.
 const MOVE_STEP: i32 = 32;
 
+/// За сколько миллисекунд два щелчка считаются двойным.
+///
+/// Полсекунды — то, к чему человек привык за тридцать лет чужих рабочих столов.
+/// Меньше — и двойной щелчок не засчитывается у того, кто не торопится; больше —
+/// и два отдельных щелчка по одному значку случайно открывают программу.
+const DOUBLE_CLICK_MS: u64 = 500;
+
 static DESKTOP: SpinLock<Option<Compositor>> = SpinLock::new(None);
+
+/// Когда был прошлый щелчок по значку и по какому именно.
+///
+/// Обычные статики, а не поле стола: стол вынимается из-под замка на время
+/// работы, и класть в него состояние, которое нужно **между** двумя вызовами,
+/// значит гадать, тот ли это стол.
+static LAST_ICON_CLICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LAST_ICON: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Номер программы для сравнения «тот же ли это значок».
+const fn icon_key(app: App) -> u8 {
+    match app {
+        App::Terminal => 0,
+        App::System => 1,
+        App::Files => 2,
+        App::About => 3,
+        App::Settings => 4,
+        App::Shutdown => 5,
+        App::Restart => 6,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Запуск
@@ -217,6 +248,14 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
             width * 2 / 3,
             work * 2 / 3,
         ),
+        // «Параметры» — окно для чтения и нажатий, а не для длинного вывода:
+        // оно уже терминала и стоит правее значков, чтобы не накрывать их
+        // собой при открытии с рабочего стола.
+        App::Settings => {
+            let w = (width * 5 / 12).max(420);
+            let h = (work * 3 / 4).max(320);
+            Rect::new((width / 4) as i32, (work / 10) as i32, w, h)
+        }
         App::About => {
             let w = (width / 2).max(320);
             let h = (work / 2).max(200);
@@ -249,6 +288,11 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
     let scale = desktop.scale();
     match app {
         App::Files => Window::files(rect, scale),
+        App::Settings => Window::settings(
+            rect,
+            scale,
+            (desktop.screen_width(), desktop.screen_height()),
+        ),
         App::About => {
             let mut window = Window::text(App::About, rect, scale)?;
             window.write_str(&about_text(desktop));
@@ -540,6 +584,16 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     if event.pressed(Buttons::LEFT) {
         press(desktop, x, y, status);
     }
+    // Правая кнопка: меню стола там, где щёлкнули. Пока оно открыто, левая
+    // кнопка выбирает в нём пункт — этим и занимается `press`.
+    if event.pressed(Buttons::RIGHT) {
+        if desktop.context_open() {
+            desktop.close_context();
+        } else if desktop.window_at(x, y).is_none() && desktop.panel_at(x, y).is_none() {
+            desktop.open_context(x, y);
+            kprintln!("  desktop     : context menu at {x},{y}");
+        }
+    }
     if event.released(Buttons::LEFT) {
         // Где окно оказалось — в журнал: это единственное видимое снаружи
         // последствие перетаскивания, и без него проверить его можно было бы
@@ -567,6 +621,21 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
 /// стрелкой. Обратный порядок означал бы, что кнопка, накрытая меню,
 /// срабатывает сквозь него.
 fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
+    // 0. Меню стола — оно поверх всего, включая меню запуска.
+    if desktop.context_open() {
+        match desktop.context_action_at(x, y) {
+            Some(action) => {
+                context_action(desktop, action, status);
+                return;
+            }
+            None => {
+                desktop.close_context();
+                kprintln!("  desktop     : context menu closed");
+                return;
+            }
+        }
+    }
+
     // 1. Открытое меню.
     if desktop.menu_open() {
         let index = desktop.menu_mut().and_then(|menu| menu.index_at(x, y));
@@ -602,7 +671,17 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
         match hit {
             PanelHit::Menu => toggle_menu(desktop, status),
             PanelHit::Window(app) => {
-                launch(desktop, app);
+                // Щелчок по кнопке активного окна сворачивает его — так ведёт
+                // себя панель задач везде, где человек её видел, и другого
+                // способа свернуть окно без мыши у кнопки нет.
+                if desktop.focused_app() == Some(app) && !desktop.is_minimized(app) {
+                    if desktop.minimize(app) {
+                        kprintln!("  desktop     : minimized '{}'", app.title());
+                    }
+                    log_focus(desktop);
+                } else {
+                    launch(desktop, app);
+                }
                 desktop.refresh_panel(status);
             }
             PanelHit::Empty => {}
@@ -610,7 +689,24 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
         return;
     }
 
-    // 3. Окна.
+    // 3. Значки на столе — ниже окон, но выше фона.
+    if let Some(app) = desktop.icon_at(x, y) {
+        desktop.select_icon(Some(app));
+        // Второй щелчок по тому же значку в пределах [`DOUBLE_CLICK_MS`]
+        // открывает его. Порог во времени, а не «щелчок с Shift» и не
+        // «одиночный открывает»: так это работает у всех, кто видел стол.
+        let now = crate::time::uptime_ms();
+        let last = LAST_ICON_CLICK.swap(now, core::sync::atomic::Ordering::Relaxed);
+        let same = LAST_ICON.swap(icon_key(app), core::sync::atomic::Ordering::Relaxed)
+            == icon_key(app);
+        if same && now.saturating_sub(last) <= DOUBLE_CLICK_MS {
+            launch(desktop, app);
+            desktop.refresh_panel(status);
+        }
+        return;
+    }
+
+    // 4. Окна.
     if let Some((index, hit)) = desktop.window_at(x, y) {
         let app = desktop.app_at(index);
         desktop.raise(index);
@@ -624,13 +720,44 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                     log_focus(desktop);
                 }
             }
+            Hit::Minimize => {
+                if let Some(app) = app {
+                    if desktop.minimize(app) {
+                        kprintln!("  desktop     : minimized '{}'", app.title());
+                    }
+                    log_focus(desktop);
+                }
+            }
+            Hit::Maximize => {
+                if let Some(app) = app {
+                    if desktop.toggle_maximize(app) {
+                        kprintln!("  desktop     : resized '{}'", app.title());
+                        // Новый прямоугольник — следом: без него снаружи не
+                        // видно, куда уехало окно, и попасть в его кнопку
+                        // второй раз можно только наугад.
+                        log_window(desktop, app, true);
+                    }
+                }
+            }
+            Hit::Resize => {
+                if let Some(app) = app {
+                    desktop.set_resize_drag(app);
+                    kprintln!("  desktop     : resizing '{}'", app.title());
+                }
+            }
             Hit::Title => {
                 desktop.set_drag(app);
                 if let Some(app) = app {
                     kprintln!("  desktop     : drag '{}'", app.title());
                 }
             }
-            Hit::Body => {}
+            // Щелчок по содержимому: его разбирает само содержимое — в
+            // «Параметрах» им выбирают раздел и нажимают пункты.
+            Hit::Body => {
+                if let Some(window) = desktop.focused_mut() {
+                    window.handle_click(x, y);
+                }
+            }
         }
         desktop.refresh_panel(status);
     }
@@ -756,6 +883,11 @@ fn handle_menu(desktop: &mut Compositor, code: KeyCode, status: &Status) {
 /// Запустить программу: поднять её окно или создать новое.
 fn launch(desktop: &mut Compositor, app: App) {
     if let Some(index) = desktop.index_of(app) {
+        // Свёрнутое окно возвращается на экран, а не просто поднимается: иначе
+        // кнопка в панели задач у свёрнутого окна не делала бы ничего видимого.
+        if desktop.restore(app) {
+            kprintln!("  desktop     : restored '{}'", app.title());
+        }
         desktop.raise(index);
         log_focus(desktop);
         return;
@@ -769,6 +901,51 @@ fn launch(desktop: &mut Compositor, app: App) {
         log_focus(desktop);
     } else {
         kprintln!("  desktop     : not enough memory for '{}'", app.title());
+    }
+}
+
+/// Выполнить пункт меню стола.
+///
+/// Меню остаётся открытым и показывает ответ: «создал папку» и «отказано в
+/// правах» — оба ответа человек обязан увидеть, а закрывшееся меню не сказало
+/// бы ни того, ни другого.
+fn context_action(desktop: &mut Compositor, action: context::Action, status: &Status) {
+    match action {
+        context::Action::NewFolder | context::Action::NewTextFile => {
+            let directory = action == context::Action::NewFolder;
+            match context::create_entry(directory) {
+                Ok(name) => {
+                    kprintln!(
+                        "  desktop     : created '{}' in {}",
+                        name,
+                        context::desktop_dir()
+                    );
+                    desktop.context_note(&alloc::format!("created {name}"));
+                    // Открытый файловый менеджер обязан показать созданное:
+                    // иначе «создал» видно только на слово.
+                    if let Some(window) = desktop.find(App::Files) {
+                        window.redraw_content();
+                    }
+                }
+                Err(err) => {
+                    kprintln!("  desktop     : cannot create: {err}");
+                    desktop.context_note(&err);
+                }
+            }
+        }
+        context::Action::DisplaySettings => {
+            desktop.close_context();
+            launch(desktop, App::Settings);
+            if let Some(window) = desktop.find(App::Settings) {
+                window.show_display_settings();
+            }
+            desktop.refresh_panel(status);
+        }
+        context::Action::Refresh => {
+            desktop.close_context();
+            desktop.repaint_all();
+            kprintln!("  desktop     : repainted");
+        }
     }
 }
 

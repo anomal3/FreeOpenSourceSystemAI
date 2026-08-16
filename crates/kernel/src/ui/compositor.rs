@@ -29,6 +29,8 @@ use alloc::vec::Vec;
 
 use mini_ui::{Rect, Screen, Surface};
 
+use super::context::ContextMenu;
+use super::icons::Icons;
 use super::panel::{Menu, Panel, PanelHit, Status};
 use super::pointer::Pointer;
 use super::theme;
@@ -58,11 +60,17 @@ pub struct Compositor {
     menu: Option<Menu>,
     /// Указатель мыши — верхний слой кадра.
     pointer: Pointer,
+    /// Значки на самом столе — слой между фоном и окнами.
+    icons: Icons,
+    /// Меню по правому щелчку. Верхний слой, как и меню запуска.
+    context: Option<ContextMenu>,
     /// Окно, которое сейчас тащат за заголовок.
     ///
     /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
     /// запомненный до щелчка, после него указывал бы на соседнее окно.
     drag: Option<App>,
+    /// Захват меняет размер окна, а не его место.
+    drag_resizes: bool,
     /// Масштаб глифа для новых окон.
     scale: u32,
     damage: [Rect; MAX_DAMAGE],
@@ -83,7 +91,10 @@ impl Compositor {
             panel: None,
             menu: None,
             pointer,
+            icons: Icons::new(scale),
+            context: ContextMenu::new(scale.min(2)),
             drag: None,
+            drag_resizes: false,
             scale,
             damage: [Rect::EMPTY; MAX_DAMAGE],
             damage_count: 0,
@@ -186,14 +197,45 @@ impl Compositor {
         if index >= self.windows.len() {
             return;
         }
+        // Кто теряет фокус — запоминается до перестановки: индексы после неё
+        // съедут, а перекрасить надо ровно два заголовка. Перекрашивать все
+        // окна здесь дорого не «в принципе», а измеримо: на 1920×1080 в
+        // отладочной сборке переключение окон занимало столько, что второе
+        // нажатие Tab не успевало быть прочитанным с клавиатуры и терялось.
+        let losing = self.windows.get(self.focus).map(|window| window.app);
+        // Перерисовать надо не всё поднятое окно, а только то, что его
+        // закрывало: пиксели, видные и до, и после поднятия, не изменились.
+        // Разница измерима — на 1920×1080 в отладочной сборке перерисовка окна
+        // целиком занимала больше четверти секунды, и следующее нажатие
+        // клавиши терялось: клавиатуру некому было опросить.
+        let mut uncovered = [Rect::EMPTY; MAX_DAMAGE];
+        let mut uncovered_count = 0;
+        {
+            let raised = self.windows[index].rect;
+            for above in self.windows[index + 1..].iter().filter(|w| !w.minimized) {
+                let overlap = raised.intersect(&above.rect);
+                if !overlap.is_empty() && uncovered_count < MAX_DAMAGE {
+                    uncovered[uncovered_count] = overlap;
+                    uncovered_count += 1;
+                }
+            }
+        }
         let window = self.windows.remove(index);
-        let rect = window.rect;
         self.windows.push(window);
         self.focus = self.windows.len() - 1;
-        self.refresh_decorations();
+        if let Some(app) = losing {
+            if let Some(previous) = self.windows.iter_mut().find(|window| window.app == app) {
+                previous.draw_decorations(false);
+            }
+        }
+        if let Some(window) = self.windows.last_mut() {
+            window.draw_decorations(true);
+        }
         // Поднятое окно — единственное место, где порядок по глубине
         // изменился; всё остальное на экране осталось прежним.
-        self.mark(rect);
+        for index in 0..uncovered_count {
+            self.mark(uncovered[index]);
+        }
     }
 
     /// Поднять нижнее окно наверх — обход по кругу.
@@ -306,12 +348,35 @@ impl Compositor {
     /// Верхнее окно под точкой и то, во что она попала.
     #[must_use]
     pub fn window_at(&self, x: i32, y: i32) -> Option<(usize, Hit)> {
-        // Сверху вниз: перекрытое окно щелчок получать не должно.
+        // Сверху вниз: перекрытое окно щелчок получать не должно. Свёрнутого
+        // окна на экране нет — щелчок проходит сквозь его прежнее место.
         self.windows
             .iter()
             .enumerate()
             .rev()
+            .filter(|(_, window)| !window.minimized)
             .find_map(|(index, window)| window.hit(x, y).map(|hit| (index, hit)))
+    }
+
+    /// Значок стола под точкой — если она не накрыта окном.
+    ///
+    /// Проверка «не накрыта окном» здесь, а не у вызывающего: значок лежит на
+    /// столе, то есть ниже всех окон, и щелчок сквозь окно по значку под ним —
+    /// это ровно та ошибка, которую пользователь заметит первой.
+    #[must_use]
+    pub fn icon_at(&self, x: i32, y: i32) -> Option<App> {
+        if self.window_at(x, y).is_some() {
+            return None;
+        }
+        self.icons.at(x, y)
+    }
+
+    /// Выделить значок (или снять выделение).
+    pub fn select_icon(&mut self, app: Option<App>) {
+        let damage = self.icons.select(app);
+        if !damage.is_empty() {
+            self.mark(damage);
+        }
     }
 
     /// Попадание в панель задач.
@@ -327,6 +392,15 @@ impl Compositor {
     /// Начать или закончить перетаскивание окна.
     pub fn set_drag(&mut self, app: Option<App>) {
         self.drag = app;
+        if app.is_none() {
+            self.drag_resizes = false;
+        }
+    }
+
+    /// Начать изменение размера окна: тот же захват, другое действие.
+    pub fn set_resize_drag(&mut self, app: App) {
+        self.drag = Some(app);
+        self.drag_resizes = true;
     }
 
     #[must_use]
@@ -334,7 +408,7 @@ impl Compositor {
         self.drag
     }
 
-    /// Сдвинуть окно, которое тащат.
+    /// Сдвинуть окно, которое тащат, — или изменить его размер.
     pub fn drag_by(&mut self, dx: i32, dy: i32) {
         let Some(app) = self.drag else {
             return;
@@ -343,21 +417,105 @@ impl Compositor {
             // Окно закрыли, не отпустив кнопку. Такое бывает, и тащить дальше
             // нечего.
             self.drag = None;
+            self.drag_resizes = false;
             return;
         };
         let width = self.screen.width();
         let bottom = self.work_bottom();
+        let resizes = self.drag_resizes;
         let Some(window) = self.windows.get_mut(index) else {
             return;
         };
         let before = window.rect;
-        window.move_within(dx, dy, width, bottom);
+        if resizes {
+            // Размер считается от места окна до указателя, а не приращением к
+            // прежнему: окно, упёршееся в наименьший размер, иначе продолжало бы
+            // «копить» движение мыши и отставало бы от неё на обратном ходу.
+            let w = (before.w as i32 + dx).max(0) as u32;
+            let h = (before.h as i32 + dy).max(0) as u32;
+            let limit_w = width.saturating_sub(before.x.max(0) as u32);
+            let limit_h = (bottom - before.y).max(0) as u32;
+            if !window.resize(w.min(limit_w), h.min(limit_h)) {
+                return;
+            }
+        } else {
+            window.move_within(dx, dy, width, bottom);
+        }
         if window.rect == before {
             return;
         }
         let after = window.rect;
         self.mark(before);
         self.mark(after);
+    }
+
+    /// Свернуть окно: убрать с экрана, оставив в панели задач.
+    pub fn minimize(&mut self, app: App) -> bool {
+        let Some(index) = self.index_of(app) else {
+            return false;
+        };
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        if window.minimized {
+            return false;
+        }
+        window.minimized = true;
+        let rect = window.rect;
+        self.mark(rect);
+        // Фокус уходит вниз: свёрнутое окно не может быть активным, иначе
+        // клавиши уходили бы туда, где их некому показать.
+        if self.focus == index {
+            self.focus_next();
+        }
+        true
+    }
+
+    /// Вернуть свёрнутое окно на экран.
+    pub fn restore(&mut self, app: App) -> bool {
+        let Some(index) = self.index_of(app) else {
+            return false;
+        };
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        if !window.minimized {
+            return false;
+        }
+        window.minimized = false;
+        // Поверхность цела, но экран под окном за это время перерисовали —
+        // значит показать надо всё окно целиком, а не то, что в нём изменилось.
+        window.damage = Rect::new(0, 0, window.rect.w, window.rect.h);
+        true
+    }
+
+    /// Свёрнуто ли окно этой программы.
+    #[must_use]
+    pub fn is_minimized(&self, app: App) -> bool {
+        self.windows
+            .iter()
+            .find(|window| window.app == app)
+            .is_some_and(|window| window.minimized)
+    }
+
+    /// Развернуть окно на всю рабочую область или вернуть прежний размер.
+    pub fn toggle_maximize(&mut self, app: App) -> bool {
+        let Some(index) = self.index_of(app) else {
+            return false;
+        };
+        let width = self.screen.width();
+        let bottom = self.work_bottom();
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        let before = window.rect;
+        if !window.toggle_maximize(width, bottom) {
+            return false;
+        }
+        let after = window.rect;
+        self.mark(before);
+        self.mark(after);
+        true
     }
 
     /// Закрыть окно программы. Возвращает `true`, если оно было.
@@ -451,6 +609,55 @@ impl Compositor {
                 self.mark(rect);
             }
         }
+
+        if let Some(menu) = self.context.as_mut() {
+            let damage = menu.take_damage();
+            if !damage.is_empty() {
+                let rect = damage.translate(menu.rect.x, menu.rect.y);
+                self.mark(rect);
+            }
+        }
+    }
+
+    /// Меню стола: открыть в точке, закрыть, спросить пункт под указателем.
+    pub fn open_context(&mut self, x: i32, y: i32) {
+        let screen = (self.screen.width(), self.screen.height());
+        let bottom = self.work_bottom();
+        if let Some(menu) = self.context.as_mut() {
+            menu.open_at(x, y, screen, bottom);
+        }
+    }
+
+    pub fn context_open(&self) -> bool {
+        self.context.as_ref().is_some_and(ContextMenu::is_open)
+    }
+
+    pub fn context_action_at(&self, x: i32, y: i32) -> Option<super::context::Action> {
+        self.context.as_ref().and_then(|menu| menu.action_at(x, y))
+    }
+
+    /// Показать в меню ответ действия — оно остаётся открытым.
+    pub fn context_note(&mut self, note: &str) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.set_note(note);
+        }
+    }
+
+    /// Закрыть меню стола и стереть его с экрана.
+    pub fn close_context(&mut self) {
+        let rect = self.context.as_ref().map(|menu| menu.rect);
+        if let Some(menu) = self.context.as_mut() {
+            menu.close();
+        }
+        if let Some(rect) = rect {
+            self.mark(rect);
+        }
+    }
+
+    /// Перерисовать весь экран — то, что делает пункт «Refresh».
+    pub fn repaint_all(&mut self) {
+        let all = self.screen.bounds();
+        self.mark(all);
     }
 
     /// Пометить область меню как изменившуюся — при закрытии его надо стереть.
@@ -505,7 +712,8 @@ impl Compositor {
     /// несколько тысяч записей в фреймбуфер на нажатие клавиши.
     fn compose(&self, rect: Rect) {
         self.draw_background(rect);
-        for window in &self.windows {
+        self.icons.draw(&self.screen, rect);
+        for window in self.windows.iter().filter(|window| !window.minimized) {
             let overlap = window.rect.intersect(&rect);
             if !overlap.is_empty() {
                 self.blit(window.surface(), window.rect, overlap);
@@ -518,6 +726,14 @@ impl Compositor {
             }
         }
         if let Some(menu) = self.menu.as_ref() {
+            if menu.is_open() {
+                let overlap = menu.rect.intersect(&rect);
+                if !overlap.is_empty() {
+                    self.blit(menu.surface(), menu.rect, overlap);
+                }
+            }
+        }
+        if let Some(menu) = self.context.as_ref() {
             if menu.is_open() {
                 let overlap = menu.rect.intersect(&rect);
                 if !overlap.is_empty() {

@@ -218,7 +218,9 @@ impl Menu {
             widest = widest.max(text::width_of(app.about(), scale.saturating_sub(1).max(1)));
         }
         let width = widest + theme::PADDING * 6;
-        let height = row_h * (App::LAUNCHABLE.len() as u32 * 2 + 1) + theme::PADDING * 2;
+        // Плюс шапка, плюс черта перед питанием — иначе последний пункт
+        // упирается в край и выглядит обрезанным.
+        let height = row_h * (App::LAUNCHABLE.len() as u32 * 2 + 1) + theme::PADDING * 5;
         let surface = Surface::new(width, height, theme::WINDOW_BG)?;
         let rect = Rect::new(0, panel_top - height as i32, width, height);
         Some(Self { surface, rect, scale, selected: 0, open: false, damage: Rect::EMPTY })
@@ -250,7 +252,9 @@ impl Menu {
             return None;
         }
         let row_h = GLYPH_H * self.scale + theme::PADDING * 3;
-        let top = theme::PADDING + theme::BORDER + row_h;
+        // Первая строка — шапка с именем системы, и щелчок по ней не открывает
+        // ничего; отступ ниже повторяет тот, что отложен при рисовании.
+        let top = theme::PADDING + theme::BORDER + row_h + theme::PADDING * 2;
         let local = (y - self.rect.y) as u32;
         if local < top {
             return None;
@@ -298,10 +302,53 @@ impl Menu {
         let left = theme::PADDING * 3;
         let mut y = theme::PADDING + theme::BORDER;
 
-        text::draw_text(&mut self.surface, left, y, "Start", scale, theme::DIM, None);
-        y += row_h;
+        // Шапка: имя системы на полосе акцента. Не украшение — это ответ на
+        // вопрос «что за машина», который человек задаёт первым, а спрашивать
+        // его у окна «About» ради версии слишком долго.
+        let header = Rect::new(
+            theme::BORDER as i32,
+            theme::BORDER as i32,
+            bounds.w.saturating_sub(theme::BORDER * 2),
+            row_h + theme::PADDING,
+        );
+        self.surface.fill(header, theme::ACCENT);
+        text::draw_text(
+            &mut self.surface,
+            left,
+            y + theme::PADDING / 2,
+            "FreeOS",
+            scale,
+            theme::ON_ACCENT,
+            None,
+        );
+        let version_x = bounds
+            .w
+            .saturating_sub(text::width_of(crate::VERSION, small) + left);
+        text::draw_text(
+            &mut self.surface,
+            version_x,
+            y + theme::PADDING,
+            crate::VERSION,
+            small,
+            theme::ON_ACCENT,
+            None,
+        );
+        y += row_h + theme::PADDING * 2;
 
         for (index, app) in App::LAUNCHABLE.iter().enumerate() {
+            // Питание отделяется чертой: «выключить» рядом с «открыть терминал»
+            // — это соседство, в котором однажды промахиваются.
+            if app.confirms_power().is_some() && index > 0 {
+                let line = Rect::new(
+                    left as i32,
+                    y as i32 - theme::PADDING as i32,
+                    bounds.w.saturating_sub(left * 2),
+                    1.max(scale / 2),
+                );
+                self.surface.fill(line, theme::FRAME);
+                y += theme::PADDING;
+            }
+
             let selected = index == self.selected;
             if selected {
                 self.surface.fill(
@@ -314,10 +361,30 @@ impl Menu {
                     theme::SELECT_BG,
                 );
             }
+
+            // Квадратик слева — место значка. Он не картинка программы, а
+            // отметка строки: список из одних букв читается как вывод команды,
+            // а не как меню, по которому ходят.
+            let mark = Rect::new(
+                (left - theme::PADDING) as i32,
+                y as i32 + (GLYPH_H * scale / 4) as i32,
+                GLYPH_H * scale / 2,
+                GLYPH_H * scale / 2,
+            );
+            self.surface.fill(
+                mark,
+                match app.confirms_power() {
+                    Some(_) => theme::CLOSE,
+                    None if selected => theme::ACCENT,
+                    None => theme::DIM,
+                },
+            );
+
+            let text_left = left + text::GLYPH_W * scale;
             let title_color = if selected { theme::ACCENT } else { theme::TEXT };
-            text::draw_text(&mut self.surface, left, y, app.title(), scale, title_color, None);
+            text::draw_text(&mut self.surface, text_left, y, app.title(), scale, title_color, None);
             y += row_h;
-            text::draw_text(&mut self.surface, left, y, app.about(), small, theme::DIM, None);
+            text::draw_text(&mut self.surface, text_left, y, app.about(), small, theme::DIM, None);
             y += row_h;
         }
 

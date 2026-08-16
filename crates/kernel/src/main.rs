@@ -83,6 +83,18 @@ use crate::vfs::FileSystem;
 /// Ровно то же значение и тем же способом собирает `xtask` для имени файла
 /// образа и метки тома (`xtask/src/version.rs`). Патч-версия отброшена там и
 /// здесь: две записи одной версии, различающиеся на глаз, — это уже две версии.
+/// За машиной никого нет: система запущена стендом.
+///
+/// Ставится один раз при разборе [`BootInfo`] и читается оболочкой — единственным
+/// местом, которому эта разница важна (см. `shell::IDLE_TIMEOUT_SECONDS`).
+static UNATTENDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// За машиной никого нет — см. [`UNATTENDED`].
+#[must_use]
+pub fn unattended() -> bool {
+    UNATTENDED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION_MAJOR"),
     ".",
@@ -304,6 +316,9 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     // SAFETY: адрес прошёл полную проверку в `validate` до переключения стека,
     // а память под ним отображена как `BootloaderReclaimable` и пока цела.
     let info = unsafe { ptr::read(boot_info as *const BootInfo) };
+    // Запоминается сразу: метку читает оболочка, а до неё ещё вся загрузка, и
+    // класть такое «где-нибудь по дороге» — способ однажды прочитать ноль.
+    UNATTENDED.store(info.unattended(), core::sync::atomic::Ordering::Relaxed);
 
     kprintln!();
     kprintln!("---- running on the kernel's own stack --------------------------");

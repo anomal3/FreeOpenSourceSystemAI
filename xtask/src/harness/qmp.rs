@@ -42,6 +42,8 @@ const ABS_MAX: i64 = 0x7FFF;
 
 /// Кнопки в терминах QMP.
 pub const BUTTON_LEFT: &str = "left";
+/// Правая кнопка — ею открывается меню рабочего стола.
+pub const BUTTON_RIGHT: &str = "right";
 
 pub struct Qmp {
     stream: TcpStream,

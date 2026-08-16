@@ -240,6 +240,18 @@ pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
         }
     }
 
+    // Метка «за машиной никого нет». Лежит только на ESP, который собирает
+    // стенд, и никогда — на носителе, который получает человек: по ней ядро
+    // отличает прогон от работы и закрывает сеанс по простою.
+    let autorun = esp.join("FREEOS").join("AUTORUN.CFG");
+    if let Some(parent) = autorun.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
+    }
+    std::fs::write(&autorun, b"unattended
+")
+        .with_context(|| format!("не удалось записать {}", autorun.display()))?;
+
     Ok(esp)
 }
 

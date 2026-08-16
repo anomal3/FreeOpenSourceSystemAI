@@ -25,7 +25,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use mini_ui::text::{self, GLYPH_H};
+use mini_ui::text::{self, GLYPH_H, GLYPH_W};
 use mini_ui::{Rect, Surface};
 
 use super::theme;
@@ -64,6 +64,14 @@ struct Preview {
 
 pub struct FilesView {
     path: String,
+    /// Куда можно вернуться кнопкой «назад» — стек посещённых каталогов.
+    ///
+    /// Стек, а не одно «предыдущее место»: человек, зашедший на три уровня
+    /// вниз, ждёт, что «назад» проведёт его тем же путём обратно, а не швырнёт
+    /// в начало.
+    back: Vec<String>,
+    /// Куда можно пойти «вперёд» — то, откуда вернулись назад.
+    forward: Vec<String>,
     rows: Vec<Row>,
     selected: usize,
     scroll: usize,
@@ -77,6 +85,8 @@ impl FilesView {
     pub fn new() -> Self {
         let mut view = Self {
             path: String::from("/"),
+            back: Vec::new(),
+            forward: Vec::new(),
             rows: Vec::new(),
             selected: 0,
             scroll: 0,
@@ -149,8 +159,11 @@ impl FilesView {
                 self.selected = self.rows.len().saturating_sub(1);
                 true
             }
-            KeyCode::Enter => self.open_selected(),
-            KeyCode::Backspace | KeyCode::Left => self.go_up(),
+            KeyCode::Enter | KeyCode::Right => self.open_selected(),
+            KeyCode::Backspace => self.go_up(),
+            // Влево — «назад», как у стрелки на панели: подниматься наверх
+            // умеет Backspace, и две клавиши на одно действие ничего не дают.
+            KeyCode::Left => self.go_back() || self.go_up(),
             _ => false,
         }
     }
@@ -189,12 +202,25 @@ impl FilesView {
         };
         let target = join(&self.path, &row.name);
         if row.directory {
-            self.path = target;
-            self.reload();
+            self.go_to(target);
             return true;
         }
         self.preview = Some(read_preview(&row.name, &target));
         true
+    }
+
+    /// Перейти в каталог, запомнив, откуда пришли.
+    ///
+    /// Переход вперёд обнуляет список «вперёд» — как в любом обозревателе: путь,
+    /// с которого свернули, перестаёт существовать.
+    fn go_to(&mut self, path: String) {
+        if path == self.path {
+            return;
+        }
+        self.back.push(core::mem::replace(&mut self.path, path));
+        self.forward.clear();
+        self.preview = None;
+        self.reload();
     }
 
     /// Подняться на уровень выше.
@@ -206,9 +232,57 @@ impl FilesView {
             Some(0) | None => String::from("/"),
             Some(index) => self.path[..index].to_string(),
         };
-        self.path = parent;
+        self.go_to(parent);
+        true
+    }
+
+    /// Вернуться туда, откуда пришли.
+    pub fn go_back(&mut self) -> bool {
+        let Some(previous) = self.back.pop() else {
+            return false;
+        };
+        self.forward.push(core::mem::replace(&mut self.path, previous));
+        self.preview = None;
         self.reload();
         true
+    }
+
+    /// Пойти обратно вперёд — туда, откуда вернулись назад.
+    pub fn go_forward(&mut self) -> bool {
+        let Some(next) = self.forward.pop() else {
+            return false;
+        };
+        self.back.push(core::mem::replace(&mut self.path, next));
+        self.preview = None;
+        self.reload();
+        true
+    }
+
+    /// Щелчок по окну: координаты внутри области содержимого.
+    ///
+    /// Кнопки навигации считаются по той же формуле, что и рисуются, — иначе
+    /// они разъедутся при первом же изменении масштаба, и попасть в них будет
+    /// можно только наугад.
+    pub fn click(&mut self, area: Rect, scale: u32, x: i32, y: i32) -> bool {
+        let line_h = GLYPH_H * scale + 2;
+        let button_w = GLYPH_W * scale * 3;
+        let button_h = line_h + 2 * scale;
+        let top = area.y;
+        if y < top || y >= top + button_h as i32 {
+            return false;
+        }
+        let offset = (x - area.x).max(0) as u32;
+        let step = button_w + 2 * scale;
+        let index = offset / step;
+        if offset % step > button_w {
+            return false;
+        }
+        match index {
+            0 => self.go_back(),
+            1 => self.go_forward(),
+            2 => self.go_up(),
+            _ => false,
+        }
     }
 
     /// Нарисовать содержимое окна.
@@ -222,14 +296,56 @@ impl FilesView {
         let left = area.x as u32;
         let mut y = area.y as u32;
 
-        // Заголовок: где мы находимся. Он же — единственное место, где виден
-        // путь целиком, поэтому рисуется всегда, и в списке, и в просмотре.
+        // Панель навигации: три кнопки и строка пути. Кнопки нарисованы всегда,
+        // но недоступная гаснет — «назад» из первого же каталога не должно
+        // выглядеть как неисправность.
+        let button_w = GLYPH_W * scale * 3;
+        let button_h = line_h + 2 * scale;
+        for (index, (glyph, enabled)) in [
+            ("<", !self.back.is_empty()),
+            (">", !self.forward.is_empty()),
+            ("^", self.path != "/"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rect = Rect::new(
+                (left + index as u32 * (button_w + 2 * scale)) as i32,
+                y as i32,
+                button_w,
+                button_h,
+            );
+            surface.fill(rect, if enabled { theme::SELECT_BG } else { theme::WINDOW_BG });
+            surface.frame(rect, 1.max(scale / 2), theme::FRAME);
+            text::draw_text(
+                surface,
+                rect.x as u32 + (button_w - GLYPH_W * scale) / 2,
+                rect.y as u32 + scale,
+                glyph,
+                scale,
+                if enabled { theme::TEXT } else { theme::DIM },
+                None,
+            );
+        }
+
+        // Строка пути — справа от кнопок. Она же единственное место, где путь
+        // виден целиком, поэтому рисуется и в просмотре файла.
+        let path_x = left + 3 * (button_w + 2 * scale) + GLYPH_W * scale;
         let header = match self.preview.as_ref() {
             Some(preview) => format!("{}  -  {}", self.path, preview.name),
             None => self.path.clone(),
         };
-        text::draw_text(surface, left, y, &header, scale, theme::ACCENT, None);
-        y += line_h + line_h / 2;
+        let room = ((area.right() as u32).saturating_sub(path_x) / (GLYPH_W * scale)) as usize;
+        let header = if header.chars().count() > room {
+            // Обрезается **начало**: конец пути — то, где человек сейчас, и
+            // именно он важнее корня.
+            let skip = header.chars().count() - room.saturating_sub(1);
+            format!("~{}", header.chars().skip(skip).collect::<String>())
+        } else {
+            header
+        };
+        text::draw_text(surface, path_x, y + scale, &header, scale, theme::ACCENT, None);
+        y += button_h + line_h / 2;
 
         let footer_h = line_h * 2;
         let body_bottom = (area.bottom() as u32).saturating_sub(footer_h);
@@ -247,7 +363,7 @@ impl FilesView {
         let hint = if self.preview.is_some() {
             "Up/Down scroll    Esc back to the list"
         } else {
-            "Up/Down select    Enter open    Backspace up"
+            "Enter open    Left back    Backspace up"
         };
         text::draw_text(surface, left, hint_y, hint, scale, theme::DIM, None);
     }

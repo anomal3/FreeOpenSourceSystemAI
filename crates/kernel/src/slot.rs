@@ -443,6 +443,57 @@ const fn initrd_name(slot: Slot) -> &'static str {
 }
 
 /// Перелить кусок контейнера в файл на ESP, не держа его в памяти целиком.
+/// Запомнить на ESP, какое разрешение экрана просить у прошивки.
+///
+/// Записывается файл `FREEOS/DISPLAY.CFG` со строкой вида `1280x720`. Место
+/// выбрано не от лени: разрешение задаётся до того, как появляется ядро, —
+/// единственный, кто может об этом попросить, это загрузчик, а единственное,
+/// что он читает раньше всего, — раздел, с которого сам запустился. Раздел
+/// состояния (ext2) ему недоступен, а UEFI-переменные потребовали бы от ядра
+/// доступа к runtime-службам прошивки.
+///
+/// Поэтому же выбор вступает в силу со следующей загрузки: переключить режим на
+/// работающей машине нечем — GOP живёт только до `ExitBootServices`.
+pub fn request_screen_mode(width: u32, height: u32) -> Result<(), alloc::string::String> {
+    use core::fmt::Write as _;
+
+    let mut text = alloc::string::String::new();
+    let _ = writeln!(text, "{width}x{height}");
+    let bytes = text.as_bytes();
+
+    let mut guard = LAYOUT.lock();
+    let layout = guard.as_mut().ok_or_else(|| alloc::string::String::from("no ESP on this machine"))?;
+    let (device, first_lba) = layout
+        .esp
+        .as_mut()
+        .ok_or_else(|| alloc::string::String::from("no ESP on this machine"))?;
+
+    let mut esp = device.clone();
+    let esp_lba = *first_lba;
+    let mut volume = disk::fat32::open(&mut esp, esp_lba).map_err(|err| alloc::format!("{err:?}"))?;
+    let reservation = volume
+        .reserve_file(&mut esp, DISPLAY_CFG, bytes.len() as u64)
+        .map_err(|err| alloc::format!("{err:?}"))?;
+
+    // Файл короче сектора, поэтому пишется он одним сектором с нулевым хвостом:
+    // за концом файла на свежем кластере лежит то, что осталось от прежнего
+    // владельца, и отдавать это прошивке незачем.
+    let sector = esp.sector_size() as usize;
+    let mut block = [0u8; disk::MAX_SECTOR_SIZE];
+    block[..bytes.len()].copy_from_slice(bytes);
+    esp.write(reservation.first_lba, &block[..sector])
+        .map_err(|err| alloc::format!("{err:?}"))?;
+
+    volume
+        .commit_file(&mut esp, DISPLAY_CFG, &reservation, bytes.len() as u64)
+        .map_err(|err| alloc::format!("{err:?}"))?;
+    kprintln!("  display     : {width}x{height} requested for the next boot");
+    Ok(())
+}
+
+/// Где на ESP лежит просьба о разрешении экрана.
+const DISPLAY_CFG: &str = "FREEOS/DISPLAY.CFG";
+
 fn write_esp_file(
     node: &dyn Node,
     header: &Header,

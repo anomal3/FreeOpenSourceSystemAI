@@ -33,13 +33,20 @@ use crate::{fs, irq, kprint, mm, sched, time, tty, ui, usb, user};
 /// Приглашение к вводу.
 const PROMPT: &str = "freeos> ";
 
-/// Сколько секунд ждать ввода, прежде чем закончить сеанс.
+/// Сколько секунд ждать ввода, прежде чем закончить сеанс, когда набирать
+/// некому.
 ///
 /// Предел обязателен, а не удобен: без него запуск в CI (где никто ничего не
 /// набирает) висел бы вечно, и «ядро ждёт ввод» стало бы неотличимо от «ядро
-/// зависло». Двадцати секунд достаточно, чтобы человек успел напечатать команду,
-/// и мало настолько, чтобы автоматический прогон завершался сам.
+/// зависло».
 const IDLE_TIMEOUT_SECONDS: u64 = 20;
+
+/// Предел простоя для человека за машиной.
+///
+/// Двадцати секунд ему не хватает: он читает баннер, смотрит на окна, думает —
+/// и сеанс закрывается у него на глазах, посреди работы. Полчаса — это «машину
+/// забыли включённой», а не «человек задумался».
+const IDLE_TIMEOUT_HUMAN_SECONDS: u64 = 30 * 60;
 
 /// Как часто обновлять окно состояния.
 const STATUS_PERIOD_MS: u64 = 500;
@@ -277,9 +284,18 @@ pub fn task() {
             }
         }
 
-        if time::uptime_ms().saturating_sub(idle_since) >= IDLE_TIMEOUT_SECONDS * 1000 {
+        // Кто за машиной — решает не наличие клавиатуры, а метка прогона:
+        // клавиатура есть и у гостя стенда, а сценарий ею как раз и набирает.
+        // Метку ставит загрузчик по файлу на разделе, который собирает стенд
+        // (см. `boot_info::BOOT_UNATTENDED`).
+        let limit = if crate::unattended() {
+            IDLE_TIMEOUT_SECONDS
+        } else {
+            IDLE_TIMEOUT_HUMAN_SECONDS
+        };
+        if time::uptime_ms().saturating_sub(idle_since) >= limit * 1000 {
             sprintln!();
-            sprintln!("  no input for {IDLE_TIMEOUT_SECONDS} s, finishing the session");
+            sprintln!("  no input for {limit} s, finishing the session");
             ui::set_cursor(false);
             return;
         }
@@ -612,7 +628,29 @@ fn run_command(line: &str) -> bool {
             sprintln!("  finishing the session");
             return true;
         }
-        other => sprintln!("  unknown command '{other}'; try 'help'"),
+        // Не команда — может быть программой. Оболочка ищет её в `/bin`, как
+        // это делает всякая оболочка со своим `PATH`; списка каталогов у нас
+        // пока нет, и он не нужен — программы лежат в одном месте.
+        //
+        // Написать `mc` вместо `run /bin/mc` — не удобство ради удобства:
+        // человек, знающий имя программы, не обязан знать ещё и путь к ней и
+        // слово `run`. Отказ при этом остаётся честным: если файла нет, так и
+        // говорится, и говорится про **имя**, а не про придуманный путь.
+        other => {
+            let path = alloc::format!("/bin/{other}");
+            if fs::resolve_as(user::session::credentials(), &path, Access::NONE)
+                .is_some_and(|result| result.is_ok())
+            {
+                let line = if argument.is_empty() {
+                    path
+                } else {
+                    alloc::format!("{path} {argument}")
+                };
+                run_program(&line);
+            } else {
+                sprintln!("  unknown command '{other}'; try 'help'");
+            }
+        }
     }
     false
 }

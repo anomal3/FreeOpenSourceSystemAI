@@ -31,11 +31,89 @@ const BARS: [(u8, u8, u8); 8] = [
     (0, 0, 0),       // black
 ];
 
+/// Разрешения, которые стол просит у прошивки, в порядке предпочтения.
+///
+/// Прошивка отдаёт по умолчанию то, что ей удобно, — обычно 800×600, а на
+/// некоторых машинах и 640×480. Для системы, на которую человек смотрит, это
+/// выглядит как неисправность, поэтому режим выбирается, а не принимается:
+/// сначала привычные 1920×1080, затем 1280×720, затем 1024×768. Если ни одного
+/// из них прошивка не предлагает, остаётся её собственный выбор — режим, в
+/// котором она уже работает, заведомо рабочий.
+///
+/// Порядок начинается с 1280×720, а не с 1920×1080, по земной причине: окно
+/// эмулятора размером в целый экран не помещается на экран, за которым сидит
+/// человек, и половина стола оказывается за краем. Когда в «Параметрах»
+/// появится выбор разрешения, порядок станет всего лишь значением по умолчанию.
+const WANTED_MODES: [(usize, usize); 3] = [(1280, 720), (1920, 1080), (1024, 768)];
+
+/// Установить самый желанный из режимов, которые предлагает прошивка.
+///
+/// Молчаливого отказа здесь нет: если запрошенный режим не установился, об этом
+/// печатается строка. «Экран не того размера» и «экран не переключился» — разные
+/// неисправности, и различить их потом будет нечем.
+fn choose_mode(gop: &mut GraphicsOutput, preferred: Option<(usize, usize)>) {
+    // Просьба человека идёт первой, а список по умолчанию — за ней: если
+    // прошивка такого режима не предлагает, выбор всё равно состоится, а не
+    // оставит экран в том, что дала прошивка.
+    let wanted = preferred
+        .into_iter()
+        .chain(WANTED_MODES)
+        .collect::<alloc::vec::Vec<_>>();
+    for (width, height) in wanted {
+        // Режим забирается из итератора копией: итератор заимствует протокол, а
+        // `set_mode` требует его целиком, и держать оба сразу нельзя.
+        let found = gop.modes().find(|mode| {
+            mode.info().resolution() == (width, height)
+                && matches!(
+                    mode.info().pixel_format(),
+                    GopPixelFormat::Rgb | GopPixelFormat::Bgr
+                )
+        });
+        let Some(mode) = found else {
+            continue;
+        };
+        if gop.current_mode_info().resolution() == (width, height) {
+            return;
+        }
+        match gop.set_mode(&mode) {
+            Ok(()) => {
+                println!("  [gop] switched to {width}x{height}");
+                return;
+            }
+            Err(err) => println!("  [gop] cannot switch to {width}x{height} ({err:?})"),
+        }
+    }
+}
+
+/// Что человек выбрал в «Параметрах» — из файла `\FREEOS\DISPLAY.CFG`.
+///
+/// Файл пишет ядро (см. `kernel::slot::request_screen_mode`), а читается он
+/// здесь и только здесь: разрешение задаётся до того, как ядро существует.
+/// Ошибок эта функция не знает — нет файла, нечитаемая строка, чужие цифры —
+/// всё это означает одно: человек ничего не просил.
+pub fn requested_mode() -> Option<(usize, usize)> {
+    let mut volume = crate::volume::BootVolume::open().ok()?;
+    let path = uefi::cstr16!("\\FREEOS\\DISPLAY.CFG");
+    let mut file = volume.open_regular(path).ok()??;
+    let mut buffer = [0u8; 32];
+    let read = file.read(&mut buffer).ok()?;
+    let text = core::str::from_utf8(&buffer[..read]).ok()?;
+    let line = text.lines().next()?.trim();
+    let (width, height) = line.split_once(['x', 'X'])?;
+    let width: usize = width.trim().parse().ok()?;
+    let height: usize = height.trim().parse().ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    println!("  [gop] {width}x{height} requested by the system");
+    Some((width, height))
+}
+
 /// Открывает GOP, описывает текущий режим и рисует тестовую картинку.
 ///
 /// Headless-машина (или прошивка без GOP) — не ошибка: возвращаем
 /// [`Framebuffer::NONE`], ядро потом само решит, что делать без экрана.
-pub fn probe_framebuffer() -> Framebuffer {
+pub fn probe_framebuffer(preferred: Option<(usize, usize)>) -> Framebuffer {
     let handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
         Ok(handle) => handle,
         Err(err) => {
@@ -51,6 +129,8 @@ pub fn probe_framebuffer() -> Framebuffer {
             return Framebuffer::NONE;
         }
     };
+
+    choose_mode(&mut gop, preferred);
 
     let mode = gop.current_mode_info();
     let (width, height) = mode.resolution();

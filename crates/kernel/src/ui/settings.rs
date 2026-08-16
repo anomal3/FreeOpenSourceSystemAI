@@ -1,0 +1,562 @@
+//! Окно «Параметры»: то, что человек настраивает, не набирая команд.
+//!
+//! # Почему это окно, а не набор команд оболочки
+//!
+//! Все четыре раздела и сейчас доступны из терминала: версию печатает `about`,
+//! пакеты — `pkg list`, обновление — `sysupdate`, разрешение задаёт прошивка.
+//! Разница не в возможностях, а в том, что человеку не приходится знать имена
+//! команд, чтобы посмотреть, сколько памяти в машине и откуда она берёт
+//! обновления. Окно ничего не умеет сверх команд — и это осознанно: две дороги к
+//! одному действию расходятся ровно в тот день, когда одну из них поправят.
+//!
+//! # Почему разделы слева, а содержимое справа
+//!
+//! Потому что так устроены «Параметры» везде, где человек их видел. Раскладка,
+//! к которой не надо привыкать, — это раскладка, которую не надо объяснять.
+
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+use mini_ui::text::{self, GLYPH_H, GLYPH_W};
+use mini_ui::{Rect, Surface};
+
+use super::theme;
+use crate::input::KeyCode;
+use crate::{arch, config, fs};
+
+/// Разделы окна — порядок сверху вниз.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    /// Что это за машина: версия, процессор, память, экран.
+    System,
+    /// Экран: какой режим сейчас и какой попросить у прошивки.
+    Display,
+    /// Что установлено пакетами.
+    Programs,
+    /// Откуда система берёт обновления и что с ними делать.
+    Updates,
+}
+
+impl Section {
+    const ALL: [Section; 4] = [
+        Section::System,
+        Section::Display,
+        Section::Programs,
+        Section::Updates,
+    ];
+
+    const fn title(self) -> &'static str {
+        match self {
+            Section::System => "System",
+            Section::Display => "Display",
+            Section::Programs => "Programs",
+            Section::Updates => "Updates",
+        }
+    }
+
+    const fn about(self) -> &'static str {
+        match self {
+            Section::System => "version, processor, memory",
+            Section::Display => "screen resolution",
+            Section::Programs => "installed packages",
+            Section::Updates => "where updates come from",
+        }
+    }
+}
+
+/// Разрешения, которые можно попросить у прошивки.
+///
+/// Список, а не свободный ввод: прошивка предлагает свой набор режимов, и
+/// написанное от руки «1234×567» она всё равно отвергнет. Здесь перечислены те,
+/// которые предлагает всякая машина, на которой эта система вообще запускается.
+pub const MODES: [(u32, u32); 5] = [
+    (1024, 768),
+    (1280, 720),
+    (1280, 800),
+    (1600, 900),
+    (1920, 1080),
+];
+
+/// Одна строка правой половины окна.
+enum Line {
+    /// Заголовок раздела содержимого.
+    Heading(String),
+    /// Пара «название — значение»: то, что можно только прочитать.
+    Fact(String, String),
+    /// Пункт, по которому можно нажать.
+    Action(String, String),
+    /// Пустая строка.
+    Gap,
+}
+
+pub struct SettingsView {
+    section: usize,
+    /// Выбранный пункт справа — считается по строкам [`Line::Action`].
+    action: usize,
+    /// Что ответило последнее действие.
+    message: Option<String>,
+    /// Размер экрана: окно узнаёт его от стола, само оно экрана не видит.
+    screen: (u32, u32),
+    /// Фокус на левом списке разделов, а не на пунктах справа.
+    on_sections: bool,
+}
+
+impl SettingsView {
+    #[must_use]
+    pub fn new(screen: (u32, u32)) -> Self {
+        Self { section: 0, action: 0, message: None, screen, on_sections: true }
+    }
+
+    /// Перейти на раздел экрана — им открывается меню стола.
+    pub fn show_display(&mut self) {
+        self.section = 1;
+        self.on_sections = true;
+        self.action = 0;
+        self.message = None;
+    }
+
+    fn current(&self) -> Section {
+        Section::ALL[self.section.min(Section::ALL.len() - 1)]
+    }
+
+    /// Строки правой половины для текущего раздела.
+    fn lines(&self) -> Vec<Line> {
+        match self.current() {
+            Section::System => self.system_lines(),
+            Section::Display => self.display_lines(),
+            Section::Programs => self.programs_lines(),
+            Section::Updates => self.updates_lines(),
+        }
+    }
+
+    fn system_lines(&self) -> Vec<Line> {
+        let frames = crate::mm::frame::stats();
+        let uptime = crate::time::uptime_ms() / 1000;
+        let mut lines = Vec::new();
+        lines.push(Line::Heading(format!("FreeOS {}", crate::VERSION)));
+        lines.push(Line::Gap);
+        lines.push(Line::Fact("Architecture".to_string(), arch::ARCH_NAME.to_string()));
+        lines.push(Line::Fact(
+            "Memory".to_string(),
+            format!(
+                "{} MiB free of {} MiB",
+                frames.free_bytes() / (1024 * 1024),
+                frames.total_bytes() / (1024 * 1024)
+            ),
+        ));
+        lines.push(Line::Fact(
+            "Screen".to_string(),
+            format!("{}x{}", self.screen.0, self.screen.1),
+        ));
+        lines.push(Line::Fact(
+            "Uptime".to_string(),
+            format!("{} h {:02} min {:02} s", uptime / 3600, (uptime / 60) % 60, uptime % 60),
+        ));
+        lines.push(Line::Fact("Mounted".to_string(), mounted_text()));
+        lines.push(Line::Gap);
+        lines.push(Line::Heading("Written from scratch in Rust".to_string()));
+        lines
+    }
+
+    fn display_lines(&self) -> Vec<Line> {
+        let mut lines = Vec::new();
+        lines.push(Line::Heading("Screen resolution".to_string()));
+        lines.push(Line::Gap);
+        lines.push(Line::Fact(
+            "Now".to_string(),
+            format!("{}x{}", self.screen.0, self.screen.1),
+        ));
+        lines.push(Line::Gap);
+        for (width, height) in MODES {
+            let mark = if (width, height) == self.screen { "current" } else { "" };
+            lines.push(Line::Action(format!("{width} x {height}"), mark.to_string()));
+        }
+        lines.push(Line::Gap);
+        lines.push(Line::Heading("Applied at next boot".to_string()));
+        lines
+    }
+
+    fn programs_lines(&self) -> Vec<Line> {
+        let mut lines = Vec::new();
+        lines.push(Line::Heading("Installed packages".to_string()));
+        lines.push(Line::Gap);
+        match packages() {
+            Ok(names) if names.is_empty() => {
+                lines.push(Line::Fact(
+                    "None".to_string(),
+                    "install with: pkg add <file>".to_string(),
+                ));
+            }
+            Ok(names) => {
+                for name in names {
+                    lines.push(Line::Fact(name, "/opt".to_string()));
+                }
+            }
+            Err(err) => lines.push(Line::Fact("Registry".to_string(), err)),
+        }
+        lines.push(Line::Gap);
+        lines.push(Line::Heading("pkg add / pkg remove".to_string()));
+        lines
+    }
+
+    fn updates_lines(&self) -> Vec<Line> {
+        let mut lines = Vec::new();
+        lines.push(Line::Heading("System updates".to_string()));
+        lines.push(Line::Gap);
+        lines.push(Line::Fact("Installed".to_string(), crate::VERSION.to_string()));
+        for server in update_servers() {
+            lines.push(Line::Fact("Server".to_string(), server));
+        }
+        lines.push(Line::Gap);
+        lines.push(Line::Action(
+            "Check for updates".to_string(),
+            "runs sysupdate".to_string(),
+        ));
+        lines.push(Line::Gap);
+        lines.push(Line::Heading("Updates must be signed".to_string()));
+        lines
+    }
+
+    /// Сколько пунктов, по которым можно нажать, в текущем разделе.
+    fn actions(&self) -> usize {
+        self.lines()
+            .iter()
+            .filter(|line| matches!(line, Line::Action(_, _)))
+            .count()
+    }
+
+    /// Разобрать клавишу. `true` — окно её использовало.
+    pub fn handle(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Up => {
+                if self.on_sections {
+                    self.section = self.section.saturating_sub(1);
+                } else {
+                    self.action = self.action.saturating_sub(1);
+                }
+                self.message = None;
+                true
+            }
+            KeyCode::Down => {
+                if self.on_sections {
+                    self.section = (self.section + 1).min(Section::ALL.len() - 1);
+                } else {
+                    self.action = (self.action + 1).min(self.actions().saturating_sub(1));
+                }
+                self.message = None;
+                true
+            }
+            // Вправо — перейти к пунктам раздела, влево — вернуться к списку
+            // разделов. Клавиатурой окно проходится целиком: мышь на этой
+            // машине есть не всегда.
+            KeyCode::Right | KeyCode::Tab => {
+                if self.actions() > 0 {
+                    self.on_sections = false;
+                    self.action = self.action.min(self.actions() - 1);
+                }
+                true
+            }
+            KeyCode::Left => {
+                self.on_sections = true;
+                true
+            }
+            KeyCode::Enter => {
+                if self.on_sections {
+                    if self.actions() > 0 {
+                        self.on_sections = false;
+                        self.action = 0;
+                    }
+                } else {
+                    self.activate();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Щелчок по окну: координаты внутри области содержимого.
+    ///
+    /// Возвращает `true`, если щелчок что-то изменил и окно надо перерисовать.
+    pub fn click(&mut self, area: Rect, scale: u32, x: i32, y: i32) -> bool {
+        let step = (GLYPH_H * scale + 4 * scale) as i32;
+        let split = area.x + (area.w as i32) / 3;
+        if x < split {
+            let index = ((y - area.y - step / 2) / (step * 2)).max(0) as usize;
+            if index < Section::ALL.len() {
+                self.section = index;
+                self.on_sections = true;
+                self.action = 0;
+                self.message = None;
+                return true;
+            }
+            return false;
+        }
+
+        // Справа считаем строки подряд и ищем, на какую попали: у пунктов свой
+        // счёт, потому что нажимать можно только по ним.
+        let row = ((y - area.y) / step).max(0) as usize;
+        let mut action_index = 0;
+        for (index, line) in self.lines().iter().enumerate() {
+            if let Line::Action(_, _) = line {
+                if index == row {
+                    self.on_sections = false;
+                    self.action = action_index;
+                    self.activate();
+                    return true;
+                }
+                action_index += 1;
+            }
+        }
+        false
+    }
+
+    /// Выполнить выбранный пункт.
+    fn activate(&mut self) {
+        match self.current() {
+            Section::Display => {
+                let Some((width, height)) = MODES.get(self.action).copied() else {
+                    return;
+                };
+                self.message = Some(match crate::slot::request_screen_mode(width, height) {
+                    Ok(()) => format!("{width}x{height} will be used from the next start"),
+                    Err(err) => format!("cannot save the choice: {err}"),
+                });
+            }
+            Section::Updates => {
+                // Окно не качает обновление само и не ждёт его: `sysupdate` —
+                // программа третьего кольца, у неё сеть, TLS и запись в раздел.
+                // Окно только запускает её, а разговаривает она с человеком в
+                // терминале — там же, где отвечала бы, набери он её имя руками.
+                // Ждать её здесь нельзя: этот код работает внутри разбора
+                // события ввода.
+                self.message = Some(
+                    match crate::user::spawn("/bin/sysupdate", crate::user::session::credentials())
+                    {
+                        Ok(id) => alloc::format!("sysupdate started as {id}; see the terminal"),
+                        Err(err) => alloc::format!("cannot start sysupdate: {err}"),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// Нарисовать окно целиком.
+    pub fn draw(&self, surface: &mut Surface, area: Rect, scale: u32) {
+        surface.fill(area, theme::WINDOW_BG);
+        let step = (GLYPH_H * scale + 4 * scale) as i32;
+        let split = area.x + (area.w as i32) / 3;
+
+        // Левая колонка: разделы. Каждый занимает две строки — название и
+        // пояснение под ним, как в меню запуска.
+        for (index, section) in Section::ALL.iter().enumerate() {
+            let top = area.y + index as i32 * step * 2;
+            let row = Rect::new(
+                area.x,
+                top,
+                (split - area.x).max(0) as u32,
+                (step * 2) as u32,
+            );
+            let chosen = index == self.section;
+            if chosen {
+                surface.fill(row, if self.on_sections { theme::SELECT_BG } else { theme::inactive(theme::SELECT_BG) });
+            }
+            text::draw_text(
+                surface,
+                (area.x + 6 * scale as i32) as u32,
+                (top + 2 * scale as i32) as u32,
+                section.title(),
+                scale,
+                if chosen { theme::TEXT } else { theme::DIM },
+                None,
+            );
+            // Подпись раздела обрезается по ширине колонки: она пояснение, а
+            // не заголовок, и заезжать на содержимое справа ей нельзя.
+            let small = scale.saturating_sub(1).max(1);
+            let room = (((split - area.x - 12 * scale as i32).max(0) as u32) / (GLYPH_W * small)) as usize;
+            text::draw_text(
+                surface,
+                (area.x + 6 * scale as i32) as u32,
+                (top + step) as u32,
+                &clip_text(section.about(), room),
+                small,
+                theme::DIM,
+                None,
+            );
+        }
+
+        // Разделительная черта: без неё две колонки читаются как одна с рваными
+        // отступами.
+        surface.fill(
+            Rect::new(split, area.y, 1.max(scale / 2), area.h),
+            theme::FRAME,
+        );
+
+        // Правая колонка: содержимое раздела. Ширина колонки значений
+        // считается от места, а не задана числом: у узкого окна значение,
+        // отодвинутое на четырнадцать знаков, уезжало за край и обрывалось на
+        // полуслове.
+        let text_x = (split + 10 * scale as i32) as u32;
+        let right_w = area.right().saturating_sub(text_x as i32).max(0) as u32;
+        let cell = GLYPH_W * scale;
+        let columns = (right_w / cell).max(1);
+        let name_width = columns.saturating_sub(4) / 2;
+        let value_x = text_x + cell * name_width.min(14).max(1);
+        let value_room = ((area.right() - value_x as i32).max(0) as u32 / cell) as usize;
+        let mut action_index = 0;
+        for (index, line) in self.lines().iter().enumerate() {
+            let top = area.y + index as i32 * step;
+            if top + step > area.bottom() {
+                break;
+            }
+            match line {
+                Line::Heading(title) => {
+                    let room = (right_w / cell) as usize;
+                    text::draw_text(
+                        surface,
+                        text_x,
+                        top as u32,
+                        &clip_text(title, room),
+                        scale,
+                        theme::ACCENT,
+                        None,
+                    );
+                }
+                Line::Fact(name, value) => {
+                    text::draw_text(surface, text_x, top as u32, name, scale, theme::DIM, None);
+                    text::draw_text(
+                        surface,
+                        value_x,
+                        top as u32,
+                        &clip_text(value, value_room),
+                        scale,
+                        theme::TEXT,
+                        None,
+                    );
+                }
+                Line::Action(name, note) => {
+                    let chosen = !self.on_sections && action_index == self.action;
+                    if chosen {
+                        surface.fill(
+                            Rect::new(split + 4, top, area.right().saturating_sub(split + 8).max(0) as u32, step as u32),
+                            theme::SELECT_BG,
+                        );
+                    }
+                    text::draw_text(
+                        surface,
+                        text_x,
+                        top as u32,
+                        name,
+                        scale,
+                        if chosen { theme::TEXT } else { theme::DIM },
+                        None,
+                    );
+                    if !note.is_empty() {
+                        // Пометка идёт за самим пунктом, а не в колонке
+                        // значений: пункт короткий, и разнесённые по разным
+                        // колонкам «1280 x 720» и «current» читались как две
+                        // отдельные строки, а на узком окне ещё и налезали
+                        // друг на друга.
+                        let after = text_x + cell * (name.chars().count() as u32 + 2);
+                        let room = ((area.right() - after as i32).max(0) as u32 / cell) as usize;
+                        text::draw_text(
+                            surface,
+                            after,
+                            top as u32,
+                            &clip_text(note, room),
+                            scale,
+                            theme::DIRECTORY,
+                            None,
+                        );
+                    }
+                    action_index += 1;
+                }
+                Line::Gap => {}
+            }
+        }
+
+        // Ответ последнего действия — внизу окна, отдельной полосой: он
+        // относится ко всему окну, а не к строке, по которой нажали.
+        if let Some(message) = &self.message {
+            let bar = Rect::new(area.x, area.bottom() - step, area.w, step as u32);
+            surface.fill(bar, theme::SELECT_BG);
+            text::draw_text(
+                surface,
+                (area.x + 6 * scale as i32) as u32,
+                (bar.y + 2) as u32,
+                message,
+                scale,
+                theme::TEXT,
+                None,
+            );
+        }
+    }
+}
+
+/// Обрезать строку по числу знаков, поставив многоточие.
+///
+/// Обрезать, а не переносить: строка «Параметров» — это одно значение, и
+/// половина его на следующей строке читается как другое значение.
+fn clip_text(text: &str, room: usize) -> String {
+    if room == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= room {
+        return text.to_string();
+    }
+    let keep = room.saturating_sub(1);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push('~');
+    out
+}
+
+/// Что и куда смонтировано — одной строкой.
+fn mounted_text() -> String {
+    let mounts = fs::mounted();
+    if mounts.is_empty() {
+        return "nothing".to_string();
+    }
+    let mut text = String::new();
+    for (index, (prefix, kind)) in mounts.iter().enumerate() {
+        if index > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(prefix);
+        text.push_str(" ");
+        text.push_str(kind);
+    }
+    text
+}
+
+/// Имена установленных пакетов из реестра `/var/lib/pkg`.
+///
+/// Реестр — то же место, куда пишет `pkg`: два списка установленного
+/// разошлись бы в первый же день.
+fn packages() -> Result<Vec<String>, String> {
+    const REGISTRY: &str = "/var/lib/pkg";
+    let listing = fs::list(REGISTRY).ok_or_else(|| "no filesystem".to_string())?;
+    let entries = listing.map_err(|err| format!("{err:?}"))?;
+    let mut names: Vec<String> = entries
+        .into_iter()
+        .filter(|entry| entry.name.ends_with(".pkg"))
+        .map(|entry| entry.name.trim_end_matches(".pkg").to_string())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// Серверы обновлений из `update.cfg` — в том порядке, в каком их пробует
+/// `sysupdate`.
+fn update_servers() -> Vec<String> {
+    let Some((bytes, _)) = config::read("update.cfg", 4096) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("server="))
+        .map(|value| value.to_string())
+        .take(4)
+        .collect()
+}

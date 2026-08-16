@@ -159,6 +159,8 @@ pub enum Step {
     Aim(aim::Aim),
     /// Нажать левую кнопку и отпустить её там же.
     Click,
+    /// Щелчок правой кнопкой — меню рабочего стола.
+    RightClick,
     /// Нажать левую кнопку и **не** отпускать — начало перетаскивания.
     Press,
     /// Отпустить все кнопки.
@@ -640,12 +642,12 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("windows,", 30_000),
             Step::Shot("05-desktop"),
-            // Меню умеет не только запускать. Пятый пункт — «Shut down», и он
+            // Меню умеет не только запускать. Шестой пункт — «Shut down», и он
             // открывает не выключение, а вопрос: подтверждение сделано обычным
             // окном, потому что человек уже знает, как закрываются окна.
             Step::Key("f1"),
             Step::Await("desktop     : menu opened", 15_000),
-            Step::Repeat("down", 4),
+            Step::Repeat("down", 5),
             Step::Key("ret"),
             Step::Await("desktop     : opened 'Shut down'", 15_000),
             Step::Wait(2_500),
@@ -661,7 +663,7 @@ pub const ALL: &[Scenario] = &[
             // просьбу — а гасит систему служебная задача.
             Step::Key("f1"),
             Step::Await("desktop     : menu opened", 15_000),
-            Step::Repeat("down", 4),
+            Step::Repeat("down", 5),
             Step::Key("ret"),
             Step::Await("desktop     : opened 'Shut down'", 15_000),
             Step::Key("y"),
@@ -738,6 +740,93 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : focus 'Terminal'", 15_000),
             Step::Wait(1_500),
             Step::Shot("03-desktop"),
+            // Кнопки заголовка: свернуть — и окна на экране нет, зато видны
+            // значки стола; кнопка в панели задач возвращает его обратно.
+            Step::Aim(Aim::Minimize("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : minimized 'Terminal'", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("04-icons"),
+            // Двойной щелчок по значку открывает программу. Первый значок
+            // сверху — «This computer», то есть окно файлов.
+            Step::Aim(Aim::Icon(0)),
+            Step::Click,
+            Step::Click,
+            Step::Await("desktop     : opened 'Files'", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("05-icon-opened"),
+            // Развернуть на весь стол и вернуть обратно — оба перехода
+            // печатаются, потому что оба меняют размер окна.
+            Step::Aim(Aim::Maximize("Files")),
+            Step::Click,
+            Step::Await("desktop     : resized 'Files'", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("06-maximized"),
+            Step::Aim(Aim::Maximize("Files")),
+            Step::Click,
+            Step::Await("desktop     : resized 'Files'", 15_000),
+            Step::Wait(1_000),
+            Step::Aim(Aim::Close("Files")),
+            Step::Click,
+            Step::Await("desktop     : closed 'Files'", 15_000),
+            // Свёрнутый терминал возвращается тем же двойным щелчком по своему
+            // значку: «открыть» уже открытое окно — это показать его снова.
+            Step::Aim(Aim::Icon(1)),
+            Step::Click,
+            Step::Click,
+            Step::Await("desktop     : restored 'Terminal'", 15_000),
+            Step::Wait(1_000),
+            Step::Shot("07-restored"),
+            // «Параметры»: значок третий сверху. Терминал при этом сворачивается
+            // — значки лежат на столе, то есть под окнами, и щелчок по значку
+            // из-под окна означал бы щелчок по окну.
+            Step::Aim(Aim::Minimize("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : minimized 'Terminal'", 15_000),
+            Step::Aim(Aim::Icon(2)),
+            Step::Click,
+            Step::Click,
+            Step::Await("desktop     : opened 'Settings'", 15_000),
+            Step::Wait(2_000),
+            Step::Shot("08-settings"),
+            // Раздел «Display» — второй в левой колонке; выбирается клавишей,
+            // потому что попадание мышью в строку списка зависит от масштаба.
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Wait(1_500),
+            Step::Shot("09-settings-display"),
+            // Убрать за собой: окно параметров закрывается, терминал
+            // возвращается со стола — иначе набранное ниже ушло бы не туда.
+            Step::Aim(Aim::Close("Settings")),
+            Step::Click,
+            Step::Await("desktop     : closed 'Settings'", 15_000),
+            // Меню стола: правый щелчок по пустому месту, создание папки,
+            // закрытие щелчком мимо. Проверяется строками гостя — снимок
+            // показывает последний нарисованный кадр, а не то, что случилось.
+            Step::Aim(Aim::Empty),
+            Step::RightClick,
+            Step::Await("desktop     : context menu at", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("10-context-menu"),
+            // Живой носитель ничего не хранит: корень — образ initrd в FAT, где
+            // каталогов не заводят. Меню обязано сказать это словами, а не
+            // «operation not supported»; создание же проверяется на
+            // установленной системе, где корень ext2 (сценарий `installed`).
+            Step::Aim(Aim::ContextItem(0)),
+            Step::Click,
+            Step::Await("cannot create: the live system cannot store files", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("11-context-refused"),
+            // Закрывается щелчком мимо — и «мимо» здесь ниже самого меню:
+            // точка, из которой его открыли, теперь занята им самим.
+            Step::Aim(Aim::EmptyBelow),
+            Step::Click,
+            Step::Await("desktop     : context menu closed", 15_000),
+            Step::Aim(Aim::Icon(1)),
+            Step::Click,
+            Step::Click,
+            Step::Await("desktop     : restored 'Terminal'", 15_000),
+            Step::Wait(1_000),
             Step::Type("exit"),
             Step::Key("ret"),
             Step::Await("finishing the session", 30_000),
@@ -1678,6 +1767,29 @@ pub const ALL: &[Scenario] = &[
             // установке с тем, что система показывает потом.
             Step::Await("timezone    : UTC+03:00 from /etc/system.cfg", 30_000),
             Step::Await("freeos> ", 30_000),
+            // Меню рабочего стола на установленной системе: здесь корень ext2,
+            // и «создать папку» действительно создаёт её — в отличие от живого
+            // носителя, где хранить нечего. Каталог стола заводится по дороге,
+            // вместе с домашним.
+            // Окна убираются с дороги: меню стола открывается только там, где
+            // стол виден, а щелчок по окну — это щелчок по окну.
+            Step::Aim(Aim::Minimize("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : minimized 'Terminal'", 15_000),
+            Step::Aim(Aim::Minimize("System")),
+            Step::Click,
+            Step::Await("desktop     : minimized 'System'", 15_000),
+            Step::Aim(Aim::Empty),
+            Step::RightClick,
+            Step::Await("desktop     : context menu at", 15_000),
+            Step::Aim(Aim::ContextItem(0)),
+            Step::Click,
+            Step::Await("desktop     : created 'New folder' in /home/roman/Desktop", 15_000),
+            Step::Aim(Aim::EmptyBelow),
+            Step::Click,
+            Step::Await("desktop     : context menu closed", 15_000),
+            Step::Line("ls /home/roman/Desktop"),
+            Step::Await("New folder", 15_000),
             Step::Line("ls /"),
             Step::Await("etc/", 15_000),
             Step::Line("cat /etc/system.cfg"),
@@ -1850,7 +1962,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await("wrote 11 bytes", 15_000),
             // Панели указаны аргументами: программа не знает, где что лежит, и
             // знать не должна.
-            Step::Line("run /bin/mc /home/roman/mcdir /home/roman"),
+            // Короткая форма: имя программы вместо `run /bin/...`. Оболочка
+            // ищет её в `/bin` — так же, как всякая оболочка ищет по `PATH`.
+            Step::Line("mc /home/roman/mcdir /home/roman"),
             Step::Await("mc: started", 30_000),
             // Прямой режим — то, ради чего в фазе 29 появился второй режим
             // терминала: без него стрелки приезжали бы четырьмя видимыми

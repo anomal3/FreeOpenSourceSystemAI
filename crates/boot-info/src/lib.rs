@@ -42,6 +42,16 @@ pub const BOOT_SAFE_MODE: u64 = 1 << 0;
 /// not capture, or simply to be sure.
 pub const BOOT_CHECK_DISK: u64 = 1 << 1;
 
+/// За машиной никого нет: она запущена стендом, а не человеком.
+///
+/// Ставится, когда на загрузочном разделе лежит файл `FREEOS/AUTORUN.CFG`, —
+/// его кладёт туда стенд и никогда не кладёт установщик. Разница видна ровно в
+/// одном месте: оболочка закрывает сеанс по простою, чтобы прогон, которому
+/// никто ничего не набирает, заканчивался сам, а не висел до таймаута. Человек
+/// за настоящей машиной этого предела не встречает вовсе — он читает баннер и
+/// думает столько, сколько нужно.
+pub const BOOT_UNATTENDED: u64 = 1 << 2;
+
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,7 +233,7 @@ pub struct BootInfo {
     /// the hand-off and does not restart in between.
     pub wall_clock_counter: u64,
     /// What was chosen in the bootloader menu: [`BOOT_SAFE_MODE`],
-    /// [`BOOT_CHECK_DISK`], or zero for an ordinary boot.
+    /// [`BOOT_CHECK_DISK`], [`BOOT_UNATTENDED`], or zero for an ordinary boot.
     ///
     /// A field in the stable contract rather than a file the kernel would have
     /// to find and parse: the choice is made before there is a filesystem to
@@ -445,5 +455,11 @@ impl BootInfo {
     #[must_use]
     pub const fn check_disk(&self) -> bool {
         self.boot_flags & BOOT_CHECK_DISK != 0
+    }
+
+    /// Whether nobody is sitting at this machine — see [`BOOT_UNATTENDED`].
+    #[must_use]
+    pub const fn unattended(&self) -> bool {
+        self.boot_flags & BOOT_UNATTENDED != 0
     }
 }

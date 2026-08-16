@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 
 use crate::font;
-use crate::{Color, Rect, Surface};
+use crate::{Color, Rect, Screen, Surface};
 
 /// Размер глифа в таблице шрифта.
 pub const GLYPH_W: u32 = font::GLYPH_W;
@@ -71,6 +71,53 @@ pub fn draw_glyph(
                 }
             }
         }
+    }
+}
+
+/// Нарисовать строку прямо на экране, без поверхности под ней.
+///
+/// Нужно тому, что рисуется поверх фона и не имеет собственной поверхности —
+/// значкам рабочего стола. Фон под буквами сохраняется: точки ставятся только
+/// там, где в глифе единица, иначе подпись значка ехала бы на прямоугольнике
+/// чужого цвета поверх градиента стола.
+///
+/// Экран нельзя читать, поэтому «прозрачность» здесь — это именно пропуск
+/// пустых точек, а не смешивание.
+/// `clip` ограничивает вывод: рисуется только то, что попадает внутрь него.
+/// Это не удобство, а необходимость — экран собирается по прямоугольникам
+/// изменений, и надпись, нарисованная целиком ради задетого края, легла бы
+/// поверх окна, которое её закрывает.
+pub fn draw_text_on_screen(
+    screen: &Screen,
+    x: u32,
+    y: u32,
+    text: &str,
+    scale: u32,
+    fg: Color,
+    clip: Rect,
+) {
+    let scale = scale.max(1);
+    let mut cursor = x;
+    for ch in text.chars() {
+        let glyph = font::glyph(ch);
+        for (gy, bits) in glyph.iter().copied().enumerate() {
+            for gx in 0..GLYPH_W {
+                if (bits >> gx) & 1 == 0 {
+                    continue;
+                }
+                let dot = Rect::new(
+                    (cursor + gx * scale) as i32,
+                    (y + gy as u32 * scale) as i32,
+                    scale,
+                    scale,
+                );
+                let visible = dot.intersect(&clip);
+                if !visible.is_empty() {
+                    screen.fill(visible, fg);
+                }
+            }
+        }
+        cursor += GLYPH_W * scale;
     }
 }
 
@@ -243,6 +290,76 @@ impl TextGrid {
             GLYPH_W * self.scale,
             GLYPH_H * self.scale,
         )
+    }
+
+    /// Пересадить сетку в область другого размера, сохранив написанное.
+    ///
+    /// Нужно окну, которое человек тянет за угол: сетка привязана к пикселям
+    /// поверхности, а поверхность при этом создаётся заново. Без переноса
+    /// содержимого изменение размера стирало бы всё, что напечатано, — то есть
+    /// вело бы себя как очистка экрана, чего от рамки окна никто не ждёт.
+    ///
+    /// Что не помещается — обрезается снизу и справа; курсор остаётся в
+    /// пределах новой сетки. `false`, если в новую область не влезает ни одна
+    /// ячейка или не хватило памяти: сетка при этом остаётся прежней, и
+    /// вызывающий вправе отказаться от изменения размера.
+    pub fn rebind(&mut self, surface: &mut Surface, area: Rect) -> bool {
+        let cell_w = GLYPH_W * self.scale;
+        let cell_h = GLYPH_H * self.scale;
+        let cols = area.w / cell_w;
+        let rows = area.h / cell_h;
+        if cols == 0 || rows == 0 || area.x < 0 || area.y < 0 {
+            return false;
+        }
+
+        let Some(len) = (cols as usize).checked_mul(rows as usize) else {
+            return false;
+        };
+        let mut cells = Vec::new();
+        if cells.try_reserve_exact(len).is_err() {
+            return false;
+        }
+        cells.resize(len, b' ');
+        let mut attrs = Vec::new();
+        if attrs.try_reserve_exact(len).is_err() {
+            return false;
+        }
+        attrs.resize(len, ATTR_DEFAULT);
+
+        // Строки переносятся с начала, а не с конца: терминал печатает сверху
+        // вниз, и при уменьшении окна человек скорее ждёт увидеть начало вывода,
+        // чем его хвост. Прокрутка к последней строке — отдельное решение,
+        // которого у этого окна пока нет.
+        let keep_cols = cols.min(self.cols) as usize;
+        let keep_rows = rows.min(self.rows) as usize;
+        for row in 0..keep_rows {
+            let from = row * self.cols as usize;
+            let to = row * cols as usize;
+            cells[to..to + keep_cols].copy_from_slice(&self.cells[from..from + keep_cols]);
+            attrs[to..to + keep_cols].copy_from_slice(&self.attrs[from..from + keep_cols]);
+        }
+
+        self.origin = (area.x as u32, area.y as u32);
+        self.cols = cols;
+        self.rows = rows;
+        self.cells = cells;
+        self.attrs = attrs;
+        self.col = self.col.min(cols - 1);
+        self.row = self.row.min(rows - 1);
+        // Курсор нарисован на прежней поверхности, которой больше нет.
+        self.cursor_drawn = false;
+
+        surface.fill(self.area(), self.bg);
+        for row in 0..rows {
+            for col in 0..cols {
+                let byte = self.cells[(row * cols + col) as usize];
+                if byte != b' ' || self.attrs[(row * cols + col) as usize] != ATTR_DEFAULT {
+                    self.draw_cell(surface, col, row, byte);
+                }
+            }
+        }
+        self.damage = self.area();
+        true
     }
 
     /// Очистить сетку и залить её область фоном.

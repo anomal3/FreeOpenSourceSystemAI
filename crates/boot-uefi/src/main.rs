@@ -87,8 +87,11 @@ fn main() -> Status {
     // Спрашивается до всего остального: если что-то не так с диском или с
     // графикой, человек обязан успеть сказать об этом раньше, чем загрузчик
     // до них доберётся.
-    info.boot_flags = menu::choose();
-    info.framebuffer = graphics::probe_framebuffer();
+    info.boot_flags = menu::choose() | unattended_flag();
+    // Разрешение, выбранное человеком в «Параметрах», лежит файлом на этом же
+    // томе: сменить режим экрана можно только здесь, до `ExitBootServices`, и
+    // ядро может лишь попросить об этом заранее.
+    info.framebuffer = graphics::probe_framebuffer(graphics::requested_mode());
     info.acpi_rsdp = find_acpi_rsdp();
 
     print_boot_info(&info);
@@ -102,6 +105,23 @@ fn main() -> Status {
             linger(ERROR_LINGER_SECONDS);
             Status::LOAD_ERROR
         }
+    }
+}
+
+/// Метка «за машиной никого нет», если стенд положил её на раздел.
+///
+/// Файл, а не пункт меню: меню требует, чтобы кто-то нажал клавишу, а весь
+/// смысл метки в том, что нажимать некому.
+fn unattended_flag() -> u64 {
+    let Ok(mut volume) = volume::BootVolume::open() else {
+        return 0;
+    };
+    match volume.open_regular(uefi::cstr16!("\\FREEOS\\AUTORUN.CFG")) {
+        Ok(Some(_)) => {
+            println!("  [cfg] unattended run: the shell will close an idle session");
+            boot_info::BOOT_UNATTENDED
+        }
+        _ => 0,
     }
 }
 
