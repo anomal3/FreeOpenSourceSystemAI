@@ -603,6 +603,12 @@ impl Compositor {
         self.menu.as_mut()
     }
 
+    /// Сколько программ из `/bin` показывает меню запуска.
+    #[must_use]
+    pub fn menu_programs(&self) -> usize {
+        self.menu.as_ref().map_or(0, Menu::program_count)
+    }
+
     pub fn menu_open(&self) -> bool {
         self.menu.as_ref().is_some_and(Menu::is_open)
     }

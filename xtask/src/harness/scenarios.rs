@@ -642,6 +642,29 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("windows,", 30_000),
             Step::Shot("05-desktop"),
+            // Правый столбец меню — программы из `/bin`. Их там два десятка, и
+            // одним списком с окнами меню вышло бы выше экрана: у каждого окна
+            // строка описания, то есть две строки на пункт.
+            Step::Expect("desktop     : start menu lists 24 programs from /bin"),
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Key("right"),
+            Step::Wait(1_000),
+            Step::Shot("06-menu-programs"),
+            // Десятая строка сверху — `hello`. Номер считается по `/bin`,
+            // отсортированному по алфавиту, без `init`: поменяется
+            // `USER_PROGRAMS` в `build.rs` — поменяется и он. Промах виден
+            // сразу: следующий шаг ждёт имя запущенного файла целиком.
+            Step::Repeat("down", 9),
+            Step::Key("ret"),
+            Step::Await("desktop     : started '/bin/hello'", 15_000),
+            // И то, ради чего пункт вообще нужен: программа не просто
+            // запустилась, а печатает туда, где человек её видит, — окно
+            // оболочки поднимается вместе с запуском.
+            Step::Await("desktop     : focus 'Terminal'", 15_000),
+            Step::Await("hello from userspace", 30_000),
+            Step::Wait(2_000),
+            Step::Shot("07-program-ran"),
             // Меню умеет не только запускать. Шестой пункт — «Shut down», и он
             // открывает не выключение, а вопрос: подтверждение сделано обычным
             // окном, потому что человек уже знает, как закрываются окна.
@@ -651,7 +674,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("desktop     : opened 'Shut down'", 15_000),
             Step::Wait(2_500),
-            Step::Shot("06-shutdown"),
+            Step::Shot("08-shutdown"),
             // «Нет» обязано означать «нет»: машина остаётся работать, окно
             // закрывается, и об отказе сказано вслух.
             Step::Key("n"),

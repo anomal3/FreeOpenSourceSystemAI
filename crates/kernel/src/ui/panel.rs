@@ -195,20 +195,53 @@ impl Panel {
     }
 }
 
-/// Меню запуска.
+/// Что выбрано в меню запуска.
+///
+/// Программа ядра и программа из `/bin` — разные вещи, и меню обязано
+/// возвращать разные ответы. Одно перечисление на двоих потребовало бы завести
+/// у `App` вариант «какая-нибудь программа с именем», то есть строку внутри
+/// перечисления, которое существует ровно затем, чтобы строк не было.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Choice {
+    /// Окно, которое умеет открыть сам стол.
+    App(App),
+    /// Программа третьего кольца — её имя в `/bin`.
+    Program(String),
+}
+
+/// Меню запуска: окна слева, программы из `/bin` справа.
+///
+/// # Почему два столбца, а не один список
+///
+/// Потому что в `/bin` двадцать пять программ, а у окна каждой строки меню есть
+/// пояснение — то есть две строки. Одним списком меню выходит выше экрана: на
+/// 1280×720 рабочая область 696 точек, а один столбец из всего сразу — больше
+/// тысячи. Второй столбец стоит ширины, которой на экране хватает, и не стоит
+/// ни прокрутки, ни вложенных подменю, каждое из которых пришлось бы открывать
+/// и закрывать.
 pub struct Menu {
     surface: Surface,
     pub rect: Rect,
     scale: u32,
-    selected: usize,
+    /// Выбранная строка левого столбца.
+    app_row: usize,
+    /// Выбранная строка правого столбца.
+    program_row: usize,
+    /// Выбор стоит в правом столбце.
+    on_programs: bool,
     open: bool,
     damage: Rect,
+    /// Имена программ из `/bin`, по алфавиту.
+    programs: Vec<String>,
+    /// Ширина левого столбца в точках.
+    left_w: u32,
 }
 
 impl Menu {
     #[must_use]
     pub fn new(panel_top: i32, scale: u32) -> Option<Self> {
         let row_h = GLYPH_H * scale + theme::PADDING * 3;
+        let prog_h = program_row_height(scale);
         // Ширина считается по самой длинной строке, а не задана числом: строки
         // меняются вместе со списком программ, и подрезанное описание выглядит
         // как испорченный вывод.
@@ -217,13 +250,53 @@ impl Menu {
             widest = widest.max(text::width_of(app.title(), scale));
             widest = widest.max(text::width_of(app.about(), scale.saturating_sub(1).max(1)));
         }
-        let width = widest + theme::PADDING * 6;
+        let left_w = widest + theme::PADDING * 6;
         // Плюс шапка, плюс черта перед питанием — иначе последний пункт
         // упирается в край и выглядит обрезанным.
-        let height = row_h * (App::LAUNCHABLE.len() as u32 * 2 + 1) + theme::PADDING * 5;
+        let left_h = row_h * (App::LAUNCHABLE.len() as u32 * 2 + 1) + theme::PADDING * 5;
+
+        // Сколько строк правого столбца помещается над панелью задач. Список
+        // обрезается по месту, а не по выдуманному числу: на 800×600 при
+        // масштабе 1 помещается вдвое больше строк, чем на 1280×720 при
+        // масштабе 2, и предел, подобранный под один экран, на другом означал
+        // бы либо пустоту снизу, либо меню под панелью.
+        let room = panel_top.max(0) as u32;
+        // Отступ до первой строки правого столбца считается ровно так же, как
+        // при рисовании, и это не педантизм: разойдись две формулы на одну
+        // строку — и последняя программа списка оказалась бы за нижним краем
+        // поверхности, то есть невидимой и недостижимой мышью. Ровно это и
+        // случилось на первом прогоне, `wc` пропала.
+        let head = theme::PADDING + theme::BORDER + row_h + theme::PADDING * 2;
+        // Плюс строка заголовка «Programs», плюс поля снизу.
+        let tail = theme::PADDING + theme::BORDER;
+        let fits = (room
+            .saturating_sub(head + prog_h + tail)
+            / prog_h.max(1)) as usize;
+        let programs = list_programs(fits);
+
+        let mut widest_program = text::width_of(PROGRAMS_TITLE, scale);
+        for name in &programs {
+            widest_program = widest_program.max(text::width_of(name, scale));
+        }
+        let right_w = widest_program + theme::PADDING * 6;
+        let right_h = head + prog_h * (programs.len() as u32 + 1) + tail;
+
+        let width = left_w + right_w;
+        let height = left_h.max(right_h).min(room.max(1));
         let surface = Surface::new(width, height, theme::WINDOW_BG)?;
         let rect = Rect::new(0, panel_top - height as i32, width, height);
-        Some(Self { surface, rect, scale, selected: 0, open: false, damage: Rect::EMPTY })
+        Some(Self {
+            surface,
+            rect,
+            scale,
+            app_row: 0,
+            program_row: 0,
+            on_programs: false,
+            open: false,
+            damage: Rect::EMPTY,
+            programs,
+            left_w,
+        })
     }
 
     #[must_use]
@@ -231,11 +304,19 @@ impl Menu {
         self.open
     }
 
+    /// Сколько программ меню показывает.
+    #[must_use]
+    pub fn program_count(&self) -> usize {
+        self.programs.len()
+    }
+
     /// Открыть или закрыть меню. Возвращает новое состояние.
     pub fn toggle(&mut self) -> bool {
         self.open = !self.open;
         if self.open {
-            self.selected = 0;
+            self.app_row = 0;
+            self.program_row = 0;
+            self.on_programs = false;
             self.redraw();
         }
         self.open
@@ -245,50 +326,108 @@ impl Menu {
         self.open = false;
     }
 
-    /// Пункт меню под точкой (координаты экрана).
+    /// Что лежит под точкой (координаты экрана).
     #[must_use]
-    pub fn index_at(&self, x: i32, y: i32) -> Option<usize> {
+    pub fn choice_at(&self, x: i32, y: i32) -> Option<Choice> {
         if !self.rect.contains(x, y) {
             return None;
         }
+        let local_y = (y - self.rect.y) as u32;
         let row_h = GLYPH_H * self.scale + theme::PADDING * 3;
         // Первая строка — шапка с именем системы, и щелчок по ней не открывает
         // ничего; отступ ниже повторяет тот, что отложен при рисовании.
         let top = theme::PADDING + theme::BORDER + row_h + theme::PADDING * 2;
-        let local = (y - self.rect.y) as u32;
-        if local < top {
+        if local_y < top {
             return None;
+        }
+        if (x - self.rect.x) as u32 >= self.left_w {
+            let index = ((local_y - top) / program_row_height(self.scale)) as usize;
+            return self.programs.get(index).cloned().map(Choice::Program);
         }
         // Пункт занимает две строки — название и описание, — поэтому попадание
         // считается по паре: щелчок по описанию обязан открывать ту же
         // программу, что и щелчок по названию.
-        let index = ((local - top) / (row_h * 2)) as usize;
-        (index < App::LAUNCHABLE.len()).then_some(index)
+        let index = ((local_y - top) / (row_h * 2)) as usize;
+        App::LAUNCHABLE.get(index).copied().map(Choice::App)
     }
 
-    /// Поставить выделение на пункт под указателем.
-    pub fn select(&mut self, index: usize) {
-        if index >= App::LAUNCHABLE.len() || index == self.selected {
+    /// Поставить выделение туда, где стоит указатель.
+    pub fn select_at(&mut self, x: i32, y: i32) {
+        let Some(choice) = self.choice_at(x, y) else {
+            return;
+        };
+        let (on_programs, row) = match &choice {
+            Choice::App(app) => (
+                false,
+                App::LAUNCHABLE.iter().position(|item| item == app).unwrap_or(0),
+            ),
+            Choice::Program(name) => (
+                true,
+                self.programs.iter().position(|item| item == name).unwrap_or(0),
+            ),
+        };
+        if self.on_programs == on_programs
+            && (if on_programs { self.program_row } else { self.app_row }) == row
+        {
             return;
         }
-        self.selected = index;
+        self.on_programs = on_programs;
+        if on_programs {
+            self.program_row = row;
+        } else {
+            self.app_row = row;
+        }
         self.redraw();
     }
 
+    /// Сдвинуть выбор внутри столбца, по кругу.
     pub fn move_selection(&mut self, forward: bool) {
-        let count = App::LAUNCHABLE.len();
-        self.selected = if forward {
-            (self.selected + 1) % count
+        let count = if self.on_programs {
+            self.programs.len()
         } else {
-            (self.selected + count - 1) % count
+            App::LAUNCHABLE.len()
+        };
+        if count == 0 {
+            return;
+        }
+        let row = if self.on_programs {
+            &mut self.program_row
+        } else {
+            &mut self.app_row
+        };
+        *row = if forward {
+            (*row + 1) % count
+        } else {
+            (*row + count - 1) % count
         };
         self.redraw();
     }
 
+    /// Перейти в другой столбец. Возвращает `true`, если переход состоялся.
+    ///
+    /// Столбцы переключаются стрелками влево-вправо, а не общим обходом
+    /// сверху вниз: список программ длиннее списка окон в три раза, и обход по
+    /// кругу означал бы двадцать нажатий, чтобы вернуться к «Терминалу».
+    pub fn switch_column(&mut self, to_programs: bool) -> bool {
+        if to_programs && self.programs.is_empty() {
+            return false;
+        }
+        if self.on_programs == to_programs {
+            return false;
+        }
+        self.on_programs = to_programs;
+        self.redraw();
+        true
+    }
+
     /// Что выбрано сейчас.
     #[must_use]
-    pub fn selection(&self) -> App {
-        App::LAUNCHABLE[self.selected.min(App::LAUNCHABLE.len() - 1)]
+    pub fn selection(&self) -> Option<Choice> {
+        if self.on_programs {
+            self.programs.get(self.program_row).cloned().map(Choice::Program)
+        } else {
+            App::LAUNCHABLE.get(self.app_row).copied().map(Choice::App)
+        }
     }
 
     fn redraw(&mut self) {
@@ -334,6 +473,7 @@ impl Menu {
             None,
         );
         y += row_h + theme::PADDING * 2;
+        let top = y;
 
         for (index, app) in App::LAUNCHABLE.iter().enumerate() {
             // Питание отделяется чертой: «выключить» рядом с «открыть терминал»
@@ -342,20 +482,20 @@ impl Menu {
                 let line = Rect::new(
                     left as i32,
                     y as i32 - theme::PADDING as i32,
-                    bounds.w.saturating_sub(left * 2),
+                    self.left_w.saturating_sub(left * 2),
                     1.max(scale / 2),
                 );
                 self.surface.fill(line, theme::FRAME);
                 y += theme::PADDING;
             }
 
-            let selected = index == self.selected;
+            let selected = !self.on_programs && index == self.app_row;
             if selected {
                 self.surface.fill(
                     Rect::new(
                         theme::BORDER as i32,
                         y as i32 - theme::PADDING as i32,
-                        bounds.w - theme::BORDER * 2,
+                        self.left_w - theme::BORDER * 2,
                         row_h * 2 - theme::PADDING,
                     ),
                     theme::SELECT_BG,
@@ -388,6 +528,60 @@ impl Menu {
             y += row_h;
         }
 
+        // Черта между столбцами: без неё два списка читаются как один с рваными
+        // отступами.
+        self.surface.fill(
+            Rect::new(
+                self.left_w as i32,
+                top as i32 - theme::PADDING as i32,
+                1.max(scale / 2),
+                bounds.h.saturating_sub(top + theme::PADDING),
+            ),
+            theme::FRAME,
+        );
+
+        // Правый столбец: то, что лежит в `/bin`. Описаний у этих строк нет и
+        // взяться им неоткуда — программа не рассказывает о себе ничего, пока
+        // её не запустишь.
+        let right_x = self.left_w + left;
+        text::draw_text(
+            &mut self.surface,
+            right_x,
+            top,
+            PROGRAMS_TITLE,
+            scale,
+            theme::DIRECTORY,
+            None,
+        );
+        let prog_h = program_row_height(scale);
+        for (index, name) in self.programs.iter().enumerate() {
+            let row_y = top + prog_h + index as u32 * prog_h;
+            if row_y + prog_h > bounds.h {
+                break;
+            }
+            let selected = self.on_programs && index == self.program_row;
+            if selected {
+                self.surface.fill(
+                    Rect::new(
+                        self.left_w as i32 + theme::BORDER as i32,
+                        row_y as i32 - theme::PADDING as i32 / 2,
+                        bounds.w.saturating_sub(self.left_w + theme::BORDER * 2),
+                        prog_h,
+                    ),
+                    theme::SELECT_BG,
+                );
+            }
+            text::draw_text(
+                &mut self.surface,
+                right_x,
+                row_y,
+                name,
+                scale,
+                if selected { theme::ACCENT } else { theme::TEXT },
+                None,
+            );
+        }
+
         self.damage = bounds;
     }
 
@@ -399,6 +593,43 @@ impl Menu {
     pub fn take_damage(&mut self) -> Rect {
         core::mem::replace(&mut self.damage, Rect::EMPTY)
     }
+}
+
+/// Заголовок правого столбца.
+const PROGRAMS_TITLE: &str = "Programs";
+
+/// Высота строки списка программ.
+///
+/// Ниже строки левого столбца: у программы нет описания под именем, и отступ,
+/// рассчитанный на две строки, растянул бы список вдвое без единой лишней
+/// буквы.
+fn program_row_height(scale: u32) -> u32 {
+    GLYPH_H * scale + theme::PADDING * 2
+}
+
+/// Имена программ из `/bin`, по алфавиту, не больше `limit`.
+///
+/// # Чего здесь нет и почему
+///
+/// `init` в списке нет: это надзиратель за службами, он уже работает, и вторая
+/// его копия, запущенная человеком из меню, взялась бы поднимать те же службы
+/// заново. Всё остальное в списке есть, включая то, что падает нарочно
+/// (`crash`, `svcbad`): оболочка запускает их по имени и сейчас, и прятать в
+/// меню то, что можно набрать руками, значило бы делать вид, что этого нет.
+fn list_programs(limit: usize) -> Vec<String> {
+    const HIDDEN: [&str; 1] = ["init"];
+    let Some(Ok(entries)) = crate::fs::list("/bin") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .into_iter()
+        .filter(|entry| entry.kind == crate::vfs::NodeKind::File)
+        .map(|entry| entry.name)
+        .filter(|name| !HIDDEN.contains(&name.as_str()))
+        .collect();
+    names.sort();
+    names.truncate(limit);
+    names
 }
 
 /// Время работы в виде `Ч:ММ:СС`.

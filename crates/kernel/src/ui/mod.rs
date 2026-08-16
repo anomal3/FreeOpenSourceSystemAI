@@ -132,6 +132,12 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
         log_window(&desktop, app, focused);
     }
     log_icons(&desktop);
+    // Сколько программ нашлось в `/bin` — единственное, чем список меню видно
+    // снаружи: сам он рисуется, а нарисованное доказательством не считается.
+    kprintln!(
+        "  desktop     : start menu lists {} programs from /bin",
+        desktop.menu_programs()
+    );
 
     // Размер сетки запоминается один раз: окна не меняют размера, а спрашивают
     // его программы — в том числе тогда, когда стол занят перерисовкой.
@@ -674,16 +680,16 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
 
     // 1. Открытое меню.
     if desktop.menu_open() {
-        let index = desktop.menu_mut().and_then(|menu| menu.index_at(x, y));
-        match index {
-            Some(index) => {
+        let choice = desktop.menu_mut().and_then(|menu| menu.choice_at(x, y));
+        match choice {
+            Some(choice) => {
                 if let Some(menu) = desktop.menu_mut() {
-                    menu.select(index);
+                    menu.select_at(x, y);
                     menu.close();
                 }
                 kprintln!("  desktop     : menu closed");
                 desktop.mark_menu_area();
-                launch(desktop, App::LAUNCHABLE[index]);
+                run_choice(desktop, choice);
                 desktop.refresh_panel(status);
                 return;
             }
@@ -897,8 +903,22 @@ fn handle_menu(desktop: &mut Compositor, code: KeyCode, status: &Status) {
     match code {
         KeyCode::Up => menu.move_selection(false),
         KeyCode::Down => menu.move_selection(true),
+        // Влево-вправо ходят между столбцами: слева окна стола, справа
+        // программы из `/bin`. Обход обоих списков одними стрелками вверх-вниз
+        // означал бы двадцать нажатий на дорогу от последней программы обратно
+        // к «Терминалу».
+        KeyCode::Right => {
+            if !menu.switch_column(true) {
+                return;
+            }
+        }
+        KeyCode::Left => {
+            if !menu.switch_column(false) {
+                return;
+            }
+        }
         KeyCode::Enter => {
-            launching = Some(menu.selection());
+            launching = menu.selection();
             menu.close();
             closed = true;
         }
@@ -913,11 +933,32 @@ fn handle_menu(desktop: &mut Compositor, code: KeyCode, status: &Status) {
         kprintln!("  desktop     : menu closed");
         desktop.mark_menu_area();
     }
-    if let Some(app) = launching {
-        launch(desktop, app);
+    if let Some(choice) = launching {
+        run_choice(desktop, choice);
     }
     desktop.refresh_panel(status);
     desktop.present();
+}
+
+/// Выполнить то, что выбрали в меню запуска.
+///
+/// Окно стола открывается здесь же, а программа третьего кольца запускается и
+/// **поднимает окно оболочки**: она разговаривает строками, и оставить её
+/// говорить в закрытое окно значило бы запустить программу, ответа которой
+/// нигде не видно. Ждать её нельзя — этот код работает внутри разбора события
+/// ввода.
+fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
+    match choice {
+        panel::Choice::App(app) => launch(desktop, app),
+        panel::Choice::Program(name) => {
+            let path = alloc::format!("/bin/{name}");
+            match crate::user::spawn(&path, crate::user::session::credentials()) {
+                Ok(id) => kprintln!("  desktop     : started '{path}' as {id}"),
+                Err(err) => kprintln!("  desktop     : cannot start '{path}': {err}"),
+            }
+            launch(desktop, App::Terminal);
+        }
+    }
 }
 
 /// Запустить программу: поднять её окно или создать новое.
