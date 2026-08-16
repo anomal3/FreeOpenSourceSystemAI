@@ -16,7 +16,7 @@
 use alloc::vec::Vec;
 
 use crate::font;
-use crate::{Color, Rect, Screen, Surface};
+use crate::{Color, Rect, Surface};
 
 /// Размер глифа в таблице шрифта.
 pub const GLYPH_W: u32 = font::GLYPH_W;
@@ -47,9 +47,27 @@ pub fn draw_glyph(
     fg: Color,
     bg: Option<Color>,
 ) {
+    draw_glyph_at(surface, x as i32, y as i32, ch, scale, fg, bg);
+}
+
+/// То же, но координаты со знаком.
+///
+/// Отрицательное начало — законное состояние, а не ошибка: кадр собирается
+/// полосами, и надпись, начавшаяся выше полосы, попадает в неё нижней частью.
+/// Считать её «не попавшей» значило бы терять верхнюю строку подписи всякий
+/// раз, когда граница полосы прошла по букве.
+pub fn draw_glyph_at(
+    surface: &mut Surface,
+    x: i32,
+    y: i32,
+    ch: char,
+    scale: u32,
+    fg: Color,
+    bg: Option<Color>,
+) {
     let glyph = font::glyph(ch);
-    let fg = fg.pixel();
-    let bg = bg.map(Color::pixel);
+    let fg_pixel = fg.pixel();
+    let bg_pixel = bg.map(Color::pixel);
 
     for (gy, bits) in glyph.iter().copied().enumerate() {
         for gx in 0..GLYPH_W {
@@ -58,66 +76,159 @@ pub fn draw_glyph(
             // вправо на номер столбца, а не на 7 - столбец.
             let lit = (bits >> gx) & 1 != 0;
             let pixel = if lit {
-                fg
+                fg_pixel
             } else {
-                match bg {
+                match bg_pixel {
                     Some(bg) => bg,
                     None => continue,
                 }
             };
             for sy in 0..scale {
                 for sx in 0..scale {
-                    surface.put(x + gx * scale + sx, y + gy as u32 * scale + sy, pixel);
+                    put(
+                        surface,
+                        x + (gx * scale + sx) as i32,
+                        y + (gy as u32 * scale + sy) as i32,
+                        pixel,
+                    );
                 }
+            }
+        }
+    }
+
+    if scale >= 2 {
+        smooth_glyph(surface, x, y, &glyph, scale, fg, bg);
+    }
+}
+
+/// Поставить точку по координатам со знаком; отрицательные отбрасываются.
+fn put(surface: &mut Surface, x: i32, y: i32, pixel: u32) {
+    if x < 0 || y < 0 {
+        return;
+    }
+    surface.put(x as u32, y as u32, pixel);
+}
+
+/// Сгладить ступеньки увеличенного глифа.
+///
+/// # Зачем
+///
+/// Шрифт растровый, 8×8, и на экране он показывается увеличенным вдвое или
+/// втрое. Наклонная черта в такой картинке — это лесенка из квадратов размером
+/// с масштаб, и именно она делает экран «пиксельным»: буква `S` при масштабе 2
+/// состоит из ступенек в четыре точки. Никакого второго шрифта у системы нет и
+/// взяться ему неоткуда — кириллица здесь нарисована руками, — поэтому
+/// сглаживается тот, который есть.
+///
+/// # Как
+///
+/// Правило то же, что у Scale2x/EPX, и оно про углы: если две соседние точки
+/// (сверху и слева) горят, а противоположные им — нет, то угол между ними
+/// принадлежит наклонной, а не квадрату. У EPX такой угол просто закрашивается
+/// цветом соседей, отчего лесенка превращается в скос; здесь он закрашивается
+/// **полутоном** — смесью цвета буквы и того, что под ней. Полутон дешевле
+/// целого закрашивания по внешнему виду: скос из чистого цвета сам выглядит
+/// ступенькой, просто вдвое мельче.
+///
+/// # Почему это работает только на поверхности
+///
+/// Полутон надо с чем-то смешивать. Когда фон задан (`bg`), он известен; когда
+/// надпись рисуется поверх готового (заголовок окна, подпись значка) — цвет
+/// берётся **чтением точки**, а прочитать можно только обычную память. Именно
+/// поэтому кадр теперь собирается в буфере, а не сразу на экране: сглаживание
+/// поверх фреймбуфера невозможно в принципе.
+fn smooth_glyph(
+    surface: &mut Surface,
+    x: i32,
+    y: i32,
+    glyph: &[u8; 8],
+    scale: u32,
+    fg: Color,
+    bg: Option<Color>,
+) {
+    // Сторона уголка: половина квадрата, но не меньше точки. При масштабе 2 это
+    // ровно тот подпиксель, который переставляет EPX, при масштабе 3 — четыре
+    // из девяти.
+    let corner = (scale / 2).max(1);
+    let lit = |gx: i32, gy: i32| -> bool {
+        if !(0..8).contains(&gx) || !(0..8).contains(&gy) {
+            return false;
+        }
+        (glyph[gy as usize] >> gx) & 1 != 0
+    };
+
+    for gy in 0..8i32 {
+        for gx in 0..8i32 {
+            let here = lit(gx, gy);
+            let up = lit(gx, gy - 1);
+            let down = lit(gx, gy + 1);
+            let left = lit(gx - 1, gy);
+            let right = lit(gx + 1, gy);
+
+            // Четыре угла квадрата: каждый описан парой соседей, которые его
+            // образуют, и парой противоположных, которые обязаны молчать.
+            // Условие `сосед != противоположный` — то самое место, где EPX
+            // отличает наклонную от сплошного края: у сплошного края соседи
+            // одинаковы с обеих сторон, и сглаживать там нечего.
+            for (near_a, near_b, far_a, far_b, dx, dy) in [
+                (up, left, down, right, 0, 0),
+                (up, right, down, left, 1, 0),
+                (down, left, up, right, 0, 1),
+                (down, right, up, left, 1, 1),
+            ] {
+                // Два соседа, образующих угол, горят одинаково и **не так**,
+                // как точка между ними; каждый из них при этом отличается от
+                // противоположного ему. Последние два условия и отделяют
+                // наклонную от сплошного края: у сплошного края соседи
+                // одинаковы с обеих сторон, и сглаживать там нечего.
+                //
+                // Порядок сравнений здесь не вкусовщина: первая запись этого
+                // правила сравнивала `near_a` с `far_a`, а не с `far_b`, — то
+                // есть верх с низом вместо верха с правым, — и не срабатывала
+                // ни разу. Выглядело это в точности как отсутствие сглаживания.
+                if near_a != near_b || near_a == here || near_a == far_b || near_b == far_a {
+                    continue;
+                }
+                let px = x + (gx * scale as i32) + if dx == 1 { (scale - corner) as i32 } else { 0 };
+                let py = y + (gy * scale as i32) + if dy == 1 { (scale - corner) as i32 } else { 0 };
+                paint_corner(surface, px, py, corner, here, fg, bg);
             }
         }
     }
 }
 
-/// Нарисовать строку прямо на экране, без поверхности под ней.
-///
-/// Нужно тому, что рисуется поверх фона и не имеет собственной поверхности —
-/// значкам рабочего стола. Фон под буквами сохраняется: точки ставятся только
-/// там, где в глифе единица, иначе подпись значка ехала бы на прямоугольнике
-/// чужого цвета поверх градиента стола.
-///
-/// Экран нельзя читать, поэтому «прозрачность» здесь — это именно пропуск
-/// пустых точек, а не смешивание.
-/// `clip` ограничивает вывод: рисуется только то, что попадает внутрь него.
-/// Это не удобство, а необходимость — экран собирается по прямоугольникам
-/// изменений, и надпись, нарисованная целиком ради задетого края, легла бы
-/// поверх окна, которое её закрывает.
-pub fn draw_text_on_screen(
-    screen: &Screen,
-    x: u32,
-    y: u32,
-    text: &str,
-    scale: u32,
+/// Закрасить уголок полутоном между цветом буквы и тем, что под ней.
+fn paint_corner(
+    surface: &mut Surface,
+    x: i32,
+    y: i32,
+    side: u32,
+    lit: bool,
     fg: Color,
-    clip: Rect,
+    bg: Option<Color>,
 ) {
-    let scale = scale.max(1);
-    let mut cursor = x;
-    for ch in text.chars() {
-        let glyph = font::glyph(ch);
-        for (gy, bits) in glyph.iter().copied().enumerate() {
-            for gx in 0..GLYPH_W {
-                if (bits >> gx) & 1 == 0 {
-                    continue;
-                }
-                let dot = Rect::new(
-                    (cursor + gx * scale) as i32,
-                    (y + gy as u32 * scale) as i32,
-                    scale,
-                    scale,
-                );
-                let visible = dot.intersect(&clip);
-                if !visible.is_empty() {
-                    screen.fill(visible, fg);
-                }
+    for oy in 0..side as i32 {
+        for ox in 0..side as i32 {
+            let (px, py) = (x + ox, y + oy);
+            if px < 0 || py < 0 {
+                continue;
             }
+            let (px, py) = (px as u32, py as u32);
+            // Что под точкой: заданный фон, а если фона нет — то, что уже
+            // нарисовано. Читать приходится каждую точку отдельно: под
+            // заголовком окна лежит полоса одного цвета, а под подписью значка
+            // — градиент стола, и один прочитанный цвет на весь уголок дал бы
+            // на нём видимую ступеньку вместо сглаженной.
+            let under = match bg {
+                Some(color) => color,
+                None => Color::from_pixel(surface.get(px, py)),
+            };
+            // Горящая точка гасится наполовину, погашенная — наполовину
+            // зажигается. Направление смешивания одно и то же, меняется только
+            // то, что считать началом.
+            let mixed = if lit { fg.mix(under, 128) } else { under.mix(fg, 128) };
+            surface.put(px, py, mixed.pixel());
         }
-        cursor += GLYPH_W * scale;
     }
 }
 
@@ -131,12 +242,25 @@ pub fn draw_text(
     fg: Color,
     bg: Option<Color>,
 ) -> Rect {
+    draw_text_at(surface, x as i32, y as i32, text, scale, fg, bg)
+}
+
+/// То же, но координаты со знаком — см. [`draw_glyph_at`].
+pub fn draw_text_at(
+    surface: &mut Surface,
+    x: i32,
+    y: i32,
+    text: &str,
+    scale: u32,
+    fg: Color,
+    bg: Option<Color>,
+) -> Rect {
     let mut cursor = x;
     for ch in text.chars() {
-        draw_glyph(surface, cursor, y, ch, scale, fg, bg);
-        cursor += GLYPH_W * scale;
+        draw_glyph_at(surface, cursor, y, ch, scale, fg, bg);
+        cursor += (GLYPH_W * scale) as i32;
     }
-    Rect::new(x as i32, y as i32, cursor - x, GLYPH_H * scale)
+    Rect::new(x, y, (cursor - x).max(0) as u32, GLYPH_H * scale)
 }
 
 /// Шестнадцать цветов терминала — те самые, которые ANSI нумерует от 30 до 37 и

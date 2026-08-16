@@ -24,6 +24,26 @@
 //! Градиент считается по номеру строки, а разметка — по остатку от деления
 //! координаты, поэтому фон рисуется из ничего, и его хватает на любой экран,
 //! который отдаст прошивка.
+//!
+//! # Кадр собирается в памяти и выводится целиком
+//!
+//! Слои складываются не на экран, а в буфер, и на экран уходит уже готовая
+//! картинка — одним копированием строк. Это даёт три разные вещи, и каждая
+//! стоила бы отдельной работы:
+//!
+//! 1. **Ничего не мелькает.** Раньше прямоугольник сначала заливался фоном, а
+//!    окно ложилось поверх — и между этими двумя действиями фон было видно.
+//! 2. **В экран пишут один раз.** Фреймбуфер — память устройства; фон, значок и
+//!    окно, легшие на одно место, стоили трёх записей в неё, а теперь одной.
+//! 3. **Буфер можно читать.** На этом стоит сглаживание шрифта: полутон на
+//!    ступеньке буквы смешивается с тем, что под ней, а прочитать «что под
+//!    ней» на экране невозможно — чтение write-combining памяти сбрасывает
+//!    буфер записи.
+//!
+//! Буфер — **полоса**, а не целый экран: экран 1920×1080 в четырёх байтах на
+//! точку — это восемь мегабайт из шестнадцати, то есть половина кучи под одну
+//! картинку. Полоса в полмегабайта даёт то же самое, а прямоугольник выше её
+//! просто выводится в несколько заходов.
 
 use alloc::vec::Vec;
 
@@ -73,6 +93,8 @@ pub struct Compositor {
     drag_resizes: bool,
     /// Масштаб глифа для новых окон.
     scale: u32,
+    /// Буфер, в котором собирается кадр, — полоса во всю ширину экрана.
+    back: Surface,
     damage: [Rect; MAX_DAMAGE],
     damage_count: usize,
     /// Изменений накопилось больше, чем помещается: проще перерисовать всё.
@@ -81,10 +103,33 @@ pub struct Compositor {
     rects: u64,
 }
 
+/// Сколько памяти отдаётся под полосу, в которой собирается кадр.
+///
+/// Полмегабайта — это сотня строк на экране 1280 точек и семь десятков на 1920.
+/// Больше не нужно: полоса влияет только на число заходов, а не на то, что
+/// получится; меньше — и на каждый прямоугольник изменений приходилось бы по
+/// десятку выводов на экран, каждый со своим обходом всех слоёв.
+const BAND_BYTES: u32 = 512 * 1024;
+
+/// Наименьшая и наибольшая высота полосы в строках.
+const BAND_MIN: u32 = 16;
+const BAND_MAX: u32 = 256;
+
 impl Compositor {
-    pub fn new(screen: Screen, scale: u32) -> Self {
+    /// Поднять композитор на этом экране.
+    ///
+    /// `None`, если не хватило памяти под буфер кадра. Это не отказ системы:
+    /// ядро в таком случае работает с оболочкой в серийной линии — ровно как
+    /// тогда, когда прошивка не дала фреймбуфера вовсе. Отдельного пути «рисуем
+    /// прямо на экран, без буфера» здесь намеренно нет: он означал бы две
+    /// сборки кадра, из которых вторая проверялась бы только на машине, где не
+    /// хватило памяти, — то есть никогда.
+    pub fn new(screen: Screen, scale: u32) -> Option<Self> {
         let pointer = Pointer::new(screen.width(), screen.height());
+        let rows = (BAND_BYTES / (screen.width().max(1) * 4)).clamp(BAND_MIN, BAND_MAX);
+        let back = Surface::new(screen.width(), rows.min(screen.height().max(1)), theme::DESKTOP_TOP)?;
         let mut compositor = Self {
+            back,
             screen,
             windows: Vec::new(),
             focus: 0,
@@ -113,7 +158,7 @@ impl Compositor {
         // ячейка, заехавшая под панель задач, щёлкается панелью, а не значком.
         compositor.icons.set_area(panel_top);
         compositor.icons.reload();
-        compositor
+        Some(compositor)
     }
 
     /// Нижняя граница области, в которой живут окна: верх панели.
@@ -804,8 +849,10 @@ impl Compositor {
         self.damage_count = 0;
     }
 
-    /// Нарисовать один прямоугольник экрана: фон, окна снизу вверх, панель,
-    /// меню.
+    /// Собрать прямоугольник экрана и вывести его целиком.
+    ///
+    /// Прямоугольник выше полосы буфера разрезается на несколько: каждая полоса
+    /// собирается со всеми слоями и уходит на экран одним выводом.
     ///
     /// # Почему здесь нет короткого пути
     ///
@@ -817,53 +864,75 @@ impl Compositor {
     /// оказывалось поверх верхнего. Причину найти не удалось — трассировка
     /// показывала правильный порядок вывода, а на экране был обратный, — и
     /// оптимизация убрана целиком. Оптимизация, работающая не всегда, хуже её
-    /// отсутствия: она превращает картинку в лотерею, а сэкономленное здесь —
-    /// несколько тысяч записей в фреймбуфер на нажатие клавиши.
-    fn compose(&self, rect: Rect) {
-        self.draw_background(rect);
-        self.icons.draw(&self.screen, rect);
+    /// отсутствия: она превращает картинку в лотерею.
+    fn compose(&mut self, rect: Rect) {
+        // Буфер вынимается на время сборки — иначе он занят изменяемой
+        // ссылкой, пока читаются окна, значки и панель, то есть весь остальной
+        // композитор. Тот же приём, что и у самого стола под замком.
+        let mut back = core::mem::replace(&mut self.back, Surface::EMPTY);
+        let band_h = back.height().max(1);
+        let mut top = rect.y;
+        while top < rect.bottom() {
+            let height = band_h.min((rect.bottom() - top) as u32);
+            let band = Rect::new(rect.x, top, rect.w, height);
+            self.compose_band(&mut back, band);
+            // Буфер во всю ширину экрана, поэтому по горизонтали координаты
+            // совпадают, и сдвигать надо только начало по вертикали.
+            self.screen.blit(
+                &back,
+                (band.x, band.y),
+                Rect::new(band.x, 0, band.w, band.h),
+            );
+            top += height as i32;
+        }
+        self.back = back;
+    }
+
+    /// Сложить все слои одной полосы в буфер.
+    ///
+    /// Порядок — снизу вверх, и он же делает обрезку: значок, попавший под
+    /// окно, просто перекрывается им в буфере. Пока слои шли прямо на экран,
+    /// каждый рисующий обязан был обрезать себя сам по прямоугольнику
+    /// изменений — иначе значок, задетый краем, ложился поверх закрывающего его
+    /// окна.
+    fn compose_band(&self, back: &mut Surface, band: Rect) {
+        let dy = -band.y;
+        self.draw_background(back, band, dy);
+        self.icons.draw(back, band, dy);
         for window in self.windows.iter().filter(|window| !window.minimized) {
-            let overlap = window.rect.intersect(&rect);
-            if !overlap.is_empty() {
-                self.blit(window.surface(), window.rect, overlap);
-            }
+            self.stack(back, window.surface(), window.rect, band, dy);
         }
         if let Some(panel) = self.panel.as_ref() {
-            let overlap = panel.rect.intersect(&rect);
-            if !overlap.is_empty() {
-                self.blit(panel.surface(), panel.rect, overlap);
-            }
+            self.stack(back, panel.surface(), panel.rect, band, dy);
         }
         if let Some(menu) = self.menu.as_ref() {
             if menu.is_open() {
-                let overlap = menu.rect.intersect(&rect);
-                if !overlap.is_empty() {
-                    self.blit(menu.surface(), menu.rect, overlap);
-                }
+                self.stack(back, menu.surface(), menu.rect, band, dy);
             }
         }
         if let Some(menu) = self.context.as_ref() {
             if menu.is_open() {
-                let overlap = menu.rect.intersect(&rect);
-                if !overlap.is_empty() {
-                    self.blit(menu.surface(), menu.rect, overlap);
-                }
+                self.stack(back, menu.surface(), menu.rect, band, dy);
             }
         }
         // Курсор — последним и без проверки пересечения: он мал, а обрезка
         // однобитной картинки уже сделана внутри `draw_bitmap`. Проверка
-        // «попадает ли он в прямоугольник» стоила бы больше, чем экономила.
-        self.pointer.draw(&self.screen);
+        // «попадает ли он в полосу» стоила бы больше, чем экономила.
+        self.pointer.draw(back, dy);
     }
 
-    /// Вывести часть поверхности слоя, попадающую в `rect` (координаты экрана).
-    fn blit(&self, surface: &Surface, placed: Rect, rect: Rect) {
-        let src = rect.translate(-placed.x, -placed.y);
-        self.screen.blit(surface, (rect.x, rect.y), src);
+    /// Положить в полосу ту часть слоя, которая в неё попадает.
+    fn stack(&self, back: &mut Surface, surface: &Surface, placed: Rect, band: Rect, dy: i32) {
+        let overlap = placed.intersect(&band);
+        if overlap.is_empty() {
+            return;
+        }
+        let src = overlap.translate(-placed.x, -placed.y);
+        back.blit_from(surface, (overlap.x, overlap.y + dy), src);
     }
 
     /// Фон рабочего стола: вертикальный градиент и точки разметки.
-    fn draw_background(&self, rect: Rect) {
+    fn draw_background(&self, back: &mut Surface, rect: Rect, dy: i32) {
         let height = self.screen.height().max(1);
         for y in rect.y..rect.bottom() {
             if y < 0 {
@@ -871,10 +940,12 @@ impl Compositor {
             }
             // Вес смешивания — доля пройденной высоты экрана. Считается от
             // экрана, а не от прямоугольника: иначе каждый кусок фона имел бы
-            // собственный градиент, и границы кусков были бы видны.
+            // собственный градиент, и границы кусков были бы видны. С полосами
+            // это стало не рассуждением, а условием — полос на экране до
+            // десятка.
             let weight = ((y as u32).min(height - 1) * 255 / height) as u8;
             let color = theme::DESKTOP_TOP.mix(theme::DESKTOP_BOTTOM, weight);
-            self.screen.fill(Rect::new(rect.x, y, rect.w, 1), color);
+            back.fill(Rect::new(rect.x, y + dy, rect.w, 1), color);
         }
 
         // Разметка: редкая сетка точек. Она даёт глазу опору — на однородной
@@ -885,8 +956,7 @@ impl Compositor {
         while y < rect.bottom() {
             let mut x = first_x;
             while x < rect.right() {
-                self.screen
-                    .fill(Rect::new(x, y, DOT_SIZE, DOT_SIZE), theme::DESKTOP_DOT);
+                back.fill(Rect::new(x, y + dy, DOT_SIZE, DOT_SIZE), theme::DESKTOP_DOT);
                 x += DOT_STEP as i32;
             }
             y += DOT_STEP as i32;

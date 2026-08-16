@@ -28,7 +28,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use mini_ui::text::{self};
-use mini_ui::{Color, Rect, Screen};
+use mini_ui::{Color, Rect, Surface};
 
 use super::theme;
 use super::window::App;
@@ -251,32 +251,32 @@ impl Icons {
         damage
     }
 
-    /// Нарисовать значки, попадающие в `rect`.
+    /// Нарисовать значки, попадающие в полосу кадра.
     ///
-    /// Рисует прямо на экран, между фоном и окнами: значок — часть стола, и
-    /// окно, наехавшее на него, обязано его закрывать.
-    pub fn draw(&self, screen: &Screen, rect: Rect) {
+    /// Значок — часть стола: он ложится в буфер между фоном и окнами, и окно,
+    /// наехавшее на него, перекрывает его само. Обрезать себя значку больше не
+    /// нужно — этим занимается порядок слоёв. Пока слои шли прямо на экран,
+    /// обрезка была обязательной: нарисованный целиком ради задетого края,
+    /// значок ложился поверх закрывающего его окна.
+    pub fn draw(&self, back: &mut Surface, band: Rect, dy: i32) {
         for index in 0..self.items.len() {
             let cell = self.cell(index);
-            if cell.intersect(&rect).is_empty() {
+            if cell.intersect(&band).is_empty() {
                 continue;
             }
             let item = &self.items[index];
-            self.draw_one(screen, cell, rect, item, self.selected == Some(index));
+            self.draw_one(back, cell, dy, item, self.selected == Some(index));
         }
     }
 
-    /// Нарисовать один значок, не выходя за `clip`.
-    ///
-    /// Обрезка обязательна: значок рисуется поверх фона, а собирается экран
-    /// прямоугольниками изменений. Нарисованный целиком ради задетого края, он
-    /// лёг бы поверх окна, которое его закрывает.
-    fn draw_one(&self, screen: &Screen, cell: Rect, clip: Rect, item: &Item, selected: bool) {
-        let paint = |rect: Rect, color: Color| {
-            let visible = rect.intersect(&clip);
-            if !visible.is_empty() {
-                screen.fill(visible, color);
-            }
+    /// Нарисовать один значок в полосе кадра.
+    fn draw_one(&self, back: &mut Surface, cell: Rect, dy: i32, item: &Item, selected: bool) {
+        // Всё рисование идёт в координатах экрана, а в полосу переводится одним
+        // сдвигом здесь: две системы координат внутри рисующего кода — это две
+        // возможности перепутать, и обе выглядят как значок, уехавший на
+        // полполосы.
+        let mut paint = |rect: Rect, color: Color| {
+            back.fill(rect.translate(0, dy), color);
         };
         let scale = self.scale;
         let art = ART * scale;
@@ -335,14 +335,14 @@ impl Icons {
                     ),
                     Color::rgb(0x06, 0x10, 0x18),
                 );
-                text::draw_text_on_screen(
-                    screen,
-                    (art_x + 5 * scale as i32) as u32,
-                    (art_y + 11 * scale as i32) as u32,
+                text::draw_text_at(
+                    back,
+                    art_x + 5 * scale as i32,
+                    art_y + 11 * scale as i32 + dy,
                     ">_",
                     scale,
                     theme::DIRECTORY,
-                    clip,
+                    None,
                 );
             }
             // Шестерёнка: круг из четырёх зубцов вокруг квадрата. На такой
@@ -457,14 +457,14 @@ impl Icons {
                     ),
                     theme::WINDOW_BG,
                 );
-                text::draw_text_on_screen(
-                    screen,
-                    (art_x + (art / 2) as i32 - (text::GLYPH_W * scale / 2) as i32) as u32,
-                    (art_y + (art / 2) as i32 - (text::GLYPH_H * scale / 2) as i32) as u32,
+                text::draw_text_at(
+                    back,
+                    art_x + (art / 2) as i32 - (text::GLYPH_W * scale / 2) as i32,
+                    art_y + (art / 2) as i32 - (text::GLYPH_H * scale / 2) as i32 + dy,
                     "i",
                     scale,
                     theme::TEXT,
-                    clip,
+                    None,
                 );
             }
         }
@@ -477,14 +477,14 @@ impl Icons {
         let text_w = text::width_of(&label, scale);
         let text_x = cell.x + ((cell.w.saturating_sub(text_w)) / 2) as i32;
         let text_y = art_y + (ART * scale + 4 * scale) as i32;
-        text::draw_text_on_screen(
-            screen,
-            text_x.max(cell.x) as u32,
-            text_y as u32,
+        text::draw_text_at(
+            back,
+            text_x.max(cell.x),
+            text_y + dy,
             &label,
             scale,
             theme::TEXT,
-            clip,
+            None,
         );
     }
 }

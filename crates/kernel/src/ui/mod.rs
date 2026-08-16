@@ -101,7 +101,12 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
     };
 
     let scale = theme::scale_for(screen.width());
-    let mut desktop = Compositor::new(screen, scale);
+    // Буфер кадра — условие работы стола, а не украшение: без него собирать
+    // картинку негде. Не хватило памяти — система работает в серийной линии,
+    // ровно как на машине без фреймбуфера.
+    let Some(mut desktop) = Compositor::new(screen, scale) else {
+        return false;
+    };
 
     // Окно оболочки обязательно, остальные — нет: без второго окна система
     // работает, поэтому отказ выделения памяти под него не повод отказываться

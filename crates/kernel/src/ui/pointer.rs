@@ -125,14 +125,18 @@ impl Pointer {
         true
     }
 
-    /// Нарисовать курсор на экране.
-    pub fn draw(&self, screen: &mini_ui::Screen) {
+    /// Нарисовать курсор в собираемой полосе кадра.
+    ///
+    /// `dy` — сдвиг координат экрана к координатам полосы. Курсор рисуется в
+    /// каждой полосе, которую задевает, и обрезается сам: маска ставит точки
+    /// поштучно, а поверхность отбрасывает то, что вышло за её края.
+    pub fn draw(&self, surface: &mut mini_ui::Surface, dy: i32) {
         if !self.visible {
             return;
         }
         // Обводка первой, заливка поверх: маски не пересекаются, но порядок
         // задаёт, что окажется сверху при округлении координат.
-        screen.draw_bitmap((self.x, self.y), &OUTLINE, WIDTH, OUTLINE_COLOR);
-        screen.draw_bitmap((self.x, self.y), &FILL, WIDTH, FILL_COLOR);
+        surface.draw_bitmap((self.x, self.y + dy), &OUTLINE, WIDTH, OUTLINE_COLOR);
+        surface.draw_bitmap((self.x, self.y + dy), &FILL, WIDTH, FILL_COLOR);
     }
 }

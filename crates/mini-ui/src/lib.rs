@@ -94,6 +94,27 @@ impl Color {
         }
     }
 
+    /// Разобрать упакованный пиксель обратно в цвет.
+    ///
+    /// Обратна [`Color::pixel`] и нужна ровно одному: сглаживанию шрифта.
+    /// Надпись, нарисованная без фона (заголовок окна, подпись значка),
+    /// смешивается с тем, что под ней, — а узнать это «что» можно только
+    /// прочитав точку. Поверхность читать можно; экран — нет, и поэтому
+    /// сглаживание работает только там, где рисуют в память.
+    #[must_use]
+    pub fn from_pixel(pixel: u32) -> Self {
+        let (a, b, c) = (
+            (pixel & 0xFF) as u8,
+            ((pixel >> 8) & 0xFF) as u8,
+            ((pixel >> 16) & 0xFF) as u8,
+        );
+        match FORMAT.load(Ordering::Acquire) {
+            FORMAT_RGB => Self { r: a, g: b, b: c },
+            FORMAT_BGR => Self { r: c, g: b, b: a },
+            _ => Self { r: 0, g: 0, b: 0 },
+        }
+    }
+
     /// Смешать два цвета в заданной пропорции: `weight = 0` — целиком `self`,
     /// `255` — целиком `other`.
     ///
@@ -219,6 +240,15 @@ pub struct Surface {
 }
 
 impl Surface {
+    /// Поверхность без единой точки.
+    ///
+    /// Нужна одному: композитор вынимает буфер кадра из себя на время сборки,
+    /// потому что иначе он занят изменяемой ссылкой, пока читаются все
+    /// остальные слои. Место, откуда его вынули, обязано чем-то быть заполнено,
+    /// и пустая поверхность дешевле `Option`, который пришлось бы разворачивать
+    /// на каждом обращении.
+    pub const EMPTY: Self = Self { pixels: Vec::new(), width: 0, height: 0 };
+
     /// Создать поверхность, залитую цветом.
     ///
     /// Возвращает `None`, если памяти не хватило: поверхность размером с экран —
@@ -260,6 +290,73 @@ impl Surface {
     pub fn row(&self, y: u32) -> &[u32] {
         let start = (y as usize) * (self.width as usize);
         &self.pixels[start..start + self.width as usize]
+    }
+
+    /// Прочитать пиксель. За пределами поверхности — ноль.
+    ///
+    /// Поверхность живёт в обычной памяти, и это единственная причина, по
+    /// которой чтение здесь вообще есть: у экрана такого метода нет и быть не
+    /// может — чтение write-combining памяти сбрасывает буфер записи.
+    #[must_use]
+    pub fn get(&self, x: u32, y: u32) -> u32 {
+        if x >= self.width || y >= self.height {
+            return 0;
+        }
+        self.pixels[(y as usize) * (self.width as usize) + (x as usize)]
+    }
+
+    /// Вывести часть другой поверхности в эту.
+    ///
+    /// То же, что [`Screen::blit`], но между двумя кусками обычной памяти:
+    /// нужно сборке кадра, которая складывает слои в буфер, а не сразу на
+    /// экран. Обрезка по обеим границам — здесь, вызывающему ею заниматься не
+    /// нужно.
+    pub fn blit_from(&mut self, source: &Self, dst: (i32, i32), src_rect: Rect) {
+        let src = src_rect.intersect(&source.bounds());
+        if src.is_empty() {
+            return;
+        }
+        let placed = Rect::new(dst.0, dst.1, src.w, src.h);
+        let visible = placed.intersect(&self.bounds());
+        if visible.is_empty() {
+            return;
+        }
+        let skip_x = (visible.x - placed.x) as u32;
+        let skip_y = (visible.y - placed.y) as u32;
+        let stride = self.width as usize;
+        for row in 0..visible.h {
+            let line = source.row(src.y as u32 + skip_y + row);
+            let from = (src.x as u32 + skip_x) as usize;
+            let slice = &line[from..from + visible.w as usize];
+            let start = ((visible.y as u32 + row) as usize) * stride + visible.x as usize;
+            self.pixels[start..start + slice.len()].copy_from_slice(slice);
+        }
+    }
+
+    /// Нарисовать однобитную картинку: точка ставится там, где в маске единица.
+    ///
+    /// Тот же формат маски, что у [`Screen::draw_bitmap`], и заведён он ради
+    /// того же — указателя мыши, который обязан пропускать сквозь себя то, что
+    /// под ним.
+    pub fn draw_bitmap(&mut self, at: (i32, i32), rows: &[u16], width: u32, color: Color) {
+        let width = width.min(16);
+        let pixel = color.pixel();
+        for (row, bits) in rows.iter().copied().enumerate() {
+            let y = at.1 + row as i32;
+            if y < 0 {
+                continue;
+            }
+            for column in 0..width {
+                if bits & (1 << (width - 1 - column)) == 0 {
+                    continue;
+                }
+                let x = at.0 + column as i32;
+                if x < 0 {
+                    continue;
+                }
+                self.put(x as u32, y as u32, pixel);
+            }
+        }
     }
 
     /// Поставить пиксель. Координаты за пределами поверхности игнорируются:
