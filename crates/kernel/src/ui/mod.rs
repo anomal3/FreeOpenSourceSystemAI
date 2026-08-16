@@ -84,20 +84,7 @@ static DESKTOP: SpinLock<Option<Compositor>> = SpinLock::new(None);
 /// работы, и класть в него состояние, которое нужно **между** двумя вызовами,
 /// значит гадать, тот ли это стол.
 static LAST_ICON_CLICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static LAST_ICON: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(u8::MAX);
-
-/// Номер программы для сравнения «тот же ли это значок».
-const fn icon_key(app: App) -> u8 {
-    match app {
-        App::Terminal => 0,
-        App::System => 1,
-        App::Files => 2,
-        App::About => 3,
-        App::Settings => 4,
-        App::Shutdown => 5,
-        App::Restart => 6,
-    }
-}
+static LAST_ICON: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
 // ---------------------------------------------------------------------------
 // Запуск
@@ -144,6 +131,7 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
     for (app, focused) in desktop.buttons() {
         log_window(&desktop, app, focused);
     }
+    log_icons(&desktop);
 
     // Размер сетки запоминается один раз: окна не меняют размера, а спрашивают
     // его программы — в том числе тогда, когда стол занят перерисовкой.
@@ -495,6 +483,15 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         return route(desktop, event, status);
     }
 
+    // Меню стола выше меню запуска и выше сочетаний оконного менеджера: пока в
+    // нём набирают имя, Ctrl+W и Tab означают буквы этого имени, а не действия
+    // над окнами.
+    if desktop.context_open() {
+        if handle_context_key(desktop, event, status) {
+            return None;
+        }
+    }
+
     if desktop.menu_open() {
         handle_menu(desktop, event.code, status);
         return None;
@@ -590,8 +587,36 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         if desktop.context_open() {
             desktop.close_context();
         } else if desktop.window_at(x, y).is_none() && desktop.panel_at(x, y).is_none() {
-            desktop.open_context(x, y);
-            kprintln!("  desktop     : context menu at {x},{y}");
+            // Пункты зависят от того, во что целились. «Удалить», предложенное
+            // тогда, когда ничего не выбрано, относилось бы неизвестно к чему —
+            // а на столе это означало бы удалённый наугад файл.
+            let (items, what) = match desktop.icon_at(x, y) {
+                Some(index) => {
+                    desktop.select_icon(Some(index));
+                    match desktop.icon_kind(index) {
+                        Some(icons::Kind::App(_)) => (&context::Action::ON_APP[..], "icon"),
+                        Some(_) => (&context::Action::ON_ENTRY[..], "entry"),
+                        None => (&context::Action::ON_DESKTOP[..], "desktop"),
+                    }
+                }
+                None => {
+                    desktop.select_icon(None);
+                    (&context::Action::ON_DESKTOP[..], "desktop")
+                }
+            };
+            desktop.open_context(x, y, items);
+            // Печатается **место, куда меню встало**, а не точка щелчка: у
+            // края экрана оно сдвигается, чтобы не выехать, и стенд, целящийся
+            // по точке щелчка, попадал бы мимо пунктов.
+            if let Some(rect) = desktop.context_rect() {
+                kprintln!(
+                    "  desktop     : context menu at {},{} {}x{} for {what}",
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    rect.h
+                );
+            }
         }
     }
     if event.released(Buttons::LEFT) {
@@ -623,8 +648,19 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
 fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     // 0. Меню стола — оно поверх всего, включая меню запуска.
     if desktop.context_open() {
+        // Пока в меню набирают имя или отвечают на вопрос об удалении, щелчок
+        // внутрь него не пункт: пунктов там сейчас не нарисовано. Щелчок мимо
+        // — отказ, как и Esc.
+        if desktop.context_editing() {
+            if !desktop.context_contains(x, y) {
+                desktop.close_context();
+                kprintln!("  desktop     : context menu closed");
+            }
+            return;
+        }
         match desktop.context_action_at(x, y) {
             Some(action) => {
+                desktop.context_select(action);
                 context_action(desktop, action, status);
                 return;
             }
@@ -690,21 +726,25 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     }
 
     // 3. Значки на столе — ниже окон, но выше фона.
-    if let Some(app) = desktop.icon_at(x, y) {
-        desktop.select_icon(Some(app));
+    if let Some(index) = desktop.icon_at(x, y) {
+        desktop.select_icon(Some(index));
         // Второй щелчок по тому же значку в пределах [`DOUBLE_CLICK_MS`]
         // открывает его. Порог во времени, а не «щелчок с Shift» и не
         // «одиночный открывает»: так это работает у всех, кто видел стол.
         let now = crate::time::uptime_ms();
         let last = LAST_ICON_CLICK.swap(now, core::sync::atomic::Ordering::Relaxed);
-        let same = LAST_ICON.swap(icon_key(app), core::sync::atomic::Ordering::Relaxed)
-            == icon_key(app);
+        let key = index as u32;
+        let same = LAST_ICON.swap(key, core::sync::atomic::Ordering::Relaxed) == key;
         if same && now.saturating_sub(last) <= DOUBLE_CLICK_MS {
-            launch(desktop, app);
+            open_icon(desktop, index);
             desktop.refresh_panel(status);
         }
         return;
     }
+    // Щелчок по пустому столу снимает выделение: выбранным обязано оставаться
+    // то, во что человек целился последним, а не то, что он выбрал минуту назад
+    // и уже забыл.
+    desktop.select_icon(None);
 
     // 4. Окна.
     if let Some((index, hit)) = desktop.window_at(x, y) {
@@ -904,6 +944,37 @@ fn launch(desktop: &mut Compositor, app: App) {
     }
 }
 
+/// Открыть значок: системный — окном программы, файл и каталог — менеджером.
+///
+/// Отдельная функция, а не ветка внутри разбора щелчка, потому что открывают
+/// значок двумя дорогами — двойным щелчком и пунктом «Open», — и разошедшиеся
+/// дороги к одному действию расходятся окончательно в тот день, когда одну из
+/// них поправят.
+fn open_icon(desktop: &mut Compositor, index: usize) {
+    match desktop.icon_kind(index) {
+        Some(icons::Kind::App(app)) => launch(desktop, app),
+        Some(kind) => {
+            let Some(path) = desktop.icon_path(index) else {
+                return;
+            };
+            let directory = kind == icons::Kind::Folder;
+            launch(desktop, App::Files);
+            if let Some(window) = desktop.find(App::Files) {
+                window.reveal(&path, directory);
+            }
+            kprintln!("  desktop     : opened '{path}'");
+        }
+        None => {}
+    }
+}
+
+/// Показать в открытом файловом менеджере то, что изменилось на диске.
+fn refresh_files_window(desktop: &mut Compositor) {
+    if let Some(window) = desktop.find(App::Files) {
+        window.refresh_files();
+    }
+}
+
 /// Выполнить пункт меню стола.
 ///
 /// Меню остаётся открытым и показывает ответ: «создал папку» и «отказано в
@@ -911,6 +982,24 @@ fn launch(desktop: &mut Compositor, app: App) {
 /// бы ни того, ни другого.
 fn context_action(desktop: &mut Compositor, action: context::Action, status: &Status) {
     match action {
+        context::Action::Open => {
+            desktop.close_context();
+            if let Some(index) = desktop.icon_selection() {
+                open_icon(desktop, index);
+            }
+            desktop.refresh_panel(status);
+        }
+        // «Переименовать» и «удалить» ничего не делают сразу: первое просит
+        // имя, второе — подтверждения. Действие происходит в ответе на
+        // клавишу, см. [`handle_context_key`].
+        context::Action::Rename => match selected_entry(desktop) {
+            Some((_, label)) => desktop.context_rename(&label),
+            None => desktop.context_note("nothing is selected"),
+        },
+        context::Action::Delete => match selected_entry(desktop) {
+            Some((_, label)) => desktop.context_confirm(&label),
+            None => desktop.context_note("nothing is selected"),
+        },
         context::Action::NewFolder | context::Action::NewTextFile => {
             let directory = action == context::Action::NewFolder;
             match context::create_entry(directory) {
@@ -921,11 +1010,11 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
                         context::desktop_dir()
                     );
                     desktop.context_note(&alloc::format!("created {name}"));
-                    // Открытый файловый менеджер обязан показать созданное:
-                    // иначе «создал» видно только на слово.
-                    if let Some(window) = desktop.find(App::Files) {
-                        window.redraw_content();
-                    }
+                    // Созданное обязано появиться и на столе, и в открытом
+                    // менеджере: иначе «создал» видно только на слово.
+                    desktop.reload_icons();
+                    log_icons(desktop);
+                    refresh_files_window(desktop);
                 }
                 Err(err) => {
                     kprintln!("  desktop     : cannot create: {err}");
@@ -943,10 +1032,115 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         }
         context::Action::Refresh => {
             desktop.close_context();
+            // «Обновить» на рабочем столе — это перечитать каталог, а не только
+            // перерисовать пиксели: файл, созданный оболочкой, иначе появлялся
+            // бы на столе неизвестно когда.
+            desktop.reload_icons();
+            log_icons(desktop);
+            refresh_files_window(desktop);
             desktop.repaint_all();
             kprintln!("  desktop     : repainted");
         }
     }
+}
+
+/// Что выбрано на столе, если это файл или каталог: путь и подпись.
+///
+/// Системный значок сюда не попадает: у него нет пути, а переименовать
+/// «Settings» нечем.
+fn selected_entry(desktop: &Compositor) -> Option<(String, String)> {
+    let index = desktop.icon_selection()?;
+    let path = desktop.icon_path(index)?;
+    let label = desktop.icon_label(index)?;
+    Some((path, label))
+}
+
+/// Разобрать клавишу, пока открыто меню стола.
+///
+/// Возвращает `true`, если клавиша меню понадобилась. `false` означает, что её
+/// разберёт кто-нибудь ещё, — тогда меню остаётся открытым, и это намеренно:
+/// закрывать его на всякую незнакомую клавишу значило бы терять набранное имя
+/// от случайного нажатия.
+fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> bool {
+    match desktop.context_key(event) {
+        context::Reply::Ignored => false,
+        context::Reply::Handled => {
+            desktop.present();
+            true
+        }
+        context::Reply::Close => {
+            desktop.close_context();
+            kprintln!("  desktop     : context menu closed");
+            desktop.present();
+            true
+        }
+        context::Reply::Run(action) => {
+            context_action(desktop, action, status);
+            desktop.refresh_panel(status);
+            desktop.present();
+            true
+        }
+        context::Reply::Rename(name) => {
+            match selected_entry(desktop) {
+                Some((path, _)) => match context::rename_entry(&path, &name) {
+                    Ok(target) => {
+                        let new_name = context::base_name(&target);
+                        kprintln!("  desktop     : renamed '{path}' to '{new_name}'");
+                        desktop.context_note(&alloc::format!("renamed to {new_name}"));
+                        desktop.reload_icons();
+                        // Выделение остаётся на том же файле под новым именем:
+                        // иначе следующий пункт меню — «удалить» — относился бы
+                        // к пустоте, и человек, переименовавший файл и решивший
+                        // его убрать, получил бы «ничего не выбрано».
+                        desktop.select_icon_path(&target);
+                        log_icons(desktop);
+                        refresh_files_window(desktop);
+                    }
+                    Err(err) => {
+                        kprintln!("  desktop     : cannot rename '{path}': {err}");
+                        desktop.context_note(&err);
+                    }
+                },
+                None => desktop.context_note("nothing is selected"),
+            }
+            desktop.present();
+            true
+        }
+        context::Reply::Delete => {
+            match selected_entry(desktop) {
+                Some((path, label)) => match context::delete_entry(&path) {
+                    Ok(()) => {
+                        kprintln!("  desktop     : deleted '{path}'");
+                        desktop.context_note(&alloc::format!("deleted {label}"));
+                        desktop.reload_icons();
+                        log_icons(desktop);
+                        refresh_files_window(desktop);
+                    }
+                    Err(err) => {
+                        kprintln!("  desktop     : cannot delete '{path}': {err}");
+                        desktop.context_note(&err);
+                    }
+                },
+                None => desktop.context_note("nothing is selected"),
+            }
+            desktop.present();
+            true
+        }
+    }
+}
+
+/// Записать в журнал, что сейчас лежит на столе.
+///
+/// Не украшение вывода: содержимое каталога стола видно только глазами, а
+/// снимок экрана доказательством не считается — он показывает последний
+/// нарисованный кадр. Эта строка — единственный способ проверить, что созданный
+/// файл появился на столе, а удалённый исчез.
+fn log_icons(desktop: &Compositor) {
+    let (total, entries) = desktop.icon_counts();
+    kprintln!(
+        "  desktop     : icons {total}, {entries} from {}",
+        context::desktop_dir()
+    );
 }
 
 /// Записать в журнал, какое окно стало активным.

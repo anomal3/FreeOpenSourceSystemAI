@@ -1771,6 +1771,16 @@ pub const ALL: &[Scenario] = &[
             // и «создать папку» действительно создаёт её — в отличие от живого
             // носителя, где хранить нечего. Каталог стола заводится по дороге,
             // вместе с домашним.
+            // Стол начинается пустым, и это проверяется вслух. Прогон,
+            // оборванный посередине, оставил бы на нём свою папку, и все
+            // проверки ниже считали бы значки на один больше — а выглядело бы
+            // это как поломка стола. Убрать её можно так:
+            // `rm /home/roman/Desktop/<имя>` в гостевой оболочке либо новым
+            // прогоном сценария `install`, который пересоздаёт диск.
+            // Строка печатается при запуске стола, то есть **до** приглашения,
+            // которого сценарий дождался выше, — поэтому проверка по всему
+            // журналу, а не ожидание вперёд от курсора.
+            Step::Expect("desktop     : icons 4, 0 from /home/roman/Desktop"),
             // Окна убираются с дороги: меню стола открывается только там, где
             // стол виден, а щелчок по окну — это щелчок по окну.
             Step::Aim(Aim::Minimize("Terminal")),
@@ -1785,11 +1795,69 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::ContextItem(0)),
             Step::Click,
             Step::Await("desktop     : created 'New folder' in /home/roman/Desktop", 15_000),
+            // Созданное обязано появиться **на столе**, а не только на диске:
+            // четыре системных значка плюс один из каталога.
+            Step::Await("desktop     : icons 5, 1 from /home/roman/Desktop", 15_000),
+            Step::Aim(Aim::EmptyBelow),
+            Step::Click,
+            Step::Await("desktop     : context menu closed", 15_000),
+            Step::Wait(2_000),
+            Step::Shot("01-desktop-folder"),
+            // Меню на самом значке: пункты у него другие — открыть,
+            // переименовать, удалить. Значок пятый сверху, то есть первый после
+            // системных.
+            Step::Aim(Aim::Icon(4)),
+            Step::RightClick,
+            Step::Await("desktop     : context menu at", 15_000),
+            Step::Expect("for entry"),
+            Step::Wait(1_500),
+            Step::Shot("02-entry-menu"),
+            // «Переименовать» — второй пункт. Строка приходит заполненной
+            // прежним именем; Ctrl+U стирает её целиком, дальше набирается
+            // новое имя на настоящей клавиатуре.
+            Step::Aim(Aim::ContextItem(1)),
+            Step::Click,
+            Step::Wait(1_500),
+            Step::Shot("03-rename"),
+            Step::Key("ctrl-u"),
+            Step::Type("Reports"),
+            Step::Key("ret"),
+            Step::Await(
+                "desktop     : renamed '/home/roman/Desktop/New folder' to 'Reports'",
+                15_000,
+            ),
+            Step::Await("desktop     : icons 5, 1 from /home/roman/Desktop", 15_000),
+            // Меню закрывается **до** команды оболочке, и это не уборка за
+            // собой: пока оно открыто, оно забирает весь ввод — в том числе
+            // перевод строки, приехавший по серийной линии. Первый прогон
+            // упал ровно на этом: `Enter` от команды `ls` попал в меню и
+            // запустил «переименовать» второй раз.
             Step::Aim(Aim::EmptyBelow),
             Step::Click,
             Step::Await("desktop     : context menu closed", 15_000),
             Step::Line("ls /home/roman/Desktop"),
-            Step::Await("New folder", 15_000),
+            Step::Await("Reports", 15_000),
+            // Удаление спрашивает подтверждения: отменить его нечем, корзины в
+            // системе нет. Отвечает на вопрос клавиша, а не щелчок — пунктов в
+            // меню в этот момент не нарисовано.
+            Step::Aim(Aim::Icon(4)),
+            Step::RightClick,
+            Step::Await("desktop     : context menu at", 15_000),
+            Step::Aim(Aim::ContextItem(2)),
+            Step::Click,
+            Step::Wait(1_500),
+            Step::Shot("04-delete-confirm"),
+            Step::Key("y"),
+            Step::Await("desktop     : deleted '/home/roman/Desktop/Reports'", 15_000),
+            Step::Await("desktop     : icons 4, 0 from /home/roman/Desktop", 15_000),
+            Step::Aim(Aim::EmptyBelow),
+            Step::Click,
+            Step::Await("desktop     : context menu closed", 15_000),
+            // Каталог стола остаётся пустым, и это условие повторяемости:
+            // созданное предыдущим прогоном заняло бы имя «New folder», а
+            // проверки выше считают значки поимённо. Сам каталог остаётся —
+            // его завело создание папки, и это тоже проверка: на живом носителе
+            // он не заводится вовсе.
             Step::Line("ls /"),
             Step::Await("etc/", 15_000),
             Step::Line("cat /etc/system.cfg"),

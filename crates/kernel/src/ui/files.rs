@@ -258,6 +258,40 @@ impl FilesView {
         true
     }
 
+    /// Показать то, что открыли значком со стола.
+    ///
+    /// Каталог открывается сам; файл открывается **в своём каталоге** и сразу на
+    /// просмотре: показать содержимое файла, не показав, где он лежит, значит
+    /// оставить человека без единственного способа выйти из просмотра куда-то,
+    /// кроме корня.
+    pub fn reveal(&mut self, path: &str, directory: bool) {
+        if directory {
+            self.go_to(path.to_string());
+            return;
+        }
+        let (parent, name) = match path.rfind('/') {
+            Some(0) | None => (String::from("/"), path.trim_start_matches('/').to_string()),
+            Some(index) => (path[..index].to_string(), path[index + 1..].to_string()),
+        };
+        if parent != self.path {
+            self.go_to(parent);
+        }
+        if let Some(index) = self.rows.iter().position(|row| row.name == name) {
+            self.selected = index;
+        }
+        self.preview = Some(read_preview(&name, path));
+    }
+
+    /// Перечитать текущий каталог, оставшись в нём.
+    ///
+    /// Нужно тому, кто изменил файл со стороны: созданный, переименованный или
+    /// удалённый файл обязан появиться и исчезнуть в открытом окне, а не
+    /// дожидаться, пока человек уйдёт из каталога и вернётся.
+    pub fn refresh(&mut self) {
+        self.preview = None;
+        self.reload();
+    }
+
     /// Щелчок по окну: координаты внутри области содержимого.
     ///
     /// Кнопки навигации считаются по той же формуле, что и рисуются, — иначе

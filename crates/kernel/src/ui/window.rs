@@ -530,6 +530,22 @@ impl Window {
         self.damage = self.damage.union(&area);
     }
 
+    /// Показать в файловом менеджере то, что открыли значком со стола.
+    pub fn reveal(&mut self, path: &str, directory: bool) {
+        if let Content::Files(view) = &mut self.content {
+            view.reveal(path, directory);
+            self.redraw_content();
+        }
+    }
+
+    /// Перечитать открытый каталог.
+    pub fn refresh_files(&mut self) {
+        if let Content::Files(view) = &mut self.content {
+            view.refresh();
+            self.redraw_content();
+        }
+    }
+
     /// Показать в «Параметрах» раздел экрана.
     ///
     /// Нужно меню стола: пункт «Display settings» обязан открывать окно уже на

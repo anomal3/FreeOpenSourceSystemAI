@@ -29,8 +29,8 @@ use alloc::vec::Vec;
 
 use mini_ui::{Rect, Screen, Surface};
 
-use super::context::ContextMenu;
-use super::icons::Icons;
+use super::context::{Action, ContextMenu, Reply};
+use super::icons::{Icons, Kind};
 use super::panel::{Menu, Panel, PanelHit, Status};
 use super::pointer::Pointer;
 use super::theme;
@@ -109,6 +109,10 @@ impl Compositor {
         );
         let panel_top = compositor.work_bottom();
         compositor.menu = Menu::new(panel_top, scale.min(2));
+        // Длина столбца значков считается от рабочей области, а не от экрана:
+        // ячейка, заехавшая под панель задач, щёлкается панелью, а не значком.
+        compositor.icons.set_area(panel_top);
+        compositor.icons.reload();
         compositor
     }
 
@@ -364,19 +368,67 @@ impl Compositor {
     /// столе, то есть ниже всех окон, и щелчок сквозь окно по значку под ним —
     /// это ровно та ошибка, которую пользователь заметит первой.
     #[must_use]
-    pub fn icon_at(&self, x: i32, y: i32) -> Option<App> {
+    pub fn icon_at(&self, x: i32, y: i32) -> Option<usize> {
         if self.window_at(x, y).is_some() {
             return None;
         }
         self.icons.at(x, y)
     }
 
+    /// Что за значок стоит на этом месте сетки.
+    #[must_use]
+    pub fn icon_kind(&self, index: usize) -> Option<Kind> {
+        self.icons.item(index).map(|item| item.kind.clone())
+    }
+
+    /// Подпись значка.
+    #[must_use]
+    pub fn icon_label(&self, index: usize) -> Option<alloc::string::String> {
+        self.icons.item(index).map(|item| item.label.clone())
+    }
+
+    /// Путь к тому, что за значком, — только у файлов и каталогов стола.
+    #[must_use]
+    pub fn icon_path(&self, index: usize) -> Option<alloc::string::String> {
+        self.icons.item(index).and_then(|item| item.path.clone())
+    }
+
+    /// Какой значок выбран сейчас.
+    #[must_use]
+    pub fn icon_selection(&self) -> Option<usize> {
+        self.icons.selection()
+    }
+
+    /// Сколько значков на столе и сколько из них — файлы и каталоги.
+    #[must_use]
+    pub fn icon_counts(&self) -> (usize, usize) {
+        self.icons.counts()
+    }
+
+    /// Выделить значок по пути — тем, кто только что переименовал файл.
+    pub fn select_icon_path(&mut self, path: &str) {
+        let index = self.icons.index_of_path(path);
+        self.select_icon(index);
+    }
+
     /// Выделить значок (или снять выделение).
-    pub fn select_icon(&mut self, app: Option<App>) {
-        let damage = self.icons.select(app);
+    pub fn select_icon(&mut self, index: Option<usize>) {
+        let damage = self.icons.select(index);
         if !damage.is_empty() {
             self.mark(damage);
         }
+    }
+
+    /// Перечитать каталог стола и показать его заново.
+    ///
+    /// Помечается объединение сетки **до** и **после**: удалённый файл
+    /// освобождает ячейку, которую иначе никто не стёр бы, и она осталась бы на
+    /// экране до первой чужой перерисовки.
+    pub fn reload_icons(&mut self) {
+        let before = self.icons.bounds();
+        self.icons.reload();
+        let after = self.icons.bounds();
+        self.mark(before.union(&after));
     }
 
     /// Попадание в панель задач.
@@ -620,11 +672,11 @@ impl Compositor {
     }
 
     /// Меню стола: открыть в точке, закрыть, спросить пункт под указателем.
-    pub fn open_context(&mut self, x: i32, y: i32) {
+    pub fn open_context(&mut self, x: i32, y: i32, items: &[Action]) {
         let screen = (self.screen.width(), self.screen.height());
         let bottom = self.work_bottom();
         if let Some(menu) = self.context.as_mut() {
-            menu.open_at(x, y, screen, bottom);
+            menu.open_at(x, y, screen, bottom, items);
         }
     }
 
@@ -632,8 +684,59 @@ impl Compositor {
         self.context.as_ref().is_some_and(ContextMenu::is_open)
     }
 
-    pub fn context_action_at(&self, x: i32, y: i32) -> Option<super::context::Action> {
+    /// Занято ли меню набором имени или вопросом об удалении.
+    pub fn context_editing(&self) -> bool {
+        self.context
+            .as_ref()
+            .is_some_and(|menu| menu.is_open() && menu.is_editing())
+    }
+
+    /// Где стоит меню стола — если оно открыто.
+    pub fn context_rect(&self) -> Option<Rect> {
+        self.context
+            .as_ref()
+            .filter(|menu| menu.is_open())
+            .map(|menu| menu.rect)
+    }
+
+    /// Накрывает ли меню стола эту точку.
+    pub fn context_contains(&self, x: i32, y: i32) -> bool {
+        self.context
+            .as_ref()
+            .is_some_and(|menu| menu.is_open() && menu.rect.contains(x, y))
+    }
+
+    pub fn context_action_at(&self, x: i32, y: i32) -> Option<Action> {
         self.context.as_ref().and_then(|menu| menu.action_at(x, y))
+    }
+
+    /// Отдать клавишу меню стола.
+    pub fn context_key(&mut self, event: crate::input::KeyEvent) -> Reply {
+        match self.context.as_mut() {
+            Some(menu) => menu.handle_key(event),
+            None => Reply::Ignored,
+        }
+    }
+
+    /// Перевести меню в набор нового имени.
+    pub fn context_rename(&mut self, name: &str) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.start_rename(name);
+        }
+    }
+
+    /// Спросить в меню, точно ли удалять.
+    pub fn context_confirm(&mut self, name: &str) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.start_confirm(name);
+        }
+    }
+
+    /// Подсветить в меню пункт, по которому щёлкнули.
+    pub fn context_select(&mut self, action: Action) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.select_action(action);
+        }
     }
 
     /// Показать в меню ответ действия — оно остаётся открытым.
