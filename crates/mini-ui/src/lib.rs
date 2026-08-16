@@ -389,14 +389,20 @@ impl Screen {
         let pixel = color.pixel();
         for y in rect.y..rect.bottom() {
             let start = (y as usize) * (self.stride as usize) + rect.x as usize;
-            for x in 0..rect.w as usize {
-                // SAFETY: `start + x` не выходит за stride * height пикселей —
-                // это проверено в `new` против заявленного `fb.size`, а
-                // прямоугольник обрезан по границам экрана. `write_volatile`
-                // обязателен: обычную запись компилятор вправе выбросить,
-                // решив, что результат никто не читает.
-                unsafe { self.base.add(start + x).write_volatile(pixel) };
-            }
+            // Строка целиком, а не пиксель за пикселем. Разница не
+            // косметическая: `write_volatile` компилятор не вправе ни объединить,
+            // ни векторизовать, и заливка шла по четыре байта за раз. На экране
+            // 1920×1080 это превращало обычное переключение окон в четверть
+            // секунды работы — за это время терялось следующее нажатие клавиши,
+            // потому что клавиатуру некому было опросить.
+            //
+            // SAFETY: `start + rect.w` не выходит за `stride * height` пикселей —
+            // это проверено в `new` против заявленного `fb.size`, а
+            // прямоугольник обрезан по границам экрана. Ссылка живёт только
+            // внутри этой итерации, и другой ссылки на те же пиксели нет:
+            // фреймбуфер трогает один рабочий стол из одной задачи.
+            let row = unsafe { core::slice::from_raw_parts_mut(self.base.add(start), rect.w as usize) };
+            row.fill(pixel);
         }
     }
 
@@ -465,11 +471,12 @@ impl Screen {
             let slice = &source[from..from + visible.w as usize];
             let start =
                 ((visible.y as u32 + row) as usize) * (self.stride as usize) + visible.x as usize;
-            for (offset, pixel) in slice.iter().enumerate() {
-                // SAFETY: см. `fill`; и строка поверхности, и место на экране
-                // обрезаны по своим границам выше.
-                unsafe { self.base.add(start + offset).write_volatile(*pixel) };
-            }
+            // SAFETY: см. `fill`; и строка поверхности, и место на экране
+            // обрезаны по своим границам выше, а копия идёт строкой — по той же
+            // причине, по которой залив­ка перестала идти по пикселю.
+            let target =
+                unsafe { core::slice::from_raw_parts_mut(self.base.add(start), slice.len()) };
+            target.copy_from_slice(slice);
         }
     }
 }
