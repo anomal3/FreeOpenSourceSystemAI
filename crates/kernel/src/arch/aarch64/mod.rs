@@ -215,6 +215,7 @@ const REG_CR: usize = 0x30; // Control
 const REG_IMSC: usize = 0x38; // Interrupt Mask Set/Clear
 const REG_ICR: usize = 0x44; // Interrupt Clear
 
+const DR_OVERRUN: u32 = 1 << 11; // байт пришёл в полное FIFO и потерян
 const FR_RXFE: u32 = 1 << 4; // приёмное FIFO пусто
 const FR_TXFF: u32 = 1 << 5; // передающее FIFO заполнено
 
@@ -393,7 +394,14 @@ pub fn drain_uart_rx() {
         // SAFETY: FIFO не пусто; чтение `DR` извлекает байт — побочный эффект
         // ожидаемый и необходимый. Старшие биты слова несут признаки ошибок
         // кадрирования и чётности; данные — только младшие восемь.
-        let byte = unsafe { uart.read(REG_DR) } as u8;
+        let word = unsafe { uart.read(REG_DR) };
+        // Бит 11 того же слова — переполнение приёмника: байт пришёл в полное
+        // FIFO и потерян. Считаем по той же причине, что и на x86-64: молча
+        // потерянный байт ввода выглядит как «система не приняла команду».
+        if word & DR_OVERRUN != 0 {
+            crate::input::ascii::note_overrun();
+        }
+        let byte = word as u8;
         crate::input::ascii::feed(byte);
     }
     // Флаги снимаются после вычитывания. `RXRIS` опускается и сам, когда FIFO
