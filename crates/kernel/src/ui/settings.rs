@@ -84,10 +84,58 @@ enum Line {
     Heading(String),
     /// Пара «название — значение»: то, что можно только прочитать.
     Fact(String, String),
-    /// Пункт, по которому можно нажать.
-    Action(String, String),
+    /// Пункт, по которому можно нажать, вместе с тем, что он делает.
+    ///
+    /// Действие лежит в самой строке, а не выводится из её номера. Номер годился,
+    /// пока пункты были перечислением разрешений экрана; список установленных
+    /// пакетов меняется от машины к машине, и «пятый пункт означает удалить
+    /// пятый пакет» — это два места, обязанные считать одинаково, а разойдутся
+    /// они в первый же день.
+    Action(Deed, String, String),
     /// Пустая строка.
     Gap,
+}
+
+/// Что делает пункт, по которому нажали.
+#[derive(Clone, PartialEq, Eq)]
+enum Deed {
+    /// Попросить у прошивки этот режим экрана.
+    Mode(u32, u32),
+    /// Запустить `sysupdate`.
+    CheckUpdates,
+    /// Показать, что можно поставить.
+    ChooseFile,
+    /// Поставить пакет из этого файла.
+    Install(String),
+    /// Спросить, точно ли удалять этот пакет.
+    AskRemove(String),
+    /// Удалить его.
+    Remove(String),
+    /// Вернуться к списку установленного.
+    BackToList,
+}
+
+/// Чем занят раздел «Programs».
+///
+/// Установка и удаление — два разговора, а не два нажатия: у первого надо
+/// спросить, какой файл ставить, у второго — точно ли удалять. Оба разговора
+/// идут в той же правой половине окна, потому что отдельное окно ради двух
+/// вопросов — это ещё один вид окна, который придётся объяснять.
+#[derive(Clone, PartialEq, Eq)]
+enum Programs {
+    /// Список установленного.
+    List,
+    /// Выбор файла для установки — вместе с тем, что нашлось.
+    ///
+    /// Список найденного лежит здесь, а не пересчитывается при рисовании, и это
+    /// не кеш ради скорости. Строки правой половины считаются заново на каждое
+    /// нажатие — и на разбор клавиши, и на перерисовку, — а поиск файлов
+    /// пакетов означает обход трёх каталогов и чтение заголовка у каждого
+    /// найденного. Внутри обработчика события ввода это те самые сотни
+    /// миллисекунд, за которые теряется следующая клавиша.
+    Choose(Vec<String>),
+    /// Вопрос «точно удалить этот пакет?».
+    Confirm(String),
 }
 
 pub struct SettingsView {
@@ -100,12 +148,21 @@ pub struct SettingsView {
     screen: (u32, u32),
     /// Фокус на левом списке разделов, а не на пунктах справа.
     on_sections: bool,
+    /// Чем занят раздел «Programs».
+    programs: Programs,
 }
 
 impl SettingsView {
     #[must_use]
     pub fn new(screen: (u32, u32)) -> Self {
-        Self { section: 0, action: 0, message: None, screen, on_sections: true }
+        Self {
+            section: 0,
+            action: 0,
+            message: None,
+            screen,
+            on_sections: true,
+            programs: Programs::List,
+        }
     }
 
     /// Перейти на раздел экрана — им открывается меню стола.
@@ -170,7 +227,11 @@ impl SettingsView {
         lines.push(Line::Gap);
         for (width, height) in MODES {
             let mark = if (width, height) == self.screen { "current" } else { "" };
-            lines.push(Line::Action(format!("{width} x {height}"), mark.to_string()));
+            lines.push(Line::Action(
+                Deed::Mode(width, height),
+                format!("{width} x {height}"),
+                mark.to_string(),
+            ));
         }
         lines.push(Line::Gap);
         lines.push(Line::Heading("Applied at next boot".to_string()));
@@ -178,6 +239,14 @@ impl SettingsView {
     }
 
     fn programs_lines(&self) -> Vec<Line> {
+        match &self.programs {
+            Programs::List => self.programs_list(),
+            Programs::Choose(found) => Self::programs_choose(found),
+            Programs::Confirm(name) => Self::programs_confirm(name),
+        }
+    }
+
+    fn programs_list(&self) -> Vec<Line> {
         let mut lines = Vec::new();
         lines.push(Line::Heading("Installed packages".to_string()));
         lines.push(Line::Gap);
@@ -185,18 +254,83 @@ impl SettingsView {
             Ok(names) if names.is_empty() => {
                 lines.push(Line::Fact(
                     "None".to_string(),
-                    "install with: pkg add <file>".to_string(),
+                    "nothing is installed yet".to_string(),
                 ));
             }
             Ok(names) => {
                 for name in names {
-                    lines.push(Line::Fact(name, "/opt".to_string()));
+                    lines.push(Line::Action(
+                        Deed::AskRemove(name.clone()),
+                        name,
+                        "remove".to_string(),
+                    ));
                 }
             }
+            // Отказ реестра — не пустой список: «пакетов нет» и «спросить не
+            // удалось» человек обязан различать, иначе он поставит второй раз
+            // то, что уже стоит.
             Err(err) => lines.push(Line::Fact("Registry".to_string(), err)),
         }
         lines.push(Line::Gap);
-        lines.push(Line::Heading("pkg add / pkg remove".to_string()));
+        lines.push(Line::Action(
+            Deed::ChooseFile,
+            "Install a package".to_string(),
+            // Без пометки: она встаёт за самим пунктом, а на пункт такой длины
+            // от неё остаётся один знак обрезки — то есть ровно ничего, кроме
+            // мусора справа.
+            String::new(),
+        ));
+        lines.push(Line::Gap);
+        lines.push(Line::Heading("Packages live in /opt".to_string()));
+        lines
+    }
+
+    fn programs_choose(found: &[String]) -> Vec<Line> {
+        let mut lines = Vec::new();
+        lines.push(Line::Heading("Install a package".to_string()));
+        lines.push(Line::Gap);
+        if found.is_empty() {
+            lines.push(Line::Fact(
+                "No files".to_string(),
+                "looked in /media and home".to_string(),
+            ));
+        }
+        for path in found {
+            let name = short_name(path);
+            lines.push(Line::Action(
+                Deed::Install(path.clone()),
+                name,
+                String::new(),
+            ));
+        }
+        lines.push(Line::Gap);
+        lines.push(Line::Action(
+            Deed::BackToList,
+            "Back".to_string(),
+            String::new(),
+        ));
+        lines
+    }
+
+    fn programs_confirm(name: &str) -> Vec<Line> {
+        let mut lines = Vec::new();
+        lines.push(Line::Heading(format!("Remove {name}?")));
+        lines.push(Line::Gap);
+        lines.push(Line::Fact(
+            "Files".to_string(),
+            format!("/opt/{name} goes away"),
+        ));
+        lines.push(Line::Gap);
+        lines.push(Line::Action(
+            Deed::Remove(name.to_string()),
+            "Yes, remove it".to_string(),
+            "runs pkg remove".to_string(),
+        ));
+        lines.push(Line::Action(
+            Deed::BackToList,
+            "No, keep it".to_string(),
+            String::new(),
+        ));
         lines
     }
 
@@ -210,6 +344,7 @@ impl SettingsView {
         }
         lines.push(Line::Gap);
         lines.push(Line::Action(
+            Deed::CheckUpdates,
             "Check for updates".to_string(),
             "runs sysupdate".to_string(),
         ));
@@ -222,7 +357,7 @@ impl SettingsView {
     fn actions(&self) -> usize {
         self.lines()
             .iter()
-            .filter(|line| matches!(line, Line::Action(_, _)))
+            .filter(|line| matches!(line, Line::Action(..)))
             .count()
     }
 
@@ -232,6 +367,7 @@ impl SettingsView {
             KeyCode::Up => {
                 if self.on_sections {
                     self.section = self.section.saturating_sub(1);
+                    self.programs = Programs::List;
                 } else {
                     self.action = self.action.saturating_sub(1);
                 }
@@ -241,6 +377,11 @@ impl SettingsView {
             KeyCode::Down => {
                 if self.on_sections {
                     self.section = (self.section + 1).min(Section::ALL.len() - 1);
+                    // Уход из раздела возвращает его в исходное состояние:
+                    // вопрос «точно удалить?», оставленный без ответа, при
+                    // возврате означал бы вопрос о том, чего человек уже не
+                    // помнит.
+                    self.programs = Programs::List;
                 } else {
                     self.action = (self.action + 1).min(self.actions().saturating_sub(1));
                 }
@@ -289,6 +430,7 @@ impl SettingsView {
                 self.on_sections = true;
                 self.action = 0;
                 self.message = None;
+                self.programs = Programs::List;
                 return true;
             }
             return false;
@@ -299,7 +441,7 @@ impl SettingsView {
         let row = ((y - area.y) / step).max(0) as usize;
         let mut action_index = 0;
         for (index, line) in self.lines().iter().enumerate() {
-            if let Line::Action(_, _) = line {
+            if let Line::Action(..) = line {
                 if index == row {
                     self.on_sections = false;
                     self.action = action_index;
@@ -313,33 +455,67 @@ impl SettingsView {
     }
 
     /// Выполнить выбранный пункт.
+    ///
+    /// Что именно делать, спрашивается у самой строки: список пунктов зависит
+    /// от того, что установлено на этой машине, и вывести действие из номера
+    /// строки означало бы считать список дважды.
     fn activate(&mut self) {
-        match self.current() {
-            Section::Display => {
-                let Some((width, height)) = MODES.get(self.action).copied() else {
-                    return;
-                };
+        let deed = self
+            .lines()
+            .into_iter()
+            .filter_map(|line| match line {
+                Line::Action(deed, _, _) => Some(deed),
+                _ => None,
+            })
+            .nth(self.action);
+        let Some(deed) = deed else {
+            return;
+        };
+        match deed {
+            Deed::Mode(width, height) => {
                 self.message = Some(match crate::slot::request_screen_mode(width, height) {
                     Ok(()) => format!("{width}x{height} will be used from the next start"),
                     Err(err) => format!("cannot save the choice: {err}"),
                 });
             }
-            Section::Updates => {
-                // Окно не качает обновление само и не ждёт его: `sysupdate` —
-                // программа третьего кольца, у неё сеть, TLS и запись в раздел.
-                // Окно только запускает её, а разговаривает она с человеком в
-                // терминале — там же, где отвечала бы, набери он её имя руками.
-                // Ждать её здесь нельзя: этот код работает внутри разбора
-                // события ввода.
-                self.message = Some(
-                    match crate::user::spawn("/bin/sysupdate", crate::user::session::credentials())
-                    {
-                        Ok(id) => alloc::format!("sysupdate started as {id}; see the terminal"),
-                        Err(err) => alloc::format!("cannot start sysupdate: {err}"),
-                    },
-                );
+            // Окно не качает обновление само и не ждёт его: `sysupdate` —
+            // программа третьего кольца, у неё сеть, TLS и запись в раздел.
+            // Окно только запускает её, а разговаривает она с человеком в
+            // терминале — там же, где отвечала бы, набери он её имя руками.
+            // Ждать её здесь нельзя: этот код работает внутри разбора события
+            // ввода. То же самое и ниже, с `pkg`.
+            Deed::CheckUpdates => self.message = Some(run("/bin/sysupdate", "sysupdate")),
+            Deed::ChooseFile => {
+                let found = available();
+                let empty = found.is_empty();
+                self.programs = Programs::Choose(found);
+                self.action = 0;
+                self.message = empty.then(|| {
+                    "no .fpk package was found in /media or in your home".to_string()
+                });
             }
-            _ => {}
+            Deed::Install(path) => {
+                let line = format!("/bin/pkg install {path}");
+                self.message = Some(run(&line, "pkg install"));
+                self.programs = Programs::List;
+                self.action = 0;
+            }
+            Deed::AskRemove(name) => {
+                self.programs = Programs::Confirm(name);
+                self.action = 0;
+                self.message = None;
+            }
+            Deed::Remove(name) => {
+                let line = format!("/bin/pkg remove {name}");
+                self.message = Some(run(&line, "pkg remove"));
+                self.programs = Programs::List;
+                self.action = 0;
+            }
+            Deed::BackToList => {
+                self.programs = Programs::List;
+                self.action = 0;
+                self.message = None;
+            }
         }
     }
 
@@ -436,7 +612,7 @@ impl SettingsView {
                         None,
                     );
                 }
-                Line::Action(name, note) => {
+                Line::Action(_, name, note) => {
                     let chosen = !self.on_sections && action_index == self.action;
                     if chosen {
                         surface.fill(
@@ -545,6 +721,95 @@ fn packages() -> Result<Vec<String>, String> {
         .collect();
     names.sort();
     Ok(names)
+}
+
+/// Запустить программу и рассказать человеку, чем это кончилось.
+///
+/// Окно не ждёт её конца и не может ждать: этот код работает внутри разбора
+/// события ввода, а `pkg` читает файл, распаковывает его и пишет на диск. Всё,
+/// что окно вправе сообщить, — что программа **начала** работу; говорит она
+/// сама, в терминале.
+fn run(line: &str, what: &str) -> String {
+    match crate::user::spawn(line, crate::user::session::credentials()) {
+        Ok(id) => {
+            // В журнал — чтобы снаружи было видно, что программу запустило
+            // **окно**, а не человек в терминале. Без этой строки проверить
+            // кнопку нечем: вывод самой программы одинаков в обоих случаях.
+            crate::kprintln!("  settings    : started '{line}' as {id}");
+            format!("{what} started as {id}; see the terminal")
+        }
+        Err(err) => {
+            crate::kprintln!("  settings    : cannot start '{line}': {err}");
+            format!("cannot start {what}: {err}")
+        }
+    }
+}
+
+/// Файлы пакетов, которые видно с этой машины.
+///
+/// Смотрим в носитель, в домашний каталог и на стол — три места, куда пакет
+/// попадает: с установочного носителя, из загрузки и рукой человека. Обходить
+/// весь корень нельзя: это чтение каждого каталога тома внутри обработчика
+/// события ввода.
+fn available() -> Vec<String> {
+    const MEDIA: &str = "/media";
+    let home = super::context::home_dir();
+    let desktop = super::context::desktop_dir();
+    let mut found = Vec::new();
+    for place in [MEDIA, home.as_str(), desktop.as_str()] {
+        let Some(Ok(entries)) = fs::list(place) else {
+            continue;
+        };
+        let mut names: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| entry.name.ends_with(".fpk"))
+            .map(|entry| entry.name)
+            .collect();
+        names.sort();
+        for name in names {
+            if found.len() == MAX_FILES {
+                return found;
+            }
+            let path = format!("{place}/{name}");
+            if is_package(&path) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Пакет ли это — или образ системы под тем же расширением.
+///
+/// Различать обязательно: в `/media` рядом с пакетами лежат контейнеры
+/// обновления, у них то же расширение и тот же формат, но ставит их не `pkg`, а
+/// `sysupdate`. Предложить образ системы в списке «что установить» значило бы
+/// предложить действие, которое кончится отказом, — и человек решил бы, что
+/// сломан он или файл.
+///
+/// Читается только заголовок: манифест с именем и версией лежит за ним и стоил
+/// бы ещё одного чтения на каждый файл, а этот код работает внутри разбора
+/// события ввода.
+fn is_package(path: &str) -> bool {
+    let Some(Ok((bytes, _))) = fs::read(path, fpk::HEADER_SIZE) else {
+        return false;
+    };
+    matches!(fpk::Header::parse(&bytes), Ok(header) if header.kind == fpk::Kind::Package)
+}
+
+/// Сколько файлов показывается в списке установки.
+///
+/// Предел не косметический: список рисуется в окне, а имена приходят с
+/// носителя. Каталог с сотней файлов означал бы сто строк, из которых видно
+/// восемь, и прокрутки у этого списка нет.
+const MAX_FILES: usize = 8;
+
+/// Имя файла без каталога.
+fn short_name(path: &str) -> String {
+    match path.rfind('/') {
+        Some(index) => path[index + 1..].to_string(),
+        None => path.to_string(),
+    }
 }
 
 /// Серверы обновлений из `update.cfg` — в том порядке, в каком их пробует

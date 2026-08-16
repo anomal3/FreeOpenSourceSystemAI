@@ -537,14 +537,19 @@ fn tail(text: &str, room: usize) -> String {
 /// заранее, значит получить систему, где меню не работает на всех машинах,
 /// поставленных раньше.
 pub fn desktop_dir() -> String {
-    let home = crate::user::session::with_name(|name| {
+    alloc::format!("{}/Desktop", home_dir())
+}
+
+/// Домашний каталог того, кто вошёл, — `/root`, если имени нет.
+#[must_use]
+pub fn home_dir() -> String {
+    crate::user::session::with_name(|name| {
         if name.is_empty() || name == "root" {
             "/root".to_string()
         } else {
             alloc::format!("/home/{name}")
         }
-    });
-    alloc::format!("{home}/Desktop")
+    })
 }
 
 /// Создать в каталоге стола каталог или пустой файл с незанятым именем.

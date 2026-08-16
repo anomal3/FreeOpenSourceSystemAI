@@ -2558,6 +2558,58 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run /bin/pkg remove extra"),
             Step::Await("pkg: removed extra", 30_000),
 
+            // Вторая половина фазы: то же самое кнопками, без единой набранной
+            // команды. Проверяется не `pkg` — он проверен выше, — а то, что
+            // окно «Параметры» действительно его запускает: строка
+            // `settings : started ...` печатается только этим путём.
+            //
+            // Всё клавиатурой: попадание мышью в строку списка зависит от
+            // масштаба шрифта, а он на двух архитектурах разный.
+            Step::Wait(2_000),
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Repeat("down", 2),
+            Step::Key("ret"),
+            Step::Await("desktop     : opened 'Settings'", 15_000),
+            // Третий раздел слева — «Programs»; вправо-вниз по пунктам справа.
+            Step::Repeat("down", 2),
+            Step::Key("ret"),
+            Step::Wait(1_500),
+            Step::Shot("01-programs"),
+            // Единственный пункт пустого списка — «поставить пакет». За ним
+            // список файлов: контейнеры обновления системы в него не попадают,
+            // хотя лежат в том же `/media` и с тем же расширением.
+            Step::Key("ret"),
+            Step::Wait(1_500),
+            Step::Shot("02-choose"),
+            // Первым идёт `extra`, вторым `hello`; ставим второй — первый
+            // требует его и не встал бы.
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Await("settings    : started '/bin/pkg install /media/hello-1.0.fpk'", 15_000),
+            Step::Await("pkg: installed hello 1.0, 2 file(s)", 60_000),
+            // Перечитать список: окно рисует то, что видит, а увидеть новое
+            // оно может только заново пройдясь по реестру.
+            Step::Key("left"),
+            Step::Key("right"),
+            Step::Wait(1_500),
+            Step::Shot("03-installed"),
+            // Теперь удаление — оно спрашивает подтверждения, и это отдельное
+            // нажатие: снести пакет промахом мимо строки нельзя.
+            Step::Key("ret"),
+            Step::Wait(1_500),
+            Step::Shot("04-remove-confirm"),
+            Step::Key("ret"),
+            Step::Await("settings    : started '/bin/pkg remove hello'", 15_000),
+            Step::Await("pkg: removed hello, 2 file(s)", 60_000),
+
+            // Окно закрывается **до** команды оболочке, и это не уборка: ввод
+            // достаётся активному окну, а активно сейчас окно «Параметры».
+            // Строка `exit`, приехавшая по серийной линии, ушла бы в него и
+            // пропала — первый прогон именно так и встал.
+            Step::Key("ctrl-w"),
+            Step::Await("desktop     : closed 'Settings'", 15_000),
+            Step::Wait(2_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
