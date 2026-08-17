@@ -51,6 +51,12 @@ const UART_PRIORITY: u8 = 0xA0;
 /// для поиска I/O APIC. Аргумент присутствует ради единой подписи: ядро вызывает
 /// `arch::input::init(&info)` и не должно знать, кому из архитектур он полезен.
 pub fn init(_info: &BootInfo) -> Sources {
+    // Тачскрин ищется первым и **независимо** от линии: на телефоне порт не
+    // выведен наружу вовсе, и все ветки ниже кончаются ранним возвратом. Найти
+    // указатель после них значило бы не найти его никогда — ровно на той
+    // машине, ради которой он и написан.
+    let mut sources = Sources { keyboard: false, serial: false, mouse: touchscreen() };
+
     // Обе версии годятся: разница между ними — в том, как разрешается прерывание
     // (у v3 приватные живут в redistributor'е), и это уже спрятано внутри
     // `gic::enable_interrupt`. Отказывать здесь по версии значило бы оставить
@@ -62,7 +68,6 @@ pub fn init(_info: &BootInfo) -> Sources {
     // на VirtualBox `INTID 33` — это GPIO, а не порт.
     if crate::serial::absent() {
         kprintln!("  serial in   : no serial port on this machine");
-        let sources = Sources::default();
         crate::input::set_sources(sources);
         return sources;
     }
@@ -74,14 +79,12 @@ pub fn init(_info: &BootInfo) -> Sources {
     // Линия наружу у аппарата всё равно не выведена, так что терять нечего.
     if !super::serial_is_pl011() {
         kprintln!("  serial in   : this port is not PL011; its interrupt number is unknown");
-        let sources = Sources::default();
         crate::input::set_sources(sources);
         return sources;
     }
 
     if !matches!(gic::version(), Some(gic::Version::V2 | gic::Version::V3)) {
         kprintln!("  input       : no usable GIC, the UART interrupt cannot be enabled");
-        let sources = Sources::default();
         crate::input::set_sources(sources);
         return sources;
     }
@@ -107,7 +110,25 @@ pub fn init(_info: &BootInfo) -> Sources {
     // кнопке — нет, и «работает везде» было бы неправдой.
     kprintln!("  power       : no power button here; it arrives through ACPI GED, described in AML");
 
-    let sources = Sources { keyboard: false, serial: true, mouse: false };
+    sources.serial = true;
     crate::input::set_sources(sources);
     sources
+}
+
+/// Найти тачскрин, если машина описана деревом устройств.
+///
+/// На UEFI-машине дерева нет, и искать нечего: шины I²C там не описаны никем, а
+/// перебирать адреса наугад — это писать в чужие регистры.
+fn touchscreen() -> bool {
+    // SAFETY: дерево ещё не переиспользовано — ядро забирает его память только
+    // после того, как прочитает отсюда всё нужное, а ввод поднимается раньше.
+    let Some(fdt) = (unsafe { super::device_tree() }) else {
+        return false;
+    };
+    // SAFETY: таблицы ядра активны, окна шин драйвер отображает сам.
+    let found = unsafe { super::mtk_touch::probe(&fdt) };
+    if !found {
+        kprintln!("  touch       : no touchscreen answered on any i2c bus");
+    }
+    found
 }

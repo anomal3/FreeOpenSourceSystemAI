@@ -23,7 +23,7 @@ mod x86_64;
 pub use x86_64::{
     ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, halt, pci_config_read32,
     pci_config_write32, power_off, reboot, remember_serial, serial_fallback,
-    wait_for_interrupt,
+    spawn_input_services, wait_for_interrupt,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -32,7 +32,7 @@ mod aarch64;
 pub use aarch64::{
     ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, halt, pci_config_read32,
     pci_config_write32, power_off, reboot, remember_serial, serial_fallback,
-    wait_for_interrupt,
+    spawn_input_services, wait_for_interrupt,
 };
 
 /// Вход по договору Linux: дерево устройств в `x0`, MMU выключен.

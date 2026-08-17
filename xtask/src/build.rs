@@ -180,7 +180,51 @@ pub fn build_component(component: Component, arch: Arch, release: bool) -> Resul
     run_cargo(&mut cmd, "build", component, triple)?;
 
     let dir = paths::artifact_dir(triple, release);
-    locate_artifact(&dir, component)
+    let artifact = locate_artifact(&dir, component)?;
+    if component == Component::Kernel {
+        check_relocatable(&artifact)?;
+    }
+    Ok(artifact)
+}
+
+/// Убедиться, что ядро собрано позиционно-независимым.
+///
+/// # Зачем проверять то, что задано в `.cargo/config.toml`
+///
+/// Затем, что рядом живёт **вторая** сборка того же крейта — для телефона, под
+/// фиксированный адрес (`cargo xtask phone --full-kernel`). У неё тот же
+/// триплет и то же имя файла, и стоит собрать её мимо её собственного дерева —
+/// например, руками, задав `RUSTFLAGS`, — как она встанет ровно туда, откуда
+/// загрузчик берёт ядро для ESP.
+///
+/// Дальше происходит вот что: загрузчик читает `ET_EXEC`, слинкованный под
+/// `0x40080000`, и либо отказывается его грузить, либо прыгает в заголовок
+/// arm64. Снаружи это выглядит как «ядро перестало грузиться», и искать причину
+/// будут в ядре. Поймано дважды за один день — второй раз мной же, после того
+/// как первый был вылечен отдельным деревом сборки.
+///
+/// Проверка стоит чтения восемнадцати байт и превращает молчаливую подмену в
+/// строку с объяснением.
+fn check_relocatable(elf: &Path) -> Result<()> {
+    let head = std::fs::read(elf).with_context(|| format!("не читается {}", elf.display()))?;
+    if head.len() < 18 || &head[..4] != b"\x7fELF" {
+        bail!("{} — не ELF", elf.display());
+    }
+    const ET_DYN: u16 = 3;
+    let kind = u16::from_le_bytes([head[16], head[17]]);
+    if kind != ET_DYN {
+        bail!(
+            "{} собран как ET_{}, а не как позиционно-независимый образ.\n\n\
+             Похоже, поверх него легла сборка для телефона: у неё тот же триплет и \
+             то же имя файла.\n\
+             Лечится пересборкой ядра; телефонную собирайте только через \
+             `cargo xtask phone --full-kernel` — она уходит в target/phone и \
+             ничего не подменяет.",
+            elf.display(),
+            if kind == 2 { "EXEC".to_string() } else { kind.to_string() }
+        );
+    }
+    Ok(())
 }
 
 /// Триплет пользовательских программ.

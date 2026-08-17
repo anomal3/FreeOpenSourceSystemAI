@@ -171,3 +171,63 @@ fn root_cells(fdt: &Fdt<'_>) -> (usize, usize) {
         root.property_u64("#size-cells").unwrap_or(1) as usize,
     )
 }
+
+/// Снять тактирование со всех блоков инфраструктуры.
+///
+/// # Зачем это понадобилось
+///
+/// Из семи шин I²C аппарата четыре не отвечают вовсе: регистр состояния не
+/// меняется ни от чего, и передача упирается в предел ожидания. Так выглядит
+/// блок, которому не подаётся такт, — загрузчик включает ровно то, что нужно
+/// ему самому (питание, зарядка, панель), а остальное оставляет выключенным.
+///
+/// Тачскрина нет ни на одной из трёх живых шин: та, что отвечает честно, несёт
+/// единственное устройство по адресу `0x6b`. Значит, он на одной из молчащих, и
+/// пока к ней не подведён такт, спрашивать её бессмысленно.
+///
+/// # Почему всё сразу, а не нужное
+///
+/// Чтобы включить именно нужный, надо знать соответствие «номер такта в дереве
+/// → регистр и бит», а это таблица конкретного кристалла, и у нас её нет.
+/// Регистры же снятия известны: у всего семейства MediaTek их четыре, и запись
+/// единиц в них означает «не глушить ничего». Включённый лишний блок стоит
+/// потребления; невключённый нужный стоит захода к аппарату.
+///
+/// Печатается состояние до и после — иначе «включили» неотличимо от «записали
+/// в никуда», а это ровно та разница, ради которой всё и делается.
+///
+/// # Safety
+///
+/// Вызывать на активных таблицах ядра; окно блока отображается здесь же.
+pub unsafe fn ungate_infra(fdt: &Fdt<'_>) {
+    let Some(node) = fdt
+        .find("/infracfg_ao@10001000")
+        .or_else(|| fdt.find_compatible("mediatek,infracfg_ao"))
+        .or_else(|| fdt.find_compatible("mediatek,mt6765-infracfg"))
+    else {
+        crate::kprintln!("  clocks      : no infracfg node in the device tree");
+        return;
+    };
+    let (address_cells, size_cells) = root_cells(fdt);
+    let Some(region) = node.reg(address_cells, size_cells).next() else {
+        return;
+    };
+    let base = region.address;
+    if base == 0 || !crate::arch::aarch64::mtk_touch::map_device_page(base) {
+        return;
+    }
+
+    // Четвёрка «снять / состояние» — раскладка, одинаковая у всего семейства.
+    const GATES: [(usize, usize); 4] = [(0x84, 0x90), (0x8c, 0x94), (0xa8, 0xac), (0xc4, 0xc8)];
+
+    for (index, (clear, state)) in GATES.iter().enumerate() {
+        // SAFETY: блок назван деревом и отображён выше как память устройства.
+        let before = unsafe { ((base as usize + state) as *const u32).read_volatile() };
+        // SAFETY: см. выше. Единица в регистре снятия означает «этот блок не
+        // глушить»; биты, которым нечего снимать, запись игнорирует.
+        unsafe { ((base as usize + clear) as *mut u32).write_volatile(u32::MAX) };
+        // SAFETY: см. выше.
+        let after = unsafe { ((base as usize + state) as *const u32).read_volatile() };
+        crate::kprintln!("  clocks      : infra{index} gates {before:#010x} -> {after:#010x}");
+    }
+}

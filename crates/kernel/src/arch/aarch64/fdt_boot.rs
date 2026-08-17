@@ -445,6 +445,63 @@ pub fn gic_layout(fdt: &Fdt<'_>) -> Option<super::acpi::GicLayout> {
     })
 }
 
+/// Сколько шин I²C помещается в перечисление. У MT6765 их семь.
+pub const MAX_I2C: usize = 8;
+
+/// Одна шина I²C так, как её описывает дерево.
+#[derive(Clone, Copy)]
+pub struct I2cBus {
+    /// Окно регистров контроллера.
+    pub base: u64,
+    /// Блок настройки выводов, которому принадлежат SCL и SDA этой шины.
+    ///
+    /// Дерево называет его само (`gpio_start`), и это единственное место, где
+    /// про выводы шины сказано хоть что-то: узлов состояния выводов у шин I²C в
+    /// этом дереве нет вовсе — в отличие от карт памяти, у которых они есть.
+    pub pins: Option<u64>,
+    /// Номера выводов данных и такта.
+    pub sda: u32,
+    pub scl: u32,
+}
+
+/// Окна регистров всех шин I²C, какие описывает дерево.
+///
+/// Возвращаются адресами, а не узлами: всё, что нужно дальше, — это куда
+/// писать. Пустые места означают, что шин меньше, а не что какая-то пропущена.
+///
+/// Шины перечисляются целиком и опрашиваются потом все, потому что дерево не
+/// говорит, на какой из них тачскрин: у MediaTek он регистрируется
+/// платформенным кодом, и в дереве от него остаётся узел `/touch` с одним
+/// свойством `compatible` — без адреса и без шины.
+pub fn i2c_buses(fdt: &Fdt<'_>) -> [Option<I2cBus>; MAX_I2C] {
+    let mut buses = [None; MAX_I2C];
+    let mut count = 0;
+    let (address_cells, size_cells) = root_cells(fdt);
+
+    for node in fdt.nodes() {
+        if !node.is_compatible("mediatek,i2c") && !node.is_compatible("mediatek,mt6577-i2c") {
+            continue;
+        }
+        // Первое окно — сам контроллер; второе, если оно есть, принадлежит
+        // каналу DMA, а он нам не нужен: передачи короткие и укладываются в
+        // FIFO.
+        let Some(region) = node.reg(address_cells, size_cells).next() else {
+            continue;
+        };
+        if region.address == 0 || count == MAX_I2C {
+            continue;
+        }
+        buses[count] = Some(I2cBus {
+            base: region.address,
+            pins: node.property_u64("gpio_start").filter(|value| *value != 0),
+            sda: node.property_u64("sda-gpio-id").unwrap_or(u64::MAX) as u32,
+            scl: node.property_u64("scl-gpio-id").unwrap_or(u64::MAX) as u32,
+        });
+        count += 1;
+    }
+    buses
+}
+
 /// Узел последовательного порта: тот, что назвал загрузчик, или первый знакомый.
 ///
 /// `stdout-path` — это выбор загрузчика, и уважать его важнее, чем найти первый
