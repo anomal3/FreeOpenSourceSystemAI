@@ -26,6 +26,7 @@
 //! одной короткой посылки по I²C и снимает всё это целиком.
 
 use super::mtk_i2c::{self, Bus, Error, Layout};
+use super::mtk_spi;
 use crate::input::{Buttons, post_pointer_at};
 use crate::sync::SpinLock;
 use fdt::Fdt;
@@ -163,41 +164,12 @@ pub unsafe fn probe(fdt: &Fdt<'_>) -> bool {
                 );
             }
 
-            // Полный обход шины, а не только знакомых адресов.
-            //
-            // Знакомые кончились: на единственной исправной шине аппарата не
-            // отозвался ни один из них, и это ответ, из которого не следует
-            // ничего — ни «тачскрин на SPI», ни «мы смотрим не туда». Список
-            // того, кто на шине **есть**, следует уже о многом: по адресу
-            // контроллер узнаётся, а пустая шина закрывает её целиком.
-            //
-            // Обход стоит недорого именно потому, что шина исправна: отказ
-            // приходит от железа сразу, а не по истечении предела ожидания.
-            let mut seen = [0u8; 24];
-            let mut count = 0;
-            for address in 0x08..=0x77u8 {
-                // SAFETY: см. выше.
-                if unsafe { bus.present(address) } && count < seen.len() {
-                    seen[count] = address;
-                    count += 1;
-                }
-            }
-            let mark = if honest { "" } else { " (untrusted)" };
-            if count == 0 {
-                crate::kprintln!("  touch       : i2c {base:#010x}{mark} is empty, nobody answers");
-            } else {
-                // Печатается по восемь в строку: экран телефона узкий, а
-                // перенос посреди списка адресов читается хуже всего.
-                for chunk in seen[..count].chunks(8) {
-                    let mut line = [0u8; 8];
-                    line[..chunk.len()].copy_from_slice(chunk);
-                    crate::kprintln!(
-                        "  touch       : i2c {base:#010x}{mark} answers {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x} {:#04x}",
-                        line[0], line[1], line[2], line[3], line[4], line[5], line[6], line[7]
-                    );
-                }
-            }
-
+            // Полный обход шины здесь когда-то был и своё дело сделал: он и
+            // доказал, что тачскрина на I²C нет. Держать его в каждой загрузке
+            // незачем — он занимает секунды и полтора десятка строк экрана, а
+            // отвечает на вопрос, который уже закрыт. Знакомые адреса
+            // опрашиваются по-прежнему: аппараты этой модели бывают разных
+            // партий, и на другой панель вполне может оказаться на шине.
             for (address, kind) in KNOWN {
                 // SAFETY: см. выше.
                 if honest && unsafe { bus.present(address) } {
@@ -229,6 +201,11 @@ pub unsafe fn probe(fdt: &Fdt<'_>) -> bool {
             break;
         }
     }
+
+    // SPI — там, где тачскрин у этого аппарата и оказался. Опрашивается после
+    // I²C, а не вместо: у соседних партий панель бывает и на шине.
+    // SAFETY: таблицы ядра активны, окна отображаются внутри.
+    unsafe { probe_spi(fdt) };
 
     let Some(touch) = found else {
         return false;
@@ -267,6 +244,177 @@ fn report_pins(window: &super::fdt_boot::I2cBus) {
         words[2],
         words[3]
     );
+}
+
+/// Спросить у каждого контроллера SPI, не Novatek ли на нём.
+///
+/// # Что именно спрашивается
+///
+/// Идентификатор кристалла — шесть байт, которые Novatek кладёт по адресу
+/// `0x3F004` своей внутренней памяти. Читается он в два приёма, и оба взяты из
+/// опубликованного драйвера Novatek, а не выведены:
+///
+/// 1. посылка `FF 07 E0` выбирает страницу: `0xFF` — команда «дальше адрес»,
+///    следующие два байта — тот же `0x3F004`, сдвинутый на 15 и на 7;
+/// 2. посылка, начинающаяся с `0x84`, читает: младшие семь бит — смещение
+///    внутри страницы, старший бит означает чтение.
+///
+/// Ответ смещён на два байта — так устроен обмен у этого чипа, и первые два
+/// байта в нём мусорные. Печатаются они всё равно: увидеть `00 00 00 ...` или
+/// `ff ff ff ...` полезно, это два разных отказа. Первое означает молчащую
+/// линию данных, второе — отсутствующее устройство.
+///
+/// # Safety
+///
+/// Таблицы ядра активны.
+unsafe fn probe_spi(fdt: &Fdt<'_>) {
+    /// Адрес идентификатора внутри чипа.
+    const TRIM_ADDRESS: u32 = 0x3_F004;
+    /// Адрес регистра программного сброса. Взят из описания панели в исходниках
+    /// ядра Xiaomi для этого аппарата (`novatek,swrst-n8-addr`).
+    const RESET_ADDRESS: u32 = 0x3_F0FE;
+    /// Значение, которое этот регистр понимает как «перезапустись».
+    const RESET_VALUE: u8 = 0x69;
+    /// Вывод, которым кристалл держится в сбросе (`novatek,reset-gpio`).
+    const RESET_PIN: u32 = 174;
+    /// Выводы шины `spi3`: данные к нам, выбор кристалла, данные от нас, такт.
+    const SPI3_PINS: [u32; 4] = [21, 22, 23, 24];
+    /// Функция, под которой эти выводы принадлежат `spi3`.
+    const SPI3_FUNCTION: u32 = 1;
+    /// Контроллер, на котором висит панель: `spi3` из того же описания. Совпал
+    /// с единственным, чья линия данных имеет подтяжку, — то есть измерение и
+    /// исходники сошлись независимо.
+    const TOUCH_SPI: u64 = 0x1101_3000;
+
+    // Отпустить сброс — то, без чего всё остальное бессмысленно. Кристалл до
+    // этого момента выключен, и линия данных читается подтяжкой: `ff ff ff ...`
+    // на нужном контроллере и `00` на всех прочих. Именно это мы и видели.
+    let pins = fdt
+        .find("/gpio@10005000")
+        .or_else(|| fdt.find_compatible("mediatek,mt6765-pinctrl"))
+        .and_then(|node| {
+            let (address_cells, size_cells) = root_cells(fdt);
+            node.reg(address_cells, size_cells).next().map(|region| region.address)
+        });
+    match pins {
+        Some(pins) if map_device_page(pins) => {
+            // Сначала выводы шины, потом сброс. Порядок важен: кристалл,
+            // отпущенный на линиях, которые ещё никуда не подключены, успевает
+            // проснуться в пустоту.
+            //
+            // SAFETY: окно отображено; номера выводов и номер функции взяты из
+            // описания кристалла, а не угаданы.
+            let mut modes = [0u32; 4];
+            unsafe {
+                for (slot, pin) in SPI3_PINS.into_iter().enumerate() {
+                    modes[slot] = super::mtk::gpio_mode(pins, pin, SPI3_FUNCTION);
+                }
+                gpio_reset(pins, RESET_PIN);
+            }
+            crate::kprintln!(
+                "  touch       : spi3 pins 21-24 now read back as {} {} {} {}, reset released",
+                modes[0], modes[1], modes[2], modes[3]
+            );
+        }
+        _ => crate::kprintln!("  touch       : no pin controller, cannot set up the bus"),
+    }
+
+    let Some(base) = super::fdt_boot::spi_buses(fdt).into_iter().flatten().find(|base| *base == TOUCH_SPI)
+    else {
+        crate::kprintln!("  touch       : no spi controller at {TOUCH_SPI:#010x}");
+        return;
+    };
+    if !map_device_page(base) {
+        return;
+    }
+
+    // SAFETY: окно отображено выше как память устройства.
+    let bus = unsafe { mtk_spi::Bus::new(base as usize) };
+    // Четыре режима фазы такта и четыре набора выводов.
+    //
+    // Перебирались они и раньше, и ничего не значили: выводы тогда ещё не были
+    // закреплены за шиной, и наружу не выходило ничего, какой режим ни ставь.
+    // Теперь выходит — регистр режима читается обратно единицами, а время
+    // передачи меняется вместе с делителем такта, — и опыт наконец задаёт
+    // вопрос, а не повторяет сам себя.
+    for pad in 0..2u32 {
+        for mode in 0..4u8 {
+            // SAFETY: окно отображено; параметры перебираются.
+            unsafe { bus.prepare(mtk_spi::Timing::Enhanced, mode, pad, 0x40) };
+
+            // SAFETY: см. выше.
+            unsafe {
+                let _ = bus.transfer(&page_command(RESET_ADDRESS), &mut []);
+                let _ = bus.transfer(&[RESET_ADDRESS as u8 & 0x7f, RESET_VALUE], &mut []);
+            }
+            wait_ms(35);
+
+            // SAFETY: см. выше.
+            let _ = unsafe { bus.transfer(&page_command(TRIM_ADDRESS), &mut []) };
+            let request = [(TRIM_ADDRESS as u8 & 0x7f) | 0x80, 0, 0, 0, 0, 0, 0, 0];
+            let mut answer = [0u8; 8];
+            // SAFETY: см. выше.
+            let _ = unsafe { bus.transfer(&request, &mut answer) };
+
+            crate::kprintln!(
+                "  touch       : pad {pad} mode {mode} id {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                answer[2], answer[3], answer[4], answer[5], answer[6], answer[7]
+            );
+
+            // Ответ из одних нулей или одних единиц — это состояние линии, а не
+            // ответ. Всё прочее уже что-то значит.
+            if answer[2..].iter().any(|byte| *byte != 0x00 && *byte != 0xff) {
+                crate::kprintln!("  touch       : the chip is talking");
+                return;
+            }
+        }
+    }
+}
+
+/// Дёрнуть вывод сброса: прижать, выдержать, отпустить.
+///
+/// # Safety
+///
+/// `pins` — отображённое окно контроллера выводов, `pin` — вывод сброса.
+unsafe fn gpio_reset(pins: u64, pin: u32) {
+    // SAFETY: контракт функции.
+    unsafe { super::mtk::gpio_output(pins, pin, false) };
+    wait_ms(20);
+    // SAFETY: см. выше.
+    unsafe { super::mtk::gpio_output(pins, pin, true) };
+    wait_ms(50);
+}
+
+/// Размеры ячеек корня — те же, что у всех остальных читателей дерева.
+fn root_cells(fdt: &Fdt<'_>) -> (usize, usize) {
+    let Some(root) = fdt.nodes().next() else {
+        return (2, 1);
+    };
+    (
+        root.property_u64("#address-cells").unwrap_or(2) as usize,
+        root.property_u64("#size-cells").unwrap_or(1) as usize,
+    )
+}
+
+/// Посылка «дальше говорим по этому адресу».
+///
+/// `0xff` — команда выбора страницы, следующие два байта — тот же адрес,
+/// сдвинутый на пятнадцать и на семь. Числа не выведены: так их складывает сам
+/// драйвер Novatek, и повторены они буква в букву.
+fn page_command(address: u32) -> [u8; 3] {
+    [0xff, ((address >> 15) & 0xff) as u8, ((address >> 7) & 0xff) as u8]
+}
+
+/// Подождать столько миллисекунд, сколько просит чип после сброса.
+///
+/// По счётчику тиков, а не циклом заданной длины: тактовая частота этой машины
+/// нам не принадлежит, и «тридцать пять миллисекунд» превратились бы в три или
+/// в триста.
+fn wait_ms(ms: u64) {
+    let until = crate::time::uptime_ms() + ms;
+    while crate::time::uptime_ms() < until {
+        core::hint::spin_loop();
+    }
 }
 
 /// Нашёлся ли читаемый тачскрин.

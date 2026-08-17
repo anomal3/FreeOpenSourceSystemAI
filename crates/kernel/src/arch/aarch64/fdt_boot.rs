@@ -502,6 +502,32 @@ pub fn i2c_buses(fdt: &Fdt<'_>) -> [Option<I2cBus>; MAX_I2C] {
     buses
 }
 
+/// Окна регистров всех контроллеров SPI, какие описывает дерево.
+///
+/// Их шесть, и дерево не говорит, на каком из них тачскрин: узел `/touch` несёт
+/// одно свойство `compatible` и больше ничего. Значит, спрашивать надо все —
+/// ровно как с шинами I²C, и с тем же выводом: перебор дешевле догадки.
+pub fn spi_buses(fdt: &Fdt<'_>) -> [Option<u64>; MAX_I2C] {
+    let mut buses = [None; MAX_I2C];
+    let mut count = 0;
+    let (address_cells, size_cells) = root_cells(fdt);
+
+    for node in fdt.nodes() {
+        if !node.is_compatible("mediatek,mt6765-spi") && !node.is_compatible("mediatek,spi") {
+            continue;
+        }
+        let Some(region) = node.reg(address_cells, size_cells).next() else {
+            continue;
+        };
+        if region.address == 0 || count == MAX_I2C {
+            continue;
+        }
+        buses[count] = Some(region.address);
+        count += 1;
+    }
+    buses
+}
+
 /// Узел последовательного порта: тот, что назвал загрузчик, или первый знакомый.
 ///
 /// `stdout-path` — это выбор загрузчика, и уважать его важнее, чем найти первый
