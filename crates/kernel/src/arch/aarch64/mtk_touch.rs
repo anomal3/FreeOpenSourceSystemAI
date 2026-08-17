@@ -26,6 +26,7 @@
 //! одной короткой посылки по I²C и снимает всё это целиком.
 
 use super::mtk_i2c::{self, Bus, Error, Layout};
+use super::mtk::{gpio_input, gpio_output};
 use super::mtk_spi;
 use crate::input::{Buttons, post_pointer_at};
 use crate::sync::SpinLock;
@@ -368,6 +369,117 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
                 return;
             }
         }
+    }
+
+    // Контроллер сказал всё, что мог. Последнее слово — за обменом вручную.
+    let Some(pins) = pins else { return };
+    let mut answer = [0u8; 8];
+    // SAFETY: окно отображено выше; выводы принадлежат `spi3`, и контроллер
+    // этой шины больше не работает — мы забираем их себе.
+    unsafe {
+        bitbang(pins, &page_command(RESET_ADDRESS), &mut []);
+        bitbang(pins, &[RESET_ADDRESS as u8 & 0x7f, RESET_VALUE], &mut []);
+    }
+    wait_ms(40);
+    // SAFETY: см. выше.
+    unsafe {
+        bitbang(pins, &page_command(TRIM_ADDRESS), &mut []);
+        bitbang(pins, &[(TRIM_ADDRESS as u8 & 0x7f) | 0x80, 0, 0, 0, 0, 0, 0, 0], &mut answer);
+    }
+    crate::kprintln!(
+        "  touch       : by hand, id {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+        answer[2], answer[3], answer[4], answer[5], answer[6], answer[7]
+    );
+
+    // Последнее непроверенное звено — и оно наше собственное. Что выводы шины
+    // переключились, доказано чтением обратно; что **вывод сброса поднялся** —
+    // ничем. Линия, которую держит внизу кто-то ещё, выглядит снаружи ровно как
+    // отпущенная: запись проходит, а уровень не меняется.
+    //
+    // Заодно спрашивается вывод прерывания: живой кристалл после сброса дёргает
+    // его сам, и его уровень — независимое свидетельство.
+    // SAFETY: окно отображено; читается состояние, ничего не меняется.
+    let (reset_high, irq_high) = unsafe {
+        super::mtk::gpio_output(pins, RESET_PIN, true);
+        wait_ms(20);
+        (
+            super::mtk::gpio_level(pins, RESET_PIN),
+            super::mtk::gpio_input(pins, 0),
+        )
+    };
+    crate::kprintln!(
+        "  touch       : reset line reads {}, irq line reads {}",
+        u8::from(reset_high),
+        u8::from(irq_high)
+    );
+}
+
+/// Обмен по SPI руками, без контроллера.
+///
+/// # Зачем такое вообще пишут
+///
+/// Затем, что иначе не отличить «кристалл молчит» от «блок, который с ним
+/// говорит, настроен не так». Всё, что можно было измерить у контроллера,
+/// измерено и работает: такт бежит и меняется вместе с делителем, выводы
+/// закреплены и читаются обратно, сброс отпущен, режимы перебраны. И всё равно
+/// линия данных стоит на подтяжке.
+///
+/// Обмен вручную выкидывает контроллер из цепочки целиком: такт, выбор
+/// кристалла и данные выставляются как обычные выводы, по одному биту. Медленно
+/// — но здесь скорость и не нужна, нужен ответ на один вопрос.
+///
+/// # Safety
+///
+/// `pins` — отображённое окно контроллера выводов; выводы принадлежат `spi3` и
+/// в этот момент никем больше не используются.
+unsafe fn bitbang(pins: u64, tx: &[u8], rx: &mut [u8]) {
+    const MISO: u32 = 21;
+    const CS: u32 = 22;
+    const MOSI: u32 = 23;
+    const CLK: u32 = 24;
+
+    /// Четверть периода. Число не выведено, а взято с запасом: чип держит до
+    /// девяти мегагерц, а здесь выходит несколько десятков килогерц.
+    fn tick() {
+        for _ in 0..200 {
+            core::hint::spin_loop();
+        }
+    }
+
+    // SAFETY: контракт функции.
+    unsafe {
+        // Покой: выбор снят, такт внизу — это режим 0, тот же, что у чипа.
+        gpio_output(pins, CS, true);
+        gpio_output(pins, CLK, false);
+        gpio_output(pins, MOSI, false);
+        let _ = gpio_input(pins, MISO);
+        tick();
+
+        gpio_output(pins, CS, false);
+        tick();
+
+        for index in 0..tx.len().max(rx.len()) {
+            let byte = tx.get(index).copied().unwrap_or(0);
+            let mut received = 0u8;
+            for bit in (0..8).rev() {
+                gpio_output(pins, MOSI, byte >> bit & 1 != 0);
+                tick();
+                gpio_output(pins, CLK, true);
+                // Читается на фронте — так велит режим 0.
+                if gpio_input(pins, MISO) {
+                    received |= 1 << bit;
+                }
+                tick();
+                gpio_output(pins, CLK, false);
+            }
+            if let Some(slot) = rx.get_mut(index) {
+                *slot = received;
+            }
+        }
+
+        tick();
+        gpio_output(pins, CS, true);
+        tick();
     }
 }
 

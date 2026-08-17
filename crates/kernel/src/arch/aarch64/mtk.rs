@@ -308,3 +308,46 @@ pub unsafe fn gpio_mode(base: u64, pin: u32, function: u32) -> u32 {
         ((mode as *const u32).read_volatile() >> shift) & 0xf
     }
 }
+
+/// Настроить вывод на приём и прочитать его уровень.
+///
+/// Нужно ровно для одного опыта — обмена по SPI вручную, без контроллера (см.
+/// [`super::mtk_touch`]). Он отвечает на вопрос, который иначе не закрыть:
+/// молчит кристалл или неверно настроен блок, который с ним говорит. Снаружи
+/// эти два случая неразличимы, а чинятся в разных местах.
+///
+/// # Safety
+///
+/// См. [`gpio_output`].
+pub unsafe fn gpio_input(base: u64, pin: u32) -> bool {
+    let direction = base as usize + (pin as usize / 32) * 0x10;
+    let data = base as usize + 0x200 + (pin as usize / 32) * 0x10;
+    let bit = 1u32 << (pin % 32);
+
+    // SAFETY: контракт функции.
+    unsafe {
+        gpio_mode(base, pin, 0);
+        let current = (direction as *const u32).read_volatile();
+        (direction as *mut u32).write_volatile(current & !bit);
+        (data as *const u32).read_volatile() & bit != 0
+    }
+}
+
+/// Прочитать настоящий уровень на выводе, которым мы же и управляем.
+///
+/// Не то же самое, что прочитать, что мы туда записали: регистр значения
+/// хранит наше желание, а регистр входа — то, что на выводе на самом деле.
+/// Линия, которую держит внизу кто-то ещё, выглядит по записанному значению
+/// отпущенной, а по входу — прижатой. Разница между этими двумя регистрами и
+/// есть ответ на вопрос «отпустили ли мы сброс».
+///
+/// # Safety
+///
+/// См. [`gpio_output`]. Направление вывода не меняется: он остаётся выходом,
+/// а вход у MediaTek читается и на выходе.
+pub unsafe fn gpio_level(base: u64, pin: u32) -> bool {
+    let data = base as usize + 0x200 + (pin as usize / 32) * 0x10;
+    let bit = 1u32 << (pin % 32);
+    // SAFETY: контракт функции.
+    unsafe { (data as *const u32).read_volatile() & bit != 0 }
+}
