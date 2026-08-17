@@ -82,6 +82,15 @@ pub unsafe extern "C" fn bare_main(dtb: *const u8) -> ! {
         fill(base, bytes, FOUND);
     }
 
+    // Буфер из `/chosen` закрашен, а экран не изменился: загрузчик лишь
+    // зарезервировал эту память для ядра, а показывает он другую. Спрашиваем у
+    // самого контроллера дисплея, что он выводит **сейчас**, и красим то.
+    if let Some(base) = scanned_buffer(&fdt) {
+        // SAFETY: единственный поток исполнения.
+        unsafe { (*core::ptr::addr_of_mut!(KNOWN)).screen = Some((base, 0)) };
+        fill(base, 0, DONE);
+    }
+
     if let Some(line) = Uart::from_fdt(&fdt) {
         // SAFETY: то же.
         unsafe { (*core::ptr::addr_of_mut!(KNOWN)).line = Some(line) };
@@ -177,6 +186,48 @@ fn mtk_probe() -> ! {
     }
 }
 
+/// Адрес буфера, который контроллер дисплея выводит прямо сейчас.
+///
+/// Спросить у железа дешевле, чем искать: у блока наложения есть регистр с
+/// адресом слоя, и в нём лежит ровно то, что видно на панели. Нам не нужно
+/// знать это число заранее — достаточно прочитать его на самом аппарате и
+/// закрасить по нему.
+///
+/// Адреса блоков берутся из дерева (`disp_ovl0`, `disp_ovl0_2l`, `disp_rdma0`),
+/// а смещения регистров — из открытого драйвера MediaTek в ядре Linux
+/// (`mtk_disp_ovl.c`, `mtk_disp_rdma.c`), где они одни и те же во всём
+/// семействе. Ни одно из этих чисел не угадано.
+fn scanned_buffer(fdt: &Fdt<'_>) -> Option<u64> {
+    /// Адрес нулевого слоя наложения.
+    const OVL_LAYER0_ADDR: usize = 0x0f40 / 4;
+    /// Начало памяти, которую вычитывает RDMA.
+    const RDMA_MEM_START: usize = 0x0f00 / 4;
+
+    let (address_cells, size_cells) = root_cells(fdt);
+    for (path, register) in [
+        ("/disp_ovl0", OVL_LAYER0_ADDR),
+        ("/disp_ovl0_2l", OVL_LAYER0_ADDR),
+        ("/disp_rdma0", RDMA_MEM_START),
+    ] {
+        let Some(node) = fdt.find(path) else { continue };
+        let Some(region) = node.reg(address_cells, size_cells).next() else { continue };
+        if region.address == 0 {
+            continue;
+        }
+        // SAFETY: адрес блока взят из дерева машины; чтение регистра ничего не
+        // меняет, а volatile обязателен — обычное компилятор вправе выбросить.
+        let value =
+            u64::from(unsafe { (region.address as *const u32).add(register).read_volatile() });
+        // Годится только то, что похоже на ОЗУ: у этой машины оно начинается с
+        // 0x40000000. Ноль означает выключенный слой, мелкое число — что мы
+        // прочитали не тот регистр, и красить по нему нельзя.
+        if value >= 0x4000_0000 {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// Погасить сторожевой таймер.
 ///
 /// Адрес берётся из дерева, а не из константы: у MT676x это `toprgu` по
@@ -211,6 +262,19 @@ const WATCHDOG_KEY: u32 = 0x2200_0000;
 
 /// Залить видеопамять одним цветом.
 fn fill(base: u64, bytes: u64, colour: u32) {
+    // Заливается не «сколько сказало дерево», а не меньше трёх кадров экрана.
+    //
+    // Объём из `atag,videolfb-vramSize` проверить нечем: экрана, на котором
+    // видно результат, у нас пока нет — он и есть то, что выясняется. А слишком
+    // маленький объём даёт ровно ту же картину, что неверный адрес: несколько
+    // закрашенных точек, которых не разглядеть, и вывод «буфер не тот». Порог
+    // снимает эту двусмысленность и стоит лишь времени записи.
+    //
+    // Размеры взяты с самого аппарата (`wm size` — 720×1600), четыре байта на
+    // точку и три кадра на случай тройной буферизации.
+    const FRAME: u64 = 720 * 1600 * 4;
+    let bytes = bytes.max(FRAME * 3);
+
     let pixels = (bytes / 4) as usize;
     let buffer = base as *mut u32;
     for index in 0..pixels {
