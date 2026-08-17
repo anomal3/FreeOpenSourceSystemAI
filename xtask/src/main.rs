@@ -22,6 +22,7 @@ mod inspect;
 mod keys;
 mod package;
 mod paths;
+mod phone;
 mod qemu;
 mod repo;
 mod util;
@@ -65,6 +66,8 @@ enum Command {
     Test(TestArgs),
     /// Собрать каталог репозитория обновлений: образы, индекс и его подпись.
     Repo(RepoArgs),
+    /// Собрать образ, который запустит заводской загрузчик телефона.
+    Phone(PhoneArgs),
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -268,6 +271,43 @@ struct RepoArgs {
     /// Куда сложить готовое. По умолчанию `build/repo`.
     #[arg(long)]
     out: Option<std::path::PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct PhoneArgs {
+    /// Версия заголовка Android boot image.
+    ///
+    /// Перебирается не от хорошей жизни: разбирает заголовок заводской
+    /// загрузчик, и какую версию он понимает — известно только ему. У аппарата
+    /// на Android 10 и новее это 2, у машин постарше встречается 0.
+    #[arg(long, default_value_t = 2)]
+    header_version: u32,
+    /// База, от которой считаются адреса частей образа.
+    #[arg(long, value_parser = parse_hex)]
+    base: Option<u64>,
+    /// Строка запуска. По умолчанию — та, по которой MTK узнаёт 64-битное ядро.
+    #[arg(long)]
+    cmdline: Option<String>,
+    /// Положить в образ дерево устройств (только для заголовка версии 2).
+    #[arg(long)]
+    dtb: Option<std::path::PathBuf>,
+    /// Завернуть готовый файл вместо сборки `boot-bare`.
+    #[arg(long)]
+    kernel: Option<std::path::PathBuf>,
+    /// Куда положить образ. По умолчанию `build/bare-boot.img`.
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Разобрать чужой образ и напечатать его заголовок — так проверяются
+    /// адреса по заводскому boot.img.
+    #[arg(long)]
+    read: Option<std::path::PathBuf>,
+}
+
+/// Число из командной строки, в том числе шестнадцатеричное.
+fn parse_hex(text: &str) -> Result<u64, String> {
+    let trimmed = text.trim_start_matches("0x").trim_start_matches("0X");
+    let radix = if trimmed.len() == text.len() { 10 } else { 16 };
+    u64::from_str_radix(trimmed, radix).map_err(|err| format!("{text}: {err}"))
 }
 
 #[derive(Args, Debug)]
@@ -476,6 +516,22 @@ fn real_main() -> Result<()> {
                 only: args.scenario,
                 windowed: args.windowed,
                 jobs,
+            })?;
+        }
+
+        Command::Phone(args) => {
+            if let Some(path) = args.read {
+                phone::read(&path)?;
+                return Ok(());
+            }
+            let defaults = phone::Options::default();
+            phone::build(&phone::Options {
+                header_version: args.header_version,
+                base: args.base.unwrap_or(defaults.base),
+                cmdline: args.cmdline.unwrap_or(defaults.cmdline),
+                dtb: args.dtb,
+                out: args.out,
+                kernel: args.kernel,
             })?;
         }
 
