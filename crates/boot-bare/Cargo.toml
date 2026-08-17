@@ -1,0 +1,16 @@
+[package]
+name = "boot-bare"
+description = "A kernel image a phone's own bootloader can start: Linux arm64 contract, device tree in x0."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "boot-bare"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+fdt = { path = "../fdt" }

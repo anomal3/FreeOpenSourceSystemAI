@@ -114,6 +114,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-bare"
+version = "0.3.0"
+dependencies = [
+ "fdt",
+]
+
+[[package]]
 name = "boot-info"
 version = "0.3.0"
 
