@@ -21,11 +21,12 @@
 
 use super::fastboot::Fastboot;
 use super::musb::{Musb, reg};
+use crate::arch::aarch64::timer;
 use super::musb::{
     CSR0_DATAEND, CSR0_RXPKTRDY, CSR0_SENDSTALL, CSR0_SETUPEND, CSR0_SVDRXPKTRDY,
-    CSR0_SVDSETUPEND, CSR0_TXPKTRDY, DEVCTL_SESSION, INTR_RESET, POWER_HSENAB, POWER_HSMODE,
-    POWER_SOFTCONN, RXCSR_CLRDATATOG, RXCSR_FLUSHFIFO, RXCSR_RXPKTRDY, TXCSR_CLRDATATOG,
-    TXCSR_FLUSHFIFO, TXCSR_MODE, TXCSR_TXPKTRDY,
+    CSR0_SVDSETUPEND, CSR0_TXPKTRDY, DCM_DISABLE, DEVCTL_SESSION, INTRUSBE_RESET, INTR_RESET,
+    INTRTX_EP0, POWER_HSENAB, POWER_HSMODE, POWER_SOFTCONN, RXCSR_CLRDATATOG, RXCSR_FLUSHFIFO,
+    RXCSR_RXPKTRDY, TXCSR_CLRDATATOG, TXCSR_FLUSHFIFO, TXCSR_MODE, TXCSR_TXPKTRDY,
 };
 
 /// Наибольший пакет нулевой точки. Не настраивается — так устроен контроллер.
@@ -50,6 +51,20 @@ const STRINGS: [&str; 3] = ["FreeOS", "FreeOS phone", "dandelion"];
 /// нужен не им, а строкам: каждая буква занимает два байта, и «FreeOS phone»
 /// уже двадцать шесть.
 const REPLY_MAX: usize = 128;
+
+/// Мгновенный снимок регистров для отчёта на экране.
+///
+/// Существует потому, что у этой машины один канал наружу и он шириной в
+/// фотографию. Каждое лишнее число здесь бесплатно, каждое недостающее стоит
+/// перезагрузки, снимка и получаса.
+pub struct Snapshot {
+    pub power: u8,
+    pub csr0: u16,
+    pub count0: u8,
+    pub faddr: u8,
+    pub intrtx: u16,
+    pub swrst: u8,
+}
 
 /// Незавершённый ответ хосту на нулевой точке.
 struct Reply {
@@ -77,6 +92,27 @@ pub struct Gadget {
     /// Признаки шины, замеченные с запуска. Только для отчёта на экране: по
     /// ним видно, дошло ли до нас хоть что-нибудь от хоста.
     pub seen: u8,
+    /// Подтяжка поднята. См. [`Gadget::prepare`].
+    announced: bool,
+    /// Сколько раз хост сбрасывал шину.
+    pub resets: u16,
+    /// Сколько ответов мы отправили хосту.
+    ///
+    /// Вместе с [`Gadget::setups`] это вторая половина того же вопроса:
+    /// «спросили» и «ответили» — разные числа, и расхождение между ними
+    /// показывает, на чём именно обрывается разговор.
+    pub replies: u16,
+    /// Сколько запросов пришло на нулевую точку.
+    ///
+    /// Счётчики существуют ради одного вопроса, на который нельзя ответить
+    /// снаружи: доходят ли до нас запросы вообще. Ноль здесь и «устройство не
+    /// отвечает» на хосте — это неисправность в шине; ненулевое здесь и то же
+    /// самое на хосте — неисправность в наших ответах. Одно число разделяет два
+    /// расследования, каждое из которых стоит вечера.
+    pub setups: u16,
+    /// Код последнего запроса и его старший байт значения — то есть какой
+    /// именно дескриптор просили последним, прежде чем всё встало.
+    pub last: (u8, u8),
 }
 
 impl Gadget {
@@ -89,31 +125,97 @@ impl Gadget {
             reply: None,
             fastboot: Fastboot::new(),
             seen: 0,
+            announced: false,
+            resets: 0,
+            replies: 0,
+            setups: 0,
+            last: (0, 0),
         }
     }
 
-    /// Настроить точки и подключиться к шине.
+    /// Настроить точки и открыть сессию — но **не** заявлять о себе шине.
     ///
-    /// Порядок обязателен, и он ровно обратный интуиции: подтяжка линии данных
-    /// ставится **последней**. Она означает «я здесь, спрашивайте», и заявить
-    /// это раньше, чем точки готовы, значит получить запрос, на который нечем
-    /// ответить, — а неотвеченное устройство хост объявляет неисправным, и
-    /// второй попытки уже не будет.
-    pub fn attach(&mut self) {
+    /// Подтяжка линии данных поднимается отдельно, из [`Gadget::poll`], и это
+    /// главный урок первой проверки на аппарате. Она означает «я здесь,
+    /// спрашивайте», и хост начинает спрашивать немедленно. Поднятая здесь, она
+    /// заставала ядро занятым: сразу после USB поднимается тачскрин, а это
+    /// обход семи шин, ручной обмен по битам и чтения — секунды, в которые
+    /// отвечать было некому. Windows показывала «Device Descriptor Request
+    /// Failed», и второй попытки хост не делает.
+    ///
+    /// Теперь заявление о себе и готовность слушать — один и тот же миг.
+    pub fn prepare(&mut self) {
+        self.quiesce();
+
+        // Контроллеру запрещается гасить собственные такты. Строка взята из
+        // `musb_start` изготовителя, где она стоит без объяснений; смысл её,
+        // однако, виден по последствиям — блок, засыпающий по своему
+        // усмотрению, отвечает шине через раз, а перечисление через раз не
+        // проходит вовсе: хост спрашивает трижды и уходит навсегда.
+        let dcm = self.musb.read32(reg::DCM);
+        self.musb.write32(reg::DCM, dcm | DCM_DISABLE);
+
         self.configure_endpoints();
         self.musb.write8(reg::DEVCTL, DEVCTL_SESSION);
-        let power = self.musb.read8(reg::POWER);
-        self.musb.write8(reg::POWER, power | POWER_HSENAB);
+
+        // Из признаков шины в режиме устройства слушается только сброс — так
+        // же, как у изготовителя.
+        self.musb.write8(reg::INTRUSBE, INTRUSBE_RESET);
+
+        // Скорость объявляется записью **целиком**, а не поверх прочитанного.
+        // Прочитанное содержало разряд «высокая скорость состоялась» — тот,
+        // что контроллер выставляет сам и который мы не вправе ему сообщать.
+        self.musb.write8(reg::POWER, POWER_HSENAB);
+    }
+
+    /// Привести контроллер в известное состояние.
+    ///
+    /// Загрузчик пользовался этим блоком для своего fastboot и оставил его как
+    /// придётся: с разрешёнными признаками и неразобранной очередью событий.
+    /// Начинать поверх чужого состояния — значит получить чужое событие вместо
+    /// первого своего.
+    fn quiesce(&self) {
+        self.musb.write8(reg::INTRUSBE, 0);
+        self.musb.write16(reg::INTRTXE, 0);
+        self.musb.write16(reg::INTRRXE, 0);
+        // Признаки сбрасываются записью единиц: всё, что накопилось до нас,
+        // объявляется прочитанным.
+        self.musb.write16(reg::INTRTX, 0xffff);
+        self.musb.write16(reg::INTRRX, 0xffff);
+        self.musb.write8(reg::INTRUSB, 0xef);
+    }
+
+    /// Поднять подтяжку. Вызывается один раз, первым же проходом опроса.
+    fn announce(&mut self) {
         self.musb
-            .write8(reg::POWER, power | POWER_HSENAB | POWER_SOFTCONN);
+            .write8(reg::POWER, POWER_HSENAB | POWER_SOFTCONN);
+        self.announced = true;
     }
 
     /// Один проход обмена. Вызывать часто; ничего не ждёт.
     pub fn poll(&mut self) {
+        if !self.announced {
+            self.announce();
+        }
+
         let events = self.musb.read8(reg::INTRUSB);
-        self.seen |= events;
-        if events & INTR_RESET != 0 {
-            self.on_reset();
+        if events != 0 {
+            // Признаки снимаются **записью** прочитанного, а не самим чтением.
+            //
+            // Разница стоила вечера и выглядела как неисправность где угодно,
+            // только не здесь. Незанятый разряд «хост сбросил шину» остаётся
+            // взведённым навсегда, а значит сброс обрабатывается заново каждую
+            // миллисекунду: адрес обнуляется, настройка объявляется забытой,
+            // точки перенастраиваются. Перечисление разваливалось ровно в тот
+            // миг, когда начинало получаться, — хост успевал спросить
+            // дескриптор и даже получить ответ, после чего устройство теряло
+            // о себе всё. Счётчик сбросов, дойдя до предела разрядной сетки,
+            // это и показал.
+            self.musb.write8(reg::INTRUSB, events);
+            self.seen |= events;
+            if events & INTR_RESET != 0 {
+                self.on_reset();
+            }
         }
 
         self.poll_control();
@@ -129,6 +231,7 @@ impl Gadget {
     /// это наше пожелание, а не итог переговоров, и настроенные по нему точки
     /// на полной скорости ждали бы пакетов, которых не бывает.
     fn on_reset(&mut self) {
+        self.resets = self.resets.saturating_add(1);
         self.musb.write8(reg::FADDR, 0);
         self.high_speed = self.musb.read8(reg::POWER) & POWER_HSMODE != 0;
         self.configured = false;
@@ -146,8 +249,16 @@ impl Gadget {
         // запрашивает её по **старому** адресу, и поменять его раньше — значит
         // не ответить на собственное подтверждение: устройство назначенного
         // адреса не получит, а прежнего у него уже нет.
+        //
+        // Признак завершения — разряд нулевой точки в регистре передающих
+        // точек, и ничто другое. Прежняя редакция смотрела на регистр
+        // состояния самой точки, а он чист **и до завершающей стадии, и
+        // после**: разницы между «ещё не ответили» и «уже ответили» в нём нет.
+        // Адрес поэтому записывался на миллисекунду раньше времени, и хост
+        // сообщал ровно то, что происходило, — «не удалось назначить адрес».
         if let Some(address) = self.pending_address {
-            if csr & (CSR0_RXPKTRDY | CSR0_TXPKTRDY) == 0 {
+            if self.musb.read16(reg::INTRTX) & INTRTX_EP0 != 0 {
+                self.musb.write16(reg::INTRTX, INTRTX_EP0);
                 self.musb.write8(reg::FADDR, address);
                 self.pending_address = None;
             }
@@ -163,7 +274,7 @@ impl Gadget {
 
         if self.reply.is_some() {
             if csr & CSR0_TXPKTRDY == 0 {
-                self.send_next(false);
+                self.send_next();
             }
             return;
         }
@@ -172,7 +283,8 @@ impl Gadget {
             return;
         }
 
-        let count = usize::from(self.musb.read16(reg::COUNT0));
+        // Восемь разрядов, а не шестнадцать. См. [`reg::COUNT0`].
+        let count = usize::from(self.musb.read8(reg::COUNT0));
         if count != 8 {
             // Восемь байт — длина запроса, другой здесь не бывает. Что бы это
             // ни было, память точки надо освободить, иначе она встанет.
@@ -185,6 +297,8 @@ impl Gadget {
 
         let mut setup = [0u8; 8];
         self.musb.read_fifo(0, &mut setup);
+        self.setups = self.setups.saturating_add(1);
+        self.last = (setup[1], setup[3]);
         self.handle_setup(&setup);
     }
 
@@ -228,6 +342,10 @@ impl Gadget {
             // SET_ADDRESS
             (false, 0x05) => {
                 self.pending_address = Some((value & 0x7f) as u8);
+                // Признак нулевой точки снимается **до** подтверждения: ждать
+                // предстоит именно ту завершающую стадию, которая начнётся
+                // сейчас, а не остаток предыдущей.
+                self.musb.write16(reg::INTRTX, INTRTX_EP0);
                 self.ack();
             }
             // SET_CONFIGURATION
@@ -397,15 +515,45 @@ impl Gadget {
             sent: 0,
             zero_packet: len < requested && len % EP0_MAX == 0,
         });
-        self.send_next(true);
+
+        // Запрос подтверждается **отдельной записью**, до того как ответ
+        // ляжет в память точки, — и дальше контроллеру дают время развернуть
+        // точку с приёма на передачу.
+        //
+        // Это не осторожность, а условие работы, и стоило оно вечера.
+        // Подтверждение, отправленное вместе с данными, означает, что данные
+        // кладутся в память, ещё стоящую на приём: запись проходит, ошибки
+        // нет, ответ не уходит никуда. Снаружи это выглядит как устройство,
+        // которое видно на шине и молчит на первый же вопрос. Изготовитель
+        // делает так же и объясняет тем, что «контроллеру нужен миг на смену
+        // режима».
+        self.musb.write16(reg::CSR0, CSR0_SVDRXPKTRDY);
+        self.replies = self.replies.saturating_add(1);
+        self.await_receive_cleared();
+
+        self.send_next();
+    }
+
+    /// Дождаться, пока контроллер снимет признак принятого пакета.
+    ///
+    /// Предел ожидания короткий и намеренно: это происходит за микросекунды, а
+    /// затянувшееся ожидание означает не «сейчас получится», а «уже не
+    /// получится» — и висеть в нём означало бы не ответить и на все следующие
+    /// запросы тоже.
+    fn await_receive_cleared(&self) {
+        for _ in 0..1000 {
+            if self.musb.read16(reg::CSR0) & CSR0_RXPKTRDY == 0 {
+                return;
+            }
+            timer::delay_us(10);
+        }
     }
 
     /// Отправить очередную порцию ответа.
     ///
-    /// `first` означает, что это ещё и подтверждение самого запроса: его надо
-    /// снять ровно один раз, иначе контроллер примет следующий запрос поверх
-    /// незаконченного.
-    fn send_next(&mut self, first: bool) {
+    /// Подтверждения запроса здесь нет: оно отдано отдельно и раньше, в
+    /// [`Gadget::start_reply`], — см. объяснение там.
+    fn send_next(&mut self) {
         let Some(reply) = self.reply.as_mut() else {
             return;
         };
@@ -422,9 +570,6 @@ impl Gadget {
         self.musb.write_fifo(0, &data[from..from + chunk]);
 
         let mut csr = CSR0_TXPKTRDY;
-        if first {
-            csr |= CSR0_SVDRXPKTRDY;
-        }
         if done || chunk == 0 {
             csr |= CSR0_DATAEND;
             self.reply = None;
@@ -453,6 +598,24 @@ impl Gadget {
     #[must_use]
     pub fn is_high_speed(&self) -> bool {
         self.high_speed
+    }
+
+    /// Подключение и состояние нулевой точки прямо сейчас.
+    ///
+    /// Второе разделяет два очень разных отказа, снаружи неразличимых: разряд
+    /// «пришёл пакет» во взведённом состоянии означает, что хост нас спросил, а
+    /// мы не ответили; его отсутствие — что не спросил.
+    #[must_use]
+    pub fn snapshot(&self) -> Snapshot {
+        self.musb.select(0);
+        Snapshot {
+            power: self.musb.read8(reg::POWER),
+            csr0: self.musb.read16(reg::CSR0),
+            count0: self.musb.read8(reg::COUNT0),
+            faddr: self.musb.read8(reg::FADDR),
+            intrtx: self.musb.read16(reg::INTRTX),
+            swrst: self.musb.read8(reg::BUSPERF3),
+        }
     }
 }
 

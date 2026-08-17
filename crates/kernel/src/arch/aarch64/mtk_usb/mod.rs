@@ -107,18 +107,19 @@ pub unsafe fn start(fdt: &Fdt<'_>) -> Option<Report> {
         )
     };
 
+    // Заставить контроллер не обращать внимания на «болтовню» — помеху на
+    // линии, которую он иначе принимает за ошибку шины и на которую отвечает
+    // разрывом. Изготовитель делает эту же запись дважды, при подготовке блока
+    // и при запуске гаджета, и объясняет её наводкой от внешних источников.
+    let bus = musb.read8(reg::BUSPERF3);
+    musb.write8(reg::BUSPERF3, (bus & !0x40) | 0x80);
+
     let before = phy.state();
     phy.recover();
     let after = phy.state();
 
-    // Настройка шины контроллера, которую изготовитель делает при каждом
-    // запуске. Значение непрозрачно и в открытом драйвере объяснено одним
-    // номером обращения в поддержку; воспроизводим как есть.
-    let bus = musb.read8(reg::BUSPERF3);
-    musb.write8(reg::BUSPERF3, (bus & !0x40) | 0x80);
-
     let mut device = Gadget::new(musb);
-    device.attach();
+    device.prepare();
 
     musb.select(0);
     let report = Report {
@@ -158,6 +159,55 @@ pub fn service_task() {
         poll();
         crate::sched::sleep_ms(1);
     }
+}
+
+/// Рассказать в журнале, чем кончился обмен с хостом.
+///
+/// Печатается до того, как экран заберёт рабочий стол: на аппарате без линии
+/// это последний миг, когда журнал видит человек. Строка отвечает на
+/// единственный вопрос, который нельзя выяснить с той стороны кабеля, — доходят
+/// ли до нас запросы вообще.
+pub fn report() -> bool {
+    let guard = GADGET.lock();
+    let Some(device) = guard.as_ref() else {
+        // Устройства нет вовсе — ждать нечего, и держать журнал не для кого.
+        return true;
+    };
+    if device.is_configured() {
+        let speed = if device.is_high_speed() {
+            "high"
+        } else {
+            "full"
+        };
+        crate::kprintln!(
+            "  usb         : enumerated at {speed} speed, {} setup requests -- `fastboot oem log` works",
+            device.setups
+        );
+        return true;
+    }
+    // Всё, что может понадобиться, за один раз. Каждый вопрос к этой машине
+    // стоит перезагрузки и снимка экрана, сделанного руками, — значит цена
+    // лишнего числа в строке равна нулю, а цена недостающего равна заходу.
+    let now = device.snapshot();
+    crate::kprintln!(
+        "  usb         : no; resets {}, setups {}, replies {}, last {:#04x}/{:#04x}, events {:#04x}",
+        device.resets,
+        device.setups,
+        device.replies,
+        device.last.0,
+        device.last.1,
+        device.seen
+    );
+    crate::kprintln!(
+        "  usb         : power {:#04x} csr0 {:#06x} count0 {} faddr {:#04x} intrtx {:#06x} swrst {:#04x}",
+        now.power,
+        now.csr0,
+        now.count0,
+        now.faddr,
+        now.intrtx,
+        now.swrst
+    );
+    false
 }
 
 /// Перечислил ли нас хост: настройка выбрана, скорость договорена, признаки
