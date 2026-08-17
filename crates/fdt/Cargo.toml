@@ -1,0 +1,9 @@
+[package]
+name = "fdt"
+description = "Flattened Device Tree reader: the machine description a phone's bootloader hands over instead of ACPI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
