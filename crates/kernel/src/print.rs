@@ -4,6 +4,10 @@
 //! [`kprintln!`](crate::kprintln) пишет в оба, и каждый приёмник сам решает,
 //! готов ли он: до `serial::init` и до `console::init` вызовы просто ничего
 //! не делают, что позволяет пользоваться макросами с самой первой инструкции.
+//!
+//! Третий приёмник — [`klog`](crate::klog), кольцо в памяти. Он не показывает
+//! ничего и нужен там, где первые два молчат: у телефона линии наружу нет, а
+//! экран забирает рабочий стол. Строку оттуда потом отдаёт по кабелю fastboot.
 
 use core::fmt;
 
@@ -23,6 +27,7 @@ pub fn _print(args: fmt::Arguments<'_>) {
     crate::arch::interrupts::without_interrupts(|| {
         crate::serial::_print(args);
         crate::console::_print(args);
+        crate::klog::_print(args);
     });
 }
 

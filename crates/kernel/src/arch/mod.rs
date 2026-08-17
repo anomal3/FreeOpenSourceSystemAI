@@ -11,6 +11,7 @@
 //! | [`halt`]     | необратимая остановка процессора                     |
 //! | [`power_off`]| погасить машину: регистры ACPI или PSCI              |
 //! | [`reboot`]   | перезагрузить её же                                  |
+//! | [`poll_boot_devices`] | обмен с теми, кто не дождётся планировщика  |
 //!
 //! Остальной код ядра не содержит ни одного `#[cfg(target_arch)]`: выбор
 //! реализации происходит ровно один раз, вот в этом модуле.
@@ -22,7 +23,7 @@ mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
     ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, halt, pci_config_read32,
-    pci_config_write32, power_off, reboot, remember_serial, serial_fallback,
+    pci_config_write32, poll_boot_devices, power_off, reboot, remember_serial, serial_fallback,
     spawn_input_services, wait_for_interrupt,
 };
 
@@ -31,7 +32,7 @@ mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
     ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, halt, pci_config_read32,
-    pci_config_write32, power_off, reboot, remember_serial, serial_fallback,
+    pci_config_write32, poll_boot_devices, power_off, reboot, remember_serial, serial_fallback,
     spawn_input_services, wait_for_interrupt,
 };
 

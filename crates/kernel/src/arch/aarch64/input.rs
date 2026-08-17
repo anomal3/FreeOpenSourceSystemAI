@@ -132,10 +132,39 @@ fn touchscreen() -> bool {
     //
     // SAFETY: таблицы ядра активны, окна отображаются внутри.
     match unsafe { super::mtk_usb::start(&fdt) } {
-        Some((power, devctl)) => {
+        Some(report) => {
+            // Пара «до» и «после» — единственное доказательство, что записи
+            // дошли до железа. Прошлая редакция драйвера печатала здесь два
+            // нуля и была прочитана как «блок обесточен»; на деле окно было
+            // чужим. Числа остаются в отчёте именно поэтому.
             kprintln!(
-                "  usb         : connected to the bus, power {power:#04x}, devctl {devctl:#04x}"
+                "  usb phy     : window {:#010x}, mode {:#010x} -> {:#010x}, force {:#010x} -> {:#010x}",
+                report.phy_window,
+                report.before.0,
+                report.after.0,
+                report.before.1,
+                report.after.1
             );
+            kprintln!(
+                "  usb         : power {:#04x}, devctl {:#04x}, endpoints {:#04x}, config {:#04x}",
+                report.power,
+                report.devctl,
+                report.endpoints,
+                report.configdata
+            );
+            // Вывод делается здесь, а не человеком по четырём числам. Прошлый
+            // раз ровно эти нули были прочитаны как «блок обесточен», и заход
+            // ушёл в дерево тактов, тогда как ошибка была в адресе. Пусть
+            // машина называет обе возможности сама.
+            if report.after == (0, 0) {
+                kprintln!(
+                    "  usb         : the phy window reads zero even after writing -- wrong window or no clock"
+                );
+            } else {
+                kprintln!(
+                    "  usb         : pretending to be a fastboot device; try `fastboot devices`"
+                );
+            }
         }
         None => kprintln!("  usb         : no usb controller in the device tree"),
     }
