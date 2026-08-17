@@ -50,14 +50,14 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 // ---------------------------------------------------------------------------
 
 /// Бит 0: запись валидна. Ноль — Translation fault при первом обращении.
-const DESC_VALID: u64 = 1 << 0;
+pub(super) const DESC_VALID: u64 = 1 << 0;
 
 /// Бит 1. На уровнях L0…L2 отличает таблицу (1) от блока (0), на L3 —
 /// страницу (1) от зарезервированного значения (0). Мы не создаём блоков,
 /// поэтому в наших записях он всегда единица — но на промежуточных уровнях
 /// этот же бит нужно ещё и *проверять*, иначе блочная запись будет разобрана
 /// как указатель на таблицу.
-const DESC_TABLE: u64 = 1 << 1;
+pub(super) const DESC_TABLE: u64 = 1 << 1;
 /// То же самое значение в роли «это страница уровня L3».
 const DESC_PAGE: u64 = 1 << 1;
 
@@ -67,13 +67,13 @@ const DESC_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 /// Биты 4:2 — `AttrIndx`, номер байта в `MAIR_EL1`. Тип памяти на AArch64 не
 /// кодируется в самом дескрипторе (как PCD/PWT на x86), а выбирается косвенно
 /// из восьми предустановленных вариантов.
-const DESC_ATTR_INDX_SHIFT: u64 = 2;
+pub(super) const DESC_ATTR_INDX_SHIFT: u64 = 2;
 
 /// Биты 7:6 — `AP[2:1]`, права доступа.
-const DESC_AP_SHIFT: u64 = 6;
+pub(super) const DESC_AP_SHIFT: u64 = 6;
 
 /// Биты 9:8 — `SH[1:0]`, shareability.
-const DESC_SH_SHIFT: u64 = 8;
+pub(super) const DESC_SH_SHIFT: u64 = 8;
 
 /// Бит 10 — Access Flag.
 ///
@@ -82,7 +82,7 @@ const DESC_SH_SHIFT: u64 = 8;
 /// оставить AF нулём, первое же обращение к странице даст не «всё работает», а
 /// Access Flag fault, и выглядеть это будет как полностью отсутствующее
 /// отображение.
-const DESC_AF: u64 = 1 << 10;
+pub(super) const DESC_AF: u64 = 1 << 10;
 
 /// Бит 11 — non-global: запись привязана к текущему ASID. Отображения ядра
 /// обязаны быть глобальными, чтобы переживать смену ASID.
@@ -95,10 +95,10 @@ const DESC_NG: u64 = 1 << 11;
 /// бита два, и «страница исполняемая» означает «оба запрещающих бита сняты для
 /// нужного уровня привилегий». Отсутствие [`PageFlags::EXEC`] обязано ставить
 /// PXN — иначе данные ядра остаются исполняемыми, и W^X превращается в W.
-const DESC_PXN: u64 = 1 << 53;
+pub(super) const DESC_PXN: u64 = 1 << 53;
 
 /// Бит 54 — Unprivileged eXecute Never (в однорежимных описаниях просто XN).
-const DESC_UXN: u64 = 1 << 54;
+pub(super) const DESC_UXN: u64 = 1 << 54;
 
 // `AP[2:1]` (биты 7:6). Кодировка неинтуитивна: ноль — это не «нет доступа», а
 // «чтение и запись из EL1». Таблица из ARM ARM D8.4.1:
@@ -110,7 +110,7 @@ const DESC_UXN: u64 = 1 << 54;
 //   11      | только чтение   | только чтение
 //
 /// Память ядра, доступная на запись.
-const AP_EL1_RW: u64 = 0b00;
+pub(super) const AP_EL1_RW: u64 = 0b00;
 /// Память ядра, доступная только на чтение.
 const AP_EL1_RO: u64 = 0b10;
 /// Разделяемая с пользователем страница, доступная на запись.
@@ -120,7 +120,7 @@ const AP_EL1_RO_EL0_RO: u64 = 0b11;
 
 /// `SH[1:0]` = 00. Для Device-памяти поле игнорируется (она всегда трактуется
 /// как outer shareable), поэтому туда пишем ноль.
-const SH_NON_SHAREABLE: u64 = 0b00;
+pub(super) const SH_NON_SHAREABLE: u64 = 0b00;
 
 /// `SH[1:0]` = 11, inner shareable.
 ///
@@ -128,7 +128,7 @@ const SH_NON_SHAREABLE: u64 = 0b00;
 /// одного кластера архитектурой не гарантируется, и на многоядерной машине
 /// таблицы страниц, записанные одним ядром, другое может не увидеть. Ошибка
 /// при этом проявляется не сразу и не воспроизводится на одном ядре.
-const SH_INNER_SHAREABLE: u64 = 0b11;
+pub(super) const SH_INNER_SHAREABLE: u64 = 0b11;
 
 /// Сколько уровней в дереве при 4 КиБ и 48 битах.
 const LEVEL_COUNT: usize = 4;
@@ -137,7 +137,7 @@ const LEAF_LEVEL: usize = 0;
 /// Корневой уровень в той же нумерации (ARM: L0).
 const ROOT_LEVEL: usize = LEVEL_COUNT - 1;
 /// Записей в одной таблице.
-const ENTRIES_PER_TABLE: usize = PAGE_SIZE / size_of::<u64>();
+pub(super) const ENTRIES_PER_TABLE: usize = PAGE_SIZE / size_of::<u64>();
 
 // ---------------------------------------------------------------------------
 // MAIR_EL1: словарь типов памяти
@@ -163,13 +163,13 @@ const MAIR_ATTR_DEVICE_NGNRE: u64 = 0x04;
 /// записанное процессором лежит в кеше.
 const MAIR_ATTR_NORMAL_NC: u64 = 0x44;
 
-const ATTR_IDX_NORMAL: u64 = 0;
-const ATTR_IDX_DEVICE_NGNRNE: u64 = 1;
+pub(super) const ATTR_IDX_NORMAL: u64 = 0;
+pub(super) const ATTR_IDX_DEVICE_NGNRNE: u64 = 1;
 const ATTR_IDX_DEVICE_NGNRE: u64 = 2;
-const ATTR_IDX_NORMAL_NC: u64 = 3;
+pub(super) const ATTR_IDX_NORMAL_NC: u64 = 3;
 
 /// Готовое значение `MAIR_EL1`: восемь байт, по байту на индекс атрибута.
-const MAIR_EL1_VALUE: u64 = (MAIR_ATTR_NORMAL_WB << (ATTR_IDX_NORMAL * 8))
+pub(super) const MAIR_EL1_VALUE: u64 = (MAIR_ATTR_NORMAL_WB << (ATTR_IDX_NORMAL * 8))
     | (MAIR_ATTR_DEVICE_NGNRNE << (ATTR_IDX_DEVICE_NGNRNE * 8))
     | (MAIR_ATTR_DEVICE_NGNRE << (ATTR_IDX_DEVICE_NGNRE * 8))
     | (MAIR_ATTR_NORMAL_NC << (ATTR_IDX_NORMAL_NC * 8));
@@ -221,9 +221,9 @@ const ID_AA64MMFR0_TGRAN4_MASK: u64 = 0xF;
 const ID_AA64MMFR0_TGRAN4_NONE: u64 = 0b1111;
 
 // SCTLR_EL1
-const SCTLR_M: u64 = 1 << 0; // MMU включён
-const SCTLR_C: u64 = 1 << 2; // кеш данных включён
-const SCTLR_I: u64 = 1 << 12; // кеш инструкций включён
+pub(super) const SCTLR_M: u64 = 1 << 0; // MMU включён
+pub(super) const SCTLR_C: u64 = 1 << 2; // кеш данных включён
+pub(super) const SCTLR_I: u64 = 1 << 12; // кеш инструкций включён
 /// `SPAN` = 1 — не взводить `PSTATE.PAN` при входе в исключение.
 ///
 /// `FEAT_PAN` запрещает EL1 обращаться к страницам, доступным EL0, а при
@@ -244,7 +244,7 @@ const SCTLR_I: u64 = 1 << 12; // кеш инструкций включён
 /// отдельная работа: снимать придётся в каждом месте, где ядро трогает
 /// пользовательский адрес. Пока ядро выбирает то же поведение, что было у него
 /// всегда, — но выбирает его явно, а не по недосмотру.
-const SCTLR_SPAN: u64 = 1 << 23;
+pub(super) const SCTLR_SPAN: u64 = 1 << 23;
 
 // ---------------------------------------------------------------------------
 // Примитивы синхронизации трансляции
@@ -315,7 +315,7 @@ fn id_aa64mmfr0() -> u64 {
 /// Ставить в `IPS` значение больше того, что заявляет `PARange`, нельзя:
 /// поведение не определено. Поэтому берём минимум из заявленного железом и
 /// того, что умеем сами.
-fn supported_ips() -> u64 {
+pub(super) fn supported_ips() -> u64 {
     (id_aa64mmfr0() & ID_AA64MMFR0_PARANGE_MASK).min(TCR_IPS_48BIT)
 }
 
@@ -336,7 +336,7 @@ fn current_el() -> u64 {
 }
 
 /// Собрать значение `TCR_EL1` для 48-битной трансляции обеих половин.
-fn tcr_el1_value(ips: u64) -> u64 {
+pub(super) fn tcr_el1_value(ips: u64) -> u64 {
     // EPD0 (бит 7) и EPD1 (бит 23) остаются нулями — именно это и включает обе
     // половины: единица в EPD запретила бы обход таблиц соответствующего TTBR
     // и превратила бы любое обращение в Translation fault.
@@ -723,6 +723,23 @@ impl AddressSpace for PageTables {
 /// Обычная память ядра: чтение и запись, исполнение запрещено.
 const KERNEL_DATA: PageFlags = PageFlags::READ.union(PageFlags::WRITE);
 /// MMIO и фреймбуфер.
+/// Кадровый буфер: обычная память **без кэша**, а не память устройства.
+///
+/// Разница видна и на глаз, и на секундомере. Device-nGnRnE запрещает
+/// объединять записи: каждая точка — отдельная посылка на шину, и заливка
+/// экрана телефона занимала десятки секунд, которые было видно сверху вниз.
+/// Normal Non-Cacheable даёт то же, ради чего Device здесь и стоял, — панель
+/// читает буфер мимо кэша и видит записанное сразу, — но разрешает процессору
+/// собирать записи в пакеты.
+///
+/// Есть и вторая причина, менее заметная и более опасная: тип памяти обязан
+/// совпадать с тем, которым тот же буфер описан в **ранней** раскладке
+/// (`boot_mmu`). Два разных типа на один физический адрес архитектура объявляет
+/// непредсказуемым поведением, и здесь «непредсказуемо» означало бы картинку,
+/// портящуюся через минуту после загрузки, когда вытеснится строка кэша.
+const KERNEL_FRAMEBUFFER: PageFlags =
+    PageFlags::READ.union(PageFlags::WRITE).union(PageFlags::DMA);
+
 const KERNEL_DEVICE: PageFlags =
     PageFlags::READ.union(PageFlags::WRITE).union(PageFlags::DEVICE);
 /// Права образа ядра, когда загрузчик не сообщил сегменты, — то есть W^X не
@@ -1234,7 +1251,9 @@ fn map_physical_memory(
         // Reserved — это прошивка и MMIO. Normal-память процессору позволено
         // читать спекулятивно, а спекулятивное чтение регистра устройства
         // имеет побочные эффекты; Device-семантика такое чтение запрещает.
-        let flags = if region.kind == KIND_RESERVED || region.kind == KIND_FRAMEBUFFER {
+        let flags = if region.kind == KIND_FRAMEBUFFER {
+            KERNEL_FRAMEBUFFER
+        } else if region.kind == KIND_RESERVED {
             KERNEL_DEVICE
         } else {
             KERNEL_DATA
@@ -1333,18 +1352,19 @@ fn map_devices(
     // прямое отображение уже описывает ту же страницу как обычную память, а два
     // разных типа памяти на один физический адрес архитектура объявляет
     // непредсказуемым поведением.
+    //
+    // Адрес берётся у самого порта, а не из константы QEMU: на машине,
+    // описанной деревом устройств, он уже найден и уже используется — вся
+    // диагностика загрузки шла через него. Отобразить вместо него умолчание
+    // значило бы оставить работающую линию без окна ровно в тот момент, когда
+    // она нужнее всего.
     if !crate::serial::absent() {
-        let uart = PhysAddr::new(super::QEMU_VIRT_PL011 as u64);
-        // SAFETY: пространство не активировано; страница регистров PL011 не
+        let base = super::serial_base();
+        let uart = PhysAddr::new(base as u64);
+        // SAFETY: пространство не активировано; страница регистров UART не
         // пересекается с кодом или стеком ядра.
         unsafe {
-            space.map_range(
-                VirtAddr::new(super::QEMU_VIRT_PL011),
-                uart,
-                PAGE_SIZE,
-                KERNEL_DEVICE,
-                alloc,
-            )?;
+            space.map_range(VirtAddr::new(base), uart, PAGE_SIZE, KERNEL_DEVICE, alloc)?;
             space.map_range(uart.to_direct_map(), uart, PAGE_SIZE, KERNEL_DEVICE, alloc)?;
         }
     }
@@ -1382,10 +1402,10 @@ fn map_devices(
                 VirtAddr::new(fb.as_u64() as usize),
                 fb,
                 len,
-                KERNEL_DEVICE,
+                KERNEL_FRAMEBUFFER,
                 alloc,
             )?;
-            space.map_range(fb.to_direct_map(), fb, len, KERNEL_DEVICE, alloc)?;
+            space.map_range(fb.to_direct_map(), fb, len, KERNEL_FRAMEBUFFER, alloc)?;
         }
     }
 

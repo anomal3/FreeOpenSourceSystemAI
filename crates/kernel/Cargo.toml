@@ -14,6 +14,13 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# Сборка для чужого загрузчика: вход по договору Linux, дерево устройств вместо
+# UEFI, фиксированный адрес компоновки (`phone.ld`). Включается только через
+# `cargo xtask phone --kernel-image`; обычная сборка ядра остаётся PIE и об этом
+# коде не знает.
+phone = []
+
 [dependencies]
 boot-info = { path = "../boot-info" }
 # Дата из секунд эпохи и обратно. Тот же крейт считает время в загрузчике и в

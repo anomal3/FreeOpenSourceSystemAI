@@ -31,25 +31,25 @@
 //! вслух: молча потерянная область памяти выглядит как «машина видит вдвое
 //! меньше ОЗУ», и искать это будут в распределителе.
 
-// Потребитель этого модуля — второй вход в ядро, по договору Linux
-// (`kernel_main_fdt`), которого ещё нет: он пишется следующим шагом. До тех пор
-// модуль собирается, но не вызывается ниоткуда, и это намеренно — разбор дерева
-// проверяется отдельно от входа, потому что ошибки у них разные и чинятся
-// по-разному.
+// Разбор дерева нужен только там, где машина описана им, — то есть на входе по
+// договору Linux. На UEFI-сборке модуль компилируется, но не вызывается, и это
+// намеренно: разбор проверяется отдельно от входа, потому что ошибки у них
+// разные и чинятся по-разному.
 #![allow(dead_code)]
 
 use boot_info::{
-    Arch, BootInfo, Framebuffer, MemoryKind, MemoryMap, MemoryRegion, PixelFormat,
+    Arch, BootInfo, Framebuffer, KernelImage, MemoryKind, MemoryMap, MemoryRegion, PixelFormat,
 };
 use fdt::Fdt;
 
 /// Сколько областей памяти помещается в карту.
 ///
-/// Тридцать две — это вчетверо больше, чем бывает у телефона: у MT6765 один
-/// банк ОЗУ и с десяток зарезервированных кусков (модем, доверенная среда,
-/// кадровый буфер). Предел существует потому, что памяти под массив взять
+/// Считать надо не банки, а куски, на которые они разрезаны: каждая занятая
+/// область делит свободную надвое. У MT6765 один банк ОЗУ и с десяток
+/// зарезервированных кусков, то есть около тридцати записей; девяносто шесть —
+/// троекратный запас. Предел существует потому, что памяти под массив взять
 /// негде: он в `.bss`, и вырасти по ходу не может.
-const MAX_REGIONS: usize = 32;
+const MAX_REGIONS: usize = 96;
 
 /// Карта памяти. Статическая по той же причине, по которой нет `Vec`.
 static mut REGIONS: [MemoryRegion; MAX_REGIONS] =
@@ -74,6 +74,16 @@ pub const DEFAULT_SCREEN: (u32, u32) = (720, 1600);
 
 /// Собрать описание машины из дерева, лежащего по адресу `dtb`.
 ///
+/// `screen` — кадровый буфер, если вызывающий узнал его сам. На MediaTek это
+/// именно так: адрес спрашивается у контроллера дисплея, а не берётся из
+/// `/chosen`, где загрузчик называет память, которую он **резервирует**, а не
+/// ту, которую показывает (см. [`super::mtk::scanned_buffer`]). `None` означает
+/// «поищи в дереве» — путь для машин, где загрузчик честен.
+///
+/// `image` — где лежит сам работающий код. Без этого распределитель кадров
+/// выдал бы страницу ядра под первую же аллокацию: узлы `/memory` описывают всё
+/// ОЗУ свободным, включая тот кусок, из которого ядро исполняется.
+///
 /// Возвращает `None`, если по адресу не дерево или в нём нет памяти: без карты
 /// памяти ядру нечего делать, и лучше остановиться здесь, чем в распределителе
 /// кадров, где причина будет не видна.
@@ -82,35 +92,69 @@ pub const DEFAULT_SCREEN: (u32, u32) = (720, 1600);
 ///
 /// `dtb` — адрес, полученный от загрузчика в `x0`. Он обязан указывать на
 /// отображённую память; всё остальное проверяется разбором.
-pub unsafe fn describe(dtb: *const u8, screen: (u32, u32)) -> Option<&'static BootInfo> {
+pub unsafe fn describe(
+    dtb: *const u8,
+    screen: Option<Framebuffer>,
+    image: KernelImage,
+) -> Option<&'static BootInfo> {
     // SAFETY: контракт функции.
     let fdt = unsafe { Fdt::from_ptr(dtb) }?;
 
+    let framebuffer = match screen {
+        Some(given) => given,
+        None => framebuffer(&fdt, DEFAULT_SCREEN),
+    };
+
+    // Сначала — всё занятое, до последнего куска, и только потом свободное.
+    //
+    // # Почему не «позже уточняет раньше»
+    //
+    // Соблазнительно выписать банки ОЗУ свободными, а поверх них занятые куски,
+    // и считать, что читатель разберётся. Читатель не разбирается:
+    // распределитель кадров (`mm::frame`) раздаёт нули по регионам `Usable` и
+    // **не** проходит по карте второй раз, вычёркивая занятое. Карте UEFI такой
+    // проход и не нужен — она разбиение, а не набор наложенных прямоугольников,
+    // и один физический адрес описан в ней ровно однажды.
+    //
+    // Это стоило захода: карта выглядела правильной, ядро печатало «reserved»
+    // про собственный образ — и тут же выдавало его страницы под таблицы,
+    // затирая себя на ходу. Поэтому здесь свободное **вырезается** вокруг
+    // занятого, а не покрывается им.
+    let mut taken = [Span::EMPTY; MAX_TAKEN];
+    let mut taken_count = 0;
+
+    taken_count = reserved_spans(&fdt, &mut taken, taken_count);
+    // Само дерево: затереть его означало бы затереть описание машины по ходу
+    // чтения.
+    taken_count = add_span(
+        &mut taken,
+        taken_count,
+        dtb as u64,
+        blob_len(&fdt),
+        MemoryKind::BootloaderReclaimable,
+    );
+    // Образ: он лежит в обычном ОЗУ и попадает в `/memory` свободным.
+    taken_count = add_span(&mut taken, taken_count, image.base, image.size, MemoryKind::Reserved);
+    // Кадровый буфер: отданный под кучу, он выглядит как цветной мусор поверх
+    // интерфейса — и появляется не сразу, а когда куче понадобится расти.
+    taken_count = add_span(
+        &mut taken,
+        taken_count,
+        framebuffer.base,
+        framebuffer.size,
+        MemoryKind::Framebuffer,
+    );
+
+    sort_spans(&mut taken[..taken_count]);
+
     let mut count = 0;
-    // Порядок важен: сначала свободное, потом занятое. Тот, кто читает карту,
-    // обязан считать более позднюю запись уточнением более ранней — ровно так
-    // же ведёт себя карта UEFI, и заводить второе правило ради второй машины
-    // значило бы иметь два распределителя.
-    count = collect_memory(&fdt, count);
-    count = collect_reserved(&fdt, count);
-    count = mark(dtb as u64, blob_len(&fdt), MemoryKind::BootloaderReclaimable, count);
+    for span in &taken[..taken_count] {
+        count = mark(span.start, span.len(), span.kind, count);
+    }
+    count = collect_memory(&fdt, &taken[..taken_count], count);
 
     if count == 0 {
         return None;
-    }
-
-    let framebuffer = framebuffer(&fdt, screen);
-    // Кадровый буфер отмечается занятым отдельно: он живёт в обычном ОЗУ,
-    // попадает в `/memory` как свободный, и распределитель кадров, не знающий
-    // об этом, отдал бы его первой же программе — а на экране это выглядит как
-    // цветной мусор поверх интерфейса.
-    if framebuffer.base != 0 {
-        count = mark(
-            framebuffer.base,
-            framebuffer.size,
-            MemoryKind::Framebuffer,
-            count,
-        );
     }
 
     // SAFETY: ядро однопоточно в этот момент — это первые инструкции после
@@ -120,6 +164,7 @@ pub unsafe fn describe(dtb: *const u8, screen: (u32, u32)) -> Option<&'static Bo
         let info = &mut *(&raw mut INFO);
         info.framebuffer = framebuffer;
         info.device_tree = dtb as u64;
+        info.kernel = image;
         info.memory_map = MemoryMap {
             ptr: (&raw const REGIONS) as u64,
             len: count as u64,
@@ -151,22 +196,102 @@ fn mark(start: u64, len: u64, kind: MemoryKind, count: usize) -> usize {
     count + 1
 }
 
-/// Банки ОЗУ из узлов `/memory`.
+/// Банки ОЗУ из узлов `/memory`, за вычетом всего занятого.
 ///
 /// Узлов бывает несколько, и это не редкость: у машин с раздельными банками
 /// каждый описан своим. Брать только первый значило бы увидеть половину памяти
 /// — то есть работающую систему, у которой необъяснимо мало ОЗУ.
-fn collect_memory(fdt: &Fdt<'_>, mut count: usize) -> usize {
+///
+/// `taken` обязан быть отсортирован по началу: банк режется одним проходом
+/// слева направо, а такой проход возможен только по упорядоченному списку.
+fn collect_memory(fdt: &Fdt<'_>, taken: &[Span], mut count: usize) -> usize {
     let (address_cells, size_cells) = root_cells(fdt);
     for node in fdt.nodes() {
         if node.property_str("device_type") != Some("memory") {
             continue;
         }
         for region in node.reg(address_cells, size_cells) {
-            count = mark(region.address, region.size, MemoryKind::Usable, count);
+            let mut start = region.address;
+            let end = region.address.saturating_add(region.size);
+            for span in taken {
+                if span.end <= start {
+                    continue;
+                }
+                if span.start >= end {
+                    break;
+                }
+                if span.start > start {
+                    count = mark(start, span.start - start, MemoryKind::Usable, count);
+                }
+                start = start.max(span.end);
+            }
+            if start < end {
+                count = mark(start, end - start, MemoryKind::Usable, count);
+            }
         }
     }
     count
+}
+
+/// Занятый кусок физической памяти.
+#[derive(Clone, Copy)]
+struct Span {
+    start: u64,
+    end: u64,
+    kind: MemoryKind,
+}
+
+impl Span {
+    const EMPTY: Self = Self { start: 0, end: 0, kind: MemoryKind::Reserved };
+
+    fn len(&self) -> u64 {
+        self.end - self.start
+    }
+}
+
+/// Сколько занятых кусков помещается.
+///
+/// У телефона их с десяток: модем, доверенная среда, кадровый буфер, само
+/// дерево, образ ядра. Двадцать четыре — вдвое больше, чем видно на аппарате.
+const MAX_TAKEN: usize = 24;
+
+/// Добавить кусок, округлив его наружу до целых страниц.
+///
+/// Округление именно наружу: полстраницы, оставшейся «свободной» внутри чужой
+/// области, хватит, чтобы распределитель выдал её целиком — страница неделима.
+fn add_span(
+    taken: &mut [Span; MAX_TAKEN],
+    count: usize,
+    start: u64,
+    len: u64,
+    kind: MemoryKind,
+) -> usize {
+    if len == 0 {
+        return count;
+    }
+    if count == MAX_TAKEN {
+        crate::kprintln!("  fdt         : too many reserved areas, dropping {start:#x}+{len:#x}");
+        return count;
+    }
+    const PAGE: u64 = 4096;
+    taken[count] = Span {
+        start: start & !(PAGE - 1),
+        end: start.saturating_add(len).next_multiple_of(PAGE),
+        kind,
+    };
+    count + 1
+}
+
+/// Упорядочить по началу. Вставками: список короткий, а сортировки без
+/// выделения памяти в `core` нет.
+fn sort_spans(spans: &mut [Span]) {
+    for index in 1..spans.len() {
+        let mut slot = index;
+        while slot > 0 && spans[slot - 1].start > spans[slot].start {
+            spans.swap(slot - 1, slot);
+            slot -= 1;
+        }
+    }
 }
 
 /// Куски, которые занял кто-то до нас: `/reserved-memory`.
@@ -174,7 +299,7 @@ fn collect_memory(fdt: &Fdt<'_>, mut count: usize) -> usize {
 /// На телефоне их много и они не украшение: там живут модем, доверенная среда и
 /// сам кадровый буфер. Отдать такой кусок распределителю — это перезаписать
 /// чужую память, и проявится оно не сразу и не там.
-fn collect_reserved(fdt: &Fdt<'_>, mut count: usize) -> usize {
+fn reserved_spans(fdt: &Fdt<'_>, taken: &mut [Span; MAX_TAKEN], mut count: usize) -> usize {
     let Some(parent) = fdt.find("/reserved-memory") else {
         return count;
     };
@@ -186,7 +311,7 @@ fn collect_reserved(fdt: &Fdt<'_>, mut count: usize) -> usize {
 
     for node in fdt.nodes().filter(|node| node.depth == parent.depth + 1) {
         for region in node.reg(address_cells, size_cells) {
-            count = mark(region.address, region.size, MemoryKind::Reserved, count);
+            count = add_span(taken, count, region.address, region.size, MemoryKind::Reserved);
         }
     }
     count
@@ -282,6 +407,70 @@ fn videolfb_blob(chosen: &fdt::Node<'_>) -> Option<(u64, u64)> {
     let base = u64::from_be_bytes(value[0..8].try_into().ok()?);
     let vram = u64::from(u32::from_be_bytes(value[16..20].try_into().ok()?));
     Some((base, vram))
+}
+
+/// Где в этой машине контроллер прерываний.
+///
+/// То же, что MADT даёт на UEFI-машине, только из дерева. Без этого ядро
+/// осталось бы с умолчаниями QEMU (`0x08000000`), а у телефона распределитель
+/// лежит по `0x0C000000` — то есть первое же обращение к контроллеру ушло бы в
+/// пустое место шины. Настроенный и молчащий контроллер снаружи неотличим от
+/// работающего, поэтому догадка здесь опаснее отказа.
+///
+/// Порядок окон в `reg` задан привязкой самого дерева: у GICv3 сначала
+/// распределитель, потом redistributor; у GICv2 — распределитель и
+/// процессорный интерфейс. Перепутать их местами значит настроить одно через
+/// другое.
+pub fn gic_layout(fdt: &Fdt<'_>) -> Option<super::acpi::GicLayout> {
+    let node = fdt
+        .find_compatible("arm,gic-v3")
+        .map(|node| (node, 3u8))
+        .or_else(|| fdt.find_compatible("arm,gic-400").map(|node| (node, 2)))
+        .or_else(|| fdt.find_compatible("arm,cortex-a15-gic").map(|node| (node, 2)));
+    let (node, version) = node?;
+
+    let (address_cells, size_cells) = root_cells(fdt);
+    let mut windows = node.reg(address_cells, size_cells);
+    let distributor = windows.next()?.address;
+    if distributor == 0 {
+        return None;
+    }
+    let second = windows.next().map(|region| region.address).filter(|address| *address != 0);
+
+    Some(super::acpi::GicLayout {
+        distributor: distributor as usize,
+        cpu_interface: if version == 2 { second.map(|address| address as usize) } else { None },
+        redistributor: if version == 3 { second.map(|address| address as usize) } else { None },
+        version,
+    })
+}
+
+/// Узел последовательного порта: тот, что назвал загрузчик, или первый знакомый.
+///
+/// `stdout-path` — это выбор загрузчика, и уважать его важнее, чем найти первый
+/// попавшийся порт: портов у машины несколько, а наружу выведен обычно один.
+///
+/// Возвращает адрес окна регистров и признак «это PL011». Всё остальное, что
+/// встречается на ARM, — 16550 или его родня, включая `mediatek,mt6577-uart`.
+pub fn uart(fdt: &Fdt<'_>) -> Option<(usize, bool)> {
+    let node = stdout(fdt).or_else(|| {
+        fdt.find_compatible("arm,pl011")
+            .or_else(|| fdt.find_compatible("mediatek,mt6577-uart"))
+            .or_else(|| fdt.find_compatible("ns16550a"))
+            .or_else(|| fdt.find_compatible("ns16550"))
+    })?;
+    let pl011 = node.is_compatible("arm,pl011");
+    let (address_cells, size_cells) = root_cells(fdt);
+    let region = node.reg(address_cells, size_cells).next()?;
+    (region.address != 0).then_some((region.address as usize, pl011))
+}
+
+/// Узел, названный в `/chosen/stdout-path`.
+fn stdout<'a>(fdt: &Fdt<'a>) -> Option<fdt::Node<'a>> {
+    let path = fdt.find("/chosen")?.property_str("stdout-path")?;
+    // Путь бывает с параметрами линии через двоеточие: `/pl011@9000000:115200n8`.
+    let path = path.split(':').next().unwrap_or(path);
+    fdt.find(path)
 }
 
 /// Длина самого дерева — чтобы отметить его память занятой.

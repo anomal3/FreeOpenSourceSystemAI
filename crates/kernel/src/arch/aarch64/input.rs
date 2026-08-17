@@ -67,6 +67,18 @@ pub fn init(_info: &BootInfo) -> Sources {
         return sources;
     }
 
+    // Номер прерывания ниже — константа, снятая с одной машины, и верна она
+    // ровно там, где порт PL011. На телефоне порт другой (16550 от MediaTek), а
+    // `INTID 33` там принадлежит какому-то из его устройств: разрешить его
+    // значило бы получать чужие прерывания и считать их нажатиями клавиш.
+    // Линия наружу у аппарата всё равно не выведена, так что терять нечего.
+    if !super::serial_is_pl011() {
+        kprintln!("  serial in   : this port is not PL011; its interrupt number is unknown");
+        let sources = Sources::default();
+        crate::input::set_sources(sources);
+        return sources;
+    }
+
     if !matches!(gic::version(), Some(gic::Version::V2 | gic::Version::V3)) {
         kprintln!("  input       : no usable GIC, the UART interrupt cannot be enabled");
         let sources = Sources::default();

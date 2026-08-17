@@ -22,7 +22,8 @@ mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
     ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, halt, pci_config_read32,
-    pci_config_write32, power_off, reboot, wait_for_interrupt,
+    pci_config_write32, power_off, reboot, remember_serial, serial_fallback,
+    wait_for_interrupt,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -30,8 +31,16 @@ mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
     ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, halt, pci_config_read32,
-    pci_config_write32, power_off, reboot, wait_for_interrupt,
+    pci_config_write32, power_off, reboot, remember_serial, serial_fallback,
+    wait_for_interrupt,
 };
+
+/// Вход по договору Linux: дерево устройств в `x0`, MMU выключен.
+///
+/// Существует только в сборке для телефона — там, где ядро запускает чужой
+/// загрузчик. См. [`aarch64::linux_boot`].
+#[cfg(all(target_arch = "aarch64", feature = "phone"))]
+pub use aarch64::linux_boot;
 
 /// Адресное пространство ядра — реализация [`crate::mm::AddressSpace`] для
 /// текущей архитектуры. На x86-64 это дерево от PML4, на AArch64 — пара

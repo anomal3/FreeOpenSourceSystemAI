@@ -29,10 +29,51 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// Порт был отключён, потому что его там не оказалось.
 static ABSENT: AtomicBool = AtomicBool::new(false);
 
+/// Порт назван до входа в общую часть ядра — см. [`preset`].
+static PRESET: AtomicBool = AtomicBool::new(false);
+
 /// Инициализировать порт. Вызывается один раз, самым первым делом в ядре.
 pub fn init() {
-    SERIAL.lock().init();
+    // Порт, названный заранее, повторно не заводится и не подменяется. Разница
+    // не косметическая: `arch::Serial::PLATFORM` — это адрес PL011 у QEMU, и на
+    // машине, где по нему нет ничего, «инициализация» означала бы запись в
+    // чужие регистры вслепую.
+    if PRESET.load(Ordering::Acquire) {
+        return;
+    }
+    let mut port = SERIAL.lock();
+    port.init();
+    crate::arch::remember_serial(&port);
     READY.store(true, Ordering::Release);
+}
+
+/// Назвать порт до того, как ядро начнёт печатать.
+///
+/// Нужно там, где адрес линии неизвестен до разбора дерева устройств, то есть
+/// на входе по договору Linux. `None` означает «в этой машине порта нет»: тогда
+/// ядро молчит с самого начала, а не после двух десятков строк, ушедших по
+/// угаданному адресу.
+///
+/// # Safety
+///
+/// `device` обязан описывать настоящий UART, чьё окно регистров уже отображено
+/// с Device-семантикой. Вызывать до [`init`].
+pub unsafe fn preset(device: Option<crate::arch::Serial>) {
+    match device {
+        Some(device) => {
+            let mut port = SERIAL.lock();
+            *port = device;
+            port.init();
+            crate::arch::remember_serial(&port);
+            ABSENT.store(false, Ordering::Release);
+            READY.store(true, Ordering::Release);
+        }
+        None => {
+            READY.store(false, Ordering::Release);
+            ABSENT.store(true, Ordering::Release);
+        }
+    }
+    PRESET.store(true, Ordering::Release);
 }
 
 /// Замолчать: по адресу порта не порт.
@@ -80,6 +121,7 @@ pub unsafe fn adopt(device: arch::Serial) {
     let mut port = SERIAL.lock();
     *port = device;
     port.init();
+    arch::remember_serial(&port);
     ABSENT.store(false, Ordering::Release);
     READY.store(true, Ordering::Release);
 }
@@ -129,11 +171,16 @@ pub fn _print(args: fmt::Arguments<'_>) {
         None => {
             // Лок занят — значит мы вклинились в чужой вывод. Пишем мимо лока:
             // `arch::Serial` не хранит состояния, которое можно порвать, — это
-            // адрес порта и ничего больше, а `write_byte` укладывается в одну
-            // запись регистра. Поэтому копия `PLATFORM` на стеке адресует тот
-            // же самый UART и не создаёт второй ссылки на глобальное значение.
-            // Цена — перемешанные символы двух сообщений; молчание дороже.
-            let mut fallback = arch::Serial::PLATFORM;
+            // адрес порта и его вид, а `write_byte` укладывается в одну запись
+            // регистра. Поэтому копия на стеке адресует тот же самый UART и не
+            // создаёт второй ссылки на глобальное значение. Цена — перемешанные
+            // символы двух сообщений; молчание дороже.
+            //
+            // Копия берётся у арх-слоя, а не из константы `PLATFORM`: на
+            // машине, где порт нашёлся в дереве, константа означает адрес, по
+            // которому нет ничего, и сообщение об отказе стало бы вторым
+            // отказом.
+            let mut fallback = arch::serial_fallback();
             let _ = Port(&mut fallback).write_fmt(args);
         }
     }

@@ -3,6 +3,84 @@
 
 pub mod fdt_boot;
 pub mod acpi;
+pub mod boot_mmu;
+pub mod mtk;
+
+// Вход по договору Linux собирается только для телефона: он тянет за собой
+// ассемблерный заголовок, фиксированный адрес компоновки и свой компоновочный
+// сценарий. На UEFI-сборке всего этого быть не должно — там точка входа одна и
+// адрес размещения заранее неизвестен.
+#[cfg(feature = "phone")]
+pub mod linux_boot;
+
+/// Адрес дерева устройств, если машина описана им.
+///
+/// Ноль означает «нет дерева» — так на всякой UEFI-машине, где описание
+/// приезжает таблицами ACPI. Заводится один раз, на входе по договору Linux, и
+/// дальше читается теми, кто иначе полагался бы на умолчания QEMU: поиском
+/// контроллера прерываний и поиском линии.
+static DEVICE_TREE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Запомнить дерево устройств этой машины.
+pub fn set_device_tree(dtb: u64) {
+    DEVICE_TREE.store(dtb, core::sync::atomic::Ordering::Release);
+}
+
+/// Разобрать запомненное дерево, если оно есть.
+///
+/// # Safety
+///
+/// Память, в которой лежит дерево, обязана быть ещё отображена и не
+/// переиспользована. Она помечена `BootloaderReclaimable`, то есть ядро вправе
+/// её забрать, — и вызывать это после того, как оно её забрало, нельзя.
+unsafe fn device_tree() -> Option<fdt::Fdt<'static>> {
+    let dtb = DEVICE_TREE.load(core::sync::atomic::Ordering::Acquire);
+    if dtb == 0 {
+        return None;
+    }
+    // SAFETY: контракт функции; невалидное дерево даёт `None`, а не чтение мимо.
+    unsafe { fdt::Fdt::from_ptr(dtb as *const u8) }
+}
+
+/// Линия, объявленная деревом этой машины.
+///
+/// `None` означает «в дереве порта нет» — законное состояние, и обрабатывать
+/// его молчанием правильнее, чем догадкой: писать по угаданному адресу на
+/// телефоне значит писать в чужие регистры.
+pub fn serial_from_tree(fdt: &fdt::Fdt<'_>) -> Option<Serial> {
+    let (base, pl011) = fdt_boot::uart(fdt)?;
+    // SAFETY: адрес взят из дерева машины и описывает окно регистров UART;
+    // отображено оно ранней раскладкой как память устройства.
+    let port = unsafe { if pl011 { Serial::at(base) } else { Serial::ns16550(base) } };
+
+    // Порт, объявленный деревом, может быть выключен: у телефона питание и
+    // тактирование блоков раздаёт отдельный контроллер, и линия, которой не
+    // пользовались, вполне может стоять без тактов. Регистр состояния тогда
+    // читается нулями, «передатчик свободен» не наступает никогда, и каждый
+    // печатаемый байт обходится в предел ожидания. Загрузочный журнал — тысячи
+    // байт; молчание вышло бы дешевле, а выглядело бы это как зависание.
+    //
+    // Проверка стоит один короткий опрос и отвечает на единственный вопрос:
+    // отдаёт ли порт хоть когда-нибудь готовность.
+    // SAFETY: чтение регистра состояния побочных эффектов не имеет.
+    let alive = (0..1000).any(|_| unsafe {
+        match port.kind {
+            Kind::Pl011 => port.read(REG_FR) & FR_TXFF == 0,
+            Kind::Ns16550 => port.read(NS16550_LSR) & NS16550_THRE != 0,
+        }
+    });
+    alive.then_some(port)
+}
+
+/// Тот ли это порт, для которого известен номер прерывания.
+///
+/// Номер снят с QEMU `virt` и верен ровно для PL011 (см.
+/// [`input::UART_INTID`]); у всякого другого порта он означал бы чужое
+/// устройство.
+#[must_use]
+pub fn serial_is_pl011() -> bool {
+    serial_fallback().kind == Kind::Pl011
+}
 
 /// Выяснить, где на этой машине контроллер прерываний, и отобразить его окна.
 ///
@@ -18,6 +96,28 @@ pub mod acpi;
 ///
 /// Вызывать один раз, до [`gic::init`], на активных таблицах ядра.
 pub unsafe fn probe_gic(rsdp: u64) {
+    // Дерево — раньше ACPI, и не по вкусу: на машине, описанной деревом, таблиц
+    // нет вовсе, а умолчания QEMU там означают чужой адрес. У телефона
+    // распределитель по `0x0C000000`, у QEMU `virt` — по `0x08000000`.
+    //
+    // SAFETY: дерево ещё не переиспользовано — ядро забирает его память только
+    // после того, как прочитает отсюда всё нужное.
+    if let Some(layout) = unsafe { device_tree() }.as_ref().and_then(fdt_boot::gic_layout) {
+        crate::kprintln!(
+            "  interrupts  : the device tree says GICv{} at {:#010x}",
+            layout.version,
+            layout.distributor
+        );
+        if let Some(base) = layout.redistributor {
+            crate::kprintln!("  interrupts  : redistributor at {base:#010x}");
+        }
+        gic::configure(&layout);
+        // SAFETY: адреса пришли из дерева машины и описывают регистры
+        // контроллера; таблицы ядра активны.
+        unsafe { map_gic_windows() };
+        return;
+    }
+
     // SAFETY: контракт функции; ноль означает «таблиц нет».
     match unsafe { acpi::find_gic(rsdp) } {
         Some(layout) => {
@@ -42,30 +142,9 @@ pub unsafe fn probe_gic(rsdp: u64) {
                 crate::kprintln!("  interrupts  : redistributor at {base:#010x}");
             }
 
-            // Окна по найденным адресам. Те, что совпали с умолчаниями, уже
-            // отображены при построении пространства — повторное отображение
-            // тем же флагам безвредно и обходится дешевле, чем сравнение.
-            for (base, size) in gic::mmio_windows() {
-                if base == 0 {
-                    continue;
-                }
-                let phys = crate::mm::PhysAddr::new(base as u64);
-                // SAFETY: адреса пришли из таблиц прошивки и описывают
-                // регистры контроллера; Device-семантика для них обязательна.
-                let mapped = unsafe {
-                    crate::arch::map_active(
-                        crate::mm::VirtAddr::new(base),
-                        phys,
-                        size,
-                        crate::mm::PageFlags::READ
-                            .union(crate::mm::PageFlags::WRITE)
-                            .union(crate::mm::PageFlags::DEVICE),
-                    )
-                };
-                if let Err(err) = mapped {
-                    crate::kprintln!("WARNING: cannot map GIC window {base:#010x}: {err:?}");
-                }
-            }
+            // SAFETY: адреса пришли из таблиц прошивки и описывают регистры
+            // контроллера; таблицы ядра активны.
+            unsafe { map_gic_windows() };
         }
         // Ни ACPI, ни MADT: остаются адреса QEMU virt. Случай законный, но
         // сказать о нём надо — молчаливая догадка об адресах и оставила ядро
@@ -76,6 +155,42 @@ pub unsafe fn probe_gic(rsdp: u64) {
         ),
     }
 }
+/// Отобразить окна контроллера прерываний по адресам, которые он объявил.
+///
+/// Окна заводятся здесь, а не при построении пространства: адреса становятся
+/// известны только теперь. Те, что совпали с умолчаниями, уже отображены —
+/// повторное отображение теми же флагами безвредно и обходится дешевле, чем
+/// сравнение.
+///
+/// # Safety
+///
+/// Вызывать на активных таблицах ядра, после [`gic::configure`].
+unsafe fn map_gic_windows() {
+    for (base, size) in gic::mmio_windows() {
+        // Нулевой адрес означает «такого окна на этой машине нет» — так
+        // отсутствует redistributor у GICv2. Отображать нулевую страницу как
+        // устройство нельзя: она законная память.
+        if base == 0 {
+            continue;
+        }
+        let phys = crate::mm::PhysAddr::new(base as u64);
+        // SAFETY: контракт функции; Device-семантика для регистров обязательна.
+        let mapped = unsafe {
+            crate::arch::map_active(
+                crate::mm::VirtAddr::new(base),
+                phys,
+                size,
+                crate::mm::PageFlags::READ
+                    .union(crate::mm::PageFlags::WRITE)
+                    .union(crate::mm::PageFlags::DEVICE),
+            )
+        };
+        if let Err(err) = mapped {
+            crate::kprintln!("WARNING: cannot map GIC window {base:#010x}: {err:?}");
+        }
+    }
+}
+
 /// Найти консольный порт там, где его объявила прошивка.
 ///
 /// Вызывается вместе с [`probe_gic`] и по той же причине: адрес UART на ARM
@@ -92,6 +207,22 @@ pub unsafe fn probe_gic(rsdp: u64) {
 ///
 /// Вызывать на активных таблицах ядра, один раз.
 pub unsafe fn probe_serial(rsdp: u64) {
+    // На машине, описанной деревом, порт уже найден и заведён на входе — иначе
+    // не было бы видно ни строчки из всего, что печаталось до этого места.
+    // Здесь остаётся сказать, какой именно, чтобы «порт найден в дереве» и
+    // «порта нет, и мы молчим» различались в журнале, а не по его отсутствию.
+    if DEVICE_TREE.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        if crate::serial::absent() {
+            crate::kprintln!("  serial      : no UART in the device tree; the kernel stays quiet");
+        } else {
+            crate::kprintln!(
+                "  serial      : the device tree puts the console UART at {:#010x}",
+                serial_base()
+            );
+        }
+        return;
+    }
+
     // SAFETY: контракт функции; ноль означает «таблиц нет».
     let Some(base) = (unsafe { acpi::find_uart(rsdp) }) else {
         // Молчать об этом нельзя ровно там, где ядро и так молчит: если порт не
@@ -277,14 +408,31 @@ pub unsafe fn pci_config_read32(_address: u32) -> u32 {
 #[allow(dead_code)] // общий интерфейс с x86-64
 pub unsafe fn pci_config_write32(_address: u32, _value: u32) {}
 
-/// UART PL011, отображённый в память.
+/// Какой именно порт лежит по адресу.
+///
+/// Двух хватает на всё, что встречается на ARM. Различаются они не только
+/// раскладкой регистров, но и **смыслом** флага готовности: у PL011 бит 5
+/// регистра флагов означает «передатчик полон», у 16550 бит 5 регистра
+/// состояния — «передатчик пуст». Перепутать их значит либо писать в занятый
+/// порт и терять байты, либо ждать вечно.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Pl011,
+    /// 16550 и его родня, включая `mediatek,mt6577-uart`. Регистры там разнесены
+    /// по четыре байта, поэтому смещение состояния — 0x14, а не 5.
+    Ns16550,
+}
+
+/// UART, отображённый в память.
+#[derive(Clone, Copy)]
 pub struct Serial {
     base: usize,
+    kind: Kind,
 }
 
 impl Serial {
     /// UART, с которого ядро начинает говорить на этой платформе.
-    pub const PLATFORM: Self = Self { base: QEMU_VIRT_PL011 };
+    pub const PLATFORM: Self = Self { base: QEMU_VIRT_PL011, kind: Kind::Pl011 };
 
     /// UART по адресу, который назвала прошивка.
     ///
@@ -294,7 +442,26 @@ impl Serial {
     /// Device-семантикой.
     #[must_use]
     pub const unsafe fn at(base: usize) -> Self {
-        Self { base }
+        Self { base, kind: Kind::Pl011 }
+    }
+
+    /// UART семейства 16550 по адресу из дерева устройств.
+    ///
+    /// # Safety
+    ///
+    /// Те же требования, что у [`Serial::at`].
+    #[must_use]
+    pub const unsafe fn ns16550(base: usize) -> Self {
+        Self { base, kind: Kind::Ns16550 }
+    }
+
+    /// Адрес окна регистров. Нужен построению таблиц: окно линии обязано быть
+    /// отображено **до** переключения на них, иначе первая же строка после
+    /// переключения уходит в отказ — а сообщить о нём некуда, потому что
+    /// сообщать пришлось бы в ту же линию.
+    #[must_use]
+    pub const fn base(&self) -> usize {
+        self.base
     }
 
     /// # Safety
@@ -323,6 +490,13 @@ impl Serial {
 
 impl SerialDevice for Serial {
     fn init(&mut self) {
+        // 16550 настраивать нечем: скорость задаётся делителем, а делитель
+        // считается от тактовой частоты порта, которой в дереве может не быть
+        // вовсе. Загрузчик эту линию уже настроил и печатал в неё сам —
+        // перенастраивать её наугад значит сломать работающее.
+        if self.kind == Kind::Ns16550 {
+            return;
+        }
         // SAFETY: `self.base` — задокументированный адрес PL011 на QEMU virt.
         // К моменту вызова `ExitBootServices` уже сделан, MMU либо выключен,
         // либо оставлен прошивкой с identity-отображением устройств, поэтому
@@ -343,9 +517,14 @@ impl SerialDevice for Serial {
     fn write_byte(&mut self, byte: u8) {
         let mut spins = 0u32;
         loop {
-            // SAFETY: чтение регистра флагов PL011 не имеет побочных эффектов.
-            let flags = unsafe { self.read(REG_FR) };
-            if flags & FR_TXFF == 0 {
+            // SAFETY: чтение регистра состояния не имеет побочных эффектов.
+            let ready = unsafe {
+                match self.kind {
+                    Kind::Pl011 => self.read(REG_FR) & FR_TXFF == 0,
+                    Kind::Ns16550 => self.read(NS16550_LSR) & NS16550_THRE != 0,
+                }
+            };
+            if ready {
                 break;
             }
             spins += 1;
@@ -353,10 +532,54 @@ impl SerialDevice for Serial {
                 return; // UART отсутствует или не разгребает FIFO
             }
         }
-        // SAFETY: FIFO не заполнено (проверено выше), запись в DR ставит байт
-        // в очередь на передачу и не затрагивает ничего другого.
+        // SAFETY: передатчик свободен (проверено выше), запись в регистр данных
+        // ставит байт в очередь и не затрагивает ничего другого. У обоих портов
+        // этот регистр лежит по нулевому смещению.
         unsafe { self.write(REG_DR, u32::from(byte)) };
     }
+}
+
+/// 16550: регистр состояния линии. Регистры разнесены по четыре байта, поэтому
+/// пятый — это смещение 0x14.
+const NS16550_LSR: usize = 0x14;
+/// Бит 5 того же регистра: регистр передачи пуст, байт можно класть.
+const NS16550_THRE: u32 = 1 << 5;
+
+/// Порт, известный без взятия лока.
+///
+/// Существует ради одного места — печати из обработчика отказа, вклинившейся в
+/// уже начатый вывод (см. [`crate::serial::_print`]). Там лок брать нельзя, а
+/// печатать надо, и до появления второго вида UART ответом была константа
+/// `Serial::PLATFORM`. На телефоне эта константа — адрес, по которому нет
+/// ничего: сообщение об отказе стало бы вторым отказом.
+static FALLBACK_BASE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(QEMU_VIRT_PL011);
+/// Вид порта из [`FALLBACK_BASE`]: `true` — PL011.
+static FALLBACK_PL011: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(true);
+
+/// Запомнить порт, в который ядро говорит сейчас.
+pub fn remember_serial(device: &Serial) {
+    FALLBACK_BASE.store(device.base, core::sync::atomic::Ordering::Release);
+    FALLBACK_PL011.store(device.kind == Kind::Pl011, core::sync::atomic::Ordering::Release);
+}
+
+/// Тот же порт, но без лока. См. [`FALLBACK_BASE`].
+#[must_use]
+pub fn serial_fallback() -> Serial {
+    let base = FALLBACK_BASE.load(core::sync::atomic::Ordering::Acquire);
+    let kind = if FALLBACK_PL011.load(core::sync::atomic::Ordering::Acquire) {
+        Kind::Pl011
+    } else {
+        Kind::Ns16550
+    };
+    Serial { base, kind }
+}
+
+/// Адрес окна регистров линии — для построения таблиц страниц.
+#[must_use]
+pub fn serial_base() -> usize {
+    FALLBACK_BASE.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Разрешить прерывания приёма на PL011.
@@ -373,7 +596,13 @@ impl SerialDevice for Serial {
 /// [`paging::build_kernel_address_space`]), а INTID [`input::UART_INTID`] —
 /// разрешён в GIC уже после того, как обработчик готов его принять.
 pub unsafe fn enable_uart_rx() {
-    let uart = Serial::PLATFORM;
+    let uart = serial_fallback();
+    // 16550 сюда не заводится: его прерывание разрешается другими регистрами, а
+    // вслепую записанный PL011-регистр по адресу 16550 — это настройка чужого
+    // устройства. На телефоне линия наружу и не выведена, так что терять нечего.
+    if uart.kind != Kind::Pl011 {
+        return;
+    }
     // SAFETY: адрес — задокументированное окно PL011 на QEMU virt; условия
     // делегированы вызывающему контрактом функции. Сначала снимаются все
     // висящие флаги: прошивка могла оставить свои, и первый же размаскированный
@@ -386,7 +615,10 @@ pub unsafe fn enable_uart_rx() {
 
 /// Забрать из приёмника PL011 всё, что там есть, и отдать подсистеме ввода.
 pub fn drain_uart_rx() {
-    let uart = Serial::PLATFORM;
+    let uart = serial_fallback();
+    if uart.kind != Kind::Pl011 {
+        return;
+    }
     for _ in 0..32 {
         // SAFETY: чтение регистра флагов побочных эффектов не имеет.
         if unsafe { uart.read(REG_FR) } & FR_RXFE != 0 {

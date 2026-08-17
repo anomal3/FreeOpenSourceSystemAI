@@ -303,6 +303,14 @@ struct PhoneArgs {
     /// Держать аппарат живым после работы — чтобы разглядеть экран без спешки.
     #[arg(long)]
     keepalive: bool,
+    /// Собрать **настоящее ядро** — систему с рабочим столом, а не пробу.
+    ///
+    /// Тот же крейт `kernel`, что и для UEFI, но с входом по договору Linux и
+    /// фиксированным адресом размещения. Без этого ключа собирается `boot-bare`
+    /// — маленький образ, который отвечает на вопрос «запускает ли нас
+    /// загрузчик» и больше ни на что.
+    #[arg(long, conflicts_with_all = ["probe", "kernel"])]
+    full_kernel: bool,
     /// Собрать образ-пробу: пинать сторожевой таймер MediaTek и больше ничего.
     ///
     /// Отвечает на единственный вопрос — исполняется ли наш код на аппарате.
@@ -562,6 +570,7 @@ fn real_main() -> Result<()> {
                 kernel: args.kernel,
                 gzip: args.gzip,
                 ramdisk: args.ramdisk,
+                full_kernel: args.full_kernel,
                 probe: args.probe,
                 keepalive: args.keepalive,
                 mtk_header: args.mtk_header,

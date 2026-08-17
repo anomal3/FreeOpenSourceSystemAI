@@ -315,6 +315,20 @@ impl Serial {
     pub const PLATFORM: Self = Self { base: COM1 };
 }
 
+/// Запомнить порт, в который ядро говорит сейчас.
+///
+/// На этой архитектуре запоминать нечего: COM1 закреплён за портом 0x3F8
+/// платформой, и другого адреса у консоли не бывает. Функция существует ради
+/// общего интерфейса с AArch64, где адрес UART не закреплён ничем и приезжает
+/// из ACPI или из дерева устройств.
+pub fn remember_serial(_device: &Serial) {}
+
+/// Тот же порт, но без взятия лока, — для печати из обработчика отказа.
+#[must_use]
+pub fn serial_fallback() -> Serial {
+    Serial::PLATFORM
+}
+
 impl SerialDevice for Serial {
     fn init(&mut self) {
         let base = self.base;

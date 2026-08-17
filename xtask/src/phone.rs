@@ -98,6 +98,13 @@ pub struct Options {
     /// Держать аппарат живым после того, как всё сделано, — чтобы экран можно
     /// было разглядеть без спешки.
     pub keepalive: bool,
+    /// Собрать **настоящее ядро**, а не пробный `boot-bare`.
+    ///
+    /// Это и есть цель всей затеи: система с рабочим столом на аппарате.
+    /// Собирается тот же крейт `kernel`, что и для UEFI, но с признаком `phone`
+    /// и своим компоновочным сценарием — вход по договору Linux и фиксированный
+    /// адрес размещения вместо PIE. Путь UEFI при этом не трогается.
+    pub full_kernel: bool,
     /// Собрать образ-пробу: пинать сторожевой таймер и больше ничего.
     ///
     /// Отвечает на один вопрос — исполняется ли наш код на аппарате, — и не
@@ -125,6 +132,7 @@ impl Default for Options {
             kernel: None,
             gzip: false,
             ramdisk: None,
+            full_kernel: false,
             probe: false,
             keepalive: false,
             mtk_header: false,
@@ -214,6 +222,7 @@ pub fn build(options: &Options) -> Result<PathBuf> {
             }
             path.clone()
         }
+        None if options.full_kernel => build_kernel(options.base + KERNEL_OFFSET)?,
         None => build_bare(options.base + KERNEL_OFFSET, options.probe, options.keepalive)?,
     };
 
@@ -235,6 +244,102 @@ pub fn build(options: &Options) -> Result<PathBuf> {
 
     Ok(out)
 }
+
+/// Собрать настоящее ядро под чужой загрузчик и вынуть голый двоичный код.
+///
+/// # Чем эта сборка отличается от обычной
+///
+/// Тем же крейтом, но тремя вещами, и каждая обязательна:
+///
+/// * признак `phone` включает второй вход — `head_fdt.S` с заголовком arm64,
+///   таблицей векторов и спуском с EL2 на EL1;
+/// * `phone.ld` кладёт образ по фиксированному адресу вместо PIE: применять
+///   релокации заводскому загрузчику нечем;
+/// * `relocation-model=static` — иначе компилятор продолжит генерировать
+///   обращения через GOT, а заполнить GOT некому.
+///
+/// `RUSTFLAGS` подаются переменной окружения, а не через `.cargo/config.toml`:
+/// там они подействовали бы на весь workspace, включая обычную сборку ядра,
+/// которая обязана остаться позиционно-независимой.
+///
+/// `expected_load` — адрес, по которому загрузчик положит образ. Он обязан
+/// совпасть с адресом компоновки, и здесь последнее место, где это ещё можно
+/// сверить: в голом двоичном файле адреса уже нет, а расхождение не даёт ни
+/// отказа, ни сообщения — машина исправно крутится и молчит.
+pub fn build_kernel(expected_load: u64) -> Result<PathBuf> {
+    let script = paths::workspace_root().join("crates/kernel/phone.ld");
+    if !script.is_file() {
+        bail!("нет компоновочного сценария: {}", script.display());
+    }
+
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut cmd = std::process::Command::new(cargo);
+    cmd.current_dir(paths::workspace_root())
+        .arg("build")
+        .arg("--package")
+        .arg("kernel")
+        .arg("--features")
+        .arg("phone")
+        .arg("--target")
+        .arg(KERNEL_TARGET)
+        .arg("-Zbuild-std=core,alloc,compiler_builtins")
+        .arg("-Zbuild-std-features=compiler-builtins-mem");
+
+    // Путь к сценарию обязан быть в родной для компоновщика записи: lld не
+    // находит файл по пути вида `/e/...`, который подставляет оболочка git
+    // bash, и жалуется при этом на отсутствующий сценарий, а не на путь.
+    let flags = format!(
+        "-C link-arg=-T{} -C link-arg=--no-dynamic-linker -C relocation-model=static",
+        script.display()
+    );
+    cmd.env("RUSTFLAGS", flags);
+
+    // Своё дерево сборки, и это не аккуратность, а необходимость. Триплет у двух
+    // сборок один, имя артефакта одно — значит, при общем `target/` вторая
+    // сборка кладёт свой файл ровно туда, откуда `xtask build` берёт ядро для
+    // ESP. Дальше происходит вот что: загрузчик читает статический ET_EXEC,
+    // слинкованный под 0x40080000, и либо отказывается, либо прыгает в
+    // заголовок arm64. Поймано прогоном, который встал на первой же строке
+    // баннера, — а выглядело это как «ядро перестало грузиться на aarch64».
+    let target_dir = paths::workspace_root().join("target/phone");
+    cmd.env("CARGO_TARGET_DIR", &target_dir);
+    util::run(&mut cmd, "cargo build (kernel, phone)")?;
+
+    let elf = target_dir.join(format!("{KERNEL_TARGET}/debug/kernel"));
+    if !elf.is_file() {
+        bail!("ядро не собралось: нет {}", elf.display());
+    }
+
+    let linked = link_address(&elf)?;
+    if linked != expected_load {
+        bail!(
+            "ядро скомпоновано под {linked:#x}, а загрузчик положит его по {expected_load:#x}\n\
+             Совпасть обязаны: либо поправьте адрес в crates/kernel/phone.ld, \
+             либо задайте --base."
+        );
+    }
+
+    let out = paths::build_dir().join("phone-kernel.img");
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+
+    // Загрузчик читает файл как есть, с первого байта: заголовок образа обязан
+    // оказаться в самом начале файла, а не за заголовками ELF.
+    let mut cmd = std::process::Command::new(objcopy()?);
+    cmd.arg("-O").arg("binary").arg(&elf).arg(&out);
+    util::run(&mut cmd, "llvm-objcopy (kernel)")?;
+
+    Ok(out)
+}
+
+/// Таргет ядра: softfloat-вариант, тот же, что и в обычной сборке.
+///
+/// Softfloat здесь не украшение: обработчик прерывания не сохраняет векторных
+/// регистров, а обычный `aarch64-unknown-none` объявлен hardfloat, и компилятор
+/// вправе держать живое значение в `v8`–`v15` или собрать `memset` через
+/// `dup v0.16b`. Первый же тик таймера такое значение испортил бы.
+const KERNEL_TARGET: &str = "aarch64-unknown-none-softfloat";
 
 /// Собрать standalone-образ `boot-bare` и вынуть из ELF голый двоичный код.
 ///
