@@ -294,6 +294,9 @@ struct PhoneArgs {
     /// Завернуть готовый файл вместо сборки `boot-bare`.
     #[arg(long)]
     kernel: Option<std::path::PathBuf>,
+    /// Надеть на ядро 512-байтовый заголовок MediaTek.
+    #[arg(long)]
+    mtk_header: bool,
     /// Куда положить образ. По умолчанию `build/bare-boot.img`.
     #[arg(long)]
     out: Option<std::path::PathBuf>,
@@ -532,6 +535,7 @@ fn real_main() -> Result<()> {
                 dtb: args.dtb,
                 out: args.out,
                 kernel: args.kernel,
+                mtk_header: args.mtk_header,
             })?;
         }
 

@@ -72,6 +72,14 @@ pub struct Options {
     pub out: Option<PathBuf>,
     /// Не собирать `boot-bare`, а завернуть готовый файл.
     pub kernel: Option<PathBuf>,
+    /// Надеть на ядро 512-байтовый заголовок MediaTek.
+    ///
+    /// У MTK части загрузочного образа завёрнуты ещё раз, в свой заголовок с
+    /// меткой и именем. Одни версии LK его снимают, если он есть, другие
+    /// снимают **всегда** — и тогда образ без него теряет первые 512 байт, то
+    /// есть свой настоящий заголовок и начало кода, а переход уходит в середину
+    /// инструкции. Отличить одно от другого можно только запуском.
+    pub mtk_header: bool,
 }
 
 impl Default for Options {
@@ -83,8 +91,26 @@ impl Default for Options {
             dtb: None,
             out: None,
             kernel: None,
+            mtk_header: false,
         }
     }
+}
+
+/// Заголовок MediaTek: метка, длина, имя части — и всё это ровно 512 байт.
+fn mtk_wrap(payload: &[u8], name: &str) -> Vec<u8> {
+    const SIZE: usize = 512;
+    let mut header = vec![0xffu8; SIZE];
+    header[0..4].copy_from_slice(&0x5888_1688u32.to_le_bytes());
+    header[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    // Имя дополняется нулями, а не 0xff: LK сравнивает его как строку.
+    for slot in header[8..40].iter_mut() {
+        *slot = 0;
+    }
+    header[8..8 + name.len()].copy_from_slice(name.as_bytes());
+
+    let mut out = header;
+    out.extend_from_slice(payload);
+    out
 }
 
 /// Собрать `boot-bare` и завернуть его в загрузочный образ.
@@ -243,6 +269,11 @@ fn pack(kernel: &Path, options: &Options) -> Result<Vec<u8>> {
     let kernel_bytes = std::fs::read(kernel)
         .with_context(|| format!("не удалось прочитать {}", kernel.display()))?;
     check_arm64_header(&kernel_bytes, kernel, options.base + KERNEL_OFFSET)?;
+    let kernel_bytes = if options.mtk_header {
+        mtk_wrap(&kernel_bytes, "KERNEL")
+    } else {
+        kernel_bytes
+    };
 
     let dtb_bytes = match &options.dtb {
         Some(path) => std::fs::read(path)
