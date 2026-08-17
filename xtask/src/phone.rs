@@ -42,7 +42,12 @@ const MTK_BASE: u64 = 0x4007_8000;
 const KERNEL_OFFSET: u64 = 0x0000_8000;
 const RAMDISK_OFFSET: u64 = 0x11a8_8000;
 const SECOND_OFFSET: u64 = 0x00f0_0000;
-const TAGS_OFFSET: u64 = 0x0788_0000;
+// Смещение меток снято с заводского `recovery.img` (`--read`): там метки и
+// дерево лежат по `0x47880000`. Соглашение семейства даёт `0x07880000`, то есть
+// на 0x78000 выше, — и это тот случай, когда «почти правильный» адрес хуже
+// неправильного: загрузчик кладёт туда дерево, а ядро читает его по адресу из
+// заголовка, и разъехаться они могут молча.
+const TAGS_OFFSET: u64 = 0x0780_8000;
 const PAGE_SIZE: u32 = 2048;
 
 /// Строка запуска, по которой LK понимает разрядность.
@@ -410,13 +415,71 @@ fn image_id(kernel: &[u8], dtb: &[u8], header_version: u32) -> [u8; 20] {
 ///
 /// Ради одного: заводской boot.img — единственный источник настоящих адресов.
 /// Всё, что до него, — соглашение семейства.
-pub fn read(path: &Path) -> Result<()> {
+pub fn read(path: &Path, extract_dtb: Option<&Path>) -> Result<()> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("не удалось прочитать {}", path.display()))?;
     if bytes.len() < 2048 || &bytes[..8] != MAGIC {
         bail!("{} — не Android boot image", path.display());
     }
-    describe(&bytes)
+    describe(&bytes)?;
+
+    if let Some(out) = extract_dtb {
+        let dtb = carve_dtb(&bytes)?;
+        std::fs::write(out, &dtb)
+            .with_context(|| format!("не удалось записать {}", out.display()))?;
+        say!("  дерево извлечено: {} ({} байт)", out.display(), dtb.len());
+    }
+    Ok(())
+}
+
+/// Вырезать дерево устройств из чужого образа.
+///
+/// Части лежат подряд и каждая добита до страницы, поэтому смещение дерева —
+/// это сумма страниц всех предыдущих частей плюс страница заголовка. Порядок
+/// задан форматом: ядро, ramdisk, second, recovery_dtbo, дерево.
+fn carve_dtb(bytes: &[u8]) -> Result<Vec<u8>> {
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+
+    if word(40) < 2 {
+        bail!("у образа заголовок версии {} — отдельного дерева в нём нет", word(40));
+    }
+    let page = word(36);
+    if page == 0 {
+        bail!("в заголовке нулевой размер страницы");
+    }
+    let pages = |size: usize| size.div_ceil(page);
+
+    let mut offset = page; // страница заголовка
+    offset += pages(word(8)) * page; // ядро
+    offset += pages(word(16)) * page; // ramdisk
+    offset += pages(word(24)) * page; // second
+    offset += pages(word(1632)) * page; // recovery_dtbo
+
+    let size = word(1648);
+    if size == 0 {
+        bail!("в образе нет дерева устройств");
+    }
+    let end = offset.checked_add(size).unwrap_or(usize::MAX);
+    if end > bytes.len() {
+        bail!("дерево заявлено по смещению {offset:#x}, а образ короче");
+    }
+
+    // Метка проверяется здесь, а не у вызывающего: вырезали мы по арифметике из
+    // чужого заголовка, и ошибка в ней даёт правдоподобный кусок чужих данных.
+    //
+    // Меток две, и это не перестраховка. В поле дерева лежит либо само дерево,
+    // либо **таблица** деревьев (тот же формат, что у раздела `dtbo`): заголовок
+    // на 32 байта, записи по 32 байта, и только потом дерево. Загрузчик разбирает
+    // то, что там лежит, поэтому блок копируется целиком и как есть — вынимать
+    // из таблицы одно дерево значило бы отдать загрузчику не тот формат.
+    let dtb = bytes[offset..end].to_vec();
+    let magic = u32::from_be_bytes(dtb[..4].try_into().unwrap());
+    match magic {
+        0xd00d_feed => say!("  дерево     : само по себе"),
+        0xd7b7_ab1e => say!("  дерево     : таблица деревьев (формат dtbo)"),
+        _ => bail!("по смещению {offset:#x} лежит не дерево: метка {magic:#010x}"),
+    }
+    Ok(dtb)
 }
 
 /// Напечатать разбор заголовка.

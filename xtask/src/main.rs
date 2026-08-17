@@ -304,6 +304,9 @@ struct PhoneArgs {
     /// адреса по заводскому boot.img.
     #[arg(long)]
     read: Option<std::path::PathBuf>,
+    /// Вырезать дерево устройств из образа, указанного в `--read`.
+    #[arg(long, requires = "read")]
+    extract_dtb: Option<std::path::PathBuf>,
 }
 
 /// Число из командной строки, в том числе шестнадцатеричное.
@@ -524,7 +527,7 @@ fn real_main() -> Result<()> {
 
         Command::Phone(args) => {
             if let Some(path) = args.read {
-                phone::read(&path)?;
+                phone::read(&path, args.extract_dtb.as_deref())?;
                 return Ok(());
             }
             let defaults = phone::Options::default();
