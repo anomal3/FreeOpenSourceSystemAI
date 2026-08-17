@@ -77,6 +77,13 @@ pub struct Options {
     pub out: Option<PathBuf>,
     /// Не собирать `boot-bare`, а завернуть готовый файл.
     pub kernel: Option<PathBuf>,
+    /// Положить в образ RAM-диск.
+    ///
+    /// Нашему образу он не нужен — он самодостаточен. Нужен он загрузчику: у
+    /// всякого настоящего `boot` и `recovery` RAM-диск есть, и нулевой размер
+    /// здесь — то, чем наш образ отличается от заводского сильнее всего.
+    /// Содержимое не важно, важно, что часть есть и она не пуста.
+    pub ramdisk: Option<PathBuf>,
     /// Собрать образ-пробу: пинать сторожевой таймер и больше ничего.
     ///
     /// Отвечает на один вопрос — исполняется ли наш код на аппарате, — и не
@@ -102,6 +109,7 @@ impl Default for Options {
             dtb: None,
             out: None,
             kernel: None,
+            ramdisk: None,
             probe: false,
             mtk_header: false,
         }
@@ -290,6 +298,11 @@ fn pack(kernel: &Path, options: &Options) -> Result<Vec<u8>> {
         kernel_bytes
     };
 
+    let ramdisk_bytes = match &options.ramdisk {
+        Some(path) => std::fs::read(path)
+            .with_context(|| format!("не удалось прочитать {}", path.display()))?,
+        None => Vec::new(),
+    };
     let dtb_bytes = match &options.dtb {
         Some(path) => std::fs::read(path)
             .with_context(|| format!("не удалось прочитать {}", path.display()))?,
@@ -310,10 +323,11 @@ fn pack(kernel: &Path, options: &Options) -> Result<Vec<u8>> {
 
     put32(&mut header, 8, kernel_bytes.len() as u32);
     put32(&mut header, 12, (base + KERNEL_OFFSET) as u32);
-    // Диска у нас нет, файловой системы в ОЗУ тоже: `boot-bare` самодостаточен.
-    // Нулевой размер здесь — это заявление «ядру нечего подавать», а не
-    // забытое поле.
-    put32(&mut header, 16, 0);
+    // Диска у нас нет, файловой системы в ОЗУ тоже: `boot-bare` самодостаточен,
+    // и нулевой размер здесь — заявление «ядру нечего подавать», а не забытое
+    // поле. Но загрузчик о нашей самодостаточности не знает, а у всякого
+    // настоящего образа эта часть есть — поэтому её можно подложить.
+    put32(&mut header, 16, ramdisk_bytes.len() as u32);
     put32(&mut header, 20, (base + RAMDISK_OFFSET) as u32);
     put32(&mut header, 24, 0);
     put32(&mut header, 28, (base + SECOND_OFFSET) as u32);
@@ -342,11 +356,14 @@ fn pack(kernel: &Path, options: &Options) -> Result<Vec<u8>> {
     // Отпечаток: SHA-1 по содержимому и размерам всех частей. Загрузчик его не
     // проверяет, а вот `unpack_bootimg` и глаз человека — да, и образ с нулями
     // в этом поле выглядит как собранный на коленке.
-    let id = image_id(&kernel_bytes, &dtb_bytes, options.header_version);
+    let id = image_id(&kernel_bytes, &ramdisk_bytes, &dtb_bytes, options.header_version);
     header[576..576 + 20].copy_from_slice(&id);
 
     let mut image = header;
     push_padded(&mut image, &kernel_bytes, page);
+    if !ramdisk_bytes.is_empty() {
+        push_padded(&mut image, &ramdisk_bytes, page);
+    }
     if !dtb_bytes.is_empty() {
         push_padded(&mut image, &dtb_bytes, page);
     }
@@ -403,14 +420,14 @@ fn check_arm64_header(bytes: &[u8], path: &Path, load: u64) -> Result<()> {
 
 /// Отпечаток образа так, как его считает `mkbootimg`: по каждой части — её
 /// содержимое, следом её размер.
-fn image_id(kernel: &[u8], dtb: &[u8], header_version: u32) -> [u8; 20] {
+fn image_id(kernel: &[u8], ramdisk: &[u8], dtb: &[u8], header_version: u32) -> [u8; 20] {
     let mut sha = Sha1::new();
     let mut part = |sha: &mut Sha1, bytes: &[u8]| {
         sha.update(bytes);
         sha.update(&(bytes.len() as u32).to_le_bytes());
     };
     part(&mut sha, kernel);
-    part(&mut sha, &[]); // ramdisk
+    part(&mut sha, ramdisk);
     part(&mut sha, &[]); // second
     if header_version >= 1 {
         part(&mut sha, &[]); // recovery_dtbo
@@ -425,7 +442,7 @@ fn image_id(kernel: &[u8], dtb: &[u8], header_version: u32) -> [u8; 20] {
 ///
 /// Ради одного: заводской boot.img — единственный источник настоящих адресов.
 /// Всё, что до него, — соглашение семейства.
-pub fn read(path: &Path, extract_dtb: Option<&Path>) -> Result<()> {
+pub fn read(path: &Path, extract_dtb: Option<&Path>, extract_ramdisk: Option<&Path>) -> Result<()> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("не удалось прочитать {}", path.display()))?;
     if bytes.len() < 2048 || &bytes[..8] != MAGIC {
@@ -438,6 +455,22 @@ pub fn read(path: &Path, extract_dtb: Option<&Path>) -> Result<()> {
         std::fs::write(out, &dtb)
             .with_context(|| format!("не удалось записать {}", out.display()))?;
         say!("  дерево извлечено: {} ({} байт)", out.display(), dtb.len());
+    }
+    if let Some(out) = extract_ramdisk {
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let page = word(36);
+        let size = word(16);
+        if size == 0 {
+            bail!("в образе нет RAM-диска");
+        }
+        // Ramdisk идёт сразу за ядром, и обе части добиты до страницы.
+        let offset = page + word(8).div_ceil(page) * page;
+        if offset + size > bytes.len() {
+            bail!("RAM-диск заявлен по смещению {offset:#x}, а образ короче");
+        }
+        std::fs::write(out, &bytes[offset..offset + size])
+            .with_context(|| format!("не удалось записать {}", out.display()))?;
+        say!("  RAM-диск извлечён: {} ({size} байт)", out.display());
     }
     Ok(())
 }

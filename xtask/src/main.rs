@@ -294,6 +294,9 @@ struct PhoneArgs {
     /// Завернуть готовый файл вместо сборки `boot-bare`.
     #[arg(long)]
     kernel: Option<std::path::PathBuf>,
+    /// Положить в образ RAM-диск — не для нас, а для загрузчика.
+    #[arg(long)]
+    ramdisk: Option<std::path::PathBuf>,
     /// Собрать образ-пробу: пинать сторожевой таймер MediaTek и больше ничего.
     ///
     /// Отвечает на единственный вопрос — исполняется ли наш код на аппарате.
@@ -313,6 +316,9 @@ struct PhoneArgs {
     /// Вырезать дерево устройств из образа, указанного в `--read`.
     #[arg(long, requires = "read")]
     extract_dtb: Option<std::path::PathBuf>,
+    /// Вырезать RAM-диск из образа, указанного в `--read`.
+    #[arg(long, requires = "read")]
+    extract_ramdisk: Option<std::path::PathBuf>,
 }
 
 /// Число из командной строки, в том числе шестнадцатеричное.
@@ -533,7 +539,11 @@ fn real_main() -> Result<()> {
 
         Command::Phone(args) => {
             if let Some(path) = args.read {
-                phone::read(&path, args.extract_dtb.as_deref())?;
+                phone::read(
+                    &path,
+                    args.extract_dtb.as_deref(),
+                    args.extract_ramdisk.as_deref(),
+                )?;
                 return Ok(());
             }
             let defaults = phone::Options::default();
@@ -544,6 +554,7 @@ fn real_main() -> Result<()> {
                 dtb: args.dtb,
                 out: args.out,
                 kernel: args.kernel,
+                ramdisk: args.ramdisk,
                 probe: args.probe,
                 mtk_header: args.mtk_header,
             })?;
