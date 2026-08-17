@@ -387,8 +387,50 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
         bitbang(pins, &[(TRIM_ADDRESS as u8 & 0x7f) | 0x80, 0, 0, 0, 0, 0, 0, 0], &mut answer);
     }
     crate::kprintln!(
-        "  touch       : by hand, id {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-        answer[2], answer[3], answer[4], answer[5], answer[6], answer[7]
+        "  touch       : by hand, {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+        answer[0], answer[1], answer[2], answer[3], answer[4], answer[5], answer[6], answer[7]
+    );
+
+    // Версия первая: **не отпускать выбор кристалла** между командой и чтением.
+    // Родной драйвер отпускает, но у него между посылками работает вся остальная
+    // машинерия ядра, а у нас голый обмен — и чип вполне может терять команду на
+    // разрыве.
+    //
+    // Версия вторая: скорость. Мы идём на десятках килогерц, вендор — на 9,6 МГц.
+    // Некоторые чипы на слишком медленном такте засыпают между битами.
+    for slow in [1u32, 8] {
+        let mut held = [0u8; 8];
+        // SAFETY: окно отображено; выводы наши.
+        unsafe {
+            bitbang_select(pins, true);
+            bitbang_bytes(pins, &page_command(TRIM_ADDRESS), &mut [], slow);
+            bitbang_bytes(
+                pins,
+                &[(TRIM_ADDRESS as u8 & 0x7f) | 0x80, 0, 0, 0, 0, 0, 0, 0],
+                &mut held,
+                slow,
+            );
+            bitbang_select(pins, false);
+        }
+        crate::kprintln!(
+            "  touch       : cs held, slow {slow}, {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            held[0], held[1], held[2], held[3], held[4], held[5], held[6], held[7]
+        );
+    }
+
+    // Версия третья: чип уже работает и ему есть что сказать — линия прерывания
+    // прижата. Значит, спрашивать надо не «кто ты» (это вопрос загрузчику
+    // кристалла), а «что у тебя есть»: буфер событий текущей страницы.
+    let mut events = [0u8; 8];
+    // SAFETY: см. выше.
+    unsafe {
+        bitbang_select(pins, true);
+        bitbang_bytes(pins, &[0x80, 0, 0, 0, 0, 0, 0, 0], &mut events, 1);
+        bitbang_select(pins, false);
+    }
+    crate::kprintln!(
+        "  touch       : events, {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+        events[0], events[1], events[2], events[3], events[4], events[5], events[6], events[7]
     );
 
     // Последнее непроверенное звено — и оно наше собственное. Что выводы шины
@@ -433,53 +475,75 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
 /// `pins` — отображённое окно контроллера выводов; выводы принадлежат `spi3` и
 /// в этот момент никем больше не используются.
 unsafe fn bitbang(pins: u64, tx: &[u8], rx: &mut [u8]) {
-    const MISO: u32 = 21;
-    const CS: u32 = 22;
-    const MOSI: u32 = 23;
-    const CLK: u32 = 24;
-
-    /// Четверть периода. Число не выведено, а взято с запасом: чип держит до
-    /// девяти мегагерц, а здесь выходит несколько десятков килогерц.
-    fn tick() {
-        for _ in 0..200 {
-            core::hint::spin_loop();
-        }
-    }
-
     // SAFETY: контракт функции.
     unsafe {
-        // Покой: выбор снят, такт внизу — это режим 0, тот же, что у чипа.
-        gpio_output(pins, CS, true);
+        bitbang_select(pins, true);
+        bitbang_bytes(pins, tx, rx, 1);
+        bitbang_select(pins, false);
+    }
+}
+
+/// Выводы шины `spi3`, вынесенные из тела: их спрашивают три разные функции.
+const MISO: u32 = 21;
+const CS: u32 = 22;
+const MOSI: u32 = 23;
+const CLK: u32 = 24;
+
+/// Прижать или отпустить выбор кристалла.
+///
+/// Отдельно от передачи — чтобы можно было провести **две** посылки, не отпуская
+/// его между ними. Родной драйвер отпускает, но родной драйвер и работает; у нас
+/// же это одна из трёх оставшихся версий, и проверяется она одной строкой.
+///
+/// # Safety
+///
+/// См. [`bitbang`].
+unsafe fn bitbang_select(pins: u64, active: bool) {
+    // SAFETY: контракт функции. Выбор активен низким уровнем.
+    unsafe {
+        gpio_output(pins, CS, !active);
         gpio_output(pins, CLK, false);
         gpio_output(pins, MOSI, false);
         let _ = gpio_input(pins, MISO);
-        tick();
+    }
+    bitbang_tick(4);
+}
 
-        gpio_output(pins, CS, false);
-        tick();
+/// Пауза между фронтами. `slow` умножает её — на медленном такте прощаются
+/// длинные провода, на быстром чип не успевает заснуть между битами.
+fn bitbang_tick(slow: u32) {
+    for _ in 0..(50 * slow) {
+        core::hint::spin_loop();
+    }
+}
 
+/// Прокачать байты, не трогая выбор кристалла.
+///
+/// # Safety
+///
+/// См. [`bitbang`]; выбор кристалла должен быть уже прижат.
+unsafe fn bitbang_bytes(pins: u64, tx: &[u8], rx: &mut [u8], slow: u32) {
+
+    // SAFETY: контракт функции.
+    unsafe {
         for index in 0..tx.len().max(rx.len()) {
             let byte = tx.get(index).copied().unwrap_or(0);
             let mut received = 0u8;
             for bit in (0..8).rev() {
                 gpio_output(pins, MOSI, byte >> bit & 1 != 0);
-                tick();
+                bitbang_tick(slow);
                 gpio_output(pins, CLK, true);
                 // Читается на фронте — так велит режим 0.
                 if gpio_input(pins, MISO) {
                     received |= 1 << bit;
                 }
-                tick();
+                bitbang_tick(slow);
                 gpio_output(pins, CLK, false);
             }
             if let Some(slot) = rx.get_mut(index) {
                 *slot = received;
             }
         }
-
-        tick();
-        gpio_output(pins, CS, true);
-        tick();
     }
 }
 
