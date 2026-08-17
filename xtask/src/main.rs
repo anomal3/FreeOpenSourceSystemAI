@@ -300,6 +300,9 @@ struct PhoneArgs {
     /// Положить в образ RAM-диск — не для нас, а для загрузчика.
     #[arg(long)]
     ramdisk: Option<std::path::PathBuf>,
+    /// Держать аппарат живым после работы — чтобы разглядеть экран без спешки.
+    #[arg(long)]
+    keepalive: bool,
     /// Собрать образ-пробу: пинать сторожевой таймер MediaTek и больше ничего.
     ///
     /// Отвечает на единственный вопрос — исполняется ли наш код на аппарате.
@@ -560,6 +563,7 @@ fn real_main() -> Result<()> {
                 gzip: args.gzip,
                 ramdisk: args.ramdisk,
                 probe: args.probe,
+                keepalive: args.keepalive,
                 mtk_header: args.mtk_header,
             })?;
         }
