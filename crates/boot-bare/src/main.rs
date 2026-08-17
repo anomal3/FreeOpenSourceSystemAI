@@ -54,14 +54,8 @@ global_asm!(include_str!("head.S"));
 pub unsafe extern "C" fn bare_main(dtb: *const u8) -> ! {
     // ВРЕМЕННО: метки хода. R — дошли до Rust, D — указатель выровнен,
     // F — дерево разобрано, U — линия найдена.
-    let probe = |c: u8| unsafe { (0x0900_0000u64 as *mut u32).write_volatile(u32::from(c)) };
-    probe(b'R');
-    if !dtb.is_null() && (dtb as usize) % 8 == 0 { probe(b'D'); }
-    probe(b'0' + ((dtb as usize >> 20) & 7) as u8);
-
     // SAFETY: см. контракт функции.
     let fdt = unsafe { Fdt::from_ptr(dtb) };
-    if fdt.is_some() { probe(b'F'); }
 
     // Порядок именно такой: сначала линия, потом экран. Линия есть на QEMU и
     // нет на телефоне, экран — наоборот; выполняя оба, один и тот же образ
@@ -86,12 +80,9 @@ pub unsafe extern "C" fn bare_main(dtb: *const u8) -> ! {
 /// самый «угаданный адрес», на котором система уже спотыкалась на чужом
 /// гипервизоре.
 fn report(fdt: &Fdt<'_>) {
-    let probe = |c: u8| unsafe { (0x0900_0000u64 as *mut u32).write_volatile(u32::from(c)) };
     let Some(uart) = Uart::from_fdt(fdt) else {
-        probe(b'!');
         return;
     };
-    probe(b'U');
     uart.puts("\r\nFreeOS bare image: the bootloader started us.\r\n");
 
     if let Some(root) = fdt.nodes().next() {
