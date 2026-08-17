@@ -77,6 +77,12 @@ pub struct Options {
     pub out: Option<PathBuf>,
     /// Не собирать `boot-bare`, а завернуть готовый файл.
     pub kernel: Option<PathBuf>,
+    /// Сжать ядро в gzip — так, как хранит его заводской образ.
+    ///
+    /// Не для экономии места: заводское ядро начинается с `1f 8b 08 00`, то
+    /// есть загрузчик кладёт в образ **сжатое** ядро и распаковывает его сам.
+    /// Голый образ он распаковать не может и перезагружается, так и не прыгнув.
+    pub gzip: bool,
     /// Положить в образ RAM-диск.
     ///
     /// Нашему образу он не нужен — он самодостаточен. Нужен он загрузчику: у
@@ -109,11 +115,68 @@ impl Default for Options {
             dtb: None,
             out: None,
             kernel: None,
+            gzip: false,
             ramdisk: None,
             probe: false,
             mtk_header: false,
         }
     }
+}
+
+/// Завернуть данные в gzip, ничего не сжимая.
+///
+/// Формат deflate разрешает блоки «как есть»: байт признаков, длина, её
+/// дополнение, дальше сами данные. Распаковщик обязан их понимать — это часть
+/// формата, а не расширение, — и потому такой поток разбирает любой gzip.
+///
+/// Сжатия здесь нет намеренно. Нам нужна **оболочка**, потому что загрузчик
+/// умеет читать только её; экономить же на образе в сотню килобайт нечего, а
+/// настоящий упаковщик — это либо чужой крейт в дереве, либо своя реализация
+/// Хаффмана, и то и другое ради нуля пользы.
+fn gzip(payload: &[u8]) -> Vec<u8> {
+    // Метка, метод (deflate), без флагов, время ноль. Два последних байта —
+    // те же, что в заводском образе: признаки упаковщика и код системы.
+    let mut out = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x02, 0x03];
+
+    // Длина блока хранится в двух байтах, поэтому по 64 КиБ без одного.
+    const BLOCK: usize = 65535;
+    let mut rest = payload;
+    loop {
+        let take = rest.len().min(BLOCK);
+        let (block, tail) = rest.split_at(take);
+        let last = tail.is_empty();
+        out.push(if last { 1 } else { 0 }); // BFINAL, тип 00 — «как есть»
+        out.extend_from_slice(&(take as u16).to_le_bytes());
+        out.extend_from_slice(&(!(take as u16)).to_le_bytes());
+        out.extend_from_slice(block);
+        if last {
+            break;
+        }
+        rest = tail;
+    }
+
+    out.extend_from_slice(&crc32(payload).to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out
+}
+
+/// Контрольная сумма, которой gzip заканчивается.
+///
+/// Без таблицы: она считается один раз для файла в сотню килобайт, и таблица
+/// на 256 слов здесь дороже, чем восемь сдвигов на байт.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let carry = crc & 1;
+            crc >>= 1;
+            if carry != 0 {
+                crc ^= 0xedb8_8320;
+            }
+        }
+    }
+    !crc
 }
 
 /// Заголовок MediaTek: метка, длина, имя части — и всё это ровно 512 байт.
@@ -292,6 +355,13 @@ fn pack(kernel: &Path, options: &Options) -> Result<Vec<u8>> {
     let kernel_bytes = std::fs::read(kernel)
         .with_context(|| format!("не удалось прочитать {}", kernel.display()))?;
     check_arm64_header(&kernel_bytes, kernel, options.base + KERNEL_OFFSET)?;
+    // Порядок обязателен: заголовок arm64 проверяется у **несжатого** образа,
+    // после сжатия его там уже нет.
+    let kernel_bytes = if options.gzip {
+        gzip(&kernel_bytes)
+    } else {
+        kernel_bytes
+    };
     let kernel_bytes = if options.mtk_header {
         mtk_wrap(&kernel_bytes, "KERNEL")
     } else {
@@ -643,6 +713,29 @@ impl Sha1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gzip_wrapper_is_one_a_real_unpacker_accepts() {
+        let payload: Vec<u8> = (0..200_000u32).map(|index| (index % 251) as u8).collect();
+        let packed = gzip(&payload);
+
+        assert_eq!(&packed[..4], &[0x1f, 0x8b, 0x08, 0x00], "метка и метод");
+        // Хвост: сумма и длина исходных данных. По ней распаковщик проверяет
+        // себя, и разойдись она — файл будет объявлен испорченным.
+        let tail = &packed[packed.len() - 8..];
+        assert_eq!(u32::from_le_bytes(tail[..4].try_into().unwrap()), crc32(&payload));
+        assert_eq!(
+            u32::from_le_bytes(tail[4..].try_into().unwrap()),
+            payload.len() as u32
+        );
+
+        // Блоков должно получиться больше одного, иначе проверка не трогает
+        // самое хрупкое место — переход между ними.
+        assert!(payload.len() > 65535, "данные обязаны не влезать в один блок");
+
+        // И сама сумма — на опубликованном значении, а не на самой себе.
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+    }
 
     #[test]
     fn sha1_matches_the_published_vectors() {

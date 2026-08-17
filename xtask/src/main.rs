@@ -294,6 +294,9 @@ struct PhoneArgs {
     /// Завернуть готовый файл вместо сборки `boot-bare`.
     #[arg(long)]
     kernel: Option<std::path::PathBuf>,
+    /// Сжать ядро в gzip — так, как хранит его заводской образ.
+    #[arg(long)]
+    gzip: bool,
     /// Положить в образ RAM-диск — не для нас, а для загрузчика.
     #[arg(long)]
     ramdisk: Option<std::path::PathBuf>,
@@ -554,6 +557,7 @@ fn real_main() -> Result<()> {
                 dtb: args.dtb,
                 out: args.out,
                 kernel: args.kernel,
+                gzip: args.gzip,
                 ramdisk: args.ramdisk,
                 probe: args.probe,
                 mtk_header: args.mtk_header,
