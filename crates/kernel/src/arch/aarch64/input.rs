@@ -125,6 +125,20 @@ fn touchscreen() -> bool {
     let Some(fdt) = (unsafe { super::device_tree() }) else {
         return false;
     };
+
+    // USB поднимается здесь же, рядом с остальным вводом, и по той же причине:
+    // это будущий канал, по которому машина заговорит. Пока от него нужен один
+    // ответ — замечает ли компьютер, что к нему что-то подключили.
+    //
+    // SAFETY: таблицы ядра активны, окна отображаются внутри.
+    match unsafe { super::mtk_usb::start(&fdt) } {
+        Some((power, devctl)) => {
+            kprintln!(
+                "  usb         : connected to the bus, power {power:#04x}, devctl {devctl:#04x}"
+            );
+        }
+        None => kprintln!("  usb         : no usb controller in the device tree"),
+    }
     // SAFETY: таблицы ядра активны, окна шин драйвер отображает сам.
     let found = unsafe { super::mtk_touch::probe(&fdt) };
     if !found {
