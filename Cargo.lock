@@ -586,6 +586,7 @@ dependencies = [
  "disk",
  "ed25519-dalek",
  "ext2",
+ "fdt",
  "font8x8",
  "fpk",
  "linked_list_allocator",
