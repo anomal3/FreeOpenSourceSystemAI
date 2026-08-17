@@ -77,6 +77,12 @@ pub struct Options {
     pub out: Option<PathBuf>,
     /// Не собирать `boot-bare`, а завернуть готовый файл.
     pub kernel: Option<PathBuf>,
+    /// Собрать образ-пробу: пинать сторожевой таймер и больше ничего.
+    ///
+    /// Отвечает на один вопрос — исполняется ли наш код на аппарате, — и не
+    /// зависит ни от разбора дерева, ни от экрана, ни от того, верно ли мы
+    /// умеем таймер гасить.
+    pub probe: bool,
     /// Надеть на ядро 512-байтовый заголовок MediaTek.
     ///
     /// У MTK части загрузочного образа завёрнуты ещё раз, в свой заголовок с
@@ -96,6 +102,7 @@ impl Default for Options {
             dtb: None,
             out: None,
             kernel: None,
+            probe: false,
             mtk_header: false,
         }
     }
@@ -127,7 +134,7 @@ pub fn build(options: &Options) -> Result<PathBuf> {
             }
             path.clone()
         }
-        None => build_bare(options.base + KERNEL_OFFSET)?,
+        None => build_bare(options.base + KERNEL_OFFSET, options.probe)?,
     };
 
     let out = match &options.out {
@@ -155,7 +162,7 @@ pub fn build(options: &Options) -> Result<PathBuf> {
 /// совпасть с адресом компоновки, и здесь это последнее место, где ещё можно
 /// сверить: в голом двоичном файле адреса уже нет. Расхождение не даёт ни
 /// отказа, ни сообщения — машина исправно крутится и молчит.
-pub fn build_bare(expected_load: u64) -> Result<PathBuf> {
+pub fn build_bare(expected_load: u64, probe: bool) -> Result<PathBuf> {
     let script = paths::workspace_root().join("crates/boot-bare/bare.ld");
     if !script.is_file() {
         bail!("нет компоновочного сценария: {}", script.display());
@@ -171,6 +178,9 @@ pub fn build_bare(expected_load: u64) -> Result<PathBuf> {
         .arg("aarch64-unknown-none")
         .arg("-Zbuild-std=core,compiler_builtins")
         .arg("-Zbuild-std-features=compiler-builtins-mem");
+    if probe {
+        cmd.arg("--features").arg("mtk-probe");
+    }
 
     // Компоновочный сценарий подаётся через RUSTFLAGS этого запуска: в
     // `.cargo/config.toml` он подействовал бы на весь workspace. Путь обязан

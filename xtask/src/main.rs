@@ -294,6 +294,12 @@ struct PhoneArgs {
     /// Завернуть готовый файл вместо сборки `boot-bare`.
     #[arg(long)]
     kernel: Option<std::path::PathBuf>,
+    /// Собрать образ-пробу: пинать сторожевой таймер MediaTek и больше ничего.
+    ///
+    /// Отвечает на единственный вопрос — исполняется ли наш код на аппарате.
+    /// Аппарат остался жив — да; перезагрузился — нет.
+    #[arg(long)]
+    probe: bool,
     /// Надеть на ядро 512-байтовый заголовок MediaTek.
     #[arg(long)]
     mtk_header: bool,
@@ -538,6 +544,7 @@ fn real_main() -> Result<()> {
                 dtb: args.dtb,
                 out: args.out,
                 kernel: args.kernel,
+                probe: args.probe,
                 mtk_header: args.mtk_header,
             })?;
         }
