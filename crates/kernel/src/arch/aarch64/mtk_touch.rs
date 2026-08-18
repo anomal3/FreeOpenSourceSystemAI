@@ -177,6 +177,19 @@ static POLL_SOURCE: AtomicU8 = AtomicU8::new(1);
 /// курсором не двигать» — нужно, пока разбор отчёта под вопросом.
 static REPORTING: AtomicU8 = AtomicU8::new(1);
 
+/// Поднялась ли прошивка панели.
+///
+/// Отдельно от «кристалл найден», и разница здесь не бухгалтерская. Кристалл мы
+/// берём всегда — даже молчащий, чтобы к нему можно было обратиться по кабелю.
+/// Но наверх, в ответ на вопрос «есть ли у этой машины ввод», годится только
+/// работающая панель: от этого ответа зависит, отдать ли экран рабочему столу.
+///
+/// Отдать его напрасно — не косметическая ошибка. Отрисовка стола занимает
+/// секунды сплошной работы с памятью устройства, в которые шину USB опрашивать
+/// некому, и хост объявляет разрыв насовсем. То есть машина променяла бы
+/// единственный работающий канал наружу на картинку, по которой нечем нажать.
+static FIRMWARE_UP: AtomicU8 = AtomicU8::new(0);
+
 /// Размер панели. Координаты контроллер отдаёт в точках экрана, но врать он
 /// умеет, и обрезка по этим числам дешевле, чем курсор, уехавший за буфер.
 const SCREEN: (u16, u16) = (
@@ -307,7 +320,7 @@ pub unsafe fn probe(fdt: &Fdt<'_>) -> bool {
     // от этого ответа зависит, заведётся ли задача опроса и появится ли на
     // машине источник событий вообще. Без него ядро считает, что нажимать
     // нечем, и не поднимает ни оболочку, ни рабочий стол.
-    let on_spi = SPI_TOUCH.lock().is_some();
+    let on_spi = SPI_TOUCH.lock().is_some() && FIRMWARE_UP.load(Ordering::Relaxed) != 0;
 
     let Some(touch) = found else {
         return on_spi;
@@ -854,6 +867,7 @@ unsafe fn interrogate(
     let up = match outcome {
         super::mtk_touch_fw::Outcome::Up(ms) => {
             crate::kprintln!("  touch       : firmware came up after {ms} ms");
+            FIRMWARE_UP.store(1, Ordering::Relaxed);
             true
         }
         super::mtk_touch_fw::Outcome::Silent(state) => {
@@ -1159,7 +1173,7 @@ pub fn load_firmware(index: usize) -> Option<Outcome> {
     let blob = super::mtk_touch_fw::BLOBS.get(index)?;
     // SAFETY: окна отображены, выводы принадлежат `spi3`; настройка шины
     // восстанавливается внутри перед каждой посылкой.
-    Some(unsafe {
+    let outcome = unsafe {
         super::mtk_touch_fw::download(
             &touch.bus,
             touch.pins,
@@ -1169,7 +1183,15 @@ pub fn load_firmware(index: usize) -> Option<Outcome> {
             touch.pad,
             touch.mode,
         )
-    })
+    };
+    // Удавшаяся загрузка по кабелю значит ровно то же, что удавшаяся при
+    // поиске: панель работает. Стол от этого уже не поедет — его решение
+    // принято при загрузке, — но опрос начнёт давать координаты, и увидеть их
+    // можно тут же, `oem tstat`.
+    if matches!(outcome, Outcome::Up(_)) {
+        FIRMWARE_UP.store(1, Ordering::Relaxed);
+    }
+    Some(outcome)
 }
 
 /// Сколько образов прошивки вкомпилировано.
@@ -1403,7 +1425,8 @@ fn wait_ms(ms: u64) {
 /// Нашёлся ли читаемый тачскрин.
 #[must_use]
 pub fn present() -> bool {
-    TOUCH.lock().is_some() || SPI_TOUCH.lock().is_some()
+    TOUCH.lock().is_some()
+        || (SPI_TOUCH.lock().is_some() && FIRMWARE_UP.load(Ordering::Relaxed) != 0)
 }
 
 /// Отобразить страницу регистров как память устройства.
