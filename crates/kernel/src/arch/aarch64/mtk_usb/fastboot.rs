@@ -34,6 +34,13 @@ const TEXT: usize = PACKET - 4;
 enum State {
     /// Ждёт команду.
     Idle,
+    /// Выдаёт карту буфера событий панели: с какого смещения продолжать.
+    ///
+    /// Существует ради вопроса, который нельзя задать иначе: где именно панель
+    /// держит координаты. Отчёт по смещению, указанному в драйвере, читается
+    /// пустым, а соседние смещения того же буфера — живыми, и увидеть разницу
+    /// можно только осмотрев буфер целиком в тот миг, когда палец на экране.
+    Dump { offset: u32 },
     /// Отдаёт журнал: откуда читать и где остановиться.
     ///
     /// Граница запоминается в тот миг, когда команда пришла, и это не мелочь:
@@ -126,6 +133,11 @@ impl Fastboot {
             return;
         }
 
+        if let State::Dump { offset } = self.state {
+            self.continue_dump(offset);
+            return;
+        }
+
         let mut command = [0u8; PACKET];
         if let Some(len) = bulk.receive(&mut command) {
             self.handle(&command[..len]);
@@ -143,6 +155,9 @@ impl Fastboot {
 
         if let Some(name) = text.strip_prefix("getvar:") {
             self.getvar(name);
+        } else if text == "oem touchdump" {
+            self.state = State::Dump { offset: 0 };
+            self.continue_dump(0);
         } else if text == "oem log" || text == "oem klog" {
             let (at, until) = (klog::oldest(), klog::written());
             self.state = State::Log { at, until };
@@ -210,6 +225,48 @@ impl Fastboot {
             // Неизвестное имя — пустое значение, а не отказ: так отвечают
             // настоящие загрузчики, и `fastboot getvar all` не спотыкается.
             _ => self.respond(b"OKAY", ""),
+        }
+    }
+
+    /// Отдать очередную строку карты буфера — или закончить.
+    fn continue_dump(&mut self, offset: u32) {
+        /// Докуда осматривать буфер. Больше сотни байт там уже не наше:
+        /// отчёт о касаниях у этого кристалла занимает шестьдесят шесть.
+        const END: u32 = 0x80;
+        /// По сколько байт за строку. Двенадцать умещаются в пакет ответа
+        /// вместе с подписью смещения, а тридцать ломают само чтение.
+        const STEP: u32 = 12;
+
+        if offset >= END {
+            self.state = State::Idle;
+            self.respond(b"OKAY", "");
+            return;
+        }
+        self.state = State::Dump { offset: offset + STEP };
+
+        match crate::arch::aarch64::mtk_touch::raw_at(offset, STEP as usize) {
+            Some(bytes) => {
+                let mut text = [0u8; TEXT];
+                text[0] = b'+';
+                text[1] = hex_digit((offset >> 4) as u8);
+                text[2] = hex_digit((offset & 0x0f) as u8);
+                text[3] = b' ';
+                let mut at = 4;
+                for byte in bytes.iter().take(STEP as usize) {
+                    text[at] = hex_digit(byte >> 4);
+                    text[at + 1] = hex_digit(byte & 0x0f);
+                    text[at + 2] = b' ';
+                    at += 3;
+                }
+                self.out[..4].copy_from_slice(b"INFO");
+                self.out[4..4 + at].copy_from_slice(&text[..at]);
+                self.out_len = 4 + at;
+                self.ready = true;
+            }
+            None => {
+                self.state = State::Idle;
+                self.respond(b"FAIL", "no touchscreen");
+            }
         }
     }
 

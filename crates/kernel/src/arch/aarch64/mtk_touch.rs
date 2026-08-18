@@ -765,7 +765,7 @@ unsafe fn interrogate(bus: &mtk_spi::Bus, pins: Option<u64>, reset_pin: u32, pad
     wait_ms(200);
 
     // SAFETY: см. выше.
-    let state = unsafe { read_event(bus, EVENT_BUFFER, RESET_COMPLETE, 6) };
+    let (state, _) = unsafe { read_event(bus, EVENT_BUFFER, RESET_COMPLETE, 6) };
     crate::kprintln!(
         "  touch       : reset state {:02x} {:02x} {:02x} (0xa0..0xaf means the firmware is up)",
         state[0], state[1], state[2]
@@ -776,11 +776,11 @@ unsafe fn interrogate(bus: &mtk_spi::Bus, pins: Option<u64>, reset_pin: u32, pad
     // этот миг ещё раскладывает свой буфер. Родной драйвер повторяет трижды, и
     // без повтора одна и та же машина то опознаёт панель, то нет — на соседних
     // загрузках, без единой правки в коде.
-    let mut info = [0u8; 20];
+    let mut info = [0u8; 30];
     let mut sane = false;
     for _ in 0..3 {
         // SAFETY: см. выше.
-        info = unsafe { read_event(bus, EVENT_BUFFER, FIRMWARE_INFO, 17) };
+        info = unsafe { read_event(bus, EVENT_BUFFER, FIRMWARE_INFO, 17) }.0;
         // Версия и её дополнение до 0xff — проверка, которую делает и родной
         // драйвер: сведения читаются по одному байту, и сбитый обмен даёт
         // правдоподобные числа, не сходящиеся между собой.
@@ -833,11 +833,11 @@ unsafe fn interrogate(bus: &mtk_spi::Bus, pins: Option<u64>, reset_pin: u32, pad
 /// именно сейчас. Журнал для этого не годится — он рассказывает о прошлом, а
 /// печатать в него на каждом опросе значит утопить всё остальное.
 #[must_use]
-pub fn raw_report() -> Option<[u8; 20]> {
+pub fn raw_report() -> Option<[u8; 30]> {
     let guard = SPI_TOUCH.lock();
     let touch = guard.as_ref()?;
     // SAFETY: окна отображены, выводы наши; настройка восстанавливается внутри.
-    Some(unsafe { touch.read(0x00, 13) })
+    Some(unsafe { touch.read(0x00, 13) }.0)
 }
 
 /// Прочитать по кабелю произвольное смещение буфера событий.
@@ -847,11 +847,11 @@ pub fn raw_report() -> Option<[u8; 20]> {
 /// вопрос «а что лежит вот здесь» возникает по одному на заход, и городить под
 /// каждый свою переменную — это по прошивке на вопрос.
 #[must_use]
-pub fn raw_at(offset: u32, len: usize) -> Option<[u8; 20]> {
+pub fn raw_at(offset: u32, len: usize) -> Option<[u8; 30]> {
     let guard = SPI_TOUCH.lock();
     let touch = guard.as_ref()?;
     // SAFETY: см. [`raw_report`].
-    Some(unsafe { touch.read(offset, len) })
+    Some(unsafe { touch.read(offset, len) }.0)
 }
 
 impl SpiTouch {
@@ -860,7 +860,7 @@ impl SpiTouch {
     /// # Safety
     ///
     /// Окна отображены, выводы принадлежат `spi3`.
-    unsafe fn read(&self, offset: u32, len: usize) -> [u8; 20] {
+    unsafe fn read(&self, offset: u32, len: usize) -> ([u8; 30], bool) {
         // SAFETY: контракт функции. Настройка ставится заново каждый раз — см.
         // объяснение у полей `pad` и `mode`.
         unsafe {
@@ -890,6 +890,11 @@ pub fn irq_level() -> Option<bool> {
     Some(unsafe { gpio_input(pins, IRQ_PIN) })
 }
 
+/// Опросить панель из чужой задачи. См. объяснение в `mtk_usb::service_task`.
+pub fn poll_from_here() {
+    poll_spi_once();
+}
+
 /// Один опрос панели: есть ли палец и где.
 ///
 /// # Формат отчёта
@@ -909,21 +914,12 @@ fn poll_spi_once() {
         return;
     };
 
-    // Опрос идёт заметно реже, чем крутится задача.
-    //
-    // Пять миллисекунд — верный период для тачскрина на I²C, ради которого
-    // задача и писалась, но не для этого кристалла: при таком темпе он
-    // перестаёт отвечать вовсе, и шина читается подтяжкой. Через полсотни
-    // миллисекунд простоя тот же обмен проходит безупречно — это и видно по
-    // тому, что чтение по кабелю, приходящее изредка, всегда удаётся, а
-    // непрерывный опрос не удаётся никогда.
-    touch.ticks = touch.ticks.wrapping_add(1);
-    if touch.ticks % 10 != 0 {
-        return;
-    }
-
     // SAFETY: окна отображены, выводы наши; настройка восстанавливается внутри.
-    let report = unsafe { touch.read(0x00, 20) };
+    // Двенадцать байт, а не тридцать. Длина здесь не безразлична и проверена
+    // опытом: то же самое смещение, прочитанное двенадцатью байтами, отдаёт
+    // содержимое, а тридцатью — сплошные единицы, хотя контроллер отчитывается
+    // об успешной передаче. Двенадцати хватает на два пальца.
+    let (report, reached) = unsafe { touch.read(0x00, 12) };
 
     // Первые несколько непустых отчётов уходят в журнал целиком.
     //
@@ -941,7 +937,23 @@ fn poll_spi_once() {
     // ни разу, ни на пяти миллисекундах периода, ни на пятидесяти. Разбираться
     // надо не с кристаллом, а с тем, чем эти два пути отличаются.
     if report.iter().all(|byte| *byte == 0xff) {
+        if touch.seen < 4 {
+            touch.seen += 1;
+            crate::kprintln!(
+                "  touch       : polled all ff, transfer {}",
+                if reached { "reached the wire" } else { "NEVER LEFT" }
+            );
+        }
         return;
+    }
+
+    if report.iter().any(|byte| *byte != 0x00 && *byte != 0xff) && touch.seen < 8 {
+        touch.seen += 1;
+        crate::kprintln!(
+            "  touch       : REPORT {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+            report[0], report[1], report[2], report[3],
+            report[4], report[5], report[6], report[7]
+        );
     }
 
     let identifier = report[0] >> 3;
@@ -978,19 +990,25 @@ fn poll_spi_once() {
 /// # Safety
 ///
 /// См. [`interrogate`].
-unsafe fn read_event(bus: &mtk_spi::Bus, buffer: u32, offset: u32, len: usize) -> [u8; 20] {
-    let mut answer = [0u8; 24];
-    let mut request = [0u8; 24];
-    let len = len.min(20);
+unsafe fn read_event(bus: &mtk_spi::Bus, buffer: u32, offset: u32, len: usize) -> ([u8; 30], bool) {
+    let mut answer = [0u8; 32];
+    let mut request = [0u8; 32];
+    // Тридцать — предел не наш, а контроллера: его память передачи вмещает
+    // тридцать два байта вместе с двумя служебными.
+    let len = len.min(30);
     request[0] = read_command(offset);
     // SAFETY: контракт функции.
-    unsafe {
-        let _ = bus.transfer(&page_command(buffer | offset), &mut []);
-        let _ = bus.transfer(&request[..len + 2], &mut answer[..len + 2]);
-    }
-    let mut out = [0u8; 20];
+    let done = unsafe {
+        let page = bus.transfer(&page_command(buffer | offset), &mut []);
+        let data = bus.transfer(&request[..len + 2], &mut answer[..len + 2]);
+        page.is_some() && data.is_some()
+    };
+    let mut out = [0u8; 30];
     out[..len].copy_from_slice(&answer[2..len + 2]);
-    out
+    // Признак возвращается наружу, а не теряется. «Передача не дошла до
+    // провода» и «кристалл ответил единицами» — разные вещи, а выглядят
+    // одинаково: и там и там на руках `ff`.
+    (out, done)
 }
 
 /// Записать байт по адресу внутри кристалла.
