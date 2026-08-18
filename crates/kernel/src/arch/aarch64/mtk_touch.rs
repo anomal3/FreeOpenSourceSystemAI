@@ -82,6 +82,25 @@ struct Touch {
 
 static TOUCH: SpinLock<Option<Touch>> = SpinLock::new(None);
 
+/// Панель Novatek на SPI — та, что стоит в этом аппарате.
+///
+/// Отдельно от [`TOUCH`], а не ещё одним значением `Kind`, потому что общего у
+/// них ровно ничего: другая шина, другой тип, другой протокол. Свести их под
+/// один тип значило бы завести поле, которое у половины значений не имеет
+/// смысла, — и первую же ошибку, которую компилятор не поймает.
+struct SpiTouch {
+    bus: mtk_spi::Bus,
+    /// Палец на экране. Нужно, чтобы отпускание уходило ровно один раз.
+    down: bool,
+    /// Где палец был в последний раз, в долях экрана.
+    last: (u16, u16),
+}
+
+static SPI_TOUCH: SpinLock<Option<SpiTouch>> = SpinLock::new(None);
+
+/// Буфер событий прошивки у этого кристалла (`NT36672A_memory_map`).
+const EVENT_BUFFER: u32 = 0x2_1C00;
+
 /// Размер панели. Координаты контроллер отдаёт в точках экрана, но врать он
 /// умеет, и обрезка по этим числам дешевле, чем курсор, уехавший за буфер.
 const SCREEN: (u16, u16) = (
@@ -208,8 +227,14 @@ pub unsafe fn probe(fdt: &Fdt<'_>) -> bool {
     // SAFETY: таблицы ядра активны, окна отображаются внутри.
     unsafe { probe_spi(fdt) };
 
+    // Панель на SPI — тоже найденный тачскрин, и сказать об этом обязательно:
+    // от этого ответа зависит, заведётся ли задача опроса и появится ли на
+    // машине источник событий вообще. Без него ядро считает, что нажимать
+    // нечем, и не поднимает ни оболочку, ни рабочий стол.
+    let on_spi = SPI_TOUCH.lock().is_some();
+
     let Some(touch) = found else {
-        return false;
+        return on_spi;
     };
     *TOUCH.lock() = Some(touch);
     true
@@ -270,12 +295,23 @@ fn report_pins(window: &super::fdt_boot::I2cBus) {
 /// Таблицы ядра активны.
 unsafe fn probe_spi(fdt: &Fdt<'_>) {
     /// Адрес идентификатора внутри чипа.
-    const TRIM_ADDRESS: u32 = 0x3_F004;
+    ///
+    /// `0x1F64E`, а не `0x3F004`: второе стояло здесь раньше и взято не из
+    /// драйвера этого кристалла. Читать оттуда — всё равно что спрашивать не по
+    /// тому адресу и делать выводы из молчания.
+    const TRIM_ADDRESS: u32 = 0x1_F64E;
     /// Адрес регистра программного сброса. Взят из описания панели в исходниках
     /// ядра Xiaomi для этого аппарата (`novatek,swrst-n8-addr`).
     const RESET_ADDRESS: u32 = 0x3_F0FE;
     /// Значение, которое этот регистр понимает как «перезапустись».
     const RESET_VALUE: u8 = 0x69;
+    /// Инженерный сброс — единственная посылка, которую кристалл принимает,
+    /// пока его держат в аппаратном сбросе (`ENG_RST_ADDR` в драйвере).
+    const ENGINEERING_RESET_ADDRESS: u32 = 0x7F_FF80;
+    const ENGINEERING_RESET_VALUE: u8 = 0x5a;
+    /// Быстрое чтение. Изготовитель выключает его сразу после сброса: пока оно
+    /// включено, обмен идёт по другому договору, чем весь остальной драйвер.
+    const FAST_READ_ADDRESS: u32 = 0x3_F310;
     /// Вывод, которым кристалл держится в сбросе (`novatek,reset-gpio`).
     const RESET_PIN: u32 = 174;
     /// Выводы шины `spi3`: данные к нам, выбор кристалла, данные от нас, такт.
@@ -310,10 +346,9 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
                 for (slot, pin) in SPI3_PINS.into_iter().enumerate() {
                     modes[slot] = super::mtk::gpio_mode(pins, pin, SPI3_FUNCTION);
                 }
-                gpio_reset(pins, RESET_PIN);
             }
             crate::kprintln!(
-                "  touch       : spi3 pins 21-24 now read back as {} {} {} {}, reset released",
+                "  touch       : spi3 pins 21-24 now read back as {} {} {} {}",
                 modes[0], modes[1], modes[2], modes[3]
             );
         }
@@ -343,16 +378,40 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
             // SAFETY: окно отображено; параметры перебираются.
             unsafe { bus.prepare(mtk_spi::Timing::Enhanced, mode, pad, 0x40) };
 
-            // SAFETY: см. выше.
+            // Последовательность запуска целиком, как у изготовителя. Каждый её
+            // шаг по отдельности выглядит необязательным, и раньше мы делали
+            // только последний — оттого и молчание.
+            //
+            // SAFETY: см. выше; окна отображены, выводы принадлежат шине.
             unsafe {
-                let _ = bus.transfer(&page_command(RESET_ADDRESS), &mut []);
-                let _ = bus.transfer(&[RESET_ADDRESS as u8 & 0x7f, RESET_VALUE], &mut []);
+                // Кристалл держится в сбросе — и **в этом состоянии** принимает
+                // ровно одну посылку, инженерный сброс. Она выводит его из того,
+                // во что его оставил загрузчик.
+                if let Some(pins) = pins {
+                    super::mtk::gpio_output(pins, RESET_PIN, false);
+                }
+                write_addr(&bus, ENGINEERING_RESET_ADDRESS, ENGINEERING_RESET_VALUE);
+                wait_ms(1);
+
+                // Сброс отпускается, и кристаллу дают подняться.
+                if let Some(pins) = pins {
+                    super::mtk::gpio_output(pins, RESET_PIN, true);
+                }
+                wait_ms(10);
+
+                // Перезапуск загрузчика кристалла и отключение быстрого чтения:
+                // с ним обмен идёт по другому договору.
+                write_addr(&bus, RESET_ADDRESS, RESET_VALUE);
+                wait_ms(5);
+                write_addr(&bus, FAST_READ_ADDRESS, 0x00);
             }
-            wait_ms(35);
 
             // SAFETY: см. выше.
             let _ = unsafe { bus.transfer(&page_command(TRIM_ADDRESS), &mut []) };
-            let request = [(TRIM_ADDRESS as u8 & 0x7f) | 0x80, 0, 0, 0, 0, 0, 0, 0];
+            // Чтение: разряд направления **снят**, и передача на байт длиннее
+            // запрошенного — первый принятый байт кристалл тратит на разгон.
+            // Полезное начинается с третьего.
+            let request = [read_command(TRIM_ADDRESS), 0, 0, 0, 0, 0, 0, 0];
             let mut answer = [0u8; 8];
             // SAFETY: см. выше.
             let _ = unsafe { bus.transfer(&request, &mut answer) };
@@ -366,6 +425,8 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
             // ответ. Всё прочее уже что-то значит.
             if answer[2..].iter().any(|byte| *byte != 0x00 && *byte != 0xff) {
                 crate::kprintln!("  touch       : the chip is talking");
+                // SAFETY: шина настроена, кристалл опознан.
+                unsafe { interrogate(&bus, pins, RESET_PIN) };
                 return;
             }
         }
@@ -378,13 +439,13 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
     // этой шины больше не работает — мы забираем их себе.
     unsafe {
         bitbang(pins, &page_command(RESET_ADDRESS), &mut []);
-        bitbang(pins, &[RESET_ADDRESS as u8 & 0x7f, RESET_VALUE], &mut []);
+        bitbang(pins, &[write_command(RESET_ADDRESS), RESET_VALUE], &mut []);
     }
     wait_ms(40);
     // SAFETY: см. выше.
     unsafe {
         bitbang(pins, &page_command(TRIM_ADDRESS), &mut []);
-        bitbang(pins, &[(TRIM_ADDRESS as u8 & 0x7f) | 0x80, 0, 0, 0, 0, 0, 0, 0], &mut answer);
+        bitbang(pins, &[read_command(TRIM_ADDRESS), 0, 0, 0, 0, 0, 0, 0], &mut answer);
     }
     crate::kprintln!(
         "  touch       : by hand, {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
@@ -406,7 +467,7 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
             bitbang_bytes(pins, &page_command(TRIM_ADDRESS), &mut [], slow);
             bitbang_bytes(
                 pins,
-                &[(TRIM_ADDRESS as u8 & 0x7f) | 0x80, 0, 0, 0, 0, 0, 0, 0],
+                &[read_command(TRIM_ADDRESS), 0, 0, 0, 0, 0, 0, 0],
                 &mut held,
                 slow,
             );
@@ -589,7 +650,197 @@ fn root_cells(fdt: &Fdt<'_>) -> (usize, usize) {
 ///
 /// Следующие два байта — адрес, сдвинутый на пятнадцать и на семь.
 fn page_command(address: u32) -> [u8; 3] {
-    [0x7f, ((address >> 15) & 0xff) as u8, ((address >> 7) & 0xff) as u8]
+    // Первый байт — `0xff`, а не `0x7f`. Разряд 7 у этого кристалла означает
+    // «это запись», и посылка выбора страницы — тоже запись. Со снятым разрядом
+    // чип читает её как чтение по адресу `0x7f` и страницу не меняет: всё
+    // последующее уходит в ту, что была.
+    [0xff, ((address >> 15) & 0xff) as u8, ((address >> 7) & 0xff) as u8]
+}
+
+/// Первый байт посылки: адрес плюс направление.
+///
+/// # Почему это отдельные функции, а не два места в коде
+///
+/// Потому что один раз они уже разъехались, и разъехались наоборот: чтение
+/// уходило с разрядом записи, запись — без него. Кристалл в ответ на «запиши по
+/// адресу идентификатора» честно молчал, а выглядело это как мёртвая шина, и
+/// поиск ушёл в питание, выводы и тактирование по очереди.
+///
+/// Названия здесь — как у изготовителя (`SPI_READ_MASK`, `SPI_WRITE_MASK`),
+/// чтобы следующий читатель мог сверить их глазами, не разбираясь в битах.
+const fn read_command(address: u32) -> u8 {
+    (address as u8) & 0x7f
+}
+
+const fn write_command(address: u32) -> u8 {
+    (address as u8) | 0x80
+}
+
+/// Расспросить опознанный кристалл: готова ли прошивка и что она о себе знает.
+///
+/// # Зачем отдельный проход
+///
+/// Опознание доказало, что обмен работает, — но опознание отвечает загрузчик
+/// кристалла, а касания считает прошивка. Между ними целое состояние: прошивка
+/// поднимается после сброса не мгновенно и заявляет о готовности в своём
+/// буфере событий. Спрашивать координаты, не дождавшись её, — значит читать
+/// мусор и принимать его за касания.
+///
+/// Здесь всё это только **читается и печатается**. Разбирать отчёт и слать
+/// события будет следующий шаг: наполовину угаданный протокол хуже
+/// отсутствующего — он даёт координаты, и они неверны.
+///
+/// # Safety
+///
+/// Шина настроена, окна отображены, выводы принадлежат `spi3`.
+unsafe fn interrogate(bus: &mtk_spi::Bus, pins: Option<u64>, reset_pin: u32) {
+    /// Смещение внутри него: прошивка поднялась и работает.
+    const RESET_COMPLETE: u32 = 0x60;
+    /// Смещение: версия, размеры панели, число пальцев.
+    const FIRMWARE_INFO: u32 = 0x78;
+
+    // Аппаратный сброс: загрузчик кристалла отдаёт управление прошивке только
+    // после него. Программный сброс, которым мы пользовались при опознании,
+    // оставляет кристалл в загрузчике — там он отвечает на вопросы о себе и
+    // молчит обо всём остальном.
+    // SAFETY: контракт функции.
+    unsafe {
+        if let Some(pins) = pins {
+            gpio_output(pins, reset_pin, false);
+            wait_ms(10);
+            gpio_output(pins, reset_pin, true);
+        }
+    }
+    wait_ms(200);
+
+    // SAFETY: см. выше.
+    let state = unsafe { read_event(bus, EVENT_BUFFER, RESET_COMPLETE, 6) };
+    crate::kprintln!(
+        "  touch       : reset state {:02x} {:02x} {:02x} (0xa0..0xaf means the firmware is up)",
+        state[0], state[1], state[2]
+    );
+
+    // SAFETY: см. выше.
+    let info = unsafe { read_event(bus, EVENT_BUFFER, FIRMWARE_INFO, 17) };
+    // Версия и её дополнение до 0xff — проверка, которую делает и родной
+    // драйвер: сведения читаются по одному байту, и сбитый обмен даёт
+    // правдоподобные числа, не сходящиеся между собой.
+    let sane = (u16::from(info[0]) + u16::from(info[1])) == 0xff;
+    crate::kprintln!(
+        "  touch       : firmware {:#04x}, panel {}x{}, {} nodes, {} keys, checksum {}",
+        info[0],
+        (u16::from(info[4]) << 8) | u16::from(info[5]),
+        (u16::from(info[6]) << 8) | u16::from(info[7]),
+        info[2],
+        info[10],
+        if sane { "ok" } else { "BROKEN" }
+    );
+
+    // Прошивка обязана заявить о себе состоянием из своего диапазона. Не
+    // заявила — значит поднялся загрузчик, а не она; читать координаты у него
+    // бессмысленно, и делать вид, что тачскрин найден, тоже.
+    if !(0xa0..=0xaf).contains(&state[0]) {
+        crate::kprintln!("  touch       : the firmware did not come up; not taking this chip");
+        return;
+    }
+    if !sane {
+        crate::kprintln!("  touch       : firmware info does not add up; not taking this chip");
+        return;
+    }
+
+    *SPI_TOUCH.lock() = Some(SpiTouch {
+        bus: *bus,
+        down: false,
+        last: (0, 0),
+    });
+    crate::kprintln!("  touch       : NT36525B on spi3 is ours; polling for fingers");
+}
+
+/// Один опрос панели: есть ли палец и где.
+///
+/// # Формат отчёта
+///
+/// Шесть байт на палец, подряд, начиная с самого начала буфера событий. У
+/// первого байта старшие пять разрядов — номер пальца (нумерация с единицы,
+/// ноль означает «этого пальца нет»), младшие три — что с ним происходит:
+/// единица и двойка означают «на экране», всё прочее — снят.
+///
+/// Координата занимает полтора байта: старшие восемь разрядов лежат отдельно,
+/// младшие четыре — в половинке общего байта. Собирать их надо именно так, а
+/// не брать один старший байт: панель 720 точек шириной, и потеря младших
+/// разрядов дала бы курсор, прыгающий шагами по шестнадцать точек.
+fn poll_spi_once() {
+    let mut guard = SPI_TOUCH.lock();
+    let Some(touch) = guard.as_mut() else {
+        return;
+    };
+
+    // SAFETY: шина настроена при поиске, окна отображены, выводы наши.
+    let report = unsafe { read_event(&touch.bus, EVENT_BUFFER, 0x00, 7) };
+
+    let identifier = report[0] >> 3;
+    let state = report[0] & 0x07;
+    if identifier == 0 || !(state == 0x01 || state == 0x02) {
+        if touch.down {
+            touch.down = false;
+            post_pointer_at(touch.last.0, touch.last.1, 0, Buttons::NONE);
+        }
+        return;
+    }
+
+    let x = (u16::from(report[1]) << 4) | u16::from(report[3] >> 4);
+    let y = (u16::from(report[2]) << 4) | u16::from(report[3] & 0x0f);
+    if x > SCREEN.0 || y > SCREEN.1 {
+        return; // панель врать умеет; за её краем щёлкать нечему
+    }
+
+    let point = to_fractions(x, y);
+    touch.down = true;
+    touch.last = point;
+    post_pointer_at(point.0, point.1, 0, Buttons::LEFT);
+}
+
+/// Прочитать из буфера событий прошивки.
+///
+/// Страница выбирается **вместе со смещением** — так делает родной драйвер, и
+/// это не украшение: у кристалла адрес разрезан на страницу и смещение, и
+/// выбрать страницу без смещения значит попасть в её начало.
+///
+/// Возвращает до 20 байт полезных данных, уже без двух служебных в начале
+/// принятого.
+///
+/// # Safety
+///
+/// См. [`interrogate`].
+unsafe fn read_event(bus: &mtk_spi::Bus, buffer: u32, offset: u32, len: usize) -> [u8; 20] {
+    let mut answer = [0u8; 24];
+    let mut request = [0u8; 24];
+    let len = len.min(20);
+    request[0] = read_command(offset);
+    // SAFETY: контракт функции.
+    unsafe {
+        let _ = bus.transfer(&page_command(buffer | offset), &mut []);
+        let _ = bus.transfer(&request[..len + 2], &mut answer[..len + 2]);
+    }
+    let mut out = [0u8; 20];
+    out[..len].copy_from_slice(&answer[2..len + 2]);
+    out
+}
+
+/// Записать байт по адресу внутри кристалла.
+///
+/// Две посылки, и обе — записи: сначала «дальше говорим по этой странице»,
+/// потом сам байт. Разделять их нельзя, страница живёт до следующей смены.
+///
+/// # Safety
+///
+/// Окно шины отображено, выводы за ней закреплены.
+unsafe fn write_addr(bus: &mtk_spi::Bus, address: u32, value: u8) {
+    // SAFETY: контракт функции.
+    unsafe {
+        let _ = bus.transfer(&page_command(address), &mut []);
+        let _ = bus.transfer(&[write_command(address), value], &mut []);
+    }
 }
 
 /// Подождать столько миллисекунд, сколько просит чип после сброса.
@@ -607,7 +858,7 @@ fn wait_ms(ms: u64) {
 /// Нашёлся ли читаемый тачскрин.
 #[must_use]
 pub fn present() -> bool {
-    TOUCH.lock().is_some()
+    TOUCH.lock().is_some() || SPI_TOUCH.lock().is_some()
 }
 
 /// Отобразить страницу регистров как память устройства.
@@ -652,6 +903,8 @@ pub fn service_task() {
 }
 
 fn poll_once() {
+    poll_spi_once();
+
     let mut guard = TOUCH.lock();
     let Some(touch) = guard.as_mut() else {
         return;
