@@ -252,6 +252,7 @@ pub unsafe fn download(
     }
     wait_ms(40);
 
+    let mut sent = 0u32;
     for part in parts.iter().take(count) {
         if part.size == 0 {
             continue;
@@ -262,8 +263,19 @@ pub unsafe fn download(
         let size = part.size as usize + 1;
         let mut written = 0;
         while written < size {
-            let len = CHUNK.min(size - written);
             let to = part.to + written as u32;
+            // Кусок обрезается по границе страницы кристалла.
+            //
+            // Не из осторожности: части образа начинаются где придётся
+            // (`0x00dac4`, `0x00ec2c`, `0x024c70` — ни одна не кратна
+            // шестнадцати), и посылка, начатая под конец страницы, ушла бы за
+            // её край. Изготовитель на это не смотрит — он пишет по шестьдесят
+            // три килобайта за раз и полагается на то, что кристалл сам
+            // переходит на следующую страницу. Возможно, так и есть; но у нас
+            // предел посылки тридцать два байта, границы приходится считать
+            // всё равно, и считать их правильно ничего не стоит.
+            let to_page_end = 0x80 - (to as usize & 0x7f);
+            let len = CHUNK.min(size - written).min(to_page_end);
             let from = part.from as usize + written;
             let mut packet = [0u8; CHUNK + 1];
             packet[0] = (to as u8) | 0x80;
@@ -278,6 +290,7 @@ pub unsafe fn download(
                 let _ = bus.transfer(&packet[..=len], &mut []);
             }
             written += len;
+            sent += 1;
 
             // Обмен с компьютером прокручивается прямо посреди записи.
             //
@@ -289,7 +302,7 @@ pub unsafe fn download(
             //
             // Раз в тридцать два куска: реже — не спасает, чаще — половина
             // времени уходит на проверку замка, который почти всегда свободен.
-            if written % (CHUNK * 32) == 0 {
+            if sent % 32 == 0 {
                 super::mtk_usb::poll();
             }
         }
