@@ -174,9 +174,63 @@ impl Fastboot {
             // нечем и незачем их писать.
             "max-download-size" => self.respond(b"OKAY", "0"),
             "secure" => self.respond(b"OKAY", "no"),
+            // Отчёт панели прямо сейчас, шестнадцатеричными парами. Живёт среди
+            // переменных, а не команд, по прозаичной причине: значение
+            // переменной программа `fastboot` печатает, а ответ на `oem` —
+            // нет, и вопрос «что панель говорит, пока я держу палец» иначе
+            // остаётся без видимого ответа.
+            // Линия прерывания панели: ноль означает «кристаллу есть что
+            // сказать». Вместе с пустым буфером событий это разные диагнозы.
+            "touchirq" => match crate::arch::aarch64::mtk_touch::irq_level() {
+                Some(true) => self.respond(b"OKAY", "high (nothing to report)"),
+                Some(false) => self.respond(b"OKAY", "low (the chip has something)"),
+                None => self.respond(b"FAIL", "no touchscreen"),
+            },
+            // Сведения о прошивке и её состояние — те же, что печатаются при
+            // загрузке, но спрошенные сейчас, а не в прошлом.
+            "touchinfo" => self.dump_touch(0x78, 12),
+            "touchstate" => self.dump_touch(0x60, 8),
+            "touch" => match crate::arch::aarch64::mtk_touch::raw_report() {
+                Some(report) => {
+                    let mut text = [0u8; TEXT];
+                    let mut at = 0;
+                    for byte in report.iter().take(13) {
+                        text[at] = hex_digit(byte >> 4);
+                        text[at + 1] = hex_digit(byte & 0x0f);
+                        text[at + 2] = b' ';
+                        at += 3;
+                    }
+                    self.out[..4].copy_from_slice(b"OKAY");
+                    self.out[4..4 + at].copy_from_slice(&text[..at]);
+                    self.out_len = 4 + at;
+                    self.ready = true;
+                }
+                None => self.respond(b"FAIL", "no touchscreen"),
+            },
             // Неизвестное имя — пустое значение, а не отказ: так отвечают
             // настоящие загрузчики, и `fastboot getvar all` не спотыкается.
             _ => self.respond(b"OKAY", ""),
+        }
+    }
+
+    /// Отдать кусок памяти кристалла шестнадцатеричными парами.
+    fn dump_touch(&mut self, offset: u32, len: usize) {
+        match crate::arch::aarch64::mtk_touch::raw_at(offset, len) {
+            Some(bytes) => {
+                let mut text = [0u8; TEXT];
+                let mut at = 0;
+                for byte in bytes.iter().take(len) {
+                    text[at] = hex_digit(byte >> 4);
+                    text[at + 1] = hex_digit(byte & 0x0f);
+                    text[at + 2] = b' ';
+                    at += 3;
+                }
+                self.out[..4].copy_from_slice(b"OKAY");
+                self.out[4..4 + at].copy_from_slice(&text[..at]);
+                self.out_len = 4 + at;
+                self.ready = true;
+            }
+            None => self.respond(b"FAIL", "no touchscreen"),
         }
     }
 
@@ -245,4 +299,15 @@ fn trim_end(line: &[u8]) -> usize {
         len -= 1;
     }
     len
+}
+
+/// Одна шестнадцатеричная цифра.
+///
+/// Своя, потому что форматирование ядра выделяет память, а этот код работает
+/// внутри опроса, где выделять нельзя и незачем.
+const fn hex_digit(value: u8) -> u8 {
+    match value {
+        0..=9 => b'0' + value,
+        _ => b'a' + (value - 10),
+    }
 }
