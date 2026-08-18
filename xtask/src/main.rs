@@ -68,6 +68,8 @@ enum Command {
     Repo(RepoArgs),
     /// Собрать образ, который запустит заводской загрузчик телефона.
     Phone(PhoneArgs),
+    /// Принести прошивку тачскрина телефона: чужая, в хранилище её нет.
+    PhoneFirmware,
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -575,6 +577,10 @@ fn real_main() -> Result<()> {
                 keepalive: args.keepalive,
                 mtk_header: args.mtk_header,
             })?;
+        }
+
+        Command::PhoneFirmware => {
+            phone::fetch_firmware()?;
         }
 
         Command::Check(args) => {

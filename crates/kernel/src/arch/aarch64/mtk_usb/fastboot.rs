@@ -48,7 +48,15 @@ enum State {
     /// неё `oem log` не кончился бы никогда, потому что журнал прирастал бы
     /// ровно настолько, насколько его успели прочитать.
     Log { at: u64, until: u64 },
+    /// Отдаёт заранее сложенные строки ответа: какую следующей.
+    Lines { at: u8 },
 }
+
+/// Сколько строк помещается в один ответ.
+///
+/// Восемь — с запасом на самый длинный ответ: тридцать байт кристалла
+/// шестнадцатеричными парами не влезают в один пакет и занимают две строки.
+const LINES: usize = 8;
 
 /// Сколько проходов подряд можно не суметь отдать ответ, прежде чем считать
 /// собеседника ушедшим.
@@ -68,6 +76,16 @@ pub struct Fastboot {
     stalled: u16,
     /// Отдать ответ и перезагрузить машину.
     reboot_after_reply: bool,
+    /// Сложенные строки ответа и сколько их.
+    ///
+    /// Складываются целиком **до** первой отправки, а не по мере надобности, и
+    /// это не расточительность. Ответ на `oem tr` — это то, что кристалл сказал
+    /// в один определённый миг; выдавая его частями и дочитывая между пакетами,
+    /// мы получили бы срез, склеенный из разных мгновений, и не заметили бы
+    /// этого никогда.
+    lines: [[u8; TEXT]; LINES],
+    line_len: [u8; LINES],
+    line_count: u8,
 }
 
 impl Fastboot {
@@ -79,6 +97,9 @@ impl Fastboot {
             ready: false,
             stalled: 0,
             reboot_after_reply: false,
+            lines: [[0; TEXT]; LINES],
+            line_len: [0; LINES],
+            line_count: 0,
         }
     }
 
@@ -138,6 +159,11 @@ impl Fastboot {
             return;
         }
 
+        if let State::Lines { at } = self.state {
+            self.continue_lines(at);
+            return;
+        }
+
         let mut command = [0u8; PACKET];
         if let Some(len) = bulk.receive(&mut command) {
             self.handle(&command[..len]);
@@ -158,6 +184,8 @@ impl Fastboot {
         } else if text == "oem touchdump" {
             self.state = State::Dump { offset: 0 };
             self.continue_dump(0);
+        } else if let Some(rest) = text.strip_prefix("oem t") {
+            self.touch_command(rest);
         } else if text == "oem log" || text == "oem klog" {
             let (at, until) = (klog::oldest(), klog::written());
             self.state = State::Log { at, until };
@@ -177,6 +205,265 @@ impl Fastboot {
         } else {
             self.respond(b"FAIL", "unknown command");
         }
+    }
+
+    /// Разговор с тачскрином по кабелю: `oem t<что> [аргументы]`.
+    ///
+    /// # Зачем целый разговор, а не пара переменных
+    ///
+    /// Затем, что каждый вопрос к панели, зашитый в ядро, стоит сборки,
+    /// прошивки, перезагрузки и **двух нажатий питания живым человеком** — на
+    /// логотипе загрузчика, куда изнутри ядра не дотянуться. За вечер это
+    /// полтора десятка кругов, и на каждый круг приходится ровно одна догадка.
+    ///
+    /// Догадок же осталось много, и все они об одном: чего прошивка панели
+    /// ждёт, чтобы начать складывать отчёт о касаниях туда, откуда его берёт
+    /// родной драйвер. Проверять их по одной в круг — значит не проверить их
+    /// никогда.
+    ///
+    /// Поэтому кристалл открывается целиком: читать по любому адресу, писать по
+    /// любому адресу, пересбрасывать, менять предполагаемый адрес буфера
+    /// событий и переключать опрос — всё это отсюда, не трогая аппарат руками.
+    ///
+    /// | команда | что делает |
+    /// |---|---|
+    /// | `tr <адрес> <длина>` | прочитать байты по полному адресу |
+    /// | `tw <адрес> <байт>` | записать байт по полному адресу |
+    /// | `trst [hard]` | пересбросить кристалл и дождаться прошивки |
+    /// | `tmode <байт>` | `nvt_change_mode`: команда в `0x50` и рукопожатие |
+    /// | `tbase <адрес>` | сменить адрес буфера событий |
+    /// | `tsrc <0..3>` | кто опрашивает: 1 — USB, 2 — тач, 3 — обе |
+    /// | `treport <0/1>` | слать ли события указателя наверх |
+    /// | `tstat` | счётчики опроса и последний непустой отчёт |
+    ///
+    /// Числа читаются шестнадцатеричными без приставки: `oem tr 21c00 12`.
+    fn touch_command(&mut self, rest: &str) {
+        use crate::arch::aarch64::mtk_touch as touch;
+
+        let mut words = rest.split_whitespace();
+        let Some(what) = words.next() else {
+            self.respond(b"FAIL", "say what to do with the touchscreen");
+            return;
+        };
+        let first = words.next();
+        let second = words.next();
+
+        self.line_count = 0;
+        match what {
+            "r" => {
+                let (Some(address), Some(len)) = (first.and_then(hex32), second.and_then(hex32))
+                else {
+                    self.respond(b"FAIL", "usage: oem tr <hex address> <hex length>");
+                    return;
+                };
+                match touch::read_raw(address, len as usize) {
+                    Some(probe) => {
+                        // Число опросов печатается рядом с байтами, и это не
+                        // украшение: «кристалл ответил единицами» и «посылка не
+                        // вышла на провод» дают на руках одно и то же `ff`, а
+                        // различает их только время, которое заняла передача.
+                        let mut head = [0u8; TEXT];
+                        let mut at = 0;
+                        at += put(&mut head[at..], b"page ");
+                        at += put_dec(&mut head[at..], probe.page_spins);
+                        at += put(&mut head[at..], b" data ");
+                        at += put_dec(&mut head[at..], probe.data_spins);
+                        if probe.page_spins == 0 || probe.data_spins == 0 {
+                            at += put(&mut head[at..], b" NEVER LEFT THE WIRE");
+                        }
+                        self.say(&head[..at]);
+                        self.say_bytes(&probe.bytes[..probe.len]);
+                    }
+                    None => self.say(b"no touchscreen"),
+                }
+            }
+            "w" => {
+                let (Some(address), Some(value)) = (first.and_then(hex32), second.and_then(hex32))
+                else {
+                    self.respond(b"FAIL", "usage: oem tw <hex address> <hex byte>");
+                    return;
+                };
+                if touch::write_raw(address, value as u8) {
+                    self.say(b"written");
+                } else {
+                    self.say(b"no touchscreen");
+                }
+            }
+            "rst" => {
+                let hard = first == Some("hard");
+                match touch::reset_chip(hard) {
+                    Some((state, waited)) => {
+                        let mut head = [0u8; TEXT];
+                        let mut at = 0;
+                        at += put(&mut head[at..], b"state after ");
+                        at += put_dec(&mut head[at..], waited);
+                        at += put(&mut head[at..], b" ms (0xa0..0xaf is up)");
+                        self.say(&head[..at]);
+                        self.say_bytes(&state[..6]);
+                    }
+                    None => self.say(b"no touchscreen"),
+                }
+            }
+            "mode" => {
+                let Some(mode) = first.and_then(hex32) else {
+                    self.respond(b"FAIL", "usage: oem tmode <hex mode>");
+                    return;
+                };
+                if touch::change_mode(mode as u8) {
+                    self.say(b"mode written, host ready handshaken");
+                } else {
+                    self.say(b"no touchscreen");
+                }
+            }
+            "base" => {
+                let Some(address) = first.and_then(hex32) else {
+                    self.respond(b"FAIL", "usage: oem tbase <hex address>");
+                    return;
+                };
+                touch::set_event_base(address);
+                self.say(b"event buffer moved");
+            }
+            "src" => {
+                let Some(mask) = first.and_then(hex32) else {
+                    self.respond(b"FAIL", "usage: oem tsrc <0..3>");
+                    return;
+                };
+                touch::set_poll_source(mask as u8);
+                self.say(b"polling source changed");
+            }
+            "report" => {
+                let Some(on) = first.and_then(hex32) else {
+                    self.respond(b"FAIL", "usage: oem treport <0|1>");
+                    return;
+                };
+                touch::set_reporting(on != 0);
+                self.say(b"reporting changed");
+            }
+            // Положить в кристалл один из вкомпилированных образов прошивки.
+            //
+            // Живёт здесь, а не только в загрузке, потому что панелей у этого
+            // аппарата четыре разновидности, имя от загрузчика бывает не то, а
+            // перебрать четыре образа по кабелю — это четыре команды против
+            // четырёх сборок и восьми нажатий питания.
+            "fw" => {
+                let Some(index) = first.and_then(hex32) else {
+                    self.respond(b"FAIL", "usage: oem tfw <image number>");
+                    return;
+                };
+                match touch::load_firmware(index as usize) {
+                    Some(outcome) => {
+                        let mut head = [0u8; TEXT];
+                        let mut at = 0;
+                        match outcome {
+                            touch::Outcome::Up(ms) => {
+                                at += put(&mut head[at..], b"firmware up after ");
+                                at += put_dec(&mut head[at..], ms);
+                                at += put(&mut head[at..], b" ms");
+                            }
+                            touch::Outcome::Silent(state) => {
+                                at += put(&mut head[at..], b"written but silent, state ");
+                                head[at] = hex_digit(state >> 4);
+                                head[at + 1] = hex_digit(state & 0x0f);
+                                at += 2;
+                            }
+                            touch::Outcome::Broken => {
+                                at += put(&mut head[at..], b"image did not parse");
+                            }
+                        }
+                        self.say(&head[..at]);
+                    }
+                    None => {
+                        let mut head = [0u8; TEXT];
+                        let mut at = put(&mut head[0..], b"no such image; there are ");
+                        at += put_dec(&mut head[at..], touch::firmware_count() as u32);
+                        self.say(&head[..at]);
+                    }
+                }
+            }
+            "stat" => match touch::stats() {
+                Some(stats) => {
+                    let mut head = [0u8; TEXT];
+                    let mut at = 0;
+                    at += put(&mut head[at..], b"polls ");
+                    at += put_dec(&mut head[at..], stats.polls);
+                    at += put(&mut head[at..], b" stalled ");
+                    at += put_dec(&mut head[at..], stats.stalled);
+                    at += put(&mut head[at..], b" live ");
+                    at += put_dec(&mut head[at..], stats.live);
+                    at += put(&mut head[at..], b" irq-low ");
+                    at += put_dec(&mut head[at..], stats.asserted);
+                    self.say(&head[..at]);
+
+                    let mut tail = [0u8; TEXT];
+                    let mut at = 0;
+                    at += put(&mut tail[at..], b"base ");
+                    at += put_hex32(&mut tail[at..], stats.base);
+                    at += put(&mut tail[at..], b" source ");
+                    at += put_dec(&mut tail[at..], u32::from(stats.source));
+                    at += put(
+                        &mut tail[at..],
+                        if stats.reporting { b" reporting" } else { b" quiet" },
+                    );
+                    self.say(&tail[..at]);
+                    self.say_bytes(&stats.last);
+                }
+                None => self.say(b"no touchscreen"),
+            },
+            _ => {
+                self.respond(b"FAIL", "unknown touch command");
+                return;
+            }
+        }
+        self.state = State::Lines { at: 0 };
+        self.continue_lines(0);
+    }
+
+    /// Сложить строку в ответ. Лишние молча отбрасываются: обрезанный ответ
+    /// лучше, чем отказ на команду, которая уже сделала свою работу.
+    fn say(&mut self, text: &[u8]) {
+        let slot = self.line_count as usize;
+        if slot >= LINES {
+            return;
+        }
+        let len = text.len().min(TEXT);
+        self.lines[slot][..len].copy_from_slice(&text[..len]);
+        self.line_len[slot] = len as u8;
+        self.line_count += 1;
+    }
+
+    /// Сложить байты шестнадцатеричными парами, по столько на строку, сколько
+    /// влезает в пакет.
+    fn say_bytes(&mut self, bytes: &[u8]) {
+        /// Три знака на байт, и надо оставить место под конец строки.
+        const PER_LINE: usize = TEXT / 3;
+
+        for chunk in bytes.chunks(PER_LINE) {
+            let mut text = [0u8; TEXT];
+            let mut at = 0;
+            for byte in chunk {
+                text[at] = hex_digit(byte >> 4);
+                text[at + 1] = hex_digit(byte & 0x0f);
+                text[at + 2] = b' ';
+                at += 3;
+            }
+            self.say(&text[..at]);
+        }
+    }
+
+    /// Отдать очередную сложенную строку — или закончить.
+    fn continue_lines(&mut self, at: u8) {
+        if at >= self.line_count {
+            self.state = State::Idle;
+            self.line_count = 0;
+            self.respond(b"OKAY", "");
+            return;
+        }
+        self.state = State::Lines { at: at + 1 };
+        let len = self.line_len[at as usize] as usize;
+        self.out[..4].copy_from_slice(b"INFO");
+        self.out[4..4 + len].copy_from_slice(&self.lines[at as usize][..len]);
+        self.out_len = 4 + len;
+        self.ready = true;
     }
 
     fn getvar(&mut self, name: &str) {
@@ -367,4 +654,70 @@ const fn hex_digit(value: u8) -> u8 {
         0..=9 => b'0' + value,
         _ => b'a' + (value - 10),
     }
+}
+
+/// Разобрать шестнадцатеричное число без приставки.
+///
+/// Без приставки — потому что её пришлось бы набирать в каждой команде, а все
+/// числа здесь до единого шестнадцатеричные: адреса внутри кристалла, значения
+/// его регистров, длины. Десятичное среди них было бы исключением, а не
+/// правилом.
+fn hex32(text: &str) -> Option<u32> {
+    let text = text.strip_prefix("0x").unwrap_or(text);
+    if text.is_empty() || text.len() > 8 {
+        return None;
+    }
+    let mut value = 0u32;
+    for byte in text.bytes() {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        value = (value << 4) | u32::from(digit);
+    }
+    Some(value)
+}
+
+/// Положить строку в буфер, вернув, сколько заняла. Не влезло — не положила
+/// ничего: полуобрезанное слово в ответе читается как неисправность.
+fn put(out: &mut [u8], text: &[u8]) -> usize {
+    if text.len() > out.len() {
+        return 0;
+    }
+    out[..text.len()].copy_from_slice(text);
+    text.len()
+}
+
+/// То же для десятичного числа. Десятичного — потому что это счётчики, а их
+/// читает человек.
+fn put_dec(out: &mut [u8], mut value: u32) -> usize {
+    let mut digits = [0u8; 10];
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    if len > out.len() {
+        return 0;
+    }
+    for (at, digit) in digits[..len].iter().rev().enumerate() {
+        out[at] = *digit;
+    }
+    len
+}
+
+/// И для адреса — шестнадцатеричным, как его набирают в команде.
+fn put_hex32(out: &mut [u8], value: u32) -> usize {
+    let mut digits = [0u8; 8];
+    for (at, slot) in digits.iter_mut().enumerate() {
+        *slot = hex_digit(((value >> (28 - at * 4)) & 0x0f) as u8);
+    }
+    let start = digits.iter().position(|d| *d != b'0').unwrap_or(7);
+    put(out, &digits[start..])
 }

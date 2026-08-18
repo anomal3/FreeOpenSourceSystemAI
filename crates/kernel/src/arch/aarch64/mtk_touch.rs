@@ -30,6 +30,7 @@ use super::mtk::{gpio_input, gpio_output};
 use super::mtk_spi;
 use crate::input::{Buttons, post_pointer_at};
 use crate::sync::SpinLock;
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use fdt::Fdt;
 
 /// Кого умеем читать.
@@ -109,12 +110,72 @@ struct SpiTouch {
     ticks: u32,
     /// Где палец был в последний раз, в долях экрана.
     last: (u16, u16),
+    /// Счётчики опроса. Живут здесь, а не в журнале, по прозаичной причине:
+    /// опрос идёт сотнями раз в секунду, и печатать каждый проход — значит
+    /// утопить журнал, ради которого делался USB. А спросить «сколько раз ты
+    /// вообще сходил к панели и чем это кончилось» надо в любой миг.
+    polls: u32,
+    stalled: u32,
+    live: u32,
+    asserted: u32,
+    /// Последний непустой отчёт — тот самый, ради которого всё.
+    last_report: [u8; 12],
 }
 
 static SPI_TOUCH: SpinLock<Option<SpiTouch>> = SpinLock::new(None);
 
 /// Буфер событий прошивки у этого кристалла (`NT36672A_memory_map`).
-const EVENT_BUFFER: u32 = 0x2_1C00;
+///
+/// Переменная, а не постоянная, и это не украшение. В таблице изготовителя
+/// идентификатор `25 65 03` встречается дважды, и вторая запись указывает на
+/// другую карту памяти (`NT36525_memory_map`, `0x11A00`). Какая из двух верна
+/// для этой партии, из аппарата не вычитать — только спросить его самого. А
+/// каждый вопрос, зашитый в постоянную, стоит прошивки, перезагрузки и двух
+/// нажатий питания живым человеком. Здесь он стоит одной строки в консоли ПК.
+static EVENT_BASE: AtomicU32 = AtomicU32::new(0x2_1C00);
+
+/// Текущий адрес буфера событий.
+fn event_base() -> u32 {
+    EVENT_BASE.load(Ordering::Relaxed)
+}
+
+/// Адрес регистра программного сброса. Взят из описания панели в исходниках
+/// ядра Xiaomi для этого аппарата (`novatek,swrst-n8-addr`).
+const RESET_ADDRESS: u32 = 0x3_F0FE;
+/// Значение, которое этот регистр понимает как «перезапустись».
+const RESET_VALUE: u8 = 0x69;
+/// Инженерный сброс — единственная посылка, которую кристалл принимает, пока
+/// его держат в аппаратном сбросе (`ENG_RST_ADDR` в драйвере).
+const ENGINEERING_RESET_ADDRESS: u32 = 0x7F_FF80;
+const ENGINEERING_RESET_VALUE: u8 = 0x5a;
+/// Быстрое чтение. Изготовитель выключает его сразу после сброса: пока оно
+/// включено, обмен идёт по другому договору, чем весь остальной драйвер.
+const FAST_READ_ADDRESS: u32 = 0x3_F310;
+/// Вывод, которым кристалл держится в сбросе (`novatek,reset-gpio`).
+const RESET_PIN: u32 = 174;
+/// Вывод прерывания панели (`novatek,irq-gpio` в описании аппарата).
+/// Тринадцатый номер, стоящий там же в `interrupts`, принадлежит другому
+/// описанию того же узла — Focaltech, — и к этому кристаллу отношения не имеет.
+const IRQ_PIN: u32 = 0;
+
+/// Смещения внутри буфера событий, как их называет изготовитель.
+const EVENT_MAP_HOST_CMD: u32 = 0x50;
+const EVENT_MAP_HANDSHAKE: u32 = 0x51;
+const EVENT_MAP_RESET_COMPLETE: u32 = 0x60;
+const EVENT_MAP_FWINFO: u32 = 0x78;
+
+/// Кто опрашивает панель: разряд 0 — задача USB, разряд 1 — задача тачскрина.
+///
+/// Переключается по кабелю, и ради этого и заведено. Долгое время считалось,
+/// что чтение из задачи тачскрина «не выходит на провод», а из задачи USB
+/// выходит, — и опрос был перенесён туда подпоркой. Обе задачи при этом
+/// продолжали опрашивать, то есть предполагаемая разница между ними ни разу не
+/// была измерена в чистом виде. Теперь измеряется одной командой.
+static POLL_SOURCE: AtomicU8 = AtomicU8::new(1);
+
+/// Слать ли события указателя наверх. Ноль означает «читать и считать, но
+/// курсором не двигать» — нужно, пока разбор отчёта под вопросом.
+static REPORTING: AtomicU8 = AtomicU8::new(1);
 
 /// Размер панели. Координаты контроллер отдаёт в точках экрана, но врать он
 /// умеет, и обрезка по этим числам дешевле, чем курсор, уехавший за буфер.
@@ -315,20 +376,6 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
     /// драйвера этого кристалла. Читать оттуда — всё равно что спрашивать не по
     /// тому адресу и делать выводы из молчания.
     const TRIM_ADDRESS: u32 = 0x1_F64E;
-    /// Адрес регистра программного сброса. Взят из описания панели в исходниках
-    /// ядра Xiaomi для этого аппарата (`novatek,swrst-n8-addr`).
-    const RESET_ADDRESS: u32 = 0x3_F0FE;
-    /// Значение, которое этот регистр понимает как «перезапустись».
-    const RESET_VALUE: u8 = 0x69;
-    /// Инженерный сброс — единственная посылка, которую кристалл принимает,
-    /// пока его держат в аппаратном сбросе (`ENG_RST_ADDR` в драйвере).
-    const ENGINEERING_RESET_ADDRESS: u32 = 0x7F_FF80;
-    const ENGINEERING_RESET_VALUE: u8 = 0x5a;
-    /// Быстрое чтение. Изготовитель выключает его сразу после сброса: пока оно
-    /// включено, обмен идёт по другому договору, чем весь остальной драйвер.
-    const FAST_READ_ADDRESS: u32 = 0x3_F310;
-    /// Вывод, которым кристалл держится в сбросе (`novatek,reset-gpio`).
-    const RESET_PIN: u32 = 174;
     /// Выводы шины `spi3`: данные к нам, выбор кристалла, данные от нас, такт.
     const SPI3_PINS: [u32; 4] = [21, 22, 23, 24];
     /// Функция, под которой эти выводы принадлежат `spi3`.
@@ -456,8 +503,15 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
             // он не совпадает с известным.
             if identified(&answer[2..8]) {
                 crate::kprintln!("  touch       : NT36525B answered on pad {pad} mode {mode}");
+                // Имя панели даёт загрузчик, и по нему выбирается образ
+                // прошивки: панелей у этого аппарата четыре разновидности, и
+                // прошивка у каждой своя.
+                let bootargs = fdt
+                    .find("/chosen")
+                    .and_then(|chosen| chosen.property_str("bootargs"))
+                    .unwrap_or("");
                 // SAFETY: шина настроена, кристалл опознан.
-                unsafe { interrogate(&bus, pins, RESET_PIN, pad, mode) };
+                unsafe { interrogate(&bus, pins, RESET_PIN, pad, mode, bootargs) };
                 return;
             }
 
@@ -744,32 +798,75 @@ fn identified(id: &[u8]) -> bool {
 /// # Safety
 ///
 /// Шина настроена, окна отображены, выводы принадлежат `spi3`.
-unsafe fn interrogate(bus: &mtk_spi::Bus, pins: Option<u64>, reset_pin: u32, pad: u32, mode: u8) {
-    /// Смещение внутри него: прошивка поднялась и работает.
-    const RESET_COMPLETE: u32 = 0x60;
-    /// Смещение: версия, размеры панели, число пальцев.
-    const FIRMWARE_INFO: u32 = 0x78;
+unsafe fn interrogate(
+    bus: &mtk_spi::Bus,
+    pins: Option<u64>,
+    reset_pin: u32,
+    pad: u32,
+    mode: u8,
+    bootargs: &str,
+) {
+    const FIRMWARE_INFO: u32 = EVENT_MAP_FWINFO;
 
-    // Аппаратный сброс: загрузчик кристалла отдаёт управление прошивке только
-    // после него. Программный сброс, которым мы пользовались при опознании,
-    // оставляет кристалл в загрузчике — там он отвечает на вопросы о себе и
-    // молчит обо всём остальном.
+    // Аппаратный сброс. Дальше — не ожидание прошивки, а её **загрузка**.
+    //
+    // Ждать её здесь бессмысленно, и это выяснено опытом, а не выведено:
+    // своей прошивки у кристалла нет вовсе, при включении в нём поднимается
+    // только загрузчик. Прежний код ждал её секунду и объявлял кристалл
+    // негодным — на исправном железе, которому просто не дали, что исполнять.
     // SAFETY: контракт функции.
     unsafe {
         if let Some(pins) = pins {
             gpio_output(pins, reset_pin, false);
             wait_ms(10);
             gpio_output(pins, reset_pin, true);
+            wait_ms(10);
         }
     }
-    wait_ms(200);
 
-    // SAFETY: см. выше.
-    let (state, _) = unsafe { read_event(bus, EVENT_BUFFER, RESET_COMPLETE, 6) };
+    let count = super::mtk_touch_fw::BLOBS.len();
+    if count == 0 {
+        crate::kprintln!(
+            "  touch       : no firmware compiled in -- run `cargo xtask phone-firmware`"
+        );
+        return;
+    }
+    let chosen = super::mtk_touch_fw::choose(bootargs).unwrap_or(0);
     crate::kprintln!(
-        "  touch       : reset state {:02x} {:02x} {:02x} (0xa0..0xaf means the firmware is up)",
-        state[0], state[1], state[2]
+        "  touch       : no firmware of its own; loading image {} of {} ({})",
+        chosen,
+        count,
+        super::mtk_touch_fw::BLOBS[chosen].vendor
     );
+    // SAFETY: см. выше; настройка шины восстанавливается внутри перед каждой
+    // посылкой.
+    let outcome = unsafe {
+        super::mtk_touch_fw::download(
+            bus,
+            pins,
+            reset_pin,
+            event_base(),
+            &super::mtk_touch_fw::BLOBS[chosen],
+            pad,
+            mode,
+        )
+    };
+    let up = match outcome {
+        super::mtk_touch_fw::Outcome::Up(ms) => {
+            crate::kprintln!("  touch       : firmware came up after {ms} ms");
+            true
+        }
+        super::mtk_touch_fw::Outcome::Silent(state) => {
+            crate::kprintln!(
+                "  touch       : firmware written but silent, state {state:02x} (checksum refused?)"
+            );
+            false
+        }
+        super::mtk_touch_fw::Outcome::Broken => {
+            crate::kprintln!("  touch       : the firmware image did not parse");
+            false
+        }
+    };
 
     // Сведения о прошивке читаются с повтором, и это не перестраховка. Первое
     // чтение сразу после её подъёма приходит то полным, то пустым: прошивка в
@@ -780,7 +877,7 @@ unsafe fn interrogate(bus: &mtk_spi::Bus, pins: Option<u64>, reset_pin: u32, pad
     let mut sane = false;
     for _ in 0..3 {
         // SAFETY: см. выше.
-        info = unsafe { read_event(bus, EVENT_BUFFER, FIRMWARE_INFO, 17) }.0;
+        info = unsafe { read_event(bus, event_base(), FIRMWARE_INFO, 17) }.0;
         // Версия и её дополнение до 0xff — проверка, которую делает и родной
         // драйвер: сведения читаются по одному байту, и сбитый обмен даёт
         // правдоподобные числа, не сходящиеся между собой.
@@ -800,12 +897,16 @@ unsafe fn interrogate(bus: &mtk_spi::Bus, pins: Option<u64>, reset_pin: u32, pad
         if sane { "ok" } else { "BROKEN" }
     );
 
-    // Прошивка обязана заявить о себе состоянием из своего диапазона. Не
-    // заявила — значит поднялся загрузчик, а не она; читать координаты у него
-    // бессмысленно, и делать вид, что тачскрин найден, тоже.
-    if !(0xa0..=0xaf).contains(&state[0]) {
-        crate::kprintln!("  touch       : the firmware did not come up; not taking this chip");
-        return;
+    // Кристалл берётся **и тогда, когда прошивка не поднялась**, и это не
+    // небрежность. Пока он у нас, к нему можно обратиться по кабелю: положить
+    // другой из четырёх образов, перечитать регистры, пересбросить. Отказаться
+    // от него здесь значило бы запереть себя без единой возможности спросить —
+    // ровно та ошибка, которая стоила этой задаче нескольких вечеров.
+    if !up {
+        crate::kprintln!(
+            "  touch       : keeping the chip anyway -- try `fastboot oem tfw <0..{}>`",
+            count - 1
+        );
     }
     // Несошедшиеся сведения — не повод отказываться от панели. Родной драйвер
     // в этом случае берёт размеры по умолчанию и работает дальше, и он прав:
@@ -822,6 +923,11 @@ unsafe fn interrogate(bus: &mtk_spi::Bus, pins: Option<u64>, reset_pin: u32, pad
         seen: 0,
         ticks: 0,
         last: (0, 0),
+        polls: 0,
+        stalled: 0,
+        live: 0,
+        asserted: 0,
+        last_report: [0; 12],
     });
     crate::kprintln!("  touch       : NT36525B on spi3 is ours; polling for fingers");
 }
@@ -866,9 +972,243 @@ impl SpiTouch {
         unsafe {
             self.bus
                 .prepare(mtk_spi::Timing::Enhanced, self.mode, self.pad, 0x40);
-            read_event(&self.bus, EVENT_BUFFER, offset, len)
+            read_event(&self.bus, event_base(), offset, len)
         }
     }
+
+    /// Настроить шину заново — перед любым обменом, всегда.
+    ///
+    /// # Safety
+    ///
+    /// Окно отображено, выводы принадлежат `spi3`.
+    unsafe fn setup(&self) {
+        // SAFETY: контракт функции.
+        unsafe {
+            self.bus
+                .prepare(mtk_spi::Timing::Enhanced, self.mode, self.pad, 0x40);
+        }
+    }
+}
+
+/// Что вернуло чтение по произвольному адресу.
+///
+/// Число опросов возвращается наружу, а не выбрасывается, потому что оно
+/// отвечает на вопрос, который иначе не задать: **шли ли биты по проводам**.
+/// Ноль означает, что передача не завершилась вовсе, а не что кристалл ответил
+/// нулями, — и это две совершенно разные неисправности, выглядящие снаружи
+/// одинаково.
+pub struct Probe {
+    pub bytes: [u8; 30],
+    pub len: usize,
+    /// Опросов на посылке выбора страницы; ноль — не завершилась.
+    pub page_spins: u32,
+    /// Опросов на посылке чтения; ноль — не завершилась.
+    pub data_spins: u32,
+}
+
+/// Прочитать байты по **полному** адресу внутри кристалла.
+///
+/// # Чем отличается от [`raw_at`]
+///
+/// Тем, что адрес полный, а не смещение внутри буфера событий. Буфер событий —
+/// это догадка (их две в таблице изготовителя), и проверить догадку, умея
+/// читать только внутри неё, нельзя по построению.
+#[must_use]
+pub fn read_raw(address: u32, len: usize) -> Option<Probe> {
+    let guard = SPI_TOUCH.lock();
+    let touch = guard.as_ref()?;
+    let len = len.clamp(1, 30);
+    let mut request = [0u8; 32];
+    let mut answer = [0u8; 32];
+    request[0] = read_command(address);
+    // SAFETY: окна отображены, выводы принадлежат `spi3`.
+    let (page_spins, data_spins) = unsafe {
+        touch.setup();
+        let page = touch.bus.transfer(&page_command(address), &mut []);
+        let data = touch
+            .bus
+            .transfer(&request[..len + 2], &mut answer[..len + 2]);
+        (page.unwrap_or(0), data.unwrap_or(0))
+    };
+    let mut bytes = [0u8; 30];
+    bytes[..len].copy_from_slice(&answer[2..len + 2]);
+    Some(Probe { bytes, len, page_spins, data_spins })
+}
+
+/// Записать байт по **полному** адресу внутри кристалла.
+///
+/// # Чем это опасно и почему всё-таки есть
+///
+/// Тем, что кристаллу можно сказать лишнее. Опасность ограничена тем, что
+/// прошивка живёт во внешней памяти и пишется только особой
+/// последовательностью, которой здесь нет: всё, до чего дотягивается эта
+/// функция, — оперативная память кристалла и его управляющие регистры, и
+/// худшее, что выйдет, — сброс.
+///
+/// А без неё не проверить ни одной догадки о том, чего прошивка ждёт, чтобы
+/// начать докладывать о касаниях, — а именно на этом всё и стоит.
+#[must_use]
+pub fn write_raw(address: u32, value: u8) -> bool {
+    let guard = SPI_TOUCH.lock();
+    let Some(touch) = guard.as_ref() else {
+        return false;
+    };
+    // SAFETY: окна отображены, выводы принадлежат `spi3`.
+    unsafe {
+        touch.setup();
+        write_addr(&touch.bus, address, value);
+    }
+    true
+}
+
+/// Сменить адрес буфера событий, которым пользуются опрос и чтение по кабелю.
+pub fn set_event_base(address: u32) {
+    EVENT_BASE.store(address, Ordering::Relaxed);
+}
+
+/// Кто опрашивает панель и слать ли события наверх.
+pub fn set_poll_source(mask: u8) {
+    POLL_SOURCE.store(mask & 0x03, Ordering::Relaxed);
+}
+
+pub fn set_reporting(on: bool) {
+    REPORTING.store(u8::from(on), Ordering::Relaxed);
+}
+
+/// Пересбросить кристалл и дождаться, пока прошивка заявит о готовности.
+///
+/// `hard` означает «дёрнуть вывод сброса»; иначе делается только программный
+/// сброс загрузчика кристалла. Возвращает состояние и число миллисекунд, за
+/// которое оно стало годным, — а если так и не стало, полное время ожидания.
+#[must_use]
+pub fn reset_chip(hard: bool) -> Option<([u8; 30], u32)> {
+    let guard = SPI_TOUCH.lock();
+    let touch = guard.as_ref()?;
+    // SAFETY: окна отображены, выводы принадлежат `spi3`.
+    unsafe {
+        touch.setup();
+        if hard {
+            if let Some(pins) = touch.pins {
+                // Пока вывод сброса прижат, кристалл принимает ровно одну
+                // посылку — инженерный сброс. Порядок взят у изготовителя
+                // целиком: каждый его шаг по отдельности выглядит лишним.
+                gpio_output(pins, RESET_PIN, false);
+                write_addr(&touch.bus, ENGINEERING_RESET_ADDRESS, ENGINEERING_RESET_VALUE);
+                wait_ms(1);
+                gpio_output(pins, RESET_PIN, true);
+                wait_ms(10);
+            }
+        }
+        write_addr(&touch.bus, RESET_ADDRESS, RESET_VALUE);
+        wait_ms(5);
+        write_addr(&touch.bus, FAST_READ_ADDRESS, 0x00);
+    }
+
+    let mut state = [0u8; 30];
+    let mut rounds = 0u32;
+    while rounds < 100 {
+        wait_ms(10);
+        rounds += 1;
+        // SAFETY: см. выше.
+        state = unsafe { touch.read(EVENT_MAP_RESET_COMPLETE, 6) }.0;
+        if (0xa0..=0xaf).contains(&state[0]) {
+            break;
+        }
+    }
+    Some((state, rounds * 10))
+}
+
+/// Сказать прошивке, в каком режиме работать, — и подтвердить готовность хоста.
+///
+/// Это `nvt_change_mode` изготовителя целиком: команда в `0x50`, а для обычного
+/// режима ещё и рукопожатие `0xBB` в `0x51` через двадцать миллисекунд. Второй
+/// половины у нас не было ни разу, а прошивка вполне может ждать именно её,
+/// прежде чем начать складывать отчёты в буфер.
+#[must_use]
+pub fn change_mode(mode: u8) -> bool {
+    let base = event_base();
+    if !write_raw(base | EVENT_MAP_HOST_CMD, mode) {
+        return false;
+    }
+    if mode == 0x00 {
+        wait_ms(20);
+        let _ = write_raw(base | EVENT_MAP_HANDSHAKE, 0xbb);
+        wait_ms(20);
+    }
+    true
+}
+
+pub use super::mtk_touch_fw::Outcome;
+
+/// Положить в кристалл образ прошивки и запустить его.
+///
+/// # Зачем это вообще нужно
+///
+/// Затем, что своей прошивки у этого кристалла нет — см. [`super::mtk_touch_fw`].
+/// Пока её не положишь, панель отвечает на любой вопрос о себе и молчит о
+/// касаниях, и молчание это выглядит как что угодно, только не как отсутствие
+/// прошивки.
+///
+/// Номер образа приходит снаружи, потому что панелей у этого аппарата четыре
+/// разновидности, а какая стоит здесь — известно только из имени, которое даёт
+/// загрузчик, и не всегда.
+#[must_use]
+pub fn load_firmware(index: usize) -> Option<Outcome> {
+    let guard = SPI_TOUCH.lock();
+    let touch = guard.as_ref()?;
+    let blob = super::mtk_touch_fw::BLOBS.get(index)?;
+    // SAFETY: окна отображены, выводы принадлежат `spi3`; настройка шины
+    // восстанавливается внутри перед каждой посылкой.
+    Some(unsafe {
+        super::mtk_touch_fw::download(
+            &touch.bus,
+            touch.pins,
+            RESET_PIN,
+            event_base(),
+            blob,
+            touch.pad,
+            touch.mode,
+        )
+    })
+}
+
+/// Сколько образов прошивки вкомпилировано.
+#[must_use]
+pub fn firmware_count() -> usize {
+    super::mtk_touch_fw::BLOBS.len()
+}
+
+/// Счётчики опроса — чтобы спросить по кабелю, что видит опрос сам.
+#[derive(Clone, Copy)]
+pub struct Stats {
+    pub polls: u32,
+    /// Проходов, где передача не дошла до провода.
+    pub stalled: u32,
+    /// Проходов, где отчёт был не пуст.
+    pub live: u32,
+    /// Проходов, где линия прерывания была прижата.
+    pub asserted: u32,
+    /// Последний непустой отчёт.
+    pub last: [u8; 12],
+    pub source: u8,
+    pub reporting: bool,
+    pub base: u32,
+}
+
+#[must_use]
+pub fn stats() -> Option<Stats> {
+    let guard = SPI_TOUCH.lock();
+    let touch = guard.as_ref()?;
+    Some(Stats {
+        polls: touch.polls,
+        stalled: touch.stalled,
+        live: touch.live,
+        asserted: touch.asserted,
+        last: touch.last_report,
+        source: POLL_SOURCE.load(Ordering::Relaxed),
+        reporting: REPORTING.load(Ordering::Relaxed) != 0,
+        base: event_base(),
+    })
 }
 
 /// Уровень линии прерывания панели.
@@ -878,21 +1218,22 @@ impl SpiTouch {
 /// и различает их только это число.
 #[must_use]
 pub fn irq_level() -> Option<bool> {
-    /// Вывод прерывания панели (`novatek,irq-gpio` в описании аппарата).
-    /// Тринадцатый номер, стоящий там же в `interrupts`, принадлежит другому
-    /// описанию того же узла — Focaltech, — и к этому кристаллу отношения не
-    /// имеет.
-    const IRQ_PIN: u32 = 0;
-
     let guard = SPI_TOUCH.lock();
     let pins = guard.as_ref()?.pins?;
     // SAFETY: окно блока выводов отображено при поиске.
     Some(unsafe { gpio_input(pins, IRQ_PIN) })
 }
 
-/// Опросить панель из чужой задачи. См. объяснение в `mtk_usb::service_task`.
+/// Опросить панель из задачи USB, если ей это поручено.
+///
+/// Кому поручено, решает [`POLL_SOURCE`] и меняется по кабелю. До сих пор
+/// опрашивали **обе** задачи разом, а объяснение при этом гласило, что одна из
+/// них до провода не доходит: два утверждения, которые не могут быть верны
+/// одновременно и ни разу не проверялись по отдельности.
 pub fn poll_from_here() {
-    poll_spi_once();
+    if POLL_SOURCE.load(Ordering::Relaxed) & 1 != 0 {
+        poll_spi_once();
+    }
 }
 
 /// Один опрос панели: есть ли палец и где.
@@ -914,46 +1255,62 @@ fn poll_spi_once() {
         return;
     };
 
+    touch.polls = touch.polls.wrapping_add(1);
+    touch.ticks = touch.ticks.wrapping_add(1);
+
+    // Линия прерывания спрашивается **до** чтения, а не после.
+    //
+    // У Novatek она прижимается, когда отчёт готов, и отпускается, когда его
+    // забрали. Прижата ли она в тот миг, когда мы читаем, — единственное, что
+    // отличает «прошивка не докладывает» от «докладывает, а мы приходим не
+    // вовремя», и стоит это одного чтения регистра.
+    let asserted = match touch.pins {
+        // SAFETY: окно блока выводов отображено при поиске.
+        Some(pins) => !unsafe { gpio_input(pins, IRQ_PIN) },
+        None => false,
+    };
+    if asserted {
+        touch.asserted = touch.asserted.wrapping_add(1);
+    }
+
     // SAFETY: окна отображены, выводы наши; настройка восстанавливается внутри.
     // Двенадцать байт, а не тридцать. Длина здесь не безразлична и проверена
     // опытом: то же самое смещение, прочитанное двенадцатью байтами, отдаёт
     // содержимое, а тридцатью — сплошные единицы, хотя контроллер отчитывается
     // об успешной передаче. Двенадцати хватает на два пальца.
     let (report, reached) = unsafe { touch.read(0x00, 12) };
-
-    // Первые несколько непустых отчётов уходят в журнал целиком.
-    //
-    // Это не отладочный мусор, а единственный способ увидеть касание: линия
-    // прерывания у панели прижата к нулю — кристаллу есть что сказать, — а
-    // буфер по известному адресу читается нулями. Значит отчёт лежит не там,
-    // где его ищут, и найти его можно только поймав живое касание. Печатается
-    // ограниченное число раз: диагностика, которая не смолкает, топит журнал,
-    // ради которого всё это и делалось.
-    // Отчёт из одних единиц означает, что передача не вышла на провода вовсе.
-    //
-    // Это открытый дефект, и он не про панель: то же самое чтение, пришедшее по
-    // кабелю из задачи USB, проходит безупречно — сведения о прошивке и её
-    // состояние читаются верно в любой миг работы. А из этой задачи не проходит
-    // ни разу, ни на пяти миллисекундах периода, ни на пятидесяти. Разбираться
-    // надо не с кристаллом, а с тем, чем эти два пути отличаются.
-    if report.iter().all(|byte| *byte == 0xff) {
-        if touch.seen < 4 {
-            touch.seen += 1;
-            crate::kprintln!(
-                "  touch       : polled all ff, transfer {}",
-                if reached { "reached the wire" } else { "NEVER LEFT" }
-            );
-        }
-        return;
+    if !reached {
+        touch.stalled = touch.stalled.wrapping_add(1);
     }
 
-    if report.iter().any(|byte| *byte != 0x00 && *byte != 0xff) && touch.seen < 8 {
-        touch.seen += 1;
-        crate::kprintln!(
-            "  touch       : REPORT {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-            report[0], report[1], report[2], report[3],
-            report[4], report[5], report[6], report[7]
-        );
+    // Отчёт из одних единиц или одних нулей — не отчёт.
+    //
+    // Единицы означают, что линию данных никто не вёл; нули — что кристалл
+    // ответил, но сказать ему нечего. Ни то ни другое не разбирается, но и в
+    // журнал больше не печатается: опрос идёт сотни раз в секунду, а спросить,
+    // что он видит, теперь можно по кабелю (`fastboot oem tstat`).
+    let empty = report[..12].iter().all(|byte| *byte == 0xff)
+        || report[..12].iter().all(|byte| *byte == 0x00);
+    if !empty {
+        touch.live = touch.live.wrapping_add(1);
+        touch.last_report.copy_from_slice(&report[..12]);
+        if touch.seen < 8 {
+            touch.seen += 1;
+            crate::kprintln!(
+                "  touch       : REPORT {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                report[0], report[1], report[2], report[3],
+                report[4], report[5], report[6], report[7]
+            );
+        }
+    }
+    if empty {
+        if touch.down {
+            touch.down = false;
+            if REPORTING.load(Ordering::Relaxed) != 0 {
+                post_pointer_at(touch.last.0, touch.last.1, 0, Buttons::NONE);
+            }
+        }
+        return;
     }
 
     let identifier = report[0] >> 3;
@@ -961,7 +1318,9 @@ fn poll_spi_once() {
     if identifier == 0 || !(state == 0x01 || state == 0x02) {
         if touch.down {
             touch.down = false;
-            post_pointer_at(touch.last.0, touch.last.1, 0, Buttons::NONE);
+            if REPORTING.load(Ordering::Relaxed) != 0 {
+                post_pointer_at(touch.last.0, touch.last.1, 0, Buttons::NONE);
+            }
         }
         return;
     }
@@ -975,7 +1334,9 @@ fn poll_spi_once() {
     let point = to_fractions(x, y);
     touch.down = true;
     touch.last = point;
-    post_pointer_at(point.0, point.1, 0, Buttons::LEFT);
+    if REPORTING.load(Ordering::Relaxed) != 0 {
+        post_pointer_at(point.0, point.1, 0, Buttons::LEFT);
+    }
 }
 
 /// Прочитать из буфера событий прошивки.
@@ -990,7 +1351,7 @@ fn poll_spi_once() {
 /// # Safety
 ///
 /// См. [`interrogate`].
-unsafe fn read_event(bus: &mtk_spi::Bus, buffer: u32, offset: u32, len: usize) -> ([u8; 30], bool) {
+pub(super) unsafe fn read_event(bus: &mtk_spi::Bus, buffer: u32, offset: u32, len: usize) -> ([u8; 30], bool) {
     let mut answer = [0u8; 32];
     let mut request = [0u8; 32];
     // Тридцать — предел не наш, а контроллера: его память передачи вмещает
@@ -1019,7 +1380,7 @@ unsafe fn read_event(bus: &mtk_spi::Bus, buffer: u32, offset: u32, len: usize) -
 /// # Safety
 ///
 /// Окно шины отображено, выводы за ней закреплены.
-unsafe fn write_addr(bus: &mtk_spi::Bus, address: u32, value: u8) {
+pub(super) unsafe fn write_addr(bus: &mtk_spi::Bus, address: u32, value: u8) {
     // SAFETY: контракт функции.
     unsafe {
         let _ = bus.transfer(&page_command(address), &mut []);
@@ -1087,7 +1448,9 @@ pub fn service_task() {
 }
 
 fn poll_once() {
-    poll_spi_once();
+    if POLL_SOURCE.load(Ordering::Relaxed) & 2 != 0 {
+        poll_spi_once();
+    }
 
     let mut guard = TOUCH.lock();
     let Some(touch) = guard.as_mut() else {

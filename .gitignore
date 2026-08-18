@@ -5,3 +5,7 @@
 *.log
 **/*.rs.bk
 .DS_Store
+
+# Прошивка тачскрина телефона: чужая, несвободная и не наша, чтобы её
+# раздавать. Кладётся сюда `cargo xtask phone-firmware`; см. firmware/README.md.
+/firmware/novatek/*.bin

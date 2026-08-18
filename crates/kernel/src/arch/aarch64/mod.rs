@@ -9,6 +9,7 @@ pub mod mtk_i2c;
 pub mod mtk_spi;
 pub mod mtk_usb;
 pub mod mtk_touch;
+pub mod mtk_touch_fw;
 
 // Вход по договору Linux собирается только для телефона: он тянет за собой
 // ассемблерный заголовок, фиксированный адрес компоновки и свой компоновочный

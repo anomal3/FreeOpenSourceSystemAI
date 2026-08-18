@@ -272,6 +272,18 @@ pub fn build_kernel(expected_load: u64) -> Result<PathBuf> {
         bail!("нет компоновочного сценария: {}", script.display());
     }
 
+    // Прошивка тачскрина подключается только тогда, когда она есть. Её нет в
+    // хранилище — она чужая и несвободная (firmware/README.md), — и требовать
+    // её для сборки значило бы, что ядро не собирается на чистой выкачке.
+    let features = if firmware_present() {
+        "phone,touch-firmware"
+    } else {
+        eprintln!(
+            "внимание: прошивки тачскрина нет в firmware/novatek/, тачскрина на              аппарате не будет. Взять: cargo xtask phone-firmware"
+        );
+        "phone"
+    };
+
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = std::process::Command::new(cargo);
     cmd.current_dir(paths::workspace_root())
@@ -279,7 +291,7 @@ pub fn build_kernel(expected_load: u64) -> Result<PathBuf> {
         .arg("--package")
         .arg("kernel")
         .arg("--features")
-        .arg("phone")
+        .arg(features)
         .arg("--target")
         .arg(KERNEL_TARGET)
         .arg("-Zbuild-std=core,alloc,compiler_builtins")
@@ -880,4 +892,73 @@ mod tests {
         }
         assert_eq!(one, sha.finish(), "по байту и целиком — один и тот же ответ");
     }
+}
+
+/// Имена образов прошивки тачскрина — те же, что у Xiaomi в `/vendor/firmware`.
+const TOUCH_FIRMWARE: [&str; 4] = [
+    "novatek_ts_djn_fw.bin",
+    "novatek_ts_hlt_fw.bin",
+    "novatek_ts_ebbg_fw.bin",
+    "novatek_ts_truly_fw.bin",
+];
+
+/// Где они лежат у нас.
+fn firmware_dir() -> std::path::PathBuf {
+    paths::workspace_root().join("firmware/novatek")
+}
+
+/// Все ли образы на месте.
+///
+/// Все — не «хотя бы один»: панелей у этого аппарата четыре разновидности, и
+/// какая стоит в конкретном, известно не всегда. Ядро выбирает по имени от
+/// загрузчика, а если не угадало — человек перебирает четыре по кабелю. С
+/// половиной набора этот перебор упирается в отсутствующий файл, а не в ответ.
+fn firmware_present() -> bool {
+    let dir = firmware_dir();
+    TOUCH_FIRMWARE.iter().all(|name| dir.join(name).is_file())
+}
+
+/// Принести прошивку тачскрина.
+///
+/// # Почему её нет в хранилище
+///
+/// Потому что она чужая: это двоичный код Novatek, который Xiaomi раздаёт в
+/// составе аппарата и который мы не имеем права раздавать вместе со своим
+/// исходным кодом. Поэтому здесь только адрес, по которому её берут.
+///
+/// # Почему без неё нельзя
+///
+/// Потому что кристалл NT36525B **не хранит прошивку**: при включении в нём
+/// поднимается один загрузчик, а исполняемый образ каждый раз кладёт в его ОЗУ
+/// хозяин. Нет образа — панель отвечает, кто она такая, и молчит о касаниях.
+pub fn fetch_firmware() -> anyhow::Result<()> {
+    /// Открытое хранилище двоичных файлов этого аппарата, из которого их берут
+    /// и сборки Android для него.
+    const FROM: &str =
+        "https://raw.githubusercontent.com/AndroidBlobs/vendor_xiaomi_dandelion/master/proprietary/vendor/firmware";
+
+    let dir = firmware_dir();
+    std::fs::create_dir_all(&dir)?;
+    for name in TOUCH_FIRMWARE {
+        let to = dir.join(name);
+        if to.is_file() {
+            println!("  уже есть : {name}");
+            continue;
+        }
+        let url = format!("{FROM}/{name}");
+        let mut cmd = std::process::Command::new("curl");
+        cmd.arg("-sSL").arg("-o").arg(&to).arg(&url);
+        util::run(&mut cmd, "curl (прошивка тачскрина)")?;
+        let size = std::fs::metadata(&to).map(|m| m.len()).unwrap_or(0);
+        // Пустой или крошечный файл — это страница с ошибкой, а не прошивка.
+        // Оставить её значит получить ядро, которое молча кладёт в кристалл
+        // мусор и не проходит проверку суммы.
+        if size < 4096 {
+            let _ = std::fs::remove_file(&to);
+            anyhow::bail!("не скачалось: {name} ({size} байт)");
+        }
+        println!("  принесено: {name}, {size} байт");
+    }
+    println!("\nПрошивка на месте. Пересоберите образ: cargo xtask phone --full-kernel --gzip ...");
+    Ok(())
 }
