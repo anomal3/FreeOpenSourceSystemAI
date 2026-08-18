@@ -43,12 +43,24 @@ enum State {
     Log { at: u64, until: u64 },
 }
 
+/// Сколько проходов подряд можно не суметь отдать ответ, прежде чем считать
+/// собеседника ушедшим.
+///
+/// Проход занимает миллисекунду, так что это около двух секунд. Хост, который
+/// спросил и слушает, забирает ответ за доли миллисекунды; две секунды молчания
+/// означают не «медленно», а «некому».
+const ABANDONED: u16 = 2000;
+
 pub struct Fastboot {
     state: State,
     /// Готовый ответ, который ещё не удалось отдать.
     out: [u8; PACKET],
     out_len: usize,
     ready: bool,
+    /// Сколько проходов подряд ответ не удаётся отдать.
+    stalled: u16,
+    /// Отдать ответ и перезагрузить машину.
+    reboot_after_reply: bool,
 }
 
 impl Fastboot {
@@ -58,6 +70,8 @@ impl Fastboot {
             out: [0; PACKET],
             out_len: 0,
             ready: false,
+            stalled: 0,
+            reboot_after_reply: false,
         }
     }
 
@@ -66,6 +80,18 @@ impl Fastboot {
         self.state = State::Idle;
         self.ready = false;
         self.out_len = 0;
+        self.stalled = 0;
+    }
+
+    /// Собеседник ушёл: бросить недосказанное и вернуться к ожиданию команды.
+    ///
+    /// Без этого одна прерванная выдача запирает устройство навсегда — оно
+    /// вечно предлагает ответ на вопрос, который больше некому услышать, и не
+    /// слышит новых. Проверено ровно так: вывод `oem log` оборвали на середине,
+    /// и следующая же команда получила «нет связи».
+    fn abandon(&mut self, bulk: &mut Bulk) {
+        bulk.flush();
+        self.reset();
     }
 
     /// Один шаг обмена. За проход делается ровно одно дело — так очередь на
@@ -74,6 +100,23 @@ impl Fastboot {
         if self.ready {
             if bulk.send(&self.out[..self.out_len]) {
                 self.ready = false;
+                self.stalled = 0;
+                // Перезагрузка — **после** того, как ответ ушёл. Сброс до
+                // отправки означал бы для хоста оборванную команду: он не
+                // отличает «выполнено и машина ушла» от «не ответили».
+                if self.reboot_after_reply {
+                    self.reboot_after_reply = false;
+                    crate::arch::aarch64::mtk::reboot();
+                }
+                return;
+            }
+            // Хост не забирает ответ. Обычно это значит «ещё не успел», но
+            // иногда — «ушёл»: программа на той стороне прервана, а мы остались
+            // с недосказанной фразой и ждём слушателя, которого нет. Отличить
+            // одно от другого можно только по времени.
+            self.stalled = self.stalled.saturating_add(1);
+            if self.stalled >= ABANDONED {
+                self.abandon(bulk);
             }
             return;
         }
@@ -104,6 +147,18 @@ impl Fastboot {
             let (at, until) = (klog::oldest(), klog::written());
             self.state = State::Log { at, until };
             self.continue_log(at, until);
+        } else if matches!(
+            text,
+            "reboot" | "reboot-bootloader" | "reboot-fastboot" | "oem reboot"
+        ) {
+            // Загрузчику нельзя сказать «открой fastboot»: это делается записью
+            // в служебный раздел, а памятью мы управлять не умеем. Поэтому
+            // машина уходит в обычную загрузку — оттуда её доводит `adb`. Имена
+            // с «-bootloader» приняты всё равно: человек наберёт привычное, и
+            // отказ на нём читался бы как неисправность, а не как разница между
+            // «перезагружусь» и «перезагружусь именно туда».
+            self.reboot_after_reply = true;
+            self.respond(b"OKAY", "");
         } else {
             self.respond(b"FAIL", "unknown command");
         }

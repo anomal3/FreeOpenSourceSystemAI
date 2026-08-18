@@ -36,7 +36,14 @@ use crate::sync::SpinLock;
 /// Журнал загрузки этой машины — около четырёх килобайт. Тридцать два дают
 /// запас на то, что печатается уже под рабочим столом, и стоят одной страницы
 /// с небольшим в `.bss`, где нули ничего не весят и в образе.
+/// Ёмкость обязана быть степенью двойки: остаток от деления тогда считается
+/// одним «и», а не делением. Мелочь? Нет: журнал пишется на каждую строку,
+/// которую печатает ядро, а в отладочной сборке деление шестидесятичетырёх
+/// разрядных чисел на каждый байт обходится в разы дороже самой записи.
 pub const CAPACITY: usize = 32 * 1024;
+
+/// Маска вместо деления. См. [`CAPACITY`].
+const MASK: u64 = CAPACITY as u64 - 1;
 
 struct Ring {
     bytes: [u8; CAPACITY],
@@ -51,11 +58,21 @@ static RING: SpinLock<Ring> = SpinLock::new(Ring {
 });
 
 impl Ring {
-    fn push(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            let at = (self.written % CAPACITY as u64) as usize;
-            self.bytes[at] = byte;
-            self.written += 1;
+    /// Дописать в кольцо. Копируется кусками, а не побайтово: строка ложится
+    /// одним-двумя копированиями вместо цикла на каждый символ.
+    fn push(&mut self, mut bytes: &[u8]) {
+        // Кольцо короче написанного — хранить можно только хвост, остальное
+        // всё равно было бы затёрто тем же вызовом.
+        if bytes.len() > CAPACITY {
+            bytes = &bytes[bytes.len() - CAPACITY..];
+        }
+        while !bytes.is_empty() {
+            let at = (self.written & MASK) as usize;
+            let room = CAPACITY - at;
+            let chunk = bytes.len().min(room);
+            self.bytes[at..at + chunk].copy_from_slice(&bytes[..chunk]);
+            self.written += chunk as u64;
+            bytes = &bytes[chunk..];
         }
     }
 }
@@ -109,7 +126,7 @@ pub fn read(from: u64, out: &mut [u8]) -> (usize, u64) {
     let mut at = from.max(oldest);
     let mut count = 0;
     while at < ring.written && count < out.len() {
-        out[count] = ring.bytes[(at % CAPACITY as u64) as usize];
+        out[count] = ring.bytes[(at & MASK) as usize];
         count += 1;
         at += 1;
     }
