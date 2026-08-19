@@ -177,6 +177,27 @@ static POLL_SOURCE: AtomicU8 = AtomicU8::new(1);
 /// курсором не двигать» — нужно, пока разбор отчёта под вопросом.
 static REPORTING: AtomicU8 = AtomicU8::new(1);
 
+/// Половина периода такта шины, в единицах контроллера.
+///
+/// Переменная, и это не роскошь. Здесь стоит заведомо большое число — то, на
+/// котором кристалл когда-то отозвался, — и оно даёт около двадцати килогерц
+/// против девяти с половиной мегагерц у изготовителя. Пока по шине читали по
+/// десятку байт, разница была незаметна; запись прошивки — пять тысяч посылок,
+/// и она заняла тридцать четыре секунды. Подобрать быстрейшее надёжное
+/// значение можно только опытом на живом аппарате, и теперь он стоит одной
+/// команды (`oem tclk`), а не сборки с перепрошивкой.
+static SPI_HALF: AtomicU32 = AtomicU32::new(0x40);
+
+/// Текущая половина периода такта.
+pub fn clock_half() -> u32 {
+    SPI_HALF.load(Ordering::Relaxed)
+}
+
+/// Сменить её.
+pub fn set_clock_half(half: u32) {
+    SPI_HALF.store(half.clamp(2, 0x400), Ordering::Relaxed);
+}
+
 /// Поднялась ли прошивка панели.
 ///
 /// Отдельно от «кристалл найден», и разница здесь не бухгалтерская. Кристалл мы
@@ -985,7 +1006,7 @@ impl SpiTouch {
         // объяснение у полей `pad` и `mode`.
         unsafe {
             self.bus
-                .prepare(mtk_spi::Timing::Enhanced, self.mode, self.pad, 0x40);
+                .prepare(mtk_spi::Timing::Enhanced, self.mode, self.pad, clock_half());
             read_event(&self.bus, event_base(), offset, len)
         }
     }
@@ -999,7 +1020,7 @@ impl SpiTouch {
         // SAFETY: контракт функции.
         unsafe {
             self.bus
-                .prepare(mtk_spi::Timing::Enhanced, self.mode, self.pad, 0x40);
+                .prepare(mtk_spi::Timing::Enhanced, self.mode, self.pad, clock_half());
         }
     }
 }

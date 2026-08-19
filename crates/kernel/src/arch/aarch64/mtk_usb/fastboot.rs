@@ -380,6 +380,26 @@ impl Fastboot {
                     }
                 }
             }
+            // Половина периода такта шины. Живёт здесь по той же причине, что
+            // и всё остальное: быстрейшее надёжное значение подбирается только
+            // опытом на живом аппарате, а каждый опыт через сборку стоит двух
+            // нажатий питания живым человеком.
+            "clk" => {
+                let Some(half) = first.and_then(hex32) else {
+                    let mut head = [0u8; TEXT];
+                    let mut at = put(&mut head[0..], b"clock half is ");
+                    at += put_hex32(&mut head[at..], touch::clock_half());
+                    self.say(&head[..at]);
+                    self.state = State::Lines { at: 0 };
+                    self.continue_lines(0);
+                    return;
+                };
+                touch::set_clock_half(half);
+                let mut head = [0u8; TEXT];
+                let mut at = put(&mut head[0..], b"clock half now ");
+                at += put_hex32(&mut head[at..], touch::clock_half());
+                self.say(&head[..at]);
+            }
             "stat" => match touch::stats() {
                 Some(stats) => {
                     let mut head = [0u8; TEXT];

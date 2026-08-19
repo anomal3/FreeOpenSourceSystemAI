@@ -270,6 +270,8 @@ pub unsafe fn download(
     wait_ms(40);
 
     let mut sent = 0u32;
+    let mut retried = 0u32;
+    let mut failed = 0u32;
     let started = crate::time::uptime_ms();
     for part in parts.iter().take(count) {
         if part.size == 0 {
@@ -300,15 +302,36 @@ pub unsafe fn download(
             for (slot, byte) in packet[1..=len].iter_mut().enumerate() {
                 *byte = blob.data.get(from + slot).copied().unwrap_or(0);
             }
-            // SAFETY: см. выше; настройка восстанавливается перед каждой
-            // посылкой — контроллер сбрасывает себя на любой неудаче.
-            unsafe {
-                setup(bus, pad, mode);
-                let _ = bus.transfer(&page_of(to), &mut []);
-                let _ = bus.transfer(&packet[..=len], &mut []);
+            // Записать и **сверить**, и так до совпадения.
+            //
+            // Четыре попытки: искажение редкое и случайное, и второй посылки
+            // хватало всегда. Больше четырёх — это уже не помеха, а что-то
+            // устойчивое (не та частота такта, не тот адрес), и молча биться в
+            // него тысячу раз значит превратить загрузку в зависание.
+            let mut check = [0u8; CHUNK];
+            let mut attempt = 0;
+            loop {
+                // SAFETY: см. выше; настройка восстанавливается перед каждой
+                // посылкой — контроллер сбрасывает себя на любой неудаче.
+                unsafe {
+                    setup(bus, pad, mode);
+                    let _ = bus.transfer(&page_of(to), &mut []);
+                    let _ = bus.transfer(&packet[..=len], &mut []);
+                    setup(bus, pad, mode);
+                    read_at(bus, to, len, &mut check);
+                }
+                sent += 1;
+                if check[..len] == packet[1..=len] {
+                    break;
+                }
+                attempt += 1;
+                retried += 1;
+                if attempt >= 4 {
+                    failed += 1;
+                    break;
+                }
             }
             written += len;
-            sent += 1;
 
             // Обмен с компьютером прокручивается прямо посреди записи.
             //
@@ -337,9 +360,11 @@ pub unsafe fn download(
     // полсекунды, а минуту, — это будет видно сразу и здесь, а не выведено из
     // того, что аппарат не отозвался.
     crate::kprintln!(
-        "  touch       : {} packets written in {} ms",
+        "  touch       : {} packets in {} ms, {} rewritten, {} still wrong",
         sent,
-        crate::time::uptime_ms().saturating_sub(started)
+        crate::time::uptime_ms().saturating_sub(started),
+        retried,
+        failed
     );
 
     // Регистры проверки: откуда, сколько и какая сумма — для кода и для данных.
@@ -460,7 +485,43 @@ unsafe fn check_bank(
 /// Окно регистров отображено.
 unsafe fn setup(bus: &mtk_spi::Bus, pad: u32, mode: u8) {
     // SAFETY: контракт функции.
-    unsafe { bus.prepare(mtk_spi::Timing::Enhanced, mode, pad, 0x40) };
+    unsafe {
+        bus.prepare(
+            mtk_spi::Timing::Enhanced,
+            mode,
+            pad,
+            super::mtk_touch::clock_half(),
+        )
+    };
+}
+
+/// Прочитать байты по полному адресу — чтобы сверить записанное.
+///
+/// # Зачем сверять
+///
+/// Затем, что запись **врёт**, и это измерено, а не предположено. Из пяти
+/// тысяч посылок три легли в ОЗУ искажёнными: `0x80` стало `0x8c`, `0x65` —
+/// `0x71`, `0xcd` — `0xf9`. Три байта на пятьдесят шесть килобайт, и все три
+/// устойчивы: перечитывание даёт то же самое, то есть в памяти кристалла
+/// действительно лежит не то, что посылали.
+///
+/// Для человека такая доля незаметна. Для аппаратной проверки суммы, которой
+/// загрузчик кристалла решает, запускать ли образ, одного байта достаточно,
+/// чтобы отказать, — и он отказывал, а выглядело это как «прошивка не та».
+///
+/// # Safety
+///
+/// Окна отображены, выводы принадлежат `spi3`.
+unsafe fn read_at(bus: &mtk_spi::Bus, address: u32, len: usize, out: &mut [u8]) {
+    let mut request = [0u8; 32];
+    let mut answer = [0u8; 32];
+    request[0] = (address as u8) & 0x7f;
+    // SAFETY: контракт функции.
+    unsafe {
+        let _ = bus.transfer(&page_of(address), &mut []);
+        let _ = bus.transfer(&request[..len + 2], &mut answer[..len + 2]);
+    }
+    out[..len].copy_from_slice(&answer[2..len + 2]);
 }
 
 /// Посылка выбора страницы. Та же, что у соседа по модулю, — здесь она своя
