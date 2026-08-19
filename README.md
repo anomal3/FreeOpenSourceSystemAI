@@ -34,7 +34,8 @@ The most recent and the hardest part. The kernel boots through the factory bootl
 Android boot image, takes the framebuffer the bootloader left, brings up the MediaTek USB
 controller in device mode so the log can be read over the cable (`fastboot oem log`), and
 drives the Novatek NT36525B touch panel over SPI — including **downloading the panel's
-firmware into it**, because that chip keeps none of its own.
+firmware into it**, because that chip keeps none of its own. Windows are dragged, resized and
+closed with a finger, at sixty-five samples a second.
 
 The full story, with every wrong turn and what each one cost, is in **[docs/PHONE.md](docs/PHONE.md)**.
 
