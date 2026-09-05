@@ -307,9 +307,35 @@ pub fn user_can(ptr: usize, len: usize, need: PageFlags) -> bool {
     let first = ptr / PAGE_SIZE;
     let last = (ptr + len - 1) / PAGE_SIZE;
     for page in first..=last {
-        let Some((_, flags)) = arch::translate(root, VirtAddr::new(page * PAGE_SIZE)) else {
-            return false;
+        let virt = VirtAddr::new(page * PAGE_SIZE);
+
+        let flags = match arch::translate(root, virt) {
+            Some((_, flags)) => flags,
+            // Страницы нет — но это больше не обязательно отказ. С фазы 41
+            // программа вправе держать адрес, за которым лежит файл, а не
+            // память, и «ещё не прочитано» — не то же самое, что «не твоё».
+            //
+            // Подкачивает **ядро, до обращения**, а не отказ страницы во время
+            // него, и это главное решение здесь. Ядро пишет в память программы
+            // с правами кольца ноль: его собственный отказ страницы не снимает
+            // программу, а останавливает машину. Поэтому буфер приводится в
+            // порядок заранее, там, где на неудачу ещё можно ответить кодом
+            // ошибки, — и ловушка «отказ страницы внутри системного вызова»
+            // перестаёт существовать, вместо того чтобы обрабатываться.
+            None => {
+                if !super::fault_in(virt.as_usize(), need.contains(PageFlags::WRITE), false) {
+                    return false;
+                }
+                match arch::translate(root, virt) {
+                    Some((_, flags)) => flags,
+                    // Подкачка сказала «сделано», а страницы нет. Верить ей на
+                    // слово нельзя: соврала бы она — ядро следующей же строкой
+                    // писало бы в неотображённую память.
+                    None => return false,
+                }
+            }
         };
+
         if !flags.contains(need) || !flags.contains(PageFlags::USER) {
             return false;
         }

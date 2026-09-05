@@ -40,7 +40,7 @@ use user_abi::{
 };
 use user_abi::{ERR_BROKEN_PIPE, LAUNCH_KEEP, Launch, SYS_LAUNCH, SYS_PIPE};
 use user_abi::{ERR_UPDATE_REFUSED, SYS_UPDATE};
-use user_abi::{ERR_LIMIT, SYS_MMAP, SYS_MUNMAP};
+use user_abi::{ERR_LIMIT, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP};
 use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
@@ -149,6 +149,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_UPDATE => update(a0, a1),
         SYS_MMAP => mmap(a0),
         SYS_MUNMAP => munmap(a0, a1),
+        SYS_MMAP_FILE => mmap_file(a0, a1, a2),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1124,6 +1125,24 @@ fn mmap(len: usize) -> i64 {
     }
 }
 
+/// `mmap_file(fd, offset, len)` — отобразить кусок файла в память программы.
+///
+/// Три аргумента, и это ровно столько, сколько есть регистров, — потому вызов и
+/// отдельный, а не флаг к [`mmap`]. Файл, смещение и длина суть разные вещи, и
+/// уложить их в один вызов с безымянной памятью можно было бы только через
+/// структуру в памяти программы, то есть добавив к отображению файла ещё одну
+/// проверку указателя.
+///
+/// Ни одной страницы этот вызов не выделяет: он заводит область и возвращает
+/// адрес. Читать файл начнёт обработчик отказа, когда программа туда посмотрит.
+fn mmap_file(fd: usize, offset: usize, len: usize) -> i64 {
+    match super::with_current(|program| program.mmap_file(fd, offset as u64, len)) {
+        Some(Ok(addr)) => addr as i64,
+        Some(Err(err)) => mmap_errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
 /// `munmap(addr, len)` — вернуть системе то, что выдал [`mmap`].
 fn munmap(addr: usize, len: usize) -> i64 {
     match super::with_current(|program| program.munmap(addr, len)) {
@@ -1144,6 +1163,11 @@ fn mmap_errno(err: super::MmapError) -> i64 {
         super::MmapError::BadRequest => ERR_BAD_ADDRESS,
         super::MmapError::Limit => ERR_LIMIT,
         super::MmapError::NoMemory => ERR_NO_SPACE,
+        // Отказ дескриптора переводится общим переводчиком: «нет такого
+        // дескриптора» и «за ним не файл» программа уже умеет читать, и
+        // придумывать для отображения второй словарь тех же самых причин
+        // значило бы завести два ответа на один вопрос.
+        super::MmapError::BadFile(err) => errno(err),
     }
 }
 

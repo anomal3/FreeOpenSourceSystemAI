@@ -654,6 +654,12 @@ impl Compositor {
         self.menu.as_ref().map_or(0, Menu::program_count)
     }
 
+    /// Сколько программ не поместилось в список меню.
+    #[must_use]
+    pub fn menu_dropped(&self) -> usize {
+        self.menu.as_ref().map_or(0, Menu::dropped_programs)
+    }
+
     pub fn menu_open(&self) -> bool {
         self.menu.as_ref().is_some_and(Menu::is_open)
     }

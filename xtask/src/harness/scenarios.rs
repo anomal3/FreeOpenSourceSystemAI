@@ -355,6 +355,25 @@ pub struct Scenario {
     /// шестидесяти мегабайт на каждой установке — ради файла, который нужен
     /// двум сценариям из тридцати.
     pub updates: bool,
+    /// Положить в образ установленной системы `/media/big.dat` — файл, который
+    /// заведомо не помещается под предел резидентных страниц отображения.
+    ///
+    /// Тем же приёмом и по той же причине, что [`Scenario::updates`]: файл
+    /// пишется на корневой раздел уже установленного образа, до запуска и с
+    /// хоста. Другого пути к нему нет вовсе — двести мебибайт нельзя ни набрать
+    /// по серийной линии, ни положить в initrd, который целиком меньше.
+    ///
+    /// Содержимое **вычисляется**, а не берётся из репозитория, и это тоже не
+    /// экономия места: узор зависит и от номера страницы, и от смещения внутри
+    /// неё, поэтому ошибка отображения меняет ответ (см.
+    /// [`crate::package::BIG_FILE_CHECKSUM`]). Файл в репозитории пришлось бы
+    /// либо хранить, либо генерировать — то есть делать ровно то же самое, но
+    /// в двух местах.
+    ///
+    /// Файл переживает прогон вместе с диском: во второй раз он не строится, а
+    /// опознаётся на месте — иначе цепочка платила бы за него десятками секунд
+    /// на каждом прогоне.
+    pub big_file: bool,
     /// Положить открытый ключ стенда в `authorized_keys` гостя.
     ///
     /// Тем же приёмом и по той же причине, что [`Scenario::updates`]: файл
@@ -404,6 +423,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -442,6 +462,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -500,6 +521,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -543,6 +565,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -582,9 +605,19 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
+            // Сколько программ меню показало. Порогом, а не числом: помещается
+            // на разных машинах разное — на AArch64 влезают все двадцать шесть,
+            // на x86-64 последняя уже нет.
+            //
+            // Проверка стоит **до** ожидания приглашения, и это не придирка к
+            // порядку: рабочий стол поднимается при загрузке, то есть строку он
+            // печатает раньше, чем оболочка здоровается. Ожидание приглашения
+            // уводит курсор за неё, и всё, что ищет вперёд, её уже не находит.
+            Step::AtLeast("desktop     : start menu lists ", 25, BOOT),
             Step::Await("freeos> ", BOOT),
             // Стол не печатает ничего сам по себе, поэтому все проверки здесь
             // опираются на строки, которые оконный менеджер пишет в журнал.
@@ -645,17 +678,32 @@ pub const ALL: &[Scenario] = &[
             // Правый столбец меню — программы из `/bin`. Их там два десятка, и
             // одним списком с окнами меню вышло бы выше экрана: у каждого окна
             // строка описания, то есть две строки на пункт.
-            Step::Expect("desktop     : start menu lists 25 programs from /bin"),
+            //
+            // С фазы 41 программ стало больше, чем строк, и проверяется теперь
+            // не только их число, но и **хвост про непоместившиеся**. Обрезка
+            // была здесь всегда и всегда молчала: программа, оставшаяся за
+            // нижним краем, недостижима мышью и ничем себя не выдаёт — «в меню
+            // нет» и «в системе нет» выглядят одинаково. Строка без хвоста
+            // теперь означала бы, что список снова обрезается молча.
+            // Всего программ — точным числом: оно от экрана не зависит и
+            // меняется только вместе со списком в `/bin`. Сколько из них
+            // показано, проверено порогом в начале сценария, где курсор эту
+            // строку ещё не прошёл.
+            Step::Expect("of 26 programs from /bin"),
             Step::Key("f1"),
             Step::Await("desktop     : menu opened", 15_000),
             Step::Key("right"),
             Step::Wait(1_000),
             Step::Shot("06-menu-programs"),
-            // Десятая строка сверху — `hello`. Номер считается по `/bin`,
+            // Одиннадцатая строка сверху — `hello`. Номер считается по `/bin`,
             // отсортированному по алфавиту, без `init`: поменяется
             // `USER_PROGRAMS` в `build.rs` — поменяется и он. Промах виден
             // сразу: следующий шаг ждёт имя запущенного файла целиком.
-            Step::Repeat("down", 9),
+            //
+            // В фазе 41 он и поменялся: `filemap` встаёт между `fetch` и
+            // `forever`, то есть перед `hello`, и сдвигает его на строку вниз.
+            // Десять нажатий, а не девять.
+            Step::Repeat("down", 10),
             Step::Key("ret"),
             Step::Await("desktop     : started '/bin/hello'", 15_000),
             // И то, ради чего пункт вообще нужен: программа не просто
@@ -711,6 +759,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -871,6 +920,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -937,6 +987,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1001,6 +1052,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[Arch::X86_64],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         // Свойство накапливается к уже заданной машине `q35`, как и `i8042=off`
         // у `usb_only`. Так воспроизводится VirtualBox: там PIT существует, но
@@ -1041,6 +1093,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1191,6 +1244,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1253,6 +1307,53 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "filemap",
+        about: "Файл отображён в память и читается по обращению, а не целиком.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Пока это проверка механизма, а не масштаба: файл берётся тот, что
+            // и так лежит в образе. Настоящая проверка фазы — файл, который в
+            // память не помещается, — стоит отдельно и на установленном диске,
+            // потому что для него нужен раздел, куда хост может этот файл положить.
+            Step::Line("run /bin/filemap /bin/sysupdate"),
+            Step::Await("filemap: /bin/sysupdate is ", 30_000),
+            // Сумма по каждому сотому байту. Она ничего не доказывает сама по
+            // себе — доказывает то, что программа дошла до конца файла, ни разу
+            // не получив отказ, которого не поправила подкачка.
+            Step::Await("filemap: checksum over every 100th byte is ", 60_000),
+            // А вот это и есть утверждение фазы: страницы читались по одной, по
+            // мере обращения. Ноль здесь означал бы, что отображение наполнили
+            // заранее, то есть что подкачки не было.
+            //
+            // Проверка стоит **до** строки программы, а не после, и это не
+            // вкусовщина: печатает её `munmap` в ядре, то есть она приходит
+            // раньше, чем программа успевает сказать «unmapped», а ожидание
+            // ищет только вперёд от курсора.
+            Step::AtLeast("  user        : file mapping released, ", 1, 15_000),
+            Step::Await("filemap: unmapped", 15_000),
+            Step::Await("exited with code 0", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+            Step::Absent("user        : WARNING"),
+        ],
+    },
+    Scenario {
         name: "stdin",
         about: "Программа читает набранное, управляет терминалом и снимается по Ctrl+C.",
         target: Target::Live,
@@ -1267,6 +1368,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1348,6 +1450,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         // `-cpu max` — не украшение. С процессором по умолчанию QEMU не
         // объявляет `XSAVE`, и ядро уходит на путь `FXSAVE`: проверялась бы
@@ -1405,6 +1508,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1455,6 +1559,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1519,6 +1624,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1579,6 +1685,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1638,6 +1745,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1679,6 +1787,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[Arch::Aarch64],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         // Свойство накапливается к уже заданной машине `virt`. Версия по
         // умолчанию — та, что выбрал QEMU; здесь она задана явно, потому что
@@ -1720,6 +1829,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1748,6 +1858,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1779,6 +1890,7 @@ pub const ALL: &[Scenario] = &[
         // пойдёт после установки, а с `-no-reboot` она вместо этого погасла бы.
         reboots: true,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -1857,6 +1969,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2025,6 +2138,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2111,6 +2225,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2219,6 +2334,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2246,6 +2362,108 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "filemap-big",
+        about: "Программа обходит файл в 200 МиБ, а ядро держит из него не больше шестнадцати.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: true,
+        ssh_key: false,
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Считаем кадры до, чтобы сверить после.
+            //
+            // Прогрева, каким начинается сценарий `mmap`, здесь нет, и это
+            // осознанный риск, а не забывчивость. Там он нужен был потому, что
+            // первый запуск программы стоит того, что запуском не является;
+            // здесь то же рассуждение почти не работает: куча ядра — это
+            // фиксированный диапазон, отображённый при старте
+            // (`HEAP_BASE..HEAP_BASE+HEAP_SIZE`), так что ни узел VFS, ни
+            // очередь резидентных страниц кадров не занимают, а образ, стек и
+            // таблицы задачи возвращаются целиком (это отдельно проверяет
+            // сценарий `userspace`). Останется одно окно неопределённости —
+            // окно DMA дискового драйвера, которое умеет расти один раз. К
+            // первому `mem` корень уже смонтирован и с него прочитаны и
+            // `/etc/passwd`, и образ оболочки, то есть окно своё уже взяло.
+            //
+            // Если эта сверка всё же окажется дрожащей, лечится она так же, как
+            // в `mmap`: прогонять `/bin/filemap` на маленьком файле **до**
+            // первого `mem`, а не убирать проверку.
+            Step::Line("mem"),
+            Step::Capture("  frames   ", 15_000),
+
+            Step::Line("run /bin/filemap /media/big.dat"),
+            // Размер точный и это намеренно: файл кладёт хост, и «файл на месте»
+            // здесь означает ещё и «положен целиком». Двести мебибайт при блоке
+            // 4 КиБ — это 51 200 блоков, то есть двойная косвенность в inode;
+            // оборвись она на переходе через таблицу, размер вышел бы другим.
+            Step::Await(crate::package::BIG_FILE_SIZE_LINE, 60_000),
+            // Ответ, посчитанный по каждому сотому байту. Число выписано в
+            // `crate::package`, а не здесь, и не для красоты: рядом с ним стоит
+            // тест, который пересчитывает его тем же генератором, каким файл
+            // наполнялся, — то есть напечатанное гостем сверяется со счётом,
+            // который на госте не выполнялся.
+            //
+            // Десять минут — не запас на всякий случай, а оценка: 51 200
+            // страниц, каждая приходит отдельным чтением с виртуального диска,
+            // и 47 104 из них вытесняются по дороге. Под QEMU без ускорения это
+            // минуты.
+            Step::Await(crate::package::BIG_FILE_CHECKSUM_LINE, 900_000),
+
+            // Вот ради этих двух чисел вся фаза, и оба проверяются здесь.
+            //
+            // Первое: страниц прочитано не меньше, чем их в файле. Обход идёт
+            // строго вперёд, шагом меньше страницы, поэтому каждая страница
+            // читается ровно один раз — 209 715 200 / 4096 = 51 200. Меньше
+            // означало бы, что часть файла программа не увидела вовсе.
+            Step::AtLeast("  user        : file mapping released, ", 16_384, 30_000),
+            // Второе, и оно и есть утверждение фазы: вытеснения были. Предел
+            // резидентных страниц в ядре — 4096, то есть арифметика даёт
+            // 51 200 − 4096 = 47 104. Порог взят ниже (40 000) намеренно:
+            // сверка с точным 47 104 была бы пересказом константы ядра — измени
+            // её кто-нибудь, и сценарий упал бы, ничего не сообщив о подкачке.
+            // Сорок тысяч не проходят ни при каком пределе, при котором файл
+            // помещается целиком, и проходят при любом разумном.
+            //
+            // Вместе эти две строки говорят то, чего по отдельности не говорит
+            // ни одна: программа прошла двести мебибайт, а ядро не держало из
+            // них больше шестнадцати.
+            Step::AtLeast(" reads and ", 12_000, 30_000),
+            // Обе проверки стоят **до** строки самой программы, и это не
+            // вкусовщина: печатает их `munmap` в ядре, то есть они приходят
+            // раньше, чем программа успевает сказать «unmapped», а ожидание
+            // ищет только вперёд от курсора. Поставь их после — и они искали бы
+            // то, что уже проехало.
+            Step::Await("filemap: unmapped", 30_000),
+            Step::Await("exited with code 0", 30_000),
+
+            // И кадры вернулись все до одного. Число подставляется то самое,
+            // что снято выше: отображение файла занимает кадры и отпускает их
+            // на вытеснении, то есть путь возврата здесь исполняется сорок семь
+            // тысяч раз — потеряй он по странице на тысячу вызовов, разница
+            // была бы видна невооружённым глазом.
+            Step::Line("mem"),
+            Step::Await("  frames   {} of", 30_000),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+            // Ядро печатает это, если при возврате области нашлось не столько
+            // страниц, сколько за ней числилось.
+            Step::Absent("user        : WARNING"),
+        ],
+    },
+    Scenario {
         name: "power",
         about: "Машину можно выключить и перезагрузить, и том закрывается за собой чисто.",
         target: Target::Installed,
@@ -2261,6 +2479,7 @@ pub const ALL: &[Scenario] = &[
         // Единственный сценарий, в котором перезагрузка — цель, а не симптом.
         reboots: true,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2328,6 +2547,7 @@ pub const ALL: &[Scenario] = &[
         // существует; после него машина обязана подняться сама.
         reboots: true,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2384,6 +2604,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2450,6 +2671,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[Arch::X86_64],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2482,6 +2704,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2534,6 +2757,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2580,6 +2804,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2738,6 +2963,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -2818,6 +3044,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: true,
         extra: &[],
         steps: &[
@@ -2934,6 +3161,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: true,
         extra: &[],
         steps: &[
@@ -3004,6 +3232,7 @@ pub const ALL: &[Scenario] = &[
         // возврат.
         reboots: true,
         updates: true,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -3087,6 +3316,7 @@ pub const ALL: &[Scenario] = &[
         // Две загрузки в одном процессе: до обновления и после.
         reboots: true,
         updates: true,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -3178,6 +3408,7 @@ pub const ALL: &[Scenario] = &[
         // Две загрузки в одном процессе: до обновления и после.
         reboots: true,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -3277,6 +3508,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -3361,6 +3593,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -3419,6 +3652,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -3463,6 +3697,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -3532,6 +3767,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -3591,6 +3827,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -3662,6 +3899,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[
@@ -3713,6 +3951,7 @@ pub const ALL: &[Scenario] = &[
         arches: &[],
         reboots: false,
         updates: false,
+        big_file: false,
         ssh_key: false,
         extra: &[],
         steps: &[

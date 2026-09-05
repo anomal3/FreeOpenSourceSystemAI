@@ -233,6 +233,15 @@ pub struct Menu {
     damage: Rect,
     /// Имена программ из `/bin`, по алфавиту.
     programs: Vec<String>,
+    /// Сколько программ в список **не** поместилось.
+    ///
+    /// Ноль почти всегда, и именно поэтому поле нужно. Список обрезается по
+    /// высоте экрана, и обрезался он молча: программа, не влезшая в последнюю
+    /// строку, просто переставала существовать для того, кто пользуется мышью.
+    /// Один раз это уже случилось — из меню пропала `wc`, и нашли её не сразу
+    /// (см. расчёт `fits` ниже). Тогда починили формулу; теперь программ стало
+    /// больше, чем строк, и чинить формулу нечем — но сказать об этом можно.
+    dropped: usize,
     /// Ширина левого столбца в точках.
     left_w: u32,
 }
@@ -272,7 +281,7 @@ impl Menu {
         let fits = (room
             .saturating_sub(head + prog_h + tail)
             / prog_h.max(1)) as usize;
-        let programs = list_programs(fits);
+        let (programs, dropped) = list_programs(fits);
 
         let mut widest_program = text::width_of(PROGRAMS_TITLE, scale);
         for name in &programs {
@@ -295,6 +304,7 @@ impl Menu {
             open: false,
             damage: Rect::EMPTY,
             programs,
+            dropped,
             left_w,
         })
     }
@@ -308,6 +318,12 @@ impl Menu {
     #[must_use]
     pub fn program_count(&self) -> usize {
         self.programs.len()
+    }
+
+    /// Сколько программ не поместилось в список.
+    #[must_use]
+    pub fn dropped_programs(&self) -> usize {
+        self.dropped
     }
 
     /// Открыть или закрыть меню. Возвращает новое состояние.
@@ -616,10 +632,17 @@ fn program_row_height(scale: u32) -> u32 {
 /// заново. Всё остальное в списке есть, включая то, что падает нарочно
 /// (`crash`, `svcbad`): оболочка запускает их по имени и сейчас, и прятать в
 /// меню то, что можно набрать руками, значило бы делать вид, что этого нет.
-fn list_programs(limit: usize) -> Vec<String> {
+/// Возвращает имена и **сколько их не поместилось**.
+///
+/// Второе число важнее, чем кажется. Обрезка по высоте экрана неизбежна, а вот
+/// молчание о ней — нет: программа, оставшаяся за краем, недостижима мышью и
+/// при этом ничем себя не выдаёт. Пока имён было меньше, чем строк, разница не
+/// проявлялась; как только их стало больше, «в меню нет» и «в системе нет»
+/// стали выглядеть одинаково.
+fn list_programs(limit: usize) -> (Vec<String>, usize) {
     const HIDDEN: [&str; 1] = ["init"];
     let Some(Ok(entries)) = crate::fs::list("/bin") else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let mut names: Vec<String> = entries
         .into_iter()
@@ -628,8 +651,9 @@ fn list_programs(limit: usize) -> Vec<String> {
         .filter(|name| !HIDDEN.contains(&name.as_str()))
         .collect();
     names.sort();
+    let dropped = names.len().saturating_sub(limit);
     names.truncate(limit);
-    names
+    (names, dropped)
 }
 
 /// Время работы в виде `Ч:ММ:СС`.

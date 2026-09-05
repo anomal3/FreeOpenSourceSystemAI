@@ -86,6 +86,17 @@ pub fn handle(fault: Fault, ctx: TrapContext) -> ! {
         Fault::DoubleFault => {
             kprintln!("double fault: a fault occurred while handling another one");
             kprintln!("the first fault's own handler could not run to completion");
+            // Самый частый способ сюда попасть — переполнение стека ядра, и
+            // распознаётся оно здесь, а не в разборе #PF. Так стало с фазой 41:
+            // пока #PF был фатальным, он приходил на свой IST и успевал
+            // объясниться сам; теперь он обязан уметь возвращаться, а значит
+            // приходит на стек задачи — и на переполненном стеке процессору
+            // некуда положить кадр, отчего #PF немедленно становится #DF.
+            //
+            // Указатель стека при этом сохраняется в кадре двойного отказа, то
+            // есть тот же вывод делается по тем же данным, только на вектор
+            // позже.
+            explain_stack(ctx.sp);
         }
         Fault::InvalidOpcode => {
             kprintln!("invalid opcode at {:#018x}", ctx.pc);
@@ -105,6 +116,25 @@ pub fn handle(fault: Fault, ctx: TrapContext) -> ! {
     kprintln!();
     kprintln!("FreeOS kernel: halted by an unrecoverable fault.");
     arch::halt();
+}
+
+/// Сказать, не в сторожевую ли страницу упёрся стек.
+///
+/// Отдельно от [`explain_address`] потому, что вопрос другой: там — «куда
+/// обращались», здесь — «откуда обращались». Переполнение стека узнаётся именно
+/// по второму: адрес обращения при нём может быть каким угодно, а вот сам стек
+/// стоит ровно на границе.
+fn explain_stack(sp: usize) {
+    let stack_bottom = STACK_TOP - STACK_SIZE;
+    let guard_bottom = stack_bottom - PAGE_SIZE;
+
+    // Полстраницы допуска вниз: процессор к этому моменту уже пытался положить
+    // кадр, то есть указатель успел уйти ниже той границы, на которой всё
+    // сломалось.
+    if (guard_bottom.saturating_sub(PAGE_SIZE)..stack_bottom).contains(&sp) {
+        kprintln!("  --> the stack pointer is at the kernel stack guard page: the stack overflowed");
+        kprintln!("      stack spans {stack_bottom:#018x}..{STACK_TOP:#018x}");
+    }
 }
 
 /// Подсказать, во что попал адрес, если это узнаваемое место.

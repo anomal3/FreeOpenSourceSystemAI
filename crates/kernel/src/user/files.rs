@@ -18,7 +18,7 @@
 //! том и разобранный inode — сотни байт, но выделяет их куча ядра, а не
 //! программа, и предела у неё нет.
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use user_abi::{FD_FIRST, MAX_OPEN_FILES, O_CREATE, O_TRUNC, O_WRITE};
@@ -38,7 +38,15 @@ use super::pipe::{self, PipeError};
 /// Открытый файл: узел, то, докуда программа его дочитала, и можно ли в него
 /// писать.
 struct Open {
-    node: Box<dyn Node>,
+    /// Узел, а не путь: путь может быть переименован под руками, открытый файл
+    /// — нет.
+    ///
+    /// `Arc`, а не `Box`, с фазы 41: отображение файла в память живёт своей
+    /// жизнью и обязано пережить закрытие дескриптора. Разделяемое владение
+    /// здесь — не удобство, а само обещание `SYS_MMAP_FILE`: программа,
+    /// отобразившая файл, закрывает дескриптор сразу же, потому что он ей
+    /// больше не нужен, и страницы обязаны продолжать подкачиваться.
+    node: Arc<dyn Node>,
     offset: u64,
     /// Право писать спрошено при открытии и запомнено здесь. Перепроверять его
     /// на каждой записи не нужно и неверно: в Unix смена прав не отбирает уже
@@ -164,7 +172,8 @@ impl Table {
             .iter()
             .position(Option::is_none)
             .ok_or(FileError::TooManyFiles)?;
-        self.slots[slot] = Some(Slot::File(Open { node, offset: 0, writable, entries }));
+        self.slots[slot] =
+            Some(Slot::File(Open { node: Arc::from(node), offset: 0, writable, entries }));
         Ok(slot + FD_FIRST)
     }
 
@@ -193,7 +202,7 @@ impl Table {
             .position(Option::is_none)
             .ok_or(FileError::TooManyFiles)?;
         self.slots[slot] =
-            Some(Slot::File(Open { node, offset: 0, writable: true, entries: None }));
+            Some(Slot::File(Open { node: Arc::from(node), offset: 0, writable: true, entries: None }));
         Ok(slot + FD_FIRST)
     }
 
@@ -235,6 +244,33 @@ impl Table {
         };
         open.offset += 1;
         Ok(Some(entry.clone()))
+    }
+
+    /// Узел за дескриптором — чтобы отобразить его в память.
+    ///
+    /// Отдаётся клон `Arc`, и в этом весь смысл: с этого мгновения у файла два
+    /// владельца, дескриптор и отображение, и закрытие первого второго не
+    /// трогает. Смещение дескриптора при этом **не** участвует — у отображения
+    /// своё, пришедшее аргументом; читать один файл через `read` и через
+    /// отображение одновременно позволено, и позиции у них разные.
+    ///
+    /// Отображать можно только обычный файл. Каталог и канал отвергаются здесь,
+    /// а не в вызывающем: что такое «страница каталога», не знает никто, а у
+    /// канала нет ни длины, ни смещения — читать его можно только вперёд и
+    /// только один раз.
+    pub fn node(&self, fd: usize) -> Result<Arc<dyn Node>, FileError> {
+        match self.slots.get(index_of(fd)?).and_then(Option::as_ref) {
+            Some(Slot::File(open)) => {
+                if open.entries.is_some() {
+                    return Err(FileError::Vfs(VfsError::WrongKind));
+                }
+                Ok(Arc::clone(&open.node))
+            }
+            Some(Slot::PipeRead(_) | Slot::PipeWrite(_)) => {
+                Err(FileError::Vfs(VfsError::WrongKind))
+            }
+            None => Err(FileError::BadFd),
+        }
     }
 
     /// Прочитать из дескриптора в буфер. Возвращает, сколько прочитано; ноль —
