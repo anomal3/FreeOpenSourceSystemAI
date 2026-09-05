@@ -23,7 +23,8 @@ use core::panic::PanicInfo;
 
 use user_abi::{
     ERR_BAD_PATH, FD_STDERR, FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID,
-    SYS_GETUID, SYS_OPEN, SYS_READ, O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_READDIR,
+    SYS_GETUID, SYS_OPEN, SYS_READ, O_CREATE, O_TRUNC, O_WRITE, SYS_MKDIR, SYS_MMAP,
+    SYS_MUNMAP, SYS_READDIR,
     SYS_REMOVE, SYS_RENAME, SYS_SEEK, SYS_SLEEP, SYS_SPAWN, SYS_STAT, SYS_TIME, SYS_TTYMODE,
     SYS_UPTIME, SYS_WAIT, SYS_WINSIZE, SYS_WRITE, SYS_YIELD, SPAWN_INHERIT, Stat, TTY_LINE,
     TTY_RAW, WAIT_NOHANG,
@@ -40,9 +41,9 @@ use user_abi::{
 };
 
 pub use user_abi::{
-    Dirent, ERR_AGAIN, ERR_BROKEN_PIPE, ERR_NOT_FOUND, ERR_NO_NETWORK, ERR_NO_TASK, ERR_PERMISSION,
-    ERR_UPDATE_REFUSED, FD_STDIN, KIND_DIRECTORY, KIND_FILE, NetConfig, NetInfo, Peer, SEEK_CUR,
-    SEEK_END, SEEK_SET, SLOT_A, SLOT_B, StreamState,
+    Dirent, ERR_AGAIN, ERR_BROKEN_PIPE, ERR_LIMIT, ERR_NOT_FOUND, ERR_NO_NETWORK, ERR_NO_SPACE,
+    ERR_NO_TASK, ERR_PERMISSION, ERR_UPDATE_REFUSED, FD_STDIN, KIND_DIRECTORY, KIND_FILE, NetConfig,
+    NetInfo, Peer, SEEK_CUR, SEEK_END, SEEK_SET, SLOT_A, SLOT_B, StreamState,
 };
 
 /// Выполнить системный вызов.
@@ -1073,6 +1074,50 @@ pub fn config_path(name: &str) -> Option<Path> {
 pub fn apply_update(path: &str) -> i64 {
     // SAFETY: путь живёт в памяти программы, длина — его собственная.
     unsafe { syscall(SYS_UPDATE, path.as_ptr() as usize, path.len(), 0) }
+}
+
+// ---------------------------------------------------------------------------
+// Память по запросу
+// ---------------------------------------------------------------------------
+
+/// Попросить у ядра `len` байт безымянной памяти.
+///
+/// Возвращает адрес начала области либо отрицательный код договора:
+/// [`user_abi::ERR_NO_SPACE`] — у машины нет свободных кадров,
+/// [`ERR_LIMIT`] — столько не дадут одной задаче, [`user_abi::ERR_BAD_ADDRESS`]
+/// — просили ноль байт. Число, а не `Result`, по той же причине, что и у
+/// [`open`]: перевод кода в тип — это уже библиотека, а тут одна строка.
+///
+/// Длина округляется вверх до страницы **ядром**, и обвязка этого не повторяет:
+/// сколько именно досталось, знает только та сторона, которая раскладывала
+/// таблицы. Программе, которой важен размер страницы, придётся спросить о нём
+/// отдельно — сейчас спрашивать нечем, и это названный предел, а не забытая
+/// функция.
+///
+/// Адрес приходит выровненным на страницу — иначе он не был бы началом
+/// отображения, — то есть годится под любой тип, какой бывает у нас.
+pub fn mmap(len: usize) -> i64 {
+    // SAFETY: аргумент — число. Никакого указателя программы вызов не читает:
+    // память он не берёт у программы, а отдаёт ей.
+    unsafe { syscall(SYS_MMAP, len, 0, 0) }
+}
+
+/// Вернуть ядру область, взятую [`mmap`]. Ноль — вернули.
+///
+/// `addr` и `len` обязаны **в точности** повторять то, что вернул [`mmap`] и что
+/// у него просили: половину области отдать нельзя, и на попытку ядро отвечает
+/// [`user_abi::ERR_BAD_ADDRESS`]. Почему так — сказано в договоре у
+/// [`user_abi::SYS_MUNMAP`].
+///
+/// После удачного возврата ни один адрес из области не читается и не пишется:
+/// обращение туда — отказ страницы, то есть конец программы. Держать в
+/// переменных указатели внутрь возвращённой области поэтому бессмысленно, и
+/// обвязка тут ничем не поможет — она не видит, кто их себе переписал.
+pub fn munmap(addr: usize, len: usize) -> i64 {
+    // SAFETY: аргументы — числа. Ядро само проверит, что такая область у этой
+    // задачи есть; соврать ему адресом чужой памяти нельзя — своей таблице
+    // областей оно верит, а не нам.
+    unsafe { syscall(SYS_MUNMAP, addr, len, 0) }
 }
 
 /// Путь, собираемый по кусочкам в буфере на стеке.

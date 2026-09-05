@@ -40,6 +40,7 @@ use user_abi::{
 };
 use user_abi::{ERR_BROKEN_PIPE, LAUNCH_KEEP, Launch, SYS_LAUNCH, SYS_PIPE};
 use user_abi::{ERR_UPDATE_REFUSED, SYS_UPDATE};
+use user_abi::{ERR_LIMIT, SYS_MMAP, SYS_MUNMAP};
 use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
@@ -146,6 +147,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_RESOLVE => resolve(a0, a1, a2),
         SYS_RANDOM => random(a0, a1),
         SYS_UPDATE => update(a0, a1),
+        SYS_MMAP => mmap(a0),
+        SYS_MUNMAP => munmap(a0, a1),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1101,6 +1104,46 @@ fn net_errno(err: NetError) -> i64 {
             | crate::net::socket::SocketError::NoPeer
             | crate::net::socket::SocketError::TooLong(_) => ERR_BAD_ADDRESS,
         },
+    }
+}
+
+/// `mmap(len)` — попросить у ядра `len` байт безымянной памяти.
+///
+/// Возвращает адрес, а не ноль с адресом где-то ещё: адрес и есть результат.
+/// Он заведомо положителен как число со знаком — окно программы начинается с
+/// 512 ГиБ, — так что отличить его от кода ошибки можно по знаку, как и во всех
+/// остальных вызовах договора.
+///
+/// Проверять `len` по таблицам здесь нечего: это длина, а не указатель. Всё,
+/// что можно сказать неверно, скажет [`super::Program::mmap`].
+fn mmap(len: usize) -> i64 {
+    match super::with_current(|program| program.mmap(len)) {
+        Some(Ok(addr)) => addr as i64,
+        Some(Err(err)) => mmap_errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `munmap(addr, len)` — вернуть системе то, что выдал [`mmap`].
+fn munmap(addr: usize, len: usize) -> i64 {
+    match super::with_current(|program| program.munmap(addr, len)) {
+        Some(Ok(())) => 0,
+        Some(Err(err)) => mmap_errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
+/// Почему память не выдана — в терминах договора.
+///
+/// «Машина полна» и «тебе столько не полагается» — разные ответы намеренно, и
+/// разница эта нужна не журналу, а программе: на первый ответ разумно
+/// подождать или сдаться, на второй — попросить меньше. Один код на оба
+/// заставил бы её гадать.
+fn mmap_errno(err: super::MmapError) -> i64 {
+    match err {
+        super::MmapError::BadRequest => ERR_BAD_ADDRESS,
+        super::MmapError::Limit => ERR_LIMIT,
+        super::MmapError::NoMemory => ERR_NO_SPACE,
     }
 }
 

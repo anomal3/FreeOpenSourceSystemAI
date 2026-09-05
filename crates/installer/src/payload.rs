@@ -220,7 +220,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// после этого **перестал собираться** — и это лучший исход из возможных,
 /// потому что собравшийся установщик поставил бы систему без `/bin/sshd`, а
 /// узналось бы это только по не запустившейся службе.
-const PROGRAMS: [(&CStr16, &str); 25] = [
+const PROGRAMS: [(&CStr16, &str); 26] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -248,6 +248,7 @@ const PROGRAMS: [(&CStr16, &str); 25] = [
     // `SYSUPDATE` — девять знаков. В `/bin` файл ложится полным именем.
     (cstr16!("\\FREEOS\\BIN\\SYSUPD"), "sysupdate"),
     (cstr16!("\\FREEOS\\BIN\\FETCH"), "fetch"),
+    (cstr16!("\\FREEOS\\BIN\\MEMTEST"), "memtest"),
 ];
 
 /// Эталонные настройки на носителе и их пути в корневом образе.
