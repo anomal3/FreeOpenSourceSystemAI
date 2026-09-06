@@ -41,6 +41,7 @@ pub mod compositor;
 pub mod context;
 pub mod files;
 pub mod icons;
+pub mod paint;
 pub mod panel;
 pub mod pointer;
 pub mod settings;
@@ -100,7 +101,7 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
         return false;
     };
 
-    let scale = theme::scale_for(screen.width());
+    let scale = theme::geometry_scale(screen.width());
     // Буфер кадра — условие работы стола, а не украшение: без него собирать
     // картинку негде. Не хватило памяти — система работает в серийной линии,
     // ровно как на машине без фреймбуфера.
@@ -127,13 +128,13 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
     desktop.present();
 
     kprintln!(
-        "  desktop     : {}x{}, glyph scale {}, panel {} px",
+        "  desktop     : {}x{}, ui scale {}, panel {} px",
         desktop.screen_width(),
         desktop.screen_height(),
         desktop.scale(),
         desktop.screen_height() as i32 - desktop.work_bottom(),
     );
-    for (app, focused) in desktop.buttons() {
+    for (app, focused, _) in desktop.buttons() {
         log_window(&desktop, app, focused);
     }
     log_icons(&desktop);
@@ -256,13 +257,20 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
             width * 2 / 3,
             work * 2 / 3,
         ),
-        // «Параметры» — окно для чтения и нажатий, а не для длинного вывода:
-        // оно уже терминала и стоит правее значков, чтобы не накрывать их
-        // собой при открытии с рабочего стола.
+        // «Параметры» — окно из двух колонок: разделы слева и настройки
+        // справа. Ширина считается от них, а не долей экрана: боковая колонка
+        // 240, содержимому нужно место под подпись, пояснение и элемент
+        // справа, а предпросмотр стола — ещё 340. Окно уже этой суммы
+        // показывало бы содержимое в щели между колонкой и краем.
         App::Settings => {
-            let w = (width * 5 / 12).max(420);
-            let h = (work * 3 / 4).max(320);
-            Rect::new((width / 4) as i32, (work / 10) as i32, w, h)
+            let w = (width * 7 / 8).clamp(560, width.saturating_sub(margin).max(560));
+            let h = (work * 4 / 5).max(360);
+            Rect::new(
+                ((width.saturating_sub(w)) / 2) as i32,
+                (work / 12) as i32,
+                w,
+                h,
+            )
         }
         App::About => {
             let w = (width / 2).max(320);
@@ -323,22 +331,21 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
 fn confirm_text(app: App) -> String {
     let mut text = String::new();
     // Строки короткие не случайно: окно подтверждения вдвое уже терминала, а
-    // перенос посреди фразы выглядит как испорченный вывод. Тридцать восемь
-    // знаков помещаются и на 800×600, и на 1280×800 — то есть при обоих
-    // масштабах глифа, которые выбирает стол.
+    // перенос посреди фразы выглядит как испорченный вывод. Сорок знаков
+    // помещаются и на 800×600, и на 1280×800.
     let (what, then) = if app == App::Restart {
-        ("Restart the machine?", "It starts again from the same disk.")
+        ("Перезагрузить машину?", "Она запустится снова с того же диска.")
     } else {
-        ("Switch the machine off?", "Power it on by hand afterwards.")
+        ("Выключить машину?", "Включать её придётся руками.")
     };
     let _ = write!(
         text,
         "{what}\n\n\
-         The root volume is closed first,\n\
-         so the next boot finds it clean.\n\
+         Корневой том закрывается первым,\n\
+         чтобы следующая загрузка нашла его целым.\n\
          {then}\n\n\
-         Y   yes, do it\n\
-         N   no, forget it (Esc, Ctrl+W)\n",
+         Y   да, выключаем\n\
+         N   нет, передумал (Esc, Ctrl+W)\n",
     );
     text
 }
@@ -353,13 +360,13 @@ fn about_text(desktop: &Compositor) -> String {
     let _ = write!(
         text,
         "FreeOS {}\n\
-         An operating system written from scratch in Rust.\n\n\
-         architecture  {}\n\
-         screen        {}x{}\n\n\
-         Meta or F1    start menu\n\
-         Tab           next window\n\
-         Ctrl+W        close window\n\
-         Ctrl+arrows   move window\n",
+         Операционная система, написанная на Rust с пустого места.\n\n\
+         архитектура   {}\n\
+         экран         {}x{}\n\n\
+         Meta или F1   меню запуска\n\
+         Tab           следующее окно\n\
+         Ctrl+W        закрыть окно\n\
+         Ctrl+стрелки  подвинуть окно\n",
         crate::VERSION,
         arch::ARCH_NAME,
         desktop.screen_width(),
@@ -643,7 +650,13 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         // Где окно оказалось — в журнал: это единственное видимое снаружи
         // последствие перетаскивания, и без него проверить его можно было бы
         // только глазами по снимку экрана.
-        if let Some(app) = desktop.dragging() {
+        //
+        // Строка печатается, **только если окно действительно переехало**.
+        // Щелчок по заголовку проходит через тот же захват и отпускание, и
+        // раньше он писал «переехало туда, где стояло». Стенд ждёт переезда по
+        // этой строке — и принимал за него щелчок, после чего целился в кнопку
+        // закрытия по старому месту окна и промахивался мимо всего окна.
+        if let Some(app) = desktop.dragging().filter(|_| desktop.drag_moved()) {
             if let Some(rect) = desktop.rect_of(app) {
                 kprintln!(
                     "  desktop     : moved '{}' to {},{}",
@@ -814,8 +827,23 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             // Щелчок по содержимому: его разбирает само содержимое — в
             // «Параметрах» им выбирают раздел и нажимают пункты.
             Hit::Body => {
-                if let Some(window) = desktop.focused_mut() {
-                    window.handle_click(x, y);
+                let changed = match desktop.focused_mut() {
+                    Some(window) => {
+                        window.handle_click(x, y);
+                        window.took_theme_change()
+                    }
+                    None => false,
+                };
+                // Смена темы — единственное, что окно меняет за своими
+                // границами. Перекрашивать стол изнутри окна оно не может:
+                // остальные окна, панель и обои принадлежат композитору,
+                // и окно о них не знает.
+                if changed {
+                    kprintln!(
+                        "  desktop     : theme {}",
+                        if theme::is_dark() { "dark" } else { "light" }
+                    );
+                    desktop.restyle(status);
                 }
             }
         }
@@ -1076,6 +1104,16 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
                     desktop.context_note(&err);
                 }
             }
+        }
+        context::Action::Theme => {
+            desktop.close_context();
+            let dark = !theme::is_dark();
+            theme::set_dark(dark);
+            kprintln!(
+                "  desktop     : theme {}",
+                if dark { "dark" } else { "light" }
+            );
+            desktop.restyle(status);
         }
         context::Action::DisplaySettings => {
             desktop.close_context();

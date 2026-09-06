@@ -23,16 +23,58 @@
 //! оконного менеджера заново. Меню уже забирает себе весь ввод, пока открыто,
 //! поэтому строка набирается в нём же: одна дополнительная строка на экране
 //! против отдельного вида окна.
+//!
+//! # Почему тени и углов здесь нет
+//!
+//! Меню — плавающая стеклянная карточка, но тень под ней и срез её углов
+//! рисует композитор: он один знает, что лежит под слоем, а обои у него
+//! радиальные, с цветными пятнами и сеткой точек. Повторить их внутри
+//! поверхности нельзя даже приблизительно — прямоугольник другого оттенка
+//! выдал бы себя сразу. Поэтому поверхность здесь ровно размером с карточку, а
+//! заливка сводится к непрозрачному цвету поверх усреднённых обоев: всё, кроме
+//! углов, композитор копирует как есть.
+//!
+//! # Почему раскладка считается одной функцией
+//!
+//! Потому что нарисованное и нажимаемое обязаны совпадать: [`plan`] отвечает,
+//! где лежит какая строка, и её спрашивают и отрисовка, и поиск пункта под
+//! указателем. Пока это были две формулы, они сходились ровно до первой правки
+//! отступа.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use mini_ui::text::{self, GLYPH_H, GLYPH_W};
+use mini_ui::draw;
+use mini_ui::glyphicon::{self, Icon};
+use mini_ui::typeface::{Face, Role};
 use mini_ui::{Rect, Surface};
 
+use super::paint::{self, Ctx, RowState, Tone};
 use super::theme;
 use crate::input::{KeyCode, KeyEvent, Modifiers};
 use crate::vfs::perm::Access;
+
+/// Поле внутри карточки.
+const CARD_PAD: u32 = 8;
+/// Высота строки меню.
+const ROW_H: u32 = 32;
+/// Зазор между строками.
+const ROW_GAP: u32 = 1;
+/// Поле внутри строки.
+const ROW_PAD: u32 = 10;
+/// Сторона значка в строке.
+const ICON: u32 = 14;
+/// Просвет между значком и подписью.
+const ICON_GAP: u32 = 10;
+/// Поле разделителя сверху и снизу.
+const SEP_PAD: u32 = 5;
+/// Высота поля ввода имени.
+const FIELD_H: u32 = 30;
+
+/// Подсказка под полем ввода имени — она же задаёт наименьшую ширину меню.
+const RENAME_HINT: &str = "Enter — переименовать    Esc — отмена    Ctrl+U — очистить";
+/// Подсказка под вопросом об удалении.
+const CONFIRM_HINT: &str = "Y — удалить    N — оставить";
 
 /// Что предлагает меню.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -47,6 +89,8 @@ pub enum Action {
     NewFolder,
     /// Создать пустой текстовый файл там же.
     NewTextFile,
+    /// Переключить тему на противоположную.
+    Theme,
     /// Открыть «Параметры» на разделе экрана.
     DisplaySettings,
     /// Перечитать стол и перерисовать его целиком.
@@ -55,20 +99,27 @@ pub enum Action {
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 7] = [
+    const ALL: [Action; 8] = [
         Action::Open,
         Action::Rename,
         Action::Delete,
         Action::NewFolder,
         Action::NewTextFile,
+        Action::Theme,
         Action::DisplaySettings,
         Action::Refresh,
     ];
 
     /// Пункты меню, открытого на пустом месте стола.
-    pub const ON_DESKTOP: [Action; 4] = [
+    /// Пункты меню, открытого на пустом месте стола.
+    ///
+    /// Тема стоит здесь, а не только в «Параметрах», по той же причине, по
+    /// которой обои меняют щелчком по столу: это свойство самого стола, и идти
+    /// за ним в окно настроек человек не должен.
+    pub const ON_DESKTOP: [Action; 5] = [
         Action::NewFolder,
         Action::NewTextFile,
+        Action::Theme,
         Action::DisplaySettings,
         Action::Refresh,
     ];
@@ -85,15 +136,58 @@ impl Action {
     /// нечем, а открыть его — можно.
     pub const ON_APP: [Action; 2] = [Action::Open, Action::Refresh];
 
-    const fn title(self) -> &'static str {
+    fn title(self) -> &'static str {
         match self {
-            Action::Open => "Open",
-            Action::Rename => "Rename",
-            Action::Delete => "Delete",
-            Action::NewFolder => "New folder",
-            Action::NewTextFile => "New text file",
-            Action::DisplaySettings => "Display settings",
-            Action::Refresh => "Refresh",
+            Action::Open => "Открыть",
+            Action::Rename => "Переименовать",
+            Action::Delete => "Удалить",
+            Action::NewFolder => "Создать папку",
+            Action::NewTextFile => "Создать текстовый файл",
+            // Пункт называется тем, что произойдёт, а не тем, что есть сейчас:
+            // «Тёмная тема» при включённой тёмной читается как признак, а не
+            // как действие, и человек нажимает её, чтобы «включить», получая
+            // обратное.
+            Action::Theme => {
+                if theme::is_dark() {
+                    "Светлая тема"
+                } else {
+                    "Тёмная тема"
+                }
+            }
+            Action::DisplaySettings => "Настройки экрана",
+            Action::Refresh => "Обновить",
+        }
+    }
+
+    /// К какой группе относится пункт — между группами идёт черта.
+    ///
+    /// Группа, а не список разделителей: пункты собираются по три разных
+    /// набора, и разделитель, заданный номером строки, съезжал бы в каждом из
+    /// них по-своему.
+    const fn group(self) -> u8 {
+        match self {
+            Action::Open | Action::Rename | Action::Delete => 0,
+            Action::NewFolder | Action::NewTextFile => 1,
+            Action::Theme | Action::DisplaySettings | Action::Refresh => 2,
+        }
+    }
+
+    /// Значок пункта. `None` — подходящего в наборе нет.
+    ///
+    /// «Переименовать» остаётся без значка намеренно: карандаша в наборе нет, а
+    /// подобрать «что-нибудь похожее» значит поставить в строку картинку,
+    /// которая говорит не то. Отступ подписи от этого не меняется — иначе одна
+    /// строка выехала бы левее остальных.
+    fn icon(self) -> Option<Icon> {
+        match self {
+            Action::Open => Some(Icon::ChevronRight),
+            Action::Rename => None,
+            Action::Delete => Some(Icon::Close),
+            Action::NewFolder => Some(Icon::Folder),
+            Action::NewTextFile => Some(Icon::File),
+            Action::Theme => Some(if theme::is_dark() { Icon::Sun } else { Icon::Moon }),
+            Action::DisplaySettings => Some(Icon::Display),
+            Action::Refresh => Some(Icon::Update),
         }
     }
 }
@@ -139,6 +233,11 @@ pub struct ContextMenu {
     open: bool,
     mode: Mode,
     damage: Rect,
+    /// Верх панели задач: ниже него карточке выезжать нельзя.
+    ///
+    /// Запоминается при открытии, потому что подгонять высоту приходится и
+    /// позже — когда меню сменило список пунктов на поле ввода имени.
+    work_bottom: i32,
     /// Ответ последнего действия — показывается строкой внизу меню.
     note: Option<String>,
 }
@@ -146,20 +245,27 @@ pub struct ContextMenu {
 impl ContextMenu {
     #[must_use]
     pub fn new(scale: u32) -> Option<Self> {
-        let row_h = row_height(scale);
+        let ctx = Ctx::scaled(scale);
+        // Ширина считается по самому длинному пункту и по самой длинной
+        // подсказке: меню, которое меняет ширину вместе с содержимым, прыгало
+        // бы под рукой.
         let mut widest = 0;
         for action in Action::ALL {
-            widest = widest.max(text::width_of(action.title(), scale));
+            widest = widest.max(ctx.face(Role::Body).width(action.title()));
         }
-        // Место под сообщение внизу: оно бывает длиннее пунктов, и меню, которое
-        // меняет ширину вместе с ответом, прыгало бы под рукой.
-        let width = (widest + GLYPH_W * scale * 8).max(GLYPH_W * scale * 28);
+        let content = ctx.px(ICON + ICON_GAP) + widest;
+        let hint = ctx
+            .face(Role::Caption)
+            .width(RENAME_HINT)
+            .max(ctx.face(Role::Caption).width(CONFIRM_HINT));
+        let width = content.max(hint) + ctx.px((CARD_PAD + ROW_PAD) * 2);
+
         // Поверхность — на самое длинное меню, какое бывает; показывается из
         // неё столько строк, сколько пунктов у этого открытия. Растить и
         // сжимать поверхность на каждый щелчок значило бы просить память в
         // обработчике события ввода — и остаться без меню, когда её не дали.
-        let height = row_h * (Action::ON_DESKTOP.len() as u32 + 2) + theme::PADDING * 2;
-        let surface = Surface::new(width, height, theme::WINDOW_BG)?;
+        let height = height_for(ctx, &Action::ON_ENTRY).max(height_for(ctx, &Action::ON_DESKTOP));
+        let surface = Surface::new(width, height, theme::wall_average(theme::palette()))?;
         Some(Self {
             surface,
             rect: Rect::new(0, 0, width, height),
@@ -169,6 +275,7 @@ impl ContextMenu {
             open: false,
             mode: Mode::Menu,
             damage: Rect::EMPTY,
+            work_bottom: i32::MAX,
             note: None,
         })
     }
@@ -184,9 +291,9 @@ impl ContextMenu {
         !matches!(self.mode, Mode::Menu)
     }
 
-    /// Высота меню с таким числом пунктов.
-    fn height_for(&self, items: usize) -> u32 {
-        row_height(self.scale) * (items as u32 + 1) + theme::PADDING * 2
+    /// Контекст отрисовки. Подложка — обои: карточка лежит на них.
+    fn ctx(&self) -> Ctx {
+        Ctx::scaled(self.scale).on(theme::wall_average(theme::palette()))
     }
 
     /// Открыть меню в точке экрана, не выпуская его за края.
@@ -200,7 +307,9 @@ impl ContextMenu {
     ) {
         self.items.clear();
         self.items.extend_from_slice(items);
-        self.rect.h = self.height_for(self.items.len()).min(self.surface.height());
+        self.work_bottom = work_bottom;
+        let ctx = self.ctx();
+        self.rect.h = height_for(ctx, &self.items).min(self.surface.height());
         let max_x = (screen.0 as i32 - self.rect.w as i32).max(0);
         let max_y = (work_bottom - self.rect.h as i32).max(0);
         self.rect.x = x.clamp(0, max_x);
@@ -223,16 +332,29 @@ impl ContextMenu {
         if self.is_editing() || !self.rect.contains(x, y) {
             return None;
         }
-        let row_h = row_height(self.scale);
-        let local = (y - self.rect.y - theme::PADDING as i32).max(0) as u32;
-        let index = (local / row_h) as usize;
-        self.items.get(index).copied()
+        let local = (x - self.rect.x, y - self.rect.y);
+        let layout = plan(self.ctx(), self.card(), &self.items);
+        layout
+            .rows
+            .iter()
+            .find(|slot| slot.rect.contains(local.0, local.1))
+            .map(|slot| slot.action)
+    }
+
+    /// Карточка — вся поверхность целиком.
+    ///
+    /// Отдельный метод, а не `Rect::new(0, 0, w, h)` по месту: раскладку
+    /// спрашивают из трёх мест, и «где начинается карточка» обязано быть одним
+    /// ответом.
+    fn card(&self) -> Rect {
+        Rect::new(0, 0, self.rect.w, self.rect.h)
     }
 
     /// Начать набор нового имени.
     pub fn start_rename(&mut self, name: &str) {
         self.mode = Mode::Rename { from: name.to_string(), text: name.to_string() };
         self.note = None;
+        self.fit(rename_height(self.ctx()));
         self.redraw();
     }
 
@@ -244,7 +366,21 @@ impl ContextMenu {
     pub fn start_confirm(&mut self, name: &str) {
         self.mode = Mode::Confirm { name: name.to_string() };
         self.note = None;
+        self.fit(confirm_height(self.ctx()));
         self.redraw();
+    }
+
+    /// Подогнать карточку под новую высоту, не дав ей выехать вниз.
+    ///
+    /// Меню открылось у нижнего края и стало ниже — оно обязано остаться там,
+    /// где стояло; стало выше — обязано подняться, а не уехать под панель.
+    fn fit(&mut self, height: u32) {
+        let before = self.rect.h;
+        self.rect.h = height.min(self.surface.height());
+        if self.rect.h > before {
+            let limit = self.work_bottom - self.rect.h as i32;
+            self.rect.y = self.rect.y.min(limit.max(0));
+        }
     }
 
     /// Разобрать клавишу, пока меню открыто.
@@ -348,6 +484,19 @@ impl ContextMenu {
         }
     }
 
+    /// Перерисовать меню под текущую тему.
+    ///
+    /// У меню своя поверхность, и цвета в неё уже вписаны: смена темы не
+    /// перекрашивает нарисованное, её надо нарисовать заново. Закрытое меню
+    /// изменившимся не помечается — его на экране нет, и просить композитор
+    /// перерисовать место, где его нет, значит тратить кадр впустую.
+    pub fn restyle(&mut self) {
+        self.redraw();
+        if !self.open {
+            self.damage = Rect::EMPTY;
+        }
+    }
+
     /// Показать ответ действия, не закрывая меню.
     pub fn set_note(&mut self, note: impl Into<String>) {
         self.note = Some(note.into());
@@ -356,137 +505,71 @@ impl ContextMenu {
     }
 
     fn redraw(&mut self) {
-        let scale = self.scale;
-        let row_h = row_height(scale);
+        let ctx = self.ctx();
+        let p = ctx.palette;
         let bounds = Rect::new(0, 0, self.surface.width(), self.rect.h);
-        self.surface.fill(bounds, theme::WINDOW_BG);
-        self.surface.frame(bounds, theme::BORDER, theme::ACCENT);
+        let card = self.card();
+
+        // Внутренности карточки лежат на стекле, а не на обоях: сведи их поверх
+        // обоев — и строка под указателем окажется на полтона мимо той
+        // подложки, на которой она нарисована.
+        let glass = ctx.flat(p.glass);
+        let inner = ctx.on(glass);
+        let radius = ctx.px(theme::R_CARD);
+        let layout = plan(ctx, card, &self.items);
+
+        {
+            let s = &mut self.surface;
+            // Заливка идёт по всей поверхности, а не по скруглённой фигуре:
+            // углы срезает композитор, а точки, оставшиеся от прошлой
+            // отрисовки, просвечивали бы сквозь его сглаживание.
+            s.fill(bounds, glass);
+            draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
+            draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+        }
 
         match &self.mode {
             Mode::Menu => {
-                for index in 0..self.items.len() {
-                    let action = self.items[index];
-                    let y = theme::PADDING + index as u32 * row_h;
-                    if index == self.selected {
-                        self.surface.fill(
-                            Rect::new(
-                                theme::BORDER as i32,
-                                y as i32,
-                                bounds.w.saturating_sub(theme::BORDER * 2),
-                                row_h,
-                            ),
-                            theme::SELECT_BG,
-                        );
-                    }
-                    // Удаление — единственный пункт, после которого нечего
-                    // вернуть, и красным оно названо ровно поэтому.
-                    let color = if action == Action::Delete {
-                        theme::CLOSE
-                    } else {
-                        theme::TEXT
-                    };
-                    text::draw_text(
-                        &mut self.surface,
-                        GLYPH_W * scale,
-                        y + scale,
-                        action.title(),
-                        scale,
-                        color,
-                        None,
+                let selected = self.selected;
+                let s = &mut self.surface;
+                for y in &layout.lines {
+                    paint::separator(
+                        inner,
+                        s,
+                        card.x + ctx.px(CARD_PAD + ROW_PAD) as i32,
+                        *y,
+                        card.w.saturating_sub(ctx.px((CARD_PAD + ROW_PAD) * 2)),
                     );
+                }
+                for (index, slot) in layout.rows.iter().enumerate() {
+                    draw_row(inner, s, slot, index == selected);
                 }
             }
             Mode::Rename { text, .. } => {
-                let room = self.room();
-                text::draw_text(
-                    &mut self.surface,
-                    GLYPH_W * scale,
-                    theme::PADDING + scale,
-                    "New name:",
-                    scale,
-                    theme::DIM,
-                    None,
-                );
-                // Показывается **хвост** строки: набирают в конце, и уехавший
-                // за край курсор выглядел бы как переставший отвечать ввод.
-                let shown = tail(text, room.saturating_sub(1));
-                let line = alloc::format!("{shown}_");
-                text::draw_text(
-                    &mut self.surface,
-                    GLYPH_W * scale,
-                    theme::PADDING + row_h + scale,
-                    &line,
-                    scale,
-                    theme::TEXT,
-                    None,
-                );
-                // Подсказка — у нижнего края, а не сразу под строкой ввода:
-                // высота меню задана числом пунктов, и подсказка посередине
-                // оставляла бы под собой пустую половину коробки.
-                text::draw_text(
-                    &mut self.surface,
-                    GLYPH_W * scale,
-                    self.rect.h.saturating_sub(row_h) + scale,
-                    "Enter rename   Esc cancel   Ctrl+U clear",
-                    scale.saturating_sub(1).max(1),
-                    theme::DIM,
-                    None,
-                );
+                let s = &mut self.surface;
+                draw_rename(inner, s, card, text);
             }
             Mode::Confirm { name } => {
-                let room = self.room();
-                text::draw_text(
-                    &mut self.surface,
-                    GLYPH_W * scale,
-                    theme::PADDING + scale,
-                    "Delete for good?",
-                    scale,
-                    theme::CLOSE,
-                    None,
-                );
-                text::draw_text(
-                    &mut self.surface,
-                    GLYPH_W * scale,
-                    theme::PADDING + row_h + scale,
-                    &clip(name, room),
-                    scale,
-                    theme::TEXT,
-                    None,
-                );
-                text::draw_text(
-                    &mut self.surface,
-                    GLYPH_W * scale,
-                    self.rect.h.saturating_sub(row_h) + scale,
-                    "Y delete   N keep it",
-                    scale.saturating_sub(1).max(1),
-                    theme::DIM,
-                    None,
-                );
+                let s = &mut self.surface;
+                draw_confirm(inner, s, card, name);
             }
         }
 
         if let Some(note) = &self.note {
-            let y = self.rect.h.saturating_sub(row_h);
-            let room = self.room();
-            let text = clip(note, room);
-            text::draw_text(
-                &mut self.surface,
-                GLYPH_W * scale,
-                y + scale,
-                &text,
-                scale.saturating_sub(1).max(1),
-                theme::DIRECTORY,
-                None,
+            let s = &mut self.surface;
+            paint::text_clipped(
+                inner,
+                s,
+                Role::Caption,
+                layout.note.x,
+                layout.note.y,
+                layout.note.w,
+                note,
+                p.ink4,
             );
         }
 
         self.damage = bounds;
-    }
-
-    /// Сколько знаков помещается в строку меню.
-    fn room(&self) -> usize {
-        let cell = GLYPH_W * self.scale;
-        ((self.surface.width().saturating_sub(cell * 2)) / cell) as usize
     }
 
     #[must_use]
@@ -505,29 +588,229 @@ impl ContextMenu {
 /// негде показать, — это ввод вслепую.
 const NAME_LIMIT: usize = 64;
 
-fn row_height(scale: u32) -> u32 {
-    GLYPH_H * scale + theme::PADDING * 2
+/// Одна строка меню и место, которое она занимает.
+struct Slot {
+    action: Action,
+    rect: Rect,
 }
 
-/// Обрезать строку по числу знаков, пометив обрезку.
-fn clip(text: &str, room: usize) -> String {
-    if room == 0 {
-        return String::new();
+/// Где что лежит в карточке.
+struct Plan {
+    rows: Vec<Slot>,
+    /// Высоты, на которых идут черты между группами.
+    lines: Vec<i32>,
+    /// Место под ответ действия внизу карточки.
+    note: Rect,
+}
+
+/// Разложить пункты по карточке.
+///
+/// Одна функция на отрисовку и на поиск пункта под указателем — см. заголовок
+/// модуля.
+fn plan(ctx: Ctx, card: Rect, items: &[Action]) -> Plan {
+    let pad = ctx.px(CARD_PAD);
+    let row_h = ctx.px(ROW_H);
+    let gap = ctx.px(ROW_GAP);
+    let sep = ctx.px(SEP_PAD * 2) + 1;
+    let mut y = card.y + pad as i32;
+    let mut rows = Vec::new();
+    let mut lines = Vec::new();
+    let mut previous: Option<Action> = None;
+
+    for action in items {
+        if previous.is_some_and(|before| before.group() != action.group()) {
+            lines.push(y + ctx.px(SEP_PAD) as i32);
+            y += sep as i32;
+        }
+        rows.push(Slot {
+            action: *action,
+            rect: Rect::new(
+                card.x + pad as i32,
+                y,
+                card.w.saturating_sub(pad * 2),
+                row_h,
+            ),
+        });
+        y += (row_h + gap) as i32;
+        previous = Some(*action);
     }
-    if text.chars().count() <= room {
-        return text.to_string();
+
+    let note_pad = ctx.px(CARD_PAD + ROW_PAD);
+    let note = Rect::new(
+        card.x + note_pad as i32,
+        y + ctx.px(4) as i32,
+        card.w.saturating_sub(note_pad * 2),
+        u32::from(ctx.face(Role::Caption).line),
+    );
+    Plan { rows, lines, note }
+}
+
+/// Высота поверхности, нужная меню с такими пунктами.
+///
+/// Считается по той же раскладке, что и рисуется: разойдись формулы — и
+/// последний пункт оказался бы за нижним краем поверхности, то есть невидимым и
+/// недостижимым мышью.
+fn height_for(ctx: Ctx, items: &[Action]) -> u32 {
+    let card = Rect::new(0, 0, 0, 0);
+    let layout = plan(ctx, card, items);
+    let bottom = layout.note.bottom() + ctx.px(CARD_PAD) as i32;
+    bottom.max(0) as u32
+}
+
+/// Высота карточки, занятой набором имени.
+///
+/// Считается отдельно, а не берётся от списка пунктов: поверхность заведена
+/// под самый длинный список раз и навсегда, и если карточку рисовать во всю её
+/// высоту, под подсказкой остаётся пустая треть. Пустота внизу читается как
+/// «здесь что-то не нарисовалось».
+fn rename_height(ctx: Ctx) -> u32 {
+    let caps = u32::from(ctx.face(Role::MonoCaps).line);
+    let hint = u32::from(ctx.face(Role::Caption).line);
+    // Слагаемые те же и в том же порядке, что в [`draw_rename`], — иначе
+    // подпись однажды уедет под нижний край, и заметит это только глаз.
+    ctx.px(CARD_PAD + 6) + caps + ctx.px(10) + ctx.px(FIELD_H) + ctx.px(10) + hint
+        + ctx.px(CARD_PAD + 6)
+}
+
+/// Высота карточки с вопросом об удалении.
+fn confirm_height(ctx: Ctx) -> u32 {
+    let chip = ctx.px(22);
+    let body = u32::from(ctx.face(Role::Body).line);
+    let hint = u32::from(ctx.face(Role::Caption).line);
+    ctx.px(CARD_PAD + 4) + chip + ctx.px(10) + body + ctx.px(10) + hint + ctx.px(CARD_PAD + 4)
+}
+
+/// Нарисовать строку меню.
+fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, selected: bool) {
+    let p = ctx.palette;
+    // Удаление — единственный пункт, после которого нечего вернуть, и красным
+    // оно названо ровно поэтому.
+    let danger = slot.action == Action::Delete;
+    let r = ctx.px(theme::R_CHIP);
+    if selected {
+        if danger {
+            draw::rounded(s, slot.rect, r, ctx.flat(p.badbg), 255);
+            draw::rounded_stroke(s, slot.rect, r, p.badline, 255);
+        } else {
+            paint::row(ctx, s, slot.rect, RowState::Selected);
+        }
     }
-    text.chars().take(room.saturating_sub(1)).collect::<String>() + "~"
+    let ink = if danger {
+        p.bad_ink
+    } else if selected {
+        paint::row_ink(ctx, RowState::Selected)
+    } else {
+        p.ink2
+    };
+
+    let pad = ctx.px(ROW_PAD);
+    let icon = ctx.px(ICON);
+    if let Some(glyph) = slot.action.icon() {
+        glyphicon::draw(
+            s,
+            glyph,
+            slot.rect.x + pad as i32,
+            slot.rect.y + (slot.rect.h as i32 - icon as i32) / 2,
+            icon,
+            ink,
+            255,
+        );
+    }
+    // Отступ подписи один и тот же со значком и без него: строка без картинки,
+    // подтянутая к краю, ломает колонку подписей.
+    let x = slot.rect.x + (pad + icon + ctx.px(ICON_GAP)) as i32;
+    paint::text_clipped(
+        ctx,
+        s,
+        Role::Body,
+        x,
+        paint::baseline(ctx, Role::Body, slot.rect),
+        (slot.rect.right() - pad as i32 - x).max(0) as u32,
+        slot.action.title(),
+        ink,
+    );
+}
+
+/// Поле ввода нового имени.
+fn draw_rename(ctx: Ctx, s: &mut Surface, card: Rect, text: &str) {
+    let p = ctx.palette;
+    let pad = ctx.px(CARD_PAD + ROW_PAD);
+    let left = card.x + pad as i32;
+    let width = card.w.saturating_sub(pad * 2);
+    let mut y = card.y + ctx.px(CARD_PAD + 6) as i32;
+
+    paint::caps(ctx, s, left, y, "НОВОЕ ИМЯ");
+    y += (u32::from(ctx.face(Role::MonoCaps).line) + ctx.px(10)) as i32;
+
+    let field = Rect::new(left, y, width, ctx.px(FIELD_H));
+    let r = ctx.px(theme::R_CHIP);
+    paint::sunk(ctx, s, field, r);
+    // Кольцо снаружи и обводка по краю: поле, в которое сейчас набирают, обязано
+    // отличаться от поля, которое просто нарисовано, — иначе непонятно, куда
+    // уходят нажатия.
+    draw::rounded_stroke(s, field, r, p.acc, 255);
+    let ring = Rect::new(
+        field.x - ctx.px(2) as i32,
+        field.y - ctx.px(2) as i32,
+        field.w + ctx.px(4),
+        field.h + ctx.px(4),
+    );
+    draw::rounded_stroke(s, ring, r + ctx.px(2), p.acctint.color, p.acctint.alpha);
+
+    // Показывается **хвост** строки: набирают в конце, и уехавший за край
+    // курсор выглядел бы как переставший отвечать ввод.
+    let inner = ctx.px(10);
+    let room = field.w.saturating_sub(inner * 2 + ctx.px(4));
+    let shown = tail(ctx.face(Role::Mono), text, room);
+    let baseline = paint::baseline(ctx, Role::Mono, field);
+    let used = paint::text(ctx, s, Role::Mono, field.x + inner as i32, baseline, &shown, p.ink2);
+    let caret = Rect::new(
+        field.x + (inner + used) as i32 + ctx.px(1) as i32,
+        field.y + (field.h as i32 - ctx.px(15) as i32) / 2,
+        ctx.px(1),
+        ctx.px(15),
+    );
+    s.fill(caret, p.acc);
+
+    y += (field.h + ctx.px(10)) as i32;
+    paint::text_clipped(ctx, s, Role::Caption, left, y, width, RENAME_HINT, p.ink5);
+}
+
+/// Вопрос об удалении.
+fn draw_confirm(ctx: Ctx, s: &mut Surface, card: Rect, name: &str) {
+    let p = ctx.palette;
+    let pad = ctx.px(CARD_PAD + ROW_PAD);
+    let left = card.x + pad as i32;
+    let width = card.w.saturating_sub(pad * 2);
+    let mut y = card.y + ctx.px(CARD_PAD + 4) as i32;
+
+    let chip = Rect::new(left, y, paint::chip_width(ctx, "УДАЛИТЬ НАВСЕГДА"), ctx.px(22));
+    paint::chip(ctx, s, chip, "УДАЛИТЬ НАВСЕГДА", Tone::Bad);
+    y += (chip.h + ctx.px(10)) as i32;
+
+    paint::text_clipped(ctx, s, Role::Body, left, y, width, name, p.ink2);
+    y += (u32::from(ctx.face(Role::Body).line) + ctx.px(10)) as i32;
+
+    paint::text_clipped(ctx, s, Role::Caption, left, y, width, CONFIRM_HINT, p.bad_ink);
 }
 
 /// Оставить хвост строки — то, что набирают прямо сейчас.
-fn tail(text: &str, room: usize) -> String {
-    let count = text.chars().count();
-    if count <= room || room == 0 {
+fn tail(face: &Face, text: &str, room: u32) -> String {
+    if face.width(text) <= room {
         return text.to_string();
     }
-    let skip = count - room.saturating_sub(1);
-    alloc::format!("~{}", text.chars().skip(skip).collect::<String>())
+    let mark = face.width("…");
+    let room = room.saturating_sub(mark);
+    let count = text.chars().count();
+    for skip in 1..=count {
+        let candidate: String = text.chars().skip(skip).collect();
+        if face.width(&candidate) <= room {
+            let mut out = String::from("…");
+            out.push_str(&candidate);
+            return out;
+        }
+    }
+    String::from("…")
 }
 
 /// Каталог стола — там появляется всё, что создаётся его меню.
@@ -682,4 +965,3 @@ fn ensure_dir(path: &str) -> Result<(), String> {
     }
     Ok(())
 }
-

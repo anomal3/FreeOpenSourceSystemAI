@@ -875,6 +875,31 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("desktop     : restored 'Terminal'", 15_000),
             Step::Wait(1_000),
+            // Смена темы. Проверяется отсюда, а не из окна параметров, по двум
+            // причинам: пункт меню стола стоит на известном месте, а перекраска
+            // из него задевает **всё** — обои, значки, панель, оба открытых
+            // окна, — то есть ровно то, что ломается, если перекрасить не всех.
+            //
+            // Пункт третий сверху, и над ним одна разделительная черта: пункты
+            // «создать» отделены от «тема / настройки / обновить».
+            Step::Aim(Aim::EmptyRight),
+            Step::RightClick,
+            Step::Await("desktop     : context menu at", 15_000),
+            Step::Aim(Aim::ContextItem(2, 1)),
+            Step::Click,
+            Step::Await("desktop     : theme light", 15_000),
+            Step::Wait(2_000),
+            Step::Shot("12-light"),
+            // И обратно: тёмная тема обязана вернуться такой же, какой была, а
+            // не «почти такой». Снимок до и снимок после сравнивает человек.
+            Step::Aim(Aim::EmptyRight),
+            Step::RightClick,
+            Step::Await("desktop     : context menu at", 15_000),
+            Step::Aim(Aim::ContextItem(2, 1)),
+            Step::Click,
+            Step::Await("desktop     : theme dark", 15_000),
+            Step::Wait(2_000),
+            Step::Shot("13-dark-again"),
             Step::Shot("07-restored"),
             // «Параметры»: значок третий сверху. Терминал при этом сворачивается
             // — значки лежат на столе, то есть под окнами, и щелчок по значку
@@ -888,9 +913,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : opened 'Settings'", 15_000),
             Step::Wait(2_000),
             Step::Shot("08-settings"),
-            // Раздел «Display» — второй в левой колонке; выбирается клавишей,
-            // потому что попадание мышью в строку списка зависит от масштаба.
-            Step::Key("down"),
+            // «Экран» — первый раздел в левой колонке, и Enter переводит
+            // разбор клавиш из списка разделов в сами настройки. Снимок после
+            // этого показывает то, ради чего раздел и открывают: список
+            // режимов и два образца темы.
             Step::Key("ret"),
             Step::Wait(1_500),
             Step::Shot("09-settings-display"),
@@ -911,7 +937,7 @@ pub const ALL: &[Scenario] = &[
             // каталогов не заводят. Меню обязано сказать это словами, а не
             // «operation not supported»; создание же проверяется на
             // установленной системе, где корень ext2 (сценарий `installed`).
-            Step::Aim(Aim::ContextItem(0)),
+            Step::Aim(Aim::ContextItem(0, 0)),
             Step::Click,
             Step::Await("cannot create: the live system cannot store files", 15_000),
             Step::Wait(1_500),
@@ -2175,7 +2201,7 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Empty),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(0)),
+            Step::Aim(Aim::ContextItem(0, 0)),
             Step::Click,
             Step::Await("desktop     : created 'New folder' in /home/roman/Desktop", 15_000),
             // Созданное обязано появиться **на столе**, а не только на диске:
@@ -2198,7 +2224,7 @@ pub const ALL: &[Scenario] = &[
             // «Переименовать» — второй пункт. Строка приходит заполненной
             // прежним именем; Ctrl+U стирает её целиком, дальше набирается
             // новое имя на настоящей клавиатуре.
-            Step::Aim(Aim::ContextItem(1)),
+            Step::Aim(Aim::ContextItem(1, 0)),
             Step::Click,
             Step::Wait(1_500),
             Step::Shot("03-rename"),
@@ -2226,7 +2252,7 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Icon(4)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(2)),
+            Step::Aim(Aim::ContextItem(2, 0)),
             Step::Click,
             Step::Wait(1_500),
             Step::Shot("04-delete-confirm"),
@@ -2562,9 +2588,19 @@ pub const ALL: &[Scenario] = &[
             // первому `mem` корень уже смонтирован и с него прочитаны и
             // `/etc/passwd`, и образ оболочки, то есть окно своё уже взяло.
             //
-            // Если эта сверка всё же окажется дрожащей, лечится она так же, как
-            // в `mmap`: прогонять `/bin/filemap` на маленьком файле **до**
-            // первого `mem`, а не убирать проверку.
+            // Дрожащей она оказалась, и не из-за окна DMA. Сеть в этом
+            // прогоне выключена, `sshd` не может занять порт и падает, а
+            // надзиратель перезапускает его трижды с паузами. Первый `mem`
+            // попадал в случайную точку этой пляски: иногда адресное
+            // пространство `sshd` — семьсот восемьдесят девять кадров — уже
+            // числилось за ним, иногда ещё нет. Второй `mem` брался через пять
+            // минут, когда `sshd` давно сдался, и числа расходились ровно на
+            // эти семьсот восемьдесят девять.
+            //
+            // Поэтому счёт начинается там, где система перестала шевелиться
+            // сама по себе. Строка приходит после третьего отказа, то есть
+            // через несколько секунд после приглашения.
+            Step::Await("init: 'sshd' failed 3 time(s) in a row, giving up", 60_000),
             Step::Line("mem"),
             Step::Capture("  frames   ", 15_000),
 
@@ -3077,8 +3113,9 @@ pub const ALL: &[Scenario] = &[
             Step::Repeat("down", 2),
             Step::Key("ret"),
             Step::Await("desktop     : opened 'Settings'", 15_000),
-            // Третий раздел слева — «Programs»; вправо-вниз по пунктам справа.
-            Step::Repeat("down", 2),
+            // «Пакеты» — второй раздел слева; Enter переводит разбор клавиш
+            // из списка разделов в пункты справа.
+            Step::Key("down"),
             Step::Key("ret"),
             Step::Wait(1_500),
             Step::Shot("01-programs"),

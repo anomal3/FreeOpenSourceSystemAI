@@ -16,6 +16,7 @@
 use alloc::vec::Vec;
 
 use crate::font;
+use crate::typeface::{self, Face};
 use crate::{Color, Rect, Surface};
 
 /// Размер глифа в таблице шрифта.
@@ -303,7 +304,13 @@ pub struct TextGrid {
     origin: (u32, u32),
     cols: u32,
     rows: u32,
-    scale: u32,
+    /// Начертание ячейки. Моноширинное — иначе колонки не сойдутся.
+    face: &'static Face,
+    /// Размер ячейки: ширина знака и высота строки этого начертания.
+    ///
+    /// Хранится, а не пересчитывается: она нужна на каждую ячейку, а достать её
+    /// из начертания — это поиск глифа нуля в таблице.
+    cell: (u32, u32),
     /// Что сейчас в каждой ячейке. Нужно для прокрутки и для восстановления
     /// того, что было под курсором.
     ///
@@ -341,10 +348,8 @@ impl TextGrid {
     /// Возвращает `None`, если в область не помещается ни одна ячейка или не
     /// хватило памяти под теневой буфер.
     #[must_use]
-    pub fn new(area: Rect, scale: u32, fg: Color, bg: Color) -> Option<Self> {
-        let scale = scale.max(1);
-        let cell_w = GLYPH_W * scale;
-        let cell_h = GLYPH_H * scale;
+    pub fn new(area: Rect, face: &'static Face, fg: Color, bg: Color) -> Option<Self> {
+        let (cell_w, cell_h) = typeface::cell(face);
         let cols = area.w / cell_w;
         let rows = area.h / cell_h;
         if cols == 0 || rows == 0 || area.x < 0 || area.y < 0 {
@@ -363,7 +368,8 @@ impl TextGrid {
             origin: (area.x as u32, area.y as u32),
             cols,
             rows,
-            scale,
+            face,
+            cell: (cell_w, cell_h),
             cells,
             attrs,
             attr: ATTR_DEFAULT,
@@ -393,9 +399,30 @@ impl TextGrid {
         Rect {
             x: self.origin.0 as i32,
             y: self.origin.1 as i32,
-            w: self.cols * GLYPH_W * self.scale,
-            h: self.rows * GLYPH_H * self.scale,
+            w: self.cols * self.cell.0,
+            h: self.rows * self.cell.1,
         }
+    }
+
+    /// Перекрасить сетку и нарисовать её заново из теневого буфера.
+    ///
+    /// Нужно смене темы: цвета окна меняются, а напечатанное — нет, и стирать
+    /// вывод оболочки ради новой палитры значило бы наказывать за смену темы.
+    /// Перерисовка идёт из теневого буфера, который сетка и так ведёт ради
+    /// прокрутки, — второго хранилища для этого не потребовалось.
+    pub fn recolor(&mut self, surface: &mut Surface, fg: Color, bg: Color) {
+        self.fg = fg;
+        self.bg = bg;
+        let area = self.area();
+        surface.fill(area, bg);
+        self.cursor_drawn = false;
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                let byte = self.cells[(row * self.cols + col) as usize];
+                self.draw_cell(surface, col, row, byte);
+            }
+        }
+        self.mark(area);
     }
 
     /// Забрать накопленную область изменений и начать копить заново.
@@ -409,10 +436,10 @@ impl TextGrid {
 
     fn cell_rect(&self, col: u32, row: u32) -> Rect {
         Rect::new(
-            (self.origin.0 + col * GLYPH_W * self.scale) as i32,
-            (self.origin.1 + row * GLYPH_H * self.scale) as i32,
-            GLYPH_W * self.scale,
-            GLYPH_H * self.scale,
+            (self.origin.0 + col * self.cell.0) as i32,
+            (self.origin.1 + row * self.cell.1) as i32,
+            self.cell.0,
+            self.cell.1,
         )
     }
 
@@ -428,8 +455,7 @@ impl TextGrid {
     /// ячейка или не хватило памяти: сетка при этом остаётся прежней, и
     /// вызывающий вправе отказаться от изменения размера.
     pub fn rebind(&mut self, surface: &mut Surface, area: Rect) -> bool {
-        let cell_w = GLYPH_W * self.scale;
-        let cell_h = GLYPH_H * self.scale;
+        let (cell_w, cell_h) = self.cell;
         let cols = area.w / cell_w;
         let rows = area.h / cell_h;
         if cols == 0 || rows == 0 || area.x < 0 || area.y < 0 {
@@ -639,7 +665,10 @@ impl TextGrid {
             return;
         }
         let cell = self.cell_rect(self.col, self.row);
-        let line = Rect::new(cell.x, cell.bottom() - self.scale as i32, cell.w, self.scale);
+        // Толщина подчёркивания растёт вместе с кеглем: на строке в 25 точек
+        // черта в одну точку теряется, на строке в 17 черта в две — жирна.
+        let thick = (self.cell.1 / 12).max(1);
+        let line = Rect::new(cell.x, cell.bottom() - thick as i32, cell.w, thick);
         surface.fill(line, self.fg);
         self.mark(line);
         self.cursor_drawn = true;
@@ -663,15 +692,12 @@ impl TextGrid {
     fn draw_cell(&mut self, surface: &mut Surface, col: u32, row: u32, byte: u8) {
         let cell = self.cell_rect(col, row);
         let (fg, bg) = self.colors(self.attrs[(row * self.cols + col) as usize]);
-        draw_glyph(
-            surface,
-            cell.x as u32,
-            cell.y as u32,
-            char::from(byte),
-            self.scale,
-            fg,
-            Some(bg),
-        );
+        // Фон заливается всегда, а не только под непробельным знаком: ячейка
+        // рисуется поверх прежней, и остаток старого глифа иначе просвечивал бы
+        // сквозь новый — сглаженный знак не закрывает собой всю ячейку.
+        surface.fill(cell, bg);
+        let mut buffer = [0u8; 4];
+        typeface::draw(surface, self.face, cell.x, cell.y, char_str(byte, &mut buffer), fg, 255);
         self.mark(cell);
     }
 
@@ -703,7 +729,7 @@ impl TextGrid {
         // внутри обычной памяти на порядок дешевле, чем нарисовать заново
         // несколько тысяч ячеек.
         let area = self.area();
-        surface.scroll_up(area, GLYPH_H * self.scale, self.bg);
+        surface.scroll_up(area, self.cell.1, self.bg);
         self.mark(area);
 
         self.col = 0;
@@ -775,4 +801,14 @@ impl TextGrid {
         self.put_cell(surface, self.col, self.row, byte);
         self.col += 1;
     }
+}
+
+/// Байт ячейки как строка из одного знака.
+///
+/// Сетка хранит байты — терминал работает с потоком ASCII, — а рисующий текст
+/// принимает строку. Буфер даёт вызывающий: возвращать `&str` на собственный
+/// временный массив функция не может, а заводить `String` на каждую ячейку
+/// значило бы выделение памяти на каждый напечатанный знак.
+fn char_str(byte: u8, buffer: &mut [u8; 4]) -> &str {
+    char::from(byte).encode_utf8(buffer)
 }

@@ -54,16 +54,28 @@ pub enum Aim {
     Empty,
     /// Пустое место ниже [`Aim::Empty`]: туда не попадает меню, открытое в нём.
     EmptyBelow,
-    /// Пункт меню стола по номеру сверху; меню открывается в [`Aim::Empty`].
-    ContextItem(usize),
+    /// Пустое место правее любого окна из раскладки по умолчанию.
+    ///
+    /// Нужно там, где окна открыты: [`Aim::Empty`] стоит в середине экрана, а
+    /// середину занимает первое же окно, и правый щелчок достаётся ему, а не
+    /// столу.
+    EmptyRight,
+    /// Пункт меню стола: номер сверху и сколько разделительных черт лежит
+    /// **над** ним.
+    ///
+    /// Число черт задаётся здесь, а не считается: группы пунктов живут в
+    /// `Action::group` на стороне гостя, и стенд о них не знает. Ошибка в этом
+    /// числе видна сразу — щелчок попадает в соседний пункт, и прогон валится
+    /// на строке, которой не дождался.
+    ContextItem(usize, i32),
     /// Середина окна.
     Middle(&'static str),
 }
 
-/// Строка `desktop     : 1280x800, glyph scale 2, panel 24 px`.
+/// Строка `desktop     : 1280x800, ui scale 1, panel 80 px`.
 fn desktop_line(log: &str) -> Result<&str> {
     log.lines()
-        .find(|line| line.contains("desktop     : ") && line.contains("glyph scale"))
+        .find(|line| line.contains("desktop     : ") && line.contains("ui scale"))
         .context("в журнале нет строки с размером экрана")
 }
 
@@ -99,14 +111,54 @@ fn field(log: &str, label: &str) -> Result<i32> {
         .with_context(|| format!("за '{label}' не оказалось числа"))
 }
 
-/// Масштаб глифа, выбранный столом.
+/// Высота полосы заголовка окна. `theme::TITLE_H`.
+const TITLE_H: i32 = 44;
+/// Сторона кнопки заголовка. `theme::TITLE_BTN`.
+const TITLE_BTN: i32 = 30;
+/// Зазор между кнопками заголовка. `theme::TITLE_GAP`.
+const TITLE_GAP: i32 = 6;
+/// Отступ ряда кнопок от правого края окна.
+const TITLE_MARGIN: i32 = 10;
+
+/// Высота панели задач. `theme::PANEL_H`.
+const PANEL_H: i32 = 52;
+/// Отступ панели задач от краёв экрана. `theme::PANEL_INSET`.
+const PANEL_INSET: i32 = 14;
+
+/// Сетка значков стола. Всё — из `theme.rs`.
+const ICON_CELL_W: i32 = 110;
+const ICON_CELL_H: i32 = 100;
+const ICON_GAP: i32 = 12;
+const ICON_MARGIN: i32 = 28;
+const ICON_TILE: i32 = 46;
+
+/// Строка меню стола и поле вокруг списка.
+const CONTEXT_ROW_H: i32 = 32;
+const CONTEXT_ROW_GAP: i32 = 1;
+const CONTEXT_PAD: i32 = 8;
+/// Поле разделительной черты сверху и снизу.
+const CONTEXT_SEP_PAD: i32 = 5;
+
+/// Середина кнопки заголовка, считая справа налево.
+fn title_button(log: &str, title: &str, from_right: i32) -> Result<(i32, i32)> {
+    let rect = window(log, title)?;
+    let scale = ui_scale(log)?;
+    let step = (TITLE_BTN + TITLE_GAP) * scale;
+    let right = rect.x + rect.w - TITLE_MARGIN * scale;
+    Ok((
+        right - from_right * step - TITLE_BTN * scale / 2,
+        rect.y + TITLE_H * scale / 2,
+    ))
+}
+
+/// Множитель геометрии стола.
 ///
-/// Читается из журнала, а не берётся двойкой: на `virt` с `ramfb` экран 800×600
-/// и масштаб **единица**, то есть все размеры сетки значков и строк меню вдвое
-/// меньше. Прицел, посчитанный с двойкой, попадал бы там мимо ячейки — и это
-/// выглядело бы как «щёлкнули по обоям», а не как ошибка стенда.
-fn glyph_scale(log: &str) -> Result<i32> {
-    field(log, "glyph scale")
+/// Печатается той же строкой, что и раньше печатался масштаб глифа: шрифт
+/// масштабировать перестали — под каждый размерный ряд он растеризован
+/// отдельно, — а геометрию по-прежнему надо, и число в строке теперь означает
+/// именно её.
+fn ui_scale(log: &str) -> Result<i32> {
+    field(log, "ui scale")
 }
 
 /// Высота панели задач в точках.
@@ -179,50 +231,47 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
     let (width, height) = screen(log)?;
     let point = match aim {
         Aim::Corner => (0, 0),
-        // Не в самый угол: панель начинается от нуля, но щелчок ровно в
-        // последнюю точку экрана слишком похож на промах, чтобы им что-то
-        // проверять.
-        Aim::MenuButton => (4, height - 4),
+        // Панель задач больше не приклеена к краю: она плавает с отступом
+        // `PANEL_INSET` от каждого края, и щелчок в самый угол попадает теперь
+        // в обои. Прицел — середина кнопки «FreeOS»: она стоит первой, отступ
+        // от края плашки 12, высота 34.
+        Aim::MenuButton => (
+            PANEL_INSET + 12 + 40,
+            height - PANEL_INSET - PANEL_H / 2,
+        ),
         Aim::Title(title) => {
             let rect = window(log, title)?;
-            (rect.x + rect.w / 3, rect.y + 6)
+            (rect.x + rect.w / 3, rect.y + TITLE_H * ui_scale(log)? / 2)
         }
-        Aim::Close(title) => {
-            let rect = window(log, title)?;
-            (rect.x + rect.w - 8, rect.y + 8)
-        }
-        // Кнопки одинаковые и квадратные со стороной в высоту полосы
-        // заголовка; она равна высоте глифа на масштаб плюс отступы, и на всех
-        // экранах, где живёт стол, это 24 точки. Считать её из журнала было бы
-        // честнее, но стол её не печатает, а промах в кнопку соседа виден сразу
-        // — по строке, которую гость напечатает в ответ.
-        Aim::Minimize(title) => {
-            let rect = window(log, title)?;
-            (rect.x + rect.w - 8 - 48, rect.y + 8)
-        }
-        Aim::Maximize(title) => {
-            let rect = window(log, title)?;
-            (rect.x + rect.w - 8 - 24, rect.y + 8)
-        }
+        // Кнопки заголовка стоят справа налево с отступом 10 от края: сторона
+        // 30, зазор 6, то есть шаг 36. Числа те же, что в `theme.rs`, и
+        // разойтись им нельзя — прицел, посчитанный по старой геометрии, молча
+        // попадает в кнопку соседа, а это «свернул вместо закрыл».
+        Aim::Close(title) => title_button(log, title, 0)?,
+        Aim::Maximize(title) => title_button(log, title, 1)?,
+        Aim::Minimize(title) => title_button(log, title, 2)?,
         Aim::Grip(title) => {
             let rect = window(log, title)?;
-            (rect.x + rect.w - 6, rect.y + rect.h - 6)
+            (rect.x + rect.w - 8, rect.y + rect.h - 8)
         }
         // Пустое место: середина экрана по ширине и треть по высоте — там нет
         // ни значков (они слева), ни панели (она внизу). Окна к этому моменту
         // сценарий обязан убрать сам.
         Aim::Empty => (width / 2, height / 3),
         Aim::EmptyBelow => (width / 2, height * 3 / 4),
+        Aim::EmptyRight => (width * 7 / 8, height / 4),
         // Меню стола стоит там, где сказал сам гость: у края экрана оно
         // сдвигается, чтобы не выехать, и прицел по точке щелчка попадал бы
         // мимо. Строка — высота глифа на масштаб меню плюс отступы по четыре
         // точки; масштаб меню ограничен двойкой самим столом.
-        Aim::ContextItem(index) => {
+        Aim::ContextItem(index, breaks) => {
             let rect = context_menu(log)?;
-            let row = 8 * glyph_scale(log)?.min(2) + 8;
+            let scale = ui_scale(log)?;
+            let row = (CONTEXT_ROW_H + CONTEXT_ROW_GAP) * scale;
+            let gap = (CONTEXT_SEP_PAD * 2 + 1) * scale;
             (
                 rect.x + rect.w / 4,
-                rect.y + 4 + index as i32 * row + row / 2,
+                rect.y + CONTEXT_PAD * scale + index as i32 * row + row / 2 + breaks * gap,
             )
         }
         // Значки лежат столбцами слева: отступ 12 точек на масштаб, ячейка
@@ -230,17 +279,20 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         // как его считает сам стол, и по той же формуле: разойдись они, прицел
         // молча уехал бы в соседнюю ячейку.
         Aim::Icon(index) => {
-            let scale = glyph_scale(log)?;
-            let cell_w = 112 * scale;
-            let cell_h = 64 * scale;
-            let margin = 12 * scale;
+            let scale = ui_scale(log)?;
+            let step_x = (ICON_CELL_W + ICON_GAP) * scale;
+            let step_y = (ICON_CELL_H + ICON_GAP) * scale;
+            let margin = ICON_MARGIN * scale;
             let work_bottom = height - panel_height(log)?;
-            let rows = ((work_bottom - margin) / cell_h).max(1);
+            let rows = ((work_bottom - margin) / step_y).max(1);
             let column = index as i32 / rows;
             let row = index as i32 % rows;
+            // Прицел — середина плитки, а не ячейки: подпись под плиткой
+            // занимает нижнюю треть ячейки, и щелчок по ней тоже попадает в
+            // значок, но по середине плитки промахнуться нечем.
             (
-                margin + column * cell_w + cell_w / 2,
-                margin + row * cell_h + cell_h / 2,
+                margin + column * step_x + ICON_CELL_W * scale / 2,
+                margin + row * step_y + (10 + ICON_TILE / 2) * scale,
             )
         }
         Aim::Middle(title) => {

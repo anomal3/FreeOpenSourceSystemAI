@@ -11,9 +11,18 @@
 //! # Почему он рисует себя сам, а не печатает строки в сетку символов
 //!
 //! Потому что выделенная строка — это заливка прямоугольника, а сетка символов
-//! ([`mini_ui::text::TextGrid`]) знает ровно два цвета на всё окно. Список,
-//! в котором выбранный элемент помечен стрелкой вместо подсветки, читается как
-//! вывод команды, а не как список, по которому ходят.
+//! знает ровно два цвета на всё окно. Список, в котором выбранный элемент
+//! помечен стрелкой вместо подсветки, читается как вывод команды, а не как
+//! список, по которому ходят.
+//!
+//! # Почему раскладка считается одной функцией
+//!
+//! Потому что нарисованное и нажимаемое обязаны совпадать. Пока кнопка «назад»
+//! рисовалась одной формулой, а искалась под указателем другой, они сходились
+//! ровно до первой правки отступа — и расхождение выглядело не как ошибка
+//! раскладки, а как «мышь не работает». Теперь [`layout`] отвечает на вопрос
+//! «где что лежит» один раз, а [`FilesView::draw`] и [`FilesView::click`]
+//! спрашивают её.
 //!
 //! # Что он доказывает
 //!
@@ -25,9 +34,12 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use mini_ui::text::{self, GLYPH_H, GLYPH_W};
+use mini_ui::draw;
+use mini_ui::glyphicon::{self, Icon};
+use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface};
 
+use super::paint::{self, Ctx, RowState, Tone};
 use super::theme;
 use crate::fs;
 use crate::input::KeyCode;
@@ -42,14 +54,47 @@ const PREVIEW_LIMIT: usize = 8 * 1024;
 /// Сколько строк файла показывается.
 const PREVIEW_LINES: usize = 256;
 
+/// С какой ширины окна появляется боковая колонка.
+///
+/// Колонка в 240 точек съедает у списка треть окна шириной 700; ниже этого
+/// порога быстрый доступ мешает тому, ради чего окно открыли.
+const SIDE_FROM: u32 = 700;
+
 /// Одна строка списка.
 struct Row {
     name: String,
     directory: bool,
+    /// Лежит ли запись там, где живут программы.
+    ///
+    /// Признак строки, а не вопрос к пути на каждой отрисовке: путь у всех
+    /// строк списка один, и спрашивать его двадцать раз подряд значит двадцать
+    /// раз ответить одно и то же.
+    program: bool,
     mode: u16,
     uid: u32,
     gid: u32,
     size: u64,
+}
+
+impl Row {
+    /// Значок строки: каталог, пакет, программа или обычный файл.
+    ///
+    /// Исполняемый бит один в признак программы не годится: в образе initrd он
+    /// стоит у **всего**, включая `README.TXT`, и список получался из одних
+    /// коробок. Поэтому пакет узнаётся по расширению, программа — по
+    /// исполняемому биту вместе с каталогом, где программам и место, а всё
+    /// остальное остаётся файлом.
+    fn icon(&self) -> (Icon, Tone, bool) {
+        if self.directory {
+            (Icon::Folder, Tone::Accent, true)
+        } else if self.name.ends_with(".fpk") {
+            (Icon::Package, Tone::Accent, false)
+        } else if self.mode & 0o111 != 0 && self.program {
+            (Icon::Terminal, Tone::Ok, false)
+        } else {
+            (Icon::File, Tone::Muted, false)
+        }
+    }
 }
 
 /// Просмотр файла.
@@ -74,7 +119,6 @@ pub struct FilesView {
     forward: Vec<String>,
     rows: Vec<Row>,
     selected: usize,
-    scroll: usize,
     /// Ошибка чтения каталога вместо списка.
     error: Option<String>,
     preview: Option<Preview>,
@@ -89,7 +133,6 @@ impl FilesView {
             forward: Vec::new(),
             rows: Vec::new(),
             selected: 0,
-            scroll: 0,
             error: None,
             preview: None,
         };
@@ -101,7 +144,6 @@ impl FilesView {
     fn reload(&mut self) {
         self.rows.clear();
         self.selected = 0;
-        self.scroll = 0;
         self.error = None;
 
         match fs::list(&self.path) {
@@ -113,9 +155,11 @@ impl FilesView {
                     if entry.name == "." || entry.name == ".." {
                         continue;
                     }
+                    let program = self.path == "/bin" || self.path.ends_with("/bin");
                     self.rows.push(Row {
                         name: entry.name,
                         directory: entry.kind == NodeKind::Directory,
+                        program,
                         mode: entry.mode,
                         uid: entry.uid,
                         gid: entry.gid,
@@ -294,211 +338,383 @@ impl FilesView {
 
     /// Щелчок по окну: координаты внутри области содержимого.
     ///
-    /// Кнопки навигации считаются по той же формуле, что и рисуются, — иначе
-    /// они разъедутся при первом же изменении масштаба, и попасть в них будет
-    /// можно только наугад.
-    pub fn click(&mut self, area: Rect, scale: u32, x: i32, y: i32) -> bool {
-        let line_h = GLYPH_H * scale + 2;
-        let button_w = GLYPH_W * scale * 3;
-        let button_h = line_h + 2 * scale;
-        let top = area.y;
-        if y < top || y >= top + button_h as i32 {
+    /// Кнопки навигации, строки быстрого доступа и строки списка ищутся по той
+    /// же [`layout`], по которой рисуются, — иначе они разъедутся при первом же
+    /// изменении размера окна, и попасть в них будет можно только наугад.
+    pub fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        let plan = layout(ctx, area);
+
+        if plan.toolbar.contains(x, y) {
+            if plan.nav[0].contains(x, y) {
+                return self.go_back();
+            }
+            if plan.nav[1].contains(x, y) {
+                return self.go_forward();
+            }
+            if plan.nav[2].contains(x, y) {
+                return self.go_up();
+            }
             return false;
         }
-        let offset = (x - area.x).max(0) as u32;
-        let step = button_w + 2 * scale;
-        let index = offset / step;
-        if offset % step > button_w {
+
+        if let Some(side) = plan.side {
+            if side.contains(x, y) {
+                let inner = ctx.on(theme::panel_bg());
+                for slot in place_slots(inner, side) {
+                    if slot.rect.contains(x, y) {
+                        if slot.path == self.path {
+                            return false;
+                        }
+                        self.go_to(slot.path);
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+
+        // В просмотре список не показан, и щёлкать в нём не по чему: строки под
+        // текстом файла нет, а «попал в невидимую строку» — это выбор вслепую.
+        if self.preview.is_some() || !plan.list.contains(x, y) {
             return false;
         }
-        match index {
-            0 => self.go_back(),
-            1 => self.go_forward(),
-            2 => self.go_up(),
-            _ => false,
+        let visible = plan.visible();
+        let step = (plan.row_h + plan.row_gap).max(1) as i32;
+        let offset = ((y - plan.list.y) / step).max(0) as usize;
+        if offset >= visible {
+            return false;
         }
+        let index = self.first_visible(visible) + offset;
+        if index >= self.rows.len() {
+            return false;
+        }
+        // Щелчок по уже выбранной строке открывает её. Двойного щелчка окно не
+        // получает — до содержимого доходит одно событие, — а открыть файл
+        // мышью надо; повторное попадание в ту же строку и есть это «ещё раз».
+        if self.selected == index {
+            return self.open_selected();
+        }
+        self.selected = index;
+        true
     }
 
     /// Нарисовать содержимое окна.
-    pub fn draw(&self, surface: &mut Surface, area: Rect, scale: u32) {
-        surface.fill(area, theme::WINDOW_BG);
-        let line_h = GLYPH_H * scale + 2;
-        if area.h < line_h * 3 {
+    ///
+    /// Область приходит уже залитой фоном окна — это делает окно, потому что
+    /// заливать её обязано и то содержимое, которое рисует одну строку. Второй
+    /// заливки здесь нет намеренно: на 1080p она стоила бы лишних двух
+    /// миллионов записей на каждое нажатие стрелки.
+    pub fn draw(&self, surface: &mut Surface, area: Rect, ctx: Ctx) {
+        let plan = layout(ctx, area);
+        self.draw_toolbar(surface, ctx, &plan);
+        if let Some(side) = plan.side {
+            self.draw_side(surface, ctx, side);
+        }
+        match self.preview.as_ref() {
+            Some(preview) => self.draw_preview(surface, ctx, &plan, preview),
+            None => self.draw_list(surface, ctx, &plan),
+        }
+        self.draw_status(surface, ctx, &plan);
+    }
+
+    /// Панель инструментов: три стрелки и строка пути.
+    fn draw_toolbar(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
+        let p = ctx.palette;
+        if plan.toolbar.is_empty() {
+            return;
+        }
+        s.fill(plan.toolbar, ctx.flat(p.panel));
+        draw::hline(
+            s,
+            plan.toolbar.x,
+            plan.toolbar.bottom() - 1,
+            plan.toolbar.w,
+            p.line.color,
+            p.line.alpha,
+        );
+        // Всё, что лежит на панели, сводится поверх **панели**, а не поверх
+        // окна: разница в один-два уровня яркости глазом не ловится, а на
+        // снимке видна как кнопка чуть другого оттенка, чем соседняя.
+        let bar = ctx.on(theme::panel_bg());
+
+        // Недоступная кнопка гаснет, а не пропадает: «назад» из первого же
+        // каталога не должно выглядеть как неисправность.
+        let states = [
+            (Icon::Back, !self.back.is_empty()),
+            (Icon::Forward, !self.forward.is_empty()),
+            (Icon::Up, self.path != "/"),
+        ];
+        for (rect, (icon, enabled)) in plan.nav.iter().zip(states) {
+            nav_button(bar, s, *rect, icon, enabled);
+        }
+
+        if plan.path.is_empty() {
+            return;
+        }
+        paint::sunk(bar, s, plan.path, ctx.px(theme::R_ROW));
+        // Путь виден только здесь, поэтому он рисуется и в просмотре файла:
+        // иначе, открыв файл, человек перестаёт понимать, где находится.
+        let shown = match self.preview.as_ref() {
+            Some(preview) => format!("{}  ·  {}", self.path, preview.name),
+            None => self.path.clone(),
+        };
+        let pad = ctx.px(12);
+        let mut x = plan.path.x + pad as i32;
+        let mut room = plan.path.w.saturating_sub(pad * 2);
+        let y = paint::baseline(bar, Role::Mono, plan.path);
+        // Первая косая — акцентом: она отмечает корень, от которого читается
+        // всё остальное, и без неё путь сливается в одну серую строку.
+        if let Some(rest) = shown.strip_prefix('/') {
+            let used = paint::text(bar, s, Role::Mono, x, y, "/", p.acc_ink);
+            x += used as i32;
+            room = room.saturating_sub(used);
+            paint::text_clipped(bar, s, Role::Mono, x, y, room, rest, p.ink3);
+        } else {
+            paint::text_clipped(bar, s, Role::Mono, x, y, room, &shown, p.ink3);
+        }
+    }
+
+    /// Боковая колонка быстрого доступа.
+    fn draw_side(&self, s: &mut Surface, ctx: Ctx, side: Rect) {
+        let p = ctx.palette;
+        if side.is_empty() {
+            return;
+        }
+        s.fill(side, ctx.flat(p.panel));
+        draw::vline(s, side.right() - 1, side.y, side.h, p.line.color, p.line.alpha);
+        let inner = ctx.on(theme::panel_bg());
+        let pad = ctx.px(12);
+
+        for slot in place_slots(inner, side) {
+            if let Some(head) = slot.head {
+                paint::caps(inner, s, side.x + ctx.px(16) as i32, slot.head_y, head);
+            }
+            let state = if slot.path == self.path {
+                RowState::Selected
+            } else {
+                RowState::Idle
+            };
+            paint::row(inner, s, slot.rect, state);
+            paint::text_clipped(
+                inner,
+                s,
+                Role::Mono,
+                slot.rect.x + pad as i32,
+                paint::baseline(inner, Role::Mono, slot.rect),
+                slot.rect.w.saturating_sub(pad * 2),
+                &slot.path,
+                paint::row_ink(inner, state),
+            );
+        }
+    }
+
+    /// Список файлов: заголовок столбцов и строки.
+    fn draw_list(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
+        let p = ctx.palette;
+        if plan.list.is_empty() {
             return;
         }
 
-        let left = area.x as u32;
-        let mut y = area.y as u32;
-
-        // Панель навигации: три кнопки и строка пути. Кнопки нарисованы всегда,
-        // но недоступная гаснет — «назад» из первого же каталога не должно
-        // выглядеть как неисправность.
-        let button_w = GLYPH_W * scale * 3;
-        let button_h = line_h + 2 * scale;
-        for (index, (glyph, enabled)) in [
-            ("<", !self.back.is_empty()),
-            (">", !self.forward.is_empty()),
-            ("^", self.path != "/"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let rect = Rect::new(
-                (left + index as u32 * (button_w + 2 * scale)) as i32,
-                y as i32,
-                button_w,
-                button_h,
+        if !plan.header.is_empty() {
+            let x = plan.header.x + ctx.px(24) as i32;
+            let y = paint::baseline(ctx, Role::MonoCaps, plan.header);
+            paint::caps(ctx, s, x, y, "ИМЯ");
+            let tail = ctx
+                .face(Role::MonoCaps)
+                .width_tracked("РАЗМЕР", theme::CAPS_TRACKING * ctx.scale);
+            paint::caps(
+                ctx,
+                s,
+                plan.header.right() - ctx.px(22) as i32 - tail as i32,
+                y,
+                "РАЗМЕР",
             );
-            surface.fill(rect, if enabled { theme::SELECT_BG } else { theme::WINDOW_BG });
-            surface.frame(rect, 1.max(scale / 2), theme::FRAME);
-            text::draw_text(
-                surface,
-                rect.x as u32 + (button_w - GLYPH_W * scale) / 2,
-                rect.y as u32 + scale,
-                glyph,
-                scale,
-                if enabled { theme::TEXT } else { theme::DIM },
-                None,
+            draw::hline(
+                s,
+                plan.header.x + ctx.px(12) as i32,
+                plan.header.bottom() - 1,
+                plan.header.w.saturating_sub(ctx.px(24)),
+                p.line.color,
+                p.line.alpha,
             );
         }
 
-        // Строка пути — справа от кнопок. Она же единственное место, где путь
-        // виден целиком, поэтому рисуется и в просмотре файла.
-        let path_x = left + 3 * (button_w + 2 * scale) + GLYPH_W * scale;
-        let header = match self.preview.as_ref() {
-            Some(preview) => format!("{}  -  {}", self.path, preview.name),
-            None => self.path.clone(),
-        };
-        let room = ((area.right() as u32).saturating_sub(path_x) / (GLYPH_W * scale)) as usize;
-        let header = if header.chars().count() > room {
-            // Обрезается **начало**: конец пути — то, где человек сейчас, и
-            // именно он важнее корня.
-            let skip = header.chars().count() - room.saturating_sub(1);
-            format!("~{}", header.chars().skip(skip).collect::<String>())
-        } else {
-            header
-        };
-        text::draw_text(surface, path_x, y + scale, &header, scale, theme::ACCENT, None);
-        y += button_h + line_h / 2;
-
-        let footer_h = line_h * 2;
-        let body_bottom = (area.bottom() as u32).saturating_sub(footer_h);
-        let visible = ((body_bottom.saturating_sub(y)) / line_h) as usize;
-
-        match self.preview.as_ref() {
-            Some(preview) => {
-                self.draw_preview(surface, preview, area, left, y, line_h, visible, scale)
-            }
-            None => self.draw_list(surface, area, left, y, line_h, visible, scale),
+        let visible = plan.visible();
+        if visible == 0 {
+            return;
         }
 
-        // Подсказка внизу: без неё стрелки и Enter — это то, что надо угадать.
-        let hint_y = (area.bottom() as u32).saturating_sub(line_h);
-        let hint = if self.preview.is_some() {
-            "Up/Down scroll    Esc back to the list"
-        } else {
-            "Enter open    Left back    Backspace up"
-        };
-        text::draw_text(surface, left, hint_y, hint, scale, theme::DIM, None);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw_list(
-        &self,
-        surface: &mut Surface,
-        area: Rect,
-        left: u32,
-        top: u32,
-        line_h: u32,
-        visible: usize,
-        scale: u32,
-    ) {
         if let Some(error) = &self.error {
-            text::draw_text(surface, left, top, error, scale, theme::CLOSE, None);
+            let rect = plan.row_rect(ctx, 0);
+            paint::text_clipped(
+                ctx,
+                s,
+                Role::Body,
+                rect.x + ctx.px(10) as i32,
+                paint::baseline(ctx, Role::Body, rect),
+                rect.w.saturating_sub(ctx.px(20)),
+                error,
+                p.bad_ink,
+            );
             return;
         }
         if self.rows.is_empty() {
-            text::draw_text(surface, left, top, "(empty)", scale, theme::DIM, None);
+            let rect = plan.row_rect(ctx, 0);
+            paint::text_clipped(
+                ctx,
+                s,
+                Role::Body,
+                rect.x + ctx.px(10) as i32,
+                paint::baseline(ctx, Role::Body, rect),
+                rect.w.saturating_sub(ctx.px(20)),
+                "Пусто",
+                p.ink5,
+            );
             return;
         }
 
         // Прокрутка считается здесь, а не хранится: сколько строк помещается,
         // знает только тот, кто рисует, а размер окна может измениться.
-        let first = if self.selected >= visible {
-            self.selected + 1 - visible
-        } else {
-            0
-        };
-
+        let first = self.first_visible(visible);
         for (offset, row) in self.rows.iter().skip(first).take(visible).enumerate() {
-            let index = first + offset;
-            let y = top + offset as u32 * line_h;
-            let selected = index == self.selected;
-            if selected {
-                surface.fill(
-                    Rect::new(area.x, y as i32 - 1, area.w, line_h),
-                    theme::SELECT_BG,
-                );
-            }
-            let name_color = if row.directory {
-                theme::DIRECTORY
-            } else {
-                theme::TEXT
-            };
-            // Три колонки с фиксированным началом: права и размер, выровненные
-            // по левому краю случайной длины имени, не читаются вовсе.
-            let meta = format!(
-                "{:04o} {:>4}:{:<4} {:>9}",
-                row.mode,
-                row.uid,
-                row.gid,
-                if row.directory {
-                    String::from("-")
-                } else {
-                    size_text(row.size)
-                }
+            let rect = plan.row_rect(ctx, offset);
+            let selected = first + offset == self.selected;
+            let state = if selected { RowState::Selected } else { RowState::Idle };
+            paint::row(ctx, s, rect, state);
+
+            let tile_side = ctx.px(26);
+            let tile = Rect::new(
+                rect.x + ctx.px(6) as i32,
+                rect.y + (rect.h as i32 - tile_side as i32) / 2,
+                tile_side,
+                tile_side,
             );
-            text::draw_text(surface, left, y, &meta, scale, theme::DIM, None);
-            let name_x = left + text::width_of(&meta, scale) + text::GLYPH_W * scale;
-            let name = if row.directory {
-                format!("{}/", row.name)
+            let (icon, tone, filled) = row.icon();
+            paint::icon_tile(ctx, s, tile, icon, tone, filled);
+
+            // Размер и права прижаты к правому краю: выровненные по левому краю
+            // случайной длины имени, столбцы чисел не читаются вовсе.
+            let mut right = rect.right() - ctx.px(10) as i32;
+            let small = paint::baseline(ctx, Role::MonoSmall, rect);
+            let size = if row.directory {
+                String::from("—")
             } else {
-                row.name.clone()
+                size_text(row.size)
             };
-            let room = (area.right() as u32).saturating_sub(name_x);
-            text::draw_text(
-                surface,
+            paint::text_right(ctx, s, Role::MonoSmall, right, small, &size, p.ink4);
+            right -= ctx.px(76) as i32;
+            if rect.w > ctx.px(360) {
+                let meta = format!("{:04o} {}:{}", row.mode, row.uid, row.gid);
+                paint::text_right(ctx, s, Role::MonoSmall, right, small, &meta, p.ink4);
+                right -= ctx.px(120) as i32;
+            }
+
+            let name_x = tile.right() + ctx.px(10) as i32;
+            let room = (right - name_x).max(0) as u32;
+            let (role, ink) = if selected {
+                (Role::Title, p.ink)
+            } else if row.directory {
+                (Role::Label, p.ink2)
+            } else {
+                (Role::Body, p.ink3)
+            };
+            paint::text_clipped(
+                ctx,
+                s,
+                role,
                 name_x,
-                y,
-                &fit(&name, columns(room, scale)),
-                scale,
-                name_color,
-                None,
+                paint::baseline(ctx, role, rect),
+                room,
+                &row.name,
+                ink,
             );
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn draw_preview(
-        &self,
-        surface: &mut Surface,
-        preview: &Preview,
-        area: Rect,
-        left: u32,
-        top: u32,
-        line_h: u32,
-        visible: usize,
-        scale: u32,
-    ) {
-        let width = columns(area.w, scale);
-        let body = visible.saturating_sub(1);
+    /// Содержимое открытого файла на месте списка.
+    fn draw_preview(&self, s: &mut Surface, ctx: Ctx, plan: &Plan, preview: &Preview) {
+        let p = ctx.palette;
+        let area = plan.list.union(&plan.header);
+        if area.is_empty() {
+            return;
+        }
+        let step = u32::from(ctx.face(Role::Mono).line) + ctx.px(2);
+        let pad = ctx.px(16);
+        let room = area.w.saturating_sub(pad * 2);
+        let note_h = if preview.note.is_empty() { 0 } else { step * 2 };
+        let body = (area.h.saturating_sub(note_h) / step.max(1)) as usize;
+
         for (offset, line) in preview.lines.iter().skip(preview.scroll).take(body).enumerate() {
-            let y = top + offset as u32 * line_h;
-            text::draw_text(surface, left, y, &fit(line, width), scale, theme::TEXT, None);
+            paint::text_clipped(
+                ctx,
+                s,
+                Role::Mono,
+                area.x + pad as i32,
+                area.y + (offset as u32 * step) as i32,
+                room,
+                line,
+                p.ink3,
+            );
         }
         if !preview.note.is_empty() {
-            let y = top + body as u32 * line_h;
-            text::draw_text(surface, left, y, &preview.note, scale, theme::DIM, None);
+            paint::text_clipped(
+                ctx,
+                s,
+                Role::Caption,
+                area.x + pad as i32,
+                area.bottom() - step as i32,
+                room,
+                &preview.note,
+                p.ink4,
+            );
+        }
+    }
+
+    /// Строка состояния: без неё стрелки и Enter — это то, что надо угадать.
+    fn draw_status(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
+        let p = ctx.palette;
+        if plan.status.is_empty() {
+            return;
+        }
+        s.fill(plan.status, ctx.flat(p.panel));
+        draw::hline(
+            s,
+            plan.status.x,
+            plan.status.y,
+            plan.status.w,
+            p.line2.color,
+            p.line2.alpha,
+        );
+        let bar = ctx.on(theme::panel_bg());
+        let text = if self.preview.is_some() {
+            String::from("Стрелки — листать    Esc — назад к списку")
+        } else if self.error.is_some() {
+            String::from("Стрелка влево — назад    Backspace — вверх")
+        } else {
+            format!(
+                "{} объектов    Enter — открыть    влево — назад    Backspace — вверх",
+                self.rows.len()
+            )
+        };
+        let pad = ctx.px(14);
+        paint::text_clipped(
+            bar,
+            s,
+            Role::MonoSmall,
+            plan.status.x + pad as i32,
+            paint::baseline(bar, Role::MonoSmall, plan.status),
+            plan.status.w.saturating_sub(pad * 2),
+            &text,
+            p.ink4,
+        );
+    }
+
+    /// Первая показанная строка при таком числе видимых.
+    fn first_visible(&self, visible: usize) -> usize {
+        if visible == 0 || self.selected < visible {
+            0
+        } else {
+            self.selected + 1 - visible
         }
     }
 }
@@ -509,26 +725,184 @@ impl Default for FilesView {
     }
 }
 
-/// Сколько знаков помещается в полосу шириной `width`.
-fn columns(width: u32, scale: u32) -> usize {
-    (width / (text::GLYPH_W * scale.max(1))) as usize
+/// Где что лежит в окне менеджера.
+///
+/// Все прямоугольники — в координатах поверхности окна, те же, в которых
+/// приходит щелчок.
+struct Plan {
+    toolbar: Rect,
+    /// «Назад», «вперёд», «вверх» — в этом порядке.
+    nav: [Rect; 3],
+    path: Rect,
+    side: Option<Rect>,
+    header: Rect,
+    list: Rect,
+    status: Rect,
+    row_h: u32,
+    row_gap: u32,
 }
 
-/// Обрезать строку по ширине, пометив обрезку.
+impl Plan {
+    /// Сколько строк списка помещается.
+    fn visible(&self) -> usize {
+        let step = (self.row_h + self.row_gap).max(1);
+        ((self.list.h + self.row_gap) / step) as usize
+    }
+
+    /// Строка списка с таким номером сверху.
+    fn row_rect(&self, ctx: Ctx, offset: usize) -> Rect {
+        let pad = ctx.px(12);
+        Rect::new(
+            self.list.x + pad as i32,
+            self.list.y + (offset as u32 * (self.row_h + self.row_gap)) as i32,
+            self.list.w.saturating_sub(pad * 2),
+            self.row_h,
+        )
+    }
+}
+
+/// Посчитать раскладку окна.
 ///
-/// Обрезать обязательно: рисование текста молча уходит за границу поверхности,
-/// и длинное имя выглядело бы как обрубленное на полбукве — то есть как дефект
-/// вывода, а не как «здесь не поместилось». Знак `>` на конце говорит, что
-/// строка продолжается; многоточия в шрифте 8×8 нет.
-fn fit(text: &str, columns: usize) -> String {
-    if text.chars().count() <= columns {
-        return text.to_string();
+/// Одна функция на отрисовку и на щелчок — см. заголовок модуля.
+fn layout(ctx: Ctx, area: Rect) -> Plan {
+    let pad = ctx.px(14);
+    let toolbar_h = ctx.px(theme::TOOLBAR_H).min(area.h);
+    let toolbar = Rect::new(area.x, area.y, area.w, toolbar_h);
+
+    let btn = ctx.px(30);
+    let gap = ctx.px(6);
+    let btn_y = toolbar.y + (toolbar_h as i32 - btn as i32) / 2;
+    let mut x = area.x + pad as i32;
+    let mut nav = [Rect::EMPTY; 3];
+    for slot in &mut nav {
+        *slot = Rect::new(x, btn_y, btn, btn);
+        x += (btn + gap) as i32;
     }
-    if columns == 0 {
-        return String::new();
+
+    let path_h = ctx.px(32);
+    let path_x = x + ctx.px(4) as i32;
+    let path_w = (area.right() - pad as i32 - path_x).max(0) as u32;
+    let path = Rect::new(
+        path_x,
+        toolbar.y + (toolbar_h as i32 - path_h as i32) / 2,
+        path_w,
+        path_h,
+    );
+
+    let status_h = ctx.px(theme::STATUS_H);
+    let status_y = (area.bottom() - status_h as i32).max(toolbar.bottom());
+    let status = Rect::new(area.x, status_y, area.w, status_h);
+
+    let top = toolbar.bottom();
+    let bottom = status.y;
+    let body_h = (bottom - top).max(0) as u32;
+
+    // Колонка есть только там, где после неё остаётся окно, а не щель.
+    let side = if area.w > ctx.px(SIDE_FROM) && body_h > 0 {
+        Some(Rect::new(area.x, top, ctx.px(theme::SIDE_W), body_h))
+    } else {
+        None
+    };
+    let body_x = side.map_or(area.x, |side| side.right());
+    let body_w = (area.right() - body_x).max(0) as u32;
+
+    let header_h = (u32::from(ctx.face(Role::MonoCaps).line) + ctx.px(14)).min(body_h);
+    let header = Rect::new(body_x, top, body_w, header_h);
+    let list = Rect::new(
+        body_x,
+        top + header_h as i32,
+        body_w,
+        body_h.saturating_sub(header_h),
+    );
+
+    Plan {
+        toolbar,
+        nav,
+        path,
+        side,
+        header,
+        list,
+        status,
+        row_h: ctx.px(32),
+        row_gap: ctx.px(2),
     }
-    let mut out: String = text.chars().take(columns - 1).collect();
-    out.push('>');
+}
+
+/// Кнопка навигации: доступная — с подложкой, недоступная — одним значком.
+///
+/// Рисуется здесь, а не через [`paint::icon_button`]: у той кнопки состояния
+/// «под указателем», а у этой — «есть куда идти», и цвет значка в них меняется
+/// по-разному.
+fn nav_button(ctx: Ctx, s: &mut Surface, rect: Rect, icon: Icon, enabled: bool) {
+    let p = ctx.palette;
+    let r = ctx.px(theme::R_CHIP);
+    if enabled {
+        draw::rounded(s, rect, r, ctx.flat(p.ghost), 255);
+        draw::rounded_stroke(s, rect, r, p.line2.color, p.line2.alpha);
+    }
+    // Та же доля, что у значка в кнопке заголовка: 11 точек в кнопке 30.
+    let side = rect.w.min(rect.h) * 11 / 30;
+    let x = rect.x + (rect.w as i32 - side as i32) / 2;
+    let y = rect.y + (rect.h as i32 - side as i32) / 2;
+    let ink = if enabled { p.ink3 } else { p.ink6 };
+    glyphicon::draw(s, icon, x, y, side, ink, 255);
+}
+
+/// Строка быстрого доступа вместе с местом, которое она занимает.
+struct PlaceSlot {
+    /// Заголовок группы над строкой, если строка её открывает.
+    head: Option<&'static str>,
+    head_y: i32,
+    path: String,
+    rect: Rect,
+}
+
+/// Куда ведёт быстрый доступ.
+///
+/// Список короткий и составлен из того, что в системе точно есть: корень, дом
+/// вошедшего, его стол и два системных каталога. Закладок человек пока не
+/// заводит — заводить их некуда, файла настроек у стола нет.
+fn places() -> [(Option<&'static str>, String); 5] {
+    [
+        (Some("МЕСТА"), String::from("/")),
+        (None, super::context::home_dir()),
+        (None, super::context::desktop_dir()),
+        (Some("СИСТЕМА"), String::from("/bin")),
+        (None, String::from("/etc")),
+    ]
+}
+
+/// Разложить быстрый доступ по колонке.
+fn place_slots(ctx: Ctx, side: Rect) -> Vec<PlaceSlot> {
+    let padx = ctx.px(16);
+    let row_h = ctx.px(32);
+    let gap = ctx.px(2);
+    let caps_h = u32::from(ctx.face(Role::MonoCaps).line) + ctx.px(12);
+    let mut y = side.y + ctx.px(10) as i32;
+    let mut out = Vec::new();
+
+    for (head, path) in places() {
+        let head_y = if head.is_some() {
+            let at = y + ctx.px(4) as i32;
+            y += caps_h as i32;
+            at
+        } else {
+            0
+        };
+        let rect = Rect::new(
+            side.x + padx as i32,
+            y,
+            side.w.saturating_sub(padx * 2),
+            row_h,
+        );
+        y += (row_h + gap) as i32;
+        // Не поместилось — не рисуем: строка, наполовину заехавшая под список,
+        // выглядит как испорченная отрисовка, а не как «здесь кончилось место».
+        if rect.bottom() > side.bottom() {
+            break;
+        }
+        out.push(PlaceSlot { head, head_y, path, rect });
+    }
     out
 }
 

@@ -47,7 +47,7 @@
 
 use alloc::vec::Vec;
 
-use mini_ui::{Rect, Screen, Surface};
+use mini_ui::{Color, Rect, Screen, Surface, draw};
 
 use super::context::{Action, ContextMenu, Reply};
 use super::icons::{Icons, Kind};
@@ -65,10 +65,20 @@ use super::window::{App, Hit, Window};
 const MAX_DAMAGE: usize = 12;
 
 /// Шаг разметки на фоне рабочего стола.
-const DOT_STEP: u32 = 48;
+const DOT_STEP: u32 = 24;
 
 /// Размер точки разметки.
-const DOT_SIZE: u32 = 2;
+const DOT_SIZE: u32 = 1;
+
+/// На сколько тень плавающего слоя выходит за его края.
+///
+/// Тень — единственное, что отделяет панель задач от обоев там, где обои
+/// светлые: однопиксельной обводки на светлой теме не видно, а без отделения
+/// панель читается как полоса, нарисованная прямо на фоне.
+const SHADOW_SPREAD: u32 = 18;
+
+/// На сколько тень смещена вниз относительно самого слоя.
+const SHADOW_DROP: u32 = 10;
 
 pub struct Compositor {
     screen: Screen,
@@ -89,6 +99,14 @@ pub struct Compositor {
     /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
     /// запомненный до щелчка, после него указывал бы на соседнее окно.
     drag: Option<App>,
+    /// Где стояло окно в тот миг, когда его взяли.
+    ///
+    /// Нужно одному: отличить перетаскивание от щелчка по заголовку. Щелчок
+    /// тоже проходит через захват и отпускание, и без этой точки в журнале
+    /// появляется строка «окно переехало туда, где оно и было». Она не просто
+    /// лишняя: стенд ждёт переезда по этой строке и принимает за него щелчок,
+    /// после чего целится в окно по старому месту.
+    drag_from: (i32, i32),
     /// Захват меняет размер окна, а не его место.
     drag_resizes: bool,
     /// Масштаб глифа для новых окон.
@@ -127,7 +145,8 @@ impl Compositor {
     pub fn new(screen: Screen, scale: u32) -> Option<Self> {
         let pointer = Pointer::new(screen.width(), screen.height());
         let rows = (BAND_BYTES / (screen.width().max(1) * 4)).clamp(BAND_MIN, BAND_MAX);
-        let back = Surface::new(screen.width(), rows.min(screen.height().max(1)), theme::DESKTOP_TOP)?;
+        let wall = theme::palette().wall_top;
+        let back = Surface::new(screen.width(), rows.min(screen.height().max(1)), wall)?;
         let mut compositor = Self {
             back,
             screen,
@@ -139,6 +158,7 @@ impl Compositor {
             icons: Icons::new(scale),
             context: ContextMenu::new(scale.min(2)),
             drag: None,
+            drag_from: (0, 0),
             drag_resizes: false,
             scale,
             damage: [Rect::EMPTY; MAX_DAMAGE],
@@ -194,7 +214,7 @@ impl Compositor {
         // Помечается площадь нового окна, а не весь экран: остальное как было,
         // так и осталось. Разница не косметическая — перерисовка экрана целиком
         // задерживает ввод настолько, что успевает измениться порядок событий.
-        self.mark(rect);
+        self.mark_layer(rect);
     }
 
     pub fn find(&mut self, app: App) -> Option<&mut Window> {
@@ -237,7 +257,7 @@ impl Compositor {
         self.windows
             .iter()
             .enumerate()
-            .map(|(index, window)| (window.app, index == self.focus))
+            .map(|(index, window)| (window.app, index == self.focus, window.minimized))
             .collect()
     }
 
@@ -283,7 +303,7 @@ impl Compositor {
         // Поднятое окно — единственное место, где порядок по глубине
         // изменился; всё остальное на экране осталось прежним.
         for index in 0..uncovered_count {
-            self.mark(uncovered[index]);
+            self.mark_layer(uncovered[index]);
         }
     }
 
@@ -304,7 +324,7 @@ impl Compositor {
         self.focus = self.windows.len().saturating_sub(1);
         self.refresh_decorations();
         // На месте закрытого окна снова виден фон и то, что было под ним.
-        self.mark(window.rect);
+        self.mark_layer(window.rect);
         Some(window.app)
     }
 
@@ -324,8 +344,8 @@ impl Compositor {
         // Два прямоугольника, а не один объединяющий: при большом сдвиге
         // объединение — это почти весь экран, тогда как настоящих изменений два
         // куска по краям.
-        self.mark(before);
-        self.mark(after);
+        self.mark_layer(before);
+        self.mark_layer(after);
     }
 
     // -----------------------------------------------------------------------
@@ -473,7 +493,7 @@ impl Compositor {
         let before = self.icons.bounds();
         self.icons.reload();
         let after = self.icons.bounds();
-        self.mark(before.union(&after));
+        self.mark_layer(before.union(&after));
     }
 
     /// Попадание в панель задач.
@@ -489,14 +509,26 @@ impl Compositor {
     /// Начать или закончить перетаскивание окна.
     pub fn set_drag(&mut self, app: Option<App>) {
         self.drag = app;
-        if app.is_none() {
+        if let Some(app) = app {
+            self.drag_from = self.rect_of(app).map_or((0, 0), |rect| (rect.x, rect.y));
+        } else {
             self.drag_resizes = false;
+        }
+    }
+
+    /// Переехало ли окно с тех пор, как его взяли.
+    #[must_use]
+    pub fn drag_moved(&self) -> bool {
+        match self.drag.and_then(|app| self.rect_of(app)) {
+            Some(rect) => (rect.x, rect.y) != self.drag_from,
+            None => false,
         }
     }
 
     /// Начать изменение размера окна: тот же захват, другое действие.
     pub fn set_resize_drag(&mut self, app: App) {
         self.drag = Some(app);
+        self.drag_from = self.rect_of(app).map_or((0, 0), |rect| (rect.x, rect.y));
         self.drag_resizes = true;
     }
 
@@ -542,8 +574,8 @@ impl Compositor {
             return;
         }
         let after = window.rect;
-        self.mark(before);
-        self.mark(after);
+        self.mark_layer(before);
+        self.mark_layer(after);
     }
 
     /// Свернуть окно: убрать с экрана, оставив в панели задач.
@@ -559,7 +591,7 @@ impl Compositor {
         }
         window.minimized = true;
         let rect = window.rect;
-        self.mark(rect);
+        self.mark_layer(rect);
         // Фокус уходит вниз: свёрнутое окно не может быть активным, иначе
         // клавиши уходили бы туда, где их некому показать.
         if self.focus == index {
@@ -583,6 +615,11 @@ impl Compositor {
         // Поверхность цела, но экран под окном за это время перерисовали —
         // значит показать надо всё окно целиком, а не то, что в нём изменилось.
         window.damage = Rect::new(0, 0, window.rect.w, window.rect.h);
+        let rect = window.rect;
+        // Вернувшееся окно приносит с собой и тень: без неё вокруг него
+        // осталась бы светлая рамка от того, что лежало здесь, пока оно было
+        // свёрнуто.
+        self.mark_layer(rect);
         true
     }
 
@@ -610,8 +647,8 @@ impl Compositor {
             return false;
         }
         let after = window.rect;
-        self.mark(before);
-        self.mark(after);
+        self.mark_layer(before);
+        self.mark_layer(after);
         true
     }
 
@@ -625,7 +662,7 @@ impl Compositor {
             self.focus = self.windows.len().saturating_sub(1);
         }
         self.refresh_decorations();
-        self.mark(window.rect);
+        self.mark_layer(window.rect);
         if self.drag == Some(app) {
             self.drag = None;
         }
@@ -687,6 +724,27 @@ impl Compositor {
         }
         self.damage[self.damage_count] = rect;
         self.damage_count += 1;
+    }
+
+    /// Пометить изменившимся **слой целиком**: вместе с его тенью.
+    ///
+    /// Отдельно от [`Compositor::mark`], а не вместо него, из-за цены. Тень
+    /// выходит за границы слоя, и уехавшее окно оставило бы за собой её след, —
+    /// но расширять так каждый прямоугольник значило бы платить за это и на
+    /// каждой напечатанной в терминале букве. Буква тени не отбрасывает; слой
+    /// отбрасывает. Поэтому расширяются только те прямоугольники, которые
+    /// описывают появление, исчезновение или переезд слоя.
+    fn mark_layer(&mut self, rect: Rect) {
+        if rect.is_empty() {
+            return;
+        }
+        let halo = (SHADOW_SPREAD + SHADOW_DROP) * self.scale;
+        self.mark(Rect::new(
+            rect.x - halo as i32,
+            rect.y - halo as i32,
+            rect.w + halo * 2,
+            rect.h + halo * 2,
+        ));
     }
 
     /// Перенести накопленные слоями изменения в общий список.
@@ -777,16 +835,38 @@ impl Compositor {
 
     /// Перевести меню в набор нового имени.
     pub fn context_rename(&mut self, name: &str) {
+        let before = self.context.as_ref().map(|menu| menu.rect);
         if let Some(menu) = self.context.as_mut() {
             menu.start_rename(name);
         }
+        self.mark_shrunk(before);
     }
 
     /// Спросить в меню, точно ли удалять.
     pub fn context_confirm(&mut self, name: &str) {
+        let before = self.context.as_ref().map(|menu| menu.rect);
         if let Some(menu) = self.context.as_mut() {
             menu.start_confirm(name);
         }
+        self.mark_shrunk(before);
+    }
+
+    /// Стереть то, что осталось от прежнего, большего меню.
+    ///
+    /// Карточка меняет высоту вместе с тем, что в ней: список пунктов выше
+    /// поля ввода имени. Меню сообщает об изменившемся в собственных
+    /// координатах, а их композитор сдвигает на **новый** прямоугольник — и
+    /// освободившаяся полоса под ним остаётся на экране куском прошлой
+    /// карточки. Помечается разница, а не всё подряд: обычно она пуста.
+    fn mark_shrunk(&mut self, before: Option<Rect>) {
+        let Some(before) = before else { return };
+        let Some(after) = self.context.as_ref().map(|menu| menu.rect) else {
+            return;
+        };
+        if before == after {
+            return;
+        }
+        self.mark_layer(before.union(&after));
     }
 
     /// Подсветить в меню пункт, по которому щёлкнули.
@@ -810,8 +890,34 @@ impl Compositor {
             menu.close();
         }
         if let Some(rect) = rect {
-            self.mark(rect);
+            self.mark_layer(rect);
         }
+    }
+
+    /// Перекрасить стол в другую тему.
+    ///
+    /// Перекрашивается всё и сразу: тема — это цвет каждой точки, и оставить
+    /// хоть один слой в прежней палитре значит показать человеку наполовину
+    /// перекрашенный стол, который он примет за поломку.
+    ///
+    /// Поверхности при этом не пересоздаются: размеры от темы не зависят, а
+    /// пересоздание стоило бы отказа выделения там, где ничего выделять не
+    /// нужно.
+    pub fn restyle(&mut self, status: &Status) {
+        let focus = self.focus;
+        for (index, window) in self.windows.iter_mut().enumerate() {
+            window.restyle();
+            window.draw_decorations(index == focus);
+        }
+        self.icons.restyle();
+        if let Some(menu) = self.context.as_mut() {
+            menu.restyle();
+        }
+        self.refresh_panel(status);
+        if let Some(menu) = self.menu.as_mut() {
+            menu.restyle();
+        }
+        self.repaint_all();
     }
 
     /// Перерисовать весь экран — то, что делает пункт «Refresh».
@@ -824,7 +930,7 @@ impl Compositor {
     pub fn mark_menu_area(&mut self) {
         if let Some(menu) = self.menu.as_ref() {
             let rect = menu.rect;
-            self.mark(rect);
+            self.mark_layer(rect);
         }
     }
 
@@ -901,24 +1007,33 @@ impl Compositor {
     /// каждый рисующий обязан был обрезать себя сам по прямоугольнику
     /// изменений — иначе значок, задетый краем, ложился поверх закрывающего его
     /// окна.
+    ///
+    /// Тень слоя рисуется **перед** самим слоем и по тем же правилам порядка:
+    /// тень окна ложится на всё, что ниже него, и не задевает то, что выше.
     fn compose_band(&self, back: &mut Surface, band: Rect) {
         let dy = -band.y;
+        let radius = theme::R_WINDOW * self.scale;
         self.draw_background(back, band, dy);
         self.icons.draw(back, band, dy);
         for window in self.windows.iter().filter(|window| !window.minimized) {
-            self.stack(back, window.surface(), window.rect, band, dy);
+            self.drop_shadow(back, window.rect, band, dy, radius);
+            self.stack(back, window.surface(), window.rect, band, dy, radius);
         }
         if let Some(panel) = self.panel.as_ref() {
-            self.stack(back, panel.surface(), panel.rect, band, dy);
+            self.drop_shadow(back, panel.rect, band, dy, radius);
+            self.stack(back, panel.surface(), panel.rect, band, dy, radius);
         }
         if let Some(menu) = self.menu.as_ref() {
             if menu.is_open() {
-                self.stack(back, menu.surface(), menu.rect, band, dy);
+                self.drop_shadow(back, menu.rect, band, dy, radius);
+                self.stack(back, menu.surface(), menu.rect, band, dy, radius);
             }
         }
         if let Some(menu) = self.context.as_ref() {
             if menu.is_open() {
-                self.stack(back, menu.surface(), menu.rect, band, dy);
+                let r = theme::R_CARD * self.scale;
+                self.drop_shadow(back, menu.rect, band, dy, r);
+                self.stack(back, menu.surface(), menu.rect, band, dy, r);
             }
         }
         // Курсор — последним и без проверки пересечения: он мал, а обрезка
@@ -927,45 +1042,218 @@ impl Compositor {
         self.pointer.draw(back, dy);
     }
 
-    /// Положить в полосу ту часть слоя, которая в неё попадает.
-    fn stack(&self, back: &mut Surface, surface: &Surface, placed: Rect, band: Rect, dy: i32) {
+    /// Мягкая тень под слоем.
+    ///
+    /// Она не украшение: на светлой теме однопиксельная обводка панели по
+    /// светлым обоям не видна вовсе, и без тени панель читается как полоса,
+    /// нарисованная прямо на фоне, а не как лежащая на нём плашка.
+    fn drop_shadow(&self, back: &mut Surface, placed: Rect, band: Rect, dy: i32, radius: u32) {
+        let spread = SHADOW_SPREAD * self.scale;
+        let drop = SHADOW_DROP * self.scale;
+        if !Self::touches(placed.translate(0, drop as i32), band, spread) {
+            return;
+        }
+        let ink = theme::palette().shadow;
+        let halo = placed.translate(0, drop as i32 + dy);
+        draw::shadow(back, halo, radius, spread, ink.color, ink.alpha);
+    }
+
+    /// Задевает ли слой полосу с учётом того, на сколько его тень выходит наружу.
+    fn touches(placed: Rect, band: Rect, margin: u32) -> bool {
+        let grown = Rect::new(
+            placed.x - margin as i32,
+            placed.y - margin as i32,
+            placed.w + margin * 2,
+            placed.h + margin * 2,
+        );
+        !grown.intersect(&band).is_empty()
+    }
+
+    /// Положить в полосу ту часть слоя, которая в неё попадает, срезав углы.
+    ///
+    /// Скругление живёт здесь, а не в самом слое, по одной причине: угол — это
+    /// место, где сквозь окно видны обои, а обои к этому моменту уже лежат в
+    /// буфере. Слой рисует себя прямоугольником и о срезе не знает.
+    ///
+    /// Строки, проходящие мимо углов, копируются целиком, как и раньше: срез
+    /// касается четырёх квадратов со стороной в радиус, то есть восьмисот
+    /// точек на окно любого размера.
+    fn stack(
+        &self,
+        back: &mut Surface,
+        surface: &Surface,
+        placed: Rect,
+        band: Rect,
+        dy: i32,
+        radius: u32,
+    ) {
         let overlap = placed.intersect(&band);
         if overlap.is_empty() {
             return;
         }
-        let src = overlap.translate(-placed.x, -placed.y);
-        back.blit_from(surface, (overlap.x, overlap.y + dy), src);
+        let radius = radius.min(placed.w / 2).min(placed.h / 2) as i32;
+        for row in 0..overlap.h {
+            let screen_y = overlap.y + row as i32;
+            let local_y = screen_y - placed.y;
+            // Насколько строка углублена в угловую зону сверху или снизу.
+            // `None` — строка проходит мимо углов и копируется целиком.
+            let corner_y = if local_y < radius {
+                Some(radius - local_y)
+            } else if local_y >= placed.h as i32 - radius {
+                Some(local_y - (placed.h as i32 - radius) + 1)
+            } else {
+                None
+            };
+            let Some(depth_y) = corner_y else {
+                let src = Rect::new(overlap.x - placed.x, local_y, overlap.w, 1);
+                back.blit_from(surface, (overlap.x, screen_y + dy), src);
+                continue;
+            };
+            for column in 0..overlap.w {
+                let screen_x = overlap.x + column as i32;
+                let local_x = screen_x - placed.x;
+                let depth_x = if local_x < radius {
+                    radius - local_x
+                } else if local_x >= placed.w as i32 - radius {
+                    local_x - (placed.w as i32 - radius) + 1
+                } else {
+                    0
+                };
+                let pixel = surface.get(local_x as u32, local_y as u32);
+                let target = (screen_x as u32, (screen_y + dy) as u32);
+                if depth_x == 0 {
+                    back.put(target.0, target.1, pixel);
+                    continue;
+                }
+                let coverage = corner_coverage(depth_x, depth_y, radius);
+                if coverage == 0 {
+                    continue;
+                }
+                let under = Color::from_pixel(back.get(target.0, target.1));
+                let over = Color::from_pixel(pixel);
+                back.put(target.0, target.1, under.mix(over, coverage).pixel());
+            }
+        }
     }
 
-    /// Фон рабочего стола: вертикальный градиент и точки разметки.
+    /// Обои рабочего стола.
+    ///
+    /// # Почему всё считается, а не хранится картинкой
+    ///
+    /// Картинка размером с экран — четыре мегабайта при куче в шестнадцать.
+    /// Здесь же цвет любой точки — функция от её координат.
+    ///
+    /// # Из чего они состоят
+    ///
+    /// Эллиптическое световое пятно у верхнего края, два размытых цветных круга
+    /// по противоположным углам и редкая сетка точек. Это не украшение: на
+    /// однородной заливке перетаскиваемое окно кажется стоящим на месте, и
+    /// глазу нужна опора, чтобы увидеть движение.
+    ///
+    /// # Почему считается именно так
+    ///
+    /// Стол перерисовывает фон на каждом переезде окна, а машина под ним —
+    /// эмулятор без ускорения, где деление стоит десятки тактов. Первая версия
+    /// делала на точку шесть делений и корень, и картинка отставала от мыши на
+    /// секунду: окно на снимке стояло там, откуда его уже утащили.
+    ///
+    /// Поэтому здесь нет ни одного деления в цикле по точкам. Полуоси
+    /// превращены в множители один раз, вклад строки посчитан один раз на
+    /// строку, корень заменён таблицей на тысячу значений, а цвет основы —
+    /// таблицей на двести пятьдесят шесть готовых точек. В цикле остаются
+    /// умножение, сдвиг и обращение к таблице.
     fn draw_background(&self, back: &mut Surface, rect: Rect, dy: i32) {
-        let height = self.screen.height().max(1);
-        for y in rect.y..rect.bottom() {
-            if y < 0 {
-                continue;
-            }
-            // Вес смешивания — доля пройденной высоты экрана. Считается от
-            // экрана, а не от прямоугольника: иначе каждый кусок фона имел бы
-            // собственный градиент, и границы кусков были бы видны. С полосами
-            // это стало не рассуждением, а условием — полос на экране до
-            // десятка.
-            let weight = ((y as u32).min(height - 1) * 255 / height) as u8;
-            let color = theme::DESKTOP_TOP.mix(theme::DESKTOP_BOTTOM, weight);
-            back.fill(Rect::new(rect.x, y + dy, rect.w, 1), color);
+        let p = theme::palette();
+        let width = self.screen.width().max(1) as i32;
+        let height = self.screen.height().max(1) as i32;
+
+        // Числа повторяют макет: эллипс шириной в три четверти экрана с центром
+        // на трети ширины у самого верха, и два круга по противоположным углам.
+        let glow = Ellipse::new(width * 3 / 10, 0, width * 3 / 4, height * 7 / 10);
+        let cool = Ellipse::new(-width / 12, -height / 8, width * 5 / 8, height * 7 / 10);
+        let warm = Ellipse::new(
+            width + width / 8,
+            height + height / 6,
+            width * 5 / 7,
+            height * 3 / 4,
+        );
+        let cool_ink = Color::rgb(0x5A, 0xA2, 0xFF);
+        let warm_ink = Color::rgb(0xC7, 0x7D, 0xFF);
+        // Цветные круги на светлой теме приглушены вчетверо: то, что на тёмном
+        // фоне читается как подсветка, на светлом становится пятном краски.
+        let tint = if theme::is_dark() { 1 } else { 4 };
+        let cool_peak = 92 / tint;
+        let warm_peak = 74 / tint;
+
+        // Таблица перехода: квадрат расстояния → вес смешивания. Корень берётся
+        // тысячу раз вместо миллиона.
+        let mut ramp = [0u8; RAMP + 1];
+        let full = UNIT * 65 / 100;
+        for (index, slot) in ramp.iter_mut().enumerate() {
+            let d2 = (index as i64) * UNIT / (RAMP as i64);
+            let distance = isqrt((d2 * UNIT) as u64) as i64;
+            *slot = (distance * 255 / full).min(255) as u8;
+        }
+        // Готовые точки основы: их всего двести пятьдесят шесть, и без круга
+        // над ними цвет точки — это одно обращение к массиву.
+        let mut base = [0u32; 256];
+        for (weight, slot) in base.iter_mut().enumerate() {
+            *slot = p.wall_top.mix(p.wall_bottom, weight as u8).pixel();
         }
 
-        // Разметка: редкая сетка точек. Она даёт глазу опору — на однородной
-        // заливке перетаскиваемое окно кажется стоящим на месте.
-        let first_x = align_up(rect.x, DOT_STEP);
-        let first_y = align_up(rect.y, DOT_STEP);
-        let mut y = first_y;
-        while y < rect.bottom() {
-            let mut x = first_x;
-            while x < rect.right() {
-                back.fill(Rect::new(x, y + dy, DOT_SIZE, DOT_SIZE), theme::DESKTOP_DOT);
-                x += DOT_STEP as i32;
+        for y in rect.y.max(0)..rect.bottom() {
+            let glow_row = glow.row(y);
+            let cool_row = cool.row(y);
+            let warm_row = warm.row(y);
+            // Строка целиком вне круга отсекается один раз, а не на каждой её
+            // точке.
+            let cool_here = cool_row < UNIT && cool_peak > 0;
+            let warm_here = warm_row < UNIT && warm_peak > 0;
+            let target = (y + dy) as u32;
+            let from = rect.x.max(0) as usize;
+            let to = (rect.right().max(0) as usize).min(back.width() as usize);
+            let row = back.row_mut(target);
+            if from >= to || row.len() < to {
+                continue;
             }
-            y += DOT_STEP as i32;
+            for (offset, slot) in row[from..to].iter_mut().enumerate() {
+                let x = from as i32 + offset as i32;
+                let d2 = glow.at(x, glow_row).clamp(0, UNIT);
+                let weight = ramp[(d2 * (RAMP as i64) / UNIT) as usize];
+                let mut pixel = base[weight as usize];
+                if cool_here {
+                    let blue = cool.glow(x, cool_row, cool_peak);
+                    if blue > 0 {
+                        pixel = Color::from_pixel(pixel).mix(cool_ink, blue).pixel();
+                    }
+                }
+                if warm_here {
+                    let violet = warm.glow(x, warm_row, warm_peak);
+                    if violet > 0 {
+                        pixel = Color::from_pixel(pixel).mix(warm_ink, violet).pixel();
+                    }
+                }
+                *slot = pixel;
+            }
+        }
+
+        // Разметка: редкая сетка точек. Вторая опора для глаза — по ней видно,
+        // что окно едет, даже когда оно едет по однотонному месту.
+        let step = DOT_STEP * self.scale;
+        let size = DOT_SIZE * self.scale;
+        let mut y = align_up(rect.y, step);
+        while y < rect.bottom() {
+            let mut x = align_up(rect.x, step);
+            while x < rect.right() {
+                draw::blend_rect(
+                    back,
+                    Rect::new(x, y + dy, size, size),
+                    p.wall_dot.color,
+                    p.wall_dot.alpha,
+                );
+                x += step as i32;
+            }
+            y += step as i32;
         }
     }
 
@@ -993,4 +1281,110 @@ fn align_up(value: i32, step: u32) -> i32 {
     // Округление к большему работает и для отрицательных: `div_euclid`
     // округляет вниз в математическом смысле, а не в сторону нуля.
     (value + step - 1).div_euclid(step) * step
+}
+
+
+/// Эллипс, по которому считается пятно на обоях.
+///
+/// Полуоси хранятся не длинами, а множителями: вклад точки в нормированное
+/// расстояние — это `d² · k`, и деление, которое иначе пришлось бы делать на
+/// каждую точку кадра, сделано здесь один раз.
+struct Ellipse {
+    cx: i32,
+    cy: i32,
+    kx: i64,
+    ky: i64,
+}
+
+/// Единица нормированного расстояния в неподвижной точке.
+const UNIT: i64 = 4096;
+
+/// Сколько знаков после запятой хранит множитель полуоси.
+///
+/// Двадцать: при полуоси в тысячу точек множитель получается около пяти
+/// миллионов, и произведение с квадратом расстояния остаётся далеко внутри
+/// шестидесяти четырёх бит, а точность нормированного расстояния — доли
+/// единицы из четырёх тысяч.
+const AXIS_BITS: u32 = 20;
+
+/// Сколько ступеней в таблице перехода.
+const RAMP: usize = 1024;
+
+impl Ellipse {
+    fn new(cx: i32, cy: i32, a: i32, b: i32) -> Self {
+        let a = i64::from(a.max(1));
+        let b = i64::from(b.max(1));
+        Self {
+            cx,
+            cy,
+            kx: (UNIT << AXIS_BITS) / (a * a),
+            ky: (UNIT << AXIS_BITS) / (b * b),
+        }
+    }
+
+    /// Вклад строки в квадрат нормированного расстояния.
+    fn row(&self, y: i32) -> i64 {
+        let dy = i64::from(y - self.cy);
+        (dy * dy * self.ky) >> AXIS_BITS
+    }
+
+    /// Квадрат нормированного расстояния до центра: [`UNIT`] на самом эллипсе.
+    fn at(&self, x: i32, row: i64) -> i64 {
+        let dx = i64::from(x - self.cx);
+        row + ((dx * dx * self.kx) >> AXIS_BITS)
+    }
+
+    /// Насыщенность цветного круга в этой точке, 0 за его краем.
+    fn glow(&self, x: i32, row: i64, peak: i64) -> u8 {
+        let d2 = self.at(x, row);
+        if d2 >= UNIT {
+            return 0;
+        }
+        let fade = UNIT - d2;
+        (peak * fade / UNIT * fade / UNIT).clamp(0, 255) as u8
+    }
+}
+
+/// Доля точки, накрытая скруглённым углом.
+///
+/// `depth_x` и `depth_y` — на сколько точка углублена в угловой квадрат,
+/// считая от его внешнего края внутрь. Центр дуги при этом стоит в точке
+/// `(radius, radius)` того же квадрата, и задача сводится к расстоянию до него.
+fn corner_coverage(depth_x: i32, depth_y: i32, radius: i32) -> u8 {
+    if radius <= 0 {
+        return 255;
+    }
+    // Расстояние считается до центра точки, поэтому половина точки прибавлена
+    // сразу: без неё край дуги смещается на полточки внутрь, и скругление у
+    // соседних окон выглядит разной толщины.
+    let dx = i64::from(depth_x) * 256 - 128;
+    let dy = i64::from(depth_y) * 256 - 128;
+    let distance = isqrt((dx * dx + dy * dy) as u64) as i64;
+    let edge = i64::from(radius) * 256;
+    if distance + 128 <= edge {
+        return 255;
+    }
+    if distance >= edge + 128 {
+        return 0;
+    }
+    ((edge + 128 - distance) * 255 / 256).clamp(0, 255) as u8
+}
+
+/// Целочисленный квадратный корень.
+///
+/// Свой, а не из ядра языка: плавающую точку в ядре трогать нельзя — на AArch64
+/// её регистры в обработчике прерывания не сохраняются, и одно умножение на
+/// `f32` посреди отрисовки портит состояние прерванной задачи.
+fn isqrt(value: u64) -> u64 {
+    if value < 2 {
+        return value;
+    }
+    let mut guess = 1u64 << ((65 - value.leading_zeros()) / 2);
+    loop {
+        let next = (guess + value / guess) / 2;
+        if next >= guess {
+            return guess;
+        }
+        guess = next;
+    }
 }

@@ -35,8 +35,11 @@
 
 extern crate alloc;
 
+pub mod draw;
 pub mod font;
+pub mod glyphicon;
 pub mod text;
+pub mod typeface;
 pub mod widget;
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -311,6 +314,24 @@ impl Surface {
             return 0;
         }
         self.pixels[(y as usize) * (self.width as usize) + (x as usize)]
+    }
+
+    /// Одна строка пикселей на запись.
+    ///
+    /// Нужна тем, кто заполняет строку целиком и считает цвет каждой точки сам:
+    /// обоям рабочего стола. Через [`Surface::put`] это стоило бы проверки
+    /// границ на каждую из миллиона точек кадра, а в эмуляторе без ускорения
+    /// такая проверка — не «немного дороже», а разница между мгновенной
+    /// перерисовкой и отстающей на секунду картинкой.
+    ///
+    /// Пустой срез за пределами поверхности: вызывающий и так пишет в цикле по
+    /// строкам, и отдельная проверка у него была бы третьей подряд.
+    pub fn row_mut(&mut self, y: u32) -> &mut [u32] {
+        if y >= self.height {
+            return &mut [];
+        }
+        let start = (y as usize) * (self.width as usize);
+        &mut self.pixels[start..start + self.width as usize]
     }
 
     /// Вывести часть другой поверхности в эту.

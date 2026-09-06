@@ -6,7 +6,16 @@
 //! меняется само по себе: терминал печатает, список файлов листается. Значок не
 //! меняется вовсе — он рисуется поверх фона теми же примитивами, что и фон, и
 //! стоит ровно столько же. Отдельная поверхность на каждый значок означала бы
-//! мегабайты памяти под картинку, которую можно нарисовать шестью заливками.
+//! мегабайты памяти под картинку, которую можно нарисовать плиткой и подписью.
+//!
+//! # Почему подсветка смешивается, а не сводится
+//!
+//! Значок лежит **прямо на обоях**, и полоса кадра, в которую он рисует, обои
+//! уже содержит. Значит цвет под каждой точкой известен по-настоящему, и
+//! полупрозрачные токены (`hover1`, `hover2`) можно смешать честно, а не
+//! свести заранее к непрозрачному поверх усреднённых обоев. Сведение здесь
+//! выдало бы себя сразу: прямоугольник подсветки оказался бы чуть светлее или
+//! темнее фона по краям градиента.
 //!
 //! # Почему открытие по двойному щелчку
 //!
@@ -22,38 +31,34 @@
 //! бы завести в файловой системе оповещение об изменениях — устройство размером
 //! с сам рабочий стол ради каталога, в котором десяток записей. Список
 //! перечитывается там, где стол и так знает, что что-то произошло, и по пункту
-//! «Refresh» — как в любом обозревателе файлов.
+//! «Обновить» — как в любом обозревателе файлов.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use mini_ui::text::{self};
-use mini_ui::{Color, Rect, Surface};
+use mini_ui::draw;
+use mini_ui::glyphicon::Icon;
+use mini_ui::typeface::Role;
+use mini_ui::{Rect, Surface};
 
+use super::paint::{self, Ctx, Tone};
 use super::theme;
 use super::window::App;
 use crate::vfs::NodeKind;
 
-/// Сторона картинки значка при масштабе 1.
-const ART: u32 = 32;
-/// Ширина ячейки значка вместе с подписью, при масштабе 1.
+/// Поле внутри ячейки: слева, справа и сверху.
 ///
-/// Не 96, как было до появления файлов: в ячейку такой ширины помещается
-/// двенадцать знаков подписи, и «This computer» обрывалось на «This comput>».
-/// Имена файлов бывают любые, но четырнадцать знаков покрывают и системные
-/// подписи, и то, что создаёт меню стола («New file 2.txt»).
-const CELL_W: u32 = 112;
-/// Высота ячейки значка, при масштабе 1.
-const CELL_H: u32 = 64;
-/// Отступ сетки значков от края экрана, при масштабе 1.
-const MARGIN: u32 = 12;
+/// Остальная сетка живёт в [`theme`] и только там: по тем же числам стенд
+/// наводит указатель на значок, и второй набор констант здесь означал бы, что
+/// проверка целится не туда, куда нарисовано.
+const CELL_PAD: u32 = 10;
 
 /// Сколько записей каталога стола показывается.
 ///
 /// Предел не косметический: имена приходят с носителя, и каталог с тысячей
 /// файлов означал бы тысячу строк в куче и сетку значков поверх всего экрана.
 /// Лишнее не пропадает — оно видно в файловом менеджере, куда и ведёт двойной
-/// щелчок по значку «This computer».
+/// щелчок по значку «Файлы».
 const MAX_ENTRIES: usize = 48;
 
 /// Что лежит на столе от системы и в каком порядке — сверху вниз.
@@ -61,12 +66,7 @@ const MAX_ENTRIES: usize = 48;
 /// Порядок не алфавитный и не случайный: сначала то, чем человек пользуется,
 /// открыв систему впервые («здесь мои файлы»), затем инструменты. Список
 /// короткий намеренно — стол, засыпанный значками, ничем не лучше пустого.
-const SYSTEM: [(App, &str); 4] = [
-    (App::Files, "This computer"),
-    (App::Terminal, "Terminal"),
-    (App::Settings, "Settings"),
-    (App::About, "About"),
-];
+const SYSTEM: [App; 4] = [App::Files, App::Terminal, App::Settings, App::About];
 
 /// Что за значок стоит в ячейке.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -85,7 +85,7 @@ pub struct Item {
     pub label: String,
     /// Полный путь — только у того, что лежит в каталоге стола.
     ///
-    /// У системного значка пути нет вовсе, и это не пропуск: «Settings» — не
+    /// У системного значка пути нет вовсе, и это не пропуск: «Параметры» — не
     /// файл, переименовать и удалить его нечем. По отсутствию пути меню и
     /// решает, что предлагать человеку.
     pub path: Option<String>,
@@ -102,8 +102,8 @@ pub struct Icons {
     /// Сколько значков помещается в столбец.
     ///
     /// Считается от рабочей области, а не задано числом: на 800×600 в столбец
-    /// входит восемь ячеек, на 1080p — шестнадцать, и сетка, посчитанная под
-    /// один экран, на другом уехала бы под панель задач.
+    /// входит меньше ячеек, чем на 1080p, и сетка, посчитанная под один экран,
+    /// на другом уехала бы под панель задач.
     rows: u32,
 }
 
@@ -115,10 +115,31 @@ impl Icons {
         icons
     }
 
+    /// Контекст отрисовки.
+    ///
+    /// Подложка — усреднённые обои: значок лежит на них, и всё, что у него
+    /// сводится к непрозрачному (заливка плитки), обязано сводиться поверх них,
+    /// а не поверх окна. Берётся среднее, а не цвет под самой ячейкой, — иначе
+    /// один и тот же значок менял бы оттенок при переносе сетки.
+    fn ctx(&self) -> Ctx {
+        let palette = theme::palette();
+        Ctx::scaled(self.scale).on(theme::wall_average(palette))
+    }
+
+    /// Перечитать цвета под текущую тему.
+    ///
+    /// Тело пустое, и это не заглушка: значки не держат ни одной поверхности и
+    /// ни одного сведённого цвета — палитра спрашивается заново на каждой
+    /// отрисовке (см. [`Icons::ctx`]). Метод существует потому, что вызывающему
+    /// не положено знать, у кого из слоёв есть что перекрашивать; появись у
+    /// значков кеш — перекраска окажется здесь, а стол править не придётся.
+    pub fn restyle(&mut self) {}
+
     /// Задать высоту рабочей области — от неё считается длина столбца.
     pub fn set_area(&mut self, work_bottom: i32) {
-        let usable = (work_bottom - (MARGIN * self.scale) as i32).max(0) as u32;
-        self.rows = (usable / (CELL_H * self.scale)).max(1);
+        let ctx = self.ctx();
+        let usable = (work_bottom - ctx.px(theme::ICON_MARGIN) as i32).max(0) as u32;
+        self.rows = (usable / ctx.px(theme::ICON_CELL_H + theme::ICON_GAP).max(1)).max(1);
     }
 
     /// Перечитать каталог стола.
@@ -193,26 +214,30 @@ impl Icons {
     /// рабочих столах, и причина у всех одна — вниз экрана меньше, чем вправо,
     /// и столбец кончается предсказуемо.
     fn cell(&self, index: usize) -> Rect {
-        let scale = self.scale;
-        let column = index as u32 / self.rows;
-        let row = index as u32 % self.rows;
+        let ctx = self.ctx();
+        let margin = ctx.px(theme::ICON_MARGIN) as i32;
+        let step_x = ctx.px(theme::ICON_CELL_W + theme::ICON_GAP);
+        let step_y = ctx.px(theme::ICON_CELL_H + theme::ICON_GAP);
+        let column = index as u32 / self.rows.max(1);
+        let row = index as u32 % self.rows.max(1);
         Rect::new(
-            (MARGIN * scale + column * CELL_W * scale) as i32,
-            (MARGIN * scale + row * CELL_H * scale) as i32,
-            CELL_W * scale,
-            CELL_H * scale,
+            margin + (column * step_x) as i32,
+            margin + (row * step_y) as i32,
+            ctx.px(theme::ICON_CELL_W),
+            ctx.px(theme::ICON_CELL_H),
         )
     }
 
     /// Все ячейки вместе — область, которую занимает сетка значков.
     #[must_use]
     pub fn bounds(&self) -> Rect {
-        let columns = (self.items.len() as u32).div_ceil(self.rows).max(1);
+        let ctx = self.ctx();
+        let columns = (self.items.len() as u32).div_ceil(self.rows.max(1)).max(1);
         Rect::new(
-            (MARGIN * self.scale) as i32,
-            (MARGIN * self.scale) as i32,
-            columns * CELL_W * self.scale,
-            self.rows * CELL_H * self.scale,
+            ctx.px(theme::ICON_MARGIN) as i32,
+            ctx.px(theme::ICON_MARGIN) as i32,
+            columns * ctx.px(theme::ICON_CELL_W + theme::ICON_GAP),
+            self.rows * ctx.px(theme::ICON_CELL_H + theme::ICON_GAP),
         )
     }
 
@@ -271,221 +296,107 @@ impl Icons {
 
     /// Нарисовать один значок в полосе кадра.
     fn draw_one(&self, back: &mut Surface, cell: Rect, dy: i32, item: &Item, selected: bool) {
-        // Всё рисование идёт в координатах экрана, а в полосу переводится одним
+        // Всё считается в координатах экрана, а в полосу переводится одним
         // сдвигом здесь: две системы координат внутри рисующего кода — это две
         // возможности перепутать, и обе выглядят как значок, уехавший на
         // полполосы.
-        let mut paint = |rect: Rect, color: Color| {
-            back.fill(rect.translate(0, dy), color);
-        };
-        let scale = self.scale;
-        let art = ART * scale;
-        let art_x = cell.x + (cell.w.saturating_sub(art) / 2) as i32;
-        let art_y = cell.y + (4 * scale) as i32;
+        let cell = cell.translate(0, dy);
+        let ctx = self.ctx();
+        let p = ctx.palette;
 
         if selected {
-            // Подсветка — по всей ячейке, а не по картинке: человек целится в
+            // Подсветка — по всей ячейке, а не по плитке: человек целится в
             // значок вместе с подписью, и выделять надо то, во что он целился.
-            paint(cell, theme::SELECT_BG);
+            let r = ctx.px(theme::R_CARD);
+            draw::rounded(back, cell, r, p.hover2.color, p.hover2.alpha);
+            draw::rounded_stroke(back, cell, r, p.accline.color, p.accline.alpha);
         }
 
-        match &item.kind {
-            // Системный блок с экраном: прямоугольник, светлое «стекло» и
-            // подставка. Узнаваемость здесь важнее правдоподобия — значок
-            // размером в тридцать две точки не бывает похож на настоящую вещь.
-            Kind::App(App::Files) => {
-                paint(Rect::new(art_x, art_y, art, art * 3 / 4), theme::FRAME);
-                paint(
-                    Rect::new(
-                        art_x + 3 * scale as i32,
-                        art_y + 3 * scale as i32,
-                        art - 6 * scale,
-                        art * 3 / 4 - 6 * scale,
-                    ),
-                    theme::ACCENT,
-                );
-                paint(
-                    Rect::new(
-                        art_x + (art / 3) as i32,
-                        art_y + (art * 3 / 4) as i32,
-                        art / 3,
-                        4 * scale,
-                    ),
-                    theme::FRAME,
-                );
-                paint(
-                    Rect::new(
-                        art_x + (art / 6) as i32,
-                        art_y + (art * 3 / 4 + 4 * scale) as i32,
-                        art * 2 / 3,
-                        3 * scale,
-                    ),
-                    theme::FRAME,
-                );
-            }
-            // Окно терминала с приглашением: рамка и две чёрточки.
-            Kind::App(App::Terminal) => {
-                paint(Rect::new(art_x, art_y, art, art), theme::FRAME);
-                paint(
-                    Rect::new(
-                        art_x + 2 * scale as i32,
-                        art_y + (6 * scale) as i32,
-                        art - 4 * scale,
-                        art - 8 * scale,
-                    ),
-                    Color::rgb(0x06, 0x10, 0x18),
-                );
-                text::draw_text_at(
-                    back,
-                    art_x + 5 * scale as i32,
-                    art_y + 11 * scale as i32 + dy,
-                    ">_",
-                    scale,
-                    theme::DIRECTORY,
-                    None,
-                );
-            }
-            // Шестерёнка: круг из четырёх зубцов вокруг квадрата. На такой
-            // сетке настоящая шестерёнка превращается в кашу, а этот силуэт
-            // читается.
-            Kind::App(App::Settings) => {
-                let centre = (art_x + (art / 2) as i32, art_y + (art / 2) as i32);
-                let arm = (art / 3) as i32;
-                let thick = 6 * scale;
-                paint(
-                    Rect::new(
-                        centre.0 - (thick / 2) as i32,
-                        centre.1 - arm,
-                        thick,
-                        arm as u32 * 2,
-                    ),
-                    theme::DIM,
-                );
-                paint(
-                    Rect::new(
-                        centre.0 - arm,
-                        centre.1 - (thick / 2) as i32,
-                        arm as u32 * 2,
-                        thick,
-                    ),
-                    theme::DIM,
-                );
-                paint(
-                    Rect::new(
-                        centre.0 - (art / 4) as i32,
-                        centre.1 - (art / 4) as i32,
-                        art / 2,
-                        art / 2,
-                    ),
-                    theme::ACCENT,
-                );
-                paint(
-                    Rect::new(
-                        centre.0 - (art / 8) as i32,
-                        centre.1 - (art / 8) as i32,
-                        art / 4,
-                        art / 4,
-                    ),
-                    theme::DESKTOP_TOP,
-                );
-            }
-            // Папка: корешок с язычком сверху слева. Язычок — единственное, чем
-            // папка отличается от любого другого прямоугольника, поэтому он
-            // рисуется даже при масштабе 1, где на него приходится три точки.
-            Kind::Folder => {
-                let body_y = art_y + (art / 5) as i32;
-                paint(
-                    Rect::new(art_x, art_y + (art / 8) as i32, art * 2 / 5, art / 8),
-                    theme::DIRECTORY,
-                );
-                paint(
-                    Rect::new(art_x, body_y, art, art * 5 / 8),
-                    theme::DIRECTORY,
-                );
-                // Тёмная полоска внутри — «створка»: без неё папка на тёмном
-                // фоне читается как сплошная зелёная плитка.
-                paint(
-                    Rect::new(
-                        art_x + 2 * scale as i32,
-                        body_y + 3 * scale as i32,
-                        art - 4 * scale,
-                        2 * scale,
-                    ),
-                    theme::DESKTOP_TOP,
-                );
-            }
-            // Лист бумаги с загнутым уголком и тремя строчками текста. Уголок —
-            // то, по чему файл отличают от папки на любом рабочем столе.
-            Kind::File => {
-                let w = art * 3 / 4;
-                let x = art_x + (art - w) as i32 / 2;
-                paint(Rect::new(x, art_y, w, art), theme::TEXT);
-                // Уголок: ступенька из треугольника, сложенного полосками.
-                let fold = w / 3;
-                for step in 0..fold {
-                    paint(
-                        Rect::new(
-                            x + (w - fold + step) as i32,
-                            art_y + step as i32,
-                            fold - step,
-                            1,
-                        ),
-                        theme::DESKTOP_TOP,
-                    );
-                }
-                for line in 0..3u32 {
-                    paint(
-                        Rect::new(
-                            x + 3 * scale as i32,
-                            art_y + (art / 2 + line * 5 * scale) as i32,
-                            w.saturating_sub(6 * scale),
-                            2 * scale,
-                        ),
-                        theme::DIM,
-                    );
-                }
-            }
-            // Буква «i» в круге — то, чем «сведения» обозначены везде.
-            Kind::App(_) => {
-                paint(Rect::new(art_x, art_y, art, art), theme::ACCENT);
-                paint(
-                    Rect::new(
-                        art_x + 3 * scale as i32,
-                        art_y + 3 * scale as i32,
-                        art - 6 * scale,
-                        art - 6 * scale,
-                    ),
-                    theme::WINDOW_BG,
-                );
-                text::draw_text_at(
-                    back,
-                    art_x + (art / 2) as i32 - (text::GLYPH_W * scale / 2) as i32,
-                    art_y + (art / 2) as i32 - (text::GLYPH_H * scale / 2) as i32 + dy,
-                    "i",
-                    scale,
-                    theme::TEXT,
-                    None,
-                );
-            }
-        }
-
-        // Подпись — по центру ячейки. Длинную обрезаем, а не переносим: две
-        // строки под значком сделали бы сетку неровной, а имена файлов бывают
-        // любой длины и переносить их пришлось бы посреди слова.
-        let room = (cell.w / (text::GLYPH_W * scale)) as usize;
-        let label = fit(&item.label, room);
-        let text_w = text::width_of(&label, scale);
-        let text_x = cell.x + ((cell.w.saturating_sub(text_w)) / 2) as i32;
-        let text_y = art_y + (ART * scale + 4 * scale) as i32;
-        text::draw_text_at(
-            back,
-            text_x.max(cell.x),
-            text_y + dy,
-            &label,
-            scale,
-            theme::TEXT,
-            None,
+        let side = ctx.px(theme::ICON_TILE);
+        let tile = Rect::new(
+            cell.x + (cell.w as i32 - side as i32) / 2,
+            cell.y + ctx.px(CELL_PAD) as i32,
+            side,
+            side,
         );
+        let (icon, tone, filled) = art(&item.kind);
+        paint::icon_tile(ctx, back, tile, icon, tone, filled);
+
+        // Подпись — до двух строк. Одна строка обрезала бы «This computer» на
+        // «This comp…», а три сделали бы сетку неровной: высота ячейки задана
+        // числом, и третья строка выехала бы на соседнюю ячейку.
+        let pad = ctx.px(CELL_PAD);
+        let room = cell.w.saturating_sub(pad * 2);
+        let ink = if selected { p.ink } else { p.ink2 };
+        let step = u32::from(ctx.face(Role::Label).line);
+        let mut y = tile.bottom() + ctx.px(theme::ICON_LABEL_GAP) as i32;
+        let (first, second) = wrap(ctx, &item.label, room);
+        centered(ctx, back, cell, y, room, &first, ink);
+        if let Some(second) = second {
+            y += step as i32;
+            centered(ctx, back, cell, y, room, &second, ink);
+        }
+    }
+}
+
+/// Плитка значка: что на ней нарисовано и залита ли она цветом.
+///
+/// Картинка и оттенок берутся у самой программы: значок в заголовке окна, в
+/// меню запуска и на столе обязан быть одним и тем же, а три списка соответствий
+/// разошлись бы в первый же день.
+///
+/// Залиты только два значка из всех. Заливка — это «сюда смотреть в первую
+/// очередь», и если залить всё, она перестаёт что-либо значить.
+fn art(kind: &Kind) -> (Icon, Tone, bool) {
+    match kind {
+        Kind::App(app) => (
+            app.icon(),
+            app.tone(),
+            matches!(app, App::Files | App::Terminal),
+        ),
+        Kind::Folder => (Icon::Folder, Tone::Muted, false),
+        Kind::File => (Icon::File, Tone::Muted, false),
+    }
+}
+
+/// Написать строку подписи по центру ячейки.
+fn centered(
+    ctx: Ctx,
+    s: &mut Surface,
+    cell: Rect,
+    y: i32,
+    room: u32,
+    line: &str,
+    ink: mini_ui::Color,
+) {
+    let width = ctx.face(Role::Label).width(line).min(room);
+    let x = cell.x + (cell.w as i32 - width as i32) / 2;
+    paint::text_clipped(ctx, s, Role::Label, x, y, room, line, ink);
+}
+
+/// Разложить подпись на одну-две строки.
+///
+/// Перенос ищется по границе слова: «New folder 2», разорванное на «New fold» и
+/// «er 2», читается как испорченное имя, а не как перенос. Слова, которое не
+/// помещается целиком, это не спасает — тогда рвём где придётся, а хвост второй
+/// строки обрежет многоточие.
+fn wrap(ctx: Ctx, label: &str, room: u32) -> (String, Option<String>) {
+    let face = ctx.face(Role::Label);
+    if face.width(label) <= room {
+        return (label.to_string(), None);
+    }
+    let fits = face.fits(label, room);
+    let head: String = label.chars().take(fits).collect();
+    match head.rfind(' ') {
+        Some(at) if at > 0 => {
+            let first: String = head[..at].to_string();
+            let rest: String = label.chars().skip(first.chars().count() + 1).collect();
+            (first, Some(rest))
+        }
+        _ => {
+            let rest: String = label.chars().skip(fits).collect();
+            (head, Some(rest))
+        }
     }
 }
 
@@ -493,27 +404,10 @@ impl Icons {
 fn system_items() -> Vec<Item> {
     SYSTEM
         .iter()
-        .map(|(app, label)| Item {
+        .map(|app| Item {
             kind: Kind::App(*app),
-            label: (*label).to_string(),
+            label: app.caption().to_string(),
             path: None,
         })
         .collect()
-}
-
-/// Обрезать подпись по числу знаков, пометив обрезку.
-///
-/// Знак `>` на конце говорит, что имя продолжается; многоточия в шрифте 8×8
-/// нет, а обрубленное на полбукве имя выглядит как испорченный вывод, а не как
-/// «здесь не поместилось».
-fn fit(text: &str, room: usize) -> String {
-    if room == 0 {
-        return String::new();
-    }
-    if text.chars().count() <= room {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(room - 1).collect();
-    out.push('>');
-    out
 }

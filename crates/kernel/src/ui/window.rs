@@ -1,14 +1,41 @@
-//! Окно: поверхность вместе с рамкой, заголовком и содержимым.
+//! Окно: поверхность вместе с заголовком и содержимым.
 //!
 //! Украшения нарисованы в той же поверхности, что и содержимое, поэтому вывод
 //! окна на экран — одна операция, а не три. Плата — перерисовка заголовка при
 //! смене активного окна, то есть несколько тысяч пикселей в обычной памяти,
 //! которую, в отличие от экрана, можно и читать, и переписывать сколько угодно.
+//!
+//! # Почему у окна нет рамки
+//!
+//! Рамка в две точки была единственным способом отделить окно от фона, пока
+//! фон и окно отличались только яркостью заливки. Теперь окно отделяет
+//! однопиксельная обводка изнутри и светлая кромка по верхнему краю — то же,
+//! чем отделяет себя лист бумаги, лежащий на столе. Толстая рамка при этом
+//! съедала по четыре точки с каждой стороны и делала маленькое окно ещё меньше.
+//!
+//! # Почему скругление рисует не окно, а композитор
+//!
+//! Поверхность окна прямоугольна, и прозрачности в ней нет. Скруглённый угол —
+//! это место, где сквозь окно видны обои, а обои знает только композитор.
+//! Поэтому окно рисует себя во всю поверхность, а углы срезаются при выводе,
+//! смешиванием с уже нарисованным фоном.
+//!
+//! # Почему высота заголовка не зависит от фокуса
+//!
+//! В макете у неактивного окна полоса ниже. Сделать так значило бы, что при
+//! каждом переключении окон область содержимого меняет размер, а список файлов
+//! и «Параметры» пересобирают раскладку. Неактивное окно отличается тем, что
+//! теряет градиент, кромку и заливку кнопок, — этого достаточно, и это стоит
+//! одной полосы, а не всего окна.
 
-use mini_ui::text::{self, TextGrid};
+use mini_ui::draw;
+use mini_ui::glyphicon::Icon;
+use mini_ui::text::TextGrid;
+use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface};
 
 use super::files::FilesView;
+use super::paint::{self, Ctx, Weight};
 use super::settings::SettingsView;
 use super::theme;
 use crate::input::KeyCode;
@@ -71,7 +98,52 @@ impl App {
         }
     }
 
-    /// Заголовок окна и подпись в панели задач.
+    /// Как окно называется для человека.
+    ///
+    /// Отдельно от [`App::title`], а не вместо него: `title` попадает в журнал,
+    /// по нему стенд находит окно на экране и по нему же сверяет строки прогона.
+    /// Журнал — инструмент разработчика и остаётся на латинице; заголовок окна
+    /// читает человек, и он на его языке.
+    #[must_use]
+    pub const fn caption(self) -> &'static str {
+        match self {
+            App::Terminal => "Терминал",
+            App::System => "Системный монитор",
+            App::Files => "Файлы",
+            App::About => "О системе",
+            App::Settings => "Параметры",
+            App::Shutdown => "Выключение",
+            App::Restart => "Перезагрузка",
+        }
+    }
+
+    /// Каким цветом горит значок программы.
+    ///
+    /// Цвет опознаёт окно раньше, чем прочитан заголовок: зелёный — терминал,
+    /// красный — вопрос о выключении, синий — всё остальное.
+    #[must_use]
+    pub const fn tone(self) -> super::paint::Tone {
+        match self {
+            App::Terminal => super::paint::Tone::Ok,
+            App::Shutdown | App::Restart => super::paint::Tone::Bad,
+            _ => super::paint::Tone::Accent,
+        }
+    }
+
+    /// Значок программы: на столе, в меню запуска и в заголовке окна.
+    #[must_use]
+    pub const fn icon(self) -> Icon {
+        match self {
+            App::Terminal => Icon::Terminal,
+            App::System => Icon::Chart,
+            App::Files => Icon::Folder,
+            App::About => Icon::Info,
+            App::Settings => Icon::Settings,
+            App::Shutdown | App::Restart => Icon::Power,
+        }
+    }
+
+    /// Имя окна в журнале и в прицеле стенда.
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
@@ -89,13 +161,13 @@ impl App {
     #[must_use]
     pub const fn about(self) -> &'static str {
         match self {
-            App::Terminal => "shell and kernel commands",
-            App::Files => "browse the mounted root",
-            App::System => "memory, tasks, input counters",
-            App::About => "what this system is",
-            App::Settings => "screen, programs, updates",
-            App::Shutdown => "close the volume and switch off",
-            App::Restart => "close the volume and start again",
+            App::Terminal => "оболочка и команды ядра",
+            App::Files => "обзор смонтированного корня",
+            App::System => "память, задачи, счётчики ввода",
+            App::About => "что это за система",
+            App::Settings => "экран, программы, обновление",
+            App::Shutdown => "закрыть том и выключить",
+            App::Restart => "закрыть том и запустить снова",
         }
     }
 }
@@ -132,11 +204,12 @@ pub struct Window {
     pub rect: Rect,
     surface: Surface,
     content: Content,
-    /// Масштаб глифа содержимого.
+    /// Множитель геометрии стола: 1 на обычном экране, 2 на очень плотном.
+    ///
+    /// Из него же выводится размерный ряд шрифта — порог у них общий, и хранить
+    /// два числа значило бы однажды нарисовать кнопку одного ряда шрифтом
+    /// другого.
     scale: u32,
-    /// Масштаб глифа заголовка. Ограничен двойкой: на экране 1920 заголовок
-    /// втрое крупнее обычного съел бы половину окна.
-    title_scale: u32,
     /// Окно свёрнуто: его нет на экране, но оно есть в панели задач.
     ///
     /// Свёрнутое окно сохраняет и поверхность, и содержимое: свернуть — это
@@ -157,7 +230,10 @@ const MIN_W: u32 = 220;
 const MIN_H: u32 = 120;
 
 /// Сторона уголка, за который тянут размер.
-const GRIP: u32 = 16;
+///
+/// Больше прежних шестнадцати: у скруглённого окна сам угол срезан, и попасть
+/// в квадрат, половина которого приходится на срез, мышью нельзя.
+const GRIP: u32 = 20;
 
 impl Window {
     /// Создать текстовое окно.
@@ -168,15 +244,16 @@ impl Window {
     /// обязана продолжить работу без этого окна.
     #[must_use]
     pub fn text(app: App, rect: Rect, scale: u32) -> Option<Self> {
-        let surface = Surface::new(rect.w, rect.h, theme::WINDOW_BG)?;
-        let title_scale = scale.min(2);
+        let ctx = Ctx::scaled(scale);
+        let back = theme::window_bg();
+        let surface = Surface::new(rect.w, rect.h, back)?;
         let grid = TextGrid::new(
-            content_area(&surface, title_scale),
-            scale,
-            theme::TEXT,
-            theme::WINDOW_BG,
+            content_area(&surface, scale).shrink(ctx.px(4)),
+            ctx.face(Role::Mono),
+            ctx.palette.ink2,
+            back,
         )?;
-        let mut window = Self::wrap(app, rect, surface, Content::Text(grid), scale, title_scale);
+        let mut window = Self::wrap(app, rect, surface, Content::Text(grid), scale);
         window.draw_decorations(false);
         Some(window)
     }
@@ -184,10 +261,9 @@ impl Window {
     /// Создать окно параметров.
     #[must_use]
     pub fn settings(rect: Rect, scale: u32, screen: (u32, u32)) -> Option<Self> {
-        let surface = Surface::new(rect.w, rect.h, theme::WINDOW_BG)?;
-        let title_scale = scale.min(2);
+        let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
         let content = Content::Settings(SettingsView::new(screen));
-        let mut window = Self::wrap(App::Settings, rect, surface, content, scale, title_scale);
+        let mut window = Self::wrap(App::Settings, rect, surface, content, scale);
         window.redraw_content();
         window.draw_decorations(false);
         Some(window)
@@ -196,30 +272,21 @@ impl Window {
     /// Создать окно файлового менеджера.
     #[must_use]
     pub fn files(rect: Rect, scale: u32) -> Option<Self> {
-        let surface = Surface::new(rect.w, rect.h, theme::WINDOW_BG)?;
-        let title_scale = scale.min(2);
+        let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
         let content = Content::Files(FilesView::new());
-        let mut window = Self::wrap(App::Files, rect, surface, content, scale, title_scale);
+        let mut window = Self::wrap(App::Files, rect, surface, content, scale);
         window.redraw_content();
         window.draw_decorations(false);
         Some(window)
     }
 
-    fn wrap(
-        app: App,
-        rect: Rect,
-        surface: Surface,
-        content: Content,
-        scale: u32,
-        title_scale: u32,
-    ) -> Self {
+    fn wrap(app: App, rect: Rect, surface: Surface, content: Content, scale: u32) -> Self {
         Self {
             app,
             rect,
             surface,
             content,
             scale,
-            title_scale,
             minimized: false,
             restore: None,
             damage: Rect::EMPTY,
@@ -228,8 +295,13 @@ impl Window {
 
     /// Высота полосы заголовка при заданном масштабе.
     #[must_use]
-    pub const fn title_height(title_scale: u32) -> u32 {
-        text::GLYPH_H * title_scale + theme::PADDING * 2
+    pub const fn title_height(scale: u32) -> u32 {
+        theme::TITLE_H * scale
+    }
+
+    /// Контекст отрисовки этого окна.
+    fn ctx(&self) -> Ctx {
+        Ctx::scaled(self.scale)
     }
 
     /// Кнопки заголовка справа налево: закрыть, развернуть, свернуть.
@@ -237,10 +309,15 @@ impl Window {
     /// Порядок как у окон, к которым человек привык: крестик крайний справа,
     /// потому что промахнуться мимо него — это закрыть окно, а не свернуть.
     fn title_button(&self, from_right: u32) -> Rect {
-        let size = Self::title_height(self.title_scale);
+        let scale = self.scale;
+        let size = theme::TITLE_BTN * scale;
+        let gap = theme::TITLE_GAP * scale;
+        let margin = 10 * scale;
+        let step = size + gap;
+        let right = self.surface.width() as i32 - margin as i32;
         Rect::new(
-            self.surface.width() as i32 - (theme::BORDER + size * (from_right + 1)) as i32,
-            theme::BORDER as i32,
+            right - (size + step * from_right) as i32,
+            (Self::title_height(scale) as i32 - size as i32) / 2,
             size,
             size,
         )
@@ -290,7 +367,7 @@ impl Window {
         if self.minimize_button().contains(local.0, local.1) {
             return Some(Hit::Minimize);
         }
-        let title_bottom = (theme::BORDER + Self::title_height(self.title_scale)) as i32;
+        let title_bottom = Self::title_height(self.scale) as i32;
         if local.1 < title_bottom {
             return Some(Hit::Title);
         }
@@ -303,72 +380,110 @@ impl Window {
         Some(Hit::Body)
     }
 
-    /// Нарисовать рамку, заголовок и кнопку закрытия.
+    /// Нарисовать заголовок, кнопки и обводку окна.
+    ///
+    /// Полоса заголовка — градиент сверху вниз, поверх него светлая кромка в
+    /// одну точку и линия под полосой. Три полосы вместо одной заливки: без них
+    /// заголовок и содержимое отличаются на две единицы яркости, и граница
+    /// между ними не читается вовсе.
     pub fn draw_decorations(&mut self, focused: bool) {
-        let title_h = Self::title_height(self.title_scale);
+        let ctx = self.ctx();
+        let p = ctx.palette;
+        let scale = self.scale;
+        let title_h = Self::title_height(scale);
         let bounds = self.surface.bounds();
+        let radius = ctx.px(theme::R_WINDOW);
+        let bar = Rect::new(0, 0, bounds.w, title_h);
 
-        // Неактивное окно получает тот же цвет, приглушённый к фону: заголовок
-        // остаётся видимым, но перестаёт спорить за внимание с активным.
-        let accent = if focused {
-            theme::ACCENT
-        } else {
-            theme::inactive(theme::ACCENT)
-        };
-
-        self.surface.frame(bounds, theme::BORDER, theme::FRAME);
-        let title_bar = Rect::new(
-            theme::BORDER as i32,
-            theme::BORDER as i32,
-            bounds.w.saturating_sub(theme::BORDER * 2),
-            title_h,
-        );
-        self.surface.fill(title_bar, accent);
-
-        let title_color = if focused { theme::ON_ACCENT } else { theme::TEXT };
-        text::draw_text(
+        // Полоса — прямоугольник без скругления, и это не упущение: верхние
+        // углы окна срезает композитор при выводе, потому что за ними видны
+        // обои, а он один их знает. Скруглить полосу здесь значило бы срезать
+        // угол дважды, а её нижние углы — ещё и там, где под ней лежит не фон,
+        // а содержимое.
+        //
+        // Первая версия обходила это полосой на `radius` выше нужного, и она
+        // молча закрашивала четырнадцать верхних точек содержимого: у
+        // терминала верхняя строка оказывалась срезанной пополам.
+        let top = if focused { p.tb1 } else { p.tb2 };
+        let bottom = p.tb2;
+        draw::rounded_gradient(
             &mut self.surface,
-            theme::BORDER + theme::PADDING,
-            theme::BORDER + theme::PADDING,
-            self.app.title(),
-            self.title_scale,
-            title_color,
-            None,
+            bar,
+            0,
+            ctx.flat(top),
+            ctx.flat(bottom),
+            255,
         );
+        draw::hline(
+            &mut self.surface,
+            0,
+            title_h as i32 - 1,
+            bounds.w,
+            p.tbline.color,
+            p.tbline.alpha,
+        );
+        if focused {
+            draw::crown(&mut self.surface, bounds, radius, p.crown.color, p.crown.alpha);
+        }
+
+        // Значок программы: тот же скруглённый квадрат, что у неё на столе и в
+        // меню. Он и опознаёт окно быстрее заголовка — цвет читается раньше
+        // текста.
+        let badge_side = ctx.px(18);
+        let badge = Rect::new(
+            ctx.px(16) as i32,
+            (title_h as i32 - badge_side as i32) / 2,
+            badge_side,
+            badge_side,
+        );
+        let tone = if focused { self.app.tone() } else { paint::Tone::Muted };
+        paint::badge(ctx, &mut self.surface, badge, tone);
 
         // Кнопки нарисованы всегда, а не только у активного окна: кнопка,
         // появляющаяся при наведении, потребовала бы следить за указателем и
         // перерисовывать заголовок на каждое его движение.
-        let glyph_w = text::GLYPH_W * self.title_scale;
-        let glyph_h = text::GLYPH_H * self.title_scale;
+        //
         // Знак «развернуть» меняется вместе с состоянием: развёрнутое окно
         // предлагает вернуть прежний размер, и одинаковый значок в обоих
         // случаях означал бы, что человек нажимает наугад.
-        let restore_glyph = if self.restore.is_some() { "-" } else { "[" };
-        for (button, glyph, fill) in [
-            (self.minimize_button(), "_", accent),
-            (self.maximize_button(), restore_glyph, accent),
-            (self.close_button(), "x", theme::CLOSE),
+        let restore_icon = if self.restore.is_some() { Icon::Restore } else { Icon::Maximize };
+        let weight = if focused { Weight::Normal } else { Weight::Ghost };
+        for (button, icon, weight) in [
+            (self.minimize_button(), Icon::Minimize, weight),
+            (self.maximize_button(), restore_icon, weight),
+            (
+                self.close_button(),
+                Icon::Close,
+                if focused { Weight::Danger } else { Weight::Ghost },
+            ),
         ] {
-            self.surface.fill(button, fill);
-            text::draw_text(
-                &mut self.surface,
-                button.x as u32 + button.w.saturating_sub(glyph_w) / 2,
-                button.y as u32 + button.h.saturating_sub(glyph_h) / 2,
-                glyph,
-                self.title_scale,
-                if fill == theme::CLOSE || focused {
-                    theme::ON_ACCENT
-                } else {
-                    theme::TEXT
-                },
-                None,
-            );
+            paint::icon_button(ctx, &mut self.surface, button, icon, weight, false);
         }
 
-        // Уголок размера: три косые чёрточки в правом нижнем углу. Без
-        // нарисованного признака за него никто не потянет — угадывать, что окно
-        // где-то тянется, человек не обязан.
+        // Заголовок кончается там, где начинаются кнопки: подпись, заехавшая
+        // под крестик, читается как ошибка отрисовки.
+        let text_x = badge.right() + ctx.px(11) as i32;
+        let room = (self.minimize_button().x - ctx.px(12) as i32 - text_x).max(0) as u32;
+        let ink = if focused { p.ink } else { p.ink4 };
+        paint::text_clipped(
+            ctx,
+            &mut self.surface,
+            Role::Title,
+            text_x,
+            paint::baseline(ctx, Role::Title, bar),
+            room,
+            self.app.caption(),
+            ink,
+        );
+        // Обводка окна — последней: она ложится поверх и полосы заголовка, и
+        // содержимого, и именно она делает из двух прямоугольников один лист.
+        let edge = if focused { p.line3 } else { p.line2 };
+        draw::rounded_stroke(&mut self.surface, bounds, radius, edge.color, edge.alpha);
+
+        // Уголок размера: три точки в правом нижнем углу. Без нарисованного
+        // признака за него никто не потянет — угадывать, что окно где-то
+        // тянется, человек не обязан.
+        //
         // Уголок рисуется, но **не** помечается изменившимся: он не зависит ни
         // от фокуса, ни от содержимого. Пометить его вместе с заголовком стоило
         // бы всей площади окна — прямоугольник изменений один, и объединение
@@ -376,24 +491,53 @@ impl Window {
         // это превращало переключение окон в перерисовку всего экрана: клавиша
         // Tab обрабатывалась дольше пяти секунд.
         let grip = self.resize_grip();
-        for step in 0..3u32 {
-            let offset = (step * 5 + 3) as i32;
-            let from_x = grip.x + grip.w as i32 - 2;
-            let from_y = grip.y + grip.h as i32 - offset;
-            for along in 0..offset.min(grip.w as i32 - 2) {
-                self.surface.fill(
-                    Rect::new(from_x - along, from_y + along, 2, 2),
-                    theme::FRAME,
-                );
-            }
+        let dot = ctx.px(2).max(1);
+        for (dx, dy) in [(0u32, 0u32), (1, 0), (0, 1)] {
+            let step = ctx.px(5) as i32;
+            draw::circle(
+                &mut self.surface,
+                grip.right() - ctx.px(6) as i32 - dx as i32 * step,
+                grip.bottom() - ctx.px(6) as i32 - dy as i32 * step,
+                dot,
+                p.ink6,
+                255,
+            );
         }
 
         // Изменилась только полоса сверху — её и помечаем. Пометить всё окно
         // было бы проще на одну строку и дороже на площадь окна при каждом
         // переключении фокуса.
-        self.damage = self
-            .damage
-            .union(&Rect::new(0, 0, bounds.w, theme::BORDER + title_h));
+        self.damage = self.damage.union(&Rect::new(0, 0, bounds.w, title_h));
+        // Обводка идёт по всему периметру, и без её краёв неактивное окно
+        // осталось бы с яркой рамкой активного. Три полосы в одну точку стоят
+        // ничтожно мало по сравнению с площадью окна.
+        self.damage = self.damage.union(&Rect::new(0, bounds.h as i32 - 1, bounds.w, 1));
+        self.damage = self.damage.union(&Rect::new(0, 0, 1, bounds.h));
+        self.damage = self.damage.union(&Rect::new(bounds.w as i32 - 1, 0, 1, bounds.h));
+    }
+
+    /// Перекрасить окно под текущую тему.
+    ///
+    /// Заголовок перерисует тот, кто знает, активно ли окно, — здесь только
+    /// содержимое. Разделение не косметическое: фокус живёт у композитора, и
+    /// окно, взявшееся угадывать его само, ошибётся на первом же переключении.
+    pub fn restyle(&mut self) {
+        let ctx = self.ctx();
+        let back = theme::window_bg();
+        match &mut self.content {
+            Content::Text(grid) => {
+                // Заливается вся область содержимого, а не только сетка: в
+                // высоту окна редко помещается целое число строк, и остаток
+                // внизу — несколько точек, а то и полтора десятка — иначе
+                // остаётся полосой прежней темы под самой рамкой.
+                let area = content_area(&self.surface, self.scale);
+                self.surface.fill(area, back);
+                grid.recolor(&mut self.surface, ctx.palette.ink2, back);
+                grid.take_damage();
+                self.damage = self.damage.union(&area);
+            }
+            Content::Files(_) | Content::Settings(_) => self.redraw_content(),
+        }
     }
 
     /// Напечатать в окно. Действует только на текстовые окна.
@@ -521,10 +665,14 @@ impl Window {
 
     /// Перерисовать содержимое, которое рисует себя само.
     pub fn redraw_content(&mut self) {
-        let area = content_area(&self.surface, self.title_scale);
+        let area = content_area(&self.surface, self.scale);
+        let ctx = self.ctx();
+        // Содержимое рисуется поверх прежнего, и заливка обязательна: список,
+        // ставший короче, иначе оставил бы под собой хвост предыдущего.
+        self.surface.fill(area, theme::window_bg());
         match &self.content {
-            Content::Files(view) => view.draw(&mut self.surface, area, self.scale),
-            Content::Settings(view) => view.draw(&mut self.surface, area, self.scale),
+            Content::Files(view) => view.draw(&mut self.surface, area, ctx),
+            Content::Settings(view) => view.draw(&mut self.surface, area, ctx),
             Content::Text(_) => return,
         }
         self.damage = self.damage.union(&area);
@@ -562,12 +710,12 @@ impl Window {
     /// `true` — содержимое им воспользовалось и окно перерисовано. Текстовые
     /// окна щелчков не разбирают: в них нечего выбирать мышью.
     pub fn handle_click(&mut self, x: i32, y: i32) -> bool {
-        let area = content_area(&self.surface, self.title_scale);
+        let area = content_area(&self.surface, self.scale);
+        let ctx = self.ctx();
         let local = (x - self.rect.x, y - self.rect.y);
-        let scale = self.scale;
         let used = match &mut self.content {
-            Content::Settings(view) => view.click(area, scale, local.0, local.1),
-            Content::Files(view) => view.click(area, scale, local.0, local.1),
+            Content::Settings(view) => view.click(area, ctx, local.0, local.1),
+            Content::Files(view) => view.click(area, ctx, local.0, local.1),
             Content::Text(_) => false,
         };
         if used {
@@ -576,12 +724,24 @@ impl Window {
         used
     }
 
+    /// Сменило ли содержимое тему с прошлого вопроса.
+    ///
+    /// Признак снимается чтением: спросить обязан ровно один — тот, кто умеет
+    /// перекрасить весь стол, — и второй утвердительный ответ означал бы вторую
+    /// перерисовку экрана на ровном месте.
+    pub fn took_theme_change(&mut self) -> bool {
+        match &mut self.content {
+            Content::Settings(view) => view.take_theme_change(),
+            Content::Files(_) | Content::Text(_) => false,
+        }
+    }
+
     /// Сдвинуть окно, оставив заголовок на экране.
     ///
     /// Полностью уехавшее окно нельзя ни вернуть, ни закрыть мышью, которой на
     /// этой фазе нет, — поэтому часть заголовка обязана остаться видимой.
     pub fn move_within(&mut self, dx: i32, dy: i32, screen_w: u32, bottom_limit: i32) {
-        let keep = Self::title_height(self.title_scale) as i32 * 3;
+        let keep = Self::title_height(self.scale) as i32 * 3;
         let min_x = keep - self.rect.w as i32;
         let max_x = screen_w as i32 - keep;
         let max_y = (bottom_limit - keep).max(0);
@@ -601,13 +761,13 @@ impl Window {
         if w == self.rect.w && h == self.rect.h {
             return true;
         }
-        let Some(mut surface) = Surface::new(w, h, theme::WINDOW_BG) else {
+        let Some(mut surface) = Surface::new(w, h, theme::window_bg()) else {
             return false;
         };
-        let area = content_area(&surface, self.title_scale);
+        let inner = content_area(&surface, self.scale).shrink(self.ctx().px(4));
         match &mut self.content {
             Content::Text(grid) => {
-                if !grid.rebind(&mut surface, area) {
+                if !grid.rebind(&mut surface, inner) {
                     return false;
                 }
             }
@@ -656,12 +816,6 @@ impl Window {
         }
     }
 
-    /// Развёрнуто ли окно во весь экран.
-    #[must_use]
-    pub const fn maximized(&self) -> bool {
-        self.restore.is_some()
-    }
-
     /// Поверхность окна — для сборки кадра.
     #[must_use]
     pub const fn surface(&self) -> &Surface {
@@ -669,17 +823,17 @@ impl Window {
     }
 }
 
-/// Область поверхности под содержимое: всё, кроме рамки и заголовка.
-fn content_area(surface: &Surface, title_scale: u32) -> Rect {
-    let top = theme::BORDER + Window::title_height(title_scale) + theme::PADDING;
+/// Область поверхности под содержимое: всё, что ниже полосы заголовка.
+///
+/// Поля не отнимаются: их назначает само содержимое, и они у списка файлов и у
+/// «Параметров» разные. Отнимать их здесь значило бы, что боковая колонка,
+/// которая обязана доходить до края окна, до него не доходит.
+fn content_area(surface: &Surface, scale: u32) -> Rect {
+    let top = Window::title_height(scale);
     Rect::new(
-        (theme::BORDER + theme::PADDING) as i32,
+        0,
         top as i32,
-        surface
-            .width()
-            .saturating_sub((theme::BORDER + theme::PADDING) * 2),
-        surface
-            .height()
-            .saturating_sub(top + theme::BORDER + theme::PADDING),
+        surface.width(),
+        surface.height().saturating_sub(top),
     )
 }

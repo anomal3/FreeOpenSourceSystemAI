@@ -21,7 +21,7 @@ written down in the source, in Russian, next to the code that resulted from it.
 |---|---|
 | **Boots** | UEFI on x86-64 and ARM64; a live ISO that writes nothing, and an installer that partitions a disk |
 | **Filesystem** | ext2, read and written by us — created, verified and repaired from inside the system (`fsck`) |
-| **Desktop** | Framebuffer compositor: wallpaper, taskbar, start menu, draggable windows, terminal, file manager |
+| **Desktop** | Framebuffer compositor: antialiased proportional type, rounded translucent windows, a floating taskbar, start menu, terminal, file manager — in a dark and a light theme |
 | **Userspace** | ELF programs in ring 3 / EL0, one address space each, preemptive scheduling, pipes, `mode`/`uid`/`gid` enforced, memory on request (`mmap`) in 4 KiB or 2 MiB pages, and files mapped into memory and paged in on demand |
 | **Network** | Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP with all eleven states, TLS 1.3 with X.509 |
 | **SSH** | A real OpenSSH client logs in with a key and runs programs from `/bin` as the account that logged in |
@@ -38,6 +38,26 @@ firmware into it**, because that chip keeps none of its own. Windows are dragged
 closed with a finger, at sixty-five samples a second.
 
 The full story, with every wrong turn and what each one cost, is in **[docs/PHONE.md](docs/PHONE.md)**.
+
+### The look
+
+![The desktop](docs/history/2026-09-07-01-desktop-dark.png)
+
+The desktop draws real type — Inter and JetBrains Mono, rasterised ahead of time on the
+developer's machine and blended with the pixels underneath — on rounded, translucent surfaces,
+over wallpaper that is computed rather than stored. Icons are drawn as strokes, not bitmaps, so
+they recolour with the theme and scale without steps. Windows have soft shadows; their corners
+are cut at compositing time, because that is the only place where what shows through them is
+known.
+
+There is a dark theme and a light one — one geometry, two palettes — switched by right-clicking
+the desktop or in **Параметры → Экран**. Everything repaints at once: wallpaper, icons, taskbar,
+every open window, and whatever the terminal had already printed.
+
+![The same desktop in the light theme](docs/history/2026-09-07-02-desktop-light.png)
+
+More pictures are in **[docs/SHOTS.md](docs/SHOTS.md)**; how it is put together, and which
+number lives where, is in **[docs/LOOK.md](docs/LOOK.md)**.
 
 ---
 
