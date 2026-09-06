@@ -3,10 +3,20 @@
 //! # Что здесь реализовано
 //!
 //! Трансляция с гранулой 4 КиБ и 48-битными адресами: четыре уровня таблиц
-//! (ARM называет их L0…L3), только страницы 4 КиБ. Блочные отображения
-//! (2 МиБ / 1 ГиБ) сознательно не используются — они бы заставили либо дробить
-//! блок при первом же запросе с другими правами, либо огрублять W^X до границы
-//! в 2 МиБ, а вся эта машинерия затевается именно ради W^X.
+//! (ARM называет их L0…L3). Страницы 4 КиБ везде, кроме безымянной памяти по
+//! запросу, — там с фазы 42 берутся блоки на 2 МиБ (уровень [`BLOCK_LEVEL`],
+//! он же ARM L2).
+//!
+//! Прежний довод против блоков остаётся в силе для всего остального: блок
+//! пришлось бы либо дробить при первом же запросе с другими правами, либо
+//! огрублять W^X до границы в 2 МиБ, а вся эта машинерия затевается именно
+//! ради W^X. Безымянную память он не задевает — она `READ | WRITE | USER` и
+//! никогда не исполняемая, так что делить внутри неё нечего.
+//!
+//! Блочные отображения на 1 ГиБ не создаются и сейчас. Блок отличается от
+//! страницы одним битом — у страницы бит 1 взведён, у блока нет — и адресуется
+//! своей маской ([`DESC_BLOCK_ADDR_MASK`]): биты 20:12 в нём зарезервированы, а
+//! бит 16 занят `nT`.
 //!
 //! # Две половины — два корневых дерева
 //!
@@ -36,8 +46,8 @@
 #![allow(dead_code)]
 
 use crate::mm::{
-    AddressSpace, FrameAllocator, HEAP_BASE, HEAP_SIZE, MapError, PAGE_SIZE, PHYS_MAP_BASE,
-    PageFlags, PhysAddr, STACK_SIZE, STACK_TOP, VirtAddr,
+    AddressSpace, FrameAllocator, HEAP_BASE, HEAP_SIZE, HUGE_PAGE_FRAMES, HUGE_PAGE_SIZE, MapError,
+    PAGE_SIZE, PHYS_MAP_BASE, PageFlags, PhysAddr, STACK_SIZE, STACK_TOP, VirtAddr,
 };
 use boot_info::{BootInfo, MemoryKind, MemoryMap};
 use core::arch::asm;
@@ -63,6 +73,12 @@ const DESC_PAGE: u64 = 1 << 1;
 
 /// Биты 47:12 — физический адрес следующей таблицы либо самой страницы.
 const DESC_ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+/// Адрес в **блочном** дескрипторе: биты 47:21.
+///
+/// Отдельная маска, а не та же самая: биты 20:12 в блоке зарезервированы, а бит
+/// 16 (`nT`) в них определён. Разобрать блок обычной маской значит принять эти
+/// биты за часть адреса и вернуть в пул кадр, которого нет.
+const DESC_BLOCK_ADDR_MASK: u64 = 0x0000_FFFF_FFE0_0000;
 
 /// Биты 4:2 — `AttrIndx`, номер байта в `MAIR_EL1`. Тип памяти на AArch64 не
 /// кодируется в самом дескрипторе (как PCD/PWT на x86), а выбирается косвенно
@@ -134,6 +150,12 @@ pub(super) const SH_INNER_SHAREABLE: u64 = 0b11;
 const LEVEL_COUNT: usize = 4;
 /// Уровень листьев в нумерации [`VirtAddr::table_index`] (ARM: L3).
 const LEAF_LEVEL: usize = 0;
+/// Уровень, записи которого покрывают по 2 МиБ каждая — L2 в терминах ARM.
+///
+/// Здесь живёт блочный дескриптор: то же самое, что страница, но без бита 1.
+/// Спутать блок с таблицей — значит уйти обходом в данные, приняв их за
+/// следующий уровень, поэтому уровень назван, а не написан числом по месту.
+const BLOCK_LEVEL: usize = 1;
 /// Корневой уровень в той же нумерации (ARM: L0).
 const ROOT_LEVEL: usize = LEVEL_COUNT - 1;
 /// Записей в одной таблице.
@@ -511,6 +533,78 @@ impl PageTables {
         }
 
         Ok(self.entry_ptr(table, virt.table_index(LEAF_LEVEL)))
+    }
+
+    /// Отобразить 2 МиБ одним блочным дескриптором уровня L2.
+    ///
+    /// Спуск идёт до [`BLOCK_LEVEL`] и там кончается: блок — это лист, а не
+    /// ссылка, и таблицы под ним нет. От страницы он отличается ровно одним
+    /// битом — у страницы бит 1 взведён, у блока нет, — а все остальные поля
+    /// (AttrIndx, AP, SH, AF, nG, PXN/UXN) стоят на тех же местах и значат то
+    /// же самое.
+    ///
+    /// Оба адреса обязаны быть кратны 2 МиБ: биты 20:12 адресного поля блока
+    /// зарезервированы, и единица в них — не смещение, а неопределённое
+    /// поведение обходчика таблиц.
+    ///
+    /// # Safety
+    ///
+    /// Те же условия, что у [`AddressSpace::map`], сразу для всех 512 кадров.
+    pub unsafe fn map_huge(
+        &mut self,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        flags: PageFlags,
+        alloc: &mut impl FrameAllocator,
+    ) -> Result<(), MapError> {
+        if virt.as_usize() % HUGE_PAGE_SIZE != 0 || phys.as_u64() % HUGE_PAGE_SIZE as u64 != 0 {
+            return Err(MapError::Misaligned);
+        }
+        if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) {
+            return Err(MapError::WriteExecute);
+        }
+
+        let mut table = self.root_for(virt)?;
+        let mut level = ROOT_LEVEL;
+        while level > BLOCK_LEVEL {
+            let entry_ptr = self.entry_ptr(table, virt.table_index(level));
+            // SAFETY: указатель внутрь таблицы, доступной по действующей
+            // трансляции; `volatile` — потому что то же место читает обходчик.
+            let entry = unsafe { ptr::read_volatile(entry_ptr) };
+            table = if entry & DESC_VALID == 0 {
+                let frame = alloc.allocate().ok_or(MapError::OutOfFrames)?;
+                let desc = (frame.as_u64() & DESC_ADDR_MASK) | DESC_VALID | DESC_TABLE;
+                // Нули свежей таблицы обязаны стать видны обходчику раньше
+                // ссылки на неё — иначе он пройдёт по недописанной памяти.
+                dsb_ishst();
+                // SAFETY: тот же указатель, что и при чтении выше.
+                unsafe { ptr::write_volatile(entry_ptr, desc) };
+                dsb_ishst();
+                frame
+            } else if entry & DESC_TABLE == 0 {
+                // Блок на пути: разбирать его как указатель на таблицу нельзя.
+                return Err(MapError::AlreadyMapped);
+            } else {
+                PhysAddr::new(entry & DESC_ADDR_MASK)
+            };
+            level -= 1;
+        }
+
+        let slot = self.entry_ptr(table, virt.table_index(BLOCK_LEVEL));
+        // SAFETY: `slot` — запись таблицы L2, полученной спуском выше.
+        let existing = unsafe { ptr::read_volatile(slot) };
+        if existing & DESC_VALID != 0 {
+            return Err(MapError::AlreadyMapped);
+        }
+
+        // Блок — это лист без бита 1. Снимаем его с того же дескриптора,
+        // который строится для страницы: остальные поля совпадают до бита.
+        let desc = (leaf_descriptor(phys, flags) & !DESC_PAGE & !DESC_ADDR_MASK)
+            | (phys.as_u64() & DESC_BLOCK_ADDR_MASK);
+        // SAFETY: слот принадлежит нашей таблице и был пуст.
+        unsafe { ptr::write_volatile(slot, desc) };
+        dsb_ishst();
+        Ok(())
     }
 
     /// Общая реализация отображения. `allow_write_exec` снимает запрет W^X и
@@ -956,10 +1050,21 @@ pub fn translate(root: PhysAddr, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)
         // SAFETY: на первой итерации это корень переданного дерева, дальше —
         // адрес из его же записи; таблицы видны через прямое отображение.
         let desc = unsafe { ptr::read_volatile(table_entry(table, virt.table_index(level))) };
-        if desc & DESC_VALID == 0 || desc & DESC_TABLE == 0 {
-            // Блочных отображений этот модуль не создаёт, а разбирать чужое как
-            // цепочку таблиц нельзя.
+        if desc & DESC_VALID == 0 {
             return None;
+        }
+        if desc & DESC_TABLE == 0 {
+            // Блок — это лист, и спуск на нём кончается. Отвечаем адресом
+            // внутри него, а не его началом: у страницы ответ тоже про
+            // переданный адрес, и вызывающему незачем знать размер.
+            if level != BLOCK_LEVEL {
+                // Гигабайтных блоков этот модуль не создаёт, а разбирать чужой
+                // вслепую нельзя — честнее ответить «не знаю».
+                return None;
+            }
+            let inside = virt.as_usize() & (HUGE_PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let phys = PhysAddr::new((desc & DESC_BLOCK_ADDR_MASK) + inside as u64);
+            return Some((phys, leaf_flags(desc)));
         }
         table = PhysAddr::new(desc & DESC_ADDR_MASK);
         level -= 1;
@@ -993,15 +1098,44 @@ pub fn translate(root: PhysAddr, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)
 /// одному этому дереву: вернувший его вызывающий отдаст его аллокатору, и
 /// второй владелец получил бы чужую память.
 #[must_use]
-pub unsafe fn unmap(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
+pub unsafe fn unmap(root: PhysAddr, virt: VirtAddr) -> Option<(PhysAddr, usize)> {
     let mut table = root;
     let mut level = ROOT_LEVEL;
     while level > LEAF_LEVEL {
         // SAFETY: на первой итерации это корень переданного дерева, дальше —
         // адрес из его же записи; таблицы видны через прямое отображение.
         let desc = unsafe { ptr::read_volatile(table_entry(table, virt.table_index(level))) };
-        if desc & DESC_VALID == 0 || desc & DESC_TABLE == 0 {
+        if desc & DESC_VALID == 0 {
             return None;
+        }
+        if desc & DESC_TABLE == 0 {
+            if level != BLOCK_LEVEL {
+                return None;
+            }
+            // Снять можно только блок целиком. Просьба про кусок — ошибка
+            // вызывающего, и отвечать на неё надо громко: молчаливый отказ
+            // выглядел бы как «нечего снимать», кадры остались бы
+            // отображёнными, а счёт возвращённых страниц сошёлся бы неверно.
+            //
+            // Разбить блок на 512 страниц и снять одну этот модуль намеренно
+            // не умеет: частичное освобождение к нему не приходит — область
+            // снимается целиком, а вытеснение работает только с отображённым
+            // файлом, который блоков не берёт.
+            if virt.as_usize() % HUGE_PAGE_SIZE != 0 {
+                crate::kprintln!(
+                    "mm: refusing to unmap part of a huge page at {:#x}",
+                    virt.as_usize()
+                );
+                return None;
+            }
+            let slot = table_entry(table, virt.table_index(BLOCK_LEVEL));
+            let phys = PhysAddr::new(desc & DESC_BLOCK_ADDR_MASK);
+            // SAFETY: тот же слот той же таблицы; обнуляется целиком.
+            unsafe { ptr::write_volatile(slot, 0) };
+            dsb_ishst();
+            // SAFETY: изменение дескриптора уже видно обходчику.
+            unsafe { invalidate_page(virt) };
+            return Some((phys, HUGE_PAGE_FRAMES));
         }
         table = PhysAddr::new(desc & DESC_ADDR_MASK);
         level -= 1;
@@ -1031,7 +1165,7 @@ pub unsafe fn unmap(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     // SAFETY: изменение дескриптора уже видно walker'у (`dsb ishst` выше).
     unsafe { invalidate_page(virt) };
 
-    Some(PhysAddr::new(leaf & DESC_ADDR_MASK))
+    Some((PhysAddr::new(leaf & DESC_ADDR_MASK), 1))
 }
 
 /// Права дескриптора страницы в терминах, не зависящих от архитектуры.
@@ -1172,6 +1306,19 @@ unsafe fn free_subtree(
             // используется.
             unsafe { alloc.free(target) };
             *pages += 1;
+        } else if desc & DESC_TABLE == 0 && level == BLOCK_LEVEL {
+            // Блок — это 512 обычных кадров подряд, и вернуть надо все.
+            // Поштучно, а не одним вызовом: `FrameAllocator` — трейт, и
+            // непрерывного освобождения в нём нет, зато каждый кадр проходит те
+            // же проверки, что и любой другой.
+            let base = desc & DESC_BLOCK_ADDR_MASK;
+            for offset in 0..HUGE_PAGE_FRAMES {
+                let frame = PhysAddr::new(base + (offset * PAGE_SIZE) as u64);
+                // SAFETY: кадры принадлежали одному блоку окна и больше нигде
+                // не используются.
+                unsafe { alloc.free(frame) };
+            }
+            *pages += HUGE_PAGE_FRAMES;
         } else if desc & DESC_TABLE == 0 {
             // Блочное отображение: этот модуль их не создаёт, значит запись
             // чужая, и возвращать в пул мегабайты неизвестно чего нельзя.

@@ -31,7 +31,10 @@
 //! и второй возвращается в ядро не оттуда, откуда уходил. Уборка, написанная
 //! в конце удачного пути, на втором просто не исполнилась бы.
 
-use crate::mm::{AddressSpace, FrameAllocator, MapError, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+use crate::mm::{
+    AddressSpace, FrameAllocator, HUGE_PAGE_FRAMES, HUGE_PAGE_SIZE, MapError, PAGE_SIZE, PageFlags,
+    PhysAddr, VirtAddr,
+};
 use crate::{arch, kprintln};
 
 /// Номер уровня корневой таблицы в нумерации [`VirtAddr::table_index`].
@@ -141,7 +144,8 @@ impl Space {
         base: VirtAddr,
         pages: usize,
         flags: PageFlags,
-    ) -> Result<(), MapError> {
+        huge: bool,
+    ) -> Result<usize, MapError> {
         let root = self.root;
         // SAFETY: корень принадлежит этому объекту и жив, пока жив он; записи
         // правятся через прямое отображение, которое есть и в дереве программы
@@ -149,13 +153,67 @@ impl Space {
         let mut space = unsafe { arch::space_at(root) };
 
         let mut done = 0;
+        let mut blocks = 0;
+
         while done < pages {
-            let want = CHUNK_PAGES.min(pages - done);
+            let here = base.as_usize() + done * PAGE_SIZE;
+
+            // Крупная страница берётся, только если сходятся три вещи: её
+            // попросили, адрес стоит на границе 2 МиБ и до конца области
+            // осталось не меньше блока. Ни одну из трёх нельзя подтянуть
+            // молча: сдвинуть адрес значит отдать не то, что просили, а
+            // округлить длину — отдать больше, чем просили.
+            if huge && here % HUGE_PAGE_SIZE == 0 && pages - done >= HUGE_PAGE_FRAMES {
+                let taken = crate::mm::frame::with(|frames| {
+                    // Запас проверяется с учётом всего блока сразу: взять его
+                    // и обнаружить, что ядру не осталось, поздно — кадры уже
+                    // не свободны.
+                    if frames.stats().free <= super::RESERVE_FRAMES + HUGE_PAGE_FRAMES {
+                        return false;
+                    }
+                    let Some(phys) = frames.allocate_aligned(HUGE_PAGE_FRAMES, HUGE_PAGE_FRAMES)
+                    else {
+                        return false;
+                    };
+                    // SAFETY: кадры только что выданы аллокатором, идут подряд,
+                    // выровнены на 2 МиБ и не принадлежат больше никому.
+                    match unsafe {
+                        space.map_huge(VirtAddr::new(here), phys, flags, frames)
+                    } {
+                        Ok(()) => true,
+                        Err(_) => {
+                            // SAFETY: кадры выданы этим же аллокатором и никуда
+                            // не ушли — отображения не случилось.
+                            unsafe { frames.free_contiguous(phys, HUGE_PAGE_FRAMES) };
+                            false
+                        }
+                    }
+                })
+                .unwrap_or(false);
+
+                if taken {
+                    done += HUGE_PAGE_FRAMES;
+                    blocks += 1;
+                    continue;
+                }
+                // Не вышло — это законный ответ, а не отказ: непрерывного
+                // выровненного куска может не быть на исправной машине.
+                // Дальше идут обычные страницы, и программа даже не узнает.
+            }
+
+            // Обычные страницы, порциями. Порция не переходит следующую
+            // границу 2 МиБ, если крупные страницы просили: иначе, отступив
+            // один раз, мы уже не попали бы на границу до конца области.
+            let mut want = CHUNK_PAGES.min(pages - done);
+            if huge {
+                let to_boundary = (HUGE_PAGE_SIZE - here % HUGE_PAGE_SIZE) / PAGE_SIZE;
+                want = want.min(to_boundary);
+            }
 
             let (made, failure) = crate::mm::frame::with(|frames| {
                 let mut made = 0;
                 while made < want {
-                    let virt = VirtAddr::new(base.as_usize() + (done + made) * PAGE_SIZE);
+                    let virt = VirtAddr::new(here + made * PAGE_SIZE);
 
                     // Запас проверяется на каждой странице, а не один раз до
                     // цикла: отображение само берёт кадры под промежуточные
@@ -193,7 +251,7 @@ impl Space {
             }
         }
 
-        Ok(())
+        Ok(blocks)
     }
 
     /// Снять `pages` страниц с адреса `base` и вернуть их кадры в пул.
@@ -217,24 +275,47 @@ impl Space {
         let mut done = 0;
 
         while done < pages {
-            let want = CHUNK_PAGES.min(pages - done);
-            freed += crate::mm::frame::with(|frames| {
+            let limit = (done + CHUNK_PAGES).min(pages);
+            let (reached, got) = crate::mm::frame::with(|frames| {
+                let mut at = done;
                 let mut got = 0;
-                for index in 0..want {
-                    let virt = VirtAddr::new(base.as_usize() + (done + index) * PAGE_SIZE);
-                    // SAFETY: дерево принадлежит этому объекту; кадр под адресом
-                    // принадлежит одной этой программе — условие делегировано выше.
-                    if let Some(phys) = unsafe { arch::unmap(root, virt) } {
-                        // SAFETY: кадр пришёл из этого же дерева, ссылок на него
-                        // в таблицах не осталось, а TLB сброшен внутри `unmap`.
-                        unsafe { frames.free(phys) };
-                        got += 1;
+                while at < limit {
+                    let virt = VirtAddr::new(base.as_usize() + at * PAGE_SIZE);
+                    // SAFETY: дерево принадлежит этому объекту; кадры под
+                    // адресом принадлежат одной этой программе — условие
+                    // делегировано выше.
+                    match unsafe { arch::unmap(root, virt) } {
+                        Some((phys, count)) => {
+                            for offset in 0..count {
+                                let frame =
+                                    PhysAddr::new(phys.as_u64() + (offset * PAGE_SIZE) as u64);
+                                // SAFETY: кадр пришёл из этого же дерева,
+                                // ссылок на него в таблицах не осталось, а TLB
+                                // сброшен внутри `unmap`.
+                                unsafe { frames.free(frame) };
+                            }
+                            got += count;
+                            // Шаг по числу снятых кадров, а не по единице:
+                            // крупная страница снимается целиком, и следующие
+                            // 511 адресов внутри неё отображения уже не имеют.
+                            // Шагая по одному, мы бы 511 раз прошли четыре
+                            // уровня таблиц ради заведомого «ничего нет».
+                            at += count;
+                        }
+                        // Страницы нет — это законно: у отображённого файла
+                        // подкачано не всё.
+                        None => at += 1,
                     }
                 }
-                got
+                (at, got)
             })
-            .unwrap_or(0);
-            done += want;
+            .unwrap_or((limit, 0));
+
+            freed += got;
+            // `reached` может уйти за границу порции: крупная страница шире
+            // её. Это не ошибка, а причина, по которой шаг берётся отсюда, а не
+            // из арифметики порций.
+            done = reached.max(done + 1);
         }
 
         freed

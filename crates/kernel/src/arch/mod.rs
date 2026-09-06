@@ -117,7 +117,7 @@ pub use aarch64::paging::map_active;
 /// | [`activate_space`]       | переключить процессор на дерево программы       |
 /// | [`activate_kernel_space`]| вернуться на дерево ядра                        |
 /// | [`free_user_space`]      | разобрать окно программы и вернуть кадры в пул  |
-/// | [`unmap`]                | снять одну страницу и забрать кадр обратно      |
+/// | [`unmap`]                | снять страницу и забрать её кадры обратно       |
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::{
     activate_kernel_space, activate_space, free_user_space, kernel_root, new_user_space, space_at,

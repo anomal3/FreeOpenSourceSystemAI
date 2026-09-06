@@ -382,6 +382,27 @@ pub struct Scenario {
     /// кто его скачал, получил бы систему, пускающую владельца ключа из
     /// `build/test/`. Подробности — в [`super::sshkeys`].
     pub ssh_key: bool,
+    /// Сколько памяти дать машине (аргумент `-m` QEMU). Пусто — оставить
+    /// умолчание стенда, то есть 512 МиБ.
+    ///
+    /// Просят больше **не ради скорости**. Крупная страница — это не «две тысячи
+    /// обычных подряд по номеру», а непрерывный и выровненный на два мебибайта
+    /// отрезок **физической** памяти; ядро ищет его в пуле кадров, и на машине с
+    /// 512 МиБ, из которых своё уже взяли ядро, initrd и композитор, такого
+    /// отрезка может не найтись ни одного.
+    ///
+    /// Плохо здесь не то, что не найдётся, а то, чем это кончится. Отказа не
+    /// будет: ядру велено разложить просьбу обычными страницами по 4 КиБ и
+    /// вернуть тот же адрес — честное поведение, названное в договоре у
+    /// `MAP_HUGE`. Значит, сценарий про крупные страницы прошёл бы целиком, ни
+    /// одной крупной страницы не увидев, и молча проверил бы ровно то же, что
+    /// проверяет сценарий `mmap`. Проверка, которая ничего не проверяет и не
+    /// говорит об этом вслух, хуже упавшей.
+    ///
+    /// Поэтому память называется там, где от неё зависит **смысл** проверки, а
+    /// не везде подряд: лишний гигабайт — это лишний гигабайт у каждого воркера
+    /// параллельного прогона, а их на машине столько, сколько ядер.
+    pub memory: &'static str,
 }
 
 impl Scenario {
@@ -425,6 +446,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await(crate::version::KERNEL_BANNER, BOOT),
@@ -464,6 +486,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -523,6 +546,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -567,6 +591,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -607,6 +632,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Сколько программ меню показало. Порогом, а не числом: помещается
@@ -761,6 +787,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -922,6 +949,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -989,6 +1017,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1054,6 +1083,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         // Свойство накапливается к уже заданной машине `q35`, как и `i8042=off`
         // у `usb_only`. Так воспроизводится VirtualBox: там PIT существует, но
         // измерить по нему частоту локального APIC не удаётся, и система
@@ -1095,6 +1125,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1246,6 +1277,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1307,6 +1339,123 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "hugepages",
+        about: "Двести пятьдесят шесть мегабайт легли ста двадцатью восемью блоками по 2 МиБ, и все вернулись.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        // Обе архитектуры, и это не симметрия ради симметрии. Блочная запись —
+        // единственное место фазы, где код у них **разный** по существу: на
+        // x86-64 крупная страница это бит PS в записи каталога, на AArch64 —
+        // дескриптор блока на втором уровне, с другим форматом и другими
+        // правилами обхода. Проверить одну и поверить за вторую здесь нельзя.
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        // Два гигабайта, и вот зачем — подробно сказано у самого поля. Коротко:
+        // на 512 МиБ непрерывного и выровненного отрезка в 2 МиБ может не
+        // найтись, ядро честно разложит просьбу обычными страницами, и сценарий
+        // пройдёт, ничего из того, ради чего заведён, не проверив.
+        memory: "2G",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+
+            // Счёта свободных кадров целиком здесь нет, и это решение, а не
+            // упущение. Сначала он тут стоял — как в сценарии `mmap`: снять
+            // число до, сверить после. На живой машине он оказался шумным:
+            // службы поднимаются и падают по своему расписанию, а каждая стоит
+            // ровно 789 кадров — 784 страницы окна и 5 таблиц. Первый прогон на
+            // эти самые 789 и разошёлся: между двумя замерами успел завершиться
+            // `dhcp`. Сравнивались два разных состояния системы, а не «до
+            // программы» и «после программы».
+            //
+            // Заменено на то, что от чужого расписания не зависит вовсе: на
+            // числа, которые ядро печатает про **эту** область. Они точные, они
+            // про неё одну, и подделать их нечем.
+
+            Step::Line("run /bin/memtest 256 huge"),
+
+            // Центральное утверждение фазы, и другого способа его проверить нет
+            // вовсе: со стороны программы крупная страница неотличима от
+            // обычной — тот же адрес, та же память, — и говорит о том, что
+            // вышло, только ядро. 256 МиБ / 2 МиБ = 128 блоков.
+            //
+            // Шаг стоит **до** ожиданий самой программы: строку печатает ядро
+            // внутри `mmap`, то есть раньше, чем memtest успевает сказать
+            // «mapped», а ожидание ищет только вперёд от курсора.
+            Step::AtLeast("  user        : mmap: ", 128, 300_000),
+            // И ни одной обычной страницы в остатке. Отступление на 4 КиБ —
+            // законный исход вообще, но не на простаивающей машине с двумя
+            // гигабайтами: здесь оно означало бы, что поиск выровненного
+            // непрерывного отрезка не находит того, что в пуле заведомо есть.
+            Step::Expect("huge and 0 small pages"),
+
+            // Память при этом настоящая: узор, зависящий от смещения, записан и
+            // прочитан обратно. Ошибка в блочной записи — это чаще всего
+            // отображение, где соседние блоки ведут на один физический отрезок,
+            // и ловится она именно сверкой, а не тем, что запись не упала.
+            //
+            // Ожидание щедрое по той же причине, что и в сценарии `mmap`:
+            // выделение жадное, 256 МиБ действительно занимаются и обнуляются.
+            Step::Await("memtest: 256 MiB written and read back, no mismatches", 300_000),
+            Step::Await("memtest: unmapped", 60_000),
+            // Код выхода проверяется явно, и это не формальность. Программа
+            // умеет провалить собственную проверку и сказать об этом строкой,
+            // которой сценарий не ждёт: тогда всё ожидаемое сбудется, а провал
+            // останется в журнале незамеченным. Один раз в этой фазе так и
+            // вышло — проверка «пул отказал в 500 МиБ» на машине с двумя
+            // гигабайтами ложна, и сценарий прошёл бы поверх её провала.
+            Step::Await("exited with code 0", 60_000),
+
+            // Самый острый край фазы, и проверяется он отдельным запуском.
+            //
+            // Область возвращается двумя разными путями, и они не заменяют друг
+            // друга. `munmap` идёт по записям, зная длину области, — его только
+            // что прошли выше. Уборка при выходе не знает ничего: она обходит
+            // поддерево таблиц и разбирает всё, что найдёт, обязана узнать блок
+            // по одному биту и вернуть за него 512 кадров. До этой фазы она не
+            // умела — печатала отказ и шла дальше, теряя два мегабайта
+            // навсегда, молча и не роняя ничего.
+            //
+            // Отсюда `keep`: программа уходит, не прибравшись, и число в строке
+            // ядра — единственное доказательство. Восемь мегабайт, а не двести
+            // пятьдесят шесть, потому что проверяется не масштаб, а
+            // арифметика: 4 блока по 512 кадров плюс окно программы (768
+            // страниц образа и 16 стека) — ровно 2832.
+            Step::Line("run /bin/memtest 8 huge keep"),
+            Step::Await("memtest: leaving the region to the teardown", 60_000),
+            Step::Await("  user        : space released, 2832 pages", 60_000),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+            // Ядро печатает это, если при возврате нашлось не столько страниц,
+            // сколько выдавалось.
+            Step::Absent("user        : WARNING"),
+            // Собственные отказы разборщика таблиц. Каждый из них означает, что
+            // до блока добрались кодом, который блоков не понимает: первый —
+            // при возврате пространства целиком, второй — при `munmap`.
+            //
+            // Формулировок у первого две, по одной на архитектуру, и это не
+            // небрежность, а то же самое, ради чего сценарий гоняется на обеих:
+            // на x86-64 это «huge page», на AArch64 — «block mapping», потому
+            // что там это и называется блоком. Проверять надо обе: сценарий с
+            // одной строкой на второй архитектуре молчал бы всегда.
+            Step::Absent("refusing to free a huge page"),
+            Step::Absent("refusing to free a block mapping"),
+            Step::Absent("refusing to unmap part of a huge page"),
+        ],
+    },
+    Scenario {
         name: "filemap",
         about: "Файл отображён в память и читается по обращению, а не целиком.",
         target: Target::Live,
@@ -1323,6 +1472,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1370,6 +1520,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1452,6 +1603,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         // `-cpu max` — не украшение. С процессором по умолчанию QEMU не
         // объявляет `XSAVE`, и ядро уходит на путь `FXSAVE`: проверялась бы
         // ровно та половина, которой на современной машине не бывает. Здесь
@@ -1510,6 +1662,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1561,6 +1714,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1626,6 +1780,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1687,6 +1842,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Время системы считает счётчик, который идёт сам, а не тики
@@ -1747,6 +1903,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Это утверждение фазы целиком: прошивка нашла на носителе
@@ -1789,6 +1946,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         // Свойство накапливается к уже заданной машине `virt`. Версия по
         // умолчанию — та, что выбрал QEMU; здесь она задана явно, потому что
         // проверяется именно другая ветка кода.
@@ -1831,6 +1989,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -1860,6 +2019,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // На VVFAT таблицы разделов не существует вовсе — QEMU синтезирует
@@ -1892,6 +2052,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("FreeOS installer", BOOT),
@@ -1971,6 +2132,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
@@ -2140,6 +2302,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -2227,6 +2390,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -2336,6 +2500,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Это отдельная загрузка того же диска. Всё, что проверяется ниже,
@@ -2378,6 +2543,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: true,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -2481,6 +2647,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Первая загрузка. Каким том был до неё, не утверждаем: предыдущий
@@ -2549,6 +2716,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
@@ -2606,6 +2774,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Клавиши жмутся **заранее**: прошивка копит нажатия в буфере, а
@@ -2673,6 +2842,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Кнопка заведена при загрузке — и сказано, каким вектором и с
@@ -2706,6 +2876,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Сначала — что найден именно контроллер AHCI, а не что-то, что
@@ -2759,6 +2930,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Версия и шаг звонков читаются из регистров контроллера: получить
@@ -2806,6 +2978,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -2965,6 +3138,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Супервизор поднимается **при загрузке**, без единой команды: это
@@ -3046,6 +3220,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: true,
+        memory: "",
         extra: &[],
         steps: &[
             Step::AwaitAny("account     : /etc/passwd", BOOT),
@@ -3163,6 +3338,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: true,
+        memory: "",
         extra: &[],
         steps: &[
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
@@ -3234,6 +3410,7 @@ pub const ALL: &[Scenario] = &[
         updates: true,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -3318,6 +3495,7 @@ pub const ALL: &[Scenario] = &[
         updates: true,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -3410,6 +3588,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Строка про службы печатается **до** приглашения, и ждать её после
@@ -3510,6 +3689,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
@@ -3595,6 +3775,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::Await("FreeOS installer", BOOT),
@@ -3654,6 +3835,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Диск объявляет свой блок сам, и ядро его принимает, а не
@@ -3699,6 +3881,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Карта найдена и назвала свой аппаратный адрес. Адрес приехал из
@@ -3769,6 +3952,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
@@ -3829,6 +4013,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Адрес берётся у DHCP: сервер, которому его задали руками, проверял
@@ -3901,6 +4086,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Адрес и сервер имён приезжают от DHCP — руками здесь не задаётся
@@ -3953,6 +4139,7 @@ pub const ALL: &[Scenario] = &[
         updates: false,
         big_file: false,
         ssh_key: false,
+        memory: "",
         extra: &[],
         steps: &[
             // Служба поднимается супервизором при загрузке, без единой команды.

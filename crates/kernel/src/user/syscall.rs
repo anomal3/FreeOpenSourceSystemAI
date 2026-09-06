@@ -147,7 +147,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_RESOLVE => resolve(a0, a1, a2),
         SYS_RANDOM => random(a0, a1),
         SYS_UPDATE => update(a0, a1),
-        SYS_MMAP => mmap(a0),
+        SYS_MMAP => mmap(a0, a1),
         SYS_MUNMAP => munmap(a0, a1),
         SYS_MMAP_FILE => mmap_file(a0, a1, a2),
         _ => ERR_NO_SYSCALL,
@@ -1117,8 +1117,8 @@ fn net_errno(err: NetError) -> i64 {
 ///
 /// Проверять `len` по таблицам здесь нечего: это длина, а не указатель. Всё,
 /// что можно сказать неверно, скажет [`super::Program::mmap`].
-fn mmap(len: usize) -> i64 {
-    match super::with_current(|program| program.mmap(len)) {
+fn mmap(len: usize, flags: usize) -> i64 {
+    match super::with_current(|program| program.mmap(len, flags)) {
         Some(Ok(addr)) => addr as i64,
         Some(Err(err)) => mmap_errno(err),
         None => ERR_NO_PROGRAM,

@@ -700,6 +700,17 @@ fn execute(
     let mut extra: Vec<String> = scenario.qemu_args(arch).iter().map(|s| (*s).to_string()).collect();
     extra.extend(scenario.extra.iter().map(|s| (*s).to_string()));
 
+    // Память машины. Пустая строка сценария означает «оставить умолчание», а не
+    // «нисколько», поэтому здесь развилка, а не подстановка пустого аргумента.
+    // Само умолчание не переписывается сюда числом намеренно: оно объявлено
+    // ровно в одном месте ([`RunOptions::default`]), и второе его написание
+    // однажды разошлось бы с первым.
+    let memory = if scenario.memory.is_empty() {
+        RunOptions::default().memory
+    } else {
+        scenario.memory.to_string()
+    };
+
     let opts = RunOptions {
         // Хранилище UEFI-переменных пересоздаётся перед каждым сценарием.
         // Иначе запись загрузки, оставшаяся от прошлого прогона, уводит
@@ -709,6 +720,7 @@ fn execute(
         serial_only: !windowed,
         drives,
         extra,
+        memory,
         serial: qemu::Serial::Socket(serial_addr),
         monitor: Some(monitor_addr),
         qmp: qmp_addr,

@@ -75,8 +75,10 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::mm::{FrameAllocator, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+use crate::mm::{FrameAllocator, HUGE_PAGE_FRAMES, HUGE_PAGE_SIZE, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 use crate::sync::Mutex;
+use user_abi::MAP_HUGE;
+
 use crate::vfs::Node;
 use crate::vfs::perm::{Access, Credentials};
 use crate::{arch, kprintln, sched};
@@ -286,8 +288,16 @@ struct FileBacking {
 struct Mapping {
     /// Адрес начала. Всегда кратен странице.
     base: usize,
-    /// Длина в страницах.
+    /// Длина в страницах. Всегда в обычных, 4 КиБ, даже когда часть области
+    /// отображена крупными: страница — единица учёта, а не единица записи.
     pages: usize,
+    /// Сколько крупных страниц ушло на эту область.
+    ///
+    /// Ноль — обычная область. Нужно двум вещам: сказать в журнале, чем она
+    /// отображена (без этого «крупные страницы работают» и «крупные страницы
+    /// молча не получились» выглядят одинаково), и сойтись в `munmap`, где
+    /// возвращённые кадры считаются, а блок стоит пятисот двенадцати.
+    blocks: usize,
     /// Чем наполнять её страницы.
     source: Source,
 }
@@ -430,22 +440,44 @@ impl Program {
     /// Исполнять безымянную память нельзя, и не потому, что здесь так решили:
     /// отображение с `WRITE | EXEC` отвергает сам построитель таблиц
     /// ([`crate::mm::MapError::WriteExecute`]).
-    fn mmap(&mut self, len: usize) -> Result<usize, MmapError> {
-        let (base, pages) = self.reserve(len)?;
+    fn mmap(&mut self, len: usize, flags: usize) -> Result<usize, MmapError> {
+        let huge = flags & MAP_HUGE != 0;
+        // Крупные страницы требуют выравнивания и по виртуальному адресу тоже,
+        // а не только по физическому: запись покрывает 2 МиБ от границы, и
+        // область, начавшаяся мимо неё, не получит ни одного блока, сколько бы
+        // непрерывной памяти ни нашлось.
+        let align = if huge { HUGE_PAGE_SIZE } else { PAGE_SIZE };
+        let (base, pages) = self.reserve(len, align)?;
 
         // SAFETY: `reserve` вернул адрес внутри области запроса, не
         // пересекающийся ни с одной уже выданной; образ и стек лежат ниже
         // [`MMAP_BASE`].
-        unsafe {
+        let blocks = unsafe {
             self.space.map_anon(
                 VirtAddr::new(base),
                 pages,
                 PageFlags::READ | PageFlags::WRITE | PageFlags::USER,
+                huge,
             )
         }
         .map_err(|_| MmapError::NoMemory)?;
 
-        self.remember(Mapping { base, pages, source: Source::Anonymous });
+        if huge {
+            // Оба числа, и всегда, когда крупные страницы просили. Отступление
+            // на обычные — законный исход, но исход **другой**, и молчать о нём
+            // нельзя: программа, получившая всё обычными страницами, работает
+            // так же и стоит столько же, сколько до этой фазы, — а выглядит как
+            // успех.
+            // Счётчики стоят раньше адреса намеренно: адрес здесь — примета
+            // для человека, а числа читает стенд, и число сразу за неизменной
+            // подстрокой он достать умеет, а из середины строки — нет.
+            kprintln!(
+                "  user        : mmap: {blocks} huge and {} small pages at {base:#x}",
+                pages - blocks * HUGE_PAGE_FRAMES
+            );
+        }
+
+        self.remember(Mapping { base, pages, blocks, source: Source::Anonymous });
         Ok(base)
     }
 
@@ -471,11 +503,15 @@ impl Program {
         }
 
         let node = self.files.node(fd).map_err(MmapError::BadFile)?;
-        let (base, pages) = self.reserve(len)?;
+        // Обычные страницы, и крупных здесь не будет. Подкачка работает
+        // постранично, а вытеснить четверть блока нечем; читать же 2 МиБ на
+        // один отказ — ровно та жадность, от которой фаза 41 уходила.
+        let (base, pages) = self.reserve(len, PAGE_SIZE)?;
 
         self.remember(Mapping {
             base,
             pages,
+            blocks: 0,
             source: Source::File(FileBacking {
                 node,
                 offset,
@@ -518,6 +554,10 @@ impl Program {
         // читали» и «страниц меньше, потому что они потерялись» — это как раз
         // то, что здесь различается.
         let owed = match &region.source {
+            // Крупная страница возвращается пятьюстами двенадцатью кадрами, и
+            // в счёт они идут поштучно: единица учёта здесь кадр, а не запись
+            // таблицы. Поэтому число то же самое, чем бы область ни была
+            // отображена, — и именно поэтому оно ничего не скрывает.
             Source::Anonymous => region.pages,
             Source::File(file) => file.resident.len(),
         };
@@ -544,7 +584,7 @@ impl Program {
     ///
     /// Общее начало обоих `mmap`: до того, как выяснится, чем область будет
     /// наполнена, вопросы к ней одни и те же.
-    fn reserve(&self, len: usize) -> Result<(usize, usize), MmapError> {
+    fn reserve(&self, len: usize, align: usize) -> Result<(usize, usize), MmapError> {
         if len == 0 {
             return Err(MmapError::BadRequest);
         }
@@ -561,7 +601,7 @@ impl Program {
         if self.mappings.len() == MAX_MAPPINGS {
             return Err(MmapError::Limit);
         }
-        let base = self.find_gap(bytes).ok_or(MmapError::Limit)?;
+        let base = self.find_gap(bytes, align).ok_or(MmapError::Limit)?;
         Ok((base, pages))
     }
 
@@ -571,15 +611,22 @@ impl Program {
     /// видна там, где программа берёт и отдаёт по кругу: счётчик, ползущий
     /// вверх, упёрся бы в конец области, ни разу не заняв её целиком, — то есть
     /// предел на задачу считал бы не занятую память, а прожитую жизнь.
-    fn find_gap(&self, bytes: usize) -> Option<usize> {
-        let mut candidate = MMAP_BASE;
+    fn find_gap(&self, bytes: usize, align: usize) -> Option<usize> {
+        // Начало области уже кратно двум мегабайтам ([`MMAP_BASE`]), так что
+        // первый кандидат выравнивания не требует. Требуют следующие: области
+        // укладываются вплотную, и конец предыдущей приходится где угодно.
+        let mut candidate = MMAP_BASE.next_multiple_of(align);
         for region in &self.mappings {
-            if region.base - candidate >= bytes {
+            if region.base >= candidate && region.base - candidate >= bytes {
                 return Some(candidate);
             }
-            candidate = region.base + region.pages * PAGE_SIZE;
+            let end = region.base + region.pages * PAGE_SIZE;
+            candidate = candidate.max(end).next_multiple_of(align);
         }
-        (MMAP_BASE + MMAP_MAX_BYTES - candidate >= bytes).then_some(candidate)
+        (MMAP_BASE + MMAP_MAX_BYTES)
+            .checked_sub(candidate)
+            .is_some_and(|room| room >= bytes)
+            .then_some(candidate)
     }
 
     /// Записать область в таблицу, сохранив порядок по адресу.

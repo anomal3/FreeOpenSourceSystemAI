@@ -1,14 +1,25 @@
-//! Страничная трансляция x86-64: PML4 → PDPT → PD → PT, страницы только 4 КиБ.
+//! Страничная трансляция x86-64: PML4 → PDPT → PD → PT, страницы 4 КиБ и 2 МиБ.
 //!
-//! # Почему только 4 КиБ
+//! # Где 4 КиБ, а где 2 МиБ
 //!
-//! Записи уровней PD и PDPT умеют быть листовыми (биты `PS`), давая страницы
+//! Записи уровней PD и PDPT умеют быть листовыми (бит `PS`), давая страницы
 //! 2 МиБ и 1 ГиБ. Соблазн велик — таблиц было бы на два порядка меньше, — но
 //! W^X работает с гранулярностью отображения: сегменты ELF выровнены на 4 КиБ,
 //! и на 2-мегабайтной странице код неизбежно оказался бы в одной странице с
 //! данными, а значит либо данные стали бы исполняемыми, либо код — записываемым.
-//! Ради этого и строится вся конструкция, поэтому большие страницы не
-//! используются нигде, а встреченная чужая большая страница считается ошибкой.
+//! Ради этого и строится вся конструкция.
+//!
+//! Довод этот держится там, где есть что делить: образ программы, ядро,
+//! отображённый файл — всё это раскладывается страницами 4 КиБ и будет
+//! раскладываться дальше. С фазы 42 из-под него выведено ровно одно место —
+//! безымянная память по запросу: она `READ | WRITE | USER` и никогда не
+//! исполняемая, делить внутри неё нечего, и ослабнуть W^X не от чего.
+//!
+//! Крупная запись живёт на [`LEVEL_PD`], отличается битом `PS` и адресуется
+//! **своей** маской ([`ENTRY_HUGE_ADDR_MASK`]): младшие биты адресного поля в
+//! ней зарезервированы, а бит 12 занят `PAT`, который у обычной записи стоит в
+//! бите 7. Гигабайтных страниц этот модуль не создаёт по-прежнему, и
+//! встреченная — чужая, то есть ошибка.
 //!
 //! # Как выглядит запись таблицы
 //!
@@ -53,8 +64,8 @@
 
 use super::{cpuid, rdmsr, wrmsr};
 use crate::mm::{
-    AddressSpace, FrameAllocator, HEAP_BASE, HEAP_SIZE, MapError, PAGE_SIZE, PHYS_MAP_BASE,
-    PageFlags, PhysAddr, STACK_SIZE, STACK_TOP, VirtAddr,
+    AddressSpace, FrameAllocator, HEAP_BASE, HEAP_SIZE, HUGE_PAGE_FRAMES, HUGE_PAGE_SIZE, MapError,
+    PAGE_SIZE, PHYS_MAP_BASE, PageFlags, PhysAddr, STACK_SIZE, STACK_TOP, VirtAddr,
 };
 use boot_info::{BootInfo, MemoryKind};
 use core::arch::asm;
@@ -85,12 +96,25 @@ const ENTRY_HUGE: u64 = 1 << 7;
 const ENTRY_NO_EXECUTE: u64 = 1 << 63;
 /// Биты 51..12: физический адрес следующей таблицы или конечного кадра.
 const ENTRY_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+/// Адрес в записи **крупной** страницы: биты 51:21.
+///
+/// Отдельная маска, а не та же самая, и это не педантизм. Биты 20:13 в такой
+/// записи зарезервированы и обязаны быть нулём, а бит 12 — это `PAT`, который у
+/// обычной записи стоит в бите 7. Разобрать крупную запись обычной маской
+/// значит вернуть адрес с посторонним битом и отдать в пул чужой кадр.
+const ENTRY_HUGE_ADDR_MASK: u64 = 0x000F_FFFF_FFE0_0000;
 
 /// Сколько записей в таблице любого уровня: 4096 байт / 8 байт.
 const ENTRIES_PER_TABLE: usize = PAGE_SIZE / size_of::<u64>();
 
 /// Номер уровня листовой таблицы (PT) в нумерации [`VirtAddr::table_index`].
 const LEVEL_PT: usize = 0;
+/// Уровень каталога страниц: его записи покрывают по 2 МиБ каждая.
+///
+/// Именно здесь живёт крупная страница — запись с битом `PS` вместо ссылки на
+/// листовую таблицу. Числом это не пишется нигде, кроме этой строки: спутать
+/// уровни значит принять адрес данных за адрес таблицы и уйти обходом в них.
+const LEVEL_PD: usize = 1;
 /// Номер уровня корневой таблицы (PML4).
 const LEVEL_PML4: usize = 3;
 
@@ -175,6 +199,11 @@ impl Entry {
     const fn addr(self) -> PhysAddr {
         PhysAddr::new(self.0 & ENTRY_ADDR_MASK)
     }
+
+    /// Физический адрес крупной страницы. Звать только для записи с `PS`.
+    const fn huge_addr(self) -> PhysAddr {
+        PhysAddr::new(self.0 & ENTRY_HUGE_ADDR_MASK)
+    }
 }
 
 /// Адресное пространство x86-64: дерево из четырёх уровней с корнем в PML4.
@@ -252,6 +281,62 @@ impl PageTable {
         // `FrameAllocator`) и никому больше не принадлежит; слот пуст.
         unsafe { ptr::write_volatile(slot, Entry(frame.as_u64() | wanted)) };
         Ok(frame)
+    }
+}
+
+impl PageTable {
+    /// Отобразить 2 МиБ одной записью каталога.
+    ///
+    /// Спуск идёт до `LEVEL_PD` и там останавливается: запись этого уровня с
+    /// битом `PS` — это уже лист, а не ссылка. Листовой таблицы под ней нет и
+    /// не будет, в чём и весь выигрыш — одна запись в TLB вместо пятисот
+    /// двенадцати.
+    ///
+    /// Оба адреса обязаны быть кратны 2 МиБ. Виртуальный — потому что иначе
+    /// запись покрыла бы не тот диапазон, физический — потому что младшие биты
+    /// адресного поля в такой записи зарезервированы, и единица в них даёт
+    /// отказ страницы с разбором зарезервированного бита, а не «чуть смещённое»
+    /// отображение.
+    ///
+    /// # Safety
+    ///
+    /// Те же условия, что у [`AddressSpace::map`], для всех 512 кадров сразу.
+    pub unsafe fn map_huge(
+        &mut self,
+        virt: VirtAddr,
+        phys: PhysAddr,
+        flags: PageFlags,
+        alloc: &mut impl FrameAllocator,
+    ) -> Result<(), MapError> {
+        if virt.as_usize() % HUGE_PAGE_SIZE != 0 || phys.as_u64() % HUGE_PAGE_SIZE as u64 != 0 {
+            return Err(MapError::Misaligned);
+        }
+        if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) {
+            return Err(MapError::WriteExecute);
+        }
+
+        let want_user = flags.contains(PageFlags::USER);
+        let mut table = self.root;
+        // До каталога включительно: (3, 2). Уровень 1 — листовой для 2 МиБ.
+        for level in (LEVEL_PD + 1..=LEVEL_PML4).rev() {
+            // SAFETY: на первой итерации это корень дерева, дальше — то, что
+            // вернула предыдущая `descend`.
+            table = unsafe { self.descend(table, virt.table_index(level), want_user, alloc)? };
+        }
+
+        let slot = self.entry_ptr(table, virt.table_index(LEVEL_PD));
+        // SAFETY: `slot` — запись каталога, полученного спуском выше.
+        let existing = unsafe { ptr::read_volatile(slot) };
+        if existing.is_present() {
+            return Err(MapError::AlreadyMapped);
+        }
+
+        // SAFETY: слот принадлежит нашей таблице и был пуст.
+        unsafe { ptr::write_volatile(slot, Entry(leaf_bits(phys, flags) | ENTRY_HUGE)) };
+        // SAFETY: `invlpg` не обращается к памяти и не может отказать; один
+        // адрес внутри крупной страницы сбрасывает её трансляцию целиком.
+        unsafe { invlpg(virt) };
+        Ok(())
     }
 }
 
@@ -547,10 +632,22 @@ pub fn translate(root: PhysAddr, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)
         // SAFETY: на первой итерации это корень переданного дерева, дальше —
         // адрес из его же записи; обе таблицы видны через прямое отображение.
         let entry = unsafe { ptr::read_volatile(table_entry(table, virt.table_index(level))) };
-        if !entry.is_present() || entry.is_huge() {
-            // Больших страниц этот модуль не создаёт, а разбирать чужую как
-            // цепочку таблиц нельзя — честнее ответить «не знаю».
+        if !entry.is_present() {
             return None;
+        }
+        if entry.is_huge() {
+            // Крупная страница — это лист, а не ссылка, и спуск на ней
+            // кончается. Отвечаем адресом внутри неё, а не её началом: у
+            // обычной страницы ответ тоже про переданный адрес, и вызывающему
+            // незачем знать, каким размером он отображён.
+            if level != LEVEL_PD {
+                // Гигабайтную запись этот модуль не создаёт, а разбирать чужую
+                // вслепую нельзя — честнее ответить «не знаю».
+                return None;
+            }
+            let inside = virt.as_usize() & (HUGE_PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let phys = PhysAddr::new(entry.huge_addr().as_u64() + inside as u64);
+            return Some((phys, leaf_flags(entry.0)));
         }
         table = entry.addr();
     }
@@ -582,14 +679,45 @@ pub fn translate(root: PhysAddr, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)
 /// кадр под `virt` — принадлежать одному этому дереву: вернувший его вызывающий
 /// отдаст его аллокатору, и второй владелец получил бы чужую память.
 #[must_use]
-pub unsafe fn unmap(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
+pub unsafe fn unmap(root: PhysAddr, virt: VirtAddr) -> Option<(PhysAddr, usize)> {
     let mut table = root;
     for level in (LEVEL_PT + 1..=LEVEL_PML4).rev() {
         // SAFETY: на первой итерации это корень переданного дерева, дальше —
         // адрес из его же записи; обе таблицы видны через прямое отображение.
         let entry = unsafe { ptr::read_volatile(table_entry(table, virt.table_index(level))) };
-        if !entry.is_present() || entry.is_huge() {
+        if !entry.is_present() {
             return None;
+        }
+        if entry.is_huge() {
+            if level != LEVEL_PD {
+                return None;
+            }
+            // Снять можно только крупную страницу целиком. Просьба про кусок —
+            // это не «сделаем сколько сможем», а ошибка вызывающего, и
+            // отвечать на неё надо громко: молчаливый отказ выглядел бы как
+            // «нечего снимать», кадры остались бы отображёнными, а счёт
+            // возвращённых страниц сошёлся бы неверно.
+            //
+            // Разбить страницу на 512 обычных и снять одну — то, чего этот
+            // модуль намеренно не умеет: частичное освобождение к нему не
+            // приходит (область снимается целиком, а вытеснение работает
+            // только с отображённым файлом, который крупных страниц не берёт).
+            if virt.as_usize() % HUGE_PAGE_SIZE != 0 {
+                crate::kprintln!(
+                    "mm: refusing to unmap part of a huge page at {:#x}",
+                    virt.as_usize()
+                );
+                return None;
+            }
+            let slot = table_entry(table, virt.table_index(LEVEL_PD));
+            let phys = entry.huge_addr();
+            // SAFETY: слот той же таблицы; обнуляется целиком, чтобы в записи
+            // не остался адрес кадров, уходящих в пул.
+            unsafe { ptr::write_volatile(slot, Entry(0)) };
+            // SAFETY: `invlpg` не обращается к памяти; один адрес внутри
+            // крупной страницы сбрасывает её трансляцию целиком.
+            unsafe { invlpg(virt) };
+            return Some((phys, HUGE_PAGE_FRAMES));
         }
         table = entry.addr();
     }
@@ -612,7 +740,7 @@ pub unsafe fn unmap(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr> {
     // SAFETY: `invlpg` не обращается к памяти и не может отказать.
     unsafe { invlpg(virt) };
 
-    Some(leaf.addr())
+    Some((leaf.addr(), 1))
 }
 
 /// Права листовой записи в терминах, не зависящих от архитектуры.
@@ -728,11 +856,33 @@ unsafe fn free_subtree(
         if !entry.is_present() {
             continue;
         }
-        if entry.is_huge() {
-            // Больших страниц окно программы не содержит: их не создаёт ни один
-            // путь этого модуля. Встреченная — чужая, и освобождать её вслепую
-            // означало бы вернуть в пул мегабайты неизвестно чего.
-            crate::kprintln!("mm: refusing to free a huge page at level {level} of a user space");
+        // Проверка на крупную страницу обязана стоять **под** уровнем, а не
+        // над ним: на листовой таблице бит 7 — это не `PS`, а `PAT`. Сегодня
+        // `PAT` не ставит никто, поэтому ошибка не проявлялась; поставил бы —
+        // и обычная страница перестала бы освобождаться, с сообщением,
+        // уводящим расследование в крупные страницы.
+        if level > LEVEL_PT && entry.is_huge() {
+            if level != LEVEL_PD {
+                // Гигабайтных записей окно программы не содержит: их не создаёт
+                // ни один путь этого модуля. Встреченная — чужая, и вернуть её
+                // в пул вслепую значило бы отдать гигабайт неизвестно чего.
+                crate::kprintln!(
+                    "mm: refusing to free a huge page at level {level} of a user space"
+                );
+                continue;
+            }
+            // Крупная страница — это 512 обычных кадров подряд, и вернуть их
+            // надо все. Поштучно, а не одним вызовом: `FrameAllocator` — трейт,
+            // и непрерывного освобождения в нём нет, зато каждый кадр проходит
+            // те же проверки, что и любой другой.
+            let base = entry.huge_addr().as_u64();
+            for offset in 0..HUGE_PAGE_FRAMES {
+                let frame = PhysAddr::new(base + (offset * PAGE_SIZE) as u64);
+                // SAFETY: кадры принадлежали одной крупной странице окна и
+                // больше нигде не используются.
+                unsafe { alloc.free(frame) };
+            }
+            *pages += HUGE_PAGE_FRAMES;
             continue;
         }
         if level == LEVEL_PT {
