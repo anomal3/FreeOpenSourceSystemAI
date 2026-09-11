@@ -69,13 +69,24 @@ pub use aarch64::build_kernel_address_space;
 
 /// Уйти в пользовательский режим и вернуться с кодом завершения программы.
 ///
-/// [`swap_user_return_stack`] переставляет то, что процессор помнит о
-/// возвращении из третьего кольца: значение принадлежит задаче, и планировщик
-/// меняет его вместе с ней.
+/// Стек, на который программа вернётся, хранит задача (см.
+/// [`crate::sched::remember_return_stack`]): до фазы 43 он лежал в глобальной
+/// переменной арх-слоя, а на двух процессорах такая переменная одна на двух
+/// исполняющих программы.
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::user::{enter_user, return_to_kernel, swap_user_return_stack};
+pub use x86_64::user::{enter_user, return_to_kernel};
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::user::{enter_user, return_to_kernel, swap_user_return_stack};
+pub use aarch64::user::{enter_user, return_to_kernel};
+
+/// Запуск и остановка остальных процессоров, номер текущего.
+///
+/// Обе реализации выставляют один набор имён: `current_index`, `discover`,
+/// `prepare`, `start_cpu`, `stop_others` и `ID_NAME`. Общий порядок запуска —
+/// в [`crate::smp`].
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::smp;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::smp;
 
 /// Куда процессор переключит стек при входе в ядро из третьего кольца.
 ///

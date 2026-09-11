@@ -737,6 +737,46 @@ fn init_locked() {
             kprintln!("         CNTFRQ_EL0 reads {}", timer::frequency());
         }
     }
+
+    // Просьба остановиться от соседнего процессора. Разрешается уже сейчас, хотя
+    // соседей ещё нет: разрешение SGI банковано, и на загрузочном его больше
+    // никто не поставит.
+    //
+    // SAFETY: контроллер опознан и включён.
+    unsafe { gic::enable_interrupt(super::smp::IPI_STOP, IPI_PRIORITY) };
+}
+
+/// Приоритет межпроцессорных прерываний: выше таймерного.
+///
+/// Просьба остановиться приходит, когда машина кончается, и ждать ради неё
+/// очередного тика незачем.
+const IPI_PRIORITY: u8 = 0x40;
+
+/// Поднять прерывания на проснувшемся процессоре: векторы, его часть
+/// контроллера, таймер.
+///
+/// Прерывания процессору **не** разрешаются — это делает общий код, когда
+/// процессор готов стать холостой задачей.
+pub fn init_secondary() {
+    without_interrupts(|| {
+        // SAFETY: таблица векторов — та же, что у загрузочного, и выровнена.
+        unsafe { install_vectors() };
+        // SAFETY: прерывания запрещены; вход уже выбрал `SP_EL1`, и значение
+        // указателя от этого вызова не меняется.
+        unsafe { select_kernel_stack() };
+
+        if !matches!(gic::version(), Some(gic::Version::V2 | gic::Version::V3)) {
+            return;
+        }
+        // SAFETY: контроллер опознан загрузочным процессором, redistributor
+        // этого процессора (для v3) запомнен до его запуска, векторы стоят.
+        unsafe {
+            gic::init_secondary();
+            gic::enable_interrupt(timer::TIMER_INTID, TIMER_PRIORITY);
+            gic::enable_interrupt(super::smp::IPI_STOP, IPI_PRIORITY);
+            timer::init_secondary();
+        }
+    });
 }
 
 /// Записать адрес таблицы в `VBAR_EL1`.

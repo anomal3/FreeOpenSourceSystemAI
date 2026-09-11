@@ -97,6 +97,74 @@ unsafe fn conduit(rsdp: u64) -> Option<Conduit> {
     })
 }
 
+/// Номер функции PSCI `CPU_ON` в 64-разрядном соглашении SMC.
+const PSCI_CPU_ON: u32 = 0xC400_0003;
+
+/// Ответ PSCI «функция не поддерживается» — и наш ответ, когда звать некого.
+const PSCI_NOT_SUPPORTED: i64 = -1;
+
+/// Объявляет ли прошивка PSCI.
+///
+/// # Safety
+///
+/// См. [`power_off`].
+pub unsafe fn psci_available(rsdp: u64) -> bool {
+    // SAFETY: контракт функции.
+    unsafe { conduit(rsdp) }.is_some()
+}
+
+/// Разбудить процессор `mpidr`: начать исполнение в EL1 с физического адреса
+/// `entry`, положив `context` в `x0`.
+///
+/// `Err` несёт код PSCI: `-4` (уже включён), `-2` (неверные параметры) и так
+/// далее — печатает его вызывающий, потому что знает, кого будил.
+///
+/// # Safety
+///
+/// `entry` — физический адрес кода, способного работать с выключенным MMU; всё,
+/// что он читает по `context`, обязано лежать по физическим адресам.
+pub unsafe fn cpu_on(rsdp: u64, mpidr: u64, entry: u64, context: u64) -> Result<(), i64> {
+    // SAFETY: контракт функции.
+    let Some(conduit) = (unsafe { conduit(rsdp) }) else {
+        return Err(PSCI_NOT_SUPPORTED);
+    };
+    // SAFETY: номер функции из спецификации PSCI, способ вызова — из FADT.
+    let result = unsafe { call_with(conduit, PSCI_CPU_ON, mpidr, entry, context) };
+    if result == 0 { Ok(()) } else { Err(result) }
+}
+
+/// Вызвать функцию PSCI с тремя аргументами и вернуть её ответ.
+///
+/// # Safety
+///
+/// См. [`call`].
+unsafe fn call_with(conduit: Conduit, function: u32, a1: u64, a2: u64, a3: u64) -> i64 {
+    let result: u64;
+    // SAFETY: контракт функции; SMC Calling Convention возвращает ответ в x0 и
+    // вправе испортить x1..x3.
+    unsafe {
+        match conduit {
+            Conduit::Smc => asm!(
+                "smc #0",
+                inlateout("x0") u64::from(function) => result,
+                inlateout("x1") a1 => _,
+                inlateout("x2") a2 => _,
+                inlateout("x3") a3 => _,
+                options(nostack),
+            ),
+            Conduit::Hvc => asm!(
+                "hvc #0",
+                inlateout("x0") u64::from(function) => result,
+                inlateout("x1") a1 => _,
+                inlateout("x2") a2 => _,
+                inlateout("x3") a3 => _,
+                options(nostack),
+            ),
+        }
+    }
+    result as i64
+}
+
 /// Вызвать функцию PSCI.
 ///
 /// # Safety

@@ -428,6 +428,51 @@ impl Scenario {
 /// добавляется время на разметку носителя.
 const BOOT: u64 = 120_000;
 
+/// Шаги сценариев о нескольких процессорах — общие для GICv2 и GICv3.
+///
+/// # Что именно доказывает одновременность
+///
+/// Не время. Две программы, исполнившиеся за то же время, что одна, — довод
+/// слабый: под эмулятором время зависит от загрузки хоста, и стенд в три потока
+/// сделал бы из него лотерею. Довод здесь — строка `tasks`: ядро печатает, что
+/// исполняет **каждый** процессор в этот миг, и если обе программы названы
+/// исполняющимися, они исполняются на разных процессорах — на одном двум
+/// задачам сразу быть негде. Оболочка, печатающая список, занимает третий.
+///
+/// Рядом — счётчики переключений на каждом процессоре (строка `cpu 3`), и
+/// строка самой программы о том, на каких процессорах она побывала.
+const SMP_STEPS: &[Step] = &[
+    Step::Await("smp         : 4 of 4 processors online", BOOT),
+    Step::Await("freeos> ", BOOT),
+    Step::Line("run -b /bin/spin 6000"),
+    Step::Capture("started as #", 15_000),
+    Step::Line("run -b /bin/spin 6000"),
+    Step::Capture2("started as #", 15_000),
+    // Программе нужно время дойти до третьего кольца: загрузка образа — работа
+    // ядра, и в ней задача тоже «исполняется», но проверять хочется жгущий цикл.
+    Step::Wait(2_000),
+    Step::Line("tasks"),
+    Step::AwaitAny(": running #{} (program)", 15_000),
+    Step::AwaitAny(": running #{2} (program)", 15_000),
+    // Где угодно в выводе, а не «после»: программа, найденная шагом выше, может
+    // исполняться как раз на третьем процессоре, и тогда её строка **и есть**
+    // строка `cpu 3` — курсор уже за ней. Так упал первый прогон на AArch64.
+    Step::AwaitAny("cpu 3      :", 15_000),
+    Step::AwaitAny("spin {}: burned", 60_000),
+    Step::AwaitAny("spin {2}: burned", 60_000),
+    Step::Line("echo still-alive"),
+    Step::Await("  still-alive", 15_000),
+    Step::Line("exit"),
+    Step::Await("finishing the session", 15_000),
+    // Выход из сеанса останавливает машину, и остальные процессоры обязаны
+    // получить об этом просьбу, а не продолжать служебные задачи в пустоте.
+    Step::Await("other processor(s) asked to stop", 30_000),
+    Step::Absent("KERNEL PANIC"),
+    Step::Absent("CPU FAULT"),
+    Step::Absent("STACK OVERFLOW"),
+    Step::Absent("did not report"),
+];
+
 pub const ALL: &[Scenario] = &[
     Scenario {
         name: "boot",
@@ -1722,6 +1767,53 @@ pub const ALL: &[Scenario] = &[
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
         ],
+    },
+    Scenario {
+        name: "smp",
+        about: "Четыре процессора: две жгущие программы исполняются одновременно, а не по очереди.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &["-smp", "4"],
+        steps: SMP_STEPS,
+    },
+    Scenario {
+        name: "smp-gicv3",
+        about: "Четыре процессора на GICv3: у каждого свой redistributor, найденный по сродству.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        // Только AArch64: на x86-64 GIC не существует.
+        arches: &[Arch::Aarch64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // Прошивка QEMU описывает redistributor'ы одним диапазоном и не говорит,
+        // какой кому принадлежит: ядро обязано найти их по `GICR_TYPER`. Без
+        // этого сценария путь проверялся бы только на GICv2, где redistributor'ов
+        // нет вовсе.
+        extra: &["-smp", "4", "-machine", "gic-version=3"],
+        steps: SMP_STEPS,
     },
     Scenario {
         name: "kill",

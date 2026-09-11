@@ -340,6 +340,7 @@ pub mod input;
 pub mod interrupts;
 pub mod paging;
 mod power;
+pub mod smp;
 pub mod timer;
 pub mod user;
 

@@ -441,6 +441,9 @@ pub fn gic_layout(fdt: &Fdt<'_>) -> Option<super::acpi::GicLayout> {
         distributor: distributor as usize,
         cpu_interface: if version == 2 { second.map(|address| address as usize) } else { None },
         redistributor: if version == 3 { second.map(|address| address as usize) } else { None },
+        // Машина, описанная деревом, остальных процессоров не запускает, и
+        // искать их redistributor'ы незачем.
+        redistributor_span: 0,
         version,
     })
 }

@@ -251,3 +251,32 @@ pub fn fired() -> bool {
     }
     ctl & CNTV_CTL_ISTATUS != 0
 }
+
+/// Запустить таймер проснувшегося процессора.
+///
+/// Регистры таймера банкованы — у каждого процессора свои, — а частота и период
+/// одни на машину: их посчитал [`init`] на загрузочном. Возвращает `false`,
+/// если тот таймер не запустил.
+///
+/// # Safety
+///
+/// Прерывание [`TIMER_INTID`] разрешено в redistributor'е (или банкованном
+/// регистре distributor'а) **этого** процессора, векторы установлены.
+pub unsafe fn init_secondary() -> bool {
+    let period = PERIOD.load(Ordering::Relaxed);
+    if period == 0 {
+        return false;
+    }
+    // SAFETY: контракт функции; порядок тот же, что в `init`.
+    unsafe {
+        asm!(
+            "msr cntv_tval_el0, {period}",
+            "msr cntv_ctl_el0, {ctl}",
+            "isb",
+            period = in(reg) period,
+            ctl = in(reg) CNTV_CTL_ENABLE,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    true
+}

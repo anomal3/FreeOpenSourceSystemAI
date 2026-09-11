@@ -1,26 +1,28 @@
-//! Разбор таблиц ACPI, нужных ARM: где контроллер прерываний и где консоль.
+//! Разбор таблиц ACPI, нужных ARM: где контроллер прерываний, где консоль и
+//! сколько процессоров.
 //!
 //! # Почему это понадобилось
 //!
 //! Потому что адреса были зашиты константами под QEMU `virt`, и на первой же
 //! чужой машине — VirtualBox на Apple Silicon — ядро напечатало «unsupported
 //! interrupt controller (Unknown) at 0x08000000» и осталось без таймера и без
-//! клавиатуры. Всё остальное работало: память, часы, initrd, PCI, xHCI. Не
-//! работал ровно тот узел, адрес которого был угадан, а не прочитан.
+//! клавиатуры. Не работал ровно тот узел, адрес которого был угадан, а не
+//! прочитан.
 //!
 //! Правильный источник у ARM ровно один — таблицы прошивки. На платформах с
 //! ACPI это MADT (она же `APIC`), где distributor описан записью типа
 //! [`ENTRY_GICD`], а redistributor'ы GICv3 — записями [`ENTRY_GICR`] или полем
-//! внутри записи процессора [`ENTRY_GICC`].
+//! внутри записи процессора [`ENTRY_GICC`]. Та же запись процессора с фазы 43
+//! отвечает и на вопрос, сколько процессоров у машины и как их зовут.
 //!
 //! # Чего здесь нет
 //!
-//! Device tree. Машина без ACPI (Raspberry Pi без UEFI, будущий телефон) сюда
-//! не попадёт вовсе: у неё не будет и `BootInfo::acpi_rsdp`. Разбор FDT — это
-//! отдельный формат и отдельная фаза, и делать его вслепую, не имея машины, где
-//! его можно прогнать, значит писать код, который выглядит рабочим.
+//! Device tree. Машина без ACPI (Raspberry Pi без UEFI, телефон) сюда не
+//! попадёт вовсе: у неё не будет и `BootInfo::acpi_rsdp`. Разбор FDT — это
+//! отдельный формат, и остальных процессоров такая машина не запускает.
 
 use crate::acpi::{self, AcpiError};
+use crate::smp::Found;
 
 /// Запись MADT: процессорный интерфейс GIC.
 const ENTRY_GICC: u8 = 0x0B;
@@ -35,6 +37,19 @@ const SDT_HEADER: usize = 36;
 /// флаги. Для ARM они бессмысленны, но место занимают.
 const MADT_FIXED: usize = 8;
 
+/// Записи процессора: флаги, адрес его redistributor'а и `MPIDR`.
+const GICC_FLAGS: usize = 12;
+const GICC_REDISTRIBUTOR: usize = 60;
+const GICC_MPIDR: usize = 68;
+/// Флаг записи процессора: процессор включён.
+const GICC_ENABLED: u32 = 1 << 0;
+/// Записи диапазона redistributor'ов: база и длина.
+const GICR_BASE: usize = 4;
+const GICR_LENGTH: usize = 12;
+
+/// Биты `MPIDR`, составляющие адрес процессора: Aff3 и Aff2..Aff0.
+pub const MPIDR_AFFINITY: u64 = 0xFF_00FF_FFFF;
+
 /// То, что ядро узнало о контроллере прерываний.
 #[derive(Debug, Clone, Copy)]
 pub struct GicLayout {
@@ -45,6 +60,10 @@ pub struct GicLayout {
     pub cpu_interface: Option<usize>,
     /// Физический адрес redistributor'а этого ядра (GICv3).
     pub redistributor: Option<usize>,
+    /// Длина диапазона redistributor'ов, если прошивка описала их диапазоном.
+    /// Ноль — диапазона нет. Нужна, чтобы найти redistributor второго
+    /// процессора, не зная его адреса заранее.
+    pub redistributor_span: usize,
     /// Версия, объявленная прошивкой: 2, 3, 4 — или 0, если она промолчала.
     pub version: u8,
 }
@@ -73,6 +92,7 @@ pub unsafe fn find_gic(rsdp: u64) -> Option<GicLayout> {
         distributor: 0,
         cpu_interface: None,
         redistributor: None,
+        redistributor_span: 0,
         version: 0,
     };
 
@@ -99,7 +119,7 @@ pub unsafe fn find_gic(rsdp: u64) -> Option<GicLayout> {
                 if cpu != 0 && layout.cpu_interface.is_none() {
                     layout.cpu_interface = Some(cpu);
                 }
-                let redistributor = acpi::read_u64(madt, at + 60) as usize;
+                let redistributor = acpi::read_u64(madt, at + GICC_REDISTRIBUTOR) as usize;
                 if redistributor != 0 && layout.redistributor.is_none() {
                     layout.redistributor = Some(redistributor);
                 }
@@ -108,9 +128,10 @@ pub unsafe fn find_gic(rsdp: u64) -> Option<GicLayout> {
             // в записи процессора: прошивка вправе описать диапазон и оставить
             // поле нулевым.
             ENTRY_GICR if len >= 16 => {
-                let base = acpi::read_u64(madt, at + 4) as usize;
+                let base = acpi::read_u64(madt, at + GICR_BASE) as usize;
                 if base != 0 {
                     layout.redistributor = Some(base);
+                    layout.redistributor_span = acpi::read_u32(madt, at + GICR_LENGTH) as usize;
                 }
             }
             _ => {}
@@ -123,6 +144,49 @@ pub unsafe fn find_gic(rsdp: u64) -> Option<GicLayout> {
         return None;
     }
     Some(layout)
+}
+
+/// Перечислить включённые процессоры из MADT.
+///
+/// `boot` — `MPIDR` загрузочного процессора: он узнаётся по нему, а не по первой
+/// записи, потому что порядок записей спецификация не закрепляет. Вторым числом
+/// каждого процессора едет адрес его redistributor'а, если прошивка его назвала.
+///
+/// Таблиц нет — значит и процессор один: без MADT неоткуда узнать, как зовут
+/// остальных, а просить прошивку разбудить процессор с угаданным `MPIDR` — это
+/// ровно угаданный адрес, от которого ядро уже однажды отказалось.
+///
+/// # Safety
+///
+/// См. [`find_gic`].
+pub unsafe fn processors(rsdp: u64, boot: u64) -> Found {
+    let mut found = Found::only(boot);
+    if rsdp == 0 {
+        return found;
+    }
+    // SAFETY: контракт функции.
+    let Ok(madt) = (unsafe { acpi::find_table(rsdp, b"APIC") }) else {
+        return found;
+    };
+
+    let mut at = SDT_HEADER + MADT_FIXED;
+    while at + 2 <= madt.len() {
+        let kind = madt[at];
+        let len = madt[at + 1] as usize;
+        if len < 2 || at + len > madt.len() {
+            break;
+        }
+        if kind == ENTRY_GICC && len >= GICC_MPIDR + 8 {
+            let flags = acpi::read_u32(madt, at + GICC_FLAGS);
+            if flags & GICC_ENABLED != 0 {
+                let mpidr = acpi::read_u64(madt, at + GICC_MPIDR) & MPIDR_AFFINITY;
+                let redistributor = acpi::read_u64(madt, at + GICC_REDISTRIBUTOR);
+                found.push(mpidr, redistributor);
+            }
+        }
+        at += len;
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -140,12 +204,6 @@ const GAS_ADDRESS: usize = 4;
 const GAS_SPACE_MEMORY: u8 = 0;
 
 /// Типы интерфейса, которые понимает драйвер PL011.
-///
-/// `0x03` — сам PL011; `0x0D` и `0x0E` — SBSA-вариант того же регистрового
-/// набора (полный и 32-разрядный), совместимый с ним по всем регистрам, которые
-/// этот драйвер трогает. Всё остальное (16550, DCC, MediaTek) — другое
-/// устройство, и молча считать его PL011 значило бы писать байты в чужие
-/// регистры.
 const INTERFACE_PL011: u8 = 0x03;
 const INTERFACE_SBSA_32: u8 = 0x0D;
 const INTERFACE_SBSA: u8 = 0x0E;
@@ -156,13 +214,7 @@ const INTERFACE_SBSA: u8 = 0x0E;
 ///
 /// Затем же, зачем MADT: адрес UART на ARM ничем не закреплён. У QEMU `virt`
 /// это `0x0900_0000`, у VirtualBox на Apple Silicon — `0xffdd_f000`, и ядро,
-/// знающее только первый, на второй машине немо. Немо буквально: там не было ни
-/// одной строки журнала, и единственный способ понять, почему не работает
-/// клавиатура, — снимок экрана, на котором журнал уже затёрт рабочим столом.
-///
-/// SPCR (Serial Port Console Redirection) — та самая таблица, в которой прошивка
-/// говорит, куда она сама выводит консоль. Прошивка VirtualBox туда и пишет: её
-/// вывод виден в файле, к которому подключён порт, — а ядро молчало.
+/// знающее только первый, на второй машине немо.
 ///
 /// `None` означает «таблицы нет либо описан не наш порт» — тогда остаётся
 /// умолчание QEMU, и это состояние печатается вслух.
@@ -198,9 +250,7 @@ unsafe fn uart_from_spcr(rsdp: u64) -> Option<usize> {
     if !matches!(interface, INTERFACE_PL011 | INTERFACE_SBSA | INTERFACE_SBSA_32) {
         return None;
     }
-    // Порт в пространстве ввода-вывода на ARM невозможен физически: такого
-    // пространства у архитектуры нет. Значение, отличное от «памяти», означает
-    // испорченную таблицу либо порт, до которого этому драйверу не дотянуться.
+    // Порт в пространстве ввода-вывода на ARM невозможен физически.
     if spcr[SPCR_BASE + GAS_SPACE_ID] != GAS_SPACE_MEMORY {
         return None;
     }
@@ -211,11 +261,8 @@ unsafe fn uart_from_spcr(rsdp: u64) -> Option<usize> {
 
 /// Порт из DBG2 — таблицы отладочных портов.
 ///
-/// Она существует отдельно от SPCR и описывает то же самое устройство с другой
-/// целью: SPCR отвечает на вопрос «куда прошивка выводит консоль», DBG2 — «какие
-/// порты пригодны для отладки». Прошивка вправе объявить одну из них, обе или ни
-/// одной, поэтому смотреть надо в обе: молчание системы стоит дороже двух
-/// разборов по тридцать строк.
+/// Прошивка вправе объявить одну из SPCR и DBG2, обе или ни одной, поэтому
+/// смотреть надо в обе.
 ///
 /// # Safety
 ///
@@ -251,8 +298,7 @@ unsafe fn uart_from_dbg2(rsdp: u64) -> Option<usize> {
             break;
         }
         let length = usize::from(acpi::read_u16(dbg2, at + DEVICE_LENGTH));
-        // Нулевая длина — испорченная таблица, а не пустая запись: без проверки
-        // обход зациклился бы навсегда.
+        // Нулевая длина — испорченная таблица, а не пустая запись.
         if length < 22 || at + length > dbg2.len() {
             break;
         }

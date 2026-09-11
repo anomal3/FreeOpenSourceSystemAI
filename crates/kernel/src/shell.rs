@@ -99,8 +99,8 @@ impl fmt::Write for Out {
 /// Напечатать в оболочку одним куском.
 ///
 /// Аргумент — уже собранный `format_args!`, поэтому лок берётся один раз на всю
-/// строку, а не на каждую её часть. `SpinLock` не перевходим, поэтому внутри
-/// работает [`Raw`], который не запирается повторно.
+/// строку, а не на каждую её часть. Строку собирает [`Line`] и отдаёт в вывод
+/// одним куском.
 ///
 /// Лока, однако, мало, и это выяснилось на первом же полном прогоне стенда в
 /// четыре потока. Он держит только тех, кто печатает **сюда**; `kprintln!`
@@ -118,18 +118,66 @@ impl fmt::Write for Out {
 pub fn print(args: fmt::Arguments<'_>) {
     let _hold = sched::hold_preemption();
     let _guard = OUT.lock();
-    let _ = Raw.write_fmt(args);
+    let mut line = Line::new();
+    let _ = line.write_fmt(args);
+    line.flush();
 }
 
-/// Тот же приёмник, но без лока — для использования под уже взятым [`OUT`].
-struct Raw;
+/// Строка, собранная целиком прежде, чем уйти в вывод.
+///
+/// На одном процессоре хватало лока и просьбы не вытеснять: `write_fmt` пишет
+/// кусками (текст, подстановка, снова текст), и чужой вывод мог попасть между
+/// ними только через переключение задач. На двух процессорах соседний печатает
+/// в serial в тот же миг, и строка рвётся посреди подстановки — «started as» на
+/// одной строке, номер задачи на другой, — а стенд ищет их вместе. Лок serial
+/// держит целым каждый **вызов**, поэтому куски складываются здесь и уходят
+/// одним.
+///
+/// Буфер на стеке, а не `String`: печатают и там, где кучи может не хватить.
+/// Кусок длиннее буфера уходит отдельно — строка при этом может разорваться, но
+/// не потеряется.
+struct Line {
+    bytes: [u8; LINE_BYTES],
+    len: usize,
+}
 
-impl fmt::Write for Raw {
+/// Сколько байт строки собирается перед выводом.
+const LINE_BYTES: usize = 512;
+
+impl Line {
+    const fn new() -> Self {
+        Self { bytes: [0; LINE_BYTES], len: 0 }
+    }
+
+    /// Отдать собранное в вывод.
+    fn flush(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        // Буфер наполняется только целыми кусками `&str`, поэтому граница
+        // символа не разрезана, и разбор не откажет.
+        if let Ok(text) = core::str::from_utf8(&self.bytes[..self.len]) {
+            write_raw(text);
+        }
+        self.len = 0;
+    }
+}
+
+impl fmt::Write for Line {
     fn write_str(&mut self, text: &str) -> fmt::Result {
-        write_raw(text);
+        if self.len + text.len() > LINE_BYTES {
+            self.flush();
+        }
+        if text.len() > LINE_BYTES {
+            write_raw(text);
+            return Ok(());
+        }
+        self.bytes[self.len..self.len + text.len()].copy_from_slice(text.as_bytes());
+        self.len += text.len();
         Ok(())
     }
 }
+
 
 /// Куда на самом деле уходит вывод оболочки.
 fn write_raw(text: &str) {

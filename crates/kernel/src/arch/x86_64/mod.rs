@@ -12,6 +12,7 @@ pub mod input;
 pub mod interrupts;
 pub mod ioapic;
 pub mod paging;
+pub mod smp;
 pub mod tsc;
 pub mod user;
 

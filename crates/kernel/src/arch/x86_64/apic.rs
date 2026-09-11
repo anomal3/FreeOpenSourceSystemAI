@@ -582,6 +582,7 @@ fn start_timer() {
     // APIC уже должен знать, какой вектор доставлять.
     write_reg(REG_LVT_TIMER, LVT_TIMER_PERIODIC | u32::from(VECTOR_TIMER));
     write_reg(REG_TIMER_INITIAL_COUNT, initial as u32);
+    TIMER_COUNT.store(initial as u32, Ordering::Relaxed);
 
     kprintln!(
         "  timer       : {} Hz on vector {:#04x}, count {} (bus {}.{:03} MHz, measured against {source})",
@@ -591,4 +592,104 @@ fn start_timer() {
         hz * TIMER_DIVISOR / 1_000_000,
         (hz * TIMER_DIVISOR / 1000) % 1000
     );
+}
+
+// --- Остальные процессоры -----------------------------------------------------
+
+/// Просьба остановиться: паника, неисправимый отказ или выключение машины.
+///
+/// Приоритет выше таймерного (класс 3 против 2): процессор, у которого как раз
+/// обрабатывается тик, остановится сразу после него, а не после следующего.
+pub const VECTOR_IPI_STOP: u8 = 0x30;
+
+/// Начальный счёт таймера, измеренный загрузочным процессором.
+///
+/// Остальные его не меряют. Частота шины у процессоров одной машины одна, а
+/// повторная калибровка на каждом стоила бы десяти миллисекунд на процессор и
+/// давала бы чуть разные числа — то есть чуть разную длину тика, которую потом
+/// пришлось бы объяснять. Ноль — таймер не запущен и на остальных не нужен.
+static TIMER_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Регистр команды межпроцессорного прерывания: младшая и старшая половины.
+const REG_ICR_LOW: u32 = 0x300;
+const REG_ICR_HIGH: u32 = 0x310;
+/// Тот же регистр в x2APIC — один MSR на 64 бита, получатель в старшей половине.
+const X2APIC_ICR: u32 = 0x830;
+
+/// Способ доставки `INIT`: сбросить процессор и ждать `SIPI`.
+const ICR_INIT: u32 = 0b101 << 8;
+/// Способ доставки `SIPI`: начать исполнять код с адреса `вектор × 0x1000`.
+const ICR_STARTUP: u32 = 0b110 << 8;
+/// Послано, но ещё не доставлено (только xAPIC).
+const ICR_PENDING: u32 = 1 << 12;
+/// Уровень «выставлен». Для всего, кроме снятия `INIT`, обязан быть единицей.
+const ICR_ASSERT: u32 = 1 << 14;
+/// Сокращение получателя «все, кроме себя».
+const ICR_ALL_BUT_SELF: u32 = 0b11 << 18;
+
+/// Сколько опросить признак доставки, прежде чем перестать ждать.
+const ICR_SPIN_LIMIT: u32 = 1_000_000;
+
+/// Включить локальный APIC проснувшегося процессора в том же режиме, что у
+/// загрузочного, и запустить на нём таймер.
+pub fn init_secondary() {
+    // SAFETY: APIC на этой машине есть — на нём уже работает загрузочный
+    // процессор, а модель процессоров у машины одна.
+    let base = unsafe { rdmsr(IA32_APIC_BASE) };
+    // SAFETY: тот же MSR, что прочитан выше; переход в x2APIC — по тем же
+    // правилам, что в `enable_apic`: сначала EN, потом EXTD.
+    unsafe {
+        wrmsr(IA32_APIC_BASE, base | APIC_BASE_ENABLE);
+        if X2APIC.load(Ordering::Relaxed) {
+            wrmsr(IA32_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_EXTD);
+        }
+    }
+    // В режиме xAPIC окно регистров у всех процессоров по одному адресу, и
+    // каждый видит в нём свой APIC: отображать заново нечего.
+    write_reg(REG_SPURIOUS, SVR_APIC_ENABLE | u32::from(VECTOR_SPURIOUS));
+    write_reg(REG_TPR, 0);
+
+    let count = TIMER_COUNT.load(Ordering::Relaxed);
+    if count == 0 {
+        return;
+    }
+    write_reg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
+    write_reg(REG_LVT_TIMER, LVT_TIMER_PERIODIC | u32::from(VECTOR_TIMER));
+    write_reg(REG_TIMER_INITIAL_COUNT, count);
+}
+
+/// Послать межпроцессорное прерывание.
+fn write_icr(destination: u32, command: u32) {
+    if X2APIC.load(Ordering::Relaxed) {
+        // SAFETY: режим x2APIC включён, MSR команды существует; запись одним
+        // обращением и есть отправка.
+        unsafe { wrmsr(X2APIC_ICR, (u64::from(destination) << 32) | u64::from(command)) };
+        return;
+    }
+    // В xAPIC отправляет запись младшей половины, поэтому получатель пишется
+    // первым. Признак «ещё не доставлено» ждётся: следующая команда, записанная
+    // поверх недоставленной, заменила бы её.
+    write_reg(REG_ICR_HIGH, destination << 24);
+    write_reg(REG_ICR_LOW, command);
+    for _ in 0..ICR_SPIN_LIMIT {
+        if read_reg(REG_ICR_LOW) & ICR_PENDING == 0 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// `INIT` процессору с номером `apic_id`.
+pub fn send_init(apic_id: u32) {
+    write_icr(apic_id, ICR_INIT | ICR_ASSERT);
+}
+
+/// `SIPI` процессору с номером `apic_id`: начать с адреса `vector × 0x1000`.
+pub fn send_startup(apic_id: u32, vector: u8) {
+    write_icr(apic_id, ICR_STARTUP | ICR_ASSERT | u32::from(vector));
+}
+
+/// Прерывание `vector` всем процессорам, кроме текущего.
+pub fn send_to_others(vector: u8) {
+    write_icr(0, ICR_ALL_BUT_SELF | ICR_ASSERT | u32::from(vector));
 }

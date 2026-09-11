@@ -131,6 +131,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         // второе пространство имён для тех же объектов пришлось бы всё время
         // сопоставлять с первым.
         SYS_GETPID => i64::from(sched::current().as_u32()),
+        // Номер процессора верен ровно на миг ответа — см. договор.
+        user_abi::SYS_GETCPU => crate::smp::cpu() as i64,
         SYS_SOCKET => socket(a0),
         SYS_BIND => bind(a0, a1),
         SYS_CONNECT => connect(a0, a1, a2),
