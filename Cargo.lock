@@ -1115,6 +1115,8 @@ name = "user-progs"
 version = "0.3.0"
 dependencies = [
  "fpk",
+ "linked_list_allocator",
+ "mini-ui",
  "osupdate",
  "ssh",
  "tls",

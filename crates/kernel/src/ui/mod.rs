@@ -110,19 +110,16 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
         return false;
     };
 
-    // Окно оболочки обязательно, остальные — нет: без второго окна система
-    // работает, поэтому отказ выделения памяти под него не повод отказываться
-    // от графики целиком.
+    // Окно оболочки обязательно: без него системе негде принять команду.
+    //
+    // Второго окна ядро больше не заводит. До фазы 47b здесь открывалось окно
+    // состояния — оно перекрывало оболочку и тем показывало, что композитор
+    // складывает слои, а не рисует два независимых прямоугольника. Теперь
+    // монитор системы это программа (`/bin/sysmon`), её поднимает супервизор, и
+    // перекрытие получается то же самое — только окно приходит снаружи ядра.
     let Some(terminal) = build(&desktop, App::Terminal) else {
         return false;
     };
-    // Окно состояния сознательно перекрывает окно оболочки — без перекрытия
-    // композитор не отличить от двух независимых прямоугольников. Порядок
-    // добавления и есть порядок по глубине: состояние уходит вниз, оболочка
-    // кладётся поверх.
-    if let Some(status) = build(&desktop, App::System) {
-        desktop.push(status);
-    }
     desktop.push(terminal);
 
     desktop.refresh_panel(&status_now());
@@ -247,11 +244,6 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
             width * 5 / 8,
             work * 3 / 4,
         ),
-        App::System => {
-            let x = (margin + width * 9 / 16) as i32;
-            let w = width.saturating_sub(x as u32 + margin);
-            Rect::new(x, (work / 3) as i32, w, work / 2)
-        }
         App::Files => Rect::new(
             (width / 6) as i32,
             (work / 8) as i32,
@@ -434,14 +426,6 @@ pub fn write(text: &str) {
     }
 }
 
-/// Заменить содержимое окна состояния.
-pub fn set_status(text: &str) {
-    with_window(App::System, |window| {
-        window.clear();
-        window.write_str(text);
-    });
-}
-
 /// Очистить окно оболочки.
 pub fn clear_shell() {
     with_window(App::Terminal, Window::clear);
@@ -518,9 +502,52 @@ pub fn tick() {
 #[must_use]
 pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
     let status = status_now();
-    // Графики нет: события идут прямо в оболочку, как и до появления стола.
-    with_desktop(|desktop| dispatch_on(desktop, event, &status)).unwrap_or(Some(event))
+    for attempt in 0..INPUT_TRIES {
+        if let Some(answer) = with_desktop(|desktop| dispatch_on(desktop, event, &status)) {
+            return answer;
+        }
+        // Графики нет вовсе — ждать нечего, событие идёт прямо в оболочку, как
+        // и до появления стола.
+        if !graphics() {
+            return Some(event);
+        }
+        // Стол вынут из-под замка: кто-то собирает кадр. Ждём — см.
+        // [`INPUT_TRIES`], — но только между попытками, а не после последней.
+        if attempt + 1 < INPUT_TRIES {
+            crate::sched::sleep_ms(INPUT_PAUSE_MS);
+        }
+    }
+    // Не дождались. Событие всё-таки уходит оболочке: она есть всегда, а
+    // потерять нажатие молча — худшее из возможного.
+    Some(event)
 }
+
+/// Сколько раз ждать освободившийся стол, прежде чем отдать событие оболочке.
+///
+/// # Почему ждать вообще приходится
+///
+/// Потому что [`with_desktop`] отвечает `None` на **два разных** вопроса:
+/// «графики нет» и «стол сейчас занят сборкой кадра». До фазы 47b разница не
+/// проявлялась — фокус почти всегда был у оболочки, и «отдать оболочке»
+/// случайно совпадало с правильным ответом.
+///
+/// С окнами программ совпадение кончилось. Монитор системы перерисовывает своё
+/// окно раз в секунду, то есть стол занят заметную долю времени, и клавиша,
+/// попавшая в этот промежуток, доставалась **не тому окну**: программа своих
+/// событий не получала вовсе, а в командной строке появлялись буквы, которых
+/// туда никто не набирал. В журнале это выглядело как `awinshow: waited 20011
+/// ms, 0 event(s)` — буква `a`, отражённая эхом оболочки, приклеенная к строке
+/// программы, которая так ничего и не дождалась.
+///
+/// Двести пятьдесят попыток по [`INPUT_PAUSE_MS`] — это полсекунды. Ста
+/// миллисекунд, стоявших здесь сначала, не хватило: стол держат не только
+/// сборкой кадра, но и **открытием окна** — выделить поверхность, нарисовать
+/// украшения, переставить панель, вывести всё на экран, — а в отладочной сборке
+/// это сотни миллисекунд. Щелчок, пришедшийся на такой момент, терялся.
+const INPUT_TRIES: u32 = 250;
+
+/// Пауза между попытками достучаться до стола.
+const INPUT_PAUSE_MS: u64 = 2;
 
 fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
     // Отпускания стол не использует: все его действия происходят по нажатию.
@@ -566,12 +593,17 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
             // такая же просьба, как крестик. Иначе сочетание отнимало бы у неё
             // и окно, и возможность спросить «сохранить?».
             let focused = desktop.focused_app();
+            // Имя берётся до всякого закрытия — по той же причине, что и у
+            // крестика: у окна программы оно живёт в самом окне.
+            let name = focused.map(|app| name_of(desktop, app));
             if focused.is_some_and(|app| request_close(desktop, app)) {
-                if let Some(app) = focused {
-                    kprintln!("  desktop     : close requested of '{}'", app.title());
+                if let Some(name) = &name {
+                    kprintln!("  desktop     : close requested of '{name}'");
                 }
-            } else if let Some(closed) = desktop.close_focused() {
-                kprintln!("  desktop     : closed '{}'", closed.title());
+            } else if desktop.close_focused().is_some() {
+                if let Some(name) = &name {
+                    kprintln!("  desktop     : closed '{name}'");
+                }
             }
             log_focus(desktop);
             desktop.refresh_panel(status);
@@ -605,7 +637,31 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
 /// заставила бы одну из двух моделей притворяться другой.
 pub fn dispatch_pointer(event: PointerEvent) {
     let status = status_now();
-    with_desktop(|desktop| pointer_on(desktop, event, &status));
+    // Ждут **все** события указателя, а не только нажатия, и это выяснилось
+    // дорого. Казалось, что потерянное движение ничего не стоит: следующее
+    // придёт через миллисекунды. На деле движения складываются — курсор ведут
+    // приращениями, — и потерянное означает, что указатель не доехал. Щелчок
+    // после этого приходит исправно, но мимо: в журнале это выглядит как
+    // «не нажалась кнопка меню», а не как «потерялось движение мыши».
+    let tries = INPUT_TRIES;
+
+    for attempt in 0..tries {
+        if with_desktop(|desktop| pointer_on(desktop, event, &status)).is_some() {
+            return;
+        }
+        if !graphics() {
+            return;
+        }
+        // Спим только между попытками, а не после последней. Разница
+        // выглядит придиркой и стоила красного прогона: у движений попытка
+        // одна, и сон в конце тела означал две миллисекунды сна на **каждое**
+        // потерянное движение. У мыши их поток, задача ввода отставала — и
+        // команда, набранная в серийную линию, терялась целиком, потому что
+        // читает эту линию та же задача.
+        if attempt + 1 < tries {
+            crate::sched::sleep_ms(INPUT_PAUSE_MS);
+        }
+    }
 }
 
 fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
@@ -688,7 +744,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
             if let Some(rect) = desktop.rect_of(app) {
                 kprintln!(
                     "  desktop     : moved '{}' to {},{}",
-                    app.title(),
+                    name_of(desktop, app),
                     rect.x,
                     rect.y
                 );
@@ -772,8 +828,9 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 // себя панель задач везде, где человек её видел, и другого
                 // способа свернуть окно без мыши у кнопки нет.
                 if desktop.focused_app() == Some(app) && !desktop.is_minimized(app) {
+                    let name = name_of(desktop, app);
                     if desktop.minimize(app) {
-                        kprintln!("  desktop     : minimized '{}'", app.title());
+                        kprintln!("  desktop     : minimized '{name}'");
                     }
                     log_focus(desktop);
                 } else {
@@ -815,26 +872,32 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
         match hit {
             Hit::Close => {
                 if let Some(app) = app {
+                    // Имя спрашивается **до** закрытия: у окна программы оно
+                    // живёт в самом окне, и после того, как окно убрано со
+                    // стола, узнать его уже негде.
+                    let name = name_of(desktop, app);
                     if request_close(desktop, app) {
-                        kprintln!("  desktop     : close requested of '{}'", app.title());
+                        kprintln!("  desktop     : close requested of '{name}'");
                     } else if desktop.close(app) {
-                        kprintln!("  desktop     : closed '{}'", app.title());
+                        kprintln!("  desktop     : closed '{name}'");
                     }
                     log_focus(desktop);
                 }
             }
             Hit::Minimize => {
                 if let Some(app) = app {
+                    let name = name_of(desktop, app);
                     if desktop.minimize(app) {
-                        kprintln!("  desktop     : minimized '{}'", app.title());
+                        kprintln!("  desktop     : minimized '{name}'");
                     }
                     log_focus(desktop);
                 }
             }
             Hit::Maximize => {
                 if let Some(app) = app {
+                    let name = name_of(desktop, app);
                     if desktop.toggle_maximize(app) {
-                        kprintln!("  desktop     : resized '{}'", app.title());
+                        kprintln!("  desktop     : resized '{name}'");
                         // Новый прямоугольник — следом: без него снаружи не
                         // видно, куда уехало окно, и попасть в его кнопку
                         // второй раз можно только наугад.
@@ -845,13 +908,13 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             Hit::Resize => {
                 if let Some(app) = app {
                     desktop.set_resize_drag(app);
-                    kprintln!("  desktop     : resizing '{}'", app.title());
+                    kprintln!("  desktop     : resizing '{}'", name_of(desktop, app));
                 }
             }
             Hit::Title => {
                 desktop.set_drag(app);
                 if let Some(app) = app {
-                    kprintln!("  desktop     : drag '{}'", app.title());
+                    kprintln!("  desktop     : drag '{}'", name_of(desktop, app));
                 }
             }
             // Щелчок по содержимому: его разбирает само содержимое — в
@@ -1311,7 +1374,7 @@ fn log_icons(desktop: &Compositor) {
 /// — он показывает последний нарисованный кадр, а не текущее состояние.
 fn log_focus(desktop: &Compositor) {
     if let Some(app) = desktop.focused_app() {
-        kprintln!("  desktop     : focus '{}'", app.title());
+        kprintln!("  desktop     : focus '{}'", name_of(desktop, app));
     }
 }
 
@@ -1446,6 +1509,20 @@ pub fn close_window(task: u32) -> Result<(), WindowError> {
         Ok(())
     })
     .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Как окно называется в журнале.
+///
+/// У окон ядра это [`App::title`] — латиница, потому что журнал читает
+/// разработчик, и по нему же наводит мышь автоматический стенд. У окна программы
+/// имени в перечислении нет вовсе: оно своё и приехало из самой программы, а
+/// печатать вместо него родовое «Program» значило бы, что два разных окна в
+/// журнале неразличимы — и что стенд, целящийся по имени, не найдёт ни одного.
+fn name_of(desktop: &Compositor, app: App) -> String {
+    match app {
+        App::Program(_) => desktop.caption_of(app).unwrap_or_else(|| String::from(app.title())),
+        _ => String::from(app.title()),
+    }
 }
 
 /// Записать в журнал, где стоит окно.

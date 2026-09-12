@@ -246,10 +246,10 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 29] = [
+pub const USER_PROGRAMS: [&str; 30] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sshd",
-    "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow",
+    "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow", "sysmon",
 ];
 
 /// Программы, которые в `/bin` **не** едут.
@@ -292,7 +292,13 @@ pub fn build_user_programs(arch: Arch, release: bool) -> Result<Vec<PathBuf>> {
     // малую модель (адреса влезают в 32 бита со знаком), а программа живёт по
     // адресу 512 ГиБ. Ошибка выглядит как «relocation R_X86_64_32S out of
     // range» в чужом объектнике и никак не связана с нашим кодом.
-    cmd.arg("-Zbuild-std=core,compiler_builtins")
+    //
+    // `alloc` в списке с фазы 47b — у программы появилась куча. Без него cargo
+    // берёт **предсобранный** `alloc` из тулчейна, а тот зависит от
+    // предсобранного `core`; в сборке оказываются два разных `core`, и
+    // компоновщик отвергает её с «duplicate lang item in crate core: sized» —
+    // сообщением, по которому причину не угадать никогда.
+    cmd.arg("-Zbuild-std=core,alloc,compiler_builtins")
         .arg("-Zbuild-std-features=compiler-builtins-mem");
 
     // `-C link-arg=-T<файл>` доходит до компоновщика как есть. Максимальный
@@ -615,7 +621,9 @@ pub fn check(arches: &[Arch]) -> Result<()> {
             .arg("--bins")
             .arg("--target")
             .arg(user_triple(arch))
-            .arg("-Zbuild-std=core,compiler_builtins")
+            // Тот же список, что и при сборке: проверка, собирающая другой
+            // набор стандартных крейтов, проверяет не то, что поедет в образ.
+            .arg("-Zbuild-std=core,alloc,compiler_builtins")
             .arg("-Zbuild-std-features=compiler-builtins-mem");
         util::run(&mut cmd, &format!("cargo check (user-progs, {})", user_triple(arch)))?;
     }

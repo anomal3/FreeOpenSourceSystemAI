@@ -54,8 +54,6 @@ use crate::input::KeyCode;
 pub enum App {
     /// Оболочка.
     Terminal,
-    /// Счётчики системы.
-    System,
     /// Файловый менеджер.
     Files,
     /// Что это за система.
@@ -89,11 +87,14 @@ pub enum App {
 
 impl App {
     /// Порядок в меню запуска.
-    pub const LAUNCHABLE: [App; 7] = [
+    /// Монитора системы здесь больше нет, и это не пропуск: с фазы 47b он —
+    /// программа `/bin/sysmon`, и меню запуска находит его там же, где все
+    /// остальные программы из `/bin`. Оставить его здесь значило бы предлагать
+    /// человеку два разных способа открыть одно и то же окно.
+    pub const LAUNCHABLE: [App; 6] = [
         App::Terminal,
         App::Files,
         App::Settings,
-        App::System,
         App::About,
         App::Shutdown,
         App::Restart,
@@ -125,7 +126,6 @@ impl App {
     pub const fn caption(self) -> &'static str {
         match self {
             App::Terminal => "Терминал",
-            App::System => "Системный монитор",
             App::Files => "Файлы",
             App::About => "О системе",
             App::Settings => "Параметры",
@@ -157,7 +157,6 @@ impl App {
     pub const fn icon(self) -> Icon {
         match self {
             App::Terminal => Icon::Terminal,
-            App::System => Icon::Chart,
             App::Files => Icon::Folder,
             App::About => Icon::Info,
             App::Settings => Icon::Settings,
@@ -171,7 +170,6 @@ impl App {
     pub const fn title(self) -> &'static str {
         match self {
             App::Terminal => "Terminal",
-            App::System => "System",
             App::Files => "Files",
             App::About => "About",
             App::Settings => "Settings",
@@ -189,7 +187,6 @@ impl App {
         match self {
             App::Terminal => "оболочка и команды ядра",
             App::Files => "обзор смонтированного корня",
-            App::System => "память, задачи, счётчики ввода",
             App::About => "что это за система",
             App::Settings => "экран, программы, обновление",
             App::Shutdown => "закрыть том и выключить",

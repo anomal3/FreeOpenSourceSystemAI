@@ -477,60 +477,20 @@ fn handle_key(code: KeyCode, editor: &LineEditor) {
     sprint!("{PROMPT}{}", editor.as_str());
 }
 
-/// Обновить окно состояния и панель задач.
+/// Обновить панель задач.
+///
+/// Окно состояния отсюда ушло. С фазы 47b счётчики показывает программа
+/// `/bin/sysmon`: она спрашивает их системным вызовом и рисует сама, а оболочке
+/// больше нечего ей рассказывать. Осталось то, что принадлежит столу, — часы и
+/// память на панели; заводить им отдельный источник времени значило бы рисовать
+/// из обработчика прерывания.
 fn update_status() {
     if !ui::is_active() {
         return;
     }
-    // Часы и память на панели — то же обновление, что и окно состояния, и по
-    // тому же таймеру: заводить столу отдельный источник времени значило бы
-    // рисовать из обработчика прерывания.
     ui::tick();
-    let frames = mm::frame::stats();
-    let heap = mm::heap::stats();
-    let (dma_used, dma_total) = mm::dma::stats();
-    let events = input::stats();
-    let (composed, rects, windows) = ui::stats();
-
-    let mut text = String::new();
-    let _ = write!(
-        text,
-        "uptime  {} ms\n\
-         ticks   {}\n\
-         frames  {composed} composed, {rects} rects\n\
-         windows {windows}\n\
-         keys    {} posted, {} dropped\n",
-        time::uptime_ms(),
-        irq::ticks(),
-        events.posted,
-        events.dropped,
-    );
-    if let Some(usb) = usb::xhci::summary() {
-        let _ = write!(
-            text,
-            "usb     {} devices, {} reports, {} err\n",
-            usb.devices, usb.reports, usb.errors
-        );
-    }
-    let (moves, merged) = input::pointer_stats();
-    if moves > 0 {
-        let _ = write!(text, "pointer {moves} reports, {merged} merged\n");
-    }
-    let _ = write!(
-        text,
-        "memory  {} MiB free of {} MiB\n\
-         heap    {} KiB free\n\
-         dma     {} of {} KiB\n\
-         tasks   {} alive",
-        frames.free_bytes() / (1024 * 1024),
-        frames.total_bytes() / (1024 * 1024),
-        heap.free / 1024,
-        dma_used / 1024,
-        dma_total / 1024,
-        sched::alive(),
-    );
-    ui::set_status(&text);
 }
+
 
 /// Выполнить команду. Возвращает `true`, если сеанс пора закончить.
 fn run_command(line: &str) -> bool {

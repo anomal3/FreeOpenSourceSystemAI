@@ -17,9 +17,20 @@
 
 #![no_std]
 
+// Куча появилась в фазе 47b, и не «для удобства»: рисовать своё окно программа
+// обязана тем же `mini-ui`, которым рисует стол, а он объявляет `extern crate
+// alloc`. Без глобального аллокатора крейт с ним не собирается вовсе — даже
+// если ни одного `Vec` на пути исполнения нет.
+extern crate alloc;
+
 pub mod http;
 
+use core::alloc::{GlobalAlloc, Layout};
+use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
+use core::ptr::NonNull;
+
+use linked_list_allocator::Heap;
 
 use user_abi::{
     ERR_BAD_PATH, FD_STDERR, FD_STDOUT, SYS_CLOSE, SYS_EXIT, SYS_GETGID, SYS_GETPID,
@@ -58,7 +69,12 @@ use user_abi::{
     DUP_ANY, SYS_CLOCK, SYS_DUP, SYS_FSTAT, SYS_ISATTY, SYS_NANOSLEEP, SYS_POLL, SYS_TIMES,
 };
 
-pub use user_abi::{MAX_TITLE, WIN_CLOSE, WIN_KEY, WIN_POINTER, WinEvent};
+pub use user_abi::{
+    MAX_TITLE, PIXEL_BGR, PIXEL_RGB, SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_POINTER,
+    WinEvent,
+};
+
+use user_abi::SYS_SYSINFO;
 
 use user_abi::{SYS_WINCLOSE, SYS_WINCOMMIT, SYS_WINEVENT, SYS_WINOPEN, WindowSpec};
 
@@ -198,6 +214,94 @@ impl Window {
     pub const fn id(&self) -> i64 {
         self.id
     }
+}
+
+/// Сколько памяти программа отводит под кучу.
+///
+/// Мегабайт. Число небольшое намеренно: куча берётся у ядра одним куском через
+/// [`mmap`], и взять её с запасом «на всякий случай» значило бы, что **каждая**
+/// программа в системе занимает этот запас независимо от того, нужен он ей.
+/// Мегабайта хватает и монитору системы, и списку файлов; программе, которой
+/// мало, число придётся поднять — и узнает она об этом сразу, отказом
+/// выделения, а не тихой порчей чего-нибудь.
+const HEAP_BYTES: usize = 1024 * 1024;
+
+/// Куча программы.
+///
+/// # Почему без замка
+///
+/// Потому что запирать нечего. У программы **одна** задача, и её адресное
+/// пространство принадлежит ей одной: вытеснение переключает процессор на
+/// другую задачу, но у той своя куча — другой объект по другому адресу в другом
+/// пространстве. Обработчиков прерываний в третьем кольце нет вовсе, значит
+/// вклиниться в середину правки списка свободных блоков некому.
+///
+/// Это и есть разница с кучей ядра, где `SpinLock` обязателен: тот аллокатор
+/// зовут из любой точки системы, включая обработчик прерывания, и две
+/// одновременные выдачи порвали бы ему список.
+///
+/// # Почему она заводится лениво
+///
+/// Потому что большинству программ она не нужна вовсе, а `mmap` — это кадры,
+/// которые ядро отдаёт целиком и сразу. Программа, не выделившая ни байта, не
+/// должна стоить системе мегабайта памяти.
+struct ProgramHeap {
+    inner: UnsafeCell<Heap>,
+}
+
+// SAFETY: у программы один поток исполнения (см. доккомментарий типа), поэтому
+// двух одновременных обращений к этой куче не бывает.
+unsafe impl Sync for ProgramHeap {}
+
+#[global_allocator]
+static HEAP: ProgramHeap = ProgramHeap { inner: UnsafeCell::new(Heap::empty()) };
+
+// SAFETY: `alloc` возвращает либо null, либо блок, выданный `Heap` под
+// запрошенные размер и выравнивание и не пересекающийся ни с одним живым;
+// `dealloc` возвращает блок той же куче с тем же `Layout`. Гонок нет — см.
+// [`ProgramHeap`].
+unsafe impl GlobalAlloc for ProgramHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: ссылка одна, потому что поток в этом адресном пространстве
+        // один, и живёт она только внутри этого вызова.
+        let heap = unsafe { &mut *self.inner.get() };
+        if heap.size() == 0 {
+            let base = mmap(HEAP_BYTES, 0);
+            if base < 0 {
+                // Памяти нет — отказ, а не паника: решать, что делать без
+                // кучи, обязан тот, кто её просил.
+                return core::ptr::null_mut();
+            }
+            // SAFETY: ядро только что выдало эту область этой программе
+            // целиком; она не пересекается ни с чем и живёт до её конца.
+            unsafe { heap.init(base as usize as *mut u8, HEAP_BYTES) };
+        }
+        heap.allocate_first_fit(layout)
+            .map_or(core::ptr::null_mut(), NonNull::as_ptr)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let Some(block) = NonNull::new(ptr) else {
+            return;
+        };
+        // SAFETY: ссылка одна (см. выше); блок выдан этой же кучей с этим же
+        // `Layout` — это условие договора `GlobalAlloc`, и держит его тот, кто
+        // зовёт.
+        unsafe { (*self.inner.get()).deallocate(block, layout) };
+    }
+}
+
+/// Спросить у ядра счётчики системы.
+///
+/// Все числа снимаются одним вызовом и потому относятся к одному мгновению:
+/// картина состояния, склеенная из нескольких снимков, врёт тем убедительнее,
+/// чем быстрее меняется система.
+#[must_use]
+pub fn sysinfo() -> Option<SysInfo> {
+    let mut out = SysInfo::default();
+    // SAFETY: структура живёт в памяти программы, выравнивание от типа.
+    let result = unsafe { syscall(SYS_SYSINFO, core::ptr::from_mut(&mut out) as usize, 0, 0) };
+    (result == 0).then_some(out)
 }
 
 /// Выполнить системный вызов.
@@ -1357,7 +1461,8 @@ pub fn munmap(addr: usize, len: usize) -> i64 {
 
 /// Путь, собираемый по кусочкам в буфере на стеке.
 ///
-/// Существует потому, что кучи у программы нет, а склеивать пути приходится
+/// Существует потому, что куча у программы появилась только в фазе 47b и берётся
+/// у ядра целым мегабайтом, а склеивать пути приходится
 /// всем, кто ходит по дереву: `/opt` + имя пакета + путь внутри него. Своя
 /// длина у каждого куска, общий предел — тот же, что принимает ядро.
 pub struct Path {

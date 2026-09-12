@@ -34,8 +34,7 @@
 #![no_main]
 
 use user_progs::{
-    Args, Line, WIN_CLOSE, WIN_KEY, WIN_POINTER, Window, exit, monotonic_ms, munmap, nanosleep,
-    println,
+    Line, WIN_CLOSE, WIN_KEY, WIN_POINTER, Window, exit, monotonic_ms, munmap, nanosleep, println,
 };
 
 /// Размер окна в точках. Небольшое намеренно: 320×200 — это 63 страницы
@@ -64,11 +63,7 @@ const POLL_MS: u32 = 50;
 const QUIT: u32 = 'q' as u32;
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
-    // SAFETY: значения пришли от ядра в том виде, в каком их описывает договор.
-    let args = unsafe { Args::new(argc, argv) };
-    let leak = matches!(args.get(1), Some("leak"));
-
+pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let mut window = match open() {
         Some(window) => window,
         None => exit(1),
@@ -94,22 +89,20 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
 
     check_munmap(&mut window);
 
-    if leak {
-        // Уходим, не прибравшись. Всё, что здесь можно сказать честно, —
-        // сказать вслух, что это сделано нарочно. Вернулись ли кадры, скажет
-        // ядро; программы к тому времени уже не будет.
-        println("winshow: leaving the window to the teardown");
-        exit(0)
-    }
-
     wait_for_events(&window);
 
-    println("winshow: closing the window myself");
-    if window.close() < 0 {
-        println("winshow: FAILED closing the window was refused");
-        exit(1);
-    }
-    println("winshow: done");
+    // Уходим, не прибравшись, и делаем это **всегда**. Сказать об этом вслух
+    // обязательно: окно остаётся на столе, и снять его должно ядро — до того,
+    // как разберёт адресное пространство программы. Вернулись ли кадры, скажет
+    // оно само; программы к тому времени уже не будет.
+    //
+    // Почему не двумя режимами, как было сначала. Аргумент означал вторую
+    // команду в сценарии, а вторая команда в серийную линию теряется, пока
+    // система много печатает (открытый дефект приёмника UART) — прогон на
+    // медленной машине падал именно так, и чем длиннее команда, тем вернее.
+    // Проверку «программа закрывает окно сама» делает `sysmon` в сценариях с
+    // мышью: там крестик просит, а программа соглашается.
+    println("winshow: leaving the window to the teardown");
     exit(0)
 }
 

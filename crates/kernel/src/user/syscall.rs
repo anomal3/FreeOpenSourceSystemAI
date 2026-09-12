@@ -50,6 +50,7 @@ use mini_ui::Rect;
 use user_abi::{
     MAX_TITLE, SYS_WINCLOSE, SYS_WINCOMMIT, SYS_WINEVENT, SYS_WINOPEN, WinEvent, WindowSpec,
 };
+use user_abi::{SYSINFO_DARK, SYS_SYSINFO, SysInfo};
 use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
@@ -174,6 +175,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_WINCOMMIT => wincommit(a0 as i64, a1, a2),
         SYS_WINEVENT => winevent(a0 as i64, a1),
         SYS_WINCLOSE => winclose(a0 as i64),
+        // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
+        SYS_SYSINFO => sysinfo(a0),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1341,7 +1344,17 @@ fn nanosleep(seconds: u64, nanos: u64) -> i64 {
     else {
         return ERR_BAD_ADDRESS;
     };
-    sched::sleep_ms(ms);
+    // Тик запаса, и он обязателен. Округление вверх в тиках — ещё не гарантия
+    // длительности: планировщик будит спящего на **границе** тика, а отсчёт
+    // начинается там, где просьба застала таймер. Пришедшая сразу после тика
+    // теряет почти целый тик — тридцать миллисекунд оборачиваются двадцатью
+    // восемью, что прогон и поймал.
+    //
+    // Договор обещает «не меньше запрошенного», а не «примерно столько», и
+    // платит за это единственным тиком: спящий просыпается позже на десять
+    // миллисекунд, зато никогда — раньше срока.
+    let tick_ms = 1000 / u64::from(crate::irq::TIMER_HZ);
+    sched::sleep_ms(ms.saturating_add(tick_ms));
     0
 }
 
@@ -1483,6 +1496,60 @@ fn winevent(id: i64, out: usize) -> i64 {
     // SAFETY: адрес проверен на выравнивание и на запись.
     unsafe { core::ptr::write(out as *mut WinEvent, event) };
     1
+}
+
+/// `sysinfo(ptr на SysInfo) -> 0`.
+///
+/// Все числа снимаются **подряд, в одном вызове**, и это главное его свойство.
+/// Монитор рисует картину состояния; картина, склеенная из десяти снимков,
+/// взятых в разные мгновения, врёт тем убедительнее, чем быстрее меняется
+/// система.
+fn sysinfo(out: usize) -> i64 {
+    if out % align_of::<SysInfo>() != 0 {
+        return ERR_BAD_ADDRESS;
+    }
+    if !space::user_can(out, size_of::<SysInfo>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+
+    let frames = crate::mm::frame::stats();
+    let heap = crate::mm::heap::stats();
+    let (dma_used, dma_total) = crate::mm::dma::stats();
+    let keys = crate::input::stats();
+    let (pointer_moves, pointer_merged) = crate::input::pointer_stats();
+    let (composed, rects, windows) = crate::ui::stats();
+
+    let value = SysInfo {
+        uptime_ms: time::uptime_ms(),
+        ticks: crate::irq::ticks(),
+        frames_total: frames.total_bytes() as u64,
+        frames_free: frames.free_bytes() as u64,
+        heap_size: heap.size as u64,
+        heap_free: heap.free as u64,
+        dma_total: dma_total as u64,
+        dma_used: dma_used as u64,
+        keys_posted: keys.posted,
+        keys_dropped: keys.dropped,
+        pointer_moves,
+        pointer_merged,
+        frames_composed: composed,
+        rects,
+        windows: windows as u32,
+        tasks_alive: sched::alive() as u32,
+        // Тема едет вместе с числами, а не отдельным вызовом: программа
+        // спрашивает её ровно тогда же, когда спрашивает, что показать. Без
+        // этого признака монитор не узнал бы о смене темы вовсе — своего
+        // состояния стола у программы нет.
+        flags: if crate::ui::theme::is_dark() { SYSINFO_DARK } else { 0 },
+        // Число берётся у самого `mini-ui`, а не собирается здесь заново: тот
+        // же счётчик, который читает `Color::pixel`, отвечает и на этот вопрос.
+        // Два независимых способа сказать одно и то же однажды разошлись бы, и
+        // разошлись бы молча — окном, где красное нарисовано синим.
+        pixel_format: mini_ui::format_code(),
+    };
+    // SAFETY: адрес проверен на выравнивание и на запись.
+    unsafe { core::ptr::write(out as *mut SysInfo, value) };
+    0
 }
 
 /// `winclose(id) -> 0`.
