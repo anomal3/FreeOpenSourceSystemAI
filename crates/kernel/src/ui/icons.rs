@@ -57,8 +57,8 @@ const CELL_PAD: u32 = 10;
 ///
 /// Предел не косметический: имена приходят с носителя, и каталог с тысячей
 /// файлов означал бы тысячу строк в куче и сетку значков поверх всего экрана.
-/// Лишнее не пропадает — оно видно в файловом менеджере, куда и ведёт двойной
-/// щелчок по значку «Файлы».
+/// Лишнее не пропадает — оно видно в файловом менеджере, который открывает
+/// значок «Файлы».
 const MAX_ENTRIES: usize = 48;
 
 /// Что лежит на столе от системы и в каком порядке — сверху вниз.
@@ -66,13 +66,26 @@ const MAX_ENTRIES: usize = 48;
 /// Порядок не алфавитный и не случайный: сначала то, чем человек пользуется,
 /// открыв систему впервые («здесь мои файлы»), затем инструменты. Список
 /// короткий намеренно — стол, засыпанный значками, ничем не лучше пустого.
-const SYSTEM: [App; 4] = [App::Files, App::Terminal, App::Settings, App::About];
+const SYSTEM: [App; 3] = [App::Terminal, App::Settings, App::About];
+
+/// Файловый менеджер — первым значком на столе, как и был.
+///
+/// Отдельно от [`SYSTEM`], потому что с фазы 47c это **программа**, а не окно
+/// ядра: значок её запускает. Порядок при этом не изменился — «здесь мои
+/// файлы» остаётся первым, что человек видит, открыв систему.
+const FILES_COMMAND: &str = "/bin/files";
+const FILES_LABEL: &str = "Файлы";
 
 /// Что за значок стоит в ячейке.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Kind {
-    /// Системный значок: открывает окно программы.
+    /// Системный значок: открывает окно ядра.
     App(App),
+    /// Значок, запускающий программу третьего кольца.
+    ///
+    /// Команду держит поле `path` записи — то же, в котором у файла лежит его
+    /// путь. Два поля под одно «что открыть» разошлись бы при первой правке.
+    Program(Icon),
     /// Каталог в каталоге стола.
     Folder,
     /// Файл там же.
@@ -349,11 +362,10 @@ impl Icons {
 /// очередь», и если залить всё, она перестаёт что-либо значить.
 fn art(kind: &Kind) -> (Icon, Tone, bool) {
     match kind {
-        Kind::App(app) => (
-            app.icon(),
-            app.tone(),
-            matches!(app, App::Files | App::Terminal),
-        ),
+        Kind::App(app) => (app.icon(), app.tone(), matches!(app, App::Terminal)),
+        // Плитка залита, как была у окна ядра: снаружи переезд менеджера в
+        // программу не должен быть заметен ничем, включая цвет значка.
+        Kind::Program(icon) => (*icon, Tone::Accent, true),
         Kind::Folder => (Icon::Folder, Tone::Muted, false),
         Kind::File => (Icon::File, Tone::Muted, false),
     }
@@ -402,12 +414,16 @@ fn wrap(ctx: Ctx, label: &str, room: u32) -> (String, Option<String>) {
 
 /// Системные значки — те, что есть на столе всегда.
 fn system_items() -> Vec<Item> {
-    SYSTEM
-        .iter()
-        .map(|app| Item {
-            kind: Kind::App(*app),
-            label: app.caption().to_string(),
-            path: None,
-        })
-        .collect()
+    let mut out = Vec::new();
+    out.push(Item {
+        kind: Kind::Program(Icon::Folder),
+        label: FILES_LABEL.to_string(),
+        path: Some(FILES_COMMAND.to_string()),
+    });
+    out.extend(SYSTEM.iter().map(|app| Item {
+        kind: Kind::App(*app),
+        label: app.caption().to_string(),
+        path: None,
+    }));
+    out
 }

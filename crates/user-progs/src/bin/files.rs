@@ -1,54 +1,81 @@
-//! Файловый менеджер: содержимое смонтированного корня в окне.
+//! Файловый менеджер: содержимое смонтированного корня в окне программы.
 //!
-//! # Зачем он в ядре
+//! # Что здесь изменилось по сравнению с прошлой фазой
 //!
-//! По той же причине, по которой в ядре живёт оболочка: пользовательского
-//! пространства ещё нет, и «программа» на этой фазе — это модуль. Граница всё
-//! равно проведена там, где она будет проходить и потом: менеджер обращается к
-//! файловой системе только через [`crate::fs`], то есть через тот же путь, что и
-//! `ls` в оболочке, и ничего не знает ни про ext2, ни про virtio-blk.
+//! Это окно было **частью ядра** — модуль `ui::files`, девятьсот строк, которые
+//! читали файловую систему прямым вызовом и рисовали прямо в поверхность окна,
+//! заведённого композитором. Теперь окно просит программа, каталог читается
+//! системными вызовами, а рисует она сама — тем же `mini-ui`, которым рисует
+//! себя стол.
 //!
-//! # Почему он рисует себя сам, а не печатает строки в сетку символов
+//! Смысл переезда не в красоте. Менеджер — это разбор чужих имён, чужих прав и
+//! чужого содержимого; падать он обязан вместе со своим окном, а не вместе с
+//! машиной. Это последнее большое окно, которое ядро рисовало само.
 //!
-//! Потому что выделенная строка — это заливка прямоугольника, а сетка символов
-//! знает ровно два цвета на всё окно. Список, в котором выбранный элемент
-//! помечен стрелкой вместо подсветки, читается как вывод команды, а не как
-//! список, по которому ходят.
+//! # Что он доказывает
+//!
+//! Что цепочка «virtio-blk → GPT → ext2 → VFS → системный вызов» работает не
+//! только в выводе команды: права, владелец и размер в окне взяты из inode, а
+//! просмотр файла читает его блоки по-настоящему — и всё это из третьего
+//! кольца, через `SYS_READDIR` и `SYS_READ`.
 //!
 //! # Почему раскладка считается одной функцией
 //!
 //! Потому что нарисованное и нажимаемое обязаны совпадать. Пока кнопка «назад»
 //! рисовалась одной формулой, а искалась под указателем другой, они сходились
 //! ровно до первой правки отступа — и расхождение выглядело не как ошибка
-//! раскладки, а как «мышь не работает». Теперь [`layout`] отвечает на вопрос
-//! «где что лежит» один раз, а [`FilesView::draw`] и [`FilesView::click`]
-//! спрашивают её.
+//! раскладки, а как «мышь не работает». [`layout`] отвечает на вопрос «где что
+//! лежит» один раз, а [`Files::draw`] и [`Files::click`] её спрашивают.
 //!
-//! # Что он доказывает
+//! # Аргументы: `files [путь]`
 //!
-//! Что цепочка «virtio-blk → GPT → ext2 → VFS» работает не только в
-//! диагностическом выводе ядра: права, владелец и размер в окне взяты из inode,
-//! а просмотр файла читает его блоки по-настоящему.
+//! Путь — каталог, с которого начать. Его передаёт стол, когда человек открыл
+//! значок папки: до переезда то же самое делал вызов `reveal` внутри ядра.
+//! Файл в аргументе тоже годится — менеджер откроет его каталог и покажет
+//! содержимое, потому что показать файл, не показав, где он лежит, значит
+//! оставить человека без единственного способа выйти из просмотра куда-то,
+//! кроме корня.
+//!
+//! # Чего программа не знает и знать пока неоткуда
+//!
+//! **Имени вошедшего.** Оно есть у ядра (`/etc/passwd` читает оно, а права на
+//! этот файл — `0640 root`), и до программ не доходит ничем. Поэтому домашний
+//! каталог в боковой колонке — это `/root` для нулевого uid и `/home` для
+//! остальных: первое верно, второе честно. Гадать имя по uid нечем, а
+//! показывать `/home/roman` всем подряд — хуже, чем показать общий каталог.
+
+#![no_std]
+#![no_main]
+
+extern crate alloc;
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use mini_ui::draw;
 use mini_ui::glyphicon::{self, Icon};
-use mini_ui::typeface::Role;
-use mini_ui::{Rect, Surface};
-
 use mini_ui::paint::{self, Ctx, RowState, Tone};
-use mini_ui::theme;
-use crate::fs;
-use crate::input::KeyCode;
-use crate::vfs::NodeKind;
+use mini_ui::typeface::Role;
+use mini_ui::{Rect, Surface, draw, theme};
+use user_abi::{Dirent, KIND_DIRECTORY, Stat};
+use user_progs::{
+    Args, SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME,
+    WIN_KEY_LEFT, WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP, WIN_POINTER,
+    Window, close, exit, monotonic_ms, nanosleep, open, println, read, readdir_raw, stat,
+    sysinfo,
+};
+
+/// Имя окна.
+///
+/// Латиницей и именно это слово: по нему автоматический стенд наводит мышь
+/// (`Aim::Close("Files")`), и оно же стояло у окна, пока оно было частью ядра.
+/// Переезд не должен быть заметен снаружи — в этом половина его проверки.
+const TITLE: &str = "Files";
 
 /// Сколько байт файла показывает просмотр.
 ///
 /// Предел не косметический: размер файла приходит с носителя, и окно, в которое
-/// вывалили сорок мегабайт, — это заполненная куча и остановка системы.
+/// вывалили сорок мегабайт, — это заполненная куча и остановка программы.
 const PREVIEW_LIMIT: usize = 8 * 1024;
 
 /// Сколько строк файла показывается.
@@ -60,6 +87,39 @@ const PREVIEW_LINES: usize = 256;
 /// порога быстрый доступ мешает тому, ради чего окно открыли.
 const SIDE_FROM: u32 = 700;
 
+/// Сколько записей каталога читается.
+///
+/// Предел здесь по той же причине, по которой он есть у просмотра: число
+/// записей приходит с носителя. Тысяча строк — это больше, чем помещается на
+/// любой экран, умноженное на запас; каталог длиннее показывается не целиком, и
+/// об этом написано в строке состояния, а не умалчивается.
+const MAX_ROWS: usize = 1024;
+
+/// Пауза между опросами очереди событий.
+const POLL_NS: u32 = 30_000_000;
+
+/// Как часто спрашивать систему о теме.
+///
+/// События «тема изменилась» договор не знает — своего состояния стола у
+/// программы нет, — поэтому признак перечитывается. Две секунды: человек
+/// переключает тему руками и замечает задержку в две секунды как «сработало», а
+/// не как «не сработало».
+const THEME_PERIOD_MS: u64 = 2_000;
+
+/// Сколько всего ждать окна при запуске.
+///
+/// Полминуты, как у монитора системы, и по той же причине: при загрузке система
+/// много печатает, а каждая строка в окне оболочки — перерисовка, на которую
+/// стол берут целиком.
+const OPEN_WAIT_MS: u64 = 30_000;
+
+/// Сколько ждать графики при запуске.
+const WAIT_GRAPHICS_MS: u64 = 10_000;
+
+// ---------------------------------------------------------------------------
+// Данные
+// ---------------------------------------------------------------------------
+
 /// Одна строка списка.
 struct Row {
     name: String,
@@ -70,7 +130,7 @@ struct Row {
     /// строк списка один, и спрашивать его двадцать раз подряд значит двадцать
     /// раз ответить одно и то же.
     program: bool,
-    mode: u16,
+    mode: u32,
     uid: u32,
     gid: u32,
     size: u64,
@@ -107,7 +167,8 @@ struct Preview {
     scroll: usize,
 }
 
-pub struct FilesView {
+/// Состояние менеджера.
+struct Files {
     path: String,
     /// Куда можно вернуться кнопкой «назад» — стек посещённых каталогов.
     ///
@@ -119,22 +180,27 @@ pub struct FilesView {
     forward: Vec<String>,
     rows: Vec<Row>,
     selected: usize,
+    /// Сколько записей каталога не поместилось в [`MAX_ROWS`].
+    dropped: usize,
     /// Ошибка чтения каталога вместо списка.
     error: Option<String>,
     preview: Option<Preview>,
+    /// Домашний каталог для боковой колонки.
+    home: String,
 }
 
-impl FilesView {
-    #[must_use]
-    pub fn new() -> Self {
+impl Files {
+    fn new(path: String, home: String) -> Self {
         let mut view = Self {
-            path: String::from("/"),
+            path,
             back: Vec::new(),
             forward: Vec::new(),
             rows: Vec::new(),
             selected: 0,
+            dropped: 0,
             error: None,
             preview: None,
+            home,
         };
         view.reload();
         view
@@ -144,28 +210,13 @@ impl FilesView {
     fn reload(&mut self) {
         self.rows.clear();
         self.selected = 0;
+        self.dropped = 0;
         self.error = None;
 
-        match fs::list(&self.path) {
-            Some(Ok(entries)) => {
-                for entry in entries {
-                    // «.» и «..» приходят от ext2 как настоящие записи. Свою
-                    // навигацию мы уже дали (Backspace), а две строки, ведущие
-                    // «сюда же» и «наверх», в списке только мешают.
-                    if entry.name == "." || entry.name == ".." {
-                        continue;
-                    }
-                    let program = self.path == "/bin" || self.path.ends_with("/bin");
-                    self.rows.push(Row {
-                        name: entry.name,
-                        directory: entry.kind == NodeKind::Directory,
-                        program,
-                        mode: entry.mode,
-                        uid: entry.uid,
-                        gid: entry.gid,
-                        size: entry.size,
-                    });
-                }
+        match list_dir(&self.path) {
+            Ok((rows, dropped)) => {
+                self.rows = rows;
+                self.dropped = dropped;
                 // Каталоги наверх, дальше по имени: порядок записей в ext2 —
                 // это порядок вставки, то есть для человека случайный.
                 self.rows.sort_by(|a, b| {
@@ -174,64 +225,83 @@ impl FilesView {
                         .then_with(|| a.name.cmp(&b.name))
                 });
             }
-            Some(Err(err)) => self.error = Some(format!("{err}")),
-            None => self.error = Some("no filesystem is mounted".to_string()),
+            Err(text) => self.error = Some(text),
         }
     }
 
-    /// Обработать клавишу. Возвращает `true`, если картинку надо перерисовать.
-    pub fn handle(&mut self, code: KeyCode) -> bool {
+    /// Обработать клавишу. `true` — картинку надо перерисовать.
+    fn key(&mut self, code: u32) -> bool {
         if self.preview.is_some() {
-            return self.handle_preview(code);
+            return self.key_preview(code);
         }
         match code {
-            KeyCode::Up => {
+            WIN_KEY_UP => {
                 self.selected = self.selected.saturating_sub(1);
                 true
             }
-            KeyCode::Down => {
+            WIN_KEY_DOWN => {
                 if self.selected + 1 < self.rows.len() {
                     self.selected += 1;
                 }
                 true
             }
-            KeyCode::Home => {
+            WIN_KEY_HOME => {
                 self.selected = 0;
                 true
             }
-            KeyCode::End => {
+            WIN_KEY_END => {
                 self.selected = self.rows.len().saturating_sub(1);
                 true
             }
-            KeyCode::Enter | KeyCode::Right => self.open_selected(),
-            KeyCode::Backspace => self.go_up(),
+            // Enter приезжает символом: у него он есть, и договор отдаёт
+            // символ раньше имени.
+            ENTER | WIN_KEY_RIGHT => self.open_selected(),
+            BACKSPACE => self.go_up(),
             // Влево — «назад», как у стрелки на панели: подниматься наверх
             // умеет Backspace, и две клавиши на одно действие ничего не дают.
-            KeyCode::Left => self.go_back() || self.go_up(),
+            WIN_KEY_LEFT => self.go_back() || self.go_up(),
+            // Обновить. В ядре этого пункта не было и не требовалось: меню
+            // стола само звало `refresh_files` у открытого окна. Через границу
+            // привилегий такого вызова нет, и чинить это извещением о смене
+            // каталога — работа не этой фазы. Поэтому клавиша, и она названа в
+            // строке состояния, а не оставлена на угадывание.
+            REFRESH => {
+                self.reload();
+                true
+            }
             _ => false,
         }
     }
 
-    fn handle_preview(&mut self, code: KeyCode) -> bool {
+    fn key_preview(&mut self, code: u32) -> bool {
         let Some(preview) = self.preview.as_mut() else {
             return false;
         };
+        let page = PREVIEW_PAGE;
         match code {
-            KeyCode::Escape | KeyCode::Backspace | KeyCode::Left => {
+            ESCAPE | BACKSPACE | WIN_KEY_LEFT => {
                 self.preview = None;
                 true
             }
-            KeyCode::Down => {
+            WIN_KEY_DOWN => {
                 if preview.scroll + 1 < preview.lines.len() {
                     preview.scroll += 1;
                 }
                 true
             }
-            KeyCode::Up => {
+            WIN_KEY_UP => {
                 preview.scroll = preview.scroll.saturating_sub(1);
                 true
             }
-            KeyCode::Home => {
+            WIN_KEY_PAGE_DOWN => {
+                preview.scroll = (preview.scroll + page).min(preview.lines.len().saturating_sub(1));
+                true
+            }
+            WIN_KEY_PAGE_UP => {
+                preview.scroll = preview.scroll.saturating_sub(page);
+                true
+            }
+            WIN_KEY_HOME => {
                 preview.scroll = 0;
                 true
             }
@@ -265,6 +335,10 @@ impl FilesView {
         self.forward.clear();
         self.preview = None;
         self.reload();
+        // Отдельная строка, а не «список перечитан»: «выделение переехало» и
+        // «мы вошли внутрь» печатают одно и то же — путь и число строк, — и
+        // отличить одно от другого снаружи было бы нечем.
+        println(&format!("files: entered '{}'", self.path));
     }
 
     /// Подняться на уровень выше.
@@ -272,16 +346,13 @@ impl FilesView {
         if self.path == "/" {
             return false;
         }
-        let parent = match self.path.rfind('/') {
-            Some(0) | None => String::from("/"),
-            Some(index) => self.path[..index].to_string(),
-        };
+        let parent = parent_of(&self.path);
         self.go_to(parent);
         true
     }
 
     /// Вернуться туда, откуда пришли.
-    pub fn go_back(&mut self) -> bool {
+    fn go_back(&mut self) -> bool {
         let Some(previous) = self.back.pop() else {
             return false;
         };
@@ -292,7 +363,7 @@ impl FilesView {
     }
 
     /// Пойти обратно вперёд — туда, откуда вернулись назад.
-    pub fn go_forward(&mut self) -> bool {
+    fn go_forward(&mut self) -> bool {
         let Some(next) = self.forward.pop() else {
             return false;
         };
@@ -302,46 +373,12 @@ impl FilesView {
         true
     }
 
-    /// Показать то, что открыли значком со стола.
-    ///
-    /// Каталог открывается сам; файл открывается **в своём каталоге** и сразу на
-    /// просмотре: показать содержимое файла, не показав, где он лежит, значит
-    /// оставить человека без единственного способа выйти из просмотра куда-то,
-    /// кроме корня.
-    pub fn reveal(&mut self, path: &str, directory: bool) {
-        if directory {
-            self.go_to(path.to_string());
-            return;
-        }
-        let (parent, name) = match path.rfind('/') {
-            Some(0) | None => (String::from("/"), path.trim_start_matches('/').to_string()),
-            Some(index) => (path[..index].to_string(), path[index + 1..].to_string()),
-        };
-        if parent != self.path {
-            self.go_to(parent);
-        }
-        if let Some(index) = self.rows.iter().position(|row| row.name == name) {
-            self.selected = index;
-        }
-        self.preview = Some(read_preview(&name, path));
-    }
-
-    /// Перечитать текущий каталог, оставшись в нём.
-    ///
-    /// Нужно тому, кто изменил файл со стороны: созданный, переименованный или
-    /// удалённый файл обязан появиться и исчезнуть в открытом окне, а не
-    /// дожидаться, пока человек уйдёт из каталога и вернётся.
-    pub fn refresh(&mut self) {
-        self.preview = None;
-        self.reload();
-    }
-
-    /// Щелчок по окну: координаты внутри области содержимого.
+    /// Щелчок по окну: координаты внутри поверхности.
     ///
     /// Кнопки навигации, строки быстрого доступа и строки списка ищутся по той
     /// же [`layout`], по которой рисуются, — иначе они разъедутся при первом же
     /// изменении размера окна, и попасть в них будет можно только наугад.
-    pub fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+    fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = layout(ctx, area);
 
         if plan.toolbar.contains(x, y) {
@@ -360,7 +397,7 @@ impl FilesView {
         if let Some(side) = plan.side {
             if side.contains(x, y) {
                 let inner = ctx.on(theme::panel_bg());
-                for slot in place_slots(inner, side) {
+                for slot in place_slots(inner, side, &self.home) {
                     if slot.rect.contains(x, y) {
                         if slot.path == self.path {
                             return false;
@@ -398,13 +435,13 @@ impl FilesView {
         true
     }
 
-    /// Нарисовать содержимое окна.
+    /// Нарисовать окно целиком.
     ///
-    /// Область приходит уже залитой фоном окна — это делает окно, потому что
-    /// заливать её обязано и то содержимое, которое рисует одну строку. Второй
-    /// заливки здесь нет намеренно: на 1080p она стоила бы лишних двух
-    /// миллионов записей на каждое нажатие стрелки.
-    pub fn draw(&self, surface: &mut Surface, area: Rect, ctx: Ctx) {
+    /// Фон заливается здесь, а не приходит готовым: до переезда область
+    /// заливало окно ядра, а у программы поверхность своя и заливать её больше
+    /// некому.
+    fn draw(&self, surface: &mut Surface, area: Rect, ctx: Ctx) {
+        surface.fill(area, theme::window_bg());
         let plan = layout(ctx, area);
         self.draw_toolbar(surface, ctx, &plan);
         if let Some(side) = plan.side {
@@ -485,7 +522,7 @@ impl FilesView {
         let inner = ctx.on(theme::panel_bg());
         let pad = ctx.px(12);
 
-        for slot in place_slots(inner, side) {
+        for slot in place_slots(inner, side, &self.home) {
             if let Some(head) = slot.head {
                 paint::caps(inner, s, side.x + ctx.px(16) as i32, slot.head_y, head);
             }
@@ -604,7 +641,7 @@ impl FilesView {
             paint::text_right(ctx, s, Role::MonoSmall, right, small, &size, p.ink4);
             right -= ctx.px(76) as i32;
             if rect.w > ctx.px(360) {
-                let meta = format!("{:04o} {}:{}", row.mode, row.uid, row.gid);
+                let meta = format!("{:04o} {}:{}", row.mode & 0o7777, row.uid, row.gid);
                 paint::text_right(ctx, s, Role::MonoSmall, right, small, &meta, p.ink4);
                 right -= ctx.px(120) as i32;
             }
@@ -690,9 +727,15 @@ impl FilesView {
             String::from("Стрелки — листать    Esc — назад к списку")
         } else if self.error.is_some() {
             String::from("Стрелка влево — назад    Backspace — вверх")
+        } else if self.dropped != 0 {
+            format!(
+                "{} из {} объектов    показаны не все",
+                self.rows.len(),
+                self.rows.len() + self.dropped
+            )
         } else {
             format!(
-                "{} объектов    Enter — открыть    влево — назад    Backspace — вверх",
+                "{} объектов    Enter — открыть    Backspace — вверх    R — обновить",
                 self.rows.len()
             )
         };
@@ -719,11 +762,27 @@ impl FilesView {
     }
 }
 
-impl Default for FilesView {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ---------------------------------------------------------------------------
+// Клавиши, у которых символ есть
+// ---------------------------------------------------------------------------
+
+/// Enter. Договор отдаёт символ раньше имени, и у этой клавиши он есть.
+const ENTER: u32 = '\n' as u32;
+/// Backspace — `0x08`, его собственный код в ASCII.
+const BACKSPACE: u32 = 0x08;
+/// Escape — `0x1B`, тоже собственный.
+const ESCAPE: u32 = 0x1B;
+/// Обновить список. `r` — потому что F-ряд договор программам не отдаёт.
+const REFRESH: u32 = 'r' as u32;
+/// Закрыть окно.
+const QUIT: u32 = 'q' as u32;
+
+/// На сколько строк прокручивает просмотр страница.
+const PREVIEW_PAGE: usize = 20;
+
+// ---------------------------------------------------------------------------
+// Раскладка
+// ---------------------------------------------------------------------------
 
 /// Где что лежит в окне менеджера.
 ///
@@ -859,21 +918,21 @@ struct PlaceSlot {
 
 /// Куда ведёт быстрый доступ.
 ///
-/// Список короткий и составлен из того, что в системе точно есть: корень, дом
-/// вошедшего, его стол и два системных каталога. Закладок человек пока не
-/// заводит — заводить их некуда, файла настроек у стола нет.
-fn places() -> [(Option<&'static str>, String); 5] {
+/// Список короткий и составлен из того, что в системе точно есть: корень, дом,
+/// стол и два системных каталога. Закладок человек пока не заводит — заводить
+/// их некуда, файла настроек у стола нет.
+fn places(home: &str) -> [(Option<&'static str>, String); 5] {
     [
         (Some("МЕСТА"), String::from("/")),
-        (None, super::context::home_dir()),
-        (None, super::context::desktop_dir()),
+        (None, home.to_string()),
+        (None, format!("{home}/Desktop")),
         (Some("СИСТЕМА"), String::from("/bin")),
         (None, String::from("/etc")),
     ]
 }
 
 /// Разложить быстрый доступ по колонке.
-fn place_slots(ctx: Ctx, side: Rect) -> Vec<PlaceSlot> {
+fn place_slots(ctx: Ctx, side: Rect, home: &str) -> Vec<PlaceSlot> {
     let padx = ctx.px(16);
     let row_h = ctx.px(32);
     let gap = ctx.px(2);
@@ -881,7 +940,7 @@ fn place_slots(ctx: Ctx, side: Rect) -> Vec<PlaceSlot> {
     let mut y = side.y + ctx.px(10) as i32;
     let mut out = Vec::new();
 
-    for (head, path) in places() {
+    for (head, path) in places(home) {
         let head_y = if head.is_some() {
             let at = y + ctx.px(4) as i32;
             y += caps_h as i32;
@@ -906,12 +965,24 @@ fn place_slots(ctx: Ctx, side: Rect) -> Vec<PlaceSlot> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Файловая система
+// ---------------------------------------------------------------------------
+
 /// Собрать путь к записи внутри каталога.
 fn join(dir: &str, name: &str) -> String {
     if dir == "/" {
         format!("/{name}")
     } else {
         format!("{dir}/{name}")
+    }
+}
+
+/// Каталог, в котором лежит этот путь.
+fn parent_of(path: &str) -> String {
+    match path.rfind('/') {
+        Some(0) | None => String::from("/"),
+        Some(index) => path[..index].to_string(),
     }
 }
 
@@ -926,31 +997,369 @@ fn size_text(bytes: u64) -> String {
     }
 }
 
+/// Прочитать каталог. Возвращает строки и сколько записей не поместилось.
+///
+/// Ошибка — текстом, а не кодом: показывать её человеку всё равно строкой, а
+/// перевод кода в слова в одном месте лучше, чем в трёх.
+fn list_dir(path: &str) -> Result<(Vec<Row>, usize), String> {
+    let fd = open(path);
+    if fd < 0 {
+        return Err(format!("cannot open {path}: error {fd}"));
+    }
+    let program = path == "/bin" || path.ends_with("/bin");
+    let mut rows = Vec::new();
+    let mut dropped = 0usize;
+    let mut entry = Dirent::default();
+
+    loop {
+        let step = readdir_raw(fd, &mut entry);
+        if step == 0 {
+            break;
+        }
+        if step < 0 {
+            close(fd);
+            return Err(format!("cannot read {path}: error {step}"));
+        }
+        // Имя пришло из-за границы доверия: длина — поле структуры, а байты —
+        // содержимое носителя. И то и другое проверяется, а не берётся на веру:
+        // длина за пределом массива увела бы срез в чужую память, а не-UTF-8
+        // прошёл бы в отрисовку и вышел мусором на экране.
+        let len = (entry.name_len as usize).min(entry.name.len());
+        let Ok(name) = core::str::from_utf8(&entry.name[..len]) else {
+            continue;
+        };
+        // «.» и «..» приходят от ext2 как настоящие записи. Своя навигация уже
+        // есть (Backspace), а две строки, ведущие «сюда же» и «наверх», в
+        // списке только мешают.
+        if name == "." || name == ".." {
+            continue;
+        }
+        if rows.len() >= MAX_ROWS {
+            dropped += 1;
+            continue;
+        }
+        rows.push(Row {
+            name: name.to_string(),
+            directory: entry.kind == KIND_DIRECTORY,
+            program,
+            mode: entry.mode,
+            uid: entry.uid,
+            gid: entry.gid,
+            size: entry.size,
+        });
+    }
+
+    close(fd);
+    Ok((rows, dropped))
+}
+
 /// Прочитать файл для просмотра.
 fn read_preview(name: &str, path: &str) -> Preview {
     let mut lines = Vec::new();
     let mut note = String::new();
 
-    match fs::read(path, PREVIEW_LIMIT) {
-        Some(Ok((bytes, total))) => match core::str::from_utf8(&bytes) {
-            Ok(text) => {
-                for line in text.lines().take(PREVIEW_LINES) {
-                    // Табуляции и управляющие байты испортили бы разметку строки:
-                    // рисование текста не знает про них ничего.
-                    lines.push(line.replace('\t', "    "));
-                }
-                if total > bytes.len() as u64 {
-                    note = format!("... {} of {total} bytes shown", bytes.len());
-                }
+    let fd = open(path);
+    if fd < 0 {
+        return Preview {
+            name: name.to_string(),
+            lines,
+            note: format!("cannot read: error {fd}"),
+            scroll: 0,
+        };
+    }
+
+    // Полный размер спрашивается отдельно: прочитано будет не больше предела, а
+    // сказать «показано не всё» можно только зная, сколько всего.
+    let mut info = Stat::default();
+    let total = if fstat_ok(fd, &mut info) { info.size } else { 0 };
+
+    let mut buffer = Vec::new();
+    // `try_reserve` вместо `vec![]`: отказ аллокатора обязан вернуться ошибкой,
+    // а не уронить программу. Восемь килобайт есть почти всегда — «почти» здесь
+    // и означает, что проверка нужна.
+    if buffer.try_reserve_exact(PREVIEW_LIMIT).is_err() {
+        close(fd);
+        return Preview {
+            name: name.to_string(),
+            lines,
+            note: String::from("not enough memory to preview this file"),
+            scroll: 0,
+        };
+    }
+    buffer.resize(PREVIEW_LIMIT, 0u8);
+
+    let read_bytes = read(fd, &mut buffer);
+    close(fd);
+    if read_bytes < 0 {
+        return Preview {
+            name: name.to_string(),
+            lines,
+            note: format!("cannot read: error {read_bytes}"),
+            scroll: 0,
+        };
+    }
+    let got = (read_bytes as usize).min(buffer.len());
+
+    match core::str::from_utf8(&buffer[..got]) {
+        Ok(text) => {
+            for line in text.lines().take(PREVIEW_LINES) {
+                // Табуляции и управляющие байты испортили бы разметку строки:
+                // рисование текста не знает про них ничего.
+                lines.push(line.replace('\t', "    "));
             }
-            // Двоичный файл не показывается вовсе, а не показывается мусором:
-            // из «шрифт нарисовал непечатное» никто не сделает вывода, что файл
-            // двоичный.
-            Err(_) => note = format!("binary file, {} bytes", bytes.len()),
-        },
-        Some(Err(err)) => note = format!("cannot read: {err}"),
-        None => note = String::from("no filesystem is mounted"),
+            if total > got as u64 {
+                note = format!("... {got} of {total} bytes shown");
+            }
+        }
+        // Двоичный файл не показывается вовсе, а не показывается мусором: из
+        // «шрифт нарисовал непечатное» никто не сделает вывода, что файл
+        // двоичный.
+        Err(_) => note = format!("binary file, {got} bytes"),
     }
 
     Preview { name: name.to_string(), lines, note, scroll: 0 }
+}
+
+/// `fstat`, у которого ответ — «получилось или нет».
+fn fstat_ok(fd: i64, out: &mut Stat) -> bool {
+    user_progs::fstat(fd, out) >= 0
+}
+
+// ---------------------------------------------------------------------------
+// Запуск
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
+    // SAFETY: значения пришли из `_start` ровно в том виде, в каком их положило
+    // ядро, — это и есть единственный допустимый источник по контракту `Args`.
+    let args = unsafe { Args::new(argc, argv) };
+
+    let Some(info) = wait_for_graphics() else {
+        // Машина без графики — это не сбой: система работает в серийной линии,
+        // и показывать каталог просто негде.
+        println("files: no graphics on this machine, nothing to show");
+        exit(0)
+    };
+
+    // Формат точки и тема — первое, что нужно сделать, и сделать до всякой
+    // отрисовки. Оба счётчика у программы свои: адресное пространство своё, и
+    // заполненные ядром у себя ей не видны. Без формата окно вышло бы сплошь
+    // чёрным при совершенно исправной отрисовке, без темы — светлым на тёмном
+    // столе; обе ошибки глазами ищут долго.
+    mini_ui::use_raw_format(info.pixel_format);
+    theme::set_dark(info.flags & SYSINFO_DARK != 0);
+
+    let start = starting_dir(args.get(1));
+    let home = if user_progs::uid() == 0 { "/root" } else { "/home" };
+
+    let (width, height) = window_size(&info);
+    let scale = theme::geometry_scale(info.screen_w.max(1));
+
+    let Some(mut window) = open_patiently(width, height) else {
+        println("files: FAILED the desktop never freed up; no window");
+        exit(1)
+    };
+
+    let base = window.pixels().as_mut_ptr();
+    // SAFETY: ядро отобразило ровно `width * height` точек по этому адресу и
+    // держит их, пока живо окно. Второй ссылки на них нет — `window` больше
+    // пикселей никому не отдаёт.
+    let Some(mut surface) = (unsafe { Surface::from_raw(base, width, height) }) else {
+        println("files: FAILED the surface the kernel gave makes no sense");
+        exit(1)
+    };
+
+    let area = Rect::new(0, 0, width, height);
+    let ctx = Ctx::scaled(scale);
+    let mut view = Files::new(start, home.to_string());
+
+    println(&format!("files: window '{TITLE}' opened, {width}x{height}"));
+    // Что именно прочитано — в журнал, по разу на каждый каталог. Нарисованное
+    // на экране снаружи не проверить, а строка проверяется: она и отличает
+    // «список показан» от «окно нарисовано пустым».
+    view.report();
+
+    let mut dark = info.flags & SYSINFO_DARK != 0;
+    let mut next_theme = monotonic_ms() + THEME_PERIOD_MS;
+    let mut dirty = true;
+    let reason;
+
+    'live: loop {
+        while let Some(event) = window.next_event() {
+            match event.kind {
+                // Просьба закрыться — крестиком или Ctrl+W. Соглашаемся сразу:
+                // несохранённого у менеджера нет.
+                WIN_CLOSE => {
+                    reason = "request";
+                    break 'live;
+                }
+                WIN_KEY if event.code == QUIT && view.preview.is_none() => {
+                    reason = "'q'";
+                    break 'live;
+                }
+                WIN_KEY => {
+                    if view.key(event.code) {
+                        view.report_if_moved();
+                        dirty = true;
+                    }
+                }
+                WIN_POINTER => {
+                    if view.click(area, ctx, event.x, event.y) {
+                        view.report_if_moved();
+                        dirty = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let now = monotonic_ms();
+        if now >= next_theme {
+            next_theme = now + THEME_PERIOD_MS;
+            if let Some(fresh) = sysinfo() {
+                let fresh_dark = fresh.flags & SYSINFO_DARK != 0;
+                if fresh_dark != dark {
+                    dark = fresh_dark;
+                    theme::set_dark(dark);
+                    println(if dark {
+                        "files: repainted for the dark theme"
+                    } else {
+                        "files: repainted for the light theme"
+                    });
+                    dirty = true;
+                }
+            }
+        }
+
+        if dirty {
+            // Контекст пересобирается на каждый кадр, а не хранится: он держит
+            // палитру и сведённую подложку, а обе меняются вместе с темой.
+            view.draw(&mut surface, area, Ctx::scaled(scale));
+            // Отказ здесь — **не** сбой, и выходить из-за него нельзя. Занятый
+            // стол отвечает `ERR_AGAIN`, а пропущенный кадр ничего не стоит:
+            // следующий виток нарисует то же самое. Ровно на этом монитор
+            // системы падал и поднимался супервизором по кругу.
+            if window.commit() >= 0 {
+                dirty = false;
+            }
+        }
+
+        nanosleep(0, POLL_NS);
+    }
+
+    println(&format!("files: closing on {reason}"));
+    window.close();
+    exit(0)
+}
+
+impl Files {
+    /// Сказать в журнал, что показано сейчас.
+    ///
+    /// Печатается то, чего снаружи не видно иначе: путь, число строк и имя
+    /// выбранной. Снимок экрана доказательством не считается — это правило
+    /// дома, — а по этой строке стенд проверяет и переход по каталогам, и то,
+    /// что стрелка действительно двигает выделение.
+    fn report(&self) {
+        match &self.error {
+            Some(text) => println(&format!("files: {} failed: {text}", self.path)),
+            None => println(&format!(
+                "files: {} has {} entries, selected '{}'",
+                self.path,
+                self.rows.len(),
+                self.selected_name()
+            )),
+        }
+    }
+
+    /// Имя выбранной строки, либо прочерк, если выбирать не из чего.
+    fn selected_name(&self) -> &str {
+        match self.rows.get(self.selected) {
+            Some(row) => &row.name,
+            None => "-",
+        }
+    }
+
+    /// Сказать в журнал после действия, которое могло сменить каталог, строку
+    /// или открыть просмотр.
+    fn report_if_moved(&self) {
+        match self.preview.as_ref() {
+            Some(preview) => println(&format!(
+                "files: preview '{}' has {} line(s)",
+                preview.name,
+                preview.lines.len()
+            )),
+            None => self.report(),
+        }
+    }
+}
+
+/// С какого каталога начать.
+///
+/// Аргумент бывает и файлом: значок на столе указывает на файл ровно так же,
+/// как на папку, и требовать от стола различать их значило бы завести две
+/// команды запуска вместо одной.
+fn starting_dir(argument: Option<&str>) -> String {
+    let Some(path) = argument else {
+        return String::from("/");
+    };
+    if path.is_empty() {
+        return String::from("/");
+    }
+    let mut info = Stat::default();
+    if stat(path, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
+        return path.to_string();
+    }
+    // Не каталог или его вовсе нет — показываем то место, где он должен был бы
+    // лежать. Пустое окно с сообщением «нет такого пути» человеку бесполезно:
+    // он открыл менеджер, чтобы смотреть файлы, а не чтобы читать отказ.
+    parent_of(path)
+}
+
+/// Какого размера просить окно.
+///
+/// Две трети экрана — ровно столько занимало это окно, пока его раскладку
+/// считало ядро. Считается от экрана, а не задано числом: окно в 850 точек на
+/// экране 3840 выглядит маркой на конверте, а на 800×600 не помещается вовсе.
+fn window_size(info: &SysInfo) -> (u32, u32) {
+    let w = (info.screen_w * 2 / 3).clamp(320, info.screen_w.max(320));
+    let h = (info.screen_h * 2 / 3).clamp(240, info.screen_h.max(240));
+    (w, h)
+}
+
+/// Попросить окно столько раз, сколько нужно.
+fn open_patiently(width: u32, height: u32) -> Option<Window> {
+    let deadline = monotonic_ms() + OPEN_WAIT_MS;
+    loop {
+        match Window::open(TITLE, width, height) {
+            Ok(window) => return Some(window),
+            Err(code) => {
+                // Всё, кроме «попробуйте ещё», окончательно: окна такого
+                // размера не дадут никогда, сколько ни проси.
+                if code != user_progs::ERR_AGAIN {
+                    println(&format!("files: FAILED opening the window: {code}"));
+                    return None;
+                }
+            }
+        }
+        if monotonic_ms() >= deadline {
+            return None;
+        }
+        nanosleep(0, POLL_NS);
+    }
+}
+
+/// Дождаться, пока система скажет формат точки, — это и значит «графика есть».
+fn wait_for_graphics() -> Option<SysInfo> {
+    let deadline = monotonic_ms() + WAIT_GRAPHICS_MS;
+    loop {
+        let info = sysinfo()?;
+        if info.pixel_format != 0 && info.screen_w != 0 {
+            return Some(info);
+        }
+        if monotonic_ms() >= deadline {
+            return None;
+        }
+        nanosleep(0, POLL_NS);
+    }
 }

@@ -44,7 +44,6 @@
 // от ядра у них не было ни одной, так что переезд свёлся к переносу двух файлов.
 pub mod compositor;
 pub mod context;
-pub mod files;
 pub mod icons;
 pub mod panel;
 pub mod pointer;
@@ -166,6 +165,10 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
         (u64::from(cells.0) << 32) | u64::from(cells.1),
         core::sync::atomic::Ordering::Relaxed,
     );
+    SCREEN_SIZE.store(
+        (u64::from(desktop.screen_width()) << 32) | u64::from(desktop.screen_height()),
+        core::sync::atomic::Ordering::Relaxed,
+    );
 
     *DESKTOP.lock() = Some(desktop);
     GRAPHICS.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -208,6 +211,22 @@ static GRAPHICS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool
 /// гонка, а не программа.
 static SHELL_CELLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Размер экрана в точках, упакованный в одно слово. Нули — графики нет.
+///
+/// Живёт здесь по той же причине, что и [`SHELL_CELLS`], и спрашивают его те
+/// же: программа, открывающая окно, выбирает по нему и свой размер, и
+/// множитель геометрии. Спросить его через захват стола значило бы отдать нули
+/// тому, кто спросил во время перерисовки, — то есть окно в ноль точек, и
+/// виновата была бы гонка, а не программа.
+static SCREEN_SIZE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Размер экрана в точках. `(0, 0)` — графики на этой машине нет.
+#[must_use]
+pub fn screen_size() -> (u32, u32) {
+    let packed = SCREEN_SIZE.load(core::sync::atomic::Ordering::Relaxed);
+    ((packed >> 32) as u32, packed as u32)
+}
+
 /// Поработать со столом — **вне** замка.
 ///
 /// Стол вынимается из-под замка на время работы, а не удерживается под ним, и
@@ -247,12 +266,6 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
             (work / 16) as i32,
             width * 5 / 8,
             work * 3 / 4,
-        ),
-        App::Files => Rect::new(
-            (width / 6) as i32,
-            (work / 8) as i32,
-            width * 2 / 3,
-            work * 2 / 3,
         ),
         // «Параметры» — окно из двух колонок: разделы слева и настройки
         // справа. Ширина считается от них, а не долей экрана: боковая колонка
@@ -314,7 +327,6 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
     let rect = layout(desktop, app);
     let scale = desktop.scale();
     match app {
-        App::Files => Window::files(rect, scale),
         App::Settings => Window::settings(
             rect,
             scale,
@@ -1188,7 +1200,7 @@ fn launch(desktop: &mut Compositor, app: App) {
     }
 }
 
-/// Открыть значок: системный — окном программы, файл и каталог — менеджером.
+/// Открыть значок: системный — окном ядра, программа и файл — запуском.
 ///
 /// Отдельная функция, а не ветка внутри разбора щелчка, потому что открывают
 /// значок двумя дорогами — двойным щелчком и пунктом «Open», — и разошедшиеся
@@ -1197,25 +1209,47 @@ fn launch(desktop: &mut Compositor, app: App) {
 fn open_icon(desktop: &mut Compositor, index: usize) {
     match desktop.icon_kind(index) {
         Some(icons::Kind::App(app)) => launch(desktop, app),
-        Some(kind) => {
+        // Значок-запуск: команда лежит в пути записи. Так на столе живёт
+        // файловый менеджер с фазы 47c — он программа, и открывать его окном
+        // ядра больше нечем.
+        Some(icons::Kind::Program(_)) => {
+            let Some(command) = desktop.icon_path(index) else {
+                return;
+            };
+            start(desktop, &command);
+        }
+        // Файл или каталог со стола. До 47c здесь поднималось окно ядра и ему
+        // говорили `reveal`; теперь путь уезжает **аргументом** программе.
+        // Разбор на слова делает сама задача, кавычек он не знает — имя с
+        // пробелом приедет двумя аргументами, и это названный предел, а не
+        // недосмотр: заводить разбор кавычек ради стола значит заводить его во
+        // всей системе.
+        Some(_) => {
             let Some(path) = desktop.icon_path(index) else {
                 return;
             };
-            let directory = kind == icons::Kind::Folder;
-            launch(desktop, App::Files);
-            if let Some(window) = desktop.find(App::Files) {
-                window.reveal(&path, directory);
-            }
+            start(desktop, &alloc::format!("/bin/files {path}"));
             kprintln!("  desktop     : opened '{path}'");
         }
         None => {}
     }
 }
 
-/// Показать в открытом файловом менеджере то, что изменилось на диске.
-fn refresh_files_window(desktop: &mut Compositor) {
-    if let Some(window) = desktop.find(App::Files) {
-        window.refresh_files();
+/// Запустить программу третьего кольца по готовой командной строке.
+///
+/// Ждать её нельзя — этот код работает внутри разбора события ввода, — поэтому
+/// «получилось» здесь означает «задача заведена», а не «окно появилось». Окно
+/// программа откроет сама, и сама же о нём скажет.
+fn start(desktop: &mut Compositor, command: &str) {
+    match crate::user::spawn(command, crate::user::session::credentials()) {
+        Ok(id) => kprintln!("  desktop     : started '{command}' as {id}"),
+        Err(err) => {
+            kprintln!("  desktop     : cannot start '{command}': {err}");
+            // Отказ виден только в журнале, а человек смотрит на стол. Поднять
+            // оболочку — единственное, что можно сделать отсюда: там он
+            // прочитает ту же строку.
+            launch(desktop, App::Terminal);
+        }
     }
 }
 
@@ -1258,7 +1292,6 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
                     // менеджере: иначе «создал» видно только на слово.
                     desktop.reload_icons();
                     log_icons(desktop);
-                    refresh_files_window(desktop);
                 }
                 Err(err) => {
                     kprintln!("  desktop     : cannot create: {err}");
@@ -1291,7 +1324,6 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             // бы на столе неизвестно когда.
             desktop.reload_icons();
             log_icons(desktop);
-            refresh_files_window(desktop);
             desktop.repaint_all();
             kprintln!("  desktop     : repainted");
         }
@@ -1348,7 +1380,6 @@ fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status
                         // его убрать, получил бы «ничего не выбрано».
                         desktop.select_icon_path(&target);
                         log_icons(desktop);
-                        refresh_files_window(desktop);
                     }
                     Err(err) => {
                         kprintln!("  desktop     : cannot rename '{path}': {err}");
@@ -1368,7 +1399,6 @@ fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status
                         desktop.context_note(&alloc::format!("deleted {label}"));
                         desktop.reload_icons();
                         log_icons(desktop);
-                        refresh_files_window(desktop);
                     }
                     Err(err) => {
                         kprintln!("  desktop     : cannot delete '{path}': {err}");

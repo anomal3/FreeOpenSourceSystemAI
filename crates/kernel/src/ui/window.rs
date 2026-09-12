@@ -38,7 +38,6 @@ use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface};
 use user_abi::WinEvent;
 
-use super::files::FilesView;
 use mini_ui::paint::{self, Ctx, Weight};
 use super::settings::SettingsView;
 use mini_ui::theme;
@@ -54,8 +53,6 @@ use crate::input::KeyCode;
 pub enum App {
     /// Оболочка.
     Terminal,
-    /// Файловый менеджер.
-    Files,
     /// Что это за система.
     About,
     /// Параметры: сведения о системе, экран, программы, обновление.
@@ -87,13 +84,14 @@ pub enum App {
 
 impl App {
     /// Порядок в меню запуска.
-    /// Монитора системы здесь больше нет, и это не пропуск: с фазы 47b он —
-    /// программа `/bin/sysmon`, и меню запуска находит его там же, где все
-    /// остальные программы из `/bin`. Оставить его здесь значило бы предлагать
-    /// человеку два разных способа открыть одно и то же окно.
-    pub const LAUNCHABLE: [App; 6] = [
+    ///
+    /// Ни монитора системы, ни файлового менеджера здесь больше нет, и это не
+    /// пропуск: с фазы 47b первый — программа `/bin/sysmon`, с 47c второй —
+    /// `/bin/files`, и меню находит обоих там же, где все остальные программы
+    /// из `/bin`. Оставить их здесь значило бы предлагать человеку два разных
+    /// способа открыть одно и то же окно.
+    pub const LAUNCHABLE: [App; 5] = [
         App::Terminal,
-        App::Files,
         App::Settings,
         App::About,
         App::Shutdown,
@@ -126,7 +124,6 @@ impl App {
     pub const fn caption(self) -> &'static str {
         match self {
             App::Terminal => "Терминал",
-            App::Files => "Файлы",
             App::About => "О системе",
             App::Settings => "Параметры",
             App::Shutdown => "Выключение",
@@ -157,7 +154,6 @@ impl App {
     pub const fn icon(self) -> Icon {
         match self {
             App::Terminal => Icon::Terminal,
-            App::Files => Icon::Folder,
             App::About => Icon::Info,
             App::Settings => Icon::Settings,
             App::Shutdown | App::Restart => Icon::Power,
@@ -170,7 +166,6 @@ impl App {
     pub const fn title(self) -> &'static str {
         match self {
             App::Terminal => "Terminal",
-            App::Files => "Files",
             App::About => "About",
             App::Settings => "Settings",
             App::Shutdown => "Shut down",
@@ -186,7 +181,6 @@ impl App {
     pub const fn about(self) -> &'static str {
         match self {
             App::Terminal => "оболочка и команды ядра",
-            App::Files => "обзор смонтированного корня",
             App::About => "что это за система",
             App::Settings => "экран, программы, обновление",
             App::Shutdown => "закрыть том и выключить",
@@ -220,8 +214,6 @@ pub enum Hit {
 pub enum Content {
     /// Сетка символов: терминал и всё, что печатает строки.
     Text(TextGrid),
-    /// Список файлов, который рисует себя сам.
-    Files(FilesView),
     /// Окно параметров: разделы слева, содержимое справа.
     Settings(SettingsView),
     /// Окно пользовательской программы: пиксели пишет она сама.
@@ -331,18 +323,6 @@ impl Window {
         let content = Content::Settings(SettingsView::new(screen));
         let title = own(App::Settings.caption())?;
         let mut window = Self::wrap(App::Settings, rect, surface, content, scale, title);
-        window.redraw_content();
-        window.draw_decorations(false);
-        Some(window)
-    }
-
-    /// Создать окно файлового менеджера.
-    #[must_use]
-    pub fn files(rect: Rect, scale: u32) -> Option<Self> {
-        let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
-        let content = Content::Files(FilesView::new());
-        let title = own(App::Files.caption())?;
-        let mut window = Self::wrap(App::Files, rect, surface, content, scale, title);
         window.redraw_content();
         window.draw_decorations(false);
         Some(window)
@@ -633,7 +613,7 @@ impl Window {
                 grid.take_damage();
                 self.damage = self.damage.union(&area);
             }
-            Content::Files(_) | Content::Settings(_) => self.redraw_content(),
+            Content::Settings(_) => self.redraw_content(),
             // Окно программы темы не знает и знать не может: его пиксели
             // написала программа, и перекрасить их ядру нечем. Заголовок
             // перерисует композитор, а содержимое останется прежним — это
@@ -739,20 +719,13 @@ impl Window {
     pub fn size_in_cells(&self) -> (u32, u32) {
         match &self.content {
             Content::Text(grid) => (grid.cols(), grid.rows()),
-            Content::Files(_) | Content::Settings(_) | Content::Program(_) => (0, 0),
+            Content::Settings(_) | Content::Program(_) => (0, 0),
         }
     }
 
     /// Передать клавишу содержимому. `true` — окно её обработало.
     pub fn handle_key(&mut self, code: KeyCode) -> bool {
         match &mut self.content {
-            Content::Files(view) => {
-                if !view.handle(code) {
-                    return false;
-                }
-                self.redraw_content();
-                true
-            }
             Content::Settings(view) => {
                 if !view.handle(code) {
                     return false;
@@ -780,7 +753,6 @@ impl Window {
         // ставший короче, иначе оставил бы под собой хвост предыдущего.
         self.surface.fill(area, theme::window_bg());
         match &self.content {
-            Content::Files(view) => view.draw(&mut self.surface, area, ctx),
             Content::Settings(view) => view.draw(&mut self.surface, area, ctx),
             Content::Text(_) => return,
             // Пиксели программы ядро не рисует, а переносит: что в них
@@ -793,22 +765,6 @@ impl Window {
             }
         }
         self.damage = self.damage.union(&area);
-    }
-
-    /// Показать в файловом менеджере то, что открыли значком со стола.
-    pub fn reveal(&mut self, path: &str, directory: bool) {
-        if let Content::Files(view) = &mut self.content {
-            view.reveal(path, directory);
-            self.redraw_content();
-        }
-    }
-
-    /// Перечитать открытый каталог.
-    pub fn refresh_files(&mut self) {
-        if let Content::Files(view) = &mut self.content {
-            view.refresh();
-            self.redraw_content();
-        }
     }
 
     /// Показать в «Параметрах» раздел экрана.
@@ -832,7 +788,6 @@ impl Window {
         let local = (x - self.rect.x, y - self.rect.y);
         let used = match &mut self.content {
             Content::Settings(view) => view.click(area, ctx, local.0, local.1),
-            Content::Files(view) => view.click(area, ctx, local.0, local.1),
             Content::Text(_) => false,
             // Щелчок по окну программы — её событие, а не работа ядра: кладёт
             // его в очередь оконный менеджер, которому известны кнопки мыши.
@@ -852,7 +807,7 @@ impl Window {
     pub fn took_theme_change(&mut self) -> bool {
         match &mut self.content {
             Content::Settings(view) => view.take_theme_change(),
-            Content::Files(_) | Content::Text(_) | Content::Program(_) => false,
+            Content::Text(_) | Content::Program(_) => false,
         }
     }
 
@@ -893,7 +848,7 @@ impl Window {
             }
             // Список файлов и «Параметры» рисуют себя от размера области, и
             // переносить в них нечего: содержимое соберётся заново.
-            Content::Files(_) | Content::Settings(_) => {}
+            Content::Settings(_) => {}
             // Окно программы размера не меняет, и это названный предел. Его
             // пиксели лежат в кадрах, отображённых программе; новый размер
             // означал бы другие кадры по другому адресу — то есть поверхность,

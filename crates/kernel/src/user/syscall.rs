@@ -1519,6 +1519,7 @@ fn sysinfo(out: usize) -> i64 {
     let (pointer_moves, pointer_merged) = crate::input::pointer_stats();
     let (composed, rects, windows) = crate::ui::stats();
 
+    let screen = crate::ui::screen_size();
     let value = SysInfo {
         uptime_ms: time::uptime_ms(),
         ticks: crate::irq::ticks(),
@@ -1546,6 +1547,12 @@ fn sysinfo(out: usize) -> i64 {
         // Два независимых способа сказать одно и то же однажды разошлись бы, и
         // разошлись бы молча — окном, где красное нарисовано синим.
         pixel_format: mini_ui::format_code(),
+        // Размер экрана берётся у стола, а не у окна спрашивающего: окно — это
+        // то, что программа выбрала сама, и считать от него множитель
+        // геометрии значит нарисовать содержимое в одном масштабе, а рамку
+        // вокруг него — в другом.
+        screen_w: screen.0,
+        screen_h: screen.1,
     };
     // SAFETY: адрес проверен на выравнивание и на запись.
     unsafe { core::ptr::write(out as *mut SysInfo, value) };
