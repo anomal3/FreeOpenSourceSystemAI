@@ -760,7 +760,7 @@ pub const ALL: &[Scenario] = &[
             // меняется только вместе со списком в `/bin`. Сколько из них
             // показано, проверено порогом в начале сценария, где курсор эту
             // строку ещё не прошёл.
-            Step::Expect("of 27 programs from /bin"),
+            Step::Expect("of 28 programs from /bin"),
             Step::Key("f1"),
             Step::Await("desktop     : menu opened", 15_000),
             Step::Key("right"),
@@ -4392,6 +4392,92 @@ pub const ALL: &[Scenario] = &[
             // просто часто будят.
             Step::Line("tasks"),
             Step::Await(" ms on cpu", 15_000),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "window",
+        about: "Окно у программы: своя поверхность, свои события, снятие за умершей.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Запуск уходит в **серийную линию**: оболочка читает её независимо
+            // от того, какое окно на столе в фокусе. Это важно для шагов ниже —
+            // как только окно программы откроется, клавиатура станет её.
+            Step::Line("run /bin/winshow"),
+
+            // Окно завёл композитор, и говорит об этом он, а не программа.
+            // Геометрия в строке — не украшение: по ней стенд наводит мышь, и
+            // без неё «окно есть» подтверждалось бы только снимком экрана.
+            Step::Await("desktop     : opened 'winshow' for ", 60_000),
+            Step::Await("window      : 'winshow' at ", 30_000),
+
+            // Поверхность — настоящая память программы. Узор зависит от обеих
+            // координат: отображение, где две страницы ведут на один кадр,
+            // залитую константой область прошло бы незамеченным.
+            Step::Await("winshow: wrote and read back 64000 points, no mismatches", 30_000),
+            Step::Await("winshow: committed the whole window", 30_000),
+
+            // Названный предел договора, проверенный, а не только записанный:
+            // вернуть кадры поверхности по просьбе программы нельзя.
+            Step::Await("winshow: munmap refused the surface, as promised", 30_000),
+
+            // Событие доходит. Клавиша идёт через **клавиатуру**, а не линию, и
+            // достаётся фокусному окну — то есть окну программы, а не оболочке.
+            // `97` — это `a`: договор присылает символ, а не код клавиши.
+            Step::Type("a"),
+            Step::Await("winshow: key 97", 30_000),
+
+            // И программа их различает: `q` заканчивает ожидание. Без второй
+            // клавиши строка выше доказывала бы только, что события считают.
+            Step::Type("q"),
+            Step::Await("winshow: key 113", 30_000),
+
+            // Окно закрывает сама программа — крестик и Ctrl+W только просят.
+            Step::Await("winshow: closing the window myself", 30_000),
+            Step::Await("desktop     : closed the window of ", 30_000),
+            Step::Await("winshow: done", 15_000),
+
+            // Вторая половина: программа уходит, не закрыв окно. Снять его и
+            // вернуть кадры обязано ядро — и обязано успеть **до** разбора её
+            // адресного пространства.
+            Step::Line("run /bin/winshow leak"),
+            Step::Await("winshow: leaving the window to the teardown", 60_000),
+
+            // Строка ядра, а не программы: её к этому моменту уже нет. Число
+            // кадров здесь — единственное доказательство, что поверхность
+            // вернулась целиком, а не осталась висеть за умершей задачей.
+            Step::Await("user        : reclaimed ", 30_000),
+
+            // Два способа сделать это неправильно, каждый со своей строкой.
+            // Первый — сдаться перед занятым столом и оставить кадры навсегда;
+            // второй — недосчитаться страниц при снятии отображения.
+            Step::Absent("WARNING: the desktop stayed busy"),
+            Step::Absent("WARNING: the window surface gave back"),
+
+            // Ни одна проверка программы не провалилась. Отдельным шагом,
+            // потому что «строка не напечаталась» и «проверка не прошла» —
+            // разные беды, и первую поймали бы ожидания выше, а вторую только
+            // это.
+            Step::Absent("winshow: FAILED"),
 
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),

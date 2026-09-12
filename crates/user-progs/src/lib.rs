@@ -58,6 +58,148 @@ use user_abi::{
     DUP_ANY, SYS_CLOCK, SYS_DUP, SYS_FSTAT, SYS_ISATTY, SYS_NANOSLEEP, SYS_POLL, SYS_TIMES,
 };
 
+pub use user_abi::{MAX_TITLE, WIN_CLOSE, WIN_KEY, WIN_POINTER, WinEvent};
+
+use user_abi::{SYS_WINCLOSE, SYS_WINCOMMIT, SYS_WINEVENT, SYS_WINOPEN, WindowSpec};
+
+/// Сколько раз повторять вызов окна, пока стол занят сборкой кадра.
+///
+/// Сорок попыток по [`BUSY_PAUSE_NS`] — две секунды, то есть заведомо больше
+/// самой долгой перерисовки.
+const BUSY_TRIES: u32 = 40;
+
+/// Пауза между попытками, в наносекундах. Пятьдесят миллисекунд.
+const BUSY_PAUSE_NS: u32 = 50_000_000;
+
+/// Повторить вызов окна, пока стол занят сборкой кадра.
+///
+/// [`ERR_AGAIN`] от вызовов окна означает «ещё раз», а не «не вышло»: стол
+/// вынимают из-под замка на время перерисовки, и попасть в этот промежуток —
+/// обычное дело, а не редкость.
+///
+/// Повтор живёт здесь, в обвязке, а не в каждой программе, и это решение, а не
+/// удобство: ждать занятый стол — свойство **договора**, одинаковое для всех, и
+/// программа, забывшая о нём в одном вызове из четырёх, падает не всегда, а
+/// через раз. Первый же прогон фазы 47a свалился ровно так — повтор стоял при
+/// открытии окна и отсутствовал при `commit`.
+fn insist(mut call: impl FnMut() -> i64) -> i64 {
+    for _ in 0..BUSY_TRIES {
+        let answer = call();
+        if answer != ERR_AGAIN {
+            return answer;
+        }
+        nanosleep(0, BUSY_PAUSE_NS);
+    }
+    ERR_AGAIN
+}
+
+/// Окно программы на рабочем столе (фаза 47a).
+///
+/// Владеет поверхностью — страницами, которые ядро отобразило в память
+/// программы. Пиксели пишутся в них как в обычный массив: ни системного вызова,
+/// ни копии на точку. На экран написанное попадает не само — пока не позван
+/// [`Window::commit`], компоновщик о правке не знает.
+pub struct Window {
+    id: i64,
+    base: *mut u32,
+    width: u32,
+    height: u32,
+}
+
+impl Window {
+    /// Попросить окно. Ошибка — код отказа из договора.
+    ///
+    /// Занятый стол здесь уже переждан ([`insist`]): [`ERR_AGAIN`] возвращается
+    /// только если он не освободился за две секунды, и это уже не «попробуйте
+    /// ещё», а «что-то не так».
+    pub fn open(title: &str, width: u32, height: u32) -> Result<Self, i64> {
+        let mut spec = WindowSpec {
+            title: title.as_ptr() as u64,
+            title_len: title.len() as u64,
+            surface: 0,
+            width,
+            height,
+            id: 0,
+        };
+        let result = insist(|| {
+            // SAFETY: структура живёт в памяти программы и доступна ей на
+            // запись; заголовок — живой срез, переживающий вызов.
+            unsafe { syscall(SYS_WINOPEN, core::ptr::from_mut(&mut spec) as usize, 0, 0) }
+        });
+        if result < 0 {
+            return Err(result);
+        }
+        Ok(Self { id: spec.id, base: spec.surface as *mut u32, width, height })
+    }
+
+    /// Пиксели окна: строка за строкой, по четыре байта на точку.
+    #[must_use]
+    pub fn pixels(&mut self) -> &mut [u32] {
+        let count = self.width as usize * self.height as usize;
+        // SAFETY: ядро отобразило ровно `width * height` точек по этому адресу и
+        // держит их, пока живо окно. Ссылка здесь одна: её выдаёт `&mut self`, а
+        // второго `Window` с тем же адресом не бывает — его выдаёт только
+        // `open`, и на каждую задачу окно одно.
+        unsafe { core::slice::from_raw_parts_mut(self.base, count) }
+    }
+
+    /// Показать всё окно целиком.
+    pub fn commit(&self) -> i64 {
+        // SAFETY: аргументы — числа; нули означают «всё окно».
+        insist(|| unsafe { syscall(SYS_WINCOMMIT, self.id as usize, 0, 0) })
+    }
+
+    /// Показать кусок окна.
+    pub fn commit_area(&self, x: u32, y: u32, w: u32, h: u32) -> i64 {
+        let point = ((x as usize) << 32) | y as usize;
+        let size = ((w as usize) << 32) | h as usize;
+        // SAFETY: аргументы — числа.
+        insist(|| unsafe { syscall(SYS_WINCOMMIT, self.id as usize, point, size) })
+    }
+
+    /// Забрать событие. `None` — очередь пуста; вызов не ждёт.
+    #[must_use]
+    pub fn next_event(&self) -> Option<WinEvent> {
+        let mut event = WinEvent::default();
+        // SAFETY: структура живёт в памяти программы, выравнивание от типа.
+        let result = unsafe {
+            syscall(
+                SYS_WINEVENT,
+                self.id as usize,
+                core::ptr::from_mut(&mut event) as usize,
+                0,
+            )
+        };
+        (result == 1).then_some(event)
+    }
+
+    /// Закрыть окно. Поверхность после этого недействительна.
+    ///
+    /// Забирает `self` намеренно: обратиться к пикселям после закрытия — это
+    /// отказ страницы, то есть конец программы, и лучше, когда такое не
+    /// компилируется.
+    pub fn close(self) -> i64 {
+        // SAFETY: аргумент — число.
+        insist(|| unsafe { syscall(SYS_WINCLOSE, self.id as usize, 0, 0) })
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Номер окна — он же номер задачи.
+    #[must_use]
+    pub const fn id(&self) -> i64 {
+        self.id
+    }
+}
+
 /// Выполнить системный вызов.
 ///
 /// # Safety

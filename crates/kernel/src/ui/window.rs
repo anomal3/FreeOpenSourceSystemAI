@@ -28,11 +28,15 @@
 //! теряет градиент, кромку и заливку кнопок, — этого достаточно, и это стоит
 //! одной полосы, а не всего окна.
 
+use alloc::collections::VecDeque;
+use alloc::string::String;
+
 use mini_ui::draw;
 use mini_ui::glyphicon::Icon;
 use mini_ui::text::TextGrid;
 use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface};
+use user_abi::WinEvent;
 
 use super::files::FilesView;
 use super::paint::{self, Ctx, Weight};
@@ -68,6 +72,19 @@ pub enum App {
     Shutdown,
     /// Подтверждение перезагрузки.
     Restart,
+    /// Окно пользовательской программы (фаза 47a).
+    ///
+    /// Внутри — номер задачи, а **не** имя. Имя у такого окна своё, приезжает
+    /// из программы и живёт в самом окне ([`Window::caption`]); номер задачи
+    /// отвечает на другой вопрос — чьё это окно, — и отвечает единственным
+    /// способом, который переживает смерть программы. Снимая задачу, ядро
+    /// знает, какое окно убрать, и не спрашивает об этом программу, которой
+    /// может уже не быть.
+    ///
+    /// Отсюда же и предел, названный вслух: окно у программы **одно**. Второй
+    /// [`user_abi::SYS_WINOPEN`] получает отказ, потому что окна ищут по
+    /// [`App`], а два окна с одним номером задачи неразличимы.
+    Program(u32),
 }
 
 impl App {
@@ -114,6 +131,11 @@ impl App {
             App::Settings => "Параметры",
             App::Shutdown => "Выключение",
             App::Restart => "Перезагрузка",
+            // Запас, а не подпись: у окна программы есть собственное имя, и
+            // берут его из окна ([`Window::caption`]), а не отсюда. Сюда
+            // попадают, когда окна уже нет, — например, печатая в журнал о
+            // только что закрытом.
+            App::Program(_) => "Программа",
         }
     }
 
@@ -140,6 +162,7 @@ impl App {
             App::About => Icon::Info,
             App::Settings => Icon::Settings,
             App::Shutdown | App::Restart => Icon::Power,
+            App::Program(_) => Icon::Package,
         }
     }
 
@@ -154,6 +177,9 @@ impl App {
             App::Settings => "Settings",
             App::Shutdown => "Shut down",
             App::Restart => "Restart",
+            // Имя программы в журнал печатает не это: оно приезжает из окна, а
+            // здесь стоит родовое слово — на случай, когда окна уже нет.
+            App::Program(_) => "Program",
         }
     }
 
@@ -168,6 +194,10 @@ impl App {
             App::Settings => "экран, программы, обновление",
             App::Shutdown => "закрыть том и выключить",
             App::Restart => "закрыть том и запустить снова",
+            // В меню запуска окна программ не попадают: их открывает сама
+            // программа, а не человек со стола. Строка здесь затем, что разбор
+            // обязан быть полным.
+            App::Program(_) => "окно пользовательской программы",
         }
     }
 }
@@ -197,13 +227,52 @@ pub enum Content {
     Files(FilesView),
     /// Окно параметров: разделы слева, содержимое справа.
     Settings(SettingsView),
+    /// Окно пользовательской программы: пиксели пишет она сама.
+    Program(ProgramView),
 }
+
+/// Окно, которое рисует не ядро.
+pub struct ProgramView {
+    /// Поверхность программы — кадры, отображённые в её адресное пространство.
+    ///
+    /// Отдельно от поверхности окна, а не вместо неё, и это не лишняя копия на
+    /// ровном месте: в поверхности окна лежат ещё и украшения, нарисованные
+    /// ядром. Отдай мы программе её целиком — программа писала бы в
+    /// собственный заголовок, и закрасить кнопку «закрыть» стало бы её
+    /// законным правом.
+    ///
+    /// Цена названа: [`Window::commit`] копирует изменившийся кусок, то есть
+    /// ровно столько пикселей, сколько программа объявила изменившимися.
+    pixels: Surface,
+    /// События, которых программа ещё не забрала.
+    ///
+    /// Очередь конечна ([`MAX_EVENTS`]), и переполнение теряет **новые**
+    /// события, а не старые: [`user_abi::WIN_CLOSE`] к этому моменту уже лежит
+    /// в ней, и выбросить его ради очередного щелчка значило бы получить окно,
+    /// которое невозможно закрыть.
+    events: VecDeque<WinEvent>,
+}
+
+/// Сколько событий окно держит непрочитанными.
+///
+/// Тридцать два — это пара секунд невнимательности программы, занятой своим
+/// делом. Держать больше незачем: события устаревают, и программа, не
+/// разобравшая очередь за это время, получит от длинной очереди только
+/// запоздалые ответы на то, чего человек уже не помнит.
+const MAX_EVENTS: usize = 32;
 
 pub struct Window {
     pub app: App,
     pub rect: Rect,
     surface: Surface,
     content: Content,
+    /// Как окно называется в заголовке и в кнопке панели задач.
+    ///
+    /// Собственная строка, а не [`App::caption`], и с фазы 47a иначе нельзя: у
+    /// окна программы имя своё, приезжает оно из самой программы, и заимствовать
+    /// его нечем — строка лежит в памяти программы, которой может не стать
+    /// раньше окна.
+    title: String,
     /// Множитель геометрии стола: 1 на обычном экране, 2 на очень плотном.
     ///
     /// Из него же выводится размерный ряд шрифта — порог у них общий, и хранить
@@ -253,7 +322,7 @@ impl Window {
             ctx.palette.ink2,
             back,
         )?;
-        let mut window = Self::wrap(app, rect, surface, Content::Text(grid), scale);
+        let mut window = Self::wrap(app, rect, surface, Content::Text(grid), scale, own(app.caption())?);
         window.draw_decorations(false);
         Some(window)
     }
@@ -263,7 +332,8 @@ impl Window {
     pub fn settings(rect: Rect, scale: u32, screen: (u32, u32)) -> Option<Self> {
         let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
         let content = Content::Settings(SettingsView::new(screen));
-        let mut window = Self::wrap(App::Settings, rect, surface, content, scale);
+        let title = own(App::Settings.caption())?;
+        let mut window = Self::wrap(App::Settings, rect, surface, content, scale, title);
         window.redraw_content();
         window.draw_decorations(false);
         Some(window)
@@ -274,18 +344,48 @@ impl Window {
     pub fn files(rect: Rect, scale: u32) -> Option<Self> {
         let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
         let content = Content::Files(FilesView::new());
-        let mut window = Self::wrap(App::Files, rect, surface, content, scale);
+        let title = own(App::Files.caption())?;
+        let mut window = Self::wrap(App::Files, rect, surface, content, scale, title);
         window.redraw_content();
         window.draw_decorations(false);
         Some(window)
     }
 
-    fn wrap(app: App, rect: Rect, surface: Surface, content: Content, scale: u32) -> Self {
+    /// Создать окно пользовательской программы.
+    ///
+    /// `pixels` — поверхность программы, то есть кадры, которые ей отображены;
+    /// владеет ими не окно, а тот, кто их выдал ([`crate::user`]). Окно живёт
+    /// ровно столько же, сколько они, и это не совпадение: снимает окно и
+    /// возвращает кадры один и тот же путь.
+    ///
+    /// Размер окна больше размера поверхности на высоту заголовка: программа
+    /// просит место **под содержимое**, а полосу сверху рисует ядро. Считать
+    /// иначе значило бы отдавать программе окно, в котором её же рисунок
+    /// наполовину закрыт заголовком.
+    #[must_use]
+    pub fn program(app: App, rect: Rect, scale: u32, title: &str, pixels: Surface) -> Option<Self> {
+        let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
+        let content = Content::Program(ProgramView { pixels, events: VecDeque::new() });
+        let mut window = Self::wrap(app, rect, surface, content, scale, own(title)?);
+        window.redraw_content();
+        window.draw_decorations(false);
+        Some(window)
+    }
+
+    fn wrap(
+        app: App,
+        rect: Rect,
+        surface: Surface,
+        content: Content,
+        scale: u32,
+        title: String,
+    ) -> Self {
         Self {
             app,
             rect,
             surface,
             content,
+            title,
             scale,
             minimized: false,
             restore: None,
@@ -472,7 +572,7 @@ impl Window {
             text_x,
             paint::baseline(ctx, Role::Title, bar),
             room,
-            self.app.caption(),
+            &self.title,
             ink,
         );
         // Обводка окна — последней: она ложится поверх и полосы заголовка, и
@@ -537,6 +637,13 @@ impl Window {
                 self.damage = self.damage.union(&area);
             }
             Content::Files(_) | Content::Settings(_) => self.redraw_content(),
+            // Окно программы темы не знает и знать не может: его пиксели
+            // написала программа, и перекрасить их ядру нечем. Заголовок
+            // перерисует композитор, а содержимое останется прежним — это
+            // названный предел, а не упущение. Сказать программе «сменилась
+            // тема» договор пока не умеет, и выдумывать событие ради одной
+            // перекраски значило бы завести половину протокола.
+            Content::Program(_) => {}
         }
     }
 
@@ -635,7 +742,7 @@ impl Window {
     pub fn size_in_cells(&self) -> (u32, u32) {
         match &self.content {
             Content::Text(grid) => (grid.cols(), grid.rows()),
-            Content::Files(_) | Content::Settings(_) => (0, 0),
+            Content::Files(_) | Content::Settings(_) | Content::Program(_) => (0, 0),
         }
     }
 
@@ -660,6 +767,11 @@ impl Window {
             // в задаче оболочки, потому что набираемая строка — состояние
             // оболочки, а не окна.
             Content::Text(_) => false,
+            // Окно программы — тоже не здесь, и по другой причине: сюда
+            // приезжает код клавиши, а программе нужен символ, который зависит
+            // от модификаторов. Модификаторы есть только у оконного менеджера
+            // ([`super::route`]), он событие и кладёт в очередь.
+            Content::Program(_) => false,
         }
     }
 
@@ -674,6 +786,14 @@ impl Window {
             Content::Files(view) => view.draw(&mut self.surface, area, ctx),
             Content::Settings(view) => view.draw(&mut self.surface, area, ctx),
             Content::Text(_) => return,
+            // Пиксели программы ядро не рисует, а переносит: что в них
+            // написано — её дело. Заливка выше не лишняя и здесь: поверхность
+            // программы бывает меньше области содержимого, и без заливки по
+            // краям осталось бы то, что лежало там прежде.
+            Content::Program(view) => {
+                let whole = view.pixels.bounds();
+                self.surface.blit_from(&view.pixels, (area.x, area.y), whole);
+            }
         }
         self.damage = self.damage.union(&area);
     }
@@ -717,6 +837,9 @@ impl Window {
             Content::Settings(view) => view.click(area, ctx, local.0, local.1),
             Content::Files(view) => view.click(area, ctx, local.0, local.1),
             Content::Text(_) => false,
+            // Щелчок по окну программы — её событие, а не работа ядра: кладёт
+            // его в очередь оконный менеджер, которому известны кнопки мыши.
+            Content::Program(_) => false,
         };
         if used {
             self.redraw_content();
@@ -732,7 +855,7 @@ impl Window {
     pub fn took_theme_change(&mut self) -> bool {
         match &mut self.content {
             Content::Settings(view) => view.take_theme_change(),
-            Content::Files(_) | Content::Text(_) => false,
+            Content::Files(_) | Content::Text(_) | Content::Program(_) => false,
         }
     }
 
@@ -774,6 +897,14 @@ impl Window {
             // Список файлов и «Параметры» рисуют себя от размера области, и
             // переносить в них нечего: содержимое соберётся заново.
             Content::Files(_) | Content::Settings(_) => {}
+            // Окно программы размера не меняет, и это названный предел. Его
+            // пиксели лежат в кадрах, отображённых программе; новый размер
+            // означал бы другие кадры по другому адресу — то есть поверхность,
+            // из-под которой у работающей программы выдернули память. Сказать
+            // ей об этом нечем: события «размер изменился» в договоре нет, и
+            // завести его половиной, без способа дождаться ответа, значило бы
+            // менять память под чужой рукой.
+            Content::Program(_) => return false,
         }
 
         self.surface = surface;
@@ -821,6 +952,92 @@ impl Window {
     pub const fn surface(&self) -> &Surface {
         &self.surface
     }
+
+    /// Как окно называется для человека.
+    ///
+    /// У окон ядра это [`App::caption`], у окна программы — имя, которое
+    /// назвала она сама.
+    #[must_use]
+    pub fn caption(&self) -> &str {
+        &self.title
+    }
+
+    /// Окно ли это пользовательской программы.
+    ///
+    /// Спрашивает оконный менеджер, и спрашивает не из любопытства: закрытие
+    /// такого окна — **просьба** к программе, а не действие над окном.
+    #[must_use]
+    pub fn is_program(&self) -> bool {
+        matches!(self.content, Content::Program(_))
+    }
+
+    /// Перенести на поверхность окна тот кусок, который программа объявила
+    /// изменившимся.
+    ///
+    /// Координаты — внутри поверхности программы; `None` означает «всё окно».
+    /// Прямоугольник, вылезающий за её край, обрезается, а не отвергается:
+    /// программа считает в своих координатах и о полосе заголовка не знает
+    /// ничего.
+    pub fn commit(&mut self, area: Option<Rect>) {
+        let Content::Program(view) = &self.content else {
+            return;
+        };
+        let content = content_area(&self.surface, self.scale);
+        let whole = view.pixels.bounds();
+        let src = area.unwrap_or(whole).intersect(&whole);
+        if src.is_empty() {
+            return;
+        }
+        let at = (content.x + src.x, content.y + src.y);
+        self.surface.blit_from(&view.pixels, at, src);
+        self.damage = self.damage.union(&Rect::new(at.0, at.1, src.w, src.h));
+    }
+
+    /// Положить событие в очередь окна. `false` — очередь полна.
+    pub fn push_event(&mut self, event: WinEvent) -> bool {
+        let Content::Program(view) = &mut self.content else {
+            return false;
+        };
+        if view.events.len() >= MAX_EVENTS {
+            // Просьба закрыться вытесняет самое старое событие, а не теряется
+            // сама. Без этой строки обещание договора («переполнение теряет
+            // новые события, а `WIN_CLOSE` к этому моменту уже лежит в
+            // очереди») держалось бы только на порядке, в котором события
+            // приходят, — то есть не держалось бы вовсе: тридцать два щелчка
+            // подряд по невнимательной программе, и окно больше нечем закрыть.
+            if event.kind != user_abi::WIN_CLOSE {
+                return false;
+            }
+            view.events.pop_front();
+        }
+        // Отказ аллокатора — это потерянное событие, а не остановка системы:
+        // очередь окна не то место, ради которого стоит гасить машину.
+        if view.events.try_reserve(1).is_err() {
+            return false;
+        }
+        view.events.push_back(event);
+        true
+    }
+
+    /// Забрать самое старое событие. `None` — очередь пуста.
+    pub fn pop_event(&mut self) -> Option<WinEvent> {
+        let Content::Program(view) = &mut self.content else {
+            return None;
+        };
+        view.events.pop_front()
+    }
+}
+
+/// Скопировать заголовок в собственную строку.
+///
+/// `None` — не хватило памяти. `to_string` здесь не годится ровно поэтому: он
+/// уводит отказ аллокатора в `handle_alloc_error`, то есть останавливает
+/// систему из-за заголовка окна.
+fn own(text: &str) -> Option<String> {
+    let mut owned = String::new();
+    owned.try_reserve_exact(text.len()).ok()?;
+    owned.push_str(text);
+    Some(owned)
 }
 
 /// Область поверхности под содержимое: всё, что ниже полосы заголовка.

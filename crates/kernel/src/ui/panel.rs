@@ -161,8 +161,11 @@ impl Metrics {
     }
 
     /// Ширина кнопки окна с полной подписью.
-    fn button_width(self, app: App, state: ButtonState) -> u32 {
-        self.side * 2 + self.dot() + self.gap + self.ctx.face(state.role()).width(app.caption())
+    ///
+    /// Подпись приходит строкой, а не выводится из [`App`]: у окна программы
+    /// имя своё, и спросить его у перечисления нечем.
+    fn button_width(self, caption: &str, state: ButtonState) -> u32 {
+        self.side * 2 + self.dot() + self.gap + self.ctx.face(state.role()).width(caption)
     }
 
     /// Сторона плитки в шапке меню.
@@ -361,7 +364,7 @@ impl Panel {
     /// высотой, и вычисление изменившегося куска стоило бы дороже перерисовки.
     /// Она же перекрашивает панель после смены темы — отдельного пути для этого
     /// нет и не нужно.
-    pub fn redraw(&mut self, windows: &[(App, bool, bool)], menu_open: bool, status: &Status) {
+    pub fn redraw(&mut self, windows: &[Entry], menu_open: bool, status: &Status) {
         let ctx = desk_ctx(self.scale);
         let m = Metrics::new(ctx);
         let p = ctx.palette;
@@ -437,9 +440,9 @@ impl Panel {
             p.line2.alpha,
         );
 
-        for ((app, focused, minimized), (_, rect)) in windows.iter().zip(self.buttons.iter()) {
+        for (entry, (_, rect)) in windows.iter().zip(self.buttons.iter()) {
             let rect = *rect;
-            let state = ButtonState::of(*focused, *minimized);
+            let state = ButtonState::of(entry.focused, entry.minimized);
             if state == ButtonState::Active {
                 draw::rounded(&mut self.surface, rect, m.round_row, p.ghost.color, p.ghost.alpha);
                 draw::rounded_stroke(
@@ -470,7 +473,7 @@ impl Panel {
                 rect.x + (m.side + dot + m.gap) as i32,
                 paint::baseline(ctx, role, rect),
                 rect.w.saturating_sub(m.side * 2 + dot + m.gap),
-                app.caption(),
+                &entry.caption,
                 state.ink(p),
             );
         }
@@ -518,12 +521,7 @@ struct PanelLayout {
     buttons: Buttons,
 }
 
-fn panel_layout(
-    m: Metrics,
-    plate: Rect,
-    windows: &[(App, bool, bool)],
-    status_w: u32,
-) -> PanelLayout {
+fn panel_layout(m: Metrics, plate: Rect, windows: &[Entry], status_w: u32) -> PanelLayout {
     let pad = m.plate_pad();
     let y = plate.y + pad as i32;
     let brand = Rect::new(plate.x + pad as i32, y, m.brand_width(), m.btn_h);
@@ -547,13 +545,14 @@ fn panel_layout(
     // подписи. Всё, что короче, — не сокращённая кнопка, а мусор в строке.
     let least = m.side * 2 + m.dot() + m.gap + m.ctx.px(24);
     let mut buttons = Buttons::new();
-    for (app, focused, minimized) in windows {
+    for entry in windows {
         let room = (limit - x).max(0) as u32;
         if room < least {
             break;
         }
-        let width = m.button_width(*app, ButtonState::of(*focused, *minimized)).min(room);
-        buttons.push((*app, Rect::new(x, y, width, m.btn_h)));
+        let state = ButtonState::of(entry.focused, entry.minimized);
+        let width = m.button_width(&entry.caption, state).min(room);
+        buttons.push((entry.app, Rect::new(x, y, width, m.btn_h)));
         x += (width + m.gap) as i32;
     }
 
@@ -1175,8 +1174,23 @@ fn uptime_text(ms: u64) -> String {
     )
 }
 
-/// Список окон для панели: программа, «активно» и «свёрнуто».
-pub type Windows = Vec<(App, bool, bool)>;
+/// Одно окно в глазах панели задач.
+///
+/// Структура, а не кортеж, и это перемена фазы 47a: подпись перестала
+/// выводиться из [`App`] — у окна программы имя своё, — а кортеж из четырёх
+/// полей на месте применения читается загадкой.
+pub struct Entry {
+    pub app: App,
+    /// Как окно называется. Собственная строка, а не ссылка на окно: список
+    /// переживает выход стола из-под замка, а окно за это время может
+    /// закрыться.
+    pub caption: String,
+    pub focused: bool,
+    pub minimized: bool,
+}
+
+/// Список окон для панели.
+pub type Windows = Vec<Entry>;
 
 /// Кнопки панели вместе с их местом.
 type Buttons = Vec<(App, Rect)>;

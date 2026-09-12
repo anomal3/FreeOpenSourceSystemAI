@@ -230,6 +230,20 @@ impl Compositor {
             .map(|window| window.rect)
     }
 
+    /// Как называется окно этой программы.
+    ///
+    /// Нужно журналу: у окна программы имя своё, и [`App::title`] о нём не
+    /// знает. Строка собственная, а не заимствованная, по той же причине, что и
+    /// в [`Compositor::buttons`], — стол выходит из-под замка, окно может
+    /// закрыться.
+    #[must_use]
+    pub fn caption_of(&self, app: App) -> Option<alloc::string::String> {
+        self.windows
+            .iter()
+            .find(|window| window.app == app)
+            .map(|window| window.caption().into())
+    }
+
     /// Какая программа живёт в окне с этим номером.
     #[must_use]
     pub fn app_at(&self, index: usize) -> Option<App> {
@@ -257,7 +271,12 @@ impl Compositor {
         self.windows
             .iter()
             .enumerate()
-            .map(|(index, window)| (window.app, index == self.focus, window.minimized))
+            .map(|(index, window)| super::panel::Entry {
+                app: window.app,
+                caption: window.caption().into(),
+                focused: index == self.focus,
+                minimized: window.minimized,
+            })
             .collect()
     }
 

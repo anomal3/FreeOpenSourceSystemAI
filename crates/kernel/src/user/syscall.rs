@@ -46,6 +46,10 @@ use user_abi::{
     POLL_OUT, PollFd, SYS_CLOCK, SYS_DUP, SYS_FSTAT, SYS_ISATTY, SYS_NANOSLEEP, SYS_POLL,
     SYS_TIMES, Timespec, Times,
 };
+use mini_ui::Rect;
+use user_abi::{
+    MAX_TITLE, SYS_WINCLOSE, SYS_WINCOMMIT, SYS_WINEVENT, SYS_WINOPEN, WinEvent, WindowSpec,
+};
 use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
@@ -165,6 +169,11 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_NANOSLEEP => nanosleep(a0 as u64, a1 as u64),
         SYS_POLL => poll(a0, a1, a2 as i64),
         SYS_TIMES => times(a0),
+        // Фаза 47a: окно у программы.
+        SYS_WINOPEN => winopen(a0),
+        SYS_WINCOMMIT => wincommit(a0 as i64, a1, a2),
+        SYS_WINEVENT => winevent(a0 as i64, a1),
+        SYS_WINCLOSE => winclose(a0 as i64),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1352,6 +1361,139 @@ fn times(out: usize) -> i64 {
     // SAFETY: адрес проверен на выравнивание и на запись.
     unsafe { core::ptr::write(out as *mut Times, value) };
     0
+}
+
+/// Окно, которым программа вправе распоряжаться, — только её собственное.
+///
+/// Номер окна и есть номер задачи, и назвать чужой программа не может: свой она
+/// узнала из [`WindowSpec`], а чужого ей не даёт ни один вызов. Проверка всё
+/// равно стоит здесь: договор обязан отвечать отказом на бессмыслицу, а не
+/// трогать чужое окно, если номер однажды окажется угадываемым.
+fn own_window(id: i64) -> Result<(), i64> {
+    if id != i64::from(sched::current().as_u32()) {
+        return Err(user_abi::ERR_NOT_FOUND);
+    }
+    Ok(())
+}
+
+/// Чем ответить программе, которой не дали окна.
+fn window_errno(err: super::WindowError) -> i64 {
+    use crate::ui::WindowError as Desk;
+    match err {
+        super::WindowError::BadSize => ERR_LIMIT,
+        super::WindowError::NoProgram => ERR_NO_PROGRAM,
+        super::WindowError::Memory(err) => mmap_errno(err),
+        // «Стол сейчас занят» — единственный отказ, после которого стоит
+        // попробовать ещё раз, и отвечает он тем же кодом, что и всюду в
+        // договоре, где ответ временный.
+        super::WindowError::Desktop(Desk::Busy) => user_abi::ERR_AGAIN,
+        super::WindowError::Desktop(Desk::NoDesktop) => ERR_UNSUPPORTED,
+        super::WindowError::Desktop(Desk::Exists) => user_abi::ERR_EXISTS,
+        super::WindowError::Desktop(Desk::NoWindow) => user_abi::ERR_NOT_FOUND,
+        super::WindowError::Desktop(Desk::NoMemory) => user_abi::ERR_NO_SPACE,
+    }
+}
+
+/// `winopen(ptr на WindowSpec) -> 0`.
+///
+/// Структура и читается, и пишется: программа называет размер и заголовок, ядро
+/// дописывает адрес поверхности и номер окна. Поэтому проверка прав — на
+/// запись, а не на чтение: страница, доступная только на чтение, сделала бы
+/// ответ невозможным уже после того, как окно заведено.
+fn winopen(ptr: usize) -> i64 {
+    if ptr % align_of::<WindowSpec>() != 0 {
+        return ERR_BAD_ADDRESS;
+    }
+    if !space::user_can(ptr, size_of::<WindowSpec>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: адрес проверен на выравнивание и на то, что структура целиком
+    // лежит в страницах программы, доступных ей на запись.
+    let mut spec = unsafe { core::ptr::read(ptr as *const WindowSpec) };
+
+    let len = spec.title_len as usize;
+    // Длиннее предела — отказ, а не обрезка: окно с урезанным именем человек
+    // ищет по имени, которого у него нет. Так сказано и в договоре.
+    if len == 0 || len > MAX_TITLE {
+        return ERR_LIMIT;
+    }
+    let title_ptr = spec.title as usize;
+    if !space::user_can(title_ptr, len, PageFlags::READ) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: диапазон проверен по таблицам программы; строка только читается,
+    // и ссылка на неё не переживает этот вызов.
+    let bytes = unsafe { core::slice::from_raw_parts(title_ptr as *const u8, len) };
+    let Ok(title) = core::str::from_utf8(bytes) else {
+        return ERR_BAD_ADDRESS;
+    };
+
+    match super::open_window(title, spec.width, spec.height) {
+        Ok(surface) => {
+            spec.surface = surface as u64;
+            spec.id = i64::from(sched::current().as_u32());
+            // SAFETY: тот же адрес, проверенный на запись выше.
+            unsafe { core::ptr::write(ptr as *mut WindowSpec, spec) };
+            0
+        }
+        Err(err) => window_errno(err),
+    }
+}
+
+/// `wincommit(id, (x << 32) | y, (w << 32) | h) -> 0`.
+fn wincommit(id: i64, point: usize, size: usize) -> i64 {
+    if let Err(err) = own_window(id) {
+        return err;
+    }
+    let (x, y) = ((point >> 32) as u32, (point & 0xffff_ffff) as u32);
+    let (w, h) = ((size >> 32) as u32, (size & 0xffff_ffff) as u32);
+    // Нулевая сторона означает «всё окно целиком» — так сказано в договоре.
+    let area = if w == 0 || h == 0 {
+        None
+    } else {
+        if x > i32::MAX as u32 || y > i32::MAX as u32 {
+            return ERR_BAD_ADDRESS;
+        }
+        Some(Rect::new(x as i32, y as i32, w, h))
+    };
+    match super::commit_window(area) {
+        Ok(()) => 0,
+        Err(err) => window_errno(err),
+    }
+}
+
+/// `winevent(id, ptr на WinEvent) -> 1 | 0`.
+///
+/// Не ждёт: единица — событие записано, ноль — очередь пуста. Программа, которой
+/// нечем заняться, спит сама и решает сама, сколько, — тот же довод, что у
+/// [`user_abi::SYS_RECV`].
+fn winevent(id: i64, out: usize) -> i64 {
+    if let Err(err) = own_window(id) {
+        return err;
+    }
+    if out % align_of::<WinEvent>() != 0 {
+        return ERR_BAD_ADDRESS;
+    }
+    if !space::user_can(out, size_of::<WinEvent>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    let Some(event) = super::window_event() else {
+        return 0;
+    };
+    // SAFETY: адрес проверен на выравнивание и на запись.
+    unsafe { core::ptr::write(out as *mut WinEvent, event) };
+    1
+}
+
+/// `winclose(id) -> 0`.
+fn winclose(id: i64) -> i64 {
+    if let Err(err) = own_window(id) {
+        return err;
+    }
+    match super::close_window() {
+        Ok(()) => 0,
+        Err(err) => window_errno(err),
+    }
 }
 
 /// `poll(ptr, сколько, срок) -> сколько готовых`.

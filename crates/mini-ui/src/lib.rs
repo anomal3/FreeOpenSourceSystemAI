@@ -244,11 +244,40 @@ impl Rect {
 /// Поверхность в обычной памяти: то, во что рисуют окна и экраны установщика.
 ///
 /// Пиксели хранятся уже упакованными под формат машины — см. заголовок модуля.
+/// Где лежат пиксели поверхности.
+///
+/// Появилось в фазе 47a, и вот зачем. Окно программы рисует сама программа, то
+/// есть пиксели обязаны лежать в страницах, отображённых в её адресное
+/// пространство, — а такие страницы заводит ядро и адресует сырым указателем.
+/// Куча для них не годится: она не выровнена по странице и не лежит на кадрах,
+/// которые можно кому-то отобразить.
+///
+/// Перечисление приватное, и это главное его свойство: снаружи [`Surface`]
+/// осталась ровно той же — те же методы, те же подписи, — поэтому ни один из
+/// десяти её потребителей в ядре и ни один в установщике не заметил перемены.
+enum Pixels {
+    /// Своя память. Так живут все поверхности, кроме окон программ.
+    Owned(Vec<u32>),
+    /// Чужая память: кадры, которые завёл и которыми владеет кто-то другой.
+    ///
+    /// Поверхность здесь — только окно наружу, и освобождать эту память при
+    /// разрушении она не имеет права: у кадров есть владелец, и он один знает,
+    /// когда их вернуть.
+    Borrowed { base: *mut u32, len: usize },
+}
+
 pub struct Surface {
-    pixels: Vec<u32>,
+    pixels: Pixels,
     width: u32,
     height: u32,
 }
+
+// SAFETY: единственное, что мешает вывести `Send` автоматически, — сырой
+// указатель в [`Pixels::Borrowed`]. Он адресует кадры, выданные аллокатором
+// ядра под одну эту поверхность; ни на какой поток они не завязаны, а владелец
+// у них ровно один — тот, кто их завёл. Ровно тем же рассуждением и по той же
+// причине `Send` объявлен у [`Screen`].
+unsafe impl Send for Surface {}
 
 impl Surface {
     /// Поверхность без единой точки.
@@ -258,7 +287,51 @@ impl Surface {
     /// остальные слои. Место, откуда его вынули, обязано чем-то быть заполнено,
     /// и пустая поверхность дешевле `Option`, который пришлось бы разворачивать
     /// на каждом обращении.
-    pub const EMPTY: Self = Self { pixels: Vec::new(), width: 0, height: 0 };
+    pub const EMPTY: Self = Self { pixels: Pixels::Owned(Vec::new()), width: 0, height: 0 };
+
+    /// Поверхность поверх чужой памяти.
+    ///
+    /// Заведена ради окна программы: пиксели лежат в кадрах, которые ядро
+    /// отобразило программе, и рисует в них она сама.
+    ///
+    /// # Safety
+    ///
+    /// `base` обязан адресовать не меньше `width * height` пикселей по четыре
+    /// байта, быть выровненным под `u32` и оставаться живым **дольше**, чем эта
+    /// поверхность. Освобождать эту память поверхность не будет: у неё есть
+    /// владелец, и разрушение здесь ничего не возвращает в пул.
+    #[must_use]
+    pub unsafe fn from_raw(base: *mut u32, width: u32, height: u32) -> Option<Self> {
+        if width == 0 || height == 0 || base.is_null() {
+            return None;
+        }
+        let len = (width as usize).checked_mul(height as usize)?;
+        Some(Self { pixels: Pixels::Borrowed { base, len }, width, height })
+    }
+
+    /// Пиксели на чтение.
+    fn as_slice(&self) -> &[u32] {
+        match &self.pixels {
+            Pixels::Owned(pixels) => pixels,
+            // SAFETY: условие [`Surface::from_raw`] — указатель адресует `len`
+            // пикселей и жив дольше поверхности.
+            Pixels::Borrowed { base, len } => unsafe {
+                core::slice::from_raw_parts(*base as *const u32, *len)
+            },
+        }
+    }
+
+    /// Пиксели на запись.
+    fn as_mut_slice(&mut self) -> &mut [u32] {
+        match &mut self.pixels {
+            Pixels::Owned(pixels) => pixels,
+            // SAFETY: то же условие; изменяемая ссылка на саму поверхность
+            // здесь одна, значит и на её пиксели тоже.
+            Pixels::Borrowed { base, len } => unsafe {
+                core::slice::from_raw_parts_mut(*base, *len)
+            },
+        }
+    }
 
     /// Создать поверхность, залитую цветом.
     ///
@@ -277,7 +350,7 @@ impl Surface {
         // ошибкой, а не уйти в `handle_alloc_error` и остановить систему.
         pixels.try_reserve_exact(len).ok()?;
         pixels.resize(len, fill.pixel());
-        Some(Self { pixels, width, height })
+        Some(Self { pixels: Pixels::Owned(pixels), width, height })
     }
 
     #[must_use]
@@ -300,7 +373,8 @@ impl Surface {
     #[must_use]
     pub fn row(&self, y: u32) -> &[u32] {
         let start = (y as usize) * (self.width as usize);
-        &self.pixels[start..start + self.width as usize]
+        let width = self.width as usize;
+        &self.as_slice()[start..start + width]
     }
 
     /// Прочитать пиксель. За пределами поверхности — ноль.
@@ -313,7 +387,8 @@ impl Surface {
         if x >= self.width || y >= self.height {
             return 0;
         }
-        self.pixels[(y as usize) * (self.width as usize) + (x as usize)]
+        let at = (y as usize) * (self.width as usize) + (x as usize);
+        self.as_slice()[at]
     }
 
     /// Одна строка пикселей на запись.
@@ -331,7 +406,8 @@ impl Surface {
             return &mut [];
         }
         let start = (y as usize) * (self.width as usize);
-        &mut self.pixels[start..start + self.width as usize]
+        let width = self.width as usize;
+        &mut self.as_mut_slice()[start..start + width]
     }
 
     /// Вывести часть другой поверхности в эту.
@@ -358,7 +434,8 @@ impl Surface {
             let from = (src.x as u32 + skip_x) as usize;
             let slice = &line[from..from + visible.w as usize];
             let start = ((visible.y as u32 + row) as usize) * stride + visible.x as usize;
-            self.pixels[start..start + slice.len()].copy_from_slice(slice);
+            let len = slice.len();
+            self.as_mut_slice()[start..start + len].copy_from_slice(slice);
         }
     }
 
@@ -394,7 +471,8 @@ impl Surface {
         if x >= self.width || y >= self.height {
             return;
         }
-        self.pixels[(y as usize) * (self.width as usize) + (x as usize)] = pixel;
+        let at = (y as usize) * (self.width as usize) + (x as usize);
+        self.as_mut_slice()[at] = pixel;
     }
 
     /// Залить прямоугольник.
@@ -404,9 +482,11 @@ impl Surface {
             return;
         }
         let pixel = color.pixel();
+        let width = self.width as usize;
         for y in rect.y..rect.bottom() {
-            let start = (y as usize) * (self.width as usize) + rect.x as usize;
-            self.pixels[start..start + rect.w as usize].fill(pixel);
+            let start = (y as usize) * width + rect.x as usize;
+            let w = rect.w as usize;
+            self.as_mut_slice()[start..start + w].fill(pixel);
         }
     }
 
@@ -444,8 +524,8 @@ impl Surface {
             let dst = ((rect.y as u32 + y) as usize) * stride + x;
             let src = ((rect.y as u32 + y + lines) as usize) * stride + x;
             // `copy_within` на всём буфере, а не построчная копия срезов: две
-            // непересекающиеся строки одного `Vec` иначе не одолжить.
-            self.pixels.copy_within(src..src + w, dst);
+            // непересекающиеся строки одного среза иначе не одолжить.
+            self.as_mut_slice().copy_within(src..src + w, dst);
         }
         let cleared = Rect::new(rect.x, rect.bottom() - lines as i32, rect.w, lines);
         self.fill(cleared, fill);

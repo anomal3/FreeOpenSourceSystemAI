@@ -52,7 +52,8 @@ pub mod window;
 use alloc::string::String;
 use core::fmt::Write as _;
 
-use mini_ui::{Rect, Screen};
+use mini_ui::{Rect, Screen, Surface};
+use user_abi::{WIN_CLOSE, WIN_KEY, WIN_POINTER, WinEvent};
 
 use crate::input::{Buttons, KeyCode, KeyEvent, Modifiers, PointerEvent};
 use crate::sync::SpinLock;
@@ -134,8 +135,8 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
         desktop.scale(),
         desktop.screen_height() as i32 - desktop.work_bottom(),
     );
-    for (app, focused, _) in desktop.buttons() {
-        log_window(&desktop, app, focused);
+    for entry in desktop.buttons() {
+        log_window(&desktop, entry.app, entry.focused);
     }
     log_icons(&desktop);
     // Сколько программ нашлось в `/bin` — единственное, чем список меню видно
@@ -295,6 +296,20 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
                 h,
             )
         }
+        // Окно программы сюда не приходит: его прямоугольник считается от
+        // поверхности, которую заказала сама программа ([`open_window`]), а не
+        // от размера экрана. Ветка стоит ради полноты разбора, и ответ у неё
+        // осмысленный, а не нулевой, — на случай, если однажды придёт.
+        App::Program(_) => {
+            let w = (width / 2).max(320);
+            let h = (work / 2).max(200);
+            Rect::new(
+                ((width.saturating_sub(w)) / 2) as i32,
+                ((work.saturating_sub(h)) / 2) as i32,
+                w,
+                h,
+            )
+        }
     }
 }
 
@@ -319,6 +334,11 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
             window.write_str(&confirm_text(app));
             Some(window)
         }
+        // Окно программы строится не здесь, и построить его столу нечем: ему
+        // нужны кадры, которые выдаёт [`crate::user`]. Сюда приходят с меню и с
+        // панели задач, а там окно программы к этому времени уже существует —
+        // кнопка на панели без окна не рисуется.
+        App::Program(_) => None,
         other => Window::text(other, rect, scale),
     }
 }
@@ -542,7 +562,15 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
             return None;
         }
         KeyCode::W if event.mods.contains(Modifiers::CTRL) => {
-            if let Some(closed) = desktop.close_focused() {
+            // Окно программы закрывает сама программа, и Ctrl+W для неё —
+            // такая же просьба, как крестик. Иначе сочетание отнимало бы у неё
+            // и окно, и возможность спросить «сохранить?».
+            let focused = desktop.focused_app();
+            if focused.is_some_and(|app| request_close(desktop, app)) {
+                if let Some(app) = focused {
+                    kprintln!("  desktop     : close requested of '{}'", app.title());
+                }
+            } else if let Some(closed) = desktop.close_focused() {
                 kprintln!("  desktop     : closed '{}'", closed.title());
             }
             log_focus(desktop);
@@ -787,7 +815,9 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
         match hit {
             Hit::Close => {
                 if let Some(app) = app {
-                    if desktop.close(app) {
+                    if request_close(desktop, app) {
+                        kprintln!("  desktop     : close requested of '{}'", app.title());
+                    } else if desktop.close(app) {
                         kprintln!("  desktop     : closed '{}'", app.title());
                     }
                     log_focus(desktop);
@@ -827,7 +857,29 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             // Щелчок по содержимому: его разбирает само содержимое — в
             // «Параметрах» им выбирают раздел и нажимают пункты.
             Hit::Body => {
+                let scale = desktop.scale();
                 let changed = match desktop.focused_mut() {
+                    // Окно программы получает щелчок событием, а не
+                    // перерисовкой: что нарисовать в ответ, решает она.
+                    Some(window) if window.is_program() => {
+                        // Координаты переводятся в систему поверхности: окно
+                        // двигают по столу, и программа, считающая в экранных,
+                        // промахивалась бы мимо собственных кнопок всякий раз,
+                        // когда окно сдвинули.
+                        let local = (
+                            x - window.rect.x,
+                            y - window.rect.y - Window::title_height(scale) as i32,
+                        );
+                        // Единица — левая кнопка, и других здесь не бывает:
+                        // правая открывает меню стола и до окна не доходит.
+                        window.push_event(WinEvent {
+                            kind: WIN_POINTER,
+                            code: 1,
+                            x: local.0,
+                            y: local.1,
+                        });
+                        false
+                    }
                     Some(window) => {
                         window.handle_click(x, y);
                         window.took_theme_change()
@@ -901,6 +953,21 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
         // равно уходит ей: иначе система осталась бы без единственного места,
         // где можно набрать команду.
         Some(App::Terminal) | None => Some(event),
+        // Окно программы получает символ, а не код клавиши, и только нажатия.
+        // Клавиша без символа — стрелки, F-ряд — события не даёт вовсе: класть
+        // им ноль значило бы сделать их все одной клавишей (см. договор
+        // [`WinEvent::code`]).
+        Some(app @ App::Program(_)) => {
+            if event.pressed {
+                if let Some(symbol) = event.to_char() {
+                    let key = WinEvent { kind: WIN_KEY, code: symbol as u32, x: 0, y: 0 };
+                    if let Some(window) = desktop.find(app) {
+                        window.push_event(key);
+                    }
+                }
+            }
+            None
+        }
         Some(_) => {
             if event.pressed {
                 let handled = desktop
@@ -1248,6 +1315,139 @@ fn log_focus(desktop: &Compositor) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Окна пользовательских программ (фаза 47a)
+// ---------------------------------------------------------------------------
+
+/// Почему окно программе не досталось.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowError {
+    /// Графики на машине нет вовсе — окну негде быть.
+    NoDesktop,
+    /// Стол занят сборкой кадра. Ответ временный: стоит попробовать ещё раз.
+    ///
+    /// Отдельно от [`WindowError::NoDesktop`] намеренно: «окна не будет
+    /// никогда» и «окна нет сию секунду» — разные ответы, и программа,
+    /// получившая на второй первый, зря закончила бы работу.
+    Busy,
+    /// У этой задачи окно уже есть. Окно у программы одно — см. [`App::Program`].
+    Exists,
+    /// Окна с таким номером нет.
+    NoWindow,
+    /// Не хватило памяти под поверхность окна.
+    NoMemory,
+}
+
+/// Чем ответить, когда стол не дался.
+fn unavailable() -> WindowError {
+    if graphics() { WindowError::Busy } else { WindowError::NoDesktop }
+}
+
+/// Попросить окно программы закрыться. `true` — просьба ушла в очередь.
+///
+/// `false` означает «это не окно программы», а не «не получилось»: обычное окно
+/// закрывают на месте, спрашивать там некого.
+fn request_close(desktop: &mut Compositor, app: App) -> bool {
+    if !matches!(app, App::Program(_)) {
+        return false;
+    }
+    let Some(window) = desktop.find(app) else {
+        return false;
+    };
+    window.push_event(WinEvent { kind: WIN_CLOSE, code: 0, x: 0, y: 0 });
+    true
+}
+
+/// Завести окно задаче `task` поверх её поверхности.
+///
+/// Пиксели принадлежат не окну: [`Surface`] здесь заимствованная, построенная
+/// поверх кадров, которые выдал и которыми владеет [`crate::user`]. Окно живёт
+/// ровно столько же, сколько они, и снимает их тот же путь, что снимает окно.
+pub fn open_window(task: u32, title: &str, pixels: Surface) -> Result<(), WindowError> {
+    let app = App::Program(task);
+    let (w, h) = (pixels.width(), pixels.height());
+    with_desktop(|desktop| {
+        if desktop.index_of(app).is_some() {
+            return Err(WindowError::Exists);
+        }
+        let scale = desktop.scale();
+        // Окно выше поверхности на полосу заголовка: программа просит место
+        // **под содержимое**, а полосу рисует ядро. Считать иначе значило бы
+        // отдавать ей окно, в котором её же рисунок наполовину под заголовком.
+        let full_h = h.saturating_add(Window::title_height(scale));
+        let screen = desktop.screen_width();
+        let work = desktop.work_bottom().max(1) as u32;
+        let rect = Rect::new(
+            ((screen.saturating_sub(w)) / 2) as i32,
+            ((work.saturating_sub(full_h)) / 2) as i32,
+            w,
+            full_h,
+        );
+        let window =
+            Window::program(app, rect, scale, title, pixels).ok_or(WindowError::NoMemory)?;
+        desktop.push(window);
+        kprintln!(
+            "  desktop     : opened '{title}' for {}",
+            crate::sched::TaskId::new(task)
+        );
+        log_window(desktop, app, true);
+        desktop.refresh_panel(&status_now());
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Показать на экране то, что программа нарисовала в своей поверхности.
+///
+/// `area` — в координатах поверхности, `None` — «всё окно». Вылезающее за её
+/// край обрезается, а не отвергается: программа считает в своих координатах и о
+/// полосе заголовка не знает ничего.
+pub fn commit_window(task: u32, area: Option<Rect>) -> Result<(), WindowError> {
+    let app = App::Program(task);
+    with_desktop(|desktop| {
+        let Some(window) = desktop.find(app) else {
+            return Err(WindowError::NoWindow);
+        };
+        window.commit(area);
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Забрать у окна самое старое событие.
+///
+/// `None` — событий нет **или** стол сейчас занят. Разница здесь неважна и
+/// потому не возвращается: событие в очереди никуда не денется, а программа
+/// спросит снова — она и так спрашивает в цикле.
+pub fn next_window_event(task: u32) -> Option<WinEvent> {
+    with_desktop(|desktop| desktop.find(App::Program(task))?.pop_event()).flatten()
+}
+
+/// Убрать окно задачи со стола.
+///
+/// Пиксели после этого никто не читает — и только поэтому кадры под ними можно
+/// возвращать в пул. Порядок обязателен: сначала окно уходит со стола, потом
+/// освобождается память, а не наоборот.
+pub fn close_window(task: u32) -> Result<(), WindowError> {
+    let app = App::Program(task);
+    with_desktop(|desktop| {
+        if !desktop.close(app) {
+            return Err(WindowError::NoWindow);
+        }
+        kprintln!(
+            "  desktop     : closed the window of {}",
+            crate::sched::TaskId::new(task)
+        );
+        log_focus(desktop);
+        desktop.refresh_panel(&status_now());
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
 /// Записать в журнал, где стоит окно.
 ///
 /// Координаты нужны не человеку: по ним автоматический прогон наводит мышь.
@@ -1258,9 +1458,15 @@ fn log_window(desktop: &Compositor, app: App, focused: bool) {
     let Some(rect) = desktop.rect_of(app) else {
         return;
     };
+    // У окна программы имя своё, и в журнал едет именно оно: [`App::title`]
+    // знает только родовое слово «Program», а стенд наводит мышь по имени.
+    let own = match app {
+        App::Program(_) => desktop.caption_of(app),
+        _ => None,
+    };
     kprintln!(
         "  window      : '{}' at {},{} {}x{}{}",
-        app.title(),
+        own.as_deref().unwrap_or(app.title()),
         rect.x,
         rect.y,
         rect.w,

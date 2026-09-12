@@ -253,6 +253,20 @@ enum Source {
     Anonymous,
     /// Файлом: страницы подкачиваются по обращению (фаза 41).
     File(FileBacking),
+    /// Поверхностью окна: подряд идущие кадры, выданные под пиксели (фаза 47a).
+    ///
+    /// Внутри — физический адрес первого кадра, потому что вернуть их можно
+    /// только всем куском сразу: выданы они [`allocate_contiguous`], и ядро
+    /// читает их одним срезом через прямое отображение.
+    ///
+    /// Главное отличие от остальных двух — **владелец**. Кадры под поверхностью
+    /// принадлежат окну, а не программе, и поэтому область живёт по особым
+    /// правилам: `munmap` на неё отвечает отказом, а разбор пространства обязан
+    /// пройти мимо неё — иначе первая же снятая программа оставит композитору
+    /// ссылку на кадры, уже отданные в пул.
+    ///
+    /// [`allocate_contiguous`]: crate::mm::frame::BitmapFrameAllocator::allocate_contiguous
+    Surface(PhysAddr),
 }
 
 /// Файл, стоящий за областью, и всё, что нужно знать о её страницах.
@@ -523,6 +537,109 @@ impl Program {
         Ok(base)
     }
 
+    /// Отвести место под поверхность окна и отобразить в неё свежие кадры.
+    ///
+    /// Возвращает адрес поверхности в памяти программы и физический адрес
+    /// первого кадра. Кадры берутся **подряд**: ядро читает поверхность одним
+    /// срезом через прямое отображение, как обычный массив пикселей, а не по
+    /// странице за раз.
+    ///
+    /// Область записывается в ту же таблицу, что и `mmap`, и это не небрежность,
+    /// а два нужных следствия разом: [`Program::find_gap`] обойдёт её, выдавая
+    /// адрес следующему `mmap`, а [`Program::munmap`] найдёт её и откажет —
+    /// ровно то, что обещает договор.
+    fn attach_surface(&mut self, pages: usize) -> Result<(usize, PhysAddr), MmapError> {
+        if self.mappings.len() == MAX_MAPPINGS {
+            return Err(MmapError::Limit);
+        }
+        let Some(bytes) = pages.checked_mul(PAGE_SIZE) else {
+            return Err(MmapError::BadRequest);
+        };
+        let base = self.find_gap(bytes, PAGE_SIZE).ok_or(MmapError::Limit)?;
+
+        // Запас пула соблюдается и здесь, наравне с обычной выдачей: окно — это
+        // мегабайты, и программа, попросившая окно размером с экран, не должна
+        // оставлять систему без кадров, которыми ей же об этом сообщат.
+        let phys = crate::mm::frame::with(|frames| {
+            if frames.stats().free <= RESERVE_FRAMES + pages {
+                return None;
+            }
+            frames.allocate_contiguous(pages)
+        })
+        .flatten()
+        .ok_or(MmapError::NoMemory)?;
+
+        // SAFETY: кадры только что выданы пулом подряд и живы, пока живо окно;
+        // адрес подобран `find_gap`, то есть свободен и лежит в окне программы.
+        let mapped = unsafe {
+            self.space.map_frames(
+                VirtAddr::new(base),
+                phys,
+                pages,
+                PageFlags::READ | PageFlags::WRITE | PageFlags::USER,
+            )
+        };
+        if mapped.is_err() {
+            crate::mm::frame::with(|pool| {
+                // SAFETY: кадры выданы этим же пулом, отображение не состоялось,
+                // и держать их больше некому.
+                unsafe { pool.free_contiguous(phys, pages) };
+            });
+            return Err(MmapError::NoMemory);
+        }
+
+        self.remember(Mapping { base, pages, blocks: 0, source: Source::Surface(phys) });
+        Ok((base, phys))
+    }
+
+    /// Снять поверхность окна: убрать отображение и вернуть кадры в пул.
+    ///
+    /// Возвращает число возвращённых кадров или `None`, если поверхности не
+    /// было. Порядок обеспечивает вызывающий: к этому моменту окно обязано быть
+    /// уже снято со стола, иначе композитор читал бы пиксели из кадров, только
+    /// что отданных другому.
+    /// Есть ли у программы поверхность окна.
+    ///
+    /// Дешёвый вопрос, на который отвечает сама программа, и задают его **до**
+    /// того, как пойдут к столу. Порядок здесь не стилистический: программ без
+    /// окна подавляющее большинство, и спрашивать о них стол значило бы лезть
+    /// на каждом выходе `ls` под замок, который держит сборка кадра.
+    fn has_surface(&self) -> bool {
+        self.mappings
+            .iter()
+            .any(|region| matches!(region.source, Source::Surface(_)))
+    }
+
+    fn detach_surface(&mut self) -> Option<usize> {
+        let index = self
+            .mappings
+            .iter()
+            .position(|region| matches!(region.source, Source::Surface(_)))?;
+        let region = self.mappings.remove(index);
+        let Source::Surface(phys) = region.source else {
+            unreachable!("область только что опознана поверхностью");
+        };
+
+        // SAFETY: область принадлежит этой программе и отображена
+        // `map_frames`. Кадры здесь в пул **не** уезжают — в этом всё отличие
+        // от `unmap_range`; их вернёт строка ниже, одним куском и ровно раз.
+        let removed =
+            unsafe { self.space.unmap_range_keep(VirtAddr::new(region.base), region.pages) };
+        if removed != region.pages {
+            kprintln!(
+                "  user        : WARNING: the window surface gave back {removed} pages of {}",
+                region.pages
+            );
+        }
+        crate::mm::frame::with(|pool| {
+            // SAFETY: кадры выданы `allocate_contiguous` этого же пула, сняты с
+            // отображения строкой выше, и смотреть на них больше некому: окно
+            // ушло со стола раньше, чем сюда пришли.
+            unsafe { pool.free_contiguous(phys, region.pages) };
+        });
+        Some(region.pages)
+    }
+
     /// Вернуть системе область, выданную [`Program::mmap`] или
     /// [`Program::mmap_file`].
     ///
@@ -543,6 +660,15 @@ impl Program {
             .position(|region| region.base == addr && region.pages == pages)
             .ok_or(MmapError::BadRequest)?;
 
+        // Поверхность окна этим вызовом не снимается, и сказано это не здесь, а
+        // в договоре ([`user_abi::SYS_WINOPEN`]): кадры под ней принадлежат
+        // окну. `unmap_range` ниже вернул бы их в пул, следующая выдача отдала
+        // бы их второму владельцу — и композитор продолжал бы рисовать из чужой
+        // памяти. Вернуть поверхность можно только вместе с окном.
+        if matches!(self.mappings[index].source, Source::Surface(_)) {
+            return Err(MmapError::BadRequest);
+        }
+
         // SAFETY: область выдана этой же программе и записана в её таблице, то
         // есть кадры под ней принадлежат ей одной.
         let freed = unsafe { self.space.unmap_range(VirtAddr::new(addr), pages) };
@@ -560,6 +686,10 @@ impl Program {
             // отображена, — и именно поэтому оно ничего не скрывает.
             Source::Anonymous => region.pages,
             Source::File(file) => file.resident.len(),
+            // Сюда не приходят: поверхность отсеяна проверкой выше. Ветка
+            // существует затем, чтобы новый вид области нельзя было завести,
+            // не ответив на вопрос, сколько кадров он обязан вернуть.
+            Source::Surface(_) => region.pages,
         };
         if freed != owed {
             kprintln!(
@@ -795,6 +925,164 @@ pub fn with_current<R>(f: impl FnOnce(&mut Program) -> R) -> Option<R> {
     let slot = sched::current_slot();
     let mut table = PROGRAMS.lock();
     table.get_mut(slot).and_then(Option::as_mut).map(f)
+}
+
+/// Сколько байт поверхности окна ядро согласно выдать.
+///
+/// Четыре мегабайта — это ровно 1024×1024 точки. Предел здесь не про адреса, а
+/// про кадры: поверхность выдаётся **подряд**, целиком и сразу, и просьба
+/// размером с экран в шестнадцать миллионов точек означала бы шестьдесят
+/// четыре мегабайта непрерывной памяти у одной программы — кусок, которого на
+/// раздробленной памяти может не найтись вовсе.
+const WINDOW_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Сколько ждать занятый стол, снимая окно за умершей программой.
+///
+/// Две секунды — заведомо больше самой долгой сборки кадра (сотни миллисекунд в
+/// отладочной сборке на 1920×1080). Ждём **сном**, а не уступкой процессора:
+/// уступка возвращается к нам сразу же и на занятом столе превращается в
+/// холостой круг, а не в ожидание.
+const RECLAIM_WAIT_MS: u64 = 2_000;
+
+/// Пауза между попытками снять окно.
+const RECLAIM_PAUSE_MS: u64 = 20;
+
+/// Почему окно программе не досталось.
+#[derive(Debug, Clone, Copy)]
+pub enum WindowError {
+    /// Размер бессмысленный или больше [`WINDOW_MAX_BYTES`].
+    BadSize,
+    /// Задача не исполняет программы.
+    NoProgram,
+    /// Памяти под поверхность не нашлось.
+    Memory(MmapError),
+    /// Стол окна не дал.
+    Desktop(crate::ui::WindowError),
+}
+
+/// Завести окно текущей программе. Возвращает адрес поверхности в её памяти.
+///
+/// # Почему здесь два захода под лок таблицы программ, а не один
+///
+/// Потому что между ними работает стол, а он собирает кадр — сотни миллисекунд
+/// в отладочной сборке. Лок таблицы программ ждёт **каждый** системный вызов
+/// **каждой** задачи, и удерживать его на время перерисовки значило бы
+/// останавливать систему на каждое открытое окно. Поэтому память выдаётся под
+/// локом, окно заводится без него, а неудача откатывается третьим заходом.
+///
+/// Гонки между заходами нет, и это не везение: между ними программа стоит
+/// внутри этого самого вызова, а её области трогает только она.
+pub fn open_window(title: &str, width: u32, height: u32) -> Result<usize, WindowError> {
+    if width == 0 || height == 0 {
+        return Err(WindowError::BadSize);
+    }
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|points| points.checked_mul(4))
+        .ok_or(WindowError::BadSize)?;
+    if bytes > WINDOW_MAX_BYTES {
+        return Err(WindowError::BadSize);
+    }
+    let pages = bytes.div_ceil(PAGE_SIZE);
+
+    let (base, phys) = with_current(|program| program.attach_surface(pages))
+        .ok_or(WindowError::NoProgram)?
+        .map_err(WindowError::Memory)?;
+
+    // SAFETY: кадры выданы подряд, живы, пока живо окно, и видны ядру через
+    // прямое отображение. Второй ссылки на них нет: программа получила адрес
+    // строкой выше и всё ещё стоит в этом вызове, а стол увидит поверхность
+    // только после того, как она уедет в окно.
+    let surface = unsafe {
+        mini_ui::Surface::from_raw(phys.to_direct_map().as_mut_ptr::<u32>(), width, height)
+    };
+    let task = sched::current().as_u32();
+    let opened = match surface {
+        Some(surface) => crate::ui::open_window(task, title, surface),
+        None => Err(crate::ui::WindowError::NoMemory),
+    };
+    if let Err(err) = opened {
+        // Окна не будет — значит и поверхности быть не должно. Оставить её
+        // значило бы отдать программе память, которой она не просила, и
+        // держать кадры до самого её конца.
+        with_current(Program::detach_surface);
+        return Err(WindowError::Desktop(err));
+    }
+    Ok(base)
+}
+
+/// Показать на экране то, что программа нарисовала. `None` — всё окно.
+pub fn commit_window(area: Option<mini_ui::Rect>) -> Result<(), WindowError> {
+    crate::ui::commit_window(sched::current().as_u32(), area).map_err(WindowError::Desktop)
+}
+
+/// Забрать событие окна текущей программы.
+pub fn window_event() -> Option<user_abi::WinEvent> {
+    crate::ui::next_window_event(sched::current().as_u32())
+}
+
+/// Закрыть окно текущей программы и вернуть его память.
+pub fn close_window() -> Result<(), WindowError> {
+    // Сначала окно уходит со стола, и только потом освобождаются кадры: пока
+    // окно на столе, композитор вправе читать его пиксели.
+    crate::ui::close_window(sched::current().as_u32()).map_err(WindowError::Desktop)?;
+    with_current(Program::detach_surface).ok_or(WindowError::NoProgram)?;
+    Ok(())
+}
+
+/// Снять окно программы, которая его не закрыла.
+///
+/// Зовётся из [`run`] **до** того, как пространство программы будет разобрано, и
+/// в этом весь смысл вызова. Разбор освобождает поддерево окна рекурсивно, не
+/// различая, чьи кадры под ним лежат, — а поверхность принадлежит не программе.
+///
+/// Заметить смерть задачи позже нельзя в принципе, и это стоит сказать прямо:
+/// [`sched::exit_current_with`] помечает задачу законченной уже после того, как
+/// `run` вернул пространство в пул. Тот, кто взялся бы «обойти мёртвые задачи и
+/// убрать их окна», опоздал бы всегда — кадры поверхности к этому времени уже
+/// выданы кому-то другому, а композитор всё ещё из них рисует.
+fn reclaim_window() {
+    // Первый вопрос — **программе**, а не столу, и это исправление, а не
+    // предусмотрительность. Сначала здесь стоял безусловный поход к столу, и
+    // первый же прогон напечатал «окно задачи #10 потеряно» про задачу, у
+    // которой окна никогда не было: путь выхода обычного `ls` натыкался на
+    // стол, занятый сборкой кадра, и жаловался на утечку несуществующего окна.
+    if with_current(|program| program.has_surface()) != Some(true) {
+        return;
+    }
+
+    let task = sched::current().as_u32();
+    let deadline = crate::time::uptime_ms().saturating_add(RECLAIM_WAIT_MS);
+    loop {
+        match crate::ui::close_window(task) {
+            Ok(()) => break,
+            // Окна нет вовсе: графики на машине не было, а поверхность у
+            // программы всё равно есть. Кадры возвращаются как обычно.
+            Err(crate::ui::WindowError::NoWindow | crate::ui::WindowError::NoDesktop) => break,
+            // Стол занят сборкой кадра — подождём.
+            Err(_) => {}
+        }
+        if crate::time::uptime_ms() >= deadline {
+            // Кадры **не** освобождаются: окно всё ещё на столе, и вернуть их
+            // в пул значило бы отдать их другому владельцу прямо под рукой
+            // композитора. Громкая утечка лучше молчаливой порчи памяти —
+            // поэтому строка кричит, а кадры остаются на месте.
+            kprintln!(
+                "  user        : WARNING: the desktop stayed busy; the window of {} is leaked",
+                sched::current()
+            );
+            return;
+        }
+        sched::sleep_ms(RECLAIM_PAUSE_MS);
+    }
+
+    let Some(Some(pages)) = with_current(Program::detach_surface) else {
+        return;
+    };
+    kprintln!(
+        "  user        : reclaimed {pages} frame(s) of the window of {}",
+        sched::current()
+    );
 }
 
 /// Корень таблиц страниц программы текущей задачи.
@@ -1207,6 +1495,12 @@ fn run(
     // SAFETY: таблицы ядра активированы при запуске системы и никуда не делись
     // — пространство программы построено их копией.
     unsafe { arch::activate_kernel_space() };
+
+    // Окно снимается **здесь** — до того, как пространство будет разобрано, и
+    // это единственное место, где такой порядок ещё возможен (см.
+    // [`reclaim_window`]). Программа, закрывшая окно сама, ничего здесь не
+    // стоит: снимать уже нечего.
+    reclaim_window();
 
     // Программа забирается из таблицы и уничтожается здесь: `Drop` её
     // пространства возвращает окно в пул кадров, а таблица дескрипторов
