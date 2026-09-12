@@ -53,7 +53,7 @@ use super::context::{Action, ContextMenu, Reply};
 use super::icons::{Icons, Kind};
 use super::panel::{Menu, Panel, PanelHit, Status};
 use super::pointer::Pointer;
-use super::theme;
+use mini_ui::theme;
 use super::window::{App, Hit, Window};
 
 /// Сколько прямоугольников изменений композитор согласен помнить.

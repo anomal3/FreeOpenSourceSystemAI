@@ -39,9 +39,9 @@ use mini_ui::{Rect, Surface};
 use user_abi::WinEvent;
 
 use super::files::FilesView;
-use super::paint::{self, Ctx, Weight};
+use mini_ui::paint::{self, Ctx, Weight};
 use super::settings::SettingsView;
-use super::theme;
+use mini_ui::theme;
 use crate::input::KeyCode;
 
 /// Какая программа живёт в окне.
@@ -144,11 +144,11 @@ impl App {
     /// Цвет опознаёт окно раньше, чем прочитан заголовок: зелёный — терминал,
     /// красный — вопрос о выключении, синий — всё остальное.
     #[must_use]
-    pub const fn tone(self) -> super::paint::Tone {
+    pub const fn tone(self) -> mini_ui::paint::Tone {
         match self {
-            App::Terminal => super::paint::Tone::Ok,
-            App::Shutdown | App::Restart => super::paint::Tone::Bad,
-            _ => super::paint::Tone::Accent,
+            App::Terminal => mini_ui::paint::Tone::Ok,
+            App::Shutdown | App::Restart => mini_ui::paint::Tone::Bad,
+            _ => mini_ui::paint::Tone::Accent,
         }
     }
 

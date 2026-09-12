@@ -41,8 +41,8 @@ use mini_ui::glyphicon::{self, Icon};
 use mini_ui::typeface::Role;
 use mini_ui::{Color, Rect, Surface};
 
-use super::paint::{self, Ctx, RowState, Tone};
-use super::theme::{self, Palette};
+use mini_ui::paint::{self, Ctx, RowState, Tone};
+use mini_ui::theme::{self, Palette};
 use super::window::App;
 
 /// Надпись на кнопке меню.

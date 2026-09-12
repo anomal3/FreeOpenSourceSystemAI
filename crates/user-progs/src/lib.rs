@@ -70,9 +70,35 @@ use user_abi::{
 };
 
 pub use user_abi::{
-    MAX_TITLE, PIXEL_BGR, PIXEL_RGB, SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_POINTER,
-    WinEvent,
+    MAX_TITLE, PIXEL_BGR, PIXEL_RGB, SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_KEY_DELETE,
+    WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT, WIN_KEY_NAMED, WIN_KEY_PAGE_DOWN,
+    WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP, WIN_POINTER, WinEvent,
 };
+
+/// Как эта клавиша называется в журнале — или `None`, если она пришла символом.
+///
+/// Существует ради того, чтобы имя клавиши было **видно строкой**. Число
+/// `16777219` в журнале ничего не говорит ни человеку, ни стенду, а сверять
+/// стенд с числом значило бы вписать границу диапазона ещё и в него.
+#[must_use]
+pub fn key_name(code: u32) -> Option<&'static str> {
+    Some(match code {
+        WIN_KEY_LEFT => "left",
+        WIN_KEY_RIGHT => "right",
+        WIN_KEY_UP => "up",
+        WIN_KEY_DOWN => "down",
+        WIN_KEY_HOME => "home",
+        WIN_KEY_END => "end",
+        WIN_KEY_PAGE_UP => "pageup",
+        WIN_KEY_PAGE_DOWN => "pagedown",
+        WIN_KEY_DELETE => "delete",
+        // Имя из будущего: договор обещает, что всё выше границы — имя, а не
+        // символ, и программа, собранная до его выдачи, обязана это понимать, а
+        // не принимать за букву.
+        other if other >= WIN_KEY_NAMED => "unknown",
+        _ => return None,
+    })
+}
 
 use user_abi::SYS_SYSINFO;
 

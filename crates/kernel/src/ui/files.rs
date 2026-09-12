@@ -39,8 +39,8 @@ use mini_ui::glyphicon::{self, Icon};
 use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface};
 
-use super::paint::{self, Ctx, RowState, Tone};
-use super::theme;
+use mini_ui::paint::{self, Ctx, RowState, Tone};
+use mini_ui::theme;
 use crate::fs;
 use crate::input::KeyCode;
 use crate::vfs::NodeKind;

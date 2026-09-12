@@ -37,21 +37,25 @@
 //! Когда появится пользовательское пространство, на месте этого вызова окажется
 //! доставка события процессу — а не переписанный оконный менеджер.
 
+// Словарь элементов (`paint`) и палитра (`theme`) с фазы 47c живут в
+// `mini_ui`, а не здесь. Переезд не косметический: окно перестало быть частью
+// ядра, и рисовать теми же цветами обязаны обе стороны границы привилегий —
+// иначе файловый менеджер выглядит на этом столе чужой программой. Зависимостей
+// от ядра у них не было ни одной, так что переезд свёлся к переносу двух файлов.
 pub mod compositor;
 pub mod context;
 pub mod files;
 pub mod icons;
-pub mod paint;
 pub mod panel;
 pub mod pointer;
 pub mod settings;
 pub mod term;
-pub mod theme;
 pub mod window;
 
 use alloc::string::String;
 use core::fmt::Write as _;
 
+use mini_ui::theme;
 use mini_ui::{Rect, Screen, Surface};
 use user_abi::{WIN_CLOSE, WIN_KEY, WIN_POINTER, WinEvent};
 
@@ -996,6 +1000,33 @@ fn confirm_key(desktop: &mut Compositor, app: App, restart: bool, code: KeyCode)
     }
 }
 
+/// Чем эта клавиша приедет в окно программы, и приедет ли вообще.
+///
+/// Символ — если он у клавиши есть; иначе имя из договора — если оно ей выдано.
+/// `None` означает «эта клавиша программам не обещана», и таких большинство.
+///
+/// Порядок именно такой: сначала символ. Обратный сделал бы `Delete` именем
+/// даже там, где клавиатура шлёт за него `0x7F`, — и программа получала бы одну
+/// и ту же клавишу то так, то эдак, в зависимости от того, пришла она с
+/// терминала или с настоящей клавиатуры.
+fn program_key(event: KeyEvent) -> Option<u32> {
+    if let Some(symbol) = event.to_char() {
+        return Some(symbol as u32);
+    }
+    Some(match event.code {
+        KeyCode::Left => user_abi::WIN_KEY_LEFT,
+        KeyCode::Right => user_abi::WIN_KEY_RIGHT,
+        KeyCode::Up => user_abi::WIN_KEY_UP,
+        KeyCode::Down => user_abi::WIN_KEY_DOWN,
+        KeyCode::Home => user_abi::WIN_KEY_HOME,
+        KeyCode::End => user_abi::WIN_KEY_END,
+        KeyCode::PageUp => user_abi::WIN_KEY_PAGE_UP,
+        KeyCode::PageDown => user_abi::WIN_KEY_PAGE_DOWN,
+        KeyCode::Delete => user_abi::WIN_KEY_DELETE,
+        _ => return None,
+    })
+}
+
 /// Отдать событие активному окну.
 fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
     // Окно подтверждения разбирает клавиши само и раньше остальных: у него нет
@@ -1017,13 +1048,13 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
         // где можно набрать команду.
         Some(App::Terminal) | None => Some(event),
         // Окно программы получает символ, а не код клавиши, и только нажатия.
-        // Клавиша без символа — стрелки, F-ряд — события не даёт вовсе: класть
-        // им ноль значило бы сделать их все одной клавишей (см. договор
-        // [`WinEvent::code`]).
+        // Клавише без символа даётся имя из договора — но только той, которой
+        // это имя выдано: остальные (F-ряд, цифровой блок) событий по-прежнему
+        // не дают. См. [`WinEvent::code`], там сказано, почему это честнее.
         Some(app @ App::Program(_)) => {
             if event.pressed {
-                if let Some(symbol) = event.to_char() {
-                    let key = WinEvent { kind: WIN_KEY, code: symbol as u32, x: 0, y: 0 };
+                if let Some(code) = program_key(event) {
+                    let key = WinEvent { kind: WIN_KEY, code, x: 0, y: 0 };
                     if let Some(window) = desktop.find(app) {
                         window.push_event(key);
                     }

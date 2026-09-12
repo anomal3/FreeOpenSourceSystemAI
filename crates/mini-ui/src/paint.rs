@@ -21,12 +21,11 @@
 //! ошибок раскладки — это перепутанные местами ширина и высота в списке из
 //! четырёх чисел.
 
-use mini_ui::draw;
-use mini_ui::glyphicon::{self, Icon};
-use mini_ui::typeface::{self, Face, Role, Tier};
-use mini_ui::{Color, Rect, Surface};
-
-use super::theme::{self, Ink, Palette};
+use crate::draw;
+use crate::glyphicon::{self, Icon};
+use crate::theme::{self, Ink, Palette};
+use crate::typeface::{self, Face, Role, Tier};
+use crate::{Color, Rect, Surface};
 
 /// Всё, что нужно знать, чтобы нарисовать элемент.
 #[derive(Clone, Copy)]

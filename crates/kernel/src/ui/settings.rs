@@ -35,8 +35,8 @@ use mini_ui::glyphicon::{self, Icon};
 use mini_ui::typeface::Role;
 use mini_ui::{Color, Rect, Surface};
 
-use super::paint::{self, Ctx, RowState, Tone, Weight};
-use super::theme;
+use mini_ui::paint::{self, Ctx, RowState, Tone, Weight};
+use mini_ui::theme;
 use crate::input::KeyCode;
 use crate::{arch, config, fs};
 
