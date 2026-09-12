@@ -1268,6 +1268,7 @@ dependencies = [
  "png",
  "rcgen",
  "rustls",
+ "user-abi",
 ]
 
 [[package]]

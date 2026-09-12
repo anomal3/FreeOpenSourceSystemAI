@@ -2663,6 +2663,66 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "libc",
+        about: "Программа на C: собрана нашим набором, печатает printf'ом и работает с файлами.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Установленная система, а не живая, и это не выбор из удобства:
+            // корень живой — образ initrd в FAT, и писать в него нельзя. Файл,
+            // который программа создаёт и читает обратно, — половина того, что
+            // эта фаза обещала, и проверить её можно только на ext2.
+            Step::Line("run /bin/cdemo /home/roman"),
+            // Первая же строка доказывает больше, чем кажется: она напечатана
+            // `printf`, то есть сквозь всю libc — форматирование, буфер stdio,
+            // наш `write`, системный вызов. До этой фазы программа умела
+            // печатать только тем, что написали мы сами.
+            Step::Await("cdemo: starting, writing under /home/roman", 30_000),
+            // Строки и форматирование. Здесь нет ничего от системы: сломайся
+            // это, сломана сама библиотека, а не порт.
+            Step::Await("cdemo: ok strings and snprintf", 15_000),
+            // `qsort` зовёт нашу функцию обратно — то есть проверяет указатель
+            // на функцию. Он живёт по адресу 512 ГиБ и не влезает в тридцать
+            // два бита; неверно выбранная модель кода ломается ровно здесь.
+            Step::Await("cdemo: ok qsort", 15_000),
+            // Куча. `malloc` идёт через наш `sbrk`, а тот — через `SYS_MMAP`.
+            Step::Await("cdemo: ok malloc", 15_000),
+            // И то, ради чего фаза названа так, как названа: файл создан
+            // `fopen`, записан `fwrite`, прочитан обратно и совпал побайтно.
+            Step::Await("cdemo: ok fopen and fwrite", 30_000),
+            Step::Await("cdemo: ok stat", 15_000),
+            Step::Await("cdemo: ok fread", 15_000),
+            // Удаление проверяется отдельным `stat`: `remove`, вернувшая ноль и
+            // ничего не удалившая, — ровно та заглушка, против которой написана
+            // вся фаза.
+            Step::Await("cdemo: ok remove", 15_000),
+            // Итог одной строкой. Ноль — и только ноль.
+            Step::Await("cdemo: done, 0 check(s) failed", 15_000),
+            Step::Await("exited with code 0", 15_000),
+            // Отдельным шагом, потому что «строка не напечаталась» и «проверка
+            // не прошла» — разные беды, и первую поймали бы ожидания выше.
+            Step::Absent("cdemo: FAILED"),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "mc",
         about: "Двухпанельный менеджер: ходьба по каталогам, копирование, удаление — всё вне ядра.",
         target: Target::Installed,

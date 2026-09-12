@@ -13,6 +13,7 @@ mod out;
 
 mod arch;
 mod build;
+mod cbuild;
 mod diskfile;
 mod firmware;
 mod harness;
@@ -62,6 +63,17 @@ enum Command {
     Iso(ImageArgs),
     /// Разобрать образ диска: разделы и содержимое корневой ФС.
     Inspect(InspectArgs),
+    /// Собрать набор для C: picolibc под обе архитектуры.
+    ///
+    /// Нужна один раз после `clean` или после обновления LLVM. Всё, что она
+    /// делает, — рецепт, который иначе жил бы в чьей-то памяти.
+    Toolchain,
+    /// Собрать программы на C: слой ОС, стартовый код и примеры.
+    ///
+    /// Отдельной командой, а не только внутри `build`, чтобы набор можно было
+    /// проверить, не собирая образ целиком: сборка C — единственное место,
+    /// которое зависит от инструментов вне репозитория.
+    Cbuild(CbuildArgs),
     /// Прогнать систему в QEMU по сценариям стенда — без человека за клавиатурой.
     Test(TestArgs),
     /// Собрать каталог репозитория обновлений: образы, индекс и его подпись.
@@ -170,6 +182,13 @@ struct ImageArgs {
     /// Собрать установочный носитель, а не образ готовой системы.
     #[arg(long)]
     installer: bool,
+}
+
+#[derive(Args, Debug)]
+struct CbuildArgs {
+    /// Под какую архитектуру собирать. По умолчанию — обе.
+    #[arg(short, long)]
+    arch: Option<Arch>,
 }
 
 #[derive(Args, Debug)]
@@ -502,6 +521,25 @@ fn real_main() -> Result<()> {
             say!("Проверить результат установки:");
             say!("    cargo xtask inspect --arch {}   # что записано на диск", args.arch);
             say!("    cargo xtask run --arch {} --installed   # загрузиться с него", args.arch);
+        }
+
+        Command::Toolchain => {
+            cbuild::toolchain()?;
+            say!("набор для C собран: build/toolchain/sysroot/<арх>");
+        }
+
+        Command::Cbuild(args) => {
+            let arches: Vec<Arch> = match args.arch {
+                Some(arch) => vec![arch],
+                None => Arch::ALL.to_vec(),
+            };
+            for arch in arches {
+                say!("=== {} ===", arch.name());
+                for (name, path) in cbuild::build_c_programs(arch)? {
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    say!("  {name}: {size} байт — {}", path.display());
+                }
+            }
         }
 
         Command::Inspect(args) => {
