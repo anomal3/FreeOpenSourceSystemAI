@@ -26,6 +26,8 @@ mod paths;
 mod phone;
 mod qemu;
 mod repo;
+mod sdk;
+mod thirdparty;
 mod util;
 mod version;
 
@@ -68,6 +70,18 @@ enum Command {
     /// Нужна один раз после `clean` или после обновления LLVM. Всё, что она
     /// делает, — рецепт, который иначе жил бы в чьей-то памяти.
     Toolchain,
+    /// Собрать набор для сборки: sysroot, обёртки `<арх>-freeos-cc` и пакет.
+    ///
+    /// Это `toolchain` плюс то, чего ему не хватало, чтобы набором мог
+    /// воспользоваться кто-то, кроме нас: заголовки и библиотеки в одном месте,
+    /// компилятор под именем, которое ищет чужой `configure`.
+    Sdk(SdkArgs),
+    /// Собрать чужой проект нашим набором: `zlib`.
+    ///
+    /// Отдельной командой, потому что она ходит в сеть. Это единственное место
+    /// во всей сборке, которому нужен интернет, и прятать его внутри `build`
+    /// значило бы делать сборку системы зависимой от чужого сервера.
+    Thirdparty(ThirdpartyArgs),
     /// Собрать программы на C: слой ОС, стартовый код и примеры.
     ///
     /// Отдельной командой, а не только внутри `build`, чтобы набор можно было
@@ -189,6 +203,23 @@ struct CbuildArgs {
     /// Под какую архитектуру собирать. По умолчанию — обе.
     #[arg(short, long)]
     arch: Option<Arch>,
+}
+
+#[derive(Args, Debug)]
+struct SdkArgs {
+    /// Ещё и собрать пакет `.fpk` с набором.
+    #[arg(long)]
+    package: bool,
+}
+
+#[derive(Args, Debug)]
+struct ThirdpartyArgs {
+    /// Под какую архитектуру собирать. По умолчанию — обе.
+    #[arg(short, long)]
+    arch: Option<Arch>,
+    /// Принести исходники заново, даже если они уже лежат.
+    #[arg(long)]
+    refresh: bool,
 }
 
 #[derive(Args, Debug)]
@@ -526,6 +557,23 @@ fn real_main() -> Result<()> {
         Command::Toolchain => {
             cbuild::toolchain()?;
             say!("набор для C собран: build/toolchain/sysroot/<арх>");
+        }
+
+        Command::Sdk(args) => {
+            sdk::install()?;
+            if args.package {
+                for arch in Arch::ALL {
+                    sdk::build_package(arch)?;
+                }
+            }
+        }
+
+        Command::Thirdparty(args) => {
+            let arches: Vec<Arch> = match args.arch {
+                Some(arch) => vec![arch],
+                None => Arch::ALL.to_vec(),
+            };
+            thirdparty::build_all(&arches, args.refresh)?;
         }
 
         Command::Cbuild(args) => {

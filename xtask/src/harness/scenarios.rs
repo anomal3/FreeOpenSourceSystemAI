@@ -2723,6 +2723,56 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "sdk",
+        about: "Чужая библиотека (zlib 1.3.1), собранная нашим набором, работает в системе.",
+        // Живая система, а не установленная, и это осознанно: программа не
+        // трогает файлов вовсе — только кучу, — а живой прогон вдвое короче.
+        // Проверять на ext2 то, чему файловая система не нужна, значит платить
+        // за установку ради ничего.
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Line("run /bin/zdemo"),
+            // Версия печатается самой zlib из её же заголовка. Строка
+            // доказывает, что слинкована именно чужая библиотека, а не наша
+            // заглушка с теми же именами.
+            Step::Await("zdemo: starting, zlib 1.3.1", 30_000),
+            Step::Await("zdemo: sample is 18000 bytes", 15_000),
+            // Чужой CRC-32 против своего, посчитанного побитно в той же
+            // программе. Совпадение двух независимых реализаций — проверка;
+            // совпадение библиотеки с собой — тавтология.
+            Step::Await("zdemo: ok crc32", 15_000),
+            // Сжатие обязано **уменьшить**: несжимаемый вход zlib заворачивает
+            // в блок «как есть», и проверка прошла бы с неработающим
+            // дефлятором.
+            Step::Await("zdemo: ok compress2", 30_000),
+            // И то, ради чего фаза: данные, прошедшие туда и обратно через
+            // чужой код, совпали побайтно.
+            Step::Await("zdemo: ok round trip", 30_000),
+            Step::Await("zdemo: done, 0 check(s) failed", 15_000),
+            Step::Await("exited with code 0", 15_000),
+            // Отдельным шагом: «строка не напечаталась» и «проверка не прошла» —
+            // разные беды, и первую поймали бы ожидания выше.
+            Step::Absent("zdemo: FAILED"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "mc",
         about: "Двухпанельный менеджер: ходьба по каталогам, копирование, удаление — всё вне ядра.",
         target: Target::Installed,

@@ -1,0 +1,25 @@
+[package]
+name = "freeos-cc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Библиотека и бинарник у одного крейта не для красоты: правила сборки C —
+# триплет, флаги, поиск инструментов — обязаны быть в **одном** месте. Обёртка
+# зовёт их отсюда, `xtask` подключает этот же крейт как библиотеку, и разъехаться
+# им негде.
+[lib]
+name = "freeos_cc"
+path = "src/lib.rs"
+
+# Четыре имени у одного бинарника: обёртка узнаёт себя по argv[0]. Копии кладёт
+# `cargo xtask sdk` — здесь одна цель сборки, потому что код у них общий.
+[[bin]]
+name = "freeos-cc"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -10,6 +10,7 @@ members = [
     "crates/ext2",
     "crates/fdt",
     "crates/fpk",
+    "crates/freeos-cc",
     "crates/installer",
     "crates/kernel",
     "crates/mini-ui",

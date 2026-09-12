@@ -23,6 +23,7 @@ written down in the source, in Russian, next to the code that resulted from it.
 | **Filesystem** | ext2, read and written by us — created, verified and repaired from inside the system (`fsck`) |
 | **Desktop** | Framebuffer compositor: antialiased proportional type, rounded translucent windows, a floating taskbar, start menu, terminal, file manager — in a dark and a light theme. A program can ask for **a window of its own**: it draws straight into mapped pixels and reads its own keys and clicks — the system monitor is exactly that, a program outside the kernel |
 | **Userspace** | ELF programs in ring 3 / EL0, one address space each, preemptive scheduling, pipes, `mode`/`uid`/`gid` enforced, memory on request (`mmap`) in 4 KiB or 2 MiB pages, files mapped into memory and paged in on demand, and a **versioned syscall contract** — `dup`, `fstat`, `isatty`, `poll`, clocks and CPU time, frozen by tests that name every number |
+| **C and a toolchain** | A picolibc port and a cross toolchain: `x86_64-freeos-cc hello.c -o hello` produces a program that runs. **zlib 1.3.1 builds from its own `configure`, unpatched, for both architectures** — and the result works: 18 000 bytes compress to 123 and come back byte-identical, inside the system |
 | **Network** | Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP with all eleven states, TLS 1.3 with X.509 |
 | **SSH** | A real OpenSSH client logs in with a key and runs programs from `/bin` as the account that logged in |
 | **Updates** | A/B root slots, signed images, automatic rollback after three failed boots; over HTTP or GitHub Releases |
@@ -99,6 +100,23 @@ cargo xtask test                         # the whole bench, both architectures
 cargo xtask test --full                  # both profiles too -- the bar a phase must clear
 ```
 
+### Building C programs for it
+
+Needs LLVM, plus `make` and `sh` for foreign projects that bring their own build
+system (`winget install LLVM.LLVM ezwinports.make`; `sh` arrives with Git).
+
+```bash
+cargo xtask sdk                 # headers, libraries and the x86_64-freeos-* wrappers
+cargo xtask sdk --package       # ... and an .fpk with the sysroot in it
+cargo xtask thirdparty          # fetch zlib and build it with the toolchain
+
+build/toolchain/bin/x86_64-freeos-cc hello.c -o hello
+```
+
+The compiler is not part of the package and will not be: clang installs itself
+and weighs a gigabyte. What the toolchain adds is the target — headers, libraries,
+a link script, and wrappers under the names a foreign `configure` looks for.
+
 ### For the phone
 
 ```bash
@@ -146,10 +164,10 @@ waiting to go wrong in it is in **[ROADMAP.md](ROADMAP.md)**.
 | **v0.2** | Userspace, permissions, packages, A/B updates, services, power, `fsck`, safe mode | **done** |
 | **v0.3** | Network: Ethernet through TCP, SSH with key login, signed updates, TLS 1.3 | **done** |
 | **v0.4** | Real hardware: a phone — its own bootloader, no UEFI, no ACPI, USB in device mode, **a working touchscreen** | in progress |
-| next | SMP; then writable file mappings and eviction under pressure | planned |
-| then | A libc and a toolchain: somebody else's project builds for this system unpatched | planned |
-| then | Windows belong to programs; settings and desktop icons | planned |
-| then | btrfs; a Raspberry Pi 4 — the first machine that is not an emulator | planned |
+| **v0.5** | A libc and a toolchain: somebody else's project builds for this system unpatched | **done** |
+| **v0.6** | Windows belong to programs; settings and desktop icons | in progress |
+| next | btrfs: data apart from the system | planned |
+| then | A Raspberry Pi 4 — the first machine that is not an emulator | planned |
 
 ---
 
@@ -161,6 +179,8 @@ crates/boot-info/    Stable #[repr(C)] hand-off contract: bootloader -> kernel
 crates/disk/         GPT and a FAT32 formatter          crates/ext2/  the ext2 format
 crates/ssh/          Packets, curve25519, chacha20-poly1305, public-key login
 crates/mini-ui/      Surfaces, 8x8 text, widgets        crates/installer/  the installer
+crates/freeos-cc/    Build rules for C, and the x86_64-freeos-cc wrapper itself
+libc/                The OS layer under picolibc, crt0, and example programs
 crates/kernel/
   src/mm/            Frames, page tables, heap, DMA arena
   src/sched/         Preemptive scheduler and tasks

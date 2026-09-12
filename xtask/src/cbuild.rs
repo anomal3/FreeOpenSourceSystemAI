@@ -35,108 +35,31 @@ pub fn syscall_header() -> PathBuf {
     libc_dir().join("freeos/freeos-syscall.h")
 }
 
-/// Где стоит LLVM, если его нет на PATH.
+/// Цель набора, соответствующая нашей архитектуре.
 ///
-/// Путь с пробелом — известная беда этого набора: cmake разваливает
-/// `C:/Program Files/...` на два аргумента и молча собирает пустую библиотеку.
-/// Здесь пробел безвреден (аргументы уходят через `Command`, а не через
-/// строку), но сам путь всё равно нужен: winget ставит LLVM машинно, а PATH
-/// пользователя обновляется только в новых терминалах.
-const LLVM_FALLBACK: &str = r"C:\Program Files\LLVM\bin";
+/// Перевод, а не второй перечислитель: правила сборки C живут в крейте
+/// `freeos-cc`, потому что он же — обёртка `x86_64-freeos-cc`, которой собирают
+/// чужие проекты. Два списка флагов — наш и её — разошлись бы молча.
+pub fn c_target(arch: Arch) -> freeos_cc::Target {
+    match arch {
+        Arch::X86_64 => freeos_cc::Target::X86_64,
+        Arch::Aarch64 => freeos_cc::Target::Aarch64,
+    }
+}
 
 /// Найти инструмент набора: сначала на PATH, потом там, куда его кладёт winget.
 pub fn llvm_tool(name: &str) -> Result<PathBuf> {
-    let exe = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    };
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(&exe);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-    let fallback = Path::new(LLVM_FALLBACK).join(&exe);
-    if fallback.is_file() {
-        return Ok(fallback);
-    }
-    bail!(
-        "не найден {name}: нет ни на PATH, ни в {LLVM_FALLBACK}.\n\
-         Поставить набор: winget install --id LLVM.LLVM --exact"
-    )
+    freeos_cc::find_tool(name).map_err(anyhow::Error::msg)
 }
 
-/// Триплет, под который собирается C для этой архитектуры.
+/// Флаги компиляции для **нашего** кода: правила набора плюс строгость.
 ///
-/// # Почему у двух архитектур он разной природы
-///
-/// У AArch64 всё как ожидается: `aarch64-unknown-none-elf` — это
-/// «свободностоящая ELF-мишень без операционной системы», и драйвер clang знает
-/// про неё всё, включая компоновщик.
-///
-/// У x86-64 такого драйвера **нет**. Любой голый триплет (`x86_64-none-elf`,
-/// `x86_64-unknown-none-elf`, `x86_64-elf`) попадает в общий GCC-совместимый
-/// драйвер, а тот зовёт для компоновки `gcc` — и `-fuse-ld=lld` передаёт **ему
-/// же**, вместо того чтобы выбрать компоновщик сам. На машине без gcc это
-/// «unable to execute command: program not executable», и обойти это из
-/// командной строки нечем.
-///
-/// Поэтому у x86-64 стоит триплет Linux — единственный, чей драйвер умеет lld, —
-/// а линуксовость снимается с препроцессора явно (`-U__linux__` и соседи, см.
-/// [`c_flags`]). Компоновщика от триплета мы при этом не берём вовсе: линкуем
-/// `ld.lld` напрямую своим сценарием.
-///
-/// Цена названа: если когда-нибудь clang заведёт настоящий bare-metal драйвер
-/// для x86-64, эту строку надо будет вернуть к `x86_64-unknown-none-elf` и
-/// выбросить семь `-U`. Проверяется это одной сборкой.
-pub fn c_triple(arch: Arch) -> &'static str {
-    match arch {
-        Arch::X86_64 => "x86_64-unknown-linux-elf",
-        Arch::Aarch64 => "aarch64-unknown-none-elf",
-    }
-}
-
-/// Флаги компиляции, общие для всего, что мы собираем на C.
-///
-/// `-ffreestanding` — стандартной библиотеки под нами может не быть вовсе;
-/// `-fno-stack-protector` — защита стека зовёт `__stack_chk_fail`, которого
-/// неоткуда взять; `-mcmodel=large` на x86-64 — по той же причине, по которой
-/// он стоит у программ на Rust: программа живёт по адресу 512 ГиБ, а малая
-/// модель кода рассчитана на первые два гигабайта, и обращение к своим же
-/// данным не дотягивается.
-///
-/// `-U__linux__` и соседи — следствие выбора триплета, см. [`c_triple`]. Снять
-/// их нельзя: picolibc и всякая портируемая программа смотрят именно на эти
-/// макросы, решая, есть ли под ними Linux. Под нами его нет.
+/// Строгость приписывается здесь, а не в наборе, и это существенно: `-Werror` на
+/// своём коде — дисциплина, а на чужом — «сборка ломается от новой версии
+/// компилятора». Обёртка, которой собирают zlib, этих трёх флагов не ставит.
 pub fn c_flags(arch: Arch) -> Vec<String> {
-    let mut flags = vec![
-        format!("--target={}", c_triple(arch)),
-        "-ffreestanding".into(),
-        "-fno-stack-protector".into(),
-        "-fno-pic".into(),
-        "-fno-PIE".into(),
-        "-O2".into(),
-        "-Wall".into(),
-        "-Wextra".into(),
-        "-Werror".into(),
-    ];
-    if arch == Arch::X86_64 {
-        flags.push("-mcmodel=large".into());
-        for macro_name in [
-            "__linux__",
-            "__linux",
-            "linux",
-            "__gnu_linux__",
-            "__unix__",
-            "__unix",
-            "unix",
-        ] {
-            flags.push(format!("-U{macro_name}"));
-        }
-    }
+    let mut flags = freeos_cc::compile_flags(c_target(arch));
+    flags.extend(["-O2".to_string(), "-Wall".into(), "-Wextra".into(), "-Werror".into()]);
     flags
 }
 
@@ -169,21 +92,8 @@ pub fn compile(arch: Arch, source: &Path, object: &Path, includes: &[PathBuf]) -
 }
 
 /// Каталог заголовков самого компилятора: `<корень LLVM>/lib/clang/<версия>/include`.
-///
-/// Ищется по дереву, а не собирается из номера версии: номер меняется с каждым
-/// обновлением LLVM, и зашитый в код он сломал бы сборку ровно тогда, когда её
-/// никто не трогал.
 fn clang_builtin_includes(clang: &Path) -> Option<PathBuf> {
-    let root = clang.parent()?.parent()?;
-    let versions = std::fs::read_dir(root.join("lib/clang")).ok()?;
-    let mut best: Option<PathBuf> = None;
-    for entry in versions.flatten() {
-        let candidate = entry.path().join("include");
-        if candidate.join("stddef.h").is_file() {
-            best = Some(candidate);
-        }
-    }
-    best
+    freeos_cc::clang_builtin_includes(clang)
 }
 
 /// Слинковать программу нашим компоновочным сценарием.
@@ -217,8 +127,28 @@ pub fn link(objects: &[PathBuf], libs: &[PathBuf], output: &Path) -> Result<()> 
     run(cmd, &format!("ld.lld -> {}", output.display()))
 }
 
-/// Программы на C, которые едут в `/bin`. Они же — имена файлов там.
-pub const C_PROGRAMS: [&str; 1] = ["cdemo"];
+/// Программа на C, которая едет в `/bin`.
+pub struct CProgram {
+    /// Имя файла в `/bin` и имя исходника в `libc/examples`.
+    pub name: &'static str,
+    /// Файл в `<sysroot>/lib`, без которого её незачем собирать.
+    ///
+    /// `None` — программе хватает libc. Иначе это чужая библиотека, и её
+    /// отсутствие не ошибка: `cargo xtask thirdparty` ходит в сеть, и система
+    /// обязана собираться на машине без интернета — просто без этой программы.
+    pub needs: Option<&'static str>,
+    /// Что дописать компоновщику после наших объектников.
+    pub libs: &'static [&'static str],
+}
+
+/// Программы на C, которые едут в `/bin`.
+pub const C_PROGRAMS: [CProgram; 2] = [
+    CProgram { name: "cdemo", needs: None, libs: &[] },
+    // Чужая библиотека, собранная нашим набором. Она здесь не ради сжатия: это
+    // единственная проверка, доказывающая, что код, вышедший из чужого
+    // `configure`, **работает**, а не только собрался. См. `libc/examples/zdemo.c`.
+    CProgram { name: "zdemo", needs: Some("libz.a"), libs: &["libz.a"] },
+];
 
 /// Корень всего, что собрано из чужих исходников.
 ///
@@ -459,15 +389,22 @@ fn write_cross_file(arch: Arch) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Корень всех sysroot'ов: в нём по каталогу на архитектуру.
+///
+/// Именно его понимает переменная `FREEOS_SYSROOT`: обёртка дописывает к нему
+/// имя своей цели сама, потому что цель она знает из своего имени, а вызвавший
+/// её `make` — нет.
+pub fn sysroot_root() -> PathBuf {
+    paths::workspace_root().join("build/toolchain/sysroot")
+}
+
 /// Где лежит собранная picolibc для этой архитектуры.
 ///
 /// Каталог под `build/`, то есть **не** в репозитории: это результат сборки
 /// чужих исходников, а не наш код. Собирает его `cargo xtask toolchain`; нет
 /// каталога — нет и libc, и сказать об этом надо внятно, а не падением clang.
 pub fn sysroot(arch: Arch) -> PathBuf {
-    paths::workspace_root()
-        .join("build/toolchain/sysroot")
-        .join(arch.name())
+    sysroot_root().join(arch.name())
 }
 
 /// Библиотека вспомогательных подпрограмм компилятора.
@@ -524,16 +461,38 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     }
 
     let mut built = Vec::new();
-    for name in C_PROGRAMS {
-        let source = libc_dir().join("examples").join(format!("{name}.c"));
-        let object = work.join(format!("{name}.o"));
+    for program in &C_PROGRAMS {
+        if let Some(needed) = program.needs {
+            if !sysroot.join("lib").join(needed).is_file() {
+                say!(
+                    "{} пропущена: нет {} — собрать: cargo xtask thirdparty",
+                    program.name,
+                    sysroot.join("lib").join(needed).display()
+                );
+                continue;
+            }
+        }
+        let source = libc_dir()
+            .join("examples")
+            .join(format!("{}.c", program.name));
+        let object = work.join(format!("{}.o", program.name));
         compile(arch, &source, &object, &includes)?;
 
         let mut objects = common.clone();
         objects.push(object);
-        let output = work.join(name);
-        link(&objects, &[libc.clone(), builtins.clone()], &output)?;
-        built.push((name, output));
+        // Чужие библиотеки идут **перед** libc: компоновщик берёт из архива
+        // только недостающее и идёт слева направо, а zlib зовёт `memcpy` и
+        // `malloc`. Поставленная после libc, она не вытянула бы ничего.
+        let mut libs: Vec<PathBuf> = program
+            .libs
+            .iter()
+            .map(|name| sysroot.join("lib").join(name))
+            .collect();
+        libs.push(libc.clone());
+        libs.push(builtins.clone());
+        let output = work.join(program.name);
+        link(&objects, &libs, &output)?;
+        built.push((program.name, output));
     }
     Ok(built)
 }
