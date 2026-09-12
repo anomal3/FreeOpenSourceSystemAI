@@ -891,9 +891,29 @@ fn schedule_with(cause: Cause) {
                             unsafe { arch::fpu::restore(area) };
                         }
 
+                        // Часы спрашиваются один раз на переключение и служат
+                        // обоим: концом отрезка уходящей задачи и началом
+                        // отрезка приходящей. Двумя вызовами промежуток между
+                        // ними не достался бы никому, и сумма по задачам
+                        // тихо отставала бы от времени работы системы.
+                        //
+                        // Читать их отсюда можно: `uptime_ms` берёт атомики и
+                        // счётчик процессора, не заходя ни в один лок, — иначе
+                        // это был бы второй лок под локом планировщика при
+                        // запрещённых прерываниях.
+                        let now = crate::time::uptime_ms();
                         if let Some(task) = sched.tasks[current].as_mut() {
                             if task.state == TaskState::Running {
                                 task.state = TaskState::Ready;
+                            }
+                            // Отрезок закрывается здесь — в той же точке, где
+                            // задача перестаёт исполняться. Отметка в ноль
+                            // означает, что начала у отрезка не было (см.
+                            // `Task::ran_since_ms`), и приписывать такой
+                            // задаче время неоткуда.
+                            if task.ran_since_ms != 0 {
+                                task.cpu_ms += now.saturating_sub(task.ran_since_ms);
+                                task.ran_since_ms = 0;
                             }
                             // Счётчик снятий висит на **покидаемой** задаче:
                             // вопрос, на который он отвечает, — уступает ли она
@@ -908,6 +928,7 @@ fn schedule_with(cause: Cause) {
                             task.state = TaskState::Running;
                             task.cpu = Some(cpu);
                             task.switches += 1;
+                            task.ran_since_ms = now;
                         }
                         let state = &mut sched.cpus[cpu];
                         state.previous = Some(current);
@@ -1196,6 +1217,26 @@ pub fn switch_count() -> u64 {
     SCHED.lock().switches()
 }
 
+/// Сколько миллисекунд задача занимала процессор — включая незакрытый отрезок.
+///
+/// `None`, если задачи с таким номером нет.
+///
+/// Незакрытый отрезок добирается **здесь**, а не копится на каждом тике, и это
+/// разница в цене: спрашивающих единицы, а тиков сотня в секунду на каждом
+/// процессоре. Без добора задача, спросившая о себе, всегда получала бы время
+/// своего предыдущего захода — то есть ноль, пока она не переключится хоть раз.
+#[must_use]
+pub fn cpu_ms(id: TaskId) -> Option<u64> {
+    let sched = SCHED.lock();
+    let task = sched.tasks.iter().flatten().find(|task| task.id == id)?;
+    let running = if task.ran_since_ms == 0 {
+        0
+    } else {
+        crate::time::uptime_ms().saturating_sub(task.ran_since_ms)
+    };
+    Some(task.cpu_ms + running)
+}
+
 /// Запущено ли планирование.
 #[must_use]
 pub fn is_running() -> bool {
@@ -1220,13 +1261,23 @@ pub fn dump() {
             Some(_) => "OVERFLOWN",
             None => "freed",
         };
+        // Время на процессоре — у исполняющейся задачи вместе с незакрытым
+        // отрезком: иначе та, что считает прямо сейчас, показывала бы время
+        // своего предыдущего захода и выглядела бы бездельницей.
+        let cpu_ms = entry.cpu_ms
+            + if entry.ran_since_ms == 0 {
+                0
+            } else {
+                crate::time::uptime_ms().saturating_sub(entry.ran_since_ms)
+            };
         kprintln!(
-            "  {} {:<8} {:<9} {:>3} switches ({} forced), stack {}",
+            "  {} {:<8} {:<9} {:>3} switches ({} forced), {} ms on cpu, stack {}",
             entry.id,
             entry.name,
             entry.state,
             entry.switches,
             entry.preempted,
+            cpu_ms,
             stack
         );
     }

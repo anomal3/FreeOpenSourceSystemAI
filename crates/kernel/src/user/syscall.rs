@@ -42,6 +42,11 @@ use user_abi::{ERR_BROKEN_PIPE, LAUNCH_KEEP, Launch, SYS_LAUNCH, SYS_PIPE};
 use user_abi::{ERR_UPDATE_REFUSED, SYS_UPDATE};
 use user_abi::{ERR_LIMIT, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP};
 use user_abi::{
+    CLOCK_MONOTONIC, CLOCK_REALTIME, KIND_PIPE, POLL_BAD, POLL_FOREVER, POLL_HUP, POLL_IN,
+    POLL_OUT, PollFd, SYS_CLOCK, SYS_DUP, SYS_FSTAT, SYS_ISATTY, SYS_NANOSLEEP, SYS_POLL,
+    SYS_TIMES, Timespec, Times,
+};
+use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
     SYS_NETINFO, SYS_PEER, SYS_RANDOM, SYS_RECV, SYS_RESOLVE, SYS_SEND, SYS_SHUTDOWN,
@@ -152,6 +157,14 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_MMAP => mmap(a0, a1),
         SYS_MUNMAP => munmap(a0, a1),
         SYS_MMAP_FILE => mmap_file(a0, a1, a2),
+        // Фаза 44: то, без чего не встаёт libc.
+        SYS_DUP => dup(a0, a1),
+        SYS_FSTAT => fstat(a0, a1),
+        SYS_ISATTY => isatty(a0),
+        SYS_CLOCK => clock(a0, a1),
+        SYS_NANOSLEEP => nanosleep(a0 as u64, a1 as u64),
+        SYS_POLL => poll(a0, a1, a2 as i64),
+        SYS_TIMES => times(a0),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1170,6 +1183,318 @@ fn mmap_errno(err: super::MmapError) -> i64 {
         // придумывать для отображения второй словарь тех же самых причин
         // значило бы завести два ответа на один вопрос.
         super::MmapError::BadFile(err) => errno(err),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Фаза 44: вызовы, на которые можно положить libc
+// ---------------------------------------------------------------------------
+
+/// `dup(fd, куда) -> новый дескриптор`.
+///
+/// Вся работа — в таблице дескрипторов: там же сказано, почему копии делят
+/// позицию и почему занять ноль, единицу или двойку нельзя.
+fn dup(fd: usize, to: usize) -> i64 {
+    match super::with_current(|program| program.files.dup(fd, to)) {
+        Some(Ok(new_fd)) => new_fd as i64,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `fstat(fd, out) -> 0`.
+///
+/// Отличается от [`stat`] тем, о чём спрашивает: тот разбирает путь, а этот
+/// смотрит на уже открытое. Прав при этом не спрашивается вовсе — их спросили
+/// при открытии, и файл, который программа держит, она вправе измерить.
+fn fstat(fd: usize, out: usize) -> i64 {
+    // Выравнивание — до всего остального, как и у `stat`: невыровненная запись
+    // структуры отказывает на AArch64 и молча теряет скорость на x86-64.
+    if out % align_of::<Stat>() != 0 {
+        return ERR_BAD_ADDRESS;
+    }
+    if !space::user_can(out, size_of::<Stat>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+
+    let info = match super::with_current(|program| program.files.describe(fd)) {
+        Some(Ok(info)) => info,
+        Some(Err(err)) => return errno(err),
+        None => return ERR_NO_PROGRAM,
+    };
+
+    let value = Stat {
+        size: info.size,
+        mode: u32::from(info.mode),
+        uid: info.uid,
+        gid: info.gid,
+        kind: match info.kind {
+            files::FdKind::File => KIND_FILE,
+            files::FdKind::Directory => KIND_DIRECTORY,
+            files::FdKind::Pipe => KIND_PIPE,
+        },
+    };
+    // SAFETY: адрес проверен на выравнивание и на то, что структура целиком
+    // лежит в страницах, доступных программе на запись.
+    unsafe { core::ptr::write(out as *mut Stat, value) };
+    0
+}
+
+/// `isatty(fd) -> 1 | 0`.
+///
+/// # Почему таблицы дескрипторов здесь мало
+///
+/// Потому что стандартные потоки в ней не лежат: за ними либо терминал, либо
+/// конец канала, выданный запускающим. Всё, что лежит **в** таблице, программа
+/// открыла сама — файл, каталог или канал, — и терминалом не является ни одно
+/// из них. Поэтому вопрос разделён надвое: про потоки спрашиваем программу, про
+/// остальное — таблицу, и только ради того, чтобы отличить «не терминал» от
+/// «такого дескриптора нет».
+fn isatty(fd: usize) -> i64 {
+    if fd == FD_STDIN {
+        return match super::with_current(|program| program.stdin.is_some()) {
+            Some(true) => 0,
+            Some(false) => 1,
+            None => ERR_NO_PROGRAM,
+        };
+    }
+    if fd == FD_STDOUT || fd == FD_STDERR {
+        // Диагностика уходит в журнал системы, а он для программы — то же
+        // устройство, что консоль: увести в канал можно только вывод.
+        return match super::with_current(|program| program.stdout.is_some()) {
+            Some(true) if fd == FD_STDOUT => 0,
+            Some(_) => 1,
+            None => ERR_NO_PROGRAM,
+        };
+    }
+    match super::with_current(|program| program.files.describe(fd)) {
+        Some(Ok(_)) => 0,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `clock(какие часы, out) -> 0`.
+fn clock(kind: usize, out: usize) -> i64 {
+    /// Наносекунд в секунде.
+    const NANOS: u64 = 1_000_000_000;
+
+    if out % align_of::<Timespec>() != 0 {
+        return ERR_BAD_ADDRESS;
+    }
+    if !space::user_can(out, size_of::<Timespec>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+
+    let value = match kind {
+        CLOCK_MONOTONIC => {
+            let ns = time::uptime_ns();
+            Timespec { seconds: ns / NANOS, nanos: (ns % NANOS) as u32, _reserved: 0 }
+        }
+        CLOCK_REALTIME => match time::now_unix() {
+            // Доли секунды берутся у монотонного счётчика: время суток система
+            // знает с точностью до секунды — столько ей сказала прошивка, — а
+            // растёт оно ровно так же, как время работы.
+            Some(seconds) => Timespec {
+                seconds,
+                nanos: (time::uptime_ns() % NANOS) as u32,
+                _reserved: 0,
+            },
+            // Ноль означает «времени суток система не знает» — тот же ответ,
+            // что у `SYS_TIME`. Долей к нему не приписывается: у показания,
+            // которого нет, нет и долей.
+            None => Timespec::default(),
+        },
+        // Неизвестные часы — отказ, а не «возьмём монотонные»: программа,
+        // спросившая не то, получила бы не тот ответ и не узнала бы об этом.
+        _ => return ERR_UNSUPPORTED,
+    };
+
+    // SAFETY: адрес проверен на выравнивание и на запись.
+    unsafe { core::ptr::write(out as *mut Timespec, value) };
+    0
+}
+
+/// `nanosleep(секунды, наносекунды) -> 0`.
+fn nanosleep(seconds: u64, nanos: u64) -> i64 {
+    // Поле больше миллиарда — ошибка в счёте у просящего, а не повод проспать
+    // лишний день: такого `timespec` не бывает нигде.
+    if nanos >= 1_000_000_000 {
+        return ERR_BAD_ADDRESS;
+    }
+    // Округление **вверх**, и здесь оно двойное: наносекунды до миллисекунд
+    // здесь, миллисекунды до тика — в планировщике. Оба раза вверх, потому что
+    // вернуться раньше срока значит нарушить единственное, что вызов обещает, а
+    // поймать такое в программе, ждавшей готовности устройства, почти нельзя.
+    let Some(ms) = seconds
+        .checked_mul(1000)
+        .and_then(|whole| whole.checked_add(nanos.div_ceil(1_000_000)))
+    else {
+        return ERR_BAD_ADDRESS;
+    };
+    sched::sleep_ms(ms);
+    0
+}
+
+/// `times(out) -> 0`.
+fn times(out: usize) -> i64 {
+    if out % align_of::<Times>() != 0 {
+        return ERR_BAD_ADDRESS;
+    }
+    if !space::user_can(out, size_of::<Times>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+
+    let Some(cpu_ms) = sched::cpu_ms(sched::current()) else {
+        return ERR_NO_TASK;
+    };
+    let value = Times { cpu_ms, uptime_ms: time::uptime_ms() };
+    // SAFETY: адрес проверен на выравнивание и на запись.
+    unsafe { core::ptr::write(out as *mut Times, value) };
+    0
+}
+
+/// `poll(ptr, сколько, срок) -> сколько готовых`.
+///
+/// # Почему здесь цикл со сном, а не ожидание события
+///
+/// Потому что ждать надо **несколько** источников разом, а адрес ожидания у
+/// задачи один. Ввод будит [`sched::wake_input`], канал — `wake_lock` по своему
+/// адресу, и уснуть на обоих нечем. Поэтому задача засыпает коротким сроком и,
+/// проснувшись, спрашивает всех заново.
+///
+/// Цена названа честно: событие канала может опоздать на этот срок — десятую
+/// долю секунды. Это задержка, а не потеря, и тот же приём стоит в чтении
+/// ввода, где пробуждение тоже можно упустить. Настоящее решение — общий список
+/// ожидающих у каждого источника — это отдельная работа, и делать её половиной
+/// ради одного вызова значило бы получить `poll`, который иногда не просыпается
+/// вовсе.
+fn poll(ptr: usize, count: usize, timeout_ms: i64) -> i64 {
+    /// Сколько дескрипторов принимается за раз.
+    ///
+    /// Столько, сколько их у программы вообще бывает, плюс три стандартных
+    /// потока: спрашивать о большем — значит спрашивать об одном и том же
+    /// дважды, а массив разбирается на каждом круге цикла.
+    const MAX_POLL: usize = user_abi::MAX_OPEN_FILES + 3;
+
+    if count == 0 || count > MAX_POLL {
+        return ERR_BAD_ADDRESS;
+    }
+    let Some(bytes) = count.checked_mul(size_of::<PollFd>()) else {
+        return ERR_BAD_ADDRESS;
+    };
+    // Именно `WRITE`: в каждую запись ядро дописывает поле `ready`.
+    if !space::user_can(ptr, bytes, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+
+    let deadline = if timeout_ms == POLL_FOREVER {
+        None
+    } else if timeout_ms < 0 {
+        // Отрицательный срок, кроме POLL_FOREVER, ничего не означает.
+        return ERR_BAD_ADDRESS;
+    } else {
+        Some(time::uptime_ms().saturating_add(timeout_ms as u64))
+    };
+
+    loop {
+        let mut ready = 0;
+        for index in 0..count {
+            let at = ptr + index * size_of::<PollFd>();
+            // SAFETY: весь массив проверен по таблицам программы на запись;
+            // `PollFd` — `repr(C)`, и любое содержимое для него законно.
+            let mut entry = unsafe { (at as *const PollFd).read_unaligned() };
+            // Отрицательный номер — «эту строку пропустить»: так удобнее тому,
+            // кто держит список постоянным и временно выключает из него записи.
+            entry.ready = if entry.fd < 0 {
+                0
+            } else {
+                readiness_of(entry.fd as usize, entry.wanted)
+            };
+            if entry.ready != 0 {
+                ready += 1;
+            }
+            // SAFETY: тот же проверенный диапазон и та же структура.
+            unsafe { (at as *mut PollFd).write_unaligned(entry) };
+        }
+        if ready > 0 {
+            return ready;
+        }
+        if deadline.is_some_and(|deadline| time::uptime_ms() >= deadline) {
+            // Ноль означает «вышел срок», а не ошибку: это обычный исход.
+            return 0;
+        }
+        // Программу могли попросить снять, пока она ждала. Проверка здесь по
+        // той же причине, что и в чтении ввода: снятие происходит на возврате
+        // в третье кольцо, а ожидание без срока туда не возвращается никогда.
+        if super::kill_pending() {
+            return 0;
+        }
+
+        let slice = crate::irq::ticks() + u64::from(crate::irq::TIMER_HZ) / 10;
+        sched::block_on_input(slice, || false);
+    }
+}
+
+/// Что готово у одного дескриптора — в терминах договора.
+fn readiness_of(fd: usize, wanted: u32) -> u32 {
+    if fd == FD_STDIN {
+        return match super::with_current(|program| program.stdin.clone()) {
+            Some(Some(stdin)) => {
+                let mut ready = 0;
+                if wanted & POLL_IN != 0 && stdin.ready() {
+                    ready |= POLL_IN;
+                }
+                if stdin.hangup() {
+                    ready |= POLL_HUP;
+                }
+                ready
+            }
+            // Терминал: читать есть что, когда что-нибудь набрано **или** ввод
+            // кончился. Конец — тоже готовность, иначе программа, дождавшаяся
+            // Ctrl+D, ждала бы его вечно.
+            Some(None) if wanted & POLL_IN != 0 && crate::tty::ready() => POLL_IN,
+            Some(None) => 0,
+            None => POLL_BAD,
+        };
+    }
+    if fd == FD_STDOUT || fd == FD_STDERR {
+        return match super::with_current(|program| program.stdout.clone()) {
+            Some(Some(stdout)) if fd == FD_STDOUT => {
+                let mut ready = 0;
+                if wanted & POLL_OUT != 0 && stdout.ready() {
+                    ready |= POLL_OUT;
+                }
+                if stdout.hangup() {
+                    ready |= POLL_HUP;
+                }
+                ready
+            }
+            // Окно оболочки и журнал принимают всегда: очереди, которая могла
+            // бы переполниться, у них нет.
+            Some(_) => wanted & POLL_OUT,
+            None => POLL_BAD,
+        };
+    }
+
+    match super::with_current(|program| program.files.readiness(fd)) {
+        Some(Ok((readable, writable, hangup))) => {
+            let mut ready = 0;
+            if wanted & POLL_IN != 0 && readable {
+                ready |= POLL_IN;
+            }
+            if wanted & POLL_OUT != 0 && writable {
+                ready |= POLL_OUT;
+            }
+            if hangup {
+                ready |= POLL_HUP;
+            }
+            ready
+        }
+        // Дескриптора нет — это готовность, а не отказ всего вызова: иначе
+        // `poll` с одним закрытым номером в списке ждал бы полный срок, чтобы
+        // ответить «ничего не случилось».
+        Some(Err(_)) | None => POLL_BAD,
     }
 }
 

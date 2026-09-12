@@ -18,6 +18,8 @@
 //! том и разобранный inode — сотни байт, но выделяет их куча ядра, а не
 //! программа, и предела у неё нет.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -47,7 +49,21 @@ struct Open {
     /// отобразившая файл, закрывает дескриптор сразу же, потому что он ей
     /// больше не нужен, и страницы обязаны продолжать подкачиваться.
     node: Arc<dyn Node>,
-    offset: u64,
+    /// Докуда программа дочитала — и **общее** у всех копий дескриптора.
+    ///
+    /// Атомик, а не обычное число, с фазы 44: `SYS_DUP` выдаёт второй номер на
+    /// тот же открытый файл, и позиция у них обязана быть одна. Отдельные
+    /// позиции выглядели бы как работающий `dup` ровно до первой дописи в
+    /// конец — и это тот род ошибки, который находят не в отладчике, а в
+    /// испорченном файле.
+    ///
+    /// Взаимного исключения этот атомик **не** даёт и не обязан: «прочитать и
+    /// сдвинуть» — две операции, и атомарны они не сами по себе, а потому, что
+    /// обе идут под локом программы ([`super::with_current`]). Двух задач у
+    /// одной таблицы не бывает: дескрипторы не наследуются при запуске (см.
+    /// договор `SYS_SPAWN`), так что делить позицию может только сама программа
+    /// с собой.
+    offset: AtomicU64,
     /// Право писать спрошено при открытии и запомнено здесь. Перепроверять его
     /// на каждой записи не нужно и неверно: в Unix смена прав не отбирает уже
     /// открытый файл, и ровно на это рассчитывает всякий, кто держит файл
@@ -72,7 +88,10 @@ struct Open {
 /// стандартный ввод оказался сегодня, — а весь смысл канала в том, что не
 /// приходится.
 enum Slot {
-    File(Open),
+    /// Открытый файл. `Arc`, потому что дескрипторов на него бывает несколько:
+    /// `SYS_DUP` кладёт в другое место таблицы ссылку на **тот же** `Open`, и
+    /// закрытие одного номера оставляет файл живым, пока цел хоть один.
+    File(Arc<Open>),
     /// Читающий конец: из него берёт `read`.
     PipeRead(pipe::Reader),
     /// Пишущий конец: в него отдаёт `write`.
@@ -98,6 +117,27 @@ pub enum FileError {
     NotSeekable,
     /// Канал сказал своё: писать некому либо прямо сейчас нечего читать.
     Pipe(PipeError),
+}
+
+/// Чем оказался дескриптор — ответ [`Table::describe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdKind {
+    File,
+    Directory,
+    /// Конец канала. Отдельный вид, а не «файл нулевой длины»: библиотека
+    /// выбирает по нему способ буферизации, и труба, назвавшаяся файлом,
+    /// получила бы вывод, который не появляется, пока не наберётся килобайт.
+    Pipe,
+}
+
+/// Что ядро знает об открытом дескрипторе — ответ [`Table::describe`].
+#[derive(Debug, Clone, Copy)]
+pub struct FdInfo {
+    pub size: u64,
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub kind: FdKind,
 }
 
 /// От чего считается смещение в [`Table::seek`].
@@ -172,8 +212,12 @@ impl Table {
             .iter()
             .position(Option::is_none)
             .ok_or(FileError::TooManyFiles)?;
-        self.slots[slot] =
-            Some(Slot::File(Open { node: Arc::from(node), offset: 0, writable, entries }));
+        self.slots[slot] = Some(Slot::File(Arc::new(Open {
+            node: Arc::from(node),
+            offset: AtomicU64::new(0),
+            writable,
+            entries,
+        })));
         Ok(slot + FD_FIRST)
     }
 
@@ -201,8 +245,12 @@ impl Table {
             .iter()
             .position(Option::is_none)
             .ok_or(FileError::TooManyFiles)?;
-        self.slots[slot] =
-            Some(Slot::File(Open { node: Arc::from(node), offset: 0, writable: true, entries: None }));
+        self.slots[slot] = Some(Slot::File(Arc::new(Open {
+            node: Arc::from(node),
+            offset: AtomicU64::new(0),
+            writable: true,
+            entries: None,
+        })));
         Ok(slot + FD_FIRST)
     }
 
@@ -214,8 +262,9 @@ impl Table {
                 if !open.writable {
                     return Err(FileError::Vfs(VfsError::PermissionDenied));
                 }
-                let written = open.node.write_at(open.offset, data).map_err(FileError::Vfs)?;
-                open.offset += written as u64;
+                let at = open.offset.load(Ordering::Relaxed);
+                let written = open.node.write_at(at, data).map_err(FileError::Vfs)?;
+                open.offset.store(at + written as u64, Ordering::Relaxed);
                 Ok(written)
             }
             // Запись в канал через дескриптор **не ждёт** места, и это не
@@ -238,11 +287,11 @@ impl Table {
         let open = Self::as_file(self.slots[index].as_mut())?;
         let entries = open.entries.as_ref().ok_or(FileError::Vfs(VfsError::WrongKind))?;
 
-        let at = open.offset as usize;
+        let at = open.offset.load(Ordering::Relaxed) as usize;
         let Some(entry) = entries.get(at) else {
             return Ok(None);
         };
-        open.offset += 1;
+        open.offset.store(at as u64 + 1, Ordering::Relaxed);
         Ok(Some(entry.clone()))
     }
 
@@ -286,11 +335,12 @@ impl Table {
                 if open.entries.is_some() {
                     return Err(FileError::Vfs(VfsError::WrongKind));
                 }
-                let read = open.node.read_at(open.offset, buf).map_err(FileError::Vfs)?;
+                let at = open.offset.load(Ordering::Relaxed);
+                let read = open.node.read_at(at, buf).map_err(FileError::Vfs)?;
                 // Смещение двигается на прочитанное, а не на запрошенное: у
                 // конца файла это разные числа, и второе увело бы следующее
                 // чтение за конец.
-                open.offset += read as u64;
+                open.offset.store(at + read as u64, Ordering::Relaxed);
                 Ok(read)
             }
             // Не ждёт по той же причине, что и запись выше.
@@ -312,7 +362,7 @@ impl Table {
         let open = Self::as_file(self.slots[index].as_mut())?;
         let base = match whence {
             Whence::Set => 0,
-            Whence::Current => open.offset,
+            Whence::Current => open.offset.load(Ordering::Relaxed),
             // Размер спрашивается у узла, а не запоминается при открытии: файл
             // мог вырасти с тех пор — в том числе от записи через этот же
             // дескриптор.
@@ -322,7 +372,7 @@ impl Table {
         let Some(position) = base.checked_add_signed(offset) else {
             return Err(FileError::BadOffset);
         };
-        open.offset = position;
+        open.offset.store(position, Ordering::Relaxed);
         Ok(position)
     }
 
@@ -382,10 +432,96 @@ impl Table {
     }
 
     /// Место таблицы как файл.
-    fn as_file(slot: Option<&mut Slot>) -> Result<&mut Open, FileError> {
+    fn as_file(slot: Option<&mut Slot>) -> Result<&Open, FileError> {
         match slot.ok_or(FileError::BadFd)? {
             Slot::File(open) => Ok(open),
             _ => Err(FileError::NotSeekable),
+        }
+    }
+
+    /// Продублировать дескриптор. `to` — [`user_abi::DUP_ANY`] либо номер,
+    /// который надо занять.
+    ///
+    /// Копируется **ссылка**, а не открытый файл: позиция, права и снимок
+    /// каталога у копий общие. Для концов канала «копия» означает ещё и то,
+    /// что живых концов стало на один больше, — их считает сам канал, и без
+    /// этого закрытие первой копии объявило бы конец файла тому, кто читает с
+    /// другой стороны.
+    ///
+    /// Занятое место закрывается до того, как в него положат копию, и это
+    /// единственный способ выполнить просьбу: два места с одним номером не
+    /// бывают. Если копируют дескриптор сам в себя, не делается ничего — иначе
+    /// закрытие места уничтожило бы то, что мы собираемся в него положить.
+    pub fn dup(&mut self, fd: usize, to: usize) -> Result<usize, FileError> {
+        let from = index_of(fd)?;
+        let copy = match self.slots[from].as_ref().ok_or(FileError::BadFd)? {
+            Slot::File(open) => Slot::File(Arc::clone(open)),
+            Slot::PipeRead(reader) => Slot::PipeRead(reader.clone()),
+            Slot::PipeWrite(writer) => Slot::PipeWrite(writer.clone()),
+        };
+
+        let target = if to == user_abi::DUP_ANY {
+            self.free_slot()?
+        } else {
+            // Стандартные потоки местами таблицы не являются, и подменить их
+            // записью в ней нечем — см. договор `SYS_DUP`.
+            let target = index_of(to).map_err(|_| FileError::Vfs(VfsError::Unsupported))?;
+            if target == from {
+                return Ok(fd);
+            }
+            self.slots[target] = None;
+            target
+        };
+
+        self.slots[target] = Some(copy);
+        Ok(target + FD_FIRST)
+    }
+
+    /// Что лежит за дескриптором — для `SYS_FSTAT` и `SYS_ISATTY`.
+    ///
+    /// Отдаёт готовые числа, а не узел: у канала узла нет вовсе, и вызывающему
+    /// пришлось бы разбирать два случая там, где вопрос у него один.
+    pub fn describe(&self, fd: usize) -> Result<FdInfo, FileError> {
+        match self.slots.get(index_of(fd)?).and_then(Option::as_ref) {
+            Some(Slot::File(open)) => {
+                let meta = open.node.metadata();
+                Ok(FdInfo {
+                    size: meta.size,
+                    mode: meta.mode,
+                    uid: meta.uid,
+                    gid: meta.gid,
+                    kind: match meta.kind {
+                        NodeKind::Directory => FdKind::Directory,
+                        NodeKind::File => FdKind::File,
+                    },
+                })
+            }
+            // У канала нет ни длины, ни владельца, ни прав: он не лежит на
+            // носителе. Нули здесь — не заглушка, а единственный честный ответ,
+            // и отличает канал от пустого файла поле `kind`.
+            Some(Slot::PipeRead(_) | Slot::PipeWrite(_)) => Ok(FdInfo {
+                size: 0,
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                kind: FdKind::Pipe,
+            }),
+            None => Err(FileError::BadFd),
+        }
+    }
+
+    /// Готовность дескриптора: `(есть что читать, есть куда писать, другой
+    /// конец закрыт)` — для `SYS_POLL`.
+    ///
+    /// Обычный файл готов всегда, и это не упрощение: у него нечего ждать —
+    /// чтение с конца немедленно возвращает ноль, а запись идёт на носитель.
+    /// Так отвечает `poll` на файл везде, где он есть.
+    pub fn readiness(&self, fd: usize) -> Result<(bool, bool, bool), FileError> {
+        match self.slots.get(index_of(fd)?).and_then(Option::as_ref) {
+            Some(Slot::File(open)) => Ok((true, open.writable, false)),
+            Some(Slot::PipeRead(reader)) => Ok((reader.ready(), false, reader.hangup())),
+            Some(Slot::PipeWrite(writer)) => Ok((false, writer.ready(), writer.hangup())),
+            None => Err(FileError::BadFd),
         }
     }
 

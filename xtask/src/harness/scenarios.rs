@@ -760,7 +760,7 @@ pub const ALL: &[Scenario] = &[
             // меняется только вместе со списком в `/bin`. Сколько из них
             // показано, проверено порогом в начале сценария, где курсор эту
             // строку ещё не прошёл.
-            Step::Expect("of 26 programs from /bin"),
+            Step::Expect("of 27 programs from /bin"),
             Step::Key("f1"),
             Step::Await("desktop     : menu opened", 15_000),
             Step::Key("right"),
@@ -4321,6 +4321,77 @@ pub const ALL: &[Scenario] = &[
             Step::AtLeast("  udp      ", 2, 15_000),
             Step::Await("sockets  0 open", 15_000),
             Step::Absent("port 68 is taken"),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "abi",
+        about: "Вызовы, которых требует libc: dup, fstat, isatty, часы, nanosleep, poll, times.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Line("run /bin/posix"),
+
+            // Каждое утверждение ждётся отдельно и по порядку печати: программа
+            // печатает их одной строкой каждое, и строка, которой нет, — это
+            // проверка, до которой она не дошла.
+            Step::Await("posix: abi version 65536", 60_000),
+
+            // Позиция у копий дескриптора общая. Число здесь важнее слова:
+            // `dup` с независимой позицией сказал бы «четыре».
+            Step::Await("posix: dup shares the position, both say 8", 30_000),
+            Step::Await("posix: fstat matches stat, size ", 30_000),
+            Step::Await("posix: isatty stdout 1, file 0", 30_000),
+            Step::Await("posix: monotonic advanced ", 30_000),
+
+            // Сон длится не меньше запрошенного — проверено часами внутри
+            // программы, а сюда приезжает уже готовый ответ.
+            Step::Await("posix: nanosleep asked 30 ms, slept ", 30_000),
+            Step::Await("posix: times cpu ", 30_000),
+
+            // Главное утверждение фазы: две программы, соединённые каналом.
+            // `poll` просыпается на чужом выводе, а не по сроку, и видит конец
+            // трубы отдельно от её содержимого.
+            Step::Await("posix: poll saw the pipe readable, 1 ready", 60_000),
+
+            // Чтение канала через дескриптор не ждёт: пустой канал с живым
+            // писателем отвечает `ERR_AGAIN`, и ждать обязан сам читатель —
+            // этим вызовом. Строка печатается всегда, а вот **число** ожиданий
+            // проверять нельзя: успел ли `hello` написать всё разом, решает
+            // планировщик, и ноль здесь так же законен, как тройка.
+            Step::Await("posix: poll waited on the pipe ", 30_000),
+
+            Step::Await("posix: poll saw the hangup after ", 30_000),
+            Step::Await("posix: all checks passed", 30_000),
+
+            // Ни одна проверка не провалилась. Отдельным шагом, потому что
+            // «строка не напечаталась» и «проверка не прошла» — разные беды, и
+            // первую поймали бы ожидания выше, а вторую — только это.
+            Step::Absent("posix: FAILED"),
+
+            // Время на процессоре теперь печатает и `tasks`: без него счётчик
+            // переключений не отличает задачу, которая считает, от той, которую
+            // просто часто будят.
+            Step::Line("tasks"),
+            Step::Await(" ms on cpu", 15_000),
 
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),

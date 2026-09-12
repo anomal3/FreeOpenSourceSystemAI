@@ -246,10 +246,10 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 27] = [
+pub const USER_PROGRAMS: [&str; 28] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sshd",
-    "cat", "sysupdate", "fetch", "memtest", "filemap",
+    "cat", "sysupdate", "fetch", "memtest", "filemap", "posix",
 ];
 
 /// Программы, которые в `/bin` **не** едут.
@@ -564,7 +564,14 @@ pub fn check(arches: &[Arch]) -> Result<()> {
     // ошибки — чёрный экран без единой строки, потому что печатать ещё некуда:
     // адрес UART ядро берёт из того же дерева. Проверка идёт на настоящем
     // дереве, снятом с машины `virt`.
-    for package in ["fdt", "fpk", "slots", "ssh"] {
+    // Договор с программами — то же рассуждение, доведённое до конца. С фазы 44
+    // номера вызовов и раскладки структур больше не внутреннее дело двух наших
+    // крейтов, которые всегда собираются вместе и потому всегда согласны: это
+    // обещание программам, собранным когда-то отдельно. Проверяется оно
+    // единственным способом, который переживает невнимательность, — тестами,
+    // называющими каждый номер и каждый размер числом. Сдвинутое поле иначе
+    // сломало бы чужую программу молча, и не при сборке, а при чтении файла.
+    for package in ["fdt", "fpk", "slots", "ssh", "user-abi"] {
         let mut cmd = cargo();
         cmd.arg("test").arg("--package").arg(package);
         util::run(&mut cmd, &format!("cargo test ({package})"))?;

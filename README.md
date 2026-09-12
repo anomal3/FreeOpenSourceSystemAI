@@ -22,7 +22,7 @@ written down in the source, in Russian, next to the code that resulted from it.
 | **Boots** | UEFI on x86-64 and ARM64; a live ISO that writes nothing, and an installer that partitions a disk |
 | **Filesystem** | ext2, read and written by us — created, verified and repaired from inside the system (`fsck`) |
 | **Desktop** | Framebuffer compositor: antialiased proportional type, rounded translucent windows, a floating taskbar, start menu, terminal, file manager — in a dark and a light theme |
-| **Userspace** | ELF programs in ring 3 / EL0, one address space each, preemptive scheduling, pipes, `mode`/`uid`/`gid` enforced, memory on request (`mmap`) in 4 KiB or 2 MiB pages, and files mapped into memory and paged in on demand |
+| **Userspace** | ELF programs in ring 3 / EL0, one address space each, preemptive scheduling, pipes, `mode`/`uid`/`gid` enforced, memory on request (`mmap`) in 4 KiB or 2 MiB pages, files mapped into memory and paged in on demand, and a **versioned syscall contract** — `dup`, `fstat`, `isatty`, `poll`, clocks and CPU time, frozen by tests that name every number |
 | **Network** | Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP with all eleven states, TLS 1.3 with X.509 |
 | **SSH** | A real OpenSSH client logs in with a key and runs programs from `/bin` as the account that logged in |
 | **Updates** | A/B root slots, signed images, automatic rollback after three failed boots; over HTTP or GitHub Releases |
