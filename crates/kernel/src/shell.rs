@@ -526,6 +526,27 @@ fn run_command(line: &str) -> bool {
             // неотличимо от ошибки в разборе или в оболочке — на выяснение
             // ушло три полных прогона стенда.
             sprintln!("  serial   {} byte(s) lost to receiver overrun", input::ascii::overruns());
+            // Следующие две строки — про то, чем предыдущая держится у нуля.
+            // Пока ядро печатает, оно вычитывает приёмник само, байт за байтом;
+            // эти байты и есть «спасённые». Вторая строка — сколько из них не
+            // влезло в кольцо: потеря уже наша, не аппаратная, и чинится она
+            // размером кольца, а не порогом FIFO. Одним числом их не сложить —
+            // по сумме нельзя решить, что чинить; и строки две, а не одна, чтобы
+            // каждое число проверялось стендом по своему началу строки.
+            let (rescued, spilled) = input::ascii::rescued();
+            sprintln!("  rescued  {rescued} byte(s) taken from the receiver while printing");
+            sprintln!("  spilled  {spilled} byte(s) lost because the rescue ring was full");
+            // И строка про причину, а не про следствие: сколько длилась самая
+            // долгая печать с запрещёнными прерываниями. Это и есть промежуток,
+            // в который приёмник переполняется, — а заодно и тот, в который не
+            // идут часы и не работает вытеснение. Дефект открытый; строка стоит
+            // здесь, чтобы его не потеряли.
+            let (longest, at) = crate::print::longest_silence();
+            let hz = crate::arch::monotonic::frequency();
+            let us = if hz == 0 { 0 } else { longest * 1_000_000 / hz };
+            sprintln!(
+                "  deafest  {us} us, the longest print with interrupts disabled (at tick {at})"
+            );
             sprintln!(
                 "  terminal {} mode, {} byte(s) read by programs, {} dropped, foreground {}",
                 if tty::is_raw() { "raw" } else { "line" },

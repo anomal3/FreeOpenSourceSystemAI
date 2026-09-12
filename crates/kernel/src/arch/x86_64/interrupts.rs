@@ -462,7 +462,10 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
                 apic::eoi();
             }
             apic::VECTOR_SERIAL => {
-                super::drain_serial_rx();
+                // Только вынуть из FIFO. Разбор — на возврате из ловушки
+                // (`irq::on_trap_return`), потому что он будит планировщик, а
+                // здесь прерывание ещё не подтверждено.
+                crate::input::ascii::take();
                 apic::eoi();
             }
             // xHCI. Обработчик подтверждает прерывание у самого контроллера и

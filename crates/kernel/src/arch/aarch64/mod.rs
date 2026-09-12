@@ -413,6 +413,7 @@ const REG_IBRD: usize = 0x24; // Integer Baud Rate Divisor
 const REG_FBRD: usize = 0x28; // Fractional Baud Rate Divisor
 const REG_LCRH: usize = 0x2C; // Line Control
 const REG_CR: usize = 0x30; // Control
+const REG_IFLS: usize = 0x34; // Interrupt FIFO Level Select
 const REG_IMSC: usize = 0x38; // Interrupt Mask Set/Clear
 const REG_ICR: usize = 0x44; // Interrupt Clear
 
@@ -429,6 +430,21 @@ const INT_RX_TIMEOUT: u32 = 1 << 6;
 
 /// Все биты регистров прерываний PL011: одиннадцать источников.
 const INT_ALL: u32 = 0x7FF;
+
+/// `IFLS`: порог приёмного FIFO — одна восьмая, то есть четыре байта из
+/// тридцати двух; передающего — половина, как по сбросу.
+///
+/// Значение по сбросу (`0x12`) даёт половину и на приёме: прерывание пришло бы,
+/// когда шестнадцать байт уже в FIFO и до потери остаётся столько же. Ядро же
+/// печатает строку с запрещёнными прерываниями, а строка оболочки — это до 512
+/// байт, сорок миллисекунд линии; половина FIFO означала, что прерывание
+/// приходит, когда спасать почти нечего. Четверть от порога — двадцать восемь
+/// байт запаса вместо шестнадцати, а лишние прерывания на человеческом темпе
+/// набора не стоят ничего.
+///
+/// Поля: биты 2:0 — передатчик (`0b010` — половина), биты 5:3 — приёмник
+/// (`0b000` — одна восьмая).
+const IFLS_RX_EIGHTH_TX_HALF: u32 = 0b000_010;
 
 const LCRH_FEN: u32 = 1 << 4; // включить FIFO
 const LCRH_WLEN_8: u32 = 0b11 << 5; // 8 бит данных
@@ -578,6 +594,8 @@ impl SerialDevice for Serial {
             self.write(REG_IBRD, IBRD_115200);
             self.write(REG_FBRD, FBRD_115200);
             self.write(REG_LCRH, LCRH_FEN | LCRH_WLEN_8);
+            // Порог — после `LCRH`: до включения FIFO поле не имеет смысла.
+            self.write(REG_IFLS, IFLS_RX_EIGHTH_TX_HALF);
             self.write(REG_IMSC, 0);
             self.write(REG_CR, CR_UARTEN | CR_TXE | CR_RXE);
         }
@@ -682,13 +700,19 @@ pub unsafe fn enable_uart_rx() {
     }
 }
 
-/// Забрать из приёмника PL011 всё, что там есть, и отдать подсистеме ввода.
-pub fn drain_uart_rx() {
+/// Забрать из приёмника PL011 всё, что там есть. Возвращает число байт в `out`.
+///
+/// Байты только вынимаются, но не разбираются: разбор кончается пробуждением
+/// планировщика, а звать эту функцию приходится в том числе изнутри печати, где
+/// планировщик может быть уже занят нами же. Разводит одно с другим
+/// [`crate::input::ascii`], там же и разбор.
+pub fn drain_serial_rx(out: &mut [u8]) -> usize {
     let uart = serial_fallback();
     if uart.kind != Kind::Pl011 {
-        return;
+        return 0;
     }
-    for _ in 0..32 {
+    let mut taken = 0;
+    while taken < out.len() {
         // SAFETY: чтение регистра флагов побочных эффектов не имеет.
         if unsafe { uart.read(REG_FR) } & FR_RXFE != 0 {
             break;
@@ -703,14 +727,15 @@ pub fn drain_uart_rx() {
         if word & DR_OVERRUN != 0 {
             crate::input::ascii::note_overrun();
         }
-        let byte = word as u8;
-        crate::input::ascii::feed(byte);
+        out[taken] = word as u8;
+        taken += 1;
     }
     // Флаги снимаются после вычитывания. `RXRIS` опускается и сам, когда FIFO
     // опустошено, но `RTRIS` (тайм-аут) — только записью в `ICR`, и без неё
     // прерывание пришло бы снова немедленно.
     // SAFETY: см. выше.
     unsafe { uart.write(REG_ICR, INT_RX | INT_RX_TIMEOUT) };
+    taken
 }
 
 /// Остановить процессор до ближайшего прерывания.

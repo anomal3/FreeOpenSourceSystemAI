@@ -13,6 +13,7 @@
 //! | [`reboot`]   | перезагрузить её же                                  |
 //! | [`poll_boot_devices`] | обмен с теми, кто не дождётся планировщика  |
 //! | [`report_boot_devices`] | их итог, пока журнал ещё виден человеку   |
+//! | [`drain_serial_rx`] | вынуть принятое из приёмника, не разбирая     |
 //!
 //! Остальной код ядра не содержит ни одного `#[cfg(target_arch)]`: выбор
 //! реализации происходит ровно один раз, вот в этом модуле.
@@ -23,8 +24,8 @@ use crate::mm::VirtAddr;
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
-    ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, halt, pci_config_read32,
-    pci_config_write32, poll_boot_devices, power_off, reboot, remember_serial,
+    ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, drain_serial_rx, halt,
+    pci_config_read32, pci_config_write32, poll_boot_devices, power_off, reboot, remember_serial,
     report_boot_devices, serial_fallback, spawn_input_services, wait_for_interrupt,
 };
 
@@ -32,8 +33,8 @@ pub use x86_64::{
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
-    ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, halt, pci_config_read32,
-    pci_config_write32, poll_boot_devices, power_off, reboot, remember_serial,
+    ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, drain_serial_rx, halt,
+    pci_config_read32, pci_config_write32, poll_boot_devices, power_off, reboot, remember_serial,
     report_boot_devices, serial_fallback, spawn_input_services, wait_for_interrupt,
 };
 

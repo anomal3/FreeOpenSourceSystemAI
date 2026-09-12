@@ -561,8 +561,10 @@ fn handle_irq(from_user: bool) {
         crate::irq::on_timer_tick();
     } else if intid == input::UART_INTID {
         // Ровно та же логика, что у таймера: линия UART уровневая, и `EOI` до
-        // вычитывания FIFO вернул бы нас сюда немедленно.
-        super::drain_uart_rx();
+        // вычитывания FIFO вернул бы нас сюда немедленно. Только вынуть, не
+        // разбирая: разбор будит планировщик и потому отложен до
+        // `irq::on_trap_return`, то есть до подтверждения.
+        crate::input::ascii::take();
     } else if intid != 0 && intid == XHCI_INTID.load(Ordering::Relaxed) {
         // MSI от контроллера xHCI, пришедшее через приставку v2m как обычное
         // SPI. Обработчик подтверждает прерывание у контроллера и будит задачу;
