@@ -23,6 +23,7 @@ written down in the source, in Russian, next to the code that resulted from it.
 | **Filesystem** | ext2, read and written by us — created, verified and repaired from inside the system (`fsck`) |
 | **Desktop** | Framebuffer compositor: antialiased proportional type, rounded translucent windows, a floating taskbar, start menu, terminal, file manager — in a dark and a light theme. A program can ask for **a window of its own**: it draws straight into mapped pixels and reads its own keys and clicks — the system monitor is exactly that, a program outside the kernel |
 | **Userspace** | ELF programs in ring 3 / EL0, one address space each, preemptive scheduling, pipes, `mode`/`uid`/`gid` enforced, memory on request (`mmap`) in 4 KiB or 2 MiB pages, files mapped into memory and paged in on demand, and a **versioned syscall contract** — `dup`, `fstat`, `isatty`, `poll`, clocks and CPU time, frozen by tests that name every number |
+| **Familiar to a Windows user** | `cat C:\etc\system.cfg` works, and so does `\bin`; `D:` is refused by name, because this system has one root. The file manager labels `/bin` as «Программы» and `/home/you` as «Мои документы», folds the service trees, and shows the real path all the while — one key switches it all off |
 | **Settings** | Timezone, theme, and a static address are set in a window and survive a reboot — written to `/etc` on the state partition, applied at the next boot before any service starts. Volumes and accounts are listed; the filesystem check runs from there |
 | **C and a toolchain** | A picolibc port and a cross toolchain: `x86_64-freeos-cc hello.c -o hello` produces a program that runs. **zlib 1.3.1 builds from its own `configure`, unpatched, for both architectures** — and the result works: 18 000 bytes compress to 123 and come back byte-identical, inside the system |
 | **Network** | Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP with all eleven states, TLS 1.3 with X.509 |
@@ -166,7 +167,7 @@ waiting to go wrong in it is in **[ROADMAP.md](ROADMAP.md)**.
 | **v0.3** | Network: Ethernet through TCP, SSH with key login, signed updates, TLS 1.3 | **done** |
 | **v0.4** | Real hardware: a phone — its own bootloader, no UEFI, no ACPI, USB in device mode, **a working touchscreen** | in progress |
 | **v0.5** | A libc and a toolchain: somebody else's project builds for this system unpatched | **done** |
-| **v0.6** | Windows belong to programs; settings and desktop icons | in progress |
+| **v0.6** | Windows belong to programs; settings that persist; a layout a Windows user recognises | **done** |
 | next | btrfs: data apart from the system | planned |
 | then | A Raspberry Pi 4 — the first machine that is not an emulator | planned |
 

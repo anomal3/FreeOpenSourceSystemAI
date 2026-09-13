@@ -187,6 +187,17 @@ struct Files {
     preview: Option<Preview>,
     /// Домашний каталог для боковой колонки.
     home: String,
+    /// Знакомый вид: подписи вместо имён, служебные деревья свёрнуты.
+    ///
+    /// По умолчанию включён, и это не мелочь: система, которую человек видит
+    /// впервые, встречает его словами «Программы» и «Настройки», а не `/bin` и
+    /// `/etc`. Выключается клавишей — тем же способом, каким везде показывают
+    /// скрытые файлы, — и тогда видно настоящие имена и все каталоги.
+    ///
+    /// Настоящий путь при этом виден **всегда**, в адресной строке: подпись
+    /// украшает, а не прячет. Подпись, вытеснившая путь, превращает «нет такого
+    /// файла» в загадку.
+    friendly: bool,
 }
 
 impl Files {
@@ -201,6 +212,7 @@ impl Files {
             error: None,
             preview: None,
             home,
+            friendly: true,
         };
         view.reload();
         view
@@ -215,7 +227,16 @@ impl Files {
 
         match list_dir(&self.path) {
             Ok((rows, dropped)) => {
-                self.rows = rows;
+                // Служебные деревья сворачиваются здесь, а не при отрисовке:
+                // иначе стрелка вниз ходила бы по невидимым строкам, и выделение
+                // пропадало бы на ровном месте.
+                self.rows = if self.friendly {
+                    rows.into_iter()
+                        .filter(|row| !sysconf::winpath::is_folded(&join(&self.path, &row.name)))
+                        .collect()
+                } else {
+                    rows
+                };
                 self.dropped = dropped;
                 // Каталоги наверх, дальше по имени: порядок записей в ext2 —
                 // это порядок вставки, то есть для человека случайный.
@@ -269,7 +290,35 @@ impl Files {
                 self.reload();
                 true
             }
+            // Переключить вид. Выделение сбрасывается вместе с перечитыванием
+            // списка — иначе номер строки указывал бы на другую запись: в
+            // обычном виде каталогов больше.
+            VIEW => {
+                self.friendly = !self.friendly;
+                self.reload();
+                println(&format!(
+                    "files: view {}",
+                    if self.friendly { "friendly" } else { "plain" }
+                ));
+                true
+            }
             _ => false,
+        }
+    }
+
+    /// Как называется эта запись на экране.
+    ///
+    /// Подпись есть у немногих каталогов и только на верхних уровнях — таблица в
+    /// `sysconf::winpath`. У остальных возвращается настоящее имя: сочинять
+    /// перевод для `/usr/lib` значило бы показывать человеку слово, которого он
+    /// нигде больше не увидит.
+    fn shown_name<'a>(&self, row: &'a Row) -> &'a str {
+        if !self.friendly {
+            return &row.name;
+        }
+        match sysconf::winpath::label(&join(&self.path, &row.name)) {
+            Some(label) => label,
+            None => &row.name,
         }
     }
 
@@ -532,6 +581,14 @@ impl Files {
                 RowState::Idle
             };
             paint::row(inner, s, slot.rect, state);
+            // В боковой колонке подпись уместна больше всего: это ровно те
+            // места, у которых знакомое имя есть, и человек ищет их глазами, а
+            // не читает путь.
+            let shown = if self.friendly {
+                sysconf::winpath::label(&slot.path).unwrap_or(slot.path.as_str())
+            } else {
+                slot.path.as_str()
+            };
             paint::text_clipped(
                 inner,
                 s,
@@ -539,7 +596,7 @@ impl Files {
                 slot.rect.x + pad as i32,
                 paint::baseline(inner, Role::Mono, slot.rect),
                 slot.rect.w.saturating_sub(pad * 2),
-                &slot.path,
+                shown,
                 paint::row_ink(inner, state),
             );
         }
@@ -662,7 +719,7 @@ impl Files {
                 name_x,
                 paint::baseline(ctx, role, rect),
                 room,
-                &row.name,
+                self.shown_name(row),
                 ink,
             );
         }
@@ -735,8 +792,9 @@ impl Files {
             )
         } else {
             format!(
-                "{} объектов    Enter — открыть    Backspace — вверх    R — обновить",
-                self.rows.len()
+                "{} объектов    Enter — открыть    Backspace — вверх    R — обновить                     V — {}",
+                self.rows.len(),
+                if self.friendly { "настоящие имена" } else { "знакомый вид" }
             )
         };
         let pad = ctx.px(14);
@@ -774,6 +832,9 @@ const BACKSPACE: u32 = 0x08;
 const ESCAPE: u32 = 0x1B;
 /// Обновить список. `r` — потому что F-ряд договор программам не отдаёт.
 const REFRESH: u32 = 'r' as u32;
+
+/// Переключить знакомый вид на настоящие имена и обратно.
+const VIEW: u32 = 'v' as u32;
 /// Закрыть окно.
 const QUIT: u32 = 'q' as u32;
 

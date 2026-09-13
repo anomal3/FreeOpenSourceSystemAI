@@ -492,6 +492,37 @@ fn update_status() {
 }
 
 
+/// Путь, который набрал человек: `C:\etc` здесь означает `/etc`.
+///
+/// `None` — путь назвал том, которого в этой системе нет; об этом уже сказано, и
+/// команде делать нечего.
+///
+/// # Почему перевод здесь, а не в разборе пути
+///
+/// Потому что переводить можно только то, что набрал человек. Всё остальное —
+/// путь, который система сложила сама (`/mnt/` + аргумент), имя в журнале, имя
+/// в сообщении об ошибке — обязано работать с настоящими именами: иначе два
+/// написания одного пути разойдутся, и отличить их будет не по чему. Оболочка —
+/// ровно та граница, за которой начинается набранное человеком.
+///
+/// Возвращается `String`, а не `Cow`: юниксовый путь тут копируется зря, но
+/// команда оболочки и так печатает его в строку, а `Cow` в сигнатуре стоил бы
+/// времени жизни у каждого места вызова.
+fn human_path(argument: &str) -> Option<String> {
+    match sysconf::winpath::accept(argument) {
+        sysconf::winpath::Accepted::AsIs(path) => Some(String::from(path)),
+        sysconf::winpath::Accepted::Translated(path) => Some(path),
+        sysconf::winpath::Accepted::NoSuchDrive(letter) => {
+            sprintln!(
+                "  there is no drive {letter}: in this system. \
+                 It has a single root, and it is {}:",
+                sysconf::winpath::DRIVE
+            );
+            None
+        }
+    }
+}
+
 /// Выполнить команду. Возвращает `true`, если сеанс пора закончить.
 fn run_command(line: &str) -> bool {
     let line = line.trim();
@@ -567,19 +598,24 @@ fn run_command(line: &str) -> bool {
                 sprintln!("  (no window to clear; output goes to the serial console)");
             }
         }
-        "ls" => list(if argument.is_empty() { "/" } else { argument }),
+        "ls" => {
+            let Some(path) = human_path(if argument.is_empty() { "/" } else { argument }) else {
+                return false;
+            };
+            list(&path);
+        }
         "stat" => {
             if argument.is_empty() {
                 sprintln!("  usage: stat <path>");
-            } else {
-                stat(argument);
+            } else if let Some(path) = human_path(argument) {
+                stat(&path);
             }
         }
         "cat" => {
             if argument.is_empty() {
                 sprintln!("  usage: cat <path>");
-            } else {
-                show(argument);
+            } else if let Some(path) = human_path(argument) {
+                show(&path);
             }
         }
         // `echo текст > путь` — единственное перенаправление, какое здесь
@@ -589,14 +625,20 @@ fn run_command(line: &str) -> bool {
         // печатают напрямую. Обещать `>` для всех команд, сделав его для одной,
         // было бы хуже, чем не обещать вовсе.
         "echo" => match argument.split_once('>') {
-            Some((text, path)) => save(path.trim(), text.trim_end()),
+            // Переводится **только цель перенаправления**: текст слева от `>` —
+            // это текст, и `echo C:\Windows` обязан напечатать то, что набрали.
+            Some((text, path)) => {
+                if let Some(path) = human_path(path.trim()) {
+                    save(&path, text.trim_end());
+                }
+            }
             None => sprintln!("  {argument}"),
         },
         "mkdir" => {
             if argument.is_empty() {
                 sprintln!("  usage: mkdir <path>");
-            } else {
-                match fs::mkdir_as(user::session::credentials(), argument, 0o755) {
+            } else if let Some(argument) = human_path(argument) {
+                match fs::mkdir_as(user::session::credentials(), &argument, 0o755) {
                     Some(Ok(())) => sprintln!("  created {argument}"),
                     Some(Err(err)) => sprintln!("  mkdir {argument}: {err}"),
                     None => sprintln!("  no filesystem is mounted"),
@@ -606,8 +648,8 @@ fn run_command(line: &str) -> bool {
         "rm" => {
             if argument.is_empty() {
                 sprintln!("  usage: rm <path>");
-            } else {
-                match fs::remove_as(user::session::credentials(), argument) {
+            } else if let Some(argument) = human_path(argument) {
+                match fs::remove_as(user::session::credentials(), &argument) {
                     Some(Ok(())) => sprintln!("  removed {argument}"),
                     Some(Err(err)) => sprintln!("  rm {argument}: {err}"),
                     None => sprintln!("  no filesystem is mounted"),

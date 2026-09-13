@@ -216,7 +216,17 @@ impl Icons {
     /// Сколько всего значков и сколько из них пришло из каталога стола.
     #[must_use]
     pub fn counts(&self) -> (usize, usize) {
-        let entries = self.items.iter().filter(|item| item.path.is_some()).count();
+        // Считаются записи **каталога стола**, а не всё, у чего есть путь.
+        // Разница появилась в 47c и тогда же осталась незамеченной: значок
+        // «Файлы» стал `Kind::Program` с командой в поле `path`, и строка
+        // журнала «N из ~/Desktop» начала врать на единицу. Ловил её только
+        // сценарий стенда, и ловил как несовпадение числа, а не как ошибку в
+        // словах — то есть выглядело это как сломанный сценарий.
+        let entries = self
+            .items
+            .iter()
+            .filter(|item| matches!(item.kind, Kind::Folder | Kind::File))
+            .count();
         (self.items.len(), entries)
     }
 

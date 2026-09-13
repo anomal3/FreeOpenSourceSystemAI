@@ -670,3 +670,82 @@ pub fn clean() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Установщик кладёт в `/bin` **каждую** собранную программу.
+    ///
+    /// # Зачем читать чужой исходник, а не сверять два списка в коде
+    ///
+    /// Затем, что второй список живёт в крейте установщика, а тот собирается
+    /// только под UEFI-мишень: подключить его сюда как библиотеку нельзя.
+    /// Остаётся то же, что уже делает `cbuild` с заголовком для C, — прочитать
+    /// файл и вынуть из него имена. Разбор тупой намеренно: файл наш, и правило
+    /// «одна пара в строке» соблюдать дешевле, чем писать разборщик Rust.
+    ///
+    /// # Цена, которую этот тест уже окупил
+    ///
+    /// Список установщика разошёлся с `USER_PROGRAMS` дважды. В первый раз
+    /// (фаза 37) спасла длина массива, записанная числом: установщик перестал
+    /// собираться. Во второй (фазы 47b и 47c) длина совпала — забыли и строки, и
+    /// число, — и установленная система полгода оставалась без файлового
+    /// менеджера и монитора. Нашлось это случайно, сценарием, который просто
+    /// перечислил `/bin`.
+    #[test]
+    fn installer_ships_every_program() {
+        let path = paths::workspace_root().join("crates/installer/src/payload.rs");
+        let text = std::fs::read_to_string(&path).expect("исходник установщика на месте");
+
+        // Из `PROGRAMS` берётся второе поле пары — имя в `/bin`.
+        let body = text
+            .split("const PROGRAMS:")
+            .nth(1)
+            .and_then(|rest| rest.split("];").next())
+            .expect("в установщике есть таблица PROGRAMS");
+        let mut shipped: Vec<&str> = Vec::new();
+        for line in body.lines() {
+            let Some(rest) = line.split_once("), \"") else {
+                continue;
+            };
+            let Some(name) = rest.1.split('"').next() else {
+                continue;
+            };
+            shipped.push(name);
+        }
+        assert!(
+            shipped.len() > 20,
+            "из установщика вынулось всего {} имён — разбор сломался",
+            shipped.len()
+        );
+
+        let expected: Vec<&str> = USER_PROGRAMS
+            .iter()
+            .copied()
+            .chain(crate::cbuild::C_PROGRAMS.iter().map(|program| program.name))
+            .collect();
+
+        let missing: Vec<&&str> = expected
+            .iter()
+            .filter(|name| !shipped.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "установщик не кладёт в /bin: {missing:?}\n\
+             Дописать пары в PROGRAMS (crates/installer/src/payload.rs) и поднять длину массива."
+        );
+
+        // И в обратную сторону: имя, которого больше не собирают, установщик
+        // будет искать на носителе и не найдёт. Отказ при этом выглядит как
+        // испорченный носитель.
+        let stray: Vec<&&str> = shipped
+            .iter()
+            .filter(|name| !expected.contains(name))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "установщик ищет на носителе то, чего не собирают: {stray:?}"
+        );
+    }
+}

@@ -837,7 +837,14 @@ pub const ALL: &[Scenario] = &[
             // меняется только вместе со списком в `/bin`. Сколько из них
             // показано, проверено порогом в начале сценария, где курсор эту
             // строку ещё не прошёл.
-            Step::Expect("of 30 programs from /bin"),
+            //
+            // Тридцать две с фазы 46: к тридцати программам на Rust добавились
+            // две на C — `cdemo` и `zdemo`. Цена названа вслух: `zdemo`
+            // собирается только там, где выполнена `cargo xtask thirdparty`,
+            // то есть где была сеть. На машине без интернета это число будет
+            // 31, и стенд об этом скажет — здесь и в сценарии `sdk`, которому
+            // без `zdemo` нечего запускать.
+            Step::Expect("of 32 programs from /bin"),
             Step::Key("f1"),
             Step::Await("desktop     : menu opened", 15_000),
             Step::Key("right"),
@@ -851,8 +858,14 @@ pub const ALL: &[Scenario] = &[
             // В фазе 41 он и поменялся: `filemap` встаёт между `fetch` и
             // `forever`, то есть перед `hello`, и сдвинул его на строку вниз. В
             // 47c — снова: `files` встаёт между `filemap` и `forever`.
-            // Одиннадцать нажатий.
-            Step::Repeat("down", 11),
+            //
+            // И в 48a — в третий раз, но по другой причине: выяснилось, что
+            // меню открывается с **уже выбранной** первой строкой, а не с
+            // пустым выбором. То есть счёт всегда был на единицу мал, и
+            // одиннадцать нажатий приводили на `forever`. Заметить это раньше
+            // было нечем: соседняя строка запускается так же успешно, а имя в
+            // ожидании до 48a никто не перепроверял.
+            Step::Repeat("down", 12),
             Step::Key("ret"),
             Step::Await("desktop     : started '/bin/hello'", 15_000),
             // И то, ради чего пункт вообще нужен: программа не просто
@@ -2453,14 +2466,26 @@ pub const ALL: &[Scenario] = &[
             // которого сценарий дождался выше, — поэтому проверка по всему
             // журналу, а не ожидание вперёд от курсора.
             Step::Expect("desktop     : icons 4, 0 from /home/roman/Desktop"),
+            // Монитор системы запускается **вручную**, и это не забывчивость
+            // сценария. С фазы 47b он программа (`/bin/sysmon`), а службой быть
+            // не должен: открытие окна держит стол сотни миллисекунд, и всё,
+            // что придёт в этот момент, рискует пропасть — так и написано в
+            // `services`. До 47b окно заводило ядро само, и сценарий его просто
+            // находил; с тех пор он **искал окно, которого никто не открывал**,
+            // и был красным. Нашлось это в 48a, вместе с двумя такими же.
+            Step::Line("run -b /bin/sysmon"),
+            Step::Await("window      : 'System' at", 30_000),
+            Step::Wait(1_500),
             // Окна убираются с дороги: меню стола открывается только там, где
-            // стол виден, а щелчок по окну — это щелчок по окну.
-            Step::Aim(Aim::Minimize("Terminal")),
-            Step::Click,
-            Step::Await("desktop     : minimized 'Terminal'", 15_000),
+            // стол виден, а щелчок по окну — это щелчок по окну. Монитор
+            // сворачивается первым: он только что открылся и лежит поверх
+            // оболочки, то есть её кнопка сейчас под ним.
             Step::Aim(Aim::Minimize("System")),
             Step::Click,
             Step::Await("desktop     : minimized 'System'", 15_000),
+            Step::Aim(Aim::Minimize("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : minimized 'Terminal'", 15_000),
             Step::Aim(Aim::Empty),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
@@ -4410,6 +4435,96 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("sshd: encrypted, curve25519-sha256 with chacha20-poly1305", 30_000),
             Step::AwaitAny("sshd: service accepted", 15_000),
 
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "winpath",
+        about: "Путь, написанный по-виндовому, ведёт туда же; в менеджере — знакомые подписи.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+
+            // ── Оболочка ─────────────────────────────────────────────────────
+            //
+            // Сначала юниксовое написание — оно задаёт то, с чем сравнивать.
+            // Строка `timezone=` есть в `system.cfg` у всякой установленной
+            // системы, и её написал установщик, а не мы.
+            Step::Line("cat /etc/system.cfg"),
+            Step::Await("timezone=", 15_000),
+            // То же самое по-виндовому, с обратными косыми. Отвечать обязано
+            // тем же.
+            Step::Line(r"cat C:\etc\system.cfg"),
+            Step::Await("timezone=", 15_000),
+            // И со прямыми косыми после буквы: так пишут те, кто уже привык к
+            // обоим мирам.
+            Step::Line("ls C:/etc"),
+            Step::Await("system.cfg", 15_000),
+            // Одиночная обратная косая — «от корня» в виндовом написании.
+            Step::Line(r"ls \bin"),
+            Step::Await("files", 15_000),
+
+            // Чужая буква — отказ по имени, а не молчаливое совпадение с C:.
+            // Это главное утверждение раздела: `D:\etc` и `C:\etc` в той
+            // системе, откуда человек пришёл, — разные места, и открыть по ним
+            // один файл значило бы соврать ему о его же данных.
+            Step::Line(r"cat D:\etc\system.cfg"),
+            Step::Await("there is no drive D: in this system", 15_000),
+            Step::Absent("timezone= (from D)"),
+
+            // Обратная косая **в имени файла** остаётся знаком имени, а не
+            // разделителем: путь без буквы тома и без ведущей косой не
+            // переводится вовсе.
+            Step::Line("mkdir /home/roman/w"),
+            Step::Await("created /home/roman/w", 15_000),
+            Step::Line(r"mkdir C:\home\roman\w\inner"),
+            Step::Await("created /home/roman/w/inner", 15_000),
+            Step::Line(r"rm C:\home\roman\w\inner"),
+            Step::Await("removed /home/roman/w/inner", 15_000),
+            Step::Line("rm /home/roman/w"),
+            Step::Await("removed /home/roman/w", 15_000),
+
+            // ── Файловый менеджер ────────────────────────────────────────────
+            Step::Line("run -b /bin/files"),
+            Step::Await("window      : 'Files' at", 30_000),
+            Step::Await("files: / has ", 15_000),
+            Step::Wait(2_500),
+            // В знакомом виде: «Программы» вместо `bin`, «Настройки» вместо
+            // `etc`, а служебные деревья свёрнуты.
+            Step::Shot("01-friendly"),
+            // Переключатель показывает настоящие имена — и вместе с ними всё,
+            // что было свёрнуто.
+            Step::Type("v"),
+            Step::Await("files: view plain", 15_000),
+            Step::Wait(2_500),
+            Step::Shot("02-plain"),
+            // И обратно: переключатель работает в обе стороны, а не «включается
+            // один раз».
+            Step::Type("v"),
+            Step::Await("files: view friendly", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("03-friendly-again"),
+
+            Step::Key("ctrl-w"),
+            Step::Await("files: closing on request", 15_000),
+            Step::Await("desktop     : focus 'Terminal'", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
         ],
     },
