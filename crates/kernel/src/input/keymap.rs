@@ -4,14 +4,24 @@
 //! [`KeyCode::Digit2`] нарисовано `2` и `@`. Драйверы об этом не знают
 //! принципиально — см. заголовок [`super`].
 //!
-//! # Что реализовано
+//! # Раскладки
 //!
-//! US QWERTY и только он. Причина не в лени: русская раскладка требует не второй
-//! таблицы, а решения двух вопросов, которых на этой фазе не существует, —
-//! как переключаться между раскладками и в какой кодировке ядро держит текст
-//! (ASCII в текущей экранной консоли не покрывает кириллицу вовсе, см. таблицу
-//! глифов в [`crate::console`]). Добавить вторую таблицу к готовому решению
-//! легко; выбрать решение задним числом, когда таблиц уже три, — нет.
+//! Две: US QWERTY и русская ЙЦУКЕН. Действующая — одно состояние на всё ядро
+//! ([`layout`]), а не свойство окна: клавиатура одна, и человек, переключивший
+//! её в терминале, ждёт кириллицы и в поле имени файла. Переключается сочетанием
+//! Alt+Shift (см. [`observe`]) и Win+Пробел на столе — ровно теми, к которым
+//! привык человек с Windows, — а при загрузке берётся из `/etc/system.cfg`,
+//! куда её записал установщик ([`adopt`]).
+//!
+//! Русская таблица — та, что в Windows: `ё` на клавише слева от единицы, точка
+//! и запятая на клавише `/`, `№` на Shift+3. Ctrl-сочетания при этом считаются
+//! по латинской позиции клавиши: Ctrl+C — это 0x03 независимо от раскладки,
+//! иначе прервать программу в русской раскладке было бы нечем.
+//!
+//! Кириллица доезжает до экрана как UTF-8: сетка терминала хранит символы, а
+//! не байты, и шрифт стола содержит русский алфавит. Текстовая консоль без
+//! графики знает только ASCII и печатает вместо буквы `?` — это ограничение
+//! консоли, а не раскладки.
 //!
 //! # Чего здесь нет намеренно
 //!
@@ -21,7 +31,160 @@
 //! Потребитель разбирает такие клавиши по [`KeyCode`] — так у него остаётся
 //! возможность повести себя по-разному, а не только удалить символ.
 
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
 use super::{KeyCode, KeyEvent, Modifiers};
+
+/// Раскладка клавиатуры.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Layout {
+    /// Латиница, US QWERTY.
+    Us,
+    /// Кириллица, ЙЦУКЕН.
+    Ru,
+}
+
+impl Layout {
+    /// Как раскладка записана в `/etc/system.cfg` — теми же словами, что у
+    /// установщика.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Layout::Us => "us",
+            Layout::Ru => "ru",
+        }
+    }
+
+    /// Две буквы для трея — язык, а не раскладка: так подписан индикатор
+    /// в Windows, и так его читают, не задумываясь.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Layout::Us => "EN",
+            Layout::Ru => "RU",
+        }
+    }
+
+    /// Имя для меню и журнала.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Layout::Us => "English (US)",
+            Layout::Ru => "Русская",
+        }
+    }
+
+    /// Другая из двух.
+    #[must_use]
+    pub const fn other(self) -> Self {
+        match self {
+            Layout::Us => Layout::Ru,
+            Layout::Ru => Layout::Us,
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "us" | "en" => Some(Layout::Us),
+            "ru" => Some(Layout::Ru),
+            _ => None,
+        }
+    }
+
+    const fn from_bits(bits: u8) -> Self {
+        match bits {
+            1 => Layout::Ru,
+            _ => Layout::Us,
+        }
+    }
+}
+
+/// Действующая раскладка. Атомик, а не замок: читается на каждую клавишу, в
+/// том числе из мест, где замок брать нельзя.
+static LAYOUT: AtomicU8 = AtomicU8::new(0);
+
+/// Сочетание Alt+Shift уже сработало и клавиши ещё не отпущены.
+///
+/// Без этого автоповтор удерживаемого Shift переключал бы раскладку десять
+/// раз в секунду — туда и обратно, и в момент отпускания она оказывалась бы
+/// случайной.
+static CHORD_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Какая раскладка действует сейчас.
+#[must_use]
+pub fn layout() -> Layout {
+    Layout::from_bits(LAYOUT.load(Ordering::Relaxed))
+}
+
+/// Переключить раскладку и назвать новую в журнале.
+///
+/// Строка журнала — то, по чему стенд узнаёт, что сочетание дошло: на снимке
+/// экрана переключение видно только по двум буквам в трее.
+pub fn set_layout(layout: Layout) {
+    LAYOUT.store(layout as u8, Ordering::Relaxed);
+    crate::kprintln!("  keyboard    : layout {} ({})", layout.label(), layout.tag());
+}
+
+/// Переключить на другую из двух. Возвращает новую.
+pub fn toggle_layout() -> Layout {
+    let next = layout().other();
+    set_layout(next);
+    next
+}
+
+/// Посмотреть на событие: не сочетание ли это переключения раскладки.
+///
+/// `true` — было сочетание Alt+Shift, и раскладка **уже переключена**.
+/// Зовёт тот, кто разбирает клавиши первым: стол в графическом режиме, редактор
+/// строки без графики. Один потребитель на событие — иначе сочетание
+/// переключало бы дважды и оставляло раскладку прежней.
+///
+/// Работает по нажатию второй клавиши сочетания, какая бы из двух ни была
+/// второй: Alt, потом Shift — или Shift, потом Alt. Так ведёт себя Windows, и
+/// человек не помнит, в каком порядке нажимает.
+pub fn observe(event: KeyEvent) -> bool {
+    let both = event.mods.contains(Modifiers::ALT) && event.mods.contains(Modifiers::SHIFT);
+    if !both {
+        CHORD_HELD.store(false, Ordering::Relaxed);
+        return false;
+    }
+    let chord_key = matches!(
+        event.code,
+        KeyCode::LeftShift | KeyCode::RightShift | KeyCode::LeftAlt | KeyCode::RightAlt
+    );
+    if !event.pressed || !chord_key {
+        return false;
+    }
+    if CHORD_HELD.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    toggle_layout();
+    true
+}
+
+/// Прочитать раскладку из `/etc/system.cfg`.
+///
+/// Вызывается один раз после монтирования корня, там же, где часовой пояс. Нет
+/// файла или ключа — остаётся US, молча: на загруженной с носителя системе
+/// настроек нет, и это не событие.
+pub fn adopt() {
+    const CONFIG: &str = "system.cfg";
+    const LIMIT: usize = 4096;
+    let Some((bytes, source)) = crate::config::read(CONFIG, LIMIT) else {
+        return;
+    };
+    let text = core::str::from_utf8(&bytes).unwrap_or("");
+    let Some(layout) = sysconf::value(text, "keyboard").and_then(Layout::from_tag) else {
+        return;
+    };
+    LAYOUT.store(layout as u8, Ordering::Relaxed);
+    crate::kprintln!(
+        "  keyboard    : layout {} ({}) from {}",
+        layout.label(),
+        layout.tag(),
+        crate::config::path(CONFIG, source)
+    );
+}
 
 /// Символ, который даёт это событие, или `None`, если события символ не даёт.
 ///
@@ -48,8 +211,9 @@ pub fn char_for_code(code: KeyCode, mods: Modifiers) -> Option<char> {
     }
 
     let shift = mods.contains(Modifiers::SHIFT);
+    let cyrillic = layout() == Layout::Ru;
 
-    if let Some((lower, upper)) = letter(code) {
+    if let Some((lower, upper)) = if cyrillic { ru_letter(code) } else { letter(code) } {
         // Caps и Shift складываются по XOR, а не по OR: при залипшем Caps
         // нажатый Shift даёт строчную букву. Это не тонкость реализации, а то,
         // как ведёт себя любая клавиатура.
@@ -57,7 +221,11 @@ pub fn char_for_code(code: KeyCode, mods: Modifiers) -> Option<char> {
         return Some(if upper_case { upper } else { lower });
     }
 
-    if let Some((plain, shifted)) = printable(code) {
+    // Знаки в русской раскладке лежат иначе только на верхнем ряду и двух
+    // клавишах справа; всё, чего нет в её таблице, берётся из общей — цифровой
+    // блок и минус с равно у обеих раскладок одни.
+    let pair = if cyrillic { ru_printable(code) } else { None };
+    if let Some((plain, shifted)) = pair.or_else(|| printable(code)) {
         return Some(if shift { shifted } else { plain });
     }
 
@@ -102,6 +270,66 @@ const fn letter(code: KeyCode) -> Option<(char, char)> {
         KeyCode::X => ('x', 'X'),
         KeyCode::Y => ('y', 'Y'),
         KeyCode::Z => ('z', 'Z'),
+        _ => return None,
+    };
+    Some(pair)
+}
+
+/// Буква русской раскладки: строчная и заглавная.
+///
+/// Букв здесь больше, чем в латинской: `ё`, `х`, `ъ`, `ж`, `э`, `б`, `ю` стоят
+/// на клавишах, где в US лежат знаки. Это буквы, и Caps Lock действует на них
+/// так же, как на остальные, — потому они здесь, а не в [`ru_printable`].
+const fn ru_letter(code: KeyCode) -> Option<(char, char)> {
+    let pair = match code {
+        KeyCode::Q => ('й', 'Й'),
+        KeyCode::W => ('ц', 'Ц'),
+        KeyCode::E => ('у', 'У'),
+        KeyCode::R => ('к', 'К'),
+        KeyCode::T => ('е', 'Е'),
+        KeyCode::Y => ('н', 'Н'),
+        KeyCode::U => ('г', 'Г'),
+        KeyCode::I => ('ш', 'Ш'),
+        KeyCode::O => ('щ', 'Щ'),
+        KeyCode::P => ('з', 'З'),
+        KeyCode::LeftBracket => ('х', 'Х'),
+        KeyCode::RightBracket => ('ъ', 'Ъ'),
+        KeyCode::A => ('ф', 'Ф'),
+        KeyCode::S => ('ы', 'Ы'),
+        KeyCode::D => ('в', 'В'),
+        KeyCode::F => ('а', 'А'),
+        KeyCode::G => ('п', 'П'),
+        KeyCode::H => ('р', 'Р'),
+        KeyCode::J => ('о', 'О'),
+        KeyCode::K => ('л', 'Л'),
+        KeyCode::L => ('д', 'Д'),
+        KeyCode::Semicolon => ('ж', 'Ж'),
+        KeyCode::Apostrophe => ('э', 'Э'),
+        KeyCode::Z => ('я', 'Я'),
+        KeyCode::X => ('ч', 'Ч'),
+        KeyCode::C => ('с', 'С'),
+        KeyCode::V => ('м', 'М'),
+        KeyCode::B => ('и', 'И'),
+        KeyCode::N => ('т', 'Т'),
+        KeyCode::M => ('ь', 'Ь'),
+        KeyCode::Comma => ('б', 'Б'),
+        KeyCode::Period => ('ю', 'Ю'),
+        KeyCode::Grave => ('ё', 'Ё'),
+        _ => return None,
+    };
+    Some(pair)
+}
+
+/// Знаки русской раскладки, отличающиеся от US: обычный и с Shift.
+const fn ru_printable(code: KeyCode) -> Option<(char, char)> {
+    let pair = match code {
+        KeyCode::Digit2 => ('2', '"'),
+        KeyCode::Digit3 => ('3', '№'),
+        KeyCode::Digit4 => ('4', ';'),
+        KeyCode::Digit6 => ('6', ':'),
+        KeyCode::Digit7 => ('7', '?'),
+        KeyCode::Backslash => ('\\', '/'),
+        KeyCode::Slash => ('.', ','),
         _ => return None,
     };
     Some(pair)

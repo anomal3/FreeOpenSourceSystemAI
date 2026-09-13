@@ -895,6 +895,37 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : close requested of 'Files'", 15_000),
             Step::Await("desktop     : closed the window of ", 15_000),
             Step::Await("desktop     : focus 'Terminal'", 15_000),
+            // Фаза С2: раскладка. Alt+Shift переключает на русскую, клавиши
+            // `f` и `d` приезжают в оболочку как «ав», и она отвечает набранным
+            // — журнал несёт UTF-8, и стенд сверяет его как текст. Снимок
+            // ловит трей с «RU» и кириллицу в терминале.
+            Step::Key("alt-shift"),
+            Step::Await("keyboard    : layout RU (ru)", 15_000),
+            Step::Key("f"),
+            Step::Key("d"),
+            Step::Wait(600),
+            Step::Shot("09-tray-ru"),
+            Step::Key("ret"),
+            Step::Await("unknown command 'ав'", 15_000),
+            // Win+Пробел — обратно. Клавиша с логотипом при этом меню не
+            // открывает: его открывает отпускание, и только если за нажатием не
+            // последовало другой клавиши.
+            Step::Key("meta_l-spc"),
+            Step::Await("keyboard    : layout EN (us)", 15_000),
+            Step::Key("meta_l"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Key("esc"),
+            Step::Await("desktop     : menu closed", 15_000),
+            // Меню трея: правая кнопка по часам, первый пункт — раскладка.
+            Step::Aim(aim::Aim::Tray),
+            Step::RightClick,
+            Step::Await("for tray", 15_000),
+            Step::Wait(600),
+            Step::Shot("10-tray-menu"),
+            Step::Key("ret"),
+            Step::Await("keyboard    : layout RU (ru)", 15_000),
+            Step::Key("alt-shift"),
+            Step::Await("keyboard    : layout EN (us)", 15_000),
             // Меню умеет не только запускать. «Shut down» открывает не
             // выключение, а вопрос: подтверждение сделано обычным окном, потому
             // что человек уже знает, как закрываются окна.

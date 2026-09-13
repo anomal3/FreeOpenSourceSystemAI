@@ -46,6 +46,40 @@ pub struct SerialLine {
     cursor: usize,
 }
 
+/// Раскодировать из буфера всё, что сложилось в символы, и оставить в нём
+/// незавершённый хвост.
+///
+/// Незавершённый — это неполный многобайтный знак в самом конце; он дождётся
+/// следующего чтения. Ошибочный байт посреди потока заменяется знаком замены
+/// сразу, как это делает `from_utf8_lossy`: ждать его продолжения нечего.
+fn take_decoded(pending: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    let mut from = 0;
+    loop {
+        match std::str::from_utf8(&pending[from..]) {
+            Ok(text) => {
+                out.push_str(text);
+                from = pending.len();
+                break;
+            }
+            Err(err) => {
+                let valid = err.valid_up_to();
+                out.push_str(std::str::from_utf8(&pending[from..from + valid]).unwrap_or(""));
+                from += valid;
+                match err.error_len() {
+                    Some(bad) => {
+                        out.push('\u{FFFD}');
+                        from += bad;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    pending.drain(..from);
+    out
+}
+
 impl SerialLine {
     /// Начать читать линию в фоне.
     pub fn spawn(stream: TcpStream) -> Result<Self> {
@@ -65,6 +99,12 @@ impl SerialLine {
         let thread_stop = Arc::clone(&stop);
         let reader = std::thread::spawn(move || {
             let mut chunk = [0u8; 4096];
+            // Хвост, не сложившийся в символ. Серийная линия отдаёт байты как
+            // придётся — по одному, по три, — и многобайтный знак UTF-8 бывает
+            // разрезан границей чтения. Раскодированный по кускам он давал
+            // четыре знака замены вместо двух русских букв, и стенд, ждавший
+            // `unknown command 'ав'`, не дожидался.
+            let mut pending: Vec<u8> = Vec::new();
             while !thread_stop.load(Ordering::Relaxed) {
                 match reader_stream.read(&mut chunk) {
                     Ok(0) => {
@@ -72,7 +112,8 @@ impl SerialLine {
                         return;
                     }
                     Ok(count) => {
-                        let text = String::from_utf8_lossy(&chunk[..count]);
+                        pending.extend_from_slice(&chunk[..count]);
+                        let text = take_decoded(&mut pending);
                         let mut guard = thread_buffer.lock().expect("буфер линии");
                         guard.text.push_str(&text);
                     }

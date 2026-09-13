@@ -95,11 +95,21 @@ pub enum Action {
     DisplaySettings,
     /// Перечитать стол и перерисовать его целиком.
     Refresh,
+    /// Переключить раскладку на другую из двух.
+    SwitchLayout,
+    /// Открыть «Параметры» на разделе сети.
+    NetworkSettings,
+    /// Открыть «Параметры» на разделе часов.
+    ClockSettings,
+    /// Диспетчер задач. Его пока нет, и пункт об этом говорит, а не прячется:
+    /// правило дома — нереализованное показывать с пометкой «функция
+    /// запланирована», чтобы человек не искал то, чего нет.
+    TaskManager,
 }
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 8] = [
+    const ALL: [Action; 12] = [
         Action::Open,
         Action::Rename,
         Action::Delete,
@@ -108,6 +118,10 @@ impl Action {
         Action::Theme,
         Action::DisplaySettings,
         Action::Refresh,
+        Action::SwitchLayout,
+        Action::NetworkSettings,
+        Action::ClockSettings,
+        Action::TaskManager,
     ];
 
     /// Пункты меню, открытого на пустом месте стола.
@@ -136,6 +150,18 @@ impl Action {
     /// нечем, а открыть его — можно.
     pub const ON_APP: [Action; 2] = [Action::Open, Action::Refresh];
 
+    /// Пункты меню, открытого правой кнопкой на трее и пустом месте панели.
+    ///
+    /// То, что у Windows разбросано по трём значкам трея, здесь в одном меню:
+    /// значков пока три, и меню на каждый было бы тремя меню из одного пункта.
+    pub const ON_TRAY: [Action; 5] = [
+        Action::SwitchLayout,
+        Action::NetworkSettings,
+        Action::ClockSettings,
+        Action::DisplaySettings,
+        Action::TaskManager,
+    ];
+
     fn title(self) -> &'static str {
         match self {
             Action::Open => "Открыть",
@@ -156,6 +182,14 @@ impl Action {
             }
             Action::DisplaySettings => "Настройки экрана",
             Action::Refresh => "Обновить",
+            // Как и тема: пункт назван тем, что произойдёт.
+            Action::SwitchLayout => match crate::input::keymap::layout().other() {
+                crate::input::keymap::Layout::Ru => "Раскладка: русская",
+                crate::input::keymap::Layout::Us => "Раскладка: English",
+            },
+            Action::NetworkSettings => "Параметры сети",
+            Action::ClockSettings => "Дата и время",
+            Action::TaskManager => "Диспетчер задач (функция запланирована)",
         }
     }
 
@@ -169,6 +203,9 @@ impl Action {
             Action::Open | Action::Rename | Action::Delete => 0,
             Action::NewFolder | Action::NewTextFile => 1,
             Action::Theme | Action::DisplaySettings | Action::Refresh => 2,
+            Action::SwitchLayout => 3,
+            Action::NetworkSettings | Action::ClockSettings => 2,
+            Action::TaskManager => 4,
         }
     }
 
@@ -188,6 +225,10 @@ impl Action {
             Action::Theme => Some(if theme::is_dark() { Icon::Sun } else { Icon::Moon }),
             Action::DisplaySettings => Some(Icon::Display),
             Action::Refresh => Some(Icon::Update),
+            Action::SwitchLayout => Some(Icon::Keyboard),
+            Action::NetworkSettings => Some(Icon::Network),
+            Action::ClockSettings => Some(Icon::Clock),
+            Action::TaskManager => Some(Icon::Chart),
         }
     }
 }
@@ -264,7 +305,9 @@ impl ContextMenu {
         // неё столько строк, сколько пунктов у этого открытия. Растить и
         // сжимать поверхность на каждый щелчок значило бы просить память в
         // обработчике события ввода — и остаться без меню, когда её не дали.
-        let height = height_for(ctx, &Action::ON_ENTRY).max(height_for(ctx, &Action::ON_DESKTOP));
+        let height = height_for(ctx, &Action::ON_ENTRY)
+            .max(height_for(ctx, &Action::ON_DESKTOP))
+            .max(height_for(ctx, &Action::ON_TRAY));
         let surface = Surface::new(width, height, theme::wall_average(theme::palette()))?;
         Some(Self {
             surface,

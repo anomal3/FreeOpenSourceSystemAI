@@ -251,19 +251,51 @@ impl ButtonState {
     }
 }
 
-/// Что панель показывает справа.
+/// Что панель показывает справа — в трее.
+///
+/// Трей, а не счётчики: до фазы С2 справа стояли свободная память и время
+/// работы, и Роман спросил, зачем они там. Человеку с Windows справа нужны
+/// язык, сеть и часы — то, что он проверяет взглядом десять раз в день. Память
+/// осталась в «О системе» и в разделе «Система» Параметров.
 pub struct Status {
     /// Местное время `ЧЧ:ММ`, если система его знает.
     ///
     /// Готовой строкой, а не числом: панель рисует то, что ей дали, и знать о
-    /// часовых поясах ей незачем. Время работы при этом остаётся на месте — оно
-    /// отвечает на другой вопрос («давно ли эта машина включена»), и заменить
-    /// им часы было нельзя, как нельзя и наоборот.
+    /// часовых поясах ей незачем. Без часов трей показывает время работы —
+    /// хоть какое-то время лучше пустого места.
     pub clock: Option<String>,
     pub uptime_ms: u64,
-    pub free_mib: u64,
-    pub total_mib: u64,
+    /// Есть ли сеть. Считается снаружи, до захвата замка стола: у сети свой
+    /// замок, и брать его под замком стола нельзя — см. [`super::status_now`].
+    pub net: NetState,
 }
+
+/// Состояние сети для значка в трее.
+///
+/// Раскладка сюда не входит намеренно: её панель спрашивает сама у
+/// [`crate::input::keymap::layout`] — это атомик без замка, и панель, которую
+/// перерисовали сразу после сочетания клавиш, показывает новую раскладку, а не
+/// ту, что была в момент подсчёта `Status`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetState {
+    /// Сетевой карты нет.
+    Absent,
+    /// Карта есть, адреса нет.
+    NoAddress,
+    /// Адрес назначен.
+    Up,
+}
+
+/// Значок трея, в который попал указатель.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrayItem {
+    Network,
+    Layout,
+    Clock,
+}
+
+/// Значки трея вместе с их местом на плашке.
+type Tray = Vec<(TrayItem, Rect)>;
 
 /// Панель задач: плавающая плашка вдоль нижнего края экрана.
 pub struct Panel {
@@ -286,6 +318,8 @@ pub struct Panel {
     /// расхождение выглядит как «кнопка не нажимается», хотя нажимается
     /// соседняя.
     buttons: Buttons,
+    /// Значки трея там же и по той же причине.
+    tray: Tray,
 }
 
 impl Panel {
@@ -319,6 +353,7 @@ impl Panel {
             damage: Rect::EMPTY,
             brand: Rect::EMPTY,
             buttons: Buttons::new(),
+            tray: Tray::new(),
         })
     }
 
@@ -344,6 +379,11 @@ impl Panel {
                 return Some(PanelHit::Window(*app));
             }
         }
+        for (item, rect) in &self.tray {
+            if x >= rect.x && x < rect.right() {
+                return Some(PanelHit::Tray(*item));
+            }
+        }
         Some(PanelHit::Empty)
     }
 
@@ -366,17 +406,22 @@ impl Panel {
         draw::rounded_stroke(&mut self.surface, plate, m.round, p.line3.color, p.line3.alpha);
         draw::crown(&mut self.surface, plate, m.round, p.crown.color, p.crown.alpha);
 
-        // Правый край считается раньше кнопок: место под часы и счётчики занято
-        // всегда, а кнопкам достаётся то, что осталось. Наоборот было бы хуже —
-        // десяток открытых окон вытеснил бы часы за край экрана.
-        let mem = alloc::format!("mem {} / {} МиБ", status.free_mib, status.total_mib);
-        let up = alloc::format!("up {}", uptime_text(status.uptime_ms));
+        // Правый край считается раньше кнопок: место под трей занято всегда, а
+        // кнопкам достаётся то, что осталось. Наоборот было бы хуже — десяток
+        // открытых окон вытеснил бы часы за край экрана.
+        let clock = match status.clock.as_deref() {
+            Some(clock) => String::from(clock),
+            None => alloc::format!("up {}", uptime_text(status.uptime_ms)),
+        };
+        let lang = crate::input::keymap::layout().label();
         let mono = ctx.face(Role::Mono);
-        let step = ctx.px(16);
-        let mut status_w = mono.width(&mem) + step + mono.width(&up);
-        if let Some(clock) = status.clock.as_deref() {
-            status_w += step + mono.width(clock);
-        }
+        let body = ctx.face(Role::Body);
+        // Шаг между значками трея — шире зазора кнопок: значки не кнопки в
+        // ряд, а три отдельных индикатора, и слипшиеся они читались бы как
+        // одна надпись «RU 12:30».
+        let step = ctx.px(14);
+        let glyph = m.glyph();
+        let mut status_w = glyph + step + body.width(lang) + step + mono.width(&clock);
         // Совсем узкий экран: показать всё нельзя, и тогда правого края нет
         // вовсе. Обрезанное наполовину число хуже отсутствующего — по нему не
         // понять, что именно обрезано.
@@ -467,21 +512,62 @@ impl Panel {
             );
         }
 
+        self.tray.clear();
         if status_w > 0 {
-            let y = paint::baseline(ctx, Role::Mono, plate);
+            let half = (step / 2) as i32;
             let mut x = plate.right() - (m.plate_pad() + status_w) as i32;
-            x += paint::text(ctx, &mut self.surface, Role::Mono, x, y, &mem, p.ink3) as i32;
-            x += step as i32;
-            // Пока настоящих часов нет, время работы и есть часы — и набрано
-            // оно тогда цветом часов, а не счётчиков. Иначе на панели не
-            // остаётся ни одной строки в полную силу, и правый край читается
-            // как сплошная серая сноска.
-            let up_ink = if status.clock.is_some() { p.ink3 } else { p.ink };
-            x += paint::text(ctx, &mut self.surface, Role::Mono, x, y, &up, up_ink) as i32;
-            if let Some(clock) = status.clock.as_deref() {
-                x += step as i32;
-                paint::text(ctx, &mut self.surface, Role::Mono, x, y, clock, p.ink);
-            }
+
+            // Сеть: значок в полную силу, когда адрес есть, и приглушённый,
+            // когда карты нет или адрес не получен. Приглушённый, а не другой
+            // значок: «нет сети» в наборе значков нет, а чужой значок сказал бы
+            // не то. Разница между «нет карты» и «нет адреса» — в меню трея.
+            let net_ink = match status.net {
+                NetState::Up => p.ink,
+                NetState::NoAddress | NetState::Absent => p.ink3,
+            };
+            glyphicon::draw(
+                &mut self.surface,
+                Icon::Network,
+                x,
+                plate.y + (plate.h as i32 - glyph as i32) / 2,
+                glyph,
+                net_ink,
+                255,
+            );
+            // Область попадания шире значка на полшага в обе стороны: значок в
+            // четырнадцать точек — цель для меткого, а трей должен нажиматься
+            // с первого раза.
+            self.tray.push((
+                TrayItem::Network,
+                Rect::new(x - half, plate.y, glyph + step, plate.h),
+            ));
+            x += (glyph + step) as i32;
+
+            let width = paint::text(
+                ctx,
+                &mut self.surface,
+                Role::Body,
+                x,
+                paint::baseline(ctx, Role::Body, plate),
+                lang,
+                p.ink,
+            );
+            self.tray.push((TrayItem::Layout, Rect::new(x - half, plate.y, width + step, plate.h)));
+            x += (width + step) as i32;
+
+            let width = paint::text(
+                ctx,
+                &mut self.surface,
+                Role::Mono,
+                x,
+                paint::baseline(ctx, Role::Mono, plate),
+                &clock,
+                p.ink,
+            );
+            self.tray.push((
+                TrayItem::Clock,
+                Rect::new(x - half, plate.y, width + m.plate_pad(), plate.h),
+            ));
         }
 
         self.damage = self.surface.bounds();
@@ -1090,6 +1176,8 @@ pub enum PanelHit {
     Menu,
     /// Кнопка окна.
     Window(App),
+    /// Значок трея.
+    Tray(TrayItem),
     /// Пустое место плашки: щелчок туда не должен доставаться окну под ней.
     Empty,
 }

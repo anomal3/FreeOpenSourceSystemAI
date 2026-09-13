@@ -793,9 +793,9 @@ impl Window {
     ///
     /// Нужно меню стола: пункт «Display settings» обязан открывать окно уже на
     /// нужном разделе, иначе он всего лишь синоним значка «Settings».
-    pub fn show_display_settings(&mut self) {
+    pub fn show_settings(&mut self, section: super::settings::Section) {
         if let Content::Settings(view) = &mut self.content {
-            view.show_display();
+            view.show(section);
             self.redraw_content();
         }
     }

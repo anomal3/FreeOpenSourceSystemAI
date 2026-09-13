@@ -314,10 +314,12 @@ pub struct TextGrid {
     /// Что сейчас в каждой ячейке. Нужно для прокрутки и для восстановления
     /// того, что было под курсором.
     ///
-    /// Байты, а не символы: сетку заполняет терминал, а он работает с потоком
-    /// ASCII. Байт на ячейку вместо четырёх — это не экономия ради экономии, а
-    /// разница в теневом буфере на экран 200×60.
-    cells: Vec<u8>,
+    /// Символы, а не байты. Сетка начиналась с байта на ячейку — терминал
+    /// работал с потоком ASCII, — и это держалось ровно до русской раскладки:
+    /// буква, набранная в терминале, приезжала на экран знаком вопроса. Четыре
+    /// байта на ячейку — это 48 КиБ на экран 200×60, и столько стоит право
+    /// печатать не только латиницу.
+    cells: Vec<char>,
     /// Цвет каждой ячейки: индекс палитры в младших четырёх битах для текста, в
     /// старших — для фона, либо [`ATTR_DEFAULT`].
     ///
@@ -359,7 +361,7 @@ impl TextGrid {
         let len = (cols as usize).checked_mul(rows as usize)?;
         let mut cells = Vec::new();
         cells.try_reserve_exact(len).ok()?;
-        cells.resize(len, b' ');
+        cells.resize(len, ' ');
         let mut attrs = Vec::new();
         attrs.try_reserve_exact(len).ok()?;
         attrs.resize(len, ATTR_DEFAULT);
@@ -418,8 +420,8 @@ impl TextGrid {
         self.cursor_drawn = false;
         for row in 0..self.rows {
             for col in 0..self.cols {
-                let byte = self.cells[(row * self.cols + col) as usize];
-                self.draw_cell(surface, col, row, byte);
+                let ch = self.cells[(row * self.cols + col) as usize];
+                self.draw_cell(surface, col, row, ch);
             }
         }
         self.mark(area);
@@ -469,7 +471,7 @@ impl TextGrid {
         if cells.try_reserve_exact(len).is_err() {
             return false;
         }
-        cells.resize(len, b' ');
+        cells.resize(len, ' ');
         let mut attrs = Vec::new();
         if attrs.try_reserve_exact(len).is_err() {
             return false;
@@ -502,9 +504,9 @@ impl TextGrid {
         surface.fill(self.area(), self.bg);
         for row in 0..rows {
             for col in 0..cols {
-                let byte = self.cells[(row * cols + col) as usize];
-                if byte != b' ' || self.attrs[(row * cols + col) as usize] != ATTR_DEFAULT {
-                    self.draw_cell(surface, col, row, byte);
+                let ch = self.cells[(row * cols + col) as usize];
+                if ch != ' ' || self.attrs[(row * cols + col) as usize] != ATTR_DEFAULT {
+                    self.draw_cell(surface, col, row, ch);
                 }
             }
         }
@@ -514,7 +516,7 @@ impl TextGrid {
 
     /// Очистить сетку и залить её область фоном.
     pub fn clear(&mut self, surface: &mut Surface) {
-        self.cells.fill(b' ');
+        self.cells.fill(' ');
         self.attrs.fill(ATTR_DEFAULT);
         self.col = 0;
         self.row = 0;
@@ -630,12 +632,12 @@ impl TextGrid {
         for index in from..to {
             let col = (index as u32) % self.cols;
             let row = (index as u32) / self.cols;
-            if self.cells[index] == b' ' && self.attrs[index] == ATTR_DEFAULT {
+            if self.cells[index] == ' ' && self.attrs[index] == ATTR_DEFAULT {
                 continue;
             }
-            self.cells[index] = b' ';
+            self.cells[index] = ' ';
             self.attrs[index] = ATTR_DEFAULT;
-            self.draw_cell(surface, col, row, b' ');
+            self.draw_cell(surface, col, row, ' ');
         }
         if had_cursor || self.cursor_enabled {
             self.draw_cursor(surface);
@@ -685,32 +687,36 @@ impl TextGrid {
         // Перерисовываем ячейку целиком из теневого буфера: след курсора при
         // этом исчезает вместе с фоном, и знать, что именно было под ним, не
         // требуется.
-        let byte = self.cells[(self.row * self.cols + self.col) as usize];
-        self.draw_cell(surface, self.col, self.row, byte);
+        let ch = self.cells[(self.row * self.cols + self.col) as usize];
+        self.draw_cell(surface, self.col, self.row, ch);
     }
 
-    fn draw_cell(&mut self, surface: &mut Surface, col: u32, row: u32, byte: u8) {
+    fn draw_cell(&mut self, surface: &mut Surface, col: u32, row: u32, ch: char) {
         let cell = self.cell_rect(col, row);
         let (fg, bg) = self.colors(self.attrs[(row * self.cols + col) as usize]);
         // Фон заливается всегда, а не только под непробельным знаком: ячейка
         // рисуется поверх прежней, и остаток старого глифа иначе просвечивал бы
         // сквозь новый — сглаженный знак не закрывает собой всю ячейку.
         surface.fill(cell, bg);
+        // Буфер даёт эта функция, а не `String`: рисующий текст принимает
+        // строку, и заводить её на каждую ячейку значило бы выделение памяти на
+        // каждый напечатанный знак.
         let mut buffer = [0u8; 4];
-        typeface::draw(surface, self.face, cell.x, cell.y, char_str(byte, &mut buffer), fg, 255);
+        let text = ch.encode_utf8(&mut buffer);
+        typeface::draw(surface, self.face, cell.x, cell.y, text, fg, 255);
         self.mark(cell);
     }
 
-    fn put_cell(&mut self, surface: &mut Surface, col: u32, row: u32, byte: u8) {
+    fn put_cell(&mut self, surface: &mut Surface, col: u32, row: u32, ch: char) {
         let index = (row * self.cols + col) as usize;
         // Сравнивается и символ, и цвет: ячейка, перекрашенная под тем же
         // символом, изменилась ровно так же, как ячейка с новым символом.
-        if self.cells[index] == byte && self.attrs[index] == self.attr {
+        if self.cells[index] == ch && self.attrs[index] == self.attr {
             return;
         }
-        self.cells[index] = byte;
+        self.cells[index] = ch;
         self.attrs[index] = self.attr;
-        self.draw_cell(surface, col, row, byte);
+        self.draw_cell(surface, col, row, ch);
     }
 
     /// Сдвинуть содержимое на строку вверх.
@@ -719,7 +725,7 @@ impl TextGrid {
         self.cells.copy_within(cols.., 0);
         self.attrs.copy_within(cols.., 0);
         let last = (self.rows as usize - 1) * cols;
-        self.cells[last..].fill(b' ');
+        self.cells[last..].fill(' ');
         // Освободившаяся строка получает цвета окна, а не последний
         // назначенный: `scroll_up` заливает её именно фоном окна, и разойтись с
         // ним значило бы, что теневой буфер описывает не то, что на экране.
@@ -752,7 +758,7 @@ impl TextGrid {
             return;
         }
         while self.col < stop {
-            self.put_cell(surface, self.col, self.row, b' ');
+            self.put_cell(surface, self.col, self.row, ' ');
             self.col += 1;
         }
     }
@@ -797,18 +803,12 @@ impl TextGrid {
         if self.col >= self.cols {
             self.newline(surface);
         }
-        let byte = if (0x20..0x7F).contains(&(ch as u32)) { ch as u8 } else { b'?' };
-        self.put_cell(surface, self.col, self.row, byte);
+        // Управляющие знаки, кроме разобранных выше, в ячейку не попадают: у
+        // них нет глифа, и хранить их значило бы рисовать `?` там, где
+        // программа ничего не печатала. Всё остальное хранится как есть — знак
+        // не из шрифта заменит на `?` уже начертание, а не сетка.
+        let ch = if (ch as u32) < 0x20 || ch == '\u{7F}' { '?' } else { ch };
+        self.put_cell(surface, self.col, self.row, ch);
         self.col += 1;
     }
-}
-
-/// Байт ячейки как строка из одного знака.
-///
-/// Сетка хранит байты — терминал работает с потоком ASCII, — а рисующий текст
-/// принимает строку. Буфер даёт вызывающий: возвращать `&str` на собственный
-/// временный массив функция не может, а заводить `String` на каждую ячейку
-/// значило бы выделение памяти на каждый напечатанный знак.
-fn char_str(byte: u8, buffer: &mut [u8; 4]) -> &str {
-    char::from(byte).encode_utf8(buffer)
 }

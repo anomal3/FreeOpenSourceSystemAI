@@ -41,8 +41,12 @@ use crate::input::KeyCode;
 use crate::{arch, config, fs, kprintln};
 
 /// Разделы окна — порядок сверху вниз.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Section {
+///
+/// Открыт наружу ради трея и меню стола: «Параметры сети» в трее обязаны
+/// открыть окно сразу на сети, а не на первом разделе, откуда до сети ещё три
+/// щелчка.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Section {
     /// Экран: режим, тема, масштаб.
     Display,
     /// Часовой пояс и то, который сейчас час.
@@ -320,9 +324,9 @@ impl SettingsView {
         }
     }
 
-    /// Перейти на раздел экрана — им открывается меню стола.
-    pub fn show_display(&mut self) {
-        self.section = Self::index_of(Section::Display);
+    /// Перейти на раздел — так окно открывают меню стола и трей.
+    pub fn show(&mut self, section: Section) {
+        self.section = Self::index_of(section);
         self.on_sections = true;
         self.action = 0;
         self.report = None;

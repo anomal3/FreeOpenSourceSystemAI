@@ -54,18 +54,20 @@ pub mod term;
 pub mod window;
 
 use alloc::string::String;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mini_ui::theme;
 use mini_ui::{Rect, Screen, Surface};
 use user_abi::{WIN_CLOSE, WIN_KEY, WIN_POINTER, WinEvent};
 
+use crate::input::keymap;
 use crate::input::{Buttons, KeyCode, KeyEvent, Modifiers, PointerEvent};
 use crate::sync::SpinLock;
 use crate::{arch, kprintln, mm};
 
 use compositor::Compositor;
-use panel::{PanelHit, Status};
+use panel::{NetState, PanelHit, Status, TrayItem};
+use settings::Section;
 pub use window::App;
 use dialog::{AboutFacts, Answer, Dialog};
 use window::{Hit, Window};
@@ -405,10 +407,27 @@ fn status_now() -> Status {
     Status {
         clock: crate::time::clock_text(),
         uptime_ms: crate::time::uptime_ms(),
-        free_mib,
-        total_mib,
+        net: net_state(),
     }
 }
+
+/// Сеть для значка в трее. Берёт замок сети — потому зовётся из
+/// [`status_now`], вне замка стола.
+fn net_state() -> NetState {
+    match crate::net::status() {
+        None => NetState::Absent,
+        Some(status) if status.address.is_unspecified() => NetState::NoAddress,
+        Some(_) => NetState::Up,
+    }
+}
+
+/// Клавиша с логотипом нажата, и с тех пор не нажимали ничего другого.
+///
+/// Меню открывает её **отпускание**, как в Windows: нажатие само по себе
+/// ничего не значит, потому что за ним может идти Пробел (раскладка) — и
+/// открывать меню, чтобы тут же закрыть, значило бы мигать им на каждое
+/// Win+Пробел.
+static META_ARMED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Вывод программ
@@ -558,11 +577,41 @@ const INPUT_TRIES: u32 = 250;
 const INPUT_PAUSE_MS: u64 = 2;
 
 fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
+    // Alt+Shift — раскладка, и раньше всего остального: сочетание из двух
+    // модификаторов не значит ничего ни для меню, ни для окна, а трей обязан
+    // показать новую раскладку в том же кадре.
+    if keymap::observe(event) {
+        desktop.refresh_panel(status);
+        desktop.present();
+        return None;
+    }
+
+    // Клавиша с логотипом — см. [`META_ARMED`]. Разбирается до отпусканий:
+    // работает именно отпускание.
+    if matches!(event.code, KeyCode::LeftMeta | KeyCode::RightMeta) {
+        if event.pressed {
+            META_ARMED.store(true, Ordering::Relaxed);
+        } else if META_ARMED.swap(false, Ordering::Relaxed) {
+            toggle_menu(desktop, status);
+        }
+        return None;
+    }
+
     // Отпускания стол не использует: все его действия происходят по нажатию.
     // Пропускать их дальше всё равно нужно — редактор строки различает нажатие
     // и отпускание сам, и молчаливая потеря половины событий однажды вылезет.
     if !event.pressed {
         return route(desktop, event, status);
+    }
+    META_ARMED.store(false, Ordering::Relaxed);
+
+    // Win+Пробел — второе сочетание раскладки, то, к которому привыкли в
+    // Windows 8 и позже. Alt+Shift выше — то, к которому привыкли раньше.
+    if event.code == KeyCode::Space && event.mods.contains(Modifiers::META) {
+        keymap::toggle_layout();
+        desktop.refresh_panel(status);
+        desktop.present();
+        return None;
     }
 
     // Меню стола выше меню запуска и выше сочетаний оконного менеджера: пока в
@@ -580,10 +629,10 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
     }
 
     match event.code {
-        // Клавиша с логотипом — то же, что кнопка «FreeOS» на панели. F1
-        // продублирован не для удобства: Meta доходит не с каждой клавиатуры и
+        // F1 — то же, что кнопка «FreeOS» на панели и клавиша с логотипом.
+        // Продублирована не для удобства: Meta доходит не с каждой клавиатуры и
         // не через каждый эмулятор, а стол без меню — это набор окон.
-        KeyCode::LeftMeta | KeyCode::RightMeta | KeyCode::F1 => {
+        KeyCode::F1 => {
             toggle_menu(desktop, status);
             return None;
         }
@@ -703,13 +752,20 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     // Правая кнопка: меню стола там, где щёлкнули. Пока оно открыто, левая
     // кнопка выбирает в нём пункт — этим и занимается `press`.
     if event.pressed(Buttons::RIGHT) {
-        if desktop.context_open() {
+        // Пункты зависят от того, во что целились. «Удалить», предложенное
+        // тогда, когда ничего не выбрано, относилось бы неизвестно к чему —
+        // а на столе это означало бы удалённый наугад файл. `None` — целились
+        // в окно или в кнопку панели: у них своего меню пока нет.
+        let target: Option<(&[context::Action], &str)> = if desktop.context_open() {
             desktop.close_context();
-        } else if desktop.window_at(x, y).is_none() && desktop.panel_at(x, y).is_none() {
-            // Пункты зависят от того, во что целились. «Удалить», предложенное
-            // тогда, когда ничего не выбрано, относилось бы неизвестно к чему —
-            // а на столе это означало бы удалённый наугад файл.
-            let (items, what) = match desktop.icon_at(x, y) {
+            None
+        } else if let Some(hit) = desktop.panel_at(x, y) {
+            match hit {
+                PanelHit::Tray(_) | PanelHit::Empty => Some((&context::Action::ON_TRAY[..], "tray")),
+                PanelHit::Menu | PanelHit::Window(_) => None,
+            }
+        } else if desktop.window_at(x, y).is_none() {
+            Some(match desktop.icon_at(x, y) {
                 Some(index) => {
                     desktop.select_icon(Some(index));
                     match desktop.icon_kind(index) {
@@ -722,7 +778,21 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                     desktop.select_icon(None);
                     (&context::Action::ON_DESKTOP[..], "desktop")
                 }
-            };
+            })
+        } else {
+            None
+        };
+        if let Some((items, what)) = target {
+            // Открытое меню запуска закрывается: два меню разом — это два
+            // ответа на один щелчок.
+            if desktop.menu_open() {
+                if let Some(menu) = desktop.menu_mut() {
+                    menu.close();
+                }
+                kprintln!("  desktop     : menu closed");
+                desktop.mark_menu_area();
+                desktop.refresh_panel(status);
+            }
             desktop.open_context(x, y, items);
             // Печатается **место, куда меню встало**, а не точка щелчка: у
             // края экрана оно сдвигается, чтобы не выехать, и стенд, целящийся
@@ -846,6 +916,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 }
                 desktop.refresh_panel(status);
             }
+            PanelHit::Tray(item) => tray_click(desktop, item, status),
             PanelHit::Empty => {}
         }
         return;
@@ -1315,11 +1386,27 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         }
         context::Action::DisplaySettings => {
             desktop.close_context();
-            launch(desktop, App::Settings);
-            if let Some(window) = desktop.find(App::Settings) {
-                window.show_display_settings();
-            }
+            open_settings(desktop, Section::Display, status);
+        }
+        context::Action::NetworkSettings => {
+            desktop.close_context();
+            open_settings(desktop, Section::Network, status);
+        }
+        context::Action::ClockSettings => {
+            desktop.close_context();
+            open_settings(desktop, Section::Clock, status);
+        }
+        context::Action::SwitchLayout => {
+            desktop.close_context();
+            keymap::toggle_layout();
             desktop.refresh_panel(status);
+        }
+        context::Action::TaskManager => {
+            // Меню остаётся открытым с ответом внизу — так же, как отвечает
+            // «создать»: человек видит, что нажатие дошло и что за ним пока
+            // ничего не стоит.
+            kprintln!("  desktop     : task manager is planned, not built yet");
+            desktop.context_note("функция запланирована");
         }
         context::Action::Refresh => {
             desktop.close_context();
@@ -1332,6 +1419,31 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             kprintln!("  desktop     : repainted");
         }
     }
+}
+
+/// Щелчок по значку трея.
+///
+/// Язык переключается щелчком, как в Windows; сеть и часы открывают свой
+/// раздел «Параметров» — ровно тот, а не окно с первого раздела.
+fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
+    match item {
+        TrayItem::Layout => {
+            keymap::toggle_layout();
+            desktop.refresh_panel(status);
+        }
+        TrayItem::Network => open_settings(desktop, Section::Network, status),
+        TrayItem::Clock => open_settings(desktop, Section::Clock, status),
+    }
+}
+
+/// Открыть «Параметры» на заданном разделе.
+fn open_settings(desktop: &mut Compositor, section: Section, status: &Status) {
+    launch(desktop, App::Settings);
+    if let Some(window) = desktop.find(App::Settings) {
+        window.show_settings(section);
+    }
+    kprintln!("  desktop     : settings opened on {section:?}");
+    desktop.refresh_panel(status);
 }
 
 /// Что выбрано на столе, если это файл или каталог: путь и подпись.

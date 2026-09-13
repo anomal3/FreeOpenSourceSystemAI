@@ -166,8 +166,8 @@ pub static ENGLISH: Strings = Strings {
     account_err_mismatch: "The two passwords differ.",
 
     keyboard_heading: "Keyboard layout",
-    keyboard_body: "Recorded in the configuration file. The kernel currently ships one keymap \
-                    (US) and will use it whatever is chosen here.",
+    keyboard_body: "The layout the system starts with. Alt+Shift or Win+Space switches \
+                    between US and RU at any time.",
 
     timezone_heading: "Time zone",
     timezone_body: "Recorded in the configuration file as an offset from UTC.",
@@ -241,8 +241,8 @@ pub static RUSSIAN: Strings = Strings {
     account_err_mismatch: "Введенные пароли различаются.",
 
     keyboard_heading: "Раскладка клавиатуры",
-    keyboard_body: "Записывается в файл настроек. В ядре пока одна раскладка (US), и оно \
-                    возьмет ее независимо от выбора здесь.",
+    keyboard_body: "Раскладка, с которой система стартует. Alt+Shift или Win+Пробел \
+                    переключают между US и RU в любой момент.",
 
     timezone_heading: "Часовой пояс",
     timezone_body: "Записывается в файл настроек как смещение от UTC.",

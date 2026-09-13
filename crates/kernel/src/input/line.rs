@@ -128,6 +128,12 @@ impl LineEditor {
 
     /// Обработать событие клавиатуры, отправляя эхо в `out`.
     pub fn handle(&mut self, event: KeyEvent, out: &mut impl Write) -> Edit {
+        // Alt+Shift переключает раскладку и здесь — на консоли без стола
+        // редактор строки первым видит клавиши. На столе сочетание перехватит
+        // стол, и сюда оно не дойдёт; дважды не переключится.
+        if super::keymap::observe(event) {
+            return Edit::Ignored;
+        }
         if !event.pressed {
             return Edit::Ignored;
         }
