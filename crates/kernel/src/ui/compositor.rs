@@ -726,16 +726,16 @@ impl Compositor {
         self.menu.as_mut()
     }
 
-    /// Сколько программ из `/bin` показывает меню запуска.
+    /// Сколько строк в меню запуска.
     #[must_use]
-    pub fn menu_programs(&self) -> usize {
-        self.menu.as_ref().map_or(0, Menu::program_count)
+    pub fn menu_items(&self) -> usize {
+        self.menu.as_ref().map_or(0, Menu::item_count)
     }
 
-    /// Сколько программ не поместилось в список меню.
+    /// Сколько программ лежит в `/bin`.
     #[must_use]
-    pub fn menu_dropped(&self) -> usize {
-        self.menu.as_ref().map_or(0, Menu::dropped_programs)
+    pub fn menu_bin_programs(&self) -> usize {
+        self.menu.as_ref().map_or(0, Menu::bin_programs)
     }
 
     pub fn menu_open(&self) -> bool {

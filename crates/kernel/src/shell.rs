@@ -1121,6 +1121,23 @@ fn help() {
     sprintln!("  shutdown      switch the machine off");
     sprintln!("  reboot        restart the machine");
     sprintln!("  exit          finish the boot and halt");
+
+    // Программы из `/bin` — здесь же. С фазы С3 в меню «Пуск» только те, у
+    // которых есть окно, а остальные запускаются по имени, и узнать эти имена
+    // человеку больше негде.
+    if let Some(Ok(entries)) = fs::list("/bin") {
+        let mut names: alloc::vec::Vec<alloc::string::String> = entries
+            .into_iter()
+            .filter(|entry| entry.kind == crate::vfs::NodeKind::File)
+            .map(|entry| entry.name)
+            .collect();
+        names.sort();
+        sprintln!();
+        sprintln!("  programs in /bin, run by name ({}):", names.len());
+        for line in names.chunks(8) {
+            sprintln!("    {}", line.join("  "));
+        }
+    }
 }
 
 /// Который час.

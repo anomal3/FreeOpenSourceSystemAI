@@ -157,10 +157,13 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
     // все, на x86-64 — нет, и сценарий, один на обе архитектуры, проверить такое
     // не может. Два числа рядом читаются одинаково везде, а неполнота списка
     // видна их несовпадением.
-    let listed = desktop.menu_programs();
+    // С фазы С3 в меню только то, у чего есть окно, а остальное из `/bin`
+    // запускается в терминале. Оба числа в одной строке: «в меню семь строк»
+    // без числа программ не говорит, сколько осталось за его пределами.
     kprintln!(
-        "  desktop     : start menu lists {listed} of {} programs from /bin",
-        listed + desktop.menu_dropped()
+        "  desktop     : start menu lists {} items; /bin holds {} programs, the rest run from the terminal",
+        desktop.menu_items(),
+        desktop.menu_bin_programs()
     );
 
     // Размер сетки запоминается один раз: окна не меняют размера, а спрашивают
@@ -1122,20 +1125,6 @@ fn handle_menu(desktop: &mut Compositor, code: KeyCode, status: &Status) {
     match code {
         KeyCode::Up => menu.move_selection(false),
         KeyCode::Down => menu.move_selection(true),
-        // Влево-вправо ходят между столбцами: слева окна стола, справа
-        // программы из `/bin`. Обход обоих списков одними стрелками вверх-вниз
-        // означал бы двадцать нажатий на дорогу от последней программы обратно
-        // к «Терминалу».
-        KeyCode::Right => {
-            if !menu.switch_column(true) {
-                return;
-            }
-        }
-        KeyCode::Left => {
-            if !menu.switch_column(false) {
-                return;
-            }
-        }
         KeyCode::Enter => {
             launching = menu.selection();
             menu.close();
@@ -1161,11 +1150,13 @@ fn handle_menu(desktop: &mut Compositor, code: KeyCode, status: &Status) {
 
 /// Выполнить то, что выбрали в меню запуска.
 ///
-/// Окно стола открывается здесь же, а программа третьего кольца запускается и
-/// **поднимает окно оболочки**: она разговаривает строками, и оставить её
-/// говорить в закрытое окно значило бы запустить программу, ответа которой
-/// нигде не видно. Ждать её нельзя — этот код работает внутри разбора события
-/// ввода.
+/// Окно стола открывается здесь же, а программа третьего кольца запускается.
+///
+/// Терминал при этом **не** поднимается. До фазы С3 поднимался: в меню стояли
+/// и консольные программы, которые говорят строками, и без поднятого терминала
+/// их ответа не было видно. Теперь в меню только программы с окном, и терминал,
+/// выскочивший поверх их окна, выглядел бы как ошибка. Ждать программу нельзя —
+/// этот код работает внутри разбора события ввода.
 fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
     match choice {
         panel::Choice::App(app) => launch(desktop, app),
@@ -1175,7 +1166,6 @@ fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
                 Ok(id) => kprintln!("  desktop     : started '{path}' as {id}"),
                 Err(err) => kprintln!("  desktop     : cannot start '{path}': {err}"),
             }
-            launch(desktop, App::Terminal);
         }
     }
 }
