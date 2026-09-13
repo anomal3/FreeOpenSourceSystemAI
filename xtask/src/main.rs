@@ -12,6 +12,7 @@
 mod out;
 
 mod arch;
+mod btrfsfix;
 mod build;
 mod cbuild;
 mod diskfile;
@@ -96,6 +97,12 @@ enum Command {
     Phone(PhoneArgs),
     /// Принести прошивку тачскрина телефона: чужая, в хранилище её нет.
     PhoneFirmware,
+    /// Пересобрать образец тома btrfs, по которому идут тесты крейта `btrfs`.
+    ///
+    /// Нужен WSL с `btrfs-progs`: `mkfs.btrfs` на Windows взять негде. Готовый
+    /// образец лежит в репозитории, поэтому команда нужна, только когда в него
+    /// добавляют файл.
+    BtrfsFixture,
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -667,6 +674,10 @@ fn real_main() -> Result<()> {
 
         Command::PhoneFirmware => {
             phone::fetch_firmware()?;
+        }
+
+        Command::BtrfsFixture => {
+            btrfsfix::build()?;
         }
 
         Command::Check(args) => {

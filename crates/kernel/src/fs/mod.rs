@@ -27,9 +27,11 @@
 //! граница проходит по кольцу привилегий, а не по слою кода. Подробнее — в
 //! [`crate::vfs::perm`].
 
+pub mod btrfsfs;
 pub mod ext2fs;
 pub mod fat;
 
+pub use btrfsfs::BtrfsFs;
 pub use ext2fs::Ext2Fs;
 pub use fat::Fat32;
 
@@ -52,15 +54,27 @@ use crate::vfs::{DirEntry, FileSystem, Node, NodeKind, VfsError, VfsResult};
 ///
 /// # Как устроено сопоставление
 ///
-/// Префикс — начало пути (`/etc`), и путь уезжает в найденную ФС **целиком**, а
-/// не остатком. Это не экономия на подстроке: раздел состояния несёт у себя
-/// настоящие `/etc`, `/home`, `/var` и `/opt`, то есть его собственное дерево
-/// совпадает с тем, что он обслуживает. Резать путь пришлось бы там, где
-/// смонтированный том лежит по другому имени, — а такого случая в системе нет,
-/// и заводить под него механизм значило бы заводить второй способ ошибиться.
+/// Префикс — начало пути (`/etc`). А вот что уезжает в саму ФС, зависит от
+/// того, как том устроен внутри, и случаев ровно два:
+///
+/// * **том несёт префикс у себя** — путь уезжает **целиком**. Так смонтирован
+///   раздел состояния: у него внутри настоящие `/etc`, `/home`, `/var` и
+///   `/opt`, то есть его собственное дерево совпадает с тем, что он
+///   обслуживает, и резать путь значило бы искать `/passwd` там, где лежит
+///   `/etc/passwd`;
+/// * **корень тома и есть точка монтирования** — префикс отрезается. Так
+///   смонтирован раздел данных: том сделан чужой программой, и требовать от
+///   человека, чтобы его файлы лежали внутри каталога с именем `data`, — это
+///   обязательство, которого ни одна файловая система не накладывает.
+///
+/// До фазы 49 второго случая не было, и путь резать было негде. Теперь он есть,
+/// и различие записано полем, а не подразумевается: молчаливое «наверное,
+/// целиком» стоило бы тома, который смонтирован и при этом пуст.
 struct Mount {
     /// Начало пути без завершающей косой: `""` у корня, `"/etc"` у ветки.
     prefix: &'static str,
+    /// Что отрезать от пути, прежде чем отдать его тому. Пусто — не резать.
+    strip: &'static str,
     fs: Arc<dyn FileSystem>,
 }
 
@@ -89,6 +103,19 @@ pub fn set_root(fs: Box<dyn FileSystem>) {
 /// Повторное монтирование того же префикса заменяет прежнюю: так корень с диска
 /// сменяет образ initrd, не оставляя за собой второй записи.
 pub fn mount_at(prefix: &'static str, fs: Arc<dyn FileSystem>) {
+    insert_mount(prefix, "", fs);
+}
+
+/// Смонтировать ФС так, что её корень — и есть эта точка.
+///
+/// Отличается от [`mount_at`] ровно одним: путь, уходящий в том, теряет
+/// префикс. `/data/notes.txt` станет `/notes.txt`, потому что на самом томе
+/// никакого `data` нет и быть не должно — см. [`Mount`].
+pub fn mount_volume_at(prefix: &'static str, fs: Arc<dyn FileSystem>) {
+    insert_mount(prefix, prefix, fs);
+}
+
+fn insert_mount(prefix: &'static str, strip: &'static str, fs: Arc<dyn FileSystem>) {
     let mut mounts = MOUNTS.lock();
     mounts.retain(|mount| mount.prefix != prefix);
     // Место находится по длине префикса: длинные впереди. `Vec::insert`, а не
@@ -103,7 +130,24 @@ pub fn mount_at(prefix: &'static str, fs: Arc<dyn FileSystem>) {
     if mounts.try_reserve(1).is_err() {
         return;
     }
-    mounts.insert(at, Mount { prefix, fs });
+    mounts.insert(at, Mount { prefix, strip, fs });
+}
+
+/// Путь в том виде, в каком его видит сам том.
+///
+/// Пустой остаток превращается в `"/"`: `/data` — это корень тома, а не
+/// пустое имя, на котором разбор пути споткнётся.
+fn inside<'a>(strip: &str, path: &'a str) -> &'a str {
+    if strip.is_empty() {
+        return path;
+    }
+    match path.strip_prefix(strip) {
+        Some(rest) if rest.is_empty() => "/",
+        Some(rest) => rest,
+        // Сюда не попасть: префикс проверен `covers` до того, как том выбран.
+        // Отдать путь целиком безопаснее, чем отрезать наугад.
+        None => path,
+    }
 }
 
 /// Какая ФС отвечает за этот путь.
@@ -112,12 +156,12 @@ pub fn mount_at(prefix: &'static str, fs: Arc<dyn FileSystem>) {
 /// читает диск, а чтение диска ждёт прерывания — держать в это время лок
 /// таблицы монтирования значило бы остановить всех остальных на время
 /// обращения к носителю.
-fn for_path(path: &str) -> Option<Arc<dyn FileSystem>> {
+fn for_path(path: &str) -> Option<(Arc<dyn FileSystem>, &'static str)> {
     let mounts = MOUNTS.lock();
     mounts
         .iter()
         .find(|mount| covers(mount.prefix, path))
-        .map(|mount| Arc::clone(&mount.fs))
+        .map(|mount| (Arc::clone(&mount.fs), mount.strip))
 }
 
 /// Обслуживает ли префикс этот путь.
@@ -140,14 +184,19 @@ fn covers(prefix: &str, path: &str) -> bool {
 /// Замыкание исполняется **без** лока таблицы монтирования, но сама ФС внутри
 /// себя запирается как ей нужно.
 pub fn with_root<R>(f: impl FnOnce(&dyn FileSystem) -> R) -> Option<R> {
-    let fs = for_path("/")?;
+    let (fs, _) = for_path("/")?;
     Some(f(&*fs))
 }
 
 /// Сделать что-нибудь с той ФС, которая отвечает за путь.
-pub fn with_fs<R>(path: &str, f: impl FnOnce(&dyn FileSystem) -> R) -> Option<R> {
-    let fs = for_path(path)?;
-    Some(f(&*fs))
+///
+/// Замыканию достаётся **путь внутри тома**, а не тот, что пришёл снаружи. Это
+/// не удобство: единственный способ забыть про отрезание префикса — иметь под
+/// рукой оба пути, и подпись устроена так, чтобы такого выбора не было.
+pub fn with_fs<R>(path: &str, f: impl FnOnce(&dyn FileSystem, &str) -> R) -> Option<R> {
+    let (fs, strip) = for_path(path)?;
+    let inner = inside(strip, path);
+    Some(f(&*fs, inner))
 }
 
 /// Перечислить смонтированное: префикс и имя ФС.
@@ -185,9 +234,9 @@ pub fn resolve_as(
     path: &str,
     want: Access,
 ) -> Option<VfsResult<Box<dyn Node>>> {
-    with_fs(path, |fs| {
+    with_fs(path, |fs, inner| {
         let mut node = fs.root()?;
-        for component in crate::vfs::path::components(path)? {
+        for component in crate::vfs::path::components(inner)? {
             // Право пройти спрашивается у каталога, в котором мы стоим, — до
             // того, как станет известно, есть ли там такое имя. Иначе ответ
             // «нет такого файла» рассказывал бы о содержимом каталога, в
@@ -308,13 +357,15 @@ pub fn rename_as(cred: Credentials, old: &str, new: &str) -> Option<VfsResult<()
     // читается и не пишется, а перенос между томами — это чтение и запись
     // целиком, то есть другая операция с другой ценой и другими способами
     // не удаться. Ровно так же ведёт себя `rename(2)` в Unix (`EXDEV`).
-    let (Some(source), Some(target)) = (for_path(old), for_path(new)) else {
+    let (Some((source, strip)), Some((target, other))) = (for_path(old), for_path(new)) else {
         return None;
     };
-    if !Arc::ptr_eq(&source, &target) {
+    // Один и тот же том, смонтированный дважды по-разному, — это две границы
+    // монтирования, а не одна: `strip` у них разный, и путь внутри тома тоже.
+    if !Arc::ptr_eq(&source, &target) || strip != other {
         return Some(Err(VfsError::Unsupported));
     }
-    Some(source.rename(old, new))
+    Some(source.rename(inside(strip, old), inside(strip, new)))
 }
 
 /// Перечислить каталог корневой ФС.
@@ -322,8 +373,8 @@ pub fn rename_as(cred: Credentials, old: &str, new: &str) -> Option<VfsResult<()
 /// Внешний `None` означает «ничего не смонтировано» — это не ошибка пути, и
 /// сообщение о ней должно быть другим.
 pub fn list(path: &str) -> Option<VfsResult<Vec<DirEntry>>> {
-    with_fs(path, |fs| {
-        let node = fs.resolve(path)?;
+    with_fs(path, |fs, inner| {
+        let node = fs.resolve(inner)?;
         node.list()
     })
 }
@@ -434,8 +485,8 @@ pub fn sync_all() -> Vec<(&'static str, VfsResult<()>)> {
 /// Прочитать не более `limit` байт файла. Возвращает прочитанное и полный размер
 /// файла — чтобы вызывающий мог сказать, что показал не всё.
 pub fn read(path: &str, limit: usize) -> Option<VfsResult<(Vec<u8>, u64)>> {
-    with_fs(path, |fs| {
-        let node = fs.resolve(path)?;
+    with_fs(path, |fs, inner| {
+        let node = fs.resolve(inner)?;
         let meta = node.metadata();
         if meta.kind != NodeKind::File {
             return Err(VfsError::WrongKind);

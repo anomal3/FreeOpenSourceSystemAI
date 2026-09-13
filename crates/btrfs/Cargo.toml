@@ -1,0 +1,20 @@
+[package]
+name = "btrfs"
+description = "The btrfs on-disk format, read side: the kernel mounts volumes made by mkfs.btrfs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Только ради трейта BlockDevice и типа Error: формат btrfs не должен знать,
+# лежит он в памяти, на разделе или на диске под драйвером ядра.
+disk = { path = "../disk" }
+
+[dev-dependencies]
+# Образец тома лежит в репозитории сжатым: в развёрнутом виде это 128 МиБ,
+# из которых заняты единицы процентов. Распаковка нужна только тестам.
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+
+[lints]
+workspace = true

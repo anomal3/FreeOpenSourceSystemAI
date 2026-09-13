@@ -491,6 +491,91 @@ pub fn prepare_target(arch: Arch, release: bool, size_mib: u64, fresh: bool) -> 
     Ok(path)
 }
 
+/// Готовит диск с томом btrfs — тем самым образцом, что лежит в
+/// `crates/btrfs/tests/`.
+///
+/// # Почему том берётся из репозитория, а не создаётся здесь
+///
+/// Потому что создать его нечем: `mkfs.btrfs` — программа Linux, и на машине
+/// разработчика она есть не всегда, а на машине, где идёт стенд, её может не
+/// быть вовсе. Писать btrfs своим кодом ради проверки своего же читателя — это
+/// ровно та подмена, из-за которой ext2 в проекте проверяется чужим крейтом:
+/// две половины одной ошибки сходятся друг с другом идеально.
+///
+/// Поэтому образец делается раз (`cargo xtask btrfs-fixture`), лежит в
+/// репозитории сжатым и здесь только разворачивается и обносится таблицей
+/// разделов. Разметку пишет **наш** `disk::gpt` — тот же код, что у
+/// установщика; проверяется она тем, что ядро находит раздел по типу.
+pub fn prepare_btrfs_disk(arch: Arch, release: bool) -> Result<PathBuf> {
+    let path = paths::btrfs_disk(arch, release);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
+    }
+
+    let packed = paths::workspace_root().join("crates/btrfs/tests/fixture.img.gz");
+    let squeezed = fs::read(&packed)
+        .with_context(|| format!("не читается образец тома {}", packed.display()))?;
+    let mut volume = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::GzDecoder::new(&squeezed[..]),
+        &mut volume,
+    )
+    .with_context(|| format!("не разворачивается {}", packed.display()))?;
+
+    // Слепок по сжатому файлу: он меняется ровно тогда, когда меняется образец,
+    // и стоит ничего. Разворачивать 128 МиБ на каждом прогоне сценария незачем.
+    let stamp = path.with_extension("stamp");
+    let want = format!("{} {}\n", squeezed.len(), fnv1a64(&squeezed));
+    if util::file_len(&path).is_some() && fs::read_to_string(&stamp).ok().as_deref() == Some(&want) {
+        say!("диск btrfs: {} (как есть)", path.display());
+        return Ok(path);
+    }
+
+    let front = GPT_MARGIN_BYTES;
+    let disk_bytes = front + volume.len() as u64 + GPT_MARGIN_BYTES;
+    let sectors = disk_bytes / SECTOR_SIZE as u64;
+    let mut dev = MemDisk::new(sectors).with_context(|| {
+        format!("не удалось разместить в памяти диск на {} МиБ", disk_bytes / (1024 * 1024))
+    })?;
+
+    let first_lba = front / SECTOR_SIZE as u64;
+    let last_lba = first_lba + (volume.len() / SECTOR_SIZE) as u64 - 1;
+    let seed = fnv1a64(&squeezed);
+
+    gpt::wipe(&mut dev).map_err(|err| anyhow::anyhow!("не удалось очистить диск: {err}"))?;
+    gpt::write(
+        &mut dev,
+        Guid::from_entropy(expand(seed, b"freeos-btrfs-disk")),
+        &[PartitionSpec {
+            type_guid: gpt::FREEOS_DATA_TYPE,
+            unique_guid: Guid::from_entropy(expand(seed, b"freeos-btrfs-part")),
+            first_lba,
+            last_lba,
+            attributes: 0,
+            name: "FreeOS data",
+        }],
+    )
+    .map_err(|err| anyhow::anyhow!("не удалось записать таблицу разделов: {err}"))?;
+
+    {
+        use disk::BlockDevice as _;
+        dev.write(first_lba, &volume)
+            .map_err(|err| anyhow::anyhow!("не удалось уложить том на диск: {err}"))?;
+    }
+    volume.clear();
+
+    fs::write(&path, dev.into_vec())
+        .with_context(|| format!("не удалось записать {}", path.display()))?;
+    fs::write(&stamp, &want)?;
+    say!(
+        "диск btrfs: {} ({} МиБ, раздел данных с LBA {first_lba})",
+        path.display(),
+        disk_bytes / (1024 * 1024)
+    );
+    Ok(path)
+}
+
 /// Собрать загрузочный ISO и вернуть путь к нему.
 ///
 /// Отличается от [`build`] не содержимым, а упаковкой: те же файлы, тот же том

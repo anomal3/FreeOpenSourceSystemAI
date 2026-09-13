@@ -825,6 +825,10 @@ fn mount_disk_root(info: &BootInfo) {
 
     let Some(partition) = block::take(&found, root_type) else {
         kprintln!("  root        : no FreeOS root partition: keeping the initrd as root");
+        // Раздел данных от корня не зависит — в этом весь его смысл. Система,
+        // живущая на initrd, обязана увидеть его так же, как установленная:
+        // иначе «подключить диск с данными» работало бы только после установки.
+        mount_data(&found, info);
         return;
     };
     let first_lba = partition.first_lba;
@@ -878,6 +882,7 @@ fn mount_disk_root(info: &BootInfo) {
     fs::set_root(alloc::boxed::Box::new(mount));
 
     mount_state(&found, info);
+    mount_data(&found, info);
     // Разметка запоминается целиком: подтверждение загрузки и `sysupdate`
     // спросят о ней позже и из другого места.
     slot::remember(&found, slot);
@@ -995,6 +1000,85 @@ fn mount_state(found: &[block::Partition], info: &BootInfo) {
     if !writable {
         kprintln!("  state       : mounted read-only, nothing will be written to it");
     }
+}
+
+/// Куда монтируется раздел данных.
+///
+/// Одна ветка, а не пять, как у состояния: раздел данных — это том целиком, со
+/// своим содержимым, а не дополнение к корню. Смешивать его с деревом системы
+/// незачем — он и существует затем, чтобы система его не касалась.
+const DATA_BRANCH: &str = "/data";
+
+/// Найти и смонтировать раздел данных.
+///
+/// Его отсутствие — обычное дело: установщик такой раздел не создаёт, он
+/// появляется только там, где его завёл человек. Поэтому и молчание при
+/// отсутствии: строка «нет раздела данных» на каждой загрузке приучила бы её не
+/// читать.
+///
+/// # Почему формат выясняется пробой, а не типом раздела
+///
+/// Тип в GPT говорит, **зачем** раздел, а не **чем** он отформатирован. За
+/// время переезда на btrfs на одном и том же типе будут встречаться оба
+/// формата, и решать по типу значило бы завести третий GUID ради вопроса,
+/// ответ на который лежит в первых байтах самого тома.
+fn mount_data(found: &[block::Partition], info: &BootInfo) {
+    use disk::gpt;
+
+    let Some(partition) = block::take(found, gpt::FREEOS_DATA_TYPE) else {
+        return;
+    };
+    let first_lba = partition.first_lba;
+    let mut device = partition.device;
+
+    if !btrfs::detect(&mut device, first_lba) {
+        // Не btrfs — значит ext2, и обращаться с ним надо как с состоянием:
+        // проверить до монтирования и открыть на запись, если режим позволяет.
+        check_volume("data", &mut device, first_lba, info.check_disk());
+        let writable = !info.safe_mode();
+        match fs::Ext2Fs::mount(alloc::boxed::Box::new(device), first_lba, writable) {
+            Ok(mount) => {
+                let (blocks, block_size, _, _) = mount.stats();
+                kprintln!(
+                    "  data        : ext2 at LBA {first_lba}, {blocks} blocks of {block_size} B"
+                );
+                fs::mount_volume_at(DATA_BRANCH, alloc::sync::Arc::new(mount));
+                kprintln!("  data        : {DATA_BRANCH} comes from the data partition");
+            }
+            Err(err) => {
+                kprintln!("  data        : cannot mount the data partition at LBA {first_lba}: {err}");
+            }
+        }
+        return;
+    }
+
+    // btrfs открывается только на чтение, и `check_volume` ему не зовётся:
+    // нашего `fsck` для этого формата нет, а проверять один формат средствами
+    // другого — худший из возможных способов испортить том.
+    let mount = match fs::BtrfsFs::mount(alloc::boxed::Box::new(device), first_lba) {
+        Ok(mount) => mount,
+        Err(err) => {
+            kprintln!("  data        : cannot mount btrfs at LBA {first_lba}: {err}");
+            return;
+        }
+    };
+    let (sector, node) = mount.geometry();
+    let (generation, total, used, chunks, requests) = mount.stats();
+    kprintln!(
+        "  data        : btrfs at LBA {first_lba}, {} MiB, {} MiB used, {chunks} chunk(s)",
+        total / (1024 * 1024),
+        used / (1024 * 1024)
+    );
+    kprintln!(
+        "  data        : label '{}', generation {generation}, {sector} B sectors, {node} B nodes",
+        mount.label()
+    );
+    if !mount.was_clean() {
+        kprintln!("  data        : volume was NOT unmounted cleanly, the log tree is not replayed");
+    }
+    kprintln!("  data        : mounted read-only, {requests} disk request(s) so far");
+    fs::mount_volume_at(DATA_BRANCH, alloc::sync::Arc::new(mount));
+    kprintln!("  data        : {DATA_BRANCH} comes from the data partition");
 }
 
 /// Сказать вслух, каким режимом грузимся.

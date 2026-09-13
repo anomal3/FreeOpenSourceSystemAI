@@ -43,6 +43,14 @@ pub enum Target {
     /// путём, который прошивка умеет всегда, а проверяемый диск оказывается
     /// вторым носителем: ядро обязано найти корень **на нём**, перебрав оба.
     LiveAndDisk,
+    /// Система грузится с каталога хоста, а рядом подключён диск с томом
+    /// **btrfs**, созданным `mkfs.btrfs`.
+    ///
+    /// Второй носитель здесь не «ещё один диск», а весь смысл проверки: том
+    /// сделан чужой программой, и система обязана прочитать его, ничего о нём
+    /// не зная заранее. Корня FreeOS на этом диске нет — ядро оставляет корнем
+    /// initrd и монтирует только раздел данных.
+    LiveAndBtrfs,
 }
 
 impl Target {
@@ -75,6 +83,7 @@ impl Target {
             Target::Installed => "диск после установки",
             Target::Iso => "загрузочный ISO в приводе",
             Target::LiveAndDisk => "каталог хоста плюс диск после установки",
+            Target::LiveAndBtrfs => "каталог хоста плюс диск с томом btrfs",
         }
     }
 }
@@ -5131,6 +5140,97 @@ pub const ALL: &[Scenario] = &[
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "btrfs-read",
+        about: "Том btrfs, созданный mkfs.btrfs, монтируется в /data и читается.",
+        target: Target::LiveAndBtrfs,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            // Диск есть, корня FreeOS на нём нет — и это часть проверки:
+            // раздел данных обязан находиться сам по себе, а не как довесок к
+            // установленной системе.
+            Step::Await("root        : no FreeOS root partition", BOOT),
+            // Дальше — то, что ядро вычитало из ЧУЖОГО тома. Метка и поколение
+            // взяты из суперблока, число кусков — из дерева кусков, то есть
+            // одной этой строкой доказан весь путь до B-деревьев.
+            Step::Await("data        : btrfs at LBA", 60_000),
+            Step::Await("128 MiB,", 10_000),
+            Step::Await("label 'FREEOS-FIXTURE'", 10_000),
+            Step::Await("4096 B sectors, 16384 B nodes", 10_000),
+            Step::Await("data        : mounted read-only", 10_000),
+            Step::Await("/data comes from the data partition", 10_000),
+            Step::Await("freeos> ", 60_000),
+
+            // Каталог: имена приходят из дерева, а размеры и права — из inode
+            // каждого файла, то есть на каждое имя идёт отдельный спуск.
+            // Имена ждутся по одному и в том порядке, в каком их клали:
+            // перечисление идёт по `DIR_INDEX`, то есть по порядку создания, а
+            // не по хешу имени. `Step::Expect` здесь не годится — он смотрит в
+            // буфер сразу, а строки приезжают по линии медленнее, чем ядро их
+            // печатает.
+            Step::Line("ls /data"),
+            Step::Await("hello.txt", 30_000),
+            Step::Await("dir/", 30_000),
+            Step::Await("holes.bin", 30_000),
+            Step::Await("many/", 30_000),
+
+            // Встроенный экстент: содержимое файла лежит внутри узла дерева, и
+            // отдельного блока данных у него нет вовсе.
+            Step::Line("cat /data/hello.txt"),
+            Step::Await("hello from btrfs", 30_000),
+
+            // Две тысячи файлов — дерево высотой больше нуля. Имя ищется по
+            // хешу, а не перебором: перебор на такой каталог не уложился бы ни
+            // в один срок стенда, и это само по себе проверка.
+            Step::Line("cat /data/many/f1999"),
+            Step::Await("file 1999", 30_000),
+
+            // Вложенность и файл, который больше предела встраивания, но меньше
+            // сектора: экстент есть, и он длиннее самого файла.
+            Step::Line("cat /data/dir/sub/small.txt"),
+            Step::Await("small", 30_000),
+            Step::Line("stat /data/mixed.bin"),
+            Step::Await("file, 3000 bytes", 30_000),
+
+            // Настоящее чтение данных с проверкой сумм — через программу, то
+            // есть через системные вызовы, а не командой ядра. `wc` читает файл
+            // кусками по 512 байт: каждый такой кусок заставляет ядро найти
+            // экстент, прочитать сектор и сверить его crc32c.
+            Step::Line("run /bin/wc /data/mixed.bin"),
+            Step::Await("3000 bytes in /data/mixed.bin", 60_000),
+
+            // Размер большого файла берётся из inode, без чтения: четыре
+            // мегабайта, сверенные до байта, проверяются на хосте
+            // (`cargo test -p btrfs`), где это стоит доли секунды, а не минут
+            // эмулятора. Здесь доказывается, что ядро видит тот же файл.
+            Step::Line("stat /data/dir/big.bin"),
+            Step::Await("file, 4194304 bytes", 30_000),
+
+            // Том открыт только на чтение, и отказ обязан прийти от файловой
+            // системы, а не от прав: файл лежит под root, а сеанс живой системы
+            // тоже идёт от root.
+            Step::Line("echo nope > /data/hello.txt"),
+            Step::Await("/data/hello.txt:", 30_000),
+            Step::Absent("KERNEL PANIC"),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
         ],
     },
 ];

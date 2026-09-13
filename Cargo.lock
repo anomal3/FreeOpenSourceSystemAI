@@ -135,6 +135,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "btrfs"
+version = "0.3.0"
+dependencies = [
+ "disk",
+ "flate2",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -593,6 +601,7 @@ name = "kernel"
 version = "0.3.0"
 dependencies = [
  "boot-info",
+ "btrfs",
  "calendar",
  "disk",
  "ed25519-dalek",
@@ -1267,12 +1276,14 @@ name = "xtask"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "btrfs",
  "clap",
  "disk",
  "ed25519-dalek",
  "ext2",
  "ext4-view",
  "fatfs",
+ "flate2",
  "fpk",
  "freeos-cc",
  "osupdate",

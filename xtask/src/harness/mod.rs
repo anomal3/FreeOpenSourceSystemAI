@@ -2072,6 +2072,10 @@ fn prepare_drives(
             Drive::HostDirectory(qemu::prepare_esp(built)?),
             Drive::Image(prepare_installed_disk(arch, built.release)?),
         ],
+        Target::LiveAndBtrfs => vec![
+            Drive::HostDirectory(qemu::prepare_esp(built)?),
+            Drive::Image(image::prepare_btrfs_disk(arch, built.release)?),
+        ],
     };
     Ok(drives)
 }
