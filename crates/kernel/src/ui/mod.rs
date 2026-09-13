@@ -764,7 +764,34 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 PanelHit::Tray(_) | PanelHit::Empty => Some((&context::Action::ON_TRAY[..], "tray")),
                 PanelHit::Menu | PanelHit::Window(_) => None,
             }
-        } else if desktop.window_at(x, y).is_none() {
+        } else if let Some((index, hit)) = desktop.window_at(x, y) {
+            // Правая кнопка внутри окна программы доходит до неё событием с
+            // кодом 2 — так у файлового менеджера появляется своё меню. Окно
+            // при этом поднимается, как и от левой: меню над окном, которое
+            // не в фокусе, читалось бы как меню чужого окна.
+            if hit == Hit::Body {
+                desktop.raise(index);
+                log_focus(desktop);
+                let scale = desktop.scale();
+                if let Some(window) = desktop.focused_mut() {
+                    if window.is_program() {
+                        let local = (
+                            x - window.rect.x,
+                            y - window.rect.y - Window::title_height(scale) as i32,
+                        );
+                        window.push_event(WinEvent {
+                            kind: WIN_POINTER,
+                            code: 2,
+                            x: local.0,
+                            y: local.1,
+                        });
+                    }
+                }
+                desktop.refresh_panel(status);
+                desktop.present();
+            }
+            None
+        } else {
             Some(match desktop.icon_at(x, y) {
                 Some(index) => {
                     desktop.select_icon(Some(index));
@@ -779,8 +806,6 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                     (&context::Action::ON_DESKTOP[..], "desktop")
                 }
             })
-        } else {
-            None
         };
         if let Some((items, what)) = target {
             // Открытое меню запуска закрывается: два меню разом — это два
@@ -1015,8 +1040,8 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                             x - window.rect.x,
                             y - window.rect.y - Window::title_height(scale) as i32,
                         );
-                        // Единица — левая кнопка, и других здесь не бывает:
-                        // правая открывает меню стола и до окна не доходит.
+                        // Единица — левая кнопка; правая приходит двойкой из
+                        // разбора правой кнопки ниже.
                         window.push_event(WinEvent {
                             kind: WIN_POINTER,
                             code: 1,
@@ -1091,6 +1116,13 @@ fn program_key(event: KeyEvent) -> Option<u32> {
         return Some(symbol as u32);
     }
     Some(match event.code {
+        // Backspace и Escape раскладка символом не отдаёт — намеренно, см.
+        // `keymap`, — а договор окон обещает их программам символами `0x08`
+        // и `0x1B`: так их шлёт всякий терминал, и так их ждёт «Файлы». До
+        // фазы С4 обе клавиши здесь терялись, и «вверх» по Backspace в окне
+        // программы не работал ни разу — заметно это стало только со стенда.
+        KeyCode::Backspace => 0x08,
+        KeyCode::Escape => 0x1B,
         KeyCode::Left => user_abi::WIN_KEY_LEFT,
         KeyCode::Right => user_abi::WIN_KEY_RIGHT,
         KeyCode::Up => user_abi::WIN_KEY_UP,
@@ -1100,6 +1132,7 @@ fn program_key(event: KeyEvent) -> Option<u32> {
         KeyCode::PageUp => user_abi::WIN_KEY_PAGE_UP,
         KeyCode::PageDown => user_abi::WIN_KEY_PAGE_DOWN,
         KeyCode::Delete => user_abi::WIN_KEY_DELETE,
+        KeyCode::Menu => user_abi::WIN_KEY_MENU,
         _ => return None,
     })
 }

@@ -71,8 +71,8 @@ use user_abi::{
 
 pub use user_abi::{
     MAX_TITLE, PIXEL_BGR, PIXEL_RGB, SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_KEY_DELETE,
-    WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT, WIN_KEY_NAMED, WIN_KEY_PAGE_DOWN,
-    WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP, WIN_POINTER, WinEvent,
+    WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT, WIN_KEY_MENU, WIN_KEY_NAMED,
+    WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP, WIN_POINTER, WinEvent,
 };
 
 /// Как эта клавиша называется в журнале — или `None`, если она пришла символом.
@@ -92,6 +92,7 @@ pub fn key_name(code: u32) -> Option<&'static str> {
         WIN_KEY_PAGE_UP => "pageup",
         WIN_KEY_PAGE_DOWN => "pagedown",
         WIN_KEY_DELETE => "delete",
+        WIN_KEY_MENU => "menu",
         // Имя из будущего: договор обещает, что всё выше границы — имя, а не
         // символ, и программа, собранная до его выдачи, обязана это понимать, а
         // не принимать за букву.
@@ -328,6 +329,15 @@ pub fn sysinfo() -> Option<SysInfo> {
     // SAFETY: структура живёт в памяти программы, выравнивание от типа.
     let result = unsafe { syscall(SYS_SYSINFO, core::ptr::from_mut(&mut out) as usize, 0, 0) };
     (result == 0).then_some(out)
+}
+
+/// Точки монтирования текстом: по строке `точка<TAB>фс` на том.
+///
+/// Возвращает, сколько байт буфера занято, либо отрицательный код. См.
+/// [`user_abi::SYS_MOUNTS`].
+pub fn mounts(buffer: &mut [u8]) -> i64 {
+    // SAFETY: буфер — живой срез программы, длина его собственная.
+    unsafe { syscall(user_abi::SYS_MOUNTS, buffer.as_mut_ptr() as usize, buffer.len(), 0) }
 }
 
 /// Выполнить системный вызов.

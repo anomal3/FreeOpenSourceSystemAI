@@ -50,7 +50,7 @@ use mini_ui::Rect;
 use user_abi::{
     MAX_TITLE, SYS_WINCLOSE, SYS_WINCOMMIT, SYS_WINEVENT, SYS_WINOPEN, WinEvent, WindowSpec,
 };
-use user_abi::{SYSINFO_DARK, SYS_SYSINFO, SysInfo};
+use user_abi::{SYSINFO_DARK, SYS_MOUNTS, SYS_SYSINFO, SysInfo};
 use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
@@ -177,6 +177,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_WINCLOSE => winclose(a0 as i64),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
+        // Фаза С4: тома для «Моего компьютера».
+        SYS_MOUNTS => mounts(a0, a1),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1504,6 +1506,34 @@ fn winevent(id: i64, out: usize) -> i64 {
 /// Монитор рисует картину состояния; картина, склеенная из десяти снимков,
 /// взятых в разные мгновения, врёт тем убедительнее, чем быстрее меняется
 /// система.
+/// `mounts(ptr, len)`: точки монтирования текстом, по строке на том.
+///
+/// Записывается только то, что помещается целыми строками: см. договор у
+/// [`SYS_MOUNTS`].
+fn mounts(ptr: usize, len: usize) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    if !space::user_can(ptr, len, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: диапазон проверен по таблицам программы, страницы отображены и
+    // доступны ей на запись; ядро и программа не исполняются одновременно.
+    let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+    let mut written = 0usize;
+    for (point, kind) in crate::fs::mounted() {
+        let point = if point.is_empty() { "/" } else { point };
+        let line = alloc::format!("{point}\t{kind}\n");
+        let bytes = line.as_bytes();
+        if written + bytes.len() > len {
+            break;
+        }
+        out[written..written + bytes.len()].copy_from_slice(bytes);
+        written += bytes.len();
+    }
+    written as i64
+}
+
 fn sysinfo(out: usize) -> i64 {
     if out % align_of::<SysInfo>() != 0 {
         return ERR_BAD_ADDRESS;
