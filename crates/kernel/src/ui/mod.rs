@@ -44,6 +44,7 @@
 // от ядра у них не было ни одной, так что переезд свёлся к переносу двух файлов.
 pub mod compositor;
 pub mod context;
+pub mod dialog;
 pub mod icons;
 pub mod panel;
 pub mod pointer;
@@ -53,7 +54,7 @@ pub mod term;
 pub mod window;
 
 use alloc::string::String;
-use core::fmt::Write as _;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use mini_ui::theme;
 use mini_ui::{Rect, Screen, Surface};
@@ -66,6 +67,7 @@ use crate::{arch, kprintln, mm};
 use compositor::Compositor;
 use panel::{PanelHit, Status};
 pub use window::App;
+use dialog::{AboutFacts, Answer, Dialog};
 use window::{Hit, Window};
 
 /// Насколько сдвигается окно за одно нажатие Ctrl+стрелка.
@@ -295,9 +297,13 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
                 h,
             )
         }
+        // Размер диалога — от его содержимого, а не доля экрана: текст и
+        // кнопки те же на любом мониторе, и на 1920 окно в половину ширины
+        // было бы пустым полем с кнопками в дальнем углу.
         App::About => {
-            let w = (width / 2).max(320);
-            let h = (work / 2).max(200);
+            let scale = desktop.scale();
+            let w = (540 * scale).min(width);
+            let h = (440 * scale).min(work);
             Rect::new(
                 ((width - w) / 2) as i32,
                 ((work.saturating_sub(h)) / 2) as i32,
@@ -306,11 +312,12 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
             )
         }
         // Подтверждение встаёт по центру и заметно меньше остальных: это вопрос
-        // на две строки ответа, и окно размером с терминал выглядело бы как
-        // ещё одна программа, а не как «система ждёт от вас слова».
+        // с двумя кнопками, и окно размером с терминал выглядело бы как ещё одна
+        // программа, а не как «система ждёт от вас ответа».
         App::Shutdown | App::Restart => {
-            let w = (width / 2).max(360).min(width);
-            let h = (work / 3).max(180);
+            let scale = desktop.scale();
+            let w = (500 * scale).min(width);
+            let h = (260 * scale).min(work);
             Rect::new(
                 ((width.saturating_sub(w)) / 2) as i32,
                 ((work.saturating_sub(h)) / 2) as i32,
@@ -345,15 +352,9 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
             scale,
             (desktop.screen_width(), desktop.screen_height()),
         ),
-        App::About => {
-            let mut window = Window::text(App::About, rect, scale)?;
-            window.write_str(&about_text(desktop));
-            Some(window)
-        }
+        App::About => Window::dialog(App::About, rect, scale, Dialog::About(about_facts(desktop))),
         App::Shutdown | App::Restart => {
-            let mut window = Window::text(app, rect, scale)?;
-            window.write_str(&confirm_text(app));
-            Some(window)
+            Window::dialog(app, rect, scale, Dialog::Power { restart: app == App::Restart })
         }
         // Окно программы строится не здесь, и построить его столу нечем: ему
         // нужны кадры, которые выдаёт [`crate::user`]. Сюда приходят с меню и с
@@ -364,57 +365,28 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
     }
 }
 
-/// Текст окна подтверждения.
+/// Память на момент последнего обновления панели, в МиБ.
 ///
-/// Оно объясняет не только выбор, но и последствие: «том будет закрыт» — это
-/// то, ради чего порядок действий при выключении вообще существует, и человеку
-/// стоит знать, что систему нельзя гасить кнопкой на корпусе просто так.
-fn confirm_text(app: App) -> String {
-    let mut text = String::new();
-    // Строки короткие не случайно: окно подтверждения вдвое уже терминала, а
-    // перенос посреди фразы выглядит как испорченный вывод. Сорок знаков
-    // помещаются и на 800×600, и на 1280×800.
-    let (what, then) = if app == App::Restart {
-        ("Перезагрузить машину?", "Она запустится снова с того же диска.")
-    } else {
-        ("Выключить машину?", "Включать её придётся руками.")
-    };
-    let _ = write!(
-        text,
-        "{what}\n\n\
-         Корневой том закрывается первым,\n\
-         чтобы следующая загрузка нашла его целым.\n\
-         {then}\n\n\
-         Y   да, выключаем\n\
-         N   нет, передумал (Esc, Ctrl+W)\n",
-    );
-    text
+/// Копия, а не вопрос к пулу кадров: окно строится под замком стола, а пул
+/// кадров живёт за своим замком, и под ним бывает вывод, который доходит до
+/// терминала на столе. Спросить пул отсюда — значит взять два замка в порядке,
+/// обратном тому, в каком их берёт вывод. [`status_now`] спрашивает его вне
+/// замка стола при каждом обновлении панели и оставляет числа здесь.
+static LAST_FREE_MIB: AtomicU64 = AtomicU64::new(0);
+static LAST_TOTAL_MIB: AtomicU64 = AtomicU64::new(0);
+
+/// Сведения для окна «О системе» — на момент его открытия.
+fn about_facts(desktop: &Compositor) -> AboutFacts {
+    AboutFacts {
+        version: crate::VERSION,
+        arch: arch::ARCH_NAME,
+        screen: (desktop.screen_width(), desktop.screen_height()),
+        free_mib: LAST_FREE_MIB.load(Ordering::Relaxed),
+        total_mib: LAST_TOTAL_MIB.load(Ordering::Relaxed),
+        uptime_ms: crate::time::uptime_ms(),
+    }
 }
 
-/// Текст окна «о системе».
-///
-/// Он же — единственное место, где сочетания клавиш стола записаны для
-/// пользователя. Меню их не показывает: меню отвечает на вопрос «что можно
-/// запустить», а не «как этим управлять».
-fn about_text(desktop: &Compositor) -> String {
-    let mut text = String::new();
-    let _ = write!(
-        text,
-        "FreeOS {}\n\
-         Операционная система, написанная на Rust с пустого места.\n\n\
-         архитектура   {}\n\
-         экран         {}x{}\n\n\
-         Meta или F1   меню запуска\n\
-         Tab           следующее окно\n\
-         Ctrl+W        закрыть окно\n\
-         Ctrl+стрелки  подвинуть окно\n",
-        crate::VERSION,
-        arch::ARCH_NAME,
-        desktop.screen_width(),
-        desktop.screen_height(),
-    );
-    text
-}
 
 /// Что показывает панель справа.
 ///
@@ -423,11 +395,15 @@ fn about_text(desktop: &Compositor) -> String {
 /// взаимную блокировку.
 fn status_now() -> Status {
     let frames = mm::frame::stats();
+    let free_mib = (frames.free_bytes() / (1024 * 1024)) as u64;
+    let total_mib = (frames.total_bytes() / (1024 * 1024)) as u64;
+    LAST_FREE_MIB.store(free_mib, Ordering::Relaxed);
+    LAST_TOTAL_MIB.store(total_mib, Ordering::Relaxed);
     Status {
         clock: crate::time::clock_text(),
         uptime_ms: crate::time::uptime_ms(),
-        free_mib: (frames.free_bytes() / (1024 * 1024)) as u64,
-        total_mib: (frames.total_bytes() / (1024 * 1024)) as u64,
+        free_mib,
+        total_mib,
     }
 }
 
@@ -950,6 +926,9 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             // «Параметрах» им выбирают раздел и нажимают пункты.
             Hit::Body => {
                 let scale = desktop.scale();
+                // Ответ диалога забирается здесь, а действует ниже: окно сейчас
+                // заимствовано у стола, и закрыть его изнутри `match` нечем.
+                let mut answer = None;
                 let changed = match desktop.focused_mut() {
                     // Окно программы получает щелчок событием, а не
                     // перерисовкой: что нарисовать в ответ, решает она.
@@ -974,10 +953,15 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                     }
                     Some(window) => {
                         window.handle_click(x, y);
+                        answer = window.take_answer();
                         window.took_theme_change()
                     }
                     None => false,
                 };
+                if let (Some(answer), Some(app)) = (answer, app) {
+                    answer_dialog(desktop, app, answer);
+                    log_focus(desktop);
+                }
                 // Смена темы — единственное, что окно меняет за своими
                 // границами. Перекрашивать стол изнутри окна оно не может:
                 // остальные окна, панель и обои принадлежат композитору,
@@ -995,33 +979,27 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     }
 }
 
-/// Ответить на вопрос окна подтверждения.
+/// Ответить диалогу: закрыть окно и, если это было «да» на вопрос о питании,
+/// поднять просьбу выключиться.
 ///
-/// Возвращает `true`, если клавиша была ответом: всё остальное окно
-/// подтверждения игнорирует — набирать в нём нечего.
+/// Строки журнала те же, что были у ответа буквами: по ним стенд узнаёт,
+/// что окно закрыто и чем.
 ///
 /// Само выключение здесь **не** происходит. Эта функция работает под замком
 /// рабочего стола, взятым с запрещёнными прерываниями, а выключение сбрасывает
 /// том на диск и ждёт ответа контроллера — то есть ждёт прерывания, которого в
 /// этом состоянии не будет. Поэтому здесь поднимается просьба, а гасит систему
 /// задача (см. [`crate::power`]).
-fn confirm_key(desktop: &mut Compositor, app: App, restart: bool, code: KeyCode) -> bool {
-    match code {
-        KeyCode::Y => {
-            if desktop.close(app) {
-                kprintln!("  desktop     : closed '{}'", app.title());
-            }
+fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
+    if desktop.close(app) {
+        kprintln!("  desktop     : closed '{}'", app.title());
+    }
+    match (app.confirms_power(), answer) {
+        (Some(restart), Answer::Confirm) => {
             crate::power::request(restart, crate::power::Source::Desktop);
-            true
         }
-        KeyCode::N | KeyCode::Escape => {
-            if desktop.close(app) {
-                kprintln!("  desktop     : closed '{}'", app.title());
-            }
-            kprintln!("  desktop     : '{}' cancelled", app.title());
-            true
-        }
-        _ => false,
+        (Some(_), Answer::Close) => kprintln!("  desktop     : '{}' cancelled", app.title()),
+        (None, _) => {}
     }
 }
 
@@ -1054,13 +1032,26 @@ fn program_key(event: KeyEvent) -> Option<u32> {
 
 /// Отдать событие активному окну.
 fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
-    // Окно подтверждения разбирает клавиши само и раньше остальных: у него нет
-    // содержимого, которое стоило бы прокручивать, зато есть ровно два ответа.
+    // Диалог разбирает клавиши раньше остальных окон: набирать в нём нечего, а
+    // ответ закрывает окно, и закрыть его может только стол.
     if let Some(app) = desktop.focused_app() {
-        if let Some(restart) = app.confirms_power() {
-            if event.pressed && confirm_key(desktop, app, restart, event.code) {
-                log_focus(desktop);
-                desktop.refresh_panel(status);
+        if app == App::About || app.confirms_power().is_some() {
+            if event.pressed {
+                // `Y` и `N` у вопроса о питании остались с тех пор, когда кнопок
+                // не было: на них стоит стенд, а человеку они не мешают.
+                let answer = match event.code {
+                    KeyCode::Y if app.confirms_power().is_some() => Some(Answer::Confirm),
+                    KeyCode::N if app.confirms_power().is_some() => Some(Answer::Close),
+                    code => desktop.focused_mut().and_then(|window| {
+                        window.handle_key(code);
+                        window.take_answer()
+                    }),
+                };
+                if let Some(answer) = answer {
+                    answer_dialog(desktop, app, answer);
+                    log_focus(desktop);
+                    desktop.refresh_panel(status);
+                }
                 desktop.present();
             }
             return None;

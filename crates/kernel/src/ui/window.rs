@@ -39,6 +39,7 @@ use mini_ui::{Rect, Surface};
 use user_abi::WinEvent;
 
 use mini_ui::paint::{self, Ctx, Weight};
+use super::dialog::{Answer, Dialog, DialogView};
 use super::settings::SettingsView;
 use mini_ui::theme;
 use crate::input::KeyCode;
@@ -216,6 +217,8 @@ pub enum Content {
     Text(TextGrid),
     /// Окно параметров: разделы слева, содержимое справа.
     Settings(SettingsView),
+    /// Окно, которое сообщает или спрашивает: «О системе», выключение.
+    Dialog(DialogView),
     /// Окно пользовательской программы: пиксели пишет она сама.
     Program(ProgramView),
 }
@@ -323,6 +326,17 @@ impl Window {
         let content = Content::Settings(SettingsView::new(screen));
         let title = own(App::Settings.caption())?;
         let mut window = Self::wrap(App::Settings, rect, surface, content, scale, title);
+        window.redraw_content();
+        window.draw_decorations(false);
+        Some(window)
+    }
+
+    /// Создать окно, которое сообщает или спрашивает.
+    #[must_use]
+    pub fn dialog(app: App, rect: Rect, scale: u32, dialog: Dialog) -> Option<Self> {
+        let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
+        let content = Content::Dialog(DialogView::new(dialog));
+        let mut window = Self::wrap(app, rect, surface, content, scale, own(app.caption())?);
         window.redraw_content();
         window.draw_decorations(false);
         Some(window)
@@ -613,7 +627,7 @@ impl Window {
                 grid.take_damage();
                 self.damage = self.damage.union(&area);
             }
-            Content::Settings(_) => self.redraw_content(),
+            Content::Settings(_) | Content::Dialog(_) => self.redraw_content(),
             // Окно программы темы не знает и знать не может: его пиксели
             // написала программа, и перекрасить их ядру нечем. Заголовок
             // перерисует композитор, а содержимое останется прежним — это
@@ -719,7 +733,7 @@ impl Window {
     pub fn size_in_cells(&self) -> (u32, u32) {
         match &self.content {
             Content::Text(grid) => (grid.cols(), grid.rows()),
-            Content::Settings(_) | Content::Program(_) => (0, 0),
+            Content::Settings(_) | Content::Dialog(_) | Content::Program(_) => (0, 0),
         }
     }
 
@@ -727,6 +741,13 @@ impl Window {
     pub fn handle_key(&mut self, code: KeyCode) -> bool {
         match &mut self.content {
             Content::Settings(view) => {
+                if !view.handle(code) {
+                    return false;
+                }
+                self.redraw_content();
+                true
+            }
+            Content::Dialog(view) => {
                 if !view.handle(code) {
                     return false;
                 }
@@ -754,6 +775,7 @@ impl Window {
         self.surface.fill(area, theme::window_bg());
         match &self.content {
             Content::Settings(view) => view.draw(&mut self.surface, area, ctx),
+            Content::Dialog(view) => view.draw(&mut self.surface, area, ctx),
             Content::Text(_) => return,
             // Пиксели программы ядро не рисует, а переносит: что в них
             // написано — её дело. Заливка выше не лишняя и здесь: поверхность
@@ -788,6 +810,7 @@ impl Window {
         let local = (x - self.rect.x, y - self.rect.y);
         let used = match &mut self.content {
             Content::Settings(view) => view.click(area, ctx, local.0, local.1),
+            Content::Dialog(view) => view.click(area, ctx, local.0, local.1),
             Content::Text(_) => false,
             // Щелчок по окну программы — её событие, а не работа ядра: кладёт
             // его в очередь оконный менеджер, которому известны кнопки мыши.
@@ -807,7 +830,18 @@ impl Window {
     pub fn took_theme_change(&mut self) -> bool {
         match &mut self.content {
             Content::Settings(view) => view.take_theme_change(),
-            Content::Text(_) | Content::Program(_) => false,
+            Content::Text(_) | Content::Dialog(_) | Content::Program(_) => false,
+        }
+    }
+
+    /// Забрать ответ диалога, если его дали.
+    ///
+    /// Ответ забирает стол, а не окно действует само: «Выключить» закрывает
+    /// окно и поднимает просьбу к системе, и то и другое за пределами окна.
+    pub fn take_answer(&mut self) -> Option<Answer> {
+        match &mut self.content {
+            Content::Dialog(view) => view.take_answer(),
+            Content::Text(_) | Content::Settings(_) | Content::Program(_) => None,
         }
     }
 
@@ -848,7 +882,7 @@ impl Window {
             }
             // Список файлов и «Параметры» рисуют себя от размера области, и
             // переносить в них нечего: содержимое соберётся заново.
-            Content::Settings(_) => {}
+            Content::Settings(_) | Content::Dialog(_) => {}
             // Окно программы размера не меняет, и это названный предел. Его
             // пиксели лежат в кадрах, отображённых программе; новый размер
             // означал бы другие кадры по другому адресу — то есть поверхность,
