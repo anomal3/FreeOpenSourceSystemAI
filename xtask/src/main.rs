@@ -484,7 +484,9 @@ fn real_main() -> Result<()> {
             } else if args.image {
                 qemu::Drive::Image(image::build(&built, image::Kind::System)?)
             } else {
-                qemu::Drive::HostDirectory(qemu::prepare_esp(&built)?)
+                // Без окна за машиной никого нет — это CI; с окном сидит
+                // человек, и сеанс не должен закрываться через двадцать секунд.
+                qemu::Drive::HostDirectory(qemu::prepare_esp(&built, args.serial_only)?)
             };
 
             let opts = qemu::RunOptions {

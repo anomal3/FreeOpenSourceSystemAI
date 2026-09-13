@@ -2029,7 +2029,7 @@ fn prepare_drives(
     ports: HostPorts,
 ) -> Result<Vec<Drive>> {
     let drives = match scenario.target {
-        Target::Live => vec![Drive::HostDirectory(qemu::prepare_esp(built)?)],
+        Target::Live => vec![Drive::HostDirectory(qemu::prepare_esp(built, true)?)],
         Target::Image => vec![Drive::Image(image::build(built, image::Kind::System)?)],
         Target::Installer => vec![
             // Порядок важен: прошивка перебирает носители в порядке подключения,
@@ -2089,11 +2089,11 @@ fn prepare_drives(
         // Порядок обязателен: прошивка грузится с первого носителя, а второй —
         // тот, ради которого сценарий существует.
         Target::LiveAndDisk => vec![
-            Drive::HostDirectory(qemu::prepare_esp(built)?),
+            Drive::HostDirectory(qemu::prepare_esp(built, true)?),
             Drive::Image(prepare_installed_disk(arch, built.release)?),
         ],
         Target::LiveAndBtrfs => vec![
-            Drive::HostDirectory(qemu::prepare_esp(built)?),
+            Drive::HostDirectory(qemu::prepare_esp(built, true)?),
             Drive::Image(image::prepare_btrfs_disk(arch, built.release)?),
         ],
     };

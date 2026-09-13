@@ -190,7 +190,11 @@ pub enum Drive {
 /// Раскладка: загрузчик уходит в `\EFI\BOOT\BOOT<MACHINE>.EFI` (путь диктует
 /// прошивка), ядро — в корень под именем `kernel.elf`, образ RAM-диска — туда
 /// же под именем `initrd.img` (оба имени диктует загрузчик).
-pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
+///
+/// `unattended` — за машиной никого нет: стенд и запуск без окна. Только тогда
+/// на ESP кладётся метка, по которой оболочка закрывает сеанс после двадцати
+/// секунд простоя.
+pub fn prepare_esp(built: &Built, unattended: bool) -> Result<PathBuf> {
     let arch = built.arch;
     let esp = paths::esp_dir(arch);
 
@@ -243,14 +247,26 @@ pub fn prepare_esp(built: &Built) -> Result<PathBuf> {
     // Метка «за машиной никого нет». Лежит только на ESP, который собирает
     // стенд, и никогда — на носителе, который получает человек: по ней ядро
     // отличает прогон от работы и закрывает сеанс по простою.
+    //
+    // До 2026-09-13 она писалась всегда, в том числе для `cargo xtask run` с
+    // окном: человек открывал QEMU, двадцать секунд читал стол, и оболочка
+    // закрывала сеанс у него на глазах — время на панели замирало, курсор
+    // пропадал, и это выглядело как зависание под аппаратной виртуализацией.
+    // Каталог ESP у стенда и у ручного запуска один, поэтому метка, которой
+    // здесь быть не должно, ещё и удаляется: иначе её оставил бы прошлый прогон.
     let autorun = esp.join("FREEOS").join("AUTORUN.CFG");
-    if let Some(parent) = autorun.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
-    }
-    std::fs::write(&autorun, b"unattended
+    if unattended {
+        if let Some(parent) = autorun.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
+        }
+        std::fs::write(&autorun, b"unattended
 ")
-        .with_context(|| format!("не удалось записать {}", autorun.display()))?;
+            .with_context(|| format!("не удалось записать {}", autorun.display()))?;
+    } else if autorun.is_file() {
+        std::fs::remove_file(&autorun)
+            .with_context(|| format!("не удалось удалить {}", autorun.display()))?;
+    }
 
     Ok(esp)
 }
