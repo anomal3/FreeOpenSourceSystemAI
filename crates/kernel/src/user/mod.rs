@@ -415,6 +415,9 @@ pub struct Program {
     /// проверка прав в системном вызове обязана спрашивать **программу**, а не
     /// сеанс, — см. [`credentials`].
     cred: Credentials,
+    /// Откуда программа запущена — то, что диспетчер задач показывает как
+    /// «расположение файла». До фазы С5 путь жил только в строке журнала.
+    pub path: alloc::string::String,
     /// Откуда программа читает стандартный ввод.
     ///
     /// `None` — с терминала, как было всегда. `Some` — из канала: так её
@@ -1462,6 +1465,7 @@ fn run(
             running: true,
             kill_requested: false,
             cred,
+            path: alloc::string::String::from(path),
             stdin,
             stdout,
             mappings: Vec::new(),
@@ -1846,6 +1850,8 @@ pub enum KillError {
     /// её означало бы бросить её стек, её локи и её незаконченную работу
     /// неизвестно в каком состоянии.
     NotAProgram,
+    /// Программа чужая: снять её вправе только владелец и root.
+    NotAllowed,
 }
 
 impl core::fmt::Display for KillError {
@@ -1856,8 +1862,35 @@ impl core::fmt::Display for KillError {
             Self::NoSuchTask => f.write_str("does not exist"),
             Self::AlreadyFinished => f.write_str("has already finished"),
             Self::NotAProgram => f.write_str("is not running a program; only programs can be stopped"),
+            Self::NotAllowed => f.write_str("belongs to another user"),
         }
     }
+}
+
+/// Путь и uid программы в слоте — для диспетчера задач. `None` — слот не
+/// исполняет программу.
+#[must_use]
+pub fn program_facts(slot: usize) -> Option<(alloc::string::String, u32)> {
+    let table = PROGRAMS.lock();
+    let program = table.get(slot)?.as_ref()?;
+    Some((program.path.clone(), program.cred.uid))
+}
+
+/// Как [`request_kill`], но от имени `who`: чужую программу снимает только
+/// root. Проверка здесь, а не в [`request_kill`], по той же причине, что и у
+/// `spawn`: внутри ядра оболочке проверять нечего, граница — системный вызов.
+pub fn request_kill_as(id: sched::TaskId, who: Credentials) -> Result<(), KillError> {
+    if !who.is_root() {
+        let (slot, _) = sched::lookup(id).ok_or(KillError::NoSuchTask)?;
+        // Замок отпускается до [`request_kill`]: тот берёт его сам.
+        let owner = program_facts(slot).map(|(_, uid)| uid);
+        match owner {
+            Some(uid) if uid == who.uid => {}
+            Some(_) => return Err(KillError::NotAllowed),
+            None => return Err(KillError::NotAProgram),
+        }
+    }
+    request_kill(id)
 }
 
 /// Попросить снять программу задачи `id`.

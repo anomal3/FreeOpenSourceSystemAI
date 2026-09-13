@@ -969,6 +969,29 @@ pub const SYS_SYSINFO: usize = 57;
 /// полем той же строки; программа, которая читает два поля, продолжит работать.
 pub const SYS_MOUNTS: usize = 58;
 
+/// Задачи. `(ptr, len) -> сколько байт записано`.
+///
+/// По строке на задачу, поля через табуляцию:
+/// `<номер>\t<имя>\t<состояние>\t<мс на процессоре>\t<род>\t<uid>\t<путь>`.
+/// Род — `program`, `service` (программа, объявленная служебной) или
+/// `kernel`; у задачи ядра uid — `-`, путь пустой. Состояние — то же слово,
+/// что печатает `tasks` в оболочке. Не поместившееся отбрасывается по границе
+/// строки, как у [`SYS_MOUNTS`].
+///
+/// Это тот самый «список задач», которого [`SYS_SYSINFO`] себе не взял:
+/// переменное число строк переменной длины. Появился ради диспетчера задач
+/// (фаза С5).
+pub const SYS_TASKS: usize = 59;
+
+/// Снять задачу. `(номер) -> 0`.
+///
+/// Просьба, а не приказ, как у `kill` в оболочке: программа снимается на
+/// ближайшем возврате в третье кольцо. Свою программу снимает кто угодно, чужую
+/// — только root ([`ERR_PERMISSION`]); задачу ядра — никто
+/// ([`ERR_UNSUPPORTED`]); которой нет или которая уже закончилась —
+/// [`ERR_NOT_FOUND`].
+pub const SYS_KILL: usize = 60;
+
 /// Счётчики системы — ответ [`SYS_SYSINFO`].
 ///
 /// Все размеры в **байтах**, всё время в **миллисекундах**: единица, о которой
@@ -1650,6 +1673,9 @@ mod tests {
         assert_eq!(SYS_SYSINFO, 57);
         // Фаза С4 — «Мой компьютер» в файловом менеджере.
         assert_eq!(SYS_MOUNTS, 58);
+        // Фаза С5 — диспетчер задач.
+        assert_eq!(SYS_TASKS, 59);
+        assert_eq!(SYS_KILL, 60);
     }
 
     /// Ни один номер не выдан дважды.
@@ -1669,7 +1695,7 @@ mod tests {
             SYS_SHUTDOWN, SYS_STREAMSTATE, SYS_RANDOM, SYS_PIPE, SYS_LAUNCH, SYS_UPDATE,
             SYS_MMAP, SYS_MUNMAP, SYS_MMAP_FILE, SYS_GETCPU, SYS_DUP, SYS_FSTAT, SYS_ISATTY,
             SYS_CLOCK, SYS_NANOSLEEP, SYS_POLL, SYS_TIMES, SYS_WINOPEN, SYS_WINCOMMIT,
-            SYS_WINEVENT, SYS_WINCLOSE, SYS_SYSINFO, SYS_MOUNTS,
+            SYS_WINEVENT, SYS_WINCLOSE, SYS_SYSINFO, SYS_MOUNTS, SYS_TASKS, SYS_KILL,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

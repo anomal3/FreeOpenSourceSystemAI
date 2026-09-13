@@ -340,6 +340,19 @@ pub fn mounts(buffer: &mut [u8]) -> i64 {
     unsafe { syscall(user_abi::SYS_MOUNTS, buffer.as_mut_ptr() as usize, buffer.len(), 0) }
 }
 
+/// Задачи текстом: по строке на задачу, поля через табуляцию. См.
+/// [`user_abi::SYS_TASKS`].
+pub fn tasks(buffer: &mut [u8]) -> i64 {
+    // SAFETY: буфер — живой срез программы, длина его собственная.
+    unsafe { syscall(user_abi::SYS_TASKS, buffer.as_mut_ptr() as usize, buffer.len(), 0) }
+}
+
+/// Попросить задачу остановиться. См. [`user_abi::SYS_KILL`].
+pub fn kill(id: u32) -> i64 {
+    // SAFETY: аргумент — число.
+    unsafe { syscall(user_abi::SYS_KILL, id as usize, 0, 0) }
+}
+
 /// Выполнить системный вызов.
 ///
 /// # Safety

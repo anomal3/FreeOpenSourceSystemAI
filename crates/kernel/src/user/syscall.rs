@@ -50,7 +50,7 @@ use mini_ui::Rect;
 use user_abi::{
     MAX_TITLE, SYS_WINCLOSE, SYS_WINCOMMIT, SYS_WINEVENT, SYS_WINOPEN, WinEvent, WindowSpec,
 };
-use user_abi::{SYSINFO_DARK, SYS_MOUNTS, SYS_SYSINFO, SysInfo};
+use user_abi::{SYSINFO_DARK, SYS_KILL, SYS_MOUNTS, SYS_SYSINFO, SYS_TASKS, SysInfo};
 use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
@@ -179,6 +179,9 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
         SYS_MOUNTS => mounts(a0, a1),
+        // Фаза С5: диспетчер задач.
+        SYS_TASKS => tasks(a0, a1),
+        SYS_KILL => kill(a0),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1506,6 +1509,63 @@ fn winevent(id: i64, out: usize) -> i64 {
 /// Монитор рисует картину состояния; картина, склеенная из десяти снимков,
 /// взятых в разные мгновения, врёт тем убедительнее, чем быстрее меняется
 /// система.
+/// `tasks(ptr, len)`: задачи текстом, по строке на задачу — см. договор у
+/// [`SYS_TASKS`].
+fn tasks(ptr: usize, len: usize) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    if !space::user_can(ptr, len, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: как у `mounts`: диапазон проверен по таблицам программы.
+    let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+    let mut written = 0usize;
+    for task in sched::snapshot() {
+        // Снимок берётся до того, как спрашивать таблицу программ: у неё свой
+        // замок, и брать его под замком планировщика нельзя.
+        let line = match super::program_facts(task.slot) {
+            Some((path, uid)) => {
+                let kind = if task.daemon { "service" } else { "program" };
+                let name = path.rsplit('/').next().unwrap_or(task.name);
+                alloc::format!(
+                    "{}\t{name}\t{}\t{}\t{kind}\t{uid}\t{path}\n",
+                    task.id.as_u32(),
+                    task.state,
+                    task.cpu_ms
+                )
+            }
+            None => alloc::format!(
+                "{}\t{}\t{}\t{}\tkernel\t-\t\n",
+                task.id.as_u32(),
+                task.name,
+                task.state,
+                task.cpu_ms
+            ),
+        };
+        let bytes = line.as_bytes();
+        if written + bytes.len() > len {
+            break;
+        }
+        out[written..written + bytes.len()].copy_from_slice(bytes);
+        written += bytes.len();
+    }
+    written as i64
+}
+
+/// `kill(id) -> 0`: попросить программу остановиться. Чужую — только root.
+fn kill(id: usize) -> i64 {
+    let Ok(raw) = u32::try_from(id) else {
+        return ERR_NOT_FOUND;
+    };
+    match super::request_kill_as(sched::TaskId::new(raw), super::credentials()) {
+        Ok(()) => 0,
+        Err(super::KillError::NoSuchTask | super::KillError::AlreadyFinished) => ERR_NOT_FOUND,
+        Err(super::KillError::NotAProgram) => ERR_UNSUPPORTED,
+        Err(super::KillError::NotAllowed) => ERR_PERMISSION,
+    }
+}
+
 /// `mounts(ptr, len)`: точки монтирования текстом, по строке на том.
 ///
 /// Записывается только то, что помещается целыми строками: см. договор у

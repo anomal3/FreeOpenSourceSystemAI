@@ -876,7 +876,7 @@ pub const ALL: &[Scenario] = &[
             // экрана не зависит и меняется только вместе с `USER_PROGRAMS` в
             // `build.rs`. Тридцать две с фазы 46; `zdemo` собирается только там,
             // где выполнена `cargo xtask thirdparty`, и без неё здесь будет 31.
-            Step::Expect("/bin holds 32 programs"),
+            Step::Expect("/bin holds 33 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -5403,6 +5403,108 @@ pub const ALL: &[Scenario] = &[
             Step::Key("esc"),
             Step::Key("ctrl-w"),
             Step::Await("files: closing on request", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "taskmgr",
+        about: "Диспетчер задач: список задач из ядра, снятие задачи, расположение файла, меню, вкладки, запуск из трея.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Без сети `sshd` три раза падает и печатает об этом, а строка,
+            // набранная в серийную линию под этот шум, теряется (см. заметку
+            // об UART). Дождаться, пока супервизор сдастся.
+            Step::Await("init: 'sshd' failed 3 time(s) in a row, giving up", 60_000),
+            Step::Wait(1_000),
+            // Жертва: монитор системы — программа с окном, которую не жалко.
+            Step::Line("run -b /bin/sysmon"),
+            Step::Await("window      : 'System' at", 30_000),
+            // Новое окно забирает фокус, и строка из серийной линии ушла бы в
+            // него, а не в оболочку: Tab возвращает терминал.
+            Step::Await("sysmon: theme", 15_000),
+            Step::Key("tab"),
+            Step::Await("desktop     : focus 'Terminal'", 15_000),
+            Step::Line("run -b /bin/taskmgr"),
+            Step::Await("window      : 'Task Manager' at", 30_000),
+            Step::Await("taskmgr: ", 15_000),
+            Step::Await(" task(s): ", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("01-processes"),
+            // Программы стоят новыми сверху: первый — сам диспетчер, второй —
+            // монитор. Delete снимает его; ядро говорит, что сняло, стол —
+            // что окно ушло.
+            Step::Key("down"),
+            Step::Await("taskmgr: selected #", 15_000),
+            Step::Expect("'sysmon'"),
+            Step::Key("delete"),
+            Step::Await("taskmgr: asked #", 15_000),
+            // Стол убирает окно раньше, чем ядро дописывает строку о снятии.
+            Step::Await("desktop     : closed the window of ", 15_000),
+            Step::Await("/bin/sysmon: killed by request", 15_000),
+            Step::Wait(2_500),
+            Step::Shot("02-ended"),
+            // Enter на первой строке — расположение файла самого диспетчера:
+            // открываются «Файлы» в /bin.
+            Step::Key("home"),
+            Step::Key("ret"),
+            Step::Await("taskmgr: opened location /bin for #", 15_000),
+            Step::Await("files: /bin has 34 entries", 30_000),
+            Step::Wait(1_500),
+            Step::Shot("03-location"),
+            Step::Aim(Aim::Close("Files")),
+            Step::Click,
+            Step::Await("files: closing on request", 15_000),
+            Step::Await("desktop     : closed the window of ", 15_000),
+            // Правая кнопка по строке — меню задачи.
+            Step::Aim(Aim::Title("Task Manager")),
+            Step::Click,
+            Step::Await("desktop     : focus 'Task Manager'", 15_000),
+            Step::Aim(Aim::TaskRow(0)),
+            Step::RightClick,
+            Step::Await("taskmgr: menu opened for #", 15_000),
+            Step::Wait(800),
+            Step::Shot("04-menu"),
+            Step::Key("esc"),
+            Step::Await("taskmgr: menu closed", 15_000),
+            // Вкладки — цифрами: Tab на столе переключает окна.
+            Step::Key("2"),
+            Step::Await("taskmgr: tab performance", 15_000),
+            Step::Wait(800),
+            Step::Shot("05-performance"),
+            Step::Key("3"),
+            Step::Await("taskmgr: tab services", 15_000),
+            Step::Await("taskmgr: services: 3 described, ", 15_000),
+            Step::Wait(800),
+            Step::Shot("06-services"),
+            Step::Key("ctrl-w"),
+            Step::Await("taskmgr: closing on request", 15_000),
+            Step::Await("desktop     : closed the window of ", 15_000),
+            // Из меню трея: пятый пункт, над ним две черты.
+            Step::Aim(Aim::Tray),
+            Step::RightClick,
+            Step::Await("for tray", 15_000),
+            Step::Aim(Aim::ContextItem(4, 2)),
+            Step::Click,
+            Step::Await("desktop     : started '/bin/taskmgr'", 15_000),
+            Step::Await("window      : 'Task Manager' at", 30_000),
+            Step::Key("ctrl-w"),
+            Step::Await("taskmgr: closing on request", 15_000),
             Step::Absent("KERNEL PANIC"),
         ],
     },

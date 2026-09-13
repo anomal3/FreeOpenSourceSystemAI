@@ -1272,6 +1272,48 @@ pub fn alive() -> usize {
 }
 
 /// Компактный список задач с состояниями.
+/// То, что о задаче знает диспетчер задач.
+///
+/// Снимок, а не ссылка: таблица живёт под замком планировщика, и отдавать
+/// наружу что-то, кроме копии, значило бы держать этот замок, пока программа
+/// рисует окно.
+pub struct TaskFacts {
+    /// Слот в таблице — по нему [`crate::user`] находит программу задачи.
+    pub slot: usize,
+    pub id: TaskId,
+    pub name: &'static str,
+    pub state: TaskState,
+    /// Вместе с незакрытым отрезком исполняющейся задачи, как в [`dump`].
+    pub cpu_ms: u64,
+    pub daemon: bool,
+}
+
+/// Снимок всех задач — для `SYS_TASKS`.
+#[must_use]
+pub fn snapshot() -> alloc::vec::Vec<TaskFacts> {
+    let sched = SCHED.lock();
+    let now = crate::time::uptime_ms();
+    let mut out = alloc::vec::Vec::new();
+    for (slot, entry) in sched.tasks.iter().enumerate() {
+        let Some(task) = entry else {
+            continue;
+        };
+        let running = if task.ran_since_ms == 0 { 0 } else { now.saturating_sub(task.ran_since_ms) };
+        if out.try_reserve(1).is_err() {
+            break;
+        }
+        out.push(TaskFacts {
+            slot,
+            id: task.id,
+            name: task.name,
+            state: task.state,
+            cpu_ms: task.cpu_ms + running,
+            daemon: task.daemon,
+        });
+    }
+    out
+}
+
 pub fn dump() {
     // Строки собираются и печатаются под локом. Это допустимо ровно потому, что
     // `kprintln!` не обращается к планировщику: иначе получилась бы рекурсия на

@@ -233,7 +233,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 33] = [
+const PROGRAMS: [(&CStr16, &str); 34] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -272,6 +272,8 @@ const PROGRAMS: [(&CStr16, &str); 33] = [
     // установленная система показывает значок «Файлы», за которым ничего нет.
     (cstr16!("\\FREEOS\\BIN\\FILES"), "files"),
     (cstr16!("\\FREEOS\\BIN\\SYSMON"), "sysmon"),
+    // Диспетчер задач (фаза С5) — тот, что в меню запуска и в трее.
+    (cstr16!("\\FREEOS\\BIN\\TASKMGR"), "taskmgr"),
     (cstr16!("\\FREEOS\\BIN\\WINSHOW"), "winshow"),
     (cstr16!("\\FREEOS\\BIN\\POSIX"), "posix"),
     // Чужая библиотека, собранная нашим набором (фаза 46).

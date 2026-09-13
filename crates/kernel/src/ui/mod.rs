@@ -1435,11 +1435,9 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             desktop.refresh_panel(status);
         }
         context::Action::TaskManager => {
-            // Меню остаётся открытым с ответом внизу — так же, как отвечает
-            // «создать»: человек видит, что нажатие дошло и что за ним пока
-            // ничего не стоит.
-            kprintln!("  desktop     : task manager is planned, not built yet");
-            desktop.context_note("функция запланирована");
+            desktop.close_context();
+            run_choice(desktop, panel::Choice::Program("taskmgr"));
+            desktop.refresh_panel(status);
         }
         context::Action::Refresh => {
             desktop.close_context();

@@ -68,6 +68,9 @@ pub enum Aim {
     FilesRow(i32),
     /// Пустое место списка того же окна — середина по высоте.
     FilesBody,
+    /// Строка таблицы в окне «Task Manager» с таким номером сверху: та же
+    /// геометрия, что у «Files», только строки без зазора — 32 точки.
+    TaskRow(i32),
     /// Пустое место правее любого окна из раскладки по умолчанию.
     ///
     /// Нужно там, где окна открыты: [`Aim::Empty`] стоит в середине экрана, а
@@ -279,6 +282,10 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::FilesBody => {
             let rect = window(log, "Files")?;
             (rect.x + 340, rect.y + rect.h / 2)
+        }
+        Aim::TaskRow(n) => {
+            let rect = window(log, "Task Manager")?;
+            (rect.x + 200, rect.y + TITLE_H + 48 + 27 + n * 32 + 16)
         }
         Aim::Empty => (width / 2, height / 3),
         Aim::EmptyBelow => (width / 2, height * 3 / 4),
