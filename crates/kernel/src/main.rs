@@ -1052,10 +1052,15 @@ fn mount_data(found: &[block::Partition], info: &BootInfo) {
         return;
     }
 
-    // btrfs открывается только на чтение, и `check_volume` ему не зовётся:
-    // нашего `fsck` для этого формата нет, а проверять один формат средствами
-    // другого — худший из возможных способов испортить том.
-    let mount = match fs::BtrfsFs::mount(alloc::boxed::Box::new(device), first_lba) {
+    // `check_volume` btrfs не зовётся: он говорит на ext2, а проверять один
+    // формат средствами другого — худший из способов испортить том. Своя
+    // проверка у btrfs есть (`fsck` в оболочке), но она читает том целиком, и
+    // платить за это на каждой загрузке незачем: суммы сверяются при чтении.
+    //
+    // На запись — если режим позволяет. Писатель вправе отказаться от тома,
+    // который понимает не целиком; тогда том всё равно монтируется, на чтение.
+    let writable = !info.safe_mode();
+    let mount = match fs::BtrfsFs::mount(alloc::boxed::Box::new(device), first_lba, writable) {
         Ok(mount) => mount,
         Err(err) => {
             kprintln!("  data        : cannot mount btrfs at LBA {first_lba}: {err}");
@@ -1076,7 +1081,15 @@ fn mount_data(found: &[block::Partition], info: &BootInfo) {
     if !mount.was_clean() {
         kprintln!("  data        : volume was NOT unmounted cleanly, the log tree is not replayed");
     }
-    kprintln!("  data        : mounted read-only, {requests} disk request(s) so far");
+    // Отказ писателя называется вслух и с причиной: «том открылся только на
+    // чтение» без объяснения выглядело бы как безопасный режим, которого нет.
+    if mount.writable() {
+        kprintln!("  data        : mounted read-write, {requests} disk request(s) so far");
+    } else if let Some(err) = mount.refused() {
+        kprintln!("  data        : the writer refused the volume ({err}), mounted read-only");
+    } else {
+        kprintln!("  data        : mounted read-only, {requests} disk request(s) so far");
+    }
     fs::mount_volume_at(DATA_BRANCH, alloc::sync::Arc::new(mount));
     kprintln!("  data        : {DATA_BRANCH} comes from the data partition");
 }

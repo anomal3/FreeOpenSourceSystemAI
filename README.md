@@ -168,7 +168,7 @@ waiting to go wrong in it is in **[ROADMAP.md](ROADMAP.md)**.
 | **v0.4** | Real hardware: a phone — its own bootloader, no UEFI, no ACPI, USB in device mode, **a working touchscreen** | in progress |
 | **v0.5** | A libc and a toolchain: somebody else's project builds for this system unpatched | **done** |
 | **v0.6** | Windows belong to programs; settings that persist; a layout a Windows user recognises | **done** |
-| **v0.7** | btrfs: a volume made by `mkfs.btrfs` mounts at `/data` and reads, with crc32c checked on **every** data sector; `fsck` walks the whole volume; our own `mkfs` and writer create, overwrite, truncate, delete and rename files in a way `btrfs check` and the Linux kernel accept | the format side is done; the kernel writing to btrfs and the installer are next |
+| **v0.7** | btrfs: a volume made by `mkfs.btrfs` mounts at `/data` and reads, with crc32c checked on **every** data sector; `fsck` walks the whole volume; our own `mkfs` and writer create, overwrite, truncate, delete and rename files in a way `btrfs check` and the Linux kernel accept; the kernel writes to `/data`, and Linux reads back what it wrote | done; the state partition stays on ext2 until `/data` has been lived with |
 | then | A Raspberry Pi 4 — the first machine that is not an emulator | planned |
 
 ---

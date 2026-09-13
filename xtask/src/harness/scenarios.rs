@@ -225,6 +225,28 @@ pub enum Step {
     /// процесс ушёл сам — значит гость действительно выполнил команду ACPI (или
     /// PSCI), а не просто напечатал, что собирается.
     Exits(u64),
+    /// Прочитать том btrfs на диске сценария **с хоста** — после
+    /// [`Step::Exits`], когда гость погас и дописывать ему нечего.
+    ///
+    /// Доказывает то, чего не докажет ни одна строка гостя: записанное дошло до
+    /// диска. Читает наш же крейт, поэтому это согласованность, а не формат, —
+    /// подробности в [`super::datavol`].
+    DataVolume(VolumeCheck),
+}
+
+/// Что обязано найтись на томе после сценария.
+pub struct VolumeCheck {
+    /// Пути внутри тома и содержимое файлов целиком.
+    pub files: &'static [(&'static str, Content)],
+    /// Чего на томе быть не должно.
+    pub gone: &'static [&'static str],
+}
+
+/// Содержимое файла: текстом или повторённым байтом — три тысячи одинаковых
+/// букв строкой в сценарии не прочёл бы никто.
+pub enum Content {
+    Text(&'static str),
+    Repeat(u8, usize),
 }
 
 /// С каким ключом стенд стучится к гостю.
@@ -5198,7 +5220,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("128 MiB,", 10_000),
             Step::Await("label 'FREEOS-FIXTURE'", 10_000),
             Step::Await("4096 B sectors, 16384 B nodes", 10_000),
-            Step::Await("data        : mounted read-only", 10_000),
+            Step::Await("data        : mounted read-write", 10_000),
             Step::Await("/data comes from the data partition", 10_000),
             Step::Await("freeos> ", 60_000),
 
@@ -5247,26 +5269,136 @@ pub const ALL: &[Scenario] = &[
             Step::Line("stat /data/dir/big.bin"),
             Step::Await("file, 4194304 bytes", 30_000),
 
-            // Проверка тома: один обход дерева со сверкой контрольной суммы
-            // КАЖДОГО сектора данных. Число секторов в строке — не украшение:
-            // проверка, которая ничего не прочитала, отчиталась бы теми же
-            // словами, и только это число отличает её от настоящей.
-            //
-            // Срок щедрый намеренно: это единственный шаг сценария, чья работа
-            // пропорциональна размеру тома.
-            Step::Line("fsck"),
-            Step::Await("/data: 2010 inode(s) and 1027 block(s) in use", 180_000),
-            Step::Await("/data: the volume is consistent", 30_000),
-
-            // Том открыт только на чтение, и отказ обязан прийти от файловой
-            // системы, а не от прав: файл лежит под root, а сеанс живой системы
-            // тоже идёт от root.
-            Step::Line("echo nope > /data/hello.txt"),
-            Step::Await("/data/hello.txt:", 30_000),
+            // Проверки тома здесь нет: с фазы 50d она идёт в `btrfs-write`,
+            // после записи, и обходит тот же образец вместе с записанным.
+            // Обход — единственный шаг, чья работа пропорциональна тому (две
+            // минуты на aarch64), и платить за него дважды незачем.
             Step::Absent("KERNEL PANIC"),
 
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
+        ],
+    },
+    Scenario {
+        name: "btrfs-write",
+        about: "Ядро пишет в том btrfs, созданный mkfs.btrfs, а после выключения том сверяется с хоста.",
+        target: Target::LiveAndBtrfs,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("root        : no FreeOS root partition", BOOT),
+            // Писатель открыл чужой том: отказ писателя назывался бы здесь же,
+            // с причиной, и том остался бы на чтение.
+            Step::Await("data        : btrfs at LBA", 60_000),
+            Step::Await("data        : mounted read-write", 10_000),
+            Step::Await("freeos> ", 60_000),
+
+            // Новый каталог и встроенный файл: данные лежат в листе дерева.
+            Step::Line("mkdir /data/notes"),
+            Step::Await("created /data/notes", 30_000),
+            Step::Line("echo written by the freeos kernel > /data/notes/first.txt"),
+            Step::Await("wrote 29 bytes to /data/notes/first.txt", 30_000),
+            Step::Line("cat /data/notes/first.txt"),
+            Step::Await("written by the freeos kernel", 30_000),
+
+            // Файл, который положил Linux: усечение и запись поверх — две
+            // транзакции подряд над чужим элементом.
+            Step::Line("echo replaced by freeos > /data/hello.txt"),
+            Step::Await("wrote 19 bytes to /data/hello.txt", 30_000),
+            Step::Line("cat /data/hello.txt"),
+            Step::Await("replaced by freeos", 30_000),
+
+            // Удаление в каталоге на две тысячи имён: дерево там в несколько
+            // уровней, и перестраивается оно целиком. Соседнее имя обязано
+            // остаться — иначе «удалилось» могло значить «удалилось всё».
+            Step::Line("rm /data/many/f0000"),
+            Step::Await("removed /data/many/f0000", 30_000),
+            Step::Line("cat /data/many/f0000"),
+            Step::Await("no such file or directory", 30_000),
+            Step::Line("cat /data/many/f1999"),
+            Step::Await("file 1999", 30_000),
+
+            // Каталог: непустой не удаляется, опустевший — да.
+            Step::Line("rm /data/dir/sub"),
+            Step::Await("the directory is not empty", 30_000),
+            Step::Line("rm /data/dir/sub/small.txt"),
+            Step::Await("removed /data/dir/sub/small.txt", 30_000),
+            Step::Line("rm /data/dir/sub"),
+            Step::Await("removed /data/dir/sub", 30_000),
+
+            // Копия из третьего кольца. `mc` пишет кусками по 512 байт, и файл
+            // в 3000 байт проходит весь путь: четыре записи встроенным, на пятой
+            // он перестаёт помещаться в лист и переезжает в экстент, шестая —
+            // запись поверх сектора с его сверкой. Семь транзакций на копию.
+            //
+            // Порядок строк панели — порядок создания имён (`DIR_INDEX`): «..»,
+            // `hello.txt`, `dir`, `holes.bin`, `mixed.bin`. Четыре вниз.
+            Step::Line("mc /data /data/notes"),
+            Step::Await("mc: started", 30_000),
+            Step::Raw(b"\x1b[B"),
+            Step::Wait(500),
+            Step::Raw(b"\x1b[B"),
+            Step::Wait(500),
+            Step::Raw(b"\x1b[B"),
+            Step::Wait(500),
+            Step::Raw(b"\x1b[B"),
+            Step::Wait(500),
+            Step::Raw(b"\x1b[15~"),
+            Step::Await("mc: copied /data/mixed.bin -> /data/notes/mixed.bin", 60_000),
+            // Переименование файла Linux: запись каталога, а не данные.
+            Step::Raw(b"\x1b[17~"),
+            Step::Wait(500),
+            Step::Raw(b"mixed-renamed.bin\n"),
+            Step::Await("mc: renamed /data/mixed.bin -> /data/mixed-renamed.bin", 30_000),
+            Step::Raw(b"\x1b[21~"),
+            Step::Await("mc: done", 15_000),
+            Step::Await("tty         : foreground released", 15_000),
+            Step::Await("freeos> ", 15_000),
+
+            // Копия читается программой, то есть сектор за сектором со сверкой
+            // суммы, которую посчитал наш писатель.
+            Step::Line("run /bin/wc /data/notes/mixed.bin"),
+            Step::Await("3000 bytes in /data/notes/mixed.bin", 60_000),
+            Step::Line("stat /data/mixed-renamed.bin"),
+            Step::Await("file, 3000 bytes", 30_000),
+
+            // Обход тома со сверкой каждого сектора — и чужого, и нашего. Числа
+            // посчитаны: из 2010 inode образца ушли три (`f0000`, `small.txt`,
+            // `sub`) и пришли три (`notes`, `first.txt`, копия); секторов стало
+            // на один больше — копия, единственный новый файл вне листа.
+            Step::Line("fsck"),
+            Step::Await("/data: 2010 inode(s) and 1028 block(s) in use", 240_000),
+            Step::Await("/data: the volume is consistent", 30_000),
+
+            // Выключение, и только потом — взгляд с хоста.
+            Step::Line("shutdown"),
+            Step::Await("volume      : /data flushed and marked clean", 30_000),
+            Step::Exits(30_000),
+            Step::Absent("KERNEL PANIC"),
+            // Тот же список сверяет Linux: `SCENARIO_ROUND` в `xtask/src/btrfsfix.rs`.
+            Step::DataVolume(VolumeCheck {
+                files: &[
+                    ("/notes/first.txt", Content::Text("written by the freeos kernel\n")),
+                    ("/hello.txt", Content::Text("replaced by freeos\n")),
+                    ("/notes/mixed.bin", Content::Repeat(b'M', 3000)),
+                    ("/mixed-renamed.bin", Content::Repeat(b'M', 3000)),
+                    ("/many/f1999", Content::Text("file 1999\n")),
+                ],
+                gone: &["/mixed.bin", "/many/f0000", "/dir/sub"],
+            }),
         ],
     },
 ];

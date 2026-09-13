@@ -30,6 +30,7 @@
 //!    машина, которую видит человек.
 
 mod aim;
+mod datavol;
 mod keys;
 mod monitor;
 mod qmp;
@@ -40,7 +41,7 @@ mod sshkeys;
 mod tlskeys;
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -628,6 +629,10 @@ fn execute(
     // (эхо-сервер) появится ниже, когда его выдаст ядро ОС.
     let mut ports = HostPorts::for_config(arch, built.release);
     let drives = prepare_drives(scenario, built, arch, ports)?;
+    // Диск с томом btrfs, если он у сценария есть: шаг `DataVolume` читает его
+    // с хоста, когда гость уже погас.
+    let data_disk = matches!(scenario.target, Target::LiveAndBtrfs)
+        .then(|| paths::btrfs_disk(arch, built.release));
 
     // Слушаем мы, подключается QEMU: порт 0 отдаёт свободный номер, и гонки за
     // фиксированный порт с другим процессом на машине не существует.
@@ -772,6 +777,7 @@ fn execute(
         hostfwd.map(|(host, _)| host),
         ports,
         workers,
+        data_disk.as_deref(),
     );
 
     // Обычно гость машину не выключает: `arch::halt()` — это остановка
@@ -803,6 +809,8 @@ fn play(
     ports: HostPorts,
     // Сколько прогонов идёт одновременно: от этого зависят сроки ожидания.
     workers: u16,
+    // Диск с томом btrfs — для проверки с хоста после выключения.
+    data_disk: Option<&Path>,
 ) -> Result<()> {
     let started = Instant::now();
     // Где сейчас указатель. Мышь относительная, абсолютных координат у неё нет,
@@ -1088,6 +1096,18 @@ fn play(
                 // байты ещё в сокете, а следующие шаги (`Absent`, `Expect`)
                 // читают именно то, что стенд успел принять.
                 std::thread::sleep(Duration::from_millis(300));
+            }
+            Step::DataVolume(expect) => {
+                let Some(path) = data_disk else {
+                    bail!("шаг {index}: у сценария нет диска с томом btrfs");
+                };
+                // Процесс QEMU к этому шагу обязан быть мёртв: образ, который
+                // читают, пока эмулятор в него пишет, описывает не том, а гонку.
+                if child.try_wait().with_context(|| format!("шаг {index}"))?.is_none() {
+                    bail!("шаг {index}: QEMU ещё работает — том читается только после выключения");
+                }
+                say!("  [{at:>6} мс] шаг {index}: том btrfs {} с хоста", path.display());
+                datavol::check(path, expect).with_context(|| format!("шаг {index}"))?;
             }
             Step::TcpEcho(text, timeout_ms) => {
                 let Some(port) = hostfwd else {

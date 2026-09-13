@@ -523,15 +523,11 @@ pub fn prepare_btrfs_disk(arch: Arch, release: bool) -> Result<PathBuf> {
     )
     .with_context(|| format!("не разворачивается {}", packed.display()))?;
 
-    // Слепок по сжатому файлу: он меняется ровно тогда, когда меняется образец,
-    // и стоит ничего. Разворачивать 128 МиБ на каждом прогоне сценария незачем.
-    let stamp = path.with_extension("stamp");
-    let want = format!("{} {}\n", squeezed.len(), fnv1a64(&squeezed));
-    if util::file_len(&path).is_some() && fs::read_to_string(&stamp).ok().as_deref() == Some(&want) {
-        say!("диск btrfs: {} (как есть)", path.display());
-        return Ok(path);
-    }
-
+    // Том разворачивается заново на **каждом** прогоне. До фазы 50d здесь был
+    // слепок, и файл с прошлого прогона брался как есть: ядро том только
+    // читало, и он оставался образцом. Теперь в него пишут, и взятый повторно
+    // образ нёс бы чужие правки — `btrfs-read` проверял бы не образец, а то,
+    // что оставил после себя `btrfs-write`. Цена — запись 128 МиБ, доля секунды.
     let front = GPT_MARGIN_BYTES;
     let disk_bytes = front + volume.len() as u64 + GPT_MARGIN_BYTES;
     let sectors = disk_bytes / SECTOR_SIZE as u64;
@@ -567,7 +563,6 @@ pub fn prepare_btrfs_disk(arch: Arch, release: bool) -> Result<PathBuf> {
 
     fs::write(&path, dev.into_vec())
         .with_context(|| format!("не удалось записать {}", path.display()))?;
-    fs::write(&stamp, &want)?;
     say!(
         "диск btrfs: {} ({} МиБ, раздел данных с LBA {first_lba})",
         path.display(),

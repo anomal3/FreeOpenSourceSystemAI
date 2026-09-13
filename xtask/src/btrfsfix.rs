@@ -229,6 +229,24 @@ must [ -e mnt/many/f000 ]
 echo "--- Linux прочитал нашу правку поверх своей"
 "#;
 
+/// Том после сценария `btrfs-write`: Linux сверяет то, что записало ядро FreeOS.
+///
+/// Список обязан совпадать с шагом `DataVolume` сценария (`harness/scenarios.rs`):
+/// там то же сверяет наш читатель, здесь — чужой.
+const SCENARIO_ROUND: &str = r#"
+must [ "$(cat mnt/notes/first.txt)" = "written by the freeos kernel" ]
+must [ "$(cat mnt/hello.txt)" = "replaced by freeos" ]
+same mnt/notes/mixed.bin @MIXED@
+same mnt/mixed-renamed.bin @MIXED@
+must [ ! -e mnt/mixed.bin ]
+must [ ! -e mnt/many/f0000 ]
+must [ ! -e mnt/dir/sub ]
+must [ "$(cat mnt/many/f1999)" = "file 1999" ]
+must [ "$(ls mnt/many | wc -l)" = "1999" ]
+same mnt/dir/big.bin @BIG@
+echo "--- Linux прочитал записанное ядром FreeOS, и нетронутое осталось целым"
+"#;
+
 /// Конец любого круга: проверить том после Linux и отдать его обратно.
 const CHECK_AFTER: &str = r#"
 echo "--- btrfs check: после того как Linux смонтировал и отпустил том"
@@ -426,6 +444,49 @@ pub fn linux_check() -> Result<()> {
     round(&distro, &dir, "ours-final.img", &disk, &script, "Linux не принял правку поверх своей")?;
 
     say!("btrfs: восемь раз btrfs check без нареканий — Linux и наш код читают и правят записанное друг другом");
+    Ok(())
+}
+
+/// Отдать Linux диск, в который писало ядро FreeOS (сценарий `btrfs-write`).
+///
+/// Раздел вырезается на хосте нашим `disk::gpt`: смещение раздела внутри
+/// образа — не то, о чём стоит договариваться с `losetup` в чужой системе.
+pub fn scenario_check(image: &Path) -> Result<()> {
+    let distro = find_distro()?;
+    let data = std::fs::read(image).with_context(|| format!("не читается {}", image.display()))?;
+    let mut dev = disk::MemDisk::from_vec(data).ok_or_else(|| anyhow!("длина образа не кратна сектору"))?;
+    let table = disk::gpt::read(&mut dev).map_err(|err| anyhow!("таблица разделов не читается: {err}"))?;
+    let part = table
+        .find(disk::gpt::FREEOS_DATA_TYPE)
+        .ok_or_else(|| anyhow!("на диске {} нет раздела данных", image.display()))?;
+    let first = part.first_lba as usize * disk::DEFAULT_SECTOR_SIZE;
+    let last = (part.last_lba as usize + 1) * disk::DEFAULT_SECTOR_SIZE;
+    let bytes = dev.as_bytes();
+    if last > bytes.len() {
+        bail!("раздел данных выходит за пределы образа");
+    }
+
+    let dir = paths::build_dir().join("btrfs-linux-check");
+    std::fs::create_dir_all(&dir)?;
+    let volume = dir.join("scenario.img");
+    std::fs::write(&volume, &bytes[first..last]).with_context(|| format!("не пишется {}", volume.display()))?;
+    say!("btrfs: том после сценария {} проверяет «{distro}»", image.display());
+
+    // Оба эталона — из рецепта образца (`RECIPE`): `mixed.bin` гость скопировал
+    // и переименовал, а `big.bin` не трогал, и он обязан остаться целым.
+    let mixed = vec![b'M'; 3000];
+    let big = b"0123456789abcdef".repeat(4096 * 64);
+    let script = format!(
+        "{CHECK_PRELUDE}{SCENARIO_ROUND}{CHECK_COMPLAINTS}\n\
+         echo \"--- btrfs check: после того как Linux смонтировал и отпустил том\"\n\
+         btrfs check v.img\n"
+    )
+    .replace("@STAGE@", "том, в который писало ядро FreeOS")
+    .replace("@MIXED@", &hex(&hash(&mixed)))
+    .replace("@BIG@", &hex(&hash(&big)));
+    let (_, log) = run_in(&distro, &script, Some(&volume)).context("Linux не принял том после сценария")?;
+    show(&log);
+    say!("btrfs: btrfs check дважды без нареканий, Linux прочитал записанное ядром FreeOS");
     Ok(())
 }
 

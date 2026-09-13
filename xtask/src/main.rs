@@ -108,7 +108,10 @@ enum Command {
     /// Четыре круга: наш `mkfs` и писатель, запись Linux, наши правки поверх,
     /// наша правка рядом с разрезом, который сделал Linux. В каждом `btrfs
     /// check` смотрит на том до монтирования и после. Нужен WSL с `btrfs-progs`.
-    BtrfsLinuxCheck,
+    ///
+    /// С `--image` — вместо кругов диск, оставленный сценарием `btrfs-write`:
+    /// то, что записало ядро FreeOS, сверяет Linux.
+    BtrfsLinuxCheck(BtrfsLinuxCheckArgs),
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -233,6 +236,14 @@ struct ThirdpartyArgs {
     /// Принести исходники заново, даже если они уже лежат.
     #[arg(long)]
     refresh: bool,
+}
+
+#[derive(Args, Debug)]
+struct BtrfsLinuxCheckArgs {
+    /// Диск сценария `btrfs-write` (путь печатает шаг стенда). Без него идут
+    /// четыре круга своего `mkfs` и писателя.
+    #[arg(long)]
+    image: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -686,9 +697,10 @@ fn real_main() -> Result<()> {
             btrfsfix::build()?;
         }
 
-        Command::BtrfsLinuxCheck => {
-            btrfsfix::linux_check()?;
-        }
+        Command::BtrfsLinuxCheck(args) => match args.image {
+            Some(image) => btrfsfix::scenario_check(&image)?,
+            None => btrfsfix::linux_check()?,
+        },
 
         Command::Check(args) => {
             let arches: Vec<Arch> = match args.arch {
