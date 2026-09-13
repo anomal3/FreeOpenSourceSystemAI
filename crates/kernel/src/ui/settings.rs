@@ -63,10 +63,17 @@ pub enum Section {
     Updates,
     /// Что это за машина: версия, процессор, память, время работы.
     System,
+    /// Тема, акцент, обои, высота заголовка — «Персонализация» Windows.
+    Look,
+    /// Обзор всех разделов плитками — «Панель управления» из эскиза.
+    ///
+    /// Последним в списке, а не первым: на порядок первых восьми стоят шаги
+    /// стенда, которые считают строки клавишей «вниз».
+    Overview,
 }
 
 impl Section {
-    const ALL: [Section; 8] = [
+    const ALL: [Section; 10] = [
         Section::Display,
         Section::Clock,
         Section::Network,
@@ -75,6 +82,8 @@ impl Section {
         Section::Programs,
         Section::Updates,
         Section::System,
+        Section::Look,
+        Section::Overview,
     ];
 
     const fn title(self) -> &'static str {
@@ -87,6 +96,24 @@ impl Section {
             Section::Programs => "Пакеты",
             Section::Updates => "Обновление",
             Section::System => "О системе",
+            Section::Look => "Оформление",
+            Section::Overview => "Панель управления",
+        }
+    }
+
+    /// Одной строкой — для плитки обзора.
+    const fn blurb(self) -> &'static str {
+        match self {
+            Section::Display => "Разрешение и масштаб рабочего стола",
+            Section::Clock => "Часовой пояс и который сейчас час",
+            Section::Network => "Адрес: по DHCP или заданный руками",
+            Section::Disks => "Точки монтирования и проверка томов",
+            Section::Users => "Учётные записи и этот сеанс",
+            Section::Programs => "Пакеты .fpk: установка и удаление",
+            Section::Updates => "Откуда брать обновления",
+            Section::System => "Версия, архитектура, память, время работы",
+            Section::Look => "Тема, акцент, обои, заголовки окон",
+            Section::Overview => "",
         }
     }
 
@@ -105,6 +132,8 @@ impl Section {
             Section::Programs => Icon::Package,
             Section::Updates => Icon::Update,
             Section::System => Icon::Info,
+            Section::Look => Icon::Sun,
+            Section::Overview => Icon::Settings,
         }
     }
 
@@ -115,11 +144,12 @@ impl Section {
     /// существует. Раздел при этом не прячется: спрятанный раздел выглядит как
     /// «в этой системе нет настроек сети», а серый — как «в этой машине нет
     /// сетевой карты», и это разные утверждения.
-    fn available(self) -> bool {
-        match self {
-            Section::Network => crate::net::is_present(),
-            _ => true,
-        }
+    ///
+    /// С фазы С6 «Сеть» без карты тоже открывается: серая строка без
+    /// объяснения выглядела отсутствующим разделом, а открытый раздел говорит
+    /// словами, чего не хватает, и что это функция запланирована.
+    const fn available(self) -> bool {
+        true
     }
 }
 
@@ -149,6 +179,12 @@ enum Deed {
     Mode(u32, u32),
     /// Перейти на тёмную (`true`) или светлую тему.
     Theme(bool),
+    /// Акцентный цвет, обои и высота заголовка — персонализация (фаза С6).
+    Accent(theme::Accent),
+    Wallpaper(theme::Wallpaper),
+    TitleBar(u32),
+    /// Плитка обзора: открыть раздел.
+    Open(Section),
     /// Выбрать часовой пояс — смещение от UTC в минутах.
     Timezone(i32),
     /// Вернуть адрес во власть DHCP.
@@ -305,8 +341,10 @@ pub struct SettingsView {
     programs: Programs,
     /// Что набрано в разделе «Сеть».
     net: NetDraft,
-    /// Тема сменилась, и перекрасить пора весь стол.
+    /// Вид сменился — тема, акцент или обои, — и перекрасить пора весь стол.
     theme_changed: bool,
+    /// Сменилась высота заголовка: стол пересобирает окна.
+    title_changed: bool,
 }
 
 impl SettingsView {
@@ -321,6 +359,7 @@ impl SettingsView {
             programs: Programs::List,
             net: NetDraft::current(),
             theme_changed: false,
+            title_changed: false,
         }
     }
 
@@ -340,6 +379,11 @@ impl SettingsView {
     /// поверхностями, обязан перекрасить стол ровно однажды на смену.
     pub fn take_theme_change(&mut self) -> bool {
         core::mem::take(&mut self.theme_changed)
+    }
+
+    /// Сменилась ли высота заголовка с прошлого вопроса.
+    pub fn take_title_change(&mut self) -> bool {
+        core::mem::take(&mut self.title_changed)
     }
 
     fn index_of(section: Section) -> usize {
@@ -369,9 +413,14 @@ impl SettingsView {
     /// Одна строка пояснения под заголовком.
     fn about(&self) -> String {
         match (self.current(), &self.programs) {
-            (Section::Display, _) => "Разрешение, тема и масштаб рабочего стола.".to_string(),
+            (Section::Display, _) => "Разрешение и масштаб рабочего стола.".to_string(),
+            (Section::Look, _) => "Тема, акцент, обои и окна — применяется сразу.".to_string(),
             (Section::Clock, _) => "Который сейчас час и от чего его отсчитывать.".to_string(),
+            (Section::Network, _) if !crate::net::is_present() => {
+                "Сетевой карты в этой машине нет.".to_string()
+            }
             (Section::Network, _) => "Адрес этой машины: спрашивать или задать.".to_string(),
+            (Section::Overview, _) => "Все разделы на одном экране.".to_string(),
             (Section::Disks, _) => "Что смонтировано и в каком это состоянии.".to_string(),
             (Section::Users, _) => "Кто может входить в эту систему.".to_string(),
             (Section::Programs, Programs::List) => {
@@ -402,8 +451,26 @@ impl SettingsView {
                 for (width, height) in MODES {
                     out.push(Deed::Mode(width, height));
                 }
+            }
+            Section::Look => {
                 out.push(Deed::Theme(true));
                 out.push(Deed::Theme(false));
+                for accent in theme::Accent::ALL {
+                    out.push(Deed::Accent(accent));
+                }
+                for wall in theme::Wallpaper::ALL {
+                    out.push(Deed::Wallpaper(wall));
+                }
+                for height in theme::TITLE_HEIGHTS {
+                    out.push(Deed::TitleBar(height));
+                }
+            }
+            Section::Overview => {
+                for section in Section::ALL {
+                    if section != Section::Overview {
+                        out.push(Deed::Open(section));
+                    }
+                }
             }
             Section::Programs => match &self.programs {
                 Programs::List => {
@@ -428,13 +495,16 @@ impl SettingsView {
                     out.push(Deed::Timezone(minutes));
                 }
             }
-            Section::Network => {
+            // Без карты пунктов нет: адрес задавать нечему, и Enter на разделе
+            // ничего не делает — раздел при этом открыт и объясняет, почему.
+            Section::Network if crate::net::is_present() => {
                 out.push(Deed::NetDhcp);
                 out.push(Deed::NetStatic);
                 out.push(Deed::NetEdit(Field::Address));
                 out.push(Deed::NetEdit(Field::Gateway));
                 out.push(Deed::NetApply);
             }
+            Section::Network => {}
             Section::Disks => out.push(Deed::CheckDisks),
             // Список учётных записей — чтение, и действий у него нет. Заводить
             // их здесь значило бы обещать создание пользователя, которого в
@@ -732,6 +802,48 @@ impl SettingsView {
                     Err(err) => Report::bad(format!("тема применена, но не запомнена: {err}")),
                 });
             }
+            // Акцент, обои и заголовок — как тема: применяются сразу и
+            // записываются всегда.
+            Deed::Accent(accent) => {
+                if theme::set_accent(accent) {
+                    self.theme_changed = true;
+                }
+                self.report = Some(match super::prefs::store_accent(accent) {
+                    Ok(()) => {
+                        kprintln!("  settings    : accent {} saved", accent.tag());
+                        Report::ok(format!("акцент «{}» запомнен", accent.title()))
+                    }
+                    Err(err) => Report::bad(format!("акцент применён, но не запомнен: {err}")),
+                });
+            }
+            Deed::Wallpaper(wall) => {
+                if theme::set_wallpaper(wall) {
+                    self.theme_changed = true;
+                }
+                self.report = Some(match super::prefs::store_wallpaper(wall) {
+                    Ok(()) => {
+                        kprintln!("  settings    : wallpaper {} saved", wall.tag());
+                        Report::ok(format!("обои «{}» запомнены", wall.title()))
+                    }
+                    Err(err) => Report::bad(format!("обои применены, но не запомнены: {err}")),
+                });
+            }
+            Deed::TitleBar(height) => {
+                if theme::set_title_h(height) {
+                    self.title_changed = true;
+                }
+                self.report = Some(match super::prefs::store_title_bar(height) {
+                    Ok(()) => {
+                        kprintln!("  settings    : title bar {height} saved");
+                        Report::ok(format!("высота заголовка {height} запомнена"))
+                    }
+                    Err(err) => Report::bad(format!("высота применена, но не запомнена: {err}")),
+                });
+            }
+            Deed::Open(section) => {
+                kprintln!("  settings    : opened {} from the overview", section.title());
+                self.show(section);
+            }
             Deed::Timezone(minutes) => {
                 let text = crate::time::zone_text(minutes);
                 self.report = Some(match crate::time::set_timezone(minutes) {
@@ -970,7 +1082,7 @@ impl SettingsView {
         // Колонка предпросмотра появляется только там, где после неё остаётся
         // место на сами настройки: картинка, из-за которой список режимов сжался
         // до полоски, объясняет меньше, чем занимает.
-        let wide = self.current() == Section::Display && inner.w > ctx.px(700);
+        let wide = matches!(self.current(), Section::Display | Section::Look) && inner.w > ctx.px(700);
         let preview = wide.then(|| {
             Rect::new(
                 inner.right() - ctx.px(340) as i32,
@@ -1015,6 +1127,8 @@ impl SettingsView {
             Section::Programs => self.draw_programs(pass, main, y),
             Section::Updates => self.draw_updates(pass, main, y),
             Section::System => self.draw_system(pass, main, y),
+            Section::Look => self.draw_look(pass, main, y),
+            Section::Overview => self.draw_overview(pass, main, y),
         }
         if let Some(column) = preview {
             draw_preview(pass, column);
@@ -1082,6 +1196,120 @@ impl SettingsView {
             }
         }
 
+        // ── Масштаб интерфейса ───────────────────────────────────────────────
+        //
+        // Не переключатель: множитель выводится из ширины экрана — тот же порог,
+        // что у размерного ряда шрифта, — и отдельного признака под ним нет.
+        // Вкладка «200 %», которая не включается, объясняла бы человеку не то,
+        // как устроен интерфейс, а то, что кнопка сломана.
+        let scale_label = if ctx.scale >= 2 { "200 %" } else { "100 %" };
+        let chip_w = paint::chip_width(ctx, scale_label);
+        let (slot, next) = setting(
+            pass,
+            main,
+            y,
+            "Масштаб интерфейса",
+            "Выбирается по ширине экрана; свой множитель — функция запланирована.",
+            (chip_w, ctx.px(26)),
+        );
+        if pass.visible(slot) {
+            pass.on(|s| paint::chip(ctx, s, slot, scale_label, Tone::Muted));
+        }
+        y = next;
+
+        pass.note(
+            main.x,
+            y + ctx.px(16) as i32,
+            main.w,
+            "Режим экрана применяется при следующем запуске; смена без перезагрузки — функция запланирована.",
+        );
+    }
+
+    /// Обзор: плитки всех разделов с одной строкой фактов на каждой.
+    fn draw_overview(&self, pass: &mut Pass, main: Rect, y: i32) {
+        let ctx = pass.ctx;
+        let p = ctx.palette;
+        let gap = ctx.px(12);
+        let cols = if main.w > ctx.px(620) { 2 } else { 1 };
+        let tile_w = main.w.saturating_sub(gap * (cols - 1)) / cols;
+        let tile_h = ctx.px(96);
+        let sections: Vec<Section> =
+            Section::ALL.into_iter().filter(|section| *section != Section::Overview).collect();
+        for (index, section) in sections.into_iter().enumerate() {
+            let col = index as u32 % cols;
+            let row = index as u32 / cols;
+            let rect = Rect::new(
+                main.x + (col * (tile_w + gap)) as i32,
+                y + (row * (tile_h + gap)) as i32,
+                tile_w,
+                tile_h,
+            );
+            let focused = pass.deed(rect, Deed::Open(section));
+            if !pass.visible(rect) {
+                continue;
+            }
+            let fact = self.fact_of(section);
+            pass.on(|s| {
+                paint::card(ctx, s, rect);
+                if focused {
+                    draw::rounded_stroke(s, rect, ctx.px(theme::R_CARD), p.acc, 255);
+                }
+                let tile = Rect::new(rect.x + ctx.px(14) as i32, rect.y + ctx.px(14) as i32, ctx.px(34), ctx.px(34));
+                paint::icon_tile(ctx, s, tile, section.icon(), Tone::Accent, false);
+                let text_x = tile.right() + ctx.px(12) as i32;
+                let room = (rect.right() - text_x - ctx.px(14) as i32).max(0) as u32;
+                let mut ty = rect.y + ctx.px(14) as i32;
+                paint::text_clipped(ctx, s, Role::Strong, text_x, ty, room, section.title(), p.ink);
+                ty += line_h(ctx, Role::Strong) + ctx.px(2) as i32;
+                paint::text_clipped(ctx, s, Role::Caption, text_x, ty, room, section.blurb(), p.ink4);
+                ty += line_h(ctx, Role::Caption) + ctx.px(6) as i32;
+                paint::text_clipped(ctx, s, Role::Mono, text_x, ty, room, &fact, p.acc_ink);
+            });
+        }
+    }
+
+    /// Одна строка фактов для плитки обзора.
+    fn fact_of(&self, section: Section) -> String {
+        match section {
+            Section::Display => format!("{} × {} · {}", self.screen.0, self.screen.1, if theme::is_dark() { "тёмная" } else { "светлая" }),
+            Section::Clock => match crate::time::clock_text() {
+                Some(clock) => format!("{clock} · UTC{}", crate::time::offset_text()),
+                None => format!("UTC{}", crate::time::offset_text()),
+            },
+            Section::Network => match crate::net::status() {
+                None => String::from("карты нет"),
+                Some(status) if status.address.is_unspecified() => String::from("адреса пока нет"),
+                Some(status) => format!("{}", status.address),
+            },
+            Section::Disks => {
+                let count = crate::fs::mounted().len();
+                format!("точек монтирования: {count}")
+            }
+            Section::Users => format!("учётных записей: {}", accounts().len()),
+            Section::Programs => match packages() {
+                Ok(list) => format!("установлено: {}", list.len()),
+                Err(_) => String::from("реестр не прочитан"),
+            },
+            Section::Updates => format!("серверов: {}", update_servers().len()),
+            Section::System => format!("FreeOS {} · {}", crate::VERSION, arch::ARCH_NAME),
+            Section::Look => format!(
+                "{} · {} · {}",
+                if theme::is_dark() { "тёмная" } else { "светлая" },
+                theme::accent().title(),
+                theme::wallpaper().title()
+            ),
+            Section::Overview => String::new(),
+        }
+    }
+
+    /// Раздел «Оформление»: тема, акцент, обои, высота заголовка (фаза С6).
+    ///
+    /// Отдельно от «Экрана», как в Windows «Персонализация» отдельно от
+    /// «Дисплея»: вместе они не помещаются в окно, и выбор высоты заголовка
+    /// уезжал под нижний край, где мышью его не достать.
+    fn draw_look(&self, pass: &mut Pass, main: Rect, y: i32) {
+        let ctx = pass.ctx;
+        let mut y = y;
         // ── Тема ─────────────────────────────────────────────────────────────
         let swatch_w = ctx.px(80);
         let swatch_h = ctx.px(6) * 3 + ctx.px(24) + line_h(ctx, Role::MonoCaps) as u32;
@@ -1108,33 +1336,77 @@ impl SettingsView {
         }
         y = next;
 
-        // ── Масштаб интерфейса ───────────────────────────────────────────────
-        //
-        // Не переключатель: множитель выводится из ширины экрана — тот же порог,
-        // что у размерного ряда шрифта, — и отдельного признака под ним нет.
-        // Вкладка «200 %», которая не включается, объясняла бы человеку не то,
-        // как устроен интерфейс, а то, что кнопка сломана.
-        let scale_label = if ctx.scale >= 2 { "200 %" } else { "100 %" };
-        let chip_w = paint::chip_width(ctx, scale_label);
+        // ── Акцентный цвет ───────────────────────────────────────────────────
+        let dot_w = ctx.px(40);
+        let dot_gap = ctx.px(8);
+        let accents = theme::Accent::ALL.len() as u32;
         let (slot, next) = setting(
             pass,
             main,
             y,
-            "Масштаб интерфейса",
-            "Целые кратности: шрифт остаётся резким.",
-            (chip_w, ctx.px(26)),
+            "Акцентный цвет",
+            "Фокус, выделение и главное действие.",
+            (dot_w * accents + dot_gap * (accents - 1), dot_w),
         );
-        if pass.visible(slot) {
-            pass.on(|s| paint::chip(ctx, s, slot, scale_label, Tone::Muted));
+        for (index, accent) in theme::Accent::ALL.into_iter().enumerate() {
+            let rect = Rect::new(slot.x + (index as u32 * (dot_w + dot_gap)) as i32, slot.y, dot_w, dot_w);
+            let focused = pass.deed(rect, Deed::Accent(accent));
+            if pass.visible(rect) {
+                color_swatch(pass, rect, theme::accent_color(accent), None, theme::accent() == accent, focused);
+            }
         }
         y = next;
 
-        pass.note(
-            main.x,
-            y + ctx.px(16) as i32,
-            main.w,
-            "Режим экрана применяется при следующем запуске.",
+        // ── Обои ─────────────────────────────────────────────────────────────
+        let wall_w = ctx.px(64);
+        let wall_h = ctx.px(40);
+        let walls = theme::Wallpaper::ALL.len() as u32;
+        let (slot, next) = setting(
+            pass,
+            main,
+            y,
+            "Обои",
+            "Градиент и разметка точками; рисуются, а не хранятся.",
+            (wall_w * walls + dot_gap * (walls - 1), wall_h),
         );
+        for (index, wall) in theme::Wallpaper::ALL.into_iter().enumerate() {
+            let rect = Rect::new(slot.x + (index as u32 * (wall_w + dot_gap)) as i32, slot.y, wall_w, wall_h);
+            let focused = pass.deed(rect, Deed::Wallpaper(wall));
+            if pass.visible(rect) {
+                let (top, bottom) = theme::wallpaper_colors(wall);
+                color_swatch(pass, rect, top, Some(bottom), theme::wallpaper() == wall, focused);
+            }
+        }
+        y = next;
+
+        // ── Высота заголовка окна ────────────────────────────────────────────
+        let row_h = ctx.px(30);
+        let gap = ctx.px(2);
+        let heights = theme::TITLE_HEIGHTS.len() as u32;
+        let (list, next) = setting(
+            pass,
+            main,
+            y,
+            "Заголовок окна",
+            "Применяется ко всем окнам сразу.",
+            (ctx.px(230).min(main.w), row_h * heights + gap * (heights - 1)),
+        );
+        for (index, height) in theme::TITLE_HEIGHTS.into_iter().enumerate() {
+            let rect = Rect::new(list.x, list.y + (index as u32 * (row_h + gap)) as i32, list.w, row_h);
+            let focused = pass.deed(rect, Deed::TitleBar(height));
+            if !pass.visible(rect) {
+                continue;
+            }
+            let label = match index {
+                0 => format!("Компактный · {height}"),
+                1 => format!("Обычный · {height}"),
+                _ => format!("Крупный · {height}"),
+            };
+            choice_row(pass, rect, &label, theme::title_h() == height, focused);
+        }
+        y = next;
+
+        let _ = y;
     }
 
     /// Раздел «Дата и время».
@@ -1212,7 +1484,24 @@ impl SettingsView {
     fn draw_network(&self, pass: &mut Pass, main: Rect, y: i32) {
         let ctx = pass.ctx;
         let Some(status) = crate::net::status() else {
-            pass.note(main.x, y, main.w, "В этой машине нет сетевой карты.");
+            // Раздел открыт, но настраивать нечего — и об этом сказано словами,
+            // а не серой строкой в списке. Правило вехи v0.7b.
+            let y = fact_card(
+                pass,
+                main,
+                y,
+                "СЕТЕВАЯ КАРТА",
+                &[
+                    (String::from("Найдено"), String::from("ничего")),
+                    (String::from("Драйверы"), String::from("virtio-net, e1000")),
+                ],
+            );
+            pass.note(
+                main.x,
+                y + ctx.px(8) as i32,
+                main.w,
+                "Сетевой карты в этой машине нет: адрес задавать нечему. Раздел появится вместе с драйвером для вашей карты — функция запланирована.",
+            );
             return;
         };
 
@@ -1389,7 +1678,7 @@ impl SettingsView {
             main.x,
             y + pass.ctx.px(8) as i32,
             main.w,
-            "Учётные записи заводит установщик: хешировать пароль умеет только он.",
+            "Учётные записи заводит установщик: хешировать пароль умеет только он. Добавить пользователя или сменить пароль отсюда — функция запланирована.",
         );
     }
 
@@ -2088,6 +2377,29 @@ fn swatch(pass: &mut Pass, rect: Rect, dark: bool, current: bool, focused: bool)
 /// Картинка, а не список цветов: назвать тему можно и словом, но выбирают её
 /// глазами, и единственный честный ответ на вопрос «что получится» — показать,
 /// что получится.
+/// Образец цвета: квадрат с заливкой (или градиентом сверху вниз), кольцо у
+/// выбранного и рамка у того, на чём фокус.
+fn color_swatch(pass: &mut Pass, rect: Rect, top: Color, bottom: Option<Color>, current: bool, focused: bool) {
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    let radius = ctx.px(theme::R_ROW);
+    pass.on(|s| {
+        match bottom {
+            Some(bottom) => draw::rounded_gradient(s, rect, radius, top, bottom, 255),
+            None => draw::rounded(s, rect, radius, top, 255),
+        }
+        draw::rounded_stroke(s, rect, radius, p.line3.color, p.line3.alpha);
+        if current {
+            let ring = Rect::new(rect.x - 2, rect.y - 2, rect.w + 4, rect.h + 4);
+            draw::rounded_stroke(s, ring, radius + 2, p.ink, 255);
+        }
+        if focused {
+            let ring = Rect::new(rect.x - 4, rect.y - 4, rect.w + 8, rect.h + 8);
+            draw::rounded_stroke(s, ring, radius + 4, p.acc, 255);
+        }
+    });
+}
+
 fn draw_preview(pass: &mut Pass, area: Rect) {
     let ctx = pass.ctx;
     let p = ctx.palette;

@@ -961,6 +961,22 @@ impl Compositor {
         self.repaint_all();
     }
 
+    /// Пересобрать все окна под новую высоту заголовка и перекрасить стол.
+    ///
+    /// Окно, которому после этого не хватило рабочей области, поджимается к
+    /// её низу: заголовок вырос, и нижняя кромка иначе ушла бы под панель.
+    pub fn retitle_all(&mut self, status: &Status) {
+        let bottom = self.work_bottom();
+        for window in self.windows.iter_mut() {
+            window.retitle();
+            let overflow = window.rect.bottom() - bottom;
+            if overflow > 0 {
+                window.rect.y = (window.rect.y - overflow).max(0);
+            }
+        }
+        self.restyle(status);
+    }
+
     /// Перерисовать весь экран — то, что делает пункт «Refresh».
     pub fn repaint_all(&mut self) {
         let all = self.screen.bounds();

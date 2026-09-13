@@ -4421,15 +4421,19 @@ pub const ALL: &[Scenario] = &[
             // Возврат в список разделов, вверх до «Экрана», и там светлая тема.
             // Она проверяет другое, чем пояс: тема применяется мгновенно и
             // раньше нигде не сохранялась вовсе.
+            // С фазы С6 тема живёт в «Оформлении» — девятом разделе; светлая
+            // — второй пункт в нём.
             Step::Key("left"),
-            Step::Key("up"),
+            Step::Repeat("down", 7),
             Step::Key("ret"),
-            Step::Repeat("down", 6),
+            Step::Key("down"),
             Step::Key("ret"),
-            Step::Wait(1_500),
+            Step::Await("settings    : theme light saved", 15_000),
+            Step::Wait(3_000),
             Step::Shot("03-light"),
 
             // ── Постоянный адрес ─────────────────────────────────────────────
+            // Из «Оформления» (девятого) к «Сети» (третьему): шесть вверх.
             //
             // Тот же адрес, что дал DHCP, и это осознанно: пользовательская сеть
             // QEMU пробрасывает порт на свой постоянный адрес гостя, и машина,
@@ -4439,7 +4443,7 @@ pub const ALL: &[Scenario] = &[
             // доказывается тем, что после перезагрузки DHCP не запускается
             // вовсе.
             Step::Key("left"),
-            Step::Repeat("down", 2),
+            Step::Repeat("up", 6),
             Step::Key("ret"),
             Step::Wait(1_500),
             Step::Shot("04-network"),
@@ -4547,15 +4551,38 @@ pub const ALL: &[Scenario] = &[
 
             // «Экран» — раздел, на котором окно открывается; тёмная тема шестым
             // пунктом, сразу за пятью разрешениями.
+            Step::Repeat("down", 8),
             Step::Key("ret"),
-            Step::Repeat("down", 5),
             Step::Key("ret"),
             Step::Await("settings    : theme dark saved", 15_000),
+            // Персонализация (фаза С6): за двумя темами — пять акцентов, четыре
+            // обоев и три высоты заголовка. Второй акцент — фиолетовый, вторые
+            // обои — «Океан», третья высота — крупный заголовок; всё это
+            // применяется сразу и записывается в desktop.cfg.
+            Step::Repeat("down", 3),
+            Step::Key("ret"),
+            Step::Await("settings    : accent violet saved", 15_000),
+            Step::Await("desktop     : theme dark, accent violet, wallpaper night", 15_000),
+            Step::Repeat("down", 5),
+            Step::Key("ret"),
+            Step::Await("settings    : wallpaper ocean saved", 15_000),
+            Step::Repeat("down", 5),
+            Step::Key("ret"),
+            Step::Await("settings    : title bar 52 saved", 15_000),
+            Step::Await("desktop     : title bar 52 px", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("06-personalized"),
+            // Заголовок — обратно к обычному: на его высоту рассчитаны прицелы
+            // стенда в остальных сценариях цепочки; акцент и обои остаются —
+            // их переживание перезагрузки видно на снимках следующих сценариев.
+            Step::Key("up"),
+            Step::Key("ret"),
+            Step::Await("settings    : title bar 44 saved", 15_000),
 
             // «Дата и время»: седьмой пояс сверху — UTC+03:00, тот, что записал
             // установщик.
             Step::Key("left"),
-            Step::Key("down"),
+            Step::Repeat("up", 7),
             Step::Key("ret"),
             Step::Repeat("down", 6),
             Step::Key("ret"),
@@ -4568,6 +4595,16 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Key("ret"),
             Step::Await("settings    : address back to DHCP, /etc/network.cfg removed", 15_000),
+
+            // «Панель управления» — последний, девятый раздел: плитки всех
+            // остальных, и Enter на первой открывает «Экран и оформление».
+            Step::Key("left"),
+            Step::Repeat("down", 7),
+            Step::Wait(3_000),
+            Step::Shot("07-overview"),
+            Step::Key("ret"),
+            Step::Key("ret"),
+            Step::Await("settings    : opened Экран from the overview", 15_000),
 
             Step::Key("ctrl-w"),
             Step::Await("desktop     : closed 'Settings'", 15_000),

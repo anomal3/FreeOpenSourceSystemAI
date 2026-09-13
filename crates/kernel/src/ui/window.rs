@@ -385,9 +385,38 @@ impl Window {
     }
 
     /// Высота полосы заголовка при заданном масштабе.
+    ///
+    /// С фазы С6 — настройка, а не константа: [`theme::title_h`] выбирает
+    /// человек в «Параметрах».
     #[must_use]
-    pub const fn title_height(scale: u32) -> u32 {
-        theme::TITLE_H * scale
+    pub fn title_height(scale: u32) -> u32 {
+        theme::title_h() * scale
+    }
+
+    /// Пересобрать окно под новую высоту заголовка.
+    ///
+    /// Содержимое сохраняет размер, а окно — нет: у окна программы пиксели
+    /// лежат в кадрах, отображённых ей, и менять их размер нельзя (см.
+    /// [`Window::resize`]), поэтому растёт или уменьшается сам прямоугольник
+    /// окна — ровно на разницу высот заголовка. Окна ядра пересобираются как
+    /// при изменении размера: их содержимое рисует себя от области заново.
+    pub fn retitle(&mut self) -> bool {
+        let title = Self::title_height(self.scale);
+        if let Content::Program(view) = &self.content {
+            let h = view.pixels.height() + title;
+            let w = self.rect.w;
+            let Some(surface) = Surface::new(w, h, theme::window_bg()) else {
+                return false;
+            };
+            self.surface = surface;
+            self.rect.h = h;
+            self.commit(None);
+            self.draw_decorations(false);
+            self.damage = Rect::new(0, 0, w, h);
+            return true;
+        }
+        let (w, h) = (self.rect.w, self.rect.h);
+        self.rebuild(w, h)
     }
 
     /// Контекст отрисовки этого окна.
@@ -834,6 +863,14 @@ impl Window {
         }
     }
 
+    /// Сменилась ли высота заголовка — тогда стол пересобирает все окна.
+    pub fn took_title_change(&mut self) -> bool {
+        match &mut self.content {
+            Content::Settings(view) => view.take_title_change(),
+            Content::Text(_) | Content::Dialog(_) | Content::Program(_) => false,
+        }
+    }
+
     /// Забрать ответ диалога, если его дали.
     ///
     /// Ответ забирает стол, а не окно действует само: «Выключить» закрывает
@@ -870,6 +907,12 @@ impl Window {
         if w == self.rect.w && h == self.rect.h {
             return true;
         }
+        self.rebuild(w, h)
+    }
+
+    /// Собрать поверхность заново под такой размер — общая часть изменения
+    /// размера и смены высоты заголовка.
+    fn rebuild(&mut self, w: u32, h: u32) -> bool {
         let Some(mut surface) = Surface::new(w, h, theme::window_bg()) else {
             return false;
         };

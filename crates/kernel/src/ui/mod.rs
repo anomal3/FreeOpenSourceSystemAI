@@ -411,13 +411,19 @@ fn status_now() -> Status {
     }
 }
 
-/// Сеть для значка в трее. Берёт замок сети — потому зовётся из
-/// [`status_now`], вне замка стола.
+/// Сеть для значка в трее — по двум флагам без замка.
+///
+/// Первая версия спрашивала `net::status()` и брала замок сети на каждое
+/// событие ввода. С сетевой картой машина вставала намертво посреди набора
+/// адреса в «Параметрах»: замок сети держит и сетевая задача, и встреча двух
+/// задач на нём с выключенными прерываниями — это остановка всего.
 fn net_state() -> NetState {
-    match crate::net::status() {
-        None => NetState::Absent,
-        Some(status) if status.address.is_unspecified() => NetState::NoAddress,
-        Some(_) => NetState::Up,
+    if !crate::net::is_present() {
+        NetState::Absent
+    } else if crate::net::has_address() {
+        NetState::Up
+    } else {
+        NetState::NoAddress
     }
 }
 
@@ -1028,6 +1034,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 // Ответ диалога забирается здесь, а действует ниже: окно сейчас
                 // заимствовано у стола, и закрыть его изнутри `match` нечем.
                 let mut answer = None;
+                let mut title_changed = false;
                 let changed = match desktop.focused_mut() {
                     // Окно программы получает щелчок событием, а не
                     // перерисовкой: что нарисовать в ответ, решает она.
@@ -1053,7 +1060,10 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                     Some(window) => {
                         window.handle_click(x, y);
                         answer = window.take_answer();
-                        window.took_theme_change()
+                        let title = window.took_title_change();
+                        let look = window.took_theme_change();
+                        title_changed = title;
+                        look
                     }
                     None => false,
                 };
@@ -1061,17 +1071,11 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                     answer_dialog(desktop, app, answer);
                     log_focus(desktop);
                 }
-                // Смена темы — единственное, что окно меняет за своими
+                // Смена вида — единственное, что окно меняет за своими
                 // границами. Перекрашивать стол изнутри окна оно не может:
                 // остальные окна, панель и обои принадлежат композитору,
                 // и окно о них не знает.
-                if changed {
-                    kprintln!(
-                        "  desktop     : theme {}",
-                        if theme::is_dark() { "dark" } else { "light" }
-                    );
-                    desktop.restyle(status);
-                }
+                apply_look_change(desktop, changed, title_changed, status);
             }
         }
         desktop.refresh_panel(status);
@@ -1187,15 +1191,39 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
         }
         Some(_) => {
             if event.pressed {
-                let handled = desktop
-                    .focused_mut()
-                    .is_some_and(|window| window.handle_key(event.code));
-                if handled {
-                    desktop.present();
+                let outcome = desktop.focused_mut().map(|window| {
+                    let handled = window.handle_key(event.code);
+                    (handled, window.took_theme_change(), window.took_title_change())
+                });
+                if let Some((handled, look, title)) = outcome {
+                    // С клавиатуры вид меняется так же, как мышью: раньше
+                    // тема, выбранная стрелками и Enter, перекрашивала одно
+                    // окно, а стол оставался прежним до следующего щелчка.
+                    apply_look_change(desktop, look, title, status);
+                    if handled {
+                        desktop.present();
+                    }
                 }
             }
             None
         }
+    }
+}
+
+/// Перекрасить стол после того, как «Параметры» сменили тему, акцент, обои или
+/// высоту заголовка.
+fn apply_look_change(desktop: &mut Compositor, look: bool, title: bool, status: &Status) {
+    if title {
+        kprintln!("  desktop     : title bar {} px", theme::title_h());
+        desktop.retitle_all(status);
+    } else if look {
+        kprintln!(
+            "  desktop     : theme {}, accent {}, wallpaper {}",
+            if theme::is_dark() { "dark" } else { "light" },
+            theme::accent().tag(),
+            theme::wallpaper().tag()
+        );
+        desktop.restyle(status);
     }
 }
 

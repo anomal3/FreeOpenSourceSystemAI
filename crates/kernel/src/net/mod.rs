@@ -166,6 +166,23 @@ struct Interface {
 
 static INTERFACE: SpinLock<Option<Interface>> = SpinLock::new(None);
 
+/// Карта есть — без замка.
+///
+/// Флаг, а не вопрос к [`INTERFACE`]: [`is_present`] зовут из-под замка стола
+/// на каждую клавишу в «Параметрах» (фаза С6), а сетевая задача под замком
+/// интерфейса печатает в окно — то есть просит замок стола. Два замка в
+/// обратном порядке однажды встретились, и машина встала на тринадцатом
+/// Backspace. Атомик замка не берёт, и встречаться нечему.
+static PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Адрес назначен — тоже без замка, для значка сети в трее: тот спрашивает
+/// на каждое событие ввода, и замок сети под это не годится.
+static HAS_ADDRESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Есть ли у машины адрес — без замка.
+pub fn has_address() -> bool {
+    HAS_ADDRESS.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Найти сетевую карту и поднять её.
 ///
 /// # Safety
@@ -209,6 +226,7 @@ pub unsafe fn init(rsdp: u64) {
     let mac = device.mac();
     crate::kprintln!("  network     : virtio-net, hardware address {}", eth::Display(mac));
 
+    PRESENT.store(true, core::sync::atomic::Ordering::Release);
     *INTERFACE.lock() = Some(Interface {
         device,
         mac,
@@ -236,7 +254,7 @@ pub unsafe fn init(rsdp: u64) {
 
 /// Есть ли в системе сетевая карта.
 pub fn is_present() -> bool {
-    INTERFACE.lock().is_some()
+    PRESENT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Настройка интерфейса — то, что показывает команда `ip`.
@@ -285,6 +303,7 @@ pub fn configure(address: Ipv4, netmask: Ipv4, gateway: Ipv4) -> Result<(), NetE
     iface.address = address;
     iface.netmask = netmask;
     iface.gateway = gateway;
+    HAS_ADDRESS.store(!address.is_unspecified(), core::sync::atomic::Ordering::Release);
     Ok(())
 }
 

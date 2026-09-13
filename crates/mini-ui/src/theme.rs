@@ -41,7 +41,7 @@
 //! две, а стоит столько же, сколько первые две вместе: каждый оттенок надо
 //! подобрать заново и проверить на всех поверхностях.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use crate::Color;
 
@@ -281,10 +281,285 @@ pub const LIGHT: Palette = Palette {
 /// возникнуть раньше, чем появится третья.
 static DARK_THEME: AtomicBool = AtomicBool::new(true);
 
-/// Текущая палитра.
+// ── Персонализация (фаза С6) ─────────────────────────────────────────────────
+//
+// Акцент, обои и высота заголовка окна — настройки времени выполнения, как и
+// тема. Палитра при этом остаётся `&'static`: все сочетания темы, акцента и
+// обоев посчитаны на этапе компиляции в одну таблицу, и [`palette`] лишь
+// выбирает из неё. Считать палитру на лету значило бы держать её под замком —
+// а замок в крейте рисования брать некому и незачем.
+
+/// Акцентный цвет: фокус, выделение и главное действие.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Accent {
+    Blue,
+    Violet,
+    Green,
+    Orange,
+    Rose,
+}
+
+impl Accent {
+    pub const ALL: [Accent; 5] =
+        [Accent::Blue, Accent::Violet, Accent::Green, Accent::Orange, Accent::Rose];
+
+    /// Слово в `desktop.cfg`.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Accent::Blue => "blue",
+            Accent::Violet => "violet",
+            Accent::Green => "green",
+            Accent::Orange => "orange",
+            Accent::Rose => "rose",
+        }
+    }
+
+    #[must_use]
+    pub const fn title(self) -> &'static str {
+        match self {
+            Accent::Blue => "Синий",
+            Accent::Violet => "Фиолетовый",
+            Accent::Green => "Зелёный",
+            Accent::Orange => "Оранжевый",
+            Accent::Rose => "Розовый",
+        }
+    }
+
+    #[must_use]
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|accent| accent.tag() == tag)
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Accent::Violet,
+            2 => Accent::Green,
+            3 => Accent::Orange,
+            4 => Accent::Rose,
+            _ => Accent::Blue,
+        }
+    }
+}
+
+/// Обои: два цвета градиента и цвет точек разметки, свои для каждой темы.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Wallpaper {
+    Night,
+    Ocean,
+    Sunset,
+    Graphite,
+}
+
+impl Wallpaper {
+    pub const ALL: [Wallpaper; 4] =
+        [Wallpaper::Night, Wallpaper::Ocean, Wallpaper::Sunset, Wallpaper::Graphite];
+
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Wallpaper::Night => "night",
+            Wallpaper::Ocean => "ocean",
+            Wallpaper::Sunset => "sunset",
+            Wallpaper::Graphite => "graphite",
+        }
+    }
+
+    #[must_use]
+    pub const fn title(self) -> &'static str {
+        match self {
+            Wallpaper::Night => "Ночь",
+            Wallpaper::Ocean => "Океан",
+            Wallpaper::Sunset => "Закат",
+            Wallpaper::Graphite => "Графит",
+        }
+    }
+
+    #[must_use]
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|wall| wall.tag() == tag)
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn from_index(index: usize) -> Self {
+        match index {
+            1 => Wallpaper::Ocean,
+            2 => Wallpaper::Sunset,
+            3 => Wallpaper::Graphite,
+            _ => Wallpaper::Night,
+        }
+    }
+}
+
+/// Цвета акцента: для тёмной и для светлой темы отдельно — на тёмном фоне
+/// акцент светлее, на светлом темнее, и одна пара на обе темы не читалась бы.
+struct AccentColors {
+    /// Основной, тёмный край градиента, кромка выделения, цвет текста.
+    dark: (Color, Color, Color, Color),
+    light: (Color, Color, Color, Color),
+}
+
+const ACCENTS: [AccentColors; 5] = [
+    AccentColors {
+        dark: (Color::rgb(0x5A, 0xA2, 0xFF), Color::rgb(0x2F, 0x6E, 0xDE), Color::rgb(0x2F, 0x4B, 0x78), Color::rgb(0x5A, 0xA2, 0xFF)),
+        light: (Color::rgb(0x3B, 0x8E, 0xF0), Color::rgb(0x20, 0x65, 0xCF), Color::rgb(0xA9, 0xCB, 0xF7), Color::rgb(0x1A, 0x5C, 0xC4)),
+    },
+    AccentColors {
+        dark: (Color::rgb(0xA7, 0x8B, 0xFA), Color::rgb(0x7C, 0x3A, 0xED), Color::rgb(0x4C, 0x3A, 0x80), Color::rgb(0xB8, 0xA3, 0xFF)),
+        light: (Color::rgb(0x8B, 0x5C, 0xF6), Color::rgb(0x6D, 0x28, 0xD9), Color::rgb(0xD6, 0xC7, 0xFB), Color::rgb(0x5B, 0x21, 0xB6)),
+    },
+    AccentColors {
+        dark: (Color::rgb(0x34, 0xD3, 0x99), Color::rgb(0x05, 0x96, 0x69), Color::rgb(0x24, 0x5C, 0x48), Color::rgb(0x5E, 0xE0, 0xB0)),
+        light: (Color::rgb(0x10, 0xB9, 0x81), Color::rgb(0x04, 0x78, 0x57), Color::rgb(0xB4, 0xEB, 0xD4), Color::rgb(0x04, 0x78, 0x57)),
+    },
+    AccentColors {
+        dark: (Color::rgb(0xFB, 0x92, 0x3C), Color::rgb(0xEA, 0x58, 0x0C), Color::rgb(0x6B, 0x3A, 0x1E), Color::rgb(0xFF, 0xA9, 0x5E)),
+        light: (Color::rgb(0xF9, 0x73, 0x16), Color::rgb(0xC2, 0x41, 0x0C), Color::rgb(0xFB, 0xD5, 0xB5), Color::rgb(0xB4, 0x53, 0x09)),
+    },
+    AccentColors {
+        dark: (Color::rgb(0xFB, 0x71, 0x85), Color::rgb(0xE1, 0x1D, 0x48), Color::rgb(0x6B, 0x2D, 0x3A), Color::rgb(0xFF, 0x8F, 0xA0)),
+        light: (Color::rgb(0xF4, 0x3F, 0x5E), Color::rgb(0xBE, 0x12, 0x3C), Color::rgb(0xFB, 0xC4, 0xCF), Color::rgb(0xBE, 0x12, 0x3C)),
+    },
+];
+
+/// Цвета обоев: верх, низ, точки — для тёмной и светлой темы.
+struct WallColors {
+    dark: (Color, Color, Ink),
+    light: (Color, Color, Ink),
+}
+
+const WALLS: [WallColors; 4] = [
+    WallColors {
+        dark: (Color::rgb(0x16, 0x25, 0x3F), Color::rgb(0x0A, 0x12, 0x20), Ink::rgba(0x2A, 0x3A, 0x52, 153)),
+        light: (Color::rgb(0xDC, 0xE7, 0xF7), Color::rgb(0xEA, 0xEE, 0xF6), Ink::rgba(0xA9, 0xB6, 0xC9, 153)),
+    },
+    WallColors {
+        dark: (Color::rgb(0x0F, 0x3A, 0x3A), Color::rgb(0x08, 0x1A, 0x22), Ink::rgba(0x2A, 0x5A, 0x5A, 153)),
+        light: (Color::rgb(0xD6, 0xF0, 0xEE), Color::rgb(0xE8, 0xF5, 0xF3), Ink::rgba(0x9C, 0xC9, 0xC4, 153)),
+    },
+    WallColors {
+        dark: (Color::rgb(0x3A, 0x1E, 0x3F), Color::rgb(0x1A, 0x0E, 0x22), Ink::rgba(0x5A, 0x3A, 0x5E, 153)),
+        light: (Color::rgb(0xF7, 0xE3, 0xDC), Color::rgb(0xF3, 0xE9, 0xF6), Ink::rgba(0xC9, 0xAF, 0xB6, 153)),
+    },
+    WallColors {
+        dark: (Color::rgb(0x23, 0x27, 0x2E), Color::rgb(0x12, 0x14, 0x18), Ink::rgba(0x3A, 0x3F, 0x48, 153)),
+        light: (Color::rgb(0xE6, 0xE8, 0xEC), Color::rgb(0xF0, 0xF1, 0xF4), Ink::rgba(0xB6, 0xBA, 0xC2, 153)),
+    },
+];
+
+/// Палитра темы с таким акцентом и такими обоями.
+const fn styled(dark: bool, accent: usize, wall: usize) -> Palette {
+    let mut p = if dark { DARK } else { LIGHT };
+    let (acc, acc2, edge, ink) = if dark { ACCENTS[accent].dark } else { ACCENTS[accent].light };
+    p.acc = acc;
+    p.acc2 = acc2;
+    p.accedge = edge;
+    p.acc_ink = ink;
+    // Прозрачности — те же, что у синего в каждой теме: они подобраны под
+    // фон, а не под оттенок.
+    p.accline = if dark { Ink::rgba(acc.r, acc.g, acc.b, 85) } else { Ink::rgba(acc2.r, acc2.g, acc2.b, 51) };
+    p.acctint = Ink::rgba(acc.r, acc.g, acc.b, 31);
+    p.sel1 = Ink::rgba(acc.r, acc.g, acc.b, if dark { 61 } else { 51 });
+    p.sel2 = Ink::rgba(acc.r, acc.g, acc.b, if dark { 26 } else { 20 });
+    let (top, bottom, dot) = if dark { WALLS[wall].dark } else { WALLS[wall].light };
+    p.wall_top = top;
+    p.wall_bottom = bottom;
+    p.wall_dot = dot;
+    p
+}
+
+const fn build_palettes() -> [[[Palette; 4]; 5]; 2] {
+    let mut out = [[[DARK; 4]; 5]; 2];
+    let mut theme = 0;
+    while theme < 2 {
+        let mut accent = 0;
+        while accent < 5 {
+            let mut wall = 0;
+            while wall < 4 {
+                out[theme][accent][wall] = styled(theme == 0, accent, wall);
+                wall += 1;
+            }
+            accent += 1;
+        }
+        theme += 1;
+    }
+    out
+}
+
+/// Все сочетания: `[тёмная|светлая][акцент][обои]`.
+static PALETTES: [[[Palette; 4]; 5]; 2] = build_palettes();
+
+static ACCENT: AtomicU8 = AtomicU8::new(0);
+static WALLPAPER: AtomicU8 = AtomicU8::new(0);
+/// Высота заголовка окна в точках при масштабе 1. Из [`TITLE_HEIGHTS`].
+static TITLE_BAR: AtomicU32 = AtomicU32::new(TITLE_H);
+
+/// Допустимые высоты заголовка: компактный, обычный (макет), крупный.
+pub const TITLE_HEIGHTS: [u32; 3] = [36, 44, 52];
+
+#[must_use]
+pub fn accent() -> Accent {
+    Accent::from_index(ACCENT.load(Ordering::Relaxed) as usize)
+}
+
+/// Основной цвет такого акцента в нынешней теме — для образцов в «Параметрах».
+#[must_use]
+pub fn accent_color(accent: Accent) -> Color {
+    let colors = &ACCENTS[accent.index()];
+    if is_dark() { colors.dark.0 } else { colors.light.0 }
+}
+
+/// Верх и низ таких обоев в нынешней теме — для образцов в «Параметрах».
+#[must_use]
+pub fn wallpaper_colors(wall: Wallpaper) -> (Color, Color) {
+    let colors = &WALLS[wall.index()];
+    let (top, bottom, _) = if is_dark() { colors.dark } else { colors.light };
+    (top, bottom)
+}
+
+/// `true` — акцент действительно сменился.
+pub fn set_accent(accent: Accent) -> bool {
+    ACCENT.swap(accent.index() as u8, Ordering::Relaxed) != accent.index() as u8
+}
+
+#[must_use]
+pub fn wallpaper() -> Wallpaper {
+    Wallpaper::from_index(WALLPAPER.load(Ordering::Relaxed) as usize)
+}
+
+pub fn set_wallpaper(wall: Wallpaper) -> bool {
+    WALLPAPER.swap(wall.index() as u8, Ordering::Relaxed) != wall.index() as u8
+}
+
+/// Высота заголовка окна при масштабе 1.
+#[must_use]
+pub fn title_h() -> u32 {
+    TITLE_BAR.load(Ordering::Relaxed)
+}
+
+/// Задать высоту заголовка. Принимается только из [`TITLE_HEIGHTS`]: заголовок
+/// в три точки — это не настройка, а испорченный файл. `true` — изменилась.
+pub fn set_title_h(height: u32) -> bool {
+    if !TITLE_HEIGHTS.contains(&height) {
+        return false;
+    }
+    TITLE_BAR.swap(height, Ordering::Relaxed) != height
+}
+
+/// Текущая палитра: тема, акцент и обои.
 #[must_use]
 pub fn palette() -> &'static Palette {
-    if DARK_THEME.load(Ordering::Relaxed) { &DARK } else { &LIGHT }
+    let theme = if DARK_THEME.load(Ordering::Relaxed) { 0 } else { 1 };
+    let accent = (ACCENT.load(Ordering::Relaxed) as usize).min(4);
+    let wall = (WALLPAPER.load(Ordering::Relaxed) as usize).min(3);
+    &PALETTES[theme][accent][wall]
 }
 
 /// Тёмная ли тема сейчас.

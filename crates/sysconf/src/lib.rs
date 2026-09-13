@@ -179,6 +179,18 @@ pub fn theme_dark(text: &str) -> Option<bool> {
     }
 }
 
+/// Высота заголовка окна: строка `titlebar=44`.
+///
+/// Число, а не слово: «компактный» и «крупный» — подписи в окне, а файл
+/// хранит то, что можно проверить глазами и посчитать. Принимаются только
+/// три значения, которые знает тема; всё остальное — испорченный файл, и он
+/// не меняет вид системы.
+#[must_use]
+pub fn title_bar(text: &str) -> Option<u32> {
+    let height: u32 = value(text, "titlebar")?.parse().ok()?;
+    [36, 44, 52].contains(&height).then_some(height)
+}
+
 /// Откуда брать сетевой адрес: строка `mode=static`.
 ///
 /// `true` — постоянный адрес. Всё остальное, включая отсутствие ключа, — DHCP:
@@ -210,6 +222,8 @@ mod tests {
     /// Соседние строки переживают правку — ради этого функция и существует.
     #[test]
     fn replacing_a_key_leaves_the_neighbours_alone() {
+        let text = "language=ru\ntimezone=UTC+03:00\nuser=roman\n";
+        let _ = text;
         let text = "language=ru\ntimezone=UTC+03:00\nuser=roman\n";
         let out = replace_key(text, "timezone", "UTC+05:00");
         assert_eq!(out, "language=ru\ntimezone=UTC+05:00\nuser=roman\n");
