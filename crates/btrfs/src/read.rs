@@ -717,7 +717,7 @@ fn extent_span(raw: &[u8]) -> Result<u64> {
 }
 
 /// Разобрать одну запись каталога; возвращает её и свою длину в байтах.
-fn parse_dir_item(raw: &[u8]) -> Result<(DirEntry, usize)> {
+pub(crate) fn parse_dir_item(raw: &[u8]) -> Result<(DirEntry, usize)> {
     if raw.len() < DIR_ITEM_HEAD_SIZE {
         return Err(Error::Corrupt);
     }
@@ -760,7 +760,7 @@ fn parse_dir_item(raw: &[u8]) -> Result<(DirEntry, usize)> {
 /// написаны одним `mkfs` или одной чужой системой и различаться не могут.
 /// Фаза записи обязана вернуться сюда — с этого момента копии начнут расходиться
 /// при обрыве питания.
-fn read_superblock(dev: &mut dyn BlockDevice, first_lba: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_superblock(dev: &mut dyn BlockDevice, first_lba: u64) -> Result<Vec<u8>> {
     let sector = u64::from(dev.sector_size());
     if sector == 0 {
         return Err(Error::Unsupported);

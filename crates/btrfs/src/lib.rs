@@ -41,11 +41,15 @@
 //! экстенты данных (обычные, встроенные и предвыделенные), дыры, и **сверка
 //! crc32c на каждом прочитанном блоке** — и метаданных, и данных.
 //!
-//! Нет: записи (она в фазе 50), подтомов и снимков, сжатия, RAID любого вида,
-//! нескольких устройств в томе, журнала (`log tree`), расширенных атрибутов.
-//! Каждый пункт отвергается явной ошибкой [`Error::Unsupported`], а не молча:
-//! том, который мы не понимаем целиком, обязан сказать об этом, а не показать
-//! половину содержимого с уверенным видом.
+//! Есть и создание пустого тома — [`format`], свой `mkfs` (фаза 50a). Раскладка
+//! у него та же, что у `mkfs.btrfs`, и проверяется она не нашим читателем, а
+//! `btrfs check` и ядром Linux.
+//!
+//! Нет: записи в существующий том (фаза 50b), подтомов и снимков, сжатия, RAID
+//! любого вида, нескольких устройств в томе, журнала (`log tree`), расширенных
+//! атрибутов. Каждый пункт отвергается явной ошибкой [`Error::Unsupported`], а
+//! не молча: том, который мы не понимаем целиком, обязан сказать об этом, а не
+//! показать половину содержимого с уверенным видом.
 //!
 //! # Единицы измерения, в которых легко ошибиться
 //!
@@ -77,13 +81,18 @@ extern crate std;
 mod check;
 mod chunk;
 mod crc32c;
+mod format;
 mod layout;
+mod node;
 mod read;
 #[cfg(test)]
 mod tests;
 mod tree;
+mod write;
 
 pub use check::{Problem, Report, describe};
+pub use format::{FormatOptions, MIN_VOLUME_BYTES, format};
+pub use write::{Attributes, Writer};
 pub use layout::{Key, item_type};
 pub use read::{Btrfs, DirEntry, FileType, Inode, detect};
 
@@ -118,6 +127,16 @@ pub enum Error {
     Unsupported,
     /// Не хватило памяти.
     NoMemory,
+    /// Имя в каталоге уже занято.
+    Exists,
+    /// Удаляемый каталог не пуст.
+    NotEmpty,
+    /// На томе не осталось места — ни в кусках, ни под новый кусок.
+    NoSpace,
+    /// Операция сорвалась на середине, и транзакция в памяти больше ничего
+    /// согласованного не описывает. Её нельзя зафиксировать — только открыть
+    /// том заново.
+    Aborted,
 }
 
 impl From<disk::Error> for Error {
@@ -142,6 +161,10 @@ impl fmt::Display for Error {
             Error::BadName => "the name is empty, too long or contains a slash",
             Error::Unsupported => "the volume uses a feature this implementation lacks",
             Error::NoMemory => "out of memory",
+            Error::Exists => "the name already exists",
+            Error::NotEmpty => "the directory is not empty",
+            Error::NoSpace => "no free space left on the volume",
+            Error::Aborted => "an earlier failure left the transaction unusable",
         };
         f.write_str(text)
     }

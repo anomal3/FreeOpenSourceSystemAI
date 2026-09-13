@@ -60,6 +60,11 @@ impl ChunkMap {
         self.entries.len()
     }
 
+    /// Все куски по возрастанию логического адреса.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Chunk> {
+        self.entries.iter()
+    }
+
     /// Добавить кусок, разобрав его описание.
     ///
     /// `raw` — описание куска (`btrfs_chunk`) без ключа.

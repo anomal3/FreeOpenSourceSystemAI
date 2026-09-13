@@ -168,7 +168,7 @@ waiting to go wrong in it is in **[ROADMAP.md](ROADMAP.md)**.
 | **v0.4** | Real hardware: a phone — its own bootloader, no UEFI, no ACPI, USB in device mode, **a working touchscreen** | in progress |
 | **v0.5** | A libc and a toolchain: somebody else's project builds for this system unpatched | **done** |
 | **v0.6** | Windows belong to programs; settings that persist; a layout a Windows user recognises | **done** |
-| **v0.7** | btrfs: a volume made by `mkfs.btrfs` mounts at `/data` and reads, with crc32c checked on **every** data sector; `fsck` walks the whole volume | reading works, writing is next |
+| **v0.7** | btrfs: a volume made by `mkfs.btrfs` mounts at `/data` and reads, with crc32c checked on **every** data sector; `fsck` walks the whole volume; our own `mkfs` and writer create, overwrite, truncate, delete and rename files in a way `btrfs check` and the Linux kernel accept | the format side is done; the kernel writing to btrfs and the installer are next |
 | then | A Raspberry Pi 4 — the first machine that is not an emulator | planned |
 
 ---
@@ -179,7 +179,7 @@ waiting to go wrong in it is in **[ROADMAP.md](ROADMAP.md)**.
 crates/boot-uefi/    UEFI application: GOP probe, ELF loading, ExitBootServices
 crates/boot-info/    Stable #[repr(C)] hand-off contract: bootloader -> kernel
 crates/disk/         GPT and a FAT32 formatter          crates/ext2/  the ext2 format
-crates/btrfs/        btrfs on read: B-trees, chunk mapping, crc32c on every data sector
+crates/btrfs/        btrfs: B-trees, chunk mapping, crc32c on every data sector, mkfs
 crates/ssh/          Packets, curve25519, chacha20-poly1305, public-key login
 crates/mini-ui/      Surfaces, 8x8 text, widgets        crates/installer/  the installer
 crates/freeos-cc/    Build rules for C, and the x86_64-freeos-cc wrapper itself

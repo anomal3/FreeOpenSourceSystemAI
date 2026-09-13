@@ -103,6 +103,12 @@ enum Command {
     /// образец лежит в репозитории, поэтому команда нужна, только когда в него
     /// добавляют файл.
     BtrfsFixture,
+    /// Отдать том, созданный и изменённый нашим кодом, на суд Linux.
+    ///
+    /// Четыре круга: наш `mkfs` и писатель, запись Linux, наши правки поверх,
+    /// наша правка рядом с разрезом, который сделал Linux. В каждом `btrfs
+    /// check` смотрит на том до монтирования и после. Нужен WSL с `btrfs-progs`.
+    BtrfsLinuxCheck,
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -678,6 +684,10 @@ fn real_main() -> Result<()> {
 
         Command::BtrfsFixture => {
             btrfsfix::build()?;
+        }
+
+        Command::BtrfsLinuxCheck => {
+            btrfsfix::linux_check()?;
         }
 
         Command::Check(args) => {

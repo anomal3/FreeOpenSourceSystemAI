@@ -57,6 +57,13 @@ fn convert(err: btrfs::Error) -> VfsError {
         btrfs::Error::BadName => VfsError::BadPath,
         btrfs::Error::NoMemory => VfsError::OutOfMemory,
         btrfs::Error::Unsupported => VfsError::Unsupported,
+        btrfs::Error::Exists => VfsError::Exists,
+        btrfs::Error::NotEmpty => VfsError::NotEmpty,
+        btrfs::Error::NoSpace => VfsError::NoSpace,
+        // Транзакция, сорванная прежним отказом носителя или памяти. Ядро
+        // писателем пока не пользуется; ближайшее честное — «устройство
+        // отказало», потому что причина была именно там.
+        btrfs::Error::Aborted => VfsError::Io,
         btrfs::Error::Corrupt | btrfs::Error::BadChecksum | btrfs::Error::TooSmall => {
             VfsError::Corrupt
         }

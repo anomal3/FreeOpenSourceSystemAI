@@ -170,9 +170,16 @@ impl Key {
             offset: u64_at(raw, at + 9),
         }
     }
+
+    /// Записать ключ в том же упакованном виде, в каком он читается.
+    pub(crate) fn store(self, raw: &mut [u8], at: usize) {
+        put_u64(raw, at, self.objectid);
+        raw[at + 8] = self.kind;
+        put_u64(raw, at + 9, self.offset);
+    }
 }
 
-/// Типы элементов, которые читатель понимает.
+/// Типы элементов: те, что читатель понимает, и те, что пишет `mkfs`.
 pub mod item_type {
     pub const INODE_ITEM: u8 = 1;
     pub const INODE_REF: u8 = 12;
@@ -181,21 +188,55 @@ pub mod item_type {
     pub const EXTENT_DATA: u8 = 108;
     pub const EXTENT_CSUM: u8 = 128;
     pub const ROOT_ITEM: u8 = 132;
+    /// Экстент данных в дереве экстентов; длина лежит в смещении ключа.
+    pub const EXTENT_ITEM: u8 = 168;
+    /// Узел дерева в дереве экстентов; уровень узла лежит в смещении ключа.
+    pub const METADATA_ITEM: u8 = 169;
+    /// Ссылка «этот узел принадлежит дереву N».
+    pub const TREE_BLOCK_REF: u8 = 176;
+    /// Ссылка «эти данные — у такого-то файла такого-то дерева».
+    pub const EXTENT_DATA_REF: u8 = 178;
+    /// Ссылка на узел через родителя — признак общих узлов (снимков).
+    pub const SHARED_BLOCK_REF: u8 = 182;
+    /// Ссылка на данные через родителя — тоже от снимков.
+    pub const SHARED_DATA_REF: u8 = 184;
+    /// Длинная обратная ссылка inode — появляется у сотен жёстких ссылок.
+    pub const INODE_EXTREF: u8 = 13;
+    pub const BLOCK_GROUP_ITEM: u8 = 192;
+    pub const FREE_SPACE_INFO: u8 = 198;
+    pub const FREE_SPACE_EXTENT: u8 = 199;
+    pub const DEV_EXTENT: u8 = 204;
     pub const DEV_ITEM: u8 = 216;
     pub const CHUNK_ITEM: u8 = 228;
+    pub const UUID_KEY_SUBVOL: u8 = 251;
 }
 
 /// Номера деревьев и особых объектов.
 pub(crate) mod objectid {
+    /// Дерево корней. Его собственный корень лежит в суперблоке.
+    pub const ROOT_TREE: u64 = 1;
+    pub const EXTENT_TREE: u64 = 2;
+    pub const CHUNK_TREE: u64 = 3;
+    pub const DEV_TREE: u64 = 4;
+    /// Под этим номером в дереве кусков лежат описания устройств.
+    pub const DEV_ITEMS: u64 = 1;
     /// Дерево файловой системы — то самое, где лежат файлы.
     pub const FS_TREE: u64 = 5;
+    /// Каталог внутри дерева корней, где подтома записаны по именам.
+    pub const ROOT_TREE_DIR: u64 = 6;
     /// Дерево контрольных сумм данных.
     pub const CSUM_TREE: u64 = 7;
+    pub const UUID_TREE: u64 = 9;
+    pub const FREE_SPACE_TREE: u64 = 10;
+    /// Дерево перемещения данных: `-9` в беззнаковом виде.
+    pub const DATA_RELOC_TREE: u64 = u64::MAX - 8;
     /// Объект, под которым лежат все суммы: `-10` в беззнаковом виде.
     pub const EXTENT_CSUM: u64 = u64::MAX - 9;
     /// Первый номер, который достаётся файлам и каталогам. Корневой каталог
     /// подтома — всегда он.
     pub const FIRST_FREE: u64 = 256;
+    /// Последний номер для файлов: выше лежат особые объекты (`-255` и ниже).
+    pub const LAST_FREE: u64 = u64::MAX - 256;
     /// Объект, под которым в дереве кусков лежат сами куски.
     pub const FIRST_CHUNK_TREE: u64 = 256;
 }
@@ -365,6 +406,177 @@ pub(crate) const ROOT_ITEM_BYTENR: usize = INODE_ITEM_SIZE + 16;
 pub(crate) const ROOT_ITEM_LEVEL: usize = 238;
 /// Столько байт занимает элемент дерева корней целиком.
 pub(crate) const ROOT_ITEM_MIN_SIZE: usize = 239;
+
+// --- то, что нужно только тому, кто создаёт том -------------------------------
+//
+// Читателю эти поля безразличны, но без любого из них `btrfs check` объявит
+// том несогласованным. Смещения сверены с байтами тома от `mkfs.btrfs` 6.8.1
+// (`od` по адресам из `btrfs inspect-internal dump-tree`), а не только с
+// описанием формата.
+
+pub(crate) const SB_FLAGS: usize = 56;
+pub(crate) const SB_ROOT_DIR: usize = 128;
+pub(crate) const SB_LEAFSIZE: usize = 152;
+pub(crate) const SB_STRIPESIZE: usize = 156;
+pub(crate) const SB_CHUNK_ROOT_GENERATION: usize = 164;
+pub(crate) const SB_COMPAT_RO_FLAGS: usize = 180;
+pub(crate) const SB_DEV_ITEM: usize = 201;
+/// Четыре запасных набора корней, по 168 байт.
+pub(crate) const SB_SUPER_ROOTS: usize = 2859;
+
+pub(crate) const BACKUP_TREE_ROOT: usize = 0;
+pub(crate) const BACKUP_CHUNK_ROOT: usize = 16;
+pub(crate) const BACKUP_EXTENT_ROOT: usize = 32;
+pub(crate) const BACKUP_FS_ROOT: usize = 48;
+pub(crate) const BACKUP_DEV_ROOT: usize = 64;
+pub(crate) const BACKUP_CSUM_ROOT: usize = 80;
+pub(crate) const BACKUP_TOTAL_BYTES: usize = 96;
+pub(crate) const BACKUP_BYTES_USED: usize = 104;
+pub(crate) const BACKUP_NUM_DEVICES: usize = 112;
+
+/// Том ведёт дерево свободного места, и оно согласовано с деревом экстентов.
+///
+/// Без второго бита ядро Linux при первом монтировании перестроило бы дерево
+/// само — то есть молча переписало бы то, что мы проверяли.
+pub(crate) const COMPAT_RO_FREE_SPACE_TREE: u64 = 1 << 0;
+pub(crate) const COMPAT_RO_FREE_SPACE_TREE_VALID: u64 = 1 << 1;
+
+/// Возможности, с которыми создаётся том: те же, что у `mkfs.btrfs` 6.8.1 по
+/// умолчанию, — `0x341` в его `dump-super`.
+pub(crate) const INCOMPAT_CREATED: u64 =
+    INCOMPAT_MIXED_BACKREF | INCOMPAT_EXTENDED_IREF | INCOMPAT_SKINNY_METADATA | INCOMPAT_NO_HOLES;
+
+pub(crate) const HDR_FLAGS: usize = 56;
+pub(crate) const HDR_CHUNK_TREE_UUID: usize = 64;
+pub(crate) const HDR_OWNER: usize = 88;
+
+/// Блок записан. Тот же бит стоит и в поле флагов суперблока.
+pub(crate) const HEADER_FLAG_WRITTEN: u64 = 1 << 0;
+/// Версия обратных ссылок живёт в старшем байте флагов узла. Первая —
+/// «смешанные», единственная, которую понимает современное ядро.
+pub(crate) const HEADER_BACKREF_REV_MIXED: u64 = 1 << 56;
+
+pub(crate) const DEV_ITEM_SIZE: usize = 98;
+pub(crate) const DEV_ITEM_DEVID: usize = 0;
+pub(crate) const DEV_ITEM_TOTAL_BYTES: usize = 8;
+pub(crate) const DEV_ITEM_BYTES_USED: usize = 16;
+pub(crate) const DEV_ITEM_IO_ALIGN: usize = 24;
+pub(crate) const DEV_ITEM_IO_WIDTH: usize = 28;
+pub(crate) const DEV_ITEM_SECTOR_SIZE: usize = 32;
+pub(crate) const DEV_ITEM_UUID: usize = 66;
+pub(crate) const DEV_ITEM_FSID: usize = 82;
+
+/// Описание куска с одной полосой.
+pub(crate) const CHUNK_ITEM_SIZE: usize = CHUNK_HEAD_SIZE + STRIPE_SIZE;
+pub(crate) const CHUNK_OWNER: usize = 8;
+pub(crate) const CHUNK_STRIPE_LEN: usize = 16;
+pub(crate) const CHUNK_IO_ALIGN: usize = 32;
+pub(crate) const CHUNK_IO_WIDTH: usize = 36;
+pub(crate) const CHUNK_SECTOR_SIZE: usize = 40;
+pub(crate) const CHUNK_SUB_STRIPES: usize = 46;
+pub(crate) const STRIPE_DEV_UUID: usize = 16;
+
+pub(crate) const BLOCK_GROUP_DATA: u64 = 1 << 0;
+pub(crate) const BLOCK_GROUP_SYSTEM: u64 = 1 << 1;
+pub(crate) const BLOCK_GROUP_METADATA: u64 = 1 << 2;
+
+pub(crate) const BLOCK_GROUP_ITEM_SIZE: usize = 24;
+pub(crate) const BLOCK_GROUP_USED: usize = 0;
+pub(crate) const BLOCK_GROUP_CHUNK_OBJECTID: usize = 8;
+pub(crate) const BLOCK_GROUP_FLAGS: usize = 16;
+
+pub(crate) const EXTENT_ITEM_SIZE: usize = 24;
+pub(crate) const EXTENT_ITEM_REFS: usize = 0;
+pub(crate) const EXTENT_ITEM_GENERATION: usize = 8;
+pub(crate) const EXTENT_ITEM_FLAGS: usize = 16;
+pub(crate) const EXTENT_FLAG_TREE_BLOCK: u64 = 1 << 1;
+/// Запись об узле дерева с одной встроенной ссылкой: 24 + тип + владелец.
+pub(crate) const METADATA_ITEM_SIZE: usize = EXTENT_ITEM_SIZE + 1 + 8;
+
+pub(crate) const DEV_EXTENT_SIZE: usize = 48;
+pub(crate) const DEV_EXTENT_CHUNK_TREE: usize = 0;
+pub(crate) const DEV_EXTENT_CHUNK_OBJECTID: usize = 8;
+pub(crate) const DEV_EXTENT_CHUNK_OFFSET: usize = 16;
+pub(crate) const DEV_EXTENT_LENGTH: usize = 24;
+pub(crate) const DEV_EXTENT_UUID: usize = 32;
+
+pub(crate) const FREE_SPACE_INFO_SIZE: usize = 8;
+pub(crate) const FREE_SPACE_INFO_EXTENT_COUNT: usize = 0;
+
+pub(crate) const INODE_GENERATION: usize = 0;
+pub(crate) const INODE_NBYTES: usize = 24;
+pub(crate) const INODE_ATIME: usize = 112;
+pub(crate) const INODE_CTIME: usize = 124;
+pub(crate) const INODE_OTIME: usize = 148;
+
+pub(crate) const INODE_REF_HEAD_SIZE: usize = 10;
+pub(crate) const INODE_REF_NAME_LEN: usize = 8;
+
+pub(crate) const DIR_ITEM_TYPE: usize = 29;
+pub(crate) const FILE_TYPE_DIRECTORY: u8 = 2;
+
+pub(crate) const ROOT_ITEM_SIZE: usize = 439;
+pub(crate) const ROOT_ITEM_GENERATION: usize = INODE_ITEM_SIZE;
+pub(crate) const ROOT_ITEM_DIRID: usize = INODE_ITEM_SIZE + 8;
+pub(crate) const ROOT_ITEM_BYTES_USED: usize = INODE_ITEM_SIZE + 32;
+pub(crate) const ROOT_ITEM_REFS: usize = 216;
+pub(crate) const ROOT_ITEM_GENERATION_V2: usize = 239;
+pub(crate) const ROOT_ITEM_UUID: usize = 247;
+pub(crate) const ROOT_ITEM_CTIME: usize = 327;
+pub(crate) const ROOT_ITEM_OTIME: usize = 339;
+
+// --- то, что нужно писателю в существующий том ---------------------------------
+//
+// Сверено с томом, в который писало ядро Linux (`dump-tree` после `mount`,
+// записи файла и `umount`).
+
+pub(crate) const BACKUP_SIZE: usize = 168;
+pub(crate) const BACKUP_TREE_ROOT_LEVEL: usize = 152;
+pub(crate) const BACKUP_CHUNK_ROOT_LEVEL: usize = 153;
+pub(crate) const BACKUP_EXTENT_ROOT_LEVEL: usize = 154;
+pub(crate) const BACKUP_FS_ROOT_LEVEL: usize = 155;
+pub(crate) const BACKUP_DEV_ROOT_LEVEL: usize = 156;
+pub(crate) const BACKUP_CSUM_ROOT_LEVEL: usize = 157;
+
+/// Вид группы блоков без профиля размещения.
+pub(crate) const BLOCK_GROUP_TYPE_MASK: u64 =
+    BLOCK_GROUP_DATA | BLOCK_GROUP_SYSTEM | BLOCK_GROUP_METADATA;
+
+pub(crate) const EXTENT_FLAG_DATA: u64 = 1 << 0;
+
+/// Запись об экстенте данных со встроенной ссылкой: 24 + тип + ссылка (28).
+pub(crate) const DATA_EXTENT_ITEM_SIZE: usize = EXTENT_ITEM_SIZE + 1 + 28;
+/// Поля ссылки на данные — считаются от байта за её типом.
+pub(crate) const DATA_REF_ROOT: usize = 1;
+pub(crate) const DATA_REF_OBJECTID: usize = 9;
+pub(crate) const DATA_REF_OFFSET: usize = 17;
+pub(crate) const DATA_REF_COUNT: usize = 25;
+
+pub(crate) const EXTENT_GENERATION: usize = 0;
+pub(crate) const EXTENT_DISK_NUM_BYTES: usize = 29;
+
+pub(crate) const INODE_TRANSID: usize = 8;
+pub(crate) const DIR_ITEM_TRANSID: usize = 17;
+pub(crate) const FILE_TYPE_REGULAR: u8 = 1;
+
+pub(crate) const ROOT_ITEM_CTRANSID: usize = 295;
+
+// --- запись полей ------------------------------------------------------------
+
+#[inline]
+pub(crate) fn put_u16(buf: &mut [u8], at: usize, value: u16) {
+    buf[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+pub(crate) fn put_u32(buf: &mut [u8], at: usize, value: u32) {
+    buf[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[inline]
+pub(crate) fn put_u64(buf: &mut [u8], at: usize, value: u64) {
+    buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+}
 
 // --- чтение полей ------------------------------------------------------------
 
