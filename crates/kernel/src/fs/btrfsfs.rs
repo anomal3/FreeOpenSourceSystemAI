@@ -141,6 +141,42 @@ impl BtrfsMount {
     pub fn was_clean(&self) -> bool {
         self.0.inner.lock().fs.was_clean()
     }
+
+    /// Обойти том целиком и сверить всё, что сверяется.
+    ///
+    /// Замок держится всю проверку — как и у ext2, и по той же причине: без
+    /// него другая задача успела бы поменять том посреди обхода, и «находка»
+    /// описывала бы не том, а гонку. Здесь, впрочем, менять его некому: том
+    /// открыт только на чтение.
+    fn summary(&self) -> VfsResult<crate::vfs::CheckSummary> {
+        let report = {
+            let mut guard = self.0.inner.lock();
+            let Inner { disk, fs } = &mut *guard;
+            fs.check(disk).map_err(convert)?
+        };
+
+        let mut problems = Vec::new();
+        problems
+            .try_reserve_exact(report.problems.len())
+            .map_err(|_| VfsError::OutOfMemory)?;
+        for problem in &report.problems {
+            problems.push(btrfs::describe(problem).map_err(convert)?);
+        }
+
+        Ok(crate::vfs::CheckSummary {
+            // Всё, что нашлось, требует решения человека: чинить том нечем —
+            // писателя у этого формата пока нет. Сказать «починится при
+            // следующей загрузке» было бы прямым враньём.
+            needs_attention: !problems.is_empty() || report.dropped > 0,
+            problems,
+            dropped: report.dropped,
+            // Числа — **по итогам обхода**, а не из счётчиков тома: счётчики
+            // проверка как раз и сверяет, и брать их отсюда значило бы
+            // отчитаться тем, что проверялось.
+            inodes_used: u32::try_from(report.inodes).unwrap_or(u32::MAX),
+            blocks_used: u32::try_from(report.sectors).unwrap_or(u32::MAX),
+        })
+    }
 }
 
 impl FileSystem for BtrfsMount {
@@ -155,6 +191,10 @@ impl FileSystem for BtrfsMount {
             fs.root(disk).map_err(convert)?
         };
         Ok(Box::new(BtrfsNode { fs: Arc::clone(&self.0), inode }))
+    }
+
+    fn check(&self) -> Option<VfsResult<crate::vfs::CheckSummary>> {
+        Some(self.summary())
     }
 
     /// Сбрасывать нечего: том открыт только на чтение и не менялся.

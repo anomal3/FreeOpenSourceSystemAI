@@ -223,6 +223,16 @@ impl Btrfs {
         self.was_clean
     }
 
+    /// Корень дерева файловой системы и его высота — для проверки тома.
+    pub(crate) const fn fs_root(&self) -> (u64, u8) {
+        self.fs_tree
+    }
+
+    /// Геометрия тома — для проверки тома, которая ходит по дереву сама.
+    pub(crate) const fn volume_mut(&mut self) -> &mut Volume {
+        &mut self.volume
+    }
+
     /// Корневой каталог.
     pub fn root(&mut self, dev: &mut dyn BlockDevice) -> Result<Inode> {
         self.inode(dev, objectid::FIRST_FREE)
@@ -541,6 +551,45 @@ impl Btrfs {
         let take = take.min(sector as usize - skip);
         buf[..take].copy_from_slice(&whole[skip..skip + take]);
         Ok(take)
+    }
+
+    /// Прочитать диапазон данных и сверить его контрольные суммы.
+    ///
+    /// Нужен проверке тома, и подпись у него другая не случайно: проверке не
+    /// нужны сами байты — ей нужен ответ «сошлось или нет». Поэтому буфер
+    /// приходит снаружи и переиспользуется, а результат чтения никуда не
+    /// уезжает.
+    ///
+    /// `logical` выровнен по сектору, `bytes` кратен ему.
+    pub(crate) fn verify_range(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        logical: u64,
+        bytes: u64,
+        scratch: &mut [u8],
+        csums: &mut Option<Cursor>,
+    ) -> Result<()> {
+        let sector = u64::from(self.volume.sectorsize);
+        let step = (scratch.len() as u64 / sector) * sector;
+        if step == 0 {
+            return Err(Error::NoMemory);
+        }
+        let mut done = 0u64;
+        while done < bytes {
+            let at = logical + done;
+            // Отрезок не должен пересекать границу куска: за ней физический
+            // адрес считается по другой записи карты.
+            let run = self.volume.contiguous(at)?;
+            let take = step.min(bytes - done).min(run - run % sector);
+            if take == 0 {
+                return Err(Error::Corrupt);
+            }
+            let take = take as usize;
+            self.volume.read_logical(dev, at, &mut scratch[..take])?;
+            self.check_data(dev, at, &scratch[..take], csums)?;
+            done += take as u64;
+        }
+        Ok(())
     }
 
     /// Сверить контрольные суммы прочитанных секторов данных.

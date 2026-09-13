@@ -74,6 +74,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod check;
 mod chunk;
 mod crc32c;
 mod layout;
@@ -82,6 +83,7 @@ mod read;
 mod tests;
 mod tree;
 
+pub use check::{Problem, Report, describe};
 pub use layout::{Key, item_type};
 pub use read::{Btrfs, DirEntry, FileType, Inode, detect};
 

@@ -330,6 +330,14 @@ impl Cursor {
         }
     }
 
+    /// Логический адрес листа, на котором стоит обход.
+    ///
+    /// Нужен проверке тома: находка без адреса узла не даёт зацепиться ни
+    /// `btrfs inspect-internal`, ни глазам.
+    pub(crate) fn leaf_address(&self) -> u64 {
+        self.path.last().map_or(0, |(address, _)| *address)
+    }
+
     /// Данные текущего элемента.
     pub(crate) fn item(&self) -> Result<&[u8]> {
         if self.done || self.slot >= self.nritems {

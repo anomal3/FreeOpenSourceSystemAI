@@ -29,7 +29,7 @@ use std::io::Read as _;
 use disk::MemDisk;
 
 use crate::read::{Btrfs, FileType};
-use crate::{Error, Key, item_type};
+use crate::{Error, Key, Problem, item_type};
 
 /// Развернуть образ из репозитория в память.
 fn fixture() -> MemDisk {
@@ -319,4 +319,51 @@ fn find_pattern(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[test]
+fn a_clean_volume_checks_out_clean() {
+    let mut disk = fixture();
+    let mut fs = Btrfs::mount(&mut disk, 0).unwrap();
+    let report = fs.check(&mut disk).expect("проверка не дошла до конца");
+
+    assert!(report.is_clean(), "на чистом томе нашлось: {:?}", report.problems);
+    // Две тысячи мелких файлов плюс шесть в корне и один в `dir/sub`. Точное
+    // число здесь уместно: образец собирается рецептом, а не наугад, и
+    // расхождение означало бы, что обход дерева не дошёл до конца.
+    assert_eq!(report.files, 2000 + 5 + 1, "файлов найдено {}", report.files);
+    // Корень, `dir`, `dir/sub`, `many`.
+    assert_eq!(report.directories, 4, "каталогов найдено {}", report.directories);
+    // Четыре мегабайта, мегабайт с дырой, три килобайта и мелочь.
+    assert!(report.bytes > 5 * 1024 * 1024, "суммарный размер {}", report.bytes);
+    // Сверены настоящие сектора, а не ноль: проверка, которая ничего не
+    // прочитала, отчиталась бы точно так же.
+    assert!(report.sectors > 1000, "сверено секторов {}", report.sectors);
+}
+
+#[test]
+fn the_check_finds_broken_data_and_keeps_going() {
+    let spoiled = {
+        let disk = fixture();
+        let mut raw = disk.into_vec();
+        let at = find_pattern(&raw, b"0123456789abcdef0123456789abcdef")
+            .expect("узор файла не нашёлся в образе");
+        raw[at] ^= 0xFF;
+        raw
+    };
+    let mut disk = MemDisk::from_vec(spoiled).unwrap();
+    let mut fs = Btrfs::mount(&mut disk, 0).unwrap();
+    let report = fs.check(&mut disk).expect("проверка обязана дойти до конца");
+
+    assert!(!report.is_clean(), "порча прошла незамеченной");
+    assert!(
+        report.problems.iter().any(|problem| matches!(problem, Problem::BadData { .. })),
+        "нашлось не то: {:?}",
+        report.problems
+    );
+    // Главное во всей проверке: найдя порчу, она не бросает том. Остальные
+    // файлы обязаны быть просмотрены — иначе один испорченный сектор скрывал
+    // бы все следующие.
+    assert_eq!(report.files, 2006, "обход оборвался: файлов {}", report.files);
+    assert!(!crate::describe(&report.problems[0]).unwrap().is_empty());
 }
