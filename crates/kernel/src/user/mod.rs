@@ -1869,6 +1869,14 @@ impl core::fmt::Display for KillError {
 /// этом ядре системные вызовы не блокируются, поэтому выйдет она сразу, но
 /// обещать это на будущее нельзя.
 pub fn request_kill(id: sched::TaskId) -> Result<(), KillError> {
+    // Холостая задача — задача ядра, и отказ ей полагается тот же, что задаче
+    // USB или питания: «это не программа». До фазы 43 так и было; с появлением
+    // нескольких процессоров холостые слоты перестали отдаваться поиском, и
+    // `kill 0` стал отвечать «такой задачи нет» — про задачу, которую `tasks`
+    // печатает первой строкой.
+    if sched::is_idle(id) {
+        return Err(KillError::NotAProgram);
+    }
     let (slot, state) = sched::lookup(id).ok_or(KillError::NoSuchTask)?;
     if state == sched::TaskState::Finished {
         return Err(KillError::AlreadyFinished);

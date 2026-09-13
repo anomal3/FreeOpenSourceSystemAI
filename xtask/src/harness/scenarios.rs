@@ -4222,244 +4222,6 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
-        name: "install4k",
-        about: "Установщик размечает диск с сектором 4096 — раскладка считается в его секторах.",
-        target: Target::Installer,
-        usb_only: false,
-        tablet: false,
-        ohci: false,
-        disk_bus: DiskBus::Nvme4k,
-        network: false,
-        guest_port: 0,
-        host_echo: false,
-        host_repo: false,
-        arches: &[],
-        reboots: false,
-        updates: false,
-        big_file: false,
-        ssh_key: false,
-        memory: "",
-        extra: &[],
-        steps: &[
-            Step::Await("FreeOS installer", BOOT),
-            Step::Await("[disk]", 30_000),
-            Step::Wait(1_500),
-            Step::Key("ret"),
-            Step::Wait(700),
-            Step::Key("ret"),
-            Step::Wait(700),
-            Step::Shot("01-disk-4k"),
-            Step::Key("ret"),
-            Step::Wait(700),
-            Step::Type("roman"),
-            Step::Key("tab"),
-            Step::Type("freeos"),
-            Step::Key("tab"),
-            Step::Type("freeos"),
-            Step::Key("ret"),
-            Step::Wait(700),
-            Step::Key("ret"),
-            Step::Wait(700),
-            Step::Repeat("down", 3),
-            Step::Key("ret"),
-            Step::Wait(700),
-            Step::Shot("02-confirm-4k"),
-            Step::Key("down"),
-            Step::Key("ret"),
-            // Установка на 4Kn-диск проходит целиком: разметка, ESP с
-            // BytsPerSec = 4096 и корень ext2, у которого блок равен сектору.
-            //
-            // Срок вдвое больше прежнего, и поднят он не наугад: в прогоне
-            // вчетвером эта установка на ARM заняла больше четырёх минут и
-            // упёрлась в 240 с — а следом упал `sector4k`, которому нужен
-            // записанный ею диск. Срок здесь отвечает на вопрос «не повисло
-            // ли», и на машине, где рядом работают ещё три эмулятора, ответ
-            // «четыре минуты» — не «повисло».
-            Step::Await("[install] finished", 480_000),
-            Step::Expect("[install] state: /etc/passwd"),
-            Step::Wait(1_000),
-            Step::Shot("03-done-4k"),
-        ],
-    },
-    Scenario {
-        name: "sector4k",
-        about: "Корень на диске с сектором 4096: тот же путь GPT → ext2 → VFS, другие адреса.",
-        target: Target::LiveAndDisk,
-        usb_only: false,
-        tablet: false,
-        ohci: false,
-        disk_bus: DiskBus::Nvme4k,
-        network: false,
-        guest_port: 0,
-        host_echo: false,
-        host_repo: false,
-        arches: &[],
-        reboots: false,
-        updates: false,
-        big_file: false,
-        ssh_key: false,
-        memory: "",
-        extra: &[],
-        steps: &[
-            // Диск объявляет свой блок сам, и ядро его принимает, а не
-            // отвергает: до Phase 26c здесь стояло «block size 4096 is not
-            // supported», и корень не находился вовсе.
-            Step::Await("nvme        : ", BOOT),
-            Step::Await("disk        : nvme #0", 30_000),
-            // Строка, ради которой заведён сценарий: таблица разделов прочитана
-            // на носителе, у которого сектор вчетверо больше обычного.
-            Step::Await("4096-byte sectors", 30_000),
-            Step::Await("on nvme #0 at LBA", 30_000),
-            Step::Await("root        : ext2 at LBA", 30_000),
-            // Файл, записанный установщиком, читается: значит и суперблок, и
-            // таблицы inode найдены по верным адресам, а не по формуле,
-            // делённой на 512.
-            Step::Await("account     : /etc/passwd", 30_000),
-            Step::Await("freeos> ", 30_000),
-            Step::Line("cat /etc/system.cfg"),
-            Step::Await("language=", 15_000),
-            Step::Line("echo written-on-4kn > /home/roman/sector4k.txt"),
-            Step::Await("wrote 15 bytes", 15_000),
-            Step::Line("cat /home/roman/sector4k.txt"),
-            Step::Await("written-on-4kn", 15_000),
-            Step::Line("exit"),
-            Step::Await("finishing the session", 15_000),
-            Step::Absent("KERNEL PANIC"),
-        ],
-    },
-    Scenario {
-        name: "net",
-        about: "Карта поднимается, ARP находит шлюз, ping доходит до чужого стека и возвращается.",
-        target: Target::Live,
-        usb_only: false,
-        tablet: false,
-        ohci: false,
-        disk_bus: DiskBus::Virtio,
-        network: true,
-        guest_port: 0,
-        host_echo: false,
-        host_repo: false,
-        arches: &[],
-        reboots: false,
-        updates: false,
-        big_file: false,
-        ssh_key: false,
-        memory: "",
-        extra: &[],
-        steps: &[
-            // Карта найдена и назвала свой аппаратный адрес. Адрес приехал из
-            // конфигурации устройства, то есть возможность `VIRTIO_NET_F_MAC`
-            // действительно согласована, а не пропущена.
-            Step::Await("network     : virtio-net, hardware address ", BOOT),
-            Step::Await("network     : receive task ", 30_000),
-            Step::Await("freeos> ", 60_000),
-
-            // Адреса не выдуманы: это раскладка пользовательской сети QEMU.
-            // Гость — .15, шлюз — .2, и оба заданы не нами.
-            Step::Line("ip 10.0.2.15/24 10.0.2.2"),
-            Step::Await("address 10.0.2.15/24 set", 15_000),
-
-            // Главное утверждение фазы. Чтобы эта строка появилась, обязаны
-            // сработать все четыре слоя подряд: кадр Ethernet уехал через
-            // очередь virtio, ARP нашёл аппаратный адрес шлюза, заголовок IPv4
-            // сошёлся по контрольной сумме, эхо сошлось по своей — **другой** —
-            // сумме, и ответ вернулся через приёмную очередь в задачу.
-            //
-            // Отвечает при этом чужая реализация: стек SLIRP внутри QEMU. Любую
-            // нашу ошибку в суммах или в порядке байт он молча отбрасывает, а не
-            // прощает, — ради этого сеть и проверяется им, а не собой.
-            Step::Line("ping 10.0.2.2 2"),
-            Step::Await("reply from 10.0.2.2, seq 1", 30_000),
-            Step::Await("reply from 10.0.2.2, seq 2", 30_000),
-            Step::Await("2 of 2 answered", 15_000),
-
-            // Шлюз попал в таблицу ARP — то есть ответ на запрос разобран, а не
-            // «как-то само доехало».
-            Step::Line("arp"),
-            Step::Await("10.0.2.2", 15_000),
-
-            // Счётчики сходятся с тем, что произошло: два запроса ушли, два
-            // ответа пришли. Ноль в любом из них означал бы систему, которая
-            // печатает правильные слова, ничего не отправляя.
-            //
-            // Порядок проверок повторяет порядок строк вывода: ожидание ищет
-            // вперёд от того места, где остановилось прошлое, и строка адреса,
-            // напечатанная выше строки `icmp`, для него уже позади.
-            Step::Line("ip"),
-            Step::Await("address  10.0.2.15/24", 15_000),
-            // И обратная сторона: ни один кадр не потерян на приёме. Приёмная
-            // очередь, из которой забыли вернуть буфер, кончается молча — и
-            // видно это только здесь.
-            Step::Await("0 dropped in", 15_000),
-            Step::AtLeast("  icmp     ", 2, 15_000),
-
-            Step::Line("exit"),
-            Step::Await("finishing the session", 15_000),
-            Step::Absent("KERNEL PANIC"),
-        ],
-    },
-    Scenario {
-        name: "ssh-kex",
-        about: "Настоящий ssh с хоста доходит до обмена ключами и шифрования и говорит об этом.",
-        target: Target::Live,
-        usb_only: false,
-        tablet: false,
-        ohci: false,
-        disk_bus: DiskBus::Virtio,
-        network: true,
-        guest_port: 22,
-        host_echo: false,
-        host_repo: false,
-        arches: &[],
-        reboots: false,
-        updates: false,
-        big_file: false,
-        ssh_key: false,
-        memory: "",
-        extra: &[],
-        steps: &[
-            Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
-            // Ключ хоста делается при первом запуске, и качество источника
-            // случайности названо в журнале ядра, а не подразумевается.
-            Step::AwaitAny("sshd: listening on port 22", 60_000),
-            Step::Wait(1_000),
-
-            // И главное: с хоста приходит **настоящий** OpenSSH. Он придирчив к
-            // каждому полю формата, и всё, в чём мы ошиблись, назовёт вслух.
-            // Проверяются три утверждения: договорились об обмене ключами,
-            // приняли ключ хоста ed25519, договорились о шифре в обе стороны.
-            Step::Ssh(SshRun {
-                // Без ключа: этот сценарий проверяет транспорт, а не вход.
-                identity: Identity::None,
-                command: "",
-                stdin: "",
-                expect: &[
-                    "kex: algorithm: curve25519-sha256",
-                    "kex: host key algorithm: ssh-ed25519",
-                    "chacha20-poly1305@openssh.com",
-                    // Аутентификация обязана быть отвергнута, и здесь это
-                    // успех сценария: отказ означает, что зашифрованный канал
-                    // работает и по нему прошёл разбор сообщений.
-                    //
-                    // На живой системе она отвергается **всегда**, кем бы ни
-                    // был клиент: учётных записей на образе initrd нет, а
-                    // класть их туда нельзя — этот образ уезжает в выпуск.
-                    "Authentications that can continue: publickey",
-                ],
-                absent: &[],
-                timeout_ms: 60_000,
-            }),
-            // И гость называет причину своими словами.
-            Step::AwaitAny("sshd: no account file here, so nobody can log in", 30_000),
-
-            // Гость видел то же самое со своей стороны.
-            Step::AwaitAny("sshd: encrypted, curve25519-sha256 with chacha20-poly1305", 30_000),
-            Step::AwaitAny("sshd: service accepted", 15_000),
-
-            Step::Absent("KERNEL PANIC"),
-        ],
-    },
-    Scenario {
         name: "winpath",
         about: "Путь, написанный по-виндовому, ведёт туда же; в менеджере — знакомые подписи.",
         target: Target::Installed,
@@ -4772,6 +4534,253 @@ pub const ALL: &[Scenario] = &[
 
             Step::Line("shutdown"),
             Step::Exits(30_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    // `winpath` и `settings` обязаны стоять ДО `install4k`.
+    //
+    // Оба грузятся с установленного диска на 512-байтовой шине, а `install4k`
+    // пересоздаёт тот же файл с сектором 4096 и оставляет его таким. Стоя
+    // после него, они получали машину, которой прошивке нечего загрузить:
+    // журнал обрывался на `EFI Internal Shell`, а сценарий шесть минут ждал
+    // приглашения. Оба были красными весь полный прогон и на обеих
+    // архитектурах — и никто этого не видел, потому что полных прогонов не
+    // делали с фазы 39a.
+    Scenario {
+        name: "install4k",
+        about: "Установщик размечает диск с сектором 4096 — раскладка считается в его секторах.",
+        target: Target::Installer,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Nvme4k,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("FreeOS installer", BOOT),
+            Step::Await("[disk]", 30_000),
+            Step::Wait(1_500),
+            Step::Key("ret"),
+            Step::Wait(700),
+            Step::Key("ret"),
+            Step::Wait(700),
+            Step::Shot("01-disk-4k"),
+            Step::Key("ret"),
+            Step::Wait(700),
+            Step::Type("roman"),
+            Step::Key("tab"),
+            Step::Type("freeos"),
+            Step::Key("tab"),
+            Step::Type("freeos"),
+            Step::Key("ret"),
+            Step::Wait(700),
+            Step::Key("ret"),
+            Step::Wait(700),
+            Step::Repeat("down", 3),
+            Step::Key("ret"),
+            Step::Wait(700),
+            Step::Shot("02-confirm-4k"),
+            Step::Key("down"),
+            Step::Key("ret"),
+            // Установка на 4Kn-диск проходит целиком: разметка, ESP с
+            // BytsPerSec = 4096 и корень ext2, у которого блок равен сектору.
+            //
+            // Срок вдвое больше прежнего, и поднят он не наугад: в прогоне
+            // вчетвером эта установка на ARM заняла больше четырёх минут и
+            // упёрлась в 240 с — а следом упал `sector4k`, которому нужен
+            // записанный ею диск. Срок здесь отвечает на вопрос «не повисло
+            // ли», и на машине, где рядом работают ещё три эмулятора, ответ
+            // «четыре минуты» — не «повисло».
+            Step::Await("[install] finished", 480_000),
+            Step::Expect("[install] state: /etc/passwd"),
+            Step::Wait(1_000),
+            Step::Shot("03-done-4k"),
+        ],
+    },
+    Scenario {
+        name: "sector4k",
+        about: "Корень на диске с сектором 4096: тот же путь GPT → ext2 → VFS, другие адреса.",
+        target: Target::LiveAndDisk,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Nvme4k,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            // Диск объявляет свой блок сам, и ядро его принимает, а не
+            // отвергает: до Phase 26c здесь стояло «block size 4096 is not
+            // supported», и корень не находился вовсе.
+            Step::Await("nvme        : ", BOOT),
+            Step::Await("disk        : nvme #0", 30_000),
+            // Строка, ради которой заведён сценарий: таблица разделов прочитана
+            // на носителе, у которого сектор вчетверо больше обычного.
+            Step::Await("4096-byte sectors", 30_000),
+            Step::Await("on nvme #0 at LBA", 30_000),
+            Step::Await("root        : ext2 at LBA", 30_000),
+            // Файл, записанный установщиком, читается: значит и суперблок, и
+            // таблицы inode найдены по верным адресам, а не по формуле,
+            // делённой на 512.
+            Step::Await("account     : /etc/passwd", 30_000),
+            Step::Await("freeos> ", 30_000),
+            Step::Line("cat /etc/system.cfg"),
+            Step::Await("language=", 15_000),
+            Step::Line("echo written-on-4kn > /home/roman/sector4k.txt"),
+            Step::Await("wrote 15 bytes", 15_000),
+            Step::Line("cat /home/roman/sector4k.txt"),
+            Step::Await("written-on-4kn", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "net",
+        about: "Карта поднимается, ARP находит шлюз, ping доходит до чужого стека и возвращается.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            // Карта найдена и назвала свой аппаратный адрес. Адрес приехал из
+            // конфигурации устройства, то есть возможность `VIRTIO_NET_F_MAC`
+            // действительно согласована, а не пропущена.
+            Step::Await("network     : virtio-net, hardware address ", BOOT),
+            Step::Await("network     : receive task ", 30_000),
+            Step::Await("freeos> ", 60_000),
+
+            // Адреса не выдуманы: это раскладка пользовательской сети QEMU.
+            // Гость — .15, шлюз — .2, и оба заданы не нами.
+            Step::Line("ip 10.0.2.15/24 10.0.2.2"),
+            Step::Await("address 10.0.2.15/24 set", 15_000),
+
+            // Главное утверждение фазы. Чтобы эта строка появилась, обязаны
+            // сработать все четыре слоя подряд: кадр Ethernet уехал через
+            // очередь virtio, ARP нашёл аппаратный адрес шлюза, заголовок IPv4
+            // сошёлся по контрольной сумме, эхо сошлось по своей — **другой** —
+            // сумме, и ответ вернулся через приёмную очередь в задачу.
+            //
+            // Отвечает при этом чужая реализация: стек SLIRP внутри QEMU. Любую
+            // нашу ошибку в суммах или в порядке байт он молча отбрасывает, а не
+            // прощает, — ради этого сеть и проверяется им, а не собой.
+            Step::Line("ping 10.0.2.2 2"),
+            Step::Await("reply from 10.0.2.2, seq 1", 30_000),
+            Step::Await("reply from 10.0.2.2, seq 2", 30_000),
+            Step::Await("2 of 2 answered", 15_000),
+
+            // Шлюз попал в таблицу ARP — то есть ответ на запрос разобран, а не
+            // «как-то само доехало».
+            Step::Line("arp"),
+            Step::Await("10.0.2.2", 15_000),
+
+            // Счётчики сходятся с тем, что произошло: два запроса ушли, два
+            // ответа пришли. Ноль в любом из них означал бы систему, которая
+            // печатает правильные слова, ничего не отправляя.
+            //
+            // Порядок проверок повторяет порядок строк вывода: ожидание ищет
+            // вперёд от того места, где остановилось прошлое, и строка адреса,
+            // напечатанная выше строки `icmp`, для него уже позади.
+            Step::Line("ip"),
+            Step::Await("address  10.0.2.15/24", 15_000),
+            // И обратная сторона: ни один кадр не потерян на приёме. Приёмная
+            // очередь, из которой забыли вернуть буфер, кончается молча — и
+            // видно это только здесь.
+            Step::Await("0 dropped in", 15_000),
+            Step::AtLeast("  icmp     ", 2, 15_000),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "ssh-kex",
+        about: "Настоящий ssh с хоста доходит до обмена ключами и шифрования и говорит об этом.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        guest_port: 22,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
+            // Ключ хоста делается при первом запуске, и качество источника
+            // случайности названо в журнале ядра, а не подразумевается.
+            Step::AwaitAny("sshd: listening on port 22", 60_000),
+            Step::Wait(1_000),
+
+            // И главное: с хоста приходит **настоящий** OpenSSH. Он придирчив к
+            // каждому полю формата, и всё, в чём мы ошиблись, назовёт вслух.
+            // Проверяются три утверждения: договорились об обмене ключами,
+            // приняли ключ хоста ed25519, договорились о шифре в обе стороны.
+            Step::Ssh(SshRun {
+                // Без ключа: этот сценарий проверяет транспорт, а не вход.
+                identity: Identity::None,
+                command: "",
+                stdin: "",
+                expect: &[
+                    "kex: algorithm: curve25519-sha256",
+                    "kex: host key algorithm: ssh-ed25519",
+                    "chacha20-poly1305@openssh.com",
+                    // Аутентификация обязана быть отвергнута, и здесь это
+                    // успех сценария: отказ означает, что зашифрованный канал
+                    // работает и по нему прошёл разбор сообщений.
+                    //
+                    // На живой системе она отвергается **всегда**, кем бы ни
+                    // был клиент: учётных записей на образе initrd нет, а
+                    // класть их туда нельзя — этот образ уезжает в выпуск.
+                    "Authentications that can continue: publickey",
+                ],
+                absent: &[],
+                timeout_ms: 60_000,
+            }),
+            // И гость называет причину своими словами.
+            Step::AwaitAny("sshd: no account file here, so nobody can log in", 30_000),
+
+            // Гость видел то же самое со своей стороны.
+            Step::AwaitAny("sshd: encrypted, curve25519-sha256 with chacha20-poly1305", 30_000),
+            Step::AwaitAny("sshd: service accepted", 15_000),
+
             Step::Absent("KERNEL PANIC"),
         ],
     },
