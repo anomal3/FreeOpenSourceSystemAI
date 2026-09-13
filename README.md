@@ -23,6 +23,7 @@ written down in the source, in Russian, next to the code that resulted from it.
 | **Filesystem** | ext2, read and written by us — created, verified and repaired from inside the system (`fsck`) |
 | **Desktop** | Framebuffer compositor: antialiased proportional type, rounded translucent windows, a floating taskbar, start menu, terminal, file manager — in a dark and a light theme. A program can ask for **a window of its own**: it draws straight into mapped pixels and reads its own keys and clicks — the system monitor is exactly that, a program outside the kernel |
 | **Userspace** | ELF programs in ring 3 / EL0, one address space each, preemptive scheduling, pipes, `mode`/`uid`/`gid` enforced, memory on request (`mmap`) in 4 KiB or 2 MiB pages, files mapped into memory and paged in on demand, and a **versioned syscall contract** — `dup`, `fstat`, `isatty`, `poll`, clocks and CPU time, frozen by tests that name every number |
+| **Settings** | Timezone, theme, and a static address are set in a window and survive a reboot — written to `/etc` on the state partition, applied at the next boot before any service starts. Volumes and accounts are listed; the filesystem check runs from there |
 | **C and a toolchain** | A picolibc port and a cross toolchain: `x86_64-freeos-cc hello.c -o hello` produces a program that runs. **zlib 1.3.1 builds from its own `configure`, unpatched, for both architectures** — and the result works: 18 000 bytes compress to 123 and come back byte-identical, inside the system |
 | **Network** | Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP with all eleven states, TLS 1.3 with X.509 |
 | **SSH** | A real OpenSSH client logs in with a key and runs programs from `/bin` as the account that logged in |
@@ -180,6 +181,7 @@ crates/disk/         GPT and a FAT32 formatter          crates/ext2/  the ext2 f
 crates/ssh/          Packets, curve25519, chacha20-poly1305, public-key login
 crates/mini-ui/      Surfaces, 8x8 text, widgets        crates/installer/  the installer
 crates/freeos-cc/    Build rules for C, and the x86_64-freeos-cc wrapper itself
+crates/sysconf/      The key=value files in /etc -- parsed here so the tests can run
 libc/                The OS layer under picolibc, crt0, and example programs
 crates/kernel/
   src/mm/            Frames, page tables, heap, DMA arena

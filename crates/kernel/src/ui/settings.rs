@@ -38,13 +38,21 @@ use mini_ui::{Color, Rect, Surface};
 use mini_ui::paint::{self, Ctx, RowState, Tone, Weight};
 use mini_ui::theme;
 use crate::input::KeyCode;
-use crate::{arch, config, fs};
+use crate::{arch, config, fs, kprintln};
 
 /// Разделы окна — порядок сверху вниз.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     /// Экран: режим, тема, масштаб.
     Display,
+    /// Часовой пояс и то, который сейчас час.
+    Clock,
+    /// Адрес машины: получать по DHCP или задать постоянный.
+    Network,
+    /// Тома, свободное место и проверка файловой системы.
+    Disks,
+    /// Кто может входить в эту систему.
+    Users,
     /// Что установлено пакетами.
     Programs,
     /// Откуда система берёт обновления и что с ними делать.
@@ -54,8 +62,12 @@ enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 4] = [
+    const ALL: [Section; 8] = [
         Section::Display,
+        Section::Clock,
+        Section::Network,
+        Section::Disks,
+        Section::Users,
         Section::Programs,
         Section::Updates,
         Section::System,
@@ -64,6 +76,10 @@ impl Section {
     const fn title(self) -> &'static str {
         match self {
             Section::Display => "Экран",
+            Section::Clock => "Дата и время",
+            Section::Network => "Сеть",
+            Section::Disks => "Диски",
+            Section::Users => "Пользователи",
             Section::Programs => "Пакеты",
             Section::Updates => "Обновление",
             Section::System => "О системе",
@@ -73,13 +89,15 @@ impl Section {
     /// Значок раздела.
     ///
     /// Разделов ровно столько, сколько в системе есть того, что они
-    /// настраивают. [`Icon`] знает и «Ввод», и «Диски», и «Сеть», и «Службы», но
-    /// строка бокового списка без содержимого за ней — это обещание, которого
-    /// окно не выполнит; серым такой раздел рисуется тогда, когда он появится, а
-    /// драйвера под ним на этой машине не окажется.
+    /// настраивают. Строка бокового списка без содержимого за ней — это
+    /// обещание, которого окно не выполнит.
     const fn icon(self) -> Icon {
         match self {
             Section::Display => Icon::Display,
+            Section::Clock => Icon::Clock,
+            Section::Network => Icon::Network,
+            Section::Disks => Icon::Disk,
+            Section::Users => Icon::User,
             Section::Programs => Icon::Package,
             Section::Updates => Icon::Update,
             Section::System => Icon::Info,
@@ -88,12 +106,16 @@ impl Section {
 
     /// Есть ли за разделом то, что он настраивает.
     ///
-    /// Пока всегда да: все четыре раздела опираются на то, что в ядре уже есть.
-    /// Признак заведён не про запас, а потому что цвет недоступной строки —
-    /// часть словаря бокового списка, и вводить его вместе с первым же разделом
-    /// без драйвера значило бы менять раскладку и палитру одной правкой.
-    const fn available(self) -> bool {
-        true
+    /// Признак завёлся не про запас: «Сеть» на машине без сетевой карты — это
+    /// ровно тот случай, ради которого серый цвет в словаре бокового списка и
+    /// существует. Раздел при этом не прячется: спрятанный раздел выглядит как
+    /// «в этой системе нет настроек сети», а серый — как «в этой машине нет
+    /// сетевой карты», и это разные утверждения.
+    fn available(self) -> bool {
+        match self {
+            Section::Network => crate::net::is_present(),
+            _ => true,
+        }
     }
 }
 
@@ -123,6 +145,18 @@ enum Deed {
     Mode(u32, u32),
     /// Перейти на тёмную (`true`) или светлую тему.
     Theme(bool),
+    /// Выбрать часовой пояс — смещение от UTC в минутах.
+    Timezone(i32),
+    /// Вернуть адрес во власть DHCP.
+    NetDhcp,
+    /// Перейти к правке постоянного адреса.
+    NetStatic,
+    /// Встать в поле ввода: адрес или шлюз.
+    NetEdit(Field),
+    /// Применить набранное и записать в `/etc/network.cfg`.
+    NetApply,
+    /// Проверить файловые системы.
+    CheckDisks,
     /// Запустить `sysupdate`.
     CheckUpdates,
     /// Показать, что можно поставить.
@@ -136,6 +170,79 @@ enum Deed {
     /// Вернуться к списку установленного.
     BackToList,
 }
+
+/// Какое из двух полей раздела «Сеть» правится.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Field {
+    /// Адрес с длиной префикса: `10.0.2.15/24`.
+    Address,
+    /// Шлюз: `10.0.2.2`. Пустой — «шлюза нет».
+    Gateway,
+}
+
+/// Поля ввода раздела «Сеть».
+///
+/// # Почему ввод ограничен цифрами, точкой и косой
+///
+/// Не из осторожности, а потому что клавиатура ядра отдаёт **позицию клавиши**,
+/// а не символ ([`KeyCode`]): чтобы получить букву, нужна раскладка, а раскладок
+/// в системе две и выбираются они в установщике. Адрес состоит из цифр, точек и
+/// одной косой — эти клавиши на всех раскладках стоят на одном месте, и никакой
+/// таблицы для них не требуется. Поле, принимающее буквы, пришлось бы отложить
+/// до фазы с раскладками; поле, принимающее адрес, работает сегодня.
+///
+/// Цена названа: имя узла отсюда не задать. Оно и не задаётся — DNS-имя себе
+/// система не присваивает.
+#[derive(Clone)]
+struct NetDraft {
+    address: String,
+    gateway: String,
+    /// В каком поле каретка. `None` — ни в каком, клавиши уходят разделам.
+    editing: Option<Field>,
+}
+
+impl NetDraft {
+    /// Начальное содержимое — то, что у машины сейчас.
+    ///
+    /// Не пустые поля: человек, открывший раздел, чаще уточняет адрес, чем
+    /// придумывает его с нуля, а пустое поле вдобавок не показывает, какого
+    /// вида ответ от него ждут.
+    fn current() -> Self {
+        let (address, gateway) = match crate::net::status() {
+            Some(status) if !status.address.is_unspecified() => (
+                format!("{}/{}", status.address, status.netmask.prefix().unwrap_or(24)),
+                if status.gateway.is_unspecified() {
+                    String::new()
+                } else {
+                    format!("{}", status.gateway)
+                },
+            ),
+            _ => (String::new(), String::new()),
+        };
+        Self { address, gateway, editing: None }
+    }
+
+    fn text(&self, field: Field) -> &str {
+        match field {
+            Field::Address => &self.address,
+            Field::Gateway => &self.gateway,
+        }
+    }
+
+    fn text_mut(&mut self, field: Field) -> &mut String {
+        match field {
+            Field::Address => &mut self.address,
+            Field::Gateway => &mut self.gateway,
+        }
+    }
+}
+
+/// Наибольшая длина того, что можно набрать в поле адреса.
+///
+/// `255.255.255.255/32` — восемнадцать знаков; предел вдвое больше, чтобы
+/// опечатка не упиралась молча в конец строки, но строка в куче не росла от
+/// зажатой клавиши.
+const FIELD_LIMIT: usize = 36;
 
 /// Чем занят раздел «Пакеты».
 ///
@@ -192,6 +299,8 @@ pub struct SettingsView {
     on_sections: bool,
     /// Чем занят раздел «Пакеты».
     programs: Programs,
+    /// Что набрано в разделе «Сеть».
+    net: NetDraft,
     /// Тема сменилась, и перекрасить пора весь стол.
     theme_changed: bool,
 }
@@ -206,6 +315,7 @@ impl SettingsView {
             screen,
             on_sections: true,
             programs: Programs::List,
+            net: NetDraft::current(),
             theme_changed: false,
         }
     }
@@ -256,6 +366,10 @@ impl SettingsView {
     fn about(&self) -> String {
         match (self.current(), &self.programs) {
             (Section::Display, _) => "Разрешение, тема и масштаб рабочего стола.".to_string(),
+            (Section::Clock, _) => "Который сейчас час и от чего его отсчитывать.".to_string(),
+            (Section::Network, _) => "Адрес этой машины: спрашивать или задать.".to_string(),
+            (Section::Disks, _) => "Что смонтировано и в каком это состоянии.".to_string(),
+            (Section::Users, _) => "Кто может входить в эту систему.".to_string(),
             (Section::Programs, Programs::List) => {
                 "Что установлено на этой машине и что можно поставить.".to_string()
             }
@@ -305,6 +419,24 @@ impl SettingsView {
                     out.push(Deed::BackToList);
                 }
             },
+            Section::Clock => {
+                for minutes in crate::time::TIMEZONES {
+                    out.push(Deed::Timezone(minutes));
+                }
+            }
+            Section::Network => {
+                out.push(Deed::NetDhcp);
+                out.push(Deed::NetStatic);
+                out.push(Deed::NetEdit(Field::Address));
+                out.push(Deed::NetEdit(Field::Gateway));
+                out.push(Deed::NetApply);
+            }
+            Section::Disks => out.push(Deed::CheckDisks),
+            // Список учётных записей — чтение, и действий у него нет. Заводить
+            // их здесь значило бы обещать создание пользователя, которого в
+            // системе нет ни в каком виде: пароль умеет хешировать только
+            // установщик. См. пояснение в `draw_users`.
+            Section::Users => {}
             Section::Updates => out.push(Deed::CheckUpdates),
             Section::System => {}
         }
@@ -318,6 +450,18 @@ impl SettingsView {
     /// кнопку, которая ничего не делает.
     fn buttons(&self) -> Vec<(Deed, &'static str, Weight)> {
         let mut out = Vec::new();
+        // «Применить» у сети — в подвале, и это не украшение. Содержимое раздела
+        // высокое (карточка состояния, выбор источника, два поля), и кнопка,
+        // нарисованная под ними, оказывалась за нижним краем окна: клавиатурой
+        // достижима, мышью — нет вовсе. Подвал прижат к низу и виден всегда.
+        //
+        // Она же — единственное действие в окне, которое не срабатывает сразу:
+        // адрес меняется под тем, кто сидит по сети, и промах мимо строки не
+        // должен обрывать ему соединение.
+        if self.current() == Section::Network {
+            out.push((Deed::NetApply, "Применить", Weight::Primary));
+            return out;
+        }
         if self.current() != Section::Programs {
             return out;
         }
@@ -338,6 +482,16 @@ impl SettingsView {
 
     /// Разобрать клавишу. `true` — окно её использовало.
     pub fn handle(&mut self, code: KeyCode) -> bool {
+        // Поле ввода забирает клавиши целиком, и это не жадность: стрелка вниз
+        // внутри поля обязана оставаться стрелкой вниз для списка разделов, но
+        // цифра обязана попасть в поле, а не выбрать пункт с этим номером. Раз
+        // граница проходит по клавишам, а не по областям окна, разбирать её
+        // надо здесь и до всего остального.
+        if let Some(field) = self.net.editing {
+            if self.type_into(field, code) {
+                return true;
+            }
+        }
         match code {
             KeyCode::Up => {
                 if self.on_sections {
@@ -393,6 +547,53 @@ impl SettingsView {
         }
     }
 
+    /// Набрать знак в поле. `true` — клавиша использована полем.
+    ///
+    /// Возвращает `false` на всём, чего в адресе быть не может, — и тогда
+    /// клавиша достаётся окну как обычно. Так стрелки и Tab продолжают ходить
+    /// по разделам, не выходя из поля: человек, набравший половину адреса и
+    /// заглянувший в соседний раздел, возвращается к своей половине.
+    fn type_into(&mut self, field: Field, code: KeyCode) -> bool {
+        let digit = match code {
+            KeyCode::Digit0 => Some('0'),
+            KeyCode::Digit1 => Some('1'),
+            KeyCode::Digit2 => Some('2'),
+            KeyCode::Digit3 => Some('3'),
+            KeyCode::Digit4 => Some('4'),
+            KeyCode::Digit5 => Some('5'),
+            KeyCode::Digit6 => Some('6'),
+            KeyCode::Digit7 => Some('7'),
+            KeyCode::Digit8 => Some('8'),
+            KeyCode::Digit9 => Some('9'),
+            KeyCode::Period => Some('.'),
+            KeyCode::Slash => Some('/'),
+            _ => None,
+        };
+        if let Some(ch) = digit {
+            let text = self.net.text_mut(field);
+            if text.len() < FIELD_LIMIT {
+                text.push(ch);
+            }
+            self.report = None;
+            return true;
+        }
+        match code {
+            KeyCode::Backspace => {
+                self.net.text_mut(field).pop();
+                self.report = None;
+                true
+            }
+            // Enter из поля — не «применить», а «поле готово». Применение
+            // отдельной кнопкой намеренно: адрес меняется под тем, кто сидит по
+            // сети, и лишний Enter не должен обрывать ему соединение.
+            KeyCode::Enter | KeyCode::Escape => {
+                self.net.editing = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Щелчок по окну: координаты внутри области содержимого.
     ///
     /// Возвращает `true`, если щелчок что-то изменил и окно надо перерисовать.
@@ -425,6 +626,67 @@ impl SettingsView {
         }
     }
 
+    /// Применить набранный адрес и записать его.
+    ///
+    /// Порядок обязателен: сначала **применить**, потом записать. Записанный и
+    /// не применённый адрес — это файл, который заработает после перезагрузки,
+    /// и человек, набравший опечатку, узнает о ней не сейчас, а тогда, когда
+    /// машина уже недоступна. Применённый первым отказывает немедленно и
+    /// говорит, чем именно плох.
+    fn apply_network(&mut self) {
+        use crate::net::ipv4::Ipv4;
+        use crate::net::persist::{Mode, Settings};
+
+        let address = self.net.address.trim().to_string();
+        let Some((host, bits)) = address.split_once('/') else {
+            self.report = Some(Report::bad(String::from(
+                "адрес пишется с длиной префикса: 10.0.2.15/24",
+            )));
+            return;
+        };
+        let (Some(host), Ok(bits)) = (Ipv4::parse(host), bits.parse::<u32>()) else {
+            self.report = Some(Report::bad(format!("это не адрес: {address}")));
+            return;
+        };
+        let Some(netmask) = Ipv4::from_prefix(bits) else {
+            self.report = Some(Report::bad(format!("префикс — от 0 до 32 бит, а не {bits}")));
+            return;
+        };
+        let gateway_text = self.net.gateway.trim().to_string();
+        let gateway = if gateway_text.is_empty() {
+            Ipv4::UNSPECIFIED
+        } else {
+            match Ipv4::parse(&gateway_text) {
+                Some(gateway) => gateway,
+                None => {
+                    self.report = Some(Report::bad(format!("это не шлюз: {gateway_text}")));
+                    return;
+                }
+            }
+        };
+
+        if let Err(err) = crate::net::configure(host, netmask, gateway) {
+            self.report = Some(Report::bad(format!("адрес не принят: {err}")));
+            return;
+        }
+        // Сервер имён сохраняется тот, что есть: спрашивать его отдельным полем
+        // незачем — он приезжает с арендой, а при постоянном адресе остаётся
+        // тем, который уже работает. Ноль здесь означает «не знаем», и таким он
+        // в файл и уедет.
+        let dns = crate::net::dns_server().unwrap_or(Ipv4::UNSPECIFIED);
+        let settings = Settings { mode: Mode::Static, address: host, netmask, gateway, dns };
+        self.net.editing = None;
+        self.report = Some(match crate::net::persist::store(&settings) {
+            Ok(()) => {
+                kprintln!("  settings    : address {host}/{bits} static, saved");
+                Report::ok(format!("адрес {host}/{bits} применён и запомнен"))
+            }
+            // Применён, но не записан — состояние, о котором обязано быть
+            // сказано вслух: оно работает ровно до выключения.
+            Err(err) => Report::bad(format!("{host}/{bits} применён, но не записан: {err}")),
+        });
+    }
+
     /// Выполнить выбранный пункт.
     fn activate(&mut self) {
         let Some(deed) = self.deeds().into_iter().nth(self.action) else {
@@ -449,7 +711,95 @@ impl SettingsView {
                 if theme::set_dark(dark) {
                     self.theme_changed = true;
                 }
+                // Записывается всегда, а не только при смене: человек, нажавший
+                // на уже выбранную тему после отказа записи, вправе ожидать
+                // второй попытки, а не молчания.
+                self.report = Some(match super::prefs::store_theme(dark) {
+                    Ok(()) => {
+                        // В журнал, а не только в окно: снимок экрана
+                        // доказательством не считается, и «тема запомнена»
+                        // проверяется стендом по этой строке.
+                        kprintln!(
+                            "  settings    : theme {} saved",
+                            if dark { "dark" } else { "light" }
+                        );
+                        Report::ok(String::from("тема запомнена"))
+                    }
+                    Err(err) => Report::bad(format!("тема применена, но не запомнена: {err}")),
+                });
+            }
+            Deed::Timezone(minutes) => {
+                let text = crate::time::zone_text(minutes);
+                self.report = Some(match crate::time::set_timezone(minutes) {
+                    Ok(()) => Report::ok(format!("часовой пояс {text} применён и запомнен")),
+                    Err(err) => Report::bad(format!("{text} не записан: {err}")),
+                });
+            }
+            Deed::NetDhcp => {
+                self.report = Some(match crate::net::persist::forget() {
+                    // Адрес не сбрасывается: он ещё работает, и обрывать связь
+                    // раньше, чем её восстановит DHCP, значит отнимать у
+                    // человека дорогу назад. Аренду возьмёт служба при
+                    // следующей загрузке — об этом и сказано.
+                    Ok(true) => {
+                        kprintln!("  settings    : address back to DHCP, /etc/network.cfg removed");
+                        Report::ok(String::from(
+                            "адрес будет получаться по DHCP со следующего запуска",
+                        ))
+                    }
+                    Ok(false) => Report::ok(String::from("адрес и так получается по DHCP")),
+                    Err(err) => Report::bad(format!("не записано: {err}")),
+                });
+            }
+            Deed::NetStatic => {
+                // Не действие, а переход к правке: заполняем поля тем, что у
+                // машины сейчас, и встаём в первое.
+                self.net = NetDraft::current();
+                self.net.editing = Some(Field::Address);
                 self.report = None;
+            }
+            Deed::NetEdit(field) => {
+                self.net.editing = Some(field);
+                self.report = None;
+            }
+            Deed::NetApply => self.apply_network(),
+            Deed::CheckDisks => {
+                // Только проверка, без починки, и это не половина работы.
+                // Чинить том, смонтированный на запись, нельзя: редактор
+                // держит счётчики блоков в памяти, и `fsck`, поправивший их на
+                // диске, разойдётся с ним молча. Ровно то же сказано в
+                // `shell.rs` у команды `fsck`.
+                let mut problems = 0usize;
+                let mut volumes = 0usize;
+                for (point, result) in crate::fs::check_all() {
+                    match result {
+                        Some(Ok(summary)) => {
+                            volumes += 1;
+                            // Не поместившиеся в список находки считаются тоже:
+                            // «замечаний нет» на томе, где их было слишком
+                            // много, чтобы перечислить, — самый вредный из
+                            // возможных ответов.
+                            problems += summary.problems.len() + summary.dropped;
+                            kprintln!(
+                                "  settings    : fsck {point}: {} problem(s)",
+                                summary.problems.len() + summary.dropped
+                            );
+                        }
+                        Some(Err(err)) => {
+                            volumes += 1;
+                            problems += 1;
+                            kprintln!("  settings    : fsck {point}: {err}");
+                        }
+                        None => {}
+                    }
+                }
+                self.report = Some(if problems == 0 {
+                    Report::ok(format!("проверено томов: {volumes}, замечаний нет"))
+                } else {
+                    Report::bad(format!(
+                        "замечаний: {problems}. Починить можно только при загрузке"
+                    ))
+                });
             }
             // Окно не качает обновление само и не ждёт его: `sysupdate` —
             // программа третьего кольца, у неё сеть, TLS и запись в раздел.
@@ -654,6 +1004,10 @@ impl SettingsView {
 
         match self.current() {
             Section::Display => self.draw_display(pass, main, y),
+            Section::Clock => self.draw_clock(pass, main, y),
+            Section::Network => self.draw_network(pass, main, y),
+            Section::Disks => self.draw_disks(pass, main, y),
+            Section::Users => Self::draw_users(pass, main, y),
             Section::Programs => self.draw_programs(pass, main, y),
             Section::Updates => self.draw_updates(pass, main, y),
             Section::System => self.draw_system(pass, main, y),
@@ -776,6 +1130,262 @@ impl SettingsView {
             y + ctx.px(16) as i32,
             main.w,
             "Режим экрана применяется при следующем запуске.",
+        );
+    }
+
+    /// Раздел «Дата и время».
+    ///
+    /// Часы показываются, но не задаются, и это не недоделка. Время система
+    /// однажды прочитала у прошивки (UEFI `GetTime` до выхода из boot services),
+    /// а обратной операции после выхода не существует — писать в RTC напрямую
+    /// значило бы завести драйвер часов на каждую машину отдельно. Поэтому
+    /// раздел настраивает то единственное, что здесь настраивается: сдвиг.
+    fn draw_clock(&self, pass: &mut Pass, main: Rect, y: i32) {
+        let ctx = pass.ctx;
+        let now = crate::time::now_local();
+        // Две строки, а не три: «по Гринвичу» выводится из местного времени и
+        // смещения, которые тут же рядом, и место в окне стоит дороже, чем
+        // избавление читателя от вычитания.
+        let rows = [
+            (
+                "Местное время".to_string(),
+                now.map_or_else(|| "часов нет".to_string(), |t| format!("{t}")),
+            ),
+            ("Смещение".to_string(), crate::time::offset_text()),
+        ];
+        let y = fact_card(pass, main, y, "ЧАСЫ", &rows);
+
+        // Список в два столбца: тринадцать поясов в одну колонку — это четыреста
+        // точек, то есть больше, чем остаётся под содержимое. Столбцы, а не
+        // прокрутка: прокрутка требует полосы, колеса и памяти о положении, а
+        // тринадцать строк — это семь строк в два ряда.
+        let row_h = ctx.px(30);
+        let gap = ctx.px(2);
+        let column_gap = ctx.px(8);
+        let zones = crate::time::TIMEZONES;
+        let rows_count = zones.len().div_ceil(2) as u32;
+        let column_w = ctx.px(150);
+        let list_w = (column_w * 2 + column_gap).min(main.w);
+        let list_h = row_h * rows_count + gap * rows_count.saturating_sub(1);
+        let (list, next) = setting(
+            pass,
+            main,
+            y,
+            "Часовой пояс",
+            "Применяется сразу и запоминается.",
+            (list_w, list_h),
+        );
+        let current = crate::time::offset_minutes();
+        for (index, minutes) in zones.iter().enumerate() {
+            // Заполняется **по столбцам**, сверху вниз и слева направо: так
+            // порядок на экране совпадает с порядком, по которому ходят стрелки
+            // клавиатуры. Заполнение по строкам развело бы их, и стрелка вниз
+            // прыгала бы через полсписка.
+            let column = index as u32 / rows_count;
+            let row = index as u32 % rows_count;
+            let rect = Rect::new(
+                list.x + (column * (column_w + column_gap)) as i32,
+                list.y + (row * (row_h + gap)) as i32,
+                column_w,
+                row_h,
+            );
+            let focused = pass.deed(rect, Deed::Timezone(*minutes));
+            if !pass.visible(rect) {
+                continue;
+            }
+            choice_row(pass, rect, &crate::time::zone_text(*minutes), *minutes == current, focused);
+        }
+
+        pass.note(
+            main.x,
+            next + ctx.px(8) as i32,
+            main.w,
+            "Часы идут от прошивки: перевести их эта система не умеет.",
+        );
+    }
+
+    /// Раздел «Сеть».
+    fn draw_network(&self, pass: &mut Pass, main: Rect, y: i32) {
+        let ctx = pass.ctx;
+        let Some(status) = crate::net::status() else {
+            pass.note(main.x, y, main.w, "В этой машине нет сетевой карты.");
+            return;
+        };
+
+        // Четыре строки, не пять: «что записано» видно ниже по отметке «СЕЙЧАС»
+        // в списке выбора, и повторять это карточкой значит занимать высоту,
+        // которой не хватает полю шлюза.
+        let rows = [
+            (
+                "Аппаратный адрес".to_string(),
+                format!("{}", crate::net::eth::Display(status.mac)),
+            ),
+            (
+                "Адрес".to_string(),
+                if status.address.is_unspecified() {
+                    "пока нет".to_string()
+                } else {
+                    format!("{}/{}", status.address, status.netmask.prefix().unwrap_or(0))
+                },
+            ),
+            (
+                "Шлюз".to_string(),
+                if status.gateway.is_unspecified() {
+                    "нет".to_string()
+                } else {
+                    format!("{}", status.gateway)
+                },
+            ),
+            (
+                "Сервер имён".to_string(),
+                if status.dns.is_unspecified() {
+                    "нет".to_string()
+                } else {
+                    format!("{}", status.dns)
+                },
+            ),
+        ];
+        let y = fact_card(pass, main, y, "СЕЙЧАС", &rows);
+
+        // ── Откуда брать адрес ───────────────────────────────────────────────
+        let row_h = ctx.px(30);
+        let gap = ctx.px(2);
+        let list_w = ctx.px(260).min(main.w);
+        let (list, mut y) = setting(
+            pass,
+            main,
+            y,
+            "Откуда адрес",
+            "Выбор запоминается на разделе состояния.",
+            (list_w, row_h * 2 + gap),
+        );
+        let is_static = matches!(
+            crate::net::persist::load().map(|settings| settings.mode),
+            Some(crate::net::persist::Mode::Static)
+        );
+        for (index, (deed, label, chosen)) in [
+            (Deed::NetDhcp, "Получать автоматически (DHCP)", !is_static),
+            (Deed::NetStatic, "Постоянный адрес", is_static),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rect = Rect::new(
+                list.x,
+                list.y + (index as u32 * (row_h + gap)) as i32,
+                list.w,
+                row_h,
+            );
+            let focused = pass.deed(rect, deed);
+            if pass.visible(rect) {
+                choice_row(pass, rect, label, chosen, focused);
+            }
+        }
+
+        // ── Поля ─────────────────────────────────────────────────────────────
+        let field_h = ctx.px(30);
+        let field_w = ctx.px(200).min(main.w);
+        for (field, label, note) in [
+            (
+                Field::Address,
+                "Адрес и префикс",
+                "Например 10.0.2.15/24. Цифры, точка и косая.",
+            ),
+            (Field::Gateway, "Шлюз", "Пусто — шлюза нет."),
+        ] {
+            let (slot, next) = setting(pass, main, y, label, note, (field_w, field_h));
+            let focused = pass.deed(slot, Deed::NetEdit(field));
+            if pass.visible(slot) {
+                let active = self.net.editing == Some(field);
+                text_field(pass, slot, self.net.text(field), active, focused);
+            }
+            y = next;
+        }
+        // Кнопка «Применить» рисуется в подвале окна, а не здесь — см.
+        // [`SettingsView::buttons`]. Подвал прижат к низу и виден всегда, а
+        // содержимое раздела кончается там, где кончается место.
+        let _ = y;
+    }
+
+    /// Раздел «Диски».
+    fn draw_disks(&self, pass: &mut Pass, main: Rect, y: i32) {
+        let ctx = pass.ctx;
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for (point, kind) in crate::fs::mounted() {
+            // У корня приставка пустая — так его и хранит таблица монтирования,
+            // потому что она приписывается к пути слева. Строка с пустым именем
+            // выглядит как потерянная запись, поэтому корень называется здесь
+            // тем, чем его называет человек.
+            let point = if point.is_empty() { "/" } else { point };
+            rows.push((point.to_string(), kind.to_string()));
+        }
+        if rows.is_empty() {
+            rows.push(("—".to_string(), "ничего не смонтировано".to_string()));
+        }
+        // «Точки», а не «тома», и разница не словесная: пять из шести строк
+        // ниже — ветки **одного** раздела состояния, и назвать их томами
+        // значило бы обещать шесть дисков там, где их два. Сколько на самом
+        // деле томов, говорит проверка: она обходит каждый по разу.
+        let y = fact_card(pass, main, y, "ТОЧКИ МОНТИРОВАНИЯ", &rows);
+
+        let button_h = ctx.px(30);
+        let button_w = paint::chip_width(ctx, "Проверить файловые системы") + ctx.px(28);
+        let (slot, next) = setting(
+            pass,
+            main,
+            y,
+            "Проверка",
+            "Только чтение: чинить том под работающей системой нельзя.",
+            (button_w.min(main.w), button_h),
+        );
+        let focused = pass.deed(slot, Deed::CheckDisks);
+        if pass.visible(slot) {
+            pass.on(|s| {
+                paint::button(ctx, s, slot, Weight::Normal, "Проверить файловые системы", focused);
+            });
+        }
+
+        pass.note(
+            main.x,
+            next + ctx.px(8) as i32,
+            main.w,
+            "Найденное чинит проверка при загрузке — том тогда ещё никто не правит.",
+        );
+    }
+
+    /// Раздел «Пользователи».
+    ///
+    /// Только список, и это названо в самом окне, а не спрятано. Завести
+    /// пользователя отсюда нельзя, потому что пароль в этой системе умеет
+    /// хешировать ровно один код — установщика, — и он живёт вне ядра. Кнопка
+    /// «Добавить», открывающая окно, которое ничего не создаёт, была бы хуже
+    /// отсутствующей кнопки.
+    fn draw_users(pass: &mut Pass, main: Rect, y: i32) {
+        let rows = accounts();
+        let mut cards: Vec<(String, String)> = Vec::new();
+        for (name, uid, gid) in &rows {
+            cards.push((name.clone(), format!("uid {uid}, gid {gid}")));
+        }
+        if cards.is_empty() {
+            cards.push((
+                "—".to_string(),
+                "учётных записей нет: система загружена с носителя".to_string(),
+            ));
+        }
+        let mut y = fact_card(pass, main, y, "УЧЁТНЫЕ ЗАПИСИ", &cards);
+
+        let session = crate::user::session::credentials();
+        let name = crate::user::session::with_name(|name| name.to_string());
+        y = fact_card(pass, main, y, "ЭТОТ СЕАНС", &[(
+            name,
+            format!("uid {}, gid {}", session.uid, session.gid),
+        )]);
+
+        pass.note(
+            main.x,
+            y + pass.ctx.px(8) as i32,
+            main.w,
+            "Учётные записи заводит установщик: хешировать пароль умеет только он.",
         );
     }
 
@@ -1201,6 +1811,118 @@ fn setting(
 /// Значение стоит во второй колонке, а не прижато к правому краю: длинный
 /// список смонтированного, выровненный вправо, наезжал бы на собственную
 /// подпись, и обрезать пришлось бы не хвост, а начало.
+/// Строка списка, из которого выбирают одно.
+///
+/// Отдельной функцией, потому что таких списков стало четыре — разрешения,
+/// пояса, откуда брать адрес — и переписанная в каждом разметка разошлась бы
+/// первой же правкой отступа. Отметка «СЕЙЧАС» здесь та же, что у разрешений, и
+/// это не совпадение: одинаковый смысл обязан выглядеть одинаково.
+fn choice_row(pass: &mut Pass, rect: Rect, label: &str, current: bool, focused: bool) {
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    let state = if current {
+        RowState::Selected
+    } else if focused {
+        RowState::Hover
+    } else {
+        RowState::Idle
+    };
+    pass.on(|s| paint::row(ctx, s, rect, state));
+    if focused && current {
+        pass.on(|s| draw::rounded_stroke(s, rect, ctx.px(theme::R_ROW), p.acc, 255));
+    }
+    let ink = paint::row_ink(ctx, state);
+    let baseline = paint::baseline(ctx, Role::Mono, rect);
+    let chip_w = paint::chip_width(ctx, "СЕЙЧАС");
+    // Место под отметку резервируется только там, где она есть. Резервировать
+    // всегда было бы проще, но в узком столбце — а часовые пояса стоят в два
+    // столбца по 150 точек — это съедало бы две трети строки, и «UTC+05:30»
+    // обрезалось бы у каждого пояса, кроме выбранного.
+    let room = if current {
+        rect.w.saturating_sub(chip_w + ctx.px(28))
+    } else {
+        rect.w.saturating_sub(ctx.px(24))
+    };
+    pass.text_clipped(Role::Mono, rect.x + ctx.px(12) as i32, baseline, room, label, ink);
+    if current {
+        let chip = Rect::new(
+            rect.right() - (chip_w + ctx.px(8)) as i32,
+            rect.y + (rect.h as i32 - ctx.px(20) as i32) / 2,
+            chip_w,
+            ctx.px(20),
+        );
+        pass.on(|s| paint::chip(ctx, s, chip, "СЕЙЧАС", Tone::Accent));
+    }
+}
+
+/// Поле ввода с кареткой.
+///
+/// Каретка рисуется только у поля, в котором стоит ввод, и это единственное,
+/// чем оно отличается от соседнего: рамка у обоих одна. Мигания нет намеренно —
+/// мигающая каретка требует перерисовки по таймеру, то есть кадра в секунду на
+/// пустом месте, а у окна, живущего в ядре, кадр стоит дороже, чем у программы.
+fn text_field(pass: &mut Pass, rect: Rect, text: &str, active: bool, focused: bool) {
+    let ctx = pass.ctx;
+    let p = ctx.palette;
+    pass.on(|s| paint::sunk(ctx, s, rect, ctx.px(theme::R_ROW)));
+    if active || focused {
+        let ink = if active { p.acc } else { p.ink4 };
+        pass.on(|s| draw::rounded_stroke(s, rect, ctx.px(theme::R_ROW), ink, 255));
+    }
+    let baseline = paint::baseline(ctx, Role::Mono, rect);
+    let x = rect.x + ctx.px(10) as i32;
+    let room = rect.w.saturating_sub(ctx.px(24));
+    // Ширина берётся у шрифта, а не у отрисовки: рисование обрезает строку по
+    // месту, и каретка, поставленная по нарисованному, уезжала бы к левому краю
+    // ровно тогда, когда строка перестала помещаться.
+    let width = ctx.face(Role::Mono).width(text).min(room);
+    pass.text_clipped(Role::Mono, x, baseline, room, text, p.ink);
+    if active {
+        let caret = Rect::new(
+            x + width as i32 + ctx.px(1) as i32,
+            rect.y + ctx.px(6) as i32,
+            ctx.px(2),
+            rect.h.saturating_sub(ctx.px(12)),
+        );
+        pass.on(|s| s.fill(caret, p.acc));
+    }
+}
+
+/// Учётные записи из `/etc/passwd`: имя, uid, gid.
+///
+/// Читается мимо проверки прав по той же причине, что и в `user::session`:
+/// спрашивает ядро, а не программа, и файл `0640 root` иначе не открыть. Разбор
+/// свой и минимальный — нужны три поля из восьми, а хеш пароля не нужен вовсе и
+/// в окно не попадает.
+fn accounts() -> Vec<(String, u32, u32)> {
+    let Some((bytes, _)) = config::read("passwd", 8 * 1024) else {
+        return Vec::new();
+    };
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split(':');
+        let (Some(name), Some(uid), Some(gid)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(uid), Ok(gid)) = (uid.parse::<u32>(), gid.parse::<u32>()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        out.push((name.to_string(), uid, gid));
+    }
+    out
+}
+
 fn fact_card(pass: &mut Pass, area: Rect, y: i32, title: &str, rows: &[(String, String)]) -> i32 {
     let ctx = pass.ctx;
     let p = ctx.palette;

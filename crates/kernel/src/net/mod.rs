@@ -32,6 +32,7 @@ pub mod dns;
 pub mod eth;
 pub mod icmp;
 pub mod ipv4;
+pub mod persist;
 pub mod socket;
 pub mod stream;
 pub mod tcp;

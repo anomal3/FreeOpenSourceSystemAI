@@ -604,6 +604,7 @@ dependencies = [
  "mini-ui",
  "osupdate",
  "slots",
+ "sysconf",
  "usb-hid",
  "user-abi",
 ]
@@ -993,6 +994,10 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "sysconf"
+version = "0.3.0"
 
 [[package]]
 name = "time"

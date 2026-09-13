@@ -35,8 +35,8 @@
 #![no_main]
 
 use user_progs::{
-    NetConfig, NetInfo, bind, close_socket, connect, error, error_num, exit, netconf, netinfo,
-    recv_waiting, send_waiting, sleep_ms, socket, uptime_ms,
+    NetConfig, NetInfo, bind, close, close_socket, config_path, connect, error, error_num, exit,
+    netconf, netinfo, open, read, recv_waiting, send_waiting, sleep_ms, socket, uptime_ms,
 };
 
 /// Порт клиента.
@@ -110,6 +110,19 @@ fn renew_after(lease_seconds: u32) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
+    // Постоянный адрес старше аренды. Проверяется **первым делом**, до того как
+    // в сеть уйдёт хоть один кадр: DISCOVER, отправленный машиной с заданным
+    // адресом, — это не только лишний обмен, но и предложение от сервера,
+    // которое некому отклонить, то есть адрес, зря зарезервированный в чужой
+    // сети на время аренды.
+    //
+    // Уходим с нулём: это не падение службы, а её работа — увидеть, что делать
+    // нечего. Супервизор поднимать нас по кругу не должен.
+    if static_address_is_set() {
+        error("dhcp: a static address is configured, standing down\n");
+        exit(0);
+    }
+
     let mut info = NetInfo::default();
     if netinfo(&mut info) != 0 || info.present == 0 {
         // Карты нет — это не поломка службы, а свойство машины. Сказать и уйти
@@ -136,6 +149,39 @@ pub extern "C" fn _start() -> ! {
             }
         }
     }
+}
+
+/// Задан ли в `/etc/network.cfg` постоянный адрес.
+///
+/// Читается тот же файл и тем же соглашением, что у ядра
+/// (`crates/kernel/src/net/persist.rs`): сначала `/etc`, потом эталон в образе.
+/// Разбор здесь нарочно минимальный — нужен ответ «да или нет», а не настройки:
+/// применяет их ядро при загрузке, и второй разборщик разошёлся бы с первым.
+fn static_address_is_set() -> bool {
+    let Some(path) = config_path("network.cfg") else {
+        return false;
+    };
+    let fd = open(path.as_str());
+    if fd < 0 {
+        return false;
+    }
+    let mut buffer = [0u8; 512];
+    let got = read(fd, &mut buffer);
+    close(fd);
+    if got <= 0 {
+        return false;
+    }
+    let Ok(text) = core::str::from_utf8(&buffer[..got as usize]) else {
+        return false;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(value) = line.strip_prefix("mode=") else {
+            continue;
+        };
+        return value.trim().eq_ignore_ascii_case("static");
+    }
+    false
 }
 
 /// Что приехало в ACK.

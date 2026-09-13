@@ -47,6 +47,7 @@ pub mod context;
 pub mod icons;
 pub mod panel;
 pub mod pointer;
+pub mod prefs;
 pub mod settings;
 pub mod term;
 pub mod window;
@@ -106,6 +107,11 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
     };
 
     let scale = theme::geometry_scale(screen.width());
+    // Тема читается **до** создания композитора: палитра выбирается один раз,
+    // при сборке первого кадра, и тема, применённая после, потребовала бы
+    // перекрасить всё заново — то есть показать человеку вспышку чужого цвета
+    // на каждой загрузке.
+    prefs::adopt();
     // Буфер кадра — условие работы стола, а не украшение: без него собирать
     // картинку негде. Не хватило памяти — система работает в серийной линии,
     // ровно как на машине без фреймбуфера.
@@ -274,10 +280,17 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
         // показывало бы содержимое в щели между колонкой и краем.
         App::Settings => {
             let w = (width * 7 / 8).clamp(560, width.saturating_sub(margin).max(560));
-            let h = (work * 4 / 5).max(360);
+            // Девять десятых рабочей области, а не четыре пятых, и это не вкус.
+            // С фазы 48 разделов восемь, и у трёх из них содержимое высокое:
+            // список часовых поясов, два поля сети с подписями, перечень томов.
+            // На прежней высоте нижняя строка каждого из них уезжала за край —
+            // клавиатурой она достижима (попадания считаются независимо от
+            // видимости), а мышью нет вовсе. Раздел, которым нельзя
+            // воспользоваться мышью, — это раздел, о котором никто не узнает.
+            let h = (work * 9 / 10).max(360);
             Rect::new(
                 ((width.saturating_sub(w)) / 2) as i32,
-                (work / 12) as i32,
+                (work / 24) as i32,
                 w,
                 h,
             )
@@ -1303,9 +1316,19 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             desktop.close_context();
             let dark = !theme::is_dark();
             theme::set_dark(dark);
+            // Записывается здесь же, а не «когда-нибудь потом»: тема, выбранная
+            // из меню и не пережившая перезагрузку, — та же ошибка, что тема,
+            // выбранная из окна и не пережившая её. Отказ записи не отменяет
+            // смену: вид уже другой, и молчать о том, что он не запомнен,
+            // нельзя, а откатывать — значит спорить с человеком.
+            let saved = prefs::store_theme(dark);
             kprintln!(
-                "  desktop     : theme {}",
-                if dark { "dark" } else { "light" }
+                "  desktop     : theme {}{}",
+                if dark { "dark" } else { "light" },
+                match saved {
+                    Ok(()) => "",
+                    Err(_) => " (not saved: the root is read-only)",
+                }
             );
             desktop.restyle(status);
         }
