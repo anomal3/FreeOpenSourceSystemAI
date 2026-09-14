@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -651,5 +651,36 @@ fn controls_print_what_winforms_prints() {
     let (result, output) = run_with(CONTROLS, "controls.dll", &["self-test"]);
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, CONTROLS_OUTPUT);
+    assert_eq!(code, 0);
+}
+
+/// Образец `tools/dotnet/samples/lists` (фаза N7b): список и выпадающий список
+/// из дизайнера.
+const LISTS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/lists.dll");
+
+/// Что печатает `dotnet lists.dll self-test` (записано 2026-09-15, .NET 10,
+/// WinForms на Windows, LF): выбор при вставке, удалении и сортировке строк.
+const LISTS_OUTPUT: &str = concat!(
+    "shown: 3 -1 One False | 3 -1 DropDownList ''\n",
+    "list: 1 Oslo | Moscow,Oslo,Paris\n",
+    "after insert: 2 Oslo\n",
+    "find: 3 2 -1 4 False\n",
+    "list: -1 null | Berlin,Moscow,Paris,Tokyo\n",
+    "after remove: -1\n",
+    "list: 2 Paris | Berlin,Moscow,Paris,Tokyo\n",
+    "sorted: Berlin,Moscow,Paris,Tokyo 2\n",
+    "list: -1 null | Moscow,Paris,Tokyo\n",
+    "combo: 2 Large 'Large' | Small,Medium,Large\n",
+    "combo: 0 Small 'Small' | Small,Medium,Large\n",
+    "combo text: 'Small' 0\n",
+    "cleared: -1 '' 3\n",
+    "range: ArgumentOutOfRangeException\n",
+);
+
+#[test]
+fn lists_print_what_winforms_prints() {
+    let (result, output) = run_with(LISTS, "lists.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, LISTS_OUTPUT);
     assert_eq!(code, 0);
 }

@@ -626,6 +626,21 @@ namespace System.Windows.Forms
         {
         }
 
+        // Левый верхний угол элемента в точках окна формы.
+        internal Point OriginInForm()
+        {
+            int ox = 0;
+            int oy = 0;
+            Control control = this;
+            while (control != null && !(control is Form))
+            {
+                ox += control.x;
+                oy += control.y;
+                control = control.Parent;
+            }
+            return new Point(ox, oy);
+        }
+
         public Form FindForm()
         {
             Control control = this;
@@ -1006,6 +1021,10 @@ namespace System.Windows.Forms
 
         internal bool NeedsPaint { get; set; }
 
+        // Открытый выпадающий список (фаза N7b): рисуется поверх всех элементов
+        // и первым получает щелчок.
+        internal ComboBox OpenDropDown { get; set; }
+
         public FormStartPosition StartPosition { get; set; } = FormStartPosition.WindowsDefaultLocation;
 
         public FormBorderStyle FormBorderStyle { get; set; } = FormBorderStyle.Sizable;
@@ -1103,6 +1122,24 @@ namespace System.Windows.Forms
                 case FreeOsWindow.EventNone:
                     return false;
                 case FreeOsWindow.EventPointer:
+                    if (OpenDropDown != null)
+                    {
+                        // Щелчок в открытом списке выбирает строку; мимо — только
+                        // закрывает список, как в Windows.
+                        ComboBox combo = OpenDropDown;
+                        Point origin = combo.OriginInForm();
+                        Rectangle drop = combo.DropDownBounds(origin.X, origin.Y);
+                        if (drop.Contains(px, py))
+                        {
+                            combo.ClickDropDown(py - drop.Y);
+                            return true;
+                        }
+                        if (!new Rectangle(origin.X, origin.Y, combo.Width, combo.Height).Contains(px, py))
+                        {
+                            combo.DroppedDown = false;
+                            return true;
+                        }
+                    }
                     Control target = ChildAt(px, py, out int localX, out int localY);
                     // Фокус переходит при нажатии, до MouseDown, как в WinForms.
                     if (target.CanFocus)
@@ -1131,6 +1168,11 @@ namespace System.Windows.Forms
             }
             NeedsPaint = false;
             PaintTree(window, 0, 0, new Rectangle(0, 0, ClientSize.Width, ClientSize.Height));
+            if (OpenDropDown != null)
+            {
+                Point origin = OpenDropDown.OriginInForm();
+                OpenDropDown.PaintDropDown(window, origin.X, origin.Y);
+            }
             FreeOsWindow.Present(window);
             return true;
         }
