@@ -153,6 +153,47 @@ namespace System.Text
         public static Encoding UTF8 => utf8 ??= new UTF8Encoding();
 
         public abstract string WebName { get; }
+
+        // Кодировка у своей среды одна — UTF-8 (фаза N5a), и перекодирует её Rust:
+        // неверные последовательности становятся U+FFFD так же, как у .NET.
+        public virtual string GetString(byte[] bytes)
+        {
+            if (bytes == null)
+            {
+                throw new ArgumentNullException("bytes");
+            }
+            return DecodeUtf8(bytes, 0, bytes.Length);
+        }
+
+        public virtual string GetString(byte[] bytes, int index, int count)
+        {
+            if (bytes == null)
+            {
+                throw new ArgumentNullException("bytes");
+            }
+            if (index < 0 || count < 0 || index > bytes.Length - count)
+            {
+                throw new ArgumentOutOfRangeException(index < 0 ? "index" : "count");
+            }
+            return DecodeUtf8(bytes, index, count);
+        }
+
+        public virtual byte[] GetBytes(string s)
+        {
+            if (s == null)
+            {
+                throw new ArgumentNullException("s");
+            }
+            return EncodeUtf8(s);
+        }
+
+        public virtual int GetByteCount(string s) => GetBytes(s).Length;
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern string DecodeUtf8(byte[] bytes, int index, int count);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern byte[] EncodeUtf8(string s);
     }
 
     public sealed class UTF8Encoding : Encoding

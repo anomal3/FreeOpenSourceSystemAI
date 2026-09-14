@@ -23,8 +23,11 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use clr_vm::{Host, Vm};
-use user_progs::{Args, close, error, exit, file_size, heap_size, open, print, read};
+use clr_vm::{FileKind, Host, IoError, Vm};
+use user_progs::{
+    Args, Dirent, KIND_DIRECTORY, SEEK_END, close, error, exit, file_size, heap_size, mkdir, open, open_write, print, read,
+    readdir_raw, remove, rename, seek, stat, uid, write,
+};
 
 /// Куча программы. Сборка, разобранные методы, кадры и все объекты программы
 /// живут в ней; мегабайта, который достаётся остальным программам, не хватает.
@@ -43,13 +46,183 @@ const FILE_MAX: usize = 4 * 1024 * 1024;
 /// заняты кодами, которые программа вправе вернуть сама.
 const RUNTIME_FAILED: i64 = 134;
 
-/// Стандартный вывод программы — это терминал.
-struct Console;
+/// Стандартный вывод программы — терминал, файлы — файловая система FreeOS
+/// (фаза N5a).
+///
+/// Текущего каталога у задачи FreeOS нет, поэтому у программы он свой:
+/// домашний каталог пользователя из `/etc/passwd` (у `root` — `/root`). От него
+/// считаются относительные пути, и `File.WriteAllText("notes.txt", …)` пишет
+/// туда же, где пользователь хранит свои файлы.
+struct Console {
+    home: String,
+}
 
 impl Host for Console {
     fn write_out(&mut self, text: &str) {
         print(text);
     }
+
+    fn current_dir(&mut self) -> String {
+        self.home.clone()
+    }
+
+    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, IoError> {
+        if self.stat(path)?.0 == FileKind::Directory {
+            return Err(IoError::WrongKind);
+        }
+        let fd = open(path);
+        if fd < 0 {
+            return Err(io_error(fd));
+        }
+        let size = file_size(fd);
+        if size < 0 {
+            close(fd);
+            return Err(io_error(size));
+        }
+        let mut data = Vec::new();
+        if data.try_reserve_exact(size as usize).is_err() {
+            close(fd);
+            return Err(IoError::Other);
+        }
+        data.resize(size as usize, 0);
+        let mut filled = 0;
+        while filled < data.len() {
+            let got = read(fd, &mut data[filled..]);
+            if got < 0 {
+                close(fd);
+                return Err(io_error(got));
+            }
+            if got == 0 {
+                break;
+            }
+            filled += got as usize;
+        }
+        close(fd);
+        data.truncate(filled);
+        Ok(data)
+    }
+
+    fn write_file(&mut self, path: &str, data: &[u8], append: bool) -> Result<(), IoError> {
+        if let Ok((FileKind::Directory, _)) = self.stat(path) {
+            return Err(IoError::WrongKind);
+        }
+        let fd = open_write(path, true, !append);
+        if fd < 0 {
+            return Err(io_error(fd));
+        }
+        if append {
+            let end = seek(fd, 0, SEEK_END);
+            if end < 0 {
+                close(fd);
+                return Err(io_error(end));
+            }
+        }
+        let mut written = 0;
+        while written < data.len() {
+            let count = write(fd, &data[written..]);
+            if count <= 0 {
+                close(fd);
+                return Err(if count < 0 { io_error(count) } else { IoError::NoSpace });
+            }
+            written += count as usize;
+        }
+        let closed = close(fd);
+        if closed < 0 { Err(io_error(closed)) } else { Ok(()) }
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), IoError> {
+        if self.stat(path)?.0 == FileKind::Directory {
+            return Err(IoError::WrongKind);
+        }
+        code(remove(path))
+    }
+
+    fn create_dir(&mut self, path: &str) -> Result<(), IoError> {
+        code(mkdir(path, 0o755))
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<(), IoError> {
+        if self.stat(path)?.0 == FileKind::File {
+            return Err(IoError::WrongKind);
+        }
+        code(remove(path))
+    }
+
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), IoError> {
+        code(rename(from, to))
+    }
+
+    fn stat(&mut self, path: &str) -> Result<(FileKind, u64), IoError> {
+        let mut info = user_abi::Stat::default();
+        code(stat(path, &mut info))?;
+        Ok((if info.kind == KIND_DIRECTORY { FileKind::Directory } else { FileKind::File }, info.size))
+    }
+
+    fn list_dir(&mut self, path: &str) -> Result<Vec<String>, IoError> {
+        let fd = open(path);
+        if fd < 0 {
+            return Err(io_error(fd));
+        }
+        let mut names = Vec::new();
+        loop {
+            let mut entry = Dirent::default();
+            let got = readdir_raw(fd, &mut entry);
+            if got < 0 {
+                close(fd);
+                return Err(io_error(got));
+            }
+            if got == 0 {
+                break;
+            }
+            let length = (entry.name_len as usize).min(entry.name.len());
+            let name = String::from_utf8_lossy(&entry.name[..length]).into_owned();
+            if name != "." && name != ".." {
+                names.push(name);
+            }
+        }
+        close(fd);
+        Ok(names)
+    }
+}
+
+/// Отказ ядра как отказ файловой операции среды.
+fn io_error(code: i64) -> IoError {
+    match code {
+        user_abi::ERR_NOT_FOUND => IoError::NotFound,
+        user_abi::ERR_EXISTS => IoError::Exists,
+        user_abi::ERR_NOT_EMPTY => IoError::NotEmpty,
+        user_abi::ERR_PERMISSION => IoError::Denied,
+        user_abi::ERR_NO_SPACE => IoError::NoSpace,
+        _ => IoError::Other,
+    }
+}
+
+fn code(result: i64) -> Result<(), IoError> {
+    if result < 0 { Err(io_error(result)) } else { Ok(()) }
+}
+
+/// Домашний каталог того, от чьего имени запущена программа.
+///
+/// У `root` — `/root`. У пользователя — строка `home=` из `/etc/system.cfg`:
+/// `/etc/passwd` закрыт от всех, кроме root (в нём отпечаток пароля), и
+/// установщик нарочно дублирует имя и домашний каталог в открытых настройках.
+/// Нет строки — корень.
+fn home_directory() -> String {
+    if uid() == 0 {
+        return String::from("/root");
+    }
+    let Some(config) = user_progs::config_path("system.cfg") else { return String::from("/") };
+    let Ok(data) = load(config.as_str()) else { return String::from("/") };
+    let text = String::from_utf8_lossy(&data);
+    for line in text.lines() {
+        if let Some(home) = line.trim().strip_prefix("home=") {
+            let home = home.trim();
+            if home.starts_with('/') {
+                return String::from(home);
+            }
+        }
+    }
+    String::from("/")
 }
 
 /// Стек среды: мегабайт вместо обычных 64 КиБ.
@@ -110,7 +283,7 @@ extern "C" fn run(start: usize) -> ! {
         }
     };
 
-    let mut vm = match Vm::new(&data, &corelib, Console) {
+    let mut vm = match Vm::new(&data, &corelib, Console { home: home_directory() }) {
         Ok(vm) => vm,
         Err(failure) => {
             error(&format!("dotnet: error: {name}: {failure}\n"));

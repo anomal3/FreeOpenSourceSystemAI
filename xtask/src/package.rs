@@ -318,6 +318,22 @@ fn build_root_image(
             .map_err(|err| anyhow::anyhow!("не удалось записать эталон {name}: {err}"))?;
     }
 
+    // Своя среда .NET (фаза N5a) — тем же комплектом, что ставит установщик:
+    // обновлённая машина не должна терять `/usr/share/dotnet`.
+    for dir in ["usr/share/dotnet", "usr/share/dotnet/samples"] {
+        fs_image
+            .create_dir_path(&mut disk, dir, 0o755, 0, 0)
+            .map_err(|err| anyhow::anyhow!("не удалось создать /{dir} в образе: {err}"))?;
+    }
+    for (name, _) in crate::arch::PAYLOAD_DOTNET {
+        let source = paths::initrd_source_dir().join("usr/share/dotnet").join(name);
+        let data = fs::read(&source)
+            .with_context(|| format!("не удалось прочитать {}", source.display()))?;
+        fs_image
+            .write_file_path(&mut disk, &format!("usr/share/dotnet/{name}"), &data, 0o644, 0, 0)
+            .map_err(|err| anyhow::anyhow!("не удалось записать {name}: {err}"))?;
+    }
+
     fs_image
         .create_dir_path(&mut disk, "bin", 0o755, 0, 0)
         .map_err(|err| anyhow::anyhow!("не удалось создать /bin в образе: {err}"))?;

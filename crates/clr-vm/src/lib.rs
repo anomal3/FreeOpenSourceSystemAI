@@ -24,7 +24,10 @@
 //! .NET считает его в одинарной точности. Массив примитивов хранит числа своей
 //! ширины (`heap::Items`), имена перечислений берутся из метаданных ([`enums`]).
 //!
-//! Чего нет — `decimal`, файлов, потоков (N5 и дальше). Встреча с неподдержанным — не падение и не
+//! Фаза N5a — файлы: `System.IO` на C# поверх файловых членов [`Host`]; на
+//! машине разработчика хост — каталог-песочница ([`sandbox`]).
+//!
+//! Чего нет — `decimal`, `DateTime`, потоков (N5b и дальше). Встреча с неподдержанным — не падение и не
 //! молчание, а [`VmError`] с полным именем члена или кодом инструкции и местом.
 //!
 //! # Базовая библиотека
@@ -55,7 +58,7 @@
 
 extern crate alloc;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "std"))]
 extern crate std;
 
 mod dispatch;
@@ -66,6 +69,8 @@ mod heap;
 mod loader;
 mod natives;
 pub mod number;
+#[cfg(any(test, feature = "std"))]
+pub mod sandbox;
 mod objects;
 mod ops;
 mod places;
@@ -80,12 +85,110 @@ use alloc::string::String;
 use core::fmt;
 
 pub use value::{ObjRef, Pointer, Value};
+
+use alloc::vec::Vec;
 pub use vm::Vm;
 
 /// То, что среда берёт у системы, на которой работает.
+///
+/// Файловые члены (фаза N5a) получают путь уже полным и разобранным — с `/`,
+/// без `.` и `..`: относительные пути, текущий каталог и разделители решает
+/// `System.IO.Path` на C#. По умолчанию файлов у хоста нет, и программа
+/// получает исключение, а не падение среды.
 pub trait Host {
     /// Напечатать текст в стандартный вывод программы.
     fn write_out(&mut self, text: &str);
+
+    /// Текущий каталог программы — полный путь, от него считаются относительные.
+    fn current_dir(&mut self) -> String {
+        String::from("/")
+    }
+
+    /// Прочитать файл целиком.
+    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, IoError> {
+        let _ = path;
+        Err(IoError::Unsupported)
+    }
+
+    /// Записать файл целиком, создав его; `append` — дописать в конец.
+    fn write_file(&mut self, path: &str, data: &[u8], append: bool) -> Result<(), IoError> {
+        let _ = (path, data, append);
+        Err(IoError::Unsupported)
+    }
+
+    /// Удалить файл (не каталог).
+    fn remove_file(&mut self, path: &str) -> Result<(), IoError> {
+        let _ = path;
+        Err(IoError::Unsupported)
+    }
+
+    /// Создать один каталог; родитель обязан существовать.
+    fn create_dir(&mut self, path: &str) -> Result<(), IoError> {
+        let _ = path;
+        Err(IoError::Unsupported)
+    }
+
+    /// Удалить пустой каталог.
+    fn remove_dir(&mut self, path: &str) -> Result<(), IoError> {
+        let _ = path;
+        Err(IoError::Unsupported)
+    }
+
+    /// Переименовать или перенести файл либо каталог.
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), IoError> {
+        let _ = (from, to);
+        Err(IoError::Unsupported)
+    }
+
+    /// Что лежит по пути и сколько в нём байт.
+    fn stat(&mut self, path: &str) -> Result<(FileKind, u64), IoError> {
+        let _ = path;
+        Err(IoError::Unsupported)
+    }
+
+    /// Имена в каталоге, без `.` и `..`, в порядке файловой системы.
+    fn list_dir(&mut self, path: &str) -> Result<Vec<String>, IoError> {
+        let _ = path;
+        Err(IoError::Unsupported)
+    }
+}
+
+/// Почему файловая операция не удалась. Какое исключение из этого выйдет,
+/// решает `System.IO` на C#.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoError {
+    NotFound,
+    Exists,
+    NotEmpty,
+    Denied,
+    NoSpace,
+    /// Каталог там, где ждали файл, или наоборот.
+    WrongKind,
+    /// Файлов у этого хоста нет вовсе.
+    Unsupported,
+    Other,
+}
+
+impl IoError {
+    /// Код для `System.IO.FileSystem` (см. `tools/dotnet/corelib/IO.cs`).
+    pub(crate) const fn code(self) -> i32 {
+        match self {
+            Self::NotFound => 1,
+            Self::Exists => 2,
+            Self::NotEmpty => 3,
+            Self::Denied => 4,
+            Self::NoSpace => 5,
+            Self::WrongKind => 6,
+            Self::Unsupported => 7,
+            Self::Other => 8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileKind {
+    File,
+    Directory,
 }
 
 /// Почему программа не выполнилась до конца.

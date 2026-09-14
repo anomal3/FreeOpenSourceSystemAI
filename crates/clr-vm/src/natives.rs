@@ -93,6 +93,18 @@ pub(crate) enum Native {
     Math(MathOp, bool),
     /// `Math.Atan2`/`Math.Pow` и их `MathF`.
     Math2(MathOp2, bool),
+    /// Файловые члены `System.IO.FileSystem` (фаза N5a).
+    CurrentDirectory,
+    ReadFile,
+    WriteFile,
+    RemoveFile,
+    CreateDirectory,
+    RemoveDirectory,
+    RenamePath,
+    StatPath,
+    ListDirectory,
+    DecodeUtf8,
+    EncodeUtf8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -255,6 +267,17 @@ const TABLE: &[(&str, Native)] = &[
     ("System.MathF::Round(float32)", Native::Math(MathOp::Round, true)),
     ("System.MathF::Atan2(float32,float32)", Native::Math2(MathOp2::Atan2, true)),
     ("System.MathF::Pow(float32,float32)", Native::Math2(MathOp2::Pow, true)),
+    ("System.IO.FileSystem::GetCurrentDirectoryNative()", Native::CurrentDirectory),
+    ("System.IO.FileSystem::ReadFile(string,uint8[]&)", Native::ReadFile),
+    ("System.IO.FileSystem::WriteFile(string,uint8[],bool)", Native::WriteFile),
+    ("System.IO.FileSystem::RemoveFile(string)", Native::RemoveFile),
+    ("System.IO.FileSystem::CreateDirectory(string)", Native::CreateDirectory),
+    ("System.IO.FileSystem::RemoveDirectory(string)", Native::RemoveDirectory),
+    ("System.IO.FileSystem::Rename(string,string)", Native::RenamePath),
+    ("System.IO.FileSystem::Stat(string,int64&)", Native::StatPath),
+    ("System.IO.FileSystem::ListDirectory(string,string[]&)", Native::ListDirectory),
+    ("System.Text.Encoding::DecodeUtf8(uint8[],int32,int32)", Native::DecodeUtf8),
+    ("System.Text.Encoding::EncodeUtf8(string)", Native::EncodeUtf8),
 ];
 
 pub(crate) fn lookup(key: &str) -> Option<Native> {
@@ -657,7 +680,141 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
                 })
             })
         }
+        Native::CurrentDirectory => {
+            let directory = vm.host.current_dir();
+            Some(vm.new_string_from(&directory)?)
+        }
+        Native::ReadFile => {
+            let path = path_arg(vm, arg(0)?)?;
+            let Value::Ptr(out) = arg(1)? else {
+                return Err(vm.invalid("out argument is not a pointer"));
+            };
+            match vm.host.read_file(&path) {
+                Ok(data) => {
+                    let array = byte_array(vm, data)?;
+                    vm.store(out, array)?;
+                    Some(Value::I32(0))
+                }
+                Err(failure) => {
+                    vm.store(out, Value::Obj(None))?;
+                    Some(Value::I32(failure.code()))
+                }
+            }
+        }
+        Native::WriteFile => {
+            let path = path_arg(vm, arg(0)?)?;
+            let data = bytes_of(vm, arg(1)?)?;
+            let append = vm.int32(arg(2)?)? != 0;
+            status(vm.host.write_file(&path, &data, append))
+        }
+        Native::RemoveFile => {
+            let path = path_arg(vm, arg(0)?)?;
+            status(vm.host.remove_file(&path))
+        }
+        Native::CreateDirectory => {
+            let path = path_arg(vm, arg(0)?)?;
+            status(vm.host.create_dir(&path))
+        }
+        Native::RemoveDirectory => {
+            let path = path_arg(vm, arg(0)?)?;
+            status(vm.host.remove_dir(&path))
+        }
+        Native::RenamePath => {
+            let from = path_arg(vm, arg(0)?)?;
+            let to = path_arg(vm, arg(1)?)?;
+            status(vm.host.rename(&from, &to))
+        }
+        Native::StatPath => {
+            let path = path_arg(vm, arg(0)?)?;
+            let Value::Ptr(out) = arg(1)? else {
+                return Err(vm.invalid("out argument is not a pointer"));
+            };
+            let (code, size) = match vm.host.stat(&path) {
+                Ok((crate::FileKind::File, size)) => (1, size),
+                Ok((crate::FileKind::Directory, size)) => (2, size),
+                Err(failure) => (-failure.code(), 0),
+            };
+            vm.store(out, Value::I64(size as i64))?;
+            Some(Value::I32(code))
+        }
+        Native::ListDirectory => {
+            let path = path_arg(vm, arg(0)?)?;
+            let Value::Ptr(out) = arg(1)? else {
+                return Err(vm.invalid("out argument is not a pointer"));
+            };
+            match vm.host.list_dir(&path) {
+                Ok(names) => {
+                    let mut values = Vec::new();
+                    values.try_reserve_exact(names.len()).map_err(|_| VmError::OutOfMemory)?;
+                    for name in &names {
+                        values.push(vm.new_string_from(name)?);
+                    }
+                    let string = vm.corelib_type("System.String")?;
+                    let ty = vm.array_of(string)?;
+                    let array = vm.heap.alloc(Object::Array { ty, items: crate::heap::Items::Values(values) })?;
+                    vm.store(out, Value::Obj(Some(array)))?;
+                    Some(Value::I32(0))
+                }
+                Err(failure) => {
+                    vm.store(out, Value::Obj(None))?;
+                    Some(Value::I32(failure.code()))
+                }
+            }
+        }
+        // Неверные последовательности — U+FFFD по «наибольшей части», как у .NET.
+        Native::DecodeUtf8 => {
+            let data = bytes_of(vm, arg(0)?)?;
+            let start = usize::try_from(vm.int32(arg(1)?)?).unwrap_or(usize::MAX);
+            let count = usize::try_from(vm.int32(arg(2)?)?).unwrap_or(usize::MAX);
+            let Some(slice) = start.checked_add(count).and_then(|end| data.get(start..end)) else {
+                return Err(vm.exception("System.ArgumentOutOfRangeException"));
+            };
+            let text = alloc::string::String::from_utf8_lossy(slice);
+            Some(vm.new_string_from(&text)?)
+        }
+        // Одинокая суррогатная половинка — U+FFFD, как у .NET.
+        Native::EncodeUtf8 => {
+            let units = this_units(vm, arg(0)?)?;
+            let text: alloc::string::String =
+                char::decode_utf16(units.iter().copied()).map(|c| c.unwrap_or('\u{FFFD}')).collect();
+            Some(byte_array(vm, text.into_bytes())?)
+        }
     })
+}
+
+/// Путь-аргумент файлового члена. `null` отсекает C#, но среда не верит.
+fn path_arg<H: Host>(vm: &Vm<'_, H>, value: Value) -> Result<alloc::string::String, VmError> {
+    let units = vm.string_units(value)?.ok_or_else(|| vm.exception("System.ArgumentNullException"))?;
+    Ok(alloc::string::String::from_utf16_lossy(&units))
+}
+
+/// Копия содержимого `byte[]`: хосту нельзя отдать ссылку внутрь кучи, пока он
+/// сам занимает среду.
+fn bytes_of<H: Host>(vm: &Vm<'_, H>, value: Value) -> Result<Vec<u8>, VmError> {
+    match value {
+        Value::Obj(Some(object)) => match vm.heap.get(object) {
+            Some(Object::Array { items: crate::heap::Items::U8(bytes), .. }) => {
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(bytes.len()).map_err(|_| VmError::OutOfMemory)?;
+                copy.extend_from_slice(bytes);
+                Ok(copy)
+            }
+            _ => Err(vm.invalid("expected a byte array")),
+        },
+        Value::Obj(None) => Err(vm.exception("System.ArgumentNullException")),
+        _ => Err(vm.invalid("expected a byte array reference")),
+    }
+}
+
+fn byte_array<H: Host>(vm: &mut Vm<'_, H>, data: Vec<u8>) -> Result<Value, VmError> {
+    let element = vm.prim_type(Prim::U1)?;
+    let ty = vm.array_of(element)?;
+    Ok(Value::Obj(Some(vm.heap.alloc(Object::Array { ty, items: crate::heap::Items::U8(data) })?)))
+}
+
+/// Итог файлового члена для C#: 0 или код отказа.
+fn status(result: Result<(), crate::IoError>) -> Option<Value> {
+    Some(Value::I32(result.map_or_else(crate::IoError::code, |()| 0)))
 }
 
 /// Строка по формату или исключение, которое бросил бы .NET.

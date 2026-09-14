@@ -255,6 +255,13 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                 payload.push(read_payload(&target, &paths::defaults_dir().join(name))?);
             }
 
+            // Своя среда .NET (фаза N5a): базовая библиотека и образцы для
+            // сценариев установленной системы, из того же `initrd/`.
+            for (name, medium) in arch::PAYLOAD_DOTNET {
+                let target = format!("{}/{medium}", arch::PAYLOAD_DOTNET_DIR);
+                payload.push(read_payload(&target, &paths::initrd_source_dir().join("usr/share/dotnet").join(name))?);
+            }
+
             // Образцовые пакеты. Имена на носителе — короткие 8.3, потому что
             // это FAT; настоящие имена (`hello-1.0.fpk`) знает установщик и
             // ставит файлы под ними в `/media`.

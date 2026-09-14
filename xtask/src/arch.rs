@@ -285,6 +285,19 @@ pub const PAYLOAD_DEFAULTS_DIR: &str = "FREEOS/DEF";
 pub const PAYLOAD_DEFAULTS: [(&str, &str); 3] =
     [("services", "SERVICES"), ("update.cfg", "UPDATE.CFG"), ("ca.pem", "CA.PEM")];
 
+/// Каталог своей среды .NET на установочном носителе (фаза N5a).
+///
+/// Без базовой библиотеки `/bin/dotnet` на установленной системе не запускает
+/// ничего: до N5a это не было видно, потому что все сценарии .NET шли с
+/// «живой» загрузки, где `/usr/share/dotnet` лежит в образе RAM-диска.
+pub const PAYLOAD_DOTNET_DIR: &str = "FREEOS/NET";
+
+/// Что из `initrd/usr/share/dotnet/` едет на носитель и под какими именами 8.3.
+/// Образцы — только те, что запускают сценарии установленной системы. Список
+/// обязан совпадать с `DOTNET` в `crates/installer/src/payload.rs`.
+pub const PAYLOAD_DOTNET: [(&str, &str); 3] =
+    [("FreeOs.CoreLib.dll", "CORELIB.DLL"), ("samples/hello.dll", "HELLO.DLL"), ("samples/files.dll", "FILES.DLL")];
+
 /// Каталог с пользовательскими программами на установочном носителе.
 ///
 /// Программы лежат на носителе **отдельными файлами**, хотя те же самые уже

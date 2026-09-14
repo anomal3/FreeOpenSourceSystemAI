@@ -75,7 +75,7 @@ rcgen = "0.13"
 # Здесь он печатает сборку для сверки с System.Reflection.Metadata
 # (`cargo xtask clr-check`): проверяет его чужой читатель, а не он сам себя.
 clr-meta = { path = "../crates/clr-meta" }
-clr-vm = { path = "../crates/clr-vm" }
+clr-vm = { path = "../crates/clr-vm", features = ["std"] }
 
 [lints]
 workspace = true

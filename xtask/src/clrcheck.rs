@@ -35,8 +35,8 @@ use clr_meta::{Assembly, Coded, Token};
 ///
 /// `features` нужен ради таблиц метаданных, а не запуска: в нём P/Invoke,
 /// которого у среды ещё нет.
-const SAMPLES: [(&str, bool); 12] =
-    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("floats", true), ("enums", true), ("linq", true), ("features", false)];
+const SAMPLES: [(&str, bool); 13] =
+    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("floats", true), ("enums", true), ("linq", true), ("files", true), ("features", false)];
 
 /// Имя сборки базовой библиотеки своей среды (`tools/dotnet/corelib`).
 const CORELIB: &str = "FreeOs.CoreLib.dll";
@@ -116,11 +116,19 @@ pub fn check() -> Result<()> {
         }
         let dll = out.join("samples").join(sample).join(format!("{sample}.dll"));
         let data = fs::read(&dll).with_context(|| format!("read {}", dll.display()))?;
-        let (their_code, theirs) = run_dotnet(&dll)?;
-        let (our_code, ours) = run_ours(&data, &corelib);
-        if ours == theirs && our_code == Some(their_code) {
+        // Фаза N5a: каждая среда начинает в своём пустом каталоге, и сравнивается
+        // не только вывод, но и файлы, которые программа после себя оставила.
+        let sandbox = out.join("run").join(sample);
+        let (our_dir, their_dir) = (sandbox.join("ours"), sandbox.join("theirs"));
+        fresh_dir(&our_dir)?;
+        fresh_dir(&their_dir)?;
+        let (their_code, theirs) = run_dotnet(&dll, &their_dir)?;
+        let (our_code, ours) = run_ours(&data, &corelib, &our_dir);
+        let (our_files, their_files) = (tree(&our_dir)?, tree(&their_dir)?);
+        if ours == theirs && our_code == Some(their_code) && our_files == their_files {
+            let files = if our_files.is_empty() { String::new() } else { format!(", {} files and directories as dotnet left them", our_files.len()) };
             println!(
-                "clr-check: run {sample}: output matches dotnet ({} lines), exit code {their_code}",
+                "clr-check: run {sample}: output matches dotnet ({} lines), exit code {their_code}{files}",
                 ours.lines().count()
             );
         } else {
@@ -134,6 +142,12 @@ pub fn check() -> Result<()> {
                 println!("  ours  : {our_line}");
                 println!("  theirs: {their_line}");
             }
+            if our_files != their_files {
+                let names = |files: &[(String, Vec<u8>)]| files.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(" ");
+                println!("  files ours  : {}", names(&our_files));
+                println!("  files theirs: {}", names(&their_files));
+                println!("  (a name listed in both differs in content; trees are in {})", sandbox.display());
+            }
         }
         refresh_initrd(&root, &format!("samples/{sample}.dll"), &data)?;
     }
@@ -143,14 +157,43 @@ pub fn check() -> Result<()> {
     Ok(())
 }
 
-/// Выполнить сборку настоящим dotnet.
-fn run_dotnet(dll: &Path) -> Result<(i32, String)> {
+fn fresh_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        fs::remove_dir_all(dir).with_context(|| format!("clear {}", dir.display()))?;
+    }
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))
+}
+
+/// Всё, что лежит в каталоге: пути от него через `/` по порядку и содержимое
+/// файлов (у каталога — пусто, а имя кончается на `/`).
+fn tree(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut entries = Vec::new();
+    let mut pending = vec![(dir.to_path_buf(), String::new())];
+    while let Some((path, prefix)) = pending.pop() {
+        for entry in fs::read_dir(&path).with_context(|| format!("list {}", path.display()))? {
+            let entry = entry?;
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if entry.file_type()?.is_dir() {
+                entries.push((format!("{name}/"), Vec::new()));
+                pending.push((entry.path(), format!("{name}/")));
+            } else {
+                entries.push((name, fs::read(entry.path())?));
+            }
+        }
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+/// Выполнить сборку настоящим dotnet в каталоге `dir`.
+fn run_dotnet(dll: &Path, dir: &Path) -> Result<(i32, String)> {
     // Режим инвариантной глобализации: у FreeOS культур нет, и сравнивать надо
     // с тем, что печатает .NET без них. Иначе на русской Windows эталон
     // получал бы запятую в дробных числах, неразрывные пробелы в разрядах и
     // культурное сравнение строк (фаза N4a).
     let output = Command::new("dotnet")
         .arg(dll)
+        .current_dir(dir)
         .env("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1")
         .output()
         .context("run dotnet")?;
@@ -160,23 +203,16 @@ fn run_dotnet(dll: &Path) -> Result<(i32, String)> {
     Ok((output.status.code().unwrap_or(-1), text.replace("\r\n", "\n")))
 }
 
-struct Capture(String);
-
-impl clr_vm::Host for Capture {
-    fn write_out(&mut self, text: &str) {
-        self.0.push_str(text);
-    }
-}
-
-/// Выполнить сборку своей средой. Ошибка среды попадает в вывод строкой — так
-/// её видно в сравнении рядом с тем, что успело напечататься.
-fn run_ours(data: &[u8], corelib: &[u8]) -> (Option<i32>, String) {
-    let mut vm = match clr_vm::Vm::new(data, corelib, Capture(String::new())) {
+/// Выполнить сборку своей средой с файлами в песочнице `dir`. Ошибка среды
+/// попадает в вывод строкой — так её видно в сравнении рядом с тем, что успело
+/// напечататься.
+fn run_ours(data: &[u8], corelib: &[u8], dir: &Path) -> (Option<i32>, String) {
+    let mut vm = match clr_vm::Vm::new(data, corelib, clr_vm::sandbox::Sandbox::new(dir)) {
         Ok(vm) => vm,
         Err(error) => return (None, format!("<load error: {error}>\n")),
     };
     let result = vm.run_main(&[]);
-    let mut output = vm.into_host().0;
+    let mut output = vm.into_host().output;
     match result {
         Ok(code) => (Some(code), output),
         Err(error) => {

@@ -8,15 +8,8 @@
 use std::string::String;
 
 use crate::ops::{self, Fault};
-use crate::{Host, Value, Vm, VmError};
-
-struct Capture(String);
-
-impl Host for Capture {
-    fn write_out(&mut self, text: &str) {
-        self.0.push_str(text);
-    }
-}
+use crate::sandbox::Sandbox;
+use crate::{Value, Vm, VmError};
 
 /// Базовая библиотека своей среды — та же сборка, что едет в образ.
 const CORELIB: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/FreeOs.CoreLib.dll");
@@ -99,10 +92,19 @@ const ARITH_OUTPUT: &str = concat!(
     "arith: done\n",
 );
 
+/// Запустить образец с файлами в своём пустом каталоге (фаза N5a): тесты идут
+/// параллельно, и общий каталог они делили бы между собой.
 fn run(data: &[u8]) -> (Result<i32, VmError>, String) {
-    let mut vm = Vm::new(data, CORELIB, Capture(String::new())).expect("assembly parses");
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(std::format!("clr-vm-test-{}-{number}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("sandbox directory");
+    let mut vm = Vm::new(data, CORELIB, Sandbox::new(&dir)).expect("assembly parses");
     let result = vm.run_main(&[]);
-    (result, vm.into_host().0)
+    let output = vm.into_host().output;
+    let _ = std::fs::remove_dir_all(&dir);
+    (result, output)
 }
 
 /// Сколько стека получает поток теста, КиБ.
@@ -120,7 +122,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -226,10 +228,10 @@ const GC_OUTPUT: &str = concat!(
 /// значение программа проверяет сама), и сборок было больше нуля.
 #[test]
 fn garbage_is_collected_and_the_living_survive() {
-    let mut vm = Vm::new(GC, CORELIB, Capture(String::new())).expect("assembly parses");
+    let mut vm = Vm::new(GC, CORELIB, Sandbox::new(std::env::temp_dir())).expect("assembly parses");
     let result = vm.run_main(&[]);
     let collections = vm.collections();
-    let output = vm.into_host().0;
+    let output = vm.into_host().output;
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, GC_OUTPUT);
     assert_eq!(code, 6);
@@ -466,4 +468,41 @@ fn shifts_mask_the_count() {
     assert_eq!(ops::shift(0x64, Value::I32(-17), Value::I32(28)), Ok(Value::I32(15)));
     assert_eq!(ops::shift(0x62, Value::I32(1), Value::I32(33)), Ok(Value::I32(2)));
     assert_eq!(ops::shift(0x63, Value::I32(-64), Value::I32(3)), Ok(Value::I32(-8)));
+}
+
+/// Образец `tools/dotnet/samples/files` (фаза N5a).
+const FILES: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/files.dll");
+
+/// Что печатает `dotnet files.dll`, запущенный в пустом каталоге (записано
+/// 2026-09-14, .NET 10, LF).
+const FILES_OUTPUT: &str = concat!(
+    "files: start\n",
+    "False False\n",
+    "old True True\n",
+    "31 3 [first line|вторая строка|third] 43 208 вторая 43\n",
+    "5 250 255 True\n",
+    "log 1: level=info\n",
+    "log 2: 42\n",
+    "log 3: appended\n",
+    "end True\n",
+    "3 appended\n",
+    "a.md,data.bin,notes.txt | notes.txt | logs | b.txt,notes.txt | app.log,b.txt,old\n",
+    "False 31\n",
+    "copy over: IOException\n",
+    "# a False\n",
+    "read: FileNotFoundException missing.txt\n",
+    "write: DirectoryNotFoundException\n",
+    "rmdir: IOException\n",
+    "False app.log,b.txt,moved.txt\n",
+    "file.tar.gz file.tar .gz report.md False [] False\n",
+    "notes.txt .txt True 43 False n5-files 2\n",
+    "files: done\n",
+);
+
+#[test]
+fn files_print_what_dotnet_prints() {
+    let (result, output) = run(FILES);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, FILES_OUTPUT);
+    assert_eq!(code, 13);
 }

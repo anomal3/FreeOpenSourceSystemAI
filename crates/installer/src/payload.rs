@@ -196,6 +196,18 @@ pub fn probe() -> Result<Payload, Error> {
         }
     }
 
+    // Своя среда .NET (фаза N5a): базовая библиотека и образцы — файлы образа,
+    // как и эталонные настройки, и ставятся тем же шагом.
+    for (source, target) in DOTNET {
+        match stat(&mut root, source, What::Defaults) {
+            Ok(size) => {
+                logln!("[payload] .NET runtime file {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Defaults, size });
+            }
+            Err(_) => logln!("[payload] {source} is missing; /bin/dotnet will lack it"),
+        }
+    }
+
     for (source, target) in PACKAGES {
         match stat(&mut root, source, What::Package) {
             Ok(size) => {
@@ -306,6 +318,17 @@ const DEFAULTS: [(&CStr16, &str); 3] = [
         cstr16!("\\FREEOS\\DEF\\CA.PEM"),
         "usr/share/defaults/etc/ca.pem",
     ),
+];
+
+/// Своя среда .NET на носителе и её пути в корневом образе (фаза N5a).
+///
+/// Список обязан совпадать с `PAYLOAD_DOTNET` в `xtask/src/arch.rs`. Без
+/// базовой библиотеки `/bin/dotnet` на установленной системе не запускает
+/// ничего.
+const DOTNET: [(&CStr16, &str); 3] = [
+    (cstr16!("\\FREEOS\\NET\\CORELIB.DLL"), "usr/share/dotnet/FreeOs.CoreLib.dll"),
+    (cstr16!("\\FREEOS\\NET\\HELLO.DLL"), "usr/share/dotnet/samples/hello.dll"),
+    (cstr16!("\\FREEOS\\NET\\FILES.DLL"), "usr/share/dotnet/samples/files.dll"),
 ];
 
 /// Образцовые пакеты на носителе и их имена в `/media`.

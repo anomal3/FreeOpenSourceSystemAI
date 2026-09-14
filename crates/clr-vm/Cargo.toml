@@ -15,5 +15,10 @@ clr-meta = { path = "../clr-meta" }
 # Rust (порт musl). В `core` из них только арифметика.
 libm = "0.2"
 
+[features]
+# Хост с настоящими файлами в каталоге-песочнице (`clr_vm::sandbox`) — для
+# `cargo xtask clr-check`. На FreeOS не нужен: там файлы даёт `/bin/dotnet`.
+std = []
+
 [lints]
 workspace = true

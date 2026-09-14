@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N5a: файлы и каталоги. Запускается в пустом каталоге:
+       clr-check выставляет его текущим, /bin/dotnet на FreeOS считает пути от
+       домашнего каталога. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
