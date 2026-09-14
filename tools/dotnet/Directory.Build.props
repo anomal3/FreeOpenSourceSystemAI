@@ -12,9 +12,18 @@
     коммит менял бы байты hello.dll, и `cargo xtask clr-check` перезаписывал бы
     образцы после каждого коммита, — так это и нашлось.
   -->
+  <!--
+    Одного этого мало, и это тоже нашлось проверкой после коммита: SourceLink
+    пишет в PDB адрес исходников с тем же хешем коммита, идентификатор PDB
+    вшивается в каталог отладки сборки, а метка времени детерминированной
+    сборки — это хеш всех входов. Отличались 72 байта. Образцам и верификатору
+    отладочная информация не нужна вовсе: своя среда её не читает.
+  -->
   <PropertyGroup>
     <Deterministic>true</Deterministic>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <EnableSourceLink>false</EnableSourceLink>
+    <DebugType>none</DebugType>
   </PropertyGroup>
 
 </Project>
