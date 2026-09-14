@@ -1,20 +1,13 @@
-//! Члены базовой библиотеки, написанные здесь, а не на C#.
-//!
-//! # Почему в Rust
-//!
-//! Базовая библиотека своей среды будет на C# (фаза N4) — но её IL нечем
-//! исполнять, пока у интерпретатора нет объектов (N3). Поэтому первые члены,
-//! без которых не напечатать и строки, живут здесь. Их ровно столько, сколько
-//! нашлось в ссылках образцов `hello` и `arith` (`MemberRef` в
-//! `cargo xtask clr-check`), плюс ближайшие соседи тех же перегрузок.
+//! Члены базовой библиотеки, написанные в Rust, а не на C#.
 //!
 //! # Как находятся
 //!
-//! По полному имени с типами параметров — `System.Console::WriteLine(string)`.
-//! Сборка, из которой ссылка пришла (`System.Console` или `System.Runtime`), не
-//! участвует: в .NET тип переезжает между сборками пересылкой, и одна и та же
-//! программа, собранная под разные версии, ссылается на `Console` то через
-//! одну, то через другую.
+//! Базовая библиотека (`tools/dotnet/corelib`) объявляет их `extern` с
+//! `MethodImplOptions.InternalCall`. Встретив такой метод, среда ищет его здесь
+//! по полному имени с типами параметров — `System.String::Concat(string,string)`.
+//! Всё, что можно написать на C#, написано на C#; здесь только то, что требует
+//! знать устройство среды: печать, строки UTF-16, тип объекта, раскладку
+//! значения, данные сборки.
 
 use alloc::format;
 use alloc::vec::Vec;
@@ -26,187 +19,138 @@ use crate::{Host, VmError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Native {
-    WriteLineString,
+    Write,
+    WriteLine,
     WriteLineEmpty,
-    WriteLineI32,
-    WriteLineI64,
-    WriteLineU32,
-    WriteLineBool,
-    WriteLineChar,
-    WriteString,
-    WriteI32,
-    WriteChar,
-    SetOutputEncoding,
-    EncodingUtf8,
-    I32ToString,
-    I64ToString,
-    U32ToString,
-    U64ToString,
-    I16ToString,
-    U16ToString,
-    ByteToString,
-    SByteToString,
-    BoolToString,
-    CharToString,
+    GetType,
+    TypeName,
+    TypeFullName,
+    ValueTypeEquals,
+    ValueTypeHash,
+    EnumToString,
+    InitializeArray,
+    ObjectHash,
+    ArrayLength,
+    StringLength,
+    StringChar,
     Concat2,
     Concat3,
     Concat4,
-    StringLength,
-    StringChar,
     StringEquals,
-    StringNotEquals,
-    ObjectCtor,
+    StringHash,
+    BoolToString,
+    CharToString,
+    I8ToString,
+    U8ToString,
+    I16ToString,
+    U16ToString,
+    I32ToString,
+    U32ToString,
+    I64ToString,
+    U64ToString,
 }
 
 const TABLE: &[(&str, Native)] = &[
-    ("System.Console::WriteLine(string)", Native::WriteLineString),
+    ("System.Console::Write(string)", Native::Write),
+    ("System.Console::WriteLine(string)", Native::WriteLine),
     ("System.Console::WriteLine()", Native::WriteLineEmpty),
-    ("System.Console::WriteLine(int32)", Native::WriteLineI32),
-    ("System.Console::WriteLine(int64)", Native::WriteLineI64),
-    ("System.Console::WriteLine(uint32)", Native::WriteLineU32),
-    ("System.Console::WriteLine(bool)", Native::WriteLineBool),
-    ("System.Console::WriteLine(char)", Native::WriteLineChar),
-    ("System.Console::Write(string)", Native::WriteString),
-    ("System.Console::Write(int32)", Native::WriteI32),
-    ("System.Console::Write(char)", Native::WriteChar),
-    ("System.Console::set_OutputEncoding(System.Text.Encoding)", Native::SetOutputEncoding),
-    ("System.Text.Encoding::get_UTF8()", Native::EncodingUtf8),
-    ("System.Int32::ToString()", Native::I32ToString),
-    ("System.Int64::ToString()", Native::I64ToString),
-    ("System.UInt32::ToString()", Native::U32ToString),
-    ("System.UInt64::ToString()", Native::U64ToString),
-    ("System.Int16::ToString()", Native::I16ToString),
-    ("System.UInt16::ToString()", Native::U16ToString),
-    ("System.Byte::ToString()", Native::ByteToString),
-    ("System.SByte::ToString()", Native::SByteToString),
-    ("System.Boolean::ToString()", Native::BoolToString),
-    ("System.Char::ToString()", Native::CharToString),
+    ("System.Object::GetType()", Native::GetType),
+    ("System.RuntimeType::get_Name()", Native::TypeName),
+    ("System.RuntimeType::get_FullName()", Native::TypeFullName),
+    ("System.ValueType::Equals(object)", Native::ValueTypeEquals),
+    ("System.ValueType::GetHashCode()", Native::ValueTypeHash),
+    ("System.Enum::ToString()", Native::EnumToString),
+    (
+        "System.Runtime.CompilerServices.RuntimeHelpers::InitializeArray(System.Array,System.RuntimeFieldHandle)",
+        Native::InitializeArray,
+    ),
+    ("System.Runtime.CompilerServices.RuntimeHelpers::GetHashCode(object)", Native::ObjectHash),
+    ("System.Array::get_Length()", Native::ArrayLength),
+    ("System.String::get_Length()", Native::StringLength),
+    ("System.String::get_Chars(int32)", Native::StringChar),
     ("System.String::Concat(string,string)", Native::Concat2),
     ("System.String::Concat(string,string,string)", Native::Concat3),
     ("System.String::Concat(string,string,string,string)", Native::Concat4),
-    ("System.String::get_Length()", Native::StringLength),
-    ("System.String::get_Chars(int32)", Native::StringChar),
-    ("System.String::op_Equality(string,string)", Native::StringEquals),
-    ("System.String::op_Inequality(string,string)", Native::StringNotEquals),
-    ("System.Object::.ctor()", Native::ObjectCtor),
+    ("System.String::Equals(string,string)", Native::StringEquals),
+    ("System.String::GetHashCode()", Native::StringHash),
+    ("System.Boolean::ToString()", Native::BoolToString),
+    ("System.Char::ToString()", Native::CharToString),
+    ("System.SByte::ToString()", Native::I8ToString),
+    ("System.Byte::ToString()", Native::U8ToString),
+    ("System.Int16::ToString()", Native::I16ToString),
+    ("System.UInt16::ToString()", Native::U16ToString),
+    ("System.Int32::ToString()", Native::I32ToString),
+    ("System.UInt32::ToString()", Native::U32ToString),
+    ("System.Int64::ToString()", Native::I64ToString),
+    ("System.UInt64::ToString()", Native::U64ToString),
 ];
 
 pub(crate) fn lookup(key: &str) -> Option<Native> {
     TABLE.iter().find(|(name, _)| *name == key).map(|(_, native)| *native)
 }
 
-impl Native {
-    /// Сколько значений член снимает со стека — вместе с `this`.
-    pub(crate) const fn arguments(self) -> usize {
-        match self {
-            Self::WriteLineEmpty | Self::EncodingUtf8 => 0,
-            Self::Concat2 | Self::StringChar | Self::StringEquals | Self::StringNotEquals => 2,
-            Self::Concat3 => 3,
-            Self::Concat4 => 4,
-            _ => 1,
-        }
-    }
-}
-
 /// Выполнить член. `Some` — значение, которое он вернул.
-pub(crate) fn call<H: Host>(
-    vm: &mut Vm<'_, H>,
-    native: Native,
-    args: &[Value],
-) -> Result<Option<Value>, VmError> {
-    let arg = |index: usize| args.get(index).copied().ok_or(VmError::StackOverflow);
+pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) -> Result<Option<Value>, VmError> {
+    let arg = |index: usize| args.get(index).copied().ok_or(VmError::Invalid { what: "missing argument", at: alloc::string::String::new() });
+    // `this` метода примитива приходит указателем на число или упакованным
+    // объектом; `deref` достаёт число в обоих случаях.
+    let number = |vm: &Vm<'_, H>| -> Result<Value, VmError> { vm.deref(arg(0)?) };
     Ok(match native {
-        Native::WriteLineString | Native::WriteString => {
+        Native::Write | Native::WriteLine => {
             let text = vm.string_units(arg(0)?)?.unwrap_or_default();
-            vm.print_units(&text, native == Native::WriteLineString);
+            vm.print_units(&text, native == Native::WriteLine);
             None
         }
         Native::WriteLineEmpty => {
             vm.print_units(&[], true);
             None
         }
-        Native::WriteLineI32 | Native::WriteI32 => {
-            let value = vm.int32(arg(0)?)?;
-            vm.print_text(&format!("{value}"), native == Native::WriteLineI32);
+        Native::GetType => {
+            let Value::Obj(Some(object)) = arg(0)? else {
+                return Err(vm.exception("System.NullReferenceException"));
+            };
+            let ty = vm.type_of_object(object)?;
+            Some(vm.type_object(ty)?)
+        }
+        Native::TypeName => {
+            let ty = vm.runtime_type(arg(0)?)?;
+            let name = vm.simple_name(ty)?;
+            Some(vm.new_string_from(&name)?)
+        }
+        Native::TypeFullName => {
+            let ty = vm.runtime_type(arg(0)?)?;
+            let name = vm.types[ty.0 as usize].name.clone();
+            Some(vm.new_string_from(&name)?)
+        }
+        Native::ValueTypeEquals => {
+            let equal = match (vm.boxed(arg(0)?), vm.boxed(arg(1)?)) {
+                (Some((ta, a)), Some((tb, b))) => ta == tb && vm.values_equal(a, b, 0),
+                _ => false,
+            };
+            Some(Value::I32(i32::from(equal)))
+        }
+        // Хэш значения и объекта печатать бессмысленно (у .NET он случаен от
+        // запуска к запуску), но он обязан быть одинаков у равных значений.
+        Native::ValueTypeHash => {
+            let hash = match vm.boxed(arg(0)?) {
+                Some((_, Value::I32(x))) => x,
+                Some((_, Value::I64(x) | Value::Native(x))) => (x ^ (x >> 32)) as i32,
+                _ => 0,
+            };
+            Some(Value::I32(hash))
+        }
+        Native::ObjectHash => Some(Value::I32(match arg(0)? {
+            Value::Obj(Some(object)) => object.0 as i32,
+            _ => 0,
+        })),
+        Native::EnumToString => {
+            return Err(VmError::Unsupported { what: format!("Enum.ToString in {} (phase N4)", vm.location()) });
+        }
+        Native::InitializeArray => {
+            vm.initialize_array(arg(0)?, arg(1)?)?;
             None
         }
-        Native::WriteLineI64 => {
-            let value = vm.int64(arg(0)?)?;
-            vm.print_text(&format!("{value}"), true);
-            None
-        }
-        Native::WriteLineU32 => {
-            let value = vm.int32(arg(0)?)? as u32;
-            vm.print_text(&format!("{value}"), true);
-            None
-        }
-        Native::WriteLineBool => {
-            let value = vm.int32(arg(0)?)? != 0;
-            vm.print_text(if value { "True" } else { "False" }, true);
-            None
-        }
-        Native::WriteLineChar | Native::WriteChar => {
-            let unit = vm.int32(arg(0)?)? as u16;
-            vm.print_units(&[unit], native == Native::WriteLineChar);
-            None
-        }
-        // Вывод своей среды всегда UTF-8, так что смена кодировки — пустая
-        // операция. Смысл у неё один: программа, написанная для настоящего
-        // dotnet на русской Windows, работает здесь без правки.
-        Native::SetOutputEncoding => None,
-        Native::EncodingUtf8 => Some(vm.utf8_encoding()?),
-        // `call instance string int32::ToString()` получает `this` указателем
-        // на значение: компилятор кладёт число в переменную и берёт её адрес.
-        Native::I32ToString => {
-            let value = vm.int32(vm.deref(arg(0)?)?)?;
-            Some(vm.new_string_from(&format!("{value}"))?)
-        }
-        Native::I64ToString => {
-            let value = vm.int64(vm.deref(arg(0)?)?)?;
-            Some(vm.new_string_from(&format!("{value}"))?)
-        }
-        Native::U32ToString => {
-            let value = vm.int32(vm.deref(arg(0)?)?)? as u32;
-            Some(vm.new_string_from(&format!("{value}"))?)
-        }
-        Native::U64ToString => {
-            let value = vm.int64(vm.deref(arg(0)?)?)? as u64;
-            Some(vm.new_string_from(&format!("{value}"))?)
-        }
-        Native::I16ToString => {
-            let value = vm.int32(vm.deref(arg(0)?)?)? as i16;
-            Some(vm.new_string_from(&format!("{value}"))?)
-        }
-        Native::U16ToString => {
-            let value = vm.int32(vm.deref(arg(0)?)?)? as u16;
-            Some(vm.new_string_from(&format!("{value}"))?)
-        }
-        Native::ByteToString => {
-            let value = vm.int32(vm.deref(arg(0)?)?)? as u8;
-            Some(vm.new_string_from(&format!("{value}"))?)
-        }
-        Native::SByteToString => {
-            let value = vm.int32(vm.deref(arg(0)?)?)? as i8;
-            Some(vm.new_string_from(&format!("{value}"))?)
-        }
-        Native::BoolToString => {
-            let value = vm.int32(vm.deref(arg(0)?)?)? != 0;
-            Some(vm.new_string_from(if value { "True" } else { "False" })?)
-        }
-        Native::CharToString => {
-            let unit = vm.int32(vm.deref(arg(0)?)?)? as u16;
-            Some(Value::Obj(Some(vm.heap.string(core::iter::once(unit))?)))
-        }
-        Native::Concat2 | Native::Concat3 | Native::Concat4 => {
-            // `null` в склейке — пустая строка, как в .NET.
-            let mut joined: Vec<u16> = Vec::new();
-            for value in args {
-                let part = vm.string_units(*value)?.unwrap_or_default();
-                joined.try_reserve(part.len()).map_err(|_| VmError::OutOfMemory)?;
-                joined.extend_from_slice(&part);
-            }
-            Some(Value::Obj(Some(vm.heap.alloc(Object::String(joined))?)))
-        }
+        Native::ArrayLength => Some(Value::I32(vm.array_len(arg(0)?)? as i32)),
         Native::StringLength => {
             let Some(text) = vm.string_units(arg(0)?)? else {
                 return Err(vm.exception("System.NullReferenceException"));
@@ -224,12 +168,45 @@ pub(crate) fn call<H: Host>(
                 .ok_or_else(|| vm.exception("System.IndexOutOfRangeException"))?;
             Some(Value::I32(i32::from(unit)))
         }
-        Native::StringEquals | Native::StringNotEquals => {
+        Native::Concat2 | Native::Concat3 | Native::Concat4 => {
+            // `null` в склейке — пустая строка, как в .NET.
+            let mut joined: Vec<u16> = Vec::new();
+            for value in args {
+                let part = vm.string_units(*value)?.unwrap_or_default();
+                joined.try_reserve(part.len()).map_err(|_| VmError::OutOfMemory)?;
+                joined.extend_from_slice(&part);
+            }
+            Some(Value::Obj(Some(vm.heap.alloc(Object::String(joined))?)))
+        }
+        Native::StringEquals => {
             let left = vm.string_units(arg(0)?)?;
             let right = vm.string_units(arg(1)?)?;
-            let equal = left == right;
-            Some(Value::I32(i32::from(equal == (native == Native::StringEquals))))
+            Some(Value::I32(i32::from(left == right)))
         }
-        Native::ObjectCtor => None,
+        Native::StringHash => {
+            let text = vm.string_units(arg(0)?)?.unwrap_or_default();
+            let hash = text.iter().fold(5381i32, |h, &u| h.wrapping_mul(33) ^ i32::from(u));
+            Some(Value::I32(hash))
+        }
+        Native::BoolToString => {
+            let value = vm.int32(number(vm)?)? != 0;
+            Some(vm.new_string_from(if value { "True" } else { "False" })?)
+        }
+        Native::CharToString => {
+            let unit = vm.int32(number(vm)?)? as u16;
+            Some(Value::Obj(Some(vm.heap.string(core::iter::once(unit))?)))
+        }
+        Native::I8ToString => text(vm, format!("{}", vm.int32(number(vm)?)? as i8))?,
+        Native::U8ToString => text(vm, format!("{}", vm.int32(number(vm)?)? as u8))?,
+        Native::I16ToString => text(vm, format!("{}", vm.int32(number(vm)?)? as i16))?,
+        Native::U16ToString => text(vm, format!("{}", vm.int32(number(vm)?)? as u16))?,
+        Native::I32ToString => text(vm, format!("{}", vm.int32(number(vm)?)?))?,
+        Native::U32ToString => text(vm, format!("{}", vm.int32(number(vm)?)? as u32))?,
+        Native::I64ToString => text(vm, format!("{}", vm.int64(number(vm)?)?))?,
+        Native::U64ToString => text(vm, format!("{}", vm.int64(number(vm)?)? as u64))?,
     })
+}
+
+fn text<H: Host>(vm: &mut Vm<'_, H>, text: alloc::string::String) -> Result<Option<Value>, VmError> {
+    Ok(Some(vm.new_string_from(&text)?))
 }

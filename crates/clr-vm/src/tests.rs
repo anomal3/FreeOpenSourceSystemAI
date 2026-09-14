@@ -18,8 +18,57 @@ impl Host for Capture {
     }
 }
 
+/// Базовая библиотека своей среды — та же сборка, что едет в образ.
+const CORELIB: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/FreeOs.CoreLib.dll");
 /// Шаблон `dotnet new console`.
 const HELLO: &[u8] = include_bytes!("../../clr-meta/fixtures/hello.dll");
+/// Образец `tools/dotnet/samples/objects` (фаза N3a).
+const OBJECTS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/objects.dll");
+
+/// Что печатает `dotnet objects.dll` (записано 2026-09-14, .NET 10, LF).
+const OBJECTS_OUTPUT: &str = concat!(
+    "objects: start\n",
+    "Rex says woof\n",
+    "little Bim says yip\n",
+    "Cat says meow\n",
+    "Animal Rex\n",
+    "hidden cat\n",
+    "Animal Cat\n",
+    "created: 3\n",
+    "age: 2\n",
+    "is Dog: True\n",
+    "is Cat: False\n",
+    "as Animal: True\n",
+    "puppy: yip\n",
+    "type: Puppy / FreeOs.Samples.Objects.Puppy\n",
+    "counter at 2\n",
+    "after reset: 0\n",
+    "step: 2\n",
+    "base next: 3\n",
+    "is IResettable: True\n",
+    "before Registry\n",
+    "Registry: static constructor\n",
+    "registry: 102\n",
+    "before Lazy\n",
+    "Lazy: static constructor\n",
+    "Lazy: instance constructor\n",
+    "hello from Lazy\n",
+    "lazy is True\n",
+    "a = (1, 2), b = (11, 12), sum 23\n",
+    "points: (0, 0) (5, 5) (7, 0)\n",
+    "array keeps (5, 5), copy (105, 105)\n",
+    "holder: (50, 3) line (3, 3)-(4, 4)\n",
+    "narrow: 0 32767\n",
+    "plain: FreeOs.Samples.Objects.Plain\n",
+    "boxed (1, 2), moved (2, 3), unboxed (1, 2)\n",
+    "number 42 back 43 is int: True\n",
+    "boxed equals: True True False\n",
+    "level: 200 True null slot True\n",
+    "primes: 129\n",
+    "раздватри 3\n",
+    "same: True False\n",
+    "objects: done\n",
+);
 /// Образец `tools/dotnet/samples/arith` — тот же файл, что едет в образ.
 const ARITH: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/arith.dll");
 
@@ -51,9 +100,43 @@ const ARITH_OUTPUT: &str = concat!(
 );
 
 fn run(data: &[u8]) -> (Result<i32, VmError>, String) {
-    let mut vm = Vm::new(data, Capture(String::new())).expect("assembly parses");
+    let mut vm = Vm::new(data, CORELIB, Capture(String::new())).expect("assembly parses");
     let result = vm.run_main(&[]);
     (result, vm.into_host().0)
+}
+
+/// Сколько стека получает поток теста, КиБ.
+///
+/// Тесты на машине разработчика идут на восьми мегабайтах, а `/bin/dotnet` —
+/// на стеке в мегабайт, взятом у ядра (`DOTNET_STACK_BYTES`). Разница однажды
+/// уже спрятала дефект: на обычных для программ 64 КиБ среда фазы N3a падала,
+/// пока все тесты были зелёными (замер: `objects` — около 90 КиБ на хосте,
+/// рекурсия загрузки типов по 3–5 КиБ на уровень). Четверть мегабайта — запас
+/// на кадры AArch64, которые крупнее, и на глубокие иерархии вроде WinForms.
+/// `CLR_STACK_KIB` меняет размер для замеров.
+const TEST_STACK_KIB: usize = 256;
+
+#[test]
+fn samples_fit_in_the_user_stack() {
+    let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
+    for (name, data) in [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS)] {
+        let worker = std::thread::Builder::new()
+            .stack_size(kib * 1024)
+            .spawn(move || run(data).0.map(|_| ()).map_err(|error| std::format!("{error}")))
+            .expect("thread starts");
+        // Переполнение стека обрывает весь процесс теста — это и есть провал.
+        let result = worker.join().expect("thread finishes");
+        assert!(result.is_ok(), "{name} in {kib} KiB: {result:?}");
+    }
+}
+
+#[test]
+fn objects_print_what_dotnet_prints() {
+    let (result, output) = run(OBJECTS);
+    // Сначала ошибка среды: по одному обрезанному выводу не видно, где встала.
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, OBJECTS_OUTPUT);
+    assert_eq!(code, 3);
 }
 
 #[test]

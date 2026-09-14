@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Базовая библиотека своей среды .NET (веха v0.7c, с фазы N3a).
+
+    Программа, собранная обычным `dotnet build`, ссылается на System.Runtime и
+    System.Console от Microsoft. Своя среда разрешает эти ссылки ПО ИМЕНИ типа и
+    члена в эту сборку: `[System.Console]System.Console::WriteLine(string)`
+    находит здесь `System.Console.WriteLine(string)`. Члены, которые нельзя
+    написать на C# (печать, длина строки, тип объекта), объявлены `extern` с
+    `MethodImplOptions.InternalCall` и выполняются кодом Rust из `clr-vm`.
+
+    Почему без стандартной библиотеки (NoStdLib): эта сборка сама и есть
+    стандартная библиотека. Она определяет System.Object, System.String и
+    примитивы, и ссылаться на чужие ей нечего — в метаданных нет ни одной
+    AssemblyRef. Компилятору нужны только имена «особых» типов, и он берёт их
+    отсюда.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>FreeOs.CoreLib</AssemblyName>
+    <RootNamespace>System</RootNamespace>
+    <NoStdLib>true</NoStdLib>
+    <NoCompilerStandardLib>true</NoCompilerStandardLib>
+    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <!-- Без mscorlib компилятору не у кого узнать версию метаданных. -->
+    <RuntimeMetadataVersion>v4.0.30319</RuntimeMetadataVersion>
+    <!-- CS0660/CS0661: String определяет == без полного набора, как и в .NET. -->
+    <NoWarn>$(NoWarn);CS0660;CS0661</NoWarn>
+  </PropertyGroup>
+
+</Project>

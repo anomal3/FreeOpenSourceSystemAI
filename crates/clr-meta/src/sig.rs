@@ -132,6 +132,16 @@ pub fn type_token(encoded: u32) -> Result<Token, Error> {
 /// сборка напрямую, — чтобы разбор сигнатур не зависел от того, откуда имена.
 pub trait TypeNames {
     fn write_name(&self, token: Token, out: &mut dyn Write) -> Result<(), Error>;
+
+    /// Записать обобщённый параметр: `!0` — параметр типа, `!!0` — метода.
+    ///
+    /// Среда выполнения подставляет сюда аргументы экземпляра: у
+    /// `Base<int>::M(!0)` и `Derived::M(int32)` одна и та же ячейка таблицы
+    /// виртуальных методов, и увидеть это можно, только записав `!0` как `int32`.
+    fn write_var(&self, number: u32, method: bool, out: &mut dyn Write) -> Result<(), Error> {
+        let bang = if method { "!!" } else { "!" };
+        write!(out, "{bang}{number}").map_err(|_| FORMAT)
+    }
 }
 
 /// Имена-заглушки для обхода, которому имена не нужны.
@@ -307,8 +317,7 @@ fn visit<W: Write + ?Sized>(
         elem::VAR | elem::MVAR => {
             let number = read_u(blob, &mut at)?;
             if let Some(out) = out.as_deref_mut() {
-                let bang = if code == elem::VAR { "!" } else { "!!" };
-                write!(out, "{bang}{number}").map_err(|_| FORMAT)?;
+                names.write_var(number, code == elem::MVAR, &mut Dyn(out))?;
             }
         }
         elem::ARRAY => {

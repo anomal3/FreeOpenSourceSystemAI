@@ -3143,6 +3143,31 @@ pub const ALL: &[Scenario] = &[
             Step::Await("Привет из IL", 60_000),
             Step::Await("arith: done", 60_000),
             Step::Await("dotnet: arith.dll: Main returned 0", 60_000),
+            Step::Await("freeos> ", 15_000),
+            // Фаза N3a: классы, виртуальные вызовы, интерфейсы, статические
+            // конструкторы, структуры и упаковка поверх своей базовой библиотеки
+            // на C#. Строки выбраны так, что каждая ломается от своего дефекта:
+            // таблица виртуальных методов, повторная реализация интерфейса,
+            // порядок статического конструктора, копия структуры, упаковка.
+            Step::Line("dotnet /usr/share/dotnet/samples/objects.dll"),
+            Step::Await("objects: start", 60_000),
+            Step::Await("little Bim says yip", 60_000),
+            Step::Await("type: Puppy / FreeOs.Samples.Objects.Puppy", 60_000),
+            Step::Await("counter at 2", 60_000),
+            Step::Await("base next: 3", 60_000),
+            Step::Await("before Registry", 60_000),
+            Step::Await("Registry: static constructor", 60_000),
+            Step::Await("registry: 102", 60_000),
+            Step::Await("a = (1, 2), b = (11, 12), sum 23", 60_000),
+            Step::Await("points: (0, 0) (5, 5) (7, 0)", 60_000),
+            Step::Await("holder: (50, 3) line (3, 3)-(4, 4)", 60_000),
+            Step::Await("boxed (1, 2), moved (2, 3), unboxed (1, 2)", 60_000),
+            Step::Await("boxed equals: True True False", 60_000),
+            Step::Await("primes: 129", 60_000),
+            Step::Await("раздватри 3", 60_000),
+            Step::Await("objects: done", 60_000),
+            // Main возвращает число созданных животных — три.
+            Step::Await("dotnet: objects.dll: Main returned 3", 60_000),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),
         ],

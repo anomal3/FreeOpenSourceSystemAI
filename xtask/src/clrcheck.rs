@@ -33,9 +33,12 @@ use clr_meta::{Assembly, Coded, Token};
 
 /// Пробные программы, собираемые перед сверкой, и выполняет ли их своя среда.
 ///
-/// `features` нужен ради таблиц метаданных: в нём объекты, события и
-/// исключения, которых у среды фазы N2 ещё нет.
-const SAMPLES: [(&str, bool); 3] = [("hello", true), ("arith", true), ("features", false)];
+/// `features` нужен ради таблиц метаданных: в нём события, делегаты и
+/// исключения, которых у среды фазы N3a ещё нет.
+const SAMPLES: [(&str, bool); 4] = [("hello", true), ("arith", true), ("objects", true), ("features", false)];
+
+/// Имя сборки базовой библиотеки своей среды (`tools/dotnet/corelib`).
+const CORELIB: &str = "FreeOs.CoreLib.dll";
 
 pub fn check() -> Result<()> {
     let root = repo_root();
@@ -52,6 +55,12 @@ pub fn check() -> Result<()> {
         dotnet_build(&root.join("tools/dotnet/samples").join(sample), &dir)?;
         assemblies.push((sample.to_string(), dir.join(format!("{sample}.dll"))));
     }
+    // Своя базовая библиотека тоже сверяется: это сборка без стандартной
+    // библиотеки (NoStdLib), и нашему разбору такие ещё не попадались.
+    let corelib_dir = out.join("corelib");
+    dotnet_build(&root.join("tools/dotnet/corelib"), &corelib_dir)?;
+    let corelib_path = corelib_dir.join(CORELIB);
+    assemblies.push((CORELIB.to_string(), corelib_path.clone()));
     let runtimes = installed_runtimes()?;
     if let Some(core) = runtimes.iter().find(|r| r.name == "Microsoft.NETCore.App") {
         for file in ["System.Private.CoreLib.dll", "System.Runtime.dll", "System.Console.dll"] {
@@ -93,6 +102,8 @@ pub fn check() -> Result<()> {
 
     // Фаза N2: те же программы — своей средой и настоящим dotnet. Совпасть
     // обязаны вывод до байта и код возврата.
+    let corelib = fs::read(&corelib_path).with_context(|| format!("read {}", corelib_path.display()))?;
+    refresh_initrd(&root, CORELIB, &corelib)?;
     let mut run_failed = 0;
     for (sample, run) in SAMPLES {
         if !run {
@@ -101,7 +112,7 @@ pub fn check() -> Result<()> {
         let dll = out.join("samples").join(sample).join(format!("{sample}.dll"));
         let data = fs::read(&dll).with_context(|| format!("read {}", dll.display()))?;
         let (their_code, theirs) = run_dotnet(&dll)?;
-        let (our_code, ours) = run_ours(&data);
+        let (our_code, ours) = run_ours(&data, &corelib);
         if ours == theirs && our_code == Some(their_code) {
             println!(
                 "clr-check: run {sample}: output matches dotnet ({} lines), exit code {their_code}",
@@ -119,7 +130,7 @@ pub fn check() -> Result<()> {
                 println!("  theirs: {their_line}");
             }
         }
-        refresh_initrd_sample(&root, sample, &data)?;
+        refresh_initrd(&root, &format!("samples/{sample}.dll"), &data)?;
     }
     if run_failed > 0 {
         bail!("{run_failed} sample program(s) behave differently under the own runtime");
@@ -146,8 +157,8 @@ impl clr_vm::Host for Capture {
 
 /// Выполнить сборку своей средой. Ошибка среды попадает в вывод строкой — так
 /// её видно в сравнении рядом с тем, что успело напечататься.
-fn run_ours(data: &[u8]) -> (Option<i32>, String) {
-    let mut vm = match clr_vm::Vm::new(data, Capture(String::new())) {
+fn run_ours(data: &[u8], corelib: &[u8]) -> (Option<i32>, String) {
+    let mut vm = match clr_vm::Vm::new(data, corelib, Capture(String::new())) {
         Ok(vm) => vm,
         Err(error) => return (None, format!("<load error: {error}>\n")),
     };
@@ -162,18 +173,19 @@ fn run_ours(data: &[u8]) -> (Option<i32>, String) {
     }
 }
 
-/// Положить свежую сборку образца в initrd, если там лежит другая.
+/// Положить свежую сборку (образец или базовую библиотеку) в initrd, если там
+/// лежит другая. `relative` — путь внутри `/usr/share/dotnet`.
 ///
-/// Образ системы собирается без .NET SDK, поэтому сборки образцов лежат в
-/// репозитории готовыми. Сборка у SDK детерминирована, и расхождение означает,
-/// что поменялся исходник образца или сам SDK, — тогда образ обязан везти то,
-/// что сейчас проверено.
-fn refresh_initrd_sample(root: &Path, sample: &str, data: &[u8]) -> Result<()> {
-    let dir = root.join("initrd/usr/share/dotnet/samples");
-    let path = dir.join(format!("{sample}.dll"));
+/// Образ системы собирается без .NET SDK, поэтому сборки лежат в репозитории
+/// готовыми. Сборка у SDK детерминирована, и расхождение означает, что
+/// поменялся исходник или сам SDK, — тогда образ обязан везти то, что сейчас
+/// проверено.
+fn refresh_initrd(root: &Path, relative: &str, data: &[u8]) -> Result<()> {
+    let path = root.join("initrd/usr/share/dotnet").join(relative);
     if fs::read(&path).ok().as_deref() == Some(data) {
         return Ok(());
     }
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     fs::write(&path, data).with_context(|| format!("write {}", path.display()))?;
     println!("clr-check: updated {} - the image carries this build now, commit it", path.display());

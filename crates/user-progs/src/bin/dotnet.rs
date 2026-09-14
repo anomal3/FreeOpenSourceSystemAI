@@ -30,6 +30,10 @@ use user_progs::{Args, close, error, exit, file_size, heap_size, open, print, re
 /// живут в ней; мегабайта, который достаётся остальным программам, не хватает.
 const HEAP_BYTES: usize = 16 * 1024 * 1024;
 
+/// Базовая библиотека своей среды: на неё разрешаются ссылки программы на
+/// `System.Runtime` и `System.Console` (фаза N3a).
+const CORELIB: &str = "/usr/share/dotnet/FreeOs.CoreLib.dll";
+
 /// Самая большая сборка, которую программа читает.
 const FILE_MAX: usize = 4 * 1024 * 1024;
 
@@ -48,10 +52,32 @@ impl Host for Console {
     }
 }
 
+/// Стек среды: мегабайт вместо обычных 64 КиБ.
+///
+/// Загрузка типа в `clr-vm` рекурсивна по цепочке баз и полей-структур, по
+/// 3–5 КиБ на уровень, и образец `objects` фазы N3a съедал около 90 КиБ —
+/// `/bin/dotnet` снимался ядром на первой же сборке. Иерархии WinForms
+/// (`Form` → … → `Object`, семь уровней) глубже. Мегабайт — с запасом на них и
+/// на кадры AArch64, а тест `samples_fit_in_the_user_stack` в `clr-vm` держит
+/// образцы в четверти этого.
+const DOTNET_STACK_BYTES: usize = 1024 * 1024;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
-    // Первым делом, до любого выделения: размер кучи задаётся один раз.
+    // Первым делом, до любого выделения: и размер кучи, и место стека зависят
+    // от того, что ещё ничего не выделено (см. `run_on_own_stack`).
     heap_size(HEAP_BYTES);
+    let start = (argc, argv);
+    let code = user_progs::run_on_own_stack(DOTNET_STACK_BYTES, run, core::ptr::from_ref(&start) as usize);
+    error(&format!("dotnet: error: no memory for a {DOTNET_STACK_BYTES}-byte stack (code {code})\n"));
+    exit(1)
+}
+
+/// Всё остальное — уже на стеке среды.
+extern "C" fn run(start: usize) -> ! {
+    // SAFETY: `start` — адрес пары в кадре `_start`, который не вернётся
+    // никогда, так что пара жива до конца программы.
+    let (argc, argv) = unsafe { *(start as *const (usize, *const *const u8)) };
 
     // SAFETY: значения пришли от ядра в том виде, в каком их описывает договор.
     let args = unsafe { Args::new(argc, argv) };
@@ -76,7 +102,15 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         index += 1;
     }
 
-    let mut vm = match Vm::new(&data, Console) {
+    let corelib = match load(CORELIB) {
+        Ok(corelib) => corelib,
+        Err(text) => {
+            error(&format!("dotnet: error: {CORELIB}: {text}\n"));
+            exit(1)
+        }
+    };
+
+    let mut vm = match Vm::new(&data, &corelib, Console) {
         Ok(vm) => vm,
         Err(failure) => {
             error(&format!("dotnet: error: {name}: {failure}\n"));

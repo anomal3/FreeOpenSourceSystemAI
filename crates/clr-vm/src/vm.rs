@@ -1,19 +1,20 @@
-//! Цикл исполнения: кадры, инструкции IL, вызовы.
+//! Цикл исполнения: кадры и инструкции IL.
+//!
+//! Что делают вызовы, поля и упаковка — `objects.rs`; где лежат значения —
+//! `places.rs`; типы и токены — `loader.rs` и `dispatch.rs`.
 
 use alloc::collections::BTreeMap;
-use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt::Write as _;
 
-use clr_meta::sig::{self, elem};
 use clr_meta::tables::id;
-use clr_meta::{Assembly, Coded, Token};
+use clr_meta::{Assembly, Token};
 
 use crate::heap::{Heap, Object};
-use crate::natives::{self, Native};
-use crate::ops::{self, Fault};
+use crate::ops;
+use crate::places::{narrow_load, narrow_store};
+use crate::types::{Asm, Body, MethodId, MethodInfo, PROGRAM, Resolved, Type, TypeId, TYPE_BEFORE_FIELD_INIT};
 use crate::value::{ObjRef, Pointer, Value};
 use crate::{Host, VmError};
 
@@ -25,89 +26,70 @@ use crate::{Host, VmError};
 /// называется переполнением стека, как и в .NET.
 pub const MAX_FRAMES: usize = 2048;
 
-/// Флаг `MethodDef.Flags`: метод виртуальный.
-const METHOD_VIRTUAL: u32 = 0x0040;
-
-/// Во что обнуляется локальная переменная при входе в метод.
-#[derive(Clone, Copy)]
-enum Slot {
-    I32,
-    I64,
-    Native,
-    F,
-    Obj,
+pub(crate) struct Frame<'a> {
+    pub method: MethodId,
+    pub body: Rc<Body<'a>>,
+    pub pc: usize,
+    pub args: Vec<Value>,
+    pub locals: Vec<Value>,
+    pub stack: Vec<Value>,
+    /// Тип из префикса `constrained.` — для следующего `callvirt`.
+    pub constrained: Option<TypeId>,
 }
 
-impl Slot {
-    const fn zero(self) -> Value {
-        match self {
-            Self::I32 => Value::I32(0),
-            Self::I64 => Value::I64(0),
-            Self::Native => Value::Native(0),
-            Self::F => Value::F(0.0),
-            Self::Obj => Value::Obj(None),
-        }
-    }
-}
-
-/// Метод, подготовленный к исполнению: разобран один раз и лежит в кэше.
-struct Method<'a> {
-    row: u32,
-    code: &'a [u8],
-    max_stack: u16,
-    has_this: bool,
-    params: u32,
-    returns_value: bool,
-    is_virtual: bool,
-    locals: Vec<Slot>,
-}
-
-/// Кого зовёт инструкция `call`.
-#[derive(Clone, Copy)]
-enum Callee {
-    /// Метод этой сборки.
-    User(u32),
-    /// Член базовой библиотеки, написанный в Rust.
-    Native(Native),
-}
-
-struct Frame<'a> {
-    method: Rc<Method<'a>>,
-    pc: usize,
-    args: Vec<Value>,
-    locals: Vec<Value>,
-    stack: Vec<Value>,
-}
-
-/// Среда выполнения одной сборки.
+/// Среда выполнения программы вместе с базовой библиотекой.
 pub struct Vm<'a, H: Host> {
-    asm: Assembly<'a>,
-    host: H,
+    /// Базовая библиотека (`types::CORELIB`) и программа (`types::PROGRAM`).
+    pub(crate) asms: [Assembly<'a>; 2],
+    pub(crate) host: H,
     pub(crate) heap: Heap,
-    frames: Vec<Frame<'a>>,
-    methods: BTreeMap<u32, Rc<Method<'a>>>,
-    callees: BTreeMap<u32, Callee>,
-    /// Объекты строк `ldstr` по смещению в `#US`: литерал выделяется один раз,
-    /// как интернированная строка в .NET, — иначе цикл со строкой внутри рос бы
-    /// в куче на каждом обороте.
-    strings: BTreeMap<u32, ObjRef>,
-    encoding: Option<ObjRef>,
+    pub(crate) frames: Vec<Frame<'a>>,
+    pub(crate) types: Vec<Type>,
+    pub(crate) type_map: BTreeMap<(Asm, u32, Vec<TypeId>), TypeId>,
+    pub(crate) array_types: BTreeMap<TypeId, TypeId>,
+    pub(crate) corelib_types: BTreeMap<&'static str, TypeId>,
+    pub(crate) typerefs: BTreeMap<(Asm, u32), (Asm, u32)>,
+    pub(crate) load_depth: u32,
+    pub(crate) methods: Vec<MethodInfo<'a>>,
+    pub(crate) method_map: BTreeMap<(Asm, u32, TypeId, Vec<TypeId>), MethodId>,
+    /// Номер ячейки таблицы виртуальных методов у каждого виртуального метода.
+    pub(crate) slots: BTreeMap<MethodId, usize>,
+    pub(crate) dispatch_cache: BTreeMap<(TypeId, MethodId), MethodId>,
+    pub(crate) resolved: BTreeMap<(MethodId, u32), Resolved>,
+    /// Владельцы методов и полей: `[сборка * 2 + (поле ли)]`, строятся при
+    /// первом обращении.
+    pub(crate) owners: [Vec<u32>; 4],
+    /// Объекты строк `ldstr`: литерал выделяется один раз, как интернированная
+    /// строка в .NET, — иначе цикл со строкой внутри рос бы в куче на каждом
+    /// обороте.
+    pub(crate) strings: BTreeMap<(Asm, u32), ObjRef>,
+    pub(crate) type_objects: BTreeMap<TypeId, ObjRef>,
     /// Сколько инструкций выполнено.
     pub instructions: u64,
 }
 
 impl<'a, H: Host> Vm<'a, H> {
-    /// Подготовить сборку к запуску.
-    pub fn new(data: &'a [u8], host: H) -> Result<Self, VmError> {
+    /// Подготовить программу к запуску поверх базовой библиотеки.
+    pub fn new(program: &'a [u8], corelib: &'a [u8], host: H) -> Result<Self, VmError> {
         Ok(Self {
-            asm: Assembly::parse(data)?,
+            asms: [Assembly::parse(corelib)?, Assembly::parse(program)?],
             host,
             heap: Heap::new(),
             frames: Vec::new(),
-            methods: BTreeMap::new(),
-            callees: BTreeMap::new(),
+            types: Vec::new(),
+            type_map: BTreeMap::new(),
+            array_types: BTreeMap::new(),
+            corelib_types: BTreeMap::new(),
+            typerefs: BTreeMap::new(),
+            load_depth: 0,
+            methods: Vec::new(),
+            method_map: BTreeMap::new(),
+            slots: BTreeMap::new(),
+            dispatch_cache: BTreeMap::new(),
+            resolved: BTreeMap::new(),
+            owners: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             strings: BTreeMap::new(),
-            encoding: None,
+            type_objects: BTreeMap::new(),
             instructions: 0,
         })
     }
@@ -119,12 +101,12 @@ impl<'a, H: Host> Vm<'a, H> {
 
     #[must_use]
     pub fn type_count(&self) -> u32 {
-        self.asm.tables.rows(id::TYPE_DEF)
+        self.asms[usize::from(PROGRAM)].tables.rows(id::TYPE_DEF)
     }
 
     #[must_use]
     pub fn method_count(&self) -> u32 {
-        self.asm.tables.rows(id::METHOD_DEF)
+        self.asms[usize::from(PROGRAM)].tables.rows(id::METHOD_DEF)
     }
 
     #[must_use]
@@ -134,22 +116,25 @@ impl<'a, H: Host> Vm<'a, H> {
 
     /// Выполнить точку входа. Возвращает то, что вернул `Main` (ноль у `void`).
     pub fn run_main(&mut self, args: &[&str]) -> Result<i32, VmError> {
-        let entry = Token::from_value(self.asm.cli.entry_point);
+        let entry = Token::from_value(self.asms[usize::from(PROGRAM)].cli.entry_point);
         if entry.table != id::METHOD_DEF || entry.is_nil() {
             return Err(VmError::NoEntryPoint);
         }
-        let method = self.method(entry.row)?;
+        let owner_row = self.owner_row(PROGRAM, entry.row, false)?;
+        let owner = self.load_def(PROGRAM, owner_row, Rc::from([]))?;
+        let method = self.method_id(PROGRAM, entry.row, owner, Rc::from([]))?;
         let mut call_args = Vec::new();
-        match method.params {
+        match self.methods[method.0 as usize].params {
             0 => {}
             1 => {
-                let mut elements = Vec::new();
-                elements.try_reserve_exact(args.len()).map_err(|_| VmError::OutOfMemory)?;
+                let string = self.corelib_type("System.String")?;
+                let array_ty = self.array_of(string)?;
+                let mut items = Vec::new();
+                items.try_reserve_exact(args.len()).map_err(|_| VmError::OutOfMemory)?;
                 for arg in args {
-                    let text = self.heap.string(arg.encode_utf16())?;
-                    elements.push(Value::Obj(Some(text)));
+                    items.push(Value::Obj(Some(self.heap.string(arg.encode_utf16())?)));
                 }
-                let array = self.heap.alloc(Object::Array(elements))?;
+                let array = self.heap.alloc(Object::Array { ty: array_ty, items })?;
                 call_args.push(Value::Obj(Some(array)));
             }
             _ => {
@@ -159,19 +144,23 @@ impl<'a, H: Host> Vm<'a, H> {
             }
         }
         self.enter(method, call_args)?;
-        Ok(match self.execute()? {
+        // Статический конструктор типа с `Main` выполняется раньше `Main`: его
+        // кадр ложится сверху.
+        if self.types[owner.0 as usize].flags & TYPE_BEFORE_FIELD_INIT == 0 {
+            self.ensure_initialized(owner)?;
+        }
+        Ok(match self.execute(0)? {
             Some(Value::I32(code)) => code,
             _ => 0,
         })
     }
 
-    /// Исполнять, пока не вернётся кадр, лежащий сверху в момент вызова.
-    fn execute(&mut self) -> Result<Option<Value>, VmError> {
-        let floor = self.frames.len() - 1;
+    /// Исполнять, пока число кадров не опустится до `floor`.
+    fn execute(&mut self, floor: usize) -> Result<Option<Value>, VmError> {
         loop {
             self.instructions += 1;
             let top = self.frames.len() - 1;
-            let code = self.frames[top].method.code;
+            let code = self.frames[top].body.code;
             let pc = self.frames[top].pc;
             let Some(&op) = code.get(pc) else {
                 return Err(self.invalid("execution ran past the end of the method"));
@@ -181,49 +170,36 @@ impl<'a, H: Host> Vm<'a, H> {
                 // nop, break
                 0x00 | 0x01 => {}
                 // ldarg.0 … ldarg.3
-                0x02..=0x05 => {
-                    let value = self.arg(usize::from(op - 0x02))?;
-                    self.push(value)?;
-                }
+                0x02..=0x05 => self.push_place(Pointer::Arg { frame: top as u32, index: u32::from(op - 0x02) })?,
                 // ldloc.0 … ldloc.3
-                0x06..=0x09 => {
-                    let value = self.local(usize::from(op - 0x06))?;
-                    self.push(value)?;
-                }
+                0x06..=0x09 => self.push_place(Pointer::Local { frame: top as u32, index: u32::from(op - 0x06) })?,
                 // stloc.0 … stloc.3
-                0x0A..=0x0D => {
-                    let value = self.pop()?;
-                    self.set_local(usize::from(op - 0x0A), value)?;
-                }
+                0x0A..=0x0D => self.pop_to(Pointer::Local { frame: top as u32, index: u32::from(op - 0x0A) })?,
                 0x0E => {
                     let index = self.operand_u8(code, &mut next)?;
-                    let value = self.arg(index)?;
-                    self.push(value)?;
+                    self.push_place(Pointer::Arg { frame: top as u32, index })?;
                 }
                 0x0F => {
                     let index = self.operand_u8(code, &mut next)?;
-                    let pointer = self.arg_pointer(index)?;
+                    let pointer = self.arg_pointer(index as usize)?;
                     self.push(pointer)?;
                 }
                 0x10 => {
                     let index = self.operand_u8(code, &mut next)?;
-                    let value = self.pop()?;
-                    self.set_arg(index, value)?;
+                    self.pop_to(Pointer::Arg { frame: top as u32, index })?;
                 }
                 0x11 => {
                     let index = self.operand_u8(code, &mut next)?;
-                    let value = self.local(index)?;
-                    self.push(value)?;
+                    self.push_place(Pointer::Local { frame: top as u32, index })?;
                 }
                 0x12 => {
                     let index = self.operand_u8(code, &mut next)?;
-                    let pointer = self.local_pointer(index)?;
+                    let pointer = self.local_pointer(index as usize)?;
                     self.push(pointer)?;
                 }
                 0x13 => {
                     let index = self.operand_u8(code, &mut next)?;
-                    let value = self.pop()?;
-                    self.set_local(index, value)?;
+                    self.pop_to(Pointer::Local { frame: top as u32, index })?;
                 }
                 // ldnull
                 0x14 => self.push(Value::Obj(None))?,
@@ -249,9 +225,10 @@ impl<'a, H: Host> Vm<'a, H> {
                     let bytes = self.operand::<8>(code, &mut next)?;
                     self.push(Value::F(f64::from_le_bytes(bytes)))?;
                 }
-                // dup
+                // dup: копия структуры, а не второй владелец.
                 0x25 => {
                     let value = self.peek()?;
+                    let value = self.copy_out(value)?;
                     self.push(value)?;
                 }
                 // pop
@@ -260,18 +237,14 @@ impl<'a, H: Host> Vm<'a, H> {
                 }
                 // call, callvirt
                 0x28 | 0x6F => {
-                    let token = u32::from_le_bytes(self.operand::<4>(code, &mut next)?);
-                    self.frames[top].pc = next;
-                    self.call(token, op == 0x6F)?;
+                    let token = self.operand_u32(code, &mut next)?;
+                    self.call(token, op == 0x6F, next)?;
                     continue;
                 }
                 // ret
                 0x2A => {
-                    let value = if self.frames[top].method.returns_value {
-                        Some(self.pop()?)
-                    } else {
-                        None
-                    };
+                    let returns = self.methods[self.frames[top].method.0 as usize].returns;
+                    let value = if returns { Some(self.pop()?) } else { None };
                     self.frames.pop();
                     if self.frames.len() == floor {
                         return Ok(value);
@@ -290,14 +263,14 @@ impl<'a, H: Host> Vm<'a, H> {
                 }
                 // br … blt.un
                 0x38..=0x44 => {
-                    let offset = i32::from_le_bytes(self.operand::<4>(code, &mut next)?);
+                    let offset = self.operand_u32(code, &mut next)? as i32;
                     if self.branch(op - 0x38)? {
                         next = self.target(code, next, i64::from(offset))?;
                     }
                 }
                 // switch
                 0x45 => {
-                    let count = u32::from_le_bytes(self.operand::<4>(code, &mut next)?) as usize;
+                    let count = self.operand_u32(code, &mut next)? as usize;
                     let table = next;
                     let Some(after) = count
                         .checked_mul(4)
@@ -313,21 +286,21 @@ impl<'a, H: Host> Vm<'a, H> {
                     next = after;
                     if index < count {
                         let mut at = table + index * 4;
-                        let offset = i32::from_le_bytes(self.operand::<4>(code, &mut at)?);
+                        let offset = self.operand_u32(code, &mut at)? as i32;
                         next = self.target(code, after, i64::from(offset))?;
                     }
                 }
                 // ldind.i1 … ldind.ref
                 0x46..=0x50 => {
-                    let pointer = self.pop()?;
-                    let value = self.load_indirect(pointer)?;
+                    let pointer = self.pop_pointer()?;
+                    let value = self.load(pointer)?;
                     self.push(narrow_load(op, value))?;
                 }
                 // stind.ref … stind.r8, stind.i
                 0x51..=0x57 | 0xDF => {
                     let value = self.pop()?;
-                    let pointer = self.pop()?;
-                    self.store_indirect(pointer, narrow_store(op, value))?;
+                    let pointer = self.pop_pointer()?;
+                    self.store(pointer, narrow_store(op, value))?;
                 }
                 // add … xor, add.ovf … sub.ovf.un
                 0x58..=0x61 | 0xD6..=0xDB => {
@@ -355,17 +328,90 @@ impl<'a, H: Host> Vm<'a, H> {
                     let result = ops::convert(op, value).map_err(|fault| self.fault(fault))?;
                     self.push(result)?;
                 }
+                // cpobj
+                0x70 => {
+                    self.operand_u32(code, &mut next)?;
+                    let source = self.pop_pointer()?;
+                    let destination = self.pop_pointer()?;
+                    let value = self.load(source)?;
+                    let value = self.copy_out(value)?;
+                    self.store(destination, value)?;
+                }
+                // ldobj
+                0x71 => {
+                    let token = self.operand_u32(code, &mut next)?;
+                    let ty = self.resolve_type(self.frames[top].method, token)?;
+                    let pointer = self.pop_pointer()?;
+                    let value = self.load(pointer)?;
+                    let value = self.copy_out(value)?;
+                    let store = self.types[ty.0 as usize].store(ty);
+                    self.push(store.narrow(value))?;
+                }
                 // ldstr
                 0x72 => {
-                    let token = u32::from_le_bytes(self.operand::<4>(code, &mut next)?);
-                    let value = self.load_string(token)?;
+                    let token = self.operand_u32(code, &mut next)?;
+                    let asm = self.methods[self.frames[top].method.0 as usize].asm;
+                    let value = self.load_string(asm, token)?;
                     self.push(value)?;
+                }
+                // newobj
+                0x73 => {
+                    let token = self.operand_u32(code, &mut next)?;
+                    self.new_object(token, next)?;
+                    continue;
+                }
+                // castclass, isinst
+                0x74 | 0x75 => {
+                    let token = self.operand_u32(code, &mut next)?;
+                    let ty = self.resolve_type(self.frames[top].method, token)?;
+                    self.cast(ty, op == 0x74)?;
+                }
+                // unbox, unbox.any
+                0x79 | 0xA5 => {
+                    let token = self.operand_u32(code, &mut next)?;
+                    let ty = self.resolve_type(self.frames[top].method, token)?;
+                    self.unbox(ty, op == 0xA5)?;
+                }
+                // ldfld, ldflda
+                0x7B | 0x7C => {
+                    let token = self.operand_u32(code, &mut next)?;
+                    self.load_field(token, op == 0x7C)?;
+                }
+                // stfld
+                0x7D => {
+                    let token = self.operand_u32(code, &mut next)?;
+                    self.store_field(token)?;
+                }
+                // ldsfld, ldsflda, stsfld
+                0x7E..=0x80 => {
+                    let token = self.operand_u32(code, &mut next)?;
+                    if !self.static_field(op, token)? {
+                        continue;
+                    }
+                }
+                // stobj
+                0x81 => {
+                    let token = self.operand_u32(code, &mut next)?;
+                    let ty = self.resolve_type(self.frames[top].method, token)?;
+                    let value = self.pop()?;
+                    let pointer = self.pop_pointer()?;
+                    let store = self.types[ty.0 as usize].store(ty);
+                    self.store(pointer, store.narrow(value))?;
+                }
+                // box
+                0x8C => {
+                    let token = self.operand_u32(code, &mut next)?;
+                    let ty = self.resolve_type(self.frames[top].method, token)?;
+                    let value = self.pop()?;
+                    let boxed = self.box_value(ty, value)?;
+                    self.push(boxed)?;
                 }
                 // newarr
                 0x8D => {
-                    let token = u32::from_le_bytes(self.operand::<4>(code, &mut next)?);
+                    let token = self.operand_u32(code, &mut next)?;
+                    let element = self.resolve_type(self.frames[top].method, token)?;
                     let length = self.pop()?;
-                    let array = self.new_array(token, length)?;
+                    let array = self.new_array(element, length)?;
                     self.push(array)?;
                 }
                 // ldlen
@@ -376,7 +422,7 @@ impl<'a, H: Host> Vm<'a, H> {
                 }
                 // ldelema
                 0x8F => {
-                    self.operand::<4>(code, &mut next)?;
+                    self.operand_u32(code, &mut next)?;
                     let index = self.pop()?;
                     let array = self.pop()?;
                     let (array, index) = self.element(array, index)?;
@@ -385,12 +431,13 @@ impl<'a, H: Host> Vm<'a, H> {
                 // ldelem.i1 … ldelem.ref, ldelem <T>
                 0x90..=0x9A | 0xA3 => {
                     if op == 0xA3 {
-                        self.operand::<4>(code, &mut next)?;
+                        self.operand_u32(code, &mut next)?;
                     }
                     let index = self.pop()?;
                     let array = self.pop()?;
                     let (array, index) = self.element(array, index)?;
-                    let value = self.load_indirect(Value::Ptr(Pointer::Element { array, index }))?;
+                    let value = self.load(Pointer::Element { array, index })?;
+                    let value = self.copy_out(value)?;
                     // Элементы лежат так же, как значения по указателю:
                     // `ldelem.X` — это `ldind.X`, сдвинутый на 0x4A.
                     let value = if op == 0xA3 { value } else { narrow_load(op - 0x4A, value) };
@@ -399,7 +446,7 @@ impl<'a, H: Host> Vm<'a, H> {
                 // stelem.i … stelem.ref, stelem <T>
                 0x9B..=0xA2 | 0xA4 => {
                     if op == 0xA4 {
-                        self.operand::<4>(code, &mut next)?;
+                        self.operand_u32(code, &mut next)?;
                     }
                     let value = self.pop()?;
                     let index = self.pop()?;
@@ -409,14 +456,19 @@ impl<'a, H: Host> Vm<'a, H> {
                         0x9C..=0xA1 => op - 0x4A,
                         _ => 0x51,
                     };
-                    self.store_indirect(Value::Ptr(Pointer::Element { array, index }), narrow_store(stind, value))?;
+                    self.store(Pointer::Element { array, index }, narrow_store(stind, value))?;
+                }
+                // ldtoken
+                0xD0 => {
+                    let token = self.operand_u32(code, &mut next)?;
+                    self.load_token(token)?;
                 }
                 // leave, leave.s: выход из защищённого блока. Обработчиков у
-                // методов этой фазы нет (см. `method`), и `leave` — это переход,
-                // очищающий стек вычислений.
+                // методов этой фазы нет (см. `Vm::body`), и `leave` — это
+                // переход, очищающий стек вычислений.
                 0xDD | 0xDE => {
                     let offset = if op == 0xDD {
-                        i64::from(i32::from_le_bytes(self.operand::<4>(code, &mut next)?))
+                        i64::from(self.operand_u32(code, &mut next)? as i32)
                     } else {
                         let [byte] = self.operand::<1>(code, &mut next)?;
                         i64::from(byte as i8)
@@ -443,33 +495,42 @@ impl<'a, H: Host> Vm<'a, H> {
                         }
                         0x09 => {
                             let index = self.operand_u16(code, &mut next)?;
-                            let value = self.arg(index)?;
-                            self.push(value)?;
+                            self.push_place(Pointer::Arg { frame: top as u32, index })?;
                         }
                         0x0A => {
                             let index = self.operand_u16(code, &mut next)?;
-                            let pointer = self.arg_pointer(index)?;
+                            let pointer = self.arg_pointer(index as usize)?;
                             self.push(pointer)?;
                         }
                         0x0B => {
                             let index = self.operand_u16(code, &mut next)?;
-                            let value = self.pop()?;
-                            self.set_arg(index, value)?;
+                            self.pop_to(Pointer::Arg { frame: top as u32, index })?;
                         }
                         0x0C => {
                             let index = self.operand_u16(code, &mut next)?;
-                            let value = self.local(index)?;
-                            self.push(value)?;
+                            self.push_place(Pointer::Local { frame: top as u32, index })?;
                         }
                         0x0D => {
                             let index = self.operand_u16(code, &mut next)?;
-                            let pointer = self.local_pointer(index)?;
+                            let pointer = self.local_pointer(index as usize)?;
                             self.push(pointer)?;
                         }
                         0x0E => {
                             let index = self.operand_u16(code, &mut next)?;
-                            let value = self.pop()?;
-                            self.set_local(index, value)?;
+                            self.pop_to(Pointer::Local { frame: top as u32, index })?;
+                        }
+                        // initobj
+                        0x15 => {
+                            let token = self.operand_u32(code, &mut next)?;
+                            let ty = self.resolve_type(self.frames[top].method, token)?;
+                            let pointer = self.pop_pointer()?;
+                            self.clear(pointer, ty)?;
+                        }
+                        // constrained.
+                        0x16 => {
+                            let token = self.operand_u32(code, &mut next)?;
+                            let ty = self.resolve_type(self.frames[top].method, token)?;
+                            self.frames[top].constrained = Some(ty);
                         }
                         // Префиксы `unaligned.` и `no.` с байтом операнда,
                         // `volatile.`, `tail.` и `readonly.` без: интерпретатору
@@ -487,134 +548,25 @@ impl<'a, H: Host> Vm<'a, H> {
         }
     }
 
-    // --------------------------------------------------------------------
-    // Стек, аргументы, локальные переменные
-    // --------------------------------------------------------------------
-
-    fn push(&mut self, value: Value) -> Result<(), VmError> {
-        let Some(frame) = self.frames.last_mut() else {
-            return Err(VmError::Invalid { what: "push without a frame", at: String::new() });
-        };
-        frame.stack.try_reserve(1).map_err(|_| VmError::OutOfMemory)?;
-        frame.stack.push(value);
-        Ok(())
+    /// Положить на стек копию значения из места.
+    fn push_place(&mut self, pointer: Pointer) -> Result<(), VmError> {
+        let value = self.load(pointer)?;
+        let value = self.copy_out(value)?;
+        self.push(value)
     }
 
-    fn pop(&mut self) -> Result<Value, VmError> {
-        match self.frames.last_mut().and_then(|frame| frame.stack.pop()) {
-            Some(value) => Ok(value),
-            None => Err(self.invalid("evaluation stack underflow")),
-        }
+    /// Снять значение со стека в место.
+    fn pop_to(&mut self, pointer: Pointer) -> Result<(), VmError> {
+        let value = self.pop()?;
+        self.store(pointer, value)
     }
 
-    fn peek(&self) -> Result<Value, VmError> {
-        self.frames
-            .last()
-            .and_then(|frame| frame.stack.last().copied())
-            .ok_or_else(|| self.invalid("evaluation stack underflow"))
-    }
-
-    fn arg(&self, index: usize) -> Result<Value, VmError> {
-        self.frames
-            .last()
-            .and_then(|frame| frame.args.get(index).copied())
-            .ok_or_else(|| self.invalid("argument number out of range"))
-    }
-
-    fn set_arg(&mut self, index: usize, value: Value) -> Result<(), VmError> {
-        let top = self.frames.len() - 1;
-        if index >= self.frames[top].args.len() {
-            return Err(self.invalid("argument number out of range"));
-        }
-        self.frames[top].args[index] = value;
-        Ok(())
-    }
-
-    fn local(&self, index: usize) -> Result<Value, VmError> {
-        self.frames
-            .last()
-            .and_then(|frame| frame.locals.get(index).copied())
-            .ok_or_else(|| self.invalid("local variable number out of range"))
-    }
-
-    fn set_local(&mut self, index: usize, value: Value) -> Result<(), VmError> {
-        let top = self.frames.len() - 1;
-        if index >= self.frames[top].locals.len() {
-            return Err(self.invalid("local variable number out of range"));
-        }
-        self.frames[top].locals[index] = value;
-        Ok(())
-    }
-
-    fn arg_pointer(&self, index: usize) -> Result<Value, VmError> {
-        let top = self.frames.len() - 1;
-        if index >= self.frames[top].args.len() {
-            return Err(self.invalid("argument number out of range"));
-        }
-        Ok(Value::Ptr(Pointer::Arg { frame: top as u32, index: index as u32 }))
-    }
-
-    fn local_pointer(&self, index: usize) -> Result<Value, VmError> {
-        let top = self.frames.len() - 1;
-        if index >= self.frames[top].locals.len() {
-            return Err(self.invalid("local variable number out of range"));
-        }
-        Ok(Value::Ptr(Pointer::Local { frame: top as u32, index: index as u32 }))
-    }
-
-    fn load_indirect(&self, pointer: Value) -> Result<Value, VmError> {
-        match pointer {
-            Value::Ptr(Pointer::Local { frame, index }) => self
-                .frames
-                .get(frame as usize)
-                .and_then(|frame| frame.locals.get(index as usize).copied())
-                .ok_or_else(|| self.invalid("pointer to a local variable that no longer exists")),
-            Value::Ptr(Pointer::Arg { frame, index }) => self
-                .frames
-                .get(frame as usize)
-                .and_then(|frame| frame.args.get(index as usize).copied())
-                .ok_or_else(|| self.invalid("pointer to an argument that no longer exists")),
-            Value::Ptr(Pointer::Element { array, index }) => match self.heap.get(array) {
-                Some(Object::Array(elements)) => elements
-                    .get(index as usize)
-                    .copied()
-                    .ok_or_else(|| self.exception("System.IndexOutOfRangeException")),
-                _ => Err(self.invalid("element pointer into something that is not an array")),
-            },
+    fn pop_pointer(&mut self) -> Result<Pointer, VmError> {
+        match self.pop()? {
+            Value::Ptr(pointer) => Ok(pointer),
             Value::Obj(None) => Err(self.exception("System.NullReferenceException")),
             _ => Err(self.invalid("indirection through a value that is not a pointer")),
         }
-    }
-
-    fn store_indirect(&mut self, pointer: Value, value: Value) -> Result<(), VmError> {
-        match pointer {
-            Value::Ptr(Pointer::Local { frame, index }) => {
-                let ok = self.frames.get(frame as usize).is_some_and(|f| (index as usize) < f.locals.len());
-                if !ok {
-                    return Err(self.invalid("pointer to a local variable that no longer exists"));
-                }
-                self.frames[frame as usize].locals[index as usize] = value;
-            }
-            Value::Ptr(Pointer::Arg { frame, index }) => {
-                let ok = self.frames.get(frame as usize).is_some_and(|f| (index as usize) < f.args.len());
-                if !ok {
-                    return Err(self.invalid("pointer to an argument that no longer exists"));
-                }
-                self.frames[frame as usize].args[index as usize] = value;
-            }
-            Value::Ptr(Pointer::Element { array, index }) => {
-                let exists = matches!(self.heap.get(array), Some(Object::Array(e)) if (index as usize) < e.len());
-                if !exists {
-                    return Err(self.exception("System.IndexOutOfRangeException"));
-                }
-                if let Some(Object::Array(elements)) = self.heap.get_mut(array) {
-                    elements[index as usize] = value;
-                }
-            }
-            Value::Obj(None) => return Err(self.exception("System.NullReferenceException")),
-            _ => return Err(self.invalid("indirection through a value that is not a pointer")),
-        }
-        Ok(())
     }
 
     // --------------------------------------------------------------------
@@ -631,13 +583,17 @@ impl<'a, H: Host> Vm<'a, H> {
         Ok(out)
     }
 
-    fn operand_u8(&self, code: &[u8], next: &mut usize) -> Result<usize, VmError> {
+    fn operand_u8(&self, code: &[u8], next: &mut usize) -> Result<u32, VmError> {
         let [byte] = self.operand::<1>(code, next)?;
-        Ok(usize::from(byte))
+        Ok(u32::from(byte))
     }
 
-    fn operand_u16(&self, code: &[u8], next: &mut usize) -> Result<usize, VmError> {
-        Ok(usize::from(u16::from_le_bytes(self.operand::<2>(code, next)?)))
+    fn operand_u16(&self, code: &[u8], next: &mut usize) -> Result<u32, VmError> {
+        Ok(u32::from(u16::from_le_bytes(self.operand::<2>(code, next)?)))
+    }
+
+    fn operand_u32(&self, code: &[u8], next: &mut usize) -> Result<u32, VmError> {
+        Ok(u32::from_le_bytes(self.operand::<4>(code, next)?))
     }
 
     fn target(&self, code: &[u8], next: usize, offset: i64) -> Result<usize, VmError> {
@@ -675,501 +631,5 @@ impl<'a, H: Host> Vm<'a, H> {
                 }
             }
         })
-    }
-
-    // --------------------------------------------------------------------
-    // Вызовы
-    // --------------------------------------------------------------------
-
-    fn call(&mut self, token: u32, virtual_call: bool) -> Result<(), VmError> {
-        match self.resolve(token)? {
-            Callee::User(row) => {
-                let method = self.method(row)?;
-                if virtual_call && method.is_virtual {
-                    return Err(VmError::Unsupported {
-                        what: format!("virtual call to {} (phase N3)", self.method_name(row)),
-                    });
-                }
-                let count = method.params as usize + usize::from(method.has_this);
-                let args = self.pop_args(count)?;
-                if virtual_call && method.has_this && args.first() == Some(&Value::Obj(None)) {
-                    return Err(self.exception("System.NullReferenceException"));
-                }
-                self.enter(method, args)
-            }
-            Callee::Native(native) => {
-                let args = self.pop_args(native.arguments())?;
-                if let Some(result) = natives::call(self, native, &args)? {
-                    self.push(result)?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn pop_args(&mut self, count: usize) -> Result<Vec<Value>, VmError> {
-        let top = self.frames.len() - 1;
-        let depth = self.frames[top].stack.len();
-        if depth < count {
-            return Err(self.invalid("not enough arguments on the evaluation stack"));
-        }
-        let mut args = Vec::new();
-        args.try_reserve_exact(count).map_err(|_| VmError::OutOfMemory)?;
-        args.extend(self.frames[top].stack.drain(depth - count..));
-        Ok(args)
-    }
-
-    fn enter(&mut self, method: Rc<Method<'a>>, args: Vec<Value>) -> Result<(), VmError> {
-        if self.frames.len() >= MAX_FRAMES {
-            return Err(VmError::StackOverflow);
-        }
-        let mut locals = Vec::new();
-        locals.try_reserve_exact(method.locals.len()).map_err(|_| VmError::OutOfMemory)?;
-        locals.extend(method.locals.iter().map(|slot| slot.zero()));
-        let mut stack = Vec::new();
-        stack.try_reserve(usize::from(method.max_stack)).map_err(|_| VmError::OutOfMemory)?;
-        self.frames.try_reserve(1).map_err(|_| VmError::OutOfMemory)?;
-        self.frames.push(Frame { method, pc: 0, args, locals, stack });
-        Ok(())
-    }
-
-    fn resolve(&mut self, token: u32) -> Result<Callee, VmError> {
-        if let Some(callee) = self.callees.get(&token) {
-            return Ok(*callee);
-        }
-        let t = Token::from_value(token);
-        let callee = match t.table {
-            id::METHOD_DEF => Callee::User(t.row),
-            id::MEMBER_REF => self.resolve_member_ref(t.row)?,
-            id::METHOD_SPEC => {
-                return Err(VmError::Unsupported {
-                    what: format!("call to a generic method instantiation in {} (phase N3)", self.location()),
-                });
-            }
-            _ => return Err(self.invalid("call token is not a method")),
-        };
-        self.callees.insert(token, callee);
-        Ok(callee)
-    }
-
-    fn resolve_member_ref(&self, row: u32) -> Result<Callee, VmError> {
-        let tables = self.asm.tables;
-        let strings = self.asm.root.strings;
-        let parent = tables.coded_column(id::MEMBER_REF, row, 0, Coded::MemberRefParent)?;
-        let name = strings.get(tables.column(id::MEMBER_REF, row, 1)?)?;
-        let signature = self.asm.root.blobs.get(tables.column(id::MEMBER_REF, row, 2)?)?;
-        match parent.table {
-            id::TYPE_DEF => return self.find_method(parent.row, name, signature).map(Callee::User),
-            id::TYPE_REF => {}
-            _ => {
-                return Err(VmError::Unsupported {
-                    what: format!("call to {name} on a generic type instantiation (phase N3)"),
-                });
-            }
-        }
-
-        let scope = tables.coded_column(id::TYPE_REF, parent.row, 0, Coded::ResolutionScope)?;
-        if scope.table == id::MODULE {
-            let type_name = strings.get(tables.column(id::TYPE_REF, parent.row, 1)?)?;
-            let namespace = strings.get(tables.column(id::TYPE_REF, parent.row, 2)?)?;
-            if let Some(type_row) = self.find_type_def(namespace, type_name)? {
-                return self.find_method(type_row, name, signature).map(Callee::User);
-            }
-        }
-
-        let mut key = String::new();
-        self.asm.write_type_name(parent, &mut key, 0)?;
-        let _ = write!(key, "::{name}(");
-        sig::write_params(signature, &self.asm, &mut key)?;
-        key.push(')');
-        if let Some(native) = natives::lookup(&key) {
-            return Ok(Callee::Native(native));
-        }
-        let assembly = if scope.table == id::ASSEMBLY_REF {
-            strings.get(tables.column(id::ASSEMBLY_REF, scope.row, 6)?)?
-        } else {
-            "this module"
-        };
-        Err(VmError::MissingMember { name: format!("{key} from {assembly}") })
-    }
-
-    fn find_type_def(&self, namespace: &str, name: &str) -> Result<Option<u32>, VmError> {
-        let tables = self.asm.tables;
-        let strings = self.asm.root.strings;
-        for row in 1..=tables.rows(id::TYPE_DEF) {
-            if strings.get(tables.column(id::TYPE_DEF, row, 1)?)? == name
-                && strings.get(tables.column(id::TYPE_DEF, row, 2)?)? == namespace
-            {
-                return Ok(Some(row));
-            }
-        }
-        Ok(None)
-    }
-
-    fn find_method(&self, type_row: u32, name: &str, signature: &[u8]) -> Result<u32, VmError> {
-        let tables = self.asm.tables;
-        for method in tables.list(id::TYPE_DEF, type_row, 5, id::METHOD_DEF, id::METHOD_PTR)? {
-            let method = method?;
-            // Перегрузки различаются сигнатурой, и сравнивается она побайтно:
-            // обе стороны записаны одним компилятором одной сборки.
-            if self.asm.root.strings.get(tables.column(id::METHOD_DEF, method, 3)?)? == name
-                && self.asm.root.blobs.get(tables.column(id::METHOD_DEF, method, 4)?)? == signature
-            {
-                return Ok(method);
-            }
-        }
-        let mut owner = String::new();
-        let _ = self.asm.write_type_name(Token { table: id::TYPE_DEF, row: type_row }, &mut owner, 0);
-        Err(VmError::MissingMember { name: format!("{owner}::{name}") })
-    }
-
-    /// Разобрать метод один раз и положить в кэш.
-    fn method(&mut self, row: u32) -> Result<Rc<Method<'a>>, VmError> {
-        if let Some(method) = self.methods.get(&row) {
-            return Ok(Rc::clone(method));
-        }
-        let tables = self.asm.tables;
-        let rva = tables.column(id::METHOD_DEF, row, 0)?;
-        let flags = tables.column(id::METHOD_DEF, row, 2)?;
-        let blob = self.asm.root.blobs.get(tables.column(id::METHOD_DEF, row, 4)?)?;
-        let signature = sig::method_sig(blob)?;
-        if signature.header.convention & 0x0F == sig::CALL_VARARG {
-            return Err(VmError::Unsupported {
-                what: format!("variable argument lists in {}", self.method_name(row)),
-            });
-        }
-        if signature.header.generic_params > 0 {
-            return Err(VmError::Unsupported {
-                what: format!("generic method {} (phase N3)", self.method_name(row)),
-            });
-        }
-        let Some(body) = self.asm.method_body(rva)? else {
-            return Err(VmError::Unsupported {
-                what: format!(
-                    "{} has no IL body: it is extern, abstract or provided by the runtime",
-                    self.method_name(row)
-                ),
-            });
-        };
-        if body.clauses().next().is_some() {
-            return Err(VmError::Unsupported {
-                what: format!("exception handling in {} (phase N3)", self.method_name(row)),
-            });
-        }
-        let locals = self.local_slots(body.local_signature, row)?;
-        let method = Rc::new(Method {
-            row,
-            code: body.code,
-            max_stack: body.max_stack,
-            has_this: signature.header.convention & sig::HAS_THIS != 0,
-            params: signature.header.params,
-            returns_value: signature.returns_value,
-            is_virtual: flags & METHOD_VIRTUAL != 0,
-            locals,
-        });
-        self.methods.insert(row, Rc::clone(&method));
-        Ok(method)
-    }
-
-    fn local_slots(&self, token: u32, row: u32) -> Result<Vec<Slot>, VmError> {
-        let mut slots = Vec::new();
-        if token == 0 {
-            return Ok(slots);
-        }
-        let t = Token::from_value(token);
-        if t.table != id::STAND_ALONE_SIG {
-            return Err(VmError::Invalid {
-                what: "local variable signature token points elsewhere",
-                at: self.method_name(row),
-            });
-        }
-        let blob = self.asm.root.blobs.get(self.asm.tables.column(id::STAND_ALONE_SIG, t.row, 0)?)?;
-        let (count, mut at) = sig::locals(blob)?;
-        slots.try_reserve_exact(count as usize).map_err(|_| VmError::OutOfMemory)?;
-        for _ in 0..count {
-            let slot = match sig::element(blob, at)? {
-                elem::BOOLEAN | elem::CHAR | elem::I1 | elem::U1 | elem::I2 | elem::U2 | elem::I4 | elem::U4 => {
-                    Slot::I32
-                }
-                elem::I8 | elem::U8 => Slot::I64,
-                elem::I | elem::U | elem::PTR | elem::FNPTR => Slot::Native,
-                elem::R4 | elem::R8 => Slot::F,
-                elem::STRING | elem::CLASS | elem::OBJECT | elem::SZARRAY | elem::ARRAY | elem::BYREF => Slot::Obj,
-                elem::GENERICINST if blob.get(sig::skip_modifiers(blob, at)? + 1) == Some(&elem::CLASS) => Slot::Obj,
-                _ => {
-                    let mut name = String::new();
-                    let _ = sig::write_type(blob, at, &self.asm, &mut name);
-                    return Err(VmError::Unsupported {
-                        what: format!(
-                            "local variable of type {name} in {} (value types: phase N3)",
-                            self.method_name(row)
-                        ),
-                    });
-                }
-            };
-            slots.push(slot);
-            at = sig::skip_type(blob, at)?;
-        }
-        Ok(slots)
-    }
-
-    // --------------------------------------------------------------------
-    // Строки и массивы
-    // --------------------------------------------------------------------
-
-    fn load_string(&mut self, token: u32) -> Result<Value, VmError> {
-        let t = Token::from_value(token);
-        if t.table != id::USER_STRING {
-            return Err(self.invalid("ldstr token is not a user string"));
-        }
-        if let Some(existing) = self.strings.get(&t.row) {
-            return Ok(Value::Obj(Some(*existing)));
-        }
-        let text = self.asm.root.user_strings.get(t.row)?;
-        let reference = self.heap.string(text.units())?;
-        self.strings.insert(t.row, reference);
-        Ok(Value::Obj(Some(reference)))
-    }
-
-    fn new_array(&mut self, token: u32, length: Value) -> Result<Value, VmError> {
-        let count = match length {
-            Value::I32(n) => i64::from(n),
-            Value::Native(n) => n,
-            _ => return Err(self.invalid("array length is not an integer")),
-        };
-        if count < 0 {
-            return Err(self.exception("System.OverflowException"));
-        }
-        let zero = self.element_zero(token)?;
-        let mut elements = Vec::new();
-        elements.try_reserve_exact(count as usize).map_err(|_| VmError::OutOfMemory)?;
-        elements.resize(count as usize, zero);
-        let array = self.heap.alloc(Object::Array(elements))?;
-        Ok(Value::Obj(Some(array)))
-    }
-
-    /// Чем заполнен новый массив элементов этого типа.
-    fn element_zero(&self, token: u32) -> Result<Value, VmError> {
-        let mut name = String::new();
-        self.asm.write_type_name(Token::from_value(token), &mut name, 0)?;
-        Ok(match name.as_str() {
-            "System.Boolean" | "System.Char" | "System.SByte" | "System.Byte" | "System.Int16"
-            | "System.UInt16" | "System.Int32" | "System.UInt32" => Value::I32(0),
-            "System.Int64" | "System.UInt64" => Value::I64(0),
-            "System.IntPtr" | "System.UIntPtr" => Value::Native(0),
-            "System.Single" | "System.Double" => Value::F(0.0),
-            _ => {
-                // Массив значимых типов пользователя — это структуры, а
-                // структур у среды ещё нет. Сказать об этом честнее, чем
-                // молча завести массив ссылок.
-                let t = Token::from_value(token);
-                if t.table == id::TYPE_DEF && self.is_value_type(t.row)? {
-                    return Err(VmError::Unsupported {
-                        what: format!("array of value type {name} (phase N3)"),
-                    });
-                }
-                Value::Obj(None)
-            }
-        })
-    }
-
-    fn is_value_type(&self, type_row: u32) -> Result<bool, VmError> {
-        let base = self.asm.tables.coded_column(id::TYPE_DEF, type_row, 3, Coded::TypeDefOrRef)?;
-        if base.is_nil() {
-            return Ok(false);
-        }
-        let mut name = String::new();
-        self.asm.write_type_name(base, &mut name, 0)?;
-        Ok(name == "System.ValueType" || name == "System.Enum")
-    }
-
-    fn element(&self, array: Value, index: Value) -> Result<(ObjRef, u32), VmError> {
-        let reference = match array {
-            Value::Obj(Some(reference)) => reference,
-            Value::Obj(None) => return Err(self.exception("System.NullReferenceException")),
-            _ => return Err(self.invalid("element access on a value that is not an array")),
-        };
-        let index = match index {
-            Value::I32(i) => i64::from(i),
-            Value::Native(i) => i,
-            _ => return Err(self.invalid("array index is not an integer")),
-        };
-        let length = self.array_len(Value::Obj(Some(reference)))?;
-        if index < 0 || index as usize >= length {
-            return Err(self.exception("System.IndexOutOfRangeException"));
-        }
-        Ok((reference, index as u32))
-    }
-
-    fn array_len(&self, array: Value) -> Result<usize, VmError> {
-        match array {
-            Value::Obj(Some(reference)) => match self.heap.get(reference) {
-                Some(Object::Array(elements)) => Ok(elements.len()),
-                _ => Err(self.invalid("ldlen on something that is not an array")),
-            },
-            Value::Obj(None) => Err(self.exception("System.NullReferenceException")),
-            _ => Err(self.invalid("ldlen on a value that is not a reference")),
-        }
-    }
-
-    // --------------------------------------------------------------------
-    // Для членов библиотеки
-    // --------------------------------------------------------------------
-
-    pub(crate) fn string_units(&self, value: Value) -> Result<Option<Vec<u16>>, VmError> {
-        match value {
-            Value::Obj(None) => Ok(None),
-            Value::Obj(Some(reference)) => match self.heap.get(reference) {
-                Some(Object::String(units)) => {
-                    let mut copy = Vec::new();
-                    copy.try_reserve_exact(units.len()).map_err(|_| VmError::OutOfMemory)?;
-                    copy.extend_from_slice(units);
-                    Ok(Some(copy))
-                }
-                _ => Err(self.invalid("expected a string")),
-            },
-            _ => Err(self.invalid("expected a string reference")),
-        }
-    }
-
-    pub(crate) fn print_units(&mut self, units: &[u16], newline: bool) {
-        let mut text = String::new();
-        // Одиночная половинка суррогатной пары печатается знаком замены — так
-        // же поступает кодировщик UTF-8 в .NET.
-        text.extend(char::decode_utf16(units.iter().copied()).map(|c| c.unwrap_or('\u{FFFD}')));
-        if newline {
-            text.push('\n');
-        }
-        self.host.write_out(&text);
-    }
-
-    pub(crate) fn print_text(&mut self, text: &str, newline: bool) {
-        if newline {
-            let mut line = String::from(text);
-            line.push('\n');
-            self.host.write_out(&line);
-        } else {
-            self.host.write_out(text);
-        }
-    }
-
-    pub(crate) fn int32(&self, value: Value) -> Result<i32, VmError> {
-        match value {
-            Value::I32(x) => Ok(x),
-            _ => Err(self.invalid("expected an int32")),
-        }
-    }
-
-    pub(crate) fn int64(&self, value: Value) -> Result<i64, VmError> {
-        match value {
-            Value::I64(x) => Ok(x),
-            _ => Err(self.invalid("expected an int64")),
-        }
-    }
-
-    /// Значение по указателю — или само значение, если это не указатель.
-    pub(crate) fn deref(&self, value: Value) -> Result<Value, VmError> {
-        match value {
-            Value::Ptr(_) => self.load_indirect(value),
-            other => Ok(other),
-        }
-    }
-
-    pub(crate) fn new_string_from(&mut self, text: &str) -> Result<Value, VmError> {
-        Ok(Value::Obj(Some(self.heap.string(text.encode_utf16())?)))
-    }
-
-    pub(crate) fn utf8_encoding(&mut self) -> Result<Value, VmError> {
-        if let Some(existing) = self.encoding {
-            return Ok(Value::Obj(Some(existing)));
-        }
-        let reference = self.heap.alloc(Object::Encoding)?;
-        self.encoding = Some(reference);
-        Ok(Value::Obj(Some(reference)))
-    }
-
-    // --------------------------------------------------------------------
-    // Ошибки и имена
-    // --------------------------------------------------------------------
-
-    /// Где сейчас исполнение: `Program::<Main>$ IL_0012`.
-    pub(crate) fn location(&self) -> String {
-        match self.frames.last() {
-            Some(frame) => format!("{} IL_{:04x}", self.method_name(frame.method.row), frame.pc),
-            None => String::from("the runtime"),
-        }
-    }
-
-    fn method_name(&self, row: u32) -> String {
-        let mut out = String::new();
-        let tables = self.asm.tables;
-        'types: for type_row in 1..=tables.rows(id::TYPE_DEF) {
-            let Ok(list) = tables.list(id::TYPE_DEF, type_row, 5, id::METHOD_DEF, id::METHOD_PTR) else {
-                break;
-            };
-            for method in list {
-                if method == Ok(row) {
-                    let _ = self.asm.write_type_name(Token { table: id::TYPE_DEF, row: type_row }, &mut out, 0);
-                    out.push_str("::");
-                    break 'types;
-                }
-            }
-        }
-        match tables.column(id::METHOD_DEF, row, 3).and_then(|index| self.asm.root.strings.get(index)) {
-            Ok(name) => out.push_str(name),
-            Err(_) => {
-                let _ = write!(out, "method #{row}");
-            }
-        }
-        out
-    }
-
-    pub(crate) fn invalid(&self, what: &'static str) -> VmError {
-        VmError::Invalid { what, at: self.location() }
-    }
-
-    pub(crate) fn exception(&self, name: &'static str) -> VmError {
-        VmError::Exception { name, at: self.location() }
-    }
-
-    fn fault(&self, fault: Fault) -> VmError {
-        match fault {
-            Fault::DivideByZero => self.exception("System.DivideByZeroException"),
-            Fault::Overflow => self.exception("System.OverflowException"),
-            Fault::Invalid(what) => self.invalid(what),
-        }
-    }
-
-    fn unsupported_instruction(&self, op: u16) -> VmError {
-        let topic = match op {
-            0x70 | 0x71 | 0x73..=0x75 | 0x79 | 0x7B..=0x81 | 0x8C | 0xA5 | 0xFE15 | 0xFE1C => {
-                "objects, fields and value types (phase N3)"
-            }
-            0x7A | 0xDC | 0xFE11 | 0xFE1A => "exceptions (phase N3)",
-            0x29 | 0xFE06 | 0xFE07 => "delegates and function pointers (phase N3)",
-            0xFE16 => "constrained calls on generic parameters (phase N3)",
-            _ => "not implemented",
-        };
-        VmError::Unsupported { what: format!("IL instruction 0x{op:02x} in {}: {topic}", self.location()) }
-    }
-}
-
-/// Сузить значение, прочитанное `ldind.X`.
-fn narrow_load(op: u8, value: Value) -> Value {
-    match (op, value) {
-        (0x46, Value::I32(x)) => Value::I32(i32::from(x as i8)),
-        (0x47, Value::I32(x)) => Value::I32(i32::from(x as u8)),
-        (0x48, Value::I32(x)) => Value::I32(i32::from(x as i16)),
-        (0x49, Value::I32(x)) => Value::I32(i32::from(x as u16)),
-        _ => value,
-    }
-}
-
-/// Сузить значение, записываемое `stind.X`.
-fn narrow_store(op: u8, value: Value) -> Value {
-    match (op, value) {
-        (0x52, Value::I32(x)) => Value::I32(i32::from(x as i8)),
-        (0x53, Value::I32(x)) => Value::I32(i32::from(x as i16)),
-        _ => value,
     }
 }

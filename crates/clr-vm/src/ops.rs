@@ -425,6 +425,7 @@ pub(crate) fn truthy(value: Value) -> Result<bool, Fault> {
         Value::I64(x) | Value::Native(x) => x != 0,
         Value::Obj(x) => x.is_some(),
         Value::Ptr(_) => true,
+        Value::Struct(_) => return Err(Fault::Invalid("branch on a struct value")),
         Value::F(_) => return Err(Fault::Invalid("branch on a floating point value")),
     })
 }
