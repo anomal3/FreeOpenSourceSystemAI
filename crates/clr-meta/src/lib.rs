@@ -102,4 +102,72 @@ impl<'a> Assembly<'a> {
         }
         MethodBody::parse(self.image.from_rva(rva)?).map(Some)
     }
+
+    /// Записать полное имя типа: `System.Console`, вложенный — `Outer/Inner`,
+    /// спецификацию типа — её сигнатурой.
+    ///
+    /// `depth` ограничивает цепочку вложенных типов: она пришла из файла, и
+    /// зацикленная ссылка `TypeRef` на саму себя иначе исчерпала бы стек.
+    pub fn write_type_name(
+        &self,
+        token: Token,
+        out: &mut dyn core::fmt::Write,
+        depth: u32,
+    ) -> Result<(), Error> {
+        use tables::id;
+        const FORMAT: Error = Error::BadSignature("cannot format");
+        if depth > 16 {
+            return Err(Error::BadIndex("type nesting"));
+        }
+        let t = &self.tables;
+        let strings = self.root.strings;
+        match token.table {
+            id::TYPE_DEF => {
+                let name = strings.get(t.column(id::TYPE_DEF, token.row, 1)?)?;
+                let namespace = strings.get(t.column(id::TYPE_DEF, token.row, 2)?)?;
+                if let Some(outer) = self.enclosing_type(token.row)? {
+                    self.write_type_name(Token { table: id::TYPE_DEF, row: outer }, out, depth + 1)?;
+                    out.write_char('/').map_err(|_| FORMAT)?;
+                } else if !namespace.is_empty() {
+                    write!(out, "{namespace}.").map_err(|_| FORMAT)?;
+                }
+                out.write_str(name).map_err(|_| FORMAT)
+            }
+            id::TYPE_REF => {
+                let scope = t.coded_column(id::TYPE_REF, token.row, 0, Coded::ResolutionScope)?;
+                let name = strings.get(t.column(id::TYPE_REF, token.row, 1)?)?;
+                let namespace = strings.get(t.column(id::TYPE_REF, token.row, 2)?)?;
+                if scope.table == id::TYPE_REF && !scope.is_nil() {
+                    self.write_type_name(scope, out, depth + 1)?;
+                    out.write_char('/').map_err(|_| FORMAT)?;
+                } else if !namespace.is_empty() {
+                    write!(out, "{namespace}.").map_err(|_| FORMAT)?;
+                }
+                out.write_str(name).map_err(|_| FORMAT)
+            }
+            id::TYPE_SPEC => {
+                let blob = self.root.blobs.get(t.column(id::TYPE_SPEC, token.row, 0)?)?;
+                sig::write_type(blob, 0, self, out).map(|_| ())
+            }
+            _ => Err(Error::BadIndex("not a type token")),
+        }
+    }
+
+    /// Строка `TypeDef`, внутри которой объявлен тип, — или `None`, если он
+    /// верхнего уровня.
+    pub fn enclosing_type(&self, type_row: u32) -> Result<Option<u32>, Error> {
+        use tables::id;
+        for row in 1..=self.tables.rows(id::NESTED_CLASS) {
+            if self.tables.column(id::NESTED_CLASS, row, 0)? == type_row {
+                return self.tables.column(id::NESTED_CLASS, row, 1).map(Some);
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl sig::TypeNames for Assembly<'_> {
+    fn write_name(&self, token: Token, out: &mut dyn core::fmt::Write) -> Result<(), Error> {
+        self.write_type_name(token, out, 0)
+    }
 }

@@ -879,7 +879,7 @@ pub const ALL: &[Scenario] = &[
             // экрана не зависит и меняется только вместе с `USER_PROGRAMS` в
             // `build.rs`. Тридцать две с фазы 46; `zdemo` собирается только там,
             // где выполнена `cargo xtask thirdparty`, и без неё здесь будет 31.
-            Step::Expect("/bin holds 34 programs"),
+            Step::Expect("/bin holds 35 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -3090,6 +3090,60 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("term        : dropped output"),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "dotnet",
+        about: "Своя среда .NET: сборки, собранные dotnet build на Windows, выполняются вне ядра без переделки.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Шаблон `dotnet new console` без единой правки. Живая система, а не
+            // установленная: сборки только читаются, а initrd везёт их сам.
+            Step::Line("dotnet /usr/share/dotnet/samples/hello.dll"),
+            Step::Await("dotnet: hello.dll: 4608 bytes, 2 type(s), 2 method(s)", 60_000),
+            Step::Await("Hello, World!", 60_000),
+            // Строка итога — доказательство, что `Main` дошёл до `ret`, а не что
+            // программа успела напечатать и упала.
+            Step::Await("dotnet: hello.dll: Main returned 0", 60_000),
+            Step::Await("freeos> ", 15_000),
+            // Арифметика трёх ширин, рекурсия, циклы, switch, склейка строк и
+            // кириллица. Каждая строка — та же, что печатает настоящий dotnet
+            // (сверено `cargo xtask clr-check` и тестом `clr-vm`).
+            Step::Line("dotnet /usr/share/dotnet/samples/arith.dll"),
+            Step::Await("arith: start", 60_000),
+            Step::Await("sum 1..10 = 55", 60_000),
+            Step::Await("fib(20) = 6765", 120_000),
+            Step::Await("fact(20) = 2432902008176640000", 60_000),
+            Step::Await("gcd(1071, 462) = 21", 60_000),
+            Step::Await("-17 / 5 = -3, -17 % 5 = -2", 60_000),
+            Step::Await("uint: 4294967279", 60_000),
+            Step::Await("uint >> 28: 15", 60_000),
+            Step::Await("1L << 40 = 1099511627776", 60_000),
+            Step::Await("-64 >> 3 = -8", 60_000),
+            Step::Await("bool: True, char: Z", 60_000),
+            Step::Await("switch: zero one", 60_000),
+            Step::Await("switch: two many", 60_000),
+            Step::Await("Привет из IL", 60_000),
+            Step::Await("arith: done", 60_000),
+            Step::Await("dotnet: arith.dll: Main returned 0", 60_000),
+            Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),
         ],
     },
@@ -5685,7 +5739,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("home"),
             Step::Key("ret"),
             Step::Await("taskmgr: opened location /bin for #", 15_000),
-            Step::Await("files: /bin has 35 entries", 30_000),
+            Step::Await("files: /bin has 36 entries", 30_000),
             Step::Wait(1_500),
             Step::Shot("03-location"),
             Step::Aim(Aim::Close("Files")),

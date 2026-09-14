@@ -1,0 +1,16 @@
+[package]
+name = "clr-vm"
+description = "The own .NET runtime: an IL interpreter over clr-meta, run by /bin/dotnet on FreeOS and by cargo xtask clr-check on the host (milestone v0.7c)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Разбор сборки. Интерпретатор берёт из него байты IL, сигнатуры и имена, и
+# ничего не разбирает сам: формат читает один крейт, проверенный чужим читателем.
+clr-meta = { path = "../clr-meta" }
+
+[lints]
+workspace = true

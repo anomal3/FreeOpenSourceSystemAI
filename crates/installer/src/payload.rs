@@ -233,7 +233,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 35] = [
+const PROGRAMS: [(&CStr16, &str); 36] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -276,6 +276,8 @@ const PROGRAMS: [(&CStr16, &str); 35] = [
     (cstr16!("\\FREEOS\\BIN\\TASKMGR"), "taskmgr"),
     // Диспетчер устройств (фаза С7).
     (cstr16!("\\FREEOS\\BIN\\DEVMGR"), "devmgr"),
+    // Своя среда .NET (веха v0.7c, фаза N2).
+    (cstr16!("\\FREEOS\\BIN\\DOTNET"), "dotnet"),
     (cstr16!("\\FREEOS\\BIN\\WINSHOW"), "winshow"),
     (cstr16!("\\FREEOS\\BIN\\POSIX"), "posix"),
     // Чужая библиотека, собранная нашим набором (фаза 46).

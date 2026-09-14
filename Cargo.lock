@@ -248,6 +248,13 @@ name = "clr-meta"
 version = "0.3.0"
 
 [[package]]
+name = "clr-vm"
+version = "0.3.0"
+dependencies = [
+ "clr-meta",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1136,6 +1143,7 @@ version = "0.3.0"
 name = "user-progs"
 version = "0.3.0"
 dependencies = [
+ "clr-vm",
  "fpk",
  "linked_list_allocator",
  "mini-ui",
@@ -1283,6 +1291,7 @@ dependencies = [
  "btrfs",
  "clap",
  "clr-meta",
+ "clr-vm",
  "disk",
  "ed25519-dalek",
  "ext2",

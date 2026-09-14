@@ -31,8 +31,11 @@ use clr_meta::body::{CLAUSE_CATCH, CLAUSE_FILTER};
 use clr_meta::tables::{TABLE_COUNT, id};
 use clr_meta::{Assembly, Coded, Token};
 
-/// Пробные программы, собираемые перед сверкой.
-const SAMPLES: [&str; 2] = ["hello", "features"];
+/// Пробные программы, собираемые перед сверкой, и выполняет ли их своя среда.
+///
+/// `features` нужен ради таблиц метаданных: в нём объекты, события и
+/// исключения, которых у среды фазы N2 ещё нет.
+const SAMPLES: [(&str, bool); 3] = [("hello", true), ("arith", true), ("features", false)];
 
 pub fn check() -> Result<()> {
     let root = repo_root();
@@ -44,7 +47,7 @@ pub fn check() -> Result<()> {
     let dumper = dumper_dir.join("clrdump.dll");
 
     let mut assemblies: Vec<(String, PathBuf)> = Vec::new();
-    for sample in SAMPLES {
+    for (sample, _) in SAMPLES {
         let dir = out.join("samples").join(sample);
         dotnet_build(&root.join("tools/dotnet/samples").join(sample), &dir)?;
         assemblies.push((sample.to_string(), dir.join(format!("{sample}.dll"))));
@@ -87,6 +90,93 @@ pub fn check() -> Result<()> {
         bail!("{failed} of {} assemblies differ from System.Reflection.Metadata", assemblies.len());
     }
     println!("clr-check: all {} assemblies match System.Reflection.Metadata", assemblies.len());
+
+    // Фаза N2: те же программы — своей средой и настоящим dotnet. Совпасть
+    // обязаны вывод до байта и код возврата.
+    let mut run_failed = 0;
+    for (sample, run) in SAMPLES {
+        if !run {
+            continue;
+        }
+        let dll = out.join("samples").join(sample).join(format!("{sample}.dll"));
+        let data = fs::read(&dll).with_context(|| format!("read {}", dll.display()))?;
+        let (their_code, theirs) = run_dotnet(&dll)?;
+        let (our_code, ours) = run_ours(&data);
+        if ours == theirs && our_code == Some(their_code) {
+            println!(
+                "clr-check: run {sample}: output matches dotnet ({} lines), exit code {their_code}",
+                ours.lines().count()
+            );
+        } else {
+            run_failed += 1;
+            let base = out.join(format!("{sample}.run"));
+            fs::write(base.with_extension("ours.txt"), &ours)?;
+            fs::write(base.with_extension("theirs.txt"), &theirs)?;
+            println!("clr-check: run {sample}: DIFFERS (exit code ours {our_code:?}, dotnet {their_code})");
+            if let Some((line, our_line, their_line)) = first_difference(&ours, &theirs) {
+                println!("  line {line}");
+                println!("  ours  : {our_line}");
+                println!("  theirs: {their_line}");
+            }
+        }
+        refresh_initrd_sample(&root, sample, &data)?;
+    }
+    if run_failed > 0 {
+        bail!("{run_failed} sample program(s) behave differently under the own runtime");
+    }
+    Ok(())
+}
+
+/// Выполнить сборку настоящим dotnet.
+fn run_dotnet(dll: &Path) -> Result<(i32, String)> {
+    let output = Command::new("dotnet").arg(dll).output().context("run dotnet")?;
+    let text = String::from_utf8(output.stdout).context("dotnet output is not UTF-8")?;
+    // .NET на Windows переводит строку парой CR LF, своя среда — одним LF, как
+    // принято на FreeOS. Это разница платформ, а не поведения программы.
+    Ok((output.status.code().unwrap_or(-1), text.replace("\r\n", "\n")))
+}
+
+struct Capture(String);
+
+impl clr_vm::Host for Capture {
+    fn write_out(&mut self, text: &str) {
+        self.0.push_str(text);
+    }
+}
+
+/// Выполнить сборку своей средой. Ошибка среды попадает в вывод строкой — так
+/// её видно в сравнении рядом с тем, что успело напечататься.
+fn run_ours(data: &[u8]) -> (Option<i32>, String) {
+    let mut vm = match clr_vm::Vm::new(data, Capture(String::new())) {
+        Ok(vm) => vm,
+        Err(error) => return (None, format!("<load error: {error}>\n")),
+    };
+    let result = vm.run_main(&[]);
+    let mut output = vm.into_host().0;
+    match result {
+        Ok(code) => (Some(code), output),
+        Err(error) => {
+            output.push_str(&format!("<error: {error}>\n"));
+            (None, output)
+        }
+    }
+}
+
+/// Положить свежую сборку образца в initrd, если там лежит другая.
+///
+/// Образ системы собирается без .NET SDK, поэтому сборки образцов лежат в
+/// репозитории готовыми. Сборка у SDK детерминирована, и расхождение означает,
+/// что поменялся исходник образца или сам SDK, — тогда образ обязан везти то,
+/// что сейчас проверено.
+fn refresh_initrd_sample(root: &Path, sample: &str, data: &[u8]) -> Result<()> {
+    let dir = root.join("initrd/usr/share/dotnet/samples");
+    let path = dir.join(format!("{sample}.dll"));
+    if fs::read(&path).ok().as_deref() == Some(data) {
+        return Ok(());
+    }
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    fs::write(&path, data).with_context(|| format!("write {}", path.display()))?;
+    println!("clr-check: updated {} - the image carries this build now, commit it", path.display());
     Ok(())
 }
 

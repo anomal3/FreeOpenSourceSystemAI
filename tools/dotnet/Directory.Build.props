@@ -1,0 +1,20 @@
+<Project>
+
+  <!--
+    Общие настройки для верификатора и образцов своей среды .NET (веха v0.7c).
+
+    Сборки образцов лежат в репозитории готовыми (initrd/usr/share/dotnet/samples):
+    образ системы собирается без .NET SDK. Значит, одна и та же сборка из одного
+    и того же исходника обязана давать одни и те же байты.
+
+    Сама по себе сборка у SDK детерминирована, но с .NET 8 он вшивает хеш
+    текущего коммита git в AssemblyInformationalVersion (`1.0.0+<sha>`). Каждый
+    коммит менял бы байты hello.dll, и `cargo xtask clr-check` перезаписывал бы
+    образцы после каждого коммита, — так это и нашлось.
+  -->
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+
+</Project>

@@ -255,6 +255,30 @@ impl Window {
 /// выделения, а не тихой порчей чего-нибудь.
 const HEAP_BYTES: usize = 1024 * 1024;
 
+/// Сколько памяти возьмёт куча, когда её заведут.
+///
+/// Меняется [`heap_size`] до первого выделения. Нужно своей среде .NET (фаза
+/// N2): интерпретатор с разобранной сборкой, кадрами и объектами программы в
+/// мегабайт не помещается, а поднимать [`HEAP_BYTES`] всем программам ради одной
+/// значило бы отнять память у каждой.
+static HEAP_WANTED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(HEAP_BYTES);
+
+/// Попросить кучу другого размера. Действует только до первого выделения:
+/// заведённую кучу не расширить — она берётся у ядра одним куском.
+///
+/// Возвращает `false`, если опоздали, и тогда куча остаётся какой была.
+pub fn heap_size(bytes: usize) -> bool {
+    // SAFETY: у программы один поток (см. `ProgramHeap`), и ссылка на кучу живёт
+    // только внутри этого чтения.
+    let started = unsafe { (*HEAP.inner.get()).size() != 0 };
+    if started {
+        return false;
+    }
+    HEAP_WANTED.store(bytes.max(HEAP_BYTES), core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 /// Куча программы.
 ///
 /// # Почему без замка
@@ -295,7 +319,8 @@ unsafe impl GlobalAlloc for ProgramHeap {
         // один, и живёт она только внутри этого вызова.
         let heap = unsafe { &mut *self.inner.get() };
         if heap.size() == 0 {
-            let base = mmap(HEAP_BYTES, 0);
+            let bytes = HEAP_WANTED.load(core::sync::atomic::Ordering::Relaxed);
+            let base = mmap(bytes, 0);
             if base < 0 {
                 // Памяти нет — отказ, а не паника: решать, что делать без
                 // кучи, обязан тот, кто её просил.
@@ -303,7 +328,7 @@ unsafe impl GlobalAlloc for ProgramHeap {
             }
             // SAFETY: ядро только что выдало эту область этой программе
             // целиком; она не пересекается ни с чем и живёт до её конца.
-            unsafe { heap.init(base as usize as *mut u8, HEAP_BYTES) };
+            unsafe { heap.init(base as usize as *mut u8, bytes) };
         }
         heap.allocate_first_fit(layout)
             .map_or(core::ptr::null_mut(), NonNull::as_ptr)
