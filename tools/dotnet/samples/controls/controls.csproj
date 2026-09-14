@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N7a: поле ввода, флажок и надпись из дизайнера. clr-check
+       запускает его с аргументом self-test: форма меняет элементы из кода и
+       закрывается. На стенде в поле печатает клавиатура, по флажку щёлкает мышь. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

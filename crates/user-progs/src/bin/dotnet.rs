@@ -47,6 +47,8 @@ const POLL_NS: u32 = 30_000_000;
 struct ProgramWindow {
     window: Window,
     surface: Surface,
+    width: u32,
+    height: u32,
     title: String,
     frames: u64,
 }
@@ -285,7 +287,7 @@ impl Host for Console {
             return None;
         };
         error(&format!("dotnet: window '{title}' opened, {width}x{height}\n"));
-        self.windows.push(Some(ProgramWindow { window, surface, title: String::from(title), frames: 0 }));
+        self.windows.push(Some(ProgramWindow { window, surface, width, height, title: String::from(title), frames: 0 }));
         u32::try_from(self.windows.len() - 1).ok()
     }
 
@@ -296,16 +298,32 @@ impl Host for Console {
         target.surface.fill(Rect::new(area.x, area.y, area.width, area.height), color);
     }
 
-    // Отсечение по элементу — только начало строки: строка, начатая внутри,
-    // дописывается до края окна.
+    // Отсечения у шрифта нет, поэтому оно честное, но снаружи: точки строки
+    // вне элемента запоминаются до рисования и возвращаются после (фаза N7a —
+    // текст, уехавший за край поля ввода, не ложится на соседей).
     fn window_text(&mut self, window: u32, x: i32, y: i32, text: &str, argb: u32, clip: WindowRect) {
         let Some(face) = self.graphics() else { return };
         let Some(target) = self.window_mut(window) else { return };
-        if x >= clip.x + clip.width as i32 || y >= clip.y + clip.height as i32 {
+        let width = face.width(text) as i32;
+        let height = i32::from(face.line);
+        let clip_right = clip.x + clip.width as i32;
+        let clip_bottom = clip.y + clip.height as i32;
+        if x >= clip_right || y >= clip_bottom || x + width <= clip.x || y + height <= clip.y {
             return;
+        }
+        let mut saved = Vec::new();
+        for py in y.max(0)..(y + height).min(target.height as i32) {
+            for px in x.max(0)..(x + width).min(target.width as i32) {
+                if px < clip.x || px >= clip_right || py < clip.y || py >= clip_bottom {
+                    saved.push((px as u32, py as u32, target.surface.get(px as u32, py as u32)));
+                }
+            }
         }
         let color = Color::rgb((argb >> 16) as u8, (argb >> 8) as u8, argb as u8);
         typeface::draw(&mut target.surface, face, x, y, text, color, 255);
+        for (px, py, pixel) in saved {
+            target.surface.put(px, py, pixel);
+        }
     }
 
     fn text_width(&mut self, text: &str) -> u32 {
@@ -336,7 +354,7 @@ impl Host for Console {
 
     fn window_close(&mut self, window: u32) {
         let Some(slot) = self.windows.get_mut(window as usize) else { return };
-        if let Some(ProgramWindow { window, surface, title, frames }) = slot.take() {
+        if let Some(ProgramWindow { window, surface, title, frames, .. }) = slot.take() {
             drop(surface);
             window.close();
             error(&format!("dotnet: window '{title}' closed after {frames} frame(s)\n"));

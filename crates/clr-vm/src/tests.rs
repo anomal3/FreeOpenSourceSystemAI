@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -621,5 +621,35 @@ fn winforms_template_prints_what_winforms_prints() {
     let (result, output) = run_with(WINFORMS, "winforms.dll", &["self-test"]);
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, WINFORMS_OUTPUT);
+    assert_eq!(code, 0);
+}
+
+/// Образец `tools/dotnet/samples/controls` (фаза N7a): поле ввода, флажок и
+/// надпись из дизайнера.
+const CONTROLS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/controls.dll");
+
+/// Что печатает `dotnet controls.dll self-test` (записано 2026-09-15, .NET 10,
+/// WinForms на Windows, LF).
+const CONTROLS_OUTPUT: &str = concat!(
+    "shown: 0 32767 False False False Unchecked False True 0\n",
+    "text: hello | False Unchecked | 1\n",
+    "text: hello world | False Unchecked | 2\n",
+    "caret: 11 0 11\n",
+    "selected: ell 1 3\n",
+    "text: abcdefgh | False Unchecked | 3\n",
+    "text:  | False Unchecked | 4\n",
+    "checked:  | True Checked | 4\n",
+    "state: Checked\n",
+    "state: Indeterminate\n",
+    "checked:  | False Unchecked | 4\n",
+    "state: Unchecked\n",
+    "label:  / Unchecked\n",
+);
+
+#[test]
+fn controls_print_what_winforms_prints() {
+    let (result, output) = run_with(CONTROLS, "controls.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, CONTROLS_OUTPUT);
     assert_eq!(code, 0);
 }

@@ -69,25 +69,43 @@ namespace System.Windows.Forms
         // Кнопка нажимается левой кнопкой мыши; правая до Click не доходит.
         internal override bool ClicksWithLeftOnly => true;
 
-        protected override void OnPaintBackground(PaintEventArgs pevent)
+        internal override bool Selectable => true;
+
+        protected override void OnPaintBackground(PaintEventArgs pevent) => DrawFace(pevent.Graphics);
+
+        protected override void OnPaint(PaintEventArgs e)
         {
-            Graphics g = pevent.Graphics;
-            g.Clear(Color.FromArgb(173, 173, 173));
+            DrawContent(e.Graphics);
+            base.OnPaint(e);
+        }
+
+        // Рамка — синяя у кнопки с фокусом.
+        internal virtual void DrawFace(Graphics g)
+        {
+            g.Clear(Focused ? SystemColors.Highlight : Color.FromArgb(173, 173, 173));
             Color face = UseVisualStyleBackColor ? Color.FromArgb(225, 225, 225) : BackColor;
             g.FillRectangle(new SolidBrush(face), 1, 1, Width - 2, Height - 2);
         }
 
-        protected override void OnPaint(PaintEventArgs e)
+        internal virtual void DrawContent(Graphics g)
         {
             string text = Text;
             if (text.Length > 0)
             {
                 int textWidth = FreeOsWindow.TextWidth(text);
                 int textHeight = FreeOsWindow.TextHeight();
-                e.Graphics.DrawString(text, Font, new SolidBrush(Enabled ? ForeColor : SystemColors.GrayText),
+                g.DrawString(text, Font, new SolidBrush(Enabled ? ForeColor : SystemColors.GrayText),
                     (Width - textWidth) / 2, (Height - textHeight) / 2);
             }
-            base.OnPaint(e);
+        }
+
+        // Пробел нажимает кнопку и переключает флажок, как в WinForms.
+        internal override void ProcessKey(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Space)
+            {
+                OnClick(EventArgs.Empty);
+            }
         }
     }
 
@@ -102,6 +120,17 @@ namespace System.Windows.Forms
             {
                 OnClick(EventArgs.Empty);
             }
+        }
+
+        // У кнопки с фокусом Enter — тоже нажатие.
+        internal override void ProcessKey(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Enter)
+            {
+                PerformClick();
+                return;
+            }
+            base.ProcessKey(e);
         }
     }
 

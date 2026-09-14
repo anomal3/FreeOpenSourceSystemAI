@@ -462,7 +462,7 @@ namespace System.Windows.Forms
                 {
                     return backColor;
                 }
-                return Parent != null ? Parent.BackColor : SystemColors.Control;
+                return AmbientBackColor;
             }
             set
             {
@@ -711,7 +711,145 @@ namespace System.Windows.Forms
             OnMouseUp(args);
         }
 
-        internal void DeliverKey(char c) => OnKeyPress(new KeyPressEventArgs(c));
+        // Фон, если его не задали: у большинства элементов — родительский, у
+        // поля ввода — белый.
+        internal virtual Color AmbientBackColor => Parent != null ? Parent.BackColor : SystemColors.Control;
+
+        // Фаза N7a: фокус. Принимают его только элементы, которые умеют ввод.
+        internal virtual bool Selectable => false;
+
+        public bool CanFocus => Selectable && Enabled && Visible;
+
+        public bool CanSelect => CanFocus;
+
+        public bool Focused
+        {
+            get
+            {
+                Form form = FindForm();
+                return form != null && form.ActiveControl == this;
+            }
+        }
+
+        public bool ContainsFocus => Focused;
+
+        public bool Focus()
+        {
+            Form form = FindForm();
+            if (form == null || !CanFocus)
+            {
+                return false;
+            }
+            form.ActiveControl = this;
+            return form.ActiveControl == this;
+        }
+
+        public void Select() => Focus();
+
+        public bool Contains(Control ctl)
+        {
+            while (ctl != null)
+            {
+                ctl = ctl.Parent;
+                if (ctl == this)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        public event EventHandler Enter;
+
+        public event EventHandler Leave;
+
+        public event EventHandler GotFocus;
+
+        public event EventHandler LostFocus;
+
+        public event KeyEventHandler KeyDown;
+
+        public event KeyEventHandler KeyUp;
+
+        protected virtual void OnEnter(EventArgs e) => Enter?.Invoke(this, e);
+
+        protected virtual void OnLeave(EventArgs e) => Leave?.Invoke(this, e);
+
+        protected virtual void OnGotFocus(EventArgs e) => GotFocus?.Invoke(this, e);
+
+        protected virtual void OnLostFocus(EventArgs e) => LostFocus?.Invoke(this, e);
+
+        protected virtual void OnKeyDown(KeyEventArgs e) => KeyDown?.Invoke(this, e);
+
+        protected virtual void OnKeyUp(KeyEventArgs e) => KeyUp?.Invoke(this, e);
+
+        // Для ContainerControl: чужие protected-члены зовут только отсюда.
+        internal void RaiseFocus(bool entering)
+        {
+            if (entering)
+            {
+                OnEnter(EventArgs.Empty);
+                OnGotFocus(EventArgs.Empty);
+            }
+            else
+            {
+                OnLeave(EventArgs.Empty);
+                OnLostFocus(EventArgs.Empty);
+            }
+            Invalidate();
+        }
+
+        // Клавиша стола: KeyDown, то, что элемент делает с ней сам, KeyPress у
+        // символа, ввод символа, KeyUp — порядок WinForms.
+        internal void DeliverKey(int code)
+        {
+            if (!Enabled)
+            {
+                return;
+            }
+            Keys keys = KeyMap.ToKeys(code);
+            var down = new KeyEventArgs(keys);
+            OnKeyDown(down);
+            if (!down.Handled)
+            {
+                ProcessKey(down);
+            }
+            if (!down.SuppressKeyPress && KeyMap.ToChar(code, out char c))
+            {
+                var press = new KeyPressEventArgs(c);
+                OnKeyPress(press);
+                if (!press.Handled)
+                {
+                    ProcessChar(press.KeyChar);
+                }
+            }
+            OnKeyUp(new KeyEventArgs(keys));
+        }
+
+        internal virtual void ProcessKey(KeyEventArgs e)
+        {
+        }
+
+        internal virtual void ProcessChar(char c)
+        {
+        }
+
+        // Первый по TabIndex элемент, который примет фокус, — как при показе
+        // формы в WinForms.
+        internal Control FirstFocusable()
+        {
+            Control best = null;
+            for (int i = 0; i < Controls.Count; i++)
+            {
+                Control child = Controls[i];
+                Control candidate = child.CanFocus ? child : child.FirstFocusable();
+                if (candidate != null && (best == null || child.TabIndex < best.TabIndex))
+                {
+                    best = candidate;
+                }
+            }
+            return best;
+        }
 
         // Фон, Paint и потомки снизу вверх: первый в Controls — самый верхний.
         internal void PaintTree(int window, int originX, int originY, Rectangle visible)
@@ -826,7 +964,30 @@ namespace System.Windows.Forms
 
         public AutoScaleMode AutoScaleMode { get; set; } = AutoScaleMode.Inherit;
 
-        public Control ActiveControl { get; set; }
+        private Control active;
+
+        // Смена фокуса: Leave и LostFocus у прежнего, Enter и GotFocus у нового.
+        public Control ActiveControl
+        {
+            get => active;
+            set
+            {
+                if (active == value || (value != null && (!value.CanFocus || !Contains(value))))
+                {
+                    return;
+                }
+                Control previous = active;
+                active = value;
+                if (previous != null)
+                {
+                    previous.RaiseFocus(false);
+                }
+                if (value != null)
+                {
+                    value.RaiseFocus(true);
+                }
+            }
+        }
     }
 
     public class Form : ContainerControl
@@ -894,6 +1055,10 @@ namespace System.Windows.Forms
             }
             Application.Opened(this);
             base.SetVisibleCore(true);
+            if (ActiveControl == null)
+            {
+                ActiveControl = FirstFocusable();
+            }
             Application.Post(() => OnShown(EventArgs.Empty));
         }
 
@@ -939,13 +1104,16 @@ namespace System.Windows.Forms
                     return false;
                 case FreeOsWindow.EventPointer:
                     Control target = ChildAt(px, py, out int localX, out int localY);
+                    // Фокус переходит при нажатии, до MouseDown, как в WinForms.
+                    if (target.CanFocus)
+                    {
+                        ActiveControl = target;
+                    }
                     target.DeliverClick(code == 2 ? MouseButtons.Right : MouseButtons.Left, localX, localY);
                     return true;
                 case FreeOsWindow.EventKey:
-                    if (code >= 0 && code < 0x10000)
-                    {
-                        DeliverKey((char)code);
-                    }
+                    Control focused = ActiveControl != null && ActiveControl.CanFocus ? ActiveControl : this;
+                    focused.DeliverKey(code);
                     return true;
                 case FreeOsWindow.EventClose:
                     CloseFor(CloseReason.UserClosing);
