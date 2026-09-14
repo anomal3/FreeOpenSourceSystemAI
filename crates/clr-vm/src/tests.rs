@@ -120,7 +120,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -339,6 +339,64 @@ fn floats_print_what_dotnet_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, FLOATS_OUTPUT);
     assert_eq!(code, 41);
+}
+
+/// Образец `tools/dotnet/samples/enums` (фаза N4d).
+const ENUMS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/enums.dll");
+
+/// Что печатает `dotnet enums.dll` (записано 2026-09-14, .NET 10, LF).
+const ENUMS_OUTPUT: &str = concat!(
+    "enums: start\n",
+    "Blue Red Green 42 6\n",
+    "Read, Execute | ReadWrite | All | None | 8 | 9\n",
+    "0 Bold, Italic 8 High 7 Min Negative -5\n",
+    "Blue 6 Blue 00000006 Read, Execute 5 C8 FF Bold, Italic\n",
+    "Green ReadWrite False Red True Blue Blue High\n",
+    "Red,Green,Blue None,Read,Write,ReadWrite,Execute,All True False Green\n",
+    "True False True 1 True Color FreeOs.Samples.Enums.Color\n",
+    "Requested value 'nope' was not found.\n",
+    "3 False Green True cold warm\n",
+    "enums: done\n",
+);
+
+#[test]
+fn enums_print_what_dotnet_prints() {
+    let (result, output) = run(ENUMS);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, ENUMS_OUTPUT);
+    assert_eq!(code, 6);
+}
+
+/// Образец `tools/dotnet/samples/linq` (фаза N4d).
+const LINQ: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/linq.dll");
+
+/// Что печатает `dotnet linq.dll` (записано 2026-09-14, .NET 10, LF).
+/// `OrderBy` устойчив: Bob раньше Eve, Ann раньше Cid.
+const LINQ_OUTPUT: &str = concat!(
+    "linq: start\n",
+    "64,4,16,36,0 45 9 0 4.5 5\n",
+    "0,1,2 2,1,0 5 0 0 True True False\n",
+    "Dan Bob Eve Ann Cid | Cid Ann Eve Bob Dan\n",
+    "Oslo: 2 Ann+Cid avg 31\n",
+    "Rome: 2 Bob+Dan avg 22\n",
+    "Kyiv: 1 Eve avg 25\n",
+    "31 131 31 26.2 Dan Bob Dan\n",
+    "EVE,CID,BOB,ANN 2,0,1 120 ababab\n",
+    "Ann5,Bob3,Cid8,Dan1,Eve9 15 0,6 True 5,3,6,0\n",
+    "two,four 6 x,y 0Ann,1Bob,2Cid,3Dan,4Eve\n",
+    "0 4 10 True 13\n",
+    "Sequence contains no elements\n",
+    "Sequence contains more than one matching element\n",
+    "4000000 1000000 8496120 1229 234 3999\n",
+    "linq: done\n",
+);
+
+#[test]
+fn linq_prints_what_dotnet_prints() {
+    let (result, output) = run(LINQ);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, LINQ_OUTPUT);
+    assert_eq!(code, 29);
 }
 
 #[test]

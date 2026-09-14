@@ -120,7 +120,7 @@ impl<'a, H: Host> Vm<'a, H> {
             }
             Pointer::Element { array, index } => match self.heap.get(array) {
                 Some(Object::Array { items, .. }) => match items.get(index as usize) {
-                    Some(value) => Some(*value),
+                    Some(value) => Some(value),
                     None => return Err(self.exception("System.IndexOutOfRangeException")),
                 },
                 _ => None,
@@ -153,6 +153,19 @@ impl<'a, H: Host> Vm<'a, H> {
             }
             return Ok(());
         }
+        // Элемент массива чисел — не значение среды, а число своей ширины:
+        // записывается сужением, а не заменой ячейки.
+        if let Pointer::Element { array, index } = pointer {
+            let stored = match self.heap.get_mut(array) {
+                Some(Object::Array { items, .. }) => items.set(index as usize, value),
+                _ => false,
+            };
+            return if stored {
+                Ok(())
+            } else {
+                Err(self.invalid("store into a place that does not hold this kind of value"))
+            };
+        }
         let slot = match pointer {
             Pointer::Local { frame, index } => {
                 self.frames.get_mut(frame as usize).and_then(|f| f.locals.get_mut(index as usize))
@@ -160,10 +173,7 @@ impl<'a, H: Host> Vm<'a, H> {
             Pointer::Arg { frame, index } => {
                 self.frames.get_mut(frame as usize).and_then(|f| f.args.get_mut(index as usize))
             }
-            Pointer::Element { array, index } => match self.heap.get_mut(array) {
-                Some(Object::Array { items, .. }) => items.get_mut(index as usize),
-                _ => None,
-            },
+            Pointer::Element { .. } => None,
             Pointer::Field { object, index } => match self.heap.get_mut(object) {
                 Some(Object::Instance { fields, .. } | Object::Struct { fields, .. }) => {
                     fields.get_mut(index as usize)
@@ -319,15 +329,22 @@ impl<'a, H: Host> Vm<'a, H> {
         }
         let ty = self.array_of(element)?;
         let store = self.types[element.0 as usize].store(element);
-        let mut items = Vec::new();
-        items.try_reserve_exact(count as usize).map_err(|_| VmError::OutOfMemory)?;
-        if let Store::Struct(_) = store {
-            for _ in 0..count {
-                items.push(self.zero(store)?);
+        let count = usize::try_from(count).map_err(|_| VmError::OutOfMemory)?;
+        let items = match store {
+            Store::Prim(prim) => crate::heap::Items::zeroed(prim, count)?,
+            _ => {
+                let mut values = Vec::new();
+                values.try_reserve_exact(count).map_err(|_| VmError::OutOfMemory)?;
+                if let Store::Struct(_) = store {
+                    for _ in 0..count {
+                        values.push(self.zero(store)?);
+                    }
+                } else {
+                    values.resize(count, self.zero(store)?);
+                }
+                crate::heap::Items::Values(values)
             }
-        } else {
-            items.resize(count as usize, self.zero(store)?);
-        }
+        };
         Ok(Value::Obj(Some(self.heap.alloc(Object::Array { ty, items })?)))
     }
 

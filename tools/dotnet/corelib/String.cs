@@ -42,6 +42,20 @@ namespace System
             return result;
         }
 
+        public static string Concat(Collections.Generic.IEnumerable<string> values)
+        {
+            if (values == null)
+            {
+                throw new ArgumentNullException("values");
+            }
+            var builder = new Text.StringBuilder();
+            foreach (string value in values)
+            {
+                builder.Append(value);
+            }
+            return builder.ToString();
+        }
+
         public static string Concat(object arg0, object arg1) => Concat(arg0?.ToString(), arg1?.ToString());
 
         public static string Concat(object arg0, object arg1, object arg2) =>

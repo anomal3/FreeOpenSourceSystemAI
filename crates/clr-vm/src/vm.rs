@@ -186,7 +186,7 @@ impl<'a, H: Host> Vm<'a, H> {
                 for arg in args {
                     items.push(Value::Obj(Some(self.heap.string(arg.encode_utf16())?)));
                 }
-                let array = self.heap.alloc(Object::Array { ty: array_ty, items })?;
+                let array = self.heap.alloc(Object::Array { ty: array_ty, items: crate::heap::Items::Values(items) })?;
                 call_args.push(Value::Obj(Some(array)));
             }
             _ => {

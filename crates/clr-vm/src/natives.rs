@@ -28,7 +28,12 @@ pub(crate) enum Native {
     TypeFullName,
     ValueTypeEquals,
     ValueTypeHash,
-    EnumToString,
+    EnumNames,
+    EnumValues,
+    EnumIsFlags,
+    EnumUnderlying,
+    EnumToBits,
+    EnumBox,
     InitializeArray,
     ObjectHash,
     ArrayLength,
@@ -142,7 +147,12 @@ const TABLE: &[(&str, Native)] = &[
     ("System.RuntimeType::get_FullName()", Native::TypeFullName),
     ("System.ValueType::Equals(object)", Native::ValueTypeEquals),
     ("System.ValueType::GetHashCode()", Native::ValueTypeHash),
-    ("System.Enum::ToString()", Native::EnumToString),
+    ("System.Enum::InternalGetNames(System.Type)", Native::EnumNames),
+    ("System.Enum::InternalGetValues(System.Type)", Native::EnumValues),
+    ("System.Enum::InternalIsFlags(System.Type)", Native::EnumIsFlags),
+    ("System.Enum::InternalUnderlying(System.Type)", Native::EnumUnderlying),
+    ("System.Enum::InternalToUInt64(object)", Native::EnumToBits),
+    ("System.Enum::InternalBox(System.Type,uint64)", Native::EnumBox),
     (
         "System.Runtime.CompilerServices.RuntimeHelpers::InitializeArray(System.Array,System.RuntimeFieldHandle)",
         Native::InitializeArray,
@@ -305,8 +315,60 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
             Value::Obj(Some(object)) => object.0 as i32,
             _ => 0,
         })),
-        Native::EnumToString => {
-            return Err(VmError::Unsupported { what: format!("Enum.ToString in {} (phase N4)", vm.location()) });
+        Native::EnumNames | Native::EnumValues => {
+            let ty = vm.runtime_type(arg(0)?)?;
+            let members = vm.enum_members(ty)?;
+            let (element, items) = if native == Native::EnumNames {
+                let mut names = Vec::new();
+                names.try_reserve_exact(members.len()).map_err(|_| VmError::OutOfMemory)?;
+                for (name, _) in &members {
+                    names.push(vm.new_string_from(name)?);
+                }
+                (vm.corelib_type("System.String")?, crate::heap::Items::Values(names))
+            } else {
+                let mut values = Vec::new();
+                values.try_reserve_exact(members.len()).map_err(|_| VmError::OutOfMemory)?;
+                values.extend(members.iter().map(|(_, bits)| *bits as i64));
+                (vm.prim_type(Prim::U8)?, crate::heap::Items::I64(values))
+            };
+            let array_ty = vm.array_of(element)?;
+            Some(Value::Obj(Some(vm.heap.alloc(Object::Array { ty: array_ty, items })?)))
+        }
+        Native::EnumIsFlags => {
+            let ty = vm.runtime_type(arg(0)?)?;
+            Some(Value::I32(i32::from(vm.enum_is_flags(ty)?)))
+        }
+        Native::EnumUnderlying => {
+            let ty = vm.runtime_type(arg(0)?)?;
+            Some(Value::I32(crate::enums::enum_width(vm.enum_prim(ty)?)))
+        }
+        Native::EnumToBits => {
+            let Some((ty, value)) = vm.boxed(arg(0)?) else {
+                return Err(vm.exception("System.NullReferenceException"));
+            };
+            let prim = match vm.types[ty.0 as usize].kind {
+                crate::types::Kind::Enum(prim) | crate::types::Kind::Prim(prim) => prim,
+                _ => return Err(vm.exception("System.ArgumentException")),
+            };
+            let bits = match value {
+                Value::I32(x) => u64::from(x as u32),
+                Value::I64(x) | Value::Native(x) => x as u64,
+                _ => return Err(vm.invalid("enum value that is not an integer")),
+            };
+            Some(Value::I64((bits & crate::enums::enum_mask(prim)) as i64))
+        }
+        Native::EnumBox => {
+            let ty = vm.runtime_type(arg(0)?)?;
+            let prim = vm.enum_prim(ty)?;
+            let bits = vm.int64(arg(1)?)? as u64;
+            // Как значение этой ширины на стеке: мелкие — `int32` с расширением
+            // знака или нулями.
+            let value = match prim {
+                Prim::I8 | Prim::U8 => Value::I64(bits as i64),
+                Prim::I | Prim::U => Value::Native(bits as i64),
+                _ => prim.narrow(Value::I32(bits as u32 as i32)),
+            };
+            Some(vm.box_value(ty, value)?)
         }
         Native::InitializeArray => {
             vm.initialize_array(arg(0)?, arg(1)?)?;
@@ -411,10 +473,7 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
             let units = this_units(vm, arg(0)?)?;
             let char_type = vm.prim_type(Prim::Char)?;
             let ty = vm.array_of(char_type)?;
-            let mut items = Vec::new();
-            items.try_reserve_exact(units.len()).map_err(|_| VmError::OutOfMemory)?;
-            items.extend(units.iter().map(|&unit| Value::I32(i32::from(unit))));
-            Some(Value::Obj(Some(vm.heap.alloc(Object::Array { ty, items })?)))
+            Some(Value::Obj(Some(vm.heap.alloc(Object::Array { ty, items: crate::heap::Items::U16(units) })?)))
         }
         Native::StringSubstring => {
             let units = this_units(vm, arg(0)?)?;
@@ -693,15 +752,10 @@ fn char_array<H: Host>(vm: &Vm<'_, H>, value: Value) -> Result<Option<Vec<u16>>,
     match value {
         Value::Obj(None) => Ok(None),
         Value::Obj(Some(object)) => match vm.heap.get(object) {
-            Some(Object::Array { items, .. }) => {
+            Some(Object::Array { items: crate::heap::Items::U16(chars), .. }) => {
                 let mut units = Vec::new();
-                units.try_reserve_exact(items.len()).map_err(|_| VmError::OutOfMemory)?;
-                for item in items {
-                    units.push(match item {
-                        Value::I32(unit) => *unit as u16,
-                        _ => return Err(vm.invalid("char array holds a value that is not a char")),
-                    });
-                }
+                units.try_reserve_exact(chars.len()).map_err(|_| VmError::OutOfMemory)?;
+                units.extend_from_slice(chars);
                 Ok(Some(units))
             }
             _ => Err(vm.invalid("expected a char array")),

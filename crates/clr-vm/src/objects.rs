@@ -519,7 +519,7 @@ impl<'a, H: Host> Vm<'a, H> {
         };
         let Value::Obj(Some(object)) = array else { return Ok(()) };
         if let Some(Object::Array { items, .. }) = self.heap.get_mut(object) {
-            for (item, bytes) in items.iter_mut().zip(data.chunks_exact(size)) {
+            for (index, bytes) in data.chunks_exact(size).enumerate().take(items.len()) {
                 let mut raw = [0u8; 8];
                 raw[..size].copy_from_slice(bytes);
                 let bits = u64::from_le_bytes(raw);
@@ -533,7 +533,7 @@ impl<'a, H: Host> Vm<'a, H> {
                     Prim::R4 => Value::F32(f32::from_bits(bits as u32)),
                     Prim::R8 => Value::F(f64::from_bits(bits)),
                 };
-                *item = value;
+                items.set(index, value);
             }
         }
         Ok(())

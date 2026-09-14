@@ -96,9 +96,13 @@ impl<H: Host> Vm<'_, H> {
             }
             *mark = true;
             match self.heap.get(ObjRef(index)) {
-                Some(Object::Array { items: values, .. })
-                | Some(Object::Instance { fields: values, .. })
-                | Some(Object::Struct { fields: values, .. }) => {
+                // Массив чисел ссылок не держит: у него `values()` пуст.
+                Some(Object::Array { items, .. }) => {
+                    for value in items.values() {
+                        push(&mut work, *value)?;
+                    }
+                }
+                Some(Object::Instance { fields: values, .. }) | Some(Object::Struct { fields: values, .. }) => {
                     for value in values {
                         push(&mut work, *value)?;
                     }
