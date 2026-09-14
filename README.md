@@ -210,4 +210,4 @@ on — a claim checked rather than asserted, because the same code drives the ke
 
 ## Licence
 
-MIT OR Apache-2.0
+Distributed under the GNU General Public License v3 — see [LICENSE](LICENSE).

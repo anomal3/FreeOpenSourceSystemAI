@@ -1,3 +1,6 @@
+// Этот файл является частью FreeOpenSourceSystemAI.
+// Программа распространяется на условиях GNU General Public License v3.
+
 //! `cargo xtask` — host-side оркестратор сборки и запуска ОС.
 //!
 //! Живёт в том же workspace, что и ядерные крейты, но собирается под host-триплет.

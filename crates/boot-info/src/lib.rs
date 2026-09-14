@@ -1,3 +1,6 @@
+// Этот файл является частью FreeOpenSourceSystemAI.
+// Программа распространяется на условиях GNU General Public License v3.
+
 //! The hand-off contract between the UEFI bootloader and the kernel.
 //!
 //! This crate is deliberately dependency-free and `#![no_std]`. It is linked

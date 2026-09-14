@@ -1,3 +1,6 @@
+// Этот файл является частью FreeOpenSourceSystemAI.
+// Программа распространяется на условиях GNU General Public License v3.
+
 //! Разбор HID Report Descriptor: как читать устройство, которое не говорит на
 //! boot-протоколе.
 //!
