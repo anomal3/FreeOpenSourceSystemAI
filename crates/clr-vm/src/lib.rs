@@ -11,9 +11,13 @@
 //! умолчанию), статические конструкторы, структуры с копированием по значению,
 //! упаковка, `is`/`as`/приведения, инициализаторы массивов из данных сборки.
 //!
-//! Чего нет — исключений (N3b), обобщённых методов с делегатами (N3c), сборщика
-//! мусора (N3d: пока объекты живут до конца программы) и большей части
-//! базовой библиотеки (N4). Встреча с неподдержанным — не падение и не
+//! Фаза N3b — исключения: `throw`, `catch` по типу, фильтры `when`, `finally`
+//! и `fault`, `rethrow`, исключения самой среды, которые программа ловит
+//! ([`eh`]).
+//!
+//! Чего нет — обобщённых методов с делегатами (N3c), сборщика мусора (N3d:
+//! пока объекты живут до конца программы) и большей части базовой библиотеки
+//! (N4). Встреча с неподдержанным — не падение и не
 //! молчание, а [`VmError`] с полным именем члена или кодом инструкции и местом.
 //!
 //! # Базовая библиотека
@@ -48,6 +52,7 @@ extern crate alloc;
 extern crate std;
 
 mod dispatch;
+mod eh;
 mod heap;
 mod loader;
 mod natives;
@@ -88,8 +93,12 @@ pub enum VmError {
     MissingType { name: String },
     /// IL, которого не пропустил бы верификатор: стек пуст, типы не сходятся.
     Invalid { what: &'static str, at: String },
-    /// Исключение .NET, которое программа не поймала.
+    /// Исключение, которое бросает сама среда (`System.NullReferenceException`
+    /// и подобные). Цикл исполнения превращает его в объект и бросает в
+    /// программу; наружу оно выходит, только если бросить некуда.
     Exception { name: &'static str, at: String },
+    /// Исключение, которое программа не поймала.
+    Unhandled { name: String, message: String, at: String },
     /// Кончилась память.
     OutOfMemory,
     /// Вызовы вложены глубже, чем разрешено.
@@ -108,6 +117,7 @@ impl fmt::Display for VmError {
             Self::MissingType { name } => write!(f, "missing type {name} (not in the base library yet)"),
             Self::Invalid { what, at } => write!(f, "invalid IL: {what} in {at}"),
             Self::Exception { name, at } => write!(f, "unhandled exception {name} in {at}"),
+            Self::Unhandled { name, message, at } => write!(f, "unhandled exception {name}: {message} in {at}"),
             Self::OutOfMemory => write!(f, "out of memory"),
             Self::StackOverflow => {
                 write!(f, "stack overflow: more than {} nested calls", vm::MAX_FRAMES)

@@ -130,6 +130,52 @@ fn samples_fit_in_the_user_stack() {
     }
 }
 
+/// Образец `tools/dotnet/samples/exceptions` (фаза N3b).
+const EXCEPTIONS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/exceptions.dll");
+
+/// Что печатает `dotnet exceptions.dll` (записано 2026-09-14, .NET 10, LF).
+/// `filter deep` раньше `unwind 1` — два прохода поиска обработчика.
+const EXCEPTIONS_OUTPUT: &str = concat!(
+    "exceptions: start\n",
+    "caught simple code 3\n",
+    "filter deep\n",
+    "unwind 1\n",
+    "unwind 2\n",
+    "unwind 3\n",
+    "deep: bottom code 7\n",
+    "filter no\n",
+    "fell through to AppError\n",
+    "finally before return\n",
+    "finally returns 1\n",
+    "inner finally\n",
+    "outer caught inner\n",
+    "nested 110\n",
+    "null: Object reference not set to an instance of an object.\n",
+    "index: Index was outside the bounds of the array.\n",
+    "divide: Attempted to divide by zero.\n",
+    "cast failed\n",
+    "overflow: Arithmetic operation resulted in an overflow.\n",
+    "log again\n",
+    "rethrown again\n",
+    "open file\n",
+    "close file\n",
+    "argument: Value cannot be null. (Parameter 'path')\n",
+    "finally throws\n",
+    "got second\n",
+    "FreeOs.Samples.Exceptions.AppError: not thrown\n",
+    "Exception of type 'System.Exception' was thrown.\n",
+    "loop 43\n",
+    "exceptions: done\n",
+);
+
+#[test]
+fn exceptions_print_what_dotnet_prints() {
+    let (result, output) = run(EXCEPTIONS);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, EXCEPTIONS_OUTPUT);
+    assert_eq!(code, 43);
+}
+
 #[test]
 fn objects_print_what_dotnet_prints() {
     let (result, output) = run(OBJECTS);

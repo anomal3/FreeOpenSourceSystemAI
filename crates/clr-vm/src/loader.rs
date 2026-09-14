@@ -657,12 +657,8 @@ impl<'a, H: Host> Vm<'a, H> {
         };
         let mut clauses = Vec::new();
         for clause in parsed.clauses() {
+            clauses.try_reserve(1).map_err(|_| VmError::OutOfMemory)?;
             clauses.push(clause?);
-        }
-        if !clauses.is_empty() {
-            return Err(VmError::Unsupported {
-                what: format!("exception handling in {} (phase N3b)", self.method_name(method)),
-            });
         }
         let mut locals = Vec::new();
         if parsed.local_signature != 0 {
@@ -824,7 +820,7 @@ impl<'a, H: Host> Vm<'a, H> {
     }
 
 
-    fn find_field(&mut self, owner: TypeId, name: &str) -> Result<Option<FieldRef>, VmError> {
+    pub(crate) fn find_field(&mut self, owner: TypeId, name: &str) -> Result<Option<FieldRef>, VmError> {
         let mut current = Some(owner);
         while let Some(ty) = current {
             if let Some((asm, row)) = self.types[ty.0 as usize].def {

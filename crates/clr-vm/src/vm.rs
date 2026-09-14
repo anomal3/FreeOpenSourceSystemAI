@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use clr_meta::tables::id;
 use clr_meta::{Assembly, Token};
 
+use crate::eh::Continuation;
 use crate::heap::{Heap, Object};
 use crate::ops;
 use crate::places::{narrow_load, narrow_store};
@@ -35,6 +36,46 @@ pub(crate) struct Frame<'a> {
     pub stack: Vec<Value>,
     /// Тип из префикса `constrained.` — для следующего `callvirt`.
     pub constrained: Option<TypeId>,
+    pub kind: FrameKind,
+    /// Что делать по `endfinally` выполняемых сейчас `finally` (см. `eh.rs`).
+    pub continuations: Vec<Continuation>,
+    /// Исключения работающих обработчиков `catch` — для `rethrow`.
+    pub caught: Vec<(u32, ObjRef)>,
+    /// Кадр конструктора исключения, брошенного средой: объект бросается,
+    /// когда конструктор вернётся.
+    pub then_throw: Option<ObjRef>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FrameKind {
+    Normal,
+    /// Фильтр `when` обработчика `clause` в кадре `owner`: он забрал аргументы
+    /// и переменные владельца и вернёт их на `endfilter`.
+    Filter { owner: usize, clause: u32, exception: ObjRef },
+}
+
+impl<'a> Frame<'a> {
+    pub(crate) const fn new(
+        method: MethodId,
+        body: Rc<Body<'a>>,
+        args: Vec<Value>,
+        locals: Vec<Value>,
+        stack: Vec<Value>,
+    ) -> Self {
+        Self {
+            method,
+            body,
+            pc: 0,
+            args,
+            locals,
+            stack,
+            constrained: None,
+            kind: FrameKind::Normal,
+            continuations: Vec::new(),
+            caught: Vec::new(),
+            then_throw: None,
+        }
+    }
 }
 
 /// Среда выполнения программы вместе с базовой библиотекой.
@@ -156,7 +197,21 @@ impl<'a, H: Host> Vm<'a, H> {
     }
 
     /// Исполнять, пока число кадров не опустится до `floor`.
+    ///
+    /// Исключение, которое бросила сама среда посреди инструкции
+    /// ([`VmError::Exception`]: `null.Length`, выход за массив), становится
+    /// объектом и летит в программу — всё состояние в кадрах, и цикл просто
+    /// начинается заново. Наружу уходит только то, чего программа не поймала.
     fn execute(&mut self, floor: usize) -> Result<Option<Value>, VmError> {
+        loop {
+            match self.run_frames(floor) {
+                Err(VmError::Exception { name, .. }) if self.frames.len() > floor => self.throw_runtime(name)?,
+                other => return other,
+            }
+        }
+    }
+
+    fn run_frames(&mut self, floor: usize) -> Result<Option<Value>, VmError> {
         loop {
             self.instructions += 1;
             let top = self.frames.len() - 1;
@@ -245,9 +300,13 @@ impl<'a, H: Host> Vm<'a, H> {
                 0x2A => {
                     let returns = self.methods[self.frames[top].method.0 as usize].returns;
                     let value = if returns { Some(self.pop()?) } else { None };
-                    self.frames.pop();
+                    let finished = self.frames.pop();
                     if self.frames.len() == floor {
                         return Ok(value);
+                    }
+                    if let Some(exception) = finished.and_then(|frame| frame.then_throw) {
+                        self.raise(exception)?;
+                        continue;
                     }
                     if let Some(value) = value {
                         self.push(value)?;
@@ -372,6 +431,20 @@ impl<'a, H: Host> Vm<'a, H> {
                     let ty = self.resolve_type(self.frames[top].method, token)?;
                     self.unbox(ty, op == 0xA5)?;
                 }
+                // throw
+                0x7A => {
+                    match self.pop()? {
+                        Value::Obj(Some(exception)) => self.raise(exception)?,
+                        Value::Obj(None) => return Err(self.exception("System.NullReferenceException")),
+                        _ => return Err(self.invalid("throw of a value that is not a reference")),
+                    }
+                    continue;
+                }
+                // endfinally
+                0xDC => {
+                    self.end_finally()?;
+                    continue;
+                }
                 // ldfld, ldflda
                 0x7B | 0x7C => {
                     let token = self.operand_u32(code, &mut next)?;
@@ -463,9 +536,8 @@ impl<'a, H: Host> Vm<'a, H> {
                     let token = self.operand_u32(code, &mut next)?;
                     self.load_token(token)?;
                 }
-                // leave, leave.s: выход из защищённого блока. Обработчиков у
-                // методов этой фазы нет (см. `Vm::body`), и `leave` — это
-                // переход, очищающий стек вычислений.
+                // leave, leave.s: выход из защищённого блока через все
+                // `finally` по дороге (см. `eh.rs`).
                 0xDD | 0xDE => {
                     let offset = if op == 0xDD {
                         i64::from(self.operand_u32(code, &mut next)? as i32)
@@ -473,8 +545,9 @@ impl<'a, H: Host> Vm<'a, H> {
                         let [byte] = self.operand::<1>(code, &mut next)?;
                         i64::from(byte as i8)
                     };
-                    self.frames[top].stack.clear();
-                    next = self.target(code, next, offset)?;
+                    let target = self.target(code, next, offset)?;
+                    self.leave(pc, target)?;
+                    continue;
                 }
                 0xFE => {
                     let [second] = self.operand::<1>(code, &mut next)?;
@@ -539,6 +612,16 @@ impl<'a, H: Host> Vm<'a, H> {
                             self.operand::<1>(code, &mut next)?;
                         }
                         0x13 | 0x14 | 0x1E => {}
+                        // endfilter
+                        0x11 => {
+                            self.end_filter()?;
+                            continue;
+                        }
+                        // rethrow
+                        0x1A => {
+                            self.rethrow()?;
+                            continue;
+                        }
                         _ => return Err(self.unsupported_instruction(0xFE00 | u16::from(second))),
                     }
                 }

@@ -33,8 +33,19 @@ impl<'a, H: Host> Vm<'a, H> {
         let mut stack = Vec::new();
         stack.try_reserve(usize::from(body.max_stack)).map_err(|_| VmError::OutOfMemory)?;
         self.frames.try_reserve(1).map_err(|_| VmError::OutOfMemory)?;
-        self.frames.push(Frame { method, body, pc: 0, args, locals, stack, constrained: None });
+        self.frames.push(Frame::new(method, body, args, locals, stack));
         Ok(())
+    }
+
+    /// Экземпляр класса с обнулёнными полями, без конструктора.
+    pub(crate) fn new_instance(&mut self, ty: TypeId) -> Result<ObjRef, VmError> {
+        let stores: Vec<Store> = self.types[ty.0 as usize].fields.iter().map(|slot| slot.store).collect();
+        let mut fields = Vec::new();
+        fields.try_reserve_exact(stores.len()).map_err(|_| VmError::OutOfMemory)?;
+        for store in stores {
+            fields.push(self.zero(store)?);
+        }
+        self.heap.alloc(Object::Instance { ty, fields })
     }
 
     /// Выполнить метод с готовыми аргументами: член в Rust — сразу, метод IL —
@@ -159,13 +170,7 @@ impl<'a, H: Host> Vm<'a, H> {
                 (Value::Struct(object), Value::Ptr(Pointer::Struct(object)))
             }
             Kind::Class => {
-                let stores: Vec<Store> = self.types[owner.0 as usize].fields.iter().map(|slot| slot.store).collect();
-                let mut fields = Vec::new();
-                fields.try_reserve_exact(stores.len()).map_err(|_| VmError::OutOfMemory)?;
-                for store in stores {
-                    fields.push(self.zero(store)?);
-                }
-                let object = Value::Obj(Some(self.heap.alloc(Object::Instance { ty: owner, fields })?));
+                let object = Value::Obj(Some(self.new_instance(owner)?));
                 (object, object)
             }
             _ => {
@@ -186,7 +191,6 @@ impl<'a, H: Host> Vm<'a, H> {
     // --------------------------------------------------------------------
     // Поля
     // --------------------------------------------------------------------
-
 
     fn field(&mut self, token: u32) -> Result<FieldRef, VmError> {
         let context = self.frames[self.frames.len() - 1].method;

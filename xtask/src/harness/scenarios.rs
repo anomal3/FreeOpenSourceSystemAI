@@ -3168,6 +3168,26 @@ pub const ALL: &[Scenario] = &[
             Step::Await("objects: done", 60_000),
             // Main возвращает число созданных животных — три.
             Step::Await("dotnet: objects.dll: Main returned 3", 60_000),
+            Step::Await("freeos> ", 15_000),
+            // Фаза N3b: исключения. Порядок строк и есть проверка: фильтр
+            // печатает раньше `finally` внутренних кадров (два прохода, как в
+            // CLR), исключение из `finally` заменяет летящее, а исключения самой
+            // среды ловятся программой с текстом из базовой библиотеки.
+            Step::Line("dotnet /usr/share/dotnet/samples/exceptions.dll"),
+            Step::Await("exceptions: start", 60_000),
+            Step::Await("filter deep", 60_000),
+            Step::Await("unwind 1", 60_000),
+            Step::Await("deep: bottom code 7", 60_000),
+            Step::Await("fell through to AppError", 60_000),
+            Step::Await("nested 110", 60_000),
+            Step::Await("null: Object reference not set to an instance of an object.", 60_000),
+            Step::Await("divide: Attempted to divide by zero.", 60_000),
+            Step::Await("rethrown again", 60_000),
+            Step::Await("close file", 60_000),
+            Step::Await("got second", 60_000),
+            Step::Await("loop 43", 60_000),
+            Step::Await("exceptions: done", 60_000),
+            Step::Await("dotnet: exceptions.dll: Main returned 43", 60_000),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),
         ],

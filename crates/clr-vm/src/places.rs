@@ -456,7 +456,6 @@ impl<'a, H: Host> Vm<'a, H> {
 
     pub(crate) fn unsupported_instruction(&self, op: u16) -> VmError {
         let topic = match op {
-            0x7A | 0xDC | 0xFE11 | 0xFE1A => "exceptions (phase N3b)",
             0x29 | 0xFE06 | 0xFE07 => "delegates and function pointers (phase N3c)",
             0xFE1C => "sizeof (phase N4)",
             _ => "not implemented",

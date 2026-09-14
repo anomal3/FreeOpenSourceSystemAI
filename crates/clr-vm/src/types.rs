@@ -289,9 +289,7 @@ pub(crate) struct Body<'a> {
     pub code: &'a [u8],
     pub max_stack: u16,
     pub locals: Vec<Store>,
-    /// Обработчики исключений. Тело с ними пока не разбирается вовсе
-    /// (`Vm::body` отказывает с названием фазы); читать их будет N3b.
-    #[allow(dead_code)]
+    /// Обработчики исключений в порядке таблицы — изнутри наружу (`eh.rs`).
     pub clauses: Vec<ExceptionClause>,
 }
 

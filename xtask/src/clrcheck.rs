@@ -35,7 +35,8 @@ use clr_meta::{Assembly, Coded, Token};
 ///
 /// `features` нужен ради таблиц метаданных: в нём события, делегаты и
 /// исключения, которых у среды фазы N3a ещё нет.
-const SAMPLES: [(&str, bool); 4] = [("hello", true), ("arith", true), ("objects", true), ("features", false)];
+const SAMPLES: [(&str, bool); 5] =
+    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("features", false)];
 
 /// Имя сборки базовой библиотеки своей среды (`tools/dotnet/corelib`).
 const CORELIB: &str = "FreeOs.CoreLib.dll";
