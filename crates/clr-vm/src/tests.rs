@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -601,4 +601,25 @@ fn form_prints_what_winforms_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, FORM_OUTPUT);
     assert_eq!(code, 17);
+}
+
+/// Образец `tools/dotnet/samples/winforms` (фаза N6b): шаблон `dotnet new winforms`
+/// с кнопкой и надписью из дизайнера.
+const WINFORMS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/winforms.dll");
+
+/// Что печатает `dotnet winforms.dll self-test` (записано 2026-09-15, .NET 10,
+/// WinForms на Windows, LF): форма дважды нажимает кнопку и закрывается.
+const WINFORMS_OUTPUT: &str = concat!(
+    "shown: Form1 | Click me | label1 | 2 True 0 True Form1\n",
+    "button1: Clicked 1 time\n",
+    "button1: Clicked 2 times\n",
+    "closed: UserClosing Clicked 2 times\n",
+);
+
+#[test]
+fn winforms_template_prints_what_winforms_prints() {
+    let (result, output) = run_with(WINFORMS, "winforms.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, WINFORMS_OUTPUT);
+    assert_eq!(code, 0);
 }

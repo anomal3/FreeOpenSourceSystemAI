@@ -3361,6 +3361,16 @@ Windows эталон получал бы запятую в дробных чис
   смешивается.
 - **N6b — кнопка и надпись.** `Button`, `Label`, `Click`, шаблон
   `dotnet new winforms` с кнопкой из дизайнера; стенд щёлкает по кнопке.
+  Образец `winforms` — шаблон без правок сгенерированного кода, в дизайнере
+  добавлены `button1` и `label1`, руками написан только обработчик. Код
+  дизайнера (`SuspendLayout`, `AutoScaleDimensions`, `AutoScaleMode.Font`,
+  `Controls.Add`, `ResumeLayout`, `PerformLayout`) принимается как есть. С
+  `self-test` форма дважды зовёт `PerformClick()`, и вывод совпадает с
+  WinForms; на стенде по кнопке дважды щёлкает мышь, надпись меняется, окно
+  закрывается крестиком. Размеры не печатаются: с `AutoScaleMode.Font` из
+  шаблона они у Windows зависят от DPI экрана. Ловушка: `Controls.Count`
+  компилятор берёт у `Layout.ArrangedElementCollection` — базового класса
+  коллекции, которого в коде программы не видно.
 
 **Фаза N7 — WinForms, которой можно пользоваться.** `TextBox` с русской
 раскладкой, `CheckBox`, `ListBox`, `ComboBox`, `MessageBox` окнами с кнопками,

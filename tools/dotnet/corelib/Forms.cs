@@ -691,6 +691,9 @@ namespace System.Windows.Forms
             return this;
         }
 
+        // Доходит ли до Click щелчок не левой кнопкой (у кнопки — нет).
+        internal virtual bool ClicksWithLeftOnly => false;
+
         // Щелчок в порядке WinForms: MouseDown, Click, MouseClick, MouseUp.
         internal void DeliverClick(MouseButtons button, int localX, int localY)
         {
@@ -700,7 +703,10 @@ namespace System.Windows.Forms
             }
             var args = new MouseEventArgs(button, 1, localX, localY, 0);
             OnMouseDown(args);
-            OnClick(EventArgs.Empty);
+            if (button == MouseButtons.Left || !ClicksWithLeftOnly)
+            {
+                OnClick(EventArgs.Empty);
+            }
             OnMouseClick(args);
             OnMouseUp(args);
         }
@@ -741,7 +747,9 @@ namespace System.Windows.Forms
             base.Dispose(disposing);
         }
 
-        public class ControlCollection
+        // База — ArrangedElementCollection, как у WinForms: компилятор берёт
+        // `Controls.Count` у неё, а индексатор — у этого класса.
+        public class ControlCollection : Layout.ArrangedElementCollection
         {
             private readonly List<Control> items = new List<Control>();
 
@@ -752,7 +760,7 @@ namespace System.Windows.Forms
 
             public Control Owner { get; }
 
-            public int Count => items.Count;
+            public override int Count => items.Count;
 
             public Control this[int index] => items[index];
 

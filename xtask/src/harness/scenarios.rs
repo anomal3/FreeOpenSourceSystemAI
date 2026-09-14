@@ -3305,8 +3305,9 @@ pub const ALL: &[Scenario] = &[
             // Фаза N6a: окно WinForms. Форма открывается окном программы,
             // рисует себя в Paint, получает щелчок мышью в своих координатах и
             // закрывается крестиком стола — FormClosing и FormClosed с причиной
-            // UserClosing, как под Windows. Шаг последний: окно забирает фокус, и
-            // строка, набранная после него, ушла бы в окно.
+            // UserClosing, как под Windows. Пока окно открыто, строк в линию не
+            // набирать: фокус у окна, и строка ушла бы в него. После закрытия
+            // стол сам отдаёт фокус терминалу (`focus 'Terminal'`).
             Step::Line("dotnet /usr/share/dotnet/samples/form.dll"),
             Step::Await("form: start", 60_000),
             Step::Await("Color [SteelBlue] -12156236 70,130,180 True", 60_000),
@@ -3327,6 +3328,32 @@ pub const ALL: &[Scenario] = &[
             Step::Await("dotnet: window 'FreeOS Form' closed after", 30_000),
             Step::Await("form: Run returned, disposed True", 30_000),
             Step::Await("dotnet: form.dll: Main returned 17", 30_000),
+            // `focus 'Terminal'` стол печатает раньше, при закрытии окна, — ждать
+            // его здесь значит искать позади курсора.
+            Step::Await("freeos> ", 15_000),
+            // Фаза N6b: шаблон `dotnet new winforms` с кнопкой и надписью из
+            // дизайнера, без единой правки сгенерированного кода. Стенд щёлкает
+            // по середине кнопки — (12, 12) и 94×29 из дизайнера; масштаба по DPI
+            // у среды нет, и координаты те же, что в коде. Между щелчками пауза:
+            // два щелчка подряд — это ещё и двойной щелчок.
+            Step::Line("dotnet /usr/share/dotnet/samples/winforms.dll"),
+            Step::Await("dotnet: window 'Form1' opened, 800x450", 60_000),
+            Step::Await("shown: Form1 | Click me | label1 | 2 True 0 True Form1", 60_000),
+            Step::Wait(2_500),
+            Step::Shot("winforms"),
+            Step::Aim(Aim::Program("Form1", 59, 26)),
+            Step::Click,
+            Step::Await("button1: Clicked 1 time", 30_000),
+            Step::Wait(1_200),
+            Step::Click,
+            Step::Await("button1: Clicked 2 times", 30_000),
+            Step::Wait(2_500),
+            Step::Shot("winforms-clicked"),
+            Step::Aim(Aim::Close("Form1")),
+            Step::Click,
+            Step::Await("closed: UserClosing Clicked 2 times", 30_000),
+            Step::Await("dotnet: window 'Form1' closed after", 30_000),
+            Step::Await("dotnet: winforms.dll: Main returned 0", 30_000),
             Step::Absent("finally after Environment.Exit must not run"),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),

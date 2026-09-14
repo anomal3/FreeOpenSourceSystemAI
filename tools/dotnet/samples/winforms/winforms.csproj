@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N6b: шаблон dotnet new winforms, в дизайнере добавлены
+       кнопка и надпись. clr-check запускает его с аргументом self-test: форма
+       дважды нажимает кнопку сама и закрывается. На стенде кнопку нажимает мышь. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
