@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -682,5 +682,31 @@ fn lists_print_what_winforms_prints() {
     let (result, output) = run_with(LISTS, "lists.dll", &["self-test"]);
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, LISTS_OUTPUT);
+    assert_eq!(code, 0);
+}
+
+/// Образец `tools/dotnet/samples/dialogs` (фаза N7c): таймер из дизайнера.
+/// Окна сообщений самопроверка не открывает — под Windows модальное окно
+/// ждало бы человека; их нажимает стенд.
+const DIALOGS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/dialogs.dll");
+
+/// Что печатает `dotnet dialogs.dll self-test` (записано 2026-09-15, .NET 10,
+/// WinForms на Windows, LF): три тика, остановка и закрытие из обработчика.
+const DIALOGS_OUTPUT: &str = concat!(
+    "shown: False 50 null None YesNoCancel 6 Exclamation 48\n",
+    "started: True\n",
+    "tick 1 True 50\n",
+    "tick 2 True 50\n",
+    "tick 3 True 50\n",
+    "stopped: False\n",
+    "restart and disable: False 3\n",
+    "closed: UserClosing 3\n",
+);
+
+#[test]
+fn dialogs_print_what_winforms_prints() {
+    let (result, output) = run_with(DIALOGS, "dialogs.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, DIALOGS_OUTPUT);
     assert_eq!(code, 0);
 }

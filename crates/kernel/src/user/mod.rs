@@ -265,8 +265,11 @@ enum Source {
     /// пройти мимо неё — иначе первая же снятая программа оставит композитору
     /// ссылку на кадры, уже отданные в пул.
     ///
+    /// Второе число — номер окна у программы (фаза N7c): окон может быть
+    /// несколько, и снимать надо поверхность того, которое закрыли.
+    ///
     /// [`allocate_contiguous`]: crate::mm::frame::BitmapFrameAllocator::allocate_contiguous
-    Surface(PhysAddr),
+    Surface(PhysAddr, u32),
 }
 
 /// Файл, стоящий за областью, и всё, что нужно знать о её страницах.
@@ -551,7 +554,7 @@ impl Program {
     /// а два нужных следствия разом: [`Program::find_gap`] обойдёт её, выдавая
     /// адрес следующему `mmap`, а [`Program::munmap`] найдёт её и откажет —
     /// ровно то, что обещает договор.
-    fn attach_surface(&mut self, pages: usize) -> Result<(usize, PhysAddr), MmapError> {
+    fn attach_surface(&mut self, pages: usize, slot: u32) -> Result<(usize, PhysAddr), MmapError> {
         if self.mappings.len() == MAX_MAPPINGS {
             return Err(MmapError::Limit);
         }
@@ -591,8 +594,23 @@ impl Program {
             return Err(MmapError::NoMemory);
         }
 
-        self.remember(Mapping { base, pages, blocks: 0, source: Source::Surface(phys) });
+        self.remember(Mapping { base, pages, blocks: 0, source: Source::Surface(phys, slot) });
         Ok((base, phys))
+    }
+
+    /// Номера окон, у которых есть поверхность, — битовая маска.
+    fn window_slots(&self) -> u32 {
+        self.mappings.iter().fold(0, |mask, region| match &region.source {
+            Source::Surface(_, slot) => mask | (1 << *slot),
+            _ => mask,
+        })
+    }
+
+    /// Свободный номер для следующего окна; `None` — окон уже
+    /// [`user_abi::MAX_WINDOWS`].
+    fn free_window_slot(&self) -> Option<u32> {
+        let taken = self.window_slots();
+        (0..user_abi::MAX_WINDOWS).find(|slot| taken & (1 << slot) == 0)
     }
 
     /// Снять поверхность окна: убрать отображение и вернуть кадры в пул.
@@ -608,18 +626,16 @@ impl Program {
     /// окна подавляющее большинство, и спрашивать о них стол значило бы лезть
     /// на каждом выходе `ls` под замок, который держит сборка кадра.
     fn has_surface(&self) -> bool {
-        self.mappings
-            .iter()
-            .any(|region| matches!(region.source, Source::Surface(_)))
+        self.window_slots() != 0
     }
 
-    fn detach_surface(&mut self) -> Option<usize> {
+    fn detach_surface(&mut self, slot: u32) -> Option<usize> {
         let index = self
             .mappings
             .iter()
-            .position(|region| matches!(region.source, Source::Surface(_)))?;
+            .position(|region| matches!(region.source, Source::Surface(_, owner) if owner == slot))?;
         let region = self.mappings.remove(index);
-        let Source::Surface(phys) = region.source else {
+        let Source::Surface(phys, _) = region.source else {
             unreachable!("область только что опознана поверхностью");
         };
 
@@ -668,7 +684,7 @@ impl Program {
         // окну. `unmap_range` ниже вернул бы их в пул, следующая выдача отдала
         // бы их второму владельцу — и композитор продолжал бы рисовать из чужой
         // памяти. Вернуть поверхность можно только вместе с окном.
-        if matches!(self.mappings[index].source, Source::Surface(_)) {
+        if matches!(self.mappings[index].source, Source::Surface(..)) {
             return Err(MmapError::BadRequest);
         }
 
@@ -692,7 +708,7 @@ impl Program {
             // Сюда не приходят: поверхность отсеяна проверкой выше. Ветка
             // существует затем, чтобы новый вид области нельзя было завести,
             // не ответив на вопрос, сколько кадров он обязан вернуть.
-            Source::Surface(_) => region.pages,
+            Source::Surface(..) => region.pages,
         };
         if freed != owed {
             kprintln!(
@@ -961,9 +977,12 @@ pub enum WindowError {
     Memory(MmapError),
     /// Стол окна не дал.
     Desktop(crate::ui::WindowError),
+    /// Окон у программы уже [`user_abi::MAX_WINDOWS`].
+    TooMany,
 }
 
-/// Завести окно текущей программе. Возвращает адрес поверхности в её памяти.
+/// Завести окно текущей программе. Возвращает адрес поверхности в её памяти и
+/// номер окна у программы.
 ///
 /// # Почему здесь два захода под лок таблицы программ, а не один
 ///
@@ -975,7 +994,7 @@ pub enum WindowError {
 ///
 /// Гонки между заходами нет, и это не везение: между ними программа стоит
 /// внутри этого самого вызова, а её области трогает только она.
-pub fn open_window(title: &str, width: u32, height: u32) -> Result<usize, WindowError> {
+pub fn open_window(title: &str, width: u32, height: u32) -> Result<(usize, u32), WindowError> {
     if width == 0 || height == 0 {
         return Err(WindowError::BadSize);
     }
@@ -988,9 +1007,12 @@ pub fn open_window(title: &str, width: u32, height: u32) -> Result<usize, Window
     }
     let pages = bytes.div_ceil(PAGE_SIZE);
 
-    let (base, phys) = with_current(|program| program.attach_surface(pages))
-        .ok_or(WindowError::NoProgram)?
-        .map_err(WindowError::Memory)?;
+    let (slot, base, phys) = with_current(|program| {
+        let slot = program.free_window_slot().ok_or(WindowError::TooMany)?;
+        let (base, phys) = program.attach_surface(pages, slot).map_err(WindowError::Memory)?;
+        Ok((slot, base, phys))
+    })
+    .ok_or(WindowError::NoProgram)??;
 
     // SAFETY: кадры выданы подряд, живы, пока живо окно, и видны ядру через
     // прямое отображение. Второй ссылки на них нет: программа получила адрес
@@ -1001,35 +1023,36 @@ pub fn open_window(title: &str, width: u32, height: u32) -> Result<usize, Window
     };
     let task = sched::current().as_u32();
     let opened = match surface {
-        Some(surface) => crate::ui::open_window(task, title, surface),
+        Some(surface) => crate::ui::open_window(task, slot, title, surface),
         None => Err(crate::ui::WindowError::NoMemory),
     };
     if let Err(err) = opened {
         // Окна не будет — значит и поверхности быть не должно. Оставить её
         // значило бы отдать программе память, которой она не просила, и
         // держать кадры до самого её конца.
-        with_current(Program::detach_surface);
+        with_current(|program| program.detach_surface(slot));
         return Err(WindowError::Desktop(err));
     }
-    Ok(base)
+    Ok((base, slot))
 }
 
-/// Показать на экране то, что программа нарисовала. `None` — всё окно.
-pub fn commit_window(area: Option<mini_ui::Rect>) -> Result<(), WindowError> {
-    crate::ui::commit_window(sched::current().as_u32(), area).map_err(WindowError::Desktop)
+/// Показать на экране то, что программа нарисовала в окне `slot`. `None` — всё
+/// окно.
+pub fn commit_window(slot: u32, area: Option<mini_ui::Rect>) -> Result<(), WindowError> {
+    crate::ui::commit_window(sched::current().as_u32(), slot, area).map_err(WindowError::Desktop)
 }
 
-/// Забрать событие окна текущей программы.
-pub fn window_event() -> Option<user_abi::WinEvent> {
-    crate::ui::next_window_event(sched::current().as_u32())
+/// Забрать событие окна `slot` текущей программы.
+pub fn window_event(slot: u32) -> Option<user_abi::WinEvent> {
+    crate::ui::next_window_event(sched::current().as_u32(), slot)
 }
 
-/// Закрыть окно текущей программы и вернуть его память.
-pub fn close_window() -> Result<(), WindowError> {
+/// Закрыть окно `slot` текущей программы и вернуть его память.
+pub fn close_window(slot: u32) -> Result<(), WindowError> {
     // Сначала окно уходит со стола, и только потом освобождаются кадры: пока
     // окно на столе, композитор вправе читать его пиксели.
-    crate::ui::close_window(sched::current().as_u32()).map_err(WindowError::Desktop)?;
-    with_current(Program::detach_surface).ok_or(WindowError::NoProgram)?;
+    crate::ui::close_window(sched::current().as_u32(), slot).map_err(WindowError::Desktop)?;
+    with_current(|program| program.detach_surface(slot)).ok_or(WindowError::NoProgram)?;
     Ok(())
 }
 
@@ -1053,11 +1076,21 @@ fn reclaim_window() {
     if with_current(|program| program.has_surface()) != Some(true) {
         return;
     }
+    // Окон у программы может быть несколько (фаза N7c) — снимается каждое.
+    let slots = with_current(|program| program.window_slots()).unwrap_or(0);
+    for slot in 0..user_abi::MAX_WINDOWS {
+        if slots & (1 << slot) != 0 {
+            reclaim_slot(slot);
+        }
+    }
+}
 
+/// Снять одно окно умершей программы — см. [`reclaim_window`].
+fn reclaim_slot(slot: u32) {
     let task = sched::current().as_u32();
     let deadline = crate::time::uptime_ms().saturating_add(RECLAIM_WAIT_MS);
     loop {
-        match crate::ui::close_window(task) {
+        match crate::ui::close_window(task, slot) {
             Ok(()) => break,
             // Окна нет вовсе: графики на машине не было, а поверхность у
             // программы всё равно есть. Кадры возвращаются как обычно.
@@ -1079,7 +1112,7 @@ fn reclaim_window() {
         sched::sleep_ms(RECLAIM_PAUSE_MS);
     }
 
-    let Some(Some(pages)) = with_current(Program::detach_surface) else {
+    let Some(Some(pages)) = with_current(|program| program.detach_surface(slot)) else {
         return;
     };
     kprintln!(

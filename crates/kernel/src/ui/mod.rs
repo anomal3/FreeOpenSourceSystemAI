@@ -416,7 +416,7 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
         // поверхности, которую заказала сама программа ([`open_window`]), а не
         // от размера экрана. Ветка стоит ради полноты разбора, и ответ у неё
         // осмысленный, а не нулевой, — на случай, если однажды придёт.
-        App::Program(_) => {
+        App::Program(..) => {
             let w = (width / 2).max(320);
             let h = (work / 2).max(200);
             Rect::new(
@@ -447,7 +447,7 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
         // нужны кадры, которые выдаёт [`crate::user`]. Сюда приходят с меню и с
         // панели задач, а там окно программы к этому времени уже существует —
         // кнопка на панели без окна не рисуется.
-        App::Program(_) => None,
+        App::Program(..) => None,
         other => Window::text(other, rect, scale),
     }
 }
@@ -1312,7 +1312,7 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
         // Клавише без символа даётся имя из договора — но только той, которой
         // это имя выдано: остальные (F-ряд, цифровой блок) событий по-прежнему
         // не дают. См. [`WinEvent::code`], там сказано, почему это честнее.
-        Some(app @ App::Program(_)) => {
+        Some(app @ App::Program(..)) => {
             if event.pressed {
                 if let Some(code) = program_key(event) {
                     let key = WinEvent { kind: WIN_KEY, code, x: 0, y: 0 };
@@ -1831,7 +1831,7 @@ pub enum WindowError {
     /// никогда» и «окна нет сию секунду» — разные ответы, и программа,
     /// получившая на второй первый, зря закончила бы работу.
     Busy,
-    /// У этой задачи окно уже есть. Окно у программы одно — см. [`App::Program`].
+    /// Окно с этим номером у задачи уже есть — см. [`App::Program`].
     Exists,
     /// Окна с таким номером нет.
     NoWindow,
@@ -1849,7 +1849,7 @@ fn unavailable() -> WindowError {
 /// `false` означает «это не окно программы», а не «не получилось»: обычное окно
 /// закрывают на месте, спрашивать там некого.
 fn request_close(desktop: &mut Compositor, app: App) -> bool {
-    if !matches!(app, App::Program(_)) {
+    if !matches!(app, App::Program(..)) {
         return false;
     }
     let Some(window) = desktop.find(app) else {
@@ -1859,13 +1859,13 @@ fn request_close(desktop: &mut Compositor, app: App) -> bool {
     true
 }
 
-/// Завести окно задаче `task` поверх её поверхности.
+/// Завести задаче `task` окно номер `slot` поверх её поверхности.
 ///
 /// Пиксели принадлежат не окну: [`Surface`] здесь заимствованная, построенная
 /// поверх кадров, которые выдал и которыми владеет [`crate::user`]. Окно живёт
 /// ровно столько же, сколько они, и снимает их тот же путь, что снимает окно.
-pub fn open_window(task: u32, title: &str, pixels: Surface) -> Result<(), WindowError> {
-    let app = App::Program(task);
+pub fn open_window(task: u32, slot: u32, title: &str, pixels: Surface) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
     let (w, h) = (pixels.width(), pixels.height());
     with_desktop(|desktop| {
         if desktop.index_of(app).is_some() {
@@ -1904,8 +1904,8 @@ pub fn open_window(task: u32, title: &str, pixels: Surface) -> Result<(), Window
 /// `area` — в координатах поверхности, `None` — «всё окно». Вылезающее за её
 /// край обрезается, а не отвергается: программа считает в своих координатах и о
 /// полосе заголовка не знает ничего.
-pub fn commit_window(task: u32, area: Option<Rect>) -> Result<(), WindowError> {
-    let app = App::Program(task);
+pub fn commit_window(task: u32, slot: u32, area: Option<Rect>) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
     with_desktop(|desktop| {
         let Some(window) = desktop.find(app) else {
             return Err(WindowError::NoWindow);
@@ -1922,8 +1922,8 @@ pub fn commit_window(task: u32, area: Option<Rect>) -> Result<(), WindowError> {
 /// `None` — событий нет **или** стол сейчас занят. Разница здесь неважна и
 /// потому не возвращается: событие в очереди никуда не денется, а программа
 /// спросит снова — она и так спрашивает в цикле.
-pub fn next_window_event(task: u32) -> Option<WinEvent> {
-    with_desktop(|desktop| desktop.find(App::Program(task))?.pop_event()).flatten()
+pub fn next_window_event(task: u32, slot: u32) -> Option<WinEvent> {
+    with_desktop(|desktop| desktop.find(App::Program(task, slot))?.pop_event()).flatten()
 }
 
 /// Убрать окно задачи со стола.
@@ -1931,8 +1931,8 @@ pub fn next_window_event(task: u32) -> Option<WinEvent> {
 /// Пиксели после этого никто не читает — и только поэтому кадры под ними можно
 /// возвращать в пул. Порядок обязателен: сначала окно уходит со стола, потом
 /// освобождается память, а не наоборот.
-pub fn close_window(task: u32) -> Result<(), WindowError> {
-    let app = App::Program(task);
+pub fn close_window(task: u32, slot: u32) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
     with_desktop(|desktop| {
         if !desktop.close(app) {
             return Err(WindowError::NoWindow);
@@ -1958,7 +1958,7 @@ pub fn close_window(task: u32) -> Result<(), WindowError> {
 /// журнале неразличимы — и что стенд, целящийся по имени, не найдёт ни одного.
 fn name_of(desktop: &Compositor, app: App) -> String {
     match app {
-        App::Program(_) => desktop.caption_of(app).unwrap_or_else(|| String::from(app.title())),
+        App::Program(..) => desktop.caption_of(app).unwrap_or_else(|| String::from(app.title())),
         _ => String::from(app.title()),
     }
 }
@@ -1977,7 +1977,7 @@ fn log_window(desktop: &Compositor, app: App, focused: bool) {
     // У окна программы имя своё, и в журнал едет именно оно: [`App::title`]
     // знает только родовое слово «Program», а стенд наводит мышь по имени.
     let own = match app {
-        App::Program(_) => desktop.caption_of(app),
+        App::Program(..) => desktop.caption_of(app),
         _ => None,
     };
     kprintln!(

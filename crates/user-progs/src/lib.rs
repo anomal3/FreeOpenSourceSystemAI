@@ -188,7 +188,7 @@ impl Window {
         // SAFETY: ядро отобразило ровно `width * height` точек по этому адресу и
         // держит их, пока живо окно. Ссылка здесь одна: её выдаёт `&mut self`, а
         // второго `Window` с тем же адресом не бывает — его выдаёт только
-        // `open`, и на каждую задачу окно одно.
+        // `open`, и каждое окно получает свою поверхность.
         unsafe { core::slice::from_raw_parts_mut(self.base, count) }
     }
 
@@ -242,7 +242,7 @@ impl Window {
         self.height
     }
 
-    /// Номер окна — он же номер задачи.
+    /// Номер окна: номер задачи и номер окна у неё — см. [`user_abi::window_id`].
     #[must_use]
     pub const fn id(&self) -> i64 {
         self.id

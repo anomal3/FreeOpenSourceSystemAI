@@ -109,9 +109,25 @@ namespace System.Windows.Forms
         }
     }
 
-    public class Button : ButtonBase
+    public class Button : ButtonBase, IButtonControl
     {
         public DialogResult DialogResult { get; set; }
+
+        public void NotifyDefault(bool value)
+        {
+        }
+
+        // Кнопка с DialogResult отдаёт его форме до обработчиков Click, а
+        // закрывает модальную форму уже цикл ShowDialog.
+        protected override void OnClick(EventArgs e)
+        {
+            Form form = FindForm();
+            if (form != null && DialogResult != DialogResult.None)
+            {
+                form.DialogResult = DialogResult;
+            }
+            base.OnClick(e);
+        }
 
         // Как в WinForms: нажатие из кода — только у видимой и доступной кнопки.
         public void PerformClick()

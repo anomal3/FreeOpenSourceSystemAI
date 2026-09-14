@@ -282,6 +282,11 @@ namespace System.Windows.Forms
         private static readonly List<Form> openForms = new List<Form>();
         private static readonly Queue<Action> posted = new Queue<Action>();
 
+        // Включённые таймеры (фаза N7c) и стопка модальных форм: ввод получает
+        // только верхняя из них.
+        private static readonly List<Timer> timers = new List<Timer>();
+        private static readonly List<Form> modal = new List<Form>();
+
         // Сколько спать, когда делать нечего: окно отвечает на щелчок за кадр
         // стола, а холостой оборот интерпретатора не жжёт процессор.
         private const int IdleSleepMs = 20;
@@ -324,8 +329,8 @@ namespace System.Windows.Forms
 
         public static void DoEvents() => DoEventsOnce();
 
-        // Один оборот цикла: отложенное, события окон, перерисовка. `false` —
-        // делать было нечего.
+        // Один оборот цикла: отложенное, таймеры, события окон, перерисовка.
+        // `false` — делать было нечего.
         private static bool DoEventsOnce()
         {
             bool busy = false;
@@ -334,6 +339,19 @@ namespace System.Windows.Forms
                 posted.Dequeue()();
                 busy = true;
             }
+            if (timers.Count > 0)
+            {
+                // Копия: обработчик тика вправе остановить и запустить таймеры.
+                Timer[] due = timers.ToArray();
+                long now = NowMs();
+                for (int i = 0; i < due.Length; i++)
+                {
+                    if (due[i].FireIfDue(now))
+                    {
+                        busy = true;
+                    }
+                }
+            }
             for (int i = openForms.Count - 1; i >= 0; i--)
             {
                 if (i >= openForms.Count)
@@ -341,7 +359,10 @@ namespace System.Windows.Forms
                     continue;
                 }
                 Form form = openForms[i];
-                while (form.PumpEvent())
+                // Под модальным окном форма рисуется, но ввода не получает:
+                // её события выбираются и выбрасываются.
+                bool blocked = modal.Count > 0 && modal[modal.Count - 1] != form;
+                while (blocked ? form.DiscardEvent() : form.PumpEvent())
                 {
                     busy = true;
                 }
@@ -370,6 +391,52 @@ namespace System.Windows.Forms
         internal static void Opened(Form form) => openForms.Add(form);
 
         internal static void Closed(Form form) => openForms.Remove(form);
+
+        internal static long NowMs() => Diagnostics.Stopwatch.GetTimestamp() / 10000;
+
+        internal static void AddTimer(Timer timer)
+        {
+            if (!timers.Contains(timer))
+            {
+                timers.Add(timer);
+            }
+        }
+
+        internal static void RemoveTimer(Timer timer) => timers.Remove(timer);
+
+        internal static bool IsModal(Form form) => modal.Contains(form);
+
+        // Свой цикл событий для ShowDialog: пока форма открыта. Кнопка с
+        // DialogResult закрывает её после обработчика, как в WinForms; отказ в
+        // FormClosing возвращает DialogResult к None.
+        internal static void RunModal(Form form)
+        {
+            modal.Add(form);
+            try
+            {
+                while (!form.IsDisposed)
+                {
+                    bool busy = DoEventsOnce();
+                    if (!form.IsDisposed && form.DialogResult != DialogResult.None)
+                    {
+                        form.CloseFor(CloseReason.None);
+                        if (!form.IsDisposed)
+                        {
+                            form.DialogResult = DialogResult.None;
+                        }
+                        continue;
+                    }
+                    if (!busy)
+                    {
+                        Thread.Sleep(IdleSleepMs);
+                    }
+                }
+            }
+            finally
+            {
+                modal.Remove(form);
+            }
+        }
     }
 
     public class Control : Component
@@ -1025,6 +1092,31 @@ namespace System.Windows.Forms
         // и первым получает щелчок.
         internal ComboBox OpenDropDown { get; set; }
 
+        // Диалог (фаза N7c). У модальной формы значение, отличное от None,
+        // закрывает её — это проверяет цикл Application.RunModal.
+        public DialogResult DialogResult { get; set; }
+
+        public IButtonControl AcceptButton { get; set; }
+
+        public IButtonControl CancelButton { get; set; }
+
+        // Кому отдать фокус при показе вместо первого элемента по TabIndex.
+        internal Control PreferredFocus { get; set; }
+
+        public DialogResult ShowDialog() => ShowDialog(null);
+
+        public DialogResult ShowDialog(IWin32Window owner)
+        {
+            if (Application.IsModal(this))
+            {
+                throw new InvalidOperationException("Form that is already displayed modally cannot be displayed as a modal dialog box. Close the form before calling showDialog.");
+            }
+            DialogResult = DialogResult.None;
+            Show();
+            Application.RunModal(this);
+            return DialogResult;
+        }
+
         public FormStartPosition StartPosition { get; set; } = FormStartPosition.WindowsDefaultLocation;
 
         public FormBorderStyle FormBorderStyle { get; set; } = FormBorderStyle.Sizable;
@@ -1076,7 +1168,7 @@ namespace System.Windows.Forms
             base.SetVisibleCore(true);
             if (ActiveControl == null)
             {
-                ActiveControl = FirstFocusable();
+                ActiveControl = PreferredFocus ?? FirstFocusable();
             }
             Application.Post(() => OnShown(EventArgs.Empty));
         }
@@ -1093,6 +1185,11 @@ namespace System.Windows.Forms
             {
                 Dispose();
                 return;
+            }
+            // Модальную форму закрыли не кнопкой — как в WinForms, это Cancel.
+            if (reason != CloseReason.None && DialogResult == DialogResult.None && Application.IsModal(this))
+            {
+                DialogResult = DialogResult.Cancel;
             }
             closing = true;
             var args = new FormClosingEventArgs(reason, false);
@@ -1150,6 +1247,19 @@ namespace System.Windows.Forms
                     return true;
                 case FreeOsWindow.EventKey:
                     Control focused = ActiveControl != null && ActiveControl.CanFocus ? ActiveControl : this;
+                    Keys key = KeyMap.ToKeys(code);
+                    // Enter нажимает кнопку по умолчанию, если фокус не на
+                    // другой кнопке, Escape — кнопку отмены.
+                    if (key == Keys.Enter && AcceptButton != null && !(focused is IButtonControl))
+                    {
+                        AcceptButton.PerformClick();
+                        return true;
+                    }
+                    if (key == Keys.Escape && CancelButton != null)
+                    {
+                        CancelButton.PerformClick();
+                        return true;
+                    }
                     focused.DeliverKey(code);
                     return true;
                 case FreeOsWindow.EventClose:
@@ -1158,6 +1268,12 @@ namespace System.Windows.Forms
                 default:
                     return true;
             }
+        }
+
+        // Форма под модальным окном: событие выбрано и выброшено.
+        internal bool DiscardEvent()
+        {
+            return window >= 0 && FreeOsWindow.NextEvent(window, out int px, out int py, out int code) != FreeOsWindow.EventNone;
         }
 
         internal bool PaintIfNeeded()

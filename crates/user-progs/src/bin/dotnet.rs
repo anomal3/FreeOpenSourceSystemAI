@@ -85,6 +85,8 @@ struct Console {
     windows: Vec<Option<ProgramWindow>>,
     /// Шрифт форм, когда графика уже приготовлена.
     face: Option<&'static Face>,
+    /// Имя программы без `.dll` — заголовок окна, которому C# не дал своего.
+    program: String,
 }
 
 impl Console {
@@ -266,6 +268,11 @@ impl Host for Console {
 
     fn window_open(&mut self, title: &str, width: u32, height: u32) -> Option<u32> {
         self.graphics()?;
+        // Пустой заголовок ядро не принимает: у кнопки на панели задач должно быть
+        // имя. Окно без заголовка — например, окно сообщения — называется
+        // именем программы.
+        let program = self.program.clone();
+        let title = if title.is_empty() { program.as_str() } else { title };
         let deadline = monotonic_ms() + OPEN_WAIT_MS;
         let mut window = loop {
             match Window::open(title, width, height) {
@@ -471,6 +478,7 @@ extern "C" fn run(start: usize) -> ! {
         offset_minutes: sysconf::timezone_minutes(&settings).unwrap_or(0),
         windows: Vec::new(),
         face: None,
+        program: String::from(name.strip_suffix(".dll").unwrap_or(name)),
     };
     let mut vm = match Vm::new(&data, &corelib, console) {
         Ok(vm) => vm,

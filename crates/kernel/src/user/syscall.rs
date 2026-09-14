@@ -1385,22 +1385,25 @@ fn times(out: usize) -> i64 {
 
 /// Окно, которым программа вправе распоряжаться, — только её собственное.
 ///
-/// Номер окна и есть номер задачи, и назвать чужой программа не может: свой она
-/// узнала из [`WindowSpec`], а чужого ей не даёт ни один вызов. Проверка всё
-/// равно стоит здесь: договор обязан отвечать отказом на бессмыслицу, а не
-/// трогать чужое окно, если номер однажды окажется угадываемым.
-fn own_window(id: i64) -> Result<(), i64> {
-    if id != i64::from(sched::current().as_u32()) {
+/// Номер окна — номер задачи и номер окна у неё ([`user_abi::window_id`]), и
+/// назвать чужое программа не может: свой она узнала из [`WindowSpec`], а
+/// чужого ей не даёт ни один вызов. Проверка всё равно стоит здесь: договор
+/// обязан отвечать отказом на бессмыслицу, а не трогать чужое окно, если номер
+/// однажды окажется угадываемым. Ответ — номер окна у задачи.
+fn own_window(id: i64) -> Result<u32, i64> {
+    let task = (id as u64 & 0xffff_ffff) as u32;
+    let slot = (id as u64 >> 32) as u32;
+    if id < 0 || task != sched::current().as_u32() || slot >= user_abi::MAX_WINDOWS {
         return Err(user_abi::ERR_NOT_FOUND);
     }
-    Ok(())
+    Ok(slot)
 }
 
 /// Чем ответить программе, которой не дали окна.
 fn window_errno(err: super::WindowError) -> i64 {
     use crate::ui::WindowError as Desk;
     match err {
-        super::WindowError::BadSize => ERR_LIMIT,
+        super::WindowError::BadSize | super::WindowError::TooMany => ERR_LIMIT,
         super::WindowError::NoProgram => ERR_NO_PROGRAM,
         super::WindowError::Memory(err) => mmap_errno(err),
         // «Стол сейчас занят» — единственный отказ, после которого стоит
@@ -1449,9 +1452,9 @@ fn winopen(ptr: usize) -> i64 {
     };
 
     match super::open_window(title, spec.width, spec.height) {
-        Ok(surface) => {
+        Ok((surface, slot)) => {
             spec.surface = surface as u64;
-            spec.id = i64::from(sched::current().as_u32());
+            spec.id = user_abi::window_id(sched::current().as_u32(), slot);
             // SAFETY: тот же адрес, проверенный на запись выше.
             unsafe { core::ptr::write(ptr as *mut WindowSpec, spec) };
             0
@@ -1462,9 +1465,10 @@ fn winopen(ptr: usize) -> i64 {
 
 /// `wincommit(id, (x << 32) | y, (w << 32) | h) -> 0`.
 fn wincommit(id: i64, point: usize, size: usize) -> i64 {
-    if let Err(err) = own_window(id) {
-        return err;
-    }
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
     let (x, y) = ((point >> 32) as u32, (point & 0xffff_ffff) as u32);
     let (w, h) = ((size >> 32) as u32, (size & 0xffff_ffff) as u32);
     // Нулевая сторона означает «всё окно целиком» — так сказано в договоре.
@@ -1476,7 +1480,7 @@ fn wincommit(id: i64, point: usize, size: usize) -> i64 {
         }
         Some(Rect::new(x as i32, y as i32, w, h))
     };
-    match super::commit_window(area) {
+    match super::commit_window(slot, area) {
         Ok(()) => 0,
         Err(err) => window_errno(err),
     }
@@ -1488,16 +1492,17 @@ fn wincommit(id: i64, point: usize, size: usize) -> i64 {
 /// нечем заняться, спит сама и решает сама, сколько, — тот же довод, что у
 /// [`user_abi::SYS_RECV`].
 fn winevent(id: i64, out: usize) -> i64 {
-    if let Err(err) = own_window(id) {
-        return err;
-    }
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
     if out % align_of::<WinEvent>() != 0 {
         return ERR_BAD_ADDRESS;
     }
     if !space::user_can(out, size_of::<WinEvent>(), PageFlags::WRITE) {
         return ERR_BAD_ADDRESS;
     }
-    let Some(event) = super::window_event() else {
+    let Some(event) = super::window_event(slot) else {
         return 0;
     };
     // SAFETY: адрес проверен на выравнивание и на запись.
@@ -1680,10 +1685,11 @@ fn sysinfo(out: usize) -> i64 {
 
 /// `winclose(id) -> 0`.
 fn winclose(id: i64) -> i64 {
-    if let Err(err) = own_window(id) {
-        return err;
-    }
-    match super::close_window() {
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    match super::close_window(slot) {
         Ok(()) => 0,
         Err(err) => window_errno(err),
     }
