@@ -111,6 +111,12 @@ pub struct Vm<'a, H: Host> {
     pub(crate) type_objects: BTreeMap<TypeId, ObjRef>,
     /// Сколько инструкций выполнено.
     pub instructions: u64,
+    /// Путь к сборке — первый элемент `Environment.GetCommandLineArgs()`.
+    program_path: String,
+    /// Путь и аргументы `Main`, как их отдаёт `GetCommandLineArgs` (фаза N5b).
+    pub(crate) command_line: Vec<String>,
+    /// Закончилась ли программа вызовом `Environment.Exit`.
+    exited: bool,
 }
 
 impl<'a, H: Host> Vm<'a, H> {
@@ -136,7 +142,22 @@ impl<'a, H: Host> Vm<'a, H> {
             strings: BTreeMap::new(),
             type_objects: BTreeMap::new(),
             instructions: 0,
+            program_path: String::new(),
+            command_line: Vec::new(),
+            exited: false,
         })
+    }
+
+    /// Каким путём запущена сборка: его программа видит первым элементом
+    /// `Environment.GetCommandLineArgs()`, как у `dotnet app.dll`.
+    pub fn set_program_path(&mut self, path: &str) {
+        self.program_path = String::from(path);
+    }
+
+    /// Вернула ли программа код через `Environment.Exit`, а не из `Main`.
+    #[must_use]
+    pub fn exited(&self) -> bool {
+        self.exited
     }
 
     /// Отдать то, во что среда печатала.
@@ -175,6 +196,12 @@ impl<'a, H: Host> Vm<'a, H> {
         let owner_row = self.owner_row(PROGRAM, entry.row, false)?;
         let owner = self.load_def(PROGRAM, owner_row, Rc::from([]))?;
         let method = self.method_id(PROGRAM, entry.row, owner, Rc::from([]))?;
+        self.command_line.clear();
+        self.command_line.try_reserve_exact(args.len() + 1).map_err(|_| VmError::OutOfMemory)?;
+        self.command_line.push(self.program_path.clone());
+        for arg in args {
+            self.command_line.push(String::from(*arg));
+        }
         let mut call_args = Vec::new();
         match self.methods[method.0 as usize].params {
             0 => {}
@@ -201,10 +228,17 @@ impl<'a, H: Host> Vm<'a, H> {
         if self.types[owner.0 as usize].flags & TYPE_BEFORE_FIELD_INIT == 0 {
             self.ensure_initialized(owner)?;
         }
-        Ok(match self.execute(0)? {
-            Some(Value::I32(code)) => code,
-            _ => 0,
-        })
+        match self.execute(0) {
+            Ok(Some(Value::I32(code))) => Ok(code),
+            Ok(_) => Ok(0),
+            // `Environment.Exit`: кадры с их `finally` брошены, как в .NET.
+            Err(VmError::Exit { code }) => {
+                self.exited = true;
+                self.frames.clear();
+                Ok(code)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Исполнять, пока число кадров не опустится до `floor`.

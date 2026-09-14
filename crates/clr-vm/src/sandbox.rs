@@ -18,11 +18,13 @@ pub struct Sandbox {
     root: PathBuf,
     /// Всё, что программа напечатала.
     pub output: String,
+    /// Точка отсчёта монотонных часов (фаза N5b).
+    started: std::time::Instant,
 }
 
 impl Sandbox {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), output: String::new() }
+        Self { root: root.into(), output: String::new(), started: std::time::Instant::now() }
     }
 
     fn place(&self, path: &str) -> PathBuf {
@@ -107,5 +109,25 @@ impl Host for Sandbox {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
         Ok(names)
+    }
+
+    fn utc_now(&mut self) -> i64 {
+        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        (since.as_nanos() / 100) as i64
+    }
+
+    // Часового пояса у std нет, и песочница живёт по UTC. Образцы печатают про
+    // местное время только проверки, верные при любом смещении.
+
+    fn monotonic_nanos(&mut self) -> u64 {
+        self.started.elapsed().as_nanos() as u64
+    }
+
+    fn sleep(&mut self, milliseconds: u32) {
+        std::thread::sleep(std::time::Duration::from_millis(u64::from(milliseconds)));
+    }
+
+    fn processor_count(&mut self) -> u32 {
+        std::thread::available_parallelism().map_or(1, |count| count.get() as u32)
     }
 }

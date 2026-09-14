@@ -257,6 +257,28 @@ namespace System
             return builder.ToString();
         }
 
+        public static string Join(string separator, string[] value, int startIndex, int count)
+        {
+            if (value == null)
+            {
+                throw new ArgumentNullException("value");
+            }
+            if (startIndex < 0 || count < 0 || startIndex > value.Length - count)
+            {
+                throw new ArgumentOutOfRangeException("startIndex", "Index and count must refer to a location within the buffer.");
+            }
+            var builder = new StringBuilder();
+            for (int i = 0; i < count; i++)
+            {
+                if (i > 0)
+                {
+                    builder.Append(separator);
+                }
+                builder.Append(value[startIndex + i]);
+            }
+            return builder.ToString();
+        }
+
         public static string Join(string separator, Collections.Generic.IEnumerable<string> values)
         {
             var builder = new StringBuilder();

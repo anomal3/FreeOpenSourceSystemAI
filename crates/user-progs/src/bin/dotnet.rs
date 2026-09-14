@@ -24,9 +24,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use clr_vm::{FileKind, Host, IoError, Vm};
+use user_abi::{CLOCK_MONOTONIC, CLOCK_REALTIME};
 use user_progs::{
-    Args, Dirent, KIND_DIRECTORY, SEEK_END, close, error, exit, file_size, heap_size, mkdir, open, open_write, print, read,
-    readdir_raw, remove, rename, seek, stat, uid, write,
+    Args, Dirent, KIND_DIRECTORY, SEEK_END, clock, close, error, exit, file_size, heap_size, mkdir, open, open_write, print,
+    read, readdir_raw, remove, rename, seek, sleep_ms, stat, sysinfo, uid, write,
 };
 
 /// Куча программы. Сборка, разобранные методы, кадры и все объекты программы
@@ -47,14 +48,16 @@ const FILE_MAX: usize = 4 * 1024 * 1024;
 const RUNTIME_FAILED: i64 = 134;
 
 /// Стандартный вывод программы — терминал, файлы — файловая система FreeOS
-/// (фаза N5a).
+/// (фаза N5a), часы — часы ядра (фаза N5b).
 ///
 /// Текущего каталога у задачи FreeOS нет, поэтому у программы он свой:
-/// домашний каталог пользователя из `/etc/passwd` (у `root` — `/root`). От него
-/// считаются относительные пути, и `File.WriteAllText("notes.txt", …)` пишет
-/// туда же, где пользователь хранит свои файлы.
+/// домашний каталог пользователя (см. [`home_directory`]). От него считаются
+/// относительные пути, и `File.WriteAllText("notes.txt", …)` пишет туда же, где
+/// пользователь хранит свои файлы.
 struct Console {
     home: String,
+    /// Смещение местного времени из строки `timezone=` настроек, минуты.
+    offset_minutes: i32,
 }
 
 impl Host for Console {
@@ -183,6 +186,26 @@ impl Host for Console {
         close(fd);
         Ok(names)
     }
+
+    fn utc_now(&mut self) -> i64 {
+        clock(CLOCK_REALTIME).map_or(0, |time| time.seconds as i64 * 10_000_000 + i64::from(time.nanos / 100))
+    }
+
+    fn local_offset_minutes(&mut self) -> i32 {
+        self.offset_minutes
+    }
+
+    fn monotonic_nanos(&mut self) -> u64 {
+        clock(CLOCK_MONOTONIC).map_or(0, |time| time.seconds * 1_000_000_000 + u64::from(time.nanos))
+    }
+
+    fn sleep(&mut self, milliseconds: u32) {
+        sleep_ms(u64::from(milliseconds));
+    }
+
+    fn processor_count(&mut self) -> u32 {
+        sysinfo().map_or(1, |info| info.cpus.max(1))
+    }
 }
 
 /// Отказ ядра как отказ файловой операции среды.
@@ -201,19 +224,23 @@ fn code(result: i64) -> Result<(), IoError> {
     if result < 0 { Err(io_error(result)) } else { Ok(()) }
 }
 
+/// Открытые настройки системы (`/etc/system.cfg`) текстом; нет файла — пусто.
+fn system_settings() -> String {
+    let Some(config) = user_progs::config_path("system.cfg") else { return String::new() };
+    let Ok(data) = load(config.as_str()) else { return String::new() };
+    String::from_utf8_lossy(&data).into_owned()
+}
+
 /// Домашний каталог того, от чьего имени запущена программа.
 ///
-/// У `root` — `/root`. У пользователя — строка `home=` из `/etc/system.cfg`:
+/// У `root` — `/root`. У пользователя — строка `home=` из настроек:
 /// `/etc/passwd` закрыт от всех, кроме root (в нём отпечаток пароля), и
 /// установщик нарочно дублирует имя и домашний каталог в открытых настройках.
 /// Нет строки — корень.
-fn home_directory() -> String {
+fn home_directory(text: &str) -> String {
     if uid() == 0 {
         return String::from("/root");
     }
-    let Some(config) = user_progs::config_path("system.cfg") else { return String::from("/") };
-    let Ok(data) = load(config.as_str()) else { return String::from("/") };
-    let text = String::from_utf8_lossy(&data);
     for line in text.lines() {
         if let Some(home) = line.trim().strip_prefix("home=") {
             let home = home.trim();
@@ -283,7 +310,10 @@ extern "C" fn run(start: usize) -> ! {
         }
     };
 
-    let mut vm = match Vm::new(&data, &corelib, Console { home: home_directory() }) {
+    // Пояс — тот же, что показывают часы стола: строка `timezone=` настроек.
+    let settings = system_settings();
+    let console = Console { home: home_directory(&settings), offset_minutes: sysconf::timezone_minutes(&settings).unwrap_or(0) };
+    let mut vm = match Vm::new(&data, &corelib, console) {
         Ok(vm) => vm,
         Err(failure) => {
             error(&format!("dotnet: error: {name}: {failure}\n"));
@@ -297,10 +327,13 @@ extern "C" fn run(start: usize) -> ! {
         vm.method_count()
     ));
 
+    vm.set_program_path(path);
     match vm.run_main(&program_args) {
         Ok(code) => {
+            // `Environment.Exit` — не возврат из `Main`, и журнал это различает.
+            let how = if vm.exited() { format!("Environment.Exit({code})") } else { format!("Main returned {code}") };
             error(&format!(
-                "dotnet: {name}: Main returned {code} after {} instruction(s), {} object(s), {} collection(s)\n",
+                "dotnet: {name}: {how} after {} instruction(s), {} object(s), {} collection(s)\n",
                 vm.instructions,
                 vm.object_count(),
                 vm.collections()

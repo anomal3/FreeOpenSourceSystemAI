@@ -35,8 +35,18 @@ use clr_meta::{Assembly, Coded, Token};
 ///
 /// `features` нужен ради таблиц метаданных, а не запуска: в нём P/Invoke,
 /// которого у среды ещё нет.
-const SAMPLES: [(&str, bool); 13] =
-    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("floats", true), ("enums", true), ("linq", true), ("files", true), ("features", false)];
+const SAMPLES: [(&str, bool); 14] =
+    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("floats", true), ("enums", true), ("linq", true), ("files", true), ("time", true), ("features", false)];
+
+/// Аргументы командной строки образца. `time` печатает их и
+/// `Environment.GetCommandLineArgs()` (фаза N5b); кириллица проверяет, что
+/// аргумент доходит до программы строкой UTF-16 без потерь.
+fn sample_args(sample: &str) -> &'static [&'static str] {
+    match sample {
+        "time" => &["alpha", "два"],
+        _ => &[],
+    }
+}
 
 /// Имя сборки базовой библиотеки своей среды (`tools/dotnet/corelib`).
 const CORELIB: &str = "FreeOs.CoreLib.dll";
@@ -122,8 +132,9 @@ pub fn check() -> Result<()> {
         let (our_dir, their_dir) = (sandbox.join("ours"), sandbox.join("theirs"));
         fresh_dir(&our_dir)?;
         fresh_dir(&their_dir)?;
-        let (their_code, theirs) = run_dotnet(&dll, &their_dir)?;
-        let (our_code, ours) = run_ours(&data, &corelib, &our_dir);
+        let args = sample_args(sample);
+        let (their_code, theirs) = run_dotnet(&dll, &their_dir, args)?;
+        let (our_code, ours) = run_ours(&data, &corelib, &our_dir, &format!("{sample}.dll"), args);
         let (our_files, their_files) = (tree(&our_dir)?, tree(&their_dir)?);
         if ours == theirs && our_code == Some(their_code) && our_files == their_files {
             let files = if our_files.is_empty() { String::new() } else { format!(", {} files and directories as dotnet left them", our_files.len()) };
@@ -186,13 +197,14 @@ fn tree(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
 }
 
 /// Выполнить сборку настоящим dotnet в каталоге `dir`.
-fn run_dotnet(dll: &Path, dir: &Path) -> Result<(i32, String)> {
+fn run_dotnet(dll: &Path, dir: &Path, args: &[&str]) -> Result<(i32, String)> {
     // Режим инвариантной глобализации: у FreeOS культур нет, и сравнивать надо
     // с тем, что печатает .NET без них. Иначе на русской Windows эталон
     // получал бы запятую в дробных числах, неразрывные пробелы в разрядах и
     // культурное сравнение строк (фаза N4a).
     let output = Command::new("dotnet")
         .arg(dll)
+        .args(args)
         .current_dir(dir)
         .env("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1")
         .output()
@@ -206,12 +218,16 @@ fn run_dotnet(dll: &Path, dir: &Path) -> Result<(i32, String)> {
 /// Выполнить сборку своей средой с файлами в песочнице `dir`. Ошибка среды
 /// попадает в вывод строкой — так её видно в сравнении рядом с тем, что успело
 /// напечататься.
-fn run_ours(data: &[u8], corelib: &[u8], dir: &Path) -> (Option<i32>, String) {
+///
+/// `program` — путь к сборке для `Environment.GetCommandLineArgs()`: у dotnet
+/// там полный путь, образец печатает от него только имя файла.
+fn run_ours(data: &[u8], corelib: &[u8], dir: &Path, program: &str, args: &[&str]) -> (Option<i32>, String) {
     let mut vm = match clr_vm::Vm::new(data, corelib, clr_vm::sandbox::Sandbox::new(dir)) {
         Ok(vm) => vm,
         Err(error) => return (None, format!("<load error: {error}>\n")),
     };
-    let result = vm.run_main(&[]);
+    vm.set_program_path(program);
+    let result = vm.run_main(args);
     let mut output = vm.into_host().output;
     match result {
         Ok(code) => (Some(code), output),

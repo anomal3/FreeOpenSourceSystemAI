@@ -3280,6 +3280,28 @@ pub const ALL: &[Scenario] = &[
             Step::Await("4000000 1000000 8496120 1229 234 3999", 120_000),
             Step::Await("linq: done", 60_000),
             Step::Await("dotnet: linq.dll: Main returned 29", 60_000),
+            Step::Await("freeos> ", 15_000),
+            // Фаза N5b: время и окружение. Даты от фиксированного мига печатаются
+            // как у dotnet; строка `now:` проверяет часы ядра (год не 1970) и
+            // пояс из настроек, `slept:` — сон и монотонные часы, `machine:` —
+            // число процессоров из SYS_SYSINFO. Код 21 приходит через
+            // `Environment.Exit`, мимо `finally`, и журнал говорит об этом сам.
+            Step::Line("dotnet /usr/share/dotnet/samples/time.dll alpha beta"),
+            Step::Await("time: start", 60_000),
+            Step::Await("F: Monday, 14 September 2026 21:05:07", 60_000),
+            Step::Await("o: 2026-09-14T21:05:07.1230000", 60_000),
+            Step::Await("Mon Sep 14 1200 12 A.D. hey q 21 | 09:05:07 A 02026", 60_000),
+            Step::Await("2024-02-29 2025-02-28 2026-12-24T09:05:07.1230000 2026-09-13T17:35:07.3730005", 60_000),
+            Step::Await("2026-09-14T07:05:00.0000000 False 0 True Monday, 14 September 2026", 60_000),
+            Step::Await("1:2:03:04.567 1:02:03:04.5670000 -1.02:03:04.5670000 1.02:03:04.567 2 -1:2:03:04.567", 60_000),
+            Step::Await("now: True Utc Local True True Local True True Utc", 60_000),
+            Step::Await("slept: True True True True True False True True True", 60_000),
+            Step::Await("args: 2 [alpha|beta]", 60_000),
+            Step::Await("command line: 3 time.dll alpha|beta", 60_000),
+            Step::Await("machine: True True", 60_000),
+            Step::Await("time: done", 60_000),
+            Step::Await("dotnet: time.dll: Environment.Exit(21)", 60_000),
+            Step::Absent("finally after Environment.Exit must not run"),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),
         ],

@@ -1078,6 +1078,10 @@ pub struct SysInfo {
     /// сдвинутым смещениям и получала бы числа, не имеющие смысла.
     pub screen_w: u32,
     pub screen_h: u32,
+    /// Сколько процессоров работает (фаза N5b): `Environment.ProcessorCount`
+    /// своей среды .NET. Приписано в конец по той же причине, что и размеры
+    /// экрана.
+    pub cpus: u32,
 }
 
 /// [`SysInfo::pixel_format`]: красный лежит в младшем байте точки.
@@ -1832,7 +1836,10 @@ mod tests {
         // Размер вырос со 128 до 136 в фазе 47c: приписаны размеры экрана. Все
         // смещения ниже остались прежними — так и должно быть, и проверяется
         // это именно тем, что строки не пришлось править.
-        assert_eq!(size_of::<SysInfo>(), 136);
+        //
+        // В фазе N5b приписано число процессоров: 140 байт, выровненные до 144.
+        assert_eq!(size_of::<SysInfo>(), 144);
+        assert_eq!(core::mem::offset_of!(SysInfo, cpus), 136);
         assert_eq!(align_of::<SysInfo>(), 8);
         assert_eq!(core::mem::offset_of!(SysInfo, uptime_ms), 0);
         assert_eq!(core::mem::offset_of!(SysInfo, frames_total), 16);

@@ -95,13 +95,19 @@ const ARITH_OUTPUT: &str = concat!(
 /// Запустить образец с файлами в своём пустом каталоге (фаза N5a): тесты идут
 /// параллельно, и общий каталог они делили бы между собой.
 fn run(data: &[u8]) -> (Result<i32, VmError>, String) {
+    run_with(data, "", &[])
+}
+
+/// То же с путём сборки и аргументами командной строки (фаза N5b).
+fn run_with(data: &[u8], program: &str, args: &[&str]) -> (Result<i32, VmError>, String) {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(std::format!("clr-vm-test-{}-{number}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("sandbox directory");
     let mut vm = Vm::new(data, CORELIB, Sandbox::new(&dir)).expect("assembly parses");
-    let result = vm.run_main(&[]);
+    vm.set_program_path(program);
+    let result = vm.run_main(args);
     let output = vm.into_host().output;
     let _ = std::fs::remove_dir_all(&dir);
     (result, output)
@@ -122,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -505,4 +511,66 @@ fn files_print_what_dotnet_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, FILES_OUTPUT);
     assert_eq!(code, 13);
+}
+
+/// Образец `tools/dotnet/samples/time` (фаза N5b).
+const TIME: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/time.dll");
+
+/// Что печатает `dotnet time.dll alpha два` (записано 2026-09-15, .NET 10, LF).
+/// Строки про текущее время, сон и машину — проверки, верные везде.
+const TIME_OUTPUT: &str = concat!(
+    "time: start\n",
+    "639250167071230000 2026-9-14 Monday 257 Unspecified\n",
+    "21:5:7.123 21:05:07.1230000 2026-09-14T00:00:00\n",
+    "09/14/2026 21:05:07\n",
+    "d: 09/14/2026\n",
+    "D: Monday, 14 September 2026\n",
+    "f: Monday, 14 September 2026 21:05\n",
+    "F: Monday, 14 September 2026 21:05:07\n",
+    "g: 09/14/2026 21:05\n",
+    "G: 09/14/2026 21:05:07\n",
+    "m: September 14\n",
+    "o: 2026-09-14T21:05:07.1230000\n",
+    "r: Mon, 14 Sep 2026 21:05:07 GMT\n",
+    "s: 2026-09-14T21:05:07\n",
+    "t: 21:05\n",
+    "T: 21:05:07\n",
+    "u: 2026-09-14 21:05:07Z\n",
+    "y: 2026 September\n",
+    "Monday, 14 September 2026 at 9:05 PM | 26/9/14 21:05:07.123\n",
+    "Mon Sep 14 1200 12 A.D. hey q 21 | 09:05:07 A 02026\n",
+    "21:05             2026-09-14 005 05 5 1 02\n",
+    "2026-09-14T21:05:07.1230000Z Z|u|r\n",
+    "2024-02-29 2025-02-28 2026-12-24T09:05:07.1230000 2026-09-13T17:35:07.3730005\n",
+    "False True True 28 29 Saturday\n",
+    "108.02:54:52.8770000 21:00:07 True True 1 False\n",
+    "0001-01-01T00:00:00.0000000 3155378975999999999 9999-12-31T23:59:59.9999999\n",
+    "2026-09-14T21:05:07.1234567 2026-09-14T21:05:00.0000000 2026-09-14T00:00:00.0000000\n",
+    "2026-09-14T07:05:00.0000000 False 0 True Monday, 14 September 2026\n",
+    "ctor: ArgumentOutOfRangeException\n",
+    "parse: FormatException\n",
+    "1.02:03:04.5670000 937845670000 1 2 3 4 567 26.051268611111112 1563.0761166666666 93784567\n",
+    "1:2:03:04.567 1:02:03:04.5670000 -1.02:03:04.5670000 1.02:03:04.567 2 -1:2:03:04.567\n",
+    "00:01:30.5000000 00:00:01.5000000 -00:02:15 00:00:00 10675199.02:48:05.4775807 -10675199.02:48:05.4775808 1.12:00:00 2.00:00:00\n",
+    "1.02:03:04.5000000 -00:00:30 12:34:00 False 5.00:00:00 03:04:00\n",
+    "1.03:03:04.5670000 -1.21:56:55.4330000 2.04:06:09.1340000 06:30:46.1417500 26.051268611111112 1.02:03:04.5670000 True 0 True\n",
+    "span: OverflowException 0\n",
+    "now: True Utc Local True True Local True True Utc\n",
+    "slept: True True True True True False True True True\n",
+    "reset: 00:00:00 False\n",
+    "restart: True\n",
+    "sleep: ArgumentOutOfRangeException\n",
+    "args: 2 [alpha|два]\n",
+    "command line: 3 time.dll alpha|два\n",
+    "machine: True True\n",
+    "time: done\n",
+);
+
+#[test]
+fn time_prints_what_dotnet_prints() {
+    let (result, output) = run_with(TIME, "time.dll", &["alpha", "два"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, TIME_OUTPUT);
+    // `Environment.Exit(args.Length + 19)` мимо `finally` и `return 99`.
+    assert_eq!(code, 21);
 }

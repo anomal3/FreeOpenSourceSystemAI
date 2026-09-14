@@ -105,6 +105,14 @@ pub(crate) enum Native {
     ListDirectory,
     DecodeUtf8,
     EncodeUtf8,
+    /// Часы, сон и окружение `System.Clock` (фаза N5b).
+    UtcTicks,
+    LocalOffset,
+    MonotonicTicks,
+    Sleep,
+    ProcessorCount,
+    Exit,
+    CommandLine,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +286,13 @@ const TABLE: &[(&str, Native)] = &[
     ("System.IO.FileSystem::ListDirectory(string,string[]&)", Native::ListDirectory),
     ("System.Text.Encoding::DecodeUtf8(uint8[],int32,int32)", Native::DecodeUtf8),
     ("System.Text.Encoding::EncodeUtf8(string)", Native::EncodeUtf8),
+    ("System.Clock::UtcTicks()", Native::UtcTicks),
+    ("System.Clock::LocalOffsetMinutes()", Native::LocalOffset),
+    ("System.Clock::MonotonicTicks()", Native::MonotonicTicks),
+    ("System.Clock::Sleep(int32)", Native::Sleep),
+    ("System.Clock::ProcessorCount()", Native::ProcessorCount),
+    ("System.Clock::Exit(int32)", Native::Exit),
+    ("System.Clock::CommandLine()", Native::CommandLine),
 ];
 
 pub(crate) fn lookup(key: &str) -> Option<Native> {
@@ -778,6 +793,34 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
             let text: alloc::string::String =
                 char::decode_utf16(units.iter().copied()).map(|c| c.unwrap_or('\u{FFFD}')).collect();
             Some(byte_array(vm, text.into_bytes())?)
+        }
+        Native::UtcTicks => Some(Value::I64(vm.host.utc_now())),
+        Native::LocalOffset => Some(Value::I32(vm.host.local_offset_minutes())),
+        // Тик — 100 нс, как у `Stopwatch` на Windows (см. Clock.cs).
+        Native::MonotonicTicks => Some(Value::I64((vm.host.monotonic_nanos() / 100) as i64)),
+        Native::Sleep => {
+            let milliseconds = vm.int32(arg(0)?)?;
+            if milliseconds < 0 {
+                // `Timeout.Infinite`: программа просила уснуть навсегда.
+                loop {
+                    vm.host.sleep(u32::MAX);
+                }
+            }
+            vm.host.sleep(milliseconds as u32);
+            None
+        }
+        Native::ProcessorCount => Some(Value::I32(vm.host.processor_count().max(1) as i32)),
+        Native::Exit => return Err(VmError::Exit { code: vm.int32(arg(0)?)? }),
+        Native::CommandLine => {
+            let line = vm.command_line.clone();
+            let mut values = Vec::new();
+            values.try_reserve_exact(line.len()).map_err(|_| VmError::OutOfMemory)?;
+            for part in &line {
+                values.push(vm.new_string_from(part)?);
+            }
+            let string = vm.corelib_type("System.String")?;
+            let ty = vm.array_of(string)?;
+            Some(Value::Obj(Some(vm.heap.alloc(Object::Array { ty, items: crate::heap::Items::Values(values) })?)))
         }
     })
 }

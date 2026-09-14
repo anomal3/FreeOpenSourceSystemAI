@@ -1671,6 +1671,7 @@ fn sysinfo(out: usize) -> i64 {
         // вокруг него — в другом.
         screen_w: screen.0,
         screen_h: screen.1,
+        cpus: crate::smp::online() as u32,
     };
     // SAFETY: адрес проверен на выравнивание и на запись.
     unsafe { core::ptr::write(out as *mut SysInfo, value) };

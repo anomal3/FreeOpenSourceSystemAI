@@ -1283,13 +1283,4 @@ namespace System
         {
         }
     }
-
-    public static class Environment
-    {
-        // Поток один (веха v0.7c).
-        public static int CurrentManagedThreadId => 1;
-
-        // Перевод строки FreeOS — LF.
-        public static string NewLine => "\n";
-    }
 }

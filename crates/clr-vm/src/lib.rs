@@ -27,7 +27,11 @@
 //! Фаза N5a — файлы: `System.IO` на C# поверх файловых членов [`Host`]; на
 //! машине разработчика хост — каталог-песочница ([`sandbox`]).
 //!
-//! Чего нет — `decimal`, `DateTime`, потоков (N5b и дальше). Встреча с неподдержанным — не падение и не
+//! Фаза N5b — время и окружение: `DateTime`, `TimeSpan`, `Stopwatch` и
+//! `Environment` на C#; часы, сон, число процессоров у [`Host`], командная
+//! строка и `Environment.Exit` — у самой среды ([`VmError::Exit`]).
+//!
+//! Чего нет — `decimal`, потоков. Встреча с неподдержанным — не падение и не
 //! молчание, а [`VmError`] с полным именем члена или кодом инструкции и местом.
 //!
 //! # Базовая библиотека
@@ -151,6 +155,31 @@ pub trait Host {
         let _ = path;
         Err(IoError::Unsupported)
     }
+
+    /// Время суток (фаза N5b): тики по 100 нс от начала эпохи Unix, UTC.
+    fn utc_now(&mut self) -> i64 {
+        0
+    }
+
+    /// На сколько минут местное время впереди UTC.
+    fn local_offset_minutes(&mut self) -> i32 {
+        0
+    }
+
+    /// Монотонные часы: наносекунды от произвольной точки, не убывают.
+    fn monotonic_nanos(&mut self) -> u64 {
+        0
+    }
+
+    /// Уснуть на столько миллисекунд.
+    fn sleep(&mut self, milliseconds: u32) {
+        let _ = milliseconds;
+    }
+
+    /// Сколько процессоров у машины.
+    fn processor_count(&mut self) -> u32 {
+        1
+    }
 }
 
 /// Почему файловая операция не удалась. Какое исключение из этого выйдет,
@@ -216,6 +245,9 @@ pub enum VmError {
     OutOfMemory,
     /// Вызовы вложены глубже, чем разрешено.
     StackOverflow,
+    /// Программа вызвала `Environment.Exit`. Летит мимо `finally` до
+    /// [`Vm::run_main`], и тот возвращает код как обычный итог.
+    Exit { code: i32 },
 }
 
 impl fmt::Display for VmError {
@@ -232,6 +264,7 @@ impl fmt::Display for VmError {
             Self::Exception { name, at } => write!(f, "unhandled exception {name} in {at}"),
             Self::Unhandled { name, message, at } => write!(f, "unhandled exception {name}: {message} in {at}"),
             Self::OutOfMemory => write!(f, "out of memory"),
+            Self::Exit { code } => write!(f, "the program called Environment.Exit({code})"),
             Self::StackOverflow => {
                 write!(f, "stack overflow: more than {} nested calls", vm::MAX_FRAMES)
             }
