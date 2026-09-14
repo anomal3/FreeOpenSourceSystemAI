@@ -119,7 +119,9 @@ const TEST_STACK_KIB: usize = 256;
 #[test]
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
-    for (name, data) in [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS)] {
+    for (name, data) in
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS)]
+    {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
             .spawn(move || run(data).0.map(|_| ()).map_err(|error| std::format!("{error}")))
@@ -174,6 +176,36 @@ fn exceptions_print_what_dotnet_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, EXCEPTIONS_OUTPUT);
     assert_eq!(code, 43);
+}
+
+/// Образец `tools/dotnet/samples/generics` (фаза N3c).
+const GENERICS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/generics.dll");
+
+/// Что печатает `dotnet generics.dll` (записано 2026-09-14, .NET 10, LF).
+const GENERICS_OUTPUT: &str = concat!(
+    "generics: start\n",
+    "stacks: 25 4 два один\n",
+    "empty peek: 0 True\n",
+    "pair (7, семь) swapped (семь, 7)\n",
+    "Tally<Int32> ready\n",
+    "Tally<String> ready\n",
+    "tally 2 10\n",
+    "max 9 pear -5\n",
+    "area 13 26\n",
+    "delegates 5 1005 42 3\n",
+    "multicast 22\n",
+    "clicked OK\n",
+    "clicks 1\n",
+    "interpolated: привет, мир! 3 x (7, семь) = 21\n",
+    "generics: done\n",
+);
+
+#[test]
+fn generics_print_what_dotnet_prints() {
+    let (result, output) = run(GENERICS);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, GENERICS_OUTPUT);
+    assert_eq!(code, 22);
 }
 
 #[test]

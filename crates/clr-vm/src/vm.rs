@@ -44,6 +44,9 @@ pub(crate) struct Frame<'a> {
     /// Кадр конструктора исключения, брошенного средой: объект бросается,
     /// когда конструктор вернётся.
     pub then_throw: Option<ObjRef>,
+    /// Не класть значение, которое вернёт метод: это не последний вызов в
+    /// списке делегата, и результат у делегата — от последнего.
+    pub discard_result: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -74,6 +77,7 @@ impl<'a> Frame<'a> {
             continuations: Vec::new(),
             caught: Vec::new(),
             then_throw: None,
+            discard_result: false,
         }
     }
 }
@@ -304,8 +308,13 @@ impl<'a, H: Host> Vm<'a, H> {
                     if self.frames.len() == floor {
                         return Ok(value);
                     }
-                    if let Some(exception) = finished.and_then(|frame| frame.then_throw) {
+                    let (then_throw, discard) =
+                        finished.map_or((None, false), |frame| (frame.then_throw, frame.discard_result));
+                    if let Some(exception) = then_throw {
                         self.raise(exception)?;
+                        continue;
+                    }
+                    if discard {
                         continue;
                     }
                     if let Some(value) = value {
@@ -612,6 +621,29 @@ impl<'a, H: Host> Vm<'a, H> {
                             self.operand::<1>(code, &mut next)?;
                         }
                         0x13 | 0x14 | 0x1E => {}
+                        // ldftn
+                        0x06 => {
+                            let token = self.operand_u32(code, &mut next)?;
+                            let Resolved::Method(method) = self.resolve(self.frames[top].method, token)? else {
+                                return Err(self.invalid("ldftn token is not a method"));
+                            };
+                            self.push(Value::Fn(method.0))?;
+                        }
+                        // ldvirtftn: метод настоящего типа объекта.
+                        0x07 => {
+                            let token = self.operand_u32(code, &mut next)?;
+                            let Resolved::Method(method) = self.resolve(self.frames[top].method, token)? else {
+                                return Err(self.invalid("ldvirtftn token is not a method"));
+                            };
+                            let object = match self.pop()? {
+                                Value::Obj(Some(object)) => object,
+                                Value::Obj(None) => return Err(self.exception("System.NullReferenceException")),
+                                _ => return Err(self.invalid("ldvirtftn on a value that is not a reference")),
+                            };
+                            let ty = self.type_of_object(object)?;
+                            let target = self.dispatch(ty, method)?;
+                            self.push(Value::Fn(target.0))?;
+                        }
                         // endfilter
                         0x11 => {
                             self.end_filter()?;

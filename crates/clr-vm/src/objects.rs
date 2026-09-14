@@ -37,6 +37,112 @@ impl<'a, H: Host> Vm<'a, H> {
         Ok(())
     }
 
+    /// Тип делегата — наследник `MulticastDelegate`.
+    pub(crate) fn is_delegate(&mut self, ty: TypeId) -> Result<bool, VmError> {
+        let multicast = self.corelib_type("System.MulticastDelegate")?;
+        Ok(self.types[ty.0 as usize].base == Some(multicast))
+    }
+
+    /// `Invoke` делегата: вызвать весь список по порядку.
+    ///
+    /// Кадры кладутся от последнего вызова к первому, так что первый
+    /// выполнится первым, — без рекурсии Rust и без ожидания внутри этой
+    /// функции. Результат у делегата — от последнего вызова, остальные кадры
+    /// помечены `discard_result`. Аргументы-структуры получает копией каждый
+    /// вызов, кроме последнего: у значения один владелец.
+    fn invoke_delegate(&mut self, args: Vec<Value>) -> Result<(), VmError> {
+        let Some(&this) = args.first() else {
+            return Err(self.invalid("delegate invoked without the delegate"));
+        };
+        let targets = match this {
+            Value::Obj(Some(object)) => match self.heap.get(object) {
+                Some(Object::Delegate { targets, .. }) => {
+                    let mut copy = Vec::new();
+                    copy.try_reserve_exact(targets.len()).map_err(|_| VmError::OutOfMemory)?;
+                    copy.extend_from_slice(targets);
+                    copy
+                }
+                _ => return Err(self.invalid("Invoke on something that is not a delegate")),
+            },
+            Value::Obj(None) => return Err(self.exception("System.NullReferenceException")),
+            _ => return Err(self.invalid("Invoke on a value that is not a reference")),
+        };
+        let last = targets.len().saturating_sub(1);
+        for (index, (target, method)) in targets.iter().copied().enumerate().rev() {
+            let (has_this, native) = {
+                let info = &self.methods[method.0 as usize];
+                (info.has_this, info.native.is_some())
+            };
+            if native && targets.len() > 1 {
+                // Член в Rust выполнился бы сразу, раньше кадров, лежащих под
+                // ним, и порядок вызовов списка сломался бы.
+                return Err(VmError::Unsupported {
+                    what: format!("a multicast delegate over the runtime member {}", self.method_name(method)),
+                });
+            }
+            let mut call_args = Vec::new();
+            call_args.try_reserve_exact(args.len()).map_err(|_| VmError::OutOfMemory)?;
+            if has_this {
+                call_args.push(target);
+            }
+            for value in &args[1..] {
+                call_args.push(if index == last { *value } else { self.copy_out(*value)? });
+            }
+            let depth = self.frames.len();
+            self.run_method(method, call_args)?;
+            if index != last && self.frames.len() > depth {
+                self.frames[depth].discard_result = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// `Delegate.Combine`: списки подряд; `null` с любой стороны не меняет другой.
+    pub(crate) fn combine_delegates(&mut self, a: Value, b: Value) -> Result<Value, VmError> {
+        let (Value::Obj(Some(first)), Value::Obj(Some(second))) = (a, b) else {
+            return Ok(if a == Value::Obj(None) { b } else { a });
+        };
+        let (ty, mut targets) = self.delegate_targets(first)?;
+        let (_, more) = self.delegate_targets(second)?;
+        targets.try_reserve(more.len()).map_err(|_| VmError::OutOfMemory)?;
+        targets.extend(more);
+        Ok(Value::Obj(Some(self.heap.alloc(Object::Delegate { ty, targets })?)))
+    }
+
+    /// `Delegate.Remove`: убрать последнее вхождение списка `value`, как .NET;
+    /// пустой список — `null`.
+    pub(crate) fn remove_delegate(&mut self, source: Value, value: Value) -> Result<Value, VmError> {
+        let (Value::Obj(Some(from)), Value::Obj(Some(what))) = (source, value) else {
+            return Ok(source);
+        };
+        let (ty, mut targets) = self.delegate_targets(from)?;
+        let (_, removed) = self.delegate_targets(what)?;
+        if removed.is_empty() || removed.len() > targets.len() {
+            return Ok(source);
+        }
+        let Some(start) = (0..=targets.len() - removed.len()).rev().find(|&at| targets[at..at + removed.len()] == removed[..])
+        else {
+            return Ok(source);
+        };
+        targets.drain(start..start + removed.len());
+        if targets.is_empty() {
+            return Ok(Value::Obj(None));
+        }
+        Ok(Value::Obj(Some(self.heap.alloc(Object::Delegate { ty, targets })?)))
+    }
+
+    fn delegate_targets(&self, object: ObjRef) -> Result<(TypeId, Vec<(Value, MethodId)>), VmError> {
+        match self.heap.get(object) {
+            Some(Object::Delegate { ty, targets }) => {
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(targets.len()).map_err(|_| VmError::OutOfMemory)?;
+                copy.extend_from_slice(targets);
+                Ok((*ty, copy))
+            }
+            _ => Err(self.exception("System.InvalidCastException")),
+        }
+    }
+
     /// Экземпляр класса с обнулёнными полями, без конструктора.
     pub(crate) fn new_instance(&mut self, ty: TypeId) -> Result<ObjRef, VmError> {
         let stores: Vec<Store> = self.types[ty.0 as usize].fields.iter().map(|slot| slot.store).collect();
@@ -55,6 +161,10 @@ impl<'a, H: Host> Vm<'a, H> {
             let info = &self.methods[method.0 as usize];
             (info.native, info.impl_flags, info.flags, info.asm, info.row, info.name, info.sig)
         };
+        let owner = self.methods[method.0 as usize].owner;
+        if name == "Invoke" && self.is_delegate(owner)? {
+            return self.invoke_delegate(args);
+        }
         if let Some(native) = native {
             if let Some(result) = natives::call(self, native, &args)? {
                 self.push(result)?;
@@ -157,9 +267,21 @@ impl<'a, H: Host> Vm<'a, H> {
         if owner == self.corelib_type("System.String")? {
             return Err(VmError::Unsupported { what: String::from("string constructors (phase N4)") });
         }
-        let multicast = self.corelib_type("System.MulticastDelegate")?;
-        if self.types[owner.0 as usize].base == Some(multicast) {
-            return Err(VmError::Unsupported { what: String::from("delegates (phase N3c)") });
+        if self.is_delegate(owner)? {
+            // Конструктор делегата — «runtime managed»: тела нет, объект
+            // собирает среда из цели и указателя на метод.
+            let function = self.pop()?;
+            let target = self.pop()?;
+            let Value::Fn(method) = function else {
+                return Err(self.invalid("delegate constructed without a method pointer"));
+            };
+            let mut targets = Vec::new();
+            targets.try_reserve_exact(1).map_err(|_| VmError::OutOfMemory)?;
+            targets.push((target, MethodId(method)));
+            let object = self.heap.alloc(Object::Delegate { ty: owner, targets })?;
+            self.push(Value::Obj(Some(object)))?;
+            self.frames[top].pc = next;
+            return Ok(());
         }
         let args = self.pop_args(params)?;
         let (instance, this) = match self.types[owner.0 as usize].kind {
@@ -337,6 +459,12 @@ impl<'a, H: Host> Vm<'a, H> {
         let context = self.frames[self.frames.len() - 1].method;
         match self.resolve(context, token)? {
             Resolved::Field(field) => self.push(Value::Native((i64::from(field.asm) << 32) | i64::from(field.row))),
+            // `typeof(T)`: вместо дескриптора сразу объект типа, и
+            // `Type.GetTypeFromHandle` возвращает его как есть.
+            Resolved::Type(ty) => {
+                let object = self.type_object(ty)?;
+                self.push(object)
+            }
             _ => Err(VmError::Unsupported { what: format!("typeof and method handles in {} (phase N4)", self.location()) }),
         }
     }

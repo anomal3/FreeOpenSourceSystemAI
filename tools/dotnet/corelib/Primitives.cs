@@ -43,10 +43,13 @@ namespace System
         public override extern string ToString();
     }
 
-    public struct Int32
+    public struct Int32 : IComparable<int>
     {
         [MethodImpl(MethodImplOptions.InternalCall)]
         public override extern string ToString();
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public extern int CompareTo(int value);
     }
 
     public struct UInt32
@@ -55,10 +58,13 @@ namespace System
         public override extern string ToString();
     }
 
-    public struct Int64
+    public struct Int64 : IComparable<long>
     {
         [MethodImpl(MethodImplOptions.InternalCall)]
         public override extern string ToString();
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public extern int CompareTo(long value);
     }
 
     public struct UInt64

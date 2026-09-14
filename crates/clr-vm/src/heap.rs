@@ -8,7 +8,7 @@
 use alloc::vec::Vec;
 
 use crate::VmError;
-use crate::types::TypeId;
+use crate::types::{MethodId, TypeId};
 use crate::value::{ObjRef, Value};
 
 pub(crate) enum Object {
@@ -24,6 +24,9 @@ pub(crate) enum Object {
     Boxed { ty: TypeId, value: Value },
     /// Объект `System.Type`, который возвращает `GetType()`.
     RuntimeType(TypeId),
+    /// Делегат: список вызовов по порядку — цель (`null` у статического
+    /// метода) и метод.
+    Delegate { ty: TypeId, targets: Vec<(Value, MethodId)> },
 }
 
 pub(crate) struct Heap {

@@ -48,6 +48,12 @@ pub(crate) enum Native {
     U32ToString,
     I64ToString,
     U64ToString,
+    DelegateCombine,
+    DelegateRemove,
+    TypeFromHandle,
+    I32CompareTo,
+    I64CompareTo,
+    StringCompareTo,
 }
 
 const TABLE: &[(&str, Native)] = &[
@@ -83,6 +89,12 @@ const TABLE: &[(&str, Native)] = &[
     ("System.UInt32::ToString()", Native::U32ToString),
     ("System.Int64::ToString()", Native::I64ToString),
     ("System.UInt64::ToString()", Native::U64ToString),
+    ("System.Delegate::Combine(System.Delegate,System.Delegate)", Native::DelegateCombine),
+    ("System.Delegate::Remove(System.Delegate,System.Delegate)", Native::DelegateRemove),
+    ("System.Type::GetTypeFromHandle(System.RuntimeTypeHandle)", Native::TypeFromHandle),
+    ("System.Int32::CompareTo(int32)", Native::I32CompareTo),
+    ("System.Int64::CompareTo(int64)", Native::I64CompareTo),
+    ("System.String::CompareTo(string)", Native::StringCompareTo),
 ];
 
 pub(crate) fn lookup(key: &str) -> Option<Native> {
@@ -204,6 +216,23 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
         Native::U32ToString => text(vm, format!("{}", vm.int32(number(vm)?)? as u32))?,
         Native::I64ToString => text(vm, format!("{}", vm.int64(number(vm)?)?))?,
         Native::U64ToString => text(vm, format!("{}", vm.int64(number(vm)?)? as u64))?,
+        Native::DelegateCombine => Some(vm.combine_delegates(arg(0)?, arg(1)?)?),
+        Native::DelegateRemove => Some(vm.remove_delegate(arg(0)?, arg(1)?)?),
+        Native::TypeFromHandle => Some(arg(0)?),
+        Native::I32CompareTo => {
+            let order = vm.int32(number(vm)?)?.cmp(&vm.int32(arg(1)?)?);
+            Some(Value::I32(order as i32))
+        }
+        Native::I64CompareTo => {
+            let order = vm.int64(number(vm)?)?.cmp(&vm.int64(arg(1)?)?);
+            Some(Value::I32(order as i32))
+        }
+        // `null` меньше любой строки, как в .NET.
+        Native::StringCompareTo => {
+            let left = vm.string_units(arg(0)?)?;
+            let right = vm.string_units(arg(1)?)?;
+            Some(Value::I32(left.cmp(&right) as i32))
+        }
     })
 }
 

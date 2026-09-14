@@ -5,7 +5,7 @@ using System.Text;
 
 namespace System
 {
-    public sealed class String
+    public sealed class String : IComparable<string>
     {
         public static readonly string Empty = "";
 
@@ -55,6 +55,11 @@ namespace System
         public static bool operator !=(string a, string b) => !Equals(a, b);
 
         public static bool IsNullOrEmpty(string value) => value == null || value.Length == 0;
+
+        // Порядковое сравнение единиц UTF-16. У .NET `CompareTo` культурное, и
+        // на смешанном регистре и диакритике порядок разойдётся — это фаза N4.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public extern int CompareTo(string strB);
 
         public override bool Equals(object obj) => obj is string other && Equals(this, other);
 

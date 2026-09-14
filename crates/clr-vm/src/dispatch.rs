@@ -328,7 +328,13 @@ impl<'a, H: Host> Vm<'a, H> {
     pub(crate) fn type_of_object(&mut self, object: ObjRef) -> Result<TypeId, VmError> {
         match self.heap.get(object) {
             Some(Object::String(_)) => self.corelib_type("System.String"),
-            Some(Object::Array { ty, .. } | Object::Instance { ty, .. } | Object::Struct { ty, .. } | Object::Boxed { ty, .. }) => {
+            Some(
+                Object::Array { ty, .. }
+                | Object::Instance { ty, .. }
+                | Object::Struct { ty, .. }
+                | Object::Boxed { ty, .. }
+                | Object::Delegate { ty, .. },
+            ) => {
                 Ok(*ty)
             }
             Some(Object::RuntimeType(_)) => self.corelib_type("System.RuntimeType"),

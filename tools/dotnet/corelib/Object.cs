@@ -57,6 +57,12 @@ namespace System
 
     public abstract class Delegate
     {
+        // Список вызовов живёт внутри объекта делегата в среде.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern Delegate Combine(Delegate a, Delegate b);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern Delegate Remove(Delegate source, Delegate value);
     }
 
     public abstract class MulticastDelegate : Delegate

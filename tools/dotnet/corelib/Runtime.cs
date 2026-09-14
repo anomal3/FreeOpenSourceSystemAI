@@ -30,6 +30,11 @@ namespace System
         public abstract string FullName { get; }
 
         public override string ToString() => FullName;
+
+        // `typeof(T)` — это `ldtoken` и этот вызов. Среда кладёт на стек сразу
+        // объект типа, так что отдать его — всё, что остаётся.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern Type GetTypeFromHandle(RuntimeTypeHandle handle);
     }
 
     // Тип, который возвращает `GetType()`. Один объект на тип, как в .NET:

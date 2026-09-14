@@ -33,10 +33,10 @@ use clr_meta::{Assembly, Coded, Token};
 
 /// Пробные программы, собираемые перед сверкой, и выполняет ли их своя среда.
 ///
-/// `features` нужен ради таблиц метаданных: в нём события, делегаты и
-/// исключения, которых у среды фазы N3a ещё нет.
-const SAMPLES: [(&str, bool); 5] =
-    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("features", false)];
+/// `features` нужен ради таблиц метаданных, а не запуска: в нём P/Invoke,
+/// форматирование дробного числа и `Enum.ToString`, которых у среды ещё нет.
+const SAMPLES: [(&str, bool); 6] =
+    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("features", false)];
 
 /// Имя сборки базовой библиотеки своей среды (`tools/dotnet/corelib`).
 const CORELIB: &str = "FreeOs.CoreLib.dll";
