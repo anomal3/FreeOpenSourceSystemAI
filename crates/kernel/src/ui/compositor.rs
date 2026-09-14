@@ -138,6 +138,15 @@ const BAND_BYTES: u32 = 512 * 1024;
 const BAND_MIN: u32 = 16;
 const BAND_MAX: u32 = 256;
 
+/// Слои стола, посчитанные от размера экрана, — собранные заранее под новый
+/// режим (фаза С6a). См. [`Compositor::prepare_screen`].
+pub struct Layers {
+    back: Surface,
+    panel: Option<Panel>,
+    menu: Option<Menu>,
+    context: Option<ContextMenu>,
+}
+
 impl Compositor {
     /// Поднять композитор на этом экране.
     ///
@@ -981,6 +990,64 @@ impl Compositor {
             }
         }
         self.restyle(status);
+    }
+
+    /// Собрать слои под экран другого размера, ничего пока не меняя.
+    ///
+    /// Отдельно от [`Self::adopt_screen`], и порядок важен: память спрашивается
+    /// **до** того, как переключён адаптер. Не хватило — `None`, адаптер не
+    /// тронут, экран прежний. В обратном порядке отказ означал бы экран нового
+    /// размера и стол, которому нечем на нём рисовать.
+    pub fn prepare_screen(&self, width: u32, height: u32) -> Option<Layers> {
+        let rows = (BAND_BYTES / (width.max(1) * 4)).clamp(BAND_MIN, BAND_MAX);
+        let back = Surface::new(width, rows.min(height.max(1)), theme::palette().wall_top)?;
+        let panel = Panel::new(width, height, self.scale.min(2));
+        let top = panel.as_ref().map_or(height as i32, |panel| panel.rect.y);
+        let menu = Menu::new(top, self.scale.min(2));
+        let context = ContextMenu::new(self.scale.min(2));
+        Some(Layers { back, panel, menu, context })
+    }
+
+    /// Перейти на экран нового размера — смена режима на ходу.
+    ///
+    /// Всё, что посчитано от размера экрана, заменяется собранным в
+    /// [`Self::prepare_screen`]. Окна переезжают, а не строятся заново: в них
+    /// состояние — строки терминала, память программы, — и пересоздать окно
+    /// значило бы его потерять. Окно, не влезающее в новый экран, поджимается,
+    /// если умеет менять размер, и в любом случае прижимается внутрь: окно
+    /// программы размера не меняет (см. `Window::rebuild`).
+    ///
+    /// Масштаб интерфейса остаётся прежним. Смена масштаба пересобрала бы сетку
+    /// терминала, и строки, уже набранные человеком, переехали бы — это другая
+    /// работа, и в эту фазу она не входит.
+    pub fn adopt_screen(&mut self, screen: Screen, layers: Layers, status: &Status) {
+        let (width, height) = (screen.width(), screen.height());
+        self.screen = screen;
+        self.back = layers.back;
+        self.panel = layers.panel;
+        self.menu = layers.menu;
+        self.context = layers.context;
+        self.pointer = Pointer::new(width, height);
+        self.drag = None;
+        let bottom = self.work_bottom();
+        self.icons.set_area(bottom);
+        self.icons.reload();
+        for window in self.windows.iter_mut() {
+            let fit_w = window.rect.w.min(width);
+            let fit_h = window.rect.h.min(bottom.max(1) as u32);
+            if (fit_w, fit_h) != (window.rect.w, window.rect.h) {
+                // Отказ — окно программы или нехватка памяти: окно остаётся
+                // своего размера и только прижимается ниже.
+                let _ = window.resize(fit_w, fit_h);
+            }
+            let max_x = (width as i32 - window.rect.w as i32).max(0);
+            let max_y = (bottom - window.rect.h as i32).max(0);
+            window.rect.x = window.rect.x.clamp(0, max_x);
+            window.rect.y = window.rect.y.clamp(0, max_y);
+        }
+        self.restyle(status);
+        self.damage_count = 0;
+        self.damage_overflow = true;
     }
 
     /// Перерисовать весь экран — то, что делает пункт «Refresh».

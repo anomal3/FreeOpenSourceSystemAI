@@ -871,6 +871,22 @@ impl Window {
         }
     }
 
+    /// Попросили ли «Параметры» другой режим экрана (фаза С6a).
+    pub fn took_mode_request(&mut self) -> Option<(u32, u32)> {
+        match &mut self.content {
+            Content::Settings(view) => view.take_mode_request(),
+            Content::Text(_) | Content::Dialog(_) | Content::Program(_) => None,
+        }
+    }
+
+    /// Сказать окну, чем кончилась смена режима, и перерисовать его.
+    pub fn mode_applied(&mut self, requested: (u32, u32), outcome: Result<(), alloc::string::String>) {
+        if let Content::Settings(view) = &mut self.content {
+            view.mode_applied(requested, outcome);
+            self.redraw_content();
+        }
+    }
+
     /// Забрать ответ диалога, если его дали.
     ///
     /// Ответ забирает стол, а не окно действует само: «Выключить» закрывает

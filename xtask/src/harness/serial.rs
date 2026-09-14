@@ -210,6 +210,33 @@ impl SerialLine {
         }
     }
 
+    /// Дождаться конца строки, на которой остановилось прошлое ожидание.
+    ///
+    /// Нужно тем, кто разбирает журнал целиком, — наведению мыши. Ожидание
+    /// `window      : 'System' at` совпадает с **началом** строки, а цифры за
+    /// ним могут приехать следующим чтением сокета: так `mouse` на x86_64 упал в
+    /// цепочке с «в журнале нет окна 'System'», хотя строка в журнале была. Та
+    /// же ловушка, что описана у [`Self::capture_number`].
+    ///
+    /// Срок короткий и не ошибка: за курсором бывает строка, которая перевода
+    /// не получит никогда, — приглашение оболочки `freeos> `.
+    pub fn finish_line(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let guard = self.buffer.lock().expect("буфер линии");
+                let done = guard.text.get(self.cursor..).is_some_and(|tail| tail.contains('\n'));
+                if done || guard.closed {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// Встречалась ли подстрока во всём выводе.
     pub fn seen(&self, needle: &str) -> bool {
         self.buffer.lock().expect("буфер линии").text.contains(needle)

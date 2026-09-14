@@ -90,9 +90,13 @@ pub enum Aim {
 }
 
 /// Строка `desktop     : 1280x800, ui scale 1, panel 80 px`.
+///
+/// Последняя, а не первая: с фазы С6a режим меняется на ходу, и стол печатает
+/// строку заново. Первая описывала бы экран, которого уже нет.
 fn desktop_line(log: &str) -> Result<&str> {
     log.lines()
-        .find(|line| line.contains("desktop     : ") && line.contains("ui scale"))
+        .filter(|line| line.contains("desktop     : ") && line.contains("ui scale"))
+        .last()
         .context("в журнале нет строки с размером экрана")
 }
 

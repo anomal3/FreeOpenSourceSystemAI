@@ -303,6 +303,38 @@ pub unsafe fn pci_config_write32(address: u32, value: u32) {
     }
 }
 
+/// Порты интерфейса Bochs VBE: номер регистра и его значение.
+const VBE_INDEX: u16 = 0x1CE;
+const VBE_DATA: u16 = 0x1CF;
+
+/// Прочитать регистр Bochs VBE — стандартного VGA QEMU (фаза С6a).
+///
+/// # Safety
+///
+/// За портами `0x1CE/0x1CF` обязан стоять адаптер Bochs VBE: на машине без
+/// него они могут принадлежать чужому устройству. Пара «номер — значение» не
+/// должна пересекаться с другим обращением к тем же портам.
+pub unsafe fn vbe_read(index: u16) -> u16 {
+    // SAFETY: контракт функции.
+    unsafe {
+        outw(VBE_INDEX, index);
+        inw(VBE_DATA)
+    }
+}
+
+/// Записать регистр Bochs VBE.
+///
+/// # Safety
+///
+/// См. [`vbe_read`]; запись меняет режим экрана.
+pub unsafe fn vbe_write(index: u16, value: u16) {
+    // SAFETY: контракт функции.
+    unsafe {
+        outw(VBE_INDEX, index);
+        outw(VBE_DATA, value);
+    }
+}
+
 /// Запись двойного слова в порт.
 ///
 /// # Safety

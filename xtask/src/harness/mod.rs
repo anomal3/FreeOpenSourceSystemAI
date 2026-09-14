@@ -1005,6 +1005,7 @@ fn play(
                 line.write_raw(bytes).with_context(|| format!("шаг {index}"))?;
             }
             Step::Aim(target) => {
+                line.finish_line(Duration::from_secs(1));
                 let log = line.text();
                 let (width, height) = aim::screen(&log).with_context(|| format!("шаг {index}"))?;
                 let from = *pointer.get_or_insert((width / 2, height / 2));
@@ -1022,6 +1023,7 @@ fn play(
             }
             Step::Move(dx, dy) => {
                 say!("  [{at:>6} мс] шаг {index}: указатель на {dx},{dy}");
+                line.finish_line(Duration::from_secs(1));
                 let log = line.text();
                 let (width, height) = aim::screen(&log).with_context(|| format!("шаг {index}"))?;
                 let from = *pointer.get_or_insert((width / 2, height / 2));
@@ -1207,6 +1209,21 @@ fn play(
                 let (w, h) = shot::ppm_to_png(&ppm, &png).with_context(|| format!("шаг {index}"))?;
                 say!("             {w}x{h} -> {}", png.display());
                 shots.push(png);
+            }
+            Step::Screen(width, height) => {
+                say!("  [{at:>6} мс] шаг {index}: экран гостя должен быть {width}x{height}");
+                // Размер спрашивается у QEMU, а не у журнала гостя: строка
+                // «стол перешёл на 1024x768» доказывает только то, что стол так
+                // думает. Кадр, который отдаёт монитор, — это то, что показывает
+                // устройство.
+                let ppm = paths::test_dir().join(format!("{prefix}-screen.ppm"));
+                let png = ppm.with_extension("png");
+                std::fs::create_dir_all(paths::test_dir()).ok();
+                hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
+                let (w, h) = shot::ppm_to_png(&ppm, &png).with_context(|| format!("шаг {index}"))?;
+                if (w, h) != (*width, *height) {
+                    bail!("шаг {index}: экран гостя {w}x{h}, а не {width}x{height}");
+                }
             }
         }
     }

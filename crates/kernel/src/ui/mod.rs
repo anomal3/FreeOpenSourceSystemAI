@@ -88,6 +88,10 @@ const DOUBLE_CLICK_MS: u64 = 500;
 
 static DESKTOP: SpinLock<Option<Compositor>> = SpinLock::new(None);
 
+/// Фреймбуфер, на котором стол рисует сейчас: от прошивки или от последней
+/// смены режима. Драйвер сверяет с ним, тот ли адаптер показывает картинку.
+static FRAMEBUFFER: SpinLock<boot_info::Framebuffer> = SpinLock::new(boot_info::Framebuffer::NONE);
+
 /// Когда был прошлый щелчок по значку и по какому именно.
 ///
 /// Обычные статики, а не поле стола: стол вынимается из-под замка на время
@@ -109,6 +113,7 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
     let Some(screen) = Screen::new(fb) else {
         return false;
     };
+    *FRAMEBUFFER.lock() = *fb;
 
     let scale = theme::geometry_scale(screen.width());
     // Тема читается **до** создания композитора: палитра выбирается один раз,
@@ -1057,6 +1062,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 // заимствовано у стола, и закрыть его изнутри `match` нечем.
                 let mut answer = None;
                 let mut title_changed = false;
+                let mut mode = None;
                 let changed = match desktop.focused_mut() {
                     // Окно программы получает щелчок событием, а не
                     // перерисовкой: что нарисовать в ответ, решает она.
@@ -1085,6 +1091,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                         let title = window.took_title_change();
                         let look = window.took_theme_change();
                         title_changed = title;
+                        mode = window.took_mode_request();
                         look
                     }
                     None => false,
@@ -1098,6 +1105,9 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 // остальные окна, панель и обои принадлежат композитору,
                 // и окно о них не знает.
                 apply_look_change(desktop, changed, title_changed, status);
+                if let Some(mode) = mode {
+                    change_mode(desktop, mode, status);
+                }
             }
         }
         desktop.refresh_panel(status);
@@ -1215,13 +1225,21 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
             if event.pressed {
                 let outcome = desktop.focused_mut().map(|window| {
                     let handled = window.handle_key(event.code);
-                    (handled, window.took_theme_change(), window.took_title_change())
+                    (
+                        handled,
+                        window.took_theme_change(),
+                        window.took_title_change(),
+                        window.took_mode_request(),
+                    )
                 });
-                if let Some((handled, look, title)) = outcome {
+                if let Some((handled, look, title, mode)) = outcome {
                     // С клавиатуры вид меняется так же, как мышью: раньше
                     // тема, выбранная стрелками и Enter, перекрашивала одно
                     // окно, а стол оставался прежним до следующего щелчка.
                     apply_look_change(desktop, look, title, status);
+                    if let Some(mode) = mode {
+                        change_mode(desktop, mode, status);
+                    }
                     if handled {
                         desktop.present();
                     }
@@ -1230,6 +1248,66 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
             None
         }
     }
+}
+
+/// Сменить режим экрана по просьбе «Параметров» (фаза С6a) и сказать окну,
+/// чем кончилось.
+fn change_mode(desktop: &mut Compositor, (width, height): (u32, u32), status: &Status) {
+    let outcome = switch_mode(desktop, width, height, status);
+    if let Err(why) = &outcome {
+        kprintln!("  display     : {width}x{height} not set now: {why}");
+    }
+    if let Some(window) = desktop.find(App::Settings) {
+        window.mode_applied((width, height), outcome);
+    }
+    desktop.present();
+}
+
+/// Переключить адаптер и перевезти на новый экран стол.
+///
+/// Порядок — от того, что может отказать без последствий, к тому, что
+/// отменить нельзя: слои нового размера, адаптер, переезд стола.
+fn switch_mode(desktop: &mut Compositor, width: u32, height: u32, status: &Status) -> Result<(), String> {
+    let layers = desktop
+        .prepare_screen(width, height)
+        .ok_or_else(|| String::from("no memory for the new frame buffer"))?;
+    let current = *FRAMEBUFFER.lock();
+    let fb = crate::display::set_mode(&current, width, height).map_err(|err| alloc::format!("{err}"))?;
+    // Размер буфера посчитан драйвером от того же режима, поэтому отказ здесь —
+    // ошибка в драйвере, а не свойство машины. Сказать о ней всё равно надо.
+    let Some(screen) = Screen::new(&fb) else {
+        return Err(String::from("the new frame buffer does not add up"));
+    };
+    *FRAMEBUFFER.lock() = fb;
+    crate::console::adopt(&fb);
+    desktop.adopt_screen(screen, layers, status);
+
+    let cells = match desktop.find(App::Terminal) {
+        Some(window) => window.size_in_cells(),
+        None => (0, 0),
+    };
+    SHELL_CELLS.store(
+        (u64::from(cells.0) << 32) | u64::from(cells.1),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    SCREEN_SIZE.store(
+        (u64::from(width) << 32) | u64::from(height),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
+    kprintln!("  display     : {width}x{height} set now by {}", crate::display::DRIVER);
+    // Та же строка, что при запуске: по последней такой стенд наводит мышь.
+    kprintln!(
+        "  desktop     : {}x{}, ui scale {}, panel {} px",
+        desktop.screen_width(),
+        desktop.screen_height(),
+        desktop.scale(),
+        desktop.screen_height() as i32 - desktop.work_bottom(),
+    );
+    for entry in desktop.buttons() {
+        log_window(desktop, entry.app, entry.focused);
+    }
+    Ok(())
 }
 
 /// Перекрасить стол после того, как «Параметры» сменили тему, акцент, обои или

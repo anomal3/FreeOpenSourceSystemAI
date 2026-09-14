@@ -169,7 +169,7 @@ waiting to go wrong in it is in **[ROADMAP.md](ROADMAP.md)**.
 | **v0.5** | A libc and a toolchain: somebody else's project builds for this system unpatched | **done** |
 | **v0.6** | Windows belong to programs; settings that persist; a layout a Windows user recognises | **done** |
 | **v0.7** | btrfs: a volume made by `mkfs.btrfs` mounts at `/data` and reads, with crc32c checked on **every** data sector; `fsck` walks the whole volume; our own `mkfs` and writer create, overwrite, truncate, delete and rename files in a way `btrfs check` and the Linux kernel accept; the kernel writes to `/data`, and Linux reads back what it wrote | done; the state partition stays on ext2 until `/data` has been lived with |
-| **v0.7b** | A desktop a Windows user does not have to get used to: dialogs with buttons instead of `Y`/`N`, a start menu of applications rather than of `/bin`, a tray with the input language, network and clock, RU/EN keyboard layouts switched with Alt+Shift or Win+Space, a file manager that opens on a double click and has a context menu, a task manager that can end a task | in progress: С1–С6 of С9 done |
+| **v0.7b** | A desktop a Windows user does not have to get used to: dialogs with buttons instead of `Y`/`N`, a start menu of applications rather than of `/bin`, a tray with the input language, network and clock, RU/EN keyboard layouts switched with Alt+Shift or Win+Space, a file manager that opens on a double click and has a context menu, a task manager that can end a task | in progress: С1–С6a of С9 done; the resolution changes without a reboot |
 | then | A Raspberry Pi 4 — the first machine that is not an emulator | planned |
 
 ---

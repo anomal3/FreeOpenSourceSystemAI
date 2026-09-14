@@ -268,6 +268,17 @@ pub fn prepare_esp(built: &Built, unattended: bool) -> Result<PathBuf> {
             .with_context(|| format!("не удалось удалить {}", autorun.display()))?;
     }
 
+    // Выбор разрешения из «Параметров» ложится на ESP рядом с меткой, а каталог
+    // ESP у воркера один на все его прогоны. Оставленный, он увёл бы следующий
+    // сценарий в чужой режим, и всё, что целится мышью по размеру экрана,
+    // промахивалось бы по причине, к проверяемому не относящейся. Стенд всегда
+    // начинает с режима прошивки.
+    let display = esp.join("FREEOS").join("DISPLAY.CFG");
+    if unattended && display.is_file() {
+        std::fs::remove_file(&display)
+            .with_context(|| format!("не удалось удалить {}", display.display()))?;
+    }
+
     Ok(esp)
 }
 

@@ -345,6 +345,11 @@ pub struct SettingsView {
     theme_changed: bool,
     /// Сменилась высота заголовка: стол пересобирает окна.
     title_changed: bool,
+    /// Выбран режим экрана — переключает его стол (фаза С6a).
+    mode_request: Option<(u32, u32)>,
+    /// Чем кончилась запись выбора на следующий запуск — для отчёта, который
+    /// складывается, когда стол скажет, переключил ли он экран.
+    remembered: Option<Result<(), String>>,
 }
 
 impl SettingsView {
@@ -360,6 +365,8 @@ impl SettingsView {
             net: NetDraft::current(),
             theme_changed: false,
             title_changed: false,
+            mode_request: None,
+            remembered: None,
         }
     }
 
@@ -384,6 +391,37 @@ impl SettingsView {
     /// Сменилась ли высота заголовка с прошлого вопроса.
     pub fn take_title_change(&mut self) -> bool {
         core::mem::take(&mut self.title_changed)
+    }
+
+    /// Выбран ли режим экрана с прошлого вопроса.
+    ///
+    /// Признак наружу по той же причине, что у темы: экран принадлежит столу, и
+    /// переключить его изнутри окна нечем.
+    pub fn take_mode_request(&mut self) -> Option<(u32, u32)> {
+        self.mode_request.take()
+    }
+
+    /// Стол сказал, переключил ли он экран. Отчёт — из двух половин: сменилось
+    /// ли сейчас и запомнилось ли на следующий запуск. Любая из них может
+    /// отказать отдельно, и молчать о любой нельзя.
+    pub fn mode_applied(&mut self, requested: (u32, u32), outcome: Result<(), String>) {
+        let (width, height) = requested;
+        let remembered = self.remembered.take().unwrap_or(Ok(()));
+        if outcome.is_ok() {
+            self.screen = requested;
+        }
+        self.report = Some(match (outcome, remembered) {
+            (Ok(()), Ok(())) => Report::ok(format!("{width}×{height} включено и запомнено")),
+            (Ok(()), Err(err)) => {
+                Report::bad(format!("{width}×{height} включено до перезагрузки: не записано ({err})"))
+            }
+            (Err(why), Ok(())) => Report::ok(format!(
+                "{width}×{height} — со следующего запуска: на ходу не переключить ({why})"
+            )),
+            (Err(why), Err(err)) => {
+                Report::bad(format!("режим не сменён ({why}) и не сохранён ({err})"))
+            }
+        });
     }
 
     fn index_of(section: Section) -> usize {
@@ -771,13 +809,12 @@ impl SettingsView {
 
     fn perform(&mut self, deed: Deed) {
         match deed {
+            // Запоминается здесь, переключается у стола: см. `take_mode_request`.
+            // Запись — первой: выбор, пережитый перезагрузкой, ценен и тогда,
+            // когда адаптер на ходу переключить нечем.
             Deed::Mode(width, height) => {
-                self.report = Some(match crate::slot::request_screen_mode(width, height) {
-                    Ok(()) => Report::ok(format!(
-                        "{width}×{height} будет использовано со следующего запуска"
-                    )),
-                    Err(err) => Report::bad(format!("выбор не сохранён: {err}")),
-                });
+                self.remembered = Some(crate::slot::request_screen_mode(width, height));
+                self.mode_request = Some((width, height));
             }
             // Тема меняется здесь и сейчас, без «Применить»: единственный способ
             // выбрать её — посмотреть на неё, а для этого её надо включить.
@@ -1153,7 +1190,7 @@ impl SettingsView {
             main,
             y,
             "Разрешение",
-            "Режим задаёт прошивка.",
+            "Меняется сразу и запоминается на следующий запуск.",
             (list_w, list_h),
         );
         for (index, (width, height)) in MODES.iter().enumerate() {
@@ -1221,7 +1258,7 @@ impl SettingsView {
             main.x,
             y + ctx.px(16) as i32,
             main.w,
-            "Режим экрана применяется при следующем запуске; смена без перезагрузки — функция запланирована.",
+            "Режим меняется сразу на стандартном VGA QEMU и на ramfb; на другой видеокарте — со следующего запуска.",
         );
     }
 

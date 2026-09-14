@@ -121,7 +121,7 @@ impl Console {
             return None;
         }
 
-        let mut console = Self {
+        let console = Self {
             base: fb.base as *mut u32,
             width: fb.width,
             height: fb.height,
@@ -138,7 +138,8 @@ impl Console {
             cursor: false,
             cursor_drawn: false,
         };
-        console.clear();
+        // Заливки здесь нет: её делает [`init`]. Консоль, заведённая после смены
+        // режима ([`adopt`]), рисовать не вправе — экран в это время у стола.
         Some(console)
     }
 
@@ -479,12 +480,30 @@ static READY: AtomicBool = AtomicBool::new(false);
 
 /// Инициализировать экранную консоль. Возвращает `true`, если экран доступен.
 pub fn init(fb: &Framebuffer) -> bool {
-    let Some(console) = Console::new(fb) else {
+    let Some(mut console) = Console::new(fb) else {
         return false;
     };
+    console.clear();
     *CONSOLE.lock() = Some(console);
     READY.store(true, Ordering::Release);
     true
+}
+
+/// Перевести консоль на новый фреймбуфер после смены режима (фаза С6a).
+///
+/// Экран в это время принадлежит столу, поэтому ничего не рисуется. Нужна
+/// замена одному — панике: она забирает экран через [`reclaim_screen`] и иначе
+/// рисовала бы по геометрии прежнего режима, строками чужой ширины, а на
+/// `ramfb` ещё и в буфер, который устройство больше не показывает и который
+/// уже вернулся в пул кадров.
+pub fn adopt(fb: &Framebuffer) {
+    let console = Console::new(fb).map(|mut console| {
+        // Буфер выделяется до захвата замка: порядок «консоль, затем куча»
+        // разрешён, но держать консоль на время выделения незачем.
+        let _ = console.enable_scroll();
+        console
+    });
+    *CONSOLE.lock() = console;
 }
 
 /// Включить прокрутку экранной консоли.

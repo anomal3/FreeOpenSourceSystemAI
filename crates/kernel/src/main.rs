@@ -44,6 +44,7 @@ mod arch;
 mod block;
 mod config;
 mod console;
+mod display;
 mod fs;
 mod input;
 mod irq;

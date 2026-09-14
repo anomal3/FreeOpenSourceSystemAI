@@ -110,6 +110,9 @@ pub fn set_trap_stack(_top: usize) {}
 /// памяти, а хранить его глобально означало бы завести ещё один изменяемый
 /// синглтон ради нескольких записей в таблицу.
 #[cfg(target_arch = "x86_64")]
+pub use x86_64::{vbe_read, vbe_write};
+
+#[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::map_active;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::paging::map_active;

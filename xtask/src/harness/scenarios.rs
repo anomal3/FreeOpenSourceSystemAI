@@ -182,6 +182,9 @@ pub enum Step {
     Wait(u64),
     /// Снять экран.
     Shot(&'static str),
+    /// Проверить размер кадра, который показывает устройство, — по монитору
+    /// QEMU, а не по словам гостя (фаза С6a).
+    Screen(u32, u32),
     /// Сбросить машину, ничего не спрашивая у гостя (`system_reset` монитора).
     ///
     /// Это и есть «выдернули шнур»: система не получает ни уведомления, ни
@@ -961,6 +964,74 @@ pub const ALL: &[Scenario] = &[
             Step::Await("shutting down", 15_000),
             Step::Exits(30_000),
             Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "display",
+        about: "Разрешение меняется из «Параметров» без перезагрузки, и мышь попадает в новый экран.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Await("desktop     : opened 'Settings'", 15_000),
+
+            // Окно открывается на «Экране»; Enter переводит клавиши к пунктам,
+            // первый из них — 1024×768. На x86 он меньше режима прошивки
+            // (1280×720 у OVMF), на AArch64 больше (800×600 у ramfb): так один
+            // сценарий проверяет оба направления — сжатие окон и растяжение
+            // стола.
+            Step::Key("ret"),
+            Step::Key("ret"),
+            Step::Await("display     : 1024x768 set now", 30_000),
+            Step::Await("desktop     : 1024x768, ui scale", 30_000),
+            // Главное доказательство — от QEMU: кадр, который отдаёт устройство,
+            // стал этого размера. Строки гостя выше говорят только о том, что
+            // гость так думает.
+            Step::Screen(1024, 768),
+            Step::Wait(3_000),
+            Step::Shot("01-1024x768"),
+
+            // Второй режим — следующий пункт. Повторная смена проверяет то, чего
+            // не проверяет первая: адаптер переключается из режима, который
+            // задали мы, а не прошивка, и на AArch64 прежний буфер — уже наш.
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Await("display     : 1280x720 set now", 30_000),
+            Step::Await("desktop     : 1280x720, ui scale", 30_000),
+            Step::Screen(1280, 720),
+            Step::Wait(3_000),
+            Step::Shot("02-1280x720"),
+
+            // Мышь на новом экране. Указатель после смены встаёт в середину,
+            // поэтому сначала — в угол, до упора; дальше стенд целится по
+            // последней строке размера стола. Кнопка меню промахнулась бы, если
+            // бы панель осталась на высоте прежнего режима.
+            Step::Aim(Aim::Corner),
+            Step::Aim(Aim::MenuButton),
+            Step::Click,
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("03-menu"),
+            Step::Click,
+            Step::Await("desktop     : menu closed", 15_000),
         ],
     },
     Scenario {
