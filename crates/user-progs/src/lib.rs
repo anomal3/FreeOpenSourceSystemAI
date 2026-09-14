@@ -222,6 +222,22 @@ impl Window {
         (result == 1).then_some(event)
     }
 
+    /// Сменить размер окна (фаза N7d). После успеха прежние пиксели
+    /// недействительны: поверхность у окна новая, и [`Window::pixels`] отдаёт
+    /// уже её. Ошибка — код отказа, и окно остаётся прежним.
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), i64> {
+        let size = ((width as usize) << 32) | height as usize;
+        // SAFETY: аргументы — числа.
+        let result = insist(|| unsafe { syscall(user_abi::SYS_WINRESIZE, self.id as usize, size, 0) });
+        if result < 0 {
+            return Err(result);
+        }
+        self.base = result as *mut u32;
+        self.width = width;
+        self.height = height;
+        Ok(())
+    }
+
     /// Закрыть окно. Поверхность после этого недействительна.
     ///
     /// Забирает `self` намеренно: обратиться к пикселям после закрытия — это

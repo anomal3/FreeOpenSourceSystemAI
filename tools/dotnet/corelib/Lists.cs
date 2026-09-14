@@ -542,7 +542,11 @@ namespace System.Windows.Forms
                 Form form = FindForm();
                 if (form != null)
                 {
-                    form.OpenDropDown = value ? this : null;
+                    if (value && form.Popup != null)
+                    {
+                        form.Popup.ClosePopup();
+                    }
+                    form.Popup = value ? this : null;
                     form.NeedsPaint = true;
                 }
                 if (value)
@@ -618,22 +622,31 @@ namespace System.Windows.Forms
 
         private int DropRows => Math.Max(1, Math.Min(MaxDropDownItems, Rows.Count));
 
-        // Где открытый список лежит в окне формы.
-        internal Rectangle DropDownBounds(int originX, int originY) =>
-            new Rectangle(originX, originY + Height, Math.Max(Width, DropDownWidth), DropRows * RowHeight + 2);
-
-        internal void PaintDropDown(int window, int originX, int originY)
+        // Открытый список лежит под полем, в точках окна формы.
+        internal override Rectangle PopupBounds
         {
-            Rectangle bounds = DropDownBounds(originX, originY);
+            get
+            {
+                Point origin = OriginInForm();
+                return new Rectangle(origin.X, origin.Y + Height, Math.Max(Width, DropDownWidth), DropRows * RowHeight + 2);
+            }
+        }
+
+        internal override void PaintPopup(int window)
+        {
+            Rectangle bounds = PopupBounds;
             var g = new Graphics(window, bounds.X, bounds.Y, bounds);
             g.Clear(Color.FromArgb(122, 122, 122));
             g.FillRectangle(new SolidBrush(SystemColors.Window), 1, 1, bounds.Width - 2, bounds.Height - 2);
             DrawRows(g, new Rectangle(1, 1, bounds.Width - 2, bounds.Height - 2), dropTop);
         }
 
+        internal override void ClosePopup() => DroppedDown = false;
+
         // Щелчок в открытом списке: строка выбирается, список закрывается.
-        internal void ClickDropDown(int localY)
+        internal override void ClickPopup(int x, int y)
         {
+            int localY = y - PopupBounds.Y;
             int index = dropTop + (localY - 1) / RowHeight;
             DroppedDown = false;
             if (localY >= 1 && index < Rows.Count)

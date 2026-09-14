@@ -122,6 +122,7 @@ pub(crate) enum Native {
     WindowPresent,
     WindowEvent,
     WindowClose,
+    WindowResize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,6 +311,7 @@ const TABLE: &[(&str, Native)] = &[
     ("System.Windows.Forms.FreeOsWindow::Present(int32)", Native::WindowPresent),
     ("System.Windows.Forms.FreeOsWindow::NextEvent(int32,int32&,int32&,int32&)", Native::WindowEvent),
     ("System.Windows.Forms.FreeOsWindow::Close(int32)", Native::WindowClose),
+    ("System.Windows.Forms.FreeOsWindow::Resize(int32,int32,int32)", Native::WindowResize),
 ];
 
 pub(crate) fn lookup(key: &str) -> Option<Native> {
@@ -897,6 +899,16 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
                 vm.host.window_close(window);
             }
             None
+        }
+        Native::WindowResize => {
+            let resized = match window_arg(vm, arg(0)?)? {
+                Some(window) => {
+                    let (width, height) = (vm.int32(arg(1)?)?, vm.int32(arg(2)?)?);
+                    width > 0 && height > 0 && vm.host.window_resize(window, width as u32, height as u32)
+                }
+                None => false,
+            };
+            Some(Value::I32(i32::from(resized)))
         }
     })
 }

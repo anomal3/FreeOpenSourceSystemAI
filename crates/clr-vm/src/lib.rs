@@ -228,6 +228,13 @@ pub trait Host {
     fn window_close(&mut self, window: u32) {
         let _ = window;
     }
+
+    /// Сменить размер содержимого окна (фаза N7d): форма выросла из кода.
+    /// `false` — окно осталось прежним.
+    fn window_resize(&mut self, window: u32, width: u32, height: u32) -> bool {
+        let _ = (window, width, height);
+        false
+    }
 }
 
 /// Прямоугольник в точках окна.

@@ -132,6 +132,31 @@ namespace System.Windows.Forms
 
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static extern void Close(int window);
+
+        // Новый размер содержимого (фаза N7d): форма выросла из кода. `false` —
+        // окно осталось прежним.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern bool Resize(int window, int width, int height);
+    }
+
+    [Flags]
+    public enum AnchorStyles
+    {
+        None = 0,
+        Top = 1,
+        Bottom = 2,
+        Left = 4,
+        Right = 8,
+    }
+
+    public enum DockStyle
+    {
+        None = 0,
+        Top = 1,
+        Bottom = 2,
+        Left = 3,
+        Right = 4,
+        Fill = 5,
     }
 
     public enum HighDpiMode
@@ -453,6 +478,15 @@ namespace System.Windows.Forms
         private Font font;
         private int layoutSuspended;
 
+        // Раскладка (фаза N7d). Расстояния до правого и нижнего края родителя
+        // запоминаются, когда место задаёт код, а не раскладка: так делает
+        // WinForms, и элемент, поставленный кодом, не уезжает при следующей
+        // раскладке.
+        private AnchorStyles anchor = AnchorStyles.Top | AnchorStyles.Left;
+        private DockStyle dock = DockStyle.None;
+        private int anchorRight;
+        private int anchorBottom;
+
         public Control()
         {
             Controls = new ControlCollection(this);
@@ -503,6 +537,11 @@ namespace System.Windows.Forms
         {
             VisibleState = value;
             Invalidate();
+            // Скрытый элемент места в раскладке родителя не занимает.
+            if (Parent != null)
+            {
+                Parent.PerformLayout();
+            }
         }
 
         public virtual string Text
@@ -621,8 +660,64 @@ namespace System.Windows.Forms
 
         public Rectangle DisplayRectangle => ClientRectangle;
 
+        // Место, заданное кодом: раскладка родителя это запоминает.
         public void SetBounds(int x, int y, int width, int height)
         {
+            Place(x, y, width, height);
+            RememberAnchor();
+            if (dock != DockStyle.None && Parent != null)
+            {
+                Parent.PerformLayout();
+            }
+        }
+
+        public virtual AnchorStyles Anchor
+        {
+            get => anchor;
+            set
+            {
+                anchor = value;
+                dock = DockStyle.None;
+                RememberAnchor();
+            }
+        }
+
+        public virtual DockStyle Dock
+        {
+            get => dock;
+            set
+            {
+                if (dock == value)
+                {
+                    return;
+                }
+                dock = value;
+                if (value != DockStyle.None)
+                {
+                    anchor = AnchorStyles.Top | AnchorStyles.Left;
+                }
+                if (Parent != null)
+                {
+                    Parent.PerformLayout();
+                }
+            }
+        }
+
+        // Какой размер элемент согласен принять: меню, например, само знает свою
+        // высоту.
+        internal virtual Size ConstrainSize(int width, int height) => new Size(width, height);
+
+        // После смены места, до Resize: у формы здесь растёт окно.
+        internal virtual void OnBoundsChanged(bool resized)
+        {
+        }
+
+        // Место от раскладки: расстояния для Anchor не пересчитываются.
+        internal void Place(int x, int y, int width, int height)
+        {
+            Size size = ConstrainSize(Math.Max(0, width), Math.Max(0, height));
+            width = size.Width;
+            height = size.Height;
             if (this.x == x && this.y == y && this.width == width && this.height == height)
             {
                 return;
@@ -632,11 +727,99 @@ namespace System.Windows.Forms
             this.y = y;
             this.width = width;
             this.height = height;
+            OnBoundsChanged(resized);
             if (resized)
             {
+                // Как в WinForms: сначала раскладка потомков, потом Resize.
+                LayoutChildren();
                 OnResize(EventArgs.Empty);
             }
             Invalidate();
+        }
+
+        internal void RememberAnchor()
+        {
+            if (Parent == null)
+            {
+                return;
+            }
+            Size area = Parent.ClientSize;
+            anchorRight = area.Width - x - width;
+            anchorBottom = area.Height - y - height;
+        }
+
+        // Dock — в обратном порядке Controls, от краёв к середине; остальные
+        // держат запомненные расстояния до краёв, к которым привязаны.
+        internal void LayoutChildren()
+        {
+            if (layoutSuspended > 0 || Controls.Count == 0)
+            {
+                return;
+            }
+            Size area = ClientSize;
+            int left = 0;
+            int top = 0;
+            int right = area.Width;
+            int bottom = area.Height;
+            for (int i = Controls.Count - 1; i >= 0; i--)
+            {
+                Control child = Controls[i];
+                if (!child.VisibleState)
+                {
+                    continue;
+                }
+                switch (child.dock)
+                {
+                    case DockStyle.Top:
+                        child.Place(left, top, right - left, child.height);
+                        top += child.height;
+                        break;
+                    case DockStyle.Bottom:
+                        child.Place(left, bottom - child.ConstrainSize(right - left, child.height).Height, right - left, child.height);
+                        bottom -= child.height;
+                        break;
+                    case DockStyle.Left:
+                        child.Place(left, top, child.width, bottom - top);
+                        left += child.width;
+                        break;
+                    case DockStyle.Right:
+                        child.Place(right - child.width, top, child.width, bottom - top);
+                        right -= child.width;
+                        break;
+                    case DockStyle.Fill:
+                        child.Place(left, top, right - left, bottom - top);
+                        break;
+                    default:
+                        int nx = child.x;
+                        int ny = child.y;
+                        int nw = child.width;
+                        int nh = child.height;
+                        if ((child.anchor & AnchorStyles.Right) != 0)
+                        {
+                            if ((child.anchor & AnchorStyles.Left) != 0)
+                            {
+                                nw = area.Width - child.anchorRight - nx;
+                            }
+                            else
+                            {
+                                nx = area.Width - child.anchorRight - nw;
+                            }
+                        }
+                        if ((child.anchor & AnchorStyles.Bottom) != 0)
+                        {
+                            if ((child.anchor & AnchorStyles.Top) != 0)
+                            {
+                                nh = area.Height - child.anchorBottom - ny;
+                            }
+                            else
+                            {
+                                ny = area.Height - child.anchorBottom - nh;
+                            }
+                        }
+                        child.Place(nx, ny, nw, nh);
+                        break;
+                }
+            }
         }
 
         public event EventHandler Click;
@@ -689,9 +872,7 @@ namespace System.Windows.Forms
             }
         }
 
-        public void PerformLayout()
-        {
-        }
+        public void PerformLayout() => LayoutChildren();
 
         // Левый верхний угол элемента в точках окна формы.
         internal Point OriginInForm()
@@ -796,6 +977,26 @@ namespace System.Windows.Forms
         // Фон, если его не задали: у большинства элементов — родительский, у
         // поля ввода — белый.
         internal virtual Color AmbientBackColor => Parent != null ? Parent.BackColor : SystemColors.Control;
+
+        // Всплывающее поверх формы (фазы N7b, N7d) — открытый выпадающий список
+        // или меню. Координаты — в точках окна формы; форма рисует его после
+        // всех элементов и отдаёт ему щелчок первым.
+        internal virtual Rectangle PopupBounds => Rectangle.Empty;
+
+        internal virtual void PaintPopup(int window)
+        {
+        }
+
+        internal virtual void ClickPopup(int x, int y)
+        {
+        }
+
+        // Клавиша, пока всплывающее открыто. `true` — разобрана.
+        internal virtual bool KeyPopup(Keys key) => false;
+
+        internal virtual void ClosePopup()
+        {
+        }
 
         // Фаза N7a: фокус. Принимают его только элементы, которые умеют ввод.
         internal virtual bool Selectable => false;
@@ -993,7 +1194,9 @@ namespace System.Windows.Forms
                 value.Parent?.Controls.Remove(value);
                 items.Add(value);
                 value.Parent = Owner;
+                value.RememberAnchor();
                 Owner.Invalidate();
+                Owner.PerformLayout();
             }
 
             public void AddRange(Control[] controls)
@@ -1008,6 +1211,7 @@ namespace System.Windows.Forms
             {
                 items.Insert(index, value);
                 value.Parent = Owner;
+                Owner.PerformLayout();
             }
 
             public virtual void Remove(Control value)
@@ -1016,6 +1220,7 @@ namespace System.Windows.Forms
                 {
                     value.Parent = null;
                     Owner.Invalidate();
+                    Owner.PerformLayout();
                 }
             }
 
@@ -1088,9 +1293,11 @@ namespace System.Windows.Forms
 
         internal bool NeedsPaint { get; set; }
 
-        // Открытый выпадающий список (фаза N7b): рисуется поверх всех элементов
-        // и первым получает щелчок.
-        internal ComboBox OpenDropDown { get; set; }
+        // Открытое всплывающее — выпадающий список (N7b) или меню (N7d): чьё
+        // оно, см. Control.PopupBounds.
+        internal Control Popup { get; set; }
+
+        public MenuStrip MainMenuStrip { get; set; }
 
         // Диалог (фаза N7c). У модальной формы значение, отличное от None,
         // закрывает её — это проверяет цикл Application.RunModal.
@@ -1219,21 +1426,21 @@ namespace System.Windows.Forms
                 case FreeOsWindow.EventNone:
                     return false;
                 case FreeOsWindow.EventPointer:
-                    if (OpenDropDown != null)
+                    if (Popup != null)
                     {
-                        // Щелчок в открытом списке выбирает строку; мимо — только
-                        // закрывает список, как в Windows.
-                        ComboBox combo = OpenDropDown;
-                        Point origin = combo.OriginInForm();
-                        Rectangle drop = combo.DropDownBounds(origin.X, origin.Y);
-                        if (drop.Contains(px, py))
+                        // Щелчок во всплывающем разбирает оно само; мимо него и
+                        // мимо открывшего его элемента — только закрывает, как в
+                        // Windows. Щелчок по самому элементу достаётся элементу.
+                        Control owner = Popup;
+                        if (owner.PopupBounds.Contains(px, py))
                         {
-                            combo.ClickDropDown(py - drop.Y);
+                            owner.ClickPopup(px, py);
                             return true;
                         }
-                        if (!new Rectangle(origin.X, origin.Y, combo.Width, combo.Height).Contains(px, py))
+                        Point origin = owner.OriginInForm();
+                        if (!new Rectangle(origin.X, origin.Y, owner.Width, owner.Height).Contains(px, py))
                         {
-                            combo.DroppedDown = false;
+                            owner.ClosePopup();
                             return true;
                         }
                     }
@@ -1248,6 +1455,10 @@ namespace System.Windows.Forms
                 case FreeOsWindow.EventKey:
                     Control focused = ActiveControl != null && ActiveControl.CanFocus ? ActiveControl : this;
                     Keys key = KeyMap.ToKeys(code);
+                    if (Popup != null && Popup.KeyPopup(key))
+                    {
+                        return true;
+                    }
                     // Enter нажимает кнопку по умолчанию, если фокус не на
                     // другой кнопке, Escape — кнопку отмены.
                     if (key == Keys.Enter && AcceptButton != null && !(focused is IButtonControl))
@@ -1284,13 +1495,23 @@ namespace System.Windows.Forms
             }
             NeedsPaint = false;
             PaintTree(window, 0, 0, new Rectangle(0, 0, ClientSize.Width, ClientSize.Height));
-            if (OpenDropDown != null)
+            if (Popup != null)
             {
-                Point origin = OpenDropDown.OriginInForm();
-                OpenDropDown.PaintDropDown(window, origin.X, origin.Y);
+                Popup.PaintPopup(window);
             }
             FreeOsWindow.Present(window);
             return true;
+        }
+
+        // Форма выросла или сжалась из кода — окно FreeOS меняет размер вместе
+        // с ней (фаза N7d).
+        internal override void OnBoundsChanged(bool resized)
+        {
+            if (resized && window >= 0)
+            {
+                FreeOsWindow.Resize(window, Width, Height);
+                NeedsPaint = true;
+            }
         }
 
         protected override void Dispose(bool disposing)

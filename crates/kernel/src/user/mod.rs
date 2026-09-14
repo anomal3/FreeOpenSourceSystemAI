@@ -629,11 +629,26 @@ impl Program {
         self.window_slots() != 0
     }
 
+    /// Адрес поверхности окна `slot` в памяти программы.
+    fn surface_base(&self, slot: u32) -> Option<usize> {
+        self.mappings
+            .iter()
+            .find(|region| matches!(region.source, Source::Surface(_, owner) if owner == slot))
+            .map(|region| region.base)
+    }
+
     fn detach_surface(&mut self, slot: u32) -> Option<usize> {
+        let base = self.surface_base(slot)?;
+        self.detach_surface_at(base)
+    }
+
+    /// Снять поверхность по адресу. Нужна смене размера (фаза N7d): на миг у
+    /// окна две поверхности с одним номером, и снять надо именно прежнюю.
+    fn detach_surface_at(&mut self, base: usize) -> Option<usize> {
         let index = self
             .mappings
             .iter()
-            .position(|region| matches!(region.source, Source::Surface(_, owner) if owner == slot))?;
+            .position(|region| region.base == base && matches!(region.source, Source::Surface(..)))?;
         let region = self.mappings.remove(index);
         let Source::Surface(phys, _) = region.source else {
             unreachable!("область только что опознана поверхностью");
@@ -995,17 +1010,7 @@ pub enum WindowError {
 /// Гонки между заходами нет, и это не везение: между ними программа стоит
 /// внутри этого самого вызова, а её области трогает только она.
 pub fn open_window(title: &str, width: u32, height: u32) -> Result<(usize, u32), WindowError> {
-    if width == 0 || height == 0 {
-        return Err(WindowError::BadSize);
-    }
-    let bytes = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|points| points.checked_mul(4))
-        .ok_or(WindowError::BadSize)?;
-    if bytes > WINDOW_MAX_BYTES {
-        return Err(WindowError::BadSize);
-    }
-    let pages = bytes.div_ceil(PAGE_SIZE);
+    let pages = surface_pages(width, height)?;
 
     let (slot, base, phys) = with_current(|program| {
         let slot = program.free_window_slot().ok_or(WindowError::TooMany)?;
@@ -1034,6 +1039,56 @@ pub fn open_window(title: &str, width: u32, height: u32) -> Result<(usize, u32),
         return Err(WindowError::Desktop(err));
     }
     Ok((base, slot))
+}
+
+/// Сколько страниц под поверхность такого размера; бессмысленный размер или
+/// больше [`WINDOW_MAX_BYTES`] — отказ.
+fn surface_pages(width: u32, height: u32) -> Result<usize, WindowError> {
+    if width == 0 || height == 0 {
+        return Err(WindowError::BadSize);
+    }
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|points| points.checked_mul(4))
+        .ok_or(WindowError::BadSize)?;
+    if bytes > WINDOW_MAX_BYTES {
+        return Err(WindowError::BadSize);
+    }
+    Ok(bytes.div_ceil(PAGE_SIZE))
+}
+
+/// Сменить размер окна `slot` текущей программы (фаза N7d). Возвращает адрес
+/// новой поверхности; прежняя снята.
+///
+/// Порядок тот же, что у открытия и закрытия: новые кадры выдаются под локом
+/// таблицы программ, стол переходит на них без лока, и только потом снимаются
+/// прежние — пока стол держит окно, композитор вправе читать его пиксели. При
+/// отказе снимается новая поверхность, а окно остаётся прежним.
+pub fn resize_window(slot: u32, width: u32, height: u32) -> Result<usize, WindowError> {
+    let pages = surface_pages(width, height)?;
+    let (old, base, phys) = with_current(|program| {
+        let old = program
+            .surface_base(slot)
+            .ok_or(WindowError::Desktop(crate::ui::WindowError::NoWindow))?;
+        let (base, phys) = program.attach_surface(pages, slot).map_err(WindowError::Memory)?;
+        Ok((old, base, phys))
+    })
+    .ok_or(WindowError::NoProgram)??;
+
+    // SAFETY: как в [`open_window`] — кадры выданы подряд, живы, пока живо окно,
+    // и второй ссылки на них нет, пока программа стоит в этом вызове.
+    let surface = unsafe {
+        mini_ui::Surface::from_raw(phys.to_direct_map().as_mut_ptr::<u32>(), width, height)
+    };
+    let task = sched::current().as_u32();
+    let resized = match surface {
+        Some(surface) => crate::ui::resize_window(task, slot, surface),
+        None => Err(crate::ui::WindowError::NoMemory),
+    };
+    let dropped = if resized.is_ok() { old } else { base };
+    with_current(|program| program.detach_surface_at(dropped));
+    resized.map_err(WindowError::Desktop)?;
+    Ok(base)
 }
 
 /// Показать на экране то, что программа нарисовала в окне `slot`. `None` — всё

@@ -1917,6 +1917,28 @@ pub fn commit_window(task: u32, slot: u32, area: Option<Rect>) -> Result<(), Win
     .unwrap_or_else(|| Err(unavailable()))
 }
 
+/// Сменить окну программы размер (фаза N7d): `pixels` — новая поверхность той же
+/// программы. Прежнюю [`crate::user`] снимает уже после этого вызова: до его
+/// конца композитор вправе читать старые пиксели.
+pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let focused = desktop.focused_app() == Some(app);
+        let Some(window) = desktop.find(app) else {
+            return Err(WindowError::NoWindow);
+        };
+        if !window.replace_pixels(pixels, focused) {
+            return Err(WindowError::NoMemory);
+        }
+        log_window(desktop, app, focused);
+        // Окно могло сжаться: открывшееся под ним место рисуется заново.
+        desktop.repaint_all();
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
 /// Забрать у окна самое старое событие.
 ///
 /// `None` — событий нет **или** стол сейчас занят. Разница здесь неважна и

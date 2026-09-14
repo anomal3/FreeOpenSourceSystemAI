@@ -394,6 +394,33 @@ impl Window {
         theme::title_h() * scale
     }
 
+    /// Сменить окну программы поверхность: программа попросила другой размер
+    /// (фаза N7d, [`user_abi::SYS_WINRESIZE`]). Место окна на столе остаётся.
+    ///
+    /// `false` — памяти под окно нового размера не нашлось, и окно осталось
+    /// прежним вместе с прежними пикселями.
+    pub fn replace_pixels(&mut self, pixels: Surface, focused: bool) -> bool {
+        if !matches!(self.content, Content::Program(_)) {
+            return false;
+        }
+        let w = pixels.width();
+        let h = pixels.height() + Self::title_height(self.scale);
+        let Some(surface) = Surface::new(w, h, theme::window_bg()) else {
+            return false;
+        };
+        if let Content::Program(view) = &mut self.content {
+            view.pixels = pixels;
+        }
+        self.surface = surface;
+        self.rect.w = w;
+        self.rect.h = h;
+        self.restore = None;
+        self.commit(None);
+        self.draw_decorations(focused);
+        self.damage = Rect::new(0, 0, w, h);
+        true
+    }
+
     /// Пересобрать окно под новую высоту заголовка.
     ///
     /// Содержимое сохраняет размер, а окно — нет: у окна программы пиксели

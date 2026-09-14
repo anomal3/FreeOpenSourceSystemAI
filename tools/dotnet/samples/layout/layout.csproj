@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N7d: меню, Dock и Anchor из дизайнера. clr-check
+       запускает его с аргументом self-test: кнопка растит форму, пункты меню
+       нажимаются из кода, панель переезжает к правому краю, и форма
+       закрывается пунктом Exit. Высоты меню и поля ввода зависят от шрифта,
+       поэтому печатаются расстояния и равенства, а не они сами. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

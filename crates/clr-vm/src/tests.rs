@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -708,5 +708,35 @@ fn dialogs_print_what_winforms_prints() {
     let (result, output) = run_with(DIALOGS, "dialogs.dll", &["self-test"]);
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, DIALOGS_OUTPUT);
+    assert_eq!(code, 0);
+}
+
+/// Образец `tools/dotnet/samples/layout` (фаза N7d): меню, Dock и Anchor из
+/// дизайнера. Высоты меню и поля ввода зависят от шрифта, и образец печатает
+/// расстояния и равенства, а не их.
+const LAYOUT: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/layout.dll");
+
+/// Что печатает `dotnet layout.dll self-test` (записано 2026-09-15, .NET 10,
+/// WinForms на Windows, LF): раскладка до и после роста формы, пункты меню,
+/// панель у правого края и скрытая.
+const LAYOUT_OUTPUT: &str = concat!(
+    "shown: panel1 0 100 True True | panel2 100 300 True | label 0 400 24 True | menu 0 400 | text 12 12 276 | button 12 12 100 28\n",
+    "menu: Top 2 &File 3 True O, Control True False ToolStripSeparator Bottom, Right Fill\n",
+    "grown: 500x300 panel1 0 100 True True | panel2 100 400 True | label 0 500 24 True | menu 0 500 | text 12 12 376 | button 12 12 100 28\n",
+    "open: ToolStripMenuItem &Open\n",
+    "wrap: True Checked\n",
+    "wrap: False Unchecked\n",
+    "right: 400 100 0 400\n",
+    "hidden: 0 500 476\n",
+    "shrunk: panel1 300 100 True True | panel2 0 300 True | label 0 400 24 True | menu 0 400 | text 12 12 276 | button -88 -38 100 28\n",
+    "exit\n",
+    "closed: UserClosing\n",
+);
+
+#[test]
+fn layout_prints_what_winforms_prints() {
+    let (result, output) = run_with(LAYOUT, "layout.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, LAYOUT_OUTPUT);
     assert_eq!(code, 0);
 }

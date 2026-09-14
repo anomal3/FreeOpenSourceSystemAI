@@ -1033,6 +1033,19 @@ pub const SYS_KILL: usize = 60;
 /// Появился ради диспетчера устройств (фаза С7).
 pub const SYS_DEVICES: usize = 61;
 
+/// Сменить размер своего окна. `(id, (w << 32) | h, 0) -> адрес новой поверхности`.
+///
+/// Фаза N7d: форма WinForms выросла из кода. Поверхность выдаётся заново —
+/// растянуть отображённые страницы нечем, — и прежний адрес после ответа
+/// недействителен: его страницы сняты. Место окна на столе остаётся. Отказ —
+/// отрицательный код, и тогда у программы прежнее окно с прежней поверхностью.
+///
+/// Просит новый размер сама программа и стоит внутри вызова, пока меняется её
+/// память, поэтому страницы не выдёргиваются у неё из-под руки. Человек размер
+/// окна программы по-прежнему не меняет: события «размер изменился» в договоре
+/// нет.
+pub const SYS_WINRESIZE: usize = 62;
+
 /// Счётчики системы — ответ [`SYS_SYSINFO`].
 ///
 /// Все размеры в **байтах**, всё время в **миллисекундах**: единица, о которой
@@ -1723,6 +1736,16 @@ mod tests {
         assert_eq!(SYS_KILL, 60);
         // Фаза С7 — диспетчер устройств.
         assert_eq!(SYS_DEVICES, 61);
+        // Фаза N7d — форма WinForms растёт из кода.
+        assert_eq!(SYS_WINRESIZE, 62);
+    }
+
+    /// Номер окна: у первого окна он равен номеру задачи, как до фазы N7c.
+    #[test]
+    fn window_ids_keep_the_first_window_equal_to_the_task() {
+        assert_eq!(window_id(29, 0), 29);
+        assert_eq!(window_id(29, 1), (1 << 32) | 29);
+        assert_eq!(window_id(u32::MAX, MAX_WINDOWS - 1), (7 << 32) | 0xffff_ffff);
     }
 
     /// Ни один номер не выдан дважды.
@@ -1743,7 +1766,7 @@ mod tests {
             SYS_MMAP, SYS_MUNMAP, SYS_MMAP_FILE, SYS_GETCPU, SYS_DUP, SYS_FSTAT, SYS_ISATTY,
             SYS_CLOCK, SYS_NANOSLEEP, SYS_POLL, SYS_TIMES, SYS_WINOPEN, SYS_WINCOMMIT,
             SYS_WINEVENT, SYS_WINCLOSE, SYS_SYSINFO, SYS_MOUNTS, SYS_TASKS, SYS_KILL,
-            SYS_DEVICES,
+            SYS_DEVICES, SYS_WINRESIZE,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(

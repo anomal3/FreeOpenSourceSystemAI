@@ -175,6 +175,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_WINCOMMIT => wincommit(a0 as i64, a1, a2),
         SYS_WINEVENT => winevent(a0 as i64, a1),
         SYS_WINCLOSE => winclose(a0 as i64),
+        // Фаза N7d: форма выросла из кода.
+        user_abi::SYS_WINRESIZE => winresize(a0 as i64, a1),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -1681,6 +1683,19 @@ fn sysinfo(out: usize) -> i64 {
     // SAFETY: адрес проверен на выравнивание и на запись.
     unsafe { core::ptr::write(out as *mut SysInfo, value) };
     0
+}
+
+/// `winresize(id, (w << 32) | h) -> адрес новой поверхности`.
+fn winresize(id: i64, size: usize) -> i64 {
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    let (w, h) = ((size >> 32) as u32, (size & 0xffff_ffff) as u32);
+    match super::resize_window(slot, w, h) {
+        Ok(base) => base as i64,
+        Err(err) => window_errno(err),
+    }
 }
 
 /// `winclose(id) -> 0`.

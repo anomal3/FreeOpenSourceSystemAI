@@ -182,4 +182,16 @@ impl Host for Sandbox {
             *slot = None;
         }
     }
+
+    fn window_resize(&mut self, window: u32, width: u32, height: u32) -> bool {
+        let Some(Some(frame)) = self.windows.get_mut(window as usize) else { return false };
+        let Ok(count) = usize::try_from(u64::from(width) * u64::from(height)) else { return false };
+        let mut pixels = Vec::new();
+        if pixels.try_reserve_exact(count).is_err() {
+            return false;
+        }
+        pixels.resize(count, 0);
+        *frame = Frame { width, height, pixels, idle: frame.idle };
+        true
+    }
 }

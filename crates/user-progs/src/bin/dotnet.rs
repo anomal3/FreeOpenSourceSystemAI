@@ -367,6 +367,26 @@ impl Host for Console {
             error(&format!("dotnet: window '{title}' closed after {frames} frame(s)\n"));
         }
     }
+
+    fn window_resize(&mut self, window: u32, width: u32, height: u32) -> bool {
+        let Some(target) = self.window_mut(window) else { return false };
+        if target.width == width && target.height == height {
+            return true;
+        }
+        if let Err(code) = target.window.resize(width, height) {
+            error(&format!("dotnet: window '{}' kept its size, the resize was refused (code {code})\n", target.title));
+            return false;
+        }
+        let base = target.window.pixels().as_mut_ptr();
+        // SAFETY: как при открытии — страницы новой поверхности отображены ядром,
+        // пока живо окно; прежняя поверхность заменяется, не будучи прочитана.
+        let Some(surface) = (unsafe { Surface::from_raw(base, width, height) }) else { return false };
+        target.surface = surface;
+        target.width = width;
+        target.height = height;
+        error(&format!("dotnet: window '{}' resized to {width}x{height}\n", target.title));
+        true
+    }
 }
 
 /// Отказ ядра как отказ файловой операции среды.
