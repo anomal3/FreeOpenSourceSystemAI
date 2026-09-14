@@ -3252,9 +3252,21 @@ Windows эталон получал бы запятую в дробных чис
   формату. Чего нет: форматов `N`/`F`/`E`/`P`/`C` и пользовательских
   (`0000`) — отказ с названием N4c; `IsLetter`/`IsDigit` — приближение
   категорий Unicode через свойства Rust.
-- **N4b — коллекции.** `IEnumerable<T>`/`IEnumerator<T>`, `foreach` по ним,
-  массивы как `IList<T>`, `List<T>`, `Dictionary<TKey,TValue>`, `HashSet<T>`,
-  `EqualityComparer<T>.Default`, итераторы `yield return`.
+- **N4b — коллекции** — **сделано.** Образец `collections` (17 строк, код 6)
+  совпал с `dotnet` с первого запуска: `List<T>` (вставка, удаление,
+  сортировка, `Find` с предикатом), `Dictionary` с ключами-строками,
+  -структурами и -классами с `IEquatable<T>`, `KeyNotFoundException` с текстом
+  .NET, `Keys`/`Values`, `HashSet`, `Queue`, `Stack`, массив как `IList<T>` и
+  `IEnumerable<T>`, `Array.Sort`/`IndexOf`, итераторы `yield return` с
+  `finally` при `break`. Всё на C#. `Dictionary` и `HashSet` устроены как у
+  .NET — записи в порядке добавления, корзины, список свободных мест, — и
+  порядок перебора совпадает, включая место удалённого, занятое новым: хэш на
+  порядок не влияет, повторено устройство. Массив реализует интерфейсы
+  коллекций методами `SZArrayHelper<T>` с самим массивом в `this`, как в
+  CoreCLR, — единственная правка интерпретатора в этой части. Чего нет:
+  сортировка не повторяет introsort .NET, и порядок равных элементов может
+  отличаться; вариантности интерфейсов (`string[]` как
+  `IEnumerable<object>`).
 - **N4c — дробные числа.** Печать `double`/`float` кратчайшим представлением,
   форматы `F`/`N`/`E`/`P`, `double.Parse`, `Math.Sqrt` и тригонометрия.
 - **N4d — Linq и остальное.** `Where`/`Select`/`OrderBy`/`ToList`/`Sum` и

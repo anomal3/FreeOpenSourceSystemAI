@@ -35,8 +35,8 @@ use clr_meta::{Assembly, Coded, Token};
 ///
 /// `features` нужен ради таблиц метаданных, а не запуска: в нём P/Invoke,
 /// форматирование дробного числа и `Enum.ToString`, которых у среды ещё нет.
-const SAMPLES: [(&str, bool); 8] =
-    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("features", false)];
+const SAMPLES: [(&str, bool); 9] =
+    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("features", false)];
 
 /// Имя сборки базовой библиотеки своей среды (`tools/dotnet/corelib`).
 const CORELIB: &str = "FreeOs.CoreLib.dll";

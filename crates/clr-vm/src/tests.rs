@@ -120,7 +120,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -270,6 +270,39 @@ fn text_prints_what_dotnet_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, TEXT_OUTPUT);
     assert_eq!(code, 77);
+}
+
+/// Образец `tools/dotnet/samples/collections` (фаза N4b).
+const COLLECTIONS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/collections.dll");
+
+/// Что печатает `dotnet collections.dll` (записано 2026-09-14, .NET 10, LF).
+/// Порядок в `dict` и `set` — порядок записей: место удалённого занял новый.
+const COLLECTIONS_OUTPUT: &str = concat!(
+    "collections: start\n",
+    "list 5,8,1 count 3 has 8 True at 1\n",
+    "sorted 8,7,1 sum 16 array 3\n",
+    "names apple fig pear kiwi lime kiwi 1 True\n",
+    "cells R1C2 True -1\n",
+    "dict ann=31 dan=19 cid=41 count 3 False True 41\n",
+    "missing: The given key 'zed' was not present in the dictionary.\n",
+    "keys ann,dan,cid values 31,19,41\n",
+    "struct key far class key 1 False\n",
+    "set 16,1,9 count 3 added False has 9 True\n",
+    "queue ab2 stack 211\n",
+    "array 1,2,3 sum 6 index 1 ilist 33\n",
+    "evens 0,2,4,6,8 sum 2550\n",
+    "word alpha\n",
+    "word beta\n",
+    "words: finally\n",
+    "collections: done\n",
+);
+
+#[test]
+fn collections_print_what_dotnet_prints() {
+    let (result, output) = run(COLLECTIONS);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, COLLECTIONS_OUTPUT);
+    assert_eq!(code, 6);
 }
 
 #[test]

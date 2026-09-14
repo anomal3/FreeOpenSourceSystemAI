@@ -343,7 +343,23 @@ impl<'a, H: Host> Vm<'a, H> {
             initialized: true,
         })?;
         self.array_types.insert(element, ty);
+        // Интерфейсы массива (`IList<T>`, `IEnumerable<T>`…) — те, что реализует
+        // `SZArrayHelper<T>` базовой библиотеки; там же `dispatch.rs` ищет их
+        // методы. Тип массива уже в таблице: загрузка помощника не зациклится,
+        // даже если ему самому понадобится `T[]`.
+        if let Some(helper) = self.array_helper(element)? {
+            let interfaces = self.types[helper.0 as usize].interfaces.clone();
+            self.types[ty.0 as usize].interfaces = interfaces;
+        }
         Ok(ty)
+    }
+
+    /// `SZArrayHelper<element>`, если базовая библиотека его знает.
+    pub(crate) fn array_helper(&mut self, element: TypeId) -> Result<Option<TypeId>, VmError> {
+        let Some(row) = self.find_type_def(CORELIB, "System", "SZArrayHelper`1")? else {
+            return Ok(None);
+        };
+        self.load_def(CORELIB, row, Rc::from([element])).map(Some)
     }
 
     fn push_type(&mut self, t: Type) -> Result<TypeId, VmError> {

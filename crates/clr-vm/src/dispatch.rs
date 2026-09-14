@@ -222,6 +222,13 @@ impl<'a, H: Host> Vm<'a, H> {
 
 
     fn interface_impl(&mut self, ty: TypeId, method: MethodId) -> Result<MethodId, VmError> {
+        // Массив реализует интерфейсы коллекций методами `SZArrayHelper<T>`,
+        // которые получают сам массив в `this` (как в CoreCLR).
+        if let Kind::Array(element) = self.types[ty.0 as usize].kind {
+            if let Some(helper) = self.array_helper(element)? {
+                return self.interface_impl(helper, method);
+            }
+        }
         let (iasm, name, blob, interface, margs, has_body) = {
             let info = &self.methods[method.0 as usize];
             (info.asm, info.name, info.sig, info.owner, Rc::clone(&info.margs), info.rva != 0)

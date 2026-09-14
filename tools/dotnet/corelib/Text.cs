@@ -257,6 +257,38 @@ namespace System
             return builder.ToString();
         }
 
+        public static string Join(string separator, Collections.Generic.IEnumerable<string> values)
+        {
+            var builder = new StringBuilder();
+            bool first = true;
+            foreach (string value in values)
+            {
+                if (!first)
+                {
+                    builder.Append(separator);
+                }
+                builder.Append(value);
+                first = false;
+            }
+            return builder.ToString();
+        }
+
+        public static string Join<T>(string separator, Collections.Generic.IEnumerable<T> values)
+        {
+            var builder = new StringBuilder();
+            bool first = true;
+            foreach (T value in values)
+            {
+                if (!first)
+                {
+                    builder.Append(separator);
+                }
+                builder.Append(value?.ToString());
+                first = false;
+            }
+            return builder.ToString();
+        }
+
         public static string Format(string format, object arg0) => FormatCore(format, new[] { arg0 });
 
         public static string Format(string format, object arg0, object arg1) => FormatCore(format, new[] { arg0, arg1 });

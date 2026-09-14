@@ -19,6 +19,10 @@ namespace System
 
     public delegate TResult Func<in T1, in T2, out TResult>(T1 arg1, T2 arg2);
 
+    public delegate bool Predicate<in T>(T obj);
+
+    public delegate int Comparison<in T>(T x, T y);
+
     public delegate void EventHandler(object sender, EventArgs e);
 
     public delegate void EventHandler<TEventArgs>(object sender, TEventArgs e);

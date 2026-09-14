@@ -53,6 +53,64 @@ namespace System
             [MethodImpl(MethodImplOptions.InternalCall)]
             get;
         }
+
+        public static void Sort<T>(T[] array)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if (array.Length > 1)
+            {
+                Collections.Generic.ArraySortHelper<T>.Sort(array, 0, array.Length, null);
+            }
+        }
+
+        public static void Sort<T>(T[] array, Comparison<T> comparison) =>
+            Collections.Generic.ArraySortHelper<T>.Sort(array, 0, array.Length, new Collections.Generic.ComparisonComparer<T>(comparison));
+
+        public static int IndexOf<T>(T[] array, T value)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            Collections.Generic.EqualityComparer<T> comparer = Collections.Generic.EqualityComparer<T>.Default;
+            for (int i = 0; i < array.Length; i++)
+            {
+                if (comparer.Equals(array[i], value))
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        public static void Reverse<T>(T[] array)
+        {
+            for (int i = 0, j = array.Length - 1; i < j; i++, j--)
+            {
+                T item = array[i];
+                array[i] = array[j];
+                array[j] = item;
+            }
+        }
+
+        public static T[] Empty<T>() => new T[0];
+
+        public static void Resize<T>(ref T[] array, int newSize)
+        {
+            T[] resized = new T[newSize];
+            if (array != null)
+            {
+                int length = array.Length < newSize ? array.Length : newSize;
+                for (int i = 0; i < length; i++)
+                {
+                    resized[i] = array[i];
+                }
+            }
+            array = resized;
+        }
     }
 
     public abstract class Delegate
