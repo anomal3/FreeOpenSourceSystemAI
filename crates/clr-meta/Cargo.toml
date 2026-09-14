@@ -1,0 +1,16 @@
+[package]
+name = "clr-meta"
+description = "Reading .NET assemblies: PE/COFF, the CLI header, ECMA-335 metadata tables and heaps, IL method bodies - the first layer of the own .NET runtime (milestone v0.7c)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Зависимостей нет намеренно: формат описан в ECMA-335 целиком, и его разбор —
+# это сотни строк таблиц, а не криптография, которую своей писать нельзя.
+# Проверяется он не нашими же тестами, а чужим читателем того же формата —
+# `System.Reflection.Metadata` от Microsoft (`cargo xtask clr-check`).
+
+[lints]
+workspace = true

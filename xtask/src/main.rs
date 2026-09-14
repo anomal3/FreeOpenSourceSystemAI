@@ -15,6 +15,7 @@ mod arch;
 mod btrfsfix;
 mod build;
 mod cbuild;
+mod clrcheck;
 mod diskfile;
 mod firmware;
 mod harness;
@@ -112,6 +113,9 @@ enum Command {
     /// С `--image` — вместо кругов диск, оставленный сценарием `btrfs-write`:
     /// то, что записало ядро FreeOS, сверяет Linux.
     BtrfsLinuxCheck(BtrfsLinuxCheckArgs),
+    /// Сверить наш разбор сборок .NET (крейт clr-meta) с System.Reflection.Metadata:
+    /// пробные программы, CoreLib и WinForms установленного .NET (фаза N1).
+    ClrCheck,
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
@@ -703,6 +707,8 @@ fn real_main() -> Result<()> {
             Some(image) => btrfsfix::scenario_check(&image)?,
             None => btrfsfix::linux_check()?,
         },
+
+        Command::ClrCheck => clrcheck::check()?,
 
         Command::Check(args) => {
             let arches: Vec<Arch> = match args.arch {

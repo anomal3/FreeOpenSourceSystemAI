@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Чужой читатель сборок для фазы N1 (веха v0.7c). Печатает те же факты, что
+    `cargo xtask clr-check` печатает нашим разбором, но читает их
+    System.Reflection.Metadata от Microsoft. net8.0 — чтобы запускаться на
+    любом установленном .NET начиная с LTS, а не только на новейшем.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <RollForward>LatestMajor</RollForward>
+  </PropertyGroup>
+
+</Project>

@@ -71,6 +71,10 @@ user-abi = { path = "../crates/user-abi" }
 # неправы.
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rcgen = "0.13"
+# Разбор сборок .NET — тот же крейт, на котором стоит своя среда (веха v0.7c).
+# Здесь он печатает сборку для сверки с System.Reflection.Metadata
+# (`cargo xtask clr-check`): проверяет его чужой читатель, а не он сам себя.
+clr-meta = { path = "../crates/clr-meta" }
 
 [lints]
 workspace = true
