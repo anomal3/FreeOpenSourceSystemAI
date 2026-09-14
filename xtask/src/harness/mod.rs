@@ -780,6 +780,17 @@ fn execute(
         data_disk.as_deref(),
     );
 
+    // Провал, а гость ещё жив, — снять, где стоят процессоры. Журнал серийной
+    // линии у зависшей машины просто обрывается, и по нему «встала намертво»
+    // не отличить от «ждёт замок» или «крутится в цикле». Три снимка через
+    // паузу отвечают на это сразу: RIP стоит на месте — ждём; прыгает внутри
+    // одной функции — крутимся; IF снят — прерывания запрещены. Куплено
+    // зависанием `settings` на x86_64, которое два сеанса искали по коду.
+    let freeze = match (&result, child.try_wait()) {
+        (Err(_), Ok(None)) => Some(freeze_report(&mut hmp)),
+        _ => None,
+    };
+
     // Обычно гость машину не выключает: `arch::halt()` — это остановка
     // процессора, а не снятие питания, и процесс приходится снимать. С фазы 27
     // есть и второй случай — сценарий, в котором гость гаснет сам; там к этому
@@ -787,7 +798,10 @@ fn execute(
     // надо всё равно: провалившийся сценарий иначе оставил бы висеть QEMU.
     child.kill().ok();
     let output = child.wait_with_output().ok();
-    let text = line.finish();
+    let mut text = line.finish();
+    if let Some(freeze) = freeze {
+        text.push_str(&freeze);
+    }
 
     write_log(log_path, &text, output.as_ref());
     say!("журнал: {}", log_path.display());
@@ -2123,6 +2137,26 @@ fn with_qemu_output(mut child: Child, err: anyhow::Error) -> anyhow::Error {
         return err;
     }
     err.context(text)
+}
+
+/// Состояние процессоров провалившегося гостя — текстом для журнала.
+///
+/// Ошибки монитора не прерывают отчёт: он пишется о машине, которая уже
+/// провалилась, и половина снимка лучше, чем ни одного.
+fn freeze_report(hmp: &mut monitor::Monitor) -> String {
+    let mut report = String::from("\n=== процессоры в момент провала ===\n");
+    for round in 1..=3 {
+        for command in ["info cpus", "info registers -a", "x/12i $pc"] {
+            report.push_str(&format!("--- снимок {round}: {command}\n"));
+            match hmp.command(command) {
+                Ok(answer) => report.push_str(&answer),
+                Err(err) => report.push_str(&format!("(монитор не ответил: {err:#})")),
+            }
+            report.push('\n');
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    report
 }
 
 fn write_log(path: &std::path::Path, serial: &str, output: Option<&std::process::Output>) {

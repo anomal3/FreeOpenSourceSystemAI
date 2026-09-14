@@ -119,6 +119,11 @@ pub struct Compositor {
     damage_overflow: bool,
     frames: u64,
     rects: u64,
+    /// Кадр не собирать: за этим событием в очереди ввода уже лежит следующее.
+    ///
+    /// Изменения при этом не теряются — они копятся в прямоугольниках окон и в
+    /// [`Self::damage`] и уходят на экран ближайшим несложенным кадром.
+    deferred: bool,
 }
 
 /// Сколько памяти отдаётся под полосу, в которой собирается кадр.
@@ -166,6 +171,7 @@ impl Compositor {
             damage_overflow: true,
             frames: 0,
             rects: 0,
+            deferred: false,
         };
         compositor.panel = Panel::new(
             compositor.screen.width(),
@@ -991,8 +997,16 @@ impl Compositor {
         }
     }
 
+    /// Откладывать ли сборку кадров — см. [`Self::deferred`].
+    pub fn set_deferred(&mut self, deferred: bool) {
+        self.deferred = deferred;
+    }
+
     /// Собрать кадр: вывести на экран всё, что изменилось.
     pub fn present(&mut self) {
+        if self.deferred {
+            return;
+        }
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
             return;

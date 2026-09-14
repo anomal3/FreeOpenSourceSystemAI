@@ -535,8 +535,30 @@ pub fn tick() {
 #[must_use]
 pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
     let status = status_now();
+    // Следующее событие уже в очереди — кадр под это собирать незачем: его
+    // никто не увидит, следующий всё равно соберётся поверх. Без этого каждое
+    // нажатие в «Параметрах» стоило полной сборки окна 1120×588 вместе с
+    // обоями под ним, в отладочной сборке дольше, чем стенд ждёт между
+    // клавишами. Очередь росла, «Применить» доезжало через полминуты, и на
+    // x86_64 сценарий `settings` выглядел зависшим — снимок регистров показал
+    // процессор в `draw_background` при включённых прерываниях.
+    //
+    // Последнее событие очереди кадр собирает само, даже если ничего не
+    // нарисовало: отложенное предыдущими иначе ждало бы полсекунды до
+    // [`tick`]. Так бывает всякий раз — за нажатием едет его отпускание, а
+    // отпускание окна не перерисовывает.
+    let defer = crate::input::has_events();
     for attempt in 0..INPUT_TRIES {
-        if let Some(answer) = with_desktop(|desktop| dispatch_on(desktop, event, &status)) {
+        let answer = with_desktop(|desktop| {
+            desktop.set_deferred(defer);
+            let answer = dispatch_on(desktop, event, &status);
+            desktop.set_deferred(false);
+            if !defer {
+                desktop.present();
+            }
+            answer
+        });
+        if let Some(answer) = answer {
             return answer;
         }
         // Графики нет вовсе — ждать нечего, событие идёт прямо в оболочку, как
