@@ -347,6 +347,13 @@ pub fn tasks(buffer: &mut [u8]) -> i64 {
     unsafe { syscall(user_abi::SYS_TASKS, buffer.as_mut_ptr() as usize, buffer.len(), 0) }
 }
 
+/// Устройства текстом: по строке на устройство, поля через табуляцию. См.
+/// [`user_abi::SYS_DEVICES`].
+pub fn devices(buffer: &mut [u8]) -> i64 {
+    // SAFETY: буфер — живой срез программы, длина его собственная.
+    unsafe { syscall(user_abi::SYS_DEVICES, buffer.as_mut_ptr() as usize, buffer.len(), 0) }
+}
+
 /// Попросить задачу остановиться. См. [`user_abi::SYS_KILL`].
 pub fn kill(id: u32) -> i64 {
     // SAFETY: аргумент — число.

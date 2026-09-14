@@ -660,7 +660,7 @@ struct Program {
     icon: Icon,
 }
 
-static PROGRAMS: [Program; 2] = [
+static PROGRAMS: [Program; 3] = [
     Program {
         file: "files",
         caption: "Файлы",
@@ -675,6 +675,13 @@ static PROGRAMS: [Program; 2] = [
         caption: "Диспетчер задач",
         about: "процессы, память и службы",
         icon: Icon::Chart,
+    },
+    // Диспетчер устройств (фаза С7): что стоит в машине и чем обслуживается.
+    Program {
+        file: "devmgr",
+        caption: "Диспетчер устройств",
+        about: "устройства и их драйверы",
+        icon: Icon::Devices,
     },
 ];
 

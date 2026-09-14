@@ -44,6 +44,7 @@ mod arch;
 mod block;
 mod config;
 mod console;
+mod devices;
 mod display;
 mod fs;
 mod input;
@@ -800,6 +801,7 @@ fn mount_disk_root(info: &BootInfo) {
         return;
     }
     for found in &disks {
+        devices::remember_disk(found.kind.name(), found.unit, found.sectors());
         kprintln!(
             "  disk        : {} #{}, {} sectors ({} MiB)",
             found.kind.name(),

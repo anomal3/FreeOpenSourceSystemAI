@@ -268,7 +268,7 @@ pub unsafe fn probe(root: &pci::Root) -> Vec<AhciDisk> {
 
     // SAFETY: контракт функции.
     match unsafe { attach(&device, &mut disks) } {
-        Ok(()) => {}
+        Ok(()) => crate::devices::claim(device.address, "ahci"),
         Err(err) => kprintln!("  ahci        : controller found but unusable: {err}"),
     }
     disks

@@ -115,6 +115,7 @@ pub fn set_mode(current: &Framebuffer, width: u32, height: u32) -> Result<Frameb
     if (got_w, got_h) != (w, h) {
         return Err(DisplayError::Refused("the adapter kept another mode"));
     }
+    crate::devices::claim(device.address, "bochs vbe");
 
     Ok(Framebuffer {
         base: virt.as_usize() as u64,

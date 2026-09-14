@@ -121,7 +121,9 @@ impl VirtioNet {
         .ok_or(VirtioError::NoCapabilities)?;
 
         // SAFETY: контракт функции.
-        unsafe { Self::attach(&device) }
+        let card = unsafe { Self::attach(&device) }?;
+        crate::devices::claim(device.address, "virtio-net");
+        Ok(card)
     }
 
     /// Подготовить найденное устройство.

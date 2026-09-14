@@ -274,6 +274,8 @@ const PROGRAMS: [(&CStr16, &str); 34] = [
     (cstr16!("\\FREEOS\\BIN\\SYSMON"), "sysmon"),
     // Диспетчер задач (фаза С5) — тот, что в меню запуска и в трее.
     (cstr16!("\\FREEOS\\BIN\\TASKMGR"), "taskmgr"),
+    // Диспетчер устройств (фаза С7).
+    (cstr16!("\\FREEOS\\BIN\\DEVMGR"), "devmgr"),
     (cstr16!("\\FREEOS\\BIN\\WINSHOW"), "winshow"),
     (cstr16!("\\FREEOS\\BIN\\POSIX"), "posix"),
     // Чужая библиотека, собранная нашим набором (фаза 46).

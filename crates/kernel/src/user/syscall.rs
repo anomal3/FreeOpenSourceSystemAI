@@ -50,7 +50,7 @@ use mini_ui::Rect;
 use user_abi::{
     MAX_TITLE, SYS_WINCLOSE, SYS_WINCOMMIT, SYS_WINEVENT, SYS_WINOPEN, WinEvent, WindowSpec,
 };
-use user_abi::{SYSINFO_DARK, SYS_KILL, SYS_MOUNTS, SYS_SYSINFO, SYS_TASKS, SysInfo};
+use user_abi::{SYSINFO_DARK, SYS_DEVICES, SYS_KILL, SYS_MOUNTS, SYS_SYSINFO, SYS_TASKS, SysInfo};
 use user_abi::{
     ERR_BAD_SOCKET, ERR_NO_NETWORK, NetConfig, NetInfo, Peer, SOCK_TCP, SOCK_UDP, STREAM_FIRST,
     StreamState, SYS_ACCEPT, SYS_BIND, SYS_CLOSE_SOCKET, SYS_CONNECT, SYS_LISTEN, SYS_NETCONF,
@@ -182,6 +182,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         // Фаза С5: диспетчер задач.
         SYS_TASKS => tasks(a0, a1),
         SYS_KILL => kill(a0),
+        // Фаза С7: диспетчер устройств.
+        SYS_DEVICES => devices(a0, a1),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1543,6 +1545,32 @@ fn tasks(ptr: usize, len: usize) -> i64 {
                 task.cpu_ms
             ),
         };
+        let bytes = line.as_bytes();
+        if written + bytes.len() > len {
+            break;
+        }
+        out[written..written + bytes.len()].copy_from_slice(bytes);
+        written += bytes.len();
+    }
+    written as i64
+}
+
+/// `devices(ptr, len)`: перепись устройств текстом — см. договор у
+/// [`SYS_DEVICES`].
+fn devices(ptr: usize, len: usize) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    if !space::user_can(ptr, len, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    // Перепись собирается до того, как тронута память программы: обход шины и
+    // сводки драйверов берут свои замки, а копирование — нет.
+    let report = crate::devices::report();
+    // SAFETY: как у `mounts`: диапазон проверен по таблицам программы.
+    let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+    let mut written = 0usize;
+    for line in report.split_inclusive('\n') {
         let bytes = line.as_bytes();
         if written + bytes.len() > len {
             break;

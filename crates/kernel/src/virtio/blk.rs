@@ -139,7 +139,10 @@ impl VirtioBlk {
         for device in devices {
             // SAFETY: контракт функции.
             match unsafe { Self::attach(&device) } {
-                Ok(disk) => found.push(disk),
+                Ok(disk) => {
+                    crate::devices::claim(device.address, "virtio-blk");
+                    found.push(disk);
+                }
                 Err(err) => {
                     kprintln!("  disk        : virtio-blk at {} unusable: {err}", device.address);
                 }

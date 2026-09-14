@@ -251,6 +251,7 @@ pub unsafe fn probe(root: &pci::Root) -> Vec<Nvme> {
     // SAFETY: контракт функции.
     match unsafe { Nvme::attach(&device) } {
         Ok(disk) => {
+            crate::devices::claim(device.address, "nvme");
             kprintln!(
                 "  nvme        : {} blocks of {} B ({} MiB)",
                 disk.blocks,

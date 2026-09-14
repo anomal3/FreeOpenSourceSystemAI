@@ -879,7 +879,7 @@ pub const ALL: &[Scenario] = &[
             // экрана не зависит и меняется только вместе с `USER_PROGRAMS` в
             // `build.rs`. Тридцать две с фазы 46; `zdemo` собирается только там,
             // где выполнена `cargo xtask thirdparty`, и без неё здесь будет 31.
-            Step::Expect("/bin holds 33 programs"),
+            Step::Expect("/bin holds 34 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -933,12 +933,12 @@ pub const ALL: &[Scenario] = &[
             // выключение, а вопрос: подтверждение сделано обычным окном, потому
             // что человек уже знает, как закрываются окна.
             //
-            // Пункт **шестой**: с фазы С3 перед питанием стоят «Файлы» и
-            // «Системный монитор» — программы с окнами, которые меню берёт из
-            // `/bin`.
+            // Пункт **седьмой**: перед питанием стоят программы с окнами из
+            // `/bin` — «Файлы», «Диспетчер задач» и с фазы С7 «Диспетчер
+            // устройств».
             Step::Key("f1"),
             Step::Await("desktop     : menu opened", 15_000),
-            Step::Repeat("down", 5),
+            Step::Repeat("down", 6),
             Step::Key("ret"),
             Step::Await("desktop     : opened 'Shut down'", 15_000),
             Step::Wait(2_500),
@@ -953,10 +953,10 @@ pub const ALL: &[Scenario] = &[
             // ни ждать прерывание нельзя, поэтому окно только поднимает
             // просьбу — а гасит систему служебная задача.
             //
-            // Пункт тот же шестой, что и выше.
+            // Пункт тот же седьмой, что и выше.
             Step::Key("f1"),
             Step::Await("desktop     : menu opened", 15_000),
-            Step::Repeat("down", 5),
+            Step::Repeat("down", 6),
             Step::Key("ret"),
             Step::Await("desktop     : opened 'Shut down'", 15_000),
             Step::Key("y"),
@@ -993,32 +993,35 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("desktop     : opened 'Settings'", 15_000),
 
-            // Окно открывается на «Экране»; Enter переводит клавиши к пунктам,
-            // первый из них — 1024×768. На x86 он меньше режима прошивки
-            // (1280×720 у OVMF), на AArch64 больше (800×600 у ramfb): так один
-            // сценарий проверяет оба направления — сжатие окон и растяжение
-            // стола.
+            // Окно открывается на «Экране»; Enter переводит клавиши к пунктам.
+            // Режимы выбраны так, чтобы **каждая** смена меняла размер на обеих
+            // архитектурах. Загрузчик ставит 1280×720 на x86 и 1024×768 на
+            // AArch64 — первая версия сценария начинала с 1024×768 и на AArch64
+            // переключала экран в тот же размер, то есть проверка размера кадра
+            // там ничего не доказывала. Поэтому сначала 1280×800 (третий пункт)
+            // — больше обоих, потом 1024×768 (первый) — сжатие окон на обеих.
             Step::Key("ret"),
+            Step::Repeat("down", 2),
             Step::Key("ret"),
-            Step::Await("display     : 1024x768 set now", 30_000),
-            Step::Await("desktop     : 1024x768, ui scale", 30_000),
+            Step::Await("display     : 1280x800 set now", 30_000),
+            Step::Await("desktop     : 1280x800, ui scale", 30_000),
             // Главное доказательство — от QEMU: кадр, который отдаёт устройство,
             // стал этого размера. Строки гостя выше говорят только о том, что
             // гость так думает.
+            Step::Screen(1280, 800),
+            Step::Wait(3_000),
+            Step::Shot("01-1280x800"),
+
+            // Вторая смена проверяет то, чего не проверяет первая: адаптер
+            // переключается из режима, который задали мы, а не прошивка, и на
+            // AArch64 прежний буфер — уже наш и возвращается в пул.
+            Step::Repeat("up", 2),
+            Step::Key("ret"),
+            Step::Await("display     : 1024x768 set now", 30_000),
+            Step::Await("desktop     : 1024x768, ui scale", 30_000),
             Step::Screen(1024, 768),
             Step::Wait(3_000),
-            Step::Shot("01-1024x768"),
-
-            // Второй режим — следующий пункт. Повторная смена проверяет то, чего
-            // не проверяет первая: адаптер переключается из режима, который
-            // задали мы, а не прошивка, и на AArch64 прежний буфер — уже наш.
-            Step::Key("down"),
-            Step::Key("ret"),
-            Step::Await("display     : 1280x720 set now", 30_000),
-            Step::Await("desktop     : 1280x720, ui scale", 30_000),
-            Step::Screen(1280, 720),
-            Step::Wait(3_000),
-            Step::Shot("02-1280x720"),
+            Step::Shot("02-1024x768"),
 
             // Мышь на новом экране. Указатель после смены встаёт в середину,
             // поэтому сначала — в угол, до упора; дальше стенд целится по
@@ -5515,6 +5518,54 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "devices",
+        about: "Диспетчер устройств: перепись PCI, USB и дисков из ядра, драйвер и состояние у каждого.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Та же причина, что у `taskmgr`: строка, набранная под шум трёх
+            // падений `sshd`, теряется.
+            Step::Await("init: 'sshd' failed 3 time(s) in a row, giving up", 60_000),
+            Step::Wait(1_000),
+            Step::Line("run -b /bin/devmgr"),
+            Step::Await("window      : 'Device Manager' at", 30_000),
+            // Перепись — строками журнала, по одной на устройство. Проверяется
+            // то, что есть на обеих архитектурах: контроллер xHCI с клавиатурой
+            // на нём и диск virtio-blk, с которого система запущена. Каждое —
+            // вместе с драйвером и состоянием: «найдено» без «чем обслуживается»
+            // — это не то, ради чего окно.
+            Step::AwaitAny("usb controller (xhci): xhci active", 15_000),
+            Step::AwaitAny(" keyboard: xhci active", 15_000),
+            Step::AwaitAny("devmgr: disk virtio-blk #0 ", 15_000),
+            Step::AwaitAny(" disk(s); ", 15_000),
+            Step::Wait(2_000),
+            Step::Shot("01-devices"),
+            // Окно в фокусе после запуска: стрелка выбирает следующее устройство.
+            Step::Key("down"),
+            Step::Await("devmgr: selected ", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("02-selected"),
+            Step::Aim(Aim::Close("Device Manager")),
+            Step::Click,
+            Step::Await("devmgr: closing on request", 15_000),
+        ],
+    },
+    Scenario {
         name: "taskmgr",
         about: "Диспетчер задач: список задач из ядра, снятие задачи, расположение файла, меню, вкладки, запуск из трея.",
         target: Target::Live,
@@ -5572,7 +5623,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("home"),
             Step::Key("ret"),
             Step::Await("taskmgr: opened location /bin for #", 15_000),
-            Step::Await("files: /bin has 34 entries", 30_000),
+            Step::Await("files: /bin has 35 entries", 30_000),
             Step::Wait(1_500),
             Step::Shot("03-location"),
             Step::Aim(Aim::Close("Files")),

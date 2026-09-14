@@ -992,6 +992,25 @@ pub const SYS_TASKS: usize = 59;
 /// [`ERR_NOT_FOUND`].
 pub const SYS_KILL: usize = 60;
 
+/// Устройства. `(ptr, len) -> сколько байт записано`.
+///
+/// По строке на устройство, поля через табуляцию:
+/// `<шина>\t<место>\t<идентификатор>\t<что>\t<драйвер>\t<состояние>`.
+///
+/// * шина — `pci`, `usb` или `disk`;
+/// * место — адрес функции `0000:00:02.0`, `port 5` или `virtio-blk #0`;
+/// * идентификатор — `vendor:device` шестнадцатерично, у диска — размер в МиБ;
+/// * что — класс словами по-английски (`usb controller (xhci)`, `keyboard`),
+///   переводит программа;
+/// * драйвер — имя драйвера ядра или `-`;
+/// * состояние — `active` (поднят), `idle` (драйвер есть, но этим устройством
+///   не занят), `none` (драйвера нет), `not-needed` (мосты: их настраивает
+///   прошивка).
+///
+/// Не поместившееся отбрасывается по границе строки, как у [`SYS_MOUNTS`].
+/// Появился ради диспетчера устройств (фаза С7).
+pub const SYS_DEVICES: usize = 61;
+
 /// Счётчики системы — ответ [`SYS_SYSINFO`].
 ///
 /// Все размеры в **байтах**, всё время в **миллисекундах**: единица, о которой
@@ -1676,6 +1695,8 @@ mod tests {
         // Фаза С5 — диспетчер задач.
         assert_eq!(SYS_TASKS, 59);
         assert_eq!(SYS_KILL, 60);
+        // Фаза С7 — диспетчер устройств.
+        assert_eq!(SYS_DEVICES, 61);
     }
 
     /// Ни один номер не выдан дважды.
@@ -1696,6 +1717,7 @@ mod tests {
             SYS_MMAP, SYS_MUNMAP, SYS_MMAP_FILE, SYS_GETCPU, SYS_DUP, SYS_FSTAT, SYS_ISATTY,
             SYS_CLOCK, SYS_NANOSLEEP, SYS_POLL, SYS_TIMES, SYS_WINOPEN, SYS_WINCOMMIT,
             SYS_WINEVENT, SYS_WINCLOSE, SYS_SYSINFO, SYS_MOUNTS, SYS_TASKS, SYS_KILL,
+            SYS_DEVICES,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(
