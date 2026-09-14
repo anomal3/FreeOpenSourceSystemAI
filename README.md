@@ -210,4 +210,6 @@ on — a claim checked rather than asserted, because the same code drives the ke
 
 ## Licence
 
+Copyright (C) 2026 Виталий Ардашов ([gerzoid](https://github.com/gerzoid)), Роман Кощеев ([anomal3](https://github.com/anomal3)).
+
 Distributed under the GNU General Public License v3 — see [LICENSE](LICENSE).

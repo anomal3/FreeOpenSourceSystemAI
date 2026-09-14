@@ -1,4 +1,5 @@
-﻿// Этот файл является частью FreeOpenSourceSystemAI.
+﻿// Copyright (C) 2026 Виталий Ардашов, Роман Кощеев
+// Этот файл является частью FreeOpenSourceSystemAI.
 // Программа распространяется на условиях GNU General Public License v3.
 
 //! Ядро FreeOS: приём управления от UEFI-загрузчика и запуск подсистем.

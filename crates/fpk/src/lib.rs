@@ -1,3 +1,4 @@
+// Copyright (C) 2026 Виталий Ардашов, Роман Кощеев
 // Этот файл является частью FreeOpenSourceSystemAI.
 // Программа распространяется на условиях GNU General Public License v3.
 
