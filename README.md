@@ -170,7 +170,9 @@ waiting to go wrong in it is in **[ROADMAP.md](ROADMAP.md)**.
 | **v0.6** | Windows belong to programs; settings that persist; a layout a Windows user recognises | **done** |
 | **v0.7** | btrfs: a volume made by `mkfs.btrfs` mounts at `/data` and reads, with crc32c checked on **every** data sector; `fsck` walks the whole volume; our own `mkfs` and writer create, overwrite, truncate, delete and rename files in a way `btrfs check` and the Linux kernel accept; the kernel writes to `/data`, and Linux reads back what it wrote | done; the state partition stays on ext2 until `/data` has been lived with |
 | **v0.7b** | A desktop a Windows user does not have to get used to: dialogs with buttons instead of `Y`/`N`, a start menu of applications rather than of `/bin`, a tray with the input language, network and clock, RU/EN keyboard layouts switched with Alt+Shift or Win+Space, a file manager that opens on a double click and has a context menu, a task manager that can end a task | done: С1–С9; the resolution changes without a reboot, a device manager shows what drives each device, window programs share one set of elements, `mc` looks and works like Far — blue panels, dialogs, a viewer and an editor |
+| **v0.7c** | C# programs and WinForms: a `.dll` built with `dotnet build` on Windows runs here unchanged, on an own .NET runtime — an IL interpreter, a precise garbage collector, an own base library and an own `System.Windows.Forms` over FreeOS windows | next |
 | then | A Raspberry Pi 4 — the first machine that is not an emulator | planned |
+| **v0.9** | Mono beside the own runtime: kernel threads, TLS, signals and `mprotect`, pthreads, cairo and libgdiplus, then Mono and its WinForms with a FreeOS window driver | planned |
 
 ---
 
