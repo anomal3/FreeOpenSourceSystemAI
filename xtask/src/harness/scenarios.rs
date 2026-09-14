@@ -3222,6 +3222,19 @@ pub const ALL: &[Scenario] = &[
             // файле: подстрока «0 collection(s)» совпала бы и с «10», и с
             // законным нулём у `hello` выше.
             Step::Await("dotnet: gc.dll: Main returned 6", 60_000),
+            Step::Await("freeos> ", 15_000),
+            // Фаза N4a: строки, форматирование, разбор, StringBuilder, Math.
+            Step::Line("dotnet /usr/share/dotnet/samples/text.dll"),
+            Step::Await("text: start", 60_000),
+            Step::Await("HELLO, FREEOS WORLD hello, freeos world ПРИВЕТ, МИР", 60_000),
+            Step::Await("4 [a|b||c] abc", 60_000),
+            Step::Await("2 + 3 = 5 [   7|8   ]", 60_000),
+            Step::Await("   42|-7  |FF|00ff|003|-0012|-2147483648|18446744073709551615", 60_000),
+            Step::Await(">>Y=10,True -3 14 =", 60_000),
+            Step::Await("format: The input string 'x' was not in a correct format.", 60_000),
+            Step::Await("True True Ж 65 True True", 60_000),
+            Step::Await("text: done", 60_000),
+            Step::Await("dotnet: text.dll: Main returned 77", 60_000),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),
         ],

@@ -88,7 +88,15 @@ namespace System.Runtime.CompilerServices
 
         public void AppendFormatted(object value) => text = string.Concat(text, value?.ToString());
 
-        public void AppendFormatted<T>(T value) => text = string.Concat(text, value?.ToString());
+        public void AppendFormatted<T>(T value) => text = string.Concat(text, string.FormatItem(value, null));
+
+        public void AppendFormatted<T>(T value, string format) => text = string.Concat(text, string.FormatItem(value, format));
+
+        public void AppendFormatted<T>(T value, int alignment) =>
+            text = string.Concat(text, string.Align(string.FormatItem(value, null), alignment));
+
+        public void AppendFormatted<T>(T value, int alignment, string format) =>
+            text = string.Concat(text, string.Align(string.FormatItem(value, format), alignment));
 
         public string ToStringAndClear()
         {

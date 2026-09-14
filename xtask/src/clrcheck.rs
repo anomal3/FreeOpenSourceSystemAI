@@ -35,8 +35,8 @@ use clr_meta::{Assembly, Coded, Token};
 ///
 /// `features` нужен ради таблиц метаданных, а не запуска: в нём P/Invoke,
 /// форматирование дробного числа и `Enum.ToString`, которых у среды ещё нет.
-const SAMPLES: [(&str, bool); 7] =
-    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("features", false)];
+const SAMPLES: [(&str, bool); 8] =
+    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("features", false)];
 
 /// Имя сборки базовой библиотеки своей среды (`tools/dotnet/corelib`).
 const CORELIB: &str = "FreeOs.CoreLib.dll";
@@ -141,7 +141,15 @@ pub fn check() -> Result<()> {
 
 /// Выполнить сборку настоящим dotnet.
 fn run_dotnet(dll: &Path) -> Result<(i32, String)> {
-    let output = Command::new("dotnet").arg(dll).output().context("run dotnet")?;
+    // Режим инвариантной глобализации: у FreeOS культур нет, и сравнивать надо
+    // с тем, что печатает .NET без них. Иначе на русской Windows эталон
+    // получал бы запятую в дробных числах, неразрывные пробелы в разрядах и
+    // культурное сравнение строк (фаза N4a).
+    let output = Command::new("dotnet")
+        .arg(dll)
+        .env("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1")
+        .output()
+        .context("run dotnet")?;
     let text = String::from_utf8(output.stdout).context("dotnet output is not UTF-8")?;
     // .NET на Windows переводит строку парой CR LF, своя среда — одним LF, как
     // принято на FreeOS. Это разница платформ, а не поведения программы.

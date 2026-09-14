@@ -5,7 +5,7 @@ using System.Text;
 
 namespace System
 {
-    public sealed class String : IComparable<string>
+    public sealed partial class String : IComparable<string>
     {
         public static readonly string Empty = "";
 

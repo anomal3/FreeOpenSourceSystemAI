@@ -120,7 +120,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -234,6 +234,42 @@ fn garbage_is_collected_and_the_living_survive() {
     assert_eq!(output, GC_OUTPUT);
     assert_eq!(code, 6);
     assert!(collections > 0, "the sample allocates ~70 MiB and never collected");
+}
+
+/// Образец `tools/dotnet/samples/text` (фаза N4a).
+const TEXT: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/text.dll");
+
+/// Что печатает `dotnet text.dll` в режиме инвариантной глобализации
+/// (записано 2026-09-14, .NET 10, LF). В `y  |` и `[   7|8   ]` пробелы —
+/// выравнивание, а не хвост строки.
+const TEXT_OUTPUT: &str = concat!(
+    "text: start\n",
+    "[Hello, FreeOS world] 19 21 21\n",
+    "HELLO, FREEOS WORLD hello, freeos world ПРИВЕТ, МИР\n",
+    "FreeOS world|Hello|7|4|15|-1\n",
+    "True True True False\n",
+    "4 [a|b||c] abc\n",
+    "aXYcaXYc heLLo ...x y  |\n",
+    "------ok 3 li__ne rve\n",
+    "True True -1 1\n",
+    "2 + 3 = 5 [   7|8   ]\n",
+    "   42|-7  |FF|00ff|003|-0012|-2147483648|18446744073709551615\n",
+    "000000FF 1000 -005 c8\n",
+    ">>Y=10,True -3 14 =\n",
+    "ok 2\n",
+    "-123 False 0 9000000000 True 77\n",
+    "format: The input string 'x' was not in a correct format.\n",
+    "7 -2 9 10 -1\n",
+    "True True Ж 65 True True\n",
+    "text: done\n",
+);
+
+#[test]
+fn text_prints_what_dotnet_prints() {
+    let (result, output) = run(TEXT);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, TEXT_OUTPUT);
+    assert_eq!(code, 77);
 }
 
 #[test]

@@ -265,7 +265,19 @@ impl<'a, H: Host> Vm<'a, H> {
             return Ok(());
         }
         if owner == self.corelib_type("System.String")? {
-            return Err(VmError::Unsupported { what: String::from("string constructors (phase N4)") });
+            // Строка неизменяема и собирается средой целиком: её конструктор —
+            // член в Rust, который сам возвращает готовый объект.
+            let Some(native) = self.methods[ctor.0 as usize].native else {
+                return Err(VmError::MissingMember {
+                    name: format!("{} (a string constructor the runtime does not provide)", self.method_name(ctor)),
+                });
+            };
+            let args = self.pop_args(params)?;
+            self.frames[top].pc = next;
+            if let Some(result) = natives::call(self, native, &args)? {
+                self.push(result)?;
+            }
+            return Ok(());
         }
         if self.is_delegate(owner)? {
             // Конструктор делегата — «runtime managed»: тела нет, объект
