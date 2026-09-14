@@ -77,6 +77,47 @@ pub(crate) enum Native {
     CharToUpper,
     CharToLower,
     IntegerToString(IntKind),
+    /// `ToString()` и `ToString(string)` у `double` (`false`) и `float` (`true`).
+    FloatToString(bool),
+    FloatTryParse,
+    DoubleToBits,
+    BitsToDouble,
+    SingleToBits,
+    BitsToSingle,
+    /// `Math` (`false`) или `MathF` (`true`) с одним аргументом.
+    Math(MathOp, bool),
+    /// `Math.Atan2`/`Math.Pow` и их `MathF`.
+    Math2(MathOp2, bool),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MathOp {
+    Sqrt,
+    Cbrt,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Exp,
+    Log,
+    Log10,
+    Log2,
+    Floor,
+    Ceiling,
+    Truncate,
+    Round,
+    Abs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MathOp2 {
+    Atan2,
+    Pow,
 }
 
 /// Какой целый примитив печатается по формату.
@@ -160,6 +201,50 @@ const TABLE: &[(&str, Native)] = &[
     ("System.UInt32::ToString(string)", Native::IntegerToString(IntKind::U32)),
     ("System.Int64::ToString(string)", Native::IntegerToString(IntKind::I64)),
     ("System.UInt64::ToString(string)", Native::IntegerToString(IntKind::U64)),
+    ("System.Double::ToString()", Native::FloatToString(false)),
+    ("System.Double::ToString(string)", Native::FloatToString(false)),
+    ("System.Single::ToString()", Native::FloatToString(true)),
+    ("System.Single::ToString(string)", Native::FloatToString(true)),
+    ("System.Double::TryParseFloat(string,bool,float64&)", Native::FloatTryParse),
+    ("System.BitConverter::DoubleToInt64Bits(float64)", Native::DoubleToBits),
+    ("System.BitConverter::Int64BitsToDouble(int64)", Native::BitsToDouble),
+    ("System.BitConverter::SingleToInt32Bits(float32)", Native::SingleToBits),
+    ("System.BitConverter::Int32BitsToSingle(int32)", Native::BitsToSingle),
+    ("System.Math::Sqrt(float64)", Native::Math(MathOp::Sqrt, false)),
+    ("System.Math::Cbrt(float64)", Native::Math(MathOp::Cbrt, false)),
+    ("System.Math::Sin(float64)", Native::Math(MathOp::Sin, false)),
+    ("System.Math::Cos(float64)", Native::Math(MathOp::Cos, false)),
+    ("System.Math::Tan(float64)", Native::Math(MathOp::Tan, false)),
+    ("System.Math::Asin(float64)", Native::Math(MathOp::Asin, false)),
+    ("System.Math::Acos(float64)", Native::Math(MathOp::Acos, false)),
+    ("System.Math::Atan(float64)", Native::Math(MathOp::Atan, false)),
+    ("System.Math::Sinh(float64)", Native::Math(MathOp::Sinh, false)),
+    ("System.Math::Cosh(float64)", Native::Math(MathOp::Cosh, false)),
+    ("System.Math::Tanh(float64)", Native::Math(MathOp::Tanh, false)),
+    ("System.Math::Exp(float64)", Native::Math(MathOp::Exp, false)),
+    ("System.Math::Log(float64)", Native::Math(MathOp::Log, false)),
+    ("System.Math::Log10(float64)", Native::Math(MathOp::Log10, false)),
+    ("System.Math::Log2(float64)", Native::Math(MathOp::Log2, false)),
+    ("System.Math::Floor(float64)", Native::Math(MathOp::Floor, false)),
+    ("System.Math::Ceiling(float64)", Native::Math(MathOp::Ceiling, false)),
+    ("System.Math::Truncate(float64)", Native::Math(MathOp::Truncate, false)),
+    ("System.Math::Round(float64)", Native::Math(MathOp::Round, false)),
+    ("System.Math::Abs(float64)", Native::Math(MathOp::Abs, false)),
+    ("System.Math::Abs(float32)", Native::Math(MathOp::Abs, true)),
+    ("System.Math::Atan2(float64,float64)", Native::Math2(MathOp2::Atan2, false)),
+    ("System.Math::Pow(float64,float64)", Native::Math2(MathOp2::Pow, false)),
+    ("System.MathF::Sqrt(float32)", Native::Math(MathOp::Sqrt, true)),
+    ("System.MathF::Sin(float32)", Native::Math(MathOp::Sin, true)),
+    ("System.MathF::Cos(float32)", Native::Math(MathOp::Cos, true)),
+    ("System.MathF::Tan(float32)", Native::Math(MathOp::Tan, true)),
+    ("System.MathF::Exp(float32)", Native::Math(MathOp::Exp, true)),
+    ("System.MathF::Log(float32)", Native::Math(MathOp::Log, true)),
+    ("System.MathF::Floor(float32)", Native::Math(MathOp::Floor, true)),
+    ("System.MathF::Ceiling(float32)", Native::Math(MathOp::Ceiling, true)),
+    ("System.MathF::Truncate(float32)", Native::Math(MathOp::Truncate, true)),
+    ("System.MathF::Round(float32)", Native::Math(MathOp::Round, true)),
+    ("System.MathF::Atan2(float32,float32)", Native::Math2(MathOp2::Atan2, true)),
+    ("System.MathF::Pow(float32,float32)", Native::Math2(MathOp2::Pow, true)),
 ];
 
 pub(crate) fn lookup(key: &str) -> Option<Native> {
@@ -462,18 +547,131 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
                 (IntKind::U64, Value::I64(x)) => (i128::from(x as u64), 64),
                 _ => return Err(vm.invalid("integer ToString on a value of another width")),
             };
-            let format = vm.string_units(arg(1)?)?;
-            match format_integer(value, bits, format.as_deref()) {
-                Ok(text) => Some(vm.new_string_from(&text)?),
-                Err(FormatFailure::Bad) => return Err(vm.exception("System.FormatException")),
-                Err(FormatFailure::Unsupported(spec)) => {
-                    return Err(VmError::Unsupported {
-                        what: format!("numeric format \"{spec}\" in {} (phase N4c)", vm.location()),
-                    });
-                }
-            }
+            let format = vm.string_units(arg(1)?)?.unwrap_or_default();
+            let printed = crate::number::format_integer(value, bits, &format);
+            formatted(vm, printed)?
+        }
+        Native::FloatToString(single) => {
+            let value = float(vm, number(vm)?)?;
+            // `ToString()` без формата — то же, что с пустым.
+            let format = match args.get(1) {
+                Some(&format) => vm.string_units(format)?.unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let printed = if single {
+                crate::number::format_single(value as f32, &format)
+            } else {
+                crate::number::format_double(value, &format)
+            };
+            formatted(vm, printed)?
+        }
+        Native::FloatTryParse => {
+            let text = vm.string_units(arg(0)?)?.unwrap_or_default();
+            let single = vm.int32(arg(1)?)? != 0;
+            let Value::Ptr(result) = arg(2)? else {
+                return Err(vm.invalid("out argument is not a pointer"));
+            };
+            let parsed = crate::number::parse_float(&text, single);
+            vm.store(result, Value::F(parsed.unwrap_or(0.0)))?;
+            Some(Value::I32(i32::from(parsed.is_some())))
+        }
+        Native::DoubleToBits => Some(Value::I64(float(vm, arg(0)?)?.to_bits() as i64)),
+        Native::BitsToDouble => Some(Value::F(f64::from_bits(vm.int64(arg(0)?)? as u64))),
+        Native::SingleToBits => Some(Value::I32((float(vm, arg(0)?)? as f32).to_bits() as i32)),
+        Native::BitsToSingle => Some(Value::F32(f32::from_bits(vm.int32(arg(0)?)? as u32))),
+        Native::Math(op, single) => {
+            let x = float(vm, arg(0)?)?;
+            Some(if single { Value::F32(math_f32(op, x as f32)) } else { Value::F(math_f64(op, x)) })
+        }
+        Native::Math2(op, single) => {
+            let (x, y) = (float(vm, arg(0)?)?, float(vm, arg(1)?)?);
+            Some(if single {
+                let (x, y) = (x as f32, y as f32);
+                Value::F32(match op {
+                    MathOp2::Atan2 => libm::atan2f(x, y),
+                    MathOp2::Pow => libm::powf(x, y),
+                })
+            } else {
+                Value::F(match op {
+                    MathOp2::Atan2 => libm::atan2(x, y),
+                    MathOp2::Pow => libm::pow(x, y),
+                })
+            })
         }
     })
+}
+
+/// Строка по формату или исключение, которое бросил бы .NET.
+fn formatted<H: Host>(
+    vm: &mut Vm<'_, H>,
+    printed: Result<Vec<u16>, crate::number::FormatError>,
+) -> Result<Option<Value>, VmError> {
+    match printed {
+        Ok(units) => string_value(vm, units),
+        Err(crate::number::FormatError::Bad) => Err(vm.exception("System.FormatException")),
+        Err(crate::number::FormatError::TooLong) => Err(VmError::OutOfMemory),
+    }
+}
+
+/// Дробное число любой точности как `f64` — `float32` расширяется без потерь.
+fn float<H: Host>(vm: &Vm<'_, H>, value: Value) -> Result<f64, VmError> {
+    match value {
+        Value::F(x) => Ok(x),
+        Value::F32(x) => Ok(f64::from(x)),
+        _ => Err(vm.invalid("expected a floating point number")),
+    }
+}
+
+/// Округление `Math.Round` — к ближайшему, половина к чётному (`roundeven`),
+/// а не `round` из C, у которого половина уходит от нуля.
+fn math_f64(op: MathOp, x: f64) -> f64 {
+    match op {
+        MathOp::Sqrt => libm::sqrt(x),
+        MathOp::Cbrt => libm::cbrt(x),
+        MathOp::Sin => libm::sin(x),
+        MathOp::Cos => libm::cos(x),
+        MathOp::Tan => libm::tan(x),
+        MathOp::Asin => libm::asin(x),
+        MathOp::Acos => libm::acos(x),
+        MathOp::Atan => libm::atan(x),
+        MathOp::Sinh => libm::sinh(x),
+        MathOp::Cosh => libm::cosh(x),
+        MathOp::Tanh => libm::tanh(x),
+        MathOp::Exp => libm::exp(x),
+        MathOp::Log => libm::log(x),
+        MathOp::Log10 => libm::log10(x),
+        MathOp::Log2 => libm::log2(x),
+        MathOp::Floor => libm::floor(x),
+        MathOp::Ceiling => libm::ceil(x),
+        MathOp::Truncate => libm::trunc(x),
+        MathOp::Round => libm::roundeven(x),
+        MathOp::Abs => libm::fabs(x),
+    }
+}
+
+fn math_f32(op: MathOp, x: f32) -> f32 {
+    match op {
+        MathOp::Sqrt => libm::sqrtf(x),
+        MathOp::Cbrt => libm::cbrtf(x),
+        MathOp::Sin => libm::sinf(x),
+        MathOp::Cos => libm::cosf(x),
+        MathOp::Tan => libm::tanf(x),
+        MathOp::Asin => libm::asinf(x),
+        MathOp::Acos => libm::acosf(x),
+        MathOp::Atan => libm::atanf(x),
+        MathOp::Sinh => libm::sinhf(x),
+        MathOp::Cosh => libm::coshf(x),
+        MathOp::Tanh => libm::tanhf(x),
+        MathOp::Exp => libm::expf(x),
+        MathOp::Log => libm::logf(x),
+        MathOp::Log10 => libm::log10f(x),
+        MathOp::Log2 => libm::log2f(x),
+        MathOp::Floor => libm::floorf(x),
+        MathOp::Ceiling => libm::ceilf(x),
+        MathOp::Truncate => libm::truncf(x),
+        MathOp::Round => libm::roundevenf(x),
+        MathOp::Abs => libm::fabsf(x),
+    }
 }
 
 fn text<H: Host>(vm: &mut Vm<'_, H>, text: alloc::string::String) -> Result<Option<Value>, VmError> {
@@ -572,43 +770,3 @@ fn is_decimal_digit(c: char) -> bool {
     })
 }
 
-enum FormatFailure {
-    /// Строка формата неверна — `FormatException`.
-    Bad,
-    /// Формат верный, но ещё не написан.
-    Unsupported(alloc::string::String),
-}
-
-/// Целое по стандартному формату .NET: пусто и `G` — десятичное, `Dn` —
-/// десятичное с нулями до `n` цифр, `Xn`/`xn` — шестнадцатеричное в
-/// дополнительном коде ширины типа (`-1` у `int` — `FFFFFFFF`).
-fn format_integer(value: i128, bits: u32, format: Option<&[u16]>) -> Result<alloc::string::String, FormatFailure> {
-    let spec: alloc::string::String =
-        char::decode_utf16(format.unwrap_or(&[]).iter().copied()).map(|c| c.unwrap_or('\u{FFFD}')).collect();
-    let mut chars = spec.chars();
-    let Some(letter) = chars.next() else {
-        return Ok(format!("{value}"));
-    };
-    let rest = chars.as_str();
-    if !letter.is_ascii_alphabetic() || !rest.bytes().all(|b| b.is_ascii_digit()) {
-        // Пользовательский формат (`0000`, `#,##0`) — фаза N4c.
-        return Err(FormatFailure::Unsupported(spec));
-    }
-    let precision: usize = if rest.is_empty() { 0 } else { rest.parse().map_err(|_| FormatFailure::Bad)? };
-    if precision > 999_999_999 {
-        return Err(FormatFailure::Bad);
-    }
-    match letter.to_ascii_uppercase() {
-        'G' if rest.is_empty() => Ok(format!("{value}")),
-        'D' => {
-            let digits = format!("{:0>precision$}", value.unsigned_abs());
-            Ok(if value < 0 { format!("-{digits}") } else { digits })
-        }
-        'X' => {
-            let bits_value = (value as u128) & ((1u128 << bits) - 1);
-            Ok(if letter == 'X' { format!("{bits_value:0>precision$X}") } else { format!("{bits_value:0>precision$x}") })
-        }
-        'C' | 'E' | 'F' | 'G' | 'N' | 'P' | 'R' => Err(FormatFailure::Unsupported(spec)),
-        _ => Err(FormatFailure::Bad),
-    }
-}

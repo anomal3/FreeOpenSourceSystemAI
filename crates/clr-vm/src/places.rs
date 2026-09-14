@@ -471,6 +471,8 @@ pub(crate) fn narrow_load(op: u8, value: Value) -> Value {
         (0x47, Value::I32(x)) => Value::I32(i32::from(x as u8)),
         (0x48, Value::I32(x)) => Value::I32(i32::from(x as i16)),
         (0x49, Value::I32(x)) => Value::I32(i32::from(x as u16)),
+        (0x4E, Value::F(x)) => Value::F32(x as f32),
+        (0x4F, Value::F32(x)) => Value::F(f64::from(x)),
         _ => value,
     }
 }
@@ -480,6 +482,8 @@ pub(crate) fn narrow_store(op: u8, value: Value) -> Value {
     match (op, value) {
         (0x52, Value::I32(x)) => Value::I32(i32::from(x as i8)),
         (0x53, Value::I32(x)) => Value::I32(i32::from(x as i16)),
+        (0x56, Value::F(x)) => Value::F32(x as f32),
+        (0x57, Value::F32(x)) => Value::F(f64::from(x)),
         _ => value,
     }
 }

@@ -33,10 +33,10 @@ use clr_meta::{Assembly, Coded, Token};
 
 /// Пробные программы, собираемые перед сверкой, и выполняет ли их своя среда.
 ///
-/// `features` нужен ради таблиц метаданных, а не запуска: в нём P/Invoke,
-/// форматирование дробного числа и `Enum.ToString`, которых у среды ещё нет.
-const SAMPLES: [(&str, bool); 9] =
-    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("features", false)];
+/// `features` нужен ради таблиц метаданных, а не запуска: в нём P/Invoke и
+/// `Enum.ToString`, которых у среды ещё нет.
+const SAMPLES: [(&str, bool); 10] =
+    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("floats", true), ("features", false)];
 
 /// Имя сборки базовой библиотеки своей среды (`tools/dotnet/corelib`).
 const CORELIB: &str = "FreeOs.CoreLib.dll";
@@ -100,6 +100,10 @@ pub fn check() -> Result<()> {
         bail!("{failed} of {} assemblies differ from System.Reflection.Metadata", assemblies.len());
     }
     println!("clr-check: all {} assemblies match System.Reflection.Metadata", assemblies.len());
+
+    // Фаза N4c: печать и разбор чисел — десятки тысяч случаев за секунды, без
+    // интерпретатора (см. `numcheck`).
+    crate::numcheck::check(&root, &out)?;
 
     // Фаза N2: те же программы — своей средой и настоящим dotnet. Совпасть
     // обязаны вывод до байта и код возврата.
@@ -206,7 +210,7 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
-fn dotnet_build(project: &Path, out: &Path) -> Result<()> {
+pub(crate) fn dotnet_build(project: &Path, out: &Path) -> Result<()> {
     let status = Command::new("dotnet")
         .args(["build", "-c", "Release", "--nologo", "-v", "quiet", "-o"])
         .arg(out)

@@ -205,14 +205,212 @@ namespace System
     {
     }
 
-    // Печать дробных чисел — кратчайшее представление, читаемое обратно в то же
-    // число, — фаза N4c. До неё `ToString` у них наследуется от ValueType и
-    // печатает имя типа; образцы дробные числа не печатают.
-    public struct Single
+    // Дробные числа (фаза N4c). Печать и разбор — в Rust (`clr_vm::number`):
+    // им нужны биты числа и длинная арифметика, а правила повторяют .NET до
+    // символа и сверяются с ним `clr-check`. Остальное — на C#: внутри
+    // структуры `this` и есть само число.
+    public struct Single : IComparable, IComparable<float>, IEquatable<float>, IFormattable
     {
+        public const float MinValue = -3.40282347E+38f;
+        public const float MaxValue = 3.40282347E+38f;
+        public const float Epsilon = 1.401298E-45f;
+        public const float PositiveInfinity = 1.0f / 0.0f;
+        public const float NegativeInfinity = -1.0f / 0.0f;
+        public const float NaN = 0.0f / 0.0f;
+        public const float NegativeZero = -0.0f;
+
+        public static bool IsNaN(float f) => f != f;
+
+        public static bool IsInfinity(float f) => f == PositiveInfinity || f == NegativeInfinity;
+
+        public static bool IsPositiveInfinity(float f) => f == PositiveInfinity;
+
+        public static bool IsNegativeInfinity(float f) => f == NegativeInfinity;
+
+        public static bool IsFinite(float f) => !IsNaN(f) && !IsInfinity(f);
+
+        public static bool IsNegative(float f) => BitConverter.SingleToInt32Bits(f) < 0;
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public override extern string ToString();
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public extern string ToString(string format);
+
+        public string ToString(IFormatProvider provider) => ToString();
+
+        public string ToString(string format, IFormatProvider provider) => ToString(format);
+
+        // NaN меньше любого числа и равен сам себе — порядок для сортировки, а
+        // не для `<`.
+        public int CompareTo(float value)
+        {
+            if (this < value)
+            {
+                return -1;
+            }
+            if (this > value)
+            {
+                return 1;
+            }
+            if (this == value)
+            {
+                return 0;
+            }
+            if (IsNaN(this))
+            {
+                return IsNaN(value) ? 0 : -1;
+            }
+            return 1;
+        }
+
+        public int CompareTo(object value)
+        {
+            if (value == null)
+            {
+                return 1;
+            }
+            if (value is float f)
+            {
+                return CompareTo(f);
+            }
+            throw new ArgumentException("Object must be of type Single.");
+        }
+
+        public bool Equals(float obj) => this == obj || (IsNaN(obj) && IsNaN(this));
+
+        public override bool Equals(object obj) => obj is float f && Equals(f);
+
+        // Все NaN и оба нуля — один хэш, как у .NET.
+        public override int GetHashCode()
+        {
+            int bits = BitConverter.SingleToInt32Bits(this);
+            if (IsNaN(this) || this == 0)
+            {
+                bits &= 0x7F800000;
+            }
+            return bits;
+        }
+
+        public static float Parse(string s) => (float)double.ParseFloat(s, true);
+
+        public static bool TryParse(string s, out float result)
+        {
+            bool parsed = double.TryParseFloat(s, true, out double value);
+            result = (float)value;
+            return parsed;
+        }
     }
 
-    public struct Double
+    public struct Double : IComparable, IComparable<double>, IEquatable<double>, IFormattable
     {
+        public const double MinValue = -1.7976931348623157E+308;
+        public const double MaxValue = 1.7976931348623157E+308;
+        public const double Epsilon = 4.9406564584124654E-324;
+        public const double NegativeInfinity = -1.0 / 0.0;
+        public const double PositiveInfinity = 1.0 / 0.0;
+        public const double NaN = 0.0 / 0.0;
+        public const double NegativeZero = -0.0;
+
+        public static bool IsNaN(double d) => d != d;
+
+        public static bool IsInfinity(double d) => d == PositiveInfinity || d == NegativeInfinity;
+
+        public static bool IsPositiveInfinity(double d) => d == PositiveInfinity;
+
+        public static bool IsNegativeInfinity(double d) => d == NegativeInfinity;
+
+        public static bool IsFinite(double d) => !IsNaN(d) && !IsInfinity(d);
+
+        public static bool IsNegative(double d) => BitConverter.DoubleToInt64Bits(d) < 0;
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public override extern string ToString();
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public extern string ToString(string format);
+
+        public string ToString(IFormatProvider provider) => ToString();
+
+        public string ToString(string format, IFormatProvider provider) => ToString(format);
+
+        public int CompareTo(double value)
+        {
+            if (this < value)
+            {
+                return -1;
+            }
+            if (this > value)
+            {
+                return 1;
+            }
+            if (this == value)
+            {
+                return 0;
+            }
+            if (IsNaN(this))
+            {
+                return IsNaN(value) ? 0 : -1;
+            }
+            return 1;
+        }
+
+        public int CompareTo(object value)
+        {
+            if (value == null)
+            {
+                return 1;
+            }
+            if (value is double d)
+            {
+                return CompareTo(d);
+            }
+            throw new ArgumentException("Object must be of type Double.");
+        }
+
+        public bool Equals(double obj) => this == obj || (IsNaN(obj) && IsNaN(this));
+
+        public override bool Equals(object obj) => obj is double d && Equals(d);
+
+        public override int GetHashCode()
+        {
+            long bits = BitConverter.DoubleToInt64Bits(this);
+            if (IsNaN(this) || this == 0)
+            {
+                bits &= 0x7FF0000000000000;
+            }
+            return (int)bits ^ (int)(bits >> 32);
+        }
+
+        public static double Parse(string s) => ParseFloat(s, false);
+
+        public static bool TryParse(string s, out double result)
+        {
+            if (s == null)
+            {
+                result = 0;
+                return false;
+            }
+            return TryParseFloat(s, false, out result);
+        }
+
+        internal static double ParseFloat(string s, bool single)
+        {
+            if (s == null)
+            {
+                throw new ArgumentNullException("s");
+            }
+            if (!TryParseFloat(s, single, out double result))
+            {
+                throw new FormatException("The input string '" + s + "' was not in a correct format.");
+            }
+            return result;
+        }
+
+        // Разбор по правилам .NET с инвариантной культурой: пробелы, знак,
+        // разряды через запятую, экспонента, NaN и Infinity. `single` — к
+        // ближайшему float, а не к ближайшему double.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern bool TryParseFloat(string s, bool single, out double result);
     }
 }

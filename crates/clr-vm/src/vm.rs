@@ -288,7 +288,7 @@ impl<'a, H: Host> Vm<'a, H> {
                 }
                 0x22 => {
                     let bytes = self.operand::<4>(code, &mut next)?;
-                    self.push(Value::F(f64::from(f32::from_le_bytes(bytes))))?;
+                    self.push(Value::F32(f32::from_le_bytes(bytes)))?;
                 }
                 0x23 => {
                     let bytes = self.operand::<8>(code, &mut next)?;

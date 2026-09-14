@@ -165,7 +165,8 @@ impl Prim {
         match self {
             Self::I8 | Self::U8 => Value::I64(0),
             Self::I | Self::U => Value::Native(0),
-            Self::R4 | Self::R8 => Value::F(0.0),
+            Self::R4 => Value::F32(0.0),
+            Self::R8 => Value::F(0.0),
             _ => Value::I32(0),
         }
     }

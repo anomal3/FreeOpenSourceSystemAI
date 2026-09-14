@@ -29,8 +29,9 @@
     <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
     <!-- Без mscorlib компилятору не у кого узнать версию метаданных. -->
     <RuntimeMetadataVersion>v4.0.30319</RuntimeMetadataVersion>
-    <!-- CS0660/CS0661: String определяет == без полного набора, как и в .NET. -->
-    <NoWarn>$(NoWarn);CS0660;CS0661</NoWarn>
+    <!-- CS0660/CS0661: String определяет == без полного набора, как и в .NET.
+         CS1718: `d != d` — это и есть проверка на NaN. -->
+    <NoWarn>$(NoWarn);CS0660;CS0661;CS1718</NoWarn>
   </PropertyGroup>
 
 </Project>

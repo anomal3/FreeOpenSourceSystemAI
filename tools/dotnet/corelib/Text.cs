@@ -542,6 +542,342 @@ namespace System
         public static int Sign(int value) => value < 0 ? -1 : value > 0 ? 1 : 0;
 
         public static int Sign(long value) => value < 0 ? -1 : value > 0 ? 1 : 0;
+
+        // Дробная математика (фаза N4c). Функции — в Rust, из крейта `libm`
+        // (порт musl). Точность у них та же, что у C-библиотек, но последний
+        // бит синуса или степени у разных библиотек может различаться — и у
+        // самого .NET на Windows и Linux тоже. Корень, округления и модуль
+        // точны везде.
+        public const double PI = 3.14159265358979323846;
+        public const double E = 2.7182818284590452354;
+        public const double Tau = 6.283185307179586476925;
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Sqrt(double d);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Cbrt(double d);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Sin(double a);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Cos(double d);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Tan(double a);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Asin(double d);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Acos(double d);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Atan(double d);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Atan2(double y, double x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Sinh(double value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Cosh(double value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Tanh(double value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Exp(double d);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Log(double d);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Log10(double d);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Log2(double x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Pow(double x, double y);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Floor(double d);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Ceiling(double a);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Truncate(double d);
+
+        /// Округление к ближайшему, половина — к чётному.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Round(double a);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Abs(double value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Abs(float value);
+
+        public static double Log(double a, double newBase)
+        {
+            if (double.IsNaN(a))
+            {
+                return a;
+            }
+            if (double.IsNaN(newBase))
+            {
+                return newBase;
+            }
+            if (newBase == 1)
+            {
+                return double.NaN;
+            }
+            if (a != 1 && (newBase == 0 || double.IsPositiveInfinity(newBase)))
+            {
+                return double.NaN;
+            }
+            return Log(a) / Log(newBase);
+        }
+
+        // Максимум и минимум по IEEE 754-2019: NaN побеждает, +0 больше -0.
+        public static double Max(double val1, double val2)
+        {
+            if (val1 != val2)
+            {
+                if (!double.IsNaN(val1))
+                {
+                    return val2 < val1 ? val1 : val2;
+                }
+                return val1;
+            }
+            return double.IsNegative(val2) ? val1 : val2;
+        }
+
+        public static double Min(double val1, double val2)
+        {
+            if (val1 != val2)
+            {
+                if (!double.IsNaN(val1))
+                {
+                    return val1 < val2 ? val1 : val2;
+                }
+                return val1;
+            }
+            return double.IsNegative(val1) ? val1 : val2;
+        }
+
+        public static float Max(float val1, float val2)
+        {
+            if (val1 != val2)
+            {
+                if (!float.IsNaN(val1))
+                {
+                    return val2 < val1 ? val1 : val2;
+                }
+                return val1;
+            }
+            return float.IsNegative(val2) ? val1 : val2;
+        }
+
+        public static float Min(float val1, float val2)
+        {
+            if (val1 != val2)
+            {
+                if (!float.IsNaN(val1))
+                {
+                    return val1 < val2 ? val1 : val2;
+                }
+                return val1;
+            }
+            return float.IsNegative(val1) ? val1 : val2;
+        }
+
+        public static int Sign(double value)
+        {
+            if (value < 0)
+            {
+                return -1;
+            }
+            if (value > 0)
+            {
+                return 1;
+            }
+            if (value == 0)
+            {
+                return 0;
+            }
+            throw new ArithmeticException("Function does not accept floating point Not-a-Number values.");
+        }
+
+        public static int Sign(float value) => Sign((double)value);
+
+        public static double Clamp(double value, double min, double max)
+        {
+            if (min > max)
+            {
+                throw new ArgumentException("'" + min + "' cannot be greater than " + max + ".");
+            }
+            if (value < min)
+            {
+                return min;
+            }
+            if (value > max)
+            {
+                return max;
+            }
+            return value;
+        }
+
+        public static double CopySign(double x, double y)
+        {
+            long magnitude = BitConverter.DoubleToInt64Bits(x) & 0x7FFFFFFFFFFFFFFF;
+            long sign = BitConverter.DoubleToInt64Bits(y) & unchecked((long)0x8000000000000000);
+            return BitConverter.Int64BitsToDouble(magnitude | sign);
+        }
+
+        public static double Round(double value, int digits) => Round(value, digits, MidpointRounding.ToEven);
+
+        public static double Round(double value, MidpointRounding mode)
+        {
+            switch (mode)
+            {
+                case MidpointRounding.ToEven:
+                    return Round(value);
+                case MidpointRounding.AwayFromZero:
+                    // Как у .NET: через дробную часть, а не `Truncate(value + 0.5)`,
+                    // которое ошибается у 0.49999999999999994.
+                    double whole = Truncate(value);
+                    double fraction = value - whole;
+                    if (Abs(fraction) >= 0.5)
+                    {
+                        whole += Sign(fraction);
+                    }
+                    return whole;
+                case MidpointRounding.ToZero:
+                    return Truncate(value);
+                case MidpointRounding.ToNegativeInfinity:
+                    return Floor(value);
+                case MidpointRounding.ToPositiveInfinity:
+                    return Ceiling(value);
+                default:
+                    throw new ArgumentException("The value '" + (int)mode + "' is not valid for this usage of the type MidpointRounding.", "mode");
+            }
+        }
+
+        // Как у .NET: умножить на степень десяти, округлить, разделить. От
+        // 1e16 у числа дробной части уже нет.
+        public static double Round(double value, int digits, MidpointRounding mode)
+        {
+            if ((uint)digits > 15)
+            {
+                throw new ArgumentOutOfRangeException("digits", "Rounding digits must be between 0 and 15, inclusive.");
+            }
+            if (mode < MidpointRounding.ToEven || mode > MidpointRounding.ToPositiveInfinity)
+            {
+                throw new ArgumentException("The value '" + (int)mode + "' is not valid for this usage of the type MidpointRounding.", "mode");
+            }
+            if (Abs(value) < 1e16)
+            {
+                double power10 = Power10(digits);
+                value *= power10;
+                value = Round(value, mode);
+                value /= power10;
+            }
+            return value;
+        }
+
+        private static double Power10(int digits)
+        {
+            double power = 1;
+            for (int i = 0; i < digits; i++)
+            {
+                power *= 10;
+            }
+            return power;
+        }
+    }
+
+    public enum MidpointRounding
+    {
+        ToEven = 0,
+        AwayFromZero = 1,
+        ToZero = 2,
+        ToNegativeInfinity = 3,
+        ToPositiveInfinity = 4,
+    }
+
+    public static class MathF
+    {
+        public const float PI = 3.14159265f;
+        public const float E = 2.71828183f;
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Sqrt(float x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Sin(float x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Cos(float x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Tan(float x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Atan2(float y, float x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Pow(float x, float y);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Exp(float x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Log(float x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Floor(float x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Ceiling(float x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Truncate(float x);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Round(float x);
+
+        public static float Abs(float x) => Math.Abs(x);
+
+        public static float Max(float x, float y) => Math.Max(x, y);
+
+        public static float Min(float x, float y) => Math.Min(x, y);
+    }
+
+    // Биты чисел. Порядок байт у FreeOS на обеих архитектурах — от младшего.
+    public static class BitConverter
+    {
+        public static readonly bool IsLittleEndian = true;
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern long DoubleToInt64Bits(double value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern double Int64BitsToDouble(long value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern int SingleToInt32Bits(float value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern float Int32BitsToSingle(int value);
+
+        public static ulong DoubleToUInt64Bits(double value) => (ulong)DoubleToInt64Bits(value);
+
+        public static double UInt64BitsToDouble(ulong value) => Int64BitsToDouble((long)value);
     }
 }
 
@@ -670,6 +1006,10 @@ namespace System.Text
         public StringBuilder Append(long value) => Append(value.ToString());
 
         public StringBuilder Append(ulong value) => Append(value.ToString());
+
+        public StringBuilder Append(float value) => Append(value.ToString());
+
+        public StringBuilder Append(double value) => Append(value.ToString());
 
         // Перевод строки FreeOS — один LF; у .NET на Windows здесь CR LF.
         public StringBuilder AppendLine() => Append('\n');

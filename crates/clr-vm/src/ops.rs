@@ -27,8 +27,25 @@ pub(crate) fn binary(op: u8, a: Value, b: Value) -> Result<Value, Fault> {
         (Value::Native(x), Value::I32(y)) => int64(op, x, i64::from(y)).map(Value::Native),
         (Value::I32(x), Value::Native(y)) => int64(op, i64::from(x), y).map(Value::Native),
         (Value::F(x), Value::F(y)) => float(op, x, y).map(Value::F),
+        // `float` с `float` — в одинарной точности, как у JIT .NET: округление
+        // сразу до `f32`, а не через `f64`, иначе у половин выходит другой бит.
+        (Value::F32(x), Value::F32(y)) => float32(op, x, y).map(Value::F32),
+        // Вперемешку оба — вид `F`, и `float32` расширяется без потерь.
+        (Value::F32(x), Value::F(y)) => float(op, f64::from(x), y).map(Value::F),
+        (Value::F(x), Value::F32(y)) => float(op, x, f64::from(y)).map(Value::F),
         _ => Err(Fault::Invalid("arithmetic on incompatible operands")),
     }
+}
+
+fn float32(op: u8, x: f32, y: f32) -> Result<f32, Fault> {
+    Ok(match op {
+        0x58 => x + y,
+        0x59 => x - y,
+        0x5A => x * y,
+        0x5B => x / y,
+        0x5D => libm::fmodf(x, y),
+        _ => return Err(Fault::Invalid("instruction not defined for floating point")),
+    })
 }
 
 fn int32(op: u8, x: i32, y: i32) -> Result<i32, Fault> {
@@ -168,6 +185,7 @@ pub(crate) fn unary(op: u8, value: Value) -> Result<Value, Fault> {
         (0x65, Value::I64(x)) => Value::I64(x.wrapping_neg()),
         (0x65, Value::Native(x)) => Value::Native(x.wrapping_neg()),
         (0x65, Value::F(x)) => Value::F(-x),
+        (0x65, Value::F32(x)) => Value::F32(-x),
         (0x66, Value::I32(x)) => Value::I32(!x),
         (0x66, Value::I64(x)) => Value::I64(!x),
         (0x66, Value::Native(x)) => Value::Native(!x),
@@ -253,14 +271,15 @@ pub(crate) fn convert(op: u8, value: Value) -> Result<Value, Fault> {
         Value::I32(x) => Source::Int { signed: i64::from(x), unsigned: u64::from(x as u32) },
         Value::I64(x) | Value::Native(x) => Source::Int { signed: x, unsigned: x as u64 },
         Value::F(x) => Source::Float(x),
+        Value::F32(x) => Source::Float(f64::from(x)),
         _ => return Err(Fault::Invalid("conversion of a reference")),
     };
 
     match width {
         R4 => {
-            return Ok(Value::F(match source {
-                Source::Int { signed, .. } => f64::from(signed as f32),
-                Source::Float(f) => f64::from(f as f32),
+            return Ok(Value::F32(match source {
+                Source::Int { signed, .. } => signed as f32,
+                Source::Float(f) => f as f32,
             }));
         }
         R8 => {
@@ -398,10 +417,11 @@ pub(crate) fn compare(a: Value, b: Value) -> Result<Comparison, Fault> {
         }
         (Value::I32(x), Value::Native(y)) => ints(i64::from(x), y, i64::from(x) as u64, y as u64),
         (Value::Native(x), Value::I32(y)) => ints(x, i64::from(y), x as u64, i64::from(y) as u64),
-        (Value::F(x), Value::F(y)) => {
-            let order = x.partial_cmp(&y);
-            Comparison { signed: order, unsigned: order, equal: x == y }
-        }
+        (Value::F(x), Value::F(y)) => floats(x, y),
+        // `float32` расширяется до `f64` без потерь, и порядок тот же.
+        (Value::F32(x), Value::F32(y)) => floats(f64::from(x), f64::from(y)),
+        (Value::F32(x), Value::F(y)) => floats(f64::from(x), y),
+        (Value::F(x), Value::F32(y)) => floats(x, f64::from(y)),
         // Ссылки сравниваются только на равенство — и с `null` через `cgt.un`,
         // которым компилятор C# записывает `x != null`. Порядок номеров в куче
         // смысла не несёт, но детерминирован.
@@ -418,6 +438,11 @@ pub(crate) fn compare(a: Value, b: Value) -> Result<Comparison, Fault> {
     })
 }
 
+fn floats(x: f64, y: f64) -> Comparison {
+    let order = x.partial_cmp(&y);
+    Comparison { signed: order, unsigned: order, equal: x == y }
+}
+
 /// Истинность для `brtrue`/`brfalse`.
 pub(crate) fn truthy(value: Value) -> Result<bool, Fault> {
     Ok(match value {
@@ -427,6 +452,6 @@ pub(crate) fn truthy(value: Value) -> Result<bool, Fault> {
         Value::Ptr(_) => true,
         Value::Struct(_) => return Err(Fault::Invalid("branch on a struct value")),
         Value::Fn(_) => true,
-        Value::F(_) => return Err(Fault::Invalid("branch on a floating point value")),
+        Value::F(_) | Value::F32(_) => return Err(Fault::Invalid("branch on a floating point value")),
     })
 }

@@ -120,7 +120,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -303,6 +303,42 @@ fn collections_print_what_dotnet_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, COLLECTIONS_OUTPUT);
     assert_eq!(code, 6);
+}
+
+/// Образец `tools/dotnet/samples/floats` (фаза N4c).
+const FLOATS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/floats.dll");
+
+/// Что печатает `dotnet floats.dll` (записано 2026-09-14, .NET 10, LF,
+/// инвариантная глобализация). `¤` — знак валюты инвариантной культуры.
+const FLOATS_OUTPUT: &str = concat!(
+    "floats: start\n",
+    "0.30000000000000004\n",
+    "0.3333333333333333 0.6666666666666666 1E+21 1E-07 123.456 -0 100\n",
+    "1.7976931348623157E+308 5E-324 NaN Infinity -Infinity\n",
+    "3.14|2.7183|12,345.68|25.6 %|1.234E+003|(\u{a4}42.50)|2|4|0.12\n",
+    "1,234,567.89 5E-1 (3.8) zero 2.68 2.67\n",
+    "[     1.414] [1.23E+03] [1.5]\n",
+    "1,234,567|-5.00|4.20E+001|700 %|\u{a4}255.00|12,345.00|neg|zero|00012\n",
+    "0.33333334 16777216 16777216 3.4028235E+38 1 True 0.3333333432674408 0.1\n",
+    "-123450 True Infinity False 0 3.14159 NaN -Infinity\n",
+    "The input string 'abc' was not in a correct format.\n",
+    "1.4142135623730951 -3 -2 -2 2 4 -2 3 1024\n",
+    "2.35 3 -1.2 0 NaN -0 -1 5\n",
+    "0.8414709848 0.5000000000 0.5463024898 2.3561944902 2.7182818285 2.3025850930 0.3010299957 1.4142135624 1.4142135\n",
+    "3/3/3 -3/-3/0 2147483647/10000000000/4294967295 0/0/0 -1/-1/0 3.5 2 -1.5\n",
+    "NaN -Infinity -1 0 2.25 3.5 True False True -1 1074266112 0\n",
+    "3 2 2\n",
+    "1.6439345666815615 3.1406380562059946 3FFA4D8E550A946E\n",
+    "1.25 2.5 -1E-10\n",
+    "floats: done\n",
+);
+
+#[test]
+fn floats_print_what_dotnet_prints() {
+    let (result, output) = run(FLOATS);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, FLOATS_OUTPUT);
+    assert_eq!(code, 41);
 }
 
 #[test]

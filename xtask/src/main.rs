@@ -16,6 +16,7 @@ mod btrfsfix;
 mod build;
 mod cbuild;
 mod clrcheck;
+mod numcheck;
 mod diskfile;
 mod firmware;
 mod harness;

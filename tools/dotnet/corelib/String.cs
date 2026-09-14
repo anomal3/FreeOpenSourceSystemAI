@@ -106,6 +106,14 @@ namespace System
 
         public static void Write(ulong value) => Write(value.ToString());
 
+        public static void Write(float value) => Write(value.ToString());
+
+        public static void Write(double value) => Write(value.ToString());
+
+        public static void WriteLine(float value) => WriteLine(value.ToString());
+
+        public static void WriteLine(double value) => WriteLine(value.ToString());
+
         public static void WriteLine(object value) => WriteLine(value?.ToString());
 
         public static void WriteLine(bool value) => WriteLine(value.ToString());

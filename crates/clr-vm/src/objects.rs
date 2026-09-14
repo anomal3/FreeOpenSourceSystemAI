@@ -530,7 +530,7 @@ impl<'a, H: Host> Vm<'a, H> {
                     Prim::I4 => Value::I32(bits as u32 as i32),
                     Prim::I8 | Prim::U8 => Value::I64(bits as i64),
                     Prim::I | Prim::U => Value::Native(bits as i64),
-                    Prim::R4 => Value::F(f64::from(f32::from_bits(bits as u32))),
+                    Prim::R4 => Value::F32(f32::from_bits(bits as u32)),
                     Prim::R8 => Value::F(f64::from_bits(bits)),
                 };
                 *item = value;
