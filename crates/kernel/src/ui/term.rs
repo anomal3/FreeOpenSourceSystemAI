@@ -41,10 +41,11 @@ const LOG_LIMIT: u64 = 32;
 
 /// Сколько числовых параметров помещается в одной последовательности.
 ///
-/// `ESC [ 1 ; 34 ; 47 m` — три; больше в подмножестве, которое здесь разобрано,
-/// не встречается. Лишние параметры отбрасываются, а не роняют разбор: поток
-/// приходит от программы, то есть из-за границы доверия.
-const MAX_PARAMS: usize = 4;
+/// С фазы С9 цвет задаётся и номером палитры в 256 цветов: `ESC [ 38 ; 5 ; 18 ;
+/// 48 ; 5 ; 30 m` — уже шесть, а с `38 ; 2 ; r ; g ; b` для обеих половин —
+/// десять. Лишние параметры отбрасываются, а не роняют разбор: поток приходит
+/// от программы, то есть из-за границы доверия.
+const MAX_PARAMS: usize = 16;
 
 /// Состояние автомата разбора.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -246,8 +247,9 @@ fn apply(window: Option<&mut Window>, parser: &Parser, final_byte: u8) {
         }
         (false, b'm') => {
             let count = parser.count.max(1);
-            for index in 0..count {
-                sgr(window, parser.params[index]);
+            let mut index = 0;
+            while index < count {
+                index += sgr(window, &parser.params[index..count]);
             }
             log(format_args!("CSI {}m", parser.params[0]));
         }
@@ -294,19 +296,68 @@ fn log_only(parser: &Parser, final_byte: u8) {
     }
 }
 
-/// Один параметр `ESC [ … m`.
-fn sgr(window: &mut Window, value: u32) {
+/// Одна команда `ESC [ … m`. Возвращает, сколько параметров она заняла.
+///
+/// Команд длиннее одного параметра две — `38` и `48`: за ними идёт `5 ; n`
+/// (номер 256-цветной палитры) или `2 ; r ; g ; b`. Их хвост обязан быть съеден
+/// вместе с ними: иначе `5` из `38 ; 5 ; 18` разобралось бы отдельной командой
+/// «мигание», а `18` — ничем, и цвет молча не встал бы.
+fn sgr(window: &mut Window, params: &[u32]) -> usize {
+    let value = params[0];
     match value {
         0 => window.term_reset_attr(),
+        7 => window.term_set_inverse(true),
+        27 => window.term_set_inverse(false),
         30..=37 => window.term_set_fg((value - 30) as u8),
         // Яркая половина палитры: те же восемь цветов, сдвинутые на восемь.
         90..=97 => window.term_set_fg((value - 90 + 8) as u8),
         40..=47 => window.term_set_bg((value - 40) as u8),
         100..=107 => window.term_set_bg((value - 100 + 8) as u8),
-        // Жирный (1) в шрифте 8×8 изобразить нечем, и подменять его яркостью
-        // значило бы решать за программу, какой у неё цвет.
+        39 => window.term_default_fg(),
+        49 => window.term_default_bg(),
+        38 | 48 => {
+            let (index, used) = match params.get(1) {
+                Some(5) => (params.get(2).map(|n| (*n).min(255) as u8), 3),
+                Some(2) => {
+                    let channel = |at: usize| params.get(at).map_or(0, |v| (*v).min(255));
+                    (Some(nearest_cube(channel(2), channel(3), channel(4))), 5)
+                }
+                // Неизвестный вид цвета: съедается одна команда, остальное
+                // разбирается как есть — лучшего предположения нет.
+                _ => (None, 1),
+            };
+            if let Some(index) = index {
+                if value == 38 {
+                    window.term_set_fg(index);
+                } else {
+                    window.term_set_bg(index);
+                }
+            }
+            return used.min(params.len());
+        }
+        // Жирный (1) изобразить нечем — начертание одно, — и подменять его
+        // яркостью значило бы решать за программу, какой у неё цвет.
         _ => {}
     }
+    1
+}
+
+/// Ближайший к цвету номер из куба 6×6×6 палитры xterm.
+///
+/// Цвет ячейки хранится номером палитры, а не тремя байтами (см. `TextGrid`),
+/// поэтому `38 ; 2 ; r ; g ; b` приближается кубом. Точность — шаг в 40 единиц
+/// на канал; программам, которым этого мало, в текстовом терминале тесно и так.
+fn nearest_cube(r: u32, g: u32, b: u32) -> u8 {
+    let step = |v: u32| {
+        if v < 48 {
+            0
+        } else if v < 115 {
+            1
+        } else {
+            ((v - 35) / 40).min(5)
+        }
+    };
+    (16 + 36 * step(r) + 6 * step(g) + step(b)) as u8
 }
 
 /// Назвать разобранное в журнале — пока их не стало слишком много.

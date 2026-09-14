@@ -750,6 +750,27 @@ impl Window {
         }
     }
 
+    /// Вернуть тексту цвет окна.
+    pub fn term_default_fg(&mut self) {
+        if let Content::Text(grid) = &mut self.content {
+            grid.default_fg();
+        }
+    }
+
+    /// Вернуть фону цвет окна.
+    pub fn term_default_bg(&mut self) {
+        if let Content::Text(grid) = &mut self.content {
+            grid.default_bg();
+        }
+    }
+
+    /// Включить или выключить инверсию.
+    pub fn term_set_inverse(&mut self, on: bool) {
+        if let Content::Text(grid) = &mut self.content {
+            grid.set_inverse(on);
+        }
+    }
+
     /// Вернуть цвета окна.
     pub fn term_reset_attr(&mut self) {
         if let Content::Text(grid) = &mut self.content {
@@ -797,6 +818,16 @@ impl Window {
 
     /// Перерисовать содержимое, которое рисует себя само.
     pub fn redraw_content(&mut self) {
+        // Сетку терминала рисует она сама, и заливать её нельзя — выход раньше
+        // заливки, а не после. Дефект, найденный в фазе С9: `rebuild` звал эту
+        // функцию сразу за `TextGrid::rebind`, заливка стирала только что
+        // перенесённые знаки, а теневой буфер сетки продолжал считать их
+        // нарисованными. Оболочка после разворачивания теряла напечатанное с
+        // экрана, а `mc`, присылающий только изменившиеся ячейки, получал
+        // тёмные дыры там, где новый кадр совпал со старым.
+        if matches!(self.content, Content::Text(_)) {
+            return;
+        }
         let area = content_area(&self.surface, self.scale);
         let ctx = self.ctx();
         // Содержимое рисуется поверх прежнего, и заливка обязательна: список,

@@ -2953,6 +2953,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("freeos> ", 15_000),
             Step::Line("rm /home/roman/mcdir/two.txt"),
             Step::Await("freeos> ", 15_000),
+            Step::Line("rm /home/roman/mcdir/zed.txt"),
+            Step::Await("freeos> ", 15_000),
             Step::Line("rm /home/roman/mcdir"),
             Step::Await("freeos> ", 15_000),
             // Каталог с одним предсказуемым файлом. Проверять `mc` на `/bin`
@@ -2963,6 +2965,11 @@ pub const ALL: &[Scenario] = &[
             Step::Await("created /home/roman/mcdir", 15_000),
             Step::Line("echo mc-payload > /home/roman/mcdir/one.txt"),
             Step::Await("wrote 11 bytes", 15_000),
+            // Второй файл — для правки и просмотра (фаза С9). Имя на «z»: панель
+            // сортирует по имени, и «вниз на одну» по-прежнему попадает в
+            // `one.txt`.
+            Step::Line("echo mc-edit > /home/roman/mcdir/zed.txt"),
+            Step::Await("wrote 8 bytes", 15_000),
             // Панели указаны аргументами: программа не знает, где что лежит, и
             // знать не должна.
             // Короткая форма: имя программы вместо `run /bin/...`. Оболочка
@@ -2980,20 +2987,42 @@ pub const ALL: &[Scenario] = &[
             // которую прислал бы настоящий терминал, и возвращается программе
             // ею же.
             Step::Raw(b"\x1b[B"),
-            Step::Wait(500),
+            Step::Wait(2000),
             Step::Shot("mc"),
-            // F5 копирует файл под курсором в каталог другой панели. Строка
-            // называет обе стороны целиком: «скопировалось» и «скопировалось не
-            // то» иначе выглядели бы одинаково.
+            // Окно терминала разворачивается под работающим `mc` — и `mc` идёт
+            // за ним (фаза С9). Три строки по порядку: стол изменил окно, ядро
+            // назвало новый размер сетки (до С9 оно помнило размер от загрузки),
+            // `mc` его перечитал сам, без нажатия клавиши. Потом окно
+            // возвращается, чтобы остальные шаги шли в прежнем размере.
+            Step::Aim(Aim::Maximize("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : resized 'Terminal'", 15_000),
+            Step::Await("term        : window is now", 15_000),
+            Step::Await("mc: window is", 15_000),
+            Step::Wait(2000),
+            Step::Shot("mc-maximized"),
+            Step::Aim(Aim::Maximize("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : resized 'Terminal'", 15_000),
+            Step::Await("term        : window is now", 15_000),
+            Step::Await("mc: window is", 15_000),
+            Step::Wait(1000),
+            // F5 копирует файл под курсором в каталог другой панели. С фазы С9
+            // сначала спрашивает — окном с полем, где уже стоит путь другой
+            // панели, — и Enter соглашается. Строка называет обе стороны
+            // целиком: «скопировалось» и «скопировалось не то» иначе выглядели
+            // бы одинаково.
             Step::Raw(b"\x1b[15~"),
+            Step::Wait(2000),
+            Step::Shot("mc-copy"),
+            Step::Raw(b"\n"),
             Step::Await(
                 "mc: copied /home/roman/mcdir/one.txt -> /home/roman/one.txt",
                 20_000,
             ),
             // F6 переименовывает — и это не «скопировать и удалить»: содержимое
-            // не читается вовсе, меняется запись каталога. Имя набирается в
-            // строке внизу, то есть программа читает ввод и в прямом режиме
-            // тоже, посимвольно и со своим эхом.
+            // не читается вовсе, меняется запись каталога. В поле уже стоит
+            // выделенное имя, и первая набранная буква заменяет его целиком.
             Step::Raw(b"\x1b[17~"),
             Step::Wait(500),
             Step::Raw(b"two.txt\n"),
@@ -3001,12 +3030,37 @@ pub const ALL: &[Scenario] = &[
                 "mc: renamed /home/roman/mcdir/one.txt -> /home/roman/mcdir/two.txt",
                 20_000,
             ),
-            // После переименования курсор снова на «..»: панель перечитана.
-            // Спускаемся к переименованному файлу и удаляем его.
-            Step::Raw(b"\x1b[B"),
-            Step::Wait(500),
+            // Курсор остался на переименованном (как в Far), поэтому F8 сразу:
+            // удаление спрашивает подтверждение, Enter — «Удалить».
             Step::Raw(b"\x1b[19~"),
+            Step::Wait(500),
+            Step::Raw(b"\n"),
             Step::Await("mc: removed /home/roman/mcdir/two.txt", 20_000),
+            // Курсор остаётся на том же месте списка — теперь там `zed.txt`.
+            // F4 открывает правку: в конец первой строки дописываются ещё две,
+            // F2 сохраняет. Число байт посчитано: «mc-edit\n» (8) + «second
+            // line\n» (12) + «third\n» (6) — перевод строки в конце файла был и
+            // сохраняется.
+            Step::Raw(b"\x1bOS"),
+            Step::Await("mc: editing /home/roman/mcdir/zed.txt, 1 line(s)", 20_000),
+            Step::Raw(b"\x1b[F"),
+            Step::Raw(b"\nsecond line\nthird"),
+            Step::Wait(2000),
+            Step::Shot("mc-edit"),
+            Step::Raw(b"\x1bOQ"),
+            Step::Await("mc: saved /home/roman/mcdir/zed.txt, 26 bytes", 20_000),
+            Step::Raw(b"\x1b[21~"),
+            Step::Await("mc: editor closed", 20_000),
+            // F3 — просмотр того же файла: трёх строк, записанных правкой. End
+            // уводит в конец, и строка закрытия называет видимый кусок — у
+            // файла короче окна это все три строки при любом размере окна.
+            Step::Raw(b"\x1bOR"),
+            Step::Await("mc: viewed /home/roman/mcdir/zed.txt", 20_000),
+            Step::Raw(b"\x1b[F"),
+            Step::Wait(2000),
+            Step::Shot("mc-view"),
+            Step::Raw(b"\x1bOR"),
+            Step::Await("mc: viewer closed showing lines 1-3 of 3", 20_000),
             // F10 — выход. Программа возвращает построчный режим и убирает за
             // собой экран.
             Step::Raw(b"\x1b[21~"),
@@ -3026,6 +3080,14 @@ pub const ALL: &[Scenario] = &[
             Step::Await("mc-payload", 20_000),
             Step::Line("cat /home/roman/mcdir/two.txt"),
             Step::Await("no such file or directory", 15_000),
+            // Правка пережила программу: оболочка читает то, что сохранил F2.
+            Step::Line("cat /home/roman/mcdir/zed.txt"),
+            Step::Await("second line", 20_000),
+            Step::Await("third", 15_000),
+            // Вывод в окно, пришедший, пока стол рисовал кадр, ждёт в очереди, а
+            // не пропадает (фаза С9). Пропасть он может только при переполнении
+            // очереди — и тогда ядро это называет.
+            Step::Absent("term        : dropped output"),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

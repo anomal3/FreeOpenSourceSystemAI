@@ -35,6 +35,8 @@
 
 extern crate alloc;
 
+/// Псевдографика по ячейке терминала: рамки и блоки от края до края (фаза С9).
+pub mod boxdraw;
 pub mod draw;
 pub mod font;
 pub mod glyphicon;
