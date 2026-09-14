@@ -54,15 +54,17 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use mini_ui::glyphicon::{self, Icon};
+use mini_ui::kit::{self, Entry};
 use mini_ui::paint::{self, Ctx, RowState, Tone, Weight};
 use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface, draw, theme};
 use user_abi::{Dirent, KIND_DIRECTORY, Stat};
+use user_progs::app::{self, App, Spec};
 use user_progs::{
-    Args, SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END,
-    WIN_KEY_HOME, WIN_KEY_LEFT, WIN_KEY_MENU, WIN_KEY_NAMED, WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP,
-    WIN_KEY_RIGHT, WIN_KEY_UP, WIN_POINTER, Window, close, create, exit, mkdir, monotonic_ms,
-    mounts, nanosleep, open, println, read, readdir_raw, remove, rename, stat, sysinfo,
+    Args, SysInfo, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT,
+    WIN_KEY_MENU, WIN_KEY_NAMED, WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP,
+    close, create, mkdir, monotonic_ms, mounts, open, println, read, readdir_raw, remove, rename,
+    stat, sysinfo,
 };
 
 /// Имя окна.
@@ -113,26 +115,12 @@ const SIDE_FROM: u32 = 700;
 /// об этом написано в строке состояния, а не умалчивается.
 const MAX_ROWS: usize = 1024;
 
-/// Пауза между опросами очереди событий.
-const POLL_NS: u32 = 30_000_000;
-
-/// Как часто спрашивать систему о теме.
+/// Паспорт окна для каркаса программ (фаза С8).
 ///
-/// События «тема изменилась» договор не знает — своего состояния стола у
-/// программы нет, — поэтому признак перечитывается. Две секунды: человек
-/// переключает тему руками и замечает задержку в две секунды как «сработало», а
-/// не как «не сработало».
-const THEME_PERIOD_MS: u64 = 2_000;
-
-/// Сколько всего ждать окна при запуске.
-///
-/// Полминуты, как у монитора системы, и по той же причине: при загрузке система
-/// много печатает, а каждая строка в окне оболочки — перерисовка, на которую
-/// стол берут целиком.
-const OPEN_WAIT_MS: u64 = 30_000;
-
-/// Сколько ждать графики при запуске.
-const WAIT_GRAPHICS_MS: u64 = 10_000;
+/// Период — как часто спрашивать систему о теме. События «тема изменилась»
+/// договор не знает, и признак перечитывается; две секунды человек замечает
+/// как «сработало», а не как «не сработало».
+const SPEC: Spec = Spec { name: "files", title: TITLE, period_ms: 2_000 };
 
 // ---------------------------------------------------------------------------
 // Данные
@@ -294,6 +282,14 @@ impl MenuItem {
     }
 }
 
+/// Пункты для общего меню (`mini_ui::kit`, фаза С8).
+fn entries(items: &[MenuItem]) -> Vec<Entry<'static>> {
+    items
+        .iter()
+        .map(|item| Entry { title: item.title(), icon: item.icon(), danger: item.danger(), group: item.group() })
+        .collect()
+}
+
 /// Чем занято меню.
 enum MenuMode {
     /// Показывает пункты.
@@ -435,7 +431,7 @@ impl Files {
     }
 
     /// Обработать клавишу. `true` — картинку надо перерисовать.
-    fn key(&mut self, code: u32) -> bool {
+    fn on_key(&mut self, code: u32) -> bool {
         if self.menu.is_some() {
             return self.key_menu(code);
         }
@@ -1000,7 +996,7 @@ impl Files {
     /// Кнопки навигации, строки быстрого доступа и строки списка ищутся по той
     /// же [`layout`], по которой рисуются, — иначе они разъедутся при первом же
     /// изменении размера окна, и попасть в них будет можно только наугад.
-    fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+    fn on_click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = layout(ctx, area);
 
         // Открытое меню получает щелчок первым: внутри — пункт, снаружи —
@@ -1009,19 +1005,8 @@ impl Files {
         if let Some(menu) = self.menu.as_ref() {
             if let Some(card) = self.menu_rect(ctx, area) {
                 if matches!(menu.mode, MenuMode::Items) && card.contains(x, y) {
-                    let row_h = ctx.px(theme::MENU_ROW_H) as i32;
-                    let mut top = card.y + ctx.px(6) as i32;
-                    let mut hit = None;
-                    for (index, item) in menu.items.iter().enumerate() {
-                        if index > 0 && item.group() != menu.items[index - 1].group() {
-                            top += ctx.px(9) as i32;
-                        }
-                        if y >= top && y < top + row_h {
-                            hit = Some(*item);
-                            break;
-                        }
-                        top += row_h;
-                    }
+                    // Та же геометрия пунктов, что у отрисовки: считает её `kit`.
+                    let hit = kit::menu_hit(ctx, card, &entries(&menu.items), x, y).map(|index| menu.items[index]);
                     if let Some(item) = hit {
                         self.run_menu_item(item);
                     }
@@ -1100,7 +1085,7 @@ impl Files {
     }
 
     /// Правая кнопка: меню для строки под указателем или для каталога.
-    fn click_right(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+    fn on_click_right(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = layout(ctx, area);
         if self.menu.is_some() {
             self.close_menu();
@@ -1199,22 +1184,8 @@ impl Files {
             return (0, 0);
         };
         let pad = ctx.px(6);
-        let row_h = ctx.px(theme::MENU_ROW_H);
         match &menu.mode {
-            MenuMode::Items => {
-                let mut widest = 0;
-                for item in &menu.items {
-                    widest = widest.max(ctx.face(Role::Body).width(item.title()));
-                }
-                let mut h = pad * 2;
-                for (index, item) in menu.items.iter().enumerate() {
-                    if index > 0 && item.group() != menu.items[index - 1].group() {
-                        h += ctx.px(9);
-                    }
-                    h += row_h;
-                }
-                (widest + ctx.px(14 + 10 + 12) * 2, h)
-            }
+            MenuMode::Items => kit::menu_size(ctx, &entries(&menu.items)),
             MenuMode::Rename(_) | MenuMode::Confirm => {
                 let hint = ctx.face(Role::Caption).width(RENAME_HINT).max(ctx.face(Role::Caption).width(CONFIRM_HINT));
                 (hint.max(ctx.px(320)) + ctx.px(28), ctx.px(40) + ctx.px(32) + ctx.px(28) + pad * 2)
@@ -1227,7 +1198,7 @@ impl Files {
     /// Фон заливается здесь, а не приходит готовым: до переезда область
     /// заливало окно ядра, а у программы поверхность своя и заливать её больше
     /// некому.
-    fn draw(&self, surface: &mut Surface, area: Rect, ctx: Ctx) {
+    fn render(&self, surface: &mut Surface, area: Rect, ctx: Ctx) {
         surface.fill(area, theme::window_bg());
         let plan = layout(ctx, area);
         self.draw_toolbar(surface, ctx, &plan);
@@ -1440,58 +1411,16 @@ impl Files {
         let Some(card) = self.menu_rect(ctx, area) else {
             return;
         };
-        let p = ctx.palette;
-        draw::shadow(s, card, ctx.px(theme::R_CARD), ctx.px(18), mini_ui::Color::rgb(0, 0, 0), 90);
-        draw::rounded(s, card, ctx.px(theme::R_CARD), ctx.flat(p.panel), 255);
-        draw::rounded_stroke(s, card, ctx.px(theme::R_CARD), p.line3.color, p.line3.alpha);
-        let inner = ctx.on(theme::panel_bg());
-        let pad = ctx.px(6);
+        // Пункты рисует общее меню; поле имени и вопрос об удалении — своё
+        // содержимое на той же карточке (фаза С8).
+        if matches!(menu.mode, MenuMode::Items) {
+            kit::draw_menu(ctx, s, card, &entries(&menu.items), menu.selected);
+            return;
+        }
+        let inner = kit::card(ctx, s, card);
+        let p = inner.palette;
         match &menu.mode {
-            MenuMode::Items => {
-                let row_h = ctx.px(theme::MENU_ROW_H);
-                let mut y = card.y + pad as i32;
-                for (index, item) in menu.items.iter().enumerate() {
-                    if index > 0 && item.group() != menu.items[index - 1].group() {
-                        let line_y = y + ctx.px(4) as i32;
-                        paint::separator(inner, s, card.x + ctx.px(12) as i32, line_y, card.w.saturating_sub(ctx.px(24)));
-                        y += ctx.px(9) as i32;
-                    }
-                    let row = Rect::new(card.x + pad as i32, y, card.w.saturating_sub(pad * 2), row_h);
-                    let selected = index == menu.selected;
-                    paint::row(inner, s, row, if selected { RowState::Selected } else { RowState::Idle });
-                    let icon_side = ctx.px(14);
-                    let text_x = row.x + ctx.px(14 + 14 + 10) as i32;
-                    if let Some(icon) = item.icon() {
-                        glyphicon::draw(
-                            s,
-                            icon,
-                            row.x + ctx.px(14) as i32,
-                            row.y + (row.h as i32 - icon_side as i32) / 2,
-                            icon_side,
-                            if item.danger() { p.bad_ink } else { p.ink3 },
-                            255,
-                        );
-                    }
-                    let ink = if item.danger() {
-                        p.bad_ink
-                    } else if selected {
-                        p.ink
-                    } else {
-                        p.ink2
-                    };
-                    paint::text_clipped(
-                        inner,
-                        s,
-                        Role::Body,
-                        text_x,
-                        paint::baseline(inner, Role::Body, row),
-                        (row.right() - text_x - ctx.px(12) as i32).max(0) as u32,
-                        item.title(),
-                        ink,
-                    );
-                    y += row_h as i32;
-                }
-            }
+            MenuMode::Items => {}
             MenuMode::Rename(name) => {
                 let x = card.x + ctx.px(14) as i32;
                 let room = card.w.saturating_sub(ctx.px(28));
@@ -1547,19 +1476,8 @@ impl Files {
         if plan.toolbar.is_empty() {
             return;
         }
-        s.fill(plan.toolbar, ctx.flat(p.panel));
-        draw::hline(
-            s,
-            plan.toolbar.x,
-            plan.toolbar.bottom() - 1,
-            plan.toolbar.w,
-            p.line.color,
-            p.line.alpha,
-        );
-        // Всё, что лежит на панели, сводится поверх **панели**, а не поверх
-        // окна: разница в один-два уровня яркости глазом не ловится, а на
-        // снимке видна как кнопка чуть другого оттенка, чем соседняя.
-        let bar = ctx.on(theme::panel_bg());
+        // Панель и контекст поверх неё — общие (`kit`, фаза С8).
+        let bar = kit::toolbar(ctx, s, plan.toolbar);
 
         // Недоступная кнопка гаснет, а не пропадает: «назад» из первого же
         // каталога не должно выглядеть как неисправность.
@@ -1845,20 +1763,9 @@ impl Files {
 
     /// Строка состояния: без неё стрелки и Enter — это то, что надо угадать.
     fn draw_status(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
-        let p = ctx.palette;
         if plan.status.is_empty() {
             return;
         }
-        s.fill(plan.status, ctx.flat(p.panel));
-        draw::hline(
-            s,
-            plan.status.x,
-            plan.status.y,
-            plan.status.w,
-            p.line2.color,
-            p.line2.alpha,
-        );
-        let bar = ctx.on(theme::panel_bg());
         let text = if let Some(note) = self.note.as_ref() {
             note.clone()
         } else if self.preview.is_some() {
@@ -1882,17 +1789,7 @@ impl Files {
                 if self.friendly { "настоящие имена" } else { "знакомый вид" }
             )
         };
-        let pad = ctx.px(14);
-        paint::text_clipped(
-            bar,
-            s,
-            Role::MonoSmall,
-            plan.status.x + pad as i32,
-            paint::baseline(bar, Role::MonoSmall, plan.status),
-            plan.status.w.saturating_sub(pad * 2),
-            &text,
-            p.ink4,
-        );
+        kit::status_bar(ctx, s, plan.status, &text);
     }
 
     /// Первая показанная строка при таком числе видимых.
@@ -1931,8 +1828,6 @@ const REFRESH: u32 = 'r' as u32;
 
 /// Переключить знакомый вид на настоящие имена и обратно.
 const VIEW: u32 = 'v' as u32;
-/// Закрыть окно.
-const QUIT: u32 = 'q' as u32;
 
 /// На сколько строк прокручивает просмотр страница.
 const PREVIEW_PAGE: usize = 20;
@@ -2421,128 +2316,55 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // ядро, — это и есть единственный допустимый источник по контракту `Args`.
     let args = unsafe { Args::new(argc, argv) };
 
-    let Some(info) = wait_for_graphics() else {
-        // Машина без графики — это не сбой: система работает в серийной линии,
-        // и показывать каталог просто негде.
-        println("files: no graphics on this machine, nothing to show");
-        exit(0)
-    };
-
-    // Формат точки и тема — первое, что нужно сделать, и сделать до всякой
-    // отрисовки. Оба счётчика у программы свои: адресное пространство своё, и
-    // заполненные ядром у себя ей не видны. Без формата окно вышло бы сплошь
-    // чёрным при совершенно исправной отрисовке, без темы — светлым на тёмном
-    // столе; обе ошибки глазами ищут долго.
-    mini_ui::use_raw_format(info.pixel_format);
-    theme::set_dark(info.flags & SYSINFO_DARK != 0);
-
+    // Графика, формат точки и тема — у каркаса (`user_progs::app`, фаза С8).
+    let info = app::start(&SPEC);
     let start = starting_dir(args.get(1));
     let home = if user_progs::uid() == 0 { "/root" } else { "/home" };
+    let size = window_size(&info);
 
-    let (width, height) = window_size(&info);
-    let scale = theme::geometry_scale(info.screen_w.max(1));
+    app::run(&SPEC, &info, size, move |_, _| {
+        let view = Files::new(start, home.to_string());
+        // Что именно прочитано — в журнал, по разу на каждый каталог.
+        // Нарисованное на экране снаружи не проверить, а строка проверяется:
+        // она и отличает «список показан» от «окно нарисовано пустым».
+        view.report();
+        view
+    })
+}
 
-    let Some(mut window) = open_patiently(width, height) else {
-        println("files: FAILED the desktop never freed up; no window");
-        exit(1)
-    };
-
-    let base = window.pixels().as_mut_ptr();
-    // SAFETY: ядро отобразило ровно `width * height` точек по этому адресу и
-    // держит их, пока живо окно. Второй ссылки на них нет — `window` больше
-    // пикселей никому не отдаёт.
-    let Some(mut surface) = (unsafe { Surface::from_raw(base, width, height) }) else {
-        println("files: FAILED the surface the kernel gave makes no sense");
-        exit(1)
-    };
-
-    let area = Rect::new(0, 0, width, height);
-    let ctx = Ctx::scaled(scale);
-    let mut view = Files::new(start, home.to_string());
-
-    println(&format!("files: window '{TITLE}' opened, {width}x{height}"));
-    // Что именно прочитано — в журнал, по разу на каждый каталог. Нарисованное
-    // на экране снаружи не проверить, а строка проверяется: она и отличает
-    // «список показан» от «окно нарисовано пустым».
-    view.report();
-
-    let mut dark = info.flags & SYSINFO_DARK != 0;
-    let mut next_theme = monotonic_ms() + THEME_PERIOD_MS;
-    let mut dirty = true;
-    let reason;
-
-    'live: loop {
-        while let Some(event) = window.next_event() {
-            match event.kind {
-                // Просьба закрыться — крестиком или Ctrl+W. Соглашаемся сразу:
-                // несохранённого у менеджера нет.
-                WIN_CLOSE => {
-                    reason = "request";
-                    break 'live;
-                }
-                WIN_KEY if event.code == QUIT && view.preview.is_none() => {
-                    reason = "'q'";
-                    break 'live;
-                }
-                WIN_KEY => {
-                    if view.key(event.code) {
-                        view.report_if_moved();
-                        dirty = true;
-                    }
-                }
-                WIN_POINTER => {
-                    // Двойка — правая кнопка, единица — левая.
-                    let handled = if event.code == 2 {
-                        view.click_right(area, ctx, event.x, event.y)
-                    } else {
-                        view.click(area, ctx, event.x, event.y)
-                    };
-                    if handled {
-                        view.report_if_moved();
-                        dirty = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let now = monotonic_ms();
-        if now >= next_theme {
-            next_theme = now + THEME_PERIOD_MS;
-            if let Some(fresh) = sysinfo() {
-                let fresh_dark = fresh.flags & SYSINFO_DARK != 0;
-                if fresh_dark != dark {
-                    dark = fresh_dark;
-                    theme::set_dark(dark);
-                    println(if dark {
-                        "files: repainted for the dark theme"
-                    } else {
-                        "files: repainted for the light theme"
-                    });
-                    dirty = true;
-                }
-            }
-        }
-
-        if dirty {
-            // Контекст пересобирается на каждый кадр, а не хранится: он держит
-            // палитру и сведённую подложку, а обе меняются вместе с темой.
-            view.draw(&mut surface, area, Ctx::scaled(scale));
-            // Отказ здесь — **не** сбой, и выходить из-за него нельзя. Занятый
-            // стол отвечает `ERR_AGAIN`, а пропущенный кадр ничего не стоит:
-            // следующий виток нарисует то же самое. Ровно на этом монитор
-            // системы падал и поднимался супервизором по кругу.
-            if window.commit() >= 0 {
-                dirty = false;
-            }
-        }
-
-        nanosleep(0, POLL_NS);
+/// Окно и цикл — у каркаса; здесь только то, чем «Файлы» отвечают на ввод.
+///
+/// Собственные методы названы иначе (`render`, `on_key`, `on_click`), чем
+/// методы трейта: при одинаковых именах вызов из реализации трейта держался бы
+/// на правиле «собственный метод важнее», и одна опечатка превратила бы его в
+/// тихую бесконечную рекурсию.
+impl App for Files {
+    fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
+        self.render(s, area, ctx);
     }
 
-    println(&format!("files: closing on {reason}"));
-    window.close();
-    exit(0)
+    fn key(&mut self, code: u32) -> bool {
+        self.on_key(code)
+    }
+
+    fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        self.on_click(area, ctx, x, y)
+    }
+
+    fn click_right(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        self.on_click_right(area, ctx, x, y)
+    }
+
+    fn after_input(&mut self) {
+        self.report_if_moved();
+    }
+
+    /// `q` закрывает окно только тогда, когда это не буква. До фазы С8
+    /// проверялся лишь просмотр файла, и имя с буквой «q», набранное в поле
+    /// переименования, закрывало окно на полуслове.
+    fn quits_on_q(&self) -> bool {
+        self.preview.is_none() && self.menu.is_none()
+    }
 }
 
 impl Files {
@@ -2629,39 +2451,3 @@ fn window_size(info: &SysInfo) -> (u32, u32) {
     (w, h)
 }
 
-/// Попросить окно столько раз, сколько нужно.
-fn open_patiently(width: u32, height: u32) -> Option<Window> {
-    let deadline = monotonic_ms() + OPEN_WAIT_MS;
-    loop {
-        match Window::open(TITLE, width, height) {
-            Ok(window) => return Some(window),
-            Err(code) => {
-                // Всё, кроме «попробуйте ещё», окончательно: окна такого
-                // размера не дадут никогда, сколько ни проси.
-                if code != user_progs::ERR_AGAIN {
-                    println(&format!("files: FAILED opening the window: {code}"));
-                    return None;
-                }
-            }
-        }
-        if monotonic_ms() >= deadline {
-            return None;
-        }
-        nanosleep(0, POLL_NS);
-    }
-}
-
-/// Дождаться, пока система скажет формат точки, — это и значит «графика есть».
-fn wait_for_graphics() -> Option<SysInfo> {
-    let deadline = monotonic_ms() + WAIT_GRAPHICS_MS;
-    loop {
-        let info = sysinfo()?;
-        if info.pixel_format != 0 && info.screen_w != 0 {
-            return Some(info);
-        }
-        if monotonic_ms() >= deadline {
-            return None;
-        }
-        nanosleep(0, POLL_NS);
-    }
-}

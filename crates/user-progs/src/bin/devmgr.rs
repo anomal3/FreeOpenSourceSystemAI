@@ -4,7 +4,7 @@
 //! # Зачем
 //!
 //! Правило вехи v0.7b: человек с Windows не должен выяснять расспросами, почему
-//! «сеть не работает». До этой фазы ответ жил только в журнале загрузки —
+//! «сеть не работает». До фазы С7 ответ жил только в журнале загрузки —
 //! строками вроде `network : no virtio-net card attached`, — а журнала на чужой
 //! машине нет вовсе. Окно показывает то же самое словами: каждое устройство на
 //! шине PCI, на USB и каждый диск, драйвер ядра и его состояние.
@@ -13,7 +13,8 @@
 //!
 //! Всё — вызовом `SYS_DEVICES`, строками. Ядро обходит шину PCI заново на каждый
 //! вопрос и спрашивает драйверы, что они подняли; окно только раскладывает это
-//! по группам и переводит классы на русский.
+//! по группам и переводит классы на русский. Окно и цикл — у `user_progs::app`,
+//! панели, таблица и пометка о строках за краем — у `mini_ui::kit` (фаза С8).
 //!
 //! # Чего окно не умеет и говорит об этом
 //!
@@ -31,27 +32,25 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use mini_ui::glyphicon::Icon;
+use mini_ui::kit::{self, Frame, Table};
 use mini_ui::paint::{self, Ctx, RowState, Tone};
 use mini_ui::typeface::Role;
-use mini_ui::{Rect, Surface, draw, theme};
+use mini_ui::{Rect, Surface};
+use user_progs::app::{self, App, Spec};
 use user_progs::{
-    Args, SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME,
-    WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_UP, WIN_POINTER, Window, devices, exit,
-    monotonic_ms, nanosleep, println, sysinfo,
+    SysInfo, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP,
+    WIN_KEY_UP, devices, println,
 };
 
-/// Имя окна. Латиницей: по нему стенд наводит мышь.
-const TITLE: &str = "Device Manager";
+const SPEC: Spec = Spec {
+    name: "devmgr",
+    title: "Device Manager",
+    // Устройства меняются редко — горячим подключением, — и чаще спрашивать
+    // шину незачем.
+    period_ms: 3_000,
+};
 
-/// Как часто перечитывать перепись. Устройства меняются редко — горячим
-/// подключением, — и чаще спрашивать шину незачем.
-const PERIOD_MS: u64 = 3_000;
-const POLL_NS: u32 = 30_000_000;
 const DEVICES_LIMIT: usize = 16 * 1024;
-const OPEN_WAIT_MS: u64 = 30_000;
-const WAIT_GRAPHICS_MS: u64 = 10_000;
-
-const QUIT: u32 = 'q' as u32;
 const REFRESH: u32 = 'r' as u32;
 
 // ---------------------------------------------------------------------------
@@ -289,6 +288,15 @@ struct Manager {
     last_log: String,
 }
 
+/// Столбцы по важности: узкое окно теряет сначала место и идентификатор, а не
+/// состояние. Снимок AArch64 с окном в 682 точки показал обратное — исчезал
+/// именно «СОСТОЯНИЕ», ради которого окно и открывают.
+const TITLES: [&str; 5] = ["УСТРОЙСТВО", "ДРАЙВЕР", "СОСТОЯНИЕ", "МЕСТО", "ИДЕНТИФИКАТОР"];
+
+fn columns(ctx: Ctx, table: &Table) -> Vec<Rect> {
+    table.columns(ctx, &[0, ctx.px(100), ctx.px(190), ctx.px(120), ctx.px(110)], ctx.px(200))
+}
+
 impl Manager {
     fn new() -> Self {
         let mut manager = Self { devices: Vec::new(), rows: Vec::new(), selected: 0, last_log: String::new() };
@@ -345,6 +353,18 @@ impl Manager {
         }
     }
 
+    /// Первая показанная строка списка: выбранное устройство всегда на экране.
+    fn first_row(&self, shown: usize) -> usize {
+        let at = self
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Device(index) if *index == self.selected))
+            .unwrap_or(0);
+        kit::first_visible(at, shown)
+    }
+}
+
+impl App for Manager {
     fn key(&mut self, code: u32) -> bool {
         let last = self.devices.len().saturating_sub(1);
         match code {
@@ -360,36 +380,13 @@ impl Manager {
         true
     }
 
-    /// Номер строки списка, с которой начинается видимая часть: выбранное
-    /// устройство всегда на экране.
-    fn first_visible(&self, visible: usize) -> usize {
-        let at = self
-            .rows
-            .iter()
-            .position(|row| matches!(row, Row::Device(index) if *index == self.selected))
-            .unwrap_or(0);
-        if visible == 0 || at < visible { 0 } else { at + 1 - visible }
-    }
-
-    /// Сколько строк списка показывается: если все не помещаются, последняя
-    /// отдана пометке о скрытых.
-    fn shown(&self, plan: &Plan) -> usize {
-        let visible = plan.visible();
-        if self.rows.len() > visible { visible.saturating_sub(1) } else { visible }
-    }
-
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
-        let plan = layout(ctx, area);
-        if !plan.list.contains(x, y) {
+        let table = Table::new(ctx, Frame::new(ctx, area).body).with_row(ctx.px(30));
+        let shown = table.shown(self.rows.len());
+        let Some(offset) = table.offset_at(x, y, shown) else {
             return false;
-        }
-        let offset = ((y - plan.list.y) / plan.row_h.max(1) as i32).max(0) as usize;
-        let shown = self.shown(&plan);
-        if offset >= shown {
-            return false;
-        }
-        let first = self.first_visible(shown);
-        match self.rows.get(first + offset) {
+        };
+        match self.rows.get(self.first_row(shown) + offset) {
             Some(Row::Device(index)) => {
                 self.select(*index);
                 true
@@ -398,28 +395,21 @@ impl Manager {
         }
     }
 
+    fn tick(&mut self, _info: &SysInfo) -> bool {
+        self.refresh();
+        true
+    }
+
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
         let p = ctx.palette;
-        s.fill(area, theme::window_bg());
-        let plan = layout(ctx, area);
+        s.fill(area, mini_ui::theme::window_bg());
+        let frame = Frame::new(ctx, area);
 
         // Панель: что это и сколько всего.
-        s.fill(plan.toolbar, ctx.flat(p.panel));
-        draw::hline(s, plan.toolbar.x, plan.toolbar.bottom() - 1, plan.toolbar.w, p.line.color, p.line.alpha);
-        let bar = ctx.on(theme::panel_bg());
-        let pad = ctx.px(16);
-        paint::text_clipped(
-            bar,
-            s,
-            Role::Title,
-            plan.toolbar.x + pad as i32,
-            paint::baseline(bar, Role::Title, plan.toolbar),
-            plan.toolbar.w / 2,
-            "Устройства этого компьютера",
-            p.ink2,
-        );
-        let missing = self.devices.iter().filter(|device| device.state == State::Missing).count();
+        let bar = kit::toolbar(ctx, s, frame.toolbar);
+        kit::toolbar_title(bar, s, frame.toolbar, "Устройства этого компьютера");
         let total = self.devices.len();
+        let missing = self.devices.iter().filter(|device| device.state == State::Missing).count();
         let count = if missing == 0 {
             format!("{total} {}", devices_word(total))
         } else {
@@ -429,33 +419,20 @@ impl Manager {
             bar,
             s,
             Role::Mono,
-            plan.toolbar.right() - pad as i32,
-            paint::baseline(bar, Role::Mono, plan.toolbar),
+            frame.toolbar.right() - ctx.px(16) as i32,
+            paint::baseline(bar, Role::Mono, frame.toolbar),
             &count,
             if missing == 0 { p.ink3 } else { p.bad_ink },
         );
 
-        // Шапка столбцов.
-        let cols = plan.columns(ctx);
-        let y = paint::baseline(ctx, Role::MonoCaps, plan.header);
-        for (rect, title) in cols.iter().zip(["УСТРОЙСТВО", "ДРАЙВЕР", "СОСТОЯНИЕ", "МЕСТО", "ИДЕНТИФИКАТОР"]) {
-            if rect.w > 0 {
-                paint::caps(ctx, s, rect.x, y, title);
-            }
-        }
-        draw::hline(
-            s,
-            plan.header.x + ctx.px(12) as i32,
-            plan.header.bottom() - 1,
-            plan.header.w.saturating_sub(ctx.px(24)),
-            p.line.color,
-            p.line.alpha,
-        );
+        let table = Table::new(ctx, frame.body).with_row(ctx.px(30));
+        let cols = columns(ctx, &table);
+        table.draw_header(ctx, s, &cols, &TITLES);
 
-        let visible = self.shown(&plan);
-        let first = self.first_visible(visible);
-        for (offset, row) in self.rows.iter().skip(first).take(visible).enumerate() {
-            let rect = plan.row_rect(ctx, offset);
+        let shown = table.shown(self.rows.len());
+        let first = self.first_row(shown);
+        for (offset, row) in self.rows.iter().skip(first).take(shown).enumerate() {
+            let rect = table.row_rect(ctx, offset);
             match *row {
                 Row::Header(bus, count) => {
                     let text = format!("{} · {count}", bus.title());
@@ -484,36 +461,15 @@ impl Manager {
                         (device.id.clone(), Role::Mono, p.ink4),
                     ];
                     for (column, (col, (text, role, ink))) in cols.iter().zip(cells).enumerate() {
-                        if col.w == 0 {
-                            continue;
-                        }
                         let x = if column == 0 { tile.right() + ctx.px(10) as i32 } else { col.x };
-                        let room = (col.right() - x - ctx.px(8) as i32).max(0) as u32;
-                        paint::text_clipped(ctx, s, role, x, paint::baseline(ctx, role, rect), room, &text, ink);
+                        kit::cell(ctx, s, *col, x, rect, role, &text, ink);
                     }
                 }
             }
         }
-        // Строки за краем названы, а не молча отрезаны: на снимке x86 группа
-        // «ДИСКИ · 1» стояла последней видимой строкой, а сам диск — под краем,
-        // и окно читалось как «диск не найден».
-        if self.rows.len() > plan.visible() {
-            let below = self.rows.len().saturating_sub(first + visible);
-            let rect = plan.row_rect(ctx, visible);
-            let text = format!("строк выше: {first}, ниже: {below} — стрелки, PageUp, PageDown");
-            paint::text_clipped(
-                ctx,
-                s,
-                Role::Caption,
-                rect.x + ctx.px(6) as i32,
-                paint::baseline(ctx, Role::Caption, rect),
-                rect.w,
-                &text,
-                p.ink3,
-            );
-        }
+        table.draw_overflow(ctx, s, self.rows.len(), first, shown);
         if self.devices.is_empty() {
-            let rect = plan.row_rect(ctx, 0);
+            let rect = table.row_rect(ctx, 0);
             paint::text_clipped(
                 ctx,
                 s,
@@ -527,8 +483,6 @@ impl Manager {
         }
 
         // Строка состояния: выбранное устройство одной фразой.
-        s.fill(plan.status, ctx.flat(p.panel));
-        draw::hline(s, plan.status.x, plan.status.y, plan.status.w, p.line2.color, p.line2.alpha);
         let text = match self.devices.get(self.selected) {
             Some(device) => {
                 let serves = match (device.state, device.driver.as_deref()) {
@@ -541,211 +495,13 @@ impl Manager {
             }
             None => String::from("Стрелки — выбрать устройство    R — обновить"),
         };
-        let pad = ctx.px(14);
-        paint::text_clipped(
-            bar,
-            s,
-            Role::MonoSmall,
-            plan.status.x + pad as i32,
-            paint::baseline(bar, Role::MonoSmall, plan.status),
-            plan.status.w.saturating_sub(pad * 2),
-            &text,
-            p.ink4,
-        );
+        kit::status_bar(ctx, s, frame.status, &text);
     }
 }
-
-struct Plan {
-    toolbar: Rect,
-    header: Rect,
-    list: Rect,
-    status: Rect,
-    row_h: u32,
-}
-
-impl Plan {
-    fn visible(&self) -> usize {
-        (self.list.h / self.row_h.max(1)) as usize
-    }
-
-    fn row_rect(&self, ctx: Ctx, offset: usize) -> Rect {
-        let pad = ctx.px(12);
-        Rect::new(
-            self.list.x + pad as i32,
-            self.list.y + (offset as u32 * self.row_h) as i32,
-            self.list.w.saturating_sub(pad * 2),
-            self.row_h.saturating_sub(ctx.px(2)),
-        )
-    }
-
-    /// Столбцы: имя тянется, остальные — по ширине содержимого; узкое окно
-    /// теряет столбцы справа налево, как у диспетчера задач.
-    fn columns(&self, ctx: Ctx) -> [Rect; 5] {
-        // Порядок — по важности: первыми уходят место и идентификатор, а не
-        // состояние. Снимок AArch64 с окном в 682 точки показал обратное —
-        // исчезал именно «СОСТОЯНИЕ», ради которого окно и открывают.
-        let widths = [0, ctx.px(100), ctx.px(190), ctx.px(120), ctx.px(110)];
-        let left = self.list.x + ctx.px(24) as i32;
-        let right = self.list.right() - ctx.px(22) as i32;
-        let name_min = ctx.px(200);
-        let mut used = 0u32;
-        let mut shown = 1;
-        for width in widths.iter().skip(1) {
-            if left + (name_min + used + width) as i32 > right {
-                break;
-            }
-            used += width;
-            shown += 1;
-        }
-        let mut out = [Rect::EMPTY; 5];
-        let mut x = right - used as i32;
-        out[0] = Rect::new(left, self.list.y, (x - left).max(0) as u32, self.list.h);
-        for index in 1..shown {
-            out[index] = Rect::new(x, self.list.y, widths[index], self.list.h);
-            x += widths[index] as i32;
-        }
-        out
-    }
-}
-
-fn layout(ctx: Ctx, area: Rect) -> Plan {
-    let toolbar_h = ctx.px(theme::TOOLBAR_H).min(area.h);
-    let toolbar = Rect::new(area.x, area.y, area.w, toolbar_h);
-    let status_h = ctx.px(theme::STATUS_H);
-    let status_y = (area.bottom() - status_h as i32).max(toolbar.bottom());
-    let status = Rect::new(area.x, status_y, area.w, status_h);
-    let body_h = (status.y - toolbar.bottom()).max(0) as u32;
-    let header_h = (u32::from(ctx.face(Role::MonoCaps).line) + ctx.px(14)).min(body_h);
-    let header = Rect::new(area.x, toolbar.bottom(), area.w, header_h);
-    let list = Rect::new(area.x, header.bottom(), area.w, body_h.saturating_sub(header_h));
-    Plan { toolbar, header, list, status, row_h: ctx.px(30) }
-}
-
-// ---------------------------------------------------------------------------
-// Запуск
-// ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
-    // SAFETY: значения пришли из `_start` ровно в том виде, в каком их положило
-    // ядро.
-    let _args = unsafe { Args::new(argc, argv) };
-
-    let Some(info) = wait_for_graphics() else {
-        println("devmgr: no graphics on this machine, nothing to show");
-        exit(0)
-    };
-    mini_ui::use_raw_format(info.pixel_format);
-    theme::set_dark(info.flags & SYSINFO_DARK != 0);
-
-    let width = (info.screen_w * 2 / 3).clamp(320, info.screen_w.max(320));
-    let height = (info.screen_h * 2 / 3).clamp(240, info.screen_h.max(240));
-    let scale = theme::geometry_scale(info.screen_w.max(1));
-
-    let Some(mut window) = open_patiently(width, height) else {
-        println("devmgr: FAILED the desktop never freed up; no window");
-        exit(1)
-    };
-    let base = window.pixels().as_mut_ptr();
-    // SAFETY: ядро отобразило ровно `width * height` точек по этому адресу и
-    // держит их, пока живо окно; второй ссылки на них нет.
-    let Some(mut surface) = (unsafe { Surface::from_raw(base, width, height) }) else {
-        println("devmgr: FAILED the surface the kernel gave makes no sense");
-        exit(1)
-    };
-
-    let area = Rect::new(0, 0, width, height);
-    let ctx = Ctx::scaled(scale);
-    println(&format!("devmgr: window '{TITLE}' opened, {width}x{height}"));
-    let mut manager = Manager::new();
-
-    let mut dark = info.flags & SYSINFO_DARK != 0;
-    let mut next = monotonic_ms() + PERIOD_MS;
-    let mut dirty = true;
-    let reason;
-
-    'live: loop {
-        while let Some(event) = window.next_event() {
-            match event.kind {
-                WIN_CLOSE => {
-                    reason = "request";
-                    break 'live;
-                }
-                WIN_KEY if event.code == QUIT => {
-                    reason = "'q'";
-                    break 'live;
-                }
-                WIN_KEY => {
-                    if manager.key(event.code) {
-                        dirty = true;
-                    }
-                }
-                WIN_POINTER if event.code != 2 => {
-                    if manager.click(area, ctx, event.x, event.y) {
-                        dirty = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let now = monotonic_ms();
-        if now >= next {
-            next = now + PERIOD_MS;
-            manager.refresh();
-            if let Some(fresh) = sysinfo() {
-                let fresh_dark = fresh.flags & SYSINFO_DARK != 0;
-                if fresh_dark != dark {
-                    dark = fresh_dark;
-                    theme::set_dark(dark);
-                }
-            }
-            dirty = true;
-        }
-
-        if dirty {
-            manager.draw(&mut surface, area, Ctx::scaled(scale));
-            if window.commit() >= 0 {
-                dirty = false;
-            }
-        }
-        nanosleep(0, POLL_NS);
-    }
-
-    println(&format!("devmgr: closing on {reason}"));
-    window.close();
-    exit(0)
-}
-
-fn open_patiently(width: u32, height: u32) -> Option<Window> {
-    let deadline = monotonic_ms() + OPEN_WAIT_MS;
-    loop {
-        match Window::open(TITLE, width, height) {
-            Ok(window) => return Some(window),
-            Err(code) => {
-                if code != user_progs::ERR_AGAIN {
-                    println(&format!("devmgr: FAILED opening the window: {code}"));
-                    return None;
-                }
-            }
-        }
-        if monotonic_ms() >= deadline {
-            return None;
-        }
-        nanosleep(0, POLL_NS);
-    }
-}
-
-fn wait_for_graphics() -> Option<SysInfo> {
-    let deadline = monotonic_ms() + WAIT_GRAPHICS_MS;
-    loop {
-        let info = sysinfo()?;
-        if info.pixel_format != 0 && info.screen_w != 0 {
-            return Some(info);
-        }
-        if monotonic_ms() >= deadline {
-            return None;
-        }
-        nanosleep(0, POLL_NS);
-    }
+pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
+    let info = app::start(&SPEC);
+    let size = app::two_thirds(&info);
+    app::run(&SPEC, &info, size, |_, _| Manager::new())
 }

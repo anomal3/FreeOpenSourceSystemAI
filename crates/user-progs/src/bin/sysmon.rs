@@ -5,26 +5,25 @@
 //! Это окно было **частью ядра**. Модуль `ui` заводил его при старте стола,
 //! оболочка раз в секунду собирала строку из `mm::frame`, `mm::heap` и
 //! планировщика и печатала её в текстовую сетку. Теперь окно заводит программа,
-//! числа приезжают одним системным вызовом, а рисует их тоже она — теми же
-//! `mini-ui`, которыми рисует себя стол.
+//! числа приезжают одним системным вызовом, а рисует их тоже она.
 //!
 //! Смысл переезда не в красоте. Монитор — это разбор и показ чужих чисел, и
 //! падать он обязан вместе со своим окном, а не вместе с машиной.
+//!
+//! # Фаза С8: окно, а не терминал
+//!
+//! До неё монитор рисовал семь строк встроенным шрифтом 8×8 по точке — и
+//! выглядел кусочком консоли посреди стола, где всё остальное нарисовано
+//! сглаженным шрифтом, полосами и карточками. Теперь он собран из того же
+//! набора, что диспетчер задач (`mini_ui::kit`), а окно и цикл — у
+//! `user_progs::app`. Строки журнала прежние: на окне «System» стоит десяток
+//! шагов стенда.
 //!
 //! # Почему числа приезжают одной структурой
 //!
 //! Потому что показываются они **рядом**, и картина, склеенная из десяти
 //! снимков, взятых в разные мгновения, врёт тем убедительнее, чем быстрее
 //! меняется система. Один вызов — один миг.
-//!
-//! # Почему формат точки приходится спрашивать
-//!
-//! Потому что упаковка цвета зависит от машины: её знает прошивка, а прошивку
-//! программа не видит. `mini-ui` держит формат в глобальном счётчике, который
-//! ядро заполняет при создании экрана, — но у программы своё адресное
-//! пространство и свой экземпляр этого счётчика, пустой. Без переданного числа
-//! `Color::pixel` отвечала бы нулём, и окно вышло бы **сплошь чёрным при
-//! совершенно исправной отрисовке** — ошибка, которую глазами ищут долго.
 
 #![no_std]
 #![no_main]
@@ -32,210 +31,90 @@
 extern crate alloc;
 
 use alloc::format;
+use alloc::string::String;
 
-use mini_ui::text::draw_glyph_at;
-use mini_ui::{Color, Surface};
-use user_progs::{
-    SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, Window, exit, monotonic_ms, nanosleep, println,
-    sysinfo,
+use mini_ui::kit::{self, Frame};
+use mini_ui::paint::{self, Ctx, Tone};
+use mini_ui::typeface::Role;
+use mini_ui::{Rect, Surface, theme};
+use user_progs::app::{self, App, Spec};
+use user_progs::{SYSINFO_DARK, SysInfo, println};
+
+/// Имя окна — латиницей и именно это слово: по нему стенд наводит мышь
+/// (`Aim::Title("System")`), и оно же стояло у окна, пока оно было частью ядра.
+const SPEC: Spec = Spec {
+    name: "sysmon",
+    title: "System",
+    // Кадр монитора стоит заметно в отладочной сборке, а числа, меняющиеся
+    // быстрее, чем их успевают прочесть, ничего не сообщают.
+    period_ms: 5_000,
 };
 
-/// Имя окна.
-///
-/// Латиницей и именно это слово: по нему автоматический стенд наводит мышь
-/// (`Aim::Title("System")`), и оно же стояло у окна, пока оно было частью ядра.
-/// Переезд не должен быть заметен снаружи — в этом половина его проверки.
-const TITLE: &str = "System";
+/// Размер окна. Три полосы и строка фактов — и не больше: окно, которое
+/// стоит дорого, съедает машину, а монитор съедать её не должен.
+const WIDTH: u32 = 360;
+const HEIGHT: u32 = 300;
 
-/// Размер окна в точках.
-///
-/// Считается от того, что в нём показывают, и **от того, во что обходится
-/// кадр**. Второе оказалось важнее: окно 420×260 стоило в отладочной сборке
-/// около четырёхсот миллисекунд — заливка, глифы по точкам, копия в окно и
-/// копия на экран, — и монитор съедал пятую часть машины. Столько же примерно
-/// длилась потеря ввода: система не успевала вычитывать серийную линию, и
-/// команды пропадали целиком.
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 200;
-
-/// Ширина знака встроенного шрифта. Он растровый, 8×8, и другого размера у него
-/// не бывает — отсюда число, а не вопрос к шрифту.
-const GLYPH: u32 = 8;
-
-/// Во сколько раз увеличен шрифт.
-const SCALE: u32 = 2;
-
-/// Как часто перечитывать счётчики.
-///
-/// Пять секунд. В ядре окно обновлялось раз в секунду — и могло себе позволить:
-/// оно рисовало сеткой символов, которая перекрашивает только изменившиеся
-/// знаки, и рисовало **в задаче самой оболочки**, то есть не отнимало у неё
-/// времени. Программа рисует иначе: заливка, глифы, копия — и отнимает.
-///
-/// Первый прогон показал цену прямо: монитор с периодом в секунду съедал пятую
-/// часть машины, система переставала успевать вычитывать серийную линию, и ввод
-/// пропадал целиком — ни команд, ни движений мыши. Человек разницы между
-/// секундой и пятью не замечает, а машина замечает очень.
-const PERIOD_MS: u64 = 5_000;
-
-/// Пауза между опросами очереди событий.
-const POLL_NS: u32 = 50_000_000;
-
-/// Клавиша, закрывающая окно.
-const QUIT: u32 = 'q' as u32;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
-    let Some(first) = wait_for_graphics() else {
-        // Машина без графики — это не сбой: система работает в серийной линии,
-        // и показывать счётчики просто негде.
-        println("sysmon: no graphics on this machine, nothing to show");
-        exit(0)
-    };
-
-    // Формат точки — первое, что нужно сделать, и сделать до всякой отрисовки.
-    mini_ui::use_raw_format(first.pixel_format);
-
-    let Some(mut window) = open_patiently() else {
-        println("sysmon: FAILED the desktop never freed up; no window");
-        exit(1)
-    };
-
-    // Поверхность окна оборачивается один раз: адрес её не меняется, пока живо
-    // окно, а размер задан при открытии.
-    let base = window.pixels().as_mut_ptr();
-    // SAFETY: ядро отобразило ровно `WIDTH * HEIGHT` точек по этому адресу и
-    // держит их, пока живо окно. Второй ссылки на них нет — `window` больше
-    // пикселей никому не отдаёт.
-    let Some(mut surface) = (unsafe { Surface::from_raw(base, WIDTH, HEIGHT) }) else {
-        println("sysmon: FAILED the surface the kernel gave makes no sense");
-        exit(1)
-    };
-
-    println(&format!("sysmon: window '{TITLE}' opened, {WIDTH}x{HEIGHT}"));
-    // Первые числа — в журнал, по одному разу. Это и есть доказательство, что
-    // счётчики ядра доехали до программы: нарисованное на экране снаружи не
-    // проверить, а строка проверяется.
-    report(&first);
-
-    let mut drawn = 0u64;
-    let mut next = 0u64;
-    let mut info = first;
-    // Почему вышли — решается внутри цикла, а закрывается окно **после** него.
-    // Закрытие забирает владение окном, и сделать его внутри значило бы
-    // перемещать то, чем цикл пользуется на следующем витке.
-    let reason;
-
-    'live: loop {
-        while let Some(event) = window.next_event() {
-            match event.kind {
-                // Просьба закрыться. Соглашаемся сразу: спрашивать «сохранить?»
-                // монитору нечего.
-                WIN_CLOSE => {
-                    reason = "request";
-                    break 'live;
-                }
-                WIN_KEY if event.code == QUIT => {
-                    reason = "'q'";
-                    break 'live;
-                }
-                _ => {}
-            }
-        }
-
-        let now = monotonic_ms();
-        if now >= next {
-            next = now + PERIOD_MS;
-            if let Some(fresh) = sysinfo() {
-                // Смена темы видна по одному биту, и перерисовать окно надо
-                // целиком: фон меняется весь.
-                let repainted = fresh.flags != info.flags;
-                info = fresh;
-                paint(&mut surface, &info);
-                // Отказ здесь — **не** сбой, и выходить из-за него нельзя.
-                // Занятый стол отвечает `ERR_AGAIN`, а пропущенный кадр
-                // монитора не стоит ничего: следующий будет через две секунды,
-                // и числа в нём свежее. Первая версия считала это фатальным —
-                // монитор падал, супервизор поднимал его заново, новое окно
-                // забирало фокус, и стол превращался в чехарду.
-                if window.commit() < 0 {
-                    continue;
-                }
-                drawn += 1;
-                if repainted {
-                    println(if info.flags & SYSINFO_DARK != 0 {
-                        "sysmon: repainted for the dark theme"
-                    } else {
-                        "sysmon: repainted for the light theme"
-                    });
-                }
-            }
-        }
-
-        nanosleep(0, POLL_NS);
-    }
-
-    println(&format!("sysmon: closing on {reason} after {drawn} frame(s)"));
-    window.close();
-    exit(0)
+struct Monitor {
+    info: SysInfo,
 }
 
-/// Сколько всего ждать окна при запуске.
-///
-/// Полминуты. Обвязка отступает перед занятым столом две секунды, и при загрузке
-/// этого мало: система в это время много печатает, а каждая строка в окне
-/// оболочки — перерисовка, на которую стол берут целиком. Монитор, сдавшийся на
-/// второй секунде, падал и поднимался супервизором снова и снова.
-const OPEN_WAIT_MS: u64 = 30_000;
+impl App for Monitor {
+    fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
+        let p = ctx.palette;
+        let info = &self.info;
+        s.fill(area, theme::window_bg());
 
-/// Попросить окно столько раз, сколько нужно.
-///
-/// `None` — стол так и не освободился за [`OPEN_WAIT_MS`]; это уже не «занят», а
-/// «что-то не так», и молчать о таком нельзя.
-fn open_patiently() -> Option<Window> {
-    let deadline = monotonic_ms() + OPEN_WAIT_MS;
-    loop {
-        match Window::open(TITLE, WIDTH, HEIGHT) {
-            Ok(window) => return Some(window),
-            Err(code) => {
-                // Всё, кроме «попробуйте ещё», окончательно: окна такого
-                // размера не дадут никогда, сколько ни проси.
-                if code != user_progs::ERR_AGAIN {
-                    println(&format!("sysmon: FAILED opening the window: {code}"));
-                    return None;
-                }
+        // Панели сверху у монитора нет: заголовок окна уже говорит, что это,
+        // а место под три полосы в маленьком окне дороже.
+        let frame = Frame::new(ctx, area);
+        let body = Rect::new(area.x, area.y, area.w, (frame.status.y - area.y).max(0) as u32);
+        let pad = ctx.px(14);
+        let x = body.x + pad as i32;
+        let room = body.w.saturating_sub(pad * 2);
+        let mut y = body.y + ctx.px(18) as i32;
+
+        let mib = 1024 * 1024;
+        let memory_used = info.frames_total.saturating_sub(info.frames_free);
+        let heap_used = info.heap_size.saturating_sub(info.heap_free);
+        let bars = [
+            ("ПАМЯТЬ", memory_used, info.frames_total, format!("{} МиБ свободно из {}", info.frames_free / mib, info.frames_total / mib), Tone::Accent),
+            ("КУЧА ЯДРА", heap_used, info.heap_size, format!("{} КиБ свободно", info.heap_free / 1024), Tone::Ok),
+            ("ПАМЯТЬ УСТРОЙСТВ", info.dma_used, info.dma_total, format!("{} из {} КиБ", info.dma_used / 1024, info.dma_total / 1024), Tone::Warn),
+        ];
+        let scale = |value: u64| u32::try_from(value / 4096).unwrap_or(u32::MAX);
+        // Подпись и полоса — с тем же шагом, что во вкладке производительности
+        // диспетчера задач. Первая версия ставила полосу через восемь точек, и
+        // на снимке она срезала подписи снизу.
+        for (title, done, total, text, tone) in bars {
+            paint::caps(ctx, s, x, y, title);
+            paint::text_right(ctx, s, Role::Caption, x + room as i32, y, &text, p.ink3);
+            y += ctx.px(20) as i32;
+            paint::progress(ctx, s, Rect::new(x, y, room, ctx.px(10)), scale(done), scale(total), tone);
+            y += ctx.px(32) as i32;
+        }
+
+        let facts = [
+            format!("Работает {}", uptime_text(info.uptime_ms)),
+            format!("задач {} · окон {}", info.tasks_alive, info.windows),
+            format!("клавиш {} принято, {} потеряно", info.keys_posted, info.keys_dropped),
+        ];
+        let step = i32::from(ctx.face(Role::Body).line) + ctx.px(2) as i32;
+        for fact in facts {
+            if y + step > body.bottom() {
+                break;
             }
+            paint::text_clipped(ctx, s, Role::Body, x, y, room, &fact, p.ink2);
+            y += step;
         }
-        if monotonic_ms() >= deadline {
-            return None;
-        }
-        nanosleep(0, POLL_NS);
+
+        let status: String = format!("Обновляется раз в {} с    Q — закрыть", SPEC.period_ms / 1000);
+        kit::status_bar(ctx, s, frame.status, &status);
     }
-}
 
-/// Сколько ждать графики при запуске.
-///
-/// Монитор запускается службой, а стол поднимает ядро, и порядок между ними не
-/// обещан никем. Уйти по первому же «графики нет» значило бы остаться без окна
-/// на машине, где она появилась мгновением позже.
-const WAIT_GRAPHICS_MS: u64 = 10_000;
-
-/// Дождаться, пока система скажет формат точки, — это и значит «графика есть».
-///
-/// `None` — не дождались: либо машина без экрана, либо ядро вовсе не отвечает.
-/// Разницу здесь не различаем намеренно: ответ в обоих случаях один — показывать
-/// нечего и негде.
-fn wait_for_graphics() -> Option<SysInfo> {
-    let deadline = monotonic_ms() + WAIT_GRAPHICS_MS;
-    loop {
-        let info = sysinfo()?;
-        if info.pixel_format != 0 {
-            return Some(info);
-        }
-        if monotonic_ms() >= deadline {
-            return None;
-        }
-        nanosleep(0, POLL_NS);
+    fn tick(&mut self, info: &SysInfo) -> bool {
+        self.info = *info;
+        true
     }
 }
 
@@ -251,78 +130,23 @@ fn report(info: &SysInfo) {
         info.frames_total / (1024 * 1024)
     ));
     println(&format!("sysmon: tasks {} alive", info.tasks_alive));
-    println(&format!(
-        "sysmon: theme {}",
-        if info.flags & SYSINFO_DARK != 0 { "dark" } else { "light" }
-    ));
+    println(&format!("sysmon: theme {}", if info.flags & SYSINFO_DARK != 0 { "dark" } else { "light" }));
 }
 
-/// Цвета под текущую тему: фон, обычный текст, подпись.
-const fn palette(info: &SysInfo) -> (Color, Color, Color) {
-    if info.flags & SYSINFO_DARK != 0 {
-        (
-            Color::rgb(24, 24, 28),
-            Color::rgb(220, 220, 226),
-            Color::rgb(120, 180, 255),
-        )
-    } else {
-        (
-            Color::rgb(246, 246, 248),
-            Color::rgb(32, 32, 38),
-            Color::rgb(20, 90, 190),
-        )
-    }
+fn uptime_text(ms: u64) -> String {
+    let seconds = ms / 1000;
+    format!("{}:{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
 }
 
-/// Нарисовать окно целиком.
-fn paint(surface: &mut Surface, info: &SysInfo) {
-    let (back, ink, accent) = palette(info);
-    // Границы спрашиваются отдельной строкой: заливка берёт поверхность на
-    // запись, и вычислять аргумент из неё же в том же выражении нельзя.
-    let whole = surface.bounds();
-    surface.fill(whole, back);
-
-    let step = (GLYPH * SCALE) as i32 + 4;
-    let left = 12;
-    let mut y = 12;
-
-    line(surface, left, y, "FreeOS system monitor", accent);
-    y += step * 2;
-
-    // Строк семь, а не одиннадцать, и сокращение здесь не про вкус: каждая
-    // строка — это двадцать глифов, нарисованных по точке, и в отладочной
-    // сборке они стоят заметную долю кадра. Убрано то, что дублируется в
-    // оболочке (`ui`, `input`) или меняется слишком быстро, чтобы его успевали
-    // прочесть.
-    for text in [
-        format!("uptime  {} s", info.uptime_ms / 1000),
-        format!(
-            "memory  {} of {} MiB",
-            info.frames_free / (1024 * 1024),
-            info.frames_total / (1024 * 1024)
-        ),
-        format!("heap    {} KiB free", info.heap_free / 1024),
-        format!("dma     {} of {} KiB", info.dma_used / 1024, info.dma_total / 1024),
-        format!("tasks   {} alive", info.tasks_alive),
-        format!("keys    {} posted, {} lost", info.keys_posted, info.keys_dropped),
-        format!("windows {}", info.windows),
-    ] {
-        line(surface, left, y, &text, ink);
-        y += step;
-    }
-}
-
-/// Нарисовать строку встроенным шрифтом.
-///
-/// Без фона: окно уже залито, и второй раз закрашивать прямоугольник под каждым
-/// знаком значило бы рисовать всё дважды.
-fn line(surface: &mut Surface, x: i32, y: i32, text: &str, ink: Color) {
-    let mut at = x;
-    for ch in text.chars() {
-        // Строка, вылезшая за край окна, обрезается сама: `draw_glyph_at`
-        // отбрасывает то, что не попало в поверхность, и считает это обычным
-        // делом, а не ошибкой.
-        draw_glyph_at(surface, at, y, ch, SCALE, ink, None);
-        at += (GLYPH * SCALE) as i32;
-    }
+#[unsafe(no_mangle)]
+pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
+    let info = app::start(&SPEC);
+    // Окно не больше экрана: на крошечном экране монитор всё равно откроется.
+    let size = (WIDTH.min(info.screen_w.max(320)), HEIGHT.min(info.screen_h.max(200)));
+    app::run(&SPEC, &info, size, move |_, _| {
+        // Первые числа — в журнал, по одному разу и после строки об окне. Это
+        // и есть доказательство, что счётчики ядра доехали до программы.
+        report(&info);
+        Monitor { info }
+    })
 }

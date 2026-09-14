@@ -24,6 +24,8 @@
 extern crate alloc;
 
 pub mod http;
+/// Каркас программы с окном: окно, цикл событий, тема (фаза С8).
+pub mod app;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
