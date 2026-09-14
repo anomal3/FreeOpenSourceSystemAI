@@ -113,6 +113,15 @@ pub(crate) enum Native {
     ProcessorCount,
     Exit,
     CommandLine,
+    /// Окно формы `System.Windows.Forms.FreeOsWindow` (фаза N6a).
+    WindowOpen,
+    WindowFill,
+    WindowText,
+    TextWidth,
+    TextHeight,
+    WindowPresent,
+    WindowEvent,
+    WindowClose,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +302,14 @@ const TABLE: &[(&str, Native)] = &[
     ("System.Clock::ProcessorCount()", Native::ProcessorCount),
     ("System.Clock::Exit(int32)", Native::Exit),
     ("System.Clock::CommandLine()", Native::CommandLine),
+    ("System.Windows.Forms.FreeOsWindow::Open(string,int32,int32)", Native::WindowOpen),
+    ("System.Windows.Forms.FreeOsWindow::Fill(int32,int32,int32,int32,int32,int32)", Native::WindowFill),
+    ("System.Windows.Forms.FreeOsWindow::Text(int32,int32,int32,string,int32,int32,int32,int32,int32)", Native::WindowText),
+    ("System.Windows.Forms.FreeOsWindow::TextWidth(string)", Native::TextWidth),
+    ("System.Windows.Forms.FreeOsWindow::TextHeight()", Native::TextHeight),
+    ("System.Windows.Forms.FreeOsWindow::Present(int32)", Native::WindowPresent),
+    ("System.Windows.Forms.FreeOsWindow::NextEvent(int32,int32&,int32&,int32&)", Native::WindowEvent),
+    ("System.Windows.Forms.FreeOsWindow::Close(int32)", Native::WindowClose),
 ];
 
 pub(crate) fn lookup(key: &str) -> Option<Native> {
@@ -822,7 +839,86 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
             let ty = vm.array_of(string)?;
             Some(Value::Obj(Some(vm.heap.alloc(Object::Array { ty, items: crate::heap::Items::Values(values) })?)))
         }
+        Native::WindowOpen => {
+            let title = text_arg(vm, arg(0)?)?;
+            let (width, height) = (vm.int32(arg(1)?)?, vm.int32(arg(2)?)?);
+            let id = if width > 0 && height > 0 { vm.host.window_open(&title, width as u32, height as u32) } else { None };
+            Some(Value::I32(id.map_or(-1, |id| id as i32)))
+        }
+        Native::WindowFill => {
+            let window = window_arg(vm, arg(0)?)?;
+            let area = rect_arg(vm, [arg(1)?, arg(2)?, arg(3)?, arg(4)?])?;
+            let argb = vm.int32(arg(5)?)? as u32;
+            if let (Some(window), Some(area)) = (window, area) {
+                vm.host.window_fill(window, area, argb);
+            }
+            None
+        }
+        Native::WindowText => {
+            let window = window_arg(vm, arg(0)?)?;
+            let (x, y) = (vm.int32(arg(1)?)?, vm.int32(arg(2)?)?);
+            let text = text_arg(vm, arg(3)?)?;
+            let argb = vm.int32(arg(4)?)? as u32;
+            let clip = rect_arg(vm, [arg(5)?, arg(6)?, arg(7)?, arg(8)?])?;
+            if let (Some(window), Some(clip)) = (window, clip) {
+                vm.host.window_text(window, x, y, &text, argb, clip);
+            }
+            None
+        }
+        Native::TextWidth => {
+            let text = text_arg(vm, arg(0)?)?;
+            Some(Value::I32(vm.host.text_width(&text) as i32))
+        }
+        Native::TextHeight => Some(Value::I32(vm.host.text_height() as i32)),
+        Native::WindowPresent => {
+            if let Some(window) = window_arg(vm, arg(0)?)? {
+                vm.host.window_present(window);
+            }
+            None
+        }
+        Native::WindowEvent => {
+            let window = window_arg(vm, arg(0)?)?;
+            let (Value::Ptr(x_out), Value::Ptr(y_out), Value::Ptr(code_out)) = (arg(1)?, arg(2)?, arg(3)?) else {
+                return Err(vm.invalid("out argument is not a pointer"));
+            };
+            let (kind, x, y, code) = match window.and_then(|window| vm.host.window_event(window)) {
+                None => (0, 0, 0, 0),
+                Some(crate::WindowEvent::Key(symbol)) => (1, 0, 0, symbol as i32),
+                Some(crate::WindowEvent::Pointer { x, y, buttons }) => (2, x, y, buttons as i32),
+                Some(crate::WindowEvent::Close) => (3, 0, 0, 0),
+            };
+            vm.store(x_out, Value::I32(x))?;
+            vm.store(y_out, Value::I32(y))?;
+            vm.store(code_out, Value::I32(code))?;
+            Some(Value::I32(kind))
+        }
+        Native::WindowClose => {
+            if let Some(window) = window_arg(vm, arg(0)?)? {
+                vm.host.window_close(window);
+            }
+            None
+        }
     })
+}
+
+/// Строка-аргумент; `null` — пустая.
+fn text_arg<H: Host>(vm: &Vm<'_, H>, value: Value) -> Result<alloc::string::String, VmError> {
+    Ok(alloc::string::String::from_utf16_lossy(&vm.string_units(value)?.unwrap_or_default()))
+}
+
+/// Номер окна; отрицательный — окна нет.
+fn window_arg<H: Host>(vm: &Vm<'_, H>, value: Value) -> Result<Option<u32>, VmError> {
+    Ok(u32::try_from(vm.int32(value)?).ok())
+}
+
+/// Прямоугольник из четырёх `int`; пустой — `None`.
+fn rect_arg<H: Host>(vm: &Vm<'_, H>, values: [Value; 4]) -> Result<Option<crate::WindowRect>, VmError> {
+    let [x, y, width, height] = values;
+    let (x, y, width, height) = (vm.int32(x)?, vm.int32(y)?, vm.int32(width)?, vm.int32(height)?);
+    if width <= 0 || height <= 0 {
+        return Ok(None);
+    }
+    Ok(Some(crate::WindowRect { x, y, width: width as u32, height: height as u32 }))
 }
 
 /// Путь-аргумент файлового члена. `null` отсекает C#, но среда не верит.

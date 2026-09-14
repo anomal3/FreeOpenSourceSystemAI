@@ -72,6 +72,10 @@ pub enum Aim {
     /// Строка таблицы в окне «Task Manager» с таким номером сверху: та же
     /// геометрия, что у «Files», только строки без зазора — 32 точки.
     TaskRow(i32),
+    /// Точка содержимого окна программы с таким заголовком: `(x, y)` от левого
+    /// верхнего угла под полосой заголовка — в тех же координатах, в каких
+    /// программа получает щелчок (фаза N6a: форма WinForms).
+    Program(&'static str, i32, i32),
     /// Пустое место правее любого окна из раскладки по умолчанию.
     ///
     /// Нужно там, где окна открыты: [`Aim::Empty`] стоит в середине экрана, а
@@ -291,6 +295,10 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::TaskRow(n) => {
             let rect = window(log, "Task Manager")?;
             (rect.x + 200, rect.y + TITLE_H + 48 + 27 + n * 32 + 16)
+        }
+        Aim::Program(title, x, y) => {
+            let rect = window(log, title)?;
+            (rect.x + x, rect.y + TITLE_H + y)
         }
         Aim::Empty => (width / 2, height / 3),
         Aim::EmptyBelow => (width / 2, height * 3 / 4),

@@ -183,6 +183,70 @@ pub trait Host {
     fn processor_count(&mut self) -> u32 {
         1
     }
+
+    /// Открыть окно с содержимым `width`×`height` (фаза N6a). Номер окна или
+    /// `None`, если окон у хоста нет.
+    fn window_open(&mut self, title: &str, width: u32, height: u32) -> Option<u32> {
+        let _ = (title, width, height);
+        None
+    }
+
+    /// Залить прямоугольник окна цветом ARGB. Прямоугольник уже отсечён C#.
+    fn window_fill(&mut self, window: u32, area: WindowRect, argb: u32) {
+        let _ = (window, area, argb);
+    }
+
+    /// Написать строку системным шрифтом: `(x, y)` — левый верхний угол
+    /// строки, рисовать можно только внутри `clip`.
+    fn window_text(&mut self, window: u32, x: i32, y: i32, text: &str, argb: u32, clip: WindowRect) {
+        let _ = (window, x, y, text, argb, clip);
+    }
+
+    /// Ширина строки системным шрифтом, точки.
+    fn text_width(&mut self, text: &str) -> u32 {
+        text.chars().count() as u32 * 8
+    }
+
+    /// Высота строки системного шрифта, точки.
+    fn text_height(&mut self) -> u32 {
+        16
+    }
+
+    /// Показать нарисованное.
+    fn window_present(&mut self, window: u32) {
+        let _ = window;
+    }
+
+    /// Следующее событие окна, не дожидаясь его.
+    fn window_event(&mut self, window: u32) -> Option<WindowEvent> {
+        let _ = window;
+        None
+    }
+
+    /// Закрыть окно.
+    fn window_close(&mut self, window: u32) {
+        let _ = window;
+    }
+}
+
+/// Прямоугольник в точках окна.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Событие окна программы (фаза N6a).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowEvent {
+    /// Символ клавиши.
+    Key(u32),
+    /// Щелчок в точке содержимого; `buttons` — 1 левая, 2 правая.
+    Pointer { x: i32, y: i32, buttons: u32 },
+    /// Окно просят закрыть.
+    Close,
 }
 
 /// Почему файловая операция не удалась. Какое исключение из этого выйдет,

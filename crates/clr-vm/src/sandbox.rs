@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::string::String;
 use std::vec::Vec;
 
-use crate::{FileKind, Host, IoError};
+use crate::{FileKind, Host, IoError, WindowEvent, WindowRect};
 
 pub struct Sandbox {
     root: PathBuf,
@@ -20,11 +20,27 @@ pub struct Sandbox {
     pub output: String,
     /// Точка отсчёта монотонных часов (фаза N5b).
     started: std::time::Instant,
+    /// Окна программы — картинки в памяти (фаза N6a).
+    windows: Vec<Option<Frame>>,
 }
+
+/// Окно песочницы. Событий у него нет: ни мыши, ни человека. Программа, которая
+/// сама не закрылась, получает просьбу закрыть окно после [`IDLE_POLLS`]
+/// пустых опросов — иначе `Application.Run` крутился бы вечно.
+struct Frame {
+    width: u32,
+    height: u32,
+    pixels: Vec<u32>,
+    idle: u32,
+}
+
+/// Сколько пустых опросов событий окно терпит до просьбы закрыться: у формы
+/// оборот цикла — 20 мс сна, так что это около двух секунд.
+const IDLE_POLLS: u32 = 100;
 
 impl Sandbox {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), output: String::new(), started: std::time::Instant::now() }
+        Self { root: root.into(), output: String::new(), started: std::time::Instant::now(), windows: Vec::new() }
     }
 
     fn place(&self, path: &str) -> PathBuf {
@@ -129,5 +145,41 @@ impl Host for Sandbox {
 
     fn processor_count(&mut self) -> u32 {
         std::thread::available_parallelism().map_or(1, |count| count.get() as u32)
+    }
+
+    fn window_open(&mut self, title: &str, width: u32, height: u32) -> Option<u32> {
+        let _ = title;
+        let count = usize::try_from(u64::from(width) * u64::from(height)).ok()?;
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(count).ok()?;
+        pixels.resize(count, 0);
+        self.windows.push(Some(Frame { width, height, pixels, idle: 0 }));
+        u32::try_from(self.windows.len() - 1).ok()
+    }
+
+    fn window_fill(&mut self, window: u32, area: WindowRect, argb: u32) {
+        let Some(Some(frame)) = self.windows.get_mut(window as usize) else { return };
+        let left = area.x.max(0) as u32;
+        let top = area.y.max(0) as u32;
+        let right = (i64::from(area.x) + i64::from(area.width)).clamp(0, i64::from(frame.width)) as u32;
+        let bottom = (i64::from(area.y) + i64::from(area.height)).clamp(0, i64::from(frame.height)) as u32;
+        for y in top..bottom {
+            let row = (y * frame.width) as usize;
+            for x in left..right {
+                frame.pixels[row + x as usize] = argb;
+            }
+        }
+    }
+
+    fn window_event(&mut self, window: u32) -> Option<WindowEvent> {
+        let Some(Some(frame)) = self.windows.get_mut(window as usize) else { return None };
+        frame.idle += 1;
+        (frame.idle > IDLE_POLLS).then_some(WindowEvent::Close)
+    }
+
+    fn window_close(&mut self, window: u32) {
+        if let Some(slot) = self.windows.get_mut(window as usize) {
+            *slot = None;
+        }
     }
 }

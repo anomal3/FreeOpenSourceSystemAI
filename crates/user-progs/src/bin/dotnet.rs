@@ -23,12 +23,33 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use clr_vm::{FileKind, Host, IoError, Vm};
+use clr_vm::{FileKind, Host, IoError, Vm, WindowEvent, WindowRect};
+use mini_ui::typeface::{self, Face, Role};
+use mini_ui::{Color, Rect, Surface};
 use user_abi::{CLOCK_MONOTONIC, CLOCK_REALTIME};
 use user_progs::{
-    Args, Dirent, KIND_DIRECTORY, SEEK_END, clock, close, error, exit, file_size, heap_size, mkdir, open, open_write, print,
-    read, readdir_raw, remove, rename, seek, sleep_ms, stat, sysinfo, uid, write,
+    Args, Dirent, ERR_AGAIN, KIND_DIRECTORY, SEEK_END, SYSINFO_DARK, WIN_CLOSE, WIN_KEY, WIN_POINTER, Window, clock, close,
+    error, exit, file_size, heap_size, mkdir, monotonic_ms, nanosleep, open, open_write, print, read, readdir_raw, remove,
+    rename, seek, sleep_ms, stat, sysinfo, uid, write,
 };
+
+/// Сколько ждать графики (фаза N6a) — как `user_progs::app`: стол поднимает ядро,
+/// и программа, запущенная при загрузке, может его опередить.
+const WAIT_GRAPHICS_MS: u64 = 10_000;
+
+/// Сколько ждать окна у занятого стола — как `user_progs::app`.
+const OPEN_WAIT_MS: u64 = 30_000;
+
+/// Пауза между попытками.
+const POLL_NS: u32 = 30_000_000;
+
+/// Окно формы WinForms: окно ядра и поверхность поверх его страниц.
+struct ProgramWindow {
+    window: Window,
+    surface: Surface,
+    title: String,
+    frames: u64,
+}
 
 /// Куча программы. Сборка, разобранные методы, кадры и все объекты программы
 /// живут в ней; мегабайта, который достаётся остальным программам, не хватает.
@@ -58,6 +79,40 @@ struct Console {
     home: String,
     /// Смещение местного времени из строки `timezone=` настроек, минуты.
     offset_minutes: i32,
+    /// Окна форм по номерам, которые видит C#; закрытое — `None`.
+    windows: Vec<Option<ProgramWindow>>,
+    /// Шрифт форм, когда графика уже приготовлена.
+    face: Option<&'static Face>,
+}
+
+impl Console {
+    /// Приготовить рисование при первом окне: формат точки, тема и шрифт.
+    /// `None` — графики у машины нет.
+    fn graphics(&mut self) -> Option<&'static Face> {
+        if let Some(face) = self.face {
+            return Some(face);
+        }
+        let deadline = monotonic_ms() + WAIT_GRAPHICS_MS;
+        let info = loop {
+            match sysinfo() {
+                Some(info) if info.pixel_format != 0 && info.screen_w != 0 => break info,
+                Some(_) if monotonic_ms() < deadline => {
+                    nanosleep(0, POLL_NS);
+                }
+                _ => return None,
+            }
+        };
+        mini_ui::use_raw_format(info.pixel_format);
+        mini_ui::theme::set_dark(info.flags & SYSINFO_DARK != 0);
+        let tier = mini_ui::paint::Ctx::scaled(mini_ui::theme::geometry_scale(info.screen_w)).tier;
+        let face = typeface::face(Role::Body, tier);
+        self.face = Some(face);
+        Some(face)
+    }
+
+    fn window_mut(&mut self, window: u32) -> Option<&mut ProgramWindow> {
+        self.windows.get_mut(window as usize).and_then(Option::as_mut)
+    }
 }
 
 impl Host for Console {
@@ -206,6 +261,87 @@ impl Host for Console {
     fn processor_count(&mut self) -> u32 {
         sysinfo().map_or(1, |info| info.cpus.max(1))
     }
+
+    fn window_open(&mut self, title: &str, width: u32, height: u32) -> Option<u32> {
+        self.graphics()?;
+        let deadline = monotonic_ms() + OPEN_WAIT_MS;
+        let mut window = loop {
+            match Window::open(title, width, height) {
+                Ok(window) => break window,
+                Err(code) if code != ERR_AGAIN || monotonic_ms() >= deadline => {
+                    error(&format!("dotnet: window '{title}' was refused (code {code})\n"));
+                    return None;
+                }
+                Err(_) => {
+                    nanosleep(0, POLL_NS);
+                }
+            }
+        };
+        let base = window.pixels().as_mut_ptr();
+        // SAFETY: страницы окна отображены ядром, пока живо `window`, а
+        // поверхность лежит в той же структуре и умирает вместе с ним.
+        let Some(surface) = (unsafe { Surface::from_raw(base, width, height) }) else {
+            window.close();
+            return None;
+        };
+        error(&format!("dotnet: window '{title}' opened, {width}x{height}\n"));
+        self.windows.push(Some(ProgramWindow { window, surface, title: String::from(title), frames: 0 }));
+        u32::try_from(self.windows.len() - 1).ok()
+    }
+
+    // Прозрачность не смешивается: форма N6a рисует непрозрачными кистями.
+    fn window_fill(&mut self, window: u32, area: WindowRect, argb: u32) {
+        let Some(target) = self.window_mut(window) else { return };
+        let color = Color::rgb((argb >> 16) as u8, (argb >> 8) as u8, argb as u8);
+        target.surface.fill(Rect::new(area.x, area.y, area.width, area.height), color);
+    }
+
+    // Отсечение по элементу — только начало строки: строка, начатая внутри,
+    // дописывается до края окна.
+    fn window_text(&mut self, window: u32, x: i32, y: i32, text: &str, argb: u32, clip: WindowRect) {
+        let Some(face) = self.graphics() else { return };
+        let Some(target) = self.window_mut(window) else { return };
+        if x >= clip.x + clip.width as i32 || y >= clip.y + clip.height as i32 {
+            return;
+        }
+        let color = Color::rgb((argb >> 16) as u8, (argb >> 8) as u8, argb as u8);
+        typeface::draw(&mut target.surface, face, x, y, text, color, 255);
+    }
+
+    fn text_width(&mut self, text: &str) -> u32 {
+        self.graphics().map_or(text.chars().count() as u32 * 8, |face| face.width(text))
+    }
+
+    fn text_height(&mut self) -> u32 {
+        self.graphics().map_or(16, |face| u32::from(face.line))
+    }
+
+    fn window_present(&mut self, window: u32) {
+        let Some(target) = self.window_mut(window) else { return };
+        // Отказ занятого стола — не сбой: следующая перерисовка покажет то же.
+        if target.window.commit() >= 0 {
+            target.frames += 1;
+        }
+    }
+
+    fn window_event(&mut self, window: u32) -> Option<WindowEvent> {
+        let event = self.window_mut(window)?.window.next_event()?;
+        match event.kind {
+            WIN_KEY => Some(WindowEvent::Key(event.code)),
+            WIN_POINTER => Some(WindowEvent::Pointer { x: event.x, y: event.y, buttons: event.code }),
+            WIN_CLOSE => Some(WindowEvent::Close),
+            _ => None,
+        }
+    }
+
+    fn window_close(&mut self, window: u32) {
+        let Some(slot) = self.windows.get_mut(window as usize) else { return };
+        if let Some(ProgramWindow { window, surface, title, frames }) = slot.take() {
+            drop(surface);
+            window.close();
+            error(&format!("dotnet: window '{title}' closed after {frames} frame(s)\n"));
+        }
+    }
 }
 
 /// Отказ ядра как отказ файловой операции среды.
@@ -312,7 +448,12 @@ extern "C" fn run(start: usize) -> ! {
 
     // Пояс — тот же, что показывают часы стола: строка `timezone=` настроек.
     let settings = system_settings();
-    let console = Console { home: home_directory(&settings), offset_minutes: sysconf::timezone_minutes(&settings).unwrap_or(0) };
+    let console = Console {
+        home: home_directory(&settings),
+        offset_minutes: sysconf::timezone_minutes(&settings).unwrap_or(0),
+        windows: Vec::new(),
+        face: None,
+    };
     let mut vm = match Vm::new(&data, &corelib, console) {
         Ok(vm) => vm,
         Err(failure) => {

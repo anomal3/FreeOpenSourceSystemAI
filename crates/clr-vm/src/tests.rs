@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -573,4 +573,32 @@ fn time_prints_what_dotnet_prints() {
     assert_eq!(output, TIME_OUTPUT);
     // `Environment.Exit(args.Length + 19)` мимо `finally` и `return 99`.
     assert_eq!(code, 21);
+}
+
+/// Образец `tools/dotnet/samples/form` (фаза N6a): окно WinForms.
+const FORM: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/form.dll");
+
+/// Что печатает `dotnet form.dll self-test` (записано 2026-09-15, .NET 10,
+/// WinForms на Windows, LF): форма перерисовывается в `Update()` и закрывается.
+const FORM_OUTPUT: &str = concat!(
+    "form: start\n",
+    "{X=10,Y=20,Width=100,Height=50} 110 70 True False {X=5,Y=15,Width=110,Height=60} {X=60,Y=20,Width=50,Height=20} False\n",
+    "{X=3,Y=4} {X=13,Y=24} {Width=7, Height=8} {Width=8, Height=20} {X=1.5, Y=2} True {X=1,Y=2}\n",
+    "Color [SteelBlue] -12156236 70,130,180 True Color [A=128, R=10, G=20, B=30] 128 800a141e False True True White Color [Control]\n",
+    "ctor: 480x320 'FreeOS Form' DemoForm False Color [A=255, R=240, G=244, B=248] Segoe UI 9 Regular {X=0,Y=0,Width=480,Height=320}\n",
+    "load: {Width=480, Height=320}\n",
+    "shown: True\n",
+    "paint 1: {X=0,Y=0,Width=480,Height=320}\n",
+    "update: 1 paint(s)\n",
+    "closing: UserClosing False\n",
+    "closed: UserClosing\n",
+    "form: Run returned, disposed True\n",
+);
+
+#[test]
+fn form_prints_what_winforms_prints() {
+    let (result, output) = run_with(FORM, "form.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, FORM_OUTPUT);
+    assert_eq!(code, 17);
 }

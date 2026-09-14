@@ -35,8 +35,8 @@ use clr_meta::{Assembly, Coded, Token};
 ///
 /// `features` нужен ради таблиц метаданных, а не запуска: в нём P/Invoke,
 /// которого у среды ещё нет.
-const SAMPLES: [(&str, bool); 14] =
-    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("floats", true), ("enums", true), ("linq", true), ("files", true), ("time", true), ("features", false)];
+const SAMPLES: [(&str, bool); 15] =
+    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("floats", true), ("enums", true), ("linq", true), ("files", true), ("time", true), ("form", true), ("features", false)];
 
 /// Аргументы командной строки образца. `time` печатает их и
 /// `Environment.GetCommandLineArgs()` (фаза N5b); кириллица проверяет, что
@@ -44,6 +44,9 @@ const SAMPLES: [(&str, bool); 14] =
 fn sample_args(sample: &str) -> &'static [&'static str] {
     match sample {
         "time" => &["alpha", "два"],
+        // Форма N6a сама перерисовывается и закрывается: на машине разработчика
+        // dotnet на миг показывает настоящее окно, песочнице щёлкать некому.
+        "form" => &["self-test"],
         _ => &[],
     }
 }

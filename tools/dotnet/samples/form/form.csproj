@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N6a: окно формы. clr-check запускает его с аргументом self-test:
+       форма сама перерисовывается и закрывается, и вывод сравнивается с dotnet.
+       Без аргумента окно ждёт человека (или стенд) и закрывается крестиком. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
