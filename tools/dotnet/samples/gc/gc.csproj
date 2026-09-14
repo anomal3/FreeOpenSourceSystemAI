@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N3d: программа выделяет за время работы в разы больше,
+       чем помещается в куче /bin/dotnet, а живым держит немного. Доживает до
+       конца и печатает то же, что настоящий dotnet, — значит, сборщик собирает
+       мусор и не собирает живое. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

@@ -3205,6 +3205,23 @@ pub const ALL: &[Scenario] = &[
             Step::Await("interpolated: привет, мир! 3 x (7, семь) = 21", 60_000),
             Step::Await("generics: done", 60_000),
             Step::Await("dotnet: generics.dll: Main returned 22", 60_000),
+            Step::Await("freeos> ", 15_000),
+            // Фаза N3d: сборщик мусора. Программа выделяет около 70 МиБ при
+            // куче `/bin/dotnet` в 16 и проверяет каждое живое значение сама:
+            // без сборки она не дожила бы, с пропущенным корнем напечатала бы
+            // другие числа.
+            Step::Line("dotnet /usr/share/dotnet/samples/gc.dll"),
+            Step::Await("gc: start", 60_000),
+            Step::Await("checksum 5886420", 300_000),
+            Step::Await("chain 6 sum 7500", 60_000),
+            Step::Await("cells cell 500 / cell 2500 weight 2500", 60_000),
+            Step::Await("closure 2501 local -1", 60_000),
+            Step::Await("литерал живёт", 60_000),
+            Step::Await("gc: done", 60_000),
+            // Что сборок было больше нуля, проверяет тест `clr-vm` на том же
+            // файле: подстрока «0 collection(s)» совпала бы и с «10», и с
+            // законным нулём у `hello` выше.
+            Step::Await("dotnet: gc.dll: Main returned 6", 60_000),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),
         ],

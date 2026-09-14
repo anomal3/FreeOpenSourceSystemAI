@@ -127,9 +127,10 @@ extern "C" fn run(start: usize) -> ! {
     match vm.run_main(&program_args) {
         Ok(code) => {
             error(&format!(
-                "dotnet: {name}: Main returned {code} after {} instruction(s), {} object(s)\n",
+                "dotnet: {name}: Main returned {code} after {} instruction(s), {} object(s), {} collection(s)\n",
                 vm.instructions,
-                vm.object_count()
+                vm.object_count(),
+                vm.collections()
             ));
             exit(i64::from(code))
         }

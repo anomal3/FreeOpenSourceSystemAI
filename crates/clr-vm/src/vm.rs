@@ -154,9 +154,16 @@ impl<'a, H: Host> Vm<'a, H> {
         self.asms[usize::from(PROGRAM)].tables.rows(id::METHOD_DEF)
     }
 
+    /// Живые объекты — после последней сборки мусора и того, что выделено с неё.
     #[must_use]
     pub fn object_count(&self) -> usize {
         self.heap.len()
+    }
+
+    /// Сколько раз собирался мусор.
+    #[must_use]
+    pub fn collections(&self) -> u32 {
+        self.heap.collections()
     }
 
     /// Выполнить точку входа. Возвращает то, что вернул `Main` (ноль у `void`).
@@ -217,6 +224,9 @@ impl<'a, H: Host> Vm<'a, H> {
 
     fn run_frames(&mut self, floor: usize) -> Result<Option<Value>, VmError> {
         loop {
+            // Безопасная точка: между инструкциями все живые ссылки лежат в
+            // кадрах и статике (см. `gc.rs`).
+            self.collect_if_needed()?;
             self.instructions += 1;
             let top = self.frames.len() - 1;
             let code = self.frames[top].body.code;

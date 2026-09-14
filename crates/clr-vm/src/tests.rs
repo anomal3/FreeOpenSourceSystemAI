@@ -120,7 +120,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -206,6 +206,34 @@ fn generics_print_what_dotnet_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, GENERICS_OUTPUT);
     assert_eq!(code, 22);
+}
+
+/// Образец `tools/dotnet/samples/gc` (фаза N3d).
+const GC: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/gc.dll");
+
+/// Что печатает `dotnet gc.dll` (записано 2026-09-14, .NET 10, LF).
+const GC_OUTPUT: &str = concat!(
+    "gc: start\n",
+    "checksum 5886420\n",
+    "chain 6 sum 7500\n",
+    "cells cell 500 / cell 2500 weight 2500\n",
+    "closure 2501 local -1\n",
+    "литерал живёт\n",
+    "gc: done\n",
+);
+
+/// Мусор собран, а живое уцелело: вывод совпадает с dotnet (каждое живое
+/// значение программа проверяет сама), и сборок было больше нуля.
+#[test]
+fn garbage_is_collected_and_the_living_survive() {
+    let mut vm = Vm::new(GC, CORELIB, Capture(String::new())).expect("assembly parses");
+    let result = vm.run_main(&[]);
+    let collections = vm.collections();
+    let output = vm.into_host().0;
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, GC_OUTPUT);
+    assert_eq!(code, 6);
+    assert!(collections > 0, "the sample allocates ~70 MiB and never collected");
 }
 
 #[test]
