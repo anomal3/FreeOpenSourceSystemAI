@@ -111,6 +111,27 @@ namespace System.Windows.Forms
             base.OnClick(e);
         }
 
+        // Фаза N7h, правило WinForms: переключатель, в который вошли стрелкой,
+        // щёлкается — отметка переходит за фокусом; вошли по Tab — нет, и он
+        // остаётся остановкой Tab. Щелчок мышью отмечает сам, поэтому при
+        // нажатой кнопке мыши не делается ничего. Отметка меняется раньше, чем
+        // придёт Enter, — образец `keys` это и показывает.
+        protected override void OnEnter(EventArgs e)
+        {
+            if (MouseButtons == MouseButtons.None)
+            {
+                if (!KeyMap.TabPressed)
+                {
+                    OnClick(e);
+                }
+                else
+                {
+                    TabStop = true;
+                }
+            }
+            base.OnEnter(e);
+        }
+
         public void PerformClick()
         {
             if (CanSelect)
@@ -453,6 +474,9 @@ namespace System.Windows.Forms
             Value = Math.Max(minimum, Math.Min(maximum, value));
             OnScroll(EventArgs.Empty);
         }
+
+        // Стрелки двигают ползунок, а не фокус (фаза N7h).
+        protected override bool IsInputKey(Keys keyData) => IsNavigationKey(keyData) || base.IsInputKey(keyData);
 
         internal override void ProcessKey(KeyEventArgs e)
         {

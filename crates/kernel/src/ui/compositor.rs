@@ -109,6 +109,12 @@ pub struct Compositor {
     drag_from: (i32, i32),
     /// Захват меняет размер окна, а не его место.
     drag_resizes: bool,
+    /// Окно программы, над содержимым которого указатель был в прошлый раз
+    /// (фаза N7h).
+    ///
+    /// Нужно одному: сказать окну, что указатель ушёл. Узнать это из текущего
+    /// движения нельзя — оно достаётся уже другому окну или столу.
+    hovered: Option<App>,
     /// Масштаб глифа для новых окон.
     scale: u32,
     /// Буфер, в котором собирается кадр, — полоса во всю ширину экрана.
@@ -174,6 +180,7 @@ impl Compositor {
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
+            hovered: None,
             scale,
             damage: [Rect::EMPTY; MAX_DAMAGE],
             damage_count: 0,
@@ -234,6 +241,29 @@ impl Compositor {
 
     pub fn find(&mut self, app: App) -> Option<&mut Window> {
         self.windows.iter_mut().find(|window| window.app == app)
+    }
+
+    /// Окно программы, над **содержимым** которого стоит точка, и эта точка
+    /// внутри его поверхности. Заголовок и рамка — не содержимое: программа их
+    /// не рисует и событий о них не ждёт.
+    #[must_use]
+    pub fn program_under(&self, x: i32, y: i32) -> Option<(App, i32, i32)> {
+        let (index, hit) = self.window_at(x, y)?;
+        let window = self.windows.get(index)?;
+        if hit != Hit::Body || !window.is_program() {
+            return None;
+        }
+        let top = window.rect.y + Window::title_height(self.scale) as i32;
+        Some((window.app, x - window.rect.x, y - top))
+    }
+
+    /// См. [`Self::hovered`].
+    pub const fn hovered(&self) -> Option<App> {
+        self.hovered
+    }
+
+    pub fn set_hovered(&mut self, app: Option<App>) {
+        self.hovered = app;
     }
 
     /// Где стоит окно программы.

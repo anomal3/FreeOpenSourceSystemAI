@@ -28,7 +28,7 @@ use mini_ui::typeface::{self, Face, Role};
 use mini_ui::{Color, Rect, Surface};
 use user_abi::{CLOCK_MONOTONIC, CLOCK_REALTIME};
 use user_progs::{
-    Args, Dirent, ERR_AGAIN, KIND_DIRECTORY, SEEK_END, SYSINFO_DARK, WIN_CLOSE, WIN_KEY, WIN_POINTER, Window, clock, close,
+    Args, Dirent, ERR_AGAIN, KIND_DIRECTORY, SEEK_END, SYSINFO_DARK, WIN_CLOSE, WIN_KEY, WIN_LEAVE, WIN_MOVE, WIN_POINTER, Window, clock, close,
     error, exit, file_size, heap_size, mkdir, monotonic_ms, nanosleep, open, open_write, print, read, readdir_raw, remove,
     rename, seek, sleep_ms, stat, sysinfo, uid, write,
 };
@@ -352,8 +352,10 @@ impl Host for Console {
     fn window_event(&mut self, window: u32) -> Option<WindowEvent> {
         let event = self.window_mut(window)?.window.next_event()?;
         match event.kind {
-            WIN_KEY => Some(WindowEvent::Key(event.code)),
+            WIN_KEY => Some(WindowEvent::Key { symbol: event.code, mods: event.x as u32, latin: event.y as u32 }),
             WIN_POINTER => Some(WindowEvent::Pointer { x: event.x, y: event.y, buttons: event.code }),
+            WIN_MOVE => Some(WindowEvent::Move { x: event.x, y: event.y, buttons: event.code }),
+            WIN_LEAVE => Some(WindowEvent::Leave),
             WIN_CLOSE => Some(WindowEvent::Close),
             _ => None,
         }

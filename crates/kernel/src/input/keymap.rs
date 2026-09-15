@@ -200,6 +200,16 @@ pub fn char_for(event: KeyEvent) -> Option<char> {
     char_for_code(event.code, event.mods)
 }
 
+/// Латинская буква клавиши: что она даёт в раскладке US без Shift.
+///
+/// Нужна сочетаниям (фаза N7h, [`user_abi::WinEvent::y`]): `Ctrl+O` называет
+/// клавишу, а не символ, и в русской раскладке остаётся `Ctrl+O`. Раскладка
+/// здесь не читается нарочно — ровно в этом и смысл.
+#[must_use]
+pub fn latin(code: KeyCode) -> Option<char> {
+    letter(code).map(|(lower, _)| lower).or_else(|| printable(code).map(|(plain, _)| plain))
+}
+
 /// Символ клавиши при заданных модификаторах, без учёта нажатия/отпускания.
 #[must_use]
 pub fn char_for_code(code: KeyCode, mods: Modifiers) -> Option<char> {

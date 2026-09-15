@@ -1123,6 +1123,24 @@ impl Window {
         true
     }
 
+    /// Положить в очередь движение указателя, склеив его с предыдущим.
+    ///
+    /// Движений у мыши поток, а очередь конечна: без склейки сорок движений
+    /// заполнили бы её, и щелчок, пришедший следом, потерялся бы — договор
+    /// теряет **новые** события. Программе нужно, где указатель сейчас, поэтому
+    /// движение, лежащее последним, просто заменяется.
+    pub fn push_move(&mut self, event: WinEvent) -> bool {
+        if let Content::Program(view) = &mut self.content {
+            if let Some(last) = view.events.back_mut() {
+                if last.kind == user_abi::WIN_MOVE {
+                    *last = event;
+                    return true;
+                }
+            }
+        }
+        self.push_event(event)
+    }
+
     /// Забрать самое старое событие. `None` — очередь пуста.
     pub fn pop_event(&mut self) -> Option<WinEvent> {
         let Content::Program(view) = &mut self.content else {

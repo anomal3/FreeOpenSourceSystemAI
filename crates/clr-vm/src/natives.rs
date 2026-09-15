@@ -899,9 +899,14 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
             };
             let (kind, x, y, code) = match window.and_then(|window| vm.host.window_event(window)) {
                 None => (0, 0, 0, 0),
-                Some(crate::WindowEvent::Key(symbol)) => (1, 0, 0, symbol as i32),
+                // У клавиши точки нет, и её два числа несут модификаторы и
+                // латинскую букву: заводить ради них четвёртый выходной
+                // аргумент значило бы менять подпись вызова у всех форм.
+                Some(crate::WindowEvent::Key { symbol, mods, latin }) => (1, mods as i32, latin as i32, symbol as i32),
                 Some(crate::WindowEvent::Pointer { x, y, buttons }) => (2, x, y, buttons as i32),
                 Some(crate::WindowEvent::Close) => (3, 0, 0, 0),
+                Some(crate::WindowEvent::Move { x, y, buttons }) => (4, x, y, buttons as i32),
+                Some(crate::WindowEvent::Leave) => (5, 0, 0, 0),
             };
             vm.store(x_out, Value::I32(x))?;
             vm.store(y_out, Value::I32(y))?;

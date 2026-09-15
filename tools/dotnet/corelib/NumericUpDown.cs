@@ -9,6 +9,12 @@
 // Правила сняты с WinForms образцом `numbers`: ValueChanged приходит раньше,
 // чем обновится Text; стрелка у края значение не меняет и события не даёт;
 // сужение Maximum или Minimum подрезает значение с событием (у TrackBar — без).
+//
+// Набор с клавиатуры (фаза N7h) снят образцом `keys`: текст, поставленный не
+// самим полем, — «правка человека», и значение из неё разбирается, когда его
+// спросят, по Enter и при уходе фокуса — уже после Enter у нового элемента.
+// Число за краем подрезается к краю с событием, неразборчивый текст
+// заменяется прежним значением без события.
 
 using System.Drawing;
 
@@ -31,6 +37,9 @@ namespace System.Windows.Forms
     {
         internal const int ButtonWidth = 17;
 
+        // Каретка в тексте поля (фаза N7h).
+        private int caret;
+
         protected UpDownBase()
         {
         }
@@ -51,10 +60,22 @@ namespace System.Windows.Forms
 
         public BorderStyle BorderStyle { get; set; } = BorderStyle.Fixed3D;
 
+        // Текст правил человек, а не само поле, — значение из него ещё не
+        // разобрано.
+        protected bool UserEdit { get; set; }
+
+        // Текст сейчас ставит само поле, и правкой это не считается.
+        protected bool ChangingText { get; set; }
+
         public override string Text
         {
             get => base.Text;
-            set => base.Text = value;
+            set
+            {
+                base.Text = value;
+                UserEdit = !ChangingText;
+                caret = base.Text.Length;
+            }
         }
 
         public abstract void UpButton();
@@ -63,21 +84,93 @@ namespace System.Windows.Forms
 
         protected abstract void UpdateEditText();
 
+        protected abstract void ValidateEditText();
+
+        // Какие символы поле принимает с клавиатуры.
+        internal virtual bool AcceptsChar(char c) => true;
+
+        // Стрелки и Home/End разбирает поле: вверх-вниз меняют число, влево-вправо
+        // ведут каретку.
+        protected override bool IsInputKey(Keys keyData) => IsNavigationKey(keyData) || base.IsInputKey(keyData);
+
         internal override void ProcessKey(KeyEventArgs e)
         {
-            if (!InterceptArrowKeys)
+            string text = Text;
+            switch (e.KeyCode)
+            {
+                case Keys.Up:
+                    if (InterceptArrowKeys)
+                    {
+                        UpButton();
+                    }
+                    break;
+                case Keys.Down:
+                    if (InterceptArrowKeys)
+                    {
+                        DownButton();
+                    }
+                    break;
+                case Keys.Left:
+                    MoveCaret(caret - 1);
+                    break;
+                case Keys.Right:
+                    MoveCaret(caret + 1);
+                    break;
+                case Keys.Home:
+                    MoveCaret(0);
+                    break;
+                case Keys.End:
+                    MoveCaret(text.Length);
+                    break;
+                case Keys.Delete:
+                    if (!ReadOnly && caret < text.Length)
+                    {
+                        Edit(text.Substring(0, caret) + text.Substring(caret + 1), caret);
+                    }
+                    break;
+                case Keys.Enter:
+                    ValidateEditText();
+                    break;
+            }
+        }
+
+        internal override void ProcessChar(char c)
+        {
+            if (ReadOnly)
             {
                 return;
             }
-            if (e.KeyCode == Keys.Up)
+            string text = Text;
+            int at = Math.Min(caret, text.Length);
+            if (c == '\b')
             {
-                UpButton();
+                if (at > 0)
+                {
+                    Edit(text.Substring(0, at - 1) + text.Substring(at), at - 1);
+                }
+                return;
             }
-            else if (e.KeyCode == Keys.Down)
+            if (c < ' ' || !AcceptsChar(c))
             {
-                DownButton();
+                return;
             }
+            Edit(text.Substring(0, at) + new string(c, 1) + text.Substring(at), at + 1);
         }
+
+        private void Edit(string text, int at)
+        {
+            Text = text;
+            MoveCaret(at);
+        }
+
+        private void MoveCaret(int at)
+        {
+            caret = Math.Max(0, Math.Min(at, Text.Length));
+            Invalidate();
+        }
+
+        // Фокус ушёл — набранное разбирается.
+        internal override void FocusLeft() => ValidateEditText();
 
         // Щелчок по стрелкам у правого края: верхняя половина — вверх.
         protected override void OnMouseDown(MouseEventArgs e)
@@ -110,7 +203,13 @@ namespace System.Windows.Forms
             int textWidth = FreeOsWindow.TextWidth(text);
             int area = Width - ButtonWidth - 6;
             int left = TextAlign == HorizontalAlignment.Right ? 3 + area - textWidth : TextAlign == HorizontalAlignment.Center ? 3 + (area - textWidth) / 2 : 3;
-            g.DrawString(text, Font, new SolidBrush(Enabled ? ForeColor : SystemColors.GrayText), left, (Height - FreeOsWindow.TextHeight()) / 2);
+            int textTop = (Height - FreeOsWindow.TextHeight()) / 2;
+            g.DrawString(text, Font, new SolidBrush(Enabled ? ForeColor : SystemColors.GrayText), left, textTop);
+            if (Focused && !ReadOnly)
+            {
+                int at = Math.Min(caret, text.Length);
+                g.FillRectangle(new SolidBrush(ForeColor), left + FreeOsWindow.TextWidth(text.Substring(0, at)), textTop, 1, FreeOsWindow.TextHeight());
+            }
             // Две кнопки со стрелками у правого края.
             int x = Width - ButtonWidth - 1;
             int half = (Height - 2) / 2;
@@ -139,6 +238,7 @@ namespace System.Windows.Forms
         private bool hexadecimal;
         private bool thousands;
         private bool initializing;
+        private bool valueChanged = true;
 
         public NumericUpDown()
         {
@@ -224,9 +324,18 @@ namespace System.Windows.Forms
             }
         }
 
+        // Как у WinForms: спросили значение, пока текст правлен руками, — сначала
+        // разобрать текст.
         public decimal Value
         {
-            get => current;
+            get
+            {
+                if (UserEdit)
+                {
+                    ValidateEditText();
+                }
+                return current;
+            }
             set
             {
                 if (value == current)
@@ -238,6 +347,7 @@ namespace System.Windows.Forms
                     throw new ArgumentOutOfRangeException("value", "Value of '" + value + "' is not valid for 'Value'. 'Value' should be between 'Minimum' and 'Maximum'.");
                 }
                 current = value;
+                valueChanged = true;
                 OnValueChanged(EventArgs.Empty);
                 UpdateEditText();
             }
@@ -245,6 +355,10 @@ namespace System.Windows.Forms
 
         public override void UpButton()
         {
+            if (UserEdit)
+            {
+                ParseEditText();
+            }
             decimal next;
             try
             {
@@ -263,6 +377,10 @@ namespace System.Windows.Forms
 
         public override void DownButton()
         {
+            if (UserEdit)
+            {
+                ParseEditText();
+            }
             decimal next;
             try
             {
@@ -301,13 +419,83 @@ namespace System.Windows.Forms
             return value;
         }
 
+        // Цифры, знак, разделители дробной части и разрядов; у шестнадцатеричного
+        // — ещё буквы a–f. Остальное поле не принимает, как у WinForms.
+        internal override bool AcceptsChar(char c)
+        {
+            if ((c >= '0' && c <= '9') || c == '-' || c == '.' || c == ',')
+            {
+                return true;
+            }
+            return hexadecimal && ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
+        }
+
+        // Разобрать набранное. Пустой текст и одинокий минус — ещё не число:
+        // значение остаётся, текст тоже. Неразборчивое оставляет значение
+        // прежним, а текст вернёт UpdateEditText.
+        protected void ParseEditText()
+        {
+            string text = Text;
+            UserEdit = false;
+            if (string.IsNullOrEmpty(text) || text == "-")
+            {
+                return;
+            }
+            decimal parsed;
+            bool ok = hexadecimal ? TryParseHex(text, out parsed) : decimal.TryParse(text, out parsed);
+            if (ok)
+            {
+                Value = Constrain(parsed);
+            }
+        }
+
+        private static bool TryParseHex(string text, out decimal value)
+        {
+            value = decimal.Zero;
+            if (text.Length == 0 || text.Length > 8)
+            {
+                return false;
+            }
+            uint result = 0;
+            for (int i = 0; i < text.Length; i++)
+            {
+                char c = text[i];
+                int digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+                if (digit < 0)
+                {
+                    return false;
+                }
+                result = result * 16 + (uint)digit;
+            }
+            value = (int)result;
+            return true;
+        }
+
+        protected override void ValidateEditText()
+        {
+            ParseEditText();
+            UpdateEditText();
+        }
+
         protected override void UpdateEditText()
         {
             if (initializing)
             {
                 return;
             }
+            if (UserEdit)
+            {
+                ParseEditText();
+            }
+            string text = Text;
+            if (!valueChanged && (string.IsNullOrEmpty(text) || text == "-"))
+            {
+                return;
+            }
+            valueChanged = false;
+            ChangingText = true;
             Text = hexadecimal ? ((long)current).ToString("X") : current.ToString((thousands ? "N" : "F") + decimalPlaces);
+            ChangingText = false;
         }
     }
 }

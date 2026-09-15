@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -846,5 +846,55 @@ fn numbers_print_what_winforms_prints() {
     let (result, output) = run_with(NUMBERS, "numbers.dll", &["self-test"]);
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, NUMBERS_OUTPUT);
+    assert_eq!(code, 0);
+}
+
+/// Образец `tools/dotnet/samples/keys` (фаза N7h): Tab, стрелки, сочетания
+/// меню и набор в поле со стрелками.
+const KEYS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/keys.dll");
+
+/// Что печатает `dotnet keys.dll self-test` (записано 2026-09-16, .NET 10,
+/// WinForms на Windows, LF): Tab через ProcessDialogKey идёт к отмеченному
+/// переключателю, стрелки — по кругу группы с отметкой раньше Enter; сочетание
+/// нажимает пункт и во вложенном подменю, а без Ctrl и Alt не годится; текст
+/// поля разбирается, когда спрашивают Value, — за краем подрезается, мусор
+/// заменяется прежним значением без события.
+const KEYS_OUTPUT: &str = concat!(
+    "focus: numericUpDown1\n",
+    "shown: numericUpDown1 5 '5' O, Control 2 True | True False False\n",
+    "focus: button1\n",
+    "focus: radioButton1\n",
+    "radio: Red False\n",
+    "radio: Green True\n",
+    "focus: radioButton2\n",
+    "radio: Green False\n",
+    "radio: Blue True\n",
+    "focus: radioButton3\n",
+    "radio: Blue False\n",
+    "radio: Red True\n",
+    "focus: radioButton1\n",
+    "arrows: radioButton1 True False False\n",
+    "focus: button1\n",
+    "back: button1\n",
+    "open: &Open\n",
+    "recent: second.txt\n",
+    "shortcuts: True True False False\n",
+    "value: 42\n",
+    "typed: 42 '42'\n",
+    "value: 100\n",
+    "clamped: 100 '100'\n",
+    "value: 0\n",
+    "below: 0 '0'\n",
+    "bad: 0 '0'\n",
+    "focus: radioButton1\n",
+    "next: True radioButton1 False radioButton1\n",
+    "closed: UserClosing 0 True False False\n",
+);
+
+#[test]
+fn keys_print_what_winforms_prints() {
+    let (result, output) = run_with(KEYS, "keys.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, KEYS_OUTPUT);
     assert_eq!(code, 0);
 }

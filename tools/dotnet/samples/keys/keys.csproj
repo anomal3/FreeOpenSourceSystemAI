@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N7h: клавиатура и мышь у формы. Tab и стрелки ходят по
+       элементам, Ctrl-сочетания нажимают пункты меню, у меню есть вложенное
+       подменю, в поле со стрелками число набирается руками, у кнопки есть
+       подсказка. clr-check запускает его с аргументом self-test: клавиши
+       проходят через ProcessDialogKey и ProcessCmdKey — тот же путь, что у
+       настоящих, — и форма закрывается сама. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

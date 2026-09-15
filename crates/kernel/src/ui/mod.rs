@@ -21,7 +21,7 @@
 //! Порядок разбора, сверху вниз:
 //!
 //! 1. открытое меню — пока оно открыто, оно забирает всё;
-//! 2. сочетания оконного менеджера (Meta, Tab, Ctrl+W, Ctrl+стрелки);
+//! 2. сочетания оконного менеджера (Meta, Alt+Tab, Ctrl+W, Ctrl+стрелки);
 //! 3. активное окно, если оно умеет обрабатывать клавиши (файловый менеджер);
 //! 4. оболочка — но только если активно именно её окно.
 //!
@@ -58,7 +58,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mini_ui::theme;
 use mini_ui::{Rect, Screen, Surface};
-use user_abi::{WIN_CLOSE, WIN_KEY, WIN_POINTER, WinEvent};
+use user_abi::{WIN_CLOSE, WIN_KEY, WIN_LEAVE, WIN_MOVE, WIN_POINTER, WinEvent};
 
 use crate::input::keymap;
 use crate::input::{Buttons, KeyCode, KeyEvent, Modifiers, PointerEvent};
@@ -771,9 +771,12 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
             toggle_menu(desktop, status);
             return None;
         }
-        // Tab по кругу поднимает окна. У обычной оболочки на этой клавише
-        // дополнение имён, но дополнять пока нечего, а переключать окна нужно.
-        KeyCode::Tab => {
+        // Alt+Tab по кругу поднимает окна. До фазы N7h это делал голый Tab, и
+        // окну программы он не доставался вовсе: форма WinForms не могла
+        // перейти от поля к кнопке — первое, что пробует человек, пришедший из
+        // Windows. Там окна переключает Alt+Tab, и здесь теперь так же, а Tab
+        // без Alt идёт окну, как любая другая клавиша.
+        KeyCode::Tab if event.mods.contains(Modifiers::ALT) => {
             desktop.focus_next();
             log_focus(desktop);
             desktop.refresh_panel(status);
@@ -856,6 +859,36 @@ pub fn dispatch_pointer(event: PointerEvent) {
     }
 }
 
+/// Сказать окну программы, что над его содержимым ходит указатель (фаза N7h).
+///
+/// Окну под указателем, а не окну в фокусе: подсказка у кнопки неактивного окна
+/// всплывает и в Windows. Пока тащат окно или открыто меню стола, указатель
+/// принадлежит им, и программе не достаётся ничего — иначе подсказка всплывала
+/// бы под открытым меню запуска.
+fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons) {
+    let busy = desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open();
+    let under = if busy { None } else { desktop.program_under(x, y) };
+    let now = under.map(|(app, _, _)| app);
+    if let Some(was) = desktop.hovered().filter(|was| Some(*was) != now) {
+        if let Some(window) = desktop.find(was) {
+            window.push_event(WinEvent { kind: WIN_LEAVE, code: 0, x: 0, y: 0 });
+        }
+    }
+    desktop.set_hovered(now);
+    if let Some((app, local_x, local_y)) = under {
+        let mut mask = 0;
+        if buttons.contains(Buttons::LEFT) {
+            mask |= 1;
+        }
+        if buttons.contains(Buttons::RIGHT) {
+            mask |= 2;
+        }
+        if let Some(window) = desktop.find(app) {
+            window.push_move(WinEvent { kind: WIN_MOVE, code: mask, x: local_x, y: local_y });
+        }
+    }
+}
+
 fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     // На сколько сдвинулся курсор. У мыши это приехало в отчёте, у планшета
     // приходится вычесть одно положение из другого: устройство сообщило точку,
@@ -880,6 +913,9 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
 
     let (x, y) = desktop.pointer_position();
+    if dx != 0 || dy != 0 {
+        hover(desktop, x, y, event.buttons);
+    }
 
     if event.pressed(Buttons::LEFT) {
         press(desktop, x, y, status);
@@ -1253,6 +1289,14 @@ fn program_key(event: KeyEvent) -> Option<u32> {
     if let Some(symbol) = event.to_char() {
         return Some(symbol as u32);
     }
+    // Ctrl с цифрой управляющего символа не даёт, а сочетание `Ctrl+1` в
+    // программах есть. Символом идёт сама цифра; что Ctrl был зажат, программа
+    // узнаёт из маски (фаза N7h).
+    if event.mods.contains(Modifiers::CTRL) {
+        if let Some(plain) = keymap::latin(event.code) {
+            return Some(plain as u32);
+        }
+    }
     Some(match event.code {
         // Backspace и Escape раскладка символом не отдаёт — намеренно, см.
         // `keymap`, — а договор окон обещает их программам символами `0x08`
@@ -1273,6 +1317,21 @@ fn program_key(event: KeyEvent) -> Option<u32> {
         KeyCode::Menu => user_abi::WIN_KEY_MENU,
         _ => return None,
     })
+}
+
+/// Модификаторы клавиши так, как их обещает договор окон.
+fn program_mods(mods: Modifiers) -> i32 {
+    let mut mask = 0;
+    if mods.contains(Modifiers::SHIFT) {
+        mask |= user_abi::WIN_MOD_SHIFT;
+    }
+    if mods.contains(Modifiers::CTRL) {
+        mask |= user_abi::WIN_MOD_CTRL;
+    }
+    if mods.contains(Modifiers::ALT) {
+        mask |= user_abi::WIN_MOD_ALT;
+    }
+    mask
 }
 
 /// Отдать событие активному окну.
@@ -1315,7 +1374,11 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
         Some(app @ App::Program(..)) => {
             if event.pressed {
                 if let Some(code) = program_key(event) {
-                    let key = WinEvent { kind: WIN_KEY, code, x: 0, y: 0 };
+                    // Модификаторы и буква клавиши — фаза N7h: без них сочетание
+                    // `Ctrl+H` не отличить от Backspace, а `Ctrl+O` в русской
+                    // раскладке — от `Ctrl+щ`. См. [`WinEvent::y`].
+                    let latin = keymap::latin(event.code).map_or(0, |ch| ch as i32);
+                    let key = WinEvent { kind: WIN_KEY, code, x: program_mods(event.mods), y: latin };
                     if let Some(window) = desktop.find(app) {
                         window.push_event(key);
                     }

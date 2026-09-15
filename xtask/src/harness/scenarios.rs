@@ -593,14 +593,15 @@ pub const ALL: &[Scenario] = &[
             // предел в триста отличает одно от другого без всякой
             // двусмысленности.
             Step::AtMost("  wakeups  ", 300, 15_000),
-            // Tab поднимает нижнее окно наверх и **передаёт ему ввод**: с этой
-            // фазы фокус — это фокус, а не только порядок по глубине. Поэтому
-            // второй Tab обязателен: без него «exit» ушёл бы в окно состояния,
-            // а не в оболочку.
-            Step::Key("tab"),
+            // Alt+Tab поднимает нижнее окно наверх и **передаёт ему ввод**: с
+            // этой фазы фокус — это фокус, а не только порядок по глубине.
+            // Поэтому второй Alt+Tab обязателен: без него «exit» ушёл бы в окно
+            // состояния, а не в оболочку. (До фазы N7h окна переключал голый
+            // Tab; теперь он достаётся окну.)
+            Step::Key("alt-tab"),
             Step::Wait(500),
             Step::Shot("raised"),
-            Step::Key("tab"),
+            Step::Key("alt-tab"),
             Step::Wait(500),
             Step::Type("exit"),
             Step::Key("ret"),
@@ -752,7 +753,7 @@ pub const ALL: &[Scenario] = &[
             // клавишами и пропадает. Прогон при этом падает не здесь, а через
             // двадцать секунд, по пределу простоя оболочки, — и выглядит как
             // «система не приняла команду».
-            Step::Key("tab"),
+            Step::Key("alt-tab"),
             Step::Await("desktop     : focus 'Terminal'", 15_000),
             // Третье окно — файловый менеджер, и с фазы 47c это **программа**.
             // Запускается так же, как монитор, и по той же причине: открытие
@@ -812,7 +813,7 @@ pub const ALL: &[Scenario] = &[
             // принимает команды: сочетания оконного менеджера не должны
             // оставлять после себя зажатых модификаторов.
             //
-            // Куда попадёт Tab — следствие порядка окон по глубине, и фаза 47c
+            // Куда попадёт Alt+Tab — следствие порядка окон по глубине, и фаза 47c
             // его снова изменила. Раньше файловый менеджер заводило ядро сразу
             // из меню; теперь он программа, и перед его запуском приходится
             // поднять оболочку (иначе команда уедет в чужое окно). Поднятая
@@ -823,13 +824,13 @@ pub const ALL: &[Scenario] = &[
             // Поэтому шаги названы поимённо, а не сосчитаны числом: счёт молча
             // ломается при следующей же перестановке, а имя окна в ожидании
             // показывает, куда ввод ушёл на самом деле.
-            Step::Key("tab"),
+            Step::Key("alt-tab"),
             Step::Await("desktop     : focus 'System'", 5_000),
-            Step::Key("tab"),
+            Step::Key("alt-tab"),
             Step::Await("desktop     : focus 'Terminal'", 5_000),
             Step::Line("echo after-move"),
             Step::Await("after-move", 10_000),
-            Step::Key("tab"),
+            Step::Key("alt-tab"),
             Step::Await("desktop     : focus 'Files'", 5_000),
             // Ctrl+W теперь **просьба**, а не приказ: окно закрывает сама
             // программа, и ядру остаётся снять его за ней. Три строки, а не
@@ -3548,6 +3549,79 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("closed: UserClosing 12", 30_000),
             Step::Await("dotnet: numbers.dll: Main returned 0", 30_000),
+            Step::Await("freeos> ", 15_000),
+            // Фаза N7h: клавиатура и мышь у формы. Клавиши и строки — те же, что
+            // у пробы в Windows (`build/n7h/keyprobe`, нажатия keybd_event):
+            // число набирается в поле и принимается по Enter; Tab идёт от поля
+            // к кнопке и к отмеченному переключателю; стрелка ведёт отметку по
+            // группе — соседний теряет её раньше, чем приходит Enter; Shift+Tab
+            // назад; число за краем подрезается, когда фокус ушёл, — после
+            // Enter у кнопки. Затем сочетания меню (второе — во вложенном
+            // подменю), пробел на кнопке, подменю стрелками и подсказка у кнопки
+            // наведением мыши. Tab с этой фазы достаётся окну, окна переключает
+            // Alt+Tab.
+            Step::Line("dotnet /usr/share/dotnet/samples/keys.dll"),
+            Step::Await("dotnet: window 'Keys' opened, 320x200", 60_000),
+            Step::Await("shown: numericUpDown1 5 '5' O, Control 2 True | True False False", 60_000),
+            Step::Key("end"),
+            Step::Key("backspace"),
+            Step::Type("42"),
+            Step::Key("ret"),
+            Step::Await("value: 42", 30_000),
+            Step::Key("tab"),
+            Step::Await("focus: button1", 30_000),
+            Step::Key("tab"),
+            Step::Await("focus: radioButton1", 30_000),
+            Step::Key("down"),
+            Step::Await("radio: Red False", 30_000),
+            Step::Await("radio: Green True", 30_000),
+            Step::Await("focus: radioButton2", 30_000),
+            Step::Key("shift-tab"),
+            Step::Await("focus: button1", 30_000),
+            Step::Key("shift-tab"),
+            Step::Await("focus: numericUpDown1", 30_000),
+            Step::Key("end"),
+            Step::Key("backspace"),
+            Step::Key("backspace"),
+            Step::Type("250"),
+            Step::Key("tab"),
+            Step::Await("focus: button1", 30_000),
+            Step::Await("value: 100", 30_000),
+            Step::Key("ctrl-o"),
+            Step::Await("open: &Open", 30_000),
+            Step::Key("ctrl-shift-s"),
+            Step::Await("recent: second.txt", 30_000),
+            Step::Key("spc"),
+            Step::Await("hello", 30_000),
+            // Меню «File» щелчком, вниз до «Recent», вправо — подменю с уже
+            // выбранной первой строкой, вниз — вторая.
+            Step::Aim(Aim::Program("Keys", 20, 12)),
+            Step::Click,
+            Step::Wait(1_000),
+            Step::Key("down"),
+            Step::Key("down"),
+            Step::Key("right"),
+            Step::Key("down"),
+            // Отладочная сборка перерисовывает эту форму по нескольку секунд на
+            // клавишу (замер: 2–8 с от клавиши до строки программы), а клавиш
+            // здесь четыре подряд. С паузой 2.5 с снимок показывал форму ещё до
+            // щелчка по меню.
+            Step::Wait(10_000),
+            Step::Shot("keys-submenu"),
+            Step::Key("ret"),
+            Step::Await("recent: second.txt", 30_000),
+            // Середина кнопки «Hello»: 160 + 94/2, 38 + 29/2 от угла содержимого.
+            Step::Aim(Aim::Program("Keys", 207, 52)),
+            Step::Await("tip: button1 'Says hello'", 30_000),
+            // Строка приходит до показа (Popup — событие «перед»), а кадр с
+            // подсказкой — через перерисовку формы. Висит она 30 с
+            // (AutoPopDelay в образце), так что паузе есть куда уместиться.
+            Step::Wait(10_000),
+            Step::Shot("keys-tooltip"),
+            Step::Aim(Aim::Close("Keys")),
+            Step::Click,
+            Step::Await("closed: UserClosing 100 False True False", 30_000),
+            Step::Await("dotnet: keys.dll: Main returned 0", 30_000),
             Step::Absent("finally after Environment.Exit must not run"),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),
@@ -6167,9 +6241,9 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run -b /bin/sysmon"),
             Step::Await("window      : 'System' at", 30_000),
             // Новое окно забирает фокус, и строка из серийной линии ушла бы в
-            // него, а не в оболочку: Tab возвращает терминал.
+            // него, а не в оболочку: Alt+Tab возвращает терминал.
             Step::Await("sysmon: theme", 15_000),
-            Step::Key("tab"),
+            Step::Key("alt-tab"),
             Step::Await("desktop     : focus 'Terminal'", 15_000),
             Step::Line("run -b /bin/taskmgr"),
             Step::Await("window      : 'Task Manager' at", 30_000),

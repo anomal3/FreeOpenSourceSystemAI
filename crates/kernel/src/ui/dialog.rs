@@ -308,7 +308,7 @@ fn draw_about(ctx: Ctx, s: &mut Surface, x: i32, y: &mut i32, width: u32, facts:
     *y += line(ctx, Role::MonoCaps) + ctx.px(8) as i32;
     for (keys, what) in [
         ("Win или F1", "меню запуска"),
-        ("Tab", "следующее окно"),
+        ("Alt+Tab", "следующее окно"),
         ("Ctrl+W", "закрыть окно"),
         ("Ctrl+стрелки", "подвинуть окно"),
     ] {

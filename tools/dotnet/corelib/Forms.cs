@@ -82,6 +82,8 @@ namespace System.ComponentModel
         }
     }
 
+    public delegate void CancelEventHandler(object sender, CancelEventArgs e);
+
     public class CancelEventArgs : EventArgs
     {
         public CancelEventArgs()
@@ -107,6 +109,8 @@ namespace System.Windows.Forms
         internal const int EventKey = 1;
         internal const int EventPointer = 2;
         internal const int EventClose = 3;
+        internal const int EventMove = 4;
+        internal const int EventLeave = 5;
 
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static extern int Open(string title, int width, int height);
@@ -126,7 +130,9 @@ namespace System.Windows.Forms
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static extern void Present(int window);
 
-        // Вид события (`Event*`), для щелчка — точка и кнопки, для клавиши — символ.
+        // Вид события (`Event*`), для щелчка и движения — точка и кнопки, для
+        // клавиши — символ в `code`, модификаторы в `x` и латинская буква
+        // клавиши в `y` (фаза N7h).
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static extern int NextEvent(int window, out int x, out int y, out int code);
 
@@ -476,7 +482,21 @@ namespace System.Windows.Forms
         }
     }
 
-    public class Control : Component
+    // Сообщение окна (фаза N7h). Сообщений Windows у FreeOS нет; структура нужна
+    // подписи ProcessCmdKey, которую программы переопределяют.
+    public struct Message
+    {
+        public int Msg { get; set; }
+
+        public static Message Create(IntPtr hWnd, int msg, IntPtr wparam, IntPtr lparam)
+        {
+            var message = new Message();
+            message.Msg = msg;
+            return message;
+        }
+    }
+
+    public class Control : Component, IWin32Window
     {
         private static readonly Font defaultFont = new Font("Segoe UI", 9F);
 
@@ -1024,6 +1044,15 @@ namespace System.Windows.Forms
         {
         }
 
+        // Указатель над всплывающим (фаза N7h): меню выбирает строку под ним.
+        internal virtual void HoverPopup(int x, int y)
+        {
+        }
+
+        // Забирает ли всплывающее ввод. Подсказка — нет: щелчок и клавиша её
+        // убирают и идут форме дальше.
+        internal virtual bool PopupTakesInput => true;
+
         // Фаза N7a: фокус. Принимают его только элементы, которые умеют ввод.
         internal virtual bool Selectable => false;
 
@@ -1054,6 +1083,199 @@ namespace System.Windows.Forms
         }
 
         public void Select() => Focus();
+
+        // Своих окон Windows у элементов нет, номер окна FreeOS — дело формы.
+        // Свойство нужно программе, чтобы передать элемент как IWin32Window.
+        public IntPtr Handle => default(IntPtr);
+
+        // Фаза N7h — путь клавиши, как у WinForms (Control.PreProcessMessage):
+        // сначала сочетания (ProcessCmdKey), потом — если элемент не берёт
+        // клавишу себе (IsInputKey) — клавиши диалога (ProcessDialogKey): Tab,
+        // стрелки, Enter и Escape у формы. Не разобранное никем достаётся
+        // элементу в фокусе событиями KeyDown и KeyPress.
+        protected virtual bool IsInputKey(Keys keyData) => false;
+
+        // Стрелки, Home, End и листание без Alt — их поля, списки и ползунки
+        // разбирают сами.
+        internal static bool IsNavigationKey(Keys keyData)
+        {
+            if ((keyData & Keys.Alt) != Keys.None)
+            {
+                return false;
+            }
+            switch (keyData & Keys.KeyCode)
+            {
+                case Keys.Left:
+                case Keys.Right:
+                case Keys.Up:
+                case Keys.Down:
+                case Keys.Home:
+                case Keys.End:
+                case Keys.PageUp:
+                case Keys.PageDown:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        protected virtual bool ProcessDialogKey(Keys keyData) => Parent != null && Parent.ProcessDialogKey(keyData);
+
+        protected virtual bool ProcessCmdKey(ref Message msg, Keys keyData) => Parent != null && Parent.ProcessCmdKey(ref msg, keyData);
+
+        // Для формы: чужие protected-члены зовут только отсюда.
+        internal bool IsInputKeyFor(Keys keyData) => IsInputKey(keyData);
+
+        internal bool DialogKeyFor(Keys keyData) => ProcessDialogKey(keyData);
+
+        internal bool CmdKeyFor(ref Message msg, Keys keyData) => ProcessCmdKey(ref msg, keyData);
+
+        // Следующий элемент в порядке Tab (фаза N7h) — правило WinForms дословно:
+        // TabIndex, при равных — порядок в Controls; вглубь контейнеров, кроме
+        // тех, что сами управляют фокусом (ContainerControl — поле со стрелками
+        // внутрь себя не пускает).
+        public bool SelectNextControl(Control ctl, bool forward, bool tabStopOnly, bool nested, bool wrap)
+        {
+            if (!Contains(ctl) || (!nested && ctl.Parent != this))
+            {
+                ctl = null;
+            }
+            bool alreadyWrapped = false;
+            Control start = ctl;
+            do
+            {
+                ctl = GetNextControl(ctl, forward);
+                if (ctl == null)
+                {
+                    if (!wrap)
+                    {
+                        break;
+                    }
+                    if (alreadyWrapped)
+                    {
+                        return false;
+                    }
+                    alreadyWrapped = true;
+                }
+                else if (ctl.CanSelect && (!tabStopOnly || ctl.TabStop) && (nested || ctl.Parent == this) && !(ctl.Parent is ToolStrip))
+                {
+                    ctl.Focus();
+                    return true;
+                }
+            }
+            while (ctl != start);
+            return false;
+        }
+
+        public Control GetNextControl(Control ctl, bool forward)
+        {
+            if (!Contains(ctl))
+            {
+                ctl = this;
+            }
+            if (forward)
+            {
+                if (ctl.Controls.Count > 0 && (ctl == this || !(ctl is ContainerControl)))
+                {
+                    Control first = ctl.FirstInTabOrder(true);
+                    if (first != null)
+                    {
+                        return first;
+                    }
+                }
+                while (ctl != this)
+                {
+                    int targetIndex = ctl.TabIndex;
+                    bool hitCtl = false;
+                    Control found = null;
+                    Control parent = ctl.Parent;
+                    for (int c = 0; c < parent.Controls.Count; c++)
+                    {
+                        Control candidate = parent.Controls[c];
+                        if (candidate == ctl)
+                        {
+                            hitCtl = true;
+                        }
+                        else if (candidate.TabIndex >= targetIndex && (found == null || found.TabIndex > candidate.TabIndex) && (candidate.TabIndex != targetIndex || hitCtl))
+                        {
+                            found = candidate;
+                        }
+                    }
+                    if (found != null)
+                    {
+                        return found;
+                    }
+                    ctl = ctl.Parent;
+                }
+            }
+            else
+            {
+                if (ctl != this)
+                {
+                    int targetIndex = ctl.TabIndex;
+                    bool hitCtl = false;
+                    Control found = null;
+                    Control parent = ctl.Parent;
+                    for (int c = parent.Controls.Count - 1; c >= 0; c--)
+                    {
+                        Control candidate = parent.Controls[c];
+                        if (candidate == ctl)
+                        {
+                            hitCtl = true;
+                        }
+                        else if (candidate.TabIndex <= targetIndex && (found == null || found.TabIndex < candidate.TabIndex) && (candidate.TabIndex != targetIndex || hitCtl))
+                        {
+                            found = candidate;
+                        }
+                    }
+                    if (found != null)
+                    {
+                        ctl = found;
+                    }
+                    else
+                    {
+                        return parent == this ? null : parent;
+                    }
+                }
+                while (ctl.Controls.Count > 0 && (ctl == this || !(ctl is ContainerControl)))
+                {
+                    Control last = ctl.FirstInTabOrder(false);
+                    if (last == null)
+                    {
+                        break;
+                    }
+                    ctl = last;
+                }
+            }
+            return ctl == this ? null : ctl;
+        }
+
+        // Первый по TabIndex потомок вперёд, последний — назад.
+        private Control FirstInTabOrder(bool forward)
+        {
+            Control found = null;
+            if (forward)
+            {
+                for (int c = 0; c < Controls.Count; c++)
+                {
+                    if (found == null || found.TabIndex > Controls[c].TabIndex)
+                    {
+                        found = Controls[c];
+                    }
+                }
+            }
+            else
+            {
+                for (int c = Controls.Count - 1; c >= 0; c--)
+                {
+                    if (found == null || found.TabIndex < Controls[c].TabIndex)
+                    {
+                        found = Controls[c];
+                    }
+                }
+            }
+            return found;
+        }
 
         public bool Contains(Control ctl)
         {
@@ -1092,6 +1314,70 @@ namespace System.Windows.Forms
 
         protected virtual void OnKeyUp(KeyEventArgs e) => KeyUp?.Invoke(this, e);
 
+        // Мышь без нажатия (фаза N7h): стол присылает движения над окном, форма
+        // находит элемент под указателем и говорит, кого указатель покинул.
+        public event EventHandler MouseEnter;
+
+        public event EventHandler MouseLeave;
+
+        public event MouseEventHandler MouseMove;
+
+        protected virtual void OnMouseEnter(EventArgs e) => MouseEnter?.Invoke(this, e);
+
+        protected virtual void OnMouseLeave(EventArgs e) => MouseLeave?.Invoke(this, e);
+
+        protected virtual void OnMouseMove(MouseEventArgs e) => MouseMove?.Invoke(this, e);
+
+        internal void RaiseMouseEnter() => OnMouseEnter(EventArgs.Empty);
+
+        internal void RaiseMouseLeave() => OnMouseLeave(EventArgs.Empty);
+
+        internal void RaiseMouseMove(MouseEventArgs e) => OnMouseMove(e);
+
+        // Проверка при уходе фокуса (фаза N7h): Validating, затем Validated —
+        // после Enter у нового элемента, как в WinForms.
+        public bool CausesValidation { get; set; } = true;
+
+        public event CancelEventHandler Validating;
+
+        public event EventHandler Validated;
+
+        protected virtual void OnValidating(CancelEventArgs e) => Validating?.Invoke(this, e);
+
+        protected virtual void OnValidated(EventArgs e) => Validated?.Invoke(this, e);
+
+        // Что элемент делает с набранным, когда фокус ушёл: поле со стрелками
+        // разбирает число.
+        internal virtual void FocusLeft()
+        {
+        }
+
+        internal void RaiseValidation()
+        {
+            FocusLeft();
+            if (!CausesValidation)
+            {
+                return;
+            }
+            var args = new CancelEventArgs();
+            OnValidating(args);
+            if (!args.Cancel)
+            {
+                OnValidated(EventArgs.Empty);
+            }
+        }
+
+        // Кнопки мыши и модификаторы в эту минуту, как у WinForms. Среда знает
+        // их только на время разбора события — и этого хватает: спрашивают их
+        // обработчики этого самого события.
+        internal static MouseButtons PressedButtons;
+
+        internal static Keys PressedModifiers;
+
+        public static MouseButtons MouseButtons => PressedButtons;
+
+        public static Keys ModifierKeys => PressedModifiers;
+
         // Для ContainerControl: чужие protected-члены зовут только отсюда.
         internal void RaiseFocus(bool entering)
         {
@@ -1110,20 +1396,20 @@ namespace System.Windows.Forms
 
         // Клавиша стола: KeyDown, то, что элемент делает с ней сам, KeyPress у
         // символа, ввод символа, KeyUp — порядок WinForms.
-        internal void DeliverKey(int code)
+        internal void DeliverKey(int code, int mods, int latin)
         {
             if (!Enabled)
             {
                 return;
             }
-            Keys keys = KeyMap.ToKeys(code);
+            Keys keys = KeyMap.ToKeys(code, mods, latin);
             var down = new KeyEventArgs(keys);
             OnKeyDown(down);
             if (!down.Handled)
             {
                 ProcessKey(down);
             }
-            if (!down.SuppressKeyPress && KeyMap.ToChar(code, out char c))
+            if (!down.SuppressKeyPress && KeyMap.ToChar(code, mods, out char c))
             {
                 var press = new KeyPressEventArgs(c);
                 OnKeyPress(press);
@@ -1143,21 +1429,27 @@ namespace System.Windows.Forms
         {
         }
 
-        // Первый по TabIndex элемент, который примет фокус, — как при показе
-        // формы в WinForms.
+        // Первый в порядке Tab элемент с остановкой Tab — как при показе формы в
+        // WinForms (SelectNextControl(null, true, true, true, false)). До фазы
+        // N7h здесь сравнивался TabIndex вложенного элемента с TabIndex
+        // элементов формы, и переключатель с TabIndex 0 внутри группы с
+        // TabIndex 3 получал фокус раньше поля с TabIndex 1 — образец `keys`
+        // это и поймал.
         internal Control FirstFocusable()
         {
-            Control best = null;
-            for (int i = 0; i < Controls.Count; i++)
+            Control ctl = null;
+            while (true)
             {
-                Control child = Controls[i];
-                Control candidate = child.CanFocus ? child : child.FirstFocusable();
-                if (candidate != null && (best == null || child.TabIndex < best.TabIndex))
+                ctl = GetNextControl(ctl, true);
+                if (ctl == null)
                 {
-                    best = candidate;
+                    return null;
+                }
+                if (ctl.CanSelect && ctl.TabStop && !(ctl.Parent is ToolStrip))
+                {
+                    return ctl;
                 }
             }
-            return best;
         }
 
         // Фон, Paint и потомки снизу вверх: первый в Controls — самый верхний.
@@ -1281,7 +1573,8 @@ namespace System.Windows.Forms
 
         private Control active;
 
-        // Смена фокуса: Leave и LostFocus у прежнего, Enter и GotFocus у нового.
+        // Смена фокуса: Leave и LostFocus у прежнего, Enter и GotFocus у нового,
+        // затем проверка прежнего (фаза N7h) — в этом порядке у WinForms.
         public Control ActiveControl
         {
             get => active;
@@ -1301,7 +1594,45 @@ namespace System.Windows.Forms
                 {
                     value.RaiseFocus(true);
                 }
+                if (previous != null && !previous.IsDisposed)
+                {
+                    previous.RaiseValidation();
+                }
             }
+        }
+
+        // Tab и стрелки (фаза N7h). Tab — следующий по TabIndex с остановкой Tab
+        // во всей форме; стрелка — соседний элемент того же родителя, по кругу и
+        // без оглядки на TabStop: так отметка в группе переключателей ходит за
+        // стрелкой.
+        protected override bool ProcessDialogKey(Keys keyData)
+        {
+            if ((keyData & (Keys.Alt | Keys.Control)) == Keys.None)
+            {
+                Keys keyCode = keyData & Keys.KeyCode;
+                if (keyCode == Keys.Tab && ProcessTabKey((keyData & Keys.Shift) == Keys.None))
+                {
+                    return true;
+                }
+                if ((keyCode == Keys.Left || keyCode == Keys.Right || keyCode == Keys.Up || keyCode == Keys.Down)
+                    && ProcessArrowKey(keyCode == Keys.Right || keyCode == Keys.Down))
+                {
+                    return true;
+                }
+            }
+            return base.ProcessDialogKey(keyData);
+        }
+
+        protected virtual bool ProcessTabKey(bool forward) => SelectNextControl(ActiveControl, forward, true, true, false);
+
+        private bool ProcessArrowKey(bool forward)
+        {
+            Control group = this;
+            if (ActiveControl != null)
+            {
+                group = ActiveControl.Parent;
+            }
+            return group.SelectNextControl(ActiveControl, forward, false, false, true);
         }
     }
 
@@ -1325,7 +1656,171 @@ namespace System.Windows.Forms
         // оно, см. Control.PopupBounds.
         internal Control Popup { get; set; }
 
+        // Где указатель стоял последним и над каким элементом (фаза N7h).
+        internal Point PointerPosition { get; private set; }
+
+        private Control hovered;
+
         public MenuStrip MainMenuStrip { get; set; }
+
+        // Enter нажимает кнопку по умолчанию — кнопку в фокусе, а без неё
+        // AcceptButton; Escape — CancelButton. Как у WinForms.
+        protected override bool ProcessDialogKey(Keys keyData)
+        {
+            if ((keyData & (Keys.Alt | Keys.Control)) == Keys.None)
+            {
+                Keys keyCode = keyData & Keys.KeyCode;
+                if (keyCode == Keys.Enter)
+                {
+                    IButtonControl button = ActiveControl as IButtonControl;
+                    if (button == null)
+                    {
+                        button = AcceptButton;
+                    }
+                    if (button != null)
+                    {
+                        button.PerformClick();
+                        return true;
+                    }
+                }
+                else if (keyCode == Keys.Escape && CancelButton != null)
+                {
+                    CancelButton.PerformClick();
+                    return true;
+                }
+            }
+            return base.ProcessDialogKey(keyData);
+        }
+
+        // У формы Tab идёт по кругу.
+        protected override bool ProcessTabKey(bool forward) => SelectNextControl(ActiveControl, forward, true, true, true);
+
+        // Сочетания пунктов меню (фаза N7h): Ctrl+O нажимает пункт с
+        // ShortcutKeys = Control | O, где бы тот ни лежал — хоть во вложенном
+        // подменю. Годное сочетание — как у ToolStripManager.IsValidShortcut: с
+        // Ctrl или Alt, либо Delete, Insert и F-ряд.
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (base.ProcessCmdKey(ref msg, keyData))
+            {
+                return true;
+            }
+            return IsValidShortcut(keyData) && ClickShortcut(this, keyData);
+        }
+
+        private static bool IsValidShortcut(Keys shortcut)
+        {
+            Keys keyCode = shortcut & Keys.KeyCode;
+            Keys modifiers = shortcut & Keys.Modifiers;
+            if (shortcut == Keys.None)
+            {
+                return false;
+            }
+            if (keyCode == Keys.Delete || keyCode == Keys.Insert || ((int)keyCode >= (int)Keys.F1 && (int)keyCode <= (int)Keys.F1 + 23))
+            {
+                return true;
+            }
+            return modifiers != Keys.None && modifiers != Keys.Shift;
+        }
+
+        private static bool ClickShortcut(Control parent, Keys keyData)
+        {
+            for (int i = 0; i < parent.Controls.Count; i++)
+            {
+                Control child = parent.Controls[i];
+                var strip = child as ToolStrip;
+                if (strip != null && ClickShortcut(strip.Items, keyData))
+                {
+                    return true;
+                }
+                if (ClickShortcut(child, keyData))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool ClickShortcut(ToolStripItemCollection items, Keys keyData)
+        {
+            for (int i = 0; i < items.Count; i++)
+            {
+                var item = items[i] as ToolStripDropDownItem;
+                if (item == null)
+                {
+                    continue;
+                }
+                var menuItem = item as ToolStripMenuItem;
+                if (menuItem != null && menuItem.Enabled && menuItem.ShortcutKeys == keyData && !menuItem.HasDropDownItems)
+                {
+                    menuItem.PerformClick();
+                    return true;
+                }
+                if (item.HasDropDownItems && ClickShortcut(item.DropDownItems, keyData))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Путь клавиши до элемента (фаза N7h), как Control.PreProcessMessage у
+        // WinForms: открытое всплывающее, сочетания, клавиши диалога. `true` —
+        // клавиша разобрана, элементу она не достаётся.
+        private bool PreProcessKey(Control focused, Keys key)
+        {
+            if (Popup != null && Popup.KeyPopup(key))
+            {
+                return true;
+            }
+            var message = new Message();
+            if (focused.CmdKeyFor(ref message, key))
+            {
+                return true;
+            }
+            if (focused.IsInputKeyFor(key))
+            {
+                return false;
+            }
+            KeyMap.TabPressed = (key & Keys.KeyCode) == Keys.Tab;
+            bool handled = focused.DialogKeyFor(key);
+            KeyMap.TabPressed = false;
+            return handled;
+        }
+
+        // Кто под указателем: прежний получает MouseLeave, новый — MouseEnter,
+        // как у WinForms при переходе между окнами элементов.
+        private void Hover(Control under)
+        {
+            if (hovered == under)
+            {
+                return;
+            }
+            Control was = hovered;
+            hovered = under;
+            if (was != null && !was.IsDisposed)
+            {
+                was.RaiseMouseLeave();
+            }
+            if (under != null)
+            {
+                under.RaiseMouseEnter();
+            }
+        }
+
+        private static MouseButtons ButtonsOf(int code)
+        {
+            MouseButtons buttons = MouseButtons.None;
+            if ((code & 1) != 0)
+            {
+                buttons |= MouseButtons.Left;
+            }
+            if ((code & 2) != 0)
+            {
+                buttons |= MouseButtons.Right;
+            }
+            return buttons;
+        }
 
         // Диалог (фаза N7c). У модальной формы значение, отличное от None,
         // закрывает её — это проверяет цикл Application.RunModal.
@@ -1454,52 +1949,85 @@ namespace System.Windows.Forms
                 case FreeOsWindow.EventNone:
                     return false;
                 case FreeOsWindow.EventPointer:
+                {
+                    PointerPosition = new Point(px, py);
                     if (Popup != null)
                     {
                         // Щелчок во всплывающем разбирает оно само; мимо него и
                         // мимо открывшего его элемента — только закрывает, как в
                         // Windows. Щелчок по самому элементу достаётся элементу.
+                        // Подсказка ввода не забирает: она убирается, и щелчок
+                        // идёт дальше (фаза N7h).
                         Control owner = Popup;
-                        if (owner.PopupBounds.Contains(px, py))
+                        if (!owner.PopupTakesInput)
+                        {
+                            owner.ClosePopup();
+                        }
+                        else if (owner.PopupBounds.Contains(px, py))
                         {
                             owner.ClickPopup(px, py);
                             return true;
                         }
-                        Point origin = owner.OriginInForm();
-                        if (!new Rectangle(origin.X, origin.Y, owner.Width, owner.Height).Contains(px, py))
+                        else
                         {
-                            owner.ClosePopup();
-                            return true;
+                            Point origin = owner.OriginInForm();
+                            if (!new Rectangle(origin.X, origin.Y, owner.Width, owner.Height).Contains(px, py))
+                            {
+                                owner.ClosePopup();
+                                return true;
+                            }
                         }
                     }
                     Control target = ChildAt(px, py, out int localX, out int localY);
+                    MouseButtons button = code == 2 ? MouseButtons.Right : MouseButtons.Left;
+                    // Кнопка «нажата» на всё время разбора: переключатель,
+                    // получивший фокус щелчком, узнаёт по MouseButtons, что в
+                    // него вошли не стрелкой (фаза N7h).
+                    PressedButtons = button;
                     // Фокус переходит при нажатии, до MouseDown, как в WinForms.
                     if (target.CanFocus)
                     {
                         ActiveControl = target;
                     }
-                    target.DeliverClick(code == 2 ? MouseButtons.Right : MouseButtons.Left, localX, localY);
+                    target.DeliverClick(button, localX, localY);
+                    PressedButtons = MouseButtons.None;
                     return true;
+                }
                 case FreeOsWindow.EventKey:
+                {
+                    // У клавиши `px` — модификаторы, `py` — латинская буква.
                     Control focused = ActiveControl != null && ActiveControl.CanFocus ? ActiveControl : this;
-                    Keys key = KeyMap.ToKeys(code);
-                    if (Popup != null && Popup.KeyPopup(key))
+                    Keys key = KeyMap.ToKeys(code, px, py);
+                    PressedModifiers = key & Keys.Modifiers;
+                    if (!PreProcessKey(focused, key))
                     {
-                        return true;
+                        focused.DeliverKey(code, px, py);
                     }
-                    // Enter нажимает кнопку по умолчанию, если фокус не на
-                    // другой кнопке, Escape — кнопку отмены.
-                    if (key == Keys.Enter && AcceptButton != null && !(focused is IButtonControl))
+                    PressedModifiers = Keys.None;
+                    return true;
+                }
+                case FreeOsWindow.EventMove:
+                {
+                    PointerPosition = new Point(px, py);
+                    PressedButtons = ButtonsOf(code);
+                    if (Popup != null && Popup.PopupTakesInput && Popup.PopupBounds.Contains(px, py))
                     {
-                        AcceptButton.PerformClick();
-                        return true;
+                        // Всплывающее — своё окно у Windows: элемент под ним
+                        // указатель потерял.
+                        Hover(null);
+                        Popup.HoverPopup(px, py);
                     }
-                    if (key == Keys.Escape && CancelButton != null)
+                    else
                     {
-                        CancelButton.PerformClick();
-                        return true;
+                        Control under = ChildAt(px, py, out int moveX, out int moveY);
+                        Hover(under);
+                        under.RaiseMouseMove(new MouseEventArgs(PressedButtons, 0, moveX, moveY, 0));
                     }
-                    focused.DeliverKey(code);
+                    PressedButtons = MouseButtons.None;
+                    return true;
+                }
+                case FreeOsWindow.EventLeave:
+                    Hover(null);
                     return true;
                 case FreeOsWindow.EventClose:
                     CloseFor(CloseReason.UserClosing);

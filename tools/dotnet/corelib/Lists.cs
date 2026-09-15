@@ -343,6 +343,10 @@ namespace System.Windows.Forms
             base.OnMouseDown(e);
         }
 
+        // Стрелки и листание — выбор строки, а не переход к соседнему элементу
+        // (фаза N7h).
+        protected override bool IsInputKey(Keys keyData) => IsNavigationKey(keyData) || base.IsInputKey(keyData);
+
         internal override void ProcessKey(KeyEventArgs e)
         {
             int count = Rows.Count;
@@ -660,6 +664,8 @@ namespace System.Windows.Forms
             DroppedDown = !dropped;
             base.OnMouseDown(e);
         }
+
+        protected override bool IsInputKey(Keys keyData) => IsNavigationKey(keyData) || base.IsInputKey(keyData);
 
         internal override void ProcessKey(KeyEventArgs e)
         {

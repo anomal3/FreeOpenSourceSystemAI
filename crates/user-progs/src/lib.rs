@@ -78,7 +78,8 @@ use user_abi::{
 pub use user_abi::{
     MAX_TITLE, PIXEL_BGR, PIXEL_RGB, SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_KEY_DELETE,
     WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT, WIN_KEY_MENU, WIN_KEY_NAMED,
-    WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP, WIN_POINTER, WinEvent,
+    WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP, WIN_LEAVE, WIN_MOVE, WIN_POINTER,
+    WinEvent,
 };
 
 /// Как эта клавиша называется в журнале — или `None`, если она пришла символом.

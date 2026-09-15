@@ -4,8 +4,8 @@
 // Правила сняты с WinForms образцом `tabs`: страницы, кроме выбранной, скрыты;
 // удаление выбранной вкладки поднимает SelectedIndexChanged и выбирает
 // оставшуюся; `Items.Add(string)` у строки состояния создаёт ToolStripStatusLabel.
-// Подсказки хранятся и отдаются, но на FreeOS не всплывают: движения мыши над
-// окном программы стол не присылает.
+// Подсказка всплывает с фазы N7h: стол присылает движения мыши над окном, и
+// ToolTip узнаёт о них из MouseEnter и MouseLeave своих элементов.
 
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -286,6 +286,9 @@ namespace System.Windows.Forms
             base.OnMouseDown(e);
         }
 
+        // Стрелки листают вкладки (фаза N7h).
+        protected override bool IsInputKey(Keys keyData) => IsNavigationKey(keyData) || base.IsInputKey(keyData);
+
         internal override void ProcessKey(KeyEventArgs e)
         {
             if (TabCount == 0)
@@ -503,13 +506,43 @@ namespace System.Windows.Forms
         }
     }
 
+    public class PopupEventArgs : CancelEventArgs
+    {
+        public PopupEventArgs(IWin32Window associatedWindow, Control associatedControl, bool isBalloon, Size size)
+        {
+            AssociatedWindow = associatedWindow;
+            AssociatedControl = associatedControl;
+            IsBalloon = isBalloon;
+            ToolTipSize = size;
+        }
+
+        public IWin32Window AssociatedWindow { get; }
+
+        public Control AssociatedControl { get; }
+
+        public bool IsBalloon { get; }
+
+        public Size ToolTipSize { get; set; }
+    }
+
+    public delegate void PopupEventHandler(object sender, PopupEventArgs e);
+
     public class ToolTip : Component
     {
         private readonly Dictionary<Control, string> tips = new Dictionary<Control, string>();
         private int automaticDelay = 500;
 
+        // Фаза N7h: подсказка всплывает. Элементы с подсказкой сообщают, что над
+        // ними указатель; подсказка ждёт InitialDelay и висит AutoPopDelay. Таймер
+        // один: у подсказки одно состояние за раз — ждёт, видна или нет.
+        private readonly List<Control> watched = new List<Control>();
+        private readonly Timer timer = new Timer();
+        private Control pending;
+        private ToolTipBubble shown;
+
         public ToolTip()
         {
+            timer.Tick += OnTimer;
         }
 
         public ToolTip(IContainer cont)
@@ -561,6 +594,10 @@ namespace System.Windows.Forms
 
         public object Tag { get; set; }
 
+        // Перед показом, как у WinForms: обработчик может отменить подсказку или
+        // поменять её размер.
+        public event PopupEventHandler Popup;
+
         public void SetToolTip(Control control, string caption)
         {
             if (control == null)
@@ -575,6 +612,13 @@ namespace System.Windows.Forms
             {
                 tips[control] = caption;
             }
+            if (!watched.Contains(control))
+            {
+                watched.Add(control);
+                control.MouseEnter += OnControlEnter;
+                control.MouseLeave += OnControlLeave;
+                control.MouseDown += OnControlDown;
+            }
         }
 
         public string GetToolTip(Control control)
@@ -586,15 +630,155 @@ namespace System.Windows.Forms
             return string.Empty;
         }
 
-        public void RemoveAll() => tips.Clear();
+        public void RemoveAll()
+        {
+            tips.Clear();
+            Hide();
+        }
+
+        private void OnControlEnter(object sender, EventArgs e)
+        {
+            var control = (Control)sender;
+            if (!Active || !tips.ContainsKey(control))
+            {
+                return;
+            }
+            Hide();
+            pending = control;
+            Restart(InitialDelay);
+        }
+
+        private void OnControlLeave(object sender, EventArgs e)
+        {
+            if ((object)pending == sender || (shown != null && (object)shown.Target == sender))
+            {
+                pending = null;
+                timer.Enabled = false;
+                Hide();
+            }
+        }
+
+        // Нажатие убирает подсказку, как в Windows.
+        private void OnControlDown(object sender, MouseEventArgs e) => OnControlLeave(sender, e);
+
+        private void Restart(int delay)
+        {
+            timer.Enabled = false;
+            timer.Interval = Math.Max(1, delay);
+            timer.Enabled = true;
+        }
+
+        private void OnTimer(object sender, EventArgs e)
+        {
+            timer.Enabled = false;
+            if (shown != null)
+            {
+                // Отвисела своё.
+                Hide();
+                return;
+            }
+            Control control = pending;
+            pending = null;
+            if (control == null || !Active || !tips.TryGetValue(control, out string caption))
+            {
+                return;
+            }
+            // Пока открыто меню или список, подсказке места нет.
+            Form form = control.FindForm();
+            if (form == null || form.Popup != null)
+            {
+                return;
+            }
+            int width = FreeOsWindow.TextWidth(caption) + 2 * ToolTipBubble.Inset;
+            int height = FreeOsWindow.TextHeight() + 2 * ToolTipBubble.Inset;
+            var args = new PopupEventArgs(form, control, IsBalloon, new Size(width, height));
+            Popup?.Invoke(this, args);
+            if (args.Cancel)
+            {
+                return;
+            }
+            shown = new ToolTipBubble(this, control, caption, form, args.ToolTipSize);
+            form.Popup = shown;
+            form.NeedsPaint = true;
+            Restart(AutoPopDelay);
+        }
+
+        internal void Hide()
+        {
+            ToolTipBubble bubble = shown;
+            shown = null;
+            if (bubble != null && bubble.Host.Popup == bubble)
+            {
+                bubble.Host.Popup = null;
+                bubble.Host.NeedsPaint = true;
+            }
+        }
 
         protected override void Dispose(bool disposing)
         {
             if (disposing)
             {
+                timer.Enabled = false;
                 tips.Clear();
+                Hide();
             }
             base.Dispose(disposing);
         }
+    }
+
+    // Всплывшая подсказка (фаза N7h). Рисуется всплывающим поверх формы, как
+    // открытое меню, под указателем. Ввода она не забирает: щелчок и клавиша её
+    // убирают и идут форме дальше — подсказка ничего не заслоняет.
+    internal sealed class ToolTipBubble : Control
+    {
+        internal const int Inset = 4;
+
+        private readonly ToolTip tip;
+        private readonly string caption;
+        private readonly Rectangle bounds;
+
+        internal ToolTipBubble(ToolTip tip, Control target, string caption, Form host, Size size)
+        {
+            this.tip = tip;
+            this.caption = caption;
+            Target = target;
+            Host = host;
+            // Под указателем, а у нижнего или правого края формы — над ним и
+            // левее: окно программы подсказке не покинуть.
+            Point at = host.PointerPosition;
+            int left = Math.Max(0, Math.Min(at.X, host.ClientSize.Width - size.Width));
+            int top = at.Y + 20;
+            if (top + size.Height > host.ClientSize.Height)
+            {
+                top = Math.Max(0, at.Y - size.Height - 4);
+            }
+            bounds = new Rectangle(left, top, size.Width, size.Height);
+        }
+
+        internal Control Target { get; }
+
+        internal Form Host { get; }
+
+        internal override Rectangle PopupBounds => bounds;
+
+        internal override bool PopupTakesInput => false;
+
+        internal override void PaintPopup(int window)
+        {
+            var g = new Graphics(window, bounds.X, bounds.Y, bounds);
+            g.Clear(Color.FromArgb(118, 118, 118));
+            g.FillRectangle(new SolidBrush(Color.FromArgb(255, 255, 255)), 1, 1, bounds.Width - 2, bounds.Height - 2);
+            g.DrawString(caption, Font, new SolidBrush(Color.FromArgb(87, 87, 87)), Inset, (bounds.Height - FreeOsWindow.TextHeight()) / 2);
+        }
+
+        internal override void ClickPopup(int x, int y) => tip.Hide();
+
+        internal override bool KeyPopup(Keys key)
+        {
+            tip.Hide();
+            return false;
+        }
+
+        internal override void ClosePopup() => tip.Hide();
     }
 }

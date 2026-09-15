@@ -119,12 +119,63 @@ namespace System.Windows.Forms
     public delegate void KeyEventHandler(object sender, KeyEventArgs e);
 
     // Событие стола — клавиша и символ WinForms.
+    //
+    // С фазы N7h у клавиши есть ещё маска модификаторов (1 Shift, 2 Ctrl, 4 Alt)
+    // и латинская буква — см. `user_abi::WinEvent::y`. По букве `Keys` берутся
+    // от клавиши, как у Windows: Ctrl+O остаётся Ctrl+O в русской раскладке, а
+    // Ctrl+H не путается с Backspace, хотя символ у них один — `0x08`.
     internal static class KeyMap
     {
         // `WIN_KEY_NAMED` договора окон: выше — имена клавиш без символа.
         private const int Named = 0x01000000;
 
-        internal static Keys ToKeys(int code)
+        private const int ModShift = 1;
+        private const int ModControl = 2;
+        private const int ModAlt = 4;
+
+        // Клавишу прямо сейчас разбирает Tab (фаза N7h). Переключатель, в
+        // который вошли по Tab, не отмечается, а стрелкой — отмечается: WinForms
+        // различает это, спрашивая состояние клавиши Tab.
+        internal static bool TabPressed;
+
+        internal static Keys ToKeys(int code) => ToKeys(code, 0, 0);
+
+        internal static Keys ToKeys(int code, int mods, int latin)
+        {
+            Keys keys = FromLatin(latin);
+            if (keys == Keys.None)
+            {
+                keys = FromSymbol(code);
+            }
+            if ((mods & ModShift) != 0)
+            {
+                keys |= Keys.Shift;
+            }
+            if ((mods & ModControl) != 0)
+            {
+                keys |= Keys.Control;
+            }
+            if ((mods & ModAlt) != 0)
+            {
+                keys |= Keys.Alt;
+            }
+            return keys;
+        }
+
+        private static Keys FromLatin(int latin)
+        {
+            if (latin >= 'a' && latin <= 'z')
+            {
+                return (Keys)(latin - 32);
+            }
+            if (latin >= '0' && latin <= '9')
+            {
+                return (Keys)latin;
+            }
+            return Keys.None;
+        }
+
+        private static Keys FromSymbol(int code)
         {
             switch (code)
             {
@@ -175,11 +226,12 @@ namespace System.Windows.Forms
             return Keys.None;
         }
 
-        // Символ для KeyPress. Enter стола — `\n`, у WinForms это `\r`.
-        internal static bool ToChar(int code, out char c)
+        // Символ для KeyPress. Enter стола — `\n`, у WinForms это `\r`. С Alt
+        // KeyPress не приходит: у Windows это WM_SYSCHAR, элементу он не достаётся.
+        internal static bool ToChar(int code, int mods, out char c)
         {
             c = '\0';
-            if (code < 0 || code > 0xFFFF)
+            if ((mods & ModAlt) != 0 || code < 0 || code > 0xFFFF)
             {
                 return false;
             }
@@ -338,6 +390,10 @@ namespace System.Windows.Forms
             selectionLength = 0;
             Invalidate();
         }
+
+        // Стрелки, Home, End и листание разбирает само поле: форма не уводит по
+        // ним фокус (фаза N7h).
+        protected override bool IsInputKey(Keys keyData) => IsNavigationKey(keyData) || base.IsInputKey(keyData);
 
         internal override void ProcessKey(KeyEventArgs e)
         {

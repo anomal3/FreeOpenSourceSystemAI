@@ -253,10 +253,15 @@ pub struct WindowRect {
 /// Событие окна программы (фаза N6a).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowEvent {
-    /// Символ клавиши.
-    Key(u32),
+    /// Клавиша: символ, маска модификаторов (1 Shift, 2 Ctrl, 4 Alt) и
+    /// латинская буква клавиши или ноль — фаза N7h, см. `user_abi::WinEvent`.
+    Key { symbol: u32, mods: u32, latin: u32 },
     /// Щелчок в точке содержимого; `buttons` — 1 левая, 2 правая.
     Pointer { x: i32, y: i32, buttons: u32 },
+    /// Указатель сдвинулся над содержимым (фаза N7h).
+    Move { x: i32, y: i32, buttons: u32 },
+    /// Указатель ушёл с содержимого.
+    Leave,
     /// Окно просят закрыть.
     Close,
 }
