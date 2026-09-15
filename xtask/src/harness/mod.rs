@@ -737,7 +737,13 @@ fn execute(
         monitor: Some(monitor_addr),
         qmp: qmp_addr,
         pointer: if scenario.tablet { Pointer::Tablet } else { Pointer::Mouse },
-        usb: if scenario.ohci { UsbController::Ohci } else { UsbController::Xhci },
+        usb: if scenario.ehci {
+            UsbController::Ehci
+        } else if scenario.ohci {
+            UsbController::Ohci
+        } else {
+            UsbController::Xhci
+        },
         disk_bus: scenario.disk_bus,
         network: scenario.network,
         hostfwd,

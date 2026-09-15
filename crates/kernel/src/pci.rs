@@ -516,6 +516,46 @@ impl Device {
         }
     }
 
+    /// # Safety
+    ///
+    /// См. [`Device::read8`]. Запись меняет поведение устройства на шине.
+    unsafe fn write8(&self, offset: usize, value: u8) {
+        debug_assert!(offset < PAGE_SIZE);
+        match self.config {
+            // SAFETY: контракт функции.
+            Access::Memory(base) => unsafe {
+                (base.as_usize() as *mut u8).add(offset).write_volatile(value);
+            },
+            // Через порты байт пишется в составе двойного слова — так же, как
+            // слово в `write16`.
+            // SAFETY: см. выше.
+            Access::Ports => unsafe {
+                let address = port_address(self.address, offset);
+                let word = arch::pci_config_read32(address);
+                let shift = (offset & 3) * 8;
+                let merged = (word & !(0xFF << shift)) | (u32::from(value) << shift);
+                arch::pci_config_write32(address, merged);
+            },
+        }
+    }
+
+    /// # Safety
+    ///
+    /// См. [`Device::read32`]. Запись меняет поведение устройства на шине.
+    unsafe fn write32(&self, offset: usize, value: u32) {
+        debug_assert!(offset + 3 < PAGE_SIZE && offset % 4 == 0);
+        match self.config {
+            // SAFETY: контракт функции.
+            Access::Memory(base) => unsafe {
+                (base.as_usize() as *mut u32).byte_add(offset).write_volatile(value);
+            },
+            // SAFETY: см. выше.
+            Access::Ports => unsafe {
+                arch::pci_config_write32(port_address(self.address, offset), value);
+            },
+        }
+    }
+
     /// Разрешить устройству отвечать на обращения к памяти и быть инициатором
     /// DMA, попутно закрыв ему линию прерывания INTx.
     ///
@@ -640,6 +680,37 @@ impl Device {
         }
         // SAFETY: см. `config8`.
         unsafe { self.read32(offset) }
+    }
+
+    /// Записать байт конфигурационного пространства.
+    ///
+    /// Нужна драйверам, которые забирают устройство у прошивки: у EHCI признак
+    /// «владеет система» лежит не в окне регистров, а здесь.
+    ///
+    /// # Safety
+    ///
+    /// Запись меняет поведение устройства: смещение обязано указывать на
+    /// регистр, смысл которого вызывающий знает.
+    pub unsafe fn write_config8(&self, offset: usize, value: u8) {
+        if offset >= PAGE_SIZE {
+            return;
+        }
+        // SAFETY: страница отображена при перечислении, смещение проверено.
+        unsafe { self.write8(offset, value) };
+    }
+
+    /// Записать двойное слово конфигурационного пространства. Невыровненное
+    /// смещение не пишет ничего.
+    ///
+    /// # Safety
+    ///
+    /// См. [`Device::write_config8`].
+    pub unsafe fn write_config32(&self, offset: usize, value: u32) {
+        if offset % 4 != 0 || offset + 4 > PAGE_SIZE {
+            return;
+        }
+        // SAFETY: см. `write_config8`.
+        unsafe { self.write32(offset, value) };
     }
 
     /// Пройти список возможностей, вызывая `visit(id, offset)`.

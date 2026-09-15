@@ -133,6 +133,7 @@ fn driver_for(device: &pci::Device) -> (&'static str, &'static str) {
         (_, _, 0x01, 0x06, 0x01) => Some("ahci"),
         (_, _, 0x01, 0x08, 0x02) => Some("nvme"),
         (_, _, 0x0C, 0x03, 0x30) => Some("xhci"),
+        (_, _, 0x0C, 0x03, 0x20) => Some("ehci"),
         (_, _, 0x0C, 0x03, 0x10) => Some("ohci"),
         _ => None,
     };
@@ -142,6 +143,7 @@ fn driver_for(device: &pci::Device) -> (&'static str, &'static str) {
         // окажутся «active», и это названный предел, а не догадка.
         Some("xhci") if crate::usb::xhci::summary().is_some() => ("xhci", "active"),
         Some("ohci") if crate::usb::ohci::summary().is_some() => ("ohci", "active"),
+        Some("ehci") if crate::usb::ehci::summary().is_some() => ("ehci", "active"),
         Some(driver) => (driver, "idle"),
         None if device.class == 0x06 => ("-", "not-needed"),
         None => ("-", "none"),
@@ -187,6 +189,9 @@ pub fn report() -> String {
     }
     if let Some(summary) = crate::usb::ohci::summary() {
         usb_lines(&mut out, "ohci", &summary.attached);
+    }
+    if let Some(summary) = crate::usb::ehci::summary() {
+        usb_lines(&mut out, "ehci", &summary.attached);
     }
 
     for disk in DISKS.lock().iter().flatten() {

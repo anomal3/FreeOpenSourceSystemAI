@@ -431,6 +431,25 @@ fn banner() {
             }
         }
     }
+    // И про EHCI: на ноутбуке, ради которого писался драйвер, это единственный
+    // путь к клавиатуре, а строка о нём — единственный ответ на «почему не
+    // печатается», который человек увидит на экране.
+    if let Some(usb) = usb::ehci::summary() {
+        if usb.occupied > 0 {
+            sprintln!(
+                "EHCI: {} device(s) on {} of {} port(s), {} hub(s), {} keyboard(s), {} pointer(s).",
+                usb.devices,
+                usb.occupied,
+                usb.ports,
+                usb.hubs,
+                usb.keyboards,
+                usb.mice
+            );
+            if let Some((port, stage, err)) = usb.last_error {
+                sprintln!("     root port {port} stopped while {stage}: {err}");
+            }
+        }
+    }
     // То же самое про OHCI, и по той же причине: на машине, где ввод не
     // заработал, единственный доступный человеку ответ — эта строка. Драйверов
     // два, и молчать о втором значило бы вернуть ровно ту неисправность, из-за
@@ -1212,6 +1231,27 @@ fn usb_status() {
             sprintln!("  wakeups  {} of the service task", usb.services);
         }
         None => sprintln!("  xhci     no controller"),
+    }
+    match usb::ehci::summary() {
+        Some(usb) => {
+            sprintln!(
+                "  ehci     {} controller(s), {} devices and {} hub(s) on {} of {} port(s)",
+                usb.controllers,
+                usb.devices,
+                usb.hubs,
+                usb.occupied,
+                usb.ports
+            );
+            sprintln!("  reports  {} parsed, {} transfer errors", usb.reports, usb.errors);
+            sprintln!("  wakeups  {} of the ehci service task", usb.services);
+            if usb.unrecoverable {
+                sprintln!("  ehci     a controller reported a host system error");
+            }
+            if let Some((port, stage, err)) = usb.last_error {
+                sprintln!("  ehci     root port {port} stopped while {stage}: {err}");
+            }
+        }
+        None => sprintln!("  ehci     no controller"),
     }
     match usb::ohci::summary() {
         Some(usb) => {

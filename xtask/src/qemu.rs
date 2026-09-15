@@ -102,6 +102,11 @@ pub enum Pointer {
 pub enum UsbController {
     Xhci,
     Ohci,
+    /// `usb-ehci` без спутников. Клавиатура и мышь QEMU по умолчанию
+    /// высокоскоростные (`usb_version=2`) и садятся прямо на него; хаба и
+    /// транслятора QEMU не эмулирует, поэтому этот путь драйвера здесь не
+    /// проверяется.
+    Ehci,
 }
 
 impl UsbController {
@@ -110,6 +115,7 @@ impl UsbController {
         match self {
             Self::Xhci => "xhci.0",
             Self::Ohci => "ohci.0",
+            Self::Ehci => "ehci.0",
         }
     }
 
@@ -118,6 +124,7 @@ impl UsbController {
         match self {
             Self::Xhci => "qemu-xhci,id=xhci",
             Self::Ohci => "pci-ohci,id=ohci",
+            Self::Ehci => "usb-ehci,id=ehci",
         }
     }
 }

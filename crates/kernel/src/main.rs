@@ -620,6 +620,13 @@ fn start_input(info: &BootInfo) -> bool {
     // с одной шины, и решать за него, что именно нашлось, здесь нечем.
     unsafe { usb::xhci::init(info.acpi_rsdp) };
 
+    // EHCI — раньше OHCI, и порядок здесь не вкус: запись `CONFIGFLAG` отбирает
+    // порты у спутников, а медленные устройства драйвер EHCI тут же отдаёт
+    // обратно. К перечислению OHCI они должны быть уже у него.
+    //
+    // SAFETY: те же условия, что у xHCI выше.
+    unsafe { usb::ehci::init(info.acpi_rsdp) };
+
     // OHCI поднимается **всегда**, а не «если xHCI не нашёлся». Условие
     // выглядело бы разумно и было бы неверным: контроллеры сосуществуют, и на
     // машине с обоими устройство висит на одном из них — на каком именно,
@@ -656,6 +663,14 @@ fn run_session(have_input: bool) -> ! {
     if usb::xhci::is_present() {
         if let Err(err) = sched::spawn_daemon("usb", usb::xhci::service_task) {
             kprintln!("  spawn usb service failed: {err}");
+        }
+    }
+
+    // У EHCI задача своя по той же причине, что у OHCI ниже: контроллеры
+    // независимы, а прерываний у драйвера нет.
+    if usb::ehci::is_present() {
+        if let Err(err) = sched::spawn_daemon("ehci", usb::ehci::service_task) {
+            kprintln!("  spawn ehci service failed: {err}");
         }
     }
 
