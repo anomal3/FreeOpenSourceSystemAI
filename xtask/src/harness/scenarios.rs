@@ -6304,8 +6304,10 @@ pub const ALL: &[Scenario] = &[
             // он перестаёт помещаться в лист и переезжает в экстент, шестая —
             // запись поверх сектора с его сверкой. Семь транзакций на копию.
             //
-            // Порядок строк панели — порядок создания имён (`DIR_INDEX`): «..»,
-            // `hello.txt`, `dir`, `holes.bin`, `mixed.bin`. Четыре вниз.
+            // С фазы С9 панель сортирует как Far — папки сверху, внутри по
+            // имени: «..», `dir`, `many`, `notes`, `hello.txt`, `holes.bin`,
+            // `mixed.bin`. Шесть вниз. Прежние четыре попадали в `hello.txt`, и
+            // сценарий падал на исправной системе.
             Step::Line("mc /data /data/notes"),
             Step::Await("mc: started", 30_000),
             Step::Raw(b"\x1b[B"),
@@ -6316,7 +6318,15 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(500),
             Step::Raw(b"\x1b[B"),
             Step::Wait(500),
+            Step::Raw(b"\x1b[B"),
+            Step::Wait(500),
+            Step::Raw(b"\x1b[B"),
+            Step::Wait(500),
+            // F5 сначала спрашивает — окном, где уже стоит путь другой панели,
+            // — и Enter соглашается (как в сценарии `mc`).
             Step::Raw(b"\x1b[15~"),
+            Step::Wait(1_500),
+            Step::Raw(b"\n"),
             Step::Await("mc: copied /data/mixed.bin -> /data/notes/mixed.bin", 60_000),
             // Переименование файла Linux: запись каталога, а не данные.
             Step::Raw(b"\x1b[17~"),
