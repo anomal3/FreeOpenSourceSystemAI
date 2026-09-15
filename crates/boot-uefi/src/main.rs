@@ -70,6 +70,9 @@ const ERROR_LINGER_SECONDS: u32 = 10;
 /// загрузка должна идти дальше, а не ждать человека.
 const HANDOFF_LINGER: Duration = Duration::from_millis(1500);
 
+/// Та же пауза, когда в меню выбран пятый пункт — разбор чёрного экрана.
+const DIAGNOSTIC_LINGER: Duration = Duration::from_secs(8);
+
 /// Провал шага загрузки. Значение намеренно пустое: подробности уже напечатаны
 /// там, где они были известны, а вызывающему остаётся только свернуть загрузку.
 #[derive(Debug, Clone, Copy)]
@@ -91,16 +94,29 @@ fn main() -> Status {
     // Спрашивается до всего остального: если что-то не так с диском или с
     // графикой, человек обязан успеть сказать об этом раньше, чем загрузчик
     // до них доберётся.
-    info.boot_flags = menu::choose() | unattended_flag();
+    let choice = menu::choose();
+    info.boot_flags = choice.flags | unattended_flag();
     // Разрешение, выбранное человеком в «Параметрах», лежит файлом на этом же
     // томе: сменить режим экрана можно только здесь, до `ExitBootServices`, и
-    // ядро может лишь попросить об этом заранее.
-    info.framebuffer = graphics::probe_framebuffer(graphics::requested_mode());
+    // ядро может лишь попросить об этом заранее. Пятый пункт меню обходит и
+    // эту просьбу: он для машины, у которой экран от смены режима гаснет.
+    let policy = if choice.keep_display {
+        graphics::show_modes();
+        menu::pause();
+        graphics::Policy::Keep
+    } else {
+        graphics::Policy::Choose(graphics::requested_mode())
+    };
+    info.framebuffer = graphics::probe_framebuffer(policy);
     info.acpi_rsdp = find_acpi_rsdp();
 
     print_boot_info(&info);
 
-    match boot_kernel(info) {
+    // С пятым пунктом тестовая картинка стоит дольше: по ней человек, у
+    // которого гас экран, видит, что экран жив до прыжка в ядро, — и успевает
+    // это сфотографировать.
+    let handoff_pause = if choice.keep_display { DIAGNOSTIC_LINGER } else { HANDOFF_LINGER };
+    match boot_kernel(info, handoff_pause) {
         // Ok несёт `Infallible`: успешный путь заканчивается прыжком в ядро.
         Ok(never) => match never {},
         Err(Aborted) => {
@@ -131,7 +147,7 @@ fn unattended_flag() -> u64 {
 
 /// Загружает ядро и передаёт ему управление. Возвращается только при ошибке:
 /// успешный путь заканчивается прыжком, поэтому `Ok` несёт [`Infallible`].
-fn boot_kernel(mut info: BootInfo) -> Result<Infallible, Aborted> {
+fn boot_kernel(mut info: BootInfo, linger: Duration) -> Result<Infallible, Aborted> {
     println!("");
     println!("---- kernel load ------------------------------------------------");
 
@@ -216,7 +232,7 @@ fn boot_kernel(mut info: BootInfo) -> Result<Infallible, Aborted> {
 
     // Пауза до чтения часов, а не после: полторы секунды, простоявшие между
     // замером и выходом, стали бы отставанием системных часов.
-    boot::stall(HANDOFF_LINGER);
+    boot::stall(linger);
 
     handoff::exit_and_jump(handoff, kernel.entry, &overrides)
 }

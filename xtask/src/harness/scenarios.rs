@@ -4063,6 +4063,48 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "display-keep",
+        about: "Меню загрузчика, пятый пункт: режим экрана прошивки не меняется, список режимов напечатан, стол встаёт.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            // В меню попадаем так же, как в `recovery`: клавиши жмутся заранее
+            // и ещё раз, когда загрузчик заговорил.
+            Step::Repeat("s", 4),
+            Step::Await("FreeOS bootloader", BOOT),
+            Step::Repeat("s", 8),
+            Step::Await("---- boot menu", 120_000),
+            // Пункт для машины, у которой экран гаснет от смены режима (ASUS
+            // K53SD). Проверяем то, что увидит человек на фотографии: режим
+            // прошивки и список режимов — до того, как что-то поменялось.
+            Step::Key("5"),
+            Step::Await("  keeping the firmware's display mode", 15_000),
+            Step::Await("GraphicsOutput handle(s); firmware mode ", 15_000),
+            Step::Await("  [gop] modes 0:", 15_000),
+            Step::Await("  press any key to boot", 15_000),
+            Step::Key("ret"),
+            Step::Await("  [gop] keeping the firmware's ", 15_000),
+            // Стол обязан встать в любом режиме, который дала прошивка.
+            Step::Await("desktop     : ", BOOT),
+            Step::Absent("[gop] switched to"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "powerbtn",
         about: "Кнопка питания: событие ACPI доходит до системы, и она гаснет по-настоящему.",
         target: Target::Installed,

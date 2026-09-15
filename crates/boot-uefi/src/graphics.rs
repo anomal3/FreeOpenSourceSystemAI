@@ -6,10 +6,12 @@
 //!
 //! [`BootInfo`]: boot_info::BootInfo
 
+use core::fmt::Write as _;
+
 use boot_info::{Framebuffer, PixelFormat};
-use uefi::boot;
-use uefi::println;
+use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType};
 use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
+use uefi::{Identify, println, system};
 
 /// UEFI GOP всегда отдаёт 32 бита на пиксель для форматов Rgb/Bgr.
 const BYTES_PER_PIXEL: usize = 4;
@@ -44,35 +46,54 @@ const BARS: [(u8, u8, u8); 8] = [
 /// эмулятора размером в целый экран не помещается на экран, за которым сидит
 /// человек, и половина стола оказывается за краем. Когда в «Параметрах»
 /// появится выбор разрешения, порядок станет всего лишь значением по умолчанию.
+///
+/// Сам по себе список действует только на прошивке EDK II — см. [`choose_mode`]:
+/// настоящая машина остаётся в режиме своей прошивки.
 const WANTED_MODES: [(usize, usize); 3] = [(1280, 720), (1920, 1080), (1024, 768)];
+
+/// Как выбирать режим экрана.
+#[derive(Clone, Copy)]
+pub enum Policy {
+    /// Выбрать самим: сначала то, что человек просил в «Параметрах», затем
+    /// [`WANTED_MODES`].
+    Choose(Option<(usize, usize)>),
+    /// Оставить режим прошивки — пятый пункт меню загрузчика.
+    Keep,
+}
 
 /// Установить самый желанный из режимов, которые предлагает прошивка.
 ///
 /// Молчаливого отказа здесь нет: если запрошенный режим не установился, об этом
 /// печатается строка. «Экран не того размера» и «экран не переключился» — разные
 /// неисправности, и различить их потом будет нечем.
-fn choose_mode(gop: &mut GraphicsOutput, preferred: Option<(usize, usize)>) {
+fn choose_mode(gop: &mut GraphicsOutput, policy: Policy) {
+    let (width, height) = gop.current_mode_info().resolution();
+    let preferred = match policy {
+        Policy::Keep => {
+            println!("  [gop] keeping the firmware's {width}x{height}: asked in the boot menu");
+            return;
+        }
+        Policy::Choose(preferred) => preferred,
+    };
+    // Сами, без просьбы человека, режим меняем только на прошивке EDK II:
+    // это QEMU (OVMF и AAVMF) и VirtualBox, на которых переключение проверено
+    // сотнями прогонов. Настоящая машина остаётся в режиме своей прошивки — так
+    // же поступают загрузчик Windows и Linux. Найдено на ASUS K53SD (AMI,
+    // UEFI 2.0, Intel HD 3000, матрица 1366×768): после смены режима экран
+    // гаснет навсегда — и текст загрузчика, и всё, что рисует ядро. Установщик
+    // режим не трогает, и у него экран был. Первая попытка лечения — «не
+    // уводить вниз режим крупнее 1280×720» — не помогла: прошивка, видимо,
+    // стартует мельче, а отличить «мелкий режим прошивки» от «родного режима
+    // матрицы» по списку режимов нельзя. Просьба человека из «Параметров»
+    // по-прежнему выполняется, а если от неё экран гаснет, пятый пункт меню
+    // загрузчика её обходит.
+    if preferred.is_none() && !switching_trusted() {
+        println!("  [gop] keeping the firmware's {width}x{height}: modes are switched only on EDK II firmware");
+        return;
+    }
     // Просьба человека идёт первой, а список по умолчанию — за ней: если
     // прошивка такого режима не предлагает, выбор всё равно состоится, а не
     // оставит экран в том, что дала прошивка.
-    // Прошивка, которая уже работает крупнее первого режима из списка, работает
-    // в родном режиме экрана, и уводить её вниз нельзя. Найдено на ASUS K53SD
-    // (AMI, UEFI 2.0, Intel HD 3000, матрица 1366×768): прошивка честно
-    // предлагает 1280×720 и принимает его, а встроенная матрица в неродном
-    // режиме гаснет. После шапки загрузчика экран чернел навсегда — и текст
-    // загрузчика, и всё, что рисовало ядро. QEMU и VirtualBox стартуют мельче
-    // (800×600, 1024×768, 1280×800 — не крупнее по ширине), и у них ничего не
-    // меняется. Просьба человека из «Параметров» по-прежнему выполняется.
-    if preferred.is_none() {
-        let info = gop.current_mode_info();
-        let (width, height) = info.resolution();
-        let (first_w, first_h) = WANTED_MODES[0];
-        let linear = matches!(info.pixel_format(), GopPixelFormat::Rgb | GopPixelFormat::Bgr);
-        if linear && width > first_w && height > first_h {
-            println!("  [gop] keeping the firmware's {width}x{height}: larger than {first_w}x{first_h}, likely the panel's own mode");
-            return;
-        }
-    }
     let wanted = preferred
         .into_iter()
         .chain(WANTED_MODES)
@@ -103,6 +124,67 @@ fn choose_mode(gop: &mut GraphicsOutput, preferred: Option<(usize, usize)>) {
     }
 }
 
+/// Проверено ли переключение режима на этой прошивке. См. [`choose_mode`].
+fn switching_trusted() -> bool {
+    let mut vendor = alloc::string::String::new();
+    let _ = write!(vendor, "{}", system::firmware_vendor());
+    vendor.contains("EDK II")
+}
+
+/// Напечатать, в каком режиме прошивка и какие режимы она предлагает.
+///
+/// Для пятого пункта меню. С машины, у которой гаснет экран, журнала нет —
+/// есть фотография экрана, поэтому всё печатается до того, как хоть что-то
+/// меняется. Протокол открывается без захвата: захват отключил бы от него
+/// графическую консоль прошивки, и напечатанное пропало бы с экрана.
+pub fn show_modes() {
+    let handles = boot::locate_handle_buffer(SearchType::ByProtocol(&GraphicsOutput::GUID))
+        .map_or(0, |handles| handles.len());
+    let Ok(handle) = boot::get_handle_for_protocol::<GraphicsOutput>() else {
+        println!("  [gop] no GraphicsOutput handle");
+        return;
+    };
+    let params = OpenProtocolParams {
+        handle,
+        agent: boot::image_handle(),
+        controller: None,
+    };
+    // SAFETY: `GetProtocol` не делает загрузчик потребителем устройства и
+    // ничего от него не отключает; протокол только читается и закрывается в
+    // конце функции.
+    let Ok(gop) = (unsafe { boot::open_protocol::<GraphicsOutput>(params, OpenProtocolAttributes::GetProtocol) })
+    else {
+        println!("  [gop] cannot open GraphicsOutput");
+        return;
+    };
+    let info = gop.current_mode_info();
+    let (width, height) = info.resolution();
+    println!(
+        "  [gop] {handles} GraphicsOutput handle(s); firmware mode {width}x{height}, stride {}, {:?}",
+        info.stride(),
+        info.pixel_format()
+    );
+    // По шесть режимов в строке: у OVMF их три десятка, а экран в текстовом
+    // режиме прошивки бывает высотой в двадцать пять строк.
+    let mut line = alloc::string::String::new();
+    let mut in_line = 0;
+    for (index, mode) in gop.modes().enumerate() {
+        let (mode_width, mode_height) = mode.info().resolution();
+        let linear = matches!(mode.info().pixel_format(), GopPixelFormat::Rgb | GopPixelFormat::Bgr);
+        let _ = write!(line, " {index}:{mode_width}x{mode_height}{}", if linear { "" } else { "*" });
+        in_line += 1;
+        if in_line == 6 {
+            println!("  [gop] modes{line}");
+            line.clear();
+            in_line = 0;
+        }
+    }
+    if !line.is_empty() {
+        println!("  [gop] modes{line}");
+    }
+    println!("  [gop] (* = no linear framebuffer)");
+}
+
 /// Что человек выбрал в «Параметрах» — из файла `\FREEOS\DISPLAY.CFG`.
 ///
 /// Файл пишет ядро (см. `kernel::slot::request_screen_mode`), а читается он
@@ -131,7 +213,7 @@ pub fn requested_mode() -> Option<(usize, usize)> {
 ///
 /// Headless-машина (или прошивка без GOP) — не ошибка: возвращаем
 /// [`Framebuffer::NONE`], ядро потом само решит, что делать без экрана.
-pub fn probe_framebuffer(preferred: Option<(usize, usize)>) -> Framebuffer {
+pub fn probe_framebuffer(policy: Policy) -> Framebuffer {
     let handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
         Ok(handle) => handle,
         Err(err) => {
@@ -148,7 +230,7 @@ pub fn probe_framebuffer(preferred: Option<(usize, usize)>) -> Framebuffer {
         }
     };
 
-    choose_mode(&mut gop, preferred);
+    choose_mode(&mut gop, policy);
 
     let mode = gop.current_mode_info();
     let (width, height) = mode.resolution();

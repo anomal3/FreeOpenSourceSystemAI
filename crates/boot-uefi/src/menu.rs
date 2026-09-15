@@ -41,13 +41,23 @@ const POLL: Duration = Duration::from_millis(25);
 /// оставили, обязана в конце концов загрузиться сама.
 const CHOICE_WAIT: Duration = Duration::from_secs(60);
 
-/// Спросить, как грузиться, в начале работы. Возвращает флаги для
-/// [`boot_info::BootInfo`].
-pub fn choose() -> u64 {
+/// Что выбрал человек.
+#[derive(Clone, Copy, Default)]
+pub struct Choice {
+    /// Флаги для [`boot_info::BootInfo`].
+    pub flags: u64,
+    /// Не трогать режим экрана, который выставила прошивка, и показать, какие
+    /// режимы она предлагает. Ядру это знать незачем: режим выбирается здесь,
+    /// до `ExitBootServices`, поэтому в `boot_flags` пункт не попадает.
+    pub keep_display: bool,
+}
+
+/// Спросить, как грузиться, в начале работы.
+pub fn choose() -> Choice {
     // Нажатие могло случиться и до нашего запуска: прошивка держит его в
     // буфере. Первое же чтение его и достанет — ждать ради этого не нужно.
     if wait_for_key(WAIT).is_none() {
-        return 0;
+        return Choice::default();
     }
     ask()
 }
@@ -61,20 +71,31 @@ pub fn choose() -> u64 {
 /// первое ожидание. Второй опрос ловит нажатие, сделанное **пока грузится
 /// ядро**, и стоит он ровно одного чтения буфера: обычная загрузка не
 /// задерживается ни на миллисекунду.
+///
+/// Режим экрана к этому моменту уже выбран, поэтому пятый пункт здесь значит
+/// просто обычную загрузку.
 pub fn choose_late() -> u64 {
     if wait_for_key(Duration::ZERO).is_none() {
         return 0;
     }
-    ask()
+    ask().flags
+}
+
+/// Подождать любого нажатия — чтобы напечатанное успели прочитать или
+/// сфотографировать. Предел тот же, что у меню: машина, которую оставили,
+/// обязана загрузиться сама.
+pub fn pause() {
+    println!("  press any key to boot (or wait {} s)", CHOICE_WAIT.as_secs());
+    let _ = wait_for_key(CHOICE_WAIT);
 }
 
 /// Показать меню и дождаться выбора.
-fn ask() -> u64 {
+fn ask() -> Choice {
     loop {
         show();
         let Some(key) = wait_for_key(CHOICE_WAIT) else {
             println!("  no choice made, booting normally");
-            return 0;
+            return Choice::default();
         };
         match key {
             Key::Printable(character) => match char::from(character) {
@@ -87,6 +108,10 @@ fn ask() -> u64 {
                         BOOT_SAFE_MODE | BOOT_CHECK_DISK,
                     );
                 }
+                '5' => {
+                    println!("  keeping the firmware's display mode");
+                    return Choice { flags: 0, keep_display: true };
+                }
                 _ => println!("  unknown choice, try again"),
             },
             Key::Special(ScanCode::ESCAPE) => return chosen("normal boot", 0),
@@ -95,9 +120,9 @@ fn ask() -> u64 {
     }
 }
 
-fn chosen(what: &str, flags: u64) -> u64 {
+fn chosen(what: &str, flags: u64) -> Choice {
     println!("  {what}");
-    flags
+    Choice { flags, keep_display: false }
 }
 
 fn show() {
@@ -107,8 +132,9 @@ fn show() {
     println!("  2. Safe mode: no desktop, read-only root");
     println!("  3. Check the root volume, then start");
     println!("  4. Safe mode and check the volume");
+    println!("  5. Keep the firmware's display mode (if the screen goes black)");
     println!("");
-    println!("  choose 1-4:");
+    println!("  choose 1-5:");
 }
 
 /// Дождаться нажатия не дольше `limit`.

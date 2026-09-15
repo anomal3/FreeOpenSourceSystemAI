@@ -182,7 +182,7 @@ fn main() -> Status {
         return Status::UNSUPPORTED;
     };
 
-    let mut payload = match payload::probe() {
+    let payload = match payload::probe() {
         Ok(payload) => payload,
         Err(err) => {
             // Носитель неполон. Показать это надо на экране, а не в консоли:
@@ -219,7 +219,7 @@ fn main() -> Status {
     // пригодных нет вовсе, курсор просто останется на первом.
     app.disk_index = (0..app.disks.len()).find(|&index| app.disk_ok(index)).unwrap_or(0);
 
-    run(&mut display, &mut app, &mut payload)
+    run(&mut display, &mut app, &mut Some(payload))
 }
 
 fn fresh_app(disks: Vec<Disk>, plans: Vec<Option<Plan>>, payload_summary: Vec<String>) -> App {
@@ -246,12 +246,32 @@ fn fresh_app(disks: Vec<Disk>, plans: Vec<Option<Plan>>, payload_summary: Vec<St
 }
 
 /// Главный цикл: нарисовать, дождаться нажатия, обработать.
-fn run(display: &mut Display, app: &mut App, payload: &mut Payload) -> Status {
+///
+/// Носитель установки закрывается, как только установка удалась, — до экрана
+/// «Готово», а не при выходе. Экран просит вынуть носитель, а
+/// `get_image_file_system` держит его том открытым **эксклюзивно**. Прошивка,
+/// у которой вынули флешку, пытается снять с неё свои драйверы, упирается в
+/// наше открытие, и на ноутбуке ASUS K53SD (AMI, UEFI 2.0) после этого не
+/// дошло ни одно нажатие: Enter не перезагружал, машину выключали кнопкой. В
+/// QEMU носитель никто не вынимает, и стенд этого не видел.
+fn run(display: &mut Display, app: &mut App, payload: &mut Option<Payload>) -> Status {
     loop {
         ui::draw(display, app);
 
         if app.stage == Stage::Installing {
-            perform(display, app, payload);
+            match payload.as_mut() {
+                Some(opened) => perform(display, app, opened),
+                // Недостижимо: «Готово» — последний экран, и назад к установке
+                // с него дороги нет. Но если бы нашлась, это отказ носителя,
+                // а не паника.
+                None => {
+                    app.failure = Some(Failure::Payload(payload::Error::NoVolume));
+                    app.stage = Stage::Failed;
+                }
+            }
+            if app.stage == Stage::Done && payload.take().is_some() {
+                logln!("[payload] installation medium closed, it can be removed");
+            }
             continue;
         }
 
