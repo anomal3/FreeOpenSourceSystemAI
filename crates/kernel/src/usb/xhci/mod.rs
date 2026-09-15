@@ -95,6 +95,23 @@ const MIN_VERSION: u16 = 0x0090;
 const RESET_TIMEOUT_MS: u64 = 1000;
 /// Сколько ждать завершения команды.
 const COMMAND_TIMEOUT_MS: u64 = 500;
+
+/// Сколько ждать, пока прошивка отпустит контроллер. Столько же ждёт Linux.
+const HANDOFF_TIMEOUT_MS: u64 = 1000;
+
+/// Расширенная возможность USB Legacy Support (xHCI 1.1, 7.1).
+const EXT_CAP_LEGACY: u8 = 1;
+/// `USBLEGSUP`, бит 16: контроллером владеет прошивка.
+const LEGSUP_BIOS_OWNED: u32 = 1 << 16;
+/// `USBLEGSUP`, бит 24: система просит контроллер себе.
+const LEGSUP_OS_OWNED: u32 = 1 << 24;
+/// `USBLEGCTLSTS` — сразу за `USBLEGSUP`.
+const LEGCTLSTS_OFFSET: usize = 4;
+/// Биты `USBLEGCTLSTS`, которые сохраняются: всё, кроме разрешений SMI. Маска
+/// та же, что в Linux (`XHCI_LEGACY_DISABLE_SMI`).
+const LEGCTLSTS_KEEP: u32 = (0x7 << 1) | (0xFF << 5) | (0x7 << 17);
+/// Признаки случившихся SMI; сбрасываются записью единицы.
+const LEGCTLSTS_SMI_EVENTS: u32 = 0x7 << 29;
 /// Сколько ждать завершения передачи по управляющей точке.
 const TRANSFER_TIMEOUT_MS: u64 = 500;
 /// Сколько ждать окончания сброса порта.
@@ -143,6 +160,8 @@ pub enum XhciError {
     Dma(DmaError),
     /// Команда не завершилась за отведённое время.
     CommandTimeout(u32),
+    /// Контроллер адресует только 32 бита, а окно DMA лежит выше 4 ГиБ.
+    AddressWidth(u64),
     /// Команда завершилась ошибкой.
     CommandFailed { command: u32, code: u32 },
     /// Ни на одном порту нет подключённого устройства.
@@ -193,6 +212,10 @@ impl core::fmt::Display for XhciError {
             Self::StartTimeout => f.write_str("the controller did not start"),
             Self::Dma(err) => write!(f, "{err}"),
             Self::CommandTimeout(command) => write!(f, "command {command} never completed"),
+            Self::AddressWidth(phys) => write!(
+                f,
+                "the controller addresses only 32 bits, but its rings lie at {phys:#x}, above 4 GiB"
+            ),
             Self::CommandFailed { command, code } => write!(
                 f,
                 "command {command} failed: {} ({code})",
@@ -406,14 +429,21 @@ impl Controller {
             return Err(XhciError::Version(regs.version));
         }
         kprintln!(
-            "  xhci        : version {}.{:x}, {} slots, {} ports, {}-byte contexts, {} scratchpad",
+            "  xhci        : version {}.{:x}, {} slots, {} ports, {}-byte contexts, {} scratchpad, {}-bit addresses",
             regs.version >> 8,
             (regs.version >> 4) & 0xF,
             regs.max_slots,
             regs.max_ports,
             regs.context_size,
-            regs.max_scratchpad
+            regs.max_scratchpad,
+            if regs.ac64 { 64 } else { 32 }
         );
+
+        // Контроллер забирается у прошивки до всего остального, в том числе до
+        // остановки и сброса: пока им владеет её обработчик SMM, он вправе
+        // вмешаться в любое наше обращение.
+        // SAFETY: окно регистров отображено и прочитано `probe`.
+        unsafe { take_from_firmware(&regs) };
 
         let mut controller = Self {
             regs,
@@ -435,6 +465,21 @@ impl Controller {
             ports_changed: false,
             connected: 0,
         };
+
+        // Контроллер без 64-битной адресации видит только первые 4 ГиБ. Окно
+        // DMA — один непрерывный кусок размером `DMA_SIZE`, и все кольца лежат в
+        // нём, поэтому достаточно проверить, где оно может кончаться. Сказать это
+        // словами дешевле, чем разбирать «команда не завершилась» по фотографии.
+        if !controller.regs.ac64 {
+            let lowest = controller
+                .dcbaa
+                .phys()
+                .as_u64()
+                .min(controller.erst.phys().as_u64());
+            if lowest + crate::mm::DMA_SIZE as u64 > 1 << 32 {
+                return Err(XhciError::AddressWidth(lowest));
+            }
+        }
 
         // SAFETY: окно регистров отображено, кольца выделены и обнулены.
         unsafe { controller.reset() }?;
@@ -2093,6 +2138,57 @@ const IRQ_SOURCE: u32 = 1;
 /// накопившиеся события за один проход, и три прерывания подряд означают ровно
 /// то же, что одно, — «сходи посмотри».
 static EVENT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Забрать контроллер у прошивки (USB Legacy Support, xHCI 1.1, 7.1).
+///
+/// Прошивка, у которой в настройках включена поддержка USB-клавиатуры, владеет
+/// контроллером через обработчик SMM: он же изображает клавиатуру PS/2 для
+/// загрузочного меню. Система обязана попросить контроллер себе и выключить
+/// прерывания SMI — иначе обработчик прошивки продолжает работать с тем же
+/// железом, что и драйвер. Linux делает это для каждого USB-контроллера ещё при
+/// разборе PCI. У QEMU этой возможности нет, и там функция молчит.
+///
+/// Прошивка, не отпустившая контроллер за секунду, лишается его силой — тем же
+/// способом, что в Linux: без контроллера система останется без ввода, а с
+/// навязанным ей решением прошивка обычно справляется.
+///
+/// # Safety
+///
+/// Окно регистров должно быть отображено; вызывать до остановки и сброса.
+unsafe fn take_from_firmware(regs: &Registers) {
+    // SAFETY: контракт функции.
+    let Some(at) = (unsafe { regs.find_ext_cap(EXT_CAP_LEGACY) }) else {
+        return;
+    };
+    // SAFETY: `at` — найденная возможность USB Legacy Support; оба её регистра
+    // по 32 бита.
+    unsafe {
+        let value = regs.read_cap32(at);
+        if value & LEGSUP_BIOS_OWNED != 0 {
+            regs.write_cap32(at, value | LEGSUP_OS_OWNED);
+            let mut timeout = Timeout::new(HANDOFF_TIMEOUT_MS);
+            loop {
+                let now = regs.read_cap32(at);
+                if now & LEGSUP_BIOS_OWNED == 0 {
+                    kprintln!("  xhci        : the firmware handed the controller over");
+                    break;
+                }
+                if timeout.expired() {
+                    regs.write_cap32(at, (now & !LEGSUP_BIOS_OWNED) | LEGSUP_OS_OWNED);
+                    kprintln!(
+                        "  xhci        : the firmware kept the controller for {HANDOFF_TIMEOUT_MS} ms; taken anyway"
+                    );
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        } else {
+            kprintln!("  xhci        : legacy support present, the firmware does not own the controller");
+        }
+        let control = regs.read_cap32(at + LEGCTLSTS_OFFSET);
+        regs.write_cap32(at + LEGCTLSTS_OFFSET, (control & LEGCTLSTS_KEEP) | LEGCTLSTS_SMI_EVENTS);
+    }
+}
 
 /// Обработчик прерывания контроллера.
 ///

@@ -78,6 +78,14 @@ const HCSPARAMS2_SPB_LO_MASK: u32 = 0x1F;
 
 /// `HCCPARAMS1`, бит 0: контроллер умеет 64-битную адресацию.
 const HCCPARAMS1_AC64: u32 = 1 << 0;
+/// `HCCPARAMS1`, биты 31:16: где начинается список расширенных возможностей —
+/// смещение от начала окна в двойных словах. Ноль — списка нет.
+const HCCPARAMS1_XECP_SHIFT: u32 = 16;
+
+/// Сколько расширенных возможностей просмотреть, прежде чем счесть список
+/// испорченным. У настоящих контроллеров их единицы; предел нужен затем, чтобы
+/// указатель «следующей», замкнутый сам на себя, не стал вечным циклом.
+const EXT_CAP_LIMIT: usize = 64;
 /// Бит 2: размер структуры контекста — 64 байта вместо 32.
 const HCCPARAMS1_CSZ: u32 = 1 << 2;
 
@@ -241,6 +249,9 @@ pub struct Registers {
     pub ac64: bool,
     /// Размер страницы, которым контроллер оперирует.
     pub page_size: usize,
+    /// Смещение первой расширенной возможности от начала окна, в байтах.
+    /// Ноль — расширенных возможностей нет.
+    pub xecp: usize,
 }
 
 impl Registers {
@@ -283,6 +294,7 @@ impl Registers {
             context_size: if hcc1 & HCCPARAMS1_CSZ != 0 { 64 } else { 32 },
             ac64: hcc1 & HCCPARAMS1_AC64 != 0,
             page_size: 4096,
+            xecp: ((hcc1 >> HCCPARAMS1_XECP_SHIFT) as usize) * 4,
         };
 
         // `PAGESIZE` — битовая карта: бит `n` означает поддержку страниц
@@ -300,6 +312,56 @@ impl Registers {
     #[must_use]
     pub const fn cap_base(&self) -> usize {
         self.cap
+    }
+
+    /// Прочитать 32-битный регистр по смещению от начала окна.
+    ///
+    /// # Safety
+    ///
+    /// Смещение обязано указывать на существующий регистр внутри окна —
+    /// например, на расширенную возможность, найденную [`Registers::find_ext_cap`].
+    pub unsafe fn read_cap32(&self, offset: usize) -> u32 {
+        // SAFETY: контракт функции.
+        unsafe { ptr::read_volatile((self.cap + offset) as *const u32) }
+    }
+
+    /// Записать 32-битный регистр по смещению от начала окна.
+    ///
+    /// # Safety
+    ///
+    /// См. [`Registers::read_cap32`]. Запись меняет состояние контроллера.
+    pub unsafe fn write_cap32(&self, offset: usize, value: u32) {
+        // SAFETY: контракт функции.
+        unsafe { ptr::write_volatile((self.cap + offset) as *mut u32, value) };
+    }
+
+    /// Найти расширенную возможность с идентификатором `id`: смещение её
+    /// первого регистра от начала окна.
+    ///
+    /// # Safety
+    ///
+    /// Окно регистров должно быть отображено целиком: список расширенных
+    /// возможностей лежит за блоками, адреса которых сообщил [`Registers::probe`].
+    pub unsafe fn find_ext_cap(&self, id: u8) -> Option<usize> {
+        let mut at = self.xecp;
+        for _ in 0..EXT_CAP_LIMIT {
+            if at == 0 {
+                return None;
+            }
+            // SAFETY: контракт функции; `at` получен из самого контроллера.
+            let head = unsafe { self.read_cap32(at) };
+            if head & 0xFF == u32::from(id) {
+                return Some(at);
+            }
+            // Следующая возможность — в двойных словах от текущей; ноль значит
+            // «эта последняя».
+            let next = ((head >> 8) & 0xFF) as usize;
+            if next == 0 {
+                return None;
+            }
+            at += next * 4;
+        }
+        None
     }
 
     /// # Safety
@@ -324,22 +386,19 @@ impl Registers {
     /// Смещение обязано указывать на существующий 64-битный регистр блока
     /// Operational и быть выровнено на 8.
     pub unsafe fn read_op64(&self, offset: usize) -> u64 {
-        // SAFETY: контракт функции.
-        unsafe { ptr::read_volatile((self.op + offset) as *const u64) }
+        // SAFETY: контракт функции; см. [`read_split64`].
+        unsafe { read_split64(self.op + offset) }
     }
 
     /// # Safety
     ///
     /// См. [`Registers::read_op64`].
     ///
-    /// Запись делается одним 64-битным обращением, а не двумя 32-битными.
-    /// Спецификация допускает оба варианта, но у половинчатой записи есть
-    /// промежуточное состояние: в регистре оказывается новая младшая половина со
-    /// старой старшей — то есть адрес, не принадлежащий ни одной структуре.
-    /// Контроллер вправе прочитать регистр именно в этот момент.
+    /// Запись — двумя 32-битными обращениями, младшая половина первой; почему —
+    /// см. [`write_split64`].
     pub unsafe fn write_op64(&self, offset: usize, value: u64) {
         // SAFETY: контракт функции.
-        unsafe { ptr::write_volatile((self.op + offset) as *mut u64, value) };
+        unsafe { write_split64(self.op + offset, value) };
     }
 
     /// Регистр состояния порта. Порты нумеруются с единицы.
@@ -383,7 +442,7 @@ impl Registers {
     pub unsafe fn write_interrupter64(&self, index: usize, offset: usize, value: u64) {
         let addr = self.runtime + RT_INTERRUPTER_BASE + index * RT_INTERRUPTER_STRIDE + offset;
         // SAFETY: контракт функции.
-        unsafe { ptr::write_volatile(addr as *mut u64, value) };
+        unsafe { write_split64(addr, value) };
     }
 
     /// # Safety
@@ -392,7 +451,7 @@ impl Registers {
     pub unsafe fn read_interrupter64(&self, index: usize, offset: usize) -> u64 {
         let addr = self.runtime + RT_INTERRUPTER_BASE + index * RT_INTERRUPTER_STRIDE + offset;
         // SAFETY: контракт функции.
-        unsafe { ptr::read_volatile(addr as *const u64) }
+        unsafe { read_split64(addr) }
     }
 
     /// Позвонить в дверной звонок слота.
@@ -410,5 +469,47 @@ impl Registers {
         let addr = self.doorbell + usize::from(slot) * 4;
         // SAFETY: контракт функции.
         unsafe { ptr::write_volatile(addr as *mut u32, u32::from(target)) };
+    }
+}
+
+/// Записать 64-битный регистр двумя 32-битными обращениями: сначала младшую
+/// половину, затем старшую.
+///
+/// Сначала запись шла одним 64-битным обращением — ради того, чтобы в регистре
+/// не бывало новой младшей половины со старой старшей. Но на x86 такое
+/// обращение уходит в PCIe одним восьмибайтовым запросом, а контроллер вправе
+/// декодировать только четырёхбайтовые. ASMedia ASM1042 (xHCI 0.96) на ноутбуке
+/// ASUS K53SD так и не узнал адреса своих колец: первая же пустая команда «never
+/// completed». QEMU раскладывает запись на свои четырёхбайтовые регионы сам, и
+/// стенд этого не видел. Linux пишет эти регистры только так (`lo_hi_writeq`), и
+/// спецификация велит тот же порядок: контроллер без 64-битной адресации
+/// старшую половину игнорирует. Промежуточного состояния бояться нечего:
+/// `DCBAAP`, `CRCR` и `ERSTBA` пишутся на остановленном контроллере, а у `ERDP`
+/// старшая половина внутри одного кольца не меняется.
+///
+/// # Safety
+///
+/// `addr` — виртуальный адрес существующего 64-битного регистра в отображённом
+/// окне контроллера.
+unsafe fn write_split64(addr: usize, value: u64) {
+    // SAFETY: контракт функции; оба двойных слова лежат внутри регистра.
+    unsafe {
+        ptr::write_volatile(addr as *mut u32, value as u32);
+        ptr::write_volatile((addr + 4) as *mut u32, (value >> 32) as u32);
+    }
+}
+
+/// Прочитать 64-битный регистр двумя 32-битными обращениями — по той же
+/// причине, что и [`write_split64`].
+///
+/// # Safety
+///
+/// См. [`write_split64`].
+unsafe fn read_split64(addr: usize) -> u64 {
+    // SAFETY: контракт функции.
+    unsafe {
+        let low = ptr::read_volatile(addr as *const u32);
+        let high = ptr::read_volatile((addr + 4) as *const u32);
+        (u64::from(high) << 32) | u64::from(low)
     }
 }
