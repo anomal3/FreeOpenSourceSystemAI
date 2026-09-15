@@ -55,6 +55,24 @@ fn choose_mode(gop: &mut GraphicsOutput, preferred: Option<(usize, usize)>) {
     // Просьба человека идёт первой, а список по умолчанию — за ней: если
     // прошивка такого режима не предлагает, выбор всё равно состоится, а не
     // оставит экран в том, что дала прошивка.
+    // Прошивка, которая уже работает крупнее первого режима из списка, работает
+    // в родном режиме экрана, и уводить её вниз нельзя. Найдено на ASUS K53SD
+    // (AMI, UEFI 2.0, Intel HD 3000, матрица 1366×768): прошивка честно
+    // предлагает 1280×720 и принимает его, а встроенная матрица в неродном
+    // режиме гаснет. После шапки загрузчика экран чернел навсегда — и текст
+    // загрузчика, и всё, что рисовало ядро. QEMU и VirtualBox стартуют мельче
+    // (800×600, 1024×768, 1280×800 — не крупнее по ширине), и у них ничего не
+    // меняется. Просьба человека из «Параметров» по-прежнему выполняется.
+    if preferred.is_none() {
+        let info = gop.current_mode_info();
+        let (width, height) = info.resolution();
+        let (first_w, first_h) = WANTED_MODES[0];
+        let linear = matches!(info.pixel_format(), GopPixelFormat::Rgb | GopPixelFormat::Bgr);
+        if linear && width > first_w && height > first_h {
+            println!("  [gop] keeping the firmware's {width}x{height}: larger than {first_w}x{first_h}, likely the panel's own mode");
+            return;
+        }
+    }
     let wanted = preferred
         .into_iter()
         .chain(WANTED_MODES)
