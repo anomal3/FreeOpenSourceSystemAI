@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -774,5 +774,38 @@ fn choices_print_what_winforms_prints() {
     let (result, output) = run_with(CHOICES, "choices.dll", &["self-test"]);
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, CHOICES_OUTPUT);
+    assert_eq!(code, 0);
+}
+
+/// Образец `tools/dotnet/samples/tabs` (фаза N7f): вкладки, строка состояния и
+/// подсказки из дизайнера.
+const TABS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/tabs.dll");
+
+/// Что печатает `dotnet tabs.dll self-test` (записано 2026-09-15, .NET 10,
+/// WinForms на Windows, LF): выбор и видимость страниц, удаление выбранной,
+/// строка состояния и подсказки.
+const TABS_OUTPUT: &str = concat!(
+    "shown: 2 0 General | General:True Options:False | True 3 Top Normal\n",
+    "status: Bottom 1 Ready False True\n",
+    "tips: 'The first page' 'Turns it on' '' True 500 5000 500 100 False\n",
+    "selected: 2 1 Options | General:False Options:True\n",
+    "selected: 2 0 General | General:True Options:False\n",
+    "checked: True\n",
+    "selected: 2 1 Options | General:False Options:True\n",
+    "selected: 1 0 General | General:True\n",
+    "removed: 1 0 General | General:True | True\n",
+    "added: 3 0 General | General:True Extra:False Options:False Extra 0\n",
+    "selected: 3 2 Options | General:False Extra:False Options:True\n",
+    "range: ArgumentOutOfRangeException\n",
+    "tips now: '' 'Pages'\n",
+    "status now: 2 ToolStripStatusLabel More Page Options\n",
+    "closed: UserClosing Page Options\n",
+);
+
+#[test]
+fn tabs_print_what_winforms_prints() {
+    let (result, output) = run_with(TABS, "tabs.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, TABS_OUTPUT);
     assert_eq!(code, 0);
 }

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N7f: вкладки, строка состояния и всплывающие подсказки
+       из дизайнера. clr-check запускает его с аргументом self-test: вкладки
+       переключаются, удаляются и добавляются из кода, подсказки ставятся и
+       снимаются, и форма закрывается сама. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

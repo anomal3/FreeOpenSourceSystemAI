@@ -372,7 +372,9 @@ namespace System.Windows.Forms
 
         public ToolStripItem Add(string text)
         {
-            var item = new ToolStripMenuItem(text);
+            // Какой пункт «по умолчанию», решает полоса: у строки состояния это
+            // надпись, у меню — пункт меню (фаза N7f).
+            ToolStripItem item = owner != null ? owner.CreateDefaultItem(text) : new ToolStripMenuItem(text);
             Add(item);
             return item;
         }
@@ -452,6 +454,8 @@ namespace System.Windows.Forms
 
         protected override Size DefaultSize => new Size(100, 25);
 
+        internal virtual ToolStripItem CreateDefaultItem(string text) => new ToolStripMenuItem(text);
+
         public virtual ToolStripItemCollection Items { get; }
 
         public Size ImageScalingSize { get; set; } = new Size(16, 16);
@@ -470,7 +474,7 @@ namespace System.Windows.Forms
         internal override Size ConstrainSize(int width, int height) =>
             AutoSize ? new Size(width, RowHeight + 4) : new Size(width, height);
 
-        internal int ItemWidth(ToolStripItem item) =>
+        internal virtual int ItemWidth(ToolStripItem item) =>
             item.IsSeparator ? 6 : FreeOsWindow.TextWidth(item.PlainText) + 2 * ItemPadding;
 
         // Левый край пункта на полосе.

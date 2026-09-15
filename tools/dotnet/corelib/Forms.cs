@@ -277,6 +277,18 @@ namespace System.Windows.Forms
 
     public delegate void KeyPressEventHandler(object sender, KeyPressEventArgs e);
 
+    public class ControlEventArgs : EventArgs
+    {
+        public ControlEventArgs(Control control)
+        {
+            Control = control;
+        }
+
+        public Control Control { get; }
+    }
+
+    public delegate void ControlEventHandler(object sender, ControlEventArgs e);
+
     public class FormClosingEventArgs : CancelEventArgs
     {
         public FormClosingEventArgs(CloseReason closeReason, bool cancel)
@@ -658,7 +670,11 @@ namespace System.Windows.Forms
 
         public Rectangle ClientRectangle => new Rectangle(0, 0, ClientSize.Width, ClientSize.Height);
 
-        public Rectangle DisplayRectangle => ClientRectangle;
+        public virtual Rectangle DisplayRectangle => ClientRectangle;
+
+        // Поля внутри элемента (фаза N7f). Раскладка их пока не учитывает:
+        // дизайнер ставит их страницам вкладок, а страницы ставит TabControl.
+        public Padding Padding { get; set; }
 
         // Место, заданное кодом: раскладка родителя это запоминает.
         public void SetBounds(int x, int y, int width, int height)
@@ -843,6 +859,16 @@ namespace System.Windows.Forms
         protected virtual void OnTextChanged(EventArgs e) => TextChanged?.Invoke(this, e);
 
         protected virtual void OnResize(EventArgs e) => Resize?.Invoke(this, e);
+
+        // Потомок добавлен или убран (фаза N7f): у TabControl так появляются и
+        // исчезают страницы.
+        public event ControlEventHandler ControlAdded;
+
+        public event ControlEventHandler ControlRemoved;
+
+        protected virtual void OnControlAdded(ControlEventArgs e) => ControlAdded?.Invoke(this, e);
+
+        protected virtual void OnControlRemoved(ControlEventArgs e) => ControlRemoved?.Invoke(this, e);
 
         protected virtual void OnMouseClick(MouseEventArgs e) => MouseClick?.Invoke(this, e);
 
@@ -1195,6 +1221,7 @@ namespace System.Windows.Forms
                 items.Add(value);
                 value.Parent = Owner;
                 value.RememberAnchor();
+                Owner.OnControlAdded(new ControlEventArgs(value));
                 Owner.Invalidate();
                 Owner.PerformLayout();
             }
@@ -1219,6 +1246,7 @@ namespace System.Windows.Forms
                 if (value != null && items.Remove(value))
                 {
                     value.Parent = null;
+                    Owner.OnControlRemoved(new ControlEventArgs(value));
                     Owner.Invalidate();
                     Owner.PerformLayout();
                 }
