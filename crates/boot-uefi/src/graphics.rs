@@ -222,7 +222,28 @@ pub fn probe_framebuffer(policy: Policy) -> Framebuffer {
         }
     };
 
-    let mut gop = match boot::open_protocol_exclusive::<GraphicsOutput>(handle) {
+    let params = OpenProtocolParams {
+        handle,
+        agent: boot::image_handle(),
+        controller: None,
+    };
+    // Открытие **без захвата**, и это не мелочь. Эксклюзивное открытие
+    // заставляет прошивку отключить от протокола всех потребителей, в том числе
+    // её графическую консоль. На ASUS K53SD (AMI, UEFI 2.0) у консоли после
+    // этого не оставалось ни одного выхода — последовательного порта у
+    // ноутбука нет, — и следующая же строка возвращала ошибку. `println!`
+    // крейта `uefi` на ошибке паникует, обработчик паники печатает тем же
+    // `println!`, и загрузчик молча вставал: экран оставался с шапкой (или
+    // чёрным, если режим успели сменить), ядро не стартовало. В QEMU консоль
+    // пишет ещё и в последовательный порт, запись удаётся, и стенд этого не
+    // видел ни разу. Консоль прошивки при этом остаётся на экране и печатает
+    // поверх тестовой картинки — зато человек видит, докуда дошла загрузка.
+    //
+    // SAFETY: `GetProtocol` не делает загрузчик потребителем устройства и
+    // ничего от него не отключает. Протокол используется только внутри этой
+    // функции и закрывается в её конце.
+    let opened = unsafe { boot::open_protocol::<GraphicsOutput>(params, OpenProtocolAttributes::GetProtocol) };
+    let mut gop = match opened {
         Ok(gop) => gop,
         Err(err) => {
             println!("  [gop] cannot open GraphicsOutput ({err:?}) -- headless boot");
