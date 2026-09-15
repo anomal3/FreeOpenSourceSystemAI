@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -738,5 +738,41 @@ fn layout_prints_what_winforms_prints() {
     let (result, output) = run_with(LAYOUT, "layout.dll", &["self-test"]);
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, LAYOUT_OUTPUT);
+    assert_eq!(code, 0);
+}
+
+/// Образец `tools/dotnet/samples/choices` (фаза N7e): переключатели в рамке,
+/// полоса хода и ползунок из дизайнера.
+const CHOICES: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/choices.dll");
+
+/// Что печатает `dotnet choices.dll self-test` (записано 2026-09-15, .NET 10,
+/// WinForms на Windows, LF): порядок событий переключателей, края полосы хода,
+/// сужение диапазона ползунка без события.
+const CHOICES_OUTPUT: &str = concat!(
+    "shown: True False False | tabstop True False False | group Size 3 False | progress 0 100 30 25 Blocks | track 0 10 3 1 5 1 Horizontal BottomRight\n",
+    "radio: Small False | False True False | tabstop False True False\n",
+    "radio: Medium True | False True False | tabstop False True False\n",
+    "radio: Medium False | False False True | tabstop False False True\n",
+    "radio: Large True | False False True | tabstop False False True\n",
+    "radio: Large False | False False False | tabstop False False False\n",
+    "none: False False False | tabstop False False False\n",
+    "radio: Small True | True False False | tabstop True False False\n",
+    "step: 55\n",
+    "increment: 100\n",
+    "decrement: 0\n",
+    "range: ArgumentOutOfRangeException value 0\n",
+    "track: 7\n",
+    "max: 5 5 70\n",
+    "min: 6 6 6\n",
+    "track range: value 6\n",
+    "progress max: 50 50\n",
+    "closed: UserClosing Level 7\n",
+);
+
+#[test]
+fn choices_print_what_winforms_prints() {
+    let (result, output) = run_with(CHOICES, "choices.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, CHOICES_OUTPUT);
     assert_eq!(code, 0);
 }

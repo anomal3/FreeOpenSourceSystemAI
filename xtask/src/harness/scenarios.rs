@@ -3483,6 +3483,29 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("dotnet: window 'Layout' closed after", 30_000),
             Step::Await("dotnet: layout.dll: Main returned 0", 30_000),
+            Step::Await("freeos> ", 15_000),
+            // Фаза N7e: переключатели, полоса хода и ползунок. Щелчок по
+            // «Medium» снимает отметку с «Small»; щелчок по ползунку ставит
+            // значение по месту щелчка — восьмая отметка из десяти, — а
+            // стрелка вправо двигает его на шаг. Ползунок тянет за собой полосу
+            // хода.
+            Step::Line("dotnet /usr/share/dotnet/samples/choices.dll"),
+            Step::Await("dotnet: window 'Choices' opened, 380x150", 60_000),
+            Step::Await("shown: True False False | tabstop True False False", 60_000),
+            Step::Aim(Aim::Program("Choices", 34, 76)),
+            Step::Click,
+            Step::Await("radio: Medium True | False True False", 30_000),
+            Step::Aim(Aim::Program("Choices", 319, 74)),
+            Step::Click,
+            Step::Await("track: 8", 30_000),
+            Step::Key("right"),
+            Step::Await("track: 9", 30_000),
+            Step::Wait(2_500),
+            Step::Shot("choices"),
+            Step::Aim(Aim::Close("Choices")),
+            Step::Click,
+            Step::Await("closed: UserClosing Level 9", 30_000),
+            Step::Await("dotnet: choices.dll: Main returned 0", 30_000),
             Step::Absent("finally after Environment.Exit must not run"),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),

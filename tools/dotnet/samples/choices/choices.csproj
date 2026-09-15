@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N7e: переключатели, рамка, полоса хода и ползунок из дизайнера. clr-check
+       запускает его с аргументом self-test: переключатели щёлкаются из кода, полоса хода
+       шагает и упирается в края, у ползунка сужается диапазон, и форма
+       закрывается сама. Размеры не печатаются: их Windows берёт у темы
+       оформления. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
