@@ -3529,6 +3529,25 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("closed: UserClosing Enabled: True", 30_000),
             Step::Await("dotnet: tabs.dll: Main returned 0", 30_000),
+            Step::Await("freeos> ", 15_000),
+            // Фаза N7g: поле со стрелками и decimal. Щелчок по верхней стрелке
+            // первого поля — у правого края, в верхней половине — прибавляет
+            // шаг и даёт полю фокус; стрелка вверх на клавиатуре прибавляет ещё.
+            // ValueChanged приходит раньше, чем обновится текст поля.
+            Step::Line("dotnet /usr/share/dotnet/samples/numbers.dll"),
+            Step::Await("dotnet: window 'Numbers' opened, 260x90", 60_000),
+            Step::Await("shown: 10 5 50 1 '10' | 1.5 0.25 '1.50'", 60_000),
+            Step::Aim(Aim::Program("Numbers", 124, 17)),
+            Step::Click,
+            Step::Await("value: 11 '10'", 30_000),
+            Step::Key("up"),
+            Step::Await("value: 12 '11'", 30_000),
+            Step::Wait(2_500),
+            Step::Shot("numbers"),
+            Step::Aim(Aim::Close("Numbers")),
+            Step::Click,
+            Step::Await("closed: UserClosing 12", 30_000),
+            Step::Await("dotnet: numbers.dll: Main returned 0", 30_000),
             Step::Absent("finally after Environment.Exit must not run"),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),

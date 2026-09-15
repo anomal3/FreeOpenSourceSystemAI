@@ -123,6 +123,13 @@ pub(crate) enum Native {
     WindowEvent,
     WindowClose,
     WindowResize,
+    DecimalArith,
+    DecimalCompare,
+    DecimalRound,
+    DecimalFormat,
+    DecimalParse,
+    DecimalToDouble,
+    DecimalFromFloat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,6 +319,13 @@ const TABLE: &[(&str, Native)] = &[
     ("System.Windows.Forms.FreeOsWindow::NextEvent(int32,int32&,int32&,int32&)", Native::WindowEvent),
     ("System.Windows.Forms.FreeOsWindow::Close(int32)", Native::WindowClose),
     ("System.Windows.Forms.FreeOsWindow::Resize(int32,int32,int32)", Native::WindowResize),
+    ("System.Decimal::Arith(int32,int32,int32,int32,int32,int32,int32,int32,int32,int32&,int32&,int32&,int32&)", Native::DecimalArith),
+    ("System.Decimal::Cmp(int32,int32,int32,int32,int32,int32,int32,int32)", Native::DecimalCompare),
+    ("System.Decimal::RoundTo(int32,int32,int32,int32,int32,int32,int32&,int32&,int32&,int32&)", Native::DecimalRound),
+    ("System.Decimal::Format(int32,int32,int32,int32,string)", Native::DecimalFormat),
+    ("System.Decimal::ParseText(string,int32,int32&,int32&,int32&,int32&)", Native::DecimalParse),
+    ("System.Decimal::ToDoubleBits(int32,int32,int32,int32)", Native::DecimalToDouble),
+    ("System.Decimal::FromFloat(float64,bool,int32&,int32&,int32&,int32&)", Native::DecimalFromFloat),
 ];
 
 pub(crate) fn lookup(key: &str) -> Option<Native> {
@@ -910,6 +924,77 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
             };
             Some(Value::I32(i32::from(resized)))
         }
+        Native::DecimalArith => {
+            let op = vm.int32(arg(0)?)?;
+            let a = decimal_arg(vm, [arg(1)?, arg(2)?, arg(3)?, arg(4)?])?;
+            let b = decimal_arg(vm, [arg(5)?, arg(6)?, arg(7)?, arg(8)?])?;
+            let outs = [arg(9)?, arg(10)?, arg(11)?, arg(12)?];
+            let result = match op {
+                0 => crate::decimal::add(a, b),
+                1 => crate::decimal::sub(a, b),
+                2 => crate::decimal::mul(a, b),
+                3 => crate::decimal::div(a, b),
+                _ => crate::decimal::rem(a, b),
+            };
+            let status = match result {
+                Ok(value) => {
+                    store_decimal(vm, outs, value)?;
+                    0
+                }
+                Err(crate::decimal::DecimalError::Overflow) => 1,
+                Err(crate::decimal::DecimalError::DivideByZero) => 2,
+            };
+            Some(Value::I32(status))
+        }
+        Native::DecimalCompare => {
+            let a = decimal_arg(vm, [arg(0)?, arg(1)?, arg(2)?, arg(3)?])?;
+            let b = decimal_arg(vm, [arg(4)?, arg(5)?, arg(6)?, arg(7)?])?;
+            Some(Value::I32(crate::decimal::compare(a, b)))
+        }
+        Native::DecimalRound => {
+            let value = decimal_arg(vm, [arg(0)?, arg(1)?, arg(2)?, arg(3)?])?;
+            let decimals = vm.int32(arg(4)?)?.clamp(0, 28) as u32;
+            let mode = vm.int32(arg(5)?)?.clamp(0, 4) as u32;
+            let outs = [arg(6)?, arg(7)?, arg(8)?, arg(9)?];
+            store_decimal(vm, outs, crate::decimal::round(value, decimals, mode))?;
+            None
+        }
+        Native::DecimalFormat => {
+            let value = decimal_arg(vm, [arg(0)?, arg(1)?, arg(2)?, arg(3)?])?;
+            let format = vm.string_units(arg(4)?)?.unwrap_or_default();
+            formatted(vm, crate::number::format_decimal(value.mantissa, value.scale, value.negative, &format))?
+        }
+        Native::DecimalParse => {
+            let text = vm.string_units(arg(0)?)?.unwrap_or_default();
+            let style = vm.int32(arg(1)?)? as u32;
+            let outs = [arg(2)?, arg(3)?, arg(4)?, arg(5)?];
+            let status = match crate::decimal::parse(&text, style) {
+                Ok(value) => {
+                    store_decimal(vm, outs, value)?;
+                    0
+                }
+                Err(crate::decimal::ParseError::Format) => 1,
+                Err(crate::decimal::ParseError::Overflow) => 2,
+            };
+            Some(Value::I32(status))
+        }
+        Native::DecimalToDouble => {
+            let value = decimal_arg(vm, [arg(0)?, arg(1)?, arg(2)?, arg(3)?])?;
+            Some(Value::F(crate::decimal::to_double(value)))
+        }
+        Native::DecimalFromFloat => {
+            let input = float(vm, arg(0)?)?;
+            let single = vm.int32(arg(1)?)? != 0;
+            let outs = [arg(2)?, arg(3)?, arg(4)?, arg(5)?];
+            let status = match crate::decimal::from_float(input, single) {
+                Ok(value) => {
+                    store_decimal(vm, outs, value)?;
+                    0
+                }
+                Err(_) => 1,
+            };
+            Some(Value::I32(status))
+        }
     })
 }
 
@@ -921,6 +1006,24 @@ fn text_arg<H: Host>(vm: &Vm<'_, H>, value: Value) -> Result<alloc::string::Stri
 /// Номер окна; отрицательный — окна нет.
 fn window_arg<H: Host>(vm: &Vm<'_, H>, value: Value) -> Result<Option<u32>, VmError> {
     Ok(u32::try_from(vm.int32(value)?).ok())
+}
+
+/// `decimal` четырьмя `int`, как у `decimal.GetBits` (фаза N7g).
+fn decimal_arg<H: Host>(vm: &Vm<'_, H>, parts: [Value; 4]) -> Result<crate::decimal::Decimal, VmError> {
+    let [lo, mid, hi, flags] = parts;
+    crate::decimal::Decimal::from_bits(vm.int32(lo)?, vm.int32(mid)?, vm.int32(hi)?, vm.int32(flags)?)
+        .ok_or_else(|| vm.invalid("decimal bits are not valid"))
+}
+
+/// Записать `decimal` в четыре `out int`.
+fn store_decimal<H: Host>(vm: &mut Vm<'_, H>, outs: [Value; 4], value: crate::decimal::Decimal) -> Result<(), VmError> {
+    for (out, part) in outs.into_iter().zip(value.bits()) {
+        let Value::Ptr(place) = out else {
+            return Err(vm.invalid("out argument is not a pointer"));
+        };
+        vm.store(place, Value::I32(part))?;
+    }
+    Ok(())
 }
 
 /// Прямоугольник из четырёх `int`; пустой — `None`.

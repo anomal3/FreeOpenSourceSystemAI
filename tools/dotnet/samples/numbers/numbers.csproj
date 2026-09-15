@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N7g: поле со стрелками NumericUpDown из дизайнера и тип
+       decimal, на котором оно считает. clr-check запускает его с аргументом
+       self-test: стрелки нажимаются из кода, значение упирается в края, у второго
+       поля два знака после запятой и разделитель разрядов, и форма закрывается
+       сама. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -807,5 +807,44 @@ fn tabs_print_what_winforms_prints() {
     let (result, output) = run_with(TABS, "tabs.dll", &["self-test"]);
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, TABS_OUTPUT);
+    assert_eq!(code, 0);
+}
+
+/// Образец `tools/dotnet/samples/numbers` (фаза N7g): поля со стрелками из
+/// дизайнера и арифметика `decimal`.
+const NUMBERS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/numbers.dll");
+
+/// Что печатает `dotnet numbers.dll self-test` (записано 2026-09-15, .NET 10,
+/// WinForms на Windows, LF): порядок ValueChanged и Text, края, форматы поля и
+/// `decimal` — деление до 28 знаков, округление к чётному, разбор и форматы.
+const NUMBERS_OUTPUT: &str = concat!(
+    "shown: 10 5 50 1 '10' | 1.5 0.25 '1.50' 2 False True True False Left\n",
+    "value: 11 '10'\n",
+    "value: 12 '11'\n",
+    "value: 50 '12'\n",
+    "value: 49 '50'\n",
+    "range: value 49\n",
+    "value: 20 '49'\n",
+    "max: 20 20\n",
+    "value: 30 '20'\n",
+    "min: 30 30 30\n",
+    "second: 1.75 '1.75'\n",
+    "thousands: 1234.5 '1,234.50'\n",
+    "hex: '4D2'\n",
+    "math: 3.35 1.15 -1.15 2.475 2.0454545454545454545454545455 0.3333333333333333333333333333 2.5 -1.1 0.05\n",
+    "compare: True True True 1 2.25 1.10 1.10\n",
+    "round: 2.2 2.4 2 4 -2 -3 3 2.35\n",
+    "convert: 2 -1 2.25 1.75 0.1 1.5 79228162514264337593543950335 -1 -12345.6789\n",
+    "parse: 3.50 -0.001 False 0 1000\n",
+    "format: 1234.5 1,234.50 12.5 % 0042.00 -3.14\n",
+    "bits: 15,0,0,65536 -1,-1,-1,-2147483648 True\n",
+    "closed: UserClosing 30\n",
+);
+
+#[test]
+fn numbers_print_what_winforms_prints() {
+    let (result, output) = run_with(NUMBERS, "numbers.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, NUMBERS_OUTPUT);
     assert_eq!(code, 0);
 }

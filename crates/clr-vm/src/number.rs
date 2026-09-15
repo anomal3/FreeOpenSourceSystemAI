@@ -261,6 +261,28 @@ pub fn format_single(value: f32, format: &[u16]) -> Result<Vec<u16>, FormatError
     format_float(Float::Single(value), format)
 }
 
+/// `decimal` по формату .NET (фаза N7g). Цифры — все цифры мантиссы, с
+/// хвостовыми нулями: `1.10m` печатается `1.10`. `G` без точности у .NET не
+/// округляет и не переходит на экспоненту — ради тех же хвостовых нулей.
+pub fn format_decimal(mantissa: u128, scale: u32, negative: bool, format: &[u16]) -> Result<Vec<u16>, FormatError> {
+    let mut out = Vec::new();
+    let digits = if mantissa == 0 { Vec::new() } else { alloc::format!("{mantissa}").into_bytes() };
+    let mut number = Number { scale: digits.len() as i32 - scale as i32, digits, negative, floating: false };
+    let (fmt, max) = parse_format_specifier(format)?;
+    if fmt == 0 {
+        number_to_string_format(&mut out, &mut number, format);
+    } else if (fmt & 0xFFDF) == u16::from(b'G') && max == -1 {
+        if number.negative && !number.digits.is_empty() {
+            out.push(u16::from(b'-'));
+        }
+        let digits = number.digits.len() as i32;
+        format_general(&mut out, &number, digits, fmt - u16::from(b'G' - b'E'), true);
+    } else {
+        number_to_string(&mut out, &mut number, fmt, max)?;
+    }
+    Ok(out)
+}
+
 /// `Number.FormatFloat` у .NET.
 fn format_float(value: Float, format: &[u16]) -> Result<Vec<u16>, FormatError> {
     let mut out = Vec::new();
@@ -566,7 +588,7 @@ fn number_to_string(out: &mut Vec<u16>, number: &mut Number, fmt: u16, mut max: 
             if number.negative {
                 out.push(u16::from(b'-'));
             }
-            format_general(out, number, max, general - u16::from(b'G' - b'E'));
+            format_general(out, number, max, general - u16::from(b'G' - b'E'), false);
         }
         b'P' | b'p' => {
             if max < 0 {
@@ -698,10 +720,10 @@ fn format_scientific(out: &mut Vec<u16>, number: &Number, max: i32, exp_char: u1
 
 /// `FormatGeneral`: как `F`, но с переходом на экспоненту, когда порядок
 /// больше `max` или число меньше `0.0001`.
-fn format_general(out: &mut Vec<u16>, number: &Number, max: i32, exp_char: u16) {
+fn format_general(out: &mut Vec<u16>, number: &Number, max: i32, exp_char: u16, suppress_scientific: bool) {
     let mut dig_pos = number.scale;
     let mut scientific = false;
-    if dig_pos > max || dig_pos < -3 {
+    if !suppress_scientific && (dig_pos > max || dig_pos < -3) {
         dig_pos = 1;
         scientific = true;
     }

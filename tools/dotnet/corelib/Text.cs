@@ -565,6 +565,39 @@ namespace System
 
         public static int Sign(long value) => value < 0 ? -1 : value > 0 ? 1 : 0;
 
+        // Для decimal (фаза N7g) — через decimal.*; литералов `0m` нет, чтобы не
+        // читать decimal.Zero раньше его статического конструктора.
+        public static decimal Max(decimal val1, decimal val2) => val1 >= val2 ? val1 : val2;
+
+        public static decimal Min(decimal val1, decimal val2) => val1 <= val2 ? val1 : val2;
+
+        public static decimal Abs(decimal value) => value < decimal.Zero ? -value : value;
+
+        public static int Sign(decimal value) => decimal.Compare(value, decimal.Zero);
+
+        public static decimal Clamp(decimal value, decimal min, decimal max)
+        {
+            if (min > max)
+            {
+                throw new ArgumentException("'" + min + "' cannot be greater than " + max + ".");
+            }
+            return value < min ? min : value > max ? max : value;
+        }
+
+        public static decimal Round(decimal d) => decimal.Round(d);
+
+        public static decimal Round(decimal d, int decimals) => decimal.Round(d, decimals);
+
+        public static decimal Round(decimal d, MidpointRounding mode) => decimal.Round(d, mode);
+
+        public static decimal Round(decimal d, int decimals, MidpointRounding mode) => decimal.Round(d, decimals, mode);
+
+        public static decimal Floor(decimal d) => decimal.Floor(d);
+
+        public static decimal Ceiling(decimal d) => decimal.Ceiling(d);
+
+        public static decimal Truncate(decimal d) => decimal.Truncate(d);
+
         // Дробная математика (фаза N4c). Функции — в Rust, из крейта `libm`
         // (порт musl). Точность у них та же, что у C-библиотек, но последний
         // бит синуса или степени у разных библиотек может различаться — и у
