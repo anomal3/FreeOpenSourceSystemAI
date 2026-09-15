@@ -386,7 +386,7 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     // появятся задачи, и это не случайность: проснувшийся процессор простаивает
     // до `sched::run`, и всё, что ядро делает до этого места и дальше до него,
     // по-прежнему делает один загрузочный.
-    smp::start();
+    smp::start(info.one_cpu());
 
     let stats = mm::frame::stats();
     kprintln!();

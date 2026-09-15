@@ -704,6 +704,13 @@ fn execute(
 
     let mut extra: Vec<String> = scenario.qemu_args(arch).iter().map(|s| (*s).to_string()).collect();
     extra.extend(scenario.extra.iter().map(|s| (*s).to_string()));
+    // Лишние аргументы QEMU для всех сценариев разом, например `-accel whpx`:
+    // гостевой код тогда исполняет настоящий процессор, а не эмулятор. Нужно
+    // затем, что эмулятор прощает то, чего не прощает железо, — бит Accessed
+    // в GDT трамплина нашёлся только на ноутбуке.
+    if let Ok(more) = std::env::var("FREEOS_QEMU_EXTRA") {
+        extra.extend(more.split_whitespace().map(str::to_string));
+    }
 
     // Память машины. Пустая строка сценария означает «оставить умолчание», а не
     // «нисколько», поэтому здесь развилка, а не подстановка пустого аргумента.

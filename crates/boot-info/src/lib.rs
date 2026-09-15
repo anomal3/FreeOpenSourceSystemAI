@@ -56,6 +56,15 @@ pub const BOOT_CHECK_DISK: u64 = 1 << 1;
 /// думает столько, сколько нужно.
 pub const BOOT_UNATTENDED: u64 = 1 << 2;
 
+/// Не будить остальные процессоры: работать на одном загрузочном.
+///
+/// Пункт меню для машины, на которой запуск остальных процессоров вешает или
+/// перезагружает систему. Первой такой машиной стал ноутбук ASUS K53SD: сначала
+/// тройная ошибка в трамплине, затем зависание сразу за строкой `cpu 1 online`.
+/// Система на одном процессоре медленнее, но работает — и позволяет увидеть,
+/// что сломается на этой машине следующим.
+pub const BOOT_ONE_CPU: u64 = 1 << 3;
+
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,5 +474,11 @@ impl BootInfo {
     #[must_use]
     pub const fn unattended(&self) -> bool {
         self.boot_flags & BOOT_UNATTENDED != 0
+    }
+
+    /// Whether the other processors must stay asleep — see [`BOOT_ONE_CPU`].
+    #[must_use]
+    pub const fn one_cpu(&self) -> bool {
+        self.boot_flags & BOOT_ONE_CPU != 0
     }
 }

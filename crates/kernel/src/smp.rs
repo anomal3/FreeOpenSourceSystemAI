@@ -149,7 +149,11 @@ const START_TIMEOUT_MS: u64 = 1000;
 /// запуска меряется часами, а стек нового процессора берётся из кучи. Позже
 /// незачем: запущенные процессоры до [`sched::run`] простаивают, а после него
 /// сразу берут работу.
-pub fn start() {
+///
+/// `one_cpu` — просьба из меню загрузчика оставить остальные спящими. Таблицы
+/// всё равно разбираются: человеку, выбравшему этот пункт, важно видеть, сколько
+/// процессоров у машины на самом деле.
+pub fn start(one_cpu: bool) {
     kprintln!();
     kprintln!("---- processors -------------------------------------------------");
 
@@ -162,6 +166,13 @@ pub fn start() {
     }
     if found.count <= 1 {
         kprintln!("  smp         : 1 of {} processors online", found.total);
+        return;
+    }
+    if one_cpu {
+        kprintln!(
+            "  smp         : 1 of {} processors online, the others stay asleep as asked in the boot menu",
+            found.total
+        );
         return;
     }
 

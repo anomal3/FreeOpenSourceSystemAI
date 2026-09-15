@@ -4105,6 +4105,42 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "one-cpu",
+        about: "Меню загрузчика, шестой пункт: из четырёх процессоров будится один, система встаёт.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &["-smp", "4"],
+        steps: &[
+            // В меню попадаем так же, как в `recovery`.
+            Step::Repeat("s", 4),
+            Step::Await("FreeOS bootloader", BOOT),
+            Step::Repeat("s", 8),
+            Step::Await("---- boot menu", 120_000),
+            // Пункт для машины, которая встаёт при запуске остальных
+            // процессоров (ASUS K53SD). Процессоров у машины четыре — и ядро
+            // обязано это сказать, а будить не обязано.
+            Step::Key("6"),
+            Step::Await("  one processor: the others stay asleep", 15_000),
+            Step::Await("smp         : 1 of 4 processors online, the others stay asleep", BOOT),
+            Step::Await("desktop     : ", BOOT),
+            Step::Absent("cpu 1 online"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "powerbtn",
         about: "Кнопка питания: событие ACPI доходит до системы, и она гаснет по-настоящему.",
         target: Target::Installed,
