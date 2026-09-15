@@ -169,7 +169,11 @@ pub fn check() -> Result<()> {
         // пакет `winforms`.
         let config = out.join("samples").join(sample).join(format!("{sample}.runtimeconfig.json"));
         if let Ok(text) = fs::read(&config) {
-            refresh_initrd(&root, &format!("samples/{sample}.runtimeconfig.json"), &text)?;
+            // SDK пишет его с CRLF, а репозиторий хранит текст с LF
+            // (`.gitattributes`): без этой замены на свежем клоне `clr-check`
+            // «обновлял» бы все эти файлы при каждом запуске.
+            let text = String::from_utf8_lossy(&text).replace("\r\n", "\n");
+            refresh_initrd(&root, &format!("samples/{sample}.runtimeconfig.json"), text.as_bytes())?;
         }
     }
     if run_failed > 0 {
