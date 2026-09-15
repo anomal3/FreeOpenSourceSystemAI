@@ -164,6 +164,13 @@ pub fn check() -> Result<()> {
             }
         }
         refresh_initrd(&root, &format!("samples/{sample}.dll"), &data)?;
+        // Рядом со сборкой — её `.runtimeconfig.json` (фаза N8): по нему «Файлы»
+        // узнают программу и запускают её через `/bin/dotnet`, и его же везёт
+        // пакет `winforms`.
+        let config = out.join("samples").join(sample).join(format!("{sample}.runtimeconfig.json"));
+        if let Ok(text) = fs::read(&config) {
+            refresh_initrd(&root, &format!("samples/{sample}.runtimeconfig.json"), &text)?;
+        }
     }
     if run_failed > 0 {
         bail!("{run_failed} sample program(s) behave differently under the own runtime");

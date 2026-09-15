@@ -86,6 +86,23 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
         data: EXTRA.as_bytes().to_vec(),
     });
 
+    // Программа WinForms пакетом (фаза N8): управляемая сборка, её
+    // `.runtimeconfig.json` и строка запуска в манифесте — по `start=` стол
+    // ставит программу в «Пуск». Файлы берутся из `initrd/`, куда их кладёт
+    // `cargo xtask clr-check`: образ системы собирается без .NET SDK, и пакет
+    // тоже.
+    let samples = paths::initrd_source_dir().join("usr/share/dotnet/samples");
+    let mut winforms = Builder::new(Kind::Package, "winforms", "1.0");
+    winforms.field("summary", "A WinForms program from the Visual Studio designer");
+    winforms.field("caption", "WinForms");
+    winforms.field("about", "форма из дизайнера Visual Studio");
+    winforms.field("start", "/bin/dotnet /opt/winforms/winforms.dll");
+    for name in ["winforms.dll", "winforms.runtimeconfig.json"] {
+        let path = samples.join(name);
+        let data = fs::read(&path).with_context(|| format!("не удалось прочитать {}", path.display()))?;
+        winforms.file(&Entry { path: String::from(name), mode: 0o644, uid: 0, gid: 0, data });
+    }
+
     let dir = output_dir();
     fs::create_dir_all(&dir)
         .with_context(|| format!("не удалось создать каталог {}", dir.display()))?;
@@ -94,6 +111,7 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     for (file_name, bytes) in [
         ("hello-1.0.fpk", hello.finish()),
         ("extra-1.0.fpk", extra.finish()),
+        ("winforms-1.0.fpk", winforms.finish()),
     ] {
         let path = dir.join(file_name);
         fs::write(&path, &bytes)

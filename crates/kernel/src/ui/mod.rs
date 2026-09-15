@@ -1494,14 +1494,24 @@ fn apply_look_change(desktop: &mut Compositor, look: bool, title: bool, status: 
 
 /// Открыть или закрыть меню запуска.
 fn toggle_menu(desktop: &mut Compositor, status: &Status) {
+    // Открывается — значит пересобирается (фаза N8): пакет, поставленный после
+    // запуска стола, обязан появиться в «Пуске» при следующем открытии, а не
+    // после перезагрузки.
+    if !desktop.menu_open() {
+        desktop.reload_menu();
+    }
     let Some(menu) = desktop.menu_mut() else {
         return;
     };
     let opened = menu.toggle();
+    let packages = if opened { menu.package_names() } else { String::new() };
     kprintln!(
         "  desktop     : menu {}",
         if opened { "opened" } else { "closed" }
     );
+    if !packages.is_empty() {
+        kprintln!("  desktop     : start menu offers packages: {packages}");
+    }
     if !opened {
         // Закрытое меню надо стереть: под ним фон и окна, которые никто не
         // перерисовывал, — они не «изменились», но их снова видно.
@@ -1564,6 +1574,12 @@ fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
                 Err(err) => kprintln!("  desktop     : cannot start '{path}': {err}"),
             }
         }
+        // Строка пакета — командная строка целиком (`/bin/dotnet /opt/…`), с
+        // правами того же сеанса, что и у программ из `/bin`.
+        panel::Choice::Command(line) => match crate::user::spawn(&line, crate::user::session::credentials()) {
+            Ok(id) => kprintln!("  desktop     : started '{line}' as {id}"),
+            Err(err) => kprintln!("  desktop     : cannot start '{line}': {err}"),
+        },
     }
 }
 

@@ -644,6 +644,65 @@ pub enum Choice {
     App(App),
     /// Программа с собственным окном — её имя в `/bin`.
     Program(&'static str),
+    /// Программа, поставленная пакетом (фаза N8), — командная строка из
+    /// `start=` её манифеста.
+    Command(String),
+}
+
+/// Программа, поставленная пакетом (фаза N8): строка «Пуска» из реестра
+/// `/var/lib/pkg`.
+///
+/// Манифест пакета — первое место, где программа говорит о себе сама, и
+/// названный предел списка [`PROGRAMS`] здесь снят: `start=` — чем её
+/// запускать, `caption=` и `about=` — как её назвать. Пакет без `start=` в меню
+/// не попадает: это библиотека или данные, запускать там нечего.
+struct Launcher {
+    name: String,
+    caption: String,
+    about: String,
+    start: String,
+}
+
+/// Пакеты со строкой запуска — по имени, чтобы порядок строк не зависел от
+/// порядка записей в каталоге.
+fn list_packages() -> Vec<Launcher> {
+    const REGISTRY: &str = "/var/lib/pkg";
+    // Предел манифеста в контейнере — 32 КиБ (`fpk::MAX_MANIFEST`); запись
+    // реестра — тот же манифест.
+    const LIMIT: usize = 32 * 1024;
+    let Some(Ok(entries)) = crate::fs::list(REGISTRY) else {
+        return Vec::new();
+    };
+    let mut launchers = Vec::new();
+    for entry in entries {
+        if entry.kind != crate::vfs::NodeKind::File {
+            continue;
+        }
+        let Some(name) = entry.name.strip_suffix(".pkg") else {
+            continue;
+        };
+        let path = alloc::format!("{REGISTRY}/{}", entry.name);
+        // Запись, которую не прочитать или не разобрать, — не повод терять
+        // меню целиком: строки просто не будет.
+        let Some(Ok((bytes, _))) = crate::fs::read(&path, LIMIT) else {
+            continue;
+        };
+        let Ok(text) = core::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Some(start) = sysconf::value(text, "start").filter(|line| !line.is_empty()) else {
+            continue;
+        };
+        let about = sysconf::value(text, "about").or_else(|| sysconf::value(text, "summary")).unwrap_or("");
+        launchers.push(Launcher {
+            name: String::from(name),
+            caption: String::from(sysconf::value(text, "caption").unwrap_or(name)),
+            about: String::from(about),
+            start: String::from(start),
+        });
+    }
+    launchers.sort_by(|a, b| a.name.cmp(&b.name));
+    launchers
 }
 
 /// Программа из `/bin`, у которой есть окно, — то, что стоит в «Пуске».
@@ -685,25 +744,31 @@ static PROGRAMS: [Program; 3] = [
     },
 ];
 
-/// Строка меню: окно стола или программа.
+/// Строка меню: окно стола, программа или программа из пакета.
+///
+/// Пакет — номер в списке пакетов меню, а не ссылка: список читается с диска
+/// при каждом открытии и живёт в самом меню, а `Item` копируется.
 #[derive(Clone, Copy)]
 enum Item {
     App(App),
     Program(&'static Program),
+    Package(usize),
 }
 
 impl Item {
-    fn caption(self) -> &'static str {
+    fn caption(self, packages: &[Launcher]) -> &str {
         match self {
             Item::App(app) => app.caption(),
             Item::Program(program) => program.caption,
+            Item::Package(index) => packages.get(index).map_or("", |launcher| launcher.caption.as_str()),
         }
     }
 
-    fn about(self) -> &'static str {
+    fn about(self, packages: &[Launcher]) -> &str {
         match self {
             Item::App(app) => app.about(),
             Item::Program(program) => program.about,
+            Item::Package(index) => packages.get(index).map_or("", |launcher| launcher.about.as_str()),
         }
     }
 
@@ -711,13 +776,15 @@ impl Item {
         match self {
             Item::App(app) => app.icon(),
             Item::Program(program) => program.icon,
+            // Значков из ресурсов `.exe` система не читает — у всех пакетов один.
+            Item::Package(_) => Icon::Package,
         }
     }
 
     fn tone(self) -> Tone {
         match self {
             Item::App(app) => app.tone(),
-            Item::Program(_) => Tone::Accent,
+            Item::Program(_) | Item::Package(_) => Tone::Accent,
         }
     }
 
@@ -726,11 +793,12 @@ impl Item {
         matches!(self, Item::App(app) if app.confirms_power().is_some())
     }
 
-    fn choice(self) -> Choice {
-        match self {
+    fn choice(self, packages: &[Launcher]) -> Option<Choice> {
+        Some(match self {
             Item::App(app) => Choice::App(app),
             Item::Program(program) => Choice::Program(program.file),
-        }
+            Item::Package(index) => Choice::Command(packages.get(index)?.start.clone()),
+        })
     }
 }
 
@@ -758,6 +826,8 @@ pub struct Menu {
     damage: Rect,
     /// Сколько программ лежит в `/bin` — для строки журнала при запуске стола.
     bin_programs: usize,
+    /// Программы из пакетов, прочитанные при сборке меню (фаза N8).
+    packages: Vec<Launcher>,
     /// Ширина колонки строк.
     width: u32,
 }
@@ -782,6 +852,9 @@ impl Menu {
                 items.push(Item::Program(program));
             }
         }
+        // Программы из пакетов — после своих и до строк питания (фаза N8).
+        let packages = list_packages();
+        items.extend((0..packages.len()).map(Item::Package));
         items.extend([Item::App(App::Shutdown), Item::App(App::Restart)]);
 
         // Ширина — по самой длинной строке, а не заданным числом: подрезанная
@@ -790,7 +863,7 @@ impl Menu {
         let note = ctx.face(Role::Caption);
         let mut widest = ctx.face(Role::MonoCaps).width(APPS_TITLE);
         for item in &items {
-            widest = widest.max(title.width(item.caption())).max(note.width(item.about()));
+            widest = widest.max(title.width(item.caption(&packages))).max(note.width(item.about(&packages)));
         }
         let width = m.row_width(widest);
         let card_w = m.pad * 2 + width.max(m.header_width());
@@ -820,6 +893,7 @@ impl Menu {
             open: false,
             damage: Rect::EMPTY,
             bin_programs: names.len(),
+            packages,
             width,
         })
     }
@@ -839,6 +913,13 @@ impl Menu {
     #[must_use]
     pub const fn bin_programs(&self) -> usize {
         self.bin_programs
+    }
+
+    /// Имена пакетов, стоящих в меню, через запятую — для журнала (фаза N8).
+    #[must_use]
+    pub fn package_names(&self) -> String {
+        let names: Vec<&str> = self.packages.iter().map(|launcher| launcher.name.as_str()).collect();
+        names.join(", ")
     }
 
     /// Открыть или закрыть меню. Возвращает новое состояние.
@@ -879,7 +960,7 @@ impl Menu {
     #[must_use]
     pub fn choice_at(&self, x: i32, y: i32) -> Option<Choice> {
         let index = self.row_at(x, y)?;
-        self.items.get(index).map(|item| item.choice())
+        self.items.get(index).and_then(|item| item.choice(&self.packages))
     }
 
     /// Поставить выделение туда, где стоит указатель.
@@ -905,7 +986,7 @@ impl Menu {
     /// Что выбрано сейчас.
     #[must_use]
     pub fn selection(&self) -> Option<Choice> {
-        self.items.get(self.row).map(|item| item.choice())
+        self.items.get(self.row).and_then(|item| item.choice(&self.packages))
     }
 
     #[must_use]
@@ -1020,7 +1101,14 @@ impl Menu {
             let Some(item) = self.items.get(row.index).copied() else {
                 continue;
             };
-            draw_row(m, &mut self.surface, row, item.caption(), item.about(), row.index == self.row);
+            draw_row(
+                m,
+                &mut self.surface,
+                row,
+                item.caption(&self.packages),
+                item.about(&self.packages),
+                row.index == self.row,
+            );
         }
 
         self.damage = self.surface.bounds();

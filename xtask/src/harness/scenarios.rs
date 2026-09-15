@@ -3622,6 +3622,30 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("closed: UserClosing 100 False True False", 30_000),
             Step::Await("dotnet: keys.dll: Main returned 0", 30_000),
+            Step::Await("freeos> ", 15_000),
+            // Фаза N8: «Файлы» запускают .NET-программу. Рядом с `winforms.dll`
+            // лежит её `.runtimeconfig.json` — так её оставляет `dotnet build`,
+            // — и Enter по ней не открывает просмотр, а запускает `/bin/dotnet`.
+            // Строки списка идут по имени: последняя —
+            // `winforms.runtimeconfig.json`, над ней сама сборка.
+            Step::Line("run -b /bin/files /usr/share/dotnet/samples"),
+            Step::Await("window      : 'Files' at", 30_000),
+            Step::Await("files: /usr/share/dotnet/samples has ", 30_000),
+            Step::Key("end"),
+            Step::Await("selected 'winforms.runtimeconfig.json'", 15_000),
+            Step::Key("up"),
+            Step::Await("selected 'winforms.dll'", 15_000),
+            Step::Key("ret"),
+            Step::Await("files: started '/bin/dotnet /usr/share/dotnet/samples/winforms.dll' as #", 15_000),
+            Step::Await("dotnet: window 'Form1' opened, 800x450", 60_000),
+            Step::Wait(2_500),
+            Step::Shot("files-winforms"),
+            Step::Aim(Aim::Close("Form1")),
+            Step::Click,
+            Step::Await("dotnet: winforms.dll: Main returned 0", 30_000),
+            Step::Aim(Aim::Close("Files")),
+            Step::Click,
+            Step::Await("files: closing on request", 15_000),
             Step::Absent("finally after Environment.Exit must not run"),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),
@@ -4279,6 +4303,35 @@ pub const ALL: &[Scenario] = &[
 
             Step::Line("run /bin/pkg remove extra"),
             Step::Await("pkg: removed extra", 30_000),
+
+            // Фаза N8: программа WinForms пакетом. В её манифесте `start=` — и
+            // стол ставит её в «Пуск» при следующем открытии меню, без
+            // перезагрузки. Строка пакета стоит прямо над строками питания, и
+            // меню ходит по кругу: от первой строки до неё три шага вверх,
+            // сколько бы программ ни лежало в `/bin`.
+            Step::Line("run /bin/pkg install /media/winforms-1.0.fpk"),
+            Step::Await("pkg: installed winforms 1.0, 2 file(s)", 60_000),
+            Step::Wait(1_000),
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Await("desktop     : start menu offers packages: winforms", 15_000),
+            Step::Repeat("up", 3),
+            Step::Wait(1_500),
+            Step::Shot("winforms-menu"),
+            Step::Key("ret"),
+            Step::Await("desktop     : started '/bin/dotnet /opt/winforms/winforms.dll' as ", 15_000),
+            Step::Await("dotnet: window 'Form1' opened, 800x450", 60_000),
+            Step::Wait(2_500),
+            Step::Shot("winforms-window"),
+            Step::Aim(Aim::Close("Form1")),
+            Step::Click,
+            // Строку фокуса стол печатает, закрывая окно, — раньше последней
+            // строки самой программы.
+            Step::Await("desktop     : focus 'Terminal'", 30_000),
+            Step::Await("dotnet: winforms.dll: Main returned 0", 30_000),
+            Step::Wait(1_000),
+            Step::Line("run /bin/pkg remove winforms"),
+            Step::Await("pkg: removed winforms, 2 file(s)", 30_000),
 
             // Вторая половина фазы: то же самое кнопками, без единой набранной
             // команды. Проверяется не `pkg` — он проверен выше, — а то, что

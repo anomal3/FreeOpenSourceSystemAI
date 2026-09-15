@@ -787,6 +787,20 @@ impl Compositor {
         self.menu.as_ref().is_some_and(Menu::is_open)
     }
 
+    /// Пересобрать закрытое меню запуска (фаза N8): строки пакетов читаются из
+    /// реестра, а пакет могли поставить после запуска стола.
+    ///
+    /// Нехватка памяти под новую карточку оставляет прежнюю — меню без нового
+    /// пакета лучше, чем меню, которое не открылось.
+    pub fn reload_menu(&mut self) {
+        if self.menu_open() {
+            return;
+        }
+        if let Some(menu) = Menu::new(self.work_bottom(), self.scale.min(2)) {
+            self.menu = Some(menu);
+        }
+    }
+
     /// Обновить панель задач.
     pub fn refresh_panel(&mut self, status: &Status) {
         let buttons = self.buttons();

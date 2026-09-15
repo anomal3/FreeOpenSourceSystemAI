@@ -64,7 +64,7 @@ use user_progs::{
     Args, SysInfo, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT,
     WIN_KEY_MENU, WIN_KEY_NAMED, WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP,
     close, create, mkdir, monotonic_ms, mounts, open, println, read, readdir_raw, remove, rename,
-    stat, sysinfo,
+    spawn, stat, sysinfo,
 };
 
 /// Имя окна.
@@ -570,7 +570,8 @@ impl Files {
         }
     }
 
-    /// Войти в каталог, открыть том или файл на просмотр.
+    /// Войти в каталог, открыть том, запустить .NET-программу или открыть файл
+    /// на просмотр.
     fn open_selected(&mut self) -> bool {
         let Some(row) = self.rows.get(self.selected) else {
             return false;
@@ -580,7 +581,21 @@ impl Files {
             self.go_to(target);
             return true;
         }
-        self.preview = Some(read_preview(&row.name, &target));
+        let name = row.name.clone();
+        // Фаза N8: .NET-программу открыть — значит запустить, а не показать её
+        // байты. Ждать её «Файлы» не станут: у программы своё окно.
+        if let Some(line) = dotnet_command(&target) {
+            let id = spawn(&line);
+            if id < 0 {
+                println(&format!("files: cannot start '{line}': error {id}"));
+                self.note = Some(format!("Не удалось запустить «{name}»: {}", error_text(id)));
+            } else {
+                println(&format!("files: started '{line}' as #{id}"));
+                self.note = Some(format!("Запущено «{name}»"));
+            }
+            return true;
+        }
+        self.preview = Some(read_preview(&name, &target));
         true
     }
 
@@ -2232,6 +2247,35 @@ fn list_dir(path: &str) -> Result<(Vec<Row>, usize), String> {
 
     close(fd);
     Ok((rows, dropped))
+}
+
+/// Командная строка, которой запускается .NET-программа, если `path` — она.
+///
+/// Признак — `<имя>.runtimeconfig.json` рядом: `dotnet build` оставляет его у
+/// каждой программы и не оставляет у библиотек, так что `.dll` без него —
+/// библиотека, запускать которую нечего. У `.exe` вдобавок обязана лежать
+/// `<имя>.dll`: `.exe` из `dotnet build` — машинный код Windows, который
+/// запускает ту самую `.dll`, и исполнять его здесь нечем, а сама `.dll` —
+/// можно.
+///
+/// Путь с пробелом не запускается, и это названный предел: ядро делит
+/// командную строку по пробелам, и программа получила бы полпути. Такой файл
+/// откроется на просмотр, как любой другой.
+fn dotnet_command(path: &str) -> Option<String> {
+    let lower = path.to_ascii_lowercase();
+    if !(lower.ends_with(".dll") || lower.ends_with(".exe")) || path.contains(' ') {
+        return None;
+    }
+    let stem = &path[..path.len() - 4];
+    let dll = format!("{stem}.dll");
+    let mut info = Stat::default();
+    if stat(&format!("{stem}.runtimeconfig.json"), &mut info) < 0 {
+        return None;
+    }
+    if stat(&dll, &mut info) < 0 || info.kind == KIND_DIRECTORY {
+        return None;
+    }
+    Some(format!("/bin/dotnet {dll}"))
 }
 
 /// Прочитать файл для просмотра.
