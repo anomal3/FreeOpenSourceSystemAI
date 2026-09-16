@@ -1914,7 +1914,8 @@ impl Compositor {
         // закрыть собой то, что под ней.
         if let Some(shade) = self.shade.as_ref() {
             if shade.is_open() {
-                let r = theme::M_R_CARD * self.scale;
+                // Скругление — как у самой шторки (макет, экран 02).
+                let r = mini_ui::paint::Ctx::scaled(self.scale).px(38);
                 self.drop_shadow(back, shade.rect, band, dy, r);
                 self.stack(back, shade.surface(), shade.rect, band, dy, r);
             }

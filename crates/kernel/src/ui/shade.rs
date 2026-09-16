@@ -83,20 +83,17 @@ impl Shade {
         }
         let scale = scale.max(1);
         let ctx = Ctx::scaled(scale);
-        let inset = ctx.px(theme::M_INSET);
-        let top = ctx.px(theme::M_STATUS_H);
-        let width = screen_w.saturating_sub(inset * 2).max(1);
-        // Высота — по содержимому: заголовок, два ряда плиток, две полосы,
-        // заголовок уведомлений и строка «их нет». До низа экрана шторка не
-        // доходит намеренно: под ней должен остаться виден стол, иначе её
-        // нельзя закрыть нажатием мимо.
+        // Макет (экран 02): от верха экрана, с полями по 8, и строка времени —
+        // своя, внутри шторки: она закрывает строку состояния, а не лежит под ней.
+        let side = ctx.px(8);
+        let width = screen_w.saturating_sub(side * 2).max(1);
         let height = ctx
-            .px(theme::M_INSET * 2 + 26 + TILE_H * 2 + 10 + SLIDER_H * 2 + 26 + 34)
-            .min((work_bottom - top as i32).max(1) as u32);
+            .px(14 + 30 + 16 + TILE_H * 2 + 9 + 16 + SLIDER_H * 2 + 10 + 16 + 10 + 16 + 64 + 16 + 4 + 18)
+            .min(work_bottom.max(1) as u32);
         let surface = Surface::new(width, height, bg())?;
         Some(Self {
             surface,
-            rect: Rect::new(inset as i32, top as i32, width, height),
+            rect: Rect::new(side as i32, side as i32, width, height),
             scale,
             open: false,
             damage: Rect::EMPTY,
@@ -142,8 +139,7 @@ impl Shade {
         let ctx = Ctx::scaled(self.scale).on(bg());
         let p = ctx.palette;
         let card = self.surface.bounds();
-        let m = ctx.px(theme::M_INSET);
-        let round = ctx.px(theme::M_R_CARD);
+        let round = ctx.px(38);
 
         // Заливка во всю поверхность без скругления: углы срезает композитор,
         // смешивая их с тем, что под ними. Скругление здесь означало бы, что
@@ -152,19 +148,21 @@ impl Shade {
         draw::rounded_stroke(&mut self.surface, card, round, p.line3.color, p.line3.alpha);
         draw::crown(&mut self.surface, card, round, p.crown.color, p.crown.alpha);
 
-        let mut y = card.y + m as i32;
-        let left = card.x + m as i32;
-        let room = card.w.saturating_sub(m * 2);
+        let left = card.x + ctx.px(16) as i32;
+        let room = card.w.saturating_sub(ctx.px(32));
+        let mut y = card.y + ctx.px(14) as i32;
 
-        // Дата вместо часов: часы стоят в строке состояния над шторкой, и
-        // повторять их здесь незачем. Часов реального времени у телефона нет,
-        // поэтому говорится то, что известно, — сколько машина работает.
-        let head = super::clock_or_uptime();
-        paint::text_clipped(ctx, &mut self.surface, Role::Title, left, y, room, &head, p.ink);
-        y += i32::from(ctx.face(Role::Title).line) + ctx.px(10) as i32;
+        // Строка времени. Даты у телефона нет — часов реального времени тоже,
+        // — поэтому рядом со временем сказано, что это время работы.
+        let head = Rect::new(left + ctx.px(6) as i32, y, room.saturating_sub(ctx.px(12)), ctx.px(30));
+        let time = super::clock_or_uptime();
+        let time_w = paint::text(ctx, &mut self.surface, Role::Mono, head.x, paint::baseline(ctx, Role::Mono, head), &time, p.ink);
+        let note = if crate::time::clock_text().is_some() { "" } else { "время работы" };
+        paint::text(ctx, &mut self.surface, Role::Label, head.x + (time_w + ctx.px(8)) as i32, paint::baseline(ctx, Role::Label, head), note, p.ink4);
+        y += ctx.px(30 + 16) as i32;
 
         // Плитки: два ряда по две.
-        let gap = ctx.px(8);
+        let gap = ctx.px(9);
         let tile_w = (room.saturating_sub(gap * (COLUMNS - 1))) / COLUMNS;
         let tile_h = ctx.px(TILE_H);
         for (index, tile) in TILES.iter().enumerate() {
@@ -178,111 +176,80 @@ impl Shade {
             );
             self.draw_tile(ctx, rect, tile);
         }
-        y += ((tile_h + gap) * 2) as i32;
+        y += (tile_h * 2 + gap) as i32 + ctx.px(16) as i32;
 
         // Полосы: яркость и звук. Без ручки — двигать их нечем.
-        for (label, percent) in [("Яркость", 72u32), ("Звук", 30)] {
+        for (label, icon, percent, accent) in [("Яркость", Icon::Sun, 72u32, true), ("Звук", Icon::Info, 30, false)] {
             let rect = Rect::new(left, y, room, ctx.px(SLIDER_H));
-            self.draw_slider(ctx, rect, label, percent);
-            y += ctx.px(SLIDER_H + 6) as i32;
+            self.draw_slider(ctx, rect, label, icon, percent, accent);
+            y += ctx.px(SLIDER_H + 10) as i32;
         }
+        y += ctx.px(6) as i32;
 
         // Уведомлений у системы пока нет вовсе, и это сказано прямо. Пустой
         // раздел без строки читался бы как не дорисованный экран.
-        y += ctx.px(4) as i32;
-        paint::text_clipped(
-            ctx,
-            &mut self.surface,
-            Role::MonoCaps,
-            left,
-            y,
-            room,
-            "УВЕДОМЛЕНИЯ",
-            p.ink5,
-        );
-        y += i32::from(ctx.face(Role::MonoCaps).line) + ctx.px(8) as i32;
-        paint::text_clipped(
-            ctx,
-            &mut self.surface,
-            Role::Body,
-            left,
-            y,
-            room,
-            "их пока нет",
-            p.ink3,
-        );
+        paint::caps(ctx, &mut self.surface, left + ctx.px(6) as i32, y, "УВЕДОМЛЕНИЯ · 0");
+        y += ctx.px(10 + 16) as i32;
+        let empty = Rect::new(left, y, room, ctx.px(64));
+        draw::rounded(&mut self.surface, empty, ctx.px(20), p.card.color, p.card.alpha);
+        draw::rounded_stroke(&mut self.surface, empty, ctx.px(20), p.line2.color, p.line2.alpha);
+        paint::text_clipped(ctx, &mut self.surface, Role::Body, empty.x + ctx.px(14) as i32, paint::baseline(ctx, Role::Body, empty), empty.w, "Уведомлений пока нет", p.ink3);
+        y += ctx.px(64 + 16) as i32;
+
+        let handle = Rect::new(card.w as i32 / 2 - ctx.px(22) as i32, y, ctx.px(44), ctx.px(4));
+        draw::rounded(&mut self.surface, handle, handle.h / 2, p.ink6, 180);
 
         self.damage = card;
     }
 
-    /// Одна плитка состояния.
+    /// Одна плитка состояния: значок слева, имя и состояние справа. Включённая
+    /// залита акцентом.
     fn draw_tile(&mut self, ctx: Ctx, rect: Rect, tile: &Tile) {
         let p = ctx.palette;
-        let round = ctx.px(theme::M_R_TILE);
-        let (fill, alpha) = if tile.on {
-            (p.acctint.color, p.acctint.alpha)
+        let round = ctx.px(20);
+        let ink = if tile.on {
+            draw::rounded_gradient(&mut self.surface, rect, round, p.acc, p.acc2, 255);
+            draw::rounded_stroke(&mut self.surface, rect, round, p.accline.color, p.accline.alpha);
+            Color::rgb(0xFF, 0xFF, 0xFF)
         } else {
-            (p.card.color, p.card.alpha)
+            draw::rounded(&mut self.surface, rect, round, p.btn.color, p.btn.alpha);
+            draw::rounded_stroke(&mut self.surface, rect, round, p.btnline.color, p.btnline.alpha);
+            p.ink2
         };
-        draw::rounded(&mut self.surface, rect, round, fill, alpha);
-        draw::rounded_stroke(&mut self.surface, rect, round, p.line2.color, p.line2.alpha);
-
         let glyph = ctx.px(20);
-        let pad = ctx.px(12);
-        let tone = if tile.on { p.acc } else { p.ink3 };
-        glyphicon::draw(
-            &mut self.surface,
-            tile.icon,
-            rect.x + pad as i32,
-            rect.y + pad as i32,
-            glyph,
-            tone,
-            255,
-        );
-        let text_x = rect.x + pad as i32;
-        let room = rect.w.saturating_sub(pad * 2);
-        let mut y = rect.y + (pad + glyph) as i32 + ctx.px(6) as i32;
-        paint::text_clipped(ctx, &mut self.surface, Role::Body, text_x, y, room, tile.label, p.ink);
-        y += i32::from(ctx.face(Role::Body).line);
-        paint::text_clipped(
-            ctx,
-            &mut self.surface,
-            Role::Caption,
-            text_x,
-            y,
-            room,
-            tile.note,
-            p.ink5,
-        );
+        let icon_x = rect.x + ctx.px(14) as i32;
+        glyphicon::draw(&mut self.surface, tile.icon, icon_x, rect.y + (rect.h as i32 - glyph as i32) / 2, glyph, ink, 255);
+        let text_x = icon_x + (glyph + ctx.px(11)) as i32;
+        let room = (rect.right() - ctx.px(10) as i32 - text_x).max(0) as u32;
+        let title = ctx.face(Role::Title);
+        let small = ctx.face(Role::MonoSmall);
+        let top = rect.y + (rect.h as i32 - i32::from(title.line) - i32::from(small.line)) / 2;
+        paint::text_clipped(ctx, &mut self.surface, Role::Title, text_x, top, room, tile.label, ink);
+        let note_ink = if tile.on { ink } else { p.ink4 };
+        paint::text_clipped(ctx, &mut self.surface, Role::MonoSmall, text_x, top + i32::from(title.line), room, tile.note, note_ink);
     }
 
-    /// Строка с полосой: подпись, доля, сама полоса.
-    fn draw_slider(&mut self, ctx: Ctx, rect: Rect, label: &str, percent: u32) {
+    /// Полоса: кнопка во всю ширину, внутри — заливка на долю и подпись.
+    fn draw_slider(&mut self, ctx: Ctx, rect: Rect, label: &str, icon: Icon, percent: u32, accent: bool) {
         let p = ctx.palette;
-        let text = format!("{label} {percent} %");
-        paint::text_clipped(
-            ctx,
-            &mut self.surface,
-            Role::Body,
-            rect.x,
-            rect.y,
-            rect.w,
-            &text,
-            p.ink2,
-        );
-        let bar_h = ctx.px(6);
-        let bar = Rect::new(
-            rect.x,
-            rect.bottom() - bar_h as i32 - ctx.px(6) as i32,
-            rect.w,
-            bar_h,
-        );
-        draw::rounded(&mut self.surface, bar, bar_h / 2, p.sunk.color, p.sunk.alpha);
-        let filled = bar.w * percent.min(100) / 100;
+        let round = ctx.px(16);
+        draw::rounded(&mut self.surface, rect, round, p.btn.color, p.btn.alpha);
+        let filled = rect.w * percent.min(100) / 100;
         if filled > 0 {
-            let done = Rect::new(bar.x, bar.y, filled, bar_h);
-            draw::rounded_gradient(&mut self.surface, done, bar_h / 2, p.acc2, p.acc, 255);
+            let part = Rect::new(rect.x, rect.y, filled, rect.h);
+            if accent {
+                draw::horizontal_gradient(&mut self.surface, part, round, p.acc2, p.acc, 140);
+            } else {
+                draw::rounded(&mut self.surface, part, round, p.ink6, 115);
+            }
         }
+        draw::rounded_stroke(&mut self.surface, rect, round, p.btnline.color, p.btnline.alpha);
+        let glyph = ctx.px(18);
+        let icon_x = rect.x + ctx.px(16) as i32;
+        glyphicon::draw(&mut self.surface, icon, icon_x, rect.y + (rect.h as i32 - glyph as i32) / 2, glyph, p.ink, 255);
+        let text = format!("{label} {percent} %");
+        let text_x = icon_x + (glyph + ctx.px(10)) as i32;
+        paint::text_clipped(ctx, &mut self.surface, Role::Label, text_x, paint::baseline(ctx, Role::Label, rect), rect.w, &text, p.ink);
     }
 }
 

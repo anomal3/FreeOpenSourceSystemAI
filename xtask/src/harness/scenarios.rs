@@ -937,6 +937,16 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : minimize flight of 'Terminal': ", 15_000),
             Step::Wait(1500),
             Step::Shot("04-stack"),
+            // Шторка — нажатием на строку состояния, закрывается нажатием мимо.
+            Step::Aim(Aim::Point(360, 40)),
+            Step::Click,
+            Step::Await("desktop     : shade opened", 15_000),
+            Step::Wait(1000),
+            Step::Shot("04b-shade"),
+            Step::Aim(Aim::Point(360, 1300)),
+            Step::Click,
+            Step::Await("desktop     : shade closed", 15_000),
+            Step::Wait(500),
             // Нажатие на стопку открывает лист «Свёрнутые программы»; строка
             // терминала разворачивает его обратно полётом из стопки.
             Step::Aim(Aim::Point(368, 1495)),
