@@ -411,11 +411,14 @@ impl Panel {
         })
     }
 
-    /// Нарисовать док телефона: телефон, поиск, камера.
+    /// Нарисовать док телефона по макету (`FreeOS-mobile`, экраны 01 и 09).
+    ///
+    /// Без свёрнутых окон: телефон, «FreeOS» с подписью, поиск во всю
+    /// оставшуюся ширину, камера. Со свёрнутыми: телефон, «Пуск» плиткой,
+    /// стопка свёрнутых во всю оставшуюся ширину, поиск плиткой, камера.
     ///
     /// Кнопок открытых окон здесь нет намеренно. На телефоне окно одно и во
-    /// весь экран — переключать нечего, а список окон занял бы место того, чем
-    /// пользуются каждый день.
+    /// весь экран — переключать нечего; свёрнутые собраны в стопку.
     ///
     /// За телефоном и камерой программ пока нет, и кнопки всё равно стоят:
     /// место под них в доке — это решение о раскладке, а не обещание. Нажатие
@@ -423,63 +426,35 @@ impl Panel {
     fn redraw_dock(&mut self, m: Metrics, plate: Rect, menu_open: bool, windows: &[Entry]) {
         let ctx = m.ctx;
         let p = ctx.palette;
-        let minimized = windows.iter().filter(|entry| entry.minimized).count();
-        let layout = dock_layout(m, plate, minimized);
-        let glyph = ctx.px(20);
+        let minimized: Vec<App> =
+            windows.iter().filter(|entry| entry.minimized).map(|entry| entry.app).collect();
+        let layout = dock_layout(m, plate, minimized.len());
+        let radius = ctx.px(16);
 
-        // Боковые кнопки: подложка кнопки, значок по центру. Того, за чем нет
-        // программы, это не отличает — отличать нечем, и притворяться, что
-        // кнопка «выключена», было бы неправдой: нажать её можно.
-        for (rect, icon) in [(layout.left, Icon::Devices), (layout.right, Icon::Display)] {
-            draw::rounded(&mut self.surface, rect, m.round_row, p.btn.color, p.btn.alpha);
-            draw::rounded_stroke(
-                &mut self.surface,
-                rect,
-                m.round_row,
-                p.btnline.color,
-                p.btnline.alpha,
-            );
-            glyphicon::draw(
-                &mut self.surface,
-                icon,
-                rect.x + (rect.w as i32 - glyph as i32) / 2,
-                rect.y + (rect.h as i32 - glyph as i32) / 2,
-                glyph,
-                p.ink2,
-                255,
-            );
+        for (rect, icon) in [(layout.left, Icon::Phone), (layout.right, Icon::Camera)] {
+            dock_button(&mut self.surface, ctx, rect);
+            centered_icon(&mut self.surface, rect, icon, ctx.px(21), p.ink2);
         }
 
-        // Кнопка «Пуск». Открытое меню переворачивает градиент — кнопка
-        // выглядит вдавленной; то же правило, что у настольной панели.
+        // «Пуск». Открытое меню переворачивает градиент — кнопка выглядит
+        // вдавленной; то же правило, что у настольной панели.
         let (top, bottom) = if menu_open { (p.acc2, p.acc) } else { (p.acc, p.acc2) };
-        draw::rounded_gradient(&mut self.surface, layout.brand, m.round_row, top, bottom, 255);
-        draw::rounded_stroke(
-            &mut self.surface,
-            layout.brand,
-            m.round_row,
-            p.accline.color,
-            p.accline.alpha,
-        );
-        // Широкая кнопка подписана именем системы, узкая — только значком:
-        // подпись, обрезанная до «Fr…», хуже её отсутствия.
-        let wide = layout.brand.w > m.btn_h + ctx.px(20);
-        let icon_x = if wide {
-            layout.brand.x + m.side as i32
-        } else {
-            layout.brand.x + (layout.brand.w as i32 - glyph as i32) / 2
-        };
-        glyphicon::draw(
-            &mut self.surface,
-            Icon::Grid,
-            icon_x,
-            layout.brand.y + (layout.brand.h as i32 - glyph as i32) / 2,
-            glyph,
-            WHITE,
-            255,
-        );
-        if wide {
-            let text_x = icon_x + glyph as i32 + m.gap as i32;
+        if layout.brand_square.is_empty() {
+            // Широкая: тёмная пилюля, внутри у левого края синяя плитка 40 со
+            // значком, справа от неё имя системы. Прежде синей была вся кнопка
+            // и подпись упиралась в её край: в макете ширина считается от
+            // подписи, а не от доли дока.
+            dock_button(&mut self.surface, ctx, layout.brand);
+            draw::rounded_gradient(&mut self.surface, layout.chip, ctx.px(13), top, bottom, 255);
+            draw::rounded_stroke(
+                &mut self.surface,
+                layout.chip,
+                ctx.px(13),
+                p.accline.color,
+                p.accline.alpha,
+            );
+            draw_grid(&mut self.surface, layout.chip, ctx.px(18), WHITE);
+            let text_x = layout.chip.right() + ctx.px(9) as i32;
             paint::text_clipped(
                 ctx,
                 &mut self.surface,
@@ -488,114 +463,152 @@ impl Panel {
                 paint::baseline(ctx, Role::Title, layout.brand),
                 layout.brand.right().saturating_sub(text_x).max(0) as u32,
                 DOCK_BRAND,
-                WHITE,
+                p.ink,
             );
-        }
-
-        // Стопка свёрнутых окон: плитки внахлёст со сдвигом, чтобы из-под
-        // верхней выглядывали края нижних. Так видно, что окон несколько, не
-        // называя их числом.
-        if !layout.stack.is_empty() {
-            draw::rounded(
-                &mut self.surface,
-                layout.stack,
-                m.round_row,
-                p.btn.color,
-                p.btn.alpha,
-            );
+        } else {
+            draw::rounded_gradient(&mut self.surface, layout.brand_square, radius, top, bottom, 255);
             draw::rounded_stroke(
                 &mut self.surface,
-                layout.stack,
-                m.round_row,
-                p.btnline.color,
-                p.btnline.alpha,
+                layout.brand_square,
+                radius,
+                p.accline.color,
+                p.accline.alpha,
             );
-            // Плитка мельче кнопки, а шаг — почти в половину плитки: из-под
-            // верхней должен выглядывать не край в две точки, а узнаваемый
-            // кусок соседней.
-            let tile = ctx.px(20);
-            let step = ctx.px(11);
-            let count = minimized.min(3);
-            let total = tile + step * (count.saturating_sub(1)) as u32;
-            let base_x = layout.stack.x + (layout.stack.w as i32 - total as i32) / 2;
-            let base_y = layout.stack.y + (layout.stack.h as i32 - tile as i32) / 2;
-            for index in 0..count {
-                // Нижние плитки приподняты и сдвинуты: поворота у нас нет, а
-                // разнобой нужен — ровная стопка читается как одна плитка.
-                let lift = ((count - index - 1) as u32 * ctx.px(2)) as i32;
-                let rect = Rect::new(
-                    base_x + (index as u32 * step) as i32,
-                    base_y - lift,
-                    tile,
-                    tile,
-                );
-                let last = index + 1 == count;
-                if last {
-                    draw::rounded_gradient(&mut self.surface, rect, ctx.px(7), p.acc, p.acc2, 255);
-                } else {
-                    draw::rounded(&mut self.surface, rect, ctx.px(7), ctx.flat(p.ghost), 255);
-                }
-                draw::rounded_stroke(
-                    &mut self.surface,
-                    rect,
-                    ctx.px(7),
-                    p.btnline.color,
-                    p.btnline.alpha,
-                );
-            }
+            draw_grid(&mut self.surface, layout.brand_square, ctx.px(18), WHITE);
         }
 
-        // Поле поиска.
-        draw::rounded(&mut self.surface, layout.search, m.round_row, p.btn.color, p.btn.alpha);
-        draw::rounded_stroke(
-            &mut self.surface,
-            layout.search,
-            m.round_row,
-            p.btnline.color,
-            p.btnline.alpha,
-        );
-        let search_icon = ctx.px(16);
-        let icon_x = layout.search.x + m.gap as i32;
-        glyphicon::draw(
-            &mut self.surface,
-            Icon::Search,
-            icon_x,
-            layout.search.y + (layout.search.h as i32 - search_icon as i32) / 2,
-            search_icon,
-            p.ink3,
-            255,
-        );
-        // Подпись — только если помещается целиком. Обрезанная до «По…» она
-        // ничего не сообщает, а лупа рядом говорит то же самое и без слов.
-        let text_x = icon_x + search_icon as i32 + m.gap as i32;
-        let room = layout.search.right().saturating_sub(text_x + m.gap as i32).max(0) as u32;
-        if room >= ctx.face(Role::Body).width(SEARCH_HINT) {
-            paint::text_clipped(
-                ctx,
+        if !layout.stack.is_empty() {
+            self.draw_stack(ctx, layout.stack, &minimized);
+        }
+
+        // Поиск: полем с подписью, пока места хватает, плиткой с лупой — когда
+        // док делит место со стопкой.
+        dock_button(&mut self.surface, ctx, layout.search);
+        let lens = ctx.px(15);
+        if layout.stack.is_empty() {
+            let icon_x = layout.search.x + ctx.px(12) as i32;
+            glyphicon::draw(
                 &mut self.surface,
-                Role::Body,
-                text_x,
-                paint::baseline(ctx, Role::Body, layout.search),
-                room,
-                SEARCH_HINT,
-                p.ink3,
+                Icon::Search,
+                icon_x,
+                layout.search.y + (layout.search.h as i32 - lens as i32) / 2,
+                lens,
+                p.ink4,
+                255,
             );
+            // Подпись — только если помещается целиком. Обрезанная до «По…»
+            // она ничего не сообщает, а лупа рядом говорит то же без слов.
+            let text_x = icon_x + (lens + ctx.px(7)) as i32;
+            let room =
+                layout.search.right().saturating_sub(text_x + ctx.px(12) as i32).max(0) as u32;
+            if room >= ctx.face(Role::Body).width(SEARCH_HINT) {
+                paint::text_clipped(
+                    ctx,
+                    &mut self.surface,
+                    Role::Body,
+                    text_x,
+                    paint::baseline(ctx, Role::Body, layout.search),
+                    room,
+                    SEARCH_HINT,
+                    p.ink4,
+                );
+            }
+        } else {
+            centered_icon(&mut self.surface, layout.search, Icon::Search, lens, p.ink4);
         }
 
         // Полоска жеста. Она лежит ниже плашки — там, где у этого экрана и так
         // ничего не помещается, — и служит меткой низа, а не кнопкой.
-        draw::rounded(
-            &mut self.surface,
-            layout.home,
-            layout.home.h / 2,
-            p.ink6,
-            160,
-        );
+        draw::rounded(&mut self.surface, layout.home, layout.home.h / 2, p.ink6, 160);
 
         self.dock = Some(layout);
         self.brand = layout.search;
         self.buttons = Buttons::new();
         self.tray = Tray::new();
+    }
+
+    /// Стопка свёрнутых окон (макет, экран 09): утопленное поле с кольцом
+    /// акцента, плитки программ внахлёст и счётчик в углу.
+    ///
+    /// Плитка несёт значок и цвет **своей** программы: стопка из одинаковых
+    /// синих квадратов говорила бы только «что-то свёрнуто», а по ней надо
+    /// узнать, что именно. Показывается не больше четырёх — пятая уже не
+    /// читается, для неё есть счётчик.
+    ///
+    /// Поворота плиток, как в макете, пока нет: он придёт вместе с анимацией
+    /// сворачивания, которой нужно то же умение.
+    fn draw_stack(&mut self, ctx: Ctx, stack: Rect, apps: &[App]) {
+        let p = ctx.palette;
+        let radius = ctx.px(16);
+        // Кольцо снаружи — мягкое, внутри — чёткое: поле выглядит местом, куда
+        // «сложены» окна, а не ещё одной кнопкой.
+        let glow = ctx.px(3);
+        let halo = Rect::new(
+            stack.x - glow as i32,
+            stack.y - glow as i32,
+            stack.w + glow * 2,
+            stack.h + glow * 2,
+        );
+        draw::rounded(&mut self.surface, halo, radius + glow, p.acctint.color, p.acctint.alpha);
+        draw::rounded(&mut self.surface, stack, radius, ctx.flat(p.sunk), 255);
+        draw::rounded_stroke(&mut self.surface, stack, radius, p.acc, 255);
+
+        let shown = &apps[apps.len().saturating_sub(4)..];
+        let tile = ctx.px(30);
+        let step = ctx.px(16);
+        let total = tile + step * shown.len().saturating_sub(1) as u32;
+        let base_x = stack.x + (stack.w as i32 - total as i32) / 2;
+        let y = stack.y + (stack.h as i32 - tile as i32) / 2;
+        let glyph = ctx.px(15);
+        for (index, app) in shown.iter().enumerate() {
+            let rect = Rect::new(base_x + (index as u32 * step) as i32, y, tile, tile);
+            let r = ctx.px(10);
+            let ink = match app.tone() {
+                Tone::Ok => {
+                    draw::rounded_gradient(&mut self.surface, rect, r, p.ok, p.ok2, 255);
+                    WHITE
+                }
+                Tone::Bad => {
+                    draw::rounded(&mut self.surface, rect, r, p.bad, 255);
+                    WHITE
+                }
+                Tone::Accent if index + 1 == shown.len() => {
+                    draw::rounded_gradient(&mut self.surface, rect, r, p.acc, p.acc2, 255);
+                    WHITE
+                }
+                _ => {
+                    // Подложка кнопки поверх утопленного поля — непрозрачной:
+                    // иначе сквозь плитку просвечивала бы соседняя под ней.
+                    draw::rounded(&mut self.surface, rect, r, ctx.flat(p.btn), 255);
+                    draw::rounded_stroke(&mut self.surface, rect, r, p.btnline.color, p.btnline.alpha);
+                    p.ink3
+                }
+            };
+            let icon = if *app == App::Terminal { Icon::Prompt } else { app.icon() };
+            centered_icon(&mut self.surface, rect, icon, glyph, ink);
+        }
+
+        // Счётчик — в углу поля, чуть за его краем, как в макете.
+        let count = alloc::format!("{}", apps.len());
+        let face = ctx.face(Role::Caption);
+        let badge_h = ctx.px(18);
+        let badge_w = (face.width(&count) + ctx.px(10)).max(badge_h);
+        let badge = Rect::new(
+            stack.right() + ctx.px(5) as i32 - badge_w as i32,
+            stack.y - ctx.px(5) as i32,
+            badge_w,
+            badge_h,
+        );
+        draw::rounded(&mut self.surface, badge, badge_h / 2, p.acc, 255);
+        paint::text(
+            ctx,
+            &mut self.surface,
+            Role::Caption,
+            badge.x + (badge_w as i32 - face.width(&count) as i32) / 2,
+            paint::baseline(ctx, Role::Caption, badge),
+            &count,
+            WHITE,
+        );
     }
 
     /// Забыть, что было нарисовано: следующий [`Panel::redraw`] нарисует заново.
@@ -627,7 +640,9 @@ impl Panel {
             if x >= dock.left.x && x < dock.left.right() {
                 return Some(PanelHit::Missing("phone"));
             }
-            if x >= dock.brand.x && x < dock.brand.right() {
+            if (x >= dock.brand.x && x < dock.brand.right())
+                || (x >= dock.brand_square.x && x < dock.brand_square.right())
+            {
                 return Some(PanelHit::Menu);
             }
             if !dock.stack.is_empty() && x >= dock.stack.x && x < dock.stack.right() {
@@ -899,74 +914,114 @@ struct PanelLayout {
 struct DockLayout {
     /// Кнопка слева: телефон.
     left: Rect,
-    /// Кнопка «Пуск»: широкая с подписью, пока нет свёрнутых окон, и плитка,
-    /// когда они появились.
+    /// «Пуск» широкий, с подписью. Пустой, когда он плиткой.
     brand: Rect,
+    /// Синяя плитка со значком внутри широкого «Пуска».
+    chip: Rect,
+    /// «Пуск» плиткой — когда док делит место со стопкой.
+    brand_square: Rect,
     /// Стопка свёрнутых окон. Пустой прямоугольник — сворачивать нечего.
     stack: Rect,
-    /// Поле поиска.
+    /// Поиск: полем или плиткой.
     search: Rect,
-    /// Плитка со значком внутри поля поиска.
-    chip: Rect,
     /// Кнопка справа: камера.
     right: Rect,
     /// Полоска жеста под доком.
     home: Rect,
 }
 
+/// Числа — из макета (экраны 01 и 09) в его точках; `ctx.px` переводит в наши.
 fn dock_layout(m: Metrics, plate: Rect, minimized: usize) -> DockLayout {
-    let side = m.btn_h;
-    let pad = (plate.h.saturating_sub(side)) / 2;
-    let y = plate.y + pad as i32;
-    let gap = m.ctx.px(10);
+    let ctx = m.ctx;
+    let side = ctx.px(48);
+    let y = plate.y + (plate.h as i32 - side as i32) / 2;
+    // Со стопкой в доке пятеро, и поля в макете уже: 12 и 8 вместо 14 и 10.
+    let (pad, gap) = if minimized == 0 { (ctx.px(14), ctx.px(10)) } else { (ctx.px(12), ctx.px(8)) };
 
     let left = Rect::new(plate.x + pad as i32, y, side, side);
     let right = Rect::new(plate.right() - (pad + side) as i32, y, side, side);
-    let mut search_x = left.right() + gap as i32;
-    let room = (right.x - gap as i32 - search_x).max(side as i32) as u32;
+    let start = left.right() + gap as i32;
+    let end = right.x - gap as i32;
 
-    // Пока свёрнутых окон нет, «Пуск» широкий и подписан именем системы, а
-    // поиск занимает остаток. Как только окна сворачиваются, между ними встаёт
-    // стопка, и «Пуск» ужимается до плитки: место на экране одно, и делить его
-    // приходится с тем, что появилось.
-    let (brand_w, stack) = if minimized == 0 {
-        (room * 2 / 5, Rect::EMPTY)
+    let (brand, chip, brand_square, stack, search) = if minimized == 0 {
+        // Ширина «Пуска» — от подписи: 4 слева, плитка 40, 9, подпись, 13.
+        let text = ctx.face(Role::Title).width(DOCK_BRAND);
+        let width = ctx.px(4 + 40 + 9 + 13) + text;
+        let brand = Rect::new(start, y, width, side);
+        let chip_side = ctx.px(40);
+        let chip = Rect::new(
+            brand.x + ctx.px(4) as i32,
+            y + (side as i32 - chip_side as i32) / 2,
+            chip_side,
+            chip_side,
+        );
+        let search_x = brand.right() + gap as i32;
+        let search = Rect::new(search_x, y, (end - search_x).max(side as i32) as u32, side);
+        (brand, chip, Rect::EMPTY, Rect::EMPTY, search)
     } else {
-        // Ширина стопки — по числу плиток в ней, а не постоянная: одно
-        // свёрнутое окно это одна плитка, и кнопка под три выглядела бы
-        // полупустой. Больше трёх не показываем — четвёртая уже не читается.
-        let tiles = minimized.min(3) as u32;
-        let stack_w = m.ctx.px(20) + m.ctx.px(11) * tiles.saturating_sub(1) + m.ctx.px(20);
-        let brand = side;
-        let stack = Rect::new(search_x + brand as i32 + gap as i32, y, stack_w, side);
-        (brand, stack)
+        let brand_square = Rect::new(start, y, side, side);
+        let search = Rect::new(end - side as i32, y, side, side);
+        let stack_x = brand_square.right() + gap as i32;
+        let stack_w = (search.x - gap as i32 - stack_x).max(ctx.px(92) as i32) as u32;
+        let stack = Rect::new(stack_x, y, stack_w, side);
+        (Rect::EMPTY, Rect::EMPTY, brand_square, stack, search)
     };
-    let brand = Rect::new(search_x, y, brand_w, side);
-    search_x = brand.right() + gap as i32;
-    if !stack.is_empty() {
-        search_x = stack.right() + gap as i32;
-    }
-    let search_w = (right.x - gap as i32 - search_x).max(m.ctx.px(40) as i32) as u32;
-    let search = Rect::new(search_x, y, search_w, side);
-
-    // Плитка внутри поля — на четыре точки меньше него со всех сторон: в
-    // макете она вложена с полем, а не вписана в край.
-    let inner = m.ctx.px(4);
-    let chip_side = side.saturating_sub(inner * 2);
-    let chip = Rect::new(search.x + inner as i32, search.y + inner as i32, chip_side, chip_side);
 
     // Полоска жеста лежит **под** доком, у самого низа экрана: это метка
     // системы, а не элемент дока, и внутри плашки она читалась бы кнопкой.
-    let home_w = m.ctx.px(theme::M_HOME_W);
-    let home_h = m.ctx.px(theme::M_HOME_H);
+    let home_w = ctx.px(theme::M_HOME_W);
+    let home_h = ctx.px(theme::M_HOME_H);
+    let below = ctx.px(theme::M_INSET);
     let home = Rect::new(
         plate.x + (plate.w as i32 - home_w as i32) / 2,
-        plate.bottom() + ((pad as i32 - home_h as i32) / 2).max(0),
+        plate.bottom() + ((below as i32 - home_h as i32) / 2).max(0),
         home_w,
         home_h,
     );
 
-    DockLayout { left, brand, stack, search, chip, right, home }
+    DockLayout { left, brand, chip, brand_square, stack, search, right, home }
+}
+
+/// Подложка кнопки дока: стекло кнопки и её контур — у всех кнопок одно.
+fn dock_button(surface: &mut Surface, ctx: Ctx, rect: Rect) {
+    let p = ctx.palette;
+    let radius = ctx.px(16);
+    draw::rounded(surface, rect, radius, p.btn.color, p.btn.alpha);
+    draw::rounded_stroke(surface, rect, radius, p.btnline.color, p.btnline.alpha);
+}
+
+/// Значок по центру прямоугольника.
+fn centered_icon(surface: &mut Surface, rect: Rect, icon: Icon, size: u32, color: Color) {
+    glyphicon::draw(
+        surface,
+        icon,
+        rect.x + (rect.w as i32 - size as i32) / 2,
+        rect.y + (rect.h as i32 - size as i32) / 2,
+        size,
+        color,
+        255,
+    );
+}
+
+/// Значок «Пуска» — четыре **залитые** плитки, как в макете, а не контур
+/// [`Icon::Grid`]: на синей кнопке контур в полторы точки теряется.
+fn draw_grid(surface: &mut Surface, area: Rect, size: u32, color: Color) {
+    let cell = size * 5 / 16;
+    let gap = size * 2 / 16;
+    let x0 = area.x + (area.w as i32 - size as i32) / 2 + (size * 2 / 16) as i32;
+    let y0 = area.y + (area.h as i32 - size as i32) / 2 + (size * 2 / 16) as i32;
+    let radius = (size * 12 / 160).max(1);
+    for row in 0..2u32 {
+        for col in 0..2u32 {
+            let rect = Rect::new(
+                x0 + (col * (cell + gap)) as i32,
+                y0 + (row * (cell + gap)) as i32,
+                cell,
+                cell,
+            );
+            draw::rounded(surface, rect, radius, color, 255);
+        }
+    }
 }
 
 fn panel_layout(m: Metrics, plate: Rect, windows: &[Entry], status_w: u32) -> PanelLayout {
