@@ -763,6 +763,20 @@ pub fn note_dock_band() {
     DOCK_BANDS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Во что обошёлся док в этой полосе.
+static DOCK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Записать время дока.
+pub fn note_dock_ns(ns: u64) {
+    DOCK_NS.fetch_add(ns, Ordering::Relaxed);
+}
+
+/// Наносекунды, ушедшие на док.
+#[must_use]
+pub fn dock_ns() -> u64 {
+    DOCK_NS.load(Ordering::Relaxed)
+}
+
 /// Сколько раз док копировался в полосу.
 #[must_use]
 pub fn dock_bands() -> u64 {

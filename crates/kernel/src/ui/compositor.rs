@@ -1332,8 +1332,14 @@ impl Compositor {
             // `top` растёт и при тапе в верх экрана, где дока нет вовсе.
             if !panel.rect.intersect(&band).is_empty() {
                 super::note_dock_band();
+                let t0 = crate::time::uptime_ns();
                 self.drop_shadow(back, panel.rect, band, dy, radius);
                 self.stack(back, panel.surface(), panel.rect, band, dy, radius);
+                // Док считается отдельно от прочих верхних слоёв: он попадает
+                // в девять-двенадцать полос, а `top` стоит восемь миллисекунд,
+                // и одно с другим не сходится. Пока время не разведено, любое
+                // объяснение — догадка.
+                super::note_dock_ns(crate::time::uptime_ns().wrapping_sub(t0));
             }
         }
         if let Some(menu) = self.menu.as_ref() {
