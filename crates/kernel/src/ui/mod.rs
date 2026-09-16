@@ -1401,15 +1401,9 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 }
             }
             Hit::Title => {
-                // Захват заголовка на телефоне не начинается вовсе: тащить
-                // окно во весь экран некуда (см. [`Compositor::drag_by`]).
-                // Проверка здесь, а не только там, чтобы в журнале не стояло
-                // «drag», за которым ничего не происходит.
-                if !theme::is_mobile() {
-                    desktop.set_drag(app);
-                    if let Some(app) = app {
-                        kprintln!("  desktop     : drag '{}'", name_of(desktop, app));
-                    }
+                desktop.set_drag(app);
+                if let Some(app) = app {
+                    kprintln!("  desktop     : drag '{}'", name_of(desktop, app));
                 }
             }
             // Щелчок по содержимому: его разбирает само содержимое — в

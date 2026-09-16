@@ -510,8 +510,11 @@ impl Panel {
                 p.btnline.color,
                 p.btnline.alpha,
             );
-            let tile = ctx.px(22);
-            let step = ctx.px(6);
+            // Плитка мельче кнопки, а шаг — почти в половину плитки: из-под
+            // верхней должен выглядывать не край в две точки, а узнаваемый
+            // кусок соседней.
+            let tile = ctx.px(20);
+            let step = ctx.px(11);
             let count = minimized.min(3);
             let total = tile + step * (count.saturating_sub(1)) as u32;
             let base_x = layout.stack.x + (layout.stack.w as i32 - total as i32) / 2;
@@ -562,17 +565,22 @@ impl Panel {
             p.ink3,
             255,
         );
+        // Подпись — только если помещается целиком. Обрезанная до «По…» она
+        // ничего не сообщает, а лупа рядом говорит то же самое и без слов.
         let text_x = icon_x + search_icon as i32 + m.gap as i32;
-        paint::text_clipped(
-            ctx,
-            &mut self.surface,
-            Role::Body,
-            text_x,
-            paint::baseline(ctx, Role::Body, layout.search),
-            layout.search.right().saturating_sub(text_x).max(0) as u32,
-            SEARCH_HINT,
-            p.ink3,
-        );
+        let room = layout.search.right().saturating_sub(text_x + m.gap as i32).max(0) as u32;
+        if room >= ctx.face(Role::Body).width(SEARCH_HINT) {
+            paint::text_clipped(
+                ctx,
+                &mut self.surface,
+                Role::Body,
+                text_x,
+                paint::baseline(ctx, Role::Body, layout.search),
+                room,
+                SEARCH_HINT,
+                p.ink3,
+            );
+        }
 
         // Полоска жеста. Она лежит ниже плашки — там, где у этого экрана и так
         // ничего не помещается, — и служит меткой низа, а не кнопкой.
@@ -924,7 +932,11 @@ fn dock_layout(m: Metrics, plate: Rect, minimized: usize) -> DockLayout {
     let (brand_w, stack) = if minimized == 0 {
         (room * 2 / 5, Rect::EMPTY)
     } else {
-        let stack_w = side + m.ctx.px(18);
+        // Ширина стопки — по числу плиток в ней, а не постоянная: одно
+        // свёрнутое окно это одна плитка, и кнопка под три выглядела бы
+        // полупустой. Больше трёх не показываем — четвёртая уже не читается.
+        let tiles = minimized.min(3) as u32;
+        let stack_w = m.ctx.px(20) + m.ctx.px(11) * tiles.saturating_sub(1) + m.ctx.px(20);
         let brand = side;
         let stack = Rect::new(search_x + brand as i32 + gap as i32, y, stack_w, side);
         (brand, stack)
