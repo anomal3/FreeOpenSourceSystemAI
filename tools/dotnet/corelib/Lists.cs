@@ -17,6 +17,12 @@ namespace System.Collections
     {
         int Count { get; }
 
+        // Фаза N10: чужой код реализует оба члена явно
+        // (`object ICollection.SyncRoot`), и без них в интерфейсе не собирается.
+        object SyncRoot { get; }
+
+        bool IsSynchronized { get; }
+
         void CopyTo(Array array, int index);
     }
 
@@ -398,6 +404,10 @@ namespace System.Windows.Forms
         {
             private readonly ListBox owner;
 
+            object Collections.ICollection.SyncRoot => this;
+
+            bool Collections.ICollection.IsSynchronized => false;
+
             public ObjectCollection(ListBox owner)
             {
                 this.owner = owner;
@@ -717,6 +727,10 @@ namespace System.Windows.Forms
         public class ObjectCollection : Collections.IList
         {
             private readonly ComboBox owner;
+
+            object Collections.ICollection.SyncRoot => this;
+
+            bool Collections.ICollection.IsSynchronized => false;
 
             public ObjectCollection(ComboBox owner)
             {

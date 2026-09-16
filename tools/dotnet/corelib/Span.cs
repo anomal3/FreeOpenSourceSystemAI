@@ -46,6 +46,20 @@ namespace System
             return array[start + index];
         }
 
+        // Фаза N10: `nodes[i].Element` в PriorityQueue читает поле элемента
+        // прямо по ссылке, без копии всей пары.
+        public ref readonly T this[int index]
+        {
+            get
+            {
+                if ((uint)index >= (uint)length)
+                {
+                    throw new IndexOutOfRangeException();
+                }
+                return ref array[start + index];
+            }
+        }
+
         public T[] ToArray()
         {
             T[] copy = new T[length];
@@ -61,6 +75,8 @@ namespace System
 
     public static class MemoryExtensions
     {
+        public static Span<T> AsSpan<T>(this T[] array, int start, int length) => new Span<T>(array, start, length);
+
         public static bool Contains<T>(this ReadOnlySpan<T> span, T value) where T : IEquatable<T> => IndexOf(span, value) >= 0;
 
         public static int IndexOf<T>(this ReadOnlySpan<T> span, T value) where T : IEquatable<T>

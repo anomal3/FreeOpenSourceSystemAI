@@ -30,8 +30,12 @@
     <!-- Без mscorlib компилятору не у кого узнать версию метаданных. -->
     <RuntimeMetadataVersion>v4.0.30319</RuntimeMetadataVersion>
     <!-- CS0660/CS0661: String определяет == без полного набора, как и в .NET.
-         CS1718: `d != d` — это и есть проверка на NaN. -->
-    <NoWarn>$(NoWarn);CS0660;CS0661;CS1718</NoWarn>
+         CS1718: `d != d` — это и есть проверка на NaN.
+         CS8632: файлы из dotnet/runtime (FromDotnet/, фаза N10) несут пометки
+         `?` у ссылочных типов — там проект собирается с Nullable enable. Здесь
+         пометки выключены, и файл не правится ради тишины: его заменяют
+         копированием новой версии. -->
+    <NoWarn>$(NoWarn);CS0660;CS0661;CS1718;CS8632</NoWarn>
   </PropertyGroup>
 
 </Project>

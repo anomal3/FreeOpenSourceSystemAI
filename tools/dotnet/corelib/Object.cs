@@ -372,6 +372,34 @@ namespace System
 
         public static T[] Empty<T>() => new T[0];
 
+        // Фаза N10: члены, которыми пользуется PriorityQueue из dotnet/runtime.
+        // Число то же, что у .NET: очередь сравнивает с ним свою ёмкость, и
+        // другое значение поменяло бы, где рост упирается в предел.
+        public static int MaxLength => 0x7FFFFFC7;
+
+        // Многомерных массивов среда не знает вовсе (loader.rs отказывает на
+        // загрузке типа), так что любой массив здесь одномерный с нуля.
+        public int Rank => 1;
+
+        public int GetLowerBound(int dimension)
+        {
+            if (dimension != 0)
+            {
+                throw new IndexOutOfRangeException();
+            }
+            return 0;
+        }
+
+        // Необобщённое копирование и очистка: тип элемента известен только
+        // среде, поэтому тело в Rust (natives.rs). Копирование между массивами
+        // разных типов элементов — ArrayTypeMismatchException, даже там, где
+        // .NET упаковал бы значения в object[]; программам это пока не нужно.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern void Copy(Array sourceArray, int sourceIndex, Array destinationArray, int destinationIndex, int length);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern void Clear(Array array, int index, int length);
+
         public static void Resize<T>(ref T[] array, int newSize)
         {
             T[] resized = new T[newSize];

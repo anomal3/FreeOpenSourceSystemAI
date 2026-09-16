@@ -117,6 +117,14 @@ namespace System
             : base(message, paramName)
         {
         }
+
+        public static void ThrowIfNull(object argument, [Runtime.CompilerServices.CallerArgumentExpression("argument")] string paramName = null)
+        {
+            if (argument == null)
+            {
+                throw new ArgumentNullException(paramName);
+            }
+        }
     }
 
     public class ArgumentOutOfRangeException : ArgumentException
@@ -134,6 +142,38 @@ namespace System
         public ArgumentOutOfRangeException(string paramName, string message)
             : base(message, paramName)
         {
+        }
+
+        public ArgumentOutOfRangeException(string paramName, object actualValue, string message)
+            : base(message, paramName)
+        {
+            ActualValue = actualValue;
+        }
+
+        public virtual object ActualValue { get; }
+
+        // Как у .NET: значение идёт второй строкой после « (Parameter '…')».
+        public override string Message
+        {
+            get
+            {
+                string text = base.Message;
+                if (ActualValue == null)
+                {
+                    return text;
+                }
+                return text + Environment.NewLine + "Actual value was " + ActualValue.ToString() + ".";
+            }
+        }
+
+        // У .NET это обобщённый `ThrowIfNegative<T>` над INumberBase<T>; обобщённой
+        // арифметики у своей corelib нет, а очереди хватает `int`.
+        public static void ThrowIfNegative(int value, [Runtime.CompilerServices.CallerArgumentExpression("value")] string paramName = null)
+        {
+            if (value < 0)
+            {
+                throw new ArgumentOutOfRangeException(paramName, value, paramName + " ('" + value.ToString() + "') must be a non-negative value.");
+            }
         }
     }
 

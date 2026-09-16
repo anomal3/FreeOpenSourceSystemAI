@@ -57,6 +57,9 @@ pub(crate) enum Native {
     DelegateCombine,
     DelegateRemove,
     TypeFromHandle,
+    TypeIsValueType,
+    ArrayCopy,
+    ArrayClear,
     I32CompareTo,
     I64CompareTo,
     StringCompareTo,
@@ -216,6 +219,10 @@ const TABLE: &[(&str, Native)] = &[
     ("System.Delegate::Combine(System.Delegate,System.Delegate)", Native::DelegateCombine),
     ("System.Delegate::Remove(System.Delegate,System.Delegate)", Native::DelegateRemove),
     ("System.Type::GetTypeFromHandle(System.RuntimeTypeHandle)", Native::TypeFromHandle),
+    // Фаза N10: то, чего не хватило PriorityQueue из dotnet/runtime.
+    ("System.Type::get_IsValueType()", Native::TypeIsValueType),
+    ("System.Array::Copy(System.Array,int32,System.Array,int32,int32)", Native::ArrayCopy),
+    ("System.Array::Clear(System.Array,int32,int32)", Native::ArrayClear),
     ("System.Int32::CompareTo(int32)", Native::I32CompareTo),
     ("System.Int64::CompareTo(int64)", Native::I64CompareTo),
     ("System.String::CompareTo(string)", Native::StringCompareTo),
@@ -502,6 +509,20 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
         Native::DelegateCombine => Some(vm.combine_delegates(arg(0)?, arg(1)?)?),
         Native::DelegateRemove => Some(vm.remove_delegate(arg(0)?, arg(1)?)?),
         Native::TypeFromHandle => Some(arg(0)?),
+        Native::TypeIsValueType => {
+            let ty = vm.runtime_type(arg(0)?)?;
+            Some(Value::I32(i32::from(vm.types[ty.0 as usize].is_value_type())))
+        }
+        Native::ArrayCopy => {
+            let (source_index, destination_index, length) = (vm.int32(arg(1)?)?, vm.int32(arg(3)?)?, vm.int32(arg(4)?)?);
+            vm.copy_elements(arg(0)?, source_index, arg(2)?, destination_index, length)?;
+            None
+        }
+        Native::ArrayClear => {
+            let (index, length) = (vm.int32(arg(1)?)?, vm.int32(arg(2)?)?);
+            vm.clear_elements(arg(0)?, index, length)?;
+            None
+        }
         Native::I32CompareTo => {
             let order = vm.int32(number(vm)?)?.cmp(&vm.int32(arg(1)?)?);
             Some(Value::I32(order as i32))

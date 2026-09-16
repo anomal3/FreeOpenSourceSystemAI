@@ -3555,6 +3555,26 @@ pub const ALL: &[Scenario] = &[
             Step::Await("time: done", 60_000),
             Step::Await("dotnet: time.dll: Environment.Exit(21)", 60_000),
             Step::Await("freeos> ", 15_000),
+            // Фаза N10: PriorityQueue — файл dotnet/runtime в corelib без правки.
+            // Раскладка кучи (`heap`) и порядок равных приоритетов (`ties`)
+            // совпадают с dotnet только при том же алгоритме; `copied` и
+            // `cleared` идут через Array.Copy и Array.Clear среды, `negative` —
+            // через сообщение в две строки, склеенное образцом.
+            Step::Line("dotnet /usr/share/dotnet/samples/pqueue.dll"),
+            Step::Await("pqueue: start", 60_000),
+            Step::Await("heap g:0 b:2 d:4 a:1 c:3 f:6 e:5 count 7 capacity 7", 60_000),
+            Step::Await("ties red:3 gray:4 gold:4 pink:4 cyan:4 blue:4 green:5", 60_000),
+            Step::Await("max high top huge peek mid:5 rest mid:5 low:1 tiny:0", 60_000),
+            Step::Await("jobs removed True y:7 missing False layout urgent:1 later:8 z:7 x:7", 60_000),
+            Step::Await("copied (, 0) (r, 1) (q, 3) (s, 2)", 60_000),
+            Step::Await("copy: Target array type is not compatible", 60_000),
+            Step::Await("cleared 0 capacity 3", 60_000),
+            Step::Await("negative: initialCapacity | initialCapacity ('-1') must be a non-negative value.", 60_000),
+            Step::Await("modified: Collection was modified after the enumerator was instantiated.", 60_000),
+            Step::Await("dijkstra A=0 B=7 C=9 F=11 E=20 D=20", 60_000),
+            Step::Await("pqueue: done", 60_000),
+            Step::Await("dotnet: pqueue.dll: Main returned 20", 60_000),
+            Step::Await("freeos> ", 15_000),
             // Фаза N6a: окно WinForms. Форма открывается окном программы,
             // рисует себя в Paint, получает щелчок мышью в своих координатах и
             // закрывается крестиком стола — FormClosing и FormClosed с причиной

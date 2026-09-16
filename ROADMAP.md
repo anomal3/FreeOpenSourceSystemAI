@@ -3868,6 +3868,54 @@ GPLv2 в проект GPLv3 не переносится.
 `corelib`, и записать, во что это обошлось. По результату решать об остальных.
 Записано по слову Романа 2026-09-17. **M на первую пробу, дальше по итогу.**
 
+Первая проба — сделано (2026-09-16):
+
+- **Взят `PriorityQueue<TElement, TPriority>`** с его отладочным видом —
+  `src/libraries/System.Collections/src/System/Collections/Generic/PriorityQueue.cs`
+  и `PriorityQueueDebugView.cs`, коммит dotnet/runtime `bb31474e`, 1103 строки.
+  Файлы лежат в `tools/dotnet/corelib/FromDotnet/` байт в байт (только концы
+  строк LF) рядом с `LICENSE.TXT` dotnet/runtime. Кодировки, названные выше
+  примером, первой пробой быть не могли: все шесть классов кодировок
+  (`ASCIIEncoding`, `Latin1Encoding`, `UTF7/8/32Encoding`, `UnicodeEncoding`) и
+  сам `Encoding` написаны на `char*`/`byte*` — от 21 до 43 мест с указателями на
+  файл, а их помощники (`Ascii.Utility`, `Latin1Utility`) ещё и на `Vector128`.
+  У интерпретатора указатель — это место (переменная, элемент, поле), а не
+  адрес: ни сложения с указателем, ни `fixed`, ни `localloc`. Это
+  несовместимость устройства, а не лицензии, ровно того рода, что названа выше.
+- **Правило пробы: чужой файл не правится.** Всё, чего ему не хватило, дописано
+  к своей corelib, и цена видна отдельно (`DotnetSupport.cs`, 305 строк с
+  комментариями):
+  типы, без которых текст не собирается, — `ValueTuple<T1, T2>`,
+  `TupleElementNamesAttribute`, `InAttribute` (у `ref readonly`), `Span<T>` и
+  индексатор `ReadOnlySpan<T>`, атрибуты отладчика и `MaybeNullWhen`,
+  `ICollection.SyncRoot`/`IsSynchronized`; внутренние помощники
+  System.Collections, написанные заново, — `SR` (тексты из их `Strings.resx`),
+  `ThrowHelper`, `EnumerableHelpers`; члены .NET, которых не было, —
+  `ArgumentNullException.ThrowIfNull`, `ArgumentOutOfRangeException.ThrowIfNegative`
+  (у .NET он обобщённый над `INumberBase<T>`, здесь `int`),
+  `Array.MaxLength/Rank/GetLowerBound`, `RuntimeHelpers.IsReferenceOrContainsReferences`
+  (всегда `true`: лишнее обнуление безвредно). В Rust — три члена среды:
+  `Type.IsValueType`, необобщённые `Array.Copy` и `Array.Clear` (разные типы
+  элементов — `ArrayTypeMismatchException`, упаковки в `object[]` нет).
+  Внутренних вызовов (`InternalCall`) чужой файл не имеет вовсе.
+- **Образец `pqueue`** совпал с dotnet с первого запуска: 19 строк, код 20 —
+  раскладка четверичной кучи, порядок равных приоритетов, свой сравнитель,
+  `Remove` из середины, рост ёмкости, `CopyTo` в массив пар и в массив не того
+  типа, тексты пяти исключений, проверка версии перечислителя и Дейкстра.
+  corelib выросла на 14.8 КиБ (262656 → 277504 байт). На FreeOS стенд
+  (`dotnet`, обе архитектуры) ждёт те же строки: 36563 инструкции, 1836 объектов.
+
+**Итог и что дальше.** Управляемый код без указателей переносится дёшево:
+на 1103 строки чужого текста — 305 строк опор и 90 строк Rust, и почти вся
+цена разовая (кортежи, срезы, атрибуты понадобятся каждому следующему файлу).
+Продолжать стоит там же: `System.Collections` (`LinkedList`, `SortedSet`,
+`SortedDictionary`, `SortedList` — ни одного `unsafe`), затем заменить
+написанные руками `Stack<T>` и `Queue<T>` их файлами. Кодировки, `Rune`,
+форматирование чисел и `StringBuilder` из CoreLib — только после отдельной
+фазы указателей в интерпретаторе (или не брать вовсе): там не файл, а модель
+памяти. Regex и LINQ из dotnet/runtime тянут `Span<T>` с настоящей семантикой
+`ref struct`, `SearchValues` и векторизацию — оценивать отдельно.
+
 **Размер вехи.** XL, несколько месяцев. Первый видимый результат — фаза N2.
 
 ---

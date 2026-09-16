@@ -377,6 +377,78 @@ impl<'a, H: Host> Vm<'a, H> {
         }
     }
 
+    /// Массив и его тип по ссылке из аргумента библиотечного члена: `null` —
+    /// `ArgumentNullException`, как у `Array.Copy` и `Array.Clear` в .NET.
+    fn array_argument(&self, value: Value) -> Result<(ObjRef, TypeId, usize), VmError> {
+        match value {
+            Value::Obj(Some(reference)) => match self.heap.get(reference) {
+                Some(Object::Array { ty, items }) => Ok((reference, *ty, items.len())),
+                _ => Err(self.invalid("array argument that is not an array")),
+            },
+            Value::Obj(None) => Err(self.exception("System.ArgumentNullException")),
+            _ => Err(self.invalid("array argument that is not a reference")),
+        }
+    }
+
+    /// `Array.Copy(Array, int, Array, int, int)` (фаза N10).
+    ///
+    /// Поэлементно через места, а не копией вектора: элемент-структура — это
+    /// объект с одним владельцем (`value.rs`), и перенос номера объекта сделал
+    /// бы две ячейки владельцами одних полей — запись в одну меняла бы другую.
+    /// Перекрытие внутри одного массива идёт с конца, как `memmove`: иначе
+    /// сдвиг вправо размножил бы первый элемент.
+    pub(crate) fn copy_elements(
+        &mut self,
+        source: Value,
+        source_index: i32,
+        destination: Value,
+        destination_index: i32,
+        length: i32,
+    ) -> Result<(), VmError> {
+        let (source, source_ty, source_len) = self.array_argument(source)?;
+        let (destination, destination_ty, destination_len) = self.array_argument(destination)?;
+        if source_index < 0 || destination_index < 0 || length < 0 {
+            return Err(self.exception("System.ArgumentOutOfRangeException"));
+        }
+        let (from, to, count) = (source_index as usize, destination_index as usize, length as usize);
+        if from + count > source_len || to + count > destination_len {
+            return Err(self.exception("System.ArgumentException"));
+        }
+        // Разные типы элементов .NET иногда допускает (упаковка в object[],
+        // ссылки на базовый класс). Среде это пока не нужно, а молча записать
+        // значение не того вида в компактный массив примитивов нельзя.
+        if source_ty != destination_ty {
+            return Err(self.exception("System.ArrayTypeMismatchException"));
+        }
+        let backwards = source == destination && to > from;
+        for step in 0..count {
+            let offset = if backwards { count - 1 - step } else { step };
+            let value = self.load(Pointer::Element { array: source, index: (from + offset) as u32 })?;
+            let value = self.copy_out(value)?;
+            self.store(Pointer::Element { array: destination, index: (to + offset) as u32 }, value)?;
+        }
+        Ok(())
+    }
+
+    /// `Array.Clear(Array, int, int)` (фаза N10): нулевое значение типа
+    /// элемента в каждую ячейку. Выход за массив — `IndexOutOfRangeException`,
+    /// как у .NET.
+    pub(crate) fn clear_elements(&mut self, array: Value, index: i32, length: i32) -> Result<(), VmError> {
+        let (array, ty, len) = self.array_argument(array)?;
+        if index < 0 || length < 0 || index as usize + length as usize > len {
+            return Err(self.exception("System.IndexOutOfRangeException"));
+        }
+        let crate::types::Kind::Array(element) = self.types[ty.0 as usize].kind else {
+            return Err(self.invalid("array without an element type"));
+        };
+        let store = self.types[element.0 as usize].store(element);
+        for offset in 0..length as usize {
+            let zero = self.zero(store)?;
+            self.store(Pointer::Element { array, index: (index as usize + offset) as u32 }, zero)?;
+        }
+        Ok(())
+    }
+
     // --------------------------------------------------------------------
     // Для членов библиотеки
     // --------------------------------------------------------------------

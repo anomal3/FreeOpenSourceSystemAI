@@ -31,6 +31,14 @@ namespace System
 
         public override string ToString() => FullName;
 
+        // Фаза N10: PriorityQueue выбирает путь сравнения по
+        // `typeof(TPriority).IsValueType`. Ответ знает только среда (types.rs).
+        public extern bool IsValueType
+        {
+            [MethodImpl(MethodImplOptions.InternalCall)]
+            get;
+        }
+
         // `typeof(T)` — это `ldtoken` и этот вызов. Среда кладёт на стек сразу
         // объект типа, так что отдать его — всё, что остаётся.
         [MethodImpl(MethodImplOptions.InternalCall)]
@@ -66,6 +74,12 @@ namespace System.Runtime.CompilerServices
 
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern int GetHashCode(object o);
+
+        // У .NET это подсказка JIT: «стоит ли обнулять освободившиеся ячейки,
+        // чтобы сборщик не держал ссылки». Ответ `true` всегда верен — лишнее
+        // обнуление чисел ничего не ломает, а `false` там, где ссылки есть,
+        // оставил бы мусор живым. Точный ответ сэкономил бы копейки.
+        public static bool IsReferenceOrContainsReferences<T>() => true;
     }
 
     public enum MethodImplOptions

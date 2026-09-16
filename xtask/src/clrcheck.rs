@@ -35,8 +35,8 @@ use clr_meta::{Assembly, Coded, Token};
 ///
 /// `features` нужен ради таблиц метаданных, а не запуска: в нём P/Invoke,
 /// которого у среды ещё нет.
-const SAMPLES: [(&str, bool); 24] =
-    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("floats", true), ("enums", true), ("linq", true), ("files", true), ("time", true), ("form", true), ("winforms", true), ("controls", true), ("lists", true), ("dialogs", true), ("layout", true), ("choices", true), ("tabs", true), ("numbers", true), ("keys", true), ("features", false)];
+const SAMPLES: [(&str, bool); 25] =
+    [("hello", true), ("arith", true), ("objects", true), ("exceptions", true), ("generics", true), ("gc", true), ("text", true), ("collections", true), ("floats", true), ("enums", true), ("linq", true), ("files", true), ("time", true), ("form", true), ("winforms", true), ("controls", true), ("lists", true), ("dialogs", true), ("layout", true), ("choices", true), ("tabs", true), ("numbers", true), ("keys", true), ("pqueue", true), ("features", false)];
 
 /// Аргументы командной строки образца. `time` печатает их и
 /// `Environment.GetCommandLineArgs()` (фаза N5b); кириллица проверяет, что

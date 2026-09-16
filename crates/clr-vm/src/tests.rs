@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -897,4 +897,64 @@ fn keys_print_what_winforms_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, KEYS_OUTPUT);
     assert_eq!(code, 0);
+}
+
+/// Образец `tools/dotnet/samples/pqueue` (фаза N10): `PriorityQueue` из
+/// dotnet/runtime, внесённая в corelib без правки.
+const PQUEUE: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/pqueue.dll");
+
+/// Что печатает `dotnet pqueue.dll` (записано 2026-09-16, .NET 10, LF,
+/// инвариантная глобализация). Строки `heap`, `stream`, `ties` и `jobs` —
+/// раскладка четверичной кучи и порядок при равных приоритетах: их не
+/// угадать, их можно только повторить тем же алгоритмом. `copied (, 0)` —
+/// нулевой элемент массива пар, который CopyTo не трогал.
+const PQUEUE_OUTPUT: &str = concat!(
+    "pqueue: start
+",
+    "heap g:0 b:2 d:4 a:1 c:3 f:6 e:5 count 7 capacity 7
+",
+    "peek g default True
+",
+    "drain g:0 a:1 b:2 c:3 d:4 e:5 f:6
+",
+    "stream capacity 8 layout one:1 five:5 four:4 two:2 three:3
+",
+    "ties red:3 gray:4 gold:4 pink:4 cyan:4 blue:4 green:5
+",
+    "max high top huge peek mid:5 rest mid:5 low:1 tiny:0
+",
+    "jobs removed True y:7 missing False layout urgent:1 later:8 z:7 x:7
+",
+    "capacity 20 trimmed 4 count 4
+",
+    "names 1:apple 2:banana 3:cherry
+",
+    "copied (, 0) (r, 1) (q, 3) (s, 2)
+",
+    "copy: Target array type is not compatible with the type of items in the collection. (Parameter 'array')
+",
+    "cleared 0 capacity 3
+",
+    "empty: Queue empty.
+",
+    "negative: initialCapacity | initialCapacity ('-1') must be a non-negative value. (Parameter 'initialCapacity') / Actual value was -1.
+",
+    "null: Value cannot be null. (Parameter 'items')
+",
+    "modified: Collection was modified after the enumerator was instantiated.
+",
+    "dijkstra A=0 B=7 C=9 F=11 E=20 D=20
+",
+    "pqueue: done
+",
+);
+
+#[test]
+fn pqueue_prints_what_dotnet_prints() {
+    let (result, output) = run(PQUEUE);
+    let code = result.unwrap_or_else(|error| panic!("{error}
+printed so far:
+{output}"));
+    assert_eq!(output, PQUEUE_OUTPUT);
+    assert_eq!(code, 20);
 }
