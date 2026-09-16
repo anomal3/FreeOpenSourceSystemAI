@@ -1,7 +1,7 @@
 //! Подготовка ESP и запуск QEMU.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -302,8 +302,25 @@ pub fn prepare_esp(built: &Built, unattended: bool) -> Result<PathBuf> {
         std::fs::remove_file(&display)
             .with_context(|| format!("не удалось удалить {}", display.display()))?;
     }
+    // Экран, заказанный на время прогона: `FREEOS_SCREEN=720x1600` даёт
+    // мобильный вид стола в эмуляторе — ядро ставит режим само, если прошивка
+    // такого не предлагает (`main.rs::requested_framebuffer`).
+    if let Ok(mode) = std::env::var("FREEOS_SCREEN") {
+        request_screen(&esp, mode.trim())?;
+    }
 
     Ok(esp)
+}
+
+/// Положить на ESP просьбу о разрешении экрана — то же, что пишет ядро по
+/// выбору в «Параметрах».
+pub fn request_screen(esp: &Path, mode: &str) -> Result<()> {
+    let dir = esp.join("FREEOS");
+    std::fs::create_dir_all(&dir).with_context(|| format!("не удалось создать {}", dir.display()))?;
+    let file = dir.join("DISPLAY.CFG");
+    std::fs::write(&file, format!("{mode}
+"))
+        .with_context(|| format!("не удалось записать {}", file.display()))
 }
 
 /// Аргумент `file=` для носителя.

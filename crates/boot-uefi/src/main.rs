@@ -105,7 +105,12 @@ fn main() -> Status {
         menu::pause();
         graphics::Policy::Keep
     } else {
-        graphics::Policy::Choose(graphics::requested_mode())
+        let requested = graphics::requested_mode();
+        if let Some((width, height)) = requested {
+            info.requested_width = width as u32;
+            info.requested_height = height as u32;
+        }
+        graphics::Policy::Choose(requested)
     };
     info.framebuffer = graphics::probe_framebuffer(policy);
     info.acpi_rsdp = find_acpi_rsdp();

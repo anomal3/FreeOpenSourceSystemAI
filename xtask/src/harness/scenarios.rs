@@ -473,6 +473,19 @@ impl Scenario {
 /// добавляется время на разметку носителя.
 const BOOT: u64 = 120_000;
 
+/// Экран, в котором идёт сценарий, если не тот, что даёт прошивка.
+///
+/// Функцией, а не полем [`Scenario`]: поле пришлось бы вписать в каждый из
+/// восьми десятков сценариев ради одного.
+#[must_use]
+pub fn screen_for(name: &str) -> Option<&'static str> {
+    match name {
+        // Экран телефона: форма машины и масштаб стола считаются от него.
+        "mobile" => Some("720x1600"),
+        _ => None,
+    }
+}
+
 /// Шаги сценариев о нескольких процессорах — общие для GICv2 и GICv3.
 ///
 /// # Что именно доказывает одновременность
@@ -817,6 +830,34 @@ pub const ALL: &[Scenario] = &[
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "mobile",
+        about: "Мобильный вид стола на экране телефона 720x1600: снимки для сверки с макетом.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: true,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("display     : 720x1600 set at start", BOOT),
+            Step::Await("freeos> ", BOOT),
+            Step::Wait(1500),
+            Step::Shot("01-home"),
         ],
     },
     Scenario {

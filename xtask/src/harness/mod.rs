@@ -2074,7 +2074,13 @@ fn prepare_drives(
     ports: HostPorts,
 ) -> Result<Vec<Drive>> {
     let drives = match scenario.target {
-        Target::Live => vec![Drive::HostDirectory(qemu::prepare_esp(built, true)?)],
+        Target::Live => {
+            let esp = qemu::prepare_esp(built, true)?;
+            if let Some(mode) = scenarios::screen_for(scenario.name) {
+                qemu::request_screen(&esp, mode)?;
+            }
+            vec![Drive::HostDirectory(esp)]
+        }
         Target::Image => vec![Drive::Image(image::build(built, image::Kind::System)?)],
         Target::Installer => vec![
             // Порядок важен: прошивка перебирает носители в порядке подключения,

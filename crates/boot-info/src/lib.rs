@@ -29,7 +29,7 @@ pub const BOOT_INFO_MAGIC: u64 = 0x4652_4545_4F53_0001;
 /// in front of the machine chose in the bootloader menu. Revision 7 added the
 /// A/B slot fields — which system this boot came from, how many attempts it has
 /// left, and whether the bootloader had already given up on the other one.
-pub const BOOT_INFO_REVISION: u32 = 7;
+pub const BOOT_INFO_REVISION: u32 = 8;
 
 /// Boot without the desktop, without services, and with the root filesystem
 /// mounted read-only.
@@ -274,6 +274,17 @@ pub struct BootInfo {
     /// boot from a rollback.
     pub rolled_back: u8,
     _reserved: [u8; 5],
+    /// The screen mode asked for in Settings (`FREEOS/DISPLAY.CFG`), or zeros.
+    ///
+    /// The bootloader can only pick from the firmware's list, so a mode that
+    /// is not on it stays unset. The kernel reads the request here and sets
+    /// the mode itself where it drives the adapter (Bochs VBE, ramfb) — before
+    /// the desktop starts, because the machine's form (phone or PC) and the UI
+    /// scale are decided once, from the first screen. Passed rather than read
+    /// again from the ESP: a live boot has no partition table the kernel
+    /// knows the ESP by.
+    pub requested_width: u32,
+    pub requested_height: u32,
 }
 
 /// Segment is readable.
@@ -433,6 +444,8 @@ impl BootInfo {
             slot_tries: 0,
             rolled_back: 0,
             _reserved: [0; 5],
+            requested_width: 0,
+            requested_height: 0,
         }
     }
 

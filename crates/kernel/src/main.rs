@@ -520,7 +520,8 @@ fn start_graphics(info: &BootInfo, have_input: bool) {
 
     console::release_screen();
 
-    if !ui::init(&info.framebuffer) {
+    let framebuffer = requested_framebuffer(info);
+    if !ui::init(&framebuffer) {
         console::reclaim_screen();
         kprintln!("  compositor  : could not take the screen; staying on the boot console");
         return;
@@ -531,10 +532,39 @@ fn start_graphics(info: &BootInfo, have_input: bool) {
     let (_, _, windows) = ui::stats();
     kprintln!(
         "  compositor  : {}x{} screen, {windows} windows, shell {cols}x{rows} characters",
-        info.framebuffer.width,
-        info.framebuffer.height
+        framebuffer.width,
+        framebuffer.height
     );
     kprintln!("  console     : screen handed over; the boot log continues on serial only");
+}
+
+/// Поставить режим, который просили в «Параметрах», если прошивка его не дала.
+///
+/// Загрузчик выбирает только из списка прошивки, и режим вне списка без этого
+/// не исполнялся бы вовсе. Ставится он **до** стола: форма машины (телефон или
+/// ПК) и масштаб считаются один раз, при его запуске, и портретный экран,
+/// включённый позже, дал бы стол ПК, растянутый в полоску.
+///
+/// Так же на этом стоит просмотр мобильного вида в QEMU (`FREEOS_SCREEN=720x1600`
+/// у `cargo xtask run`, сценарий стенда `mobile`): у эмулятора нет портретного
+/// режима в прошивке, а у телефона нет эмулятора.
+fn requested_framebuffer(info: &BootInfo) -> boot_info::Framebuffer {
+    let current = &info.framebuffer;
+    let (width, height) = (info.requested_width, info.requested_height);
+    if width == 0 || height == 0 || (width, height) == (current.width, current.height) {
+        return *current;
+    }
+    match display::set_mode(current, width, height) {
+        Ok(framebuffer) => {
+            console::adopt(&framebuffer);
+            kprintln!("  display     : {width}x{height} set at start by {}", display::DRIVER);
+            framebuffer
+        }
+        Err(why) => {
+            kprintln!("  display     : {width}x{height} requested, firmware mode kept: {why}");
+            *current
+        }
+    }
 }
 
 /// Задержать журнал загрузки на экране, прежде чем его закроет рабочий стол.
