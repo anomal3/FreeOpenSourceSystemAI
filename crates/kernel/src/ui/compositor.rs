@@ -54,6 +54,7 @@ use super::icons::{Icons, Kind};
 use super::panel::{Menu, Panel, PanelHit, Status};
 use super::pointer::Pointer;
 use super::flight::Flight;
+use super::start::{self, Start};
 use super::tray::{self, Sheet};
 use super::keyboard::{self, Keyboard};
 use super::shade::Shade;
@@ -109,6 +110,8 @@ pub struct Compositor {
     flight: Option<Flight>,
     /// Лист «Свёрнутые программы» — открыт, пока `Some` (см. [`super::tray`]).
     tray: Option<Sheet>,
+    /// Лист «Пуск» телефона — открыт, пока `Some` (см. [`super::start`]).
+    start: Option<Start>,
     /// Что показано в карточке «Система» — по нему видно, пора ли её
     /// перерисовать (см. [`Compositor::refresh_panel`]).
     home: super::home::Facts,
@@ -209,6 +212,7 @@ impl Compositor {
             keyboard: None,
             flight: None,
             tray: None,
+            start: None,
             home: super::home::Facts::default(),
             drag: None,
             drag_from: (0, 0),
@@ -1000,6 +1004,93 @@ impl Compositor {
         super::home::draw_recent(back, band, dy, card, self.scale, &rows, rows.len());
     }
 
+    /// Открыт ли «Пуск» телефона.
+    #[must_use]
+    pub const fn start_open(&self) -> bool {
+        self.start.is_some()
+    }
+
+    /// Ждёт ли поле поиска «Пуска» набора.
+    #[must_use]
+    pub fn start_focused(&self) -> bool {
+        self.start.as_ref().is_some_and(Start::focused)
+    }
+
+    /// Где низ листа «Пуск»: над клавиатурой, если она будет видна, иначе над
+    /// доком (поле как у листа свёрнутых).
+    fn start_bottom(&self, keyboard_up: bool) -> i32 {
+        let ctx = mini_ui::paint::Ctx::scaled(self.scale);
+        match self.keyboard.as_ref() {
+            Some(keyboard) if keyboard_up => keyboard.rect.y - ctx.px(keyboard::GAP) as i32,
+            _ => self.screen.height() as i32 - ctx.px(100) as i32,
+        }
+    }
+
+    /// Открыть «Пуск»: `focused` — сразу с полем поиска в фокусе.
+    pub fn open_start(&mut self, focused: bool) -> bool {
+        self.close_start();
+        let user = start::User {
+            name: crate::user::session::with_name(|name| alloc::string::String::from(name)),
+            uid: crate::user::session::credentials().uid,
+            slot: self.home.slot,
+        };
+        let bottom = self.start_bottom(focused);
+        self.start = Start::open(self.screen.width(), bottom, self.scale, user, focused);
+        match self.start.as_ref() {
+            Some(sheet) => {
+                let rect = sheet.rect;
+                self.mark_layer(rect);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Закрыть «Пуск», если открыт.
+    pub fn close_start(&mut self) {
+        if let Some(sheet) = self.start.take() {
+            self.mark_layer(sheet.rect);
+        }
+    }
+
+    /// Во что попало нажатие в «Пуск».
+    #[must_use]
+    pub fn start_hit(&self, x: i32, y: i32) -> Option<start::Hit> {
+        self.start.as_ref()?.hit(x, y)
+    }
+
+    /// Поле поиска получило фокус — клавиатура появится ближайшим кадром.
+    pub fn focus_start(&mut self) {
+        if let Some(sheet) = self.start.as_mut() {
+            sheet.focus();
+        }
+    }
+
+    /// Набор в поле поиска.
+    pub fn start_type(&mut self, ch: char) {
+        if let Some(sheet) = self.start.as_mut() {
+            sheet.type_char(ch);
+        }
+    }
+
+    pub fn start_backspace(&mut self) {
+        if let Some(sheet) = self.start.as_mut() {
+            sheet.backspace();
+        }
+    }
+
+    /// Что набрано в поле поиска.
+    #[must_use]
+    pub fn start_query(&self) -> Option<alloc::string::String> {
+        self.start.as_ref().map(|sheet| alloc::string::String::from(sheet.query()))
+    }
+
+    /// Первое найденное — то, что запустит ↵.
+    #[must_use]
+    pub fn start_first(&self) -> Option<start::Target> {
+        self.start.as_ref()?.first()
+    }
+
     /// Открыт ли лист «Свёрнутые программы».
     #[must_use]
     pub const fn tray_open(&self) -> bool {
@@ -1111,7 +1202,7 @@ impl Compositor {
     /// строки терминала, то есть строка ввода, оказались бы под клавишами.
     pub fn sync_keyboard(&mut self) -> Option<bool> {
         let keyboard = self.keyboard.as_ref()?;
-        let want = self.focused_app() == Some(App::Terminal);
+        let want = self.focused_app() == Some(App::Terminal) || self.start_focused();
         if keyboard.is_visible() == want {
             return None;
         }
@@ -1127,6 +1218,14 @@ impl Compositor {
             self.mark(Rect::new(0, dock.y, self.screen.width(), self.screen.height().saturating_sub(dock.y.max(0) as u32)));
         }
 
+        // «Пуск» переезжает вместе с клавиатурой: встаёт над ней или опускается
+        // к доку.
+        let start_bottom = self.start_bottom(want);
+        if let Some(sheet) = self.start.as_mut() {
+            let before = sheet.move_bottom(start_bottom);
+            let after = sheet.rect;
+            self.mark_layer(before.union(&after));
+        }
         let bottom = if want {
             rect.y - mini_ui::paint::Ctx::scaled(self.scale).px(keyboard::GAP) as i32
         } else {
@@ -1308,6 +1407,13 @@ impl Compositor {
             }
         }
 
+        if let Some(sheet) = self.start.as_mut() {
+            let damage = sheet.take_damage();
+            if !damage.is_empty() {
+                let rect = damage.translate(sheet.rect.x, sheet.rect.y);
+                self.mark(rect);
+            }
+        }
         if let Some(keyboard) = self.keyboard.as_mut() {
             let damage = keyboard.take_damage();
             if !damage.is_empty() && keyboard.is_visible() {
@@ -1780,6 +1886,11 @@ impl Compositor {
                 let t = flight.phase(crate::time::uptime_ns());
                 flight.draw(back, window.surface(), to, t, band, dy);
             }
+        }
+        if let Some(sheet) = self.start.as_ref() {
+            let r = mini_ui::paint::Ctx::scaled(self.scale).px(34);
+            self.drop_shadow(back, sheet.rect, band, dy, r);
+            self.stack(back, sheet.surface(), sheet.rect, band, dy, r);
         }
         if let Some(sheet) = self.tray.as_ref() {
             let r = mini_ui::paint::Ctx::scaled(self.scale).px(30);

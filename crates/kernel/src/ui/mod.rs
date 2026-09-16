@@ -54,6 +54,7 @@ pub mod flight;
 pub mod home;
 pub mod keyboard;
 pub mod shade;
+pub mod start;
 pub mod tray;
 pub mod statusbar;
 pub mod term;
@@ -997,6 +998,35 @@ const INPUT_TRIES: u32 = 250;
 const INPUT_PAUSE_MS: u64 = 2;
 
 fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
+    // Поле поиска «Пуска» телефона забирает клавиши раньше всех: пока оно в
+    // фокусе, набранное — это запрос, а не команда оболочке под листом.
+    if desktop.start_focused() {
+        if event.pressed {
+            match event.code {
+                crate::input::KeyCode::Backspace => desktop.start_backspace(),
+                crate::input::KeyCode::Escape => {
+                    desktop.close_start();
+                    kprintln!("  start       : closed");
+                }
+                crate::input::KeyCode::Enter => {
+                    if let Some(target) = desktop.start_first() {
+                        desktop.close_start();
+                        launch_target(desktop, target);
+                    }
+                }
+                _ => {
+                    if let Some(ch) = keymap::char_for(event) {
+                        desktop.start_type(ch);
+                    }
+                }
+            }
+            if let Some(sheet_query) = desktop.start_query() {
+                kprintln!("  start       : query '{sheet_query}'");
+            }
+        }
+        desktop.refresh_panel(status);
+        return None;
+    }
     // Alt+Shift — раскладка, и раньше всего остального: сочетание из двух
     // модификаторов не значит ничего ни для меню, ни для окна, а трей обязан
     // показать новую раскладку в том же кадре.
@@ -1221,7 +1251,8 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 PanelHit::Menu
                 | PanelHit::Window(_)
                 | PanelHit::Missing(_)
-                | PanelHit::Stack => None,
+                | PanelHit::Stack
+                | PanelHit::Search => None,
             }
         } else if let Some((index, hit)) = desktop.window_at(x, y) {
             // Правая кнопка внутри окна программы доходит до неё событием с
@@ -1322,6 +1353,34 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     desktop.present();
 }
 
+/// Открыть то, на что указывает строка или плитка «Пуска».
+fn launch_target(desktop: &mut Compositor, target: start::Target) {
+    match target {
+        start::Target::App(app) => launch(desktop, app),
+        start::Target::Program(command) => start(desktop, command),
+        start::Target::Missing(what) => {
+            kprintln!("  desktop     : {what} -- no program for it on this machine yet");
+        }
+        start::Target::Command(command) => {
+            // Команда набирается в терминале, но не исполняется: человек видит,
+            // что будет сделано, и сам жмёт ↵.
+            launch(desktop, App::Terminal);
+            for letter in command.chars() {
+                let code = if letter == ' ' {
+                    Some(crate::input::KeyCode::Space)
+                } else {
+                    keyboard::code_for(letter)
+                };
+                if let Some(code) = code {
+                    crate::input::post(code, true);
+                    crate::input::post(code, false);
+                }
+            }
+            kprintln!("  start       : typed command '{command}'");
+        }
+    }
+}
+
 /// Напечатать то, что нажато на экранной клавиатуре.
 ///
 /// Клавиши уходят в общую очередь ввода нажатием и отпусканием — так же, как их
@@ -1384,6 +1443,34 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             kprintln!("  desktop     : shade closed");
             desktop.present();
         }
+        return;
+    }
+
+    // 0а-3. «Пуск» телефона. Нажатие мимо закрывает его и дальше не идёт.
+    // Клавиатура под листом — не «мимо»: по ней в поле и печатают.
+    if desktop.start_open() && !desktop.keyboard_contains(x, y) {
+        match desktop.start_hit(x, y) {
+            Some(start::Hit::Field) => desktop.focus_start(),
+            Some(start::Hit::Launch(target)) => {
+                desktop.close_start();
+                launch_target(desktop, target);
+            }
+            Some(start::Hit::Settings) => {
+                desktop.close_start();
+                launch(desktop, App::Settings);
+            }
+            Some(start::Hit::Power) => {
+                desktop.close_start();
+                launch(desktop, App::Shutdown);
+            }
+            Some(start::Hit::Inside) => {}
+            None => {
+                desktop.close_start();
+                kprintln!("  start       : closed");
+            }
+        }
+        desktop.refresh_panel(status);
+        desktop.present();
         return;
     }
 
@@ -1505,7 +1592,18 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     // 2. Панель задач.
     if let Some(hit) = desktop.panel_at(x, y) {
         match hit {
+            // На телефоне «FreeOS» открывает лист «Пуск», а не меню ПК.
+            PanelHit::Menu if theme::is_mobile() => {
+                if desktop.open_start(false) {
+                    kprintln!("  start       : opened");
+                }
+            }
             PanelHit::Menu => toggle_menu(desktop, status),
+            PanelHit::Search => {
+                if desktop.open_start(true) {
+                    kprintln!("  start       : opened for search");
+                }
+            }
             PanelHit::Window(app) => {
                 // Щелчок по кнопке активного окна сворачивает его — так ведёт
                 // себя панель задач везде, где человек её видел, и другого

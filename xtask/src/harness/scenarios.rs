@@ -951,6 +951,31 @@ pub const ALL: &[Scenario] = &[
             Step::Await("keyboard    : shown", 15_000),
             Step::Wait(1000),
             Step::Shot("06-restored"),
+            // «Пуск» с поиском: свернуть терминал, нажать «Поиск» (со стопкой в
+            // доке это плитка с лупой), набрать «pk» клавишами экранной
+            // клавиатуры и ↵ — открывается первое найденное.
+            Step::Aim(Aim::Point(570, 164)),
+            Step::Click,
+            Step::Await("desktop     : minimize flight of 'Terminal': ", 15_000),
+            Step::Wait(1000),
+            Step::Aim(Aim::Point(508, 1495)),
+            Step::Click,
+            Step::Await("start       : opened for search", 15_000),
+            Step::Await("keyboard    : shown", 15_000),
+            Step::Wait(1000),
+            Step::Aim(Aim::Point(647, 1240)),
+            Step::Click,
+            Step::Await("start       : query 'p'", 15_000),
+            Step::Aim(Aim::Point(551, 1330)),
+            Step::Click,
+            Step::Await("start       : query 'pk'", 15_000),
+            Step::Wait(1000),
+            Step::Shot("07-search"),
+            Step::Aim(Aim::Point(613, 1509)),
+            Step::Click,
+            // Первым «pk» находит «Пакеты» (пояснение «установка .fpk») — они
+            // открывают «Настройки».
+            Step::Await("desktop     : opened 'Settings'", 15_000),
         ],
     },
     Scenario {
@@ -5125,6 +5150,7 @@ pub const ALL: &[Scenario] = &[
         ehci: false,
         disk_bus: DiskBus::Virtio,
         network: true,
+        e1000: false,
         guest_port: 22,
         host_echo: false,
         host_repo: false,

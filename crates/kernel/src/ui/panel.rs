@@ -671,7 +671,7 @@ impl Panel {
                 return Some(PanelHit::Stack);
             }
             if x >= dock.search.x && x < dock.search.right() {
-                return Some(PanelHit::Menu);
+                return Some(PanelHit::Search);
             }
             if x >= dock.right.x && x < dock.right.right() {
                 return Some(PanelHit::Missing("camera"));
@@ -1799,6 +1799,8 @@ pub enum PanelHit {
     Tray(TrayItem),
     /// Стопка свёрнутых окон в доке: тап показывает их списком.
     Stack,
+    /// Поле поиска в доке телефона: «Пуск» сразу с полем в фокусе.
+    Search,
     /// Кнопка дока, за которой программы пока нет.
     ///
     /// Телефон и камера в доке телефона стоят, а программ за ними нет — их
