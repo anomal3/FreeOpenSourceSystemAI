@@ -184,6 +184,10 @@ impl Fastboot {
         } else if text == "oem touchdump" {
             self.state = State::Dump { offset: 0 };
             self.continue_dump(0);
+        } else if let Some(rest) = text.strip_prefix("oem tap ") {
+            self.synth_tap(rest);
+        } else if let Some(rest) = text.strip_prefix("oem drag ") {
+            self.synth_drag(rest);
         } else if let Some(rest) = text.strip_prefix("oem t") {
             self.touch_command(rest);
         } else if text == "oem mem" {
@@ -502,6 +506,59 @@ impl Fastboot {
         self.continue_lines(0);
     }
 
+    /// Нажать и отпустить в точке экрана: `oem tap <x> <y>` (десятичные точки).
+    ///
+    /// # Зачем это есть
+    ///
+    /// Чтобы тот, кто ищет причину рывков, мог повторить жест **сам**, столько
+    /// раз, сколько нужно, и одинаково. Пока касание умел только человек,
+    /// каждый замер стоил чужого времени и получался разным: палец не
+    /// повторяет движение дважды, а разница между 10 и 74 миллисекундами на
+    /// кадр зависит именно от того, что делали пальцем.
+    fn synth_tap(&mut self, rest: &str) {
+        let Some((x, y)) = two_numbers(rest) else {
+            self.respond(b"FAIL", "usage: oem tap <x> <y>");
+            return;
+        };
+        let Some((fx, fy)) = to_fraction(x, y) else {
+            self.respond(b"FAIL", "no screen");
+            return;
+        };
+        crate::input::post_pointer_at(fx, fy, 0, crate::input::Buttons::LEFT);
+        crate::input::post_pointer_at(fx, fy, 0, crate::input::Buttons::NONE);
+        self.respond(b"OKAY", "");
+    }
+
+    /// Провести из точки в точку: `oem drag <x1> <y1> <x2> <y2>`.
+    ///
+    /// Двадцать шагов между концами — примерно столько отчётов даёт панель на
+    /// движение пальца в полсекунды. Кнопка держится нажатой всю дорогу, как у
+    /// настоящего перетаскивания.
+    fn synth_drag(&mut self, rest: &str) {
+        let mut words = rest.split_whitespace();
+        let mut next = || words.next().and_then(|w| w.parse::<u32>().ok());
+        let (Some(x1), Some(y1), Some(x2), Some(y2)) = (next(), next(), next(), next()) else {
+            self.respond(b"FAIL", "usage: oem drag <x1> <y1> <x2> <y2>");
+            return;
+        };
+        const STEPS: u32 = 20;
+        for step in 0..=STEPS {
+            let x = x1 + (x2 as i64 - x1 as i64) as u32 * step / STEPS;
+            let y = y1 + (y2 as i64 - y1 as i64) as u32 * step / STEPS;
+            let Some((fx, fy)) = to_fraction(x, y) else {
+                self.respond(b"FAIL", "no screen");
+                return;
+            };
+            crate::input::post_pointer_at(fx, fy, 0, crate::input::Buttons::LEFT);
+        }
+        let Some((fx, fy)) = to_fraction(x2, y2) else {
+            self.respond(b"FAIL", "no screen");
+            return;
+        };
+        crate::input::post_pointer_at(fx, fy, 0, crate::input::Buttons::NONE);
+        self.respond(b"OKAY", "");
+    }
+
     /// Сложить строку в ответ. Лишние молча отбрасываются: обрезанный ответ
     /// лучше, чем отказ на команду, которая уже сделала свою работу.
     fn say(&mut self, text: &[u8]) {
@@ -715,6 +772,25 @@ impl Fastboot {
         self.out_len = 4 + len;
         self.ready = true;
     }
+}
+
+/// Два десятичных числа через пробел.
+fn two_numbers(text: &str) -> Option<(u32, u32)> {
+    let mut words = text.split_whitespace();
+    let x = words.next()?.parse().ok()?;
+    let y = words.next()?.parse().ok()?;
+    Some((x, y))
+}
+
+/// Точка экрана — в доли, которых ждёт [`crate::input::post_pointer_at`].
+fn to_fraction(x: u32, y: u32) -> Option<(u16, u16)> {
+    let (w, h) = crate::ui::screen_size();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let fx = (u64::from(x.min(w.saturating_sub(1))) * 65535 / u64::from(w.max(1))) as u16;
+    let fy = (u64::from(y.min(h.saturating_sub(1))) * 65535 / u64::from(h.max(1))) as u16;
+    Some((fx, fy))
 }
 
 /// Отрезать возврат каретки и пробелы в конце.
