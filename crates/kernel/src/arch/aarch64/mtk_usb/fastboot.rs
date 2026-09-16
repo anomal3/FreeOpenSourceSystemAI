@@ -50,6 +50,8 @@ enum State {
     Log { at: u64, until: u64 },
     /// Отдаёт заранее сложенные строки ответа: какую следующей.
     Lines { at: u8 },
+    /// Ведёт синтетический жест: концы, очередной шаг и когда его подать.
+    Drag { from: (u32, u32), to: (u32, u32), step: u32, due_ns: u64 },
 }
 
 /// Сколько строк помещается в один ответ.
@@ -57,6 +59,10 @@ enum State {
 /// Восемь — с запасом на самый длинный ответ: тридцать байт кристалла
 /// шестнадцатеричными парами не влезают в один пакет и занимают две строки.
 const LINES: usize = 8;
+
+/// Сколько шагов в синтетическом жесте и как часто они подаются.
+const DRAG_STEPS: u32 = 20;
+const DRAG_STEP_NS: u64 = 15_000_000;
 
 /// Сколько проходов подряд можно не суметь отдать ответ, прежде чем считать
 /// собеседника ушедшим.
@@ -164,6 +170,11 @@ impl Fastboot {
             return;
         }
 
+        if let State::Drag { .. } = self.state {
+            self.continue_drag();
+            return;
+        }
+
         let mut command = [0u8; PACKET];
         if let Some(len) = bulk.receive(&mut command) {
             self.handle(&command[..len]);
@@ -215,6 +226,12 @@ impl Fastboot {
             self.say(text.as_bytes());
             self.state = State::Lines { at: 0 };
             self.continue_lines(0);
+        } else if let Some(flag) = text.strip_prefix("oem ui move ") {
+            crate::ui::set_exact_moves(flag.trim() != "0");
+            self.respond(b"OKAY", "");
+        } else if text == "oem ui reset" {
+            crate::ui::reset_timing();
+            self.respond(b"OKAY", "");
         } else if text == "oem ui" {
             // Во что обходится кадр — по кабелю, а не догадкой. Среднее на
             // кадр в микросекундах: сборка и вывод порознь (см.
@@ -231,9 +248,10 @@ impl Fastboot {
                 alloc::format!("{frames} frames, {bands} bands, {} Mpx", points / 1_000_000);
             self.say(text.as_bytes());
             let text = alloc::format!(
-                "per frame: draw {} us, blit {} us",
+                "per frame: draw {} us, blit {} us, worst {} us",
                 draw_ns / n / 1000,
                 blit_ns / n / 1000,
+                crate::ui::worst_frame_ns() / 1000,
             );
             self.say(text.as_bytes());
             let (full, part, overflows, rects) = crate::ui::damage_timing();
@@ -537,9 +555,17 @@ impl Fastboot {
 
     /// Провести из точки в точку: `oem drag <x1> <y1> <x2> <y2>`.
     ///
-    /// Двадцать шагов между концами — примерно столько отчётов даёт панель на
-    /// движение пальца в полсекунды. Кнопка держится нажатой всю дорогу, как у
-    /// настоящего перетаскивания.
+    /// Двадцать шагов между концами, по одному раз в [`DRAG_STEP_NS`], — так
+    /// отчёты шлёт панель, опрашиваемая на 65 Гц, и жест длится около трети
+    /// секунды. Кнопка держится нажатой всю дорогу, как у настоящего
+    /// перетаскивания.
+    ///
+    /// # Почему шаги растянуты во времени
+    ///
+    /// Первая версия клала все шаги в очередь разом. Стол сливает подряд
+    /// идущие сдвиги указателя в один, и жест обходился в кадр-другой — а палец
+    /// даёт кадр на каждый отчёт. Замер перетаскивания на таком жесте мерил бы
+    /// не то, что чувствует человек.
     fn synth_drag(&mut self, rest: &str) {
         let mut words = rest.split_whitespace();
         let mut next = || words.next().and_then(|w| w.parse::<u32>().ok());
@@ -547,22 +573,49 @@ impl Fastboot {
             self.respond(b"FAIL", "usage: oem drag <x1> <y1> <x2> <y2>");
             return;
         };
-        const STEPS: u32 = 20;
-        for step in 0..=STEPS {
-            let x = x1 + (x2 as i64 - x1 as i64) as u32 * step / STEPS;
-            let y = y1 + (y2 as i64 - y1 as i64) as u32 * step / STEPS;
-            let Some((fx, fy)) = to_fraction(x, y) else {
-                self.respond(b"FAIL", "no screen");
-                return;
-            };
-            crate::input::post_pointer_at(fx, fy, 0, crate::input::Buttons::LEFT);
-        }
-        let Some((fx, fy)) = to_fraction(x2, y2) else {
+        if to_fraction(x1, y1).is_none() {
             self.respond(b"FAIL", "no screen");
             return;
+        }
+        self.state = State::Drag {
+            from: (x1, y1),
+            to: (x2, y2),
+            step: 0,
+            due_ns: crate::time::uptime_ns(),
         };
-        crate::input::post_pointer_at(fx, fy, 0, crate::input::Buttons::NONE);
-        self.respond(b"OKAY", "");
+    }
+
+    /// Подать очередной шаг жеста, если подошло его время.
+    fn continue_drag(&mut self) {
+        let State::Drag { from, to, step, due_ns } = self.state else {
+            return;
+        };
+        let now = crate::time::uptime_ns();
+        if now < due_ns {
+            return;
+        }
+        // Разность — со знаком: жест влево или вверх отрицателен, и в `u32` он
+        // превращался в огромное число, а умножение — в панику ядра на первом
+        // же обратном жесте.
+        let along = |a: u32, b: u32| {
+            (i64::from(a) + (i64::from(b) - i64::from(a)) * i64::from(step) / i64::from(DRAG_STEPS))
+                as u32
+        };
+        let (x, y) = (along(from.0, to.0), along(from.1, to.1));
+        let buttons = if step < DRAG_STEPS {
+            crate::input::Buttons::LEFT
+        } else {
+            crate::input::Buttons::NONE
+        };
+        if let Some((fx, fy)) = to_fraction(x, y) {
+            crate::input::post_pointer_at(fx, fy, 0, buttons);
+        }
+        if step < DRAG_STEPS {
+            self.state = State::Drag { from, to, step: step + 1, due_ns: now + DRAG_STEP_NS };
+        } else {
+            self.state = State::Idle;
+            self.respond(b"OKAY", "");
+        }
     }
 
     /// Сложить строку в ответ. Лишние молча отбрасываются: обрезанный ответ

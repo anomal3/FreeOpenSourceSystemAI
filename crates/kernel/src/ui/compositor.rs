@@ -114,6 +114,9 @@ pub struct Compositor {
     drag_from: (i32, i32),
     /// Захват меняет размер окна, а не его место.
     drag_resizes: bool,
+    /// Окно, переехавшее с прошлого кадра, и где оно стояло **до первого**
+    /// сдвига в этом кадре. См. [`Compositor::note_moved`].
+    moved: Option<(App, Rect)>,
     /// Окно программы, над содержимым которого указатель был в прошлый раз
     /// (фаза N7h).
     ///
@@ -186,6 +189,7 @@ impl Compositor {
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
+            moved: None,
             hovered: None,
             scale,
             damage: [Rect::EMPTY; MAX_DAMAGE],
@@ -667,8 +671,7 @@ impl Compositor {
             return;
         }
         let after = window.rect;
-        self.mark_layer(before);
-        self.mark_layer(after);
+        self.note_moved(app, before, after);
     }
 
     /// Свернуть окно: убрать с экрана, оставив в панели задач.
@@ -860,15 +863,8 @@ impl Compositor {
             return;
         }
         // Ореол вокруг слоя — место под его тень: стирая слой, стереть надо и
-        // её. На телефоне тени нет (см. [`Self::drop_shadow`]), и ореол там
-        // означал бы прямоугольник на 56 точек шире нужного с каждой стороны —
-        // два таких накрывают экран целиком, учёт изменённого переполняется, и
-        // кадр перерисовывает всё.
-        let halo = if theme::is_mobile() {
-            0
-        } else {
-            (SHADOW_SPREAD + SHADOW_DROP) * self.scale
-        };
+        // её.
+        let halo = self.halo();
         self.mark(Rect::new(
             rect.x - halo as i32,
             rect.y - halo as i32,
@@ -877,8 +873,89 @@ impl Compositor {
         ));
     }
 
+    /// Запомнить переезд окна до сборки кадра.
+    ///
+    /// # Почему не пометить сразу
+    ///
+    /// Пальцем окно тащат десятками сдвигов, и между двумя кадрами их
+    /// набегает несколько. Помечая каждый, кадр собирал бы окно столько раз,
+    /// сколько было сдвигов, — а на экран из этих положений попадает только
+    /// последнее. Помнится первое «откуда»; «куда» спрашивается у окна в миг
+    /// сборки.
+    fn note_moved(&mut self, app: App, before: Rect, after: Rect) {
+        if !super::exact_moves() {
+            self.mark_layer(before);
+            self.mark_layer(after);
+            return;
+        }
+        match self.moved {
+            Some((moving, _)) if moving == app => {}
+            Some((other, from)) => {
+                // Второе окно в том же кадре — редкость; прежнее помечается
+                // сразу, чтобы не держать список.
+                let to = self.rect_of(other).unwrap_or(Rect::EMPTY);
+                self.mark_moved(from, to);
+                self.moved = Some((app, before));
+            }
+            None => self.moved = Some((app, before)),
+        }
+    }
+
+    /// Пометить переезд слоя: новое место целиком, из старого — только то, что
+    /// новым не накрыто.
+    ///
+    /// Прежде помечались оба прямоугольника целиком, а при сдвиге на палец они
+    /// совпадают почти полностью — кадр собирал окно дважды. Открывшаяся часть
+    /// старого места — не больше двух полос шириной в сдвиг.
+    ///
+    /// Разность считается от прямоугольников **вместе с ореолом тени**: тень
+    /// едет вместе со слоем, и её след стирается так же.
+    fn mark_moved(&mut self, before: Rect, after: Rect) {
+        let halo = self.halo();
+        let grow = |rect: Rect| {
+            if rect.is_empty() {
+                rect
+            } else {
+                Rect::new(
+                    rect.x - halo as i32,
+                    rect.y - halo as i32,
+                    rect.w + halo * 2,
+                    rect.h + halo * 2,
+                )
+            }
+        };
+        let (from, to) = (grow(before), grow(after));
+        self.mark(to);
+        for strip in uncovered(from, to) {
+            self.mark(strip);
+        }
+    }
+
+    /// Ширина ореола вокруг слоя — места под его тень.
+    fn halo(&self) -> u32 {
+        // На телефоне тени нет (см. [`Self::drop_shadow`]), и ореол там
+        // означал бы прямоугольник на 56 точек шире нужного с каждой стороны —
+        // два таких накрывают экран целиком, учёт изменённого переполняется, и
+        // кадр перерисовывает всё.
+        if theme::is_mobile() {
+            0
+        } else {
+            (SHADOW_SPREAD + SHADOW_DROP) * self.scale
+        }
+    }
+
     /// Перенести накопленные слоями изменения в общий список.
     fn collect(&mut self) {
+        if let Some((app, from)) = self.moved.take() {
+            // Окно могли закрыть или свернуть после сдвига: его место тогда уже
+            // помечено целиком, и «куда» пусто.
+            let to = self
+                .windows
+                .iter()
+                .find(|window| window.app == app && !window.minimized)
+                .map_or(Rect::EMPTY, |window| window.rect);
+            self.mark_moved(from, to);
+        }
         for index in 0..self.windows.len() {
             let Some(window) = self.windows.get_mut(index) else {
                 continue;
@@ -1190,6 +1267,7 @@ impl Compositor {
         if !self.damage_overflow && self.damage_count == 0 {
             return;
         }
+        let started = crate::time::uptime_ns();
         self.frames += 1;
         // И наружу, в атомик: среднее на кадр считает тот, кто спрашивает по
         // кабелю, а стол к тому времени уже занят (см. [`super::timing`]).
@@ -1202,6 +1280,7 @@ impl Compositor {
             self.rects += 1;
             self.damage_overflow = false;
             self.damage_count = 0;
+            super::note_frame_ns(crate::time::uptime_ns().wrapping_sub(started));
             return;
         }
         super::note_partial_frame(self.damage_count as u64);
@@ -1215,6 +1294,7 @@ impl Compositor {
             }
         }
         self.damage_count = 0;
+        super::note_frame_ns(crate::time::uptime_ns().wrapping_sub(started));
     }
 
     /// Собрать прямоугольник экрана и вывести его целиком.
@@ -1862,4 +1942,21 @@ fn isqrt(value: u64) -> u64 {
         }
         guess = next;
     }
+}
+
+/// Части `from`, не накрытые `to`: не больше четырёх полос — сверху, снизу и по
+/// бокам в пределах общих строк.
+fn uncovered(from: Rect, to: Rect) -> impl Iterator<Item = Rect> {
+    let overlap = from.intersect(&to);
+    let mut parts = [Rect::EMPTY; 4];
+    if overlap.is_empty() {
+        parts[0] = from;
+    } else {
+        let gap = |start: i32, end: i32| (end - start).max(0) as u32;
+        parts[0] = Rect::new(from.x, from.y, from.w, gap(from.y, overlap.y));
+        parts[1] = Rect::new(from.x, overlap.bottom(), from.w, gap(overlap.bottom(), from.bottom()));
+        parts[2] = Rect::new(from.x, overlap.y, gap(from.x, overlap.x), overlap.h);
+        parts[3] = Rect::new(overlap.right(), overlap.y, gap(overlap.right(), from.right()), overlap.h);
+    }
+    parts.into_iter().filter(|part| !part.is_empty())
 }

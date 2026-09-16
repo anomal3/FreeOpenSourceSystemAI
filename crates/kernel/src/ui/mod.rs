@@ -655,8 +655,6 @@ pub fn pointer_state() -> Option<(i32, i32, bool)> {
     })
 }
 
-/// Кадры, прямоугольники и число окон.
-#[must_use]
 /// Во что обходятся кадры: кадры, полосы, наносекунды сборки и вывода, точки.
 ///
 /// # Почему атомики, а не поля стола
@@ -807,6 +805,58 @@ pub fn timing() -> (u64, u64, u64, u64, u64) {
     )
 }
 
+/// Худший кадр с последнего сброса, в наносекундах — от начала `present` до
+/// вывода последней полосы.
+///
+/// Среднее прячет ровно то, что человек называет «лагом»: сто кадров по 3 мс и
+/// один на 200 мс дают в среднем 5 мс, а палец чувствует именно двести.
+static WORST_FRAME_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Записать длительность кадра, если он хуже прежнего худшего.
+pub fn note_frame_ns(ns: u64) {
+    WORST_FRAME_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
+/// Худший кадр, наносекунды.
+#[must_use]
+pub fn worst_frame_ns() -> u64 {
+    WORST_FRAME_NS.load(Ordering::Relaxed)
+}
+
+/// Помечать переезд окна разностью, а не двумя прямоугольниками целиком.
+///
+/// Переключатель, а не просто новый код: сравнить оба пути надо на одной
+/// прошивке и одном жесте (`oem ui move 0|1`, затем `oem drag`), иначе каждая
+/// половина замера стоит перепрошивки и нажатия питания.
+static EXACT_MOVES: AtomicBool = AtomicBool::new(true);
+
+/// Включён ли новый учёт переезда.
+#[must_use]
+pub fn exact_moves() -> bool {
+    EXACT_MOVES.load(Ordering::Relaxed)
+}
+
+/// Выбрать учёт переезда (`oem ui move 0|1`).
+pub fn set_exact_moves(on: bool) {
+    EXACT_MOVES.store(on, Ordering::Relaxed);
+}
+
+/// Обнулить все счётчики кадров (`oem ui reset`).
+///
+/// Без этого соседние замеры смешиваются: счётчики накопительные, и жест,
+/// измеренный вторым, делится на кадры первого.
+pub fn reset_timing() {
+    for counter in [
+        &FRAMES, &BANDS, &DRAW_NS, &BLIT_NS, &POINTS, &WALL_NS, &ICONS_NS, &WINDOWS_NS,
+        &SHADOW_NS, &TOP_NS, &FULL_FRAMES, &PART_FRAMES, &OVERFLOWS, &PART_RECTS,
+        &RECT_POINTS, &DOCK_BANDS, &DOCK_NS, &WORST_FRAME_NS,
+    ] {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Кадры, прямоугольники и число окон.
+#[must_use]
 pub fn stats() -> (u64, u64, usize) {
     with_desktop(|desktop| desktop.stats()).unwrap_or((0, 0, 0))
 }
