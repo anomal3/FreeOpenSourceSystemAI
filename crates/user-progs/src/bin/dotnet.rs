@@ -23,7 +23,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use clr_vm::{FileKind, Host, IoError, Vm, WindowEvent, WindowPixels, WindowRect};
+use clr_vm::{FileKind, GlyphBitmap, Host, IoError, Vm, WindowEvent, WindowPixels, WindowRect};
 use mini_ui::typeface::{self, Face, Role};
 use mini_ui::{Color, Rect, Surface};
 use user_abi::{CLOCK_MONOTONIC, CLOCK_REALTIME};
@@ -335,6 +335,32 @@ impl Host for Console {
         for (px, py, pixel) in saved {
             target.surface.put(px, py, pixel);
         }
+    }
+
+    // Глиф шрифта форм четырьмя битами на точку (фаза N9c) — развёрнутый в
+    // байты: растеризатору `System.Drawing` нужна маска, а не рисование в окно.
+    fn glyph(&mut self, ch: char) -> Option<GlyphBitmap> {
+        let face = self.graphics()?;
+        let glyph = face.glyph(ch)?;
+        let (width, height) = (u32::from(glyph.w), u32::from(glyph.h));
+        let stride = usize::from(glyph.w).div_ceil(2);
+        let mut coverage = Vec::new();
+        coverage.try_reserve_exact(width as usize * height as usize).ok()?;
+        for row in 0..usize::from(glyph.h) {
+            for column in 0..usize::from(glyph.w) {
+                let byte = typeface::data::COVERAGE.get(glyph.off as usize + row * stride + column / 2).copied().unwrap_or(0);
+                let level = if column % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                coverage.push(level * 17);
+            }
+        }
+        Some(GlyphBitmap {
+            advance: u32::from(glyph.adv),
+            left: i32::from(glyph.left),
+            top: i32::from(glyph.top),
+            width,
+            height,
+            coverage,
+        })
     }
 
     fn text_width(&mut self, text: &str) -> u32 {

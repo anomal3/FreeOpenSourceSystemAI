@@ -246,12 +246,32 @@ pub trait Host {
         None
     }
 
+    /// Глиф системного шрифта (фаза N9c): покрытие знака в том же кегле, что у
+    /// [`Host::text_width`]. `None` — у хоста шрифта нет; `System.Drawing`
+    /// тогда рисует на месте знака прямоугольник, чтобы текст не пропадал
+    /// молча.
+    fn glyph(&mut self, ch: char) -> Option<GlyphBitmap> {
+        let _ = ch;
+        None
+    }
+
     /// Сменить размер содержимого окна (фаза N7d): форма выросла из кода.
     /// `false` — окно осталось прежним.
     fn window_resize(&mut self, window: u32, width: u32, height: u32) -> bool {
         let _ = (window, width, height);
         false
     }
+}
+
+/// Глиф: покрытие `width × height` уровнями 0..=255 и где оно стоит
+/// относительно пера — `left` вправо, `top` вниз от верхней линии строки.
+pub struct GlyphBitmap {
+    pub advance: u32,
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+    pub coverage: Vec<u8>,
 }
 
 /// Точки окна: строками сверху вниз, `width × height`.

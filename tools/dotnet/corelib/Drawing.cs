@@ -936,10 +936,80 @@ namespace System.Drawing
         Millimeter = 6,
     }
 
-    // Шрифт — только описание: рисует системный шрифт FreeOS, у которого одно
-    // начертание на размер экрана. Имя и размер программа видит свои.
-    public sealed class Font : IDisposable
+    // Шрифт — имя и кегль: рисует системный шрифт FreeOS, масштабированный под
+    // кегль (фаза N9c, см. Fonts.cs). Имя и размер программа видит свои.
+    public sealed class Font : IDisposable, ICloneable
     {
+        // Кегль в точках, в котором системный шрифт рисуется без масштаба:
+        // Segoe UI 9 pt при 96 dpi — шрифт форм по умолчанию.
+        internal const float BasePixels = 12f;
+
+        public Font(FontFamily family, float emSize)
+            : this(family, emSize, FontStyle.Regular, GraphicsUnit.Point)
+        {
+        }
+
+        public Font(FontFamily family, float emSize, FontStyle style)
+            : this(family, emSize, style, GraphicsUnit.Point)
+        {
+        }
+
+        public Font(FontFamily family, float emSize, GraphicsUnit unit)
+            : this(family, emSize, FontStyle.Regular, unit)
+        {
+        }
+
+        public Font(FontFamily family, float emSize, FontStyle style, GraphicsUnit unit)
+            : this(family == null ? null : family.Name, emSize, style, unit)
+        {
+            if (family == null)
+            {
+                throw new ArgumentNullException("family");
+            }
+        }
+
+        public Font(string familyName, float emSize, GraphicsUnit unit)
+            : this(familyName, emSize, FontStyle.Regular, unit)
+        {
+        }
+
+        public Font(Font prototype, float newSize)
+            : this(prototype.Name, newSize, prototype.Style, prototype.Unit)
+        {
+        }
+
+        public FontFamily FontFamily => new FontFamily(Name);
+
+        // Кегль в точках устройства (96 dpi): пункт — 1/72 дюйма.
+        internal float PixelSize
+        {
+            get
+            {
+                switch (Unit)
+                {
+                    case GraphicsUnit.Point:
+                        return Size * 96f / 72f;
+                    case GraphicsUnit.Inch:
+                        return Size * 96f;
+                    case GraphicsUnit.Document:
+                        return Size * 96f / 300f;
+                    case GraphicsUnit.Millimeter:
+                        return Size * 96f / 25.4f;
+                    default:
+                        return Size;
+                }
+            }
+        }
+
+        internal float Scale => PixelSize / BasePixels;
+
+        public float GetHeight() => FreeOsWindow.TextHeight() * Scale;
+
+        public float GetHeight(Graphics graphics) => GetHeight();
+
+        public float GetHeight(float dpi) => GetHeight() * dpi / 96f;
+
+        public object Clone() => new Font(Name, Size, Style, Unit);
         public Font(string familyName, float emSize)
             : this(familyName, emSize, FontStyle.Regular, GraphicsUnit.Point)
         {
@@ -971,7 +1041,7 @@ namespace System.Drawing
 
         public float Size { get; }
 
-        public float SizeInPoints => Size;
+        public float SizeInPoints => PixelSize * 72f / 96f;
 
         public FontStyle Style { get; }
 
@@ -983,7 +1053,9 @@ namespace System.Drawing
 
         public bool Underline => (Style & FontStyle.Underline) != 0;
 
-        public int Height => FreeOsWindow.TextHeight();
+        public bool Strikeout => (Style & FontStyle.Strikeout) != 0;
+
+        public int Height => (int)Math.Ceiling(GetHeight());
 
         public void Dispose()
         {

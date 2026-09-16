@@ -31,6 +31,7 @@ internal static class Program
         Paths();
         Clipping();
         Regions();
+        Texts();
 
         ApplicationConfiguration.Initialize();
         var form = new CanvasForm(args.Length > 0 && args[0] == "self-test");
@@ -528,6 +529,91 @@ internal static class Program
         Console.WriteLine("clip path: " + Ink(b, 20, 20, 1, 1, 38, 38, 2, 20) + " " + C(b.GetPixel(32, 32)) + " " + C(b.GetPixel(28, 32)));
     }
 
+    // Черные точки строки: их число и рамка. Шрифты у GDI+ и у FreeOS разные,
+    // поэтому печатаются отношения — «вдвое крупнее», «выше, чем шире после
+    // поворота», «по центру прямоугольника», — а не ширина в точках.
+    private static Rectangle InkBox(Bitmap bitmap, out int count)
+    {
+        int left = int.MaxValue;
+        int top = int.MaxValue;
+        int right = -1;
+        int bottom = -1;
+        count = 0;
+        for (int y = 0; y < bitmap.Height; y++)
+        {
+            for (int x = 0; x < bitmap.Width; x++)
+            {
+                if (bitmap.GetPixel(x, y).R < 160)
+                {
+                    count++;
+                    left = Math.Min(left, x);
+                    top = Math.Min(top, y);
+                    right = Math.Max(right, x);
+                    bottom = Math.Max(bottom, y);
+                }
+            }
+        }
+        return count == 0 ? Rectangle.Empty : Rectangle.FromLTRB(left, top, right + 1, bottom + 1);
+    }
+
+    private static void Texts()
+    {
+        var small = new Font("Arial", 10);
+        var big = new Font(new FontFamily("Arial"), 20, FontStyle.Bold);
+        Bitmap b = White(120, 60);
+        using (Graphics g = Graphics.FromImage(b))
+        {
+            SizeF one = g.MeasureString("Hello", small);
+            SizeF twice = g.MeasureString("Hello", big);
+            SizeF lines = g.MeasureString("Hello\nWorld", small);
+            SizeF wrapped = g.MeasureString("Hello World Hello World", small, 60);
+            Console.WriteLine("measure: " + (twice.Width > one.Width * 1.7f && twice.Width < one.Width * 2.3f) + " " + (twice.Height > one.Height * 1.7f) + " "
+                + (lines.Height > one.Height * 1.7f && lines.Width < one.Width * 1.3f) + " " + (wrapped.Width <= 60 && wrapped.Height > one.Height * 1.7f) + " "
+                + g.MeasureString("", small) + " " + (small.Height > 10 && small.Height < 22) + " " + (big.GetHeight() > small.GetHeight() * 1.7f));
+            Console.WriteLine("font: " + small.Name + " " + small.Size + " " + small.Unit + " " + small.SizeInPoints + " " + big.Style + " " + big.Bold + " "
+                + big.FontFamily.Name + " " + new Font("Arial", 16, GraphicsUnit.Pixel).SizeInPoints + " " + FontFamily.GenericMonospace.Name);
+            g.DrawString("Hi", big, Brushes.Black, 5, 5);
+        }
+        Rectangle plain = InkBox(b, out int plainInk);
+        Console.WriteLine("text: " + (plainInk > 20) + " " + (plain.X >= 5 && plain.Y >= 5) + " " + (plain.Right < 60 && plain.Bottom < 50));
+
+        b = White(60, 120);
+        using (Graphics g = Graphics.FromImage(b))
+        {
+            g.TranslateTransform(40, 10);
+            g.RotateTransform(90);
+            g.DrawString("Hello", small, Brushes.Black, 0, 0);
+        }
+        Rectangle turned = InkBox(b, out int turnedInk);
+        Console.WriteLine("rotated text: " + (turnedInk > 10) + " " + (turned.Height > turned.Width * 2) + " " + (turned.Right <= 41));
+
+        // Строка печатается одним вызовом: пока считается рамка, в журнал FreeOS
+        // успевают вклиниться строки служб, и половинки строки стенд не узнает.
+        string alignment;
+        b = White(120, 60);
+        using (Graphics g = Graphics.FromImage(b))
+        using (var format = new StringFormat())
+        {
+            format.Alignment = StringAlignment.Center;
+            format.LineAlignment = StringAlignment.Center;
+            g.DrawString("Hi", big, Brushes.Black, new RectangleF(0, 0, 120, 60), format);
+            alignment = format.Alignment + " " + format.LineAlignment;
+        }
+        Rectangle centered = InkBox(b, out int centeredInk);
+        int middleX = centered.X + centered.Width / 2;
+        int middleY = centered.Y + centered.Height / 2;
+        Console.WriteLine("centered text: " + alignment + " " + (centeredInk > 20) + " " + (middleX > 50 && middleX < 70) + " " + (middleY > 20 && middleY < 40));
+
+        b = White(120, 60);
+        using (Graphics g = Graphics.FromImage(b))
+        {
+            g.SetClip(new Rectangle(0, 0, 12, 60));
+            g.DrawString("Hello World", big, Brushes.Black, 2, 5);
+        }
+        Rectangle clipped = InkBox(b, out int clippedInk);
+        Console.WriteLine("clipped text: " + (clippedInk > 0) + " " + (clipped.Right <= 12));
+    }
+
     private static void Regions()
     {
         var region = new Region(new Rectangle(0, 0, 20, 20));
@@ -648,6 +734,15 @@ internal sealed class CanvasForm : Form
         {
             pen.DashStyle = DashStyle.DashDot;
             g.DrawBezier(pen, 20, 220, 60, 150, 120, 250, 170, 170);
+        }
+        using (var font = new Font("Arial", 14, FontStyle.Bold))
+        {
+            GraphicsState text = g.Save();
+            g.TranslateTransform(345, 12);
+            g.RotateTransform(90);
+            g.DrawString("GDI+ on FreeOS", font, Brushes.SteelBlue, 0, 0);
+            g.Restore(text);
+            g.DrawString("System.Drawing", Font, Brushes.Black, 12, 138);
         }
         Console.WriteLine("paint: " + e.ClipRectangle + " " + g.IsVisible(5, 5) + " " + g.Transform.IsIdentity);
     }

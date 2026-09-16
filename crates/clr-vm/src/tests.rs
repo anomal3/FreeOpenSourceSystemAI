@@ -963,10 +963,10 @@ printed so far:
 /// чтением точек, пути, преобразования, отсечение и форма с двойной буферизацией.
 const DRAWING: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/drawing.dll");
 
-/// Что печатает `dotnet drawing.dll self-test` (записано 2026-09-16, .NET 10,
+/// Что печатает `dotnet drawing.dll self-test` (записано 2026-09-17, .NET 10,
 /// GDI+ на Windows, LF): точки заливок, перьев, смешивания, градиента, текстуры и
 /// картинок совпадают до значения канала; у кругов проверяется только внутри и
-/// снаружи.
+/// снаружи, у текста (фаза N9c) — отношения: шрифты у GDI+ и песочницы разные.
 const DRAWING_OUTPUT: &str = concat!(
     "drawing: start\n",
     "bitmap: 64x48 Format32bppArgb 0,0,0,0 {Width=64, Height=48} 96\n",
@@ -1025,6 +1025,12 @@ const DRAWING_OUTPUT: &str = concat!(
     "infinite: True False True False True True\n",
     "bounds: {X=0,Y=0,Width=15,Height=15} {X=0,Y=0,Width=15,Height=15}\n",
     "fill region: #.#.#\n",
+    "measure: True True True True {Width=0, Height=0} True True\n",
+    "font: Arial 10 Point 10 Bold True Arial 12 Courier New\n",
+    "text: True True True\n",
+    "rotated text: True True True\n",
+    "centered text: Center Center True True True\n",
+    "clipped text: True True\n",
     "buffer: True True 255,240,244,248 255,255,140,0\n",
     "shown: 360x240\n",
     "paint: {X=0,Y=0,Width=360,Height=240} True True\n",

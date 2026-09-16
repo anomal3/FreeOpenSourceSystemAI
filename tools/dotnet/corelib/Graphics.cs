@@ -53,6 +53,10 @@ namespace System.Drawing
         internal static extern bool RegionContains(int[] ops, float[] points, byte[] types, float x, float y);
 
         [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern void DrawText(int[] target, int[] image, int[] clipOps, float[] clipPoints, byte[] clipTypes, string text, float[] place,
+            int[] paintInts, float[] paintFloats, int[] texture);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
         internal static extern int RegionBounds(int[] ops, float[] points, byte[] types, float[] bounds);
     }
 
@@ -1156,7 +1160,22 @@ namespace System.Drawing
 
         // ---- Текст ----------------------------------------------------------
 
-        public void DrawString(string s, Font font, Brush brush, float x, float y)
+        public void DrawString(string s, Font font, Brush brush, float x, float y) => DrawString(s, font, brush, new RectangleF(x, y, 0, 0), null);
+
+        public void DrawString(string s, Font font, Brush brush, float x, float y, StringFormat format) =>
+            DrawString(s, font, brush, new RectangleF(x, y, 0, 0), format);
+
+        public void DrawString(string s, Font font, Brush brush, PointF point) => DrawString(s, font, brush, new RectangleF(point.X, point.Y, 0, 0), null);
+
+        public void DrawString(string s, Font font, Brush brush, PointF point, StringFormat format) =>
+            DrawString(s, font, brush, new RectangleF(point.X, point.Y, 0, 0), format);
+
+        public void DrawString(string s, Font font, Brush brush, RectangleF layoutRectangle) => DrawString(s, font, brush, layoutRectangle, null);
+
+        // Строки раскладываются здесь: перенос по ширине прямоугольника,
+        // выравнивание по `Alignment` и `LineAlignment`. У точки вместо
+        // прямоугольника «по центру» значит «центр строки в этой точке».
+        public void DrawString(string s, Font font, Brush brush, RectangleF layoutRectangle, StringFormat format)
         {
             if (brush == null)
             {
@@ -1166,34 +1185,90 @@ namespace System.Drawing
             {
                 throw new ArgumentNullException("font");
             }
-            if (string.IsNullOrEmpty(s) || window < 0)
+            if (string.IsNullOrEmpty(s))
             {
                 return;
             }
-            if (!brush.IsSolid(out Color color) || color.A == 0)
+            int[] t = Target();
+            if (clipRect.Width == 0)
             {
                 return;
             }
-            Target();
-            if (clipRect.Width == 0 || !TranslationOnly(out float dx, out float dy))
+            var lines = TextLayout.Lines(s, font, layoutRectangle.Width, format);
+            float lineHeight = font.GetHeight();
+            float total = lines.Count * lineHeight;
+            StringAlignment horizontal = format == null ? StringAlignment.Near : format.Alignment;
+            StringAlignment vertical = format == null ? StringAlignment.Near : format.LineAlignment;
+            float top = layoutRectangle.Y + Offset(vertical, layoutRectangle.Height, total);
+            bool legacy = window >= 0 && font.PixelSize == Font.BasePixels && clipOps == null && brush.IsSolid(out Color solid) && solid.A == 255
+                && TranslationOnly(out float dx, out float dy);
+            for (int i = 0; i < lines.Count; i++)
             {
-                return;
+                string line = lines[i];
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+                float left = layoutRectangle.X + Offset(horizontal, layoutRectangle.Width, TextLayout.Width(line, font));
+                float lineTop = top + i * lineHeight;
+                if (legacy)
+                {
+                    // Шрифт форм без масштаба и без поворота — тем же путём, что до
+                    // N9c: элементы WinForms пишут текст тысячами строк, и
+                    // рисование глифа прямо в окно дешевле маски.
+                    brush.IsSolid(out Color color);
+                    TranslationOnly(out float ox, out float oy);
+                    FreeOsWindow.Text(window, (int)(left + ox), (int)(lineTop + oy), line, color.ToArgb(), clipRect.X, clipRect.Y, clipRect.Width, clipRect.Height);
+                    continue;
+                }
+                float scale = font.Scale;
+                var place = new Matrix(scale, 0, 0, scale, left, lineTop);
+                place.Multiply(Device(), MatrixOrder.Append);
+                brush.Pack(Device(), out int[] paintInts, out float[] paintFloats, out int[] texture);
+                GdiNative.DrawText(t, Pixels, clipOps, clipPoints, clipTypes, line, place.Elements, paintInts, paintFloats, texture);
             }
-            FreeOsWindow.Text(window, (int)(x + dx), (int)(y + dy), s, color.ToArgb(), clipRect.X, clipRect.Y, clipRect.Width, clipRect.Height);
         }
 
-        public void DrawString(string s, Font font, Brush brush, PointF point) => DrawString(s, font, brush, point.X, point.Y);
-
-        public void DrawString(string s, Font font, Brush brush, RectangleF layoutRectangle) =>
-            DrawString(s, font, brush, layoutRectangle.X, layoutRectangle.Y);
-
-        public SizeF MeasureString(string text, Font font)
+        private static float Offset(StringAlignment alignment, float room, float size)
         {
+            if (alignment == StringAlignment.Near)
+            {
+                return 0;
+            }
+            float free = room > 0 ? room - size : -size;
+            return alignment == StringAlignment.Center ? free / 2 : free;
+        }
+
+        public SizeF MeasureString(string text, Font font) => MeasureString(text, font, 0, null);
+
+        public SizeF MeasureString(string text, Font font, int width) => MeasureString(text, font, (float)width, null);
+
+        public SizeF MeasureString(string text, Font font, SizeF layoutArea) => MeasureString(text, font, layoutArea.Width, null);
+
+        public SizeF MeasureString(string text, Font font, SizeF layoutArea, StringFormat stringFormat) =>
+            MeasureString(text, font, layoutArea.Width, stringFormat);
+
+        public SizeF MeasureString(string text, Font font, int width, StringFormat format) => MeasureString(text, font, (float)width, format);
+
+        public SizeF MeasureString(string text, Font font, PointF origin, StringFormat stringFormat) => MeasureString(text, font, 0, stringFormat);
+
+        private SizeF MeasureString(string text, Font font, float width, StringFormat format)
+        {
+            if (font == null)
+            {
+                throw new ArgumentNullException("font");
+            }
             if (string.IsNullOrEmpty(text))
             {
                 return SizeF.Empty;
             }
-            return new SizeF(FreeOsWindow.TextWidth(text), FreeOsWindow.TextHeight());
+            var lines = TextLayout.Lines(text, font, width, format);
+            float widest = 0;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                widest = Math.Max(widest, TextLayout.Width(lines[i], font));
+            }
+            return new SizeF(widest, lines.Count * font.GetHeight());
         }
     }
 }

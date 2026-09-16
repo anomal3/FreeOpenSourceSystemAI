@@ -4213,6 +4213,15 @@ pub const ALL: &[Scenario] = &[
             Step::Await("arcs: 4 0,3,3,3,1,3,3,3,3,3,3,3,3,3 | 5 0,1,3,3,131", 60_000),
             Step::Await("clip path: #..# 255,0,0,255 255,0,0,0", 60_000),
             Step::Await("fill region: #.#.#", 60_000),
+            // Фаза N9c: текст системным шрифтом в кегле программы — вдвое
+            // крупнее, повёрнутый, по центру прямоугольника, отсечённый. Шрифт
+            // здесь настоящий (в песочнице clr-check — прямоугольники на месте
+            // знаков), а строки — те же отношения, что у GDI+.
+            Step::Await("measure: True True True True {Width=0, Height=0} True True", 60_000),
+            Step::Await("text: True True True", 60_000),
+            Step::Await("rotated text: True True True", 60_000),
+            Step::Await("centered text: Center Center True True True", 60_000),
+            Step::Await("clipped text: True True", 60_000),
             Step::Await("buffer: True True 255,240,244,248 255,255,140,0", 60_000),
             // Форма рисует в окно тем же растеризатором: картинку из Bitmap,
             // повёрнутые полупрозрачные лучи, штриховку, отсечённую эллипсом, и

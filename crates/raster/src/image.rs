@@ -134,3 +134,59 @@ fn bilinear(source: &Source<'_>, u: f64, v: f64, part: [f64; 4]) -> u32 {
     let byte = |v: f64| (libm::floor(v + 0.5).clamp(0.0, 255.0)) as u32;
     (byte(alpha) << 24) | (byte(channels[0] / alpha) << 16) | (byte(channels[1] / alpha) << 8) | byte(channels[2] / alpha)
 }
+
+/// Нарисовать кистью маску покрытия (глиф шрифта, фаза N9c): `coverage` —
+/// `width × height` уровней 0..=255, `to_device` переводит координаты маски
+/// в координаты устройства. Маска берётся смесью четырёх точек с центрами на
+/// половинках: глиф, увеличенный или повёрнутый, остаётся гладким, а без
+/// преобразования ложится точка в точку.
+pub fn draw_coverage(
+    target: &mut Target<'_, '_>,
+    paint: &crate::paint::Paint<'_>,
+    coverage: &[u8],
+    width: u32,
+    height: u32,
+    to_device: &Matrix,
+) {
+    if width == 0 || height == 0 || (width as usize).checked_mul(height as usize).is_none_or(|count| count > coverage.len()) {
+        return;
+    }
+    let Some(to_mask) = to_device.invert() else { return };
+    let (w, h) = (f64::from(width), f64::from(height));
+    let corners = [Point::new(-1.0, -1.0), Point::new(w + 1.0, -1.0), Point::new(w + 1.0, h + 1.0), Point::new(-1.0, h + 1.0)].map(|p| to_device.apply(p));
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for p in corners {
+        min_x = min_x.min(p.x);
+        min_y = min_y.min(p.y);
+        max_x = max_x.max(p.x);
+        max_y = max_y.max(p.y);
+    }
+    let limit = |v: f64| libm::floor(v).clamp(-16_777_216.0, 16_777_216.0) as i32;
+    let area = crate::scan::Bounds::new(limit(min_x), limit(min_y), limit(max_x) + 1, limit(max_y) + 1).intersect(&target.area());
+    let at = |x: i64, y: i64| -> f64 {
+        if x < 0 || y < 0 || x >= i64::from(width) || y >= i64::from(height) {
+            return 0.0;
+        }
+        f64::from(coverage[y as usize * width as usize + x as usize])
+    };
+    for y in area.y0..area.y1 {
+        for x in area.x0..area.x1 {
+            let p = to_mask.apply(Point::new(f64::from(x) + 0.5, f64::from(y) + 0.5));
+            let (u, v) = (p.x - 0.5, p.y - 0.5);
+            if !(u > -1.0 && u < w && v > -1.0 && v < h) {
+                continue;
+            }
+            let (fx, fy) = (libm::floor(u), libm::floor(v));
+            let (tx, ty) = (u - fx, v - fy);
+            let (ix, iy) = (fx as i64, fy as i64);
+            let level = at(ix, iy) * (1.0 - tx) * (1.0 - ty)
+                + at(ix + 1, iy) * tx * (1.0 - ty)
+                + at(ix, iy + 1) * (1.0 - tx) * ty
+                + at(ix + 1, iy + 1) * tx * ty;
+            let level = libm::floor(level + 0.5).clamp(0.0, 255.0) as u8;
+            if level != 0 {
+                target.paint_row(paint, y, x, &[level]);
+            }
+        }
+    }
+}

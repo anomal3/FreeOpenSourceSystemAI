@@ -34,7 +34,7 @@ use raster::{Matrix, Point};
 use crate::heap::{Items, Object};
 use crate::value::Value;
 use crate::vm::Vm;
-use crate::{Host, VmError, WindowPixels};
+use crate::{GlyphBitmap, Host, VmError, WindowPixels};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Gdi {
@@ -44,6 +44,7 @@ pub(crate) enum Gdi {
     DrawImage,
     RegionContains,
     RegionBounds,
+    DrawText,
 }
 
 pub(crate) const TABLE: &[(&str, Gdi)] = &[
@@ -62,6 +63,10 @@ pub(crate) const TABLE: &[(&str, Gdi)] = &[
     ),
     ("System.Drawing.GdiNative::RegionContains(int32[],float32[],uint8[],float32,float32)", Gdi::RegionContains),
     ("System.Drawing.GdiNative::RegionBounds(int32[],float32[],uint8[],float32[])", Gdi::RegionBounds),
+    (
+        "System.Drawing.GdiNative::DrawText(int32[],int32[],int32[],float32[],uint8[],string,float32[],int32[],float32[],int32[])",
+        Gdi::DrawText,
+    ),
 ];
 
 const FLAG_ANTIALIAS: i32 = 1;
@@ -181,6 +186,37 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, gdi: Gdi, args: &[Value]) -> Res
             })?;
             None
         }
+        // Строка системным шрифтом (фаза N9c): `place` переводит координаты
+        // строки в шрифте хоста (перо слева, верхняя линия строки сверху) в
+        // точки устройства — C# уже сложил в неё место, кегль и преобразование.
+        Gdi::DrawText => {
+            let target = ints(vm, arg(0)?)?.unwrap_or_default();
+            let clip = clip_program(vm, arg(2)?, arg(3)?, arg(4)?)?;
+            let text = alloc::string::String::from_utf16_lossy(&vm.string_units(arg(5)?)?.unwrap_or_default());
+            let place = matrix_arg(vm, arg(6)?)?;
+            let paint = PaintData::read(vm, arg(7)?, arg(8)?, arg(9)?)?;
+            let Some(place) = place else { return Ok(None) };
+            // Глифы — до того, как холст займёт точки окна у того же хоста.
+            let mut glyphs = Vec::new();
+            glyphs.try_reserve_exact(text.chars().count()).map_err(|_| VmError::OutOfMemory)?;
+            for ch in text.chars() {
+                let glyph = match vm.host.glyph(ch) {
+                    Some(glyph) => glyph,
+                    None => missing_glyph(vm, ch)?,
+                };
+                glyphs.push(glyph);
+            }
+            with_target(vm, &target, arg(1)?, &clip, |target| {
+                let paint = paint.paint();
+                let mut pen = 0i64;
+                for glyph in &glyphs {
+                    let at = Matrix { dx: (pen + i64::from(glyph.left)) as f64, dy: f64::from(glyph.top), ..Matrix::IDENTITY };
+                    raster::image::draw_coverage(target, &paint, &glyph.coverage, glyph.width, glyph.height, &at.then(&place));
+                    pen += i64::from(glyph.advance);
+                }
+            })?;
+            None
+        }
         Gdi::RegionContains => {
             let ops = ints(vm, arg(0)?)?.unwrap_or_default();
             let points = floats(vm, arg(1)?)?.unwrap_or_default();
@@ -211,6 +247,23 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, gdi: Gdi, args: &[Value]) -> Res
             Some(Value::I32(kind))
         }
     })
+}
+
+/// Знак без глифа у хоста — прямоугольник во всю его ширину и в середину
+/// строки: так видно, что текст есть, и видно, где он кончается.
+fn missing_glyph<H: Host>(vm: &mut Vm<'_, H>, ch: char) -> Result<GlyphBitmap, VmError> {
+    let mut buffer = [0u8; 4];
+    let advance = vm.host.text_width(ch.encode_utf8(&mut buffer));
+    let line = vm.host.text_height();
+    let (width, height) = (advance.saturating_sub(2), line / 2);
+    if ch.is_whitespace() || width == 0 || height == 0 {
+        return Ok(GlyphBitmap { advance, left: 0, top: 0, width: 0, height: 0, coverage: Vec::new() });
+    }
+    let count = width as usize * height as usize;
+    let mut coverage = Vec::new();
+    coverage.try_reserve_exact(count).map_err(|_| VmError::OutOfMemory)?;
+    coverage.resize(count, 255);
+    Ok(GlyphBitmap { advance, left: 1, top: (line / 4) as i32, width, height, coverage })
 }
 
 fn flags(target: &[i32]) -> i32 {

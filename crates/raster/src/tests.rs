@@ -310,3 +310,20 @@ fn dashes_leave_gaps() {
     let row: Vec<bool> = (0..16).map(|x| (board.at(x, 20) >> 16) & 0xFF == 0).collect();
     assert_eq!(row, [true, true, true, true, true, true, false, false, true, true, true, true, true, true, false, false]);
 }
+
+#[test]
+fn a_coverage_mask_lands_pixel_for_pixel_and_scales() {
+    let mask = [255u8, 0, 128, 255];
+    let mut board = Board::new();
+    let place = Matrix { dx: 3.0, dy: 4.0, ..Matrix::IDENTITY };
+    crate::image::draw_coverage(&mut board.target(), &BLACK, &mask, 2, 2, &place);
+    assert_eq!(board.at(3, 4), 0xFF00_0000);
+    assert_eq!(board.at(4, 4), WHITE);
+    assert_eq!((board.at(3, 5) >> 16) & 0xFF, 127);
+    assert_eq!(board.at(4, 5), 0xFF00_0000);
+    let mut board = Board::new();
+    let double = Matrix { m11: 4.0, m22: 4.0, dx: 10.0, dy: 10.0, ..Matrix::IDENTITY };
+    crate::image::draw_coverage(&mut board.target(), &BLACK, &[255], 1, 1, &double);
+    assert!((board.at(12, 12) >> 16) & 0xFF < 128, "the scaled mask keeps ink in its middle");
+    assert_eq!(board.at(20, 20), WHITE);
+}
