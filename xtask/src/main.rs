@@ -103,6 +103,12 @@ enum Command {
     Phone(PhoneArgs),
     /// Принести прошивку тачскрина телефона: чужая, в хранилище её нет.
     PhoneFirmware,
+    /// Снять экран телефона по кабелю в PNG (`oem shot` + `get_staged`).
+    PhoneShot {
+        /// Куда положить снимок.
+        #[arg(default_value = "build/phone-shot.png")]
+        out: std::path::PathBuf,
+    },
     /// Пересобрать образец тома btrfs, по которому идут тесты крейта `btrfs`.
     ///
     /// Нужен WSL с `btrfs-progs`: `mkfs.btrfs` на Windows взять негде. Готовый
@@ -702,6 +708,10 @@ fn real_main() -> Result<()> {
 
         Command::PhoneFirmware => {
             phone::fetch_firmware()?;
+        }
+
+        Command::PhoneShot { out } => {
+            phone::shot(&out)?;
         }
 
         Command::BtrfsFixture => {

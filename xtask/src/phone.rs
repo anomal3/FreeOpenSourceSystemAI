@@ -938,6 +938,64 @@ fn firmware_present() -> bool {
 /// Потому что кристалл NT36525B **не хранит прошивку**: при включении в нём
 /// поднимается один загрузчик, а исполняемый образ каждый раз кладёт в его ОЗУ
 /// хозяин. Нет образа — панель отвечает, кто она такая, и молчит о касаниях.
+/// Снять экран телефона по кабелю и сохранить PNG.
+///
+/// Ядро складывает снимок по `oem shot` (заголовок `FSHT`, ширина, высота,
+/// порядок цвета, затем точки по 4 байта), `fastboot get_staged` его забирает.
+/// Зачем это — см. `Fastboot::stage_screen` в ядре: видеть телефон, не прося
+/// человека его сфотографировать.
+pub fn shot(out: &Path) -> Result<()> {
+    let fastboot = fastboot_path();
+    let raw = out.with_extension("raw");
+    util::run(std::process::Command::new(&fastboot).args(["oem", "shot"]), "fastboot oem shot")?;
+    util::run(
+        std::process::Command::new(&fastboot).arg("get_staged").arg(&raw),
+        "fastboot get_staged",
+    )?;
+    let bytes = std::fs::read(&raw).with_context(|| format!("не прочитать {}", raw.display()))?;
+    std::fs::remove_file(&raw).ok();
+    if bytes.len() < 16 || &bytes[..4] != b"FSHT" {
+        bail!("снимок без заголовка FSHT: {} байт", bytes.len());
+    }
+    let field = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap_or_default());
+    let (width, height, bgr) = (field(4), field(8), field(12) == 1);
+    let points = width as usize * height as usize;
+    if bytes.len() < 16 + points * 4 {
+        bail!("снимок обрезан: {width}x{height}, {} байт", bytes.len());
+    }
+    let mut rgb = Vec::with_capacity(points * 3);
+    for pixel in bytes[16..16 + points * 4].chunks_exact(4) {
+        if bgr {
+            rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+        } else {
+            rgb.extend_from_slice(&pixel[..3]);
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = std::fs::File::create(out).with_context(|| format!("не создать {}", out.display()))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(&rgb)?;
+    println!("{}: {width}x{height}", out.display());
+    Ok(())
+}
+
+/// Где взять `fastboot`: переменная `FASTBOOT`, затем обычное место
+/// platform-tools на Windows, затем `PATH`.
+fn fastboot_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("FASTBOOT") {
+        return path.into();
+    }
+    let windows = Path::new(r"C:\Program Files\platform-tools\fastboot.exe");
+    if windows.is_file() {
+        return windows.to_path_buf();
+    }
+    "fastboot".into()
+}
+
 pub fn fetch_firmware() -> anyhow::Result<()> {
     /// Открытое хранилище двоичных файлов этого аппарата, из которого их берут
     /// и сборки Android для него.

@@ -221,7 +221,8 @@ impl Gadget {
         self.poll_control();
 
         if self.configured {
-            self.fastboot.poll(&mut Bulk { musb: self.musb });
+            let max = usize::from(self.bulk_max_packet());
+            self.fastboot.poll(&mut Bulk { musb: self.musb, max });
         }
     }
 
@@ -648,9 +649,17 @@ fn string_descriptor(number: u8, out: &mut [u8; REPLY_MAX]) -> Option<usize> {
 /// Объёмные точки — то немногое, что нужно протоколу поверх них.
 pub struct Bulk {
     musb: Musb,
+    /// Наибольший пакет объёмной точки на договорённой скорости.
+    max: usize,
 }
 
 impl Bulk {
+    /// Наибольший пакет, который можно отдать за раз.
+    #[must_use]
+    pub const fn max_packet(&self) -> usize {
+        self.max
+    }
+
     /// Забрать пакет от хоста, если он пришёл.
     ///
     /// Пакет длиннее приёмника дочитывается и выбрасывается: оставить хвост в

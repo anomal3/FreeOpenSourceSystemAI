@@ -94,6 +94,12 @@ static DESKTOP: SpinLock<Option<Compositor>> = SpinLock::new(None);
 /// смены режима. Драйвер сверяет с ним, тот ли адаптер показывает картинку.
 static FRAMEBUFFER: SpinLock<boot_info::Framebuffer> = SpinLock::new(boot_info::Framebuffer::NONE);
 
+/// Фреймбуфер, на котором стол рисует сейчас (для снимка экрана по кабелю).
+#[must_use]
+pub fn framebuffer() -> boot_info::Framebuffer {
+    *FRAMEBUFFER.lock()
+}
+
 /// Когда был прошлый щелчок по значку и по какому именно.
 ///
 /// Обычные статики, а не поле стола: стол вынимается из-под замка на время

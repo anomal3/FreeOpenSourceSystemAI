@@ -52,6 +52,8 @@ enum State {
     Lines { at: u8 },
     /// Ведёт синтетический жест: концы, очередной шаг и когда его подать.
     Drag { from: (u32, u32), to: (u32, u32), step: u32, due_ns: u64 },
+    /// Отдаёт сложенный снимок (`fastboot get_staged`): сколько уже ушло.
+    Upload { sent: usize },
 }
 
 /// Сколько строк помещается в один ответ.
@@ -92,6 +94,8 @@ pub struct Fastboot {
     lines: [[u8; TEXT]; LINES],
     line_len: [u8; LINES],
     line_count: u8,
+    /// Данные для `fastboot get_staged` — снимок экрана из `oem shot`.
+    staged: alloc::vec::Vec<u8>,
 }
 
 impl Fastboot {
@@ -106,6 +110,7 @@ impl Fastboot {
             lines: [[0; TEXT]; LINES],
             line_len: [0; LINES],
             line_count: 0,
+            staged: alloc::vec::Vec::new(),
         }
     }
 
@@ -170,6 +175,11 @@ impl Fastboot {
             return;
         }
 
+        if let State::Upload { sent } = self.state {
+            self.continue_upload(bulk, sent);
+            return;
+        }
+
         if let State::Drag { .. } = self.state {
             self.continue_drag();
             return;
@@ -201,6 +211,16 @@ impl Fastboot {
             self.synth_drag(rest);
         } else if let Some(rest) = text.strip_prefix("oem t") {
             self.touch_command(rest);
+        } else if text == "oem shot" {
+            self.stage_screen();
+        } else if text == "upload" {
+            if self.staged.is_empty() {
+                self.respond(b"FAIL", "nothing staged: oem shot first");
+            } else {
+                let size = alloc::format!("{:08x}", self.staged.len());
+                self.respond(b"DATA", &size);
+                self.state = State::Upload { sent: 0 };
+            }
         } else if text == "oem mem" {
             // Память по кабелю. Спрашивать её журналом нельзя: журнал говорит
             // о том, что уже случилось, а здесь нужно состояние **сейчас** —
@@ -583,6 +603,81 @@ impl Fastboot {
             step: 0,
             due_ns: crate::time::uptime_ns(),
         };
+    }
+
+    /// Снять экран и положить снимок под `fastboot get_staged`.
+    ///
+    /// # Зачем
+    ///
+    /// Чтобы видеть телефон, не прося человека сфотографировать его. Каждый
+    /// снимок телефоном — это просьба, ожидание и картинка под углом, где тонкая
+    /// линия в две точки не видна вовсе; а переделка стола по макету — это
+    /// сотни таких вопросов.
+    ///
+    /// Формат: заголовок `FSHT`, ширина, высота, порядок цвета (0 RGB, 1 BGR),
+    /// все четыре — по 4 байта, младший первым; дальше строки по `width` точек
+    /// по 4 байта, без хвостов развёртки. В PNG переводит `cargo xtask
+    /// phone-shot`.
+    ///
+    /// Буфер копируется **сразу**, а не отдаётся по мере выдачи: выдача длится
+    /// секунды, а стол за это время успевает перерисоваться — и снимок оказался
+    /// бы склеен из разных кадров.
+    fn stage_screen(&mut self) {
+        let fb = crate::ui::framebuffer();
+        if fb.base == 0 || fb.width == 0 {
+            self.respond(b"FAIL", "no screen");
+            return;
+        }
+        let (width, height, stride) = (fb.width as usize, fb.height as usize, fb.stride as usize);
+        let format: u32 = match fb.format {
+            boot_info::PixelFormat::Bgr => 1,
+            _ => 0,
+        };
+        self.staged.clear();
+        if self.staged.try_reserve_exact(16 + width * height * 4).is_err() {
+            self.respond(b"FAIL", "no memory for the shot");
+            return;
+        }
+        for field in [u32::from_le_bytes(*b"FSHT"), fb.width, fb.height, format] {
+            self.staged.extend_from_slice(&field.to_le_bytes());
+        }
+        for y in 0..height {
+            // SAFETY: буфер кадра отображён целиком (им рисует стол), строка
+            // `y` лежит в пределах `stride * height`, проверенных `Screen::new`.
+            let row = unsafe {
+                core::slice::from_raw_parts((fb.base as usize + y * stride * 4) as *const u8, width * 4)
+            };
+            self.staged.extend_from_slice(row);
+        }
+        let text = alloc::format!("{width}x{height}, {} bytes staged", self.staged.len());
+        self.respond(b"OKAY", &text);
+    }
+
+    /// Отдать очередные пакеты снимка.
+    ///
+    /// За проход уходит не один пакет, а столько, сколько хост успевает
+    /// забрать за пару миллисекунд: по пакету на проход четыре с половиной
+    /// мегабайта шли бы десять секунд.
+    fn continue_upload(&mut self, bulk: &mut Bulk, mut sent: usize) {
+        let packet = bulk.max_packet();
+        let deadline = crate::time::uptime_ns() + 2_000_000;
+        while sent < self.staged.len() {
+            let end = (sent + packet).min(self.staged.len());
+            if !bulk.send(&self.staged[sent..end]) {
+                if crate::time::uptime_ns() >= deadline {
+                    break;
+                }
+                core::hint::spin_loop();
+                continue;
+            }
+            sent = end;
+        }
+        if sent < self.staged.len() {
+            self.state = State::Upload { sent };
+        } else {
+            self.state = State::Idle;
+            self.respond(b"OKAY", "");
+        }
     }
 
     /// Подать очередной шаг жеста, если подошло его время.
