@@ -625,6 +625,7 @@ dependencies = [
  "mini-ui",
  "osupdate",
  "slots",
+ "swipe",
  "sysconf",
  "usb-hid",
  "user-abi",

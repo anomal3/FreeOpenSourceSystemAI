@@ -1233,6 +1233,10 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
 
     let (x, y) = desktop.pointer_position();
+    if (dx != 0 || dy != 0) && event.buttons.contains(Buttons::LEFT) {
+        // Палец ведут по экранной клавиатуре: путь копится до отпускания.
+        desktop.keyboard_stroke_to(x, y);
+    }
     if dx != 0 || dy != 0 {
         hover(desktop, x, y, event.buttons);
     }
@@ -1329,7 +1333,17 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         }
     }
     if event.released(Buttons::LEFT) {
-        desktop.keyboard_release();
+        match desktop.keyboard_release() {
+            keyboard::Release::Nothing | keyboard::Release::Language => {}
+            keyboard::Release::Key(action) => type_on_screen(desktop, action),
+            keyboard::Release::Word { word, capital } => {
+                type_text(word, capital);
+                type_text(" ", false);
+                if capital {
+                    desktop.keyboard_consume_shift();
+                }
+            }
+        }
         // Размер, отложенный до кадра, применяется до того, как спросят, где и
         // какого размера окно: иначе отпускание описывало бы окно на шаг назад.
         desktop.settle_drag();
@@ -1370,29 +1384,21 @@ fn launch_target(desktop: &mut Compositor, target: start::Target) {
             // Команда набирается в терминале, но не исполняется: человек видит,
             // что будет сделано, и сам жмёт ↵.
             launch(desktop, App::Terminal);
-            for letter in command.chars() {
-                let code = if letter == ' ' {
-                    Some(crate::input::KeyCode::Space)
-                } else {
-                    keyboard::code_for(letter)
-                };
-                if let Some(code) = code {
-                    crate::input::post(code, true);
-                    crate::input::post(code, false);
-                }
-            }
+            type_text(command, false);
             kprintln!("  start       : typed command '{command}'");
         }
     }
 }
 
-/// Напечатать то, что нажато на экранной клавиатуре.
+/// Набрать текст так, как его набрала бы клавиатура: знак за знаком, кодами
+/// клавиш действующей раскладки (`capital` — первая буква заглавная).
 ///
-/// Клавиши уходят в общую очередь ввода нажатием и отпусканием — так же, как их
-/// кладёт USB-клавиатура (см. [`keyboard`]). Shift, нужный знаку, оборачивает
-/// нажатие и отпускается сразу за ним: оставленный нажатым, он сделал бы
-/// заглавными все следующие буквы с физической клавиатуры тоже.
-fn type_on_screen(desktop: &mut Compositor, action: keyboard::Action) {
+/// Знака, которого в раскладке нет (латиница быстрой команды `free` в русской),
+/// нет и на её клавишах. Тогда перед ним посылается Alt+Shift, а после текста —
+/// ещё раз, обратно. Раскладку сочетание переключает там же, где знак
+/// получается из кода, — у того, кто разбирает очередь, по порядку событий, —
+/// поэтому переключение не обгоняет знаки и не отстаёт от них.
+fn type_text(text: &str, capital: bool) {
     use crate::input::{self, KeyCode};
     let tap = |code: KeyCode, shift: bool| {
         if shift {
@@ -1404,25 +1410,70 @@ fn type_on_screen(desktop: &mut Compositor, action: keyboard::Action) {
             input::post(KeyCode::LeftShift, false);
         }
     };
+    let chord = || {
+        input::post(KeyCode::LeftAlt, true);
+        input::post(KeyCode::LeftShift, true);
+        input::post(KeyCode::LeftShift, false);
+        input::post(KeyCode::LeftAlt, false);
+    };
+    let original = keymap::layout();
+    let mut current = original;
+    for (index, ch) in text.chars().enumerate() {
+        let ch = if capital && index == 0 { ch.to_uppercase().next().unwrap_or(ch) } else { ch };
+        let found = keymap::code_for(ch, current).map(|key| (key, current)).or_else(|| {
+            let other = current.other();
+            keymap::code_for(ch, other).map(|key| (key, other))
+        });
+        let Some(((code, shift), layout)) = found else {
+            continue;
+        };
+        if layout != current {
+            chord();
+            current = layout;
+        }
+        tap(code, shift);
+    }
+    if current != original {
+        chord();
+    }
+}
+
+/// Напечатать то, что нажато на экранной клавиатуре.
+///
+/// Клавиши уходят в общую очередь ввода нажатием и отпусканием — так же, как их
+/// кладёт USB-клавиатура (см. [`keyboard`] и [`type_text`]).
+fn type_on_screen(desktop: &mut Compositor, action: keyboard::Action) {
+    use crate::input::{self, KeyCode};
+    let tap = |code: KeyCode| {
+        input::post(code, true);
+        input::post(code, false);
+    };
     match action {
-        keyboard::Action::Key { code, shift } => {
-            let letter = (KeyCode::A as u8..=KeyCode::Z as u8).contains(&(code as u8));
-            tap(code, shift || (letter && desktop.keyboard_shifted()));
-            if letter {
+        keyboard::Action::Char(ch) => {
+            type_text(ch.encode_utf8(&mut [0u8; 4]), false);
+            if ch.is_alphabetic() {
                 desktop.keyboard_consume_shift();
             }
         }
-        keyboard::Action::Backspace => tap(KeyCode::Backspace, false),
-        keyboard::Action::Space => tap(KeyCode::Space, false),
-        keyboard::Action::Enter => tap(KeyCode::Enter, false),
-        keyboard::Action::Tab => tap(KeyCode::Tab, false),
+        keyboard::Action::Backspace => tap(KeyCode::Backspace),
+        keyboard::Action::Space => tap(KeyCode::Space),
+        keyboard::Action::Enter => tap(KeyCode::Enter),
+        keyboard::Action::Tab => tap(KeyCode::Tab),
         keyboard::Action::Chip(word) => {
-            for letter in word.chars() {
-                if let Some(code) = keyboard::code_for(letter) {
-                    tap(code, false);
-                }
-            }
+            type_text(word, false);
             kprintln!("  keyboard    : typed '{word}'");
+        }
+        keyboard::Action::Suggest(index) => {
+            // Замена вставленного слова: стереть его вместе с пробелом и
+            // набрать выбранное — тоже с пробелом.
+            if let Some((old, new, capital)) = desktop.keyboard_suggest(index) {
+                for _ in 0..=old.chars().count() {
+                    tap(KeyCode::Backspace);
+                }
+                type_text(new, capital);
+                tap(KeyCode::Space);
+                kprintln!("  keyboard    : replaced '{old}' with '{new}'");
+            }
         }
         // Состояние самой клавиатуры — уже учтено в `Keyboard::press`.
         keyboard::Action::Shift | keyboard::Action::Page => {}

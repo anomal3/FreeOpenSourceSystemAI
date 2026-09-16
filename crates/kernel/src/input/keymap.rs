@@ -251,6 +251,48 @@ pub fn char_for_code(code: KeyCode, mods: Modifiers) -> Option<char> {
     }
 }
 
+/// Клавиши, дающие знаки, — в них ищет [`code_for`].
+const PRINTING: [KeyCode; 48] = [
+    KeyCode::A, KeyCode::B, KeyCode::C, KeyCode::D, KeyCode::E, KeyCode::F, KeyCode::G,
+    KeyCode::H, KeyCode::I, KeyCode::J, KeyCode::K, KeyCode::L, KeyCode::M, KeyCode::N,
+    KeyCode::O, KeyCode::P, KeyCode::Q, KeyCode::R, KeyCode::S, KeyCode::T, KeyCode::U,
+    KeyCode::V, KeyCode::W, KeyCode::X, KeyCode::Y, KeyCode::Z,
+    KeyCode::Digit0, KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4,
+    KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8, KeyCode::Digit9,
+    KeyCode::Minus, KeyCode::Equal, KeyCode::LeftBracket, KeyCode::RightBracket,
+    KeyCode::Backslash, KeyCode::Semicolon, KeyCode::Apostrophe, KeyCode::Grave,
+    KeyCode::Comma, KeyCode::Period, KeyCode::Slash, KeyCode::Space,
+];
+
+/// Знак клавиши в **заданной** раскладке — без Caps, Ctrl и Num Lock.
+fn char_in(layout: Layout, code: KeyCode, shift: bool) -> Option<char> {
+    let cyrillic = layout == Layout::Ru;
+    if let Some((lower, upper)) = if cyrillic { ru_letter(code) } else { letter(code) } {
+        return Some(if shift { upper } else { lower });
+    }
+    let pair = if cyrillic { ru_printable(code) } else { None };
+    if let Some((plain, shifted)) = pair.or_else(|| printable(code)) {
+        return Some(if shift { shifted } else { plain });
+    }
+    (code == KeyCode::Space).then_some(' ')
+}
+
+/// Какой клавишей, и с Shift ли, набирается знак в этой раскладке. `None` —
+/// в ней его нет: латиницы в русской, кириллицы в английской.
+///
+/// Нужна экранной клавиатуре. Она посылает коды клавиш, как USB-клавиатура,
+/// а знак из кода делает раскладка — поэтому «/» в русской раскладке набирается
+/// не той клавишей, что в английской (там на ней точка).
+#[must_use]
+pub fn code_for(ch: char, layout: Layout) -> Option<(KeyCode, bool)> {
+    PRINTING.iter().find_map(|&code| {
+        [false, true]
+            .into_iter()
+            .find(|&shift| char_in(layout, code, shift) == Some(ch))
+            .map(|shift| (code, shift))
+    })
+}
+
 /// Буква: строчный и заглавный варианты.
 const fn letter(code: KeyCode) -> Option<(char, char)> {
     let pair = match code {

@@ -1397,17 +1397,20 @@ impl Compositor {
         self.keyboard.as_mut()?.press(x, y)
     }
 
-    /// Палец отпустили — снять подсветку кнопки.
-    pub fn keyboard_release(&mut self) {
-        if let Some(keyboard) = self.keyboard.as_mut() {
-            keyboard.release();
-        }
+    /// Палец отпустили — снять подсветку кнопки и узнать, чем было касание
+    /// буквы или пробела: нажатием, словом или сменой языка.
+    pub fn keyboard_release(&mut self) -> keyboard::Release {
+        self.keyboard.as_mut().map_or(keyboard::Release::Nothing, Keyboard::release)
     }
 
-    /// Включён ли одноразовый Shift клавиатуры.
-    #[must_use]
-    pub fn keyboard_shifted(&self) -> bool {
-        self.keyboard.as_ref().is_some_and(Keyboard::shifted)
+    /// Палец ведут по клавиатуре. `true` — идёт жест.
+    pub fn keyboard_stroke_to(&mut self, x: i32, y: i32) -> bool {
+        self.keyboard.as_mut().is_some_and(|keyboard| keyboard.stroke_to(x, y))
+    }
+
+    /// Нажата подсказка: `(вставленное, новое, с заглавной)`.
+    pub fn keyboard_suggest(&mut self, index: usize) -> Option<(&'static str, &'static str, bool)> {
+        self.keyboard.as_mut()?.suggest(index)
     }
 
     /// Буква напечатана — снять одноразовый Shift.
@@ -1940,6 +1943,18 @@ impl Compositor {
             crate::kprintln!("  keyboard    : {}", if shown { "shown" } else { "hidden" });
         }
         self.advance_flight();
+        // След пальца по клавиатуре и язык её подписей. Анимация идёт, пока
+        // летит окно или тлеет след: оболочка будит стол по этому признаку.
+        let mut trail_damage = Rect::EMPTY;
+        let mut trail = false;
+        if let Some(keyboard) = self.keyboard.as_mut() {
+            keyboard.sync_lang();
+            let now = crate::time::uptime_ms();
+            trail_damage = keyboard.advance_trail(now);
+            trail = keyboard.trail_visible();
+        }
+        self.mark(trail_damage);
+        super::set_animating(self.flight.is_some() || trail);
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
             return;
@@ -2105,6 +2120,9 @@ impl Compositor {
                     let r = mini_ui::paint::Ctx::scaled(self.scale).px(34);
                     self.drop_shadow(back, keyboard.rect, band, dy, r);
                     self.stack(back, keyboard.surface(), keyboard.rect, band, dy, r);
+                }
+                if keyboard.trail_visible() {
+                    keyboard.draw_trail(back, band, dy, crate::time::uptime_ms());
                 }
                 true
             }
