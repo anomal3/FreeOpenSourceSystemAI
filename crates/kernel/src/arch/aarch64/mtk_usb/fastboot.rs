@@ -243,6 +243,8 @@ impl Fastboot {
             );
             self.say(text.as_bytes());
             let (wall, icons, windows, shadow, top) = crate::ui::layer_timing();
+            let text = alloc::format!("dock in {} bands", crate::ui::dock_bands());
+            self.say(text.as_bytes());
             let text = alloc::format!(
                 "wall {} icons {} win {} (shadow {}) top {} us",
                 wall / n / 1000,

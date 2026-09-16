@@ -1326,8 +1326,15 @@ impl Compositor {
         }
         let t_windows = crate::time::uptime_ns();
         if let Some(panel) = self.panel.as_ref() {
-            self.drop_shadow(back, panel.rect, band, dy, radius);
-            self.stack(back, panel.surface(), panel.rect, band, dy, radius);
+            // Полосы, которых док не задевает, отсекаются здесь, до всякой
+            // работы. `stack` проверяет то же самое, но уже внутри — а нам
+            // нужно знать, сколько раз он вызывается вхолостую: счётчик
+            // `top` растёт и при тапе в верх экрана, где дока нет вовсе.
+            if !panel.rect.intersect(&band).is_empty() {
+                super::note_dock_band();
+                self.drop_shadow(back, panel.rect, band, dy, radius);
+                self.stack(back, panel.surface(), panel.rect, band, dy, radius);
+            }
         }
         if let Some(menu) = self.menu.as_ref() {
             if menu.is_open() {

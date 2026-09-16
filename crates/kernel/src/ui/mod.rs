@@ -755,6 +755,20 @@ pub fn damage_timing() -> (u64, u64, u64, u64) {
     )
 }
 
+/// Сколько полос кадра действительно задел док.
+static DOCK_BANDS: AtomicU64 = AtomicU64::new(0);
+
+/// Док скопирован в полосу.
+pub fn note_dock_band() {
+    DOCK_BANDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Сколько раз док копировался в полосу.
+#[must_use]
+pub fn dock_bands() -> u64 {
+    DOCK_BANDS.load(Ordering::Relaxed)
+}
+
 /// Слои по отдельности — обои, значки, окна, из них тени, верхние слои.
 #[must_use]
 pub fn layer_timing() -> (u64, u64, u64, u64, u64) {
