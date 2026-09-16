@@ -245,7 +245,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 36] = [
+const PROGRAMS: [(&CStr16, &str); 37] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -268,6 +268,9 @@ const PROGRAMS: [(&CStr16, &str); 36] = [
     (cstr16!("\\FREEOS\\BIN\\ECHOD"), "echod"),
     (cstr16!("\\FREEOS\\BIN\\ECHOC"), "echoc"),
     (cstr16!("\\FREEOS\\BIN\\SSHD"), "sshd"),
+    // Файлы по SSH (фаза 38c). `sshd` запускает его от имени вошедшего; без
+    // него подсистема `sftp` отвечает отказом.
+    (cstr16!("\\FREEOS\\BIN\\SFTPSRV"), "sftp-server"),
     (cstr16!("\\FREEOS\\BIN\\CAT"), "cat"),
     // Имя на носителе короче настоящего: FAT здесь без длинных имён, а
     // `SYSUPDATE` — девять знаков. В `/bin` файл ложится полным именем.

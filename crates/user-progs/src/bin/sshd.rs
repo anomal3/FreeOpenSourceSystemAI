@@ -55,6 +55,13 @@
 //! нужны `pipe` и перенаправление при `spawn`. Выдавать сегодняшний набор
 //! встроенных команд за оболочку нельзя, поэтому `help` говорит об этом прямо.
 //!
+//! # SFTP (фаза 38c)
+//!
+//! Запрос `subsystem sftp` запускает `/bin/sftp-server` от имени вошедшего, и
+//! сервер дальше только возит байты между каналом и этой программой (см.
+//! [`run_sftp`]). Протокол разбирает она, а не мы: разбор чужих байтов и
+//! проверка прав остаются у задачи с правами одного человека.
+//!
 //! # Ключ хоста
 //!
 //! Тридцать два байта в `/etc/ssh_host_ed25519_key`, права `0600`. Формат свой,
@@ -86,7 +93,7 @@ use user_abi::Stat;
 use user_progs::{
     ERR_AGAIN, KIND_DIRECTORY, KIND_FILE, Path, accept, bind, close, close_socket, create, error,
     error_num, exit, launch, listen, open, pipe, random, read, recv, send, shutdown, sleep_ms, stat,
-    stream, stream_state, uptime_ms, wait, write,
+    stream, stream_state, uptime_ms, wait, write, yield_now,
 };
 
 /// Порт, на котором ждёт сервер.
@@ -115,7 +122,13 @@ fn passwd_path() -> user_progs::Path {
 }
 
 /// Размер приёмного и передающего буферов.
-const BUFFER: usize = 8192;
+///
+/// Пакет наибольшего размера, который согласен принять транспорт
+/// ([`ssh::MAX_PACKET`]), плюс поле длины и подпись. До фазы 38c здесь стояло
+/// 8 КиБ, и этого хватало разговору построчной оболочки; SFTP же пишет файл
+/// кусками по 32 КиБ, и пакет с таким куском либо не помещался бы, либо
+/// дробился бы на восемь, каждый со своим шифрованием и подписью.
+const BUFFER: usize = 36_000;
 
 /// Сколько ждать байт, прежде чем проверить состояние соединения.
 const IDLE_MS: u64 = 5;
@@ -149,7 +162,11 @@ const CHANNEL_ID: u32 = 0;
 const OUR_WINDOW: u32 = 32 * 1024;
 
 /// Наибольший пакет канала, который мы согласны принять.
-const OUR_MAX_PACKET: u32 = 4096;
+///
+/// 32 КиБ — столько просит OpenSSH и столько пишет за раз клиент SFTP. Четыре
+/// килобайта (как было до фазы 38c) стоили бы восьми пакетов на один кусок
+/// файла.
+const OUR_MAX_PACKET: u32 = 32 * 1024;
 
 /// Сколько байт вывода копится, прежде чем уехать пакетом.
 const STAGE: usize = 512;
@@ -175,6 +192,12 @@ static mut FILLED: usize = 0;
 static mut PAYLOAD: [u8; BUFFER] = [0u8; BUFFER];
 /// Буфер под собираемый пакет.
 static mut OUTPUT: [u8; BUFFER] = [0u8; BUFFER];
+/// Буфер под пакет в оболочке: заголовок, набивка, подпись.
+///
+/// Статический с фазы 38c: пока пакет был 8 КиБ, он жил на стеке функции
+/// отправки, а 36 КиБ в кадре при стеке программы в 64 КиБ — это охранная
+/// страница при первом же глубоком вызове.
+static mut FRAMED: [u8; BUFFER + 64] = [0u8; BUFFER + 64];
 /// Буфер под прочитанный файл: `/etc/passwd` или `authorized_keys`.
 ///
 /// Статический, а не на стеке: стека у программы 32 КиБ на всё, и четыре
@@ -894,6 +917,22 @@ fn channel_request(
             sink.finish(channel);
             Some(true)
         }
+        // Подсистема `sftp` (фаза 38c): файлы туда и обратно штатным клиентом.
+        // Другой подсистемы нет, и чужое имя получает отказ — так же, как
+        // неизвестный запрос ниже.
+        b"subsystem" => {
+            let name = reader.string()?;
+            if name != b"sftp" {
+                if want_reply {
+                    reply_to_request(client, transport, channel.peer, false)?;
+                }
+                error("sshd: subsystem '");
+                error_bytes(name);
+                error("' refused; only sftp is served\n");
+                return Some(true);
+            }
+            run_sftp(client, transport, channel, user, want_reply)
+        }
         // Псевдотерминала здесь нет, и притворяться, что есть, нельзя: клиент,
         // получивший согласие, переключит свой терминал в неструктурированный
         // режим и станет ждать от нас управляющих последовательностей. Честный
@@ -1370,6 +1409,381 @@ fn run_program(line: &[u8], user: &User, sink: &mut Sink<'_>) -> u32 {
     if code < 0 { 1 } else { code as u32 }
 }
 
+// --- подсистема sftp -----------------------------------------------------------
+
+/// Сколько байт клиента мы готовы держать, пока программа их не забрала.
+///
+/// Это же окно, которое объявляется клиенту на время SFTP. Прибавка окна
+/// отправляется не по приходу байт, а по их **доставке** в канал к программе:
+/// так клиент не может прислать больше, чем помещается в [`PENDING`], и
+/// медленный диск тормозит клиента, а не переполняет сервер.
+const SFTP_WINDOW: usize = 128 * 1024;
+
+/// Байты клиента, ещё не отданные программе.
+static mut PENDING: [u8; SFTP_WINDOW] = [0u8; SFTP_WINDOW];
+
+/// Сколько кругов без дела крутиться уступками, прежде чем уснуть.
+///
+/// Сон здесь — это тик таймера, 10 мс, а канал к программе — четыре килобайта.
+/// Засыпая после каждого куска, сервер упирался бы в 400 КиБ/с при любом
+/// диске и любой сети. Уступка отдаёт процессор программе и возвращается
+/// сразу; уснуть стоит, только когда долго не происходит ничего.
+const SPIN_BEFORE_SLEEP: u32 = 64;
+
+/// Обслужить подсистему `sftp`: запустить `/bin/sftp-server` от имени
+/// вошедшего и возить байты между ним и каналом, пока одна из сторон не
+/// закончит.
+///
+/// # Почему программой, а не здесь
+///
+/// Сервер исполняется от root, и каждый `open` внутри него проверялся бы по
+/// правам root. Та же причина, по которой фаза 38b выселила отсюда `ls` и
+/// `cat`; подробности — в заголовке `sftp-server.rs`.
+///
+/// # Двое, которых ждут сразу
+///
+/// Клиент и программа. Ждать одного, уснув на нём, нельзя: программа, чей
+/// канал вывода полон, стоит и не читает ввод; клиент, чьё окно кончилось,
+/// ждёт прибавки и не шлёт запросов. Поэтому цикл смотрит на всех по очереди и
+/// ничего не ждёт сам — и всякий раз, когда никто ничего не сделал, уступает
+/// процессор.
+fn run_sftp(
+    client: i64,
+    transport: &mut Transport,
+    channel: &mut Channel,
+    user: &User,
+    want_reply: bool,
+) -> Option<bool> {
+    let mut command = Path::new();
+    if !(command.push("/bin/sftp-server ") && command.push(user.home())) {
+        if want_reply {
+            reply_to_request(client, transport, channel.peer, false)?;
+        }
+        return Some(true);
+    }
+
+    let Ok((out_read, out_write)) = pipe() else {
+        error("sshd: out of memory for a pipe\n");
+        if want_reply {
+            reply_to_request(client, transport, channel.peer, false)?;
+        }
+        return Some(true);
+    };
+    let Ok((in_read, in_write)) = pipe() else {
+        close(out_read);
+        close(out_write);
+        error("sshd: out of memory for a pipe\n");
+        if want_reply {
+            reply_to_request(client, transport, channel.peer, false)?;
+        }
+        return Some(true);
+    };
+    let task = launch(command.as_str(), Some((user.uid, user.gid)), in_read, out_write);
+    // Концы программы закрываются сразу: пока сервер держит пишущий конец её
+    // вывода, конца файла на нём не наступит никогда — сервер сам и есть тот
+    // писатель, которого ждут.
+    close(out_write);
+    close(in_read);
+    if task < 0 {
+        close(out_read);
+        close(in_write);
+        error("sshd: cannot start /bin/sftp-server\n");
+        if want_reply {
+            reply_to_request(client, transport, channel.peer, false)?;
+        }
+        return Some(true);
+    }
+    if want_reply {
+        reply_to_request(client, transport, channel.peer, true)?;
+    }
+    error("sshd: sftp for ");
+    error(user.name());
+    error("\n");
+
+    let mut pump = Pump {
+        in_write: Some(in_write),
+        out_read,
+        start: 0,
+        end: 0,
+        // Сколько клиенту ещё можно прислать по нашему окну. Канал открыт с
+        // окном [`OUR_WINDOW`]; то, что пришло до подсистемы, из него уже
+        // вычтено.
+        allowance: OUR_WINDOW.saturating_sub(channel.consumed) as usize,
+        client_eof: false,
+    };
+    let outcome = pump.run(client, transport, channel);
+    // Что бы ни случилось, программа обязана закончиться: закрытый ввод даёт
+    // ей конец файла, закрытый вывод — отказ записи. Ждать её после этого
+    // безопасно — ей больше нечего ждать самой.
+    if let Some(fd) = pump.in_write.take() {
+        close(fd);
+    }
+    close(pump.out_read);
+    let code = wait(task);
+    let status = if code < 0 { 1 } else { code as u32 };
+    match outcome {
+        Finish::Exited => {
+            finish_channel(client, transport, channel, status)?;
+            Some(false)
+        }
+        Finish::ClosedByClient => {
+            error("sshd: sftp channel closed by the client\n");
+            Some(false)
+        }
+        Finish::Lost => None,
+    }
+}
+
+/// Чем кончилась подсистема.
+enum Finish {
+    /// Программа закончилась; канал закрываем мы, с кодом завершения.
+    Exited,
+    /// Клиент закрыл канал сам; наше закрытие уже отправлено.
+    ClosedByClient,
+    /// Соединения больше нет, или клиент нарушил протокол.
+    Lost,
+}
+
+/// Состояние перекачки между каналом SSH и программой.
+struct Pump {
+    /// Конец канала к программе. `None` — уже закрыт: клиент прислал `EOF`.
+    in_write: Option<i64>,
+    out_read: i64,
+    /// Недоставленные байты — `PENDING[start..end]`.
+    start: usize,
+    end: usize,
+    /// Сколько клиент ещё вправе прислать, не дожидаясь прибавки окна.
+    allowance: usize,
+    client_eof: bool,
+}
+
+impl Pump {
+    fn run(&mut self, client: i64, transport: &mut Transport, channel: &mut Channel) -> Finish {
+        // SAFETY: программа однопоточная, буфер берётся только здесь.
+        let pending = unsafe { &mut *(&raw mut PENDING) };
+        let mut idle = 0u32;
+        let mut quiet_since = uptime_ms();
+
+        loop {
+            let mut progress = false;
+
+            // 1. Всё, что пришло от клиента.
+            loop {
+                let payload = match poll_packet(client, transport) {
+                    Polled::Packet(payload) => payload,
+                    Polled::Nothing => break,
+                    Polled::Closed => return Finish::Lost,
+                };
+                progress = true;
+                match self.packet(client, transport, channel, payload, pending) {
+                    Some(None) => {}
+                    Some(Some(finish)) => return finish,
+                    None => return Finish::Lost,
+                }
+            }
+
+            // 2. Байты клиента — в канал к программе. Запись не ждёт: полный
+            // канал отвечает `ERR_AGAIN`, и остаток ждёт следующего круга.
+            if let Some(fd) = self.in_write {
+                while self.start < self.end {
+                    let wrote = write(fd, &pending[self.start..self.end]);
+                    if wrote > 0 {
+                        self.start += wrote as usize;
+                        progress = true;
+                        continue;
+                    }
+                    if wrote != ERR_AGAIN {
+                        // Читателя нет: программа закончилась. Недоставленное
+                        // выбрасывается — отдавать его некому, — а конец её
+                        // вывода увидит шаг 4.
+                        self.start = self.end;
+                        close(fd);
+                        self.in_write = None;
+                    }
+                    break;
+                }
+            }
+            if self.start == self.end {
+                self.start = 0;
+                self.end = 0;
+            } else if self.start > 0 && pending.len() - self.end < OUR_MAX_PACKET as usize {
+                pending.copy_within(self.start..self.end, 0);
+                self.end -= self.start;
+                self.start = 0;
+            }
+            // Клиент сказал всё, и всё доставлено — программе конец ввода.
+            if self.client_eof && self.start == self.end {
+                if let Some(fd) = self.in_write.take() {
+                    close(fd);
+                }
+            }
+
+            // 3. Прибавка окна — по доставленному, а не по пришедшему.
+            let held = self.end - self.start;
+            if !self.client_eof && self.allowance + held < SFTP_WINDOW / 2 {
+                let more = SFTP_WINDOW - self.allowance - held;
+                let out = unsafe { &mut *(&raw mut OUTPUT) };
+                let mut writer = Writer::new(out);
+                writer.byte(ssh::MSG_CHANNEL_WINDOW_ADJUST);
+                writer.u32(channel.peer);
+                writer.u32(more as u32);
+                let len = writer.len();
+                if send_packet(client, transport, len).is_none() {
+                    return Finish::Lost;
+                }
+                self.allowance += more;
+            }
+
+            // 4. Ответы программы — клиенту, пока его окно позволяет. Пакет
+            // собирается прямо в `OUTPUT`: заголовок канала — девять байт, и
+            // данные читаются из канала сразу на своё место.
+            while channel.window > 0 {
+                let room = (channel.window as usize)
+                    .min(channel.max_packet.saturating_sub(64) as usize)
+                    .min(OUR_MAX_PACKET as usize);
+                if room == 0 {
+                    break;
+                }
+                let out = unsafe { &mut *(&raw mut OUTPUT) };
+                let mut got = 0usize;
+                let mut ended = false;
+                while got < room {
+                    let read_now = read(self.out_read, &mut out[9 + got..9 + room]);
+                    if read_now > 0 {
+                        got += read_now as usize;
+                        continue;
+                    }
+                    if read_now != ERR_AGAIN {
+                        // Ноль — конец файла: программа закончилась и её вывод
+                        // забран весь. Ошибка чтения значит то же самое.
+                        ended = true;
+                    }
+                    break;
+                }
+                if got > 0 {
+                    out[0] = ssh::MSG_CHANNEL_DATA;
+                    out[1..5].copy_from_slice(&channel.peer.to_be_bytes());
+                    out[5..9].copy_from_slice(&(got as u32).to_be_bytes());
+                    if send_packet(client, transport, 9 + got).is_none() {
+                        return Finish::Lost;
+                    }
+                    channel.window -= got as u32;
+                    progress = true;
+                }
+                if ended {
+                    return Finish::Exited;
+                }
+                if got < room {
+                    break;
+                }
+            }
+
+            if progress {
+                idle = 0;
+                quiet_since = uptime_ms();
+            } else {
+                if uptime_ms().saturating_sub(quiet_since) >= SESSION_TIMEOUT_MS {
+                    error("sshd: the sftp session went quiet\n");
+                    return Finish::Lost;
+                }
+                idle += 1;
+                if idle < SPIN_BEFORE_SLEEP {
+                    yield_now();
+                } else {
+                    sleep_ms(1);
+                }
+            }
+        }
+    }
+
+    /// Разобрать один пакет. `Some(None)` — продолжать, `Some(Some(_))` —
+    /// подсистема кончилась, `None` — соединение потеряно.
+    fn packet(
+        &mut self,
+        client: i64,
+        transport: &mut Transport,
+        channel: &mut Channel,
+        payload: &[u8],
+        pending: &mut [u8; SFTP_WINDOW],
+    ) -> Option<Option<Finish>> {
+        let kind = *payload.first()?;
+        let mut reader = Reader::new(&payload[1..]);
+        match kind {
+            ssh::MSG_CHANNEL_DATA => {
+                let _recipient = reader.u32()?;
+                let data = reader.string()?;
+                // Окно — не пожелание: клиент, прислав больше разрешённого,
+                // либо сломан, либо проверяет, что будет. Принять лишнее
+                // значило бы писать за конец буфера.
+                if data.len() > self.allowance || data.len() > pending.len() - self.end {
+                    error("sshd: the client overran the sftp window; closing\n");
+                    disconnect(
+                        client,
+                        transport,
+                        ssh::DISCONNECT_PROTOCOL_ERROR,
+                        "window exceeded",
+                    );
+                    return None;
+                }
+                if self.client_eof || self.in_write.is_none() {
+                    // Данные после своего же `EOF` — нарушение; программа, чей
+                    // ввод закрыт, их не прочтёт. Окно всё равно тратится.
+                    self.allowance -= data.len();
+                    return Some(None);
+                }
+                pending[self.end..self.end + data.len()].copy_from_slice(data);
+                self.end += data.len();
+                self.allowance -= data.len();
+            }
+            ssh::MSG_CHANNEL_WINDOW_ADJUST => {
+                let _recipient = reader.u32()?;
+                let more = reader.u32()?;
+                channel.window = channel.window.saturating_add(more);
+            }
+            ssh::MSG_CHANNEL_EOF => self.client_eof = true,
+            ssh::MSG_CHANNEL_CLOSE => {
+                let out = unsafe { &mut *(&raw mut OUTPUT) };
+                let mut writer = Writer::new(out);
+                writer.byte(ssh::MSG_CHANNEL_CLOSE);
+                writer.u32(channel.peer);
+                let len = writer.len();
+                send_packet(client, transport, len)?;
+                return Some(Some(Finish::ClosedByClient));
+            }
+            ssh::MSG_CHANNEL_REQUEST => {
+                let _recipient = reader.u32()?;
+                let _kind = reader.string()?;
+                if reader.byte()? != 0 {
+                    reply_to_request(client, transport, channel.peer, false)?;
+                }
+            }
+            ssh::MSG_GLOBAL_REQUEST => {
+                let want_reply = reader.string().is_some() && reader.byte() == Some(1);
+                if want_reply {
+                    let out = unsafe { &mut *(&raw mut OUTPUT) };
+                    out[0] = ssh::MSG_REQUEST_FAILURE;
+                    send_packet(client, transport, 1)?;
+                }
+            }
+            ssh::MSG_DISCONNECT => {
+                error("sshd: the client said goodbye during sftp\n");
+                return None;
+            }
+            ssh::MSG_IGNORE
+            | ssh::MSG_DEBUG
+            | ssh::MSG_UNIMPLEMENTED
+            | ssh::MSG_CHANNEL_EXTENDED_DATA => {}
+            _ => {
+                let out = unsafe { &mut *(&raw mut OUTPUT) };
+                out[0] = ssh::MSG_UNIMPLEMENTED;
+                out[1..5].copy_from_slice(&0u32.to_be_bytes());
+                send_packet(client, transport, 5)?;
+            }
+        }
+        Some(None)
+    }
+}
+
 fn help(sink: &mut Sink<'_>) {
     sink.out(
         "Anything that is not listed below runs as a program from /bin, started\n\
@@ -1662,15 +2076,48 @@ fn send_packet(client: i64, transport: &mut Transport, len: usize) -> Option<()>
     // Содержимое лежит в начале `OUTPUT`, а пакет собирается вокруг него —
     // поэтому нужен второй буфер: заголовок, набивка и подпись не помещаются
     // «на месте».
-    let mut framed = [0u8; BUFFER];
-    // SAFETY: см. `serve`.
+    // SAFETY: см. `serve`; `FRAMED` берётся только здесь, и ссылка на него не
+    // переживает вызова.
     let payload = unsafe { &(&raw const OUTPUT).as_ref().unwrap()[..len] };
-    let total = transport.seal_packet(payload, &mut framed).ok()?;
+    let framed = unsafe { &mut *(&raw mut FRAMED) };
+    let total = transport.seal_packet(payload, framed).ok()?;
     send_all(client, &framed[..total])
 }
 
 /// Прочитать один пакет целиком. Возвращает срез содержимого.
 fn read_packet<'a>(client: i64, transport: &mut Transport, deadline: u64) -> Option<&'a [u8]> {
+    loop {
+        match poll_packet(client, transport) {
+            Polled::Packet(payload) => return Some(payload),
+            Polled::Closed => return None,
+            Polled::Nothing => {
+                if uptime_ms() >= deadline {
+                    error("sshd: the client went quiet\n");
+                    return None;
+                }
+                sleep_ms(IDLE_MS);
+            }
+        }
+    }
+}
+
+/// Что дал один взгляд на соединение.
+enum Polled<'a> {
+    /// Пакет целиком: срез содержимого.
+    Packet(&'a [u8]),
+    /// Целого пакета пока нет, но соединение живо.
+    Nothing,
+    /// Соединение кончилось или пакет не разбирается; причина уже в журнале.
+    Closed,
+}
+
+/// Забрать пакет, если он уже пришёл, — **не дожидаясь** его.
+///
+/// Отдельно от [`read_packet`] с фазы 38c. Построчному сеансу было что ждать
+/// только от клиента, и он спал на сокете. SFTP ждёт двоих сразу — клиента и
+/// программу `sftp-server`, — и уснувший на одном не заметил бы, что второй
+/// заполнил канал и стоит.
+fn poll_packet<'a>(client: i64, transport: &mut Transport) -> Polled<'a> {
     // SAFETY: программа однопоточная, буферы используются последовательно.
     let input = unsafe { &mut *(&raw mut INPUT) };
     let payload_buffer = unsafe { &mut *(&raw mut PAYLOAD) };
@@ -1694,19 +2141,19 @@ fn read_packet<'a>(client: i64, transport: &mut Transport, deadline: u64) -> Opt
                     // почти всегда разошедшиеся ключи, а не испорченная сеть.
                     // Молчаливый выход отсюда стоил бы часа догадок.
                     report("sshd: cannot read the packet length", err);
-                    return None;
+                    return Polled::Closed;
                 }
             };
             if size > input.len() {
                 error("sshd: the client sent a packet larger than the buffer\n");
-                return None;
+                return Polled::Closed;
             }
             if filled >= size {
                 let (payload_len, _) = match transport.open_packet(&mut input[..size]) {
                     Ok(result) => result,
                     Err(err) => {
                         report("sshd: cannot open the packet", err);
-                        return None;
+                        return Polled::Closed;
                     }
                 };
                 payload_buffer[..payload_len].copy_from_slice(&input[..payload_len]);
@@ -1727,13 +2174,15 @@ fn read_packet<'a>(client: i64, transport: &mut Transport, deadline: u64) -> Opt
 
                 // SAFETY: буфер статический и живёт всё время работы программы;
                 // вызывающий разбирает содержимое до следующего чтения.
-                return Some(unsafe { &(&raw const PAYLOAD).as_ref().unwrap()[..payload_len] });
+                return Polled::Packet(unsafe {
+                    &(&raw const PAYLOAD).as_ref().unwrap()[..payload_len]
+                });
             }
         }
 
         if filled >= input.len() {
             error("sshd: the buffer filled up without a whole packet\n");
-            return None;
+            return Polled::Closed;
         }
         let got = recv(client, &mut input[filled..]);
         if got > 0 {
@@ -1747,28 +2196,24 @@ fn read_packet<'a>(client: i64, transport: &mut Transport, deadline: u64) -> Opt
             error("sshd: recv failed with code ");
             error_num(got);
             error("\n");
-            return None;
+            return Polled::Closed;
         }
         match stream_state(client) {
             Some(state) if state.reset != 0 => {
                 error("sshd: the connection was reset\n");
-                return None;
+                return Polled::Closed;
             }
             Some(state) if state.peer_closed != 0 => {
                 error("sshd: the client closed its side\n");
-                return None;
+                return Polled::Closed;
             }
             Some(_) => {}
             None => {
                 error("sshd: the connection vanished\n");
-                return None;
+                return Polled::Closed;
             }
         }
-        if uptime_ms() >= deadline {
-            error("sshd: the client went quiet\n");
-            return None;
-        }
-        sleep_ms(IDLE_MS);
+        return Polled::Nothing;
     }
 }
 

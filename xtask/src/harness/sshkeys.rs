@@ -103,15 +103,71 @@ fn ensure_key(name: &str, comment: &str) -> Result<PathBuf> {
     Ok(private)
 }
 
-/// Положить открытый ключ в `authorized_keys` гостя на разделе состояния.
+/// Положить открытый ключ пары стенда в `authorized_keys` гостя.
 pub fn place_authorized_key(disk_path: &Path, private: &Path) -> Result<()> {
+    authorize_public_key(disk_path, &private.with_extension("pub"))
+}
+
+/// Дописать открытый ключ (файл `.pub`) в `authorized_keys` гостя на разделе
+/// состояния.
+///
+/// # Дописать, а не положить
+///
+/// До фазы 38c ключ был один — стенда, — и файл с ним либо был, либо нет. Для
+/// `cargo xtask run --installed --ssh --key` ключей два: стенда, положенный
+/// прогоном, и свой ключ человека. Отказ «файл уже лежит» оставил бы человека с
+/// системой, пускающей стенд и не пускающей его самого, — а выглядело бы это
+/// как испорченный ключ. Поэтому ключ, которого в файле нет, дописывается в
+/// конец; тот, что есть, не пишется второй раз.
+pub fn authorize_public_key(disk_path: &Path, public: &Path) -> Result<()> {
     use disk::BlockDevice as _;
 
-    let public = private.with_extension("pub");
-    let line = std::fs::read(&public)
+    let mut line = std::fs::read(public)
         .with_context(|| format!("не удалось прочитать {}", public.display()))?;
+    // `sshd` этой системы проверяет только Ed25519 — ключ другого типа лёг бы
+    // в файл и молча не пустил бы никого.
+    let text = String::from_utf8_lossy(&line).into_owned();
+    let mut fields = text.split_whitespace();
+    let (Some("ssh-ed25519"), Some(blob)) = (fields.next(), fields.next()) else {
+        bail!(
+            "{} — не открытый ключ ssh-ed25519; sshd FreeOS принимает только такие \
+             (сделать: ssh-keygen -t ed25519)",
+            public.display()
+        );
+    };
+    if !line.ends_with(b"\n") {
+        line.push(b'\n');
+    }
 
     let mut dev = crate::diskfile::DiskFile::open(disk_path, 512)?;
+
+    // Что уже лежит — читается до правки и тем же крейтом, которым прочтёт
+    // система.
+    let existing: Option<Vec<u8>> = {
+        let table = disk::gpt::read(&mut dev)
+            .map_err(|err| anyhow::anyhow!("на образе {} нет GPT: {err}", disk_path.display()))?;
+        let state = table
+            .find(disk::gpt::FREEOS_STATE_TYPE)
+            .ok_or_else(|| anyhow::anyhow!("на образе нет раздела состояния"))?;
+        let fs = ext2::Ext2::mount(&mut dev, state.first_lba)
+            .map_err(|err| anyhow::anyhow!("раздел состояния не монтируется: {err}"))?;
+        match fs.resolve(&mut dev, &format!("/home/{ACCOUNT}/.ssh/authorized_keys")) {
+            Ok(inode) => Some(
+                fs.read_file(&mut dev, &inode)
+                    .map_err(|err| anyhow::anyhow!("authorized_keys не читается: {err}"))?,
+            ),
+            Err(_) => None,
+        }
+    };
+    if let Some(existing) = &existing {
+        let known = String::from_utf8_lossy(existing)
+            .lines()
+            .any(|entry| entry.split_whitespace().nth(1) == Some(blob));
+        if known {
+            say!("стенд: ключ {} уже в authorized_keys гостя", public.display());
+            return Ok(());
+        }
+    }
     let table = disk::gpt::read(&mut dev)
         .map_err(|err| anyhow::anyhow!("на образе {} нет GPT: {err}", disk_path.display()))?;
     // Домашние каталоги живут на разделе состояния, а не на корневом: корень
@@ -132,17 +188,33 @@ pub fn place_authorized_key(disk_path: &Path, private: &Path) -> Result<()> {
     // отказывается доверять файлу ключей, лежащему там, куда может писать
     // кто-то ещё, и проверка эта настоящая, а не наша выдумка.
     let ssh_dir = format!("home/{ACCOUNT}/.ssh");
-    fs.create_dir_path(&mut dev, &ssh_dir, 0o700, FIRST_UID, FIRST_UID)
+    let dir = fs
+        .create_dir_path(&mut dev, &ssh_dir, 0o700, FIRST_UID, FIRST_UID)
         .map_err(|err| anyhow::anyhow!("не удалось создать /{ssh_dir}: {err}"))?;
 
     let target = format!("{ssh_dir}/authorized_keys");
-    match fs.write_file_path(&mut dev, &target, &line, 0o600, FIRST_UID, FIRST_UID) {
-        Ok(_) => say!("стенд: ключ положен в /{target} ({} байт)", line.len()),
-        // Уже лежит с прошлого прогона: пара переживает прогоны, значит и файл
-        // тот же самый. Перезаписи ext2-редактор не умеет, а класть второй раз
-        // то же самое незачем.
-        Err(ext2::Error::Exists) => say!("стенд: ключ в /{target} уже лежит"),
-        Err(err) => bail!("не удалось записать /{target}: {err}"),
+    let present = fs
+        .lookup(&mut dev, dir, "authorized_keys")
+        .map_err(|err| anyhow::anyhow!("не удалось заглянуть в /{ssh_dir}: {err}"))?;
+    match (present, existing) {
+        (Some((number, _)), Some(existing)) => {
+            // Файл есть, ключа в нём нет — дописать в конец. Если последняя
+            // строка без перевода, он ставится первым: иначе новый ключ
+            // склеился бы с последним в одну негодную строку.
+            let mut tail = Vec::new();
+            if !existing.is_empty() && !existing.ends_with(b"\n") {
+                tail.push(b'\n');
+            }
+            tail.extend_from_slice(&line);
+            fs.write_at(&mut dev, number, existing.len() as u64, &tail)
+                .map_err(|err| anyhow::anyhow!("не удалось дописать /{target}: {err}"))?;
+            say!("стенд: ключ {} дописан в /{target}", public.display());
+        }
+        _ => {
+            fs.write_file_path(&mut dev, &target, &line, 0o600, FIRST_UID, FIRST_UID)
+                .map_err(|err| anyhow::anyhow!("не удалось записать /{target}: {err}"))?;
+            say!("стенд: ключ положен в /{target} ({} байт)", line.len());
+        }
     }
 
     fs.flush_everywhere(&mut dev)

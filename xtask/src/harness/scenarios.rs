@@ -221,6 +221,12 @@ pub enum Step {
     /// деталям формата, и всё, в чём мы ошиблись, он назовёт вслух и оборвёт
     /// соединение. Никакой наш код в этой проверке не участвует.
     Ssh(SshRun),
+    /// Позвать **настоящий** `sftp` или `scp` с хоста (фаза 38c).
+    ///
+    /// Как и [`Step::Ssh`], в проверке не участвует ни строчки нашего кода на
+    /// стороне клиента: OpenSSH придирчив к формату SFTP и назовёт вслух всё,
+    /// в чём мы ошиблись.
+    Sftp(SftpRun),
     /// Дождаться, пока **процесс QEMU завершится сам** (мс).
     ///
     /// Самая сильная проверка выключения из возможных: до этой фазы стенд
@@ -290,6 +296,50 @@ pub struct SshRun {
     ///
     /// Проверка отказа состоит из двух половин, и вторая здесь: мало увидеть
     /// слово «отказано» — надо убедиться, что содержимого файла в ответе нет.
+    pub absent: &'static [&'static str],
+    pub timeout_ms: u64,
+}
+
+/// Что везти по SFTP и чем (фаза 38c).
+pub enum Transfer {
+    /// `sftp -b`: строки пакета. Локальные имена — в рабочем каталоге шага, где
+    /// лежат файлы из [`SftpRun::stage`].
+    Batch(&'static str),
+    /// `scp <локальный> roman@...:<удалённый>`.
+    ScpPut(&'static str, &'static str),
+    /// `scp roman@...:<удалённый> <локальный>`.
+    ScpGet(&'static str, &'static str),
+}
+
+/// Откуда взять локальный файл перед передачей.
+pub enum Source {
+    /// Столько псевдослучайных байт. Не узор: узор с периодом, кратным куску
+    /// SFTP, совпал бы сам с собой при перепутанном порядке кусков, а
+    /// последовательность xorshift за мегабайты не повторяется.
+    Random(usize),
+    /// Файл из репозитория — например готовая сборка .NET из `initrd/`.
+    Repo(&'static str),
+}
+
+/// Один запуск настоящего `sftp` или `scp` с хоста.
+///
+/// Сверка байт идёт **на хосте**: файл уехал в гостя и вернулся, и совпасть с
+/// оригиналом до последнего байта он может, только если сервер, окно канала и
+/// TCP ни разу не ошиблись.
+pub struct SftpRun {
+    pub transfer: Transfer,
+    /// Локальные файлы, которые надо положить в рабочий каталог до запуска.
+    /// Файлы с тем же именем от прошлого шага не трогаются, если здесь их нет,
+    /// — так один шаг кладёт, а следующий забирает и сверяет.
+    pub stage: &'static [(&'static str, Source)],
+    /// Удалить эти локальные файлы до запуска: скачанное прошлым прогоном
+    /// сошлось бы с оригиналом и без всякой передачи.
+    pub fresh: &'static [&'static str],
+    /// Сверить два локальных файла побайтно после передачи.
+    pub compare: Option<(&'static str, &'static str)>,
+    /// Файл, по размеру которого считается скорость передачи.
+    pub measure: Option<&'static str>,
+    pub expect: &'static [&'static str],
     pub absent: &'static [&'static str],
     pub timeout_ms: u64,
 }
@@ -1090,7 +1140,7 @@ pub const ALL: &[Scenario] = &[
             // экрана не зависит и меняется только вместе с `USER_PROGRAMS` в
             // `build.rs`. Тридцать две с фазы 46; `zdemo` собирается только там,
             // где выполнена `cargo xtask thirdparty`, и без неё здесь будет 31.
-            Step::Expect("/bin holds 35 programs"),
+            Step::Expect("/bin holds 36 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -5059,6 +5109,214 @@ pub const ALL: &[Scenario] = &[
             // скрипте проверяет именно его.
             Step::AwaitAny("sshd: session closed with status 1", 30_000),
 
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "sftp",
+        about: "Файлы туда и обратно штатными sftp и scp: мегабайты байт со сверкой, каталоги, отказ ядра, программа WinForms из «Файлов».",
+        // Установленная система по той же причине, что у `ssh-shell`: вход по
+        // ключу требует учётной записи, а отказ записи в `/etc` — настоящих
+        // прав на ext2. Место в списке — рядом с ним, до `install4k`.
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        guest_port: 22,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: true,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
+            Step::AwaitAny("sshd: listening on port 22", 90_000),
+            Step::AwaitAny("freeos> ", 90_000),
+            Step::Wait(1_000),
+
+            // 1. Четыре мебибайта в гостя. Такой файл не проходит ни одним
+            // окном — ни канала SSH (128 КиБ), ни канала к программе (4 КиБ),
+            // ни TCP, — и все три обязаны открываться по ходу, а не один раз.
+            Step::Sftp(SftpRun {
+                transfer: Transfer::Batch("put payload.bin sftp-payload.bin\nls -l sftp-payload.bin"),
+                stage: &[("payload.bin", Source::Random(4 * 1024 * 1024))],
+                fresh: &["returned.bin"],
+                compare: None,
+                measure: Some("payload.bin"),
+                expect: &["sftp-payload.bin", "4194304"],
+                absent: &[],
+                timeout_ms: 600_000,
+            }),
+            Step::AwaitAny("sshd: sftp for roman", 30_000),
+            // Главное утверждение фазы в одной строке: сервер файлов — не root.
+            Step::AwaitAny("sftp-server: session for uid 1000 gid 1000 in /home/roman", 30_000),
+            Step::AwaitAny(
+                "sftp-server: closed /home/roman/sftp-payload.bin after 4194304 bytes written",
+                60_000,
+            ),
+
+            // 2. И обратно — со сверкой каждого байта на хосте.
+            Step::Sftp(SftpRun {
+                transfer: Transfer::Batch("get sftp-payload.bin returned.bin"),
+                stage: &[],
+                fresh: &["returned.bin"],
+                compare: Some(("payload.bin", "returned.bin")),
+                measure: Some("returned.bin"),
+                expect: &[],
+                absent: &[],
+                timeout_ms: 600_000,
+            }),
+
+            // 3. `scp` с OpenSSH 9 ходит тем же SFTP — туда и обратно.
+            Step::Sftp(SftpRun {
+                transfer: Transfer::ScpPut("note.bin", "/home/roman/scp-note.bin"),
+                stage: &[("note.bin", Source::Random(100_000))],
+                fresh: &["note-back.bin"],
+                compare: None,
+                measure: None,
+                expect: &[],
+                absent: &[],
+                timeout_ms: 120_000,
+            }),
+            Step::Sftp(SftpRun {
+                transfer: Transfer::ScpGet("/home/roman/scp-note.bin", "note-back.bin"),
+                stage: &[],
+                fresh: &[],
+                compare: Some(("note.bin", "note-back.bin")),
+                measure: None,
+                expect: &[],
+                absent: &[],
+                timeout_ms: 120_000,
+            }),
+
+            // 4. Каталоги: создать, переименовать внутри, удалить. Первые три
+            // строки с `-` убирают остатки прерванного прогона: диск общий у
+            // всей цепочки установленной системы.
+            Step::Sftp(SftpRun {
+                transfer: Transfer::Batch(
+                    "-rm sftp-dir/moved.bin\n-rm sftp-dir/note.bin\n-rmdir sftp-dir\n\
+                     mkdir sftp-dir\nput note.bin sftp-dir/note.bin\n\
+                     rename sftp-dir/note.bin sftp-dir/moved.bin\nls sftp-dir\n\
+                     rm sftp-dir/moved.bin\nrmdir sftp-dir\n\
+                     rm sftp-payload.bin\nrm scp-note.bin",
+                ),
+                stage: &[],
+                fresh: &[],
+                compare: None,
+                measure: None,
+                expect: &["moved.bin"],
+                absent: &[],
+                timeout_ms: 120_000,
+            }),
+            Step::AwaitAny("sftp-server: made directory /home/roman/sftp-dir", 30_000),
+            Step::AwaitAny(
+                "sftp-server: renamed /home/roman/sftp-dir/note.bin to /home/roman/sftp-dir/moved.bin",
+                30_000,
+            ),
+            Step::AwaitAny("sftp-server: removed directory /home/roman/sftp-dir", 30_000),
+
+            // 5. Отказ — от ядра, а не от сервера: `/etc` принадлежит root, в
+            // `/root` не пускает каталог `0700`. Каждая команда с `-`, чтобы
+            // пакет дошёл до конца и показал все три отказа.
+            Step::Sftp(SftpRun {
+                transfer: Transfer::Batch(
+                    "-put note.bin /etc/sftp-denied.bin\n-get /root/notes.txt denied.txt\n\
+                     -mkdir /etc/sftp-denied",
+                ),
+                stage: &[],
+                fresh: &["denied.txt"],
+                compare: None,
+                measure: None,
+                expect: &["Permission denied"],
+                absent: &["world-readable"],
+                timeout_ms: 120_000,
+            }),
+            Step::AwaitAny(
+                "sftp-server: open for writing /etc/sftp-denied.bin refused: permission denied",
+                30_000,
+            ),
+            Step::AwaitAny(
+                "sftp-server: mkdir /etc/sftp-denied refused: permission denied",
+                30_000,
+            ),
+            // И файла там действительно нет: отказ, а не «записали и сказали
+            // отказ».
+            Step::Ssh(SshRun {
+                identity: Identity::Authorized,
+                command: "ls /etc",
+                stdin: "",
+                expect: &["passwd"],
+                absent: &["sftp-denied"],
+                timeout_ms: 60_000,
+            }),
+
+            // 6. Ради чего фаза: программа WinForms, привезённая штатным
+            // клиентом, запускается из «Файлов». Сборка и её
+            // `.runtimeconfig.json` — те же, что лежат в образе, но едут
+            // по сети в домашний каталог.
+            Step::Sftp(SftpRun {
+                transfer: Transfer::Batch(
+                    "-mkdir apps\nput winforms.dll apps/winforms.dll\n\
+                     put winforms.runtimeconfig.json apps/winforms.runtimeconfig.json",
+                ),
+                stage: &[
+                    ("winforms.dll", Source::Repo("initrd/usr/share/dotnet/samples/winforms.dll")),
+                    (
+                        "winforms.runtimeconfig.json",
+                        Source::Repo("initrd/usr/share/dotnet/samples/winforms.runtimeconfig.json"),
+                    ),
+                ],
+                fresh: &[],
+                compare: None,
+                measure: None,
+                expect: &[],
+                absent: &[],
+                timeout_ms: 120_000,
+            }),
+            Step::AwaitAny("sftp-server: closed /home/roman/apps/winforms.runtimeconfig.json after", 30_000),
+            Step::Line("run -b /bin/files /home/roman/apps"),
+            Step::Await("window      : 'Files' at", 30_000),
+            Step::Await("files: /home/roman/apps has ", 30_000),
+            Step::Key("end"),
+            Step::Await("selected 'winforms.runtimeconfig.json'", 15_000),
+            Step::Key("up"),
+            Step::Await("selected 'winforms.dll'", 15_000),
+            Step::Key("ret"),
+            Step::Await("files: started '/bin/dotnet /home/roman/apps/winforms.dll' as #", 15_000),
+            Step::Await("dotnet: window 'Form1' opened, 800x450", 60_000),
+            Step::Wait(2_500),
+            Step::Shot("sftp-winforms"),
+            Step::Aim(Aim::Close("Form1")),
+            Step::Click,
+            Step::Await("dotnet: winforms.dll: Main returned 0", 30_000),
+            Step::Aim(Aim::Close("Files")),
+            Step::Click,
+            Step::Await("files: closing on request", 15_000),
+
+            // Уборка: цепочка установленной системы делит диск.
+            Step::Sftp(SftpRun {
+                transfer: Transfer::Batch(
+                    "rm apps/winforms.dll\nrm apps/winforms.runtimeconfig.json\nrmdir apps",
+                ),
+                stage: &[],
+                fresh: &[],
+                compare: None,
+                measure: None,
+                expect: &[],
+                absent: &[],
+                timeout_ms: 120_000,
+            }),
+            Step::AwaitAny("sftp-server: removed directory /home/roman/apps", 30_000),
+
+            Step::Absent("sshd: the client overran the sftp window"),
+            Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),
         ],
     },

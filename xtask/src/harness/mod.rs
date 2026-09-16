@@ -37,7 +37,7 @@ mod qmp;
 mod scenarios;
 mod serial;
 mod shot;
-mod sshkeys;
+pub(crate) mod sshkeys;
 mod tlskeys;
 
 use std::net::TcpListener;
@@ -1214,6 +1214,31 @@ fn play(
                     }
                 }
             }
+            Step::Sftp(run) => {
+                let Some(port) = hostfwd else {
+                    bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
+                };
+                let what = match &run.transfer {
+                    scenarios::Transfer::Batch(batch) => {
+                        format!("sftp -b: {}", batch.lines().next().unwrap_or("").trim())
+                    }
+                    scenarios::Transfer::ScpPut(local, remote) => format!("scp {local} -> {remote}"),
+                    scenarios::Transfer::ScpGet(remote, local) => format!("scp {remote} -> {local}"),
+                };
+                say!("  [{at:>6} мс] шаг {index}: {what}");
+                let output = run_sftp(port, run, prefix, index, patience(run.timeout_ms))
+                    .with_context(|| format!("шаг {index}"))?;
+                for needle in run.expect {
+                    if !output.contains(needle) {
+                        bail!("шаг {index}: в выводе клиента нет \"{needle}\"");
+                    }
+                }
+                for needle in run.absent {
+                    if output.contains(needle) {
+                        bail!("шаг {index}: в выводе клиента есть \"{needle}\", а его быть не должно");
+                    }
+                }
+            }
             Step::Shot(name) => {
                 say!("  [{at:>6} мс] шаг {index}: снимок '{name}'");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
@@ -1381,6 +1406,205 @@ fn run_ssh(
     say!("             вывод ssh: {}", log.display());
 
     Ok(text)
+}
+
+/// Позвать штатный `sftp` или `scp` и вернуть всё, что он написал (фаза 38c).
+///
+/// Рабочий каталог у шага свой (`build/test/<прогон>-sftp/`), и клиент
+/// запускается **в нём**: локальные пути в пакете — просто имена. Абсолютный
+/// путь Windows в пакете `sftp` — это буква диска с двоеточием, и как её поймёт
+/// клиент, зависит от того, чей это `sftp`: из Windows или из Git.
+fn run_sftp(
+    port: u16,
+    run: &scenarios::SftpRun,
+    prefix: &str,
+    index: usize,
+    timeout: Duration,
+) -> Result<String> {
+    use std::process::Command;
+
+    let dir = paths::test_dir().join(format!("{prefix}-sftp"));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("не удалось создать {}", dir.display()))?;
+    for name in run.fresh {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    for (name, source) in run.stage {
+        let target = dir.join(name);
+        match source {
+            scenarios::Source::Random(len) => {
+                std::fs::write(&target, pseudo_random(*len))
+                    .with_context(|| format!("не удалось записать {}", target.display()))?;
+            }
+            scenarios::Source::Repo(path) => {
+                let from = paths::workspace_root().join(path);
+                std::fs::copy(&from, &target).with_context(|| {
+                    format!("не удалось скопировать {} в {}", from.display(), target.display())
+                })?;
+            }
+        }
+    }
+
+    let known_hosts = paths::test_dir().join(format!("{prefix}-known-hosts"));
+    std::fs::write(&known_hosts, b"").ok();
+    let key = sshkeys::authorized()?;
+    let destination = format!("{}@127.0.0.1", sshkeys::ACCOUNT);
+
+    let (program, mut cmd) = match &run.transfer {
+        scenarios::Transfer::Batch(_) => ("sftp", Command::new("sftp")),
+        _ => ("scp", Command::new("scp")),
+    };
+    cmd.current_dir(&dir)
+        // У `sftp` и `scp` порт — заглавной `-P`: строчная у них занята.
+        .arg("-P")
+        .arg(port.to_string())
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("IdentityAgent=none")
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-i")
+        .arg(&key);
+    match &run.transfer {
+        scenarios::Transfer::Batch(batch) => {
+            let file = dir.join("batch.txt");
+            let text: String = batch.lines().map(|line| format!("{}\n", line.trim())).collect();
+            std::fs::write(&file, text)
+                .with_context(|| format!("не удалось записать {}", file.display()))?;
+            cmd.arg("-b").arg("batch.txt").arg(&destination);
+        }
+        // Протокол у `scp` с OpenSSH 9 — SFTP, и это ровно то, что здесь
+        // проверяется. Старый протокол (`-O`) не просим: его нет и не будет.
+        scenarios::Transfer::ScpPut(local, remote) => {
+            cmd.arg(local).arg(format!("{destination}:{remote}"));
+        }
+        scenarios::Transfer::ScpGet(remote, local) => {
+            cmd.arg(format!("{destination}:{remote}")).arg(local);
+        }
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let log = paths::test_dir().join(format!("{prefix}-{program}-{index}.log"));
+    let started = Instant::now();
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("не удалось запустить {program}; он нужен для этой проверки"))?;
+    // Вывод забирается потоками, пока клиент работает: `sftp -b` печатает
+    // строку на каждую команду пакета, и канал, который никто не читает,
+    // однажды заполнится и остановит клиента посреди передачи.
+    let mut stdout = child.stdout.take().context("у клиента нет вывода")?;
+    let mut stderr = child.stderr.take().context("у клиента нет потока ошибок")?;
+    let out_reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut text).ok();
+        text
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        std::io::Read::read_to_end(&mut stderr, &mut text).ok();
+        text
+    });
+
+    let deadline = started + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                child.kill().ok();
+                let _ = child.wait();
+                let mut text = String::from_utf8_lossy(&err_reader.join().unwrap_or_default())
+                    .into_owned();
+                text.push_str(&String::from_utf8_lossy(&out_reader.join().unwrap_or_default()));
+                std::fs::write(&log, text.as_bytes()).ok();
+                bail!(
+                    "{program} не закончил за {} мс; что он успел сказать: {}",
+                    timeout.as_millis(),
+                    log.display()
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let elapsed = started.elapsed();
+    let mut text = String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).into_owned();
+    text.push_str(&String::from_utf8_lossy(&err_reader.join().unwrap_or_default()));
+    std::fs::write(&log, text.as_bytes()).ok();
+    say!(
+        "             {program} закончил с кодом {} за {:.1} с; вывод: {}",
+        status.code().unwrap_or(-1),
+        elapsed.as_secs_f64(),
+        log.display()
+    );
+    for line in text.lines().filter(|line| !line.trim().is_empty()).take(24) {
+        say!("             | {}", line.trim_end());
+    }
+
+    if let Some(name) = run.measure {
+        let size = std::fs::metadata(dir.join(name))
+            .with_context(|| format!("нет файла {name} для замера"))?
+            .len();
+        let seconds = elapsed.as_secs_f64().max(0.001);
+        // Время — всего запуска клиента, вместе с рукопожатием и входом. На
+        // мегабайтах это единицы процентов, и честнее назвать их, чем вычесть
+        // на глаз.
+        say!(
+            "             скорость: {} КиБ за {seconds:.1} с — {:.0} КиБ/с (вместе с входом)",
+            size / 1024,
+            size as f64 / 1024.0 / seconds
+        );
+    }
+
+    if let Some((a, b)) = run.compare {
+        let left = std::fs::read(dir.join(a)).with_context(|| format!("нет файла {a}"))?;
+        let right = std::fs::read(dir.join(b))
+            .with_context(|| format!("нет файла {b} — клиент его не получил"))?;
+        if left.len() != right.len() {
+            bail!("{a} — {} байт, {b} — {} байт", left.len(), right.len());
+        }
+        if let Some(at) = left.iter().zip(&right).position(|(x, y)| x != y) {
+            bail!("{a} и {b} расходятся с байта {at}");
+        }
+        say!("             {a} и {b}: {} байт совпали до последнего", left.len());
+    }
+
+    // Код клиента проверяется после сверки: пакет с `-` перед командой
+    // допускает отказ этой команды, и код тогда нулевой; ненулевой — значит
+    // отказала команда, отказа которой сценарий не ждал.
+    if !status.success() {
+        bail!("{program} закончил с кодом {:?}; вывод: {}", status.code(), log.display());
+    }
+    Ok(text)
+}
+
+/// Псевдослучайные байты для передачи: xorshift64*, зерно — часы хоста.
+///
+/// Криптографическое качество здесь не нужно: нужно, чтобы файл не совпадал
+/// сам с собой ни при каком сдвиге, кратном куску передачи. Зерно от часов —
+/// чтобы файл от прошлого прогона, оставшийся в госте, не сошёлся с новым.
+fn pseudo_random(len: usize) -> Vec<u8> {
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        | 1;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        out.extend_from_slice(&state.wrapping_mul(0x2545_F491_4F6C_DD1D).to_le_bytes());
+    }
+    out.truncate(len);
+    out
 }
 
 /// Порты, которые стенд занимает на хосте под один прогон.

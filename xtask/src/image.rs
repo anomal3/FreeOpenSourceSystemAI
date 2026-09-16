@@ -298,6 +298,8 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
 fn medium_name(name: &str) -> String {
     match name {
         "sysupdate" => String::from("SYSUPD"),
+        // Одиннадцать знаков и дефис — ни в какие 8.3 не лезет (фаза 38c).
+        "sftp-server" => String::from("SFTPSRV"),
         other => other.to_uppercase(),
     }
 }

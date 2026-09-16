@@ -52,8 +52,12 @@ extern crate std;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod sftp_tests;
+
 pub mod auth;
 pub mod cipher;
+pub mod sftp;
 pub mod wire;
 
 use ed25519_dalek::{Signer, SigningKey};

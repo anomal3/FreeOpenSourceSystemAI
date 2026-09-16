@@ -27,7 +27,7 @@ written down in the source, in Russian, next to the code that resulted from it.
 | **Settings** | Timezone, theme, and a static address are set in a window and survive a reboot — written to `/etc` on the state partition, applied at the next boot before any service starts. Volumes and accounts are listed; the filesystem check runs from there |
 | **C and a toolchain** | A picolibc port and a cross toolchain: `x86_64-freeos-cc hello.c -o hello` produces a program that runs. **zlib 1.3.1 builds from its own `configure`, unpatched, for both architectures** — and the result works: 18 000 bytes compress to 123 and come back byte-identical, inside the system |
 | **Network** | Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, TCP with all eleven states, TLS 1.3 with X.509 |
-| **SSH** | A real OpenSSH client logs in with a key and runs programs from `/bin` as the account that logged in |
+| **SSH** | A real OpenSSH client logs in with a key and runs programs from `/bin` as the account that logged in; `sftp`, `scp` and WinSCP copy files both ways through the same account |
 | **Updates** | A/B root slots, signed images, automatic rollback after three failed boots; over HTTP or GitHub Releases |
 | **Phone** | Redmi 9A (MT6762, `dandelion`): our kernel boots from the recovery partition, draws the desktop, talks over USB — and **the touchscreen works** |
 
@@ -183,7 +183,7 @@ crates/boot-uefi/    UEFI application: GOP probe, ELF loading, ExitBootServices
 crates/boot-info/    Stable #[repr(C)] hand-off contract: bootloader -> kernel
 crates/disk/         GPT and a FAT32 formatter          crates/ext2/  the ext2 format
 crates/btrfs/        btrfs: B-trees, chunk mapping, crc32c on every data sector, mkfs
-crates/ssh/          Packets, curve25519, chacha20-poly1305, public-key login
+crates/ssh/          Packets, curve25519, chacha20-poly1305, public-key login, SFTP v3
 crates/mini-ui/      Surfaces, 8x8 text, widgets        crates/installer/  the installer
 crates/freeos-cc/    Build rules for C, and the x86_64-freeos-cc wrapper itself
 crates/sysconf/      The key=value files in /etc -- parsed here so the tests can run

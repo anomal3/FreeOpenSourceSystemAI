@@ -208,6 +208,21 @@ struct RunArgs {
     /// сама: задайте его командой `ip 10.0.2.15/24 10.0.2.2`.
     #[arg(long)]
     net: bool,
+    /// Войти в установленную систему по SSH/SFTP с этой машины (фаза 38c).
+    ///
+    /// Включает сеть, пробрасывает `127.0.0.1:<--ssh-port>` на порт 22 гостя и
+    /// дописывает открытый ключ в `/home/roman/.ssh/authorized_keys` на диске
+    /// до запуска. Только с `--installed`: учётных записей у живой системы нет.
+    #[arg(long, requires = "installed")]
+    ssh: bool,
+    /// Открытый ключ (`.pub`, ssh-ed25519) для `authorized_keys`. Без него —
+    /// пара стенда из `build/test/id_ed25519`.
+    #[arg(long, requires = "ssh")]
+    key: Option<std::path::PathBuf>,
+    /// Порт на хосте для `--ssh`. Постоянный, а не случайный: его запоминают
+    /// WinSCP и `~/.ssh/config`.
+    #[arg(long, requires = "ssh", default_value_t = 2222)]
+    ssh_port: u16,
     /// Объём памяти виртуальной машины.
     #[arg(long, default_value = "512M")]
     memory: String,
@@ -504,6 +519,52 @@ fn real_main() -> Result<()> {
                 qemu::Drive::HostDirectory(qemu::prepare_esp(&built, args.serial_only)?)
             };
 
+            // Вход с этой машины: ключ ложится на диск **до** запуска — пока
+            // гость работает, его файловую систему правит только он сам.
+            let hostfwd = if args.ssh {
+                let target = paths::target_disk(args.arch, args.release);
+                // Порт проверяется заранее: занятый QEMU назвал бы невнятной
+                // строкой про `hostfwd`, и уже после загрузки прошивки.
+                std::net::TcpListener::bind(("127.0.0.1", args.ssh_port)).map_err(|err| {
+                    anyhow::anyhow!(
+                        "порт 127.0.0.1:{} занят ({err}); выберите другой: --ssh-port <порт>",
+                        args.ssh_port
+                    )
+                })?;
+                let (public, private) = match &args.key {
+                    Some(public) => (public.clone(), None),
+                    None => {
+                        let private = harness::sshkeys::authorized()?;
+                        (private.with_extension("pub"), Some(private))
+                    }
+                };
+                harness::sshkeys::authorize_public_key(&target, &public)?;
+                let identity = match &private {
+                    Some(private) => format!(" -i {}", private.display()),
+                    // Свой ключ человека: закрытая половина там, где он её
+                    // держит, и клиент найдёт её сам.
+                    None => String::new(),
+                };
+                say!();
+                say!("SSH и SFTP гостя — на 127.0.0.1:{} (вход: {}):", args.ssh_port, "roman");
+                say!(
+                    "    sftp -P {port}{identity} roman@127.0.0.1",
+                    port = args.ssh_port
+                );
+                say!(
+                    "    ssh  -p {port}{identity} roman@127.0.0.1",
+                    port = args.ssh_port
+                );
+                say!(
+                    "    WinSCP: протокол SFTP, узел 127.0.0.1, порт {}, пользователь roman, ключ .ppk из той же пары",
+                    args.ssh_port
+                );
+                say!("Ключ хоста гостя свой у каждого диска: после переустановки клиент предупредит о смене.");
+                Some((args.ssh_port, 22))
+            } else {
+                None
+            };
+
             let opts = qemu::RunOptions {
                 gdb: args.gdb,
                 serial_only: args.serial_only,
@@ -517,7 +578,8 @@ fn real_main() -> Result<()> {
                 } else {
                     qemu::UsbController::Xhci
                 },
-                network: args.net,
+                network: args.net || args.ssh,
+                hostfwd,
                 ..qemu::RunOptions::default()
             };
             qemu::run(&opts, &built)?;
