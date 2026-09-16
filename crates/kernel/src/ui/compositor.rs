@@ -1551,7 +1551,30 @@ impl Compositor {
                 back.blit_from(surface, (overlap.x, screen_y + dy), src);
                 continue;
             };
-            for column in 0..overlap.w {
+            // Середина строки углов не касается и копируется одним куском, как
+            // и строки мимо угловой зоны. Поточечный цикл остаётся только на
+            // двух квадратах по краям.
+            //
+            // Это измерено, а не выведено из общих соображений: док попадает в
+            // пять-двенадцать полос, и на нём одном уходило шесть миллисекунд
+            // из шести с небольшим, которые стоили все верхние слои вместе. У
+            // дока скругление 26 при масштабе 2 — сотня строк, и в каждой
+            // прежний цикл шёл по всем 720 точкам, хотя угловых из них 52 с
+            // каждого края, а для остальных считался квадратный корень с
+            // заведомо известным ответом.
+            let left_end = (placed.x + radius - overlap.x).clamp(0, overlap.w as i32);
+            let right_start =
+                (placed.right() - radius - overlap.x).clamp(left_end, overlap.w as i32);
+            if right_start > left_end {
+                let src = Rect::new(
+                    overlap.x - placed.x + left_end,
+                    local_y,
+                    (right_start - left_end) as u32,
+                    1,
+                );
+                back.blit_from(surface, (overlap.x + left_end, screen_y + dy), src);
+            }
+            for column in (0..left_end as u32).chain(right_start as u32..overlap.w) {
                 let screen_x = overlap.x + column as i32;
                 let local_x = screen_x - placed.x;
                 let depth_x = if local_x < radius {
