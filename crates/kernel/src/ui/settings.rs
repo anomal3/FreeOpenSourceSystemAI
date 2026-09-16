@@ -350,6 +350,11 @@ pub struct SettingsView {
     /// Чем кончилась запись выбора на следующий запуск — для отчёта, который
     /// складывается, когда стол скажет, переключил ли он экран.
     remembered: Option<Result<(), String>>,
+    /// Телефон: открыт раздел, а не список разделов (макет `FreeOS-mobile`,
+    /// экраны 04 и 05). На узком экране колонке разделов и содержимому рядом
+    /// места нет, и окно ведёт себя как настройки телефона: список, нажатие —
+    /// раздел во весь экран, стрелка назад — снова список.
+    page_open: bool,
 }
 
 impl SettingsView {
@@ -367,11 +372,13 @@ impl SettingsView {
             title_changed: false,
             mode_request: None,
             remembered: None,
+            page_open: false,
         }
     }
 
     /// Перейти на раздел — так окно открывают меню стола и трей.
     pub fn show(&mut self, section: Section) {
+        self.page_open = true;
         self.section = Self::index_of(section);
         self.on_sections = true;
         self.action = 0;
@@ -604,6 +611,12 @@ impl SettingsView {
                 return true;
             }
         }
+        // Esc на телефоне — назад к списку разделов, как стрелка в заголовке.
+        if code == KeyCode::Escape && theme::is_mobile() && self.page_open {
+            self.page_open = false;
+            self.programs = Programs::List;
+            return true;
+        }
         match code {
             KeyCode::Up => {
                 if self.on_sections {
@@ -717,7 +730,18 @@ impl SettingsView {
             return false;
         };
         match hit.spot {
+            Spot::Back => {
+                self.page_open = false;
+                self.programs = Programs::List;
+                self.report = None;
+                kprintln!("  settings    : back to the list");
+                true
+            }
             Spot::Section(index) => {
+                if theme::is_mobile() {
+                    self.page_open = true;
+                    kprintln!("  settings    : opened '{}'", Section::ALL[index].title());
+                }
                 self.section = index;
                 self.on_sections = true;
                 self.action = 0;
@@ -1018,6 +1042,18 @@ impl SettingsView {
         let background = ctx.under;
         pass.on(|s| s.fill(area, background));
 
+        if theme::is_mobile() {
+            if self.page_open {
+                let header_h = ctx.px(56);
+                self.mobile_header(&mut pass, Rect::new(area.x, area.y, area.w, header_h));
+                let body = Rect::new(area.x, area.y + header_h as i32, area.w, area.h.saturating_sub(header_h));
+                self.content(&mut pass, body);
+            } else {
+                self.mobile_list(&mut pass, area);
+            }
+            return pass.hits;
+        }
+
         let side_w = ctx.px(theme::SIDE_W).min(area.w / 2);
         self.sidebar(&mut pass, Rect::new(area.x, area.y, side_w, area.h));
         self.content(
@@ -1030,6 +1066,113 @@ impl SettingsView {
             ),
         );
         pass.hits
+    }
+
+    /// Телефон: заголовок открытого раздела — стрелка назад и имя (экран 05).
+    fn mobile_header(&self, pass: &mut Pass, area: Rect) {
+        let ctx = pass.ctx;
+        let p = ctx.palette;
+        let pad = ctx.px(16) as i32;
+        let size = ctx.px(36);
+        let back = Rect::new(area.x + pad, area.y + (area.h as i32 - size as i32) / 2, size, size);
+        let radius = ctx.px(12);
+        pass.on(|s| {
+            draw::rounded(s, back, radius, p.btn.color, p.btn.alpha);
+            draw::rounded_stroke(s, back, radius, p.btnline.color, p.btnline.alpha);
+        });
+        let glyph = ctx.px(14);
+        let (gx, gy) = (back.x + (size - glyph) as i32 / 2, back.y + (size - glyph) as i32 / 2);
+        pass.on(|s| glyphicon::draw(s, Icon::Back, gx, gy, glyph, p.ink2, 255));
+        // Попадание — вся левая часть заголовка: в стрелку целятся пальцем.
+        pass.hits.push(Hit { rect: Rect::new(area.x, area.y, ctx.px(160).min(area.w), area.h), spot: Spot::Back });
+
+        let text_x = back.right() + ctx.px(12) as i32;
+        let room = (area.right() - pad - text_x).max(0) as u32;
+        let y = paint::baseline(ctx, Role::Title, area);
+        pass.text_clipped(Role::Title, text_x, y, room, self.current().title(), p.ink);
+        let edge = p.line;
+        pass.on(|s| draw::hline(s, area.x, area.bottom() - 1, area.w, edge.color, edge.alpha));
+    }
+
+    /// Телефон: список разделов (экран 04) — карточка сеанса и две группы.
+    fn mobile_list(&self, pass: &mut Pass, area: Rect) {
+        let ctx = pass.ctx;
+        let p = ctx.palette;
+        let pad = ctx.px(16) as i32;
+        let x = area.x + pad;
+        let w = area.w.saturating_sub(ctx.px(32));
+        let mut y = area.y + ctx.px(18) as i32;
+
+        pass.text_clipped(Role::Heading, x + ctx.px(4) as i32, y, w, "Настройки", p.ink);
+        y += line_h(ctx, Role::Heading) + ctx.px(16) as i32;
+
+        // Карточка сеанса: кто вошёл. Нажатие — «Пользователи».
+        let card = Rect::new(x, y, w, ctx.px(64));
+        let radius = ctx.px(18);
+        pass.on(|s| {
+            draw::horizontal_gradient(s, card, radius, ctx.flat(p.sel1), ctx.flat(p.sel2), 255);
+            draw::rounded_stroke(s, card, radius, p.accedge, 255);
+        });
+        let avatar = Rect::new(card.x + ctx.px(14) as i32, card.y + ctx.px(14) as i32, ctx.px(36), ctx.px(36));
+        // Пустое имя — сеанс без файла учётных записей (живой носитель): это
+        // root, и «Пуск» называет его так же.
+        let name = crate::user::session::with_name(|name| if name.is_empty() { String::from("root") } else { name.to_string() });
+        let uid = crate::user::session::credentials().uid;
+        let letter: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+        pass.on(|s| draw::rounded_gradient(s, avatar, avatar.w / 2, p.acc, p.acc2, 255));
+        let lw = ctx.face(Role::Title).width(&letter) as i32;
+        let white = Color::rgb(0xFF, 0xFF, 0xFF);
+        pass.text_clipped(Role::Title, avatar.x + (avatar.w as i32 - lw) / 2, paint::baseline(ctx, Role::Title, avatar), avatar.w, &letter, white);
+        let text_x = avatar.right() + ctx.px(12) as i32;
+        let room = (card.right() - ctx.px(36) as i32 - text_x).max(0) as u32;
+        let lines = line_h(ctx, Role::Title) + line_h(ctx, Role::MonoSmall);
+        let top = card.y + (card.h as i32 - lines) / 2;
+        pass.text_clipped(Role::Title, text_x, top, room, &name, p.ink);
+        let sub = format!("uid {uid} \u{00b7} {} {}", arch::ARCH_NAME, env!("CARGO_PKG_VERSION"));
+        pass.text_clipped(Role::MonoSmall, text_x, top + line_h(ctx, Role::Title), room, &sub, p.ink4);
+        chevron(pass, card);
+        pass.section(card, Self::index_of(Section::Users));
+        y = card.bottom() + ctx.px(18) as i32;
+
+        let groups: [(&str, &[Section]); 2] = [
+            ("УСТРОЙСТВО", &[Section::Display, Section::Clock, Section::Network]),
+            ("СИСТЕМА", &[Section::Disks, Section::Programs, Section::Updates, Section::Look, Section::System]),
+        ];
+        let row_h = ctx.px(46);
+        for (caption, sections) in groups {
+            y = pass.caps_line(x + ctx.px(4) as i32, y, caption);
+            for section in sections.iter().copied() {
+                let rect = Rect::new(x, y, w, row_h);
+                if !pass.visible(rect) {
+                    break;
+                }
+                let r = ctx.px(16);
+                pass.on(|s| {
+                    draw::rounded(s, rect, r, p.card.color, p.card.alpha);
+                    draw::rounded_stroke(s, rect, r, p.line2.color, p.line2.alpha);
+                });
+                let tile = Rect::new(rect.x + ctx.px(10) as i32, rect.y + ctx.px(7) as i32, ctx.px(32), ctx.px(32));
+                let tr = ctx.px(10);
+                pass.on(|s| {
+                    draw::rounded(s, tile, tr, p.btn.color, p.btn.alpha);
+                    draw::rounded_stroke(s, tile, tr, p.btnline.color, p.btnline.alpha);
+                });
+                let glyph = ctx.px(15);
+                let (gx, gy) = (tile.x + (tile.w - glyph) as i32 / 2, tile.y + (tile.h - glyph) as i32 / 2);
+                let icon = section.icon();
+                pass.on(|s| glyphicon::draw(s, icon, gx, gy, glyph, p.ink2, 255));
+                let text_x = tile.right() + ctx.px(12) as i32;
+                let room = (rect.right() - ctx.px(36) as i32 - text_x).max(0) as u32;
+                let lines = line_h(ctx, Role::Title) + line_h(ctx, Role::Caption);
+                let top = rect.y + (rect.h as i32 - lines) / 2;
+                pass.text_clipped(Role::Title, text_x, top, room, section.title(), p.ink);
+                pass.text_clipped(Role::Caption, text_x, top + line_h(ctx, Role::Title), room, section.blurb(), p.ink4);
+                chevron(pass, rect);
+                pass.section(rect, Self::index_of(section));
+                y += (row_h + ctx.px(4)) as i32;
+            }
+            y += ctx.px(10) as i32;
+        }
     }
 
     /// Боковая колонка с разделами.
@@ -1148,9 +1291,13 @@ impl SettingsView {
         pass.limit = main.bottom() - bottom_h as i32;
 
         let mut y = main.y;
-        let heading = self.heading();
-        pass.text_clipped(Role::Heading, main.x, y, main.w, &heading, p.ink);
-        y += line_h(ctx, Role::Heading);
+        // На телефоне имя раздела уже стоит в заголовке со стрелкой назад —
+        // второй раз крупнее под ним оно только отнимало бы строку.
+        if !theme::is_mobile() {
+            let heading = self.heading();
+            pass.text_clipped(Role::Heading, main.x, y, main.w, &heading, p.ink);
+            y += line_h(ctx, Role::Heading);
+        }
         let about = self.about();
         pass.text_clipped(Role::Body, main.x, y, main.w, &about, p.ink3);
         y += line_h(ctx, Role::Body) + ctx.px(16) as i32;
@@ -1990,6 +2137,8 @@ impl SettingsView {
 /// Куда попадает щелчок.
 #[derive(Clone, PartialEq, Eq)]
 enum Spot {
+    /// Стрелка назад в заголовке раздела на телефоне.
+    Back,
     /// Строка бокового списка.
     Section(usize),
     /// Пункт содержимого.
@@ -2086,6 +2235,16 @@ impl Pass<'_> {
 }
 
 // ── Кирпичи раскладки ────────────────────────────────────────────────────────
+
+/// Стрелка «дальше» у правого края строки списка на телефоне.
+fn chevron(pass: &mut Pass, row: Rect) {
+    let ctx = pass.ctx;
+    let ink = ctx.palette.ink4;
+    let glyph = ctx.px(13);
+    let x = row.right() - ctx.px(14) as i32 - glyph as i32;
+    let y = row.y + (row.h as i32 - glyph as i32) / 2;
+    pass.on(|s| glyphicon::draw(s, Icon::Forward, x, y, glyph, ink, 255));
+}
 
 /// Высота строки этого начертания.
 fn line_h(ctx: Ctx, role: Role) -> i32 {

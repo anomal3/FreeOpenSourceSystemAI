@@ -1091,6 +1091,16 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : open zoom of 'Settings': ", 15_000),
             Step::Wait(1000),
             Step::Shot("08-settings"),
+            // Настройки на телефоне (макет, экраны 04 и 05): список разделов;
+            // «Экран» открывает раздел с заголовком, стрелка ведёт назад.
+            Step::Aim(Aim::Point(360, 560)),
+            Step::Click,
+            Step::Await("settings    : opened 'Экран'", 15_000),
+            Step::Wait(1000),
+            Step::Shot("08c-settings-display"),
+            Step::Aim(Aim::Point(80, 264)),
+            Step::Click,
+            Step::Await("settings    : back to the list", 15_000),
             Step::Aim(Aim::Point(642, 164)),
             Step::Click,
             Step::Await("desktop     : closed 'Settings'", 15_000),
