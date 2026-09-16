@@ -193,34 +193,53 @@ impl Fastboot {
             // спрашивают.
             let heap = crate::mm::heap::stats();
             let frames = crate::mm::frame::stats();
-            // Коротко до предела: под текст ответа остаётся шестьдесят байт
-            // (см. [`TEXT`]), и всё, что длиннее, обрезается молча — строка
-            // приходит на хост пустой на вид.
+            // Строками `INFO` — по той же причине, что и `oem ui` ниже: текст
+            // при `OKAY` на команду `oem` до экрана не доходит.
+            self.line_count = 0;
             let text = alloc::format!(
-                "heap {}/{} KiB, ram {}/{} MiB",
+                "heap {} of {} KiB used, {} KiB free",
                 heap.used / 1024,
                 heap.size / 1024,
+                heap.free / 1024,
+            );
+            self.say(text.as_bytes());
+            let text = alloc::format!(
+                "ram {} of {} MiB free",
                 frames.free_bytes() / (1024 * 1024),
                 frames.total_bytes() / (1024 * 1024),
             );
-            self.respond(b"OKAY", &text);
+            self.say(text.as_bytes());
+            self.state = State::Lines { at: 0 };
+            self.continue_lines(0);
         } else if text == "oem ui" {
             // Во что обходится кадр — по кабелю, а не догадкой. Среднее на
             // кадр в микросекундах: сборка и вывод порознь (см.
             // `Compositor::compose`).
-            let text = match crate::ui::timing() {
+            //
+            // Ответ идёт строками `INFO`, а не текстом при `OKAY`: текст при
+            // `OKAY` на команду `oem` программа `fastboot` не печатает вовсе —
+            // об этом сказано там же, где `getvar`, и я на этом уже обжёгся,
+            // получив два пустых ответа подряд.
+            self.line_count = 0;
+            match crate::ui::timing() {
                 Some((frames, bands, draw_ns, blit_ns, points)) => {
                     let n = frames.max(1);
-                    alloc::format!(
-                        "{frames}f {bands}b draw {} us blit {} us {} Mpx",
+                    let text = alloc::format!(
+                        "{frames} frames, {bands} bands, {} Mpx",
+                        points / 1_000_000,
+                    );
+                    self.say(text.as_bytes());
+                    let text = alloc::format!(
+                        "per frame: draw {} us, blit {} us",
                         draw_ns / n / 1000,
                         blit_ns / n / 1000,
-                        points / 1_000_000,
-                    )
+                    );
+                    self.say(text.as_bytes());
                 }
-                None => alloc::string::String::from("no desktop on this machine"),
-            };
-            self.respond(b"OKAY", &text);
+                None => self.say(b"no desktop on this machine"),
+            }
+            self.state = State::Lines { at: 0 };
+            self.continue_lines(0);
         } else if text == "oem log" || text == "oem klog" {
             let (at, until) = (klog::oldest(), klog::written());
             self.state = State::Log { at, until };
