@@ -705,6 +705,39 @@ pub fn note_layers(wall: u64, icons: u64, windows: u64, shadow: u64, top: u64) {
     TOP_NS.fetch_add(top, Ordering::Relaxed);
 }
 
+/// Кадры целиком, кадры по кускам, переполнения учёта и сумма кусков.
+static FULL_FRAMES: AtomicU64 = AtomicU64::new(0);
+static PART_FRAMES: AtomicU64 = AtomicU64::new(0);
+static OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+static PART_RECTS: AtomicU64 = AtomicU64::new(0);
+
+/// Кадр перерисовал весь экран.
+pub fn note_full_frame() {
+    FULL_FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Кадр перерисовал `rects` кусков.
+pub fn note_partial_frame(rects: u64) {
+    PART_FRAMES.fetch_add(1, Ordering::Relaxed);
+    PART_RECTS.fetch_add(rects, Ordering::Relaxed);
+}
+
+/// Учёт изменённого переполнился — дальше только полная перерисовка.
+pub fn note_overflow() {
+    OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Полные кадры, частичные, переполнения, всего кусков в частичных.
+#[must_use]
+pub fn damage_timing() -> (u64, u64, u64, u64) {
+    (
+        FULL_FRAMES.load(Ordering::Relaxed),
+        PART_FRAMES.load(Ordering::Relaxed),
+        OVERFLOWS.load(Ordering::Relaxed),
+        PART_RECTS.load(Ordering::Relaxed),
+    )
+}
+
 /// Слои по отдельности — обои, значки, окна, из них тени, верхние слои.
 #[must_use]
 pub fn layer_timing() -> (u64, u64, u64, u64, u64) {

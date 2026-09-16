@@ -836,6 +836,11 @@ impl Compositor {
         }
         if self.damage_count == MAX_DAMAGE {
             self.damage_overflow = true;
+            // Переполнение — отдельный счётчик: «весь экран перерисован» имеет
+            // две причины, и лечатся они по-разному. Двенадцать накопившихся
+            // прямоугольников — это учёт, который не справляется; смена режима
+            // или темы — это честная полная перерисовка, которой так и надо.
+            super::note_overflow();
             return;
         }
         self.damage[self.damage_count] = rect;
@@ -1178,12 +1183,14 @@ impl Compositor {
 
         if self.damage_overflow {
             let all = self.screen.bounds();
+            super::note_full_frame();
             self.compose(all);
             self.rects += 1;
             self.damage_overflow = false;
             self.damage_count = 0;
             return;
         }
+        super::note_partial_frame(self.damage_count as u64);
 
         for index in 0..self.damage_count {
             let rect = self.damage[index].intersect(&self.screen.bounds());

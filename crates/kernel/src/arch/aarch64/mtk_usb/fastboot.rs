@@ -232,6 +232,10 @@ impl Fastboot {
                 blit_ns / n / 1000,
             );
             self.say(text.as_bytes());
+            let (full, part, overflows, rects) = crate::ui::damage_timing();
+            let text =
+                alloc::format!("full {full}, partial {part} ({rects} rects), overflow {overflows}");
+            self.say(text.as_bytes());
             let (wall, icons, windows, shadow, top) = crate::ui::layer_timing();
             let text = alloc::format!(
                 "wall {} icons {} win {} (shadow {}) top {} us",
