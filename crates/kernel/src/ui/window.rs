@@ -151,6 +151,18 @@ impl App {
         }
     }
 
+    /// Можно ли менять окну размер.
+    ///
+    /// Терминалу и «Параметрам» — да: их содержимое выкладывается по размеру.
+    /// Вопросам о выключении и «О системе» — нет: это карточки с текстом ровно
+    /// под свой размер, и растянутые они только пустеют. Окну программы — нет,
+    /// и это названный предел, а не вкус (см. `Window::rebuild`). Уголок у
+    /// такого окна не рисуется: нарисованный, он обещал бы то, чего нет.
+    #[must_use]
+    pub const fn resizable(self) -> bool {
+        matches!(self, App::Terminal | App::Settings)
+    }
+
     /// Значок программы: на столе, в меню запуска и в заголовке окна.
     #[must_use]
     pub const fn icon(self) -> Icon {
@@ -530,7 +542,7 @@ impl Window {
         // Уголок проверяется после заголовка: у окна ростом с полосу заголовка
         // они пересекаются, и таскать такое окно важнее, чем тянуть его за
         // размер.
-        if self.resize_grip().contains(local.0, local.1) {
+        if self.app.resizable() && self.resize_grip().contains(local.0, local.1) {
             return Some(Hit::Resize);
         }
         Some(Hit::Body)
@@ -656,7 +668,9 @@ impl Window {
         // Tab обрабатывалась дольше пяти секунд.
         let grip = self.resize_grip();
         let dot = ctx.px(2).max(1);
-        for (dx, dy) in [(0u32, 0u32), (1, 0), (0, 1)] {
+        let grip_dots: &[(u32, u32)] =
+            if self.app.resizable() { &[(0, 0), (1, 0), (0, 1)] } else { &[] };
+        for &(dx, dy) in grip_dots {
             let step = ctx.px(5) as i32;
             draw::circle(
                 &mut self.surface,

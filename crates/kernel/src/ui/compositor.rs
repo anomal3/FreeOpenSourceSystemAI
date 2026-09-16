@@ -117,6 +117,13 @@ pub struct Compositor {
     /// Окно, переехавшее с прошлого кадра, и где оно стояло **до первого**
     /// сдвига в этом кадре. См. [`Compositor::note_moved`].
     moved: Option<(App, Rect)>,
+    /// Размер, который просит тянущий уголок, — применяется раз за кадр (см.
+    /// [`Compositor::apply_pending_size`]).
+    ///
+    /// Числа со знаком и без ограничений: это «где сейчас палец», а пределы
+    /// ставятся при применении. Так окно, упёршееся в наименьший размер, на
+    /// обратном ходу снова следует за пальцем, а не отстаёт на накопленное.
+    pending_size: Option<(App, i32, i32)>,
     /// Окно программы, над содержимым которого указатель был в прошлый раз
     /// (фаза N7h).
     ///
@@ -190,6 +197,7 @@ impl Compositor {
             drag_from: (0, 0),
             drag_resizes: false,
             moved: None,
+            pending_size: None,
             hovered: None,
             scale,
             damage: [Rect::EMPTY; MAX_DAMAGE],
@@ -648,25 +656,24 @@ impl Compositor {
         };
         let width = self.screen.width();
         let bottom = self.work_bottom();
-        let resizes = self.drag_resizes;
+        if self.drag_resizes {
+            // Размер не меняется здесь, а запоминается: см. [`Self::pending_size`]
+            // и [`Self::apply_pending_size`].
+            let Some(before) = self.windows.get(index).map(|window| window.rect) else {
+                return;
+            };
+            let (w, h) = match self.pending_size {
+                Some((pending, w, h)) if pending == app => (w, h),
+                _ => (before.w as i32, before.h as i32),
+            };
+            self.pending_size = Some((app, w + dx, h + dy));
+            return;
+        }
         let Some(window) = self.windows.get_mut(index) else {
             return;
         };
         let before = window.rect;
-        if resizes {
-            // Размер считается от места окна до указателя, а не приращением к
-            // прежнему: окно, упёршееся в наименьший размер, иначе продолжало бы
-            // «копить» движение мыши и отставало бы от неё на обратном ходу.
-            let w = (before.w as i32 + dx).max(0) as u32;
-            let h = (before.h as i32 + dy).max(0) as u32;
-            let limit_w = width.saturating_sub(before.x.max(0) as u32);
-            let limit_h = (bottom - before.y).max(0) as u32;
-            if !window.resize(w.min(limit_w), h.min(limit_h)) {
-                return;
-            }
-        } else {
-            window.move_within(dx, dy, width, bottom);
-        }
+        window.move_within(dx, dy, width, bottom);
         if window.rect == before {
             return;
         }
@@ -871,6 +878,46 @@ impl Compositor {
             rect.w + halo * 2,
             rect.h + halo * 2,
         ));
+    }
+
+    /// Довести отложенное изменение размера — палец отпустили.
+    pub fn settle_drag(&mut self) {
+        self.apply_pending_size();
+    }
+
+    /// Применить размер, который просил уголок, — один раз за кадр.
+    ///
+    /// # Почему не на каждый сдвиг пальца
+    ///
+    /// Изменение размера — это новая поверхность во весь размер окна (у окна во
+    /// весь экран телефона три с половиной мегабайта), заново выложенная сетка
+    /// терминала и окно, перерисованное целиком. Сдвиги пальца приходят чаще,
+    /// чем это успевает сделаться, и каждый честно делал всю работу для
+    /// размера, который на экран не попадал: окно тянулось плавно, но с
+    /// опозданием — Роман так и описал. Последний размер к моменту кадра — это
+    /// всё, что человек увидит.
+    fn apply_pending_size(&mut self) {
+        let Some((app, w, h)) = self.pending_size.take() else {
+            return;
+        };
+        let width = self.screen.width();
+        let bottom = self.work_bottom();
+        let Some(index) = self.index_of(app) else {
+            return;
+        };
+        let Some(window) = self.windows.get_mut(index) else {
+            return;
+        };
+        let before = window.rect;
+        let limit_w = width.saturating_sub(before.x.max(0) as u32);
+        let limit_h = (bottom - before.y).max(0) as u32;
+        let w = (w.max(0) as u32).min(limit_w);
+        let h = (h.max(0) as u32).min(limit_h);
+        if !window.resize(w, h) || window.rect == before {
+            return;
+        }
+        let after = window.rect;
+        self.note_moved(app, before, after);
     }
 
     /// Запомнить переезд окна до сборки кадра.
@@ -1263,6 +1310,7 @@ impl Compositor {
         if self.deferred {
             return;
         }
+        self.apply_pending_size();
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
             return;
