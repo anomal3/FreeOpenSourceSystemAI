@@ -657,6 +657,16 @@ pub fn pointer_state() -> Option<(i32, i32, bool)> {
 
 /// Кадры, прямоугольники и число окон.
 #[must_use]
+/// Во что обходятся кадры: кадры, полосы, наносекунды сборки и вывода, точки.
+///
+/// `None` — стола нет вовсе (машина без графики). Спрашивается по кабелю
+/// (`oem ui`): пока чисел не было, «лагает» оставалось словом, к которому
+/// нечего приложить.
+#[must_use]
+pub fn timing() -> Option<(u64, u64, u64, u64, u64)> {
+    with_desktop(|desktop| desktop.timing())
+}
+
 pub fn stats() -> (u64, u64, usize) {
     with_desktop(|desktop| desktop.stats()).unwrap_or((0, 0, 0))
 }

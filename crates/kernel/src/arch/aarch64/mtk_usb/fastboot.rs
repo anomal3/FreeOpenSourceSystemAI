@@ -193,14 +193,33 @@ impl Fastboot {
             // спрашивают.
             let heap = crate::mm::heap::stats();
             let frames = crate::mm::frame::stats();
+            // Коротко до предела: под текст ответа остаётся шестьдесят байт
+            // (см. [`TEXT`]), и всё, что длиннее, обрезается молча — строка
+            // приходит на хост пустой на вид.
             let text = alloc::format!(
-                "heap {} KiB used, {} KiB free of {} KiB; frames {} MiB free of {} MiB",
+                "heap {}/{} KiB, ram {}/{} MiB",
                 heap.used / 1024,
-                heap.free / 1024,
                 heap.size / 1024,
                 frames.free_bytes() / (1024 * 1024),
                 frames.total_bytes() / (1024 * 1024),
             );
+            self.respond(b"OKAY", &text);
+        } else if text == "oem ui" {
+            // Во что обходится кадр — по кабелю, а не догадкой. Среднее на
+            // кадр в микросекундах: сборка и вывод порознь (см.
+            // `Compositor::compose`).
+            let text = match crate::ui::timing() {
+                Some((frames, bands, draw_ns, blit_ns, points)) => {
+                    let n = frames.max(1);
+                    alloc::format!(
+                        "{frames}f {bands}b draw {} us blit {} us {} Mpx",
+                        draw_ns / n / 1000,
+                        blit_ns / n / 1000,
+                        points / 1_000_000,
+                    )
+                }
+                None => alloc::string::String::from("no desktop on this machine"),
+            };
             self.respond(b"OKAY", &text);
         } else if text == "oem log" || text == "oem klog" {
             let (at, until) = (klog::oldest(), klog::written());
