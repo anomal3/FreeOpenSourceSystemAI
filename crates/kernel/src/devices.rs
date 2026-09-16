@@ -129,6 +129,7 @@ fn driver_for(device: &pci::Device) -> (&'static str, &'static str) {
         (pci::VENDOR_VIRTIO, pci::DEVICE_VIRTIO_NET_LEGACY | pci::DEVICE_VIRTIO_NET_MODERN, ..) => {
             Some("virtio-net")
         }
+        (vendor, model, ..) if crate::net::e1000::supports(vendor, model) => Some("e1000"),
         (0x1234, 0x1111, ..) => Some("bochs vbe"),
         (_, _, 0x01, 0x06, 0x01) => Some("ahci"),
         (_, _, 0x01, 0x08, 0x02) => Some("nvme"),
@@ -205,6 +206,80 @@ pub fn report() -> String {
         );
     }
     out
+}
+
+/// Перепись шины словами — для журнала загрузки и для команды `pci`.
+///
+/// # Почему один текст на двоих
+///
+/// Потому что на чужой машине свидетельство одно — фотография экрана. Строка в
+/// журнале загрузки и строка, которую печатает оболочка, обязаны совпадать
+/// дословно: иначе человек фотографирует одно, а я ищу в коде другое. Ноутбук
+/// ASUS K53SD стоил двух ночей ровно потому, что список устройств в системе был,
+/// а идентификаторов в нём не было: класс «сетевой адаптер» не говорит, какой
+/// драйвер писать, а `1969:1083` говорит.
+#[must_use]
+pub fn census_text() -> String {
+    let mut out = String::new();
+    let rsdp = crate::acpi::rsdp();
+    if rsdp == 0 {
+        let _ = writeln!(out, "no ACPI tables, so no PCI bus here");
+        return out;
+    }
+    // SAFETY: RSDP из хэндоффа, прямое отображение активно; обход шины только
+    // читает конфигурационное пространство.
+    let Ok(root) = (unsafe { pci::Root::discover(rsdp) }) else {
+        let _ = writeln!(out, "no PCI bus on this machine");
+        return out;
+    };
+
+    let mut found: Vec<pci::Device> = Vec::new();
+    // SAFETY: см. выше.
+    unsafe {
+        pci::for_each(&root, |device| {
+            found.push(*device);
+            true
+        });
+    }
+
+    let mut without = 0usize;
+    for device in &found {
+        let (driver, state) = driver_for(device);
+        let verdict = match state {
+            "active" => alloc::format!("{driver}, working"),
+            "idle" => alloc::format!("{driver} is in this kernel, but not on this device"),
+            "not-needed" => String::from("set up by the firmware, no driver needed"),
+            _ => {
+                without += 1;
+                String::from("NO DRIVER IN THIS KERNEL")
+            }
+        };
+        let _ = writeln!(
+            out,
+            "{} {:04x}:{:04x} class {:02x}:{:02x}:{:02x} {:<24} -- {verdict}",
+            device.address,
+            device.vendor,
+            device.device,
+            device.class,
+            device.subclass,
+            device.prog_if,
+            class_name(device.class, device.subclass, device.prog_if),
+        );
+    }
+    let _ = writeln!(out, "{} function(s) on the bus, {without} of them without a driver", found.len());
+    out
+}
+
+/// Напечатать перепись в журнал загрузки.
+///
+/// Зовётся поздно — когда драйверы уже отметились: перепись, снятая до них,
+/// объявила бы «драйвера нет» у всего сразу и этим соврала бы.
+pub fn log_census() {
+    crate::kprintln!();
+    crate::kprintln!("---- devices ----------------------------------------------------");
+    for line in census_text().lines() {
+        crate::kprintln!("  bus         : {line}");
+    }
 }
 
 fn usb_lines(out: &mut String, driver: &str, attached: &[crate::usb::Attached]) {

@@ -28,7 +28,9 @@
 //! свободного дескриптора в передающей очереди.
 
 pub mod arp;
+pub mod card;
 pub mod dns;
+pub mod e1000;
 pub mod eth;
 pub mod icmp;
 pub mod ipv4;
@@ -40,8 +42,9 @@ pub mod udp;
 
 use crate::sched::TaskId;
 use crate::sync::SpinLock;
-use crate::virtio::net::{FRAME_MAX, Stats, VirtioNet};
+use crate::virtio::net::VirtioNet;
 use crate::virtio::VirtioError;
+use card::{Card, CardError, FRAME_MAX, Stats};
 use eth::Mac;
 use ipv4::Ipv4;
 
@@ -75,7 +78,7 @@ pub enum NetError {
     /// Ответа не дождались.
     Timeout,
     /// Устройство отказалось отправлять.
-    Device(VirtioError),
+    Device(CardError),
     /// Не получилось с сокетом.
     Socket(socket::SocketError),
     /// Не получилось с соединением.
@@ -146,7 +149,9 @@ struct Reply {
 
 /// Всё состояние сети.
 struct Interface {
-    device: VirtioNet,
+    /// Карта — за договором, а не за именем типа: в системе их теперь больше
+    /// одной, и стек не должен знать, с какой он работает (см. [`card`]).
+    device: alloc::boxed::Box<dyn Card>,
     mac: Mac,
     address: Ipv4,
     netmask: Ipv4,
@@ -207,16 +212,57 @@ pub unsafe fn init(rsdp: u64) {
         }
     };
 
+    // Семейства перебираются по очереди — от виртуальной карты к настоящим.
+    // Порядок тот же, что у вероятности встречи: virtio-net опознаётся парой
+    // идентификаторов и стоит в каждой второй виртуальной машине, e1000 — в
+    // несчётном множестве настоящих и в QEMU.
+    //
     // SAFETY: см. выше.
-    let device = match unsafe { VirtioNet::probe(&root) } {
-        Ok(device) => device,
-        Err(VirtioError::NoCapabilities) => {
-            // Карты нет — это обычное состояние машины, запущенной без сети, а
-            // не поломка. Сказать об этом надо, чтобы «сеть не работает» не
-            // приходилось выяснять расспросами.
-            crate::kprintln!("  network     : no virtio-net card attached to this machine");
-            return;
-        }
+    let device: alloc::boxed::Box<dyn Card> = match unsafe { VirtioNet::probe(&root) } {
+        Ok(card) => alloc::boxed::Box::new(card),
+        // Карты virtio нет — это обычное состояние настоящей машины, а не
+        // поломка: спрашиваем следующее семейство.
+        //
+        // SAFETY: см. выше.
+        Err(VirtioError::NoCapabilities) => match unsafe { e1000::E1000::probe(&root) } {
+            Ok(card) => {
+                crate::devices::claim(card.address(), "e1000");
+                if !card.link_up() {
+                    // Провод не воткнут — самая частая причина молчащей сети.
+                    // Сказать это здесь дешевле, чем выяснять через минуту по
+                    // молчанию DHCP.
+                    crate::kprintln!(
+                        "  network     : e1000 8086:{:04x}: no link on the wire yet",
+                        card.device_id()
+                    );
+                }
+                alloc::boxed::Box::new(card)
+            }
+            Err(e1000::E1000Error::NoCard) => {
+                // Ни одной карты, которую мы умеем. Машина без сети — это
+                // законное состояние, а вот машина с картой, к которой нет
+                // драйвера, — повод назвать её идентификаторы вслух: по ним
+                // пишется драйвер, а по словам «сеть не работает» — ничего.
+                //
+                // SAFETY: см. выше.
+                let others = unsafe { e1000::undriven(&root) };
+                if others.is_empty() {
+                    crate::kprintln!("  network     : no network card attached to this machine");
+                } else {
+                    for (at, vendor, model) in others {
+                        crate::kprintln!(
+                            "  network     : {at} {vendor:04x}:{model:04x} is a network card, and this kernel has no driver for it"
+                        );
+                    }
+                    crate::kprintln!("  network     : drivers in this kernel: virtio-net, e1000");
+                }
+                return;
+            }
+            Err(err) => {
+                crate::kprintln!("  network     : the card did not come up: {err}");
+                return;
+            }
+        },
         Err(err) => {
             crate::kprintln!("  network     : the card did not come up: {err}");
             return;
@@ -224,7 +270,7 @@ pub unsafe fn init(rsdp: u64) {
     };
 
     let mac = device.mac();
-    crate::kprintln!("  network     : virtio-net, hardware address {}", eth::Display(mac));
+    crate::kprintln!("  network     : {}, hardware address {}", device.name(), eth::Display(mac));
 
     PRESENT.store(true, core::sync::atomic::Ordering::Release);
     *INTERFACE.lock() = Some(Interface {
@@ -260,6 +306,10 @@ pub fn is_present() -> bool {
 /// Настройка интерфейса — то, что показывает команда `ip`.
 #[derive(Clone, Copy)]
 pub struct Status {
+    /// Имя драйвера карты: `virtio-net`, `e1000`. Спрашивается у карты, а не
+    /// вписано в оболочку: зашитое имя врало бы на всякой машине, кроме той,
+    /// для которой его вписали.
+    pub name: &'static str,
     pub mac: Mac,
     pub address: Ipv4,
     pub netmask: Ipv4,
@@ -277,6 +327,7 @@ pub fn status() -> Option<Status> {
     let guard = INTERFACE.lock();
     let iface = guard.as_ref()?;
     Some(Status {
+        name: iface.device.name(),
         mac: iface.mac,
         address: iface.address,
         netmask: iface.netmask,
@@ -1364,7 +1415,7 @@ fn send_ipv4(
 
     let total = eth::HEADER + ipv4::HEADER + payload.len();
     if total > FRAME_MAX {
-        return Err(NetError::Device(VirtioError::TooLong(total)));
+        return Err(NetError::Device(CardError::TooLong(total)));
     }
 
     let id = iface.next_id;

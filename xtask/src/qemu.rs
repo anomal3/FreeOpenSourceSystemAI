@@ -38,6 +38,8 @@ pub struct RunOptions {
     pub disk_bus: DiskBus,
     /// Подключена ли к машине сетевая карта.
     pub network: bool,
+    /// Какой картой, если подключена.
+    pub nic: Nic,
     /// Проброс порта: `(порт на хосте, порт в госте)`.
     ///
     /// Единственный способ достучаться до гостя снаружи через SLIRP: сеть за
@@ -98,6 +100,20 @@ pub enum Pointer {
 /// умеющая один xHCI, на машине читателя не слушается ни клавиатуры, ни мыши.
 /// `pci-ohci` в QEMU — тот же класс контроллера, что там эмулируется, поэтому
 /// драйвер отлаживается здесь, а не на чужой машине без журнала.
+/// Какой сетевой картой машина подключена к пользовательской сети QEMU.
+///
+/// Выбор проверяет ядро, а не эмулятор: это два разных драйвера. virtio-net —
+/// договор с гипервизором, и вне виртуальной машины его не бывает вовсе; e1000
+/// — настоящая карта Intel 8254x, которую QEMU эмулирует регистр в регистр.
+/// Пока карта была одна, весь сетевой стек — DHCP, TCP, SSH, обновления —
+/// проверялся исключительно на устройстве, которого нет ни в одном настоящем
+/// компьютере.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Nic {
+    Virtio,
+    E1000,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum UsbController {
     Xhci,
@@ -145,6 +161,7 @@ impl Default for RunOptions {
             usb: UsbController::Xhci,
             disk_bus: DiskBus::Virtio,
             network: false,
+            nic: Nic::Virtio,
             hostfwd: None,
             allow_reboot: false,
         }
@@ -598,7 +615,15 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
             None => "user,id=net0".to_string(),
         };
         cmd.args(["-netdev", &netdev]);
-        cmd.args(["-device", "virtio-net-pci,netdev=net0"]);
+        cmd.args([
+            "-device",
+            match opts.nic {
+                Nic::Virtio => "virtio-net-pci,netdev=net0",
+                // `e1000` в QEMU — это 82540EM, та самая карта, под которую
+                // написан драйвер ядра.
+                Nic::E1000 => "e1000,netdev=net0",
+            },
+        ]);
     } else {
         // Без сети машина не тратит время на попытки PXE-загрузки в UEFI.
         cmd.args(["-net", "none"]);

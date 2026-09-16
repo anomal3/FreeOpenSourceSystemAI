@@ -518,6 +518,15 @@ struct Device {
     identity: (u16, u16),
     described_by: u16,
     interface: (u8, u8),
+    /// Это второй (третий, …) интерфейс HID того же физического устройства.
+    ///
+    /// Такая запись живёт на **чужом** адресе: управляющая точка у устройства
+    /// одна, и кольцо для неё заводит первая запись. Спутник несёт только свою
+    /// точку прерываний — то есть только своё кольцо в периодическом списке.
+    /// Вписать его QH в асинхронное кольцо значило бы два разных QH на одну и ту
+    /// же точку 0 одного и того же адреса, чего спецификация не разрешает и что
+    /// контроллер обычно переживает как молчание устройства.
+    secondary: bool,
 }
 
 impl Device {
@@ -899,16 +908,20 @@ impl Controller {
             identity: (0, 0),
             described_by: 0,
             interface: (0, 0),
+            secondary: false,
         };
 
         // SAFETY: страница выделена и обнулена.
         unsafe { self.open_control(&device) };
         // SAFETY: QH в кольце, устройство отвечает по адресу 0.
         match unsafe { self.bring_up(&mut device) } {
-            Ok(()) => {
+            Ok(extra) => {
                 let is_hub = device.hub_ports > 0;
                 let address = device.address;
                 self.devices.push(device);
+                // Спутники — сразу следом: они уже настроены, и до общей
+                // пересборки периодического списка их кольца никуда не ведут.
+                self.devices.extend(extra);
                 if is_hub {
                     // SAFETY: хаб поднят и стоит в списке устройств.
                     unsafe { self.scan_hub(address) };
@@ -932,7 +945,7 @@ impl Controller {
     /// # Safety
     ///
     /// См. [`Controller::attach`]; QH управляющей точки уже в кольце.
-    unsafe fn bring_up(&mut self, device: &mut Device) -> Result<(), (Stage, EhciError)> {
+    unsafe fn bring_up(&mut self, device: &mut Device) -> Result<Vec<Device>, (Stage, EhciError)> {
         let place = device.place;
 
         // SAFETY: контракт функции.
@@ -1002,10 +1015,19 @@ impl Controller {
                 device.speed.name(),
                 device.hub_ports
             );
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let found = usb::find_hid(bytes).ok_or((Stage::Describe, EhciError::NoHid))?;
+        // Остальные интерфейсы HID выписываются **сейчас**, пока конфигурация
+        // под рукой, и это не порядок ради порядка: `bytes` — срез буфера
+        // передач самого контроллера, то есть заём `self`, а поднять по нему
+        // устройство нельзя — подъём требует `&mut self`. Выписка отпускает
+        // буфер, и заём кончается здесь же.
+        let others: Vec<HidInterface> = (1..found.interfaces)
+            .filter_map(|index| usb::find_hid_nth(bytes, index))
+            .collect();
+
         // SAFETY: устройство адресовано и описано.
         let reader = unsafe { self.enable_reports(device, &found) }
             .map_err(|err| (Stage::Enable, err))?;
@@ -1027,7 +1049,80 @@ impl Controller {
                 None => alloc::string::String::new(),
             }
         );
-        Ok(())
+
+        // Остальные интерфейсы HID того же устройства — по записи на каждый.
+        // Это ровно те приёмники беспроводных мышей, у которых нулевой
+        // интерфейс — клавиатура, а мышь висит на первом: до этой фазы драйвер
+        // поднимал нулевой, сообщал о работающей клавиатуре, которая никогда
+        // ничего не пришлёт, и указателя в системе не появлялось.
+        let mut extra = Vec::new();
+        for next in others {
+            if self.devices.len() + extra.len() + 1 >= DEVICES_MAX {
+                break;
+            }
+            // SAFETY: устройство адресовано и сконфигурировано.
+            match unsafe { self.open_satellite(device, &next, found.interfaces) } {
+                Ok(satellite) => extra.push(satellite),
+                Err(err) => kprintln!(
+                    "  ehci        : {place}: interface {} stopped while {}: {err}",
+                    next.interface,
+                    Stage::Enable
+                ),
+            }
+        }
+        Ok(extra)
+    }
+
+    /// Поднять ещё один интерфейс HID того же физического устройства.
+    ///
+    /// Своей управляющей точки у такой записи нет: она одна на устройство и
+    /// принадлежит первой записи (см. [`Device::secondary`]). Своя у спутника
+    /// только точка прерываний — и своя страница под неё.
+    ///
+    /// # Safety
+    ///
+    /// `owner` адресован и сконфигурирован, его QH управляющей точки в кольце.
+    unsafe fn open_satellite(
+        &mut self,
+        owner: &Device,
+        found: &HidInterface,
+        interfaces: u8,
+    ) -> Result<Device, EhciError> {
+        let page = dma::alloc(PAGE_SIZE)?;
+        page.zero();
+        let mut satellite = Device {
+            place: owner.place,
+            address: owner.address,
+            speed: owner.speed,
+            tt: owner.tt,
+            page,
+            max_packet: owner.max_packet,
+            depth: owner.depth,
+            hub_ports: 0,
+            hub_connected: 0,
+            reader: None,
+            report_len: found.max_packet_size.clamp(1, REPORT_MAX),
+            identity: owner.identity,
+            described_by: 0,
+            interface: (found.interface, interfaces),
+            secondary: true,
+        };
+
+        // SAFETY: контракт функции; управляющая точка — первой записи.
+        let (reader, described_by) = unsafe { self.enable_reports_on(owner.pipe(), owner.place, found) }?;
+        satellite.described_by = described_by;
+        satellite.reader = Some(reader);
+        // SAFETY: страница спутника выделена и обнулена.
+        unsafe { self.open_interrupt(&satellite, found) };
+
+        kprintln!(
+            "  ehci        : {}: interface {} of the same device is a {}, {} byte reports",
+            satellite.place,
+            found.interface,
+            satellite.reader.as_ref().map_or("unknown", Reader::name),
+            satellite.report_len
+        );
+        Ok(satellite)
     }
 
     /// Выбрать конфигурацию хаба, прочитать его дескриптор, включить питание
@@ -1248,13 +1343,38 @@ impl Controller {
     unsafe fn enable_reports(&mut self, device: &mut Device, found: &HidInterface) -> Result<Reader, EhciError> {
         let pipe = device.pipe();
         // SAFETY: контракт функции.
+        let (reader, described_by) = unsafe { self.enable_reports_on(pipe, device.place, found) }?;
+        device.described_by = described_by;
+        Ok(reader)
+    }
+
+    /// То же, но по чужой управляющей точке и без записи в устройство.
+    ///
+    /// Нужно составным устройствам: интерфейсов HID у них несколько, а
+    /// управляющая точка одна. Второй и следующие интерфейсы настраиваются
+    /// через кольцо первого — своего у них нет и быть не может (см.
+    /// [`Device::secondary`]).
+    ///
+    /// Возвращает разборщик и длину дескриптора отчётов, которой он разобран
+    /// (ноль — разобрать не удалось и работает boot-протокол).
+    ///
+    /// # Safety
+    ///
+    /// Устройство адресовано, `pipe` — его управляющая точка.
+    unsafe fn enable_reports_on(
+        &mut self,
+        pipe: Pipe,
+        place: Place,
+        found: &HidInterface,
+    ) -> Result<(Reader, u16), EhciError> {
+        // SAFETY: контракт функции.
         unsafe {
             self.control_transfer(pipe, [0, usb::REQ_SET_CONFIGURATION, found.configuration, 0, 0, 0, 0, 0], 0, false)
         }?;
 
         // SAFETY: устройство сконфигурировано.
-        let described = unsafe { self.read_report_descriptor(pipe, device.place, found) };
-        device.described_by = if described.keyboard.is_some() || described.pointer.is_some() {
+        let described = unsafe { self.read_report_descriptor(pipe, place, found) };
+        let described_by = if described.keyboard.is_some() || described.pointer.is_some() {
             found.report_len
         } else {
             0
@@ -1287,7 +1407,7 @@ impl Controller {
         if idle.is_err() {
             kprintln!("  ehci        : SET_IDLE refused; reports may repeat");
         }
-        Ok(reader)
+        Ok((reader, described_by))
     }
 
     /// Прочитать и разобрать дескриптор отчётов. Неудача — не отказ: у
@@ -1569,7 +1689,9 @@ impl Controller {
     fn relink_async(&self) {
         let head = self.head_pipe();
         let mut next = head.phys | LINK_QH;
-        for device in self.devices.iter().rev() {
+        // Спутники пропускаются: управляющая точка у устройства одна, и кольцо
+        // для неё держит первая запись (см. [`Device::secondary`]).
+        for device in self.devices.iter().rev().filter(|device| !device.secondary) {
             let pipe = device.pipe();
             pipe.write(PAGE_CONTROL_QH + QH_NEXT, next);
             next = pipe.at(PAGE_CONTROL_QH) | LINK_QH;
@@ -1597,10 +1719,18 @@ impl Controller {
     fn take_subtree(&mut self, mut victims: Vec<u8>) -> Vec<Device> {
         let mut taken = Vec::new();
         while let Some(address) = victims.pop() {
-            if let Some(index) = self.devices.iter().position(|d| d.address == address) {
+            // Записей с одним адресом может быть несколько: составное устройство
+            // — это один адрес и по записи на каждый его интерфейс HID. Забрать
+            // одну и оставить остальные значило бы оставить в периодическом
+            // списке кольцо, чья страница вот-вот будет освобождена.
+            let mut removed = false;
+            while let Some(index) = self.devices.iter().position(|d| d.address == address) {
                 let device = self.devices.remove(index);
-                victims.extend(self.devices.iter().filter(|d| d.place.parent == address).map(|d| d.address));
                 taken.push(device);
+                removed = true;
+            }
+            if removed {
+                victims.extend(self.devices.iter().filter(|d| d.place.parent == address).map(|d| d.address));
             }
         }
         taken

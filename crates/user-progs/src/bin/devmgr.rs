@@ -286,6 +286,9 @@ struct Manager {
     /// Что было напечатано в журнал в прошлый раз — чтобы печатать только
     /// перемены, а не одно и то же каждые три секунды.
     last_log: String,
+    /// Сказано ли стенду про выбор строки. Одного раза достаточно: сценарию
+    /// нужна строка, человеку за машиной — пустой терминал.
+    logged_selection: bool,
 }
 
 /// Столбцы по важности: узкое окно теряет сначала место и идентификатор, а не
@@ -299,7 +302,13 @@ fn columns(ctx: Ctx, table: &Table) -> Vec<Rect> {
 
 impl Manager {
     fn new() -> Self {
-        let mut manager = Self { devices: Vec::new(), rows: Vec::new(), selected: 0, last_log: String::new() };
+        let mut manager = Self {
+            devices: Vec::new(),
+            rows: Vec::new(),
+            selected: 0,
+            last_log: String::new(),
+            logged_selection: false,
+        };
         manager.refresh();
         manager
     }
@@ -347,8 +356,15 @@ impl Manager {
         let index = index.min(self.devices.len().saturating_sub(1));
         if index != self.selected {
             self.selected = index;
-            if let Some(device) = self.devices.get(index) {
-                println(&format!("devmgr: selected {} {} '{}'", device.bus.tag(), device.place, device.what));
+            // Печатается **первый** выбор и только он. Стенду нужна одна строка
+            // (сценарий `devices` ждёт её), а человеку строка на каждое нажатие
+            // стрелки заливает терминал: у Романа на ноутбуке экран оказался
+            // забит «devmgr: selected» до того, как он дошёл до нужной строки.
+            if !self.logged_selection {
+                if let Some(device) = self.devices.get(index) {
+                    println(&format!("devmgr: selected {} {} '{}'", device.bus.tag(), device.place, device.what));
+                }
+                self.logged_selection = true;
             }
         }
     }
@@ -491,7 +507,11 @@ impl App for Manager {
                     (State::NotNeeded, _) => String::from("настраивается прошивкой, драйвер не нужен"),
                     _ => String::from("драйвера в системе нет; установка драйверов — функция запланирована"),
                 };
-                format!("{} · {} · {serves}", russian(&device.what), device.place)
+                // Идентификатор — в строке состояния, а не только в колонке:
+                // колонка пропадает на узком окне, а ноутбучная матрица в 1366
+                // точек — это ровно узкое окно. Спрашивать «какая у тебя карта»
+                // человека, у которого система уже это знает, — стыдно.
+                format!("{} · {} · {} · {serves}", russian(&device.what), device.place, device.id)
             }
             None => String::from("Стрелки — выбрать устройство    R — обновить"),
         };

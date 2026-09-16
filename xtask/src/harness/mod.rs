@@ -50,7 +50,7 @@ use anyhow::{Context, Result, bail};
 use crate::arch::Arch;
 use crate::build::{self, BuildOptions};
 use crate::paths;
-use crate::qemu::{self, Drive, Pointer, RunOptions, UsbController};
+use crate::qemu::{self, Drive, Nic, Pointer, RunOptions, UsbController};
 use crate::{image, util};
 
 pub use scenarios::{Scenario, Step, Target};
@@ -746,6 +746,7 @@ fn execute(
         },
         disk_bus: scenario.disk_bus,
         network: scenario.network,
+        nic: if scenario.e1000 { Nic::E1000 } else { Nic::Virtio },
         hostfwd,
         allow_reboot: scenario.reboots,
         ..RunOptions::default()

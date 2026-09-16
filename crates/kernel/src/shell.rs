@@ -609,6 +609,11 @@ fn run_command(line: &str) -> bool {
             );
         }
         "usb" => usb_status(),
+        "pci" => {
+            for line in crate::devices::census_text().lines() {
+                sprintln!("  {line}");
+            }
+        }
         "ui" => ui_status(),
         "tasks" => tasks(),
         "clear" => {
@@ -813,7 +818,7 @@ fn ip(argument: &str) {
         sprintln!("  no network card in this machine");
         return;
     };
-    sprintln!("  link     virtio-net {}", crate::net::eth::Display(status.mac));
+    sprintln!("  link     {} {}", status.name, crate::net::eth::Display(status.mac));
     if status.address.is_unspecified() {
         sprintln!("  address  none yet");
     } else {
@@ -1117,6 +1122,7 @@ fn help() {
     sprintln!("  mem           physical frames, heap and DMA window");
     sprintln!("  input         key event counters");
     sprintln!("  usb           xHCI controller state");
+    sprintln!("  pci           every device on the bus, with its identifiers");
     sprintln!("  ui            compositor state");
     sprintln!("  tasks         scheduler state");
     sprintln!("  ls [path]     list a directory of the mounted filesystem");

@@ -34,6 +34,7 @@
 //! не падает, он просто читает мусор.
 
 use super::{DESC_F_WRITE, FEATURE_VERSION_1, Queue, Transport, VirtioError};
+use crate::net::card::{Card, CardError};
 use crate::mm::dma::{self, DmaBuffer};
 use crate::pci::{self, Device};
 
@@ -50,8 +51,10 @@ const CONFIG_MAC: usize = 0;
 /// Длина заголовка `virtio_net_hdr_v1`.
 const HEADER: usize = 12;
 
-/// Наибольший кадр Ethernet без контрольной суммы: заголовок и 1500 байт данных.
-pub const FRAME_MAX: usize = 1514;
+/// Наибольший кадр и счётчики — общие для всех карт: они часть договора с
+/// сетевым стеком, а не свойство virtio (см. [`crate::net::card`]). Здесь они
+/// остаются под прежними именами, потому что этот файл ими и пользуется.
+pub use crate::net::card::{FRAME_MAX, Stats};
 
 /// Сколько места отводится под один кадр вместе с заголовком virtio.
 ///
@@ -70,20 +73,6 @@ const QUEUE_TX: u16 = 1;
 /// исходящий кадр, а не остановить систему. Протоколы поверх переспросят, а
 /// эмулируемая карта забирает кадр за единицы тысяч оборотов.
 const TX_POLLS: u32 = 100_000;
-
-/// Счётчики, по которым видно, что происходит на проводе.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Stats {
-    pub rx_frames: u64,
-    pub rx_bytes: u64,
-    /// Кадры, которые устройство отдало, а мы не смогли принять: слишком
-    /// длинные или пришедшие с непонятной длиной.
-    pub rx_dropped: u64,
-    pub tx_frames: u64,
-    pub tx_bytes: u64,
-    /// Кадры, которые не удалось отправить: очередь не освободилась.
-    pub tx_dropped: u64,
-}
 
 /// Сетевая карта virtio.
 pub struct VirtioNet {
@@ -322,5 +311,37 @@ impl VirtioNet {
         while let Some((id, _)) = self.tx.take_used() {
             self.tx.free_descriptor(id);
         }
+    }
+}
+
+/// Карта virtio как одна из карт, а не как единственная.
+///
+/// Методы уже есть — этот блок только называет их общими именами. Ошибки при
+/// этом переводятся в три причины договора: повторять кадр осмысленно лишь
+/// тогда, когда очередь занята, и различать ради этого дюжину состояний virtio
+/// стеку незачем.
+impl Card for VirtioNet {
+    fn name(&self) -> &'static str {
+        "virtio-net"
+    }
+
+    fn mac(&self) -> [u8; 6] {
+        VirtioNet::mac(self)
+    }
+
+    fn send(&mut self, frame: &[u8]) -> Result<(), CardError> {
+        VirtioNet::send(self, frame).map_err(|err| match err {
+            VirtioError::TooLong(len) => CardError::TooLong(len),
+            VirtioError::QueueFull => CardError::Busy,
+            _ => CardError::Stopped,
+        })
+    }
+
+    fn receive(&mut self, frame: &mut [u8; FRAME_MAX]) -> Option<usize> {
+        VirtioNet::receive(self, frame)
+    }
+
+    fn stats(&self) -> Stats {
+        VirtioNet::stats(self)
     }
 }
