@@ -354,7 +354,9 @@ impl core::fmt::Display for EhciError {
             Self::Transfer(token) => write!(f, "transfer failed: {}", token_name(*token)),
             Self::ShortDescriptor => f.write_str("the descriptor came back shorter than it claims"),
             Self::HubDescriptor => f.write_str("the hub did not return its descriptor"),
-            Self::NoHid => f.write_str("no HID interface with an interrupt endpoint"),
+            Self::NoHid => f.write_str(
+                "not a keyboard or a pointer: this kernel drives no other USB device yet",
+            ),
             Self::UnknownHid => f.write_str("the HID interface speaks neither boot protocol nor a descriptor we understand"),
             Self::TooMany => f.write_str("more devices than the driver brings up"),
             Self::TooDeep => f.write_str("hubs are nested deeper than the driver goes"),
