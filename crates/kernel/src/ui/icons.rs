@@ -81,6 +81,13 @@ const FILES_LABEL: &str = "Файлы";
 pub enum Kind {
     /// Системный значок: открывает окно ядра.
     App(App),
+    /// Окно ядра со своим значком — когда одно окно открывается с разных
+    /// плиток: «Пакеты» на телефоне открывают «Параметры», но нарисованы
+    /// коробкой, как в макете.
+    Shortcut(App, Icon),
+    /// Значок, за которым программы на этой машине пока нет: нажатие говорит
+    /// об этом словами (`what` — то же имя, что у кнопок дока).
+    Missing(&'static str, Icon),
     /// Значок, запускающий программу третьего кольца.
     ///
     /// Команду держит поле `path` записи — то же, в котором у файла лежит его
@@ -538,7 +545,12 @@ fn art(kind: &Kind) -> (Icon, Tone, bool) {
         Kind::App(app) => (app.icon(), app.tone(), matches!(app, App::Terminal)),
         // Плитка залита, как была у окна ядра: снаружи переезд менеджера в
         // программу не должен быть заметен ничем, включая цвет значка.
-        Kind::Program(icon) => (*icon, Tone::Accent, true),
+        // На телефоне залиты только «Телефон» и «Терминал», как в макете; на
+        // столе «Файлы» остаются залитыми, как были у окна ядра.
+        Kind::Program(icon) => (*icon, Tone::Accent, !theme::is_mobile()),
+        // Телефон в макете залит акцентом: это первое, что на нём ищут.
+        Kind::Shortcut(app, icon) => (*icon, app.tone(), false),
+        Kind::Missing(what, icon) => (*icon, Tone::Accent, *what == "phone"),
         Kind::Folder => (Icon::Folder, Tone::Muted, false),
         Kind::File => (Icon::File, Tone::Muted, false),
     }
@@ -587,6 +599,9 @@ fn wrap(ctx: Ctx, label: &str, room: u32) -> (String, Option<String>) {
 
 /// Системные значки — те, что есть на столе всегда.
 fn system_items() -> Vec<Item> {
+    if theme::is_mobile() {
+        return mobile_items();
+    }
     let mut out = Vec::new();
     out.push(Item {
         kind: Kind::Program(Icon::Folder),
@@ -598,5 +613,31 @@ fn system_items() -> Vec<Item> {
         label: app.caption().to_string(),
         path: None,
     }));
+    out
+}
+
+/// Значки домашнего экрана телефона — восемь из макета (экран 01).
+///
+/// За двумя из них программы пока нет, и они всё равно стоят, как кнопки
+/// телефона и камеры в доке: раскладка — решение, а нажатие честно говорит,
+/// чего нет. «Пакеты» открывают «Параметры», где пакеты и живут; «Диски» —
+/// диспетчер устройств, где видны носители.
+fn mobile_items() -> Vec<Item> {
+    let program = |icon, label: &str, command: &str| Item {
+        kind: Kind::Program(icon),
+        label: label.to_string(),
+        path: Some(command.to_string()),
+    };
+    let app = |app: App, label: &str| Item { kind: Kind::App(app), label: label.to_string(), path: None };
+    let missing = |what, icon, label: &str| Item { kind: Kind::Missing(what, icon), label: label.to_string(), path: None };
+    let mut out = Vec::new();
+    out.push(missing("phone", Icon::Display, "Телефон"));
+    out.push(app(App::Terminal, "Терминал"));
+    out.push(app(App::Settings, "Настройки"));
+    out.push(program(Icon::Folder, FILES_LABEL, FILES_COMMAND));
+    out.push(program(Icon::Disk, "Диски", "/bin/devmgr"));
+    out.push(Item { kind: Kind::Shortcut(App::Settings, Icon::Package), label: "Пакеты".to_string(), path: None });
+    out.push(program(Icon::Chart, "Монитор", "/bin/sysmon"));
+    out.push(missing("log", Icon::Log, "Журнал"));
     out
 }

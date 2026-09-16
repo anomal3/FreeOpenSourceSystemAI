@@ -109,6 +109,9 @@ pub struct Compositor {
     flight: Option<Flight>,
     /// Лист «Свёрнутые программы» — открыт, пока `Some` (см. [`super::tray`]).
     tray: Option<Sheet>,
+    /// Что показано в карточке «Система» — по нему видно, пора ли её
+    /// перерисовать (см. [`Compositor::refresh_panel`]).
+    home: super::home::Facts,
     /// Окно, которое сейчас тащат за заголовок.
     ///
     /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
@@ -206,6 +209,7 @@ impl Compositor {
             keyboard: None,
             flight: None,
             tray: None,
+            home: super::home::Facts::default(),
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
@@ -238,10 +242,8 @@ impl Compositor {
         // Ширина экрана и верх сетки — телефону (см. [`Icons::set_span`]). На
         // столе вызов безвреден: мобильная раскладка спрашивает эти числа, а
         // настольная о них не знает.
-        compositor.icons.set_span(
-            compositor.screen.width(),
-            mini_ui::paint::Ctx::scaled(scale).px(theme::M_STATUS_H + theme::M_INSET),
-        );
+        // На телефоне сетка стоит под карточкой «Система» домашнего экрана.
+        compositor.icons.set_span(compositor.screen.width(), super::home::grid_top(scale));
         compositor.icons.reload();
         Some(compositor)
     }
@@ -858,6 +860,13 @@ impl Compositor {
 
     /// Обновить панель задач.
     pub fn refresh_panel(&mut self, status: &Status) {
+        // Карточка «Система» перерисовывается, только когда её числа сменились:
+        // аптайм меняется раз в секунду, а просят обновиться на каждое касание.
+        if theme::is_mobile() && self.home != status.home {
+            self.home = status.home;
+            let card = super::home::system_card(self.screen.width(), self.scale);
+            self.mark(card);
+        }
         let buttons = self.buttons();
         let menu_open = self.menu_open();
         if let Some(panel) = self.panel.as_mut() {
@@ -974,6 +983,21 @@ impl Compositor {
                 self.refresh_decorations();
             }
         }
+    }
+
+    /// Карточки домашнего экрана телефона — в полосу кадра, под значками.
+    fn draw_home(&self, back: &mut Surface, band: Rect, dy: i32) {
+        let width = self.screen.width();
+        super::home::draw_system(back, band, dy, width, self.scale, &self.home);
+        let minimized: Vec<(App, alloc::string::String, u64)> = self
+            .windows
+            .iter()
+            .filter(|window| window.minimized)
+            .map(|window| (window.app, alloc::string::String::from(window.caption()), window.minimized_at_ms))
+            .collect();
+        let rows = super::home::recent_rows(&minimized);
+        let card = super::home::recent_card(width, self.scale, self.icons.bounds().bottom());
+        super::home::draw_recent(back, band, dy, card, self.scale, &rows, rows.len());
     }
 
     /// Открыт ли лист «Свёрнутые программы».
@@ -1093,7 +1117,11 @@ impl Compositor {
         }
         let rect = keyboard.rect;
         self.keyboard.as_mut()?.set_visible(want);
-        self.mark_layer(rect);
+        // Вместе с промежутком над клавиатурой: он не принадлежит ни окну, ни
+        // клавиатуре, и без этого на ушедшей клавиатуре оставалась полоса
+        // прежнего кадра — нижний край карточки «Последнее» срезало ровно по ней.
+        let gap = mini_ui::paint::Ctx::scaled(self.scale).px(keyboard::GAP);
+        self.mark_layer(Rect::new(rect.x, rect.y - gap as i32, rect.w, rect.h + gap));
         if let Some(panel) = self.panel.as_ref() {
             let dock = panel.rect;
             self.mark(Rect::new(0, dock.y, self.screen.width(), self.screen.height().saturating_sub(dock.y.max(0) as u32)));
@@ -1562,10 +1590,13 @@ impl Compositor {
             return;
         }
         self.apply_pending_size();
-        self.advance_flight();
+        // Клавиатура — до полёта: иначе на медленной машине полёт успевал
+        // кончиться в том же кадре, и порядок строк журнала «клавиатура ушла» и
+        // «окно долетело» зависел от скорости кадра.
         if let Some(shown) = self.sync_keyboard() {
             crate::kprintln!("  keyboard    : {}", if shown { "shown" } else { "hidden" });
         }
+        self.advance_flight();
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
             return;
@@ -1697,6 +1728,9 @@ impl Compositor {
         // [`super::statusbar`]).
         if !covered {
             super::statusbar::draw(back, band, dy, self.screen.width(), self.scale);
+            if theme::is_mobile() {
+                self.draw_home(back, band, dy);
+            }
             self.icons.draw(back, band, dy);
         }
         let t_icons = crate::time::uptime_ns();

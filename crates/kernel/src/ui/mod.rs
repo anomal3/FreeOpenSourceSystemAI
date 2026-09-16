@@ -51,6 +51,7 @@ pub mod pointer;
 pub mod prefs;
 pub mod settings;
 pub mod flight;
+pub mod home;
 pub mod keyboard;
 pub mod shade;
 pub mod tray;
@@ -540,10 +541,23 @@ fn status_now() -> Status {
     let total_mib = (frames.total_bytes() / (1024 * 1024)) as u64;
     LAST_FREE_MIB.store(free_mib, Ordering::Relaxed);
     LAST_TOTAL_MIB.store(total_mib, Ordering::Relaxed);
+    let uptime_ms = crate::time::uptime_ms();
     Status {
         clock: crate::time::clock_text(),
-        uptime_ms: crate::time::uptime_ms(),
+        uptime_ms,
         net: net_state(),
+        home: home::Facts {
+            used_mib: total_mib.saturating_sub(free_mib),
+            total_mib,
+            // Планировщик и разметка слотов — под своими замками, и спросить их
+            // можно только здесь, до замка стола.
+            tasks: crate::sched::alive(),
+            slot: crate::slot::booted().map(|slot| match slot {
+                slots::Slot::A => 'A',
+                slots::Slot::B => 'B',
+            }),
+            uptime_s: uptime_ms / 1000,
+        },
     }
 }
 
@@ -2029,7 +2043,10 @@ fn launch(desktop: &mut Compositor, app: App) {
 /// них поправят.
 fn open_icon(desktop: &mut Compositor, index: usize) {
     match desktop.icon_kind(index) {
-        Some(icons::Kind::App(app)) => launch(desktop, app),
+        Some(icons::Kind::App(app) | icons::Kind::Shortcut(app, _)) => launch(desktop, app),
+        Some(icons::Kind::Missing(what, _)) => {
+            kprintln!("  desktop     : {what} -- no program for it on this machine yet");
+        }
         // Значок-запуск: команда лежит в пути записи. Так на столе живёт
         // файловый менеджер с фазы 47c — он программа, и открывать его окном
         // ядра больше нечем.

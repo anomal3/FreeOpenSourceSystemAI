@@ -71,6 +71,13 @@ pub fn remember(found: &[block::Partition], booted: Option<Slot>) {
     *LAYOUT.lock() = Some(Layout { esp, roots, booted });
 }
 
+/// С какого слота загрузились — из разметки, найденной при загрузке, без
+/// чтения носителя. `None` — система без слотов (живой образ).
+#[must_use]
+pub fn booted() -> Option<Slot> {
+    LAYOUT.lock().as_ref().and_then(|layout| layout.booted)
+}
+
 /// Прочитать запись о слотах с ESP.
 ///
 /// `None` означает, что читать неоткуда или не из чего: ESP не найден, запись
