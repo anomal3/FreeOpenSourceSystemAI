@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::string::String;
 use std::vec::Vec;
 
-use crate::{FileKind, Host, IoError, WindowEvent, WindowRect};
+use crate::{FileKind, Host, IoError, WindowEvent, WindowPixels, WindowRect};
 
 pub struct Sandbox {
     root: PathBuf,
@@ -169,6 +169,13 @@ impl Host for Sandbox {
                 frame.pixels[row + x as usize] = argb;
             }
         }
+    }
+
+    // Фаза N9: `Graphics` окна рисует растеризатором и в песочнице — иначе
+    // путь рисования в окно проверялся бы только на FreeOS.
+    fn window_pixels(&mut self, window: u32) -> Option<WindowPixels<'_>> {
+        let Some(Some(frame)) = self.windows.get_mut(window as usize) else { return None };
+        Some(WindowPixels { pixels: &mut frame.pixels, width: frame.width, height: frame.height, red_low: false })
     }
 
     fn window_event(&mut self, window: u32) -> Option<WindowEvent> {

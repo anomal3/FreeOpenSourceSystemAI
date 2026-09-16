@@ -23,7 +23,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use clr_vm::{FileKind, Host, IoError, Vm, WindowEvent, WindowRect};
+use clr_vm::{FileKind, Host, IoError, Vm, WindowEvent, WindowPixels, WindowRect};
 use mini_ui::typeface::{self, Face, Role};
 use mini_ui::{Color, Rect, Surface};
 use user_abi::{CLOCK_MONOTONIC, CLOCK_REALTIME};
@@ -372,6 +372,20 @@ impl Host for Console {
             window.close();
             error(&format!("dotnet: window '{title}' closed after {frames} frame(s)\n"));
         }
+    }
+
+    // Точки окна для `System.Drawing` (фаза N9). Порядок байтов — тот, что
+    // ядро назвало при первом окне (`graphics`); у окна без известного формата
+    // точек не даём вовсе: растеризатор перепутал бы красный с синим.
+    fn window_pixels(&mut self, window: u32) -> Option<WindowPixels<'_>> {
+        let red_low = match mini_ui::format_code() {
+            mini_ui::PIXEL_RGB => true,
+            mini_ui::PIXEL_BGR => false,
+            _ => return None,
+        };
+        let target = self.window_mut(window)?;
+        let (width, height) = (target.width, target.height);
+        Some(WindowPixels { pixels: target.window.pixels(), width, height, red_low })
     }
 
     fn window_resize(&mut self, window: u32, width: u32, height: u32) -> bool {

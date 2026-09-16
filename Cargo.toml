@@ -18,6 +18,7 @@ members = [
     "crates/kernel",
     "crates/mini-ui",
     "crates/osupdate",
+    "crates/raster",
     "crates/slots",
     "crates/ssh",
     "crates/swipe",
@@ -70,6 +71,12 @@ opt-level = 2
 opt-level = 2
 
 [profile.dev.package.clr-meta]
+opt-level = 2
+
+# Растеризатор `System.Drawing` (фаза N9) — по той же причине, что и среда:
+# он перебирает каждую точку фигуры, и без оптимизации заливка окна формы
+# 800×450 со сглаживанием стоила бы в эмуляторе секунды на кадр.
+[profile.dev.package.raster]
 opt-level = 2
 
 [profile.release]

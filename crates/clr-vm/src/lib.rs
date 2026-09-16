@@ -38,6 +38,10 @@
 //! Фаза N7g — `decimal`: 96-битная мантисса с масштабом и округлением к чётному
 //! ([`decimal`]), печать — тем же форматером, что у остальных чисел.
 //!
+//! Фаза N9 — `System.Drawing` как в GDI+: пути, перья, кисти, сглаживание,
+//! `Bitmap`, преобразования и отсечение. Рисует крейт `raster` ([`gdi`]) прямо
+//! в точки окна ([`Host::window_pixels`]) или в массив картинки.
+//!
 //! Чего нет — потоков. Встреча с неподдержанным — не падение и не
 //! молчание, а [`VmError`] с полным именем члена или кодом инструкции и местом.
 //!
@@ -76,6 +80,7 @@ mod dispatch;
 mod eh;
 mod enums;
 mod gc;
+mod gdi;
 mod heap;
 mod loader;
 mod natives;
@@ -233,12 +238,29 @@ pub trait Host {
         let _ = window;
     }
 
+    /// Точки окна на запись (фаза N9): `System.Drawing` рисует в них сам.
+    /// `None` — окна нет или хост не даёт его точек; рисование тогда молча
+    /// ничего не делает, как в закрытое окно.
+    fn window_pixels(&mut self, window: u32) -> Option<WindowPixels<'_>> {
+        let _ = window;
+        None
+    }
+
     /// Сменить размер содержимого окна (фаза N7d): форма выросла из кода.
     /// `false` — окно осталось прежним.
     fn window_resize(&mut self, window: u32, width: u32, height: u32) -> bool {
         let _ = (window, width, height);
         false
     }
+}
+
+/// Точки окна: строками сверху вниз, `width × height`.
+pub struct WindowPixels<'a> {
+    pub pixels: &'a mut [u32],
+    pub width: u32,
+    pub height: u32,
+    /// Красный в младшем байте слова (`mini_ui::PIXEL_RGB`); иначе в третьем.
+    pub red_low: bool,
 }
 
 /// Прямоугольник в точках окна.

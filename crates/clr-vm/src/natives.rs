@@ -133,6 +133,8 @@ pub(crate) enum Native {
     DecimalParse,
     DecimalToDouble,
     DecimalFromFloat,
+    /// `System.Drawing.GdiNative` (фаза N9), см. `gdi.rs`.
+    Gdi(crate::gdi::Gdi),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -336,7 +338,11 @@ const TABLE: &[(&str, Native)] = &[
 ];
 
 pub(crate) fn lookup(key: &str) -> Option<Native> {
-    TABLE.iter().find(|(name, _)| *name == key).map(|(_, native)| *native)
+    TABLE
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, native)| *native)
+        .or_else(|| crate::gdi::TABLE.iter().find(|(name, _)| *name == key).map(|(_, gdi)| Native::Gdi(*gdi)))
 }
 
 /// Выполнить член. `Some` — значение, которое он вернул.
@@ -345,7 +351,11 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
     // `this` метода примитива приходит указателем на число или упакованным
     // объектом; `deref` достаёт число в обоих случаях.
     let number = |vm: &Vm<'_, H>| -> Result<Value, VmError> { vm.deref(arg(0)?) };
+    if let Native::Gdi(gdi) = native {
+        return crate::gdi::call(vm, gdi, args);
+    }
     Ok(match native {
+        Native::Gdi(_) => None,
         Native::Write | Native::WriteLine => {
             let text = vm.string_units(arg(0)?)?.unwrap_or_default();
             vm.print_units(&text, native == Native::WriteLine);

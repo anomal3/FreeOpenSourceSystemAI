@@ -1,0 +1,15 @@
+[package]
+name = "raster"
+description = "Scan conversion for System.Drawing on FreeOS: GDI+ paths, pens, brushes, antialiasing, images and clip regions over a pixel buffer (milestone v0.7c, phase N9)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Корень, синус и округление без `std`: в `core` у f64 их нет.
+libm = "0.2"
+
+[lints]
+workspace = true

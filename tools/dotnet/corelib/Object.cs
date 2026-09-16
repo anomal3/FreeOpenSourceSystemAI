@@ -400,6 +400,17 @@ namespace System
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern void Clear(Array array, int index, int length);
 
+        // Копирование поэлементно (фаза N9): `Array.Copy(Array, Array, int)`
+        // без обобщения потребовал бы члена среды с разбором типов элементов,
+        // а базовой библиотеке хватает типизированного.
+        internal static void CopyItems<T>(T[] source, T[] destination, int length)
+        {
+            for (int i = 0; i < length; i++)
+            {
+                destination[i] = source[i];
+            }
+        }
+
         public static void Resize<T>(ref T[] array, int newSize)
         {
             T[] resized = new T[newSize];
@@ -449,6 +460,11 @@ namespace System
     public interface IDisposable
     {
         void Dispose();
+    }
+
+    public interface ICloneable
+    {
+        object Clone();
     }
 
     public abstract class Attribute

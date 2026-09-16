@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE), ("drawing", DRAWING)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -957,4 +957,87 @@ printed so far:
 {output}"));
     assert_eq!(output, PQUEUE_OUTPUT);
     assert_eq!(code, 20);
+}
+
+/// Образец `tools/dotnet/samples/drawing` (фаза N9): System.Drawing на Bitmap с
+/// чтением точек, пути, преобразования, отсечение и форма с двойной буферизацией.
+const DRAWING: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/drawing.dll");
+
+/// Что печатает `dotnet drawing.dll self-test` (записано 2026-09-16, .NET 10,
+/// GDI+ на Windows, LF): точки заливок, перьев, смешивания, градиента, текстуры и
+/// картинок совпадают до значения канала; у кругов проверяется только внутри и
+/// снаружи.
+const DRAWING_OUTPUT: &str = concat!(
+    "drawing: start\n",
+    "bitmap: 64x48 Format32bppArgb 0,0,0,0 {Width=64, Height=48} 96\n",
+    "pixel: 10,20,30,40 a141e28 False True\n",
+    "pixel: out of range\n",
+    "opaque: 255,0,0,0 255,20,30,40\n",
+    "fill: 255 255 0 0 0 | 0 0 255 255 | 255 0 | 255 255\n",
+    "smoothing: AntiAlias Default SourceOver Bilinear\n",
+    "antialias: 255 255 127 0 0 | 0 0 127 255\n",
+    "half: 255 255 0 0 0 | 0 0 255 255\n",
+    "triangle: ##.#.#.#.\n",
+    "ellipse: ###...##\n",
+    "smooth ellipse: True 0 255\n",
+    "pie: #...#.#\n",
+    "rectangle: 255 255 0 0 0 0 0 0 0 0 0 0 0 255 255 | 255 255 0 255 255 255 255 255 255 255 255 255 0 255 255 | 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255\n",
+    "line: 255 255 0 0 0 | 0 0 0 255 255 | 2-4 5-8 9-12 13-16 17-20 21-24 25-28 29-30\n",
+    "wide 5: ..#####.. 255 255 0 0\n",
+    "wide 4: ..####... 255 255 0 0\n",
+    "smooth wide: 255 255 127 0 255 0 0 255\n",
+    "dash pattern: 3,1 Dash Miter Flat 10 Center SolidColor\n",
+    "dashes: ######..######..\n",
+    "joins: #.###..#.\n",
+    "blend: 128,0,0,255 178,143,0,111 255,127,127,255 255,55,133,33\n",
+    "copy: 0,0,0,0 0\n",
+    "gradient brush: Tile {X=0,Y=-20,Width=40,Height=40} 255,0,0,0 {X=0,Y=20,Width=10,Height=20}\n",
+    "gradient: 0 64 128 191 249 | True True\n",
+    "texture: 255,255,0,0 255,0,255,0 255,0,0,255 255,0,0,0\n",
+    "image: 255 255 0 0 0 0 0 0 0 0 0 0 255 255 255,0,0,255 255,255,0,0\n",
+    "scaled: 0 0 127 255 255 255,0,0,255 255,191,0,64 255,255,0,0\n",
+    "nearest: 0 0 255 255 255 255,0,0,255 255,255,0,0 255,255,0,0\n",
+    "part: 255,255,0,0 255,255,255,255 255,0,0,255 255,255,0,0\n",
+    "clone: 255,0,0,255 0,0,0,0 3 255,0,0,255\n",
+    "matrix: 2,0,0,3,10,20 {X=12, Y=23} False True 10\n",
+    "rotate: 1.732,1.5,-1,2.598,10,20\n",
+    "invert: 0.433,-0.25,0.167,0.289,-7.663,-3.274\n",
+    "rotate at: 0,1,-1,0,10,0\n",
+    "shear: 2.5,3,2,2,15,26\n",
+    "vectors: {X=2, Y=0} False\n",
+    "translate: 1,0,0,1,20,10 | 2,0,0,2,20,10 | 1,0,0,1,20,10 255 255 0 0 0 0 0 255 255\n",
+    "rotate transform: 0,1,-1,0,30,0 ##..#..\n",
+    "scaled pen: .####..\n",
+    "path: 17 0,1,1,129,0,3,3,3,3,3,3,3,3,3,3,3,131 Alternate {X=0,Y=0,Width=30,Height=30} False True {X=25, Y=15} {X=15, Y=25}\n",
+    "fill mode: #. ## True\n",
+    "arcs: 4 0,3,3,3,1,3,3,3,3,3,3,3,3,3 | 5 0,1,3,3,131\n",
+    "lines: 14 0,1,1,1,129,0,3,3,3,0,1,0,1,129 {X=0, Y=5}\n",
+    "curve: 7 2,2 8,12 16,12\n",
+    "path transform: {X=5,Y=5,Width=30,Height=30} {X=0,Y=0,Width=30,Height=30}\n",
+    "star: ##.##.\n",
+    "clip: {X=0,Y=0,Width=10,Height=10} True False False {X=0,Y=0,Width=10,Height=10} {X=0,Y=0,Width=10,Height=10} #.\n",
+    "reset: {X=-4194304,Y=-4194304,Width=8388608,Height=8388608} False True {X=0,Y=0,Width=40,Height=40}\n",
+    "intersect: {X=12,Y=12,Width=3,Height=3}\n",
+    "exclude: {X=0,Y=0,Width=40,Height=40} 255,255,0,0 255,255,255,255\n",
+    "clip path: #..# 255,0,0,255 255,0,0,0\n",
+    "region: True False True False\n",
+    "xor: False True True False True\n",
+    "infinite: True False True False True True\n",
+    "bounds: {X=0,Y=0,Width=15,Height=15} {X=0,Y=0,Width=15,Height=15}\n",
+    "fill region: #.#.#\n",
+    "buffer: True True 255,240,244,248 255,255,140,0\n",
+    "shown: 360x240\n",
+    "paint: {X=0,Y=0,Width=360,Height=240} True True\n",
+    "closed: UserClosing\n",
+    "drawing: done\n",
+);
+
+#[test]
+fn drawing_prints_what_gdiplus_prints() {
+    let (result, output) = run_with(DRAWING, "drawing.dll", &["self-test"]);
+    let code = result.unwrap_or_else(|error| panic!("{error}
+printed so far:
+{output}"));
+    assert_eq!(output, DRAWING_OUTPUT);
+    assert_eq!(code, 9);
 }

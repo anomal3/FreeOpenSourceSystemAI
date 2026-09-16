@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N9: System.Drawing как в GDI+ — Bitmap с чтением точек,
+       перья, кисти, сглаживание, пути, преобразования, отсечение и текст.
+       Проверки идут на Bitmap: точку, нарисованную в память, можно прочитать,
+       и каждая строка вывода сравнивается с тем, что печатает GDI+ на Windows.
+       Строки выбраны так, чтобы не зависеть от мелочей сглаживания и шрифта:
+       точки внутри и снаружи фигур, а у краёв — «частично закрашена» вместо
+       точного значения. clr-check запускает образец с аргументом self-test:
+       форма рисует те же фигуры и закрывается сама. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
