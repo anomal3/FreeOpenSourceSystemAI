@@ -1530,7 +1530,7 @@ impl SettingsView {
                 "СЕТЕВАЯ КАРТА",
                 &[
                     (String::from("Найдено"), String::from("ничего")),
-                    (String::from("Драйверы"), String::from("virtio-net, e1000")),
+                    (String::from("Драйверы"), String::from("virtio-net, e1000, atl1c")),
                 ],
             );
             pass.note(

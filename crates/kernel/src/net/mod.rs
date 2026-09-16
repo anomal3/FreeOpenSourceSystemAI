@@ -28,6 +28,7 @@
 //! свободного дескриптора в передающей очереди.
 
 pub mod arp;
+pub mod atl1c;
 pub mod card;
 pub mod dns;
 pub mod e1000;
@@ -238,26 +239,49 @@ pub unsafe fn init(rsdp: u64) {
                 }
                 alloc::boxed::Box::new(card)
             }
-            Err(e1000::E1000Error::NoCard) => {
-                // Ни одной карты, которую мы умеем. Машина без сети — это
-                // законное состояние, а вот машина с картой, к которой нет
-                // драйвера, — повод назвать её идентификаторы вслух: по ним
-                // пишется драйвер, а по словам «сеть не работает» — ничего.
-                //
-                // SAFETY: см. выше.
-                let others = unsafe { e1000::undriven(&root) };
-                if others.is_empty() {
-                    crate::kprintln!("  network     : no network card attached to this machine");
-                } else {
-                    for (at, vendor, model) in others {
+            // Карты Intel нет — спрашиваем Atheros. Порядок между ними
+            // безразличен: обе опознаются обходом шины, и в одной машине их не
+            // бывает двух.
+            //
+            // SAFETY: см. выше.
+            Err(e1000::E1000Error::NoCard) => match unsafe { atl1c::Atl1c::probe(&root) } {
+                Ok(card) => {
+                    crate::devices::claim(card.address(), "atl1c");
+                    if !card.link_up() {
                         crate::kprintln!(
-                            "  network     : {at} {vendor:04x}:{model:04x} is a network card, and this kernel has no driver for it"
+                            "  network     : atl1c 1969:{:04x}: no link on the wire yet",
+                            card.device_id()
                         );
                     }
-                    crate::kprintln!("  network     : drivers in this kernel: virtio-net, e1000");
+                    alloc::boxed::Box::new(card)
                 }
-                return;
-            }
+                Err(atl1c::Atl1cError::NoCard) => {
+                    // Ни одной карты, которую мы умеем. Машина без сети — это
+                    // законное состояние, а вот машина с картой, к которой нет
+                    // драйвера, — повод назвать её идентификаторы вслух: по ним
+                    // пишется драйвер, а по словам «сеть не работает» — ничего.
+                    //
+                    // SAFETY: см. выше.
+                    let others = unsafe { e1000::undriven(&root) };
+                    if others.is_empty() {
+                        crate::kprintln!("  network     : no network card attached to this machine");
+                    } else {
+                        for (at, vendor, model) in others {
+                            crate::kprintln!(
+                                "  network     : {at} {vendor:04x}:{model:04x} is a network card, and this kernel has no driver for it"
+                            );
+                        }
+                        crate::kprintln!(
+                            "  network     : drivers in this kernel: virtio-net, e1000, atl1c"
+                        );
+                    }
+                    return;
+                }
+                Err(err) => {
+                    crate::kprintln!("  network     : the card did not come up: {err}");
+                    return;
+                }
+            },
             Err(err) => {
                 crate::kprintln!("  network     : the card did not come up: {err}");
                 return;

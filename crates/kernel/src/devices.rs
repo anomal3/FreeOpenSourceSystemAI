@@ -130,6 +130,7 @@ fn driver_for(device: &pci::Device) -> (&'static str, &'static str) {
             Some("virtio-net")
         }
         (vendor, model, ..) if crate::net::e1000::supports(vendor, model) => Some("e1000"),
+        (vendor, model, ..) if crate::net::atl1c::supports(vendor, model) => Some("atl1c"),
         (0x1234, 0x1111, ..) => Some("bochs vbe"),
         (_, _, 0x01, 0x06, 0x01) => Some("ahci"),
         (_, _, 0x01, 0x08, 0x02) => Some("nvme"),
