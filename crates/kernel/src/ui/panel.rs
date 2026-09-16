@@ -66,6 +66,10 @@ fn desk_ctx(scale: u32) -> Ctx {
     Ctx::scaled(scale).on(glass_bg())
 }
 
+/// Надпись в поле дока. Она же говорит, что поле делает: открывает список
+/// приложений и ищет по нему.
+const SEARCH_HINT: &str = "Пуск или поиск";
+
 /// Заливка плавающего слоя, сведённая к непрозрачному цвету.
 ///
 /// Обои берутся усреднёнными, а не в точке под плашкой: под ней их не один
@@ -117,12 +121,29 @@ impl Metrics {
             // экрана, а экран там сам скруглён по радиусу вчетверо большему.
             // Прямой угол рядом со скруглённым краем читается как обрезанный.
             round: ctx.px(if theme::is_mobile() { theme::M_R_DOCK } else { theme::R_WINDOW }),
-            round_row: ctx.px(theme::R_ROW),
-            btn_h: ctx.px(theme::PANEL_BTN_H),
+            // Скругление кнопки внутри дока — тоже крупнее: кнопка 48 точек со
+            // скруглением 10 выглядит квадратом с обточенными углами, а в
+            // макете это почти круг.
+            round_row: ctx.px(if theme::is_mobile() { theme::M_R_TILE } else { theme::R_ROW }),
+            btn_h: ctx.px(if theme::is_mobile() {
+                theme::M_DOCK_BTN
+            } else {
+                theme::PANEL_BTN_H
+            }),
             side: ctx.px(15),
             gap: ctx.px(8),
-            row_h: ctx.px(theme::MENU_ROW_H),
-            pitch: ctx.px(theme::MENU_ROW_H) + ctx.px(2),
+            // Строка «Пуска» на телефоне выше: в неё попадают пальцем, и
+            // тридцать шесть точек — это половина подушечки.
+            row_h: ctx.px(if theme::is_mobile() {
+                theme::M_MENU_ROW_H
+            } else {
+                theme::MENU_ROW_H
+            }),
+            pitch: ctx.px(if theme::is_mobile() {
+                theme::M_MENU_ROW_H
+            } else {
+                theme::MENU_ROW_H
+            }) + ctx.px(if theme::is_mobile() { 6 } else { 2 }),
             tile: ctx.px(20),
             row_pad: ctx.px(8),
             pad: ctx.px(10),
@@ -323,6 +344,12 @@ pub struct Panel {
     buttons: Buttons,
     /// Значки трея там же и по той же причине.
     tray: Tray,
+    /// Раскладка дока — только на телефоне (см. [`dock_layout`]).
+    ///
+    /// Запоминается при рисовании, как и кнопки окон: две независимые
+    /// раскладки расходятся молча, и расхождение выглядит как «кнопка не
+    /// нажимается», хотя нажимается соседняя.
+    dock: Option<DockLayout>,
 }
 
 impl Panel {
@@ -371,7 +398,109 @@ impl Panel {
             brand: Rect::EMPTY,
             buttons: Buttons::new(),
             tray: Tray::new(),
+            dock: None,
         })
+    }
+
+    /// Нарисовать док телефона: телефон, поиск, камера.
+    ///
+    /// Кнопок открытых окон здесь нет намеренно. На телефоне окно одно и во
+    /// весь экран — переключать нечего, а список окон занял бы место того, чем
+    /// пользуются каждый день.
+    ///
+    /// За телефоном и камерой программ пока нет, и кнопки всё равно стоят:
+    /// место под них в доке — это решение о раскладке, а не обещание. Нажатие
+    /// доходит до стола и называет вслух, чего именно нет.
+    fn redraw_dock(&mut self, m: Metrics, plate: Rect, menu_open: bool) {
+        let ctx = m.ctx;
+        let p = ctx.palette;
+        let layout = dock_layout(m, plate);
+        let glyph = ctx.px(20);
+
+        // Боковые кнопки: подложка кнопки, значок по центру. Того, за чем нет
+        // программы, это не отличает — отличать нечем, и притворяться, что
+        // кнопка «выключена», было бы неправдой: нажать её можно.
+        for (rect, icon) in [(layout.left, Icon::Devices), (layout.right, Icon::Display)] {
+            draw::rounded(&mut self.surface, rect, m.round_row, p.btn.color, p.btn.alpha);
+            draw::rounded_stroke(
+                &mut self.surface,
+                rect,
+                m.round_row,
+                p.btnline.color,
+                p.btnline.alpha,
+            );
+            glyphicon::draw(
+                &mut self.surface,
+                icon,
+                rect.x + (rect.w as i32 - glyph as i32) / 2,
+                rect.y + (rect.h as i32 - glyph as i32) / 2,
+                glyph,
+                p.ink2,
+                255,
+            );
+        }
+
+        // Поле поиска — оно же кнопка меню. Открытое меню вдавливает плитку
+        // тем же переворотом градиента, что и настольная кнопка «Пуск»: одно
+        // правило на обе формы, чтобы «меню открыто» выглядело одинаково.
+        draw::rounded(
+            &mut self.surface,
+            layout.search,
+            m.round_row,
+            p.btn.color,
+            p.btn.alpha,
+        );
+        draw::rounded_stroke(
+            &mut self.surface,
+            layout.search,
+            m.round_row,
+            p.btnline.color,
+            p.btnline.alpha,
+        );
+        let (top, bottom) = if menu_open { (p.acc2, p.acc) } else { (p.acc, p.acc2) };
+        draw::rounded_gradient(
+            &mut self.surface,
+            layout.chip,
+            ctx.px(theme::M_R_CHIP),
+            top,
+            bottom,
+            255,
+        );
+        glyphicon::draw(
+            &mut self.surface,
+            Icon::Grid,
+            layout.chip.x + (layout.chip.w as i32 - glyph as i32) / 2,
+            layout.chip.y + (layout.chip.h as i32 - glyph as i32) / 2,
+            glyph,
+            WHITE,
+            255,
+        );
+        let text_x = layout.chip.right() + m.gap as i32;
+        paint::text_clipped(
+            ctx,
+            &mut self.surface,
+            Role::Body,
+            text_x,
+            paint::baseline(ctx, Role::Body, layout.search),
+            layout.search.right().saturating_sub(text_x).max(0) as u32,
+            SEARCH_HINT,
+            p.ink3,
+        );
+
+        // Полоска жеста. Она лежит ниже плашки — там, где у этого экрана и так
+        // ничего не помещается, — и служит меткой низа, а не кнопкой.
+        draw::rounded(
+            &mut self.surface,
+            layout.home,
+            layout.home.h / 2,
+            p.ink6,
+            160,
+        );
+
+        self.dock = Some(layout);
+        self.brand = layout.search;
+        self.buttons = Buttons::new();
+        self.tray = Tray::new();
     }
 
     /// Во что попадает точка панели (координаты экрана).
@@ -383,6 +512,23 @@ impl Panel {
         let (x, y) = (x - self.rect.x, y - self.rect.y);
         if !self.surface.bounds().contains(x, y) {
             return None;
+        }
+        // Док разбирается первым и отдельно: у него своя раскладка, и кнопок
+        // окон в нём нет вовсе.
+        if let Some(dock) = self.dock {
+            // По высоте — на всю плашку, как и у настольных кнопок: промах на
+            // пару точек читается как «не нажалось», а пустое поле вокруг
+            // кнопки больше ничем не занято.
+            if x >= dock.left.x && x < dock.left.right() {
+                return Some(PanelHit::Missing("phone"));
+            }
+            if x >= dock.search.x && x < dock.search.right() {
+                return Some(PanelHit::Menu);
+            }
+            if x >= dock.right.x && x < dock.right.right() {
+                return Some(PanelHit::Missing("camera"));
+            }
+            return Some(PanelHit::Empty);
         }
         if self.brand.contains(x, y) {
             return Some(PanelHit::Menu);
@@ -422,6 +568,15 @@ impl Panel {
         self.surface.fill(plate, ctx.under);
         draw::rounded_stroke(&mut self.surface, plate, m.round, p.line3.color, p.line3.alpha);
         draw::crown(&mut self.surface, plate, m.round, p.crown.color, p.crown.alpha);
+
+        // Телефон: док вместо панели задач. Кнопок окон здесь нет и быть не
+        // может — окно на телефоне одно и во весь экран, переключать нечего.
+        // Вместо них то, чем пользуются: приложения, поиск, телефон и камера.
+        if theme::is_mobile() {
+            self.redraw_dock(m, plate, menu_open);
+            self.damage = plate;
+            return;
+        }
 
         // Правый край считается раньше кнопок: место под трей занято всегда, а
         // кнопкам достаётся то, что осталось. Наоборот было бы хуже — десяток
@@ -611,6 +766,57 @@ struct PanelLayout {
     /// Разделитель между кнопкой меню и кнопками окон.
     divider: Rect,
     buttons: Buttons,
+}
+
+/// Раскладка дока на телефоне: две кнопки по краям и поиск посередине.
+///
+/// Считается отдельной функцией, а не внутри рисования, по той же причине, что
+/// и настольная: раскладку спрашивают двое — тот, кто рисует, и тот, кто
+/// разбирает нажатие, — и посчитанная дважды она однажды разойдётся.
+#[derive(Clone, Copy)]
+struct DockLayout {
+    /// Кнопка слева: телефон.
+    left: Rect,
+    /// Поле «Пуск или поиск» — оно же кнопка меню.
+    search: Rect,
+    /// Плитка со значком внутри поля поиска.
+    chip: Rect,
+    /// Кнопка справа: камера.
+    right: Rect,
+    /// Полоска жеста под доком.
+    home: Rect,
+}
+
+fn dock_layout(m: Metrics, plate: Rect) -> DockLayout {
+    let side = m.btn_h;
+    let pad = (plate.h.saturating_sub(side)) / 2;
+    let y = plate.y + pad as i32;
+    let gap = m.ctx.px(10);
+
+    let left = Rect::new(plate.x + pad as i32, y, side, side);
+    let right = Rect::new(plate.right() - (pad + side) as i32, y, side, side);
+    let search_x = left.right() + gap as i32;
+    let search_w = (right.x - gap as i32 - search_x).max(side as i32) as u32;
+    let search = Rect::new(search_x, y, search_w, side);
+
+    // Плитка внутри поля — на четыре точки меньше него со всех сторон: в
+    // макете она вложена с полем, а не вписана в край.
+    let inner = m.ctx.px(4);
+    let chip_side = side.saturating_sub(inner * 2);
+    let chip = Rect::new(search.x + inner as i32, search.y + inner as i32, chip_side, chip_side);
+
+    // Полоска жеста лежит **под** доком, у самого низа экрана: это метка
+    // системы, а не элемент дока, и внутри плашки она читалась бы кнопкой.
+    let home_w = m.ctx.px(theme::M_HOME_W);
+    let home_h = m.ctx.px(theme::M_HOME_H);
+    let home = Rect::new(
+        plate.x + (plate.w as i32 - home_w as i32) / 2,
+        plate.bottom() + ((pad as i32 - home_h as i32) / 2).max(0),
+        home_w,
+        home_h,
+    );
+
+    DockLayout { left, search, chip, right, home }
 }
 
 fn panel_layout(m: Metrics, plate: Rect, windows: &[Entry], status_w: u32) -> PanelLayout {
@@ -851,7 +1057,7 @@ pub struct Menu {
 
 impl Menu {
     #[must_use]
-    pub fn new(panel_top: i32, scale: u32) -> Option<Self> {
+    pub fn new(panel_top: i32, scale: u32, screen_w: u32) -> Option<Self> {
         let scale = scale.max(1);
         let ctx = desk_ctx(scale);
         let m = Metrics::new(ctx);
@@ -891,12 +1097,27 @@ impl Menu {
         let body_h = rows_h.saturating_sub(m.pitch - m.row_h);
         let card_h = (m.head_height() + body_h + m.pad).min(panel_top as u32);
 
+        // На телефоне «Пуск» занимает экран целиком — от строки состояния до
+        // дока. Карточка по содержимому здесь не годится: строк десяток, они
+        // крупные, и посчитанная по ним карточка либо не влезет, либо встанет
+        // узкой колонкой у левого края, оставив две трети экрана пустыми.
+        let (card_w, card_h, width) = if theme::is_mobile() {
+            let inset = ctx.px(theme::M_INSET);
+            let top = ctx.px(theme::M_STATUS_H + theme::M_INSET);
+            let full_w = screen_w.saturating_sub(inset * 2).max(1);
+            let full_h = (panel_top - top as i32).max(1) as u32;
+            (full_w, full_h, full_w.saturating_sub(m.pad * 2))
+        } else {
+            (card_w, card_h, width)
+        };
+
         let surface = Surface::new(card_w, card_h, glass_bg())?;
         // Левый край карточки — ровно левый край плашки панели: одна вертикаль
         // на весь стол читается как порядок, две почти совпадающие — как ошибка
-        // отрисовки.
+        // отрисовки. На телефоне поле своё — под скруглённые углы экрана.
+        let left = if theme::is_mobile() { ctx.px(theme::M_INSET) } else { m.inset };
         let rect = Rect::new(
-            m.inset as i32,
+            left as i32,
             panel_top - surface.height() as i32,
             surface.width(),
             surface.height(),
@@ -1293,6 +1514,13 @@ pub enum PanelHit {
     Window(App),
     /// Значок трея.
     Tray(TrayItem),
+    /// Кнопка дока, за которой программы пока нет.
+    ///
+    /// Телефон и камера в доке телефона стоят, а программ за ними нет — их
+    /// некому написать, пока нет ни модема, ни камеры. Кнопка при этом не
+    /// обманка: нажатие доходит до стола, и стол говорит вслух, чего именно
+    /// нет. Промолчать было бы хуже — неотличимо от «не нажалось».
+    Missing(&'static str),
     /// Пустое место плашки: щелчок туда не должен доставаться окну под ней.
     Empty,
 }

@@ -51,6 +51,18 @@ enum Conduit {
 pub unsafe fn power_off(rsdp: u64) {
     // SAFETY: контракт функции.
     let Some(conduit) = (unsafe { conduit(rsdp) }) else {
+        // Телефон приходит сюда всегда: ACPI у него нет вовсе, значит нет и
+        // FADT, где объявляют PSCI. Перезагрузить его мы умеем — сторожевым
+        // таймером, — а **погасить** нечем: питание у MediaTek снимает
+        // отдельный контроллер (PMIC) через мост `pwrap`, и последовательность
+        // эта нигде не описана. Писать вслепую в чужой контроллер питания —
+        // цена ошибки не «не выключилось», а аппарат, который больше не
+        // включится. Поэтому здесь сказано вслух, а не сделано наугад.
+        if super::mtk::present() {
+            kprintln!("  power       : this machine has no way to switch itself off");
+            kprintln!("  power       : hold the power button; restart works and is offered");
+            return;
+        }
         kprintln!("  power       : firmware does not advertise PSCI, cannot power off");
         return;
     };
@@ -67,6 +79,16 @@ pub unsafe fn power_off(rsdp: u64) {
 pub unsafe fn reboot(rsdp: u64) {
     // SAFETY: контракт функции.
     let Some(conduit) = (unsafe { conduit(rsdp) }) else {
+        // Машина без ACPI — то есть телефон. У MediaTek перезагрузка делается
+        // сторожевым таймером: тем самым блоком, который мы и так пинаем с
+        // первой строки загрузки, чтобы он нас не сбросил. Здесь мы просим его
+        // сбросить машину нарочно.
+        //
+        // Возврата из удавшейся записи не бывает; `false` означает, что блока
+        // не нашлось в дереве, и тогда честнее сказать, чем молчать.
+        if super::mtk::reboot() {
+            return;
+        }
         kprintln!("  power       : firmware does not advertise PSCI, cannot reboot");
         return;
     };

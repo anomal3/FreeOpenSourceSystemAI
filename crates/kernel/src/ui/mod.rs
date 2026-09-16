@@ -50,6 +50,7 @@ pub mod panel;
 pub mod pointer;
 pub mod prefs;
 pub mod settings;
+pub mod shade;
 pub mod statusbar;
 pub mod term;
 pub mod window;
@@ -977,7 +978,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         } else if let Some(hit) = desktop.panel_at(x, y) {
             match hit {
                 PanelHit::Tray(_) | PanelHit::Empty => Some((&context::Action::ON_TRAY[..], "tray")),
-                PanelHit::Menu | PanelHit::Window(_) => None,
+                PanelHit::Menu | PanelHit::Window(_) | PanelHit::Missing(_) => None,
             }
         } else if let Some((index, hit)) = desktop.window_at(x, y) {
             // Правая кнопка внутри окна программы доходит до неё событием с
@@ -1081,6 +1082,35 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
 /// стрелкой. Обратный порядок означал бы, что кнопка, накрытая меню,
 /// срабатывает сквозь него.
 fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
+    // 0а. Шторка — поверх всего остального, и разбирается первой.
+    //
+    // Открытая шторка съедает нажатие целиком: нажатие внутрь пока ничего не
+    // переключает (переключать нечего — см. `ui::shade`), а нажатие мимо её
+    // закрывает. Пропустить его дальше значило бы открыть окно под шторкой,
+    // которую человек всего лишь хотел убрать.
+    if desktop.shade_open() {
+        if !desktop.shade_contains(x, y) {
+            desktop.toggle_shade();
+            kprintln!("  desktop     : shade closed");
+            desktop.present();
+        }
+        return;
+    }
+
+    // 0б. Строка состояния открывает шторку. Жеста «потянуть сверху» у нас
+    // пока нет — жестов нет вовсе, — а нажатие в ту же полосу делает то же
+    // самое и доступно с первого дня.
+    if theme::is_mobile() {
+        let bar = statusbar::bounds(desktop.screen_width(), desktop.scale());
+        if bar.contains(x, y) {
+            if desktop.toggle_shade() == Some(true) {
+                kprintln!("  desktop     : shade opened");
+                desktop.present();
+            }
+            return;
+        }
+    }
+
     // 0. Меню стола — оно поверх всего, включая меню запуска.
     if desktop.context_open() {
         // Пока в меню набирают имя или отвечают на вопрос об удалении, щелчок
@@ -1157,6 +1187,12 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 desktop.refresh_panel(status);
             }
             PanelHit::Tray(item) => tray_click(desktop, item, status),
+            // Кнопка есть, программы за ней нет. Говорится это вслух и
+            // называется своим именем: «нажатие никуда не привело» человек
+            // прочитает как поломку, а не как отсутствующую возможность.
+            PanelHit::Missing(what) => {
+                kprintln!("  desktop     : {what} -- no program for it on this machine yet");
+            }
             PanelHit::Empty => {}
         }
         return;

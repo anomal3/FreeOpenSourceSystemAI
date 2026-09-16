@@ -53,6 +53,7 @@ use super::context::{Action, ContextMenu, Reply};
 use super::icons::{Icons, Kind};
 use super::panel::{Menu, Panel, PanelHit, Status};
 use super::pointer::Pointer;
+use super::shade::Shade;
 use mini_ui::theme;
 use super::window::{App, Hit, Window};
 
@@ -94,6 +95,10 @@ pub struct Compositor {
     icons: Icons,
     /// Меню по правому щелчку. Верхний слой, как и меню запуска.
     context: Option<ContextMenu>,
+    /// Шторка телефона — слой поверх окон (см. [`super::shade`]).
+    ///
+    /// `None` на настольной машине: там её нет вовсе, а не «есть и закрыта».
+    shade: Option<Shade>,
     /// Окно, которое сейчас тащат за заголовок.
     ///
     /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
@@ -177,6 +182,7 @@ impl Compositor {
             pointer,
             icons: Icons::new(scale),
             context: ContextMenu::new(scale.min(2)),
+            shade: None,
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
@@ -195,7 +201,10 @@ impl Compositor {
             scale.min(2),
         );
         let panel_top = compositor.work_bottom();
-        compositor.menu = Menu::new(panel_top, scale.min(2));
+        compositor.menu = Menu::new(panel_top, scale.min(2), compositor.screen.width());
+        // Шторка заводится только на телефоне — [`Shade::new`] сам вернёт
+        // `None` на настольной машине.
+        compositor.shade = Shade::new(compositor.screen.width(), panel_top, scale);
         // Длина столбца значков считается от рабочей области, а не от экрана:
         // ячейка, заехавшая под панель задач, щёлкается панелью, а не значком.
         compositor.icons.set_area(panel_top);
@@ -803,7 +812,7 @@ impl Compositor {
         if self.menu_open() {
             return;
         }
-        if let Some(menu) = Menu::new(self.work_bottom(), self.scale.min(2)) {
+        if let Some(menu) = Menu::new(self.work_bottom(), self.scale.min(2), self.screen.width()) {
             self.menu = Some(menu);
         }
     }
@@ -891,6 +900,39 @@ impl Compositor {
                 self.mark(rect);
             }
         }
+
+        if let Some(shade) = self.shade.as_mut() {
+            let damage = shade.take_damage();
+            if !damage.is_empty() {
+                let rect = damage.translate(shade.rect.x, shade.rect.y);
+                self.mark(rect);
+            }
+        }
+    }
+
+    /// Открыть или закрыть шторку. Возвращает новое состояние.
+    ///
+    /// `None` — шторки на этой машине нет (см. [`Shade::new`]).
+    pub fn toggle_shade(&mut self) -> Option<bool> {
+        let rect = self.shade.as_ref()?.rect;
+        let open = self.shade.as_mut()?.toggle();
+        // Закрытую шторку надо стереть: под ней стол и окна, которые никто не
+        // перерисовывал, — они не «изменились», но их снова видно.
+        if !open {
+            self.mark_layer(rect);
+        }
+        Some(open)
+    }
+
+    #[must_use]
+    pub fn shade_open(&self) -> bool {
+        self.shade.as_ref().is_some_and(Shade::is_open)
+    }
+
+    /// Попадает ли точка в открытую шторку.
+    #[must_use]
+    pub fn shade_contains(&self, x: i32, y: i32) -> bool {
+        self.shade.as_ref().is_some_and(|shade| shade.contains(x, y))
     }
 
     /// Меню стола: открыть в точке, закрыть, спросить пункт под указателем.
@@ -1054,7 +1096,7 @@ impl Compositor {
         let back = Surface::new(width, rows.min(height.max(1)), theme::palette().wall_top)?;
         let panel = Panel::new(width, height, self.scale.min(2));
         let top = panel.as_ref().map_or(height as i32, |panel| panel.rect.y);
-        let menu = Menu::new(top, self.scale.min(2));
+        let menu = Menu::new(top, self.scale.min(2), width);
         let context = ContextMenu::new(self.scale.min(2));
         Some(Layers { back, panel, menu, context })
     }
@@ -1229,10 +1271,26 @@ impl Compositor {
                 self.stack(back, menu.surface(), menu.rect, band, dy, r);
             }
         }
+        // Шторка — поверх всего, включая док: она и открывается затем, чтобы
+        // закрыть собой то, что под ней.
+        if let Some(shade) = self.shade.as_ref() {
+            if shade.is_open() {
+                let r = theme::M_R_CARD * self.scale;
+                self.drop_shadow(back, shade.rect, band, dy, r);
+                self.stack(back, shade.surface(), shade.rect, band, dy, r);
+            }
+        }
         // Курсор — последним и без проверки пересечения: он мал, а обрезка
         // однобитной картинки уже сделана внутри `draw_bitmap`. Проверка
         // «попадает ли он в полосу» стоила бы больше, чем экономила.
-        self.pointer.draw(back, dy);
+        //
+        // На телефоне он не рисуется вовсе. Стрелка показывает, куда попадёт
+        // следующее нажатие, — а палец уже стоит там, куда попадёт: он сам
+        // виден человеку, и второй указатель на то же место означает, что
+        // система показывает ему его собственный палец с опозданием на кадр.
+        if !theme::is_mobile() {
+            self.pointer.draw(back, dy);
+        }
     }
 
     /// Мягкая тень под слоем.
