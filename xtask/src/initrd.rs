@@ -158,22 +158,14 @@ pub fn build_with(
     // Каталоги под добавляемые файлы заводятся по пути: `bin/hello` требует,
     // чтобы `bin` уже существовал в образе, а форматтер каталоги сам не создаёт.
     for (rel, path) in extra {
-        if let Some((dir, _)) = rel.rsplit_once('/') {
-            if !entries.iter().any(|entry| entry.rel == dir) {
-                entries.push(Entry { rel: dir.to_string(), node: Node::Dir });
-            }
-        }
+        ensure_dirs(rel, &mut entries);
         let data = fs::read(path)
             .with_context(|| format!("не удалось прочитать {}", path.display()))?;
         entries.push(Entry { rel: rel.clone(), node: Node::File(data) });
     }
 
     for (rel, data) in generated {
-        if let Some((dir, _)) = rel.rsplit_once('/') {
-            if !entries.iter().any(|entry| entry.rel == dir) {
-                entries.push(Entry { rel: dir.to_string(), node: Node::Dir });
-            }
-        }
+        ensure_dirs(rel, &mut entries);
         entries.push(Entry { rel: rel.clone(), node: Node::File(data.clone()) });
     }
 
@@ -233,6 +225,30 @@ pub fn build_with(
 /// обращаться к элементам просто по относительному пути (родитель к этому
 /// моменту уже создан), второе — чтобы образ не зависел от того, в каком
 /// порядке отдаёт записи файловая система хоста.
+/// Завести в списке **каждый** каталог пути, которого там ещё нет.
+///
+/// Раньше заводился только последний: для `media/hello.fpk` этого хватало, и
+/// недосмотр не всплывал годами. Всплыл он на пути `root/.ssh/authorized_keys` —
+/// форматтер отказался создавать `root/.ssh`, потому что `root` ещё не
+/// существовал, и сказал об этом честно: «No such file or directory».
+///
+/// Порядок добавления — от корня вглубь, иначе форматтер упрётся в то же самое.
+fn ensure_dirs(rel: &str, entries: &mut Vec<Entry>) {
+    let Some((dirs, _)) = rel.rsplit_once('/') else {
+        return;
+    };
+    let mut path = String::new();
+    for part in dirs.split('/') {
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(part);
+        if !entries.iter().any(|entry| entry.rel == path) {
+            entries.push(Entry { rel: path.clone(), node: Node::Dir });
+        }
+    }
+}
+
 fn collect(dir: &Path, prefix: &str, out: &mut Vec<Entry>) -> Result<()> {
     let mut names: Vec<String> = Vec::new();
     let entries = fs::read_dir(dir)

@@ -155,10 +155,37 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
         // это образ initrd, и читать `/os-keys` ей больше неоткуда. Обновиться
         // она всё равно не может (слотов у носителя нет), но отказ обязан
         // звучать «здесь нет слотов», а не «здесь нет ключей».
-        Some(initrd::build_with(opts.arch, opts.release, &extra, &[(
+        let mut generated = vec![(
             String::from("os-keys"),
             crate::keys::trusted_text()?.into_bytes(),
-        )])?)
+        )];
+
+        // Отладочная возможность: `FREEOS_AUTHORIZE=<файл>` кладёт открытый ключ
+        // SSH в живой образ, и к машине, загруженной с такой флешки, можно
+        // подключиться по сети.
+        //
+        // Переменной окружения, а не ключом командной строки, и это не лень.
+        // Ключ в образе — это дыра: всякий, кто такой образ получит, впустит к
+        // себе владельца ключа. Ключ в списке возможностей `--help` рано или
+        // поздно попадёт в сборочный сценарий выпуска, а переменная окружения
+        // требует, чтобы её задали намеренно и в этот самый раз. Обычный образ
+        // без неё не меняется ни на байт.
+        //
+        // Кладётся в два места: на живой системе `/etc/passwd` взять неоткуда,
+        // и сеанс остаётся root, а на установленной работает `roman`.
+        if let Some(path) = std::env::var_os("FREEOS_AUTHORIZE") {
+            let path = PathBuf::from(path);
+            let key = std::fs::read(&path)
+                .with_context(|| format!("не удалось прочитать ключ {}", path.display()))?;
+            say!(
+                "ВНИМАНИЕ: в образ кладётся открытый ключ SSH из {} — такой образ никому не отдавать",
+                path.display()
+            );
+            generated.push((String::from("root/.ssh/authorized_keys"), key.clone()));
+            generated.push((String::from("home/roman/.ssh/authorized_keys"), key));
+        }
+
+        Some(initrd::build_with(opts.arch, opts.release, &extra, &generated)?)
     } else {
         say!("initrd пропущен (--no-initrd)");
         None
