@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Виталий Ардашов (gerzoid), Роман Кощеев (anomal3)
 
-//! Полёт окна в стопку и обратно: анимация сворачивания («джинн»).
+//! Полёт окна в стопку и обратно: анимация сворачивания («джинн»), — и
+//! открытие и закрытие окна на телефоне («рост из плитки»).
+//!
+//! # Открытие и закрытие
+//!
+//! Окно вырастает из плитки своей программы на домашнем экране и уходит в неё
+//! обратно, проявляясь и тая по дороге. Плитки нет — программу запустили из
+//! «Пуска» или терминала — окно растёт из середины своего же места, с
+//! четырёх пятых размера. Полёт тот же, что у джинна: готовая поверхность
+//! окна растягивается выборкой ближайшей точки, перерисовки нет.
 //!
 //! # Как это выглядит
 //!
@@ -36,6 +45,19 @@ const ONE: i64 = 1024;
 /// выглядит миганием; больше — человек ждёт анимацию, а не окно.
 const DURATION_NS: u64 = 320_000_000;
 
+/// Сколько длится открытие и закрытие: короче сворачивания — человек ждёт
+/// окно, а не смотрит, куда оно делось.
+const ZOOM_NS: u64 = 240_000_000;
+
+/// Как летит окно.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    /// Сворачивание в стопку и обратно.
+    Genie,
+    /// Открытие (`restore`) и закрытие окна: рост из плитки и уход в неё.
+    Zoom,
+}
+
 /// Полёт одного окна.
 pub struct Flight {
     pub app: App,
@@ -49,20 +71,38 @@ pub struct Flight {
     /// Сколько кадров полёт занял — в журнал: полёт длится треть секунды, и
     /// снимок экрана стендом его не ловит, а число кадров говорит, был ли он.
     pub frames: u32,
+    pub motion: Motion,
+    /// Цель, известная заранее, — плитка программы для открытия и закрытия.
+    /// Цель джинна, стопка, едет вместе с доком и спрашивается каждый кадр.
+    pub to: Option<Rect>,
 }
 
 impl Flight {
     #[must_use]
     pub fn new(app: App, from: Rect, restore: bool, now_ns: u64) -> Self {
-        Self { app, from, started_ns: now_ns, restore, last: Rect::EMPTY, frames: 0 }
+        Self { app, from, started_ns: now_ns, restore, last: Rect::EMPTY, frames: 0, motion: Motion::Genie, to: None }
+    }
+
+    /// Открытие (`restore`) или закрытие окна — рост из `to` и уход в него.
+    #[must_use]
+    pub fn zoom(app: App, from: Rect, to: Rect, restore: bool, now_ns: u64) -> Self {
+        Self { motion: Motion::Zoom, to: Some(to), ..Self::new(app, from, restore, now_ns) }
+    }
+
+    const fn duration_ns(&self) -> u64 {
+        match self.motion {
+            Motion::Genie => DURATION_NS,
+            Motion::Zoom => ZOOM_NS,
+        }
     }
 
     /// Доля пройденного, `0..=ONE`, уже с учётом направления: ноль — окно на
     /// своём месте, `ONE` — окно в цели.
     #[must_use]
     pub fn phase(&self, now_ns: u64) -> i64 {
-        let elapsed = now_ns.saturating_sub(self.started_ns).min(DURATION_NS);
-        let t = (elapsed as i64 * ONE) / DURATION_NS as i64;
+        let duration = self.duration_ns();
+        let elapsed = now_ns.saturating_sub(self.started_ns).min(duration);
+        let t = (elapsed as i64 * ONE) / duration as i64;
         if self.restore { ONE - t } else { t }
     }
 
@@ -74,12 +114,15 @@ impl Flight {
 
     #[must_use]
     pub fn done(&self, now_ns: u64) -> bool {
-        now_ns.saturating_sub(self.started_ns) >= DURATION_NS
+        now_ns.saturating_sub(self.started_ns) >= self.duration_ns()
     }
 
     /// Прямоугольник, внутри которого окно лежит на этой доле пути.
     #[must_use]
     pub fn bounds(&self, to: Rect, t: i64) -> Rect {
+        if self.motion == Motion::Zoom {
+            return zoom_rect(self.from, to, t);
+        }
         let (top, bottom) = vertical(self.from, to, t);
         let left = self.from.x.min(to.x);
         let right = self.from.right().max(to.right());
@@ -91,6 +134,10 @@ impl Flight {
     /// `surface` — поверхность окна, `band` — полоса в координатах экрана,
     /// `dy` — сдвиг из экрана в полосу.
     pub fn draw(&self, back: &mut Surface, surface: &Surface, to: Rect, t: i64, band: Rect, dy: i32) {
+        if self.motion == Motion::Zoom {
+            draw_zoom(back, surface, zoom_rect(self.from, to, t), fade(t), band, dy);
+            return;
+        }
         let from = self.from;
         let (top, bottom) = vertical(from, to, t);
         let height = (bottom - top) as i64;
@@ -126,6 +173,72 @@ impl Flight {
             }
         }
     }
+}
+
+/// Где окно на этой доле пути роста: прямоугольник между местом и плиткой.
+fn zoom_rect(from: Rect, to: Rect, t: i64) -> Rect {
+    let e = ease(t);
+    let left = lerp(from.x, to.x, e);
+    let top = lerp(from.y, to.y, e);
+    let right = lerp(from.right(), to.right(), e);
+    let bottom = lerp(from.bottom(), to.bottom(), e);
+    Rect::new(left, top, (right - left).max(0) as u32, (bottom - top).max(0) as u32)
+}
+
+/// Непрозрачность окна, `0..=256`: первую половину пути от места оно не
+/// тает вовсе, вторую — тает до нуля. У плитки окна уже не видно, и она
+/// показывается из-под него, а не заслоняется точкой того же размера.
+fn fade(t: i64) -> u32 {
+    ((ONE - t) * 2 * 256 / ONE).clamp(0, 256) as u32
+}
+
+/// Растянуть поверхность окна в `rect` с непрозрачностью `alpha` из `0..=256`.
+///
+/// Шаг по источнику считается в неподвижной точке один раз на строку: деление
+/// на каждой точке, как у джинна, стоило бы на полном экране миллион делений
+/// за кадр. Смешиваются все четыре байта точки разом: у панели телефона альфа
+/// обязана быть `0xff`, и смесь двух `0xff` остаётся `0xff`.
+fn draw_zoom(back: &mut Surface, surface: &Surface, rect: Rect, alpha: u32, band: Rect, dy: i32) {
+    if rect.is_empty() || alpha == 0 || surface.width() == 0 || surface.height() == 0 {
+        return;
+    }
+    let first = rect.y.max(band.y);
+    let last = rect.bottom().min(band.bottom());
+    let x0 = rect.x.max(band.x).max(0);
+    let x1 = rect.right().min(band.right()).min(back.width() as i32);
+    if x0 >= x1 {
+        return;
+    }
+    let step = (u64::from(surface.width()) << 16) / u64::from(rect.w);
+    let start = (x0 - rect.x) as u64 * step;
+    let keep = 256 - alpha;
+    let max_x = surface.width() as usize - 1;
+    for y in first..last {
+        let src_y = (((y - rect.y) as u64 * u64::from(surface.height())) / u64::from(rect.h))
+            .min(u64::from(surface.height()) - 1) as u32;
+        let source = surface.row(src_y);
+        let row = back.row_mut((y + dy) as u32);
+        let (Some(dst), true) = (row.get_mut(x0 as usize..x1 as usize), source.len() > max_x) else {
+            continue;
+        };
+        let mut acc = start;
+        for pixel in dst.iter_mut() {
+            let src = source[((acc >> 16) as usize).min(max_x)];
+            acc += step;
+            *pixel = if keep == 0 { src } else { mix(src, *pixel, alpha, keep) };
+        }
+    }
+}
+
+/// Смесь двух точек по байтам: `a` из `256` — доля первой.
+fn mix(src: u32, dst: u32, a: u32, keep: u32) -> u32 {
+    let mut out = 0;
+    for shift in [0, 8, 16, 24] {
+        let s = (src >> shift) & 0xff;
+        let d = (dst >> shift) & 0xff;
+        out |= ((s * a + d * keep) >> 8) << shift;
+    }
+    out
 }
 
 /// Верх и низ окна на этой доле пути. Низ приезжает раньше верха: горлышко

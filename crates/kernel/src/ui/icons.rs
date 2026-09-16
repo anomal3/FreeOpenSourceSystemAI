@@ -366,6 +366,22 @@ impl Icons {
         )
     }
 
+    /// Плитка значка этой программы — откуда её окно вырастает при открытии.
+    ///
+    /// Своя плитка программы важнее ярлыка: «Пакеты» тоже открывают
+    /// «Параметры», но окно «Параметров» должно расти из «Настроек».
+    #[must_use]
+    pub fn tile_of(&self, app: App) -> Option<Rect> {
+        let own = self.items.iter().position(|item| matches!(item.kind, Kind::App(a) if a == app));
+        let index = own.or_else(|| {
+            self.items.iter().position(|item| matches!(item.kind, Kind::Shortcut(a, _) if a == app))
+        })?;
+        let cell = self.cell(index);
+        let ctx = self.ctx();
+        let side = ctx.px(if theme::is_mobile() { theme::M_TILE } else { theme::ICON_TILE });
+        Some(Rect::new(cell.x + (cell.w as i32 - side as i32) / 2, cell.y + ctx.px(CELL_PAD) as i32, side, side))
+    }
+
     /// Какой значок лежит под точкой экрана.
     #[must_use]
     pub fn at(&self, x: i32, y: i32) -> Option<usize> {

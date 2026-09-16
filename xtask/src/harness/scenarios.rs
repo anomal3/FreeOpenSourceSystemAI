@@ -986,6 +986,21 @@ pub const ALL: &[Scenario] = &[
             // Первым «pk» находит «Пакеты» (пояснение «установка .fpk») — они
             // открывают «Настройки».
             Step::Await("desktop     : opened 'Settings'", 15_000),
+            // Окно вырастает из плитки (у «Пакетов» своей нет — «Параметры»
+            // растут из «Настроек») и закрывается уходом в неё же. Середина
+            // полёта снимается на удачу, как `03-flying`; строка журнала о
+            // конце полёта — не на удачу.
+            Step::Await("desktop     : open zoom of 'Settings': ", 15_000),
+            Step::Wait(1000),
+            Step::Shot("08-settings"),
+            Step::Aim(Aim::Point(642, 164)),
+            Step::Click,
+            Step::Await("desktop     : closed 'Settings'", 15_000),
+            Step::Wait(40),
+            Step::Shot("08b-closing"),
+            Step::Await("desktop     : close zoom of 'Settings': ", 15_000),
+            Step::Wait(1000),
+            Step::Shot("09-closed"),
         ],
     },
     Scenario {
