@@ -1180,9 +1180,16 @@ impl SettingsView {
         let p = ctx.palette;
 
         // ── Разрешение ───────────────────────────────────────────────────────
+        //
+        // Список показывается только там, где режим действительно меняется.
+        // Где нет — одна строка с тем, что есть сейчас: перечень, по которому
+        // нельзя щёлкнуть, человек читает как поломку, и правильно делает.
+        let switchable = crate::display::can_switch();
         let row_h = ctx.px(30);
         let gap = ctx.px(2);
-        let count = MODES.len() as u32;
+        let modes: &[(u32, u32)] =
+            if switchable { &MODES } else { core::slice::from_ref(&self.screen) };
+        let count = modes.len() as u32;
         let list_w = ctx.px(230).min(main.w);
         let list_h = row_h * count + gap * count.saturating_sub(1);
         let (list, mut y) = setting(
@@ -1190,17 +1197,21 @@ impl SettingsView {
             main,
             y,
             "Разрешение",
-            "Меняется сразу и запоминается на следующий запуск.",
+            if switchable {
+                "Меняется сразу и запоминается на следующий запуск."
+            } else {
+                "Задаёт прошивка при загрузке: своего драйвера этой видеокарты в системе нет."
+            },
             (list_w, list_h),
         );
-        for (index, (width, height)) in MODES.iter().enumerate() {
+        for (index, (width, height)) in modes.iter().enumerate() {
             let rect = Rect::new(
                 list.x,
                 list.y + (index as u32 * (row_h + gap)) as i32,
                 list.w,
                 row_h,
             );
-            let focused = pass.deed(rect, Deed::Mode(*width, *height));
+            let focused = switchable && pass.deed(rect, Deed::Mode(*width, *height));
             if !pass.visible(rect) {
                 continue;
             }
@@ -1258,7 +1269,11 @@ impl SettingsView {
             main.x,
             y + ctx.px(16) as i32,
             main.w,
-            "Режим меняется сразу на стандартном VGA QEMU и на ramfb; на другой видеокарте — со следующего запуска.",
+            if switchable {
+                "Режим меняется сразу и запоминается на следующий запуск."
+            } else {
+                "Сменить режим может только драйвер видеокарты — его в системе пока нет, и это запланированная работа. Прошивка выбирает режим при включении машины."
+            },
         );
     }
 

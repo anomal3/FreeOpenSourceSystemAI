@@ -473,6 +473,11 @@ extern "sysv64" fn secondary_entry(index: usize) -> ! {
     // SAFETY: загрузочный подготовил TSS этого процессора до запуска, и это
     // первый код на нём; ни одного лока до этой строки не взято.
     unsafe { gdt::load_secondary(index) };
+    // Таблица типов памяти — регистр процессора, а не машины: загрузочный
+    // запрограммировал свою, этот обязан сделать то же. Иначе одни и те же
+    // страницы экрана окажутся быстрыми на одном ядре и некешируемыми на
+    // остальных — в зависимости от того, кто рисует кадр.
+    super::paging::enable_write_combining();
     super::interrupts::load_idt_secondary();
     apic::init_secondary();
     super::fpu::init_secondary();

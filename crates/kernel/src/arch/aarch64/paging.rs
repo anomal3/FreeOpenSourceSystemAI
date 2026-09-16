@@ -390,7 +390,13 @@ fn leaf_descriptor(phys: PhysAddr, flags: PageFlags) -> u64 {
     // Device-семантика из них строже.
     let attr_index = if device {
         ATTR_IDX_DEVICE_NGNRE
-    } else if flags.contains(PageFlags::DMA) {
+    } else if flags.contains(PageFlags::DMA) || flags.contains(PageFlags::WRITE_COMBINE) {
+        // `Normal Non-Cacheable` служит здесь двум разным нуждам, и обе им
+        // покрываются: буферам DMA нужно отсутствие кеша между процессором и
+        // устройством, кадровому буферу — право объединять записи. Отдельного
+        // «write-combining» у AArch64 нет вовсе: объединение разрешено всякой
+        // обычной памяти, и Non-Cacheable отличается от кешируемой только тем,
+        // что не держит строк.
         ATTR_IDX_NORMAL_NC
     } else {
         ATTR_IDX_NORMAL

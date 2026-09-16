@@ -188,7 +188,9 @@ impl FwCfg {
                 virt,
                 PhysAddr::new(page),
                 PAGE_SIZE,
-                PageFlags::READ | PageFlags::WRITE | PageFlags::DEVICE,
+                // Экран — не регистры, записи в него объединять можно и нужно
+                // (см. [`PageFlags::WRITE_COMBINE`]).
+                PageFlags::READ | PageFlags::WRITE | PageFlags::WRITE_COMBINE,
             )
         }
         .map_err(|_| DisplayError::OutOfMemory)?;

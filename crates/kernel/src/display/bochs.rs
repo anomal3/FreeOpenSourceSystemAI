@@ -36,6 +36,27 @@ const LFB_ENABLED: u16 = 0x40;
 /// записали бы значение не в тот регистр.
 static PORTS: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
 
+/// Стоит ли в машине этот адаптер.
+///
+/// Нужно не драйверу, а окну «Параметры»: список разрешений, по которому нельзя
+/// щёлкнуть, — это не сведения, а обманутое ожидание. На ноутбуке с настоящей
+/// видеокартой ответ «нет», и раздел честно говорит, что режим задаёт прошивка.
+#[must_use]
+pub fn present() -> bool {
+    let rsdp = crate::acpi::rsdp();
+    if rsdp == 0 {
+        return false;
+    }
+    // SAFETY: адрес RSDP запомнен из хэндоффа, прямое отображение активно;
+    // обход шины только читает конфигурационное пространство.
+    unsafe {
+        crate::pci::Root::discover(rsdp)
+            .ok()
+            .and_then(|root| crate::pci::find_by_id(&root, VENDOR, &[DEVICE]))
+            .is_some()
+    }
+}
+
 pub fn set_mode(current: &Framebuffer, width: u32, height: u32) -> Result<Framebuffer, DisplayError> {
     let rsdp = crate::acpi::rsdp();
     if rsdp == 0 {
@@ -87,7 +108,15 @@ pub fn set_mode(current: &Framebuffer, width: u32, height: u32) -> Result<Frameb
     // SAFETY: собственные таблицы ядра активны; диапазон — память устройства,
     // по которой ядро не исполняется, и получает семантику Device.
     unsafe {
-        crate::arch::map_active(virt, lfb, len, PageFlags::READ | PageFlags::WRITE | PageFlags::DEVICE)
+        // Экран — не регистры: записи в него можно и нужно объединять, иначе
+        // каждый пиксель стоит отдельной посылки по шине (см.
+        // [`PageFlags::WRITE_COMBINE`]).
+        crate::arch::map_active(
+            virt,
+            lfb,
+            len,
+            PageFlags::READ | PageFlags::WRITE | PageFlags::WRITE_COMBINE,
+        )
     }
     .map_err(|_| DisplayError::OutOfMemory)?;
 
