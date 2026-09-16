@@ -50,6 +50,7 @@ pub mod panel;
 pub mod pointer;
 pub mod prefs;
 pub mod settings;
+pub mod keyboard;
 pub mod shade;
 pub mod statusbar;
 pub mod term;
@@ -1259,6 +1260,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         }
     }
     if event.released(Buttons::LEFT) {
+        desktop.keyboard_release();
         // Размер, отложенный до кадра, применяется до того, как спросят, где и
         // какого размера окно: иначе отпускание описывало бы окно на шаг назад.
         desktop.settle_drag();
@@ -1287,6 +1289,49 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     desktop.present();
 }
 
+/// Напечатать то, что нажато на экранной клавиатуре.
+///
+/// Клавиши уходят в общую очередь ввода нажатием и отпусканием — так же, как их
+/// кладёт USB-клавиатура (см. [`keyboard`]). Shift, нужный знаку, оборачивает
+/// нажатие и отпускается сразу за ним: оставленный нажатым, он сделал бы
+/// заглавными все следующие буквы с физической клавиатуры тоже.
+fn type_on_screen(desktop: &mut Compositor, action: keyboard::Action) {
+    use crate::input::{self, KeyCode};
+    let tap = |code: KeyCode, shift: bool| {
+        if shift {
+            input::post(KeyCode::LeftShift, true);
+        }
+        input::post(code, true);
+        input::post(code, false);
+        if shift {
+            input::post(KeyCode::LeftShift, false);
+        }
+    };
+    match action {
+        keyboard::Action::Key { code, shift } => {
+            let letter = (KeyCode::A as u8..=KeyCode::Z as u8).contains(&(code as u8));
+            tap(code, shift || (letter && desktop.keyboard_shifted()));
+            if letter {
+                desktop.keyboard_consume_shift();
+            }
+        }
+        keyboard::Action::Backspace => tap(KeyCode::Backspace, false),
+        keyboard::Action::Space => tap(KeyCode::Space, false),
+        keyboard::Action::Enter => tap(KeyCode::Enter, false),
+        keyboard::Action::Tab => tap(KeyCode::Tab, false),
+        keyboard::Action::Chip(word) => {
+            for letter in word.chars() {
+                if let Some(code) = keyboard::code_for(letter) {
+                    tap(code, false);
+                }
+            }
+            kprintln!("  keyboard    : typed '{word}'");
+        }
+        // Состояние самой клавиатуры — уже учтено в `Keyboard::press`.
+        keyboard::Action::Shift | keyboard::Action::Page => {}
+    }
+}
+
 /// Разобрать нажатие левой кнопки.
 ///
 /// Порядок проверок — сверху вниз по слоям кадра, и он обязан совпадать с
@@ -1306,6 +1351,15 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             kprintln!("  desktop     : shade closed");
             desktop.present();
         }
+        return;
+    }
+
+    // 0а'. Экранная клавиатура: нажатие в неё — клавиша, и дальше не идёт.
+    if desktop.keyboard_contains(x, y) {
+        if let Some(action) = desktop.keyboard_press(x, y) {
+            type_on_screen(desktop, action);
+        }
+        desktop.present();
         return;
     }
 

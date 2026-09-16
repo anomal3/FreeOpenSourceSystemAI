@@ -97,6 +97,10 @@ pub enum Aim {
     ContextItem(usize, i32),
     /// Середина окна.
     Middle(&'static str),
+    /// Точка экрана как есть. Для раскладок, которые стенд не пересчитывает, —
+    /// экранной клавиатуры телефона: её место зависит только от размера экрана,
+    /// а сценарий `mobile` задаёт его сам.
+    Point(i32, i32),
 }
 
 /// Строка `desktop     : 1280x800, ui scale 1, panel 80 px`.
@@ -353,6 +357,7 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
             let rect = window(log, title)?;
             (rect.x + rect.w / 2, rect.y + rect.h / 2)
         }
+        Aim::Point(x, y) => (x, y),
     };
 
     if point.0 < 0 || point.1 < 0 || point.0 >= width || point.1 >= height {

@@ -560,7 +560,9 @@ fn run_command(line: &str) -> bool {
         "help" => help(),
         "uptime" => sprintln!("  {} ms, {} timer ticks", time::uptime_ms(), irq::ticks()),
         "date" => date(),
-        "mem" => memory(),
+        // `free` — привычное имя из Unix, и под ним команда стоит на быстрой
+        // кнопке экранной клавиатуры телефона.
+        "mem" | "free" => memory(),
         "input" => {
             let stats = input::stats();
             sprintln!(
@@ -1124,7 +1126,7 @@ fn help() {
     sprintln!("  help          this list");
     sprintln!("  uptime        time since the timer started");
     sprintln!("  date          the wall clock, local and UTC");
-    sprintln!("  mem           physical frames, heap and DMA window");
+    sprintln!("  mem, free     physical frames, heap and DMA window");
     sprintln!("  input         key event counters");
     sprintln!("  usb           xHCI controller state");
     sprintln!("  pci           every device on the bus, with its identifiers");

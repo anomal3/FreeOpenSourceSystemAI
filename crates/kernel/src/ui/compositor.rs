@@ -53,6 +53,7 @@ use super::context::{Action, ContextMenu, Reply};
 use super::icons::{Icons, Kind};
 use super::panel::{Menu, Panel, PanelHit, Status};
 use super::pointer::Pointer;
+use super::keyboard::{self, Keyboard};
 use super::shade::Shade;
 use mini_ui::theme;
 use super::window::{App, Hit, Window};
@@ -99,6 +100,9 @@ pub struct Compositor {
     ///
     /// `None` на настольной машине: там её нет вовсе, а не «есть и закрыта».
     shade: Option<Shade>,
+    /// Экранная клавиатура телефона — слой над окнами, под шторкой (см.
+    /// [`super::keyboard`]).
+    keyboard: Option<Keyboard>,
     /// Окно, которое сейчас тащат за заголовок.
     ///
     /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
@@ -193,6 +197,7 @@ impl Compositor {
             icons: Icons::new(scale),
             context: ContextMenu::new(scale.min(2)),
             shade: None,
+            keyboard: None,
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
@@ -217,6 +222,8 @@ impl Compositor {
         // Шторка заводится только на телефоне — [`Shade::new`] сам вернёт
         // `None` на настольной машине.
         compositor.shade = Shade::new(compositor.screen.width(), panel_top, scale);
+        compositor.keyboard =
+            Keyboard::new(compositor.screen.width(), compositor.screen.height(), scale);
         // Длина столбца значков считается от рабочей области, а не от экрана:
         // ячейка, заехавшая под панель задач, щёлкается панелью, а не значком.
         compositor.icons.set_area(panel_top);
@@ -604,6 +611,10 @@ impl Compositor {
     /// Попадание в панель задач.
     #[must_use]
     pub fn panel_at(&self, x: i32, y: i32) -> Option<PanelHit> {
+        // Под открытой клавиатурой дока нет — он спрятан, и нажимать его нельзя.
+        if self.keyboard_visible() {
+            return None;
+        }
         let panel = self.panel.as_ref()?;
         if !panel.rect.contains(x, y) {
             return None;
@@ -880,6 +891,90 @@ impl Compositor {
         ));
     }
 
+    /// Видна ли экранная клавиатура.
+    #[must_use]
+    pub fn keyboard_visible(&self) -> bool {
+        self.keyboard.as_ref().is_some_and(Keyboard::is_visible)
+    }
+
+    /// Попадает ли точка в экранную клавиатуру.
+    #[must_use]
+    pub fn keyboard_contains(&self, x: i32, y: i32) -> bool {
+        self.keyboard.as_ref().is_some_and(|keyboard| keyboard.contains(x, y))
+    }
+
+    /// Нажатие в клавиатуре: что делает кнопка под пальцем.
+    pub fn keyboard_press(&mut self, x: i32, y: i32) -> Option<keyboard::Action> {
+        self.keyboard.as_mut()?.press(x, y)
+    }
+
+    /// Палец отпустили — снять подсветку кнопки.
+    pub fn keyboard_release(&mut self) {
+        if let Some(keyboard) = self.keyboard.as_mut() {
+            keyboard.release();
+        }
+    }
+
+    /// Включён ли одноразовый Shift клавиатуры.
+    #[must_use]
+    pub fn keyboard_shifted(&self) -> bool {
+        self.keyboard.as_ref().is_some_and(Keyboard::shifted)
+    }
+
+    /// Буква напечатана — снять одноразовый Shift.
+    pub fn keyboard_consume_shift(&mut self) {
+        if let Some(keyboard) = self.keyboard.as_mut() {
+            keyboard.consume_shift();
+        }
+    }
+
+    /// Показать клавиатуру, если активно окно, в которое печатают, и спрятать,
+    /// если нет. Возвращает новое состояние, если оно изменилось.
+    ///
+    /// Вызывается на каждом кадре, а не в местах, где меняется фокус: мест этих
+    /// больше десятка (открытие, закрытие, сворачивание, щелчок, Alt+Tab,
+    /// программа, открывшая окно сама), и забытое одно оставило бы клавиатуру
+    /// висеть над окном, в которое не печатают.
+    ///
+    /// Вместе с клавиатурой меняется высота окна терминала: низ окна встаёт над
+    /// клавиатурой, а когда она уходит — возвращается к доку. Иначе нижние
+    /// строки терминала, то есть строка ввода, оказались бы под клавишами.
+    pub fn sync_keyboard(&mut self) -> Option<bool> {
+        let keyboard = self.keyboard.as_ref()?;
+        let want = self.focused_app() == Some(App::Terminal);
+        if keyboard.is_visible() == want {
+            return None;
+        }
+        let rect = keyboard.rect;
+        self.keyboard.as_mut()?.set_visible(want);
+        self.mark_layer(rect);
+        if let Some(panel) = self.panel.as_ref() {
+            let dock = panel.rect;
+            self.mark(Rect::new(0, dock.y, self.screen.width(), self.screen.height().saturating_sub(dock.y.max(0) as u32)));
+        }
+
+        let bottom = if want {
+            rect.y - mini_ui::paint::Ctx::scaled(self.scale).px(keyboard::GAP) as i32
+        } else {
+            self.work_bottom()
+        };
+        if let Some(index) = self.index_of(App::Terminal) {
+            if let Some(window) = self.windows.get_mut(index) {
+                let before = window.rect;
+                let height = (bottom - before.y).max(0) as u32;
+                if height != before.h && window.resize(before.w, height) {
+                    let after = window.rect;
+                    self.note_moved(App::Terminal, before, after);
+                    // Пересборка поверхности рисует рамку неактивной (см.
+                    // `Window::rebuild`): без этого активный терминал с
+                    // появлением клавиатуры выглядел погасшим.
+                    self.refresh_decorations();
+                }
+            }
+        }
+        Some(want)
+    }
+
     /// Довести отложенное изменение размера — палец отпустили.
     pub fn settle_drag(&mut self) {
         self.apply_pending_size();
@@ -1039,6 +1134,13 @@ impl Compositor {
             }
         }
 
+        if let Some(keyboard) = self.keyboard.as_mut() {
+            let damage = keyboard.take_damage();
+            if !damage.is_empty() && keyboard.is_visible() {
+                let rect = damage.translate(keyboard.rect.x, keyboard.rect.y);
+                self.mark(rect);
+            }
+        }
         if let Some(shade) = self.shade.as_mut() {
             let damage = shade.take_damage();
             if !damage.is_empty() {
@@ -1263,6 +1365,9 @@ impl Compositor {
         self.panel = layers.panel;
         self.menu = layers.menu;
         self.context = layers.context;
+        // Клавиатура собирается заново под новый экран: её ширина и место — от
+        // него. Видимость вернёт ближайший кадр (см. [`Self::sync_keyboard`]).
+        self.keyboard = Keyboard::new(width, height, self.scale);
         self.pointer = Pointer::new(width, height);
         self.drag = None;
         let bottom = self.work_bottom();
@@ -1311,6 +1416,9 @@ impl Compositor {
             return;
         }
         self.apply_pending_size();
+        if let Some(shown) = self.sync_keyboard() {
+            crate::kprintln!("  keyboard    : {}", if shown { "shown" } else { "hidden" });
+        }
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
             return;
@@ -1453,7 +1561,20 @@ impl Compositor {
             self.stack(back, window.surface(), window.rect, band, dy, radius);
         }
         let t_windows = crate::time::uptime_ns();
-        if let Some(panel) = self.panel.as_ref() {
+        // Клавиатура — над окнами и вместо дока: в макете окно с клавиатурой
+        // доходит до низа экрана, и док под ней не виден вовсе.
+        let keyboard_up = match self.keyboard.as_ref() {
+            Some(keyboard) if keyboard.is_visible() => {
+                if !keyboard.rect.intersect(&band).is_empty() {
+                    let r = mini_ui::paint::Ctx::scaled(self.scale).px(34);
+                    self.drop_shadow(back, keyboard.rect, band, dy, r);
+                    self.stack(back, keyboard.surface(), keyboard.rect, band, dy, r);
+                }
+                true
+            }
+            _ => false,
+        };
+        if let Some(panel) = self.panel.as_ref().filter(|_| !keyboard_up) {
             // Полосы, которых док не задевает, отсекаются здесь, до всякой
             // работы. `stack` проверяет то же самое, но уже внутри — а нам
             // нужно знать, сколько раз он вызывается вхолостую: счётчик

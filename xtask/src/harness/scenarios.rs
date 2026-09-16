@@ -855,9 +855,22 @@ pub const ALL: &[Scenario] = &[
         extra: &[],
         steps: &[
             Step::Await("display     : 720x1600 set at start", BOOT),
+            Step::Await("keyboard    : shown", BOOT),
             Step::Await("freeos> ", BOOT),
             Step::Wait(1500),
             Step::Shot("01-home"),
+            // Экранная клавиатура печатает в оболочку: быстрая команда `free`,
+            // затем ↵. Точки — середины кнопок на экране 720x1600 (снимок
+            // `01-home`); команда доходит до оболочки тем же путём, что и с
+            // USB-клавиатуры, и оболочка её выполняет.
+            Step::Aim(Aim::Point(300, 1133)),
+            Step::Click,
+            Step::Await("keyboard    : typed 'free'", 15_000),
+            Step::Aim(Aim::Point(613, 1509)),
+            Step::Click,
+            Step::Await(" MiB free", 15_000),
+            Step::Wait(1000),
+            Step::Shot("02-typed"),
         ],
     },
     Scenario {
