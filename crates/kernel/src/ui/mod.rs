@@ -689,6 +689,34 @@ pub fn note_frame() {
     FRAMES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Во что обошлись слои одной полосы: обои, значки, окна (из них тени), верх.
+static WALL_NS: AtomicU64 = AtomicU64::new(0);
+static ICONS_NS: AtomicU64 = AtomicU64::new(0);
+static WINDOWS_NS: AtomicU64 = AtomicU64::new(0);
+static SHADOW_NS: AtomicU64 = AtomicU64::new(0);
+static TOP_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Записать, во что обошлись слои полосы.
+pub fn note_layers(wall: u64, icons: u64, windows: u64, shadow: u64, top: u64) {
+    WALL_NS.fetch_add(wall, Ordering::Relaxed);
+    ICONS_NS.fetch_add(icons, Ordering::Relaxed);
+    WINDOWS_NS.fetch_add(windows, Ordering::Relaxed);
+    SHADOW_NS.fetch_add(shadow, Ordering::Relaxed);
+    TOP_NS.fetch_add(top, Ordering::Relaxed);
+}
+
+/// Слои по отдельности — обои, значки, окна, из них тени, верхние слои.
+#[must_use]
+pub fn layer_timing() -> (u64, u64, u64, u64, u64) {
+    (
+        WALL_NS.load(Ordering::Relaxed),
+        ICONS_NS.load(Ordering::Relaxed),
+        WINDOWS_NS.load(Ordering::Relaxed),
+        SHADOW_NS.load(Ordering::Relaxed),
+        TOP_NS.load(Ordering::Relaxed),
+    )
+}
+
 /// Кадры, полосы, наносекунды сборки и вывода, точки.
 #[must_use]
 pub fn timing() -> (u64, u64, u64, u64, u64) {

@@ -232,6 +232,16 @@ impl Fastboot {
                 blit_ns / n / 1000,
             );
             self.say(text.as_bytes());
+            let (wall, icons, windows, shadow, top) = crate::ui::layer_timing();
+            let text = alloc::format!(
+                "wall {} icons {} win {} (shadow {}) top {} us",
+                wall / n / 1000,
+                icons / n / 1000,
+                windows / n / 1000,
+                shadow / n / 1000,
+                top / n / 1000,
+            );
+            self.say(text.as_bytes());
             self.state = State::Lines { at: 0 };
             self.continue_lines(0);
         } else if text == "oem log" || text == "oem klog" {

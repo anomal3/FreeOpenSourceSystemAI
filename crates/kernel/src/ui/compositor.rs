@@ -1266,16 +1266,26 @@ impl Compositor {
     fn compose_band(&self, back: &mut Surface, band: Rect) {
         let dy = -band.y;
         let radius = theme::R_WINDOW * self.scale;
+        // Разложение сборки по слоям. Общее число уже сказало, что виновата
+        // сборка, а не вывод; теперь надо знать, какой её кусок, — иначе
+        // правка снова окажется догадкой.
+        let t_start = crate::time::uptime_ns();
         self.draw_background(back, band, dy);
+        let t_wall = crate::time::uptime_ns();
         // Строка состояния — часть стола и лежит под окнами: она рисуется сразу
         // после обоев, до значков. На настольной машине не рисуется вовсе (см.
         // [`super::statusbar`]).
         super::statusbar::draw(back, band, dy, self.screen.width(), self.scale);
         self.icons.draw(back, band, dy);
+        let t_icons = crate::time::uptime_ns();
+        let mut shadow_ns = 0u64;
         for window in self.windows.iter().filter(|window| !window.minimized) {
+            let t0 = crate::time::uptime_ns();
             self.drop_shadow(back, window.rect, band, dy, radius);
+            shadow_ns += crate::time::uptime_ns().wrapping_sub(t0);
             self.stack(back, window.surface(), window.rect, band, dy, radius);
         }
+        let t_windows = crate::time::uptime_ns();
         if let Some(panel) = self.panel.as_ref() {
             self.drop_shadow(back, panel.rect, band, dy, radius);
             self.stack(back, panel.surface(), panel.rect, band, dy, radius);
@@ -1313,6 +1323,14 @@ impl Compositor {
         if !theme::is_mobile() {
             self.pointer.draw(back, dy);
         }
+        let t_end = crate::time::uptime_ns();
+        super::note_layers(
+            t_wall.wrapping_sub(t_start),
+            t_icons.wrapping_sub(t_wall),
+            t_windows.wrapping_sub(t_icons),
+            shadow_ns,
+            t_end.wrapping_sub(t_windows),
+        );
     }
 
     /// Фон для телефона: градиент по строкам и разметка, без световых пятен.
