@@ -199,6 +199,13 @@ impl Compositor {
         // Длина столбца значков считается от рабочей области, а не от экрана:
         // ячейка, заехавшая под панель задач, щёлкается панелью, а не значком.
         compositor.icons.set_area(panel_top);
+        // Ширина экрана и верх сетки — телефону (см. [`Icons::set_span`]). На
+        // столе вызов безвреден: мобильная раскладка спрашивает эти числа, а
+        // настольная о них не знает.
+        compositor.icons.set_span(
+            compositor.screen.width(),
+            mini_ui::paint::Ctx::scaled(scale).px(theme::M_STATUS_H + theme::M_INSET),
+        );
         compositor.icons.reload();
         Some(compositor)
     }
@@ -1196,6 +1203,10 @@ impl Compositor {
         let dy = -band.y;
         let radius = theme::R_WINDOW * self.scale;
         self.draw_background(back, band, dy);
+        // Строка состояния — часть стола и лежит под окнами: она рисуется сразу
+        // после обоев, до значков. На настольной машине не рисуется вовсе (см.
+        // [`super::statusbar`]).
+        super::statusbar::draw(back, band, dy, self.screen.width(), self.scale);
         self.icons.draw(back, band, dy);
         for window in self.windows.iter().filter(|window| !window.minimized) {
             self.drop_shadow(back, window.rect, band, dy, radius);

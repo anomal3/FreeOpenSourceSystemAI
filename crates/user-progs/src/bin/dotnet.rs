@@ -108,7 +108,11 @@ impl Console {
         };
         mini_ui::use_raw_format(info.pixel_format);
         mini_ui::theme::set_dark(info.flags & SYSINFO_DARK != 0);
-        let tier = mini_ui::paint::Ctx::scaled(mini_ui::theme::geometry_scale(info.screen_w)).tier;
+        let tier = mini_ui::paint::Ctx::scaled(mini_ui::theme::geometry_scale(
+            info.screen_w,
+            info.screen_h,
+        ))
+        .tier;
         let face = typeface::face(Role::Body, tier);
         self.face = Some(face);
         Some(face)

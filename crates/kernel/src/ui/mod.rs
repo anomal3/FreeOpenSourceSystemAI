@@ -50,6 +50,7 @@ pub mod panel;
 pub mod pointer;
 pub mod prefs;
 pub mod settings;
+pub mod statusbar;
 pub mod term;
 pub mod window;
 
@@ -115,7 +116,12 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
     };
     *FRAMEBUFFER.lock() = *fb;
 
-    let scale = theme::geometry_scale(screen.width());
+    // Форма машины запоминается **до** масштаба и до палитры: от неё зависят и
+    // множитель геометрии, и раскладка стола, и то, как открываются окна.
+    // Спрашивается она у экрана, а не у настройки: человек, включивший систему
+    // на телефоне, не должен сначала объяснять ей, что это телефон.
+    theme::set_form(theme::form_for(screen.width(), screen.height()));
+    let scale = theme::geometry_scale(screen.width(), screen.height());
     // Тема читается **до** создания композитора: палитра выбирается один раз,
     // при сборке первого кадра, и тема, применённая после, потребовала бы
     // перекрасить всё заново — то есть показать человеку вспышку чужого цвета
@@ -355,6 +361,21 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
     let work = desktop.work_bottom().max(1) as u32;
     let margin = width / 24;
 
+    // На телефоне окно занимает экран целиком — от строки состояния до дока.
+    //
+    // Не «так красивее»: окно в половину экрана на телефоне нельзя ни читать,
+    // ни двигать. Двигать нечем — пальцем за полосу заголовка шириной в палец
+    // же; читать нечего — в четверти экрана помещается три строки. Все
+    // мобильные системы пришли к одному и тому же, и пришли не от вкуса.
+    if theme::is_mobile() {
+        let ctx = mini_ui::paint::Ctx::scaled(desktop.scale());
+        let top = ctx.px(theme::M_STATUS_H + theme::M_INSET) as i32;
+        let inset = ctx.px(theme::M_INSET);
+        let w = width.saturating_sub(inset * 2).max(1);
+        let h = (work - top.max(0) as u32).max(1);
+        return Rect::new(inset as i32, top, w, h);
+    }
+
     match app {
         App::Terminal => Rect::new(
             margin as i32,
@@ -480,6 +501,29 @@ fn about_facts(desktop: &Compositor) -> AboutFacts {
 /// Считается **до** захвата замка стола: счётчики памяти живут за своим замком,
 /// и брать два замка во вложенном порядке — это способ однажды получить
 /// взаимную блокировку.
+/// Сколько памяти свободно и сколько её всего, в мегабайтах.
+///
+/// Из атомиков, а не из [`mm::frame::stats`], и это важно: спрашивают их при
+/// сборке кадра, то есть под замком стола, а `stats` берёт свой. Числа кладёт
+/// сюда [`status_now`], который вызывается снаружи всех замков стола.
+#[must_use]
+pub fn memory_mib() -> (u64, u64) {
+    (
+        LAST_FREE_MIB.load(Ordering::Relaxed),
+        LAST_TOTAL_MIB.load(Ordering::Relaxed),
+    )
+}
+
+/// Часы, а если их нет — время работы.
+///
+/// Машина без часов реального времени (телефон — ровно такая: прошивка времени
+/// не отдаёт) знает только, сколько она работает. Показать это честнее, чем
+/// оставить пустое место или нарисовать выдуманное время.
+#[must_use]
+pub fn clock_or_uptime() -> String {
+    crate::time::clock_text().unwrap_or_else(|| statusbar::uptime_text(crate::time::uptime_ms()))
+}
+
 fn status_now() -> Status {
     let frames = mm::frame::stats();
     let free_mib = (frames.free_bytes() / (1024 * 1024)) as u64;

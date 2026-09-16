@@ -113,7 +113,10 @@ impl Metrics {
         Self {
             ctx,
             inset: ctx.px(theme::PANEL_INSET),
-            round: ctx.px(theme::R_WINDOW),
+            // Док у телефона скруглён сильнее плашки: он лежит у самого края
+            // экрана, а экран там сам скруглён по радиусу вчетверо большему.
+            // Прямой угол рядом со скруглённым краем читается как обрезанный.
+            round: ctx.px(if theme::is_mobile() { theme::M_R_DOCK } else { theme::R_WINDOW }),
             round_row: ctx.px(theme::R_ROW),
             btn_h: ctx.px(theme::PANEL_BTN_H),
             side: ctx.px(15),
@@ -330,15 +333,29 @@ impl Panel {
     /// обязано остановиться над верхним полем, а не над самой плашкой — иначе
     /// оно ляжет под её тень и подсветится ею снизу.
     #[must_use]
-    pub const fn height(scale: u32) -> u32 {
+    pub fn height(scale: u32) -> u32 {
+        if theme::is_mobile() {
+            // Док у телефона выше панели и отстоит от края дальше: под нижним
+            // краем экрана лежит место жеста «домой», а по бокам — скруглённые
+            // углы. Кнопка, попавшая туда, видна и не нажимается.
+            return (theme::M_DOCK_H + theme::M_INSET * 2) * scale;
+        }
         (theme::PANEL_H + theme::PANEL_INSET * 2) * scale
     }
 
     #[must_use]
     pub fn new(screen_w: u32, screen_h: u32, scale: u32) -> Option<Self> {
         let scale = scale.max(1);
-        let inset = theme::PANEL_INSET * scale;
-        let plate_h = theme::PANEL_H * scale;
+        // Оба числа обязаны быть теми же, из которых сложена [`Panel::height`]:
+        // по ней композитор считает нижнюю границу рабочей области. Разойдись
+        // они — и плашка встанет не на своё поле, а окна улягутся ей под тень.
+        let (inset, plate) = if theme::is_mobile() {
+            (theme::M_INSET, theme::M_DOCK_H)
+        } else {
+            (theme::PANEL_INSET, theme::PANEL_H)
+        };
+        let inset = inset * scale;
+        let plate_h = plate * scale;
         let plate_w = screen_w.checked_sub(inset * 2).filter(|w| *w > 0)?;
         let surface = Surface::new(plate_w, plate_h, glass_bg())?;
         // Плашка стоит на нижнем поле той полосы, которую панель отнимает у

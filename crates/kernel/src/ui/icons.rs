@@ -118,12 +118,16 @@ pub struct Icons {
     /// входит меньше ячеек, чем на 1080p, и сетка, посчитанная под один экран,
     /// на другом уехала бы под панель задач.
     rows: u32,
+    /// Ширина экрана и верх сетки — на телефоне (см. [`Icons::set_span`]).
+    width: u32,
+    top: u32,
 }
 
 impl Icons {
     #[must_use]
     pub fn new(scale: u32) -> Self {
-        let mut icons = Self { scale, items: Vec::new(), selected: None, rows: 1 };
+        let mut icons =
+            Self { scale, items: Vec::new(), selected: None, rows: 1, width: 0, top: 0 };
         icons.items = system_items();
         icons
     }
@@ -153,6 +157,17 @@ impl Icons {
         let ctx = self.ctx();
         let usable = (work_bottom - ctx.px(theme::ICON_MARGIN) as i32).max(0) as u32;
         self.rows = (usable / ctx.px(theme::ICON_CELL_H + theme::ICON_GAP).max(1)).max(1);
+    }
+
+    /// Задать ширину экрана и верх сетки — только для телефона.
+    ///
+    /// На столе ни то, ни другое не нужно: сетка начинается от поля и растёт
+    /// вправо, сколько бы её ни было. На телефоне она начинается **под строкой
+    /// состояния** и делит ширину экрана поровну, поэтому оба числа приходят
+    /// снаружи — сама сетка экрана не знает.
+    pub fn set_span(&mut self, width: u32, top: u32) {
+        self.width = width;
+        self.top = top;
     }
 
     /// Перечитать каталог стола.
@@ -238,6 +253,9 @@ impl Icons {
     /// и столбец кончается предсказуемо.
     fn cell(&self, index: usize) -> Rect {
         let ctx = self.ctx();
+        if theme::is_mobile() {
+            return self.cell_mobile(index, ctx);
+        }
         let margin = ctx.px(theme::ICON_MARGIN) as i32;
         let step_x = ctx.px(theme::ICON_CELL_W + theme::ICON_GAP);
         let step_y = ctx.px(theme::ICON_CELL_H + theme::ICON_GAP);
@@ -248,6 +266,32 @@ impl Icons {
             margin + (row * step_y) as i32,
             ctx.px(theme::ICON_CELL_W),
             ctx.px(theme::ICON_CELL_H),
+        )
+    }
+
+    /// Ячейка значка на телефоне: сетка по строкам, четыре в ряд.
+    ///
+    /// По строкам, а не по столбцам, и это не вкус: у экрана в ладони вниз
+    /// места вдесятеро больше, чем вправо, а палец ведёт список сверху вниз.
+    /// Столбцами здесь заполнялся бы один столбец на весь экран.
+    ///
+    /// Ширина ячейки делится поровну между колонками, а не берётся из макета:
+    /// панель бывает 720 точек шириной, а бывает 1080, и сетка, посчитанная
+    /// числом, на второй оставила бы полосу пустоты справа.
+    fn cell_mobile(&self, index: usize, ctx: Ctx) -> Rect {
+        let inset = ctx.px(theme::M_INSET);
+        let columns = theme::M_COLUMNS.max(1);
+        let usable = self.width.saturating_sub(inset * 2).max(columns);
+        let cell_w = usable / columns;
+        let cell_h = ctx.px(theme::M_CELL_H);
+        let gap = ctx.px(theme::M_CELL_GAP);
+        let column = index as u32 % columns;
+        let row = index as u32 / columns;
+        Rect::new(
+            (inset + column * cell_w) as i32,
+            (self.top + row * (cell_h + gap)) as i32,
+            cell_w,
+            cell_h,
         )
     }
 
@@ -335,7 +379,10 @@ impl Icons {
             draw::rounded_stroke(back, cell, r, p.accline.color, p.accline.alpha);
         }
 
-        let side = ctx.px(theme::ICON_TILE);
+        // Плитка на телефоне крупнее: в неё целятся пальцем, а не курсором.
+        // Сорок шесть точек — это девять миллиметров на мониторе и четыре с
+        // половиной на панели телефона, то есть вдвое меньше подушечки пальца.
+        let side = ctx.px(if theme::is_mobile() { theme::M_TILE } else { theme::ICON_TILE });
         let tile = Rect::new(
             cell.x + (cell.w as i32 - side as i32) / 2,
             cell.y + ctx.px(CELL_PAD) as i32,
