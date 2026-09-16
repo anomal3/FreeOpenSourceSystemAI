@@ -509,7 +509,10 @@ impl Window {
         if self.close_button().contains(local.0, local.1) {
             return Some(Hit::Close);
         }
-        if self.maximize_button().contains(local.0, local.1) {
+        // Кнопки «развернуть» на телефоне нет: окно там и так во весь экран, и
+        // разворачивать его некуда. Проверка снята вместе с самой кнопкой —
+        // иначе место, где её нарисовали бы, продолжало бы нажиматься.
+        if !theme::is_mobile() && self.maximize_button().contains(local.0, local.1) {
             return Some(Hit::Maximize);
         }
         if self.minimize_button().contains(local.0, local.1) {
@@ -596,15 +599,23 @@ impl Window {
         // случаях означал бы, что человек нажимает наугад.
         let restore_icon = if self.restore.is_some() { Icon::Restore } else { Icon::Maximize };
         let weight = if focused { Weight::Normal } else { Weight::Ghost };
-        for (button, icon, weight) in [
-            (self.minimize_button(), Icon::Minimize, weight),
-            (self.maximize_button(), restore_icon, weight),
+        // Кнопки заголовка. На телефоне «развернуть» не рисуется вовсе: окно и
+        // так во весь экран, разворачивать его некуда, а кнопка, которая ничего
+        // не меняет, — это обещание, которого система не держит.
+        let mobile = theme::is_mobile();
+        for (button, icon, weight, only_desktop) in [
+            (self.minimize_button(), Icon::Minimize, weight, false),
+            (self.maximize_button(), restore_icon, weight, true),
             (
                 self.close_button(),
                 Icon::Close,
                 if focused { Weight::Danger } else { Weight::Ghost },
+                false,
             ),
         ] {
+            if mobile && only_desktop {
+                continue;
+            }
             paint::icon_button(ctx, &mut self.surface, button, icon, weight, false);
         }
 

@@ -1293,6 +1293,63 @@ impl Compositor {
         }
     }
 
+    /// Фон для телефона: градиент по строкам и разметка, без световых пятен.
+    ///
+    /// # Почему он другой
+    ///
+    /// Не потому, что на телефоне некрасиво, а потому, что там он не виден.
+    /// Окно на этом экране занимает его целиком, и весь счёт трёх эллипсов
+    /// уходит под окно. Сам счёт недёшев: три умножения и до трёх смешиваний на
+    /// каждую из миллиона с лишним точек, и всё это на каждом кадре.
+    ///
+    /// Здесь на точку остаётся одно обращение к таблице. Цвет строки считается
+    /// один раз на строку, а разметка ставится там же, где и на столе, — она
+    /// нужна и здесь: на однородной заливке движение не читается.
+    fn draw_background_flat(&self, back: &mut Surface, rect: Rect, dy: i32) {
+        let p = theme::palette();
+        let height = self.screen.height().max(1) as i32;
+
+        // Готовые цвета основы: двести пятьдесят шесть оттенков перехода, и
+        // цвет точки — это выбор из массива, а не смешивание.
+        let mut base = [0u32; 256];
+        for (weight, slot) in base.iter_mut().enumerate() {
+            *slot = p.wall_top.mix(p.wall_bottom, weight as u8).pixel();
+        }
+
+        for y in rect.y.max(0)..rect.bottom() {
+            // Вес перехода — доля высоты экрана, посчитанная один раз на строку.
+            let weight = (y.clamp(0, height) * 255 / height) as usize;
+            let pixel = base[weight.min(255)];
+            let target = (y + dy) as u32;
+            let from = rect.x.max(0) as usize;
+            let to = (rect.right().max(0) as usize).min(back.width() as usize);
+            let row = back.row_mut(target);
+            if from >= to || row.len() < to {
+                continue;
+            }
+            row[from..to].fill(pixel);
+        }
+
+        // Разметка — тем же способом, что у настольного фона: редкие точки,
+        // по которым глаз видит, что окно поехало.
+        let step = DOT_STEP * self.scale;
+        let size = DOT_SIZE * self.scale;
+        let mut y = align_up(rect.y, step);
+        while y < rect.bottom() {
+            let mut x = align_up(rect.x, step);
+            while x < rect.right() {
+                draw::blend_rect(
+                    back,
+                    Rect::new(x, y + dy, size, size),
+                    p.wall_dot.color,
+                    p.wall_dot.alpha,
+                );
+                x += step as i32;
+            }
+            y += step as i32;
+        }
+    }
+
     /// Мягкая тень под слоем.
     ///
     /// Она не украшение: на светлой теме однопиксельная обводка панели по
@@ -1414,6 +1471,16 @@ impl Compositor {
     /// таблицей на двести пятьдесят шесть готовых точек. В цикле остаются
     /// умножение, сдвиг и обращение к таблице.
     fn draw_background(&self, back: &mut Surface, rect: Rect, dy: i32) {
+        // На телефоне фон считается дешёвым способом, и это не упрощение ради
+        // упрощения. Три световых пятна стоят на точку трёх умножений и до трёх
+        // смешиваний; экран 720×1600 — это миллион с лишним точек, а окно на
+        // телефоне занимает его целиком, то есть весь этот счёт уходит под
+        // окно, где его никто не увидит. Глазом это выглядит как окно,
+        // проявляющееся сверху вниз.
+        if theme::is_mobile() {
+            self.draw_background_flat(back, rect, dy);
+            return;
+        }
         let p = theme::palette();
         let width = self.screen.width().max(1) as i32;
         let height = self.screen.height().max(1) as i32;

@@ -186,6 +186,22 @@ impl Fastboot {
             self.continue_dump(0);
         } else if let Some(rest) = text.strip_prefix("oem t") {
             self.touch_command(rest);
+        } else if text == "oem mem" {
+            // Память по кабелю. Спрашивать её журналом нельзя: журнал говорит
+            // о том, что уже случилось, а здесь нужно состояние **сейчас** —
+            // сколько кучи свободно в тот момент, когда на экране то, о чём
+            // спрашивают.
+            let heap = crate::mm::heap::stats();
+            let frames = crate::mm::frame::stats();
+            let text = alloc::format!(
+                "heap {} KiB used, {} KiB free of {} KiB; frames {} MiB free of {} MiB",
+                heap.used / 1024,
+                heap.free / 1024,
+                heap.size / 1024,
+                frames.free_bytes() / (1024 * 1024),
+                frames.total_bytes() / (1024 * 1024),
+            );
+            self.respond(b"OKAY", &text);
         } else if text == "oem log" || text == "oem klog" {
             let (at, until) = (klog::oldest(), klog::written());
             self.state = State::Log { at, until };

@@ -1208,7 +1208,12 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
         let last = LAST_ICON_CLICK.swap(now, core::sync::atomic::Ordering::Relaxed);
         let key = index as u32;
         let same = LAST_ICON.swap(key, core::sync::atomic::Ordering::Relaxed) == key;
-        if same && now.saturating_sub(last) <= DOUBLE_CLICK_MS {
+        // Пальцем открывают с одного раза. Двойной щелчок придуман мышью и для
+        // мыши: там указатель стоит на месте между нажатиями, и второе попадает
+        // туда же само собой. Палец между двумя нажатиями уходит с экрана, и
+        // повторить попадание в ту же точку за полсекунды — задача, которую
+        // человек не должен решать, чтобы открыть программу.
+        if theme::is_mobile() || (same && now.saturating_sub(last) <= DOUBLE_CLICK_MS) {
             open_icon(desktop, index);
             desktop.refresh_panel(status);
         }
