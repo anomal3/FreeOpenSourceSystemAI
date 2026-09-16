@@ -68,7 +68,11 @@ fn desk_ctx(scale: u32) -> Ctx {
 
 /// Надпись в поле дока. Она же говорит, что поле делает: открывает список
 /// приложений и ищет по нему.
-const SEARCH_HINT: &str = "Пуск или поиск";
+const SEARCH_HINT: &str = "Поиск";
+
+/// Подпись кнопки «Пуск» на телефоне. Имя системы, а не слово «Пуск»: кнопка
+/// широкая, места хватает, и человек читает, чем он пользуется.
+const DOCK_BRAND: &str = "FreeOS";
 
 /// Заливка плавающего слоя, сведённая к непрозрачному цвету.
 ///
@@ -416,10 +420,11 @@ impl Panel {
     /// За телефоном и камерой программ пока нет, и кнопки всё равно стоят:
     /// место под них в доке — это решение о раскладке, а не обещание. Нажатие
     /// доходит до стола и называет вслух, чего именно нет.
-    fn redraw_dock(&mut self, m: Metrics, plate: Rect, menu_open: bool) {
+    fn redraw_dock(&mut self, m: Metrics, plate: Rect, menu_open: bool, windows: &[Entry]) {
         let ctx = m.ctx;
         let p = ctx.palette;
-        let layout = dock_layout(m, plate);
+        let minimized = windows.iter().filter(|entry| entry.minimized).count();
+        let layout = dock_layout(m, plate, minimized);
         let glyph = ctx.px(20);
 
         // Боковые кнопки: подложка кнопки, значок по центру. Того, за чем нет
@@ -445,16 +450,100 @@ impl Panel {
             );
         }
 
-        // Поле поиска — оно же кнопка меню. Открытое меню вдавливает плитку
-        // тем же переворотом градиента, что и настольная кнопка «Пуск»: одно
-        // правило на обе формы, чтобы «меню открыто» выглядело одинаково.
-        draw::rounded(
+        // Кнопка «Пуск». Открытое меню переворачивает градиент — кнопка
+        // выглядит вдавленной; то же правило, что у настольной панели.
+        let (top, bottom) = if menu_open { (p.acc2, p.acc) } else { (p.acc, p.acc2) };
+        draw::rounded_gradient(&mut self.surface, layout.brand, m.round_row, top, bottom, 255);
+        draw::rounded_stroke(
             &mut self.surface,
-            layout.search,
+            layout.brand,
             m.round_row,
-            p.btn.color,
-            p.btn.alpha,
+            p.accline.color,
+            p.accline.alpha,
         );
+        // Широкая кнопка подписана именем системы, узкая — только значком:
+        // подпись, обрезанная до «Fr…», хуже её отсутствия.
+        let wide = layout.brand.w > m.btn_h + ctx.px(20);
+        let icon_x = if wide {
+            layout.brand.x + m.side as i32
+        } else {
+            layout.brand.x + (layout.brand.w as i32 - glyph as i32) / 2
+        };
+        glyphicon::draw(
+            &mut self.surface,
+            Icon::Grid,
+            icon_x,
+            layout.brand.y + (layout.brand.h as i32 - glyph as i32) / 2,
+            glyph,
+            WHITE,
+            255,
+        );
+        if wide {
+            let text_x = icon_x + glyph as i32 + m.gap as i32;
+            paint::text_clipped(
+                ctx,
+                &mut self.surface,
+                Role::Title,
+                text_x,
+                paint::baseline(ctx, Role::Title, layout.brand),
+                layout.brand.right().saturating_sub(text_x).max(0) as u32,
+                DOCK_BRAND,
+                WHITE,
+            );
+        }
+
+        // Стопка свёрнутых окон: плитки внахлёст со сдвигом, чтобы из-под
+        // верхней выглядывали края нижних. Так видно, что окон несколько, не
+        // называя их числом.
+        if !layout.stack.is_empty() {
+            draw::rounded(
+                &mut self.surface,
+                layout.stack,
+                m.round_row,
+                p.btn.color,
+                p.btn.alpha,
+            );
+            draw::rounded_stroke(
+                &mut self.surface,
+                layout.stack,
+                m.round_row,
+                p.btnline.color,
+                p.btnline.alpha,
+            );
+            let tile = ctx.px(22);
+            let step = ctx.px(6);
+            let count = minimized.min(3);
+            let total = tile + step * (count.saturating_sub(1)) as u32;
+            let base_x = layout.stack.x + (layout.stack.w as i32 - total as i32) / 2;
+            let base_y = layout.stack.y + (layout.stack.h as i32 - tile as i32) / 2;
+            for index in 0..count {
+                // Нижние плитки приподняты и сдвинуты: поворота у нас нет, а
+                // разнобой нужен — ровная стопка читается как одна плитка.
+                let lift = ((count - index - 1) as u32 * ctx.px(2)) as i32;
+                let rect = Rect::new(
+                    base_x + (index as u32 * step) as i32,
+                    base_y - lift,
+                    tile,
+                    tile,
+                );
+                let last = index + 1 == count;
+                if last {
+                    draw::rounded_gradient(&mut self.surface, rect, ctx.px(7), p.acc, p.acc2, 255);
+                } else {
+                    draw::rounded(&mut self.surface, rect, ctx.px(7), ctx.flat(p.ghost), 255);
+                }
+                draw::rounded_stroke(
+                    &mut self.surface,
+                    rect,
+                    ctx.px(7),
+                    p.btnline.color,
+                    p.btnline.alpha,
+                );
+            }
+        }
+
+        // Поле поиска.
+        draw::rounded(&mut self.surface, layout.search, m.round_row, p.btn.color, p.btn.alpha);
         draw::rounded_stroke(
             &mut self.surface,
             layout.search,
@@ -462,25 +551,18 @@ impl Panel {
             p.btnline.color,
             p.btnline.alpha,
         );
-        let (top, bottom) = if menu_open { (p.acc2, p.acc) } else { (p.acc, p.acc2) };
-        draw::rounded_gradient(
-            &mut self.surface,
-            layout.chip,
-            ctx.px(theme::M_R_CHIP),
-            top,
-            bottom,
-            255,
-        );
+        let search_icon = ctx.px(16);
+        let icon_x = layout.search.x + m.gap as i32;
         glyphicon::draw(
             &mut self.surface,
-            Icon::Grid,
-            layout.chip.x + (layout.chip.w as i32 - glyph as i32) / 2,
-            layout.chip.y + (layout.chip.h as i32 - glyph as i32) / 2,
-            glyph,
-            WHITE,
+            Icon::Search,
+            icon_x,
+            layout.search.y + (layout.search.h as i32 - search_icon as i32) / 2,
+            search_icon,
+            p.ink3,
             255,
         );
-        let text_x = layout.chip.right() + m.gap as i32;
+        let text_x = icon_x + search_icon as i32 + m.gap as i32;
         paint::text_clipped(
             ctx,
             &mut self.surface,
@@ -536,6 +618,12 @@ impl Panel {
             // кнопки больше ничем не занято.
             if x >= dock.left.x && x < dock.left.right() {
                 return Some(PanelHit::Missing("phone"));
+            }
+            if x >= dock.brand.x && x < dock.brand.right() {
+                return Some(PanelHit::Menu);
+            }
+            if !dock.stack.is_empty() && x >= dock.stack.x && x < dock.stack.right() {
+                return Some(PanelHit::Stack);
             }
             if x >= dock.search.x && x < dock.search.right() {
                 return Some(PanelHit::Menu);
@@ -599,7 +687,7 @@ impl Panel {
         // может — окно на телефоне одно и во весь экран, переключать нечего.
         // Вместо них то, чем пользуются: приложения, поиск, телефон и камера.
         if theme::is_mobile() {
-            self.redraw_dock(m, plate, menu_open);
+            self.redraw_dock(m, plate, menu_open, windows);
             self.damage = plate;
             return;
         }
@@ -803,7 +891,12 @@ struct PanelLayout {
 struct DockLayout {
     /// Кнопка слева: телефон.
     left: Rect,
-    /// Поле «Пуск или поиск» — оно же кнопка меню.
+    /// Кнопка «Пуск»: широкая с подписью, пока нет свёрнутых окон, и плитка,
+    /// когда они появились.
+    brand: Rect,
+    /// Стопка свёрнутых окон. Пустой прямоугольник — сворачивать нечего.
+    stack: Rect,
+    /// Поле поиска.
     search: Rect,
     /// Плитка со значком внутри поля поиска.
     chip: Rect,
@@ -813,7 +906,7 @@ struct DockLayout {
     home: Rect,
 }
 
-fn dock_layout(m: Metrics, plate: Rect) -> DockLayout {
+fn dock_layout(m: Metrics, plate: Rect, minimized: usize) -> DockLayout {
     let side = m.btn_h;
     let pad = (plate.h.saturating_sub(side)) / 2;
     let y = plate.y + pad as i32;
@@ -821,8 +914,27 @@ fn dock_layout(m: Metrics, plate: Rect) -> DockLayout {
 
     let left = Rect::new(plate.x + pad as i32, y, side, side);
     let right = Rect::new(plate.right() - (pad + side) as i32, y, side, side);
-    let search_x = left.right() + gap as i32;
-    let search_w = (right.x - gap as i32 - search_x).max(side as i32) as u32;
+    let mut search_x = left.right() + gap as i32;
+    let room = (right.x - gap as i32 - search_x).max(side as i32) as u32;
+
+    // Пока свёрнутых окон нет, «Пуск» широкий и подписан именем системы, а
+    // поиск занимает остаток. Как только окна сворачиваются, между ними встаёт
+    // стопка, и «Пуск» ужимается до плитки: место на экране одно, и делить его
+    // приходится с тем, что появилось.
+    let (brand_w, stack) = if minimized == 0 {
+        (room * 2 / 5, Rect::EMPTY)
+    } else {
+        let stack_w = side + m.ctx.px(18);
+        let brand = side;
+        let stack = Rect::new(search_x + brand as i32 + gap as i32, y, stack_w, side);
+        (brand, stack)
+    };
+    let brand = Rect::new(search_x, y, brand_w, side);
+    search_x = brand.right() + gap as i32;
+    if !stack.is_empty() {
+        search_x = stack.right() + gap as i32;
+    }
+    let search_w = (right.x - gap as i32 - search_x).max(m.ctx.px(40) as i32) as u32;
     let search = Rect::new(search_x, y, search_w, side);
 
     // Плитка внутри поля — на четыре точки меньше него со всех сторон: в
@@ -842,7 +954,7 @@ fn dock_layout(m: Metrics, plate: Rect) -> DockLayout {
         home_h,
     );
 
-    DockLayout { left, search, chip, right, home }
+    DockLayout { left, brand, stack, search, chip, right, home }
 }
 
 fn panel_layout(m: Metrics, plate: Rect, windows: &[Entry], status_w: u32) -> PanelLayout {
@@ -1596,6 +1708,8 @@ pub enum PanelHit {
     Window(App),
     /// Значок трея.
     Tray(TrayItem),
+    /// Стопка свёрнутых окон в доке: тап показывает их списком.
+    Stack,
     /// Кнопка дока, за которой программы пока нет.
     ///
     /// Телефон и камера в доке телефона стоят, а программ за ними нет — их

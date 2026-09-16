@@ -1100,7 +1100,10 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         } else if let Some(hit) = desktop.panel_at(x, y) {
             match hit {
                 PanelHit::Tray(_) | PanelHit::Empty => Some((&context::Action::ON_TRAY[..], "tray")),
-                PanelHit::Menu | PanelHit::Window(_) | PanelHit::Missing(_) => None,
+                PanelHit::Menu
+                | PanelHit::Window(_)
+                | PanelHit::Missing(_)
+                | PanelHit::Stack => None,
             }
         } else if let Some((index, hit)) = desktop.window_at(x, y) {
             // Правая кнопка внутри окна программы доходит до неё событием с
@@ -1312,6 +1315,10 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             // Кнопка есть, программы за ней нет. Говорится это вслух и
             // называется своим именем: «нажатие никуда не привело» человек
             // прочитает как поломку, а не как отсутствующую возможность.
+            // Стопка свёрнутых: показать их списком. Пока список — это меню
+            // запуска, где свёрнутые окна и так перечислены; отдельное окно
+            // «Свёрнутые программы» из макета будет следующим шагом.
+            PanelHit::Stack => toggle_menu(desktop, status),
             PanelHit::Missing(what) => {
                 kprintln!("  desktop     : {what} -- no program for it on this machine yet");
             }
