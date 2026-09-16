@@ -36,11 +36,15 @@
 //! Когда на телефоне активно окно, в которое печатают, — пока это терминал (см.
 //! `Compositor::sync_keyboard`). Док в это время спрятан.
 //!
-//! # Чего в ней нет
+//! # Долгое нажатие и ⌫
 //!
-//! Долгого нажатия (ё, ъ и цифры верхнего ряда) и автоповтора ⌫ — следующие шаги.
-//! «ё» и «ъ» в словах жестом набираются уже сейчас: у них те же клавиши, что у
-//! «е» и «ь».
+//! Палец, задержанный на букве дольше [`LONG_MS`] и не сдвинутый, открывает над
+//! клавишей варианты (эскиз, кадр 4): «е» → «ё», «ь» → «ъ», у верхнего ряда —
+//! цифра из угла клавиши. Палец доводят до нужного и отпускают.
+//!
+//! ⌫ при удержании стирает с автоповтором. Сразу после слова, набранного
+//! жестом, ⌫ стирает всё слово с его пробелом — как в Gboard: жест ошибается
+//! словами, а не буквами.
 
 use alloc::vec::Vec;
 
@@ -79,6 +83,14 @@ const TRAIL_MS: u64 = 450;
 const TRAIL_R: u32 = 5;
 /// Сколько подсказок встаёт над клавишами.
 const SUGGESTIONS: usize = 3;
+/// Через сколько миллисекунд удержания открываются варианты буквы.
+const LONG_MS: u64 = 400;
+/// Автоповтор ⌫: задержка до первого повтора и шаг, мс.
+const REPEAT_DELAY_MS: u64 = 450;
+const REPEAT_MS: u64 = 60;
+/// Ширина ячейки варианта и высота строки вариантов, в точках макета.
+const ALT_CELL: u32 = 34;
+const ALT_H: u32 = 46;
 
 /// Что делает кнопка.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,6 +109,8 @@ pub enum Action {
     Chip(&'static str),
     /// Подсказка над клавишами: номер в списке подсказок.
     Suggest(usize),
+    /// ⌫ сразу после слова жестом: стереть столько знаков (слово и пробел).
+    EraseWord(usize),
 }
 
 /// Чем кончилось касание буквенной клавиши или пробела.
@@ -136,6 +150,8 @@ struct Key {
     upper: &'static str,
     /// Буква, через которую идёт жест. `None` — клавиша не буквенная.
     letter: Option<char>,
+    /// Цифра в углу клавиши верхнего ряда — вариант долгого нажатия.
+    digit: Option<char>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -150,6 +166,18 @@ struct Stroke {
     key: usize,
     /// Путь пальца в точках экрана.
     points: Vec<Point>,
+    /// Когда палец опустился (мс).
+    at: u64,
+    /// Открытые варианты долгого нажатия.
+    popup: Option<Popup>,
+}
+
+/// Строка вариантов над клавишей.
+struct Popup {
+    /// Где она на поверхности клавиатуры.
+    rect: Rect,
+    chars: Vec<char>,
+    selected: usize,
 }
 
 pub struct Keyboard {
@@ -184,6 +212,8 @@ pub struct Keyboard {
     /// русский. Разбор тридцати тысяч строк — не то, за что платят при
     /// каждом показе клавиатуры.
     dicts: [Option<Dictionary>; 2],
+    /// Удерживаемый ⌫: когда стереть следующий знак (мс).
+    repeat: Option<u64>,
 }
 
 /// Заливка слоя, сведённая к непрозрачному цвету, — как у дока.
@@ -226,6 +256,7 @@ impl Keyboard {
             current: 0,
             capital: false,
             dicts: [None, None],
+            repeat: None,
         };
         keyboard.layout();
         Some(keyboard)
@@ -300,12 +331,23 @@ impl Keyboard {
         let index = self.keys.iter().position(|key| key.rect.contains(local.0, local.1))?;
         let key = self.keys[index];
         self.pressed = Some(index);
+        let now = crate::time::uptime_ms();
         if key.letter.is_some() || key.action == Action::Space {
-            self.stroke = Some(Stroke { key: index, points: alloc::vec![Point::new(x, y)] });
+            self.stroke = Some(Stroke { key: index, points: alloc::vec![Point::new(x, y)], at: now, popup: None });
             self.trail.clear();
             self.trail.push((Point::new(x, y), crate::time::uptime_ms()));
             self.redraw_key(index);
             return None;
+        }
+        // ⌫ сразу после слова жестом стирает слово целиком.
+        if key.action == Action::Backspace && !self.suggestions.is_empty() {
+            let count = self.suggestions[self.current].chars().count() + 1;
+            self.set_suggestions(Vec::new());
+            self.redraw_key(index);
+            return Some(Action::EraseWord(count));
+        }
+        if key.action == Action::Backspace {
+            self.repeat = Some(now + REPEAT_DELAY_MS);
         }
         // Любая другая клавиша, кроме подсказки, принимает вставленное слово:
         // строка подсказок снова становится быстрыми командами.
@@ -346,6 +388,18 @@ impl Keyboard {
         let Some(stroke) = self.stroke.as_mut() else {
             return false;
         };
+        // Открыты варианты: палец выбирает среди них, а не ведёт жест.
+        if let Some(popup) = stroke.popup.as_mut() {
+            let ctx = Ctx::scaled(self.scale);
+            let (cell, pad) = (ctx.px(ALT_CELL) as i32, ctx.px(4) as i32);
+            let local = x - self.rect.x - popup.rect.x - pad;
+            let slot = ((local.max(0) / cell.max(1)) as usize).min(popup.chars.len() - 1);
+            if slot != popup.selected {
+                popup.selected = slot;
+                self.draw_popup();
+            }
+            return true;
+        }
         let point = Point::new(x, y);
         let last = stroke.points.last().copied().unwrap_or(point);
         // Точки ближе трёх — дрожь пальца, а не путь.
@@ -380,6 +434,7 @@ impl Keyboard {
 
     /// Палец отпустили: снять подсветку и решить, чем было касание.
     pub fn release(&mut self) -> Release {
+        self.repeat = None;
         if let Some(index) = self.pressed.take() {
             self.redraw_key(index);
         }
@@ -389,6 +444,15 @@ impl Keyboard {
         let Some(key) = self.keys.get(stroke.key).copied() else {
             return Release::Nothing;
         };
+        if let Some(popup) = stroke.popup {
+            // Строка вариантов лежала поверх клавиш — клавиатура рисуется заново.
+            self.trail.clear();
+            self.set_suggestions(Vec::new());
+            self.redraw();
+            let ch = popup.chars[popup.selected];
+            crate::kprintln!("  keyboard    : long press '{ch}'");
+            return Release::Key(Action::Char(ch));
+        }
         let layout = self.swipe_layout();
         let key_w = layout.key_width();
         let (first, last) = (stroke.points[0], stroke.points[stroke.points.len() - 1]);
@@ -504,6 +568,111 @@ impl Keyboard {
         layout
     }
 
+    /// Держат ли палец на клавиатуре: пока держат, стол будит кадры — иначе
+    /// долгое нажатие и автоповтор ⌫ ждали бы следующего события пальца.
+    #[must_use]
+    pub const fn holding(&self) -> bool {
+        self.stroke.is_some() || self.repeat.is_some()
+    }
+
+    /// Шаг времени перед кадром: открыть варианты задержанной буквы, стереть
+    /// следующий знак удерживаемым ⌫.
+    pub fn tick(&mut self, now_ms: u64) {
+        if let Some(due) = self.repeat {
+            if now_ms >= due {
+                crate::input::post(crate::input::KeyCode::Backspace, true);
+                crate::input::post(crate::input::KeyCode::Backspace, false);
+                self.repeat = Some(now_ms + REPEAT_MS);
+            }
+        }
+        let Some(stroke) = self.stroke.as_ref() else {
+            return;
+        };
+        if stroke.popup.is_some() || now_ms.saturating_sub(stroke.at) < LONG_MS {
+            return;
+        }
+        let Some(key) = self.keys.get(stroke.key).copied() else {
+            return;
+        };
+        // Сдвинутый палец — начало жеста, а не долгое нажатие.
+        let moved: i32 = stroke.points.windows(2).map(|p| (p[0].x - p[1].x).abs() + (p[0].y - p[1].y).abs()).sum();
+        if moved > key.rect.w as i32 / 2 {
+            return;
+        }
+        let chars = self.alternates(&key);
+        if chars.len() < 2 {
+            return;
+        }
+        let ctx = Ctx::scaled(self.scale);
+        let cell = ctx.px(ALT_CELL);
+        let pad = ctx.px(4);
+        let w = cell * chars.len() as u32 + pad * 2;
+        let h = ctx.px(ALT_H);
+        let x = (key.rect.x + key.rect.w as i32 / 2 - (cell / 2 + pad) as i32)
+            .clamp(0, self.surface.width().saturating_sub(w) as i32);
+        let y = (key.rect.y - h as i32 - ctx.px(4) as i32).max(0);
+        crate::kprintln!("  keyboard    : alternates {:?}", chars);
+        // Первый вариант — сама буква, выбран второй: ради него и держали.
+        let popup = Popup { rect: Rect::new(x, y, w, h), chars, selected: 1 };
+        self.trail.clear();
+        if let Some(index) = self.pressed.take() {
+            self.redraw_key(index);
+        }
+        if let Some(stroke) = self.stroke.as_mut() {
+            stroke.popup = Some(popup);
+        }
+        self.draw_popup();
+    }
+
+    /// Варианты буквы: она сама, особая буква её клавиши и цифра из угла.
+    fn alternates(&self, key: &Key) -> Vec<char> {
+        let Some(letter) = key.letter else {
+            return Vec::new();
+        };
+        let upper = self.shift;
+        let case = |c: char| if upper { c.to_uppercase().next().unwrap_or(c) } else { c };
+        let mut chars = alloc::vec![case(letter)];
+        match letter {
+            'е' => chars.push(case('ё')),
+            'ь' => chars.push(case('ъ')),
+            _ => {}
+        }
+        if let Some(digit) = key.digit {
+            chars.push(digit);
+        }
+        chars
+    }
+
+    /// Нарисовать строку вариантов поверх клавиш.
+    fn draw_popup(&mut self) {
+        let Some(popup) = self.stroke.as_ref().and_then(|s| s.popup.as_ref()) else {
+            return;
+        };
+        let (rect, chars, selected) = (popup.rect, popup.chars.clone(), popup.selected);
+        let ctx = Ctx::scaled(self.scale).on(bg());
+        let p = ctx.palette;
+        let radius = ctx.px(14);
+        draw::rounded(&mut self.surface, rect, radius, ctx.under, 255);
+        draw::rounded(&mut self.surface, rect, radius, p.btn.color, p.btn.alpha);
+        draw::rounded_stroke(&mut self.surface, rect, radius, p.accline.color, p.accline.alpha);
+        let cell = ctx.px(ALT_CELL);
+        let pad = ctx.px(4);
+        let mut buf = [0u8; 4];
+        for (index, ch) in chars.iter().enumerate() {
+            let slot = Rect::new(rect.x + (pad + cell * index as u32) as i32, rect.y + pad as i32, cell, rect.h - pad * 2);
+            let ink = if index == selected {
+                draw::rounded_gradient(&mut self.surface, slot, ctx.px(10), p.acc, p.acc2, 255);
+                Color::rgb(0xFF, 0xFF, 0xFF)
+            } else {
+                p.ink
+            };
+            let label = ch.encode_utf8(&mut buf);
+            let w = ctx.face(Role::Strong).width(label);
+            paint::text(ctx, &mut self.surface, Role::Strong, slot.x + (slot.w as i32 - w as i32) / 2, paint::baseline(ctx, Role::Strong, slot), label, ink);
+        }
+        self.damage = self.damage.union(&rect);
+    }
+
     // -----------------------------------------------------------------------
     // След пальца
     // -----------------------------------------------------------------------
@@ -592,6 +761,7 @@ impl Keyboard {
                     label: word,
                     upper: word,
                     letter: None,
+                    digit: None,
                 });
                 x += (w + ctx.px(7)) as i32;
             }
@@ -602,6 +772,7 @@ impl Keyboard {
                 label: "Tab",
                 upper: "Tab",
                 letter: None,
+            digit: None,
             });
         } else {
             // Подсказки: три равные ячейки, лучшая посередине (эскиз, кадр 1).
@@ -618,6 +789,7 @@ impl Keyboard {
                     label: word,
                     upper: word,
                     letter: None,
+                    digit: None,
                 });
             }
         }
@@ -636,14 +808,14 @@ impl Keyboard {
         };
 
         // Ряд 1 — во всю ширину.
-        push_row(&mut keys, rows[0], side, y, inner, key_h, gap, letters);
+        push_row(&mut keys, rows[0], side, y, inner, key_h, gap, letters, letters);
         y += (key_h + ctx.px(ROW_GAP)) as i32;
 
         // Ряд 2 — с полями по 16, как в макете: так клавиши второго ряда стоят
         // между клавишами первого, а не под ними. В русской раскладке во втором
         // ряду одиннадцать клавиш, как и в первом, и полей нет.
         let indent = if rows[1].0.chars().count() < rows[0].0.chars().count() { ctx.px(16) } else { 0 };
-        push_row(&mut keys, rows[1], side + indent as i32, y, inner.saturating_sub(indent * 2), key_h, gap, letters);
+        push_row(&mut keys, rows[1], side + indent as i32, y, inner.saturating_sub(indent * 2), key_h, gap, letters, false);
         y += (key_h + ctx.px(ROW_GAP)) as i32;
 
         // Ряд 3 — ⇧ и ⌫ по краям, по 44.
@@ -655,9 +827,10 @@ impl Keyboard {
             label: "",
             upper: "",
             letter: None,
+            digit: None,
         });
         let middle_w = inner.saturating_sub((wide + gap) * 2);
-        push_row(&mut keys, rows[2], side + (wide + gap) as i32, y, middle_w, key_h, gap, letters);
+        push_row(&mut keys, rows[2], side + (wide + gap) as i32, y, middle_w, key_h, gap, letters, false);
         keys.push(Key {
             rect: Rect::new(side + (inner - wide) as i32, y, wide, key_h),
             action: Action::Backspace,
@@ -665,6 +838,7 @@ impl Keyboard {
             label: "",
             upper: "",
             letter: None,
+            digit: None,
         });
         y += (key_h + ctx.px(ROW_GAP)) as i32;
 
@@ -678,7 +852,7 @@ impl Keyboard {
         let space_w = inner.saturating_sub(fixed_w);
         let mut x = side;
         for (w, action, look, label) in fixed {
-            keys.push(Key { rect: Rect::new(x, y, w, key_h), action, look, label, upper: label, letter: None });
+            keys.push(Key { rect: Rect::new(x, y, w, key_h), action, look, label, upper: label, letter: None, digit: None });
             x += (w + gap) as i32;
         }
         let name = match self.lang {
@@ -692,10 +866,11 @@ impl Keyboard {
             label: name,
             upper: name,
             letter: None,
+            digit: None,
         });
         x += (space_w + gap) as i32;
         for (w, action, look, label) in tail {
-            keys.push(Key { rect: Rect::new(x, y, w, key_h), action, look, label, upper: label, letter: None });
+            keys.push(Key { rect: Rect::new(x, y, w, key_h), action, look, label, upper: label, letter: None, digit: None });
             x += (w + gap) as i32;
         }
 
@@ -836,6 +1011,22 @@ impl Keyboard {
             label,
             ink,
         );
+        // Цифра в углу — подсказка, что у клавиши есть долгое нажатие.
+        if let Some(digit) = key.digit {
+            let mut buf = [0u8; 4];
+            let text = digit.encode_utf8(&mut buf);
+            let small = ctx.face(Role::MonoSmall);
+            let dw = small.width(text) as i32;
+            paint::text(
+                ctx,
+                &mut self.surface,
+                Role::MonoSmall,
+                key.rect.right() - dw - ctx.px(4) as i32,
+                key.rect.y + ctx.px(1) as i32,
+                text,
+                p.ink4,
+            );
+        }
     }
 }
 
@@ -851,6 +1042,7 @@ fn push_row(
     height: u32,
     gap: u32,
     letters: bool,
+    digits: bool,
 ) {
     let (lower, upper) = row;
     let count = lower.chars().count() as u32;
@@ -875,6 +1067,7 @@ fn push_row(
             label: &lower[at..at + ch.len_utf8()],
             upper: &upper[up_at..up_at + up.len_utf8()],
             letter: letters.then_some(ch),
+            digit: if digits { "1234567890".chars().nth(index) } else { None },
         });
     }
 }

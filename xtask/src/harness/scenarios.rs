@@ -964,6 +964,45 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Point(613, 1509)),
             Step::Click,
             Step::Await("hello привет", 15_000),
+            // Долгое нажатие: над «е» встают «е ё 5», палец доводят до «5».
+            // Ячейка варианта — 68 точек, первая стоит над самой клавишей.
+            Step::Aim(Aim::Point(300, 1240)),
+            Step::Press,
+            Step::Wait(1200),
+            Step::Await("keyboard    : alternates ['е', 'ё', '5']", 15_000),
+            Step::Aim(Aim::Point(436, 1240)),
+            Step::Wait(300),
+            Step::Shot("02e-long-press"),
+            Step::Release,
+            Step::Await("keyboard    : long press '5'", 15_000),
+            // «ь» держат и отпускают на месте — выбран второй вариант, «ъ».
+            Step::Aim(Aim::Point(455, 1420)),
+            Step::Press,
+            Step::Wait(1200),
+            Step::Await("keyboard    : alternates ['ь', 'ъ']", 15_000),
+            Step::Release,
+            Step::Await("keyboard    : long press 'ъ'", 15_000),
+            // ⌫ сразу после слова жестом стирает слово целиком.
+            Step::Aim(Aim::Point(300, 1330)),
+            Step::Press,
+            Step::Aim(Aim::Point(358, 1330)),
+            Step::Aim(Aim::Point(357, 1420)),
+            Step::Aim(Aim::Point(184, 1330)),
+            Step::Aim(Aim::Point(300, 1240)),
+            Step::Aim(Aim::Point(406, 1420)),
+            Step::Release,
+            Step::Await("keyboard    : swipe of ", 15_000),
+            Step::Aim(Aim::Point(632, 1420)),
+            Step::Click,
+            Step::Await("keyboard    : erased the swiped word", 15_000),
+            // Удержание ⌫ стирает «5ъ» автоповтором. Проверить стёртое по
+            // журналу нельзя — эхо набранного уже в нём; видно по снимку.
+            Step::Aim(Aim::Point(632, 1420)),
+            Step::Press,
+            Step::Wait(1500),
+            Step::Release,
+            Step::Wait(500),
+            Step::Shot("02f-erased"),
             // Быстрая команда латиницей в русской раскладке: стол посылает
             // Alt+Shift до и после, и оболочка получает `free`, а не `акуу`.
             Step::Aim(Aim::Point(300, 1133)),

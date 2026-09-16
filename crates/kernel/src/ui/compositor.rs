@@ -1950,8 +1950,9 @@ impl Compositor {
         if let Some(keyboard) = self.keyboard.as_mut() {
             keyboard.sync_lang();
             let now = crate::time::uptime_ms();
+            keyboard.tick(now);
             trail_damage = keyboard.advance_trail(now);
-            trail = keyboard.trail_visible();
+            trail = keyboard.trail_visible() || keyboard.holding();
         }
         self.mark(trail_damage);
         super::set_animating(self.flight.is_some() || trail);

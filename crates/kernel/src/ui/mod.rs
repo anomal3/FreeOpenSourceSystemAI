@@ -1475,6 +1475,12 @@ fn type_on_screen(desktop: &mut Compositor, action: keyboard::Action) {
                 kprintln!("  keyboard    : replaced '{old}' with '{new}'");
             }
         }
+        keyboard::Action::EraseWord(count) => {
+            for _ in 0..count {
+                tap(KeyCode::Backspace);
+            }
+            kprintln!("  keyboard    : erased the swiped word");
+        }
         // Состояние самой клавиатуры — уже учтено в `Keyboard::press`.
         keyboard::Action::Shift | keyboard::Action::Page => {}
     }
