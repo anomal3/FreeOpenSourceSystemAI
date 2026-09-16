@@ -30,6 +30,18 @@
 //! был решён вопрос с I²C, и там это сэкономило несколько заходов к аппарату.
 
 use core::ptr;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Что `STATUS0` показывал перед запуском последней передачи и сколько опросов
+/// она заняла — для строки поиска кристалла (см. [`last_transfer`]).
+static LAST_STALE: AtomicU32 = AtomicU32::new(0);
+static LAST_SPINS: AtomicU32 = AtomicU32::new(0);
+
+/// Состояние перед запуском и число опросов у последней передачи.
+#[must_use]
+pub fn last_transfer() -> (u32, u32) {
+    (LAST_STALE.load(Ordering::Relaxed), LAST_SPINS.load(Ordering::Relaxed))
+}
 
 /// Смещения регистров. У SPI они одни для всего семейства — расходятся не
 /// адреса, а смысл двух из них (см. [`Timing`]).
@@ -77,8 +89,18 @@ const STATUS0_DONE: u32 = 1 << 0;
 /// Сколько байт помещается в FIFO в каждую сторону.
 pub const FIFO: usize = 32;
 
-/// Сколько раз опросить состояние, прежде чем счесть передачу зависшей.
-const POLL_LIMIT: u32 = 200_000;
+/// Сколько ждать завершения передачи, прежде чем счесть её зависшей.
+///
+/// # Время, а не число опросов
+///
+/// Здесь стояло `200_000` опросов, и в неоптимизированной сборке это были
+/// десятки миллисекунд. С `opt-level=2` опрос стал во много раз дешевле, предел
+/// сжался до долей миллисекунды, и кристалл, ещё не проснувшийся после сброса,
+/// в него не укладывался: на аппарате две первые передачи упёрлись ровно в
+/// `200000 polls`, третья прошла за 352. В соседней загрузке не уложилась ни
+/// одна — тачскрина «не было», стол не поднялся. Предел, заданный числом
+/// проходов цикла, означает скорость компилятора, а не устройства.
+const TIMEOUT_NS: u64 = 50_000_000;
 
 /// Половина периода такта в единицах, которые считает контроллер.
 ///
@@ -210,20 +232,35 @@ impl Bus {
                 offset += 4;
             }
 
+            // Признак «закончено» у вендора снимается **чтением**
+            // (`mtk_spi_interrupt` читает `SPI_STATUS0_REG`); запись оставлена
+            // тоже. Чтение попало сюда догадкой «признак прошлой передачи висит,
+            // и быстрый опрос забирает пустой приёмник» — и замер её опроверг:
+            // перед запуском здесь `0x0`. Настоящей причиной был предел
+            // ожидания (см. [`TIMEOUT_NS`]). Значение остаётся в
+            // [`last_transfer`]: догадка дешевле, когда её можно проверить.
             self.write(STATUS0, STATUS0_DONE);
+            LAST_STALE.store(self.read(STATUS0), Ordering::Relaxed);
             let command = self.read(CMD);
             self.write(CMD, command | CMD_ACT);
 
+            let started = crate::time::uptime_ns();
             let mut spins = 0u32;
             while self.read(STATUS0) & STATUS0_DONE == 0 {
-                spins += 1;
-                if spins >= POLL_LIMIT {
+                spins = spins.saturating_add(1);
+                // Часы спрашиваются не на каждом проходе: передача обычно
+                // занимает сотни опросов, и часы на каждом стоили бы дороже её.
+                if spins & 0xff == 0
+                    && crate::time::uptime_ns().wrapping_sub(started) >= TIMEOUT_NS
+                {
+                    LAST_SPINS.store(spins, Ordering::Relaxed);
                     self.write(CMD, CMD_RST);
                     return None;
                 }
                 core::hint::spin_loop();
             }
 
+            LAST_SPINS.store(spins, Ordering::Relaxed);
             let mut offset = 0;
             while offset < rx.len() {
                 let word = self.read(RX_DATA);

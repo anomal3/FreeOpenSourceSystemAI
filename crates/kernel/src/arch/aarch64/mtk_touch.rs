@@ -528,11 +528,14 @@ unsafe fn probe_spi(fdt: &Fdt<'_>) {
             let mut answer = [0u8; 8];
             // SAFETY: см. выше.
             let _ = unsafe { bus.transfer(&request, &mut answer) };
+            let (stale, spins) = mtk_spi::last_transfer();
 
             crate::kprintln!(
                 "  touch       : pad {pad} mode {mode} id {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
                 answer[2], answer[3], answer[4], answer[5], answer[6], answer[7]
             );
+            // Отдельной строкой: `oem log` режет строку на 64 байтах.
+            crate::kprintln!("  touch       :   status before {stale:#x}, {spins} polls");
             // Кристалл считается найденным, только если назвал **себя**.
             //
             // Прежний признак — «хоть один байт не ноль и не единицы» — слишком

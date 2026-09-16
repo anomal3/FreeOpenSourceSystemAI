@@ -300,8 +300,15 @@ pub fn build_kernel(expected_load: u64) -> Result<PathBuf> {
     // Путь к сценарию обязан быть в родной для компоновщика записи: lld не
     // находит файл по пути вида `/e/...`, который подставляет оболочка git
     // bash, и жалуется при этом на отсутствующий сценарий, а не на путь.
+    //
+    // `opt-level=2` — потому что всё, что человек видит на телефоне, это
+    // попиксельные циклы стола, а без оптимизации каждый из них — вызов на
+    // точку. Проверки переполнения и `debug_assert` подаются явно: без них
+    // `rustc` при оптимизации выключает их сам, а меняться должна скорость, а
+    // не то, что проверяется (тот же довод, что у btrfs в `Cargo.toml`).
     let flags = format!(
-        "-C link-arg=-T{} -C link-arg=--no-dynamic-linker -C relocation-model=static",
+        "-C link-arg=-T{} -C link-arg=--no-dynamic-linker -C relocation-model=static \
+         -C opt-level=2 -C debug-assertions=on -C overflow-checks=on",
         script.display()
     );
     cmd.env("RUSTFLAGS", flags);
