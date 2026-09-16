@@ -722,6 +722,23 @@ pub fn note_partial_frame(rects: u64) {
     PART_RECTS.fetch_add(rects, Ordering::Relaxed);
 }
 
+/// Площадь одного куска изменений — чтобы отличать «много мелких» от
+/// «несколько во весь экран». Сумма точек уже есть, но она считается по
+/// полосам, а полоса всегда во всю ширину экрана: по ней не видно, был ли сам
+/// прямоугольник узким.
+static RECT_POINTS: AtomicU64 = AtomicU64::new(0);
+
+/// Записать площадь куска изменений.
+pub fn note_rect(points: u64) {
+    RECT_POINTS.fetch_add(points, Ordering::Relaxed);
+}
+
+/// Сколько точек всего пришлось на куски изменений.
+#[must_use]
+pub fn rect_points() -> u64 {
+    RECT_POINTS.load(Ordering::Relaxed)
+}
+
 /// Учёт изменённого переполнился — дальше только полная перерисовка.
 pub fn note_overflow() {
     OVERFLOWS.fetch_add(1, Ordering::Relaxed);
@@ -1377,9 +1394,15 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 }
             }
             Hit::Title => {
-                desktop.set_drag(app);
-                if let Some(app) = app {
-                    kprintln!("  desktop     : drag '{}'", name_of(desktop, app));
+                // Захват заголовка на телефоне не начинается вовсе: тащить
+                // окно во весь экран некуда (см. [`Compositor::drag_by`]).
+                // Проверка здесь, а не только там, чтобы в журнале не стояло
+                // «drag», за которым ничего не происходит.
+                if !theme::is_mobile() {
+                    desktop.set_drag(app);
+                    if let Some(app) = app {
+                        kprintln!("  desktop     : drag '{}'", name_of(desktop, app));
+                    }
                 }
             }
             // Щелчок по содержимому: его разбирает само содержимое — в
