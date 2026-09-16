@@ -65,6 +65,9 @@ const STATUS_PERIOD_MS: u64 = 500;
 /// десять раз в секунду вместо ста.
 const POLL_PERIOD_MS: u64 = 100;
 
+/// Шаг цикла, пока на столе идёт анимация: около шестидесяти кадров в секунду.
+const FRAME_PERIOD_MS: u64 = 16;
+
 /// Сколько байт файла показывает `cat`.
 ///
 /// Предел не косметический: файл на носителе может быть любого размера, а окно
@@ -256,7 +259,10 @@ pub fn task() {
         let seen = input::sequence();
 
         let now = time::uptime_ms();
-        if now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
+        // Пока идёт анимация, стол собирает кадр на каждом витке: полёт окна
+        // живёт по часам, а не по событиям, и без этого кадров между двумя
+        // касаниями не было бы вовсе.
+        if ui::animating() || now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
             status_at = now;
             update_status();
         }
@@ -368,7 +374,10 @@ pub fn task() {
         //
         // Срок сна — до ближайшего обновления окна состояния: часы в нём должны
         // идти и тогда, когда никто ничего не набирает.
-        let deadline = irq::ticks() + POLL_PERIOD_MS * u64::from(irq::TIMER_HZ) / 1000;
+        // Во время анимации — кадр в шестнадцать миллисекунд, иначе прежний
+        // опрос: будить стол чаще без дела значит отнимать процессор у всех.
+        let period = if ui::animating() { FRAME_PERIOD_MS } else { POLL_PERIOD_MS };
+        let deadline = irq::ticks() + period * u64::from(irq::TIMER_HZ) / 1000;
         sched::block_on_input(deadline, || input::sequence() != seen);
     }
 }
@@ -1469,7 +1478,10 @@ fn foreground(id: sched::TaskId) {
         let seen = input::sequence();
 
         let now = time::uptime_ms();
-        if now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
+        // Пока идёт анимация, стол собирает кадр на каждом витке: полёт окна
+        // живёт по часам, а не по событиям, и без этого кадров между двумя
+        // касаниями не было бы вовсе.
+        if ui::animating() || now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
             status_at = now;
             update_status();
         }
@@ -1531,7 +1543,10 @@ fn foreground(id: sched::TaskId) {
         // не перевходим, то есть это была бы не задержка, а вечное зависание с
         // запрещёнными прерываниями. Цена отказа — до `POLL_PERIOD_MS`
         // задержки перед возвратом приглашения, и она незаметна.
-        let deadline = irq::ticks() + POLL_PERIOD_MS * u64::from(irq::TIMER_HZ) / 1000;
+        // Во время анимации — кадр в шестнадцать миллисекунд, иначе прежний
+        // опрос: будить стол чаще без дела значит отнимать процессор у всех.
+        let period = if ui::animating() { FRAME_PERIOD_MS } else { POLL_PERIOD_MS };
+        let deadline = irq::ticks() + period * u64::from(irq::TIMER_HZ) / 1000;
         sched::block_on_input(deadline, || input::sequence() != seen);
     }
 

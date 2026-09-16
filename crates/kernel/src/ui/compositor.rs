@@ -53,6 +53,7 @@ use super::context::{Action, ContextMenu, Reply};
 use super::icons::{Icons, Kind};
 use super::panel::{Menu, Panel, PanelHit, Status};
 use super::pointer::Pointer;
+use super::flight::Flight;
 use super::keyboard::{self, Keyboard};
 use super::shade::Shade;
 use mini_ui::theme;
@@ -103,6 +104,8 @@ pub struct Compositor {
     /// Экранная клавиатура телефона — слой над окнами, под шторкой (см.
     /// [`super::keyboard`]).
     keyboard: Option<Keyboard>,
+    /// Окно, летящее в стопку или из неё (см. [`super::flight`]).
+    flight: Option<Flight>,
     /// Окно, которое сейчас тащат за заголовок.
     ///
     /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
@@ -198,6 +201,7 @@ impl Compositor {
             context: ContextMenu::new(scale.min(2)),
             shade: None,
             keyboard: None,
+            flight: None,
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
@@ -706,6 +710,7 @@ impl Compositor {
         window.minimized = true;
         let rect = window.rect;
         self.mark_layer(rect);
+        self.start_flight(app, rect, false);
         // Фокус переезжает на **верхнее из оставшихся видимых**. Прежде здесь
         // стоял `focus_next`, а тот поднимает нулевое окно, не спрашивая, не
         // свёрнуто ли оно: свернув последнее видимое, система делала активным
@@ -734,11 +739,19 @@ impl Compositor {
         if !window.minimized {
             return false;
         }
-        window.minimized = false;
         // Поверхность цела, но экран под окном за это время перерисовали —
         // значит показать надо всё окно целиком, а не то, что в нём изменилось.
         window.damage = Rect::new(0, 0, window.rect.w, window.rect.h);
         let rect = window.rect;
+        // Окно возвращается полётом из стопки. Свёрнутым оно остаётся до конца
+        // полёта: иначе на экране было бы сразу два окна — готовое на месте и
+        // летящее к нему.
+        if self.start_flight(app, rect, true) {
+            return true;
+        }
+        if let Some(window) = self.windows.get_mut(index) {
+            window.minimized = false;
+        }
         // Вернувшееся окно приносит с собой и тень: без неё вокруг него
         // осталась бы светлая рамка от того, что лежало здесь, пока оно было
         // свёрнуто.
@@ -889,6 +902,73 @@ impl Compositor {
             rect.w + halo * 2,
             rect.h + halo * 2,
         ));
+    }
+
+    /// Начать полёт окна. `false` — анимации не будет, и окно надо показать
+    /// или спрятать сразу.
+    ///
+    /// Полёт один: второе сворачивание, пришедшее во время первого, сначала
+    /// доводит первое до конца — два окна, летящие в одну стопку, человек не
+    /// разглядит, а держать список ради этого незачем.
+    fn start_flight(&mut self, app: App, rect: Rect, restore: bool) -> bool {
+        self.finish_flight();
+        if self.panel.is_none() {
+            return false;
+        }
+        self.flight = Some(Flight::new(app, rect, restore, crate::time::uptime_ns()));
+        super::set_animating(true);
+        true
+    }
+
+    /// Куда летит окно: стопка в доке телефона, кнопка окна на панели задач.
+    fn flight_target(&self, app: App) -> Rect {
+        let fallback = Rect::new(self.screen.width() as i32 / 2, self.screen.height() as i32, 1, 1);
+        self.panel.as_ref().and_then(|panel| panel.anchor(app)).unwrap_or(fallback)
+    }
+
+    /// Шаг полёта перед кадром: пометить, что стёрто и что нарисовано.
+    fn advance_flight(&mut self) {
+        let now = crate::time::uptime_ns();
+        let Some(flight) = self.flight.as_ref() else {
+            return;
+        };
+        let to = self.flight_target(flight.app);
+        let current = flight.bounds(to, flight.phase(now));
+        let last = flight.last;
+        let done = flight.done(now);
+        self.mark(last.union(&current));
+        if let Some(flight) = self.flight.as_mut() {
+            flight.last = current;
+            flight.frames += 1;
+        }
+        if done {
+            self.finish_flight();
+        }
+    }
+
+    /// Довести полёт до конца: развернувшееся окно — на место.
+    fn finish_flight(&mut self) {
+        let Some(flight) = self.flight.take() else {
+            return;
+        };
+        super::set_animating(false);
+        self.mark(flight.last);
+        crate::kprintln!(
+            "  desktop     : {} flight of '{}': {} frames in {} ms",
+            if flight.restore { "restore" } else { "minimize" },
+            flight.app.title(),
+            flight.frames,
+            flight.elapsed_ms(crate::time::uptime_ns()),
+        );
+        if flight.restore {
+            if let Some(index) = self.index_of(flight.app) {
+                if let Some(window) = self.windows.get_mut(index) {
+                    window.minimized = false;
+                }
+                self.mark_layer(flight.from);
+                self.refresh_decorations();
+            }
+        }
     }
 
     /// Видна ли экранная клавиатура.
@@ -1416,6 +1496,7 @@ impl Compositor {
             return;
         }
         self.apply_pending_size();
+        self.advance_flight();
         if let Some(shown) = self.sync_keyboard() {
             crate::kprintln!("  keyboard    : {}", if shown { "shown" } else { "hidden" });
         }
@@ -1589,6 +1670,15 @@ impl Compositor {
                 // и одно с другим не сходится. Пока время не разведено, любое
                 // объяснение — догадка.
                 super::note_dock_ns(crate::time::uptime_ns().wrapping_sub(t0));
+            }
+        }
+        // Летящее окно — над доком: оно садится в стопку, и стопка не должна
+        // его перекрывать.
+        if let Some(flight) = self.flight.as_ref() {
+            if let Some(window) = self.windows.iter().find(|window| window.app == flight.app) {
+                let to = self.flight_target(flight.app);
+                let t = flight.phase(crate::time::uptime_ns());
+                flight.draw(back, window.surface(), to, t, band, dy);
             }
         }
         if let Some(menu) = self.menu.as_ref() {

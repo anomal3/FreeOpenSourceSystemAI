@@ -50,6 +50,7 @@ pub mod panel;
 pub mod pointer;
 pub mod prefs;
 pub mod settings;
+pub mod flight;
 pub mod keyboard;
 pub mod shade;
 pub mod statusbar;
@@ -846,6 +847,23 @@ pub fn exact_moves() -> bool {
 /// Выбрать учёт переезда (`oem ui move 0|1`).
 pub fn set_exact_moves(on: bool) {
     EXACT_MOVES.store(on, Ordering::Relaxed);
+}
+
+/// Идёт ли анимация — оболочке надо будить стол чаще (см. `shell::task`).
+///
+/// Атомиком, а не вопросом к столу: спрашивают на каждом витке цикла ввода,
+/// а стол в этот миг может быть вынут из-под замка другой задачей.
+static ANIMATING: AtomicBool = AtomicBool::new(false);
+
+/// Идёт ли анимация прямо сейчас.
+#[must_use]
+pub fn animating() -> bool {
+    ANIMATING.load(Ordering::Relaxed)
+}
+
+/// Отметить, идёт ли анимация. Зовёт композитор после каждого кадра.
+pub fn set_animating(on: bool) {
+    ANIMATING.store(on, Ordering::Relaxed);
 }
 
 /// Обнулить все счётчики кадров (`oem ui reset`).

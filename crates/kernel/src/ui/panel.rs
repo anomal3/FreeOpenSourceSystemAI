@@ -611,6 +611,26 @@ impl Panel {
         );
     }
 
+    /// Куда сворачивается окно этой программы — в координатах экрана.
+    ///
+    /// На телефоне это стопка (а пока её нет — «Пуск»), на столе — кнопка окна
+    /// на панели задач. `None` — кнопки у окна нет (не поместилась).
+    #[must_use]
+    pub fn anchor(&self, app: App) -> Option<Rect> {
+        let local = if let Some(dock) = self.dock {
+            if !dock.stack.is_empty() {
+                dock.stack
+            } else if !dock.brand.is_empty() {
+                dock.brand
+            } else {
+                dock.brand_square
+            }
+        } else {
+            self.buttons.iter().find(|(owner, _)| *owner == app).map(|(_, rect)| *rect)?
+        };
+        Some(local.translate(self.rect.x, self.rect.y))
+    }
+
     /// Забыть, что было нарисовано: следующий [`Panel::redraw`] нарисует заново.
     ///
     /// Нужен там, где меняются цвета, а не содержимое: тема, акцент, обои. Ни

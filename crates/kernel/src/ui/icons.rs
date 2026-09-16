@@ -409,13 +409,32 @@ impl Icons {
             if visible.is_empty() {
                 return;
             }
-            let src = Rect::new(
-                visible.x - self.face_at.x,
-                visible.y - self.face_at.y,
-                visible.w,
-                visible.h,
-            );
-            back.blit_from(face, (visible.x, visible.y + dy), src);
+            // Точки цвета подложки не копируются: подложка — это средний цвет
+            // обоев, а обои — переход с точками, и скопированная целиком
+            // картинка ложилась на стол тёмным прямоугольником (видно на
+            // телефоне, снимок стенда `mobile`). Сглаженные края плиток сведены
+            // с тем же средним цветом, и отличие от настоящего фона под ними —
+            // доли процента яркости, глазом не различимые.
+            let key = self.ctx().under.pixel();
+            let from_x = (visible.x - self.face_at.x) as usize;
+            let width = visible.w as usize;
+            let screen_x = visible.x.max(0) as usize;
+            for row in 0..visible.h {
+                let src_y = (visible.y - self.face_at.y) as u32 + row;
+                let dst_y = (visible.y + dy) as u32 + row;
+                let source = face.row(src_y);
+                let target = back.row_mut(dst_y);
+                let (Some(source), Some(target)) =
+                    (source.get(from_x..from_x + width), target.get_mut(screen_x..screen_x + width))
+                else {
+                    continue;
+                };
+                for (dst, src) in target.iter_mut().zip(source) {
+                    if *src != key {
+                        *dst = *src;
+                    }
+                }
+            }
             return;
         }
         for index in 0..self.items.len() {
