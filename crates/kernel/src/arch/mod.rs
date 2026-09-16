@@ -38,6 +38,18 @@ pub use aarch64::{
     report_boot_devices, serial_fallback, spawn_input_services, wait_for_interrupt,
 };
 
+/// Умеет ли машина выключиться сама — см. `power::can_power_off`.
+#[cfg(target_arch = "aarch64")]
+#[must_use]
+pub fn can_power_off() -> bool {
+    !aarch64::mtk::present()
+}
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub const fn can_power_off() -> bool {
+    true
+}
+
 /// Вход по договору Linux: дерево устройств в `x0`, MMU выключен.
 ///
 /// Существует только в сборке для телефона — там, где ядро запускает чужой

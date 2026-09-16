@@ -47,6 +47,7 @@ pub mod context;
 pub mod dialog;
 pub mod icons;
 pub mod panel;
+pub mod powersheet;
 pub mod pointer;
 pub mod prefs;
 pub mod settings;
@@ -1523,13 +1524,41 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             }
             Some(start::Hit::Power) => {
                 desktop.close_start();
-                launch(desktop, App::Shutdown);
+                // Телефону — лист над доком (макет, экран 08), столу — окно.
+                if theme::is_mobile() && desktop.open_power() {
+                    kprintln!("  desktop     : power sheet opened");
+                } else {
+                    launch(desktop, App::Shutdown);
+                }
             }
             Some(start::Hit::Inside) => {}
             None => {
                 desktop.close_start();
                 kprintln!("  start       : closed");
             }
+        }
+        desktop.refresh_panel(status);
+        desktop.present();
+        return;
+    }
+
+    // 0а'. Лист питания телефона. Нажатие мимо закрывает его и дальше не идёт.
+    if desktop.power_open() {
+        let hit = desktop.power_hit(x, y);
+        if hit != Some(powersheet::Hit::Inside) {
+            desktop.close_power();
+        }
+        match hit {
+            Some(powersheet::Hit::PowerOff) => {
+                kprintln!("  desktop     : power off chosen on the sheet");
+                crate::power::request(false, crate::power::Source::Desktop);
+            }
+            Some(powersheet::Hit::Restart) => {
+                kprintln!("  desktop     : restart chosen on the sheet");
+                crate::power::request(true, crate::power::Source::Desktop);
+            }
+            Some(powersheet::Hit::Cancel) | None => kprintln!("  desktop     : power sheet closed"),
+            Some(powersheet::Hit::Inside) => return,
         }
         desktop.refresh_panel(status);
         desktop.present();
@@ -1662,7 +1691,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             }
             PanelHit::Menu => toggle_menu(desktop, status),
             PanelHit::Search => {
-                if desktop.open_start(true) {
+                            if desktop.open_start(true) {
                     kprintln!("  start       : opened for search");
                 }
             }

@@ -1099,6 +1099,20 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : close zoom of 'Settings': ", 15_000),
             Step::Wait(1000),
             Step::Shot("09-closed"),
+            // Питание (макет, экран 08): «Пуск» -> кнопка питания открывает
+            // лист над доком. Нажатие мимо закрывает его, ничего не выключая.
+            Step::Aim(Aim::Point(211, 1495)),
+            Step::Click,
+            Step::Await("start       : opened", 15_000),
+            Step::Wait(800),
+            Step::Aim(Aim::Point(632, 1320)),
+            Step::Click,
+            Step::Await("desktop     : power sheet opened", 15_000),
+            Step::Wait(1000),
+            Step::Shot("10-power"),
+            Step::Aim(Aim::Point(360, 300)),
+            Step::Click,
+            Step::Await("desktop     : power sheet closed", 15_000),
         ],
     },
     Scenario {

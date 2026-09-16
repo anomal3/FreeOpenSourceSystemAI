@@ -280,7 +280,7 @@ pub fn age_text(ms: u64) -> String {
 ///
 /// Свой, а не `widget::wrap`: тот считает знаки, а шрифт у нас
 /// пропорциональный, и строка из «ш» вдвое шире строки из «і».
-fn wrap_px(text: &str, width: u32, measure: impl Fn(&str) -> u32) -> Vec<&str> {
+pub fn wrap_px(text: &str, width: u32, measure: impl Fn(&str) -> u32) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut start = 0;
     let mut last_fit = 0;

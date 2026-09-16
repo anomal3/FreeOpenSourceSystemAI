@@ -113,6 +113,8 @@ pub struct Compositor {
     closing: Option<Window>,
     /// Лист «Свёрнутые программы» — открыт, пока `Some` (см. [`super::tray`]).
     tray: Option<Sheet>,
+    /// Лист «Выключить телефон?» — открыт, пока `Some` (см. [`super::powersheet`]).
+    power: Option<super::powersheet::Sheet>,
     /// Лист «Пуск» телефона — открыт, пока `Some` (см. [`super::start`]).
     start: Option<Start>,
     /// Что показано в карточке «Система» — по нему видно, пора ли её
@@ -246,6 +248,7 @@ impl Compositor {
             flight: None,
             closing: None,
             tray: None,
+            power: None,
             start: None,
             home: super::home::Facts::default(),
             under: None,
@@ -1361,6 +1364,40 @@ impl Compositor {
         }
     }
 
+    /// Открыт ли лист питания.
+    #[must_use]
+    pub const fn power_open(&self) -> bool {
+        self.power.is_some()
+    }
+
+    /// Открыть лист питания над доком. `false` — не хватило памяти.
+    pub fn open_power(&mut self) -> bool {
+        self.close_power();
+        let can_off = crate::power::can_power_off();
+        self.power = super::powersheet::Sheet::open(self.screen.width(), self.screen.height(), self.scale, can_off);
+        match self.power.as_ref() {
+            Some(sheet) => {
+                let rect = sheet.rect;
+                self.mark_layer(rect);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Закрыть лист питания, если открыт.
+    pub fn close_power(&mut self) {
+        if let Some(sheet) = self.power.take() {
+            self.mark_layer(sheet.rect);
+        }
+    }
+
+    /// Во что попало нажатие в лист питания. `None` — мимо листа.
+    #[must_use]
+    pub fn power_hit(&self, x: i32, y: i32) -> Option<super::powersheet::Hit> {
+        self.power.as_ref()?.hit(x, y)
+    }
+
     /// Закрыть лист свёрнутых, если открыт.
     pub fn close_tray(&mut self) {
         if let Some(sheet) = self.tray.take() {
@@ -2162,6 +2199,11 @@ impl Compositor {
             self.stack(back, sheet.surface(), sheet.rect, band, dy, r);
         }
         if let Some(sheet) = self.tray.as_ref() {
+            let r = mini_ui::paint::Ctx::scaled(self.scale).px(30);
+            self.drop_shadow(back, sheet.rect, band, dy, r);
+            self.stack(back, sheet.surface(), sheet.rect, band, dy, r);
+        }
+        if let Some(sheet) = self.power.as_ref() {
             let r = mini_ui::paint::Ctx::scaled(self.scale).px(30);
             self.drop_shadow(back, sheet.rect, band, dy, r);
             self.stack(back, sheet.surface(), sheet.rect, band, dy, r);
