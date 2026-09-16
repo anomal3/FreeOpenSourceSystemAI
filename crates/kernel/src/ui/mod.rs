@@ -659,12 +659,46 @@ pub fn pointer_state() -> Option<(i32, i32, bool)> {
 #[must_use]
 /// Во что обходятся кадры: кадры, полосы, наносекунды сборки и вывода, точки.
 ///
-/// `None` — стола нет вовсе (машина без графики). Спрашивается по кабелю
-/// (`oem ui`): пока чисел не было, «лагает» оставалось словом, к которому
-/// нечего приложить.
+/// # Почему атомики, а не поля стола
+///
+/// Потому что спрашивают об этом **тогда, когда стол занят**, и только тогда
+/// это и интересно. [`with_desktop`] стол не одалживает, а **вынимает** из-под
+/// замка на всё время работы — пока идёт разбор касания и сборка кадра, любой
+/// другой спрашивающий получает `None`. Первая версия замера жила полями
+/// композитора, и по кабелю она отвечала «стола на этой машине нет» ровно в те
+/// мгновения, ради которых её и заводили.
+///
+/// Те же грабли уже обошли числа памяти в строке состояния — см.
+/// [`memory_mib`].
+static FRAMES: AtomicU64 = AtomicU64::new(0);
+static BANDS: AtomicU64 = AtomicU64::new(0);
+static DRAW_NS: AtomicU64 = AtomicU64::new(0);
+static BLIT_NS: AtomicU64 = AtomicU64::new(0);
+static POINTS: AtomicU64 = AtomicU64::new(0);
+
+/// Записать, во что обошлась одна полоса кадра. Зовётся из композитора.
+pub fn note_band(draw_ns: u64, blit_ns: u64, points: u64) {
+    BANDS.fetch_add(1, Ordering::Relaxed);
+    DRAW_NS.fetch_add(draw_ns, Ordering::Relaxed);
+    BLIT_NS.fetch_add(blit_ns, Ordering::Relaxed);
+    POINTS.fetch_add(points, Ordering::Relaxed);
+}
+
+/// Записать, что кадр собран.
+pub fn note_frame() {
+    FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Кадры, полосы, наносекунды сборки и вывода, точки.
 #[must_use]
-pub fn timing() -> Option<(u64, u64, u64, u64, u64)> {
-    with_desktop(|desktop| desktop.timing())
+pub fn timing() -> (u64, u64, u64, u64, u64) {
+    (
+        FRAMES.load(Ordering::Relaxed),
+        BANDS.load(Ordering::Relaxed),
+        DRAW_NS.load(Ordering::Relaxed),
+        BLIT_NS.load(Ordering::Relaxed),
+        POINTS.load(Ordering::Relaxed),
+    )
 }
 
 pub fn stats() -> (u64, u64, usize) {

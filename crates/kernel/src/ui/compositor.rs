@@ -130,11 +130,6 @@ pub struct Compositor {
     damage_overflow: bool,
     frames: u64,
     rects: u64,
-    /// Во что обходятся кадры (см. [`Compositor::timing`]).
-    draw_ns: u64,
-    blit_ns: u64,
-    bands: u64,
-    points: u64,
     /// Кадр не собирать: за этим событием в очереди ввода уже лежит следующее.
     ///
     /// Изменения при этом не теряются — они копятся в прямоугольниках окон и в
@@ -198,10 +193,6 @@ impl Compositor {
             damage_overflow: true,
             frames: 0,
             rects: 0,
-            draw_ns: 0,
-            blit_ns: 0,
-            bands: 0,
-            points: 0,
             deferred: false,
         };
         compositor.panel = Panel::new(
@@ -1181,6 +1172,9 @@ impl Compositor {
             return;
         }
         self.frames += 1;
+        // И наружу, в атомик: среднее на кадр считает тот, кто спрашивает по
+        // кабелю, а стол к тому времени уже занят (см. [`super::timing`]).
+        super::note_frame();
 
         if self.damage_overflow {
             let all = self.screen.bounds();
@@ -1244,26 +1238,20 @@ impl Compositor {
                 Rect::new(band.x, 0, band.w, band.h),
             );
             let t2 = crate::time::uptime_ns();
-            self.draw_ns = self.draw_ns.wrapping_add(t1.wrapping_sub(t0));
-            self.blit_ns = self.blit_ns.wrapping_add(t2.wrapping_sub(t1));
-            self.bands = self.bands.wrapping_add(1);
-            self.points = self
-                .points
-                .wrapping_add(u64::from(band.w) * u64::from(band.h));
+            // Наружу, в атомики: спрашивают эти числа по кабелю, пока стол
+            // занят, а занятый стол вынут из-под замка целиком (см.
+            // [`super::timing`]).
+            super::note_band(
+                t1.wrapping_sub(t0),
+                t2.wrapping_sub(t1),
+                u64::from(band.w) * u64::from(band.h),
+            );
 
             top += height as i32;
         }
         self.back = back;
     }
 
-    /// Во что обошлись кадры: сборка, вывод, число полос и точек.
-    ///
-    /// Наносекунды, а не миллисекунды: кадр укладывается в единицы миллисекунд,
-    /// и округление до них показало бы нули там, где разница есть.
-    #[must_use]
-    pub const fn timing(&self) -> (u64, u64, u64, u64, u64) {
-        (self.frames, self.bands, self.draw_ns, self.blit_ns, self.points)
-    }
 
     /// Сложить все слои одной полосы в буфер.
     ///

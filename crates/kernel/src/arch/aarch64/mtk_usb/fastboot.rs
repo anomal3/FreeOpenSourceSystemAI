@@ -221,23 +221,17 @@ impl Fastboot {
             // об этом сказано там же, где `getvar`, и я на этом уже обжёгся,
             // получив два пустых ответа подряд.
             self.line_count = 0;
-            match crate::ui::timing() {
-                Some((frames, bands, draw_ns, blit_ns, points)) => {
-                    let n = frames.max(1);
-                    let text = alloc::format!(
-                        "{frames} frames, {bands} bands, {} Mpx",
-                        points / 1_000_000,
-                    );
-                    self.say(text.as_bytes());
-                    let text = alloc::format!(
-                        "per frame: draw {} us, blit {} us",
-                        draw_ns / n / 1000,
-                        blit_ns / n / 1000,
-                    );
-                    self.say(text.as_bytes());
-                }
-                None => self.say(b"no desktop on this machine"),
-            }
+            let (frames, bands, draw_ns, blit_ns, points) = crate::ui::timing();
+            let n = frames.max(1);
+            let text =
+                alloc::format!("{frames} frames, {bands} bands, {} Mpx", points / 1_000_000);
+            self.say(text.as_bytes());
+            let text = alloc::format!(
+                "per frame: draw {} us, blit {} us",
+                draw_ns / n / 1000,
+                blit_ns / n / 1000,
+            );
+            self.say(text.as_bytes());
             self.state = State::Lines { at: 0 };
             self.continue_lines(0);
         } else if text == "oem log" || text == "oem klog" {
