@@ -20,6 +20,7 @@ members = [
     "crates/osupdate",
     "crates/slots",
     "crates/ssh",
+    "crates/swipe",
     "crates/sysconf",
     "crates/tls",
     "crates/usb-hid",

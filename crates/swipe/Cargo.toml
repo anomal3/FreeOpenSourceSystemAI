@@ -1,0 +1,13 @@
+[package]
+name = "swipe"
+description = "Word gestures for the on-screen keyboard: a path across the keys becomes a word from a frequency dictionary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
