@@ -859,7 +859,16 @@ impl Compositor {
         if rect.is_empty() {
             return;
         }
-        let halo = (SHADOW_SPREAD + SHADOW_DROP) * self.scale;
+        // Ореол вокруг слоя — место под его тень: стирая слой, стереть надо и
+        // её. На телефоне тени нет (см. [`Self::drop_shadow`]), и ореол там
+        // означал бы прямоугольник на 56 точек шире нужного с каждой стороны —
+        // два таких накрывают экран целиком, учёт изменённого переполняется, и
+        // кадр перерисовывает всё.
+        let halo = if theme::is_mobile() {
+            0
+        } else {
+            (SHADOW_SPREAD + SHADOW_DROP) * self.scale
+        };
         self.mark(Rect::new(
             rect.x - halo as i32,
             rect.y - halo as i32,
@@ -1066,6 +1075,11 @@ impl Compositor {
         self.icons.restyle();
         if let Some(menu) = self.context.as_mut() {
             menu.restyle();
+        }
+        // Панель рисует себя заново только при изменившемся содержимом (см.
+        // [`Panel::redraw`]), а здесь меняются цвета — их отпечаток не видит.
+        if let Some(panel) = self.panel.as_mut() {
+            panel.forget();
         }
         self.refresh_panel(status);
         if let Some(menu) = self.menu.as_mut() {
