@@ -165,7 +165,7 @@ pub fn draw_system(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale
 
     // Строка внизу: аптайм.
     let s = facts.uptime_s;
-    let line = alloc::format!("Аптайм {}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60);
+    let line = alloc::format!("Аптайм {}:{:02}", s / 3600, (s / 60) % 60);
     let line_y = stats_y + ctx.px(STAT_H + GAP) as i32;
     paint::text_clipped(ctx, back, Role::Body, inner.x, line_y, inner.w, &line, p.ink4);
 }

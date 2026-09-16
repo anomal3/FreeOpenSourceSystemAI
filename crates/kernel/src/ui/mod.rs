@@ -548,7 +548,10 @@ fn status_now() -> Status {
         uptime_ms,
         net: net_state(),
         home: home::Facts {
-            used_mib: total_mib.saturating_sub(free_mib),
+            // С шагом в 4 МиБ: карточка входит в картинку под окнами, и память,
+            // гуляющая на мебибайт при каждой команде, пересобирала бы её на
+            // каждом наборе в терминале.
+            used_mib: total_mib.saturating_sub(free_mib) / 4 * 4,
             total_mib,
             // Планировщик и разметка слотов — под своими замками, и спросить их
             // можно только здесь, до замка стола.
@@ -557,7 +560,9 @@ fn status_now() -> Status {
                 slots::Slot::A => 'A',
                 slots::Slot::B => 'B',
             }),
-            uptime_s: uptime_ms / 1000,
+            // До минуты: карточка входит в картинку под окнами, и секунды
+            // пересобирали бы её каждую секунду.
+            uptime_s: uptime_ms / 60_000 * 60,
         },
     }
 }

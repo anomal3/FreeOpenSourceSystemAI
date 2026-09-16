@@ -113,6 +113,12 @@ pub struct Keyboard {
     keys: Vec<Key>,
     pressed: Option<usize>,
     damage: Rect,
+    /// Нарисована ли поверхность в нынешнем виде (страница, Shift).
+    ///
+    /// Показ клавиатуры не перерисовывает её, если рисовать нечего: сорок
+    /// клавиш с текстом и скруглениями стоили на телефоне худшего кадра в
+    /// 179 мс при каждом разворачивании терминала.
+    drawn: bool,
 }
 
 /// Заливка слоя, сведённая к непрозрачному цвету, — как у дока.
@@ -146,6 +152,7 @@ impl Keyboard {
             keys: Vec::new(),
             pressed: None,
             damage: Rect::EMPTY,
+            drawn: false,
         };
         keyboard.layout();
         Some(keyboard)
@@ -167,9 +174,15 @@ impl Keyboard {
             return false;
         }
         self.visible = visible;
-        self.pressed = None;
         if visible {
-            self.redraw();
+            if let Some(index) = self.pressed.take() {
+                self.redraw_key(index);
+            }
+            if self.drawn {
+                self.damage = self.surface.bounds();
+            } else {
+                self.redraw();
+            }
         }
         true
     }
@@ -374,6 +387,7 @@ impl Keyboard {
             self.draw_key(ctx, index);
         }
         self.damage = card;
+        self.drawn = true;
     }
 
     /// Перерисовать одну кнопку — нажатие и отпускание.

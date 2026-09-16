@@ -115,6 +115,22 @@ pub struct Compositor {
     /// Что показано в карточке «Система» — по нему видно, пора ли её
     /// перерисовать (см. [`Compositor::refresh_panel`]).
     home: super::home::Facts,
+    /// Готовая картинка всего, что лежит под окнами телефона: обои, строка
+    /// состояния, карточки домашнего экрана, значки.
+    ///
+    /// # Зачем
+    ///
+    /// Измерено на телефоне (`oem ui`): пока окно летело в стопку, слой под
+    /// окнами стоил 69 мс на кадр, и полёт уложился в два кадра. Каждая полоса
+    /// кадра рисовала карточки заново целиком — скругления, стекло, текст, — а
+    /// меняется эта картинка раз в минуту. Теперь она собирается один раз и
+    /// копируется в полосы, как окно.
+    under: Option<Surface>,
+    /// Годна ли [`Self::under`]. Сбрасывается там, где под окнами что-то
+    /// меняется (см. [`Self::invalidate_under`]).
+    under_valid: bool,
+    /// Текст часов, который нарисован в строке состояния.
+    status_text: alloc::string::String,
     /// Окно, которое сейчас тащат за заголовок.
     ///
     /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
@@ -162,6 +178,9 @@ pub struct Compositor {
     /// [`Self::damage`] и уходят на экран ближайшим несложенным кадром.
     deferred: bool,
 }
+
+/// Сколько раз картинка под окнами сбрасывалась — для разбора по журналу.
+static UNDER_DROPS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Сколько памяти отдаётся под полосу, в которой собирается кадр.
 ///
@@ -214,6 +233,9 @@ impl Compositor {
             tray: None,
             start: None,
             home: super::home::Facts::default(),
+            under: None,
+            under_valid: false,
+            status_text: alloc::string::String::new(),
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
@@ -604,6 +626,7 @@ impl Compositor {
 
     /// Выделить значок (или снять выделение).
     pub fn select_icon(&mut self, index: Option<usize>) {
+        self.invalidate_under();
         let damage = self.icons.select(index);
         if !damage.is_empty() {
             self.mark(damage);
@@ -616,6 +639,7 @@ impl Compositor {
     /// освобождает ячейку, которую иначе никто не стёр бы, и она осталась бы на
     /// экране до первой чужой перерисовки.
     pub fn reload_icons(&mut self) {
+        self.invalidate_under();
         let before = self.icons.bounds();
         self.icons.reload();
         let after = self.icons.bounds();
@@ -719,6 +743,9 @@ impl Compositor {
         }
         window.minimized = true;
         window.minimized_at_ms = crate::time::uptime_ms();
+        // Карточка «Последнее» под окнами перечисляет свёрнутые, но картинка
+        // сбрасывается при посадке (см. `finish_flight`): полёт идёт поверх
+        // готовой, и треть секунды карточка показывает прежний список.
         let rect = window.rect;
         self.mark_layer(rect);
         self.start_flight(app, rect, false);
@@ -763,6 +790,7 @@ impl Compositor {
         if let Some(window) = self.windows.get_mut(index) {
             window.minimized = false;
         }
+        self.invalidate_under();
         // Вернувшееся окно приносит с собой и тень: без неё вокруг него
         // осталась бы светлая рамка от того, что лежало здесь, пока оно было
         // свёрнуто.
@@ -805,6 +833,7 @@ impl Compositor {
             return false;
         };
         let window = self.windows.remove(index);
+        self.invalidate_under();
         if self.focus >= self.windows.len() {
             self.focus = self.windows.len().saturating_sub(1);
         }
@@ -869,7 +898,17 @@ impl Compositor {
         if theme::is_mobile() && self.home != status.home {
             self.home = status.home;
             let card = super::home::system_card(self.screen.width(), self.scale);
+            self.invalidate_under();
             self.mark(card);
+        }
+        if theme::is_mobile() {
+            let text = super::clock_or_uptime();
+            if text != self.status_text {
+                self.status_text = text;
+                let bar = super::statusbar::bounds(self.screen.width(), self.scale);
+                self.invalidate_under();
+                self.mark(bar);
+            }
         }
         let buttons = self.buttons();
         let menu_open = self.menu_open();
@@ -971,6 +1010,13 @@ impl Compositor {
         };
         super::set_animating(false);
         self.mark(flight.last);
+        self.invalidate_under();
+        if !flight.restore {
+            // Список «Последнего» поменялся — пересобранная картинка выйдет на
+            // экран целиком.
+            let all = self.screen.bounds();
+            self.mark(all);
+        }
         crate::kprintln!(
             "  desktop     : {} flight of '{}': {} frames in {} ms",
             if flight.restore { "restore" } else { "minimize" },
@@ -983,6 +1029,7 @@ impl Compositor {
                 if let Some(window) = self.windows.get_mut(index) {
                     window.minimized = false;
                 }
+                self.invalidate_under();
                 self.mark_layer(flight.from);
                 self.refresh_decorations();
             }
@@ -1002,6 +1049,51 @@ impl Compositor {
         let rows = super::home::recent_rows(&minimized);
         let card = super::home::recent_card(width, self.scale, self.icons.bounds().bottom());
         super::home::draw_recent(back, band, dy, card, self.scale, &rows, rows.len());
+    }
+
+    /// Картинка под окнами устарела — собрать заново к ближайшему кадру.
+    pub fn invalidate_under(&mut self) {
+        if self.under_valid {
+            UNDER_DROPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        self.under_valid = false;
+    }
+
+    /// Собрать картинку под окнами телефона, если она устарела.
+    fn rebuild_under(&mut self) {
+        if !theme::is_mobile() || self.under_valid {
+            return;
+        }
+        // Не во время полёта: сборка стоит десятки миллисекунд, и в кадре
+        // полёта она становилась рывком. Под окном — можно и нужно: тогда к
+        // сворачиванию картинка уже готова. Первая версия откладывала сборку и
+        // под окном, и на телефоне первый же полёт шёл медленным путём (27 мс
+        // на кадр, худший 177 мс).
+        if self.flight.is_some() {
+            return;
+        }
+        let (width, height) = (self.screen.width(), self.screen.height());
+        let fresh = match self.under.take() {
+            Some(surface) if surface.width() == width && surface.height() == height => Some(surface),
+            _ => Surface::new(width, height, theme::palette().wall_top),
+        };
+        let Some(mut surface) = fresh else {
+            // Памяти не хватило — рисуем в полосы, как раньше.
+            return;
+        };
+        let started = crate::time::uptime_ns();
+        let all = Rect::new(0, 0, width, height);
+        self.draw_background(&mut surface, all, 0);
+        super::statusbar::draw(&mut surface, all, 0, width, self.scale);
+        self.draw_home(&mut surface, all, 0);
+        self.icons.draw(&mut surface, all, 0);
+        self.under = Some(surface);
+        self.under_valid = true;
+        crate::kprintln!(
+            "  desktop     : under-window picture rebuilt in {} ms ({} drops so far)",
+            crate::time::uptime_ns().wrapping_sub(started) / 1_000_000,
+            UNDER_DROPS.load(core::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     /// Открыт ли «Пуск» телефона.
@@ -1232,7 +1324,12 @@ impl Compositor {
             self.work_bottom()
         };
         if let Some(index) = self.index_of(App::Terminal) {
-            if let Some(window) = self.windows.get_mut(index) {
+            if let Some(window) = self.windows.get_mut(index).filter(|window| !window.minimized) {
+                // Свёрнутый терминал размера не меняет. Иначе каждое сворачивание
+                // растягивало бы его на весь экран (клавиатура ушла), а
+                // разворачивание — ужимало обратно: две поверхности по 3,4 МБ и
+                // две перекладки сетки ровно в кадрах полёта. На телефоне это
+                // был худший кадр в 55 мс — рывок, который Роман и почувствовал.
                 let before = window.rect;
                 let height = (bottom - before.y).max(0) as u32;
                 if height != before.h && window.resize(before.w, height) {
@@ -1573,6 +1670,7 @@ impl Compositor {
     /// пересоздание стоило бы отказа выделения там, где ничего выделять не
     /// нужно.
     pub fn restyle(&mut self, status: &Status) {
+        self.invalidate_under();
         let focus = self.focus;
         for (index, window) in self.windows.iter_mut().enumerate() {
             window.restyle();
@@ -1649,6 +1747,8 @@ impl Compositor {
         // него. Видимость вернёт ближайший кадр (см. [`Self::sync_keyboard`]).
         self.keyboard = Keyboard::new(width, height, self.scale);
         self.pointer = Pointer::new(width, height);
+        self.under = None;
+        self.under_valid = false;
         self.drag = None;
         let bottom = self.work_bottom();
         self.icons.set_area(bottom);
@@ -1696,6 +1796,7 @@ impl Compositor {
             return;
         }
         self.apply_pending_size();
+        self.rebuild_under();
         // Клавиатура — до полёта: иначе на медленной машине полёт успевал
         // кончиться в том же кадре, и порядок строк журнала «клавиатура ушла» и
         // «окно долетело» зависел от скорости кадра.
@@ -1825,14 +1926,26 @@ impl Compositor {
         // рисование того, что под ними.
         let covered = self.band_covered(band);
         let t_start = crate::time::uptime_ns();
-        if !covered {
+        // Телефон: всё, что под окнами, — одним копированием из готовой картинки.
+        let cached = match self.under.as_ref() {
+            // Во время полёта — и устаревшая: пересобирать её в кадре полёта
+            // нельзя (рывок), а треть секунды прежнего списка не видно.
+            Some(under) if (self.under_valid || self.flight.is_some()) && theme::is_mobile() => {
+                if !covered {
+                    back.blit_from(under, (band.x, band.y + dy), band);
+                }
+                true
+            }
+            _ => false,
+        };
+        if !covered && !cached {
             self.draw_background(back, band, dy);
         }
         let t_wall = crate::time::uptime_ns();
         // Строка состояния — часть стола и лежит под окнами: она рисуется сразу
         // после обоев, до значков. На настольной машине не рисуется вовсе (см.
         // [`super::statusbar`]).
-        if !covered {
+        if !covered && !cached {
             super::statusbar::draw(back, band, dy, self.screen.width(), self.scale);
             if theme::is_mobile() {
                 self.draw_home(back, band, dy);
