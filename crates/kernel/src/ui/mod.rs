@@ -53,6 +53,7 @@ pub mod settings;
 pub mod flight;
 pub mod keyboard;
 pub mod shade;
+pub mod tray;
 pub mod statusbar;
 pub mod term;
 pub mod window;
@@ -1372,6 +1373,42 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
         return;
     }
 
+    // 0а''. Лист «Свёрнутые программы» — над доком. Нажатие мимо закрывает
+    // его и дальше не идёт: иначе человек, просто убирающий лист, открыл бы
+    // то, что под ним.
+    if desktop.tray_open() {
+        match desktop.tray_hit(x, y) {
+            Some(tray::Hit::Restore(app)) => {
+                desktop.close_tray();
+                launch(desktop, app);
+            }
+            Some(tray::Hit::Close(app)) => {
+                desktop.close_tray();
+                let name = name_of(desktop, app);
+                if request_close(desktop, app) {
+                    kprintln!("  desktop     : close requested of '{name}'");
+                } else if desktop.close(app) {
+                    kprintln!("  desktop     : closed '{name}'");
+                }
+                log_focus(desktop);
+            }
+            Some(tray::Hit::RestoreAll) => {
+                desktop.close_tray();
+                for app in desktop.minimized_apps() {
+                    launch(desktop, app);
+                }
+            }
+            Some(tray::Hit::Inside) => return,
+            None => {
+                desktop.close_tray();
+                kprintln!("  desktop     : minimized list closed");
+            }
+        }
+        desktop.refresh_panel(status);
+        desktop.present();
+        return;
+    }
+
     // 0а'. Экранная клавиатура: нажатие в неё — клавиша, и дальше не идёт.
     if desktop.keyboard_contains(x, y) {
         if let Some(action) = desktop.keyboard_press(x, y) {
@@ -1477,7 +1514,11 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             // Стопка свёрнутых: показать их списком. Пока список — это меню
             // запуска, где свёрнутые окна и так перечислены; отдельное окно
             // «Свёрнутые программы» из макета будет следующим шагом.
-            PanelHit::Stack => toggle_menu(desktop, status),
+            PanelHit::Stack => {
+                if desktop.toggle_tray() {
+                    kprintln!("  desktop     : minimized list opened");
+                }
+            }
             PanelHit::Missing(what) => {
                 kprintln!("  desktop     : {what} -- no program for it on this machine yet");
             }

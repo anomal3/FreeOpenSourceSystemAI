@@ -54,6 +54,7 @@ use super::icons::{Icons, Kind};
 use super::panel::{Menu, Panel, PanelHit, Status};
 use super::pointer::Pointer;
 use super::flight::Flight;
+use super::tray::{self, Sheet};
 use super::keyboard::{self, Keyboard};
 use super::shade::Shade;
 use mini_ui::theme;
@@ -106,6 +107,8 @@ pub struct Compositor {
     keyboard: Option<Keyboard>,
     /// Окно, летящее в стопку или из неё (см. [`super::flight`]).
     flight: Option<Flight>,
+    /// Лист «Свёрнутые программы» — открыт, пока `Some` (см. [`super::tray`]).
+    tray: Option<Sheet>,
     /// Окно, которое сейчас тащат за заголовок.
     ///
     /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
@@ -202,6 +205,7 @@ impl Compositor {
             shade: None,
             keyboard: None,
             flight: None,
+            tray: None,
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
@@ -708,6 +712,7 @@ impl Compositor {
             return false;
         }
         window.minimized = true;
+        window.minimized_at_ms = crate::time::uptime_ms();
         let rect = window.rect;
         self.mark_layer(rect);
         self.start_flight(app, rect, false);
@@ -969,6 +974,67 @@ impl Compositor {
                 self.refresh_decorations();
             }
         }
+    }
+
+    /// Открыт ли лист «Свёрнутые программы».
+    #[must_use]
+    pub const fn tray_open(&self) -> bool {
+        self.tray.is_some()
+    }
+
+    /// Открыть лист свёрнутых над доком — или закрыть, если открыт.
+    /// Возвращает, открыт ли он теперь.
+    pub fn toggle_tray(&mut self) -> bool {
+        if let Some(sheet) = self.tray.take() {
+            self.mark_layer(sheet.rect);
+            return false;
+        }
+        let now = crate::time::uptime_ms();
+        let mut minimized: Vec<&Window> = self.windows.iter().filter(|window| window.minimized).collect();
+        minimized.sort_by(|a, b| b.minimized_at_ms.cmp(&a.minimized_at_ms));
+        let rows: Vec<tray::Row> = minimized
+            .iter()
+            .map(|window| tray::Row {
+                app: window.app,
+                title: alloc::string::String::from(window.caption()),
+                note: match window.app {
+                    App::Terminal => alloc::string::String::from("оболочка"),
+                    App::Settings => alloc::string::String::from("параметры системы"),
+                    App::About => alloc::string::String::from("о системе"),
+                    App::Shutdown | App::Restart => alloc::string::String::from("вопрос о питании"),
+                    App::Program(task, _) => alloc::format!("задача #{task}"),
+                },
+                age: tray::age_text(now.saturating_sub(window.minimized_at_ms)),
+            })
+            .collect();
+        self.tray = Sheet::open(self.screen.width(), self.screen.height(), self.scale, &rows);
+        match self.tray.as_ref() {
+            Some(sheet) => {
+                let rect = sheet.rect;
+                self.mark_layer(rect);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Закрыть лист свёрнутых, если открыт.
+    pub fn close_tray(&mut self) {
+        if let Some(sheet) = self.tray.take() {
+            self.mark_layer(sheet.rect);
+        }
+    }
+
+    /// Во что попало нажатие в лист свёрнутых. `None` — мимо листа.
+    #[must_use]
+    pub fn tray_hit(&self, x: i32, y: i32) -> Option<tray::Hit> {
+        self.tray.as_ref()?.hit(x, y)
+    }
+
+    /// Свёрнутые окна — для «Развернуть все».
+    #[must_use]
+    pub fn minimized_apps(&self) -> Vec<App> {
+        self.windows.iter().filter(|window| window.minimized).map(|window| window.app).collect()
     }
 
     /// Видна ли экранная клавиатура.
@@ -1680,6 +1746,11 @@ impl Compositor {
                 let t = flight.phase(crate::time::uptime_ns());
                 flight.draw(back, window.surface(), to, t, band, dy);
             }
+        }
+        if let Some(sheet) = self.tray.as_ref() {
+            let r = mini_ui::paint::Ctx::scaled(self.scale).px(30);
+            self.drop_shadow(back, sheet.rect, band, dy, r);
+            self.stack(back, sheet.surface(), sheet.rect, band, dy, r);
         }
         if let Some(menu) = self.menu.as_ref() {
             if menu.is_open() {

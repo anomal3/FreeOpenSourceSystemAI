@@ -887,6 +887,20 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : minimize flight of 'Terminal': ", 15_000),
             Step::Wait(1500),
             Step::Shot("04-stack"),
+            // Нажатие на стопку открывает лист «Свёрнутые программы»; строка
+            // терминала разворачивает его обратно полётом из стопки.
+            Step::Aim(Aim::Point(368, 1495)),
+            Step::Click,
+            Step::Await("desktop     : minimized list opened", 15_000),
+            Step::Wait(1000),
+            Step::Shot("05-minimized-list"),
+            Step::Aim(Aim::Point(300, 1130)),
+            Step::Click,
+            Step::Await("desktop     : restored 'Terminal'", 15_000),
+            Step::Await("desktop     : restore flight of 'Terminal': ", 15_000),
+            Step::Await("keyboard    : shown", 15_000),
+            Step::Wait(1000),
+            Step::Shot("06-restored"),
         ],
     },
     Scenario {
