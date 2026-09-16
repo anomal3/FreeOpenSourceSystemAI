@@ -118,6 +118,26 @@ pub struct Icons {
     /// входит меньше ячеек, чем на 1080p, и сетка, посчитанная под один экран,
     /// на другом уехала бы под панель задач.
     rows: u32,
+    /// Готовая картинка сетки: рисуется при изменении, в кадр копируется.
+    ///
+    /// # Зачем она появилась
+    ///
+    /// Измерено на телефоне: значки стоили 48 мс на кадр при перетаскивании
+    /// окна. Причина не в сложности плитки, а в числе повторов — кадр режется
+    /// на полосы, и `draw` вызывался для каждой, пересчитывая заново скруглённую
+    /// заливку, градиент, обводку, штриховой значок и две строки подписи. При
+    /// восьми полосах это тридцать две отрисовки плитки на один кадр.
+    ///
+    /// Панель и меню так не делают с самого начала: у них своя поверхность, а в
+    /// кадр они копируются. Здесь то же самое.
+    ///
+    /// `None` — поверхность ещё не собрана или не хватило памяти; тогда значки
+    /// рисуются прямо в полосу, как раньше. Это не запасной путь на всякий
+    /// случай: сетка бывает шире экрана, и на машине без памяти под неё стол
+    /// обязан работать по-прежнему.
+    face: Option<Surface>,
+    /// Что нарисовано на [`Icons::face`]: сама она об этом не знает.
+    face_at: Rect,
     /// Ширина экрана и верх сетки — на телефоне (см. [`Icons::set_span`]).
     width: u32,
     top: u32,
@@ -126,8 +146,16 @@ pub struct Icons {
 impl Icons {
     #[must_use]
     pub fn new(scale: u32) -> Self {
-        let mut icons =
-            Self { scale, items: Vec::new(), selected: None, rows: 1, width: 0, top: 0 };
+        let mut icons = Self {
+            scale,
+            items: Vec::new(),
+            selected: None,
+            rows: 1,
+            face: None,
+            face_at: Rect::EMPTY,
+            width: 0,
+            top: 0,
+        };
         icons.items = system_items();
         icons
     }
@@ -150,13 +178,18 @@ impl Icons {
     /// отрисовке (см. [`Icons::ctx`]). Метод существует потому, что вызывающему
     /// не положено знать, у кого из слоёв есть что перекрашивать; появись у
     /// значков кеш — перекраска окажется здесь, а стол править не придётся.
-    pub fn restyle(&mut self) {}
+    pub fn restyle(&mut self) {
+        // Кеша цветов у значков по-прежнему нет, но картинка сетки теперь есть,
+        // и она нарисована прежней палитрой.
+        self.rebuild();
+    }
 
     /// Задать высоту рабочей области — от неё считается длина столбца.
     pub fn set_area(&mut self, work_bottom: i32) {
         let ctx = self.ctx();
         let usable = (work_bottom - ctx.px(theme::ICON_MARGIN) as i32).max(0) as u32;
         self.rows = (usable / ctx.px(theme::ICON_CELL_H + theme::ICON_GAP).max(1)).max(1);
+        self.rebuild();
     }
 
     /// Задать ширину экрана и верх сетки — только для телефона.
@@ -168,6 +201,7 @@ impl Icons {
     pub fn set_span(&mut self, width: u32, top: u32) {
         self.width = width;
         self.top = top;
+        self.rebuild();
     }
 
     /// Перечитать каталог стола.
@@ -218,6 +252,7 @@ impl Icons {
         if let Some(path) = keep {
             self.selected = self.index_of_path(&path);
         }
+        self.rebuild();
     }
 
     /// Номер значка с этим путём.
@@ -298,6 +333,22 @@ impl Icons {
     /// Все ячейки вместе — область, которую занимает сетка значков.
     #[must_use]
     pub fn bounds(&self) -> Rect {
+        // На телефоне сетка идёт рядами во всю ширину экрана и начинается под
+        // строкой состояния: её границы считаются по ячейкам, а не по
+        // настольной формуле со столбцами.
+        if theme::is_mobile() {
+            let count = self.items.len().max(1);
+            let rows = (count as u32).div_ceil(theme::M_COLUMNS.max(1));
+            let ctx = self.ctx();
+            let cell_h = ctx.px(theme::M_CELL_H);
+            let gap = ctx.px(theme::M_CELL_GAP);
+            return Rect::new(
+                ctx.px(theme::M_INSET) as i32,
+                self.top as i32,
+                self.width.saturating_sub(ctx.px(theme::M_INSET) * 2).max(1),
+                rows * cell_h + gap * rows.saturating_sub(1),
+            );
+        }
         let ctx = self.ctx();
         let columns = (self.items.len() as u32).div_ceil(self.rows.max(1)).max(1);
         Rect::new(
@@ -340,6 +391,7 @@ impl Icons {
         for slot in [previous, index].into_iter().flatten() {
             damage = damage.union(&self.cell(slot));
         }
+        self.rebuild();
         damage
     }
 
@@ -351,6 +403,21 @@ impl Icons {
     /// обрезка была обязательной: нарисованный целиком ради задетого края,
     /// значок ложился поверх закрывающего его окна.
     pub fn draw(&self, back: &mut Surface, band: Rect, dy: i32) {
+        // Готовая картинка — одним копированием той части, что попала в полосу.
+        if let Some(face) = self.face.as_ref() {
+            let visible = self.face_at.intersect(&band);
+            if visible.is_empty() {
+                return;
+            }
+            let src = Rect::new(
+                visible.x - self.face_at.x,
+                visible.y - self.face_at.y,
+                visible.w,
+                visible.h,
+            );
+            back.blit_from(face, (visible.x, visible.y + dy), src);
+            return;
+        }
         for index in 0..self.items.len() {
             let cell = self.cell(index);
             if cell.intersect(&band).is_empty() {
@@ -359,6 +426,36 @@ impl Icons {
             let item = &self.items[index];
             self.draw_one(back, cell, dy, item, self.selected == Some(index));
         }
+    }
+
+    /// Собрать картинку сетки заново.
+    ///
+    /// Зовётся во всех местах, где сетка меняется: перечитан каталог, выбран
+    /// другой значок, сменилась рабочая область или тема. Забыть одно из них —
+    /// значит оставить на экране прошлую картинку, поэтому список этих мест
+    /// короткий и весь на виду (см. вызовы [`Icons::rebuild`]).
+    pub fn rebuild(&mut self) {
+        let area = self.bounds();
+        self.face = None;
+        self.face_at = Rect::EMPTY;
+        if area.w == 0 || area.h == 0 {
+            return;
+        }
+        // Подложка — усреднённые обои: поверх них сводится всё полупрозрачное в
+        // плитке, ровно как при рисовании прямо в кадр.
+        let under = self.ctx().under;
+        let Some(mut face) = Surface::new(area.w, area.h, under) else {
+            return;
+        };
+        for index in 0..self.items.len() {
+            let cell = self.cell(index);
+            let local = cell.translate(-area.x, -area.y);
+            let item = &self.items[index];
+            let selected = self.selected == Some(index);
+            self.draw_one(&mut face, local, 0, item, selected);
+        }
+        self.face = Some(face);
+        self.face_at = area;
     }
 
     /// Нарисовать один значок в полосе кадра.
