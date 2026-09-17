@@ -20,7 +20,7 @@
 #![no_main]
 
 use user_progs::{
-    Args, FD_STDIN, SEEK_SET, close, exit, file_size, open, print, print_u64, println, read, seek,
+    Args, FD_STDIN, Line, SEEK_SET, close, exit, file_size, open, println, read, seek,
 };
 
 /// Сколько байт читается за раз.
@@ -42,9 +42,7 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         Some(path) => {
             let fd = open(path);
             if fd < 0 {
-                print("wc: cannot open ");
-                print(path);
-                println("");
+                Line::new().str("wc: cannot open ").str(path).end();
                 exit(1);
             }
             (path, fd)
@@ -111,14 +109,20 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         close(fd);
     }
 
-    print("wc: ");
-    print_u64(lines);
-    print(" lines, ");
-    print_u64(words);
-    print(" words, ");
-    print_u64(bytes);
-    print(" bytes in ");
-    println(path);
+    // Одной записью, а не восемью. По кускам эту строку разрывала чужая печать:
+    // в журнале оказывалось `wc: 18 lines, 143 words, 853 bytes in init: 'sshd'
+    // ended with code 1`, и стенд справедливо не находил обещанного. Поведение
+    // при этом исправно, испорчено доказательство — см. `Line`.
+    Line::new()
+        .str("wc: ")
+        .num(lines)
+        .str(" lines, ")
+        .num(words)
+        .str(" words, ")
+        .num(bytes)
+        .str(" bytes in ")
+        .str(path)
+        .end();
 
     // Размер, измеренный `seek`-ом, обязан совпасть с числом прочитанных байт.
     // Проверяет это сама программа, а не стенд: два числа получены разными
@@ -130,9 +134,7 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     if size as u64 == bytes {
         println("wc: size from seek matches the bytes read");
     } else {
-        print("wc: MISMATCH, seek says ");
-        print_u64(size as u64);
-        println("");
+        Line::new().str("wc: MISMATCH, seek says ").num(size as u64).end();
         exit(1);
     }
 

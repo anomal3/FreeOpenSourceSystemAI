@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use user_progs::{exit, pid, print, print_u64, println, uptime_ms, yield_now};
+use user_progs::{Line, exit, pid, uptime_ms, yield_now};
 
 /// Сколько раз программа отметится.
 const TICKS: u64 = 5;
@@ -40,19 +40,26 @@ pub extern "C" fn _start() -> ! {
             yield_now();
         }
 
-        print("count ");
-        print_u64(me);
-        print(": tick ");
-        print_u64(tick);
-        print(" of ");
-        print_u64(TICKS);
-        print(" at ");
-        print_u64(uptime_ms());
-        println(" ms");
+        // Строка уходит ядру **одной** записью. Двумя её печатать нельзя, и
+        // это не украшение: две копии этой программы работают одновременно
+        // нарочно, и печать по кускам перемешивалась у них на середине —
+        // в журнале оказывалось `count 235 at 81926: done` вместо двух строк.
+        // Стенд ловит такое как «система не сказала того, что сказала»: хуже
+        // всего то, что поведение при этом исправно, а доказательство
+        // испорчено. Тем же способом и по той же причине печатает `vec`.
+        Line::new()
+            .str("count ")
+            .num(me)
+            .str(": tick ")
+            .num(tick)
+            .str(" of ")
+            .num(TICKS)
+            .str(" at ")
+            .num(uptime_ms())
+            .str(" ms")
+            .end();
     }
 
-    print("count ");
-    print_u64(me);
-    println(": done");
+    Line::new().str("count ").num(me).str(": done").end();
     exit(0)
 }

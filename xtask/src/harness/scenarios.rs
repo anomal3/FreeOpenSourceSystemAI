@@ -1321,9 +1321,11 @@ pub const ALL: &[Scenario] = &[
             // программы из `/bin` запускаются в терминале по имени, и их список
             // печатает `help`. Число программ в `/bin` — точным числом: оно от
             // экрана не зависит и меняется только вместе с `USER_PROGRAMS` в
-            // `build.rs`. Тридцать две с фазы 46; `zdemo` собирается только там,
-            // где выполнена `cargo xtask thirdparty`, и без неё здесь будет 31.
-            Step::Expect("/bin holds 37 programs"),
+            // `build.rs` и `C_PROGRAMS` в `cbuild.rs`, минус скрытый `init`.
+            // Тридцать девять с канарейками стека (`smash` и `csmash`);
+            // `zdemo` собирается только там, где выполнена
+            // `cargo xtask thirdparty`, и без неё здесь будет 38.
+            Step::Expect("/bin holds 39 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -1997,6 +1999,27 @@ pub const ALL: &[Scenario] = &[
             Step::Await("about to read kernel memory", 30_000),
             Step::Await("user        : killed by", 15_000),
             Step::Await("killed by the kernel", 15_000),
+            // Четвёртая переполняет буфер на своём стеке. Канарейка (очередь
+            // второго разбора, пункт 1): функция замечает затёртый кадр в
+            // эпилоге и зовёт `__stack_chk_fail`, а не возвращается по адресу
+            // `0x4141414141414141`. Без неё та же программа снималась бы за
+            // отказ команды — то есть строкой «killed by», которой здесь нет.
+            // Эталон ядро кладёт в страницу только на чтение — об этом оно
+            // говорит при каждом запуске.
+            Step::Line("run /bin/smash"),
+            Step::Await("stack guard read-only at 0x0000008060c00000", 30_000),
+            Step::Await("smash: overrunning a 16-byte stack buffer", 30_000),
+            Step::Await("stack smashing detected, aborting", 15_000),
+            Step::Await("exited with code 134", 15_000),
+            Step::Absent("smash: returned from the overrun"),
+            // И та же программа со словом `guard` пишет в саму страницу
+            // эталона: она отображена без права записи, и подделать эталон
+            // переполнением нельзя — запись в него снимает программу.
+            Step::Line("run /bin/smash guard"),
+            Step::Await("smash: about to write to the stack guard page", 30_000),
+            Step::Await("user        : killed by", 15_000),
+            Step::Await("killed by the kernel", 15_000),
+            Step::Absent("the guard page took a write"),
             // Две программы сразу. Обе запускаются в фоне, то есть оболочка не
             // ждёт ни одну, — и это первая проверка: приглашение возвращается
             // немедленно. Дальше в журнале идут строки обеих программ вперемежку,
@@ -3380,6 +3403,16 @@ pub const ALL: &[Scenario] = &[
             // Отдельным шагом, потому что «строка не напечаталась» и «проверка
             // не прошла» — разные беды, и первую поймали бы ожидания выше.
             Step::Absent("cdemo: FAILED"),
+            // Канарейка стека у программы на C. Её ставит `clang`
+            // (`-fstack-protector-strong` в `freeos_cc::compile_flags`), эталон
+            // читает по тому же символу из той же страницы, что и программы на
+            // Rust, а `__stack_chk_fail` — в стартовом коде `crt0.c`. Код 134
+            // — тот же, что у `smash`, и у процесса, убитого `SIGABRT`.
+            Step::Line("run /bin/csmash"),
+            Step::Await("csmash: overrunning a 16-byte stack buffer", 30_000),
+            Step::Await("stack smashing detected, aborting", 15_000),
+            Step::Await("exited with code 134", 15_000),
+            Step::Absent("csmash: returned from the overrun"),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
@@ -6945,7 +6978,9 @@ pub const ALL: &[Scenario] = &[
             // Каждое утверждение ждётся отдельно и по порядку печати: программа
             // печатает их одной строкой каждое, и строка, которой нет, — это
             // проверка, до которой она не дошла.
-            Step::Await("posix: abi version 65536", 60_000),
+            // 65537 = 0x0001_0001: младшая половина выросла со страницей процесса
+            // (эталон канарейки стека), см. `user_abi::ABI_VERSION`.
+            Step::Await("posix: abi version 65537", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».

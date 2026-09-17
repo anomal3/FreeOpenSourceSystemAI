@@ -142,8 +142,11 @@ pub struct CProgram {
 }
 
 /// Программы на C, которые едут в `/bin`.
-pub const C_PROGRAMS: [CProgram; 2] = [
+pub const C_PROGRAMS: [CProgram; 3] = [
     CProgram { name: "cdemo", needs: None, libs: &[] },
+    // Переполняет свой стек нарочно: доказывает, что канарейка стека есть и у
+    // программ на C. См. `libc/examples/csmash.c` и `__stack_chk_fail` в `crt0.c`.
+    CProgram { name: "csmash", needs: None, libs: &[] },
     // Чужая библиотека, собранная нашим набором. Она здесь не ради сжатия: это
     // единственная проверка, доказывающая, что код, вышедший из чужого
     // `configure`, **работает**, а не только собрался. См. `libc/examples/zdemo.c`.
@@ -192,8 +195,22 @@ pub fn toolchain() -> Result<()> {
             );
         }
 
-        let cross = write_cross_file(arch)?;
         let build = root.join(format!("pico-{}", arch.name()));
+        // Кросс-файл meson читает один раз, при `setup`: `configure` его не
+        // перечитывает, и изменившиеся флаги компилятора (так в `c_flags`
+        // появилась канарейка стека) молча остались бы без действия — libc
+        // собиралась бы старыми флагами, а `cargo xtask toolchain` говорил бы,
+        // что всё сделано. Поэтому изменившийся кросс-файл сносит каталог
+        // сборки: полная пересборка picolibc — минуты, а расхождение между
+        // тем, что записано, и тем, что собрано, не находится никак.
+        let cross_before = std::fs::read(cross_file_path(arch)).ok();
+        let cross = write_cross_file(arch)?;
+        if cross_before.is_some_and(|old| std::fs::read(&cross).ok().as_deref() != Some(old.as_slice()))
+            && build.is_dir()
+        {
+            say!("кросс-файл {} изменился, каталог сборки пересоздаётся", arch.name());
+            std::fs::remove_dir_all(&build)?;
+        }
         let meson = tool("meson")?;
         let ninja = tool("ninja")?;
 
@@ -334,11 +351,16 @@ fn tool(name: &str) -> Result<PathBuf> {
 /// 3. **Файл обязан быть без BOM.** meson читает его разбором ini и на BOM
 ///    отвечает «File contains no section headers» — про первую же строку,
 ///    которая на вид совершенно правильная.
+/// Где лежит порождённый кросс-файл этой архитектуры.
+fn cross_file_path(arch: Arch) -> PathBuf {
+    toolchain_dir().join("cross").join(format!("{}.txt", arch.name()))
+}
+
 fn write_cross_file(arch: Arch) -> Result<PathBuf> {
-    let root = toolchain_dir();
-    let cross_dir = root.join("cross");
-    std::fs::create_dir_all(&cross_dir)?;
-    let path = cross_dir.join(format!("{}.txt", arch.name()));
+    let path = cross_file_path(arch);
+    if let Some(cross_dir) = path.parent() {
+        std::fs::create_dir_all(cross_dir)?;
+    }
 
     let rt_dir = builtins(arch)
         .parent()

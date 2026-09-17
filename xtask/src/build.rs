@@ -307,11 +307,11 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 36] = [
+pub const USER_PROGRAMS: [&str; 37] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sshd",
     "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow", "sysmon", "files",
-    "taskmgr", "devmgr", "dotnet", "sftp-server", "big",
+    "taskmgr", "devmgr", "dotnet", "sftp-server", "big", "smash",
 ];
 
 /// Программы, которые в `/bin` **не** едут.
@@ -371,9 +371,16 @@ pub fn build_user_programs(arch: Arch, release: bool) -> Result<Vec<PathBuf>> {
     // заголовки; с отладочными секциями крошечная программа весит два с
     // половиной мегабайта, и сегмент, уехавший за предел чтения, выглядел бы
     // как испорченный файл.
+    // Канарейки стека — в каждой функции со стековым массивом или локальной
+    // переменной, чей адрес утёк (`strong`, тот же выбор, что у дистрибутивов
+    // Linux для `gcc`). Флаг действует и на пересобираемые `core`/`alloc`: они
+    // разбирают те же чужие байты, что и программа. Эталон компилятор читает
+    // по символу `__stack_chk_guard`, который `user.ld` ставит на страницу
+    // процесса (`user_abi::PROCESS_PAGE`); падение зовёт `__stack_chk_fail`
+    // из `user_progs`. Флаг нестабильный, но и сборка вся на nightly.
     let mut flags = format!(
         "-C link-arg=-T{} -C link-arg=-z -C link-arg=max-page-size=0x1000 \
-         -C relocation-model=static -C strip=debuginfo",
+         -C relocation-model=static -C strip=debuginfo -Z stack-protector=strong",
         script.display()
     );
     if arch == Arch::X86_64 {

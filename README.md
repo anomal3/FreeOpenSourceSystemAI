@@ -22,7 +22,7 @@ written down in the source, in Russian, next to the code that resulted from it.
 | **Boots** | UEFI on x86-64 and ARM64; a live ISO that writes nothing, and an installer that partitions a disk |
 | **Filesystem** | ext2, read and written by us — created, verified and repaired from inside the system (`fsck`) |
 | **Desktop** | Framebuffer compositor: antialiased proportional type, rounded translucent windows, a floating taskbar, start menu, terminal, file manager — in a dark and a light theme. A program can ask for **a window of its own**: it draws straight into mapped pixels and reads its own keys and clicks — the system monitor is exactly that, a program outside the kernel |
-| **Userspace** | ELF programs in ring 3 / EL0, one address space each, preemptive scheduling, pipes, `mode`/`uid`/`gid` enforced, memory on request (`mmap`) in 4 KiB or 2 MiB pages, files mapped into memory and paged in on demand, and a **versioned syscall contract** — `dup`, `fstat`, `isatty`, `poll`, clocks and CPU time, frozen by tests that name every number |
+| **Userspace** | ELF programs in ring 3 / EL0, one address space each, preemptive scheduling, pipes, `mode`/`uid`/`gid` enforced, memory on request (`mmap`) in 4 KiB or 2 MiB pages, files mapped into memory and paged in on demand, W^X on every page and a **stack canary in every program** — Rust and C alike, with the reference value in a read-only page the kernel fills before the program starts — and a **versioned syscall contract** — `dup`, `fstat`, `isatty`, `poll`, clocks and CPU time, frozen by tests that name every number |
 | **Familiar to a Windows user** | `cat C:\etc\system.cfg` works, and so does `\bin`; `D:` is refused by name, because this system has one root. The file manager labels `/bin` as «Программы» and `/home/you` as «Мои документы», folds the service trees, and shows the real path all the while — one key switches it all off |
 | **Settings** | Timezone, theme, and a static address are set in a window and survive a reboot — written to `/etc` on the state partition, applied at the next boot before any service starts. Volumes and accounts are listed; the filesystem check runs from there |
 | **C and a toolchain** | A picolibc port and a cross toolchain: `x86_64-freeos-cc hello.c -o hello` produces a program that runs. **zlib 1.3.1 builds from its own `configure`, unpatched, for both architectures** — and the result works: 18 000 bytes compress to 123 and come back byte-identical, inside the system |
@@ -114,6 +114,11 @@ cargo xtask thirdparty          # fetch zlib and build it with the toolchain
 
 build/toolchain/bin/x86_64-freeos-cc hello.c -o hello
 ```
+
+Every program comes out with a stack canary (`-fstack-protector-strong`) and
+no build system needs to know: the reference value lives in a read-only page
+the kernel maps for the program, and the link script points `__stack_chk_guard`
+at it.
 
 The compiler is not part of the package and will not be: clang installs itself
 and weighs a gigabyte. What the toolchain adds is the target — headers, libraries,
