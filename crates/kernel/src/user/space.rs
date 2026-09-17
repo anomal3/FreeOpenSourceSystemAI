@@ -98,12 +98,6 @@ impl Space {
         .unwrap_or(Err(MapError::OutOfFrames))
     }
 
-    /// Чем отображён адрес в этом пространстве.
-    #[must_use]
-    pub fn translate(&self, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)> {
-        arch::translate(self.root, virt)
-    }
-
     /// Физический адрес корневой таблицы — то, что уезжает в `CR3`/`TTBR0_EL1`.
     #[must_use]
     pub fn root(&self) -> PhysAddr {

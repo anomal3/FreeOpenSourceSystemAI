@@ -1315,7 +1315,7 @@ pub const ALL: &[Scenario] = &[
             // экрана не зависит и меняется только вместе с `USER_PROGRAMS` в
             // `build.rs`. Тридцать две с фазы 46; `zdemo` собирается только там,
             // где выполнена `cargo xtask thirdparty`, и без неё здесь будет 31.
-            Step::Expect("/bin holds 36 programs"),
+            Step::Expect("/bin holds 37 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -1919,7 +1919,10 @@ pub const ALL: &[Scenario] = &[
             // память программы отображена в её собственных таблицах и
             // отсутствует в таблицах ядра. Обе строки печатает ядро, обойдя
             // оба дерева, — то есть это не пересказ намерения, а результат.
-            Step::Await("entry maps to", 30_000),
+            // С фазы 54 точка входа при запуске ещё не отображена — её
+            // страница придёт по обращению; ядро подтверждает, что она лежит в
+            // исполняемом сегменте из таблицы областей.
+            Step::Await("entry is paged on demand from the segment at", 30_000),
             Step::Await("the kernel space maps nothing at", 15_000),
             Step::Await("hello from userspace", 30_000),
             Step::Await("uptime as the kernel sees it:", 15_000),
@@ -1937,7 +1940,7 @@ pub const ALL: &[Scenario] = &[
             // когда окно было в три раза меньше, и сценарий с ним не проходил.
             // Строка приходит раньше отчёта оболочки: пространство разбирается
             // внутри `run`, а не после него.
-            Step::Await("space released, 784 pages and 5 tables returned", 15_000),
+            Step::AtLeast("space released, ", 17, 15_000),
             Step::Await("exited with code 0", 15_000),
             // Программа, которой сказали, что делать: путь приходит аргументом,
             // а не зашит в неё. Числа точные и это намеренно — «что-то
@@ -1979,7 +1982,7 @@ pub const ALL: &[Scenario] = &[
             // Снятая отказом программа возвращается в ядро не оттуда, откуда
             // уходила, и уборку на этом пути легко потерять — поэтому та же
             // строка проверяется и здесь.
-            Step::Await("space released, 784 pages and 5 tables returned", 15_000),
+            Step::AtLeast("space released, ", 17, 15_000),
             Step::Await("killed by the kernel", 15_000),
             // Третья читает память ядра по адресу, который в её собственных
             // таблицах есть: корень программы — копия ядерного. Отказ здесь
@@ -2283,6 +2286,19 @@ pub const ALL: &[Scenario] = &[
             // ищет только вперёд от курсора.
             Step::AtLeast("  user        : file mapping released, ", 1, 15_000),
             Step::Await("filemap: unmapped", 15_000),
+            Step::Await("exited with code 0", 15_000),
+            // Фаза 54: образ программы читается по обращению. `big` несёт шесть
+            // мегабайт данных — вдвое больше прежнего окна в три, — и может
+            // запуститься только если ядро не читает файл заранее. Свёртка
+            // посчитана на хосте (см. `big.rs`); строку с числом прочитанных
+            // страниц печатает ядро при выходе, и их не меньше, чем страниц
+            // данных: обход трогает каждую, а держит ядро только четыре
+            // мегабайта из шести, так что часть страниц читается дважды.
+            Step::Line("run /bin/big"),
+            Step::Await("big: data is 6291456 bytes in the image", 60_000),
+            Step::Await("big: checksum over every 1000th word is 13091774967880311519", 300_000),
+            Step::Await("big: spot checks passed", 30_000),
+            Step::AtLeast("  user        : program image released, ", 1536, 30_000),
             Step::Await("exited with code 0", 15_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
@@ -2635,7 +2651,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("user        : killed by request, task #{}", 15_000),
             // Память вернулась в пул целиком, тем же путём, что и после отказа:
             // 128 страниц образа, 8 стека и четыре таблицы.
-            Step::Await("space released, 784 pages and 5 tables returned", 15_000),
+            Step::AtLeast("space released, ", 17, 15_000),
             Step::Await("#{} /bin/forever: killed by request", 15_000),
             // Снять её второй раз нельзя, и отказ объясняет почему.
             Step::Line("kill {}"),

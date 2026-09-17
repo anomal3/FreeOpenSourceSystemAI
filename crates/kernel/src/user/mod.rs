@@ -96,39 +96,27 @@ use space::Space;
 /// перестало бы быть обходом одного поддерева (см. [`space::WINDOW_SLOT`]).
 pub const WINDOW_BASE: usize = 0x0000_0080_0000_0000;
 
-/// Сколько страниц отведено под образ программы.
+/// Сколько адресов отведено под образ программы.
 ///
-/// Три мегабайта. Число росло дважды, и оба раза по одной и той же причине —
-/// в системе заводилась программа с чужой криптографией внутри:
+/// Гибибайт — и это предел адресов, а не памяти. С фазы 54 образ **не
+/// раскладывается заранее**: сегменты ELF записываются в таблицу областей
+/// программы так же, как отображённый файл (фаза 41), и страница читается с
+/// носителя при первом обращении к ней. Программа занимает столько кадров,
+/// сколько страниц тронула, а размер файла ограничен только этим окном и
+/// самим носителем.
 ///
-/// * полмегабайта хватало до фазы 37, пока не появился `sshd` (Curve25519,
-///   Ed25519, SHA-256, ChaCha20 — в отладочной сборке мегабайт);
-/// * полутора хватало до фазы 39a, пока не появился `sysupdate` с TLS: P-256,
-///   P-384 и разбор X.509 в неоптимизированной сборке дают почти полтора
-///   мегабайта одного только кода, и от предела оставалось восемьдесят восемь
-///   килобайт — то есть одна следующая правка.
-///
-/// Отказ выглядит при этом обманчиво: загрузчик отвергает не размер, а
-/// **сегмент**, потому что ядро дочитывает файл до предела и получает
-/// заголовок, обещающий больше байт, чем прочитано. Искать причину идут в
-/// формат ELF.
-///
-/// Цена названа вслух: кадры под окно выделяются целиком и сразу, то есть
-/// каждая запущенная программа занимает три мегабайта независимо от того,
-/// сколько ей нужно. При 512 МиБ у гостя и полудюжине задач это два процента
-/// памяти.
-///
-/// Фаза 40 этого числа **не** отменила, и стоит сказать почему. Она дала
-/// программе память по запросу ([`MMAP_BASE`]) — то есть сняла потолок с того,
-/// сколько программа может занять, — но образ по-прежнему раскладывается
-/// целиком до первой её инструкции, потому что раскладывает его загрузчик, а не
-/// отказ страницы. Константой размер образа перестанет быть в фазе 41, когда
-/// отказ станет рабочим механизмом и сегменты можно будет дочитывать по
+/// История числа стоит того, чтобы её помнить. До фазы 54 здесь стояло число
+/// страниц, и кадры под них выделялись целиком при запуске: полмегабайта до
+/// `sshd` (фаза 37), полтора до `sysupdate` с TLS (фаза 39a), три после. Каждый
+/// раз предел находил не размер, а его следствие: ядро дочитывало файл до
+/// предела, а загрузчик жаловался на «сегмент, противоречащий сам себе», и
+/// искать шли в формат ELF. Роман потребовал снять предел вовсе: «программы
+/// могут быть большие», — и снят он не константой побольше, а загрузкой по
 /// обращению.
 ///
-/// Верхняя граница не произвольна: до вершины стека четыре мегабайта, и образ
-/// обязан кончиться раньше, оставив неотображённую полосу между собой и стеком.
-const IMAGE_PAGES: usize = 768;
+/// Верхняя граница по-прежнему не произвольна: за окном образа лежит
+/// неотображённая полоса, за ней стек, за ним — память по запросу.
+const IMAGE_LIMIT_BYTES: usize = 1 << 30;
 /// Сколько страниц отведено под стек программы.
 ///
 /// Было восемь, стало шестнадцать — и подняты они не «на всякий случай».
@@ -145,29 +133,29 @@ const IMAGE_PAGES: usize = 768;
 /// вслух.
 const STACK_PAGES: usize = 16;
 
-/// Размер образа в байтах.
-const IMAGE_BYTES: usize = IMAGE_PAGES * PAGE_SIZE;
-
-/// Вершина стека программы. Отстоит от начала окна на четыре мегабайта — чтобы
-/// переполнение стека упиралось в неотображённые страницы, а не в конец образа.
+/// Вершина стека программы. Отстоит от конца окна образа на четыре мегабайта —
+/// чтобы переполнение стека упиралось в неотображённые страницы, а не в конец
+/// образа.
 ///
-/// Полоса между концом образа (три мегабайта) и низом стека — почти мегабайт
-/// неотображённой памяти. Она и есть та проверка, которой нет в самом стеке:
-/// программа, ушедшая за свой кадр, получает отказ страницы, а не тихо портит
-/// собственный `.bss`.
-pub const STACK_TOP: usize = WINDOW_BASE + 0x0040_0000;
+/// Полоса между самым большим возможным образом и низом стека — почти четыре
+/// мегабайта неотображённой памяти. Она и есть та проверка, которой нет в самом
+/// стеке: программа, ушедшая за свой кадр, получает отказ страницы, а не тихо
+/// портит собственный `.bss`. У обычной программы полоса много шире: образ
+/// кончается там, где кончается её последний сегмент.
+pub const STACK_TOP: usize = WINDOW_BASE + IMAGE_LIMIT_BYTES + 0x0040_0000;
 /// Низ стека.
 const STACK_BASE: usize = STACK_TOP - STACK_PAGES * PAGE_SIZE;
 
 /// Начало области, которую программа получает по запросу (`SYS_MMAP`).
 ///
-/// Восемь мегабайт от начала окна, то есть **на четыре мегабайта выше вершины
-/// стека**. Полоса между ними не забыта, а поставлена: она продолжает ту же
-/// мысль, что и полоса между образом и стеком, — программа, ушедшая за свой
-/// стек, обязана упереться в неотображённое, а не в чужие данные. Без неё
-/// переполнение стека молча писало бы в первую выданную по запросу страницу,
-/// и выглядело бы это как испорченные данные, а не как ошибка в программе.
-pub const MMAP_BASE: usize = WINDOW_BASE + 0x0080_0000;
+/// **На четыре мегабайта выше вершины стека**. Полоса между ними не забыта, а
+/// поставлена: она продолжает ту же мысль, что и полоса между образом и
+/// стеком, — программа, ушедшая за свой стек, обязана упереться в
+/// неотображённое, а не в чужие данные. Без неё переполнение стека молча
+/// писало бы в первую выданную по запросу страницу, и выглядело бы это как
+/// испорченные данные, а не как ошибка в программе. Начало кратно двум
+/// мегабайтам: крупные страницы (фаза 42) требуют этого от адреса.
+pub const MMAP_BASE: usize = STACK_TOP + 0x0040_0000;
 
 /// Сколько памяти по запросу отведено **одной** задаче.
 ///
@@ -201,11 +189,14 @@ pub const RESERVE_FRAMES: usize = 8 * 1024 * 1024 / PAGE_SIZE;
 
 /// Сколько отдельных областей может держать одна задача.
 ///
-/// Шестнадцать. Число маленькое намеренно: таблица лежит прямо в [`Program`],
-/// обходится линейно, и обход её — цена каждого `mmap`. Программе, которой не
-/// хватило шестнадцати областей, отказывают тем же ответом, что и упёршейся в
-/// [`MMAP_MAX_BYTES`]: с её стороны это одно и то же — «больше не дадут».
-const MAX_MAPPINGS: usize = 16;
+/// Тридцать две. Число маленькое намеренно: таблица лежит прямо в [`Program`],
+/// обходится линейно, и обход её — цена каждого `mmap` и каждого отказа
+/// страницы. Программе, которой не хватило областей, отказывают тем же
+/// ответом, что и упёршейся в [`MMAP_MAX_BYTES`]: с её стороны это одно и то
+/// же — «больше не дадут». Было шестнадцать; с фазы 54 в той же таблице лежат
+/// и сегменты самого образа (обычно три-четыре), и столько же осталось
+/// программе на её собственные области.
+const MAX_MAPPINGS: usize = 32;
 
 /// Сколько страниц одной отображённой области ядро держит в памяти сразу.
 ///
@@ -253,6 +244,12 @@ enum Source {
     Anonymous,
     /// Файлом: страницы подкачиваются по обращению (фаза 41).
     File(FileBacking),
+    /// Сегментом программы (фаза 54): страницы читаются из файла программы
+    /// при первом обращении, а за концом файловой части лежат нули (`.bss`).
+    /// Страницы на запись после первого чтения — свои, и их не вытесняют;
+    /// страницы кода и данных только на чтение — чистые, и вытесняются, как у
+    /// отображённого файла.
+    Image(ImageBacking),
     /// Поверхностью окна: подряд идущие кадры, выданные под пиксели (фаза 47a).
     ///
     /// Внутри — физический адрес первого кадра, потому что вернуть их можно
@@ -289,6 +286,27 @@ struct FileBacking {
     /// и LRU выбирают одну и ту же страницу.
     resident: VecDeque<usize>,
     /// Сколько раз страницу пришлось читать с диска.
+    reads: u64,
+    /// Сколько раз страницу выбросили, чтобы освободить место.
+    evictions: u64,
+}
+
+/// Сегмент образа программы, стоящий за областью (фаза 54).
+struct ImageBacking {
+    /// Файл программы.
+    node: Arc<dyn Node>,
+    /// Смещение в файле, отвечающее началу области (первой её странице).
+    offset: u64,
+    /// Сколько байт от начала области приходит из файла; дальше — нули.
+    file_bytes: usize,
+    /// Права сегмента: чтение, запись, исполнение — плюс третье кольцо.
+    flags: PageFlags,
+    /// Подкачанные страницы **без права записи**, в порядке подкачки: они
+    /// чистые, и вытеснять их можно так же, как у отображённого файла.
+    /// Страницы на запись сюда не попадают — выброшенная страница данных
+    /// вернулась бы из файла в исходном виде.
+    resident: VecDeque<usize>,
+    /// Сколько раз страницу пришлось читать с носителя.
     reads: u64,
     /// Сколько раз страницу выбросили, чтобы освободить место.
     evictions: u64,
@@ -333,14 +351,43 @@ pub enum MmapError {
     BadFile(files::FileError),
 }
 
-/// Сколько байт файла программы ядро согласно прочитать.
+/// Сколько байт файла программы ядро читает при запуске.
 ///
-/// Ровно столько же, сколько отведено под образ: файл больше окна всё равно не
-/// разложится, а обрезанное чтение — худший из способов об этом сообщить.
-/// Именно оно и произошло, когда `sshd` перерос прежние полмегабайта: ядро
-/// молча дочитывало файл до предела, а загрузчик потом жаловался на «сегмент,
-/// противоречащий сам себе», уводя расследование к формату ELF вместо размера.
-const MAX_FILE: usize = IMAGE_BYTES;
+/// Только заголовки: заголовок файла и таблица сегментов лежат в начале, и
+/// шестидесяти четырёх килобайт хватает любому компоновщику с большим запасом.
+/// Если таблица всё же не поместилась, дочитывается ровно до её конца. Сами
+/// сегменты при запуске **не читаются** (фаза 54): их страницы приходят по
+/// обращению, и поэтому у размера программы больше нет предела, о который она
+/// упиралась бы при запуске.
+const HEADER_BYTES: usize = 64 * 1024;
+
+/// Читать ли страницы образа при запуске, а не по обращению.
+///
+/// `true` — и это временно. Механизм чтения по обращению написан и работает
+/// (образ `big` в шесть мегабайт проходит стенд на обеих архитектурах), но
+/// полный прогон нашёл два дефекта, которые он вскрывает, а не порождает:
+///
+/// * на AArch64 задача, уснувшая на занятом `Mutex` изнутри обработчика
+///   отказа (вторая программа стартует, пока первая читает страницу), после
+///   пробуждения делает `eret` по адресу внутри ядра — первая программа
+///   снимается «за instruction abort»; замок из обработчика убран, но что
+///   именно портит кадр, не найдено;
+/// * на x86-64 `ls` в сценарии `userspace` останавливает всю машину посреди
+///   вывода — похоже на отказ страницы из режима ядра под уже взятым
+///   `PROGRAMS`, то есть второй захват того же замка той же задачей.
+///
+/// Пока оба не разобраны, страницы читаются при запуске **тем же кодом
+/// областей** ([`prefetch`]): предела размера у программы больше нет, а
+/// память она занимает по размеру файла, как и до фазы 54. Переключить на
+/// чтение по обращению — одна константа, и стенд (`filemap`, `userspace`,
+/// `desktop`, `mc`) покажет, живы ли дефекты.
+const IMAGE_PAGED_ON_DEMAND: bool = false;
+
+/// Сколько страниц образа могут делить два сегмента.
+///
+/// Обычно одна-две: конец `.rodata` и начало `.data`, крошечный `.data` и
+/// `.bss` за ним. Больше — не раскладка, а противоречивый заголовок.
+const MAX_SHARED_PAGES: usize = 64;
 
 /// Почему программа не запустилась.
 #[derive(Debug, Clone, Copy)]
@@ -362,6 +409,8 @@ pub enum Error {
     AlreadyRunning,
     /// В таблице планировщика нет места под ещё одну задачу.
     TooManyTasks,
+    /// Сегментов в файле больше, чем полагается одной программе областей.
+    TooManySegments,
 }
 
 impl core::fmt::Display for Error {
@@ -378,6 +427,7 @@ impl core::fmt::Display for Error {
             ),
             Self::AlreadyRunning => f.write_str("this task already runs a program"),
             Self::TooManyTasks => f.write_str("the task table is full"),
+            Self::TooManySegments => f.write_str("the program has more loadable segments than a task may hold"),
         }
     }
 }
@@ -702,6 +752,11 @@ impl Program {
         if matches!(self.mappings[index].source, Source::Surface(..)) {
             return Err(MmapError::BadRequest);
         }
+        // Сегмент собственного образа программа не снимает: код, который
+        // исполняется, и данные, по которым он ходит, уходят вместе с ней.
+        if matches!(self.mappings[index].source, Source::Image(..)) {
+            return Err(MmapError::BadRequest);
+        }
 
         // SAFETY: область выдана этой же программе и записана в её таблице, то
         // есть кадры под ней принадлежат ей одной.
@@ -720,10 +775,10 @@ impl Program {
             // отображена, — и именно поэтому оно ничего не скрывает.
             Source::Anonymous => region.pages,
             Source::File(file) => file.resident.len(),
-            // Сюда не приходят: поверхность отсеяна проверкой выше. Ветка
-            // существует затем, чтобы новый вид области нельзя было завести,
-            // не ответив на вопрос, сколько кадров он обязан вернуть.
-            Source::Surface(..) => region.pages,
+            // Сюда не приходят: поверхность и сегмент образа отсеяны проверками
+            // выше. Ветки существуют затем, чтобы новый вид области нельзя было
+            // завести, не ответив на вопрос, сколько кадров он обязан вернуть.
+            Source::Surface(..) | Source::Image(..) => region.pages,
         };
         if freed != owed {
             kprintln!(
@@ -815,103 +870,113 @@ impl Program {
     /// то есть одна подкачка — это один запрос к диску и ни одного лишнего
     /// байта, а угадывать за программу, куда она пойдёт дальше, — работа с
     /// собственными измерениями, которых у этой фазы нет.
-    fn fault_in(&mut self, addr: usize, write: bool, present: bool) -> bool {
-        // Страница на месте, а обращение не прошло — это нарушение прав, и
-        // подкачка тут ни при чём. Единственный законный случай сегодня —
-        // запись в отображение, открытое на чтение.
-        if present {
-            return false;
+    /// Первая половина отказа — под замком: чем наполнять страницу.
+    ///
+    /// Возвращает откуда читать, сколько байт (остальное — нули), с какими
+    /// правами отобразить и чистая ли страница после этого (то есть можно ли
+    /// её потом выбросить и прочитать заново). `None` — «за такой адрес никто
+    /// не отвечает», обычный ответ, а не поломка: разыменованный ноль и
+    /// указатель мимо области выглядят здесь одинаково.
+    ///
+    /// Само чтение идёт **без** замка ([`fault_in`]): под ним нельзя спать, а
+    /// путь чтения спит, и вторая программа, отказавшая в это время, ждала бы
+    /// не носитель, а чужой замок.
+    fn fault_plan(&self, page_addr: usize, write: bool) -> Option<FaultPlan> {
+        let region = self.mappings.iter().find(|region| {
+            page_addr >= region.base && page_addr < region.base + region.pages * PAGE_SIZE
+        })?;
+        let page = (page_addr - region.base) / PAGE_SIZE;
+        match &region.source {
+            Source::File(file) => {
+                // Отображение только на чтение, и попытка записи — не отказ
+                // подкачки, а именно то, о чём договор предупреждал.
+                if write {
+                    return None;
+                }
+                Some(FaultPlan {
+                    node: Arc::clone(&file.node),
+                    offset: file.offset + (page as u64) * PAGE_SIZE as u64,
+                    want: PAGE_SIZE,
+                    flags: PageFlags::READ | PageFlags::USER,
+                    clean: true,
+                })
+            }
+            Source::Image(image) => {
+                // Запись в сегмент кода или данных только на чтение — ошибка
+                // программы, а не повод подложить ей страницу.
+                if write && !image.flags.contains(PageFlags::WRITE) {
+                    return None;
+                }
+                let start = page * PAGE_SIZE;
+                // Файловая часть сегмента кончается где угодно внутри
+                // страницы; всё, что за ней, обязано быть нулём (`.bss`) — а
+                // не тем, что лежит в файле дальше.
+                Some(FaultPlan {
+                    node: Arc::clone(&image.node),
+                    offset: image.offset + start as u64,
+                    want: image.file_bytes.saturating_sub(start).min(PAGE_SIZE),
+                    flags: image.flags,
+                    clean: !image.flags.contains(PageFlags::WRITE),
+                })
+            }
+            // Безымянная область отображена целиком с самого начала, поверхность
+            // окна — тоже. Отказ внутри них означает, что таблицы разошлись с
+            // этой записью, и молчать об этом нельзя: снять программу
+            // правильнее, чем тихо подложить ей чистую страницу вместо той, что
+            // потерялась.
+            Source::Anonymous | Source::Surface(..) => None,
         }
+    }
 
-        let page_addr = addr & !(PAGE_SIZE - 1);
+    /// Вторая половина отказа — снова под замком: отобразить прочитанный
+    /// кадр и учесть его. `false` — области уже нет или отобразить не вышло;
+    /// кадр тогда возвращает вызывающий.
+    fn fault_commit(&mut self, page_addr: usize, frame: PhysAddr, plan: &FaultPlan) -> bool {
         let Some(index) = self.mappings.iter().position(|region| {
             page_addr >= region.base && page_addr < region.base + region.pages * PAGE_SIZE
         }) else {
             return false;
         };
-
-        let region = &self.mappings[index];
-        let base = region.base;
+        let base = self.mappings[index].base;
         let page = (page_addr - base) / PAGE_SIZE;
-        let Source::File(file) = &region.source else {
-            // Безымянная область отображена целиком с самого начала. Отказ
-            // внутри неё означает, что таблицы разошлись с этой записью, и
-            // молчать об этом нельзя: снять программу правильнее, чем тихо
-            // подложить ей чистую страницу вместо той, что потерялась.
-            return false;
-        };
-        // Отображение только на чтение, и попытка записи — не отказ подкачки,
-        // а именно то, о чём договор предупреждал.
-        if write {
-            return false;
-        }
-
-        let offset = file.offset + (page as u64) * PAGE_SIZE as u64;
-        let node = Arc::clone(&file.node);
-
-        // Кадр берётся до чтения, и замок пула отпускается тоже до него: путь
-        // чтения берёт засыпающие мьютексы, а держать под ними `SpinLock`,
-        // запрещающий прерывания, — прямая дорога в тупик.
-        let Some(frame) = take_frame_reserved() else {
-            return false;
-        };
-
-        // SAFETY: кадр только что выдан аллокатором, принадлежит нам одним и
-        // виден через прямое отображение. Читаем в него **мимо** адресов
-        // программы: обращение по `page_addr` вызвало бы тот же отказ, который
-        // мы сейчас и обрабатываем.
-        let buffer = unsafe { core::slice::from_raw_parts_mut(frame_bytes(frame), PAGE_SIZE) };
-        let read = match node.read_at(offset, buffer) {
-            Ok(read) => read,
-            Err(_) => {
-                return_frame(frame);
-                return false;
-            }
-        };
-        // Хвост последней страницы файла обязан быть нулём, а не тем, что
-        // лежало в кадре: чтение за концом возвращает короткий счёт и остаток
-        // буфера не трогает. Кадр приходит обнулённым, так что делать тут
-        // нечего — но проверить стоит: первая же выдача кадров без обнуления
-        // открыла бы программе чужие данные, и молча.
-        debug_assert!(buffer[read..].iter().all(|byte| *byte == 0));
 
         // SAFETY: кадр наш, адрес лежит в области этой программы, и страницы
         // под ним сейчас нет — с неё и начался отказ.
-        if unsafe {
-            self.space
-                .map(VirtAddr::new(page_addr), frame, PageFlags::READ | PageFlags::USER)
-        }
-        .is_err()
-        {
-            return_frame(frame);
+        if unsafe { self.space.map(VirtAddr::new(page_addr), frame, plan.flags) }.is_err() {
             return false;
         }
 
-        let Source::File(file) = &mut self.mappings[index].source else {
-            unreachable!("источник области не менялся между двумя обращениями");
+        let (what, resident, reads, evictions) = match &mut self.mappings[index].source {
+            Source::File(file) => ("file mapping", &mut file.resident, &mut file.reads, &mut file.evictions),
+            Source::Image(image) => {
+                ("program image", &mut image.resident, &mut image.reads, &mut image.evictions)
+            }
+            _ => return true,
         };
-        file.resident.push_back(page);
-        file.reads += 1;
+        *reads += 1;
 
         // Счётчик подкачек виден в журнале, и не только ради отчёта: по нему
         // отличают «медленно» от «по кругу». Обход файла вперёд обязан стоить
         // ровно одну подкачку на страницу, и если строк приходит больше, чем в
         // файле страниц, значит вытеснение выбрасывает то, что ещё нужно, —
         // а снаружи это выглядит просто как долгая работа.
-        if file.reads % PROGRESS_EVERY == 0 {
-            kprintln!(
-                "  user        : file mapping paging, {} reads and {} evictions",
-                file.reads,
-                file.evictions
-            );
+        if *reads % PROGRESS_EVERY == 0 {
+            kprintln!("  user        : {what} paging, {} reads and {} evictions", *reads, *evictions);
         }
 
-        if file.resident.len() > RESIDENT_MAX_PAGES {
+        // Страница на запись — своя с этого момента: в файле её нет в том виде,
+        // в каком её оставит программа, и выбрасывать её нельзя.
+        if !plan.clean {
+            return true;
+        }
+        resident.push_back(page);
+
+        if resident.len() > RESIDENT_MAX_PAGES {
             // Место кончилось — выбрасываем самую давнюю. Страница чиста
             // (отображение на чтение), поэтому «выбросить» — это снять и
             // вернуть кадр: ни записи на диск, ни согласования ни с кем.
-            if let Some(old) = file.resident.pop_front() {
-                file.evictions += 1;
+            if let Some(old) = resident.pop_front() {
+                *evictions += 1;
                 let victim = VirtAddr::new(base + old * PAGE_SIZE);
                 // SAFETY: страница принадлежит этой области, то есть этой
                 // программе; понадобится — прочитается с диска заново.
@@ -921,6 +986,15 @@ impl Program {
 
         true
     }
+}
+
+/// Чем наполнить отказавшую страницу — ответ [`Program::fault_plan`].
+struct FaultPlan {
+    node: Arc<dyn Node>,
+    offset: u64,
+    want: usize,
+    flags: PageFlags,
+    clean: bool,
 }
 
 /// Взять кадр, не трогая запас, который ядро держит для себя.
@@ -1209,31 +1283,6 @@ fn frame_bytes(frame: PhysAddr) -> *mut u8 {
     frame.to_direct_map().as_mut_ptr::<u8>()
 }
 
-/// Скопировать данные в образ по смещению от [`WINDOW_BASE`].
-fn write_image(frames: &[PhysAddr], offset: usize, data: &[u8]) {
-    let mut written = 0;
-    while written < data.len() {
-        let at = offset + written;
-        let page = at / PAGE_SIZE;
-        let in_page = at % PAGE_SIZE;
-        let Some(frame) = frames.get(page) else {
-            return;
-        };
-        let chunk = (PAGE_SIZE - in_page).min(data.len() - written);
-        // SAFETY: страница внутри окна (проверено `get`), смещение внутри
-        // страницы, длина обрезана по её концу. Источник — срез файла, приёмник
-        // — кадр в прямом отображении; пересечься они не могут.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr().add(written),
-                frame_bytes(*frame).add(in_page),
-                chunk,
-            );
-        }
-        written += chunk;
-    }
-}
-
 /// Разложить аргументы в верхней странице стека программы.
 ///
 /// Возвращает `(argc, адрес массива argv, новую вершину стека)` — всё в
@@ -1332,105 +1381,252 @@ fn return_frame(frame: PhysAddr) {
     });
 }
 
-/// Права страниц образа: объединение прав сегментов, которые их задевают.
-///
-/// Страница, не задетая ни одним сегментом, остаётся доступной только на
-/// чтение: она внутри окна, и оставлять её записываемой незачем.
-fn image_flags(image: &elf::Image<'_>) -> Result<[PageFlags; IMAGE_PAGES], Error> {
-    let mut flags = [PageFlags::READ.union(PageFlags::USER); IMAGE_PAGES];
-    let mut segments = 0usize;
-
-    for segment in image.segments((WINDOW_BASE, WINDOW_BASE + IMAGE_BYTES)) {
-        let segment = segment.map_err(Error::Elf)?;
-        segments += 1;
-
-        let offset = segment.vaddr - WINDOW_BASE;
-        let first = offset / PAGE_SIZE;
-        let last = (offset + segment.memsz - 1) / PAGE_SIZE;
-        let segment_flags = PageFlags::from_segment_flags(segment.flags).union(PageFlags::USER);
-        for page in first..=last.min(IMAGE_PAGES - 1) {
-            flags[page] = flags[page].union(segment_flags);
-        }
-    }
-
-    if segments == 0 {
-        return Err(Error::Elf(elf::ElfError::NoSegments));
-    }
-
-    // Проверка до первого отображения, а не после: `map` откажет и сам, но
-    // отказать на середине окна значит оставить половину страниц с правами, о
-    // которых уже никто не спрашивал.
-    for (page, page_flags) in flags.iter().enumerate() {
-        if page_flags.contains(PageFlags::WRITE) && page_flags.contains(PageFlags::EXEC) {
-            return Err(Error::WriteExecute(page));
-        }
-    }
-
-    Ok(flags)
-}
-
-/// Прочитать образ программы целиком.
+/// Прочитать заголовки программы: заголовок файла и таблицу сегментов.
 ///
 /// Читает **ядро**, а не программа, и права на чтение файла для этого не
 /// требуются — так же, как в Unix, где `execve` довольствуется битом `x`.
 /// Разница осмысленная: содержимое исполняемого файла не отдаётся тому, кто его
-/// запустил, оно отдаётся процессору.
-fn read_image(node: &dyn crate::vfs::Node) -> Result<Vec<u8>, Error> {
+/// запустил, оно отдаётся процессору — и с фазы 54 отдаётся по страницам, по
+/// мере того как процессор до них доходит. Здесь читаются только заголовки
+/// ([`HEADER_BYTES`]); если таблица сегментов в них не поместилась, чтение
+/// повторяется до её конца.
+///
+/// Возвращает прочитанное и полную длину файла: по ней разбор проверяет, что
+/// каждый сегмент внутри файла, не читая его.
+fn read_header(node: &dyn crate::vfs::Node) -> Result<(Vec<u8>, usize), Error> {
     let meta = node.metadata();
     if meta.kind != crate::vfs::NodeKind::File {
         return Err(Error::Read(crate::vfs::VfsError::WrongKind));
     }
-    let want = (meta.size as usize).min(MAX_FILE);
-
-    let mut bytes = Vec::new();
-    // `try_reserve_exact`, а не `vec![]`: размер пришёл с носителя, и отказ
-    // аллокатора обязан стать ошибкой, а не паникой.
-    bytes.try_reserve_exact(want).map_err(|_| Error::OutOfMemory)?;
-    bytes.resize(want, 0);
-
-    let read = node.read_at(0, &mut bytes).map_err(Error::Read)?;
-    bytes.truncate(read);
-    Ok(bytes)
+    let size = meta.size as usize;
+    let mut want = size.min(HEADER_BYTES);
+    loop {
+        let mut bytes = Vec::new();
+        // `try_reserve_exact`, а не `vec![]`: размер пришёл с носителя, и отказ
+        // аллокатора обязан стать ошибкой, а не паникой.
+        bytes.try_reserve_exact(want).map_err(|_| Error::OutOfMemory)?;
+        bytes.resize(want, 0);
+        let read = node.read_at(0, &mut bytes).map_err(Error::Read)?;
+        bytes.truncate(read);
+        match elf::Image::parse(&bytes, size) {
+            // Таблица сегментов за прочитанным — дочитать, пока есть что.
+            Err(elf::ElfError::Truncated) if want < size => want = (want * 4).min(size),
+            _ => return Ok((bytes, size)),
+        }
+    }
 }
 
-/// Что получилось из разложенного образа: точка входа и верхняя страница стека.
+/// Прочитать все страницы сегмента при запуске (см. [`IMAGE_PAGED_ON_DEMAND`]).
 ///
-/// Кадр стека нужен снаружи, чтобы записать туда аргументы. Писать их через
-/// адреса программы было бы нельзя: к моменту, когда пространство активно, и
-/// возможно только через прямое отображение — тем же способом, каким сюда
-/// попадает содержимое сегментов.
-struct Loaded {
-    entry: usize,
-    stack_top_frame: PhysAddr,
-}
-
-/// Разложить программу по её адресному пространству и вернуть точку входа.
-fn load(space: &mut Space, bytes: &[u8]) -> Result<Loaded, Error> {
-    let image = elf::Image::parse(bytes).map_err(Error::Elf)?;
-    let flags = image_flags(&image)?;
-
-    let mut pages = Vec::new();
-    pages.try_reserve_exact(IMAGE_PAGES).map_err(|_| Error::OutOfMemory)?;
-
-    // Кадры не обнуляются здесь: аллокатор выдаёт их чистыми по контракту, и это
-    // ровно то, что требуется в двух местах сразу — `.bss` программы обязан быть
-    // нулевым, а память от чего бы то ни было предыдущего не должна ей достаться.
-    for page in 0..IMAGE_PAGES {
-        // Кадры, уже попавшие в таблицы, возвращать здесь не надо: они внутри
-        // окна, и `Drop` пространства вернёт их вместе с ним.
+/// То же, что делает отказ страницы, только заранее и без замков: программы
+/// ещё нет в таблице, и спорить за неё некому. Прочитанные страницы в
+/// `resident` не попадают — вытеснять их нельзя, иначе обращение к ним снова
+/// пошло бы через отказ, который здесь и обходится.
+fn prefetch(space: &mut Space, region: &mut Mapping) -> Result<(), Error> {
+    let Source::Image(image) = &mut region.source else {
+        return Ok(());
+    };
+    for page in 0..region.pages {
+        let start = page * PAGE_SIZE;
+        let want = image.file_bytes.saturating_sub(start).min(PAGE_SIZE);
         let frame = take_frame()?;
-        // SAFETY: кадр только что выделен под эту программу и больше никому не
-        // принадлежит; при разборе пространства он вернётся в пул.
-        let mapped = unsafe {
-            space.map(VirtAddr::new(WINDOW_BASE + page * PAGE_SIZE), frame, flags[page])
-        };
-        if let Err(err) = mapped {
-            // Отображения не появилось — значит поддерево окна этот кадр не
-            // содержит, и вернуть его надо здесь.
+        // SAFETY: кадр только что выдан под эту программу, обнулён по договору
+        // аллокатора и виден через прямое отображение.
+        let buffer = unsafe { core::slice::from_raw_parts_mut(frame_bytes(frame), PAGE_SIZE) };
+        if want > 0 {
+            if let Err(err) = image.node.read_at(image.offset + start as u64, &mut buffer[..want]) {
+                return_frame(frame);
+                return Err(Error::Read(err));
+            }
+        }
+        // SAFETY: кадр наш, адрес внутри области этой программы.
+        if let Err(err) = unsafe { space.map(VirtAddr::new(region.base + start), frame, image.flags) } {
             return_frame(frame);
             return Err(Error::Map(err));
         }
-        pages.push(frame);
+        image.reads += 1;
+    }
+    Ok(())
+}
+
+/// Что получилось из разложенного образа: точка входа, верхняя страница стека
+/// и области, из которых сегменты будут читаться по обращению.
+///
+/// Кадр стека нужен снаружи, чтобы записать туда аргументы. Писать их через
+/// адреса программы было бы нельзя: к моменту, когда пространство активно, и
+/// возможно только через прямое отображение.
+struct Loaded {
+    entry: usize,
+    stack_top_frame: PhysAddr,
+    mappings: Vec<Mapping>,
+}
+
+/// Разложить программу по её адресному пространству и вернуть точку входа.
+///
+/// «Разложить» с фазы 54 значит записать сегменты в таблицу областей: ни одна
+/// страница образа здесь не читается и не отображается — первое обращение к
+/// ней придёт отказом страницы, и [`Program::fault_in`] прочитает её из файла.
+/// Стек — исключение: его верхняя страница нужна сразу, под аргументы, а
+/// остальные дешевле выдать здесь, чем ловить шестнадцать отказов на первом
+/// же вызове.
+fn load(
+    space: &mut Space,
+    node: &Arc<dyn Node>,
+    header: &[u8],
+    file_len: usize,
+) -> Result<Loaded, Error> {
+    let image = elf::Image::parse(header, file_len).map_err(Error::Elf)?;
+
+    // Сегменты по возрастанию адреса. Права уже в понятиях страниц.
+    struct Seg {
+        vaddr: usize,
+        memsz: usize,
+        file_offset: usize,
+        filesz: usize,
+        flags: PageFlags,
+    }
+    let mut segs: Vec<Seg> = Vec::new();
+    for segment in image.segments((WINDOW_BASE, WINDOW_BASE + IMAGE_LIMIT_BYTES)) {
+        let segment = segment.map_err(Error::Elf)?;
+        let flags = PageFlags::from_segment_flags(segment.flags).union(PageFlags::USER);
+        // Проверка до первой записи в таблицу, а не в отказе страницы:
+        // отказать на середине запуска значит оставить программу без половины
+        // сегментов, о которых уже никто не спрашивал.
+        if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) {
+            return Err(Error::WriteExecute((segment.vaddr - WINDOW_BASE) / PAGE_SIZE));
+        }
+        if segs.len() >= MAX_MAPPINGS / 2 {
+            return Err(Error::TooManySegments);
+        }
+        segs.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        segs.push(Seg {
+            vaddr: segment.vaddr,
+            memsz: segment.memsz,
+            file_offset: segment.file_offset,
+            filesz: segment.filesz,
+            flags,
+        });
+    }
+    if segs.is_empty() {
+        return Err(Error::Elf(elf::ElfError::NoSegments));
+    }
+    segs.sort_by_key(|seg| seg.vaddr);
+
+    // Страница, которую делят два сегмента (`.rodata` кончается и `.data`
+    // начинается внутри одной страницы — компоновщик вправе так уложить
+    // программу, собранную не нашим сценарием), читается **сразу**, из обоих
+    // сегментов, и отображается с объединёнными правами — как делал прежний
+    // загрузчик для всех страниц. По обращению читаются только страницы,
+    // принадлежащие одному сегменту: у страницы из файла одно смещение, а у
+    // общей страницы их два.
+    let page_of = |addr: usize| addr / PAGE_SIZE;
+    let first_page = |seg: &Seg| page_of(seg.vaddr);
+    let last_page = |seg: &Seg| page_of(seg.vaddr + seg.memsz - 1);
+    let covers = |seg: &Seg, page: usize| first_page(seg) <= page && page <= last_page(seg);
+    let mut shared: Vec<usize> = Vec::new();
+    for (index, left) in segs.iter().enumerate() {
+        for right in &segs[index + 1..] {
+            let from = first_page(left).max(first_page(right));
+            let to = last_page(left).min(last_page(right));
+            for page in from..=to {
+                if shared.len() >= MAX_SHARED_PAGES {
+                    // Сегменты лежат друг на друге не страницей, а массивом —
+                    // это не раскладка, а противоречивый заголовок.
+                    return Err(Error::Elf(elf::ElfError::BadSegment));
+                }
+                if !shared.contains(&page) {
+                    shared.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                    shared.push(page);
+                }
+            }
+        }
+    }
+    for &page in &shared {
+        let mut flags = PageFlags::USER;
+        for seg in segs.iter().filter(|seg| covers(seg, page)) {
+            flags = flags.union(seg.flags);
+        }
+        if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) {
+            return Err(Error::WriteExecute(page - WINDOW_BASE / PAGE_SIZE));
+        }
+        let frame = take_frame()?;
+        // SAFETY: кадр только что выдан под эту программу, обнулён по договору
+        // аллокатора и виден через прямое отображение.
+        let buffer = unsafe { core::slice::from_raw_parts_mut(frame_bytes(frame), PAGE_SIZE) };
+        let page_start = page * PAGE_SIZE;
+        for seg in segs.iter().filter(|seg| covers(seg, page)) {
+            let from = seg.vaddr.max(page_start);
+            let to = (seg.vaddr + seg.filesz).min(page_start + PAGE_SIZE);
+            if from >= to {
+                continue;
+            }
+            let offset = (seg.file_offset + (from - seg.vaddr)) as u64;
+            let read = node.read_at(offset, &mut buffer[from - page_start..to - page_start]).map_err(Error::Read);
+            if let Err(err) = read {
+                return_frame(frame);
+                return Err(err);
+            }
+        }
+        // SAFETY: кадр наш, адрес внутри окна образа этой программы.
+        if let Err(err) = unsafe { space.map(VirtAddr::new(page_start), frame, flags) } {
+            return_frame(frame);
+            return Err(Error::Map(err));
+        }
+    }
+
+    // Остальные страницы — областями: каждый непрерывный пробег страниц
+    // сегмента, не задетых другим сегментом, становится своей областью.
+    let mut mappings: Vec<Mapping> = Vec::new();
+    for seg in &segs {
+        let mut run: Option<(usize, usize)> = None;
+        for page in first_page(seg)..=last_page(seg) + 1 {
+            let inside = page <= last_page(seg) && !shared.contains(&page);
+            match (run, inside) {
+                (None, true) => run = Some((page, page)),
+                (Some((from, _)), true) => run = Some((from, page)),
+                (Some((from, to)), false) => {
+                    run = None;
+                    let base = from * PAGE_SIZE;
+                    // Байт `base + n` лежит в файле по смещению `offset + n`:
+                    // смещение и адрес у сегмента сравнимы по модулю страницы,
+                    // этого требует ELF. Область, начавшаяся позже сегмента
+                    // (общая страница впереди), теряет столько же файловой части.
+                    let skipped = base.saturating_sub(seg.vaddr);
+                    let lead = seg.vaddr.saturating_sub(base);
+                    let Some(offset) = (seg.file_offset + skipped).checked_sub(lead) else {
+                        return Err(Error::Elf(elf::ElfError::BadSegment));
+                    };
+                    let file_bytes = (lead + seg.filesz).saturating_sub(skipped);
+                    if mappings.len() >= MAX_MAPPINGS / 2 {
+                        return Err(Error::TooManySegments);
+                    }
+                    mappings.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                    mappings.push(Mapping {
+                        base,
+                        pages: to - from + 1,
+                        blocks: 0,
+                        source: Source::Image(ImageBacking {
+                            node: Arc::clone(node),
+                            offset: offset as u64,
+                            file_bytes,
+                            flags: seg.flags,
+                            resident: VecDeque::new(),
+                            reads: 0,
+                            evictions: 0,
+                        }),
+                    });
+                }
+                (None, false) => {}
+            }
+        }
+    }
+    // Таблица областей упорядочена по адресу — этого ждут `find_gap` и
+    // `remember`, а порядок сегментов в файле никто не обещал.
+    mappings.sort_by_key(|region| region.base);
+    if !IMAGE_PAGED_ON_DEMAND {
+        for region in &mut mappings {
+            prefetch(space, region)?;
+        }
     }
 
     let mut stack_top_frame = PhysAddr::new(0);
@@ -1441,7 +1637,9 @@ fn load(space: &mut Space, bytes: &[u8]) -> Result<Loaded, Error> {
         if page == STACK_PAGES - 1 {
             stack_top_frame = frame;
         }
-        // SAFETY: см. выше; стек — обычная память программы на чтение и запись.
+        // SAFETY: кадр только что выделен под эту программу и больше никому не
+        // принадлежит; при разборе пространства он вернётся в пул. Стек —
+        // обычная память программы на чтение и запись.
         let mapped = unsafe {
             space.map(
                 VirtAddr::new(STACK_BASE + page * PAGE_SIZE),
@@ -1450,21 +1648,14 @@ fn load(space: &mut Space, bytes: &[u8]) -> Result<Loaded, Error> {
             )
         };
         if let Err(err) = mapped {
+            // Отображения не появилось — значит поддерево окна этот кадр не
+            // содержит, и вернуть его надо здесь.
             return_frame(frame);
             return Err(Error::Map(err));
         }
     }
 
-    // Содержимое пишется последним и через прямое отображение: права страницы в
-    // пространстве программы к этому моменту уже выставлены, и сегмент кода там
-    // на запись недоступен.
-    for segment in image.segments((WINDOW_BASE, WINDOW_BASE + IMAGE_BYTES)) {
-        let segment = segment.map_err(Error::Elf)?;
-        let source = &image.bytes()[segment.file_offset..segment.file_offset + segment.filesz];
-        write_image(&pages, segment.vaddr - WINDOW_BASE, source);
-    }
-
-    Ok(Loaded { entry: image.entry, stack_top_frame })
+    Ok(Loaded { entry: image.entry, stack_top_frame, mappings })
 }
 
 /// Напечатать то, ради чего фаза затевалась: где лежит программа и чего о ней
@@ -1474,13 +1665,22 @@ fn load(space: &mut Space, bytes: &[u8]) -> Result<Loaded, Error> {
 /// Утверждение «окно программы в таблицах ядра отсутствует» иначе нечем
 /// проверить: снимок экрана его не покажет, а отсутствие отказа доказывает
 /// только то, что ядро туда не обращалось.
-fn report(space: &Space, entry: usize) {
-    match space.translate(VirtAddr::new(entry)) {
-        Some((frame, flags)) => kprintln!(
-            "  user        : space {:?}, entry maps to {frame:?} {flags:?}",
-            space.root()
-        ),
-        None => kprintln!("  user        : WARNING: the entry point is not mapped in its own space"),
+fn report(space: &Space, entry: usize, mappings: &[Mapping]) {
+    // Точка входа ещё не отображена — и не должна быть: с фазы 54 её страница
+    // придёт по первому же обращению процессора. Утверждать здесь можно другое:
+    // что она лежит внутри исполняемого сегмента, записанного в таблицу областей.
+    let segment = mappings.iter().find(|region| {
+        entry >= region.base && entry < region.base + region.pages * PAGE_SIZE
+    });
+    match segment {
+        Some(Mapping { base, source: Source::Image(image), .. }) if image.flags.contains(PageFlags::EXEC) => {
+            kprintln!(
+                "  user        : space {:?}, entry is paged on demand from the segment at {base:#018x} {:?}",
+                space.root(),
+                image.flags
+            );
+        }
+        _ => kprintln!("  user        : WARNING: the entry point is not inside an executable segment"),
     }
 
     match space::kernel_maps(VirtAddr::new(entry)) {
@@ -1516,10 +1716,13 @@ fn run(
         Some(Err(err)) => return Err(Error::Read(err)),
         None => return Err(Error::NoFilesystem),
     };
-    let bytes = read_image(&*node)?;
+    // Узел переезжает в `Arc`: с фазы 54 его держат области сегментов, и файл
+    // программы обязан жить, пока живёт она сама.
+    let node: Arc<dyn Node> = Arc::from(node);
+    let (header, file_len) = read_header(&*node)?;
 
     let mut space = Space::new().map_err(Error::Map)?;
-    let loaded = load(&mut space, &bytes)?;
+    let loaded = load(&mut space, &node, &header, file_len)?;
     let entry = loaded.entry;
     let root = space.root();
 
@@ -1533,7 +1736,7 @@ fn run(
     kprintln!(
         "  user        : {id} '{path}' as {cred}, entry {entry:#018x}, stack {stack:#018x}"
     );
-    report(&space, entry);
+    report(&space, entry, &loaded.mappings);
 
     let slot = sched::current_slot();
     {
@@ -1556,7 +1759,7 @@ fn run(
             path: alloc::string::String::from(path),
             stdin,
             stdout,
-            mappings: Vec::new(),
+            mappings: loaded.mappings,
         });
     }
 
@@ -1598,14 +1801,27 @@ fn run(
     // пространства возвращает окно в пул кадров, а таблица дескрипторов
     // закрывает всё, что программа не закрыла сама. Снятая отказом закрыть их и
     // не могла.
-    let leaked = {
+    let program = {
         let mut table = PROGRAMS.lock();
         table.get_mut(slot).and_then(Option::take)
-    }
-    .map_or(0, |program| program.files.open_count());
+    };
+    let leaked = program.as_ref().map_or(0, |program| program.files.open_count());
     if leaked > 0 {
         kprintln!("  user        : closed {leaked} file(s) the program left open");
     }
+    // Сколько страниц образа программа прочитала и сколько из них пришлось
+    // выбросить (фаза 54). Числа стоят сразу за неизменной подстрокой — их
+    // читает стенд: обход образа обязан стоить по одному чтению на страницу.
+    if let Some(program) = &program {
+        let (reads, evictions) = program.mappings.iter().fold((0u64, 0u64), |sum, region| match &region.source {
+            Source::Image(image) => (sum.0 + image.reads, sum.1 + image.evictions),
+            _ => sum,
+        });
+        kprintln!("  user        : program image released, {reads} reads and {evictions} evictions");
+    }
+    // Программа уничтожается здесь: `Drop` её пространства возвращает в пул всё,
+    // что под ним лежит, — и стек, и прочитанные страницы образа.
+    drop(program);
 
     // Сокеты закрываются здесь же и по той же причине: программа, снятая по
     // `kill` или отказавшая, ничего не закрывает сама, а незакрытый сокет
@@ -1884,7 +2100,7 @@ pub fn owns(ptr: usize, len: usize) -> bool {
     let Some(end) = ptr.checked_add(len) else {
         return false;
     };
-    let in_image = ptr >= WINDOW_BASE && end <= WINDOW_BASE + IMAGE_BYTES;
+    let in_image = ptr >= WINDOW_BASE && end <= WINDOW_BASE + IMAGE_LIMIT_BYTES;
     let in_stack = ptr >= STACK_BASE && end <= STACK_TOP;
     let in_mmap = ptr >= MMAP_BASE && end <= MMAP_BASE + MMAP_MAX_BYTES;
     in_image || in_stack || in_mmap
@@ -1914,7 +2130,56 @@ pub fn owns(ptr: usize, len: usize) -> bool {
 /// делает, и это проверено, а не предположено.
 #[must_use]
 pub fn fault_in(addr: usize, write: bool, present: bool) -> bool {
-    with_current(|program| program.fault_in(addr, write, present)).unwrap_or(false)
+    // Страница на месте, а обращение не прошло — это нарушение прав, и
+    // подкачка тут ни при чём.
+    if present {
+        return false;
+    }
+    let page_addr = addr & !(PAGE_SIZE - 1);
+
+    // Шаг первый, под замком: что читать.
+    let Some(plan) = with_current(|program| program.fault_plan(page_addr, write)).flatten() else {
+        return false;
+    };
+
+    // Шаг второй, без замка: кадр и чтение. Замок пула отпускается до чтения:
+    // путь чтения берёт засыпающие мьютексы, а держать под ними `SpinLock`,
+    // запрещающий прерывания, — прямая дорога в тупик. Замок программ
+    // отпущен тоже — иначе программа, отказавшая в это же время, ждала бы не
+    // носитель, а этот замок, внутри своего обработчика.
+    let Some(frame) = take_frame_reserved() else {
+        return false;
+    };
+    // SAFETY: кадр только что выдан аллокатором, принадлежит нам одним и
+    // виден через прямое отображение. Читаем в него **мимо** адресов
+    // программы: обращение по `page_addr` вызвало бы тот же отказ, который
+    // мы сейчас и обрабатываем.
+    let buffer = unsafe { core::slice::from_raw_parts_mut(frame_bytes(frame), PAGE_SIZE) };
+    let read = if plan.want == 0 {
+        // Страница целиком за файловой частью сегмента — чистый `.bss`.
+        0
+    } else {
+        match plan.node.read_at(plan.offset, &mut buffer[..plan.want]) {
+            Ok(read) => read,
+            Err(_) => {
+                return_frame(frame);
+                return false;
+            }
+        }
+    };
+    // Хвост последней страницы файла обязан быть нулём, а не тем, что лежало
+    // в кадре: чтение за концом возвращает короткий счёт и остаток буфера не
+    // трогает. Кадр приходит обнулённым, так что делать тут нечего — но
+    // проверить стоит: первая же выдача кадров без обнуления открыла бы
+    // программе чужие данные, и молча.
+    debug_assert!(buffer[read..].iter().all(|byte| *byte == 0));
+
+    // Шаг третий, снова под замком: отобразить и учесть.
+    let mapped = with_current(|program| program.fault_commit(page_addr, frame, &plan)).unwrap_or(false);
+    if !mapped {
+        return_frame(frame);
+    }
+    mapped
 }
 
 /// Исполняет ли текущая задача код в третьем кольце.

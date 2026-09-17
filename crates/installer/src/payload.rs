@@ -245,7 +245,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 37] = [
+const PROGRAMS: [(&CStr16, &str); 38] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -278,6 +278,10 @@ const PROGRAMS: [(&CStr16, &str); 37] = [
     (cstr16!("\\FREEOS\\BIN\\FETCH"), "fetch"),
     (cstr16!("\\FREEOS\\BIN\\MEMTEST"), "memtest"),
     (cstr16!("\\FREEOS\\BIN\\FILEMAP"), "filemap"),
+    // Программа в шесть мегабайт данных (фаза 54): образ читается по
+    // обращению, и на установленной системе это проверяется так же, как на
+    // initrd.
+    (cstr16!("\\FREEOS\\BIN\\BIG"), "big"),
     // Первая программа, написанная не на Rust. Собрана нашим набором из C
     // (фаза 45) и с точки зрения установщика ничем не отличается от остальных:
     // тот же ELF, то же место на носителе, то же имя в `/bin`. В этом половина

@@ -127,8 +127,14 @@ const fn seg_flags(p_flags: u32) -> u32 {
 }
 
 /// Разобранный файл.
+///
+/// `bytes` — не весь файл, а его начало: заголовок и таблица сегментов (фаза
+/// 54). Сами сегменты загрузчик не копирует, их страницы читаются по
+/// обращению, поэтому здесь хранится только полная длина файла — по ней
+/// проверяется, что каждый сегмент внутри него.
 pub struct Image<'a> {
     bytes: &'a [u8],
+    file_len: usize,
     pub entry: usize,
     /// Смещение таблицы заголовков программы и её геометрия.
     phoff: usize,
@@ -137,8 +143,9 @@ pub struct Image<'a> {
 }
 
 impl<'a> Image<'a> {
-    /// Разобрать заголовок.
-    pub fn parse(bytes: &'a [u8]) -> Result<Self, ElfError> {
+    /// Разобрать заголовок. `file_len` — длина всего файла; `bytes` может быть
+    /// его началом.
+    pub fn parse(bytes: &'a [u8], file_len: usize) -> Result<Self, ElfError> {
         if bytes.len() < EHDR_LEN {
             return Err(ElfError::Truncated);
         }
@@ -170,7 +177,7 @@ impl<'a> Image<'a> {
             return Err(ElfError::Truncated);
         }
 
-        Ok(Self { bytes, entry, phoff, phentsize, phnum })
+        Ok(Self { bytes, file_len, entry, phoff, phentsize, phnum })
     }
 
     /// Перебрать загружаемые сегменты.
@@ -206,7 +213,9 @@ impl<'a> Image<'a> {
             let Some(file_end) = file_offset.checked_add(filesz) else {
                 return Some(Err(ElfError::BadSegment));
             };
-            if file_end > bytes.len() {
+            // Сравнение с длиной файла, а не с прочитанным: прочитаны только
+            // заголовки, а сегменты придут по обращению.
+            if file_end > self.file_len {
                 return Some(Err(ElfError::BadSegment));
             }
             let Some(mem_end) = vaddr.checked_add(memsz) else {
@@ -226,11 +235,6 @@ impl<'a> Image<'a> {
         })
     }
 
-    /// Байты файла — из них загрузчик копирует сегменты.
-    #[must_use]
-    pub const fn bytes(&self) -> &'a [u8] {
-        self.bytes
-    }
 }
 
 fn u16(bytes: &[u8], at: usize) -> u16 {
