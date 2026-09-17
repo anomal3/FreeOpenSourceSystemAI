@@ -179,9 +179,9 @@ pub(crate) enum IntKind {
 }
 
 const TABLE: &[(&str, Native)] = &[
-    ("System.Console::Write(string)", Native::Write),
-    ("System.Console::WriteLine(string)", Native::WriteLine),
-    ("System.Console::WriteLine()", Native::WriteLineEmpty),
+    ("System.Console::StdoutWrite(string)", Native::Write),
+    ("System.Console::StdoutWriteLine(string)", Native::WriteLine),
+    ("System.Console::StdoutWriteLine()", Native::WriteLineEmpty),
     ("System.Object::GetType()", Native::GetType),
     ("System.RuntimeType::get_Name()", Native::TypeName),
     ("System.RuntimeType::get_FullName()", Native::TypeFullName),

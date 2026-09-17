@@ -655,5 +655,12 @@ fn mobile_items() -> Vec<Item> {
     out.push(Item { kind: Kind::Shortcut(App::Settings, Icon::Package), label: "Пакеты".to_string(), path: None });
     out.push(program(Icon::Chart, "Монитор", "/bin/sysmon"));
     out.push(missing("log", Icon::Log, "Журнал"));
+    // Витрина образцов .NET: все формы WinForms и консольные образцы одной
+    // программой (`tools/dotnet/samples/gallery`). В макете её нет — плитка
+    // встаёт следующей строкой сетки.
+    out.push(program(Icon::Grid, "Примеры", GALLERY_COMMAND));
     out
 }
+
+/// Чем открывается витрина образцов .NET с домашнего экрана телефона.
+pub const GALLERY_COMMAND: &str = "/bin/dotnet /usr/share/dotnet/samples/gallery.dll";

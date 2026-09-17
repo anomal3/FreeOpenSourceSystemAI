@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Витрина: все образцы своей среды в одной программе WinForms, чтобы их
+       можно было открыть с домашнего экрана телефона. /bin/dotnet грузит ровно
+       две сборки — базовую библиотеку и программу, — поэтому образцы не
+       подключаются ссылками, а их исходники собираются сюда же.
+
+       Из образцов WinForms берутся только формы: у каждого свой Program.Main,
+       и точка входа у витрины одна. Консольные образцы берутся целиком — их Main
+       открытые и зовутся из витрины, а вывод уходит в окно через Console.SetOut.
+       hello и arith написаны операторами верхнего уровня, их Main из кода не
+       позвать; time завершает процесс через Environment.Exit, а features
+       не запускается вовсе — этих четырёх в витрине нет.
+
+       clr-check запускает витрину с аргументом self-test: она по очереди
+       открывает формы (они в этом режиме закрываются сами) и выполняет
+       консольные образцы, печатая их вывод. -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <StartupObject>Gallery.Program</StartupObject>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <Compile Include="../winforms/Form1*.cs;../controls/Form1*.cs;../lists/Form1*.cs;../dialogs/Form1*.cs;../layout/Form1*.cs;../choices/Form1*.cs;../tabs/Form1*.cs;../numbers/Form1*.cs;../keys/Form1*.cs" />
+    <Compile Include="../form/Program.cs;../collections/Program.cs;../enums/Program.cs;../exceptions/Program.cs;../floats/Program.cs;../gc/Program.cs;../generics/Program.cs;../linq/Program.cs;../objects/Program.cs;../pqueue/Program.cs;../text/Program.cs;../files/Program.cs" />
+  </ItemGroup>
+
+</Project>

@@ -97,14 +97,74 @@ namespace System
             set => outputEncoding = value;
         }
 
-        [MethodImpl(MethodImplOptions.InternalCall)]
-        public static extern void Write(string value);
+        // Куда пишет программа, если она сама это назначила (`SetOut`). Пока
+        // `null`, текст идёт прямо в стандартный вывод задачи, мимо писателя:
+        // обёртка над выводом нужна только тем, кто её подменяет, а платить за
+        // лишний вызов на каждой строке пришлось бы всем.
+        private static System.IO.TextWriter redirected;
+
+        public static System.IO.TextWriter Out => redirected ??= new StdoutWriter();
+
+        public static void SetOut(System.IO.TextWriter newOut)
+        {
+            if (newOut == null)
+            {
+                throw new ArgumentNullException("newOut");
+            }
+            redirected = newOut is StdoutWriter ? null : newOut;
+        }
+
+        public static void Write(string value)
+        {
+            if (redirected != null && !(redirected is StdoutWriter))
+            {
+                redirected.Write(value);
+                return;
+            }
+            StdoutWrite(value);
+        }
+
+        public static void WriteLine(string value)
+        {
+            if (redirected != null && !(redirected is StdoutWriter))
+            {
+                redirected.WriteLine(value);
+                return;
+            }
+            StdoutWriteLine(value);
+        }
+
+        public static void WriteLine()
+        {
+            if (redirected != null && !(redirected is StdoutWriter))
+            {
+                redirected.WriteLine();
+                return;
+            }
+            StdoutWriteLine();
+        }
 
         [MethodImpl(MethodImplOptions.InternalCall)]
-        public static extern void WriteLine(string value);
+        private static extern void StdoutWrite(string value);
 
         [MethodImpl(MethodImplOptions.InternalCall)]
-        public static extern void WriteLine();
+        private static extern void StdoutWriteLine(string value);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void StdoutWriteLine();
+
+        // Писатель над стандартным выводом — то, что отдаёт `Console.Out`, пока
+        // его не подменили.
+        private sealed class StdoutWriter : System.IO.TextWriter
+        {
+            public override void Write(char value) => StdoutWrite(value.ToString());
+
+            public override void Write(string value) => StdoutWrite(value);
+
+            public override void WriteLine(string value) => StdoutWriteLine(value);
+
+            public override void WriteLine() => StdoutWriteLine();
+        }
 
         public static void Write(object value) => Write(value?.ToString());
 
