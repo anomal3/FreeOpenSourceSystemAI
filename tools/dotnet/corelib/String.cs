@@ -81,6 +81,63 @@ namespace System
         public override extern int GetHashCode();
 
         public override string ToString() => this;
+
+        // Нерандомизированный хеш строки (фаза N10d) — им хешируют строковые
+        // ключи Dictionary и HashSet из CoreLib. Алгоритм String.Comparison.cs
+        // того же коммита, переписанный по номерам знаков: у .NET он идёт
+        // указателем по парам знаков и за концом нечётной строки читает её
+        // завершающий ноль; здесь за концом тоже ноль, и значения совпадают.
+        // Вариант без учёта регистра у .NET ставит у каждого знака бит 0x20
+        // (для ASCII это «в нижний регистр», а не-ASCII сперва переводит в
+        // верхний) — то же самое, знак за знаком.
+        internal int GetNonRandomizedHashCode() => NonRandomizedHash(this, Length, false);
+
+        internal int GetNonRandomizedHashCodeOrdinalIgnoreCase() => NonRandomizedHash(this, Length, true);
+
+        internal static int GetNonRandomizedHashCode(ReadOnlySpan<char> span) => NonRandomizedHash(span.ToArray(), span.Length, false);
+
+        internal static int GetNonRandomizedHashCodeOrdinalIgnoreCase(ReadOnlySpan<char> span) => NonRandomizedHash(span.ToArray(), span.Length, true);
+
+        private static uint Unit(string text, char[] units, int index, int length, bool ignoreCase)
+        {
+            if (index >= length)
+            {
+                return ignoreCase ? 0x20u : 0u;
+            }
+            char c = text != null ? text[index] : units[index];
+            return ignoreCase ? (uint)char.ToUpperInvariant(c) | 0x20u : c;
+        }
+
+        private static int NonRandomizedHash(string text, int length, bool ignoreCase) => NonRandomizedHash(text, null, length, ignoreCase);
+
+        private static int NonRandomizedHash(char[] units, int length, bool ignoreCase) => NonRandomizedHash(null, units, length, ignoreCase);
+
+        private static int NonRandomizedHash(string text, char[] units, int length, bool ignoreCase)
+        {
+            uint hash1 = (5381 << 16) + 5381;
+            uint hash2 = hash1;
+            int remaining = length;
+            int at = 0;
+            while (remaining > 2)
+            {
+                remaining -= 4;
+                hash1 = (System.Numerics.BitOperations.RotateLeft(hash1, 5) + hash1) ^ Pair(text, units, at, length, ignoreCase);
+                hash2 = (System.Numerics.BitOperations.RotateLeft(hash2, 5) + hash2) ^ Pair(text, units, at + 2, length, ignoreCase);
+                at += 4;
+            }
+            if (remaining > 0)
+            {
+                hash2 = (System.Numerics.BitOperations.RotateLeft(hash2, 5) + hash2) ^ Pair(text, units, at, length, ignoreCase);
+            }
+            return (int)(hash1 + (hash2 * 1566083941));
+        }
+
+        private static uint Pair(string text, char[] units, int index, int length, bool ignoreCase) =>
+            Unit(text, units, index, length, ignoreCase) | (Unit(text, units, index + 1, length, ignoreCase) << 16);
+
+        // У .NET срез знаков из строки — вид на её память; здесь — копия знаков.
+        public static implicit operator ReadOnlySpan<char>(string value) =>
+            value == null ? default : new ReadOnlySpan<char>(value.ToCharArray());
     }
 
     public static class Console

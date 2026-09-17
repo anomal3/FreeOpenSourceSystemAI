@@ -139,6 +139,9 @@ impl<'a, H: Host> Vm<'a, H> {
                 _ => None,
             },
             Pointer::Struct(object) => Some(Value::Struct(object)),
+            // Ссылка в никуда: программа разыменовала то, что должна была
+            // проверить `Unsafe.IsNullRef` — у .NET здесь тоже это исключение.
+            Pointer::Null => return Err(self.exception("System.NullReferenceException")),
         };
         found.ok_or_else(|| self.invalid("pointer to a place that does not exist"))
     }
@@ -187,7 +190,8 @@ impl<'a, H: Host> Vm<'a, H> {
                 Some(Object::Boxed { value, .. }) => Some(value),
                 _ => None,
             },
-            Pointer::Struct(_) => None,
+            // Сюда не доходит: `load` выше уже отверг ссылку в никуда.
+            Pointer::Struct(_) | Pointer::Null => None,
         };
         match slot {
             Some(slot) => {

@@ -39,6 +39,11 @@
          помеченный unsafe. Указателей среда не исполняет: `localloc` кладёт
          ноль, а память даёт конструктор Span<T>(void*, int) обычным массивом. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Dictionary и HashSet из CoreLib (фаза N10d) под TARGET_64BIT держат
+         множитель для быстрого остатка от деления (HashHelpers.FastMod):
+         FreeOS работает только на 64-битных машинах, и corelib собирается как
+         64-битная, как у самого .NET. -->
+    <DefineConstants>$(DefineConstants);TARGET_64BIT</DefineConstants>
     <NoWarn>$(NoWarn);CS0660;CS0661;CS1718;CS8632</NoWarn>
   </PropertyGroup>
 

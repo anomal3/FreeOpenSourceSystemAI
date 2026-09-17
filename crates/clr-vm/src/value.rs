@@ -66,4 +66,9 @@ pub enum Pointer {
     /// Сама структура, у которой нет другого места: `this` конструктора в
     /// `newobj` и содержимое упакованной структуры.
     Struct(ObjRef),
+    /// Ссылка в никуда — `Unsafe.NullRef<T>()` (фаза N10d): так Dictionary и
+    /// HashSet из CoreLib говорят «не найдено» из метода, отдающего `ref`.
+    /// Чтение и запись через неё — NullReferenceException; распознаёт её
+    /// только `Unsafe.IsNullRef`.
+    Null,
 }

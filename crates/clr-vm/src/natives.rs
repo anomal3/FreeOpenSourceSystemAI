@@ -66,6 +66,9 @@ pub(crate) enum Native {
     UnsafeLessThan,
     UnsafeGreaterThan,
     UnsafeByteOffset,
+    UnsafeNullRef,
+    UnsafeIsNullRef,
+    ArrayClone,
     TypeIsAssignableFrom,
     TypeElementType,
     I32CompareTo,
@@ -239,6 +242,10 @@ const TABLE: &[(&str, Native)] = &[
     ("System.Runtime.CompilerServices.Unsafe::IsAddressLessThan(!!0&,!!0&)", Native::UnsafeLessThan),
     ("System.Runtime.CompilerServices.Unsafe::IsAddressGreaterThan(!!0&,!!0&)", Native::UnsafeGreaterThan),
     ("System.Runtime.CompilerServices.Unsafe::ByteOffset(!!0&,!!0&)", Native::UnsafeByteOffset),
+    // Фаза N10d: ссылка в никуда у Dictionary и HashSet из CoreLib.
+    ("System.Runtime.CompilerServices.Unsafe::NullRef()", Native::UnsafeNullRef),
+    ("System.Runtime.CompilerServices.Unsafe::IsNullRef(!!0&)", Native::UnsafeIsNullRef),
+    ("System.Array::Clone()", Native::ArrayClone),
     ("System.Type::IsAssignableFrom(System.Type)", Native::TypeIsAssignableFrom),
     ("System.Type::GetElementType()", Native::TypeElementType),
     ("System.Int32::CompareTo(int32)", Native::I32CompareTo),
@@ -572,6 +579,30 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
                     Value::Native((i64::from(right) - i64::from(left)) * size)
                 }
             })
+        }
+        // Ссылка в никуда (фаза N10d): у неё нет места, и сравнить её можно
+        // только с самой собой — `Unsafe.AreSame` двух `NullRef` в чужих файлах
+        // не встречается, и element_ref такую ссылку отвергает как прежде.
+        Native::UnsafeNullRef => Some(Value::Ptr(crate::value::Pointer::Null)),
+        Native::UnsafeIsNullRef => Some(Value::I32(i32::from(matches!(arg(0)?, Value::Ptr(crate::value::Pointer::Null))))),
+        // `Array.Clone()` (фаза N10d, HashSet из CoreLib копирует массивы
+        // записей): новый массив того же типа, элементы — как `Array.Copy`.
+        Native::ArrayClone => {
+            let source = arg(0)?;
+            let Value::Obj(Some(object)) = source else {
+                return Err(vm.exception("System.NullReferenceException"));
+            };
+            let element = match vm.heap.get(object) {
+                Some(crate::heap::Object::Array { ty, .. }) => match vm.types[ty.0 as usize].kind {
+                    crate::types::Kind::Array(element) => element,
+                    _ => return Err(vm.invalid("array without an element type")),
+                },
+                _ => return Err(vm.invalid("Array.Clone on something that is not an array")),
+            };
+            let length = vm.array_len(source)?;
+            let copy = vm.new_array(element, Value::I32(length as i32))?;
+            vm.copy_elements(source, 0, copy, 0, length as i32)?;
+            Some(copy)
         }
         Native::TypeIsAssignableFrom => {
             let target = vm.runtime_type(arg(0)?)?;

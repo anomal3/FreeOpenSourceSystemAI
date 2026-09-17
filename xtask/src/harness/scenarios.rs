@@ -3852,6 +3852,18 @@ pub const ALL: &[Scenario] = &[
             Step::Await("set: a,b,d True True False", 60_000),
             Step::Await("dotnet: listsort.dll: Main returned 16", 60_000),
             Step::Await("freeos> ", 15_000),
+            // Фаза N10d: Dictionary и HashSet из dotnet/runtime. `order` — порядок
+            // обхода после удалений и повторных вставок, `trimmed` — простое
+            // число из таблицы HashHelpers, `span` — поиск по срезу знаков.
+            Step::Line("dotnet /usr/share/dotnet/samples/dict.dll"),
+            Step::Await("dict: start", 60_000),
+            Step::Await("order: k0=0,n1=11,k2=2,n3=13,k4=4,k5=5,k6=6,n2=12,k8=8,k9=9,n4=14", 120_000),
+            Step::Await("trimmed: 71 50", 60_000),
+            Step::Await("span: 2 False True n4 14 True 10 True False True", 60_000),
+            Step::Await("union: 31,21,7,11,13,5,17,19 8 23 59", 60_000),
+            Step::Await("words: Apple,banana,Cherry True True False True Apple,banana,date True True Apple", 60_000),
+            Step::Await("dotnet: dict.dll: Main returned 21", 60_000),
+            Step::Await("freeos> ", 15_000),
             // Фаза N6a: окно WinForms. Форма открывается окном программы,
             // рисует себя в Paint, получает щелчок мышью в своих координатах и
             // закрывается крестиком стола — FormClosing и FormClosed с причиной

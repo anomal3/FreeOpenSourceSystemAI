@@ -37,6 +37,17 @@ namespace System
 
         public bool IsEmpty => length == 0;
 
+        public ReadOnlySpan<T> Slice(int start) => Slice(start, length - start);
+
+        public ReadOnlySpan<T> Slice(int start, int length)
+        {
+            if ((uint)start > (uint)this.length || (uint)length > (uint)(this.length - start))
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            return new ReadOnlySpan<T>(array, this.start + start, length);
+        }
+
         public Enumerator GetEnumerator() => new Enumerator(this);
 
         // Перечислитель среза для `foreach` (фаза N10c, ReadOnlySet из
@@ -100,11 +111,87 @@ namespace System
         }
 
         public static implicit operator ReadOnlySpan<T>(T[] array) => new ReadOnlySpan<T>(array);
+
+        // Как у .NET: срез знаков печатается строкой (AlternateLookup словаря
+        // делает из него ключ), любой другой — именем типа и длиной.
+        public override string ToString()
+        {
+            if (typeof(T) == typeof(char))
+            {
+                return new string((char[])(object)array, start, length);
+            }
+            return "System.ReadOnlySpan<" + typeof(T).Name + ">[" + length + "]";
+        }
     }
 
     public static class MemoryExtensions
     {
         public static Span<T> AsSpan<T>(this T[] array, int start, int length) => new Span<T>(array, start, length);
+
+        // `ReadOnlySpan<char> s = "literal"` компилятор пишет этим вызовом, а не
+        // приведением строки (фаза N10d). Копия знаков, как и у приведения.
+        public static ReadOnlySpan<char> AsSpan(this string text) => text;
+
+        // Фаза N10d: HashHelpers из CoreLib ищет простое число в таблице.
+        public static int BinarySearch<T>(this ReadOnlySpan<T> span, T value) where T : IComparable<T>
+        {
+            int low = 0;
+            int high = span.Length - 1;
+            while (low <= high)
+            {
+                int middle = low + ((high - low) >> 1);
+                int order = span.ItemAt(middle).CompareTo(value);
+                if (order == 0)
+                {
+                    return middle;
+                }
+                if (order < 0)
+                {
+                    low = middle + 1;
+                }
+                else
+                {
+                    high = middle - 1;
+                }
+            }
+            return ~low;
+        }
+
+        // Фаза N10d: сравнители строк из CoreLib сверяют срез знаков со строкой.
+        // У .NET здесь `T : IEquatable<T>`; наши char и string этого интерфейса
+        // не объявляют, а сравнение по умолчанию идёт через него и так.
+        public static bool SequenceEqual<T>(this ReadOnlySpan<T> span, ReadOnlySpan<T> other)
+        {
+            if (span.Length != other.Length)
+            {
+                return false;
+            }
+            EqualityComparer<T> comparer = EqualityComparer<T>.Default;
+            for (int i = 0; i < span.Length; i++)
+            {
+                if (!comparer.Equals(span.ItemAt(i), other.ItemAt(i)))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        internal static bool EqualsOrdinalIgnoreCase(this ReadOnlySpan<char> span, ReadOnlySpan<char> other)
+        {
+            if (span.Length != other.Length)
+            {
+                return false;
+            }
+            for (int i = 0; i < span.Length; i++)
+            {
+                if (char.ToUpperInvariant(span.ItemAt(i)) != char.ToUpperInvariant(other.ItemAt(i)))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
 
         public static bool Contains<T>(this ReadOnlySpan<T> span, T value) where T : IEquatable<T> => IndexOf(span, value) >= 0;
 

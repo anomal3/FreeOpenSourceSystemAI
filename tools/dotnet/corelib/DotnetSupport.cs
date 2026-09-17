@@ -21,6 +21,16 @@
 //   ReadOnlyCollection.cs, ReadOnlySet.cs —
 //   src/libraries/System.Private.CoreLib/src/System/Collections/ObjectModel/
 //
+//   Фаза N10d: HashSetEqualityComparer.cs, InsertionBehavior.cs,
+//   NonRandomizedStringEqualityComparer.cs, IInternalStringEqualityComparer.cs,
+//   IAlternateEqualityComparer.cs (тот же коммит) и Dictionary.cs, HashSet.cs
+//   (ТЕГ v10.0.5 — версия установленного .NET, с которым сверяется clr-check:
+//   в main TrimExcess считает размер иначе) —
+//   src/libraries/System.Private.CoreLib/src/System/Collections/Generic/;
+//   HashHelpers.SerializationInfoTable.cs (тот же коммит) и HashHelpers.cs
+//   (тег v10.0.5; в main он переехал в Common/) —
+//   src/libraries/System.Private.CoreLib/src/System/Collections/
+//
 // Правило пробы: чужой файл НЕ правится. Всё, чего ему не хватает, живёт здесь
 // или дописано к нашим типам. Тогда новая версия из dotnet/runtime ложится
 // поверх копированием, а цена переноса видна одним этим файлом. Правка
@@ -196,6 +206,9 @@ namespace System
         internal const string InvalidOperation_IComparerFailed = "Failed to compare two elements in the array.";
         internal const string NotSupported_ReadOnlyCollection = "Collection is read-only.";
 
+        // Фаза N10d: HashHelpers.cs (Common) зовёт SR напрямую.
+        internal const string Arg_HTCapacityOverflow = "Hashtable's capacity overflowed and went negative. Check load factor, capacity and the current size of the table.";
+
         // У .NET это string.Format с текущей культурой; культур у среды нет,
         // и форматирование здесь всегда инвариантное.
         internal static string Format(string resourceFormat, object p1) => string.Format(resourceFormat, p1);
@@ -215,10 +228,14 @@ namespace System
         comparison,
         converter,
         count,
+        dictionary,
         index,
+        info,
         item,
+        key,
         list,
         match,
+        other,
         startIndex,
         value,
     }
@@ -237,7 +254,12 @@ namespace System
         ArgumentOutOfRange_SmallCapacity,
         Argument_InvalidOffLen,
         InvalidOperation_IComparerFailed,
+        InvalidOperation_IncompatibleComparer,
+        NotSupported_KeyCollectionSet,
         NotSupported_ReadOnlyCollection,
+        NotSupported_ValueCollectionSet,
+        Serialization_MissingKeys,
+        Serialization_NullKey,
     }
 
     public class PlatformNotSupportedException : NotSupportedException
@@ -302,6 +324,11 @@ namespace System.Collections
             ExceptionResource.Argument_InvalidOffLen => SR.Argument_InvalidOffLen,
             ExceptionResource.InvalidOperation_IComparerFailed => SR.InvalidOperation_IComparerFailed,
             ExceptionResource.NotSupported_ReadOnlyCollection => SR.NotSupported_ReadOnlyCollection,
+            ExceptionResource.InvalidOperation_IncompatibleComparer => CoreLibIncompatibleComparer,
+            ExceptionResource.NotSupported_KeyCollectionSet => SR.NotSupported_KeyCollectionSet,
+            ExceptionResource.NotSupported_ValueCollectionSet => SR.NotSupported_ValueCollectionSet,
+            ExceptionResource.Serialization_MissingKeys => CoreLibSerializationMissingKeys,
+            ExceptionResource.Serialization_NullKey => CoreLibSerializationNullKey,
             _ => resource.ToString(),
         };
 
@@ -355,6 +382,35 @@ namespace System.Collections
 
         internal static void ThrowWrongValueTypeArgumentException<T>(T value, Type targetType) =>
             throw new ArgumentException(SR.Format(CoreLibWrongType, (object)value, targetType), nameof(value));
+
+        // Члены ThrowHelper из CoreLib, которыми пользуются Dictionary и HashSet
+        // (фаза N10d). Тексты — Strings.resx CoreLib того же коммита; имена без
+        // близнеца в System.Collections лежат здесь, а не в SR.
+        private const string CoreLibConcurrentOperations = "Operations that change non-concurrent collections must have exclusive access. A concurrent update was performed on this collection and corrupted its state. The collection's state is no longer correct.";
+        private const string CoreLibIncompatibleComparer = "The collection's comparer does not support the requested operation.";
+        private const string CoreLibSerializationMissingKeys = "The Keys for this Hashtable are missing.";
+        private const string CoreLibSerializationNullKey = "One of the serialized keys is null.";
+
+        internal static void ThrowInvalidOperationException_ConcurrentOperationsNotSupported() =>
+            throw new InvalidOperationException(CoreLibConcurrentOperations);
+
+        internal static void ThrowArgumentOutOfRangeException_NeedNonNegNum(string paramName) =>
+            throw new ArgumentOutOfRangeException(paramName, SR.ArgumentOutOfRange_NeedNonNegNum);
+
+        internal static void ThrowArgumentOutOfRangeException(ExceptionArgument argument) =>
+            throw new ArgumentOutOfRangeException(argument.ToString());
+
+        internal static void ThrowKeyNotFoundException<T>(T key) =>
+            throw new Generic.KeyNotFoundException(SR.Format(SR.Arg_KeyNotFoundWithKey, (object)key));
+
+        internal static void ThrowWrongKeyTypeArgumentException<T>(T key, Type targetType) =>
+            throw new ArgumentException(SR.Format(CoreLibWrongType, (object)key, targetType), nameof(key));
+
+        internal static void ThrowAddingDuplicateWithKeyArgumentException<T>(T key) =>
+            throw new ArgumentException(SR.Format(SR.Argument_AddingDuplicate, (object)key));
+
+        internal static void ThrowSerializationException(ExceptionResource resource) =>
+            throw new Runtime.Serialization.SerializationException(Resource(resource));
     }
 }
 
@@ -727,6 +783,19 @@ namespace System.Runtime.Serialization
         }
 
         public int GetInt32(string name) => (int)GetValue(name, typeof(int));
+
+        // Тип, под которым объект был бы записан (фаза N10d,
+        // NonRandomizedStringEqualityComparer пишет себя как GenericEqualityComparer).
+        public Type ObjectType { get; private set; }
+
+        public void SetType(Type type)
+        {
+            if (type == null)
+            {
+                throw new ArgumentNullException("type");
+            }
+            ObjectType = type;
+        }
     }
 
     public class SerializationException : SystemException
@@ -751,6 +820,9 @@ namespace System.Numerics
             }
             return log;
         }
+
+        // Хеш строк (фаза N10d, String.cs) вращает слово на пять бит.
+        public static uint RotateLeft(uint value, int offset) => (value << offset) | (value >> (32 - offset));
     }
 }
 
@@ -1121,6 +1193,91 @@ namespace System.Runtime.CompilerServices
         // даёт `sizeof(T)` у среды, — частное выходит номером элемента.
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern IntPtr ByteOffset<T>(ref T origin, ref T target);
+
+        // Ссылка в никуда (фаза N10d): Dictionary и HashSet из CoreLib отдают
+        // `ref` на найденное значение, а «не найдено» у них — пустая ссылка. У
+        // среды это отдельный вид места (`Pointer::Null`, value.rs): чтение и
+        // запись через него — NullReferenceException, сравнение — только здесь.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern ref T NullRef<T>();
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern bool IsNullRef<T>(ref readonly T source);
+
+        // У .NET приведение без проверки. Здесь — обычное приведение: значения
+        // среды несут свой тип, и подменить его нечем; единственное место вызова
+        // (AlternateLookup) проверяет тип строкой раньше через `is`.
+        public static T As<T>(object o) where T : class => (T)o;
+    }
+
+    // `ref readonly` у параметра компилятор помечает этим атрибутом; тип нужен,
+    // чтобы `IsNullRef(in …)` из HashSet собрался.
+    [AttributeUsage(AttributeTargets.Parameter, Inherited = false)]
+    public sealed class RequiresLocationAttribute : Attribute
+    {
+    }
+
+    // `allows ref struct` у параметра типа (AlternateLookup) и статический
+    // метод в интерфейсе (IInternalStringEqualityComparer) компилятор разрешает
+    // только среде, объявившей эти возможности (CS8701, CS9500).
+    public static class RuntimeFeature
+    {
+        public const string ByRefLikeGenerics = nameof(ByRefLikeGenerics);
+
+        public const string DefaultImplementationsOfInterfaces = nameof(DefaultImplementationsOfInterfaces);
+
+        public static bool IsSupported(string feature) => feature == ByRefLikeGenerics || feature == DefaultImplementationsOfInterfaces;
+    }
+
+    // Таблица «объект → данные» для конструктора десериализации Dictionary и
+    // HashSet (HashHelpers.SerializationInfoTable). У .NET ключ держится слабо и
+    // запись уходит вместе с объектом; здесь — список пар по ссылке: форматтера
+    // нет, тот конструктор никто не зовёт, и таблица остаётся пустой.
+    public sealed class ConditionalWeakTable<TKey, TValue>
+        where TKey : class
+        where TValue : class
+    {
+        private readonly List<KeyValuePair<TKey, TValue>> pairs = new List<KeyValuePair<TKey, TValue>>();
+
+        public void Add(TKey key, TValue value)
+        {
+            if (key == null)
+            {
+                throw new ArgumentNullException("key");
+            }
+            if (TryGetValue(key, out _))
+            {
+                throw new ArgumentException("Key already exists.");
+            }
+            pairs.Add(new KeyValuePair<TKey, TValue>(key, value));
+        }
+
+        public bool TryGetValue(TKey key, out TValue value)
+        {
+            for (int i = 0; i < pairs.Count; i++)
+            {
+                if (ReferenceEquals(pairs[i].Key, key))
+                {
+                    value = pairs[i].Value;
+                    return true;
+                }
+            }
+            value = null;
+            return false;
+        }
+
+        public bool Remove(TKey key)
+        {
+            for (int i = 0; i < pairs.Count; i++)
+            {
+                if (ReferenceEquals(pairs[i].Key, key))
+                {
+                    pairs.RemoveAt(i);
+                    return true;
+                }
+            }
+            return false;
+        }
     }
 }
 
@@ -1131,5 +1288,185 @@ namespace System.Runtime.InteropServices
         public static ref T GetReference<T>(Span<T> span) => ref span.Reference;
 
         public static ref readonly T GetReference<T>(ReadOnlySpan<T> span) => ref span[0];
+    }
+}
+
+// ---- Фаза N10d: Dictionary<TKey, TValue> и HashSet<T> из CoreLib ----
+//
+// Взяты тем же путём: Dictionary.cs, HashSet.cs, HashSetEqualityComparer.cs,
+// InsertionBehavior.cs, NonRandomizedStringEqualityComparer.cs,
+// IInternalStringEqualityComparer.cs, IAlternateEqualityComparer.cs,
+// HashHelpers.SerializationInfoTable.cs —
+// src/libraries/System.Private.CoreLib/src/System/Collections/(Generic/);
+// HashHelpers.cs — src/libraries/Common/src/System/Collections/. Рукописные
+// Dictionary и HashSet удалены. Что это даёт программе: порядок обхода после
+// удалений и повторных вставок (список свободных записей), простые размеры
+// таблиц (`EnsureCapacity` возвращает их), поиск по срезу знаков без
+// строки (`GetAlternateLookup<ReadOnlySpan<char>>`), `CollectionsMarshal`.
+//
+// Не взято: BitArray.cs — он весь на Vector128/256/512 и переосмыслении int[]
+// как байтов (MemoryMarshal.Cast), это модель памяти, а не файл. Из-за него не
+// взят и CollectionsMarshal.cs: его AsBytes(BitArray) читает поле BitArray.
+// Остальные члены CollectionsMarshal повторены здесь дословно.
+
+namespace System.Runtime.InteropServices
+{
+    public static class CollectionsMarshal
+    {
+        public static Span<T> AsSpan<T>(List<T> list)
+        {
+            Span<T> span = default;
+            if (list != null)
+            {
+                int size = list._size;
+                T[] items = list._items;
+                if ((uint)size > (uint)items.Length)
+                {
+                    System.Collections.ThrowHelper.ThrowInvalidOperationException_ConcurrentOperationsNotSupported();
+                }
+                span = new Span<T>(items, 0, size);
+            }
+            return span;
+        }
+
+        public static ref TValue GetValueRefOrNullRef<TKey, TValue>(Dictionary<TKey, TValue> dictionary, TKey key)
+            => ref dictionary.FindValue(key);
+
+        public static ref TValue GetValueRefOrNullRef<TKey, TValue, TAlternateKey>(Dictionary<TKey, TValue>.AlternateLookup<TAlternateKey> dictionary, TAlternateKey key)
+            where TAlternateKey : allows ref struct
+            => ref dictionary.FindValue(key, out _);
+
+        public static ref TValue GetValueRefOrAddDefault<TKey, TValue>(Dictionary<TKey, TValue> dictionary, TKey key, out bool exists)
+            => ref Dictionary<TKey, TValue>.CollectionsMarshalHelper.GetValueRefOrAddDefault(dictionary, key, out exists);
+
+        public static ref TValue GetValueRefOrAddDefault<TKey, TValue, TAlternateKey>(Dictionary<TKey, TValue>.AlternateLookup<TAlternateKey> dictionary, TAlternateKey key, out bool exists)
+            where TAlternateKey : allows ref struct
+            => ref dictionary.GetValueRefOrAddDefault(key, out exists);
+
+        public static void SetCount<T>(List<T> list, int count)
+        {
+            if (count < 0)
+            {
+                System.Collections.ThrowHelper.ThrowArgumentOutOfRangeException_NeedNonNegNum(nameof(count));
+            }
+            list._version++;
+            if (count > list.Capacity)
+            {
+                list.Grow(count);
+            }
+            else if (count < list._size && System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                Array.Clear(list._items, count, list._size - count);
+            }
+            list._size = count;
+        }
+    }
+}
+
+namespace System.Collections.Generic
+{
+    // Сравнитель строк со случайным хешем: Dictionary и HashSet переходят на
+    // него, когда в одной цепочке набирается больше 100 коллизий
+    // (HashHelpers.HashCollisionThreshold). У .NET это Marvin32 с ключом из
+    // генератора случайных чисел (Marvin.cs — на указателях, не взят); здесь
+    // тот же хеш, что у NonRandomizedStringEqualityComparer, перемешанный с
+    // числом, взятым при первом обращении. Программа видит только сам переход:
+    // хеш строки у .NET и так свой в каждом запуске.
+    internal abstract class RandomizedStringEqualityComparer : EqualityComparer<string>, IInternalStringEqualityComparer
+    {
+        private static readonly uint seed = (uint)Environment.TickCount * 2654435761u + 0x9E3779B9u;
+        private readonly IEqualityComparer<string> underlyingComparer;
+
+        private RandomizedStringEqualityComparer(IEqualityComparer<string> underlyingComparer)
+        {
+            this.underlyingComparer = underlyingComparer;
+        }
+
+        internal static RandomizedStringEqualityComparer Create(IEqualityComparer<string> underlyingComparer, bool ignoreCase) =>
+            ignoreCase ? new OrdinalIgnoreCaseComparer(underlyingComparer) : new OrdinalComparer(underlyingComparer);
+
+        public IEqualityComparer<string> GetUnderlyingEqualityComparer() => underlyingComparer;
+
+        private static int Mix(int hash)
+        {
+            uint mixed = ((uint)hash ^ seed) * 0x85EBCA6Bu;
+            return (int)(mixed ^ (mixed >> 13));
+        }
+
+        private sealed class OrdinalComparer : RandomizedStringEqualityComparer, IAlternateEqualityComparer<ReadOnlySpan<char>, string>
+        {
+            internal OrdinalComparer(IEqualityComparer<string> wrappedComparer) : base(wrappedComparer)
+            {
+            }
+
+            public override bool Equals(string x, string y) => string.Equals(x, y);
+
+            public override int GetHashCode(string obj) => obj == null ? 0 : Mix(obj.GetNonRandomizedHashCode());
+
+            int IAlternateEqualityComparer<ReadOnlySpan<char>, string>.GetHashCode(ReadOnlySpan<char> span) =>
+                Mix(string.GetNonRandomizedHashCode(span));
+
+            bool IAlternateEqualityComparer<ReadOnlySpan<char>, string>.Equals(ReadOnlySpan<char> span, string target) =>
+                !(span.IsEmpty && target == null) && span.SequenceEqual(target);
+
+            string IAlternateEqualityComparer<ReadOnlySpan<char>, string>.Create(ReadOnlySpan<char> span) => span.ToString();
+        }
+
+        private sealed class OrdinalIgnoreCaseComparer : RandomizedStringEqualityComparer, IAlternateEqualityComparer<ReadOnlySpan<char>, string>
+        {
+            internal OrdinalIgnoreCaseComparer(IEqualityComparer<string> wrappedComparer) : base(wrappedComparer)
+            {
+            }
+
+            public override bool Equals(string x, string y) => string.Equals(x, y, StringComparison.OrdinalIgnoreCase);
+
+            public override int GetHashCode(string obj) => obj == null ? 0 : Mix(obj.GetNonRandomizedHashCodeOrdinalIgnoreCase());
+
+            int IAlternateEqualityComparer<ReadOnlySpan<char>, string>.GetHashCode(ReadOnlySpan<char> span) =>
+                Mix(string.GetNonRandomizedHashCodeOrdinalIgnoreCase(span));
+
+            bool IAlternateEqualityComparer<ReadOnlySpan<char>, string>.Equals(ReadOnlySpan<char> span, string target) =>
+                !(span.IsEmpty && target == null) && span.EqualsOrdinalIgnoreCase(target);
+
+            string IAlternateEqualityComparer<ReadOnlySpan<char>, string>.Create(ReadOnlySpan<char> span) => span.ToString();
+        }
+    }
+
+    // У .NET — сравнитель для `T : IEquatable<T>` из EqualityComparer.cs (тот
+    // создаёт сравнители отражением среды и не взят). Здесь тип нужен ради
+    // одного `typeof`: NonRandomizedStringEqualityComparer записывает себя под
+    // этим именем в SerializationInfo. Без ограничения на T: наша строка не
+    // объявляет IEquatable<string>, а сравнение по умолчанию и так через него.
+    internal sealed class GenericEqualityComparer<T> : EqualityComparer<T>
+    {
+        public override bool Equals(T x, T y) => Default.Equals(x, y);
+
+        public override int GetHashCode(T obj) => Default.GetHashCode(obj);
+    }
+
+    // Пустой перечислитель с общим экземпляром: его отдаёт пустой словарь
+    // (Dictionary.cs, IEnumerable<KeyValuePair>.GetEnumerator). У .NET это
+    // GenericEmptyEnumerator<T> из Collections/Generic/IEnumerator.cs.
+    internal sealed class GenericEmptyEnumerator<T> : IEnumerator<T>
+    {
+        public static readonly GenericEmptyEnumerator<T> Instance = new GenericEmptyEnumerator<T>();
+
+        private GenericEmptyEnumerator()
+        {
+        }
+
+        public T Current => throw new InvalidOperationException(SR.InvalidOperation_EnumOpCantHappen);
+
+        object System.Collections.IEnumerator.Current => Current;
+
+        public bool MoveNext() => false;
+
+        public void Reset()
+        {
+        }
+
+        public void Dispose()
+        {
+        }
     }
 }

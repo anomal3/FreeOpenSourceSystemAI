@@ -51,21 +51,19 @@ namespace System.Linq
 
         public static IEnumerable<TResult> Empty<TResult>() => Array.Empty<TResult>();
 
+        // Range и Repeat у .NET — не просто перечислители, а списки только для
+        // чтения (`IList<T>`): коллекция, построенная из них, узнаёт число
+        // элементов заранее и берёт таблицу нужного размера (фаза N10d —
+        // `new HashSet<int>(Enumerable.Range(0, 20))` у .NET получает ёмкость
+        // 23, а не растёт 3 → 7 → 17 → 37; программа видит это через
+        // `EnsureCapacity(0)`). Пустой диапазон — пустой массив, как у .NET.
         public static IEnumerable<int> Range(int start, int count)
         {
             if (count < 0 || (long)start + count - 1 > int.MaxValue)
             {
                 throw new ArgumentOutOfRangeException("count");
             }
-            return RangeIterator(start, count);
-        }
-
-        private static IEnumerable<int> RangeIterator(int start, int count)
-        {
-            for (int i = 0; i < count; i++)
-            {
-                yield return start + i;
-            }
+            return count == 0 ? Array.Empty<int>() : new RangeIterator(start, count);
         }
 
         public static IEnumerable<TResult> Repeat<TResult>(TResult element, int count)
@@ -74,15 +72,124 @@ namespace System.Linq
             {
                 throw new ArgumentOutOfRangeException("count");
             }
-            return RepeatIterator(element, count);
+            return count == 0 ? Array.Empty<TResult>() : new RepeatIterator<TResult>(element, count);
         }
 
-        private static IEnumerable<TResult> RepeatIterator<TResult>(TResult element, int count)
+        private abstract class ReadOnlyListIterator<T> : IList<T>, IReadOnlyList<T>
         {
-            for (int i = 0; i < count; i++)
+            public abstract int Count { get; }
+
+            public abstract T this[int index] { get; }
+
+            T IList<T>.this[int index]
             {
-                yield return element;
+                get => this[index];
+                set => throw new NotSupportedException("Collection is read-only.");
             }
+
+            public bool IsReadOnly => true;
+
+            public abstract IEnumerator<T> GetEnumerator();
+
+            IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+            public abstract bool Contains(T item);
+
+            public abstract int IndexOf(T item);
+
+            public void CopyTo(T[] array, int arrayIndex)
+            {
+                for (int i = 0; i < Count; i++)
+                {
+                    array[arrayIndex + i] = this[i];
+                }
+            }
+
+            public void Add(T item) => throw new NotSupportedException("Collection is read-only.");
+
+            public void Clear() => throw new NotSupportedException("Collection is read-only.");
+
+            public void Insert(int index, T item) => throw new NotSupportedException("Collection is read-only.");
+
+            public bool Remove(T item) => throw new NotSupportedException("Collection is read-only.");
+
+            public void RemoveAt(int index) => throw new NotSupportedException("Collection is read-only.");
+        }
+
+        private sealed class RangeIterator : ReadOnlyListIterator<int>
+        {
+            private readonly int start;
+            private readonly int count;
+
+            public RangeIterator(int start, int count)
+            {
+                this.start = start;
+                this.count = count;
+            }
+
+            public override int Count => count;
+
+            public override int this[int index]
+            {
+                get
+                {
+                    if ((uint)index >= (uint)count)
+                    {
+                        throw new ArgumentOutOfRangeException("index");
+                    }
+                    return start + index;
+                }
+            }
+
+            public override IEnumerator<int> GetEnumerator()
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    yield return start + i;
+                }
+            }
+
+            public override bool Contains(int item) => (uint)(item - start) < (uint)count;
+
+            public override int IndexOf(int item) => Contains(item) ? item - start : -1;
+        }
+
+        private sealed class RepeatIterator<T> : ReadOnlyListIterator<T>
+        {
+            private readonly T element;
+            private readonly int count;
+
+            public RepeatIterator(T element, int count)
+            {
+                this.element = element;
+                this.count = count;
+            }
+
+            public override int Count => count;
+
+            public override T this[int index]
+            {
+                get
+                {
+                    if ((uint)index >= (uint)count)
+                    {
+                        throw new ArgumentOutOfRangeException("index");
+                    }
+                    return element;
+                }
+            }
+
+            public override IEnumerator<T> GetEnumerator()
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    yield return element;
+                }
+            }
+
+            public override bool Contains(T item) => EqualityComparer<T>.Default.Equals(element, item);
+
+            public override int IndexOf(T item) => Contains(item) ? 0 : -1;
         }
 
         // ----------------------------------------------------------------

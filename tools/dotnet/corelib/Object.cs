@@ -648,6 +648,20 @@ namespace System
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern void Clear(Array array, int index, int length);
 
+        // Фаза N10d: HashSet из CoreLib обнуляет массив целиком и копирует
+        // массивы записей при построении множества из другого множества.
+        public static void Clear(Array array)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            Clear(array, 0, array.Length);
+        }
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public extern object Clone();
+
         // Копирование поэлементно (фаза N9): `Array.Copy(Array, Array, int)`
         // без обобщения потребовал бы члена среды с разбором типов элементов,
         // а базовой библиотеке хватает типизированного.

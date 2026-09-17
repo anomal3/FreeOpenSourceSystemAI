@@ -4053,9 +4053,67 @@ GPLv2 в проект GPLv3 не переносится.
   необобщённый `IList`, тексты исключений, `HashSet` как `ISet`. Совпал с
   dotnet; остальные 28 запусков — тоже.
 
-**Дальше по той же линии:** `HashSet<T>` и `Dictionary<TKey, TValue>` из
-CoreLib — `CollectionsMarshal`, `ref` на поля записей и сравнители строк
-`NonRandomized…`; `BitArray`. Regex и LINQ — по-прежнему отдельная оценка.
+**N10d — `Dictionary<TKey, TValue>` и `HashSet<T>` (2026-09-17).**
+
+- **Взяты из CoreLib:** `Dictionary.cs`, `HashSet.cs`, `HashSetEqualityComparer.cs`,
+  `InsertionBehavior.cs`, `NonRandomizedStringEqualityComparer.cs`,
+  `IInternalStringEqualityComparer.cs`, `IAlternateEqualityComparer.cs`,
+  `HashHelpers.SerializationInfoTable.cs`; из Common — `HashHelpers.cs`. Девять
+  файлов, без правок. Рукописные `Dictionary` и `HashSet` удалены. Что это даёт
+  программе: **порядок обхода после удалений и повторных вставок** (список
+  свободных записей — новая пара занимает последнюю освободившуюся), простые
+  размеры таблиц (`EnsureCapacity` и `TrimExcess` их возвращают), удаление во
+  время обхода без исключения, **поиск по срезу знаков без строки**
+  (`GetAlternateLookup<ReadOnlySpan<char>>`) и `CollectionsMarshal` — ссылка
+  на значение внутри словаря.
+- **Не взяты:** `BitArray.cs` — он весь на `Vector128/256/512` и
+  переосмыслении `int[]` как байтов (`MemoryMarshal.Cast`): модель памяти, а не
+  файл. Из-за него не взят и `CollectionsMarshal.cs`: его `AsBytes(BitArray)`
+  читает поле `BitArray`; остальные члены повторены дословно в DotnetSupport.
+  `RandomizedStringEqualityComparer.cs` — Marvin32 на указателях; своя запись
+  хеширует тем же нерандомизированным хешем, перемешанным с числом от запуска
+  (словарь переходит на него после 100 коллизий в одной цепочке).
+- **В среде:** `Pointer::Null` — ссылка в никуда (`Unsafe.NullRef<T>()`): так
+  чужой словарь говорит «не найдено» из метода, отдающего `ref`; чтение и
+  запись через неё — `NullReferenceException`, распознаёт её только
+  `Unsafe.IsNullRef`. `Array.Clone()`. Всё остальное — `ref` на поле записи
+  внутри массива структур, `ref` через `ldflda` по указателю — уже умела.
+- **В C#:** нерандомизированный хеш строки алгоритмом `String.Comparison.cs`,
+  переписанным по номерам знаков (у .NET он читает пары знаков указателем и за
+  концом нечётной строки — завершающий ноль; значения совпадают), `string →
+  ReadOnlySpan<char>` (копией знаков), `ReadOnlySpan.Slice/ToString`,
+  `MemoryExtensions.SequenceEqual/BinarySearch`, `RuntimeFeature`
+  (`allows ref struct` — CS9500, статический метод в интерфейсе — CS8701),
+  `RequiresLocationAttribute` (`ref readonly`), `ConditionalWeakTable` списком
+  пар, `Array.Clear(Array)`, `TARGET_64BIT` в csproj (множитель для быстрого
+  остатка от деления). Ловушки: у `char` и `string` нашей corelib нет
+  `IEquatable<T>` — ограничение `where T : IEquatable<T>` у своих помощников
+  снято; `HashHelpers.cs` из Common зовёт `SR` напрямую, в отличие от файлов
+  CoreLib.
+- **Ловушка: main ушёл вперёд от установленного .NET.** `Dictionary.cs`,
+  `HashSet.cs` и `HashHelpers.cs` с коммита `bb31474e` (main, сентябрь 2026)
+  считают `TrimExcess` иначе, чем .NET 10.0.5 на этой машине: там
+  `GetPrimeAtLeast` (ближайшее простое, 61 для 60), здесь `GetPrime` (из
+  таблицы, 71). Сверка идёт с установленным dotnet, поэтому эти три файла
+  взяты с **тега `v10.0.5`**; остальные шесть на теге и в main совпадают
+  байт в байт. Правило на будущее: файлы CoreLib брать с тега той версии, что
+  стоит у нас, а не с main.
+- **Ловушка в своём Linq:** у .NET `Enumerable.Range` и `Repeat` — списки
+  только для чтения (`IList<T>`), и `new HashSet<int>(Enumerable.Range(0, 20))`
+  сразу берёт таблицу на 23; наш `Range` был простым перечислителем, и
+  множество росло 3 → 7 → 17 → 37 — программа видит это через
+  `EnsureCapacity(0)`. Теперь `Range` и `Repeat` — списки, как у .NET.
+- **Образец `dict`** — 28 строк, код 21: порядок обхода после удалений и
+  повторных вставок, удаление во время обхода, простые размеры таблиц,
+  сравнители (`OrdinalIgnoreCase`, свой, что возвращает `Comparer`),
+  `TryAdd`/`Remove(key, out)`, тексты исключений, необобщённый `IDictionary`,
+  коллекции ключей и значений, поиск по срезу знаков (`AlternateLookup` у
+  словаря и множества), `CollectionsMarshal`, операции над множествами через
+  массив и через множество, `CreateSetComparer`. Совпал с dotnet; остальные
+  29 запусков — тоже.
+
+**Дальше по той же линии:** `BitArray` только после указателей в среде;
+Regex и LINQ — по-прежнему отдельная оценка.
 
 **Размер вехи.** XL, несколько месяцев. Первый видимый результат — фаза N2.
 

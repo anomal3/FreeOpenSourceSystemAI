@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE), ("sorted", SORTED), ("nullable", NULLABLE), ("listsort", LISTSORT), ("drawing", DRAWING)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE), ("sorted", SORTED), ("nullable", NULLABLE), ("listsort", LISTSORT), ("dict", DICT), ("drawing", DRAWING)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -1084,6 +1084,53 @@ fn list_and_sort_print_what_dotnet_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, LISTSORT_OUTPUT);
     assert_eq!(code, 16);
+}
+
+/// Образец `tools/dotnet/samples/dict` (фаза N10d): Dictionary<TKey, TValue> и
+/// HashSet<T> из dotnet/runtime.
+const DICT: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/dict.dll");
+
+/// Что печатает `dotnet dict.dll` (записано 2026-09-17, .NET 10.0.5, LF).
+/// `order`, `odd removed`, `sym` и `union` — порядок обхода после удалений и
+/// повторных вставок: его решает список свободных записей; `capacity`,
+/// `trimmed` и `trim` — простые числа из таблицы HashHelpers.
+const DICT_OUTPUT: &str = concat!(
+    "dict: start\n",
+    "order: k0=0,n1=11,k2=2,n3=13,k4=4,k5=5,k6=6,n2=12,k8=8,k9=9,n4=14\n",
+    "keys: k0,n1,k2,n3,k4,k5,k6,n2,k8,k9,n4 | 0,11,2,13,4,5,6,12,8,9,14 | 11\n",
+    "capacity: 11 23 107 3\n",
+    "trimmed: 71 50\n",
+    "odd removed: 27 0,14,28,42,56,70 1001,336,1000\n",
+    "ignore case: 1 True True True True True\n",
+    "custom: two False ByLength 2\n",
+    "try: False True True 26 False 0\n",
+    "missing: KeyNotFoundException: The given key 'nope' was not present in the dictionary. | ArgumentException: An item with the same key has already been added. Key: k0 | ArgumentNullException: Value cannot be null. (Parameter 'key') | ArgumentOutOfRangeException: Specified argument was out of the range of valid values. (Parameter 'capacity')\n",
+    "untyped: 0 True True ArgumentException: The value \"5\" is not of type \"System.String\" and cannot be used in this generic collection. (Parameter 'key') | ArgumentException: The value \"text\" is not of type \"System.Int32\" and cannot be used in this generic collection. (Parameter 'value') False False\n",
+    "entries: k0:0,n1:11,k2:2\n",
+    "copied: -,k0,n1,k2,n3,k4,k5,k6,n2,k8,k9,n4 ArgumentException: Destination array is not long enough to copy all the items in the collection. Check array index and length. | NotSupportedException: Mutating a key collection derived from a dictionary is not allowed. True False\n",
+    "span: 2 False True n4 14 True 10 True False True\n",
+    "span added: 7 KeyNotFoundException: The given key 'zz' was not present in the dictionary. | InvalidOperationException: The collection's comparer does not support the requested operation.\n",
+    "marshal: False True 10 True 3\n",
+    "copies: 0 17 n1,n3,n2 12\n",
+    "set: 0,3,6,9,1,4,7,10,2,5,8,11 12 False True True 0,3,6,9,1,4,7,10,2,5,8,11\n",
+    "sym: 1,2,22,21,6,7,8,9,10,11,12,13,14,4,16,17,18,19\n",
+    "sym set: 30,31,22,21,6,7,8,9,10,11,12,13,14,4,16,17,18,19 False True True True True\n",
+    "intersect: 30,31,22,21,10,11,12,13,14,16,17,18,19 13\n",
+    "union: 31,21,7,11,13,5,17,19 8 23 59\n",
+    "trim: 11 8 True 7 False 0\n",
+    "words: Apple,banana,Cherry True True False True Apple,banana,date True True Apple\n",
+    "set comparer: True False True 1\n",
+    "copy: 0,31,21,7,0,0,0,0,0,0 ArgumentException: Destination array is not long enough to copy all the items in the collection. Check array index and length. | ArgumentException: Destination array is not long enough to copy all the items in the collection. Check array index and length.\n",
+    "modified: InvalidOperationException: Collection was modified; enumeration operation may not execute. | InvalidOperationException: Collection was modified; enumeration operation may not execute.\n",
+    "dict: done\n",
+);
+
+#[test]
+fn dictionary_and_hash_set_print_what_dotnet_prints() {
+    let (result, output) = run(DICT);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, DICT_OUTPUT);
+    assert_eq!(code, 21);
 }
 
 /// Образец `tools/dotnet/samples/drawing` (фаза N9): System.Drawing на Bitmap с
