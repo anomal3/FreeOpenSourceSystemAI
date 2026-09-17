@@ -1055,6 +1055,18 @@ fn play(
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
+            Step::DoubleClick => {
+                say!("  [{at:>6} мс] шаг {index}: двойной щелчок");
+                for _ in 0..2 {
+                    press_button(qmp.as_deref_mut(), hmp, true)
+                        .with_context(|| format!("шаг {index}"))?;
+                    std::thread::sleep(POINTER_DELAY);
+                    press_button(qmp.as_deref_mut(), hmp, false)
+                        .with_context(|| format!("шаг {index}"))?;
+                    std::thread::sleep(POINTER_DELAY);
+                }
+                std::thread::sleep(KEY_DELAY);
+            }
             Step::RightClick => {
                 say!("  [{at:>6} мс] шаг {index}: щелчок правой");
                 press_right(qmp.as_deref_mut(), hmp, true)

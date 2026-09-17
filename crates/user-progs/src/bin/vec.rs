@@ -25,7 +25,7 @@
 
 use core::arch::asm;
 
-use user_progs::{Args, exit, print, print_u64, println};
+use user_progs::{Args, Line, exit, println};
 
 /// Сколько раз повторяется цикл «записать — уступить — сверить».
 ///
@@ -55,9 +55,10 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         }
     };
 
-    print("vec ");
-    print_u64(tag);
-    println(": filling eight vector registers and yielding");
+    // Каждая строка — одним системным вызовом ([`Line`]): рядом идёт второй
+    // экземпляр и службы init, и строка, собранная из пяти `print`, в журнале
+    // срастается с чужой — стенд ищет её целиком.
+    Line::new().str("vec ").num(tag).str(": filling eight vector registers and yielding").end();
 
     let mut failures = 0u64;
     for _ in 0..ROUNDS {
@@ -69,20 +70,18 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     }
 
     if failures == 0 {
-        print("vec ");
-        print_u64(tag);
-        print(": ");
-        print_u64(ROUNDS);
-        println(" checks passed");
+        Line::new().str("vec ").num(tag).str(": ").num(ROUNDS).str(" checks passed").end();
         exit(0)
     } else {
-        print("vec ");
-        print_u64(tag);
-        print(": MISMATCH in ");
-        print_u64(failures);
-        print(" of ");
-        print_u64(ROUNDS);
-        println(" checks");
+        Line::new()
+            .str("vec ")
+            .num(tag)
+            .str(": MISMATCH in ")
+            .num(failures)
+            .str(" of ")
+            .num(ROUNDS)
+            .str(" checks")
+            .end();
         exit(1)
     }
 }

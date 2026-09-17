@@ -155,14 +155,40 @@ pub fn system_file_name(version: &str) -> String {
     format!("freeos-{version}.fpk")
 }
 
+/// Меньше какого размера образ корня для обновления не бывает.
+///
+/// Сам размер считается по содержимому ([`update_root_bytes`]): образ **меньше**
+/// раздела, в который ляжет, и это не экономия: ext2 описывает свой размер в
+/// суперблоке, поэтому файловая система на 24 МиБ, записанная в начало раздела
+/// на гигабайт, монтируется и работает — просто не пользуется остатком. Гнать
+/// по линии гигабайт нулей ради того, чтобы «совпало», было бы бессмысленно.
+const UPDATE_ROOT_MIN_BYTES: u64 = 24 * 1024 * 1024;
+
 /// Сколько места отвести под образ корня, который уезжает в обновление.
 ///
-/// Он **меньше** раздела, в который ляжет, и это не экономия: ext2 описывает
-/// свой размер в суперблоке, поэтому файловая система на 24 МиБ, записанная в
-/// начало раздела на гигабайт, монтируется и работает — просто не пользуется
-/// остатком. Гнать по линии гигабайт нулей ради того, чтобы «совпало», было бы
-/// бессмысленно.
-const UPDATE_ROOT_BYTES: u64 = 24 * 1024 * 1024;
+/// По содержимому, а не константой. Константа в 24 МиБ держалась, пока
+/// программы были мелкими; с фазой 54 в `/bin` едет `big` на шесть мегабайт, и
+/// на aarch64 образ перестал собираться («the filesystem has no free blocks
+/// left») — четыре сценария обновления падали, не запустив гостя. Запас в
+/// четверть — на метаданные ext2 и каталоги; округление до мегабайта — чтобы
+/// размер не менялся от каждого байта в программе.
+fn update_root_bytes(programs: &[(&'static str, PathBuf)]) -> Result<u64> {
+    const MIB: u64 = 1024 * 1024;
+    let mut content = 0u64;
+    for (_, path) in programs {
+        content += fs::metadata(path)
+            .with_context(|| format!("не удалось узнать размер {}", path.display()))?
+            .len();
+    }
+    for (name, _) in crate::arch::PAYLOAD_DOTNET {
+        let source = paths::initrd_source_dir().join("usr/share/dotnet").join(name);
+        content += fs::metadata(&source)
+            .with_context(|| format!("не удалось узнать размер {}", source.display()))?
+            .len();
+    }
+    let wanted = (content + content / 4).div_ceil(MIB) * MIB;
+    Ok(wanted.max(UPDATE_ROOT_MIN_BYTES))
+}
 
 /// Собрать обновление системы: образ корня, ядро и initrd одним контейнером.
 ///
@@ -264,7 +290,7 @@ fn build_root_image(
     programs: &[(&'static str, PathBuf)],
     broken: bool,
 ) -> Result<Vec<u8>> {
-    let sectors = UPDATE_ROOT_BYTES / 512;
+    let sectors = update_root_bytes(programs)? / 512;
     let mut disk = disk::MemDisk::new(sectors)
         .context("не хватило памяти под образ корня для обновления")?;
 

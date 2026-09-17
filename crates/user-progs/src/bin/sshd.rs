@@ -1715,7 +1715,31 @@ impl Pump {
                 // Окно — не пожелание: клиент, прислав больше разрешённого,
                 // либо сломан, либо проверяет, что будет. Принять лишнее
                 // значило бы писать за конец буфера.
-                if data.len() > self.allowance || data.len() > pending.len() - self.end {
+                if data.len() > self.allowance {
+                    error("sshd: the client overran the sftp window; closing\n");
+                    disconnect(
+                        client,
+                        transport,
+                        ssh::DISCONNECT_PROTOCOL_ERROR,
+                        "window exceeded",
+                    );
+                    return None;
+                }
+                // Место под всё разрешённое клиенту есть всегда — шаг 3 держит
+                // `allowance + held == SFTP_WINDOW`, — но есть оно в буфере
+                // целиком, а не обязательно в его хвосте: голова уже слита в
+                // канал программы, а уплотняет буфер шаг 2, и то лишь когда
+                // хвост короче пакета. За один круг шага 1 приходит несколько
+                // пакетов подряд, и второй из них в хвост не влезал — клиента
+                // выкидывали за «превышение окна», которого не было. Стенд
+                // ловил это на aarch64, где канал к `sftp-server` отвечает
+                // `ERR_AGAIN` дольше.
+                if data.len() > pending.len() - self.end && self.start > 0 {
+                    pending.copy_within(self.start..self.end, 0);
+                    self.end -= self.start;
+                    self.start = 0;
+                }
+                if data.len() > pending.len() - self.end {
                     error("sshd: the client overran the sftp window; closing\n");
                     disconnect(
                         client,

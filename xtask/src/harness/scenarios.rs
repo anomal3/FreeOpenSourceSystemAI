@@ -168,6 +168,14 @@ pub enum Step {
     Aim(aim::Aim),
     /// Нажать левую кнопку и отпустить её там же.
     Click,
+    /// Два щелчка подряд с короткими паузами — как щёлкает человек.
+    ///
+    /// Не два `Click`: между теми лежит `KEY_DELAY`, и под нагрузкой (три
+    /// гостя, отладочная сборка) программа успевает начать перерисовку после
+    /// первого, а второй обрабатывает уже за порогом двойного щелчка — порог
+    /// она меряет в момент обработки, метки времени у события нет. Здесь оба
+    /// нажатия ложатся в очередь до конца перерисовки и разбираются подряд.
+    DoubleClick,
     /// Щелчок правой кнопкой — меню рабочего стола.
     RightClick,
     /// Нажать левую кнопку и **не** отпускать — начало перетаскивания.
@@ -1573,8 +1581,7 @@ pub const ALL: &[Scenario] = &[
             // окно ядра. Путь запуска новый: до неё значок умел открывать
             // только окна ядра, а программы запускались единственно из меню.
             Step::Aim(Aim::Icon(0)),
-            Step::Click,
-            Step::Click,
+            Step::DoubleClick,
             Step::Await("desktop     : started '/bin/files'", 15_000),
             // Три строки, и каждая проверяет своё звено: ядро завело задачу,
             // программа попросила окно, программа прочитала каталог. Оборвись
@@ -1594,8 +1601,7 @@ pub const ALL: &[Scenario] = &[
             // Свёрнутый терминал возвращается тем же двойным щелчком по своему
             // значку: «открыть» уже открытое окно — это показать его снова.
             Step::Aim(Aim::Icon(1)),
-            Step::Click,
-            Step::Click,
+            Step::DoubleClick,
             Step::Await("desktop     : restored 'Terminal'", 15_000),
             Step::Wait(1_000),
             // Развернуть на весь стол и вернуть обратно — оба перехода
@@ -1649,8 +1655,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("desktop     : minimized 'Terminal'", 15_000),
             Step::Aim(Aim::Icon(2)),
-            Step::Click,
-            Step::Click,
+            Step::DoubleClick,
             Step::Await("desktop     : opened 'Settings'", 15_000),
             Step::Wait(2_000),
             Step::Shot("08-settings"),
@@ -1689,8 +1694,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("desktop     : context menu closed", 15_000),
             Step::Aim(Aim::Icon(1)),
-            Step::Click,
-            Step::Click,
+            Step::DoubleClick,
             Step::Await("desktop     : restored 'Terminal'", 15_000),
             Step::Wait(1_000),
             Step::Type("exit"),
@@ -2067,6 +2071,11 @@ pub const ALL: &[Scenario] = &[
         extra: &[],
         steps: &[
             Step::Await("freeos> ", BOOT),
+            // Сценарий сверяет число занятых кадров между двумя `mem`, а в это
+            // время ещё крутится sshd: без сети он трижды не может открыть порт и
+            // перезапускается, и каждый его старт и выход двигают счёт. Ждём, пока
+            // он сдастся, — тогда между замерами не меняется ничего.
+            Step::AwaitAny("init: 'sshd' failed 3 time(s) in a row, giving up", 120_000),
             // Прогон на мегабайте — до всякого счёта, и он тут не «на всякий
             // случай». Первый запуск любой программы стоит того, что запуском
             // не является: файл читается с диска впервые, разбирается его ELF,
@@ -2217,11 +2226,14 @@ pub const ALL: &[Scenario] = &[
             // Отсюда `keep`: программа уходит, не прибравшись, и число в строке
             // ядра — единственное доказательство. Восемь мегабайт, а не двести
             // пятьдесят шесть, потому что проверяется не масштаб, а
-            // арифметика: 4 блока по 512 кадров плюс окно программы (768
-            // страниц образа и 16 стека) — ровно 2832.
+            // арифметика: 4 блока по 512 кадров плюс страницы самой программы.
+            // До фазы 54 те были ровно 784 (окно образа в 3 МиБ и стек), и
+            // строка сверялась целиком — 2832; теперь программа занимает
+            // столько, сколько весит её файл, и это число у архитектур разное.
+            // Нижняя граница держит суть проверки: потерянный блок — минус 512.
             Step::Line("run /bin/memtest 8 huge keep"),
             Step::Await("memtest: leaving the region to the teardown", 60_000),
-            Step::Await("  user        : space released, 2832 pages", 60_000),
+            Step::AtLeast("space released, ", 2048 + 17, 60_000),
 
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
@@ -5193,7 +5205,9 @@ pub const ALL: &[Scenario] = &[
             // службы».
             Step::Await("services    : /bin/init started", BOOT),
             Step::Capture("init: started 'logger' as #", 60_000),
-            Step::Await("freeos> ", 60_000),
+            // Приглашение печатает оболочка, а строки выше — init; порядок между
+            // ними не определён, и на x86-64 приглашение уже приходило раньше.
+            Step::AwaitAny("freeos> ", 60_000),
             // `AwaitAny`, а не `Await` и не `Expect`. Строку печатает **служба**,
             // приглашение — оболочка, и порядок между двумя задачами не
             // определён: на AArch64 он оказался обратным, и ожидание приглашения
@@ -7214,8 +7228,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Wait(1_200),
             Step::Absent("files: entered '/bin'"),
-            Step::Click,
-            Step::Click,
+            Step::DoubleClick,
             Step::Await("files: entered '/bin'", 15_000),
             // Свойства — пятый пункт меню записи. Клавиша меню у QEMU зовётся
             // `compose`: это она даёт `E0 5D` и usage 0x65; `menu` у него —
@@ -7343,7 +7356,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("home"),
             Step::Key("ret"),
             Step::Await("taskmgr: opened location /bin for #", 15_000),
-            Step::Await("files: /bin has 36 entries", 30_000),
+            Step::Await("files: /bin has 38 entries", 30_000),
             Step::Wait(1_500),
             Step::Shot("03-location"),
             Step::Aim(Aim::Close("Files")),
