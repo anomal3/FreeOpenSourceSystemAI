@@ -625,6 +625,7 @@ fn run_command(line: &str) -> bool {
             );
         }
         "usb" => usb_status(),
+        "dmesg" => kernel_log(argument),
         "pci" => {
             for line in crate::devices::census_text().lines() {
                 sprintln!("  {line}");
@@ -1131,6 +1132,38 @@ fn sysupdate(argument: &str) {
     }
 }
 
+/// Последние строки журнала ядра.
+///
+/// На машине без последовательной линии журнал видно только на экране, а
+/// строку, напечатанную в миг отказа, никто не успевает прочитать: так было с
+/// USB-клавиатурой ноутбука, гаснущей при входе в стол. Кольцо (`klog`) хранит
+/// её, и после переподключения её можно увидеть этой командой.
+fn kernel_log(argument: &str) {
+    let wanted: usize = if argument.is_empty() {
+        40
+    } else {
+        match argument.parse() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                sprintln!("  dmesg: '{argument}' is not a number of lines");
+                return;
+            }
+        }
+    };
+    // Снимок до печати: то, что команда напечатает сама, в него уже не войдёт.
+    let end = crate::klog::written();
+    let mut bytes = alloc::vec![0u8; crate::klog::CAPACITY];
+    let (count, _) = crate::klog::read(end.saturating_sub(crate::klog::CAPACITY as u64), &mut bytes);
+    let text = alloc::string::String::from_utf8_lossy(&bytes[..count]);
+    let lines: alloc::vec::Vec<&str> = text.lines().collect();
+    // Первая строка кольца может быть обрезана перезаписью — её не показываем.
+    let skip_torn = usize::from(end > crate::klog::CAPACITY as u64);
+    let start = lines.len().saturating_sub(wanted).max(skip_torn.min(lines.len()));
+    for line in &lines[start..] {
+        sprintln!("{line}");
+    }
+}
+
 fn help() {
     sprintln!("  help          this list");
     sprintln!("  uptime        time since the timer started");
@@ -1138,6 +1171,7 @@ fn help() {
     sprintln!("  mem, free     physical frames, heap and DMA window");
     sprintln!("  input         key event counters");
     sprintln!("  usb           xHCI controller state");
+    sprintln!("  dmesg [n]     the last n lines of the kernel log (40 by default)");
     sprintln!("  pci           every device on the bus, with its identifiers");
     sprintln!("  ui            compositor state");
     sprintln!("  tasks         scheduler state");

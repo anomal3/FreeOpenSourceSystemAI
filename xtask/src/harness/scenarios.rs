@@ -781,6 +781,13 @@ pub const ALL: &[Scenario] = &[
             Step::Await("ehci-ok", 15_000),
             Step::Line("usb"),
             Step::AtLeast("  reports  ", 1, 15_000),
+            // Журнал ядра с клавиатуры: строка о контроллере EHCI, напечатанная
+            // при загрузке, достаётся из кольца (`dmesg`), а не из линии.
+            Step::Type("dmesg 400"),
+            Step::Key("ret"),
+            Step::Await("keyboard(s), 1 pointer(s)", 15_000),
+            // Остановок точки прерываний на исправном устройстве нет.
+            Step::Absent("the report endpoint halted"),
             Step::Type("exit"),
             Step::Key("ret"),
             Step::Await("finishing the session", 15_000),

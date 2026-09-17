@@ -529,6 +529,8 @@ struct Device {
     /// же точку 0 одного и того же адреса, чего спецификация не разрешает и что
     /// контроллер обычно переживает как молчание устройства.
     secondary: bool,
+    /// Сколько передач отчёта подряд кончились остановкой точки.
+    halts: u32,
 }
 
 impl Device {
@@ -572,6 +574,10 @@ pub struct Controller {
     services: u64,
     last_error: Option<(u8, Stage, EhciError)>,
     unrecoverable: bool,
+    /// Адреса устройств, которые надо поднять заново: их точка прерываний
+    /// останавливается раз за разом (см. [`RECOVER_AFTER`]). Поднимает сверка
+    /// портов — в задаче и без замка, потому что это сброс порта с паузами.
+    recover: Vec<u8>,
 }
 
 impl Controller {
@@ -682,6 +688,7 @@ impl Controller {
             services: 0,
             last_error: None,
             unrecoverable: false,
+            recover: Vec::new(),
         };
         // SAFETY: окно регистров отображено, буферы выделены и обнулены.
         unsafe { controller.start() }?;
@@ -911,6 +918,7 @@ impl Controller {
             described_by: 0,
             interface: (0, 0),
             secondary: false,
+            halts: 0,
         };
 
         // SAFETY: страница выделена и обнулена.
@@ -1108,6 +1116,7 @@ impl Controller {
             described_by: 0,
             interface: (found.interface, interfaces),
             secondary: true,
+            halts: 0,
         };
 
         // SAFETY: контракт функции; управляющая точка — первой записи.
@@ -1785,6 +1794,26 @@ impl Controller {
     /// Контроллер работает; вызов из задачи.
     unsafe fn rescan(&mut self) -> bool {
         let mut changed = false;
+        // Устройства, чья точка останавливается раз за разом: забыть и поднять
+        // заново, как после переподключения.
+        for address in core::mem::take(&mut self.recover) {
+            let Some(place) = self.devices.iter().find(|d| d.address == address).map(|d| d.place) else {
+                continue;
+            };
+            kprintln!("  ehci        : {place}: bringing the device up again, as if it were plugged back in");
+            let taken = self.take_subtree(alloc::vec![address]);
+            // SAFETY: устройства изъяты из списка.
+            unsafe { self.retire(taken, false) };
+            if place.parent == 0 {
+                // SAFETY: контракт функции.
+                unsafe { self.attach_root_port(usize::from(place.root_port - 1)) };
+            } else {
+                self.set_hub_bit(place.parent, place.hub_port, false);
+                // SAFETY: хаб в списке — или уже изъят, тогда сверка молчит.
+                unsafe { self.check_hub_port(place.parent, place.hub_port) };
+            }
+            changed = true;
+        }
         // Порт, отданный спутнику, драйвер назад не забирает. У такого порта
         // EHCI всегда видит `CCS = 0`, и «вернуть опустевший» означало бы
         // отбирать устройство у спутника на каждой сверке. Спецификация
@@ -1835,6 +1864,7 @@ impl Controller {
             self.unrecoverable = true;
         }
         let mut errors = 0;
+        let mut recover = Vec::new();
         for device in &mut self.devices {
             if device.reader.is_none() {
                 continue;
@@ -1849,8 +1879,29 @@ impl Controller {
                 // отчёт заново. Молча терять клавиатуру из-за одного испорченного
                 // пакета — хуже.
                 errors += 1;
+                device.halts += 1;
+                // Первая остановка и та, после которой устройство поднимают
+                // заново, — в журнал: ноутбук, где клавиатура гасла, пишет
+                // только на экран, и `dmesg` после переподключения — единственный
+                // способ узнать, что было. Каждую остановку печатать нельзя: при
+                // STALL они идут раз в десять миллисекунд.
+                if device.halts == 1 || device.halts == RECOVER_AFTER {
+                    kprintln!(
+                        "  ehci        : {}: the report endpoint halted ({} in a row): {} (token {token:#010x})",
+                        device.place,
+                        device.halts,
+                        token_name(token)
+                    );
+                }
+                if device.halts == RECOVER_AFTER {
+                    recover.push(device.address);
+                }
                 pipe.write(PAGE_INTERRUPT_QH + QH_OVERLAY_TOKEN, 0);
             } else {
+                if device.halts > 1 {
+                    kprintln!("  ehci        : {}: reports again after {} halt(s)", device.place, device.halts);
+                }
+                device.halts = 0;
                 let left = (token >> TOKEN_LENGTH_SHIFT) & TOKEN_LENGTH_MASK;
                 let length = u32::from(device.report_len).saturating_sub(left) as usize;
                 if length > 0 {
@@ -1880,6 +1931,11 @@ impl Controller {
             pipe.write(PAGE_INTERRUPT_QH + QH_OVERLAY_NEXT, pipe.at(PAGE_TD_REPORT));
         }
         self.errors += errors;
+        for address in recover {
+            if !self.recover.contains(&address) {
+                self.recover.push(address);
+            }
+        }
     }
 
     fn summary_into(&self, summary: &mut Summary) {
@@ -2098,6 +2154,14 @@ const IDLE_PERIOD_MS: u64 = 500;
 /// Как часто сверять порты при работающих устройствах.
 const PORT_CHECK_PERIOD_MS: u64 = 500;
 
+/// После скольких остановок точки прерываний подряд устройство поднимают заново.
+///
+/// Одна-две — испорченный пакет, и повторный запрос лечит их сам. Устройство,
+/// чья точка останавливается раз за разом, повтором не вернуть: на ноутбуке
+/// Романа клавиатура гасла при входе в стол и оживала только переподключением —
+/// то есть сбросом порта и новым перечислением. Здесь делается то же самое.
+const RECOVER_AFTER: u32 = 8;
+
 /// Тело задачи, обслуживающей контроллеры.
 pub fn service_task() {
     let mut next_port_check = 0u64;
@@ -2111,11 +2175,12 @@ pub fn service_task() {
                 controller.service();
             }
             let devices: usize = guard.iter().map(|c| c.devices.iter().filter(|d| d.reader.is_some()).count()).sum();
-            let check = guard.iter().any(|c| c.connected != c.connected_mask() || c.has_hubs());
+            let check = guard.iter().any(|c| c.connected != c.connected_mask() || c.has_hubs() || !c.recover.is_empty());
             (devices, check, crate::time::uptime_ms())
         };
 
-        if now >= next_port_check {
+        let recovering = CONTROLLERS.lock().iter().any(|c| !c.recover.is_empty());
+        if now >= next_port_check || recovering {
             next_port_check = now.saturating_add(PORT_CHECK_PERIOD_MS);
             if check {
                 poll_hotplug();
