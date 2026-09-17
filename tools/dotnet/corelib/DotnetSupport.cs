@@ -1208,6 +1208,33 @@ namespace System.Runtime.CompilerServices
         // среды несут свой тип, и подменить его нечем; единственное место вызова
         // (AlternateLookup) проверяет тип строкой раньше через `is`.
         public static T As<T>(object o) where T : class => (T)o;
+
+        // Встроенные массивы (фаза N11). Компилятор C# 13 собирает аргументы
+        // `params ReadOnlySpan<T>` в структуру `InlineArrayN<T>` и берёт ссылку
+        // на её первую ячейку через `As<TBuffer, T>(ref buffer)`, следующие —
+        // через `Add`. У среды ячейка — поле структуры (`Pointer::Field`).
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern ref TTo As<TFrom, TTo>(ref TFrom source);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern ref T AsRef<T>(ref readonly T source);
+
+        // Массив под ссылкой и номер первого элемента в нём — для срезов
+        // (MemoryMarshal.CreateSpan). Ячейки встроенного массива копируются в
+        // новый массив, поэтому такой срез бывает только для чтения.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern T[] BackingArray<T>(ref T source, int length, bool writable, out int start);
+    }
+
+    [AttributeUsage(AttributeTargets.Struct, AllowMultiple = false)]
+    public sealed class InlineArrayAttribute : Attribute
+    {
+        public InlineArrayAttribute(int length)
+        {
+            Length = length;
+        }
+
+        public int Length { get; }
     }
 
     // `ref readonly` у параметра компилятор помечает этим атрибутом; тип нужен,
@@ -1288,6 +1315,21 @@ namespace System.Runtime.InteropServices
         public static ref T GetReference<T>(Span<T> span) => ref span.Reference;
 
         public static ref readonly T GetReference<T>(ReadOnlySpan<T> span) => ref span[0];
+
+        // Срез от ссылки и длины (фаза N11): так компилятор превращает
+        // встроенный массив аргументов в `ReadOnlySpan<T>`. Срез с записью
+        // возможен только над настоящим массивом (см. Unsafe.BackingArray).
+        public static Span<T> CreateSpan<T>(ref T reference, int length)
+        {
+            T[] array = System.Runtime.CompilerServices.Unsafe.BackingArray(ref reference, length, true, out int start);
+            return new Span<T>(array, start, length);
+        }
+
+        public static ReadOnlySpan<T> CreateReadOnlySpan<T>(ref T reference, int length)
+        {
+            T[] array = System.Runtime.CompilerServices.Unsafe.BackingArray(ref reference, length, false, out int start);
+            return new ReadOnlySpan<T>(array, start, length);
+        }
     }
 }
 

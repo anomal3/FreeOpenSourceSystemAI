@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE), ("sorted", SORTED), ("nullable", NULLABLE), ("listsort", LISTSORT), ("dict", DICT), ("drawing", DRAWING)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE), ("sorted", SORTED), ("nullable", NULLABLE), ("listsort", LISTSORT), ("dict", DICT), ("asyncs", ASYNCS), ("drawing", DRAWING)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -1131,6 +1131,51 @@ fn dictionary_and_hash_set_print_what_dotnet_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, DICT_OUTPUT);
     assert_eq!(code, 21);
+}
+
+/// Образец `tools/dotnet/samples/asyncs` (фаза N11): async/await на
+/// однопоточной очереди задач, Task.Delay по таймерам, отмена, WhenAll и
+/// WhenAny через встроенные массивы аргументов (InlineArray).
+const ASYNCS: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/asyncs.dll");
+
+/// Что печатает `dotnet asyncs.dll` (записано 2026-09-17, .NET 10.0.5, LF; три
+/// запуска одинаковые — задержки у одновременных задач различаются не меньше
+/// чем на 50 мс, иначе пул потоков .NET печатал бы их в случайном порядке).
+const ASYNCS_OUTPUT: &str = concat!(
+    "asyncs: start\n",
+    "first: begin\n",
+    "started: False\n",
+    "first: end\n",
+    "first: 20 RanToCompletion True True\n",
+    "delay: True True True\n",
+    "worker 2 done\n",
+    "worker 3 done\n",
+    "worker 1 done\n",
+    "all: 1,4,9\n",
+    "quick: begin\n",
+    "quick: end\n",
+    "any: True 30 False\n",
+    "run: 5050\n",
+    "boom: InvalidOperationException: boom\n",
+    "wrapped: AggregateException: One or more errors occurred. (wrapped) | Faulted True 1 wrapped\n",
+    "early: True ArgumentException: early\n",
+    "both: InvalidOperationException: one | 2 AggregateException: One or more errors occurred. (one) (two)\n",
+    "from: NotSupportedException: made | 7\n",
+    "cancel: TaskCanceledException: A task was canceled. | Canceled True True\n",
+    "timed: TaskCanceledException: A task was canceled. | OperationCanceledException: The operation was canceled. False\n",
+    "value: 42 5 True\n",
+    "completion: signalled RanToCompletion\n",
+    "continue: 4 42\n",
+    "lock: 3\n",
+    "asyncs: done\n",
+);
+
+#[test]
+fn async_await_prints_what_dotnet_prints() {
+    let (result, output) = run(ASYNCS);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, ASYNCS_OUTPUT);
+    assert_eq!(code, 30);
 }
 
 /// Образец `tools/dotnet/samples/drawing` (фаза N9): System.Drawing на Bitmap с

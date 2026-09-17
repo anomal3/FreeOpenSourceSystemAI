@@ -4146,8 +4146,76 @@ GPLv2 в проект GPLv3 не переносится.
   массив и через множество, `CreateSetComparer`. Совпал с dotnet; остальные
   29 запусков — тоже.
 
+**N10e — оценка Regex и LINQ из dotnet/runtime (2026-09-17), оба не взяты.**
+
+- **Regex** (`System.Text.RegularExpressions` на теге v10.0.5): 49 файлов,
+  25,7 тыс. строк плюс 33 файла символического движка (`NonBacktracking`).
+  `RegexCompiler` (6,2 тыс. строк) — Reflection.Emit; поиск везде через
+  `SearchValues` (25 мест) и `IndexOfAny` (53) — векторизованный поиск
+  CoreLib, которого у нас нет и который на указателях; `stackalloc` 34 раза.
+  Не брать, пока в среде нет указателей; свой Regex писать не по правилу N10.
+- **LINQ** (`System.Linq`, 79 файлов, 16,7 тыс. строк): указателей нет, но
+  `Sum`/`Min`/`Max`/`Average`/`Range` — на `Vector<T>` и обобщённой
+  арифметике (`INumber<T>`, `T.CreateTruncating`), а `Range(…).Select(…)`
+  идёт через `RangeSelectIterator<T> where T : INumber<T>` — это статические
+  члены интерфейсов, которых интерпретатор не исполняет. Цена: обобщённая
+  арифметика в corelib и статические виртуальные члены в среде — не меньше M.
+  Наш LINQ совпадает с dotnet на всех образцах, и N10d уже сделал `Range` и
+  `Repeat` списками, как у .NET. Отложено до появления программы, которой не
+  хватает именно их поведения.
+
+**N11 — async/await и задачи (2026-09-17).** Самая большая дыра для обычных
+программ: `Task` не было вовсе, и ни одна программа с `async Main`, `await
+Task.Delay` или `Task.Run` не запускалась.
+
+- **Что сделано (`corelib/Tasks.cs`, своя запись):** `Task`, `Task<T>`,
+  `TaskStatus`, `TaskCompletionSource`, `ValueTask`, `AggregateException`,
+  `OperationCanceledException`, `TaskCanceledException`, `CancellationToken`
+  и `CancellationTokenSource` (с `CancelAfter`), `Monitor` для `lock`,
+  строители `AsyncTaskMethodBuilder`/`AsyncVoidMethodBuilder`/
+  `AsyncValueTaskMethodBuilder`, ожидающие `TaskAwaiter`, `ConfiguredTaskAwaitable`,
+  `YieldAwaitable`, интерфейсы `IAsyncStateMachine`/`INotifyCompletion`.
+  `Task.Delay`, `Run`, `WhenAll`, `WhenAny`, `Yield`, `FromResult`,
+  `FromException`, `ContinueWith`, `Wait`, `Result`.
+- **Устройство.** Поток один, поэтому «выполнить позже» — очередь
+  (`AsyncPump`): готовые продолжения и таймеры. Крутит её тот, кто ждёт:
+  `GetResult`/`Wait`/`Result` у незавершённой задачи, и цикл сообщений
+  WinForms между событиями (`Application.DoEventsOnce`) — обработчик,
+  дошедший до `await`, продолжается оттуда. `Task.Run` — та же очередь, не
+  пул. Машина состояний async-метода упаковывается при первом ожидании один
+  раз, и все продолжения зовут `MoveNext` у коробки — как у .NET, где коробка
+  и есть задача. Ожидание задачи, которую некому завершить (ни очереди, ни
+  таймеров), — `InvalidOperationException`, а не вечный сон.
+- **Встроенные массивы (`[InlineArray]`).** Компилятор C# 13 собирает
+  аргументы `params ReadOnlySpan<T>` (`Task.WhenAll(a, b, c)`, `string.Join`
+  и `Concat` с пятью и более строками, `Path.Combine`…) в `InlineArrayN<T>`
+  из CoreLib .NET 10 (N от 2 до 16) и берёт ссылку на ячейку через
+  `Unsafe.As<TBuffer, T>(ref buffer)` и `Unsafe.Add`, а срез — через
+  `MemoryMarshal.CreateReadOnlySpan`. В среде такая структура разложена как N
+  одинаковых полей (атрибут читается из метаданных), ссылка на ячейку —
+  `Pointer::Field` с номером, `Unsafe.Add` сдвигает номер в пределах структуры,
+  срез над ячейками — копия в новом массиве и только для чтения (запись в
+  копию структура не увидела бы; срез с записью над встроенным массивом — отказ
+  «Unsupported»). Плюс `Unsafe.AsRef` и пятнадцать типов `InlineArrays.cs`.
+- **Ловушка сверки.** Под настоящим dotnet задачи идут на пуле потоков: две
+  задачи с одной задержкой падают в случайном порядке, и `WhenAll` собирает
+  ошибки в порядке завершения. Образец разносит задержки не меньше чем на
+  50 мс и не держит общих изменяемых данных у одновременных задач — три
+  запуска под dotnet одинаковые.
+- **Образец `asyncs`** — 26 строк, код 30: синхронное начало и продолжение,
+  измеренная задержка, `WhenAll` трёх задач с разными задержками, `WhenAny`,
+  `Task.Run` (в том числе с async-лямбдой), исключения через `await`, `Wait`
+  и `Result`, ошибка до первого `await`, две ошибки в `WhenAll`, отмена
+  `Task.Delay` и `CancelAfter`, `ValueTask`, `Task.Yield`,
+  `TaskCompletionSource`, `ContinueWith`, async-лямбда, `lock`. Совпал с
+  dotnet; остальные 30 запусков — тоже.
+- **Чего нет:** потоков и пула, контекстов синхронизации (`ConfigureAwait`
+  ничего не меняет), `Parallel`, `SemaphoreSlim`/`AsyncLocal`, `IAsyncEnumerable`
+  и `await foreach`, таймеров `System.Threading.Timer`. Всё это — по мере
+  того, как попадётся программе.
+
 **Дальше по той же линии:** `BitArray` только после указателей в среде;
-Regex и LINQ — по-прежнему отдельная оценка.
+Regex — после указателей; LINQ — по программе, которой он понадобится.
 
 **Размер вехи.** XL, несколько месяцев. Первый видимый результат — фаза N2.
 

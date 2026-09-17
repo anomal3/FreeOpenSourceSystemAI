@@ -341,6 +341,7 @@ impl<'a, H: Host> Vm<'a, H> {
             interfaces: Vec::new(),
             declared_interfaces: Vec::new(),
             initialized: true,
+            inline_array: None,
         })?;
         self.array_types.insert(element, ty);
         // Интерфейсы массива (`IList<T>`, `IEnumerable<T>`…) — те, что реализует
@@ -425,6 +426,7 @@ impl<'a, H: Host> Vm<'a, H> {
             interfaces: Vec::new(),
             declared_interfaces: Vec::new(),
             initialized: false,
+            inline_array: None,
         })?;
         self.type_map.insert(key, ty);
 

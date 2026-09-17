@@ -269,6 +269,10 @@ pub(crate) struct Type {
     pub declared_interfaces: Vec<TypeId>,
     /// Статический конструктор уже запускался (или его нет).
     pub initialized: bool,
+    /// Структура с `[InlineArray(N)]` (фаза N11): одно объявленное поле, N
+    /// ячеек подряд. Здесь она разложена как N одинаковых полей, и ссылка на
+    /// «элемент» такого массива — `Pointer::Field` с номером ячейки.
+    pub inline_array: Option<u32>,
 }
 
 impl Type {

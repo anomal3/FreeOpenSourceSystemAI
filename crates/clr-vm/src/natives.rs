@@ -68,6 +68,9 @@ pub(crate) enum Native {
     UnsafeByteOffset,
     UnsafeNullRef,
     UnsafeIsNullRef,
+    UnsafeAs,
+    UnsafeAsRef,
+    UnsafeBackingArray,
     ArrayClone,
     TypeIsAssignableFrom,
     TypeElementType,
@@ -246,6 +249,11 @@ const TABLE: &[(&str, Native)] = &[
     ("System.Runtime.CompilerServices.Unsafe::NullRef()", Native::UnsafeNullRef),
     ("System.Runtime.CompilerServices.Unsafe::IsNullRef(!!0&)", Native::UnsafeIsNullRef),
     ("System.Array::Clone()", Native::ArrayClone),
+    // Фаза N11: встроенные массивы (`[InlineArray]`) — так компилятор C# 13
+    // собирает аргументы `params ReadOnlySpan<T>`.
+    ("System.Runtime.CompilerServices.Unsafe::As(!!0&)", Native::UnsafeAs),
+    ("System.Runtime.CompilerServices.Unsafe::AsRef(!!0&)", Native::UnsafeAsRef),
+    ("System.Runtime.CompilerServices.Unsafe::BackingArray(!!0&,int32,bool,int32&)", Native::UnsafeBackingArray),
     ("System.Type::IsAssignableFrom(System.Type)", Native::TypeIsAssignableFrom),
     ("System.Type::GetElementType()", Native::TypeElementType),
     ("System.Int32::CompareTo(int32)", Native::I32CompareTo),
@@ -554,11 +562,107 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
         // Ссылки на элементы (фаза N10c): сдвиг и сравнение — только у элементов
         // одного массива; у прочих мест адреса нет (value.rs).
         Native::UnsafeAdd => {
-            let (array, index) = vm.element_ref(arg(0)?)?;
             let offset = i64::from(vm.int32(arg(1)?)?);
+            // Ячейка встроенного массива (фаза N11): поле структуры с
+            // `[InlineArray]`, сдвиг — номер ячейки в пределах структуры.
+            if let Value::Ptr(crate::value::Pointer::Field { object, index }) = arg(0)? {
+                let (length, count) = match vm.heap.get(object) {
+                    Some(crate::heap::Object::Struct { ty, fields }) => (vm.types[ty.0 as usize].inline_array, fields.len()),
+                    _ => (None, 0),
+                };
+                if length.is_none() {
+                    return Err(VmError::Unsupported {
+                        what: alloc::format!("Unsafe.Add on a field that is not an inline array element in {}", vm.location()),
+                    });
+                }
+                let moved = u32::try_from(i64::from(index) + offset).ok().filter(|&moved| (moved as usize) < count).ok_or_else(|| {
+                    VmError::Unsupported { what: alloc::format!("Unsafe.Add outside an inline array in {}", vm.location()) }
+                })?;
+                return Ok(Some(Value::Ptr(crate::value::Pointer::Field { object, index: moved })));
+            }
+            let (array, index) = vm.element_ref(arg(0)?)?;
             let moved = u32::try_from(i64::from(index) + offset)
                 .map_err(|_| VmError::Unsupported { what: alloc::format!("Unsafe.Add before the first element in {}", vm.location()) })?;
             Some(Value::Ptr(crate::value::Pointer::Element { array, index: moved }))
+        }
+        // `Unsafe.As<TFrom, TTo>(ref TFrom)`: у структуры с `[InlineArray]` —
+        // ссылка на её первую ячейку; всё остальное — та же ссылка, значения
+        // среды несут свой тип и переосмыслить их нечем.
+        Native::UnsafeAs => {
+            let Value::Ptr(pointer) = arg(0)? else {
+                return Err(vm.invalid("Unsafe.As of something that is not a reference"));
+            };
+            if let Value::Struct(object) = vm.load(pointer)? {
+                let inline = match vm.heap.get(object) {
+                    Some(crate::heap::Object::Struct { ty, .. }) => vm.types[ty.0 as usize].inline_array.is_some(),
+                    _ => false,
+                };
+                if inline {
+                    return Ok(Some(Value::Ptr(crate::value::Pointer::Field { object, index: 0 })));
+                }
+            }
+            Some(Value::Ptr(pointer))
+        }
+        Native::UnsafeAsRef => Some(arg(0)?),
+        // Массив под срезом (фаза N11, `MemoryMarshal.CreateSpan`): у ссылки
+        // на элемент — сам массив и номер; у ячейки встроенного массива —
+        // копия ячеек в новом массиве, и только для чтения: запись в копию
+        // структуры не увидела бы.
+        Native::UnsafeBackingArray => {
+            let length = vm.int32(arg(1)?)?;
+            let writable = vm.int32(arg(2)?)? != 0;
+            let Value::Ptr(out) = arg(3)? else {
+                return Err(vm.invalid("BackingArray without a place for the start"));
+            };
+            if length < 0 {
+                return Err(vm.exception("System.ArgumentOutOfRangeException"));
+            }
+            match arg(0)? {
+                Value::Ptr(crate::value::Pointer::Element { array, index }) => {
+                    vm.store(out, Value::I32(index as i32))?;
+                    Some(Value::Obj(Some(array)))
+                }
+                Value::Ptr(crate::value::Pointer::Field { object, index }) => {
+                    let (ty, count) = match vm.heap.get(object) {
+                        Some(crate::heap::Object::Struct { ty, fields }) => (*ty, fields.len()),
+                        _ => return Err(vm.invalid("inline array element of something that is not a struct")),
+                    };
+                    if vm.types[ty.0 as usize].inline_array.is_none() {
+                        return Err(VmError::Unsupported {
+                            what: alloc::format!("a span over a field that is not an inline array element in {}", vm.location()),
+                        });
+                    }
+                    if writable {
+                        return Err(VmError::Unsupported {
+                            what: alloc::format!("a writable span over an inline array in {}", vm.location()),
+                        });
+                    }
+                    if index as usize + length as usize > count {
+                        return Err(vm.exception("System.ArgumentOutOfRangeException"));
+                    }
+                    let Some(&element) = vm.types[ty.0 as usize].args.first() else {
+                        return Err(VmError::Unsupported {
+                            what: alloc::format!("a span over an inline array of a non-generic struct in {}", vm.location()),
+                        });
+                    };
+                    let copy = vm.new_array(element, Value::I32(length))?;
+                    let Value::Obj(Some(array)) = copy else {
+                        return Err(vm.invalid("new array is not an array"));
+                    };
+                    for i in 0..length as u32 {
+                        let value = vm.load(crate::value::Pointer::Field { object, index: index + i })?;
+                        let value = vm.copy_out(value)?;
+                        vm.store(crate::value::Pointer::Element { array, index: i }, value)?;
+                    }
+                    vm.store(out, Value::I32(0))?;
+                    Some(copy)
+                }
+                _ => {
+                    return Err(VmError::Unsupported {
+                        what: alloc::format!("a span over a reference that is neither an element nor an inline array cell in {}", vm.location()),
+                    });
+                }
+            }
         }
         Native::UnsafeAreSame | Native::UnsafeLessThan | Native::UnsafeGreaterThan | Native::UnsafeByteOffset => {
             let (left_array, left) = vm.element_ref(arg(0)?)?;

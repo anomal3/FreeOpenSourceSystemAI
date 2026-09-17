@@ -101,6 +101,54 @@ impl<H: Host> Vm<'_, H> {
         }
         Ok(false)
     }
+
+    /// Целый аргумент атрибута на определении типа — `[InlineArray(N)]`
+    /// (фаза N11). Тот же обход, что у `[Flags]`, плюс значение из
+    /// сгенерированного блоба: пролог 0x0001, затем `int32`.
+    pub(crate) fn type_attribute_int(&mut self, ty: TypeId, namespace: &str, name: &str) -> Result<Option<u32>, VmError> {
+        let Some((asm, row)) = self.types[ty.0 as usize].def else { return Ok(None) };
+        let mut found = Vec::new();
+        {
+            let a = self.assembly(asm);
+            for attribute in 1..=a.tables.rows(id::CUSTOM_ATTRIBUTE) {
+                let parent = a.tables.coded_column(id::CUSTOM_ATTRIBUTE, attribute, 0, Coded::HasCustomAttribute)?;
+                if parent.table != id::TYPE_DEF || parent.row != row {
+                    continue;
+                }
+                let ctor = a.tables.coded_column(id::CUSTOM_ATTRIBUTE, attribute, 1, Coded::CustomAttributeType)?;
+                let value = a.tables.column(id::CUSTOM_ATTRIBUTE, attribute, 2)?;
+                match ctor.table {
+                    id::MEMBER_REF => {
+                        let class = a.tables.coded_column(id::MEMBER_REF, ctor.row, 0, Coded::MemberRefParent)?;
+                        if class.table == id::TYPE_REF {
+                            found.push((id::TYPE_REF, class.row, value));
+                        }
+                    }
+                    id::METHOD_DEF => found.push((id::METHOD_DEF, ctor.row, value)),
+                    _ => {}
+                }
+            }
+        }
+        for (table, candidate, value) in found {
+            let (table, type_row) = if table == id::METHOD_DEF {
+                (id::TYPE_DEF, self.owner_row(asm, candidate, false)?)
+            } else {
+                (table, candidate)
+            };
+            let a = self.assembly(asm);
+            let found_name = a.root.strings.get(a.tables.column(table, type_row, 1)?)?;
+            let found_namespace = a.root.strings.get(a.tables.column(table, type_row, 2)?)?;
+            if found_namespace != namespace || found_name != name {
+                continue;
+            }
+            let blob = a.root.blobs.get(value)?;
+            if blob.len() < 6 || blob[0] != 1 || blob[1] != 0 {
+                return Err(self.invalid("attribute value is not a single int32"));
+            }
+            return Ok(Some(u32::from_le_bytes([blob[2], blob[3], blob[4], blob[5]])));
+        }
+        Ok(None)
+    }
 }
 
 /// Ширина базового типа в байтах; у знакового — со знаком минус.

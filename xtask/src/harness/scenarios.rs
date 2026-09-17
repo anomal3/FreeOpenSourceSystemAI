@@ -3864,6 +3864,19 @@ pub const ALL: &[Scenario] = &[
             Step::Await("words: Apple,banana,Cherry True True False True Apple,banana,date True True Apple", 60_000),
             Step::Await("dotnet: dict.dll: Main returned 21", 60_000),
             Step::Await("freeos> ", 15_000),
+            // Фаза N11: async/await. `first` — начало метода идёт синхронно, конец
+            // продолжением; `all` — три задачи с разными задержками; `cancel` —
+            // отмена Task.Delay; `delay` — таймеры очереди идут по часам.
+            Step::Line("dotnet /usr/share/dotnet/samples/asyncs.dll"),
+            Step::Await("asyncs: start", 60_000),
+            Step::Await("first: 20 RanToCompletion True True", 60_000),
+            Step::Await("delay: True True True", 60_000),
+            Step::Await("all: 1,4,9", 60_000),
+            Step::Await("both: InvalidOperationException: one | 2 AggregateException: One or more errors occurred. (one) (two)", 60_000),
+            Step::Await("cancel: TaskCanceledException: A task was canceled. | Canceled True True", 60_000),
+            Step::Await("continue: 4 42", 60_000),
+            Step::Await("dotnet: asyncs.dll: Main returned 30", 60_000),
+            Step::Await("freeos> ", 15_000),
             // Фаза N6a: окно WinForms. Форма открывается окном программы,
             // рисует себя в Paint, получает щелчок мышью в своих координатах и
             // закрывается крестиком стола — FormClosing и FormClosed с причиной

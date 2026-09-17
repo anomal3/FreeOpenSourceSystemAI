@@ -77,10 +77,29 @@ impl<'a, H: Host> Vm<'a, H> {
                 fields.push(slot);
             }
         }
+        // `[InlineArray(N)]` (фаза N11): объявлено одно поле, лежат N ячеек.
+        // Раскладываем как N одинаковых полей — копирование, обнуление и ссылки
+        // на поля работают без особых случаев.
+        let inline_array = if matches!(self.types[ty.0 as usize].kind, Kind::Struct) && fields.len() == 1 {
+            self.type_attribute_int(ty, "System.Runtime.CompilerServices", "InlineArrayAttribute")?
+        } else {
+            None
+        };
+        if let Some(length) = inline_array {
+            if length == 0 || length > 1 << 16 {
+                return Err(VmError::Unsupported { what: format!("an inline array of {length} elements") });
+            }
+            let slot = fields[0];
+            fields.try_reserve(length as usize - 1).map_err(|_| VmError::OutOfMemory)?;
+            for _ in 1..length {
+                fields.push(slot);
+            }
+        }
         {
             let t = &mut self.types[ty.0 as usize];
             t.fields = fields;
             t.static_slots = static_slots;
+            t.inline_array = inline_array;
         }
 
         // Интерфейсы: унаследованные, перечисленные и их базовые.

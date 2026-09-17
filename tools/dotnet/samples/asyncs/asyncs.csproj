@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N11: async/await, Task, ValueTask, отмена, WhenAll и
+       WhenAny, TaskCompletionSource, lock. Печать сделана так, чтобы под
+       настоящим dotnet с пулом потоков порядок строк был тем же, что у
+       однопоточной очереди: задержки различаются не меньше чем на 50 мс, а
+       общих изменяемых данных у одновременных задач нет. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

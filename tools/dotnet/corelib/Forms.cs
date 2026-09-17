@@ -377,6 +377,12 @@ namespace System.Windows.Forms
         private static bool DoEventsOnce()
         {
             bool busy = false;
+            // Продолжения async-методов и Task.Delay (фаза N11): обработчик
+            // события, дошедший до await, продолжается отсюда, между событиями.
+            if (Threading.Tasks.AsyncPump.RunOnce())
+            {
+                busy = true;
+            }
             while (posted.Count > 0)
             {
                 posted.Dequeue()();
