@@ -284,6 +284,38 @@ impl Geometry {
         if blocks_per_group == 0 || inodes_per_group == 0 || blocks == 0 {
             return Err(Error::Corrupt);
         }
+        // Обе битовые карты группы — блока́ми и inode — занимают по **одному**
+        // блоку, и это не наше соглашение, а сам формат: суперблок называет
+        // номер блока каждой карты, один на группу. Значит в группе не бывает
+        // больше сущностей, чем бит в блоке.
+        //
+        // Проверка стоит здесь, потому что без неё она не стоит нигде, а
+        // считающие по этим числам полагаются на неё молча: `fsck` отводит под
+        // карту ровно блок на группу и ставит бит по номеру внутри группы — а
+        // номер берётся из `inodes_per_group`. Суперблок, объявивший inode
+        // больше, чем бит в блоке, уводил запись за конец буфера: «len is 1024
+        // but the index is 1024», найдено фаззером на чужом томе. Отказ вместо
+        // обхода: том с такой геометрией не смонтирует и ни одна чужая
+        // система.
+        let bits_per_block = block_size.bytes().saturating_mul(8);
+        if blocks_per_group > bits_per_block || inodes_per_group > bits_per_block {
+            return Err(Error::Corrupt);
+        }
+        // Номер блока, в котором лежит суперблок. Значение ровно одно и задано
+        // форматом: при блоке 1024 байта суперблок — блок номер один (первый
+        // килобайт отдан таблице разделов), при большем блоке он лежит внутри
+        // нулевого. Так пишет и `mke2fs`, и наш форматировщик (см. выше в этом
+        // же файле).
+        //
+        // Проверка стоит здесь потому, что от этого числа считаются **все**
+        // адреса групп, и никто по пути его не проверяет: том, назвавший
+        // `0xffffffff`, давал «attempt to add with overflow» на безобидном
+        // `group_first_block(0) + 1` — и в чтении, и в проверке тома (найдено
+        // фаззером, зерно 7).
+        let expected_first = if block_size == BlockSize::B1024 { 1 } else { 0 };
+        if first_data_block != expected_first {
+            return Err(Error::Corrupt);
+        }
         // Размер inode: у rev0 он всегда 128, у rev1 записан в суперблоке. Всё,
         // что не 128, означает том, созданный не нами (скорее всего ext4), и
         // разбирать его здесь нечем.
@@ -303,9 +335,19 @@ impl Geometry {
             .saturating_sub(first_data_block)
             .div_ceil(blocks_per_group)
             .max(1);
-        if inodes != groups * inodes_per_group {
+        // Произведения — с проверкой переполнения, а не как получится. Числа
+        // сомножителей выбрал не разбирающий: том, объявивший миллион групп по
+        // миллиону inode, в отладочной сборке останавливал бы машину паникой
+        // «attempt to multiply with overflow», а в оптимизированной — считал бы
+        // геометрию по обрезанному произведению, то есть тихо не по тому тому.
+        let total_inodes = groups.checked_mul(inodes_per_group).ok_or(Error::Corrupt)?;
+        if inodes != total_inodes {
             return Err(Error::Corrupt);
         }
+        let group_desc_bytes =
+            groups.checked_mul(GROUP_DESC_SIZE as u32).ok_or(Error::Corrupt)?;
+        let inode_table_bytes =
+            inodes_per_group.checked_mul(INODE_SIZE as u32).ok_or(Error::Corrupt)?;
 
         Ok(Self {
             first_lba,
@@ -316,23 +358,43 @@ impl Geometry {
             blocks_per_group,
             inodes_per_group,
             groups,
-            group_desc_blocks: (groups * GROUP_DESC_SIZE as u32)
-                .div_ceil(block_size.bytes()),
-            inode_table_blocks: (inodes_per_group * INODE_SIZE as u32)
-                .div_ceil(block_size.bytes()),
+            group_desc_blocks: group_desc_bytes.div_ceil(block_size.bytes()),
+            inode_table_blocks: inode_table_bytes.div_ceil(block_size.bytes()),
         })
     }
 
     /// Всего inode на томе.
+    ///
+    /// Произведение не переполняется, и это не надежда: `from_superblock`
+    /// проверяет его `checked_mul` и отвергает том, у которого оно не влезает.
     #[must_use]
     pub const fn inodes(&self) -> u32 {
         self.groups * self.inodes_per_group
     }
 
+    /// Сколько всего байт помещается на томе.
+    ///
+    /// Верхняя граница размера любого файла: файл больше тома не бывает ни у
+    /// нас, ни у кого. Существует затем, что размер приходит **из инода**, то
+    /// есть выбран не нами, и всё, что по нему считается, — число обращений к
+    /// носителю. Инод, объявивший два гигабайта на томе в два мегабайта, заставлял
+    /// чтение перебирать миллионы блоков и отказывать через секунды (найдено
+    /// фаззером); в ядре это значит машину, которая не отвечает.
+    #[must_use]
+    pub const fn volume_bytes(&self) -> u64 {
+        self.blocks as u64 * self.block_size.bytes() as u64
+    }
+
     /// Первый блок группы.
+    ///
+    /// Арифметика насыщающая, хотя `from_superblock` и не пропускает
+    /// геометрию, на которой она переполнится: номер группы приходит от
+    /// вызывающего, и «номер за концом тома» обязан давать число за концом
+    /// тома, а не остановку машины.
     #[must_use]
     pub const fn group_first_block(&self, group: u32) -> u32 {
-        self.first_data_block + group * self.blocks_per_group
+        self.first_data_block
+            .saturating_add(group.saturating_mul(self.blocks_per_group))
     }
 
     /// Сколько блоков в группе. Последняя обычно короче остальных.

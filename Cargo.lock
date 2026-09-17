@@ -528,6 +528,20 @@ name = "freeos-cc"
 version = "0.7.0"
 
 [[package]]
+name = "freeos-fuzz"
+version = "0.7.0"
+dependencies = [
+ "btrfs",
+ "clr-meta",
+ "disk",
+ "ext2",
+ "fpk",
+ "tls",
+ "usb-hid",
+ "x509",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1320,6 +1334,7 @@ dependencies = [
  "flate2",
  "fpk",
  "freeos-cc",
+ "freeos-fuzz",
  "osupdate",
  "png",
  "rcgen",

@@ -23,6 +23,7 @@ mod clrcheck;
 mod numcheck;
 mod diskfile;
 mod firmware;
+mod fuzz;
 mod harness;
 mod image;
 mod initrd;
@@ -127,10 +128,30 @@ enum Command {
     /// Сверить наш разбор сборок .NET (крейт clr-meta) с System.Reflection.Metadata:
     /// пробные программы, CoreLib и WinForms установленного .NET (фаза N1).
     ClrCheck,
+    /// Долгий прогон фаззера по разборщикам чужих байт.
+    ///
+    /// Короткий прогон идёт вместе со всеми тестами (`cargo xtask check`) и
+    /// только сторожит найденное. Этой командой ищут новое — после всякой
+    /// правки разборщика и просто временами, с другим зерном.
+    Fuzz(FuzzArgs),
     /// Быстрая проверка компиляции (cargo check) без линковки.
     Check(CheckArgs),
     /// Удалить target/ и build/.
     Clean,
+}
+
+/// Что и сколько фаззить.
+#[derive(Args, Debug)]
+struct FuzzArgs {
+    /// Одна цель вместо всех. Имена печатает отказ при неверном.
+    #[arg(long, short = 't')]
+    target: Option<String>,
+    /// Зерно генератора. Оно же попадает в отчёт: с ним падение повторяется.
+    #[arg(long, short = 's', default_value_t = 1)]
+    seed: u64,
+    /// Сколько входов на цель.
+    #[arg(long, short = 'i', default_value_t = 20_000)]
+    iterations: u64,
 }
 
 #[derive(Args, Debug)]
@@ -786,6 +807,8 @@ fn real_main() -> Result<()> {
         },
 
         Command::ClrCheck => clrcheck::check()?,
+
+        Command::Fuzz(args) => fuzz::run(args.target.as_deref(), args.seed, args.iterations)?,
 
         Command::Check(args) => {
             let arches: Vec<Arch> = match args.arch {

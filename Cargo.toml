@@ -13,6 +13,7 @@ members = [
     "crates/ext2",
     "crates/fdt",
     "crates/fpk",
+    "crates/fuzz",
     "crates/freeos-cc",
     "crates/installer",
     "crates/kernel",

@@ -10,6 +10,9 @@
 //! устройство с `Report ID`, джойстик, — и проверить их прогоном стенда нечем.
 //! Это и есть причина, по которой разбор живёт в отдельном крейте.
 
+use std::vec;
+use std::vec::Vec;
+
 use crate::{Motion, parse};
 
 /// `usb-kbd` из QEMU.
@@ -198,5 +201,138 @@ fn short_reports_do_not_read_past_the_end() {
     match decoded.motion {
         Motion::Absolute { y, .. } => assert_eq!(y, 0),
         other => panic!("движение разобрано как {other:?}"),
+    }
+}
+
+/// Поле шире тридцати двух бит отбрасывается, а не читается со сдвигом.
+///
+/// Найдено фаззером (`cargo xtask fuzz --target usb-hid`). `Report Size` — один
+/// байт, то есть устройство вправе назвать 255, а чтение собирало значение
+/// сдвигами по `u32`: `1 << 40` — это паника «attempt to shift left with
+/// overflow» в отладочной сборке и молчаливый мусор в оптимизированной. Чужая
+/// мышь останавливала ядро на разборе своего же дескриптора.
+///
+/// Проверяется не только отсутствие паники: поле, которого мы прочитать не
+/// можем, обязано **пропасть**, а не приехать обрезанным до тридцати двух бит.
+/// Обрезок — это правдоподобная бессмыслица, и она хуже отсутствия поля.
+#[test]
+fn a_field_wider_than_thirty_two_bits_is_dropped() {
+    // Мышь QEMU, у которой у полей X и Y размер подменён на 255.
+    let mut descriptor = QEMU_MOUSE.to_vec();
+    let mut patched = 0;
+    for index in 0..descriptor.len() - 1 {
+        if descriptor[index] == 0x75 && descriptor[index + 1] == 0x08 {
+            descriptor[index + 1] = 0xFF;
+            patched += 1;
+        }
+    }
+    assert!(patched > 0, "в дескрипторе мыши есть Report Size 8");
+
+    let parsed = parse(&descriptor);
+    // Кнопки объявлены полями по одному биту и остаются на месте; координаты
+    // объявлены широкими и пропадают вместе со своим usage.
+    if let Some(map) = parsed.pointer {
+        let decoded = map.decode(&[0b0000_0011, 0x10, 0x20, 0x00]);
+        if let Some(decoded) = decoded {
+            match decoded.motion {
+                Motion::Relative { dx, dy, .. } => {
+                    assert_eq!((dx, dy), (0, 0), "широкое поле не должно давать значение");
+                }
+                other => panic!("движение разобрано как {other:?}"),
+            }
+        }
+    }
+
+    // И то же самое, но размером ровно 32: это предел, и он обязан работать.
+    let mut wide = QEMU_MOUSE.to_vec();
+    for index in 0..wide.len() - 1 {
+        if wide[index] == 0x75 && wide[index + 1] == 0x08 {
+            wide[index + 1] = 32;
+        }
+    }
+    let _ = parse(&wide);
+}
+
+/// Нулевой размер поля не уводит вычитание под ноль.
+///
+/// Тот же класс, что и предыдущая проверка, и найден тем же способом: у
+/// знакового поля старший бит ищется как `size - 1`, а размер приходит из
+/// дескриптора. Ноль там — паника на вычитании беззнакового.
+#[test]
+fn a_field_of_zero_bits_is_dropped() {
+    let mut descriptor = QEMU_MOUSE.to_vec();
+    for index in 0..descriptor.len() - 1 {
+        if descriptor[index] == 0x75 {
+            descriptor[index + 1] = 0;
+        }
+    }
+    let parsed = parse(&descriptor);
+    if let Some(map) = parsed.pointer {
+        let _ = map.decode(&[0x00, 0x00, 0x00, 0x00]);
+    }
+}
+
+/// Смещение поля у самого края шестнадцати бит не переполняет сложение.
+///
+/// Найдено фаззером на глубоком прогоне (`--target usb-hid --seed 2`, итерация
+/// 1252): «attempt to add with overflow». Смещение растёт по объявленным
+/// размерам и упирается в 65535 (дальше оно насыщается), а к нему прибавляется
+/// номер бита — и сложение переполнялось. Насыщение здесь и есть верный смысл:
+/// бит за пределами отчёта означает «устройство про него не сказало», и читаться
+/// он обязан нулём, а не паникой.
+#[test]
+fn an_offset_at_the_edge_of_sixteen_bits_does_not_overflow() {
+    // Дескриптор, который сначала объявляет постоянное поле шириной во весь
+    // отчёт, а затем — настоящие поля: смещение к тому моменту насыщено.
+    let mut descriptor: Vec<u8> = vec![
+        0x05, 0x01, // Usage Page (Generic Desktop)
+        0x09, 0x02, // Usage (Mouse)
+        0xa1, 0x01, // Collection (Application)
+        0x09, 0x01, // Usage (Pointer)
+        0xa1, 0x00, // Collection (Physical)
+        0x75, 0xff, // Report Size (255)
+        0x95, 0xff, // Report Count (255)
+        0x81, 0x01, // Input (Constant) — 65025 бит, смещение почти у предела
+    ];
+    // Ещё столько же: теперь смещение насыщено наверняка.
+    for _ in 0..4 {
+        descriptor.extend_from_slice(&[0x75, 0xff, 0x95, 0xff, 0x81, 0x01]);
+    }
+    descriptor.extend_from_slice(&[
+        0x05, 0x09, // Usage Page (Button)
+        0x19, 0x01, 0x29, 0x03, // Usage Minimum/Maximum (1..3)
+        0x15, 0x00, 0x25, 0x01, // Logical Minimum/Maximum
+        0x95, 0x03, 0x75, 0x01, // Report Count 3, Size 1
+        0x81, 0x02, // Input (Data, Variable)
+        0x05, 0x01, // Usage Page (Generic Desktop)
+        0x09, 0x30, 0x09, 0x31, // Usage X, Y
+        0x15, 0x81, 0x25, 0x7f, // −127..127
+        0x75, 0x08, 0x95, 0x02, // Size 8, Count 2
+        0x81, 0x06, // Input (Data, Variable, Relative)
+        0xc0, 0xc0,
+    ]);
+
+    let parsed = parse(&descriptor);
+    if let Some(map) = parsed.pointer {
+        // Отчёт короче любого из этих смещений: всё читается нулями, и
+        // единственное утверждение здесь — что оно читается, а не падает.
+        let _ = map.decode(&[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    // И то же для клавиатуры: список клавиш лежит массивом, и его смещение
+    // считается умножением номера на размер — там переполнялось и умножение.
+    let mut keyboard: Vec<u8> = vec![0x05, 0x07, 0xa1, 0x01];
+    for _ in 0..5 {
+        keyboard.extend_from_slice(&[0x75, 0xff, 0x95, 0xff, 0x81, 0x01]);
+    }
+    keyboard.extend_from_slice(&[
+        0x95, 0xff, 0x75, 0xff, // Count 255, Size 255
+        0x15, 0x00, 0x25, 0xff, 0x05, 0x07, 0x19, 0x00, 0x29, 0xff,
+        0x81, 0x00, // Input (Data, Array)
+        0xc0,
+    ]);
+    let parsed = parse(&keyboard);
+    if let Some(map) = parsed.keyboard {
+        let _ = map.decode(&[0x00, 0x00, 0x00, 0x00]);
     }
 }

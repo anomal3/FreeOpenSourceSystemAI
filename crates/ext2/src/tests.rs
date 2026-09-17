@@ -12,7 +12,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use std::vec;
 
-use disk::MemDisk;
+use disk::{BlockDevice, MemDisk};
 use ext4_view::Ext4;
 
 use crate::layout::BlockSize;
@@ -838,4 +838,122 @@ fn renaming_a_directory_across_parents_is_refused() {
     let fs = foreign(&dev);
     assert!(fs.exists("/renamed").expect("новое имя читается"));
     assert!(!fs.exists("/moving").expect("старое имя читается"));
+}
+
+/// Суперблок, объявивший в группе больше inode, чем бит в блоке, отвергается.
+///
+/// Найдено фаззером (`cargo xtask fuzz --target ext2-fsck`). Обе битовые карты
+/// группы занимают по одному блоку — так устроен формат, — а `fsck` отводил под
+/// них ровно блок на группу и ставил бит по номеру внутри группы. Номер брался
+/// из суперблока, и том, назвавший 65536 inode при блоке 1024 байта, уводил
+/// запись за конец буфера: «len is 1024 but the index is 1024». Чужой диск
+/// останавливал проверку файловой системы.
+#[test]
+fn a_group_cannot_hold_more_inodes_than_a_block_has_bits() {
+    let (mut dev, mut writer) = formatted(64 * 1024 * 1024 / 512, BlockSize::B1024);
+    writer.flush(&mut dev).expect("завершение");
+
+    // Блок 1024 байта — это 8192 бита, то есть предел. Ставим на единицу
+    // больше и заодно правим общее число inode: иначе том отвергся бы
+    // проверкой «inodes == groups * inodes_per_group», то есть не тем условием,
+    // которое проверяется.
+    let mut superblock = [0u8; 1024];
+    BlockDevice::read(&mut dev, 2, &mut superblock).expect("чтение суперблока");
+    let per_group: u32 = 8 * 1024 + 1;
+    superblock[40..44].copy_from_slice(&per_group.to_le_bytes());
+    // Общее число inode правится заодно: иначе том отвергся бы проверкой
+    // «inodes == groups * inodes_per_group», то есть не тем условием, которое
+    // проверяется. Число групп считается так же, как его считает разбор.
+    let blocks = u32::from_le_bytes(superblock[4..8].try_into().expect("четыре байта"));
+    let first = u32::from_le_bytes(superblock[20..24].try_into().expect("четыре байта"));
+    let blocks_per_group =
+        u32::from_le_bytes(superblock[32..36].try_into().expect("четыре байта"));
+    let count = blocks.saturating_sub(first).div_ceil(blocks_per_group).max(1);
+    superblock[0..4].copy_from_slice(&count.saturating_mul(per_group).to_le_bytes());
+    BlockDevice::write(&mut dev, 2, &superblock).expect("запись суперблока");
+
+    assert_eq!(Ext2::mount(&mut dev, 0).err(), Some(Error::Corrupt));
+    assert_eq!(
+        crate::check(&mut dev, 0, crate::Fix::Nothing).err(),
+        Some(Error::Corrupt),
+        "проверка тома обязана отказать так же, как монтирование"
+    );
+}
+
+/// Inode, объявивший файл больше всего тома, отвергается при чтении.
+///
+/// Найдено фаззером (`cargo xtask fuzz --target ext2`). По размеру считается,
+/// сколько блоков перебрать, и размер приходит из инода — то есть выбран не
+/// нами. Том в два мегабайта с файлом на два гигабайта заставлял `read_file`
+/// работать три секунды, прежде чем отказать; на большем числе — минуты. В
+/// ядре это машина, которая не отвечает, а не неверный ответ.
+///
+/// Разреженный файл законно занимает меньше блоков, чем обещает размером, — но
+/// не больше, чем есть весь том, и проверяется именно эта граница.
+#[test]
+fn a_file_larger_than_the_volume_is_refused() {
+    let (mut dev, mut writer) = formatted(4 * 1024 * 1024 / 512, BlockSize::B1024);
+    let number = writer
+        .create_file(&mut dev, ROOT_INODE, "big.txt", b"small", 0o644, 0, 0)
+        .expect("файл создаётся");
+    writer.flush(&mut dev).expect("завершение");
+
+    // Размер правится прямо в таблице inode: писатель такого не напишет, а
+    // чужой диск — напишет.
+    let volume = Ext2::mount(&mut dev, 0).expect("том монтируется");
+    let good = volume.inode(&mut dev, number).expect("инод читается");
+    assert_eq!(good.size, 5);
+
+    let geometry = volume.geometry();
+    let (block, within) = Ext2::inode_place(&geometry, number).expect("место инода");
+    let mut buf = [0u8; 1024];
+    BlockDevice::read(&mut dev, u64::from(block) * 2, &mut buf).expect("чтение блока");
+    buf[within + 4..within + 8].copy_from_slice(&0x8181_8181u32.to_le_bytes());
+    BlockDevice::write(&mut dev, u64::from(block) * 2, &buf).expect("запись блока");
+
+    assert_eq!(
+        volume.inode(&mut dev, number).err(),
+        Some(Error::Corrupt),
+        "размер больше тома — это испорченный инод, а не большой файл"
+    );
+}
+
+/// Суперблок, назвавший первым блоком данных не тот, что задан форматом,
+/// отвергается.
+///
+/// Найдено фаззером (зерно 7, цель `ext2` и `ext2-fsck` одновременно). Номер
+/// блока с суперблоком задан форматом однозначно: единица при блоке 1024 байта,
+/// ноль при большем. От этого числа считаются **все** адреса групп, и никто по
+/// пути его не проверял: том, назвавший `0xffffffff`, давал «attempt to add
+/// with overflow» на безобидном `group_first_block(0) + 1` — и при чтении, и
+/// при проверке тома. Чужой диск останавливал машину на сложении.
+#[test]
+fn the_first_data_block_has_to_be_what_the_format_says() {
+    for (block_size, right) in [(BlockSize::B1024, 1u32), (BlockSize::B4096, 0)] {
+        let (mut dev, mut writer) = formatted(64 * 1024 * 1024 / 512, block_size);
+        writer.flush(&mut dev).expect("завершение");
+
+        let mut superblock = [0u8; 1024];
+        BlockDevice::read(&mut dev, 2, &mut superblock).expect("чтение суперблока");
+        assert_eq!(
+            u32::from_le_bytes(superblock[20..24].try_into().expect("четыре байта")),
+            right,
+            "наш форматировщик пишет то, что задано форматом"
+        );
+
+        // То самое значение, на котором сложение переполнялось.
+        superblock[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        BlockDevice::write(&mut dev, 2, &superblock).expect("запись суперблока");
+
+        assert_eq!(
+            Ext2::mount(&mut dev, 0).err(),
+            Some(Error::Corrupt),
+            "{block_size:?}: том с чужим первым блоком не монтируется"
+        );
+        assert_eq!(
+            crate::check(&mut dev, 0, crate::Fix::Nothing).err(),
+            Some(Error::Corrupt),
+            "{block_size:?}: и проверка тома отказывает так же"
+        );
+    }
 }

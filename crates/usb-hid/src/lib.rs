@@ -145,6 +145,17 @@ const MAX_ITEMS: usize = 1024;
 /// некому.
 const MAX_BUTTONS: u8 = 8;
 
+/// Наибольшая ширина поля, которую мы умеем прочитать.
+///
+/// Тридцать два бита — размер значения, в которое поле превращается (`i32`).
+/// Дескриптор вправе объявить больше (байт размера вмещает до 255), но
+/// прочитать такое поле нам нечем: младшие тридцать два бита от
+/// шестидесятибитного значения — это не значение, а его обрезок, и отдавать
+/// его драйверу хуже, чем не отдавать ничего. Поэтому поле шире отбрасывается
+/// вместе со своим usage, а место в отчёте за ним всё равно считается занятым
+/// (см. [`Parser::input_item`]).
+const FIELD_MAX_BITS: u8 = 32;
+
 /// Поле отчёта: где лежит и как читается.
 #[derive(Clone, Copy, Debug)]
 pub struct Field {
@@ -175,8 +186,21 @@ impl Field {
     /// «устройство не сообщило».
     fn read(&self, report: &[u8]) -> i32 {
         let mut raw = 0u32;
-        for bit in 0..u16::from(self.size) {
-            let index = usize::from(self.offset + bit);
+        // Ширина обрезается до тридцати двух бит, хотя поля шире сюда и не
+        // доходят: [`FIELD_MAX_BITS`] отсекает их при разборе. Одно и то же
+        // условие в двух местах — не перестраховка: там оно **отвергает**
+        // дескриптор, а здесь держит `1 << bit` в границах типа, и держит его
+        // там, где сдвиг написан, а не там, где о нём вспомнили. Без этого
+        // дескриптор со словом `0x75 0xff` (размер поля 255) паниковал
+        // «attempt to shift left with overflow» — найдено фаззером.
+        for bit in 0..u16::from(self.size.min(FIELD_MAX_BITS)) {
+            // Сложение с насыщением, а не как получится: смещение поля
+            // приходит из дескриптора и доходит до 65535, а бит к нему
+            // прибавляется — переполнение было паникой «attempt to add with
+            // overflow» (найдено фаззером). Насыщение здесь и есть верный
+            // смысл: бит за пределами отчёта означает «устройство про него не
+            // сказало», и ниже он так и читается — нулём.
+            let index = usize::from(self.offset.saturating_add(bit));
             let Some(byte) = report.get(index / 8) else {
                 break;
             };
@@ -189,7 +213,13 @@ impl Field {
         // Смещение мыши объявлено −127..127 и обязано читаться со знаком, а
         // координата планшета — 0..32767, и «знаковое расширение» превратило бы
         // правую половину экрана в отрицательные числа.
-        if self.logical_min < 0 && self.size < 32 && raw >> (self.size - 1) & 1 != 0 {
+        // Ноль в размере отсечён при разборе и повторно здесь: без этого
+        // `self.size - 1` уходило бы под ноль у беззнакового типа, то есть
+        // паникой на вычитании — ровно там, где код выглядит безобидно.
+        if self.logical_min < 0
+            && (1..32).contains(&self.size)
+            && raw >> (self.size - 1) & 1 != 0
+        {
             return (raw | (u32::MAX << self.size)) as i32;
         }
         raw as i32
@@ -279,7 +309,7 @@ impl PointerMap {
         };
         let mut bits = 0u8;
         for index in 0..count.min(MAX_BUTTONS) {
-            let bit = usize::from(offset + u16::from(index));
+            let bit = usize::from(offset.saturating_add(u16::from(index)));
             let Some(byte) = report.get(bit / 8) else {
                 break;
             };
@@ -378,7 +408,7 @@ impl KeyboardMap {
         if let Some(offset) = self.modifiers {
             let mut bits = 0u8;
             for index in 0..8u16 {
-                let bit = usize::from(offset + index);
+                let bit = usize::from(offset.saturating_add(index));
                 let Some(byte) = report.get(bit / 8) else {
                     break;
                 };
@@ -392,7 +422,8 @@ impl KeyboardMap {
         if let Some((offset, count, size)) = self.keys {
             for index in 0..count.min(6) {
                 let field = Field {
-                    offset: offset + u16::from(index) * u16::from(size),
+                    offset: offset
+                        .saturating_add(u16::from(index).saturating_mul(u16::from(size))),
                     size,
                     logical_min: 0,
                     logical_max: i32::from(u8::MAX),
@@ -627,7 +658,11 @@ impl Parser {
         // бессмыслицу вместо честного отказа.
         self.bits = self.bits.saturating_add(width);
 
-        if flags & INPUT_CONSTANT != 0 || size == 0 || count == 0 {
+        // Поле шире тридцати двух бит пропускается так же, как постоянное:
+        // смещение уже сдвинуто выше, а прочитать его нечем (см.
+        // [`FIELD_MAX_BITS`]). Дескриптор со словом `0x75 0xff` паниковал на
+        // сдвиге — найдено фаззером, цель `usb-hid`.
+        if flags & INPUT_CONSTANT != 0 || size == 0 || count == 0 || size > FIELD_MAX_BITS {
             return;
         }
 
@@ -644,7 +679,7 @@ impl Parser {
         }
 
         for index in 0..count {
-            let offset = start + u16::from(index) * u16::from(size);
+            let offset = start.saturating_add(u16::from(index).saturating_mul(u16::from(size)));
             let usage = self.local.usage(index);
             // Usage может приехать вместе со своей страницей в старших разрядах
             // (четырёхбайтовый элемент): тогда действует она, а не текущая
@@ -679,7 +714,8 @@ impl Parser {
                     // на это нельзя: начало ряда вычисляется из номера кнопки,
                     // поэтому дескриптор, назвавший их в другом порядке, всё
                     // равно разберётся верно.
-                    let base = offset.saturating_sub((number - 1) * u16::from(size));
+                    let base =
+                        offset.saturating_sub((number - 1).saturating_mul(u16::from(size)));
                     let count = u8::try_from(number).unwrap_or(u8::MAX);
                     self.buttons = Some(match self.buttons {
                         Some((known, seen)) => (known.min(base), seen.max(count)),
@@ -690,7 +726,7 @@ impl Parser {
                     if (USAGE_MODIFIER_FIRST..=USAGE_MODIFIER_LAST).contains(&code) =>
                 {
                     let base = offset
-                        .saturating_sub((code - USAGE_MODIFIER_FIRST) * u16::from(size));
+                        .saturating_sub((code - USAGE_MODIFIER_FIRST).saturating_mul(u16::from(size)));
                     self.modifiers.get_or_insert(base);
                     self.keyboard_report = self.global.report_id;
                 }
@@ -795,7 +831,9 @@ pub fn parse(bytes: &[u8]) -> Descriptor {
             3 => 4,
             other => usize::from(other),
         };
-        if offset + length > bytes.len() {
+        // Смещение уже насыщено выше, поэтому сложение тоже с насыщением:
+        // `usize::MAX + 4` было бы паникой там, где нужен выход из цикла.
+        if offset.saturating_add(length) > bytes.len() {
             break;
         }
 

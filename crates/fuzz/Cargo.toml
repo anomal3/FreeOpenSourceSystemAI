@@ -1,0 +1,24 @@
+[package]
+name = "freeos-fuzz"
+description = "Fuzzing the parsers that read foreign bytes: the engine, the seeds and the targets."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Хостовый крейт, и только хостовый: движок пользуется потоками и
+# `catch_unwind`, которых нет ни под UEFI, ни в ядре. Сами разборщики при этом
+# остаются `no_std` — фаззер их только зовёт.
+[dependencies]
+disk = { path = "../disk" }
+ext2 = { path = "../ext2" }
+btrfs = { path = "../btrfs" }
+x509 = { path = "../x509" }
+tls = { path = "../tls" }
+usb-hid = { path = "../usb-hid" }
+fpk = { path = "../fpk" }
+clr-meta = { path = "../clr-meta" }
+
+[lints]
+workspace = true
