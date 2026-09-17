@@ -5179,6 +5179,63 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "paging-race",
+        about: "Две большие программы читают образ по обращению с диска одновременно: сон в обработчике отказа под гонкой.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Ждать «sshd сдался» здесь НЕ надо: гонке подкачки службы не
+            // мешают, а на этот шаг ложился отдельный редкий дефект aarch64 —
+            // init печатает «reading services» и замолкает, служб не поднимая
+            // (машина при этом жива, компоновщик рисует). См. ROADMAP.
+            //
+            // Два жгущих квант в третьем кольце — чтобы таймер вытеснял
+            // обработчики отказа `big` посреди чтения (каждые 10 мс). `spin`
+            // печатает СВОЙ номер задачи, а он зависит от порядка загрузки, —
+            // поэтому номера захватываются, а не пишутся числом.
+            Step::Line("run -b /bin/spin 8000"),
+            Step::Capture("started as #", 15_000),
+            Step::Line("run -b /bin/spin 8000"),
+            Step::Capture2("started as #", 15_000),
+            // Две копии `big` разом: каждая отказывает на полутора тысячах
+            // страниц, каждый отказ — чтение с диска и сон внутри обработчика.
+            // Обе досчитали свою свёртку — образ прочитан верно под гонкой.
+            Step::Line("run -b /bin/big"),
+            Step::Await("started as #", 15_000),
+            Step::Line("run -b /bin/big"),
+            Step::Await("started as #", 15_000),
+            Step::AwaitAny("big: spot checks passed", 600_000),
+            Step::AwaitAny("big: spot checks passed", 600_000),
+            Step::AwaitAny("spin {}: burned", 120_000),
+            Step::AwaitAny("spin {2}: burned", 120_000),
+            Step::Line("echo still-alive"),
+            Step::Await("still-alive", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+            Step::Absent("killed by"),
+            Step::Absent("FRAME CORRUPTED"),
+            Step::Absent("guard band below the stack"),
+        ],
+    },
+    Scenario {
         name: "services",
         about: "Убитая служба поднимается сама; падающая по кругу — останавливается, а система жива.",
         target: Target::Installed,
