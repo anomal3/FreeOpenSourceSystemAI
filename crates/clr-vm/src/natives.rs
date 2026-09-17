@@ -61,6 +61,13 @@ pub(crate) enum Native {
     ArrayCopy,
     ArrayClear,
     ArrayReverse,
+    UnsafeAdd,
+    UnsafeAreSame,
+    UnsafeLessThan,
+    UnsafeGreaterThan,
+    UnsafeByteOffset,
+    TypeIsAssignableFrom,
+    TypeElementType,
     I32CompareTo,
     I64CompareTo,
     StringCompareTo,
@@ -227,6 +234,13 @@ const TABLE: &[(&str, Native)] = &[
     ("System.Array::Copy(System.Array,int32,System.Array,int32,int32)", Native::ArrayCopy),
     ("System.Array::Clear(System.Array,int32,int32)", Native::ArrayClear),
     ("System.Array::Reverse(System.Array,int32,int32)", Native::ArrayReverse),
+    ("System.Runtime.CompilerServices.Unsafe::Add(!!0&,int32)", Native::UnsafeAdd),
+    ("System.Runtime.CompilerServices.Unsafe::AreSame(!!0&,!!0&)", Native::UnsafeAreSame),
+    ("System.Runtime.CompilerServices.Unsafe::IsAddressLessThan(!!0&,!!0&)", Native::UnsafeLessThan),
+    ("System.Runtime.CompilerServices.Unsafe::IsAddressGreaterThan(!!0&,!!0&)", Native::UnsafeGreaterThan),
+    ("System.Runtime.CompilerServices.Unsafe::ByteOffset(!!0&,!!0&)", Native::UnsafeByteOffset),
+    ("System.Type::IsAssignableFrom(System.Type)", Native::TypeIsAssignableFrom),
+    ("System.Type::GetElementType()", Native::TypeElementType),
     ("System.Int32::CompareTo(int32)", Native::I32CompareTo),
     ("System.Int64::CompareTo(int64)", Native::I64CompareTo),
     ("System.String::CompareTo(string)", Native::StringCompareTo),
@@ -529,6 +543,52 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
             let (source_index, destination_index, length) = (vm.int32(arg(1)?)?, vm.int32(arg(3)?)?, vm.int32(arg(4)?)?);
             vm.copy_elements(arg(0)?, source_index, arg(2)?, destination_index, length)?;
             None
+        }
+        // Ссылки на элементы (фаза N10c): сдвиг и сравнение — только у элементов
+        // одного массива; у прочих мест адреса нет (value.rs).
+        Native::UnsafeAdd => {
+            let (array, index) = vm.element_ref(arg(0)?)?;
+            let offset = i64::from(vm.int32(arg(1)?)?);
+            let moved = u32::try_from(i64::from(index) + offset)
+                .map_err(|_| VmError::Unsupported { what: alloc::format!("Unsafe.Add before the first element in {}", vm.location()) })?;
+            Some(Value::Ptr(crate::value::Pointer::Element { array, index: moved }))
+        }
+        Native::UnsafeAreSame | Native::UnsafeLessThan | Native::UnsafeGreaterThan | Native::UnsafeByteOffset => {
+            let (left_array, left) = vm.element_ref(arg(0)?)?;
+            let (right_array, right) = vm.element_ref(arg(1)?)?;
+            if native == Native::UnsafeAreSame {
+                return Ok(Some(Value::I32(i32::from(left_array == right_array && left == right))));
+            }
+            if left_array != right_array {
+                return Err(VmError::Unsupported {
+                    what: alloc::format!("comparing references into two different arrays in {}", vm.location()),
+                });
+            }
+            Some(match native {
+                Native::UnsafeLessThan => Value::I32(i32::from(left < right)),
+                Native::UnsafeGreaterThan => Value::I32(i32::from(left > right)),
+                _ => {
+                    let size = vm.element_size_of_array(left_array)?;
+                    Value::Native((i64::from(right) - i64::from(left)) * size)
+                }
+            })
+        }
+        Native::TypeIsAssignableFrom => {
+            let target = vm.runtime_type(arg(0)?)?;
+            match arg(1)? {
+                Value::Obj(None) => Some(Value::I32(0)),
+                other => {
+                    let source = vm.runtime_type(other)?;
+                    Some(Value::I32(i32::from(vm.assignable(source, target))))
+                }
+            }
+        }
+        Native::TypeElementType => {
+            let ty = vm.runtime_type(arg(0)?)?;
+            match vm.types[ty.0 as usize].kind {
+                crate::types::Kind::Array(element) => Some(vm.type_object(element)?),
+                _ => Some(Value::Obj(None)),
+            }
         }
         Native::ArrayReverse => {
             let (index, length) = (vm.int32(arg(1)?)?, vm.int32(arg(2)?)?);

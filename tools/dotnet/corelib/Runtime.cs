@@ -43,6 +43,14 @@ namespace System
         // объект типа, так что отдать его — всё, что остаётся.
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern Type GetTypeFromHandle(RuntimeTypeHandle handle);
+
+        // Фаза N10c: ReadOnlyCollection.CopyTo проверяет, можно ли положить
+        // элементы в массив чужого типа.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public extern bool IsAssignableFrom(Type c);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public extern Type GetElementType();
     }
 
     // Тип, который возвращает `GetType()`. Один объект на тип, как в .NET:

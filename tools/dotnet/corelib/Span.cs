@@ -37,6 +37,35 @@ namespace System
 
         public bool IsEmpty => length == 0;
 
+        public Enumerator GetEnumerator() => new Enumerator(this);
+
+        // Перечислитель среза для `foreach` (фаза N10c, ReadOnlySet из
+        // dotnet/runtime). У .NET он ref struct; здесь срез — обычная структура.
+        public struct Enumerator
+        {
+            private readonly ReadOnlySpan<T> span;
+            private int index;
+
+            internal Enumerator(ReadOnlySpan<T> span)
+            {
+                this.span = span;
+                index = -1;
+            }
+
+            public bool MoveNext()
+            {
+                int next = index + 1;
+                if (next < span.Length)
+                {
+                    index = next;
+                    return true;
+                }
+                return false;
+            }
+
+            public T Current => span.ItemAt(index);
+        }
+
         internal T ItemAt(int index)
         {
             if ((uint)index >= (uint)length)

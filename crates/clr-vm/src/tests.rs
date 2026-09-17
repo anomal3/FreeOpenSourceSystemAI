@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE), ("sorted", SORTED), ("nullable", NULLABLE), ("drawing", DRAWING)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE), ("sorted", SORTED), ("nullable", NULLABLE), ("listsort", LISTSORT), ("drawing", DRAWING)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -1038,6 +1038,52 @@ fn nullable_prints_what_dotnet_prints() {
     let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
     assert_eq!(output, NULLABLE_OUTPUT);
     assert_eq!(code, 11);
+}
+
+/// Образец `tools/dotnet/samples/listsort` (фаза N10c): List<T>,
+/// ReadOnlyCollection<T> и сортировка из dotnet/runtime.
+const LISTSORT: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/listsort.dll");
+
+/// Что печатает `dotnet listsort.dll` (записано 2026-09-17, .NET 10, LF,
+/// инвариантная глобализация; три запуска одинаковые). `large`, `comparison`
+/// и `part` — порядок равных ключей после неустойчивой сортировки .NET: его
+/// повторяет только тот же алгоритм.
+const LISTSORT_OUTPUT: &str = concat!(
+    "listsort: start\n",
+    "small: 0j9,1a0,1h7,3b1,3c2,3e4,3f5,3g6,3i8,4d3,4k10,4l11\n",
+    "large: 0u46,0t45,0n39,0j9,0z25,0w48,1a0,1r43,1m38,1k36,1f31,1d29,1b27,1t19,1q16,1x49,1h7,1p15,2o14,2l37,2p41,2w22,2m12,2n13,2s18,2v47,3s44,3b1,3o40,3e4,3f5,3g6,3c2,3i34,3y24,3i8,3c28,3a26,3r17,3h33,4j35,4e30,4k10,4l11,4q42,4d3,4x23,4v21,4u20,4g32\n",
+    "comparison: 4e30,4j35,4x23,4l11,4u20,4g32,4k10,4d3,4v21,3a26,3i8,3f5,3e4,3y24,3c2,3c28,3b1,3i34,3r17,3h33,3g6,2w22,2o14,2n13,2m12,2l37,2s18,1k36,1f31,1a0,1t19,1b27,1m38,1q16,1p15,1h7,1d29,0z25,0j9,0n39\n",
+    "part: 1a0,3b1,3c2,4d3,3e4,0j9,1h7,1t19,1q16,1p15,2o14,2w22,2s18,2m12,2n13,3r17,3f5,3i8,3g6,3y24,4l11,4k10,4u20,4v21,4x23,0z25,3a26,1b27,3c28,1d29\n",
+    "keys: 1,1,1,1,2,2,2,3,3,3,3,3,4,4,4,5,5,5,5,5 | v17,v3,v12,v7,v16,v6,v11,v9,v14,v19,v4,v1,v8,v13,v18,v10,v5,v15,v2,v0\n",
+    "doubles: NaN,NaN,-Infinity,-1,0,-0,2,3.5,10000000000\n",
+    "ordinal: Apple,Fig,Kiwi,apple,banana,date,fig,kiwi,pear\n",
+    "search: 14 -21 24\n",
+    "capacity: 3 1,2,3\n",
+    "grown: 6\n",
+    "inserted: 0,1,2,20,21,22,3,4,5,6,7,8 12 12\n",
+    "range: 2,20,21,22 1,2,20 4 7 -1\n",
+    "find: 21 4 4 7 0,2,20,22,4,6,8 True True\n",
+    "removed: 3 0,1,2,3,4,5,6,7,8\n",
+    "reversed: 5,4,3,0,6,7,8 #5,#4,#3,#0,#6,#7,#8\n",
+    "trimmed: 7 20 20\n",
+    "sum: 33\n",
+    "read only: 7 5 True NotSupportedException: Collection is read-only.\n",
+    "untyped: 7 True False ArgumentException: The value \"text\" is not of type \"System.Int32\" and cannot be used in this generic collection. (Parameter 'value')\n",
+    "boxes: 5,4,3,0,6,7,8,9\n",
+    "index: ArgumentOutOfRangeException: Index was out of range. Must be non-negative and less than the size of the collection. (Parameter 'index')\n",
+    "insert: ArgumentOutOfRangeException: Index must be within the bounds of the List. (Parameter 'index')\n",
+    "range fails: ArgumentException: Offset and length were out of bounds for the array or count is greater than the number of elements from index to the end of the source collection.\n",
+    "modified: InvalidOperationException: Collection was modified; enumeration operation may not execute.\n",
+    "set: a,b,d True True False\n",
+    "listsort: done\n",
+);
+
+#[test]
+fn list_and_sort_print_what_dotnet_prints() {
+    let (result, output) = run(LISTSORT);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, LISTSORT_OUTPUT);
+    assert_eq!(code, 16);
 }
 
 /// Образец `tools/dotnet/samples/drawing` (фаза N9): System.Drawing на Bitmap с

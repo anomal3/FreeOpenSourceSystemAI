@@ -10,6 +10,72 @@ using System.Text;
 
 namespace System
 {
+    // Фаза N10c: сравнители строк без культур. `InvariantCulture` и
+    // `CurrentCulture` здесь нет намеренно: у .NET они сравнивают по таблицам
+    // ICU, и тихо подставить порядковое сравнение значило бы отсортировать не
+    // так — программа получит отказ «missing member», а не другой порядок.
+    public abstract class StringComparer : Collections.Generic.IComparer<string>, Collections.Generic.IEqualityComparer<string>
+    {
+        private static StringComparer ordinal;
+        private static StringComparer ordinalIgnoreCase;
+
+        public static StringComparer Ordinal => ordinal ??= new OrdinalComparer(false);
+
+        public static StringComparer OrdinalIgnoreCase => ordinalIgnoreCase ??= new OrdinalComparer(true);
+
+        public abstract int Compare(string x, string y);
+
+        public abstract bool Equals(string x, string y);
+
+        public abstract int GetHashCode(string obj);
+
+        private sealed class OrdinalComparer : StringComparer
+        {
+            private readonly bool ignoreCase;
+
+            public OrdinalComparer(bool ignoreCase) => this.ignoreCase = ignoreCase;
+
+            public override int Compare(string x, string y)
+            {
+                if (ReferenceEquals(x, y))
+                {
+                    return 0;
+                }
+                if (x == null)
+                {
+                    return -1;
+                }
+                if (y == null)
+                {
+                    return 1;
+                }
+                return ignoreCase ? string.CompareOrdinal(x.ToUpperInvariant(), y.ToUpperInvariant()) : string.CompareOrdinal(x, y);
+            }
+
+            public override bool Equals(string x, string y)
+            {
+                if (ReferenceEquals(x, y))
+                {
+                    return true;
+                }
+                if (x == null || y == null || x.Length != y.Length)
+                {
+                    return false;
+                }
+                return ignoreCase ? string.CompareOrdinal(x.ToUpperInvariant(), y.ToUpperInvariant()) == 0 : string.CompareOrdinal(x, y) == 0;
+            }
+
+            public override int GetHashCode(string obj)
+            {
+                if (obj == null)
+                {
+                    throw new ArgumentNullException("obj");
+                }
+                return (ignoreCase ? obj.ToUpperInvariant() : obj).GetHashCode();
+            }
+        }
+    }
+
     public enum StringComparison
     {
         CurrentCulture = 0,

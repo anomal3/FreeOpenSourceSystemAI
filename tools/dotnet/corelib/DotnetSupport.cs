@@ -16,6 +16,11 @@
 //   BitHelper.cs — src/libraries/Common/src/System/Collections/Generic/
 //   Obsoletions.cs — src/libraries/Common/src/System/
 //
+//   Фаза N10c, тот же коммит: List.cs, ArraySortHelper.cs —
+//   src/libraries/System.Private.CoreLib/src/System/Collections/Generic/;
+//   ReadOnlyCollection.cs, ReadOnlySet.cs —
+//   src/libraries/System.Private.CoreLib/src/System/Collections/ObjectModel/
+//
 // Правило пробы: чужой файл НЕ правится. Всё, чего ему не хватает, живёт здесь
 // или дописано к нашим типам. Тогда новая версия из dotnet/runtime ложится
 // поверх копированием, а цена переноса видна одним этим файлом. Правка
@@ -134,6 +139,9 @@ namespace System
 
         public static implicit operator Span<T>(T[] array) => new Span<T>(array);
 
+        // Ссылка на первый элемент — для MemoryMarshal.GetReference.
+        internal ref T Reference => ref array[start];
+
         public ref T this[int index]
         {
             get
@@ -181,6 +189,13 @@ namespace System
         internal const string Serialization_MissingValues = "The values for this dictionary are missing.";
         internal const string SortedSet_LowerValueGreaterThanUpperValue = "Must be less than or equal to upperValue.";
 
+        internal const string Arg_BogusIComparer = "Unable to sort because the IComparer.Compare() method returns inconsistent results. Either a value does not compare equal to itself, or one value repeatedly compared to another value yields different results. IComparer: '{0}'.";
+        internal const string ArgumentOutOfRange_Count = "Count must be positive and count must refer to a location within the string/array/collection.";
+        internal const string ArgumentOutOfRange_ListInsert = "Index must be within the bounds of the List.";
+        internal const string ArgumentOutOfRange_NeedNonNegNum = "Non-negative number required.";
+        internal const string InvalidOperation_IComparerFailed = "Failed to compare two elements in the array.";
+        internal const string NotSupported_ReadOnlyCollection = "Collection is read-only.";
+
         // У .NET это string.Format с текущей культурой; культур у среды нет,
         // и форматирование здесь всегда инвариантное.
         internal static string Format(string resourceFormat, object p1) => string.Format(resourceFormat, p1);
@@ -192,16 +207,37 @@ namespace System
     // (Queue.cs). Только те, что нужны перенесённым файлам.
     internal enum ExceptionArgument
     {
+        action,
         array,
         arrayIndex,
+        capacity,
+        collection,
+        comparison,
+        converter,
+        count,
+        index,
+        item,
+        list,
+        match,
+        startIndex,
+        value,
     }
 
     internal enum ExceptionResource
     {
-        ArgumentOutOfRange_IndexMustBeLessOrEqual,
-        Argument_InvalidOffLen,
-        Arg_RankMultiDimNotSupported,
+        Arg_ArrayPlusOffTooSmall,
         Arg_NonZeroLowerBound,
+        Arg_RankMultiDimNotSupported,
+        ArgumentOutOfRange_BiggerThanCollection,
+        ArgumentOutOfRange_Count,
+        ArgumentOutOfRange_IndexMustBeLess,
+        ArgumentOutOfRange_IndexMustBeLessOrEqual,
+        ArgumentOutOfRange_ListInsert,
+        ArgumentOutOfRange_NeedNonNegNum,
+        ArgumentOutOfRange_SmallCapacity,
+        Argument_InvalidOffLen,
+        InvalidOperation_IComparerFailed,
+        NotSupported_ReadOnlyCollection,
     }
 
     public class PlatformNotSupportedException : NotSupportedException
@@ -225,8 +261,16 @@ namespace System.Collections
         internal static void ThrowVersionCheckFailed() =>
             throw new InvalidOperationException(SR.InvalidOperation_EnumFailedVersion);
 
+        // У CoreLib и System.Collections бывают разные тексты под одним именем
+        // ресурса, а класс SR здесь один. В SR лежат тексты System.Collections:
+        // их файлы зовут SR напрямую. Файлы CoreLib идут через ThrowHelper — и
+        // тексты CoreLib, расходящиеся с ними, стоят тут.
+        private const string CoreLibEnumFailedVersion = "Collection was modified; enumeration operation may not execute.";
+        private const string CoreLibWrongType = "The value \"{0}\" is not of type \"{1}\" and cannot be used in this generic collection.";
+        private const string CoreLibBiggerThanCollection = "Larger than collection size.";
+
         internal static void ThrowInvalidOperationException_InvalidOperation_EnumFailedVersion() =>
-            throw new InvalidOperationException(SR.InvalidOperation_EnumFailedVersion);
+            throw new InvalidOperationException(CoreLibEnumFailedVersion);
 
         internal static void ThrowArgumentException_Argument_IncompatibleArrayType() =>
             throw new ArgumentException(SR.Argument_IncompatibleArrayType);
@@ -245,11 +289,72 @@ namespace System.Collections
 
         private static string Resource(ExceptionResource resource) => resource switch
         {
-            ExceptionResource.ArgumentOutOfRange_IndexMustBeLessOrEqual => SR.ArgumentOutOfRange_IndexMustBeLessOrEqual,
-            ExceptionResource.Argument_InvalidOffLen => SR.Argument_InvalidOffLen,
+            ExceptionResource.Arg_ArrayPlusOffTooSmall => SR.Arg_ArrayPlusOffTooSmall,
+            ExceptionResource.Arg_NonZeroLowerBound => SR.Arg_NonZeroLowerBound,
             ExceptionResource.Arg_RankMultiDimNotSupported => SR.Arg_RankMultiDimNotSupported,
-            _ => SR.Arg_NonZeroLowerBound,
+            ExceptionResource.ArgumentOutOfRange_BiggerThanCollection => CoreLibBiggerThanCollection,
+            ExceptionResource.ArgumentOutOfRange_Count => SR.ArgumentOutOfRange_Count,
+            ExceptionResource.ArgumentOutOfRange_IndexMustBeLess => SR.ArgumentOutOfRange_IndexMustBeLess,
+            ExceptionResource.ArgumentOutOfRange_IndexMustBeLessOrEqual => SR.ArgumentOutOfRange_IndexMustBeLessOrEqual,
+            ExceptionResource.ArgumentOutOfRange_ListInsert => SR.ArgumentOutOfRange_ListInsert,
+            ExceptionResource.ArgumentOutOfRange_NeedNonNegNum => SR.ArgumentOutOfRange_NeedNonNegNum,
+            ExceptionResource.ArgumentOutOfRange_SmallCapacity => SR.ArgumentOutOfRange_SmallCapacity,
+            ExceptionResource.Argument_InvalidOffLen => SR.Argument_InvalidOffLen,
+            ExceptionResource.InvalidOperation_IComparerFailed => SR.InvalidOperation_IComparerFailed,
+            ExceptionResource.NotSupported_ReadOnlyCollection => SR.NotSupported_ReadOnlyCollection,
+            _ => resource.ToString(),
         };
+
+        // Члены ThrowHelper из CoreLib, которыми пользуются List и
+        // ReadOnlyCollection (фаза N10c). Тела — как у .NET (ThrowHelper.cs того
+        // же коммита): имя аргумента — имя элемента перечисления.
+        internal static void IfNullAndNullsAreIllegalThenThrow<T>(object value, ExceptionArgument argName)
+        {
+            if (!(default(T) == null) && value == null)
+            {
+                ThrowArgumentNullException(argName);
+            }
+        }
+
+        internal static void ThrowArgumentException_BadComparer(object comparer) =>
+            throw new ArgumentException(SR.Format(SR.Arg_BogusIComparer, comparer));
+
+        internal static void ThrowArgumentNullException(ExceptionArgument argument) =>
+            throw new ArgumentNullException(argument.ToString());
+
+        internal static void ThrowArgumentOutOfRange_IndexMustBeLessException() =>
+            throw new ArgumentOutOfRangeException(nameof(ExceptionArgument.index), SR.ArgumentOutOfRange_IndexMustBeLess);
+
+        internal static void ThrowCountArgumentOutOfRange_ArgumentOutOfRange_Count() =>
+            throw new ArgumentOutOfRangeException(nameof(ExceptionArgument.count), SR.ArgumentOutOfRange_Count);
+
+        internal static void ThrowIndexArgumentOutOfRange_NeedNonNegNumException() =>
+            throw new ArgumentOutOfRangeException(nameof(ExceptionArgument.index), SR.ArgumentOutOfRange_NeedNonNegNum);
+
+        internal static void ThrowInvalidOperationException() => throw new InvalidOperationException();
+
+        internal static void ThrowInvalidOperationException(ExceptionResource resource) =>
+            throw new InvalidOperationException(Resource(resource));
+
+        internal static void ThrowInvalidOperationException(ExceptionResource resource, Exception e) =>
+            throw new InvalidOperationException(Resource(resource), e);
+
+        internal static void ThrowInvalidOperationException_InvalidOperation_EnumOpCantHappen() =>
+            throw new InvalidOperationException(SR.InvalidOperation_EnumOpCantHappen);
+
+        internal static void ThrowNotSupportedException() => throw new NotSupportedException();
+
+        internal static void ThrowNotSupportedException(ExceptionResource resource) =>
+            throw new NotSupportedException(Resource(resource));
+
+        internal static void ThrowStartIndexArgumentOutOfRange_ArgumentOutOfRange_IndexMustBeLess() =>
+            throw new ArgumentOutOfRangeException(nameof(ExceptionArgument.startIndex), SR.ArgumentOutOfRange_IndexMustBeLess);
+
+        internal static void ThrowStartIndexArgumentOutOfRange_ArgumentOutOfRange_IndexMustBeLessOrEqual() =>
+            throw new ArgumentOutOfRangeException(nameof(ExceptionArgument.startIndex), SR.ArgumentOutOfRange_IndexMustBeLessOrEqual);
+
+        internal static void ThrowWrongValueTypeArgumentException<T>(T value, Type targetType) =>
+            throw new ArgumentException(SR.Format(CoreLibWrongType, (object)value, targetType), nameof(value));
     }
 }
 
@@ -551,6 +656,22 @@ namespace System.ComponentModel
 
 namespace System.Runtime.CompilerServices
 {
+    // Выражения коллекций `[a, b]` для ReadOnlyCollection (фаза N10c): компилятор
+    // читает атрибут, среде он не нужен.
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Interface, Inherited = false)]
+    public sealed class CollectionBuilderAttribute : Attribute
+    {
+        public CollectionBuilderAttribute(Type builderType, string methodName)
+        {
+            BuilderType = builderType;
+            MethodName = methodName;
+        }
+
+        public Type BuilderType { get; }
+
+        public string MethodName { get; }
+    }
+
     [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Enum | AttributeTargets.Interface | AttributeTargets.Delegate, Inherited = false)]
     public sealed class TypeForwardedFromAttribute : Attribute
     {
@@ -772,5 +893,243 @@ namespace System.Collections.Generic
         bool Overlaps(IEnumerable<T> other);
 
         bool SetEquals(IEnumerable<T> other);
+    }
+}
+
+// ---- Фаза N10c: List<T>, ReadOnlyCollection<T>, ReadOnlySet<T> и сортировка ----
+//
+// Взяты из CoreLib тем же путём: List.cs, ArraySortHelper.cs,
+// ReadOnlyCollection.cs, ReadOnlySet.cs. Рукописные List<T> и сортировка
+// удалены. ArraySortHelper.CoreCLR.cs не взят: помощника для типов с
+// IComparable<T> он создаёт рефлексией среды
+// (CreateInstanceForAnotherGenericParameter). Здесь помощник один — через
+// сравнитель; алгоритм у обоих один и тот же, и порядок выходит тот же.
+
+namespace System.Collections.Generic
+{
+    internal interface IArraySortHelper<TKey>
+    {
+        void Sort(Span<TKey> keys, IComparer<TKey> comparer);
+
+        int BinarySearch(TKey[] keys, int index, int length, TKey value, IComparer<TKey> comparer);
+    }
+
+    internal sealed partial class ArraySortHelper<T> : IArraySortHelper<T>
+    {
+        private static readonly IArraySortHelper<T> s_defaultArraySortHelper = new ArraySortHelper<T>();
+
+        public static IArraySortHelper<T> Default => s_defaultArraySortHelper;
+    }
+
+    internal sealed partial class GenericArraySortHelper<T> : IArraySortHelper<T>
+    {
+    }
+
+    internal interface IArraySortHelper<TKey, TValue>
+    {
+        void Sort(Span<TKey> keys, Span<TValue> values, IComparer<TKey> comparer);
+    }
+
+    internal sealed partial class ArraySortHelper<TKey, TValue> : IArraySortHelper<TKey, TValue>
+    {
+        private static readonly IArraySortHelper<TKey, TValue> s_defaultArraySortHelper = new ArraySortHelper<TKey, TValue>();
+
+        public static IArraySortHelper<TKey, TValue> Default => s_defaultArraySortHelper;
+    }
+
+    internal sealed partial class GenericArraySortHelper<TKey, TValue> : IArraySortHelper<TKey, TValue>
+    {
+    }
+}
+
+namespace System.Collections
+{
+    // Common/src/System/Collections/Generic/CollectionHelpers.cs у .NET —
+    // проверки ICollection.CopyTo; тексты из тех же ресурсов.
+    internal static class CollectionHelpers
+    {
+        internal static void CopyTo<T>(ICollection<T> collection, Array array, int index)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if (array.Rank != 1)
+            {
+                throw new ArgumentException(SR.Arg_RankMultiDimNotSupported, "array");
+            }
+            if (array.GetLowerBound(0) != 0)
+            {
+                throw new ArgumentException(SR.Arg_NonZeroLowerBound, "array");
+            }
+            if (index < 0 || index > array.Length)
+            {
+                throw new ArgumentOutOfRangeException("index", SR.ArgumentOutOfRange_NeedNonNegNum);
+            }
+            if (array.Length - index < collection.Count)
+            {
+                throw new ArgumentException(SR.Arg_ArrayPlusOffTooSmall);
+            }
+            if (array is T[] items)
+            {
+                collection.CopyTo(items, index);
+                return;
+            }
+            if (array is object[] objects)
+            {
+                try
+                {
+                    foreach (T item in collection)
+                    {
+                        objects[index++] = item;
+                    }
+                }
+                catch (ArrayTypeMismatchException)
+                {
+                    throw new ArgumentException(SR.Argument_IncompatibleArrayType, "array");
+                }
+                return;
+            }
+            throw new ArgumentException(SR.Argument_IncompatibleArrayType, "array");
+        }
+    }
+}
+
+namespace System
+{
+    // `typeof(T) == typeof(Half)` у сортировки — ради правил NaN. Чисел
+    // половинной точности у среды нет, и значений этого типа не бывает; тип
+    // нужен, чтобы сравнение собралось, и оператор — чтобы собралась ветка.
+    public readonly struct Half
+    {
+        public static bool operator <(Half left, Half right) => false;
+
+        public static bool operator >(Half left, Half right) => false;
+
+        public static bool IsNaN(Half value) => false;
+    }
+
+    // `^1` и `a..b`: компилятору нужны типы. Своя запись, а не Index.cs из
+    // dotnet/runtime — тот форматирует себя в срез через TryFormat.
+    public readonly struct Index : IEquatable<Index>
+    {
+        private readonly int _value;
+
+        public Index(int value, bool fromEnd = false)
+        {
+            if (value < 0)
+            {
+                throw new ArgumentOutOfRangeException("value", "Non-negative number required.");
+            }
+            _value = fromEnd ? ~value : value;
+        }
+
+        private Index(int value, int raw)
+        {
+            _value = raw;
+        }
+
+        public static Index Start => new Index(0);
+
+        public static Index End => new Index(0, true);
+
+        public static Index FromStart(int value) => new Index(value);
+
+        public static Index FromEnd(int value) => new Index(value, true);
+
+        public int Value => _value < 0 ? ~_value : _value;
+
+        public bool IsFromEnd => _value < 0;
+
+        public int GetOffset(int length) => _value < 0 ? length + _value + 1 : _value;
+
+        public override bool Equals(object value) => value is Index index && _value == index._value;
+
+        public bool Equals(Index other) => _value == other._value;
+
+        public override int GetHashCode() => _value;
+
+        public static implicit operator Index(int value) => FromStart(value);
+
+        public override string ToString() => IsFromEnd ? "^" + Value.ToString() : Value.ToString();
+    }
+
+    public readonly struct Range : IEquatable<Range>
+    {
+        public Index Start { get; }
+
+        public Index End { get; }
+
+        public Range(Index start, Index end)
+        {
+            Start = start;
+            End = end;
+        }
+
+        public static Range StartAt(Index start) => new Range(start, Index.End);
+
+        public static Range EndAt(Index end) => new Range(Index.Start, end);
+
+        public static Range All => new Range(Index.Start, Index.End);
+
+        public (int Offset, int Length) GetOffsetAndLength(int length)
+        {
+            int start = Start.GetOffset(length);
+            int end = End.GetOffset(length);
+            if ((uint)end > (uint)length || (uint)start > (uint)end)
+            {
+                throw new ArgumentOutOfRangeException("length");
+            }
+            return (start, end - start);
+        }
+
+        public override bool Equals(object value) => value is Range range && range.Start.Equals(Start) && range.End.Equals(End);
+
+        public bool Equals(Range other) => other.Start.Equals(Start) && other.End.Equals(End);
+
+        public override int GetHashCode() => Start.GetHashCode() * 31 + End.GetHashCode();
+
+        public override string ToString() => Start.ToString() + ".." + End.ToString();
+    }
+}
+
+namespace System.Runtime.CompilerServices
+{
+    // Ссылки на элементы массива (фаза N10c). У интерпретатора ссылка — место
+    // (value.rs), а не адрес: сдвиг и сравнение понятны только у элементов
+    // одного массива, и среда проверяет это сама (natives.rs). Для остальных
+    // мест — отказ, а не выдуманный адрес.
+    public static class Unsafe
+    {
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern ref T Add<T>(ref T source, int elementOffset);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern bool AreSame<T>(ref T left, ref T right);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern bool IsAddressLessThan<T>(ref T left, ref T right);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern bool IsAddressGreaterThan<T>(ref T left, ref T right);
+
+        public static bool IsAddressGreaterThanOrEqualTo<T>(ref T left, ref T right) => !IsAddressLessThan(ref left, ref right);
+
+        public static bool IsAddressLessThanOrEqualTo<T>(ref T left, ref T right) => !IsAddressGreaterThan(ref left, ref right);
+
+        // Расстояние в байтах: число элементов, умноженное на тот же размер, что
+        // даёт `sizeof(T)` у среды, — частное выходит номером элемента.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern IntPtr ByteOffset<T>(ref T origin, ref T target);
+    }
+}
+
+namespace System.Runtime.InteropServices
+{
+    public static class MemoryMarshal
+    {
+        public static ref T GetReference<T>(Span<T> span) => ref span.Reference;
+
+        public static ref readonly T GetReference<T>(ReadOnlySpan<T> span) => ref span[0];
     }
 }

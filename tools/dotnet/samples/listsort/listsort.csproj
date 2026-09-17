@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N10c: List<T>, ReadOnlyCollection<T> и сортировка
+       из dotnet/runtime. Порядок равных ключей после сортировки больше 16
+       элементов зависит от алгоритма (интроспективная сортировка .NET), и
+       образец его печатает. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

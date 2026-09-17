@@ -3841,6 +3841,17 @@ pub const ALL: &[Scenario] = &[
             Step::Await("list: 2 107 10||-3", 60_000),
             Step::Await("dotnet: nullable.dll: Main returned 11", 60_000),
             Step::Await("freeos> ", 15_000),
+            // Фаза N10c: List<T> и сортировка из dotnet/runtime. Строка `large`
+            // — порядок равных ключей после неустойчивой сортировки .NET.
+            Step::Line("dotnet /usr/share/dotnet/samples/listsort.dll"),
+            Step::Await("listsort: start", 60_000),
+            Step::Await("large: 0u46,0t45,0n39,0j9,0z25,0w48,1a0,1r43,1m38,1k36,1f31,1d29,1b27,1t19,1q16,1x49,1h7,1p15,2o14,2l37,2p41,2w22,2m12,2n13,2s18,2v47,3s44,3b1,3o40,3e4,3f5,3g6,3c2,3i34,3y24,3i8,3c28,3a26,3r17,3h33,4j35,4e30,4k10,4l11,4q42,4d3,4x23,4v21,4u20,4g32", 120_000),
+            Step::Await("doubles: NaN,NaN,-Infinity,-1,0,-0,2,3.5,10000000000", 60_000),
+            Step::Await("removed: 3 0,1,2,3,4,5,6,7,8", 60_000),
+            Step::Await("read only: 7 5 True NotSupportedException: Collection is read-only.", 60_000),
+            Step::Await("set: a,b,d True True False", 60_000),
+            Step::Await("dotnet: listsort.dll: Main returned 16", 60_000),
+            Step::Await("freeos> ", 15_000),
             // Фаза N6a: окно WinForms. Форма открывается окном программы,
             // рисует себя в Paint, получает щелчок мышью в своих координатах и
             // закрывается крестиком стола — FormClosing и FormClosed с причиной

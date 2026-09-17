@@ -17,6 +17,8 @@ namespace System
 
     public delegate TResult Func<in T, out TResult>(T arg);
 
+    public delegate TOutput Converter<in TInput, out TOutput>(TInput input);
+
     public delegate TResult Func<in T1, in T2, out TResult>(T1 arg1, T2 arg2);
 
     public delegate bool Predicate<in T>(T obj);

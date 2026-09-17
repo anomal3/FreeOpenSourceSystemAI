@@ -4014,10 +4014,48 @@ GPLv2 в проект GPLv3 не переносится.
   тексты исключений. `nullable` — 12 строк, код 11. Оба совпали с dotnet;
   `collections`, `pqueue` и остальные образцы совпадают по-прежнему.
 
+**N10c — `List<T>` и сортировка (2026-09-17).**
+
+- **Взяты из CoreLib:** `List.cs`, `ArraySortHelper.cs` (интроспективная
+  сортировка), `ReadOnlyCollection.cs`, `ReadOnlySet.cs`. Рукописные `List<T>`
+  и быстрая сортировка удалены; все `Array.Sort` и `Array.BinarySearch` идут
+  через их помощник. Главное, что это даёт: **порядок равных элементов**.
+  Сортировка .NET неустойчива, и какой из равных ключей встанет первым, решает
+  её алгоритм — прежняя сортировка давала другой порядок на тех же данных.
+- **Не взят** `ArraySortHelper.CoreCLR.cs`: помощника для типов с
+  `IComparable<T>` он создаёт рефлексией среды. Свой `Default` — через
+  сравнитель; алгоритм у двух помощников один, порядок тот же.
+- **Ссылки на элементы в среде.** `Unsafe.Add`, `AreSame`,
+  `IsAddressLessThan`/`GreaterThan`, `ByteOffset` и инструкция `sizeof` — для
+  ссылок на элементы одного массива (`Pointer::Element`: сдвиг — это номер,
+  сравнение — сравнение номеров). Для прочих мест — отказ «Unsupported», а не
+  выдуманный адрес. `MemoryMarshal.GetReference` — ссылка на первый элемент
+  среза. Это та самая «модель памяти», которую называл итог первой пробы, — в
+  объёме, которого хватает коллекциям.
+- **Прочее:** `ThrowHelper` CoreLib (члены и тексты из `Strings.resx`),
+  `Type.IsAssignableFrom`/`GetElementType`, `IList.IsFixedSize`, `Converter`,
+  `Index`/`Range`, `Half` (только ради `typeof(T) == typeof(Half)`),
+  `StringComparer.Ordinal`/`OrdinalIgnoreCase` (сравнений по культуре нет
+  намеренно — порядок по таблицам ICU подменять порядковым нельзя), `HashSet`
+  реализует `ISet<T>`/`IReadOnlySet<T>`.
+- **Ловушка: один ресурс — два текста.** У CoreLib и System.Collections под
+  одним именем бывают разные сообщения (`InvalidOperation_EnumFailedVersion`,
+  `Arg_WrongType`, `ArgumentOutOfRange_BiggerThanCollection`,
+  `Argument_AddingDuplicate`), а класс `SR` у нас один. В `SR` — тексты
+  System.Collections (их файлы зовут `SR` напрямую); тексты CoreLib стоят в
+  `ThrowHelper`, через который идут файлы CoreLib.
+- **Ловушка сверки:** `RadioButton.OnEnter` у настоящего WinForms смотрит на
+  **настоящую** мышь машины. Один прогон `clr-check`, пока на компьютере
+  работали мышью, дал для `keys` другой эталон; повтор — прежний.
+- **Образец `listsort`** — 27 строк, код 16: порядок равных ключей на 12, 50 и
+  40 элементах и на части списка, `Array.Sort` ключей со значениями, `double` с
+  NaN, `StringComparer.Ordinal`, API `List<T>`, `ReadOnlyCollection`,
+  необобщённый `IList`, тексты исключений, `HashSet` как `ISet`. Совпал с
+  dotnet; остальные 28 запусков — тоже.
+
 **Дальше по той же линии:** `HashSet<T>` и `Dictionary<TKey, TValue>` из
-CoreLib — там `HashHelpers`, ссылки на поля через `ref` и
-`CollectionsMarshal`; `List<T>`; `BitArray`. Regex и LINQ — по-прежнему
-отдельная оценка.
+CoreLib — `CollectionsMarshal`, `ref` на поля записей и сравнители строк
+`NonRandomized…`; `BitArray`. Regex и LINQ — по-прежнему отдельная оценка.
 
 **Размер вехи.** XL, несколько месяцев. Первый видимый результат — фаза N2.
 

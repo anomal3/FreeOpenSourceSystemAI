@@ -166,85 +166,6 @@ namespace System.Collections.Generic
         public override int Compare(T x, T y) => comparison(x, y);
     }
 
-    internal static class ArraySortHelper<T>
-    {
-        public static void Sort(T[] items, int index, int length, IComparer<T> comparer)
-        {
-            comparer = comparer ?? Comparer<T>.Default;
-            QuickSort(items, index, index + length - 1, comparer);
-        }
-
-        private static void QuickSort(T[] items, int left, int right, IComparer<T> comparer)
-        {
-            while (right - left >= 16)
-            {
-                int middle = left + (right - left) / 2;
-                if (comparer.Compare(items[middle], items[left]) < 0)
-                {
-                    Swap(items, left, middle);
-                }
-                if (comparer.Compare(items[right], items[left]) < 0)
-                {
-                    Swap(items, left, right);
-                }
-                if (comparer.Compare(items[right], items[middle]) < 0)
-                {
-                    Swap(items, middle, right);
-                }
-                T pivot = items[middle];
-                int i = left;
-                int j = right;
-                while (i <= j)
-                {
-                    while (comparer.Compare(items[i], pivot) < 0)
-                    {
-                        i++;
-                    }
-                    while (comparer.Compare(pivot, items[j]) < 0)
-                    {
-                        j--;
-                    }
-                    if (i <= j)
-                    {
-                        Swap(items, i, j);
-                        i++;
-                        j--;
-                    }
-                }
-                // Меньшую половину — рекурсией, большую — циклом: глубина не
-                // больше логарифма длины.
-                if (j - left < right - i)
-                {
-                    QuickSort(items, left, j, comparer);
-                    left = i;
-                }
-                else
-                {
-                    QuickSort(items, i, right, comparer);
-                    right = j;
-                }
-            }
-            for (int i = left + 1; i <= right; i++)
-            {
-                T item = items[i];
-                int j = i - 1;
-                while (j >= left && comparer.Compare(items[j], item) > 0)
-                {
-                    items[j + 1] = items[j];
-                    j--;
-                }
-                items[j + 1] = item;
-            }
-        }
-
-        private static void Swap(T[] items, int a, int b)
-        {
-            T item = items[a];
-            items[a] = items[b];
-            items[b] = item;
-        }
-    }
-
     public readonly struct KeyValuePair<TKey, TValue>
     {
         public KeyValuePair(TKey key, TValue value)
@@ -270,336 +191,6 @@ namespace System.Collections.Generic
         public KeyNotFoundException(string message)
             : base(message)
         {
-        }
-    }
-
-    public class List<T> : IList<T>, IReadOnlyList<T>
-    {
-        private T[] items;
-        private int size;
-        private int version;
-
-        public List()
-        {
-            items = new T[0];
-        }
-
-        public List(int capacity)
-        {
-            if (capacity < 0)
-            {
-                throw new ArgumentOutOfRangeException("capacity");
-            }
-            items = new T[capacity];
-        }
-
-        public List(IEnumerable<T> collection)
-            : this()
-        {
-            AddRange(collection);
-        }
-
-        public int Count => size;
-
-        public int Capacity => items.Length;
-
-        bool ICollection<T>.IsReadOnly => false;
-
-        public T this[int index]
-        {
-            get
-            {
-                if ((uint)index >= (uint)size)
-                {
-                    throw IndexOutOfRange();
-                }
-                return items[index];
-            }
-            set
-            {
-                if ((uint)index >= (uint)size)
-                {
-                    throw IndexOutOfRange();
-                }
-                items[index] = value;
-                version++;
-            }
-        }
-
-        private static ArgumentOutOfRangeException IndexOutOfRange() =>
-            new ArgumentOutOfRangeException("index", "Index was out of range. Must be non-negative and less than the size of the collection.");
-
-        private void Grow(int needed)
-        {
-            int capacity = items.Length == 0 ? 4 : items.Length * 2;
-            if (capacity < needed)
-            {
-                capacity = needed;
-            }
-            T[] bigger = new T[capacity];
-            for (int i = 0; i < size; i++)
-            {
-                bigger[i] = items[i];
-            }
-            items = bigger;
-        }
-
-        public void Add(T item)
-        {
-            if (size == items.Length)
-            {
-                Grow(size + 1);
-            }
-            items[size++] = item;
-            version++;
-        }
-
-        public void AddRange(IEnumerable<T> collection)
-        {
-            if (collection == null)
-            {
-                throw new ArgumentNullException("collection");
-            }
-            foreach (T item in collection)
-            {
-                Add(item);
-            }
-        }
-
-        public void Insert(int index, T item)
-        {
-            if ((uint)index > (uint)size)
-            {
-                throw new ArgumentOutOfRangeException("index", "Index must be within the bounds of the List.");
-            }
-            if (size == items.Length)
-            {
-                Grow(size + 1);
-            }
-            for (int i = size; i > index; i--)
-            {
-                items[i] = items[i - 1];
-            }
-            items[index] = item;
-            size++;
-            version++;
-        }
-
-        public bool Remove(T item)
-        {
-            int index = IndexOf(item);
-            if (index < 0)
-            {
-                return false;
-            }
-            RemoveAt(index);
-            return true;
-        }
-
-        public void RemoveAt(int index)
-        {
-            if ((uint)index >= (uint)size)
-            {
-                throw IndexOutOfRange();
-            }
-            size--;
-            for (int i = index; i < size; i++)
-            {
-                items[i] = items[i + 1];
-            }
-            items[size] = default;
-            version++;
-        }
-
-        public int RemoveAll(Predicate<T> match)
-        {
-            int kept = 0;
-            for (int i = 0; i < size; i++)
-            {
-                if (!match(items[i]))
-                {
-                    items[kept++] = items[i];
-                }
-            }
-            int removed = size - kept;
-            for (int i = kept; i < size; i++)
-            {
-                items[i] = default;
-            }
-            size = kept;
-            version++;
-            return removed;
-        }
-
-        public void Clear()
-        {
-            for (int i = 0; i < size; i++)
-            {
-                items[i] = default;
-            }
-            size = 0;
-            version++;
-        }
-
-        public bool Contains(T item) => IndexOf(item) >= 0;
-
-        public int IndexOf(T item)
-        {
-            EqualityComparer<T> comparer = EqualityComparer<T>.Default;
-            for (int i = 0; i < size; i++)
-            {
-                if (comparer.Equals(items[i], item))
-                {
-                    return i;
-                }
-            }
-            return -1;
-        }
-
-        public T Find(Predicate<T> match)
-        {
-            for (int i = 0; i < size; i++)
-            {
-                if (match(items[i]))
-                {
-                    return items[i];
-                }
-            }
-            return default;
-        }
-
-        public int FindIndex(Predicate<T> match)
-        {
-            for (int i = 0; i < size; i++)
-            {
-                if (match(items[i]))
-                {
-                    return i;
-                }
-            }
-            return -1;
-        }
-
-        public List<T> FindAll(Predicate<T> match)
-        {
-            var found = new List<T>();
-            for (int i = 0; i < size; i++)
-            {
-                if (match(items[i]))
-                {
-                    found.Add(items[i]);
-                }
-            }
-            return found;
-        }
-
-        public bool Exists(Predicate<T> match) => FindIndex(match) >= 0;
-
-        public void ForEach(Action<T> action)
-        {
-            int start = version;
-            for (int i = 0; i < size; i++)
-            {
-                action(items[i]);
-                if (version != start)
-                {
-                    throw new InvalidOperationException("Collection was modified; enumeration operation may not execute.");
-                }
-            }
-        }
-
-        public void Sort() => Sort((IComparer<T>)null);
-
-        public void Sort(IComparer<T> comparer)
-        {
-            if (size > 1)
-            {
-                ArraySortHelper<T>.Sort(items, 0, size, comparer);
-            }
-            version++;
-        }
-
-        public void Sort(Comparison<T> comparison) => Sort(new ComparisonComparer<T>(comparison));
-
-        public void Reverse()
-        {
-            for (int i = 0, j = size - 1; i < j; i++, j--)
-            {
-                T item = items[i];
-                items[i] = items[j];
-                items[j] = item;
-            }
-            version++;
-        }
-
-        public T[] ToArray()
-        {
-            T[] array = new T[size];
-            for (int i = 0; i < size; i++)
-            {
-                array[i] = items[i];
-            }
-            return array;
-        }
-
-        public void CopyTo(T[] array, int arrayIndex)
-        {
-            for (int i = 0; i < size; i++)
-            {
-                array[arrayIndex + i] = items[i];
-            }
-        }
-
-        public Enumerator GetEnumerator() => new Enumerator(this);
-
-        IEnumerator<T> IEnumerable<T>.GetEnumerator() => new Enumerator(this);
-
-        IEnumerator IEnumerable.GetEnumerator() => new Enumerator(this);
-
-        public struct Enumerator : IEnumerator<T>
-        {
-            private readonly List<T> list;
-            private readonly int version;
-            private int index;
-            private T current;
-
-            internal Enumerator(List<T> list)
-            {
-                this.list = list;
-                version = list.version;
-                index = 0;
-                current = default;
-            }
-
-            public T Current => current;
-
-            object IEnumerator.Current => current;
-
-            public bool MoveNext()
-            {
-                if (version != list.version)
-                {
-                    throw new InvalidOperationException("Collection was modified; enumeration operation may not execute.");
-                }
-                if (index < list.size)
-                {
-                    current = list.items[index];
-                    index++;
-                    return true;
-                }
-                current = default;
-                return false;
-            }
-
-            public void Reset()
-            {
-                index = 0;
-                current = default;
-            }
-
-            public void Dispose()
-            {
-            }
         }
     }
 
@@ -1025,7 +616,11 @@ namespace System.Collections.Generic
         }
     }
 
-    public class HashSet<T> : IEnumerable<T>
+    // ISet и IReadOnlySet — с фазы N10c: ReadOnlySet из dotnet/runtime
+    // оборачивает множество этими интерфейсами. Операции над множествами дают
+    // то же, что у .NET: те же элементы в том же порядке обхода, потому что
+    // добавление идёт по порядку `other`, а удаление не трогает остальных.
+    public class HashSet<T> : ISet<T>, IReadOnlySet<T>
     {
         private const int StartOfFreeList = -3;
 
@@ -1175,6 +770,189 @@ namespace System.Collections.Generic
                 return true;
             }
             return false;
+        }
+
+        bool ICollection<T>.IsReadOnly => false;
+
+        void ICollection<T>.Add(T item) => Add(item);
+
+        public IEqualityComparer<T> Comparer => comparer;
+
+        public void Clear()
+        {
+            if (count > 0)
+            {
+                buckets = null;
+                slots = null;
+                count = 0;
+                freeList = -1;
+                freeCount = 0;
+            }
+            version++;
+        }
+
+        public void CopyTo(T[] array) => CopyTo(array, 0, Count);
+
+        public void CopyTo(T[] array, int arrayIndex) => CopyTo(array, arrayIndex, Count);
+
+        public void CopyTo(T[] array, int arrayIndex, int count)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if (arrayIndex < 0)
+            {
+                throw new ArgumentOutOfRangeException("arrayIndex", arrayIndex, "arrayIndex ('" + arrayIndex.ToString() + "') must be a non-negative value.");
+            }
+            if (count < 0)
+            {
+                throw new ArgumentOutOfRangeException("count", count, "count ('" + count.ToString() + "') must be a non-negative value.");
+            }
+            if (arrayIndex > array.Length || count > array.Length - arrayIndex)
+            {
+                throw new ArgumentException("Destination array is not long enough to copy all the items in the collection. Check array index and length.");
+            }
+            foreach (T item in this)
+            {
+                if (count-- == 0)
+                {
+                    break;
+                }
+                array[arrayIndex++] = item;
+            }
+        }
+
+        // Множество `other` с нашим сравнителем: у .NET так же — сравнение идёт
+        // сравнителем этого множества, а не того.
+        private HashSet<T> Distinct(IEnumerable<T> other)
+        {
+            if (other == null)
+            {
+                throw new ArgumentNullException("other");
+            }
+            var set = new HashSet<T>(comparer);
+            foreach (T item in other)
+            {
+                set.Add(item);
+            }
+            return set;
+        }
+
+        private List<T> Snapshot()
+        {
+            var items = new List<T>(Count);
+            foreach (T item in this)
+            {
+                items.Add(item);
+            }
+            return items;
+        }
+
+        public void UnionWith(IEnumerable<T> other)
+        {
+            if (other == null)
+            {
+                throw new ArgumentNullException("other");
+            }
+            foreach (T item in other)
+            {
+                Add(item);
+            }
+        }
+
+        public void IntersectWith(IEnumerable<T> other)
+        {
+            HashSet<T> keep = Distinct(other);
+            foreach (T item in Snapshot())
+            {
+                if (!keep.Contains(item))
+                {
+                    Remove(item);
+                }
+            }
+        }
+
+        public void ExceptWith(IEnumerable<T> other)
+        {
+            if (other == null)
+            {
+                throw new ArgumentNullException("other");
+            }
+            foreach (T item in other)
+            {
+                Remove(item);
+            }
+        }
+
+        public void SymmetricExceptWith(IEnumerable<T> other)
+        {
+            foreach (T item in Distinct(other).Snapshot())
+            {
+                if (!Remove(item))
+                {
+                    Add(item);
+                }
+            }
+        }
+
+        public bool IsSubsetOf(IEnumerable<T> other)
+        {
+            HashSet<T> set = Distinct(other);
+            foreach (T item in this)
+            {
+                if (!set.Contains(item))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        public bool IsProperSubsetOf(IEnumerable<T> other)
+        {
+            HashSet<T> set = Distinct(other);
+            return set.Count > Count && IsSubsetOf(set);
+        }
+
+        public bool IsSupersetOf(IEnumerable<T> other)
+        {
+            foreach (T item in Distinct(other))
+            {
+                if (!Contains(item))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        public bool IsProperSupersetOf(IEnumerable<T> other)
+        {
+            HashSet<T> set = Distinct(other);
+            return Count > set.Count && IsSupersetOf(set);
+        }
+
+        public bool Overlaps(IEnumerable<T> other)
+        {
+            if (other == null)
+            {
+                throw new ArgumentNullException("other");
+            }
+            foreach (T item in other)
+            {
+                if (Contains(item))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        public bool SetEquals(IEnumerable<T> other)
+        {
+            HashSet<T> set = Distinct(other);
+            return set.Count == Count && IsSupersetOf(set);
         }
 
         public IEnumerator<T> GetEnumerator()

@@ -468,6 +468,55 @@ impl<'a, H: Host> Vm<'a, H> {
     /// `Array.Clear(Array, int, int)` (фаза N10): нулевое значение типа
     /// элемента в каждую ячейку. Выход за массив — `IndexOutOfRangeException`,
     /// как у .NET.
+    /// Ссылка на элемент массива: сам массив и номер элемента.
+    pub(crate) fn element_ref(&self, value: Value) -> Result<(ObjRef, u32), VmError> {
+        match value {
+            Value::Ptr(Pointer::Element { array, index }) => Ok((array, index)),
+            _ => Err(VmError::Unsupported {
+                what: format!("an unsafe reference operation on something other than an array element in {}", self.location()),
+            }),
+        }
+    }
+
+    /// Размер значения в байтах — то, что даёт `sizeof(T)`. Точный размер
+    /// структуры среде не нужен: указателей она не исполняет. Нужно, чтобы
+    /// `Unsafe.ByteOffset` делился на `sizeof` без остатка, а для этого оба
+    /// считают здесь.
+    pub(crate) fn size_of(&self, ty: TypeId) -> i64 {
+        use crate::types::{Kind, Prim};
+        match self.types[ty.0 as usize].kind {
+            Kind::Prim(p) | Kind::Enum(p) => match p {
+                Prim::Bool | Prim::I1 | Prim::U1 => 1,
+                Prim::Char | Prim::I2 | Prim::U2 => 2,
+                Prim::I4 | Prim::U4 | Prim::R4 => 4,
+                Prim::I8 | Prim::U8 | Prim::I | Prim::U | Prim::R8 => 8,
+            },
+            Kind::Struct => {
+                let fields: Vec<Store> = self.types[ty.0 as usize].fields.iter().map(|slot| slot.store).collect();
+                let total: i64 = fields
+                    .iter()
+                    .map(|store| match store {
+                        Store::Prim(_) => 8,
+                        Store::Struct(inner) => self.size_of(*inner),
+                        _ => 8,
+                    })
+                    .sum();
+                total.max(1)
+            }
+            _ => 8,
+        }
+    }
+
+    pub(crate) fn element_size_of_array(&self, array: ObjRef) -> Result<i64, VmError> {
+        match self.heap.get(array) {
+            Some(Object::Array { ty, .. }) => match self.types[ty.0 as usize].kind {
+                crate::types::Kind::Array(element) => Ok(self.size_of(element)),
+                _ => Err(self.invalid("array without an element type")),
+            },
+            _ => Err(self.invalid("reference into something that is not an array")),
+        }
+    }
+
     /// Необобщённый `Array.Reverse(Array, int, int)` (фаза N10b, `Stack.CopyTo`):
     /// тип элемента знает только среда. Проверки — как у .NET.
     pub(crate) fn reverse_elements(&mut self, array: Value, index: i32, length: i32) -> Result<(), VmError> {
@@ -605,7 +654,6 @@ impl<'a, H: Host> Vm<'a, H> {
     pub(crate) fn unsupported_instruction(&self, op: u16) -> VmError {
         let topic = match op {
             0x29 | 0xFE06 | 0xFE07 => "delegates and function pointers (phase N3c)",
-            0xFE1C => "sizeof (phase N4)",
             _ => "not implemented",
         };
         VmError::Unsupported { what: format!("IL instruction 0x{op:02x} in {}: {topic}", self.location()) }

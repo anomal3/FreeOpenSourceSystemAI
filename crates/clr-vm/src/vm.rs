@@ -688,6 +688,14 @@ impl<'a, H: Host> Vm<'a, H> {
                             let target = self.dispatch(ty, method)?;
                             self.push(Value::Fn(target.0))?;
                         }
+                        // sizeof: размер в том же счёте, что `Unsafe.ByteOffset`
+                        // (places.rs, `size_of`).
+                        0x1C => {
+                            let token = self.operand_u32(code, &mut next)?;
+                            let ty = self.resolve_type(self.frames[top].method, token)?;
+                            let size = self.size_of(ty);
+                            self.push(Value::I32(size as i32))?;
+                        }
                         // localloc: `stackalloc T[n]`. Адресов у среды нет, и
                         // память выделяет следующий за ним конструктор
                         // `Span<T>(void*, int)` — обычным массивом (corelib,

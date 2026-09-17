@@ -32,6 +32,9 @@ namespace System.Collections
 
         bool IsReadOnly { get; }
 
+        // Фаза N10c: List<T> из dotnet/runtime реализует его явно.
+        bool IsFixedSize { get; }
+
         int Add(object value);
 
         bool Contains(object value);
@@ -417,6 +420,8 @@ namespace System.Windows.Forms
 
             public bool IsReadOnly => false;
 
+            bool Collections.IList.IsFixedSize => false;
+
             public virtual object this[int index]
             {
                 get
@@ -740,6 +745,8 @@ namespace System.Windows.Forms
             public int Count => owner.Rows.Count;
 
             public bool IsReadOnly => false;
+
+            bool Collections.IList.IsFixedSize => false;
 
             public virtual object this[int index]
             {

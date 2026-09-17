@@ -336,12 +336,65 @@ namespace System
             }
             if (array.Length > 1)
             {
-                Collections.Generic.ArraySortHelper<T>.Sort(array, 0, array.Length, null);
+                Collections.Generic.ArraySortHelper<T>.Default.Sort(new Span<T>(array), null);
             }
         }
 
-        public static void Sort<T>(T[] array, Comparison<T> comparison) =>
-            Collections.Generic.ArraySortHelper<T>.Sort(array, 0, array.Length, new Collections.Generic.ComparisonComparer<T>(comparison));
+        public static void Sort<T>(T[] array, Comparison<T> comparison)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if (comparison == null)
+            {
+                throw new ArgumentNullException("comparison");
+            }
+            Collections.Generic.ArraySortHelper<T>.Sort(new Span<T>(array), comparison);
+        }
+
+        // Фаза N10c: сортировка — ArraySortHelper из dotnet/runtime
+        // (интроспективная: вставки до 16 элементов, дальше быстрая с кучей на
+        // глубине). От неё зависит порядок равных элементов, и программа его
+        // видит.
+        internal const int IntrosortSizeThreshold = 16;
+
+        public static int LastIndexOf<T>(T[] array, T value, int startIndex, int count)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if (array.Length == 0)
+            {
+                if (startIndex != -1 && startIndex != 0)
+                {
+                    throw new ArgumentOutOfRangeException("startIndex", "Index was out of range. Must be non-negative and less than the size of the collection.");
+                }
+                if (count != 0)
+                {
+                    throw new ArgumentOutOfRangeException("count", "Count must be positive and count must refer to a location within the string/array/collection.");
+                }
+                return -1;
+            }
+            if ((uint)startIndex >= (uint)array.Length)
+            {
+                throw new ArgumentOutOfRangeException("startIndex", "Index was out of range. Must be non-negative and less than the size of the collection.");
+            }
+            if (count < 0 || startIndex - count + 1 < 0)
+            {
+                throw new ArgumentOutOfRangeException("count", "Count must be positive and count must refer to a location within the string/array/collection.");
+            }
+            Collections.Generic.EqualityComparer<T> comparer = Collections.Generic.EqualityComparer<T>.Default;
+            for (int i = startIndex; i > startIndex - count; i--)
+            {
+                if (comparer.Equals(array[i], value))
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
 
         public static int IndexOf<T>(T[] array, T value)
         {
@@ -451,41 +504,61 @@ namespace System
             }
             if (length > 1)
             {
-                Collections.Generic.ArraySortHelper<T>.Sort(array, index, length, comparer);
+                Collections.Generic.ArraySortHelper<T>.Default.Sort(new Span<T>(array, index, length), comparer);
             }
         }
 
-        // Ключи и значения переставляются вместе. Вставками: у .NET здесь
-        // интроспективная сортировка, и порядок равных ключей у них не
-        // определён; перенесённый SortedList зовёт её только на словаре, где
-        // равных ключей нет.
+        public static void Sort<T>(T[] array, Collections.Generic.IComparer<T> comparer)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            Sort(array, 0, array.Length, comparer);
+        }
+
+        public static void Sort<T>(T[] array, int index, int length) => Sort(array, index, length, null);
+
+        public static void Sort<TKey, TValue>(TKey[] keys, TValue[] items) => Sort(keys, items, null);
+
+        public static int BinarySearch<T>(T[] array, T value)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            return BinarySearch(array, 0, array.Length, value, null);
+        }
+
+        public static int BinarySearch<T>(T[] array, T value, Collections.Generic.IComparer<T> comparer)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            return BinarySearch(array, 0, array.Length, value, comparer);
+        }
+
+        // Ключи и значения переставляются вместе — тем же помощником, что у .NET
+        // (фаза N10c).
         public static void Sort<TKey, TValue>(TKey[] keys, TValue[] items, Collections.Generic.IComparer<TKey> comparer)
         {
             if (keys == null)
             {
                 throw new ArgumentNullException("keys");
             }
-            comparer = comparer ?? Collections.Generic.Comparer<TKey>.Default;
-            int length = keys.Length;
-            for (int i = 1; i < length; i++)
+            if (keys.Length > 1)
             {
-                TKey key = keys[i];
-                TValue item = items == null ? default : items[i];
-                int j = i - 1;
-                while (j >= 0 && comparer.Compare(keys[j], key) > 0)
+                if (items == null)
                 {
-                    keys[j + 1] = keys[j];
-                    if (items != null)
-                    {
-                        items[j + 1] = items[j];
-                    }
-                    j--;
+                    Collections.Generic.ArraySortHelper<TKey>.Default.Sort(new Span<TKey>(keys), comparer);
+                    return;
                 }
-                keys[j + 1] = key;
-                if (items != null)
+                if (items.Length < keys.Length)
                 {
-                    items[j + 1] = item;
+                    throw new ArgumentException(SR.Arg_ArrayPlusOffTooSmall);
                 }
+                Collections.Generic.ArraySortHelper<TKey, TValue>.Default.Sort(new Span<TKey>(keys), new Span<TValue>(items, 0, keys.Length), comparer);
             }
         }
 
