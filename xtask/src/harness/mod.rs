@@ -1070,6 +1070,25 @@ fn play(
                     .with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
+            Step::Stroke(points) => {
+                say!("  [{at:>6} мс] шаг {index}: жест через {points:?}");
+                line.finish_line(Duration::from_secs(1));
+                let log = line.text();
+                let (width, height) = aim::screen(&log).with_context(|| format!("шаг {index}"))?;
+                let mut from = *pointer.get_or_insert((width / 2, height / 2));
+                for (number, point) in points.iter().copied().enumerate() {
+                    move_pointer(qmp.as_deref_mut(), hmp, from, point, width, height)
+                        .with_context(|| format!("шаг {index}"))?;
+                    from = point;
+                    if number == 0 {
+                        std::thread::sleep(POINTER_DELAY);
+                        press_button(qmp.as_deref_mut(), hmp, true)
+                            .with_context(|| format!("шаг {index}"))?;
+                    }
+                    std::thread::sleep(POINTER_DELAY);
+                }
+                pointer = Some(from);
+            }
             Step::Release => {
                 say!("  [{at:>6} мс] шаг {index}: кнопка отпущена");
                 press_button(qmp.as_deref_mut(), hmp, false)

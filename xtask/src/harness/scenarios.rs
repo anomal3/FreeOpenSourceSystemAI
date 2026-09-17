@@ -172,6 +172,15 @@ pub enum Step {
     RightClick,
     /// Нажать левую кнопку и **не** отпускать — начало перетаскивания.
     Press,
+    /// Навести на первую точку, нажать и провести через остальные, **не**
+    /// отпуская (отпускает `Release`). Жест пальцем по экранной клавиатуре.
+    ///
+    /// Отдельным шагом, а не `Press` и цепочкой `Aim`, потому что `Aim` перед
+    /// движением ждёт конца строки в линии до секунды (`finish_line`), а
+    /// приглашение `freeos> ` перевода строки не несёт. Палец между буквами
+    /// «стоял» до секунды, и клавиатура честно видела долгое нажатие (400 мс):
+    /// сценарий `mobile` падал на жесте примерно раз в несколько прогонов.
+    Stroke(&'static [(i32, i32)]),
     /// Отпустить все кнопки.
     Release,
     /// Подключить устройство к работающей машине (аргументы `device_add`).
@@ -924,39 +933,27 @@ pub const ALL: &[Scenario] = &[
             // Слово жестом (эскиз `swype`): палец ведут по буквам, не отрывая.
             // Точки — центры клавиш на экране 720x1600: ряды на y 1240, 1330,
             // 1420, пробел 1510. «echo» и «hello» — английской раскладкой.
-            Step::Aim(Aim::Point(199, 1240)),
-            Step::Press,
-            Step::Aim(Aim::Point(294, 1420)),
-            Step::Aim(Aim::Point(423, 1330)),
-            Step::Aim(Aim::Point(583, 1240)),
+            Step::Stroke(&[(199, 1240), (294, 1420), (423, 1330), (583, 1240)]),
             Step::Release,
             Step::Await("keyboard    : swipe of ", 15_000),
             Step::Expect("-> [\"echo\""),
-            Step::Aim(Aim::Point(423, 1330)),
-            Step::Press,
-            Step::Aim(Aim::Point(199, 1240)),
-            Step::Aim(Aim::Point(615, 1330)),
-            Step::Aim(Aim::Point(583, 1240)),
+            Step::Stroke(&[(423, 1330), (199, 1240), (615, 1330), (583, 1240)]),
+            // Снимок посреди жеста — на удачу: след живёт 450 мс и в отладочном
+            // QEMU обычно гаснет раньше снимка (проверен он был с TRAIL_MS=5000).
+            // Пауза даёт столу дорисовать кадр; долгого нажатия она не вызовет —
+            // палец уже сдвинулся дальше полуклавиши.
+            Step::Wait(500),
             Step::Shot("02b-swiping"),
             Step::Release,
             Step::Await("-> [\"hello\"", 15_000),
             Step::Wait(800),
             Step::Shot("02c-suggestions"),
             // Протяжка по пробелу — смена языка; подписи клавиш — кириллица.
-            Step::Aim(Aim::Point(270, 1510)),
-            Step::Press,
-            Step::Aim(Aim::Point(350, 1510)),
-            Step::Aim(Aim::Point(430, 1510)),
+            Step::Stroke(&[(270, 1510), (350, 1510), (430, 1510)]),
             Step::Release,
             Step::Await("keyboard    : layout RU (ru)", 15_000),
             // «привет»: п р и в е т — ряды ЙЦУКЕН по одиннадцать и девять клавиш.
-            Step::Aim(Aim::Point(300, 1330)),
-            Step::Press,
-            Step::Aim(Aim::Point(358, 1330)),
-            Step::Aim(Aim::Point(357, 1420)),
-            Step::Aim(Aim::Point(184, 1330)),
-            Step::Aim(Aim::Point(300, 1240)),
-            Step::Aim(Aim::Point(406, 1420)),
+            Step::Stroke(&[(300, 1330), (358, 1330), (357, 1420), (184, 1330), (300, 1240), (406, 1420)]),
             Step::Release,
             Step::Await("-> [\"привет\"", 15_000),
             Step::Wait(800),
@@ -983,13 +980,7 @@ pub const ALL: &[Scenario] = &[
             Step::Release,
             Step::Await("keyboard    : long press 'ъ'", 15_000),
             // ⌫ сразу после слова жестом стирает слово целиком.
-            Step::Aim(Aim::Point(300, 1330)),
-            Step::Press,
-            Step::Aim(Aim::Point(358, 1330)),
-            Step::Aim(Aim::Point(357, 1420)),
-            Step::Aim(Aim::Point(184, 1330)),
-            Step::Aim(Aim::Point(300, 1240)),
-            Step::Aim(Aim::Point(406, 1420)),
+            Step::Stroke(&[(300, 1330), (358, 1330), (357, 1420), (184, 1330), (300, 1240), (406, 1420)]),
             Step::Release,
             Step::Await("keyboard    : swipe of ", 15_000),
             Step::Aim(Aim::Point(632, 1420)),
@@ -1013,9 +1004,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await(" MiB free", 15_000),
             // Обратно на английский: дальше сценарий набирает латиницей.
-            Step::Aim(Aim::Point(270, 1510)),
-            Step::Press,
-            Step::Aim(Aim::Point(430, 1510)),
+            Step::Stroke(&[(270, 1510), (430, 1510)]),
             Step::Release,
             Step::Await("keyboard    : layout EN (us)", 15_000),
             Step::Wait(1000),

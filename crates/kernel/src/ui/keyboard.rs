@@ -85,6 +85,14 @@ const TRAIL_R: u32 = 5;
 const SUGGESTIONS: usize = 3;
 /// Через сколько миллисекунд удержания открываются варианты буквы.
 const LONG_MS: u64 = 400;
+/// Пропуск между двумя шагами времени дольше этого — стол не работал (долгий
+/// кадр, чужая задача), и пропущенное удержанием не считается.
+///
+/// Иначе палец, который уже ведут по буквам, получал долгое нажатие: события
+/// движения лежат недоставленными, пока стол занят кадром, а шаг времени после
+/// кадра видит «палец стоит 400 мс». Так падал сценарий `mobile` в отладочном
+/// QEMU под нагрузкой — и так же вёл бы себя телефон на первом долгом кадре.
+const STALL_MS: u64 = 100;
 /// Автоповтор ⌫: задержка до первого повтора и шаг, мс.
 const REPEAT_DELAY_MS: u64 = 450;
 const REPEAT_MS: u64 = 60;
@@ -214,6 +222,8 @@ pub struct Keyboard {
     dicts: [Option<Dictionary>; 2],
     /// Удерживаемый ⌫: когда стереть следующий знак (мс).
     repeat: Option<u64>,
+    /// Когда был прошлый шаг времени (мс) — чтобы узнать пропуск.
+    last_tick: u64,
 }
 
 /// Заливка слоя, сведённая к непрозрачному цвету, — как у дока.
@@ -257,6 +267,7 @@ impl Keyboard {
             capital: false,
             dicts: [None, None],
             repeat: None,
+            last_tick: 0,
         };
         keyboard.layout();
         Some(keyboard)
@@ -578,6 +589,14 @@ impl Keyboard {
     /// Шаг времени перед кадром: открыть варианты задержанной буквы, стереть
     /// следующий знак удерживаемым ⌫.
     pub fn tick(&mut self, now_ms: u64) {
+        let gap = now_ms.saturating_sub(self.last_tick);
+        self.last_tick = now_ms;
+        if gap > STALL_MS {
+            if let Some(stroke) = self.stroke.as_mut() {
+                // Из пропуска засчитывается не больше обычного шага.
+                stroke.at += gap - STALL_MS;
+            }
+        }
         if let Some(due) = self.repeat {
             if now_ms >= due {
                 crate::input::post(crate::input::KeyCode::Backspace, true);
