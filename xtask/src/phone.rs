@@ -213,6 +213,38 @@ fn mtk_wrap(payload: &[u8], name: &str) -> Vec<u8> {
     out
 }
 
+/// Где в разделе recovery лежит блок подписи заводского образа.
+///
+/// В последних 64 байтах раздела — хвост AVB (`AVBf`) от заводского
+/// `recovery.img`, и он указывает на блок `AVB0` по этому смещению. `fastboot
+/// flash` пишет ровно длину нашего образа, так что хвост и блок остаются. Пока
+/// образ короче, загрузчик находит подпись, видит, что она не сходится, и
+/// предлагает нажать питание — после нажатия запускается наше ядро. Образ длиннее
+/// затирает блок, и LK падает на его разборе (`ro.boot.bootreason = lk_crash`).
+/// Поймано 17.09 первым образом с initrd в 44 МиБ; снимается только заливкой
+/// заводского `recovery.img`.
+const STOCK_VBMETA_AT: u64 = 25_812_992;
+
+/// Обрезать образ тома по последнему непустому блоку.
+///
+/// Initrd — том FAT32 в 40 МиБ, из которых занята половина: меньше FAT32 не
+/// бывает (см. `initrd.rs`). Свободные кластеры драйвер не читает, а RAM-диск
+/// обязан уместиться до [`STOCK_VBMETA_AT`] вместе с ядром. Ядро берёт длину
+/// диска у загрузчика (`fdt_boot::initrd`), так что короткий образ ему не помеха.
+/// Чужой RAM-диск (заводской cpio) остаётся как есть: у него нет подписи 55 AA.
+fn trim_volume(mut bytes: Vec<u8>) -> Vec<u8> {
+    const BLOCK: usize = 64 * 1024;
+    if bytes.len() < 512 || bytes[510..512] != [0x55, 0xaa] || bytes.len() % BLOCK != 0 {
+        return bytes;
+    }
+    let mut end = bytes.len();
+    while end > BLOCK && bytes[end - BLOCK..end].iter().all(|b| *b == 0) {
+        end -= BLOCK;
+    }
+    bytes.truncate(end);
+    bytes
+}
+
 /// Собрать `boot-bare` и завернуть его в загрузочный образ.
 pub fn build(options: &Options) -> Result<PathBuf> {
     let kernel = match &options.kernel {
@@ -232,6 +264,13 @@ pub fn build(options: &Options) -> Result<PathBuf> {
     };
 
     let image = pack(&kernel, options)?;
+    if image.len() as u64 > STOCK_VBMETA_AT {
+        bail!(
+            "образ {} байт длиннее {} байт: он затрёт блок подписи заводского recovery,              и загрузчик упадёт (lk_crash) — на этом и на всех следующих образах, пока              не прошит заводской recovery.img",
+            image.len(),
+            STOCK_VBMETA_AT
+        );
+    }
     std::fs::write(&out, &image)
         .with_context(|| format!("не удалось записать {}", out.display()))?;
 
@@ -509,8 +548,9 @@ fn pack(kernel: &Path, options: &Options) -> Result<Vec<u8>> {
     };
 
     let ramdisk_bytes = match &options.ramdisk {
-        Some(path) => std::fs::read(path)
-            .with_context(|| format!("не удалось прочитать {}", path.display()))?,
+        Some(path) => trim_volume(
+            std::fs::read(path).with_context(|| format!("не удалось прочитать {}", path.display()))?,
+        ),
         None => Vec::new(),
     };
     let dtb_bytes = match &options.dtb {

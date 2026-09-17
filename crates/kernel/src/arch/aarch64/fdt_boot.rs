@@ -144,6 +144,11 @@ pub unsafe fn describe(
         framebuffer.size,
         MemoryKind::Framebuffer,
     );
+    // RAM-диск из загрузочного образа — наш initrd с `/bin` и `/usr`. Занят он
+    // на весь сеанс, как и на UEFI-машине (`MemoryKind::Reserved`): файловая
+    // система читает его до выключения.
+    let initrd = initrd(&fdt);
+    taken_count = add_span(&mut taken, taken_count, initrd.base, initrd.size, MemoryKind::Reserved);
 
     sort_spans(&mut taken[..taken_count]);
 
@@ -163,6 +168,7 @@ pub unsafe fn describe(
     unsafe {
         let info = &mut *(&raw mut INFO);
         info.framebuffer = framebuffer;
+        info.initrd = initrd;
         info.device_tree = dtb as u64;
         info.kernel = image;
         info.memory_map = MemoryMap {
@@ -292,6 +298,49 @@ fn sort_spans(spans: &mut [Span]) {
             slot -= 1;
         }
     }
+}
+
+/// Где загрузчик оставил RAM-диск: `/chosen`, `linux,initrd-start` и `-end`.
+///
+/// Это договор Linux, и LK его соблюдает: RAM-диск из загрузочного образа он
+/// кладёт по адресу из заголовка и называет границы в дереве. Раньше там лежал
+/// заводской диск Android, которым ядро не пользовалось; теперь `cargo xtask
+/// phone --ramdisk` кладёт туда наш initrd, и телефон получает те же `/bin` и
+/// `/usr/share`, что машина с UEFI.
+///
+/// Диск без загрузочного сектора FAT не принимается: initrd — том FAT32
+/// (`xtask/src/initrd.rs`), а заводской образ по этому адресу — сжатый cpio, и
+/// смонтировать его значило бы получить отказ позже и невнятно. Отказ отдаётся
+/// как «нет диска», и ядро грузится без файловой системы, как грузилось до сих
+/// пор.
+///
+/// Длина берётся у загрузчика и округляется вниз до сектора. Образ для телефона
+/// обрезан по последнему занятому блоку (`cargo xtask phone --ramdisk`,
+/// `trim_volume`): свободные кластеры драйвер не читает, а целый том в 40 МиБ
+/// не помещается в раздел recovery до блока подписи.
+fn initrd(fdt: &Fdt<'_>) -> boot_info::Initrd {
+    let none = boot_info::Initrd::NONE;
+    let Some(chosen) = fdt.find("/chosen") else {
+        return none;
+    };
+    let (Some(start), Some(end)) =
+        (chosen.property_u64("linux,initrd-start"), chosen.property_u64("linux,initrd-end"))
+    else {
+        return none;
+    };
+    const SECTOR: u64 = 512;
+    let size = end.saturating_sub(start) / SECTOR * SECTOR;
+    if size == 0 || start % 8 != 0 {
+        return none;
+    }
+    // SAFETY: MMU в этот момент отображает ОЗУ один в один (`boot_mmu`), а
+    // границы — от загрузчика и лежат внутри банка памяти, куда он образ и
+    // положил. Читается первый сектор, а размер не меньше сектора.
+    let signature = unsafe { core::ptr::read_unaligned((start + 510) as *const [u8; 2]) };
+    if signature != [0x55, 0xaa] {
+        return none;
+    }
+    boot_info::Initrd { base: start, size }
 }
 
 /// Куски, которые занял кто-то до нас: `/reserved-memory`.
