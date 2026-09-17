@@ -3818,6 +3818,33 @@ pub const ALL: &[Scenario] = &[
             Step::Await("pqueue: done", 60_000),
             Step::Await("dotnet: pqueue.dll: Main returned 20", 60_000),
             Step::Await("freeos> ", 15_000),
+            // Фаза N10b: ещё шесть коллекций из dotnet/runtime. `set ops` идёт
+            // через stackalloc (localloc среды), `stack:` — через упаковку int
+            // при копировании в object[], `tree copy` — через красно-чёрное
+            // дерево SortedSet под SortedDictionary.
+            Step::Line("dotnet /usr/share/dotnet/samples/sorted.dll"),
+            Step::Await("sorted: start", 60_000),
+            Step::Await("linked: a,b,c,d,e,c 6 a c", 60_000),
+            Step::Await("stack: 4,3,2,1 4 0,4,3,2,1,0 4,3,2,1 True", 60_000),
+            Step::Await("queue: q3,q4,q5 q3 True q3,q4,q5 InvalidOperationException: Queue empty.", 60_000),
+            Step::Await("sorted list: [apple, 1],[fig, 7],[kiwi, 2],[pear, 3] 2 -1 1", 60_000),
+            Step::Await("sorted dictionary: 10,30,50,60,70,80,90 7 v60 True False", 60_000),
+            Step::Await("set: 1,3,5,7,9,11,13 1 13 view 5,7,9,11 4 5 11", 60_000),
+            Step::Await("set ops: True True True True", 60_000),
+            Step::Await("union: 1,3,5,6,7,8,9,11,13,100 | 5,6,7 | 1,3,9,11,13 | 2,4,5,6,7,9,11,13", 60_000),
+            Step::Await("sorted: done", 60_000),
+            Step::Await("dotnet: sorted.dll: Main returned 42", 60_000),
+            Step::Await("freeos> ", 15_000),
+            // Nullable<T>: пустое значение упаковывается в null, полное — в сам T.
+            Step::Line("dotnet /usr/share/dotnet/samples/nullable.dll"),
+            Step::Await("nullable: start", 60_000),
+            Step::Await("boxed: True Int32 5 True True False", 60_000),
+            Step::Await("unboxed: 5 False 12 12", 60_000),
+            Step::Await("operators: 6 True True False True True -1", 60_000),
+            Step::Await("struct: Point (3, 4) 4 True", 60_000),
+            Step::Await("list: 2 107 10||-3", 60_000),
+            Step::Await("dotnet: nullable.dll: Main returned 11", 60_000),
+            Step::Await("freeos> ", 15_000),
             // Фаза N6a: окно WinForms. Форма открывается окном программы,
             // рисует себя в Paint, получает щелчок мышью в своих координатах и
             // закрывается крестиком стола — FormClosing и FormClosed с причиной

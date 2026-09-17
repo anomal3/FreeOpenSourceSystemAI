@@ -35,6 +35,10 @@
          `?` у ссылочных типов — там проект собирается с Nullable enable. Здесь
          пометки выключены, и файл не правится ради тишины: его заменяют
          копированием новой версии. -->
+    <!-- SortedSet из dotnet/runtime (фаза N10b) пишет `stackalloc` в метод,
+         помеченный unsafe. Указателей среда не исполняет: `localloc` кладёт
+         ноль, а память даёт конструктор Span<T>(void*, int) обычным массивом. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <NoWarn>$(NoWarn);CS0660;CS0661;CS1718;CS8632</NoWarn>
   </PropertyGroup>
 

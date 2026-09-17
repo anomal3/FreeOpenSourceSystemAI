@@ -603,7 +603,11 @@ namespace System.Collections.Generic
         }
     }
 
-    public class Dictionary<TKey, TValue> : IEnumerable<KeyValuePair<TKey, TValue>>
+    // IDictionary и IReadOnlyDictionary добавлены в фазе N10b: SortedList и
+    // SortedDictionary из dotnet/runtime принимают словарь этими интерфейсами, и
+    // без них `new SortedList<K, V>(dictionary)` не находил у нашего словаря
+    // `ICollection<KeyValuePair<K, V>>.Count`.
+    public class Dictionary<TKey, TValue> : IDictionary<TKey, TValue>, IReadOnlyDictionary<TKey, TValue>
     {
         // Номер записи, с которой начинается список свободных: `next` у
         // свободной записи хранит `StartOfFreeList - следующая`, и значения
@@ -836,6 +840,51 @@ namespace System.Collections.Generic
 
         public Enumerator GetEnumerator() => new Enumerator(this);
 
+        ICollection<TKey> IDictionary<TKey, TValue>.Keys => Keys;
+
+        ICollection<TValue> IDictionary<TKey, TValue>.Values => Values;
+
+        IEnumerable<TKey> IReadOnlyDictionary<TKey, TValue>.Keys => Keys;
+
+        IEnumerable<TValue> IReadOnlyDictionary<TKey, TValue>.Values => Values;
+
+        bool ICollection<KeyValuePair<TKey, TValue>>.IsReadOnly => false;
+
+        void ICollection<KeyValuePair<TKey, TValue>>.Add(KeyValuePair<TKey, TValue> pair) => Add(pair.Key, pair.Value);
+
+        // Пара есть, если есть ключ и значение при нём равно — как у .NET.
+        bool ICollection<KeyValuePair<TKey, TValue>>.Contains(KeyValuePair<TKey, TValue> pair) =>
+            TryGetValue(pair.Key, out TValue value) && EqualityComparer<TValue>.Default.Equals(value, pair.Value);
+
+        bool ICollection<KeyValuePair<TKey, TValue>>.Remove(KeyValuePair<TKey, TValue> pair) =>
+            ((ICollection<KeyValuePair<TKey, TValue>>)this).Contains(pair) && Remove(pair.Key);
+
+        void ICollection<KeyValuePair<TKey, TValue>>.CopyTo(KeyValuePair<TKey, TValue>[] array, int index)
+        {
+            CheckCopyTo(array, index, Count);
+            foreach (KeyValuePair<TKey, TValue> pair in this)
+            {
+                array[index++] = pair;
+            }
+        }
+
+        // Проверки CopyTo с текстами .NET — общие для словаря и его коллекций.
+        internal static void CheckCopyTo<T>(T[] array, int index, int count)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if ((uint)index > (uint)array.Length)
+            {
+                throw new ArgumentOutOfRangeException("index", index, "Index was out of range. Must be non-negative and less than or equal to the size of the collection.");
+            }
+            if (array.Length - index < count)
+            {
+                throw new ArgumentException("Destination array is not long enough to copy all the items in the collection. Check array index and length.");
+            }
+        }
+
         IEnumerator<KeyValuePair<TKey, TValue>> IEnumerable<KeyValuePair<TKey, TValue>>.GetEnumerator() => new Enumerator(this);
 
         IEnumerator IEnumerable.GetEnumerator() => new Enumerator(this);
@@ -889,13 +938,32 @@ namespace System.Collections.Generic
             }
         }
 
-        public sealed class KeyCollection : IEnumerable<TKey>
+        public sealed class KeyCollection : ICollection<TKey>, IReadOnlyCollection<TKey>
         {
             private readonly Dictionary<TKey, TValue> dictionary;
 
             internal KeyCollection(Dictionary<TKey, TValue> dictionary) => this.dictionary = dictionary;
 
             public int Count => dictionary.Count;
+
+            bool ICollection<TKey>.IsReadOnly => true;
+
+            void ICollection<TKey>.Add(TKey item) => throw new NotSupportedException(SR.NotSupported_KeyCollectionSet);
+
+            void ICollection<TKey>.Clear() => throw new NotSupportedException(SR.NotSupported_KeyCollectionSet);
+
+            bool ICollection<TKey>.Remove(TKey item) => throw new NotSupportedException(SR.NotSupported_KeyCollectionSet);
+
+            bool ICollection<TKey>.Contains(TKey item) => dictionary.ContainsKey(item);
+
+            public void CopyTo(TKey[] array, int index)
+            {
+                CheckCopyTo(array, index, dictionary.Count);
+                foreach (KeyValuePair<TKey, TValue> pair in dictionary)
+                {
+                    array[index++] = pair.Key;
+                }
+            }
 
             public IEnumerator<TKey> GetEnumerator()
             {
@@ -908,13 +976,42 @@ namespace System.Collections.Generic
             IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
         }
 
-        public sealed class ValueCollection : IEnumerable<TValue>
+        public sealed class ValueCollection : ICollection<TValue>, IReadOnlyCollection<TValue>
         {
             private readonly Dictionary<TKey, TValue> dictionary;
 
             internal ValueCollection(Dictionary<TKey, TValue> dictionary) => this.dictionary = dictionary;
 
             public int Count => dictionary.Count;
+
+            bool ICollection<TValue>.IsReadOnly => true;
+
+            void ICollection<TValue>.Add(TValue item) => throw new NotSupportedException(SR.NotSupported_ValueCollectionSet);
+
+            void ICollection<TValue>.Clear() => throw new NotSupportedException(SR.NotSupported_ValueCollectionSet);
+
+            bool ICollection<TValue>.Remove(TValue item) => throw new NotSupportedException(SR.NotSupported_ValueCollectionSet);
+
+            bool ICollection<TValue>.Contains(TValue item)
+            {
+                foreach (KeyValuePair<TKey, TValue> pair in dictionary)
+                {
+                    if (EqualityComparer<TValue>.Default.Equals(pair.Value, item))
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            public void CopyTo(TValue[] array, int index)
+            {
+                CheckCopyTo(array, index, dictionary.Count);
+                foreach (KeyValuePair<TKey, TValue> pair in dictionary)
+                {
+                    array[index++] = pair.Value;
+                }
+            }
 
             public IEnumerator<TValue> GetEnumerator()
             {
@@ -1093,116 +1190,6 @@ namespace System.Collections.Generic
                 {
                     yield return slots[i].value;
                 }
-            }
-        }
-
-        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-    }
-
-    public class Queue<T> : IEnumerable<T>
-    {
-        private T[] items = new T[4];
-        private int head;
-        private int size;
-
-        public int Count => size;
-
-        public void Enqueue(T item)
-        {
-            if (size == items.Length)
-            {
-                T[] bigger = new T[items.Length * 2];
-                for (int i = 0; i < size; i++)
-                {
-                    bigger[i] = items[(head + i) % items.Length];
-                }
-                items = bigger;
-                head = 0;
-            }
-            items[(head + size) % items.Length] = item;
-            size++;
-        }
-
-        public T Dequeue()
-        {
-            if (size == 0)
-            {
-                throw new InvalidOperationException("Queue empty.");
-            }
-            T item = items[head];
-            items[head] = default;
-            head = (head + 1) % items.Length;
-            size--;
-            return item;
-        }
-
-        public T Peek()
-        {
-            if (size == 0)
-            {
-                throw new InvalidOperationException("Queue empty.");
-            }
-            return items[head];
-        }
-
-        public IEnumerator<T> GetEnumerator()
-        {
-            for (int i = 0; i < size; i++)
-            {
-                yield return items[(head + i) % items.Length];
-            }
-        }
-
-        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-    }
-
-    public class Stack<T> : IEnumerable<T>
-    {
-        private T[] items = new T[4];
-        private int size;
-
-        public int Count => size;
-
-        public void Push(T item)
-        {
-            if (size == items.Length)
-            {
-                T[] bigger = new T[items.Length * 2];
-                for (int i = 0; i < size; i++)
-                {
-                    bigger[i] = items[i];
-                }
-                items = bigger;
-            }
-            items[size++] = item;
-        }
-
-        public T Pop()
-        {
-            if (size == 0)
-            {
-                throw new InvalidOperationException("Stack empty.");
-            }
-            T item = items[--size];
-            items[size] = default;
-            return item;
-        }
-
-        public T Peek()
-        {
-            if (size == 0)
-            {
-                throw new InvalidOperationException("Stack empty.");
-            }
-            return items[size - 1];
-        }
-
-        // Стек перебирается от вершины, как у .NET.
-        public IEnumerator<T> GetEnumerator()
-        {
-            for (int i = size - 1; i >= 0; i--)
-            {
-                yield return items[i];
             }
         }
 

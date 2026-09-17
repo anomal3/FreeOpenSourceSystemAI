@@ -175,6 +175,15 @@ namespace System
                 throw new ArgumentOutOfRangeException(paramName, value, paramName + " ('" + value.ToString() + "') must be a non-negative value.");
             }
         }
+
+        // Тоже обобщённый у .NET (IComparable<T>); здесь `int` — хватает очереди и стека.
+        public static void ThrowIfLessThan(int value, int other, [Runtime.CompilerServices.CallerArgumentExpression("value")] string paramName = null)
+        {
+            if (value < other)
+            {
+                throw new ArgumentOutOfRangeException(paramName, value, paramName + " ('" + value.ToString() + "') must be greater than or equal to '" + other.ToString() + "'.");
+            }
+        }
     }
 
     public class InvalidOperationException : SystemException

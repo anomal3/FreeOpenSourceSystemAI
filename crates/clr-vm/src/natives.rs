@@ -60,6 +60,7 @@ pub(crate) enum Native {
     TypeIsValueType,
     ArrayCopy,
     ArrayClear,
+    ArrayReverse,
     I32CompareTo,
     I64CompareTo,
     StringCompareTo,
@@ -225,6 +226,7 @@ const TABLE: &[(&str, Native)] = &[
     ("System.Type::get_IsValueType()", Native::TypeIsValueType),
     ("System.Array::Copy(System.Array,int32,System.Array,int32,int32)", Native::ArrayCopy),
     ("System.Array::Clear(System.Array,int32,int32)", Native::ArrayClear),
+    ("System.Array::Reverse(System.Array,int32,int32)", Native::ArrayReverse),
     ("System.Int32::CompareTo(int32)", Native::I32CompareTo),
     ("System.Int64::CompareTo(int64)", Native::I64CompareTo),
     ("System.String::CompareTo(string)", Native::StringCompareTo),
@@ -526,6 +528,11 @@ pub(crate) fn call<H: Host>(vm: &mut Vm<'_, H>, native: Native, args: &[Value]) 
         Native::ArrayCopy => {
             let (source_index, destination_index, length) = (vm.int32(arg(1)?)?, vm.int32(arg(3)?)?, vm.int32(arg(4)?)?);
             vm.copy_elements(arg(0)?, source_index, arg(2)?, destination_index, length)?;
+            None
+        }
+        Native::ArrayReverse => {
+            let (index, length) = (vm.int32(arg(1)?)?, vm.int32(arg(2)?)?);
+            vm.reverse_elements(arg(0)?, index, length)?;
             None
         }
         Native::ArrayClear => {

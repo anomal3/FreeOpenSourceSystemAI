@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Образец для фазы N10b: LinkedList, Stack, Queue, SortedList,
+       SortedDictionary и SortedSet — файлы dotnet/runtime в corelib без правки.
+       Печатается то, что зависит от их алгоритмов: порядок, ёмкости, поиск
+       вида, границы подмножеств и тексты исключений. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

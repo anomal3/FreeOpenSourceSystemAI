@@ -360,6 +360,181 @@ namespace System
             return -1;
         }
 
+        // Фаза N10b: перегрузки для коллекций из dotnet/runtime. Проверки
+        // аргументов и тексты исключений — как у .NET: коллекции проверяют сами,
+        // но программа может позвать эти члены и напрямую.
+        public static int IndexOf<T>(T[] array, T value, int startIndex, int count)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if ((uint)startIndex > (uint)array.Length)
+            {
+                throw new ArgumentOutOfRangeException("startIndex", "Index was out of range. Must be non-negative and less than or equal to the size of the collection.");
+            }
+            if ((uint)count > (uint)(array.Length - startIndex))
+            {
+                throw new ArgumentOutOfRangeException("count", "Count must be positive and count must refer to a location within the string/array/collection.");
+            }
+            Collections.Generic.EqualityComparer<T> comparer = Collections.Generic.EqualityComparer<T>.Default;
+            for (int i = startIndex; i < startIndex + count; i++)
+            {
+                if (comparer.Equals(array[i], value))
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        public static int LastIndexOf<T>(T[] array, T value, int startIndex)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if (array.Length == 0)
+            {
+                return -1;
+            }
+            if ((uint)startIndex >= (uint)array.Length)
+            {
+                throw new ArgumentOutOfRangeException("startIndex", "Index was out of range. Must be non-negative and less than the size of the collection.");
+            }
+            Collections.Generic.EqualityComparer<T> comparer = Collections.Generic.EqualityComparer<T>.Default;
+            for (int i = startIndex; i >= 0; i--)
+            {
+                if (comparer.Equals(array[i], value))
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        public static void Reverse<T>(T[] array, int index, int length)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if (index < 0 || length < 0)
+            {
+                throw new ArgumentOutOfRangeException(index < 0 ? "index" : "length", "Non-negative number required.");
+            }
+            if (array.Length - index < length)
+            {
+                throw new ArgumentException(SR.Argument_InvalidOffLen);
+            }
+            for (int i = index, j = index + length - 1; i < j; i++, j--)
+            {
+                T item = array[i];
+                array[i] = array[j];
+                array[j] = item;
+            }
+        }
+
+        public static void Sort<T>(T[] array, int index, int length, Collections.Generic.IComparer<T> comparer)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if (index < 0 || length < 0)
+            {
+                throw new ArgumentOutOfRangeException(length < 0 ? "length" : "index", "Non-negative number required.");
+            }
+            if (array.Length - index < length)
+            {
+                throw new ArgumentException(SR.Argument_InvalidOffLen);
+            }
+            if (length > 1)
+            {
+                Collections.Generic.ArraySortHelper<T>.Sort(array, index, length, comparer);
+            }
+        }
+
+        // Ключи и значения переставляются вместе. Вставками: у .NET здесь
+        // интроспективная сортировка, и порядок равных ключей у них не
+        // определён; перенесённый SortedList зовёт её только на словаре, где
+        // равных ключей нет.
+        public static void Sort<TKey, TValue>(TKey[] keys, TValue[] items, Collections.Generic.IComparer<TKey> comparer)
+        {
+            if (keys == null)
+            {
+                throw new ArgumentNullException("keys");
+            }
+            comparer = comparer ?? Collections.Generic.Comparer<TKey>.Default;
+            int length = keys.Length;
+            for (int i = 1; i < length; i++)
+            {
+                TKey key = keys[i];
+                TValue item = items == null ? default : items[i];
+                int j = i - 1;
+                while (j >= 0 && comparer.Compare(keys[j], key) > 0)
+                {
+                    keys[j + 1] = keys[j];
+                    if (items != null)
+                    {
+                        items[j + 1] = items[j];
+                    }
+                    j--;
+                }
+                keys[j + 1] = key;
+                if (items != null)
+                {
+                    items[j + 1] = item;
+                }
+            }
+        }
+
+        // Тот же поиск, что у .NET (ArraySortHelper.InternalBinarySearch):
+        // середина `lo + ((hi - lo) >> 1)`, промах — дополнение места вставки.
+        // От этого зависит, какой из равных элементов найдётся.
+        public static int BinarySearch<T>(T[] array, int index, int length, T value, Collections.Generic.IComparer<T> comparer)
+        {
+            if (array == null)
+            {
+                throw new ArgumentNullException("array");
+            }
+            if (index < 0 || length < 0)
+            {
+                throw new ArgumentOutOfRangeException(index < 0 ? "index" : "length", "Non-negative number required.");
+            }
+            if (array.Length - index < length)
+            {
+                throw new ArgumentException(SR.Argument_InvalidOffLen);
+            }
+            comparer = comparer ?? Collections.Generic.Comparer<T>.Default;
+            int lo = index;
+            int hi = index + length - 1;
+            while (lo <= hi)
+            {
+                int i = lo + ((hi - lo) >> 1);
+                int order = comparer.Compare(array[i], value);
+                if (order == 0)
+                {
+                    return i;
+                }
+                if (order < 0)
+                {
+                    lo = i + 1;
+                }
+                else
+                {
+                    hi = i - 1;
+                }
+            }
+            return ~lo;
+        }
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern void Reverse(Array array, int index, int length);
+
+        public static void Copy(Array sourceArray, Array destinationArray, int length) =>
+            Copy(sourceArray, 0, destinationArray, 0, length);
+
         public static void Reverse<T>(T[] array)
         {
             for (int i = 0, j = array.Length - 1; i < j; i++, j--)
@@ -452,9 +627,63 @@ namespace System
     {
     }
 
+    // До фазы N10b структура была пустой: имя нужно компилятору для `int?`, а
+    // ни одна программа им не пользовалась. Выражение `x?.M() ?? 0` у метода со
+    // значимым результатом компилятор собирает через конструктор и
+    // HasValue/GetValueOrDefault — без них Roslyn падает сам («Sequence contains
+    // no elements»), и так упала сборка SortedSet из dotnet/runtime. Члены и их
+    // поведение — как у .NET. Упаковка по правилам .NET (пустое значение
+    // упаковывается в null, полное — в сам T) — забота среды (objects.rs).
     public struct Nullable<T>
         where T : struct
     {
+        private readonly bool hasValue;
+        internal T value;
+
+        public Nullable(T value)
+        {
+            this.value = value;
+            hasValue = true;
+        }
+
+        public readonly bool HasValue => hasValue;
+
+        public readonly T Value
+        {
+            get
+            {
+                if (!hasValue)
+                {
+                    throw new InvalidOperationException("Nullable object must have a value.");
+                }
+                return value;
+            }
+        }
+
+        public readonly T GetValueOrDefault() => value;
+
+        public readonly T GetValueOrDefault(T defaultValue) => hasValue ? value : defaultValue;
+
+        public override bool Equals(object other)
+        {
+            if (!hasValue)
+            {
+                return other == null;
+            }
+            if (other == null)
+            {
+                return false;
+            }
+            return value.Equals(other);
+        }
+
+        public override int GetHashCode() => hasValue ? value.GetHashCode() : 0;
+
+        public override string ToString() => hasValue ? value.ToString() : "";
+
+        public static implicit operator T?(T value) => new T?(value);
+
+        public static explicit operator T(T? value) => value.Value;
     }
 
     public interface IDisposable

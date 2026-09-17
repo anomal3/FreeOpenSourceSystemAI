@@ -399,7 +399,31 @@ impl<'a, H: Host> Vm<'a, H> {
     // --------------------------------------------------------------------
 
 
+    /// Тип значения внутри `Nullable<T>`, если `ty` — это он.
+    ///
+    /// Упаковка у `Nullable<T>` своя (ECMA-335 I.8.2.4): пустое значение
+    /// становится `null`, полное — упакованным `T`, а распаковка обратно
+    /// принимает и то и другое. Поля структуры (corelib, Object.cs) —
+    /// `hasValue` первым, `value` вторым.
+    pub(crate) fn nullable_inner(&self, ty: TypeId) -> Option<TypeId> {
+        let info = &self.types[ty.0 as usize];
+        if info.kind == Kind::Struct && info.args.len() == 1 && info.name.starts_with("System.Nullable`1") {
+            Some(info.args[0])
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn box_value(&mut self, ty: TypeId, value: Value) -> Result<Value, VmError> {
+        if let (Some(inner), Value::Struct(nullable)) = (self.nullable_inner(ty), value) {
+            let has_value = self.load(Pointer::Field { object: nullable, index: 0 })?;
+            if !crate::ops::truthy(has_value).map_err(|fault| self.fault(fault))? {
+                return Ok(Value::Obj(None));
+            }
+            let inner_value = self.load(Pointer::Field { object: nullable, index: 1 })?;
+            let inner_value = self.copy_out(inner_value)?;
+            return self.box_value(inner, inner_value);
+        }
         let object = match self.types[ty.0 as usize].kind {
             Kind::Struct => Object::Boxed { ty, value },
             Kind::Prim(p) | Kind::Enum(p) => Object::Boxed { ty, value: p.narrow(value) },
@@ -413,6 +437,9 @@ impl<'a, H: Host> Vm<'a, H> {
     pub(crate) fn unbox(&mut self, ty: TypeId, any: bool) -> Result<(), VmError> {
         if !self.types[ty.0 as usize].is_value_type() {
             return if any { self.cast(ty, true) } else { Err(self.invalid("unbox to a reference type")) };
+        }
+        if let Some(inner) = self.nullable_inner(ty) {
+            return self.unbox_nullable(ty, inner, any);
         }
         let object = match self.pop()? {
             Value::Obj(Some(object)) => object,
@@ -447,6 +474,30 @@ impl<'a, H: Host> Vm<'a, H> {
         self.push(Value::Ptr(pointer))
     }
 
+    /// Распаковка в `Nullable<T>`: `null` даёт пустое значение, упакованный `T`
+    /// — полное, всё прочее — InvalidCastException.
+    fn unbox_nullable(&mut self, ty: TypeId, inner: TypeId, any: bool) -> Result<(), VmError> {
+        let reference = self.pop()?;
+        let nullable = match self.zero(Store::Struct(ty))? {
+            Value::Struct(object) => object,
+            _ => return Err(self.invalid("Nullable<T> is not a struct")),
+        };
+        if let Value::Obj(Some(_)) = reference {
+            self.push(reference)?;
+            self.unbox(inner, true)?;
+            let value = self.pop()?;
+            self.store(Pointer::Field { object: nullable, index: 0 }, Value::I32(1))?;
+            self.store(Pointer::Field { object: nullable, index: 1 }, value)?;
+        } else if !matches!(reference, Value::Obj(None)) {
+            return Err(self.invalid("unbox of a value that is not a reference"));
+        }
+        if any {
+            self.push(Value::Struct(nullable))
+        } else {
+            self.push(Value::Ptr(Pointer::Struct(nullable)))
+        }
+    }
+
     /// `castclass` (`throw` = true) и `isinst`.
     pub(crate) fn cast(&mut self, ty: TypeId, throw: bool) -> Result<(), VmError> {
         let value = self.pop()?;
@@ -454,7 +505,8 @@ impl<'a, H: Host> Vm<'a, H> {
             Value::Obj(None) => self.push(value),
             Value::Obj(Some(object)) => {
                 let actual = self.type_of_object(object)?;
-                if self.assignable(actual, ty) {
+                // Упакованный `T` приводится к `Nullable<T>`: `o is int?`.
+                if self.assignable(actual, ty) || self.nullable_inner(ty) == Some(actual) {
                     self.push(value)
                 } else if throw {
                     Err(self.exception("System.InvalidCastException"))

@@ -414,17 +414,52 @@ impl<'a, H: Host> Vm<'a, H> {
         if from + count > source_len || to + count > destination_len {
             return Err(self.exception("System.ArgumentException"));
         }
-        // Разные типы элементов .NET иногда допускает (упаковка в object[],
-        // ссылки на базовый класс). Среде это пока не нужно, а молча записать
-        // значение не того вида в компактный массив примитивов нельзя.
-        if source_ty != destination_ty {
-            return Err(self.exception("System.ArrayTypeMismatchException"));
-        }
+        // Разные типы элементов .NET допускает в двух случаях, и оба видны
+        // программе (фаза N10b, `ICollection.CopyTo` стека в `object[]`):
+        // значимый элемент в массив ссылок, которым он приводится, — с
+        // упаковкой каждого; ссылка в массив ссылок другого типа — если каждый
+        // элемент к нему приводится, иначе InvalidCastException. Всё прочее
+        // (int[] в long[], ссылки в компактный массив примитивов) —
+        // ArrayTypeMismatchException, как у .NET.
+        let mode = if source_ty == destination_ty {
+            Convert::Same
+        } else {
+            let element = |vm: &Self, ty: TypeId| match vm.types[ty.0 as usize].kind {
+                crate::types::Kind::Array(element) => Some(element),
+                _ => None,
+            };
+            match (element(self, source_ty), element(self, destination_ty)) {
+                (Some(from_element), Some(to_element)) if !self.types[to_element.0 as usize].is_value_type() => {
+                    if self.types[from_element.0 as usize].is_value_type() {
+                        if !self.assignable(from_element, to_element) {
+                            return Err(self.exception("System.ArrayTypeMismatchException"));
+                        }
+                        Convert::Box(from_element)
+                    } else {
+                        Convert::Cast(to_element)
+                    }
+                }
+                _ => return Err(self.exception("System.ArrayTypeMismatchException")),
+            }
+        };
         let backwards = source == destination && to > from;
         for step in 0..count {
             let offset = if backwards { count - 1 - step } else { step };
             let value = self.load(Pointer::Element { array: source, index: (from + offset) as u32 })?;
             let value = self.copy_out(value)?;
+            let value = match mode {
+                Convert::Same => value,
+                Convert::Box(element) => self.box_value(element, value)?,
+                Convert::Cast(element) => {
+                    if let Value::Obj(Some(object)) = value {
+                        let actual = self.type_of_object(object)?;
+                        if !self.assignable(actual, element) {
+                            return Err(self.exception("System.InvalidCastException"));
+                        }
+                    }
+                    value
+                }
+            };
             self.store(Pointer::Element { array: destination, index: (to + offset) as u32 }, value)?;
         }
         Ok(())
@@ -433,6 +468,30 @@ impl<'a, H: Host> Vm<'a, H> {
     /// `Array.Clear(Array, int, int)` (фаза N10): нулевое значение типа
     /// элемента в каждую ячейку. Выход за массив — `IndexOutOfRangeException`,
     /// как у .NET.
+    /// Необобщённый `Array.Reverse(Array, int, int)` (фаза N10b, `Stack.CopyTo`):
+    /// тип элемента знает только среда. Проверки — как у .NET.
+    pub(crate) fn reverse_elements(&mut self, array: Value, index: i32, length: i32) -> Result<(), VmError> {
+        let (array, _, len) = self.array_argument(array)?;
+        if index < 0 || length < 0 {
+            return Err(self.exception("System.ArgumentOutOfRangeException"));
+        }
+        if index as usize + length as usize > len {
+            return Err(self.exception("System.ArgumentException"));
+        }
+        let (mut low, mut high) = (index as usize, (index + length) as usize);
+        while low + 1 < high {
+            high -= 1;
+            let first = self.load(Pointer::Element { array, index: low as u32 })?;
+            let first = self.copy_out(first)?;
+            let last = self.load(Pointer::Element { array, index: high as u32 })?;
+            let last = self.copy_out(last)?;
+            self.store(Pointer::Element { array, index: low as u32 }, last)?;
+            self.store(Pointer::Element { array, index: high as u32 }, first)?;
+            low += 1;
+        }
+        Ok(())
+    }
+
     pub(crate) fn clear_elements(&mut self, array: Value, index: i32, length: i32) -> Result<(), VmError> {
         let (array, ty, len) = self.array_argument(array)?;
         if index < 0 || length < 0 || index as usize + length as usize > len {
@@ -575,4 +634,15 @@ pub(crate) fn narrow_store(op: u8, value: Value) -> Value {
         (0x57, Value::F32(x)) => Value::F(f64::from(x)),
         _ => value,
     }
+}
+
+/// Как `Array.Copy` переносит элемент между массивами разных типов.
+#[derive(Clone, Copy)]
+enum Convert {
+    /// Типы элементов совпадают.
+    Same,
+    /// Значимый элемент упаковывается в массив ссылок.
+    Box(TypeId),
+    /// Ссылка проверяется на приведение к типу элемента назначения.
+    Cast(TypeId),
 }

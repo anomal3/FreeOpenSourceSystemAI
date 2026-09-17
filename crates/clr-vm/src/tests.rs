@@ -128,7 +128,7 @@ const TEST_STACK_KIB: usize = 256;
 fn samples_fit_in_the_user_stack() {
     let kib = std::env::var("CLR_STACK_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(TEST_STACK_KIB);
     for (name, data) in
-        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE), ("drawing", DRAWING)]
+        [("hello", HELLO), ("arith", ARITH), ("objects", OBJECTS), ("exceptions", EXCEPTIONS), ("generics", GENERICS), ("gc", GC), ("text", TEXT), ("collections", COLLECTIONS), ("floats", FLOATS), ("enums", ENUMS), ("linq", LINQ), ("files", FILES), ("time", TIME), ("form", FORM), ("winforms", WINFORMS), ("controls", CONTROLS), ("lists", LISTS), ("dialogs", DIALOGS), ("layout", LAYOUT), ("choices", CHOICES), ("tabs", TABS), ("numbers", NUMBERS), ("keys", KEYS), ("pqueue", PQUEUE), ("sorted", SORTED), ("nullable", NULLABLE), ("drawing", DRAWING)]
     {
         let worker = std::thread::Builder::new()
             .stack_size(kib * 1024)
@@ -957,6 +957,87 @@ printed so far:
 {output}"));
     assert_eq!(output, PQUEUE_OUTPUT);
     assert_eq!(code, 20);
+}
+
+/// Образец `tools/dotnet/samples/sorted` (фаза N10b): LinkedList, Stack, Queue,
+/// SortedList, SortedDictionary и SortedSet из dotnet/runtime без правки.
+const SORTED: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/sorted.dll");
+
+/// Что печатает `dotnet sorted.dll` (записано 2026-09-17, .NET 10, LF,
+/// инвариантная глобализация; три запуска одинаковые). `set ops` идёт через
+/// `stackalloc` в SortedSet, `stack:` — через упаковку `int` при копировании в
+/// `object[]`, `queue capacity` — двухстрочный текст ArgumentOutOfRangeException.
+const SORTED_OUTPUT: &str = concat!(
+    "sorted: start\n",
+    "linked: a,b,c,d,e,c 6 a c\n",
+    "find: d e True\n",
+    "removed: b,d,e False 3\n",
+    "backwards: e,d,b\n",
+    "attached: InvalidOperationException: The LinkedList node already belongs to a LinkedList.\n",
+    "foreign: InvalidOperationException: The LinkedList node does not belong to current LinkedList.\n",
+    "empty: InvalidOperationException: The LinkedList is empty.\n",
+    "stack: 4,3,2,1 4 0,4,3,2,1,0 4,3,2,1 True\n",
+    "stack pop: 4 True 3 2 InvalidOperationException: Stack empty.\n",
+    "queue: q3,q4,q5 q3 True q3,q4,q5 InvalidOperationException: Queue empty.\n",
+    "queue capacity: 4 ArgumentOutOfRangeException: capacity ('1') must be greater than or equal to '3'. (Parameter 'capacity')\n",
+    "Actual value was 1.\n",
+    "sorted list: [apple, 1],[fig, 7],[kiwi, 2],[pear, 3] 2 -1 1\n",
+    "keys: apple,fig,kiwi,pear | 1,7,2,3 fig 4\n",
+    "changed: [fig, 70],[kiwi, 2],[pear, 3] True 3\n",
+    "duplicate: ArgumentException: An item with the same key has already been added. Key: kiwi (Parameter 'key')\n",
+    "missing: KeyNotFoundException: The given key 'lime' was not present in the dictionary.\n",
+    "by length: a,bb,ccc True\n",
+    "from dictionary: [1, one],[3, three],[5, five]\n",
+    "sorted dictionary: 10,30,50,60,70,80,90 7 v60 True False\n",
+    "tree missing: KeyNotFoundException: The given key '20' was not present in the dictionary.\n",
+    "tree copy: [10, v10] [90, v90]\n",
+    "set: 1,3,5,7,9,11,13 1 13 view 5,7,9,11 4 5 11\n",
+    "view add: 1,3,5,6,7,9,11,13 ArgumentOutOfRangeException: Specified argument was out of the range of valid values. (Parameter 'item')\n",
+    "reverse: 13,11,9,7,6,5,3,1\n",
+    "set ops: True True True True\n",
+    "union: 1,3,5,6,7,8,9,11,13,100 | 5,6,7 | 1,3,9,11,13 | 2,4,5,6,7,9,11,13\n",
+    "remove where: 3 1,5,7,11,13 True 7\n",
+    "bounds: ArgumentException: Must be less than or equal to upperValue. (Parameter 'lowerValue')\n",
+    "sorted: done\n",
+);
+
+#[test]
+fn sorted_collections_print_what_dotnet_prints() {
+    let (result, output) = run(SORTED);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, SORTED_OUTPUT);
+    assert_eq!(code, 42);
+}
+
+/// Образец `tools/dotnet/samples/nullable` (фаза N10b): упаковка и распаковка
+/// `Nullable<T>` по правилам среды .NET, `is int?`, операторы и `?.`.
+const NULLABLE: &[u8] = include_bytes!("../../../initrd/usr/share/dotnet/samples/nullable.dll");
+
+/// Что печатает `dotnet nullable.dll` (записано 2026-09-17, .NET 10, LF,
+/// инвариантная глобализация; три запуска одинаковые). `boxed: True` — пустое
+/// значение упаковалось в null; `depth: 3 ` с хвостовым пробелом — пустой
+/// `int?` печатается пустой строкой.
+const NULLABLE_OUTPUT: &str = concat!(
+    "nullable: start\n",
+    "values: False True 5 0 7 5 '' '5'\n",
+    "boxed: True Int32 5 True True False\n",
+    "unboxed: 5 False 12 12\n",
+    "no value: Nullable object must have a value.\n",
+    "wrong type: InvalidCastException\n",
+    "operators: 6 True True False True True -1\n",
+    "equals: True True 5 0\n",
+    "depth: 3 \n",
+    "struct: Point (3, 4) 4 True\n",
+    "list: 2 107 10||-3\n",
+    "nullable: done\n",
+);
+
+#[test]
+fn nullable_prints_what_dotnet_prints() {
+    let (result, output) = run(NULLABLE);
+    let code = result.unwrap_or_else(|error| panic!("{error}\nprinted so far:\n{output}"));
+    assert_eq!(output, NULLABLE_OUTPUT);
+    assert_eq!(code, 11);
 }
 
 /// Образец `tools/dotnet/samples/drawing` (фаза N9): System.Drawing на Bitmap с

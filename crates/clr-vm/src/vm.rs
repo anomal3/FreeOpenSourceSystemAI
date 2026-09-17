@@ -688,6 +688,16 @@ impl<'a, H: Host> Vm<'a, H> {
                             let target = self.dispatch(ty, method)?;
                             self.push(Value::Fn(target.0))?;
                         }
+                        // localloc: `stackalloc T[n]`. Адресов у среды нет, и
+                        // память выделяет следующий за ним конструктор
+                        // `Span<T>(void*, int)` — обычным массивом (corelib,
+                        // DotnetSupport.cs). Здесь размер снимается, а на стек
+                        // кладётся ноль вместо адреса: разыменовать его
+                        // программа не может, указателей среда не исполняет.
+                        0x0F => {
+                            self.pop()?;
+                            self.push(Value::Native(0))?;
+                        }
                         // endfilter
                         0x11 => {
                             self.end_filter()?;
