@@ -794,6 +794,7 @@ pub fn block_on_irq(source: u32, ready: impl FnOnce() -> bool) {
 /// Вызывается из обработчика прерывания, поэтому делает ровно одно: переводит
 /// ждущих в готовые. Разбор события — работа задачи, а не обработчика.
 pub fn wake_irq(source: u32) {
+    let mut woken = 0usize;
     let mut sched = SCHED.lock();
     for task in sched.tasks.iter_mut().flatten() {
         // Оба вида ожидания прерывания, и это не перечисление ради полноты:
@@ -806,8 +807,13 @@ pub fn wake_irq(source: u32) {
         );
         if waiting {
             task.state = TaskState::Ready;
+            woken += 1;
         }
     }
+    // Счётчик обновляется после обхода, но до освобождения лока: так он не
+    // может разойтись с тем, что видит следующий вызов. Стоит это одной записи
+    // в атомик — на фоне обхода таблицы задач под локом это ничто.
+    crate::irq::note_wake(source, woken);
 }
 
 /// Разбудить тех, кто ждёт лок по адресу `address`.

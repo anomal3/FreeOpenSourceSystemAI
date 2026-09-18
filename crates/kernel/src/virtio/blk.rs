@@ -85,7 +85,7 @@ pub struct VirtioBlk {
 ///
 /// Число ничего не значит снаружи (см. `sched::Wait::Irq`); важно лишь, что оно
 /// не совпадает с ярлыками xHCI (1), питания (2) и сети (3).
-const IRQ_SOURCE: u32 = 4;
+const IRQ_SOURCE: u32 = crate::irq::source::VIRTIO_BLK;
 
 /// Обработчик прерывания диска.
 ///

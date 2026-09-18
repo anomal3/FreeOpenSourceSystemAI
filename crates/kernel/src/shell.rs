@@ -714,6 +714,7 @@ fn run_command(line: &str) -> bool {
         }
         "ui" => ui_status(),
         "tasks" => tasks(),
+        "irq" => interrupt_wakes(argument),
         "clear" => {
             ui::clear_shell();
             if !ui::is_active() {
@@ -1353,6 +1354,7 @@ fn help() {
     sprintln!("  sysupdate <cmd>  check, get or apply a system update (runs as root)");
     sprintln!("  power [s]     when the screen goes dark by itself, or 'never'");
     sprintln!("  guard         the kernel's own stack canary");
+    sprintln!("  irq [name]    which devices wake the system by interrupt");
     sprintln!("  shutdown      switch the machine off");
     sprintln!("  reboot        restart the machine");
     sprintln!("  exit          finish the boot and halt");
@@ -1518,6 +1520,42 @@ fn tasks() {
     // команды — менять контракт планировщика под оболочку.
     sprintln!("  (task list goes to the serial console)");
     sched::dump();
+}
+
+/// Кто из устройств будит систему прерыванием, а кто только обещал.
+///
+/// Команда отвечает на вопрос, на который зелёный сценарий не отвечает: строка
+/// в журнале говорит лишь, что вектор **настроен**, а пришёл ли по нему хоть
+/// один сигнал — видно только здесь. Источник без прерываний работает: ожидание
+/// у него живёт на сроке, то есть ровно так же, как жил бы опрос, — и стоит
+/// сказать это словами, а не оставить нулём в столбике.
+///
+/// Без аргумента печатаются все занятые источники, с аргументом — один
+/// названный. Второе нужно стенду: проверять одну строку про один источник
+/// надёжнее, чем вычитывать таблицу.
+fn interrupt_wakes(argument: &str) {
+    let wanted = argument.trim();
+    let mut shown = 0;
+    for (source, calls, woken) in irq::wakes() {
+        let name = irq::source::name(source);
+        // Незанятые номера пропускаются: печатать пустые строки ради симметрии
+        // значит прятать занятые среди них.
+        if name == "unknown" {
+            continue;
+        }
+        if !wanted.is_empty() && wanted != name {
+            continue;
+        }
+        shown += 1;
+        if calls == 0 {
+            sprintln!("  irq         : {name} never interrupted; waiting there falls back to the deadline");
+        } else {
+            sprintln!("  irq         : {name} woke the system {calls} time(s), {woken} task wake-up(s)");
+        }
+    }
+    if shown == 0 {
+        sprintln!("  irq         : no such interrupt source");
+    }
 }
 
 /// От чьего имени система запускает программы.

@@ -163,6 +163,41 @@ pub const MSIX_ENTRY_SIZE: usize = 16;
 /// Бит 0 поля `Vector Control`: вектор замаскирован.
 const MSIX_VECTOR_MASKED: u32 = 1 << 0;
 
+/// Идентификатор возможности MSI.
+///
+/// MSI старше MSI-X и устроен беднее: у устройства не таблица векторов в его
+/// собственной памяти, а один адрес и одни данные прямо в конфигурационном
+/// пространстве. Для драйвера, которому нужно ровно одно прерывание, разницы
+/// почти нет — но объявляют устройства то одно, то другое, и выбирать не нам.
+/// Контроллер AHCI в QEMU несёт именно MSI.
+pub const CAP_ID_MSI: u8 = 0x05;
+
+/// `Message Control` возможности MSI: смещение от её начала.
+const MSI_CONTROL: usize = 0x02;
+/// Младшие 32 бита адреса сообщения.
+const MSI_ADDRESS_LOW: usize = 0x04;
+/// Бит 0 `Message Control`: MSI включён.
+const MSI_CONTROL_ENABLE: u16 = 1 << 0;
+/// Биты 6:4 — сколько векторов затребовано (логарифм по основанию два).
+/// Ноль означает один вектор, и это всё, что нам нужно.
+const MSI_CONTROL_MULTI_ENABLE: u16 = 0b111 << 4;
+/// Бит 7: устройство умеет 64-битный адрес сообщения. От этого зависит
+/// расположение всех полей за адресом, поэтому читать его надо до записи.
+const MSI_CONTROL_ADDRESS_64: u16 = 1 << 7;
+/// Бит 8: у устройства есть регистр масок отдельных векторов.
+const MSI_CONTROL_MASKABLE: u16 = 1 << 8;
+
+/// Возможность MSI устройства.
+#[derive(Debug, Clone, Copy)]
+pub struct Msi {
+    /// Смещение возможности в конфигурационном пространстве.
+    pub capability: usize,
+    /// Адрес сообщения 64-битный. Меняет смещения полей за ним.
+    pub wide: bool,
+    /// Есть регистр масок. Если есть, маску надо снять явно.
+    pub maskable: bool,
+}
+
 /// Базовый класс «Serial Bus Controller».
 pub const CLASS_SERIAL_BUS: u8 = 0x0C;
 /// Подкласс «USB Controller».
@@ -653,6 +688,73 @@ impl Device {
         let entry = table + index * MSIX_ENTRY_SIZE;
         // SAFETY: контракт функции.
         unsafe { core::ptr::write_volatile((entry + 12) as *mut u32, MSIX_VECTOR_MASKED) };
+    }
+
+    /// Найти возможность MSI, если устройство её объявляет.
+    #[must_use]
+    pub fn msi(&self) -> Option<Msi> {
+        let mut found = None;
+        self.for_each_capability(|id, offset| {
+            if id == CAP_ID_MSI {
+                found = Some(offset);
+                return false;
+            }
+            true
+        });
+        let capability = found?;
+
+        // SAFETY: смещение получено обходом списка возможностей, который уже
+        // проверил, что оно внутри отображённой страницы.
+        let control = unsafe { self.read16(capability + MSI_CONTROL) };
+        Some(Msi {
+            capability,
+            wide: control & MSI_CONTROL_ADDRESS_64 != 0,
+            maskable: control & MSI_CONTROL_MASKABLE != 0,
+        })
+    }
+
+    /// Записать адрес и данные MSI и разрешить доставку.
+    ///
+    /// Затребован ровно один вектор: поле `Multiple Message Enable` обнуляется.
+    /// Просить больше, чем умеешь обработать, — значит получить прерывания с
+    /// данными, которых обработчик не ждёт: устройство вправе класть в младшие
+    /// биты `data` номер сообщения.
+    ///
+    /// Порядок записи обязателен: адрес и данные — до бита разрешения, маска
+    /// снимается последней. Включённый MSI с недописанным адресом означает
+    /// запись устройства неизвестно куда.
+    ///
+    /// # Safety
+    ///
+    /// `msi` должен быть получен от [`Device::msi`] для этого же устройства, а
+    /// обработчик по указанным адресу и данным — установлен до вызова:
+    /// прерывание может прийти немедленно.
+    pub unsafe fn set_msi_vector(&self, msi: &Msi, address: u64, data: u32) {
+        let base = msi.capability + MSI_ADDRESS_LOW;
+        // Смещения за адресом зависят от его ширины, и это единственное, чем
+        // 32-битная возможность отличается от 64-битной.
+        let (data_offset, mask_offset) = if msi.wide { (base + 8, base + 12) } else { (base + 4, base + 8) };
+
+        // SAFETY: контракт функции; смещения — из спецификации PCI, все внутри
+        // возможности, найденной обходом списка.
+        unsafe {
+            self.write32(base, address as u32);
+            if msi.wide {
+                self.write32(base + 4, (address >> 32) as u32);
+            }
+            // Данные — 16-битное поле; старшая половина слова за ним занята
+            // другим регистром, писать её нельзя.
+            self.write16(data_offset, data as u16);
+            if msi.maskable {
+                self.write32(mask_offset, 0);
+            }
+        }
+
+        // SAFETY: см. выше.
+        let control = unsafe { self.read16(msi.capability + MSI_CONTROL) };
+        let wanted = (control & !MSI_CONTROL_MULTI_ENABLE) | MSI_CONTROL_ENABLE;
+        // SAFETY: см. выше.
+        unsafe { self.write16(msi.capability + MSI_CONTROL, wanted) };
     }
 
     /// Байт конфигурационного пространства.

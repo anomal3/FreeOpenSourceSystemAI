@@ -3430,6 +3430,12 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run /bin/ls /home/roman"),
             Step::Await("notes.txt", 30_000),
             Step::Shot("installed"),
+            // Диск virtio отвечает прерыванием, а не опросом (фаза 52). Строка
+            // в журнале о настроенном векторе этого не доказывает: она
+            // печатается до первой же команды. Здесь позади вся работа
+            // сценария, то есть сотни обращений к диску.
+            Step::Line("irq virtio-blk"),
+            Step::Await("virtio-blk woke the system", 15_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
@@ -5156,6 +5162,13 @@ pub const ALL: &[Scenario] = &[
             Step::Await("written-over-sata", 15_000),
             Step::Line("whoami"),
             Step::Await("roman (uid 1000 gid 1000)", 15_000),
+            // Проверка фазы 52, и её нельзя заменить строкой про настроенный
+            // вектор из журнала: та говорит лишь, что контроллеру сообщили, куда
+            // писать. Здесь спрашивается обратное — приходило ли по этому адресу
+            // хоть что-нибудь. Все обращения к диску выше шли через AHCI, так
+            // что к этому моменту прерываний обязано быть много.
+            Step::Line("irq ahci"),
+            Step::Await("ahci woke the system", 15_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
@@ -6966,6 +6979,12 @@ pub const ALL: &[Scenario] = &[
             // дал бы опрос: двести пробуждений в секунду, ровно и всегда.
             Step::Line("tasks"),
             Step::Await("waiting for device (with a deadline)", 15_000),
+            // И то же самое числом: сколько прерываний от карты пришло и
+            // скольких они разбудили. «Задача ждёт устройство» и «устройство
+            // её будит» — разные утверждения, и зелёным был бы сценарий, где
+            // верно только первое.
+            Step::Line("irq net"),
+            Step::Await("net woke the system", 15_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
