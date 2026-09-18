@@ -21,10 +21,10 @@ use crate::kprintln;
 use core::sync::atomic::{Ordering, fence};
 
 use super::{
-    DESC_F_NEXT, DESC_F_WRITE, FEATURE_VERSION_1, Queue, Transport, VirtioError,
+    DESC_F_NEXT, DESC_F_WRITE, FEATURE_VERSION_1, Queue, Transport, VirtioError, map_bar,
 };
 use crate::mm::dma::{self, DmaBuffer};
-use crate::pci::{self, Device};
+use crate::pci::{self, Device, MSIX_ENTRY_SIZE};
 
 /// Тип запроса: чтение.
 const REQUEST_IN: u32 = 0;
@@ -73,6 +73,32 @@ pub struct VirtioBlk {
     /// Буфер данных.
     data: DmaBuffer,
     sectors: u64,
+    /// Ярлык прерывания очереди, если устройство согласилось его присылать.
+    ///
+    /// `None` — ждём завершения холостым циклом, как ядро ждало всегда. Это не
+    /// редкий случай: на GICv3 MSI у нас нет вовсе, и диск там работает ровно
+    /// как до этой фазы.
+    irq: Option<u32>,
+}
+
+/// Ярлык источника прерывания для планировщика.
+///
+/// Число ничего не значит снаружи (см. `sched::Wait::Irq`); важно лишь, что оно
+/// не совпадает с ярлыками xHCI (1), питания (2) и сети (3).
+const IRQ_SOURCE: u32 = 4;
+
+/// Обработчик прерывания диска.
+///
+/// Будит того, кто ждёт завершения, и больше ничего: само завершение лежит в
+/// кольце `used`, и проверять его будет проснувшийся — под своим локом, а не
+/// здесь, где взять его нельзя.
+///
+/// Признака «пришло» тут нет намеренно, в отличие от сети: у диска источник
+/// правды — само кольцо, и ждущий смотрит **в него** (`Queue::has_used`).
+/// Отдельный признак был бы вторым описанием того же события, и разошлись бы
+/// они на первом же потерянном прерывании.
+pub fn on_interrupt() {
+    crate::sched::wake_irq(IRQ_SOURCE);
 }
 
 impl VirtioBlk {
@@ -201,13 +227,66 @@ impl VirtioBlk {
             return Err(VirtioError::NoMedium);
         }
 
-        Ok(Self {
+        let mut disk = Self {
             transport,
             queue,
             control,
             data,
             sectors,
-        })
+            irq: None,
+        };
+        // Прерывания просятся последними: до `DRIVER_OK` устройство не обязано
+        // смотреть в очередь, а первый запрос пойдёт уже после возврата отсюда.
+        //
+        // SAFETY: контракт функции — ядро на своих таблицах страниц.
+        if unsafe { disk.enable_interrupts(device) } {
+            disk.irq = Some(IRQ_SOURCE);
+        }
+        Ok(disk)
+    }
+
+    /// Перевести ожидание завершений с холостого цикла на прерывания.
+    ///
+    /// Возвращает `false`, когда не вышло, и это не ошибка: диск продолжает
+    /// работать ровно как раньше. Каждая причина называется вслух — «диск
+    /// занимает процессор, пока отвечает» человек должен видеть, а не угадывать.
+    ///
+    /// # Safety
+    ///
+    /// Ядро должно исполняться на собственных таблицах страниц.
+    unsafe fn enable_interrupts(&mut self, device: &Device) -> bool {
+        let Some(msix) = device.msix() else {
+            kprintln!("  virtio-blk  : no MSI-X capability; completions will be spun on");
+            return false;
+        };
+        let Some((address, data)) = crate::arch::interrupts::alloc_msi(on_interrupt) else {
+            kprintln!("  virtio-blk  : no MSI target on this machine; completions will be spun on");
+            return false;
+        };
+        let span =
+            u64::from(msix.table_offset) + (MSIX_ENTRY_SIZE * usize::from(msix.vectors)) as u64;
+        // SAFETY: контракт функции; окно — регистры устройства.
+        let table = match unsafe { map_bar(device, msix.bir as u8, span) } {
+            Ok(base) => base.as_usize() + msix.table_offset as usize,
+            Err(err) => {
+                kprintln!("  virtio-blk  : cannot map the MSI-X table ({err:?}); completions will be spun on");
+                return false;
+            }
+        };
+        // SAFETY: таблица отображена, строка 0 существует всегда, обработчик
+        // поставлен `alloc_msi` — прерывание может прийти сразу после записи.
+        unsafe { device.set_msix_vector(&msix, table, 0, address, data) };
+        // SAFETY: MSI-X включён записью выше.
+        unsafe { Queue::silence_config_changes(&self.transport) };
+        // SAFETY: см. выше; вектор ноль — та самая строка, что заполнена.
+        if !unsafe { self.queue.want_interrupts(&self.transport, 0) } {
+            kprintln!("  virtio-blk  : the device refused the queue vector; completions will be spun on");
+            return false;
+        }
+        kprintln!(
+            "  virtio-blk  : MSI-X vector 0 -> {address:#018x} data {data:#x}, completions arrive by interrupt"
+        );
+        true
     }
 
     /// Выполнить один запрос к устройству.
@@ -241,7 +320,7 @@ impl VirtioBlk {
         self.queue.set_descriptor(2, status_phys, 1, DESC_F_WRITE, 0);
 
         fence(Ordering::SeqCst);
-        self.queue.submit_and_wait(POLL_LIMIT)?;
+        self.queue.submit_and_wait(POLL_LIMIT, self.irq)?;
         fence(Ordering::SeqCst);
 
         // SAFETY: буфер выделен под заголовок и байт состояния.
