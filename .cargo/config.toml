@@ -1,9 +1,10 @@
 # Intentionally minimal.
 #
 # No [build] target and no [unstable] build-std here: both are global to the
-# workspace and would break the host-side `xtask` binary. All four targets we
-# use (*-unknown-uefi, *-unknown-none) ship precompiled core/alloc via rustup,
-# so build-std is not needed. xtask passes --target explicitly per arch.
+# workspace and would break the host-side `xtask` binary. xtask passes --target
+# explicitly per arch, and -Zbuild-std to the kernel alone (see
+# `xtask::build::apply_build_std`) — which is why `cargo build -p kernel` by
+# hand does not link: it would take the precompiled, non-PIC `alloc`.
 
 [alias]
 xtask = "run --package xtask --"
@@ -37,6 +38,19 @@ xtask = "run --package xtask --"
 #   -z max-page-size=4096 — иначе lld выравнивает сегменты на 64 КиБ (aarch64) /
 #                           4 КиБ (x86_64), раздувая образ и разъезжаясь с тем,
 #                           как загрузчик считает страницы.
+#   -Z stack-protector=strong
+#                         — канарейка стека у самого ядра. Эталон компилятор
+#                           читает по глобальному символу `__stack_chk_guard`
+#                           (проверено: на обоих наших таргетах LLVM берёт
+#                           именно глобальный символ, а не TLS, как на
+#                           `*-linux-gnu`), а определяет его ядро —
+#                           `crates/kernel/src/guard.rs`, там же и `__stack_chk_fail`.
+#                           Строка стоит здесь, а не в xtask, намеренно: под эти
+#                           два таргета собирается ровно `kernel` вместе со
+#                           своими зависимостями и пересобираемыми `core`/`alloc`
+#                           (`-Zbuild-std` передаёт xtask) — то есть флаг
+#                           достаётся всему, что исполняется в ядре, и ничему
+#                           сверх того.
 
 [target.x86_64-unknown-none]
 rustflags = [
@@ -72,6 +86,7 @@ rustflags = [
     # перекрывает `target.*.rustflags` — им векторы разрешены с фазы 29a и
     # backend они выбирают сами.
     "--cfg", "curve25519_dalek_backend=\"serial\"",
+    "-Z", "stack-protector=strong",
 ]
 
 # Ядро собирается под softfloat-вариант таргета намеренно: обычный
@@ -91,4 +106,5 @@ rustflags = [
     "-C", "link-arg=--entry=kernel_main",
     "-C", "link-arg=--export-dynamic-symbol=kernel_main",
     "-C", "link-arg=-zmax-page-size=4096",
+    "-Z", "stack-protector=strong",
 ]

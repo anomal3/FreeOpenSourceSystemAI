@@ -7063,6 +7063,61 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "canary",
+        about: "Канарейка стека у самого ядра: эталон случаен, и переполнение его не переживает.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            // Эталон заменяется на случайный при загрузке, и загрузка об этом
+            // говорит. Строка важнее, чем кажется: канарейка с известным
+            // наперёд эталоном — это канарейка, которую подделывают вместе с
+            // кадром, и отличить одну от другой можно только по этой строке.
+            Step::Await("canary      : kernel stack guard armed from", BOOT),
+            // Строка канарейки приходит в самом начале загрузки, а приглашение
+            // — в самом конце: между ними вся остальная загрузка, и срок здесь
+            // тот же, что у `boot`, а не «шестьдесят секунд на всякий случай».
+            Step::Await("FreeOS shell.", BOOT),
+            Step::Await("freeos> ", 30_000),
+
+            // Состояние — словами: «случайное значение», а не само значение.
+            Step::Line("guard"),
+            Step::Await("kernel guard : armed with a random value", 15_000),
+
+            // Опечаткой команду не вызвать: слово должно быть названо целиком.
+            Step::Line("guard please"),
+            Step::Await("is not a word this command knows", 15_000),
+
+            // И сама проверка. Ядро обязано не пережить переполнение своего
+            // буфера — и упасть именно на канарейке, а не на отказе страницы:
+            // сообщение паники названо в следующем шаге дословно.
+            Step::Line("guard smash"),
+            Step::Await("*** KERNEL PANIC ***", 30_000),
+            Step::Await("stack smashing detected in the kernel", 15_000),
+
+            // Строки, которую печатает `guard smash`, если переполнение прошло
+            // незамеченным, быть не должно. Без неё зелёный сценарий означал
+            // бы лишь «ядро что-то напечатало и упало».
+            Step::Absent("THE CANARY IS NOT WORKING"),
+        ],
+    },
+    Scenario {
         name: "screen-off",
         about: "Экран гаснет сам после бездействия и зажигается от первой же клавиши.",
         target: Target::Live,

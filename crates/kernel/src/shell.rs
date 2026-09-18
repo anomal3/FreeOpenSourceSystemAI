@@ -815,6 +815,7 @@ fn run_command(line: &str) -> bool {
         "slots" => slots(),
         "sysupdate" => sysupdate(argument),
         "power" => power_settings(argument),
+        "guard" => guard_command(argument),
         "shutdown" | "poweroff" => {
             crate::power::shut_down(false);
             // Сюда возвращаются, только если машина отказалась гаснуть: она
@@ -855,6 +856,81 @@ fn run_command(line: &str) -> bool {
         }
     }
     false
+}
+
+/// Канарейка стека ядра: показать состояние и — по отдельному слову —
+/// проверить её единственным способом, каким её можно проверить.
+///
+/// # Почему команда, ломающая ядро, есть в готовой системе, а не только в
+/// отладочной сборке
+///
+/// Потому что проверка, которой нет в приёмочном прогоне, ничего не
+/// доказывает. У программ в ring-3 канарейку проверяют `smash` и `csmash`, и
+/// первый же их прогон показал, что **в отладке и в оптимизации кадр устроен
+/// по-разному**: там, где в отладке до канарейки далеко, в оптимизации буфер
+/// лежит у самой вершины. Команда, существующая только в `debug`, проверяла бы
+/// ровно то расположение кадра, которое не поедет к человеку.
+///
+/// Цена названа честно: у сеанса за консолью появляется способ уронить ядро.
+/// Способ этот не новый — рядом стоит `shutdown`, — и разница лишь в том, что
+/// том останется незакрытым. Ровно для этого случая в суперблоке и заведён
+/// признак чистого размонтирования (фаза 27): следующая загрузка **знает**,
+/// что произошло. Слово `smash` набирается целиком и не сокращается: команда,
+/// которую можно вызвать опечаткой, рано или поздно будет вызвана опечаткой.
+fn guard_command(argument: &str) {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        sprintln!(
+            "  kernel guard : {}",
+            if crate::guard::is_armed() {
+                "armed with a random value"
+            } else {
+                "still the built-in constant"
+            }
+        );
+        // Вторая защита стека, которая была раньше этой и делает другое:
+        // канарейка ловит переполнение **буфера внутри кадра**, а краска на
+        // дне стека задачи — выход за стек целиком. Названы обе, потому что
+        // «стек защищён» без уточнения — это два разных обещания в одном.
+        sprintln!("  task stacks  : painted below the bottom, checked on every switch");
+        sprintln!("  usage: guard smash   (deliberately overflows a kernel buffer)");
+        return;
+    }
+    if argument != "smash" {
+        sprintln!("  guard: '{argument}' is not a word this command knows; try 'guard smash'");
+        return;
+    }
+    sprintln!("  guard: smashing a kernel stack buffer on purpose; the kernel must panic");
+    // Отметка в кадре **этой** функции: переполнять надо до неё, а не на
+    // выбранное наперёд число байт. Так проверка не зависит от того, каким
+    // вышел кадр в этой сборке, — тот же приём, что в `smash` и `csmash`
+    // после красного прогона, где длинное переполнение улетало за вершину
+    // стека и отказ страницы приходил раньше проверки канарейки.
+    let marker = 0u8;
+    overflow_until(&raw const marker as usize);
+    // Сюда не возвращаются: у `overflow_until` есть массив в кадре, значит и
+    // канарейка, и её эпилог обязан позвать `__stack_chk_fail`.
+    sprintln!("  guard: the overflow went unnoticed — THE CANARY IS NOT WORKING");
+}
+
+/// Залить буфер буквами `A` до отметки в кадре вызвавшего.
+///
+/// Заливка одним `write_bytes`, а не циклом, и это не стиль: у цикла счётчик
+/// живёт в **этом** кадре и в отладочной сборке однажды лёг прямо над буфером
+/// — заливка делала из счётчика число из букв, цикл кончался раньше канарейки,
+/// и выглядело это как «канарейки нет». Состояние `write_bytes` лежит в её
+/// собственном кадре, ниже нашего буфера.
+#[inline(never)]
+fn overflow_until(marker: usize) {
+    let mut buffer = [0u8; 32];
+    let from = buffer.as_mut_ptr() as usize;
+    if marker > from {
+        // SAFETY: небезопасно намеренно — в этом вся команда. Запись идёт
+        // вверх по стеку до кадра вызвавшего, то есть по своей же стековой
+        // памяти; канарейка этого кадра лежит на пути и обязана не пережить.
+        unsafe { core::ptr::write_bytes(buffer.as_mut_ptr(), b'A', marker - from) };
+    }
+    core::hint::black_box(&mut buffer);
 }
 
 /// Показать интерфейс или задать ему адрес.
@@ -1275,6 +1351,8 @@ fn help() {
     sprintln!("  mounts        what is mounted where");
     sprintln!("  slots         which system slot booted, and its state");
     sprintln!("  sysupdate <cmd>  check, get or apply a system update (runs as root)");
+    sprintln!("  power [s]     when the screen goes dark by itself, or 'never'");
+    sprintln!("  guard         the kernel's own stack canary");
     sprintln!("  shutdown      switch the machine off");
     sprintln!("  reboot        restart the machine");
     sprintln!("  exit          finish the boot and halt");
