@@ -1353,6 +1353,16 @@ pub fn dump() {
             cpu_ms,
             stack
         );
+        // Чего ждёт — отдельной строкой под своей задачей, а не колонкой:
+        // ширина у поводов разная, и втиснутые в таблицу они бы её разъехали.
+        // Печатается только у заблокированных — у остальных ответа нет.
+        if let Some((why, value)) = entry.state.waiting_for() {
+            if value == 0 {
+                kprintln!("       {why}");
+            } else {
+                kprintln!("       {why} {value}");
+            }
+        }
     }
     kprintln!(
         "  preemption : {}, {} ms slice, {} forced switch(es)",

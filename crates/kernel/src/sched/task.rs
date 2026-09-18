@@ -186,11 +186,41 @@ impl fmt::Display for TaskState {
         f.pad(match self {
             Self::Ready => "ready",
             Self::Running => "running",
-            // Чего именно ждёт задача, в одну колонку не помещается и в общей
-            // таблице не нужно: важно, что она не претендует на процессор.
+            // Чего именно ждёт задача, в эту колонку не помещается: она
+            // выравнивается по ширине, и переменной длины строка развалила бы
+            // таблицу. Ответ на «чего» даёт [`TaskState::waiting_for`], и
+            // печатается он отдельной колонкой, шириной не связанной.
             Self::Blocked(_) => "blocked",
             Self::Finished => "finished",
         })
+    }
+}
+
+impl TaskState {
+    /// Чего задача ждёт — словами, для диагностики.
+    ///
+    /// # Зачем это заведено
+    ///
+    /// Затем, что «blocked» отвечает на вопрос, которого никто не задаёт.
+    /// Когда задача встала навсегда, спрашивают не «претендует ли она на
+    /// процессор», а **чего она ждёт**, — и до сих пор этот ответ существовал
+    /// только внутри перечисления. Ровно его не хватило открытому дефекту
+    /// «init на aarch64 иногда замолкает»: по журналу видно, что задача есть и
+    /// молчит, и ни одна строка не говорит, на чём именно.
+    ///
+    /// Возвращает пару «повод — число при нём», а не готовую строку: строка
+    /// потребовала бы кучи, а зовут это в том числе там, где её может не быть.
+    /// Ноль во второй половине означает «числа нет».
+    #[must_use]
+    pub fn waiting_for(self) -> Option<(&'static str, u64)> {
+        match self {
+            Self::Blocked(Wait::Until(tick)) => Some(("sleeping until tick", tick)),
+            Self::Blocked(Wait::Task(id)) => Some(("waiting for task #", u64::from(id.as_u32()))),
+            Self::Blocked(Wait::Input(tick)) => Some(("waiting for input until tick", tick)),
+            Self::Blocked(Wait::Irq(source)) => Some(("waiting for device", u64::from(source))),
+            Self::Blocked(Wait::Lock(address)) => Some(("waiting for a lock at", address as u64)),
+            _ => None,
+        }
     }
 }
 
