@@ -1323,17 +1323,62 @@ pub fn snapshot() -> alloc::vec::Vec<TaskFacts> {
     out
 }
 
+/// Строка таблицы задач, снятая под локом планировщика.
+///
+/// Заведена ради одного: печать [`dump`] спрашивает имя программы у таблицы
+/// программ, а та под своим замком, и держать при этом замок планировщика
+/// нельзя. Снимок разрывает эту связь.
+struct Row {
+    slot: usize,
+    id: TaskId,
+    name: &'static str,
+    state: TaskState,
+    switches: u64,
+    preempted: u64,
+    cpu_ms: u64,
+    ran_since_ms: u64,
+    stack: &'static str,
+}
+
 pub fn dump() {
-    // Строки собираются и печатаются под локом. Это допустимо ровно потому, что
-    // `kprintln!` не обращается к планировщику: иначе получилась бы рекурсия на
-    // неперевходимом локе.
-    let sched = SCHED.lock();
-    for entry in sched.tasks.iter().flatten() {
-        let stack = match entry.stack.as_ref() {
-            Some(stack) if stack.guard_intact() => "held",
-            Some(_) => "OVERFLOWN",
-            None => "freed",
-        };
+    // Сначала — снимок под локом планировщика, и только потом печать.
+    //
+    // Раньше строки и собирались, и печатались под ним: `kprintln!` к
+    // планировщику не обращается, и рекурсии на неперевходимом локе не
+    // выходило. Теперь у каждой строки спрашивается ещё и имя программы, а
+    // таблица программ живёт под **своим** замком — брать его под замком
+    // планировщика нельзя (то же правило соблюдает `SYS_TASKS`, см.
+    // `user::syscall::tasks`). Значит лок отпускается раньше печати.
+    let rows = {
+        let sched = SCHED.lock();
+        let mut rows: alloc::vec::Vec<Row> = alloc::vec::Vec::new();
+        for (slot, entry) in sched.tasks.iter().enumerate() {
+            let Some(entry) = entry else { continue };
+            if rows.try_reserve(1).is_err() {
+                break;
+            }
+            let stack = match entry.stack.as_ref() {
+                Some(stack) if stack.guard_intact() => "held",
+                Some(_) => "OVERFLOWN",
+                None => "freed",
+            };
+            rows.push(Row {
+                slot,
+                id: entry.id,
+                name: entry.name,
+                state: entry.state,
+                switches: entry.switches,
+                preempted: entry.preempted,
+                cpu_ms: entry.cpu_ms,
+                ran_since_ms: entry.ran_since_ms,
+                stack,
+            });
+        }
+        rows
+    };
+
+    for entry in &rows {
+        let stack = entry.stack;
         // Время на процессоре — у исполняющейся задачи вместе с незакрытым
         // отрезком: иначе та, что считает прямо сейчас, показывала бы время
         // своего предыдущего захода и выглядела бы бездельницей.
@@ -1343,10 +1388,20 @@ pub fn dump() {
             } else {
                 crate::time::uptime_ms().saturating_sub(entry.ran_since_ms)
             };
+        // Имя программы вместо слова «program», если слот её исполняет.
+        // «program» отвечало на вопрос, которого никто не задаёт: в таблице
+        // из десяти строк восемь назывались одинаково, и понять, какая из них
+        // встала, можно было только сверяясь со строкой запуска выше по
+        // журналу. Ядро знает путь — тот же, что показывает «Диспетчер задач».
+        let path = crate::user::program_facts(entry.slot).map(|(path, _)| path);
+        let name = match path.as_deref() {
+            Some(path) => path.rsplit('/').next().unwrap_or(entry.name),
+            None => entry.name,
+        };
         kprintln!(
             "  {} {:<8} {:<9} {:>3} switches ({} forced), {} ms on cpu, stack {}",
             entry.id,
-            entry.name,
+            name,
             entry.state,
             entry.switches,
             entry.preempted,
@@ -1364,6 +1419,9 @@ pub fn dump() {
             }
         }
     }
+    // Итоги берутся под локом заново, и печатать под ним тут можно: в отличие
+    // от строк задач, ничего из таблицы программ здесь не спрашивается.
+    let sched = SCHED.lock();
     kprintln!(
         "  preemption : {}, {} ms slice, {} forced switch(es)",
         if PREEMPTION.load(Ordering::Relaxed) { "on" } else { "off" },
