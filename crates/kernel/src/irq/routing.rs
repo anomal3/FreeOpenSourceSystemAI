@@ -29,6 +29,8 @@
 //! арх-части, и у двух архитектур оно разное (вход I/O APIC против SPI у GIC).
 //! Здесь только ответ на вопрос «какая линия», один на обе.
 
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
 use crate::sync::SpinLock;
 use crate::{acpi, kprintln};
 
@@ -140,4 +142,159 @@ pub fn line_for(device: u8, pin: u8) -> Option<Line> {
 #[must_use]
 pub fn known() -> bool {
     TABLE.lock().is_some()
+}
+
+// --- общая линия -------------------------------------------------------------
+
+/// Сколько разных линий можем обслуживать.
+///
+/// Линий у шины четыре на сегмент, и все четыре — это уже больше, чем устройств
+/// без MSI на любой из наших машин. Восемь взято тем же числом, что у MSI, и по
+/// той же причине: таблица перебирается в обработчике, и перебор должен быть
+/// заведомо коротким.
+const MAX_LINES: usize = 8;
+
+/// Сколько устройств может сидеть на одной линии.
+///
+/// `INTx` разделяемый по устройству самой шины: четыре вывода на тридцать два
+/// устройства, и совпадения неизбежны. Драйвер, написанный так, будто линия его
+/// одного, работает ровно до второго устройства на ней.
+const MAX_SHARERS: usize = 4;
+
+/// Свободная ячейка линии. Ноль — законный номер линии на некоторых машинах,
+/// поэтому «свободно» обозначено заведомо невозможным номером.
+const LINE_FREE: u32 = u32::MAX;
+
+static LINE_GSI: [AtomicU32; MAX_LINES] = [const { AtomicU32::new(LINE_FREE) }; MAX_LINES];
+static LINE_HANDLERS: [[AtomicUsize; MAX_SHARERS]; MAX_LINES] =
+    [const { [const { AtomicUsize::new(0) }; MAX_SHARERS] }; MAX_LINES];
+
+/// Переходники: у арх-части обработчик без аргументов, а какая именно линия
+/// сработала, знать надо. По одному переходнику на ячейку — единственный способ
+/// передать номер, не заводя обработчику аргумент, которого у прерывания нет.
+static TRAMPOLINES: [fn(); MAX_LINES] = [
+    || fire(0),
+    || fire(1),
+    || fire(2),
+    || fire(3),
+    || fire(4),
+    || fire(5),
+    || fire(6),
+    || fire(7),
+];
+
+/// Позвать всех, кто сидит на этой линии.
+///
+/// Зовутся **все**, а не один: разделяемая линия не говорит, кто её поднял.
+/// Каждый обработчик обязан посмотреть свой регистр состояния и промолчать,
+/// если это не он. Иначе — и это главная ловушка уровневого прерывания —
+/// устройство, чей признак никто не снял, будет поднимать линию снова и снова,
+/// и машина встанет не от ошибки, а от занятости.
+fn fire(line: usize) {
+    for slot in &LINE_HANDLERS[line] {
+        let handler = slot.load(Ordering::Acquire);
+        if handler == 0 {
+            continue;
+        }
+        // SAFETY: в таблице лежат только указатели на `fn()`, положенные
+        // `request`; ноль означает пустую ячейку и отсеян выше.
+        let handler: fn() = unsafe { core::mem::transmute(handler) };
+        handler();
+    }
+}
+
+/// Подписать обработчик на линию устройства PCI.
+///
+/// Возвращает номер линии, если получилось. `None` означает одно из трёх:
+/// устройство не пользуется выводом прерывания, таблица маршрутизации не
+/// прочитана, линию не удалось разрешить у контроллера. Во всех трёх случаях
+/// драйвер обязан остаться на опросе, а не отказаться работать, — и сказать об
+/// этом вслух.
+///
+/// `handler` вызывается из обработчика прерывания, с запрещёнными прерываниями.
+/// От него требуются две вещи: снять признак у **своего** устройства и уйти.
+/// Разбор колец и всё, что занимает время, — дело разбуженной задачи.
+#[must_use]
+pub fn request(device: &crate::pci::Device, handler: fn()) -> Option<u32> {
+    let pin = device.interrupt_pin()?;
+    let line = line_for(device.address.device, pin)?;
+
+    // Линия, уже разрешённая у контроллера, второй раз не разрешается: у неё
+    // просто прибавляется обработчик. Повторный вызов `route_line` переписал бы
+    // вход контроллера на новый вектор, и первый драйвер остался бы с линией,
+    // которая больше никуда не ведёт.
+    if let Some(slot) = find_line(line.gsi) {
+        if !add_handler(slot, handler) {
+            return None;
+        }
+        // SAFETY: обработчик уже стоит в таблице этой линии.
+        unsafe { device.enable_intx() };
+        return Some(line.gsi);
+    }
+
+    for (slot, taken) in LINE_GSI.iter().enumerate() {
+        // Обмен, а не проверка с последующей записью: два драйвера могут
+        // подниматься одновременно.
+        if taken
+            .compare_exchange(LINE_FREE, line.gsi, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // Соседний вызов мог занять ячейку **этой же** линией, пока мы
+            // сюда шли. Тогда подписываемся к нему, а не заводим вторую.
+            if taken.load(Ordering::Acquire) == line.gsi {
+                return add_handler(slot, handler).then_some(line.gsi);
+            }
+            continue;
+        }
+        if !add_handler(slot, handler) {
+            taken.store(LINE_FREE, Ordering::Release);
+            return None;
+        }
+        // Обработчик стоит до разрешения линии: прерывание может прийти сразу,
+        // и пустая ячейка означала бы уровневый сигнал, который некому снять.
+        if crate::arch::interrupts::route_line(line.gsi, line.level, line.active_low, TRAMPOLINES[slot])
+        {
+            // Последним — разрешение самому устройству поднимать линию. Его
+            // ставит не драйвер, а мы: бит `Interrupt Disable` выставлен для
+            // всех при включении bus master, и снимать его имеет право только
+            // тот, кто уже завёл обработчик. Порядок обязателен — устройство
+            // вправе поднять линию в ту же секунду.
+            //
+            // SAFETY: обработчик стоит, вход контроллера размаскирован.
+            unsafe { device.enable_intx() };
+            return Some(line.gsi);
+        }
+        LINE_HANDLERS[slot][0].store(0, Ordering::Release);
+        taken.store(LINE_FREE, Ordering::Release);
+        return None;
+    }
+    None
+}
+
+fn find_line(gsi: u32) -> Option<usize> {
+    LINE_GSI.iter().position(|taken| taken.load(Ordering::Acquire) == gsi)
+}
+
+fn add_handler(line: usize, handler: fn()) -> bool {
+    LINE_HANDLERS[line]
+        .iter()
+        .any(|slot| slot.compare_exchange(0, handler as usize, Ordering::AcqRel, Ordering::Acquire).is_ok())
+}
+
+/// Сколько устройств сидит на каждой заведённой линии — для диагностики.
+#[must_use]
+pub fn shared_lines() -> alloc::vec::Vec<(u32, usize)> {
+    let mut out = alloc::vec::Vec::new();
+    for (slot, taken) in LINE_GSI.iter().enumerate() {
+        let gsi = taken.load(Ordering::Acquire);
+        if gsi == LINE_FREE {
+            continue;
+        }
+        let users = LINE_HANDLERS[slot]
+            .iter()
+            .filter(|handler| handler.load(Ordering::Acquire) != 0)
+            .count();
+        out.push((gsi, users));
+    }
+    out
 }

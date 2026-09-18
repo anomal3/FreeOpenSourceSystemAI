@@ -105,6 +105,28 @@ fn destination() -> Option<Destination> {
     Some(Destination(id as u8))
 }
 
+/// Направить линию `gsi` в вектор `vector` и снять маску.
+///
+/// Нужна маршрутизации `INTx`: там номер линии уже известен из `_PRT`, и
+/// переводить его из номера IRQ шины ISA не надо — в отличие от клавиатуры и
+/// серийного порта, где перевод делает MADT. Вид срабатывания тоже приходит
+/// готовым: прошивка описала его в том же дескрипторе, где назвала линию.
+///
+/// Возвращает `false`, если контроллера нет, некому доставлять или такого входа
+/// у него не существует. Отказ не фатален — устройство останется на опросе.
+pub fn route_gsi(gsi: u32, vector: u8, level: bool, active_low: bool) -> bool {
+    let Some(Destination(destination)) = destination() else {
+        return false;
+    };
+    let guard = IO_APIC.lock();
+    let Some(io_apic) = guard.as_ref() else {
+        return false;
+    };
+    // SAFETY: обработчики всех векторов установлены `interrupts::init` ещё до
+    // этого момента — IDT заполнена целиком, включая внешние векторы.
+    unsafe { io_apic.route(gsi, vector, destination, level, active_low) }
+}
+
 /// Прочитать MADT и напечатать, что в ней нашлось.
 fn describe_madt(rsdp: u64) -> Option<acpi::Madt> {
     // SAFETY: прямое отображение активно (таблицы ядра включены в

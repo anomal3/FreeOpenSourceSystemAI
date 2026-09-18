@@ -702,6 +702,29 @@ pub unsafe fn set_edge_triggered(intid: u32) {
     }
 }
 
+/// Объявить INTID уровневым.
+///
+/// Нужно линиям `INTx`: у PCI они уровневые и разделяемые. Умолчание после
+/// сброса контроллера такое же, но полагаться на него нельзя — прошивка
+/// работала с этим же контроллером до нас и могла переставить биты под свои
+/// нужды.
+///
+/// # Safety
+///
+/// Те же требования, что у [`set_edge_triggered`].
+pub unsafe fn set_level_triggered(intid: u32) {
+    const LEVEL: u32 = 0b00;
+    let register = (intid / 16) as usize * 4;
+    let shift = (intid % 16) * 2;
+
+    // SAFETY: контракт функции; раскладка регистра из IHI0048B, 4.3.13.
+    unsafe {
+        let current = read(gicd(), GICD_ICFGR + register);
+        let updated = (current & !(0b11 << shift)) | (LEVEL << shift);
+        write(gicd(), GICD_ICFGR + register, updated);
+    }
+}
+
 /// Какой диапазон SPI выдаёт приставка v2m: первый номер и сколько их.
 ///
 /// # Safety

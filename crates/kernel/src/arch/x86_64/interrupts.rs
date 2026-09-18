@@ -91,6 +91,11 @@ const VECTOR_FIRST_EXTERNAL: u8 = 32;
 static MSI_HANDLERS: [AtomicUsize; apic::MSI_VECTORS] =
     [const { AtomicUsize::new(0) }; apic::MSI_VECTORS];
 
+/// Обработчики линий `INTx`. Одна ячейка — одна линия, а не одно устройство:
+/// кого именно звать на разделяемой линии, решает [`crate::irq::routing`].
+static INTX_HANDLERS: [AtomicUsize; apic::INTX_VECTORS] =
+    [const { AtomicUsize::new(0) }; apic::INTX_VECTORS];
+
 // --- Биты кода ошибки #PF -----------------------------------------------------
 //
 // SDM, Vol. 3A, 4.7. Значение бита `P` инвертировано относительно интуиции:
@@ -504,6 +509,27 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
                 }
                 apic::eoi();
             }
+            // Линия `INTx` от устройства PCI. От MSI отличается тем, что она
+            // уровневая и общая: обработчик обязан снять признак у своего
+            // устройства **до** подтверждения, иначе I/O APIC доставит то же
+            // самое прерывание снова, и так без конца.
+            vector
+                if vector >= apic::VECTOR_INTX_FIRST
+                    && usize::from(vector - apic::VECTOR_INTX_FIRST) < apic::INTX_VECTORS =>
+            {
+                let index = usize::from(vector - apic::VECTOR_INTX_FIRST);
+                let handler = INTX_HANDLERS[index].load(Ordering::Acquire);
+                if handler != 0 {
+                    // SAFETY: в таблице лежат только указатели на `fn()`,
+                    // положенные `route_line`; ноль означает пустую ячейку и
+                    // отсеян выше.
+                    let handler: fn() = unsafe { core::mem::transmute(handler) };
+                    handler();
+                } else {
+                    kprintln!("interrupts: INTx vector {vector:#04x} has no handler");
+                }
+                apic::eoi();
+            }
             // Событие ACPI: кнопка питания. Обработчик снимает признак у
             // чипсета и поднимает просьбу — гасит систему задача. Признак
             // обязан быть снят **до** EOI: вход заведён по уровню, и
@@ -801,6 +827,38 @@ pub fn alloc_msi(handler: fn()) -> Option<(u64, u32)> {
         }
     }
     None
+}
+
+/// Завести линию `INTx` и направить её в обработчик.
+///
+/// `gsi` — номер линии из таблицы маршрутизации прошивки, `level` и
+/// `active_low` — оттуда же. Брать их из знания о том, как устроен PCI, было бы
+/// спором с прошивкой, которая описывает свою плату.
+///
+/// Возвращает `false`, если векторы кончились или вход не удалось размаскировать
+/// (нет I/O APIC, нет получателя). Драйвер в этом случае обязан остаться на
+/// опросе, а не отказаться работать.
+#[must_use]
+pub fn route_line(gsi: u32, level: bool, active_low: bool, handler: fn()) -> bool {
+    for (index, slot) in INTX_HANDLERS.iter().enumerate() {
+        // Обмен, а не проверка с последующей записью: два драйвера могут
+        // подниматься одновременно.
+        if slot
+            .compare_exchange(0, handler as usize, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        let vector = apic::VECTOR_INTX_FIRST + index as u8;
+        // Обработчик уже лежит в таблице: вход размаскируется последним, и
+        // прерывание, пришедшее в ту же секунду, найдёт кого позвать.
+        if super::input::route_gsi(gsi, vector, level, active_low) {
+            return true;
+        }
+        slot.store(0, Ordering::Release);
+        return false;
+    }
+    false
 }
 
 pub fn enable() {

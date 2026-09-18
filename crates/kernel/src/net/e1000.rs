@@ -46,6 +46,7 @@ use alloc::vec::Vec;
 use super::card::{Card, CardError, FRAME_MAX, Stats};
 use crate::mm::dma::{self, DmaBuffer, DmaError};
 use crate::mm::{PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+use crate::kprintln;
 use crate::pci::{self, Device};
 
 /// Изготовитель Intel.
@@ -85,7 +86,51 @@ const REG_CTRL: usize = 0x0000;
 const REG_STATUS: usize = 0x0008;
 const REG_EERD: usize = 0x0014;
 const REG_ICR: usize = 0x00C0;
+/// Разрешить причины прерывания (запись единиц).
+const REG_IMS: usize = 0x00D0;
 const REG_IMC: usize = 0x00D8;
+
+/// Какие причины нас интересуют: пришёл кадр (`RXT0` — таймер приёма, `RXDMT0`
+/// — кольцо наполовину пусто), переполнение приёма (`RXO`) и смена состояния
+/// связи (`LSC`).
+///
+/// Передача сюда не входит намеренно: отправка у нас синхронная, и прерывание
+/// «кадр ушёл» будило бы задачу ради того, чего она не ждёт.
+const INTERRUPT_CAUSES: u32 = ICR_LSC | ICR_RXDMT0 | ICR_RXO | ICR_RXT0;
+
+const ICR_LSC: u32 = 1 << 2;
+const ICR_RXDMT0: u32 = 1 << 4;
+const ICR_RXO: u32 = 1 << 6;
+const ICR_RXT0: u32 = 1 << 7;
+
+/// Окно регистров карты — для обработчика прерывания.
+///
+/// Обработчик вызывается без аргументов, а снять признак нужно именно в
+/// регистрах: адрес приходится оставлять здесь. Карта поддерживается одна — та
+/// же, что находит `probe`.
+static CARD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Прерывание от карты.
+///
+/// Линия `INTx` разделяемая, поэтому первое действие — спросить карту, её ли
+/// это сигнал. Чтение `ICR` **снимает** причины, и в этом весь смысл: не сняв
+/// их, мы оставили бы линию поднятой, а уровневое прерывание пришло бы снова и
+/// снова, пока машина не встанет от занятости.
+///
+/// Ноль означает «не наша»: сосед по линии разберётся сам.
+pub fn on_interrupt() {
+    let base = CARD.load(core::sync::atomic::Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    // SAFETY: адрес положен сюда только после отображения окна, и окно живёт
+    // всё время работы ядра.
+    let causes = unsafe { read(VirtAddr::new(base), REG_ICR) };
+    if causes == 0 {
+        return;
+    }
+    crate::net::on_interrupt();
+}
 const REG_RCTL: usize = 0x0100;
 const REG_TCTL: usize = 0x0400;
 const REG_TIPG: usize = 0x0410;
@@ -230,6 +275,8 @@ pub struct E1000 {
     /// функции, и без неё диспетчер устройств показал бы работающую карту как
     /// «драйвер есть, но этим устройством не занят».
     address: pci::Address,
+    /// Кадры приходят прерыванием, а не опросом.
+    interrupts: bool,
 }
 
 // SAFETY: вся изменяемая память карты — её собственные буферы DMA и окно
@@ -293,7 +340,7 @@ impl E1000 {
         rx_ring.zero();
         tx_ring.zero();
 
-        let card = Self {
+        let mut card = Self {
             regs,
             rx_ring,
             tx_ring,
@@ -305,11 +352,46 @@ impl E1000 {
             stats: Stats::default(),
             device_id: device.device,
             address: device.address,
+            interrupts: false,
         };
 
         // SAFETY: кольца выделены и обнулены, окно отображено.
         unsafe { card.start() };
+        // SAFETY: карта работает, окно отображено.
+        card.interrupts = unsafe { card.enable_interrupts(&device) };
         Ok(card)
+    }
+
+    /// Попросить прерывания вместо опроса.
+    ///
+    /// Возвращает `false`, если линия неизвестна или её не удалось разрешить.
+    /// Тогда карта остаётся на опросе и работает ровно как раньше — отказ здесь
+    /// не ошибка, а другой режим работы, и назван он вслух.
+    ///
+    /// # Safety
+    ///
+    /// Окно регистров должно быть отображено, карта — запущена.
+    unsafe fn enable_interrupts(&self, device: &Device) -> bool {
+        // Адрес окна кладётся **до** разрешения причин: прерывание может прийти
+        // сразу, а обработчик без адреса не снимет признак — то есть оставит
+        // уровневую линию поднятой навсегда.
+        CARD.store(self.regs.as_usize(), core::sync::atomic::Ordering::Relaxed);
+
+        let Some(gsi) = crate::irq::routing::request(device, on_interrupt) else {
+            kprintln!("  e1000       : no interrupt line known; frames will be polled for");
+            CARD.store(0, core::sync::atomic::Ordering::Relaxed);
+            return false;
+        };
+
+        // SAFETY: контракт функции.
+        unsafe {
+            // Накопленные причины снимаются до разрешения: иначе первое же
+            // прерывание придёт за событие, которого мы не видели.
+            let _ = read(self.regs, REG_ICR);
+            write(self.regs, REG_IMS, INTERRUPT_CAUSES);
+        }
+        kprintln!("  e1000       : INTx on GSI {gsi}, frames arrive by interrupt");
+        true
     }
 
     /// Какая это модель — для журнала.
@@ -412,6 +494,10 @@ impl E1000 {
 impl Card for E1000 {
     fn name(&self) -> &'static str {
         "e1000"
+    }
+
+    fn interrupts(&self) -> bool {
+        self.interrupts
     }
 
     fn mac(&self) -> [u8; 6] {
