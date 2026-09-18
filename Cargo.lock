@@ -19,6 +19,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aml"
+version = "0.7.0"
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -632,6 +636,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 name = "kernel"
 version = "0.7.0"
 dependencies = [
+ "aml",
  "boot-info",
  "btrfs",
  "calendar",

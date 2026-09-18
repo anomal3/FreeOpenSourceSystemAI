@@ -69,6 +69,9 @@ const CFG_HEADER_TYPE: usize = 0x0E;
 const CFG_BAR0: usize = 0x10;
 /// Смещение указателя на первую запись списка возможностей.
 const CFG_CAPABILITIES_PTR: usize = 0x34;
+/// Какой вывод прерывания использует функция: 1 — INTA, 4 — INTD, 0 — никакого.
+/// Регистр только для чтения: это разводка платы, а не настройка.
+const CFG_INTERRUPT_PIN: usize = 0x3D;
 
 /// `Status`, бит 4: у функции есть список возможностей.
 const STATUS_CAPABILITIES: u16 = 1 << 4;
@@ -611,6 +614,20 @@ impl Device {
         let wanted = command | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER | COMMAND_INTX_DISABLE;
         // SAFETY: см. выше.
         unsafe { self.write16(CFG_COMMAND, wanted) };
+    }
+
+    /// Какой вывод прерывания использует эта функция.
+    ///
+    /// Возвращает 0–3 (INTA–INTD) или `None`, если функция прерываний по линии
+    /// не использует вовсе. В регистре нумерация с единицы, здесь с нуля — та
+    /// же, что в таблице маршрутизации, чтобы не переводить туда-сюда на каждом
+    /// обращении.
+    #[must_use]
+    pub fn interrupt_pin(&self) -> Option<u8> {
+        // SAFETY: страница отображена при перечислении, смещение фиксировано
+        // спецификацией PCI.
+        let pin = unsafe { self.read8(CFG_INTERRUPT_PIN) };
+        if pin == 0 || pin > 4 { None } else { Some(pin - 1) }
     }
 
     /// Найти возможность MSI-X, если устройство её объявляет.

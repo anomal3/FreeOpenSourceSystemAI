@@ -899,7 +899,9 @@ pub const ALL: &[Scenario] = &[
             Step::Type("exit"),
             Step::Key("ret"),
             Step::Await("finishing the session", 15_000),
-            Step::Expect("usb controller (ohci)    INTx only"),
+            Step::Expect("usb controller (ohci)    INT"),
+            Step::Expect("route(s) from _PRT"),
+            Step::Absent("line unknown"),
             Step::Absent("KERNEL PANIC"),
         ],
     },
@@ -953,9 +955,11 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("stopped while"),
-            // То же самое про контроллер USB 2.0: опрос здесь не выбор
-            // драйвера, а всё, что предлагает устройство.
-            Step::Expect("usb controller (ehci)    INTx only"),
+            // То же самое про контроллер USB 2.0: MSI он не предлагает, а
+            // линия у него известна поимённо.
+            Step::Expect("usb controller (ehci)    INT"),
+            Step::Expect("route(s) from _PRT"),
+            Step::Absent("line unknown"),
             Step::Absent("KERNEL PANIC"),
         ],
     },
@@ -1017,11 +1021,15 @@ pub const ALL: &[Scenario] = &[
             Step::Type("exit"),
             Step::Key("ret"),
             Step::Await("finishing the session", 15_000),
-            // Почему сетевая карта осталась на опросе, сказано не
-            // комментарием в коде, а переписью шины: у неё нет ни MSI-X, ни
-            // MSI. Это утверждение об **этой машине**, а не о модели, и когда
-            // появится маршрутизация INTx, строка изменится сама.
-            Step::Expect("ethernet controller      INTx only"),
+            // У сетевой карты нет ни MSI-X, ни MSI — это утверждение об
+            // **этой машине**, а не о модели, — но линия у неё теперь известна
+            // поимённо: прочитана из таблицы прошивки, а не угадана.
+            Step::Expect("ethernet controller      INT"),
+            Step::Expect("route(s) from _PRT"),
+            // Ни одного устройства с выводом, но без линии. Такая строка
+            // означала бы дыру в разборе таблицы, а выглядела бы как молчащее
+            // устройство.
+            Step::Absent("line unknown"),
             Step::Absent("KERNEL PANIC"),
         ],
     },

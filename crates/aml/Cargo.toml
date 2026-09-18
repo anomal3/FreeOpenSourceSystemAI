@@ -1,0 +1,14 @@
+[package]
+name = "aml"
+description = "A reader for the few AML objects the kernel actually needs: the PCI interrupt routing table and the link devices it points at."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Зависимостей нет намеренно, как у usb-hid: крейт линкуется в ядро на двух
+# целях (`*-unknown-none`) и собирается хостом ради тестов, а всё, что он
+# делает, — арифметика над байтами, которые написала чужая прошивка.
+
+[lints]
+workspace = true

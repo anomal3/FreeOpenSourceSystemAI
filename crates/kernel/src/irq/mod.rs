@@ -13,6 +13,7 @@
 //! Обработчик отказов превращает такие случаи в внятное сообщение с адресом.
 
 pub mod fault;
+pub mod routing;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

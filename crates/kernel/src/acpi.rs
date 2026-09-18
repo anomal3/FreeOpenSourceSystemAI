@@ -146,7 +146,6 @@ pub fn set_rsdp(address: u64) {
 /// прерываний. На x86-64 то же самое делает разбор `BootInfo` на месте, поэтому
 /// функция там законно не вызывается; помечать это надо явно, иначе
 /// предупреждение о мёртвом коде видно ровно в одной из двух сборок.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 #[must_use]
 pub fn rsdp() -> u64 {
     RSDP.load(core::sync::atomic::Ordering::Relaxed)
@@ -181,7 +180,6 @@ pub fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 /// # Safety
 ///
 /// См. [`find_table`].
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub unsafe fn table_at(address: u64, signature: &[u8; 4]) -> Result<&'static [u8], AcpiError> {
     // SAFETY: контракт функции.
     let len = unsafe { table_length(address) }.ok_or(AcpiError::NotFound(*signature))?;
@@ -194,6 +192,38 @@ pub unsafe fn table_at(address: u64, signature: &[u8; 4]) -> Result<&'static [u8
         return Err(AcpiError::BadChecksum(*signature));
     }
     Ok(bytes)
+}
+
+/// Найти DSDT — таблицу, в которой лежит AML.
+///
+/// Её адрес не в корневой таблице, а в поле FADT, и полей этих два: 32-битное
+/// (ACPI 1.0) и 64-битное (ACPI 2.0+). Прошивки заполняют то одно, то оба, и
+/// читать надо широкое, когда оно не ноль: узкое у машины с таблицами выше
+/// четырёх гигабайт содержит обрезанный адрес, то есть чужую память.
+///
+/// # Safety
+///
+/// См. [`find_table`].
+pub unsafe fn dsdt(rsdp: u64) -> Result<&'static [u8], AcpiError> {
+    /// Смещение 64-битного указателя на DSDT в FADT.
+    const FADT_DSDT64: usize = 140;
+    /// Смещение 32-битного указателя на DSDT в FADT.
+    const FADT_DSDT32: usize = 40;
+
+    // SAFETY: контракт функции.
+    let fadt = unsafe { find_table(rsdp, b"FACP") }?;
+    let address = if fadt.len() > FADT_DSDT64 + 8 && read_u64(fadt, FADT_DSDT64) != 0 {
+        read_u64(fadt, FADT_DSDT64)
+    } else if fadt.len() > FADT_DSDT32 + 4 {
+        u64::from(read_u32(fadt, FADT_DSDT32))
+    } else {
+        return Err(AcpiError::NotFound(*b"DSDT"));
+    };
+    if address == 0 {
+        return Err(AcpiError::NotFound(*b"DSDT"));
+    }
+    // SAFETY: контракт функции; подпись и сумма проверяются внутри.
+    unsafe { table_at(address, b"DSDT") }
 }
 
 /// Найти таблицу по сигнатуре и вернуть её целиком, с уже проверенной суммой.

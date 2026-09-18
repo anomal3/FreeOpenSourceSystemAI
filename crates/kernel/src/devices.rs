@@ -262,11 +262,24 @@ pub fn census_text() -> String {
         let signalling = match (device.msix(), device.msi()) {
             (Some(msix), _) => alloc::format!("MSI-X x{}", msix.vectors),
             (None, Some(_)) => String::from("MSI"),
-            (None, None) => String::from("INTx only"),
+            // У устройства без MSI остаётся линия, и её номер — не свойство
+            // устройства, а разводка платы: он приходит из таблицы прошивки.
+            // «INTA» без номера означало бы, что маршрутизация не прочитана, и
+            // это разные положения дел, которые нельзя показывать одинаково.
+            (None, None) => match device.interrupt_pin() {
+                None => String::from("no interrupt"),
+                Some(pin) => {
+                    let name = ["INTA", "INTB", "INTC", "INTD"][usize::from(pin)];
+                    match crate::irq::routing::line_for(device.address.device, pin) {
+                        Some(line) => alloc::format!("{name} -> GSI {}", line.gsi),
+                        None => alloc::format!("{name}, line unknown"),
+                    }
+                }
+            },
         };
         let _ = writeln!(
             out,
-            "{} {:04x}:{:04x} class {:02x}:{:02x}:{:02x} {:<24} {:<10} -- {verdict}",
+            "{} {:04x}:{:04x} class {:02x}:{:02x}:{:02x} {:<24} {:<16} -- {verdict}",
             device.address,
             device.vendor,
             device.device,
