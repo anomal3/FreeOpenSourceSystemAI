@@ -41,6 +41,8 @@ pub mod stream;
 pub mod tcp;
 pub mod udp;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::sched::TaskId;
 use crate::sync::SpinLock;
 use crate::virtio::net::VirtioNet;
@@ -57,6 +59,41 @@ use ipv4::Ipv4;
 /// эмулируемой карте; настоящее железо потребует прерываний, и это честно
 /// названо в дорожной карте, а не спрятано.
 const POLL_INTERVAL_MS: u64 = 5;
+
+/// Ярлык источника прерывания для планировщика.
+///
+/// Число ничего не значит снаружи: `sched::Wait::Irq` источники различает, а не
+/// адресует. Важно лишь, что обработчик и задача договорились об одном и том же
+/// и что оно не совпадает с ярлыками xHCI (1) и питания (2).
+const IRQ_SOURCE: u32 = 3;
+
+/// Как часто крутить таймеры TCP, когда кадры приходят прерыванием.
+///
+/// Повторная передача и закрытие соединений идут по времени, а не по событиям:
+/// молчащая сеть не разбудит никого, а таймеры крутиться обязаны. Двадцать
+/// миллисекунд вместо пяти — вчетверо меньше пробуждений на молчащей машине,
+/// и всё ещё вчетверо чаще самого короткого срока TCP.
+const TCP_TICK_MS: u64 = 20;
+
+/// Пришёл ли кадр с тех пор, как задача в последний раз забирала очередь.
+///
+/// Признак, а не счётчик: задача забирает **все** накопившиеся кадры за один
+/// проход, и три прерывания подряд означают ровно то же, что одно, — «сходи
+/// посмотри».
+static FRAME_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Обработчик прерывания сетевой карты.
+///
+/// Делает ровно две вещи: поднимает признак и будит задачу. Подтверждать
+/// нечего — MSI-X доставляется сообщением, а не линией, и гасить у устройства
+/// нечего (регистр ISR у virtio читают только при INTx). Разбор очереди
+/// остаётся задаче: он берёт замок и разбирает кадры, а это сотни микросекунд
+/// с запрещёнными прерываниями — та самая болезнь, от которой прерывания и
+/// лечат.
+pub fn on_interrupt() {
+    FRAME_PENDING.store(true, Ordering::Release);
+    crate::sched::wake_irq(IRQ_SOURCE);
+}
 
 /// Идентификатор, которым система подписывает свои эхо-запросы.
 ///
@@ -315,8 +352,21 @@ pub unsafe fn init(rsdp: u64) {
     // Задача-приёмник заводится сразу и служебной: она работает, пока работает
     // система, но сама по себе поводом ей работать не является — иначе `exit` в
     // оболочке перестал бы останавливать машину.
+    // Как задача будет ждать кадры — часть того, что о системе надо знать, а
+    // не подробность драйвера: «сеть на прерываниях» и «сеть на опросе»
+    // различаются задержкой ввода и тем, спит ли процессор вообще. Строка
+    // говорит, что вышло на **этой** машине, а не что задумывалось.
+    let by_interrupt = INTERFACE
+        .lock()
+        .as_ref()
+        .is_some_and(|iface| iface.device.interrupts());
     match crate::sched::spawn_daemon("net", service_task) {
-        Ok(id) => crate::kprintln!("  network     : receive task {id}, polling every {POLL_INTERVAL_MS} ms"),
+        Ok(id) if by_interrupt => crate::kprintln!(
+            "  network     : receive task {id}, woken by interrupt (TCP timers every {TCP_TICK_MS} ms)"
+        ),
+        Ok(id) => crate::kprintln!(
+            "  network     : receive task {id}, polling every {POLL_INTERVAL_MS} ms"
+        ),
         Err(err) => crate::kprintln!("  network     : the receive task did not start: {err}"),
     }
     crate::kprintln!("  network     : no address yet; set one with `ip <addr>/<bits> [gateway]`");
@@ -752,6 +802,12 @@ pub fn arp_table() -> alloc::vec::Vec<(Ipv4, Mac, u64)> {
 /// шестнадцать кадров подряд с запрещёнными прерываниями.
 pub fn service_task() {
     let mut frame = [0u8; FRAME_MAX];
+    // Спрашивается один раз: карту не меняют на ходу, а спрашивать под локом
+    // на каждом обороте значило бы брать лок ради ответа, который не меняется.
+    let interrupts = INTERFACE
+        .lock()
+        .as_ref()
+        .is_some_and(|iface| iface.device.interrupts());
     loop {
         loop {
             let mut guard = INTERFACE.lock();
@@ -779,7 +835,24 @@ pub fn service_task() {
             }
         }
 
-        crate::sched::sleep_ms(POLL_INTERVAL_MS);
+        // Как ждать — решает карта, а не эта задача.
+        //
+        // Карта с прерываниями: спим, пока не придёт кадр, но не дольше срока
+        // таймеров TCP. Ожидание «прерывание **или** срок» — не удобство:
+        // повторная передача идёт по времени, и молчащая сеть не разбудит
+        // никого, а соединение обязано закрыться само.
+        //
+        // Карта без прерываний (e1000, atl1c, GICv3 без MSI): будильник каждые
+        // пять миллисекунд, ровно как до фазы 52. Опрос никуда не делся — он
+        // перестал быть единственным способом.
+        if interrupts {
+            crate::sched::block_on_irq_until(IRQ_SOURCE, TCP_TICK_MS, || {
+                FRAME_PENDING.swap(false, Ordering::AcqRel)
+            });
+            FRAME_PENDING.store(false, Ordering::Release);
+        } else {
+            crate::sched::sleep_ms(POLL_INTERVAL_MS);
+        }
     }
 }
 

@@ -12,7 +12,7 @@
 //! Путь прерывания от устройства PCIe до обработчика — это MSI-X: устройство
 //! не поднимает линию, а **пишет по адресу**, и что произойдёт от этой записи,
 //! решает контроллер прерываний. Поэтому арх-часть отвечает ровно на один
-//! вопрос — «куда и что писать» ([`crate::arch::interrupts::setup_xhci_msi`]):
+//! вопрос — «куда и что писать» ([`crate::arch::interrupts::alloc_msi`]):
 //!
 //! * на x86-64 адрес опознаёт локальный APIC, а данные несут номер вектора,
 //!   уже стоящего в IDT; разбирать `_PRT` из ACPI (то есть писать интерпретатор
@@ -1820,7 +1820,7 @@ impl Controller {
             kprintln!("  xhci        : no MSI-X capability; events will be polled");
             return;
         };
-        let Some((address, data)) = crate::arch::interrupts::setup_xhci_msi() else {
+        let Some((address, data)) = crate::arch::interrupts::alloc_msi(on_interrupt) else {
             kprintln!("  xhci        : no MSI target on this machine; events will be polled");
             return;
         };
@@ -1844,7 +1844,7 @@ impl Controller {
 
         // SAFETY: таблица отображена, индекс 0 существует всегда (векторов не
         // бывает ноль), обработчик уже стоит — на x86-64 он в IDT с загрузки, на
-        // AArch64 его поставил `setup_xhci_msi`.
+        // AArch64 его поставил `alloc_msi`.
         unsafe { self.device.set_msix_vector(&msix, table, 0, address, data) };
 
         // Разрешение у контроллера — двумя битами в разных регистрах: у

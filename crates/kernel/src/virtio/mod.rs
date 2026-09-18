@@ -71,10 +71,14 @@ const COMMON_DRIVER_FEATURE: usize = 0x0C;
 /// построению, но пропуск в карте регистров означал бы, что следующее
 /// смещение посчитано наугад.
 #[allow(dead_code)]
+/// Вектор MSI-X для изменений конфигурации устройства.
+const COMMON_CONFIG_MSIX_VECTOR: usize = 0x10;
 const COMMON_NUM_QUEUES: usize = 0x12;
 const COMMON_DEVICE_STATUS: usize = 0x14;
 const COMMON_QUEUE_SELECT: usize = 0x16;
 const COMMON_QUEUE_SIZE: usize = 0x18;
+/// Вектор MSI-X выбранной очереди.
+const COMMON_QUEUE_MSIX_VECTOR: usize = 0x1A;
 const COMMON_QUEUE_ENABLE: usize = 0x1C;
 const COMMON_QUEUE_NOTIFY_OFF: usize = 0x1E;
 const COMMON_QUEUE_DESC: usize = 0x20;
@@ -82,6 +86,14 @@ const COMMON_QUEUE_DRIVER: usize = 0x28;
 const COMMON_QUEUE_DEVICE: usize = 0x30;
 
 /// Биты регистра состояния устройства.
+/// «Вектора нет»: и ответ устройства, которому не хватило векторов, и то, что
+/// пишут в поле, когда прерывания от этого источника не нужны.
+const MSIX_NO_VECTOR: u16 = 0xFFFF;
+
+/// Бит `VIRTQ_AVAIL_F_NO_INTERRUPT`: просьба не присылать прерываний по этой
+/// очереди. Просьба, а не запрет — устройство вправе её не послушать.
+const AVAIL_F_NO_INTERRUPT: u16 = 1;
+
 const STATUS_ACKNOWLEDGE: u8 = 1;
 const STATUS_DRIVER: u8 = 2;
 const STATUS_DRIVER_OK: u8 = 4;
@@ -633,6 +645,62 @@ impl Queue {
     /// Сколько дескрипторов в очереди.
     pub fn size(&self) -> u16 {
         self.size
+    }
+
+    /// Попросить устройство присылать прерывания по этой очереди.
+    ///
+    /// Возвращает `true`, если устройство вектор приняло. Отказ — не ошибка:
+    /// драйвер в этом случае остаётся на опросе, как и раньше, и об этом
+    /// говорит вслух. Вектор — индекс в таблице MSI-X устройства, а не номер
+    /// прерывания: что стоит в этой строке таблицы, знает `pci`.
+    ///
+    /// Две записи, и обе обязательны. `queue_msix_vector` говорит устройству,
+    /// **куда** сигналить; снятый `VIRTQ_AVAIL_F_NO_INTERRUPT` — что сигналить
+    /// вообще нужно. Забытая вторая выглядит как «прерывания настроены, но не
+    /// приходят»: та же болезнь, что была у xHCI с двумя битами разрешения.
+    ///
+    /// # Safety
+    ///
+    /// MSI-X устройства должен быть **уже включён** и строка `vector` его
+    /// таблицы заполнена: устройство вправе сигналить сразу после этих двух
+    /// записей.
+    pub unsafe fn want_interrupts(&self, transport: &Transport, vector: u16) -> bool {
+        // SAFETY: окно общей конфигурации отображено в `Transport::open`.
+        unsafe {
+            write16(transport.common, COMMON_QUEUE_SELECT, self.index);
+            write16(transport.common, COMMON_QUEUE_MSIX_VECTOR, vector);
+        }
+        // Прочитать обратно, а не поверить: устройство, которому не хватило
+        // векторов, отвечает `NO_VECTOR` — и молча остаётся без прерываний.
+        // SAFETY: см. выше.
+        let accepted = unsafe { read16(transport.common, COMMON_QUEUE_MSIX_VECTOR) };
+        if accepted != vector {
+            return false;
+        }
+
+        // SAFETY: смещение внутри выделенного буфера очереди; поле флагов
+        // кольца `avail` — первое в нём.
+        unsafe {
+            let flags = self.memory.as_ptr::<u8>().add(self.avail_offset).cast::<u16>();
+            let now = flags.read_volatile();
+            flags.write_volatile(now & !AVAIL_F_NO_INTERRUPT);
+        }
+        true
+    }
+
+    /// Сказать устройству, что изменения конфигурации нас не интересуют.
+    ///
+    /// Отдельно от очередей: у изменений конфигурации свой вектор, и
+    /// оставленный по умолчанию он на некоторых устройствах означает нулевую
+    /// строку таблицы — то есть чужой обработчик на событие, которого никто не
+    /// ждёт.
+    ///
+    /// # Safety
+    ///
+    /// Те же требования, что у [`Queue::want_interrupts`].
+    pub unsafe fn silence_config_changes(transport: &Transport) {
+        // SAFETY: окно общей конфигурации отображено в `Transport::open`.
+        unsafe { write16(transport.common, COMMON_CONFIG_MSIX_VECTOR, MSIX_NO_VECTOR) };
     }
 
     /// Занять свободный дескриптор.

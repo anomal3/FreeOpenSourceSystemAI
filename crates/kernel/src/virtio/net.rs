@@ -33,10 +33,11 @@
 //! назначения начинается на два байта раньше, чем на самом деле: разбор при этом
 //! не падает, он просто читает мусор.
 
-use super::{DESC_F_WRITE, FEATURE_VERSION_1, Queue, Transport, VirtioError};
+use super::{DESC_F_WRITE, FEATURE_VERSION_1, Queue, Transport, VirtioError, map_bar};
 use crate::net::card::{Card, CardError};
 use crate::mm::dma::{self, DmaBuffer};
-use crate::pci::{self, Device};
+use crate::pci::{self, Device, MSIX_ENTRY_SIZE};
+use crate::kprintln;
 
 /// Возможность: устройство сообщает свой аппаратный адрес в конфигурации.
 ///
@@ -90,6 +91,12 @@ pub struct VirtioNet {
     tx_pool: DmaBuffer,
     mac: [u8; 6],
     stats: Stats,
+    /// Согласилась ли карта сообщать о кадрах прерыванием.
+    ///
+    /// Не «настроены ли мы», а «приняло ли устройство вектор»: virtio вправе
+    /// ответить `NO_VECTOR`, и драйвер, поверивший своей записи, спал бы до
+    /// прерывания, которого не будет.
+    interrupts: bool,
 }
 
 impl VirtioNet {
@@ -171,10 +178,78 @@ impl VirtioNet {
             tx_pool,
             mac,
             stats: Stats::default(),
+            interrupts: false,
         };
+        // Прерывания просятся после `DRIVER_OK` и до первых буферов. Раньше
+        // нельзя: до `DRIVER_OK` устройство не обязано смотреть в очередь
+        // вовсе. Позже незачем: первый же выставленный буфер может быть
+        // заполнен немедленно, и просьба, опоздавшая к нему, стоила бы кадра.
+        //
+        // SAFETY: контракт функции — ядро на своих таблицах страниц.
+        card.interrupts = unsafe { card.enable_interrupts(device) };
         card.fill_receive_queue();
 
         Ok(card)
+    }
+
+    /// Перевести приём кадров с опроса на прерывания.
+    ///
+    /// Возвращает `false`, когда прерываний не вышло, и это **не** ошибка:
+    /// драйвер остаётся на опросе — ровно так, как работал до фазы 52. Причин
+    /// отказа три, и все три законны: у устройства нет MSI-X, у машины нет
+    /// свободного вектора (или MSI вовсе — так на GICv3), устройству не хватило
+    /// векторов на очередь. Каждая называется вслух: «сеть работает медленнее,
+    /// чем могла бы» — это то, что человек должен видеть, а не угадывать.
+    ///
+    /// # Safety
+    ///
+    /// Ядро должно исполняться на собственных таблицах страниц.
+    unsafe fn enable_interrupts(&mut self, device: &Device) -> bool {
+        let Some(msix) = device.msix() else {
+            kprintln!("  virtio-net  : no MSI-X capability; frames will be polled");
+            return false;
+        };
+        let Some((address, data)) = crate::arch::interrupts::alloc_msi(crate::net::on_interrupt)
+        else {
+            kprintln!("  virtio-net  : no MSI target on this machine; frames will be polled");
+            return false;
+        };
+
+        // Таблица лежит в BAR, номер которого назвала сама возможность, и по
+        // смещению оттуда же. Отображается BAR целиком до конца таблицы: её
+        // строка может оказаться не первой.
+        let span = u64::from(msix.table_offset) + (MSIX_ENTRY_SIZE * usize::from(msix.vectors)) as u64;
+        // SAFETY: контракт функции; окно — регистры устройства.
+        let table = match unsafe { map_bar(device, msix.bir as u8, span) } {
+            Ok(base) => base.as_usize() + msix.table_offset as usize,
+            Err(err) => {
+                kprintln!("  virtio-net  : cannot map the MSI-X table ({err:?}); frames will be polled");
+                return false;
+            }
+        };
+
+        // SAFETY: таблица отображена, строка 0 существует всегда, обработчик
+        // уже поставлен `alloc_msi` — прерывание может прийти немедленно после
+        // этой записи, и прийти ему есть куда.
+        unsafe { device.set_msix_vector(&msix, table, 0, address, data) };
+
+        // Изменения конфигурации нам неинтересны, и молчать об этом нельзя:
+        // поле, оставленное как есть, на иных устройствах означает нулевую
+        // строку таблицы — то есть наш обработчик на событие, которого никто
+        // не ждёт.
+        // SAFETY: MSI-X включён записью выше.
+        unsafe { Queue::silence_config_changes(&self.transport) };
+
+        // SAFETY: см. выше. Вектор ноль — та самая строка, что заполнена.
+        if !unsafe { self.rx.want_interrupts(&self.transport, 0) } {
+            kprintln!("  virtio-net  : the device refused the queue vector; frames will be polled");
+            return false;
+        }
+
+        kprintln!(
+            "  virtio-net  : MSI-X vector 0 -> {address:#018x} data {data:#x}, frames arrive by interrupt"
+        );
+        true
     }
 
     /// Аппаратный адрес карты.
@@ -343,5 +418,9 @@ impl Card for VirtioNet {
 
     fn stats(&self) -> Stats {
         VirtioNet::stats(self)
+    }
+
+    fn interrupts(&self) -> bool {
+        self.interrupts
     }
 }

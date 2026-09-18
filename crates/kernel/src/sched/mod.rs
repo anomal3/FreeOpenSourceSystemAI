@@ -349,7 +349,9 @@ impl Scheduler {
         let mut woke = false;
         for task in self.tasks.iter_mut().flatten() {
             let due = match task.state {
-                TaskState::Blocked(Wait::Until(tick) | Wait::Input(tick)) => now >= tick,
+                TaskState::Blocked(
+                    Wait::Until(tick) | Wait::Input(tick) | Wait::IrqUntil(_, tick),
+                ) => now >= tick,
                 _ => false,
             };
             if due {
@@ -737,6 +739,36 @@ pub fn block_on_lock(address: usize, free: impl FnOnce() -> bool) {
     schedule();
 }
 
+/// Заблокироваться до прерывания от источника `source`, но не дольше чем на
+/// `ms` миллисекунд.
+///
+/// Срок задаётся временем, а хранится тиками — как у [`sleep_ms`], и это не
+/// подробность реализации. Пробуждение по сроку делает обработчик таймера, и
+/// сравнивать ему не с чем, кроме собственного счётчика тиков; срок,
+/// сохранённый в миллисекундах, сравнился бы с числом тиков и оказался бы в
+/// далёком будущем. Дефект был написан ровно так и найден не сценарием, а
+/// счётчиком пробуждений: за 3,8 секунды задачу разбудили шесть раз вместо
+/// ста девяноста — то есть срок не срабатывал вовсе, и таймеры TCP крутились
+/// бы только при живом трафике.
+///
+/// `ready` — та же проверка «не пришло ли уже», что и у [`block_on_irq`], и по
+/// той же причине.
+pub fn block_on_irq_until(source: u32, ms: u64, ready: impl FnOnce() -> bool) {
+    let hz = u64::from(crate::irq::TIMER_HZ);
+    let until = crate::irq::ticks().saturating_add(ms.saturating_mul(hz).div_ceil(1000).max(1));
+    {
+        let mut sched = SCHED.lock();
+        if !sched.running || ready() {
+            return;
+        }
+        let current = sched.current();
+        if let Some(task) = sched.tasks[current].as_mut() {
+            task.state = TaskState::Blocked(Wait::IrqUntil(source, until));
+        }
+    }
+    schedule();
+}
+
 /// Заблокироваться до прерывания от источника `source`.
 ///
 /// `ready` вызывается **под локом планировщика** и отвечает, не пришло ли
@@ -764,7 +796,15 @@ pub fn block_on_irq(source: u32, ready: impl FnOnce() -> bool) {
 pub fn wake_irq(source: u32) {
     let mut sched = SCHED.lock();
     for task in sched.tasks.iter_mut().flatten() {
-        if task.state == TaskState::Blocked(Wait::Irq(source)) {
+        // Оба вида ожидания прерывания, и это не перечисление ради полноты:
+        // обработчик не знает и не должен знать, поставил ли ждущий себе
+        // будильник. Пропущенный здесь вариант выглядел бы как «прерывания
+        // настроены, а задача просыпается только по сроку».
+        let waiting = matches!(
+            task.state,
+            TaskState::Blocked(Wait::Irq(waited) | Wait::IrqUntil(waited, _)) if waited == source
+        );
+        if waiting {
             task.state = TaskState::Ready;
         }
     }
