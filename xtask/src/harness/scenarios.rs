@@ -5220,6 +5220,11 @@ pub const ALL: &[Scenario] = &[
             Step::Await("written-over-nvme", 15_000),
             Step::Line("whoami"),
             Step::Await("roman (uid 1000 gid 1000)", 15_000),
+            // Проверка фазы 52: приходил ли по настроенному вектору хоть один
+            // сигнал. Строка в журнале про MSI-X этого не говорит — она
+            // печатается до первой команды ввода-вывода.
+            Step::Line("irq nvme"),
+            Step::Await("nvme woke the system", 15_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

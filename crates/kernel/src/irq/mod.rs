@@ -35,6 +35,8 @@ pub mod source {
     pub const VIRTIO_BLK: u32 = 4;
     /// Контроллер SATA.
     pub const AHCI: u32 = 5;
+    /// Контроллер NVMe.
+    pub const NVME: u32 = 6;
 
     /// Сколько источников помещается в таблицу счётчиков. Нулевой не занят
     /// никем: ноль — слишком удобное значение по умолчанию, чтобы отдавать его
@@ -50,6 +52,7 @@ pub mod source {
             NET => "net",
             VIRTIO_BLK => "virtio-blk",
             AHCI => "ahci",
+            NVME => "nvme",
             _ => "unknown",
         }
     }

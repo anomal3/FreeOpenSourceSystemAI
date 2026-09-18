@@ -109,6 +109,32 @@ const ADMIN_CREATE_CQ: u8 = 0x05;
 const ADMIN_CREATE_SQ: u8 = 0x01;
 /// Административная: рассказать о себе.
 const ADMIN_IDENTIFY: u8 = 0x06;
+
+/// На сколько засыпать за раз, ожидая ответа контроллера. Как у virtio-blk и
+/// AHCI: это срок **неполучения** прерывания, а не срок ответа диска.
+const SLEEP_SLICE_MS: u64 = 1;
+
+/// Ярлык, по которому планировщик будит ждущих ответа от NVMe.
+const IRQ_SOURCE: u32 = crate::irq::source::NVME;
+
+/// Вектор MSI-X, на который настроены обе очереди.
+///
+/// Ноль не выбран, а предписан: административная очередь завершения всегда
+/// пользуется нулевым вектором, и отдать его очереди ввода-вывода — значит
+/// получить оба потока ответов одним сигналом. Нам это и нужно: ждущий в любом
+/// случае смотрит в своё кольцо, а второй вектор потребовал бы второго
+/// обработчика ради того же самого пробуждения.
+const MSIX_VECTOR: usize = 0;
+
+/// Прерывание от контроллера NVMe.
+///
+/// Снимать признак негде и незачем: у NVMe нет регистра состояния прерываний,
+/// который надо было бы квитировать, — контроллер считает сигнал доставленным,
+/// как только хост двинул звонок очереди завершения. Это и делает тот, кого
+/// разбудили.
+pub fn on_interrupt() {
+    crate::sched::wake_irq(IRQ_SOURCE);
+}
 /// Ввод-вывод: записать.
 const IO_WRITE: u8 = 0x01;
 /// Ввод-вывод: прочитать.
@@ -231,6 +257,9 @@ pub struct Nvme {
     block_size: usize,
     /// Номер команды. Растёт, чтобы ответ можно было сопоставить с запросом.
     next_id: u16,
+    /// Ярлык прерывания, если контроллер согласился его присылать. `None` —
+    /// ждём холостым циклом, как ядро ждало всегда.
+    irq: Option<u32>,
 }
 
 /// Найти контроллеры NVMe и поднять диски за ними.
@@ -359,7 +388,17 @@ impl Nvme {
             blocks: 0,
             block_size: SECTOR_SIZE,
             next_id: 0,
+            irq: None,
         };
+
+        // Прерывания поднимаются **до** создания очереди завершения: её команда
+        // несёт номер вектора и признак «прерывания разрешены», и переиграть
+        // это потом можно только пересозданием очереди.
+        //
+        // SAFETY: контракт функции; окно регистров отображено.
+        if unsafe { disk.enable_interrupts(device) } {
+            disk.irq = Some(IRQ_SOURCE);
+        }
 
         // Порядок обязателен: очередь завершения создаётся до очереди отправки,
         // потому что вторая ссылается на первую по номеру. Контроллер откажет,
@@ -377,6 +416,56 @@ impl Nvme {
         self.blocks
     }
 
+    /// Попросить контроллер присылать прерывания.
+    ///
+    /// Возвращает `false`, если чего-то из цепочки нет: у контроллера нет MSI-X,
+    /// у машины нет цели для MSI (GICv3 без v2m), таблица векторов не легла на
+    /// отображение. Тогда драйвер остаётся на холостом цикле и работает ровно
+    /// как раньше — отказ здесь не ошибка и не повод не поднимать диск.
+    ///
+    /// # Safety
+    ///
+    /// Ядро должно исполняться на собственных таблицах страниц.
+    unsafe fn enable_interrupts(&mut self, device: &Device) -> bool {
+        let Some(msix) = device.msix() else {
+            kprintln!("  nvme        : no MSI-X capability; completions will be spun on");
+            return false;
+        };
+        if usize::from(msix.vectors) <= MSIX_VECTOR {
+            kprintln!("  nvme        : the controller offers no vector {MSIX_VECTOR}; completions will be spun on");
+            return false;
+        }
+        let Some((address, data)) = crate::arch::interrupts::alloc_msi(on_interrupt) else {
+            kprintln!("  nvme        : no MSI target on this machine; completions will be spun on");
+            return false;
+        };
+
+        let span = u64::from(msix.table_offset)
+            + (pci::MSIX_ENTRY_SIZE * usize::from(msix.vectors)) as u64;
+        // Таблица векторов лежит в памяти устройства, и её BAR не обязан быть
+        // тем же, в котором регистры. Отображается он отдельно и целиком до
+        // конца таблицы.
+        //
+        // SAFETY: контракт функции; окно — регистры устройства.
+        let table = match unsafe { map_bar(device, msix.bir, span) } {
+            Ok(base) => base.as_usize() + msix.table_offset as usize,
+            Err(err) => {
+                kprintln!("  nvme        : cannot map the MSI-X table ({err}); completions will be spun on");
+                return false;
+            }
+        };
+
+        // SAFETY: таблица отображена, вектор существует (проверено выше),
+        // обработчик поставлен `alloc_msi` — прерывание может прийти сразу
+        // после записи.
+        unsafe { device.set_msix_vector(&msix, table, MSIX_VECTOR, address, data) };
+
+        kprintln!(
+            "  nvme        : MSI-X vector {MSIX_VECTOR} -> {address:#018x} data {data:#x}, completions arrive by interrupt"
+        );
+        true
+    }
+
     /// Создать очередь завершения ввода-вывода.
     fn create_io_completion_queue(&mut self) -> Result<(), NvmeError> {
         let mut command = [0u32; 16];
@@ -385,8 +474,14 @@ impl Nvme {
         command[7] = (self.io.cq.phys().as_u64() >> 32) as u32;
         command[10] = u32::from(self.io.id) | (u32::from(QUEUE_DEPTH - 1) << 16);
         // Бит 0 — очередь лежит в непрерывной памяти. Она и лежит: буфер взят
-        // из окна DMA, которое непрерывно целиком. Прерывания не включаем.
+        // из окна DMA, которое непрерывно целиком. Бит 1 — прерывания этой
+        // очереди разрешены, старшая половина — их вектор. Просить вектор, не
+        // разрешив прерывания, так же бесполезно, как разрешить их без вектора:
+        // обязательны оба поля.
         command[11] = 1;
+        if self.irq.is_some() {
+            command[11] |= 2 | ((MSIX_VECTOR as u32) << 16);
+        }
         self.submit_admin(&command).map(|_| ())
     }
 
@@ -455,13 +550,17 @@ impl Nvme {
     /// Отправить административную команду и дождаться ответа.
     fn submit_admin(&mut self, command: &[u32; 16]) -> Result<u32, NvmeError> {
         // SAFETY: очередь и окно регистров живут столько же, сколько диск.
-        unsafe { submit(self.regs, self.doorbell_stride, &mut self.admin, command, &mut self.next_id) }
+        unsafe {
+            submit(self.regs, self.doorbell_stride, &mut self.admin, command, &mut self.next_id, self.irq)
+        }
     }
 
     /// Отправить команду ввода-вывода и дождаться ответа.
     fn submit_io(&mut self, command: &[u32; 16]) -> Result<u32, NvmeError> {
         // SAFETY: см. выше.
-        unsafe { submit(self.regs, self.doorbell_stride, &mut self.io, command, &mut self.next_id) }
+        unsafe {
+            submit(self.regs, self.doorbell_stride, &mut self.io, command, &mut self.next_id, self.irq)
+        }
     }
 
     /// Заполнить поля PRP под передачу `bytes` байт из буфера данных.
@@ -566,6 +665,7 @@ unsafe fn submit(
     queue: &mut QueuePair,
     command: &[u32; 16],
     next_id: &mut u16,
+    irq: Option<u32>,
 ) -> Result<u32, NvmeError> {
     let id = *next_id;
     *next_id = next_id.wrapping_add(1);
@@ -596,7 +696,7 @@ unsafe fn submit(
     }
 
     // SAFETY: контракт функции.
-    let status = unsafe { wait_completion(regs, stride, queue, id) }?;
+    let status = unsafe { wait_completion(regs, stride, queue, id, irq) }?;
     Ok(status)
 }
 
@@ -610,8 +710,13 @@ unsafe fn wait_completion(
     stride: usize,
     queue: &mut QueuePair,
     id: u16,
+    irq: Option<u32>,
 ) -> Result<u32, NvmeError> {
     let deadline = time::uptime_ms() + COMMAND_TIMEOUT_MS;
+    // Выбор способа ожидания делается один раз на команду: ниже обе ветви уже
+    // про то, **как** ждать. Холостой цикл нужен не только машинам без MSI-X —
+    // корень монтируется до запуска планировщика, и опознание диска идёт там.
+    let sleep = irq.filter(|_| crate::sched::is_running());
     loop {
         let slot = usize::from(queue.cq_head);
         // SAFETY: очередь выделена на QUEUE_DEPTH записей по 16 байт.
@@ -659,7 +764,27 @@ unsafe fn wait_completion(
         if time::uptime_ms() >= deadline {
             return Err(NvmeError::Timeout);
         }
-        core::hint::spin_loop();
+        match sleep {
+            Some(source) => {
+                // Условие проверяется ещё раз под локом планировщика: между
+                // проверкой выше и засыпанием ответ мог прийти, и без неё
+                // задача уснула бы после того, как её разбудили. Смотреть так
+                // безопасно — бит фазы читается, а не снимается, в отличие от
+                // кольца завершений virtio.
+                // SAFETY: контракт функции — очередь принадлежит этому
+                // контроллеру и живёт столько же, сколько он.
+                let cq = unsafe { queue.cq.as_ptr::<u32>() };
+                let slot = usize::from(queue.cq_head);
+                let wanted = queue.phase;
+                crate::sched::block_on_irq_until(source, SLEEP_SLICE_MS, || {
+                    // SAFETY: очередь выделена на QUEUE_DEPTH записей по 16
+                    // байт и живёт столько же, сколько диск.
+                    let dw3 = unsafe { cq.add(slot * CQ_ENTRY / 4 + 3).read_volatile() };
+                    (dw3 & (1 << 16) != 0) == wanted
+                });
+            }
+            None => core::hint::spin_loop(),
+        }
     }
 }
 
@@ -684,6 +809,32 @@ unsafe fn wait_ready(regs: VirtAddr, want: bool, timeout_ms: u64) -> Result<(), 
         }
         core::hint::spin_loop();
     }
+}
+
+/// Отобразить BAR устройства целиком до `span` байт.
+///
+/// Нужен таблице векторов MSI-X: она живёт в памяти устройства, и какой это
+/// BAR, говорит сама возможность.
+///
+/// # Safety
+///
+/// Ядро должно исполняться на собственных таблицах страниц.
+unsafe fn map_bar(device: &Device, bar: usize, span: u64) -> Result<VirtAddr, NvmeError> {
+    let phys = device.memory_bar(bar).ok_or(NvmeError::BadBar)?;
+    // BAR выровнен на страницу по спецификации PCI, поэтому округляется только
+    // длина.
+    let len = usize::try_from(span)
+        .map_err(|_| NvmeError::BadBar)?
+        .max(1)
+        .next_multiple_of(PAGE_SIZE);
+    let virt = phys.to_direct_map();
+    let flags = PageFlags::READ | PageFlags::WRITE | PageFlags::DEVICE;
+    // SAFETY: контракт функции. Это регистры устройства: семантика `DEVICE`
+    // обязательна. Повторное отображение того же BAR безвредно — прямое
+    // отображение взаимно однозначно, адрес получится тот же.
+    unsafe { crate::arch::map_active(virt, phys, len, flags) }
+        .map_err(|_| NvmeError::MapFailed)?;
+    Ok(virt)
 }
 
 /// Отобразить окно регистров.
