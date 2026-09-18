@@ -282,8 +282,21 @@ pub const PAYLOAD_DEFAULTS_DIR: &str = "FREEOS/DEF";
 /// носителе: том там пишется без длинных имён (см. заголовок `disk::fat32`), то
 /// есть 8.3. Список обязан совпадать с `DEFAULTS` в
 /// `crates/installer/src/payload.rs` — установщик открывает ровно эти пути.
-pub const PAYLOAD_DEFAULTS: [(&str, &str); 3] =
-    [("services", "SERVICES"), ("update.cfg", "UPDATE.CFG"), ("ca.pem", "CA.PEM")];
+pub const PAYLOAD_DEFAULTS: [(&str, &str); 4] = [
+    ("services", "SERVICES"),
+    ("update.cfg", "UPDATE.CFG"),
+    ("ca.pem", "CA.PEM"),
+    ("httpd.cfg", "HTTPD.CFG"),
+];
+
+/// Каталог сайта по умолчанию на установочном носителе.
+pub const PAYLOAD_SITE_DIR: &str = "FREEOS/WWW";
+
+/// Что из `initrd/usr/share/httpd/` едет на носитель и под какими именами 8.3.
+///
+/// Список обязан совпадать с `SITE` в `crates/installer/src/payload.rs`.
+pub const PAYLOAD_SITE: [(&str, &str); 2] =
+    [("index.html", "INDEX.HTM"), ("style.css", "STYLE.CSS")];
 
 /// Каталог своей среды .NET на установочном носителе (фаза N5a).
 ///

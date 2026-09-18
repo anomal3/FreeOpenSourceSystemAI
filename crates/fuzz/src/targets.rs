@@ -225,4 +225,39 @@ pub static TARGETS: &[Target] = &[
             let _ = clr_meta::Assembly::parse(bytes);
         },
     },
+    Target {
+        name: "http",
+        about: "Запрос из сети и ответ чужого сервера: голова сообщения и путь в ней.",
+        seeds: seeds::http_messages,
+        hot_bytes: usize::MAX,
+        run: |bytes| {
+            // Голова разбирается и как запрос, и как ответ: сервер читает
+            // первое, тот же сервер в роли обратного прокси — второе, и
+            // испорченные байты приходят к обоим из одного и того же места —
+            // из сети.
+            let head = http::head_end(bytes).unwrap_or(bytes.len());
+            let head = &bytes[..head];
+            if let Ok(request) = http::Request::parse(head) {
+                let _ = request.body();
+                let _ = request.keep_alive();
+                let (path, query) = request.split_target();
+                let _ = query;
+                // Путь — самое опасное место сервера: здесь чужая строка
+                // становится именем файла. Буфер ровно такой же, какой заводит
+                // сервер, — и разбор обязан либо уместиться в него, либо
+                // отказать.
+                let mut room = [0u8; 256];
+                if let Some(clean) = http::path::normalize(path, &mut room) {
+                    let _ = http::mime::of(clean);
+                    let _ = http::path::under(clean, "/up");
+                }
+            }
+            if let Ok(answer) = http::Response::parse(head) {
+                let _ = answer.body(http::Method::Get);
+                let _ = answer.body(http::Method::Head);
+                let _ = answer.keep_alive();
+                let _ = answer.head.value("location");
+            }
+        },
+    },
 ];

@@ -562,7 +562,7 @@ pub const BIG_FILE_CHECKSUM_LINE: &str =
 /// странице — и отображение, где две виртуальные страницы смотрят на один
 /// кадр, дало бы правильную сумму. Узор, зависящий только от номера страницы,
 /// не заметил бы сдвига внутри неё. Здесь не проходит ни то, ни другое.
-const fn big_file_byte(index: usize) -> u8 {
+pub const fn big_file_byte(index: usize) -> u8 {
     (((index >> 12) ^ index) & 0xFF) as u8
 }
 

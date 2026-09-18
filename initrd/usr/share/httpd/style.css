@@ -1,0 +1,60 @@
+/* Оформление страницы по умолчанию. Второй файл существует не для красоты:
+   страница со ссылкой на него проверяет, что сервер отдаёт больше одного файла
+   и что тип содержимого он берёт из расширения, а не из догадки. */
+
+:root {
+    color-scheme: light dark;
+    --ink: #1c1c1c;
+    --paper: #f6f5f2;
+    --accent: #1f6feb;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --ink: #e6e6e6;
+        --paper: #17181c;
+        --accent: #6ea8ff;
+    }
+}
+
+body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 16px/1.6 system-ui, "Segoe UI", sans-serif;
+}
+
+main {
+    max-width: 44rem;
+    margin: 0 auto;
+    padding: 3rem 1rem;
+}
+
+h1 {
+    font-size: 2rem;
+    margin-bottom: 0.25rem;
+}
+
+h2 {
+    font-size: 1.15rem;
+    margin-top: 2rem;
+}
+
+code {
+    font-family: ui-monospace, Consolas, monospace;
+    background: color-mix(in srgb, var(--ink) 10%, transparent);
+    padding: 0.1em 0.35em;
+    border-radius: 0.25em;
+}
+
+a {
+    color: var(--accent);
+}
+
+footer {
+    margin-top: 3rem;
+    padding-top: 1rem;
+    border-top: 1px solid color-mix(in srgb, var(--ink) 20%, transparent);
+    font-size: 0.9rem;
+    opacity: 0.75;
+}

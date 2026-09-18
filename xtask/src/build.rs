@@ -307,11 +307,11 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 37] = [
+pub const USER_PROGRAMS: [&str; 38] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sshd",
     "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow", "sysmon", "files",
-    "taskmgr", "devmgr", "dotnet", "sftp-server", "big", "smash",
+    "taskmgr", "devmgr", "dotnet", "sftp-server", "big", "smash", "httpd",
 ];
 
 /// Программы, которые в `/bin` **не** едут.
@@ -660,7 +660,7 @@ pub fn check(arches: &[Arch]) -> Result<()> {
     // том, сделанный ЧУЖОЙ программой, и ошибка в смещении поля даёт не отказ, а
     // правдоподобный мусор. В эмуляторе это выглядит как «файл прочитался не
     // так», и до причины оттуда полдня; здесь — секунда и номер байта.
-    for package in ["btrfs", "fdt", "fpk", "slots", "ssh", "sysconf", "user-abi", "xtask"] {
+    for package in ["btrfs", "fdt", "fpk", "http", "slots", "ssh", "sysconf", "user-abi", "xtask"] {
         let mut cmd = cargo();
         cmd.arg("test").arg("--package").arg(package);
         util::run(&mut cmd, &format!("cargo test ({package})"))?;

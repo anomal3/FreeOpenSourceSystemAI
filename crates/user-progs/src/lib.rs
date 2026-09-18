@@ -616,6 +616,13 @@ pub fn print_octal(value: u32) {
 pub struct Line {
     buffer: [u8; Self::MAX],
     used: usize,
+    /// Куда уходит готовая строка: в поток ошибок вместо обычного вывода.
+    ///
+    /// Служба пишет в журнал, а не человеку на экран, и её строки обязаны быть
+    /// такими же неразрываемыми: стенд читает серийную линию, где вывод всех
+    /// задач перемешан, и строка, разорванная на три записи, ловится как «в
+    /// журнале нет того, что в нём есть».
+    stderr: bool,
 }
 
 impl Default for Line {
@@ -632,6 +639,17 @@ impl Line {
         Self {
             buffer: [0; Self::MAX],
             used: 0,
+            stderr: false,
+        }
+    }
+
+    /// Такая же строка, но уходящая в поток ошибок, то есть в журнал.
+    #[must_use]
+    pub const fn to_log() -> Self {
+        Self {
+            buffer: [0; Self::MAX],
+            used: 0,
+            stderr: true,
         }
     }
 
@@ -702,7 +720,12 @@ impl Line {
     fn flush(&mut self) {
         if self.used > 0 {
             // SAFETY: в буфер попадают только куски `&str` и цифры ASCII.
-            print(unsafe { core::str::from_utf8_unchecked(&self.buffer[..self.used]) });
+            let text = unsafe { core::str::from_utf8_unchecked(&self.buffer[..self.used]) };
+            if self.stderr {
+                error(text);
+            } else {
+                print(text);
+            }
             self.used = 0;
         }
     }

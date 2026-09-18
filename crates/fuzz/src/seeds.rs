@@ -251,3 +251,24 @@ pub fn tls_records() -> Vec<Vec<u8>> {
     let alert = vec![0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00];
     vec![record, alert]
 }
+
+/// Правильные сообщения HTTP: запрос к серверу и ответ ему.
+///
+/// Оба короткие, и это здесь не экономия, а смысл: голова сообщения — это
+/// текст, у которого разбор спотыкается не на длине, а на знаках. Порча
+/// подставляет в них `\r`, `\n`, `%` и двоеточия в тех местах, где их быть не
+/// должно, — то есть ровно то, чем ломают серверы в жизни.
+#[must_use]
+pub fn http_messages() -> Vec<Vec<u8>> {
+    vec![
+        b"GET /index.html?a=1 HTTP/1.1\r\nHost: freeos\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n"
+            .to_vec(),
+        b"GET /%D0%BF%D1%83%D1%82%D1%8C/../file.txt HTTP/1.1\r\nHost: freeos\r\n\r\n".to_vec(),
+        b"POST /upload HTTP/1.1\r\nHost: freeos\r\nContent-Length: 12\r\nContent-Type: text/plain\r\n\r\nhello world\n"
+            .to_vec(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/html; charset=utf-8\r\nServer: nginx\r\n\r\nhello"
+            .to_vec(),
+        b"HTTP/1.1 302 Found\r\nLocation: http://elsewhere/x\r\nTransfer-Encoding: chunked\r\n\r\n"
+            .to_vec(),
+    ]
+}

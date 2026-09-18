@@ -265,6 +265,16 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // Образцовые пакеты. Имена на носителе — короткие 8.3, потому что
             // это FAT; настоящие имена (`hello-1.0.fpk`) знает установщик и
             // ставит файлы под ними в `/media`.
+            // Сайт, который веб-сервер отдаёт по умолчанию, — из того же
+            // `initrd/` и тем же способом, что и эталонные настройки.
+            for (name, medium) in arch::PAYLOAD_SITE {
+                let target = format!("{}/{medium}", arch::PAYLOAD_SITE_DIR);
+                payload.push(read_payload(
+                    &target,
+                    &paths::initrd_source_dir().join("usr/share/httpd").join(name),
+                )?);
+            }
+
             for package in crate::package::build_samples(arch, built.release)? {
                 let short = package
                     .file_name

@@ -682,6 +682,17 @@ fn execute(
         None
     };
 
+    // Веб-сервер хоста, которого проксирует гость. Поднимается до запуска
+    // гостя по той же причине, что и эхо-сервер: первый запрос через прокси
+    // приходит в первые же секунды сценария.
+    let _host_site = if scenario.host_site {
+        let (listener, port) = start_host_site()?;
+        ports.site = port;
+        Some(listener)
+    } else {
+        None
+    };
+
     // Сервер обновлений — тем же приёмом и по той же причине: гость идёт к нему
     // сам, в первые же секунды после того, как поднялась сеть.
     //
@@ -890,6 +901,7 @@ fn play(
             return text;
         }
         text.replace("{echo}", &ports.echo.to_string())
+            .replace("{site}", &ports.site.to_string())
             .replace("{repo}", &ports.repo.to_string())
             .replace("{tls}", &ports.tls.to_string())
             .replace("{stranger}", &ports.stranger.to_string())
@@ -1169,6 +1181,167 @@ fn play(
                 }
                 say!("  [{at:>6} мс] шаг {index}: том btrfs {} с хоста", path.display());
                 datavol::check(path, expect).with_context(|| format!("шаг {index}"))?;
+            }
+            Step::Http(get) => {
+                let Some(port) = hostfwd else {
+                    bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
+                };
+                let what = if get.raw.is_empty() {
+                    format!("{} {}", method_of(get), get.path)
+                } else {
+                    "запрос, написанный руками".to_string()
+                };
+                say!("  [{at:>6} мс] шаг {index}: с хоста на 127.0.0.1:{port} — {what}");
+                let request = build_request(get, &fill(get.path, &captured, &captured2));
+                let patience = patience(get.timeout_ms);
+                let mut client = HttpClient::open(port, patience)
+                    .with_context(|| format!("шаг {index}"))?;
+                let answer = client.ask(&request).with_context(|| format!("шаг {index}"))?;
+                say!(
+                    "             ответ {} , тело {} байт",
+                    answer.status,
+                    answer.body.len()
+                );
+                if answer.status != get.status {
+                    bail!(
+                        "шаг {index}: ожидался код {}, пришёл {}\n{}",
+                        get.status,
+                        answer.status,
+                        answer.head.trim_end()
+                    );
+                }
+                let whole = answer.text();
+                for needle in get.contains {
+                    let needle = fill(needle, &captured, &captured2);
+                    if !whole.contains(&needle) {
+                        bail!("шаг {index}: в ответе нет \"{needle}\"\n{}", answer.head.trim_end());
+                    }
+                }
+                for needle in get.absent {
+                    let needle = fill(needle, &captured, &captured2);
+                    if whole.contains(&needle) {
+                        bail!("шаг {index}: в ответе есть то, чего быть не должно: \"{needle}\"");
+                    }
+                }
+                if let Some(want) = get.body_len {
+                    if answer.body.len() != want {
+                        bail!(
+                            "шаг {index}: тело в {} байт, ожидалось {want}",
+                            answer.body.len()
+                        );
+                    }
+                }
+            }
+            Step::HttpSession(session) => {
+                let Some(port) = hostfwd else {
+                    bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
+                };
+                say!(
+                    "  [{at:>6} мс] шаг {index}: {} запроса в одном соединении",
+                    session.requests.len()
+                );
+                let patience = patience(session.timeout_ms);
+                let mut client = HttpClient::open(port, patience)
+                    .with_context(|| format!("шаг {index}"))?;
+                for (number, (path, status)) in session.requests.iter().enumerate() {
+                    let request = format!(
+                        "GET {path} HTTP/1.1\r\nHost: freeos\r\nConnection: keep-alive\r\n\r\n"
+                    );
+                    let answer = client
+                        .ask(request.as_bytes())
+                        .with_context(|| format!("шаг {index}: запрос {} ({path})", number + 1))?;
+                    if answer.status != *status {
+                        bail!(
+                            "шаг {index}: запрос {} ({path}): ожидался код {status}, пришёл {}",
+                            number + 1,
+                            answer.status
+                        );
+                    }
+                    say!("             {path} -> {} ({} байт)", answer.status, answer.body.len());
+                }
+                say!("             соединение выдержало все запросы подряд");
+            }
+            Step::HttpBulk(bulk) => {
+                let Some(port) = hostfwd else {
+                    bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
+                };
+                say!(
+                    "  [{at:>6} мс] шаг {index}: качаем {} ({} байт) и сверяем каждый байт",
+                    bulk.path,
+                    bulk.bytes
+                );
+                let started = Instant::now();
+                let patience = patience(bulk.timeout_ms);
+                let mut client = HttpClient::open(port, patience)
+                    .with_context(|| format!("шаг {index}"))?;
+                let request = format!(
+                    "GET {} HTTP/1.1\r\nHost: freeos\r\nConnection: close\r\n\r\n",
+                    bulk.path
+                );
+                let answer = client.ask(request.as_bytes()).with_context(|| format!("шаг {index}"))?;
+                if answer.status != 200 {
+                    bail!("шаг {index}: ожидался код 200, пришёл {}", answer.status);
+                }
+                if answer.body.len() as u64 != bulk.bytes {
+                    bail!(
+                        "шаг {index}: приехало {} байт из {}",
+                        answer.body.len(),
+                        bulk.bytes
+                    );
+                }
+                if let Some(at) = first_wrong(&answer.body, bulk.pattern) {
+                    bail!("шаг {index}: байт {at} приехал не тем, каким уезжал");
+                }
+                let seconds = started.elapsed().as_secs_f64().max(0.001);
+                say!(
+                    "             {} байт совпали до последнего, {:.1} с ({:.0} КиБ/с)",
+                    answer.body.len(),
+                    seconds,
+                    answer.body.len() as f64 / 1024.0 / seconds
+                );
+            }
+            Step::HttpMany(many) => {
+                let Some(port) = hostfwd else {
+                    bail!("шаг {index}: сценарий не пробрасывает порт, стучаться некуда");
+                };
+                say!(
+                    "  [{at:>6} мс] шаг {index}: {} запросов одновременно на {}",
+                    many.count,
+                    many.path
+                );
+                let patience = patience(many.timeout_ms);
+                let mut threads = Vec::new();
+                for _ in 0..many.count {
+                    let path = many.path.to_string();
+                    threads.push(std::thread::spawn(move || -> Result<HttpAnswer> {
+                        let mut client = HttpClient::open(port, patience)?;
+                        let request = format!(
+                            "GET {path} HTTP/1.1\r\nHost: freeos\r\nConnection: close\r\n\r\n"
+                        );
+                        client.ask(request.as_bytes())
+                    }));
+                }
+                for (number, thread) in threads.into_iter().enumerate() {
+                    let answer = thread
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("шаг {index}: поток запроса упал"))?
+                        .with_context(|| format!("шаг {index}: одновременный запрос {}", number + 1))?;
+                    if answer.status != 200 {
+                        bail!(
+                            "шаг {index}: одновременный запрос {}: код {}",
+                            number + 1,
+                            answer.status
+                        );
+                    }
+                    if !answer.text().contains(many.contains) {
+                        bail!(
+                            "шаг {index}: одновременный запрос {}: в ответе нет \"{}\"",
+                            number + 1,
+                            many.contains
+                        );
+                    }
+                }
+                say!("             все {} ответов пришли целыми", many.count);
             }
             Step::TcpEcho(text, timeout_ms) => {
                 let Some(port) = hostfwd else {
@@ -1666,6 +1839,12 @@ fn pseudo_random(len: usize) -> Vec<u8> {
 struct HostPorts {
     /// Эхо-сервер, к которому подключается гость. Ноль — сценарию он не нужен.
     echo: u16,
+    /// Веб-сервер хоста, которого проксирует гость. Ноль — не нужен.
+    ///
+    /// Номер выдаёт ядро ОС, как и у эхо-сервера, и по той же причине: адрес
+    /// уезжает в гостя строкой команды, которую стенд набирает во время
+    /// прогона, — значит закреплять его за конфигурацией незачем.
+    site: u16,
     /// Репозиторий обновлений по обычному HTTP.
     repo: u16,
     /// Он же по HTTPS, с корнем, который гость знает.
@@ -1683,6 +1862,7 @@ impl HostPorts {
         let base = 2000 + 10 * slot;
         Self {
             echo: 0,
+            site: 0,
             repo: base + 2,
             tls: base + 3,
             stranger: base + 4,
@@ -2035,6 +2215,279 @@ fn file_for(root: &std::path::Path, target: &str) -> Option<Vec<u8>> {
         return None;
     }
     std::fs::read(path).ok()
+}
+
+/// Ответ гостя, разобранный ровно настолько, насколько нужно проверке.
+struct HttpAnswer {
+    status: u16,
+    /// Голова целиком, текстом, вместе с первой строкой.
+    head: String,
+    body: Vec<u8>,
+}
+
+impl HttpAnswer {
+    /// Голова и тело одной строкой — то, в чём проверка ищет подстроки.
+    ///
+    /// Тело переводится в текст с потерями нарочно: искать `It works` в
+    /// странице — обычное дело, а требовать от неё быть UTF-8 нельзя, потому
+    /// что тем же клиентом качается и двоичный файл.
+    fn text(&self) -> String {
+        let mut whole = self.head.clone();
+        whole.push_str(&String::from_utf8_lossy(&self.body));
+        whole
+    }
+}
+
+/// Клиент HTTP стенда: своё соединение, свой разбор.
+///
+/// # Почему разбор свой, а не крейтом `http`
+///
+/// Потому что проверять сервер его же разборщиком — значит проверять, что две
+/// половины одного кода согласны друг с другом. Здесь два десятка строк,
+/// написанных по стандарту и независимо: ищем пустую строку, берём код из
+/// первой строки, длину — из `Content-Length`, а если его нет, читаем до
+/// закрытия. Разойдись наш сервер со стандартом — разойдётся и с этим клиентом.
+struct HttpClient {
+    stream: std::net::TcpStream,
+    /// Байты, прочитанные вперёд: хвост, приехавший вместе с телом.
+    spare: Vec<u8>,
+    patience: Duration,
+}
+
+impl HttpClient {
+    fn open(port: u16, patience: Duration) -> Result<Self> {
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let stream = std::net::TcpStream::connect_timeout(&address, patience)
+            .with_context(|| format!("не удалось подключиться к 127.0.0.1:{port}"))?;
+        stream.set_read_timeout(Some(patience))?;
+        stream.set_write_timeout(Some(patience))?;
+        stream.set_nodelay(true).ok();
+        Ok(Self { stream, spare: Vec::new(), patience })
+    }
+
+    /// Отправить запрос и собрать ответ целиком.
+    fn ask(&mut self, request: &[u8]) -> Result<HttpAnswer> {
+        use std::io::Write;
+        self.stream.write_all(request).context("запрос не ушёл")?;
+        self.stream.flush().ok();
+
+        let deadline = Instant::now() + self.patience;
+        let end = loop {
+            if let Some(at) = find(&self.spare, b"\r\n\r\n") {
+                break at + 4;
+            }
+            if Instant::now() > deadline {
+                bail!("голова ответа не пришла целиком за отведённое время");
+            }
+            if !self.fill()? {
+                // Первые байты — в отчёт: «головы нет» и «пришло не то» иначе
+                // выглядят одинаково, а это разные неисправности.
+                let preview = String::from_utf8_lossy(&self.spare[..self.spare.len().min(200)])
+                    .escape_debug()
+                    .to_string();
+                bail!(
+                    "соединение закрылось, а голова ответа не дошла: пришло {} байт, начало: {preview}",
+                    self.spare.len()
+                );
+            }
+        };
+
+        let head = String::from_utf8_lossy(&self.spare[..end]).to_string();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split(' ').nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .ok_or_else(|| anyhow::anyhow!("первая строка ответа не похожа на ответ: {head:?}"))?;
+        // У ответа на `HEAD` тела нет никогда, сколько бы ни было объявлено в
+        // `Content-Length`, — и это правило клиента, а не сервера: клиент,
+        // забывший о нём, ждёт байты, которых не будет, до самого таймаута.
+        let head_only = request.starts_with(b"HEAD ");
+        let length = if head_only {
+            Some(0)
+        } else {
+            header(&head, "content-length").and_then(|value| value.parse::<u64>().ok())
+        };
+        let closing = header(&head, "connection")
+            .is_some_and(|value| value.eq_ignore_ascii_case("close"));
+
+        // Всё, что прочитано за головой, — это уже начало тела. Дальше оно
+        // дочитывается до объявленной длины, а если длины не объявлено — до
+        // закрытия соединения.
+        let mut body: Vec<u8> = self.spare.split_off(end);
+        self.spare.clear();
+        match length {
+            Some(length) => {
+                while (body.len() as u64) < length {
+                    if Instant::now() > deadline {
+                        bail!("тело оборвалось: {} байт из {length}", body.len());
+                    }
+                    if !self.fill()? {
+                        bail!("соединение закрылось на {} байте из {length}", body.len());
+                    }
+                    body.append(&mut self.spare);
+                }
+                // Лишнее — это уже следующий ответ; такого быть не должно.
+                if body.len() as u64 > length {
+                    let extra = body.split_off(length as usize);
+                    self.spare = extra;
+                }
+            }
+            None => {
+                if closing {
+                    while self.fill()? {
+                        body.append(&mut self.spare);
+                        if Instant::now() > deadline {
+                            bail!("тело идёт дольше отведённого: {} байт", body.len());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(HttpAnswer { status, head, body })
+    }
+
+    /// Дочитать что-нибудь в `spare`. `false` — собеседник закрылся.
+    fn fill(&mut self) -> Result<bool> {
+        use std::io::Read;
+        let mut chunk = [0u8; 16 * 1024];
+        match self.stream.read(&mut chunk) {
+            Ok(0) => Ok(false),
+            Ok(read) => {
+                self.spare.extend_from_slice(&chunk[..read]);
+                Ok(true)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(true),
+            Err(err) => Err(err).context("чтение ответа оборвалось"),
+        }
+    }
+}
+
+/// Значение поля в голове ответа; регистр имени не важен.
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (field, value) = line.split_once(':')?;
+        field.eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// Где в байтах лежит образец.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+/// Метод шага — `GET`, если не сказано иначе.
+fn method_of(get: &scenarios::HttpGet) -> &str {
+    if get.method.is_empty() { "GET" } else { get.method }
+}
+
+/// Собрать запрос шага: либо написанный руками, либо обычный.
+fn build_request(get: &scenarios::HttpGet, path: &str) -> Vec<u8> {
+    if !get.raw.is_empty() {
+        return get.raw.as_bytes().to_vec();
+    }
+    format!(
+        "{} {path} HTTP/1.1\r\nHost: freeos\r\nUser-Agent: freeos-harness/1\r\nConnection: close\r\n\r\n",
+        method_of(get)
+    )
+    .into_bytes()
+}
+
+/// Номер первого байта, который приехал не тем, каким уезжал.
+fn first_wrong(body: &[u8], pattern: scenarios::Pattern) -> Option<usize> {
+    body.iter().enumerate().find_map(|(at, byte)| {
+        let want = match pattern {
+            scenarios::Pattern::BigFile => crate::package::big_file_byte(at),
+            scenarios::Pattern::Modulo => (at % 251) as u8,
+        };
+        (*byte != want).then_some(at)
+    })
+}
+
+/// Поднять на хосте веб-сервер, которого будет проксировать гость.
+///
+/// Три документа, и каждый проверяет свою половину прокси: короткий текст —
+/// что запрос дошёл и ответ вернулся; поток в четверть мегабайта — что тело
+/// переливается кусками, а не собирается в памяти; ответ кусками — что чужое
+/// разбиение мы **не** пропускаем дальше, а отвечаем `502`.
+fn start_host_site() -> Result<(HostServer, u16)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("не удалось занять порт под веб-сервер хоста")?;
+    let port = listener.local_addr()?.port();
+    let server = serve(listener, |stream| {
+        use std::io::{Read, Write};
+        let mut stream = stream;
+        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(60))).ok();
+
+        // Голова запроса читается целиком: сервер, отвечающий на половину
+        // запроса, проверял бы терпение гостя, а не прокси.
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while find(&head, b"\r\n\r\n").is_none() {
+            match stream.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(read) => head.extend_from_slice(&chunk[..read]),
+                Err(_) => return,
+            }
+            if head.len() > 8 * 1024 {
+                return;
+            }
+        }
+        let text = String::from_utf8_lossy(&head).to_string();
+        let path = text
+            .lines()
+            .next()
+            .and_then(|line| line.split(' ').nth(1))
+            .unwrap_or("/")
+            .to_string();
+
+        let answer: Vec<u8> = match path.as_str() {
+            "/hello.txt" => {
+                let body = "hello from the host\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
+            "/stream.bin" => {
+                let length = scenarios::SITE_STREAM_BYTES;
+                let mut answer = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+                )
+                .into_bytes();
+                answer.extend((0..scenarios::SITE_STREAM_BYTES).map(|at| (at % 251) as u8));
+                answer
+            }
+            "/chunked.txt" => {
+                // Ответ кусками. Наш прокси обязан отказаться его передавать:
+                // границу такого сообщения считают по-разному, и передать
+                // дальше чужой счёт — значит однажды разойтись с клиентом.
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+                    .to_vec()
+            }
+            _ => {
+                let body = "not here\n";
+                format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
+        };
+
+        if stream.write_all(&answer).is_err() {
+            return;
+        }
+        stream.flush().ok();
+        // Закрытие — часть ответа: мы обещали `Connection: close`, и гость
+        // ждёт `FIN`, чтобы считать разговор законченным.
+        stream.shutdown(std::net::Shutdown::Both).ok();
+    })?;
+    say!("стенд: веб-сервер хоста слушает {port}");
+    Ok((server, port))
 }
 
 /// Поднять на хосте эхо-сервер, к которому будет подключаться гость.

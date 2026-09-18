@@ -1,0 +1,15 @@
+[package]
+name = "http"
+description = "HTTP/1.1 messages: the head of a request and of an answer, parsed once for the server, the client and the fuzzer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Зависимостей нет и не должно быть: здесь только разбор текста. Всё, что
+# требует знать систему, — сокеты, файлы, время — живёт у того, кто зовёт.
+[dependencies]
+
+[lints]
+workspace = true

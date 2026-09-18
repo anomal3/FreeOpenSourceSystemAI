@@ -15,6 +15,7 @@ members = [
     "crates/fpk",
     "crates/fuzz",
     "crates/freeos-cc",
+    "crates/http",
     "crates/installer",
     "crates/kernel",
     "crates/mini-ui",

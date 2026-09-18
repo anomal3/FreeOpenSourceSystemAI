@@ -405,12 +405,16 @@ fn exchange(
     // — конец запроса виден по пустой строке.
 
     let mut header = [0u8; MAX_HEADER];
-    let (header_len, body_start, filled) = read_header(&mut wire, io, &mut header)?;
-    let head = core::str::from_utf8(&header[..header_len]).map_err(|_| Error::NotHttp)?;
-    let status = status_of(head)?;
+    let (body_start, filled) = read_header(&mut wire, io, &mut header)?;
+    // Разбирает крейт `http` — тот же самый, которым читает запросы наш сервер
+    // и который фаззится на хосте. Своего разбора здесь больше нет намеренно:
+    // два разбора одного формата расходятся молча, а расходиться им тут есть
+    // где — в том, где кончается голова и как посчитана длина тела.
+    let answer = http::Response::parse(&header[..body_start]).map_err(|_| Error::NotHttp)?;
+    let status = answer.status;
 
     if is_redirect(status) {
-        let target = header_value(head, "location:").ok_or(Error::NoLocation)?;
+        let target = answer.head.value("location").ok_or(Error::NoLocation)?;
         // Относительный адрес (`/other/path`) достраивается до полного: сервер
         // вправе его прислать, и отказ выглядел бы как «файл не качается».
         if target.starts_with('/') {
@@ -428,10 +432,15 @@ fn exchange(
     if status != 200 {
         return Err(Error::Status(status));
     }
-    if has_header(head, "transfer-encoding:") {
-        return Err(Error::Chunked);
-    }
-    let length = content_length(head).ok_or(Error::NoLength)?;
+    let length = match answer.body(http::Method::Get) {
+        Ok(http::Body::Length(length)) => length,
+        Ok(http::Body::Chunked) => return Err(Error::Chunked),
+        // Ни длины, ни кусков: тело кончится закрытием. Этот клиент так не
+        // качает — без длины неизвестно, дошло ли всё, а именно это ему и надо
+        // знать: следом идёт проверка подписи.
+        Ok(_) => return Err(Error::NoLength),
+        Err(_) => return Err(Error::NotHttp),
+    };
 
     // Хвост, приехавший вместе с заголовком, — это уже тело. Потерять его —
     // классическая ошибка такого разбора: файл оказывается короче ровно на то,
@@ -680,12 +689,15 @@ fn read_header(
     wire: &mut Wire<'_, '_>,
     io: &mut Buffers<'_>,
     header: &mut [u8; MAX_HEADER],
-) -> Result<(usize, usize, usize), Error> {
+) -> Result<(usize, usize), Error> {
     let deadline = uptime_ms() + HEADER_TIMEOUT_MS;
     let mut filled = 0usize;
     loop {
-        if let Some((end, body)) = find_blank_line(&header[..filled]) {
-            return Ok((end, body, filled));
+        // Границу сообщения считает крейт `http`, и только он: считать её здесь
+        // своим способом значило бы завести второе мнение о том, где кончается
+        // голова, — то самое, на котором расходятся прокси.
+        if let Some(body) = http::head_end(&header[..filled]) {
+            return Ok((body, filled));
         }
         if filled == header.len() {
             return Err(Error::HugeHeader);
@@ -707,78 +719,12 @@ fn read_header(
     }
 }
 
-/// Найти пустую строку: конец заголовка и начало тела.
-///
-/// Возвращает длину заголовка (без пустой строки) и смещение тела. Понимает и
-/// `\r\n\r\n`, и `\n\n`: второй вариант встречается у самодельных серверов, а
-/// отказ разобрать его выглядел бы как «файл не качается».
-fn find_blank_line(bytes: &[u8]) -> Option<(usize, usize)> {
-    for at in 0..bytes.len() {
-        if bytes[at..].starts_with(b"\r\n\r\n") {
-            return Some((at, at + 4));
-        }
-        if bytes[at..].starts_with(b"\n\n") {
-            return Some((at, at + 2));
-        }
-    }
-    None
-}
-
-/// Код из строки состояния `HTTP/1.1 200 OK`.
-fn status_of(head: &str) -> Result<u16, Error> {
-    let line = head.lines().next().ok_or(Error::NotHttp)?;
-    if !line.starts_with("HTTP/1.") {
-        return Err(Error::NotHttp);
-    }
-    let mut fields = line.split_whitespace();
-    let _ = fields.next();
-    fields
-        .next()
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or(Error::NotHttp)
-}
-
 /// Код, который означает «файл в другом месте».
 ///
 /// `303` в этом списке потому, что сервер вправе ответить им и на `GET`; `307`
 /// и `308` — потому, что ими GitHub переадресует на CDN.
 const fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
-}
-
-/// Есть ли такой заголовок (имя пишется строчными, со двоеточием).
-fn has_header(head: &str, name: &str) -> bool {
-    head.lines().skip(1).any(|line| starts_with_ignoring_case(line, name))
-}
-
-/// Значение заголовка по имени.
-fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
-    for line in head.lines().skip(1) {
-        if starts_with_ignoring_case(line, name) {
-            let (_, value) = line.split_once(':')?;
-            return Some(value.trim());
-        }
-    }
-    None
-}
-
-/// Значение `Content-Length`.
-fn content_length(head: &str) -> Option<u64> {
-    header_value(head, "content-length:")?.parse::<u64>().ok()
-}
-
-/// Имена заголовков нечувствительны к регистру — это требование RFC 9110, а не
-/// вежливость: `Content-Length` и `content-length` пишут разные серверы.
-fn starts_with_ignoring_case(line: &str, lowercase: &str) -> bool {
-    let line = line.as_bytes();
-    let want = lowercase.as_bytes();
-    if line.len() < want.len() {
-        return false;
-    }
-    line[..want.len()]
-        .iter()
-        .zip(want)
-        .all(|(have, want)| have.to_ascii_lowercase() == *want)
 }
 
 /// Сложить строку из кусков; `false`, если не поместилось.

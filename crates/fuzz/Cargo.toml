@@ -18,6 +18,7 @@ x509 = { path = "../x509" }
 tls = { path = "../tls" }
 usb-hid = { path = "../usb-hid" }
 fpk = { path = "../fpk" }
+http = { path = "../http" }
 clr-meta = { path = "../clr-meta" }
 
 [lints]

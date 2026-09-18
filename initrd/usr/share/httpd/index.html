@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FreeOS is serving this page</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+<h1>It works</h1>
+<p>
+This page came from <code>/bin/httpd</code>, a web server running outside the
+kernel of FreeOS. Everything under it is ours: the Ethernet driver, ARP, IPv4,
+TCP and the sockets the server speaks through.
+</p>
+<h2>What this server does</h2>
+<ul>
+<li>Serves files from a directory, one <code>Content-Length</code> at a time.</li>
+<li>Forwards a path prefix to another server and streams the answer back.</li>
+<li>Counts itself at <a href="/metrics">/metrics</a>, in the format Prometheus reads.</li>
+</ul>
+<h2>Where to change it</h2>
+<p>
+Settings live in <code>/etc/httpd.cfg</code>: the port, the directory this page
+comes from, extra directories and what to forward where. The defaults ship with
+the image in <code>/usr/share/defaults/etc/httpd.cfg</code>.
+</p>
+<footer>FreeOpenSourceSystemAI &mdash; an operating system written from the boot sector up.</footer>
+</main>
+</body>
+</html>

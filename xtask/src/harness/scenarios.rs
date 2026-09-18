@@ -258,6 +258,118 @@ pub enum Step {
     /// диска. Читает наш же крейт, поэтому это согласованность, а не формат, —
     /// подробности в [`super::datavol`].
     DataVolume(VolumeCheck),
+    /// Спросить у гостя страницу по HTTP и проверить, что он ответил.
+    ///
+    /// Клиент здесь свой, а не `TcpStream` с готовым HTTP: половина проверок —
+    /// про запросы, которых правильный клиент не пошлёт **никогда** (голая
+    /// `\n` вместо `\r\n`, две длины тела, путь с `..`), а сервер обязан
+    /// отвечать на них отказом, а не страницей.
+    Http(HttpGet),
+    /// Несколько запросов подряд **в одном соединении**.
+    ///
+    /// Единственное, чем «соединение осталось живым» отличается от «сервер
+    /// ответил и закрылся»: второй запрос уходит в тот же сокет, и ответ на
+    /// него обязан прийти оттуда же.
+    HttpSession(HttpSession),
+    /// Скачать у гостя большой файл и сверить **каждый байт**.
+    ///
+    /// Это и есть та живая нагрузка, ради которой сервер написан: десятки
+    /// мегабайт одним потоком через наш TCP, наружу, с проверкой содержимого.
+    /// Оба дефекта TCP, найденные фазой 39, видны только на таком обмене.
+    HttpBulk(HttpBulk),
+    /// Несколько запросов **одновременно**, каждый своим соединением.
+    ///
+    /// Проверяет то, чего не проверяет ни один последовательный обмен: сервер
+    /// держит несколько соединений сразу, а ядро — несколько потоков, и ответы
+    /// не перепутаны между ними.
+    HttpMany(HttpMany),
+}
+
+/// Один запрос к веб-серверу гостя.
+pub struct HttpGet {
+    /// Путь вместе с запросом. Игнорируется, если задан [`HttpGet::raw`].
+    pub path: &'static str,
+    /// Метод. Пусто — `GET`.
+    pub method: &'static str,
+    /// Запрос целиком, байт в байт, вместо собранного нами.
+    ///
+    /// Существует ради проверок, которые иначе не написать: правильный клиент
+    /// не пошлёт ни пути с `..` (он его сам сократит), ни двух длин тела, ни
+    /// строки, кончающейся одиноким переводом строки.
+    pub raw: &'static str,
+    /// Какой код ответа ожидается.
+    pub status: u16,
+    /// Что обязано найтись в ответе — в голове или в теле.
+    pub contains: &'static [&'static str],
+    /// Чего в ответе быть не должно.
+    pub absent: &'static [&'static str],
+    /// Ожидаемая длина тела; `None` — не проверять.
+    pub body_len: Option<usize>,
+    pub timeout_ms: u64,
+}
+
+impl HttpGet {
+    /// Обычный `GET` с проверкой кода.
+    pub const fn get(path: &'static str, status: u16) -> Self {
+        Self {
+            path,
+            method: "",
+            raw: "",
+            status,
+            contains: &[],
+            absent: &[],
+            body_len: None,
+            timeout_ms: 30_000,
+        }
+    }
+}
+
+/// Несколько запросов в одном соединении.
+pub struct HttpSession {
+    /// Путь и ожидаемый код — по порядку, все в один сокет.
+    pub requests: &'static [(&'static str, u16)],
+    pub timeout_ms: u64,
+}
+
+/// Большой файл, скачиваемый у гостя.
+pub struct HttpBulk {
+    pub path: &'static str,
+    /// Сколько байт обязано приехать.
+    pub bytes: u64,
+    /// Чем проверяется содержимое.
+    pub pattern: Pattern,
+    pub timeout_ms: u64,
+}
+
+/// Узор, по которому проверяется скачанное.
+///
+/// Узор, а не контрольная сумма целиком: сумма скажет «не совпало», а узор —
+/// **номер первого разошедшегося байта**, то есть место, где в потоке
+/// переставились или потерялись данные.
+#[derive(Clone, Copy)]
+pub enum Pattern {
+    /// Тот же узор, которым заполнен `/media/big.dat` (см.
+    /// [`crate::package::big_file_byte`]).
+    BigFile,
+    /// `index % 251` — им заполнены файлы сервера-собеседника на хосте.
+    Modulo,
+}
+
+/// Сколько байт отдаёт `/stream.bin` сервера-собеседника на хосте.
+///
+/// Четверть мегабайта: больше сорока сегментов TCP в каждую сторону — то есть
+/// обмен, на котором видно и окно, и подтверждения по ходу, — и при этом он
+/// проходит за секунды даже под эмуляцией.
+pub const SITE_STREAM_BYTES: usize = 256 * 1024;
+
+/// Несколько одновременных запросов.
+pub struct HttpMany {
+    pub path: &'static str,
+    /// Сколько соединений открыть разом.
+    pub count: usize,
+    /// Что обязано найтись в каждом ответе.
+    pub contains: &'static str,
+    pub timeout_ms: u64,
 }
 
 /// Что обязано найтись на томе после сценария.
@@ -446,6 +558,15 @@ pub struct Scenario {
     /// подписанный чужим ключом, с правильно подписанным индексом. Без него
     /// проверка «обновление поставилось» ничего не доказывает.
     pub host_repo: bool,
+    /// Поднять на хосте **обычный веб-сервер**, которого проксирует гость.
+    ///
+    /// Обратный прокси без того, кого он проксирует, — это половина проверки:
+    /// ответ `502` доказывает только то, что мы умеем отказывать. Сервер
+    /// раздаёт три документа (текст, поток в четверть мегабайта и ответ
+    /// кусками, которого наш прокси принять не должен), а номер его порта
+    /// уезжает в команду гостю подстановкой `{site}` — по той же причине, что и
+    /// `{echo}`: у каждого воркера он свой.
+    pub host_site: bool,
     /// Архитектуры, на которых сценарий имеет смысл. Пусто — все.
     pub arches: &'static [Arch],
     /// Сценарий **намеренно** перезагружает машину.
@@ -613,6 +734,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -655,6 +777,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -718,6 +841,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -765,6 +889,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -817,6 +942,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -877,6 +1003,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -920,6 +1047,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1150,6 +1278,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1322,10 +1451,10 @@ pub const ALL: &[Scenario] = &[
             // печатает `help`. Число программ в `/bin` — точным числом: оно от
             // экрана не зависит и меняется только вместе с `USER_PROGRAMS` в
             // `build.rs` и `C_PROGRAMS` в `cbuild.rs`, минус скрытый `init`.
-            // Тридцать девять с канарейками стека (`smash` и `csmash`);
+            // Сорок с веб-сервером (`httpd`, пункт 4 очереди второго разбора);
             // `zdemo` собирается только там, где выполнена
-            // `cargo xtask thirdparty`, и без неё здесь будет 38.
-            Step::Expect("/bin holds 39 programs"),
+            // `cargo xtask thirdparty`, и без неё здесь будет 39.
+            Step::Expect("/bin holds 40 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -1426,6 +1555,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1499,6 +1629,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1719,6 +1850,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1795,6 +1927,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -1863,6 +1996,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[Arch::X86_64],
         reboots: false,
         updates: false,
@@ -1907,6 +2041,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2085,6 +2220,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2170,6 +2306,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         // Обе архитектуры, и это не симметрия ради симметрии. Блочная запись —
         // единственное место фазы, где код у них **разный** по существу: на
         // x86-64 крупная страница это бит PS в записи каталога, на AArch64 —
@@ -2292,6 +2429,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2355,6 +2493,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2486,6 +2625,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2547,6 +2687,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2601,6 +2742,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2624,6 +2766,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         // Только AArch64: на x86-64 GIC не существует.
         arches: &[Arch::Aarch64],
         reboots: false,
@@ -2652,6 +2795,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2720,6 +2864,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2784,6 +2929,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2847,6 +2993,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2891,6 +3038,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         // Только AArch64: на x86-64 GIC не существует.
         arches: &[Arch::Aarch64],
         reboots: false,
@@ -2937,6 +3085,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -2969,6 +3118,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -3002,6 +3152,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         // Сценарий **намеренно** перезагружает машину: проверяется, куда она
         // пойдёт после установки, а с `-no-reboot` она вместо этого погасла бы.
@@ -3086,6 +3237,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -3270,6 +3422,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -3360,6 +3513,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -3436,6 +3590,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -3484,6 +3639,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -3658,6 +3814,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -4300,6 +4457,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -4376,6 +4534,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -4433,6 +4592,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -4485,6 +4645,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[Arch::X86_64],
         reboots: false,
         updates: false,
@@ -4600,6 +4761,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         // Единственный сценарий, в котором перезагрузка — цель, а не симптом.
         reboots: true,
@@ -4670,6 +4832,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         // Сброс посреди работы — это и есть та поломка, ради которой фаза
         // существует; после него машина обязана подняться сама.
@@ -4732,6 +4895,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -4799,6 +4963,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -4843,6 +5008,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -4881,6 +5047,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         // Только x86-64, и это не упущение. В QEMU `virt` кнопку приносит ACPI
         // GED, описанный в AML: без интерпретатора событие не разобрать, и ядро
         // говорит об этом вслух при загрузке. Проверяем то, что работает.
@@ -4920,6 +5087,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -4976,6 +5144,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -5026,6 +5195,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -5254,6 +5424,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -5311,6 +5482,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -5397,6 +5569,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 22,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -5517,6 +5690,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 22,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -5592,6 +5766,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 22,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -5798,6 +5973,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         // Четыре загрузки в одном процессе QEMU: три неудачные попытки и
         // возврат.
@@ -5886,6 +6062,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         // Две загрузки в одном процессе: до обновления и после.
         reboots: true,
@@ -5981,6 +6158,7 @@ pub const ALL: &[Scenario] = &[
         host_echo: false,
         // Сервер обновлений на хосте, репозиторий и `/etc/update.cfg` гостю.
         host_repo: true,
+        host_site: false,
         arches: &[],
         // Две загрузки в одном процессе: до обновления и после.
         reboots: true,
@@ -6085,6 +6263,7 @@ pub const ALL: &[Scenario] = &[
         // гостя с тремя адресами и корнем стенда. Серверов при этом поднимается
         // три — обычный и два по HTTPS, с разными корнями.
         host_repo: true,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -6173,6 +6352,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -6269,6 +6449,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 2000,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: true,
         updates: false,
@@ -6539,6 +6720,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -6601,6 +6783,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -6649,6 +6832,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -6722,6 +6906,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 22,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -6785,6 +6970,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 2000,
         host_echo: true,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -6847,6 +7033,317 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "httpd",
+        about: "Веб-сервер системы: страница, отказы, обратный прокси, счётчики и четыре соединения сразу.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 8080,
+        host_echo: false,
+        host_repo: false,
+        host_site: true,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            // «Живая» загрузка, а не установленная система, и это не мелочь:
+            // сценарий на установленном диске берёт программу **с диска**, то
+            // есть ту, которую положил туда предыдущий прогон установки. Первая
+            // же правка сервера проверялась бы тогда вхолостую. Сайт и
+            // умолчания на «живой» системе те же самые — они лежат в образе
+            // RAM-диска, откуда установщик их и берёт.
+            //
+            // Адрес берётся у DHCP: сервер, которому его задали руками,
+            // проверял бы меньше.
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
+            Step::Wait(2_000),
+
+            // Порт и корень сервер берёт из своих умолчаний в образе, а
+            // подставленный каталог и собеседника — из команды. Номер порта
+            // собеседника у каждого воркера свой, отсюда `{site}`.
+            Step::Line("run -b /bin/httpd --mount /files /media --proxy /up 10.0.2.2 {site}"),
+            Step::AwaitAny("httpd: settings from /usr/share/defaults/etc/httpd.cfg", 30_000),
+            Step::AwaitAny("httpd: listening on port 8080, root /usr/share/httpd", 30_000),
+            Step::AwaitAny("httpd: mount /files -> /media", 15_000),
+            Step::AwaitAny("httpd: proxy /up -> 10.0.2.2:{site}", 15_000),
+
+            // Страница по умолчанию. Каталог отдаётся своим `index.html`, тип
+            // берётся из расширения.
+            Step::Http(HttpGet {
+                path: "/",
+                method: "",
+                raw: "",
+                status: 200,
+                contains: &["text/html; charset=utf-8", "It works", "FreeOpenSourceSystemAI"],
+                absent: &[],
+                body_len: None,
+                timeout_ms: 30_000,
+            }),
+            // И то же самое видно с другой стороны — в журнале гостя.
+            Step::AwaitAny("httpd: GET / HTTP/1.1 -> 200,", 15_000),
+
+            // Второй файл той же страницы: сервер отдаёт больше одного файла, и
+            // тип у него другой.
+            Step::Http(HttpGet {
+                path: "/style.css",
+                method: "",
+                raw: "",
+                status: 200,
+                contains: &["text/css; charset=utf-8", "max-width"],
+                absent: &[],
+                body_len: None,
+                timeout_ms: 30_000,
+            }),
+
+            // Чего нет — того нет.
+            Step::Http(HttpGet::get("/nothing.html", 404)),
+            // Каталог без `index.html` — это `404`, а не список файлов: имена
+            // того, что лежит на диске, наружу не показывают.
+            Step::Http(HttpGet::get("/files/", 404)),
+
+            // `HEAD`: длина объявлена, тела нет. Прокси и клиенты полагаются на
+            // это правило, и сервер, приславший тело, ломает их обоих.
+            Step::Http(HttpGet {
+                path: "/index.html",
+                method: "HEAD",
+                raw: "",
+                status: 200,
+                contains: &["Content-Length:"],
+                absent: &["It works"],
+                body_len: Some(0),
+                timeout_ms: 30_000,
+            }),
+
+            // Выход за корень — тремя написаниями, и все три отказ. Второе и
+            // третье пройдут мимо всякой проверки, сделанной до разворачивания
+            // `%XX`; в ответе при этом не должно быть ни строчки из `/etc/passwd`.
+            Step::Http(HttpGet {
+                path: "",
+                method: "",
+                raw: "GET /../etc/passwd HTTP/1.1\r\nHost: freeos\r\nConnection: close\r\n\r\n",
+                status: 400,
+                contains: &[],
+                absent: &["fnv1a64", "roman:"],
+                body_len: None,
+                timeout_ms: 30_000,
+            }),
+            Step::Http(HttpGet {
+                path: "",
+                method: "",
+                raw: "GET /%2e%2e%2fetc%2fpasswd HTTP/1.1\r\nHost: freeos\r\nConnection: close\r\n\r\n",
+                status: 400,
+                contains: &[],
+                absent: &["fnv1a64", "roman:"],
+                body_len: None,
+                timeout_ms: 30_000,
+            }),
+            Step::Http(HttpGet {
+                path: "",
+                method: "",
+                raw: "GET /files/../../etc/passwd HTTP/1.1\r\nHost: freeos\r\nConnection: close\r\n\r\n",
+                status: 400,
+                contains: &[],
+                absent: &["fnv1a64", "roman:"],
+                body_len: None,
+                timeout_ms: 30_000,
+            }),
+
+            // Тела запроса сервер не читает и говорит об этом кодом, а не
+            // молчанием.
+            Step::Http(HttpGet {
+                path: "",
+                method: "",
+                raw: "POST / HTTP/1.1\r\nHost: freeos\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody",
+                status: 405,
+                contains: &["Method Not Allowed"],
+                absent: &[],
+                body_len: None,
+                timeout_ms: 30_000,
+            }),
+
+            // Две длины тела в одном запросе — это два разных мнения о том, где
+            // он кончается. Отказ, а не выбор одного из них.
+            Step::Http(HttpGet {
+                path: "",
+                method: "",
+                raw: "GET / HTTP/1.1\r\nHost: freeos\r\nContent-Length: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                status: 400,
+                contains: &[],
+                absent: &["It works"],
+                body_len: None,
+                timeout_ms: 30_000,
+            }),
+
+            // Одинокий перевод строки посреди головы — та самая щель, через
+            // которую в прокси протаскивают лишний запрос.
+            Step::Http(HttpGet {
+                path: "",
+                method: "",
+                raw: "GET / HTTP/1.1\r\nHost: freeos\nX-Smuggled: 1\r\nConnection: close\r\n\r\n",
+                status: 400,
+                contains: &[],
+                absent: &["It works"],
+                body_len: None,
+                timeout_ms: 30_000,
+            }),
+
+            // Обратный прокси: ответ чужого сервера приходит как наш.
+            Step::Http(HttpGet {
+                path: "/up/hello.txt",
+                method: "",
+                raw: "",
+                status: 200,
+                contains: &["hello from the host"],
+                absent: &[],
+                body_len: None,
+                timeout_ms: 60_000,
+            }),
+            Step::AwaitAny("httpd: GET /up/hello.txt HTTP/1.1 -> upstream 200", 15_000),
+            // Чужой отказ передаётся как есть, а не превращается в наш.
+            Step::Http(HttpGet {
+                path: "/up/missing",
+                method: "",
+                raw: "",
+                status: 404,
+                contains: &["not here"],
+                absent: &[],
+                body_len: None,
+                timeout_ms: 60_000,
+            }),
+            // А чужие куски — не передаются вовсе: границу такого сообщения
+            // считают по-разному, и передать дальше чужой счёт значит однажды
+            // разойтись с клиентом.
+            Step::Http(HttpGet::get("/up/chunked.txt", 502)),
+
+            // Тело через прокси идёт потоком, а не собирается в памяти:
+            // четверть мегабайта проходит через буфер в восемь килобайт.
+            Step::HttpBulk(HttpBulk {
+                path: "/up/stream.bin",
+                bytes: SITE_STREAM_BYTES as u64,
+                pattern: Pattern::Modulo,
+                timeout_ms: 180_000,
+            }),
+
+            // Соединение переживает несколько запросов подряд.
+            Step::HttpSession(HttpSession {
+                requests: &[
+                    ("/", 200),
+                    // Проксированный запрос **посреди** сеанса: после него
+                    // буфер головы соединения занят чужим ответом, и сервер,
+                    // забывший его очистить, отвечает `400` на следующий
+                    // совершенно исправный запрос.
+                    ("/up/hello.txt", 200),
+                    ("/style.css", 200),
+                    ("/metrics", 200),
+                ],
+                timeout_ms: 120_000,
+            }),
+
+            // И несколько соединений живут одновременно — то, чего не проверяет
+            // ни один последовательный обмен.
+            Step::HttpMany(HttpMany {
+                path: "/",
+                count: 4,
+                contains: "It works",
+                timeout_ms: 120_000,
+            }),
+
+            // Сервер считает сам себя, и счётчики к этому моменту не нулевые.
+            Step::Http(HttpGet {
+                path: "/metrics",
+                method: "",
+                raw: "",
+                status: 200,
+                contains: &[
+                    "# TYPE freeos_httpd_requests_total counter",
+                    "freeos_httpd_sent_bytes_total",
+                    "freeos_httpd_responses_4xx_total",
+                    "freeos_httpd_proxied_total",
+                ],
+                absent: &[],
+                body_len: None,
+                timeout_ms: 30_000,
+            }),
+
+            // Счётчики ядра: сегменты ходили, повторных передач не
+            // потребовалось. Ненулевой повтор в эмуляторе означал бы, что мы
+            // теряем сегменты сами.
+            Step::Line("ip"),
+            Step::Await("0 retransmitted", 20_000),
+            // И слушающий сокет на месте: ни одно из закрытых соединений его не
+            // унесло.
+            Step::Line("tcp"),
+            Step::Await("listen", 15_000),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "httpd-load",
+        about: "Шестьдесят четыре мебибайта с диска через свой TCP наружу, с проверкой каждого байта.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 8080,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        // Только x86_64, и по той же причине, что у `filemap-big`: файл на
+        // шестьдесят четыре мебибайта стоит минут эмуляции, а проверяет он то,
+        // что от архитектуры не зависит вовсе, — окно, подтверждения и
+        // повторные передачи в одном и том же коде TCP. Сам сервер на обеих
+        // архитектурах проверяет сценарий `httpd`.
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: true,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
+
+            Step::Line("run -b /bin/httpd --mount /files /media"),
+            Step::AwaitAny("httpd: mount /files -> /media", 30_000),
+
+            // Вот она, живая нагрузка. Оба дефекта TCP, найденные фазой 39,
+            // видны только на таком обмене: таймер повторной передачи, убивавший
+            // исправное соединение через сорок секунд, и обновление окна,
+            // уходившее только при окне ровно в ноль.
+            Step::HttpBulk(HttpBulk {
+                path: "/files/big.dat",
+                bytes: crate::package::BIG_FILE_BYTES as u64,
+                pattern: Pattern::BigFile,
+                timeout_ms: 900_000,
+            }),
+            Step::AwaitAny("httpd: GET /files/big.dat HTTP/1.1 -> 200,", 30_000),
+
+            Step::Line("ip"),
+            Step::Await("0 retransmitted", 20_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "dns",
         about: "Имя превращается в адрес: запрос уходит серверу, которого назвал DHCP.",
         target: Target::Live,
@@ -6860,6 +7357,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -6915,6 +7413,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -6993,6 +7492,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -7068,6 +7568,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -7176,6 +7677,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -7268,6 +7770,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -7381,6 +7884,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -7431,6 +7935,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,
@@ -7535,6 +8040,7 @@ pub const ALL: &[Scenario] = &[
         guest_port: 0,
         host_echo: false,
         host_repo: false,
+        host_site: false,
         arches: &[],
         reboots: false,
         updates: false,

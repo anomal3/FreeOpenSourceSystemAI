@@ -208,6 +208,18 @@ pub fn probe() -> Result<Payload, Error> {
         }
     }
 
+    // Сайт по умолчанию. Его отсутствие установку не срывает: сервер без
+    // страницы отвечает `404`, и это честнее несостоявшейся установки.
+    for (source, target) in SITE {
+        match stat(&mut root, source, What::Defaults) {
+            Ok(size) => {
+                logln!("[payload] site file {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Defaults, size });
+            }
+            Err(_) => logln!("[payload] {source} is missing; /bin/httpd will have no page"),
+        }
+    }
+
     for (source, target) in PACKAGES {
         match stat(&mut root, source, What::Package) {
             Ok(size) => {
@@ -245,7 +257,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 40] = [
+const PROGRAMS: [(&CStr16, &str); 41] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -307,6 +319,11 @@ const PROGRAMS: [(&CStr16, &str); 40] = [
     // То же переполнение стека, что и `smash`, но на C: канарейку ставит
     // `clang`, а `__stack_chk_fail` — стартовый код `crt0.c`.
     (cstr16!("\\FREEOS\\BIN\\CSMASH"), "csmash"),
+    // Веб-сервер (пункт 4 очереди второго разбора). Едет вместе со своим сайтом
+    // (`SITE` ниже) и своими умолчаниями, но сам не запускается: службой он не
+    // объявлен нарочно — машина, отвечающая на порт потому, что кто-то поставил
+    // систему, отвечает на него без ведома хозяина.
+    (cstr16!("\\FREEOS\\BIN\\HTTPD"), "httpd"),
 ];
 
 /// Эталонные настройки на носителе и их пути в корневом образе.
@@ -315,7 +332,7 @@ const PROGRAMS: [(&CStr16, &str); 40] = [
 /// же комплект, разложенный по носителю. Расхождение видно не сразу: система
 /// установится и заработает, а обнаружится пропажа тем, что нужная настройка не
 /// имеет умолчания — то есть службой, которая не запустилась.
-const DEFAULTS: [(&CStr16, &str); 3] = [
+const DEFAULTS: [(&CStr16, &str); 4] = [
     (
         cstr16!("\\FREEOS\\DEF\\SERVICES"),
         "usr/share/defaults/etc/services",
@@ -331,6 +348,23 @@ const DEFAULTS: [(&CStr16, &str); 3] = [
         cstr16!("\\FREEOS\\DEF\\CA.PEM"),
         "usr/share/defaults/etc/ca.pem",
     ),
+    // Настройки веб-сервера. Без них `/bin/httpd` работает на своих
+    // умолчаниях, но человеку, открывшему `/etc`, нечего править.
+    (
+        cstr16!("\\FREEOS\\DEF\\HTTPD.CFG"),
+        "usr/share/defaults/etc/httpd.cfg",
+    ),
+];
+
+/// Страница, которую веб-сервер отдаёт по умолчанию, и её оформление.
+///
+/// Список обязан совпадать с `PAYLOAD_SITE` в `xtask/src/arch.rs`. Файлов два, и
+/// второй не для красоты: страница со ссылкой на таблицу стилей — это проверка
+/// того, что сервер отдаёт больше одного файла и берёт тип содержимого из
+/// расширения имени.
+const SITE: [(&CStr16, &str); 2] = [
+    (cstr16!("\\FREEOS\\WWW\\INDEX.HTM"), "usr/share/httpd/index.html"),
+    (cstr16!("\\FREEOS\\WWW\\STYLE.CSS"), "usr/share/httpd/style.css"),
 ];
 
 /// Своя среда .NET на носителе и её пути в корневом образе (фаза N5a).
