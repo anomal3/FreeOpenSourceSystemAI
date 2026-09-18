@@ -255,9 +255,18 @@ pub fn census_text() -> String {
                 String::from("NO DRIVER IN THIS KERNEL")
             }
         };
+        // Чем устройство умеет прерывать. Спрашивается у самого устройства, а
+        // не берётся из справочника: «у этой модели есть MSI» — утверждение о
+        // модели, а нужно утверждение об этой машине. Без этой колонки вопрос
+        // «почему драйвер остался на опросе» приходится выяснять правкой кода.
+        let signalling = match (device.msix(), device.msi()) {
+            (Some(msix), _) => alloc::format!("MSI-X x{}", msix.vectors),
+            (None, Some(_)) => String::from("MSI"),
+            (None, None) => String::from("INTx only"),
+        };
         let _ = writeln!(
             out,
-            "{} {:04x}:{:04x} class {:02x}:{:02x}:{:02x} {:<24} -- {verdict}",
+            "{} {:04x}:{:04x} class {:02x}:{:02x}:{:02x} {:<24} {:<10} -- {verdict}",
             device.address,
             device.vendor,
             device.device,
@@ -265,6 +274,7 @@ pub fn census_text() -> String {
             device.subclass,
             device.prog_if,
             class_name(device.class, device.subclass, device.prog_if),
+            signalling,
         );
     }
     let _ = writeln!(out, "{} function(s) on the bus, {without} of them without a driver", found.len());
