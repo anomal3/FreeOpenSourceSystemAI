@@ -1451,10 +1451,10 @@ pub const ALL: &[Scenario] = &[
             // печатает `help`. Число программ в `/bin` — точным числом: оно от
             // экрана не зависит и меняется только вместе с `USER_PROGRAMS` в
             // `build.rs` и `C_PROGRAMS` в `cbuild.rs`, минус скрытый `init`.
-            // Сорок с веб-сервером (`httpd`, пункт 4 очереди второго разбора);
-            // `zdemo` собирается только там, где выполнена
-            // `cargo xtask thirdparty`, и без неё здесь будет 39.
-            Step::Expect("/bin holds 40 programs"),
+            // Сорок одна: веб-сервер (`httpd`) и Lua (пункты 4 и 5 очереди
+            // второго разбора). `zdemo` и `lua` собираются только там, где
+            // выполнена `cargo xtask thirdparty`, и без неё здесь будет 39.
+            Step::Expect("/bin holds 41 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -3535,6 +3535,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("cdemo: starting, writing under /home/roman", 30_000),
             // Строки и форматирование. Здесь нет ничего от системы: сломайся
             // это, сломана сама библиотека, а не порт.
+            // Массив аргументов заканчивается нулевым указателем — требование
+            // языка C, которое наши программы не замечали, а чужая заметила
+            // падением (см. `place_args` в ядре).
+            Step::Await("cdemo: ok argv ends with a null pointer", 15_000),
             Step::Await("cdemo: ok strings and snprintf", 15_000),
             // `qsort` зовёт нашу функцию обратно — то есть проверяет указатель
             // на функцию. Он живёт по адресу 512 ГиБ и не влезает в тридцать
@@ -7026,6 +7030,88 @@ pub const ALL: &[Scenario] = &[
             // смотрит на то, что уже пришло, и падал здесь через раз — на
             // «0 retransmitte».
             Step::Await("0 retransmitted", 15_000),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "lua",
+        about: "Чужой язык целиком: Lua 5.4.9 из неправленых исходников считает, ошибается, пишет файлы и запускает программы.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            // Установленная система, а не «живая»: половина проверки — про
+            // файлы, а корень живой системы лежит в памяти и только на чтение.
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+
+            // Сначала — что программа вообще запускается и знает, кто она.
+            Step::Line("lua -v"),
+            Step::Await("Lua 5.4.9", 30_000),
+
+            // Выражение из командной строки: разбор, виртуальная машина и вывод
+            // за один заход, без единого файла.
+            // Без пробелов внутри выражения, и это не стеснительность: кавычек
+            // наша оболочка не разбирает нарочно (см. разбор строки запуска в
+            // ядре), поэтому выражение с пробелом приехало бы в Lua разорванным
+            // на слова. Ограничение настоящее, и записано оно в ROADMAP.
+            Step::Line("lua -e print(('freeos'):upper()..6*7)"),
+            Step::Await("FREEOS42", 30_000),
+
+            // И весь образец целиком. Каждая строка ниже — свой слой языка;
+            // порядок тот же, в каком они печатаются.
+            Step::Line("lua /usr/share/lua/demo.lua /home/roman"),
+            Step::Await("demo: Lua 5.4", 60_000),
+            Step::Await("demo: sum 1..100 = 5050, 7//2 = 3, 7%2 = 1, sqrt(2) = 1.41421", 30_000),
+            Step::Await("demo: FreeOpenSourceSystemAI has 22 letters and 10 vowels, upper starts FREEOPE", 30_000),
+            Step::Await("demo: sorted dhcp httpd init lua sshd", 30_000),
+            Step::Await("demo: httpd is 5 letters, lua is 3", 30_000),
+            Step::Await("demo: closure counted 3", 30_000),
+            Step::Await("demo: vector (4,6)", 30_000),
+            // Сопрограммы — это своя передача управления внутри одной задачи:
+            // потоков в системе нет вовсе, а Lua их и не просит.
+            Step::Await("demo: coroutine 10 15 20", 30_000),
+            Step::Await("demo: pcall returned false and said intended failure", 30_000),
+            // Сборщик мусора: сто тысяч таблиц созданы и убраны, и куча после
+            // этого не растёт. Числа не сверяются — сверяется, что строка есть
+            // и что программа дожила до неё.
+            Step::AwaitAny("demo: gc kept", 60_000),
+
+            // Дальше язык кончается и начинается система: файлы через нашу
+            // libc, `rename` — новый системный вызов в ней (его не хватило
+            // именно здесь), и запуск другой программы через `system`.
+            Step::Await("demo: wrote and read back 5 lines, 30 bytes", 30_000),
+            Step::Await("demo: renamed and removed, first line was 'line 1'", 30_000),
+            Step::AwaitAny("demo: clock says", 30_000),
+            // `os.execute` действительно запускает программу — её вывод
+            // приходит в ту же серийную линию.
+            Step::Await("hello from userspace", 30_000),
+            Step::Await("demo: os.execute returned true", 30_000),
+            Step::Await("demo: done", 30_000),
+
+            // Файлов за собой сценарий не оставил: последний шаг образца —
+            // удаление, и проверяется это оболочкой, а не самим Lua.
+            Step::Line("ls /home/roman"),
+            Step::Absent("lua-demo"),
 
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),

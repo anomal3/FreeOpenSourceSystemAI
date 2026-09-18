@@ -289,6 +289,14 @@ pub const PAYLOAD_DEFAULTS: [(&str, &str); 4] = [
     ("httpd.cfg", "HTTPD.CFG"),
 ];
 
+/// Каталог образцов Lua на установочном носителе.
+pub const PAYLOAD_LUA_DIR: &str = "FREEOS/LUA";
+
+/// Что из `initrd/usr/share/lua/` едет на носитель и под каким именем 8.3.
+///
+/// Список обязан совпадать с `LUA` в `crates/installer/src/payload.rs`.
+pub const PAYLOAD_LUA: [(&str, &str); 1] = [("demo.lua", "DEMO.LUA")];
+
 /// Каталог сайта по умолчанию на установочном носителе.
 pub const PAYLOAD_SITE_DIR: &str = "FREEOS/WWW";
 

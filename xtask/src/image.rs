@@ -265,6 +265,15 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
             // Образцовые пакеты. Имена на носителе — короткие 8.3, потому что
             // это FAT; настоящие имена (`hello-1.0.fpk`) знает установщик и
             // ставит файлы под ними в `/media`.
+            // Образец сценария на Lua — из того же `initrd/`.
+            for (name, medium) in arch::PAYLOAD_LUA {
+                let target = format!("{}/{medium}", arch::PAYLOAD_LUA_DIR);
+                payload.push(read_payload(
+                    &target,
+                    &paths::initrd_source_dir().join("usr/share/lua").join(name),
+                )?);
+            }
+
             // Сайт, который веб-сервер отдаёт по умолчанию, — из того же
             // `initrd/` и тем же способом, что и эталонные настройки.
             for (name, medium) in arch::PAYLOAD_SITE {

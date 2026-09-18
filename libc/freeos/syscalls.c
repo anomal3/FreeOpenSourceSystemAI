@@ -232,6 +232,80 @@ int unlink(const char *path) {
     return code < 0 ? set_errno(code) : 0;
 }
 
+/* Столько же, сколько принимает ядро (`MAX_PATH` в `user/syscall.rs`): путь
+ * длиннее оно отвергает само, и складывать такой буфер незачем. */
+enum { PATH_LIMIT = 255 };
+
+int rename(const char *from, const char *to) {
+    /* Оба пути уезжают одним буфером: у вызова три аргумента, а значений нужно
+     * четыре — два адреса и две длины. Склейку разбирает ядро по первой длине;
+     * тот же приём и в обёртке для Rust, и расходиться им нельзя. */
+    size_t from_len = strlen(from);
+    size_t to_len = strlen(to);
+    char joined[2 * PATH_LIMIT];
+    if (from_len == 0 || to_len == 0 || from_len + to_len > sizeof(joined)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(joined, from, from_len);
+    memcpy(joined + from_len, to, to_len);
+    long code = freeos_syscall(SYS_RENAME, (long)joined, (long)from_len,
+                               (long)(from_len + to_len));
+    return code < 0 ? set_errno(code) : 0;
+}
+
+/* ── Запуск другой программы ─────────────────────────────────────────────── */
+
+/* `system` есть, а оболочки нет — и это не одно и то же.
+ *
+ * picolibc приносит свою `system`, написанную через `fork`+`execve`+`waitpid`.
+ * Ни одного из этих трёх вызовов у нас нет и не будет в таком виде: `fork`
+ * означает копию адресного пространства, которую наша модель памяти не делает
+ * вовсе. Поэтому `system` здесь своя, и компоновщик берёт именно её — `-lfreeos`
+ * стоит перед `-lc`.
+ *
+ * Делает она ровно то, что умеет система: отдаёт строку тому же разборщику
+ * команд, которым пользуется оболочка (`SYS_SPAWN`), и дожидается конца
+ * (`SYS_WAIT`). Этого хватает для `os.execute("ls /bin")` и не хватает ни для
+ * чего из того, что делает настоящий `sh`.
+ *
+ * Отсюда два решения, и оба названы вслух:
+ *
+ * 1. **`system(NULL)` отвечает единицей.** Командный исполнитель есть — просто
+ *    он не `sh`. Ответить нулём значило бы сказать программе «запускать нечего»,
+ *    и она не стала бы и пробовать то, что у нас прекрасно работает.
+ * 2. **Строка со знаками оболочки отвергается.** `|`, `>`, `<`, `&`, `;`, `$`,
+ *    кавычка с обратным наклоном — всё это мы исполнить не можем, а выполнить
+ *    команду, выбросив половину строки, — худший из возможных ответов: тихий и
+ *    неверный. Такой вызов возвращает -1 и `ENOTSUP`.
+ *
+ * Код возврата переводится так же, как это делает настоящий `system`: значение
+ * годится для `WEXITSTATUS`, то есть код программы уезжает в старший байт. */
+int system(const char *command) {
+    if (command == NULL) {
+        return 1;
+    }
+    for (const char *at = command; *at != '\0'; at++) {
+        if (strchr("|<>&;$`", *at) != NULL) {
+            errno = ENOTSUP;
+            return -1;
+        }
+    }
+    long task = freeos_syscall(SYS_SPAWN, (long)command, (long)strlen(command),
+                               FREEOS_SPAWN_INHERIT);
+    if (task < 0) {
+        return set_errno(task);
+    }
+    long code = freeos_syscall(SYS_WAIT, task, 0, 0);
+    if (code < 0) {
+        return set_errno(code);
+    }
+    /* Как у POSIX: младший байт — сигнал, которого у нас не бывает, старший —
+     * код возврата. Программа на C разбирает это `WEXITSTATUS`, и выдумывать
+     * своё соглашение значило бы сломать её разбор. */
+    return (int)((code & 0xff) << 8);
+}
+
 /* ── Время ───────────────────────────────────────────────────────────────── */
 
 int gettimeofday(struct timeval *now, void *timezone) {

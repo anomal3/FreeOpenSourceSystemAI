@@ -783,6 +783,7 @@ mod tests {
             .iter()
             .copied()
             .chain(crate::cbuild::C_PROGRAMS.iter().map(|program| program.name))
+            .chain(crate::cbuild::FOREIGN_PROGRAMS)
             .collect();
 
         let missing: Vec<&&str> = expected

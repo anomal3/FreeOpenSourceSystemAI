@@ -208,6 +208,17 @@ pub fn probe() -> Result<Payload, Error> {
         }
     }
 
+    // Образец сценария на Lua — тем же шагом и по той же причине, что настройки.
+    for (source, target) in LUA {
+        match stat(&mut root, source, What::Defaults) {
+            Ok(size) => {
+                logln!("[payload] lua sample {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Defaults, size });
+            }
+            Err(_) => logln!("[payload] {source} is missing; /bin/lua will have no sample"),
+        }
+    }
+
     // Сайт по умолчанию. Его отсутствие установку не срывает: сервер без
     // страницы отвечает `404`, и это честнее несостоявшейся установки.
     for (source, target) in SITE {
@@ -257,7 +268,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 41] = [
+const PROGRAMS: [(&CStr16, &str); 42] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -324,6 +335,10 @@ const PROGRAMS: [(&CStr16, &str); 41] = [
     // объявлен нарочно — машина, отвечающая на порт потому, что кто-то поставил
     // систему, отвечает на него без ведома хозяина.
     (cstr16!("\\FREEOS\\BIN\\HTTPD"), "httpd"),
+    // Lua 5.4.9, собранная нашим набором из неправленых исходников (пункт 5
+    // очереди второго разбора). Для установщика она ничем не отличается от
+    // остальных: тот же ELF, то же место на носителе, то же имя в `/bin`.
+    (cstr16!("\\FREEOS\\BIN\\LUA"), "lua"),
 ];
 
 /// Эталонные настройки на носителе и их пути в корневом образе.
@@ -355,6 +370,14 @@ const DEFAULTS: [(&CStr16, &str); 4] = [
         "usr/share/defaults/etc/httpd.cfg",
     ),
 ];
+
+/// Образец сценария на Lua и его путь в корневом образе.
+///
+/// Список обязан совпадать с `PAYLOAD_LUA` в `xtask/src/arch.rs`. Один файл, и
+/// он не украшение: сценарий, лежащий в системе, — это то, на чём проверяют,
+/// что язык в ней работает, не набирая программу руками в терминале.
+const LUA: [(&CStr16, &str); 1] =
+    [(cstr16!("\\FREEOS\\LUA\\DEMO.LUA"), "usr/share/lua/demo.lua")];
 
 /// Страница, которую веб-сервер отдаёт по умолчанию, и её оформление.
 ///

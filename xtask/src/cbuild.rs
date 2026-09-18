@@ -153,6 +153,19 @@ pub const C_PROGRAMS: [CProgram; 3] = [
     CProgram { name: "zdemo", needs: Some("libz.a"), libs: &["libz.a"] },
 ];
 
+/// Программы, которые собрал **не наш** компилятор и не наш рецепт.
+///
+/// Появляются в `sysroot/<арх>/bin/` после `cargo xtask thirdparty` и едут в
+/// образ как есть — их уже собрала своя сборочная система. Пересобирать их
+/// здесь было бы ровно той подгонкой, против которой написана вся проверка
+/// чужого кода: наш список файлов вместо их `Makefile`.
+///
+/// `luac` (сборщик байткода Lua) в этот список не входит: он собирается вместе
+/// с `lua` и лежит в наборе, но в образ не едет. Скрипты у нас исполняются
+/// исходниками, а четверть мегабайта в `/bin` ради возможности заранее собрать
+/// их в байткод — цена без спроса.
+pub const FOREIGN_PROGRAMS: [&str; 1] = ["lua"];
+
 /// Корень всего, что собрано из чужих исходников.
 ///
 /// Под `build/`, то есть вне репозитория: это результат сборки, а не наш код.
@@ -516,6 +529,21 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
         link(&objects, &libs, &output)?;
         built.push((program.name, output));
     }
+
+    // Чужие программы берутся готовыми. Нет — значит `cargo xtask thirdparty`
+    // на этой машине не выполнялась, и это не ошибка: система обязана
+    // собираться и без неё, только без этих программ.
+    for name in FOREIGN_PROGRAMS {
+        let ready = sysroot.join("bin").join(name);
+        if ready.is_file() {
+            built.push((name, ready));
+        } else {
+            say!(
+                "{name} пропущена: нет {} — собрать: cargo xtask thirdparty",
+                ready.display()
+            );
+        }
+    }
     Ok(built)
 }
 
@@ -706,6 +734,8 @@ mod tests {
             "SYS_SEEK" => abi::SYS_SEEK as i64,
             "SYS_TIME" => abi::SYS_TIME as i64,
             "SYS_RENAME" => abi::SYS_RENAME as i64,
+            "SYS_SPAWN" => abi::SYS_SPAWN as i64,
+            "SYS_WAIT" => abi::SYS_WAIT as i64,
             "SYS_CREATE" => abi::SYS_CREATE as i64,
             "SYS_RANDOM" => abi::SYS_RANDOM as i64,
             "SYS_MMAP" => abi::SYS_MMAP as i64,
@@ -731,6 +761,8 @@ mod tests {
             "KIND_FILE" => abi::KIND_FILE as i64,
             "KIND_DIRECTORY" => abi::KIND_DIRECTORY as i64,
             "KIND_PIPE" => abi::KIND_PIPE as i64,
+
+            "SPAWN_INHERIT" => abi::SPAWN_INHERIT as i64,
 
             "CLOCK_REALTIME" => abi::CLOCK_REALTIME as i64,
             "CLOCK_MONOTONIC" => abi::CLOCK_MONOTONIC as i64,

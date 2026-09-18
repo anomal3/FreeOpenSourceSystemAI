@@ -36,6 +36,8 @@
 #define SYS_SEEK 15
 #define SYS_TIME 16
 #define SYS_RENAME 20
+#define SYS_SPAWN 21
+#define SYS_WAIT 22
 #define SYS_CREATE 23
 #define SYS_RANDOM 38
 #define SYS_MMAP 42
@@ -63,6 +65,10 @@
 #define FREEOS_KIND_FILE 1
 #define FREEOS_KIND_DIRECTORY 2
 #define FREEOS_KIND_PIPE 3
+
+/* `кто` у `SYS_SPAWN`: запустить с теми же правами, что у запускающего.
+ * Минус единица, а не ноль: ноль — это root, то есть совсем другая просьба. */
+#define FREEOS_SPAWN_INHERIT (-1)
 
 #define FREEOS_CLOCK_REALTIME 0
 #define FREEOS_CLOCK_MONOTONIC 1

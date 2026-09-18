@@ -43,6 +43,24 @@ fn dir() -> PathBuf {
     sdk::root().join("thirdparty")
 }
 
+/// Чем собирается чужой проект.
+///
+/// Вид, а не общий рецепт с флажками: у zlib есть свой `configure`, у Lua его
+/// нет вовсе — и делать вид, что оба собираются одинаково, значило бы подгонять
+/// их под нас. Каждый собирается **своим** способом, тем самым, что написан в
+/// его собственной документации для кросс-сборки.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum How {
+    /// `./configure` находит набор по `CHOST`, дальше `make` и `make install`.
+    Configure,
+    /// `make <платформа>` с указанным компилятором, дальше `make install`.
+    ///
+    /// Так кросс-собирают Lua: `configure` у него нет, платформа выбирается
+    /// целью, а компилятор передаётся переменной — ровно это и написано в его
+    /// `doc/readme.html`.
+    MakePlatform(&'static str),
+}
+
 /// Чужой проект: как его зовут, откуда брать и чем проверить.
 struct Project {
     name: &'static str,
@@ -53,6 +71,13 @@ struct Project {
     sha256: &'static str,
     /// Каталог, который появляется после распаковки.
     unpacked: &'static str,
+    how: How,
+    /// Что обязано появиться в наборе после установки. Пусто — не проверять.
+    ///
+    /// Проверка не формальность: `make install`, не нашедший чего-нибудь,
+    /// охотно заканчивается успехом, и тогда «проект собран» значит «проект
+    /// собран неизвестно куда».
+    installs: &'static [&'static str],
 }
 
 /// Чем проверяется набор.
@@ -61,13 +86,37 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 1] = [Project {
-    name: "zlib",
-    version: "1.3.1",
-    url: "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
-    sha256: "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
-    unpacked: "zlib-1.3.1",
-}];
+const PROJECTS: [Project; 2] = [
+    Project {
+        name: "zlib",
+        version: "1.3.1",
+        url: "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
+        sha256: "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+        unpacked: "zlib-1.3.1",
+        how: How::Configure,
+        installs: &["lib/libz.a", "include/zlib.h"],
+    },
+    // Lua — второй чужой проект и первый, который едет в систему **программой**,
+    // а не библиотекой. Выбран он не за размер: это законченное приложение на
+    // чистом C89 без единой строки под конкретную систему, со своим сборщиком
+    // байткода, своей виртуальной машиной и своим сборщиком мусора. Из системных
+    // услуг ему нужно ровно то, чего у нас до сих пор не было: `rename` и
+    // `system` (см. `libc/freeos/syscalls.c`).
+    //
+    // Хеш — тот, что опубликован на lua.org рядом с архивом, а не тот, что
+    // приехал: сверять скачанное с ним же значит не сверять ничего.
+    Project {
+        name: "lua",
+        version: "5.4.9",
+        url: "https://www.lua.org/ftp/lua-5.4.9.tar.gz",
+        sha256: "2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6",
+        unpacked: "lua-5.4.9",
+        // `generic` — сборка без единого предположения о системе: ни POSIX, ни
+        // Linux, ни readline. Ровно то, чем мы являемся.
+        how: How::MakePlatform("generic"),
+        installs: &["bin/lua", "lib/liblua.a", "include/lua.h"],
+    },
+];
 
 /// Собрать все чужие проекты под все указанные архитектуры.
 pub fn build_all(arches: &[Arch], refresh: bool) -> Result<()> {
@@ -166,20 +215,47 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
     let triple = cbuild::c_target(arch).sdk_triple();
     let prefix = to_posix(&sysroot);
 
-    // `--static`: разделяемых библиотек в этой системе нет вовсе — нет ни
-    // динамического компоновщика, ни отображения чужого образа в чужое
-    // адресное пространство. Просить их у zlib значило бы получить отказ на
-    // шаге, к набору отношения не имеющем.
-    run_shell(
-        &work,
-        &format!("CHOST={triple} ./configure --static --prefix={prefix}"),
-        &format!("configure {} {}", project.name, arch.name()),
-    )?;
+    match project.how {
+        How::Configure => {
+            // `--static`: разделяемых библиотек в этой системе нет вовсе — нет
+            // ни динамического компоновщика, ни отображения чужого образа в
+            // чужое адресное пространство. Просить их у zlib значило бы
+            // получить отказ на шаге, к набору отношения не имеющем.
+            run_shell(
+                &work,
+                &format!("CHOST={triple} ./configure --static --prefix={prefix}"),
+                &format!("configure {} {}", project.name, arch.name()),
+            )?;
+            run_make(&work, &["libz.a"], &format!("make {}", arch.name()))?;
+            run_make(&work, &["install"], &format!("make install {}", arch.name()))?;
+        }
+        How::MakePlatform(platform) => {
+            // Компилятор передаётся переменной, и это не наша выдумка: именно
+            // так кросс-собирают Lua, и написано это в его `doc/readme.html`.
+            // Имена инструментов — с приставкой триплета, как у всякого
+            // кросс-набора; находит их `make` по PATH.
+            //
+            // `INSTALL="cp -p"` — вариант, предложенный самим его `Makefile`
+            // строкой ниже настроек. `install` на этой машине есть, но он от
+            // Git, и права `-m 0755` на файловой системе Windows означают не то
+            // же, что в Unix; `cp` честнее.
+            let recipe = format!(
+                "make -C src {platform} \
+                     CC=\"{triple}-cc -std=gnu99\" \
+                     AR=\"{triple}-ar rcu\" \
+                     RANLIB=\"{triple}-ranlib\""
+            );
+            run_shell(&work, &recipe, &format!("make {platform} {}", arch.name()))?;
+            run_shell(
+                &work,
+                &format!("make install INSTALL_TOP={prefix} INSTALL=\"cp -p\" INSTALL_EXEC=\"cp -p\" INSTALL_DATA=\"cp -p\""),
+                &format!("make install {}", arch.name()),
+            )?;
+        }
+    }
 
-    run_make(&work, &["libz.a"], &format!("make {}", arch.name()))?;
-    run_make(&work, &["install"], &format!("make install {}", arch.name()))?;
-
-    for expected in [sysroot.join("lib/libz.a"), sysroot.join("include/zlib.h")] {
+    for name in project.installs {
+        let expected = sysroot.join(name);
         if !expected.is_file() {
             bail!(
                 "{} собрался, но {} в наборе не появился",
@@ -188,12 +264,20 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
             );
         }
     }
-    let size = fs::metadata(sysroot.join("lib/libz.a"))?.len();
+    let sizes: Vec<String> = project
+        .installs
+        .iter()
+        .map(|name| {
+            let size = fs::metadata(sysroot.join(name)).map(|meta| meta.len()).unwrap_or(0);
+            format!("{name} {size} байт")
+        })
+        .collect();
     say!(
-        "{} {} для {}: libz.a {size} байт, установлен в {}",
+        "{} {} для {}: {}, установлен в {}",
         project.name,
         project.version,
         arch.name(),
+        sizes.join(", "),
         sysroot.display()
     );
     Ok(())
