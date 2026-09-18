@@ -65,6 +65,8 @@ pub enum Section {
     System,
     /// Тема, акцент, обои, высота заголовка — «Персонализация» Windows.
     Look,
+    /// Через сколько экран гаснет сам, если машину оставили в покое.
+    Power,
     /// Обзор всех разделов плитками — «Панель управления» из эскиза.
     ///
     /// Последним в списке, а не первым: на порядок первых восьми стоят шаги
@@ -73,7 +75,7 @@ pub enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 10] = [
+    const ALL: [Section; 11] = [
         Section::Display,
         Section::Clock,
         Section::Network,
@@ -83,6 +85,10 @@ impl Section {
         Section::Updates,
         Section::System,
         Section::Look,
+        // Десятым, а не рядом с «Экраном», хотя настраивает он тоже экран: на
+        // порядок первых девяти стоят шаги стенда, считающие строки клавишей
+        // «вниз», и раздел, вставленный посередине, сдвинул бы их все.
+        Section::Power,
         Section::Overview,
     ];
 
@@ -97,6 +103,7 @@ impl Section {
             Section::Updates => "Обновление",
             Section::System => "О системе",
             Section::Look => "Оформление",
+            Section::Power => "Электропитание",
             Section::Overview => "Панель управления",
         }
     }
@@ -113,6 +120,7 @@ impl Section {
             Section::Updates => "Откуда брать обновления",
             Section::System => "Версия, архитектура, память, время работы",
             Section::Look => "Тема, акцент, обои, заголовки окон",
+            Section::Power => "Через сколько гаснет экран без дела",
             Section::Overview => "",
         }
     }
@@ -133,6 +141,7 @@ impl Section {
             Section::Updates => Icon::Update,
             Section::System => Icon::Info,
             Section::Look => Icon::Sun,
+            Section::Power => Icon::Power,
             Section::Overview => Icon::Settings,
         }
     }
@@ -183,6 +192,8 @@ enum Deed {
     Accent(theme::Accent),
     Wallpaper(theme::Wallpaper),
     TitleBar(u32),
+    /// Гасить экран через столько секунд бездействия; ноль — не гасить.
+    ScreenOff(u32),
     /// Плитка обзора: открыть раздел.
     Open(Section),
     /// Выбрать часовой пояс — смещение от UTC в минутах.
@@ -465,6 +476,9 @@ impl SettingsView {
                 "Сетевой карты в этой машине нет.".to_string()
             }
             (Section::Network, _) => "Адрес этой машины: спрашивать или задать.".to_string(),
+            (Section::Power, _) => {
+                "Что делает машина, когда её оставили в покое.".to_string()
+            }
             (Section::Overview, _) => "Все разделы на одном экране.".to_string(),
             (Section::Disks, _) => "Что смонтировано и в каком это состоянии.".to_string(),
             (Section::Users, _) => "Кто может входить в эту систему.".to_string(),
@@ -508,6 +522,11 @@ impl SettingsView {
                 }
                 for height in theme::TITLE_HEIGHTS {
                     out.push(Deed::TitleBar(height));
+                }
+            }
+            Section::Power => {
+                for seconds in screen_off_options() {
+                    out.push(Deed::ScreenOff(seconds));
                 }
             }
             Section::Overview => {
@@ -901,6 +920,30 @@ impl SettingsView {
                     Err(err) => Report::bad(format!("высота применена, но не запомнена: {err}")),
                 });
             }
+            Deed::ScreenOff(seconds) => {
+                // Сначала применяется, потом записывается — как тема: настройка,
+                // которая подействует только после перезагрузки, ничем не
+                // отличается от настройки, которая не подействовала.
+                crate::power::set_screen_off_after(seconds);
+                self.report = Some(match super::prefs::store_screen_off(seconds) {
+                    Ok(()) => {
+                        // В журнал, а не только в окно: снимок экрана
+                        // доказательством не считается, и «срок запомнен»
+                        // проверяется стендом по этой строке.
+                        if seconds == 0 {
+                            kprintln!("  settings    : screen off never saved");
+                            Report::ok(String::from("экран не будет гаснуть сам"))
+                        } else {
+                            kprintln!("  settings    : screen off after {seconds} s saved");
+                            Report::ok(format!(
+                                "экран будет гаснуть через {}",
+                                screen_off_text(seconds)
+                            ))
+                        }
+                    }
+                    Err(err) => Report::bad(format!("срок применён, но не запомнен: {err}")),
+                });
+            }
             Deed::Open(section) => {
                 kprintln!("  settings    : opened {} from the overview", section.title());
                 self.show(section);
@@ -1136,7 +1179,7 @@ impl SettingsView {
 
         let groups: [(&str, &[Section]); 2] = [
             ("УСТРОЙСТВО", &[Section::Display, Section::Clock, Section::Network]),
-            ("СИСТЕМА", &[Section::Disks, Section::Programs, Section::Updates, Section::Look, Section::System]),
+            ("СИСТЕМА", &[Section::Disks, Section::Programs, Section::Updates, Section::Look, Section::Power, Section::System]),
         ];
         let row_h = ctx.px(46);
         for (caption, sections) in groups {
@@ -1312,6 +1355,7 @@ impl SettingsView {
             Section::Updates => self.draw_updates(pass, main, y),
             Section::System => self.draw_system(pass, main, y),
             Section::Look => self.draw_look(pass, main, y),
+            Section::Power => Self::draw_power(pass, main, y),
             Section::Overview => self.draw_overview(pass, main, y),
         }
         if let Some(column) = preview {
@@ -1431,9 +1475,23 @@ impl SettingsView {
         let gap = ctx.px(12);
         let cols = if main.w > ctx.px(620) { 2 } else { 1 };
         let tile_w = main.w.saturating_sub(gap * (cols - 1)) / cols;
-        let tile_h = ctx.px(96);
         let sections: Vec<Section> =
             Section::ALL.into_iter().filter(|section| *section != Section::Overview).collect();
+
+        // Высота плитки — не число, а частное: сколько осталось до низа, делить
+        // на столько рядов, сколько разделов. Плитка постоянной высоты означала
+        // бы, что с каждым новым разделом обзор молча теряет последний ряд, —
+        // и ровно это и случилось, когда разделов стало десять: «Оформление» и
+        // «Электропитание» перестали рисоваться вовсе (попадания у них при этом
+        // считались, то есть клавиатурой они открывались, а мышью — нет).
+        //
+        // Нижняя граница есть: сжимать до полоски незачем, три строки текста в
+        // плитку обязаны помещаться. Если и она не влезает, окно так мало, что
+        // разговор идёт уже не про обзор.
+        let rows = (sections.len() as u32).max(1).div_ceil(cols);
+        let room = (pass.limit - y).max(0) as u32;
+        let fit = room.saturating_sub(gap * (rows - 1)) / rows;
+        let tile_h = fit.clamp(ctx.px(72), ctx.px(96));
         for (index, section) in sections.into_iter().enumerate() {
             let col = index as u32 % cols;
             let row = index as u32 / cols;
@@ -1497,6 +1555,10 @@ impl SettingsView {
                 theme::accent().title(),
                 theme::wallpaper().title()
             ),
+            Section::Power => match crate::power::screen_off_after() {
+                0 => String::from("экран не гаснет"),
+                seconds => format!("экран гаснет через {}", screen_off_text(seconds)),
+            },
             Section::Overview => String::new(),
         }
     }
@@ -1606,6 +1668,86 @@ impl SettingsView {
         y = next;
 
         let _ = y;
+    }
+
+    /// Раздел «Электропитание».
+    ///
+    /// Настройка здесь одна, и это не заготовка. Всё остальное, чем ведает
+    /// питание, система либо делает без спроса (кнопка выключения гасит машину
+    /// сама), либо не умеет вовсе — и про «не умеет» сказано двумя строками
+    /// внизу раздела, словами. Раздел, обещающий сон и яркость, которых нет,
+    /// вреднее отсутствующего.
+    fn draw_power(pass: &mut Pass, main: Rect, y: i32) {
+        let ctx = pass.ctx;
+        let limit = crate::power::screen_off_after();
+        let rows = [
+            (
+                "Гаснет экран".to_string(),
+                if limit == 0 {
+                    "никогда".to_string()
+                } else {
+                    format!("через {}", screen_off_text(limit))
+                },
+            ),
+            // Умеет ли машина снять с себя питание — тоже про электропитание, и
+            // это не всегда «да»: у телефона на MediaTek порядок команд
+            // контроллера PMIC не описан, и кнопка там ничего не сделает.
+            //
+            // «Погашен ли экран сейчас» здесь нет нарочно: пока он погашен,
+            // кадры не собираются, и прочитать эту строку было бы некому — она
+            // всегда говорила бы «горит».
+            (
+                "Выключение".to_string(),
+                if crate::power::can_power_off() {
+                    "кнопкой питания и из меню".to_string()
+                } else {
+                    "эта машина сама не гаснет".to_string()
+                },
+            ),
+            // Откуда это берётся при загрузке — чтобы настройку можно было
+            // поправить и на машине без стола, где этого окна нет вовсе.
+            ("Настройка".to_string(), "screen_off в /etc/desktop.cfg".to_string()),
+        ];
+        let y = fact_card(pass, main, y, "ПИТАНИЕ", &rows);
+
+        let options = screen_off_options();
+        let row_h = ctx.px(30);
+        let gap = ctx.px(2);
+        let count = options.len() as u32;
+        let (list, next) = setting(
+            pass,
+            main,
+            y,
+            "Гасить экран",
+            "Любая клавиша, мышь или касание зажигают его обратно.",
+            (ctx.px(230).min(main.w), row_h * count + gap * (count - 1)),
+        );
+        for (index, seconds) in options.iter().copied().enumerate() {
+            let rect = Rect::new(list.x, list.y + (index as u32 * (row_h + gap)) as i32, list.w, row_h);
+            let focused = pass.deed(rect, Deed::ScreenOff(seconds));
+            if !pass.visible(rect) {
+                continue;
+            }
+            let label = if seconds == 0 {
+                String::from("Никогда")
+            } else {
+                screen_off_text(seconds)
+            };
+            choice_row(pass, rect, &label, limit == seconds, focused);
+        }
+
+        let y = pass.note(
+            main.x,
+            next + ctx.px(16) as i32,
+            main.w,
+            "Экран чернеет, но лампа подсветки горит: гасить её умеет монитор, а не мы.",
+        );
+        pass.note(
+            main.x,
+            y,
+            main.w,
+            "Настоящего сна (ACPI S3) здесь нет — машина не засыпает, а перестаёт рисовать.",
+        );
     }
 
     /// Раздел «Дата и время».
@@ -2308,6 +2450,54 @@ fn setting(
         }
     }
     (rect, top + body + pad)
+}
+
+/// Сроки, которые предлагает раздел «Электропитание», — вместе с тем, что
+/// стоит сейчас.
+///
+/// Текущее значение дописывается в список не про запас: срок задаётся ещё и
+/// командой `power` любым числом секунд, и список без него показывал бы отметку
+/// «СЕЙЧАС» нигде — раздел выглядел бы так, будто настройки нет вовсе.
+///
+/// Один список на отрисовку и на клавиатуру ([`SettingsView::deeds`]): два
+/// разошлись бы в первый же день, и стрелка вниз выбирала бы не то, что
+/// подсвечено.
+fn screen_off_options() -> Vec<u32> {
+    let mut out: Vec<u32> = alloc::vec![60, 300, 600, 1800];
+    let now = crate::power::screen_off_after();
+    if now != 0 && !out.contains(&now) {
+        out.push(now);
+        out.sort_unstable();
+    }
+    // «Никогда» — последним, и не потому, что это самый долгий срок: это отказ
+    // от срока, и стоять ему среди чисел не за что.
+    out.push(0);
+    out
+}
+
+/// Срок гашения словами.
+fn screen_off_text(seconds: u32) -> String {
+    match seconds {
+        0 => String::from("никогда"),
+        s if s < 60 => format!("{s} с"),
+        s if s % 60 == 0 => minutes_text(s / 60),
+        s => format!("{} мин {} с", s / 60, s % 60),
+    }
+}
+
+/// «1 минута», «5 минут», «22 минуты».
+///
+/// Число со словом, а не «5 мин.»: это не таблица, а строка, которую человек
+/// читает вслух про себя, и сокращение в ней экономит место, которого не жаль.
+fn minutes_text(count: u32) -> String {
+    let word = match (count % 10, count % 100) {
+        (1, 11) => "минут",
+        (1, _) => "минута",
+        (2..=4, 12..=14) => "минут",
+        (2..=4, _) => "минуты",
+        _ => "минут",
+    };
+    format!("{count} {word}")
 }
 
 /// Карточка с парами «подпись — значение».
