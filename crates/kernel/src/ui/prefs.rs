@@ -56,6 +56,17 @@ pub fn adopt() {
         mini_ui::theme::set_wallpaper(wall);
         crate::kprintln!("  desktop     : wallpaper {} from {}", wall.tag(), path);
     }
+    // Электропитание: через сколько гаснет экран. Здесь же, а не в своём файле,
+    // потому что это настройка того же рода — её выбирают потом и меняют часто,
+    // а установщик о ней ничего не знает.
+    if let Some(seconds) = sysconf::screen_off_seconds(text) {
+        crate::power::set_screen_off_after(seconds);
+        if seconds == 0 {
+            crate::kprintln!("  power       : screen never turns off, from {path}");
+        } else {
+            crate::kprintln!("  power       : screen off after {seconds} s, from {path}");
+        }
+    }
     if let Some(height) = sysconf::title_bar(text) {
         if mini_ui::theme::set_title_h(height) {
             crate::kprintln!("  desktop     : title bar {height} px from {path}");
@@ -81,6 +92,15 @@ pub fn store_accent(accent: mini_ui::theme::Accent) -> Result<(), crate::vfs::Vf
 /// Запомнить обои.
 pub fn store_wallpaper(wall: mini_ui::theme::Wallpaper) -> Result<(), crate::vfs::VfsError> {
     store_key("wallpaper", wall.tag())
+}
+
+/// Запомнить срок гашения экрана. Ноль — не гасить.
+pub fn store_screen_off(seconds: u32) -> Result<(), crate::vfs::VfsError> {
+    if seconds == 0 {
+        store_key("screen_off", "never")
+    } else {
+        store_key("screen_off", &alloc::format!("{seconds}"))
+    }
 }
 
 /// Запомнить высоту заголовка.

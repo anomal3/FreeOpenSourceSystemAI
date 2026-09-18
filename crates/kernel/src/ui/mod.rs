@@ -914,6 +914,29 @@ pub fn stats() -> (u64, u64, usize) {
 /// состояния. Отдельного таймера у стола нет намеренно: перерисовка из
 /// обработчика прерывания означала бы рисование под замком, взятым в
 /// произвольном месте.
+/// Погасить экран или зажечь его обратно.
+///
+/// Возвращает `false`, если стола нет вовсе: на машине в серийной консоли
+/// гасить нечего, и говорить «экран погашен» было бы неправдой.
+///
+/// Зовётся из задачи, а не из обработчика прерывания, и иначе нельзя: и
+/// заливка, и пересборка кадра берут замок стола.
+pub fn set_screen_off(off: bool) -> bool {
+    let status = if off { None } else { Some(status_now()) };
+    with_desktop(|desktop| {
+        if off {
+            desktop.blank();
+        } else {
+            desktop.unblank();
+            if let Some(status) = status.as_ref() {
+                desktop.refresh_panel(status);
+            }
+            desktop.present();
+        }
+    })
+    .is_some()
+}
+
 pub fn tick() {
     let status = status_now();
     with_desktop(|desktop| {

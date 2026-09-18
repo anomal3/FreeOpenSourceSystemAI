@@ -20,7 +20,7 @@
 //! теряет питание. Обратный порядок означал бы том, который надо чинить после
 //! каждого штатного выключения, — то есть ровно то, чего фаза 27 избегает.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::{kprintln, sched};
 
@@ -204,4 +204,115 @@ pub fn shut_down(restart: bool) {
     // и работать ей дальше — с вытеснением, как раньше.
     sched::set_preemption(true);
     announce!("  power       : the machine refused to go down");
+}
+
+// ---------------------------------------------------------------------------
+// Бездействие: экран, который гаснет сам, и машина, которая при этом не спит
+// ---------------------------------------------------------------------------
+
+/// Через сколько секунд бездействия гасить экран, если не сказано иначе.
+///
+/// Пять минут — то, что ставит своим умолчанием всякая настольная система.
+/// Меньше — человек, читающий с экрана, остаётся в темноте; больше — машина,
+/// которую забыли включённой, светит всю ночь.
+pub const DEFAULT_SCREEN_OFF_SECONDS: u32 = 300;
+
+/// Когда последний раз что-нибудь нажимали, двигали или касались, мс с загрузки.
+///
+/// Пишется из обработчика прерывания ([`crate::input::announce`]), поэтому это
+/// атомик, а не поле под замком: замок в обработчике — это остановленная
+/// машина, если он окажется занят.
+static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Через сколько секунд гасить. Ноль — не гасить вовсе.
+static SCREEN_OFF_SECONDS: AtomicU32 = AtomicU32::new(DEFAULT_SCREEN_OFF_SECONDS);
+
+/// Экран сейчас погашен.
+static SCREEN_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Значение [`LAST_INPUT_MS`] на момент гашения.
+///
+/// По нему и отличается «ввода не было» от «ввод был»: сравнивать с текущим
+/// временем бесполезно — спящая машина не знает, сколько она проспала, пока её
+/// не разбудят.
+static BLANKED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Отметить, что человек что-то сделал.
+///
+/// Зовётся на **каждое** событие ввода, из обработчика прерывания. Экран здесь
+/// не зажигается: зажечь его — значит собрать кадр, то есть взять замок стола,
+/// а этого в обработчике делать нельзя. Отметки достаточно: она разбудит
+/// задачу, а та посмотрит сюда же (см. [`idle_tick`]).
+pub fn note_input() {
+    LAST_INPUT_MS.store(crate::time::uptime_ms(), Ordering::Relaxed);
+}
+
+/// Через сколько секунд бездействия гаснет экран; ноль — никогда.
+#[must_use]
+pub fn screen_off_after() -> u32 {
+    SCREEN_OFF_SECONDS.load(Ordering::Relaxed)
+}
+
+/// Задать срок. Ноль — не гасить.
+pub fn set_screen_off_after(seconds: u32) {
+    SCREEN_OFF_SECONDS.store(seconds, Ordering::Relaxed);
+}
+
+/// Погашен ли экран прямо сейчас.
+#[must_use]
+pub fn screen_is_off() -> bool {
+    SCREEN_OFF.load(Ordering::Relaxed)
+}
+
+/// Сколько секунд никто ничего не делал.
+#[must_use]
+pub fn idle_seconds() -> u64 {
+    let last = LAST_INPUT_MS.load(Ordering::Relaxed);
+    crate::time::uptime_ms().saturating_sub(last) / 1000
+}
+
+/// Посмотреть, не пора ли погасить экран или зажечь его обратно.
+///
+/// Зовётся из цикла оболочки — то есть из задачи, где можно брать замки и
+/// собирать кадры. Возвращает `true`, если состояние изменилось: по этому
+/// признаку цикл понимает, что пора пересчитать, как долго ему спать.
+///
+/// # Почему это не «сон» в смысле ACPI
+///
+/// Потому что настоящий S3 — это сохранение состояния всей машины и вектор
+/// пробуждения в таблицах прошивки, и сделано это **не** здесь (сказано в
+/// ROADMAP). Здесь то, что даёт почти всю экономию и ничем не рискует: экран
+/// чёрный, кадры не собираются, а оболочка перестаёт просыпаться десять раз в
+/// секунду ради часов, которых никто не видит.
+pub fn idle_tick() -> bool {
+    let last = LAST_INPUT_MS.load(Ordering::Relaxed);
+    if SCREEN_OFF.load(Ordering::Relaxed) {
+        if last == BLANKED_AT.load(Ordering::Relaxed) {
+            return false;
+        }
+        // Ввод был — значит человек вернулся.
+        let slept = last.saturating_sub(BLANKED_AT.load(Ordering::Relaxed)) / 1000;
+        SCREEN_OFF.store(false, Ordering::Relaxed);
+        crate::ui::set_screen_off(false);
+        crate::kprintln!("  power       : awake, the screen was off for {slept} s");
+        return true;
+    }
+
+    let limit = SCREEN_OFF_SECONDS.load(Ordering::Relaxed);
+    if limit == 0 {
+        return false;
+    }
+    let idle_ms = crate::time::uptime_ms().saturating_sub(last);
+    if idle_ms < u64::from(limit) * 1000 {
+        return false;
+    }
+    // Гасить нечего, если рисовать некуда: на машине в серийной консоли стол не
+    // поднят, и «экран погашен» было бы неправдой.
+    if !crate::ui::set_screen_off(true) {
+        return false;
+    }
+    SCREEN_OFF.store(true, Ordering::Relaxed);
+    BLANKED_AT.store(last, Ordering::Relaxed);
+    crate::kprintln!("  power       : screen off after {limit} s without input");
+    true
 }

@@ -7037,6 +7037,83 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "screen-off",
+        about: "Экран гаснет сам после бездействия и зажигается от первой же клавиши.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+
+            // Умолчание сначала называется вслух: настройка, о которой система
+            // молчит, ничем не отличается от её отсутствия.
+            Step::Line("power"),
+            Step::Await("screen off: after 300 s without input", 15_000),
+            Step::Await("screen    : on", 15_000),
+
+            // Пять секунд вместо пяти минут — иначе сценарий ждал бы дольше,
+            // чем длится вся его остальная работа.
+            Step::Line("power 5"),
+            // Ответ у команды два: «сохранено» на установленной системе и
+            // «не сохранено, вот почему» на живой, где корень лежит в памяти.
+            // Сценарий ждёт общую часть — проверяется настройка, а не то, на
+            // чём система загружена.
+            Step::Await("screen off: after 5 s without input", 15_000),
+
+            // И ничего не трогаем. Ждём дольше срока, но меньше предела
+            // простоя сеанса (двадцать секунд на стенде): сеанс обязан дожить
+            // до пробуждения.
+            Step::Await("power       : screen off after 5 s without input", 20_000),
+            Step::Wait(1_500),
+            Step::Shot("01-dark"),
+
+            // Первая же клавиша возвращает экран. Клавиша, а не строка: «стол
+            // вернулся» — это про кадр, а строку в линию можно послать и не
+            // касаясь клавиатуры.
+            Step::Key("ret"),
+            Step::AwaitAny("power       : awake, the screen was off for", 20_000),
+            Step::Wait(2_000),
+            Step::Shot("02-awake"),
+
+            // Стол на месте и отвечает: после гашения он собрался заново, а не
+            // остался чёрным полем с курсором.
+            Step::Line("power"),
+            Step::Await("screen    : on", 15_000),
+
+            // «Никогда» — это действительно никогда: ждём дольше прежнего
+            // срока и требуем, чтобы строки гашения не было.
+            Step::Line("power never"),
+            Step::Await("screen off: never", 15_000),
+            Step::Wait(12_000),
+            Step::Line("power"),
+            // Двенадцать секунд без единого касания — вдвое больше прежнего
+            // срока. Экран при этом горит, и вот это и есть доказательство
+            // «никогда»: искать отсутствие строки в журнале бесполезно, она
+            // осталась в нём от первой половины сценария.
+            Step::Await("screen    : on", 15_000),
+
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "lua",
         about: "Чужой язык целиком: Lua 5.4.9 из неправленых исходников считает, ошибается, пишет файлы и запускает программы.",
         target: Target::Installed,

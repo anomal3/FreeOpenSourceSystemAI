@@ -68,6 +68,13 @@ const POLL_PERIOD_MS: u64 = 100;
 /// Шаг цикла, пока на столе идёт анимация: около шестидесяти кадров в секунду.
 const FRAME_PERIOD_MS: u64 = 16;
 
+/// Шаг цикла, пока экран погашен.
+///
+/// Две секунды вместо ста миллисекунд — в двадцать раз меньше пробуждений.
+/// Ноль был бы честнее по расходу, но тогда перестал бы работать предел
+/// простоя сеанса: ввод будит задачу сам, а срок — некому.
+const DARK_POLL_PERIOD_MS: u64 = 2_000;
+
 /// Сколько байт файла показывает `cat`.
 ///
 /// Предел не косметический: файл на носителе может быть любого размера, а окно
@@ -376,9 +383,83 @@ pub fn task() {
         // идти и тогда, когда никто ничего не набирает.
         // Во время анимации — кадр в шестнадцать миллисекунд, иначе прежний
         // опрос: будить стол чаще без дела значит отнимать процессор у всех.
-        let period = if ui::animating() { FRAME_PERIOD_MS } else { POLL_PERIOD_MS };
+        // Бездействие проверяется здесь, а не таймером: это единственное место
+        // в системе, которое просыпается само и при этом вправе брать замки.
+        crate::power::idle_tick();
+
+        // Пока экран погашен, часы в окне состояния не видит никто, и будить
+        // машину десять раз в секунду ради них — трата, ради устранения
+        // которой всё это и написано. Раз в две секунды — чтобы предел простоя
+        // сеанса всё-таки срабатывал.
+        let period = if ui::animating() {
+            FRAME_PERIOD_MS
+        } else if crate::power::screen_is_off() {
+            DARK_POLL_PERIOD_MS
+        } else {
+            POLL_PERIOD_MS
+        };
         let deadline = irq::ticks() + period * u64::from(irq::TIMER_HZ) / 1000;
         sched::block_on_input(deadline, || input::sequence() != seen);
+    }
+}
+
+/// Команда `power`: показать и задать, когда гаснет экран.
+///
+/// # Почему команда, а не только окно «Параметры»
+///
+/// Потому что настройка обязана быть доступна там, где есть только серийная
+/// линия: на машине без стола окна нет вовсе, а погасший экран — единственное,
+/// что человек по этой линии увидеть не может. Окно при этом тоже есть: два
+/// пути к одной настройке пишут в один и тот же файл.
+fn power_settings(argument: &str) {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        let after = crate::power::screen_off_after();
+        if after == 0 {
+            sprintln!("  screen off: never");
+        } else {
+            sprintln!("  screen off: after {after} s without input");
+        }
+        sprintln!("  idle now  : {} s", crate::power::idle_seconds());
+        sprintln!(
+            "  screen    : {}",
+            if crate::power::screen_is_off() { "off" } else { "on" }
+        );
+        sprintln!("  usage: power <seconds>|never");
+        return;
+    }
+
+    let seconds = if argument == "never" || argument == "off" {
+        Some(0)
+    } else {
+        argument.parse::<u32>().ok()
+    };
+    let Some(seconds) = seconds else {
+        sprintln!("  power: '{argument}' is neither a number of seconds nor 'never'");
+        return;
+    };
+    crate::power::set_screen_off_after(seconds);
+    // Записывается туда же, откуда читается при загрузке. Настройка, которую
+    // надо задавать заново после каждого включения, — это не настройка.
+    match ui::prefs::store_screen_off(seconds) {
+        Ok(()) => {
+            if seconds == 0 {
+                sprintln!("  screen off: never (saved)");
+            } else {
+                sprintln!("  screen off: after {seconds} s without input (saved)");
+            }
+        }
+        Err(err) => {
+            // «Живая» система пишет в образ в памяти, и записи там не переживают
+            // выключения — а чаще всего файла просто нет. Сказать об этом надо:
+            // «сохранено» о несохранённом — худшее, что может ответить
+            // настройка.
+            if seconds == 0 {
+                sprintln!("  screen off: never, but not saved: {err}");
+            } else {
+                sprintln!("  screen off: after {seconds} s without input, but not saved: {err}");
+            }
+        }
     }
 }
 
@@ -733,6 +814,7 @@ fn run_command(line: &str) -> bool {
         "mounts" => mounts(),
         "slots" => slots(),
         "sysupdate" => sysupdate(argument),
+        "power" => power_settings(argument),
         "shutdown" | "poweroff" => {
             crate::power::shut_down(false);
             // Сюда возвращаются, только если машина отказалась гаснуть: она

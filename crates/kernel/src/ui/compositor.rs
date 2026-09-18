@@ -87,6 +87,8 @@ const SHADOW_DROP: u32 = 10;
 
 pub struct Compositor {
     screen: Screen,
+    /// Экран погашен по бездействию (см. [`Compositor::blank`]).
+    blanked: bool,
     /// Снизу вверх: последнее окно поверх остальных.
     windows: Vec<Window>,
     /// Индекс активного окна.
@@ -268,6 +270,7 @@ impl Compositor {
             frames: 0,
             rects: 0,
             deferred: false,
+            blanked: false,
         };
         compositor.panel = Panel::new(
             compositor.screen.width(),
@@ -1966,9 +1969,33 @@ impl Compositor {
         self.deferred = deferred;
     }
 
+    /// Погасить экран: чёрное поле и ни одного кадра, пока не разбудят.
+    ///
+    /// Заливка идёт **мимо** обычного вывода, прямо по экрану: собирать кадр
+    /// ради одного цвета незачем, а слои при этом остаются нетронутыми — им
+    /// предстоит вернуться на экран такими же, какими были.
+    ///
+    /// Чего это **не** делает, и это стоит знать: панель не гаснет. Погасить
+    /// подсветку — значит попросить об этом монитор (DPMS) или контроллер
+    /// панели, а ни того, ни другого у нас нет. Картинка чёрная, лампа горит.
+    pub fn blank(&mut self) {
+        self.screen.fill(self.screen.bounds(), Color::rgb(0, 0, 0));
+        self.blanked = true;
+    }
+
+    /// Зажечь обратно: весь экран объявляется изменившимся и собирается заново.
+    pub fn unblank(&mut self) {
+        self.blanked = false;
+        self.repaint_all();
+    }
+
     /// Собрать кадр: вывести на экран всё, что изменилось.
     pub fn present(&mut self) {
-        if self.deferred {
+        // Погашенный экран — не то же самое, что отложенный кадр: отложенный
+        // соберётся следующим витком, а этот не соберётся, пока не придёт
+        // человек. Помеченное за это время не теряется — [`Self::unblank`]
+        // объявляет изменившимся весь экран.
+        if self.deferred || self.blanked {
             return;
         }
         self.apply_pending_size();

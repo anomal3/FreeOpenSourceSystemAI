@@ -170,6 +170,31 @@ pub fn offset_text(minutes: i32) -> String {
     format!("UTC{sign}{:02}:{:02}", absolute / 60, absolute % 60)
 }
 
+/// Через сколько секунд бездействия гасить экран.
+///
+/// `never` и `0` — не гасить; `10m` — десять минут; всё прочее — число секунд.
+/// Слово рядом с числом не украшение: «ноль» в файле настроек человек читает
+/// как «сразу», а не как «никогда», и одно из двух написаний обязано быть
+/// недвусмысленным.
+///
+/// `None` — ключа нет или он испорчен. Испорченный ключ не отменяет остальных
+/// и не роняет загрузку: умолчание остаётся в силе, а сказать о непонятном —
+/// дело того, кто читает файл.
+#[must_use]
+pub fn screen_off_seconds(text: &str) -> Option<u32> {
+    let value = value(text, "screen_off")?.trim();
+    if value.eq_ignore_ascii_case("never") || value.eq_ignore_ascii_case("off") {
+        return Some(0);
+    }
+    // Минуты пишут минутами: `10m` читается человеком быстрее, чем `600`, а
+    // ошибиться в нуле при этом негде.
+    if let Some(minutes) = value.strip_suffix(['m', 'M']) {
+        let minutes: u32 = minutes.trim().parse().ok()?;
+        return minutes.checked_mul(60);
+    }
+    value.parse::<u32>().ok()
+}
+
 /// Тёмная ли тема по строке `theme=dark`.
 ///
 /// `None` — ключа нет либо значение непонятное. Непонятное не считается тёмной
@@ -203,6 +228,38 @@ pub fn title_bar(text: &str) -> Option<u32> {
 #[must_use]
 pub fn network_is_static(text: &str) -> bool {
     value(text, "mode").is_some_and(|mode| mode.eq_ignore_ascii_case("static"))
+}
+
+#[cfg(test)]
+mod screen_off_tests {
+    use super::screen_off_seconds;
+
+    #[test]
+    fn plain_seconds_and_minutes() {
+        assert_eq!(screen_off_seconds("screen_off=300"), Some(300));
+        assert_eq!(screen_off_seconds("screen_off= 45 "), Some(45));
+        assert_eq!(screen_off_seconds("screen_off=10m"), Some(600));
+        assert_eq!(screen_off_seconds("screen_off=1M"), Some(60));
+    }
+
+    #[test]
+    fn never_is_a_word_and_a_zero() {
+        assert_eq!(screen_off_seconds("screen_off=never"), Some(0));
+        assert_eq!(screen_off_seconds("screen_off=NEVER"), Some(0));
+        assert_eq!(screen_off_seconds("screen_off=off"), Some(0));
+        assert_eq!(screen_off_seconds("screen_off=0"), Some(0));
+    }
+
+    #[test]
+    fn nonsense_is_refused_rather_than_guessed() {
+        assert_eq!(screen_off_seconds("screen_off="), None);
+        assert_eq!(screen_off_seconds("screen_off=soon"), None);
+        assert_eq!(screen_off_seconds("screen_off=-5"), None);
+        // Минуты, не помещающиеся в секунды: переполнение — отказ, а не
+        // выдуманное число.
+        assert_eq!(screen_off_seconds("screen_off=99999999m"), None);
+        assert_eq!(screen_off_seconds("theme=dark"), None);
+    }
 }
 
 #[cfg(test)]
