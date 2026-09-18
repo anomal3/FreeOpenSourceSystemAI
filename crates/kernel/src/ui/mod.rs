@@ -2191,12 +2191,25 @@ fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
                 Err(err) => kprintln!("  desktop     : cannot start '{path}': {err}"),
             }
         }
-        // Строка пакета — командная строка целиком (`/bin/dotnet /opt/…`), с
-        // правами того же сеанса, что и у программ из `/bin`.
-        panel::Choice::Command(line) => match crate::user::spawn(&line, crate::user::session::credentials()) {
-            Ok(id) => kprintln!("  desktop     : started '{line}' as {id}"),
-            Err(err) => kprintln!("  desktop     : cannot start '{line}': {err}"),
-        },
+        // Строка пакета — командная строка целиком (`/bin/dotnet /opt/…`), от
+        // имени того же сеанса, что и программы из `/bin`, но **с правами
+        // пакета**: только тем, что он попросил в манифесте. Это единственное
+        // место, где программа запускается не со всеми правами, и оно же —
+        // единственный способ, которым человек запускает поставленную
+        // программу.
+        panel::Choice::Command(line, rights) => {
+            let mut names = [0u8; 32];
+            kprintln!("  desktop     : '{line}' may use {}", rights.write_names(&mut names));
+            match crate::user::spawn_rights(
+                &line,
+                crate::user::session::credentials(),
+                rights,
+                false,
+            ) {
+                Ok(id) => kprintln!("  desktop     : started '{line}' as {id}"),
+                Err(err) => kprintln!("  desktop     : cannot start '{line}': {err}"),
+            }
+        }
     }
 }
 

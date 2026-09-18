@@ -23,6 +23,7 @@ written down in the source, in Russian, next to the code that resulted from it.
 | **Filesystem** | ext2, read and written by us — created, verified and repaired from inside the system (`fsck`) |
 | **Desktop** | Framebuffer compositor: antialiased proportional type, rounded translucent windows, a floating taskbar, start menu, terminal, file manager — in a dark and a light theme. A program can ask for **a window of its own**: it draws straight into mapped pixels and reads its own keys and clicks — the system monitor is exactly that, a program outside the kernel |
 | **Userspace** | ELF programs in ring 3 / EL0, one address space each, preemptive scheduling, pipes, `mode`/`uid`/`gid` enforced, memory on request (`mmap`) in 4 KiB or 2 MiB pages, files mapped into memory and paged in on demand, W^X on every page and a **stack canary in every program** — Rust and C alike, with the reference value in a read-only page the kernel fills before the program starts — and a **versioned syscall contract** — `dup`, `fstat`, `isatty`, `poll`, clocks and CPU time, frozen by tests that name every number |
+| **Package permissions** | A `.fpk` declares what it needs — `net`, `windows`, `files` — and gets nothing it did not ask for. Network and windows are enforced by the kernel; `files` is declared only, and says so. Two rules, both narrowing: what the launch asked for, intersected with what the package owning the executable asked for, intersected with what the launcher itself may do |
 | **Familiar to a Windows user** | `cat C:\etc\system.cfg` works, and so does `\bin`; `D:` is refused by name, because this system has one root. The file manager labels `/bin` as «Программы» and `/home/you` as «Мои документы», folds the service trees, and shows the real path all the while — one key switches it all off |
 | **Settings** | Timezone, theme, and a static address are set in a window and survive a reboot — written to `/etc` on the state partition, applied at the next boot before any service starts. Volumes and accounts are listed; the filesystem check runs from there |
 | **Parsers under fuzzing** | Everything that reads foreign bytes is fuzzed on the host: ext2 and its `fsck`, btrfs, X.509 and PEM, TLS records, HID descriptors, packages, .NET assemblies. `cargo xtask fuzz` finds and `cargo test` guards; it found a foreign mouse that stopped the kernel, a foreign disk that walked a bitmap off its buffer, and one that made a read chew for seconds |
@@ -145,7 +146,9 @@ fastboot oem log                         # the whole kernel log, over the cable
 
 Linux is a fine kernel with a graphics stack that is painful to build on. This project keeps
 the parts of the Unix model worth keeping — no telemetry, no forced network calls, a real
-permission model — and drops the accumulated complexity, starting from nothing.
+permission model — and drops the accumulated complexity, starting from nothing. "Real" is
+meant literally: `mode`/`uid`/`gid` are enforced, W^X holds on every page, every program
+carries a stack canary, and a package gets only the permissions its manifest asks for.
 
 Design bias throughout: **prefer the boring, well-specified path over the clever one.**
 

@@ -1096,7 +1096,11 @@ pub enum Choice {
     Program(&'static str),
     /// Программа, поставленная пакетом (фаза N8), — командная строка из
     /// `start=` её манифеста.
-    Command(String),
+    /// Права, которые манифест просит, едут вместе со строкой, а не
+    /// спрашиваются при запуске: спросить их пришлось бы по пути к
+    /// исполняемому файлу, а у программы на .NET этот путь — `/bin/dotnet`,
+    /// то есть системный каталог, к пакету отношения не имеющий.
+    Command(String, fpk::Rights),
 }
 
 /// Программа, поставленная пакетом (фаза N8): строка «Пуска» из реестра
@@ -1111,6 +1115,9 @@ struct Launcher {
     caption: String,
     about: String,
     start: String,
+    /// Что пакет просит у системы (`permissions=` в манифесте). Отсутствие
+    /// строки — пусто, а не «всё»: см. [`fpk::Manifest::rights`].
+    rights: fpk::Rights,
 }
 
 /// Пакеты со строкой запуска — по имени, чтобы порядок строк не зависел от
@@ -1144,11 +1151,20 @@ fn list_packages() -> Vec<Launcher> {
             continue;
         };
         let about = sysconf::value(text, "about").or_else(|| sysconf::value(text, "summary")).unwrap_or("");
+        // Права разбираются из той же записи реестра. Непонятое имя даёт
+        // пустой набор, а не «всё»: запись могла прийти от системы поновее, и
+        // «не понял, значит можно» — ровно та ошибка, ради которой всё это
+        // затевалось. Случай остаточный: такой пакет эта система и не
+        // поставит, `pkg` проверяет манифест при установке.
+        let rights = sysconf::value(text, "permissions").map_or(fpk::Rights::NONE, |list| {
+            fpk::Rights::parse(list).unwrap_or(fpk::Rights::NONE)
+        });
         launchers.push(Launcher {
             name: String::from(name),
             caption: String::from(sysconf::value(text, "caption").unwrap_or(name)),
             about: String::from(about),
             start: String::from(start),
+            rights,
         });
     }
     launchers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1247,7 +1263,10 @@ impl Item {
         Some(match self {
             Item::App(app) => Choice::App(app),
             Item::Program(program) => Choice::Program(program.file),
-            Item::Package(index) => Choice::Command(packages.get(index)?.start.clone()),
+            Item::Package(index) => {
+                let package = packages.get(index)?;
+                Choice::Command(package.start.clone(), package.rights)
+            }
         })
     }
 }

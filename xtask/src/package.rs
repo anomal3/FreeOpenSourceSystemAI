@@ -56,6 +56,9 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
 
     let mut hello = Builder::new(Kind::Package, "hello", "1.0");
     hello.field("summary", "A program that only exists inside a package");
+    // Прав не просит ни одного, и это не забывчивость, а половина проверки:
+    // `greet` пробует открыть сокет и обязан получить отказ. Пакет, который о
+    // правах молчит, не получает ничего — см. `fpk::Manifest::rights`.
     hello.file(&Entry {
         path: String::from("bin/greet"),
         // `0755`: запускать вправе кто угодно, менять — только владелец. Ровно
@@ -97,6 +100,9 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     winforms.field("caption", "WinForms");
     winforms.field("about", "форма из дизайнера Visual Studio");
     winforms.field("start", "/bin/dotnet /opt/winforms/winforms.dll");
+    // Окно — и только окно. Сети программе на WinForms не нужно, и теперь это
+    // не намерение автора, а то, что проверяет ядро.
+    winforms.field("permissions", "windows");
     for name in ["winforms.dll", "winforms.runtimeconfig.json"] {
         let path = samples.join(name);
         let data = fs::read(&path).with_context(|| format!("не удалось прочитать {}", path.display()))?;

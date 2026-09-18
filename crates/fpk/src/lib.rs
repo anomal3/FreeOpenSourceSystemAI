@@ -161,6 +161,8 @@ pub enum Error {
     BadSignature,
     /// Алгоритм подписи не тот, который умеет эта система.
     UnknownSignature(u16),
+    /// В списке прав названо то, чего система не знает.
+    UnknownRight,
 }
 
 impl Error {
@@ -181,7 +183,146 @@ impl Error {
             Self::MissingHash => "the container is signed but a payload part carries no hash",
             Self::BadSignature => "the signature does not match any key this system trusts",
             Self::UnknownSignature(_) => "the signature algorithm is not one this system knows",
+            Self::UnknownRight => "the manifest asks for a permission this system does not know",
         }
+    }
+}
+
+
+/// Права, которые пакет просит у системы.
+///
+/// # Зачем они и что здесь на самом деле сделано
+///
+/// До сих пор программа, поставленная пакетом, могла ровно то же, что и любая
+/// другая: открыть сокет, прочитать чужой файл, завести окно. Единственным
+/// ограничителем была учётная запись, от имени которой её запустили, — то есть
+/// «что можно этому человеку», а не «что нужно этой программе». Разница видна
+/// на любом примере: калькулятору не нужна сеть, и то, что он её может, не
+/// защищено ничем, кроме намерений автора.
+///
+/// Манифест позволяет автору сказать, что программе нужно, а системе —
+/// отказать во всём остальном. Объявление стоит дёшево, проверка добавляется
+/// постепенно; что проверяется **сегодня**, а что пока только объявляется,
+/// написано у каждого права ниже и повторено в ROADMAP. Обещать больше, чем
+/// проверяется, здесь нельзя: право, о котором сказано «работает», а оно не
+/// работает, хуже отсутствия права — на него будут рассчитывать.
+///
+/// # Почему набор битов, а не список строк
+///
+/// Потому что этот набор едет с каждым запуском программы и пересекается с
+/// набором родителя на каждом порождении. Список строк означал бы кучу в
+/// ядре на пути, где её быть не должно, и сравнение строк там, где хватает
+/// одной команды процессора.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rights(u8);
+
+impl Rights {
+    /// Ничего сверх своего каталога. Это же — умолчание для пакета, который о
+    /// правах не сказал.
+    pub const NONE: Self = Self(0);
+
+    /// Сеть: сокеты, соединения, имена. **Проверяется.**
+    pub const NET: Self = Self(1 << 0);
+
+    /// Файлы вне своего каталога. **Объявляется, но пока не проверяется** —
+    /// проверка означает разбор пути в каждом файловом вызове, и делать её
+    /// заодно с объявлением значило бы сделать обе вещи наспех.
+    pub const FILES: Self = Self(1 << 1);
+
+    /// Своё окно на рабочем столе. **Проверяется.**
+    pub const WINDOWS: Self = Self(1 << 2);
+
+    /// Всё, что бывает. Столько получает всякая программа, запущенная не как
+    /// пакет: системная из `/bin`, команда оболочки, служба. Ограничивать их
+    /// этим набором нечем и незачем — они и есть система.
+    pub const ALL: Self = Self(0b111);
+
+    /// Разобрать список имён через пробел: `net files windows`.
+    pub fn parse(list: &str) -> Result<Self, Error> {
+        let mut rights = Self::NONE;
+        for name in list.split_whitespace() {
+            rights = rights.union(Self::by_name(name).ok_or(Error::UnknownRight)?);
+        }
+        Ok(rights)
+    }
+
+    /// Право по имени, которым его называет манифест.
+    #[must_use]
+    pub fn by_name(name: &str) -> Option<Self> {
+        match name {
+            "net" => Some(Self::NET),
+            "files" => Some(Self::FILES),
+            "windows" => Some(Self::WINDOWS),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Пересечение — то, чем порождённая программа не может оказаться шире
+    /// породившей. Без него модель была бы фикцией: программа без сети
+    /// запускала бы `/bin/fetch` и получала бы сеть его руками.
+    #[must_use]
+    pub const fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Биты как число — ядру, чтобы положить набор в заявку на запуск.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Обратно из числа. Незнакомые биты отбрасываются: набор мог прийти от
+    /// системы постарше, и «непонятный бит» обязан значить «нет права», а не
+    /// «какое-то право».
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits & Self::ALL.0)
+    }
+
+    /// Имена прав через пробел — для журнала и для человека.
+    ///
+    /// Буфер даётся вызывающим: строку здесь собирать не на что, кучи у этого
+    /// крейта нет и не будет. Возвращает срез этого же буфера.
+    pub fn write_names<'a>(self, out: &'a mut [u8; 32]) -> &'a str {
+        let mut used = 0;
+        for (right, name) in [(Self::NET, "net"), (Self::FILES, "files"), (Self::WINDOWS, "windows")]
+        {
+            if !self.contains(right) {
+                continue;
+            }
+            if used > 0 && used < out.len() {
+                out[used] = b' ';
+                used += 1;
+            }
+            let bytes = name.as_bytes();
+            if used + bytes.len() > out.len() {
+                break;
+            }
+            out[used..used + bytes.len()].copy_from_slice(bytes);
+            used += bytes.len();
+        }
+        if used == 0 {
+            let none = b"none";
+            out[..none.len()].copy_from_slice(none);
+            used = none.len();
+        }
+        // SAFETY: в буфер попадают только имена из списка выше и пробелы.
+        unsafe { core::str::from_utf8_unchecked(&out[..used]) }
     }
 }
 
@@ -427,6 +568,24 @@ impl<'a> Manifest<'a> {
             .unwrap_or("")
             .split_whitespace()
             .filter(|name| !name.is_empty())
+    }
+
+    /// Права, которые пакет просит у системы.
+    ///
+    /// Отсутствие строки означает **ничего**, а не «всё», и это главное
+    /// решение здесь: пакет, который о правах не сказал, их не получает.
+    /// Умолчание «всё» превратило бы манифест в украшение — старый пакет
+    /// продолжал бы делать что угодно, и модель прав существовала бы только
+    /// для тех, кто сам согласился ограничиться.
+    ///
+    /// Непонятное имя — ошибка, а не пропуск: опечатка в `netwrok` иначе
+    /// молча оставила бы пакет без сети, и разбираться с этим пришлось бы по
+    /// поведению, а не по отказу установки.
+    pub fn rights(&self) -> Result<Rights, Error> {
+        match self.field("permissions") {
+            None => Ok(Rights::NONE),
+            Some(list) => Rights::parse(list),
+        }
     }
 
     /// Файлы пакета в порядке, в котором лежит их содержимое.
@@ -758,5 +917,72 @@ mod tests {
         assert!(!is_safe_path("../etc/passwd"));
         assert!(!is_safe_path("bin/../../etc/passwd"));
         assert!(!is_safe_path(""));
+    }
+
+    /// Пакет, не сказавший о правах, не получает ничего.
+    ///
+    /// Умолчание здесь — единственное решение, которое стоит проверять тестом:
+    /// сделай оно «всё», и модель прав действовала бы только на тех, кто сам
+    /// согласился ограничиться, а старый пакет продолжал бы мочь что угодно.
+    #[test]
+    fn a_package_that_says_nothing_gets_nothing() {
+        let text = "name=quiet
+version=1.0
+";
+        let header = Header {
+            kind: Kind::Package,
+            manifest_len: text.len() as u32,
+            payload_len: 0,
+            manifest_crc: crc32(text.as_bytes()),
+            payload_crc: 0,
+            signature_algorithm: 0,
+            signature_len: 0,
+            signature: [0; SIGNATURE_SIZE],
+        };
+        let manifest = Manifest::parse(&header, text.as_bytes()).expect("манифест");
+        assert_eq!(manifest.rights().expect("права"), Rights::NONE);
+    }
+
+    /// Имена прав разбираются, а незнакомое — отказ, а не пропуск.
+    #[test]
+    fn permissions_parse_by_name_and_a_typo_is_refused() {
+        assert_eq!(Rights::parse("").expect("пусто"), Rights::NONE);
+        assert_eq!(Rights::parse("net").expect("сеть"), Rights::NET);
+        assert_eq!(
+            Rights::parse("net windows").expect("два"),
+            Rights::NET.union(Rights::WINDOWS)
+        );
+        assert_eq!(Rights::parse("  files   net  ").expect("пробелы"), Rights::NET.union(Rights::FILES));
+        // Опечатка молча оставила бы пакет без права, и разбираться пришлось бы
+        // по поведению программы, а не по отказу установки.
+        assert_eq!(Rights::parse("netwrok"), Err(Error::UnknownRight));
+        assert_eq!(Rights::parse("net root"), Err(Error::UnknownRight));
+    }
+
+    /// Пересечение сужает и никогда не расширяет — на этом держится
+    /// наследование прав порождённой программой.
+    #[test]
+    fn rights_only_ever_narrow() {
+        let net = Rights::NET;
+        assert_eq!(Rights::ALL.intersect(net), net);
+        assert_eq!(net.intersect(Rights::WINDOWS), Rights::NONE);
+        assert!(Rights::ALL.contains(net));
+        assert!(!net.contains(Rights::ALL));
+        assert!(Rights::NONE.is_empty());
+        // Число и обратно — то, чем набор едет в заявке на запуск. Лишние биты
+        // отбрасываются: «непонятный бит» обязан значить «нет права».
+        assert_eq!(Rights::from_bits(Rights::ALL.bits()), Rights::ALL);
+        assert_eq!(Rights::from_bits(0xff), Rights::ALL);
+    }
+
+    /// Имена для журнала: пустой набор называется словом, а не пустотой.
+    #[test]
+    fn rights_have_names_for_the_log() {
+        let mut buffer = [0u8; 32];
+        assert_eq!(Rights::NONE.write_names(&mut buffer), "none");
+        let mut buffer = [0u8; 32];
+        assert_eq!(Rights::ALL.write_names(&mut buffer), "net files windows");
+        let mut buffer = [0u8; 32];
+        assert_eq!(Rights::WINDOWS.write_names(&mut buffer), "windows");
     }
 }

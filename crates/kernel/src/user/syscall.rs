@@ -28,6 +28,7 @@
 //! сеанса означала бы, что описание службы врёт о том, от чьего имени она
 //! работает.
 
+use fpk::Rights;
 use user_abi::{
     ERR_AGAIN, ERR_BAD_ADDRESS, ERR_BAD_FD, ERR_BAD_PATH, ERR_IO, ERR_NOT_FOUND,
     ERR_NO_FILESYSTEM, ERR_NO_PROGRAM, ERR_NO_SYSCALL, ERR_NO_TASK, ERR_PERMISSION,
@@ -821,6 +822,13 @@ fn as_stream(index: usize) -> Option<usize> {
 
 /// `socket(kind) -> номер сокета`.
 fn socket(kind: usize) -> i64 {
+    // Сеть — первое право, которое проверяется по-настоящему (манифест пакета,
+    // `permissions=net`). Проверка стоит у открытия, а не у отправки: сокет,
+    // который нельзя было открыть, не пригодится ни одному следующему вызову,
+    // и отказ приходит туда, где программа ещё умеет его показать.
+    if !super::allow(Rights::NET) {
+        return ERR_PERMISSION;
+    }
     match kind {
         SOCK_UDP => match net::socket_open(sched::current()) {
             Ok(index) => index as i64,
@@ -1023,6 +1031,11 @@ fn netconf(ptr: usize, len: usize) -> i64 {
     if super::credentials().uid != 0 {
         return ERR_PERMISSION;
     }
+    // И право сверх личности: настроить сеть — это про сеть, а `root` внутри
+    // пакета без права на сеть остаётся программой без права на сеть.
+    if !super::allow(Rights::NET) {
+        return ERR_PERMISSION;
+    }
     if len != size_of::<NetConfig>() || !space::user_can(ptr, len, PageFlags::READ) {
         return ERR_BAD_ADDRESS;
     }
@@ -1069,6 +1082,11 @@ fn netinfo(ptr: usize, len: usize) -> i64 {
 
 /// `resolve(ptr, len, out) -> 0`.
 fn resolve(ptr: usize, len: usize, out: usize) -> i64 {
+    // Разрешение имени — тоже сеть, и отдельным вызовом: до сокета оно не
+    // доходит, а наружу уходит запрос с именем, которое программа выбрала.
+    if !super::allow(Rights::NET) {
+        return ERR_PERMISSION;
+    }
     /// Сколько ждать ответа сервера имён.
     const TIMEOUT_MS: u64 = 3_000;
 
@@ -1426,6 +1444,12 @@ fn window_errno(err: super::WindowError) -> i64 {
 /// запись, а не на чтение: страница, доступная только на чтение, сделала бы
 /// ответ невозможным уже после того, как окно заведено.
 fn winopen(ptr: usize) -> i64 {
+    // Своё окно — второе проверяемое право. Пакет, не попросивший `windows`,
+    // окна не получает: окно на общем столе — это и клавиатура, и мышь, и
+    // место, которое у кого-то отнимается.
+    if !super::allow(Rights::WINDOWS) {
+        return ERR_PERMISSION;
+    }
     if ptr % align_of::<WindowSpec>() != 0 {
         return ERR_BAD_ADDRESS;
     }

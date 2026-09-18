@@ -81,6 +81,7 @@ use user_abi::MAP_HUGE;
 
 use crate::vfs::Node;
 use crate::vfs::perm::{Access, Credentials};
+use fpk::Rights;
 use crate::{arch, kprintln, sched};
 
 use space::Space;
@@ -490,6 +491,24 @@ pub struct Program {
     /// проверка прав в системном вызове обязана спрашивать **программу**, а не
     /// сеанс, — см. [`credentials`].
     cred: Credentials,
+    /// Что этой программе **разрешено** сверх того, что разрешено человеку.
+    ///
+    /// Личность отвечает на вопрос «кому можно», права — на вопрос «чего этой
+    /// программе нужно». Разница видна на калькуляторе: сеть ему не нужна, а
+    /// учётная запись человека её разрешает, и до сих пор его от сети не
+    /// удерживало ничто, кроме намерений автора.
+    ///
+    /// Набор берётся из манифеста пакета и едет с запуском, а не выводится из
+    /// пути к файлу. Причина названа: пакет запускается строкой `start=`, и у
+    /// программы на .NET эта строка — `/bin/dotnet /opt/имя/имя.dll`, то есть
+    /// исполняемый файл лежит в системном каталоге и принадлежит не пакету.
+    /// Права по пути дали бы такой программе всё, а по запуску — ровно то, что
+    /// пакет попросил.
+    ///
+    /// Всё, что запущено **не** как пакет, получает [`Rights::ALL`]: команда
+    /// оболочки, служба, системная программа из `/bin` — это и есть система, и
+    /// ограничивать её этим набором нечем.
+    rights: Rights,
     /// Откуда программа запущена — то, что диспетчер задач показывает как
     /// «расположение файла». До фазы С5 путь жил только в строке журнала.
     pub path: alloc::string::String,
@@ -1295,6 +1314,89 @@ pub fn credentials() -> Credentials {
     with_current(|program| program.cred).unwrap_or_else(session::credentials)
 }
 
+/// Права пакета, которому принадлежит файл по этому пути.
+///
+/// # Зачем это вдобавок к правам запуска
+///
+/// Права едут с запуском, потому что пакет запускается строкой `start=`, и у
+/// программы на .NET эта строка ведёт в `/bin/dotnet` — файл системный, к
+/// пакету отношения не имеющий. Но у обратного случая своя дыра: файл
+/// `/opt/hello/bin/greet` принадлежит пакету, а запущенный из оболочки получал
+/// бы всё, и «программа ограничена» значило бы «ограничена, пока её запускают
+/// из меню».
+///
+/// Поэтому правил два, и они **сужают** оба: набор запуска пересекается с
+/// набором того пакета, в чьём каталоге лежит исполняемый файл. Программа
+/// пакета ограничена, кто бы её ни запустил; программа из `/bin`, запущенная
+/// от имени пакета, ограничена правами пакета.
+///
+/// Всё, что лежит не в `/opt/<имя>/`, прав не ограничивает: [`Rights::ALL`].
+fn rights_of_path(path: &str) -> Rights {
+    /// Реестр установленного: в нём лежит манифест как есть.
+    const REGISTRY: &str = "/var/lib/pkg";
+    /// Предел манифеста в контейнере — он же предел записи реестра.
+    const LIMIT: usize = 32 * 1024;
+
+    let Some(rest) = path.strip_prefix("/opt/") else {
+        return Rights::ALL;
+    };
+    // Имя пакета — первый кусок пути. Файл прямо в `/opt` пакету не
+    // принадлежит: пакеты раскладываются по каталогам.
+    let Some((name, _)) = rest.split_once('/') else {
+        return Rights::ALL;
+    };
+    if name.is_empty() || !fpk::is_safe_component(name) {
+        return Rights::ALL;
+    }
+
+    let record = alloc::format!("{REGISTRY}/{name}.pkg");
+    // Записи нет или она не читается — значит каталог в `/opt` создан не
+    // пакетом. Ограничивать нечем: реестр и есть то место, где права названы.
+    let Some(Ok((bytes, _))) = crate::fs::read(&record, LIMIT) else {
+        return Rights::ALL;
+    };
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        return Rights::ALL;
+    };
+    // Непонятое имя права даёт пустой набор, а не «всё»: «не понял, значит
+    // можно» — ровно та ошибка, ради которой всё это затевалось.
+    sysconf::value(text, "permissions")
+        .map_or(Rights::NONE, |list| Rights::parse(list).unwrap_or(Rights::NONE))
+}
+
+/// Что разрешено программе, исполняющейся сейчас.
+///
+/// Программы может не быть вовсе — вызов пришёл из оболочки или из задачи
+/// ядра; тогда разрешено всё, и это не поблажка: оболочка и есть система.
+#[must_use]
+pub fn rights() -> Rights {
+    with_current(|program| program.rights).unwrap_or(Rights::ALL)
+}
+
+/// Отказать, если у исполняющейся программы нет права `need`.
+///
+/// Возвращает `false` и печатает строку — печатает **всегда**, и это не
+/// многословие. Отказ по правам выглядит для программы так же, как любой
+/// другой отказ вызова, и человек, у которого «программа не работает», иначе
+/// не узнает, что её остановила система, а не сеть. Строку читает и стенд:
+/// «вызов вернул ошибку» и «вызов был запрещён» — разные утверждения.
+#[must_use]
+pub fn allow(need: Rights) -> bool {
+    let mine = rights();
+    if mine.contains(need) {
+        return true;
+    }
+    let mut asked = [0u8; 32];
+    let asked = need.write_names(&mut asked);
+    let mut has = [0u8; 32];
+    let has = mine.write_names(&mut has);
+    kprintln!(
+        "  user        : {} refused {asked}: the package asked for {has}",
+        sched::current()
+    );
+    false
+}
+
 /// Виртуальный адрес кадра в прямом отображении — через него ядро пишет в
 /// память программы.
 ///
@@ -1753,6 +1855,7 @@ fn run(
     path: &str,
     args: &[&str],
     cred: Credentials,
+    rights: Rights,
     stdin: Option<pipe::Reader>,
     stdout: Option<pipe::Writer>,
 ) -> Result<i64, Error> {
@@ -1792,6 +1895,13 @@ fn run(
         "  user        : {id} '{path}' as {cred}, entry {entry:#018x}, stack {stack:#018x}, \
          stack guard read-only at {PROCESS_PAGE:#018x}"
     );
+    // Права печатаются отдельной строкой и **всегда**, даже когда их все:
+    // «чего этой программе разрешено» иначе не видно снаружи ничем, а
+    // проверять модель прав надо именно снаружи. Строку читает стенд.
+    {
+        let mut names = [0u8; 32];
+        kprintln!("  user        : {id} may use {}", rights.write_names(&mut names));
+    }
     report(&space, entry, &loaded.mappings);
 
     let slot = sched::current_slot();
@@ -1812,6 +1922,7 @@ fn run(
             running: true,
             kill_requested: false,
             cred,
+            rights,
             path: alloc::string::String::from(path),
             stdin,
             stdout,
@@ -1918,6 +2029,10 @@ struct Request {
     /// новой задаче: спросить там значило бы спросить у **её** программы,
     /// которой ещё нет, и получить личность сеанса вместо заказанной.
     cred: Credentials,
+    /// Права новой программы. Едут в заявке по той же причине, что и личность:
+    /// спросить их в новой задаче значило бы спросить у её же программы,
+    /// которой ещё нет.
+    rights: Rights,
     /// Считать ли новую задачу служебной — см. [`spawn_with`].
     daemon: bool,
     /// Концы каналов, которые новая задача получит стандартным вводом и
@@ -1960,7 +2075,25 @@ pub fn spawn(line: &str, cred: Credentials) -> Result<sched::TaskId, Error> {
 /// `exit` останавливает машину, когда живых задач не осталось. Служба,
 /// работающая вечно, отменила бы и то и другое.
 pub fn spawn_with(line: &str, cred: Credentials, daemon: bool) -> Result<sched::TaskId, Error> {
-    spawn_streams(line, cred, daemon, None, None)
+    spawn_rights(line, cred, Rights::ALL, daemon)
+}
+
+/// То же, но с явным набором прав.
+///
+/// Этим запускают пакет: набор берётся из его манифеста. Всё остальное идёт
+/// через [`spawn_with`] и получает [`Rights::ALL`] — команда оболочки, служба
+/// и системная программа ограничению не подлежат.
+///
+/// Права сужаются правами **запускающего**: программа без сети, позвавшая
+/// `/bin/fetch`, не должна получить сеть его руками. Пересечение делается
+/// здесь, в задаче того, кто просит, — в новой задаче спросить уже не у кого.
+pub fn spawn_rights(
+    line: &str,
+    cred: Credentials,
+    rights: Rights,
+    daemon: bool,
+) -> Result<sched::TaskId, Error> {
+    spawn_streams_rights(line, cred, rights, daemon, None, None)
 }
 
 /// То же, но стандартный ввод и вывод новой задачи привязаны к каналам.
@@ -1975,6 +2108,24 @@ pub fn spawn_streams(
     stdin: Option<pipe::Reader>,
     stdout: Option<pipe::Writer>,
 ) -> Result<sched::TaskId, Error> {
+    spawn_streams_rights(line, cred, Rights::ALL, daemon, stdin, stdout)
+}
+
+/// То же, но с явным набором прав.
+pub fn spawn_streams_rights(
+    line: &str,
+    cred: Credentials,
+    rights: Rights,
+    daemon: bool,
+    stdin: Option<pipe::Reader>,
+    stdout: Option<pipe::Writer>,
+) -> Result<sched::TaskId, Error> {
+    // Сужение правами запускающего. Программы может не быть вовсе (запускает
+    // оболочка или служба супервизора) — тогда сужать не от чего.
+    let rights = match with_current(|program| program.rights) {
+        Some(mine) => rights.intersect(mine),
+        None => rights,
+    };
     if line.len() > MAX_LINE {
         return Err(Error::Read(crate::vfs::VfsError::BadPath));
     }
@@ -1987,7 +2138,7 @@ pub fn spawn_streams(
         return Err(Error::OutOfMemory);
     }
     let mut request =
-        Request { line: [0; MAX_LINE], len: line.len(), cred, daemon, stdin, stdout };
+        Request { line: [0; MAX_LINE], len: line.len(), cred, rights, daemon, stdin, stdout };
     request.line[..line.len()].copy_from_slice(line.as_bytes());
     // SAFETY: блок только что выделен под `Request` с нужными размером и
     // выравниванием и никому больше не принадлежит.
@@ -2027,6 +2178,7 @@ extern "C" fn program_entry(arg: usize) -> ! {
     // остаётся заимствованным строкой аргументов и тронуть его будет нельзя.
     let (stdin, stdout) = (request.stdin.take(), request.stdout.take());
     let cred = request.cred;
+    let rights = request.rights;
     // Задача помечает себя служебной сама, хотя это же сделал и [`spawn_with`].
     // Дублирование не лишнее: пометка снаружи успевает не всегда — между
     // возвратом `spawn_raw` и ней задачу могут вытеснить, — а всё, что эта
@@ -2062,7 +2214,10 @@ extern "C" fn program_entry(arg: usize) -> ! {
     // осталась бы в заявке, а заявка живёт до конца задачи, которая уже не
     // вернётся из `exit_current_with`. Пока жив хоть один писатель, читатель на
     // другом конце не видит конца файла — то есть ждёт вечно.
-    let code = match run(path, &args[..argc], cred, stdin, stdout) {
+    // Сужение правами пакета, которому принадлежит сам файл. Второе из двух
+    // правил (см. [`rights_of_path`]); оба только сужают.
+    let rights = rights.intersect(rights_of_path(path));
+    let code = match run(path, &args[..argc], cred, rights, stdin, stdout) {
         Ok(code) => {
             if code == user_abi::EXIT_KILLED {
                 report_line(path, "killed by request");

@@ -11,7 +11,8 @@
 #![no_std]
 #![no_main]
 
-use user_progs::{Args, error, exit, print, println};
+use user_abi::ERR_PERMISSION;
+use user_progs::{Args, error, error_num, exit, print, println, socket};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
@@ -27,6 +28,22 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     error("greet: installed from a package, running as ");
     error(path);
     error("\n");
+
+    // Проба сети. Программа её не хочет и не умеет — она существует затем,
+    // чтобы показать **отказ**: манифест `hello` не просит ни одного права, а
+    // значит система обязана отказать, даже когда запустивший — root.
+    //
+    // Проверяется именно код отказа, а не «что-то пошло не так»: сокет может
+    // не открыться и оттого, что в системе нет сетевой карты, и такой отказ
+    // о правах не говорит ничего. Различить их можно только числом.
+    let fd = socket();
+    error("greet: opening a socket without asking for it returned ");
+    error_num(fd);
+    if fd == ERR_PERMISSION {
+        error(" (refused by the package permissions)\n");
+    } else {
+        error(" (NOT refused, which means the permissions did nothing)\n");
+    }
 
     exit(0)
 }

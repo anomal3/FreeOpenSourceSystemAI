@@ -5053,12 +5053,29 @@ pub const ALL: &[Scenario] = &[
             // поставилось» выглядело бы так же, как «поставилось не то».
             Step::Line("run /bin/pkg install /media/hello-1.0.fpk"),
             Step::Await("pkg: installed hello 1.0, 2 file(s)", 60_000),
+            // Права называются при установке — человек решает по этой строке.
+            // `hello` не просит ничего, и так и написано словом: пустой набор
+            // обязан называться, а не выглядеть пропущенной строкой.
+            Step::Await("pkg: hello may use none", 15_000),
 
             // Главное утверждение фазы: программа, которой в системе не было,
             // приехала пакетом и работает. `/bin/greet` не существует — она
             // попадает в систему единственным способом.
             Step::Line("run /opt/hello/bin/greet"),
+            // Права пакета действуют и на запуск из оболочки: файл лежит в
+            // `/opt/hello/`, и ядро берёт набор из записи реестра. `hello` не
+            // просит ничего — значит программа не получает ничего, даже
+            // запущенная root'ом. Строку печатает ядро при запуске, то есть
+            // **до** первой строки самой программы; порядок ожиданий здесь и
+            // есть порядок печати, а не порядок мысли.
+            Step::Await("may use none", 30_000),
             Step::Await("greet: installed from a package", 30_000),
+            // И проба сети кончается отказом по правам, а не «что-то пошло не
+            // так»: отличить это можно только кодом отказа, и его печатает
+            // сама программа.
+            Step::Await("refused net: the package asked for none", 30_000),
+            Step::Await("(refused by the package permissions)", 15_000),
+            Step::Absent("NOT refused, which means the permissions did nothing"),
             // И файл рядом с ней распаковался целиком, а не «появился».
             Step::Line("cat /opt/hello/share/readme.txt"),
             Step::Await("unpacked by pkg install", 15_000),
@@ -5124,6 +5141,10 @@ pub const ALL: &[Scenario] = &[
             // сколько бы программ ни лежало в `/bin`.
             Step::Line("run /bin/pkg install /media/winforms-1.0.fpk"),
             Step::Await("pkg: installed winforms 1.0, 2 file(s)", 60_000),
+            // Права названы при установке. `windows` и только: сети программе
+            // на WinForms не нужно, и теперь это не намерение автора, а то,
+            // что проверяет ядро.
+            Step::Await("pkg: winforms may use windows", 15_000),
             Step::Wait(1_000),
             Step::Key("f1"),
             Step::Await("desktop     : menu opened", 15_000),
@@ -5132,7 +5153,15 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_500),
             Step::Shot("winforms-menu"),
             Step::Key("ret"),
+            // Стол запускает пакет с его правами, а не со своими: исполняемый
+            // файл здесь `/bin/dotnet`, то есть системный, и по пути пакет не
+            // опознать — набор едет со строкой запуска.
+            Step::Await("desktop     : '/bin/dotnet /opt/winforms/winforms.dll' may use windows", 15_000),
             Step::Await("desktop     : started '/bin/dotnet /opt/winforms/winforms.dll' as ", 15_000),
+            Step::Await("may use windows", 30_000),
+            // И окно открывается: право на него пакет попросил. Проверять надо
+            // обе стороны — отказ без разрешённого случая доказывал бы только
+            // то, что запрещено всё.
             Step::Await("dotnet: window 'Form1' opened, 800x450", 60_000),
             Step::Wait(2_500),
             Step::Shot("winforms-window"),
