@@ -2195,6 +2195,14 @@ pub unsafe fn init(rsdp: u64) -> bool {
         // SAFETY: контракт функции.
         match unsafe { Controller::init(device) } {
             Ok(mut controller) => {
+                // Прерывания просятся **до** перечисления, и это не порядок
+                // ради порядка. Первый дескриптор запроса отчёта ставится
+                // именно при перечислении, а бит «прервать по завершении»
+                // берётся из признака в момент заполнения. Попроси мы
+                // прерывания позже — первый отчёт пришёл бы без сигнала, и
+                // заметить это можно было бы только по сроку ожидания,
+                // который его подберёт.
+                enable_interrupts(controllers.len(), device, &controller);
                 // SAFETY: контроллер работает.
                 unsafe { controller.attach_devices() };
                 let mut summary = Summary::default();
@@ -2214,11 +2222,6 @@ pub unsafe fn init(rsdp: u64) -> bool {
             Err(err) => kprintln!("  ehci        : {} unavailable: {err}", device.address),
         }
     }
-
-    // Прерывания просятся после того, как все контроллеры подняты: до этого
-    // момента они ещё перестраивались, и признак, взведённый на полпути, было
-    // бы некому объяснить.
-    enable_interrupts(&found, &controllers);
 
     let keyboard = controllers.iter().any(|c| c.has(usb::PROTOCOL_KEYBOARD));
     let mouse = controllers.iter().any(|c| c.has(usb::PROTOCOL_MOUSE));
@@ -2254,41 +2257,32 @@ const PORT_CHECK_PERIOD_MS: u64 = 500;
 /// то есть сбросом порта и новым перечислением. Здесь делается то же самое.
 const RECOVER_AFTER: u32 = 8;
 
-/// Попросить прерывания у всех поднятых контроллеров.
+/// Попросить прерывания у одного поднятого контроллера.
 ///
-/// Отказ по любому из них не ошибка: контроллер без известной линии остаётся на
-/// опросе и работает ровно как раньше. Сказать об этом надо вслух — «USB
-/// работает медленнее, чем мог бы» человек должен видеть, а не угадывать.
-fn enable_interrupts(found: &[pci::Device], controllers: &[Controller]) {
-    let mut any = false;
-    for (index, controller) in controllers.iter().enumerate() {
-        if index >= MAX_CONTROLLERS {
-            kprintln!("  ehci        : {} has no slot for interrupts; reports will be polled for", controller.pci);
-            continue;
-        }
-        let Some(device) = found.iter().find(|entry| entry.address == controller.pci) else {
-            continue;
-        };
-        // Адрес окна кладётся до разрешения: обработчик без него не снимет
-        // признак, то есть оставит уровневую линию поднятой навсегда.
-        OPERATIONAL[index].store(controller.op, core::sync::atomic::Ordering::Relaxed);
-        let Some(gsi) = crate::irq::routing::request(device, on_interrupt) else {
-            OPERATIONAL[index].store(0, core::sync::atomic::Ordering::Relaxed);
-            kprintln!("  ehci        : {} has no interrupt line known; reports will be polled for", controller.pci);
-            continue;
-        };
-        // Накопленное снимается до разрешения: иначе первое же прерывание
-        // придёт за событие, которого мы не видели.
-        controller.write(OP_USBSTS, INTERRUPT_CAUSES);
-        controller.write(OP_USBINTR, INTERRUPT_CAUSES);
-        kprintln!("  ehci        : {} INTx on GSI {gsi}, completed transfers arrive by interrupt", controller.pci);
-        any = true;
+/// Отказ не ошибка: контроллер без известной линии остаётся на опросе и
+/// работает ровно как раньше. Сказать об этом надо вслух — «USB работает
+/// медленнее, чем мог бы» человек должен видеть, а не угадывать.
+fn enable_interrupts(index: usize, device: &pci::Device, controller: &Controller) {
+    if index >= MAX_CONTROLLERS {
+        kprintln!("  ehci        : {} has no slot for interrupts; reports will be polled for", controller.pci);
+        return;
     }
-    // Признак ставится последним и один на всех: дескрипторы просят прерывания
-    // только когда есть кому их принять, а принимает один обработчик.
-    if any {
-        WANT_INTERRUPTS.store(true, core::sync::atomic::Ordering::Relaxed);
-    }
+    // Адрес окна кладётся до разрешения: обработчик без него не снимет
+    // признак, то есть оставит уровневую линию поднятой навсегда.
+    OPERATIONAL[index].store(controller.op, core::sync::atomic::Ordering::Relaxed);
+    let Some(gsi) = crate::irq::routing::request(device, on_interrupt) else {
+        OPERATIONAL[index].store(0, core::sync::atomic::Ordering::Relaxed);
+        kprintln!("  ehci        : {} has no interrupt line known; reports will be polled for", controller.pci);
+        return;
+    };
+    // Накопленное снимается до разрешения: иначе первое же прерывание придёт за
+    // событие, которого мы не видели.
+    controller.write(OP_USBSTS, INTERRUPT_CAUSES);
+    controller.write(OP_USBINTR, INTERRUPT_CAUSES);
+    // Признак один на всех контроллеров: дескрипторы просят прерывания только
+    // когда есть кому их принять, а принимает один обработчик.
+    WANT_INTERRUPTS.store(true, core::sync::atomic::Ordering::Relaxed);
+    kprintln!("  ehci        : {} INTx on GSI {gsi}, completed transfers arrive by interrupt", controller.pci);
 }
 
 /// Тело задачи, обслуживающей контроллеры.
@@ -2318,11 +2312,16 @@ pub fn service_task() {
         // Срок остаётся и на пути с прерыванием: подключение устройства в порт
         // прерыванием не сопровождается — его находит сверка портов, а её
         // заводит именно срок.
-        let period = if devices == 0 { IDLE_PERIOD_MS } else { POLL_PERIOD_MS };
         if WANT_INTERRUPTS.load(core::sync::atomic::Ordering::Relaxed) {
-            crate::sched::block_on_irq_until(IRQ_SOURCE, period, || false);
+            // С прерываниями срок перестаёт быть опросом и становится тем, чем
+            // он и должен быть: часами сверки портов. Отчёт будит сам, а
+            // подключение устройства в порт прерыванием не сопровождается — его
+            // ищет сверка, и чаще, чем раз в полсекунды, ей незачем. Оставить
+            // здесь десять миллисекунд значило бы получить прерывания и всё
+            // равно просыпаться сто раз в секунду.
+            crate::sched::block_on_irq_until(IRQ_SOURCE, PORT_CHECK_PERIOD_MS, || false);
         } else {
-            crate::sched::sleep_ms(period);
+            crate::sched::sleep_ms(if devices == 0 { IDLE_PERIOD_MS } else { POLL_PERIOD_MS });
         }
     }
 }

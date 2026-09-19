@@ -901,6 +901,11 @@ pub const ALL: &[Scenario] = &[
             // единственное, что её показывает, это число.
             Step::Line("irq ohci"),
             Step::Await("ohci woke the system", 15_000),
+            // Сколько раз задача USB вообще просыпалась. Число прерываний
+            // говорит, что сигнал доходит; это — что задача больше не будится
+            // сроком сто раз в секунду просто так.
+            Step::Line("tasks"),
+            Step::Await("preemption :", 15_000),
             Step::Type("exit"),
             Step::Key("ret"),
             Step::Await("finishing the session", 15_000),

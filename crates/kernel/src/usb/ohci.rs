@@ -1777,11 +1777,16 @@ pub fn service_task() {
         // подключение устройства в порт контроллер отмечает признаком
         // `RHSC`, которого мы не просили, — ждать его прерывания было бы
         // ожиданием того, чего не придёт. Срок же обходит порты сам.
-        let period = if devices == 0 { IDLE_PERIOD_MS } else { POLL_PERIOD_MS };
         if WANT_INTERRUPTS.load(core::sync::atomic::Ordering::Relaxed) {
-            crate::sched::block_on_irq_until(IRQ_SOURCE, period, || false);
+            // С прерываниями срок перестаёт быть опросом и становится тем, чем
+            // он и должен быть: часами сверки портов. Отчёт будит сам, а
+            // подключение устройства в порт прерыванием не сопровождается — его
+            // ищет сверка, и чаще, чем раз в полсекунды, ей незачем. Оставить
+            // здесь десять миллисекунд значило бы получить прерывания и всё
+            // равно просыпаться сто раз в секунду.
+            crate::sched::block_on_irq_until(IRQ_SOURCE, PORT_CHECK_PERIOD_MS, || false);
         } else {
-            crate::sched::sleep_ms(period);
+            crate::sched::sleep_ms(if devices == 0 { IDLE_PERIOD_MS } else { POLL_PERIOD_MS });
         }
     }
 }
