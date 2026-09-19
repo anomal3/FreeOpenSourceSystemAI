@@ -36,12 +36,32 @@ const TAB_STOP: u32 = 8;
 /// Отступ от края экрана, чтобы текст не лип к рамке монитора.
 const MARGIN: u32 = 8;
 
+/// Наибольший масштаб глифа: столько раз повторяется каждая точка шрифта.
+///
+/// Связан с лесенкой в [`Console::new`] и существует ради одного — размера
+/// буфера строки развёртки ячейки. Поднять масштаб, не тронув эту константу,
+/// значит получить обрезанный глиф, а не отказ; поэтому она названа здесь, а не
+/// подразумевается.
+const MAX_SCALE: u32 = 3;
+
+/// Значение ячейки «что на экране — неизвестно».
+///
+/// Не может совпасть ни с одним символом: в буфер текста попадают только байты
+/// от 0x20 до 0x7E (см. `write_char_raw`), всё прочее заменяется вопросом.
+const UNKNOWN_CELL: u8 = 0xFF;
+
 /// Цвета в виде (R, G, B); в пиксель они упаковываются с учётом `PixelFormat`.
 const BG: (u8, u8, u8) = (0x0A, 0x1C, 0x2E); // тёмно-синий фон ядра
 const FG: (u8, u8, u8) = (0xD8, 0xE2, 0xEC); // светло-серый текст
 
-/// Текстовая консоль, рисующая глифы прямо в фреймбуфер.
-pub struct Console {
+/// Всё, что нужно, чтобы положить точки на экран, — и ничего больше.
+///
+/// Вынесено из [`Console`] не ради красоты. Рисование идёт **вне** замка
+/// консоли и с разрешёнными прерываниями, а состояние текста — под замком;
+/// разделить их в коде надо было прежде, чем разделять во времени. Структура
+/// маленькая и `Copy`: её выносят из-под замка целиком, одной копией.
+#[derive(Clone, Copy)]
+struct Painter {
     /// Адрес первого пикселя. Фреймбуфер 32-битный, поэтому `*mut u32`.
     base: *mut u32,
     width: u32,
@@ -50,16 +70,35 @@ pub struct Console {
     stride: u32,
     /// Во сколько раз увеличен глиф — 8x8 на экране 1024+ читается плохо.
     scale: u32,
+    fg: u32,
+    bg: u32,
+}
+
+/// Текстовая консоль, рисующая глифы прямо в фреймбуфер.
+pub struct Console {
+    /// Куда и чем рисовать.
+    fb: Painter,
     cols: u32,
     rows: u32,
     col: u32,
     row: u32,
-    fg: u32,
-    bg: u32,
     /// Теневая копия экрана: `rows * cols` символов в обычной памяти. `None` —
     /// кучи ещё нет, прокрутка недоступна. Буфер существует ровно затем, чтобы
     /// при сдвиге строк не читать фреймбуфер.
     cells: Option<Vec<u8>>,
+    /// Что сейчас **на экране**, ячейка в ячейку с [`Console::cells`].
+    ///
+    /// Два буфера вместо одного — это и есть разделение «чего мы хотим» и «что
+    /// туда положено». Печать меняет первый и возвращается; второй догоняет его
+    /// отдельно, уже с разрешёнными прерываниями. Разница между ними и есть
+    /// работа, которую осталось сделать, — и она же переживает прокрутку сама
+    /// собой: сдвиг строк в первом буфере это обычный `copy_within` в памяти.
+    painted: Option<Vec<u8>>,
+    /// С какой ячейки продолжать поиск отличий.
+    ///
+    /// Без него каждый поиск начинался бы с нуля, и перерисовка экрана стоила
+    /// бы квадрата от числа ячеек вместо линейного прохода.
+    paint_at: usize,
     /// На экране есть текст, которого нет в буфере — всё, что напечатано до
     /// [`Console::enable_scroll`]. Пока флаг взведён, буфер не описывает экран,
     /// поэтому сравнивать с ним нельзя; первая же прокрутка перерисует экран
@@ -81,6 +120,123 @@ pub struct Console {
 // ни к какому потоку и не имеющую владельца, которого можно было бы бросить.
 // Всё остальное состояние (`Vec` теневого буфера, счётчики) уже `Send`.
 unsafe impl Send for Console {}
+// SAFETY: та же причина. Копия рисовальщика уходит из-под замка и рисует на
+// другом процессоре — это законно ровно потому, что она не владеет ничем,
+// кроме адреса памяти устройства, и две копии, пишущие в разные ячейки, друг
+// другу не мешают.
+unsafe impl Send for Painter {}
+
+impl Painter {
+    /// Указатель на начало горизонтального отрезка, если он целиком на экране.
+    ///
+    /// Проверка границ делается **один раз на отрезок**, а не на точку, и в
+    /// этом весь смысл: в отладочной сборке проверка с умножением стоила
+    /// столько же, сколько сама запись, а отрезков на порядок меньше, чем
+    /// точек.
+    fn row_at(&self, x: u32, y: u32, len: u32) -> Option<*mut u32> {
+        if len == 0 || y >= self.height || x >= self.width || x + len > self.width {
+            return None;
+        }
+        let offset = (y as usize) * (self.stride as usize) + (x as usize);
+        // SAFETY: `offset + len` не выходит за `stride * height` точек — это
+        // проверено в `new` против заявленного `fb.size`, а x, y и длина отсечены
+        // выше.
+        Some(unsafe { self.base.add(offset) })
+    }
+
+    /// Записать готовый отрезок точек одной строки развёртки.
+    ///
+    /// Отрезок, не помещающийся на экране целиком, рисуется по точке: это
+    /// редкий случай (край экрана), и ради него незачем усложнять быстрый путь.
+    fn blit_row(&self, x: u32, y: u32, pixels: &[u32]) {
+        let Some(row) = self.row_at(x, y, pixels.len() as u32) else {
+            for (index, color) in pixels.iter().enumerate() {
+                self.put_pixel(x + index as u32, y, *color);
+            }
+            return;
+        };
+        for (index, color) in pixels.iter().enumerate() {
+            // SAFETY: отрезок проверен `row_at` целиком. Запись обязана быть
+            // `write_volatile` по той же причине, что и в `put_pixel`.
+            unsafe { row.add(index).write_volatile(*color) };
+        }
+    }
+
+    /// Залить отрезок одним цветом.
+    fn fill_row(&self, x: u32, y: u32, len: u32, color: u32) {
+        let Some(row) = self.row_at(x, y, len) else {
+            for index in 0..len {
+                self.put_pixel(x + index, y, color);
+            }
+            return;
+        };
+        for index in 0..len as usize {
+            // SAFETY: см. [`Console::blit_row`].
+            unsafe { row.add(index).write_volatile(color) };
+        }
+    }
+
+    fn put_pixel(&self, x: u32, y: u32, color: u32) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let offset = (y as usize) * (self.stride as usize) + (x as usize);
+        // SAFETY: `offset` не выходит за stride * height пикселей — это проверено
+        // в `new` против заявленного `fb.size`, а x/y отсечены выше. Фреймбуфер
+        // — это память устройства, поэтому запись обязана быть `write_volatile`:
+        // обычную запись компилятор вправе выбросить или объединить, решив, что
+        // никто не читает результат, — и на экране ничего бы не появилось.
+        unsafe { self.base.add(offset).write_volatile(color) };
+    }
+
+    fn draw_cell(&self, col: u32, row: u32, byte: u8) {
+        // Ячейка — единица работы с фреймбуфером, и именно здесь машина глохнет.
+        // Вывод идёт с запрещёнными прерываниями (см. [`crate::print::_print`]),
+        // а прокрутка перерисовывает до тысячи ячеек: замерено — **663 мс** на
+        // 1280x720 в отладочной сборке, то есть более полусекунды, за которые не
+        // приходит ни тик таймера, ни байт из линии. Приёмного FIFO (шестнадцать
+        // байт у 16550, тридцать два у PL011) хватает на полторы миллисекунды
+        // линии, так что всё набранное в этот промежуток терялось молча.
+        //
+        // Приёмник вычитывается изнутри отрисовки — но только если прерывания
+        // запрещены. При разрешённых байт заберёт обработчик, а лишнее чтение
+        // регистра UART на каждую ячейку стоит дороже, чем кажется: это
+        // обращение к устройству, и на тысяче ячеек их тысяча.
+        //
+        // Запрещены они теперь редко: с тех пор как рисование вынесено из
+        // промежутка молчания, сюда попадают только ранняя загрузка (кучи ещё
+        // нет, буфера тоже) и паника. Разбор при этом не делается, он отложен
+        // до возврата из прерывания; почему — написано у `input::ascii::PENDING`.
+        if !crate::arch::interrupts::enabled() {
+            crate::input::ascii::rescue();
+        }
+        let glyph = BASIC_LEGACY[byte as usize];
+        let x0 = MARGIN + col * GLYPH_W * self.scale;
+        let y0 = MARGIN + row * GLYPH_H * self.scale;
+        let width = (GLYPH_W * self.scale) as usize;
+        // Строка развёртки ячейки собирается в обычной памяти и уходит в
+        // фреймбуфер одним отрезком. Так каждая точка шрифта превращается в
+        // цвет ровно один раз, а не `scale` раз, и на весь отрезок приходится
+        // одна проверка границ вместо проверки на точку.
+        let mut line = [0u32; (GLYPH_W * MAX_SCALE) as usize];
+        for (gy, bits) in glyph.iter().copied().enumerate() {
+            for gx in 0..GLYPH_W {
+                // В font8x8 младший бит байта — самый ЛЕВЫЙ пиксель строки
+                // (формат унаследован от C-заголовка font8x8_basic.h), поэтому
+                // сдвигаем вправо на номер столбца, а не на 7 - столбец.
+                let lit = (bits >> gx) & 1 != 0;
+                let color = if lit { self.fg } else { self.bg };
+                for sx in 0..self.scale {
+                    line[(gx * self.scale + sx) as usize] = color;
+                }
+            }
+            let top = y0 + gy as u32 * self.scale;
+            for sy in 0..self.scale {
+                self.blit_row(x0, top + sy, &line[..width]);
+            }
+        }
+    }
+}
 
 impl Console {
     /// Создать консоль по описанию фреймбуфера от загрузчика.
@@ -122,18 +278,22 @@ impl Console {
         }
 
         let console = Self {
-            base: fb.base as *mut u32,
-            width: fb.width,
-            height: fb.height,
-            stride: fb.stride,
-            scale,
+            fb: Painter {
+                base: fb.base as *mut u32,
+                width: fb.width,
+                height: fb.height,
+                stride: fb.stride,
+                scale,
+                fg: encode(fb.format, FG),
+                bg: encode(fb.format, BG),
+            },
             cols,
             rows,
             col: 0,
             row: 0,
-            fg: encode(fb.format, FG),
-            bg: encode(fb.format, BG),
             cells: None,
+            painted: None,
+            paint_at: 0,
             stale: false,
             cursor: false,
             cursor_drawn: false,
@@ -148,21 +308,28 @@ impl Console {
     /// Это же и визуальное доказательство, что рисует ядро: тестовый паттерн
     /// загрузчика исчезает целиком.
     fn clear(&mut self) {
-        for y in 0..self.height {
-            // Заливка экрана — это миллион записей в память устройства, и всё
-            // это время машина глуха ровно так же, как при прокрутке (см.
-            // [`Console::draw_cell`]). Строка развёртки — достаточно мелкий шаг:
-            // около тысячи записей, десятки микросекунд.
-            crate::input::ascii::rescue();
-            for x in 0..self.width {
-                self.put_pixel(x, y, self.bg);
+        for y in 0..self.fb.height {
+            // Заливка экрана — это миллион записей в память устройства.
+            // Заливка идёт из `init` и из паники, то есть как раз там, где
+            // прерывания запрещены; строка развёртки — достаточно мелкий шаг,
+            // чтобы приёмник не переполнился между ними.
+            if !crate::arch::interrupts::enabled() {
+                crate::input::ascii::rescue();
             }
+            self.fb.fill_row(0, y, self.fb.width, self.fb.bg);
         }
         self.col = 0;
         self.row = 0;
         if let Some(cells) = self.cells.as_mut() {
             cells.fill(b' ');
         }
+        // Экран только что залит фоном, то есть на нём ровно пробелы: второй
+        // буфер обязан сказать то же самое, иначе первая же покраска
+        // перерисовала бы весь экран без нужды.
+        if let Some(painted) = self.painted.as_mut() {
+            painted.fill(b' ');
+        }
+        self.paint_at = 0;
         self.stale = false;
         self.cursor_drawn = false;
     }
@@ -177,13 +344,21 @@ impl Console {
         }
         let len = (self.rows as usize) * (self.cols as usize);
         let mut cells = Vec::new();
+        let mut painted = Vec::new();
         // `try_reserve_exact` вместо `vec![]`: отказ аллокатора обязан вернуться
         // ошибкой, а не уйти в `handle_alloc_error` и уронить ядро.
-        if cells.try_reserve_exact(len).is_err() {
+        if cells.try_reserve_exact(len).is_err() || painted.try_reserve_exact(len).is_err() {
             return false;
         }
         cells.resize(len, b' ');
+        // «На экране» начинается с того же, с чего «хотим»: текст, напечатанный
+        // до этого вызова, на экране есть, но ни одному из буферов не известен.
+        // Считать его пробелами — ровно то, что делалось и раньше: он доживает
+        // до первой прокрутки и исчезает вместе с ней.
+        painted.resize(len, b' ');
         self.cells = Some(cells);
+        self.painted = Some(painted);
+        self.paint_at = 0;
         // Текст, напечатанный до этого момента, в буфер не попал.
         self.stale = self.row != 0 || self.col != 0;
         // Экран мог уже кончиться (в режиме без прокрутки `row` вырастает до
@@ -193,124 +368,89 @@ impl Console {
         true
     }
 
-    /// Сдвинуть экран на строку вверх; курсор остаётся в последней строке.
+    /// Сдвинуть текст на строку вверх; курсор остаётся в последней строке.
     ///
-    /// Прокрутка стоит дорого: на 1280x800 при `scale = 2` экран — это 79x49
-    /// ячеек по 16x16 пикселей, то есть около миллиона записей в фреймбуфер на
-    /// полную перерисовку. Поэтому перерисовываются только ячейки, содержимое
-    /// которых после сдвига изменилось; на типичном выводе ядра (короткие
-    /// строки, много пробелов справа) это примерно половина экрана.
+    /// Раньше здесь был самый дорогой кусок ядра: прокрутка перерисовывала до
+    /// тысячи ячеек, то есть сотни тысяч записей в память устройства, и всё это
+    /// время (замерено — до 0.9 с) машина не принимала ни байта и не считала
+    /// тиков. Теперь прокрутка — это `copy_within` в обычной памяти; на экран
+    /// изменения переносит [`paint`], уже с разрешёнными прерываниями.
     fn scroll(&mut self) {
-        // Буфер вынимается из `self` на время работы: одолженная ссылка на поле
-        // не даёт вызывать методы рисования, которым нужен весь `&self`.
-        let Some(mut cells) = self.cells.take() else {
+        let Some(cells) = self.cells.as_mut() else {
             return;
         };
         let cols = self.cols as usize;
         let rows = self.rows as usize;
         let last = (rows - 1) * cols;
+        cells.copy_within(cols.., 0);
+        cells[last..].fill(b' ');
 
         if self.stale {
-            // Сравнивать не с чем: на экране есть символы, которых буфер не
-            // знает. Единственный корректный вариант — перерисовать всё.
-            cells.copy_within(cols.., 0);
-            cells[last..].fill(b' ');
-            for row in 0..rows {
-                for col in 0..cols {
-                    self.draw_cell(col as u32, row as u32, cells[row * cols + col]);
-                }
+            // На экране есть символы, которых не знает ни один буфер, — всё,
+            // что напечатано до появления кучи. Сравнивать не с чем, поэтому
+            // экран объявляется неизвестным целиком: покраска перерисует его
+            // весь, ровно как делала прежняя прокрутка в этом же случае.
+            if let Some(painted) = self.painted.as_mut() {
+                painted.fill(UNKNOWN_CELL);
             }
             self.stale = false;
-        } else {
-            // Сдвиг и отрисовка одним проходом сверху вниз: строка `row` читает
-            // строку `row + 1`, до которой проход ещё не дошёл. В фреймбуфер
-            // уходят только те ячейки, содержимое которых действительно
-            // изменилось, — сравнение идёт в обычной памяти и стоит на порядки
-            // дешевле лишней записи в память устройства.
-            for row in 0..rows - 1 {
-                for col in 0..cols {
-                    let src = cells[(row + 1) * cols + col];
-                    let dst = row * cols + col;
-                    if cells[dst] != src {
-                        cells[dst] = src;
-                        self.draw_cell(col as u32, row as u32, src);
-                    }
-                }
-            }
-            for col in 0..cols {
-                if cells[last + col] != b' ' {
-                    cells[last + col] = b' ';
-                    self.draw_cell(col as u32, (rows - 1) as u32, b' ');
-                }
-            }
         }
-
-        self.cells = Some(cells);
+        self.paint_at = 0;
         self.col = 0;
         self.row = self.rows - 1;
     }
 
-    fn put_pixel(&self, x: u32, y: u32, color: u32) {
-        if x >= self.width || y >= self.height {
-            return;
-        }
-        let offset = (y as usize) * (self.stride as usize) + (x as usize);
-        // SAFETY: `offset` не выходит за stride * height пикселей — это проверено
-        // в `new` против заявленного `fb.size`, а x/y отсечены выше. Фреймбуфер
-        // — это память устройства, поэтому запись обязана быть `write_volatile`:
-        // обычную запись компилятор вправе выбросить или объединить, решив, что
-        // никто не читает результат, — и на экране ничего бы не появилось.
-        unsafe { self.base.add(offset).write_volatile(color) };
-    }
-
-    fn draw_cell(&self, col: u32, row: u32, byte: u8) {
-        // Ячейка — единица работы с фреймбуфером, и именно здесь машина глохнет.
-        // Вывод идёт с запрещёнными прерываниями (см. [`crate::print::_print`]),
-        // а прокрутка перерисовывает до тысячи ячеек: замерено — **663 мс** на
-        // 1280x720 в отладочной сборке, то есть более полусекунды, за которые не
-        // приходит ни тик таймера, ни байт из линии. Приёмного FIFO (шестнадцать
-        // байт у 16550, тридцать два у PL011) хватает на полторы миллисекунды
-        // линии, так что всё набранное в этот промежуток терялось молча.
-        //
-        // Отсюда и вызов: приёмник вычитывается в темпе отрисовки. Стоит он одно
-        // чтение регистра состояния на ячейку — полпроцента от её цены. Разбор
-        // при этом не делается, он отложен до возврата из прерывания; почему —
-        // написано у `input::ascii::PENDING`.
-        crate::input::ascii::rescue();
-        let glyph = BASIC_LEGACY[byte as usize];
-        let x0 = MARGIN + col * GLYPH_W * self.scale;
-        let y0 = MARGIN + row * GLYPH_H * self.scale;
-        for (gy, bits) in glyph.iter().copied().enumerate() {
-            for gx in 0..GLYPH_W {
-                // В font8x8 младший бит байта — самый ЛЕВЫЙ пиксель строки
-                // (формат унаследован от C-заголовка font8x8_basic.h), поэтому
-                // сдвигаем вправо на номер столбца, а не на 7 - столбец.
-                let lit = (bits >> gx) & 1 != 0;
-                let color = if lit { self.fg } else { self.bg };
-                for sy in 0..self.scale {
-                    for sx in 0..self.scale {
-                        let px = x0 + gx * self.scale + sx;
-                        let py = y0 + gy as u32 * self.scale + sy;
-                        self.put_pixel(px, py, color);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Положить символ в ячейку экрана и в теневой буфер.
+    /// Найти следующую ячейку, которая на экране не такая, как в тексте.
     ///
-    /// Если ячейка уже показывает этот символ, запись в фреймбуфер не делается
-    /// вовсе — при прокрутке совпадений набирается много.
-    fn put_cell(&mut self, col: u32, row: u32, byte: u8) {
-        if let Some(cells) = self.cells.as_mut() {
-            let idx = (row as usize) * (self.cols as usize) + (col as usize);
-            if !self.stale && cells[idx] == byte {
-                return;
+    /// Поиск продолжается с того места, где остановился прошлый, и обходит
+    /// буфер по кругу ровно один раз: перерисовка экрана стоит одного прохода,
+    /// а не квадрата от числа ячеек.
+    ///
+    /// Ячейка отмечается покрашенной **до** того, как будет нарисована. Это
+    /// намеренно: если между отметкой и рисованием кто-то напечатает в ту же
+    /// ячейку другое, тексты снова разойдутся, и следующий проход это увидит.
+    /// Обратный порядок потерял бы такую запись молча.
+    fn next_dirty(&mut self) -> Option<(u32, u32, u8)> {
+        let cols = self.cols as usize;
+        let len = cols * self.rows as usize;
+        let cells = self.cells.as_ref()?;
+        let painted = self.painted.as_mut()?;
+        for step in 0..len {
+            let index = (self.paint_at + step) % len;
+            let want = cells[index];
+            if painted[index] == want {
+                continue;
             }
-            cells[idx] = byte;
+            painted[index] = want;
+            self.paint_at = (index + 1) % len;
+            return Some(((index % cols) as u32, (index / cols) as u32, want));
         }
-        self.draw_cell(col, row, byte);
+        None
+    }
+
+    /// Есть ли что красить.
+    fn dirty(&self) -> bool {
+        match (self.cells.as_ref(), self.painted.as_ref()) {
+            (Some(cells), Some(painted)) => cells != painted,
+            _ => false,
+        }
+    }
+
+    /// Положить символ в ячейку текста.
+    ///
+    /// На экран он попадёт не отсюда: пока буфер есть, печать только правит
+    /// текст, а разницу между текстом и экраном переносит [`paint`]. Это и есть
+    /// разделение, ради которого всё затевалось, — печать возвращается за
+    /// микросекунды вместо сотен миллисекунд.
+    ///
+    /// Буфера может не быть: до появления кучи (баннер, карта памяти) рисовать
+    /// больше некому и нечем, и там символ уходит на экран сразу.
+    fn put_cell(&mut self, col: u32, row: u32, byte: u8) {
+        let Some(cells) = self.cells.as_mut() else {
+            self.fb.draw_cell(col, row, byte);
+            return;
+        };
+        cells[(row as usize) * (self.cols as usize) + (col as usize)] = byte;
     }
 
     fn newline(&mut self) {
@@ -354,12 +494,10 @@ impl Console {
         if !self.cursor || self.cursor_drawn || self.row >= self.rows || self.col >= self.cols {
             return;
         }
-        let x0 = MARGIN + self.col * GLYPH_W * self.scale;
-        let y0 = MARGIN + (self.row + 1) * GLYPH_H * self.scale - self.scale;
-        for y in 0..self.scale {
-            for x in 0..GLYPH_W * self.scale {
-                self.put_pixel(x0 + x, y0 + y, self.fg);
-            }
+        let x0 = MARGIN + self.col * GLYPH_W * self.fb.scale;
+        let y0 = MARGIN + (self.row + 1) * GLYPH_H * self.fb.scale - self.fb.scale;
+        for y in 0..self.fb.scale {
+            self.fb.fill_row(x0, y0 + y, GLYPH_W * self.fb.scale, self.fb.fg);
         }
         self.cursor_drawn = true;
     }
@@ -379,18 +517,16 @@ impl Console {
             Some(cells) => {
                 let idx = (self.row as usize) * (self.cols as usize) + (self.col as usize);
                 let byte = cells[idx];
-                self.draw_cell(self.col, self.row, byte);
+                self.fb.draw_cell(self.col, self.row, byte);
             }
             // Буфера нет: что было под курсором, неизвестно. Затираем только саму
             // полоску фоном — нижний ряд пикселей глифа при этом пострадает, но
             // это единственный вариант, не стирающий символ целиком.
             None => {
-                let x0 = MARGIN + self.col * GLYPH_W * self.scale;
-                let y0 = MARGIN + (self.row + 1) * GLYPH_H * self.scale - self.scale;
-                for y in 0..self.scale {
-                    for x in 0..GLYPH_W * self.scale {
-                        self.put_pixel(x0 + x, y0 + y, self.bg);
-                    }
+                let x0 = MARGIN + self.col * GLYPH_W * self.fb.scale;
+                let y0 = MARGIN + (self.row + 1) * GLYPH_H * self.fb.scale - self.fb.scale;
+                for y in 0..self.fb.scale {
+                    self.fb.fill_row(x0, y0 + y, GLYPH_W * self.fb.scale, self.fb.bg);
                 }
             }
         }
@@ -527,7 +663,11 @@ pub fn enable_scroll() -> bool {
     // памяти не хватит, сообщение об этом уйдёт в serial и молча пропустит
     // экран: `_print` ниже не ждёт занятого лока.
     let mut console = CONSOLE.lock();
-    console.as_mut().is_some_and(Console::enable_scroll)
+    let enabled = console.as_mut().is_some_and(Console::enable_scroll);
+    drop(console);
+    // См. `set_cursor`: замок брали мы, значит и докрашивать нам.
+    paint();
+    enabled
 }
 
 /// Точка входа макросов вывода. Не вызывать напрямую.
@@ -562,6 +702,83 @@ pub fn _print(args: fmt::Arguments<'_>) {
     }
 }
 
+/// Один рисующий за раз.
+///
+/// Красить можно откуда угодно: печать зовёт покраску из обычного кода, а
+/// обработчик прерывания печатает и тоже зовёт. Двое рисующих поделили бы
+/// ячейки пополам и оба решили бы, что экран чист. Признак дешевле замка и,
+/// главное, **не ждёт**: опоздавший просто уходит, а его грязь докрасит тот,
+/// кто уже внутри.
+static PAINTING: AtomicBool = AtomicBool::new(false);
+
+/// Перенести на экран то, что печать уже записала в текст.
+///
+/// Здесь и происходит вся дорогая работа, и здесь же она законна: функция
+/// зовётся **вне** промежутка с запрещёнными прерываниями, и между ячейками
+/// машина полностью жива — идут часы, приходит ввод, работает вытеснение.
+///
+/// Замок консоли берётся на одну ячейку: под ним только чтение буфера, а
+/// рисование — без него. Держать его на весь проход значило бы вернуть ту же
+/// глухоту под другим именем.
+pub fn paint() {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    while PAINTING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        paint_pass();
+        PAINTING.store(false, Ordering::Release);
+        // Между последней проверкой и снятием признака сосед мог напечатать и
+        // уйти, решив, что докрасим мы. Без этой проверки его строка висела бы
+        // ненарисованной до следующей чужой печати.
+        if !dirty() {
+            return;
+        }
+    }
+}
+
+/// Один проход: красить, пока есть что.
+///
+/// Замок берётся и отпускается **на каждую ячейку**. Не «на проход» — тогда
+/// вернулась бы та же глухота, только называлась бы иначе; и не «отпустить и
+/// рисовать без него» — адрес экрана из-под замка уносить нельзя. Смена режима
+/// ([`adopt`]) подменяет консоль целиком, а у `ramfb` прежний буфер после этого
+/// возвращается в пул кадров: рисующий по унесённой копии писал бы в чужую
+/// память. Замок консоли — ровно то, что разводит эти два действия, и терять
+/// его нельзя даже на одну ячейку.
+///
+/// Прерывания при этом запрещены на время одной ячейки — около двухсот
+/// пятидесяти записей, — а между ячейками машина полностью жива.
+fn paint_pass() {
+    loop {
+        let Some(mut guard) = CONSOLE.try_lock() else {
+            return;
+        };
+        let Some(console) = guard.as_mut() else {
+            return;
+        };
+        // Экран мог уйти композитору, пока мы красили предыдущую ячейку.
+        if !READY.load(Ordering::Acquire) {
+            return;
+        }
+        let Some((col, row, byte)) = console.next_dirty() else {
+            return;
+        };
+        console.fb.draw_cell(col, row, byte);
+    }
+}
+
+/// Расходится ли текст с экраном.
+fn dirty() -> bool {
+    let Some(console) = CONSOLE.try_lock() else {
+        // Замок занят — значит кто-то печатает, и он же позовёт покраску.
+        return false;
+    };
+    console.as_ref().is_some_and(Console::dirty)
+}
+
 /// Отдать экран композитору.
 ///
 /// После этого [`kprintln!`](crate::kprintln) продолжает писать в serial, но
@@ -594,6 +811,11 @@ pub fn reclaim_screen() {
         console.stale = false;
         READY.store(true, Ordering::Release);
     }
+    drop(console);
+    // Экран только что залит фоном, и вернуть на него текст должен тот, кто
+    // его забрал. Зовётся это из паники — там прерывания запрещены, и покраска
+    // пойдёт синхронно; так и надо, сообщение важнее отзывчивости.
+    paint();
 }
 
 /// Показывать или не показывать курсор.
@@ -618,4 +840,11 @@ pub fn set_cursor(visible: bool) {
             console.erase_cursor();
         }
     }
+    drop(console);
+    // Покраску зовёт печать, но замок консоли держит не только она. Красящий,
+    // наткнувшийся на занятый замок, уходит и рассчитывает, что докрасит
+    // державший, — значит, докрасить обязан каждый, кто этот замок брал.
+    // Иначе последняя строка осталась бы ненарисованной ровно до следующей
+    // печати, то есть до тех пор, пока человек чего-нибудь не наберёт.
+    paint();
 }
