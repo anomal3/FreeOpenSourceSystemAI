@@ -70,6 +70,7 @@ const HC_REVISION: usize = 0x00;
 const HC_CONTROL: usize = 0x04;
 const HC_COMMAND_STATUS: usize = 0x08;
 const HC_INTERRUPT_STATUS: usize = 0x0C;
+const HC_INTERRUPT_ENABLE: usize = 0x10;
 const HC_INTERRUPT_DISABLE: usize = 0x14;
 const HC_HCCA: usize = 0x18;
 const HC_CONTROL_HEAD_ED: usize = 0x20;
@@ -106,6 +107,46 @@ const INTR_WDH: u32 = 1 << 1;
 const INTR_UE: u32 = 1 << 4;
 /// Все биты `HcInterruptStatus`, которые бывают взведены.
 const INTR_ALL: u32 = 0xC000_007F;
+/// Общий выключатель над всеми признаками: без него контроллер не прервёт
+/// процессор, сколько бы причин ни взвёл.
+const INTR_MIE: u32 = 1 << 31;
+/// Что нас интересует: список законченных передач и неисправимая ошибка.
+const INTERRUPT_CAUSES: u32 = INTR_WDH | INTR_UE;
+
+/// Ярлык, по которому планировщик будит задачу этого контроллера.
+const IRQ_SOURCE: u32 = crate::irq::source::OHCI;
+
+/// Окно регистров — для обработчика прерывания.
+///
+/// Обработчик вызывается без аргументов, а снять признак нужно именно в
+/// регистрах. Контроллер поддерживается один — тот же, что находит `init`.
+static REGS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Просит ли драйвер прерывания по завершении передачи.
+///
+/// Читается при заполнении дескриптора: поле «отложить прерывание» лежит в нём
+/// самом, и решать это надо на каждый запрос отчёта, а не один раз.
+static WANT_INTERRUPTS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Прерывание от контроллера.
+///
+/// Линия `INTx` разделяемая, поэтому первым делом — «наше ли это». Признаки
+/// снимаются записью единиц в те же биты; не снять их означало бы оставить
+/// уровневую линию поднятой, то есть получить то же прерывание снова и снова.
+pub fn on_interrupt() {
+    let base = REGS.load(core::sync::atomic::Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let regs = Regs { base };
+    let pending = regs.read(HC_INTERRUPT_STATUS) & INTERRUPT_CAUSES;
+    if pending == 0 {
+        return;
+    }
+    regs.write(HC_INTERRUPT_STATUS, pending);
+    crate::sched::wake_irq(IRQ_SOURCE);
+}
 
 /// `HcRhDescriptorA`: число портов корневого хаба.
 const RH_A_NDP_MASK: u32 = 0xFF;
@@ -476,9 +517,18 @@ impl Device {
     fn queue_report(&self, tail: usize) {
         let next = 1 - tail;
         let buffer = self.report.phys().as_u64() as u32;
+        // Поле «отложить прерывание» — в самом дескрипторе, поэтому решается на
+        // каждый запрос отчёта. Семёрка означает «не прерывать никогда», ноль —
+        // «прервать сразу по завершении»; промежуточные значения — задержка в
+        // кадрах, и нам она не нужна: отчёт нужен тогда, когда он пришёл.
+        let delay = if WANT_INTERRUPTS.load(core::sync::atomic::Ordering::Relaxed) {
+            0
+        } else {
+            TD_NO_INTERRUPT
+        };
         self.ring.td_fill(
             tail,
-            TD_CC_NOT_ACCESSED | TD_DP_IN | TD_ROUNDING | TD_NO_INTERRUPT,
+            TD_CC_NOT_ACCESSED | TD_DP_IN | TD_ROUNDING | delay,
             buffer,
             self.ring.td_phys(next),
             buffer + u32::from(self.report_len) - 1,
@@ -597,7 +647,41 @@ impl Controller {
         unsafe { controller.take_over()? };
         // SAFETY: контроллер сброшен и переведён в рабочее состояние.
         unsafe { controller.start_root_hub() };
+        // Прерывания просятся последними: до этого момента контроллер ещё
+        // перестраивался, и признак, взведённый на полпути, было бы некому
+        // объяснить.
+        //
+        // SAFETY: контроллер работает, окно отображено.
+        unsafe { controller.enable_interrupts(&device) };
         Ok(controller)
+    }
+
+    /// Попросить прерывания вместо опроса.
+    ///
+    /// Отказ не ошибка: без известной линии контроллер остаётся на опросе и
+    /// работает ровно как раньше. Сказать об этом надо вслух — «USB работает
+    /// медленнее, чем мог бы» человек должен видеть, а не угадывать.
+    ///
+    /// # Safety
+    ///
+    /// Контроллер должен быть в рабочем состоянии, окно — отображено.
+    unsafe fn enable_interrupts(&mut self, device: &pci::Device) {
+        // Адрес окна кладётся до разрешения: обработчик без него не снимет
+        // признак, то есть оставит уровневую линию поднятой навсегда.
+        REGS.store(self.regs.base, core::sync::atomic::Ordering::Relaxed);
+
+        let Some(gsi) = crate::irq::routing::request(device, on_interrupt) else {
+            kprintln!("  ohci        : no interrupt line known; reports will be polled for");
+            REGS.store(0, core::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+
+        // Накопленное снимается до разрешения: иначе первое же прерывание
+        // придёт за событие, которого мы не видели.
+        self.regs.write(HC_INTERRUPT_STATUS, INTR_ALL);
+        self.regs.write(HC_INTERRUPT_ENABLE, INTERRUPT_CAUSES | INTR_MIE);
+        WANT_INTERRUPTS.store(true, core::sync::atomic::Ordering::Relaxed);
+        kprintln!("  ohci        : INTx on GSI {gsi}, completed transfers arrive by interrupt");
     }
 
     /// Забрать контроллер у прошивки и перевести его в рабочее состояние.
@@ -1689,7 +1773,16 @@ pub fn service_task() {
             }
         }
 
-        crate::sched::sleep_ms(if devices == 0 { IDLE_PERIOD_MS } else { POLL_PERIOD_MS });
+        // Срок остаётся и на пути с прерыванием, и это не перестраховка:
+        // подключение устройства в порт контроллер отмечает признаком
+        // `RHSC`, которого мы не просили, — ждать его прерывания было бы
+        // ожиданием того, чего не придёт. Срок же обходит порты сам.
+        let period = if devices == 0 { IDLE_PERIOD_MS } else { POLL_PERIOD_MS };
+        if WANT_INTERRUPTS.load(core::sync::atomic::Ordering::Relaxed) {
+            crate::sched::block_on_irq_until(IRQ_SOURCE, period, || false);
+        } else {
+            crate::sched::sleep_ms(period);
+        }
     }
 }
 

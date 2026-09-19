@@ -125,6 +125,76 @@ const STS_PERIODIC_ON: u32 = 1 << 14;
 const STS_ASYNC_ON: u32 = 1 << 15;
 /// Все признаки, сбрасываемые записью единицы.
 const STS_ACK_ALL: u32 = 0x3F;
+/// Закончился дескриптор, просивший прерывания.
+const STS_INTERRUPT: u32 = 1 << 0;
+/// То же, но с ошибкой.
+const STS_ERROR_INTERRUPT: u32 = 1 << 1;
+
+/// Что разрешаем и что снимаем в обработчике.
+///
+/// Ровно два признака, и остальные не случайно. Бит `Interrupt on Async
+/// Advance` драйвер **ждёт сам** — им подтверждается звонок при перестройке
+/// асинхронного кольца, — и обработчик, снявший его первым, оставил бы то
+/// ожидание вечным. Бит «системная ошибка хоста» читает `service`, и снимать
+/// его за его спиной значило бы прятать неисправность.
+const INTERRUPT_CAUSES: u32 = STS_INTERRUPT | STS_ERROR_INTERRUPT;
+
+/// Ярлык, по которому планировщик будит задачу контроллеров.
+const IRQ_SOURCE: u32 = crate::irq::source::EHCI;
+
+/// Сколько контроллеров может прислать прерывание.
+///
+/// Контроллеров у EHCI бывает несколько — чипсеты Intel ставят по два, каждый
+/// со своими портами, — поэтому здесь массив, а не одно поле. Четырёх хватает
+/// на любую из машин, которые мы видели; пятый останется на опросе и скажет об
+/// этом.
+const MAX_CONTROLLERS: usize = 4;
+
+/// Окна рабочих регистров — для обработчика прерывания.
+static OPERATIONAL: [core::sync::atomic::AtomicUsize; MAX_CONTROLLERS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_CONTROLLERS];
+
+/// Просит ли драйвер прерывания по завершении передачи.
+static WANT_INTERRUPTS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Просить ли прерывание у дескриптора запроса отчёта.
+///
+/// Решается на каждый запрос, а не один раз: бит лежит в самом дескрипторе, и
+/// до включения прерываний он обязан быть сброшен — разрешённое, но не
+/// обслуживаемое прерывание уровня повесило бы машину намертво.
+fn report_interrupt() -> u32 {
+    if WANT_INTERRUPTS.load(core::sync::atomic::Ordering::Relaxed) { TOKEN_IOC } else { 0 }
+}
+
+/// Прерывание от контроллера.
+///
+/// Линия разделяемая, и контроллеров на ней может быть несколько, поэтому
+/// обходятся все: у каждого спрашивается его собственный регистр состояния.
+/// Признаки снимаются записью единиц; не снять их означало бы оставить
+/// уровневую линию поднятой — то есть получить то же прерывание снова и снова,
+/// пока машина не встанет от занятости.
+pub fn on_interrupt() {
+    let mut ours = false;
+    for slot in &OPERATIONAL {
+        let op = slot.load(core::sync::atomic::Ordering::Relaxed);
+        if op == 0 {
+            continue;
+        }
+        // SAFETY: адрес положен сюда только после отображения окна, и окно
+        // живёт всё время работы ядра.
+        let status = unsafe { ((op + OP_USBSTS) as *const u32).read_volatile() } & INTERRUPT_CAUSES;
+        if status == 0 {
+            continue;
+        }
+        // SAFETY: см. выше.
+        unsafe { ((op + OP_USBSTS) as *mut u32).write_volatile(status) };
+        ours = true;
+    }
+    if ours {
+        crate::sched::wake_irq(IRQ_SOURCE);
+    }
+}
 
 const PORT_CCS: u32 = 1 << 0;
 const PORT_CSC: u32 = 1 << 1;
@@ -208,6 +278,8 @@ const TOKEN_PID_SETUP: u32 = 0b10 << 8;
 /// Три повтора при ошибке транзакции.
 const TOKEN_RETRIES: u32 = 0b11 << 10;
 const TOKEN_TOGGLE: u32 = 1 << 31;
+/// Прервать процессор, когда этот дескриптор закончится.
+const TOKEN_IOC: u32 = 1 << 15;
 const TOKEN_LENGTH_SHIFT: u32 = 16;
 const TOKEN_LENGTH_MASK: u32 = 0x7FFF;
 
@@ -1668,7 +1740,11 @@ impl Controller {
             PAGE_TD_REPORT,
             LINK_TERMINATE,
             LINK_TERMINATE,
-            TOKEN_ACTIVE | TOKEN_PID_IN | TOKEN_RETRIES | (u32::from(device.report_len) << TOKEN_LENGTH_SHIFT),
+            TOKEN_ACTIVE
+                | TOKEN_PID_IN
+                | TOKEN_RETRIES
+                | report_interrupt()
+                | (u32::from(device.report_len) << TOKEN_LENGTH_SHIFT),
             pipe.at(PAGE_REPORT),
         );
         pipe.write(PAGE_INTERRUPT_QH + QH_OVERLAY_NEXT, pipe.at(PAGE_TD_REPORT));
@@ -1920,13 +1996,24 @@ impl Controller {
             let segment = self.segment;
             // `queue_report` без заимствования контроллера: цикл держит его
             // устройства изменяемыми.
+            //
+            // Это **вторая копия** одного и того же заполнения, и она уже
+            // однажды солгала: бит «прервать по завершении» поставили в
+            // `queue_report`, а сюда забыли — и прерывания не приходили вовсе,
+            // хотя всё остальное было настроено верно. Первый дескриптор
+            // ставится при перечислении, все следующие — здесь, то есть именно
+            // здесь и решается, будет ли работать прерывание.
             pipe.write(PAGE_TD_REPORT + TD_NEXT, LINK_TERMINATE);
             pipe.write(PAGE_TD_REPORT + TD_ALT, LINK_TERMINATE);
             pipe.write(PAGE_TD_REPORT + TD_BUFFER, pipe.at(PAGE_REPORT));
             pipe.write(PAGE_TD_REPORT + TD_BUFFER_HIGH, segment);
             pipe.write(
                 PAGE_TD_REPORT + TD_TOKEN,
-                TOKEN_ACTIVE | TOKEN_PID_IN | TOKEN_RETRIES | (u32::from(report_len) << TOKEN_LENGTH_SHIFT),
+                TOKEN_ACTIVE
+                    | TOKEN_PID_IN
+                    | TOKEN_RETRIES
+                    | report_interrupt()
+                    | (u32::from(report_len) << TOKEN_LENGTH_SHIFT),
             );
             pipe.write(PAGE_INTERRUPT_QH + QH_OVERLAY_NEXT, pipe.at(PAGE_TD_REPORT));
         }
@@ -2128,6 +2215,11 @@ pub unsafe fn init(rsdp: u64) -> bool {
         }
     }
 
+    // Прерывания просятся после того, как все контроллеры подняты: до этого
+    // момента они ещё перестраивались, и признак, взведённый на полпути, было
+    // бы некому объяснить.
+    enable_interrupts(&found, &controllers);
+
     let keyboard = controllers.iter().any(|c| c.has(usb::PROTOCOL_KEYBOARD));
     let mouse = controllers.iter().any(|c| c.has(usb::PROTOCOL_MOUSE));
     let sources = input::sources();
@@ -2162,6 +2254,43 @@ const PORT_CHECK_PERIOD_MS: u64 = 500;
 /// то есть сбросом порта и новым перечислением. Здесь делается то же самое.
 const RECOVER_AFTER: u32 = 8;
 
+/// Попросить прерывания у всех поднятых контроллеров.
+///
+/// Отказ по любому из них не ошибка: контроллер без известной линии остаётся на
+/// опросе и работает ровно как раньше. Сказать об этом надо вслух — «USB
+/// работает медленнее, чем мог бы» человек должен видеть, а не угадывать.
+fn enable_interrupts(found: &[pci::Device], controllers: &[Controller]) {
+    let mut any = false;
+    for (index, controller) in controllers.iter().enumerate() {
+        if index >= MAX_CONTROLLERS {
+            kprintln!("  ehci        : {} has no slot for interrupts; reports will be polled for", controller.pci);
+            continue;
+        }
+        let Some(device) = found.iter().find(|entry| entry.address == controller.pci) else {
+            continue;
+        };
+        // Адрес окна кладётся до разрешения: обработчик без него не снимет
+        // признак, то есть оставит уровневую линию поднятой навсегда.
+        OPERATIONAL[index].store(controller.op, core::sync::atomic::Ordering::Relaxed);
+        let Some(gsi) = crate::irq::routing::request(device, on_interrupt) else {
+            OPERATIONAL[index].store(0, core::sync::atomic::Ordering::Relaxed);
+            kprintln!("  ehci        : {} has no interrupt line known; reports will be polled for", controller.pci);
+            continue;
+        };
+        // Накопленное снимается до разрешения: иначе первое же прерывание
+        // придёт за событие, которого мы не видели.
+        controller.write(OP_USBSTS, INTERRUPT_CAUSES);
+        controller.write(OP_USBINTR, INTERRUPT_CAUSES);
+        kprintln!("  ehci        : {} INTx on GSI {gsi}, completed transfers arrive by interrupt", controller.pci);
+        any = true;
+    }
+    // Признак ставится последним и один на всех: дескрипторы просят прерывания
+    // только когда есть кому их принять, а принимает один обработчик.
+    if any {
+        WANT_INTERRUPTS.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Тело задачи, обслуживающей контроллеры.
 pub fn service_task() {
     let mut next_port_check = 0u64;
@@ -2186,7 +2315,15 @@ pub fn service_task() {
                 poll_hotplug();
             }
         }
-        crate::sched::sleep_ms(if devices == 0 { IDLE_PERIOD_MS } else { POLL_PERIOD_MS });
+        // Срок остаётся и на пути с прерыванием: подключение устройства в порт
+        // прерыванием не сопровождается — его находит сверка портов, а её
+        // заводит именно срок.
+        let period = if devices == 0 { IDLE_PERIOD_MS } else { POLL_PERIOD_MS };
+        if WANT_INTERRUPTS.load(core::sync::atomic::Ordering::Relaxed) {
+            crate::sched::block_on_irq_until(IRQ_SOURCE, period, || false);
+        } else {
+            crate::sched::sleep_ms(period);
+        }
     }
 }
 

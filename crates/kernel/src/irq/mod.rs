@@ -38,11 +38,15 @@ pub mod source {
     pub const AHCI: u32 = 5;
     /// Контроллер NVMe.
     pub const NVME: u32 = 6;
+    /// Контроллер USB 1.1.
+    pub const OHCI: u32 = 7;
+    /// Контроллер USB 2.0.
+    pub const EHCI: u32 = 8;
 
     /// Сколько источников помещается в таблицу счётчиков. Нулевой не занят
     /// никем: ноль — слишком удобное значение по умолчанию, чтобы отдавать его
     /// настоящему устройству.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 12;
 
     /// Имя источника для диагностики.
     #[must_use]
@@ -54,6 +58,8 @@ pub mod source {
             VIRTIO_BLK => "virtio-blk",
             AHCI => "ahci",
             NVME => "nvme",
+            OHCI => "ohci",
+            EHCI => "ehci",
             _ => "unknown",
         }
     }

@@ -1556,6 +1556,16 @@ fn interrupt_wakes(argument: &str) {
     if shown == 0 {
         sprintln!("  irq         : no such interrupt source");
     }
+    if !wanted.is_empty() {
+        return;
+    }
+    // Линии отдельной строкой: у них есть вопрос, которого нет у MSI, — сколько
+    // раз линия сработала **вообще**, считая разы, когда никто не признал
+    // сигнал своим. Разойтись эти числа могут только в одну сторону, зато в
+    // самую опасную.
+    for (gsi, users, calls) in crate::irq::routing::shared_lines() {
+        sprintln!("  irq         : line GSI {gsi}: {users} device(s), {calls} interrupt(s)");
+    }
 }
 
 /// От чьего имени система запускает программы.

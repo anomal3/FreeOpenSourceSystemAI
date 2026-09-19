@@ -29,7 +29,7 @@
 //! арх-части, и у двух архитектур оно разное (вход I/O APIC против SPI у GIC).
 //! Здесь только ответ на вопрос «какая линия», один на обе.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::sync::SpinLock;
 use crate::{acpi, kprintln};
@@ -169,6 +169,15 @@ static LINE_GSI: [AtomicU32; MAX_LINES] = [const { AtomicU32::new(LINE_FREE) }; 
 static LINE_HANDLERS: [[AtomicUsize; MAX_SHARERS]; MAX_LINES] =
     [const { [const { AtomicUsize::new(0) }; MAX_SHARERS] }; MAX_LINES];
 
+/// Сколько раз линия срабатывала — считая и те разы, когда никто из сидящих на
+/// ней не признал сигнал своим.
+///
+/// Это не то же, что счётчик пробуждений: тот считает признанные сигналы. Два
+/// числа расходятся ровно в одном случае, зато в самом опасном — линия поднята
+/// причиной, которой никто не снимает. У уровневого прерывания это не «лишний
+/// вызов», а машина, занятая одним и тем же сигналом бесконечно.
+static LINE_CALLS: [AtomicU64; MAX_LINES] = [const { AtomicU64::new(0) }; MAX_LINES];
+
 /// Переходники: у арх-части обработчик без аргументов, а какая именно линия
 /// сработала, знать надо. По одному переходнику на ячейку — единственный способ
 /// передать номер, не заводя обработчику аргумент, которого у прерывания нет.
@@ -191,6 +200,7 @@ static TRAMPOLINES: [fn(); MAX_LINES] = [
 /// устройство, чей признак никто не снял, будет поднимать линию снова и снова,
 /// и машина встанет не от ошибки, а от занятости.
 fn fire(line: usize) {
+    LINE_CALLS[line].fetch_add(1, Ordering::Relaxed);
     for slot in &LINE_HANDLERS[line] {
         let handler = slot.load(Ordering::Acquire);
         if handler == 0 {
@@ -283,7 +293,7 @@ fn add_handler(line: usize, handler: fn()) -> bool {
 
 /// Сколько устройств сидит на каждой заведённой линии — для диагностики.
 #[must_use]
-pub fn shared_lines() -> alloc::vec::Vec<(u32, usize)> {
+pub fn shared_lines() -> alloc::vec::Vec<(u32, usize, u64)> {
     let mut out = alloc::vec::Vec::new();
     for (slot, taken) in LINE_GSI.iter().enumerate() {
         let gsi = taken.load(Ordering::Acquire);
@@ -294,7 +304,7 @@ pub fn shared_lines() -> alloc::vec::Vec<(u32, usize)> {
             .iter()
             .filter(|handler| handler.load(Ordering::Acquire) != 0)
             .count();
-        out.push((gsi, users));
+        out.push((gsi, users, LINE_CALLS[slot].load(Ordering::Relaxed)));
     }
     out
 }
