@@ -8349,7 +8349,12 @@ pub const ALL: &[Scenario] = &[
             Step::Key("home"),
             Step::Key("ret"),
             Step::Await("taskmgr: opened location /bin for #", 15_000),
-            Step::Await("files: /bin has 38 entries", 30_000),
+            // Сколько именно программ в /bin — не свойство диспетчера задач, а
+            // свойство сборки: с тех пор как это число вписали, добавились
+            // httpd и ещё три, и проверка падала, ничего не найдя. Проверяется
+            // то, ради чего шаг стоит: «Файлы» открылись в /bin и увидели там
+            // каталог, а не пустоту.
+            Step::AtLeast("files: /bin has ", 30, 30_000),
             Step::Wait(1_500),
             Step::Shot("03-location"),
             Step::Aim(Aim::Close("Files")),
