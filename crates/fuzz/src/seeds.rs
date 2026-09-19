@@ -120,6 +120,94 @@ pub fn hid_descriptors() -> Vec<Vec<u8>> {
     ]
 }
 
+/// Таблицы DSDT с настоящих машин — в том виде, в каком их пишут прошивки.
+///
+/// Две, и это важно: ArmVirtQemu описывает маршрутизацию переменным пакетом
+/// (`0x13`), OVMF — обычным (`0x12`), и объявляет её не именем, а методом,
+/// рядом с которым лежат две готовые таблицы. Один образец проверял бы половину
+/// разборщика.
+///
+/// Байты сняты дампом из загруженной системы, длины пересчитаны под укороченные
+/// образцы: целая таблица — восемь килобайт, и портить в ней имеет смысл тот же
+/// килобайт.
+#[must_use]
+pub fn dsdt_tables() -> Vec<Vec<u8>> {
+    /// Заголовок таблицы ACPI: разборщик его пропускает, и без него смещения
+    /// сошлись бы случайно.
+    fn header() -> Vec<u8> {
+        let mut bytes = vec![0u8; 36];
+        bytes[..4].copy_from_slice(b"DSDT");
+        bytes
+    }
+
+    /// `Device (<имя>)` со связкой, сидящей на линии `gsi`.
+    fn link(name: &[u8; 4], gsi: u8, flags: u8) -> Vec<u8> {
+        let mut body = vec![0x08, b'_', b'H', b'I', b'D', 0x0D];
+        body.extend_from_slice(b"PNP0C0F ");
+        // `_PRS` идёт раньше `_CRS` и содержит такой же дескриптор: разборщик,
+        // берущий первый попавшийся, обязан ошибиться именно здесь.
+        for name in [b"_PRS", b"_CRS"] {
+            body.extend_from_slice(&[0x08]);
+            body.extend_from_slice(name);
+            body.extend_from_slice(&[0x11, 0x0E, 0x0A, 0x0B]);
+            body.extend_from_slice(&[0x89, 0x06, 0x00, flags, 0x01, gsi, 0x00, 0x00, 0x00, 0x79, 0x00]);
+        }
+        let mut out = vec![0x5B, 0x82, (1 + 4 + body.len()) as u8];
+        out.extend_from_slice(name);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Одна запись маршрутизации: устройство, вывод, имя связки.
+    fn entry(device: u8, pin: u8, name: &[u8; 4]) -> Vec<u8> {
+        let mut body = vec![0x0C, 0xFF, 0xFF, device, 0x00];
+        body.extend_from_slice(&[0x0A, pin]);
+        body.extend_from_slice(name);
+        body.push(0x00);
+        let mut out = vec![0x12, (1 + 1 + body.len()) as u8, 4];
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn table(name: &[u8; 4], variable: bool, entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        if variable {
+            body.extend_from_slice(&[0x0A, entries.len() as u8]);
+        } else {
+            body.push(entries.len() as u8);
+        }
+        for one in entries {
+            body.extend_from_slice(one);
+        }
+        let mut out = vec![0x08];
+        out.extend_from_slice(name);
+        out.push(if variable { 0x13 } else { 0x12 });
+        out.push((1 + body.len()) as u8);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    // `virt` под ArmVirtQemu: связки `L00x` на SPI 35–38, переменный пакет.
+    let mut arm = header();
+    arm.extend_from_slice(&link(b"L000", 35, 0x01));
+    arm.extend_from_slice(&link(b"L001", 36, 0x01));
+    arm.extend_from_slice(&table(
+        b"_PRT",
+        true,
+        &[entry(0, 0, b"L000"), entry(0, 1, b"L001"), entry(1, 0, b"L001")],
+    ));
+
+    // Q35 под OVMF: связки `GSIx` на линиях 16–23, обычный пакет, и рядом с
+    // таблицей режима APIC лежит таблица режима PIC — ту брать нельзя.
+    let mut x86 = header();
+    x86.extend_from_slice(&link(b"GSIE", 20, 0x09));
+    x86.extend_from_slice(&link(b"LNKE", 11, 0x09));
+    x86.extend_from_slice(&table(b"PRTP", false, &[entry(3, 0, b"LNKE")]));
+    x86.extend_from_slice(&table(b"PRTA", false, &[entry(3, 0, b"GSIE")]));
+
+    vec![arm, x86]
+}
+
 /// Правильный контейнер `.fpk` с одним файлом внутри.
 ///
 /// Собран здесь руками, потому что писателя у крейта нет: контейнер пишет

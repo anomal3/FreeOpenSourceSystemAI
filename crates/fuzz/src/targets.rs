@@ -168,6 +168,29 @@ pub static TARGETS: &[Target] = &[
         },
     },
     Target {
+        name: "aml",
+        about: "Таблица ACPI чужой машины: маршрутизация прерываний PCI в AML.",
+        seeds: seeds::dsdt_tables,
+        hot_bytes: usize::MAX,
+        run: |bytes| {
+            // Тут байты прошивки впервые превращаются в числа, которыми потом
+            // размаскируется вход контроллера прерываний. Ошибка разбора — это
+            // не «неверная линия», а разрешённое прерывание на чужом входе;
+            // ошибка в длине пакета — чтение за концом таблицы.
+            let mut routes =
+                [aml::Route { device: 0, pin: 0, gsi: 0, level: true, active_low: true }; 128];
+            let _ = aml::routing(bytes, &mut routes);
+            // И с выходом на одну запись: переполнение считается отдельной
+            // веткой, а ветка, которую фаззер не проходит, не проверена.
+            let mut one =
+                [aml::Route { device: 0, pin: 0, gsi: 0, level: true, active_low: true }; 1];
+            let _ = aml::routing(bytes, &mut one);
+            // И вовсе без места: нулевой срез — законный вход, и делить на его
+            // длину нельзя.
+            let _ = aml::routing(bytes, &mut []);
+        },
+    },
+    Target {
         name: "usb-hid",
         about: "Дескриптор отчёта чужого устройства ввода.",
         seeds: seeds::hid_descriptors,

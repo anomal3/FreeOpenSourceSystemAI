@@ -535,6 +535,7 @@ version = "0.7.0"
 name = "freeos-fuzz"
 version = "0.7.0"
 dependencies = [
+ "aml",
  "btrfs",
  "clr-meta",
  "disk",

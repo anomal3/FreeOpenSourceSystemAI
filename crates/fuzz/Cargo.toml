@@ -11,6 +11,7 @@ publish = false
 # `catch_unwind`, которых нет ни под UEFI, ни в ядре. Сами разборщики при этом
 # остаются `no_std` — фаззер их только зовёт.
 [dependencies]
+aml = { path = "../aml" }
 disk = { path = "../disk" }
 ext2 = { path = "../ext2" }
 btrfs = { path = "../btrfs" }
