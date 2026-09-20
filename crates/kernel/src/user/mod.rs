@@ -73,6 +73,7 @@ use core::fmt::Write as _;
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::vec::Vec;
 
 use crate::mm::{FrameAllocator, HUGE_PAGE_FRAMES, HUGE_PAGE_SIZE, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
@@ -455,25 +456,27 @@ impl core::fmt::Display for Error {
     }
 }
 
-/// Программа, привязанная к задаче планировщика.
+/// Процесс: всё, что у программы общее, чем бы её ни исполняли.
 ///
-/// Всё, что раньше существовало в одном экземпляре на систему: адресное
-/// пространство, таблица открытых файлов и признак «сейчас исполняется код в
-/// третьем кольце». Каждое из них — состояние программы, а программ теперь
-/// столько же, сколько задач, которые их запустили.
+/// Адресное пространство, таблица открытых файлов, личность, права, окна и
+/// области. С фазы 55a задача этим **не владеет**, а ссылается: таблица по
+/// слотам хранит `Arc`, и процесс живёт, пока жива хоть одна ссылка. Отсюда и
+/// пойдут потоки — вторая задача с той же ссылкой.
+///
+/// Чего здесь больше нет — признака «сейчас исполняется код в третьем кольце»
+/// ([`IN_USER`]). Он принадлежит задаче: у процесса с двумя потоками один
+/// может стоять в системном вызове, пока другой исполняет свой код, и одного
+/// признака на двоих не хватило бы.
+///
+/// Имя пока прежнее. Переименование в `Process` тронуло бы сорок четыре места
+/// вызова и ничего бы не доказало; оно уместно тогда, когда рядом появится
+/// `Thread`, то есть в 55b.
 pub struct Program {
     space: Space,
     /// Открытые файлы. Публично, потому что ими распоряжаются системные вызовы
     /// ([`syscall`]), а прятать таблицу за парой одинаковых методов означало бы
     /// переписать её интерфейс дважды.
     pub files: files::Table,
-    /// Исполняется ли прямо сейчас код в третьем кольце.
-    ///
-    /// Нужно обработчику отказов: исключение «из третьего кольца» снимает
-    /// программу, но только если она действительно там. Отказ в момент, когда
-    /// программы нет, означает испорченное состояние процессора, и возвращаться
-    /// в этом случае некуда.
-    running: bool,
     /// Просили ли снять эту программу.
     ///
     /// Флаг, а не немедленное снятие, по той же причине, по которой вытеснение
@@ -1061,19 +1064,45 @@ fn take_frame_reserved() -> Option<PhysAddr> {
 /// программы нужны три машинных числа ([`sched::UserMachine`]), которые он
 /// обязан переставлять сам, а всё остальное — дело этого модуля, и знать о нём
 /// планировщику незачем.
-static PROGRAMS: Mutex<[Option<Program>; sched::MAX_TASKS]> =
+static PROGRAMS: Mutex<[Option<Arc<Mutex<Program>>>; sched::MAX_TASKS]> =
     Mutex::new([const { None }; sched::MAX_TASKS]);
+
+/// Исполняется ли прямо сейчас код третьего кольца в этом слоте.
+///
+/// По слоту, а не в [`Program`], и это первая половина разделения процесса и
+/// потока. Ответ на вопрос «мы сейчас в третьем кольце» принадлежит **задаче**:
+/// потоков у процесса будет несколько, и один может стоять в системном вызове,
+/// пока другой исполняет свой код.
+///
+/// Атомик, а не поле под локом, и это важнее, чем кажется. Спрашивает отсюда
+/// обработчик отказа страницы — тому нельзя ни ждать, ни засыпать, а прежний
+/// ответ брал спящий лок таблицы программ **до** разрешения прерываний.
+static IN_USER: [AtomicBool; sched::MAX_TASKS] =
+    [const { AtomicBool::new(false) }; sched::MAX_TASKS];
+
+/// Процесс исполняющейся задачи — ссылкой, а не заимствованием.
+///
+/// Лок таблицы держится ровно на время клонирования ссылки. Это и есть цена
+/// разделения: раньше лок таблицы удерживался на всё время работы с программой,
+/// то есть **каждый системный вызов каждой задачи** выстраивался в одну
+/// очередь на единственном локе.
+fn current_process() -> Option<Arc<Mutex<Program>>> {
+    let slot = sched::current_slot();
+    let table = PROGRAMS.lock();
+    table.get(slot).and_then(Option::as_ref).cloned()
+}
 
 /// Сделать что-нибудь с программой текущей задачи.
 ///
 /// `None`, если задача программы не исполняет, — например, когда системный
 /// вызов пришёл неизвестно откуда.
 pub fn with_current<R>(f: impl FnOnce(&mut Program) -> R) -> Option<R> {
-    // Слот спрашивается до захвата лока: так два лока никогда не удерживаются
-    // одновременно, и порядок их взятия перестаёт быть вопросом.
-    let slot = sched::current_slot();
-    let mut table = PROGRAMS.lock();
-    table.get_mut(slot).and_then(Option::as_mut).map(f)
+    // Порядок локов всегда один: таблица, потом процесс, — и второй берётся
+    // после того, как первый отпущен. Два лока одновременно не удерживаются
+    // нигде, поэтому вопроса об их порядке не возникает вовсе.
+    let process = current_process()?;
+    let mut program = process.lock();
+    Some(f(&mut program))
 }
 
 /// Сколько байт поверхности окна ядро согласно выдать.
@@ -1933,10 +1962,9 @@ fn run(
             // его.
             return Err(Error::AlreadyRunning);
         }
-        *entry = Some(Program {
+        *entry = Some(Arc::new(Mutex::new(Program {
             space,
             files: files::Table::new(),
-            running: true,
             kill_requested: false,
             cred,
             rights,
@@ -1944,8 +1972,12 @@ fn run(
             stdin,
             stdout,
             mappings: loaded.mappings,
-        });
+        })));
     }
+    // Признак поднимается после того, как процесс попал в таблицу: обработчик
+    // отказа читает его без лока и вправе увидеть `true` только тогда, когда
+    // программу уже есть где найти.
+    IN_USER[slot].store(true, Ordering::Release);
 
     // Планировщик узнаёт о пространстве до того, как процессор на него
     // переключится, — и с Phase 13b этот порядок стал обязательным, а не
@@ -1985,27 +2017,43 @@ fn run(
     // пространства возвращает окно в пул кадров, а таблица дескрипторов
     // закрывает всё, что программа не закрыла сама. Снятая отказом закрыть их и
     // не могла.
-    let program = {
+    IN_USER[slot].store(false, Ordering::Release);
+    let process = {
         let mut table = PROGRAMS.lock();
         table.get_mut(slot).and_then(Option::take)
     };
-    let leaked = program.as_ref().map_or(0, |program| program.files.open_count());
+    // Владение теперь считается ссылками, и последняя ушедшая уничтожает
+    // процесс. Пока поток у процесса один, последняя — эта; когда потоков
+    // станет несколько (фаза 55b), здесь останется ждать остальных. Сторож
+    // говорит вслух, если ссылка не единственная: молчаливое `Drop`, не
+    // случившееся вовремя, выглядит потом как утечка кадров.
+    if let Some(process) = process.as_ref() {
+        let others = Arc::strong_count(process) - 1;
+        if others > 0 {
+            kprintln!("  user        : the process still has {others} live reference(s) at exit");
+        }
+    }
+    let leaked = process.as_ref().map_or(0, |process| process.lock().files.open_count());
     if leaked > 0 {
         kprintln!("  user        : closed {leaked} file(s) the program left open");
     }
     // Сколько страниц образа программа прочитала и сколько из них пришлось
     // выбросить (фаза 54). Числа стоят сразу за неизменной подстрокой — их
     // читает стенд: обход образа обязан стоить по одному чтению на страницу.
-    if let Some(program) = &program {
+    if let Some(process) = &process {
+        let program = process.lock();
         let (reads, evictions) = program.mappings.iter().fold((0u64, 0u64), |sum, region| match &region.source {
             Source::Image(image) => (sum.0 + image.reads, sum.1 + image.evictions),
             _ => sum,
         });
         kprintln!("  user        : program image released, {reads} reads and {evictions} evictions");
     }
-    // Программа уничтожается здесь: `Drop` её пространства возвращает в пул всё,
-    // что под ним лежит, — и стек, и прочитанные страницы образа.
-    drop(program);
+    // Процесс уничтожается здесь — точнее, здесь уходит последняя ссылка на
+    // него, и `Drop` пространства возвращает в пул всё, что под ним лежит: и
+    // стек, и прочитанные страницы образа. Разница с прежним «уничтожается
+    // здесь» не словесная: порядок теперь обеспечивает счётчик ссылок, а не
+    // текст этой функции.
+    drop(process);
 
     // Сокеты закрываются здесь же и по той же причине: программа, снятая по
     // `kill` или отказавшая, ничего не закрывает сама, а незакрытый сокет
@@ -2413,7 +2461,7 @@ pub fn fault_in(addr: usize, write: bool, present: bool) -> bool {
 /// Исполняет ли текущая задача код в третьем кольце.
 #[must_use]
 pub fn is_running() -> bool {
-    with_current(|program| program.running).unwrap_or(false)
+    IN_USER[sched::current_slot()].load(Ordering::Acquire)
 }
 
 /// Почему задачу не удалось снять.
@@ -2452,8 +2500,14 @@ impl core::fmt::Display for KillError {
 /// исполняет программу.
 #[must_use]
 pub fn program_facts(slot: usize) -> Option<(alloc::string::String, u32)> {
-    let table = PROGRAMS.lock();
-    let program = table.get(slot)?.as_ref()?;
+    // Ссылка клонируется под локом таблицы, а читается уже без него: печать
+    // этой строки идёт из `tasks`, и держать на ней лок, который ждёт каждый
+    // системный вызов, незачем.
+    let process = {
+        let table = PROGRAMS.lock();
+        table.get(slot)?.as_ref()?.clone()
+    };
+    let program = process.lock();
     Some((program.path.clone(), program.cred.uid))
 }
 
@@ -2496,10 +2550,13 @@ pub fn request_kill(id: sched::TaskId) -> Result<(), KillError> {
         return Err(KillError::AlreadyFinished);
     }
 
-    let mut table = PROGRAMS.lock();
-    match table.get_mut(slot).and_then(Option::as_mut) {
-        Some(program) => {
-            program.kill_requested = true;
+    let process = {
+        let table = PROGRAMS.lock();
+        table.get(slot).and_then(Option::as_ref).cloned()
+    };
+    match process {
+        Some(process) => {
+            process.lock().kill_requested = true;
             // Программа могла спать, а снятие происходит на возврате в третье
             // кольцо — то есть спящая не снялась бы, пока не проснётся сама.
             // Пробуждение здесь и делает `kill` работающим на программе,
@@ -2546,12 +2603,15 @@ pub fn kill_pending() -> bool {
 /// и есть доказательство того, что кадр [`arch::enter_user`] на стеке этой
 /// задачи цел.
 pub unsafe fn check_kill() {
-    if !with_current(|program| program.running && program.kill_requested).unwrap_or(false) {
+    if !is_running() {
+        return;
+    }
+    if !with_current(|program| program.kill_requested).unwrap_or(false) {
         return;
     }
 
     kprintln!("  user        : killed by request, task {}", sched::current());
-    with_current(|program| program.running = false);
+    IN_USER[sched::current_slot()].store(false, Ordering::Release);
     // SAFETY: контракт функции плюс проверенный `running` — программа
     // действительно исполняется, значит `enter_user` на стеке и вернуться есть
     // куда.
@@ -2576,7 +2636,7 @@ pub unsafe fn faulted(what: &str, at: usize, addr: usize) -> ! {
         "  user        : killed by {what} at {at:#018x} (address {addr:#018x}), task {}",
         sched::current()
     );
-    with_current(|program| program.running = false);
+    IN_USER[sched::current_slot()].store(false, Ordering::Release);
     // SAFETY: контракт функции — программа запущена, значит `enter_user`
     // действительно исполняется и его кадр на стеке ядра цел.
     unsafe { arch::return_to_kernel(user_abi::EXIT_FAULTED) }
