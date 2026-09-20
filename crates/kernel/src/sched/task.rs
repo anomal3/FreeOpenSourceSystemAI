@@ -150,11 +150,14 @@ pub enum TaskState {
 /// задержка не больше самого срока. Разница в цене ошибки, а не в изяществе.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Wait {
-    /// До тика таймера с этим номером — `sleep`.
+    /// До этой отметки времени работы системы (миллисекунды) — `sleep`.
+    ///
+    /// Не до тика: тики приходят прерываниями и теряются, а время идёт по
+    /// счётчику, который сам себя считает.
     Until(u64),
     /// Пока не завершится эта задача.
     Task(TaskId),
-    /// До события ввода, но не дольше указанного тика.
+    /// До события ввода, но не дольше этой отметки времени.
     Input(u64),
     /// Пока устройство не подаст прерывание.
     ///
@@ -169,7 +172,8 @@ pub enum Wait {
     /// молчит, а разбудить задачу ради того, чтобы она ничего не нашла, —
     /// ровно тот опрос, от которого эта фаза избавляется.
     Irq(u32),
-    /// Пока устройство не подаст прерывание, но не дольше указанного тика.
+    /// Пока устройство не подаст прерывание, но не дольше этой отметки
+    /// времени.
     ///
     /// Не «то же, что [`Wait::Irq`], только с будильником». Разница в том, чего
     /// ждут: у xHCI единственный источник пробуждения — само устройство, и
@@ -238,9 +242,9 @@ impl TaskState {
     #[must_use]
     pub fn waiting_for(self) -> Option<(&'static str, u64)> {
         match self {
-            Self::Blocked(Wait::Until(tick)) => Some(("sleeping until tick", tick)),
+            Self::Blocked(Wait::Until(at)) => Some(("sleeping until uptime ms", at)),
             Self::Blocked(Wait::Task(id)) => Some(("waiting for task #", u64::from(id.as_u32()))),
-            Self::Blocked(Wait::Input(tick)) => Some(("waiting for input until tick", tick)),
+            Self::Blocked(Wait::Input(at)) => Some(("waiting for input until uptime ms", at)),
             Self::Blocked(Wait::Futex(key)) => Some(("waiting on an address, key", key as u64)),
             Self::Blocked(Wait::Irq(source)) => Some(("waiting for device", u64::from(source))),
             Self::Blocked(Wait::IrqUntil(source, _)) => {

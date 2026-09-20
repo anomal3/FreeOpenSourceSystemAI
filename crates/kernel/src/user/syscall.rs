@@ -593,7 +593,7 @@ fn read_input(buffer: &mut [u8]) -> i64 {
         // в очередь обработчик прерывания, а он не имеет права ждать лока
         // планировщика — то есть пробуждение можно потерять. Со сроком потеря
         // стоит десятой доли секунды, без срока — всей программы.
-        let deadline = crate::irq::ticks() + u64::from(crate::irq::TIMER_HZ) / 10;
+        let deadline = crate::time::uptime_ms() + 100;
         sched::block_on_input(deadline, crate::tty::ready);
     }
 }
@@ -1894,7 +1894,7 @@ fn poll(ptr: usize, count: usize, timeout_ms: i64) -> i64 {
             return 0;
         }
 
-        let slice = crate::irq::ticks() + u64::from(crate::irq::TIMER_HZ) / 10;
+        let slice = crate::time::uptime_ms() + 100;
         sched::block_on_input(slice, || false);
     }
 }

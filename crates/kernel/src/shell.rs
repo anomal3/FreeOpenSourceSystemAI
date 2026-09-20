@@ -398,7 +398,9 @@ pub fn task() {
         } else {
             POLL_PERIOD_MS
         };
-        let deadline = irq::ticks() + period * u64::from(irq::TIMER_HZ) / 1000;
+        // Срок — во времени, а не в тиках: тики теряются (см.
+        // `sched::block_on_irq_until`).
+        let deadline = time::uptime_ms() + period;
         sched::block_on_input(deadline, || input::sequence() != seen);
     }
 }
@@ -1788,7 +1790,9 @@ fn foreground(id: sched::TaskId) {
         // Во время анимации — кадр в шестнадцать миллисекунд, иначе прежний
         // опрос: будить стол чаще без дела значит отнимать процессор у всех.
         let period = if ui::animating() { FRAME_PERIOD_MS } else { POLL_PERIOD_MS };
-        let deadline = irq::ticks() + period * u64::from(irq::TIMER_HZ) / 1000;
+        // Срок — во времени, а не в тиках: тики теряются (см.
+        // `sched::block_on_irq_until`).
+        let deadline = time::uptime_ms() + period;
         sched::block_on_input(deadline, || input::sequence() != seen);
     }
 
