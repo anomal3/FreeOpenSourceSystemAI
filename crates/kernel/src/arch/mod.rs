@@ -25,6 +25,7 @@ mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
     ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, drain_serial_rx, halt,
+    set_user_tls,
     pci_config_read32, pci_config_write32, poll_boot_devices, power_off, reboot, remember_serial,
     report_boot_devices, serial_fallback, spawn_input_services, wait_for_interrupt,
 };
@@ -33,7 +34,7 @@ pub use x86_64::{
 mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
-    ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, SERIAL_MMIO, Serial, drain_serial_rx, halt,
+    ARCH_ID, ARCH_NAME, HAS_PCI_PORTS, set_user_tls, SERIAL_MMIO, Serial, drain_serial_rx, halt,
     pci_config_read32, pci_config_write32, poll_boot_devices, power_off, reboot, remember_serial,
     report_boot_devices, serial_fallback, spawn_input_services, wait_for_interrupt,
 };

@@ -49,6 +49,8 @@ use user_abi::{
 
 use user_abi::{LAUNCH_KEEP, Launch, SYS_LAUNCH, SYS_PIPE};
 
+use user_abi::{SYS_SET_TLS, SYS_THREAD_CREATE, SYS_THREAD_EXIT};
+
 use user_abi::SYS_UPDATE;
 
 use user_abi::{
@@ -1855,6 +1857,39 @@ pub fn times() -> Option<Times> {
     // SAFETY: структура живёт в памяти программы, выравнивание от типа.
     let result = unsafe { syscall(SYS_TIMES, core::ptr::from_mut(&mut out) as usize, 0, 0) };
     (result == 0).then_some(out)
+}
+
+/// Завести поток: он начнёт с `entry(arg)` на своём стеке в `stack_bytes` байт.
+///
+/// Возвращает номер задачи нового потока или `None`. Стек выделяет ядро, и под
+/// ним лежит сторожевая страница — переполнение кончается снятием программы, а
+/// не порчей соседней области.
+///
+/// Всё, кроме стека и хранилища, у потока общее с тем, кто его завёл.
+pub fn thread_create(entry: extern "C" fn(usize) -> !, arg: usize, stack_bytes: usize) -> Option<u32> {
+    // SAFETY: вызов ничего не пишет в память программы; `entry` — адрес её
+    // собственного кода.
+    let result = unsafe { syscall(SYS_THREAD_CREATE, entry as usize, arg, stack_bytes) };
+    (result > 0).then(|| result as u32)
+}
+
+/// Задать базу своего хранилища потока.
+///
+/// Ставит её себе сам поток. Ноль означает «хранилища нет».
+pub fn set_tls(base: usize) -> bool {
+    // SAFETY: вызов меняет только регистр базы, читаемый третьим кольцом.
+    unsafe { syscall(SYS_SET_TLS, base, 0, 0) == 0 }
+}
+
+/// Завершить **поток**, не трогая остальных.
+pub fn thread_exit(code: i64) -> ! {
+    // SAFETY: вызов не возвращается.
+    unsafe {
+        syscall(SYS_THREAD_EXIT, code as usize, 0, 0);
+    }
+    loop {
+        yield_now();
+    }
 }
 
 /// Завершить программу.

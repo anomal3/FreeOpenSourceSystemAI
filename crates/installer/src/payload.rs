@@ -268,7 +268,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 42] = [
+const PROGRAMS: [(&CStr16, &str); 43] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -330,6 +330,7 @@ const PROGRAMS: [(&CStr16, &str); 42] = [
     // То же переполнение стека, что и `smash`, но на C: канарейку ставит
     // `clang`, а `__stack_chk_fail` — стартовый код `crt0.c`.
     (cstr16!("\\FREEOS\\BIN\\CSMASH"), "csmash"),
+    (cstr16!("\\FREEOS\\BIN\\THREADS"), "threads"),
     // Веб-сервер (пункт 4 очереди второго разбора). Едет вместе со своим сайтом
     // (`SITE` ниже) и своими умолчаниями, но сам не запускается: службой он не
     // объявлен нарочно — машина, отвечающая на порт потому, что кто-то поставил

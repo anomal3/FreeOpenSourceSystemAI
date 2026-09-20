@@ -2942,6 +2942,64 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "threads",
+        about: "Потоки: четыре задачи в одном адресном пространстве, у каждой свой стек и своё хранилище.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Line("run /bin/threads"),
+            Step::Await("threads: starting 4 threads", 30_000),
+            // Сумма обязана сойтись ТОЧНО, и это первая из трёх проверок:
+            // разные адресные пространства дали бы каждому потоку свою копию
+            // счётчика, и сумма оказалась бы вчетверо меньше.
+            Step::Await("threads: counter is 4000 of 4000", 60_000),
+            // Вторая: потоки ушли по одному, а процесс остался.
+            Step::Await("4 thread(s) finished, and the process is still here", 30_000),
+            // Третья: каждый прочитал своё хранилище ЧЕРЕЗ регистр базы.
+            // Совпадение у двоих означало бы один регистр на всех, то есть
+            // незаписанный FS / TPIDR_EL0.
+            Step::Await("every thread read back its own storage", 15_000),
+            Step::Await("exited with code 0", 30_000),
+            // Под стеком каждого потока лежит сторожевая страница. Проверяется
+            // не обещанием, а переполнением.
+            Step::Line("run /bin/threads guard"),
+            Step::Await("about to run off the bottom of a thread stack", 30_000),
+            Step::Await("user        : killed by", 30_000),
+            Step::Await("threads: the overflowing thread is gone", 30_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+            Step::Absent("read someone else's storage"),
+            // Область стека возвращается целиком, и сторожевая страница в учёт
+            // не идёт: она никогда не была отображена. Без отдельного вида
+            // области каждое освобождение стека потока печатало бы здесь
+            // предупреждение о потерянной странице.
+            Step::Absent("user        : WARNING"),
+            // Ушедший поток обязан отпустить ссылку на процесс (фаза 55a).
+            Step::Absent("live reference(s) at exit"),
+            // Сторож не сработал бы молча — программа сказала бы об этом сама.
+            Step::Absent("the thread stack had no guard below it"),
+        ],
+    },
+    Scenario {
         name: "sleep",
         about: "Ждущая программа выходит из очереди на исполнение, и машине становится нечего делать.",
         target: Target::Live,

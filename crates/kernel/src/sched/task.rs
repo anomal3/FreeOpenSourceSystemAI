@@ -416,6 +416,16 @@ pub struct Task {
     pub id: TaskId,
     pub name: &'static str,
     pub state: TaskState,
+    /// База хранилища потока — то, что третье кольцо читает через `FS` на
+    /// x86-64 и `TPIDR_EL0` на AArch64.
+    ///
+    /// Здесь, а не в процессе: у потоков одного процесса всё общее, кроме
+    /// стека и вот этого. Регистр один на процессор, поэтому переставляет его
+    /// переключение контекста — см. `arch::set_user_tls`.
+    ///
+    /// Ноль у всякой задачи, которая хранилища не просила: у ядерных задач и у
+    /// однопоточных программ.
+    pub tls: u64,
     /// Сколько раз задача получала процессор.
     pub switches: u64,
     /// Сколько раз задачу снимали с процессора не по её воле — по истёкшему
@@ -569,6 +579,7 @@ impl Task {
             id: TaskId::IDLE,
             name: "idle",
             state: TaskState::Running,
+            tls: 0,
             switches: 0,
             preempted: 0,
             cpu_ms: 0,
@@ -601,6 +612,7 @@ impl Task {
             id,
             name,
             state: TaskState::Ready,
+            tls: 0,
             switches: 0,
             preempted: 0,
             cpu_ms: 0,

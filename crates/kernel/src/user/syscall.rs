@@ -187,6 +187,10 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_KILL => kill(a0),
         // Фаза С7: диспетчер устройств.
         SYS_DEVICES => devices(a0, a1),
+        // Фаза 55b: потоки.
+        user_abi::SYS_THREAD_CREATE => thread_create(a0, a1, a2),
+        user_abi::SYS_SET_TLS => set_tls(a0),
+        user_abi::SYS_THREAD_EXIT => thread_exit(a0 as i64),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1720,6 +1724,46 @@ fn winresize(id: i64, size: usize) -> i64 {
         Ok(base) => base as i64,
         Err(err) => window_errno(err),
     }
+}
+
+/// `thread_create(entry, arg, stack_bytes) -> номер задачи`.
+fn thread_create(entry: usize, arg: usize, stack_bytes: usize) -> i64 {
+    // Точка входа проверяется здесь, а не в `spawn_thread`: граница между
+    // «программа попросила ерунду» и «ядру нечем выполнить просьбу» проходит
+    // по системному вызову. Адрес обязан быть исполняемым из третьего кольца —
+    // иначе поток родился бы только затем, чтобы немедленно упасть.
+    if !space::user_can(entry, 1, PageFlags::USER) {
+        return ERR_BAD_ADDRESS;
+    }
+    match super::spawn_thread(entry, arg, stack_bytes) {
+        Ok(id) => i64::from(id.as_u32()),
+        Err(super::ThreadError::NoProgram) => ERR_NO_SYSCALL,
+        Err(super::ThreadError::BadRequest) => ERR_BAD_ADDRESS,
+        Err(super::ThreadError::NoMemory) => ERR_NO_SPACE,
+        Err(super::ThreadError::TooManyTasks) => ERR_LIMIT,
+    }
+}
+
+/// `set_tls(base) -> 0`.
+fn set_tls(base: usize) -> i64 {
+    // Ноль разрешён: это «хранилища у меня нет». Всё остальное обязано быть
+    // адресом самой программы — база, указывающая в ядро, дала бы третьему
+    // кольцу способ адресовать чужую память своими же обращениями.
+    if base != 0 && !space::user_can(base, 1, PageFlags::USER) {
+        return ERR_BAD_ADDRESS;
+    }
+    sched::set_current_tls(base as u64);
+    0
+}
+
+/// `thread_exit(code)` — не возвращается.
+fn thread_exit(code: i64) -> i64 {
+    // Тот же путь, что у `SYS_EXIT`, и разница не здесь, а в том, куда он
+    // ведёт: у потока это `thread_entry`, который отпустит его стек и ссылку
+    // на процесс, а у главной задачи — `run`, который разберёт процесс целиком.
+    //
+    // SAFETY: вызов пришёл из третьего кольца, значит кадр входа в него цел.
+    unsafe { crate::arch::return_to_kernel(code) }
 }
 
 /// `winclose(id) -> 0`.

@@ -260,6 +260,15 @@ const PROGRESS_EVERY: u64 = 1024;
 enum Source {
     /// Ничем. Страницы выданы сразу и целиком, и лежат в них нули (фаза 40).
     Anonymous,
+    /// Стеком потока (фаза 55b): то же, что безымянная область, но её **нижняя
+    /// страница не отображена** — это сторож.
+    ///
+    /// Отдельный вид, а не признак у безымянной, по той же причине, по которой
+    /// вообще существует это перечисление: разбор в `munmap` обязан ответить,
+    /// сколько кадров область должна вернуть, и ответ здесь другой — на один
+    /// меньше числа страниц. Скажи мы «столько же», и всякое освобождение
+    /// стека потока печатало бы предупреждение о потерянной странице.
+    ThreadStack,
     /// Файлом: страницы подкачиваются по обращению (фаза 41).
     File(FileBacking),
     /// Сегментом программы (фаза 54): страницы читаются из файла программы
@@ -595,6 +604,50 @@ impl Program {
         Ok(base)
     }
 
+    /// Выдать стек потоку: область на `bytes` плюс сторожевая страница под ней.
+    ///
+    /// Возвращает начало **всей** области (её нижняя страница — сторож),
+    /// её размер и выровненную вершину стека.
+    ///
+    /// # Почему сторож получается сам собой
+    ///
+    /// Потому что область записана в таблицу целиком, вместе со сторожевой
+    /// страницей, а отображена — без неё. Отказ внутри безымянной области
+    /// [`Program::fault_plan`] не заполняет намеренно: «таблицы разошлись с
+    /// записью» — повод снять программу, а не подложить ей чистую страницу.
+    /// Переполнение стека потока приходит ровно в этот случай.
+    ///
+    /// Записать область целиком нужно ещё и затем, чтобы сторож не достался
+    /// кому-то другому: [`Program::find_gap`] укладывает области вплотную и
+    /// отдал бы дыру в одну страницу следующей же просьбе такого размера.
+    fn map_thread_stack(&mut self, bytes: usize) -> Result<(usize, usize, usize), MmapError> {
+        let want = bytes.next_multiple_of(PAGE_SIZE);
+        let (base, pages) = self.reserve(want + PAGE_SIZE, PAGE_SIZE)?;
+        let stack_base = base + PAGE_SIZE;
+        let stack_pages = pages - 1;
+
+        // SAFETY: `reserve` вернул диапазон внутри области запроса, не
+        // пересекающийся ни с одной уже выданной; отображаем его без нижней
+        // страницы.
+        unsafe {
+            self.space.map_anon(
+                VirtAddr::new(stack_base),
+                stack_pages,
+                PageFlags::READ | PageFlags::WRITE | PageFlags::USER,
+                false,
+            )
+        }
+        .map_err(|_| MmapError::NoMemory)?;
+
+        self.remember(Mapping { base, pages, blocks: 0, source: Source::ThreadStack });
+
+        // Вершина выравнивается на 16: этого требуют оба соглашения о вызовах,
+        // и невыровненный стек ломается не сразу, а на первой же операции с
+        // вектором.
+        let top = (stack_base + stack_pages * PAGE_SIZE) & !0xF;
+        Ok((base, pages * PAGE_SIZE, top))
+    }
+
     /// Отобразить `len` байт файла `fd`, начиная с `offset`. Возвращает адрес.
     ///
     /// Ни одной страницы при этом не выделяется и ни одного байта не читается:
@@ -818,6 +871,9 @@ impl Program {
             // таблицы. Поэтому число то же самое, чем бы область ни была
             // отображена, — и именно поэтому оно ничего не скрывает.
             Source::Anonymous => region.pages,
+            // Сторожевая страница не отображалась никогда, значит и вернуться
+            // ей неоткуда.
+            Source::ThreadStack => region.pages - 1,
             Source::File(file) => file.resident.len(),
             // Сюда не приходят: поверхность и сегмент образа отсеяны проверками
             // выше. Ветки существуют затем, чтобы новый вид области нельзя было
@@ -968,7 +1024,9 @@ impl Program {
             // этой записью, и молчать об этом нельзя: снять программу
             // правильнее, чем тихо подложить ей чистую страницу вместо той, что
             // потерялась.
-            Source::Anonymous | Source::Surface(..) => None,
+            // Отказ в стеке потока — это переполнение, пришедшее в сторожевую
+            // страницу, и подкладывать ему память значило бы отменить сторожа.
+            Source::Anonymous | Source::Surface(..) | Source::ThreadStack => None,
         }
     }
 
@@ -2227,6 +2285,168 @@ pub fn spawn_streams_rights(
             })
         }
     }
+}
+
+/// Почему поток завести не удалось.
+#[derive(Debug, Clone, Copy)]
+pub enum ThreadError {
+    /// Задача, которая просит, программы не исполняет.
+    NoProgram,
+    /// Точка входа или размер стека бессмысленны.
+    BadRequest,
+    /// Под стек потока не нашлось памяти или места в адресном пространстве.
+    NoMemory,
+    /// В таблице планировщика нет свободного слота.
+    TooManyTasks,
+}
+
+impl core::fmt::Display for ThreadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoProgram => f.write_str("this task runs no program"),
+            Self::BadRequest => f.write_str("the entry point or the stack size makes no sense"),
+            Self::NoMemory => f.write_str("no room for the thread stack"),
+            Self::TooManyTasks => f.write_str("the task table is full"),
+        }
+    }
+}
+
+/// Наименьший стек потока: одна страница сверх сторожевой.
+const THREAD_STACK_MIN: usize = PAGE_SIZE;
+
+/// Наибольший стек потока.
+///
+/// Тот же порядок, что у главного стека программы. Предел здесь не про память,
+/// а про то, что область выдаётся целиком и сразу.
+const THREAD_STACK_MAX: usize = 8 * 1024 * 1024;
+
+/// Что новая задача должна знать о потоке, который ей предстоит исполнять.
+///
+/// Уезжает к ней одним указателем — больше `spawn_raw` передать не умеет, — и
+/// она же его уничтожает. Ссылка на процесс лежит **здесь**, а не берётся
+/// новой задачей из таблицы: до того, как она проснётся, в её слоте ещё пусто.
+struct ThreadStart {
+    process: Arc<Mutex<Program>>,
+    entry: usize,
+    arg: usize,
+    /// Начало области, выданной под стек, — вместе со сторожевой страницей.
+    region: usize,
+    /// Сколько байт занимает вся область, считая сторожевую страницу.
+    region_bytes: usize,
+    /// Вершина стека, уже выровненная.
+    stack_top: usize,
+}
+
+/// Завести поток в адресном пространстве исполняющейся программы.
+///
+/// Стек выделяет ядро, а не программа, и это часть договора: под стеком обязана
+/// быть **сторожевая страница**, а положить её может только тот, кто
+/// распоряжается областями. Переполнение стека потока кончается снятием
+/// программы, а не тихой порчей соседней области.
+pub fn spawn_thread(entry: usize, arg: usize, stack_bytes: usize) -> Result<sched::TaskId, ThreadError> {
+    if entry == 0 || stack_bytes < THREAD_STACK_MIN || stack_bytes > THREAD_STACK_MAX {
+        return Err(ThreadError::BadRequest);
+    }
+    let process = current_process().ok_or(ThreadError::NoProgram)?;
+
+    // Стек выдаётся под локом процесса, а задача создаётся уже без него:
+    // `spawn_raw` трогает кучу и лок планировщика, и держать на это время ещё и
+    // процесс незачем.
+    let (region, region_bytes, stack_top) = {
+        let mut program = process.lock();
+        program.map_thread_stack(stack_bytes).map_err(|_| ThreadError::NoMemory)?
+    };
+
+    let start = alloc::boxed::Box::new(ThreadStart {
+        process: Arc::clone(&process),
+        entry,
+        arg,
+        region,
+        region_bytes,
+        stack_top,
+    });
+    let raw = alloc::boxed::Box::into_raw(start);
+
+    match sched::spawn_raw("thread", PROGRAM_STACK_SIZE, thread_entry, raw as usize) {
+        Ok(id) => Ok(id),
+        Err(err) => {
+            // Задачи не будет — значит некому ни исполнять поток, ни вернуть
+            // его стек. Оба действия здесь, и в обратном порядке.
+            // SAFETY: указатель получен из `Box::into_raw` строкой выше и
+            // больше никому не отдавался.
+            drop(unsafe { alloc::boxed::Box::from_raw(raw) });
+            let _ = process.lock().munmap(region, region_bytes);
+            Err(match err {
+                sched::SpawnError::OutOfMemory => ThreadError::NoMemory,
+                sched::SpawnError::TooManyTasks => ThreadError::TooManyTasks,
+            })
+        }
+    }
+}
+
+/// Точка входа задачи, исполняющей поток.
+///
+/// Отличается от [`program_entry`] ровно тем, чем поток отличается от
+/// программы: образ не читается, пространство не строится, личность и права не
+/// выбираются — всё это у процесса уже есть, и задача просто становится ещё
+/// одним его исполнителем.
+extern "C" fn thread_entry(arg: usize) -> ! {
+    // Тот же инвариант, что у прочих батутов: задача начинает с запрещёнными
+    // прерываниями, и разрешить их некому, кроме неё самой.
+    arch::interrupts::enable();
+
+    // SAFETY: указатель выделен в `spawn_thread` и передан ровно один раз
+    // ровно этой задаче.
+    let start = unsafe { alloc::boxed::Box::from_raw(arg as *mut ThreadStart) };
+    let slot = sched::current_slot();
+    let root = start.process.lock().space.root();
+
+    {
+        let mut table = PROGRAMS.lock();
+        if let Some(entry) = table.get_mut(slot) {
+            *entry = Some(Arc::clone(&start.process));
+        }
+    }
+    IN_USER[slot].store(true, Ordering::Release);
+
+    kprintln!(
+        "  thread      : {} runs at {:#018x} on a {} KiB stack, guard page below",
+        sched::current(),
+        start.entry,
+        (start.region_bytes - PAGE_SIZE) / 1024
+    );
+
+    // Тот же порядок, что в `run`: сначала знание планировщика, потом действие
+    // процессора. Вытеснение между двумя строками переживает только первое.
+    sched::set_current_space(Some(root));
+    // SAFETY: корень принадлежит живому процессу — ссылка на него у нас в
+    // руках, и уйти он не может.
+    unsafe { arch::activate_space(root) };
+
+    // SAFETY: точка входа и стек проверены `spawn_thread`: стек выдан ядром в
+    // этом же пространстве, а вход — адрес, доступный третьему кольцу.
+    let code = unsafe { arch::enter_user(start.entry, start.stack_top, start.arg, 0) };
+
+    IN_USER[slot].store(false, Ordering::Release);
+    sched::set_current_space(None);
+    // SAFETY: таблицы ядра активированы при запуске системы.
+    unsafe { arch::activate_kernel_space() };
+
+    // Стек возвращается процессу — **после** ухода с его таблиц, и это не
+    // предосторожность, а условие: снимать отображение стека, на котором
+    // стоишь, нельзя.
+    let _ = start.process.lock().munmap(start.region, start.region_bytes);
+    {
+        let mut table = PROGRAMS.lock();
+        if let Some(entry) = table.get_mut(slot) {
+            *entry = None;
+        }
+    }
+    kprintln!("  thread      : {} finished with code {code}", sched::current());
+    // Последнее действие — отпустить ссылку на процесс. Уйди она раньше, и
+    // процесс мог бы быть уничтожен, пока мы ещё ходим по его пространству.
+    drop(start);
+    sched::exit_current_with(code)
 }
 
 /// Точка входа задачи, исполняющей программу.
