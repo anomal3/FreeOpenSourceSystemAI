@@ -187,6 +187,20 @@ pub enum Wait {
     /// засыпающий держит этот лок, прерывания запрещены и другой задаче не
     /// достанется ни такта.
     Lock(usize),
+    /// Пока кто-нибудь не разбудит по этому ключу — ожидание на адресе,
+    /// которым пользуются потоки программы (`SYS_FUTEX_WAIT`).
+    ///
+    /// Отдельный вид, а не [`Wait::Lock`] с другим числом, и причина не в
+    /// красоте. Ключ здесь — **физический** адрес страницы программы, а у
+    /// `Lock` — виртуальный адрес ядерного мьютекса; оба числа невелики и
+    /// вполне могут совпасть. Совпадение стоило бы лишнего пробуждения — не
+    /// беды, потому что оба ожидания перепроверяют условие в цикле, — но
+    /// «не беда» плохо переживает следующую правку.
+    ///
+    /// Почему ключ физический: две задачи, отобразившие одну и ту же страницу
+    /// по разным адресам, обязаны ждать на одном ключе, иначе разбудивший не
+    /// нашёл бы ждущего.
+    Futex(usize),
 }
 
 impl fmt::Display for TaskState {
@@ -227,6 +241,7 @@ impl TaskState {
             Self::Blocked(Wait::Until(tick)) => Some(("sleeping until tick", tick)),
             Self::Blocked(Wait::Task(id)) => Some(("waiting for task #", u64::from(id.as_u32()))),
             Self::Blocked(Wait::Input(tick)) => Some(("waiting for input until tick", tick)),
+            Self::Blocked(Wait::Futex(key)) => Some(("waiting on an address, key", key as u64)),
             Self::Blocked(Wait::Irq(source)) => Some(("waiting for device", u64::from(source))),
             Self::Blocked(Wait::IrqUntil(source, _)) => {
                 Some(("waiting for device (with a deadline)", u64::from(source)))

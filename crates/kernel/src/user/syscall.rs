@@ -191,6 +191,9 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_THREAD_CREATE => thread_create(a0, a1, a2),
         user_abi::SYS_SET_TLS => set_tls(a0),
         user_abi::SYS_THREAD_EXIT => thread_exit(a0 as i64),
+        // Фаза 55c: ожидание на адресе.
+        user_abi::SYS_FUTEX_WAIT => futex_wait(a0, a1 as u32),
+        user_abi::SYS_FUTEX_WAKE => futex_wake(a0, a1),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1764,6 +1767,42 @@ fn thread_exit(code: i64) -> i64 {
     //
     // SAFETY: вызов пришёл из третьего кольца, значит кадр входа в него цел.
     unsafe { crate::arch::return_to_kernel(code) }
+}
+
+/// `futex_wait(addr, expected) -> 0 | FUTEX_CHANGED`.
+fn futex_wait(addr: usize, expected: u32) -> i64 {
+    let Some(key) = super::futex_key(addr) else {
+        return ERR_BAD_ADDRESS;
+    };
+    let word = addr as *const u32;
+    let mut slept = true;
+    // Сравнение делает замыкание, и делает его **под локом планировщика** —
+    // в этом весь смысл вызова. Прочитай мы слово здесь и передай числом,
+    // между чтением и сном снова появилась бы щель, ради закрытия которой всё
+    // это и написано.
+    //
+    // Чтение из ядра по адресу программы законно: `futex_key` проверил и
+    // права, и наличие страницы, а вытеснить её у разрешённых видов области
+    // некому.
+    sched::block_on_futex(key, || {
+        // SAFETY: адрес проверен `futex_key`: он принадлежит программе,
+        // выровнен и отображён на чтение и запись.
+        let now = unsafe { core::ptr::read_volatile(word) };
+        if now != expected {
+            slept = false;
+            return true;
+        }
+        false
+    });
+    if slept { 0 } else { user_abi::FUTEX_CHANGED }
+}
+
+/// `futex_wake(addr, count) -> сколько разбудили`.
+fn futex_wake(addr: usize, count: usize) -> i64 {
+    let Some(key) = super::futex_key(addr) else {
+        return ERR_BAD_ADDRESS;
+    };
+    sched::wake_futex(key, count) as i64
 }
 
 /// `winclose(id) -> 0`.

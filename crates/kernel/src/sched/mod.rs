@@ -845,6 +845,48 @@ pub fn wake_lock(address: usize) {
     }
 }
 
+/// Заблокироваться на ключе `key`, пока `ready` отвечает `false`.
+///
+/// `ready` вызывается **под локом планировщика**, и это не подробность, а
+/// единственное, что делает ожидание на адресе рабочим. Между «посмотрел на
+/// число» и «уснул» не должно поместиться ничего: разбудивший, успевший в эту
+/// щель, разбудил бы того, кто ещё не спит, и спящий не проснулся бы никогда.
+/// Пока засыпающий держит лок планировщика, прерывания запрещены, и другой
+/// задаче на этом процессоре не достанется ни такта, а на соседнем — ни лока.
+pub fn block_on_futex(key: usize, ready: impl FnOnce() -> bool) {
+    {
+        let mut sched = SCHED.lock();
+        if !sched.running || ready() {
+            return;
+        }
+        let current = sched.current();
+        if let Some(task) = sched.tasks[current].as_mut() {
+            task.state = TaskState::Blocked(Wait::Futex(key));
+        }
+    }
+    schedule();
+}
+
+/// Разбудить ждущих на ключе `key`. `count` в ноль означает «всех».
+///
+/// Возвращает, скольких разбудили: программе это нужно, чтобы отличить «никто
+/// не ждал» от «разбудил» — без этого отпускающий замок не может сказать,
+/// стоило ли вообще звать ядро.
+pub fn wake_futex(key: usize, count: usize) -> usize {
+    let mut sched = SCHED.lock();
+    let mut woken = 0usize;
+    for task in sched.tasks.iter_mut().flatten() {
+        if count != 0 && woken >= count {
+            break;
+        }
+        if task.state == TaskState::Blocked(Wait::Futex(key)) {
+            task.state = TaskState::Ready;
+            woken += 1;
+        }
+    }
+    woken
+}
+
 /// Разбудить всех, кто ждёт ввода.
 ///
 /// Вызывается драйвером, положившим событие в очередь, — как правило из

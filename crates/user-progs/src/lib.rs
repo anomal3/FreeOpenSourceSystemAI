@@ -49,7 +49,7 @@ use user_abi::{
 
 use user_abi::{LAUNCH_KEEP, Launch, SYS_LAUNCH, SYS_PIPE};
 
-use user_abi::{SYS_SET_TLS, SYS_THREAD_CREATE, SYS_THREAD_EXIT};
+use user_abi::{FUTEX_CHANGED, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_SET_TLS, SYS_THREAD_CREATE, SYS_THREAD_EXIT};
 
 use user_abi::SYS_UPDATE;
 
@@ -1889,6 +1889,95 @@ pub fn thread_exit(code: i64) -> ! {
     }
     loop {
         yield_now();
+    }
+}
+
+/// Уснуть на адресе, если по нему лежит `expected`.
+///
+/// `Some(true)` — поспали и проснулись, `Some(false)` — по адресу лежало
+/// другое число и спать было не о чем, `None` — адрес не годится.
+pub fn futex_wait(word: &core::sync::atomic::AtomicU32, expected: u32) -> Option<bool> {
+    let addr = core::ptr::from_ref(word) as usize;
+    // SAFETY: вызов не пишет в память программы; адрес — её собственное слово.
+    let result = unsafe { syscall(SYS_FUTEX_WAIT, addr, expected as usize, 0) };
+    match result {
+        0 => Some(true),
+        FUTEX_CHANGED => Some(false),
+        _ => None,
+    }
+}
+
+/// Разбудить ждущих на адресе. `count` в ноль — всех. Возвращает, скольких.
+pub fn futex_wake(word: &core::sync::atomic::AtomicU32, count: usize) -> usize {
+    let addr = core::ptr::from_ref(word) as usize;
+    // SAFETY: вызов не пишет в память программы.
+    let result = unsafe { syscall(SYS_FUTEX_WAKE, addr, count, 0) };
+    if result < 0 { 0 } else { result as usize }
+}
+
+/// Замок для потоков одной программы.
+///
+/// Три состояния, а не два, и третье — не украшение: без него отпускающий не
+/// знает, звать ли ядро, и звал бы его на **каждом** отпускании. Ноль —
+/// свободен, единица — занят и никто не ждёт, двойка — занят и кто-то ждёт.
+/// Ядро зовётся только на переходе из двойки.
+pub struct Lock {
+    state: core::sync::atomic::AtomicU32,
+    /// Сколько раз замок и вправду укладывал спать. Нужно проверке: замок,
+    /// который «работает», крутя процессор, выглядит снаружи так же.
+    slept: core::sync::atomic::AtomicU32,
+}
+
+impl Default for Lock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Lock {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: core::sync::atomic::AtomicU32::new(0),
+            slept: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Сколько раз этот замок усыплял кого-нибудь.
+    #[must_use]
+    pub fn sleeps(&self) -> u32 {
+        self.slept.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Занять замок, уснув, если он занят.
+    pub fn acquire(&self) {
+        use core::sync::atomic::Ordering;
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        loop {
+            // Объявляем, что ждём: с этого момента отпускающий обязан позвать
+            // ядро. Обмен, а не проверка с записью: между ними отпускающий
+            // успел бы освободить замок, и мы уснули бы на свободном.
+            if self.state.swap(2, Ordering::Acquire) == 0 {
+                return;
+            }
+            if futex_wait(&self.state, 2) == Some(true) {
+                self.slept.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Отпустить замок и разбудить одного ждущего, если он есть.
+    pub fn release(&self) {
+        use core::sync::atomic::Ordering;
+        if self.state.swap(0, Ordering::Release) == 2 {
+            futex_wake(&self.state, 1);
+        }
     }
 }
 
