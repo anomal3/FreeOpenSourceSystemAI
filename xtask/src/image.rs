@@ -245,45 +245,29 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                 payload.push(read_payload(&target, path)?);
             }
 
-            // Эталонные настройки. Единственный экземпляр этих файлов лежит в
-            // репозитории (`initrd/usr/share/defaults/etc/`), и на установленную
-            // систему они попадают отсюда — установщик кладёт их в корневой
-            // образ, а не на раздел состояния. Почему именно так, сказано у
-            // `arch::PAYLOAD_DEFAULTS_DIR`.
-            for (name, medium) in arch::PAYLOAD_DEFAULTS {
-                let target = format!("{}/{medium}", arch::PAYLOAD_DEFAULTS_DIR);
-                payload.push(read_payload(&target, &paths::defaults_dir().join(name))?);
-            }
-
-            // Своя среда .NET (фаза N5a): базовая библиотека и образцы для
-            // сценариев установленной системы, из того же `initrd/`.
-            for (name, medium) in arch::PAYLOAD_DOTNET {
-                let target = format!("{}/{medium}", arch::PAYLOAD_DOTNET_DIR);
-                payload.push(read_payload(&target, &paths::initrd_source_dir().join("usr/share/dotnet").join(name))?);
+            // Всё, что образ несёт под `/usr/share`: эталонные настройки, своя
+            // среда .NET, образец Lua, страница веб-сервера. Единственный
+            // экземпляр этих файлов лежит в репозитории, в `initrd/`, и на
+            // установленную систему они попадают отсюда — установщик кладёт их
+            // в корневой образ, а не на раздел состояния. Почему именно так,
+            // сказано у `arch::PAYLOAD_DEFAULTS_DIR`.
+            //
+            // Список один на всех (`arch::IMAGE_SHARE`), и это не опрятность:
+            // такой же набор обязан нести образ обновления, а когда циклы были
+            // раздельные, он двух групп не нёс.
+            for group in &arch::IMAGE_SHARE {
+                for (name, medium) in group.files {
+                    let target = format!("{}/{medium}", group.medium_dir);
+                    payload.push(read_payload(
+                        &target,
+                        &paths::initrd_source_dir().join(group.dir).join(name),
+                    )?);
+                }
             }
 
             // Образцовые пакеты. Имена на носителе — короткие 8.3, потому что
             // это FAT; настоящие имена (`hello-1.0.fpk`) знает установщик и
             // ставит файлы под ними в `/media`.
-            // Образец сценария на Lua — из того же `initrd/`.
-            for (name, medium) in arch::PAYLOAD_LUA {
-                let target = format!("{}/{medium}", arch::PAYLOAD_LUA_DIR);
-                payload.push(read_payload(
-                    &target,
-                    &paths::initrd_source_dir().join("usr/share/lua").join(name),
-                )?);
-            }
-
-            // Сайт, который веб-сервер отдаёт по умолчанию, — из того же
-            // `initrd/` и тем же способом, что и эталонные настройки.
-            for (name, medium) in arch::PAYLOAD_SITE {
-                let target = format!("{}/{medium}", arch::PAYLOAD_SITE_DIR);
-                payload.push(read_payload(
-                    &target,
-                    &paths::initrd_source_dir().join("usr/share/httpd").join(name),
-                )?);
-            }
-
             for package in crate::package::build_samples(arch, built.release)? {
                 let short = package
                     .file_name

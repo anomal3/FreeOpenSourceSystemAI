@@ -319,6 +319,63 @@ pub const PAYLOAD_DOTNET_DIR: &str = "FREEOS/NET";
 pub const PAYLOAD_DOTNET: [(&str, &str); 3] =
     [("FreeOs.CoreLib.dll", "CORELIB.DLL"), ("samples/hello.dll", "HELLO.DLL"), ("samples/files.dll", "FILES.DLL")];
 
+/// Одна группа файлов образа, лежащая под `/usr/share`.
+///
+/// Существует ради [`IMAGE_SHARE`]; смысл — там.
+pub struct ImageShare {
+    /// Каталог. Один и тот же в дереве-источнике `initrd/` и в корневом образе.
+    pub dir: &'static str,
+    /// Что создать **под** ним. Нужен там, где имена файлов вложены
+    /// (`samples/hello.dll`): каталоги в образе создаются по одному.
+    pub subdirs: &'static [&'static str],
+    /// Каталог на установочном носителе: там FAT, и имена там 8.3.
+    pub medium_dir: &'static str,
+    /// Файлы группы: имя в `initrd/` и имя 8.3 на носителе.
+    pub files: &'static [(&'static str, &'static str)],
+}
+
+/// Что образ системы несёт под `/usr/share` — **одним** списком.
+///
+/// Список один потому, что мест, которые обязаны нести одно и то же, **три**:
+/// установочный носитель (`image.rs`), образ обновления (`package.rs`) и
+/// установщик (`crates/installer/src/payload.rs`, чужой крейт, свой список).
+/// Пока у каждого был свой цикл, расхождение было вопросом времени — и
+/// случилось: 21.09.2026 выяснилось, что образ обновления несёт `/bin`,
+/// `os-release`, эталонные настройки и .NET, но **не несёт** ни образца Lua,
+/// ни страницы веб-сервера. Обновлённая машина их теряла — молча, потому что
+/// проверял это только сценарий `lua`, шедший в цепочке **после** `update`, и
+/// выглядело это как «пропал файл», а не как «обновление его не принесло».
+///
+/// Добавляя новую группу, её дописывают сюда — и она сама доезжает и на
+/// носитель, и в обновление. Длина списка закреплена: новая группа не
+/// проскочит мимо этого места молча.
+pub const IMAGE_SHARE: [ImageShare; 4] = [
+    ImageShare {
+        dir: "usr/share/defaults/etc",
+        subdirs: &[],
+        medium_dir: PAYLOAD_DEFAULTS_DIR,
+        files: &PAYLOAD_DEFAULTS,
+    },
+    ImageShare {
+        dir: "usr/share/dotnet",
+        subdirs: &["samples"],
+        medium_dir: PAYLOAD_DOTNET_DIR,
+        files: &PAYLOAD_DOTNET,
+    },
+    ImageShare {
+        dir: "usr/share/lua",
+        subdirs: &[],
+        medium_dir: PAYLOAD_LUA_DIR,
+        files: &PAYLOAD_LUA,
+    },
+    ImageShare {
+        dir: "usr/share/httpd",
+        subdirs: &[],
+        medium_dir: PAYLOAD_SITE_DIR,
+        files: &PAYLOAD_SITE,
+    },
+];
+
 /// Каталог с пользовательскими программами на установочном носителе.
 ///
 /// Программы лежат на носителе **отдельными файлами**, хотя те же самые уже

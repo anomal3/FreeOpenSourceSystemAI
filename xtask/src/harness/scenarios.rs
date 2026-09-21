@@ -6322,6 +6322,25 @@ pub const ALL: &[Scenario] = &[
             Step::Await("roman (uid 1000 gid 1000)", 15_000),
             Step::Line("cat /home/roman/k.txt"),
             Step::Await("keep-me", 15_000),
+
+            // А `/usr/share` — на месте целиком, и это не придирка к мелочам.
+            // 21.09.2026 выяснилось, что образ обновления нёс эталонные
+            // настройки и .NET, но не нёс ни образца Lua, ни страницы
+            // веб-сервера: обновлённая машина теряла их молча. Видно это стало
+            // только в полном прогоне и совсем в другом месте — сценарий `lua`
+            // идёт в цепочке ПОСЛЕ этого и падал на «нет такого файла», будто
+            // файл потеряла установка.
+            //
+            // Проверяются крайние группы списка `arch::IMAGE_SHARE`: настройки
+            // — первая, страница сайта — последняя. Между ними .NET, за
+            // которым следит `dotnet-files`.
+            Step::Line("ls /usr/share/lua"),
+            Step::Await("demo.lua", 15_000),
+            Step::Line("ls /usr/share/httpd"),
+            Step::Await("index.html", 15_000),
+            Step::Line("ls /usr/share/defaults/etc"),
+            Step::Await("services", 15_000),
+
             Step::Shot("update-slot-b"),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),

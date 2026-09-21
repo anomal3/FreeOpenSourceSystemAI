@@ -186,11 +186,16 @@ fn update_root_bytes(programs: &[(&'static str, PathBuf)]) -> Result<u64> {
             .with_context(|| format!("не удалось узнать размер {}", path.display()))?
             .len();
     }
-    for (name, _) in crate::arch::PAYLOAD_DOTNET {
-        let source = paths::initrd_source_dir().join("usr/share/dotnet").join(name);
-        content += fs::metadata(&source)
-            .with_context(|| format!("не удалось узнать размер {}", source.display()))?
-            .len();
+    // Тот же список, по которому образ и собирается: считать размер по одному
+    // набору, а писать другой — это ровно тот способ получить «не хватило
+    // места» на файле, который в расчёт не попал.
+    for group in &crate::arch::IMAGE_SHARE {
+        for (name, _) in group.files {
+            let source = paths::initrd_source_dir().join(group.dir).join(name);
+            content += fs::metadata(&source)
+                .with_context(|| format!("не удалось узнать размер {}", source.display()))?
+                .len();
+        }
     }
     let wanted = (content + content / 4).div_ceil(MIB) * MIB;
     Ok(wanted.max(UPDATE_ROOT_MIN_BYTES))
@@ -342,46 +347,35 @@ fn build_root_image(
         .write_file_path(&mut disk, "os-keys", keys_text.as_bytes(), 0o644, 0, 0)
         .map_err(|err| anyhow::anyhow!("не удалось записать /os-keys: {err}"))?;
 
-    // Эталонные настройки. Обновление их **обязано** нести: `/etc` живёт на
-    // разделе состояния, до которого обновление не дотягивается, и без эталона
-    // в образе новая версия не смогла бы принести ни одной новой настройки. Файл
-    // берётся тот же самый, что уезжает в initrd и на установочный носитель, —
-    // копия в дереве ровно одна.
-    for dir in ["usr", "usr/share", "usr/share/defaults", "usr/share/defaults/etc"] {
-        fs_image
-            .create_dir_path(&mut disk, dir, 0o755, 0, 0)
-            .map_err(|err| anyhow::anyhow!("не удалось создать /{dir} в образе: {err}"))?;
-    }
-    for (name, _) in crate::arch::PAYLOAD_DEFAULTS {
-        let source = paths::defaults_dir().join(name);
-        let data = fs::read(&source)
-            .with_context(|| format!("не удалось прочитать {}", source.display()))?;
-        fs_image
-            .write_file_path(
-                &mut disk,
-                &format!("usr/share/defaults/etc/{name}"),
-                &data,
-                0o644,
-                0,
-                0,
-            )
-            .map_err(|err| anyhow::anyhow!("не удалось записать эталон {name}: {err}"))?;
-    }
-
-    // Своя среда .NET (фаза N5a) — тем же комплектом, что ставит установщик:
-    // обновлённая машина не должна терять `/usr/share/dotnet`.
-    for dir in ["usr/share/dotnet", "usr/share/dotnet/samples"] {
-        fs_image
-            .create_dir_path(&mut disk, dir, 0o755, 0, 0)
-            .map_err(|err| anyhow::anyhow!("не удалось создать /{dir} в образе: {err}"))?;
-    }
-    for (name, _) in crate::arch::PAYLOAD_DOTNET {
-        let source = paths::initrd_source_dir().join("usr/share/dotnet").join(name);
-        let data = fs::read(&source)
-            .with_context(|| format!("не удалось прочитать {}", source.display()))?;
-        fs_image
-            .write_file_path(&mut disk, &format!("usr/share/dotnet/{name}"), &data, 0o644, 0, 0)
-            .map_err(|err| anyhow::anyhow!("не удалось записать {name}: {err}"))?;
+    // Всё, что образ несёт под `/usr/share`. Обновление обязано нести **тот
+    // же** набор, что кладёт установщик, и причина не в аккуратности: `/etc`,
+    // `/home`, `/opt` живут на разделе состояния, до которого обновление не
+    // дотягивается, а `/usr/share` принадлежит образу и заменяется вместе с
+    // ним. Чего образ не принёс, того на обновлённой машине не станет.
+    //
+    // Список берётся общий — `arch::IMAGE_SHARE`, тот же, по которому
+    // собирается установочный носитель. До 21.09.2026 здесь был свой набор
+    // циклов, и он отстал: эталонные настройки и .NET образ нёс, а образец Lua
+    // и страницу веб-сервера — нет. Обновлённая машина их теряла.
+    for group in &crate::arch::IMAGE_SHARE {
+        // Недостающие звенья пути `create_dir_path` создаёт сам, а уже
+        // существующие находит: `usr` и `usr/share` общие у всех групп.
+        for dir in std::iter::once(group.dir.to_string())
+            .chain(group.subdirs.iter().map(|sub| format!("{}/{sub}", group.dir)))
+        {
+            fs_image
+                .create_dir_path(&mut disk, &dir, 0o755, 0, 0)
+                .map_err(|err| anyhow::anyhow!("не удалось создать /{dir} в образе: {err}"))?;
+        }
+        for (name, _) in group.files {
+            let source = paths::initrd_source_dir().join(group.dir).join(name);
+            let data = fs::read(&source)
+                .with_context(|| format!("не удалось прочитать {}", source.display()))?;
+            let target = format!("{}/{name}", group.dir);
+            fs_image
+                .write_file_path(&mut disk, &target, &data, 0o644, 0, 0)
+                .map_err(|err| anyhow::anyhow!("не удалось записать /{target} в образ: {err}"))?;
+        }
     }
 
     fs_image
