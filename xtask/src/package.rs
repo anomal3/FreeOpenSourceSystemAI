@@ -659,6 +659,35 @@ pub fn place_big_file(disk_path: &Path) -> Result<()> {
     fs.mark_dirty(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось пометить том используемым: {err}"))?;
 
+    // Освободить место, занятое контейнерами обновления.
+    //
+    // Их кладёт в `/media` сам стенд ([`place_updates`]) перед сценариями,
+    // которым они нужны, и кладёт заново каждый раз. А `httpd-load` идёт в
+    // цепочке позже, и на корне в 511 МиБ его двухсотмегабайтный файл просто
+    // не помещается рядом с тремя контейнерами по 111,6 МБ: 21.09.2026
+    // сценарий упал на «the filesystem has no free blocks left» — не на
+    // дефекте системы, а на арифметике.
+    //
+    // Снести их безопасно именно потому, что положил их стенд: сценарию,
+    // которому они понадобятся, `place_updates` положит их снова.
+    if let Some((dir, _)) = media {
+        for name in [
+            system_file_name(UPDATE_VERSION),
+            String::from("freeos-broken.fpk"),
+            String::from("freeos-forged.fpk"),
+        ] {
+            match fs.unlink(&mut dev, dir, &name) {
+                Ok(()) => say!("стенд: /media/{name} убран, чтобы освободить место под {BIG_FILE_NAME}"),
+                // Их могло и не быть: сценарии обновления в этой цепочке могли
+                // не запускаться.
+                Err(ext2::Error::NotFound) => {}
+                Err(err) => {
+                    return Err(anyhow::anyhow!("не удалось убрать /media/{name}: {err}"));
+                }
+            }
+        }
+    }
+
     let data = big_file_bytes();
     let target = format!("media/{BIG_FILE_NAME}");
     match fs.write_file_path(&mut dev, &target, &data, 0o644, 0, 0) {
