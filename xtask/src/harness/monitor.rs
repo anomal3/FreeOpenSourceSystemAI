@@ -30,11 +30,31 @@ use anyhow::{Context, Result, bail};
 /// не сообщает, а закрытия соединения ждать нельзя — оно живёт весь прогон.
 const PROMPT: &str = "(qemu) ";
 
-/// Сколько ждать ответа на команду.
+/// Сколько ждать ответа на обычную команду монитора.
 ///
-/// Секунды, а не миллисекунды: `screendump` на экране 1024×768 пишет два с
-/// лишним мегабайта на диск, и на холодной файловой системе это не мгновение.
+/// Обычная команда — это `sendkey`, `mouse_move`, `device_add`: монитор
+/// отвечает на них сразу, и пятнадцати секунд хватает с запасом в сотню раз.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Сколько ждать ответа на `screendump`.
+///
+/// Отдельный срок, и он вчетверо больше обычного. Причина — 21.09.2026: в
+/// полном прогоне `install x86_64 release` провалился на третьем шаге, не
+/// дождавшись снимка за пятнадцать секунд, и увёл за собой **двадцать восемь**
+/// сценариев установленной системы: без диска, который делает установка,
+/// проверять им нечего.
+///
+/// Снимок — единственная команда монитора, которая делает работу, а не
+/// передаёт событие: QEMU пишет два с лишним мегабайта на диск, и делает это
+/// синхронно, посреди своей же главной петли. На стенде таких машин три сразу,
+/// и все они пишут на один диск вместе с журналами воркеров. Пятнадцать секунд
+/// были не измерены, а взяты на глаз — и оказались меньше настоящего разброса.
+///
+/// Шестьдесят — тоже не измерение, а запас: вчетверо больше самого долгого
+/// наблюдавшегося снимка. Чтобы следующий прогон дал настоящее число,
+/// [`Monitor::screendump`] возвращает потраченное время, а стенд называет
+/// вслух каждый снимок, который занял дольше обычной команды.
+const SCREENDUMP_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Monitor {
     stream: TcpStream,
@@ -67,7 +87,11 @@ impl Monitor {
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                bail!("монитор молчит дольше {} с; получено: {:?}", timeout.as_secs(), self.pending);
+                bail!(
+                    "монитор молчит дольше {} с; получено: {:?}",
+                    timeout.as_secs(),
+                    excerpt(&self.pending),
+                );
             }
             self.stream
                 .set_read_timeout(Some(remaining.min(Duration::from_millis(250))))
@@ -90,13 +114,18 @@ impl Monitor {
 
     /// Выполнить команду монитора и вернуть её ответ без эха.
     pub fn command(&mut self, command: &str) -> Result<String> {
+        self.command_within(command, COMMAND_TIMEOUT)
+    }
+
+    /// То же, но со своим сроком ожидания.
+    fn command_within(&mut self, command: &str, timeout: Duration) -> Result<String> {
         self.stream
             .write_all(format!("{command}\n").as_bytes())
             .with_context(|| format!("не удалось отправить монитору '{command}'"))?;
         self.stream.flush().ok();
 
         let answer = self
-            .read_until_prompt(COMMAND_TIMEOUT)
+            .read_until_prompt(timeout)
             .with_context(|| format!("нет ответа монитора на '{command}'"))?;
 
         Ok(strip_echo(&answer, command))
@@ -104,7 +133,12 @@ impl Monitor {
 
     /// Выполнить команду, для которой любой ответ означает ошибку.
     fn command_silent(&mut self, command: &str) -> Result<()> {
-        let answer = self.command(command)?;
+        self.command_silent_within(command, COMMAND_TIMEOUT)
+    }
+
+    /// То же, но со своим сроком ожидания.
+    fn command_silent_within(&mut self, command: &str, timeout: Duration) -> Result<()> {
+        let answer = self.command_within(command, timeout)?;
         if !answer.is_empty() {
             bail!("монитор ответил на '{command}': {answer}");
         }
@@ -164,8 +198,11 @@ impl Monitor {
         self.command("system_powerdown").map(|_| ())
     }
 
-    /// Снять экран в файл PPM.
-    pub fn screendump(&mut self, path: &Path) -> Result<()> {
+    /// Снять экран в файл PPM. Возвращает, сколько это заняло.
+    ///
+    /// Время возвращается не для красоты: срок [`SCREENDUMP_TIMEOUT`] взят с
+    /// запасом, а не измерен, и настоящее число может дать только прогон.
+    pub fn screendump(&mut self, path: &Path) -> Result<Duration> {
         // Прямая косая работает и на Windows, а обратная в HMP выглядит как
         // экранирование. Пробелы неустранимы: аргумент-имя файла читается до
         // первого пробела, кавычек этот разбор не знает.
@@ -180,8 +217,28 @@ impl Monitor {
         // Формат не задаётся: `-f png` понимают не все сборки QEMU, а ошибка
         // разбора выглядит как «invalid char in expression» и не объясняет
         // ничего. PPM умеют все, а перевод в PNG делает сам стенд.
-        self.command_silent(&format!("screendump {text}"))
+        let started = Instant::now();
+        self.command_silent_within(&format!("screendump {text}"), SCREENDUMP_TIMEOUT)?;
+        Ok(started.elapsed())
     }
+}
+
+/// Последние знаки непрочитанного — для сообщения об ошибке.
+///
+/// Обрезка не для опрятности. Монитор перерисовывает строку после каждого
+/// знака, и эхо команды длиной в сто символов — это десятки килобайт `ESC[D`.
+/// Такое сообщение об ошибке не читают: оно прячет само себя, а вместе с собой
+/// и соседние строки отчёта. Хвост же говорит всё, что нужно, — на чём
+/// оборвалось.
+fn excerpt(text: &str) -> String {
+    const KEEP: usize = 160;
+
+    let count = text.chars().count();
+    if count <= KEEP {
+        return text.to_string();
+    }
+    let tail: String = text.chars().skip(count - KEEP).collect();
+    format!("…{tail} (всего {count} знак(ов))")
 }
 
 /// Отделить ответ монитора от эха.

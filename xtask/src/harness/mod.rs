@@ -1461,7 +1461,8 @@ fn play(
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
                 let png = ppm.with_extension("png");
                 std::fs::create_dir_all(paths::test_dir()).ok();
-                hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
+                let took = hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
+                report_slow_shot(index, took);
                 let (w, h) = shot::ppm_to_png(&ppm, &png).with_context(|| format!("шаг {index}"))?;
                 say!("             {w}x{h} -> {}", png.display());
                 shots.push(png);
@@ -1475,7 +1476,8 @@ fn play(
                 let ppm = paths::test_dir().join(format!("{prefix}-screen.ppm"));
                 let png = ppm.with_extension("png");
                 std::fs::create_dir_all(paths::test_dir()).ok();
-                hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
+                let took = hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
+                report_slow_shot(index, took);
                 let (w, h) = shot::ppm_to_png(&ppm, &png).with_context(|| format!("шаг {index}"))?;
                 if (w, h) != (*width, *height) {
                     bail!("шаг {index}: экран гостя {w}x{h}, а не {width}x{height}");
@@ -1484,6 +1486,22 @@ fn play(
         }
     }
     Ok(())
+}
+
+/// Назвать вслух снимок, который делался неприлично долго.
+///
+/// Единственный способ узнать настоящий разброс. Снимок — это два с лишним
+/// мегабайта, которые QEMU пишет синхронно, и на стенде таких машин три; срок
+/// в мониторе взят с запасом, а не измерен. Строка ниже копится в журналах
+/// прогонов, и по ней — а не по догадке — однажды будет выставлено число.
+///
+/// Порог — пять секунд: столько обычная команда монитора не занимает никогда.
+fn report_slow_shot(index: usize, took: std::time::Duration) {
+    const LOUD: std::time::Duration = std::time::Duration::from_secs(5);
+
+    if took >= LOUD {
+        say!("             ВНИМАНИЕ: снимок на шаге {index} занял {} мс", took.as_millis());
+    }
 }
 
 /// Позвать штатный `ssh` и вернуть всё, что он написал.
