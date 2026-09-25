@@ -561,4 +561,4 @@ pub fn halt() -> ! {
     }
 }
 
-pub use power::{power_off, reboot};
+pub use power::{power_off, reboot, reboot_on_key};

@@ -165,6 +165,70 @@ pub unsafe fn reboot(rsdp: u64) {
     }
 }
 
+/// После паники: дождаться нажатия на клавиатуре PS/2 и перезагрузить машину.
+///
+/// Нужно снимку паники ([`crate::crashlog`]): он переживает сброс, но не
+/// выключение, а у ноутбука кнопки сброса нет — удержание кнопки питания
+/// снимает питание вместе со снимком. Прерываний после паники нет, поэтому
+/// контроллер опрашивается. Берётся только **нажатие** (код меньше `0x80`):
+/// отпускание Enter после `panic now`, набранной с этой же клавиатуры, пришло
+/// бы следом и перезагрузило машину раньше, чем человек прочтёт экран.
+///
+/// Возвращается, если контроллера нет, перезагрузка не удалась или за десять
+/// минут никто ничего не нажал: крутиться вечно значит вечно греть машину,
+/// которую, возможно, уже бросили.
+///
+/// # Safety
+///
+/// Только из обработчика паники: остальные процессоры остановлены, а драйвер
+/// клавиатуры больше не работает — байты контроллера забираем мы.
+pub unsafe fn reboot_on_key(rsdp: u64) -> bool {
+    const STATUS_OUTPUT_FULL: u8 = 1 << 0;
+    const STATUS_FROM_MOUSE: u8 = 1 << 5;
+    const PATIENCE_S: u64 = 600;
+
+    // Прерывания — прочь первым делом. Паника из задачи приходит с ними
+    // разрешёнными, и байт нажатия раньше нас забрал бы обработчик клавиатуры:
+    // опрос видел бы пустой контроллер вечно (так и было в первой версии).
+    // SAFETY: возврата к прежней работе нет — дальше только сброс или `halt`.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)) };
+
+    // SAFETY: порты i8042; отсутствующий контроллер читается как `0xFF`.
+    unsafe {
+        if inb(0x64) == 0xFF {
+            return false;
+        }
+        // То, что уже лежит в буфере, нажато до паники.
+        for _ in 0..64 {
+            if inb(0x64) & STATUS_OUTPUT_FULL == 0 {
+                break;
+            }
+            let _ = inb(0x60);
+        }
+    }
+    kprintln!("press a key to restart; the log above comes back after the restart");
+
+    let hz = super::tsc::frequency();
+    let start = super::tsc::counter();
+    loop {
+        // SAFETY: см. выше.
+        let status = unsafe { inb(0x64) };
+        if status & STATUS_OUTPUT_FULL != 0 {
+            // SAFETY: см. выше.
+            let byte = unsafe { inb(0x60) };
+            if status & STATUS_FROM_MOUSE == 0 && (1..0x80).contains(&byte) {
+                // SAFETY: контракт функции.
+                unsafe { reboot(rsdp) };
+                return false;
+            }
+        }
+        if hz != 0 && super::tsc::counter().wrapping_sub(start) > hz * PATIENCE_S {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Записать значение в обобщённый адрес ACPI.
 ///
 /// # Safety

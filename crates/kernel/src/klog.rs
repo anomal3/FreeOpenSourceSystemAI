@@ -102,6 +102,20 @@ pub fn _print(args: fmt::Arguments<'_>) {
     let _ = Sink(&mut ring).write_fmt(args);
 }
 
+/// Скопировать хвост журнала в `out`, не дожидаясь замка.
+///
+/// Для паники ([`crate::crashlog`]): паника посреди печати держит замок сама, и
+/// ждать его означало бы не дождаться никогда. `None` — замок занят.
+pub fn tail_nowait(out: &mut [u8]) -> Option<usize> {
+    let ring = RING.try_lock()?;
+    let take = (out.len() as u64).min(ring.written).min(CAPACITY as u64);
+    let start = ring.written - take;
+    for (offset, byte) in out[..take as usize].iter_mut().enumerate() {
+        *byte = ring.bytes[((start + offset as u64) & MASK) as usize];
+    }
+    Some(take as usize)
+}
+
 /// Сколько байт напечатано с запуска.
 #[must_use]
 pub fn written() -> u64 {

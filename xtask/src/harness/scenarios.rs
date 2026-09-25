@@ -3204,6 +3204,65 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "panic-snapshot",
+        about: "Паника оставляет хвост журнала в памяти, и загрузка после сброса возвращает его.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        // Сброс здесь заказан: без флага QEMU с `-no-reboot` завершился бы там,
+        // где машина должна подняться и вернуть снимок.
+        reboots: true,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            // Участок занят: карта машины описала его как свободную память.
+            Step::Await("crashlog    : 64 KiB at 0x", BOOT),
+            Step::Await("freeos> ", BOOT),
+            // Холодный старт снимка не приносит — иначе проверка ниже ничего
+            // бы не доказывала.
+            Step::Line("lastpanic"),
+            Step::Await("the previous boot left no panic snapshot", 15_000),
+            Step::Line("panic now"),
+            // Строка журнала **до** паники: она обязана оказаться в снимке,
+            // то есть снимок — это журнал, а не одно сообщение.
+            Step::Await("stopping the machine on request", 15_000),
+            Step::Await("requested from the shell", 15_000),
+            Step::Await("this log is kept in memory", 15_000),
+            // Сброс, а не выключение: питание с памяти не снимается. Прошивка
+            // проходит заново целиком — и участок обязан это пережить.
+            Step::Reset,
+            Step::Await("crashlog    : the previous boot panicked", BOOT),
+            // Причина — сразу в журнале новой загрузки, без команды.
+            Step::Await("requested from the shell", 15_000),
+            Step::Await("freeos> ", BOOT),
+            Step::Line("lastpanic 60"),
+            Step::Await("stopping the machine on request", 15_000),
+            Step::Await("*** KERNEL PANIC ***", 15_000),
+            // Снимок выдаётся один раз: заголовок стёрт, и следующий сброс
+            // без паники ничего не принесёт.
+            Step::Reset,
+            Step::Await("crashlog    : 64 KiB at 0x", BOOT),
+            Step::Await("freeos> ", BOOT),
+            Step::Line("lastpanic"),
+            Step::Await("the previous boot left no panic snapshot", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+        ],
+    },
+    Scenario {
         name: "devicetree",
         about: "Ядро без прошивки: QEMU входит в него по договору Linux, машина описана только деревом, и шину PCIe ядро поднимает само.",
         target: Target::DeviceTree,
@@ -3798,6 +3857,66 @@ pub const ALL: &[Scenario] = &[
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "panic-installed",
+        about: "Снимок паники установленной системы ложится после сброса в /var/log на раздел состояния.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        // Только x86-64: перезагрузка по клавише есть только там (PS/2).
+        arches: &[Arch::X86_64],
+        // Перезагрузка заказана, см. `panic-snapshot`.
+        reboots: true,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Line("panic now"),
+            Step::Await("stopping the machine on request", 15_000),
+            Step::Await("this log is kept in memory", 15_000),
+            // Не сброс монитора, а клавиша: так перезагрузится ноутбук, у
+            // которого кнопки сброса нет. Ядро после паники опрашивает
+            // контроллер PS/2 само и делает тёплый сброс.
+            //
+            // Клавиатура USB выдёргивается первой: пока она есть, QEMU отдаёт
+            // `sendkey` ей (проверено счётчиком отчётов), и нажатие не дошло бы
+            // до PS/2 — а клавиатура ноутбука именно PS/2.
+            Step::Await("press a key to restart", 15_000),
+            Step::Unplug("usbkbd"),
+            Step::Wait(500),
+            Step::Key("spc"),
+            Step::Await("crashlog    : the previous boot panicked", BOOT),
+            // Паника оставила тома открытыми, и загрузка это видит — но пишет
+            // всё равно: раздел состояния смонтирован на запись.
+            Step::Await("crashlog    : saved to /var/log/last-panic.log", 60_000),
+            Step::Await("freeos> ", BOOT),
+            // Файл читается с диска, а не из памяти. Причина — первой строкой:
+            // `cat` оболочки показывает первые четыре килобайта, а паника лежит
+            // в конце журнала. Хвост целиком — в `lastpanic` выше по сценарию
+            // `panic-snapshot`; здесь довольно, что файл больше показанного.
+            Step::Line("cat /var/log/last-panic.log"),
+            Step::Await("FreeOS panic snapshot: at ", 30_000),
+            Step::Await("requested from the shell", 15_000),
+            Step::Await("bytes of the kernel log follow", 15_000),
+            Step::Await("4096 of ", 15_000),
+            // Выход закрывает тома чисто: следующий в цепочке (`installed`)
+            // проверяет именно это.
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
         ],
     },
     Scenario {

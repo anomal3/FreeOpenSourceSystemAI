@@ -338,6 +338,25 @@ impl BitmapFrameAllocator {
         }
     }
 
+    /// Изъять из пула участок целиком — только если **весь** он свободен.
+    ///
+    /// Нужен снимку паники ([`crate::crashlog`]): его участок обязан быть
+    /// памятью, которую карта описала как свободную, и ни одного кадра из него
+    /// не должен успеть взять кто-то ещё. Занятый кадр внутри означает одно из
+    /// двух — прошивка оставила память себе, или на ней уже лежит что-то наше, —
+    /// и в обоих случаях участок не берётся вовсе.
+    pub fn claim_range(&mut self, start: u64, len: u64) -> bool {
+        let first = (start >> PAGE_SHIFT) as usize;
+        let last = (start.saturating_add(len).div_ceil(PAGE_SIZE as u64)) as usize;
+        if last > self.frames || (first..last).any(|index| self.is_used(index)) {
+            return false;
+        }
+        for index in first..last {
+            self.reserve(index);
+        }
+        true
+    }
+
     /// Переключить аллокатор на прямое отображение физической памяти.
     ///
     /// Вызывается один раз, сразу после `AddressSpace::activate()`: с этого

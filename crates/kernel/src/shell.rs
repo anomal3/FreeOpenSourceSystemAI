@@ -723,6 +723,16 @@ fn run_command(line: &str) -> bool {
         }
         "usb" => usb_status(),
         "dmesg" => kernel_log(argument),
+        "lastpanic" => last_panic(argument),
+        // Нарочная паника: иначе путь снимка проверить нечем. Слово `now`
+        // обязательно — опечатка в `pa<Tab>` не должна ронять машину.
+        "panic" if argument == "now" => {
+            // Строка в журнал ядра, а не в окно оболочки: снимок — это хвост
+            // журнала, и по ней видно, что в нём не одно сообщение паники.
+            crate::kprintln!("  shell       : stopping the machine on request");
+            panic!("requested from the shell")
+        }
+        "panic" => sprintln!("  panic: type `panic now` to stop this machine on purpose"),
         "pci" => {
             for line in crate::devices::census_text().lines() {
                 sprintln!("  {line}");
@@ -1339,6 +1349,20 @@ fn kernel_log(argument: &str) {
     }
 }
 
+/// Хвост журнала прошлой загрузки, если она кончилась паникой.
+fn last_panic(argument: &str) {
+    let wanted: usize = argument.parse().unwrap_or(40).max(1);
+    let Some(text) = crate::crashlog::previous() else {
+        sprintln!("  lastpanic: the previous boot left no panic snapshot");
+        return;
+    };
+    let text = alloc::string::String::from_utf8_lossy(&text);
+    let lines: alloc::vec::Vec<&str> = text.lines().collect();
+    for line in &lines[lines.len().saturating_sub(wanted)..] {
+        sprintln!("{line}");
+    }
+}
+
 fn help() {
     sprintln!("  help          this list");
     sprintln!("  uptime        time since the timer started");
@@ -1347,6 +1371,8 @@ fn help() {
     sprintln!("  input         key event counters");
     sprintln!("  usb           xHCI controller state");
     sprintln!("  dmesg [n]     the last n lines of the kernel log (40 by default)");
+    sprintln!("  lastpanic [n] the last n lines of the log of a boot that panicked");
+    sprintln!("  panic now     stop this machine with a kernel panic (to test the snapshot)");
     sprintln!("  pci           every device on the bus, with its identifiers");
     sprintln!("  ui            compositor state");
     sprintln!("  tasks         scheduler state");

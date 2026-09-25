@@ -54,6 +54,7 @@ mod fs;
 mod guard;
 mod input;
 mod irq;
+mod crashlog;
 mod klog;
 mod latency;
 mod mm;
@@ -239,6 +240,9 @@ fn take_over_memory(info: &BootInfo) {
         stats.free,
         stats.free_bytes() / (1024 * 1024)
     );
+    // Участок под снимок паники занимается до первого же выданного кадра:
+    // таблицы страниц ниже легли бы поверх снимка прошлой загрузки.
+    crashlog::claim();
 
     let space: Option<Result<arch::KernelSpace, arch::SpaceError>> =
         mm::frame::with(|frames| arch::build_kernel_address_space(info, frames));
@@ -287,6 +291,9 @@ fn take_over_memory(info: &BootInfo) {
             arch::halt();
         }
     }
+
+    // Прямое отображение и куча есть — снимок прошлой загрузки можно прочитать.
+    crashlog::recover();
 }
 
 /// Убедиться, что фреймбуфер пережил переключение на собственные таблицы.
@@ -974,6 +981,9 @@ fn mount_disk_root(info: &BootInfo) {
     fs::set_root(alloc::boxed::Box::new(mount));
 
     mount_state(&found, info);
+    // Раздел состояния — единственное место, куда система пишет: снимок паники
+    // прошлой загрузки ложится туда.
+    crashlog::store();
     mount_data(&found, info);
     // Разметка запоминается целиком: подтверждение загрузки и `sysupdate`
     // спросят о ней позже и из другого места.
@@ -1726,5 +1736,11 @@ fn panic(info: &PanicInfo<'_>) -> ! {
         kprintln!("at {}:{}:{}", location.file(), location.line(), location.column());
     }
     kprintln!("{}", info.message());
+    if crashlog::save(info) {
+        kprintln!("this log is kept in memory: after a reset (not a power-off) `lastpanic` shows it");
+        // SAFETY: остальные процессоры остановлены выше; RSDP пришёл от
+        // загрузчика (ноль — таблиц нет, и сброс пойдёт запасным путём).
+        unsafe { arch::reboot_on_key(acpi::rsdp()) };
+    }
     arch::halt();
 }
