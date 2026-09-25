@@ -236,8 +236,10 @@ pub unsafe fn init(rsdp: u64) {
     crate::kprintln!();
     crate::kprintln!("---- network ----------------------------------------------------");
 
-    if rsdp == 0 {
-        crate::kprintln!("  network     : no ACPI tables, so no PCI: no network on this machine");
+    if rsdp == 0 && !crate::pci::has_tree_host() {
+        crate::kprintln!(
+            "  network     : no ACPI tables and no PCIe in the device tree: no network on this machine"
+        );
         return;
     }
 

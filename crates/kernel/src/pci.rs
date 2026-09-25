@@ -299,6 +299,17 @@ impl Root {
     ///
     /// Требования те же, что у [`acpi::find_table`].
     pub unsafe fn discover(rsdp: u64) -> Result<Self, AcpiError> {
+        // Машина без ACPI, описанная деревом устройств (фаза 51b): мост назвал
+        // сам загрузчик, и таблицы спрашивать не у кого. Порядок «сначала
+        // дерево» здесь не выбор, а следствие: таблиц на такой машине нет.
+        if rsdp == 0 {
+            if let Some(host) = tree_host() {
+                let root = Self::Ecam(host.ecam);
+                // SAFETY: контракт функции — ядро на своих таблицах.
+                unsafe { assign_once(&root, &host) };
+                return Ok(root);
+            }
+        }
         // SAFETY: контракт функции.
         match unsafe { find_ecam(rsdp) } {
             Ok(ecam) => Ok(Self::Ecam(ecam)),
@@ -366,6 +377,247 @@ pub unsafe fn find_ecam(rsdp: u64) -> Result<Ecam, AcpiError> {
         start_bus: bytes[entry + 10],
         end_bus: bytes[entry + 11],
     })
+}
+
+// ---------------------------------------------------------------------------
+// Мост из дерева устройств (фаза 51b)
+// ---------------------------------------------------------------------------
+
+/// Окно адресов моста: где его видит процессор, где — шина, и сколько.
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+    pub cpu: u64,
+    pub bus: u64,
+    pub len: u64,
+}
+
+/// Мост PCIe, описанный деревом устройств.
+///
+/// Отличается от `MCFG` не только источником. На машине с прошивкой UEFI BAR
+/// всех устройств уже расставлены — её собственные драйверы с ними работали.
+/// Там, где ядро входит по договору Linux, их не расставил никто: регистры
+/// читаются нулями, и устройство, найденное по идентификатору, не отвечает ни
+/// по какому адресу. Поэтому вместе с окном ECAM запоминаются окна памяти —
+/// туда BAR и встанут.
+#[derive(Clone, Copy)]
+pub struct TreeHost {
+    pub ecam: Ecam,
+    pub mem32: Option<Window>,
+    pub mem64: Option<Window>,
+}
+
+static TREE_HOST: crate::sync::SpinLock<Option<TreeHost>> = crate::sync::SpinLock::new(None);
+
+/// Расставлены ли уже BAR. Расставляются один раз: повторная расстановка
+/// сдвинула бы регистры устройства, с которым драйвер уже работает.
+static ASSIGNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+impl Ecam {
+    /// Окно, описанное не таблицей, а деревом.
+    #[must_use]
+    pub const fn from_tree(base: u64, start_bus: u8, end_bus: u8) -> Self {
+        Self { base, segment: 0, start_bus, end_bus }
+    }
+}
+
+/// Запомнить мост, описанный деревом этой машины.
+pub fn set_tree_host(host: TreeHost) {
+    *TREE_HOST.lock() = Some(host);
+}
+
+/// Мост из дерева, если он есть.
+#[must_use]
+pub fn tree_host() -> Option<TreeHost> {
+    *TREE_HOST.lock()
+}
+
+/// Есть ли у машины шина без ACPI — то есть из дерева.
+#[must_use]
+pub fn has_tree_host() -> bool {
+    TREE_HOST.lock().is_some()
+}
+
+/// Расставить BAR, если этого ещё не делали.
+///
+/// # Safety
+///
+/// Ядро на собственных таблицах; драйверы ещё не работают с устройствами
+/// (иначе расстановка сдвинула бы их регистры) — поэтому один раз.
+unsafe fn assign_once(root: &Root, host: &TreeHost) {
+    if ASSIGNED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: контракт функции.
+    unsafe { assign_bars(root, host) };
+}
+
+/// Выделитель адресов из одного окна: подряд, с выравниванием на размер.
+///
+/// Подряд, а не лучшим подходящим: устройств единицы, а BAR по спецификации
+/// выравнивается на собственный размер, и порядок «от больших к меньшим» дал
+/// бы выигрыш в килобайтах окна в сотни мегабайт.
+struct Allocator {
+    window: Window,
+    next: u64,
+}
+
+impl Allocator {
+    fn new(window: Window) -> Self {
+        Self { window, next: window.cpu }
+    }
+
+    /// Адрес у процессора для региона `size` байт, или `None`, если не влез.
+    fn take(&mut self, size: u64) -> Option<u64> {
+        let place = self.next.checked_add(size - 1)? & !(size - 1);
+        let end = place.checked_add(size)?;
+        if end > self.window.cpu + self.window.len {
+            return None;
+        }
+        self.next = end;
+        Some(place)
+    }
+
+    /// Тот же адрес, каким его видит шина.
+    const fn bus_address(&self, cpu: u64) -> u64 {
+        cpu - self.window.cpu + self.window.bus
+    }
+
+    fn used(&self) -> u64 {
+        self.next - self.window.cpu
+    }
+}
+
+/// Окно годится, только если шина видит память по тем же адресам, что и
+/// процессор.
+///
+/// Драйверы берут адрес регистров из BAR ([`Device::memory_bar`]) и
+/// отображают его как физический — то есть молча считают, что смещения нет. У
+/// QEMU `virt` его и нет; окно со смещением означало бы драйвер, пишущий мимо
+/// устройства, и честнее такое окно не брать, чем брать и промахиваться.
+fn identity(window: Option<Window>) -> Option<Window> {
+    window.filter(|window| window.cpu == window.bus && window.len != 0)
+}
+
+/// `Command`, бит 0: устройство отвечает на обращения к своим портам.
+const COMMAND_IO_SPACE: u16 = 1 << 0;
+
+/// Расставить BAR всех функций на шине моста.
+///
+/// Размер BAR узнаётся по спецификации: записать все единицы, прочитать —
+/// нули в младших адресных разрядах и есть размер. На время замера устройству
+/// выключается декодирование, иначе адрес из одних единиц успел бы на миг
+/// стать настоящим. Порты ввода-вывода не расставляются: ни одному нашему
+/// драйверу они не нужны.
+///
+/// # Safety
+///
+/// Ядро на собственных таблицах, драйверы с устройствами ещё не работают.
+unsafe fn assign_bars(root: &Root, host: &TreeHost) {
+    let Some(window32) = identity(host.mem32) else {
+        kprintln!("  pci         : the device tree gives no usable 32-bit memory window; BARs left as they are");
+        return;
+    };
+    let mut low = Allocator::new(window32);
+    let mut high = identity(host.mem64).map(Allocator::new);
+    let mut placed = 0usize;
+    let mut refused = 0usize;
+
+    // SAFETY: контракт функции.
+    unsafe {
+        for_each(root, |device| {
+            let kind = device.read8(CFG_HEADER_TYPE) & !HEADER_TYPE_MULTIFUNCTION;
+            if kind == HEADER_TYPE_BRIDGE {
+                // Мосту самому нужны номера шин и окна пересылки; без них
+                // устройства за ним не видны вовсе. У QEMU `virt` мостов нет;
+                // встретив мост, говорим об этом, а не делаем вид.
+                kprintln!(
+                    "  pci         : {} is a bridge and stays unprogrammed: nothing behind it will be seen",
+                    device.address
+                );
+                return true;
+            }
+            if kind != 0 {
+                return true;
+            }
+
+            let command = device.read16(CFG_COMMAND);
+            device.write16(CFG_COMMAND, command & !(COMMAND_MEMORY_SPACE | COMMAND_IO_SPACE));
+
+            let mut index = 0;
+            while index < 6 {
+                let offset = CFG_BAR0 + index * 4;
+                let original = device.read32(offset);
+                device.write32(offset, u32::MAX);
+                let probe = device.read32(offset);
+                if probe == 0 || probe & BAR_IO_SPACE != 0 {
+                    device.write32(offset, original);
+                    index += 1;
+                    continue;
+                }
+                let wide = probe & BAR_TYPE_MASK == BAR_TYPE_64BIT && index + 1 < 6;
+                let mut mask = u64::from(probe & BAR_MEMORY_ADDR_MASK);
+                if wide {
+                    device.write32(offset + 4, u32::MAX);
+                    mask |= u64::from(device.read32(offset + 4)) << 32;
+                } else {
+                    mask |= 0xFFFF_FFFF_0000_0000;
+                }
+                let size = (!mask).wrapping_add(1);
+                let step = if wide { 2 } else { 1 };
+                if size == 0 || !size.is_power_of_two() {
+                    device.write32(offset, original);
+                    index += step;
+                    continue;
+                }
+
+                // Сначала 32-битное окно: его видит любое устройство. В
+                // 64-битное уходит только то, что умеет 64-битный адрес и не
+                // поместилось.
+                let taken = match low.take(size) {
+                    Some(cpu) => Some((cpu, low.bus_address(cpu))),
+                    None if wide => high
+                        .as_mut()
+                        .and_then(|high| high.take(size).map(|cpu| (cpu, high.bus_address(cpu)))),
+                    None => None,
+                };
+                let Some((cpu, bus)) = taken else {
+                    kprintln!(
+                        "  pci         : {} BAR{index} of {} KiB does not fit any window",
+                        device.address,
+                        size / 1024
+                    );
+                    device.write32(offset, 0);
+                    refused += 1;
+                    index += step;
+                    continue;
+                };
+                device.write32(offset, (bus as u32) | (probe & !BAR_MEMORY_ADDR_MASK));
+                if wide {
+                    device.write32(offset + 4, (bus >> 32) as u32);
+                }
+                kprintln!(
+                    "  pci         : {} {:04x}:{:04x} BAR{index} {} KiB at {cpu:#012x}",
+                    device.address,
+                    device.vendor,
+                    device.device,
+                    size / 1024
+                );
+                placed += 1;
+                index += step;
+            }
+
+            // Память — да, порты и управление шиной — нет: второе включит
+            // драйвер, когда построит свои кольца (см. `enable_bus_master`).
+            device.write16(CFG_COMMAND, (command & !COMMAND_IO_SPACE) | COMMAND_MEMORY_SPACE);
+            true
+        });
+    }
+
+    kprintln!(
+        "  pci         : {placed} BAR(s) placed in the device tree's windows ({} KiB of the 32-bit window used){}",
+        low.used() / 1024,
+        if refused == 0 { "" } else { "; some did not fit" }
+    );
 }
 
 // ---------------------------------------------------------------------------

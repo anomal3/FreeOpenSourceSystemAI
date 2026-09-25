@@ -183,6 +183,33 @@ pub unsafe fn probe_gic(rsdp: u64) {
         // SAFETY: адреса пришли из дерева машины и описывают регистры
         // контроллера; таблицы ядра активны.
         unsafe { map_gic_windows() };
+        // Мост PCIe читается здесь же и по той же причине, что GIC: дерево
+        // живо только до того, как ядро заберёт его память, а шину будут
+        // спрашивать гораздо позже (фаза 51b).
+        // SAFETY: см. выше — дерево ещё не переиспользовано.
+        if let Some(host) = unsafe { device_tree() }.as_ref().and_then(fdt_boot::pcie_host) {
+            let window = |found: Option<fdt_boot::PcieWindow>| {
+                found.map(|w| crate::pci::Window { cpu: w.cpu, bus: w.bus, len: w.len })
+            };
+            crate::kprintln!(
+                "  pci         : the device tree puts ECAM at {:#012x}, buses {}..={}",
+                host.ecam,
+                host.first_bus,
+                host.last_bus
+            );
+            if let Some(w) = host.mem32 {
+                crate::kprintln!(
+                    "  pci         : 32-bit memory window {:#012x}, {} MiB",
+                    w.cpu,
+                    w.len >> 20
+                );
+            }
+            crate::pci::set_tree_host(crate::pci::TreeHost {
+                ecam: crate::pci::Ecam::from_tree(host.ecam, host.first_bus, host.last_bus),
+                mem32: window(host.mem32),
+                mem64: window(host.mem64),
+            });
+        }
         return;
     }
 

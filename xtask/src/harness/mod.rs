@@ -644,7 +644,7 @@ fn execute(
     let drives = prepare_drives(scenario, built, arch, ports)?;
     // Диск с томом btrfs, если он у сценария есть: шаг `DataVolume` читает его
     // с хоста, когда гость уже погас.
-    let data_disk = matches!(scenario.target, Target::LiveAndBtrfs)
+    let data_disk = matches!(scenario.target, Target::LiveAndBtrfs | Target::DeviceTree)
         .then(|| paths::btrfs_disk(arch, built.release));
 
     // Слушаем мы, подключается QEMU: порт 0 отдаёт свободный номер, и гонки за
@@ -778,6 +778,11 @@ fn execute(
             // статическое, со своим компоновочным сценарием и своим деревом
             // сборки (см. `phone::build_kernel`), — и нужно оно одной цели.
             Target::DeviceTree => Some(crate::phone::build_kernel(crate::phone::KERNEL_LOAD)?),
+            _ => None,
+        },
+        // RAM-диск того же захода: тот, что загрузчик UEFI положил бы на ESP.
+        direct_initrd: match scenario.target {
+            Target::DeviceTree => built.initrd().map(Path::to_path_buf),
             _ => None,
         },
         ..RunOptions::default()
@@ -2893,9 +2898,11 @@ fn prepare_drives(
             Drive::HostDirectory(qemu::prepare_esp(built, true)?),
             Drive::Image(image::prepare_btrfs_disk(arch, built.release)?),
         ],
-        // Носителя нет вовсе: ядро приносит QEMU, а ACPI, по которому ядро
-        // нашло бы шину PCI и диск на ней, у такой машины нет.
-        Target::DeviceTree => Vec::new(),
+        // Ядро и RAM-диск приносит QEMU, а носитель здесь один — диск с томом
+        // btrfs, тот же, что у `LiveAndBtrfs`. Он самодостаточен (цепочки
+        // установки не требует) и доказывает главное фазы 51b: ядро без ACPI
+        // нашло шину по дереву, расставило BAR и дошло до диска на ней.
+        Target::DeviceTree => vec![Drive::Image(image::prepare_btrfs_disk(arch, built.release)?)],
     };
     Ok(drives)
 }

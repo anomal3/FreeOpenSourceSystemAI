@@ -860,8 +860,9 @@ fn mount_disk_root(info: &BootInfo) {
     kprintln!();
     kprintln!("---- root filesystem --------------------------------------------");
 
-    if info.acpi_rsdp == 0 {
-        kprintln!("  disk        : no ACPI tables, so no PCI: keeping the initrd as root");
+    // Без ACPI шина бывает только из дерева устройств (фаза 51b).
+    if info.acpi_rsdp == 0 && !pci::has_tree_host() {
+        kprintln!("  disk        : no ACPI tables and no PCIe in the device tree: keeping the initrd as root");
         return;
     }
 

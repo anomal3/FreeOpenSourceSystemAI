@@ -3205,7 +3205,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "devicetree",
-        about: "Ядро без прошивки: QEMU входит в него по договору Linux, и машина описана только деревом устройств.",
+        about: "Ядро без прошивки: QEMU входит в него по договору Linux, машина описана только деревом, и шину PCIe ядро поднимает само.",
         target: Target::DeviceTree,
         usb_only: false,
         tablet: false,
@@ -3238,12 +3238,35 @@ pub const ALL: &[Scenario] = &[
             // QEMU и не из SPCR/MADT, которых на этой машине нет.
             Step::Await("serial      : the device tree puts the console UART at 0x09000000", 15_000),
             Step::Await("interrupts  : the device tree says GICv2 at 0x08000000", 15_000),
+            // Фаза 51b: мост PCIe — тоже из дерева (`pci-host-ecam-generic`).
+            // Окно ECAM у QEMU `virt` лежит выше четырёх гибибайт; это и адрес
+            // из `MCFG` той же машины, так что сверка честная.
+            Step::Await("pci         : the device tree puts ECAM at 0x4010000000", 15_000),
             // Прерывания доходят: таймер тикает по счётчику, а не стоит.
             Step::Await(" ticks in ", 15_000),
+            // BAR расставлены нами: прошивки, которая сделала бы это, здесь
+            // нет. Без этой строки устройства нашлись бы по идентификаторам и
+            // не ответили бы ни по какому адресу.
+            Step::Await("BAR(s) placed in the device tree's windows", 60_000),
+            // Диск на этой шине отвечает — и отвечает прерыванием MSI-X через
+            // GICv2m: без ACPI линий INTx не знает никто.
+            Step::Await("disk        : virtio-blk #0", 30_000),
+            Step::Await("/data comes from the data partition", 60_000),
             // Ввод по серийной линии тоже работает на прерывании — иначе
             // оболочка не ответила бы ниже ни на одну команду.
             Step::Await("serial in   : PL011 receive on INTID 33", 30_000),
+            // И вторая шина за ней: xHCI с его собственными MSI-X, клавиатура
+            // опознана по дескриптору отчёта.
+            Step::Await("usb         : slot 1 is a keyboard", 60_000),
             Step::Await("freeos> ", BOOT),
+            // Том прочитан по-настоящему, а не только смонтирован.
+            Step::Line("cat /data/hello.txt"),
+            Step::Await("hello from btrfs", 30_000),
+            // Клавиатура не только опознана, но и доставляет нажатия: команда
+            // набрана на USB-клавиатуре, а не в серийную линию.
+            Step::Type("echo dt-usb-ok"),
+            Step::Key("ret"),
+            Step::Await("  dt-usb-ok", 30_000),
             Step::Line("tasks"),
             Step::Await("preemption :", 15_000),
             Step::Line("exit"),

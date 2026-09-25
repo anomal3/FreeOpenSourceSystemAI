@@ -158,7 +158,8 @@ pub fn report() -> String {
     let mut out = String::new();
 
     let rsdp = crate::acpi::rsdp();
-    if rsdp != 0 {
+    // Без ACPI шина бывает только из дерева устройств — `discover` найдёт её сам.
+    if rsdp != 0 || pci::has_tree_host() {
         // SAFETY: RSDP из хэндоффа, прямое отображение активно; обход шины
         // только читает конфигурационное пространство.
         if let Ok(root) = unsafe { pci::Root::discover(rsdp) } {
@@ -223,8 +224,8 @@ pub fn report() -> String {
 pub fn census_text() -> String {
     let mut out = String::new();
     let rsdp = crate::acpi::rsdp();
-    if rsdp == 0 {
-        let _ = writeln!(out, "no ACPI tables, so no PCI bus here");
+    if rsdp == 0 && !pci::has_tree_host() {
+        let _ = writeln!(out, "no ACPI tables and no PCIe in the device tree, so no PCI bus here");
         return out;
     }
     // SAFETY: RSDP из хэндоффа, прямое отображение активно; обход шины только

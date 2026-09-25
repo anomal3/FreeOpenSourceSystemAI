@@ -600,6 +600,120 @@ pub fn uart(fdt: &Fdt<'_>) -> Option<(usize, bool)> {
     (region.address != 0).then_some((region.address as usize, pl011))
 }
 
+/// Окно адресов моста PCIe: где его видит процессор, где — шина, и сколько.
+#[derive(Clone, Copy, Debug)]
+pub struct PcieWindow {
+    pub cpu: u64,
+    pub bus: u64,
+    pub len: u64,
+}
+
+/// Мост PCIe так, как его описывает дерево (`pci-host-ecam-generic`).
+#[derive(Clone, Copy, Debug)]
+pub struct PcieHost {
+    /// Окно ECAM и его длина.
+    pub ecam: u64,
+    pub ecam_len: u64,
+    pub first_bus: u8,
+    pub last_bus: u8,
+    /// Окно 32-битной памяти — туда встают BAR, которые мы расставляем сами.
+    pub mem32: Option<PcieWindow>,
+    /// Окно 64-битной памяти, если оно есть.
+    pub mem64: Option<PcieWindow>,
+}
+
+/// Код пространства в старшей ячейке адреса PCI (`phys.hi`, биты 25:24).
+const PCI_SPACE_SHIFT: u32 = 24;
+const PCI_SPACE_MASK: u32 = 0b11;
+const PCI_SPACE_MEM32: u32 = 0b10;
+const PCI_SPACE_MEM64: u32 = 0b11;
+
+/// Мост PCIe, если дерево его описывает (фаза 51b).
+///
+/// На машине с ACPI то же самое сообщает `MCFG`, а окна адресов не нужны вовсе:
+/// BAR уже расставила прошивка. Здесь прошивки нет, и окна — единственное, что
+/// говорит, **куда** их ставить.
+///
+/// # Как читается `ranges`
+///
+/// Запись — три поля подряд: адрес на шине PCI (у моста `#address-cells` = 3:
+/// `phys.hi` с кодом пространства и два слова адреса), адрес у процессора
+/// (ячейки корня) и длина (`#size-cells` моста). Ячейки считаются по
+/// объявленным размерам, а не по тому, что «обычно» лежит в QEMU: запись,
+/// прочитанная с чужим шагом, даёт правдоподобное и неверное окно.
+pub fn pcie_host(fdt: &Fdt<'_>) -> Option<PcieHost> {
+    let node = fdt.find_compatible("pci-host-ecam-generic")?;
+    if node.property_str("status").is_some_and(|status| status != "okay" && status != "ok") {
+        return None;
+    }
+    let (address_cells, size_cells) = root_cells(fdt);
+    let window = node.reg(address_cells, size_cells).next()?;
+    if window.address == 0 || window.size == 0 {
+        return None;
+    }
+
+    // Без `bus-range` мост владеет всеми шинами, какие помещаются в окно.
+    let (first_bus, last_bus) = match node.property("bus-range") {
+        Some(value) => (
+            u8::try_from(be32_at(value, 0)?).ok()?,
+            u8::try_from(be32_at(value, 4)?.min(255)).ok()?,
+        ),
+        None => (0, u8::try_from((window.size >> 20).saturating_sub(1).min(255)).ok()?),
+    };
+
+    let child_address = node.property_u64("#address-cells").unwrap_or(3) as usize;
+    let child_size = node.property_u64("#size-cells").unwrap_or(2) as usize;
+    if child_address != 3 || child_size == 0 || child_size > 2 || address_cells > 2 {
+        return None;
+    }
+    let entry = (child_address + address_cells + child_size) * 4;
+
+    let mut mem32 = None;
+    let mut mem64 = None;
+    let ranges = node.property("ranges").unwrap_or(&[]);
+    let mut offset = 0;
+    while offset + entry <= ranges.len() {
+        let space = (be32_at(ranges, offset)? >> PCI_SPACE_SHIFT) & PCI_SPACE_MASK;
+        let bus = cells_at(ranges, offset + 4, 2)?;
+        let cpu = cells_at(ranges, offset + 12, address_cells)?;
+        let len = cells_at(ranges, offset + 12 + address_cells * 4, child_size)?;
+        let found = PcieWindow { cpu, bus, len };
+        match space {
+            PCI_SPACE_MEM32 if mem32.is_none() => mem32 = Some(found),
+            PCI_SPACE_MEM64 if mem64.is_none() => mem64 = Some(found),
+            // Порты ввода-вывода не нужны ни одному нашему драйверу: всё
+            // современное отвечает в памяти, а портов на этой архитектуре у
+            // процессора нет вовсе — их окно здесь всего лишь ещё одна память.
+            _ => {}
+        }
+        offset += entry;
+    }
+
+    Some(PcieHost {
+        ecam: window.address,
+        ecam_len: window.size,
+        first_bus,
+        last_bus,
+        mem32,
+        mem64,
+    })
+}
+
+/// 32 бита со старшим байтом вперёд — ячейка дерева.
+fn be32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    let cell = bytes.get(at..at + 4)?;
+    Some(u32::from_be_bytes([cell[0], cell[1], cell[2], cell[3]]))
+}
+
+/// Число из одной или двух ячеек подряд.
+fn cells_at(bytes: &[u8], at: usize, count: usize) -> Option<u64> {
+    match count {
+        1 => Some(u64::from(be32_at(bytes, at)?)),
+        2 => Some((u64::from(be32_at(bytes, at)?) << 32) | u64::from(be32_at(bytes, at + 4)?)),
+        _ => None,
+    }
+}
+
 /// Узел, названный в `/chosen/stdout-path`.
 fn stdout<'a>(fdt: &Fdt<'a>) -> Option<fdt::Node<'a>> {
     let path = fdt.find("/chosen")?.property_str("stdout-path")?;

@@ -60,6 +60,12 @@ pub struct RunOptions {
     /// дерево устройств, ни UEFI, ни ACPI. На стенде это единственный способ
     /// проверить этот вход, не имея аппарата под рукой.
     pub direct_kernel: Option<PathBuf>,
+    /// Образ RAM-диска к [`RunOptions::direct_kernel`] (`-initrd`).
+    ///
+    /// QEMU кладёт его в память и называет в `/chosen` дерева
+    /// (`linux,initrd-start`/`-end`) — ровно так, как заводской загрузчик
+    /// телефона передаёт свой RAM-диск. Без него ядро поднимается без корня.
+    pub direct_initrd: Option<PathBuf>,
 }
 
 /// Каким контроллером подключены носители.
@@ -184,6 +190,7 @@ impl Default for RunOptions {
             hostfwd: None,
             allow_reboot: false,
             direct_kernel: None,
+            direct_initrd: None,
         }
     }
 }
@@ -630,6 +637,9 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     cmd.args(&fw_args);
     if let Some(kernel) = &opts.direct_kernel {
         cmd.args(["-kernel", &util::qemu_path(kernel)?]);
+        if let Some(initrd) = &opts.direct_initrd {
+            cmd.args(["-initrd", &util::qemu_path(initrd)?]);
+        }
     }
     // Вывод ядра/загрузчика идёт в серийный порт: он одинаково работает на обеих
     // архитектурах и в headless-режиме CI.
