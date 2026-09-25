@@ -145,8 +145,51 @@ const STACK_PAGES: usize = 16;
 /// портит собственный `.bss`. У обычной программы полоса много шире: образ
 /// кончается там, где кончается её последний сегмент.
 pub const STACK_TOP: usize = WINDOW_BASE + IMAGE_LIMIT_BYTES + 0x0040_0000;
-/// Низ стека.
+/// Низ стека — при нулевом сдвиге (см. [`STACK_SHIFT_PAGES`]).
 const STACK_BASE: usize = STACK_TOP - STACK_PAGES * PAGE_SIZE;
+
+/// На сколько страниц вниз стек может быть сдвинут при запуске (ASLR).
+///
+/// Два мегабайта из четырёх, которые отделяют стек от конца окна образа: вторая
+/// половина полосы остаётся неотображённой и по-прежнему ловит переполнение.
+/// Девять бит случайности в номере страницы и ещё семь внутри неё (сдвиг
+/// вершины на кратное 16 до двух килобайт, см. [`place_args`]). Мало против
+/// перебора на месте, но достаточно, чтобы адрес из чужого прогона — или из
+/// снимка экрана — перестал быть адресом в этом.
+const STACK_SHIFT_PAGES: usize = 512;
+/// Нижняя граница, ниже которой стек не опускается ни при каком сдвиге.
+const STACK_LOWEST: usize = STACK_BASE - STACK_SHIFT_PAGES * PAGE_SIZE;
+
+/// С какого места области памяти по запросу начинается выдача (ASLR): случайная
+/// страница в первых 64 МиБ. Выше неё ищется первым, и только если там не
+/// нашлось — с начала области: так вся область остаётся досягаемой, и предел на
+/// задачу считает занятое, а не то, куда выпал жребий.
+const MMAP_SHIFT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Случайная раскладка одной программы.
+#[derive(Clone, Copy)]
+struct Layout {
+    stack_top: usize,
+    /// Сдвиг вершины стека внутри страницы, кратный 16.
+    stack_skew: usize,
+    mmap_start: usize,
+}
+
+impl Layout {
+    fn random() -> Self {
+        let mut bytes = [0u8; 8];
+        crate::random::fill(&mut bytes);
+        let value = u64::from_le_bytes(bytes) as usize;
+        let pages = value % STACK_SHIFT_PAGES;
+        let skew = ((value >> 16) % 128) * 16;
+        let mmap_pages = (value >> 32) % (MMAP_SHIFT_BYTES / PAGE_SIZE);
+        Self {
+            stack_top: STACK_TOP - pages * PAGE_SIZE,
+            stack_skew: skew,
+            mmap_start: MMAP_BASE + mmap_pages * PAGE_SIZE,
+        }
+    }
+}
 
 /// Начало области, которую программа получает по запросу (`SYS_MMAP`).
 ///
@@ -596,6 +639,8 @@ pub struct Program {
     /// Длина ограничена [`MAX_MAPPINGS`] по-прежнему: предел здесь не про
     /// память, а про то, что таблица обходится линейно на каждом отказе.
     mappings: Vec<Mapping>,
+    /// С какого адреса начинается поиск места под `mmap` (см. [`Layout`]).
+    mmap_start: usize,
 }
 
 impl Program {
@@ -981,15 +1026,27 @@ impl Program {
     /// вверх, упёрся бы в конец области, ни разу не заняв её целиком, — то есть
     /// предел на задачу считал бы не занятую память, а прожитую жизнь.
     fn find_gap(&self, bytes: usize, align: usize) -> Option<usize> {
-        // Начало области уже кратно двум мегабайтам ([`MMAP_BASE`]), так что
-        // первый кандидат выравнивания не требует. Требуют следующие: области
-        // укладываются вплотную, и конец предыдущей приходится где угодно.
-        let mut candidate = MMAP_BASE.next_multiple_of(align);
+        // Сначала выше случайного начала (ASLR), потом — с начала области.
+        self.find_gap_from(self.mmap_start, bytes, align)
+            .or_else(|| self.find_gap_from(MMAP_BASE, bytes, align))
+    }
+
+    /// Первое подходящее место не ниже `from`.
+    fn find_gap_from(&self, from: usize, bytes: usize, align: usize) -> Option<usize> {
+        // Начало области кратно двум мегабайтам ([`MMAP_BASE`]), случайное
+        // начало — только странице; выравнивание требуют и следующие
+        // кандидаты: области укладываются вплотную, и конец предыдущей
+        // приходится где угодно.
+        let mut candidate = from.next_multiple_of(align);
         for region in &self.mappings {
+            let end = region.base + region.pages * PAGE_SIZE;
+            // Области ниже начала поиска не мешают и не двигают кандидата.
+            if end <= candidate {
+                continue;
+            }
             if region.base >= candidate && region.base - candidate >= bytes {
                 return Some(candidate);
             }
-            let end = region.base + region.pages * PAGE_SIZE;
             candidate = candidate.max(end).next_multiple_of(align);
         }
         (MMAP_BASE + MMAP_MAX_BYTES)
@@ -1577,7 +1634,8 @@ fn frame_bytes(frame: PhysAddr) -> *mut u8 {
 /// страница на всё; аргумент, который в неё не влез, — это командная строка в
 /// четыре килобайта, и она встречается там, где кто-то её подставил, а не там,
 /// где человек её набрал.
-fn place_args(frame: PhysAddr, args: &[&str]) -> (usize, usize, usize) {
+fn place_args(frame: PhysAddr, args: &[&str], layout: Layout) -> (usize, usize, usize) {
+    let stack_top = layout.stack_top;
     /// Сколько места отдано аргументам: вся верхняя страница стека.
     const AREA: usize = PAGE_SIZE;
     /// Выравнивание вершины стека, которого требуют оба соглашения о вызовах.
@@ -1591,7 +1649,7 @@ fn place_args(frame: PhysAddr, args: &[&str]) -> (usize, usize, usize) {
 
     let mut pointers = Vec::new();
     if pointers.try_reserve_exact(args.len()).is_err() {
-        return (0, 0, STACK_TOP - ALIGN);
+        return (0, 0, stack_top - ALIGN);
     }
 
     for arg in args {
@@ -1609,7 +1667,7 @@ fn place_args(frame: PhysAddr, args: &[&str]) -> (usize, usize, usize) {
             core::ptr::copy_nonoverlapping(arg.as_ptr(), page.add(top), arg.len());
             page.add(top + arg.len()).write(0);
         }
-        pointers.push(STACK_TOP - AREA + top);
+        pointers.push(stack_top - AREA + top);
     }
 
     // Массив указателей — под строками, выровненный по размеру указателя.
@@ -1634,8 +1692,10 @@ fn place_args(frame: PhysAddr, args: &[&str]) -> (usize, usize, usize) {
             .write_unaligned(0);
     }
 
-    let argv = STACK_TOP - AREA + top;
-    let stack = (argv - ALIGN) & !(ALIGN - 1);
+    let argv = stack_top - AREA + top;
+    // Вершина — ниже аргументов ещё на случайное кратное 16 (ASLR внутри
+    // страницы); стек в шестнадцать страниц этих двух килобайт не заметит.
+    let stack = (argv - ALIGN - layout.stack_skew) & !(ALIGN - 1);
     (pointers.len(), argv, stack)
 }
 
@@ -1752,6 +1812,7 @@ fn load(
     node: &Arc<dyn Node>,
     header: &[u8],
     file_len: usize,
+    stack_top: usize,
 ) -> Result<Loaded, Error> {
     let image = elf::Image::parse(header, file_len).map_err(Error::Elf)?;
 
@@ -1910,8 +1971,8 @@ fn load(
     let mut stack_top_frame = PhysAddr::new(0);
     for page in 0..STACK_PAGES {
         let frame = take_frame()?;
-        // Верхняя страница — та, в которую упирается `STACK_TOP`, и именно в
-        // неё лягут аргументы.
+        // Верхняя страница — та, в которую упирается вершина стека, и именно
+        // в неё лягут аргументы.
         if page == STACK_PAGES - 1 {
             stack_top_frame = frame;
         }
@@ -1920,7 +1981,7 @@ fn load(
         // обычная память программы на чтение и запись.
         let mapped = unsafe {
             space.map(
-                VirtAddr::new(STACK_BASE + page * PAGE_SIZE),
+                VirtAddr::new(stack_top - STACK_PAGES * PAGE_SIZE + page * PAGE_SIZE),
                 frame,
                 PageFlags::READ.union(PageFlags::WRITE).union(PageFlags::USER),
             )
@@ -2034,7 +2095,11 @@ fn run(
     let (header, file_len) = read_header(&*node)?;
 
     let mut space = Space::new().map_err(Error::Map)?;
-    let loaded = load(&mut space, &node, &header, file_len)?;
+    // Раскладка у каждого запуска своя: стек и начало памяти по запросу
+    // сдвинуты на случайное (ASLR). Образ пока стоит там, куда его поставил
+    // компоновщик, — для его сдвига программы нужно собирать иначе (PIE).
+    let layout = Layout::random();
+    let loaded = load(&mut space, &node, &header, file_len, layout.stack_top)?;
     let entry = loaded.entry;
     let root = space.root();
 
@@ -2042,7 +2107,7 @@ fn run(
     // стека при этом опускается под них и выравнивается на 16: этого требуют
     // оба соглашения о вызовах, и невыровненный стек ломается не сразу, а на
     // первой же операции с вектором.
-    let (argc, argv, stack) = place_args(loaded.stack_top_frame, args);
+    let (argc, argv, stack) = place_args(loaded.stack_top_frame, args, layout);
 
     let id = sched::current();
     kprintln!(
@@ -2080,6 +2145,7 @@ fn run(
             stdin,
             stdout,
             mappings: loaded.mappings,
+            mmap_start: layout.mmap_start,
         })));
     }
     // Признак поднимается после того, как процесс попал в таблицу: обработчик
@@ -2691,7 +2757,9 @@ pub fn owns(ptr: usize, len: usize) -> bool {
         return false;
     };
     let in_image = ptr >= WINDOW_BASE && end <= WINDOW_BASE + IMAGE_LIMIT_BYTES;
-    let in_stack = ptr >= STACK_BASE && end <= STACK_TOP;
+    // Вся полоса, куда стек может встать при любом сдвиге, — по той же причине,
+    // по которой ниже названа вся область памяти по запросу.
+    let in_stack = ptr >= STACK_LOWEST && end <= STACK_TOP;
     let in_mmap = ptr >= MMAP_BASE && end <= MMAP_BASE + MMAP_MAX_BYTES;
     in_image || in_stack || in_mmap
 }

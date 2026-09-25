@@ -963,6 +963,16 @@ fn play(
                 say!("  [{at:>6} мс] шаг {index}: запомнено вторым {value:?}");
                 captured2 = Some(value);
             }
+            Step::Differ(what) => {
+                say!("  [{at:>6} мс] шаг {index}: {what} — два запомненных числа различаются");
+                let (Some(first), Some(second)) = (&captured, &captured2) else {
+                    bail!("шаг {index}: сравнивать нечего — сначала Capture и Capture2");
+                };
+                if first == second {
+                    bail!("шаг {index}: {what}: у двух запусков одно и то же число ({first}) — случайности нет");
+                }
+                say!("             {first} и {second}");
+            }
             Step::Clock(prefix, tolerance_s, timeout_ms) => {
                 say!("  [{at:>6} мс] шаг {index}: сверяем часы гостя с часами хоста");
                 let value = line

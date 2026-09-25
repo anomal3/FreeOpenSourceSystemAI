@@ -124,6 +124,12 @@ pub enum Step {
     /// вторая копия досчитала раньше первой, её строка оказалась позади
     /// курсора, и сценарий упал, доказывая обратное тому, что проверяет.
     Capture2(&'static str, u64),
+    /// Два запомненных числа ([`Step::Capture`] и [`Step::Capture2`]) обязаны
+    /// **различаться**. Строка — что именно сравнивается, для сообщения.
+    ///
+    /// Появился вместе с ASLR: «адрес у каждого запуска свой» — утверждение о
+    /// двух запусках, и проверить его ожиданием одной строки нельзя.
+    Differ(&'static str),
     /// Дождаться подстроки **где угодно** в выводе, в том числе позади курсора.
     ///
     /// Нужно там, где сценарий ждёт события от двух задач сразу: порядок, в
@@ -2283,7 +2289,13 @@ pub const ALL: &[Scenario] = &[
             // только вперёд, и сценарий, требующий определённого порядка там,
             // где его нет, падал бы через раз. Две ведущие пробела отличают
             // ответ команды от эха набранной строки.
-            Step::Expect("  shell-alive"),
+            //
+            // Именно `AwaitAny`, а не `Expect`: тот смотрит журнал в тот же
+            // миг, а строка команды приходит в линию по байту — и 26.09 на
+            // aarch64 она стабильно дописывалась **после** того, как обе копии
+            // досчитали (проверено и на `6dbf668`, до всех правок того дня).
+            // Ответ оболочки был, но на мгновение позже проверки.
+            Step::AwaitAny("  shell-alive", 15_000),
             // На системе, загруженной с носителя, учётных записей нет вовсе:
             // корень — образ initrd. Сеанс идёт от root, и проверки прав никому
             // ни в чём не отказывают. Это состояние обязано быть видно, а не
@@ -2496,6 +2508,13 @@ pub const ALL: &[Scenario] = &[
             // строка сверялась целиком — 2832; теперь программа занимает
             // столько, сколько весит её файл, и это число у архитектур разное.
             // Нижняя граница держит суть проверки: потерянный блок — минус 512.
+            //
+            // Строка ядра не называет задачу, а `sshd` на этой машине без сети
+            // перезапускается трижды и каждый раз печатает свою — 24 страницы.
+            // Поэтому сначала ждём, пока служба сдастся: иначе `AtLeast` брал
+            // первую строку после курсора, и под другой раскладкой времени ею
+            // оказывалась строка `sshd` (так и было 26.09 на x86-64).
+            Step::AwaitAny("'sshd' failed 3 time(s) in a row, giving up", 60_000),
             Step::Line("run /bin/memtest 8 huge keep"),
             Step::Await("memtest: leaving the region to the teardown", 60_000),
             Step::AtLeast("space released, ", 2048 + 17, 60_000),
@@ -3198,6 +3217,64 @@ pub const ALL: &[Scenario] = &[
             Step::Await("hello", 15_000),
             Step::Line("run /bin/hello"),
             Step::Await("hello from userspace", 30_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "aslr",
+        about: "Стек и память по запросу у каждого запуска программы лежат по своим адресам.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Смещения в байтах, а не номера страниц: у стека случайны и
+            // страница (девять бит), и место внутри неё (семь), и совпадение
+            // двух запусков — один шанс на 65 536, а не на 512. Прогон,
+            // краснеющий раз в пятьсот запусков, приучил бы не верить красному.
+            // Каждый запуск дожидается своего конца: строка, набранная, пока
+            // программа на переднем плане, уходит ей, а не оболочке.
+            Step::Line("run /bin/peek layout"),
+            Step::Capture("peek: stack at ", 30_000),
+            Step::Await("/bin/peek: exited with code 0", 30_000),
+            Step::Line("run /bin/peek layout"),
+            Step::Capture2("peek: stack at ", 30_000),
+            Step::Await("/bin/peek: exited with code 0", 30_000),
+            Step::Differ("вершина стека"),
+            // Память по запросу — четырнадцать бит: случайная страница в
+            // первых 64 МиБ области.
+            Step::Line("run /bin/peek layout"),
+            Step::Capture("mmap at ", 30_000),
+            Step::Await("/bin/peek: exited with code 0", 30_000),
+            Step::Line("run /bin/peek layout"),
+            Step::Capture2("mmap at ", 30_000),
+            Step::Await("/bin/peek: exited with code 0", 30_000),
+            Step::Differ("начало памяти по запросу"),
+            // Сдвиг ничего не отнял: 256 МиБ по запросу выдаются по-прежнему.
+            // Выше любого случайного начала остаётся не меньше 448 МиБ, а не
+            // нашлось бы там — поиск пошёл бы с начала области.
+            Step::Line("run /bin/memtest"),
+            Step::Await("memtest: mapped 256 MiB at ", 180_000),
+            Step::Await("memtest: unmapped", 180_000),
+            Step::Absent("peek: mmap refused"),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

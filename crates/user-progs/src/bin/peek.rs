@@ -10,11 +10,20 @@
 //! который не отображён вообще ни для кого, и отказ там означает лишь
 //! «страницы нет». Здесь адрес **отображён**, и отказ означает ровно то, что
 //! нужно доказать: страницу ядра из третьего кольца (EL0) не отдают.
+//!
+//! # `peek layout`
+//!
+//! Второй вопрос про адреса — уже не «чьи», а «где». С ASLR стек и память по
+//! запросу у каждого запуска свои, и проверить это можно только двумя
+//! запусками подряд: программа печатает смещения в байтах (от начала окна
+//! программы, десятичными — их запоминает стенд) и выходит, ничего не читая у
+//! ядра. Образ печатается тоже: он пока **не** сдвигается, и строка это
+//! показывает, а не прячет.
 
 #![no_std]
 #![no_main]
 
-use user_progs::{exit, println};
+use user_progs::{Args, Line, exit, mmap, munmap, println};
 
 /// Начало прямого отображения физической памяти в ядре (`PHYS_MAP_BASE`).
 ///
@@ -26,8 +35,17 @@ use user_progs::{exit, println};
 /// трансляции, а из-за прав.
 const KERNEL_DIRECT_MAP: usize = 0xFFFF_8000_0000_0000;
 
+/// Начало окна программы (`WINDOW_BASE` ядра): смещения считаются от него.
+const WINDOW_BASE: usize = 0x0000_0080_0000_0000;
+
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
+    // SAFETY: значения пришли от ядра в том виде, в каком их описывает договор.
+    let args = unsafe { Args::new(argc, argv) };
+    if args.get(1) == Some("layout") {
+        layout();
+    }
+
     println("about to read kernel memory that this program's own page tables describe");
 
     // SAFETY: безопасности здесь нет и не предполагается — программа
@@ -37,4 +55,30 @@ pub extern "C" fn _start() -> ! {
 
     println("the read succeeded, which means kernel memory is reachable from ring 3");
     exit(value as i64 | 1)
+}
+
+/// Где у этого запуска лежат стек, память по запросу и образ.
+fn layout() -> ! {
+    let local = 0u64;
+    let stack = core::ptr::addr_of!(local) as usize;
+    let region = mmap(4096, 0);
+    if region < 0 {
+        println("peek: mmap refused");
+        exit(1);
+    }
+    let region = region as usize;
+    let image = layout as usize;
+
+    // Одной записью: строку, собранную из нескольких, рвут чужие строки
+    // (служб, ядра), и стенд находит за «mmap at » не число, а `init: ...`.
+    Line::new()
+        .str("peek: stack at ")
+        .num((stack - WINDOW_BASE) as u64)
+        .str(", mmap at ")
+        .num((region - WINDOW_BASE) as u64)
+        .str(", image at ")
+        .num((image - WINDOW_BASE) as u64)
+        .end();
+    munmap(region, 4096);
+    exit(0)
 }
