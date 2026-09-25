@@ -129,6 +129,9 @@ no build system needs to know: the reference value lives in a read-only page
 the kernel maps for the program, and the link script points `__stack_chk_guard`
 at it.
 
+The system calls a program may make, their numbers, error codes and the rule by
+which the contract changes are in **[docs/ABI.md](docs/ABI.md)**.
+
 The compiler is not part of the package and will not be: clang installs itself
 and weighs a gigabyte. What the toolchain adds is the target — headers, libraries,
 a link script, and wrappers under the names a foreign `configure` looks for.
