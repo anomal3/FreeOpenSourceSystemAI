@@ -13,7 +13,8 @@
 //!
 //! Остальные объявляют только `INTx` — четыре вывода, разведённые по плате к
 //! входам контроллера прерываний. Какой вывод к какому входу приходит, знает
-//! только прошивка, и говорит она это таблицей `_PRT` в AML. Без неё остаются
+//! только прошивка, и говорит она это таблицей `_PRT` в AML — или, на машине
+//! без ACPI, свойством `interrupt-map` моста в дереве устройств. Без них остаются
 //! два пути: опрашивать (как сейчас) или угадать номер линии — а угаданный
 //! адрес в этом проекте уже стоил одной поездки к чужой машине.
 //!
@@ -60,6 +61,28 @@ struct Table {
 
 static TABLE: SpinLock<Option<Table>> = SpinLock::new(None);
 
+/// Сколько строк `interrupt-map` вели не в GIC и не были взяты.
+static TREE_FOREIGN: AtomicUsize = AtomicUsize::new(0);
+
+/// Принять разводку, прочитанную из дерева устройств.
+///
+/// Зовётся из разбора дерева, пока оно живо, — задолго до [`init`], который
+/// только скажет о ней в журнал. У GIC активный уровень у линий PCI высокий:
+/// инвертора на входе нет, и сообщить его контроллеру всё равно нечем.
+pub fn set_tree_routes(lines: &[(u8, u8, u32, bool)], foreign: usize) {
+    let mut routes = [aml::Route { device: 0, pin: 0, gsi: 0, level: true, active_low: false };
+        MAX_ROUTES];
+    let mut len = 0;
+    for &(device, pin, gsi, level) in lines.iter().take(MAX_ROUTES) {
+        routes[len] = aml::Route { device, pin, gsi, level, active_low: false };
+        len += 1;
+    }
+    TREE_FOREIGN.store(foreign, Ordering::Relaxed);
+    if len > 0 {
+        *TABLE.lock() = Some(Table { routes, len });
+    }
+}
+
 /// Прочитать таблицу маршрутизации из DSDT.
 ///
 /// Отсутствие таблицы — не отказ: машина без `_PRT`, объявленного данными, —
@@ -69,7 +92,20 @@ static TABLE: SpinLock<Option<Table>> = SpinLock::new(None);
 pub fn init() {
     let rsdp = acpi::rsdp();
     if rsdp == 0 {
-        kprintln!("  routing     : no ACPI tables; PCI interrupt lines are unknown");
+        let foreign = TREE_FOREIGN.load(Ordering::Relaxed);
+        if foreign > 0 {
+            // Строка, ведущая в чужой контроллер (каскад, приставка), — это
+            // линии, которых у нас не будет. Узнать об этом лучше здесь.
+            kprintln!("  routing     : {foreign} interrupt-map entr(ies) lead past the GIC and were ignored");
+        }
+        let routes = TABLE.lock().as_ref().map(|table| (table.routes, table.len));
+        match routes {
+            Some((routes, len)) => {
+                let lines = summarise(&routes[..len]);
+                kprintln!("  routing     : {len} PCI route(s) from the device tree's interrupt-map, {lines}");
+            }
+            None => kprintln!("  routing     : no ACPI tables and no interrupt-map; PCI interrupt lines are unknown"),
+        }
         return;
     }
     // SAFETY: прямое отображение активно, таблицы ACPI ещё не переиспользованы —
@@ -125,11 +161,15 @@ fn summarise(routes: &[aml::Route]) -> alloc::string::String {
     out
 }
 
-/// На какую линию выведен вывод `pin` устройства номер `device`.
+/// На какую линию выведен вывод `pin` функции по адресу `address`.
 ///
 /// `pin` — от нуля (INTA), как его отдаёт [`crate::pci::Device::interrupt_pin`].
+/// Функция за мостом спрашивается с пересчётом (см. [`root_slot`]) — здесь, а не
+/// у вызывающего: перепись шины и драйвер обязаны получить **одну** линию, и
+/// двух мест, где её считают, быть не должно.
 #[must_use]
-pub fn line_for(device: u8, pin: u8) -> Option<Line> {
+pub fn line_for(address: crate::pci::Address, pin: u8) -> Option<Line> {
+    let (device, pin) = root_slot(address, pin);
     let guard = TABLE.lock();
     let table = guard.as_ref()?;
     table.routes[..table.len]
@@ -227,7 +267,7 @@ fn fire(line: usize) {
 #[must_use]
 pub fn request(device: &crate::pci::Device, handler: fn()) -> Option<u32> {
     let pin = device.interrupt_pin()?;
-    let line = line_for(device.address.device, pin)?;
+    let line = line_for(device.address, pin)?;
 
     // Линия, уже разрешённая у контроллера, второй раз не разрешается: у неё
     // просто прибавляется обработчик. Повторный вызов `route_line` переписал бы
@@ -279,6 +319,31 @@ pub fn request(device: &crate::pci::Device, handler: fn()) -> Option<u32> {
         return None;
     }
     None
+}
+
+/// Устройство корневой шины и его вывод, к которым приходит вывод `pin`
+/// функции `address`.
+///
+/// Таблица — и `_PRT`, и `interrupt-map` — описывает только корневую шину. Мост
+/// переставляет выводы тех, кто за ним: INTA устройства номер `d` выходит из
+/// моста как `(INTA + d) % 4`. Правило из спецификации мостов PCI, одно на
+/// всех, и идёт оно вверх до корневой шины, где мост — уже обычное устройство
+/// со своей строкой в таблице. Без пересчёта устройство за мостом получило бы
+/// линию того, кто на корневой шине носит тот же номер.
+///
+/// У моста на ACPI бывает собственный `_PRT`; мы его не читаем, и перестановка —
+/// то же, что делает Linux, когда `_PRT` у моста нет.
+fn root_slot(address: crate::pci::Address, pin: u8) -> (u8, u8) {
+    let (mut at, mut pin) = (address, pin);
+    // Предел — страховка от испорченной таблицы мостов, а не ожидаемая глубина.
+    for _ in 0..16 {
+        let Some(bridge) = crate::pci::upstream_bridge(at.bus) else {
+            break;
+        };
+        pin = (pin + at.device) % 4;
+        at = bridge;
+    }
+    (at.device, pin)
 }
 
 fn find_line(gsi: u32) -> Option<usize> {

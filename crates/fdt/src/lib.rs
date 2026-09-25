@@ -201,6 +201,21 @@ impl<'a> Fdt<'a> {
     pub fn find_compatible(&self, with: &str) -> Option<Node<'a>> {
         self.nodes().find(|node| node.is_compatible(with))
     }
+
+    /// Найти узел по его `phandle` — числу, которым на него ссылаются другие
+    /// узлы (`interrupt-parent`, `interrupt-map`, `msi-parent`).
+    ///
+    /// Старые деревья пишут то же число под именем `linux,phandle`; смотрятся
+    /// оба, иначе дерево, собранное старым `dtc`, окажется без ссылок.
+    #[must_use]
+    pub fn find_phandle(&self, phandle: u32) -> Option<Node<'a>> {
+        self.nodes().find(|node| {
+            node.property("phandle")
+                .or_else(|| node.property("linux,phandle"))
+                .and_then(|value| be32(value, 0))
+                == Some(phandle)
+        })
+    }
 }
 
 /// Предел на размер дерева, принимаемого по указателю.

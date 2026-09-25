@@ -642,10 +642,7 @@ const PCI_SPACE_MEM64: u32 = 0b11;
 /// объявленным размерам, а не по тому, что «обычно» лежит в QEMU: запись,
 /// прочитанная с чужим шагом, даёт правдоподобное и неверное окно.
 pub fn pcie_host(fdt: &Fdt<'_>) -> Option<PcieHost> {
-    let node = fdt.find_compatible("pci-host-ecam-generic")?;
-    if node.property_str("status").is_some_and(|status| status != "okay" && status != "ok") {
-        return None;
-    }
+    let node = pcie_node(fdt)?;
     let (address_cells, size_cells) = root_cells(fdt);
     let window = node.reg(address_cells, size_cells).next()?;
     if window.address == 0 || window.size == 0 {
@@ -697,6 +694,156 @@ pub fn pcie_host(fdt: &Fdt<'_>) -> Option<PcieHost> {
         mem32,
         mem64,
     })
+}
+
+/// Узел моста `pci-host-ecam-generic`, если он есть и не выключен.
+fn pcie_node<'a>(fdt: &Fdt<'a>) -> Option<fdt::Node<'a>> {
+    let node = fdt.find_compatible("pci-host-ecam-generic")?;
+    if node.property_str("status").is_some_and(|status| status != "okay" && status != "ok") {
+        return None;
+    }
+    Some(node)
+}
+
+/// Куда выведен один вывод `INTx` одного устройства корневой шины моста.
+#[derive(Clone, Copy, Debug)]
+pub struct PcieIntx {
+    pub device: u8,
+    /// 0 — INTA, 3 — INTD.
+    pub pin: u8,
+    /// Номер прерывания у GIC.
+    pub intid: u32,
+    pub level: bool,
+}
+
+/// Записей разводки у корневой шины не больше, чем устройств на ней, умноженных
+/// на выводы: 32 × 4.
+pub const MAX_PCIE_INTX: usize = 128;
+
+/// Сколько строк `interrupt-map` помещается. У QEMU `virt` их шестнадцать, у
+/// Raspberry Pi 4 — одна.
+const MAX_MAP_ENTRIES: usize = 64;
+
+/// Разводка линий `INTx` моста: то, что на ACPI сообщает `_PRT`.
+///
+/// Дерево описывает её свойством `interrupt-map`: строка — адрес устройства на
+/// шине (три ячейки) и вывод (одна), затем ссылка на контроллер прерываний, его
+/// адрес (сколько ячеек — говорит **сам контроллер**, `#address-cells`) и
+/// описание прерывания (сколько ячеек — тоже он, `#interrupt-cells`). Строки
+/// сравниваются с адресом устройства после маски `interrupt-map-mask`: у QEMU
+/// `virt` маска оставляет два младших бита номера устройства, и шестнадцать
+/// строк покрывают все тридцать два устройства.
+///
+/// Результат раскрыт в таблицу «устройство, вывод → INTID» на всю корневую
+/// шину — ровно в том виде, в каком `_PRT` даёт её на x86, чтобы дальше путь
+/// был один. Строки, ведущие не в GIC, не берутся и считаются: второй ответ.
+pub fn pcie_intx(fdt: &Fdt<'_>, out: &mut [PcieIntx; MAX_PCIE_INTX]) -> (usize, usize) {
+    #[derive(Clone, Copy)]
+    struct Entry {
+        key: [u32; 4],
+        intid: u32,
+        level: bool,
+    }
+
+    let Some(node) = pcie_node(fdt) else {
+        return (0, 0);
+    };
+    let Some(map) = node.property("interrupt-map") else {
+        return (0, 0);
+    };
+    // Адрес устройства на шине — три ячейки, вывод — одна. Другое у моста PCI
+    // не встречается, и читать такое наугад значило бы получить чужие линии.
+    if node.property_u64("#interrupt-cells").unwrap_or(1) != 1
+        || node.property_u64("#address-cells").unwrap_or(3) != 3
+    {
+        return (0, 0);
+    }
+    let mask_cells = node.property("interrupt-map-mask");
+    let mut mask = [u32::MAX; 4];
+    for (index, cell) in mask.iter_mut().enumerate() {
+        if let Some(value) = mask_cells.and_then(|cells| be32_at(cells, index * 4)) {
+            *cell = value;
+        }
+    }
+
+    let mut entries = [Entry { key: [0; 4], intid: 0, level: true }; MAX_MAP_ENTRIES];
+    let mut count = 0;
+    let mut foreign = 0;
+    // Контроллер у всех строк обычно один; искать его по дереву заново на каждую
+    // строку незачем.
+    let mut parent: Option<(u32, usize, usize, bool)> = None;
+    let mut at = 0;
+    while at + 20 <= map.len() && count < MAX_MAP_ENTRIES {
+        let (Some(hi), Some(mid), Some(lo), Some(pin), Some(phandle)) = (
+            be32_at(map, at),
+            be32_at(map, at + 4),
+            be32_at(map, at + 8),
+            be32_at(map, at + 12),
+            be32_at(map, at + 16),
+        ) else {
+            break;
+        };
+        let (address_cells, interrupt_cells, gic) = match parent {
+            Some((known, address, interrupt, gic)) if known == phandle => (address, interrupt, gic),
+            _ => {
+                let Some(controller) = fdt.find_phandle(phandle) else {
+                    break;
+                };
+                let Some(interrupt) = controller.property_u64("#interrupt-cells") else {
+                    break;
+                };
+                let address = controller.property_u64("#address-cells").unwrap_or(0) as usize;
+                let gic = controller.strings("compatible").any(|name| name.contains("gic"));
+                parent = Some((phandle, address, interrupt as usize, gic));
+                (address, interrupt as usize, gic)
+            }
+        };
+        let spec = at + 20 + address_cells * 4;
+        let next = spec + interrupt_cells * 4;
+        if next > map.len() {
+            break;
+        }
+        // У GIC описание — три ячейки: вид (0 — SPI, 1 — PPI), номер внутри
+        // вида и флаги (4 и 8 — по уровню).
+        let intid = if gic && interrupt_cells == 3 {
+            match (be32_at(map, spec), be32_at(map, spec + 4)) {
+                (Some(0), Some(number)) => number.checked_add(32),
+                (Some(1), Some(number)) => number.checked_add(16),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match intid {
+            Some(intid) => {
+                let flags = be32_at(map, spec + 8).unwrap_or(4);
+                entries[count] = Entry {
+                    key: [hi & mask[0], mid & mask[1], lo & mask[2], pin & mask[3]],
+                    intid,
+                    level: matches!(flags & 0xF, 4 | 8),
+                };
+                count += 1;
+            }
+            None => foreign += 1,
+        }
+        at = next;
+    }
+
+    let mut len = 0;
+    for device in 0..32u8 {
+        for pin in 0..4u8 {
+            // Адрес устройства на корневой шине — как в `phys.hi`: шина в битах
+            // 23:16, устройство в 15:11. Шина здесь нулевая относительно моста.
+            let hi = u32::from(device) << 11;
+            let key = [hi & mask[0], 0, 0, u32::from(pin + 1) & mask[3]];
+            let Some(found) = entries[..count].iter().find(|entry| entry.key == key) else {
+                continue;
+            };
+            out[len] = PcieIntx { device, pin, intid: found.intid, level: found.level };
+            len += 1;
+        }
+    }
+    (len, foreign)
 }
 
 /// 32 бита со старшим байтом вперёд — ячейка дерева.

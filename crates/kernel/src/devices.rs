@@ -271,7 +271,7 @@ pub fn census_text() -> String {
                 None => String::from("no interrupt"),
                 Some(pin) => {
                     let name = ["INTA", "INTB", "INTC", "INTD"][usize::from(pin)];
-                    match crate::irq::routing::line_for(device.address.device, pin) {
+                    match crate::irq::routing::line_for(device.address, pin) {
                         Some(line) => alloc::format!("{name} -> GSI {}", line.gsi),
                         None => alloc::format!("{name}, line unknown"),
                     }

@@ -3225,7 +3225,21 @@ pub const ALL: &[Scenario] = &[
         big_file: false,
         ssh_key: false,
         memory: "",
-        extra: &[],
+        // Фаза 51d: два моста подряд и карта без MSI за ними. Корневой порт
+        // PCIe — то, что стоит у Raspberry Pi 4 перед контроллером USB; мост на
+        // обычную PCI за ним нужен, чтобы номер устройства за мостом был **не
+        // нулевым** — только тогда перестановка выводов чего-то стоит и её
+        // ошибка видна. e1000 — единственная наша карта на одной линии INTx.
+        extra: &[
+            "-netdev",
+            "user,id=dtnet",
+            "-device",
+            "pcie-root-port,id=rp1,chassis=1,addr=0x6",
+            "-device",
+            "pcie-pci-bridge,id=br1,bus=rp1",
+            "-device",
+            "e1000,netdev=dtnet,bus=br1,addr=0x2",
+        ],
         steps: &[
             // Описание машины собрано не загрузчиком: таблиц ACPI нет, есть
             // только дерево, которое QEMU положил рядом с ядром.
@@ -3267,10 +3281,37 @@ pub const ALL: &[Scenario] = &[
             Step::Type("echo dt-usb-ok"),
             Step::Key("ret"),
             Step::Await("  dt-usb-ok", 30_000),
+            // Карта за двумя мостами работает: кадр ушёл и ответ пришёл, то
+            // есть оба моста пересылают и регистры, и DMA наверх.
+            Step::Line("ip 10.0.2.15/24 10.0.2.2"),
+            Step::Await("address  10.0.2.15/24", 15_000),
+            Step::Line("ping 10.0.2.2 1"),
+            Step::Await("reply from 10.0.2.2, seq 1", 30_000),
+            // И будит систему линией, найденной по `interrupt-map`, — а не
+            // сроком, который выглядел бы снаружи точно так же.
+            Step::Line("irq net"),
+            Step::Await("net woke the system", 15_000),
             Step::Line("tasks"),
             Step::Await("preemption :", 15_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
+            // Номера шин розданы в глубину, и окно каждого моста охватывает
+            // тех, кто за ним.
+            Step::Expect("pci         : bridge 0000:00:06.0 forwards buses 1..=2 and memory"),
+            Step::Expect("pci         : bridge 0000:01:00.0 forwards buses 2..=2 and memory"),
+            // Шестнадцать строк `interrupt-map` под маской раскрыты на всю
+            // корневую шину: четыре линии, SPI 3–6.
+            Step::Expect("routing     : 128 PCI route(s) from the device tree's interrupt-map, 4 line(s): 35 36 37 38"),
+            // Число, которое проверяет перестановку. INTA устройства 2 за мостом
+            // на обычную PCI выходит как INTC, корневой порт (устройство 0 за
+            // ним) её не меняет, и на корневой шине это INTC устройства 6:
+            // SPI 3 + (6 + 2) % 4 = 3, INTID 35. Без перестановки ядро взяло бы
+            // INTA устройства 2 — INTID 37, чужую линию.
+            Step::Expect("e1000       : INTx on GSI 35"),
+            // Перепись шины говорит то же число, что драйвер: линия считается
+            // в одном месте. До 51d перепись пересчёта не знала и называла 37.
+            Step::Expect("8086:100e class 02:00:00 ethernet controller      INTA -> GSI 35"),
+            Step::Absent("line unknown"),
             // Журнал держится на экране телефона ради снимка; на машине без
             // кадрового буфера держать его незачем, и тридцать секунд там —
             // чистая потеря (см. `hold_boot_log`).

@@ -209,6 +209,20 @@ pub unsafe fn probe_gic(rsdp: u64) {
                 mem32: window(host.mem32),
                 mem64: window(host.mem64),
             });
+
+            // Разводка `INTx` — тоже отсюда: у устройств без MSI (e1000, EHCI,
+            // OHCI) другого пути к прерыванию на этой машине нет.
+            let mut routes = [fdt_boot::PcieIntx { device: 0, pin: 0, intid: 0, level: true };
+                fdt_boot::MAX_PCIE_INTX];
+            // SAFETY: см. выше.
+            let (len, foreign) = unsafe { device_tree() }
+                .as_ref()
+                .map_or((0, 0), |dt| fdt_boot::pcie_intx(dt, &mut routes));
+            let mut lines = [(0u8, 0u8, 0u32, true); fdt_boot::MAX_PCIE_INTX];
+            for (line, route) in lines.iter_mut().zip(&routes[..len]) {
+                *line = (route.device, route.pin, route.intid, route.level);
+            }
+            crate::irq::routing::set_tree_routes(&lines[..len], foreign);
         }
         return;
     }

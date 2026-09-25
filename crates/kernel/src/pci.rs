@@ -501,13 +501,62 @@ fn identity(window: Option<Window>) -> Option<Window> {
 /// `Command`, бит 0: устройство отвечает на обращения к своим портам.
 const COMMAND_IO_SPACE: u16 = 1 << 0;
 
-/// Расставить BAR всех функций на шине моста.
+/// Регистры моста (заголовок типа 1): номера шин.
+const CFG_PRIMARY_BUS: usize = 0x18;
+/// Последняя шина за мостом. Мост пересылает запросы конфигурации ко всем шинам
+/// от `secondary` до неё — и только к ним.
+const CFG_SUBORDINATE_BUS: usize = 0x1A;
+/// Окно портов моста: старшие четыре бита адреса, база и предел.
+const CFG_IO_BASE: usize = 0x1C;
+const CFG_IO_LIMIT: usize = 0x1D;
+/// Окно памяти моста: биты 31:20 адреса в битах 15:4 регистра.
+const CFG_MEMORY_BASE: usize = 0x20;
+const CFG_MEMORY_LIMIT: usize = 0x22;
+/// Окно памяти с предвыборкой и его старшие половины.
+const CFG_PREFETCH_BASE: usize = 0x24;
+const CFG_PREFETCH_LIMIT: usize = 0x26;
+const CFG_PREFETCH_BASE_UPPER: usize = 0x28;
+const CFG_PREFETCH_LIMIT_UPPER: usize = 0x2C;
+/// Шаг окна памяти моста: мегабайт. Меньше регистр выразить не может.
+const BRIDGE_WINDOW_ALIGN: u64 = 1 << 20;
+
+impl Allocator {
+    /// Передвинуть начало свободного места на границу `align`.
+    ///
+    /// Окно моста задаётся мегабайтами, поэтому всё, что встанет за мостом,
+    /// обязано начинаться и кончаться на такой границе: иначе в окно попал бы
+    /// кусок соседа, и его регистры ушли бы на чужую шину.
+    fn align(&mut self, align: u64) {
+        let end = self.window.cpu + self.window.len;
+        self.next = self.next.saturating_add(align - 1) & !(align - 1);
+        self.next = self.next.min(end);
+    }
+}
+
+/// Что копится за время расстановки.
+struct Assign {
+    low: Allocator,
+    high: Option<Allocator>,
+    /// Номер, который получит следующий мост. `u16`, чтобы 255 + 1 не
+    /// превратилось в ноль, — то есть в корневую шину.
+    next_bus: u16,
+    last_bus: u16,
+    placed: usize,
+    refused: usize,
+    bridges: usize,
+}
+
+/// Расставить BAR всех функций моста — и мостов за ним.
 ///
 /// Размер BAR узнаётся по спецификации: записать все единицы, прочитать —
 /// нули в младших адресных разрядах и есть размер. На время замера устройству
 /// выключается декодирование, иначе адрес из одних единиц успел бы на миг
 /// стать настоящим. Порты ввода-вывода не расставляются: ни одному нашему
 /// драйверу они не нужны.
+///
+/// Мосты получают номера шин по порядку обхода в глубину и окно памяти,
+/// которое охватывает ровно то, что встало за ними. Без этого устройства за
+/// мостом не видны вовсе: у Raspberry Pi 4 за ним сидит контроллер USB.
 ///
 /// # Safety
 ///
@@ -517,84 +566,233 @@ unsafe fn assign_bars(root: &Root, host: &TreeHost) {
         kprintln!("  pci         : the device tree gives no usable 32-bit memory window; BARs left as they are");
         return;
     };
-    let mut low = Allocator::new(window32);
-    let mut high = identity(host.mem64).map(Allocator::new);
-    let mut placed = 0usize;
-    let mut refused = 0usize;
+    let (first_bus, last_bus) = root.buses();
+    let mut state = Assign {
+        low: Allocator::new(window32),
+        high: identity(host.mem64).map(Allocator::new),
+        next_bus: u16::from(first_bus) + 1,
+        last_bus: u16::from(last_bus),
+        placed: 0,
+        refused: 0,
+        bridges: 0,
+    };
 
     // SAFETY: контракт функции.
+    unsafe { assign_bus(root, first_bus, 0, &mut state) };
+
+    kprintln!(
+        "  pci         : {} BAR(s) placed in the device tree's windows ({} KiB of the 32-bit window used, {} bridge(s)){}",
+        state.placed,
+        state.low.used() / 1024,
+        state.bridges,
+        if state.refused == 0 { "" } else { "; some did not fit" }
+    );
+}
+
+/// Обойти одну шину: BAR — устройствам, номера и окна — мостам.
+///
+/// Обход свой, а не [`for_each`]: мосту нужно сделать кое-что **после**
+/// всех, кто за ним (закрыть окно и назвать последнюю шину), а `for_each`
+/// зовёт только до.
+///
+/// # Safety
+///
+/// См. [`assign_bars`].
+unsafe fn assign_bus(root: &Root, bus: u8, depth: usize, state: &mut Assign) {
+    for device in 0..32u8 {
+        // SAFETY: контракт функции.
+        let Some(first) = (unsafe { probe(root, bus, device, 0) }) else {
+            continue;
+        };
+        // SAFETY: страница шины отображена в `probe`.
+        let header = unsafe { first.read8(CFG_HEADER_TYPE) };
+        let functions = if header & HEADER_TYPE_MULTIFUNCTION != 0 { 8 } else { 1 };
+        for function in 0..functions {
+            let found = if function == 0 {
+                Some(first)
+            } else {
+                // SAFETY: контракт функции.
+                unsafe { probe(root, bus, device, function) }
+            };
+            let Some(found) = found else {
+                continue;
+            };
+            // SAFETY: см. выше.
+            let kind = unsafe { found.read8(CFG_HEADER_TYPE) } & !HEADER_TYPE_MULTIFUNCTION;
+            // SAFETY: контракт функции.
+            unsafe {
+                match kind {
+                    0 => place_bars(&found, 6, depth, state),
+                    HEADER_TYPE_BRIDGE => program_bridge(root, &found, bus, depth, state),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Дать мосту номера шин и окно памяти, расставив всё, что за ним.
+///
+/// # Safety
+///
+/// См. [`assign_bars`].
+unsafe fn program_bridge(root: &Root, bridge: &Device, bus: u8, depth: usize, state: &mut Assign) {
+    // SAFETY: контракт функции; смещения — заголовок типа 1.
     unsafe {
-        for_each(root, |device| {
-            let kind = device.read8(CFG_HEADER_TYPE) & !HEADER_TYPE_MULTIFUNCTION;
-            if kind == HEADER_TYPE_BRIDGE {
-                // Мосту самому нужны номера шин и окна пересылки; без них
-                // устройства за ним не видны вовсе. У QEMU `virt` мостов нет;
-                // встретив мост, говорим об этом, а не делаем вид.
+        // У моста бывают и свои BAR (у корневого порта QEMU там таблица MSI-X),
+        // и встают они в окно **его** шины, а не в то, что он пересылает.
+        place_bars(bridge, 2, depth, state);
+
+        // Порты и память с предвыборкой закрыты: база выше предела. Всё, что
+        // за мостом, встанет в обычное окно — оно 32-битное, а 64-битных BAR
+        // за мостом мы не ставим (см. `place_bars`).
+        bridge.write8(CFG_IO_BASE, 0xF0);
+        bridge.write8(CFG_IO_LIMIT, 0);
+        bridge.write16(CFG_PREFETCH_BASE, 0xFFF0);
+        bridge.write16(CFG_PREFETCH_LIMIT, 0);
+        bridge.write32(CFG_PREFETCH_BASE_UPPER, 0);
+        bridge.write32(CFG_PREFETCH_LIMIT_UPPER, 0);
+
+        if depth >= MAX_BRIDGE_DEPTH || state.next_bus > state.last_bus {
+            // Номера шин кончились (или мосты вложены глубже разумного):
+            // мост остаётся закрытым, и это сказано, а не выясняется по
+            // устройству, которое «не нашлось».
+            bridge.write16(CFG_MEMORY_BASE, 0xFFF0);
+            bridge.write16(CFG_MEMORY_LIMIT, 0);
+            kprintln!("  pci         : {} is a bridge with no bus number left for it", bridge.address);
+            return;
+        }
+        let secondary = state.next_bus as u8;
+        state.next_bus += 1;
+
+        // Пока идёт обход, мост пересылает всё до последней шины моста: номера
+        // за ним ещё не розданы, и узкий диапазон спрятал бы мосты глубже.
+        bridge.write8(CFG_PRIMARY_BUS, bus);
+        bridge.write8(CFG_SECONDARY_BUS, secondary);
+        bridge.write8(CFG_SUBORDINATE_BUS, state.last_bus as u8);
+
+        state.low.align(BRIDGE_WINDOW_ALIGN);
+        let start = state.low.next;
+        assign_bus(root, secondary, depth + 1, state);
+        state.low.align(BRIDGE_WINDOW_ALIGN);
+        let end = state.low.next;
+
+        let subordinate = (state.next_bus - 1) as u8;
+        bridge.write8(CFG_SUBORDINATE_BUS, subordinate);
+        if end > start {
+            let base = state.low.bus_address(start);
+            let limit = state.low.bus_address(end - 1);
+            bridge.write16(CFG_MEMORY_BASE, ((base >> 16) & 0xFFF0) as u16);
+            bridge.write16(CFG_MEMORY_LIMIT, ((limit >> 16) & 0xFFF0) as u16);
+        } else {
+            bridge.write16(CFG_MEMORY_BASE, 0xFFF0);
+            bridge.write16(CFG_MEMORY_LIMIT, 0);
+        }
+
+        // Управление шиной у моста включаем мы, а не драйвер: драйвер знает
+        // своё устройство, а не мост над ним. Без этого бита мост не пропустит
+        // наверх ни DMA, ни сообщения MSI — устройство за ним поднимется,
+        // ответит на регистры и не сделает ни одной передачи.
+        let command = bridge.read16(CFG_COMMAND);
+        bridge.write16(
+            CFG_COMMAND,
+            (command & !COMMAND_IO_SPACE) | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER,
+        );
+        state.bridges += 1;
+        if end > start {
+            kprintln!(
+                "  pci         : bridge {} forwards buses {secondary}..={subordinate} and memory {start:#010x}..{:#010x}",
+                bridge.address,
+                end - 1
+            );
+        } else {
+            kprintln!(
+                "  pci         : bridge {} forwards buses {secondary}..={subordinate}, no memory behind it",
+                bridge.address
+            );
+        }
+    }
+}
+
+/// Расставить первые `count` BAR функции.
+///
+/// За мостом (`depth > 0`) встают только 32-битные адреса: окно моста без
+/// предвыборки 32-битное, а 64-битное с предвыборкой мы не заводим, и BAR,
+/// поставленный в 64-битное окно корня, мост просто не переслал бы.
+///
+/// # Safety
+///
+/// См. [`assign_bars`].
+unsafe fn place_bars(device: &Device, count: usize, depth: usize, state: &mut Assign) {
+    // SAFETY: контракт функции; смещения — стандартный заголовок.
+    unsafe {
+        let command = device.read16(CFG_COMMAND);
+        device.write16(CFG_COMMAND, command & !(COMMAND_MEMORY_SPACE | COMMAND_IO_SPACE));
+
+        let mut index = 0;
+        while index < count {
+            let offset = CFG_BAR0 + index * 4;
+            let original = device.read32(offset);
+            device.write32(offset, u32::MAX);
+            let probe = device.read32(offset);
+            if probe == 0 || probe & BAR_IO_SPACE != 0 {
+                device.write32(offset, original);
+                index += 1;
+                continue;
+            }
+            let wide = probe & BAR_TYPE_MASK == BAR_TYPE_64BIT && index + 1 < count;
+            let mut mask = u64::from(probe & BAR_MEMORY_ADDR_MASK);
+            if wide {
+                device.write32(offset + 4, u32::MAX);
+                mask |= u64::from(device.read32(offset + 4)) << 32;
+            } else {
+                mask |= 0xFFFF_FFFF_0000_0000;
+            }
+            let size = (!mask).wrapping_add(1);
+            let step = if wide { 2 } else { 1 };
+            if size == 0 || !size.is_power_of_two() {
+                device.write32(offset, original);
+                index += step;
+                continue;
+            }
+
+            // Сначала 32-битное окно: его видит любое устройство. В 64-битное
+            // уходит только то, что умеет 64-битный адрес, не поместилось и
+            // стоит на корневой шине.
+            let taken = match state.low.take(size) {
+                Some(cpu) => Some((cpu, state.low.bus_address(cpu))),
+                None if wide && depth == 0 => state
+                    .high
+                    .as_mut()
+                    .and_then(|high| high.take(size).map(|cpu| (cpu, high.bus_address(cpu)))),
+                None => None,
+            };
+            let Some((cpu, bus)) = taken else {
                 kprintln!(
-                    "  pci         : {} is a bridge and stays unprogrammed: nothing behind it will be seen",
-                    device.address
+                    "  pci         : {} BAR{index} of {} KiB does not fit any window",
+                    device.address,
+                    size / 1024
                 );
-                return true;
+                device.write32(offset, 0);
+                state.refused += 1;
+                index += step;
+                continue;
+            };
+            device.write32(offset, (bus as u32) | (probe & !BAR_MEMORY_ADDR_MASK));
+            if wide {
+                device.write32(offset + 4, (bus >> 32) as u32);
             }
-            if kind != 0 {
-                return true;
-            }
-
-            let command = device.read16(CFG_COMMAND);
-            device.write16(CFG_COMMAND, command & !(COMMAND_MEMORY_SPACE | COMMAND_IO_SPACE));
-
-            let mut index = 0;
-            while index < 6 {
-                let offset = CFG_BAR0 + index * 4;
-                let original = device.read32(offset);
-                device.write32(offset, u32::MAX);
-                let probe = device.read32(offset);
-                if probe == 0 || probe & BAR_IO_SPACE != 0 {
-                    device.write32(offset, original);
-                    index += 1;
-                    continue;
-                }
-                let wide = probe & BAR_TYPE_MASK == BAR_TYPE_64BIT && index + 1 < 6;
-                let mut mask = u64::from(probe & BAR_MEMORY_ADDR_MASK);
-                if wide {
-                    device.write32(offset + 4, u32::MAX);
-                    mask |= u64::from(device.read32(offset + 4)) << 32;
-                } else {
-                    mask |= 0xFFFF_FFFF_0000_0000;
-                }
-                let size = (!mask).wrapping_add(1);
-                let step = if wide { 2 } else { 1 };
-                if size == 0 || !size.is_power_of_two() {
-                    device.write32(offset, original);
-                    index += step;
-                    continue;
-                }
-
-                // Сначала 32-битное окно: его видит любое устройство. В
-                // 64-битное уходит только то, что умеет 64-битный адрес и не
-                // поместилось.
-                let taken = match low.take(size) {
-                    Some(cpu) => Some((cpu, low.bus_address(cpu))),
-                    None if wide => high
-                        .as_mut()
-                        .and_then(|high| high.take(size).map(|cpu| (cpu, high.bus_address(cpu)))),
-                    None => None,
-                };
-                let Some((cpu, bus)) = taken else {
-                    kprintln!(
-                        "  pci         : {} BAR{index} of {} KiB does not fit any window",
-                        device.address,
-                        size / 1024
-                    );
-                    device.write32(offset, 0);
-                    refused += 1;
-                    index += step;
-                    continue;
-                };
-                device.write32(offset, (bus as u32) | (probe & !BAR_MEMORY_ADDR_MASK));
-                if wide {
-                    device.write32(offset + 4, (bus >> 32) as u32);
-                }
+            // Байтами то, что меньше килобайта: у моста на обычную PCI окно
+            // контроллера горячей замены — 256 байт, и «0 KiB» читалось бы как
+            // BAR, который не поставлен.
+            if size < 1024 {
+                kprintln!(
+                    "  pci         : {} {:04x}:{:04x} BAR{index} {size} B at {cpu:#012x}",
+                    device.address,
+                    device.vendor,
+                    device.device
+                );
+            } else {
                 kprintln!(
                     "  pci         : {} {:04x}:{:04x} BAR{index} {} KiB at {cpu:#012x}",
                     device.address,
@@ -602,22 +800,34 @@ unsafe fn assign_bars(root: &Root, host: &TreeHost) {
                     device.device,
                     size / 1024
                 );
-                placed += 1;
-                index += step;
             }
+            state.placed += 1;
+            index += step;
+        }
 
-            // Память — да, порты и управление шиной — нет: второе включит
-            // драйвер, когда построит свои кольца (см. `enable_bus_master`).
-            device.write16(CFG_COMMAND, (command & !COMMAND_IO_SPACE) | COMMAND_MEMORY_SPACE);
-            true
-        });
+        // Память — да, порты и управление шиной — нет: второе включит драйвер,
+        // когда построит свои кольца (см. `enable_bus_master`).
+        device.write16(CFG_COMMAND, (command & !COMMAND_IO_SPACE) | COMMAND_MEMORY_SPACE);
     }
+}
 
-    kprintln!(
-        "  pci         : {placed} BAR(s) placed in the device tree's windows ({} KiB of the 32-bit window used){}",
-        low.used() / 1024,
-        if refused == 0 { "" } else { "; some did not fit" }
-    );
+// ---------------------------------------------------------------------------
+// Кто над шиной: мосты для пересчёта выводов прерывания
+// ---------------------------------------------------------------------------
+
+/// Мост над каждой шиной — по номеру шины.
+///
+/// Нужен таблице прерываний: она описывает выводы устройств **корневой** шины,
+/// а вывод устройства за мостом приходит к ней переставленным (см.
+/// [`crate::irq::routing`]). Заполняется обходом: мост виден только тому, кто
+/// шёл по шине сверху.
+static UPSTREAM: crate::sync::SpinLock<[Option<Address>; 256]> =
+    crate::sync::SpinLock::new([None; 256]);
+
+/// Мост, за которым лежит шина `bus`, если шина не корневая.
+#[must_use]
+pub fn upstream_bridge(bus: u8) -> Option<Address> {
+    UPSTREAM.lock()[usize::from(bus)]
 }
 
 // ---------------------------------------------------------------------------
@@ -1298,6 +1508,7 @@ unsafe fn walk_bus(
                 // конфигурация. Проверка и есть то, что делает рекурсию
                 // конечной, помимо предела глубины.
                 if secondary > bus {
+                    UPSTREAM.lock()[usize::from(secondary)] = Some(found.address);
                     // SAFETY: контракт функции.
                     if !unsafe { walk_bus(root, secondary, depth + 1, visit) } {
                         return false;
