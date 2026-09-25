@@ -1029,15 +1029,23 @@ pub fn enabled() -> bool {
 /// тот же замок. Безусловное `enable` во внутреннем вызове открыло бы окно
 /// посреди внешней секции — и ошибка проявилась бы как редкое повреждение
 /// данных под нагрузкой, воспроизводимое раз в сутки.
+///
+/// `#[track_caller]` — ради замера глухоты: самый долгий такой участок
+/// называет вызывающего (см. [`crate::latency`]).
+#[track_caller]
 pub fn without_interrupts<T>(f: impl FnOnce() -> T) -> T {
     let was_enabled = enabled();
-    if was_enabled {
+    let since = if was_enabled {
         disable();
-    }
+        crate::latency::start()
+    } else {
+        0
+    };
 
     let result = f();
 
     if was_enabled {
+        crate::latency::irq_off_ended(since, core::panic::Location::caller());
         enable();
     }
     result

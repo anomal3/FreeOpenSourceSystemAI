@@ -55,6 +55,7 @@ mod guard;
 mod input;
 mod irq;
 mod klog;
+mod latency;
 mod mm;
 mod net;
 mod pci;

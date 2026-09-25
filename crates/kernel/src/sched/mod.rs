@@ -109,7 +109,7 @@ pub use task::{
 };
 
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use alloc::boxed::Box;
 
@@ -164,18 +164,6 @@ static PREEMPTION: AtomicBool = AtomicBool::new(false);
 /// потому что и квант у каждого свой: истёкший квант одной задачи не повод
 /// снимать с процессора другую.
 static NEED_RESCHED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
-
-/// Сколько раз попросили не отбирать процессор.
-///
-/// Счётчик, а не флаг: просьбы вкладываются друг в друга, и «включить обратно»
-/// после внутренней означало бы отдать процессор посреди внешней.
-///
-/// Один на всю машину, а не на процессор, и это осознанно. Просьбу держит
-/// задача, а не процессор: задача, попросившая, может уснуть на мьютексе вывода
-/// и проснуться на другом процессоре — и снятие просьбы там расстроило бы
-/// счётчики обоих. Цена общего счётчика — пока одна задача печатает строку,
-/// квант не истекает ни у кого; строка печатается миллисекунды.
-static PREEMPT_HELD: AtomicUsize = AtomicUsize::new(0);
 
 /// Сколько тиков осталось текущей задаче каждого процессора до конца кванта.
 ///
@@ -821,6 +809,8 @@ pub fn wake_irq(source: u32) {
         );
         if waiting {
             task.state = TaskState::Ready;
+            // Не ноль, даже если часы ещё на нуле: ноль значит «отметки нет».
+            task.woken_by_irq_ms = crate::time::uptime_ms().max(1);
             woken += 1;
         }
     }
@@ -1088,6 +1078,11 @@ fn schedule_with(cause: Cause) {
                             task.cpu = Some(cpu);
                             task.switches += 1;
                             task.ran_since_ms = now;
+                            if task.woken_by_irq_ms != 0 {
+                                let waited = now.saturating_sub(task.woken_by_irq_ms);
+                                task.longest_irq_wait_ms = task.longest_irq_wait_ms.max(waited);
+                                task.woken_by_irq_ms = 0;
+                            }
                             to_tls = task.tls;
                         }
                         let state = &mut sched.cpus[cpu];
@@ -1200,12 +1195,9 @@ pub fn preempt_point() {
     if !PREEMPTION.load(Ordering::Relaxed) {
         return;
     }
-    // Кто-то просил не отбирать процессор. Флаг `NEED_RESCHED` при этом **не
-    // сбрасывается**: он подождёт ближайшего прерывания после того, как просьбу
-    // снимут.
-    if PREEMPT_HELD.load(Ordering::Relaxed) != 0 {
-        return;
-    }
+    // Просьбы «не отбирать процессор» здесь больше нет — она снята 25.09.2026,
+    // и почему, сказано у `shell::print`. Не возвращать: одна задача, рисующая
+    // строку в окно терминала, останавливала ею всю машину на секунду.
     // `swap`, а не пара «прочитать — сбросить»: флаг поднимает обработчик
     // таймера, и между чтением и сбросом он успел бы прийти ещё раз.
     if !NEED_RESCHED[smp::cpu()].swap(false, Ordering::Relaxed) {
@@ -1214,30 +1206,10 @@ pub fn preempt_point() {
     schedule_with(Cause::Preempted);
 }
 
-/// Попросить не отбирать процессор, пока живёт возвращённое значение.
-///
-/// # Зачем это понадобилось
-///
-/// Строка в журнале — единственное доказательство, которым располагает и
-/// человек, и стенд. Собирается она из кусков, и с вытеснением её разрывает
-/// чужой вывод посередине. Прерывания при этом **не** запрещаются: строка в UART
-/// уходит байтами с ожиданием готовности.
-///
-/// На нескольких процессорах одной этой просьбы мало: соседний процессор печатает
-/// независимо от того, отбирают ли процессор у нас. Там строку держит целой лок
-/// вывода, который ждёт соседа, а не пишет поверх него (см. [`crate::serial`]).
-pub fn hold_preemption() -> PreemptionHold {
-    PREEMPT_HELD.fetch_add(1, Ordering::Relaxed);
-    PreemptionHold(())
-}
-
-/// Просьба не отбирать процессор; снимается при уничтожении.
-pub struct PreemptionHold(());
-
-impl Drop for PreemptionHold {
-    fn drop(&mut self) {
-        PREEMPT_HELD.fetch_sub(1, Ordering::Relaxed);
-    }
+/// Включено ли вытеснение — то есть идёт ли планирование по-настоящему.
+#[must_use]
+pub fn preemption_on() -> bool {
+    PREEMPTION.load(Ordering::Relaxed)
 }
 
 /// Включить или выключить вытеснение по таймеру.
@@ -1469,6 +1441,7 @@ struct Row {
     preempted: u64,
     cpu_ms: u64,
     ran_since_ms: u64,
+    longest_irq_wait_ms: u64,
     stack: &'static str,
 }
 
@@ -1503,6 +1476,7 @@ pub fn dump() {
                 preempted: entry.preempted,
                 cpu_ms: entry.cpu_ms,
                 ran_since_ms: entry.ran_since_ms,
+                longest_irq_wait_ms: entry.longest_irq_wait_ms,
                 stack,
             });
         }
@@ -1550,6 +1524,14 @@ pub fn dump() {
                 kprintln!("       {why} {value}");
             }
         }
+        // Только у тех, кого будило прерывание: у прочих ответа нет, а ноль
+        // выглядел бы как «ждала мгновенно».
+        if entry.longest_irq_wait_ms != 0 {
+            kprintln!(
+                "       waited at most {} ms for a cpu after an interrupt woke it",
+                entry.longest_irq_wait_ms
+            );
+        }
     }
     // Итоги берутся под локом заново, и печатать под ним тут можно: в отличие
     // от строк задач, ничего из таблицы программ здесь не спрашивается.
@@ -1560,6 +1542,8 @@ pub fn dump() {
         SLICE_MS,
         sched.forced()
     );
+    // Два главных подозреваемых в опоздании готовой задачи — и место каждого.
+    crate::latency::report();
 
     // ── Доля простоя ─────────────────────────────────────────────────────────
     //

@@ -96,13 +96,20 @@ impl<T> SpinLock<T> {
     }
 
     /// Захватить лок, дождавшись освобождения.
+    ///
+    /// `#[track_caller]` — ради замера глухоты (см. [`crate::latency`]): место,
+    /// где взят самый долгий лок, должно называть вызывающего, а не эту строку.
     #[must_use = "лок освобождается при уничтожении охранника; проигнорировать его значит сразу же отпустить"]
+    #[track_caller]
     pub fn lock(&self) -> SpinGuard<'_, T> {
         // Прерывания запрещаются до захвата, а не после: иначе между этими
         // двумя действиями остаётся окно, в котором обработчик застаёт лок
         // уже занятым и упирается в вечное ожидание.
         let irq_was_enabled = crate::arch::interrupts::enabled();
         crate::arch::interrupts::disable();
+        // Отсчёт — с запрета, а не с захвата: ожидание соседа машина проводит
+        // такой же глухой, как и само удержание.
+        let since = if irq_was_enabled { crate::latency::start() } else { 0 };
 
         // Номер спрашивается после запрета прерываний: до него задачу могли бы
         // перенести на другой процессор, и лок запомнил бы чужой номер.
@@ -119,7 +126,7 @@ impl<T> SpinLock<T> {
             }
         }
 
-        SpinGuard { lock: self, irq_was_enabled }
+        SpinGuard { lock: self, irq_was_enabled, since, at: core::panic::Location::caller() }
     }
 
     /// Захватить лок, если его не держит **этот же** процессор.
@@ -133,9 +140,12 @@ impl<T> SpinLock<T> {
     /// его сам, и ожидание здесь такое же законное, как в [`Self::lock`]. До
     /// фазы 43 этого различия не было, и занятый лок всегда означал «мы сами» —
     /// см. заголовок модуля.
+    #[track_caller]
     pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
         let irq_was_enabled = crate::arch::interrupts::enabled();
         crate::arch::interrupts::disable();
+        let since = if irq_was_enabled { crate::latency::start() } else { 0 };
+        let at = core::panic::Location::caller();
 
         let me = crate::smp::cpu();
         loop {
@@ -145,7 +155,7 @@ impl<T> SpinLock<T> {
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(SpinGuard { lock: self, irq_was_enabled }),
+                Ok(_) => return Some(SpinGuard { lock: self, irq_was_enabled, since, at }),
                 Err(holder) if holder == me => {
                     // Захват не удался — состояние прерываний надо вернуть,
                     // иначе неудачная попытка молча оставила бы их запрещёнными.
@@ -167,6 +177,11 @@ pub struct SpinGuard<'a, T> {
     /// Были ли прерывания разрешены до захвата. Восстанавливается как было —
     /// вложенный захват не должен разрешать их раньше времени.
     irq_was_enabled: bool,
+    /// Когда закрылись прерывания, по счётчику процессора; ноль — не мерить
+    /// (вложенный захват или планировщик ещё не запущен).
+    since: u64,
+    /// Кто взял лок.
+    at: &'static core::panic::Location<'static>,
 }
 
 impl<T> Deref for SpinGuard<'_, T> {
@@ -193,6 +208,7 @@ impl<T> Drop for SpinGuard<'_, T> {
         // прерывания. Иначе обработчик успел бы прийти на ещё удерживаемый лок.
         self.lock.owner.store(FREE, Ordering::Release);
         if self.irq_was_enabled {
+            crate::latency::irq_off_ended(self.since, self.at);
             crate::arch::interrupts::enable();
         }
     }
