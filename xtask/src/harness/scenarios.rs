@@ -6144,6 +6144,67 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("KERNEL PANIC"),
         ],
     },
+    // Стоит ДО `rollback`, `update` и `update-net`, и это условие, а не порядок
+    // по вкусу. `update-net` переписывает слот A образом корня из обновления, а
+    // тот собран по размеру содержимого (`package::update_root_bytes`): после
+    // него на корне свободно считаные мебибайты, и шестидесяти четырём здесь
+    // не поместиться ни при каких контейнерах. Полный прогон 25.09.2026 упал
+    // на этом в обоих профилях. Здесь же сценарий застаёт слот, записанный
+    // установщиком, и `big.dat`, который уже положил `filemap-big`.
+    Scenario {
+        name: "httpd-load",
+        about: "Шестьдесят четыре мебибайта с диска через свой TCP наружу, с проверкой каждого байта.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 8080,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        // Только x86_64, и по той же причине, что у `filemap-big`: файл на
+        // шестьдесят четыре мебибайта стоит минут эмуляции, а проверяет он то,
+        // что от архитектуры не зависит вовсе, — окно, подтверждения и
+        // повторные передачи в одном и том же коде TCP. Сам сервер на обеих
+        // архитектурах проверяет сценарий `httpd`.
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: true,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
+
+            Step::Line("run -b /bin/httpd --mount /files /media"),
+            Step::AwaitAny("httpd: mount /files -> /media", 30_000),
+
+            // Вот она, живая нагрузка. Оба дефекта TCP, найденные фазой 39,
+            // видны только на таком обмене: таймер повторной передачи, убивавший
+            // исправное соединение через сорок секунд, и обновление окна,
+            // уходившее только при окне ровно в ноль.
+            Step::HttpBulk(HttpBulk {
+                path: "/files/big.dat",
+                bytes: crate::package::BIG_FILE_BYTES as u64,
+                pattern: Pattern::BigFile,
+                timeout_ms: 900_000,
+            }),
+            Step::AwaitAny("httpd: GET /files/big.dat HTTP/1.1 -> 200,", 30_000),
+
+            Step::Line("ip"),
+            Step::Await("0 retransmitted", 20_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
     Scenario {
         name: "rollback",
         about: "Заведомо неисправная система в слоте: попытки кончаются, машина возвращается назад.",
@@ -7756,60 +7817,6 @@ pub const ALL: &[Scenario] = &[
             Step::Line("tcp"),
             Step::Await("listen", 15_000),
 
-            Step::Line("exit"),
-            Step::Await("finishing the session", 15_000),
-            Step::Absent("KERNEL PANIC"),
-        ],
-    },
-    Scenario {
-        name: "httpd-load",
-        about: "Шестьдесят четыре мебибайта с диска через свой TCP наружу, с проверкой каждого байта.",
-        target: Target::Installed,
-        usb_only: false,
-        tablet: false,
-        ohci: false,
-        ehci: false,
-        disk_bus: DiskBus::Virtio,
-        network: true,
-        e1000: false,
-        guest_port: 8080,
-        host_echo: false,
-        host_repo: false,
-        host_site: false,
-        // Только x86_64, и по той же причине, что у `filemap-big`: файл на
-        // шестьдесят четыре мебибайта стоит минут эмуляции, а проверяет он то,
-        // что от архитектуры не зависит вовсе, — окно, подтверждения и
-        // повторные передачи в одном и том же коде TCP. Сам сервер на обеих
-        // архитектурах проверяет сценарий `httpd`.
-        arches: &[Arch::X86_64],
-        reboots: false,
-        updates: false,
-        big_file: true,
-        ssh_key: false,
-        memory: "",
-        extra: &[],
-        steps: &[
-            Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
-            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
-
-            Step::Line("run -b /bin/httpd --mount /files /media"),
-            Step::AwaitAny("httpd: mount /files -> /media", 30_000),
-
-            // Вот она, живая нагрузка. Оба дефекта TCP, найденные фазой 39,
-            // видны только на таком обмене: таймер повторной передачи, убивавший
-            // исправное соединение через сорок секунд, и обновление окна,
-            // уходившее только при окне ровно в ноль.
-            Step::HttpBulk(HttpBulk {
-                path: "/files/big.dat",
-                bytes: crate::package::BIG_FILE_BYTES as u64,
-                pattern: Pattern::BigFile,
-                timeout_ms: 900_000,
-            }),
-            Step::AwaitAny("httpd: GET /files/big.dat HTTP/1.1 -> 200,", 30_000),
-
-            Step::Line("ip"),
-            Step::Await("0 retransmitted", 20_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

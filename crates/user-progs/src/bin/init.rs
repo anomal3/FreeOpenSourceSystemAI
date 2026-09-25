@@ -52,8 +52,7 @@
 #![no_main]
 
 use user_progs::{
-    Args, close, error, error_num, exit, open, read, sleep_ms, spawn, spawn_as, uptime_ms,
-    wait_now,
+    Args, Line, close, error, exit, open, read, sleep_ms, spawn, spawn_as, uptime_ms, wait_now,
 };
 use user_abi::ERR_AGAIN;
 
@@ -181,17 +180,19 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         Err(()) => exit(1),
     };
     if count == 0 {
-        log("init: no services described in ");
-        log(path);
-        log("\n");
+        Line::to_log()
+            .str("init: no services described in ")
+            .str(path)
+            .end();
         exit(0);
     }
 
-    log("init: supervising ");
-    error_num(count as i64);
-    log(" service(s) from ");
-    log(path);
-    log("\n");
+    Line::to_log()
+        .str("init: supervising ")
+        .signed(count as i64)
+        .str(" service(s) from ")
+        .str(path)
+        .end();
 
     supervise(&mut services[..count]);
 
@@ -244,11 +245,12 @@ fn start(service: &mut Service, now: u64) {
     };
     if task < 0 {
         service.failures += 1;
-        log("init: cannot start '");
-        log(service.name());
-        log("': error ");
-        error_num(task);
-        log("\n");
+        Line::to_log()
+            .str("init: cannot start '")
+            .str(service.name())
+            .str("': error ")
+            .signed(task)
+            .end();
         if service.failures >= LIMIT {
             give_up(service);
         } else {
@@ -259,11 +261,12 @@ fn start(service: &mut Service, now: u64) {
 
     service.task = task;
     service.started_at = now;
-    log("init: started '");
-    log(service.name());
-    log("' as #");
-    error_num(task);
-    log("\n");
+    Line::to_log()
+        .str("init: started '")
+        .str(service.name())
+        .str("' as #")
+        .signed(task)
+        .end();
 }
 
 /// Проверить, не кончилась ли служба. `true` — ещё есть за кем следить.
@@ -283,13 +286,15 @@ fn reap(service: &mut Service, now: u64) -> bool {
     }
     service.failures += 1;
 
-    log("init: '");
-    log(service.name());
-    log("' ended with code ");
-    error_num(code);
-    log(" after ");
-    error_num(lived as i64);
-    log(" ms\n");
+    Line::to_log()
+        .str("init: '")
+        .str(service.name())
+        .str("' ended with code ")
+        .signed(code)
+        .str(" after ")
+        .signed(lived as i64)
+        .str(" ms")
+        .end();
 
     // Ноль означает «сделала своё дело и вышла», а не «упала». Перезапускать
     // такую службу нельзя: клиент DHCP на машине без сетевой карты честно
@@ -300,9 +305,11 @@ fn reap(service: &mut Service, now: u64) -> bool {
     // `Restart=on-failure`, и по той же причине оно там появилось.
     if code == 0 {
         service.stopped = true;
-        log("init: '");
-        log(service.name());
-        log("' finished, nothing to restart\n");
+        Line::to_log()
+            .str("init: '")
+            .str(service.name())
+            .str("' finished, nothing to restart")
+            .end();
         return false;
     }
 
@@ -312,22 +319,26 @@ fn reap(service: &mut Service, now: u64) -> bool {
     }
 
     service.retry_at = now + BACKOFF_MS;
-    log("init: restarting '");
-    log(service.name());
-    log("' in ");
-    error_num(BACKOFF_MS as i64);
-    log(" ms\n");
+    Line::to_log()
+        .str("init: restarting '")
+        .str(service.name())
+        .str("' in ")
+        .signed(BACKOFF_MS as i64)
+        .str(" ms")
+        .end();
     true
 }
 
 /// Перестать пробовать — и сказать об этом один раз и внятно.
 fn give_up(service: &mut Service) {
     service.stopped = true;
-    log("init: '");
-    log(service.name());
-    log("' failed ");
-    error_num(i64::from(service.failures));
-    log(" time(s) in a row, giving up\n");
+    Line::to_log()
+        .str("init: '")
+        .str(service.name())
+        .str("' failed ")
+        .signed(i64::from(service.failures))
+        .str(" time(s) in a row, giving up")
+        .end();
 }
 
 /// Прочитать файл описаний.
@@ -339,9 +350,10 @@ fn give_up(service: &mut Service) {
 fn load(path: &str, services: &mut [Service; MAX_SERVICES]) -> Result<usize, ()> {
     let fd = open(path);
     if fd < 0 {
-        log("init: cannot open ");
-        log(path);
-        log("\n");
+        Line::to_log()
+            .str("init: cannot open ")
+            .str(path)
+            .end();
         return Err(());
     }
 
@@ -375,9 +387,10 @@ fn load(path: &str, services: &mut [Service; MAX_SERVICES]) -> Result<usize, ()>
         match parse(line, &mut services[count]) {
             true => count += 1,
             false => {
-                log("init: cannot parse this line, skipping it: ");
-                log(line);
-                log("\n");
+                Line::to_log()
+                    .str("init: cannot parse this line, skipping it: ")
+                    .str(line)
+                    .end();
             }
         }
     }
@@ -434,6 +447,13 @@ fn parse(line: &str, service: &mut Service) -> bool {
 /// Причина та же, по которой туда пишут службы: супервизор работает всё время
 /// работы системы, в том числе тогда, когда окна оболочки нет вовсе, — а
 /// проверяется он снаружи, по серийной линии.
+///
+/// Только для строки, готовой целиком. Составную — с именем службы или числом —
+/// собирать [`Line::to_log`]: один `write` на строку. Пока init писал их
+/// кусками, полный прогон 25.09.2026 поймал в журнале
+/// `init: started '  alpha  : round 1 of 3` — чужую строку, влезшую между
+/// «started '» и именем службы, — и сценарий `dhcp` ждал 270 с строку, которая
+/// была напечатана.
 fn log(text: &str) {
     error(text);
 }
