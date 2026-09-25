@@ -51,6 +51,14 @@ pub enum Target {
     /// не зная заранее. Корня FreeOS на этом диске нет — ядро оставляет корнем
     /// initrd и монтирует только раздел данных.
     LiveAndBtrfs,
+    /// Ни прошивки, ни носителя: QEMU кладёт ядро в память сам и входит в него
+    /// по договору Linux, с деревом устройств в `x0` (фаза 51).
+    ///
+    /// Так входит в систему заводской загрузчик телефона, и до этой цели путь
+    /// проверялся только на аппарате или руками. Машина при этом описана
+    /// **только** деревом: ACPI нет, и всё, что ядро о ней знает, — память,
+    /// контроллер прерываний, линия, — прочитано оттуда. Только AArch64.
+    DeviceTree,
 }
 
 impl Target {
@@ -84,6 +92,7 @@ impl Target {
             Target::Iso => "загрузочный ISO в приводе",
             Target::LiveAndDisk => "каталог хоста плюс диск после установки",
             Target::LiveAndBtrfs => "каталог хоста плюс диск с томом btrfs",
+            Target::DeviceTree => "ядро без прошивки, машина описана деревом устройств",
         }
     }
 }
@@ -3191,6 +3200,58 @@ pub const ALL: &[Scenario] = &[
             Step::Await("hello from userspace", 30_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "devicetree",
+        about: "Ядро без прошивки: QEMU входит в него по договору Linux, и машина описана только деревом устройств.",
+        target: Target::DeviceTree,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        // Только AArch64: договор Linux с деревом в `x0` — арм-овский.
+        arches: &[Arch::Aarch64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            // Описание машины собрано не загрузчиком: таблиц ACPI нет, есть
+            // только дерево, которое QEMU положил рядом с ядром.
+            Step::Await("ACPI RSDP   : none", BOOT),
+            Step::Await("device tree : 0x", 15_000),
+            // Память — из узлов `/memory`. Число совпадает с `-m` стенда
+            // (512 МиБ): карта, собранная не из того узла, дала бы другое.
+            Step::Await("described total: 512 MiB", 15_000),
+            // Линия и контроллер прерываний — оттуда же, а не из констант
+            // QEMU и не из SPCR/MADT, которых на этой машине нет.
+            Step::Await("serial      : the device tree puts the console UART at 0x09000000", 15_000),
+            Step::Await("interrupts  : the device tree says GICv2 at 0x08000000", 15_000),
+            // Прерывания доходят: таймер тикает по счётчику, а не стоит.
+            Step::Await(" ticks in ", 15_000),
+            // Ввод по серийной линии тоже работает на прерывании — иначе
+            // оболочка не ответила бы ниже ни на одну команду.
+            Step::Await("serial in   : PL011 receive on INTID 33", 30_000),
+            Step::Await("freeos> ", BOOT),
+            Step::Line("tasks"),
+            Step::Await("preemption :", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            // Журнал держится на экране телефона ради снимка; на машине без
+            // кадрового буфера держать его незачем, и тридцать секунд там —
+            // чистая потеря (см. `hold_boot_log`).
+            Step::Absent("holding this log"),
             Step::Absent("KERNEL PANIC"),
         ],
     },

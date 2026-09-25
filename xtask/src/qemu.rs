@@ -54,6 +54,12 @@ pub struct RunOptions {
     /// Сценарию, который проверяет саму перезагрузку, флаг мешает: с ним QEMU
     /// завершается ровно там, где машина должна подняться заново.
     pub allow_reboot: bool,
+    /// Образ ядра, который QEMU загрузит сам, минуя прошивку (`-kernel`).
+    ///
+    /// Так входит в систему заводской загрузчик телефона: MMU выключен, в `x0`
+    /// дерево устройств, ни UEFI, ни ACPI. На стенде это единственный способ
+    /// проверить этот вход, не имея аппарата под рукой.
+    pub direct_kernel: Option<PathBuf>,
 }
 
 /// Каким контроллером подключены носители.
@@ -177,6 +183,7 @@ impl Default for RunOptions {
             nic: Nic::Virtio,
             hostfwd: None,
             allow_reboot: false,
+            direct_kernel: None,
         }
     }
 }
@@ -501,9 +508,22 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     let arch = built.arch;
     let qemu = find_qemu(arch)?;
 
-    let fw = firmware::resolve(arch, Some(qemu.as_path()))?;
-    let fw = firmware::prepare(arch, &fw, opts.reset_nvram)?;
-    say!("прошивка: {}", fw.description);
+    // Без прошивки — значит без UEFI вовсе: ни NVRAM, ни `pflash`. QEMU сам
+    // кладёт образ в память и входит в него по договору Linux, с деревом
+    // устройств в `x0`. Спрашивать прошивку в этом случае не только лишнее, но
+    // и неверно: её аргументы подменили бы вход.
+    let fw_args = match &opts.direct_kernel {
+        Some(_) => {
+            say!("прошивка: нет, ядро входит по договору Linux");
+            Vec::new()
+        }
+        None => {
+            let fw = firmware::resolve(arch, Some(qemu.as_path()))?;
+            let fw = firmware::prepare(arch, &fw, opts.reset_nvram)?;
+            say!("прошивка: {}", fw.description);
+            fw.args
+        }
+    };
 
     let mut cmd = Command::new(&qemu);
     cmd.current_dir(paths::workspace_root());
@@ -607,7 +627,10 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     };
 
     cmd.arg("-m").arg(&opts.memory);
-    cmd.args(&fw.args);
+    cmd.args(&fw_args);
+    if let Some(kernel) = &opts.direct_kernel {
+        cmd.args(["-kernel", &util::qemu_path(kernel)?]);
+    }
     // Вывод ядра/загрузчика идёт в серийный порт: он одинаково работает на обеих
     // архитектурах и в headless-режиме CI.
     match &opts.serial {

@@ -773,6 +773,13 @@ fn execute(
         nic: if scenario.e1000 { Nic::E1000 } else { Nic::Virtio },
         hostfwd,
         allow_reboot: scenario.reboots,
+        direct_kernel: match scenario.target {
+            // Собирается здесь, а не вместе с остальным: это другое ядро —
+            // статическое, со своим компоновочным сценарием и своим деревом
+            // сборки (см. `phone::build_kernel`), — и нужно оно одной цели.
+            Target::DeviceTree => Some(crate::phone::build_kernel(crate::phone::KERNEL_LOAD)?),
+            _ => None,
+        },
         ..RunOptions::default()
     };
 
@@ -2886,6 +2893,9 @@ fn prepare_drives(
             Drive::HostDirectory(qemu::prepare_esp(built, true)?),
             Drive::Image(image::prepare_btrfs_disk(arch, built.release)?),
         ],
+        // Носителя нет вовсе: ядро приносит QEMU, а ACPI, по которому ядро
+        // нашло бы шину PCI и диск на ней, у такой машины нет.
+        Target::DeviceTree => Vec::new(),
     };
     Ok(drives)
 }
