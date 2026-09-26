@@ -1078,6 +1078,77 @@ impl Device {
         unsafe { self.write16(CFG_COMMAND, wanted) };
     }
 
+    /// Замолчать устройство, которое больше никому не принадлежит.
+    ///
+    /// Выключаются управление шиной (устройство перестаёт обращаться к памяти),
+    /// ответ на регистры и MSI — в таком порядке, чтобы после возврата ни одно
+    /// обращение устройства к памяти не было возможно. Нужно драйверу-программе
+    /// при уходе: память, которую ей давали, возвращается в окно DMA ядра, и
+    /// устройство, продолжающее туда писать, портило бы чужие буферы.
+    ///
+    /// # Safety
+    ///
+    /// Драйвер устройства больше не работает с ним.
+    pub unsafe fn quiesce(&self) {
+        // SAFETY: контракт функции; смещения — стандартный заголовок и список
+        // возможностей, найденный обходом.
+        unsafe {
+            let command = self.read16(CFG_COMMAND);
+            self.write16(
+                CFG_COMMAND,
+                (command & !(COMMAND_BUS_MASTER | COMMAND_MEMORY_SPACE)) | COMMAND_INTX_DISABLE,
+            );
+            if let Some(msi) = self.msi() {
+                let control = self.read16(msi.capability + MSI_CONTROL);
+                self.write16(msi.capability + MSI_CONTROL, control & !MSI_CONTROL_ENABLE);
+            }
+            if let Some(msix) = self.msix() {
+                let control = self.read16(msix.capability + MSIX_CONTROL);
+                self.write16(msix.capability + MSIX_CONTROL, control & !MSIX_CONTROL_ENABLE);
+            }
+        }
+    }
+
+    /// Размер окна BAR `index` в байтах — замером, как при расстановке BAR.
+    ///
+    /// Замер пишет в BAR все единицы, поэтому на его время декодирование
+    /// памяти выключается, а прежние значения возвращаются. Звать только
+    /// для устройства, с которым сейчас никто не работает: драйверу-программе
+    /// — перед отображением окна.
+    #[must_use]
+    pub fn memory_bar_size(&self, index: usize) -> Option<u64> {
+        if index >= 6 {
+            return None;
+        }
+        let offset = CFG_BAR0 + index * 4;
+        // SAFETY: смещения BAR — в первых 64 байтах заголовка, страница
+        // отображена; всё записанное возвращается на место.
+        unsafe {
+            let command = self.read16(CFG_COMMAND);
+            self.write16(CFG_COMMAND, command & !COMMAND_MEMORY_SPACE);
+            let low = self.read32(offset);
+            let wide = low & BAR_IO_SPACE == 0 && low & BAR_TYPE_MASK == BAR_TYPE_64BIT && index + 1 < 6;
+            self.write32(offset, u32::MAX);
+            let probe = self.read32(offset);
+            self.write32(offset, low);
+            let mut mask = u64::from(probe & BAR_MEMORY_ADDR_MASK);
+            if wide {
+                let high = self.read32(offset + 4);
+                self.write32(offset + 4, u32::MAX);
+                mask |= u64::from(self.read32(offset + 4)) << 32;
+                self.write32(offset + 4, high);
+            } else {
+                mask |= 0xFFFF_FFFF_0000_0000;
+            }
+            self.write16(CFG_COMMAND, command);
+            if low & BAR_IO_SPACE != 0 || probe == 0 {
+                return None;
+            }
+            let size = (!mask).wrapping_add(1);
+            (size != 0 && size.is_power_of_two()).then_some(size)
+        }
+    }
+
     /// Разрешить устройству поднимать линию `INTx`.
     ///
     /// Снимает бит `Interrupt Disable`, который ставит

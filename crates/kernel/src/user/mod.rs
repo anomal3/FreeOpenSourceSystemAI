@@ -62,6 +62,8 @@
 //! числом, а сегмент, не поместившийся в окно, отвергается загрузчиком до
 //! первой записи в память, а не после.
 
+/// Драйвер — программа: устройство, отданное ей ядром (Д1).
+mod driver;
 pub mod elf;
 pub mod files;
 pub mod pipe;
@@ -337,6 +339,12 @@ enum Source {
     ///
     /// [`allocate_contiguous`]: crate::mm::frame::BitmapFrameAllocator::allocate_contiguous
     Surface(PhysAddr, u32),
+    /// Чужими кадрами драйвера-программы (веха «драйверы», Д1): окном
+    /// регистров устройства или памятью окна DMA ядра. Кадров пула под ней нет
+    /// (регистры) или они принадлежат окну DMA — поэтому, как и поверхность,
+    /// область снимается без возврата кадров, в [`Program::release_devices`],
+    /// и `munmap` её не снимает.
+    Device,
 }
 
 /// Файл, стоящий за областью, и всё, что нужно знать о её страницах.
@@ -641,6 +649,10 @@ pub struct Program {
     mappings: Vec<Mapping>,
     /// С какого адреса начинается поиск места под `mmap` (см. [`Layout`]).
     mmap_start: usize,
+    /// Устройства, которые программа взяла как драйвер (Д1).
+    devices: [Option<driver::Held>; user_abi::MAX_DEVICES],
+    /// Её память для DMA — буферы окна ядра.
+    dma: Vec<crate::mm::dma::DmaBuffer>,
 }
 
 impl Program {
@@ -941,7 +953,7 @@ impl Program {
         // окну. `unmap_range` ниже вернул бы их в пул, следующая выдача отдала
         // бы их второму владельцу — и композитор продолжал бы рисовать из чужой
         // памяти. Вернуть поверхность можно только вместе с окном.
-        if matches!(self.mappings[index].source, Source::Surface(..)) {
+        if matches!(self.mappings[index].source, Source::Surface(..) | Source::Device) {
             return Err(MmapError::BadRequest);
         }
         // Сегмент собственного образа программа не снимает: код, который
@@ -973,7 +985,7 @@ impl Program {
             // Сюда не приходят: поверхность и сегмент образа отсеяны проверками
             // выше. Ветки существуют затем, чтобы новый вид области нельзя было
             // завести, не ответив на вопрос, сколько кадров он обязан вернуть.
-            Source::Surface(..) | Source::Image(..) => region.pages,
+            Source::Surface(..) | Source::Image(..) | Source::Device => region.pages,
         };
         if freed != owed {
             kprintln!(
@@ -1133,7 +1145,8 @@ impl Program {
             // потерялась.
             // Отказ в стеке потока — это переполнение, пришедшее в сторожевую
             // страницу, и подкладывать ему память значило бы отменить сторожа.
-            Source::Anonymous | Source::Surface(..) | Source::ThreadStack => None,
+            // Регистры устройства и память DMA отображены целиком сразу.
+            Source::Anonymous | Source::Surface(..) | Source::ThreadStack | Source::Device => None,
         }
     }
 
@@ -2172,6 +2185,8 @@ fn run(
             stdout,
             mappings: loaded.mappings,
             mmap_start: layout.mmap_start,
+            devices: [const { None }; user_abi::MAX_DEVICES],
+            dma: Vec::new(),
         })));
     }
     // Признак поднимается после того, как процесс попал в таблицу: обработчик
@@ -2212,6 +2227,10 @@ fn run(
     // [`reclaim_window`]). Программа, закрывшая окно сама, ничего здесь не
     // стоит: снимать уже нечего.
     reclaim_window();
+    // Устройства, взятые программой как драйвер, — тем же путём и по той же
+    // причине: до разбора пространства, иначе в пул уехали бы регистры
+    // устройства, а память DMA — пока устройство ещё может в неё писать.
+    with_current(Program::release_devices);
 
     // Программа забирается из таблицы и уничтожается здесь: `Drop` её
     // пространства возвращает окно в пул кадров, а таблица дескрипторов

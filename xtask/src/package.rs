@@ -109,6 +109,23 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
         winforms.file(&Entry { path: String::from(name), mode: 0o644, uid: 0, gid: 0, data });
     }
 
+    // Драйвер устройства, которого ядро не знает (веха «драйверы», Д1):
+    // учебная карта QEMU `edu`. Право `devices` — самое широкое из всех, и
+    // пакет, который его просит, в Д2 обязан будет быть подписан.
+    let edudrv = build::packaged_program(arch, release, "edudrv")?;
+    let edudrv_bytes = fs::read(&edudrv)
+        .with_context(|| format!("не удалось прочитать {}", edudrv.display()))?;
+    let mut edu = Builder::new(Kind::Package, "edu", "1.0");
+    edu.field("summary", "A driver for the QEMU edu card, run as a program");
+    edu.field("permissions", "devices");
+    edu.file(&Entry { path: String::from("bin/edudrv"), mode: 0o755, uid: 0, gid: 0, data: edudrv_bytes.clone() });
+
+    // Тот же драйвер без права `devices`: ради проверки, что право — это то,
+    // что даёт устройство, а не то, что о нём пишут в манифесте.
+    let mut edu_nodev = Builder::new(Kind::Package, "edu-nodev", "1.0");
+    edu_nodev.field("summary", "The edu driver without the right to a device");
+    edu_nodev.file(&Entry { path: String::from("bin/edudrv"), mode: 0o755, uid: 0, gid: 0, data: edudrv_bytes });
+
     let dir = output_dir();
     fs::create_dir_all(&dir)
         .with_context(|| format!("не удалось создать каталог {}", dir.display()))?;
@@ -118,6 +135,8 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
         ("hello-1.0.fpk", hello.finish()),
         ("extra-1.0.fpk", extra.finish()),
         ("winforms-1.0.fpk", winforms.finish()),
+        ("edu-1.0.fpk", edu.finish()),
+        ("edu-nodev-1.0.fpk", edu_nodev.finish()),
     ] {
         let path = dir.join(file_name);
         fs::write(&path, &bytes)

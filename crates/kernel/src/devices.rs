@@ -59,6 +59,20 @@ pub fn claim(address: pci::Address, driver: &'static str) {
     }
 }
 
+/// Отпустить устройство: драйвер-программа кончилась (веха «драйверы», Д1).
+pub fn unclaim(address: pci::Address) {
+    for slot in CLAIMS.lock().iter_mut() {
+        if slot.is_some_and(|(known, _)| known == address) {
+            *slot = None;
+        }
+    }
+}
+
+/// Кто занял устройство, если занял.
+pub fn claimed_by(address: pci::Address) -> Option<&'static str> {
+    claimed(address)
+}
+
 fn claimed(address: pci::Address) -> Option<&'static str> {
     CLAIMS
         .lock()

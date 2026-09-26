@@ -194,6 +194,11 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         // Фаза 55c: ожидание на адресе.
         user_abi::SYS_FUTEX_WAIT => futex_wait(a0, a1 as u32),
         user_abi::SYS_FUTEX_WAKE => futex_wake(a0, a1),
+        // Веха «драйверы по VID:PID», Д1: устройство — программе.
+        user_abi::SYS_DEVICE_OPEN => device_open(a0, a1),
+        user_abi::SYS_DEVICE_MAP => device_map(a0, a1),
+        user_abi::SYS_DEVICE_WAIT => device_wait(a0, a1 as u64),
+        user_abi::SYS_DMA_ALLOC => dma_alloc(a0, a1),
         _ => ERR_NO_SYSCALL,
     }
 }
@@ -1617,6 +1622,78 @@ fn devices(ptr: usize, len: usize) -> i64 {
         written += bytes.len();
     }
     written as i64
+}
+
+/// Ответ драйверу-программе числом договора.
+fn driver_error(err: super::driver::DriverError) -> i64 {
+    use super::driver::DriverError;
+    match err {
+        DriverError::NotFound => user_abi::ERR_NOT_FOUND,
+        DriverError::Taken => user_abi::ERR_EXISTS,
+        DriverError::Limit => user_abi::ERR_LIMIT,
+        DriverError::NoInterrupts => user_abi::ERR_UNSUPPORTED,
+        DriverError::BadHandle => user_abi::ERR_BAD_FD,
+        DriverError::NoMemory => user_abi::ERR_NO_SPACE,
+    }
+}
+
+/// `device_open((vendor << 16) | device, index) -> номер`: см. договор у
+/// [`user_abi::SYS_DEVICE_OPEN`].
+fn device_open(id: usize, index: usize) -> i64 {
+    // Право проверяется первым: программа без него не узнаёт даже того, есть
+    // ли такое устройство на шине.
+    if !super::allow(Rights::DEVICES) {
+        return user_abi::ERR_PERMISSION;
+    }
+    let (vendor, device) = ((id >> 16) as u16, id as u16);
+    match super::with_current(|program| program.open_device(vendor, device, index)) {
+        Some(Ok(handle)) => handle as i64,
+        Some(Err(err)) => driver_error(err),
+        None => user_abi::ERR_NO_PROGRAM,
+    }
+}
+
+/// `device_map(номер, bar) -> адрес`: см. [`user_abi::SYS_DEVICE_MAP`].
+fn device_map(handle: usize, bar: usize) -> i64 {
+    match super::with_current(|program| program.map_device(handle, bar)) {
+        Some(Ok(base)) => base as i64,
+        Some(Err(err)) => driver_error(err),
+        None => user_abi::ERR_NO_PROGRAM,
+    }
+}
+
+/// `device_wait(номер, срок) -> сколько пришло`: см.
+/// [`user_abi::SYS_DEVICE_WAIT`].
+///
+/// Сон — вне замка программы: держать его спящим значило бы остановить все её
+/// потоки до прерывания.
+fn device_wait(handle: usize, ms: u64) -> i64 {
+    let slot = match super::with_current(|program| program.arm_device(handle)) {
+        Some(Ok(slot)) => slot,
+        Some(Err(err)) => return driver_error(err),
+        None => return user_abi::ERR_NO_PROGRAM,
+    };
+    super::driver::wait(slot, ms) as i64
+}
+
+/// `dma_alloc(len, куда физический адрес) -> адрес`: см.
+/// [`user_abi::SYS_DMA_ALLOC`].
+fn dma_alloc(len: usize, out: usize) -> i64 {
+    if !super::allow(Rights::DEVICES) {
+        return user_abi::ERR_PERMISSION;
+    }
+    if !space::user_can(out, 8, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    match super::with_current(|program| program.dma_alloc(len)) {
+        Some(Ok((base, phys))) => {
+            // SAFETY: восемь байт по `out` проверены по таблицам программы.
+            unsafe { (out as *mut u64).write_unaligned(phys) };
+            base as i64
+        }
+        Some(Err(err)) => driver_error(err),
+        None => user_abi::ERR_NO_PROGRAM,
+    }
 }
 
 /// `kill(id) -> 0`: попросить программу остановиться. Чужую — только root.

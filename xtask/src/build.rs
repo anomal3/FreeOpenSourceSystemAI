@@ -321,7 +321,7 @@ pub const USER_PROGRAMS: [&str; 39] = [
 /// программой, которая и так лежит на диске. Собираются они вместе со всеми
 /// (`cargo build --bins` строит их в любом случае), а вот в initrd и на
 /// установочный носитель не попадают.
-pub const PACKAGED_PROGRAMS: [&str; 1] = ["greet"];
+pub const PACKAGED_PROGRAMS: [&str; 2] = ["greet", "edudrv"];
 
 /// Собрать программы, исполняющиеся вне ядра.
 ///

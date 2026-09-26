@@ -406,6 +406,36 @@ pub fn devices(buffer: &mut [u8]) -> i64 {
     unsafe { syscall(user_abi::SYS_DEVICES, buffer.as_mut_ptr() as usize, buffer.len(), 0) }
 }
 
+/// Взять устройство PCI `vendor:device` (которое `index`-е по счёту) себе —
+/// драйвером. Возвращает номер устройства у программы или код ошибки. См.
+/// [`user_abi::SYS_DEVICE_OPEN`].
+pub fn device_open(vendor: u16, device: u16, index: usize) -> i64 {
+    let id = (usize::from(vendor) << 16) | usize::from(device);
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(user_abi::SYS_DEVICE_OPEN, id, index, 0) }
+}
+
+/// Отобразить окно регистров `bar` своего устройства; вернуть адрес. См.
+/// [`user_abi::SYS_DEVICE_MAP`].
+pub fn device_map(handle: usize, bar: usize) -> i64 {
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(user_abi::SYS_DEVICE_MAP, handle, bar, 0) }
+}
+
+/// Ждать прерывания своего устройства не дольше `ms`; вернуть, сколько
+/// пришло (ноль — срок вышел). См. [`user_abi::SYS_DEVICE_WAIT`].
+pub fn device_wait(handle: usize, ms: u64) -> i64 {
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(user_abi::SYS_DEVICE_WAIT, handle, ms as usize, 0) }
+}
+
+/// Память для DMA длиной `len`: вернуть адрес, физический положить в `phys`.
+/// См. [`user_abi::SYS_DMA_ALLOC`].
+pub fn dma_alloc(len: usize, phys: &mut u64) -> i64 {
+    // SAFETY: `phys` — живая переменная программы, восемь байт.
+    unsafe { syscall(user_abi::SYS_DMA_ALLOC, len, core::ptr::from_mut(phys) as usize, 0) }
+}
+
 /// Попросить задачу остановиться. См. [`user_abi::SYS_KILL`].
 pub fn kill(id: u32) -> i64 {
     // SAFETY: аргумент — число.

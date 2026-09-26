@@ -37,7 +37,7 @@
 
 use fpk::{Header, Kind, Manifest};
 use user_progs::{
-    Args, Dirent, Path, close, create, exit, file_size, mkdir, open, print, print_u64, println,
+    Args, Dirent, Line, Path, close, create, exit, file_size, mkdir, open, println,
     read, read_at, readdir, remove, stat, write,
 };
 use user_abi::Stat;
@@ -102,8 +102,10 @@ fn usage() -> i64 {
 fn install(path: &str) -> i64 {
     let fd = open(path);
     if fd < 0 {
-        print("pkg: cannot open ");
-        println(path);
+        Line::new()
+            .str("pkg: cannot open ")
+            .str(path)
+            .end();
         return 1;
     }
 
@@ -145,8 +147,10 @@ fn install(path: &str) -> i64 {
     let rights = match manifest.rights() {
         Ok(rights) => rights,
         Err(err) => {
-            print("pkg: ");
-            println(err.text());
+            Line::new()
+                .str("pkg: ")
+                .str(err.text())
+                .end();
             close(fd);
             return 1;
         }
@@ -156,11 +160,13 @@ fn install(path: &str) -> i64 {
     // и снесённый обратно, — это две операции там, где достаточно ни одной.
     for required in manifest.requires() {
         if !is_installed(required) {
-            print("pkg: ");
-            print(name);
-            print(" requires ");
-            print(required);
-            println(", which is not installed");
+            Line::new()
+                .str("pkg: ")
+                .str(name)
+                .str(" requires ")
+                .str(required)
+                .str(", which is not installed")
+                .end();
             close(fd);
             return 1;
         }
@@ -176,9 +182,11 @@ fn install(path: &str) -> i64 {
     // которых нет в новой, остались бы навсегда — и принадлежали бы пакету,
     // который их больше не помнит.
     if is_installed(name) {
-        print("pkg: ");
-        print(name);
-        println(" is already installed; remove it first");
+        Line::new()
+            .str("pkg: ")
+            .str(name)
+            .str(" is already installed; remove it first")
+            .end();
         close(fd);
         return 1;
     }
@@ -189,8 +197,10 @@ fn install(path: &str) -> i64 {
         return 1;
     }
     if mkdir(root.as_str(), 0o755) < 0 {
-        print("pkg: cannot create ");
-        println(root.as_str());
+        Line::new()
+            .str("pkg: cannot create ")
+            .str(root.as_str())
+            .end();
         close(fd);
         return 1;
     }
@@ -216,16 +226,20 @@ fn install(path: &str) -> i64 {
         // ставит: их права — свойство системы, а не архива. См. заголовок
         // крейта `fpk`.
         if !ensure_parents(root.as_str(), base) {
-            print("pkg: cannot create the directory for ");
-            println(entry.path);
+            Line::new()
+                .str("pkg: cannot create the directory for ")
+                .str(entry.path)
+                .end();
             close(fd);
             return 1;
         }
 
         let written = copy_out(fd, header.payload_offset() + entry.offset, entry.size, root.as_str(), entry.mode);
         if written < 0 {
-            print("pkg: cannot write ");
-            println(root.as_str());
+            Line::new()
+                .str("pkg: cannot write ")
+                .str(root.as_str())
+                .end();
             close(fd);
             return 1;
         }
@@ -242,25 +256,29 @@ fn install(path: &str) -> i64 {
         return 1;
     }
 
-    print("pkg: installed ");
-    print(name);
-    print(" ");
-    print(version);
-    print(", ");
-    print_u64(files);
-    print(" file(s), ");
-    print_u64(bytes);
-    print(" bytes in ");
-    println(root_of(name).as_str());
+    Line::new()
+        .str("pkg: installed ")
+        .str(name)
+        .str(" ")
+        .str(version)
+        .str(", ")
+        .num(files)
+        .str(" file(s), ")
+        .num(bytes)
+        .str(" bytes in ")
+        .str(root_of(name).as_str())
+        .end();
 
     // Права называются вслух при установке, и это не отчётность. Человек
     // ставит программу один раз, а решает по этой строке — «калькулятору нужна
     // сеть» видно здесь и больше нигде.
     let mut names = [0u8; 32];
-    print("pkg: ");
-    print(name);
-    print(" may use ");
-    println(rights.write_names(&mut names));
+    Line::new()
+        .str("pkg: ")
+        .str(name)
+        .str(" may use ")
+        .str(rights.write_names(&mut names))
+        .end();
     0
 }
 
@@ -280,17 +298,21 @@ fn list() -> i64 {
         let Some(name) = file.strip_suffix(".pkg") else { continue };
         // Версия читается из самой записи реестра: держать её ещё и в имени
         // файла значило бы иметь два источника одного факта.
-        print("  ");
-        print(name);
-        print("  ");
-        println(version_of(name).as_str());
+        Line::new()
+            .str("  ")
+            .str(name)
+            .str("  ")
+            .str(version_of(name).as_str())
+            .end();
         count += 1;
     }
     close(fd);
 
-    print("pkg: ");
-    print_u64(count);
-    println(" package(s) installed");
+    Line::new()
+        .str("pkg: ")
+        .num(count)
+        .str(" package(s) installed")
+        .end();
     0
 }
 
@@ -330,9 +352,11 @@ fn verify(only: Option<&str>) -> i64 {
     }
     close(fd);
 
-    print("pkg: verified ");
-    print_u64(checked);
-    println(" package(s)");
+    Line::new()
+        .str("pkg: verified ")
+        .num(checked)
+        .str(" package(s)")
+        .end();
     worst
 }
 
@@ -341,9 +365,11 @@ fn verify_one(name: &str) -> i64 {
     // исполняется эта функция.
     let manifest_bytes = unsafe { &mut *core::ptr::addr_of_mut!(MANIFEST) };
     let Some(manifest) = read_registry(name, manifest_bytes) else {
-        print("pkg: ");
-        print(name);
-        println(" is not installed");
+        Line::new()
+            .str("pkg: ")
+            .str(name)
+            .str(" is not installed")
+            .end();
         return 1;
     };
 
@@ -366,22 +392,26 @@ fn verify_one(name: &str) -> i64 {
         match check_file(root.as_str(), entry.size, entry.crc) {
             Ok(()) => good += 1,
             Err(why) => {
-                print("  ");
-                print(root.as_str());
-                print(": ");
-                println(why);
+                Line::new()
+                    .str("  ")
+                    .str(root.as_str())
+                    .str(": ")
+                    .str(why)
+                    .end();
                 bad += 1;
             }
         }
     }
 
-    print("pkg: ");
-    print(name);
-    print(": ");
-    print_u64(good);
-    print(" file(s) intact, ");
-    print_u64(bad);
-    println(" changed or missing");
+    Line::new()
+        .str("pkg: ")
+        .str(name)
+        .str(": ")
+        .num(good)
+        .str(" file(s) intact, ")
+        .num(bad)
+        .str(" changed or missing")
+        .end();
     i64::from(bad != 0)
 }
 
@@ -428,9 +458,11 @@ fn remove_package(name: &str) -> i64 {
     // SAFETY: программа однопоточна.
     let manifest_bytes = unsafe { &mut *core::ptr::addr_of_mut!(MANIFEST) };
     let Some(manifest) = read_registry(name, manifest_bytes) else {
-        print("pkg: ");
-        print(name);
-        println(" is not installed");
+        Line::new()
+            .str("pkg: ")
+            .str(name)
+            .str(" is not installed")
+            .end();
         return 1;
     };
 
@@ -449,8 +481,10 @@ fn remove_package(name: &str) -> i64 {
         // Отсутствующий файл — не отказ: его мог снести человек, и жаловаться
         // на то, что работа уже сделана, незачем.
         if remove(root.as_str()) < 0 && exists(root.as_str()) {
-            print("  cannot remove ");
-            println(root.as_str());
+            Line::new()
+                .str("  cannot remove ")
+                .str(root.as_str())
+                .end();
             failed += 1;
         } else {
             removed += 1;
@@ -488,13 +522,15 @@ fn remove_package(name: &str) -> i64 {
     }
     registry.truncate(0);
 
-    print("pkg: removed ");
-    print(name);
-    print(", ");
-    print_u64(removed);
-    print(" file(s), ");
-    print_u64(failed);
-    println(" failure(s)");
+    Line::new()
+        .str("pkg: removed ")
+        .str(name)
+        .str(", ")
+        .num(removed)
+        .str(" file(s), ")
+        .num(failed)
+        .str(" failure(s)")
+        .end();
     i64::from(failed != 0)
 }
 
@@ -508,8 +544,10 @@ fn read_header(fd: i64) -> Result<Header, i64> {
         return Err(1);
     }
     Header::parse(&bytes).map_err(|err| {
-        print("pkg: ");
-        println(err.text());
+        Line::new()
+            .str("pkg: ")
+            .str(err.text())
+            .end();
         1
     })
 }
@@ -530,8 +568,10 @@ fn read_manifest<'a>(
         return Err(1);
     }
     Manifest::parse(header, &buffer[..len]).map_err(|err| {
-        print("pkg: ");
-        println(err.text());
+        Line::new()
+            .str("pkg: ")
+            .str(err.text())
+            .end();
         1
     })
 }

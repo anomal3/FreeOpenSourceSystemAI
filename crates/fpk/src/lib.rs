@@ -232,10 +232,18 @@ impl Rights {
     /// Своё окно на рабочем столе. **Проверяется.**
     pub const WINDOWS: Self = Self(1 << 2);
 
+    /// Устройство PCI целиком: его регистры, прерывания и память для DMA —
+    /// драйвер, который программа (веха «драйверы по VID:PID»). **Проверяется.**
+    ///
+    /// Самое широкое право из всех: без IOMMU устройство с DMA пишет в любую
+    /// память машины, то есть программа с этим правом равна ядру по силе. Поэтому
+    /// пакет, который его просит, обязан быть подписан (часть Д2).
+    pub const DEVICES: Self = Self(1 << 3);
+
     /// Всё, что бывает. Столько получает всякая программа, запущенная не как
     /// пакет: системная из `/bin`, команда оболочки, служба. Ограничивать их
     /// этим набором нечем и незачем — они и есть система.
-    pub const ALL: Self = Self(0b111);
+    pub const ALL: Self = Self(0b1111);
 
     /// Разобрать список имён через пробел: `net files windows`.
     pub fn parse(list: &str) -> Result<Self, Error> {
@@ -253,6 +261,7 @@ impl Rights {
             "net" => Some(Self::NET),
             "files" => Some(Self::FILES),
             "windows" => Some(Self::WINDOWS),
+            "devices" => Some(Self::DEVICES),
             _ => None,
         }
     }
@@ -300,8 +309,12 @@ impl Rights {
     /// крейта нет и не будет. Возвращает срез этого же буфера.
     pub fn write_names<'a>(self, out: &'a mut [u8; 32]) -> &'a str {
         let mut used = 0;
-        for (right, name) in [(Self::NET, "net"), (Self::FILES, "files"), (Self::WINDOWS, "windows")]
-        {
+        for (right, name) in [
+            (Self::NET, "net"),
+            (Self::FILES, "files"),
+            (Self::WINDOWS, "windows"),
+            (Self::DEVICES, "devices"),
+        ] {
             if !self.contains(right) {
                 continue;
             }
@@ -981,7 +994,7 @@ version=1.0
         let mut buffer = [0u8; 32];
         assert_eq!(Rights::NONE.write_names(&mut buffer), "none");
         let mut buffer = [0u8; 32];
-        assert_eq!(Rights::ALL.write_names(&mut buffer), "net files windows");
+        assert_eq!(Rights::ALL.write_names(&mut buffer), "net files windows devices");
         let mut buffer = [0u8; 32];
         assert_eq!(Rights::WINDOWS.write_names(&mut buffer), "windows");
     }

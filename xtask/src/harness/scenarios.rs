@@ -4007,6 +4007,83 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "driver-edu",
+        about: "Устройство, которого ядро не знает, работает через драйвер-программу из пакета: регистры, MSI и DMA.",
+        // Установленная система: пакет ставится в `/opt` на разделе
+        // состояния, а у живой корень только для чтения.
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // Учебная карта QEMU. `dma_mask` — во всю ширину: по умолчанию карта
+        // обрезает адреса DMA до 28 бит, а окно DMA ядра лежит где придётся.
+        extra: &["-device", "edu,dma_mask=0xffffffffffffffff"],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Уборка за прошлым прогоном: диск цепочки переживает прогоны.
+            // Отказ не проверяется — на свежей системе удалять нечего.
+            Step::Line("run /bin/pkg remove edu"),
+            Step::Await("freeos> ", 30_000),
+            Step::Line("run /bin/pkg remove edu-nodev"),
+            Step::Await("freeos> ", 30_000),
+            // Перепись шины: карта есть, драйвера в ядре нет.
+            Step::Line("pci"),
+            Step::Await("1234:11e8", 15_000),
+            Step::Await("NO DRIVER IN THIS KERNEL", 15_000),
+            // Драйвер приходит пакетом, и пакет просит право на устройство.
+            Step::Line("run /bin/pkg install /media/edu-1.0.fpk"),
+            Step::Await("pkg: installed edu 1.0", 60_000),
+            Step::Await("pkg: edu may use devices", 15_000),
+            Step::Line("run /opt/edu/bin/edudrv"),
+            Step::Await("given to", 30_000),
+            Step::Await("edudrv: card version 1.0, registers answer", 30_000),
+            // Прерывание дошло до программы: она спала, а не опрашивала.
+            Step::Await("edudrv: 10! = 3628800 by interrupt", 30_000),
+            // Физический адрес от ядра верен: карта прочитала и записала туда.
+            Step::Await("edudrv: 64 bytes went to the card and back by DMA", 30_000),
+            // Устройство отдаётся на пути выхода — раньше, чем оболочка узнает
+            // код возврата.
+            Step::Await("is free again", 15_000),
+            Step::Await("/opt/edu/bin/edudrv: exited with code 0", 30_000),
+            Step::Line("irq driver0"),
+            Step::Await("driver0 woke the system", 15_000),
+            // Второй запуск: место, вектор и карта отданы и берутся заново.
+            Step::Line("run /opt/edu/bin/edudrv"),
+            Step::Await("edudrv: 64 bytes went to the card and back by DMA", 30_000),
+            Step::Await("/opt/edu/bin/edudrv: exited with code 0", 30_000),
+            // Тот же драйвер из пакета без права `devices`: устройство ему не
+            // дают (-5 — `ERR_PERMISSION`), и ядро не говорит даже, есть ли
+            // такое на шине.
+            Step::Line("run /bin/pkg install /media/edu-nodev-1.0.fpk"),
+            Step::Await("pkg: edu-nodev may use none", 60_000),
+            Step::Line("run /opt/edu-nodev/bin/edudrv"),
+            Step::Await("edudrv: cannot take the edu card (-5)", 30_000),
+            // Уборка: сценарий `pkg` дальше по цепочке считает пакеты на диске.
+            Step::Line("run /bin/pkg remove edu-nodev"),
+            Step::Await("freeos> ", 30_000),
+            Step::Line("run /bin/pkg remove edu"),
+            Step::Await("freeos> ", 30_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+            Step::Absent("WARNING"),
+        ],
+    },
+    Scenario {
         name: "libc",
         about: "Программа на C: собрана нашим набором, печатает printf'ом и работает с файлами.",
         target: Target::Installed,
@@ -5900,9 +5977,10 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Wait(1_500),
             Step::Shot("02-choose"),
-            // Первым идёт `extra`, вторым `hello`; ставим второй — первый
-            // требует его и не встал бы.
-            Step::Key("down"),
+            // Список по алфавиту: `edu`, `edu-nodev` (драйверы, веха «драйверы»,
+            // Д1), `extra`, `hello`. Ставим `hello` — `extra` требует его и не
+            // встал бы.
+            Step::Repeat("down", 3),
             Step::Key("ret"),
             Step::Await("settings    : started '/bin/pkg install /media/hello-1.0.fpk'", 15_000),
             Step::Await("pkg: installed hello 1.0, 2 file(s)", 60_000),
@@ -8328,7 +8406,8 @@ pub const ALL: &[Scenario] = &[
             // (эталон канарейки стека), см. `user_abi::ABI_VERSION`.
             // 65539 — это `0x0001_0003`: младшая половина выросла дважды,
             // когда добавились потоки (55b) и ожидание на адресе (55c).
-            Step::Await("posix: abi version 65539", 60_000),
+            // 65540 — `0x0001_0004`: вызовы для драйверов-программ (Д1).
+            Step::Await("posix: abi version 65540", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».

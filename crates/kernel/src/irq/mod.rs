@@ -42,11 +42,13 @@ pub mod source {
     pub const OHCI: u32 = 7;
     /// Контроллер USB 2.0.
     pub const EHCI: u32 = 8;
+    /// Первое из мест драйверов-программ (`user::driver`, их четыре: 9–12).
+    pub const DRIVER_FIRST: u32 = 9;
 
     /// Сколько источников помещается в таблицу счётчиков. Нулевой не занят
     /// никем: ноль — слишком удобное значение по умолчанию, чтобы отдавать его
     /// настоящему устройству.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 16;
 
     /// Имя источника для диагностики.
     #[must_use]
@@ -60,6 +62,10 @@ pub mod source {
             NVME => "nvme",
             OHCI => "ohci",
             EHCI => "ehci",
+            9 => "driver0",
+            10 => "driver1",
+            11 => "driver2",
+            12 => "driver3",
             _ => "unknown",
         }
     }

@@ -406,11 +406,14 @@ const DOTNET: [(&CStr16, &str); 3] = [
 ///
 /// Их отсутствие — не отказ: пакеты собирает `xtask`, и носитель, собранный без
 /// них, остаётся годным установочным носителем.
-const PACKAGES: [(&CStr16, &str); 3] = [
+const PACKAGES: [(&CStr16, &str); 5] = [
     (cstr16!("\\FREEOS\\PKG\\HELLO.FPK"), "hello-1.0.fpk"),
     (cstr16!("\\FREEOS\\PKG\\EXTRA.FPK"), "extra-1.0.fpk"),
     // Программа WinForms пакетом (фаза N8).
     (cstr16!("\\FREEOS\\PKG\\WINFORMS.FPK"), "winforms-1.0.fpk"),
+    // Драйвер-программа для учебной карты QEMU `edu` (веха «драйверы», Д1).
+    (cstr16!("\\FREEOS\\PKG\\EDU.FPK"), "edu-1.0.fpk"),
+    (cstr16!("\\FREEOS\\PKG\\EDUNODEV.FPK"), "edu-nodev-1.0.fpk"),
 ];
 
 /// Размер файла по данным файловой системы.
