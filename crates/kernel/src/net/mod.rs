@@ -719,6 +719,13 @@ pub fn stream_close(owner: TaskId, index: usize) -> Result<(), NetError> {
     iface.streams.get(owner, index).map_err(NetError::Stream)?;
     {
         let conn = iface.streams.get_mut(owner, index).map_err(NetError::Stream)?;
+        // Соединение, которое ещё не установилось, просто забывается (RFC 793,
+        // CLOSE в SYN-SENT): слать нечего и некому. Иначе `tcp_pump` отправил
+        // бы `SYN` уже после того, как программа сдалась, а на ответ сервера
+        // пришлось бы отвечать `RST` — соединения к тому времени нет.
+        if conn.state == stream::State::SynSent {
+            conn.state = stream::State::Closed;
+        }
         conn.closing = true;
     }
     tcp_pump(iface, index);
@@ -1427,6 +1434,16 @@ fn tcp_tick(iface: &mut Interface) {
                     // Заметно это стало только здесь: до сети по TCP ходили
                     // короткие обмены, где мы всегда что-нибудь отправляем.
                     conn.disarm();
+                    // Но «в полёте ничего» бывает и потому, что сегмент **не
+                    // ушёл**: адрес шлюза выяснялся, отправка вернула `Pending`
+                    // и завела этот таймер на 50 мс. Сняв его молча, мы теряли
+                    // `SYN` навсегда: соединение висело в `syn-sent`, программа
+                    // сдавалась по сроку, а при закрытии `SYN` наконец уходил —
+                    // и на ответ сервера мы же отвечали `RST` (26.09.2026,
+                    // первое соединение с настоящим сервером обновлений). Попытка
+                    // отправить задолженное дешёвая: нечего — `tcp_pump`
+                    // вернётся сразу. Повтором она не считается.
+                    retransmit = true;
                 } else if conn.gave_up() {
                     dead = true;
                 } else {
