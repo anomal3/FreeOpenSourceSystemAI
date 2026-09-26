@@ -4,7 +4,23 @@
 //!   sysupdate check [путь]   что предлагает сервер и новее ли оно нашего
 //!   sysupdate get   [путь]   скачать и проверить, ничего не устанавливая
 //!   sysupdate apply [файл]   поставить скачанное в свободный слот
+//!   sysupdate driver vvvv:dddd [путь]
+//!                            скачать драйвер устройства из каталога
 //! ```
+//!
+//! # Драйверы (веха «драйверы по VID:PID», Д4)
+//!
+//! Рядом с индексом в репозитории лежит каталог драйверов (`drivers` и
+//! `drivers.sig`, формат — `osupdate::drivers`). `driver` проверяет его подпись
+//! теми же ключами `/os-keys`, находит пакет для устройства и этой архитектуры,
+//! качает его в `/var/cache/drivers/driver.fpk` и сверяет размер и SHA-256 с
+//! подписанным каталогом. Ставит пакет не эта программа, а `pkg`: подпись
+//! самого пакета и право `devices` проверяет установщик (Д2). Зовёт всё это
+//! служба `drvd`, когда ни среди установленных пакетов, ни на `/media` драйвера
+//! не нашлось.
+//!
+//! Серверы те же, что для обновлений, из того же `update.cfg`: репозиторий у
+//! машины один, и второй список адресов однажды разошёлся бы с первым.
 //!
 //! # Порядок, в котором машина обновляется
 //!
@@ -52,11 +68,12 @@
 #![no_std]
 #![no_main]
 
+use osupdate::drivers::{self, Catalogue};
 use osupdate::index::{self, Index};
 use osupdate::keys::{self, Trusted};
 use user_progs::{
-    Args, ERR_UPDATE_REFUSED, SLOT_B, apply_update, close, config_path, error, error_num, exit,
-    http, open, print, print_u64, println, read, time_now, uid, write,
+    Args, ERR_UPDATE_REFUSED, Line, SLOT_B, apply_update, close, config_path, error, error_num,
+    exit, http, open, print, print_u64, println, read, time_now, uid, write,
 };
 
 /// Имя файла настроек.
@@ -74,6 +91,11 @@ const CA: &str = "ca.pem";
 const CACHE_DIR: &str = "/var/cache";
 const CACHE_UPDATES: &str = "/var/cache/updates";
 const CACHE_FILE: &str = "/var/cache/updates/system.fpk";
+
+/// Куда кладётся скачанный драйвер. Имя фиксированное по той же причине, что у
+/// образа: имя из каталога пришло бы из сети.
+const CACHE_DRIVERS: &str = "/var/cache/drivers";
+const DRIVER_FILE: &str = "/var/cache/drivers/driver.fpk";
 
 /// Где лежат доверенные ключи. Тот же файл, что читает ядро.
 const KEYS: &str = "/os-keys";
@@ -144,6 +166,7 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         "check" => exit(check(argument)),
         "get" => exit(get(argument)),
         "apply" => exit(apply(argument.unwrap_or(CACHE_FILE))),
+        "driver" => exit(driver(argument, args.get(3))),
         _ => {
             usage();
             exit(2);
@@ -154,6 +177,7 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
 fn usage() {
     println("usage: sysupdate check|get [repository path]");
     println("       sysupdate apply [file]");
+    println("       sysupdate driver vvvv:dddd [repository path]");
     println("  the servers are named in /etc/update.cfg, or in the image defaults");
 }
 
@@ -417,32 +441,9 @@ fn offer(servers: &Servers, trust: &mut Option<http::Trust<'static>>) -> Option<
 
     for index in 0..servers.len {
         let server = &servers.list[index];
-        let Some(index_text) = fetch_text(server, "index", trust) else {
+        let Some(index_text) = signed_text(server, &INDEX_FILES, &trusted, trust) else {
             continue;
         };
-        // Подпись читается **после** индекса и в тот же буфер нельзя: индекс
-        // нужен целиком, чтобы посчитать по нему хеш. Поэтому под подпись —
-        // стек: она короткая, строка на 140 знаков.
-        let mut signature_text = [0u8; 256];
-        let Some(signature_len) = fetch_into(server, "index.sig", &mut signature_text, trust)
-        else {
-            continue;
-        };
-        let Ok(signature_text) = core::str::from_utf8(&signature_text[..signature_len]) else {
-            error("sysupdate: index.sig is not text\n");
-            continue;
-        };
-        let Some(signature) = index::parse_signature(signature_text) else {
-            error("sysupdate: index.sig does not hold an ed25519 signature\n");
-            continue;
-        };
-
-        let digest = index::digest(index_text.as_bytes());
-        if !trusted.verifies(&digest, &signature) {
-            error("sysupdate: the index signature does not match any key this system trusts\n");
-            continue;
-        }
-        println("sysupdate: the index is signed by a key this system trusts");
 
         let parsed = match Index::parse(index_text) {
             Ok(parsed) => parsed,
@@ -485,6 +486,74 @@ fn offer(servers: &Servers, trust: &mut Option<http::Trust<'static>>) -> Option<
 
     println("sysupdate: no repository in the configuration offered an update");
     None
+}
+
+/// Подписанный файл репозитория: имена двух файлов и как считать хеш.
+struct SignedFiles {
+    /// Как файл называется в строках журнала: «index», «driver catalogue».
+    what: &'static str,
+    file: &'static str,
+    signature: &'static str,
+    digest: fn(&[u8]) -> [u8; 32],
+}
+
+const INDEX_FILES: SignedFiles = SignedFiles {
+    what: "index",
+    file: "index",
+    signature: "index.sig",
+    digest: index::digest,
+};
+
+const CATALOGUE_FILES: SignedFiles = SignedFiles {
+    what: "driver catalogue",
+    file: drivers::FILE,
+    signature: drivers::SIGNATURE_FILE,
+    digest: drivers::digest,
+};
+
+/// Скачать текстовый файл репозитория и его подпись и проверить её.
+///
+/// Возвращает текст, только если подпись сошлась: **сначала подпись, потом
+/// содержимое** (см. [`offer`]). Одна функция на индекс и на каталог драйверов,
+/// чтобы порядок проверок у них не разошёлся.
+fn signed_text(
+    server: &Server,
+    files: &SignedFiles,
+    trusted: &Trusted,
+    trust: &mut Option<http::Trust<'static>>,
+) -> Option<&'static str> {
+    let text = fetch_text(server, files.file, trust)?;
+    // Подпись читается **после** файла и в тот же буфер нельзя: файл нужен
+    // целиком, чтобы посчитать по нему хеш. Поэтому под подпись — стек: она
+    // короткая, строка на 140 знаков.
+    let mut signature_text = [0u8; 256];
+    let signature_len = fetch_into(server, files.signature, &mut signature_text, trust)?;
+    let Ok(signature_text) = core::str::from_utf8(&signature_text[..signature_len]) else {
+        Line::to_log().str("sysupdate: ").str(files.signature).str(" is not text").end();
+        return None;
+    };
+    let Some(signature) = index::parse_signature(signature_text) else {
+        Line::to_log()
+            .str("sysupdate: ")
+            .str(files.signature)
+            .str(" does not hold an ed25519 signature")
+            .end();
+        return None;
+    };
+
+    // Строки отказа и согласия — одной записью: стенд ищет их целиком, а
+    // вывод служб и оболочки идёт в ту же линию вперемежку.
+    let digest = (files.digest)(text.as_bytes());
+    if !trusted.verifies(&digest, &signature) {
+        Line::to_log()
+            .str("sysupdate: the ")
+            .str(files.what)
+            .str(" signature does not match any key this system trusts")
+            .end();
+        return None;
+    }
+    Line::new().str("sysupdate: the ").str(files.what).str(" is signed by a key this system trusts").end();
+    Some(text)
 }
 
 /// Прочитать `/os-keys` — те же ключи, которыми ядро проверяет контейнер.
@@ -701,28 +770,54 @@ fn get(path: Option<&str>) -> i64 {
     let _ = user_progs::mkdir(CACHE_DIR, 0o755);
     let _ = user_progs::mkdir(CACHE_UPDATES, 0o755);
 
-    let fd = create_truncated(CACHE_FILE);
-    if fd < 0 {
-        error("sysupdate: cannot write ");
-        error(CACHE_FILE);
-        error("\n");
-        return 1;
-    }
-
-    let mut url = Text::new();
     // Образ берётся у **того же** репозитория, который отдал подписанный индекс:
     // взять индекс у одного, а файл у другого значило бы проверять хеш не того,
     // что качали.
-    if !servers.list[offer.server].url(offer.file(), &mut url) {
-        error("sysupdate: that path is too long\n");
-        close(fd);
+    let server = &servers.list[offer.server];
+    if !download(server, offer.file(), offer.size, &offer.sha256, CACHE_FILE, &mut trust) {
         return 1;
     }
 
+    print("sysupdate: downloaded and verified ");
+    print(offer.version());
+    print(" into ");
+    println(CACHE_FILE);
+    println("sysupdate: run 'sysupdate apply' to put it into the free slot");
+    0
+}
+
+/// Скачать файл репозитория в `target` и сверить с подписанной записью.
+///
+/// Размер и SHA-256 — из подписанного индекса или каталога. Не сошлось или
+/// оборвалось — файл убирается и возвращается `false`: оставленный, он
+/// выглядел бы как готовая загрузка.
+fn download(
+    server: &Server,
+    file: &str,
+    size: u64,
+    sha256: &[u8; 32],
+    target: &str,
+    trust: &mut Option<http::Trust<'static>>,
+) -> bool {
+    let fd = create_truncated(target);
+    if fd < 0 {
+        error("sysupdate: cannot write ");
+        error(target);
+        error("\n");
+        return false;
+    }
+
+    let mut url = Text::new();
+    if !server.url(file, &mut url) {
+        error("sysupdate: that path is too long\n");
+        close(fd);
+        return false;
+    }
+
     print("sysupdate: downloading ");
-    print(offer.file());
+    print(file);
     print(" (");
-    print_u64(offer.size);
+    print_u64(size);
     println(" bytes)");
 
     let mut hasher = fpk::Hasher::new();
@@ -754,7 +849,7 @@ fn get(path: Option<&str>) -> i64 {
                 print("sysupdate: ");
                 print_u64(written / (1024 * 1024));
                 print(" of ");
-                print_u64(offer.size / (1024 * 1024));
+                print_u64(size / (1024 * 1024));
                 println(" MiB");
             }
             true
@@ -766,38 +861,94 @@ fn get(path: Option<&str>) -> i64 {
         if failed {
             println("sysupdate: writing to /var failed; is there room left?");
         } else {
-            complain(offer.file(), err);
+            complain(file, err);
         }
         // Недокачанный файл убирается: оставленный, он выглядит как готовое
         // обновление, и следующий `apply` наткнётся на него, а не на отказ.
-        let _ = user_progs::remove(CACHE_FILE);
-        return 1;
+        let _ = user_progs::remove(target);
+        return false;
     }
 
-    if written != offer.size {
+    if written != size {
         print("sysupdate: got ");
         print_u64(written);
         print(" bytes and the index promised ");
-        print_u64(offer.size);
+        print_u64(size);
         println("");
-        let _ = user_progs::remove(CACHE_FILE);
+        let _ = user_progs::remove(target);
+        return false;
+    }
+    if hasher.finish() != *sha256 {
+        // Подпись контейнера проверит ядро (или `pkg` у драйвера), но сказать
+        // об этом надо здесь и сейчас: хеш из **подписанного** индекса не
+        // сошёлся, значит по дороге приехало не то, что выложили.
+        println("sysupdate: the download does not match the sha256 in the signed index");
+        let _ = user_progs::remove(target);
+        return false;
+    }
+    true
+}
+
+/// `driver`: скачать драйвер устройства из каталога драйверов (Д4).
+///
+/// Код возврата: 0 — скачан и сверен, 3 — ни один репозиторий драйвера не
+/// предложил (обычный ответ, как «новее ничего нет» у `check`), 1 — отказ.
+fn driver(id: Option<&str>, path: Option<&str>) -> i64 {
+    if uid() != 0 {
+        println("sysupdate: only root downloads drivers");
         return 1;
     }
-    if hasher.finish() != offer.sha256 {
-        // Подпись контейнера проверит ядро, но сказать об этом надо здесь и
-        // сейчас: хеш из **подписанного** индекса не сошёлся, значит по дороге
-        // приехало не то, что выложили.
-        println("sysupdate: the download does not match the sha256 in the signed index");
-        let _ = user_progs::remove(CACHE_FILE);
-        return 1;
+    let Some(id) = id else {
+        usage();
+        return 2;
+    };
+    let Some((vendor, device)) = fpk::parse_drive(id) else {
+        Line::new().str("sysupdate: '").str(id).str("' is not vendor:device").end();
+        return 2;
+    };
+    let Some((servers, mut trust)) = prepare(path) else { return 1 };
+    let Some(trusted) = trusted_keys() else { return 1 };
+
+    for index in 0..servers.len {
+        let server = &servers.list[index];
+        let Some(text) = signed_text(server, &CATALOGUE_FILES, &trusted, &mut trust) else {
+            continue;
+        };
+        let found = match Catalogue::parse(text).and_then(|catalogue| catalogue.find(vendor, device, ARCH)) {
+            Ok(found) => found,
+            Err(err) => {
+                Line::new().str("sysupdate: ").str(err.text()).end();
+                continue;
+            }
+        };
+        Line::new()
+            .str("sysupdate: the catalogue offers ")
+            .str(found.package)
+            .str(" ")
+            .str(found.version)
+            .str(" for ")
+            .str(id)
+            .end();
+
+        let _ = user_progs::mkdir(CACHE_DIR, 0o755);
+        let _ = user_progs::mkdir(CACHE_DRIVERS, 0o755);
+        // Пакет — у того же репозитория, что отдал подписанный каталог.
+        if !download(server, found.file, found.size, &found.sha256, DRIVER_FILE, &mut trust) {
+            continue;
+        }
+        Line::new()
+            .str("sysupdate: downloaded and verified ")
+            .str(found.package)
+            .str(" ")
+            .str(found.version)
+            .str(" into ")
+            .str(DRIVER_FILE)
+            .end();
+        return 0;
     }
 
-    print("sysupdate: downloaded and verified ");
-    print(offer.version());
-    print(" into ");
-    println(CACHE_FILE);
-    println("sysupdate: run 'sysupdate apply' to put it into the free slot");
-    0
+    Line::new().str("sysupdate: no repository offered a driver for ").str(id).end();
+    3
 }
 
 /// `apply`: отдать файл ядру.

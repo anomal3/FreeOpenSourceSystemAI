@@ -5,6 +5,7 @@
 //! ошибки этого рода выглядят на машине одинаково («обновление не встало») и
 //! ищутся в подписи, а не в разборе текста.
 
+use crate::drivers::{self, Catalogue};
 use crate::index::{self, Index};
 use crate::keys::Trusted;
 
@@ -138,4 +139,93 @@ fn keys_beyond_the_limit_are_counted_not_hidden() {
     let trusted = Trusted::parse(&text);
     assert_eq!(trusted.len(), crate::keys::MAX_KEYS);
     assert_eq!(trusted.dropped(), 2);
+}
+
+/// Каталог драйверов, собранный сборщиком, разбирается разбором, и запись
+/// находится по устройству **и** архитектуре — не по чему-то одному.
+#[test]
+fn the_driver_catalogue_finds_by_device_and_arch() {
+    let offer = |arch, file, byte| drivers::build::Offer {
+        drives: "1234:11e8 1234:11e9",
+        arch,
+        package: "edu",
+        version: "1.0",
+        file,
+        size: 4096,
+        sha256: [byte; 32],
+    };
+    let text = drivers::build::render(&[
+        offer("x86_64", "edu-1.0-x86_64.fpk", 0x11),
+        offer("aarch64", "edu-1.0-aarch64.fpk", 0x22),
+    ]);
+    let catalogue = Catalogue::parse(&text).expect("каталог разбирается");
+
+    let found = catalogue.find(0x1234, 0x11e8, "aarch64").expect("драйвер есть");
+    assert_eq!(found.package, "edu");
+    assert_eq!(found.file, "edu-1.0-aarch64.fpk");
+    assert_eq!(found.sha256, [0x22; 32]);
+    // Второе устройство той же записи.
+    assert_eq!(catalogue.find(0x1234, 0x11e9, "x86_64").expect("и второе").sha256, [0x11; 32]);
+    // Чужого устройства и чужой архитектуры нет — а не первая попавшаяся запись.
+    assert_eq!(catalogue.find(0x8086, 0x100e, "x86_64").unwrap_err(), drivers::Error::NoDriver);
+    assert_eq!(catalogue.find(0x1234, 0x11e8, "riscv64").unwrap_err(), drivers::Error::NoDriver);
+}
+
+/// Каталог с путём в имени файла и каталог чужого формата отвергаются.
+#[test]
+fn a_driver_catalogue_with_a_path_or_a_newer_format_is_refused() {
+    let text = "format=1
+[driver]
+drives=1234:11e8
+arch=x86_64
+package=edu
+version=1
+                file=../os-keys
+size=1
+sha256=00
+";
+    let catalogue = Catalogue::parse(text).expect("заголовок разбирается");
+    assert!(matches!(catalogue.find(0x1234, 0x11e8, "x86_64"), Err(drivers::Error::Field(_))));
+
+    assert_eq!(Catalogue::parse("format=2
+").unwrap_err(), drivers::Error::Format(2));
+    assert_eq!(Catalogue::parse("<html>
+").unwrap_err(), drivers::Error::NoFormat);
+    // Индекс обновлений каталогом не притворится: заголовок тот же, а записей
+    // `[driver]` в нём нет.
+    let index_text = index::build::render(&[index::build::Offer {
+        version: "0.3",
+        arch: "x86_64",
+        file: "freeos-0.3-x86_64.fpk",
+        size: 16,
+        sha256: [0; 32],
+    }]);
+    let catalogue = Catalogue::parse(&index_text).expect("заголовок общий");
+    assert_eq!(catalogue.find(0x1234, 0x11e8, "x86_64").unwrap_err(), drivers::Error::NoDriver);
+}
+
+/// Подпись индекса не годится как подпись каталога, даже по тем же байтам.
+///
+/// Ради этого у каталога своя приставка: без неё подписанный индекс,
+/// выложенный под именем `drivers`, проходил бы проверку подписи.
+#[test]
+fn an_index_signature_does_not_sign_a_catalogue() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let trusted = Trusted::parse(&alloc::format!(
+        "ed25519 {} working
+",
+        crate::to_hex(&key.verifying_key().to_bytes())
+    ));
+    let bytes = b"format=1
+";
+    let as_index = key.sign(&index::digest(bytes)).to_bytes();
+    assert!(trusted.verifies(&index::digest(bytes), &as_index));
+    assert!(!trusted.verifies(&drivers::digest(bytes), &as_index));
+
+    let as_catalogue = key.sign(&drivers::digest(bytes)).to_bytes();
+    let text = drivers::build::render_signature(&as_catalogue);
+    let parsed = index::parse_signature(&text).expect("строка подписи общая");
+    assert!(trusted.verifies(&drivers::digest(bytes), &parsed));
 }

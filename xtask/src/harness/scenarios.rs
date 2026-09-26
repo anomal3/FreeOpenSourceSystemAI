@@ -689,6 +689,28 @@ pub fn screen_for(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Что стенд стирает с раздела состояния перед загрузкой: пути от корня
+/// раздела, по порядку — сначала файлы, потом опустевшие каталоги.
+///
+/// Нужно сценариям драйверов. Пакет `edu` ставит служба `drvd` от root, а
+/// оболочка стенда работает от uid 1000 и снять его не вправе — и не должна
+/// быть вправе. Без этой уборки `driver-net` нашёл бы драйвер уже
+/// установленным и до сети не дошёл бы, а `driver-edu` на втором прогоне
+/// цепочки не дошёл бы до `/media`. Функцией, по той же причине, что
+/// [`screen_for`].
+#[must_use]
+pub fn forgotten_on_state(name: &str) -> &'static [&'static str] {
+    match name {
+        "driver-edu" | "driver-net" => &[
+            "opt/edu/bin/edudrv",
+            "opt/edu/bin",
+            "opt/edu",
+            "var/lib/pkg/edu.pkg",
+        ],
+        _ => &[],
+    }
+}
+
 /// Шаги сценариев о нескольких процессорах — общие для GICv2 и GICv3.
 ///
 /// # Что именно доказывает одновременность
@@ -4075,9 +4097,12 @@ pub const ALL: &[Scenario] = &[
             // Уборка: сценарий `pkg` дальше по цепочке считает пакеты на диске.
             Step::Line("run /bin/pkg remove edu-nodev"),
             Step::Await("freeos> ", 30_000),
-            // `edu` поставил `drvd`; снимаем, чтобы следующий прогон цепочки
-            // снова шёл через `/media`, а `pkg` дальше считал свои пакеты.
+            // `edu` поставил `drvd` от root, и оболочке (uid 1000) его не снять:
+            // `pkg` обязан отказать и **оставить** запись в реестре. Снимает
+            // его стенд перед следующей загрузкой (`forgotten_on_state`).
             Step::Line("run /bin/pkg remove edu"),
+            Step::Await("cannot remove /opt/edu/bin/edudrv", 30_000),
+            Step::Await("pkg: edu stays installed: 1 file(s) could not be removed", 30_000),
             Step::Await("freeos> ", 30_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
@@ -7019,6 +7044,87 @@ pub const ALL: &[Scenario] = &[
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    // Стоит ПОСЛЕ `update-net` и `update-tls`, и это условие, а не порядок по
+    // вкусу: `update-net` перевёл машину на образ корня из репозитория, а в нём
+    // нет `/media` с образцовыми пакетами. Установленного `edu` тоже нет —
+    // `driver-edu` его снял. Значит, `drvd` обязан дойти до третьего источника,
+    // до сети. На свежем диске (одиночный прогон после `install`) он нашёл бы
+    // пакет на `/media`, и первое ожидание сценария сказало бы об этом прямо.
+    Scenario {
+        name: "driver-net",
+        about: "Драйвер устройства, которого ядро не знает, скачивается из репозитория: подписанный каталог, пакет, установка, запуск.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        // Репозиторий на хосте вместе с каталогом драйверов и `/etc/update.cfg`
+        // гостя — тот же комплект, что у `update-net`.
+        host_repo: true,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &["-device", "edu,dma_mask=0xffffffffffffffff"],
+        steps: &[
+            // Никто ничего не ставит руками (Д4): `drvd` не нашёл драйвера ни
+            // среди установленных, ни на `/media`, дождался адреса от DHCP и
+            // спросил репозиторий. Процессы идут друг за другом (`drvd` ждёт
+            // каждого), поэтому порядок строк определён, кроме приглашения
+            // оболочки и строк прав от `pkg`.
+            Step::Await("drvd: 1234:11e8 is neither installed nor on /media; asking the repository", BOOT),
+            // Подпись каталога сошлась с ключом из `/os-keys` — первой, до того
+            // как программа поверила хоть одному полю.
+            Step::Await("sysupdate: the driver catalogue is signed by a key this system trusts", 120_000),
+            Step::Await("sysupdate: the catalogue offers edu 1.0 for 1234:11e8", 60_000),
+            // Размер и SHA-256 сошлись с подписанной записью.
+            Step::Await("sysupdate: downloaded and verified edu 1.0 into /var/cache/drivers/driver.fpk", 120_000),
+            // Ставит `pkg`: подпись самого пакета и право `devices` — его дело.
+            Step::Await("pkg: installed edu 1.0", 60_000),
+            Step::AwaitAny("pkg: edu drives 1234:11e8", 30_000),
+            Step::AwaitAny("pkg: edu may use devices", 30_000),
+            Step::Await("drvd: started /opt/edu/bin/edudrv for 1234:11e8", 30_000),
+            // И скачанный драйвер работает с картой: прерывание и DMA.
+            Step::Await("edudrv: 10! = 3628800 by interrupt", 30_000),
+            Step::Await("edudrv: 64 bytes went to the card and back by DMA", 30_000),
+            Step::Await("is free again", 15_000),
+            Step::AwaitAny("freeos> ", BOOT),
+            Step::Wait(2_000),
+
+            // Каталог с чужой подписью отвергается до единого скачанного
+            // пакета. Путь `/x/` меняет только первый сервер (старая запись);
+            // дальше программа идёт к двум по HTTPS — чужой корень отвергается,
+            // свой отдаёт годный каталог. Значит, драйвер приезжает и по
+            // запасному каналу.
+            Step::Line("sysupdate driver 1234:11e8 /x/"),
+            Step::Await("the driver catalogue signature does not match any key this system trusts", 90_000),
+            Step::Await("the chain leads to nobody this system trusts", 120_000),
+            Step::Await("sysupdate: downloaded and verified edu 1.0 into /var/cache/drivers/driver.fpk", 300_000),
+            Step::Await("tty         : foreground released", 120_000),
+
+            // Устройства, которого в каталоге нет, не находится — у всех трёх
+            // серверов, и программа говорит об этом, а не качает что попало.
+            Step::Line("sysupdate driver 8086:ffff"),
+            Step::Await("the driver catalogue has nothing for this device on this architecture", 90_000),
+            Step::Await("sysupdate: no repository offered a driver for 8086:ffff", 300_000),
+            Step::Await("tty         : foreground released", 120_000),
+
+            // Уборки нет: `edu` поставлен от root, снимает его стенд перед
+            // следующей загрузкой (`forgotten_on_state`).
+            Step::Line("exit"),
+            Step::Await("finishing the session", 15_000),
+            Step::Absent("KERNEL PANIC"),
+            Step::Absent("WARNING"),
         ],
     },
     Scenario {

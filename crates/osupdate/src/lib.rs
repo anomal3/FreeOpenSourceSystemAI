@@ -30,6 +30,7 @@
 #[cfg(feature = "build")]
 extern crate alloc;
 
+pub mod drivers;
 pub mod index;
 pub mod keys;
 
@@ -85,6 +86,22 @@ pub fn to_hex(bytes: &[u8]) -> alloc::string::String {
         out.push(digits[(byte & 0xF) as usize] as char);
     }
     out
+}
+
+/// Номер формата из первой значащей строки `format=<число>`.
+///
+/// Общий у индекса обновлений и каталога драйверов: заголовок у них один, и
+/// две копии его разбора однажды разошлись бы в том, что считать значащей
+/// строкой.
+pub(crate) fn format_of(text: &str) -> Option<u32> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        return line.strip_prefix("format=")?.trim().parse::<u32>().ok();
+    }
+    None
 }
 
 /// Имя алгоритма в обоих текстовых файлах — и в `/os-keys`, и в `index.sig`.

@@ -65,7 +65,7 @@ mod tests_fsck;
 mod write;
 
 pub use check::{Fix, Problem, Report, check};
-pub use layout::{BlockSize, Geometry, ROOT_INODE};
+pub use layout::{BlockSize, DIR_TYPE_DIRECTORY, Geometry, ROOT_INODE};
 pub use read::{DirEntry, Ext2, FileType, Inode};
 pub use edit::Editor;
 pub use write::{FormatOptions, format, format_with};

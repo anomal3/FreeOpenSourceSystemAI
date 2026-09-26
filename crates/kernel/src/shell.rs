@@ -1300,6 +1300,7 @@ fn sysupdate(argument: &str) {
     if argument.is_empty() {
         sprintln!("  usage: sysupdate check|get [repository path]");
         sprintln!("         sysupdate apply [file.fpk]");
+        sprintln!("         sysupdate driver vvvv:dddd [repository path]");
         sprintln!("  the new system goes into the inactive slot; reboot to try it");
         return;
     }

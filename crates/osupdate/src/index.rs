@@ -105,23 +105,11 @@ pub struct Index<'a> {
 impl<'a> Index<'a> {
     /// Проверить заголовок и приготовиться к чтению записей.
     pub fn parse(text: &'a str) -> Result<Self, Error> {
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let Some(value) = line.strip_prefix("format=") else {
-                return Err(Error::NoFormat);
-            };
-            let Ok(format) = value.trim().parse::<u32>() else {
-                return Err(Error::NoFormat);
-            };
-            if format != FORMAT {
-                return Err(Error::Format(format));
-            }
-            return Ok(Self { text });
+        match crate::format_of(text) {
+            Some(FORMAT) => Ok(Self { text }),
+            Some(other) => Err(Error::Format(other)),
+            None => Err(Error::NoFormat),
         }
-        Err(Error::NoFormat)
     }
 
     /// Найти запись для архитектуры.

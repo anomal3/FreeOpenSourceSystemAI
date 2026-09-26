@@ -84,7 +84,7 @@ pub(crate) const FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 
 /// Тип файла в записи каталога (при включённой `FILETYPE`).
 pub(crate) const DIR_TYPE_REGULAR: u8 = 1;
-pub(crate) const DIR_TYPE_DIRECTORY: u8 = 2;
+pub const DIR_TYPE_DIRECTORY: u8 = 2;
 
 /// Тип файла в поле `i_mode`.
 pub(crate) const MODE_DIRECTORY: u16 = 0x4000;

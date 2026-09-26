@@ -96,6 +96,21 @@ pub fn sign_index_with_stranger(index: &[u8]) -> Result<[u8; 64]> {
     Ok(key.sign(&osupdate::index::digest(index)).to_bytes())
 }
 
+/// Подписать каталог драйверов рабочим ключом (веха «драйверы», Д4).
+///
+/// Тем же ключом, что индекс, но по хешу со своей приставкой
+/// (`osupdate::drivers::DOMAIN`): подпись одного не годится другому.
+pub fn sign_catalogue(catalogue: &[u8]) -> Result<[u8; 64]> {
+    let key = release()?;
+    Ok(key.sign(&osupdate::drivers::digest(catalogue)).to_bytes())
+}
+
+/// Подписать каталог драйверов ключом, которого система не знает. Для стенда.
+pub fn sign_catalogue_with_stranger(catalogue: &[u8]) -> Result<[u8; 64]> {
+    let key = stranger()?;
+    Ok(key.sign(&osupdate::drivers::digest(catalogue)).to_bytes())
+}
+
 /// Подписать готовый контейнер: посчитать, что подписывается, и вписать подпись.
 pub fn sign(container: &mut [u8], key: &SigningKey) {
     let digest = fpk::build::digest_of(container);

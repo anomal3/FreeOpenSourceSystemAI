@@ -2827,6 +2827,63 @@ fn place_update_config(disk_path: &std::path::Path, ports: HostPorts) -> Result<
     Ok(())
 }
 
+/// Стереть пути с раздела состояния гостя — до запуска.
+///
+/// Файл — `unlink`, каталог — `rmdir` (только пустой: рекурсии нет намеренно,
+/// см. [`ext2::Editor::rmdir`]). Отсутствующее пропускается: на свежем диске
+/// стирать нечего, и это не ошибка.
+fn forget_on_state(disk_path: &std::path::Path, paths: &[&str]) -> Result<()> {
+    use disk::BlockDevice as _;
+
+    let mut dev = crate::diskfile::DiskFile::open(disk_path, 512)?;
+    let table = disk::gpt::read(&mut dev)
+        .map_err(|err| anyhow::anyhow!("на образе {} нет GPT: {err}", disk_path.display()))?;
+    let state = table
+        .find(disk::gpt::FREEOS_STATE_TYPE)
+        .ok_or_else(|| anyhow::anyhow!("на образе нет раздела состояния"))?;
+    let mut fs = ext2::Editor::open(&mut dev, state.first_lba)
+        .map_err(|err| anyhow::anyhow!("раздел состояния не открывается: {err}"))?;
+    fs.mark_dirty(&mut dev)
+        .map_err(|err| anyhow::anyhow!("не удалось пометить том используемым: {err}"))?;
+
+    for path in paths {
+        let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", path));
+        // Родитель ищется по звеньям; не нашёлся — стирать нечего.
+        let mut parent = Some(ext2::ROOT_INODE);
+        for component in parent_path.split('/').filter(|part| !part.is_empty()) {
+            parent = match parent {
+                Some(dir) => fs
+                    .lookup(&mut dev, dir, component)
+                    .map_err(|err| anyhow::anyhow!("не удалось прочитать /{parent_path}: {err}"))?
+                    .map(|(number, _)| number),
+                None => None,
+            };
+        }
+        let Some(parent) = parent else { continue };
+        let Some((_, kind)) = fs
+            .lookup(&mut dev, parent, name)
+            .map_err(|err| anyhow::anyhow!("не удалось прочитать /{path}: {err}"))?
+        else {
+            continue;
+        };
+        let result = if kind == ext2::DIR_TYPE_DIRECTORY {
+            fs.rmdir(&mut dev, parent, name)
+        } else {
+            fs.unlink(&mut dev, parent, name)
+        };
+        result.map_err(|err| anyhow::anyhow!("не удалось стереть /{path}: {err}"))?;
+        say!("стенд: у гостя стёрт /{path}");
+    }
+
+    fs.flush_everywhere(&mut dev)
+        .map_err(|err| anyhow::anyhow!("не удалось сбросить раздел состояния: {err}"))?;
+    fs.mark_clean(&mut dev)
+        .map_err(|err| anyhow::anyhow!("не удалось пометить том чистым: {err}"))?;
+    dev.flush()
+        .map_err(|err| anyhow::anyhow!("не удалось сбросить образ: {err}"))?;
+    Ok(())
+}
+
 /// Носители машины для сценария.
 fn prepare_drives(
     scenario: &Scenario,
@@ -2852,6 +2909,10 @@ fn prepare_drives(
         Target::Iso => vec![Drive::Cdrom(image::build_iso(built, image::Kind::System)?)],
         Target::Installed => {
             let disk = prepare_installed_disk(arch, built.release)?;
+            let forgotten = scenarios::forgotten_on_state(scenario.name);
+            if !forgotten.is_empty() {
+                forget_on_state(&disk, forgotten)?;
+            }
             // Обновление кладётся в образ **до** запуска — так же, как человек
             // положил бы его туда с флешки. Почему не через установочный
             // носитель, сказано в заголовке `crate::diskfile`.

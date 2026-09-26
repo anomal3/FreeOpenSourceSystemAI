@@ -398,6 +398,13 @@ struct RepoArgs {
     /// Куда сложить готовое. По умолчанию `build/repo`.
     #[arg(long)]
     out: Option<std::path::PathBuf>,
+    /// Только каталог драйверов (`drivers`, `drivers.sig` и пакеты), без
+    /// образов системы и без индекса обновлений.
+    ///
+    /// Новый драйвер — не повод предлагать машинам новую систему, а индекс,
+    /// выложенный вместе с каталогом, предложил бы.
+    #[arg(long)]
+    drivers: bool,
 }
 
 #[derive(Args, Debug)]
@@ -843,10 +850,18 @@ fn real_main() -> Result<()> {
                     installer: false,
                 })?);
             }
-            let dir = repo::build(&builds.iter().collect::<Vec<_>>(), &version, &dir)?;
-            say!();
-            say!("репозиторий собран: {}", dir.display());
-            say!("выложите этот каталог на сервер как есть; система читает index, index.sig и образ");
+            let builds: Vec<&build::Built> = builds.iter().collect();
+            if args.drivers {
+                repo::build_drivers(&builds, &dir)?;
+                say!();
+                say!("каталог драйверов собран: {}", dir.display());
+                say!("выложите drivers, drivers.sig и пакеты-драйверы рядом с index на сервере");
+            } else {
+                let dir = repo::build(&builds, &version, &dir)?;
+                say!();
+                say!("репозиторий собран: {}", dir.display());
+                say!("выложите этот каталог на сервер как есть; система читает index, index.sig и образ");
+            }
         }
 
         Command::Clean => build::clean()?,

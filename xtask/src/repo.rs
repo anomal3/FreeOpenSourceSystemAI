@@ -6,7 +6,14 @@
 //!   <каталог>/index                    текст: что предлагается и с каким хешем
 //!   <каталог>/index.sig                подпись индекса
 //!   <каталог>/freeos-<версия>-<арх>.fpk  сами образы
+//!   <каталог>/drivers, drivers.sig       каталог драйверов и его подпись (Д4)
+//!   <каталог>/<пакет>-<версия>-<арх>.fpk пакеты-драйверы
 //! ```
+//!
+//! Каталог драйверов лежит в том же каталоге, что индекс, а не подкаталогом:
+//! у ассетов релиза на GitHub путей нет, только имена. Его можно собрать и
+//! выложить отдельно от образов (`cargo xtask repo --drivers`): новый драйвер —
+//! не повод предлагать всем машинам новую систему.
 //!
 //! Всё, что нужно серверу, — раздавать этот каталог по HTTP как обычные файлы.
 //! Ни базы, ни скриптов: система читает три файла и проверяет подписи сама.
@@ -28,6 +35,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use osupdate::drivers;
 use osupdate::index::build::{Offer, hash, render, render_signature};
 
 use crate::arch::Arch;
@@ -118,7 +126,87 @@ pub fn build(builds: &[&build::Built], version: &str, dir: &Path) -> Result<Path
         .with_context(|| format!("не удалось записать {}", sig_path.display()))?;
 
     say!("репозиторий: {} и {}", index_path.display(), sig_path.display());
+    build_drivers(builds, dir)?;
     Ok(dir.to_path_buf())
+}
+
+/// Собрать каталог драйверов: пакеты-драйверы всех собранных архитектур,
+/// `drivers` и `drivers.sig`.
+///
+/// Запись каталога составляется из **манифеста** пакета, а не из второго
+/// списка рядом: имя, версия и устройства берутся оттуда же, откуда их потом
+/// прочитает `pkg` на машине. Разойдись каталог с пакетом, `drvd` скачал бы
+/// драйвер, который после установки не назвал бы устройства.
+pub fn build_drivers(builds: &[&build::Built], dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("не удалось создать каталог {}", dir.display()))?;
+
+    struct Record {
+        drives: String,
+        arch: &'static str,
+        package: String,
+        version: String,
+        file: String,
+        size: u64,
+        sha256: [u8; 32],
+    }
+    let mut records: Vec<Record> = Vec::new();
+    for built in builds {
+        let arch = built.arch.name();
+        for bytes in package::drivers(built.arch, built.release)? {
+            let header = fpk::Header::parse(&bytes)
+                .map_err(|err| anyhow::anyhow!("пакет-драйвер не разбирается: {err:?}"))?;
+            let start = header.manifest_offset() as usize;
+            let manifest_bytes = &bytes[start..start + header.manifest_len as usize];
+            let manifest = fpk::Manifest::parse(&header, manifest_bytes)
+                .map_err(|err| anyhow::anyhow!("манифест пакета-драйвера не разбирается: {err:?}"))?;
+            let name = manifest.name().map_err(|err| anyhow::anyhow!("{err:?}"))?;
+            let version = manifest.version().map_err(|err| anyhow::anyhow!("{err:?}"))?;
+            let Some(drives) = manifest.field("drives") else {
+                anyhow::bail!("пакет {name} попал в каталог драйверов, но не называет устройств (drives=)");
+            };
+            if manifest.drives().any(|drive| drive.is_none()) {
+                anyhow::bail!("пакет {name}: поле drives= не разбирается как vendor:device");
+            }
+            let file = format!("{name}-{version}-{arch}.fpk");
+            let target = dir.join(&file);
+            fs::write(&target, &bytes)
+                .with_context(|| format!("не удалось записать {}", target.display()))?;
+            say!("каталог драйверов: {} ({} байт)", target.display(), bytes.len());
+            records.push(Record {
+                drives: drives.to_string(),
+                arch,
+                package: name.to_string(),
+                version: version.to_string(),
+                file,
+                size: bytes.len() as u64,
+                sha256: hash(&bytes),
+            });
+        }
+    }
+
+    let offers: Vec<drivers::build::Offer<'_>> = records
+        .iter()
+        .map(|record| drivers::build::Offer {
+            drives: &record.drives,
+            arch: record.arch,
+            package: &record.package,
+            version: &record.version,
+            file: &record.file,
+            size: record.size,
+            sha256: record.sha256,
+        })
+        .collect();
+    let path = dir.join(drivers::FILE);
+    fs::write(&path, drivers::build::render(&offers).as_bytes())
+        .with_context(|| format!("не удалось записать {}", path.display()))?;
+    // Подпись — по записанным байтам, как у индекса.
+    let signature = keys::sign_catalogue(&fs::read(&path)?)?;
+    let sig_path = dir.join(drivers::SIGNATURE_FILE);
+    fs::write(&sig_path, drivers::build::render_signature(&signature).as_bytes())
+        .with_context(|| format!("не удалось записать {}", sig_path.display()))?;
+    say!("каталог драйверов: {} и {}", path.display(), sig_path.display());
+    Ok(())
 }
 
 /// Сделать рядом репозиторий, индекс которого подписан **чужим** ключом.
@@ -157,6 +245,24 @@ pub fn build_untrusted(good: &Path, version: &str, arch: Arch, dir: &Path) -> Re
     fs::write(&index_path, index.as_bytes())?;
     let signature = keys::sign_index_with_stranger(&fs::read(&index_path)?)?;
     fs::write(dir.join("index.sig"), render_signature(&signature).as_bytes())?;
+
+    // И каталог драйверов с той же чужой подписью (Д4): отказать обязан
+    // `sysupdate driver`, до того как качать пакет. Пакеты копируются из
+    // годного каталога — дело до них не дойдёт, но отказ должен случиться из-за
+    // подписи, а не из-за «нет такого файла».
+    let catalogue = fs::read(good.join(drivers::FILE)).with_context(|| {
+        format!("годный каталог драйверов обязан быть собран раньше: нет {}", good.join(drivers::FILE).display())
+    })?;
+    let text = String::from_utf8_lossy(&catalogue).into_owned();
+    for line in text.lines() {
+        if let Some(file) = line.strip_prefix("file=") {
+            fs::copy(good.join(file), dir.join(file))
+                .with_context(|| format!("не удалось скопировать {file} в чужой репозиторий"))?;
+        }
+    }
+    fs::write(dir.join(drivers::FILE), &catalogue)?;
+    let signature = keys::sign_catalogue_with_stranger(&catalogue)?;
+    fs::write(dir.join(drivers::SIGNATURE_FILE), drivers::build::render_signature(&signature).as_bytes())?;
     say!("стенд: рядом положен репозиторий с чужой подписью индекса ({})", dir.display());
     Ok(dir.to_path_buf())
 }

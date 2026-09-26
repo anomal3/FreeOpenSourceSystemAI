@@ -545,6 +545,21 @@ fn remove_package(name: &str) -> i64 {
     root.truncate(base);
     remove(root.as_str());
 
+    // Файл остался — запись реестра остаётся тоже. Стёртая, она сделала бы
+    // пакет «не установленным», а поставить его заново не дал бы оставшийся
+    // каталог: машина застряла бы между двумя состояниями. Так случалось с
+    // драйвером, который поставил `drvd` от root, а снять пытался человек.
+    if failed != 0 {
+        Line::new()
+            .str("pkg: ")
+            .str(name)
+            .str(" stays installed: ")
+            .num(failed)
+            .str(" file(s) could not be removed")
+            .end();
+        return 1;
+    }
+
     let mut registry = registry_of(name);
     if remove(registry.as_str()) < 0 {
         println("pkg: the files are gone but the registry entry stayed");

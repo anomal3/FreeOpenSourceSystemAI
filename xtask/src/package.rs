@@ -115,13 +115,6 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     let edudrv = build::packaged_program(arch, release, "edudrv")?;
     let edudrv_bytes = fs::read(&edudrv)
         .with_context(|| format!("не удалось прочитать {}", edudrv.display()))?;
-    let mut edu = Builder::new(Kind::Package, "edu", "1.0");
-    edu.field("summary", "A driver for the QEMU edu card, run as a program");
-    edu.field("permissions", "devices");
-    edu.field("drives", "1234:11e8");
-    // Какую программу запускать для устройства — её ищет `drvd` (Д3).
-    edu.field("driver", "bin/edudrv");
-    edu.file(&Entry { path: String::from("bin/edudrv"), mode: 0o755, uid: 0, gid: 0, data: edudrv_bytes.clone() });
 
     // Тот же драйвер без права `devices`: ради проверки, что право — это то,
     // что даёт устройство, а не то, что о нём пишут в манифесте.
@@ -134,10 +127,7 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     edu_raw.field("summary", "The edu driver asking for devices without a signature");
     edu_raw.field("permissions", "devices");
     edu_raw.file(&Entry { path: String::from("bin/edudrv"), mode: 0o755, uid: 0, gid: 0, data: edudrv_bytes });
-    // Драйвер с правом на устройство подписывается рабочим ключом — тем же, что
-    // обновления системы.
-    let mut edu_bytes = edu.finish();
-    crate::keys::sign(&mut edu_bytes, &crate::keys::release()?);
+    let edu_bytes = edu_driver(arch, release)?;
 
     let dir = output_dir();
     fs::create_dir_all(&dir)
@@ -159,6 +149,34 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
         built.push(Package { file_name: String::from(file_name), path });
     }
     Ok(built)
+}
+
+/// Пакет-драйвер учебной карты QEMU `edu`, подписанный рабочим ключом.
+///
+/// Один на носитель (`/media/edu-1.0.fpk`) и на каталог драйверов в
+/// репозитории (Д4): два сборщика одного пакета однажды разошлись бы полем
+/// манифеста, и `drvd` находил бы по сети не то, что на носителе.
+pub fn edu_driver(arch: Arch, release: bool) -> Result<Vec<u8>> {
+    let edudrv = build::packaged_program(arch, release, "edudrv")?;
+    let edudrv_bytes = fs::read(&edudrv)
+        .with_context(|| format!("не удалось прочитать {}", edudrv.display()))?;
+    let mut edu = Builder::new(Kind::Package, "edu", "1.0");
+    edu.field("summary", "A driver for the QEMU edu card, run as a program");
+    edu.field("permissions", "devices");
+    edu.field("drives", "1234:11e8");
+    // Какую программу запускать для устройства — её ищет `drvd` (Д3).
+    edu.field("driver", "bin/edudrv");
+    edu.file(&Entry { path: String::from("bin/edudrv"), mode: 0o755, uid: 0, gid: 0, data: edudrv_bytes });
+    // Драйвер с правом на устройство подписывается рабочим ключом — тем же, что
+    // обновления системы (Д2).
+    let mut bytes = edu.finish();
+    crate::keys::sign(&mut bytes, &crate::keys::release()?);
+    Ok(bytes)
+}
+
+/// Пакеты-драйверы, которые уезжают в каталог драйверов репозитория (Д4).
+pub fn drivers(arch: Arch, release: bool) -> Result<Vec<Vec<u8>>> {
+    Ok(vec![edu_driver(arch, release)?])
 }
 
 /// Содержимое текстового файла в пакете `hello`.

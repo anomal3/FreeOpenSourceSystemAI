@@ -130,8 +130,9 @@ fn class_name(class: u8, subclass: u8, prog_if: u8) -> &'static str {
 /// Состояния: `active` — драйвер поднял устройство; `idle` — драйвер для
 /// такого устройства в ядре есть, но этим устройством он не занят (второй
 /// контроллер, адаптер экрана до первой смены режима, устройство, которое не
-/// поднялось); `none` — драйвера нет; `not-needed` — мосты: их настраивает
-/// прошивка, и «нет драйвера» у них означало бы тревогу на ровном месте.
+/// поднялось); `none` — драйвера нет; `not-needed` — мосты и SMBus: их
+/// настраивает прошивка, и «нет драйвера» у них означало бы тревогу на ровном
+/// месте.
 fn driver_for(device: &pci::Device) -> (&'static str, &'static str) {
     if let Some(driver) = claimed(device.address) {
         return (driver, "active");
@@ -162,6 +163,12 @@ fn driver_for(device: &pci::Device) -> (&'static str, &'static str) {
         Some("ehci") if crate::usb::ehci::summary().is_some() => ("ehci", "active"),
         Some(driver) => (driver, "idle"),
         None if device.class == 0x06 => ("-", "not-needed"),
+        // Контроллер SMBus (`0c:05`): через него читают датчики и SPD памяти,
+        // а системе он не нужен ни для чего. «Нет драйвера» у него — тревога
+        // на ровном месте, и хуже: служба `drvd` на каждой загрузке спрашивала
+        // бы о нём репозиторий (Д4). На x86-64 стенда это ICH9 `8086:2930`,
+        // и спрашивала бы она настоящий сервер из каждого сетевого сценария.
+        None if device.class == 0x0C && device.subclass == 0x05 => ("-", "not-needed"),
         None => ("-", "none"),
     }
 }
