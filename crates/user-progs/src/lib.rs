@@ -30,6 +30,8 @@ extern crate alloc;
 pub mod http;
 /// Каркас программы с окном: окно, цикл событий, тема (фаза С8).
 pub mod app;
+/// Стартовый код позиционно-независимой программы: перемещения до `_start`.
+mod start;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;

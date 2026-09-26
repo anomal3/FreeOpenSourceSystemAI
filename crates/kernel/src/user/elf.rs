@@ -6,10 +6,14 @@
 //! читаются: таблица секций (она нужна компоновщику, а не загрузчику), символы,
 //! отладочная информация, динамические таблицы и релокации.
 //!
-//! Релокаций нет не по недосмотру: программа собрана как `ET_EXEC` по
-//! фиксированному адресу, и переносить в ней нечего. Загрузка по произвольному
-//! адресу (`ET_DYN`) потребовала бы разбора `.rela.dyn` — и появится вместе с
-//! отдельным адресным пространством, где в этом будет смысл.
+//! Файл бывает двух видов. `ET_EXEC` собран под свой адрес, и кладётся туда.
+//! `ET_DYN` — позиционно-независимая программа (ASLR, часть 2): собрана от
+//! нуля, и ядро выбирает ей место само; все адреса сегментов и точка входа
+//! сдвигаются на одно и то же число. Перемещения внутри образа ядро **не**
+//! применяет — это делает стартовый код программы (`user_progs::start`), потому
+//! что страницы образа читаются по обращению и при запуске их у ядра нет.
+//! Программа, которой нужен динамический загрузчик (`PT_INTERP`), отвергается:
+//! загрузчика у системы нет.
 //!
 //! # Данные здесь недоверенные
 //!
@@ -28,8 +32,10 @@ const MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const CLASS_64: u8 = 2;
 /// Порядок байт: младший первым.
 const DATA_LE: u8 = 1;
-/// Тип файла: исполняемый.
+/// Тип файла: исполняемый по своему адресу.
 const TYPE_EXEC: u16 = 2;
+/// Тип файла: позиционно-независимый (у статической PIE — тоже он).
+const TYPE_DYN: u16 = 3;
 
 /// Машина, для которой собран файл.
 #[cfg(target_arch = "x86_64")]
@@ -39,6 +45,8 @@ const MACHINE: u16 = 183;
 
 /// Тип заголовка программы: загружаемый сегмент.
 const PT_LOAD: u32 = 1;
+/// Путь к динамическому загрузчику.
+const PT_INTERP: u32 = 3;
 
 /// Биты `p_flags` program header'а. Порядок обратен привычному по `readelf`
 /// написанию «RWX» и обратен конвенции [`boot_info`] — см. [`Segment::flags`].
@@ -67,6 +75,8 @@ pub enum ElfError {
     BadSegment,
     /// Сегментов, которые нужно загрузить, в файле нет.
     NoSegments,
+    /// Программе нужен динамический загрузчик, а его у системы нет.
+    NeedsInterpreter,
 }
 
 impl fmt::Display for ElfError {
@@ -80,6 +90,9 @@ impl fmt::Display for ElfError {
             Self::OutOfWindow => f.write_str("a segment falls outside the program window"),
             Self::BadSegment => f.write_str("a program header contradicts itself"),
             Self::NoSegments => f.write_str("the file has no loadable segments"),
+            Self::NeedsInterpreter => {
+                f.write_str("the program asks for a dynamic loader, and this system has none")
+            }
         }
     }
 }
@@ -136,6 +149,8 @@ pub struct Image<'a> {
     bytes: &'a [u8],
     file_len: usize,
     pub entry: usize,
+    /// Позиционно-независимая (`ET_DYN`): место ей выбирает ядро.
+    pub position_independent: bool,
     /// Смещение таблицы заголовков программы и её геометрия.
     phoff: usize,
     phentsize: usize,
@@ -157,7 +172,7 @@ impl<'a> Image<'a> {
         }
         let kind = u16(bytes, 16);
         let machine = u16(bytes, 18);
-        if kind != TYPE_EXEC || machine != MACHINE {
+        if (kind != TYPE_EXEC && kind != TYPE_DYN) || machine != MACHINE {
             return Err(ElfError::Unsupported);
         }
 
@@ -177,7 +192,47 @@ impl<'a> Image<'a> {
             return Err(ElfError::Truncated);
         }
 
-        Ok(Self { bytes, file_len, entry, phoff, phentsize, phnum })
+        for index in 0..phnum {
+            if u32(bytes, phoff + index * phentsize) == PT_INTERP {
+                return Err(ElfError::NeedsInterpreter);
+            }
+        }
+
+        Ok(Self {
+            bytes,
+            file_len,
+            entry,
+            position_independent: kind == TYPE_DYN,
+            phoff,
+            phentsize,
+            phnum,
+        })
+    }
+
+    /// Охват образа: наименьший адрес и конец наибольшего сегмента — так, как
+    /// их записал компоновщик. Нужен, чтобы выбрать место позиционно-независимой
+    /// программе: образ целиком обязан лечь в окно.
+    pub fn span(&self) -> Result<(usize, usize), ElfError> {
+        let mut low = usize::MAX;
+        let mut high = 0usize;
+        for index in 0..self.phnum {
+            let at = self.phoff + index * self.phentsize;
+            if u32(self.bytes, at) != PT_LOAD {
+                continue;
+            }
+            let vaddr = u64(self.bytes, at + 16) as usize;
+            let memsz = u64(self.bytes, at + 40) as usize;
+            if memsz == 0 {
+                continue;
+            }
+            let end = vaddr.checked_add(memsz).ok_or(ElfError::BadSegment)?;
+            low = low.min(vaddr);
+            high = high.max(end);
+        }
+        if high == 0 {
+            return Err(ElfError::NoSegments);
+        }
+        Ok((low, high))
     }
 
     /// Перебрать загружаемые сегменты.
@@ -185,9 +240,14 @@ impl<'a> Image<'a> {
     /// `window` — диапазон адресов, в который программе разрешено попадать.
     /// Проверка здесь, а не у вызывающего: сегмент, вылезший за окно, — это
     /// запись мимо отведённой памяти, и обнаружить её надо до записи.
+    ///
+    /// `bias` прибавляется к адресу каждого сегмента **до** проверки окна: у
+    /// позиционно-независимой программы это выбранное ядром место, у обычной —
+    /// ноль.
     pub fn segments(
         &self,
         window: (usize, usize),
+        bias: usize,
     ) -> impl Iterator<Item = Result<Segment, ElfError>> + '_ {
         (0..self.phnum).filter_map(move |index| {
             let at = self.phoff + index * self.phentsize;
@@ -198,7 +258,9 @@ impl<'a> Image<'a> {
 
             let flags = u32(bytes, at + 4);
             let file_offset = u64(bytes, at + 8) as usize;
-            let vaddr = u64(bytes, at + 16) as usize;
+            let Some(vaddr) = (u64(bytes, at + 16) as usize).checked_add(bias) else {
+                return Some(Err(ElfError::OutOfWindow));
+            };
             let filesz = u64(bytes, at + 32) as usize;
             let memsz = u64(bytes, at + 40) as usize;
 

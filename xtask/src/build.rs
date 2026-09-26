@@ -378,17 +378,26 @@ pub fn build_user_programs(arch: Arch, release: bool) -> Result<Vec<PathBuf>> {
     // по символу `__stack_chk_guard`, который `user.ld` ставит на страницу
     // процесса (`user_abi::PROCESS_PAGE`); падение зовёт `__stack_chk_fail`
     // из `user_progs`. Флаг нестабильный, но и сборка вся на nightly.
+    //
+    // Программа — позиционно-независимая (ASLR, часть 2): `pie` для кода,
+    // `--defsym=__freeos_pie=1` переключает `user.ld` на компоновку от нуля,
+    // вход — `__freeos_entry` из `user_progs`, который применяет перемещения
+    // и только потом зовёт `_start` программы. `-u` держит этот символ в сборке:
+    // без ссылки на него компоновщик вправе не взять его из библиотеки.
     let mut flags = format!(
         "-C link-arg=-T{} -C link-arg=-z -C link-arg=max-page-size=0x1000 \
-         -C relocation-model=static -C strip=debuginfo -Z stack-protector=strong",
+         -C relocation-model=pie -C link-arg=--defsym=__freeos_pie=1 \
+         -C link-arg=-e -C link-arg=__freeos_entry -C link-arg=-u -C link-arg=__freeos_entry \
+         -C strip=debuginfo -Z stack-protector=strong",
         script.display()
     );
     if arch == Arch::X86_64 {
-        // Большая модель кода: обращения к своим же данным по абсолютному
-        // 64-битному адресу. На AArch64 этого не нужно — там адрес собирается
-        // парой `adrp`/`add` относительно счётчика команд, и абсолютное
-        // положение программы значения не имеет.
-        flags.push_str(" -C code-model=large");
+        // Модель кода — обычная, малая. Большая стояла здесь, пока программа
+        // жила по абсолютному адресу 512 ГиБ: малая модель берёт адреса
+        // 32-битными числами со знаком, а 512 ГиБ в них не помещаются. У
+        // позиционно-независимой программы адреса относительны счётчика
+        // команд, и образ меньше гигабайта; эталон канарейки, лежащий по
+        // абсолютному адресу, берётся через GOT.
         // Векторные регистры программе разрешены — с Phase 29a ядро сохраняет
         // их при переключении задач. Таргет `x86_64-unknown-none` объявляет
         // `-sse,+soft-float`, то есть запрещает компилятору их использовать
@@ -403,6 +412,12 @@ pub fn build_user_programs(arch: Arch, release: bool) -> Result<Vec<PathBuf>> {
         // векторного backend'а у этого крейта нет вовсе, и до сих пор две
         // машины считали одну и ту же подпись разным кодом.
         flags.push_str(" --cfg curve25519_dalek_backend=\"serial\"");
+    }
+    if arch == Arch::Aarch64 {
+        // У `aarch64-unknown-none` статическая PIE не объявлена, и `rustc` сам
+        // `-pie` компоновщику не передаёт: без этой строки программа выходит
+        // обычной `ET_EXEC` без `_DYNAMIC`, и стартовый код не компонуется.
+        flags.push_str(" -C link-arg=-pie");
     }
     cmd.env("RUSTFLAGS", flags);
 

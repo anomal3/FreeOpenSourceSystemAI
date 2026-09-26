@@ -1799,6 +1799,30 @@ struct Loaded {
     mappings: Vec<Mapping>,
 }
 
+/// Выбрать место позиционно-независимой программе (ASLR, часть 2).
+///
+/// Случайная страница в окне образа, такая, чтобы образ поместился целиком.
+/// У гигабайтного окна и образа в несколько мегабайт это восемнадцать бит — и
+/// именно здесь ASLR начинает мешать тому, против чего он придуман: цепочке
+/// возвратов, собранной из кусков кода по известным адресам.
+///
+/// Возвращает число, которое прибавляется к каждому адресу из файла.
+fn image_bias(image: &elf::Image<'_>) -> Result<usize, Error> {
+    let (low, high) = image.span().map_err(Error::Elf)?;
+    let low = low & !(PAGE_SIZE - 1);
+    let span = (high - low).next_multiple_of(PAGE_SIZE);
+    if span > IMAGE_LIMIT_BYTES {
+        return Err(Error::Elf(elf::ElfError::OutOfWindow));
+    }
+    let slots = (IMAGE_LIMIT_BYTES - span) / PAGE_SIZE + 1;
+    let mut bytes = [0u8; 8];
+    crate::random::fill(&mut bytes);
+    let page = (u64::from_le_bytes(bytes) as usize) % slots;
+    (WINDOW_BASE + page * PAGE_SIZE)
+        .checked_sub(low)
+        .ok_or(Error::Elf(elf::ElfError::OutOfWindow))
+}
+
 /// Разложить программу по её адресному пространству и вернуть точку входа.
 ///
 /// «Разложить» с фазы 54 значит записать сегменты в таблицу областей: ни одна
@@ -1815,6 +1839,7 @@ fn load(
     stack_top: usize,
 ) -> Result<Loaded, Error> {
     let image = elf::Image::parse(header, file_len).map_err(Error::Elf)?;
+    let bias = if image.position_independent { image_bias(&image)? } else { 0 };
 
     // Сегменты по возрастанию адреса. Права уже в понятиях страниц.
     struct Seg {
@@ -1825,7 +1850,7 @@ fn load(
         flags: PageFlags,
     }
     let mut segs: Vec<Seg> = Vec::new();
-    for segment in image.segments((WINDOW_BASE, WINDOW_BASE + IMAGE_LIMIT_BYTES)) {
+    for segment in image.segments((WINDOW_BASE, WINDOW_BASE + IMAGE_LIMIT_BYTES), bias) {
         let segment = segment.map_err(Error::Elf)?;
         let flags = PageFlags::from_segment_flags(segment.flags).union(PageFlags::USER);
         // Проверка до первой записи в таблицу, а не в отказе страницы:
@@ -2027,7 +2052,8 @@ fn load(
         return Err(Error::Map(err));
     }
 
-    Ok(Loaded { entry: image.entry, stack_top_frame, mappings })
+    let entry = image.entry.checked_add(bias).ok_or(Error::Elf(elf::ElfError::OutOfWindow))?;
+    Ok(Loaded { entry, stack_top_frame, mappings })
 }
 
 /// Напечатать то, ради чего фаза затевалась: где лежит программа и чего о ней

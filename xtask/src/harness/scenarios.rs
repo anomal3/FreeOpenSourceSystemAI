@@ -3224,7 +3224,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "aslr",
-        about: "Стек и память по запросу у каждого запуска программы лежат по своим адресам.",
+        about: "Стек, память по запросу и сам код у каждого запуска программы лежат по своим адресам.",
         target: Target::Live,
         usb_only: false,
         tablet: false,
@@ -3268,6 +3268,16 @@ pub const ALL: &[Scenario] = &[
             Step::Capture2("mmap at ", 30_000),
             Step::Await("/bin/peek: exited with code 0", 30_000),
             Step::Differ("начало памяти по запросу"),
+            // Код программы (ASLR, часть 2): программа на Rust собрана
+            // позиционно-независимой, и ядро кладёт её на случайную страницу
+            // гигабайтного окна — восемнадцать бит.
+            Step::Line("run /bin/peek layout"),
+            Step::Capture("image at ", 30_000),
+            Step::Await("/bin/peek: exited with code 0", 30_000),
+            Step::Line("run /bin/peek layout"),
+            Step::Capture2("image at ", 30_000),
+            Step::Await("/bin/peek: exited with code 0", 30_000),
+            Step::Differ("адрес кода программы"),
             // Сдвиг ничего не отнял: 256 МиБ по запросу выдаются по-прежнему.
             // Выше любого случайного начала остаётся не меньше 448 МиБ, а не
             // нашлось бы там — поиск пошёл бы с начала области.
