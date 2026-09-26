@@ -119,6 +119,8 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     edu.field("summary", "A driver for the QEMU edu card, run as a program");
     edu.field("permissions", "devices");
     edu.field("drives", "1234:11e8");
+    // Какую программу запускать для устройства — её ищет `drvd` (Д3).
+    edu.field("driver", "bin/edudrv");
     edu.file(&Entry { path: String::from("bin/edudrv"), mode: 0o755, uid: 0, gid: 0, data: edudrv_bytes.clone() });
 
     // Тот же драйвер без права `devices`: ради проверки, что право — это то,

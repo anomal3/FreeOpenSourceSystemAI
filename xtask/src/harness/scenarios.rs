@@ -1543,8 +1543,9 @@ pub const ALL: &[Scenario] = &[
             // Сорок одна: веб-сервер (`httpd`) и Lua (пункты 4 и 5 очереди
             // второго разбора). `zdemo` и `lua` собираются только там, где
             // выполнена `cargo xtask thirdparty`, и без неё здесь будет 39.
-            // Сорок две: прибавилась `threads` (фаза 55b).
-            Step::Expect("/bin holds 42 programs"),
+            // Сорок две: прибавилась `threads` (фаза 55b). Сорок три — `drvd`
+            // (веха «драйверы», Д3).
+            Step::Expect("/bin holds 43 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -4033,34 +4034,28 @@ pub const ALL: &[Scenario] = &[
         // обрезает адреса DMA до 28 бит, а окно DMA ядра лежит где придётся.
         extra: &["-device", "edu,dma_mask=0xffffffffffffffff"],
         steps: &[
-            Step::Await("freeos> ", BOOT),
-            // Уборка за прошлым прогоном: диск цепочки переживает прогоны.
-            // Отказ не проверяется — на свежей системе удалять нечего.
-            Step::Line("run /bin/pkg remove edu"),
-            Step::Await("freeos> ", 30_000),
-            Step::Line("run /bin/pkg remove edu-nodev"),
-            Step::Await("freeos> ", 30_000),
-            // Перепись шины: карта есть, драйвера в ядре нет.
-            Step::Line("pci"),
-            Step::Await("1234:11e8", 15_000),
-            Step::Await("NO DRIVER IN THIS KERNEL", 15_000),
-            // Драйвер приходит пакетом, и пакет просит право на устройство.
-            Step::Line("run /bin/pkg install /media/edu-1.0.fpk"),
+            // Никто ничего не ставит руками (Д3): служба `drvd` при загрузке
+            // видит карту без драйвера, находит на `/media` пакет, который её
+            // называет, ставит его (`pkg` проверяет подпись) и запускает
+            // драйвер. Порядок строк с приглашением оболочки не определён,
+            // поэтому до приглашения — ожидания, а не строки оболочки.
+            Step::Await("drvd: 1234:11e8 is driven by /media/edu-1.0.fpk; installing it", BOOT),
             Step::Await("pkg: installed edu 1.0", 60_000),
-            Step::Await("pkg: edu may use devices", 15_000),
-            // Пакет называет, что он обслуживает, — по этому его найдёт `drvd`.
-            Step::Expect("pkg: edu drives 1234:11e8"),
-            Step::Line("run /opt/edu/bin/edudrv"),
+            // Строки `pkg` — где угодно в выводе: печатает он их вперемежку с
+            // `drvd` и службами, и `Expect` сразу после ожидания опаздывал бы.
+            Step::AwaitAny("pkg: edu drives 1234:11e8", 30_000),
+            Step::AwaitAny("pkg: edu may use devices", 30_000),
+            Step::Await("drvd: started /opt/edu/bin/edudrv for 1234:11e8", 30_000),
             Step::Await("given to", 30_000),
             Step::Await("edudrv: card version 1.0, registers answer", 30_000),
             // Прерывание дошло до программы: она спала, а не опрашивала.
             Step::Await("edudrv: 10! = 3628800 by interrupt", 30_000),
             // Физический адрес от ядра верен: карта прочитала и записала туда.
             Step::Await("edudrv: 64 bytes went to the card and back by DMA", 30_000),
-            // Устройство отдаётся на пути выхода — раньше, чем оболочка узнает
-            // код возврата.
+            // Устройство отдаётся на пути выхода программы.
             Step::Await("is free again", 15_000),
-            Step::Await("/opt/edu/bin/edudrv: exited with code 0", 30_000),
+            // Приглашение могло появиться раньше, чем `drvd` закончил.
+            Step::AwaitAny("freeos> ", BOOT),
             Step::Line("irq driver0"),
             Step::Await("driver0 woke the system", 15_000),
             // Второй запуск: место, вектор и карта отданы и берутся заново.
@@ -4080,6 +4075,8 @@ pub const ALL: &[Scenario] = &[
             // Уборка: сценарий `pkg` дальше по цепочке считает пакеты на диске.
             Step::Line("run /bin/pkg remove edu-nodev"),
             Step::Await("freeos> ", 30_000),
+            // `edu` поставил `drvd`; снимаем, чтобы следующий прогон цепочки
+            // снова шёл через `/media`, а `pkg` дальше считал свои пакеты.
             Step::Line("run /bin/pkg remove edu"),
             Step::Await("freeos> ", 30_000),
             Step::Line("exit"),
