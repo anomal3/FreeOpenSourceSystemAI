@@ -115,6 +115,7 @@ pub fn link(objects: &[PathBuf], libs: &[PathBuf], output: &Path) -> Result<()> 
         .arg(&script)
         .arg("-z")
         .arg("max-page-size=0x1000")
+        .args(freeos_cc::LINK_PIE)
         // Отладочную информацию выбрасываем здесь же, а не отдельным шагом:
         // ядро читает файл программы целиком в кучу, прежде чем разобрать
         // заголовки, и сегмент, уехавший за предел чтения, выглядел бы как
@@ -125,6 +126,27 @@ pub fn link(objects: &[PathBuf], libs: &[PathBuf], output: &Path) -> Result<()> 
     cmd.args(objects);
     cmd.args(libs);
     run(cmd, &format!("ld.lld -> {}", output.display()))
+}
+
+/// Собрать файл на ассемблере.
+///
+/// Отдельно от [`compile`]: флаги C здесь не к месту, а `-Werror` превращает
+/// каждый неиспользованный (`-O2`, `-D…`, `-nostdinc`) в отказ сборки.
+pub fn assemble(arch: Arch, source: &Path, object: &Path) -> Result<()> {
+    let clang = llvm_tool("clang")?;
+    if let Some(parent) = object.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut cmd = Command::new(&clang);
+    cmd.arg(format!("--target={}", freeos_cc::triple(c_target(arch))));
+    cmd.arg("-c").arg(source).arg("-o").arg(object);
+    run(cmd, &format!("clang {}", source.display()))
+}
+
+/// Стартовый код позиционно-независимой программы — общий с Rust (см.
+/// `crates/user-progs/src/start.rs`).
+pub fn start_source(arch: Arch) -> PathBuf {
+    libc_dir().join("freeos").join(format!("start-{}.s", arch.name()))
 }
 
 /// Программа на C, которая едет в `/bin`.
@@ -259,6 +281,21 @@ pub fn toolchain() -> Result<()> {
             .arg("--destdir")
             .arg(sysroot(arch));
         run(cmd, &format!("meson install {}", arch.name()))?;
+
+        // Канарейка стека у нас своя: эталон лежит в странице процесса (символ
+        // ставит `user.ld`), падение ловит `crt0.c`. Объектник picolibc с тем же
+        // назначением вреден дважды. Его конструктор `__stack_chk_init` пишет в
+        // эталон — то есть в страницу только на чтение, и программа снималась
+        // бы до `main`. А в позиционно-независимой программе он и не
+        // компонуется: обращается к эталону относительно счётчика команд, до
+        // абсолютного адреса страницы процесса не дотягивается. Вытаскивает
+        // его любая ссылка на `__stack_chk_guard` — определение в сценарии
+        // компоновки извлечения из архива не останавливает (так нашлось
+        // 26.09.2026, при переходе на PIE). Поэтому его в архиве нет.
+        let archive = sysroot(arch).join("lib").join("libc.a");
+        let mut cmd = Command::new(llvm_tool("llvm-ar")?);
+        cmd.arg("d").arg(&archive).arg("libc_ssp_stack_protector.c.o");
+        run(cmd, &format!("llvm-ar d {}", archive.display()))?;
     }
     Ok(())
 }
@@ -494,6 +531,10 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
         compile(arch, &source, &object, &includes)?;
         common.push(object);
     }
+    // Вход позиционно-независимой программы: перемещения до `_start`.
+    let start = work.join("start.o");
+    assemble(arch, &start_source(arch), &start)?;
+    common.push(start);
 
     let mut built = Vec::new();
     for program in &C_PROGRAMS {

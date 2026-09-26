@@ -130,13 +130,29 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
     fs::create_dir_all(&work)?;
     let includes = vec![include.clone(), cbuild::libc_dir().join("freeos")];
 
-    let crt0 = work.join("crt0.o");
+    // `crt0.o` — это `crt0.c` и вход позиционно-независимой программы
+    // (`start-<арх>.s`), склеенные в один объектник: компоновщику чужого
+    // проекта отдаётся ровно один стартовый файл, и так он получает оба.
+    let crt0_c = work.join("crt0-c.o");
     cbuild::compile(
         arch,
         &cbuild::libc_dir().join("freeos/crt0.c"),
-        &crt0,
+        &crt0_c,
         &includes,
     )?;
+    let start = work.join("start.o");
+    cbuild::assemble(arch, &cbuild::start_source(arch), &start)?;
+    let crt0 = work.join("crt0.o");
+    let status = Command::new(cbuild::llvm_tool("ld.lld")?)
+        .arg("-r")
+        .arg(&crt0_c)
+        .arg(&start)
+        .arg("-o")
+        .arg(&crt0)
+        .status()?;
+    if !status.success() {
+        bail!("ld.lld -r не склеил crt0.o: {status}");
+    }
     copy(&crt0, &lib.join("crt0.o"))?;
 
     let syscalls = work.join("syscalls.o");
