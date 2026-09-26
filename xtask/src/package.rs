@@ -118,13 +118,24 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     let mut edu = Builder::new(Kind::Package, "edu", "1.0");
     edu.field("summary", "A driver for the QEMU edu card, run as a program");
     edu.field("permissions", "devices");
+    edu.field("drives", "1234:11e8");
     edu.file(&Entry { path: String::from("bin/edudrv"), mode: 0o755, uid: 0, gid: 0, data: edudrv_bytes.clone() });
 
     // Тот же драйвер без права `devices`: ради проверки, что право — это то,
     // что даёт устройство, а не то, что о нём пишут в манифесте.
     let mut edu_nodev = Builder::new(Kind::Package, "edu-nodev", "1.0");
     edu_nodev.field("summary", "The edu driver without the right to a device");
-    edu_nodev.file(&Entry { path: String::from("bin/edudrv"), mode: 0o755, uid: 0, gid: 0, data: edudrv_bytes });
+    edu_nodev.file(&Entry { path: String::from("bin/edudrv"), mode: 0o755, uid: 0, gid: 0, data: edudrv_bytes.clone() });
+
+    // И с правом, но без подписи: `pkg` обязан его отвергнуть (Д2).
+    let mut edu_raw = Builder::new(Kind::Package, "edu-raw", "1.0");
+    edu_raw.field("summary", "The edu driver asking for devices without a signature");
+    edu_raw.field("permissions", "devices");
+    edu_raw.file(&Entry { path: String::from("bin/edudrv"), mode: 0o755, uid: 0, gid: 0, data: edudrv_bytes });
+    // Драйвер с правом на устройство подписывается рабочим ключом — тем же, что
+    // обновления системы.
+    let mut edu_bytes = edu.finish();
+    crate::keys::sign(&mut edu_bytes, &crate::keys::release()?);
 
     let dir = output_dir();
     fs::create_dir_all(&dir)
@@ -135,8 +146,9 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
         ("hello-1.0.fpk", hello.finish()),
         ("extra-1.0.fpk", extra.finish()),
         ("winforms-1.0.fpk", winforms.finish()),
-        ("edu-1.0.fpk", edu.finish()),
+        ("edu-1.0.fpk", edu_bytes),
         ("edu-nodev-1.0.fpk", edu_nodev.finish()),
+        ("edu-raw-1.0.fpk", edu_raw.finish()),
     ] {
         let path = dir.join(file_name);
         fs::write(&path, &bytes)

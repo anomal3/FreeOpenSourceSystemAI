@@ -4048,6 +4048,8 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run /bin/pkg install /media/edu-1.0.fpk"),
             Step::Await("pkg: installed edu 1.0", 60_000),
             Step::Await("pkg: edu may use devices", 15_000),
+            // Пакет называет, что он обслуживает, — по этому его найдёт `drvd`.
+            Step::Expect("pkg: edu drives 1234:11e8"),
             Step::Line("run /opt/edu/bin/edudrv"),
             Step::Await("given to", 30_000),
             Step::Await("edudrv: card version 1.0, registers answer", 30_000),
@@ -4072,6 +4074,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await("pkg: edu-nodev may use none", 60_000),
             Step::Line("run /opt/edu-nodev/bin/edudrv"),
             Step::Await("edudrv: cannot take the edu card (-5)", 30_000),
+            // С правом, но без подписи — не ставится вовсе (Д2).
+            Step::Line("run /bin/pkg install /media/edu-raw-1.0.fpk"),
+            Step::Await("pkg: edu-raw asks for the right to devices and is not signed", 60_000),
             // Уборка: сценарий `pkg` дальше по цепочке считает пакеты на диске.
             Step::Line("run /bin/pkg remove edu-nodev"),
             Step::Await("freeos> ", 30_000),
@@ -5977,10 +5982,10 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Wait(1_500),
             Step::Shot("02-choose"),
-            // Список по алфавиту: `edu`, `edu-nodev` (драйверы, веха «драйверы»,
-            // Д1), `extra`, `hello`. Ставим `hello` — `extra` требует его и не
-            // встал бы.
-            Step::Repeat("down", 3),
+            // Список по алфавиту: `edu`, `edu-nodev`, `edu-raw` (драйверы,
+            // веха «драйверы»), `extra`, `hello`. Ставим `hello` — `extra`
+            // требует его и не встал бы.
+            Step::Repeat("down", 4),
             Step::Key("ret"),
             Step::Await("settings    : started '/bin/pkg install /media/hello-1.0.fpk'", 15_000),
             Step::Await("pkg: installed hello 1.0, 2 file(s)", 60_000),

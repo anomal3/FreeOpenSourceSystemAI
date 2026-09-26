@@ -68,7 +68,7 @@ fn layout() -> ! {
         exit(1);
     }
     let region = region as usize;
-    let image = layout as usize;
+    let image = layout as *const () as usize;
 
     // Одной записью: строку, собранную из нескольких, рвут чужие строки
     // (служб, ядра), и стенд находит за «mmap at » не число, а `init: ...`.

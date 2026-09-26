@@ -35,7 +35,8 @@
 #![no_std]
 #![no_main]
 
-use fpk::{Header, Kind, Manifest};
+use fpk::{Header, Kind, Manifest, Rights};
+use osupdate::keys::Trusted;
 use user_progs::{
     Args, Dirent, Line, Path, close, create, exit, file_size, mkdir, open, println,
     read, read_at, readdir, remove, stat, write,
@@ -54,6 +55,9 @@ const REGISTRY: &str = "/var/lib/pkg";
 /// килобайта на нём — это треть всего, что у неё есть, отданная под то, что
 /// живёт от начала работы до конца.
 static mut MANIFEST: [u8; fpk::MAX_MANIFEST] = [0; fpk::MAX_MANIFEST];
+
+/// Доверенные ключи (`/os-keys`) — для пакетов, просящих право `devices`.
+static mut KEYFILE: [u8; 4096] = [0; 4096];
 
 /// Буфер, которым переливается содержимое файлов.
 static mut CHUNK: [u8; 4096] = [0; 4096];
@@ -155,6 +159,32 @@ fn install(path: &str) -> i64 {
             return 1;
         }
     };
+
+    // Право на устройство — только подписанному пакету (веха «драйверы», Д2).
+    // Без IOMMU драйвер с DMA пишет в любую память машины, то есть такой пакет
+    // равен ядру по силе, и верить ему можно ровно настолько, насколько
+    // верят тому, кто подписал систему: ключи те же, `/os-keys`.
+    if rights.contains(Rights::DEVICES) && !signed_by_trusted(fd, &header, manifest.text().as_bytes()) {
+        Line::new()
+            .str("pkg: ")
+            .str(name)
+            .str(" asks for the right to devices and is not signed by a key this system trusts; refusing")
+            .end();
+        close(fd);
+        return 1;
+    }
+    for drive in manifest.drives() {
+        match drive {
+            Some((vendor, device)) => {
+                Line::new().str("pkg: ").str(name).str(" drives ").hex4(vendor).str(":").hex4(device).end();
+            }
+            None => {
+                Line::new().str("pkg: ").str(name).str(" names a device it drives in a form other than vendor:device").end();
+                close(fd);
+                return 1;
+            }
+        }
+    }
 
     // Зависимости проверяются до первой записи: пакет, поставленный наполовину
     // и снесённый обратно, — это две операции там, где достаточно ни одной.
@@ -767,4 +797,34 @@ fn keep<'a>(name: &str, buffer: &'a mut [u8]) -> Option<&'a str> {
     }
     buffer[..name.len()].copy_from_slice(name.as_bytes());
     core::str::from_utf8(&buffer[..name.len()]).ok()
+}
+
+/// Подписан ли пакет ключом, которому верит эта система.
+///
+/// Подписывается заголовок и манифест (`fpk::signed_digest`); нагрузка входит
+/// в подпись через свои SHA-256, записанные в манифесте, — их сверяет разбор
+/// при чтении файлов.
+fn signed_by_trusted(fd: i64, header: &Header, manifest: &[u8]) -> bool {
+    if header.signature_algorithm != fpk::SIGNATURE_ED25519 {
+        return false;
+    }
+    let mut head = [0u8; fpk::HEADER_SIZE];
+    if read_at(fd, 0, &mut head) != fpk::HEADER_SIZE as i64 {
+        return false;
+    }
+    let digest = fpk::signed_digest(&head, manifest);
+    let signature = &header.signature[..usize::from(header.signature_len).min(header.signature.len())];
+
+    let keys = open("/os-keys");
+    if keys < 0 {
+        return false;
+    }
+    // SAFETY: программа однопоточна.
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(KEYFILE) };
+    let got = read(keys, buffer);
+    close(keys);
+    let Ok(text) = core::str::from_utf8(&buffer[..got.max(0) as usize]) else {
+        return false;
+    };
+    Trusted::parse(text).verifies(&digest, signature)
 }

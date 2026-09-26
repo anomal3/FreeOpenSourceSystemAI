@@ -745,6 +745,20 @@ impl Line {
         self.str(unsafe { core::str::from_utf8_unchecked(&digits[start..]) })
     }
 
+    /// Четыре шестнадцатеричные цифры строчными — так пишут идентификаторы
+    /// устройств PCI (`1234:11e8`).
+    pub fn hex4(&mut self, value: u16) -> &mut Self {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let digits = [
+            DIGITS[usize::from(value >> 12)],
+            DIGITS[usize::from((value >> 8) & 0xf)],
+            DIGITS[usize::from((value >> 4) & 0xf)],
+            DIGITS[usize::from(value & 0xf)],
+        ];
+        // SAFETY: в буфер записаны только цифры ASCII.
+        self.str(unsafe { core::str::from_utf8_unchecked(&digits) })
+    }
+
     /// Дописать перевод строки и отдать всё ядру одним вызовом.
     pub fn end(&mut self) {
         self.str("\n");

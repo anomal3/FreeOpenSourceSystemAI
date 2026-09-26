@@ -339,6 +339,20 @@ impl Rights {
     }
 }
 
+/// Разобрать `vendor:device` — два шестнадцатеричных числа по 16 бит.
+///
+/// Одно место на установщик пакетов и на службу, которая ищет драйвер по
+/// устройству: разбери они запись по-разному, пакет ставился бы, а драйвер не
+/// находился.
+#[must_use]
+pub fn parse_drive(text: &str) -> Option<(u16, u16)> {
+    let (vendor, device) = text.split_once(':')?;
+    if vendor.len() != 4 || device.len() != 4 {
+        return None;
+    }
+    Some((u16::from_str_radix(vendor, 16).ok()?, u16::from_str_radix(device, 16).ok()?))
+}
+
 /// Заголовок контейнера — всё, что нужно знать до чтения манифеста.
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
@@ -594,6 +608,14 @@ impl<'a> Manifest<'a> {
     /// Непонятное имя — ошибка, а не пропуск: опечатка в `netwrok` иначе
     /// молча оставила бы пакет без сети, и разбираться с этим пришлось бы по
     /// поведению, а не по отказу установки.
+    /// Устройства, которые обслуживает пакет-драйвер: поле `drives`, пары
+    /// `vendor:device` шестнадцатеричными числами через пробел (`1234:11e8`).
+    /// `None` в итераторе — запись, которую разобрать нельзя: установщик
+    /// обязан отвергнуть такой пакет, а не молча пропустить запись.
+    pub fn drives(&self) -> impl Iterator<Item = Option<(u16, u16)>> + 'a {
+        self.field("drives").unwrap_or("").split_whitespace().map(parse_drive)
+    }
+
     pub fn rights(&self) -> Result<Rights, Error> {
         match self.field("permissions") {
             None => Ok(Rights::NONE),
