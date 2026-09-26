@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Виталий Ардашов (gerzoid), Роман Кощеев (anomal3)
 
-//! Полёт окна в стопку и обратно: анимация сворачивания («джинн»), — и
-//! открытие и закрытие окна на телефоне («рост из плитки»).
+//! Полёт окна в стопку и обратно: анимация сворачивания («джинн»), открытие
+//! и закрытие окна («рост из плитки») и разворачивание на весь экран.
+//!
+//! Всё это — и на телефоне, и на настольной машине. На ПК цель джинна —
+//! кнопка окна на панели задач, а плитка открытия — значок программы на столе.
+//!
+//! # Разворачивание
+//!
+//! Окно перетекает из прежнего прямоугольника в новый, не тая: рисуется уже
+//! новая поверхность, растянутая в промежуточный прямоугольник. Поверхность
+//! к этому времени готова — `Window::resize` перерисовывает её сразу.
 //!
 //! # Открытие и закрытие
 //!
@@ -49,6 +58,10 @@ const DURATION_NS: u64 = 320_000_000;
 /// окно, а не смотрит, куда оно делось.
 const ZOOM_NS: u64 = 240_000_000;
 
+/// Сколько длится разворачивание: ещё короче — окно на месте, меняется лишь
+/// его размер, и следить глазу не за чем, кроме направления.
+const MORPH_NS: u64 = 200_000_000;
+
 /// Как летит окно.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
@@ -56,6 +69,9 @@ pub enum Motion {
     Genie,
     /// Открытие (`restore`) и закрытие окна: рост из плитки и уход в неё.
     Zoom,
+    /// Разворачивание на весь экран и возврат прежнего размера: окно
+    /// перетекает из старого прямоугольника в новый, не тая.
+    Morph,
 }
 
 /// Полёт одного окна.
@@ -89,10 +105,25 @@ impl Flight {
         Self { motion: Motion::Zoom, to: Some(to), ..Self::new(app, from, restore, now_ns) }
     }
 
+    /// Смена размера окна: из `to` (прежнее место) в `from` (новое). Полёт
+    /// идёт «к окну», как у открытия, поэтому `restore`.
+    #[must_use]
+    pub fn morph(app: App, from: Rect, to: Rect, now_ns: u64) -> Self {
+        Self { motion: Motion::Morph, to: Some(to), ..Self::new(app, from, true, now_ns) }
+    }
+
+    /// Прячет ли полёт окно на его месте: пока окно растёт или меняет размер,
+    /// на месте рисуется только летящая копия.
+    #[must_use]
+    pub fn hides_window(&self) -> bool {
+        self.motion != Motion::Genie && self.restore
+    }
+
     const fn duration_ns(&self) -> u64 {
         match self.motion {
             Motion::Genie => DURATION_NS,
             Motion::Zoom => ZOOM_NS,
+            Motion::Morph => MORPH_NS,
         }
     }
 
@@ -120,7 +151,7 @@ impl Flight {
     /// Прямоугольник, внутри которого окно лежит на этой доле пути.
     #[must_use]
     pub fn bounds(&self, to: Rect, t: i64) -> Rect {
-        if self.motion == Motion::Zoom {
+        if self.motion != Motion::Genie {
             return zoom_rect(self.from, to, t);
         }
         let (top, bottom) = vertical(self.from, to, t);
@@ -134,9 +165,16 @@ impl Flight {
     /// `surface` — поверхность окна, `band` — полоса в координатах экрана,
     /// `dy` — сдвиг из экрана в полосу.
     pub fn draw(&self, back: &mut Surface, surface: &Surface, to: Rect, t: i64, band: Rect, dy: i32) {
-        if self.motion == Motion::Zoom {
-            draw_zoom(back, surface, zoom_rect(self.from, to, t), fade(t), band, dy);
-            return;
+        match self.motion {
+            Motion::Zoom => {
+                draw_zoom(back, surface, zoom_rect(self.from, to, t), fade(t), band, dy);
+                return;
+            }
+            Motion::Morph => {
+                draw_zoom(back, surface, zoom_rect(self.from, to, t), 256, band, dy);
+                return;
+            }
+            Motion::Genie => {}
         }
         let from = self.from;
         let (top, bottom) = vertical(from, to, t);

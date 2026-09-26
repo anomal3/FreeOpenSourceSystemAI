@@ -9018,7 +9018,8 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("05-performance"),
             Step::Key("3"),
             Step::Await("taskmgr: tab services", 15_000),
-            Step::Await("taskmgr: services: 3 described, ", 15_000),
+            // Четыре: logger, dhcp, sshd и `drvd` (веха «драйверы», Д3).
+            Step::Await("taskmgr: services: 4 described, ", 15_000),
             Step::Wait(800),
             Step::Shot("06-services"),
             Step::Key("ctrl-w"),

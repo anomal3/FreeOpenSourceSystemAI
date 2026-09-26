@@ -330,12 +330,11 @@ impl Compositor {
         // так и осталось. Разница не косметическая — перерисовка экрана целиком
         // задерживает ввод настолько, что успевает измениться порядок событий.
         self.mark_layer(rect);
-        // На телефоне окно вырастает из своей плитки. До конца роста оно в
-        // списке и принимает ввод, но на месте не рисуется (см. `hidden_by_flight`).
-        if theme::is_mobile() {
-            let app = self.windows[self.focus].app;
-            self.start_zoom(app, rect, true);
-        }
+        // Окно вырастает из своей плитки — на ПК из значка на столе, а нет
+        // значка, из середины своего места. До конца роста оно в списке и
+        // принимает ввод, но на месте не рисуется (см. `hidden_by_flight`).
+        let app = self.windows[self.focus].app;
+        self.start_zoom(app, rect, true);
     }
 
     /// Начать рост окна из плитки (`open`) или уход в неё.
@@ -358,7 +357,7 @@ impl Compositor {
     fn hidden_by_flight(&self, window: &Window) -> bool {
         self.flight
             .as_ref()
-            .is_some_and(|flight| flight.motion == Motion::Zoom && flight.restore && flight.app == window.app)
+            .is_some_and(|flight| flight.hides_window() && flight.app == window.app)
     }
 
     pub fn find(&mut self, app: App) -> Option<&mut Window> {
@@ -875,6 +874,13 @@ impl Compositor {
         let after = window.rect;
         self.mark_layer(before);
         self.mark_layer(after);
+        // Окно перетекает в новый размер. Поверхность уже нового размера и
+        // готова: `Window::resize` перерисовал её.
+        self.finish_flight();
+        if self.panel.is_some() && !before.is_empty() && !after.is_empty() {
+            self.flight = Some(Flight::morph(app, after, before, crate::time::uptime_ns()));
+            super::set_animating(true);
+        }
         true
     }
 
@@ -893,9 +899,9 @@ impl Compositor {
         if self.drag == Some(app) {
             self.drag = None;
         }
-        // Видимое окно на телефоне уходит в свою плитку. Свёрнутое — нет: его
-        // на экране и так не было.
-        if theme::is_mobile() && !window.minimized && self.start_zoom(app, window.rect, false) {
+        // Видимое окно уходит в свою плитку. Свёрнутое — нет: его на экране и
+        // так не было.
+        if !window.minimized && self.start_zoom(app, window.rect, false) {
             self.closing = Some(window);
         }
         true
@@ -1070,6 +1076,17 @@ impl Compositor {
         };
         super::set_animating(false);
         self.mark(flight.last);
+        if flight.motion == Motion::Morph {
+            crate::kprintln!(
+                "  desktop     : {} morph of '{}': {} frames in {} ms",
+                if flight.from.w >= flight.to.map_or(0, |to| to.w) { "maximize" } else { "unmaximize" },
+                flight.app.title(),
+                flight.frames,
+                flight.elapsed_ms(crate::time::uptime_ns()),
+            );
+            self.mark_layer(flight.from);
+            return;
+        }
         if flight.motion == Motion::Zoom {
             self.closing = None;
             crate::kprintln!(
