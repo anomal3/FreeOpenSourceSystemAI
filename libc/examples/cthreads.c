@@ -24,6 +24,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -333,6 +334,52 @@ static void check_once_and_keys(void) {
     }
 }
 
+/* ── Семафор (фаза 58) ───────────────────────────────────────────────────── */
+
+/* Производитель кладёт сто единиц по одной, потребитель в другом потоке
+ * забирает их, засыпая на нуле. Сумма забранного обязана сойтись, а
+ * `sem_timedwait` на пустом — вернуть ETIMEDOUT не раньше срока. */
+static sem_t items;
+static volatile int taken_items;
+
+static void *take_items(void *arg) {
+    (void)arg;
+    for (int item = 0; item < 100; item++) {
+        sem_wait(&items);
+        taken_items++;
+    }
+    return NULL;
+}
+
+static void check_semaphore(void) {
+    sem_init(&items, 0, 0);
+    pthread_t consumer;
+    pthread_create(&consumer, NULL, take_items, NULL);
+    for (int item = 0; item < 100; item++) {
+        sem_post(&items);
+        if (item % 10 == 0) {
+            nap(1);
+        }
+    }
+    pthread_join(consumer, NULL);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 100 * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    long long started = now_ms(CLOCK_MONOTONIC);
+    int answer = sem_timedwait(&items, &deadline);
+    long long waited = now_ms(CLOCK_MONOTONIC) - started;
+    if (taken_items == 100 && answer == -1 && errno == ETIMEDOUT && waited >= 90) {
+        ok("semaphore hands over items and times out");
+    } else {
+        printf("cthreads: taken %d, answer %d, errno %d, waited %lld ms\n", taken_items, answer, errno, waited);
+        fail("semaphore hands over items and times out");
+    }
+}
+
 int main(void) {
     printf("cthreads: starting %d threads at a time\n", THREADS);
     check_mutex();
@@ -340,6 +387,7 @@ int main(void) {
     check_heap();
     check_cond();
     check_once_and_keys();
+    check_semaphore();
     printf("cthreads: done, %d check(s) failed\n", failures);
     return failures == 0 ? 0 : 1;
 }

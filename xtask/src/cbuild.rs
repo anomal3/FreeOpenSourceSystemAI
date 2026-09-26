@@ -534,7 +534,9 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     // стоя первой, заслоняет свежий (фаза 56 наткнулась: новый номер вызова
     // «не объявлен»). Других заголовков в `libc/freeos` нет, заслонять
     // ему нечего.
-    let includes = vec![libc_dir().join("freeos"), sysroot.join("include")];
+    // `libc/freeos/include` — заголовки POSIX, которых нет у picolibc
+    // (`semaphore.h`, `sys/socket.h`, …, фаза 58).
+    let includes = vec![libc_dir().join("freeos"), libc_dir().join("freeos/include"), sysroot.join("include")];
     let work = paths::workspace_root()
         .join("build/toolchain/cbuild")
         .join(arch.name());
@@ -542,7 +544,7 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     // Слой ОС и стартовый код собираются один раз на архитектуру: они одни и те
     // же для всех программ.
     let mut common = Vec::new();
-    for name in ["crt0", "syscalls", "threads"] {
+    for name in ["crt0", "syscalls", "threads", "posix"] {
         let source = libc_dir().join("freeos").join(format!("{name}.c"));
         let object = work.join(format!("{name}.o"));
         compile(arch, &source, &object, &includes)?;

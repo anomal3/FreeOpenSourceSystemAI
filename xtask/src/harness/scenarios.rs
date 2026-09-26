@@ -4404,6 +4404,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("cthreads: ok pthread_once runs once", 30_000),
             Step::Await("cthreads: ok key destructors run at thread exit", 30_000),
             Step::Await("cthreads: ok a detached thread runs on its own", 30_000),
+            // Семафор POSIX (фаза 58) — без него Mono не собирается вовсе.
+            Step::Await("cthreads: ok semaphore hands over items and times out", 30_000),
             Step::Await("cthreads: done, 0 check(s) failed", 30_000),
             Step::Await("exited with code 0", 15_000),
             Step::Absent("cthreads: FAILED"),

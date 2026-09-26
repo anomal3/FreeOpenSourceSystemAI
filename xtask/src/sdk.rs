@@ -112,6 +112,9 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
     // Потоки POSIX (фаза 57): у picolibc своего `pthread.h` нет, а чужой
     // `configure` ищет его первым делом, решая, собирать ли себя с потоками.
     copy(&cbuild::libc_dir().join("freeos/pthread.h"), &include.join("pthread.h"))?;
+    // Заголовки POSIX, которых нет у picolibc (фаза 58), — каталогом, с
+    // подкаталогами (`sys/`, `netinet/`).
+    copy_tree(&cbuild::libc_dir().join("freeos/include"), &include)?;
 
     // Компоновочный сценарий. Тот же, что у программ на Rust, и это не
     // экономия: раскладка задана требованиями ядра — адрес 512 ГиБ, страницы,
@@ -177,6 +180,10 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
         &threads,
         &includes,
     )?;
+    // Слой POSIX для чужих сред (фаза 58): семафоры, `dlopen` отказом,
+    // журнал, сокеты, разбор адресов.
+    let posix = work.join("posix.o");
+    cbuild::compile(arch, &cbuild::libc_dir().join("freeos/posix.c"), &posix, &includes)?;
     let archive = lib.join("libfreeos.a");
     // Архив пересоздаётся, а не дополняется: `llvm-ar r` в существующий файл
     // оставил бы там объектник от прошлой архитектуры, если каталог когда-то
@@ -189,6 +196,7 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
         .arg(&archive)
         .arg(&syscalls)
         .arg(&threads)
+        .arg(&posix)
         .status()
         .with_context(|| format!("не удалось запустить {}", ar.display()))?;
     if !status.success() {
@@ -381,4 +389,19 @@ mod tests {
             );
         }
     }
+}
+
+/// Скопировать дерево заголовков: файлы — с заменой, каталоги — создавая.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            copy(&entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
