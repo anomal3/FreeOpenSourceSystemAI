@@ -34,7 +34,7 @@
 | `0x0001_0001` | страница процесса `PROCESS_PAGE` с эталоном канарейки стека | `fb34dc3` |
 | `0x0001_0002` | потоки: `SYS_THREAD_CREATE`, `SYS_SET_TLS`, `SYS_THREAD_EXIT` | `19bdc9c` |
 | `0x0001_0003` | ожидание на адресе: `SYS_FUTEX_WAIT`, `SYS_FUTEX_WAKE` | `d5d9e9e` |
-| `0x0001_0004` | драйверы-программы: `SYS_DEVICE_OPEN`, `SYS_DEVICE_MAP`, `SYS_DEVICE_WAIT`, `SYS_DMA_ALLOC` | (Д1) |
+| `0x0001_0004` | драйверы-программы: `SYS_DEVICE_OPEN`, `SYS_DEVICE_MAP`, `SYS_DEVICE_WAIT`, `SYS_DMA_ALLOC` | `a042d91` |
 
 ## Соглашение о вызове
 
