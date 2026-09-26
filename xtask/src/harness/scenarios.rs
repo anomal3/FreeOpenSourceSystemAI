@@ -698,10 +698,14 @@ pub fn screen_for(name: &str) -> Option<&'static str> {
 /// установленным и до сети не дошёл бы, а `driver-edu` на втором прогоне
 /// цепочки не дошёл бы до `/media`. Функцией, по той же причине, что
 /// [`screen_for`].
+///
+/// `pkg` — оттуда же: он считает пакеты на диске («2 package(s)»), а `edu`,
+/// оставленный `driver-edu` раньше по цепочке, делает их три. Полный прогон
+/// 27.09.2026 уронил на этом `pkg` в release на x86-64.
 #[must_use]
 pub fn forgotten_on_state(name: &str) -> &'static [&'static str] {
     match name {
-        "driver-edu" | "driver-net" => &[
+        "driver-edu" | "driver-net" | "pkg" => &[
             "opt/edu/bin/edudrv",
             "opt/edu/bin",
             "opt/edu",
@@ -754,6 +758,11 @@ const SMP_STEPS: &[Step] = &[
     Step::Absent("CPU FAULT"),
     Step::Absent("STACK OVERFLOW"),
     Step::Absent("did not report"),
+    // Процессор, доложивший о запуске и не получивший с тех пор ни одного
+    // тика. Так 27.09.2026 стоял процессор 1 в отладочной сборке — вечный
+    // цикл покраски консоли с закрытыми прерываниями, — а сценарий был
+    // зелёным: одновременности хватало трёх живых из четырёх.
+    Step::Absent(", 0 switches (0 forced), idle 0% of its ticks"),
 ];
 
 pub const ALL: &[Scenario] = &[
@@ -1566,8 +1575,9 @@ pub const ALL: &[Scenario] = &[
             // второго разбора). `zdemo` и `lua` собираются только там, где
             // выполнена `cargo xtask thirdparty`, и без неё здесь будет 39.
             // Сорок две: прибавилась `threads` (фаза 55b). Сорок три — `drvd`
-            // (веха «драйверы», Д3).
-            Step::Expect("/bin holds 43 programs"),
+            // (веха «драйверы», Д3). Сорок пять — `cmem` и `cthreads`
+            // (фазы 56–57).
+            Step::Expect("/bin holds 45 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -3069,6 +3079,52 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "tlb",
+        about: "Смена прав страницы доходит до потока на другом процессоре: пишущий снят, а не пишет дальше.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // Четыре процессора: проверке нужен второй, на котором стоит
+        // пишущий поток, — на одном она ничего не доказывает.
+        extra: &["-smp", "4"],
+        steps: &[
+            Step::Await("smp         : 4 of 4 processors online", BOOT),
+            Step::Await("freeos> ", BOOT),
+            Step::Line("run /bin/threads tlb"),
+            Step::Await("threads: the writer is on cpu", 30_000),
+            Step::Await("threads: making the page read-only under the writer", 30_000),
+            // Пишущий снят на первой же записи после смены прав. Без сброса
+            // трансляций на его процессоре (на x86-64 — межпроцессорным
+            // прерыванием, фаза 56) он писал бы дальше по старой.
+            Step::Await("user        : killed by", 15_000),
+            Step::Await("threads: the writer stopped at the read-only page", 15_000),
+            Step::Await("exited with code 0", 15_000),
+            // Что исполняет каждый процессор: процессор, долго держащий
+            // прерывания закрытыми, не ответил бы на просьбу о сбросе.
+            Step::Line("tasks"),
+            Step::Wait(2_000),
+            Step::Absent(", 0 switches (0 forced), idle 0% of its ticks"),
+            Step::Absent("threads: FAILED"),
+            Step::Absent("did not flush its translations"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "sleep",
         about: "Ждущая программа выходит из очереди на исполнение, и машине становится нечего делать.",
         target: Target::Live,
@@ -4237,6 +4293,122 @@ pub const ALL: &[Scenario] = &[
             // Отдельным шагом: «строка не напечаталась» и «проверка не прошла» —
             // разные беды, и первую поймали бы ожидания выше.
             Step::Absent("zdemo: FAILED"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "cmem",
+        about: "Память, как её просит чужая среда: резерв без кадров, куски, права страниц, код в памяти.",
+        // Живая система: программа не трогает файлов.
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Line("run /bin/cmem"),
+            Step::Await("cmem: starting", 30_000),
+            // Резерв в 64 МиБ не стоит кадров, касание — стоит, `munmap`
+            // возвращает коснувшиеся (фаза 56, `MAP_LAZY`).
+            Step::Await("cmem: ok lazy reserve is free", 30_000),
+            Step::Await("cmem: ok touching takes frames", 30_000),
+            Step::Await("cmem: ok munmap returns lazy frames", 30_000),
+            // Частичный `munmap`: голова и хвост (`mono_valloc_aligned`),
+            // дыра посередине и снятие поперёк дыры.
+            Step::Await("cmem: ok aligned carve", 30_000),
+            Step::Await("cmem: ok hole in the middle", 30_000),
+            // W^X держится, а код, записанный программой, исполняется — и
+            // исполняется последний записанный (на AArch64 это синхронизация
+            // кешей, без неё вернулось бы 7 вместо 42).
+            Step::Await("cmem: ok W^X holds", 30_000),
+            Step::Await("cmem: ok code written and run", 30_000),
+            Step::Await("cmem: ok PROT_NONE and back", 30_000),
+            Step::Await("cmem: ok a hole in the range is refused", 30_000),
+            // Куча растёт между `mmap` программы — до фазы 56 первая же чужая
+            // область посреди кучи обрывала её.
+            Step::Await("cmem: ok heap grows between mmaps", 60_000),
+            Step::Await("cmem: done, 0 check(s) failed", 30_000),
+            Step::Await("exited with code 0", 15_000),
+            // Нарушения: каждое снимает программу, и строка «прошло» после
+            // него не печатается.
+            Step::Line("run /bin/cmem write-ro"),
+            Step::Await("cmem: writing to a read-only page", 30_000),
+            Step::Await("user        : killed by", 15_000),
+            Step::Line("run /bin/cmem lazy-ro"),
+            Step::Await("cmem: writing to an untouched read-only page", 30_000),
+            Step::Await("user        : killed by", 15_000),
+            Step::Line("run /bin/cmem exec-rw"),
+            Step::Await("cmem: calling into a writable page", 30_000),
+            Step::Await("user        : killed by", 15_000),
+            Step::Line("run /bin/cmem touch-none"),
+            Step::Await("cmem: reading a PROT_NONE page", 30_000),
+            Step::Await("user        : killed by", 15_000),
+            Step::Await("freeos> ", 15_000),
+            Step::Absent("cmem: FAILED"),
+            // Таблицы не разошлись с записями ни при одном разрезе.
+            Step::Absent("user        : WARNING"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "cthreads",
+        about: "Потоки POSIX в программе на C: мьютексы, условные переменные со сроком, свои errno и __thread.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // Четыре процессора: потоки обязаны встречаться по-настоящему, а не
+        // по очереди на одном.
+        extra: &["-smp", "4"],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Line("run /bin/cthreads"),
+            // Первая строка напечатана `printf` уже при живом TLS: `errno` и
+            // замок кучи в многопоточной picolibc лежат в блоке потока, и без
+            // блока программа упала бы раньше неё.
+            Step::Await("cthreads: starting 4 threads at a time", 30_000),
+            Step::Await("cthreads: ok mutex keeps a plain counter exact", 120_000),
+            Step::Await("cthreads: ok errno and __thread are per thread", 30_000),
+            Step::Await("cthreads: ok malloc from four threads at once", 120_000),
+            Step::Await("cthreads: ok condition variable carries a queue", 60_000),
+            Step::Await("cthreads: ok timed wait ends at its deadline", 30_000),
+            Step::Await("cthreads: ok pthread_once runs once", 30_000),
+            Step::Await("cthreads: ok key destructors run at thread exit", 30_000),
+            Step::Await("cthreads: ok a detached thread runs on its own", 30_000),
+            Step::Await("cthreads: done, 0 check(s) failed", 30_000),
+            Step::Await("exited with code 0", 15_000),
+            Step::Absent("cthreads: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("user        : WARNING"),
             Step::Absent("KERNEL PANIC"),
         ],
     },

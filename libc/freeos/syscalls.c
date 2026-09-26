@@ -21,14 +21,21 @@
  * вслух: код, которого в таблице нет, становится `EIO`, а не молча нулём.
  */
 
+/* Слой ОС отвечает за все имена, которые picolibc знает, — в том числе за
+ * «грубые» и «сырые» часы, видимые только под `_GNU_SOURCE`. */
+#define _GNU_SOURCE
+
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/times.h>
+#include <sched.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "freeos-syscall.h"
@@ -339,6 +346,79 @@ clock_t times(struct tms *out) {
     return (clock_t)info.uptime_ms;
 }
 
+/* ── Часы и сон (фаза 57) ────────────────────────────────────────────────── */
+
+/* Какие часы ядра отвечают на эти часы POSIX. «Грубые» и «сырые» варианты —
+ * те же часы: других у ядра нет, и честнее ответить ими, чем отказом, — а
+ * часы процессорного времени (`CLOCK_PROCESS_CPUTIME_ID`) это другое число, и
+ * им отказ. */
+static int kernel_clock(clockid_t clock) {
+    switch (clock) {
+    case CLOCK_REALTIME:
+    case CLOCK_REALTIME_COARSE:
+        return FREEOS_CLOCK_REALTIME;
+    case CLOCK_MONOTONIC:
+    case CLOCK_MONOTONIC_RAW:
+    case CLOCK_MONOTONIC_COARSE:
+        return FREEOS_CLOCK_MONOTONIC;
+    default:
+        return -1;
+    }
+}
+
+int clock_gettime(clockid_t clock, struct timespec *now) {
+    int which = kernel_clock(clock);
+    if (which < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct freeos_timespec stamp;
+    long code = freeos_syscall(SYS_CLOCK, which, (long)&stamp, 0);
+    if (code < 0) {
+        return set_errno(code);
+    }
+    now->tv_sec = (time_t)stamp.seconds;
+    now->tv_nsec = (long)stamp.nanos;
+    return 0;
+}
+
+/* Разрешение — миллисекунда: планировщик и сон идут ею (`SYS_FUTEX_WAIT`,
+ * `SYS_NANOSLEEP` с точностью до тика), и обещать мельче значило бы обещать
+ * то, чего сроки в системе не держат. */
+int clock_getres(clockid_t clock, struct timespec *resolution) {
+    if (kernel_clock(clock) < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (resolution != NULL) {
+        resolution->tv_sec = 0;
+        resolution->tv_nsec = 1000000;
+    }
+    return 0;
+}
+
+/* Сон не прерывается ничем — сигналов нет, — поэтому остаток всегда ноль. */
+int nanosleep(const struct timespec *request, struct timespec *remaining) {
+    if (request->tv_sec < 0 || request->tv_nsec < 0 || request->tv_nsec >= 1000000000L) {
+        errno = EINVAL;
+        return -1;
+    }
+    long code = freeos_syscall(SYS_NANOSLEEP, (long)request->tv_sec, request->tv_nsec, 0);
+    if (code < 0) {
+        return set_errno(code);
+    }
+    if (remaining != NULL) {
+        remaining->tv_sec = 0;
+        remaining->tv_nsec = 0;
+    }
+    return 0;
+}
+
+int sched_yield(void) {
+    freeos_syscall(SYS_YIELD, 0, 0, 0);
+    return 0;
+}
+
 /* ── Случайность ─────────────────────────────────────────────────────────── */
 
 int getentropy(void *buf, size_t len) {
@@ -363,72 +443,125 @@ int getentropy(void *buf, size_t len) {
 
 /* ── Куча ────────────────────────────────────────────────────────────────── */
 
-/* Сколько памяти просить у ядра за один раз.
+/* Сколько адресов куча резервирует разом.
  *
- * Четверть мегабайта: заметно больше, чем нужно печати и паре файлов, и заметно
- * меньше предела, который ядро даёт одной задаче. */
-#define HEAP_CHUNK (256 * 1024)
+ * Сто двадцать восемь мегабайт — адреса, а не память: резерв ленивый
+ * (`FREEOS_MAP_LAZY`, фаза 56), и кадр приходит в страницу только тогда, когда
+ * `malloc` её коснётся. Четверть от того, что ядро даёт одной задаче по
+ * запросу (512 МиБ), — остальное остаётся `mmap`, которым пользуются большие
+ * программы в обход кучи. */
+#define HEAP_RESERVE (128UL * 1024 * 1024)
 
-static char *heap_start;   /* начало последней взятой области */
+static char *heap_start;   /* начало резерва */
 static char *heap_current; /* докуда роздано */
-static char *heap_end;     /* докуда взято у ядра */
+static char *heap_end;     /* конец резерва */
 
 /* Раздвинуть кучу.
  *
- * # Почему это не настоящий `sbrk`
+ * # Почему резерв, а не «ещё кусок вплотную»
  *
- * Настоящий обещает непрерывность: память, выданная вторым вызовом, лежит сразу
- * за первой. Наш `SYS_MMAP` адреса не обещает — он возвращает тот, который
- * выбрал сам, — поэтому непрерывность здесь **проверяется**, а не
- * предполагается: если очередная область легла не вплотную к прежней, мы
- * отвечаем отказом, а не отдаём разорванный кусок под видом целого.
+ * До фазы 56 куча росла кусками по четверти мегабайта, и каждый кусок обязан
+ * был лечь вплотную к прежнему — `SYS_MMAP` адреса не обещает, и непрерывность
+ * проверялась, а не предполагалась. Это работало, пока между двумя `malloc`
+ * никто не звал `mmap` сам. Чужая среда исполнения (Mono) зовёт его на каждом
+ * шагу, и первая же её область, легшая посреди кучи, обрывала кучу навсегда.
  *
- * Цена названа честно: куча программы на C ограничена тем, сколько ядро выдало
- * подряд. Снять этот предел можно только вызовом, который умеет расширять
- * область на месте, — а такого в договоре нет, и заводить его ради malloc'а
- * значит заводить его вслепую.
+ * Резерв снимает вопрос целиком: адреса заняты один раз, сразу на весь рост, и
+ * никакой `mmap` в них не попадёт. Цена — потолок в `HEAP_RESERVE`, названный
+ * вслух; упёршийся в него `malloc` получает `ENOMEM`, а не чужую память.
+ *
+ * Уменьшение кучи только двигает границу: память остаётся за программой. Снять
+ * страницы можно было бы (частичный `munmap` с фазы 56 есть), но следующий
+ * рост пришёл бы в снятые адреса — и программу сняли бы за обращение к ним.
  */
 void *sbrk(ptrdiff_t increment) {
-    if (increment < 0) {
-        /* Уменьшение кучи не поддерживается: вернуть ядру можно только область
-         * целиком (`SYS_MUNMAP` принимает точное совпадение), а из середины
-         * кучи возвращать нечего. Отвечаем отказом, а не молча «получилось»:
-         * malloc, поверивший в возврат, посчитал бы память свободной дважды. */
-        errno = ENOSYS;
-        return (void *)-1;
-    }
-
-    if (heap_current == NULL) {
-        long got = freeos_syscall(SYS_MMAP, HEAP_CHUNK, 0, 0);
+    if (heap_start == NULL) {
+        long got = freeos_syscall(SYS_MMAP, (long)HEAP_RESERVE, FREEOS_MAP_LAZY, 0);
         if (got < 0) {
             set_errno(got);
             return (void *)-1;
         }
         heap_start = (char *)got;
         heap_current = heap_start;
-        heap_end = heap_start + HEAP_CHUNK;
+        heap_end = heap_start + HEAP_RESERVE;
     }
 
-    while (heap_current + increment > heap_end) {
-        long got = freeos_syscall(SYS_MMAP, HEAP_CHUNK, 0, 0);
-        if (got < 0) {
-            set_errno(got);
-            return (void *)-1;
-        }
-        if ((char *)got != heap_end) {
-            /* Не вплотную. Взятое не возвращаем: `SYS_MUNMAP` принял бы его, но
-             * отказ уже произошёл, и лишний вызов на пути отказа — это второе
-             * место, где что-то может пойти не так. Область останется занятой
-             * до конца программы, то есть до ближайшего мига. */
-            errno = ENOMEM;
-            return (void *)-1;
-        }
-        heap_end += HEAP_CHUNK;
+    if (increment > heap_end - heap_current || increment < heap_start - heap_current) {
+        errno = ENOMEM;
+        return (void *)-1;
     }
-
     char *previous = heap_current;
     heap_current += increment;
     return previous;
+}
+
+/* ── Отображения памяти (фаза 56) ────────────────────────────────────────── */
+
+/* `mmap`: безымянная память — всегда ленивая, как у любой системы с
+ * отложенным выделением; кусок файла — только на чтение.
+ *
+ * Чего нет, и почему это отказ, а не «сделаем похоже»:
+ * - `MAP_FIXED` — ядро выбирает адрес само и чужой не принимает. Отказ
+ *   `EINVAL`: программа, которой нужен именно этот адрес, обязана узнать, что
+ *   его не будет, — положить память в другое место молча значило бы отдать не
+ *   то, что просили. Адрес **без** `MAP_FIXED` — подсказка, и ею можно
+ *   пренебречь, как разрешает POSIX.
+ * - запись в отображение файла — ядро отображает файл только на чтение;
+ *   `EACCES`, как у POSIX при файле, открытом без права записи.
+ * - `MAP_SHARED` у безымянной памяти равен `MAP_PRIVATE`: делить её не с кем,
+ *   `fork` в системе нет. */
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
+    (void)addr;
+    if (len == 0 || (flags & MAP_FIXED) != 0) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    if ((prot & PROT_WRITE) != 0 && (prot & PROT_EXEC) != 0) {
+        /* W^X — правило системы. `EACCES` — ответ POSIX на права, которых не
+         * дадут. */
+        errno = EACCES;
+        return MAP_FAILED;
+    }
+
+    long got;
+    if ((flags & MAP_ANONYMOUS) != 0) {
+        got = freeos_syscall(SYS_MMAP, (long)len, FREEOS_MAP_LAZY, 0);
+        if (got < 0) {
+            set_errno(got);
+            return MAP_FAILED;
+        }
+        /* Ядро выдаёт «читать и писать»; остальное — второй просьбой. */
+        if (prot != (PROT_READ | PROT_WRITE)) {
+            long done = freeos_syscall(SYS_MPROTECT, got, (long)len, prot);
+            if (done < 0) {
+                freeos_syscall(SYS_MUNMAP, got, (long)len, 0);
+                set_errno(done);
+                return MAP_FAILED;
+            }
+        }
+        return (void *)got;
+    }
+
+    if ((prot & PROT_WRITE) != 0) {
+        errno = EACCES;
+        return MAP_FAILED;
+    }
+    got = freeos_syscall(SYS_MMAP_FILE, fd, (long)offset, (long)len);
+    if (got < 0) {
+        set_errno(got);
+        return MAP_FAILED;
+    }
+    return (void *)got;
+}
+
+int munmap(void *addr, size_t len) {
+    long done = freeos_syscall(SYS_MUNMAP, (long)addr, (long)len, 0);
+    return done < 0 ? set_errno(done) : 0;
+}
+
+int mprotect(void *addr, size_t len, int prot) {
+    long done = freeos_syscall(SYS_MPROTECT, (long)addr, (long)len, prot);
+    return done < 0 ? set_errno(done) : 0;
 }
 
 /* ── Конец программы ─────────────────────────────────────────────────────── */

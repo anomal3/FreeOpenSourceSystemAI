@@ -109,6 +109,9 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
     // пользовался, — почти никто не будет, — а для того, чтобы им пользовался
     // **наш слой ОС** и всякий, кому понадобится позвать систему напрямую.
     copy(&cbuild::syscall_header(), &include.join("freeos-syscall.h"))?;
+    // Потоки POSIX (фаза 57): у picolibc своего `pthread.h` нет, а чужой
+    // `configure` ищет его первым делом, решая, собирать ли себя с потоками.
+    copy(&cbuild::libc_dir().join("freeos/pthread.h"), &include.join("pthread.h"))?;
 
     // Компоновочный сценарий. Тот же, что у программ на Rust, и это не
     // экономия: раскладка задана требованиями ядра — адрес 512 ГиБ, страницы,
@@ -162,6 +165,18 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
         &syscalls,
         &includes,
     )?;
+    // Потоки и TLS (фаза 57). Отдельным объектником в том же архиве: его
+    // вытягивает `crt0.o` (`freeos_threads_start`), а вместе с ним приходят
+    // блокировки, которых многопоточная picolibc ждёт от системы. Без него
+    // первый же чужой `configure` не собрал ни одной программы:
+    // «undefined symbol: freeos_threads_start» (Mono, 27.09.2026).
+    let threads = work.join("threads.o");
+    cbuild::compile(
+        arch,
+        &cbuild::libc_dir().join("freeos/threads.c"),
+        &threads,
+        &includes,
+    )?;
     let archive = lib.join("libfreeos.a");
     // Архив пересоздаётся, а не дополняется: `llvm-ar r` в существующий файл
     // оставил бы там объектник от прошлой архитектуры, если каталог когда-то
@@ -173,6 +188,7 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
         .arg("rcs")
         .arg(&archive)
         .arg(&syscalls)
+        .arg(&threads)
         .status()
         .with_context(|| format!("не удалось запустить {}", ar.display()))?;
     if !status.success() {

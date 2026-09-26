@@ -1698,6 +1698,14 @@ pub fn munmap(addr: usize, len: usize) -> i64 {
     unsafe { syscall(SYS_MUNMAP, addr, len, 0) }
 }
 
+/// Поменять права страниц своей безымянной памяти (фаза 56). См.
+/// [`user_abi::SYS_MPROTECT`]; `prot` — [`user_abi::PROT_READ`] и соседи.
+pub fn mprotect(addr: usize, len: usize, prot: usize) -> i64 {
+    // SAFETY: аргументы — числа; какие страницы программе принадлежат, ядро
+    // проверяет по своей таблице областей.
+    unsafe { syscall(user_abi::SYS_MPROTECT, addr, len, prot) }
+}
+
 /// Путь, собираемый по кусочкам в буфере на стеке.
 ///
 /// Существует потому, что куча у программы появилась только в фазе 47b и берётся

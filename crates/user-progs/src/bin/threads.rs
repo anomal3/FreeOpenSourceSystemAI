@@ -22,13 +22,24 @@
 //! Со словом `guard` программа вместо этого переполняет стек потока — доказывая,
 //! что под ним лежит сторожевая страница и переполнение кончается снятием, а не
 //! порчей соседней области.
+//!
+//! Со словом `tlb` (фаза 56) — проверяет, что смена прав доходит до потока на
+//! **другом** процессоре. Поток пишет в страницу без остановки; главная задача
+//! делает её «только чтение». Пишущий обязан быть снят на следующей же записи.
+//! Если процессор, на котором он работает, не сбросил трансляцию, поток
+//! продолжит писать по старой — и счётчик в странице будет расти дальше. На
+//! одном процессоре проверка ничего не доказывает, поэтому программа говорит,
+//! на каких процессорах стояли оба.
 
 #![no_std]
 #![no_main]
 
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use user_progs::{Args, Lock, exit, print, print_u64, println, set_tls, sleep_ms, thread_create, thread_exit};
+use user_progs::{
+    Args, Lock, cpu, exit, mmap, mprotect, print, print_u64, println, set_tls, sleep_ms, thread_create,
+    thread_exit,
+};
 
 /// Сколько потоков завести.
 const THREADS: usize = 4;
@@ -150,6 +161,77 @@ extern "C" fn worker(index: usize) -> ! {
     thread_exit(0)
 }
 
+/// Страница, в которую пишет поток режима `tlb`, и процессор, на котором он
+/// её писал последний раз (плюс один; ноль — ещё не начинал).
+static TLB_PAGE: AtomicUsize = AtomicUsize::new(0);
+static TLB_WRITER_CPU: AtomicUsize = AtomicUsize::new(0);
+
+/// Точка входа пишущего потока режима `tlb`.
+extern "C" fn writer(_arg: usize) -> ! {
+    let page = TLB_PAGE.load(Ordering::Acquire) as *mut u64;
+    loop {
+        TLB_WRITER_CPU.store(cpu() as usize + 1, Ordering::Release);
+        // SAFETY: страница выдана `mmap` этой программе и не снимается; после
+        // смены прав запись в неё — ровно то нарушение, которое проверяется.
+        unsafe { core::ptr::write_volatile(page, core::ptr::read_volatile(page) + 1) };
+    }
+}
+
+/// Режим `tlb`: смена прав обязана дойти до потока на другом процессоре.
+fn check_tlb() -> ! {
+    let page = mmap(4096, 0);
+    if page < 0 {
+        println("threads: mmap refused");
+        exit(1);
+    }
+    TLB_PAGE.store(page as usize, Ordering::Release);
+    if thread_create(writer, 0, STACK_BYTES).is_none() {
+        println("threads: could not create the writer");
+        exit(1);
+    }
+    // Ждём, пока пишущий начнёт и окажется НЕ на нашем процессоре: главная
+    // задача уступает процессор сном, и планировщик ставит поток на свободный.
+    let mut waited = 0;
+    while TLB_WRITER_CPU.load(Ordering::Acquire) == 0 && waited < 5_000 {
+        sleep_ms(10);
+        waited += 10;
+    }
+    sleep_ms(200);
+    let mine = cpu();
+    let theirs = TLB_WRITER_CPU.load(Ordering::Acquire).saturating_sub(1);
+    print("threads: the writer is on cpu ");
+    print_u64(theirs as u64);
+    print(", this thread on cpu ");
+    print_u64(mine);
+    println("");
+    if theirs as u64 == mine {
+        println("threads: FAILED both threads share a processor, nothing is proven");
+        exit(1);
+    }
+
+    println("threads: making the page read-only under the writer");
+    if mprotect(page as usize, 4096, user_abi::PROT_READ) != 0 {
+        println("threads: FAILED mprotect refused");
+        exit(1);
+    }
+    // Два замера через паузу: пишущий, снятый на первой же записи, оставит
+    // счётчик на месте. Пишущий по старой трансляции его двигает.
+    sleep_ms(300);
+    // SAFETY: страница читаема — права «только чтение» это оставляют.
+    let first = unsafe { core::ptr::read_volatile(page as *const u64) };
+    sleep_ms(300);
+    // SAFETY: см. выше.
+    let second = unsafe { core::ptr::read_volatile(page as *const u64) };
+    if first == second {
+        println("threads: the writer stopped at the read-only page");
+        exit(0);
+    }
+    print("threads: FAILED the writer kept writing, ");
+    print_u64(second - first);
+    println(" more increments after mprotect");
+    exit(1)
+}
+
 /// Точка входа потока, который переполняет свой стек.
 extern "C" fn overflower(_arg: usize) -> ! {
     println("threads: about to run off the bottom of a thread stack");
@@ -176,6 +258,10 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // SAFETY: значения пришли от ядра ровно в том виде, в каком их описывает
     // договор.
     let args = unsafe { Args::new(argc, argv) };
+
+    if args.get(1) == Some("tlb") {
+        check_tlb();
+    }
 
     if args.get(1) == Some("guard") {
         if thread_create(overflower, 0, STACK_BYTES).is_none() {

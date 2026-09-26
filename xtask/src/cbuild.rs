@@ -164,11 +164,17 @@ pub struct CProgram {
 }
 
 /// Программы на C, которые едут в `/bin`.
-pub const C_PROGRAMS: [CProgram; 3] = [
+pub const C_PROGRAMS: [CProgram; 5] = [
     CProgram { name: "cdemo", needs: None, libs: &[] },
     // Переполняет свой стек нарочно: доказывает, что канарейка стека есть и у
     // программ на C. См. `libc/examples/csmash.c` и `__stack_chk_fail` в `crt0.c`.
     CProgram { name: "csmash", needs: None, libs: &[] },
+    // Память так, как её просит чужая среда исполнения: резерв, куски,
+    // права страниц (фаза 56). См. `libc/examples/cmem.c`.
+    CProgram { name: "cmem", needs: None, libs: &[] },
+    // Потоки POSIX: мьютексы, условные переменные со сроком, `errno` и
+    // `__thread` у каждого свои (фаза 57). См. `libc/examples/cthreads.c`.
+    CProgram { name: "cthreads", needs: None, libs: &[] },
     // Чужая библиотека, собранная нашим набором. Она здесь не ради сжатия: это
     // единственная проверка, доказывающая, что код, вышедший из чужого
     // `configure`, **работает**, а не только собрался. См. `libc/examples/zdemo.c`.
@@ -312,19 +318,25 @@ pub fn toolchain() -> Result<()> {
 ///   их устройство напишет порт сам;
 /// * `picocrt=false` — стартовый код у нас свой (`libc/freeos/crt0.c`): ядро
 ///   передаёт аргументы регистрами, а не через стек, как принято у прошивок;
-/// * `thread-local-storage=false`, `single-thread=true`, `newlib-global-errno=true`
-///   — потоков в этой системе нет. **Это не экономия, а исправление
-///   настоящего отказа**: с TLS по умолчанию первая же ошибка роняла программу
-///   отказом страницы по адресу `-4` — `errno` лежит в блоке, которого без
-///   `_init_tls` не существует, а наш компоновочный сценарий его и не заводит;
+/// * `thread-local-storage=true`, `single-thread=false` — с фазы 57 потоки в
+///   системе есть. До неё здесь стояло обратное, и это было исправлением
+///   настоящего отказа: `errno` в TLS ронял программу отказом страницы по
+///   адресу `-4`, потому что блока TLS никто не заводил. Теперь его заводит
+///   `libc/freeos/threads.c` — по шаблону, который ядро кладёт в страницу
+///   процесса, — до конструкторов и до `main`. Там же восемь функций
+///   блокировки, которых многопоточная picolibc ждёт от системы;
 /// * `multilib=false`, `tests=false` — вариантов сборки у нас один, а тесты
 ///   picolibc требуют запускать программы на хосте.
-const MESON_OPTIONS: [&str; 7] = [
+const MESON_OPTIONS: [&str; 8] = [
     "-Dsemihost=false",
     "-Dposix-console=true",
     "-Dpicocrt=false",
-    "-Dthread-local-storage=false",
-    "-Dsingle-thread=true",
+    "-Dthread-local-storage=true",
+    "-Dsingle-thread=false",
+    // Канарейка стека у нас глобальная — в странице процесса (`user.ld`).
+    // С TLS picolibc по умолчанию («auto») выбрала бы канарейку в блоке
+    // потока, по смещению, которого наш TCB не держит.
+    "-Dstack-protector-guard=global",
     "-Dmultilib=false",
     "-Dtests=false",
 ];
@@ -517,7 +529,12 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
         );
     }
 
-    let includes = vec![sysroot.join("include"), libc_dir().join("freeos")];
+    // Заголовок договора — из репозитория, а не его копия в sysroot: копию
+    // кладёт `cargo xtask sdk`, и после правки договора она устаревает, а
+    // стоя первой, заслоняет свежий (фаза 56 наткнулась: новый номер вызова
+    // «не объявлен»). Других заголовков в `libc/freeos` нет, заслонять
+    // ему нечего.
+    let includes = vec![libc_dir().join("freeos"), sysroot.join("include")];
     let work = paths::workspace_root()
         .join("build/toolchain/cbuild")
         .join(arch.name());
@@ -525,7 +542,7 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     // Слой ОС и стартовый код собираются один раз на архитектуру: они одни и те
     // же для всех программ.
     let mut common = Vec::new();
-    for name in ["crt0", "syscalls"] {
+    for name in ["crt0", "syscalls", "threads"] {
         let source = libc_dir().join("freeos").join(format!("{name}.c"));
         let object = work.join(format!("{name}.o"));
         compile(arch, &source, &object, &includes)?;
@@ -621,7 +638,15 @@ mod tests {
                 continue;
             };
             let value = value.trim_start_matches('(').trim_end_matches(')');
-            let Ok(number) = value.parse::<i64>() else {
+            // Суффиксы C (`UL`) и шестнадцатеричная запись: адрес страницы
+            // процесса (фаза 57) записан так, и тупой разбор пропустил бы его
+            // молча — то есть не сверил бы вовсе.
+            let value = value.trim_end_matches(['U', 'L', 'u', 'l']);
+            let parsed = match value.strip_prefix("0x") {
+                Some(hex) => i64::from_str_radix(hex, 16),
+                None => value.parse::<i64>(),
+            };
+            let Ok(number) = parsed else {
                 continue;
             };
             out.push((name.to_string(), number));
@@ -781,11 +806,26 @@ mod tests {
             "SYS_RANDOM" => abi::SYS_RANDOM as i64,
             "SYS_MMAP" => abi::SYS_MMAP as i64,
             "SYS_MUNMAP" => abi::SYS_MUNMAP as i64,
+            "SYS_MMAP_FILE" => abi::SYS_MMAP_FILE as i64,
             "SYS_FSTAT" => abi::SYS_FSTAT as i64,
             "SYS_ISATTY" => abi::SYS_ISATTY as i64,
             "SYS_CLOCK" => abi::SYS_CLOCK as i64,
             "SYS_NANOSLEEP" => abi::SYS_NANOSLEEP as i64,
             "SYS_TIMES" => abi::SYS_TIMES as i64,
+            "SYS_SYSINFO" => abi::SYS_SYSINFO as i64,
+            "SYS_THREAD_CREATE" => abi::SYS_THREAD_CREATE as i64,
+            "SYS_SET_TLS" => abi::SYS_SET_TLS as i64,
+            "SYS_THREAD_EXIT" => abi::SYS_THREAD_EXIT as i64,
+            "SYS_FUTEX_WAIT" => abi::SYS_FUTEX_WAIT as i64,
+            "SYS_FUTEX_WAKE" => abi::SYS_FUTEX_WAKE as i64,
+            "SYS_MPROTECT" => abi::SYS_MPROTECT as i64,
+
+            "MAP_LAZY" => abi::MAP_LAZY as i64,
+
+            "FUTEX_CHANGED" => abi::FUTEX_CHANGED,
+            "FUTEX_TIMED_OUT" => abi::FUTEX_TIMED_OUT,
+            "PROCESS_PAGE" => abi::PROCESS_PAGE as i64,
+            "PROCESS_PAGE_TLS" => abi::PROCESS_PAGE_TLS as i64,
 
             "FD_STDIN" => abi::FD_STDIN as i64,
             "FD_STDOUT" => abi::FD_STDOUT as i64,

@@ -63,11 +63,17 @@ __attribute__((noreturn)) void __stack_chk_fail(void) {
  * договора между компоновщиком и стартовым кодом. */
 extern void __libc_init_array(void);
 
+/* Хранилище главного потока (фаза 57, `threads.c`). Первым делом, до
+ * конструкторов: `errno`, замок кучи и `pthread_self` живут в TLS, и первая же
+ * ошибка системного вызова без него писала бы по базе ноль. */
+extern void freeos_threads_start(void);
+
 extern int main(int argc, char **argv);
 
 void _start(int argc, char **argv);
 
 void _start(int argc, char **argv) {
+    freeos_threads_start();
     __libc_init_array();
     exit(main(argc, argv));
 }

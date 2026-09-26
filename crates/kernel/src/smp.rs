@@ -45,7 +45,7 @@
 //! сократило бы эту задержку ценой выхода из гостя на каждое пробуждение; пока
 //! задержки не видно ни в одном сценарии, платить нечем.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::{arch, kprintln, sched, time};
 
@@ -69,6 +69,13 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Сколько процессоров работает прямо сейчас.
 static ONLINE: AtomicUsize = AtomicUsize::new(1);
 
+/// Какие именно работают — бит на номер процессора (фаза 56).
+///
+/// Числа [`ONLINE`] мало тому, кто ждёт ответа от каждого: процессор, не
+/// доложивший о запуске, оставляет в нумерации дыру, и «первые N» были бы не
+/// те N. Загрузочный — нулевой бит, взведён с самого начала.
+static ONLINE_MASK: AtomicU32 = AtomicU32::new(1);
+
 /// Номер процессора, на котором исполняется вызывающий код.
 ///
 /// Ответ верен ровно до ближайшего переключения задач: задачу могут перенести
@@ -88,6 +95,16 @@ pub fn cpu() -> usize {
 #[must_use]
 pub fn online() -> usize {
     ONLINE.load(Ordering::Relaxed)
+}
+
+/// Какие процессоры работают — бит на номер (см. [`cpu`]).
+///
+/// Спрашивает её только сброс трансляций на x86-64; на AArch64 он рассылается
+/// аппаратно, и ждать ответа там не от кого.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[must_use]
+pub fn online_mask() -> u32 {
+    ONLINE_MASK.load(Ordering::Acquire)
 }
 
 /// Что нашлось в таблицах прошивки.
@@ -224,6 +241,7 @@ pub fn start(one_cpu: bool) {
 /// дальше процессор навсегда становится холостой задачей планировщика.
 pub fn secondary_main(index: usize) -> ! {
     ONLINE.fetch_add(1, Ordering::AcqRel);
+    ONLINE_MASK.fetch_or(1 << index, Ordering::AcqRel);
     kprintln!("  smp         : cpu {index} online");
 
     arch::interrupts::enable();
@@ -259,6 +277,7 @@ pub fn stop_others() -> usize {
 
 /// Обработчик просьбы остановиться. Не возвращается.
 pub fn on_stop() -> ! {
+    ONLINE_MASK.fetch_and(!(1 << cpu()), Ordering::AcqRel);
     ONLINE.fetch_sub(1, Ordering::AcqRel);
     arch::halt()
 }

@@ -252,14 +252,26 @@ pub const RESERVE_FRAMES: usize = 8 * 1024 * 1024 / PAGE_SIZE;
 
 /// Сколько отдельных областей может держать одна задача.
 ///
-/// Тридцать две. Число маленькое намеренно: таблица лежит прямо в [`Program`],
-/// обходится линейно, и обход её — цена каждого `mmap` и каждого отказа
-/// страницы. Программе, которой не хватило областей, отказывают тем же
-/// ответом, что и упёршейся в [`MMAP_MAX_BYTES`]: с её стороны это одно и то
-/// же — «больше не дадут». Было шестнадцать; с фазы 54 в той же таблице лежат
-/// и сегменты самого образа (обычно три-четыре), и столько же осталось
-/// программе на её собственные области.
-const MAX_MAPPINGS: usize = 32;
+/// Тысяча двадцать четыре. До фазы 56 их было тридцать две, и число было
+/// маленьким намеренно: таблица обходилась линейно на каждом отказе страницы.
+/// Чужая среда исполнения (Mono) держит сотни областей — каждый кусок кучи
+/// сборщика мусора, каждый кусок памяти кода, — а частичный `munmap` делит
+/// одну область на две. Поэтому поиск стал двоичным ([`Program::region_at`]),
+/// и предел остался только затем, чтобы программа не превратила таблицу ядра
+/// в свою кучу: запись стоит полсотни байт, тысяча — пятьдесят килобайт.
+///
+/// Программе, которой не хватило областей, отказывают тем же ответом, что и
+/// упёршейся в [`MMAP_MAX_BYTES`]: с её стороны это одно и то же — «больше не
+/// дадут».
+const MAX_MAPPINGS: usize = 1024;
+
+/// Сколько сегментов может быть у образа программы.
+///
+/// Шестнадцать — столько же, сколько было при общем пределе в тридцать две
+/// области на задачу (фаза 54 отдавала образу половину). Компоновщик кладёт
+/// три-четыре; больше — признак не программы, а чего-то, собранного так,
+/// чтобы занять таблицу ядра.
+const MAX_IMAGE_SEGMENTS: usize = 16;
 
 /// Сколько страниц одной отображённой области ядро держит в памяти сразу.
 ///
@@ -303,8 +315,9 @@ const PROGRESS_EVERY: u64 = 1024;
 
 /// Чем наполнена область.
 enum Source {
-    /// Ничем. Страницы выданы сразу и целиком, и лежат в них нули (фаза 40).
-    Anonymous,
+    /// Ничем: в страницах нули (фаза 40). Права и то, когда приходят кадры, —
+    /// в [`Anon`] (фаза 56).
+    Anonymous(Anon),
     /// Стеком потока (фаза 55b): то же, что безымянная область, но её **нижняя
     /// страница не отображена** — это сторож.
     ///
@@ -345,6 +358,45 @@ enum Source {
     /// область снимается без возврата кадров, в [`Program::release_devices`],
     /// и `munmap` её не снимает.
     Device,
+}
+
+/// Безымянная область: с какими правами её страницы и когда приходят кадры.
+///
+/// `Copy`, потому что при делении области ([`Program::split_at`]) обе половины
+/// получают одно и то же — а дальше живут каждая своей жизнью.
+#[derive(Clone, Copy)]
+struct Anon {
+    /// Права страниц из третьего кольца: [`PageFlags::NONE`] для
+    /// [`user_abi::PROT_NONE`], иначе чтение, `USER` и что попросили сверху.
+    /// Отображение делает из них права записи таблицы — [`Anon::page_flags`].
+    flags: PageFlags,
+    /// Кадры по первому касанию ([`user_abi::MAP_LAZY`]), а не сразу.
+    ///
+    /// Нужен отказу страницы, и нужен ради честности, а не удобства. В жадной
+    /// области отсутствующая страница означает, что таблицы разошлись с
+    /// записью, — и программу правильнее снять, чем подложить ей чистую
+    /// страницу вместо той, что потерялась (так было с фазы 41 и так
+    /// остаётся). В ленивой отсутствующая страница — обычное дело.
+    lazy: bool,
+}
+
+impl Anon {
+    /// Жадная область «читать и писать» — то, что выдавал `SYS_MMAP` до фазы 56.
+    const fn read_write(lazy: bool) -> Self {
+        Self { flags: PageFlags::READ.union(PageFlags::WRITE).union(PageFlags::USER), lazy }
+    }
+
+    /// Права, с которыми страница стоит в таблице.
+    ///
+    /// Для «никак» страница, если она есть, остаётся отображённой — но только
+    /// для ядра, без `USER`. Снять её значило бы потерять содержимое, а POSIX
+    /// его обещает сохранить: `mprotect` меняет доступ, а не память. Обращение
+    /// программы к такой странице — отказ при присутствующей странице, то есть
+    /// нарушение прав, и программу снимают; ядро в неё тоже не полезет:
+    /// [`space::user_can`] спрашивает `USER` у той же записи.
+    fn page_flags(self) -> PageFlags {
+        if self.flags.contains(PageFlags::USER) { self.flags } else { PageFlags::READ }
+    }
 }
 
 /// Файл, стоящий за областью, и всё, что нужно знать о её страницах.
@@ -415,6 +467,13 @@ struct Mapping {
     source: Source,
 }
 
+impl Mapping {
+    /// Адрес сразу за последней страницей.
+    fn end(&self) -> usize {
+        self.base + self.pages * PAGE_SIZE
+    }
+}
+
 /// Почему память по запросу не выдана.
 #[derive(Debug, Clone, Copy)]
 pub enum MmapError {
@@ -427,6 +486,10 @@ pub enum MmapError {
     NoMemory,
     /// Дескриптор не годится: его нет, или за ним не обычный файл.
     BadFile(files::FileError),
+    /// Попросили страницу, которую можно и писать, и исполнять (фаза 56).
+    /// Отдельно от [`MmapError::BadRequest`]: просьба осмысленна, просто
+    /// система такого не даёт, и программе полезно знать разницу.
+    WriteExecute,
 }
 
 /// Сколько байт файла программы ядро читает при запуске.
@@ -644,8 +707,9 @@ pub struct Program {
     /// файл, несёт `Arc` на его узел, а он не `Copy`, и массив, который двигают
     /// сдвигом, для него больше не подходит.
     ///
-    /// Длина ограничена [`MAX_MAPPINGS`] по-прежнему: предел здесь не про
-    /// память, а про то, что таблица обходится линейно на каждом отказе.
+    /// Области лежат по возрастанию адреса и не пересекаются — на этом стоит
+    /// двоичный поиск [`Program::region_at`]. Длина ограничена
+    /// [`MAX_MAPPINGS`].
     mappings: Vec<Mapping>,
     /// С какого адреса начинается поиск места под `mmap` (см. [`Layout`]).
     mmap_start: usize,
@@ -658,20 +722,37 @@ pub struct Program {
 impl Program {
     /// Выдать программе `len` байт безымянной памяти. Возвращает её адрес.
     ///
-    /// Память выделяется **сразу и целиком**, и после фазы 41 это уже выбор, а
-    /// не безвыходность: обработчик отказа появился, лениться есть чем. Выбор
-    /// остаётся жадным потому, что у безымянной памяти нечего подкачивать —
-    /// страница из ниоткуда наполняется нулями, то есть «отложить» тут значит
-    /// отложить обнуление кадра, а не чтение с диска. Выигрыш был бы только у
-    /// того, кто просит больше, чем трогает; цена — отказ на каждой первой
-    /// странице. Отображению файла откладывать есть что, и оно откладывает.
+    /// Без флагов память выделяется **сразу и целиком**, и после фазы 41 это
+    /// уже выбор, а не безвыходность: у безымянной памяти нечего подкачивать —
+    /// «отложить» тут значит отложить обнуление кадра, а не чтение с диска.
+    /// Выигрыш от отсрочки есть только у того, кто просит больше, чем трогает,
+    /// — и с фазы 56 такой нашёлся (сборщик мусора, резервирующий адреса с
+    /// запасом). Он просит [`user_abi::MAP_LAZY`], и область заводится пустой:
+    /// кадры приходят по отказу ([`Program::fault_plan`]).
     ///
-    /// Прав у страниц ровно двое — чтение и запись из третьего кольца.
-    /// Исполнять безымянную память нельзя, и не потому, что здесь так решили:
-    /// отображение с `WRITE | EXEC` отвергает сам построитель таблиц
-    /// ([`crate::mm::MapError::WriteExecute`]).
+    /// Права у выданных страниц — чтение и запись из третьего кольца; менять их
+    /// может [`Program::mprotect`]. Страницы на запись и исполнение сразу не
+    /// будет ни здесь, ни там: такое отображение отвергает сам построитель
+    /// таблиц ([`crate::mm::MapError::WriteExecute`]).
     fn mmap(&mut self, len: usize, flags: usize) -> Result<usize, MmapError> {
         let huge = flags & MAP_HUGE != 0;
+        let lazy = flags & user_abi::MAP_LAZY != 0;
+        // Неизвестный бит — не «проигнорируем», а отказ: программа, собранная
+        // под следующий договор, иначе получила бы не то, что просила, и
+        // узнала бы об этом по поведению, а не по коду возврата.
+        if flags & !(MAP_HUGE | user_abi::MAP_LAZY) != 0 || (huge && lazy) {
+            return Err(MmapError::BadRequest);
+        }
+        if lazy {
+            let (base, pages) = self.reserve(len, PAGE_SIZE)?;
+            self.remember(Mapping {
+                base,
+                pages,
+                blocks: 0,
+                source: Source::Anonymous(Anon::read_write(true)),
+            });
+            return Ok(base);
+        }
         // Крупные страницы требуют выравнивания и по виртуальному адресу тоже,
         // а не только по физическому: запись покрывает 2 МиБ от границы, и
         // область, начавшаяся мимо неё, не получит ни одного блока, сколько бы
@@ -707,7 +788,12 @@ impl Program {
             );
         }
 
-        self.remember(Mapping { base, pages, blocks, source: Source::Anonymous });
+        self.remember(Mapping {
+            base,
+            pages,
+            blocks,
+            source: Source::Anonymous(Anon::read_write(false)),
+        });
         Ok(base)
     }
 
@@ -928,25 +1014,248 @@ impl Program {
         Some(region.pages)
     }
 
-    /// Вернуть системе область, выданную [`Program::mmap`] или
+    /// Вернуть системе память, выданную [`Program::mmap`] или
     /// [`Program::mmap_file`].
     ///
-    /// Снять можно только область целиком и ровно ту, что выдавали: адрес в
-    /// адрес, длина в длину. Кусок области снять нечем, и это сказано вслух, а
-    /// не обойдено молчанием — разрезать область значит завести вместо одной
-    /// записи две, а вместе с ними вопрос, что делать, когда записи кончились
-    /// посреди `munmap`. Ни одному потребителю в системе это пока не нужно;
-    /// понадобится — будет отдельной работой, а не побочным эффектом этой.
-    fn munmap(&mut self, addr: usize, len: usize) -> Result<(), MmapError> {
-        if len == 0 {
+    /// Два пути. Просьба, совпавшая с областью адрес в адрес и длина в длину,
+    /// снимает её целиком — так снимается всё, что вообще можно снять
+    /// ([`Program::unmap_whole`]). Иначе просьба — про куски безымянной памяти
+    /// (фаза 56, [`Program::unmap_pieces`]).
+    ///
+    /// `shared` — у процесса больше одного потока, и трансляции надо сбросить
+    /// на всех процессорах до того, как кадры уйдут в пул (см.
+    /// [`crate::arch::flush_user_translations`]).
+    fn munmap(&mut self, addr: usize, len: usize, shared: bool) -> Result<(), MmapError> {
+        if len == 0 || addr % PAGE_SIZE != 0 {
             return Err(MmapError::BadRequest);
         }
         let pages = len.div_ceil(PAGE_SIZE);
-        let index = self
-            .mappings
-            .iter()
-            .position(|region| region.base == addr && region.pages == pages)
+        match self.mappings.iter().position(|region| region.base == addr && region.pages == pages) {
+            Some(index) => self.unmap_whole(index, shared),
+            None => self.unmap_pieces(addr, pages, shared),
+        }
+    }
+
+    /// Номер области, в которую попадает `addr`, если такая есть.
+    ///
+    /// Двоичный поиск: области лежат по возрастанию и не пересекаются.
+    /// Первая область, чей конец правее `addr`, — единственный кандидат.
+    fn region_at(&self, addr: usize) -> Option<usize> {
+        let index = self.mappings.partition_point(|region| region.end() <= addr);
+        let region = self.mappings.get(index)?;
+        (region.base <= addr).then_some(index)
+    }
+
+    /// Можно ли эту область резать на куски — снимать или менять ей права
+    /// не целиком.
+    ///
+    /// Только безымянную и только без крупных страниц. Отображённый файл,
+    /// сегмент образа и стек потока — не «память программы, которой она
+    /// распоряжается», а вещи со своим смыслом; кусок крупной страницы не
+    /// снять, не разбив её на пятьсот двенадцать обычных, а разбивать таблицы
+    /// ядро не умеет намеренно (см. `arch::unmap`).
+    fn divisible(region: &Mapping) -> bool {
+        matches!(region.source, Source::Anonymous(_)) && region.blocks == 0
+    }
+
+    /// Разрезать область, внутри которой лежит `addr`, на две — по `addr`.
+    ///
+    /// Ничего не делает, если `addr` — граница области или вне всех областей.
+    /// Места в таблице и делимость проверяет вызывающий **до** первого
+    /// разреза: отказ посреди работы оставил бы таблицу разрезанной, а память
+    /// — нетронутой, и следующий вызов увидел бы не то, что выдавали.
+    fn split_at(&mut self, addr: usize) {
+        let Some(index) = self.region_at(addr) else {
+            return;
+        };
+        let region = &mut self.mappings[index];
+        if region.base == addr {
+            return;
+        }
+        let Source::Anonymous(anon) = region.source else {
+            unreachable!("делимость области проверяется до разреза");
+        };
+        let left = (addr - region.base) / PAGE_SIZE;
+        let right = Mapping {
+            base: addr,
+            pages: region.pages - left,
+            blocks: 0,
+            source: Source::Anonymous(anon),
+        };
+        region.pages = left;
+        self.mappings.insert(index + 1, right);
+    }
+
+    /// Сколько новых записей в таблице понадобится, чтобы разрезать области
+    /// по краям `[start, end)`: по одной на каждый край, приходящийся на
+    /// середину области.
+    fn cuts_needed(&self, start: usize, end: usize) -> usize {
+        [start, end]
+            .into_iter()
+            .filter(|&edge| self.region_at(edge).is_some_and(|index| self.mappings[index].base != edge))
+            .count()
+    }
+
+    /// Снять куски безымянной памяти в `[addr, addr + pages)` — голову, хвост,
+    /// середину или несколько соседних областей разом (фаза 56).
+    ///
+    /// Дыры внутри диапазона пропускаются, как в POSIX. Но если диапазон не
+    /// задел **ни одной** области, это отказ: программа, промахнувшаяся мимо
+    /// своей памяти, должна узнать об этом от ядра.
+    ///
+    /// Всё проверяется до первого разреза: задетая область, которую резать
+    /// нельзя, или нехватка места в таблице — отказ, и ничего не снято.
+    fn unmap_pieces(&mut self, addr: usize, pages: usize, shared: bool) -> Result<(), MmapError> {
+        let end = pages
+            .checked_mul(PAGE_SIZE)
+            .and_then(|bytes| addr.checked_add(bytes))
             .ok_or(MmapError::BadRequest)?;
+        let first = self.mappings.partition_point(|region| region.end() <= addr);
+        let touched = self.mappings[first..].iter().take_while(|region| region.base < end);
+        let mut any = false;
+        for region in touched {
+            if !Self::divisible(region) {
+                return Err(MmapError::BadRequest);
+            }
+            any = true;
+        }
+        if !any {
+            return Err(MmapError::BadRequest);
+        }
+        if self.mappings.len() + self.cuts_needed(addr, end) > MAX_MAPPINGS {
+            return Err(MmapError::Limit);
+        }
+
+        self.split_at(addr);
+        self.split_at(end);
+        let first = self.mappings.partition_point(|region| region.end() <= addr);
+        let count = self.mappings[first..].iter().take_while(|region| region.base < end).count();
+        let removed: Vec<Mapping> = self.mappings.drain(first..first + count).collect();
+        for region in removed {
+            // SAFETY: область только что вынута из таблицы этой программы, то
+            // есть кадры под ней принадлежат ей одной.
+            let freed = unsafe { self.space.unmap_range(VirtAddr::new(region.base), region.pages, shared) };
+            // Жадная область обязана вернуть каждую страницу — в этом и смысл
+            // проверки, что таблицы не разошлись с записью. У ленивой
+            // отображено ровно то, чего коснулись, и сверять не с чем.
+            if let Source::Anonymous(Anon { lazy: false, .. }) = region.source {
+                if freed != region.pages {
+                    kprintln!(
+                        "  user        : WARNING: piece at {:#x} gave back {freed} pages of {}",
+                        region.base,
+                        region.pages
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Поменять права страниц безымянной памяти в `[addr, addr + len)`
+    /// (фаза 56, [`user_abi::SYS_MPROTECT`]).
+    ///
+    /// Диапазон обязан быть покрыт безымянными областями без дыр: менять права
+    /// адресу, за которым ничего нет, нечему, и POSIX отвечает на это отказом
+    /// так же. Страницы, которые уже есть, получают новые права на месте —
+    /// кадр под ними не меняется, и содержимое остаётся. Страницы ленивой
+    /// области, которых ещё нет, получат новые права, когда придут.
+    ///
+    /// Переход в исполнение сопровождается синхронизацией кешей
+    /// ([`crate::arch::sync_instructions`]): на AArch64 записанное через кеш
+    /// данных иначе не увидел бы кеш инструкций.
+    fn mprotect(&mut self, addr: usize, len: usize, prot: usize, shared: bool) -> Result<(), MmapError> {
+        use user_abi::{PROT_EXEC, PROT_READ, PROT_WRITE};
+        if len == 0 || addr % PAGE_SIZE != 0 || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+            return Err(MmapError::BadRequest);
+        }
+        if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+            return Err(MmapError::WriteExecute);
+        }
+        let flags = if prot == 0 {
+            PageFlags::NONE
+        } else {
+            let mut flags = PageFlags::READ | PageFlags::USER;
+            if prot & PROT_WRITE != 0 {
+                flags |= PageFlags::WRITE;
+            }
+            if prot & PROT_EXEC != 0 {
+                flags |= PageFlags::EXEC;
+            }
+            flags
+        };
+        let end = len
+            .div_ceil(PAGE_SIZE)
+            .checked_mul(PAGE_SIZE)
+            .and_then(|bytes| addr.checked_add(bytes))
+            .ok_or(MmapError::BadRequest)?;
+
+        // Покрытие без дыр, и только тем, что можно резать.
+        let first = self.mappings.partition_point(|region| region.end() <= addr);
+        let mut covered = addr;
+        for region in self.mappings[first..].iter().take_while(|region| region.base < end) {
+            if region.base > covered || !Self::divisible(region) {
+                return Err(MmapError::BadRequest);
+            }
+            covered = region.end();
+        }
+        if covered < end {
+            return Err(MmapError::BadRequest);
+        }
+        if self.mappings.len() + self.cuts_needed(addr, end) > MAX_MAPPINGS {
+            return Err(MmapError::Limit);
+        }
+
+        self.split_at(addr);
+        self.split_at(end);
+        let root = self.space.root();
+        let executable = flags.contains(PageFlags::EXEC);
+        let first = self.mappings.partition_point(|region| region.end() <= addr);
+        let mut failed = false;
+        for index in first..self.mappings.len() {
+            let (base, pages) = (self.mappings[index].base, self.mappings[index].pages);
+            if base >= end {
+                break;
+            }
+            let Source::Anonymous(anon) = &mut self.mappings[index].source else {
+                unreachable!("покрытие проверено выше");
+            };
+            anon.flags = flags;
+            let page_flags = anon.page_flags();
+            for page in 0..pages {
+                let virt = VirtAddr::new(base + page * PAGE_SIZE);
+                let Some((phys, _)) = arch::translate(root, virt) else {
+                    continue;
+                };
+                if executable {
+                    arch::sync_instructions(phys);
+                }
+                // Тот же кадр с другими правами — построитель таблиц разрешает
+                // именно это переотображение и сам сбрасывает трансляцию на
+                // этом процессоре.
+                // SAFETY: страница принадлежит безымянной области этой
+                // программы; кадр под ней не меняется.
+                if unsafe { self.space.map(virt, phys, page_flags) }.is_err() {
+                    failed = true;
+                }
+            }
+        }
+        if shared {
+            arch::flush_user_translations();
+        }
+        // Отказ построителя здесь возможен только на исчерпании кадров под
+        // промежуточные таблицы — а они у присутствующей страницы уже есть.
+        // Значит, это расхождение таблиц с записью, и молчать о нём нельзя.
+        if failed {
+            kprintln!("  user        : WARNING: mprotect could not rewrite a page at {addr:#x}");
+            return Err(MmapError::NoMemory);
+        }
+        Ok(())
+    }
+
+    /// Снять область `index` целиком — просьба совпала с ней адрес в адрес и
+    /// длина в длину.
+    fn unmap_whole(&mut self, index: usize, shared: bool) -> Result<(), MmapError> {
+        let (addr, pages) = (self.mappings[index].base, self.mappings[index].pages);
 
         // Поверхность окна этим вызовом не снимается, и сказано это не здесь, а
         // в договоре ([`user_abi::SYS_WINOPEN`]): кадры под ней принадлежат
@@ -964,7 +1273,7 @@ impl Program {
 
         // SAFETY: область выдана этой же программе и записана в её таблице, то
         // есть кадры под ней принадлежат ей одной.
-        let freed = unsafe { self.space.unmap_range(VirtAddr::new(addr), pages) };
+        let freed = unsafe { self.space.unmap_range(VirtAddr::new(addr), pages, shared) };
 
         let region = self.mappings.remove(index);
         // Сколько страниц обязано было вернуться — вопрос к источнику: у
@@ -977,7 +1286,10 @@ impl Program {
             // в счёт они идут поштучно: единица учёта здесь кадр, а не запись
             // таблицы. Поэтому число то же самое, чем бы область ни была
             // отображена, — и именно поэтому оно ничего не скрывает.
-            Source::Anonymous => region.pages,
+            Source::Anonymous(Anon { lazy: false, .. }) => region.pages,
+            // У ленивой отображено ровно то, чего программа коснулась, и
+            // сверять вернувшееся не с чем.
+            Source::Anonymous(Anon { lazy: true, .. }) => freed,
             // Сторожевая страница не отображалась никогда, значит и вернуться
             // ей неоткуда.
             Source::ThreadStack => region.pages - 1,
@@ -1069,11 +1381,7 @@ impl Program {
 
     /// Записать область в таблицу, сохранив порядок по адресу.
     fn remember(&mut self, region: Mapping) {
-        let at = self
-            .mappings
-            .iter()
-            .position(|other| other.base > region.base)
-            .unwrap_or(self.mappings.len());
+        let at = self.mappings.partition_point(|other| other.base < region.base);
         self.mappings.insert(at, region);
     }
 
@@ -1101,11 +1409,19 @@ impl Program {
     /// путь чтения спит, и вторая программа, отказавшая в это время, ждала бы
     /// не носитель, а чужой замок.
     fn fault_plan(&self, page_addr: usize, write: bool) -> Option<FaultPlan> {
-        let region = self.mappings.iter().find(|region| {
-            page_addr >= region.base && page_addr < region.base + region.pages * PAGE_SIZE
-        })?;
+        let region = &self.mappings[self.region_at(page_addr)?];
         let page = (page_addr - region.base) / PAGE_SIZE;
         match &region.source {
+            // Ленивая безымянная память (фаза 56): страница из ниоткуда, то
+            // есть кадр с нулями, — если права области пускают такое
+            // обращение. Запись в страницу только на чтение и любое обращение
+            // к «никак» — ошибка программы, а не повод подложить ей страницу.
+            Source::Anonymous(anon) if anon.lazy => {
+                if !anon.flags.contains(PageFlags::USER) || (write && !anon.flags.contains(PageFlags::WRITE)) {
+                    return None;
+                }
+                Some(FaultPlan { node: None, offset: 0, want: 0, flags: anon.page_flags(), clean: false })
+            }
             Source::File(file) => {
                 // Отображение только на чтение, и попытка записи — не отказ
                 // подкачки, а именно то, о чём договор предупреждал.
@@ -1113,7 +1429,7 @@ impl Program {
                     return None;
                 }
                 Some(FaultPlan {
-                    node: Arc::clone(&file.node),
+                    node: Some(Arc::clone(&file.node)),
                     offset: file.offset + (page as u64) * PAGE_SIZE as u64,
                     want: PAGE_SIZE,
                     flags: PageFlags::READ | PageFlags::USER,
@@ -1131,41 +1447,48 @@ impl Program {
                 // страницы; всё, что за ней, обязано быть нулём (`.bss`) — а
                 // не тем, что лежит в файле дальше.
                 Some(FaultPlan {
-                    node: Arc::clone(&image.node),
+                    node: Some(Arc::clone(&image.node)),
                     offset: image.offset + start as u64,
                     want: image.file_bytes.saturating_sub(start).min(PAGE_SIZE),
                     flags: image.flags,
                     clean: !image.flags.contains(PageFlags::WRITE),
                 })
             }
-            // Безымянная область отображена целиком с самого начала, поверхность
-            // окна — тоже. Отказ внутри них означает, что таблицы разошлись с
-            // этой записью, и молчать об этом нельзя: снять программу
-            // правильнее, чем тихо подложить ей чистую страницу вместо той, что
-            // потерялась.
+            // Жадная безымянная область отображена целиком с самого начала,
+            // поверхность окна — тоже. Отказ внутри них означает, что таблицы
+            // разошлись с этой записью, и молчать об этом нельзя: снять
+            // программу правильнее, чем тихо подложить ей чистую страницу
+            // вместо той, что потерялась.
             // Отказ в стеке потока — это переполнение, пришедшее в сторожевую
             // страницу, и подкладывать ему память значило бы отменить сторожа.
             // Регистры устройства и память DMA отображены целиком сразу.
-            Source::Anonymous | Source::Surface(..) | Source::ThreadStack | Source::Device => None,
+            Source::Anonymous(_) | Source::Surface(..) | Source::ThreadStack | Source::Device => None,
         }
     }
 
     /// Вторая половина отказа — снова под замком: отобразить прочитанный
-    /// кадр и учесть его. `false` — области уже нет или отобразить не вышло;
-    /// кадр тогда возвращает вызывающий.
-    fn fault_commit(&mut self, page_addr: usize, frame: PhysAddr, plan: &FaultPlan) -> bool {
-        let Some(index) = self.mappings.iter().position(|region| {
-            page_addr >= region.base && page_addr < region.base + region.pages * PAGE_SIZE
-        }) else {
-            return false;
+    /// кадр и учесть его.
+    ///
+    /// [`Commit::Raced`] — страница уже есть: её, пока мы читали без замка,
+    /// поставил другой поток того же процесса, отказавший на том же адресе.
+    /// Это не отказ, а обычный исход состязания: инструкцию можно повторять, а
+    /// наш кадр лишний. До фазы 56 этот исход был ошибкой отображения и
+    /// снимал программу — у образа, подкачиваемого по обращению, это могли
+    /// сделать два потока, впервые вошедшие в одну и ту же функцию.
+    fn fault_commit(&mut self, page_addr: usize, frame: PhysAddr, plan: &FaultPlan, shared: bool) -> Commit {
+        let Some(index) = self.region_at(page_addr) else {
+            return Commit::Failed;
         };
         let base = self.mappings[index].base;
         let page = (page_addr - base) / PAGE_SIZE;
 
+        if arch::translate(self.space.root(), VirtAddr::new(page_addr)).is_some() {
+            return Commit::Raced;
+        }
         // SAFETY: кадр наш, адрес лежит в области этой программы, и страницы
-        // под ним сейчас нет — с неё и начался отказ.
+        // под ним сейчас нет — проверено строкой выше под тем же замком.
         if unsafe { self.space.map(VirtAddr::new(page_addr), frame, plan.flags) }.is_err() {
-            return false;
+            return Commit::Failed;
         }
 
         let (what, resident, reads, evictions) = match &mut self.mappings[index].source {
@@ -1173,7 +1496,7 @@ impl Program {
             Source::Image(image) => {
                 ("program image", &mut image.resident, &mut image.reads, &mut image.evictions)
             }
-            _ => return true,
+            _ => return Commit::Mapped,
         };
         *reads += 1;
 
@@ -1189,7 +1512,7 @@ impl Program {
         // Страница на запись — своя с этого момента: в файле её нет в том виде,
         // в каком её оставит программа, и выбрасывать её нельзя.
         if !plan.clean {
-            return true;
+            return Commit::Mapped;
         }
         resident.push_back(page);
 
@@ -1202,17 +1525,30 @@ impl Program {
                 let victim = VirtAddr::new(base + old * PAGE_SIZE);
                 // SAFETY: страница принадлежит этой области, то есть этой
                 // программе; понадобится — прочитается с диска заново.
-                unsafe { self.space.unmap_range(victim, 1) };
+                unsafe { self.space.unmap_range(victim, 1, shared) };
             }
         }
 
-        true
+        Commit::Mapped
     }
+}
+
+/// Исход второй половины отказа — [`Program::fault_commit`].
+enum Commit {
+    /// Страница отображена нашим кадром.
+    Mapped,
+    /// Страницу уже поставил другой поток; наш кадр лишний, инструкцию можно
+    /// повторять.
+    Raced,
+    /// Области нет или отобразить не вышло; кадр возвращает вызывающий.
+    Failed,
 }
 
 /// Чем наполнить отказавшую страницу — ответ [`Program::fault_plan`].
 struct FaultPlan {
-    node: Arc<dyn Node>,
+    /// Откуда читать; `None` — ниоткуда, страница из нулей (ленивая
+    /// безымянная память, фаза 56).
+    node: Option<Arc<dyn Node>>,
     offset: u64,
     want: usize,
     flags: PageFlags,
@@ -1281,6 +1617,26 @@ pub fn with_current<R>(f: impl FnOnce(&mut Program) -> R) -> Option<R> {
     let process = current_process()?;
     let mut program = process.lock();
     Some(f(&mut program))
+}
+
+/// Как [`with_current`], но ещё и с ответом «у процесса больше одного потока».
+///
+/// Нужен тем, кто снимает страницы или меняет им права (фаза 56). Поток на
+/// другом процессоре мог закешировать трансляцию, и пока её не сбросили,
+/// он пишет по старому адресу — в кадр, который тем временем уже отдан
+/// другому. У однопоточного процесса такого процессора нет: уходя с
+/// процессора, задача меняет корень таблиц, и это сбрасывает её трансляции
+/// сама собой. Поэтому сброс на всех процессорах платят только те, у кого
+/// потоков несколько.
+///
+/// Считаются ссылки на процесс: по одной у каждого потока в таблице
+/// программ и одна наша. Лишняя ссылка, которую держит кто-то мимоходом
+/// (диспетчер задач), даёт лишний сброс — это дорого, но не неверно.
+pub fn with_current_shared<R>(f: impl FnOnce(&mut Program, bool) -> R) -> Option<R> {
+    let process = current_process()?;
+    let shared = Arc::strong_count(&process) > 2;
+    let mut program = process.lock();
+    Some(f(&mut program, shared))
 }
 
 /// Сколько байт поверхности окна ядро согласно выдать.
@@ -1853,6 +2209,7 @@ fn load(
 ) -> Result<Loaded, Error> {
     let image = elf::Image::parse(header, file_len).map_err(Error::Elf)?;
     let bias = if image.position_independent { image_bias(&image)? } else { 0 };
+    let tls = image.tls((WINDOW_BASE, WINDOW_BASE + IMAGE_LIMIT_BYTES), bias).map_err(Error::Elf)?;
 
     // Сегменты по возрастанию адреса. Права уже в понятиях страниц.
     struct Seg {
@@ -1872,7 +2229,7 @@ fn load(
         if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) {
             return Err(Error::WriteExecute((segment.vaddr - WINDOW_BASE) / PAGE_SIZE));
         }
-        if segs.len() >= MAX_MAPPINGS / 2 {
+        if segs.len() >= MAX_IMAGE_SEGMENTS {
             return Err(Error::TooManySegments);
         }
         segs.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
@@ -1974,7 +2331,7 @@ fn load(
                         return Err(Error::Elf(elf::ElfError::BadSegment));
                     };
                     let file_bytes = (lead + seg.filesz).saturating_sub(skipped);
-                    if mappings.len() >= MAX_MAPPINGS / 2 {
+                    if mappings.len() >= MAX_IMAGE_SEGMENTS {
                         return Err(Error::TooManySegments);
                     }
                     mappings.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
@@ -2050,6 +2407,25 @@ fn load(
         // Канарейка-терминатор: младший байт — ноль, чтобы строковые функции,
         // переполняющие буфер, останавливались на нём, не дописав остаток.
         random[0] = 0;
+
+        // Шаблон хранилища потока (фаза 57): libc строит по нему блок TLS
+        // главного потока до `main` и каждого нового потока. Ядро и так
+        // читает заголовки программы; отдать libc готовый ответ проще и
+        // надёжнее, чем учить её находить `PT_TLS` самой.
+        if let Some(tls) = tls {
+            let words = [tls.vaddr as u64, tls.filesz as u64, tls.memsz as u64, tls.align as u64];
+            // SAFETY: тот же кадр; смещение и длина внутри страницы проверены
+            // на этапе компиляции договора (`PROCESS_PAGE_TLS`).
+            let out = unsafe {
+                core::slice::from_raw_parts_mut(
+                    frame_bytes(frame).add(user_abi::PROCESS_PAGE_TLS),
+                    size_of::<user_abi::TlsTemplate>(),
+                )
+            };
+            for (chunk, word) in out.chunks_exact_mut(8).zip(words) {
+                chunk.copy_from_slice(&word.to_ne_bytes());
+            }
+        }
     }
     // SAFETY: кадр принадлежит этой программе и вернётся в пул при разборе
     // пространства вместе со стеком; отображение — только на чтение.
@@ -2476,7 +2852,7 @@ pub fn futex_key(addr: usize) -> Option<usize> {
         program.mappings.iter().any(|region| {
             addr >= region.base
                 && addr < region.base + region.pages * PAGE_SIZE
-                && matches!(region.source, Source::Anonymous | Source::ThreadStack)
+                && matches!(region.source, Source::Anonymous(_) | Source::ThreadStack)
         })
     })
     .unwrap_or(false);
@@ -2580,7 +2956,8 @@ pub fn spawn_thread(entry: usize, arg: usize, stack_bytes: usize) -> Result<sche
             // SAFETY: указатель получен из `Box::into_raw` строкой выше и
             // больше никому не отдавался.
             drop(unsafe { alloc::boxed::Box::from_raw(raw) });
-            let _ = process.lock().munmap(region, region_bytes);
+            // Поток не исполнился ни разу, и чужих трансляций его стека нет.
+            let _ = process.lock().munmap(region, region_bytes, false);
             Err(match err {
                 sched::SpawnError::OutOfMemory => ThreadError::NoMemory,
                 sched::SpawnError::TooManyTasks => ThreadError::TooManyTasks,
@@ -2640,7 +3017,10 @@ extern "C" fn thread_entry(arg: usize) -> ! {
     // Стек возвращается процессу — **после** ухода с его таблиц, и это не
     // предосторожность, а условие: снимать отображение стека, на котором
     // стоишь, нельзя.
-    let _ = start.process.lock().munmap(start.region, start.region_bytes);
+    // Сброс на всех процессорах — если в процессе остался кто-то ещё: поток
+    // мог отдать соседу адрес на своём стеке, и тот ходил по нему.
+    let shared = Arc::strong_count(&start.process) > 1;
+    let _ = start.process.lock().munmap(start.region, start.region_bytes, shared);
     {
         let mut table = PROGRAMS.lock();
         if let Some(entry) = table.get_mut(slot) {
@@ -2858,17 +3238,18 @@ pub fn fault_in(addr: usize, write: bool, present: bool) -> bool {
     // программы: обращение по `page_addr` вызвало бы тот же отказ, который
     // мы сейчас и обрабатываем.
     let buffer = unsafe { core::slice::from_raw_parts_mut(frame_bytes(frame), PAGE_SIZE) };
-    let read = if plan.want == 0 {
-        // Страница целиком за файловой частью сегмента — чистый `.bss`.
-        0
-    } else {
-        match plan.node.read_at(plan.offset, &mut buffer[..plan.want]) {
+    let read = match &plan.node {
+        // Страница целиком за файловой частью сегмента — чистый `.bss`; или
+        // ленивая безымянная память, у которой файла нет вовсе.
+        _ if plan.want == 0 => 0,
+        None => 0,
+        Some(node) => match node.read_at(plan.offset, &mut buffer[..plan.want]) {
             Ok(read) => read,
             Err(_) => {
                 return_frame(frame);
                 return false;
             }
-        }
+        },
     };
     // Хвост последней страницы файла обязан быть нулём, а не тем, что лежало
     // в кадре: чтение за концом возвращает короткий счёт и остаток буфера не
@@ -2878,11 +3259,19 @@ pub fn fault_in(addr: usize, write: bool, present: bool) -> bool {
     debug_assert!(buffer[read..].iter().all(|byte| *byte == 0));
 
     // Шаг третий, снова под замком: отобразить и учесть.
-    let mapped = with_current(|program| program.fault_commit(page_addr, frame, &plan)).unwrap_or(false);
-    if !mapped {
-        return_frame(frame);
+    let commit = with_current_shared(|program, shared| program.fault_commit(page_addr, frame, &plan, shared))
+        .unwrap_or(Commit::Failed);
+    match commit {
+        Commit::Mapped => true,
+        Commit::Raced => {
+            return_frame(frame);
+            true
+        }
+        Commit::Failed => {
+            return_frame(frame);
+            false
+        }
     }
-    mapped
 }
 
 /// Исполняет ли текущая задача код в третьем кольце.

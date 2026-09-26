@@ -42,11 +42,19 @@
 #define SYS_RANDOM 38
 #define SYS_MMAP 42
 #define SYS_MUNMAP 43
+#define SYS_MMAP_FILE 44
 #define SYS_FSTAT 47
 #define SYS_ISATTY 48
 #define SYS_CLOCK 49
 #define SYS_NANOSLEEP 50
 #define SYS_TIMES 52
+#define SYS_SYSINFO 57
+#define SYS_THREAD_CREATE 63
+#define SYS_SET_TLS 64
+#define SYS_THREAD_EXIT 65
+#define SYS_FUTEX_WAIT 66
+#define SYS_FUTEX_WAKE 67
+#define SYS_MPROTECT 72
 
 /* ── Значения, которые эти вызовы принимают и возвращают ──────────────────── */
 
@@ -69,6 +77,17 @@
 /* `кто` у `SYS_SPAWN`: запустить с теми же правами, что у запускающего.
  * Минус единица, а не ноль: ноль — это root, то есть совсем другая просьба. */
 #define FREEOS_SPAWN_INHERIT (-1)
+
+/* Флаг `SYS_MMAP`: кадры по первому касанию, а не сразу (фаза 56). */
+#define FREEOS_MAP_LAZY 2
+
+/* Ответы `SYS_FUTEX_WAIT`, кроме нуля («разбудили»). */
+#define FREEOS_FUTEX_CHANGED 1
+#define FREEOS_FUTEX_TIMED_OUT 2
+
+/* Страница процесса и шаблон TLS в ней (фаза 57, `user_abi::TlsTemplate`). */
+#define FREEOS_PROCESS_PAGE 0x0000008060c00000UL
+#define FREEOS_PROCESS_PAGE_TLS 64
 
 #define FREEOS_CLOCK_REALTIME 0
 #define FREEOS_CLOCK_MONOTONIC 1

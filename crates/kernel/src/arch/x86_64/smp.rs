@@ -488,3 +488,103 @@ extern "sysv64" fn secondary_entry(index: usize) -> ! {
 pub fn stop_others() {
     apic::send_to_others(apic::VECTOR_IPI_STOP);
 }
+
+// --- Сброс трансляций на всех процессорах (фаза 56) ----------------------------
+
+/// Номер последней просьбы сбросить трансляции программ.
+static FLUSH_ASKED: AtomicU64 = AtomicU64::new(0);
+
+/// По какую просьбу включительно каждый процессор уже сбросил.
+static FLUSH_DONE: [AtomicU64; crate::smp::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// Сколько ждать ответа, прежде чем сказать о молчащем процессоре вслух.
+///
+/// Секунда — на порядки больше, чем любой исправный процессор держит
+/// прерывания закрытыми (самое долгое такое место — сборка кадра, сотни
+/// миллисекунд в отладочной сборке). Дольше — это не «медленно», а «не
+/// ответит», и ждать вечно значило бы превратить чужую поломку в свою.
+const FLUSH_PATIENCE_MS: u64 = 1_000;
+
+/// Сбросить трансляции программ на всех процессорах, кроме этого, и
+/// дождаться, что сбросили (фаза 56).
+///
+/// # Зачем
+///
+/// `invlpg` сбрасывает трансляцию только на том процессоре, который его
+/// исполнил. Пока у процесса был один поток, больше и не требовалось: уходя с
+/// процессора, задача меняет `CR3`, и это сбрасывает её трансляции само. Поток
+/// же, работающий на другом процессоре в том же пространстве, держит свои — и
+/// после `munmap` пишет по ним в кадр, который пул уже отдал другому.
+///
+/// На AArch64 этого вопроса нет: `tlbi …is` рассылается всем процессорам
+/// аппаратно, и `arch::flush_user_translations` там пуст.
+///
+/// # Почему ждём с закрытыми прерываниями и обслуживаем себя сами
+///
+/// Два процессора могут попросить друг друга одновременно. С открытыми
+/// прерываниями это бы обошлось, но с ними задачу могли бы вытеснить посреди
+/// ожидания и перенести на другой процессор — и она ждала бы ответа от того,
+/// кому ничего не посылала. Поэтому ожидание идёт с закрытыми, а встречную
+/// просьбу процессор выполняет в том же цикле, не дожидаясь прерывания.
+///
+/// Сбрасывается всё, а не страница: перезапись `CR3` тем же значением стоит
+/// одного обхода таблиц на каждый следующий промах, и это дешевле, чем
+/// передавать другим процессорам список адресов.
+pub fn shootdown() {
+    super::interrupts::without_interrupts(|| {
+        let me = current_index();
+        let others = crate::smp::online_mask() & !(1u32 << me);
+        if others == 0 {
+            return;
+        }
+        let ticket = FLUSH_ASKED.fetch_add(1, Ordering::AcqRel) + 1;
+        apic::send_to_others(apic::VECTOR_IPI_FLUSH);
+
+        let start = super::tsc::counter();
+        let patience = super::tsc::frequency() / 1000 * FLUSH_PATIENCE_MS;
+        loop {
+            serve_flush();
+            let behind = (0..crate::smp::MAX_CPUS)
+                .filter(|&cpu| others & (1u32 << cpu) != 0)
+                .find(|&cpu| FLUSH_DONE[cpu].load(Ordering::Acquire) < ticket);
+            let Some(cpu) = behind else {
+                break;
+            };
+            if patience != 0 && super::tsc::counter().wrapping_sub(start) > patience {
+                crate::kprintln!(
+                    "  smp         : WARNING: cpu {cpu} did not flush its translations within {FLUSH_PATIENCE_MS} ms                      (ticket {ticket}, mask {others:#x}, done {:?}, interrupts {:?})",
+                    FLUSH_DONE.each_ref().map(|done| done.load(Ordering::Relaxed)),
+                    FLUSH_IRQS.each_ref().map(|count| count.load(Ordering::Relaxed)),
+                );
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    });
+}
+
+/// Выполнить просьбы сбросить трансляции, пришедшие к этому процессору.
+///
+/// Зовётся обработчиком [`apic::VECTOR_IPI_FLUSH`] и циклом ожидания в
+/// [`shootdown`]. Отвечает на все просьбы по текущую разом: сброс один и тот
+/// же, сколько бы их ни накопилось.
+/// Сколько прерываний сброса принял каждый процессор — для предупреждения
+/// о молчащем: «не дошло» и «дошло, но не туда» различаются только им.
+static FLUSH_IRQS: [AtomicU64; crate::smp::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// Обработчик [`apic::VECTOR_IPI_FLUSH`].
+pub fn on_flush_interrupt() {
+    FLUSH_IRQS[current_index()].fetch_add(1, Ordering::Relaxed);
+    serve_flush();
+}
+
+pub fn serve_flush() {
+    let me = current_index();
+    let asked = FLUSH_ASKED.load(Ordering::Acquire);
+    if FLUSH_DONE[me].load(Ordering::Relaxed) < asked {
+        paging::flush_local_translations();
+        FLUSH_DONE[me].fetch_max(asked, Ordering::Release);
+    }
+}

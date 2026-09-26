@@ -47,6 +47,8 @@ const MACHINE: u16 = 183;
 const PT_LOAD: u32 = 1;
 /// Путь к динамическому загрузчику.
 const PT_INTERP: u32 = 3;
+/// Шаблон хранилища потока: `.tdata` и `.tbss` (фаза 57).
+const PT_TLS: u32 = 7;
 
 /// Биты `p_flags` program header'а. Порядок обратен привычному по `readelf`
 /// написанию «RWX» и обратен конвенции [`boot_info`] — см. [`Segment::flags`].
@@ -95,6 +97,20 @@ impl fmt::Display for ElfError {
             }
         }
     }
+}
+
+/// Шаблон хранилища потока (`PT_TLS`) — то, что libc копирует в блок каждого
+/// потока (фаза 57).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TlsTemplate {
+    /// Где лежит начальное содержимое (`.tdata`) — уже со сдвигом образа.
+    pub vaddr: usize,
+    /// Сколько байт копировать.
+    pub filesz: usize,
+    /// Сколько занимает блок (`.tdata` и `.tbss`); за `filesz` — нули.
+    pub memsz: usize,
+    /// Выравнивание блока.
+    pub align: usize,
 }
 
 /// Загружаемый сегмент в том виде, в каком он нужен загрузчику.
@@ -233,6 +249,35 @@ impl<'a> Image<'a> {
             return Err(ElfError::NoSegments);
         }
         Ok((low, high))
+    }
+
+    /// Шаблон хранилища потока, если он у программы есть (фаза 57).
+    ///
+    /// Проверяется так же строго, как загружаемый сегмент, и по той же
+    /// причине: libc будет копировать отсюда байты, и адрес, указывающий мимо
+    /// образа, стал бы чтением чужой памяти от имени программы. Начальное
+    /// содержимое обязано лежать внутри окна образа; выравнивание — степень
+    /// двойки (ноль и единица значат «без выравнивания»).
+    pub fn tls(&self, window: (usize, usize), bias: usize) -> Result<Option<TlsTemplate>, ElfError> {
+        for index in 0..self.phnum {
+            let at = self.phoff + index * self.phentsize;
+            if u32(self.bytes, at) != PT_TLS {
+                continue;
+            }
+            let vaddr = (u64(self.bytes, at + 16) as usize).checked_add(bias).ok_or(ElfError::OutOfWindow)?;
+            let filesz = u64(self.bytes, at + 32) as usize;
+            let memsz = u64(self.bytes, at + 40) as usize;
+            let align = (u64(self.bytes, at + 48) as usize).max(1);
+            if filesz > memsz || !align.is_power_of_two() {
+                return Err(ElfError::BadSegment);
+            }
+            let end = vaddr.checked_add(filesz).ok_or(ElfError::BadSegment)?;
+            if filesz > 0 && (vaddr < window.0 || end > window.1) {
+                return Err(ElfError::OutOfWindow);
+            }
+            return Ok(Some(TlsTemplate { vaddr, filesz, memsz, align }));
+        }
+        Ok(None)
     }
 
     /// Перебрать загружаемые сегменты.

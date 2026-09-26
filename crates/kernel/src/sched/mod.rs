@@ -338,7 +338,10 @@ impl Scheduler {
         for task in self.tasks.iter_mut().flatten() {
             let due = match task.state {
                 TaskState::Blocked(
-                    Wait::Until(tick) | Wait::Input(tick) | Wait::IrqUntil(_, tick),
+                    Wait::Until(tick)
+                    | Wait::Input(tick)
+                    | Wait::IrqUntil(_, tick)
+                    | Wait::FutexUntil(_, tick),
                 ) => now >= tick,
                 _ => false,
             };
@@ -841,7 +844,12 @@ pub fn wake_lock(address: usize) {
 /// щель, разбудил бы того, кто ещё не спит, и спящий не проснулся бы никогда.
 /// Пока засыпающий держит лок планировщика, прерывания запрещены, и другой
 /// задаче на этом процессоре не достанется ни такта, а на соседнем — ни лока.
-pub fn block_on_futex(key: usize, ready: impl FnOnce() -> bool) {
+///
+/// `until` — отметка времени работы системы в миллисекундах, после которой
+/// ждать хватит (фаза 57); `None` — без срока. Вышел ли срок, решает
+/// вызывающий, сравнив часы после возврата: пробуждение и срок могли
+/// прийти в один и тот же миг, и перепроверка условия всё равно на нём.
+pub fn block_on_futex(key: usize, until: Option<u64>, ready: impl FnOnce() -> bool) {
     {
         let mut sched = SCHED.lock();
         if !sched.running || ready() {
@@ -849,7 +857,10 @@ pub fn block_on_futex(key: usize, ready: impl FnOnce() -> bool) {
         }
         let current = sched.current();
         if let Some(task) = sched.tasks[current].as_mut() {
-            task.state = TaskState::Blocked(Wait::Futex(key));
+            task.state = TaskState::Blocked(match until {
+                Some(at) => Wait::FutexUntil(key, at),
+                None => Wait::Futex(key),
+            });
         }
     }
     schedule();
@@ -867,7 +878,7 @@ pub fn wake_futex(key: usize, count: usize) -> usize {
         if count != 0 && woken >= count {
             break;
         }
-        if task.state == TaskState::Blocked(Wait::Futex(key)) {
+        if matches!(task.state, TaskState::Blocked(Wait::Futex(waited) | Wait::FutexUntil(waited, _)) if waited == key) {
             task.state = TaskState::Ready;
             woken += 1;
         }

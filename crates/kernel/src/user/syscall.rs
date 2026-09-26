@@ -162,6 +162,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_UPDATE => update(a0, a1),
         SYS_MMAP => mmap(a0, a1),
         SYS_MUNMAP => munmap(a0, a1),
+        user_abi::SYS_MPROTECT => mprotect(a0, a1, a2),
         SYS_MMAP_FILE => mmap_file(a0, a1, a2),
         // Фаза 44: то, без чего не встаёт libc.
         SYS_DUP => dup(a0, a1),
@@ -192,7 +193,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_SET_TLS => set_tls(a0),
         user_abi::SYS_THREAD_EXIT => thread_exit(a0 as i64),
         // Фаза 55c: ожидание на адресе.
-        user_abi::SYS_FUTEX_WAIT => futex_wait(a0, a1 as u32),
+        user_abi::SYS_FUTEX_WAIT => futex_wait(a0, a1 as u32, a2),
         user_abi::SYS_FUTEX_WAKE => futex_wake(a0, a1),
         // Веха «драйверы по VID:PID», Д1: устройство — программе.
         user_abi::SYS_DEVICE_OPEN => device_open(a0, a1),
@@ -1209,9 +1210,20 @@ fn mmap_file(fd: usize, offset: usize, len: usize) -> i64 {
     }
 }
 
-/// `munmap(addr, len)` — вернуть системе то, что выдал [`mmap`].
+/// `munmap(addr, len)` — вернуть системе то, что выдал [`mmap`], целиком или
+/// кусками (фаза 56).
 fn munmap(addr: usize, len: usize) -> i64 {
-    match super::with_current(|program| program.munmap(addr, len)) {
+    match super::with_current_shared(|program, shared| program.munmap(addr, len, shared)) {
+        Some(Ok(())) => 0,
+        Some(Err(err)) => mmap_errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `mprotect(addr, len, prot)` — поменять права страниц своей безымянной
+/// памяти (фаза 56, [`user_abi::SYS_MPROTECT`]).
+fn mprotect(addr: usize, len: usize, prot: usize) -> i64 {
+    match super::with_current_shared(|program, shared| program.mprotect(addr, len, prot, shared)) {
         Some(Ok(())) => 0,
         Some(Err(err)) => mmap_errno(err),
         None => ERR_NO_PROGRAM,
@@ -1234,6 +1246,9 @@ fn mmap_errno(err: super::MmapError) -> i64 {
         // придумывать для отображения второй словарь тех же самых причин
         // значило бы завести два ответа на один вопрос.
         super::MmapError::BadFile(err) => errno(err),
+        // Страница на запись и исполнение сразу — не «бессмысленная просьба», а
+        // запрет системы, и программа должна отличать одно от другого.
+        super::MmapError::WriteExecute => user_abi::ERR_PERMISSION,
     }
 }
 
@@ -1847,12 +1862,15 @@ fn thread_exit(code: i64) -> i64 {
 }
 
 /// `futex_wait(addr, expected) -> 0 | FUTEX_CHANGED`.
-fn futex_wait(addr: usize, expected: u32) -> i64 {
+fn futex_wait(addr: usize, expected: u32, timeout_ms: usize) -> i64 {
     let Some(key) = super::futex_key(addr) else {
         return ERR_BAD_ADDRESS;
     };
     let word = addr as *const u32;
     let mut slept = true;
+    // Срок — от этого мига. Ноль — без срока: так звали вызов до фазы 57, и
+    // так зовут его программы на Rust, которым срок не нужен.
+    let until = (timeout_ms != 0).then(|| time::uptime_ms().saturating_add(timeout_ms as u64));
     // Сравнение делает замыкание, и делает его **под локом планировщика** —
     // в этом весь смысл вызова. Прочитай мы слово здесь и передай числом,
     // между чтением и сном снова появилась бы щель, ради закрытия которой всё
@@ -1861,7 +1879,7 @@ fn futex_wait(addr: usize, expected: u32) -> i64 {
     // Чтение из ядра по адресу программы законно: `futex_key` проверил и
     // права, и наличие страницы, а вытеснить её у разрешённых видов области
     // некому.
-    sched::block_on_futex(key, || {
+    sched::block_on_futex(key, until, || {
         // SAFETY: адрес проверен `futex_key`: он принадлежит программе,
         // выровнен и отображён на чтение и запись.
         let now = unsafe { core::ptr::read_volatile(word) };
@@ -1871,7 +1889,13 @@ fn futex_wait(addr: usize, expected: u32) -> i64 {
         }
         false
     });
-    if slept { 0 } else { user_abi::FUTEX_CHANGED }
+    if !slept {
+        return user_abi::FUTEX_CHANGED;
+    }
+    match until {
+        Some(at) if time::uptime_ms() >= at => user_abi::FUTEX_TIMED_OUT,
+        _ => 0,
+    }
 }
 
 /// `futex_wake(addr, count) -> сколько разбудили`.

@@ -3020,6 +3020,28 @@ fn freeze_report(hmp: &mut monitor::Monitor) -> String {
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+    // Верх стека каждого процессора. Адрес исполняемой инструкции говорит,
+    // **где** процессор стоит, но не **кто** его туда позвал: так 27.09 нашёлся
+    // процессор, крутившийся в `memcmp` с закрытыми прерываниями. Слова стека,
+    // попадающие в образ ядра, — адреса возврата; символизируются они тем же
+    // `llvm-symbolizer --adjust-vma`, что и `RIP`. Имя регистра у двух
+    // архитектур своё; монитор, не знающий его, ответит ошибкой в журнал.
+    let cpus = hmp
+        .command("info cpus")
+        .map(|answer| answer.lines().filter(|line| line.contains("CPU #")).count())
+        .unwrap_or(0);
+    for cpu in 0..cpus {
+        report.push_str(&format!("--- стек процессора {cpu}
+"));
+        for command in [format!("cpu {cpu}"), "x/512gx $rsp".to_string(), "x/512gx $sp".to_string()] {
+            match hmp.command(&command) {
+                Ok(answer) => report.push_str(&answer),
+                Err(err) => report.push_str(&format!("(монитор не ответил на `{command}`: {err:#})")),
+            }
+            report.push('\n');
+        }
+    }
+    let _ = hmp.command("cpu 0");
     report
 }
 

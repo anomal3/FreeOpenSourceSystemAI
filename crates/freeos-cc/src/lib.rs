@@ -134,6 +134,15 @@ pub const LINUX_MACROS: [&str; 7] = [
 ///
 /// `__freeos__` объявляется здесь же и намеренно: чужому коду нужно чем-то нас
 /// опознать, а `#ifdef __linux__` мы у него отняли.
+///
+/// `_POSIX_THREADS` и `_POSIX_MONOTONIC_CLOCK` (фаза 57) — объявление
+/// возможностей системы, которое по POSIX делает `<unistd.h>`. picolibc
+/// объявляет их только для систем, которые знает (RTEMS), и без них у
+/// программы нет ни `CLOCK_MONOTONIC`, ни `sched_yield` в заголовках, — а
+/// чужой `configure`, не найдя их, соберёт себя без потоков. Объявлено ровно
+/// то, что есть: потоки (`libc/freeos/threads.c`) и монотонные часы
+/// (`SYS_CLOCK`); таймеров, семафоров и прочего из того же списка — нет, и они
+/// не объявлены.
 pub fn compile_flags(target: Target) -> Vec<String> {
     let mut flags = vec![
         format!("--target={}", triple(target)),
@@ -143,6 +152,8 @@ pub fn compile_flags(target: Target) -> Vec<String> {
         "-fPIE".into(),
         "-D__freeos__=1".into(),
         "-D__FreeOS__=1".into(),
+        "-D_POSIX_THREADS=1".into(),
+        "-D_POSIX_MONOTONIC_CLOCK=200112L".into(),
     ];
     if target == Target::X86_64 {
         for macro_name in LINUX_MACROS {

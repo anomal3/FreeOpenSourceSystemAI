@@ -205,6 +205,13 @@ pub enum Wait {
     /// по разным адресам, обязаны ждать на одном ключе, иначе разбудивший не
     /// нашёл бы ждущего.
     Futex(usize),
+    /// То же ожидание на адресе, но не дольше этой отметки времени (фаза 57).
+    ///
+    /// Нужно условным переменным с таймаутом (`pthread_cond_timedwait`): чужая
+    /// среда исполнения ждёт так постоянно — сборщик мусора, пул потоков,
+    /// таймеры. Отдельный вариант по той же причине, что [`Wait::IrqUntil`]:
+    /// «поспать, потом подождать» пропустило бы пробуждение, пришедшее во сне.
+    FutexUntil(usize, u64),
 }
 
 impl fmt::Display for TaskState {
@@ -245,7 +252,9 @@ impl TaskState {
             Self::Blocked(Wait::Until(at)) => Some(("sleeping until uptime ms", at)),
             Self::Blocked(Wait::Task(id)) => Some(("waiting for task #", u64::from(id.as_u32()))),
             Self::Blocked(Wait::Input(at)) => Some(("waiting for input until uptime ms", at)),
-            Self::Blocked(Wait::Futex(key)) => Some(("waiting on an address, key", key as u64)),
+            Self::Blocked(Wait::Futex(key) | Wait::FutexUntil(key, _)) => {
+                Some(("waiting on an address, key", key as u64))
+            }
             Self::Blocked(Wait::Irq(source)) => Some(("waiting for device", u64::from(source))),
             Self::Blocked(Wait::IrqUntil(source, _)) => {
                 Some(("waiting for device (with a deadline)", u64::from(source)))
