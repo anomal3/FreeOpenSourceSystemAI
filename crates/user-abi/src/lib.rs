@@ -1273,6 +1273,41 @@ pub const SYS_DMA_ALLOC: usize = 71;
 /// Отказ не оставляет половины работы: всё проверяется до первой правки.
 pub const SYS_MPROTECT: usize = 72;
 
+/// Что поток знает о себе: свой номер и границы своего стека (фаза 58b).
+///
+/// `arg0` — адрес [`ThreadInfo`] в памяти программы, куда ядро запишет ответ.
+/// Возвращает ноль.
+///
+/// # Зачем
+///
+/// Стек потока выделяет ядро ([`SYS_THREAD_CREATE`]), стек главного потока —
+/// тоже, и со случайным сдвигом (ASLR). Значит, границ своего стека программа не
+/// знает — а чужой среде исполнения они нужны: сборщик мусора обходит стеки
+/// потоков в поисках ссылок, и Mono узнаёт их через `pthread_getattr_np`.
+/// Угадывать их по указателю стека на входе нельзя: вершина сдвинута под
+/// аргументы, а низа по вершине не видно вовсе.
+///
+/// Номер — тот же, что вернул [`SYS_THREAD_CREATE`] и что печатает `tasks`, у
+/// главного потока — номер задачи программы.
+pub const SYS_THREAD_INFO: usize = 73;
+
+/// Ответ [`SYS_THREAD_INFO`].
+///
+/// `stack_low..stack_high` — вся память стека, которой поток вправе
+/// пользоваться: сторожевая страница под ней в диапазон не входит. У главного
+/// потока диапазон включает ленивую часть, кадры под которую приходят по
+/// первому касанию.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThreadInfo {
+    /// Номер задачи потока.
+    pub id: u64,
+    /// Нижний адрес стека (включительно).
+    pub stack_low: u64,
+    /// Верхний адрес стека (не включительно).
+    pub stack_high: u64,
+}
+
 /// [`SYS_MPROTECT`]: никакого доступа.
 pub const PROT_NONE: usize = 0;
 /// [`SYS_MPROTECT`]: чтение.
@@ -1416,7 +1451,7 @@ pub const SYSINFO_DARK: u32 = 1;
 /// продолжает работать, потому что всё, что она знала, осталось на месте.
 /// Старшая — когда что-нибудь меняет смысл; такого пока не случалось, и
 /// случаться не должно.
-pub const ABI_VERSION: u32 = 0x0001_0005;
+pub const ABI_VERSION: u32 = 0x0001_0006;
 
 /// [`SYS_DUP`]: «дай самый маленький свободный номер».
 ///
@@ -2109,6 +2144,7 @@ mod tests {
         assert_eq!(SYS_DEVICE_WAIT, 70);
         assert_eq!(SYS_DMA_ALLOC, 71);
         assert_eq!(SYS_MPROTECT, 72);
+        assert_eq!(SYS_THREAD_INFO, 73);
         assert_eq!((PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC), (0, 1, 2, 4));
         assert_eq!((MAP_HUGE, MAP_LAZY), (1, 2));
         assert_eq!((FUTEX_CHANGED, FUTEX_TIMED_OUT), (1, 2));
@@ -2140,7 +2176,9 @@ mod tests {
             SYS_MMAP, SYS_MUNMAP, SYS_MMAP_FILE, SYS_GETCPU, SYS_DUP, SYS_FSTAT, SYS_ISATTY,
             SYS_CLOCK, SYS_NANOSLEEP, SYS_POLL, SYS_TIMES, SYS_WINOPEN, SYS_WINCOMMIT,
             SYS_WINEVENT, SYS_WINCLOSE, SYS_SYSINFO, SYS_MOUNTS, SYS_TASKS, SYS_KILL,
-            SYS_DEVICES, SYS_WINRESIZE,
+            SYS_DEVICES, SYS_WINRESIZE, SYS_THREAD_CREATE, SYS_SET_TLS, SYS_THREAD_EXIT,
+            SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_DEVICE_OPEN, SYS_DEVICE_MAP, SYS_DEVICE_WAIT,
+            SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(
@@ -2262,6 +2300,7 @@ mod tests {
         //
         // В фазе N5b приписано число процессоров: 140 байт, выровненные до 144.
         assert_eq!(size_of::<SysInfo>(), 144);
+        assert_eq!(size_of::<ThreadInfo>(), 24);
         assert_eq!(core::mem::offset_of!(SysInfo, cpus), 136);
         assert_eq!(align_of::<SysInfo>(), 8);
         assert_eq!(core::mem::offset_of!(SysInfo, uptime_ms), 0);
@@ -2289,7 +2328,9 @@ mod tests {
         // 0x0001_0005 — память для чужой среды и потоки в libc (фазы 56–57):
         // `SYS_MPROTECT`, `MAP_LAZY`, частичный `munmap`, срок у
         // `SYS_FUTEX_WAIT`, шаблон TLS в странице процесса.
-        assert_eq!(ABI_VERSION, 0x0001_0005);
+        // 0x0001_0006 — `SYS_THREAD_INFO` и стек главного потока в мегабайт
+        // (фаза 58b).
+        assert_eq!(ABI_VERSION, 0x0001_0006);
 
         assert_eq!(FD_STDIN, 0);
         assert_eq!(FD_STDOUT, 1);

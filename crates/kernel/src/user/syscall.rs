@@ -192,6 +192,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_THREAD_CREATE => thread_create(a0, a1, a2),
         user_abi::SYS_SET_TLS => set_tls(a0),
         user_abi::SYS_THREAD_EXIT => thread_exit(a0 as i64),
+        // Фаза 58b: номер и стек — чужой среде для сборщика мусора.
+        user_abi::SYS_THREAD_INFO => thread_info(a0),
         // Фаза 55c: ожидание на адресе.
         user_abi::SYS_FUTEX_WAIT => futex_wait(a0, a1 as u32, a2),
         user_abi::SYS_FUTEX_WAKE => futex_wake(a0, a1),
@@ -1848,6 +1850,25 @@ fn set_tls(base: usize) -> i64 {
         return ERR_BAD_ADDRESS;
     }
     sched::set_current_tls(base as u64);
+    0
+}
+
+/// `thread_info(out) -> 0`.
+fn thread_info(out: usize) -> i64 {
+    if out % align_of::<user_abi::ThreadInfo>() != 0 {
+        return ERR_BAD_ADDRESS;
+    }
+    if !space::user_can(out, size_of::<user_abi::ThreadInfo>(), PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    let (low, high) = super::current_stack();
+    let value = user_abi::ThreadInfo {
+        id: u64::from(sched::current().as_u32()),
+        stack_low: low as u64,
+        stack_high: high as u64,
+    };
+    // SAFETY: адрес проверен на выравнивание и на запись.
+    unsafe { core::ptr::write(out as *mut user_abi::ThreadInfo, value) };
     0
 }
 

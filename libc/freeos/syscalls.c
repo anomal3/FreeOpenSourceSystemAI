@@ -17,7 +17,7 @@
  * # Почему ошибки переводятся, а не пробрасываются
  *
  * Ядро отвечает своими отрицательными кодами ([`freeos-syscall.h`]), а C ждёт
- * `-1` и `errno`. Перевод — таблица в [`set_errno`]; её неполнота названа там же
+ * `-1` и `errno`. Перевод — таблица в [`freeos_set_errno`]; её неполнота названа там же
  * вслух: код, которого в таблице нет, становится `EIO`, а не молча нулём.
  */
 
@@ -38,6 +38,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "freeos-internal.h"
 #include "freeos-syscall.h"
 
 /* ── Ошибки ──────────────────────────────────────────────────────────────── */
@@ -48,7 +49,7 @@
  * осмысленно различить. Всё прочее — `EIO`, то есть «устройство отказало». Это
  * честнее, чем выдумывать соответствие: `EIO` человек пойдёт проверять, а
  * выдуманный `EINVAL` уведёт его искать ошибку в своих аргументах. */
-static int set_errno(long code) {
+int freeos_set_errno(long code) {
     switch (code) {
     case FREEOS_ERR_NOT_FOUND:
         errno = ENOENT;
@@ -104,17 +105,17 @@ static int set_errno(long code) {
 
 ssize_t write(int fd, const void *buf, size_t count) {
     long done = freeos_syscall(SYS_WRITE, fd, (long)buf, (long)count);
-    return done < 0 ? set_errno(done) : (ssize_t)done;
+    return done < 0 ? freeos_set_errno(done) : (ssize_t)done;
 }
 
 ssize_t read(int fd, void *buf, size_t count) {
     long done = freeos_syscall(SYS_READ, fd, (long)buf, (long)count);
-    return done < 0 ? set_errno(done) : (ssize_t)done;
+    return done < 0 ? freeos_set_errno(done) : (ssize_t)done;
 }
 
 int close(int fd) {
     long code = freeos_syscall(SYS_CLOSE, fd, 0, 0);
-    return code < 0 ? set_errno(code) : 0;
+    return code < 0 ? freeos_set_errno(code) : 0;
 }
 
 /* Открыть файл.
@@ -144,8 +145,13 @@ int open(const char *path, int flags, ...) {
         os_flags |= FREEOS_O_TRUNC;
     }
 
-    long fd = freeos_syscall(SYS_OPEN, (long)path, (long)strlen(path), os_flags);
-    return fd < 0 ? set_errno(fd) : (int)fd;
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = freeos_path(path, buf);
+    if (full == NULL) {
+        return -1;
+    }
+    long fd = freeos_syscall(SYS_OPEN, (long)full, (long)strlen(full), os_flags);
+    return fd < 0 ? freeos_set_errno(fd) : (int)fd;
 }
 
 off_t lseek(int fd, off_t offset, int whence) {
@@ -165,13 +171,13 @@ off_t lseek(int fd, off_t offset, int whence) {
         return -1;
     }
     long position = freeos_syscall(SYS_SEEK, fd, (long)offset, where);
-    return position < 0 ? set_errno(position) : (off_t)position;
+    return position < 0 ? freeos_set_errno(position) : (off_t)position;
 }
 
 int isatty(int fd) {
     long answer = freeos_syscall(SYS_ISATTY, fd, 0, 0);
     if (answer < 0) {
-        set_errno(answer);
+        freeos_set_errno(answer);
         return 0;
     }
     if (answer == 0) {
@@ -218,38 +224,51 @@ int fstat(int fd, struct stat *out) {
     struct freeos_stat info;
     long code = freeos_syscall(SYS_FSTAT, fd, (long)&info, 0);
     if (code < 0) {
-        return set_errno(code);
+        return freeos_set_errno(code);
     }
     fill_stat(out, &info);
     return 0;
 }
 
 int stat(const char *path, struct stat *out) {
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = freeos_path(path, buf);
+    if (full == NULL) {
+        return -1;
+    }
     struct freeos_stat info;
-    long code = freeos_syscall(SYS_STAT, (long)path, (long)strlen(path), (long)&info);
+    long code = freeos_syscall(SYS_STAT, (long)full, (long)strlen(full), (long)&info);
     if (code < 0) {
-        return set_errno(code);
+        return freeos_set_errno(code);
     }
     fill_stat(out, &info);
     return 0;
 }
 
 int unlink(const char *path) {
-    long code = freeos_syscall(SYS_REMOVE, (long)path, (long)strlen(path), 0);
-    return code < 0 ? set_errno(code) : 0;
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = freeos_path(path, buf);
+    if (full == NULL) {
+        return -1;
+    }
+    long code = freeos_syscall(SYS_REMOVE, (long)full, (long)strlen(full), 0);
+    return code < 0 ? freeos_set_errno(code) : 0;
 }
 
-/* Столько же, сколько принимает ядро (`MAX_PATH` в `user/syscall.rs`): путь
- * длиннее оно отвергает само, и складывать такой буфер незачем. */
-enum { PATH_LIMIT = 255 };
-
 int rename(const char *from, const char *to) {
+    char from_buf[FREEOS_PATH_LIMIT + 1];
+    char to_buf[FREEOS_PATH_LIMIT + 1];
+    from = freeos_path(from, from_buf);
+    to = from != NULL ? freeos_path(to, to_buf) : NULL;
+    if (to == NULL) {
+        return -1;
+    }
     /* Оба пути уезжают одним буфером: у вызова три аргумента, а значений нужно
      * четыре — два адреса и две длины. Склейку разбирает ядро по первой длине;
      * тот же приём и в обёртке для Rust, и расходиться им нельзя. */
     size_t from_len = strlen(from);
     size_t to_len = strlen(to);
-    char joined[2 * PATH_LIMIT];
+    char joined[2 * FREEOS_PATH_LIMIT];
     if (from_len == 0 || to_len == 0 || from_len + to_len > sizeof(joined)) {
         errno = ENAMETOOLONG;
         return -1;
@@ -258,7 +277,7 @@ int rename(const char *from, const char *to) {
     memcpy(joined + from_len, to, to_len);
     long code = freeos_syscall(SYS_RENAME, (long)joined, (long)from_len,
                                (long)(from_len + to_len));
-    return code < 0 ? set_errno(code) : 0;
+    return code < 0 ? freeos_set_errno(code) : 0;
 }
 
 /* ── Запуск другой программы ─────────────────────────────────────────────── */
@@ -301,11 +320,11 @@ int system(const char *command) {
     long task = freeos_syscall(SYS_SPAWN, (long)command, (long)strlen(command),
                                FREEOS_SPAWN_INHERIT);
     if (task < 0) {
-        return set_errno(task);
+        return freeos_set_errno(task);
     }
     long code = freeos_syscall(SYS_WAIT, task, 0, 0);
     if (code < 0) {
-        return set_errno(code);
+        return freeos_set_errno(code);
     }
     /* Как у POSIX: младший байт — сигнал, которого у нас не бывает, старший —
      * код возврата. Программа на C разбирает это `WEXITSTATUS`, и выдумывать
@@ -320,7 +339,7 @@ int gettimeofday(struct timeval *now, void *timezone) {
     struct freeos_timespec stamp;
     long code = freeos_syscall(SYS_CLOCK, FREEOS_CLOCK_REALTIME, (long)&stamp, 0);
     if (code < 0) {
-        return set_errno(code);
+        return freeos_set_errno(code);
     }
     now->tv_sec = (time_t)stamp.seconds;
     now->tv_usec = (suseconds_t)(stamp.nanos / 1000);
@@ -339,7 +358,7 @@ clock_t times(struct tms *out) {
     } info;
     long code = freeos_syscall(SYS_TIMES, (long)&info, 0, 0);
     if (code < 0) {
-        return (clock_t)set_errno(code);
+        return (clock_t)freeos_set_errno(code);
     }
     memset(out, 0, sizeof(*out));
     out->tms_utime = (clock_t)info.cpu_ms;
@@ -375,7 +394,7 @@ int clock_gettime(clockid_t clock, struct timespec *now) {
     struct freeos_timespec stamp;
     long code = freeos_syscall(SYS_CLOCK, which, (long)&stamp, 0);
     if (code < 0) {
-        return set_errno(code);
+        return freeos_set_errno(code);
     }
     now->tv_sec = (time_t)stamp.seconds;
     now->tv_nsec = (long)stamp.nanos;
@@ -405,7 +424,7 @@ int nanosleep(const struct timespec *request, struct timespec *remaining) {
     }
     long code = freeos_syscall(SYS_NANOSLEEP, (long)request->tv_sec, request->tv_nsec, 0);
     if (code < 0) {
-        return set_errno(code);
+        return freeos_set_errno(code);
     }
     if (remaining != NULL) {
         remaining->tv_sec = 0;
@@ -429,7 +448,7 @@ int getentropy(void *buf, size_t len) {
     }
     long got = freeos_syscall(SYS_RANDOM, (long)buf, (long)len, 0);
     if (got < 0) {
-        return set_errno(got);
+        return freeos_set_errno(got);
     }
     if ((size_t)got != len) {
         /* `getentropy` обязана отдать **всё** запрошенное или не отдать
@@ -478,7 +497,7 @@ void *sbrk(ptrdiff_t increment) {
     if (heap_start == NULL) {
         long got = freeos_syscall(SYS_MMAP, (long)HEAP_RESERVE, FREEOS_MAP_LAZY, 0);
         if (got < 0) {
-            set_errno(got);
+            freeos_set_errno(got);
             return (void *)-1;
         }
         heap_start = (char *)got;
@@ -527,7 +546,7 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
     if ((flags & MAP_ANONYMOUS) != 0) {
         got = freeos_syscall(SYS_MMAP, (long)len, FREEOS_MAP_LAZY, 0);
         if (got < 0) {
-            set_errno(got);
+            freeos_set_errno(got);
             return MAP_FAILED;
         }
         /* Ядро выдаёт «читать и писать»; остальное — второй просьбой. */
@@ -535,7 +554,7 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
             long done = freeos_syscall(SYS_MPROTECT, got, (long)len, prot);
             if (done < 0) {
                 freeos_syscall(SYS_MUNMAP, got, (long)len, 0);
-                set_errno(done);
+                freeos_set_errno(done);
                 return MAP_FAILED;
             }
         }
@@ -548,7 +567,7 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
     }
     got = freeos_syscall(SYS_MMAP_FILE, fd, (long)offset, (long)len);
     if (got < 0) {
-        set_errno(got);
+        freeos_set_errno(got);
         return MAP_FAILED;
     }
     return (void *)got;
@@ -556,12 +575,12 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
 
 int munmap(void *addr, size_t len) {
     long done = freeos_syscall(SYS_MUNMAP, (long)addr, (long)len, 0);
-    return done < 0 ? set_errno(done) : 0;
+    return done < 0 ? freeos_set_errno(done) : 0;
 }
 
 int mprotect(void *addr, size_t len, int prot) {
     long done = freeos_syscall(SYS_MPROTECT, (long)addr, (long)len, prot);
-    return done < 0 ? set_errno(done) : 0;
+    return done < 0 ? freeos_set_errno(done) : 0;
 }
 
 /* ── Конец программы ─────────────────────────────────────────────────────── */

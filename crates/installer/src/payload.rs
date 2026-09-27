@@ -268,7 +268,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 44] = [
+const PROGRAMS: [(&CStr16, &str); 48] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -331,6 +331,11 @@ const PROGRAMS: [(&CStr16, &str); 44] = [
     // `clang`, а `__stack_chk_fail` — стартовый код `crt0.c`.
     (cstr16!("\\FREEOS\\BIN\\CSMASH"), "csmash"),
     (cstr16!("\\FREEOS\\BIN\\THREADS"), "threads"),
+    // Память для чужой среды и потоки POSIX на C (фазы 56–57).
+    (cstr16!("\\FREEOS\\BIN\\CMEM"), "cmem"),
+    (cstr16!("\\FREEOS\\BIN\\CTHREADS"), "cthreads"),
+    // Слой POSIX под чужую среду исполнения (фаза 58b).
+    (cstr16!("\\FREEOS\\BIN\\CPOSIX"), "cposix"),
     // Служба, которая ищет драйвер устройству без драйвера (веха «драйверы», Д3).
     (cstr16!("\\FREEOS\\BIN\\DRVD"), "drvd"),
     // Веб-сервер (пункт 4 очереди второго разбора). Едет вместе со своим сайтом
@@ -342,6 +347,9 @@ const PROGRAMS: [(&CStr16, &str); 44] = [
     // очереди второго разбора). Для установщика она ничем не отличается от
     // остальных: тот же ELF, то же место на носителе, то же имя в `/bin`.
     (cstr16!("\\FREEOS\\BIN\\LUA"), "lua"),
+    // Рантайм Mono 6.14.1 (фаза 58b): едет, только если собран по рецепту
+    // `ports/mono/configure.sh`, — как Lua без `cargo xtask thirdparty`.
+    (cstr16!("\\FREEOS\\BIN\\MONO"), "mono"),
 ];
 
 /// Эталонные настройки на носителе и их пути в корневом образе.

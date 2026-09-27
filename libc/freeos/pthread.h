@@ -38,9 +38,12 @@ extern "C" {
 
 typedef struct freeos_thread *pthread_t;
 
+/* `stackaddr` — низ стека; заполняет только `pthread_getattr_np` (стеки
+ * выделяет ядро, свой стек потоку не передать). */
 typedef struct {
     size_t stacksize;
     int detachstate;
+    void *stackaddr;
 } pthread_attr_t;
 
 /* Слово `state` — то, на чём спят: 0 свободен, 1 занят, 2 занят и кто-то ждёт. */
@@ -123,6 +126,16 @@ int pthread_attr_getstacksize(const pthread_attr_t *attr, size_t *size);
 int pthread_attr_setdetachstate(pthread_attr_t *attr, int state);
 int pthread_attr_getdetachstate(const pthread_attr_t *attr, int *state);
 
+/* Границы стека потока (фаза 58b) — ими сборщик мусора чужой среды узнаёт,
+ * какую память обходить. Стек выделяет ядро, поэтому узнать его можно, а
+ * задать (`pthread_attr_setstack`) — нет.
+ *
+ * `pthread_getattr_np` — расширение GNU (есть и у musl), `pthread_getthreadid_np`
+ * — FreeBSD: номер задачи потока, тот, что печатает `tasks`. */
+int pthread_getattr_np(pthread_t thread, pthread_attr_t *attr);
+int pthread_attr_getstack(const pthread_attr_t *attr, void **addr, size_t *size);
+int pthread_getthreadid_np(void);
+
 int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr);
 int pthread_mutex_destroy(pthread_mutex_t *mutex);
 int pthread_mutex_lock(pthread_mutex_t *mutex);
@@ -160,6 +173,16 @@ void *pthread_getspecific(pthread_key_t key);
 int pthread_setspecific(pthread_key_t key, const void *value);
 
 int pthread_once(pthread_once_t *once, void (*init)(void));
+
+/* Планирование (фаза 58b). Приоритетов у планировщика нет: каждый поток —
+ * `SCHED_OTHER` с приоритетом ноль, и это правда, а не заглушка. Реального
+ * времени (`SCHED_FIFO`, `SCHED_RR`) нет — его пределы `EINVAL`, просьба о нём
+ * `ENOTSUP`. Пределы объявлены здесь, потому что picolibc прячет их за
+ * `_POSIX_PRIORITY_SCHEDULING`, которого эта система не обещает. */
+int pthread_getschedparam(pthread_t thread, int *policy, struct sched_param *param);
+int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param *param);
+int sched_get_priority_max(int policy);
+int sched_get_priority_min(int policy);
 
 /* Нет механизма в ядре — `ENOSYS` (см. заголовок файла). */
 int pthread_cancel(pthread_t thread);

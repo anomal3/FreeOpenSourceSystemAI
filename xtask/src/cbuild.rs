@@ -164,7 +164,7 @@ pub struct CProgram {
 }
 
 /// Программы на C, которые едут в `/bin`.
-pub const C_PROGRAMS: [CProgram; 5] = [
+pub const C_PROGRAMS: [CProgram; 6] = [
     CProgram { name: "cdemo", needs: None, libs: &[] },
     // Переполняет свой стек нарочно: доказывает, что канарейка стека есть и у
     // программ на C. См. `libc/examples/csmash.c` и `__stack_chk_fail` в `crt0.c`.
@@ -175,6 +175,9 @@ pub const C_PROGRAMS: [CProgram; 5] = [
     // Потоки POSIX: мьютексы, условные переменные со сроком, `errno` и
     // `__thread` у каждого свои (фаза 57). См. `libc/examples/cthreads.c`.
     CProgram { name: "cthreads", needs: None, libs: &[] },
+    // Слой POSIX под чужую среду: текущий каталог, каталоги, канал с `poll`,
+    // пределы, таблица сигналов (фаза 58b). См. `libc/examples/cposix.c`.
+    CProgram { name: "cposix", needs: None, libs: &[] },
     // Чужая библиотека, собранная нашим набором. Она здесь не ради сжатия: это
     // единственная проверка, доказывающая, что код, вышедший из чужого
     // `configure`, **работает**, а не только собрался. См. `libc/examples/zdemo.c`.
@@ -192,7 +195,11 @@ pub const C_PROGRAMS: [CProgram; 5] = [
 /// с `lua` и лежит в наборе, но в образ не едет. Скрипты у нас исполняются
 /// исходниками, а четверть мегабайта в `/bin` ради возможности заранее собрать
 /// их в байткод — цена без спроса.
-pub const FOREIGN_PROGRAMS: [&str; 1] = ["lua"];
+///
+/// `mono` (фаза 58b) — рантайм Mono 6.14.1, собранный своим `configure` по
+/// рецепту `ports/mono/configure.sh`. Пока без библиотек классов: запускается
+/// и отвечает `--version`, исполнять сборки — фаза 60.
+pub const FOREIGN_PROGRAMS: [&str; 2] = ["lua", "mono"];
 
 /// Корень всего, что собрано из чужих исходников.
 ///
@@ -544,7 +551,7 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     // Слой ОС и стартовый код собираются один раз на архитектуру: они одни и те
     // же для всех программ.
     let mut common = Vec::new();
-    for name in ["crt0", "syscalls", "threads", "posix"] {
+    for name in ["crt0", "syscalls", "threads", "posix", "files"] {
         let source = libc_dir().join("freeos").join(format!("{name}.c"));
         let object = work.join(format!("{name}.o"));
         compile(arch, &source, &object, &includes)?;
@@ -776,6 +783,32 @@ mod tests {
         assert_eq!(core::mem::offset_of!(user_abi::Stat, size), 0);
         assert_eq!(core::mem::offset_of!(user_abi::Stat, mode), 8);
         assert_eq!(core::mem::offset_of!(user_abi::Stat, kind), 20);
+
+        // Фаза 58b: каталоги, `poll` и сведения о потоке. Имена полей — те же,
+        // что в договоре, по порядку; массив имени сверяется по имени до `[`.
+        let fields_of = |name: &str| -> Vec<String> {
+            let body = text
+                .split(&format!("struct {name} {{"))
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| panic!("в заголовке есть struct {name}"));
+            body.lines()
+                .filter_map(|line| line.trim().strip_suffix(';'))
+                .filter_map(|line| line.split_whitespace().nth(1))
+                .map(|field| field.split('[').next().unwrap_or(field).to_string())
+                .collect()
+        };
+        assert_eq!(
+            fields_of("freeos_dirent"),
+            ["size", "mtime", "mode", "uid", "gid", "kind", "name_len", "name"],
+            "поля `freeos_dirent` разъехались с `user_abi::Dirent`"
+        );
+        assert_eq!(core::mem::offset_of!(user_abi::Dirent, name_len), 28);
+        assert_eq!(core::mem::offset_of!(user_abi::Dirent, name), 32);
+        assert_eq!(fields_of("freeos_pollfd"), ["fd", "wanted", "ready"]);
+        assert_eq!(size_of::<user_abi::PollFd>(), 16);
+        assert_eq!(fields_of("freeos_thread_info"), ["id", "stack_low", "stack_high"]);
+        assert_eq!(size_of::<user_abi::ThreadInfo>(), 24);
     }
 
     /// Константа договора по её имени.
@@ -801,6 +834,11 @@ mod tests {
             "SYS_REMOVE" => abi::SYS_REMOVE as i64,
             "SYS_SEEK" => abi::SYS_SEEK as i64,
             "SYS_TIME" => abi::SYS_TIME as i64,
+            "SYS_READDIR" => abi::SYS_READDIR as i64,
+            "SYS_TTYMODE" => abi::SYS_TTYMODE as i64,
+            "SYS_PIPE" => abi::SYS_PIPE as i64,
+            "SYS_DUP" => abi::SYS_DUP as i64,
+            "SYS_POLL" => abi::SYS_POLL as i64,
             "SYS_RENAME" => abi::SYS_RENAME as i64,
             "SYS_SPAWN" => abi::SYS_SPAWN as i64,
             "SYS_WAIT" => abi::SYS_WAIT as i64,
@@ -821,8 +859,21 @@ mod tests {
             "SYS_FUTEX_WAIT" => abi::SYS_FUTEX_WAIT as i64,
             "SYS_FUTEX_WAKE" => abi::SYS_FUTEX_WAKE as i64,
             "SYS_MPROTECT" => abi::SYS_MPROTECT as i64,
+            "SYS_THREAD_INFO" => abi::SYS_THREAD_INFO as i64,
 
             "MAP_LAZY" => abi::MAP_LAZY as i64,
+
+            // `usize::MAX` в договоре — минус единица в регистре.
+            "DUP_ANY" => abi::DUP_ANY as i64,
+            "POLL_IN" => i64::from(abi::POLL_IN),
+            "POLL_OUT" => i64::from(abi::POLL_OUT),
+            "POLL_HUP" => i64::from(abi::POLL_HUP),
+            "POLL_BAD" => i64::from(abi::POLL_BAD),
+            "POLL_FOREVER" => abi::POLL_FOREVER,
+            "TTY_LINE" => abi::TTY_LINE as i64,
+            "TTY_RAW" => abi::TTY_RAW as i64,
+            "MAX_OPEN_FILES" => abi::MAX_OPEN_FILES as i64,
+            "MAX_NAME" => abi::MAX_NAME as i64,
 
             "FUTEX_CHANGED" => abi::FUTEX_CHANGED,
             "FUTEX_TIMED_OUT" => abi::FUTEX_TIMED_OUT,

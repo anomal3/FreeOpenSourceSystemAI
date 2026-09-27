@@ -1,0 +1,236 @@
+--- a/config.sub
++++ b/config.sub
+@@ -1754,7 +1754,7 @@
+ 	     | onefs* | tirtos* | phoenix* | fuchsia* | redox* | bme* \
+ 	     | midnightbsd* | amdhsa* | unleashed* | emscripten* | wasi* \
+ 	     | nsk* | powerunix* | genode* | zvmoe* | qnx* | emx* | zephyr* \
+-	     | fiwix* )
++	     | fiwix* | freeos* )
+ 		;;
+ 	# This one is extra strict with allowed versions
+ 	sco3.2v2 | sco3.2v[4-9]* | sco5v6*)
+--- a/configure
++++ b/configure
+@@ -5303,6 +5303,16 @@
+ 		use_sigposix=yes
+ 		with_sigaltstack=no
+ 		;;
++	*-*-freeos*)
++				CPPFLAGS="$CPPFLAGS -D_GNU_SOURCE -D_REENTRANT"
++		libmono_cflags="-D_REENTRANT"
++		need_link_unlink=yes
++		printf "%s\n" "#define PTHREAD_POINTER_ID 1" >>confdefs.h
++
++		libgc_threads=pthreads
++		use_sigposix=yes
++		with_sigaltstack=no
++		;;
+ 	*-*-fuchsia*)
+ 
+ printf "%s\n" "#define DISABLE_PORTABILITY 1" >>confdefs.h
+@@ -30311,7 +30321,7 @@
+ { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $try_dev_random" >&5
+ printf "%s\n" "$try_dev_random" >&6; }
+ 
+-case "{$build}" in
++case "{$host}" in
+ 
+ 
+     *-*-os400*)
+--- a/configure.ac
++++ b/configure.ac
+@@ -468,6 +468,17 @@
+ 		use_sigposix=yes
+ 		with_sigaltstack=no
+ 		;;
++	*-*-freeos*)
++		dnl FreeOS: POSIX threads over the kernel's own threads and futexes,
++		dnl static linking only, no signals delivered (cooperative suspend).
++		CPPFLAGS="$CPPFLAGS -D_GNU_SOURCE -D_REENTRANT"
++		libmono_cflags="-D_REENTRANT"
++		need_link_unlink=yes
++		AC_DEFINE(PTHREAD_POINTER_ID)
++		libgc_threads=pthreads
++		use_sigposix=yes
++		with_sigaltstack=no
++		;;
+ 	*-*-fuchsia*)
+ 		AC_DEFINE(DISABLE_PORTABILITY,1,[Disable the io-portability layer])
+ 		AC_DEFINE(HOST_FUCHSIA,1,[Targeting the Fuchsia platform])
+@@ -4092,7 +4103,7 @@
+ 
+ AC_MSG_RESULT($try_dev_random)
+ 
+-case "{$build}" in
++case "{$host}" in
+ 
+ dnl IBM i does not have /dev/random, use unblocking only
+ 
+--- a/mono/metadata/w32file-unix.c
++++ b/mono/metadata/w32file-unix.c
+@@ -4766,7 +4766,7 @@
+ 	return (drive_type);
+ }
+ 
+-#if defined (HOST_DARWIN) || defined (__linux__) || defined(HOST_BSD) || defined(__FreeBSD_kernel__) || defined(__HAIKU__) || defined(_AIX)
++#if defined (HOST_DARWIN) || defined (__linux__) || defined(HOST_BSD) || defined(__FreeBSD_kernel__) || defined(__HAIKU__) || defined(_AIX) || defined(__freeos__)
+ static gchar*
+ get_fstypename (gchar *utfpath)
+ {
+--- a/mono/utils/Makefile.am
++++ b/mono/utils/Makefile.am
+@@ -182,6 +182,7 @@
+ 	mono-threads-openbsd.c	\
+ 	mono-threads-android.c	\
+ 	mono-threads-haiku.c	\
++	mono-threads-freeos.c	\
+ 	mono-threads-aix.c	\
+ 	mono-threads-wasm.c	\
+ 	mono-threads-sunos.c	\
+--- a/mono/utils/Makefile.in
++++ b/mono/utils/Makefile.in
+@@ -189,7 +189,7 @@
+ 	mono-threads-mach-helper.c mono-threads-windows.c \
+ 	mono-threads-linux.c mono-threads-freebsd.c \
+ 	mono-threads-netbsd.c mono-threads-openbsd.c \
+-	mono-threads-android.c mono-threads-haiku.c mono-threads-aix.c \
++	mono-threads-android.c mono-threads-haiku.c mono-threads-freeos.c mono-threads-aix.c \
+ 	mono-threads-wasm.c mono-threads-sunos.c mono-threads.h \
+ 	mono-threads-debug.h mono-threads-api.h mono-threads-coop.c \
+ 	mono-threads-coop.h mono-utility-thread.c \
+@@ -283,6 +283,7 @@
+ @ENABLE_MSVC_ONLY_FALSE@	libmonoutils_la-mono-threads-openbsd.lo \
+ @ENABLE_MSVC_ONLY_FALSE@	libmonoutils_la-mono-threads-android.lo \
+ @ENABLE_MSVC_ONLY_FALSE@	libmonoutils_la-mono-threads-haiku.lo \
++@ENABLE_MSVC_ONLY_FALSE@	libmonoutils_la-mono-threads-freeos.lo \
+ @ENABLE_MSVC_ONLY_FALSE@	libmonoutils_la-mono-threads-aix.lo \
+ @ENABLE_MSVC_ONLY_FALSE@	libmonoutils_la-mono-threads-wasm.lo \
+ @ENABLE_MSVC_ONLY_FALSE@	libmonoutils_la-mono-threads-sunos.lo \
+@@ -438,6 +439,7 @@
+ 	./$(DEPDIR)/libmonoutils_la-mono-threads-coop.Plo \
+ 	./$(DEPDIR)/libmonoutils_la-mono-threads-freebsd.Plo \
+ 	./$(DEPDIR)/libmonoutils_la-mono-threads-haiku.Plo \
++	./$(DEPDIR)/libmonoutils_la-mono-threads-freeos.Plo \
+ 	./$(DEPDIR)/libmonoutils_la-mono-threads-linux.Plo \
+ 	./$(DEPDIR)/libmonoutils_la-mono-threads-mach-helper.Plo \
+ 	./$(DEPDIR)/libmonoutils_la-mono-threads-mach.Plo \
+@@ -1017,6 +1019,7 @@
+ @ENABLE_MSVC_ONLY_FALSE@	mono-threads-openbsd.c	\
+ @ENABLE_MSVC_ONLY_FALSE@	mono-threads-android.c	\
+ @ENABLE_MSVC_ONLY_FALSE@	mono-threads-haiku.c	\
++@ENABLE_MSVC_ONLY_FALSE@	mono-threads-freeos.c	\
+ @ENABLE_MSVC_ONLY_FALSE@	mono-threads-aix.c	\
+ @ENABLE_MSVC_ONLY_FALSE@	mono-threads-wasm.c	\
+ @ENABLE_MSVC_ONLY_FALSE@	mono-threads-sunos.c	\
+@@ -1244,6 +1247,7 @@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/libmonoutils_la-mono-threads-coop.Plo@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/libmonoutils_la-mono-threads-freebsd.Plo@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/libmonoutils_la-mono-threads-haiku.Plo@am__quote@ # am--include-marker
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/libmonoutils_la-mono-threads-freeos.Plo@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/libmonoutils_la-mono-threads-linux.Plo@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/libmonoutils_la-mono-threads-mach-helper.Plo@am__quote@ # am--include-marker
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/libmonoutils_la-mono-threads-mach.Plo@am__quote@ # am--include-marker
+@@ -1788,6 +1792,13 @@
+ @AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
+ @am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(libmonoutils_la_CFLAGS) $(CFLAGS) -c -o libmonoutils_la-mono-threads-haiku.lo `test -f 'mono-threads-haiku.c' || echo '$(srcdir)/'`mono-threads-haiku.c
+ 
++libmonoutils_la-mono-threads-freeos.lo: mono-threads-freeos.c
++@am__fastdepCC_TRUE@	$(AM_V_CC)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(libmonoutils_la_CFLAGS) $(CFLAGS) -MT libmonoutils_la-mono-threads-freeos.lo -MD -MP -MF $(DEPDIR)/libmonoutils_la-mono-threads-freeos.Tpo -c -o libmonoutils_la-mono-threads-freeos.lo `test -f 'mono-threads-freeos.c' || echo '$(srcdir)/'`mono-threads-freeos.c
++@am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/libmonoutils_la-mono-threads-freeos.Tpo $(DEPDIR)/libmonoutils_la-mono-threads-freeos.Plo
++@AMDEP_TRUE@@am__fastdepCC_FALSE@	$(AM_V_CC)source='mono-threads-freeos.c' object='libmonoutils_la-mono-threads-freeos.lo' libtool=yes @AMDEPBACKSLASH@
++@AMDEP_TRUE@@am__fastdepCC_FALSE@	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) @AMDEPBACKSLASH@
++@am__fastdepCC_FALSE@	$(AM_V_CC@am__nodep@)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(libmonoutils_la_CFLAGS) $(CFLAGS) -c -o libmonoutils_la-mono-threads-freeos.lo `test -f 'mono-threads-freeos.c' || echo '$(srcdir)/'`mono-threads-freeos.c
++
+ libmonoutils_la-mono-threads-aix.lo: mono-threads-aix.c
+ @am__fastdepCC_TRUE@	$(AM_V_CC)$(LIBTOOL) $(AM_V_lt) --tag=CC $(AM_LIBTOOLFLAGS) $(LIBTOOLFLAGS) --mode=compile $(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(libmonoutils_la_CFLAGS) $(CFLAGS) -MT libmonoutils_la-mono-threads-aix.lo -MD -MP -MF $(DEPDIR)/libmonoutils_la-mono-threads-aix.Tpo -c -o libmonoutils_la-mono-threads-aix.lo `test -f 'mono-threads-aix.c' || echo '$(srcdir)/'`mono-threads-aix.c
+ @am__fastdepCC_TRUE@	$(AM_V_at)$(am__mv) $(DEPDIR)/libmonoutils_la-mono-threads-aix.Tpo $(DEPDIR)/libmonoutils_la-mono-threads-aix.Plo
+@@ -2382,6 +2393,7 @@
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-coop.Plo
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-freebsd.Plo
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-haiku.Plo
++	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-freeos.Plo
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-linux.Plo
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-mach-helper.Plo
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-mach.Plo
+@@ -2536,6 +2548,7 @@
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-coop.Plo
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-freebsd.Plo
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-haiku.Plo
++	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-freeos.Plo
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-linux.Plo
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-mach-helper.Plo
+ 	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-mach.Plo
+--- a/mono/utils/mono-sigcontext.h
++++ b/mono/utils/mono-sigcontext.h
+@@ -496,7 +496,7 @@
+ 
+ #ifndef UCONTEXT_REG_SET_PC
+ #define UCONTEXT_REG_SET_PC(ctx, val) do { \
+-	UCONTEXT_REG_PC (ctx) = (val); \
++	UCONTEXT_REG_PC (ctx) = (host_mgreg_t)(val); \
+ 	 } while (0)
+ #define UCONTEXT_REG_SET_SP(ctx, val) do { \
+ 	UCONTEXT_REG_SP (ctx) = (val); \
+--- a/mono/utils/mono-threads-posix-signals.c
++++ b/mono/utils/mono-threads-posix-signals.c
+@@ -95,7 +95,7 @@
+ 		suspend_signum = mono_threads_suspend_search_alternative_signal ();
+ 	return suspend_signum;
+ #else
+-#if defined(__APPLE__) || defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
++#if defined(__APPLE__) || defined(__OpenBSD__) || defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__freeos__)
+ 	return SIGXFSZ;
+ #else
+ 	return SIGPWR;
+--- /dev/null
++++ b/mono/utils/mono-threads-freeos.c
+@@ -0,0 +1,49 @@
++/**
++ * \file
++ * FreeOS: stack bounds and the OS thread id.
++ *
++ * The kernel allocates every thread stack itself (with a guard page below it),
++ * so the libc learns the bounds from the kernel and hands them out through the
++ * same pthread_getattr_np/pthread_attr_getstack pair Linux uses.
++ */
++
++#include <config.h>
++
++#if defined(__freeos__)
++
++#include <mono/utils/mono-threads.h>
++#include <pthread.h>
++
++void
++mono_threads_platform_get_stack_bounds (guint8 **staddr, size_t *stsize)
++{
++	pthread_attr_t attr;
++	gint res;
++
++	*staddr = NULL;
++	*stsize = (size_t)-1;
++
++	res = pthread_getattr_np (pthread_self (), &attr);
++	if (G_UNLIKELY (res != 0))
++		g_error ("%s: pthread_getattr_np failed with \"%s\" (%d)", __func__, g_strerror (res), res);
++
++	res = pthread_attr_getstack (&attr, (void**)staddr, stsize);
++	if (G_UNLIKELY (res != 0))
++		g_error ("%s: pthread_attr_getstack failed with \"%s\" (%d)", __func__, g_strerror (res), res);
++
++	pthread_attr_destroy (&attr);
++}
++
++guint64
++mono_native_thread_os_id_get (void)
++{
++	return (guint64)pthread_getthreadid_np ();
++}
++
++#else
++
++#include <mono/utils/mono-compiler.h>
++
++MONO_EMPTY_SOURCE_FILE (mono_threads_freeos);
++
++#endif

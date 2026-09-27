@@ -75,7 +75,7 @@ use core::fmt::Write as _;
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::vec::Vec;
 
 use crate::mm::{FrameAllocator, HUGE_PAGE_FRAMES, HUGE_PAGE_SIZE, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
@@ -137,6 +137,19 @@ const IMAGE_LIMIT_BYTES: usize = 1 << 30;
 /// вслух.
 const STACK_PAGES: usize = 16;
 
+/// Сколько адресов всего отведено под стек главного потока (фаза 58b).
+///
+/// Мегабайт, из которого жадно выдаются только верхние [`STACK_PAGES`], а
+/// остальное — безымянная память по первому касанию (фаза 56): программа,
+/// которой хватает шестнадцати страниц, не платит за остальные ничего.
+///
+/// Поднят ради чужой среды исполнения. Интерпретатор Mono рекурсивен, а
+/// переносимый код на C вообще рассчитывает на мегабайты главного стека — у
+/// Linux их восемь. Больше мегабайта здесь не помещается честно: стек со
+/// сдвигом ASLR опускается до [`STACK_LOWEST`], и под ним до конца окна образа
+/// обязан остаться неотображённый мегабайт, в который упрётся переполнение.
+const MAIN_STACK_PAGES: usize = 256;
+
 /// Вершина стека программы. Отстоит от конца окна образа на четыре мегабайта —
 /// чтобы переполнение стека упиралось в неотображённые страницы, а не в конец
 /// образа.
@@ -159,8 +172,12 @@ const STACK_BASE: usize = STACK_TOP - STACK_PAGES * PAGE_SIZE;
 /// перебора на месте, но достаточно, чтобы адрес из чужого прогона — или из
 /// снимка экрана — перестал быть адресом в этом.
 const STACK_SHIFT_PAGES: usize = 512;
-/// Нижняя граница, ниже которой стек не опускается ни при каком сдвиге.
-const STACK_LOWEST: usize = STACK_BASE - STACK_SHIFT_PAGES * PAGE_SIZE;
+/// Нижняя граница, ниже которой стек не опускается ни при каком сдвиге, —
+/// считая ленивую часть стека главного потока ([`MAIN_STACK_PAGES`]).
+const STACK_LOWEST: usize =
+    STACK_BASE - STACK_SHIFT_PAGES * PAGE_SIZE - (MAIN_STACK_PAGES - STACK_PAGES) * PAGE_SIZE;
+// Под самым низким стеком до конца окна образа — не меньше мегабайта пустоты.
+const _: () = assert!(STACK_LOWEST >= WINDOW_BASE + IMAGE_LIMIT_BYTES + 0x0010_0000);
 
 /// С какого места области памяти по запросу начинается выдача (ASLR): случайная
 /// страница в первых 64 МиБ. Выше неё ищется первым, и только если там не
@@ -1594,6 +1611,27 @@ static PROGRAMS: Mutex<[Option<Arc<Mutex<Program>>>; sched::MAX_TASKS]> =
 static IN_USER: [AtomicBool; sched::MAX_TASKS] =
     [const { AtomicBool::new(false) }; sched::MAX_TASKS];
 
+/// Границы стека программы, исполняемой задачей, — `[низ, верх)` (фаза 58b,
+/// [`user_abi::SYS_THREAD_INFO`]).
+///
+/// По слоту, как [`IN_USER`], и по той же причине: стек — свойство потока, а не
+/// процесса. Пишет их сама задача перед входом в третье кольцо, читает — она же
+/// из системного вызова, поэтому хватает `Relaxed`.
+static STACKS: [(AtomicUsize, AtomicUsize); sched::MAX_TASKS] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; sched::MAX_TASKS];
+
+fn set_stack(slot: usize, low: usize, high: usize) {
+    STACKS[slot].0.store(low, Ordering::Relaxed);
+    STACKS[slot].1.store(high, Ordering::Relaxed);
+}
+
+/// Границы стека текущего потока: `(низ, верх)`.
+#[must_use]
+pub fn current_stack() -> (usize, usize) {
+    let slot = sched::current_slot();
+    (STACKS[slot].0.load(Ordering::Relaxed), STACKS[slot].1.load(Ordering::Relaxed))
+}
+
 /// Процесс исполняющейся задачи — ссылкой, а не заимствованием.
 ///
 /// Лок таблицы держится ровно на время клонирования ссылки. Это и есть цена
@@ -2389,6 +2427,17 @@ fn load(
         }
     }
 
+    // Ниже жадных страниц — ленивая часть стека главного потока (фаза 58b):
+    // обычная безымянная память, кадр по первому касанию. Таблица областей
+    // упорядочена по адресу, а стек лежит выше всего образа — значит, в конец.
+    mappings.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+    mappings.push(Mapping {
+        base: stack_top - MAIN_STACK_PAGES * PAGE_SIZE,
+        pages: MAIN_STACK_PAGES - STACK_PAGES,
+        blocks: 0,
+        source: Source::Anonymous(Anon::read_write(true)),
+    });
+
     // Страница процесса: эталон канарейки стека. Заполняется **до** входа в
     // программу и отображается без права записи — программа читает его по
     // символу `__stack_chk_guard` в прологе каждой функции с массивом на стеке,
@@ -2568,6 +2617,7 @@ fn run(
     // Признак поднимается после того, как процесс попал в таблицу: обработчик
     // отказа читает его без лока и вправе увидеть `true` только тогда, когда
     // программу уже есть где найти.
+    set_stack(slot, layout.stack_top - MAIN_STACK_PAGES * PAGE_SIZE, layout.stack_top);
     IN_USER[slot].store(true, Ordering::Release);
 
     // Планировщик узнаёт о пространстве до того, как процессор на него
@@ -2989,6 +3039,8 @@ extern "C" fn thread_entry(arg: usize) -> ! {
             *entry = Some(Arc::clone(&start.process));
         }
     }
+    // Сторожевая страница — нижняя страница области — в границы не входит.
+    set_stack(slot, start.region + PAGE_SIZE, start.region + start.region_bytes);
     IN_USER[slot].store(true, Ordering::Release);
 
     kprintln!(

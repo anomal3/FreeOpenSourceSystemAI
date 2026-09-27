@@ -184,6 +184,9 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
     // журнал, сокеты, разбор адресов.
     let posix = work.join("posix.o");
     cbuild::compile(arch, &cbuild::libc_dir().join("freeos/posix.c"), &posix, &includes)?;
+    // Каталоги, текущий каталог, дескрипторы (фаза 58b).
+    let files = work.join("files.o");
+    cbuild::compile(arch, &cbuild::libc_dir().join("freeos/files.c"), &files, &includes)?;
     let archive = lib.join("libfreeos.a");
     // Архив пересоздаётся, а не дополняется: `llvm-ar r` в существующий файл
     // оставил бы там объектник от прошлой архитектуры, если каталог когда-то
@@ -197,6 +200,7 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
         .arg(&syscalls)
         .arg(&threads)
         .arg(&posix)
+        .arg(&files)
         .status()
         .with_context(|| format!("не удалось запустить {}", ar.display()))?;
     if !status.success() {

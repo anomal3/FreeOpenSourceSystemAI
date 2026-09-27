@@ -1576,8 +1576,9 @@ pub const ALL: &[Scenario] = &[
             // выполнена `cargo xtask thirdparty`, и без неё здесь будет 39.
             // Сорок две: прибавилась `threads` (фаза 55b). Сорок три — `drvd`
             // (веха «драйверы», Д3). Сорок пять — `cmem` и `cthreads`
-            // (фазы 56–57).
-            Step::Expect("/bin holds 45 programs"),
+            // (фазы 56–57). Сорок семь — `cposix` и `mono` (фаза 58b); `mono`
+            // едет, только если собрана по `ports/mono/configure.sh`, иначе 46.
+            Step::Expect("/bin holds 47 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -4238,6 +4239,27 @@ pub const ALL: &[Scenario] = &[
             Step::Await("stack smashing detected, aborting", 15_000),
             Step::Await("exited with code 134", 15_000),
             Step::Absent("csmash: returned from the overrun"),
+            // Слой POSIX, которого не хватило компоновке Mono (фаза 58b):
+            // текущий каталог и относительные пути, каталоги, канал с `poll`,
+            // пределы, таблица сигналов. Каждая проверка — на вызовах ядра, и
+            // заглушка «успех» не прошла бы ни одну.
+            Step::Line("run /bin/cposix /home/roman"),
+            Step::Await("cposix: starting in /home/roman", 30_000),
+            Step::Await("cposix: ok getcwd starts at / and follows chdir", 15_000),
+            Step::Await("cposix: ok a relative path lands in the current directory", 15_000),
+            Step::Await("cposix: ok chdir into a file is ENOTDIR", 15_000),
+            Step::Await("cposix: ok mkdir, then readdir lists both names with their kinds", 15_000),
+            Step::Await("cposix: ok rmdir refuses a file and removes a directory", 15_000),
+            Step::Await("cposix: ok chdir .. folds the path", 15_000),
+            Step::Await("cposix: ok access and readlink answer by stat", 15_000),
+            Step::Await("cposix: ok pipe carries bytes and poll sees them", 15_000),
+            Step::Await("cposix: ok fcntl says close-on-exec", 15_000),
+            Step::Await("cposix: ok getrlimit tells the real stack and file limits", 15_000),
+            Step::Await("cposix: ok sigaction keeps a handler and refuses SIGKILL", 15_000),
+            Step::Await("cposix: ok getuid matches geteuid", 15_000),
+            Step::Await("cposix: done, 0 check(s) failed", 15_000),
+            Step::Await("exited with code 0", 15_000),
+            Step::Absent("cposix: FAILED"),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
@@ -4406,6 +4428,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("cthreads: ok a detached thread runs on its own", 30_000),
             // Семафор POSIX (фаза 58) — без него Mono не собирается вовсе.
             Step::Await("cthreads: ok semaphore hands over items and times out", 30_000),
+            // Границы стека от ядра и мегабайт главного стека (фаза 58b) —
+            // ими сборщик мусора Mono узнаёт, какую память обходить.
+            Step::Await("cthreads: ok stack bounds come from the kernel", 30_000),
+            Step::Await("cthreads: ok the main stack holds 768 KiB of frames", 30_000),
             Step::Await("cthreads: done, 0 check(s) failed", 30_000),
             Step::Await("exited with code 0", 15_000),
             Step::Absent("cthreads: FAILED"),
@@ -8182,6 +8208,45 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "mono",
+        about: "Рантайм Mono 6.14.1, собранный своим configure нашим набором, запускается и знает, кто он.",
+        // Живая: программа файлов не пишет, а библиотек классов (фаза 60) пока
+        // нет вовсе — проверяется сам рантайм.
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // `--version` проходит разбор аргументов, инициализацию eglib и
+            // печать сведений о сборке — без единой сборки IL. Строка версии и
+            // строки настроек — те, что Mono печатает о себе сама: по ним видно,
+            // что собрана она так, как рассчитано (sgen, кооперативная
+            // остановка, `__thread`).
+            Step::Line("run /bin/mono --version"),
+            Step::Await("Mono JIT compiler version 6.14.1", 60_000),
+            Step::Await("TLS:", 30_000),
+            Step::Await("exited with code 0", 30_000),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "lua",
         about: "Чужой язык целиком: Lua 5.4.9 из неправленых исходников считает, ошибается, пишет файлы и запускает программы.",
         target: Target::Installed,
@@ -8689,7 +8754,10 @@ pub const ALL: &[Scenario] = &[
             // 65539 — это `0x0001_0003`: младшая половина выросла дважды,
             // когда добавились потоки (55b) и ожидание на адресе (55c).
             // 65540 — `0x0001_0004`: вызовы для драйверов-программ (Д1).
-            Step::Await("posix: abi version 65540", 60_000),
+            // 65542 — `0x0001_0006`: `SYS_MPROTECT` и срок у ожидания (фазы
+            // 56–57, здесь число тогда не подняли — сценарий краснел), затем
+            // `SYS_THREAD_INFO` (фаза 58b).
+            Step::Await("posix: abi version 65542", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».

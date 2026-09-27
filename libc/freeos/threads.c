@@ -155,6 +155,12 @@ struct freeos_thread {
     /* JOINABLE, DETACHED или EXITED — кто из двоих освобождает структуру. */
     unsigned int state;
     void *tls_block;
+    /* Номер задачи и стек `[stack_low, stack_high)` — у ядра, спрашивает их
+     * сам поток при старте (`learn_self`): тот, кто его завёл, стека не
+     * выбирал и не знает. */
+    long id;
+    uintptr_t stack_low;
+    uintptr_t stack_high;
     const void *specific[PTHREAD_KEYS_MAX];
     /* Отсоединённые завершившиеся ждут освобождения в этом списке. */
     struct freeos_thread *next_zombie;
@@ -202,6 +208,17 @@ __attribute__((noinline)) static void adopt(struct freeos_thread *self) { curren
 
 static void set_base(uintptr_t base) { freeos_syscall(SYS_SET_TLS, (long)base, 0, 0); }
 
+/* Спросить у ядра свой номер и свой стек (фаза 58b). Отказ оставляет нули:
+ * `pthread_getattr_np` тогда отвечает ошибкой, а не выдумывает границы. */
+static void learn_self(struct freeos_thread *self) {
+    struct freeos_thread_info info;
+    if (freeos_syscall(SYS_THREAD_INFO, (long)&info, 0, 0) == 0) {
+        self->id = (long)info.id;
+        self->stack_low = (uintptr_t)info.stack_low;
+        self->stack_high = (uintptr_t)info.stack_high;
+    }
+}
+
 /* Первое, что делает программа на C, — до конструкторов и до `main`
  * (`crt0.c`): завести хранилище главному потоку. Без него первая же ошибка
  * системного вызова писала бы `errno` по базе ноль — так ронялась программа до
@@ -219,6 +236,7 @@ void freeos_threads_start(void) {
     }
     set_base(tls_lay_out((void *)block));
     main_thread.state = JOINABLE;
+    learn_self(&main_thread);
     adopt(&main_thread);
 }
 
@@ -251,6 +269,7 @@ __attribute__((noreturn)) static void finish(struct freeos_thread *self, void *r
  * выровненным так, как ждёт компилятор. */
 __attribute__((noreturn)) static void thread_entry(struct freeos_thread *self) {
     set_base(tls_lay_out(self->tls_block));
+    learn_self(self);
     adopt(self);
     finish(self, self->start(self->arg));
 }
@@ -347,6 +366,7 @@ int pthread_sigmask(int how, const sigset_t *set, sigset_t *old) {
 int pthread_attr_init(pthread_attr_t *attr) {
     attr->stacksize = DEFAULT_STACK;
     attr->detachstate = PTHREAD_CREATE_JOINABLE;
+    attr->stackaddr = NULL;
     return 0;
 }
 
@@ -380,6 +400,32 @@ int pthread_attr_getdetachstate(const pthread_attr_t *attr, int *state) {
     *state = attr->detachstate;
     return 0;
 }
+
+/* Атрибуты уже идущего потока — главное в них стек, который выделило ядро.
+ * Поток узнал его сам при старте (`learn_self`), поэтому ответ есть и про
+ * чужой поток, а не только про себя. */
+int pthread_getattr_np(pthread_t thread, pthread_attr_t *attr) {
+    if (thread == NULL || thread->stack_high == 0) {
+        return EINVAL;
+    }
+    attr->stacksize = (size_t)(thread->stack_high - thread->stack_low);
+    attr->stackaddr = (void *)thread->stack_low;
+    attr->detachstate =
+        load(&thread->state) == DETACHED ? PTHREAD_CREATE_DETACHED : PTHREAD_CREATE_JOINABLE;
+    return 0;
+}
+
+/* Низ стека и его размер — как у POSIX: адрес — **нижний**, а не вершина. */
+int pthread_attr_getstack(const pthread_attr_t *attr, void **addr, size_t *size) {
+    if (attr->stackaddr == NULL) {
+        return EINVAL;
+    }
+    *addr = attr->stackaddr;
+    *size = attr->stacksize;
+    return 0;
+}
+
+int pthread_getthreadid_np(void) { return current != NULL ? (int)current->id : -1; }
 
 /* ── Мьютексы ────────────────────────────────────────────────────────────── */
 
@@ -812,3 +858,30 @@ void __retarget_lock_release(_LOCK_T lock) {
 }
 
 void __retarget_lock_release_recursive(_LOCK_T lock) { __retarget_lock_release(lock); }
+
+/* ── Планирование (фаза 58b) ─────────────────────────────────────────────── */
+
+int pthread_getschedparam(pthread_t thread, int *policy, struct sched_param *param) {
+    (void)thread;
+    *policy = SCHED_OTHER;
+    param->sched_priority = 0;
+    return 0;
+}
+
+int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param *param) {
+    (void)thread;
+    if (policy == SCHED_OTHER && param->sched_priority == 0) {
+        return 0;
+    }
+    return ENOTSUP;
+}
+
+int sched_get_priority_max(int policy) {
+    if (policy == SCHED_OTHER) {
+        return 0;
+    }
+    errno = EINVAL;
+    return -1;
+}
+
+int sched_get_priority_min(int policy) { return sched_get_priority_max(policy); }

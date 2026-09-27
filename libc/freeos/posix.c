@@ -24,7 +24,17 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/filio.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/select.h>
+#include <termios.h>
 
+#include "freeos-internal.h"
 #include "freeos-syscall.h"
 
 /* ── Семафоры ────────────────────────────────────────────────────────────── */
@@ -534,6 +544,284 @@ int getnameinfo(const struct sockaddr *address, socklen_t length, char *host, so
     }
     if (service != NULL && snprintf(service, service_length, "%u", ntohs(in->sin_port)) >= (int)service_length) {
         return EAI_SYSTEM;
+    }
+    return 0;
+}
+
+
+/* ── Личность (фаза 58b) ─────────────────────────────────────────────────── */
+
+/* Действующая личность у нас совпадает с настоящей: программы с `setuid` в
+ * системе нет, и права запуска — свойство программы, а не бит файла. */
+uid_t getuid(void) { return (uid_t)freeos_syscall(SYS_GETUID, 0, 0, 0); }
+uid_t geteuid(void) { return getuid(); }
+gid_t getgid(void) { return (gid_t)freeos_syscall(SYS_GETGID, 0, 0, 0); }
+gid_t getegid(void) { return getgid(); }
+
+/* ── Пределы ─────────────────────────────────────────────────────────────── */
+
+/* Три предела у нас настоящие и отвечают правдой: стек — тот, что выдало ядро
+ * этому потоку (мегабайт у главного, фаза 58b), открытые файлы — стандартные
+ * три и восемь мест таблицы. Остальные ядро не ставит, и ответ «без предела» —
+ * тоже правда. Поменять предел нечем: `setrlimit` — `ENOSYS`. */
+int getrlimit(int resource, struct rlimit *limit) {
+    rlim_t value = RLIM_INFINITY;
+    switch (resource) {
+    case RLIMIT_STACK: {
+        pthread_attr_t attr;
+        void *low;
+        size_t size;
+        if (pthread_getattr_np(pthread_self(), &attr) != 0 || pthread_attr_getstack(&attr, &low, &size) != 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        value = (rlim_t)size;
+        break;
+    }
+    case RLIMIT_NOFILE:
+        value = 3 + FREEOS_MAX_OPEN_FILES;
+        break;
+    case RLIMIT_CPU:
+    case RLIMIT_FSIZE:
+    case RLIMIT_DATA:
+    case RLIMIT_CORE:
+    case RLIMIT_AS:
+        break;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+    limit->rlim_cur = value;
+    limit->rlim_max = value;
+    return 0;
+}
+
+int setrlimit(int resource, const struct rlimit *limit) {
+    (void)resource;
+    (void)limit;
+    errno = ENOSYS;
+    return -1;
+}
+
+/* ── Сигналы ─────────────────────────────────────────────────────────────── */
+
+/* Ядро сигналов не посылает вовсе: отказ страницы снимает программу так, как
+ * это сделал бы обработчик по умолчанию, а остановить поток сборщику мусора
+ * Mono не нужно — он собран с кооперативной остановкой.
+ *
+ * Поэтому `sigaction` ведёт таблицу обработчиков честно — записать, прочитать
+ * прежний, отказать на `SIGKILL` и `SIGSTOP`, — но позван обработчик не будет
+ * никогда. Отказать здесь `ENOSYS` было бы хуже, а не честнее: Mono ставит
+ * обработчики на старте под `g_assert` и без таблицы не запускается, хотя ни
+ * одного сигнала в её режиме не ждёт. */
+static struct sigaction handlers[NSIG];
+
+int sigaction(int signal, const struct sigaction *action, struct sigaction *old) {
+    if (signal <= 0 || signal >= NSIG || ((signal == SIGKILL || signal == SIGSTOP) && action != NULL)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (old != NULL) {
+        *old = handlers[signal];
+    }
+    if (action != NULL) {
+        handlers[signal] = *action;
+    }
+    return 0;
+}
+
+/* Ждать сигнала, который никто не пошлёт, — значит спать вечно. Ответ вместо
+ * вечного сна: вызывающему лучше узнать, что ждать нечего. */
+int sigsuspend(const sigset_t *mask) {
+    (void)mask;
+    errno = ENOSYS;
+    return -1;
+}
+
+/* ── Ожидание дескрипторов ───────────────────────────────────────────────── */
+
+/* `poll` поверх `SYS_POLL`. Сокетов ядро здесь не принимает (у них своё
+ * пространство номеров, см. договор) — так же, как и сокеты в этой libc пока
+ * отвечают `ENOSYS`. */
+int poll(struct pollfd *fds, nfds_t count, int timeout) {
+    enum { ON_STACK = 16 };
+    struct freeos_pollfd local[ON_STACK];
+    struct freeos_pollfd *table = local;
+    if (count > ON_STACK) {
+        table = malloc(count * sizeof(*table));
+        if (table == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    for (nfds_t at = 0; at < count; at++) {
+        table[at].fd = fds[at].fd;
+        table[at].wanted = ((fds[at].events & POLLIN) ? FREEOS_POLL_IN : 0) |
+                           ((fds[at].events & POLLOUT) ? FREEOS_POLL_OUT : 0);
+        table[at].ready = 0;
+    }
+    long wait = timeout < 0 ? FREEOS_POLL_FOREVER : timeout;
+    long ready = freeos_syscall(SYS_POLL, (long)table, (long)count, wait);
+    if (ready >= 0) {
+        for (nfds_t at = 0; at < count; at++) {
+            uint32_t got = table[at].ready;
+            fds[at].revents = (short)(((got & FREEOS_POLL_IN) ? POLLIN : 0) | ((got & FREEOS_POLL_OUT) ? POLLOUT : 0) |
+                                      ((got & FREEOS_POLL_HUP) ? POLLHUP : 0) |
+                                      ((got & FREEOS_POLL_BAD) ? POLLNVAL : 0));
+        }
+    }
+    if (table != local) {
+        free(table);
+    }
+    return ready < 0 ? freeos_set_errno(ready) : (int)ready;
+}
+
+/* `select` — тот же `poll`, разложенный по трём наборам. Исключительных
+ * состояний у наших дескрипторов нет, третий набор всегда пуст на выходе. */
+int select(int count, fd_set *readable, fd_set *writable, fd_set *exceptional, struct timeval *timeout) {
+    if (count < 0 || count > FD_SETSIZE) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct pollfd table[FD_SETSIZE];
+    nfds_t used = 0;
+    for (int fd = 0; fd < count; fd++) {
+        short events = (short)(((readable != NULL && FD_ISSET(fd, readable)) ? POLLIN : 0) |
+                               ((writable != NULL && FD_ISSET(fd, writable)) ? POLLOUT : 0));
+        if (events != 0) {
+            table[used].fd = fd;
+            table[used].events = events;
+            table[used].revents = 0;
+            used++;
+        }
+    }
+    int wait = -1;
+    if (timeout != NULL) {
+        long long ms = (long long)timeout->tv_sec * 1000 + timeout->tv_usec / 1000;
+        wait = ms > INT_MAX ? INT_MAX : (int)ms;
+    }
+    int answer = poll(table, used, wait);
+    if (answer < 0) {
+        return -1;
+    }
+    if (readable != NULL) {
+        FD_ZERO(readable);
+    }
+    if (writable != NULL) {
+        FD_ZERO(writable);
+    }
+    if (exceptional != NULL) {
+        FD_ZERO(exceptional);
+    }
+    int marked = 0;
+    for (nfds_t at = 0; at < used; at++) {
+        if ((table[at].revents & POLLNVAL) != 0) {
+            errno = EBADF;
+            return -1;
+        }
+        if (readable != NULL && (table[at].revents & (POLLIN | POLLHUP)) != 0) {
+            FD_SET(table[at].fd, readable);
+            marked++;
+        }
+        if (writable != NULL && (table[at].revents & POLLOUT) != 0) {
+            FD_SET(table[at].fd, writable);
+            marked++;
+        }
+    }
+    return marked;
+}
+
+/* ── Терминал ────────────────────────────────────────────────────────────── */
+
+/* У терминала два режима (`SYS_TTYMODE`): строка с эхом и нажатие без эха.
+ * `termios` описывает больше, и то, что в два режима не ложится, не
+ * выдумывается: режим выбирается по `ICANON`, а `tcgetattr` после этого
+ * отвечает тем, что стоит на самом деле. Режим принадлежит программе — ядро
+ * вернёт строчный само, когда она закончится. */
+static int raw_mode;
+
+static int require_tty(int fd) {
+    if (!isatty(fd)) {
+        errno = ENOTTY;
+        return -1;
+    }
+    return 0;
+}
+
+int tcgetattr(int fd, struct termios *out) {
+    if (require_tty(fd) != 0) {
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    out->c_lflag = raw_mode ? 0 : (ICANON | ECHO);
+    return 0;
+}
+
+int tcsetattr(int fd, int when, const struct termios *in) {
+    (void)when;
+    if (require_tty(fd) != 0) {
+        return -1;
+    }
+    int raw = (in->c_lflag & ICANON) == 0;
+    long code = freeos_syscall(SYS_TTYMODE, raw ? FREEOS_TTY_RAW : FREEOS_TTY_LINE, 0, 0);
+    if (code < 0) {
+        return freeos_set_errno(code);
+    }
+    raw_mode = raw;
+    return 0;
+}
+
+/* Сбросить непрочитанный ввод: вычитать всё, что готово прямо сейчас. Буфера
+ * вывода у терминала нет — он рисуется сразу, сбрасывать там нечего. */
+int tcflush(int fd, int queue) {
+    if (require_tty(fd) != 0) {
+        return -1;
+    }
+    if (queue == TCIFLUSH || queue == TCIOFLUSH) {
+        struct pollfd one = {fd, POLLIN, 0};
+        char scratch[64];
+        while (poll(&one, 1, 0) > 0 && (one.revents & POLLIN) != 0) {
+            if (read(fd, scratch, sizeof(scratch)) <= 0) {
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+/* `ioctl` — только `FIONREAD`, и отвечает он «хоть один байт» или «ни
+ * одного»: сколько именно лежит в канале или в терминале, ядро наружу не
+ * говорит, а `poll` отвечает на главный вопрос — будет ли `read` ждать.
+ * Преуменьшить здесь безопасно (читающий прочтёт не всё за раз), преувеличить —
+ * нет. */
+int ioctl(int fd, unsigned long op, void *param) {
+    if (op == FIONREAD) {
+        struct pollfd one = {fd, POLLIN, 0};
+        if (poll(&one, 1, 0) < 0) {
+            return -1;
+        }
+        if ((one.revents & POLLNVAL) != 0) {
+            errno = EBADF;
+            return -1;
+        }
+        *(int *)param = (one.revents & POLLIN) != 0 ? 1 : 0;
+        return 0;
+    }
+    errno = ENOTTY;
+    return -1;
+}
+
+/* ── Советы о памяти ─────────────────────────────────────────────────────── */
+
+/* Совет по POSIX — совет: его вправе не исполнить, содержимое страниц он не
+ * меняет. Проверяются только аргументы. */
+int posix_madvise(void *addr, size_t len, int advice) {
+    (void)len;
+    if (((uintptr_t)addr & 4095) != 0) {
+        return EINVAL;
+    }
+    if (advice < POSIX_MADV_NORMAL || advice > POSIX_MADV_DONTNEED) {
+        return EINVAL;
     }
     return 0;
 }

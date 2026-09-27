@@ -380,6 +380,66 @@ static void check_semaphore(void) {
     }
 }
 
+/* ── Границы стека (фаза 58b) ────────────────────────────────────────────── */
+
+/* Сборщик мусора Mono узнаёт стек потока через `pthread_getattr_np` и обходит
+ * его целиком. Проверка — что ответ настоящий: адрес своей переменной лежит
+ * внутри, у главного потока мегабайт, а сам мегабайт действительно доступен —
+ * рекурсия съедает три четверти его. До фазы 58b главный стек был 64 КиБ, и
+ * эта рекурсия снимала программу. */
+
+static int inside_own_stack(void) {
+    pthread_attr_t attr;
+    void *low;
+    size_t size;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0 || pthread_attr_getstack(&attr, &low, &size) != 0) {
+        return 0;
+    }
+    uintptr_t here = (uintptr_t)&attr;
+    return here >= (uintptr_t)low && here < (uintptr_t)low + size;
+}
+
+static void *stack_of_thread(void *arg) {
+    (void)arg;
+    return (void *)(intptr_t)inside_own_stack();
+}
+
+/* Кадр в килобайт: `volatile` и сумма не дают компилятору ни выкинуть массив,
+ * ни превратить рекурсию в цикл. */
+static int deep(int depth) {
+    volatile char frame[1024];
+    frame[0] = (char)depth;
+    frame[sizeof(frame) - 1] = (char)depth;
+    if (depth == 0) {
+        return frame[0];
+    }
+    return deep(depth - 1) + frame[sizeof(frame) - 1] - (char)depth;
+}
+
+static void check_stack_bounds(void) {
+    pthread_attr_t attr;
+    void *low = NULL;
+    size_t size = 0;
+    int got = pthread_getattr_np(pthread_self(), &attr) == 0 && pthread_attr_getstack(&attr, &low, &size) == 0;
+    pthread_t other;
+    void *other_inside = NULL;
+    pthread_create(&other, NULL, stack_of_thread, NULL);
+    pthread_join(other, &other_inside);
+    int id = pthread_getthreadid_np();
+    if (got && inside_own_stack() && size >= 1024 * 1024 && other_inside != NULL && id > 0) {
+        ok("stack bounds come from the kernel");
+    } else {
+        printf("cthreads: stack %p + %zu, other thread %s, id %d\n", low, size,
+               other_inside != NULL ? "inside" : "outside", id);
+        fail("stack bounds come from the kernel");
+    }
+    if (deep(768) == 0) {
+        ok("the main stack holds 768 KiB of frames");
+    } else {
+        fail("the main stack holds 768 KiB of frames");
+    }
+}
+
 int main(void) {
     printf("cthreads: starting %d threads at a time\n", THREADS);
     check_mutex();
@@ -388,6 +448,7 @@ int main(void) {
     check_cond();
     check_once_and_keys();
     check_semaphore();
+    check_stack_bounds();
     printf("cthreads: done, %d check(s) failed\n", failures);
     return failures == 0 ? 0 : 1;
 }
