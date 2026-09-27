@@ -97,6 +97,29 @@ SECTIONS
     .data.rel.ro : { *(.data.rel.ro .data.rel.ro.*) }
     .dynamic : { *(.dynamic) }
 
+    /* Конструкторы и деструкторы (фаза 61): `__attribute__((constructor))`,
+     * статические объекты C++. picolibc зовёт их по границам, названным
+     * здесь (`__libc_init_array`, `__libc_fini_array`), и объявляет границы
+     * слабыми — поэтому скрипт без них собирался молча, а список оказывался
+     * пустым: с фазы 45 не вызывался ни один конструктор ни одной программы
+     * на C. Нашлось на pixman — её единственная реализация создаётся
+     * конструктором, и без него она «рисовала» только через маску. Указатели
+     * внутри — адреса, и перемещает их стартовый код, как всё в этом
+     * сегменте. */
+    .init_array : {
+        PROVIDE_HIDDEN(__bothinit_array_start = .);
+        KEEP(*(SORT_BY_INIT_PRIORITY(.preinit_array.*) .preinit_array))
+        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*) .init_array))
+        KEEP(*(SORT_BY_INIT_PRIORITY(.ctors.*) .ctors))
+        PROVIDE_HIDDEN(__bothinit_array_end = .);
+    }
+    .fini_array : {
+        PROVIDE_HIDDEN(__fini_array_start = .);
+        KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*) .fini_array))
+        KEEP(*(SORT_BY_INIT_PRIORITY(.dtors.*) .dtors))
+        PROVIDE_HIDDEN(__fini_array_end = .);
+    }
+
     /* Шаблон хранилища потока (фаза 57): начальные значения `__thread`
      * переменных (`.tdata`) и размер обнуляемой части (`.tbss`). Сам шаблон
      * программа не пишет — его копирует в блок каждого потока libc, узнав

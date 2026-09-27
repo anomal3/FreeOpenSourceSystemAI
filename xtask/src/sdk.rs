@@ -55,8 +55,8 @@ pub fn bin_dir() -> PathBuf {
 /// подставляет к триплету, когда ему сказали `--host=x86_64-freeos`. Не найдя
 /// `x86_64-freeos-ar`, autoconf молча берёт хостовый `ar` — и собирает архив
 /// формата хоста, который наш компоновщик не прочтёт.
-pub const TOOLS: [&str; 9] = [
-    "cc", "gcc", "ar", "ranlib", "nm", "strip", "objcopy", "objdump", "ld",
+pub const TOOLS: [&str; 10] = [
+    "cc", "gcc", "ar", "ranlib", "nm", "strip", "objcopy", "objdump", "ld", "pkg-config",
 ];
 
 /// Полный путь к обёртке набора для этой цели.

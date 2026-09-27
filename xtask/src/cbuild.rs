@@ -161,30 +161,42 @@ pub struct CProgram {
     pub needs: Option<&'static str>,
     /// Что дописать компоновщику после наших объектников.
     pub libs: &'static [&'static str],
+    /// Свои каталоги заголовков под `<sysroot>/include` (фаза 61): cairo и
+    /// freetype кладут их не в корень, а в `cairo/` и `freetype2/`.
+    pub includes: &'static [&'static str],
 }
 
 /// Программы на C, которые едут в `/bin`.
-pub const C_PROGRAMS: [CProgram; 7] = [
-    CProgram { name: "cdemo", needs: None, libs: &[] },
+pub const C_PROGRAMS: [CProgram; 8] = [
+    CProgram { name: "cdemo", needs: None, libs: &[], includes: &[] },
     // Переполняет свой стек нарочно: доказывает, что канарейка стека есть и у
     // программ на C. См. `libc/examples/csmash.c` и `__stack_chk_fail` в `crt0.c`.
-    CProgram { name: "csmash", needs: None, libs: &[] },
+    CProgram { name: "csmash", needs: None, libs: &[], includes: &[] },
     // Память так, как её просит чужая среда исполнения: резерв, куски,
     // права страниц (фаза 56). См. `libc/examples/cmem.c`.
-    CProgram { name: "cmem", needs: None, libs: &[] },
+    CProgram { name: "cmem", needs: None, libs: &[], includes: &[] },
     // Потоки POSIX: мьютексы, условные переменные со сроком, `errno` и
     // `__thread` у каждого свои (фаза 57). См. `libc/examples/cthreads.c`.
-    CProgram { name: "cthreads", needs: None, libs: &[] },
+    CProgram { name: "cthreads", needs: None, libs: &[], includes: &[] },
     // Слой POSIX под чужую среду: текущий каталог, каталоги, канал с `poll`,
     // пределы, таблица сигналов (фаза 58b). См. `libc/examples/cposix.c`.
-    CProgram { name: "cposix", needs: None, libs: &[] },
+    CProgram { name: "cposix", needs: None, libs: &[], includes: &[] },
     // Память кода: функция, записанная в память и вызванная, пока второй
     // поток её исполняет, — W^X по обращению (фаза 59). См. `libc/examples/cjit.c`.
-    CProgram { name: "cjit", needs: None, libs: &[] },
+    CProgram { name: "cjit", needs: None, libs: &[], includes: &[] },
     // Чужая библиотека, собранная нашим набором. Она здесь не ради сжатия: это
     // единственная проверка, доказывающая, что код, вышедший из чужого
     // `configure`, **работает**, а не только собрался. См. `libc/examples/zdemo.c`.
-    CProgram { name: "zdemo", needs: Some("libz.a"), libs: &["libz.a"] },
+    CProgram { name: "zdemo", needs: Some("libz.a"), libs: &["libz.a"], includes: &[] },
+    // Рисование чужой графической стопкой — cairo поверх pixman, libpng,
+    // freetype и zlib (фаза 61a): на ней стоит `System.Drawing` Mono. Точки
+    // картинки, PNG туда и обратно, глиф шрифта. См. `libc/examples/cdraw.c`.
+    CProgram {
+        name: "cdraw",
+        needs: Some("libcairo.a"),
+        libs: &["libcairo.a", "libpixman-1.a", "libfreetype.a", "libpng16.a", "libz.a"],
+        includes: &["cairo", "freetype2", "pixman-1"],
+    },
 ];
 
 /// Программы, которые собрал **не наш** компилятор и не наш рецепт.
@@ -687,7 +699,9 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
             .join("examples")
             .join(format!("{}.c", program.name));
         let object = work.join(format!("{}.o", program.name));
-        compile(arch, &source, &object, &includes)?;
+        let mut own = includes.clone();
+        own.extend(program.includes.iter().map(|dir| sysroot.join("include").join(dir)));
+        compile(arch, &source, &object, &own)?;
 
         let mut objects = common.clone();
         objects.push(object);

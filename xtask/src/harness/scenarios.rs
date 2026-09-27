@@ -1578,8 +1578,9 @@ pub const ALL: &[Scenario] = &[
             // (веха «драйверы», Д3). Сорок пять — `cmem` и `cthreads`
             // (фазы 56–57). Сорок семь — `cposix` и `mono` (фаза 58b); `mono`
             // едет, только если собрана по `ports/mono/configure.sh`, иначе 46.
-            // Сорок восемь — `cjit` (фаза 59).
-            Step::Expect("/bin holds 48 programs"),
+            // Сорок восемь — `cjit` (фаза 59). Сорок девять — `cdraw` (фаза 61a),
+            // едет, только если собрана cairo (`cargo xtask thirdparty`).
+            Step::Expect("/bin holds 49 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -8471,6 +8472,54 @@ pub const ALL: &[Scenario] = &[
             Step::Await("hello: thread summed 5000050000", 60_000),
             Step::Await("hello: args 2", 60_000),
             Step::Await("/bin/mono: exited with code 0", 30_000),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "cdraw",
+        about: "Чужая графическая стопка — cairo поверх pixman, libpng, freetype и zlib: точки картинки, PNG туда и обратно, глиф шрифта DejaVu.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            // Установленная система: PNG пишется на диск (корень живой — RAM-диск
+            // только на чтение), а шрифт лежит там, куда его положил
+            // установщик (`FONTS` в его списке).
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+            // Пути — по умолчанию программы (`/home/roman/cdraw.png`, DejaVu из
+            // `/usr/share/fonts`): длинная строка, набранная, пока стартуют
+            // службы, теряла символы.
+            Step::Line("run /bin/cdraw"),
+            Step::Await("cdraw: cairo 1.16.0", 30_000),
+            // Конструктор pixman: до фазы 61 конструкторы программ на C не
+            // вызывались, и заливка без маски молча не рисовала ничего.
+            Step::Await("cdraw: ok pixman fills and composites on its own", 60_000),
+            Step::Await("cdraw: ok a filled rectangle keeps to its edges", 60_000),
+            Step::Await("cdraw: ok an antialiased circle has a solid centre and a soft edge", 60_000),
+            Step::Await("cdraw: ok a linear gradient runs from red to blue", 60_000),
+            Step::Await("cdraw: ok a PNG written by libpng reads back pixel for pixel", 60_000),
+            Step::Await("cdraw: ok freetype draws a glyph inside its box", 60_000),
+            Step::Await("cdraw: done, 0 check(s) failed", 30_000),
+            Step::Await("exited with code 0", 15_000),
+            Step::Absent("cdraw: FAILED"),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],

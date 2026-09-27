@@ -293,7 +293,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 49] = [
+const PROGRAMS: [(&CStr16, &str); 50] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -362,6 +362,7 @@ const PROGRAMS: [(&CStr16, &str); 49] = [
     // Слой POSIX под чужую среду исполнения (фаза 58b).
     (cstr16!("\\FREEOS\\BIN\\CPOSIX"), "cposix"),
     (cstr16!("\\FREEOS\\BIN\\CJIT"), "cjit"),
+    (cstr16!("\\FREEOS\\BIN\\CDRAW"), "cdraw"),
     // Служба, которая ищет драйвер устройству без драйвера (веха «драйверы», Д3).
     (cstr16!("\\FREEOS\\BIN\\DRVD"), "drvd"),
     // Веб-сервер (пункт 4 очереди второго разбора). Едет вместе со своим сайтом

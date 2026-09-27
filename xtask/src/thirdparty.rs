@@ -59,6 +59,17 @@ enum How {
     /// целью, а компилятор передаётся переменной — ровно это и написано в его
     /// `doc/readme.html`.
     MakePlatform(&'static str),
+    /// Обычный GNU `configure`: `--host=<триплет>`, статическая сборка в
+    /// sysroot и свои ключи проекта (фаза 61). Так собирается почти всё, что
+    /// написано под autotools: инструменты с приставкой триплета, включая
+    /// `pkg-config`, `configure` находит сам. Второй список — переменные
+    /// `make`: обычно `SUBDIRS=<библиотека>`, чтобы не собирать тесты и
+    /// примеры, которым нужно то, чего в системе нет (`fork`).
+    Autotools(&'static [&'static str], &'static [&'static str]),
+    /// Не сборка, а файлы: взять из архива и положить в набор одни на обе
+    /// архитектуры (фаза 61, шрифт). Пары — путь в архиве и имя в
+    /// [`cbuild::fonts_dir`].
+    Files(&'static [(&'static str, &'static str)]),
 }
 
 /// Чужой проект: как его зовут, откуда брать и чем проверить.
@@ -86,7 +97,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 2] = [
+const PROJECTS: [Project; 7] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -116,12 +127,122 @@ const PROJECTS: [Project; 2] = [
         how: How::MakePlatform("generic"),
         installs: &["bin/lua", "lib/liblua.a", "include/lua.h"],
     },
+    // Фаза 61 — рисование для `System.Drawing` Mono: libgdiplus стоит на cairo,
+    // cairo — на pixman (растеризация), libpng (PNG, поверх zlib) и freetype
+    // (шрифты). Порядок в списке — порядок зависимостей. Хеши — опубликованные
+    // рядом с архивами.
+    Project {
+        name: "libpng",
+        version: "1.6.43",
+        url: "https://download.sourceforge.net/libpng/libpng-1.6.43.tar.xz",
+        sha256: "6a5ca0652392a2d7c9db2ae5b40210843c0bbc081cbd410825ab00cc59f14a6c",
+        unpacked: "libpng-1.6.43",
+        // Утилиты `pngfix` и соседи — программы для машины, которой у нас нет
+        // в `/bin`; библиотеке они не нужны.
+        how: How::Autotools(&["--disable-tools"], &[]),
+        installs: &["lib/libpng16.a", "include/png.h", "lib/pkgconfig/libpng.pc"],
+    },
+    Project {
+        name: "pixman",
+        version: "0.42.2",
+        url: "https://cairographics.org/releases/pixman-0.42.2.tar.gz",
+        sha256: "ea1480efada2fd948bc75366f7c349e1c96d3297d09a3fe62626e38e234a625e",
+        unpacked: "pixman-0.42.2",
+        // Последняя версия с autotools (дальше — только meson). GTK и libpng
+        // нужны лишь её тестам.
+        // Тесты — `fork` и `waitpid`, которых нет; собирается только сама
+        // библиотека.
+        how: How::Autotools(&["--disable-gtk", "--disable-libpng", "--disable-openmp"], &["SUBDIRS=pixman"]),
+        installs: &["lib/libpixman-1.a", "include/pixman-1/pixman.h", "lib/pkgconfig/pixman-1.pc"],
+    },
+    Project {
+        name: "freetype",
+        version: "2.13.2",
+        url: "https://download.savannah.gnu.org/releases/freetype/freetype-2.13.2.tar.xz",
+        sha256: "12991c4e55c506dd7f9b765933e62fd2be2e06d421505d7950a132e4f1bb484d",
+        unpacked: "freetype-2.13.2",
+        // Сжатые шрифты — через zlib, PNG-глифы — через libpng; HarfBuzz,
+        // Brotli и bzip2 не нужны.
+        how: How::Autotools(&[
+            "--with-zlib=yes",
+            "--with-png=yes",
+            "--with-harfbuzz=no",
+            "--with-brotli=no",
+            "--with-bzip2=no",
+            // Компилятор машины сборки: им freetype собирает свою утилиту
+            // `apinames`, которая исполняется здесь же, при сборке. clang от
+            // LLVM на Windows сам находит MSVC и собирает под хост.
+            "CC_BUILD=clang",
+        ], &[
+            // Свой Makefile freetype делает путь к себе абсолютным через `pwd`,
+            // а `pwd` у sh из Git — это `/e/…`, которого `make` для Windows не
+            // понимает. Переменная командной строки сильнее присваивания в
+            // Makefile: путь остаётся относительным, а собирается она из корня.
+            "TOP_DIR=.",
+        ]),
+        installs: &["lib/libfreetype.a", "include/freetype2/ft2build.h", "lib/pkgconfig/freetype2.pc"],
+    },
+    Project {
+        name: "cairo",
+        version: "1.16.0",
+        url: "https://cairographics.org/releases/cairo-1.16.0.tar.xz",
+        sha256: "5e7b29b3f113ef870d1e3ecf8adf21f923396401604bda16d44be45e66052331",
+        unpacked: "cairo-1.16.0",
+        // Последняя версия с autotools. Поверхности — картинка в памяти, PNG,
+        // PDF/SVG/PS (им хватает zlib); шрифты — freetype без fontconfig
+        // (fontconfig придёт в 61b). Оконных систем чужих ОС нет.
+        how: How::Autotools(&[
+            "--enable-ft=yes",
+            "--enable-fc=no",
+            "--enable-png=yes",
+            "--enable-xlib=no",
+            "--enable-xcb=no",
+            "--enable-quartz=no",
+            "--enable-win32=no",
+            "--enable-gobject=no",
+            "--enable-trace=no",
+            "--enable-interpreter=no",
+            "--enable-symbol-lookup=no",
+            "--disable-valgrind",
+            // Порядок слов в `double` configure узнаёт, запустив программу, —
+            // а при кросс-сборке запускать нечем. Обе наши архитектуры —
+            // little-endian.
+            "ax_cv_c_float_words_bigendian=no",
+            // `locale_t` у picolibc — число, а cairo держит его указателем в
+            // атомарной ячейке. Локаль ей нужна одна — «C», для чисел в PDF и
+            // SVG, — и на этот случай у неё есть путь через `localeconv`.
+            "ac_cv_func_newlocale=no",
+            "ac_cv_func_strtod_l=no",
+        ], &["SUBDIRS=src"]),
+        installs: &["lib/libcairo.a", "include/cairo/cairo.h", "lib/pkgconfig/cairo.pc"],
+    },
+    // Шрифт для текста: DejaVu Sans. Не собирается — берётся готовым; рядом
+    // едет его лицензия, этого она и требует.
+    Project {
+        name: "dejavu",
+        version: "2.37",
+        url: "https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.tar.bz2",
+        sha256: "fa9ca4d13871dd122f61258a80d01751d603b4d3ee14095d65453b4e846e17d7",
+        unpacked: "dejavu-fonts-ttf-2.37",
+        how: How::Files(&[("ttf/DejaVuSans.ttf", "DejaVuSans.ttf"), ("LICENSE", "DejaVu-LICENSE")]),
+        installs: &[],
+    },
 ];
 
 /// Собрать все чужие проекты под все указанные архитектуры.
 pub fn build_all(arches: &[Arch], refresh: bool) -> Result<()> {
     for project in &PROJECTS {
         let source = fetch(project, refresh)?;
+        if let How::Files(files) = project.how {
+            let dir = cbuild::fonts_dir();
+            fs::create_dir_all(&dir)?;
+            for (from, to) in files {
+                fs::copy(source.join(from), dir.join(to))
+                    .with_context(|| format!("не удалось положить {from} из {}", project.name))?;
+            }
+            say!("{} {}: {} файл(а) в {}", project.name, project.version, files.len(), dir.display());
+            continue;
+        }
         for &arch in arches {
             say!("=== {} {} для {} ===", project.name, project.version, arch.name());
             build(project, &source, arch)?;
@@ -147,7 +268,8 @@ fn fetch(project: &Project, refresh: bool) -> Result<PathBuf> {
         let _ = fs::remove_dir_all(&source);
     }
 
-    let archive = root.join(format!("{}-{}.tar.gz", project.name, project.version));
+    // Имя — из адреса: архивы бывают и `.tar.gz`, и `.tar.xz`.
+    let archive = root.join(project.url.rsplit('/').next().unwrap_or(project.name));
     if !archive.is_file() || refresh {
         say!("> curl {}", project.url);
         let status = Command::new("curl")
@@ -184,7 +306,8 @@ fn fetch(project: &Project, refresh: bool) -> Result<PathBuf> {
 
     let status = Command::new("tar")
         .current_dir(&root)
-        .arg("-xzf")
+        // `-xf` без буквы сжатия: tar узнаёт gzip и xz по содержимому.
+        .arg("-xf")
         .arg(archive.file_name().unwrap())
         .status()
         .context("не удалось запустить tar")?;
@@ -229,6 +352,39 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
             run_make(&work, &["libz.a"], &format!("make {}", arch.name()))?;
             run_make(&work, &["install"], &format!("make install {}", arch.name()))?;
         }
+        How::Autotools(extra, make_vars) => {
+            replace_config_sub(&work)?;
+            // `--disable-shared`: разделяемых библиотек в системе нет (см. zlib
+            // выше). Инструменты `configure` находит по приставке триплета —
+            // и `pkg-config` тоже: у набора он свой и смотрит только в sysroot.
+            run_shell(
+                &work,
+                &format!(
+                    // `LD` — явно: libtool ищет компоновщик, спрашивая компилятор
+                    // `-print-prog-name=ld`, и нашего по такому вопросу не находит
+                    // (так было и с Mono, фаза 58b).
+                    // `CXX`/`CXXCPP` — по той же причине: libtool проверяет C++ у
+                    // всякого проекта, а `g++` с приставкой в наборе нет.
+                    "./configure --host={triple} --prefix={prefix} --disable-shared --enable-static \
+                     LD={triple}-ld CXX={triple}-cc CXXCPP=\"{triple}-cc -E\" {}",
+                    extra.join(" ")
+                ),
+                &format!("configure {} {}", project.name, arch.name()),
+            )?;
+            // `SHELL` — путь к sh без пробела: `make` из winget подставляет его
+            // в рецепты libtool без кавычек, и «C:/Program Files/…» ломает
+            // первую же команду (так было и с Mono, фаза 58b).
+            let shell = format!("SHELL={}", make_shell()?);
+            let mut build: Vec<&str> = vec!["-j6", &shell];
+            build.extend(make_vars.iter());
+            let mut install: Vec<&str> = vec!["install", &shell];
+            install.extend(make_vars.iter());
+            run_make(&work, &build, &format!("make {} {}", project.name, arch.name()))?;
+            run_make(&work, &install, &format!("make install {} {}", project.name, arch.name()))?;
+        }
+        // Файлы не собираются: их кладёт `build_all`, один раз на обе
+        // архитектуры.
+        How::Files(_) => return Ok(()),
         How::MakePlatform(platform) => {
             // Компилятор передаётся переменной, и это не наша выдумка: именно
             // так кросс-собирают Lua, и написано это в его `doc/readme.html`.
@@ -350,6 +506,41 @@ fn find_sh() -> Result<PathBuf> {
         "не найден sh: чужой `configure` — это сценарий оболочки.\n\
          Поставить: winget install --id Git.Git --exact"
     )
+}
+
+/// Подменить в дереве проекта все `config.sub` нашим (фаза 61).
+///
+/// `config.sub` — сценарий, который по `--host` называет систему и отказывает
+/// незнакомой: `x86_64-freeos` для него «OS 'freeos' not recognized». Файл
+/// самостоятельный и обратно совместимый — заменить старый новым было обычным
+/// делом, когда появлялась новая архитектура, — поэтому здесь он один на все
+/// проекты: `ports/autotools/config.sub`, свежий GNU (из libpng 1.6.43) с
+/// единственной дописанной системой, `freeos`. Mono носит свой — в своём
+/// патче.
+fn replace_config_sub(work: &Path) -> Result<()> {
+    let ours = crate::paths::workspace_root().join("ports/autotools/config.sub");
+    let mut stack = vec![work.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().is_some_and(|name| name == "config.sub") {
+                fs::copy(&ours, &path).with_context(|| format!("не удалось заменить {}", path.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Путь к `sh`, пригодный для `SHELL=` у `make`: без пробелов.
+///
+/// Git стоит в `C:\Program Files`, и короткое имя каталога (`PROGRA~1`) — это
+/// тот же путь без пробела; косые — прямые, как их пишет `make`.
+fn make_shell() -> Result<String> {
+    let sh = find_sh()?;
+    let text = sh.to_string_lossy().replace('\\', "/");
+    Ok(text.replace("Program Files", "PROGRA~1"))
 }
 
 /// Найти `make`.

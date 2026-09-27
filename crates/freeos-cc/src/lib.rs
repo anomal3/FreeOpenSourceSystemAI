@@ -27,6 +27,8 @@
 //! `-print-file-name`. Это не украшение — на каждом из них чужой скрипт
 //! принимает решение, и молчание в ответ выглядит как «компилятор сломан».
 
+mod pkgconfig;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -536,6 +538,10 @@ pub fn run(argv: Vec<String>) -> i32 {
                 2
             }
         };
+    }
+    // pkg-config набора (фаза 61): отвечает по `.pc` из sysroot цели.
+    if tool == "pkg-config" {
+        return pkgconfig::run(target, &args);
     }
     if tool != "cc" && tool != "gcc" && tool != "clang" {
         eprintln!("{argv0}: инструмент `{tool}` набор не поставляет");
