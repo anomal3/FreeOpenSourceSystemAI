@@ -1,0 +1,13 @@
+hello: Hello from C# on Mono
+hello: sorted apple,banana,fig,pear
+hello: even squares sum to 220
+hello: fibonacci 0 1 1 2 3 5 8 13 21 34 55 89
+hello: largest word pear
+hello: circle area 7.0686
+hello: square area 4.0000
+hello: letters i=4 m=1 p=2 s=4
+hello: queue gives first then second
+hello: caught FormatException, finally ran True
+hello: closures 0,10,20
+hello: thread summed 5000050000
+hello: args 2

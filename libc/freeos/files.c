@@ -26,10 +26,13 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "freeos-internal.h"
@@ -321,6 +324,73 @@ int fsync(int fd) {
 
 int fdatasync(int fd) { return fsync(fd); }
 
+/* По той же причине `sync` — пустое действие: всё записанное уже на носителе. */
+void sync(void) {}
+
+/* `realpath` — полный путь без `.` и `..` (фаза 60). Свёртка лексическая, та
+ * же, что у `chdir`: символьных ссылок в системе нет, и путь по тексту — это и
+ * есть путь по диску. Как требует POSIX, файл обязан существовать. */
+char *realpath(const char *path, char *resolved) {
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = freeos_path(path, buf);
+    if (full == NULL) {
+        return NULL;
+    }
+    struct stat info;
+    if (stat(full, &info) != 0) {
+        return NULL;
+    }
+    if (resolved == NULL) {
+        resolved = malloc(PATH_MAX);
+        if (resolved == NULL) {
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+    strncpy(resolved, full, PATH_MAX - 1);
+    resolved[PATH_MAX - 1] = '\0';
+    return resolved;
+}
+
+/* Права, время и жёсткие ссылки файла ядро пока менять не умеет: у него нет
+ * таких вызовов. Отказ `ENOSYS`, а не успех, — программа, поставившая права
+ * «только владельцу», обязана узнать, что они остались прежними. */
+int chmod(const char *path, mode_t mode) {
+    (void)path;
+    (void)mode;
+    errno = ENOSYS;
+    return -1;
+}
+
+int fchmod(int fd, mode_t mode) {
+    (void)fd;
+    (void)mode;
+    errno = ENOSYS;
+    return -1;
+}
+
+int utimes(const char *path, const struct timeval times[2]) {
+    (void)path;
+    (void)times;
+    errno = ENOSYS;
+    return -1;
+}
+
+int link(const char *target, const char *path) {
+    (void)target;
+    (void)path;
+    errno = ENOSYS;
+    return -1;
+}
+
+/* Блокировок файлов у ядра нет — как и у `fcntl` (`F_SETLK`). */
+int flock(int fd, int operation) {
+    (void)fd;
+    (void)operation;
+    errno = ENOSYS;
+    return -1;
+}
+
 /* ── Дескрипторы ─────────────────────────────────────────────────────────── */
 
 int dup(int fd) {
@@ -345,6 +415,16 @@ int pipe(int fds[2]) {
     fds[0] = (int)(packed >> 32);
     fds[1] = (int)(packed & 0xffffffff);
     return 0;
+}
+
+/* `pipe2` (фаза 60): `O_CLOEXEC` у нас и так всегда (см. `fcntl` ниже), а
+ * неблокирующих каналов нет — как и у `F_SETFL`. */
+int pipe2(int fds[2], int flags) {
+    if ((flags & ~O_CLOEXEC) != 0) {
+        errno = (flags & O_NONBLOCK) != 0 ? ENOSYS : EINVAL;
+        return -1;
+    }
+    return pipe(fds);
 }
 
 /* `fcntl` — только то, что имеет смысл при нашей модели:

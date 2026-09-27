@@ -79,6 +79,8 @@
 #define FREEOS_KIND_FILE 1
 #define FREEOS_KIND_DIRECTORY 2
 #define FREEOS_KIND_PIPE 3
+/* Стандартный поток, за которым терминал (фаза 60). */
+#define FREEOS_KIND_TERMINAL 4
 
 /* `кто` у `SYS_SPAWN`: запустить с теми же правами, что у запускающего.
  * Минус единица, а не ноль: ноль — это root, то есть совсем другая просьба. */
@@ -190,6 +192,33 @@ struct freeos_thread_info {
     uint64_t id;
     uint64_t stack_low;
     uint64_t stack_high;
+};
+
+/* Ответ `SYS_SYSINFO` (`user_abi::SysInfo`, 144 байта). libc берёт из него
+ * память и число процессоров для `sysconf` (фаза 60), но ядро пишет структуру
+ * целиком — поэтому она здесь вся. */
+struct freeos_sysinfo {
+    uint64_t uptime_ms;
+    uint64_t ticks;
+    uint64_t frames_total;
+    uint64_t frames_free;
+    uint64_t heap_size;
+    uint64_t heap_free;
+    uint64_t dma_total;
+    uint64_t dma_used;
+    uint64_t keys_posted;
+    uint64_t keys_dropped;
+    uint64_t pointer_moves;
+    uint64_t pointer_merged;
+    uint64_t frames_composed;
+    uint64_t rects;
+    uint32_t windows;
+    uint32_t tasks_alive;
+    uint32_t flags;
+    uint32_t pixel_format;
+    uint32_t screen_w;
+    uint32_t screen_h;
+    uint32_t cpus;
 };
 
 /* ── Ловушка ──────────────────────────────────────────────────────────────── */

@@ -200,9 +200,57 @@ pub const C_PROGRAMS: [CProgram; 7] = [
 /// их в байткод — цена без спроса.
 ///
 /// `mono` (фаза 58b) — рантайм Mono 6.14.1, собранный своим `configure` по
-/// рецепту `ports/mono/configure.sh`. Пока без библиотек классов: запускается
-/// и отвечает `--version`, исполнять сборки — фаза 60.
+/// рецепту `ports/mono/configure.sh`. Библиотеки классов к нему — [`MONO_BCL`]
+/// (фаза 60).
 pub const FOREIGN_PROGRAMS: [&str; 2] = ["lua", "mono"];
+
+/// Библиотеки классов Mono, которые едут в образ рядом с `/bin/mono` (фаза 60):
+/// имя сборки и каталог в образе.
+///
+/// Сборки IL, одни на обе архитектуры, — начальный набор `monolite` из архива
+/// исходников 6.14.1, ровно под наш рантайм (почему не из пакета — в
+/// `ports/mono/bcl.sh`, он их и кладёт в [`mono_bcl_dir`]). Три сборки — то, без
+/// чего не работает консольная программа на C#.
+///
+/// Раскладка — та же, что у установленной Mono на Linux, и она не выбор, а
+/// требование рантайма. `mscorlib` он ищет в `<prefix>/lib/mono/4.5`, prefix —
+/// `/usr` (`ports/mono/configure.sh`). Все остальные сборки со строгим именем —
+/// **только** в GAC: `lib/mono/gac/<имя>/<версия>__<токен>/`. Положенная рядом
+/// с mscorlib `System.dll` не находится вовсе: у настоящей установки файлы в
+/// `4.5` — ссылки в GAC, а не сами сборки.
+pub const MONO_BCL: [(&str, &str); 3] = [
+    ("mscorlib.dll", "usr/lib/mono/4.5"),
+    ("System.dll", "usr/lib/mono/gac/System/4.0.0.0__b77a5c561934e089"),
+    ("System.Core.dll", "usr/lib/mono/gac/System.Core/4.0.0.0__b77a5c561934e089"),
+];
+
+/// Куда `ports/mono/bcl.sh` кладёт библиотеки классов на машине сборки.
+pub fn mono_bcl_dir() -> PathBuf {
+    toolchain_dir().join("mono-bcl/4.5")
+}
+
+/// Библиотеки классов Mono для образа: пары «путь в образе, путь на хосте».
+///
+/// Все или ни одной: без mscorlib Mono не запускает ничего, а половина набора
+/// падала бы на первой же ссылке на недостающую сборку — посреди работы, а не
+/// при запуске. Не подготовлены — пусто, как у чужих программ: система обязана
+/// собираться и без них.
+pub fn mono_bcl() -> Vec<(String, PathBuf)> {
+    let dir = mono_bcl_dir();
+    let files: Vec<(String, PathBuf)> = MONO_BCL
+        .iter()
+        .map(|(name, image_dir)| (format!("{image_dir}/{name}"), dir.join(name)))
+        .collect();
+    if files.iter().all(|(_, path)| path.is_file()) {
+        files
+    } else {
+        say!(
+            "библиотеки классов Mono пропущены: нет {} — положить: sh ports/mono/bcl.sh",
+            dir.display()
+        );
+        Vec::new()
+    }
+}
 
 /// Корень всего, что собрано из чужих исходников.
 ///
@@ -812,6 +860,18 @@ mod tests {
         assert_eq!(size_of::<user_abi::PollFd>(), 16);
         assert_eq!(fields_of("freeos_thread_info"), ["id", "stack_low", "stack_high"]);
         assert_eq!(size_of::<user_abi::ThreadInfo>(), 24);
+        // Фаза 60: `sysconf` берёт отсюда память и число процессоров.
+        assert_eq!(
+            fields_of("freeos_sysinfo"),
+            [
+                "uptime_ms", "ticks", "frames_total", "frames_free", "heap_size", "heap_free", "dma_total",
+                "dma_used", "keys_posted", "keys_dropped", "pointer_moves", "pointer_merged",
+                "frames_composed", "rects", "windows", "tasks_alive", "flags", "pixel_format", "screen_w",
+                "screen_h", "cpus",
+            ],
+            "поля `freeos_sysinfo` разъехались с `user_abi::SysInfo`"
+        );
+        assert_eq!(size_of::<user_abi::SysInfo>(), 144);
     }
 
     /// Константа договора по её имени.
@@ -899,6 +959,7 @@ mod tests {
             "KIND_FILE" => abi::KIND_FILE as i64,
             "KIND_DIRECTORY" => abi::KIND_DIRECTORY as i64,
             "KIND_PIPE" => abi::KIND_PIPE as i64,
+            "KIND_TERMINAL" => abi::KIND_TERMINAL as i64,
 
             "SPAWN_INHERIT" => abi::SPAWN_INHERIT as i64,
 

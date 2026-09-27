@@ -143,6 +143,11 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
             .iter()
             .map(|(name, path)| (format!("bin/{name}"), path.clone()))
             .collect();
+        // Библиотеки классов Mono (фаза 60) — только вместе с самой `mono`:
+        // без рантайма они мёртвый груз в девять мегабайт.
+        if programs.iter().any(|(name, _)| *name == "mono") {
+            extra.extend(crate::cbuild::mono_bcl());
+        }
         // Образцовые пакеты — в `/media`, туда же, куда их кладёт установщик.
         // Живая система обязана уметь ставить пакеты так же, как установленная:
         // иначе проверить `pkg` было бы можно только после установки.

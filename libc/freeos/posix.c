@@ -151,29 +151,68 @@ int sem_unlink(const char *name) {
     return -1;
 }
 
-/* ── Динамическая загрузка: отказ ────────────────────────────────────────── */
+/* ── Динамическая загрузка: по таблице экспортов (фаза 60) ───────────────── */
 
-static const char NO_LOADER[] = "FreeOS links programs statically; there is no dynamic loader";
+static const char NO_LIBRARY[] = "FreeOS links programs statically; no such library is built in";
+static const char NO_SYMBOL[] = "FreeOS links programs statically; no such symbol is built in";
 static const char *dl_error;
 
+/* «Библиотека» — сама программа: поиск во всей таблице. Отдельный объект, а
+ * не `NULL`: `NULL` из `dlopen` значит отказ. */
+static const struct freeos_export dl_self = {NULL, NULL, NULL};
+
+/* Имя библиотеки без каталога, приставки `lib` и окончания. */
+static void dl_short_name(const char *path, char *out, size_t size) {
+    const char *base = strrchr(path, '/');
+    base = base != NULL ? base + 1 : path;
+    if (strncmp(base, "lib", 3) == 0 && base[3] != '\0') {
+        base += 3;
+    }
+    snprintf(out, size, "%s", base);
+    static const char *const suffixes[] = {".so", ".dll", ".dylib"};
+    size_t length = strlen(out);
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        size_t cut = strlen(suffixes[i]);
+        if (length > cut && strcmp(out + length - cut, suffixes[i]) == 0) {
+            out[length - cut] = '\0';
+            break;
+        }
+    }
+}
+
+/* Ручка библиотеки — её первая запись в таблице: по ней `dlsym` знает имя. */
 void *dlopen(const char *path, int flags) {
-    (void)path;
     (void)flags;
-    dl_error = NO_LOADER;
+    if (path == NULL) {
+        return (void *)&dl_self;
+    }
+    char name[256];
+    dl_short_name(path, name, sizeof(name));
+    for (const struct freeos_export *entry = freeos_exports; entry != NULL && entry->name != NULL; entry++) {
+        if (strcmp(entry->library, name) == 0) {
+            return (void *)entry;
+        }
+    }
+    dl_error = NO_LIBRARY;
     return NULL;
 }
 
 void *dlsym(void *handle, const char *name) {
-    (void)handle;
-    (void)name;
-    dl_error = NO_LOADER;
+    const struct freeos_export *library = handle;
+    int everywhere = library == NULL || library == &dl_self;
+    for (const struct freeos_export *entry = freeos_exports; entry != NULL && entry->name != NULL; entry++) {
+        if ((everywhere || strcmp(entry->library, library->library) == 0) && strcmp(entry->name, name) == 0) {
+            return entry->address;
+        }
+    }
+    dl_error = NO_SYMBOL;
     return NULL;
 }
 
+/* Закрывать нечего: «библиотека» — часть программы и живёт вместе с ней. */
 int dlclose(void *handle) {
     (void)handle;
-    dl_error = NO_LOADER;
-    return -1;
+    return 0;
 }
 
 /* Сообщение отдаётся один раз и сбрасывается — так требует POSIX. */
@@ -824,4 +863,73 @@ int posix_madvise(void *addr, size_t len, int advice) {
         return EINVAL;
     }
     return 0;
+}
+
+/* `sysconf` (фаза 60): память и процессоры — из `SYS_SYSINFO`, остальное — как
+ * у picolibc (у неё `sysconf` — слабое имя её `__fallback_sysconf`). Кадр ядра
+ * и страница — одно и то же, 4 КиБ. */
+long __fallback_sysconf(int name);
+
+long sysconf(int name) {
+    switch (name) {
+    case _SC_NPROCESSORS_CONF:
+    case _SC_NPROCESSORS_ONLN:
+    case _SC_PHYS_PAGES:
+    case _SC_AVPHYS_PAGES: {
+        struct freeos_sysinfo info;
+        long code = freeos_syscall(SYS_SYSINFO, (long)&info, 0, 0);
+        if (code < 0) {
+            return freeos_set_errno(code);
+        }
+        if (name == _SC_PHYS_PAGES) {
+            return (long)info.frames_total;
+        }
+        if (name == _SC_AVPHYS_PAGES) {
+            return (long)info.frames_free;
+        }
+        return info.cpus > 0 ? (long)info.cpus : 1;
+    }
+    default:
+        return __fallback_sysconf(name);
+    }
+}
+
+/* `madvise` — тот же совет, но с ответом через `errno` (фаза 60). */
+int madvise(void *addr, size_t len, int advice) {
+    int error = posix_madvise(addr, len, advice);
+    if (error != 0) {
+        errno = error;
+        return -1;
+    }
+    return 0;
+}
+
+/* `msync`: отображения файлов у нас только на чтение, а у безымянной памяти
+ * файла нет, — записывать назад нечего ни в одном случае. Проверяется только
+ * выравнивание, как требует POSIX. */
+int msync(void *addr, size_t len, int flags) {
+    (void)len;
+    (void)flags;
+    if (((uintptr_t)addr & 4095) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+/* Закрепить страницы в памяти ядро не умеет: страницы отображённых файлов оно
+ * вправе выбросить. Отказ, а не успех: обещание «не уйдёт на диск» давать
+ * нечем. */
+int mlock(const void *addr, size_t len) {
+    (void)addr;
+    (void)len;
+    errno = ENOSYS;
+    return -1;
+}
+
+int munlock(const void *addr, size_t len) {
+    (void)addr;
+    (void)len;
+    errno = ENOSYS;
+    return -1;
 }

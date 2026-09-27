@@ -140,6 +140,17 @@ static void check_pipe(void) {
     close(ends[1]);
 }
 
+/* Стандартные потоки открыты, и `fstat` это видит (фаза 60): за ними терминал,
+ * то есть символьное устройство. Mono проверяет каждый из трёх потоков
+ * `fcntl(fd, F_GETFL)` и без ответа не открывает `Console`. */
+static void check_standard(void) {
+    struct stat in;
+    struct stat out;
+    int terminal = fstat(0, &in) == 0 && S_ISCHR(in.st_mode) && fstat(1, &out) == 0 && S_ISCHR(out.st_mode);
+    int open_all = fcntl(0, F_GETFL) != -1 && fcntl(1, F_GETFL) != -1 && fcntl(2, F_GETFL) != -1;
+    check(terminal && open_all, "fstat and fcntl see the standard streams as a terminal");
+}
+
 /* ── Пределы, личность, сигналы ──────────────────────────────────────────── */
 
 static void on_signal(int number) { (void)number; }
@@ -172,6 +183,7 @@ int main(int argc, char **argv) {
     check_cwd(dir);
     check_dirs(dir);
     check_pipe();
+    check_standard();
     check_process();
     printf("cposix: done, %d check(s) failed\n", failures);
     return failures == 0 ? 0 : 1;

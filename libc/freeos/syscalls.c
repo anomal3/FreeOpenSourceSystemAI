@@ -209,6 +209,9 @@ static void fill_stat(struct stat *out, const struct freeos_stat *info) {
     case FREEOS_KIND_PIPE:
         out->st_mode |= S_IFIFO;
         break;
+    case FREEOS_KIND_TERMINAL:
+        out->st_mode |= S_IFCHR;
+        break;
     default:
         out->st_mode |= S_IFREG;
         break;

@@ -6758,6 +6758,103 @@ Windows память кода у неё и пишется, и исполняет
   умеет писать в память процесса: такой напишет и вызовет. Это цена любой
   среды с JIT, у Apple и у нас одинаковая.
 
+# Фаза 60 — `mono hello.exe`: Mono исполняет чужую сборку C# — **сделано 2026-09-27**
+
+Итог в одной строке: `run /bin/mono /usr/share/mono/hello.exe a b` во FreeOS
+печатает ровно то же, что тот же `hello.exe` под .NET Framework 4.8 на Windows,
+— и JIT-ом, и интерпретатором (`--interpreter`), на x86-64 и на AArch64.
+`hello.exe` собран чужим компилятором (csc из .NET Framework), а эталон его
+вывода снят чужим рантаймом: `ports/mono/samples/build.sh`.
+
+Проверяет он не «напечатать строку», а по строке на часть рантайма: обобщения
+и интерфейсы через структуру и класс, LINQ (System.Core), очередь
+(System.dll), итератор, замыкания, исключение с `finally`, форматирование
+`double`, поток с `Join`. JIT за один запуск переключает страницы кода около
+двух тысяч раз в каждую сторону (фаза 59).
+
+## Библиотеки классов — не из пакета 6.12, а из monolite 6.14.1
+
+План говорил: сборки IL из пакета Mono 6.12. Исходники опровергли и это.
+Рантайм сверяет GUID версии corlib (`MONO_CORLIB_VERSION` из `configure.ac`) с
+тем, что вшит в mscorlib, и чужой mscorlib отвергает при запуске. Зато в архиве
+исходников 6.14.1 лежит `mcs/class/lib/monolite-linux/<GUID>/` — начальный
+набор, на котором Mono собирает сама себя, **ровно под наш рантайм**: mscorlib,
+System, System.Core и ещё десяток сборок вместе с компилятором `mcs.exe`.
+`ports/mono/bcl.sh` берёт оттуда три сборки; в образ они едут рядом с
+`/bin/mono` (`cbuild::MONO_BCL`), как и она — только если подготовлены.
+
+Раскладка — та же, что у установленной Mono на Linux, и это требование, а не
+вкус: mscorlib — в `/usr/lib/mono/4.5/`, остальные сборки со строгим именем
+ищутся **только** в GAC, `/usr/lib/mono/gac/<имя>/4.0.0.0__<токен>/`.
+Положенная рядом с mscorlib `System.dll` не находится вовсе.
+
+## Что пришлось сделать, по порядку ошибок
+
+1. **Prefix `/usr`** (`ports/mono/configure.sh`): путь к библиотекам классов
+   Mono берёт вшитым при сборке — `/proc/self/exe`, по которому она нашла бы
+   себя, у нас нет. **Ловушка Git Bash, дважды**: он переписывает
+   `--prefix=/usr` в `C:/Program Files/Git/usr` сначала в аргументе configure,
+   а потом, на сборке, — в `-DMONO_ASSEMBLIES="/usr/lib"`, когда sh запускает
+   компилятор (программу Windows). Первое лечится `MSYS2_ARG_CONV_EXCL` в
+   configure.sh, второе — им же у make (`-DMONO_`). Mono искала mscorlib в
+   `C:/Program Files/Git/usr/lib/mono/4.5`.
+2. **RAM-диск 64 МиБ вместо 40**: `/bin` отладочной сборки с Mono занимал 33,5
+   из 40, библиотеки классов — ещё девять.
+3. **Конец главного потока — конец процесса** (ядро, `end_other_threads`). До
+   этой фазы остальные потоки жили дальше, и финализатор Mono, спящий на
+   `futex` без срока, держал процесс вечно — со всей его памятью (в журнале не
+   было `space released`). Теперь выход главного потока поднимает снятие и
+   будит каждый поток процесса; в журнале — `thread : N ends with its
+   process`, а не «снят по просьбе». Выход по `exit` из **не** главного потока
+   процесс по-прежнему не кончает — это следующий шаг, если понадобится.
+4. **`fstat` на стандартных потоках** (`KIND_TERMINAL`, ABI `0x0001_0008`):
+   Mono проверяет каждый из трёх `fcntl(fd, F_GETFL)`, а наш `fcntl` — через
+   `fstat`, на который ядро отвечало «нет такого дескриптора» (потоки в таблице
+   не лежат). Теперь терминал — символьное устройство, канал — канал.
+   Проверка — `cposix`.
+5. **System.Native** — прослойка corefx на C, в которую библиотеки классов Mono
+   для Unix зовут через P/Invoke; без неё не работает даже `double.ToString()`
+   (статический конструктор `Interop.Sys` зовёт
+   `SystemNative_LChflagsCanSetHiddenFlag`). Mono собирает её разделяемой
+   библиотекой и только для систем, которые знает поимённо.
+   `ports/mono/native.sh` собирает нужные файлы (`pal_errno`, `pal_memory`,
+   `pal_time`, `pal_io`, `pal_random`) нашим набором в `libmono-native.a` и по
+   объектникам составляет таблицу экспортов — 69 функций.
+6. **`dlopen`/`dlsym` по таблице экспортов** (libc): статическая программа
+   может нести массив `freeos_exports` — «библиотека, имя, адрес», — и `dlsym`
+   ищет по нему. Имя библиотеки сравнивается без каталога, `lib` и `.so`:
+   `libSystem.Native.so` — это `System.Native`. Mono при этом не меняется ни
+   строкой: она ищет функции P/Invoke через `dlopen`/`dlsym`, как на Linux.
+7. **libc**: `DT_*` — числа Linux и BSD, а не свои picolibc (System.Native
+   сверяет их `static_assert`-ом); `pipe2`, `realpath`, `madvise`, `msync`,
+   `sync` — честно; `chmod`, `fchmod`, `utimes`, `link`, `flock`, `mlock` —
+   `ENOSYS`, у ядра таких вызовов нет. `sysconf` отвечает на
+   `_SC_PHYS_PAGES`, `_SC_AVPHYS_PAGES`, `_SC_NPROCESSORS_*` по
+   `SYS_SYSINFO` — Mono больше не говорит «sysconf doesn't correctly report
+   physical memory size» и не берёт 128 МиБ наугад. Заголовки picolibc
+   `sys/dirent.h` и `unistd.h` лежат в `libc/freeos/include` своими копиями.
+
+## Проверено
+
+- Сценарий **`mono`** (обе архитектуры, живая система): `--version`,
+  `hello.exe` JIT-ом — 13 строк, совпадающих с эталоном .NET Framework,
+  выход 0; то же интерпретатором; `mono /nowhere.exe` — «Cannot open
+  assembly» и выход 2.
+- Регрессия: `cjit`, `boot`, `userspace`, `mmap`, `cmem`, `threads`, `cthreads`, `pipe`, `tlb`, `aslr`, `filemap`, `smp`, `canary`, `abi`, `sdk`, `install`, `installed`, `libc`, `lua`, `desktop`, `dotnet` — обе архитектуры.
+
+## Чего фаза не сделала
+
+- **Установленная система Mono не несёт**: библиотеки классов едут только в
+  образе RAM-диска (живая загрузка). Установщику — свой список файлов 8.3
+  (`crates/installer/src/payload.rs`) и каталоги GAC.
+- System.Native без сети (`pal_networking`: нет `net/if.h`) и без учётных
+  записей (`pal_uid`: у `struct passwd` picolibc нет `pw_gecos`): сборка,
+  позвавшая их функцию, получит `EntryPointNotFoundException` в этом месте.
+- Рецепт — четыре шага руками (`ports/mono/configure.sh` в шапке), в `cargo
+  xtask thirdparty` не переехал.
+- Телефонный образ: RAM-диск с Mono и её библиотеками не влезет в 24,6 МиБ
+  раздела recovery — `phone.rs` откажет со словами; телефону Mono не нужна.
+
 # Веха v0.9 — Mono рядом со своей средой
 
 Записана по слову Романа 2026-09-14: своя среда .NET (веха v0.7c) делается
@@ -6889,7 +6986,7 @@ Windows память кода у неё и пишется, и исполняет
 не убивает. `mono_codeman_enable_write` зовёт его. Проверка — программа на C
 пишет функцию, переключает, вызывает, и второй поток в это время её исполняет.
 
-**60 — Mono в режиме интерпретатора.** `configure --enable-interpreter
+**60 — Mono в режиме интерпретатора** — *сделана 27.09, см. раздел фазы выше: `mono hello.exe` и JIT-ом, и интерпретатором; библиотеки классов — из monolite 6.14.1, а не из пакета 6.12 (GUID corlib)*. `configure --enable-interpreter
 --enable-cooperative-suspend --with-sigaltstack=no --disable-boehm
 --disable-mcs-build --with-tls=__thread`, статическая `mono`. Библиотеки
 классов — сборки IL из официального пакета Mono 6.12 для Linux: код в них

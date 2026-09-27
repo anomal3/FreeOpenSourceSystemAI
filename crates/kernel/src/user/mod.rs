@@ -687,6 +687,12 @@ pub struct Program {
     /// — на границе возврата в третье кольцо, где заведомо нет ни удерживаемого
     /// лока, ни половины начатой работы.
     kill_requested: bool,
+    /// Главный поток вышел, и остальные потоки снимаются вместе с процессом
+    /// (фаза 60): по POSIX конец `main` — конец процесса. Снимает их тот же
+    /// [`check_kill`] — `kill_requested` при этом тоже поднят, — а признак
+    /// нужен ради строки в журнале: «снят по просьбе» и «кончился вместе с
+    /// процессом» — разные события.
+    ending: bool,
     /// От чьего имени исполняется **эта** программа.
     ///
     /// С Phase 33 личность перестала быть свойством системы и стала свойством
@@ -2787,6 +2793,7 @@ fn run(
             space,
             files: files::Table::new(),
             kill_requested: false,
+            ending: false,
             cred,
             rights,
             path: alloc::string::String::from(path),
@@ -2822,6 +2829,12 @@ fn run(
     let code = unsafe { arch::enter_user(entry, stack, argc, argv) };
 
     // Сюда возвращаются оба пути: и `exit`, и снятие программы после отказа.
+    //
+    // Первым делом — остальные потоки: конец главного потока — конец
+    // процесса, как в POSIX. Без этого поток, спящий на ожидании без срока
+    // (у Mono так спит финализатор), держал бы процесс вечно — со всей его
+    // памятью.
+    end_other_threads(slot);
     //
     // Порядок здесь обратный запуску и по той же причине: сначала знание, потом
     // действие. Скажи мы процессору раньше, чем планировщику, — вытеснение между
@@ -2860,7 +2873,9 @@ fn run(
     if let Some(process) = process.as_ref() {
         let others = Arc::strong_count(process) - 1;
         if others > 0 {
-            kprintln!("  user        : the process still has {others} live reference(s) at exit");
+            kprintln!(
+                "  user        : the process still has {others} live reference(s) at exit, the last one frees it"
+            );
         }
     }
     let leaked = process.as_ref().map_or(0, |process| process.lock().files.open_count());
@@ -3641,6 +3656,43 @@ pub fn request_kill(id: sched::TaskId) -> Result<(), KillError> {
     }
 }
 
+/// Снять остальные потоки процесса, чей главный поток в слоте `slot` только
+/// что вышел (фаза 60).
+///
+/// Ничего не ждёт: поднимает просьбу о снятии и будит каждый поток процесса,
+/// а снимет их [`check_kill`] на ближайшем возврате в третье кольцо. Разбудить
+/// обязательно — поток, спящий на ожидании без срока, иначе не вернулся бы
+/// туда никогда. Процесс уничтожит последний из них, отпустив свою ссылку, —
+/// тот же счёт ссылок, что и всегда.
+fn end_other_threads(slot: usize) {
+    let Some(process) = current_process() else {
+        return;
+    };
+    let siblings: Vec<usize> = {
+        let table = PROGRAMS.lock();
+        table
+            .iter()
+            .enumerate()
+            .filter(|(other, entry)| *other != slot && entry.as_ref().is_some_and(|p| Arc::ptr_eq(p, &process)))
+            .map(|(other, _)| other)
+            .collect()
+    };
+    if siblings.is_empty() {
+        return;
+    }
+    {
+        let mut program = process.lock();
+        program.kill_requested = true;
+        program.ending = true;
+    }
+    kprintln!("  user        : main thread exited, ending {} other thread(s)", siblings.len());
+    for other in siblings {
+        if let Some(id) = sched::id_of_slot(other) {
+            sched::wake(id);
+        }
+    }
+}
+
 /// Просили ли снять программу текущей задачи.
 ///
 /// Спрашивает [`syscall`] в тех вызовах, которые умеют ждать долго: снятие
@@ -3671,11 +3723,18 @@ pub unsafe fn check_kill() {
     if !is_running() {
         return;
     }
-    if !with_current(|program| program.kill_requested).unwrap_or(false) {
+    let Some((kill, ending)) = with_current(|program| (program.kill_requested, program.ending)) else {
+        return;
+    };
+    if !kill {
         return;
     }
 
-    kprintln!("  user        : killed by request, task {}", sched::current());
+    if ending {
+        kprintln!("  thread      : {} ends with its process", sched::current());
+    } else {
+        kprintln!("  user        : killed by request, task {}", sched::current());
+    }
     IN_USER[sched::current_slot()].store(false, Ordering::Release);
     // SAFETY: контракт функции плюс проверенный `running` — программа
     // действительно исполняется, значит `enter_user` на стеке и вернуться есть

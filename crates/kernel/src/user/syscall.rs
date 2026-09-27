@@ -43,8 +43,8 @@ use user_abi::{ERR_BROKEN_PIPE, LAUNCH_KEEP, Launch, SYS_LAUNCH, SYS_PIPE};
 use user_abi::{ERR_UPDATE_REFUSED, SYS_UPDATE};
 use user_abi::{ERR_LIMIT, SYS_MMAP, SYS_MMAP_FILE, SYS_MUNMAP};
 use user_abi::{
-    CLOCK_MONOTONIC, CLOCK_REALTIME, KIND_PIPE, POLL_BAD, POLL_FOREVER, POLL_HUP, POLL_IN,
-    POLL_OUT, PollFd, SYS_CLOCK, SYS_DUP, SYS_FSTAT, SYS_ISATTY, SYS_NANOSLEEP, SYS_POLL,
+    CLOCK_MONOTONIC, CLOCK_REALTIME, KIND_PIPE, KIND_TERMINAL, POLL_BAD, POLL_FOREVER, POLL_HUP,
+    POLL_IN, POLL_OUT, PollFd, SYS_CLOCK, SYS_DUP, SYS_FSTAT, SYS_ISATTY, SYS_NANOSLEEP, SYS_POLL,
     SYS_TIMES, Timespec, Times,
 };
 use mini_ui::Rect;
@@ -1285,9 +1285,28 @@ fn fstat(fd: usize, out: usize) -> i64 {
         return ERR_BAD_ADDRESS;
     }
 
+    // Стандартные потоки в таблице не лежат (см. `isatty`): за ними терминал
+    // или конец канала, выданный запускающим. Отвечаем и на них (фаза 60) —
+    // по `fstat` libc узнаёт, открыт ли дескриптор вообще.
+    let standard = super::with_current(|program| match fd {
+        FD_STDIN => Some(program.stdin.is_some()),
+        FD_STDOUT => Some(program.stdout.is_some()),
+        FD_STDERR => Some(false),
+        _ => None,
+    });
     let info = match super::with_current(|program| program.files.describe(fd)) {
         Some(Ok(info)) => info,
-        Some(Err(err)) => return errno(err),
+        Some(Err(err)) => match standard.flatten() {
+            Some(piped) => {
+                let kind = if piped { KIND_PIPE } else { KIND_TERMINAL };
+                let value = Stat { size: 0, mode: 0, uid: 0, gid: 0, kind };
+                // SAFETY: адрес проверен на выравнивание и на то, что структура
+                // целиком лежит в страницах, доступных программе на запись.
+                unsafe { core::ptr::write(out as *mut Stat, value) };
+                return 0;
+            }
+            None => return errno(err),
+        },
         None => return ERR_NO_PROGRAM,
     };
 

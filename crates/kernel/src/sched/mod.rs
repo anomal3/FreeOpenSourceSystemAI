@@ -581,6 +581,19 @@ pub fn lookup(id: TaskId) -> Option<(usize, TaskState)> {
         })
 }
 
+/// Идентификатор задачи в слоте — обратное к [`lookup`].
+///
+/// Нужен тому, кто знает слоты, а не задачи: таблица программ разложена по
+/// слотам, а будить надо по идентификатору. `None` — слот пуст или холостой.
+#[must_use]
+pub fn id_of_slot(slot: usize) -> Option<TaskId> {
+    if is_idle_slot(slot) {
+        return None;
+    }
+    let sched = SCHED.lock();
+    sched.tasks.get(slot).and_then(Option::as_ref).map(|task| task.id)
+}
+
 /// Объявить, в каком адресном пространстве исполняется текущая задача.
 ///
 /// `None` возвращает её в пространство ядра. Значение переставляет процессор не

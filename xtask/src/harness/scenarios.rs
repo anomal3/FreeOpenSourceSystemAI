@@ -4255,6 +4255,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await("cposix: ok access and readlink answer by stat", 15_000),
             Step::Await("cposix: ok pipe carries bytes and poll sees them", 15_000),
             Step::Await("cposix: ok fcntl says close-on-exec", 15_000),
+            // Стандартные потоки видны `fstat` (фаза 60): без этого Mono не
+            // открывала `Console`.
+            Step::Await("cposix: ok fstat and fcntl see the standard streams as a terminal", 15_000),
             Step::Await("cposix: ok getrlimit tells the real stack and file limits", 15_000),
             Step::Await("cposix: ok sigaction keeps a handler and refuses SIGKILL", 15_000),
             Step::Await("cposix: ok getuid matches geteuid", 15_000),
@@ -8258,9 +8261,9 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "mono",
-        about: "Рантайм Mono 6.14.1, собранный своим configure нашим набором, запускается и знает, кто он.",
-        // Живая: программа файлов не пишет, а библиотек классов (фаза 60) пока
-        // нет вовсе — проверяется сам рантайм.
+        about: "Mono 6.14.1, собранная своим configure нашим набором, исполняет чужую сборку C# и JIT-ом, и интерпретатором — с тем же выводом, что .NET Framework.",
+        // Живая: программа файлов не пишет, а библиотеки классов (фаза 60)
+        // едут в образе RAM-диска рядом с `/bin/mono`.
         target: Target::Live,
         usb_only: false,
         tablet: false,
@@ -8291,15 +8294,50 @@ pub const ALL: &[Scenario] = &[
             Step::Await("Mono JIT compiler version 6.14.1", 60_000),
             Step::Await("TLS:", 30_000),
             Step::Await("exited with code 0", 30_000),
-            // Запуск сборки проходит `mini_init`, а он **до** поиска
-            // `mscorlib` пишет трамплины в память кода (фаза 59): без
-            // `MAP_JIT` просьба «писать и исполнять» получала отказ, и Mono
-            // падала на первом же куске кода. Библиотек классов нет (фаза 60),
-            // поэтому честный конец здесь — её собственные слова о них.
+            // Первая сборка IL (фаза 60): `hello.exe`, собранный чужим
+            // компилятором (csc из .NET Framework 4), и строки — те, что тот же файл
+            // печатает под .NET Framework на Windows (`ports/mono/samples/
+            // hello.expected`, снимает `ports/mono/samples/build.sh`). Сначала JIT:
+            // каждый метод компилируется в память кода, переключаемую ядром
+            // (фаза 59), — первая строка ждёт дольше остальных, пока Mono грузит
+            // mscorlib и компилирует запуск.
+            Step::Line("run /bin/mono /usr/share/mono/hello.exe a b"),
+            Step::Await("hello: Hello from C# on Mono", 180_000),
+            Step::Await("hello: sorted apple,banana,fig,pear", 60_000),
+            Step::Await("hello: even squares sum to 220", 60_000),
+            Step::Await("hello: fibonacci 0 1 1 2 3 5 8 13 21 34 55 89", 60_000),
+            Step::Await("hello: largest word pear", 60_000),
+            Step::Await("hello: circle area 7.0686", 60_000),
+            Step::Await("hello: square area 4.0000", 60_000),
+            Step::Await("hello: letters i=4 m=1 p=2 s=4", 60_000),
+            Step::Await("hello: queue gives first then second", 60_000),
+            Step::Await("hello: caught FormatException, finally ran True", 60_000),
+            Step::Await("hello: closures 0,10,20", 60_000),
+            Step::Await("hello: thread summed 5000050000", 60_000),
+            Step::Await("hello: args 2", 60_000),
+            Step::Await("/bin/mono: exited with code 0", 30_000),
+            // Тот же файл интерпретатором: машинного кода Mono не пишет вовсе, кроме
+            // мостов в него, — другой путь исполнения тех же сборок.
+            Step::Line("run /bin/mono --interpreter /usr/share/mono/hello.exe a b"),
+            Step::Await("hello: Hello from C# on Mono", 180_000),
+            Step::Await("hello: sorted apple,banana,fig,pear", 60_000),
+            Step::Await("hello: even squares sum to 220", 60_000),
+            Step::Await("hello: fibonacci 0 1 1 2 3 5 8 13 21 34 55 89", 60_000),
+            Step::Await("hello: largest word pear", 60_000),
+            Step::Await("hello: circle area 7.0686", 60_000),
+            Step::Await("hello: square area 4.0000", 60_000),
+            Step::Await("hello: letters i=4 m=1 p=2 s=4", 60_000),
+            Step::Await("hello: queue gives first then second", 60_000),
+            Step::Await("hello: caught FormatException, finally ran True", 60_000),
+            Step::Await("hello: closures 0,10,20", 60_000),
+            Step::Await("hello: thread summed 5000050000", 60_000),
+            Step::Await("hello: args 2", 60_000),
+            Step::Await("/bin/mono: exited with code 0", 30_000),
+            // Нет файла — отказ словами Mono и её же выход, а не снятие ядром.
             Step::Line("run /bin/mono /nowhere.exe"),
-            Step::Await("The assembly mscorlib.dll was not found or could not be loaded.", 60_000),
-            // И выход своим путём, `exit (1)`, а не снятие ядром.
-            Step::Await("/bin/mono: exited with code 1", 30_000),
+            Step::Await("Cannot open assembly '/nowhere.exe'", 60_000),
+            Step::Await("/bin/mono: exited with code 2", 30_000),
+            Step::Absent("mscorlib.dll was not found"),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],
@@ -8816,7 +8854,8 @@ pub const ALL: &[Scenario] = &[
             // 56–57, здесь число тогда не подняли — сценарий краснел), затем
             // `SYS_THREAD_INFO` (фаза 58b).
             // 65543 — `0x0001_0007`: `MAP_JIT`, память кода (фаза 59).
-            Step::Await("posix: abi version 65543", 60_000),
+            // 65544 — `0x0001_0008`: `KIND_TERMINAL` у `SYS_FSTAT` (фаза 60).
+            Step::Await("posix: abi version 65544", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».
