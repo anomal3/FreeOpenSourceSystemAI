@@ -395,12 +395,24 @@ struct Anon {
     /// страницу вместо той, что потерялась (так было с фазы 41 и так
     /// остаётся). В ленивой отсутствующая страница — обычное дело.
     lazy: bool,
+    /// Память кода ([`user_abi::MAP_JIT`], фаза 59): страница бывает то
+    /// записываемой, то исполняемой, и переключает её ядро по обращению
+    /// ([`Program::jit_flip`]). `flags` у такой области — права страницы,
+    /// которая приходит по записи или чтению; нынешнее состояние каждой
+    /// страницы записано не здесь, а в её записи таблицы, — и это
+    /// единственное место, где оно может быть верным всегда.
+    jit: bool,
 }
 
 impl Anon {
     /// Жадная область «читать и писать» — то, что выдавал `SYS_MMAP` до фазы 56.
     const fn read_write(lazy: bool) -> Self {
-        Self { flags: PageFlags::READ.union(PageFlags::WRITE).union(PageFlags::USER), lazy }
+        Self { flags: PageFlags::READ.union(PageFlags::WRITE).union(PageFlags::USER), lazy, jit: false }
+    }
+
+    /// Память кода (фаза 59): ленивая, страницы приходят записываемыми.
+    const fn jit() -> Self {
+        Self { jit: true, ..Self::read_write(true) }
     }
 
     /// Права, с которыми страница стоит в таблице.
@@ -734,6 +746,24 @@ pub struct Program {
     devices: [Option<driver::Held>; user_abi::MAX_DEVICES],
     /// Её память для DMA — буферы окна ядра.
     dma: Vec<crate::mm::dma::DmaBuffer>,
+    /// Счёт переключений памяти кода (фаза 59).
+    jit: JitStats,
+}
+
+impl Drop for Program {
+    fn drop(&mut self) {
+        // Строка только у тех, кто памятью кода пользовался: по ней видно,
+        // сколько стоило W^X, — и ждал ли кто-нибудь чужой записи.
+        let jit = &self.jit;
+        if jit.to_write + jit.to_execute > 0 {
+            kprintln!(
+                "  user        : jit: {} flips to write, {} to execute, {} waits",
+                jit.to_write,
+                jit.to_execute,
+                jit.waits
+            );
+        }
+    }
 }
 
 impl Program {
@@ -753,21 +783,20 @@ impl Program {
     /// таблиц ([`crate::mm::MapError::WriteExecute`]).
     fn mmap(&mut self, len: usize, flags: usize) -> Result<usize, MmapError> {
         let huge = flags & MAP_HUGE != 0;
-        let lazy = flags & user_abi::MAP_LAZY != 0;
+        let jit = flags & user_abi::MAP_JIT != 0;
+        // Память кода ленива всегда: страницу, которую ещё не писали, нечем
+        // ни исполнять, ни занимать.
+        let lazy = flags & user_abi::MAP_LAZY != 0 || jit;
         // Неизвестный бит — не «проигнорируем», а отказ: программа, собранная
         // под следующий договор, иначе получила бы не то, что просила, и
         // узнала бы об этом по поведению, а не по коду возврата.
-        if flags & !(MAP_HUGE | user_abi::MAP_LAZY) != 0 || (huge && lazy) {
+        if flags & !(MAP_HUGE | user_abi::MAP_LAZY | user_abi::MAP_JIT) != 0 || (huge && lazy) {
             return Err(MmapError::BadRequest);
         }
         if lazy {
             let (base, pages) = self.reserve(len, PAGE_SIZE)?;
-            self.remember(Mapping {
-                base,
-                pages,
-                blocks: 0,
-                source: Source::Anonymous(Anon::read_write(true)),
-            });
+            let anon = if jit { Anon::jit() } else { Anon::read_write(true) };
+            self.remember(Mapping { base, pages, blocks: 0, source: Source::Anonymous(anon) });
             return Ok(base);
         }
         // Крупные страницы требуют выравнивания и по виртуальному адресу тоже,
@@ -1210,7 +1239,10 @@ impl Program {
         let first = self.mappings.partition_point(|region| region.end() <= addr);
         let mut covered = addr;
         for region in self.mappings[first..].iter().take_while(|region| region.base < end) {
-            if region.base > covered || !Self::divisible(region) {
+            // Права страниц памяти кода меняет ядро само, по обращению
+            // (фаза 59), и второй хозяин у них был бы лишним.
+            let jit = matches!(region.source, Source::Anonymous(Anon { jit: true, .. }));
+            if region.base > covered || !Self::divisible(region) || jit {
                 return Err(MmapError::BadRequest);
             }
             covered = region.end();
@@ -1425,16 +1457,31 @@ impl Program {
     /// Само чтение идёт **без** замка ([`fault_in`]): под ним нельзя спать, а
     /// путь чтения спит, и вторая программа, отказавшая в это время, ждала бы
     /// не носитель, а чужой замок.
-    fn fault_plan(&self, page_addr: usize, write: bool) -> Option<FaultPlan> {
+    fn fault_plan(&self, page_addr: usize, access: Touch) -> Option<FaultPlan> {
         let region = &self.mappings[self.region_at(page_addr)?];
         let page = (page_addr - region.base) / PAGE_SIZE;
+        let write = access == Touch::Write;
         match &region.source {
+            // Память кода (фаза 59): первая страница приходит в том
+            // состоянии, какого просит обращение, — исполнение получает
+            // исполняемую, остальные записываемую.
+            Source::Anonymous(anon) if anon.jit => {
+                let flags = if access == Touch::Execute {
+                    PageFlags::READ | PageFlags::EXEC | PageFlags::USER
+                } else {
+                    anon.flags
+                };
+                Some(FaultPlan { node: None, offset: 0, want: 0, flags, clean: false })
+            }
             // Ленивая безымянная память (фаза 56): страница из ниоткуда, то
             // есть кадр с нулями, — если права области пускают такое
             // обращение. Запись в страницу только на чтение и любое обращение
             // к «никак» — ошибка программы, а не повод подложить ей страницу.
             Source::Anonymous(anon) if anon.lazy => {
-                if !anon.flags.contains(PageFlags::USER) || (write && !anon.flags.contains(PageFlags::WRITE)) {
+                if !anon.flags.contains(PageFlags::USER)
+                    || (write && !anon.flags.contains(PageFlags::WRITE))
+                    || (access == Touch::Execute && !anon.flags.contains(PageFlags::EXEC))
+                {
                     return None;
                 }
                 Some(FaultPlan { node: None, offset: 0, want: 0, flags: anon.page_flags(), clean: false })
@@ -1502,6 +1549,15 @@ impl Program {
         if arch::translate(self.space.root(), VirtAddr::new(page_addr)).is_some() {
             return Commit::Raced;
         }
+        // Страница, которую будут исполнять, наполнялась через кеш данных:
+        // чтением с носителя (сегмент кода) или обнулением (память кода).
+        // На AArch64 кеш инструкций этого не видит, пока кадр не вычищен, — и
+        // кадр, раньше служивший чужим кодом, исполнил бы прежние инструкции.
+        // Стенд этого не покажет никогда (QEMU кеши не моделирует), настоящий
+        // процессор — однажды.
+        if plan.flags.contains(PageFlags::EXEC) {
+            arch::sync_instructions(frame);
+        }
         // SAFETY: кадр наш, адрес лежит в области этой программы, и страницы
         // под ним сейчас нет — проверено строкой выше под тем же замком.
         if unsafe { self.space.map(VirtAddr::new(page_addr), frame, plan.flags) }.is_err() {
@@ -1548,6 +1604,134 @@ impl Program {
 
         Commit::Mapped
     }
+}
+
+impl Program {
+    /// Отказ на присутствующей странице памяти кода (фаза 59,
+    /// [`user_abi::MAP_JIT`]): переключить её между «писать» и «исполнять».
+    ///
+    /// Нынешнее состояние страницы читается из её записи таблицы, под замком
+    /// процесса, — поэтому два потока, отказавшие на одной странице разом,
+    /// переключат её один раз: второй найдёт её уже такой, какая ему нужна, и
+    /// просто повторит инструкцию.
+    ///
+    /// Порядок при переходе в исполнение обязателен: сначала новая запись
+    /// таблицы и сброс трансляций на всех процессорах, и только потом чистка
+    /// кешей. Обратный порядок оставил бы окно, в котором поток на другом
+    /// процессоре ещё пишет по старой трансляции — уже после чистки.
+    fn jit_flip(&mut self, page_addr: usize, access: Touch, slot: usize, shared: bool) -> Flip {
+        let Some(index) = self.region_at(page_addr) else {
+            return Flip::Refused;
+        };
+        if !matches!(self.mappings[index].source, Source::Anonymous(Anon { jit: true, .. })) {
+            return Flip::Refused;
+        }
+        let virt = VirtAddr::new(page_addr);
+        let Some((phys, now)) = arch::translate(self.space.root(), virt) else {
+            // Страницу сняли, пока мы шли к замку (другой поток отдал её
+            // `munmap`). Повтор инструкции разберётся с этим обычным путём.
+            return Flip::Done;
+        };
+        let flags = match access {
+            // Читать можно в обоих состояниях, и отказ на чтении присутствующей
+            // страницы к переключению отношения не имеет.
+            Touch::Read => return Flip::Refused,
+            Touch::Write => {
+                if now.contains(PageFlags::WRITE) {
+                    return Flip::Done;
+                }
+                self.jit.writer = Some((slot, crate::time::uptime_ms()));
+                self.jit.to_write += 1;
+                PageFlags::READ | PageFlags::WRITE | PageFlags::USER
+            }
+            Touch::Execute => {
+                if now.contains(PageFlags::EXEC) {
+                    return Flip::Done;
+                }
+                // Страницу только что открыл на запись **другой** поток — он
+                // пишет, и забрать её сейчас значило бы оборвать его очередь
+                // записей отказом на каждой следующей. Своя запись перед своим
+                // исполнением ожидания не требует: писать и исполнять разом
+                // один поток не может.
+                if let Some((writer, at)) = self.jit.writer {
+                    let fresh = crate::time::uptime_ms().saturating_sub(at) < JIT_WRITE_WINDOW_MS;
+                    if shared && writer != slot && fresh {
+                        self.jit.waits += 1;
+                        return Flip::Wait;
+                    }
+                }
+                self.jit.to_execute += 1;
+                PageFlags::READ | PageFlags::EXEC | PageFlags::USER
+            }
+        };
+        // SAFETY: страница принадлежит памяти кода этой программы; кадр под
+        // ней не меняется, меняются только права — это переотображение
+        // построитель таблиц разрешает и сам сбрасывает трансляцию на этом
+        // процессоре. Записываемой и исполняемой разом она не становится:
+        // такое отображение построитель отвергает.
+        if unsafe { self.space.map(virt, phys, flags) }.is_err() {
+            kprintln!("  user        : WARNING: jit could not rewrite the page at {page_addr:#x}");
+            return Flip::Refused;
+        }
+        if shared {
+            arch::flush_user_translations();
+        }
+        if flags.contains(PageFlags::EXEC) {
+            arch::sync_instructions(phys);
+        }
+        Flip::Done
+    }
+}
+
+/// Каким обращением программа отказала.
+///
+/// Три значения, а не признак «запись»: с фазы 59 исполнение отличается от
+/// чтения по смыслу — память кода переключают именно по нему.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Touch {
+    /// Чтение данных.
+    Read,
+    /// Запись.
+    Write,
+    /// Выборка инструкции.
+    Execute,
+}
+
+/// Исход [`Program::jit_flip`].
+enum Flip {
+    /// Страница в нужном состоянии; инструкцию можно повторять.
+    Done,
+    /// Страницу сейчас пишет другой поток: подождать и повторить.
+    Wait,
+    /// Это не память кода, или обращение не из тех, что переключают.
+    Refused,
+}
+
+/// Сколько миллисекунд после того, как поток открыл страницу кода на запись,
+/// исполнение её другим потоком ждёт, а не забирает страницу назад.
+///
+/// Две: запись метода — это сотни записей подряд, и их хватает с большим
+/// запасом; а дольше держать поток, пришедший исполнять, незачем — у
+/// пишущего нет способа сказать «закончил», и ожидание по сроку здесь
+/// единственное, которое не может стать вечным.
+const JIT_WRITE_WINDOW_MS: u64 = 2;
+
+/// Сколько спит поток, ждущий страницу кода, перед следующей попыткой.
+const JIT_WAIT_MS: u64 = 1;
+
+/// Что делала память кода программы (фаза 59) — ради строки в журнале при
+/// её конце.
+#[derive(Default)]
+struct JitStats {
+    /// Кто последним открыл страницу кода на запись (слот задачи), и когда
+    /// (миллисекунды работы системы).
+    writer: Option<(usize, u64)>,
+    /// Сколько раз страница переключалась на запись.
+    to_write: u64,
+    /// Сколько раз — на исполнение.
+    to_execute: u64,
+    /// Сколько раз исполнение ждало чужую запись.
+    waits: u64,
 }
 
 /// Исход второй половины отказа — [`Program::fault_commit`].
@@ -2612,6 +2796,7 @@ fn run(
             mmap_start: layout.mmap_start,
             devices: [const { None }; user_abi::MAX_DEVICES],
             dma: Vec::new(),
+            jit: JitStats::default(),
         })));
     }
     // Признак поднимается после того, как процесс попал в таблицу: обработчик
@@ -3264,16 +3449,28 @@ pub fn owns(ptr: usize, len: usize) -> bool {
 /// звать изнутри [`with_current`]. Сегодня ни один системный вызов так не
 /// делает, и это проверено, а не предположено.
 #[must_use]
-pub fn fault_in(addr: usize, write: bool, present: bool) -> bool {
-    // Страница на месте, а обращение не прошло — это нарушение прав, и
-    // подкачка тут ни при чём.
-    if present {
-        return false;
-    }
+pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     let page_addr = addr & !(PAGE_SIZE - 1);
+    // Страница на месте, а обращение не прошло — это нарушение прав, и
+    // подкачка тут ни при чём. Кроме памяти кода (фаза 59): у неё «не те
+    // права» — обычное состояние, и отказ означает «переключи».
+    if present {
+        let slot = sched::current_slot();
+        return match with_current_shared(|program, shared| program.jit_flip(page_addr, access, slot, shared)) {
+            Some(Flip::Done) => true,
+            // Ждём вне замка и возвращаемся в программу: инструкция
+            // повторится, и отказ спросит заново. Цикл здесь, в ядре, держал
+            // бы поток мимо проверки снятия, пока другой пишет.
+            Some(Flip::Wait) => {
+                sched::sleep_ms(JIT_WAIT_MS);
+                true
+            }
+            Some(Flip::Refused) | None => false,
+        };
+    }
 
     // Шаг первый, под замком: что читать.
-    let Some(plan) = with_current(|program| program.fault_plan(page_addr, write)).flatten() else {
+    let Some(plan) = with_current(|program| program.fault_plan(page_addr, access)).flatten() else {
         return false;
     };
 

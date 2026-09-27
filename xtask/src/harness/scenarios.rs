@@ -1578,7 +1578,8 @@ pub const ALL: &[Scenario] = &[
             // (веха «драйверы», Д3). Сорок пять — `cmem` и `cthreads`
             // (фазы 56–57). Сорок семь — `cposix` и `mono` (фаза 58b); `mono`
             // едет, только если собрана по `ports/mono/configure.sh`, иначе 46.
-            Step::Expect("/bin holds 47 programs"),
+            // Сорок восемь — `cjit` (фаза 59).
+            Step::Expect("/bin holds 48 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -4435,6 +4436,54 @@ pub const ALL: &[Scenario] = &[
             Step::Await("cthreads: done, 0 check(s) failed", 30_000),
             Step::Await("exited with code 0", 15_000),
             Step::Absent("cthreads: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("user        : WARNING"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "cjit",
+        about: "Память кода: программа пишет себе функцию и вызывает её, пока второй поток её исполняет, — W^X держится, страницы переключает ядро.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // Четыре процессора: пишущий и исполняющий потоки обязаны встречаться
+        // на одной странице по-настоящему, а не по очереди на одном.
+        extra: &["-smp", "4"],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Line("run /bin/cjit"),
+            Step::Await("cjit: code memory at ", 30_000),
+            Step::Await("cjit: ok write and execute without MAP_JIT is refused", 30_000),
+            Step::Await("cjit: ok mprotect leaves code memory to the kernel", 30_000),
+            Step::Await("cjit: ok a written function runs and a rewritten one runs anew", 30_000),
+            // Тысяча переписываний подряд, и каждое видно следующему же
+            // вызову: на AArch64 без чистки кешей число отставало бы.
+            Step::Await("cjit: ok 1000 rewrites, each seen at once", 120_000),
+            Step::Await("cjit: ok a second thread ran the function ", 120_000),
+            Step::Await("cjit: ok half of code memory is given back, the other half still runs", 30_000),
+            Step::Await("cjit: done, 0 check(s) failed", 30_000),
+            // Строка ядра при конце программы: сколько раз страницы
+            // переключались. Две тысячи — это одна тысяча переписываний,
+            // каждое стоит переключения туда и обратно.
+            Step::AtLeast("user        : jit: ", 1000, 30_000),
+            Step::Await("exited with code 0", 15_000),
+            Step::Absent("cjit: FAILED"),
             Step::Absent("user        : killed by"),
             Step::Absent("user        : WARNING"),
             Step::Absent("KERNEL PANIC"),
@@ -8242,6 +8291,15 @@ pub const ALL: &[Scenario] = &[
             Step::Await("Mono JIT compiler version 6.14.1", 60_000),
             Step::Await("TLS:", 30_000),
             Step::Await("exited with code 0", 30_000),
+            // Запуск сборки проходит `mini_init`, а он **до** поиска
+            // `mscorlib` пишет трамплины в память кода (фаза 59): без
+            // `MAP_JIT` просьба «писать и исполнять» получала отказ, и Mono
+            // падала на первом же куске кода. Библиотек классов нет (фаза 60),
+            // поэтому честный конец здесь — её собственные слова о них.
+            Step::Line("run /bin/mono /nowhere.exe"),
+            Step::Await("The assembly mscorlib.dll was not found or could not be loaded.", 60_000),
+            // И выход своим путём, `exit (1)`, а не снятие ядром.
+            Step::Await("/bin/mono: exited with code 1", 30_000),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],
@@ -8757,7 +8815,8 @@ pub const ALL: &[Scenario] = &[
             // 65542 — `0x0001_0006`: `SYS_MPROTECT` и срок у ожидания (фазы
             // 56–57, здесь число тогда не подняли — сценарий краснел), затем
             // `SYS_THREAD_INFO` (фаза 58b).
-            Step::Await("posix: abi version 65542", 60_000),
+            // 65543 — `0x0001_0007`: `MAP_JIT`, память кода (фаза 59).
+            Step::Await("posix: abi version 65543", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».

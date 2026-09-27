@@ -435,12 +435,17 @@ extern "C" fn trap_handler(kind: u64, frame: *mut TrapFrame) {
                 let write = ec == EC_DATA_ABORT_LOWER
                     && iss & ISS_WNR != 0
                     && iss & ISS_CM == 0;
+                // Выборка инструкции отличается от чтения с фазы 59: по ней
+                // переключается память кода.
+                let access = if ec == EC_INSTRUCTION_ABORT_LOWER {
+                    crate::user::Touch::Execute
+                } else if write {
+                    crate::user::Touch::Write
+                } else {
+                    crate::user::Touch::Read
+                };
 
-                if crate::user::fault_in(
-                    frame.far as usize,
-                    write,
-                    is_permission_fault(iss),
-                ) {
+                if crate::user::fault_in(frame.far as usize, access, is_permission_fault(iss)) {
                     // Отображение достроено. Возврат отсюда доходит до `eret`,
                     // и отказавшая инструкция повторяется — теперь удачно.
                     return;

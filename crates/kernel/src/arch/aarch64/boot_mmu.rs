@@ -58,7 +58,7 @@ use super::paging::{
     AP_EL1_RW, ATTR_IDX_DEVICE_NGNRNE, ATTR_IDX_NORMAL, ATTR_IDX_NORMAL_NC, DESC_AF,
     DESC_AP_SHIFT, DESC_ATTR_INDX_SHIFT, DESC_PXN, DESC_SH_SHIFT, DESC_TABLE, DESC_UXN,
     DESC_VALID, ENTRIES_PER_TABLE, MAIR_EL1_VALUE, SCTLR_C, SCTLR_I, SCTLR_M, SCTLR_SPAN,
-    SH_INNER_SHAREABLE, SH_NON_SHAREABLE, supported_ips, tcr_el1_value,
+    SCTLR_UCI, SCTLR_UCT, SH_INNER_SHAREABLE, SH_NON_SHAREABLE, supported_ips, tcr_el1_value,
 };
 
 /// Размер блока нижнего уровня этой раскладки.
@@ -277,7 +277,7 @@ unsafe fn activate() {
     unsafe {
         asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack, preserves_flags));
     }
-    sctlr |= SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_SPAN;
+    sctlr |= SCTLR_M | SCTLR_C | SCTLR_I | SCTLR_SPAN | SCTLR_UCT | SCTLR_UCI;
 
     // SAFETY: со следующей инструкции адреса транслируются нашими таблицами.
     // Код, стек и всё, что понадобится дальше, отображены тождественно, поэтому

@@ -528,12 +528,29 @@ void *sbrk(ptrdiff_t increment) {
  * - запись в отображение файла — ядро отображает файл только на чтение;
  *   `EACCES`, как у POSIX при файле, открытом без права записи.
  * - `MAP_SHARED` у безымянной памяти равен `MAP_PRIVATE`: делить её не с кем,
- *   `fork` в системе нет. */
+ *   `fork` в системе нет.
+ *
+ * `MAP_JIT` (фаза 59) — память для кода, который программа пишет себе сама,
+ * как у Apple: только безымянная, и `prot` у неё не спрашивается — страница
+ * бывает то «читать и писать», то «читать и исполнять», и переключает её ядро
+ * по обращению. Без этого флага «писать и исполнять» — отказ, как и был. */
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset) {
     (void)addr;
     if (len == 0 || (flags & MAP_FIXED) != 0) {
         errno = EINVAL;
         return MAP_FAILED;
+    }
+    if ((flags & MAP_JIT) != 0) {
+        if ((flags & MAP_ANONYMOUS) == 0) {
+            errno = EINVAL;
+            return MAP_FAILED;
+        }
+        long got = freeos_syscall(SYS_MMAP, (long)len, FREEOS_MAP_JIT, 0);
+        if (got < 0) {
+            freeos_set_errno(got);
+            return MAP_FAILED;
+        }
+        return (void *)got;
     }
     if ((prot & PROT_WRITE) != 0 && (prot & PROT_EXEC) != 0) {
         /* W^X — правило системы. `EACCES` — ответ POSIX на права, которых не

@@ -160,6 +160,22 @@
  	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-linux.Plo
  	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-mach-helper.Plo
  	-rm -f ./$(DEPDIR)/libmonoutils_la-mono-threads-mach.Plo
+--- a/mono/utils/mono-mmap.c
++++ b/mono/utils/mono-mmap.c
+@@ -314,6 +314,13 @@
+ 	}
+ #endif
+ 
++#if defined(__freeos__) && defined(MAP_JIT)
++	/* FreeOS: pages are never writable and executable at once; with MAP_JIT
++	 * the kernel flips a code page between the two on access. */
++	if (flags & MONO_MMAP_JIT)
++		mflags |= MAP_JIT;
++#endif
++
+ 	mflags |= MAP_ANONYMOUS;
+ 	mflags |= MAP_PRIVATE;
+ 
 --- a/mono/utils/mono-sigcontext.h
 +++ b/mono/utils/mono-sigcontext.h
 @@ -496,7 +496,7 @@

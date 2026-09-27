@@ -164,7 +164,7 @@ pub struct CProgram {
 }
 
 /// Программы на C, которые едут в `/bin`.
-pub const C_PROGRAMS: [CProgram; 6] = [
+pub const C_PROGRAMS: [CProgram; 7] = [
     CProgram { name: "cdemo", needs: None, libs: &[] },
     // Переполняет свой стек нарочно: доказывает, что канарейка стека есть и у
     // программ на C. См. `libc/examples/csmash.c` и `__stack_chk_fail` в `crt0.c`.
@@ -178,6 +178,9 @@ pub const C_PROGRAMS: [CProgram; 6] = [
     // Слой POSIX под чужую среду: текущий каталог, каталоги, канал с `poll`,
     // пределы, таблица сигналов (фаза 58b). См. `libc/examples/cposix.c`.
     CProgram { name: "cposix", needs: None, libs: &[] },
+    // Память кода: функция, записанная в память и вызванная, пока второй
+    // поток её исполняет, — W^X по обращению (фаза 59). См. `libc/examples/cjit.c`.
+    CProgram { name: "cjit", needs: None, libs: &[] },
     // Чужая библиотека, собранная нашим набором. Она здесь не ради сжатия: это
     // единственная проверка, доказывающая, что код, вышедший из чужого
     // `configure`, **работает**, а не только собрался. См. `libc/examples/zdemo.c`.
@@ -862,6 +865,7 @@ mod tests {
             "SYS_THREAD_INFO" => abi::SYS_THREAD_INFO as i64,
 
             "MAP_LAZY" => abi::MAP_LAZY as i64,
+            "MAP_JIT" => abi::MAP_JIT as i64,
 
             // `usize::MAX` в договоре — минус единица в регистре.
             "DUP_ANY" => abi::DUP_ANY as i64,

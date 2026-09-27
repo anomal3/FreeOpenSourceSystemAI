@@ -441,11 +441,16 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
             enable();
 
             let error = frame.error;
-            if crate::user::fault_in(
-                addr,
-                error & PF_WRITE != 0,
-                error & PF_PRESENT != 0,
-            ) {
+            // Выборка инструкции отличается от чтения с фазы 59: по ней
+            // переключается память кода.
+            let access = if error & PF_INSTRUCTION_FETCH != 0 {
+                crate::user::Touch::Execute
+            } else if error & PF_WRITE != 0 {
+                crate::user::Touch::Write
+            } else {
+                crate::user::Touch::Read
+            };
+            if crate::user::fault_in(addr, access, error & PF_PRESENT != 0) {
                 // Отображение достроено. Возврат из `dispatch` доходит до
                 // `iretq`, и отказавшая инструкция повторяется — теперь удачно.
                 return;

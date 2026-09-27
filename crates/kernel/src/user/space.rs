@@ -520,7 +520,29 @@ pub fn user_can(ptr: usize, len: usize, need: PageFlags) -> bool {
     for page in first..=last {
         let virt = VirtAddr::new(page * PAGE_SIZE);
 
+        let write = need.contains(PageFlags::WRITE);
+        let access = if write { super::Touch::Write } else { super::Touch::Read };
         let flags = match arch::translate(root, virt) {
+            // Страница памяти кода, стоящая сейчас «на исполнение» (фаза 59):
+            // запись ядра за программу переключает её так же, как
+            // переключила бы запись самой программы. Остальным страницам без
+            // права записи переключатель ответит отказом — и это прежний
+            // ответ «нельзя».
+            //
+            // Окно между этой проверкой и записью ядра остаётся тем же, что
+            // и с `mprotect` из соседнего потока: поток, пошедший исполнять
+            // эту страницу в промежутке, переключит её обратно. Буфер
+            // системного вызова в памяти кода — случай, которого не делает
+            // ни одна наша программа и ни одна известная среда.
+            Some((_, flags)) if write && !flags.contains(PageFlags::WRITE) => {
+                if !super::fault_in(virt.as_usize(), access, true) {
+                    return false;
+                }
+                match arch::translate(root, virt) {
+                    Some((_, flags)) => flags,
+                    None => return false,
+                }
+            }
             Some((_, flags)) => flags,
             // Страницы нет — но это больше не обязательно отказ. С фазы 41
             // программа вправе держать адрес, за которым лежит файл, а не
@@ -534,7 +556,7 @@ pub fn user_can(ptr: usize, len: usize, need: PageFlags) -> bool {
             // ошибки, — и ловушка «отказ страницы внутри системного вызова»
             // перестаёт существовать, вместо того чтобы обрабатываться.
             None => {
-                if !super::fault_in(virt.as_usize(), need.contains(PageFlags::WRITE), false) {
+                if !super::fault_in(virt.as_usize(), access, false) {
                     return false;
                 }
                 match arch::translate(root, virt) {
