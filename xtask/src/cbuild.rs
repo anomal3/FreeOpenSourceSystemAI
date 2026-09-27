@@ -218,10 +218,14 @@ pub const FOREIGN_PROGRAMS: [&str; 2] = ["lua", "mono"];
 /// **только** в GAC: `lib/mono/gac/<имя>/<версия>__<токен>/`. Положенная рядом
 /// с mscorlib `System.dll` не находится вовсе: у настоящей установки файлы в
 /// `4.5` — ссылки в GAC, а не сами сборки.
-pub const MONO_BCL: [(&str, &str); 3] = [
-    ("mscorlib.dll", "usr/lib/mono/4.5"),
-    ("System.dll", "usr/lib/mono/gac/System/4.0.0.0__b77a5c561934e089"),
-    ("System.Core.dll", "usr/lib/mono/gac/System.Core/4.0.0.0__b77a5c561934e089"),
+///
+/// Третье поле — имя 8.3 на установочном носителе (FAT), каталог там —
+/// [`crate::arch::PAYLOAD_MONO_LIB_DIR`]. Список обязан совпадать с `MONO_LIB`
+/// в `crates/installer/src/payload.rs`.
+pub const MONO_BCL: [(&str, &str, &str); 3] = [
+    ("mscorlib.dll", "usr/lib/mono/4.5", "MSCORLIB.DLL"),
+    ("System.dll", "usr/lib/mono/gac/System/4.0.0.0__b77a5c561934e089", "SYSTEM.DLL"),
+    ("System.Core.dll", "usr/lib/mono/gac/System.Core/4.0.0.0__b77a5c561934e089", "SYSCORE.DLL"),
 ];
 
 /// Куда `ports/mono/bcl.sh` кладёт библиотеки классов на машине сборки.
@@ -229,25 +233,79 @@ pub fn mono_bcl_dir() -> PathBuf {
     toolchain_dir().join("mono-bcl/4.5")
 }
 
-/// Библиотеки классов Mono для образа: пары «путь в образе, путь на хосте».
+/// Шрифты, которые едут в образ (фаза 61): имя, каталог в образе, имя 8.3 на
+/// носителе.
 ///
-/// Все или ни одной: без mscorlib Mono не запускает ничего, а половина набора
-/// падала бы на первой же ссылке на недостающую сборку — посреди работы, а не
-/// при запуске. Не подготовлены — пусто, как у чужих программ: система обязана
-/// собираться и без них.
-pub fn mono_bcl() -> Vec<(String, PathBuf)> {
-    let dir = mono_bcl_dir();
-    let files: Vec<(String, PathBuf)> = MONO_BCL
+/// Рисованию текста — cairo через freetype, дальше `System.Drawing` — нужен
+/// настоящий векторный шрифт, а своего TrueType у системы нет (её собственный
+/// шрифт — растровый, рисуется ядром). DejaVu Sans — свободный (лицензия
+/// Bitstream Vera с дополнениями), широкий по охвату и есть почти в любом
+/// Linux. Кладёт его `cargo xtask thirdparty` в [`fonts_dir`]. Список обязан
+/// совпадать с `FONTS` в `crates/installer/src/payload.rs`.
+pub const FONTS: [(&str, &str, &str); 2] = [
+    ("DejaVuSans.ttf", "usr/share/fonts/dejavu", "DEJAVU.TTF"),
+    // Лицензия шрифта едет рядом с ним: этого она и требует.
+    ("DejaVu-LICENSE", "usr/share/fonts/dejavu", "DEJAVU.TXT"),
+];
+
+/// Куда `cargo xtask thirdparty` кладёт шрифты: одни на обе архитектуры.
+pub fn fonts_dir() -> PathBuf {
+    toolchain_dir().join("fonts")
+}
+
+/// Чужой файл образа — не программа: библиотека классов Mono, шрифт.
+pub struct ForeignFile {
+    /// Путь в образе, без ведущей косой.
+    pub image: String,
+    /// Где он лежит на машине сборки.
+    pub host: PathBuf,
+    /// Путь на установочном носителе (FAT, имена 8.3).
+    pub medium: String,
+}
+
+/// Чужие файлы образа: библиотеки классов Mono — только вместе с самой
+/// `mono` (без рантайма они мёртвый груз в девять мегабайт), и шрифты.
+///
+/// Каждая группа — все файлы или ни одного: без mscorlib Mono не запускает
+/// ничего, а половина набора падала бы на первой же ссылке на недостающую
+/// сборку — посреди работы, а не при запуске. Не подготовлены — пусто, как у
+/// чужих программ: система обязана собираться и без них. Один список на всех,
+/// кто собирает образ (RAM-диск, установочный носитель, образ обновления), —
+/// по той же причине, по которой есть `arch::IMAGE_SHARE`.
+pub fn foreign_files(with_mono: bool) -> Vec<ForeignFile> {
+    let mut out = Vec::new();
+    if with_mono {
+        out.extend(foreign_group(
+            &MONO_BCL,
+            &mono_bcl_dir(),
+            crate::arch::PAYLOAD_MONO_LIB_DIR,
+            "библиотеки классов Mono",
+            "sh ports/mono/bcl.sh",
+        ));
+    }
+    out.extend(foreign_group(&FONTS, &fonts_dir(), crate::arch::PAYLOAD_FONTS_DIR, "шрифты", "cargo xtask thirdparty"));
+    out
+}
+
+fn foreign_group(
+    list: &[(&str, &str, &str)],
+    dir: &Path,
+    medium_dir: &str,
+    what: &str,
+    how: &str,
+) -> Vec<ForeignFile> {
+    let files: Vec<ForeignFile> = list
         .iter()
-        .map(|(name, image_dir)| (format!("{image_dir}/{name}"), dir.join(name)))
+        .map(|(name, image_dir, medium)| ForeignFile {
+            image: format!("{image_dir}/{name}"),
+            host: dir.join(name),
+            medium: format!("{medium_dir}/{medium}"),
+        })
         .collect();
-    if files.iter().all(|(_, path)| path.is_file()) {
+    if files.iter().all(|file| file.host.is_file()) {
         files
     } else {
-        say!(
-            "библиотеки классов Mono пропущены: нет {} — положить: sh ports/mono/bcl.sh",
-            dir.display()
-        );
+        say!("{what} пропущены: нет {} — положить: {how}", dir.display());
         Vec::new()
     }
 }

@@ -145,9 +145,9 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
             .collect();
         // Библиотеки классов Mono (фаза 60) — только вместе с самой `mono`:
         // без рантайма они мёртвый груз в девять мегабайт.
-        if programs.iter().any(|(name, _)| *name == "mono") {
-            extra.extend(crate::cbuild::mono_bcl());
-        }
+        // Шрифты (фаза 61) — всегда, если подготовлены.
+        let with_mono = programs.iter().any(|(name, _)| *name == "mono");
+        extra.extend(crate::cbuild::foreign_files(with_mono).into_iter().map(|file| (file.image, file.host)));
         // Образцовые пакеты — в `/media`, туда же, куда их кладёт установщик.
         // Живая система обязана уметь ставить пакеты так же, как установленная:
         // иначе проверить `pkg` было бы можно только после установки.

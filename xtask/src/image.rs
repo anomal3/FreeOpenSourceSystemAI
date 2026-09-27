@@ -265,6 +265,15 @@ fn collect(built: &Built, kind: Kind) -> Result<Vec<Payload>> {
                 }
             }
 
+            // Библиотеки классов Mono (фаза 60) — только вместе с самой `mono`,
+            // как и в образе RAM-диска. Источник — результат сборки, а не
+            // репозиторий, поэтому они не в `IMAGE_SHARE`.
+            // Шрифты (фаза 61) — тем же путём.
+            let with_mono = built.programs().any(|(name, _)| name == "mono");
+            for file in crate::cbuild::foreign_files(with_mono) {
+                payload.push(read_payload(&file.medium, &file.host)?);
+            }
+
             // Образцовые пакеты. Имена на носителе — короткие 8.3, потому что
             // это FAT; настоящие имена (`hello-1.0.fpk`) знает установщик и
             // ставит файлы под ними в `/media`.

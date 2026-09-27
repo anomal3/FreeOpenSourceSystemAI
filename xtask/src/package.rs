@@ -248,6 +248,12 @@ fn update_root_bytes(programs: &[(&'static str, PathBuf)]) -> Result<u64> {
                 .len();
         }
     }
+    let with_mono = programs.iter().any(|(name, _)| *name == "mono");
+    for file in crate::cbuild::foreign_files(with_mono) {
+        content += fs::metadata(&file.host)
+            .with_context(|| format!("не удалось узнать размер {}", file.host.display()))?
+            .len();
+    }
     let wanted = (content + content / 4).div_ceil(MIB) * MIB;
     Ok(wanted.max(UPDATE_ROOT_MIN_BYTES))
 }
@@ -427,6 +433,16 @@ fn build_root_image(
                 .write_file_path(&mut disk, &target, &data, 0o644, 0, 0)
                 .map_err(|err| anyhow::anyhow!("не удалось записать /{target} в образ: {err}"))?;
         }
+    }
+
+    // Чужие файлы образа — библиотеки классов Mono (фаза 60), шрифты (фаза
+    // 61): тот же набор, что кладёт установщик, и тем же условием.
+    let with_mono = programs.iter().any(|(name, _)| *name == "mono");
+    for file in crate::cbuild::foreign_files(with_mono) {
+        let data = fs::read(&file.host).with_context(|| format!("не удалось прочитать {}", file.host.display()))?;
+        fs_image
+            .write_file_path(&mut disk, &file.image, &data, 0o644, 0, 0)
+            .map_err(|err| anyhow::anyhow!("не удалось записать /{} в образ: {err}", file.image))?;
     }
 
     fs_image

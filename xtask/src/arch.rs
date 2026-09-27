@@ -297,6 +297,26 @@ pub const PAYLOAD_LUA_DIR: &str = "FREEOS/LUA";
 /// Список обязан совпадать с `LUA` в `crates/installer/src/payload.rs`.
 pub const PAYLOAD_LUA: [(&str, &str); 1] = [("demo.lua", "DEMO.LUA")];
 
+/// Каталог образцов для Mono на установочном носителе (фаза 60).
+pub const PAYLOAD_MONO_DIR: &str = "FREEOS/MONO";
+
+/// Что из `initrd/usr/share/mono/` едет на носитель и под каким именем 8.3.
+///
+/// Список обязан совпадать с `MONO` в `crates/installer/src/payload.rs`.
+pub const PAYLOAD_MONO: [(&str, &str); 1] = [("hello.exe", "HELLO.EXE")];
+
+/// Каталог библиотек классов Mono на установочном носителе (фаза 60).
+///
+/// Отдельно от [`PAYLOAD_MONO_DIR`] и вне [`IMAGE_SHARE`], потому что источник
+/// у них другой: не `initrd/` в репозитории, а результат сборки
+/// (`ports/mono/bcl.sh`), которого может и не быть. Имена 8.3 — в
+/// [`crate::cbuild::MONO_BCL`].
+pub const PAYLOAD_MONO_LIB_DIR: &str = "FREEOS/MONOLIB";
+
+/// Каталог шрифтов на установочном носителе (фаза 61). Имена 8.3 — в
+/// [`crate::cbuild::FONTS`].
+pub const PAYLOAD_FONTS_DIR: &str = "FREEOS/FONTS";
+
 /// Каталог сайта по умолчанию на установочном носителе.
 pub const PAYLOAD_SITE_DIR: &str = "FREEOS/WWW";
 
@@ -349,7 +369,7 @@ pub struct ImageShare {
 /// Добавляя новую группу, её дописывают сюда — и она сама доезжает и на
 /// носитель, и в обновление. Длина списка закреплена: новая группа не
 /// проскочит мимо этого места молча.
-pub const IMAGE_SHARE: [ImageShare; 4] = [
+pub const IMAGE_SHARE: [ImageShare; 5] = [
     ImageShare {
         dir: "usr/share/defaults/etc",
         subdirs: &[],
@@ -367,6 +387,12 @@ pub const IMAGE_SHARE: [ImageShare; 4] = [
         subdirs: &[],
         medium_dir: PAYLOAD_LUA_DIR,
         files: &PAYLOAD_LUA,
+    },
+    ImageShare {
+        dir: "usr/share/mono",
+        subdirs: &[],
+        medium_dir: PAYLOAD_MONO_DIR,
+        files: &PAYLOAD_MONO,
     },
     ImageShare {
         dir: "usr/share/httpd",

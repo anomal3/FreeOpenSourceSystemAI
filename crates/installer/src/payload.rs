@@ -219,6 +219,31 @@ pub fn probe() -> Result<Payload, Error> {
         }
     }
 
+    // Mono (фаза 60): образец и библиотеки классов — тем же шагом, что
+    // настройки. Их отсутствие установку не срывает: без них не заработает
+    // только `/bin/mono`, а там, где её не собирали, нет и её самой.
+    for (source, target) in MONO.into_iter().chain(MONO_LIB) {
+        match stat(&mut root, source, What::Defaults) {
+            Ok(size) => {
+                logln!("[payload] mono file {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Defaults, size });
+            }
+            Err(_) => logln!("[payload] {source} is missing; /bin/mono will lack it"),
+        }
+    }
+
+    // Шрифты (фаза 61) — тем же шагом. Без них не рисуется текст: ни у cairo,
+    // ни у `System.Drawing`.
+    for (source, target) in FONTS {
+        match stat(&mut root, source, What::Defaults) {
+            Ok(size) => {
+                logln!("[payload] font {source}: {size} bytes");
+                items.push(Item { source, target, what: What::Defaults, size });
+            }
+            Err(_) => logln!("[payload] {source} is missing; text will have no font"),
+        }
+    }
+
     // Сайт по умолчанию. Его отсутствие установку не срывает: сервер без
     // страницы отвечает `404`, и это честнее несостоявшейся установки.
     for (source, target) in SITE {
@@ -390,6 +415,36 @@ const DEFAULTS: [(&CStr16, &str); 4] = [
 /// что язык в ней работает, не набирая программу руками в терминале.
 const LUA: [(&CStr16, &str); 1] =
     [(cstr16!("\\FREEOS\\LUA\\DEMO.LUA"), "usr/share/lua/demo.lua")];
+
+/// Образец сборки C# для Mono (фаза 60).
+///
+/// Список обязан совпадать с `PAYLOAD_MONO` в `xtask/src/arch.rs`.
+const MONO: [(&CStr16, &str); 1] =
+    [(cstr16!("\\FREEOS\\MONO\\HELLO.EXE"), "usr/share/mono/hello.exe")];
+
+/// Библиотеки классов Mono (фаза 60) — туда, где их ищет рантайм: mscorlib в
+/// `4.5`, остальные сборки в GAC.
+///
+/// Список обязан совпадать с `MONO_BCL` в `xtask/src/cbuild.rs`. На носителе их
+/// может не быть — там, где Mono не собиралась, нет и её самой.
+const MONO_LIB: [(&CStr16, &str); 3] = [
+    (cstr16!("\\FREEOS\\MONOLIB\\MSCORLIB.DLL"), "usr/lib/mono/4.5/mscorlib.dll"),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\SYSTEM.DLL"),
+        "usr/lib/mono/gac/System/4.0.0.0__b77a5c561934e089/System.dll",
+    ),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\SYSCORE.DLL"),
+        "usr/lib/mono/gac/System.Core/4.0.0.0__b77a5c561934e089/System.Core.dll",
+    ),
+];
+
+/// Шрифты (фаза 61). Список обязан совпадать с `FONTS` в `xtask/src/cbuild.rs`.
+const FONTS: [(&CStr16, &str); 2] = [
+    (cstr16!("\\FREEOS\\FONTS\\DEJAVU.TTF"), "usr/share/fonts/dejavu/DejaVuSans.ttf"),
+    // Лицензия шрифта едет рядом с ним: этого она и требует.
+    (cstr16!("\\FREEOS\\FONTS\\DEJAVU.TXT"), "usr/share/fonts/dejavu/DejaVu-LICENSE"),
+];
 
 /// Страница, которую веб-сервер отдаёт по умолчанию, и её оформление.
 ///
