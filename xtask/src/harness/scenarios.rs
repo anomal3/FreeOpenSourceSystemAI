@@ -8503,6 +8503,10 @@ pub const ALL: &[Scenario] = &[
             // fontconfig лежат там, куда их положил установщик (фаза 61b).
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await("freeos> ", 90_000),
+            // Длинная строка, набранная, пока стартуют службы, теряла символы
+            // (aarch64, 28.09): эхо ввода перемешивалось с их выводом. `drvd` —
+            // служба на один проход, и её конец — это «службы встали».
+            Step::Await("init: 'drvd' finished", 60_000),
             Step::Line("ls /usr/lib/mono/gac/System.Drawing/4.0.0.0__b03f5f7f11d50a3a"),
             Step::Await("System.Drawing.dll", 15_000),
             // Строки stdout — те, что тот же drawing.exe печатает под .NET
@@ -8530,6 +8534,70 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("TypeInitializationException"),
             Step::Absent("DllNotFoundException"),
             Step::Absent("EntryPointNotFoundException"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "mono-forms",
+        about: "WinForms Mono на окнах FreeOS: форма из программы для .NET Framework открывается окном стола, кнопка отвечает на щелчок, поле — на набор, флажок — на щелчок, крестик закрывает форму.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+            // Набор — когда службы встали: см. `mono-drawing`.
+            Step::Await("init: 'drvd' finished", 60_000),
+            // `forms.exe` собран csc из .NET Framework (`ports/mono/samples/
+            // forms.cs`); точки прицела — раскладка формы из того же файла, в
+            // координатах содержимого окна.
+            Step::Line("run /bin/mono /usr/share/mono/forms.exe"),
+            Step::Await("forms: shown 360x200", 240_000),
+            Step::Wait(3_000),
+            Step::Shot("form"),
+            // Кнопка «Click me»: 12,44 размером 120x32.
+            Step::Aim(Aim::Program("Mono Forms", 72, 60)),
+            Step::Click,
+            Step::Await("forms: clicked 1", 60_000),
+            // Поле: 12,90 размером 200x24. Щелчок даёт ему фокус, набор идёт в
+            // окно в фокусе — то есть в форму, а в ней в поле.
+            Step::Aim(Aim::Program("Mono Forms", 100, 102)),
+            Step::Click,
+            Step::Wait(1_000),
+            Step::Type("abc"),
+            Step::Await("forms: text 'abc'", 60_000),
+            // Флажок: 12,126 размером 120x24.
+            Step::Aim(Aim::Program("Mono Forms", 20, 138)),
+            Step::Click,
+            Step::Await("forms: checked True", 60_000),
+            Step::Wait(2_000),
+            Step::Shot("form-used"),
+            // Крестик стола — WM_CLOSE форме, форма закрывается, цикл
+            // сообщений кончается, программа выходит с нулём.
+            Step::Aim(Aim::Close("Mono Forms")),
+            Step::Click,
+            Step::Await("forms: closed", 60_000),
+            Step::Await("forms: done", 30_000),
+            Step::Await("/bin/mono: exited with code 0", 30_000),
+            Step::Absent("Exception"),
+            Step::Absent("mwf-freeos: the desktop refused"),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],

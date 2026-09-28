@@ -21,3 +21,6 @@ cat ports/mono/samples/hello.expected
 MSYS2_ARG_CONV_EXCL='*' "$CSC" -nologo -optimize+ '-out:initrd\usr\share\mono\drawing.exe' 'ports\mono\samples\drawing.cs'
 "$OUT/drawing.exe" | tr -d '\r' > ports/mono/samples/drawing.expected
 cat ports/mono/samples/drawing.expected
+# Фаза 62: WinForms. Эталона строк у формы нет — строки появляются в ответ на
+# щелчки и набор, и сверяет их сценарий `mono-forms`.
+MSYS2_ARG_CONV_EXCL='*' "$CSC" -nologo -optimize+ -target:winexe '-out:initrd\usr\share\mono\forms.exe' 'ports\mono\samples\forms.cs'

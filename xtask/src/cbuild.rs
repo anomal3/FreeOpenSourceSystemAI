@@ -239,7 +239,7 @@ pub const FOREIGN_PROGRAMS: [&str; 2] = ["lua", "mono"];
 /// Третье поле — имя 8.3 на установочном носителе (FAT), каталог там —
 /// [`crate::arch::PAYLOAD_MONO_LIB_DIR`]. Список обязан совпадать с `MONO_LIB`
 /// в `crates/installer/src/payload.rs`.
-pub const MONO_BCL: [(&str, &str, &str); 8] = [
+pub const MONO_BCL: [(&str, &str, &str); 13] = [
     ("mscorlib.dll", "usr/lib/mono/4.5", "MSCORLIB.DLL"),
     ("System.dll", "usr/lib/mono/gac/System/4.0.0.0__b77a5c561934e089", "SYSTEM.DLL"),
     ("System.Core.dll", "usr/lib/mono/gac/System.Core/4.0.0.0__b77a5c561934e089", "SYSCORE.DLL"),
@@ -252,6 +252,17 @@ pub const MONO_BCL: [(&str, &str, &str); 8] = [
     // Фаза 61b: собрана из исходников 6.14.1 (`ports/mono/bcl.sh`); ключ у неё
     // другой — тот же, что у System.Drawing из .NET Framework.
     ("System.Drawing.dll", "usr/lib/mono/gac/System.Drawing/4.0.0.0__b03f5f7f11d50a3a", "SYSDRAW.DLL"),
+    // Фаза 62: WinForms с драйвером окон FreeOS и то, на что она ссылается
+    // (System.Data — нет, см. `ports/mono/bcl.sh`).
+    ("System.Windows.Forms.dll", "usr/lib/mono/gac/System.Windows.Forms/4.0.0.0__b77a5c561934e089", "SYSWINF.DLL"),
+    ("Accessibility.dll", "usr/lib/mono/gac/Accessibility/4.0.0.0__b03f5f7f11d50a3a", "ACCESS.DLL"),
+    ("Mono.Posix.dll", "usr/lib/mono/gac/Mono.Posix/4.0.0.0__0738eb9f132ed756", "MONOPSX.DLL"),
+    ("Mono.WebBrowser.dll", "usr/lib/mono/gac/Mono.WebBrowser/4.0.0.0__0738eb9f132ed756", "MONOWEB.DLL"),
+    (
+        "System.Runtime.Serialization.Formatters.Soap.dll",
+        "usr/lib/mono/gac/System.Runtime.Serialization.Formatters.Soap/4.0.0.0__b03f5f7f11d50a3a",
+        "SYSSOAP.DLL",
+    ),
 ];
 
 /// Куда `ports/mono/bcl.sh` кладёт библиотеки классов на машине сборки.
@@ -962,6 +973,13 @@ mod tests {
             "поля `freeos_sysinfo` разъехались с `user_abi::SysInfo`"
         );
         assert_eq!(size_of::<user_abi::SysInfo>(), 144);
+        // Фаза 62: окна у программ на C (драйвер WinForms Mono).
+        assert_eq!(fields_of("freeos_window_spec"), ["title", "title_len", "surface", "width", "height", "id"]);
+        assert_eq!(size_of::<user_abi::WindowSpec>(), 40);
+        assert_eq!(core::mem::offset_of!(user_abi::WindowSpec, surface), 16);
+        assert_eq!(core::mem::offset_of!(user_abi::WindowSpec, id), 32);
+        assert_eq!(fields_of("freeos_win_event_raw"), ["kind", "code", "x", "y"]);
+        assert_eq!(size_of::<user_abi::WinEvent>(), 16);
     }
 
     /// Константа договора по её имени.
@@ -1013,6 +1031,11 @@ mod tests {
             "SYS_FUTEX_WAKE" => abi::SYS_FUTEX_WAKE as i64,
             "SYS_MPROTECT" => abi::SYS_MPROTECT as i64,
             "SYS_THREAD_INFO" => abi::SYS_THREAD_INFO as i64,
+            "SYS_WINOPEN" => abi::SYS_WINOPEN as i64,
+            "SYS_WINCOMMIT" => abi::SYS_WINCOMMIT as i64,
+            "SYS_WINEVENT" => abi::SYS_WINEVENT as i64,
+            "SYS_WINCLOSE" => abi::SYS_WINCLOSE as i64,
+            "SYS_WINRESIZE" => abi::SYS_WINRESIZE as i64,
 
             "MAP_LAZY" => abi::MAP_LAZY as i64,
             "MAP_JIT" => abi::MAP_JIT as i64,

@@ -53,7 +53,12 @@
 #define SYS_NANOSLEEP 50
 #define SYS_POLL 51
 #define SYS_TIMES 52
+#define SYS_WINOPEN 53
+#define SYS_WINCOMMIT 54
+#define SYS_WINEVENT 55
+#define SYS_WINCLOSE 56
 #define SYS_SYSINFO 57
+#define SYS_WINRESIZE 62
 #define SYS_THREAD_CREATE 63
 #define SYS_SET_TLS 64
 #define SYS_THREAD_EXIT 65
@@ -219,6 +224,26 @@ struct freeos_sysinfo {
     uint32_t screen_w;
     uint32_t screen_h;
     uint32_t cpus;
+};
+
+/* Заявка на окно — аргумент `SYS_WINOPEN` (`user_abi::WindowSpec`, 40 байт).
+ * Первые два поля и размер заполняет программа, `surface` и `id` — ядро
+ * (фаза 62: окна у программ на C — ради WinForms Mono). */
+struct freeos_window_spec {
+    uint64_t title;
+    uint64_t title_len;
+    uint64_t surface;
+    uint32_t width;
+    uint32_t height;
+    int64_t id;
+};
+
+/* Событие окна — ответ `SYS_WINEVENT` (`user_abi::WinEvent`, 16 байт). */
+struct freeos_win_event_raw {
+    uint32_t kind;
+    uint32_t code;
+    int32_t x;
+    int32_t y;
 };
 
 /* ── Ловушка ──────────────────────────────────────────────────────────────── */

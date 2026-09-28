@@ -25,7 +25,8 @@
 #
 # Фаза 61b: в ту же таблицу — libgdiplus (если `ports/mono/gdiplus.sh` её
 # собрал) и две функции libc, которые сборки зовут через `DllImport("libc")`;
-# список библиотек для перекомпоновки mono — в native-freeos/libs.
+# список библиотек для перекомпоновки mono — в native-freeos/libs. Фаза 62 —
+# окна стола (`freeos`) для драйвера WinForms.
 #
 # Использование (из корня репозитория, после configure и make этой архитектуры
 # и, для System.Drawing, после ports/mono/gdiplus.sh):
@@ -82,10 +83,13 @@ fi
 # `readlink` — TimeZoneInfo узнаёт так свой пояс. `dlopen("libc")` ищет
 # библиотеку `c`.
 LIBC_EXPORTS="uname readlink"
+# Окна рабочего стола (фаза 62, `<freeos/window.h>` из libfreeos): их зовёт
+# драйвер WinForms `XplatUIFreeOS` — `[DllImport("freeos")]`.
+FREEOS_EXPORTS="freeos_window_open freeos_window_commit freeos_window_event freeos_window_resize freeos_window_close freeos_screen"
 {
   echo "/* Порождено ports/mono/native.sh — не править руками. */"
   echo "#include <dlfcn.h>"
-  for name in $(cat "$OUT/exports.txt" "$OUT/gdiplus.txt") $LIBC_EXPORTS; do echo "extern void $name(void);"; done
+  for name in $(cat "$OUT/exports.txt" "$OUT/gdiplus.txt") $LIBC_EXPORTS $FREEOS_EXPORTS; do echo "extern void $name(void);"; done
   echo "const struct freeos_export freeos_exports[] = {"
   while read -r name; do
     echo "    {\"System.Native\", \"$name\", (void *)$name},"
@@ -96,6 +100,9 @@ LIBC_EXPORTS="uname readlink"
   done < "$OUT/gdiplus.txt"
   for name in $LIBC_EXPORTS; do
     echo "    {\"c\", \"$name\", (void *)$name},"
+  done
+  for name in $FREEOS_EXPORTS; do
+    echo "    {\"freeos\", \"$name\", (void *)$name},"
   done
   echo "    {0, 0, 0},"
   echo "};"
@@ -113,5 +120,5 @@ if [ -s "$OUT/gdiplus.txt" ]; then
   done
 fi
 for path in $LIBS; do printf '%s ' "$(cygpath -m "$path")"; done > "$OUT/libs"
-echo "System.Native: $(wc -l < "$OUT/exports.txt") functions, gdiplus: $(wc -l < "$OUT/gdiplus.txt"), libc: $(echo $LIBC_EXPORTS | wc -w) -> $OUT"
+echo "System.Native: $(wc -l < "$OUT/exports.txt") functions, gdiplus: $(wc -l < "$OUT/gdiplus.txt"), libc: $(echo $LIBC_EXPORTS | wc -w), freeos: $(echo $FREEOS_EXPORTS | wc -w) -> $OUT"
 echo "libs: $(cat "$OUT/libs")"

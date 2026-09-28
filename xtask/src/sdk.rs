@@ -187,6 +187,10 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
     // Каталоги, текущий каталог, дескрипторы (фаза 58b).
     let files = work.join("files.o");
     cbuild::compile(arch, &cbuild::libc_dir().join("freeos/files.c"), &files, &includes)?;
+    // Окна рабочего стола (фаза 62): `<freeos/window.h>` — их зовёт драйвер
+    // WinForms Mono.
+    let window = work.join("window.o");
+    cbuild::compile(arch, &cbuild::libc_dir().join("freeos/window.c"), &window, &includes)?;
     let archive = lib.join("libfreeos.a");
     // Архив пересоздаётся, а не дополняется: `llvm-ar r` в существующий файл
     // оставил бы там объектник от прошлой архитектуры, если каталог когда-то
@@ -201,6 +205,7 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
         .arg(&threads)
         .arg(&posix)
         .arg(&files)
+        .arg(&window)
         .status()
         .with_context(|| format!("не удалось запустить {}", ar.display()))?;
     if !status.success() {

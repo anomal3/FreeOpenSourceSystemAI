@@ -250,3 +250,84 @@
 +MONO_EMPTY_SOURCE_FILE (mono_threads_freeos);
 +
 +#endif
+--- a/mcs/class/System.Drawing/Assembly/AssemblyInfo.cs
++++ b/mcs/class/System.Drawing/Assembly/AssemblyInfo.cs
+@@ -60,3 +60,5 @@
+ [assembly: AssemblyFileVersion (Consts.FxFileVersion)]
+ [assembly: CompilationRelaxations (CompilationRelaxations.NoStringInterning)]
+ [assembly: Dependency ("System,", LoadHint.Always)]
++// FreeOS: GDIPlus.FreeOSGraphicsFromHwnd задаёт драйвер окон WinForms.
++[assembly: InternalsVisibleTo ("System.Windows.Forms, PublicKey=00000000000000000400000000000000")]
+--- a/mcs/class/System.Drawing/System.Drawing/Graphics.cs
++++ b/mcs/class/System.Drawing/System.Drawing/Graphics.cs
+@@ -194,6 +194,8 @@
+ 				CopyFromScreenMac (sourceX, sourceY, destinationX, destinationY, blockRegionSize, copyPixelOperation);
+ 			} else if (GDIPlus.UseCocoaDrawable) {
+ 				CopyFromScreenMac (sourceX, sourceY, destinationX, destinationY, blockRegionSize, copyPixelOperation);
++			} else if (GDIPlus.UseFreeOSDrawable) {
++				throw new NotSupportedException ("FreeOS: the screen belongs to the desktop, programs cannot copy from it");
+ 			} else {
+ 				CopyFromScreenWin32 (sourceX, sourceY, destinationX, destinationY, blockRegionSize, copyPixelOperation);
+ 			}
+@@ -1745,6 +1747,12 @@
+ 				return g;
+ 			}
+ 
++			if (GDIPlus.UseFreeOSDrawable) {
++				if (GDIPlus.FreeOSGraphicsFromHwnd == null)
++					throw new NotSupportedException ("FreeOS: window graphics need System.Windows.Forms");
++				return GDIPlus.FreeOSGraphicsFromHwnd (hwnd);
++			}
++
+ 			if (GDIPlus.UseCarbonDrawable) {
+ 				CarbonContext context = MacSupport.GetCGContextForView (hwnd);
+ 				GDIPlus.GdipCreateFromContext_macosx (context.ctx, context.width, context.height, out graphics);
+--- a/mcs/class/System.Drawing/System.Drawing/gdipFunctions.cs
++++ b/mcs/class/System.Drawing/System.Drawing/gdipFunctions.cs
+@@ -61,6 +61,10 @@
+ 		public static bool UseX11Drawable = false;
+ 		public static bool UseCarbonDrawable = false;
+ 		public static bool UseCocoaDrawable = false;
++		// FreeOS: окна рисует стол, и Graphics окна строит драйвер окон
++		// WinForms (XplatUIFreeOS) над своей картинкой окна — X11 здесь нет.
++		public static bool UseFreeOSDrawable = false;
++		internal static Func<IntPtr, Graphics> FreeOSGraphicsFromHwnd;
+ 
+ 		private const string GdiPlus = "gdiplus";
+ 
+@@ -121,6 +125,8 @@
+ 						string os = Marshal.PtrToStringAnsi (buf);
+ 						if (os == "Darwin")
+ 							UseCarbonDrawable = true;
++						else if (os == "FreeOS")
++							UseFreeOSDrawable = true;
+ 						else
+ 							UseX11Drawable = true;
+ 					}
+@@ -148,12 +154,12 @@
+ 
+ 		static public bool RunningOnWindows ()
+ 		{
+-			return !UseX11Drawable && !UseCarbonDrawable && !UseCocoaDrawable;
++			return !UseX11Drawable && !UseCarbonDrawable && !UseCocoaDrawable && !UseFreeOSDrawable;
+ 		}
+ 
+ 		static public bool RunningOnUnix ()
+ 		{
+-			return UseX11Drawable || UseCarbonDrawable || UseCocoaDrawable;
++			return UseX11Drawable || UseCarbonDrawable || UseCocoaDrawable || UseFreeOSDrawable;
+ 		}
+ 
+ 		// Copies a Ptr to an array of Points and releases the memory
+--- a/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUI.cs
++++ b/mcs/class/System.Windows.Forms/System.Windows.Forms/XplatUI.cs
+@@ -115,6 +115,9 @@
+ 							string os = Marshal.PtrToStringAnsi (buf);
+ 							if (os == "Darwin")
+ 								driver=XplatUICarbon.GetInstance ();
++							else if (os == "FreeOS")
++								// Окна FreeOS: третий драйвер рядом с X11 и Win32.
++								driver=XplatUIFreeOS.GetInstance ();
+ 							else
+ 								driver=XplatUIX11.GetInstance ();
+ 						}

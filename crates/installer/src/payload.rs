@@ -420,10 +420,12 @@ const LUA: [(&CStr16, &str); 1] =
 /// Образец сборки C# для Mono (фаза 60).
 ///
 /// Список обязан совпадать с `PAYLOAD_MONO` в `xtask/src/arch.rs`.
-const MONO: [(&CStr16, &str); 2] = [
+const MONO: [(&CStr16, &str); 3] = [
     (cstr16!("\\FREEOS\\MONO\\HELLO.EXE"), "usr/share/mono/hello.exe"),
     // Фаза 61b: System.Drawing — рисует и сверяет точки картинки.
     (cstr16!("\\FREEOS\\MONO\\DRAWING.EXE"), "usr/share/mono/drawing.exe"),
+    // Фаза 62: WinForms — форма с кнопкой, полем и флажком.
+    (cstr16!("\\FREEOS\\MONO\\FORMS.EXE"), "usr/share/mono/forms.exe"),
 ];
 
 /// Библиотеки классов Mono (фаза 60) — туда, где их ищет рантайм: mscorlib в
@@ -431,7 +433,7 @@ const MONO: [(&CStr16, &str); 2] = [
 ///
 /// Список обязан совпадать с `MONO_BCL` в `xtask/src/cbuild.rs`. На носителе их
 /// может не быть — там, где Mono не собиралась, нет и её самой.
-const MONO_LIB: [(&CStr16, &str); 8] = [
+const MONO_LIB: [(&CStr16, &str); 13] = [
     (cstr16!("\\FREEOS\\MONOLIB\\MSCORLIB.DLL"), "usr/lib/mono/4.5/mscorlib.dll"),
     (
         cstr16!("\\FREEOS\\MONOLIB\\SYSTEM.DLL"),
@@ -460,6 +462,27 @@ const MONO_LIB: [(&CStr16, &str); 8] = [
     (
         cstr16!("\\FREEOS\\MONOLIB\\SYSDRAW.DLL"),
         "usr/lib/mono/gac/System.Drawing/4.0.0.0__b03f5f7f11d50a3a/System.Drawing.dll",
+    ),
+    // Фаза 62: WinForms и её ссылки.
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\SYSWINF.DLL"),
+        "usr/lib/mono/gac/System.Windows.Forms/4.0.0.0__b77a5c561934e089/System.Windows.Forms.dll",
+    ),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\ACCESS.DLL"),
+        "usr/lib/mono/gac/Accessibility/4.0.0.0__b03f5f7f11d50a3a/Accessibility.dll",
+    ),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\MONOPSX.DLL"),
+        "usr/lib/mono/gac/Mono.Posix/4.0.0.0__0738eb9f132ed756/Mono.Posix.dll",
+    ),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\MONOWEB.DLL"),
+        "usr/lib/mono/gac/Mono.WebBrowser/4.0.0.0__0738eb9f132ed756/Mono.WebBrowser.dll",
+    ),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\SYSSOAP.DLL"),
+        "usr/lib/mono/gac/System.Runtime.Serialization.Formatters.Soap/4.0.0.0__b03f5f7f11d50a3a/System.Runtime.Serialization.Formatters.Soap.dll",
     ),
 ];
 
