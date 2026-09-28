@@ -420,15 +420,18 @@ const LUA: [(&CStr16, &str); 1] =
 /// Образец сборки C# для Mono (фаза 60).
 ///
 /// Список обязан совпадать с `PAYLOAD_MONO` в `xtask/src/arch.rs`.
-const MONO: [(&CStr16, &str); 1] =
-    [(cstr16!("\\FREEOS\\MONO\\HELLO.EXE"), "usr/share/mono/hello.exe")];
+const MONO: [(&CStr16, &str); 2] = [
+    (cstr16!("\\FREEOS\\MONO\\HELLO.EXE"), "usr/share/mono/hello.exe"),
+    // Фаза 61b: System.Drawing — рисует и сверяет точки картинки.
+    (cstr16!("\\FREEOS\\MONO\\DRAWING.EXE"), "usr/share/mono/drawing.exe"),
+];
 
 /// Библиотеки классов Mono (фаза 60) — туда, где их ищет рантайм: mscorlib в
 /// `4.5`, остальные сборки в GAC.
 ///
 /// Список обязан совпадать с `MONO_BCL` в `xtask/src/cbuild.rs`. На носителе их
 /// может не быть — там, где Mono не собиралась, нет и её самой.
-const MONO_LIB: [(&CStr16, &str); 3] = [
+const MONO_LIB: [(&CStr16, &str); 8] = [
     (cstr16!("\\FREEOS\\MONOLIB\\MSCORLIB.DLL"), "usr/lib/mono/4.5/mscorlib.dll"),
     (
         cstr16!("\\FREEOS\\MONOLIB\\SYSTEM.DLL"),
@@ -438,13 +441,35 @@ const MONO_LIB: [(&CStr16, &str); 3] = [
         cstr16!("\\FREEOS\\MONOLIB\\SYSCORE.DLL"),
         "usr/lib/mono/gac/System.Core/4.0.0.0__b77a5c561934e089/System.Core.dll",
     ),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\SYSCONF.DLL"),
+        "usr/lib/mono/gac/System.Configuration/4.0.0.0__b03f5f7f11d50a3a/System.Configuration.dll",
+    ),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\SYSXML.DLL"),
+        "usr/lib/mono/gac/System.Xml/4.0.0.0__b77a5c561934e089/System.Xml.dll",
+    ),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\SYSSEC.DLL"),
+        "usr/lib/mono/gac/System.Security/4.0.0.0__b03f5f7f11d50a3a/System.Security.dll",
+    ),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\SYSNUM.DLL"),
+        "usr/lib/mono/gac/System.Numerics/4.0.0.0__b77a5c561934e089/System.Numerics.dll",
+    ),
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\SYSDRAW.DLL"),
+        "usr/lib/mono/gac/System.Drawing/4.0.0.0__b03f5f7f11d50a3a/System.Drawing.dll",
+    ),
 ];
 
 /// Шрифты (фаза 61). Список обязан совпадать с `FONTS` в `xtask/src/cbuild.rs`.
-const FONTS: [(&CStr16, &str); 2] = [
+const FONTS: [(&CStr16, &str); 3] = [
     (cstr16!("\\FREEOS\\FONTS\\DEJAVU.TTF"), "usr/share/fonts/dejavu/DejaVuSans.ttf"),
     // Лицензия шрифта едет рядом с ним: этого она и требует.
     (cstr16!("\\FREEOS\\FONTS\\DEJAVU.TXT"), "usr/share/fonts/dejavu/DejaVu-LICENSE"),
+    // Настройка fontconfig (фаза 61b) — в образе, а не в `/etc`.
+    (cstr16!("\\FREEOS\\FONTS\\FONTS.CNF"), "usr/share/fontconfig/fonts.conf"),
 ];
 
 /// Страница, которую веб-сервер отдаёт по умолчанию, и её оформление.

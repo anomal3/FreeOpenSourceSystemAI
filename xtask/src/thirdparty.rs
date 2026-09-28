@@ -28,6 +28,13 @@
 //! списком файлов, — но это ровно та подгонка, против которой написана вся
 //! проверка: чужой проект собирается **своей** сборочной системой или не
 //! собирается вовсе.
+//!
+//! И `gperf` (фаза 61b, `winget install --id oss-winget.gperf`): им fontconfig
+//! порождает при сборке таблицу имён своих свойств. Без него `configure`
+//! проходит (его проверка `gperf` пустой ответ принимает), а падает `make` —
+//! на `fcobjshash.h`. Вход `gperf` пишет препроцессор цели в конвейере, и его
+//! ошибка теряется: `gperf` жалуется на пустой файл, а пустой файл остаётся и
+//! валит все следующие `make` в том же дереве.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,14 +69,42 @@ enum How {
     /// Обычный GNU `configure`: `--host=<триплет>`, статическая сборка в
     /// sysroot и свои ключи проекта (фаза 61). Так собирается почти всё, что
     /// написано под autotools: инструменты с приставкой триплета, включая
-    /// `pkg-config`, `configure` находит сам. Второй список — переменные
-    /// `make`: обычно `SUBDIRS=<библиотека>`, чтобы не собирать тесты и
-    /// примеры, которым нужно то, чего в системе нет (`fork`).
-    Autotools(&'static [&'static str], &'static [&'static str]),
+    /// `pkg-config`, `configure` находит сам.
+    Autotools(Autotools),
     /// Не сборка, а файлы: взять из архива и положить в набор одни на обе
     /// архитектуры (фаза 61, шрифт). Пары — путь в архиве и имя в
     /// [`cbuild::fonts_dir`].
     Files(&'static [(&'static str, &'static str)]),
+}
+
+/// Свои ключи проекта, собираемого GNU `configure`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Autotools {
+    /// Ключи `configure` сверх общих.
+    configure: &'static [&'static str],
+    /// Переменные `make` — и сборке, и установке. Обычно `SUBDIRS=<библиотека>`,
+    /// чтобы не собирать тесты и примеры, которым нужно то, чего в системе нет
+    /// (`fork`). `{prefix}` заменяется на sysroot архитектуры.
+    make: &'static [&'static str],
+    /// Приставки аргументов, которые sh из Git не должен переписывать как пути
+    /// (`MSYS2_ARG_CONV_EXCL`, через `;`). Пусто — переписывать как обычно.
+    ///
+    /// Путь цели, вшитый в библиотеку ключом `-DИМЯ="/etc/…"`, sh из Git Bash,
+    /// запуская компилятор (программу Windows), молча превращает в
+    /// «C:/Program Files/Git/etc/…» — путь своей установки. Собирается всё, а
+    /// в системе библиотека ищет свои файлы там, где их нет (так было у Mono,
+    /// фаза 60; fontconfig вшивает пути тем же способом).
+    keep_paths: &'static str,
+    /// Файлы установки, которые едут в образ, — одни на обе архитектуры: путь
+    /// в sysroot и имя в [`cbuild::fonts_dir`]. Берутся из sysroot последней
+    /// собранной архитектуры; пусто — ничего.
+    shared: &'static [(&'static str, &'static str)],
+}
+
+impl Autotools {
+    const fn plain(configure: &'static [&'static str], make: &'static [&'static str]) -> How {
+        How::Autotools(Autotools { configure, make, keep_paths: "", shared: &[] })
+    }
 }
 
 /// Чужой проект: как его зовут, откуда брать и чем проверить.
@@ -97,7 +132,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 7] = [
+const PROJECTS: [Project; 9] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -139,7 +174,7 @@ const PROJECTS: [Project; 7] = [
         unpacked: "libpng-1.6.43",
         // Утилиты `pngfix` и соседи — программы для машины, которой у нас нет
         // в `/bin`; библиотеке они не нужны.
-        how: How::Autotools(&["--disable-tools"], &[]),
+        how: Autotools::plain(&["--disable-tools"], &[]),
         installs: &["lib/libpng16.a", "include/png.h", "lib/pkgconfig/libpng.pc"],
     },
     Project {
@@ -152,7 +187,7 @@ const PROJECTS: [Project; 7] = [
         // нужны лишь её тестам.
         // Тесты — `fork` и `waitpid`, которых нет; собирается только сама
         // библиотека.
-        how: How::Autotools(&["--disable-gtk", "--disable-libpng", "--disable-openmp"], &["SUBDIRS=pixman"]),
+        how: Autotools::plain(&["--disable-gtk", "--disable-libpng", "--disable-openmp"], &["SUBDIRS=pixman"]),
         installs: &["lib/libpixman-1.a", "include/pixman-1/pixman.h", "lib/pkgconfig/pixman-1.pc"],
     },
     Project {
@@ -163,7 +198,7 @@ const PROJECTS: [Project; 7] = [
         unpacked: "freetype-2.13.2",
         // Сжатые шрифты — через zlib, PNG-глифы — через libpng; HarfBuzz,
         // Brotli и bzip2 не нужны.
-        how: How::Autotools(&[
+        how: Autotools::plain(&[
             "--with-zlib=yes",
             "--with-png=yes",
             "--with-harfbuzz=no",
@@ -182,6 +217,89 @@ const PROJECTS: [Project; 7] = [
         ]),
         installs: &["lib/libfreetype.a", "include/freetype2/ft2build.h", "lib/pkgconfig/freetype2.pc"],
     },
+    // Фаза 61b — выбор шрифта по имени. libgdiplus ищет шрифты только через
+    // fontconfig («Arial» → лучший из того, что есть), а fontconfig читает
+    // свои настройки XML-разборщиком — expat. Хеши — те, что опубликованы
+    // рядом с архивами в Homebrew (сверено 2026-09-28).
+    Project {
+        name: "expat",
+        version: "2.8.5",
+        url: "https://github.com/libexpat/libexpat/releases/download/R_2_8_5/expat-2.8.5.tar.xz",
+        sha256: "1e727b8933ec51a77a9a9d9afcf8e688bce45d907c13e36ab7393fe36e703182",
+        unpacked: "expat-2.8.5",
+        // Только библиотека. Соль хеш-таблиц — `arc4random_buf` из libc, его
+        // `configure` находит сам.
+        how: Autotools::plain(&["--without-xmlwf", "--without-examples", "--without-tests", "--without-docbook"], &[]),
+        installs: &["lib/libexpat.a", "include/expat.h", "lib/pkgconfig/expat.pc"],
+    },
+    Project {
+        name: "fontconfig",
+        version: "2.15.0",
+        url: "https://www.freedesktop.org/software/fontconfig/release/fontconfig-2.15.0.tar.xz",
+        sha256: "63a0658d0e06e0fa886106452b58ef04f21f58202ea02a94c39de0d3335d7c0e",
+        unpacked: "fontconfig-2.15.0",
+        how: How::Autotools(Autotools {
+            // Пути **цели**: fontconfig вшивает их в библиотеку и в свой
+            // `fonts.conf` — там, в системе, она и ищет настройки, шрифты и
+            // кеш. `prefix` при этом — sysroot, куда ставятся библиотека и
+            // заголовки.
+            //
+            // Основной `fonts.conf` — не в `/etc/fonts`, как у Linux, а в
+            // `/usr/share/fontconfig`, внутри образа системы: `/etc` у
+            // установленной системы лежит на разделе состояния и обновлением
+            // не заменяется (фаза 48), и настройка, приехавшая с одной версией
+            // fontconfig, осталась бы там при следующей. Файл этот и сам
+            // говорит «не править, заменяется при обновлении». А место для
+            // своих дополнений человека — `/etc/fonts/conf.d`: его основной
+            // файл включает.
+            //
+            // Документация, переводы и iconv не нужны; XML — через expat, не
+            // libxml2. Кеш шрифтов при сборке не строится: его строит
+            // `fc-cache` цели, а не машины сборки.
+            //
+            // Хеш-таблицу имён своих свойств (`fcobjshash.h`) fontconfig
+            // порождает при сборке утилитой машины сборки `gperf`: готовой в
+            // архиве нет (см. шапку файла).
+            configure: &[
+                "--sysconfdir=/etc",
+                "--localstatedir=/var",
+                "--with-baseconfigdir=/usr/share/fontconfig",
+                "--with-configdir=/etc/fonts/conf.d",
+                "--with-default-fonts=/usr/share/fonts",
+                "--with-cache-dir=/var/cache/fontconfig",
+                "--with-templatedir=/usr/share/fontconfig/conf.avail",
+                "--with-xmldir=/usr/share/xml/fontconfig",
+                "--disable-docs",
+                "--disable-nls",
+                "--disable-iconv",
+                "--disable-libxml2",
+                "--disable-cache-build",
+                // Случайные числа (имена временных файлов кеша): найдя
+                // `random`, fontconfig берёт и `initstate`/`setstate`, а у
+                // picolibc их нет — и видно это только на компоновке
+                // программы. `lrand48` есть, следующим она берёт его.
+                "ac_cv_func_random=no",
+            ],
+            // Библиотека без утилит `fc-*`. Каталоги **установки** её
+            // настроек — в sysroot: `make install` иначе полез бы в
+            // `/usr/share` и `/var` машины сборки. Вшитые пути это не трогает —
+            // они у неё в других, заглавных переменных.
+            make: &[
+                "SUBDIRS=fontconfig fc-case fc-lang src",
+                "baseconfigdir={prefix}/share/fontconfig",
+                "fc_cachedir={prefix}/var/cache/fontconfig",
+                "xmldir={prefix}/share/xml/fontconfig",
+            ],
+            keep_paths: "-DFC_;-DFONTCONFIG_;-DCONFIGDIR",
+            shared: &[("share/fontconfig/fonts.conf", "fonts.conf")],
+        }),
+        installs: &[
+            "lib/libfontconfig.a",
+            "include/fontconfig/fontconfig.h",
+            "lib/pkgconfig/fontconfig.pc",
+            "share/fontconfig/fonts.conf",
+        ],
+    },
     Project {
         name: "cairo",
         version: "1.16.0",
@@ -189,11 +307,12 @@ const PROJECTS: [Project; 7] = [
         sha256: "5e7b29b3f113ef870d1e3ecf8adf21f923396401604bda16d44be45e66052331",
         unpacked: "cairo-1.16.0",
         // Последняя версия с autotools. Поверхности — картинка в памяти, PNG,
-        // PDF/SVG/PS (им хватает zlib); шрифты — freetype без fontconfig
-        // (fontconfig придёт в 61b). Оконных систем чужих ОС нет.
-        how: How::Autotools(&[
+        // PDF/SVG/PS (им хватает zlib); шрифты — freetype, выбор шрифта по
+        // имени — fontconfig (61b: libgdiplus создаёт шрифт cairo из шаблона
+        // fontconfig). Оконных систем чужих ОС нет.
+        how: Autotools::plain(&[
             "--enable-ft=yes",
-            "--enable-fc=no",
+            "--enable-fc=yes",
             "--enable-png=yes",
             "--enable-xlib=no",
             "--enable-xcb=no",
@@ -229,9 +348,18 @@ const PROJECTS: [Project; 7] = [
     },
 ];
 
-/// Собрать все чужие проекты под все указанные архитектуры.
-pub fn build_all(arches: &[Arch], refresh: bool) -> Result<()> {
-    for project in &PROJECTS {
+/// Собрать чужие проекты под все указанные архитектуры: все или только
+/// названные в `only`.
+///
+/// `only` — для пересборки одного проекта после правки набора или его ключей:
+/// всё целиком — это полчаса, из них двадцать минут — cairo. Зависимости он
+/// не пересобирает: названный проект строится поверх того, что уже в sysroot.
+pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> {
+    if let Some(unknown) = only.iter().find(|name| !PROJECTS.iter().any(|project| project.name == name.as_str())) {
+        let known: Vec<&str> = PROJECTS.iter().map(|project| project.name).collect();
+        bail!("нет чужого проекта «{unknown}»; есть: {}", known.join(", "));
+    }
+    for project in PROJECTS.iter().filter(|project| only.is_empty() || only.iter().any(|name| name == project.name)) {
         let source = fetch(project, refresh)?;
         if let How::Files(files) = project.how {
             let dir = cbuild::fonts_dir();
@@ -246,6 +374,15 @@ pub fn build_all(arches: &[Arch], refresh: bool) -> Result<()> {
         for &arch in arches {
             say!("=== {} {} для {} ===", project.name, project.version, arch.name());
             build(project, &source, arch)?;
+        }
+        if let (How::Autotools(own), Some(&last)) = (project.how, arches.last()) {
+            let dir = cbuild::fonts_dir();
+            for (from, to) in own.shared {
+                fs::create_dir_all(&dir)?;
+                fs::copy(cbuild::sysroot(last).join(from), dir.join(to))
+                    .with_context(|| format!("не удалось положить {from} из {}", project.name))?;
+                say!("{} {}: {from} -> {}", project.name, project.version, dir.join(to).display());
+            }
         }
     }
     Ok(())
@@ -352,8 +489,9 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
             run_make(&work, &["libz.a"], &format!("make {}", arch.name()))?;
             run_make(&work, &["install"], &format!("make install {}", arch.name()))?;
         }
-        How::Autotools(extra, make_vars) => {
+        How::Autotools(own) => {
             replace_config_sub(&work)?;
+            let keep = (!own.keep_paths.is_empty()).then_some(own.keep_paths);
             // `--disable-shared`: разделяемых библиотек в системе нет (см. zlib
             // выше). Инструменты `configure` находит по приставке триплета —
             // и `pkg-config` тоже: у набора он свой и смотрит только в sysroot.
@@ -367,7 +505,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
                     // всякого проекта, а `g++` с приставкой в наборе нет.
                     "./configure --host={triple} --prefix={prefix} --disable-shared --enable-static \
                      LD={triple}-ld CXX={triple}-cc CXXCPP=\"{triple}-cc -E\" {}",
-                    extra.join(" ")
+                    own.configure.join(" ")
                 ),
                 &format!("configure {} {}", project.name, arch.name()),
             )?;
@@ -375,12 +513,13 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
             // в рецепты libtool без кавычек, и «C:/Program Files/…» ломает
             // первую же команду (так было и с Mono, фаза 58b).
             let shell = format!("SHELL={}", make_shell()?);
+            let vars: Vec<String> = own.make.iter().map(|var| var.replace("{prefix}", &prefix)).collect();
             let mut build: Vec<&str> = vec!["-j6", &shell];
-            build.extend(make_vars.iter());
+            build.extend(vars.iter().map(String::as_str));
             let mut install: Vec<&str> = vec!["install", &shell];
-            install.extend(make_vars.iter());
-            run_make(&work, &build, &format!("make {} {}", project.name, arch.name()))?;
-            run_make(&work, &install, &format!("make install {} {}", project.name, arch.name()))?;
+            install.extend(vars.iter().map(String::as_str));
+            run_make_keeping(&work, &build, keep, &format!("make {} {}", project.name, arch.name()))?;
+            run_make_keeping(&work, &install, keep, &format!("make install {} {}", project.name, arch.name()))?;
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
@@ -453,10 +592,19 @@ fn run_shell(dir: &Path, script: &str, what: &str) -> Result<()> {
 }
 
 fn run_make(dir: &Path, args: &[&str], what: &str) -> Result<()> {
+    run_make_keeping(dir, args, None, what)
+}
+
+/// `make`, у которого sh из Git не переписывает аргументы с приставками из
+/// `keep` (см. [`Autotools::keep_paths`]).
+fn run_make_keeping(dir: &Path, args: &[&str], keep: Option<&str>, what: &str) -> Result<()> {
     let make = find_make()?;
     let mut cmd = Command::new(make);
     cmd.current_dir(dir).args(args);
     with_sdk_path(&mut cmd);
+    if let Some(keep) = keep {
+        cmd.env("MSYS2_ARG_CONV_EXCL", keep);
+    }
     run(cmd, what)
 }
 

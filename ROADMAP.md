@@ -6919,7 +6919,127 @@ System, System.Core и ещё десяток сборок вместе с ком
 expat и fontconfig, затем libgdiplus. Из glib ей нужна малость (хеш-таблицы,
 `GString`, UTF-8, мьютексы) — почти всё это есть в eglib самой Mono, и порт
 glib целиком, скорее всего, не понадобится. Проверка — `System.Drawing` из
-C#: картинка, нарисованная `Graphics`, и её точки.
+C#: картинка, нарисованная `Graphics`, и её точки. *Сделано — раздел ниже;
+glib целиком действительно не понадобилась.*
+
+# Фаза 61b — System.Drawing рисует: fontconfig, libgdiplus, сборки Mono — **сделано 2026-09-28**
+
+Вторая половина фазы 61. Программа на C#, собранная на Windows компилятором
+.NET Framework, рисует во FreeOS через `System.Drawing` Mono — `Graphics`
+над libgdiplus, та над cairo, pixman и freetype, а шрифт по имени находит
+fontconfig — и печатает **те же строки**, что тот же файл под .NET Framework,
+где рисует настоящий GDI+.
+
+## Что стало
+
+- **`cargo xtask thirdparty`**: expat 2.8.5 и fontconfig 2.15.0 (хеши сверены
+  с формулами Homebrew), cairo пересобрана с fontconfig. `How::Autotools`
+  получил свои ключи структурой: переменные `make` с подстановкой `{prefix}`,
+  приставки, которые Git Bash не должен переписывать как пути
+  (`MSYS2_ARG_CONV_EXCL`), и файлы установки, едущие в образ. Новый ключ
+  `--only <проект,…>` — пересобрать названное поверх того, что уже в наборе.
+- **Основной `fonts.conf` — в `/usr/share/fontconfig`, внутри образа**, а не в
+  `/etc/fonts`: `/etc` установленной системы лежит на разделе состояния и
+  обновлением не заменяется (фаза 48), и настройка одной версии fontconfig
+  осталась бы при следующей. Место для своих дополнений — `/etc/fonts/conf.d`,
+  основной файл его включает. Кеш — `/var/cache/fontconfig`; установщик
+  заводит его за учётной записью, как `/var/lib/pkg`: fontconfig пишет кеш от
+  имени запустившей программы.
+- **libgdiplus 6.2** (архив с dl.winehq.org — Mono теперь ведёт Wine) —
+  `ports/mono/gdiplus.sh`, шаг порта Mono, а не thirdparty: вместо glib ей
+  отдаётся **eglib самой Mono** (`ports/mono/glib/glib.h`). Имена eglib
+  переименованы (`monoeg_g_*`), поэтому libgdiplus ссылается ровно на те
+  функции, что уже лежат в `mono`, и второй копии нет. Без X11, JPEG, TIFF,
+  GIF и EXIF (их библиотек в наборе нет); BMP, PNG, ICO, EMF и WMF она читает
+  и пишет сама.
+- **Таблица экспортов** (`ports/mono/native.sh`): 608 функций `Gdip*` под
+  именем `gdiplus` — System.Drawing зовёт их `[DllImport("gdiplus")]`, — и две
+  функции libc под именем `c`. Список библиотек для перекомпоновки mono
+  `native.sh` пишет сам (`native-freeos/libs`). mono выросла с 4,0 до 7,1 МиБ
+  (x86-64).
+- **System.Drawing.dll собрана из исходников 6.14.1** (`ports/mono/bcl.sh`)
+  Roslyn из .NET SDK — тем же компилятором, которым Mono 6 собирает свои
+  библиотеки сама, — с ключами её `Makefile` и профиля `net_4_x`, против
+  mscorlib и System из monolite: ложится ровно на наш рантайм. Имя сборки —
+  как у .NET Framework (`b03f5f7f11d50a3a`), подпись отложенная. Этот же путь
+  нужен фазе 62: `System.Windows.Forms.dll` с драйвером окон FreeOS иначе не
+  получить.
+- **`uname`** в libc (`sys/utsname.h`): `FreeOS`, процессор, версия из
+  `/os-release`, а у живой системы — честное `unknown`.
+- **C++ в наборе — язык без библиотеки.** Обёртка компилирует `.cpp`, `.cc`,
+  `.cxx` как C++: без исключений и RTTI, потому что libc++, libc++abi и
+  раскрутки стека в системе нет, и `new` или `<vector>` не найдутся громко.
+  Нужно это чужим `configure`, а не программам на C++.
+- **`PKG_CONFIG_PATH`** у нашего pkg-config — впереди sysroot, как у
+  настоящего.
+
+## Ловушки, по порядку ошибок
+
+1. **`gperf` на машине сборки.** fontconfig порождает им таблицу имён своих
+   свойств, готовой в архиве нет. Без него `configure` проходит, а падает
+   `make`. Вход `gperf` пишет препроцессор цели в конвейере, и его ошибка
+   теряется: остаётся пустой файл, `gperf` жалуется на него, и пустой файл
+   валит все следующие `make` в том же дереве.
+2. **`make install` fontconfig лез в `/etc` машины сборки.** Каталоги
+   установки настроек перенаправлены в sysroot переменными `make`; вшитые
+   пути у неё в других, заглавных, и не меняются.
+3. **picolibc даёт `random`, но не `initstate`/`setstate`**, а fontconfig,
+   найдя первое, берёт и второе. Видно только на компоновке программы —
+   здесь самой mono. `ac_cv_func_random=no` уводит её на `lrand48`.
+4. **У архива libgdiplus с GitHub нет `configure`**, а autotools на машине
+   сборки нет. Выпуск с dl.winehq.org его несёт.
+5. **`AC_PROG_CXX` требует работающий C++**, хотя сама libgdiplus на C (C++ —
+   её тесты на googletest). Обёртка отдавала `conftest.cpp` компоновщику, и
+   ld.lld читал его как свой сценарий. А когда стала компилировать, всплыло
+   второе: общий для набора `-ffreestanding` в C++ отменяет особый статус
+   `main`, и clang искажает её имя (`_Z4mainv`) — `_start` её не находит. В C
+   имена не искажаются, поэтому раньше этого видно не было. Для C++ —
+   `-fhosted`.
+6. **`AC_PATH_PROG(PKG_CONFIG, pkg-config)`** у libgdiplus, а не
+   `PKG_PROG_PKG_CONFIG`: наш `<хост>-pkg-config` она не ищет, а готовое
+   значение `PKG_CONFIG` принимает, только если это абсолютный путь.
+7. **eglib называет себя glib 2.4**, и libgdiplus берёт для неё
+   `GStaticMutex`, которого в eglib нет, — он в прослойке поверх мьютекса
+   POSIX. И настоящая glib подключает `<float.h>` сама, а `matrix.c` на это
+   полагается.
+8. **libtool вложил бы eglib в libgdiplus.a**: `libeglib.la` у Mono —
+   вспомогательная библиотека libtool, и такие он вкладывает в каждую
+   статическую, собранную с ними. У `glib-2.0.pc` поэтому нет `Libs` вовсе —
+   eglib уже в `mono`.
+9. **Статический конструктор System.Drawing зовёт `uname`** через
+   `[DllImport("libc")]` — отличить macOS от прочих Unix. Без ответа — не
+   отказ одной функции, а `TypeInitializationException` на первом же
+   обращении к System.Drawing. Теперь `uname` есть в libc, а в таблице
+   экспортов — библиотека `c` (с ней и `readlink`: так TimeZoneInfo узнаёт
+   свой пояс).
+10. **Первая же кисть упала на System.Configuration.** Класс `Gdip` заводит
+    `TraceSwitch`, а у `System.Diagnostics.Switch` из System.dll есть поле
+    типа из System.Configuration — сборки, которой в образе не было.
+    Конфигурацию переключатель не читает (только в `Debug.WriteLineIf`,
+    которого в сборке без `DEBUG` нет), но тип загрузить нужно. В образ
+    уехало замыкание ссылок: System.Configuration, System.Xml,
+    System.Security, System.Numerics — все из monolite.
+
+## Проверено
+
+- `mono-drawing` (установленная система, обе архитектуры): `drawing.exe` из
+  `ports/mono/samples` — прямоугольник своего цвета по своим границам, круг со
+  сглаживанием (центр сплошной, край полутоном), текст шрифтом «без засечек» —
+  fontconfig выбрал DejaVu Sans, — PNG через `MemoryStream` туда и обратно
+  точка в точку; строки stdout совпадают с выводом того же файла под .NET
+  Framework (`drawing.expected`).
+- Регрессия: `install`, `mono-drawing`, `mono-installed`, `cdraw`, `lua`,
+  `installed`, `mono`, `libc`, `sdk`, `abi`, `boot`, `userspace`, `desktop` —
+  обе архитектуры. `userspace` на x86-64 один раз покраснел: его строку
+  `hello: epoch` разрезала посередине строка init о закончившемся в тот же
+  миг `sshd`; повторный прогон — зелёный. Программа `hello` фазой не
+  затронута, а сама перемешанная печать двух процессов в одну линию — старая
+  и известная.
+
+## Дальше — 62
+
+WinForms Mono на окнах FreeOS: третий драйвер `XplatUI` рядом с X11 и Win32,
+собранный в `System.Windows.Forms.dll` тем же путём, что System.Drawing.
 
 # Веха v0.9 — Mono рядом со своей средой
 
@@ -7060,7 +7180,7 @@ C#: картинка, нарисованная `Graphics`, и её точки.
 Проверка — вывод `mono hello.exe` у нас совпадает с выводом той же сборки под
 настоящей Mono (чужой верификатор, как у вехи v0.7c).
 
-**61 — рисование для `System.Drawing`** — *61a сделана 28.09 (cairo, pixman, libpng, freetype, шрифт; см. раздел выше), 61b — fontconfig и libgdiplus*. pixman, libpng, freetype, cairo, над
+**61 — рисование для `System.Drawing`** — *сделана 28.09 двумя частями: 61a (cairo, pixman, libpng, freetype, шрифт) и 61b (fontconfig, libgdiplus, System.Drawing из C#); см. разделы выше*. pixman, libpng, freetype, cairo, над
 ними libgdiplus — той же дорогой, что zlib.
 
 **62 — WinForms Mono на окнах FreeOS.** Третий драйвер `XplatUI` рядом с X11

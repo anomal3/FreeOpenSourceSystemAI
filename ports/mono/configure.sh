@@ -1,12 +1,16 @@
 #!/bin/sh
-# Сборка Mono 6.14.1 нашим набором (фазы 58b–60). Порт — четыре шага, все из
+# Сборка Mono 6.14.1 нашим набором (фазы 58b–61b). Порт — пять шагов, все из
 # корня репозитория, для каждой архитектуры:
 #   1. sh ports/mono/configure.sh <арх>   — этот файл;
 #   2. make (строка ниже);
-#   3. sh ports/mono/native.sh <арх>      — System.Native и таблица экспортов;
-#   4. перекомпоновка mono-sgen с ними:
+#   3. sh ports/mono/gdiplus.sh <арх>     — libgdiplus для System.Drawing
+#      (фаза 61b; нужен `cargo xtask thirdparty`). Шаг можно пропустить:
+#      mono соберётся без System.Drawing;
+#   4. sh ports/mono/native.sh <арх>      — System.Native и таблица экспортов;
+#   5. перекомпоновка mono-sgen с ними — список пишет шаг 4:
+#      rm -f build/toolchain/thirdparty/mono-<арх>/mono/mini/mono-sgen
 #      make -C build/toolchain/thirdparty/mono-<арх>/mono/mini mono-sgen \
-#        LIBS="<native-freeos>/freeos-exports.o <native-freeos>/libmono-native.a"
+#        LIBS="$(cat build/toolchain/thirdparty/mono-<арх>/native-freeos/libs)"
 #      и strip в build/toolchain/sysroot/<арх>/bin/mono.
 # Плюс один раз на обе: sh ports/mono/bcl.sh — библиотеки классов. В
 # `cargo xtask thirdparty` рецепт ещё не переехал.

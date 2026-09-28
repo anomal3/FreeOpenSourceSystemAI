@@ -287,6 +287,9 @@ struct ThirdpartyArgs {
     /// Принести исходники заново, даже если они уже лежат.
     #[arg(long)]
     refresh: bool,
+    /// Собрать только эти проекты (через запятую), поверх того, что в наборе.
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -704,7 +707,7 @@ fn real_main() -> Result<()> {
                 Some(arch) => vec![arch],
                 None => Arch::ALL.to_vec(),
             };
-            thirdparty::build_all(&arches, args.refresh)?;
+            thirdparty::build_all(&arches, args.refresh, &args.only)?;
         }
 
         Command::Cbuild(args) => {

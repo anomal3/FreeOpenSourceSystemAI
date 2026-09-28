@@ -1,0 +1,10 @@
+drawing: bitmap 64x48 Format32bppArgb
+drawing: rectangle ffc80000
+drawing: ok a filled rectangle keeps to its edges
+drawing: circle centre ff0000ff
+drawing: ok an antialiased circle has a soft edge
+drawing: ok text measures wider than tall
+drawing: ok text leaves dark marks in its own band only
+drawing: png 64x48, 3072 pixels match
+drawing: ok a PNG reads back pixel for pixel
+drawing: done, 0 check(s) failed

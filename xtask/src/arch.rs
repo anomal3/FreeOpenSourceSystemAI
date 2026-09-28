@@ -303,7 +303,7 @@ pub const PAYLOAD_MONO_DIR: &str = "FREEOS/MONO";
 /// Что из `initrd/usr/share/mono/` едет на носитель и под каким именем 8.3.
 ///
 /// Список обязан совпадать с `MONO` в `crates/installer/src/payload.rs`.
-pub const PAYLOAD_MONO: [(&str, &str); 1] = [("hello.exe", "HELLO.EXE")];
+pub const PAYLOAD_MONO: [(&str, &str); 2] = [("hello.exe", "HELLO.EXE"), ("drawing.exe", "DRAWING.EXE")];
 
 /// Каталог библиотек классов Mono на установочном носителе (фаза 60).
 ///

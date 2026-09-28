@@ -23,7 +23,12 @@
 # собираются — сборка, позвавшая их функцию, получит
 # `EntryPointNotFoundException` в этом месте, а не отказ при запуске.
 #
-# Использование (из корня репозитория, после configure и make этой архитектуры):
+# Фаза 61b: в ту же таблицу — libgdiplus (если `ports/mono/gdiplus.sh` её
+# собрал) и две функции libc, которые сборки зовут через `DllImport("libc")`;
+# список библиотек для перекомпоновки mono — в native-freeos/libs.
+#
+# Использование (из корня репозитория, после configure и make этой архитектуры
+# и, для System.Drawing, после ports/mono/gdiplus.sh):
 #   sh ports/mono/native.sh x86_64|aarch64
 set -e
 ARCH=${1:-x86_64}
@@ -58,19 +63,55 @@ for f in $SOURCES; do
 done
 $ARCH-freeos-ar rcs "$OUT/libmono-native.a" "$OUT"/*.o
 
+# Фаза 61b: libgdiplus (`ports/mono/gdiplus.sh`), если собрана, — её функции
+# `Gdip*` идут в ту же таблицу под именем `gdiplus` (так их зовёт
+# System.Drawing: `[DllImport("gdiplus")]`), а сама она и всё, на чём она
+# стоит, — в перекомпоновку mono.
+GDIPLUS=$B/gdiplus-freeos/lib/libgdiplus.a
+SYSROOT=$T/sysroot/$ARCH/lib
+
 # Таблица: всё, что объектники определяют под именем SystemNative_*.
+llvm-nm --defined-only -g "$OUT"/*.o | awk '$2 == "T" && $3 ~ /^SystemNative_/ { print $3 }' | sort -u > "$OUT/exports.txt"
+: > "$OUT/gdiplus.txt"
+if [ -f "$GDIPLUS" ]; then
+  llvm-nm --defined-only -g "$GDIPLUS" | awk '$2 == "T" && $3 ~ /^Gdip/ { print $3 }' | sort -u > "$OUT/gdiplus.txt"
+fi
+# Функции libc, которые библиотеки классов зовут напрямую, `[DllImport("libc")]`
+# (фаза 61b): `uname` — System.Drawing и System.dll отличают так macOS от
+# прочих Unix, и без него статический конструктор System.Drawing падает;
+# `readlink` — TimeZoneInfo узнаёт так свой пояс. `dlopen("libc")` ищет
+# библиотеку `c`.
+LIBC_EXPORTS="uname readlink"
 {
   echo "/* Порождено ports/mono/native.sh — не править руками. */"
   echo "#include <dlfcn.h>"
-  llvm-nm --defined-only -g "$OUT"/*.o | awk '$2 == "T" && $3 ~ /^SystemNative_/ { print $3 }' | sort -u > "$OUT/exports.txt"
-  while read -r name; do echo "extern void $name(void);"; done < "$OUT/exports.txt"
+  for name in $(cat "$OUT/exports.txt" "$OUT/gdiplus.txt") $LIBC_EXPORTS; do echo "extern void $name(void);"; done
   echo "const struct freeos_export freeos_exports[] = {"
   while read -r name; do
     echo "    {\"System.Native\", \"$name\", (void *)$name},"
     echo "    {\"mono-native\", \"$name\", (void *)$name},"
   done < "$OUT/exports.txt"
+  while read -r name; do
+    echo "    {\"gdiplus\", \"$name\", (void *)$name},"
+  done < "$OUT/gdiplus.txt"
+  for name in $LIBC_EXPORTS; do
+    echo "    {\"c\", \"$name\", (void *)$name},"
+  done
   echo "    {0, 0, 0},"
   echo "};"
 } > "$OUT/freeos-exports.c"
 $ARCH-freeos-cc -O2 -c "$OUT/freeos-exports.c" -o "$OUT/freeos-exports.o"
-echo "System.Native: $(wc -l < "$OUT/exports.txt") functions -> $OUT"
+
+# Что дописать компоновщику mono-sgen (`LIBS=$(cat …/libs)`, шаг 4 в
+# ports/mono/configure.sh). Пути — с буквой диска: `make` из winget путей
+# вида /e/… не понимает.
+LIBS="$OUT/freeos-exports.o $OUT/libmono-native.a"
+if [ -s "$OUT/gdiplus.txt" ]; then
+  LIBS="$LIBS $GDIPLUS"
+  for lib in cairo pixman-1 fontconfig expat freetype png16 z; do
+    LIBS="$LIBS $SYSROOT/lib$lib.a"
+  done
+fi
+for path in $LIBS; do printf '%s ' "$(cygpath -m "$path")"; done > "$OUT/libs"
+echo "System.Native: $(wc -l < "$OUT/exports.txt") functions, gdiplus: $(wc -l < "$OUT/gdiplus.txt"), libc: $(echo $LIBC_EXPORTS | wc -w) -> $OUT"
+echo "libs: $(cat "$OUT/libs")"

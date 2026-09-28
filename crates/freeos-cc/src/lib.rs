@@ -426,7 +426,7 @@ pub fn parse_arguments(args: &[String]) -> (Mode, Invocation) {
 /// Что это за файл по его имени.
 fn classify_file(name: &str) -> Option<Input> {
     let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".c") || lower.ends_with(".s") {
+    if lower.ends_with(".c") || lower.ends_with(".s") || is_cxx_source(name) {
         return Some(Input::Source(name.to_string()));
     }
     if lower.ends_with(".o") || lower.ends_with(".a") || lower.ends_with(".obj") {
@@ -434,6 +434,30 @@ fn classify_file(name: &str) -> Option<Input> {
     }
     None
 }
+
+/// Исходник на C++ (фаза 61b): язык clang знает по окончанию сам.
+///
+/// Набор даёт **язык**, но не его библиотеку: libc++, libc++abi и раскрутки
+/// стека в системе нет. Поэтому C++ здесь — без исключений и без RTTI
+/// ([`CXX_FLAGS`]), а `new`, `std::string` и `<vector>` не найдутся — громко, на
+/// компиляции или компоновке, а не молча. Нужно это не для программ на C++, а
+/// для чужих `configure`: libgdiplus (`AC_PROG_CXX`) отказывается собираться,
+/// если компилятор C++ не собирает `int main () { return 0; }`, хотя сама
+/// библиотека написана на C, а C++ у неё — только тесты.
+fn is_cxx_source(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".cpp", ".cc", ".cxx", ".c++"].iter().any(|suffix| lower.ends_with(suffix))
+}
+
+/// Флаги исходника на C++: то, что потребовало бы библиотеки C++, выключено
+/// (см. [`is_cxx_source`]).
+///
+/// `-fhosted` отменяет общий `-ffreestanding` ([`compile_flags`]), и не ради
+/// библиотеки: в C++ без среды исполнения `main` — обычная функция, и clang
+/// искажает её имя (`_Z4mainv`). В C имена не искажаются, и там этого не видно;
+/// здесь `_start` не находил `main`, и `configure` libgdiplus решал, что
+/// компилятора C++ нет.
+const CXX_FLAGS: [&str; 3] = ["-fhosted", "-fno-exceptions", "-fno-rtti"];
 
 /// Чем именно интересуется чужой скрипт, если собирать нечего.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -604,6 +628,9 @@ fn compile_and_link(target: Target, args: &[String]) -> Result<i32, String> {
     if mode == Mode::CompileOnly {
         let mut cmd = compile_command(target, &sysroot, &clang);
         cmd.args(&inv.compile);
+        if inv.inputs.iter().any(|input| matches!(input, Input::Source(path) if is_cxx_source(path))) {
+            cmd.args(CXX_FLAGS);
+        }
         for input in &inv.inputs {
             match input {
                 Input::Source(path) | Input::Object(path) => cmd.arg(path),
@@ -630,6 +657,9 @@ fn compile_and_link(target: Target, args: &[String]) -> Result<i32, String> {
                 let object = work.join(format!("in{number}.o"));
                 let mut cmd = compile_command(target, &sysroot, &clang);
                 cmd.args(&inv.compile);
+                if is_cxx_source(path) {
+                    cmd.args(CXX_FLAGS);
+                }
                 cmd.arg("-c").arg(path).arg("-o").arg(&object);
                 let code = status_of(cmd);
                 if code != 0 {
@@ -729,6 +759,24 @@ mod tests {
         assert_eq!(mode, Mode::CompileOnly);
         assert_eq!(inv.output.as_deref(), Some("foo.o"));
         assert_eq!(inv.inputs, vec![Input::Source(String::from("foo.c"))]);
+    }
+
+    /// Исходник на C++ — исходник, а не вход компоновщика: до фазы 61b
+    /// `conftest.cpp` уезжал в ld.lld, и тот читал его как свой сценарий.
+    #[test]
+    fn cxx_sources_are_compiled() {
+        let (_, inv) = parse_arguments(&words("conftest.cpp a.cc b.CXX -o conftest"));
+        assert_eq!(
+            inv.inputs,
+            vec![
+                Input::Source(String::from("conftest.cpp")),
+                Input::Source(String::from("a.cc")),
+                Input::Source(String::from("b.CXX")),
+            ]
+        );
+        assert!(is_cxx_source("x.c++"));
+        assert!(!is_cxx_source("x.c"));
+        assert!(!is_cxx_source("x.s"));
     }
 
     /// Порядок входов сохраняется: объектник, библиотека, снова объектник.

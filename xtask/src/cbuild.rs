@@ -194,7 +194,10 @@ pub const C_PROGRAMS: [CProgram; 8] = [
     CProgram {
         name: "cdraw",
         needs: Some("libcairo.a"),
-        libs: &["libcairo.a", "libpixman-1.a", "libfreetype.a", "libpng16.a", "libz.a"],
+        // fontconfig и expat — с фазы 61b: cairo теперь выбирает шрифт по
+        // имени через fontconfig, и её код ссылается на него, даже если
+        // программа шрифт по имени не ищет.
+        libs: &["libcairo.a", "libpixman-1.a", "libfontconfig.a", "libexpat.a", "libfreetype.a", "libpng16.a", "libz.a"],
         includes: &["cairo", "freetype2", "pixman-1"],
     },
 ];
@@ -222,7 +225,9 @@ pub const FOREIGN_PROGRAMS: [&str; 2] = ["lua", "mono"];
 /// Сборки IL, одни на обе архитектуры, — начальный набор `monolite` из архива
 /// исходников 6.14.1, ровно под наш рантайм (почему не из пакета — в
 /// `ports/mono/bcl.sh`, он их и кладёт в [`mono_bcl_dir`]). Три сборки — то, без
-/// чего не работает консольная программа на C#.
+/// чего не работает консольная программа на C#; с фазы 61b — System.Drawing
+/// (её тот же сценарий собирает из исходников) и четыре сборки, без которых
+/// она не загружается (замыкание ссылок System.Configuration).
 ///
 /// Раскладка — та же, что у установленной Mono на Linux, и она не выбор, а
 /// требование рантайма. `mscorlib` он ищет в `<prefix>/lib/mono/4.5`, prefix —
@@ -234,10 +239,19 @@ pub const FOREIGN_PROGRAMS: [&str; 2] = ["lua", "mono"];
 /// Третье поле — имя 8.3 на установочном носителе (FAT), каталог там —
 /// [`crate::arch::PAYLOAD_MONO_LIB_DIR`]. Список обязан совпадать с `MONO_LIB`
 /// в `crates/installer/src/payload.rs`.
-pub const MONO_BCL: [(&str, &str, &str); 3] = [
+pub const MONO_BCL: [(&str, &str, &str); 8] = [
     ("mscorlib.dll", "usr/lib/mono/4.5", "MSCORLIB.DLL"),
     ("System.dll", "usr/lib/mono/gac/System/4.0.0.0__b77a5c561934e089", "SYSTEM.DLL"),
     ("System.Core.dll", "usr/lib/mono/gac/System.Core/4.0.0.0__b77a5c561934e089", "SYSCORE.DLL"),
+    // Фаза 61b: замыкание ссылок System.Configuration — её типы System.dll
+    // грузит вместе с `System.Diagnostics.Switch` (см. `ports/mono/bcl.sh`).
+    ("System.Configuration.dll", "usr/lib/mono/gac/System.Configuration/4.0.0.0__b03f5f7f11d50a3a", "SYSCONF.DLL"),
+    ("System.Xml.dll", "usr/lib/mono/gac/System.Xml/4.0.0.0__b77a5c561934e089", "SYSXML.DLL"),
+    ("System.Security.dll", "usr/lib/mono/gac/System.Security/4.0.0.0__b03f5f7f11d50a3a", "SYSSEC.DLL"),
+    ("System.Numerics.dll", "usr/lib/mono/gac/System.Numerics/4.0.0.0__b77a5c561934e089", "SYSNUM.DLL"),
+    // Фаза 61b: собрана из исходников 6.14.1 (`ports/mono/bcl.sh`); ключ у неё
+    // другой — тот же, что у System.Drawing из .NET Framework.
+    ("System.Drawing.dll", "usr/lib/mono/gac/System.Drawing/4.0.0.0__b03f5f7f11d50a3a", "SYSDRAW.DLL"),
 ];
 
 /// Куда `ports/mono/bcl.sh` кладёт библиотеки классов на машине сборки.
@@ -254,10 +268,14 @@ pub fn mono_bcl_dir() -> PathBuf {
 /// Bitstream Vera с дополнениями), широкий по охвату и есть почти в любом
 /// Linux. Кладёт его `cargo xtask thirdparty` в [`fonts_dir`]. Список обязан
 /// совпадать с `FONTS` в `crates/installer/src/payload.rs`.
-pub const FONTS: [(&str, &str, &str); 2] = [
+pub const FONTS: [(&str, &str, &str); 3] = [
     ("DejaVuSans.ttf", "usr/share/fonts/dejavu", "DEJAVU.TTF"),
     // Лицензия шрифта едет рядом с ним: этого она и требует.
     ("DejaVu-LICENSE", "usr/share/fonts/dejavu", "DEJAVU.TXT"),
+    // Настройка fontconfig (фаза 61b): где шрифты и кеш, какие имена чем
+    // заменять. В образе, а не в `/etc` — почему, сказано у fontconfig в
+    // `xtask/src/thirdparty.rs`.
+    ("fonts.conf", "usr/share/fontconfig", "FONTS.CNF"),
 ];
 
 /// Куда `cargo xtask thirdparty` кладёт шрифты: одни на обе архитектуры.

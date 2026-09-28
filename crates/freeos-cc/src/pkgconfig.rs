@@ -7,7 +7,8 @@
 //! кросс-набора: autoconf (`PKG_PROG_PKG_CONFIG`) первым ищет именно
 //! `$host-pkg-config`.
 //!
-//! Ищет он **только** в sysroot цели: `lib/pkgconfig` и `share/pkgconfig`.
+//! Ищет он в sysroot цели — `lib/pkgconfig` и `share/pkgconfig` — и в
+//! каталогах `PKG_CONFIG_PATH` перед ними; хостовых каталогов не видит вовсе.
 //! Файлы `.pc` пишет `make install` чужих проектов, собранных с
 //! `--prefix=<sysroot>`, поэтому пути в них уже указывают в набор.
 //!
@@ -231,12 +232,23 @@ pub fn run(target: Target, args: &[String]) -> i32 {
     0
 }
 
-/// Где искать `.pc`: только sysroot цели.
+/// Где искать `.pc`: каталоги `PKG_CONFIG_PATH`, затем sysroot цели.
+///
+/// `PKG_CONFIG_PATH` — как у настоящего pkg-config: впереди умолчаний. Нужен он
+/// библиотеке, которую собирают поверх чужой сборки, а не поверх набора
+/// (фаза 61b): libgdiplus видит glib в лице eglib из сборки Mono своей
+/// архитектуры, и класть этот `glib-2.0.pc` в sysroot значило бы сказать
+/// всякому следующему порту, что настоящая glib в наборе есть. Разделитель —
+/// `;`, как у pkg-config на Windows: в пути с буквой диска двоеточие своё.
 fn search_dirs(target: Target) -> Vec<PathBuf> {
-    match crate::sysroot(target) {
-        Ok(root) => vec![root.join("lib/pkgconfig"), root.join("share/pkgconfig")],
-        Err(_) => Vec::new(),
+    let mut dirs: Vec<PathBuf> = std::env::var("PKG_CONFIG_PATH")
+        .map(|list| list.split(';').filter(|dir| !dir.is_empty()).map(PathBuf::from).collect())
+        .unwrap_or_default();
+    if let Ok(root) = crate::sysroot(target) {
+        dirs.push(root.join("lib/pkgconfig"));
+        dirs.push(root.join("share/pkgconfig"));
     }
+    dirs
 }
 
 fn load(dirs: &[PathBuf], name: &str) -> Option<Package> {

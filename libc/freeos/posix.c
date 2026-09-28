@@ -9,6 +9,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -20,6 +21,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/utsname.h>
 #include <sys/utime.h>
 #include <syslog.h>
 #include <time.h>
@@ -892,6 +894,58 @@ long sysconf(int name) {
     default:
         return __fallback_sysconf(name);
     }
+}
+
+/* `uname` (фаза 61b). Имя системы и процессор известны при сборке; версия —
+ * из `/os-release`, который пишет установщик и образ обновления (`version=…`).
+ * У «живой» системы с носителя этого файла нет, и версия там — `unknown`:
+ * выдумать число значило бы соврать тому, кто по нему что-то решает. Имени
+ * машины у системы пока нет вовсе — отвечаем её же именем, как Linux без
+ * настроенного имени. */
+static void uname_release(char *out, size_t size) {
+    snprintf(out, size, "unknown");
+    int fd = open("/os-release", O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    char text[256];
+    ssize_t got = read(fd, text, sizeof(text) - 1);
+    close(fd);
+    if (got <= 0) {
+        return;
+    }
+    text[got] = '\0';
+    for (char *line = text; line != NULL && *line != '\0';) {
+        char *next = strchr(line, '\n');
+        if (next != NULL) {
+            *next++ = '\0';
+        }
+        if (strncmp(line, "version=", 8) == 0 && line[8] != '\0') {
+            snprintf(out, size, "%s", line + 8);
+            return;
+        }
+        line = next;
+    }
+}
+
+int uname(struct utsname *name) {
+    if (name == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    memset(name, 0, sizeof(*name));
+    snprintf(name->sysname, sizeof(name->sysname), "FreeOS");
+    snprintf(name->nodename, sizeof(name->nodename), "freeos");
+    uname_release(name->release, sizeof(name->release));
+    snprintf(name->version, sizeof(name->version), "%s", name->release);
+#if defined(__x86_64__)
+    snprintf(name->machine, sizeof(name->machine), "x86_64");
+#elif defined(__aarch64__)
+    snprintf(name->machine, sizeof(name->machine), "aarch64");
+#else
+#error "uname: unknown architecture"
+#endif
+    return 0;
 }
 
 /* `madvise` — тот же совет, но с ответом через `errno` (фаза 60). */

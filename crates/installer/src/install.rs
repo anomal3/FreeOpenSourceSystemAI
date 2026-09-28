@@ -606,6 +606,20 @@ fn write_state(
     )?;
     fs.create_dir_path(dev, "opt", 0o755, account::FIRST_UID, account::FIRST_UID)?;
 
+    // Кеш шрифтов fontconfig (фаза 61b) — по той же причине за учётной
+    // записью: сама fontconfig пишет его при первом же поиске шрифта, от имени
+    // запустившей программы, и без каталога, куда можно писать, на каждом
+    // запуске жалуется «No writable cache directories» и сканирует шрифты
+    // заново.
+    fs.create_dir_path(dev, "var/cache", 0o755, 0, 0)?;
+    fs.create_dir_path(
+        dev,
+        "var/cache/fontconfig",
+        0o755,
+        account::FIRST_UID,
+        account::FIRST_UID,
+    )?;
+
     logln!("[install] state: /etc/passwd, /etc/system.cfg, /{home}, /opt");
 
     fs.flush_everywhere(dev)?;
