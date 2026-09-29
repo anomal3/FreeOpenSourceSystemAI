@@ -155,9 +155,9 @@ impl App {
     ///
     /// Терминалу и «Параметрам» — да: их содержимое выкладывается по размеру.
     /// Вопросам о выключении и «О системе» — нет: это карточки с текстом ровно
-    /// под свой размер, и растянутые они только пустеют. Окну программы — нет,
-    /// и это названный предел, а не вкус (см. `Window::rebuild`). Уголок у
-    /// такого окна не рисуется: нарисованный, он обещал бы то, чего нет.
+    /// под свой размер, и растянутые они только пустеют. Окну программы — только
+    /// если она сама сказала, что умеет ([`Window::resizable`], фаза 62b). Уголок
+    /// у такого окна не рисуется: нарисованный, он обещал бы то, чего нет.
     #[must_use]
     pub const fn resizable(self) -> bool {
         matches!(self, App::Terminal | App::Settings)
@@ -249,6 +249,13 @@ pub struct ProgramView {
     /// Цена названа: [`Window::commit`] копирует изменившийся кусок, то есть
     /// ровно столько пикселей, сколько программа объявила изменившимися.
     pixels: Surface,
+    /// Размер окна меняет человек (фаза 62b): программа сказала это вызовом
+    /// [`user_abi::SYS_WINSTYLE`] и тем самым обещала отвечать на
+    /// [`user_abi::WIN_RESIZE`].
+    resizable: bool,
+    /// Размер содержимого, о котором стол последним попросил программу, пока
+    /// она не ответила. См. [`Window::replace_pixels`].
+    asked: Option<(u32, u32)>,
     /// События, которых программа ещё не забрала.
     ///
     /// Очередь конечна ([`MAX_EVENTS`]), и переполнение теряет **новые**
@@ -372,7 +379,12 @@ impl Window {
     #[must_use]
     pub fn program(app: App, rect: Rect, scale: u32, title: &str, pixels: Surface) -> Option<Self> {
         let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
-        let content = Content::Program(ProgramView { pixels, events: VecDeque::new() });
+        let content = Content::Program(ProgramView {
+            pixels,
+            resizable: false,
+            asked: None,
+            events: VecDeque::new(),
+        });
         let mut window = Self::wrap(app, rect, surface, content, scale, own(title)?);
         window.redraw_content();
         window.draw_decorations(false);
@@ -411,30 +423,106 @@ impl Window {
     }
 
     /// Сменить окну программы поверхность: программа попросила другой размер
-    /// (фаза N7d, [`user_abi::SYS_WINRESIZE`]). Место окна на столе остаётся.
+    /// (фаза N7d, [`user_abi::SYS_WINRESIZE`]) — сама или в ответ на
+    /// [`user_abi::WIN_RESIZE`]. Место окна на столе остаётся.
+    ///
+    /// # Чей размер у рамки
+    ///
+    /// Рамка обычно следует за пикселями: окно — это содержимое плюс заголовок.
+    /// Исключение одно — ответ на **устаревшую** просьбу стола (фаза 62b).
+    /// Уголок тянут быстрее, чем форма успевает выложиться заново: пока
+    /// программа отвечала на прошлый размер, стол попросил следующий, и рамка,
+    /// прыгнувшая назад к ответу, дёргалась бы на каждом шаге. Поэтому, пока
+    /// последняя просьба лежит в очереди непрочитанной, рамка остаётся той, что
+    /// выбрал человек, а новые пиксели ложатся в неё как есть. Ответ на
+    /// последнюю прочитанную просьбу окончательный, какой бы размер в нём ни
+    /// был: у формы бывает наименьший размер, и спорить с ней рамке незачем.
     ///
     /// `false` — памяти под окно нового размера не нашлось, и окно осталось
     /// прежним вместе с прежними пикселями.
     pub fn replace_pixels(&mut self, pixels: Surface, focused: bool) -> bool {
-        if !matches!(self.content, Content::Program(_)) {
+        let Content::Program(view) = &self.content else {
             return false;
-        }
-        let w = pixels.width();
-        let h = pixels.height() + Self::title_height(self.scale);
+        };
+        let answer = (pixels.width(), pixels.height());
+        let asked = view.asked;
+        let stale = asked.is_some_and(|size| size != answer)
+            && view.events.iter().any(|event| event.kind == user_abi::WIN_RESIZE);
+        let (w, h) = if stale {
+            (self.rect.w, self.rect.h)
+        } else {
+            (answer.0, answer.1 + Self::title_height(self.scale))
+        };
         let Some(surface) = Surface::new(w, h, theme::window_bg()) else {
             return false;
         };
         if let Content::Program(view) = &mut self.content {
             view.pixels = pixels;
+            if !stale {
+                view.asked = None;
+            }
         }
         self.surface = surface;
         self.rect.w = w;
         self.rect.h = h;
-        self.restore = None;
-        self.commit(None);
+        // Развёрнутое окно помнит, куда вернуться, пока размер ему выбирает
+        // стол. Размер, который программа выбрала сама, не спросясь, — это уже
+        // не развёрнутое окно, и возвращать его некуда.
+        if asked.is_none() {
+            self.restore = None;
+        }
+        self.redraw_content();
         self.draw_decorations(focused);
         self.damage = Rect::new(0, 0, w, h);
         true
+    }
+
+    /// Может ли человек менять окну размер: окну ядра — по его виду
+    /// ([`App::resizable`]), окну программы — если она сказала, что умеет.
+    #[must_use]
+    pub fn resizable(&self) -> bool {
+        match &self.content {
+            Content::Program(view) => view.resizable,
+            _ => self.app.resizable(),
+        }
+    }
+
+    /// Запомнить, что программа умеет менять размер окна (фаза 62b,
+    /// [`user_abi::SYS_WINSTYLE`]). Уголок появляется или исчезает сразу.
+    pub fn set_resizable(&mut self, resizable: bool, focused: bool) {
+        let Content::Program(view) = &mut self.content else {
+            return;
+        };
+        if view.resizable == resizable {
+            return;
+        }
+        view.resizable = resizable;
+        if !resizable {
+            view.asked = None;
+        }
+        // Уголок лежит поверх пикселей программы, и снять его можно только
+        // заново перенеся их: своей заливки под ним нет.
+        self.redraw_content();
+        self.draw_decorations(focused);
+        self.damage = Rect::new(0, 0, self.rect.w, self.rect.h);
+    }
+
+    /// Попросить программу перерисоваться в новом размере содержимого.
+    ///
+    /// Событие, которое она ещё не прочла, заменяется: нужен размер, на котором
+    /// человек остановился, а не каждый промежуточный, — и очередь окна не
+    /// забивается шагами уголка.
+    fn ask_resize(&mut self, w: u32, h: u32) {
+        let Content::Program(view) = &mut self.content else {
+            return;
+        };
+        view.asked = Some((w, h));
+        let event = WinEvent { kind: user_abi::WIN_RESIZE, code: 0, x: w as i32, y: h as i32 };
+        if let Some(queued) = view.events.iter_mut().find(|e| e.kind == user_abi::WIN_RESIZE) {
+            *queued = event;
+            return;
+        }
+        self.push_event(event);
     }
 
     /// Пересобрать окно под новую высоту заголовка.
@@ -546,10 +634,34 @@ impl Window {
         // Уголок проверяется после заголовка: у окна ростом с полосу заголовка
         // они пересекаются, и таскать такое окно важнее, чем тянуть его за
         // размер.
-        if self.app.resizable() && self.resize_grip().contains(local.0, local.1) {
+        if self.resizable() && self.resize_grip().contains(local.0, local.1) {
             return Some(Hit::Resize);
         }
         Some(Hit::Body)
+    }
+
+    /// Уголок размера: три точки в правом нижнем углу — у окна, которому размер
+    /// менять можно.
+    fn draw_grip(&mut self) {
+        if !self.resizable() {
+            return;
+        }
+        let ctx = self.ctx();
+        let p = ctx.palette;
+        let grip = self.resize_grip();
+        let dot = ctx.px(2).max(1);
+        let step = ctx.px(5) as i32;
+        let inset = ctx.px(6) as i32;
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1)] {
+            draw::circle(
+                &mut self.surface,
+                grip.right() - inset - dx * step,
+                grip.bottom() - inset - dy * step,
+                dot,
+                p.ink6,
+                255,
+            );
+        }
     }
 
     /// Нарисовать заголовок, кнопки и обводку окна.
@@ -670,21 +782,7 @@ impl Window {
         // верхней полосы с нижним углом накрывает окно целиком. На 1920×1080
         // это превращало переключение окон в перерисовку всего экрана: клавиша
         // Tab обрабатывалась дольше пяти секунд.
-        let grip = self.resize_grip();
-        let dot = ctx.px(2).max(1);
-        let grip_dots: &[(u32, u32)] =
-            if self.app.resizable() { &[(0, 0), (1, 0), (0, 1)] } else { &[] };
-        for &(dx, dy) in grip_dots {
-            let step = ctx.px(5) as i32;
-            draw::circle(
-                &mut self.surface,
-                grip.right() - ctx.px(6) as i32 - dx as i32 * step,
-                grip.bottom() - ctx.px(6) as i32 - dy as i32 * step,
-                dot,
-                p.ink6,
-                255,
-            );
-        }
+        self.draw_grip();
 
         // Изменилась только полоса сверху — её и помечаем. Пометить всё окно
         // было бы проще на одну строку и дороже на площадь окна при каждом
@@ -1035,13 +1133,15 @@ impl Window {
             // Список файлов и «Параметры» рисуют себя от размера области, и
             // переносить в них нечего: содержимое соберётся заново.
             Content::Settings(_) | Content::Dialog(_) => {}
-            // Окно программы размера не меняет, и это названный предел. Его
-            // пиксели лежат в кадрах, отображённых программе; новый размер
-            // означал бы другие кадры по другому адресу — то есть поверхность,
-            // из-под которой у работающей программы выдернули память. Сказать
-            // ей об этом нечем: события «размер изменился» в договоре нет, и
-            // завести его половиной, без способа дождаться ответа, значило бы
-            // менять память под чужой рукой.
+            // Окно программы меняет размер, только если она сама сказала, что
+            // умеет (фаза 62b). Пиксели при этом не трогаются: они лежат в
+            // кадрах, отображённых программе, и новый размер означал бы
+            // поверхность, из-под которой у работающей программы выдернули
+            // память. Меняется рамка, а программе уходит просьба
+            // ([`user_abi::WIN_RESIZE`]); прежние пиксели до ответа лежат в
+            // новой рамке как есть. Отвечает она [`user_abi::SYS_WINRESIZE`] —
+            // сама, стоя внутри вызова, то есть память меняется у неё на глазах.
+            Content::Program(view) if view.resizable => {}
             Content::Program(_) => return false,
         }
 
@@ -1051,6 +1151,9 @@ impl Window {
         self.redraw_content();
         self.draw_decorations(false);
         self.damage = Rect::new(0, 0, w, h);
+        if self.is_program() {
+            self.ask_resize(w, h.saturating_sub(Self::title_height(self.scale)));
+        }
         true
     }
 
@@ -1127,8 +1230,15 @@ impl Window {
             return;
         }
         let at = (content.x + src.x, content.y + src.y);
+        let resizable = view.resizable;
         self.surface.blit_from(&view.pixels, at, src);
-        self.damage = self.damage.union(&Rect::new(at.0, at.1, src.w, src.h));
+        let copied = Rect::new(at.0, at.1, src.w, src.h);
+        // Уголок размера лежит поверх содержимого, и копия пикселей его
+        // стирает. Рисуется заново только тогда, когда копия его задела.
+        if resizable && !copied.intersect(&self.resize_grip()).is_empty() {
+            self.draw_grip();
+        }
+        self.damage = self.damage.union(&copied);
     }
 
     /// Положить событие в очередь окна. `false` — очередь полна.

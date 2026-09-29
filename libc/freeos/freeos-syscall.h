@@ -66,6 +66,7 @@
 #define SYS_FUTEX_WAKE 67
 #define SYS_MPROTECT 72
 #define SYS_THREAD_INFO 73
+#define SYS_WINSTYLE 74
 
 /* ── Значения, которые эти вызовы принимают и возвращают ──────────────────── */
 

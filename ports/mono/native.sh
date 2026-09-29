@@ -85,7 +85,7 @@ fi
 LIBC_EXPORTS="uname readlink"
 # Окна рабочего стола (фаза 62, `<freeos/window.h>` из libfreeos): их зовёт
 # драйвер WinForms `XplatUIFreeOS` — `[DllImport("freeos")]`.
-FREEOS_EXPORTS="freeos_window_open freeos_window_commit freeos_window_event freeos_window_resize freeos_window_close freeos_screen"
+FREEOS_EXPORTS="freeos_window_open freeos_window_commit freeos_window_event freeos_window_resize freeos_window_style freeos_window_close freeos_screen"
 {
   echo "/* Порождено ports/mono/native.sh — не править руками. */"
   echo "#include <dlfcn.h>"

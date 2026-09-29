@@ -674,7 +674,13 @@ impl Scenario {
 /// Общий предел на обе архитектуры, и он велик не зря: edk2 для `virt`
 /// добирается до приложения заметно дольше OVMF, а в release-сборке к этому
 /// добавляется время на разметку носителя.
-const BOOT: u64 = 120_000;
+///
+/// Сто двадцать секунд было до 29.09: с тех пор, как initrd повёз Mono (фазы
+/// 60b–62), отладочная загрузка установленной системы на aarch64 до строки
+/// корня занимает 76–107 с в одиночку, и два сценария из регрессии 62b за срок
+/// не уложились. Это рост времени загрузки, а не зависание, — он записан в
+/// TODO про тормоза QEMU (`ROADMAP.md`), и мерить его надо там.
+const BOOT: u64 = 180_000;
 
 /// Экран, в котором идёт сценарий, если не тот, что даёт прошивка.
 ///
@@ -6956,16 +6962,20 @@ pub const ALL: &[Scenario] = &[
             // слота не монтируется — значит подтверждать нечего.
             Step::Line("reboot"),
             Step::Await("[slot] booting slot B", BOOT),
-            Step::Await("root        : cannot mount ext2", 60_000),
+            // От загрузчика до корня — вся загрузка ядра, и срок у неё общий
+            // (`BOOT`). Шестидесяти секунд хватало, пока initrd не повёз Mono
+            // (фаза 60b): в отладочной сборке загрузка выросла до 56–57 с, и
+            // третья попытка 29.09 за срок не уложилась.
+            Step::Await("root        : cannot mount ext2", BOOT),
             Step::Await("freeos> ", 60_000),
             // Дальше шнур выдёргивается дважды: система не подтвердилась, и
             // каждая загрузка тратит попытку.
             Step::Reset,
             Step::Await("[slot] booting slot B", BOOT),
-            Step::Await("root        : cannot mount ext2", 60_000),
+            Step::Await("root        : cannot mount ext2", BOOT),
             Step::Reset,
             Step::Await("[slot] booting slot B", BOOT),
-            Step::Await("root        : cannot mount ext2", 60_000),
+            Step::Await("root        : cannot mount ext2", BOOT),
             Step::Reset,
 
             // И вот теперь — то, ради чего фаза. Попытки кончились, загрузчик
@@ -7062,7 +7072,10 @@ pub const ALL: &[Scenario] = &[
             // Загрузка со второго слота: другое ядро, другой initrd, другой
             // корень — и всё это заказано одним файлом.
             Step::Await("[slot] booting slot B", BOOT),
-            Step::Await("root        : slot B on", 60_000),
+            // От загрузчика до корня — вся загрузка ядра, срок общий (`BOOT`),
+            // как у `rollback`: 29.09 отладочное ядро на aarch64 на 60-й
+            // секунде ещё печатало оглавление initrd.
+            Step::Await("root        : slot B on", BOOT),
             Step::Await("root        : ext2 at LBA", 60_000),
             // Подтверждение — то, из-за отсутствия которого система откатилась
             // бы обратно.
@@ -8506,7 +8519,10 @@ pub const ALL: &[Scenario] = &[
             // Длинная строка, набранная, пока стартуют службы, теряла символы
             // (aarch64, 28.09): эхо ввода перемешивалось с их выводом. `drvd` —
             // служба на один проход, и её конец — это «службы встали».
-            Step::Await("init: 'drvd' finished", 60_000),
+            // `AwaitAny`, а не `Await`: в release служба кончается раньше, чем
+            // оболочка печатает приглашение, и поиск вперёд от приглашения её
+            // не находил (полный прогон 28.09, `mono-forms` x86_64 release).
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("ls /usr/lib/mono/gac/System.Drawing/4.0.0.0__b03f5f7f11d50a3a"),
             Step::Await("System.Drawing.dll", 15_000),
             // Строки stdout — те, что тот же drawing.exe печатает под .NET
@@ -8564,7 +8580,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await("freeos> ", 90_000),
             // Набор — когда службы встали: см. `mono-drawing`.
-            Step::Await("init: 'drvd' finished", 60_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
             // `forms.exe` собран csc из .NET Framework (`ports/mono/samples/
             // forms.cs`); точки прицела — раскладка формы из того же файла, в
             // координатах содержимого окна.
@@ -8595,6 +8611,120 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("forms: closed", 60_000),
             Step::Await("forms: done", 30_000),
+            Step::Await("/bin/mono: exited with code 0", 30_000),
+            Step::Absent("Exception"),
+            Step::Absent("mwf-freeos: the desktop refused"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "mono-popups",
+        about: "WinForms Mono, фаза 62b: выпадающий список, контекстное меню, подсказка и главное меню — всплывающие окна внутри формы; выделение текста мышью с отпусканием за краем формы; форма меняет размер вслед за столом; MessageBox — отдельным окном.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+            // Набор — когда службы встали: см. `mono-drawing`.
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // `popups.exe` собран csc из .NET Framework (`ports/mono/samples/
+            // popups.cs`). Точки прицела — клиентские точки формы из того же
+            // файла плюс 20: поверхность начинается с полосы главного меню.
+            Step::Line("run /bin/mono /usr/share/mono/popups.exe"),
+            // Рамка `Sizable` — форма сказала столу, что размер ей менять можно.
+            Step::Await("desktop     : 'Mono Popups' is resizable", 240_000),
+            Step::Await("popups: shown 400x240", 240_000),
+            // Показ — ещё не картинка: первая перерисовка в отладочной Mono
+            // идёт секундами, и снимок через три секунды был чёрным.
+            Step::Await("popups: ready", 120_000),
+            Step::Wait(1_000),
+            Step::Shot("popups"),
+            // Выпадающий список 12,12 размером 160x21. Список всплывает под
+            // полем внутри формы; «two» — вторая строка.
+            Step::Aim(Aim::Program("Mono Popups", 92, 42)),
+            Step::Click,
+            Step::Await("popups: combo dropped", 60_000),
+            Step::Wait(1_500),
+            Step::Shot("combo"),
+            Step::Aim(Aim::Program("Mono Popups", 60, 76)),
+            Step::Click,
+            Step::Await("popups: combo two", 60_000),
+            // Выделение мышью в поле 12,50 размером 220x24: нажать у левого
+            // края и отпустить правее формы. Отпускание за краем достаётся
+            // полю только захватом — у стола (`WIN_RELEASE`) и у драйвера.
+            Step::Aim(Aim::Program("Mono Popups", 16, 82)),
+            Step::Press,
+            Step::Move(150, 0),
+            Step::Move(300, 0),
+            Step::Release,
+            Step::Await("popups: selected 24", 60_000),
+            // Контекстное меню — правой кнопкой по пустому месту; «Copy» —
+            // первый пункт, сразу под точкой щелчка.
+            Step::Aim(Aim::Program("Mono Popups", 300, 80)),
+            Step::RightClick,
+            Step::Await("popups: context opened", 60_000),
+            Step::Await("popups: context painted", 60_000),
+            Step::Wait(1_000),
+            Step::Shot("context"),
+            Step::Aim(Aim::Program("Mono Popups", 330, 92)),
+            Step::Click,
+            Step::Await("popups: context Copy", 60_000),
+            // Подсказка у кнопки 298,198 размером 90x30.
+            Step::Aim(Aim::Program("Mono Popups", 343, 233)),
+            Step::Move(2, 0),
+            Step::Await("popups: tooltip shown", 60_000),
+            Step::Wait(500),
+            Step::Shot("tooltip"),
+            // Главное меню: «File» в полосе, «Hello» — первый пункт под ней.
+            Step::Aim(Aim::Program("Mono Popups", 16, 10)),
+            Step::Click,
+            Step::Await("popups: menu opened", 60_000),
+            Step::Wait(1_000),
+            Step::Shot("menu"),
+            Step::Aim(Aim::Program("Mono Popups", 40, 32)),
+            Step::Click,
+            Step::Await("popups: menu Hello", 60_000),
+            // Развернуть и вернуть: форма выкладывается по размеру, который
+            // выбрал стол, и кнопка в углу едет вместе с углом.
+            Step::Aim(Aim::Maximize("Mono Popups")),
+            Step::Click,
+            Step::Await("desktop     : resized 'Mono Popups'", 60_000),
+            Step::Await("popups: resized ", 60_000),
+            Step::Wait(2_000),
+            Step::Shot("maximized"),
+            Step::Aim(Aim::Maximize("Mono Popups")),
+            Step::Click,
+            Step::Await("popups: resized 400x240, corner at 298,198", 60_000),
+            // Вопрос — отдельное окно стола; Enter — кнопка по умолчанию.
+            Step::Aim(Aim::Program("Mono Popups", 57, 125)),
+            Step::Click,
+            Step::Await("desktop     : opened 'Question'", 60_000),
+            Step::Wait(2_000),
+            Step::Shot("question"),
+            Step::Key("ret"),
+            Step::Await("popups: answer Yes", 60_000),
+            Step::Aim(Aim::Close("Mono Popups")),
+            Step::Click,
+            Step::Await("popups: closed", 60_000),
+            Step::Await("popups: done", 30_000),
             Step::Await("/bin/mono: exited with code 0", 30_000),
             Step::Absent("Exception"),
             Step::Absent("mwf-freeos: the desktop refused"),
@@ -9080,8 +9210,9 @@ pub const ALL: &[Scenario] = &[
             // 56–57, здесь число тогда не подняли — сценарий краснел), затем
             // `SYS_THREAD_INFO` (фаза 58b).
             // 65543 — `0x0001_0007`: `MAP_JIT`, память кода (фаза 59).
-            // 65544 — `0x0001_0008`: `KIND_TERMINAL` у `SYS_FSTAT` (фаза 60).
-            Step::Await("posix: abi version 65544", 60_000),
+            // 65545 — `0x0001_0009`: `SYS_WINSTYLE`, `WIN_RELEASE` и
+            // `WIN_RESIZE` (фаза 62b).
+            Step::Await("posix: abi version 65545", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».
@@ -9353,7 +9484,9 @@ pub const ALL: &[Scenario] = &[
         steps: &[
             // Том btrfs на `/data` — единственное место, куда живая система
             // умеет писать: переименование и удаление проверяются там.
-            Step::Await("data        : mounted read-write", 60_000),
+            // Первый шаг — это вся загрузка, и срок у него общий (`BOOT`):
+            // шестьдесят секунд перестало хватать, когда initrd повёз Mono.
+            Step::Await("data        : mounted read-write", BOOT),
             Step::Await("freeos> ", 60_000),
             Step::Line("mkdir /data/c4"),
             Step::Await("created /data/c4", 30_000),

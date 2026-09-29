@@ -13,24 +13,39 @@
 // - **рисование** — в задний буфер формы (`TopLevel.Back`), с отсечением по
 //   родителям, по видимым детям и по соседям выше в порядке наложения — ровно
 //   так, как X11 отсекает дочерние окна: родитель никогда не закрашивает детей;
+// - **всплывающие окна** (фаза 62b) — подсказка, выпадающий список, меню: окна
+//   верхнего уровня без заголовка. Своего окна FreeOS у них нет — у каждого
+//   такого окна стол рисует свою полосу заголовка, а окон у программы не больше
+//   восьми. Они рисуются в поверхность формы-хозяина (`TopLevel.Host`) поверх
+//   всего, что в ней есть, и первыми ловят мышь. Хозяин — форма владельца, а
+//   нет владельца — форма, в «экранный» прямоугольник которой окно попало;
+// - **главное меню старого образца** (`MainMenu`, фаза 62b) — полоса над
+//   клиентской областью (`TopLevel.Band`): поверхность формы начинается с неё,
+//   и мышь над полосой уходит форме неклиентскими сообщениями, как у Win32;
 // - **поверхность** получает только изменившееся (`TopLevel.Dirty`), когда
 //   очередь опустела: копия прямоугольника и `freeos_window_commit`. Копия, а не
 //   рисование прямо в поверхность, по двум причинам: порядок байтов точки у
 //   машины бывает RGB (у GDI+ — всегда BGR), и каретку ввода драйвер рисует
 //   поверх копии, не трогая картинку формы;
-// - **мышь** — попадание в самое глубокое видимое окно под точкой;
-// - **клавиатура** — окну с фокусом (`focus_window`).
+// - **мышь** — попадание в самое глубокое видимое окно под точкой; нажатая
+//   кнопка захватывает указатель за окном, над которым её нажали, до
+//   отпускания (`implicit_grab`) — как X11. Стол делает то же самое для окна
+//   FreeOS в целом (`WIN_RELEASE`), поэтому ползунок, утащенный за край формы,
+//   узнаёт, где его отпустили;
+// - **клавиатура** — окну с фокусом (`focus_window`);
+// - **размер** — форме с рамкой `Sizable` стол разрешает менять размер
+//   (`freeos_window_style`), и форма выкладывается заново по `WIN_RESIZE`.
 //
 // # Чего договор окна не даёт, и что из этого следует
 //
-// - Отпускания кнопки мыши нет: стол сообщает щелчок. Драйвер отдаёт форме
-//   нажатие и отпускание подряд — кнопки, флажки и поля работают, а
-//   перетаскивания мышью (выделение текста, ползунок) нет.
-// - Отпускания клавиши тоже нет: `WM_KEYUP` идёт сразу за `WM_KEYDOWN`.
+// - Отпускания клавиши нет: `WM_KEYUP` идёт сразу за `WM_KEYDOWN`.
 // - Заголовок окна задаётся при открытии и потом не меняется.
-// - Всплывающие окна без заголовка (подсказки, выпадающие списки, меню) на стол
-//   не выходят: у каждого окна FreeOS своя полоса заголовка, а окон у программы
-//   не больше восьми. Это отдельный шаг.
+// - Всплывающее окно не выходит за край своей формы: оно в её поверхности. Не
+//   влезающее сдвигается внутрь, а больше формы — обрезается.
+// - Стол не сообщает, что программа потеряла фокус, поэтому открытое меню не
+//   закрывается от щелчка по другому окну — только от щелчка в своей форме.
+// - Окна с заголовком (`MessageBox`, диалоги) — отдельные окна стола; держать
+//   их поверх владельца стол не умеет.
 //
 // Отладка: `FREEOS_MWF_DEBUG=1` печатает в stderr, что драйвер делает с окнами.
 
@@ -70,6 +85,8 @@ namespace System.Windows.Forms {
 			[DllImport (Lib)]
 			internal static extern IntPtr freeos_window_resize (long id, uint width, uint height);
 			[DllImport (Lib)]
+			internal static extern int freeos_window_style (long id, uint flags);
+			[DllImport (Lib)]
 			internal static extern int freeos_window_close (long id);
 			[DllImport (Lib)]
 			internal static extern int freeos_screen (out uint width, out uint height, out uint pixel_format);
@@ -80,11 +97,19 @@ namespace System.Windows.Forms {
 		const uint WIN_CLOSE = 3;
 		const uint WIN_MOVE = 4;
 		const uint WIN_LEAVE = 5;
+		const uint WIN_RELEASE = 6;
+		const uint WIN_RESIZE = 7;
+		const uint WIN_STYLE_RESIZABLE = 1;
 		const int WIN_MOD_SHIFT = 1;
 		const int WIN_MOD_CTRL = 2;
 		const int WIN_MOD_ALT = 4;
 		const uint WIN_KEY_NAMED = 0x01000000;
 		const uint PIXEL_RGB = 1;
+
+		// Win32: кнопки в wParam сообщений мыши и «попали в меню» у неклиентских.
+		const int MK_LBUTTON = 1;
+		const int MK_RBUTTON = 2;
+		const int HTMENU = 5;
 
 		#endregion
 
@@ -104,6 +129,16 @@ namespace System.Windows.Forms {
 			internal Bitmap Back;
 			internal Rectangle Dirty;
 			internal string Title = "";
+			// Высота полосы главного меню (`MainMenu`) над клиентской областью:
+			// поверхность начинается с неё. Ноль — меню нет.
+			internal int Band;
+			// Всплывающие окна, показанные поверх этой формы, снизу вверх.
+			internal readonly List<Hwnd> Popups = new List<Hwnd> ();
+			// У всплывающего окна — форма, в поверхности которой оно показано.
+			internal TopLevel Host;
+			// Стол попросил новый размер, и ответить ему надо, даже если форма
+			// осталась прежней: до ответа он показывает её в рамке нового размера.
+			internal bool Answer;
 			internal bool IsOpen { get { return Id >= 0; } }
 		}
 
@@ -124,6 +159,10 @@ namespace System.Windows.Forms {
 		sealed class KeyInfo {
 			internal char Char;
 			internal Keys Modifiers;
+			// Форма, окну которой пришла клавиша. Адресат внутри неё — окно с
+			// фокусом — выбирается при выдаче сообщения, а не при заборе
+			// события (см. `KeyTarget`).
+			internal TopLevel Top;
 		}
 
 		sealed class CaretState {
@@ -157,6 +196,9 @@ namespace System.Windows.Forms {
 		IntPtr focus_window;
 		IntPtr active_window;
 		IntPtr grab_window;
+		// Окно, над которым нажали кнопку, пока её не отпустили (как неявный
+		// захват у X11): движения и отпускание достаются ему.
+		Hwnd implicit_grab;
 		Hwnd mouse_hwnd;
 		MouseButtons mouse_state;
 		Keys key_modifiers;
@@ -268,64 +310,121 @@ namespace System.Windows.Forms {
 			return hwnd;
 		}
 
+		// Запись окна верхнего уровня (формы или всплывающего) по его корню.
+		TopLevel EntryOf (Hwnd root)
+		{
+			TopLevel entry;
+			tops.TryGetValue (root, out entry);
+			return entry;
+		}
+
+		// Форма, в поверхности которой окно рисуется: своя у формы и её детей,
+		// хозяйская — у всплывающего окна и его детей.
 		TopLevel TopOf (Hwnd hwnd)
 		{
 			if (hwnd == null)
 				return null;
-			TopLevel top;
-			tops.TryGetValue (RootOf (hwnd), out top);
-			return top;
+			TopLevel entry = EntryOf (RootOf (hwnd));
+			return entry != null && entry.Host != null ? entry.Host : entry;
 		}
 
 		// Виден ли на столе: сам видим и все предки видимы, а у корня открыто
-		// окно FreeOS.
+		// окно FreeOS — своё или хозяйское.
 		bool IsShown (Hwnd hwnd)
 		{
 			for (Hwnd h = hwnd; h != null; h = h.parent) {
 				if (!h.visible || h.zombie || h.zero_sized)
 					return false;
 				if (h.parent == null) {
-					TopLevel top;
-					return tops.TryGetValue (h, out top) && top.IsOpen;
+					TopLevel entry = EntryOf (h);
+					if (entry == null)
+						return false;
+					return entry.Host != null ? entry.Host.IsOpen : entry.IsOpen;
 				}
 			}
 			return false;
 		}
 
+		// Всплывающее окно, показанное поверх чужой поверхности.
+		bool IsHosted (Hwnd root)
+		{
+			TopLevel entry = EntryOf (root);
+			return entry != null && entry.Host != null;
+		}
+
+		// Высота полосы главного меню: то, что форма добавила к рамке и
+		// заголовку сверху (`Form.WmNcCalcSize`). Считается по клиентской
+		// области, а не по `Menu.Rect` и не по `hwnd.menu`: у только что
+		// заведённого меню высота ещё не посчитана, а форма, которой меню задали
+		// в конструкторе, открывается окном раньше, чем приходит `SetMenu`, —
+		// с клиентской областью, уже сдвинутой под меню. Меню нет — разница ноль.
+		static int MenuBand (Hwnd hwnd)
+		{
+			if (hwnd.parent != null)
+				return 0;
+			Control ctrl = Control.FromHandle (hwnd.Handle);
+			if (ctrl == null)
+				return 0;
+			Hwnd.Borders frame = Hwnd.GetBorders (ctrl.GetCreateParams (), null);
+			return Math.Max (0, hwnd.ClientRect.Y - frame.top);
+		}
+
+		// Где поверхность формы на «экране»: угол клиентской области минус
+		// полоса меню над ней.
+		static Point SurfaceScreen (TopLevel top)
+		{
+			Hwnd root = top.Hwnd;
+			Rectangle client = root.ClientRect;
+			return new Point (root.x + client.X, root.y + client.Y - top.Band);
+		}
+
 		// Левый верхний угол окна целиком (с рамкой) в точках поверхности. У
-		// окна верхнего уровня рамку и заголовок рисует стол, и поверхность
-		// начинается с клиентской области — угол окна поэтому левее и выше нуля.
-		static Point WholeOrigin (Hwnd hwnd)
+		// формы рамку и заголовок рисует стол, и поверхность начинается с полосы
+		// меню или клиентской области — угол окна поэтому левее и выше нуля. У
+		// всплывающего окна место задано в «экранных» точках, и в поверхность
+		// хозяина они переводятся от её «экранного» угла.
+		Point WholeOrigin (Hwnd hwnd)
 		{
 			if (hwnd.parent == null) {
+				TopLevel entry = EntryOf (hwnd);
+				if (entry != null && entry.Host != null) {
+					Point s = SurfaceScreen (entry.Host);
+					return new Point (hwnd.x - s.X, hwnd.y - s.Y);
+				}
 				Rectangle client = hwnd.ClientRect;
-				return new Point (-client.X, -client.Y);
+				int band = entry != null ? entry.Band : 0;
+				return new Point (-client.X, band - client.Y);
 			}
 			Point p = ClientOrigin (hwnd.parent);
 			return new Point (p.X + hwnd.x, p.Y + hwnd.y);
 		}
 
-		static Point ClientOrigin (Hwnd hwnd)
+		Point ClientOrigin (Hwnd hwnd)
 		{
 			Point o = WholeOrigin (hwnd);
 			Rectangle client = hwnd.ClientRect;
 			return new Point (o.X + client.X, o.Y + client.Y);
 		}
 
-		static Rectangle WholeRect (Hwnd hwnd)
+		Rectangle WholeRect (Hwnd hwnd)
 		{
 			return new Rectangle (WholeOrigin (hwnd), new Size (hwnd.width, hwnd.height));
 		}
 
-		static Rectangle ClientRectOnSurface (Hwnd hwnd)
+		Rectangle ClientRectOnSurface (Hwnd hwnd)
 		{
 			return new Rectangle (ClientOrigin (hwnd), hwnd.ClientRect.Size);
 		}
 
+		static bool Visible (Hwnd hwnd)
+		{
+			return hwnd.visible && !hwnd.zero_sized && !hwnd.zombie;
+		}
+
 		// Что от окна видно на поверхности: пересечение с клиентскими областями
 		// предков, минус видимые дети и соседи выше в порядке наложения — у себя
-		// и у каждого предка. Порядок наложения — список детей родителя, от
-		// нижнего к верхнему.
+		// и у каждого предка, и минус всплывающие окна, лежащие выше. Порядок
+		// наложения — список детей родителя, от нижнего к верхнему.
 		Region VisibleRegion (Hwnd hwnd, bool client)
 		{
 			Region region = new Region ();
@@ -352,31 +451,59 @@ namespace System.Windows.Forms {
 						region.Exclude (WholeRect (s));
 				}
 			}
+			// Всплывающие окна — выше всего в форме: у самой формы вычитаются
+			// все, у всплывающего — те, что показаны позже него.
+			int above = top.Popups.IndexOf (RootOf (hwnd)) + 1;
+			for (int i = above; i < top.Popups.Count; i++) {
+				Hwnd popup = top.Popups [i];
+				if (Visible (popup))
+					region.Exclude (WholeRect (popup));
+			}
 			return region;
 		}
 
 		// Самое глубокое видимое окно под точкой поверхности.
-		static Hwnd HitTest (Hwnd hwnd, Point p)
+		Hwnd HitTest (Hwnd hwnd, Point p)
 		{
 			if (!ClientRectOnSurface (hwnd).Contains (p))
 				return hwnd;
 			for (int i = hwnd.children.Count - 1; i >= 0; i--) {
 				Hwnd child = (Hwnd) hwnd.children [i];
-				if (child.visible && !child.zero_sized && !child.zombie && WholeRect (child).Contains (p))
+				if (Visible (child) && WholeRect (child).Contains (p))
 					return HitTest (child, p);
 			}
 			return hwnd;
 		}
 
-		// «Экранные» координаты. Где стол поставил окно, программа не знает, —
-		// драйвер считает, что там, где просила форма (`Location`): так перевод
-		// туда и обратно сходится, а больше экранные точки ни для чего не нужны.
+		// То же с учётом всплывающих окон: они выше всего в форме.
+		Hwnd HitTest (TopLevel top, Point p)
+		{
+			for (int i = top.Popups.Count - 1; i >= 0; i--) {
+				Hwnd popup = top.Popups [i];
+				if (Visible (popup) && WholeRect (popup).Contains (p))
+					return HitTest (popup, p);
+			}
+			return HitTest (top.Hwnd, p);
+		}
+
+		// «Экранные» координаты угла клиентской области. Где стол поставил окно,
+		// программа не знает, — драйвер считает, что там, где просила форма
+		// (`Location`): так перевод туда и обратно сходится, а больше экранные
+		// точки ни для чего не нужны. Всплывающие окна живут в тех же точках —
+		// WinForms ставит их по `PointToScreen` своих элементов.
 		Point ScreenOrigin (Hwnd hwnd)
 		{
-			Hwnd root = RootOf (hwnd);
+			TopLevel top = TopOf (hwnd);
 			Point o = ClientOrigin (hwnd);
-			Rectangle client = root.ClientRect;
-			return new Point (root.x + client.X + o.X, root.y + client.Y + o.Y);
+			if (top == null) {
+				// Корень, ещё не показанный нигде: его поверхность начиналась
+				// бы с клиентской области.
+				Hwnd root = RootOf (hwnd);
+				Rectangle client = root.ClientRect;
+				return new Point (root.x + client.X + o.X, root.y + client.Y + o.Y);
+			}
+			Point s = SurfaceScreen (top);
+			return new Point (s.X + o.X, s.Y + o.Y);
 		}
 
 		#endregion
@@ -388,9 +515,10 @@ namespace System.Windows.Forms {
 			TopLevel top;
 			if (!tops.TryGetValue (hwnd, out top) || top.IsOpen)
 				return;
+			top.Band = MenuBand (hwnd);
 			Rectangle client = hwnd.ClientRect;
 			int width = Math.Max (1, client.Width);
-			int height = Math.Max (1, client.Height);
+			int height = Math.Max (1, client.Height + top.Band);
 			IntPtr surface;
 			byte[] title = Encoding.UTF8.GetBytes ((top.Title ?? "") + "\0");
 			long id = Native.freeos_window_open (title, (uint) width, (uint) height, out surface);
@@ -403,13 +531,28 @@ namespace System.Windows.Forms {
 			top.Surface = surface;
 			SetBackBuffer (top, width, height);
 			Trace ("open '{0}' {1}x{2} as window {3}", top.Title, width, height, id);
+			UpdateStyle (top, (int) hwnd.initial_style);
 			InvalidateTree (hwnd);
+		}
+
+		// Размер формы с рамкой `Sizable` меняет человек — стол узнаёт об этом
+		// здесь и даёт окну уголок и «развернуть».
+		void UpdateStyle (TopLevel top, int style)
+		{
+			if (!top.IsOpen)
+				return;
+			bool sizable = StyleSet (style, WindowStyles.WS_THICKFRAME);
+			if (Native.freeos_window_style (top.Id, sizable ? WIN_STYLE_RESIZABLE : 0) != 0)
+				Console.Error.WriteLine ("mwf-freeos: the desktop refused a style for window {0}", top.Id);
 		}
 
 		void CloseTop (TopLevel top)
 		{
 			if (!top.IsOpen)
 				return;
+			// Всплывающие окна жили в этой поверхности — вместе с ней и уходят.
+			foreach (Hwnd popup in top.Popups.ToArray ())
+				HidePopup (popup);
 			Native.freeos_window_close (top.Id);
 			Trace ("close window {0}", top.Id);
 			top.Id = -1;
@@ -442,16 +585,27 @@ namespace System.Windows.Forms {
 			top.Dirty = Rectangle.Empty;
 		}
 
-		// Размер клиентской области формы сменился — поверхность тоже.
+		// Размер клиентской области формы или полосы меню сменился —
+		// поверхность тоже. Просьбе стола (`Answer`) отвечают и тогда, когда
+		// размер не сменился: стол ждёт ответа, чтобы подогнать рамку.
 		void ResizeTop (TopLevel top)
 		{
 			if (!top.IsOpen)
 				return;
+			int band = MenuBand (top.Hwnd);
+			bool band_moved = band != top.Band;
+			top.Band = band;
 			Rectangle client = top.Hwnd.ClientRect;
 			int width = Math.Max (1, client.Width);
-			int height = Math.Max (1, client.Height);
-			if (width == top.Width && height == top.Height)
+			int height = Math.Max (1, client.Height + band);
+			if (width == top.Width && height == top.Height && !top.Answer) {
+				// Меню появилось или ушло, а высота та же: клиентская область
+				// сдвинулась по поверхности, и рисовать надо всё заново.
+				if (band_moved)
+					InvalidateSurface (top);
 				return;
+			}
+			top.Answer = false;
 			IntPtr surface = Native.freeos_window_resize (top.Id, (uint) width, (uint) height);
 			if (surface == IntPtr.Zero) {
 				Console.Error.WriteLine ("mwf-freeos: the desktop refused to resize window {0} to {1}x{2}", top.Id, width, height);
@@ -460,7 +614,35 @@ namespace System.Windows.Forms {
 			top.Surface = surface;
 			SetBackBuffer (top, width, height);
 			Trace ("resize window {0} to {1}x{2}", top.Id, width, height);
-			InvalidateTree (top.Hwnd);
+			InvalidateSurface (top);
+		}
+
+		// Стол сменил окну размер (`WIN_RESIZE`): форма получает клиентскую
+		// область этого размера — в пределах своих наименьшего и наибольшего — и
+		// выкладывается заново, как у X11 по ConfigureNotify.
+		void DesktopResize (TopLevel top, int width, int height)
+		{
+			Hwnd hwnd = top.Hwnd;
+			Rectangle client = hwnd.ClientRect;
+			int whole_w = hwnd.width - client.Width + Math.Max (1, width);
+			int whole_h = hwnd.height - client.Height + Math.Max (1, height - top.Band);
+			Form form = Control.FromHandle (hwnd.Handle) as Form;
+			if (form != null) {
+				Size min = form.MinimumSize;
+				Size max = form.MaximumSize;
+				if (min.Width > 0)
+					whole_w = Math.Max (whole_w, min.Width);
+				if (min.Height > 0)
+					whole_h = Math.Max (whole_h, min.Height);
+				if (max.Width > 0)
+					whole_w = Math.Min (whole_w, max.Width);
+				if (max.Height > 0)
+					whole_h = Math.Min (whole_h, max.Height);
+			}
+			Trace ("desktop resized window {0} to {1}x{2}", top.Id, width, height);
+			top.Answer = true;
+			SetWindowPos (hwnd.Handle, hwnd.x, hwnd.y, whole_w, whole_h);
+			ResizeTop (top);
 		}
 
 		// Перенести изменившееся на поверхности и сказать об этом столу.
@@ -491,6 +673,108 @@ namespace System.Windows.Forms {
 				DrawCaret (top, r);
 				Native.freeos_window_commit (top.Id, r.X, r.Y, r.Width, r.Height);
 			}
+		}
+
+		#endregion
+
+		#region Всплывающие окна
+
+		// Всплывающее окно: верхнего уровня, без заголовка и не форма.
+		// Подсказка, выпадающий список, меню — своего окна FreeOS у них нет.
+		static bool IsPopup (Hwnd hwnd)
+		{
+			int style = (int) hwnd.initial_style;
+			return StyleSet (style, WindowStyles.WS_POPUP) && !StyleSet (style, WindowStyles.WS_CAPTION);
+		}
+
+		// В чьей поверхности показать всплывающее окно. Владелец — надёжнее
+		// всего: его называют меню и выпадающий список. Нет владельца — форма, в
+		// «экранный» прямоугольник которой окно попало (активная — первой), потом
+		// активная, потом та, над которой указатель.
+		TopLevel HostFor (Hwnd popup)
+		{
+			if (popup.owner != null) {
+				TopLevel owner = TopOf (popup.owner);
+				if (owner != null && owner.IsOpen)
+					return owner;
+			}
+			TopLevel active = TopOf (Hwnd.ObjectFromHandle (active_window));
+			Point at = new Point (popup.x, popup.y);
+			if (active != null && active.IsOpen && ScreenRect (active).Contains (at))
+				return active;
+			foreach (TopLevel top in tops.Values) {
+				if (top.IsOpen && ScreenRect (top).Contains (at))
+					return top;
+			}
+			if (active != null && active.IsOpen)
+				return active;
+			TopLevel under = TopOf (mouse_hwnd);
+			if (under != null && under.IsOpen)
+				return under;
+			foreach (TopLevel top in tops.Values) {
+				if (top.IsOpen)
+					return top;
+			}
+			return null;
+		}
+
+		static Rectangle ScreenRect (TopLevel top)
+		{
+			return new Rectangle (SurfaceScreen (top), new Size (top.Width, top.Height));
+		}
+
+		void ShowPopup (Hwnd popup)
+		{
+			TopLevel entry = EntryOf (popup);
+			if (entry == null || entry.Host != null)
+				return;
+			TopLevel host = HostFor (popup);
+			if (host == null) {
+				Trace ("popup {0:X} has no form to show in", popup.Handle.ToInt64 ());
+				return;
+			}
+			entry.Host = host;
+			host.Popups.Remove (popup);
+			host.Popups.Add (popup);
+			FitPopup (popup);
+			Trace ("popup {0:X} {1}x{2} at {3} over window {4}", popup.Handle.ToInt64 (), popup.width, popup.height,
+				WholeOrigin (popup), host.Id);
+			InvalidateTree (popup);
+		}
+
+		void HidePopup (Hwnd popup)
+		{
+			TopLevel entry = EntryOf (popup);
+			if (entry == null || entry.Host == null)
+				return;
+			TopLevel host = entry.Host;
+			Rectangle old = WholeRect (popup);
+			entry.Host = null;
+			host.Popups.Remove (popup);
+			Trace ("popup {0:X} hidden", popup.Handle.ToInt64 ());
+			InvalidateUnder (host, old);
+		}
+
+		// Не влезающее в форму окно сдвигается внутрь неё: за край поверхности
+		// рисовать нечем. Больше формы — остаётся у левого верхнего угла и
+		// обрезается. Новое место — это и место окна для WinForms: оно узнаёт
+		// его из WM_WINDOWPOSCHANGED, и `PointToClient` сходится с тем, что видно.
+		void FitPopup (Hwnd popup)
+		{
+			TopLevel host = TopOf (popup);
+			Point o = WholeOrigin (popup);
+			int dx = 0;
+			int dy = 0;
+			if (o.X + popup.width > host.Width)
+				dx = host.Width - (o.X + popup.width);
+			if (o.X + dx < 0)
+				dx = -o.X;
+			if (o.Y + popup.height > host.Height)
+				dy = host.Height - (o.Y + popup.height);
+			if (o.Y + dy < 0)
+				dy = -o.Y;
+			popup.x += dx;
+			popup.y += dy;
 		}
 
 		#endregion
@@ -528,6 +812,24 @@ namespace System.Windows.Forms {
 			return hwnd.parent != null && (hwnd.border_style == FormBorderStyle.Fixed3D || hwnd.border_style == FormBorderStyle.FixedSingle);
 		}
 
+		// Полоса главного меню формы на поверхности; пусто — меню нет.
+		Rectangle BandRect (Hwnd hwnd)
+		{
+			if (hwnd.parent != null)
+				return Rectangle.Empty;
+			TopLevel entry = EntryOf (hwnd);
+			if (entry == null || entry.Host != null || entry.Band == 0)
+				return Rectangle.Empty;
+			return new Rectangle (0, 0, entry.Width, entry.Band);
+		}
+
+		// Есть ли у окна неклиентская часть, которую видно на поверхности: рамка
+		// дочернего окна или полоса меню формы.
+		bool HasNonClient (Hwnd hwnd)
+		{
+			return HasBorder (hwnd) || !BandRect (hwnd).IsEmpty;
+		}
+
 		// Окно и всё, что в нём, рисуется заново — окно появилось на столе или
 		// сменило поверхность.
 		void InvalidateTree (Hwnd hwnd)
@@ -535,10 +837,18 @@ namespace System.Windows.Forms {
 			if (!hwnd.visible || hwnd.zombie)
 				return;
 			AddExpose (hwnd, true, new Rectangle (Point.Empty, hwnd.ClientRect.Size));
-			if (HasBorder (hwnd))
+			if (HasNonClient (hwnd))
 				AddExpose (hwnd, false, new Rectangle (0, 0, hwnd.width, hwnd.height));
 			foreach (Hwnd child in hwnd.children.ToArray ())
 				InvalidateTree (child);
+		}
+
+		// Вся поверхность формы — сама форма и всплывающие окна поверх неё.
+		void InvalidateSurface (TopLevel top)
+		{
+			InvalidateTree (top.Hwnd);
+			foreach (Hwnd popup in top.Popups.ToArray ())
+				InvalidateTree (popup);
 		}
 
 		// Часть поверхности открылась (окно ушло, сдвинулось, спряталось) —
@@ -556,16 +866,28 @@ namespace System.Windows.Forms {
 				c.Offset (-client.X, -client.Y);
 				AddExpose (hwnd, true, c);
 			}
-			if (HasBorder (hwnd))
+			if (HasBorder (hwnd) || BandRect (hwnd).IntersectsWith (surface_rect))
 				AddExpose (hwnd, false, new Rectangle (0, 0, hwnd.width, hwnd.height));
 			foreach (Hwnd child in hwnd.children.ToArray ())
 				InvalidateArea (child, surface_rect);
 		}
 
+		// Дочернее окно ушло с этого места — открылось то, что под ним.
 		void InvalidateUnder (Hwnd hwnd, Rectangle surface_rect)
 		{
 			if (hwnd.parent != null && IsShown (hwnd.parent))
-				InvalidateArea (RootOf (hwnd), surface_rect);
+				InvalidateUnder (TopOf (hwnd), surface_rect);
+		}
+
+		// Место на поверхности формы открылось: перерисовать саму форму и
+		// всплывающие окна, которым там что-то видно.
+		void InvalidateUnder (TopLevel top, Rectangle surface_rect)
+		{
+			if (top == null || !top.IsOpen)
+				return;
+			InvalidateArea (top.Hwnd, surface_rect);
+			foreach (Hwnd popup in top.Popups.ToArray ())
+				InvalidateArea (popup, surface_rect);
 		}
 
 		// Рамку дочернего окна рисует драйвер, как у X11: `Fixed3D` и
@@ -909,18 +1231,12 @@ namespace System.Windows.Forms {
 			return CreateWindow (cp);
 		}
 
-		// Окно верхнего уровня без заголовка — подсказка, выпадающий список, меню.
-		// На стол такие пока не выходят (см. шапку).
-		static bool IsPopup (Hwnd hwnd)
-		{
-			int style = (int) hwnd.initial_style;
-			return StyleSet (style, WindowStyles.WS_POPUP) && !StyleSet (style, WindowStyles.WS_CAPTION);
-		}
-
 		void Map (Hwnd hwnd)
 		{
 			if (hwnd.parent == null) {
-				if (!IsPopup (hwnd))
+				if (IsPopup (hwnd))
+					ShowPopup (hwnd);
+				else
 					OpenTop (hwnd);
 			} else if (IsShown (hwnd)) {
 				InvalidateTree (hwnd);
@@ -936,6 +1252,8 @@ namespace System.Windows.Forms {
 
 			if (hwnd.parent != null && IsShown (hwnd))
 				InvalidateUnder (hwnd, WholeRect (hwnd));
+			if (hwnd.parent == null && IsHosted (hwnd))
+				HidePopup (hwnd);
 
 			List<Hwnd> doomed = new List<Hwnd> ();
 			Collect (hwnd, doomed);
@@ -957,6 +1275,8 @@ namespace System.Windows.Forms {
 					active_window = IntPtr.Zero;
 				if (grab_window == hh)
 					grab_window = IntPtr.Zero;
+				if (implicit_grab == h)
+					implicit_grab = null;
 				if (caret.Hwnd == hh)
 					DestroyCaret (hh);
 				if (mouse_hwnd == h)
@@ -997,7 +1317,9 @@ namespace System.Windows.Forms {
 				SendMessage (handle, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
 			} else {
 				TopLevel top;
-				if (tops.TryGetValue (hwnd, out top))
+				if (hwnd.parent == null && IsHosted (hwnd))
+					HidePopup (hwnd);
+				else if (tops.TryGetValue (hwnd, out top))
 					CloseTop (top);
 				else if (was_shown)
 					InvalidateUnder (hwnd, old);
@@ -1051,7 +1373,7 @@ namespace System.Windows.Forms {
 				ResizeTop (top);
 			if (IsShown (hwnd)) {
 				AddExpose (hwnd, true, new Rectangle (Point.Empty, rect.Size));
-				if (HasBorder (hwnd))
+				if (HasNonClient (hwnd))
 					AddExpose (hwnd, false, new Rectangle (0, 0, hwnd.width, hwnd.height));
 			}
 		}
@@ -1069,6 +1391,7 @@ namespace System.Windows.Forms {
 				return;
 
 			bool was_shown = IsShown (hwnd);
+			bool moved = hwnd.x != x || hwnd.y != y;
 			Rectangle old = WholeRect (hwnd);
 			hwnd.x = x;
 			hwnd.y = y;
@@ -1078,11 +1401,21 @@ namespace System.Windows.Forms {
 			if (!hwnd.zero_sized)
 				PerformNCCalc (hwnd);
 
+			TopLevel entry = hwnd.parent == null ? EntryOf (hwnd) : null;
 			if (hwnd.parent != null) {
 				if (was_shown)
 					InvalidateUnder (hwnd, old);
 				if (IsShown (hwnd))
 					InvalidateTree (hwnd);
+			} else if (entry != null && entry.Host != null) {
+				// Всплывающее окно переехало внутри формы-хозяина.
+				FitPopup (hwnd);
+				InvalidateUnder (entry.Host, old);
+				InvalidateTree (hwnd);
+			} else if (entry != null && entry.IsOpen && moved && entry.Popups.Count > 0) {
+				// Форма сменила «экранное» место, а всплывающие окна над ней
+				// стоят в экранных точках — на поверхности они сдвинулись.
+				InvalidateSurface (entry);
 			}
 			SendMessage (hwnd.client_window, Msg.WM_WINDOWPOSCHANGED, IntPtr.Zero, IntPtr.Zero);
 		}
@@ -1195,6 +1528,13 @@ namespace System.Windows.Forms {
 			if (hwnd == null)
 				return false;
 			hwnd.owner = hWndOwner != IntPtr.Zero ? Hwnd.ObjectFromHandle (hWndOwner) : null;
+			// Выпадающий список называет владельца уже показанным: если его форма
+			// другая, окно переезжает к ней.
+			TopLevel entry = hwnd.parent == null ? EntryOf (hwnd) : null;
+			if (entry != null && entry.Host != null && HostFor (hwnd) != entry.Host) {
+				HidePopup (hwnd);
+				ShowPopup (hwnd);
+			}
 			return true;
 		}
 
@@ -1216,8 +1556,12 @@ namespace System.Windows.Forms {
 		internal override void SetWindowStyle (IntPtr handle, CreateParams cp)
 		{
 			Hwnd hwnd = Hwnd.ObjectFromHandle (handle);
-			if (hwnd != null)
-				SetHwndStyles (hwnd, cp);
+			if (hwnd == null)
+				return;
+			SetHwndStyles (hwnd, cp);
+			TopLevel top;
+			if (hwnd.parent == null && tops.TryGetValue (hwnd, out top))
+				UpdateStyle (top, cp.Style);
 		}
 
 		internal override double GetWindowTransparency (IntPtr handle)
@@ -1591,6 +1935,8 @@ namespace System.Windows.Forms {
 				}
 				if (item != null) {
 					msg = (MSG) item;
+					if (!KeyTarget (ref msg))
+						continue;
 					if (msg.hwnd != IntPtr.Zero) {
 						Hwnd target = Hwnd.ObjectFromHandle (msg.hwnd);
 						if (target == null || target.zombie)
@@ -1664,19 +2010,38 @@ namespace System.Windows.Forms {
 			case Msg.WM_SYSCHAR:
 				key_modifiers = info != null ? info.Modifiers : Keys.None;
 				break;
+			// Кнопки — по порядку сообщений, а не событий стола: `MouseButtons`
+			// обязан отвечать то, что было в миг разбора этого сообщения.
+			case Msg.WM_MOUSEMOVE: {
+				int wparam = msg.wParam.ToInt32 ();
+				mouse_state = MouseButtons.None;
+				if ((wparam & MK_LBUTTON) != 0)
+					mouse_state |= MouseButtons.Left;
+				if ((wparam & MK_RBUTTON) != 0)
+					mouse_state |= MouseButtons.Right;
+				key_modifiers = Keys.None;
+				break;
+			}
 			case Msg.WM_LBUTTONDOWN:
 			case Msg.WM_LBUTTONDBLCLK:
-				mouse_state = MouseButtons.Left;
+			case Msg.WM_NCLBUTTONDOWN:
+				mouse_state |= MouseButtons.Left;
 				key_modifiers = Keys.None;
 				break;
 			case Msg.WM_RBUTTONDOWN:
 			case Msg.WM_RBUTTONDBLCLK:
-				mouse_state = MouseButtons.Right;
+			case Msg.WM_NCRBUTTONDOWN:
+				mouse_state |= MouseButtons.Right;
 				key_modifiers = Keys.None;
 				break;
 			case Msg.WM_LBUTTONUP:
+			case Msg.WM_NCLBUTTONUP:
+				mouse_state &= ~MouseButtons.Left;
+				key_modifiers = Keys.None;
+				break;
 			case Msg.WM_RBUTTONUP:
-				mouse_state = MouseButtons.None;
+			case Msg.WM_NCRBUTTONUP:
+				mouse_state &= ~MouseButtons.Right;
 				key_modifiers = Keys.None;
 				break;
 			default:
@@ -1746,15 +2111,21 @@ namespace System.Windows.Forms {
 			case WIN_POINTER:
 				if (active_window != top.Hwnd.Handle)
 					Activate (top.Hwnd.Handle);
-				Click (queue, top, ev);
+				ButtonDown (queue, top, ev);
+				break;
+			case WIN_RELEASE:
+				ButtonUp (queue, top, ev);
 				break;
 			case WIN_MOVE:
-				Move (queue, top, new Point (ev.X, ev.Y));
+				Move (queue, top, new Point (ev.X, ev.Y), ev.Code);
 				break;
 			case WIN_LEAVE:
 				if (mouse_hwnd != null && !mouse_hwnd.zombie)
 					Post (queue, MakeMsg (mouse_hwnd.Handle, Msg.WM_MOUSELEAVE, IntPtr.Zero, IntPtr.Zero));
 				mouse_hwnd = null;
+				break;
+			case WIN_RESIZE:
+				DesktopResize (top, ev.X, ev.Y);
 				break;
 			case WIN_CLOSE:
 				Trace ("close asked for window {0}", top.Id);
@@ -1778,9 +2149,22 @@ namespace System.Windows.Forms {
 			return (IntPtr) ((y << 16) | (x & 0xffff));
 		}
 
-		// Окно под указателем (или захватившее мышь) и точка в его клиентских
-		// координатах. Выключенное окно отдаёт мышь ближайшему включённому
-		// предку — как у X11.
+		// Кнопки из маски стола (1 левая, 2 правая) — в wParam сообщений мыши.
+		static IntPtr ButtonsParam (uint mask)
+		{
+			int wparam = 0;
+			if ((mask & 1) != 0)
+				wparam |= MK_LBUTTON;
+			if ((mask & 2) != 0)
+				wparam |= MK_RBUTTON;
+			return (IntPtr) wparam;
+		}
+
+		// Окно, которому достаётся мышь, и точка в его клиентских координатах.
+		// Порядок — как у X11: явный захват (`Control.Capture`), неявный (кнопку
+		// нажали и держат), и только потом попадание — сперва во всплывающие
+		// окна, потом в форму. Выключенное окно отдаёт мышь ближайшему
+		// включённому предку.
 		Hwnd PointerTarget (TopLevel top, Point surface, out Point client)
 		{
 			Hwnd target = null;
@@ -1789,8 +2173,10 @@ namespace System.Windows.Forms {
 				if (target != null && TopOf (target) != top)
 					target = null;
 			}
+			if (target == null && implicit_grab != null && !implicit_grab.zombie && TopOf (implicit_grab) == top)
+				target = implicit_grab;
 			if (target == null) {
-				target = HitTest (top.Hwnd, surface);
+				target = HitTest (top, surface);
 				if (!target.Enabled) {
 					Hwnd enabled = Hwnd.ObjectFromHandle (target.EnabledHwnd);
 					if (enabled != null)
@@ -1799,9 +2185,27 @@ namespace System.Windows.Forms {
 			}
 			Point o = ClientOrigin (target);
 			client = new Point (surface.X - o.X, surface.Y - o.Y);
-			Point screen = ScreenOrigin (top.Hwnd);
+			Point screen = SurfaceScreen (top);
 			mouse_position = new Point (screen.X + surface.X, screen.Y + surface.Y);
 			return target;
+		}
+
+		// Мышь над полосой главного меню, и никто её не захватил: такие события
+		// уходят форме неклиентскими, с экранной точкой, — так их ждёт `MainMenu`.
+		bool OverBand (TopLevel top, Hwnd target, Point surface)
+		{
+			return target == top.Hwnd && grab_window == IntPtr.Zero && implicit_grab == null
+				&& BandRect (top.Hwnd).Contains (surface);
+		}
+
+		// Форма выключена — открыт модальный диалог (`MessageBox`): ввод ей не
+		// достаётся, как у Win32. Стол о модальности не знает и шлёт его.
+		static bool Blocked (Hwnd target)
+		{
+			if (target == null)
+				return false;
+			Hwnd root = RootOf (target);
+			return !root.enabled && !IsPopup (root);
 		}
 
 		void EnterLeave (FQueue queue, Hwnd target)
@@ -1814,19 +2218,24 @@ namespace System.Windows.Forms {
 			Post (queue, MakeMsg (target.Handle, Msg.WM_MOUSE_ENTER, IntPtr.Zero, IntPtr.Zero));
 		}
 
-		void Move (FQueue queue, TopLevel top, Point surface)
+		void Move (FQueue queue, TopLevel top, Point surface, uint buttons)
 		{
 			Point client;
 			Hwnd target = PointerTarget (top, surface, out client);
-			EnterLeave (queue, target);
-			// Кнопки при движении не сообщаются: нажатие и отпускание уже
-			// отданы щелчком (см. шапку), и нажатая кнопка при движении начала
-			// бы выделение, которого человек не делал.
-			MSG msg = MakeMsg (target.Handle, Msg.WM_MOUSEMOVE, IntPtr.Zero, MakeLParam (client.X, client.Y));
+			if (Blocked (target))
+				return;
+			MSG msg;
+			if (OverBand (top, target, surface)) {
+				msg = MakeMsg (target.Handle, Msg.WM_NCMOUSEMOVE, (IntPtr) HTMENU,
+					MakeLParam (mouse_position.X, mouse_position.Y));
+			} else {
+				EnterLeave (queue, target);
+				msg = MakeMsg (target.Handle, Msg.WM_MOUSEMOVE, ButtonsParam (buttons), MakeLParam (client.X, client.Y));
+			}
 			lock (queue) {
 				LinkedListNode<object> last = queue.Posted.Last;
-				if (last != null && last.Value is MSG && ((MSG) last.Value).message == Msg.WM_MOUSEMOVE
-					&& ((MSG) last.Value).hwnd == msg.hwnd) {
+				if (last != null && last.Value is MSG && ((MSG) last.Value).message == msg.message
+					&& ((MSG) last.Value).hwnd == msg.hwnd && ((MSG) last.Value).wParam == msg.wParam) {
 					last.Value = msg;
 					return;
 				}
@@ -1834,20 +2243,33 @@ namespace System.Windows.Forms {
 			}
 		}
 
-		void Click (FQueue queue, TopLevel top, Native.WinEvent ev)
+		void ButtonDown (FQueue queue, TopLevel top, Native.WinEvent ev)
 		{
 			Point client;
 			Point surface = new Point (ev.X, ev.Y);
 			Hwnd target = PointerTarget (top, surface, out client);
-			EnterLeave (queue, target);
+			if (Blocked (target))
+				return;
 			bool right = ev.Code == 2;
-			Msg down = right ? Msg.WM_RBUTTONDOWN : Msg.WM_LBUTTONDOWN;
-			Msg up = right ? Msg.WM_RBUTTONUP : Msg.WM_LBUTTONUP;
-			IntPtr button = (IntPtr) (right ? 2 : 1);   // MK_RBUTTON : MK_LBUTTON
+			Msg down;
+			IntPtr lparam;
+			bool band = OverBand (top, target, surface);
+			if (band) {
+				// Нажатие по полосе меню: `MainMenu` сам захватит мышь за формой
+				// (`Control.Capture`), и отпускание придёт ей обычным сообщением.
+				down = right ? Msg.WM_NCRBUTTONDOWN : Msg.WM_NCLBUTTONDOWN;
+				lparam = MakeLParam (mouse_position.X, mouse_position.Y);
+			} else {
+				EnterLeave (queue, target);
+				down = right ? Msg.WM_RBUTTONDOWN : Msg.WM_LBUTTONDOWN;
+				lparam = MakeLParam (client.X, client.Y);
+				if (grab_window == IntPtr.Zero && implicit_grab == null)
+					implicit_grab = target;
+			}
 
 			long now = Timer.StopWatchNowMilliseconds;
 			Size slack = DoubleClickSize;
-			if (last_click_hwnd == target.Handle && last_click_message == down
+			if (!band && last_click_hwnd == target.Handle && last_click_message == down
 				&& now - last_click_time <= DoubleClickTime
 				&& Math.Abs (surface.X - last_click_point.X) <= slack.Width / 2
 				&& Math.Abs (surface.Y - last_click_point.Y) <= slack.Height / 2) {
@@ -1860,11 +2282,36 @@ namespace System.Windows.Forms {
 				last_click_point = surface;
 			}
 
-			IntPtr lparam = MakeLParam (client.X, client.Y);
-			Trace ("click {0} at {1},{2} -> {3:X} at {4},{5}", right ? "right" : "left", surface.X, surface.Y,
+			IntPtr button = (IntPtr) (right ? MK_RBUTTON : MK_LBUTTON);
+			Trace ("{0} down at {1},{2} -> {3:X} {4}", right ? "right" : "left", surface.X, surface.Y,
+				target.Handle.ToInt64 (), down);
+			if (!band)
+				Post (queue, MakeMsg (target.Handle, Msg.WM_MOUSEMOVE, IntPtr.Zero, lparam));
+			Post (queue, MakeMsg (target.Handle, down, band ? (IntPtr) HTMENU : button, lparam));
+		}
+
+		void ButtonUp (FQueue queue, TopLevel top, Native.WinEvent ev)
+		{
+			Point client;
+			Point surface = new Point (ev.X, ev.Y);
+			Hwnd target = PointerTarget (top, surface, out client);
+			bool right = ev.Code == 2;
+			// Захват кончается вместе с последней кнопкой; вторая, нажатая при
+			// первой, его не продлевает — так проще, и так делает X11.
+			implicit_grab = null;
+			if (Blocked (target))
+				return;
+			Msg up;
+			IntPtr lparam;
+			if (OverBand (top, target, surface)) {
+				up = right ? Msg.WM_NCRBUTTONUP : Msg.WM_NCLBUTTONUP;
+				lparam = MakeLParam (mouse_position.X, mouse_position.Y);
+			} else {
+				up = right ? Msg.WM_RBUTTONUP : Msg.WM_LBUTTONUP;
+				lparam = MakeLParam (client.X, client.Y);
+			}
+			Trace ("{0} up at {1},{2} -> {3:X} at {4},{5}", right ? "right" : "left", surface.X, surface.Y,
 				target.Handle.ToInt64 (), client.X, client.Y);
-			Post (queue, MakeMsg (target.Handle, Msg.WM_MOUSEMOVE, IntPtr.Zero, lparam));
-			Post (queue, MakeMsg (target.Handle, down, button, lparam));
 			Post (queue, MakeMsg (target.Handle, up, IntPtr.Zero, lparam));
 		}
 
@@ -1883,22 +2330,44 @@ namespace System.Windows.Forms {
 			if (ev.Code != 0 && ev.Code < 0x10000 && ev.Code < WIN_KEY_NAMED)
 				ch = (char) ev.Code;
 
-			IntPtr target = focus_window;
-			Hwnd focused = Hwnd.ObjectFromHandle (target);
-			if (focused == null || TopOf (focused) != top)
-				target = top.Hwnd.Handle;
-
 			bool alt = (modifiers & Keys.Alt) != 0;
 			IntPtr down_lparam = (IntPtr) (1 | (alt ? 1 << 29 : 0));
 			IntPtr up_lparam = (IntPtr) (unchecked ((int) 0xC0000001) | (alt ? 1 << 29 : 0));
 
-			MSG down = MakeMsg (target, alt ? Msg.WM_SYSKEYDOWN : Msg.WM_KEYDOWN, (IntPtr) vk, down_lparam);
-			down.refobject = new KeyInfo { Char = ch, Modifiers = modifiers };
-			MSG up = MakeMsg (target, alt ? Msg.WM_SYSKEYUP : Msg.WM_KEYUP, (IntPtr) vk, up_lparam);
-			up.refobject = new KeyInfo { Modifiers = modifiers };
-			Trace ("key 0x{0:X} '{1}' vk 0x{2:X} mods {3} -> {4:X}", ev.Code, ch == '\0' ? ' ' : ch, vk, modifiers, target.ToInt64 ());
+			// Адресата у сообщений пока нет: его назначит `KeyTarget` при выдаче.
+			MSG down = MakeMsg (IntPtr.Zero, alt ? Msg.WM_SYSKEYDOWN : Msg.WM_KEYDOWN, (IntPtr) vk, down_lparam);
+			down.refobject = new KeyInfo { Char = ch, Modifiers = modifiers, Top = top };
+			MSG up = MakeMsg (IntPtr.Zero, alt ? Msg.WM_SYSKEYUP : Msg.WM_KEYUP, (IntPtr) vk, up_lparam);
+			up.refobject = new KeyInfo { Modifiers = modifiers, Top = top };
+			Trace ("key 0x{0:X} '{1}' vk 0x{2:X} mods {3}", ev.Code, ch == '\0' ? ' ' : ch, vk, modifiers);
 			Post (queue, down);
 			Post (queue, up);
+		}
+
+		// Окно с фокусом в форме клавиши — на миг выдачи сообщения. Выбирать его
+		// при заборе события нельзя: занятая форма забирает события пачкой —
+		// щелчок по полю и набранные следом буквы разом, — и фокус переходит на
+		// поле, только когда разобрано уже поставленное в очередь нажатие.
+		// Буквы, адресованные раньше, доставались прежнему окну с фокусом:
+		// `mono-forms` на aarch64 терял первые одну-две буквы из «abc» (29.09).
+		// У X11 событие становится сообщением при разборе — так и здесь.
+		// `false` — сообщение не выдавать: форма выключена модальным окном.
+		bool KeyTarget (ref MSG msg)
+		{
+			KeyInfo info = msg.refobject as KeyInfo;
+			if (info == null || info.Top == null || msg.hwnd != IntPtr.Zero)
+				return true;
+			TopLevel top = info.Top;
+			if (!top.IsOpen)
+				return false;
+			IntPtr target = focus_window;
+			Hwnd focused = Hwnd.ObjectFromHandle (target);
+			if (focused == null || TopOf (focused) != top)
+				target = top.Hwnd.Handle;
+			if (Blocked (Hwnd.ObjectFromHandle (target)))
+				return false;
+			msg.hwnd = target;
+			return true;
 		}
 
 		// Код клавиши Win32 по событию стола: имя клавиши, управляющий символ или
@@ -2136,10 +2605,30 @@ namespace System.Windows.Forms {
 			y -= o.Y;
 		}
 
+		// Главное меню формы — прямо над клиентской областью: рамку и заголовок
+		// рисует стол, и полоса меню на поверхности начинается с её верха.
 		internal override Point GetMenuOrigin (IntPtr handle)
 		{
 			Hwnd hwnd = Hwnd.ObjectFromHandle (handle);
-			return hwnd != null ? hwnd.MenuOrigin : Point.Empty;
+			if (hwnd == null)
+				return Point.Empty;
+			if (hwnd.parent == null) {
+				Rectangle client = hwnd.ClientRect;
+				return new Point (client.X, client.Y - MenuBand (hwnd));
+			}
+			return hwnd.MenuOrigin;
+		}
+
+		// Точки меню считаются от начала полосы меню, а не от угла окна: пункты
+		// `MainMenu` хранят место от нуля, а при рисовании к нему прибавляется
+		// `GetMenuOrigin`. У X11 это одно и то же — меню там в углу окна; у нас
+		// полоса стоит под рамкой и заголовком, которые рисует стол.
+		Point MenuScreen (Hwnd hwnd)
+		{
+			Point o = ScreenOrigin (hwnd);
+			Rectangle client = hwnd.ClientRect;
+			Point menu = GetMenuOrigin (hwnd.Handle);
+			return new Point (o.X - client.X + menu.X, o.Y - client.Y + menu.Y);
 		}
 
 		internal override void MenuToScreen (IntPtr handle, ref int x, ref int y)
@@ -2147,10 +2636,9 @@ namespace System.Windows.Forms {
 			Hwnd hwnd = Hwnd.ObjectFromHandle (handle);
 			if (hwnd == null)
 				return;
-			Point o = ScreenOrigin (hwnd);
-			Rectangle client = hwnd.ClientRect;
-			x += o.X - client.X;
-			y += o.Y - client.Y;
+			Point m = MenuScreen (hwnd);
+			x += m.X;
+			y += m.Y;
 		}
 
 		internal override void ScreenToMenu (IntPtr handle, ref int x, ref int y)
@@ -2158,10 +2646,9 @@ namespace System.Windows.Forms {
 			Hwnd hwnd = Hwnd.ObjectFromHandle (handle);
 			if (hwnd == null)
 				return;
-			Point o = ScreenOrigin (hwnd);
-			Rectangle client = hwnd.ClientRect;
-			x -= o.X - client.X;
-			y -= o.Y - client.Y;
+			Point m = MenuScreen (hwnd);
+			x -= m.X;
+			y -= m.Y;
 		}
 
 		internal override void GetDisplaySize (out Size size)

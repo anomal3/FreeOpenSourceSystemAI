@@ -2003,6 +2003,11 @@ pub fn commit_window(slot: u32, area: Option<mini_ui::Rect>) -> Result<(), Windo
     crate::ui::commit_window(sched::current().as_u32(), slot, area).map_err(WindowError::Desktop)
 }
 
+/// Сказать столу, что умеет окно `slot` текущей программы (фаза 62b).
+pub fn style_window(slot: u32, flags: u32) -> Result<(), WindowError> {
+    crate::ui::style_window(sched::current().as_u32(), slot, flags).map_err(WindowError::Desktop)
+}
+
 /// Забрать событие окна `slot` текущей программы.
 pub fn window_event(slot: u32) -> Option<user_abi::WinEvent> {
     crate::ui::next_window_event(sched::current().as_u32(), slot)

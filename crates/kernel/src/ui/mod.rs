@@ -66,7 +66,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mini_ui::theme;
 use mini_ui::{Rect, Screen, Surface};
-use user_abi::{WIN_CLOSE, WIN_KEY, WIN_LEAVE, WIN_MOVE, WIN_POINTER, WinEvent};
+use user_abi::{WIN_CLOSE, WIN_KEY, WIN_LEAVE, WIN_MOVE, WIN_POINTER, WIN_RELEASE, WinEvent};
 
 use crate::input::keymap;
 use crate::input::{Buttons, KeyCode, KeyEvent, Modifiers, PointerEvent};
@@ -1203,6 +1203,29 @@ pub fn dispatch_pointer(event: PointerEvent) {
     }
 }
 
+/// Кнопку `button` (1 левая, 2 правая) отпустили в точке `x, y` экрана.
+///
+/// Отпускание достаётся окну, над которым кнопку **нажали** (фаза 62b), и точка
+/// тогда бывает за краем его поверхности. Когда отпущены все кнопки, захват
+/// кончается, и окну под указателем говорится, что оно теперь его, — а
+/// захватившему, если указатель ушёл, что ушёл: пока держали кнопку, ни того,
+/// ни другого оно не слышало.
+fn release_pointer(desktop: &mut Compositor, x: i32, y: i32, button: u32) {
+    let Some(app) = desktop.release_capture(button) else {
+        return;
+    };
+    if let Some((local_x, local_y)) = desktop.program_point(app, x, y) {
+        if let Some(window) = desktop.find(app) {
+            window.push_event(WinEvent { kind: WIN_RELEASE, code: button, x: local_x, y: local_y });
+        }
+    }
+    if desktop.captured().is_none() {
+        // Прежнее окно под указателем — то, что захватило: над ним нажимали.
+        desktop.set_hovered(Some(app));
+        hover(desktop, x, y, Buttons::NONE);
+    }
+}
+
 /// Сказать окну программы, что над его содержимым ходит указатель (фаза N7h).
 ///
 /// Окну под указателем, а не окну в фокусе: подсказка у кнопки неактивного окна
@@ -1210,6 +1233,25 @@ pub fn dispatch_pointer(event: PointerEvent) {
 /// принадлежит им, и программе не достаётся ничего — иначе подсказка всплывала
 /// бы под открытым меню запуска.
 fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons) {
+    let mut mask = 0;
+    if buttons.contains(Buttons::LEFT) {
+        mask |= 1;
+    }
+    if buttons.contains(Buttons::RIGHT) {
+        mask |= 2;
+    }
+    // Кнопку нажали над окном программы и держат: указатель принадлежит ему,
+    // где бы ни был (фаза 62b, `user_abi::WIN_RELEASE`). Окно под указателем
+    // в это время ничего не узнаёт — ни движения, ни ухода: так ведёт себя
+    // захват и у Windows, и у X11.
+    if let Some((app, _)) = desktop.captured() {
+        if let Some((local_x, local_y)) = desktop.program_point(app, x, y) {
+            if let Some(window) = desktop.find(app) {
+                window.push_move(WinEvent { kind: WIN_MOVE, code: mask, x: local_x, y: local_y });
+            }
+        }
+        return;
+    }
     let busy = desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open();
     let under = if busy { None } else { desktop.program_under(x, y) };
     let now = under.map(|(app, _, _)| app);
@@ -1220,13 +1262,6 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons) {
     }
     desktop.set_hovered(now);
     if let Some((app, local_x, local_y)) = under {
-        let mut mask = 0;
-        if buttons.contains(Buttons::LEFT) {
-            mask |= 1;
-        }
-        if buttons.contains(Buttons::RIGHT) {
-            mask |= 2;
-        }
         if let Some(window) = desktop.find(app) {
             window.push_move(WinEvent { kind: WIN_MOVE, code: mask, x: local_x, y: local_y });
         }
@@ -1308,6 +1343,8 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                             x: local.0,
                             y: local.1,
                         });
+                        let app = window.app;
+                        desktop.capture(app, 2);
                     }
                 }
                 desktop.refresh_panel(status);
@@ -1356,7 +1393,11 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
             }
         }
     }
+    if event.released(Buttons::RIGHT) {
+        release_pointer(desktop, x, y, 2);
+    }
     if event.released(Buttons::LEFT) {
+        release_pointer(desktop, x, y, 1);
         match desktop.keyboard_release() {
             keyboard::Release::Nothing | keyboard::Release::Language => {}
             keyboard::Release::Key(action) => type_on_screen(desktop, action),
@@ -1841,6 +1882,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 let mut answer = None;
                 let mut title_changed = false;
                 let mut mode = None;
+                let mut pressed = None;
                 let changed = match desktop.focused_mut() {
                     // Окно программы получает щелчок событием, а не
                     // перерисовкой: что нарисовать в ответ, решает она.
@@ -1861,6 +1903,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                             x: local.0,
                             y: local.1,
                         });
+                        pressed = Some(window.app);
                         false
                     }
                     Some(window) => {
@@ -1874,6 +1917,9 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                     }
                     None => false,
                 };
+                if let Some(pressed) = pressed {
+                    desktop.capture(pressed, 1);
+                }
                 if let (Some(answer), Some(app)) = (answer, app) {
                     answer_dialog(desktop, app, answer);
                     log_focus(desktop);
@@ -2668,6 +2714,25 @@ pub fn resize_window(task: u32, slot: u32, pixels: Surface) -> Result<(), Window
         log_window(desktop, app, focused);
         // Окно могло сжаться: открывшееся под ним место рисуется заново.
         desktop.repaint_all();
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Запомнить, что умеет окно программы (фаза 62b, `user_abi::SYS_WINSTYLE`).
+pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let focused = desktop.focused_app() == Some(app);
+        let Some(window) = desktop.find(app) else {
+            return Err(WindowError::NoWindow);
+        };
+        let resizable = flags & user_abi::WIN_STYLE_RESIZABLE != 0;
+        window.set_resizable(resizable, focused);
+        if resizable {
+            kprintln!("  desktop     : '{}' is resizable", name_of(desktop, app));
+        }
         desktop.present();
         Ok(())
     })

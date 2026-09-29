@@ -420,12 +420,14 @@ const LUA: [(&CStr16, &str); 1] =
 /// Образец сборки C# для Mono (фаза 60).
 ///
 /// Список обязан совпадать с `PAYLOAD_MONO` в `xtask/src/arch.rs`.
-const MONO: [(&CStr16, &str); 3] = [
+const MONO: [(&CStr16, &str); 4] = [
     (cstr16!("\\FREEOS\\MONO\\HELLO.EXE"), "usr/share/mono/hello.exe"),
     // Фаза 61b: System.Drawing — рисует и сверяет точки картинки.
     (cstr16!("\\FREEOS\\MONO\\DRAWING.EXE"), "usr/share/mono/drawing.exe"),
     // Фаза 62: WinForms — форма с кнопкой, полем и флажком.
     (cstr16!("\\FREEOS\\MONO\\FORMS.EXE"), "usr/share/mono/forms.exe"),
+    // Фаза 62b: всплывающие окна, перетаскивание, размер формы, главное меню.
+    (cstr16!("\\FREEOS\\MONO\\POPUPS.EXE"), "usr/share/mono/popups.exe"),
 ];
 
 /// Библиотеки классов Mono (фаза 60) — туда, где их ищет рантайм: mscorlib в

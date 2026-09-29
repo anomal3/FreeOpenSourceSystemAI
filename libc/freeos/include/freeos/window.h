@@ -39,6 +39,11 @@ extern "C" {
 #define FREEOS_WIN_CLOSE 3
 #define FREEOS_WIN_MOVE 4
 #define FREEOS_WIN_LEAVE 5
+#define FREEOS_WIN_RELEASE 6
+#define FREEOS_WIN_RESIZE 7
+
+/* Что окно умеет — `freeos_window_style`. */
+#define FREEOS_WIN_STYLE_RESIZABLE 1u
 
 /* Модификаторы в `x` события клавиши. */
 #define FREEOS_WIN_MOD_SHIFT 1
@@ -63,11 +68,20 @@ extern "C" {
  * - `FREEOS_WIN_KEY`: `code` — символ клавиши с учётом раскладки и
  *   модификаторов (или имя клавиши), `x` — маска модификаторов, `y` — буква
  *   клавиши в раскладке US без Shift (ноль — у клавиши её нет).
- * - `FREEOS_WIN_POINTER`: щелчок; `code` — 1 левой кнопкой, 2 правой; `x`,
- *   `y` — точка внутри поверхности. Отпускания кнопки договор не сообщает.
- * - `FREEOS_WIN_MOVE`: указатель над содержимым; `code` — маска кнопок.
+ * - `FREEOS_WIN_POINTER`: кнопку нажали; `code` — 1 левую, 2 правую; `x`,
+ *   `y` — точка от угла поверхности.
+ * - `FREEOS_WIN_RELEASE`: кнопку отпустили (фаза 62b); `code` — какую. Приходит
+ *   окну, над которым её нажали, и точка тогда бывает за краем поверхности.
+ * - `FREEOS_WIN_MOVE`: указатель сдвинулся; `code` — маска кнопок. Пока кнопка,
+ *   нажатая над окном, держится, движения идут ему, где бы ни был указатель.
  * - `FREEOS_WIN_LEAVE`: указатель ушёл с содержимого окна.
- * - `FREEOS_WIN_CLOSE`: окно просят закрыть; закрывает его программа. */
+ * - `FREEOS_WIN_RESIZE`: стол сменил окну размер (фаза 62b); `x`, `y` — новые
+ *   ширина и высота содержимого. Ответ — `freeos_window_resize`. Приходит только
+ *   окну, которому задан `FREEOS_WIN_STYLE_RESIZABLE`.
+ * - `FREEOS_WIN_CLOSE`: окно просят закрыть; закрывает его программа.
+ *
+ * Вид, которого программа не знает, она пропускает: новые виды договор
+ * добавляет. */
 struct freeos_win_event {
     uint32_t kind;
     uint32_t code;
@@ -89,6 +103,11 @@ int freeos_window_event(int64_t id, struct freeos_win_event *event);
 /* Сменить размер содержимого. Прежняя поверхность недействительна; ответ —
  * адрес новой, `NULL` — отказ (окно осталось прежним). */
 void *freeos_window_resize(int64_t id, uint32_t width, uint32_t height);
+
+/* Сказать столу, что окно умеет (фаза 62b): `FREEOS_WIN_STYLE_RESIZABLE` —
+ * размер меняет человек, и программа отвечает на `FREEOS_WIN_RESIZE`. Ноль
+ * снимает сказанное раньше. */
+int freeos_window_style(int64_t id, uint32_t flags);
 
 /* Закрыть окно. Поверхность после этого недействительна. */
 int freeos_window_close(int64_t id);

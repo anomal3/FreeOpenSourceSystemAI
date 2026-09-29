@@ -179,6 +179,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_WINCLOSE => winclose(a0 as i64),
         // Фаза N7d: форма выросла из кода.
         user_abi::SYS_WINRESIZE => winresize(a0 as i64, a1),
+        // Фаза 62b: окно говорит, что умеет, — размер у него меняет человек.
+        user_abi::SYS_WINSTYLE => winstyle(a0 as i64, a1),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -1838,6 +1840,24 @@ fn winresize(id: i64, size: usize) -> i64 {
     let (w, h) = ((size >> 32) as u32, (size & 0xffff_ffff) as u32);
     match super::resize_window(slot, w, h) {
         Ok(base) => base as i64,
+        Err(err) => window_errno(err),
+    }
+}
+
+/// `winstyle(id, флаги) -> 0` (фаза 62b).
+fn winstyle(id: i64, flags: usize) -> i64 {
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    // Незнакомый флаг — отказ целиком, а не выполненная знакомая часть:
+    // программа, попросившая больше, чем ядро умеет, должна узнать об этом
+    // сразу, а не по окну, которое ведёт себя не так, как она рассчитывала.
+    if flags & !(user_abi::WIN_STYLE_RESIZABLE as usize) != 0 {
+        return ERR_UNSUPPORTED;
+    }
+    match super::style_window(slot, flags as u32) {
+        Ok(()) => 0,
         Err(err) => window_errno(err),
     }
 }

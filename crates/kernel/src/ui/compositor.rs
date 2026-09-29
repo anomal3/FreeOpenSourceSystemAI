@@ -180,6 +180,13 @@ pub struct Compositor {
     /// Нужно одному: сказать окну, что указатель ушёл. Узнать это из текущего
     /// движения нельзя — оно достаётся уже другому окну или столу.
     hovered: Option<App>,
+    /// Окно программы, над содержимым которого нажали кнопку мыши, и какие
+    /// кнопки ещё держат (1 левая, 2 правая) — захват указателя (фаза 62b).
+    ///
+    /// Пока кнопка держится, движения и отпускание достаются этому окну, где бы
+    /// ни был указатель: иначе ползунок, который утащили за край окна, так и
+    /// остался бы нажатым, а выделение текста не узнало бы, где кончилось.
+    captured: Option<(App, u32)>,
     /// Масштаб глифа для новых окон.
     scale: u32,
     /// Буфер, в котором собирается кадр, — полоса во всю ширину экрана.
@@ -263,6 +270,7 @@ impl Compositor {
             moved: None,
             pending_size: None,
             hovered: None,
+            captured: None,
             scale,
             damage: [Rect::EMPTY; MAX_DAMAGE],
             damage_count: 0,
@@ -385,6 +393,42 @@ impl Compositor {
 
     pub fn set_hovered(&mut self, app: Option<App>) {
         self.hovered = app;
+    }
+
+    /// См. [`Self::captured`].
+    pub const fn captured(&self) -> Option<(App, u32)> {
+        self.captured
+    }
+
+    /// Кнопку `button` нажали над содержимым окна `app`: указатель теперь его.
+    pub fn capture(&mut self, app: App, button: u32) {
+        match self.captured {
+            Some((held, mask)) if held == app => self.captured = Some((app, mask | button)),
+            // Вторая кнопка над другим окном захват не переносит: первая всё
+            // ещё держится, и её отпускание обещано первому окну.
+            Some(_) => {}
+            None => self.captured = Some((app, button)),
+        }
+    }
+
+    /// Кнопку `button` отпустили. Ответ — окно, которому об этом сказать; захват
+    /// кончается, когда отпущены все кнопки.
+    pub fn release_capture(&mut self, button: u32) -> Option<App> {
+        let (app, mask) = self.captured?;
+        if mask & button == 0 {
+            return None;
+        }
+        let rest = mask & !button;
+        self.captured = if rest == 0 { None } else { Some((app, rest)) };
+        Some(app)
+    }
+
+    /// Точка экрана в координатах поверхности окна программы — в том числе за
+    /// её краем: захваченному окну нужна и такая.
+    #[must_use]
+    pub fn program_point(&self, app: App, x: i32, y: i32) -> Option<(i32, i32)> {
+        let rect = self.rect_of(app)?;
+        Some((x - rect.x, y - rect.y - Window::title_height(self.scale) as i32))
     }
 
     /// Где стоит окно программы.
@@ -898,6 +942,12 @@ impl Compositor {
         self.mark_layer(window.rect);
         if self.drag == Some(app) {
             self.drag = None;
+        }
+        // Окно закрыли, не отпустив кнопку: отпускание сказать уже некому, а
+        // захват, оставшийся за несуществующим окном, съел бы движения всех
+        // остальных до следующего нажатия.
+        if self.captured.is_some_and(|(held, _)| held == app) {
+            self.captured = None;
         }
         // Видимое окно уходит в свою плитку. Свёрнутое — нет: его на экране и
         // так не было.

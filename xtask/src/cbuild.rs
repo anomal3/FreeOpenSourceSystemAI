@@ -1036,6 +1036,7 @@ mod tests {
             "SYS_WINEVENT" => abi::SYS_WINEVENT as i64,
             "SYS_WINCLOSE" => abi::SYS_WINCLOSE as i64,
             "SYS_WINRESIZE" => abi::SYS_WINRESIZE as i64,
+            "SYS_WINSTYLE" => abi::SYS_WINSTYLE as i64,
 
             "MAP_LAZY" => abi::MAP_LAZY as i64,
             "MAP_JIT" => abi::MAP_JIT as i64,
