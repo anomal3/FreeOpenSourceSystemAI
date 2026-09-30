@@ -902,6 +902,43 @@ pub fn reset_timing() {
     }
 }
 
+/// Во что обходится кадр — строками, как их печатают телефонная `oem ui` и
+/// команда оболочки `ui`.
+///
+/// Одна функция на оба места, чтобы замер в QEMU и замер на телефоне по кабелю
+/// читались одинаково и сравнивались построчно. Время — среднее на кадр в
+/// микросекундах, сборка и вывод порознь (см. `Compositor::compose`), и рядом
+/// худший кадр: среднее прячет именно то, что человек называет лагом.
+#[must_use]
+pub fn timing_lines() -> [alloc::string::String; 5] {
+    let (frames, bands, draw_ns, blit_ns, points) = timing();
+    let n = frames.max(1);
+    let (full, part, overflows, rects) = damage_timing();
+    let (wall, icons, windows, shadow, top) = layer_timing();
+    [
+        alloc::format!("{frames} frames, {bands} bands, {} Mpx", points / 1_000_000),
+        alloc::format!(
+            "per frame: draw {} us, blit {} us, worst {} us",
+            draw_ns / n / 1000,
+            blit_ns / n / 1000,
+            worst_frame_ns() / 1000,
+        ),
+        alloc::format!(
+            "full {full}, partial {part} ({rects} rects, {} Kpx), overflow {overflows}",
+            rect_points() / 1000,
+        ),
+        alloc::format!("dock in {} bands, {} us/frame", dock_bands(), dock_ns() / n / 1000),
+        alloc::format!(
+            "wall {} icons {} win {} (shadow {}) top {} us",
+            wall / n / 1000,
+            icons / n / 1000,
+            windows / n / 1000,
+            shadow / n / 1000,
+            top / n / 1000,
+        ),
+    ]
+}
+
 /// Кадры, прямоугольники и число окон.
 #[must_use]
 pub fn stats() -> (u64, u64, usize) {
@@ -2253,8 +2290,12 @@ fn handle_menu(desktop: &mut Compositor, code: KeyCode, status: &Status) {
 fn run_choice(desktop: &mut Compositor, choice: panel::Choice) {
     match choice {
         panel::Choice::App(app) => launch(desktop, app),
-        panel::Choice::Program(name) => {
-            let path = alloc::format!("/bin/{name}");
+        panel::Choice::Program(name, args) => {
+            let path = if args.is_empty() {
+                alloc::format!("/bin/{name}")
+            } else {
+                alloc::format!("/bin/{name} {args}")
+            };
             match crate::user::spawn(&path, crate::user::session::credentials()) {
                 Ok(id) => kprintln!("  desktop     : started '{path}' as {id}"),
                 Err(err) => kprintln!("  desktop     : cannot start '{path}': {err}"),
@@ -2287,8 +2328,12 @@ fn launch(desktop: &mut Compositor, app: App) {
     if let Some(index) = desktop.index_of(app) {
         // Свёрнутое окно возвращается на экран, а не просто поднимается: иначе
         // кнопка в панели задач у свёрнутого окна не делала бы ничего видимого.
+        // Имя — как у строки о сворачивании (`name_of`): у окна программы
+        // `App::title` — общее «Program», и в журнале свернулось «Files», а
+        // вернулось «Program» (замечено глазами 30.09).
+        let name = name_of(desktop, app);
         if desktop.restore(app) {
-            kprintln!("  desktop     : restored '{}'", app.title());
+            kprintln!("  desktop     : restored '{name}'");
         }
         desktop.raise(index);
         log_focus(desktop);
@@ -2447,7 +2492,7 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         }
         context::Action::TaskManager => {
             desktop.close_context();
-            run_choice(desktop, panel::Choice::Program("taskmgr"));
+            run_choice(desktop, panel::Choice::Program("taskmgr", ""));
             desktop.refresh_panel(status);
         }
         context::Action::Refresh => {

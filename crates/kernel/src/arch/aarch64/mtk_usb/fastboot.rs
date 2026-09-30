@@ -262,40 +262,9 @@ impl Fastboot {
             // об этом сказано там же, где `getvar`, и я на этом уже обжёгся,
             // получив два пустых ответа подряд.
             self.line_count = 0;
-            let (frames, bands, draw_ns, blit_ns, points) = crate::ui::timing();
-            let n = frames.max(1);
-            let text =
-                alloc::format!("{frames} frames, {bands} bands, {} Mpx", points / 1_000_000);
-            self.say(text.as_bytes());
-            let text = alloc::format!(
-                "per frame: draw {} us, blit {} us, worst {} us",
-                draw_ns / n / 1000,
-                blit_ns / n / 1000,
-                crate::ui::worst_frame_ns() / 1000,
-            );
-            self.say(text.as_bytes());
-            let (full, part, overflows, rects) = crate::ui::damage_timing();
-            let text = alloc::format!(
-                "full {full}, partial {part} ({rects} rects, {} Kpx), overflow {overflows}",
-                crate::ui::rect_points() / 1000,
-            );
-            self.say(text.as_bytes());
-            let (wall, icons, windows, shadow, top) = crate::ui::layer_timing();
-            let text = alloc::format!(
-                "dock in {} bands, {} us/frame",
-                crate::ui::dock_bands(),
-                crate::ui::dock_ns() / n / 1000,
-            );
-            self.say(text.as_bytes());
-            let text = alloc::format!(
-                "wall {} icons {} win {} (shadow {}) top {} us",
-                wall / n / 1000,
-                icons / n / 1000,
-                windows / n / 1000,
-                shadow / n / 1000,
-                top / n / 1000,
-            );
-            self.say(text.as_bytes());
+            for text in crate::ui::timing_lines() {
+                self.say(text.as_bytes());
+            }
             self.state = State::Lines { at: 0 };
             self.continue_lines(0);
         } else if text == "oem log" || text == "oem klog" {

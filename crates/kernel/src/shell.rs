@@ -738,7 +738,7 @@ fn run_command(line: &str) -> bool {
                 sprintln!("  {line}");
             }
         }
-        "ui" => ui_status(),
+        "ui" => ui_status(argument),
         "tasks" => tasks(),
         "irq" => interrupt_wakes(argument),
         "clear" => {
@@ -1375,7 +1375,7 @@ fn help() {
     sprintln!("  lastpanic [n] the last n lines of the log of a boot that panicked");
     sprintln!("  panic now     stop this machine with a kernel panic (to test the snapshot)");
     sprintln!("  pci           every device on the bus, with its identifiers");
-    sprintln!("  ui            compositor state");
+    sprintln!("  ui [reset]    compositor state and frame timing; reset zeroes it");
     sprintln!("  tasks         scheduler state");
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
     sprintln!("  stat <path>   size, mode, owner and modification time");
@@ -1538,9 +1538,20 @@ fn usb_status() {
     }
 }
 
-fn ui_status() {
+/// Состояние стола, а с ним — во что обходится кадр.
+///
+/// Время кадра — те же строки, что телефон отдаёт по кабелю (`oem ui`): замер
+/// в QEMU и замер на телефоне читаются одинаково. `ui reset` обнуляет счётчики
+/// перед жестом — они накопительные, и без сброса жест делился бы на кадры
+/// загрузки.
+fn ui_status(argument: &str) {
     if !ui::is_active() {
         sprintln!("  ui       no framebuffer; the shell runs on the serial console");
+        return;
+    }
+    if argument.trim() == "reset" {
+        ui::reset_timing();
+        sprintln!("  ui       frame counters reset");
         return;
     }
     let (composed, rects, windows) = ui::stats();
@@ -1553,6 +1564,9 @@ fn ui_status() {
             "  pointer  {x},{y} {}, {moves} reports, {merged} merged",
             if visible { "visible" } else { "hidden" }
         );
+    }
+    for line in ui::timing_lines() {
+        sprintln!("  frame    {line}");
     }
 }
 

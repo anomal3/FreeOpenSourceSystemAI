@@ -1092,8 +1092,8 @@ fn panel_layout(m: Metrics, plate: Rect, windows: &[Entry], status_w: u32) -> Pa
 pub enum Choice {
     /// Окно, которое умеет открыть сам стол.
     App(App),
-    /// Программа с собственным окном — её имя в `/bin`.
-    Program(&'static str),
+    /// Программа с собственным окном — её имя в `/bin` и хвост команды.
+    Program(&'static str, &'static str),
     /// Программа, поставленная пакетом (фаза N8), — командная строка из
     /// `start=` её манифеста.
     /// Права, которые манифест просит, едут вместе со строкой, а не
@@ -1180,14 +1180,19 @@ fn list_packages() -> Vec<Launcher> {
 /// окнах, а не программа для человека.
 struct Program {
     file: &'static str,
+    /// Хвост команды — файл, который программа исполняет: у примеров WinForms
+    /// это сборка (`/bin/mono /usr/share/mono/forms.exe`). У обычной программы
+    /// из `/bin` пусто.
+    args: &'static str,
     caption: &'static str,
     about: &'static str,
     icon: Icon,
 }
 
-static PROGRAMS: [Program; 3] = [
+static PROGRAMS: [Program; 6] = [
     Program {
         file: "files",
+        args: "",
         caption: "Файлы",
         about: "папки и файлы на дисках",
         icon: Icon::Folder,
@@ -1197,6 +1202,7 @@ static PROGRAMS: [Program; 3] = [
     // можно снять.
     Program {
         file: "taskmgr",
+        args: "",
         caption: "Диспетчер задач",
         about: "процессы, память и службы",
         icon: Icon::Chart,
@@ -1204,9 +1210,34 @@ static PROGRAMS: [Program; 3] = [
     // Диспетчер устройств (фаза С7): что стоит в машине и чем обслуживается.
     Program {
         file: "devmgr",
+        args: "",
         caption: "Диспетчер устройств",
         about: "устройства и их драйверы",
         icon: Icon::Devices,
+    },
+    // Примеры WinForms — со стола, а не только набором в терминале: формы под
+    // Mono (фазы 62a–62b) и витрина своей среды .NET (та же, что плиткой
+    // «Примеры» на телефоне). Строк нет, если нет файла примера.
+    Program {
+        file: "mono",
+        args: "/usr/share/mono/forms.exe",
+        caption: "Форма WinForms",
+        about: "пример Mono: кнопка, поле, флажок",
+        icon: Icon::Grid,
+    },
+    Program {
+        file: "mono",
+        args: "/usr/share/mono/popups.exe",
+        caption: "Меню и списки",
+        about: "пример Mono: всплывающие окна, вопрос",
+        icon: Icon::Grid,
+    },
+    Program {
+        file: "dotnet",
+        args: "/usr/share/dotnet/samples/gallery.dll",
+        caption: "Примеры .NET",
+        about: "формы WinForms своей среды",
+        icon: Icon::Grid,
     },
 ];
 
@@ -1262,7 +1293,7 @@ impl Item {
     fn choice(self, packages: &[Launcher]) -> Option<Choice> {
         Some(match self {
             Item::App(app) => Choice::App(app),
-            Item::Program(program) => Choice::Program(program.file),
+            Item::Program(program) => Choice::Program(program.file, program.args),
             Item::Package(index) => {
                 let package = packages.get(index)?;
                 Choice::Command(package.start.clone(), package.rights)
@@ -1317,7 +1348,9 @@ impl Menu {
         // Программа попадает в меню, только если она действительно лежит в
         // `/bin`: строка, которая ничего не запускает, хуже отсутствующей.
         for program in &PROGRAMS {
-            if names.iter().any(|name| name == program.file) {
+            let present = program.args.is_empty()
+                || matches!(crate::fs::read(program.args, 0), Some(Ok(_)));
+            if present && names.iter().any(|name| name == program.file) {
                 items.push(Item::Program(program));
             }
         }
