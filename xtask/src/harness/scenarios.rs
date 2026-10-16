@@ -8729,7 +8729,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "mono-popups",
-        about: "WinForms Mono, фазы 62b–62c: выпадающий список, контекстное меню, подсказка и главное меню — всплывающие окна внутри формы, и щелчок по другому окну их закрывает; выделение текста мышью с отпусканием за краем формы; клавиша — нажатием и отпусканием; форма меняет размер вслед за столом; MessageBox — отдельным окном; заголовок меняется на ходу.",
+        about: "WinForms Mono, фазы 62b–62e: выпадающий список, контекстное меню, подсказка и главное меню — всплывающие окна стола, выходящие за край формы, и щелчок по другому окну их закрывает; выделение текста мышью с отпусканием за краем формы; клавиша — нажатием и отпусканием; форма меняет размер вслед за столом; MessageBox — отдельным окном; заголовок меняется на ходу.",
         target: Target::Installed,
         usb_only: false,
         tablet: false,
@@ -8785,15 +8785,18 @@ pub const ALL: &[Scenario] = &[
             Step::Move(300, 0),
             Step::Release,
             Step::Await("popups: selected 24", 60_000),
-            // Контекстное меню — правой кнопкой по пустому месту; «Copy» —
-            // первый пункт, сразу под точкой щелчка.
-            Step::Aim(Aim::Program("Mono Popups", 300, 80)),
+            // Контекстное меню — правой кнопкой по пустому месту у правого края
+            // формы; «Copy» — первый пункт, сразу под точкой щелчка. С фазы 62e
+            // меню — своё окно стола и за край формы выходит: «Copy» берётся
+            // правее формы (её ширина — 400), и щелчок туда доходит до меню.
+            Step::Aim(Aim::Program("Mono Popups", 360, 80)),
             Step::RightClick,
             Step::Await("popups: context opened", 60_000),
+            Step::AwaitAny("desktop     : popup ", 60_000),
             Step::Await("popups: context painted", 60_000),
             Step::Wait(1_000),
             Step::Shot("context"),
-            Step::Aim(Aim::Program("Mono Popups", 330, 92)),
+            Step::Aim(Aim::Program("Mono Popups", 410, 92)),
             Step::Click,
             Step::Await("popups: context Copy", 60_000),
             // Подсказка у кнопки 298,198 размером 90x30.
@@ -9387,7 +9390,8 @@ pub const ALL: &[Scenario] = &[
             // 65546 — `0x0001_000A`: `WIN_FOCUS`, `WIN_KEYUP` и `SYS_WINTITLE`
             // (фаза 62c).
             // 65547 — `0x0001_000B`: `SYS_WINOWNER` (фаза 62d).
-            Step::Await("posix: abi version 65547", 60_000),
+            // 65548 — `0x0001_000C`: `SYS_WINPOPUP`, `SYS_WINPLACE` (фаза 62e).
+            Step::Await("posix: abi version 65548", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».

@@ -69,6 +69,8 @@
 #define SYS_WINSTYLE 74
 #define SYS_WINTITLE 75
 #define SYS_WINOWNER 76
+#define SYS_WINPOPUP 77
+#define SYS_WINPLACE 78
 
 /* ── Значения, которые эти вызовы принимают и возвращают ──────────────────── */
 

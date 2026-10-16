@@ -1915,7 +1915,15 @@ pub enum WindowError {
 ///
 /// Гонки между заходами нет, и это не везение: между ними программа стоит
 /// внутри этого самого вызова, а её области трогает только она.
-pub fn open_window(title: &str, width: u32, height: u32) -> Result<(usize, u32), WindowError> {
+///
+/// `popup` — всплывающее окно (фаза 62e): над окном программы с этим номером,
+/// в этой точке от угла его содержимого.
+pub fn open_window(
+    title: &str,
+    width: u32,
+    height: u32,
+    popup: Option<(u32, (i32, i32))>,
+) -> Result<(usize, u32), WindowError> {
     let pages = surface_pages(width, height)?;
 
     let (slot, base, phys) = with_current(|program| {
@@ -1934,7 +1942,10 @@ pub fn open_window(title: &str, width: u32, height: u32) -> Result<(usize, u32),
     };
     let task = sched::current().as_u32();
     let opened = match surface {
-        Some(surface) => crate::ui::open_window(task, slot, title, surface),
+        Some(surface) => match popup {
+            Some((owner, anchor)) => crate::ui::open_popup(task, slot, title, surface, owner, anchor),
+            None => crate::ui::open_window(task, slot, title, surface),
+        },
         None => Err(crate::ui::WindowError::NoMemory),
     };
     if let Err(err) = opened {
@@ -2006,6 +2017,11 @@ pub fn commit_window(slot: u32, area: Option<mini_ui::Rect>) -> Result<(), Windo
 /// Сказать столу, что умеет окно `slot` текущей программы (фаза 62b).
 pub fn style_window(slot: u32, flags: u32) -> Result<(), WindowError> {
     crate::ui::style_window(sched::current().as_u32(), slot, flags).map_err(WindowError::Desktop)
+}
+
+/// Переставить всплывающее окно `slot` текущей программы (фаза 62e).
+pub fn place_window(slot: u32, anchor: (i32, i32)) -> Result<(), WindowError> {
+    crate::ui::place_window(sched::current().as_u32(), slot, anchor).map_err(WindowError::Desktop)
 }
 
 /// Сменить имя окна `slot` текущей программы (фаза 62c).

@@ -1039,6 +1039,8 @@ mod tests {
             "SYS_WINSTYLE" => abi::SYS_WINSTYLE as i64,
             "SYS_WINTITLE" => abi::SYS_WINTITLE as i64,
             "SYS_WINOWNER" => abi::SYS_WINOWNER as i64,
+            "SYS_WINPOPUP" => abi::SYS_WINPOPUP as i64,
+            "SYS_WINPLACE" => abi::SYS_WINPLACE as i64,
 
             "MAP_LAZY" => abi::MAP_LAZY as i64,
             "MAP_JIT" => abi::MAP_JIT as i64,

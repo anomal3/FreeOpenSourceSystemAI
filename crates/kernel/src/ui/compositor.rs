@@ -365,6 +365,79 @@ impl Compositor {
         self.start_zoom(app, rect, true);
     }
 
+    /// Добавить всплывающее окно программы над её окном `owner` (фаза 62e).
+    ///
+    /// Фокус не трогается: меню, открывшись, забрало бы ввод у формы, и стол
+    /// сказал бы ей «ты больше не активна» — то есть закрыть это самое меню.
+    /// Роста из плитки тоже нет: подсказка, вырастающая полсекунды, — это
+    /// подсказка, которой не дождались.
+    pub fn push_popup(&mut self, mut window: Window, owner: App) {
+        window.owner = Some(owner);
+        let rect = window.rect;
+        self.windows.push(window);
+        self.mark_layer(rect);
+    }
+
+    /// Всплывающее ли это окно.
+    #[must_use]
+    pub fn is_popup(&self, app: App) -> bool {
+        self.windows.iter().any(|window| window.app == app && window.popup)
+    }
+
+    /// Где всплывающему окну стоять: от угла содержимого владельца, в пределах
+    /// экрана. `None` — владельца нет.
+    #[must_use]
+    pub fn popup_rect(&self, owner: App, anchor: (i32, i32), w: u32, h: u32) -> Option<Rect> {
+        let owner = self.windows.iter().find(|window| window.app == owner)?;
+        let x = owner.rect.x.saturating_add(anchor.0);
+        let y = (owner.rect.y + owner.bar() as i32).saturating_add(anchor.1);
+        // В пределах экрана, а не формы: ради этого всплывающие окна и стали
+        // окнами стола. Не влезающее сдвигается внутрь экрана.
+        let max_x = (self.screen.width() as i32 - w as i32).max(0);
+        let max_y = (self.screen.height() as i32 - h as i32).max(0);
+        Some(Rect::new(x.clamp(0, max_x), y.clamp(0, max_y), w, h))
+    }
+
+    /// Переставить всплывающее окно: новое место от угла владельца (фаза 62e,
+    /// `user_abi::SYS_WINPLACE`). `false` — это не всплывающее окно.
+    pub fn place_popup(&mut self, app: App, anchor: (i32, i32)) -> bool {
+        let Some(window) = self.windows.iter_mut().find(|window| window.app == app && window.popup) else {
+            return false;
+        };
+        window.anchor = anchor;
+        let owner = window.owner;
+        if let Some(owner) = owner {
+            self.follow_owner(owner);
+        }
+        true
+    }
+
+    /// Всплывающие окна владельца встают на свои места от его угла — после
+    /// того, как владельца сдвинули, развернули или сменили ему размер.
+    fn follow_owner(&mut self, owner: App) {
+        let popups: Vec<(App, (i32, i32), u32, u32)> = self
+            .windows
+            .iter()
+            .filter(|window| window.popup && window.owner == Some(owner))
+            .map(|window| (window.app, window.anchor, window.rect.w, window.rect.h))
+            .collect();
+        for (app, anchor, w, h) in popups {
+            let Some(rect) = self.popup_rect(owner, anchor, w, h) else {
+                continue;
+            };
+            let Some(window) = self.find(app) else {
+                continue;
+            };
+            let before = window.rect;
+            if before == rect {
+                continue;
+            }
+            window.rect = rect;
+            self.mark_layer(before);
+            self.mark_layer(rect);
+        }
+    }
+
     /// Начать рост окна из плитки (`open`) или уход в неё.
     fn start_zoom(&mut self, app: App, rect: Rect, open: bool) -> bool {
         self.finish_flight();
@@ -402,7 +475,7 @@ impl Compositor {
         if hit != Hit::Body || !window.is_program() {
             return None;
         }
-        let top = window.rect.y + Window::title_height(self.scale) as i32;
+        let top = window.rect.y + window.bar() as i32;
         Some((window.app, x - window.rect.x, y - top))
     }
 
@@ -476,8 +549,8 @@ impl Compositor {
     /// её краем: захваченному окну нужна и такая.
     #[must_use]
     pub fn program_point(&self, app: App, x: i32, y: i32) -> Option<(i32, i32)> {
-        let rect = self.rect_of(app)?;
-        Some((x - rect.x, y - rect.y - Window::title_height(self.scale) as i32))
+        let window = self.windows.iter().find(|window| window.app == app)?;
+        Some((x - window.rect.x, y - window.rect.y - window.bar() as i32))
     }
 
     /// Где стоит окно программы.
@@ -543,6 +616,8 @@ impl Compositor {
         self.windows
             .iter()
             .enumerate()
+            // Всплывающему окну кнопка не положена: меню — часть формы.
+            .filter(|(_, window)| !window.popup)
             .map(|(index, window)| super::panel::Entry {
                 app: window.app,
                 caption: window.caption().into(),
@@ -555,6 +630,19 @@ impl Compositor {
     /// Поднять окно с номером `index` наверх и сделать активным.
     pub fn raise(&mut self, index: usize) {
         if index >= self.windows.len() {
+            return;
+        }
+        // Всплывающее окно поднимается, но фокус остаётся, где был (фаза 62e):
+        // щелчок по пункту меню — это щелчок формы, а не уход от неё.
+        if self.windows[index].popup {
+            let focused = self.windows.get(self.focus).map(|window| window.app);
+            let window = self.windows.remove(index);
+            let rect = window.rect;
+            self.windows.push(window);
+            if let Some(index) = focused.and_then(|app| self.index_of(app)) {
+                self.focus = index;
+            }
+            self.mark_layer(rect);
             return;
         }
         // Кто теряет фокус — запоминается до перестановки: индексы после неё
@@ -959,6 +1047,7 @@ impl Compositor {
         }
         let after = window.rect;
         self.note_moved(app, before, after);
+        self.follow_owner(app);
     }
 
     /// Свернуть окно: убрать с экрана, оставив в панели задач.
@@ -1055,6 +1144,7 @@ impl Compositor {
         let after = window.rect;
         self.mark_layer(before);
         self.mark_layer(after);
+        self.follow_owner(app);
         // Окно перетекает в новый размер. Поверхность уже нового размера и
         // готова: `Window::resize` перерисовал её.
         self.finish_flight();
@@ -1072,6 +1162,12 @@ impl Compositor {
         };
         let window = self.windows.remove(index);
         self.invalidate_recent();
+        // Окно ниже активного уехало из списка — номер активного съехал на одно.
+        // Раньше закрывали почти всегда верхнее, активное, окно; всплывающие
+        // (фаза 62e) закрываются и тогда, когда активна форма под ними.
+        if index < self.focus {
+            self.focus -= 1;
+        }
         // Подчинённые закрытого окна остаются без владельца, а не с номером
         // окна, которого нет: следующее окно с тем же номером их бы «усыновило».
         for other in self.windows.iter_mut().filter(|other| other.owner == Some(app)) {
@@ -1772,6 +1868,7 @@ impl Compositor {
         }
         let after = window.rect;
         self.note_moved(app, before, after);
+        self.follow_owner(app);
     }
 
     /// Запомнить переезд окна до сборки кадра.
@@ -2382,9 +2479,12 @@ impl Compositor {
         let mut shadow_ns = 0u64;
         for window in self.windows.iter().filter(|window| !window.minimized && !self.hidden_by_flight(window)) {
             let t0 = crate::time::uptime_ns();
-            self.drop_shadow(back, window.rect, band, dy, radius);
+            // Углы всплывающего окна не скругляются: меню рисует свою рамку
+            // прямоугольником, и срезанный угол вырезал бы её.
+            let r = if window.popup { 0 } else { radius };
+            self.drop_shadow(back, window.rect, band, dy, r);
             shadow_ns += crate::time::uptime_ns().wrapping_sub(t0);
-            self.stack(back, window.surface(), window.rect, band, dy, radius);
+            self.stack(back, window.surface(), window.rect, band, dy, r);
         }
         let t_windows = crate::time::uptime_ns();
         // Клавиатура — над окнами и вместо дока: в макете окно с клавиатурой

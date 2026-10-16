@@ -185,6 +185,9 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_WINTITLE => wintitle(a0 as i64, a1, a2),
         // Фаза 62d: у окна есть владелец.
         user_abi::SYS_WINOWNER => winowner(a0 as i64, a1 as i64, a2),
+        // Фаза 62e: всплывающие окна — меню, списки и подсказки за краем формы.
+        user_abi::SYS_WINPOPUP => winpopup(a0, a1 as i64, a2),
+        user_abi::SYS_WINPLACE => winplace(a0 as i64, a1),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -1498,6 +1501,40 @@ fn window_errno(err: super::WindowError) -> i64 {
 /// запись, а не на чтение: страница, доступная только на чтение, сделала бы
 /// ответ невозможным уже после того, как окно заведено.
 fn winopen(ptr: usize) -> i64 {
+    open_spec(ptr, None)
+}
+
+/// `winpopup(ptr на WindowSpec, owner, (x << 32) | y) -> 0` (фаза 62e).
+/// Заявка та же, что у [`winopen`]; точка — от угла содержимого владельца и со
+/// знаком: меню, раскрытое вверх, стоит выше формы.
+fn winpopup(ptr: usize, owner: i64, point: usize) -> i64 {
+    let owner = match own_window(owner) {
+        Ok(owner) => owner,
+        Err(err) => return err,
+    };
+    open_spec(ptr, Some((owner, signed_point(point))))
+}
+
+/// `winplace(id, (x << 32) | y) -> 0` (фаза 62e).
+fn winplace(id: i64, point: usize) -> i64 {
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    match super::place_window(slot, signed_point(point)) {
+        Ok(()) => 0,
+        Err(err) => window_errno(err),
+    }
+}
+
+/// Две координаты со знаком, упакованные по 32 бита: `(x << 32) | y`.
+fn signed_point(point: usize) -> (i32, i32) {
+    let point = point as u64;
+    ((point >> 32) as u32 as i32, point as u32 as i32)
+}
+
+/// Окно по заявке программы: обычное или всплывающее (`popup`).
+fn open_spec(ptr: usize, popup: Option<(u32, (i32, i32))>) -> i64 {
     // Своё окно — второе проверяемое право. Пакет, не попросивший `windows`,
     // окна не получает: окно на общем столе — это и клавиатура, и мышь, и
     // место, которое у кого-то отнимается.
@@ -1531,7 +1568,7 @@ fn winopen(ptr: usize) -> i64 {
         return ERR_BAD_ADDRESS;
     };
 
-    match super::open_window(title, spec.width, spec.height) {
+    match super::open_window(title, spec.width, spec.height, popup) {
         Ok((surface, slot)) => {
             spec.surface = surface as u64;
             spec.id = user_abi::window_id(sched::current().as_u32(), slot);

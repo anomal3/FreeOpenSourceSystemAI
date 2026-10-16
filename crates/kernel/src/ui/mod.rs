@@ -1389,16 +1389,14 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 let app = desktop.app_at(index);
                 desktop.raise(index);
                 log_focus(desktop);
-                let scale = desktop.scale();
                 // Фокус ушёл модальному подчинённому (фаза 62d) — щелчок по
                 // владельцу дальше не идёт: он только вернул человека к вопросу.
-                let redirected = desktop.focused_app() != app;
-                if let Some(window) = desktop.focused_mut().filter(|_| !redirected) {
+                let popup = app.is_some_and(|app| desktop.is_popup(app));
+                let redirected = desktop.focused_app() != app && !popup;
+                let target = app.and_then(|app| desktop.find(app));
+                if let Some(window) = target.filter(|_| !redirected) {
                     if window.is_program() {
-                        let local = (
-                            x - window.rect.x,
-                            y - window.rect.y - Window::title_height(scale) as i32,
-                        );
+                        let local = (x - window.rect.x, y - window.rect.y - window.bar() as i32);
                         window.push_event(WinEvent {
                             kind: WIN_POINTER,
                             code: 2,
@@ -1891,7 +1889,8 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
         // ждёт ответа, и щелчок по ней только возвращает к вопросу. Дальше —
         // ни щелчка содержимому (оно досталось бы вопросу, в чужих
         // координатах), ни перетаскивания, ни уголка.
-        if desktop.focused_app() != app && matches!(hit, Hit::Body | Hit::Title | Hit::Resize) {
+        let popup = app.is_some_and(|app| desktop.is_popup(app));
+        if desktop.focused_app() != app && !popup && matches!(hit, Hit::Body | Hit::Title | Hit::Resize) {
             desktop.present();
             return;
         }
@@ -1946,14 +1945,16 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
             // Щелчок по содержимому: его разбирает само содержимое — в
             // «Параметрах» им выбирают раздел и нажимают пункты.
             Hit::Body => {
-                let scale = desktop.scale();
                 // Ответ диалога забирается здесь, а действует ниже: окно сейчас
                 // заимствовано у стола, и закрыть его изнутри `match` нечем.
                 let mut answer = None;
                 let mut title_changed = false;
                 let mut mode = None;
                 let mut pressed = None;
-                let changed = match desktop.focused_mut() {
+                // Окно, в которое попали, а не активное: у обычного окна после
+                // поднятия это одно и то же, а всплывающее (фаза 62e) фокуса не
+                // берёт, и щелчок по меню иначе достался бы форме под ним.
+                let changed = match app.and_then(|app| desktop.find(app)) {
                     // Окно программы получает щелчок событием, а не
                     // перерисовкой: что нарисовать в ответ, решает она.
                     Some(window) if window.is_program() => {
@@ -1961,10 +1962,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                         // двигают по столу, и программа, считающая в экранных,
                         // промахивалась бы мимо собственных кнопок всякий раз,
                         // когда окно сдвинули.
-                        let local = (
-                            x - window.rect.x,
-                            y - window.rect.y - Window::title_height(scale) as i32,
-                        );
+                        let local = (x - window.rect.x, y - window.rect.y - window.bar() as i32);
                         // Единица — левая кнопка; правая приходит двойкой из
                         // разбора правой кнопки ниже.
                         window.push_event(WinEvent {
@@ -2766,6 +2764,53 @@ pub fn open_window(task: u32, slot: u32, title: &str, pixels: Surface) -> Result
         );
         log_window(desktop, app, true);
         desktop.refresh_panel(&status_now());
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Открыть всплывающее окно программы над её окном `owner` (фаза 62e,
+/// `user_abi::SYS_WINPOPUP`): `anchor` — от угла содержимого владельца.
+pub fn open_popup(
+    task: u32,
+    slot: u32,
+    title: &str,
+    pixels: Surface,
+    owner: u32,
+    anchor: (i32, i32),
+) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    let owner = App::Program(task, owner);
+    let (w, h) = (pixels.width(), pixels.height());
+    with_desktop(|desktop| {
+        if desktop.index_of(app).is_some() {
+            return Err(WindowError::Exists);
+        }
+        let rect = desktop.popup_rect(owner, anchor, w, h).ok_or(WindowError::NoWindow)?;
+        let mut window = Window::popup_program(app, rect, desktop.scale(), title, pixels)
+            .ok_or(WindowError::NoMemory)?;
+        window.anchor = anchor;
+        desktop.push_popup(window, owner);
+        kprintln!(
+            "  desktop     : popup '{title}' for {} over '{}'",
+            crate::sched::TaskId::new(task),
+            name_of(desktop, owner)
+        );
+        log_window(desktop, app, false);
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Переставить всплывающее окно программы (фаза 62e, `user_abi::SYS_WINPLACE`).
+pub fn place_window(task: u32, slot: u32, anchor: (i32, i32)) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        if !desktop.place_popup(app, anchor) {
+            return Err(WindowError::NoWindow);
+        }
         desktop.present();
         Ok(())
     })

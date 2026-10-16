@@ -307,6 +307,13 @@ pub struct Window {
     pub owner: Option<App>,
     /// Владелец ждёт ответа этого окна: при его поднятии фокус уходит сюда.
     pub modal: bool,
+    /// Всплывающее окно программы (фаза 62e, `user_abi::SYS_WINPOPUP`): меню,
+    /// выпадающий список, подсказка. Ни заголовка, ни рамки, ни кнопки на
+    /// панели задач, и фокус оно не берёт — ввод остаётся у владельца.
+    pub popup: bool,
+    /// Где оно стоит — от угла содержимого владельца: стол двигает его вместе
+    /// с владельцем.
+    pub anchor: (i32, i32),
     /// Что изменилось в поверхности с прошлой сборки, в координатах поверхности.
     pub damage: Rect,
 }
@@ -337,7 +344,7 @@ impl Window {
         let back = theme::window_bg();
         let surface = Surface::new(rect.w, rect.h, back)?;
         let grid = TextGrid::new(
-            content_area(&surface, scale).shrink(ctx.px(4)),
+            content_area(&surface, Window::title_height(scale)).shrink(ctx.px(4)),
             ctx.face(Role::Mono),
             ctx.palette.ink2,
             back,
@@ -396,6 +403,29 @@ impl Window {
         Some(window)
     }
 
+    /// Создать всплывающее окно программы (фаза 62e): то же, что
+    /// [`Self::program`], но без полосы заголовка — окно ровно с поверхность.
+    #[must_use]
+    pub fn popup_program(app: App, rect: Rect, scale: u32, title: &str, pixels: Surface) -> Option<Self> {
+        let surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
+        let content = Content::Program(ProgramView {
+            pixels,
+            resizable: false,
+            asked: None,
+            events: VecDeque::new(),
+        });
+        let mut window = Self::wrap(app, rect, surface, content, scale, own(title)?);
+        window.popup = true;
+        window.redraw_content();
+        Some(window)
+    }
+
+    /// Высота полосы заголовка **этого** окна: у всплывающего её нет.
+    #[must_use]
+    pub fn bar(&self) -> u32 {
+        if self.popup { 0 } else { Self::title_height(self.scale) }
+    }
+
     fn wrap(
         app: App,
         rect: Rect,
@@ -416,6 +446,8 @@ impl Window {
             restore: None,
             owner: None,
             modal: false,
+            popup: false,
+            anchor: (0, 0),
             damage: Rect::EMPTY,
         }
     }
@@ -458,7 +490,7 @@ impl Window {
         let (w, h) = if stale {
             (self.rect.w, self.rect.h)
         } else {
-            (answer.0, answer.1 + Self::title_height(self.scale))
+            (answer.0, answer.1 + self.bar())
         };
         let Some(surface) = Surface::new(w, h, theme::window_bg()) else {
             return false;
@@ -540,7 +572,7 @@ impl Window {
     /// окна — ровно на разницу высот заголовка. Окна ядра пересобираются как
     /// при изменении размера: их содержимое рисует себя от области заново.
     pub fn retitle(&mut self) -> bool {
-        let title = Self::title_height(self.scale);
+        let title = self.bar();
         if let Content::Program(view) = &self.content {
             let h = view.pixels.height() + title;
             let w = self.rect.w;
@@ -621,6 +653,11 @@ impl Window {
         if !self.rect.contains(x, y) {
             return None;
         }
+        // У всплывающего окна нет ни заголовка, ни кнопок, ни уголка: всё
+        // окно — содержимое.
+        if self.popup {
+            return Some(Hit::Body);
+        }
         let local = (x - self.rect.x, y - self.rect.y);
         if self.close_button().contains(local.0, local.1) {
             return Some(Hit::Close);
@@ -678,6 +715,11 @@ impl Window {
     /// заголовок и содержимое отличаются на две единицы яркости, и граница
     /// между ними не читается вовсе.
     pub fn draw_decorations(&mut self, focused: bool) {
+        // Заголовка и обводки у всплывающего окна нет: меню и список рисуют
+        // свою рамку сами.
+        if self.popup {
+            return;
+        }
         let ctx = self.ctx();
         let p = ctx.palette;
         let scale = self.scale;
@@ -811,13 +853,14 @@ impl Window {
     pub fn restyle(&mut self) {
         let ctx = self.ctx();
         let back = theme::window_bg();
+        let bar = self.bar();
         match &mut self.content {
             Content::Text(grid) => {
                 // Заливается вся область содержимого, а не только сетка: в
                 // высоту окна редко помещается целое число строк, и остаток
                 // внизу — несколько точек, а то и полтора десятка — иначе
                 // остаётся полосой прежней темы под самой рамкой.
-                let area = content_area(&self.surface, self.scale);
+                let area = content_area(&self.surface, bar);
                 self.surface.fill(area, back);
                 grid.recolor(&mut self.surface, ctx.palette.ink2, back);
                 grid.take_damage();
@@ -995,7 +1038,7 @@ impl Window {
         if matches!(self.content, Content::Text(_)) {
             return;
         }
-        let area = content_area(&self.surface, self.scale);
+        let area = content_area(&self.surface, self.bar());
         let ctx = self.ctx();
         // Содержимое рисуется поверх прежнего, и заливка обязательна: список,
         // ставший короче, иначе оставил бы под собой хвост предыдущего.
@@ -1032,7 +1075,7 @@ impl Window {
     /// `true` — содержимое им воспользовалось и окно перерисовано. Текстовые
     /// окна щелчков не разбирают: в них нечего выбирать мышью.
     pub fn handle_click(&mut self, x: i32, y: i32) -> bool {
-        let area = content_area(&self.surface, self.scale);
+        let area = content_area(&self.surface, self.bar());
         let ctx = self.ctx();
         let local = (x - self.rect.x, y - self.rect.y);
         let used = match &mut self.content {
@@ -1130,7 +1173,7 @@ impl Window {
         let Some(mut surface) = Surface::new(w, h, theme::window_bg()) else {
             return false;
         };
-        let inner = content_area(&surface, self.scale).shrink(self.ctx().px(4));
+        let inner = content_area(&surface, Self::title_height(self.scale)).shrink(self.ctx().px(4));
         match &mut self.content {
             Content::Text(grid) => {
                 if !grid.rebind(&mut surface, inner) {
@@ -1245,7 +1288,7 @@ impl Window {
         let Content::Program(view) = &self.content else {
             return;
         };
-        let content = content_area(&self.surface, self.scale);
+        let content = content_area(&self.surface, self.bar());
         let whole = view.pixels.bounds();
         let src = area.unwrap_or(whole).intersect(&whole);
         if src.is_empty() {
@@ -1333,8 +1376,7 @@ fn own(text: &str) -> Option<String> {
 /// Поля не отнимаются: их назначает само содержимое, и они у списка файлов и у
 /// «Параметров» разные. Отнимать их здесь значило бы, что боковая колонка,
 /// которая обязана доходить до края окна, до него не доходит.
-fn content_area(surface: &Surface, scale: u32) -> Rect {
-    let top = Window::title_height(scale);
+fn content_area(surface: &Surface, top: u32) -> Rect {
     Rect::new(
         0,
         top as i32,

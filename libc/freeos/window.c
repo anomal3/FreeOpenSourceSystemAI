@@ -114,6 +114,31 @@ int freeos_window_owner(int64_t id, int64_t owner, uint32_t flags) {
     return code < 0 ? freeos_set_errno(code) : 0;
 }
 
+int64_t freeos_window_popup(const char *title, uint32_t width, uint32_t height, int64_t owner,
+                            int32_t x, int32_t y, void **surface) {
+    if (title == NULL || surface == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    struct freeos_window_spec spec = {
+        .title = (uint64_t)(uintptr_t)title,
+        .title_len = strlen(title),
+        .width = width,
+        .height = height,
+    };
+    long code = insist(SYS_WINPOPUP, (long)&spec, (long)owner, pack(x, y));
+    if (code < 0) {
+        return freeos_set_errno(code);
+    }
+    *surface = (void *)(uintptr_t)spec.surface;
+    return spec.id;
+}
+
+int freeos_window_place(int64_t id, int32_t x, int32_t y) {
+    long code = insist(SYS_WINPLACE, (long)id, pack(x, y), 0);
+    return code < 0 ? freeos_set_errno(code) : 0;
+}
+
 int freeos_window_close(int64_t id) {
     long code = insist(SYS_WINCLOSE, (long)id, 0, 0);
     return code < 0 ? freeos_set_errno(code) : 0;

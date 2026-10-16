@@ -127,6 +127,17 @@ int freeos_window_title(int64_t id, const char *title);
  * фокус при поднятии владельца уходит этому окну. */
 int freeos_window_owner(int64_t id, int64_t owner, uint32_t flags);
 
+/* Открыть всплывающее окно над окном `owner` (фаза 62e): без заголовка, без
+ * кнопки на панели задач и без фокуса — ввод остаётся у владельца. `x`, `y` —
+ * от угла содержимого владельца, могут быть отрицательными; стол держит окно
+ * в пределах экрана и двигает его вместе с владельцем. Ответ — как у
+ * `freeos_window_open`. */
+int64_t freeos_window_popup(const char *title, uint32_t width, uint32_t height, int64_t owner,
+                            int32_t x, int32_t y, void **surface);
+
+/* Переставить всплывающее окно: `x`, `y` — как у `freeos_window_popup`. */
+int freeos_window_place(int64_t id, int32_t x, int32_t y);
+
 /* Закрыть окно. Поверхность после этого недействительна. */
 int freeos_window_close(int64_t id);
 

@@ -13,12 +13,13 @@
 // - **рисование** — в задний буфер формы (`TopLevel.Back`), с отсечением по
 //   родителям, по видимым детям и по соседям выше в порядке наложения — ровно
 //   так, как X11 отсекает дочерние окна: родитель никогда не закрашивает детей;
-// - **всплывающие окна** (фаза 62b) — подсказка, выпадающий список, меню: окна
-//   верхнего уровня без заголовка. Своего окна FreeOS у них нет — у каждого
-//   такого окна стол рисует свою полосу заголовка, а окон у программы не больше
-//   восьми. Они рисуются в поверхность формы-хозяина (`TopLevel.Host`) поверх
-//   всего, что в ней есть, и первыми ловят мышь. Хозяин — форма владельца, а
-//   нет владельца — форма, в «экранный» прямоугольник которой окно попало;
+// - **всплывающие окна** — подсказка, выпадающий список, меню: окна верхнего
+//   уровня без заголовка. С фазы 62e у каждого — своё окно стола без рамки и
+//   без фокуса над формой-хозяином (`freeos_window_popup`, `TopLevel.
+//   PopupOwner`), и за край формы оно выходит. Не дал стол окна — по-старому
+//   (62b): в поверхности хозяина (`TopLevel.Host`) поверх всего, что в ней
+//   есть, и первыми ловят мышь. Хозяин — форма владельца, а нет владельца —
+//   форма, в «экранный» прямоугольник которой окно попало;
 // - **главное меню старого образца** (`MainMenu`, фаза 62b) — полоса над
 //   клиентской областью (`TopLevel.Band`): поверхность формы начинается с неё,
 //   и мышь над полосой уходит форме неклиентскими сообщениями, как у Win32;
@@ -42,8 +43,9 @@
 //
 // # Чего договор окна не даёт, и что из этого следует
 //
-// - Всплывающее окно не выходит за край своей формы: оно в её поверхности. Не
-//   влезающее сдвигается внутрь, а больше формы — обрезается.
+// - Всплывающее окно — своё окно стола над формой (фаза 62e) и выходит за её
+//   край. Только если стол окна не дал (у программы их не больше восьми), оно
+//   рисуется в поверхности формы, как в 62b, и не выходит за её край.
 // - Окна с заголовком (`MessageBox`, диалоги) — отдельные окна стола; стол
 //   держит их над формой-владельцем (`freeos_window_owner`, фаза 62d), но
 //   свернуть владельца вместе с ними пока не умеет.
@@ -91,6 +93,10 @@ namespace System.Windows.Forms {
 			internal static extern int freeos_window_title (long id, byte[] title);
 			[DllImport (Lib)]
 			internal static extern int freeos_window_owner (long id, long owner, uint flags);
+			[DllImport (Lib)]
+			internal static extern long freeos_window_popup (byte[] title, uint width, uint height, long owner, int x, int y, out IntPtr surface);
+			[DllImport (Lib)]
+			internal static extern int freeos_window_place (long id, int x, int y);
 			[DllImport (Lib)]
 			internal static extern int freeos_window_close (long id);
 			[DllImport (Lib)]
@@ -144,6 +150,9 @@ namespace System.Windows.Forms {
 			internal readonly List<Hwnd> Popups = new List<Hwnd> ();
 			// У всплывающего окна — форма, в поверхности которой оно показано.
 			internal TopLevel Host;
+			// У всплывающего окна со своим окном стола (фаза 62e) — форма, над
+			// которой оно стоит: от угла её поверхности стол отсчитывает место.
+			internal TopLevel PopupOwner;
 			// Стол попросил новый размер, и ответить ему надо, даже если форма
 			// осталась прежней: до ответа он показывает её в рамке нового размера.
 			internal bool Answer;
@@ -386,6 +395,9 @@ namespace System.Windows.Forms {
 		static Point SurfaceScreen (TopLevel top)
 		{
 			Hwnd root = top.Hwnd;
+			// Поверхность всплывающего окна — всё окно, с рамкой меню.
+			if (top.PopupOwner != null)
+				return new Point (root.x, root.y);
 			Rectangle client = root.ClientRect;
 			return new Point (root.x + client.X, root.y + client.Y - top.Band);
 		}
@@ -403,6 +415,8 @@ namespace System.Windows.Forms {
 					Point s = SurfaceScreen (entry.Host);
 					return new Point (hwnd.x - s.X, hwnd.y - s.Y);
 				}
+				if (entry != null && entry.PopupOwner != null)
+					return Point.Empty;
 				Rectangle client = hwnd.ClientRect;
 				int band = entry != null ? entry.Band : 0;
 				return new Point (-client.X, band - client.Y);
@@ -556,7 +570,7 @@ namespace System.Windows.Forms {
 		// не тот, в котором окно на столе уже есть.
 		void SyncOwner (TopLevel top)
 		{
-			if (top == null || !top.IsOpen || top.Host != null)
+			if (top == null || !top.IsOpen || top.Host != null || top.PopupOwner != null)
 				return;
 			TopLevel owner = top.Hwnd.owner != null ? TopOf (top.Hwnd.owner) : null;
 			long id = owner != null && owner != top && owner.IsOpen ? owner.Id : 0;
@@ -593,6 +607,7 @@ namespace System.Windows.Forms {
 			Native.freeos_window_close (top.Id);
 			Trace ("close window {0}", top.Id);
 			top.Id = -1;
+			top.PopupOwner = null;
 			top.Surface = IntPtr.Zero;
 			FreeBackBuffer (top);
 		}
@@ -629,12 +644,17 @@ namespace System.Windows.Forms {
 		{
 			if (!top.IsOpen)
 				return;
-			int band = MenuBand (top.Hwnd);
+			int band = top.PopupOwner != null ? 0 : MenuBand (top.Hwnd);
 			bool band_moved = band != top.Band;
 			top.Band = band;
 			Rectangle client = top.Hwnd.ClientRect;
 			int width = Math.Max (1, client.Width);
 			int height = Math.Max (1, client.Height + band);
+			// Поверхность всплывающего окна — всё окно, не одна клиентская часть.
+			if (top.PopupOwner != null) {
+				width = Math.Max (1, top.Hwnd.width);
+				height = Math.Max (1, top.Hwnd.height);
+			}
 			if (width == top.Width && height == top.Height && !top.Answer) {
 				// Меню появилось или ушло, а высота та же: клиентская область
 				// сдвинулась по поверхности, и рисовать надо всё заново.
@@ -770,6 +790,10 @@ namespace System.Windows.Forms {
 				Trace ("popup {0:X} has no form to show in", popup.Handle.ToInt64 ());
 				return;
 			}
+			if (entry.IsOpen || OpenPopupTop (entry, host))
+				return;
+			// Стол окна не дал (у программы их не больше восьми) — по-старому,
+			// в поверхности формы.
 			entry.Host = host;
 			host.Popups.Remove (popup);
 			host.Popups.Add (popup);
@@ -777,6 +801,34 @@ namespace System.Windows.Forms {
 			Trace ("popup {0:X} {1}x{2} at {3} over window {4}", popup.Handle.ToInt64 (), popup.width, popup.height,
 				WholeOrigin (popup), host.Id);
 			InvalidateTree (popup);
+		}
+
+		// Всплывающее окно — своим окном стола над формой (фаза 62e,
+		// `freeos_window_popup`): за краем формы оно не обрезается и не
+		// сдвигается внутрь неё. Место — от угла поверхности формы, в тех же
+		// «экранных» точках, в каких его назвал WinForms.
+		bool OpenPopupTop (TopLevel entry, TopLevel host)
+		{
+			Hwnd popup = entry.Hwnd;
+			int width = Math.Max (1, popup.width);
+			int height = Math.Max (1, popup.height);
+			Point s = SurfaceScreen (host);
+			IntPtr surface;
+			// Пустого заголовка стол не примет, а у меню его нет; на экране его
+			// не видно — заголовка у всплывающего окна нет.
+			byte[] title = TitleBytes (entry.Title.Length > 0 ? entry.Title : "popup");
+			long id = Native.freeos_window_popup (title, (uint) width, (uint) height, host.Id, popup.x - s.X, popup.y - s.Y, out surface);
+			if (id < 0) {
+				Trace ("the desktop refused popup {0:X} over window {1}", popup.Handle.ToInt64 (), host.Id);
+				return false;
+			}
+			entry.Id = id;
+			entry.Surface = surface;
+			entry.PopupOwner = host;
+			SetBackBuffer (entry, width, height);
+			Trace ("popup {0:X} {1}x{2} as window {3} over window {4}", popup.Handle.ToInt64 (), width, height, id, host.Id);
+			InvalidateTree (popup);
+			return true;
 		}
 
 		void HidePopup (Hwnd popup)
@@ -1515,6 +1567,14 @@ namespace System.Windows.Forms {
 					InvalidateUnder (hwnd, old);
 				if (IsShown (hwnd))
 					InvalidateTree (hwnd);
+			} else if (entry != null && entry.PopupOwner != null && entry.IsOpen) {
+				// Всплывающее окно со своим окном стола: место — столу, размер —
+				// новой поверхностью.
+				if (moved) {
+					Point s = SurfaceScreen (entry.PopupOwner);
+					Native.freeos_window_place (entry.Id, x - s.X, y - s.Y);
+				}
+				ResizeTop (entry);
 			} else if (entry != null && entry.Host != null) {
 				// Всплывающее окно переехало внутри формы-хозяина.
 				FitPopup (hwnd);
@@ -2262,7 +2322,9 @@ namespace System.Windows.Forms {
 		{
 			switch (ev.Kind) {
 			case WIN_KEY:
-				if (active_window != top.Hwnd.Handle)
+				// Всплывающее окно активным не делается (фаза 62e): форма,
+				// получив WA_INACTIVE, закрыла бы это самое меню.
+				if (top.PopupOwner == null && active_window != top.Hwnd.Handle)
 					Activate (top.Hwnd.Handle);
 				KeyEvent (queue, top, ev, false);
 				break;
@@ -2270,7 +2332,7 @@ namespace System.Windows.Forms {
 				KeyEvent (queue, top, ev, true);
 				break;
 			case WIN_POINTER:
-				if (active_window != top.Hwnd.Handle)
+				if (top.PopupOwner == null && active_window != top.Hwnd.Handle)
 					Activate (top.Hwnd.Handle);
 				ButtonDown (queue, top, ev);
 				break;
@@ -2339,8 +2401,19 @@ namespace System.Windows.Forms {
 			Hwnd target = null;
 			if (grab_window != IntPtr.Zero) {
 				target = Hwnd.ObjectFromHandle (grab_window);
-				if (target != null && TopOf (target) != top)
+				TopLevel held = TopOf (target);
+				if (held == null || !held.IsOpen) {
 					target = null;
+				} else if (held != top) {
+					// Захват держит окно в другом окне стола той же программы
+					// (фаза 62e): меню старого образца — своим окном, а мышь
+					// держит форма. Как у X11, захват действует поверх окон:
+					// точка уходит держащему в его координатах, через «экран».
+					Point from = SurfaceScreen (top);
+					Point to = SurfaceScreen (held);
+					surface = new Point (from.X + surface.X - to.X, from.Y + surface.Y - to.Y);
+					top = held;
+				}
 			}
 			if (target == null && implicit_grab != null && !implicit_grab.zombie && TopOf (implicit_grab) == top)
 				target = implicit_grab;

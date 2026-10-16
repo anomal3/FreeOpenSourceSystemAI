@@ -1392,6 +1392,29 @@ pub const SYS_WINOWNER: usize = 76;
 /// поднятии уходит подчинённому.
 pub const WIN_OWNER_MODAL: u32 = 1;
 
+/// Открыть всплывающее окно над окном-владельцем. `(указатель на
+/// WindowSpec, id владельца, (x << 32) | y) -> 0` (фаза 62e).
+///
+/// Заявка и ответ — как у [`SYS_WINOPEN`]. Отличия: ни заголовка, ни рамки, ни
+/// кнопки на панели задач — окно ровно с поверхность; оно стоит над владельцем
+/// (как подчинённое [`SYS_WINOWNER`]) и **фокуса не берёт** — ввод остаётся у
+/// владельца, а щелчки по самому окну приходят ему, как всякому окну. Точка —
+/// от угла содержимого владельца, со знаком, по 32 бита: меню бывает и выше
+/// формы. Стол держит окно в пределах экрана, а не формы, и двигает его вместе
+/// с владельцем.
+///
+/// # Почему не флаг [`SYS_WINSTYLE`]
+///
+/// Окно, открытое обычным [`SYS_WINOPEN`], успело бы стать активным, и
+/// владелец получил бы [`WIN_FOCUS`] 0 — то есть «закрой открытые меню», ровно
+/// то меню, ради которого окно и открывали.
+pub const SYS_WINPOPUP: usize = 77;
+
+/// Переставить всплывающее окно. `(id, (x << 32) | y, 0) -> 0` (фаза 62e).
+///
+/// Точка — как у [`SYS_WINPOPUP`]. Окну, открытому не им, — [`ERR_NOT_FOUND`].
+pub const SYS_WINPLACE: usize = 78;
+
 /// [`SYS_WINSTYLE`]: размер окна может менять человек — уголком и кнопкой
 /// «развернуть».
 ///
@@ -1561,7 +1584,7 @@ pub const SYSINFO_DARK: u32 = 1;
 /// продолжает работать, потому что всё, что она знала, осталось на месте.
 /// Старшая — когда что-нибудь меняет смысл; такого пока не случалось, и
 /// случаться не должно.
-pub const ABI_VERSION: u32 = 0x0001_000B;
+pub const ABI_VERSION: u32 = 0x0001_000C;
 
 /// [`SYS_DUP`]: «дай самый маленький свободный номер».
 ///
@@ -2307,6 +2330,7 @@ mod tests {
         assert_eq!(SYS_WINTITLE, 75);
         assert_eq!(SYS_WINOWNER, 76);
         assert_eq!(WIN_OWNER_MODAL, 1);
+        assert_eq!((SYS_WINPOPUP, SYS_WINPLACE), (77, 78));
         assert_eq!((PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC), (0, 1, 2, 4));
         assert_eq!((MAP_HUGE, MAP_LAZY, MAP_JIT), (1, 2, 4));
         assert_eq!((FUTEX_CHANGED, FUTEX_TIMED_OUT), (1, 2));
@@ -2341,7 +2365,7 @@ mod tests {
             SYS_DEVICES, SYS_WINRESIZE, SYS_THREAD_CREATE, SYS_SET_TLS, SYS_THREAD_EXIT,
             SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_DEVICE_OPEN, SYS_DEVICE_MAP, SYS_DEVICE_WAIT,
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
-            SYS_WINOWNER,
+            SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(
@@ -2505,7 +2529,9 @@ mod tests {
         // 0x0001_000A — [`WIN_FOCUS`], [`WIN_KEYUP`] и [`SYS_WINTITLE`]:
         // активность окна, отпускание клавиши и заголовок на ходу (фаза 62c).
         // 0x0001_000B — [`SYS_WINOWNER`]: владелец окна (фаза 62d).
-        assert_eq!(ABI_VERSION, 0x0001_000B);
+        // 0x0001_000C — [`SYS_WINPOPUP`], [`SYS_WINPLACE`]: всплывающие окна
+        // (фаза 62e).
+        assert_eq!(ABI_VERSION, 0x0001_000C);
 
         assert_eq!(FD_STDIN, 0);
         assert_eq!(FD_STDOUT, 1);
