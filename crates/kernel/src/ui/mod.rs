@@ -66,7 +66,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use mini_ui::theme;
 use mini_ui::{Rect, Screen, Surface};
-use user_abi::{WIN_CLOSE, WIN_KEY, WIN_LEAVE, WIN_MOVE, WIN_POINTER, WIN_RELEASE, WinEvent};
+use user_abi::{
+    WIN_CLOSE, WIN_FOCUS, WIN_KEY, WIN_KEYUP, WIN_LEAVE, WIN_MOVE, WIN_POINTER, WIN_RELEASE, WinEvent,
+};
 
 use crate::input::keymap;
 use crate::input::{Buttons, KeyCode, KeyEvent, Modifiers, PointerEvent};
@@ -292,6 +294,8 @@ fn with_desktop<R>(action: impl FnOnce(&mut Compositor) -> R) -> Option<R> {
     // Окно оболочки могли растянуть или развернуть — а всё, что двигает окна,
     // проходит здесь.
     remember_shell_size(&mut desktop);
+    // И фокус меняет только то, что проходит здесь.
+    report_focus(&mut desktop);
     // Возвращать стол можно только с пустой очередью, и проверка идёт под тем
     // же замком, под которым пишущий кладёт в неё текст (см. [`write`]). Иначе
     // текст, положенный между «очередь пуста» и «стол на месте», ждал бы в
@@ -350,6 +354,23 @@ fn remember_shell_size(desktop: &mut Compositor) {
     let before = SHELL_CELLS.swap(packed, Ordering::Relaxed);
     if before != packed && before != 0 && packed != 0 {
         kprintln!("  term        : window is now {}x{} cells", cells.0, cells.1);
+    }
+}
+
+/// Сказать окнам программ, что активное окно сменилось (фаза 62c,
+/// `user_abi::WIN_FOCUS`): прежнему — `code` 0, новому — 1. Окна ядра событий
+/// не читают и не получают.
+fn report_focus(desktop: &mut Compositor) {
+    let Some((was, now)) = desktop.take_focus_change() else {
+        return;
+    };
+    for (app, code) in [(was, 0), (now, 1)] {
+        let Some(window) = app.and_then(|app| desktop.find(app)) else {
+            continue;
+        };
+        if window.is_program() {
+            window.push_event(WinEvent { kind: WIN_FOCUS, code, x: 0, y: 0 });
+        }
     }
 }
 
@@ -2059,6 +2080,19 @@ fn program_mods(mods: Modifiers) -> i32 {
 
 /// Отдать событие активному окну.
 fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<KeyEvent> {
+    // Отпускание клавиши, нажатие которой досталось окну программы, — ему же
+    // (фаза 62c), где бы ни был фокус теперь, и больше никому: оболочке оно
+    // ни к чему, а нажатия она и не видела.
+    if !event.pressed {
+        if let Some((app, mut key)) = desktop.release_key(event.code) {
+            key.kind = WIN_KEYUP;
+            key.x = program_mods(event.mods);
+            if let Some(window) = desktop.find(app) {
+                window.push_event(key);
+            }
+            return None;
+        }
+    }
     // Диалог разбирает клавиши раньше остальных окон: набирать в нём нечего, а
     // ответ закрывает окно, и закрыть его может только стол.
     if let Some(app) = desktop.focused_app() {
@@ -2090,8 +2124,8 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
         // равно уходит ей: иначе система осталась бы без единственного места,
         // где можно набрать команду.
         Some(App::Terminal) | None => Some(event),
-        // Окно программы получает символ, а не код клавиши, и только нажатия.
-        // Клавише без символа даётся имя из договора — но только той, которой
+        // Окно программы получает символ, а не код клавиши; отпускание —
+        // выше, по таблице нажатий. Клавише без символа даётся имя из договора — но только той, которой
         // это имя выдано: остальные (F-ряд, цифровой блок) событий по-прежнему
         // не дают. См. [`WinEvent::code`], там сказано, почему это честнее.
         Some(app @ App::Program(..)) => {
@@ -2104,6 +2138,7 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
                     let key = WinEvent { kind: WIN_KEY, code, x: program_mods(event.mods), y: latin };
                     if let Some(window) = desktop.find(app) {
                         window.push_event(key);
+                        desktop.hold_key(event.code, app, key);
                     }
                 }
             }
@@ -2779,6 +2814,25 @@ pub fn style_window(task: u32, slot: u32, flags: u32) -> Result<(), WindowError>
             kprintln!("  desktop     : '{}' is resizable", name_of(desktop, app));
         }
         desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Сменить имя окна программы (фаза 62c, `user_abi::SYS_WINTITLE`).
+pub fn title_window(task: u32, slot: u32, title: &str) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let focused = desktop.focused_app() == Some(app);
+        let Some(window) = desktop.find(app) else {
+            return Err(WindowError::NoWindow);
+        };
+        if window.set_title(title, focused) {
+            kprintln!("  desktop     : #{task} window is now called '{title}'");
+            // Кнопка на панели задач носит то же имя.
+            desktop.refresh_panel(&status_now());
+            desktop.present();
+        }
         Ok(())
     })
     .unwrap_or_else(|| Err(unavailable()))

@@ -2008,6 +2008,11 @@ pub fn style_window(slot: u32, flags: u32) -> Result<(), WindowError> {
     crate::ui::style_window(sched::current().as_u32(), slot, flags).map_err(WindowError::Desktop)
 }
 
+/// Сменить имя окна `slot` текущей программы (фаза 62c).
+pub fn title_window(slot: u32, title: &str) -> Result<(), WindowError> {
+    crate::ui::title_window(sched::current().as_u32(), slot, title).map_err(WindowError::Desktop)
+}
+
 /// Забрать событие окна `slot` текущей программы.
 pub fn window_event(slot: u32) -> Option<user_abi::WinEvent> {
     crate::ui::next_window_event(sched::current().as_u32(), slot)

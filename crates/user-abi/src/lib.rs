@@ -990,6 +990,22 @@ pub const WIN_RELEASE: u32 = 6;
 /// размера. Пока программа не прочла событие, новое встаёт на его место: нужен
 /// размер, на котором человек остановился, а не каждый промежуточный.
 pub const WIN_RESIZE: u32 = 7;
+/// [`WinEvent::kind`]: окно стало активным (`code` 1) или перестало им быть
+/// (`code` 0) — щелчком, `Alt+Tab`, сворачиванием, закрытием соседа (фаза 62c).
+///
+/// Без него программа не знала, что ввод ушёл к другому окну: открытое меню
+/// WinForms оставалось висеть после щелчка по соседнему окну, а закрыть его
+/// можно было только щелчком в своей же форме. Приходит при **смене**, а не
+/// при каждом поднятии: окно, которое и так активно, второго не получит. Первое
+/// окно программы получает `code` 1 сразу после открытия.
+pub const WIN_FOCUS: u32 = 8;
+/// [`WinEvent::kind`]: клавишу отпустили (фаза 62c). Поля — как у [`WIN_KEY`].
+///
+/// Отдельный вид, а не флаг у [`WIN_KEY`]: программа, собранная раньше,
+/// считает нажатием всякое [`WIN_KEY`], и отпускание превратилось бы у неё во
+/// второе нажатие. Приходит окну, которое получило нажатие; клавиша, нажатая до
+/// того, как окно стало активным, отпускания ему не пришлёт.
+pub const WIN_KEYUP: u32 = 9;
 
 /// [`WinEvent::x`] у [`WIN_KEY`]: зажат Shift.
 pub const WIN_MOD_SHIFT: i32 = 1;
@@ -1350,6 +1366,14 @@ pub const SYS_THREAD_INFO: usize = 73;
 /// рамки меняется на ходу.
 pub const SYS_WINSTYLE: usize = 74;
 
+/// Сменить заголовок окна. `(id, указатель на UTF-8, длина) -> 0` (фаза 62c).
+///
+/// Те же правила, что у заголовка в [`WindowSpec`]: пустой или длиннее
+/// [`MAX_TITLE`] байт — [`ERR_LIMIT`], не UTF-8 — [`ERR_BAD_ADDRESS`]. Нужен
+/// форме, у которой `Text` меняется на ходу (редактор пишет в заголовок имя
+/// файла); кнопка на панели задач меняется вместе с ним.
+pub const SYS_WINTITLE: usize = 75;
+
 /// [`SYS_WINSTYLE`]: размер окна может менять человек — уголком и кнопкой
 /// «развернуть».
 ///
@@ -1519,7 +1543,7 @@ pub const SYSINFO_DARK: u32 = 1;
 /// продолжает работать, потому что всё, что она знала, осталось на месте.
 /// Старшая — когда что-нибудь меняет смысл; такого пока не случалось, и
 /// случаться не должно.
-pub const ABI_VERSION: u32 = 0x0001_0009;
+pub const ABI_VERSION: u32 = 0x0001_000A;
 
 /// [`SYS_DUP`]: «дай самый маленький свободный номер».
 ///
@@ -2262,6 +2286,7 @@ mod tests {
         assert_eq!(SYS_MPROTECT, 72);
         assert_eq!(SYS_THREAD_INFO, 73);
         assert_eq!(SYS_WINSTYLE, 74);
+        assert_eq!(SYS_WINTITLE, 75);
         assert_eq!((PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC), (0, 1, 2, 4));
         assert_eq!((MAP_HUGE, MAP_LAZY, MAP_JIT), (1, 2, 4));
         assert_eq!((FUTEX_CHANGED, FUTEX_TIMED_OUT), (1, 2));
@@ -2295,7 +2320,7 @@ mod tests {
             SYS_WINEVENT, SYS_WINCLOSE, SYS_SYSINFO, SYS_MOUNTS, SYS_TASKS, SYS_KILL,
             SYS_DEVICES, SYS_WINRESIZE, SYS_THREAD_CREATE, SYS_SET_TLS, SYS_THREAD_EXIT,
             SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_DEVICE_OPEN, SYS_DEVICE_MAP, SYS_DEVICE_WAIT,
-            SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO,
+            SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(
@@ -2405,6 +2430,7 @@ mod tests {
         // и номера вызовов: программа, собранная раньше, знает их числами.
         assert_eq!((WIN_KEY, WIN_POINTER, WIN_CLOSE, WIN_MOVE, WIN_LEAVE), (1, 2, 3, 4, 5));
         assert_eq!((WIN_RELEASE, WIN_RESIZE, WIN_STYLE_RESIZABLE), (6, 7, 1));
+        assert_eq!((WIN_FOCUS, WIN_KEYUP), (8, 9));
         assert_eq!((WIN_MOD_SHIFT, WIN_MOD_CTRL, WIN_MOD_ALT), (1, 2, 4));
 
         // Счётчики системы: двадцать полей, и раскладка у них проверяется по
@@ -2455,7 +2481,9 @@ mod tests {
         // 0x0001_0009 — [`SYS_WINSTYLE`], [`WIN_RELEASE`] и [`WIN_RESIZE`]:
         // отпускание кнопки с захватом указателя и размер окна программы,
         // который меняет человек (фаза 62b).
-        assert_eq!(ABI_VERSION, 0x0001_0009);
+        // 0x0001_000A — [`WIN_FOCUS`], [`WIN_KEYUP`] и [`SYS_WINTITLE`]:
+        // активность окна, отпускание клавиши и заголовок на ходу (фаза 62c).
+        assert_eq!(ABI_VERSION, 0x0001_000A);
 
         assert_eq!(FD_STDIN, 0);
         assert_eq!(FD_STDOUT, 1);

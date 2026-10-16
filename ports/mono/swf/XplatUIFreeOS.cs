@@ -32,18 +32,18 @@
 //   отпускания (`implicit_grab`) — как X11. Стол делает то же самое для окна
 //   FreeOS в целом (`WIN_RELEASE`), поэтому ползунок, утащенный за край формы,
 //   узнаёт, где его отпустили;
-// - **клавиатура** — окну с фокусом (`focus_window`);
+// - **клавиатура** — окну с фокусом (`focus_window`), нажатие и отпускание
+//   порознь (`WIN_KEY`, `WIN_KEYUP`, фаза 62c);
+// - **активность** — стол говорит, что форма стала или перестала быть
+//   активной (`WIN_FOCUS`, фаза 62c), и потеря закрывает открытые меню и
+//   списки, как `FocusOut` у X11;
 // - **размер** — форме с рамкой `Sizable` стол разрешает менять размер
 //   (`freeos_window_style`), и форма выкладывается заново по `WIN_RESIZE`.
 //
 // # Чего договор окна не даёт, и что из этого следует
 //
-// - Отпускания клавиши нет: `WM_KEYUP` идёт сразу за `WM_KEYDOWN`.
-// - Заголовок окна задаётся при открытии и потом не меняется.
 // - Всплывающее окно не выходит за край своей формы: оно в её поверхности. Не
 //   влезающее сдвигается внутрь, а больше формы — обрезается.
-// - Стол не сообщает, что программа потеряла фокус, поэтому открытое меню не
-//   закрывается от щелчка по другому окну — только от щелчка в своей форме.
 // - Окна с заголовком (`MessageBox`, диалоги) — отдельные окна стола; держать
 //   их поверх владельца стол не умеет.
 //
@@ -87,6 +87,8 @@ namespace System.Windows.Forms {
 			[DllImport (Lib)]
 			internal static extern int freeos_window_style (long id, uint flags);
 			[DllImport (Lib)]
+			internal static extern int freeos_window_title (long id, byte[] title);
+			[DllImport (Lib)]
 			internal static extern int freeos_window_close (long id);
 			[DllImport (Lib)]
 			internal static extern int freeos_screen (out uint width, out uint height, out uint pixel_format);
@@ -99,6 +101,8 @@ namespace System.Windows.Forms {
 		const uint WIN_LEAVE = 5;
 		const uint WIN_RELEASE = 6;
 		const uint WIN_RESIZE = 7;
+		const uint WIN_FOCUS = 8;
+		const uint WIN_KEYUP = 9;
 		const uint WIN_STYLE_RESIZABLE = 1;
 		const int WIN_MOD_SHIFT = 1;
 		const int WIN_MOD_CTRL = 2;
@@ -520,7 +524,7 @@ namespace System.Windows.Forms {
 			int width = Math.Max (1, client.Width);
 			int height = Math.Max (1, client.Height + top.Band);
 			IntPtr surface;
-			byte[] title = Encoding.UTF8.GetBytes ((top.Title ?? "") + "\0");
+			byte[] title = TitleBytes (top.Title);
 			long id = Native.freeos_window_open (title, (uint) width, (uint) height, out surface);
 			if (id < 0) {
 				Console.Error.WriteLine ("mwf-freeos: the desktop refused a window '{0}' ({1}x{2}): error {3}",
@@ -1607,9 +1611,26 @@ namespace System.Windows.Forms {
 		{
 			Hwnd hwnd = Hwnd.ObjectFromHandle (handle);
 			TopLevel top;
-			if (hwnd != null && tops.TryGetValue (hwnd, out top))
-				top.Title = text ?? "";
+			if (hwnd == null || !tops.TryGetValue (hwnd, out top))
+				return true;
+			top.Title = text ?? "";
+			// Открытому окну — сразу (фаза 62c, `freeos_window_title`); пустого
+			// заголовка стол не принимает, и окно остаётся с прежним.
+			if (top.IsOpen && top.Title.Length > 0 && Native.freeos_window_title (top.Id, TitleBytes (top.Title)) < 0)
+				Trace ("the desktop refused title '{0}' for window {1}", top.Title, top.Id);
 			return true;
+		}
+
+		// Заголовок для стола: UTF-8 с нулём на конце, не длиннее `MAX_TITLE`
+		// (64 байта) — длиннее стол отвергает, а у формы `Text` бывает любым.
+		// Режется по границе символа: половина буквы в заголовке хуже обрыва.
+		static byte[] TitleBytes (string title)
+		{
+			const int max = 64;
+			string text = title ?? "";
+			while (Encoding.UTF8.GetByteCount (text) > max)
+				text = text.Substring (0, char.IsLowSurrogate (text [text.Length - 1]) ? text.Length - 2 : text.Length - 1);
+			return Encoding.UTF8.GetBytes (text + "\0");
 		}
 
 		internal override void SetIcon (IntPtr handle, Icon icon)
@@ -1673,6 +1694,35 @@ namespace System.Windows.Forms {
 			if (previous != IntPtr.Zero && Hwnd.ObjectFromHandle (previous) != null)
 				SendMessage (previous, Msg.WM_ACTIVATE, (IntPtr) WindowActiveFlags.WA_INACTIVE, root);
 			SendMessage (root, Msg.WM_ACTIVATE, (IntPtr) WindowActiveFlags.WA_ACTIVE, previous);
+		}
+
+		// Стол сказал, что форма больше не активна (фаза 62c, `WIN_FOCUS` 0):
+		// щелчок по другому окну, Alt+Tab. Всё открытое закрывается тем же путём,
+		// что у X11 на FocusOut: меню старого образца — своим `MenuTracker`
+		// (оно держит мышь `Control.Capture`), выпадающий список — потерей фокуса
+		// у владельца, `ToolStrip*` — `WM_ACTIVATE` с `WA_INACTIVE` (форма зовёт
+		// `ToolStripManager.FireAppFocusChanged`).
+		void DesktopDeactivate (TopLevel top)
+		{
+			if (grab_window != IntPtr.Zero) {
+				Control grabbed = Control.FromHandle (grab_window);
+				if (grabbed != null && grabbed.ActiveTracker != null)
+					grabbed.ActiveTracker.Deactivate ();
+			}
+			implicit_grab = null;
+			Hwnd focused = Hwnd.ObjectFromHandle (focus_window);
+			if (focused != null && TopOf (focused) == top) {
+				IntPtr previous = focus_window;
+				focus_window = IntPtr.Zero;
+				SendMessage (previous, Msg.WM_KILLFOCUS, IntPtr.Zero, IntPtr.Zero);
+			}
+			Hwnd active = Hwnd.ObjectFromHandle (active_window);
+			if (active != null && TopOf (active) == top) {
+				IntPtr root = active_window;
+				active_window = IntPtr.Zero;
+				Trace ("deactivate {0:X}", root.ToInt64 ());
+				SendMessage (root, Msg.WM_ACTIVATE, (IntPtr) WindowActiveFlags.WA_INACTIVE, IntPtr.Zero);
+			}
 		}
 
 		internal override IntPtr GetActive ()
@@ -2106,7 +2156,10 @@ namespace System.Windows.Forms {
 			case WIN_KEY:
 				if (active_window != top.Hwnd.Handle)
 					Activate (top.Hwnd.Handle);
-				KeyEvent (queue, top, ev);
+				KeyEvent (queue, top, ev, false);
+				break;
+			case WIN_KEYUP:
+				KeyEvent (queue, top, ev, true);
 				break;
 			case WIN_POINTER:
 				if (active_window != top.Hwnd.Handle)
@@ -2126,6 +2179,14 @@ namespace System.Windows.Forms {
 				break;
 			case WIN_RESIZE:
 				DesktopResize (top, ev.X, ev.Y);
+				break;
+			case WIN_FOCUS:
+				if (ev.Code != 0) {
+					if (active_window != top.Hwnd.Handle)
+						Activate (top.Hwnd.Handle);
+				} else {
+					DesktopDeactivate (top);
+				}
 				break;
 			case WIN_CLOSE:
 				Trace ("close asked for window {0}", top.Id);
@@ -2315,7 +2376,7 @@ namespace System.Windows.Forms {
 			Post (queue, MakeMsg (target.Handle, up, IntPtr.Zero, lparam));
 		}
 
-		void KeyEvent (FQueue queue, TopLevel top, Native.WinEvent ev)
+		void KeyEvent (FQueue queue, TopLevel top, Native.WinEvent ev, bool release)
 		{
 			Keys modifiers = Keys.None;
 			if ((ev.X & WIN_MOD_SHIFT) != 0)
@@ -2334,14 +2395,20 @@ namespace System.Windows.Forms {
 			IntPtr down_lparam = (IntPtr) (1 | (alt ? 1 << 29 : 0));
 			IntPtr up_lparam = (IntPtr) (unchecked ((int) 0xC0000001) | (alt ? 1 << 29 : 0));
 
-			// Адресата у сообщений пока нет: его назначит `KeyTarget` при выдаче.
-			MSG down = MakeMsg (IntPtr.Zero, alt ? Msg.WM_SYSKEYDOWN : Msg.WM_KEYDOWN, (IntPtr) vk, down_lparam);
-			down.refobject = new KeyInfo { Char = ch, Modifiers = modifiers, Top = top };
-			MSG up = MakeMsg (IntPtr.Zero, alt ? Msg.WM_SYSKEYUP : Msg.WM_KEYUP, (IntPtr) vk, up_lparam);
-			up.refobject = new KeyInfo { Modifiers = modifiers, Top = top };
-			Trace ("key 0x{0:X} '{1}' vk 0x{2:X} mods {3}", ev.Code, ch == '\0' ? ' ' : ch, vk, modifiers);
-			Post (queue, down);
-			Post (queue, up);
+			// Адресата у сообщения пока нет: его назначит `KeyTarget` при выдаче.
+			// Отпускание — своё событие стола (фаза 62c, `WIN_KEYUP`): до него
+			// `WM_KEYUP` шёл сразу за `WM_KEYDOWN`, и зажатая клавиша выглядела
+			// для формы как череда отдельных нажатий.
+			MSG msg;
+			if (release) {
+				msg = MakeMsg (IntPtr.Zero, alt ? Msg.WM_SYSKEYUP : Msg.WM_KEYUP, (IntPtr) vk, up_lparam);
+				msg.refobject = new KeyInfo { Modifiers = modifiers, Top = top };
+			} else {
+				msg = MakeMsg (IntPtr.Zero, alt ? Msg.WM_SYSKEYDOWN : Msg.WM_KEYDOWN, (IntPtr) vk, down_lparam);
+				msg.refobject = new KeyInfo { Char = ch, Modifiers = modifiers, Top = top };
+			}
+			Trace ("key {4} 0x{0:X} '{1}' vk 0x{2:X} mods {3}", ev.Code, ch == '\0' ? ' ' : ch, vk, modifiers, release ? "up" : "down");
+			Post (queue, msg);
 		}
 
 		// Окно с фокусом в форме клавиши — на миг выдачи сообщения. Выбирать его

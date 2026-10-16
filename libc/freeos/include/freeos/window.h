@@ -41,6 +41,8 @@ extern "C" {
 #define FREEOS_WIN_LEAVE 5
 #define FREEOS_WIN_RELEASE 6
 #define FREEOS_WIN_RESIZE 7
+#define FREEOS_WIN_FOCUS 8
+#define FREEOS_WIN_KEYUP 9
 
 /* Что окно умеет — `freeos_window_style`. */
 #define FREEOS_WIN_STYLE_RESIZABLE 1u
@@ -79,6 +81,10 @@ extern "C" {
  *   ширина и высота содержимого. Ответ — `freeos_window_resize`. Приходит только
  *   окну, которому задан `FREEOS_WIN_STYLE_RESIZABLE`.
  * - `FREEOS_WIN_CLOSE`: окно просят закрыть; закрывает его программа.
+ * - `FREEOS_WIN_FOCUS`: окно стало активным (`code` 1) или перестало (`code`
+ *   0) — фаза 62c. Приходит при смене, а не при каждом поднятии.
+ * - `FREEOS_WIN_KEYUP`: клавишу отпустили (фаза 62c); поля — как у
+ *   `FREEOS_WIN_KEY`. Приходит окну, которому досталось нажатие.
  *
  * Вид, которого программа не знает, она пропускает: новые виды договор
  * добавляет. */
@@ -108,6 +114,10 @@ void *freeos_window_resize(int64_t id, uint32_t width, uint32_t height);
  * размер меняет человек, и программа отвечает на `FREEOS_WIN_RESIZE`. Ноль
  * снимает сказанное раньше. */
 int freeos_window_style(int64_t id, uint32_t flags);
+
+/* Сменить заголовок окна (фаза 62c). UTF-8, не пустой и не длиннее 64 байт —
+ * иначе отказ. */
+int freeos_window_title(int64_t id, const char *title);
 
 /* Закрыть окно. Поверхность после этого недействительна. */
 int freeos_window_close(int64_t id);

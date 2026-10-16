@@ -1203,6 +1203,21 @@ impl Window {
         &self.title
     }
 
+    /// Сменить имя окна программы (фаза 62c, `user_abi::SYS_WINTITLE`).
+    ///
+    /// Перерисовывается только полоса заголовка ([`Self::draw_decorations`]
+    /// сама отмечает её к выводу): пиксели программы под ней не менялись. Ответ
+    /// — сменилось ли имя; то же имя второй раз не стоит кадра.
+    pub fn set_title(&mut self, title: &str, focused: bool) -> bool {
+        if !self.is_program() || self.title == title {
+            return false;
+        }
+        self.title.clear();
+        self.title.push_str(title);
+        self.draw_decorations(focused);
+        true
+    }
+
     /// Окно ли это пользовательской программы.
     ///
     /// Спрашивает оконный менеджер, и спрашивает не из любопытства: закрытие

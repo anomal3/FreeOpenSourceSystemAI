@@ -100,6 +100,15 @@ int freeos_window_style(int64_t id, uint32_t flags) {
     return code < 0 ? freeos_set_errno(code) : 0;
 }
 
+int freeos_window_title(int64_t id, const char *title) {
+    if (title == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    long code = insist(SYS_WINTITLE, (long)id, (long)title, (long)strlen(title));
+    return code < 0 ? freeos_set_errno(code) : 0;
+}
+
 int freeos_window_close(int64_t id) {
     long code = insist(SYS_WINCLOSE, (long)id, 0, 0);
     return code < 0 ? freeos_set_errno(code) : 0;

@@ -8729,7 +8729,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "mono-popups",
-        about: "WinForms Mono, фаза 62b: выпадающий список, контекстное меню, подсказка и главное меню — всплывающие окна внутри формы; выделение текста мышью с отпусканием за краем формы; форма меняет размер вслед за столом; MessageBox — отдельным окном.",
+        about: "WinForms Mono, фазы 62b–62c: выпадающий список, контекстное меню, подсказка и главное меню — всплывающие окна внутри формы, и щелчок по другому окну их закрывает; выделение текста мышью с отпусканием за краем формы; клавиша — нажатием и отпусканием; форма меняет размер вслед за столом; MessageBox — отдельным окном; заголовок меняется на ходу.",
         target: Target::Installed,
         usb_only: false,
         tablet: false,
@@ -8811,6 +8811,40 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Program("Mono Popups", 40, 32)),
             Step::Click,
             Step::Await("popups: menu Hello", 60_000),
+            // Меню сворачивается раньше, чем срабатывает пункт.
+            Step::AwaitAny("popups: menu collapsed 1", 60_000),
+            // Фаза 62c: щелчок по другому окну стола закрывает открытое меню —
+            // стол говорит форме, что она больше не активна (`WIN_FOCUS`).
+            // Контекстное меню (`ToolStrip`) закрывается с причиной
+            // «приложение потеряло фокус», главное (`MainMenu`) — сворачивается.
+            Step::Aim(Aim::Program("Mono Popups", 300, 80)),
+            Step::RightClick,
+            Step::Await("popups: context opened", 60_000),
+            Step::Aim(Aim::Title("Terminal")),
+            Step::Click,
+            Step::AwaitAny("popups: context closed AppFocusChange", 60_000),
+            Step::AwaitAny("popups: deactivated", 60_000),
+            // Оболочка, поднятая щелчком, закрывает форму почти целиком, и
+            // заголовка формы не видно: вернуть её — Alt+Tab, он поднимает
+            // нижнее окно.
+            Step::Key("alt-tab"),
+            Step::Await("popups: activated", 60_000),
+            Step::Aim(Aim::Program("Mono Popups", 16, 10)),
+            Step::Click,
+            Step::Await("popups: menu opened", 60_000),
+            Step::Aim(Aim::Title("Terminal")),
+            Step::Click,
+            Step::Await("popups: menu collapsed 2", 60_000),
+            Step::Key("alt-tab"),
+            Step::Await("popups: activated", 60_000),
+            // Нажатие и отпускание клавиши — порознь (`WIN_KEYUP`): до 62c
+            // отпускание драйвер выдумывал сразу за нажатием.
+            Step::Aim(Aim::Program("Mono Popups", 100, 82)),
+            Step::Click,
+            Step::Wait(1_000),
+            Step::Type("q"),
+            Step::Await("popups: key down Q", 60_000),
+            Step::Await("popups: key up Q", 60_000),
             // Развернуть и вернуть: форма выкладывается по размеру, который
             // выбрал стол, и кнопка в углу едет вместе с углом.
             Step::Aim(Aim::Maximize("Mono Popups")),
@@ -8830,6 +8864,16 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("question"),
             Step::Key("ret"),
             Step::Await("popups: answer Yes", 60_000),
+            // Заголовок на ходу (`SYS_WINTITLE`): кнопка 110,90 размером 90x30.
+            // Прицел по старому имени и дальше верен — окно не сдвинулось.
+            Step::Aim(Aim::Program("Mono Popups", 155, 125)),
+            Step::Click,
+            Step::Await("popups: renamed", 60_000),
+            // Строку ядра печатает смена заголовка, а программа печатает свою
+            // уже после неё.
+            Step::AwaitAny("window is now called 'Mono Popups renamed'", 60_000),
+            Step::Wait(1_000),
+            Step::Shot("renamed"),
             Step::Aim(Aim::Close("Mono Popups")),
             Step::Click,
             Step::Await("popups: closed", 60_000),
@@ -9321,7 +9365,9 @@ pub const ALL: &[Scenario] = &[
             // 65543 — `0x0001_0007`: `MAP_JIT`, память кода (фаза 59).
             // 65545 — `0x0001_0009`: `SYS_WINSTYLE`, `WIN_RELEASE` и
             // `WIN_RESIZE` (фаза 62b).
-            Step::Await("posix: abi version 65545", 60_000),
+            // 65546 — `0x0001_000A`: `WIN_FOCUS`, `WIN_KEYUP` и `SYS_WINTITLE`
+            // (фаза 62c).
+            Step::Await("posix: abi version 65546", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».

@@ -67,6 +67,7 @@
 #define SYS_MPROTECT 72
 #define SYS_THREAD_INFO 73
 #define SYS_WINSTYLE 74
+#define SYS_WINTITLE 75
 
 /* ── Значения, которые эти вызовы принимают и возвращают ──────────────────── */
 

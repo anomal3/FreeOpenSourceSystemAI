@@ -3,8 +3,10 @@
 // старого образца — всплывающие окна внутри формы; выделение текста мышью —
 // перетаскивание с захватом указателя (кнопку отпускают за краем формы);
 // кнопка, привязанная к углу, — смена размера формы столом; `MessageBox` —
-// отдельное окно стола. Каждое действие печатается строкой, по ним сверяет
-// сценарий `mono-popups`.
+// отдельное окно стола. Фаза 62c: щелчок по другому окну стола закрывает
+// открытые меню (`WIN_FOCUS`), клавиша приходит нажатием и отпусканием порознь
+// (`WIN_KEYUP`), заголовок меняется на ходу (`freeos_window_title`). Каждое
+// действие печатается строкой, по ним сверяет сценарий `mono-popups`.
 //
 // Раскладка задана числами: стенд целится в точки содержимого окна
 // (`Aim::Program`), а они — клиентские точки отсюда плюс высота полосы меню.
@@ -39,6 +41,10 @@ class PopupsForm : Form
         file.MenuItems.Add (new MenuItem ("Other"));
         file.Popup += delegate { Console.WriteLine ("popups: menu opened"); };
         menu.MenuItems.Add (file);
+        // Со счётом: меню сворачивается и после выбора пункта, и сценарий
+        // ждёт именно то сворачивание, которое вызвал щелчок по другому окну.
+        int collapses = 0;
+        menu.Collapse += delegate { Console.WriteLine ("popups: menu collapsed " + ++collapses); };
         Menu = menu;
 
         // Выпадающий список: 12,12 размером 160x21.
@@ -57,6 +63,8 @@ class PopupsForm : Form
         box.Size = new Size (220, 24);
         box.Text = Sample;
         box.MouseUp += delegate { Console.WriteLine ("popups: selected " + box.SelectionLength); };
+        box.KeyDown += delegate (object sender, KeyEventArgs e) { Console.WriteLine ("popups: key down " + e.KeyCode); };
+        box.KeyUp += delegate (object sender, KeyEventArgs e) { Console.WriteLine ("popups: key up " + e.KeyCode); };
 
         // Вопрос отдельным окном стола: 12,90 размером 90x30.
         Button ask = new Button ();
@@ -66,6 +74,16 @@ class PopupsForm : Form
         ask.Click += delegate {
             DialogResult answer = MessageBox.Show (this, "Continue?", "Question", MessageBoxButtons.YesNo);
             Console.WriteLine ("popups: answer " + answer);
+        };
+
+        // Новое имя окна: 110,90 размером 90x30.
+        Button rename = new Button ();
+        rename.Text = "Rename";
+        rename.Location = new Point (110, 90);
+        rename.Size = new Size (90, 30);
+        rename.Click += delegate {
+            Text = "Mono Popups renamed";
+            Console.WriteLine ("popups: renamed");
         };
 
         // Кнопка у правого нижнего угла: едет вместе с углом формы.
@@ -85,6 +103,9 @@ class PopupsForm : Form
         context.Items.Add ("Copy").Click += delegate { Console.WriteLine ("popups: context Copy"); };
         context.Items.Add ("Paste");
         context.Opened += delegate { Console.WriteLine ("popups: context opened"); };
+        context.Closed += delegate (object sender, ToolStripDropDownClosedEventArgs e) {
+            Console.WriteLine ("popups: context closed " + e.CloseReason);
+        };
         // «Открыто» печатается до первой перерисовки меню, а первая отрисовка
         // ToolStrip в отладочной Mono — это ещё и компиляция всего его
         // оформления; снимок ждёт, пока меню нарисуется.
@@ -100,6 +121,7 @@ class PopupsForm : Form
         Controls.Add (combo);
         Controls.Add (box);
         Controls.Add (ask);
+        Controls.Add (rename);
         Controls.Add (corner);
 
         Shown += delegate {
@@ -122,6 +144,8 @@ class PopupsForm : Form
                 Console.WriteLine ("popups: resized " + ClientSize.Width + "x" + ClientSize.Height
                     + ", corner at " + corner.Left + "," + corner.Top);
         };
+        Activated += delegate { if (shown) Console.WriteLine ("popups: activated"); };
+        Deactivate += delegate { if (shown) Console.WriteLine ("popups: deactivated"); };
         FormClosed += delegate { Console.WriteLine ("popups: closed"); };
     }
 

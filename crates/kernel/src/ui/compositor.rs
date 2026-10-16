@@ -60,6 +60,8 @@ use super::keyboard::{self, Keyboard};
 use super::shade::Shade;
 use mini_ui::theme;
 use super::window::{App, Hit, Window};
+use crate::input::KeyCode;
+use user_abi::WinEvent;
 
 /// Сколько прямоугольников изменений композитор согласен помнить.
 ///
@@ -180,6 +182,22 @@ pub struct Compositor {
     /// Нужно одному: сказать окну, что указатель ушёл. Узнать это из текущего
     /// движения нельзя — оно достаётся уже другому окну или столу.
     hovered: Option<App>,
+    /// Активное окно, о котором программам уже сказано (фаза 62c, `WIN_FOCUS`).
+    ///
+    /// Сверяется с [`Self::focused_app`] после каждого действия со столом, а не
+    /// в каждом месте, где фокус меняется: таких мест пять (поднятие, новое
+    /// окно, сворачивание, закрытие, обход по кругу), и забытое шестое молча
+    /// оставило бы меню WinForms висеть.
+    reported_focus: Option<App>,
+    /// Клавиши, нажатие которых ушло окну программы, — кому и каким событием
+    /// (фаза 62c, `WIN_KEYUP`).
+    ///
+    /// Отпускание идёт туда же, куда нажатие, а не в нынешний фокус: после
+    /// `Alt+Tab` нажатая буква отпускается уже над другим окном, и без таблицы
+    /// одно окно осталось бы с «зажатой» клавишей, а другое получило бы
+    /// отпускание того, чего не нажимали. Восьми мест хватает рукам; девятая
+    /// одновременно зажатая клавиша своего отпускания не получит.
+    held_keys: [Option<(KeyCode, App, WinEvent)>; 8],
     /// Окно программы, над содержимым которого нажали кнопку мыши, и какие
     /// кнопки ещё держат (1 левая, 2 правая) — захват указателя (фаза 62b).
     ///
@@ -270,6 +288,8 @@ impl Compositor {
             moved: None,
             pending_size: None,
             hovered: None,
+            reported_focus: None,
+            held_keys: [None; 8],
             captured: None,
             scale,
             damage: [Rect::EMPTY; MAX_DAMAGE],
@@ -393,6 +413,35 @@ impl Compositor {
 
     pub fn set_hovered(&mut self, app: Option<App>) {
         self.hovered = app;
+    }
+
+    /// Запомнить, что нажатие `key` ушло окну `app` событием `event`.
+    pub fn hold_key(&mut self, key: KeyCode, app: App, event: WinEvent) {
+        // Повтор зажатой клавиши занимает то же место, а не новое.
+        let slot = self
+            .held_keys
+            .iter()
+            .position(|held| held.is_some_and(|(code, ..)| code == key))
+            .or_else(|| self.held_keys.iter().position(Option::is_none));
+        if let Some(slot) = slot {
+            self.held_keys[slot] = Some((key, app, event));
+        }
+    }
+
+    /// Клавишу отпустили: кому досталось её нажатие и каким событием.
+    pub fn release_key(&mut self, key: KeyCode) -> Option<(App, WinEvent)> {
+        let slot = self.held_keys.iter().position(|held| held.is_some_and(|(code, ..)| code == key))?;
+        self.held_keys[slot].take().map(|(_, app, event)| (app, event))
+    }
+
+    /// Сменилось ли активное окно с прошлого раза: `Some((было, стало))`, и
+    /// новое запоминается как сказанное (фаза 62c).
+    pub fn take_focus_change(&mut self) -> Option<(Option<App>, Option<App>)> {
+        let now = self.focused_app();
+        if now == self.reported_focus {
+            return None;
+        }
+        Some((core::mem::replace(&mut self.reported_focus, now), now))
     }
 
     /// См. [`Self::captured`].

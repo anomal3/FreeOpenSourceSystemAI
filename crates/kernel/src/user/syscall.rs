@@ -181,6 +181,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_WINRESIZE => winresize(a0 as i64, a1),
         // Фаза 62b: окно говорит, что умеет, — размер у него меняет человек.
         user_abi::SYS_WINSTYLE => winstyle(a0 as i64, a1),
+        // Фаза 62c: заголовок окна меняется на ходу.
+        user_abi::SYS_WINTITLE => wintitle(a0 as i64, a1, a2),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -1857,6 +1859,31 @@ fn winstyle(id: i64, flags: usize) -> i64 {
         return ERR_UNSUPPORTED;
     }
     match super::style_window(slot, flags as u32) {
+        Ok(()) => 0,
+        Err(err) => window_errno(err),
+    }
+}
+
+/// `wintitle(id, ptr, len) -> 0` (фаза 62c). Строка проверяется так же, как
+/// заголовок в [`winopen`].
+fn wintitle(id: i64, ptr: usize, len: usize) -> i64 {
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    if len == 0 || len > MAX_TITLE {
+        return ERR_LIMIT;
+    }
+    if !space::user_can(ptr, len, PageFlags::READ) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: диапазон проверен по таблицам программы; строка только читается,
+    // и ссылка на неё не переживает этот вызов.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let Ok(title) = core::str::from_utf8(bytes) else {
+        return ERR_BAD_ADDRESS;
+    };
+    match super::title_window(slot, title) {
         Ok(()) => 0,
         Err(err) => window_errno(err),
     }
