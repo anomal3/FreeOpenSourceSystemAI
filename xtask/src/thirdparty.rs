@@ -75,6 +75,13 @@ enum How {
     /// архитектуры (фаза 61, шрифт). Пары — путь в архиве и имя в
     /// [`cbuild::fonts_dir`].
     Files(&'static [(&'static str, &'static str)]),
+    /// mbedTLS (фаза 65c): у него ни `configure`, ни установки под чужой
+    /// префикс — `make -C library` с нашим компилятором, а свои настройки
+    /// (`ports/mbedtls/freeos-config.h`) дописываются в копию его
+    /// `mbedtls_config.h`, а случайность и часы (`ports/mbedtls/freeos.c`)
+    /// вшиваются в `libmbedcrypto.a`. Так и велит его `README` для
+    /// кросс-сборки: компилятор — переменной, настройки — файлом.
+    MbedTls,
 }
 
 /// Свои ключи проекта, собираемого GNU `configure`.
@@ -132,7 +139,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 9] = [
+const PROJECTS: [Project; 10] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -337,6 +344,24 @@ const PROJECTS: [Project; 9] = [
     },
     // Шрифт для текста: DejaVu Sans. Не собирается — берётся готовым; рядом
     // едет его лицензия, этого она и требует.
+    // TLS для программ на C (веха v0.10, решение Романа 17.10): libcurl, потом
+    // браузер. Ветка 3.6 — долгой поддержки; 4.x перешла на один интерфейс PSA,
+    // и libcurl знает её хуже.
+    Project {
+        name: "mbedtls",
+        version: "3.6.7",
+        url: "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2",
+        sha256: "a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6",
+        unpacked: "mbedtls-3.6.7",
+        how: How::MbedTls,
+        installs: &[
+            "lib/libmbedcrypto.a",
+            "lib/libmbedx509.a",
+            "lib/libmbedtls.a",
+            "include/mbedtls/ssl.h",
+            "include/psa/crypto.h",
+        ],
+    },
     Project {
         name: "dejavu",
         version: "2.37",
@@ -524,6 +549,36 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
         How::Files(_) => return Ok(()),
+        How::MbedTls => {
+            let ports = crate::paths::workspace_root().join("ports/mbedtls");
+            // Настройки — в конец копии `mbedtls_config.h`: их увидят и сама
+            // библиотека, и libcurl, собранный с заголовками из набора.
+            let config = work.join("include/mbedtls/mbedtls_config.h");
+            let mut text = fs::read_to_string(&config)
+                .with_context(|| format!("нет {}", config.display()))?;
+            text.push_str(&fs::read_to_string(ports.join("freeos-config.h"))?);
+            fs::write(&config, text)?;
+            fs::copy(ports.join("freeos.c"), work.join("library/freeos_platform.c"))?;
+            run_shell(
+                &work,
+                &format!(
+                    "make -C library CC={triple}-cc AR={triple}-ar CFLAGS=-O2 \
+                     libmbedcrypto.a libmbedx509.a libmbedtls.a && \
+                     {triple}-cc -O2 -Iinclude -c library/freeos_platform.c -o library/freeos_platform.o && \
+                     {triple}-ar rcs library/libmbedcrypto.a library/freeos_platform.o"
+                ),
+                &format!("make mbedtls {}", arch.name()),
+            )?;
+            run_shell(
+                &work,
+                &format!(
+                    "mkdir -p {prefix}/include {prefix}/lib && \
+                     cp -r include/mbedtls include/psa {prefix}/include/ && \
+                     cp library/libmbedcrypto.a library/libmbedx509.a library/libmbedtls.a {prefix}/lib/"
+                ),
+                &format!("install mbedtls {}", arch.name()),
+            )?;
+        }
         How::MakePlatform(platform) => {
             // Компилятор передаётся переменной, и это не наша выдумка: именно
             // так кросс-собирают Lua, и написано это в его `doc/readme.html`.

@@ -167,7 +167,7 @@ pub struct CProgram {
 }
 
 /// Программы на C, которые едут в `/bin`.
-pub const C_PROGRAMS: [CProgram; 9] = [
+pub const C_PROGRAMS: [CProgram; 10] = [
     CProgram { name: "cdemo", needs: None, libs: &[], includes: &[] },
     // Переполняет свой стек нарочно: доказывает, что канарейка стека есть и у
     // программ на C. См. `libc/examples/csmash.c` и `__stack_chk_fail` в `crt0.c`.
@@ -202,6 +202,14 @@ pub const C_PROGRAMS: [CProgram; 9] = [
         // программа шрифт по имени не ищет.
         libs: &["libcairo.a", "libpixman-1.a", "libfontconfig.a", "libexpat.a", "libfreetype.a", "libpng16.a", "libz.a"],
         includes: &["cairo", "freetype2", "pixman-1"],
+    },
+    // HTTPS через mbedTLS поверх сокетов BSD (фаза 65c): рукопожатие с чужим
+    // сервером, цепочка по корню из файла. См. `libc/examples/ctls.c`.
+    CProgram {
+        name: "ctls",
+        needs: Some("libmbedtls.a"),
+        libs: &["libmbedtls.a", "libmbedx509.a", "libmbedcrypto.a"],
+        includes: &[],
     },
 ];
 

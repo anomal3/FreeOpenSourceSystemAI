@@ -1587,7 +1587,8 @@ pub const ALL: &[Scenario] = &[
             // Сорок восемь — `cjit` (фаза 59). Сорок девять — `cdraw` (фаза 61a),
             // едет, только если собрана cairo (`cargo xtask thirdparty`).
             // Пятьдесят — `sockfd` (фаза 65a). Пятьдесят одна — `cnet` (фаза 65b).
-            Step::Expect("/bin holds 51 programs"),
+            // Пятьдесят две — `ctls` (фаза 65c), едет, только если собран mbedTLS.
+            Step::Expect("/bin holds 52 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -8216,6 +8217,50 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run /bin/cnet resolve example.com"),
             Step::Await("cnet: example.com is ", 30_000),
             Step::Absent("cnet: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "ctls",
+        about: "HTTPS из C через mbedTLS (фаза 65c): рукопожатие с rustls стенда, цепочка по /etc/ca.pem, чужой корень отвергнут.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        // Серверы и корень — те же, что у `update-tls`: два HTTPS с разными
+        // корнями, и `/etc/ca.pem` гостя с корнем стенда.
+        host_repo: true,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 120_000),
+            Step::Wait(2_000),
+            // Свой корень: рукопожатие, проверенная цепочка, имя — адрес в
+            // `subjectAltName`, и полмегабайта тела через шифрованный канал.
+            Step::Line("run /bin/ctls 10.0.2.2 {tls} /etc/ca.pem /blob"),
+            Step::Await("ctls: roots from /etc/ca.pem", 60_000),
+            Step::Await(", the chain is verified", 120_000),
+            Step::Await("ctls: HTTP/1.1 200", 120_000),
+            Step::Await("ctls: 524288 body bytes in ", 300_000),
+            // Чужой корень. Клиент, принимающий любой сертификат, дошёл бы
+            // здесь до ответа — а обязан отказать и назвать причину.
+            Step::Line("run /bin/ctls 10.0.2.2 {stranger} /etc/ca.pem /blob"),
+            Step::Await("ctls: the certificate is rejected: ", 120_000),
+            Step::Absent("ctls: FAILED"),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],

@@ -7992,6 +7992,64 @@ QEMU исполняет гостя программно (TCG); aarch64 на эт
 `libfreeos.a` — новый `.c` надо вписать и туда, и в `sdk.rs`; длины
 массивов `C_PROGRAMS`, `USER_PROGRAMS` и программ установщика — в типе.
 
+## Фаза 65c — mbedTLS — **сделано 2026-10-17**
+
+### Что стало
+
+mbedTLS 3.6.7 (ветка долгой поддержки) собирается `cargo xtask thirdparty`
+из неправленого архива и кладёт в набор `libmbedcrypto.a`, `libmbedx509.a`,
+`libmbedtls.a` и заголовки `mbedtls/`, `psa/`. Программа на C ходит по
+HTTPS: TLS 1.3, цепочка по корню из файла, имя сервера — в том числе адрес
+из `subjectAltName`.
+
+- **Рецепт `How::MbedTls`**: ни `configure`, ни установки под префикс у
+  mbedTLS нет — `make -C library` с нашим компилятором, как велит его
+  `README` для кросс-сборки.
+- **Свои настройки — `ports/mbedtls/freeos-config.h`**, дописываются в конец
+  копии `mbedtls_config.h`: так их видит и библиотека, и всякий, кто
+  собирается с её заголовками из набора (libcurl в 65d). Своих сокетов и
+  часов mbedTLS (`NET_C`, `TIMING_C`) нет — байты в сокет кладёт программа
+  через `mbedtls_ssl_set_bio`; постоянного хранилища ключей PSA нет.
+- **Что mbedTLS берёт у системы — `ports/mbedtls/freeos.c`**, вшивается в
+  `libmbedcrypto.a`: случайность (`mbedtls_hardware_poll` поверх
+  `getentropy`, то есть `SYS_RANDOM`) и миллисекунды (`mbedtls_ms_time` на
+  `CLOCK_MONOTONIC`). Своих у mbedTLS нет: Unix он узнаёт по `__unix__`, а
+  `clock_gettime` ищет по `_POSIX_VERSION` — наш компилятор и `unistd.h` их
+  не объявляют.
+- **libc: свой `arpa/inet.h`.** У picolibc он нёс только порядок байтов, а
+  POSIX велит объявлять там `inet_pton`/`inet_ntop`. mbedTLS этому верит —
+  видит `AF_INET6` и зовёт `inet_pton`, подключив только этот заголовок.
+  Новый подключает `netinet/in.h`, где объявления жили с фазы 58.
+
+### Проверено
+
+Новый сценарий `ctls`, обе архитектуры, установленная система, пример
+`libc/examples/ctls.c` — клиент HTTPS на mbedTLS поверх сокетов BSD,
+против серверов `update-tls` (`rustls` стенда, чужая реализация): свой
+корень из `/etc/ca.pem` — TLS 1.3, `CHACHA20-POLY1305`, цепочка проверена,
+`200 OK` и ровно 524288 байт тела; сервер с чужим корнем — отказ с
+причиной («not correctly signed by the trusted CA»), а `rustls` в журнале
+стенда видит `UnknownCA`.
+
+Замер, меняющий 65e: эти полмегабайта по TLS пришли за **55–62 мс** —
+около 9 МБ/с. `fetch` в том же прогоне `update-tls` тянет тот же `/blob`
+за 237–243 мс без TLS (2,1 МБ/с) и за 1006–1055 мс по TLS (~500 КиБ/с).
+Значит, приём TCP в ядре узким местом не является: медленнее всего свой TLS
+`fetch` (`crates/tls`), а сам `fetch` и без TLS вчетверо медленнее
+программы на C, — с этого и начинать 65e, а `update-net` (~100 КБ/с на
+образе корня) мерить отдельно: там ещё запись на диск.
+
+Регрессия, debug, обе архитектуры: `install`, `ctls`, `desktop` (`/bin`
+— 52), `cnet`, `cdraw`, `libc`, `cthreads`, `update-tls`, `installed` —
+зелёные.
+
+Ловушки сборки: заголовки libc ставит `cargo xtask sdk` (копирует
+`libc/freeos/include` поверх picolibc), так что после правки заголовка —
+`sdk`, `thirdparty`, `cbuild` и `install`. И о стенде: опрос лога прогона
+с сервера Bluegent держит файл открытым, и Windows не даёт следующему
+прогону в него писать — у каждого прогона свой лог (`LOG=` у
+`.bluegent\runs.cmd`).
+
 ---
 
 # TODO — записано, но не начато
