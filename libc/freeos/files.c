@@ -436,8 +436,9 @@ int pipe2(int fds[2], int flags) {
  *   программа не наследует дескрипторов вовсе (`SYS_LAUNCH` называет её потоки
  *   поимённо). Поставить флаг — можно, снять (попросить наследования) — нельзя,
  *   `ENOSYS`;
- * - `F_GETFL` — `O_RDWR` без флагов состояния: ни `O_APPEND`, ни `O_NONBLOCK` у
- *   нас не бывает. Снять их через `F_SETFL` можно, включить — `ENOSYS`;
+ * - `F_GETFL` — `O_RDWR`, у неблокирующего сокета ещё `O_NONBLOCK` (фаза
+ *   65b); `O_APPEND` у нас не бывает. `F_SETFL` включает и снимает
+ *   `O_NONBLOCK` у сокета; у файла и канала включить его — `ENOSYS`;
  * - блокировки (`F_GETLK`, `F_SETLK`, `F_SETLKW`) — `ENOSYS`: у ядра их нет. */
 int fcntl(int fd, int cmd, ...) {
     va_list args;
@@ -469,8 +470,16 @@ int fcntl(int fd, int cmd, ...) {
         }
         return 0;
     case F_GETFL:
-        return O_RDWR;
+        return O_RDWR | (freeos_socket_is_nonblock(fd) ? O_NONBLOCK : 0);
     case F_SETFL:
+        /* `O_NONBLOCK` — у сокета (фаза 65b); у файла и канала его нет. */
+        if (S_ISSOCK(info.st_mode)) {
+            if (arg & O_APPEND) {
+                errno = ENOSYS;
+                return -1;
+            }
+            return freeos_socket_set_nonblock(fd, (arg & O_NONBLOCK) != 0);
+        }
         if (arg & (O_NONBLOCK | O_APPEND)) {
             errno = ENOSYS;
             return -1;

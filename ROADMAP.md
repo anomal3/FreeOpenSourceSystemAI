@@ -7948,6 +7948,50 @@ QEMU исполняет гостя программно (TCG); aarch64 на эт
 установленный диск — после правки примера нужен `cargo xtask cbuild` и
 `install`, пересборка initrd их не трогает.
 
+## Фаза 65b — сокеты BSD в libc — **сделано 2026-10-17**
+
+### Что стало
+
+`libc/freeos/socket.c` вместо семнадцати заглушек с `ENOSYS`: `socket`
+(`SOCK_NONBLOCK`, `SOCK_CLOEXEC`), `bind`, `connect`, `listen`, `accept` и
+`accept4`, `send`/`recv` (с `MSG_DONTWAIT`), `sendto`/`recvfrom`,
+`sendmsg`/`recvmsg`, `getsockopt`/`setsockopt`, `getsockname`,
+`getpeername`, `shutdown`. Сокет — дескриптор ядра (фаза 65a), поэтому
+`read`, `write`, `close`, `poll` и `select` работали на нём без этого файла;
+здесь — то, чего у файла нет.
+
+- **Имена**: `getaddrinfo` и `gethostbyname` разрешают имя через
+  `SYS_RESOLVE` (DNS, запись A), службы (`http`, `https`, `ssh`…) — по
+  таблице; `AI_PASSIVE`, `AI_NUMERICHOST`, `AI_NUMERICSERV`, `AI_CANONNAME`.
+- **Неблокирующий режим** — `fcntl(F_SETFL, O_NONBLOCK)`, `ioctl(FIONBIO)`,
+  флаги `socket`/`accept4`; помнит его libc — `F_GETFL` отвечает, не
+  спрашивая ядро. Исход неблокирующего соединения — `SO_ERROR`.
+- **Коды**: `ECONNRESET`, `ECONNREFUSED`, `EINPROGRESS`, `ENETUNREACH`,
+  `ENOTSOCK`, `EADDRINUSE` у `bind`; `fstat` — `S_IFSOCK`.
+- **Чего нет, и это сказано кодом**: `MSG_PEEK` и `MSG_OOB` — `EOPNOTSUPP`
+  (подсмотренное прочлось бы дважды); `socketpair` и `AF_UNIX`,
+  `AF_INET6` — `EAFNOSUPPORT`; петли `127.0.0.1` у ядра нет. Параметры
+  сокета ядро не хранит: известные `setsockopt` принимает молча — у нас они
+  и так такие или безвредны, — незнакомые отвечает `ENOPROTOOPT`.
+
+### Проверено
+
+Новый сценарий `cnet`, обе архитектуры, установленная система, пример
+`libc/examples/cnet.c` — обычный код POSIX: клиент эхо-сервера хоста
+(`getaddrinfo`, блокирующий `connect`, `send`, `select`, `recv`,
+`getsockname` — `10.0.2.15`, `getpeername`, `fstat` — `S_IFSOCK`,
+`shutdown` и конец потока нулём, `fcntl(O_NONBLOCK)`, `EINPROGRESS`, `poll`
+на запись, `SO_ERROR`, неблокирующий `recv` — `EAGAIN`, служба `http`) —
+21 проверка; сервер (`bind`, `listen`, `accept`, эхо клиенту с хоста);
+`getaddrinfo("example.com")` через DNS — как и `dns`, требует выхода в
+интернет. Первая версия отвечала `getsockname` адресом `0.0.0.0`:
+`SYS_NETINFO` ждёт размер структуры, а получал ноль, — проверка смотрела
+только порт; теперь смотрит и адрес.
+
+Ловушки сборки: `cbuild` собирает слой ОС своим списком, а не берёт
+`libfreeos.a` — новый `.c` надо вписать и туда, и в `sdk.rs`; длины
+массивов `C_PROGRAMS`, `USER_PROGRAMS` и программ установщика — в типе.
+
 ---
 
 # TODO — записано, но не начато

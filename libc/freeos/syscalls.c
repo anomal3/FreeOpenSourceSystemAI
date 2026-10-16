@@ -94,6 +94,22 @@ int freeos_set_errno(long code) {
     case FREEOS_ERR_NO_FILESYSTEM:
         errno = ENODEV;
         break;
+    /* Сеть (фаза 65b). */
+    case FREEOS_ERR_NO_NETWORK:
+        errno = ENETUNREACH;
+        break;
+    case FREEOS_ERR_BAD_SOCKET:
+        errno = ENOTSOCK;
+        break;
+    case FREEOS_ERR_CONN_RESET:
+        errno = ECONNRESET;
+        break;
+    case FREEOS_ERR_CONN_REFUSED:
+        errno = ECONNREFUSED;
+        break;
+    case FREEOS_ERR_IN_PROGRESS:
+        errno = EINPROGRESS;
+        break;
     default:
         errno = EIO;
         break;
@@ -115,7 +131,11 @@ ssize_t read(int fd, void *buf, size_t count) {
 
 int close(int fd) {
     long code = freeos_syscall(SYS_CLOSE, fd, 0, 0);
-    return code < 0 ? freeos_set_errno(code) : 0;
+    if (code < 0) {
+        return freeos_set_errno(code);
+    }
+    freeos_socket_forget(fd);
+    return 0;
 }
 
 /* Открыть файл.
@@ -211,6 +231,9 @@ static void fill_stat(struct stat *out, const struct freeos_stat *info) {
         break;
     case FREEOS_KIND_TERMINAL:
         out->st_mode |= S_IFCHR;
+        break;
+    case FREEOS_KIND_SOCKET:
+        out->st_mode |= S_IFSOCK;
         break;
     default:
         out->st_mode |= S_IFREG;

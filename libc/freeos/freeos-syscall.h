@@ -71,6 +71,11 @@
 #define SYS_WINOWNER 76
 #define SYS_WINPOPUP 77
 #define SYS_WINPLACE 78
+/* Сеть для программ на C (фаза 65b): имя в адрес, своя сеть, сокеты. */
+#define SYS_RESOLVE 32
+#define SYS_NETINFO 33
+#define SYS_SOCKFD 79
+#define SYS_SOCKCTL 80
 
 /* ── Значения, которые эти вызовы принимают и возвращают ──────────────────── */
 
@@ -91,6 +96,22 @@
 #define FREEOS_KIND_PIPE 3
 /* Стандартный поток, за которым терминал (фаза 60). */
 #define FREEOS_KIND_TERMINAL 4
+/* Сокет-дескриптор (фаза 65a). */
+#define FREEOS_KIND_SOCKET 5
+
+/* `SYS_SOCKFD`: вид и флаг (фаза 65a). */
+#define FREEOS_SOCK_UDP 0
+#define FREEOS_SOCK_TCP 1
+#define FREEOS_SOCK_NONBLOCK 1
+
+/* Действия `SYS_SOCKCTL` (фаза 65a). */
+#define FREEOS_SOCKCTL_BIND 1
+#define FREEOS_SOCKCTL_CONNECT 2
+#define FREEOS_SOCKCTL_LISTEN 3
+#define FREEOS_SOCKCTL_ACCEPT 4
+#define FREEOS_SOCKCTL_SHUTDOWN 5
+#define FREEOS_SOCKCTL_NONBLOCK 6
+#define FREEOS_SOCKCTL_INFO 7
 
 /* `кто` у `SYS_SPAWN`: запустить с теми же правами, что у запускающего.
  * Минус единица, а не ноль: ноль — это root, то есть совсем другая просьба. */
@@ -157,6 +178,11 @@
 #define FREEOS_ERR_AGAIN (-17)
 #define FREEOS_ERR_BROKEN_PIPE (-22)
 #define FREEOS_ERR_LIMIT (-24)
+#define FREEOS_ERR_NO_NETWORK (-20)
+#define FREEOS_ERR_BAD_SOCKET (-21)
+#define FREEOS_ERR_CONN_RESET (-25)
+#define FREEOS_ERR_CONN_REFUSED (-26)
+#define FREEOS_ERR_IN_PROGRESS (-27)
 
 /* Раскладка `Stat` — ответа `SYS_STAT` и `SYS_FSTAT`.
  *
@@ -187,6 +213,33 @@ struct freeos_pollfd {
     int64_t fd;
     uint32_t wanted;
     uint32_t ready;
+};
+
+/* Раскладка `SockInfo` — ответа `SYS_SOCKCTL` с `FREEOS_SOCKCTL_INFO` (фаза
+ * 65a). Адреса — IPv4 старшим байтом первым, как число. */
+struct freeos_sockinfo {
+    uint16_t local_port;
+    uint16_t remote_port;
+    uint32_t remote;
+    uint32_t from;
+    uint16_t from_port;
+    uint8_t tcp;
+    uint8_t open;
+    uint8_t peer_closed;
+    uint8_t reset;
+    uint8_t listening;
+    uint8_t _reserved;
+};
+
+/* Раскладка `NetInfo` — ответа `SYS_NETINFO`. */
+struct freeos_netinfo {
+    uint8_t mac[6];
+    uint8_t present;
+    uint8_t _reserved;
+    uint32_t address;
+    uint32_t netmask;
+    uint32_t gateway;
+    uint32_t dns;
 };
 
 /* Раскладка `Timespec` — ответа `SYS_CLOCK` и аргумента `SYS_NANOSLEEP`. */

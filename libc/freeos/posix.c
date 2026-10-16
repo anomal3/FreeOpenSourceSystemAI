@@ -261,85 +261,6 @@ void syslog(int priority, const char *format, ...) {
     va_end(args);
 }
 
-/* ── Сокеты: пока отказ ──────────────────────────────────────────────────── */
-
-/* Все до одного — `ENOSYS`, пока не привязаны к `SYS_SOCKET` и соседям. Не
- * `EAFNOSUPPORT` и не нуль: программа должна понять, что сети у неё нет
- * совсем, а не что ей попался не тот адрес. */
-static int no_sockets(void) {
-    errno = ENOSYS;
-    return -1;
-}
-
-int socket(int domain, int type, int protocol) {
-    (void)domain, (void)type, (void)protocol;
-    return no_sockets();
-}
-int bind(int fd, const struct sockaddr *address, socklen_t length) {
-    (void)fd, (void)address, (void)length;
-    return no_sockets();
-}
-int connect(int fd, const struct sockaddr *address, socklen_t length) {
-    (void)fd, (void)address, (void)length;
-    return no_sockets();
-}
-int listen(int fd, int backlog) {
-    (void)fd, (void)backlog;
-    return no_sockets();
-}
-int accept(int fd, struct sockaddr *address, socklen_t *length) {
-    (void)fd, (void)address, (void)length;
-    return no_sockets();
-}
-ssize_t send(int fd, const void *buf, size_t len, int flags) {
-    (void)fd, (void)buf, (void)len, (void)flags;
-    return no_sockets();
-}
-ssize_t recv(int fd, void *buf, size_t len, int flags) {
-    (void)fd, (void)buf, (void)len, (void)flags;
-    return no_sockets();
-}
-ssize_t sendto(int fd, const void *buf, size_t len, int flags, const struct sockaddr *to, socklen_t length) {
-    (void)fd, (void)buf, (void)len, (void)flags, (void)to, (void)length;
-    return no_sockets();
-}
-ssize_t recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *from, socklen_t *length) {
-    (void)fd, (void)buf, (void)len, (void)flags, (void)from, (void)length;
-    return no_sockets();
-}
-ssize_t sendmsg(int fd, const struct msghdr *message, int flags) {
-    (void)fd, (void)message, (void)flags;
-    return no_sockets();
-}
-ssize_t recvmsg(int fd, struct msghdr *message, int flags) {
-    (void)fd, (void)message, (void)flags;
-    return no_sockets();
-}
-int getsockopt(int fd, int level, int name, void *value, socklen_t *length) {
-    (void)fd, (void)level, (void)name, (void)value, (void)length;
-    return no_sockets();
-}
-int setsockopt(int fd, int level, int name, const void *value, socklen_t length) {
-    (void)fd, (void)level, (void)name, (void)value, (void)length;
-    return no_sockets();
-}
-int getsockname(int fd, struct sockaddr *address, socklen_t *length) {
-    (void)fd, (void)address, (void)length;
-    return no_sockets();
-}
-int getpeername(int fd, struct sockaddr *address, socklen_t *length) {
-    (void)fd, (void)address, (void)length;
-    return no_sockets();
-}
-int shutdown(int fd, int how) {
-    (void)fd, (void)how;
-    return no_sockets();
-}
-int socketpair(int domain, int type, int protocol, int fds[2]) {
-    (void)domain, (void)type, (void)protocol, (void)fds;
-    return no_sockets();
-}
-
 /* ── Ввод-вывод кусками ──────────────────────────────────────────────────── */
 
 /* Кусок за куском; короткий ответ на куске кончает пачку — дальше читать или
@@ -484,29 +405,9 @@ struct protoent *getprotobynumber(int proto) {
     return NULL;
 }
 
-struct servent *getservbyname(const char *name, const char *proto) {
-    (void)name;
-    (void)proto;
-    return NULL;
-}
-
-/* Хост — только готовый адрес: разрешения имён через сеть здесь пока нет. */
-struct hostent *gethostbyname(const char *name) {
-    static struct in_addr address;
-    static char *list[2] = {(char *)&address, NULL};
-    static char *aliases[1] = {NULL};
-    static struct hostent host;
-    if (!inet_aton(name, &address)) {
-        h_errno = HOST_NOT_FOUND;
-        return NULL;
-    }
-    host.h_name = (char *)name;
-    host.h_aliases = aliases;
-    host.h_addrtype = AF_INET;
-    host.h_length = sizeof(address);
-    host.h_addr_list = list;
-    return &host;
-}
+/* `getservbyname`, `gethostbyname`, `getaddrinfo`, `freeaddrinfo`,
+ * `gai_strerror` — в `socket.c` рядом с сокетами (фаза 65b): имя там
+ * разрешается через `SYS_RESOLVE`. */
 
 struct hostent *gethostbyaddr(const void *address, socklen_t length, int family) {
     (void)address;
@@ -514,63 +415,6 @@ struct hostent *gethostbyaddr(const void *address, socklen_t length, int family)
     (void)family;
     h_errno = HOST_NOT_FOUND;
     return NULL;
-}
-
-int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **result) {
-    if (hints != NULL && hints->ai_family != AF_UNSPEC && hints->ai_family != AF_INET) {
-        return EAI_FAMILY;
-    }
-    struct in_addr address = {INADDR_ANY};
-    if (node != NULL && !inet_aton(node, &address)) {
-        return EAI_NONAME;
-    }
-    int port = 0;
-    if (service != NULL) {
-        char *end;
-        long value = strtol(service, &end, 10);
-        if (*end != '\0' || value < 0 || value > 65535) {
-            return EAI_SERVICE;
-        }
-        port = (int)value;
-    }
-    struct addrinfo *info = calloc(1, sizeof(*info) + sizeof(struct sockaddr_in));
-    if (info == NULL) {
-        return EAI_MEMORY;
-    }
-    struct sockaddr_in *socket_address = (struct sockaddr_in *)(info + 1);
-    socket_address->sin_family = AF_INET;
-    socket_address->sin_port = htons((uint16_t)port);
-    socket_address->sin_addr = address;
-    info->ai_family = AF_INET;
-    info->ai_socktype = hints != NULL ? hints->ai_socktype : 0;
-    info->ai_protocol = hints != NULL ? hints->ai_protocol : 0;
-    info->ai_addrlen = sizeof(*socket_address);
-    info->ai_addr = (struct sockaddr *)socket_address;
-    *result = info;
-    return 0;
-}
-
-void freeaddrinfo(struct addrinfo *list) {
-    while (list != NULL) {
-        struct addrinfo *next = list->ai_next;
-        free(list);
-        list = next;
-    }
-}
-
-const char *gai_strerror(int code) {
-    switch (code) {
-    case EAI_NONAME:
-        return "name does not resolve (only numeric IPv4 addresses are understood)";
-    case EAI_FAMILY:
-        return "address family not supported";
-    case EAI_SERVICE:
-        return "service not supported";
-    case EAI_MEMORY:
-        return "out of memory";
-    default:
-        return "address lookup failed";
-    }
 }
 
 int getnameinfo(const struct sockaddr *address, socklen_t length, char *host, socklen_t host_length, char *service,
@@ -830,7 +674,7 @@ int tcflush(int fd, int queue) {
     return 0;
 }
 
-/* `ioctl` — только `FIONREAD`, и отвечает он «хоть один байт» или «ни
+/* `ioctl` — `FIONREAD` и `FIONBIO` (у сокета, фаза 65b). `FIONREAD` отвечает «хоть один байт» или «ни
  * одного»: сколько именно лежит в канале или в терминале, ядро наружу не
  * говорит, а `poll` отвечает на главный вопрос — будет ли `read` ждать.
  * Преуменьшить здесь безопасно (читающий прочтёт не всё за раз), преувеличить —
@@ -847,6 +691,10 @@ int ioctl(int fd, unsigned long op, void *param) {
         }
         *(int *)param = (one.revents & POLLIN) != 0 ? 1 : 0;
         return 0;
+    }
+    /* Неблокирующий режим — у сокета (фаза 65b). */
+    if (op == FIONBIO) {
+        return freeos_socket_set_nonblock(fd, *(int *)param != 0);
     }
     errno = ENOTTY;
     return -1;

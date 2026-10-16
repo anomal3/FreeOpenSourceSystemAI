@@ -1586,8 +1586,8 @@ pub const ALL: &[Scenario] = &[
             // едет, только если собрана по `ports/mono/configure.sh`, иначе 46.
             // Сорок восемь — `cjit` (фаза 59). Сорок девять — `cdraw` (фаза 61a),
             // едет, только если собрана cairo (`cargo xtask thirdparty`).
-            // Пятьдесят — `sockfd` (фаза 65a).
-            Step::Expect("/bin holds 50 programs"),
+            // Пятьдесят — `sockfd` (фаза 65a). Пятьдесят одна — `cnet` (фаза 65b).
+            Step::Expect("/bin holds 51 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -8172,6 +8172,51 @@ pub const ALL: &[Scenario] = &[
             Step::AwaitAny("sshd: encrypted, curve25519-sha256 with chacha20-poly1305", 30_000),
             Step::AwaitAny("sshd: service accepted", 15_000),
 
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "cnet",
+        about: "Сеть из C через сокеты BSD (фаза 65b): getaddrinfo, connect, select, неблокирующее соединение, сервер с accept, имя через DNS.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 2000,
+        host_echo: true,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
+            Step::Wait(2_000),
+            // Клиент эхо-сервера хоста — тем же кодом, что под Linux.
+            Step::Line("run /bin/cnet 10.0.2.2 {echo}"),
+            Step::Await("cnet: echoed 'c-sockets-hello'", 30_000),
+            Step::Await("cnet: done, 0 check(s) failed", 30_000),
+            // Сервер: `bind`, `listen`, `accept`, эхо клиенту с хоста.
+            Step::Line("run -b /bin/cnet serve 2000"),
+            Step::AwaitAny("cnet: listening on port 2000", 30_000),
+            Step::TcpEcho("hello to C", 20_000),
+            Step::AwaitAny("cnet: accepted a client from 10.0.2.2", 15_000),
+            Step::AwaitAny("cnet: served 10 bytes", 30_000),
+            // Имя через DNS — `getaddrinfo` на `SYS_RESOLVE`. Как и у `dns`,
+            // отвечает резолвер хоста: проверка требует выхода в интернет.
+            Step::Line("run /bin/cnet resolve example.com"),
+            Step::Await("cnet: example.com is ", 30_000),
+            Step::Absent("cnet: FAILED"),
+            Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],
     },

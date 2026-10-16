@@ -62,6 +62,9 @@ struct linger {
 #define SOCK_DGRAM 2
 #define SOCK_RAW 3
 #define SOCK_SEQPACKET 5
+/* Флаги в `type` у `socket` и `accept4` (фаза 65b): числа — как у Linux. */
+#define SOCK_NONBLOCK 0x800
+#define SOCK_CLOEXEC 0x80000
 
 #define SOL_SOCKET 1
 #define SO_DEBUG 1
@@ -85,6 +88,7 @@ struct linger {
 #define MSG_OOB 0x1
 #define MSG_PEEK 0x2
 #define MSG_DONTROUTE 0x4
+#define MSG_DONTWAIT 0x40
 #define MSG_WAITALL 0x100
 #define MSG_NOSIGNAL 0x4000
 
@@ -99,6 +103,7 @@ int bind(int fd, const struct sockaddr *address, socklen_t length);
 int connect(int fd, const struct sockaddr *address, socklen_t length);
 int listen(int fd, int backlog);
 int accept(int fd, struct sockaddr *address, socklen_t *length);
+int accept4(int fd, struct sockaddr *address, socklen_t *length, int flags);
 ssize_t send(int fd, const void *buf, size_t len, int flags);
 ssize_t recv(int fd, void *buf, size_t len, int flags);
 ssize_t sendto(int fd, const void *buf, size_t len, int flags, const struct sockaddr *to, socklen_t length);

@@ -191,6 +191,9 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
     // WinForms Mono.
     let window = work.join("window.o");
     cbuild::compile(arch, &cbuild::libc_dir().join("freeos/window.c"), &window, &includes)?;
+    // Сокеты BSD, имена хостов и служб (фаза 65b).
+    let socket = work.join("socket.o");
+    cbuild::compile(arch, &cbuild::libc_dir().join("freeos/socket.c"), &socket, &includes)?;
     let archive = lib.join("libfreeos.a");
     // Архив пересоздаётся, а не дополняется: `llvm-ar r` в существующий файл
     // оставил бы там объектник от прошлой архитектуры, если каталог когда-то
@@ -206,6 +209,7 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
         .arg(&posix)
         .arg(&files)
         .arg(&window)
+        .arg(&socket)
         .status()
         .with_context(|| format!("не удалось запустить {}", ar.display()))?;
     if !status.success() {

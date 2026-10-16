@@ -20,4 +20,13 @@ int freeos_set_errno(long code);
  * путь пуст или вышел длиннее предела. */
 const char *freeos_path(const char *path, char *buf);
 
+/* Сокеты (фаза 65b, `socket.c`). Неблокирующий режим включает и выключает
+ * только libc — она его и помнит по номеру дескриптора: `fcntl(F_GETFL)`
+ * должен отвечать, не спрашивая ядро. Не сокет — `-1` и `ENOTSOCK`. */
+int freeos_socket_set_nonblock(int fd, int on);
+/* Неблокирующий ли сокет `fd`; не сокет — ноль. */
+int freeos_socket_is_nonblock(int fd);
+/* Дескриптор закрыт — забыть о нём (`close`). */
+void freeos_socket_forget(int fd);
+
 #endif

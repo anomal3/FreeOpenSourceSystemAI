@@ -167,7 +167,7 @@ pub struct CProgram {
 }
 
 /// Программы на C, которые едут в `/bin`.
-pub const C_PROGRAMS: [CProgram; 8] = [
+pub const C_PROGRAMS: [CProgram; 9] = [
     CProgram { name: "cdemo", needs: None, libs: &[], includes: &[] },
     // Переполняет свой стек нарочно: доказывает, что канарейка стека есть и у
     // программ на C. См. `libc/examples/csmash.c` и `__stack_chk_fail` в `crt0.c`.
@@ -181,6 +181,9 @@ pub const C_PROGRAMS: [CProgram; 8] = [
     // Слой POSIX под чужую среду: текущий каталог, каталоги, канал с `poll`,
     // пределы, таблица сигналов (фаза 58b). См. `libc/examples/cposix.c`.
     CProgram { name: "cposix", needs: None, libs: &[], includes: &[] },
+    // Сеть из C через сокеты BSD: клиент, сервер, имена (фаза 65b). См.
+    // `libc/examples/cnet.c`.
+    CProgram { name: "cnet", needs: None, libs: &[], includes: &[] },
     // Память кода: функция, записанная в память и вызванная, пока второй
     // поток её исполняет, — W^X по обращению (фаза 59). См. `libc/examples/cjit.c`.
     CProgram { name: "cjit", needs: None, libs: &[], includes: &[] },
@@ -701,7 +704,7 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     // Слой ОС и стартовый код собираются один раз на архитектуру: они одни и те
     // же для всех программ.
     let mut common = Vec::new();
-    for name in ["crt0", "syscalls", "threads", "posix", "files"] {
+    for name in ["crt0", "syscalls", "threads", "posix", "files", "socket"] {
         let source = libc_dir().join("freeos").join(format!("{name}.c"));
         let object = work.join(format!("{name}.o"));
         compile(arch, &source, &object, &includes)?;
@@ -958,6 +961,21 @@ mod tests {
         assert_eq!(core::mem::offset_of!(user_abi::Dirent, name_len), 28);
         assert_eq!(core::mem::offset_of!(user_abi::Dirent, name), 32);
         assert_eq!(fields_of("freeos_pollfd"), ["fd", "wanted", "ready"]);
+        // Фаза 65b: сведения о сокете и о сети.
+        assert_eq!(
+            fields_of("freeos_sockinfo"),
+            [
+                "local_port", "remote_port", "remote", "from", "from_port", "tcp", "open",
+                "peer_closed", "reset", "listening", "_reserved"
+            ]
+        );
+        assert_eq!(size_of::<user_abi::SockInfo>(), 20);
+        assert_eq!(core::mem::offset_of!(user_abi::SockInfo, from_port), 12);
+        assert_eq!(
+            fields_of("freeos_netinfo"),
+            ["mac", "present", "_reserved", "address", "netmask", "gateway", "dns"]
+        );
+        assert_eq!(size_of::<user_abi::NetInfo>(), 24);
         assert_eq!(size_of::<user_abi::PollFd>(), 16);
         assert_eq!(fields_of("freeos_thread_info"), ["id", "stack_low", "stack_high"]);
         assert_eq!(size_of::<user_abi::ThreadInfo>(), 24);
@@ -1041,6 +1059,20 @@ mod tests {
             "SYS_WINOWNER" => abi::SYS_WINOWNER as i64,
             "SYS_WINPOPUP" => abi::SYS_WINPOPUP as i64,
             "SYS_WINPLACE" => abi::SYS_WINPLACE as i64,
+            "SYS_RESOLVE" => abi::SYS_RESOLVE as i64,
+            "SYS_NETINFO" => abi::SYS_NETINFO as i64,
+            "SYS_SOCKFD" => abi::SYS_SOCKFD as i64,
+            "SYS_SOCKCTL" => abi::SYS_SOCKCTL as i64,
+            "SOCK_UDP" => abi::SOCK_UDP as i64,
+            "SOCK_TCP" => abi::SOCK_TCP as i64,
+            "SOCK_NONBLOCK" => abi::SOCK_NONBLOCK as i64,
+            "SOCKCTL_BIND" => abi::SOCKCTL_BIND as i64,
+            "SOCKCTL_CONNECT" => abi::SOCKCTL_CONNECT as i64,
+            "SOCKCTL_LISTEN" => abi::SOCKCTL_LISTEN as i64,
+            "SOCKCTL_ACCEPT" => abi::SOCKCTL_ACCEPT as i64,
+            "SOCKCTL_SHUTDOWN" => abi::SOCKCTL_SHUTDOWN as i64,
+            "SOCKCTL_NONBLOCK" => abi::SOCKCTL_NONBLOCK as i64,
+            "SOCKCTL_INFO" => abi::SOCKCTL_INFO as i64,
 
             "MAP_LAZY" => abi::MAP_LAZY as i64,
             "MAP_JIT" => abi::MAP_JIT as i64,
@@ -1078,6 +1110,7 @@ mod tests {
             "KIND_DIRECTORY" => abi::KIND_DIRECTORY as i64,
             "KIND_PIPE" => abi::KIND_PIPE as i64,
             "KIND_TERMINAL" => abi::KIND_TERMINAL as i64,
+            "KIND_SOCKET" => abi::KIND_SOCKET as i64,
 
             "SPAWN_INHERIT" => abi::SPAWN_INHERIT as i64,
 
@@ -1101,6 +1134,11 @@ mod tests {
             "ERR_AGAIN" => abi::ERR_AGAIN,
             "ERR_BROKEN_PIPE" => abi::ERR_BROKEN_PIPE,
             "ERR_LIMIT" => abi::ERR_LIMIT,
+            "ERR_NO_NETWORK" => abi::ERR_NO_NETWORK,
+            "ERR_BAD_SOCKET" => abi::ERR_BAD_SOCKET,
+            "ERR_CONN_RESET" => abi::ERR_CONN_RESET,
+            "ERR_CONN_REFUSED" => abi::ERR_CONN_REFUSED,
+            "ERR_IN_PROGRESS" => abi::ERR_IN_PROGRESS,
 
             _ => return None,
         };
