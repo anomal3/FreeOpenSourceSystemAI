@@ -100,6 +100,25 @@ opt-level = 2
 [profile.dev.package.user-progs]
 opt-level = 2
 
+# Всё, что не наше, — тоже с оптимизацией: сторонние крейты (куча ядра
+# `linked_list_allocator`, подпись) и то, что собирает `build-std` (`core`,
+# `alloc`, `compiler_builtins` с их `memcpy` и `memset`). Плюс `ext2` и
+# `disk`, через которые читаются файлы. Замер 16.10 (фаза 63b, `popups.exe`,
+# от `Main` до созданной формы): отладочное ядро — 49,3 с на x86-64 и 46,8 с
+# на aarch64, release — 4,4 и 5,7 с; одни сторонние и `build-std` — 6,1 и
+# 10,7 с, вместе с `ext2` и `disk` — 4,7 и 6,1 с. Mono трогает десятки тысяч
+# страниц и читает мегабайты сборок, и каждая новая страница — `memset` по
+# байту, если `compiler_builtins` не оптимизирован. Проверки переполнения и
+# `debug_assert` остаются, как и у ядра выше.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.ext2]
+opt-level = 2
+
+[profile.dev.package.disk]
+opt-level = 2
+
 [profile.release]
 lto = true
 opt-level = "s"

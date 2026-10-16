@@ -17,6 +17,7 @@
 // Язык — C# 5: другого у csc из .NET Framework нет.
 
 using System;
+using System.Diagnostics;
 using System.Drawing;
 using System.Windows.Forms;
 
@@ -28,6 +29,16 @@ class PopupsForm : Form
     readonly TextBox box;
     readonly Button corner;
     bool shown;
+
+    // Сколько прошло от входа в `Main`: замер медленного первого показа формы
+    // (фаза 63, «что тормозит у Mono»). В поток ошибок — строки сценария это
+    // не трогает.
+    static readonly Stopwatch clock = Stopwatch.StartNew ();
+
+    static void Mark (string what)
+    {
+        Console.Error.WriteLine ("popups-time: " + what + " " + clock.ElapsedMilliseconds + " ms");
+    }
 
     public PopupsForm ()
     {
@@ -56,7 +67,10 @@ class PopupsForm : Form
         combo.Size = new Size (160, 21);
         combo.Items.AddRange (new object[] { "one", "two", "three" });
         combo.SelectedIndex = 0;
-        combo.DropDown += delegate { Console.WriteLine ("popups: combo dropped, item height " + combo.ItemHeight); };
+        combo.DropDown += delegate {
+            Mark ("combo dropped");
+            Console.WriteLine ("popups: combo dropped, item height " + combo.ItemHeight);
+        };
         combo.SelectedIndexChanged += delegate { Console.WriteLine ("popups: combo " + combo.SelectedItem); };
 
         // Поле для выделения мышью: 12,50 размером 220x24.
@@ -138,7 +152,9 @@ class PopupsForm : Form
         Controls.Add (list);
         Controls.Add (corner);
 
+        Mark ("constructed");
         Shown += delegate {
+            Mark ("shown");
             shown = true;
             Console.WriteLine ("popups: shown " + ClientSize.Width + "x" + ClientSize.Height);
         };
@@ -150,6 +166,7 @@ class PopupsForm : Form
         Application.Idle += delegate {
             if (shown && !ready) {
                 ready = true;
+                Mark ("ready");
                 Console.WriteLine ("popups: ready");
             }
         };
@@ -166,6 +183,7 @@ class PopupsForm : Form
     [STAThread]
     static int Main ()
     {
+        Mark ("main");
         Application.Run (new PopupsForm ());
         Console.WriteLine ("popups: done");
         return 0;
