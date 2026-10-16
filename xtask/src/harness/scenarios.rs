@@ -1588,7 +1588,8 @@ pub const ALL: &[Scenario] = &[
             // едет, только если собрана cairo (`cargo xtask thirdparty`).
             // Пятьдесят — `sockfd` (фаза 65a). Пятьдесят одна — `cnet` (фаза 65b).
             // Пятьдесят две — `ctls` (фаза 65c), едет, только если собран mbedTLS.
-            Step::Expect("/bin holds 52 programs"),
+            // Пятьдесят три — `curl` (фаза 65d), если собран `thirdparty`.
+            Step::Expect("/bin holds 53 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -8261,6 +8262,52 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run /bin/ctls 10.0.2.2 {stranger} /etc/ca.pem /blob"),
             Step::Await("ctls: the certificate is rejected: ", 120_000),
             Step::Absent("ctls: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "curl",
+        about: "curl 8.23 на libcurl, mbedTLS и сокетах BSD (фаза 65d): HTTP и HTTPS с хоста, корни из /etc/ca.pem, чужой корень отвергнут.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        // Серверы и корень — те же, что у `update-tls` и `ctls`.
+        host_repo: true,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 120_000),
+            Step::Wait(2_000),
+            // Что собрано: версия и TLS — mbedTLS, не наш `crates/tls`.
+            Step::Line("run /bin/curl --version"),
+            Step::Await("curl 8.23.0", 60_000),
+            Step::Await("mbedTLS/3.6.7", 15_000),
+            // HTTP: полмегабайта в файл. Итог печатает сама curl (`-w`) — код
+            // ответа и число байт; пробелов в ключе нет — их режет оболочка.
+            Step::Line("run /bin/curl -sS -o /home/roman/blob -w code=%{http_code},bytes=%{size_download} http://10.0.2.2:{repo}/blob"),
+            Step::Await("code=200,bytes=524288", 120_000),
+            // HTTPS с корнем по умолчанию — `/etc/ca.pem`, без `--cacert`:
+            // проверка цепочки не выключена, `ssl_verify_result` — ноль.
+            Step::Line("run /bin/curl -sS -o /home/roman/blob -w code=%{http_code},bytes=%{size_download},verify=%{ssl_verify_result} https://10.0.2.2:{tls}/blob"),
+            Step::Await("code=200,bytes=524288,verify=0", 120_000),
+            // Чужой корень: отказ с кодом 60 — «сертификат не проверен».
+            Step::Line("run /bin/curl -sS -o /home/roman/blob https://10.0.2.2:{stranger}/blob"),
+            Step::Await("curl: (60)", 120_000),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],

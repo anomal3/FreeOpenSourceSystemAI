@@ -228,7 +228,10 @@ pub const C_PROGRAMS: [CProgram; 10] = [
 /// `mono` (фаза 58b) — рантайм Mono 6.14.1, собранный своим `configure` по
 /// рецепту `ports/mono/configure.sh`. Библиотеки классов к нему — [`MONO_BCL`]
 /// (фаза 60).
-pub const FOREIGN_PROGRAMS: [&str; 2] = ["lua", "mono"];
+///
+/// `curl` (фаза 65d) — программа самого curl 8.23 поверх libcurl, mbedTLS и
+/// zlib, собранная его `configure`.
+pub const FOREIGN_PROGRAMS: [&str; 3] = ["lua", "mono", "curl"];
 
 /// Библиотеки классов Mono, которые едут в образ рядом с `/bin/mono` (фаза 60):
 /// имя сборки и каталог в образе.

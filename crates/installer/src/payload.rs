@@ -293,7 +293,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 53] = [
+const PROGRAMS: [(&CStr16, &str); 54] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -382,6 +382,9 @@ const PROGRAMS: [(&CStr16, &str); 53] = [
     // Рантайм Mono 6.14.1 (фаза 58b): едет, только если собран по рецепту
     // `ports/mono/configure.sh`, — как Lua без `cargo xtask thirdparty`.
     (cstr16!("\\FREEOS\\BIN\\MONO"), "mono"),
+    // curl 8.23 (фаза 65d): HTTP и HTTPS из командной строки, корни — из
+    // `/etc/ca.pem`. Едет, только если собран `cargo xtask thirdparty`.
+    (cstr16!("\\FREEOS\\BIN\\CURL"), "curl"),
 ];
 
 /// Эталонные настройки на носителе и их пути в корневом образе.

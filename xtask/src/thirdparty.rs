@@ -87,7 +87,8 @@ enum How {
 /// Свои ключи проекта, собираемого GNU `configure`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Autotools {
-    /// Ключи `configure` сверх общих.
+    /// Ключи `configure` сверх общих; `{prefix}` заменяется на sysroot
+    /// архитектуры, как и в [`Autotools::make`].
     configure: &'static [&'static str],
     /// Переменные `make` — и сборке, и установке. Обычно `SUBDIRS=<библиотека>`,
     /// чтобы не собирать тесты и примеры, которым нужно то, чего в системе нет
@@ -139,7 +140,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 10] = [
+const PROJECTS: [Project; 11] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -362,6 +363,64 @@ const PROJECTS: [Project; 10] = [
             "include/psa/crypto.h",
         ],
     },
+    // HTTP и HTTPS для программ на C (фаза 65d) — и программа `curl`. TLS —
+    // mbedTLS выше, сжатие — zlib. Хеш — с curl.se/info (сверено 2026-10-17).
+    Project {
+        name: "curl",
+        version: "8.23.0",
+        url: "https://curl.se/download/curl-8.23.0.tar.gz",
+        sha256: "e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49",
+        unpacked: "curl-8.23.0",
+        how: Autotools::plain(
+            &[
+                "--with-mbedtls={prefix}",
+                "--with-zlib={prefix}",
+                // Корни — те же, что у `fetch` и `sysupdate`. Путь цели уходит
+                // в `curl_config.h`, а не в ключ компилятора, и sh из Git его
+                // не переписывает (см. `Autotools::keep_paths`).
+                "--with-ca-bundle=/etc/ca.pem",
+                "--without-ca-path",
+                // Имена разрешает `getaddrinfo` поверх `SYS_RESOLVE`, сразу;
+                // поток на каждое имя ничего не дал бы.
+                "--disable-threaded-resolver",
+                // Канал пробуждения `curl_multi_wakeup` — неблокирующий `pipe2`,
+                // а каналы у нас только блокирующие (`F_SETFL` им отвечает
+                // `ENOSYS`), и без него `curl_multi_init` отказывает целиком.
+                // Будить чужой поток посреди ожидания программе `curl` не нужно;
+                // понадобится — неблокирующие каналы в ядре, не обход здесь.
+                "--disable-socketpair",
+                // `memset_explicit` в libc есть, но picolibc объявляет его только
+                // для C23, а `configure` проверяет одну компоновку — и curl
+                // зовёт необъявленную функцию. Без него curl берёт
+                // `explicit_bzero`, как у всякой newlib.
+                "ac_cv_func_memset_explicit=no",
+                // Чего в системе нет: IPv6, сокетов Unix, LDAP; HTTP/2, IDN,
+                // PSL, Brotli и zstd — чужие библиотеки, которых нет в наборе.
+                "--disable-ipv6",
+                "--disable-unix-sockets",
+                "--disable-ldap",
+                "--disable-ldaps",
+                "--without-nghttp2",
+                "--without-libidn2",
+                "--without-libpsl",
+                "--without-brotli",
+                "--without-zstd",
+                "--without-libssh2",
+                // Руководство встраивается в программу и пересобирается perl.
+                "--disable-manual",
+                "--disable-docs",
+                // Дополнения для zsh и fish порождаются запуском самой `curl` —
+                // программы цели, на машине сборки.
+                "--without-zsh-functions-dir",
+                "--without-fish-functions-dir",
+            ],
+            // `SUBDIRS` не сужается: у curl тесты и так вне сборки по
+            // умолчанию, а переменная командной строки уходит и во вложенные
+            // `make` — `include/` искал бы у себя `lib/`.
+            &[],
+        ),
+        installs: &["lib/libcurl.a", "include/curl/curl.h", "bin/curl", "lib/pkgconfig/libcurl.pc"],
+    },
     Project {
         name: "dejavu",
         version: "2.37",
@@ -530,7 +589,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
                     // всякого проекта, а `g++` с приставкой в наборе нет.
                     "./configure --host={triple} --prefix={prefix} --disable-shared --enable-static \
                      LD={triple}-ld CXX={triple}-cc CXXCPP=\"{triple}-cc -E\" {}",
-                    own.configure.join(" ")
+                    own.configure.join(" ").replace("{prefix}", &prefix)
                 ),
                 &format!("configure {} {}", project.name, arch.name()),
             )?;
