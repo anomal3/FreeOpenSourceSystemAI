@@ -21,7 +21,7 @@
 #![no_main]
 
 use user_progs::{
-    Args, ERR_BROKEN_PIPE, ERR_NOT_FOUND, ERR_PERMISSION, FD_STDIN, close, exit, open, print,
+    Args, ERR_BROKEN_PIPE, ERR_NOT_FOUND, ERR_PERMISSION, FD_STDIN, Line, close, exit, open,
     println, read, write,
 };
 use user_abi::FD_STDOUT;
@@ -47,17 +47,14 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
                 // «нет такого файла» и «читать его вам нельзя» — разные ответы
                 // и лечатся по-разному. Всё остальное печатается числом: врать
                 // про причину хуже, чем назвать код.
-                print("cat: ");
-                print(path);
+                let mut line = Line::new();
+                line.str("cat: ").str(path);
                 match fd {
-                    ERR_PERMISSION => println(": permission denied"),
-                    ERR_NOT_FOUND => println(": no such file"),
-                    other => {
-                        print(": error ");
-                        print_i64(other);
-                        println("");
-                    }
-                }
+                    ERR_PERMISSION => line.str(": permission denied"),
+                    ERR_NOT_FOUND => line.str(": no such file"),
+                    other => line.str(": error ").signed(other),
+                };
+                line.end();
                 exit(1);
             }
             (fd, true)
@@ -105,28 +102,4 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         close(fd);
     }
     exit(code)
-}
-
-/// Напечатать число со знаком — только для сообщения об ошибке.
-fn print_i64(value: i64) {
-    if value < 0 {
-        print("-");
-    }
-    let mut digits = [0u8; 20];
-    let mut len = 0;
-    let mut left = value.unsigned_abs();
-    loop {
-        digits[len] = b'0' + (left % 10) as u8;
-        len += 1;
-        left /= 10;
-        if left == 0 {
-            break;
-        }
-    }
-    while len > 0 {
-        len -= 1;
-        let byte = [digits[len]];
-        // SAFETY: цифра — это ASCII, то есть заведомо годный UTF-8.
-        print(unsafe { core::str::from_utf8_unchecked(&byte) });
-    }
 }

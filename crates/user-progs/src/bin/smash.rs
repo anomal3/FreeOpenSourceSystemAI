@@ -21,7 +21,7 @@
 #![no_main]
 
 use user_abi::PROCESS_PAGE;
-use user_progs::{Args, exit, print, print_u64, println};
+use user_progs::{Args, Line, exit, println};
 
 /// Переполнить буфер на своём стеке, затерев канарейку.
 ///
@@ -103,8 +103,9 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     overrun(core::hint::black_box(top));
     // Сюда доходят только без канарейки — и то лишь если затёртый адрес
     // возврата случайно оказался исполняемым.
-    print("smash: returned from the overrun at ");
-    print_u64(top as u64);
-    println("");
+    Line::new()
+        .str("smash: returned from the overrun at ")
+        .num(top as u64)
+        .end();
     exit(1)
 }

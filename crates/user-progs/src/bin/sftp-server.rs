@@ -38,7 +38,7 @@ use user_abi::{
     SEEK_SET, Stat,
 };
 use user_progs::{
-    Args, close, create, error, exit, fstat, gid, mkdir, open, open_write, read, readdir_raw,
+    Args, Line, close, create, error, exit, fstat, gid, mkdir, open, open_write, read, readdir_raw,
     remove, rename, seek, stat, uid, write,
 };
 
@@ -64,14 +64,14 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
 
     // Кто мы — в журнал первой строкой: весь смысл программы в том, что это
     // **не** root, и стенд проверяет именно это.
-    let mut digits = [0u8; 20];
-    error("sftp-server: session for uid ");
-    error(sftp::decimal(u64::from(uid()), &mut digits));
-    error(" gid ");
-    error(sftp::decimal(u64::from(gid()), &mut digits));
-    error(" in ");
-    error(home);
-    error("\n");
+    Line::to_log()
+        .str("sftp-server: session for uid ")
+        .num(u64::from(uid()))
+        .str(" gid ")
+        .num(u64::from(gid()))
+        .str(" in ")
+        .str(home)
+        .end();
 
     let mut server = Server::new(Kernel, home);
     // SAFETY: программа однопоточная, оба буфера используются только здесь и
@@ -129,15 +129,17 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
 
     server.close_all();
     let totals = server.totals;
-    error("sftp-server: session over: ");
-    error(sftp::decimal(totals.requests, &mut digits));
-    error(" request(s), ");
-    error(sftp::decimal(totals.bytes_written, &mut digits));
-    error(" byte(s) written, ");
-    error(sftp::decimal(totals.bytes_read, &mut digits));
-    error(" byte(s) read, ");
-    error(sftp::decimal(totals.errors, &mut digits));
-    error(" error reply(ies)\n");
+    Line::to_log()
+        .str("sftp-server: session over: ")
+        .num(totals.requests)
+        .str(" request(s), ")
+        .num(totals.bytes_written)
+        .str(" byte(s) written, ")
+        .num(totals.bytes_read)
+        .str(" byte(s) read, ")
+        .num(totals.errors)
+        .str(" error reply(ies)")
+        .end();
     exit(code)
 }
 
@@ -282,19 +284,20 @@ impl sftp::Fs for Kernel {
         // терминала человека, читающего журнал, — это уже не диагностика, а
         // команда его терминалу; поэтому всё, кроме печатного ASCII, выходит
         // знаком вопроса.
+        let mut line = Line::to_log();
         let mut staged = [0u8; 128];
         let mut len = 0usize;
         for byte in parts.iter().flat_map(|part| part.bytes()) {
             if len == staged.len() {
                 // SAFETY: в буфер попадает только печатный ASCII.
-                error(unsafe { core::str::from_utf8_unchecked(&staged[..len]) });
+                line.str(unsafe { core::str::from_utf8_unchecked(&staged[..len]) });
                 len = 0;
             }
             staged[len] = if byte.is_ascii_graphic() || byte == b' ' { byte } else { b'?' };
             len += 1;
         }
         // SAFETY: то же.
-        error(unsafe { core::str::from_utf8_unchecked(&staged[..len]) });
-        error("\n");
+        line.str(unsafe { core::str::from_utf8_unchecked(&staged[..len]) });
+        line.end();
     }
 }

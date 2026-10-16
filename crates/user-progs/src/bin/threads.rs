@@ -37,7 +37,7 @@
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use user_progs::{
-    Args, Lock, cpu, exit, mmap, mprotect, print, print_u64, println, set_tls, sleep_ms, thread_create,
+    Args, Line, Lock, cpu, exit, mmap, mprotect, println, set_tls, sleep_ms, thread_create,
     thread_exit,
 };
 
@@ -154,9 +154,12 @@ extern "C" fn worker(index: usize) -> ! {
         TLS_WRONG.fetch_add(1, Ordering::Relaxed);
     }
 
-    print("threads: worker ");
-    print_u64(index as u64);
-    println(" done");
+    // Строки печатают четыре потока разом: каждая — одним `write`, см. `Line`.
+    Line::new()
+        .str("threads: worker ")
+        .num(index as u64)
+        .str(" done")
+        .end();
     DONE.fetch_add(1, Ordering::Relaxed);
     thread_exit(0)
 }
@@ -199,11 +202,12 @@ fn check_tlb() -> ! {
     sleep_ms(200);
     let mine = cpu();
     let theirs = TLB_WRITER_CPU.load(Ordering::Acquire).saturating_sub(1);
-    print("threads: the writer is on cpu ");
-    print_u64(theirs as u64);
-    print(", this thread on cpu ");
-    print_u64(mine);
-    println("");
+    Line::new()
+        .str("threads: the writer is on cpu ")
+        .num(theirs as u64)
+        .str(", this thread on cpu ")
+        .num(mine)
+        .end();
     if theirs as u64 == mine {
         println("threads: FAILED both threads share a processor, nothing is proven");
         exit(1);
@@ -226,9 +230,11 @@ fn check_tlb() -> ! {
         println("threads: the writer stopped at the read-only page");
         exit(0);
     }
-    print("threads: FAILED the writer kept writing, ");
-    print_u64(second - first);
-    println(" more increments after mprotect");
+    Line::new()
+        .str("threads: FAILED the writer kept writing, ")
+        .num(second - first)
+        .str(" more increments after mprotect")
+        .end();
     exit(1)
 }
 
@@ -279,9 +285,10 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     for index in 0..THREADS {
         match thread_create(worker, index, STACK_BYTES) {
             Some(id) => {
-                print("threads: started thread ");
-                print_u64(u64::from(id));
-                println("");
+                Line::new()
+                    .str("threads: started thread ")
+                    .num(u64::from(id))
+                    .end();
             }
             None => {
                 println("threads: could not create a thread");
@@ -301,32 +308,40 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
 
     // SAFETY: все потоки закончили — сюда мы дошли, только дождавшись их.
     let guarded = unsafe { core::ptr::read_volatile(&raw const GUARDED) };
-    print("threads: guarded counter is ");
-    print_u64(guarded);
-    print(" of ");
-    print_u64(u64::from(STEPS) * THREADS as u64);
-    println("");
-    print("threads: the lock put someone to sleep ");
-    print_u64(u64::from(LOCK.sleeps()));
-    println(" time(s)");
+    Line::new()
+        .str("threads: guarded counter is ")
+        .num(guarded)
+        .str(" of ")
+        .num(u64::from(STEPS) * THREADS as u64)
+        .end();
+    Line::new()
+        .str("threads: the lock put someone to sleep ")
+        .num(u64::from(LOCK.sleeps()))
+        .str(" time(s)")
+        .end();
 
-    print("threads: counter is ");
-    print_u64(u64::from(COUNTER.load(Ordering::Relaxed)));
-    print(" of ");
-    print_u64(u64::from(STEPS) * THREADS as u64);
-    println("");
+    Line::new()
+        .str("threads: counter is ")
+        .num(u64::from(COUNTER.load(Ordering::Relaxed)))
+        .str(" of ")
+        .num(u64::from(STEPS) * THREADS as u64)
+        .end();
 
-    print("threads: ");
-    print_u64(DONE.load(Ordering::Relaxed) as u64);
-    println(" thread(s) finished, and the process is still here");
+    Line::new()
+        .str("threads: ")
+        .num(DONE.load(Ordering::Relaxed) as u64)
+        .str(" thread(s) finished, and the process is still here")
+        .end();
 
     let wrong = TLS_WRONG.load(Ordering::Relaxed);
     if wrong == 0 {
         println("threads: every thread read back its own storage");
     } else {
-        print("threads: ");
-        print_u64(wrong as u64);
-        println(" thread(s) read someone else's storage");
+        Line::new()
+            .str("threads: ")
+            .num(wrong as u64)
+            .str(" thread(s) read someone else's storage")
+            .end();
     }
     exit(0)
 }

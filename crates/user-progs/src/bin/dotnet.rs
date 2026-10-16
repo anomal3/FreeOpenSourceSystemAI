@@ -92,9 +92,26 @@ struct Console {
     face: Option<&'static Face>,
     /// Имя программы без `.dll` — заголовок окна, которому C# не дал своего.
     program: String,
+    /// Начатая, но не законченная строка вывода.
+    ///
+    /// `Console.Write` за `Console.Write` уходили ядру отдельными `write`, и
+    /// строку, собранную из нескольких, разрывал вывод соседней задачи:
+    /// `blend: 128,0,0,255init: started 'sshd' as #14` (полный прогон 15.10).
+    /// Атомарен один `write`, поэтому ядру уходят только целые строки — как у
+    /// stdout в Unix, буферизованного по строкам.
+    pending: String,
 }
 
 impl Console {
+    /// Отдать ядру начатую строку, не дожидаясь её конца: перед паузой, перед
+    /// ожиданием окна и на выходе, иначе подсказка без перевода строки молчала бы.
+    fn flush_out(&mut self) {
+        if !self.pending.is_empty() {
+            print(&self.pending);
+            self.pending.clear();
+        }
+    }
+
     /// Приготовить рисование при первом окне: формат точки, тема и шрифт.
     /// `None` — графики у машины нет.
     fn graphics(&mut self) -> Option<&'static Face> {
@@ -130,7 +147,11 @@ impl Console {
 
 impl Host for Console {
     fn write_out(&mut self, text: &str) {
-        print(text);
+        self.pending.push_str(text);
+        if let Some(end) = self.pending.rfind('\n') {
+            print(&self.pending[..=end]);
+            self.pending.drain(..=end);
+        }
     }
 
     fn current_dir(&mut self) -> String {
@@ -268,6 +289,7 @@ impl Host for Console {
     }
 
     fn sleep(&mut self, milliseconds: u32) {
+        self.flush_out();
         sleep_ms(u64::from(milliseconds));
     }
 
@@ -385,6 +407,7 @@ impl Host for Console {
     }
 
     fn window_event(&mut self, window: u32) -> Option<WindowEvent> {
+        self.flush_out();
         let event = self.window_mut(window)?.window.next_event()?;
         match event.kind {
             WIN_KEY => Some(WindowEvent::Key { symbol: event.code, mods: event.x as u32, latin: event.y as u32 }),
@@ -550,6 +573,7 @@ extern "C" fn run(start: usize) -> ! {
         windows: Vec::new(),
         face: None,
         program: String::from(name.strip_suffix(".dll").unwrap_or(name)),
+        pending: String::new(),
     };
     let mut vm = match Vm::new(&data, &corelib, console) {
         Ok(vm) => vm,
@@ -566,16 +590,23 @@ extern "C" fn run(start: usize) -> ! {
     ));
 
     vm.set_program_path(path);
-    match vm.run_main(&program_args) {
-        Ok(code) => {
-            // `Environment.Exit` — не возврат из `Main`, и журнал это различает.
-            let how = if vm.exited() { format!("Environment.Exit({code})") } else { format!("Main returned {code}") };
-            error(&format!(
-                "dotnet: {name}: {how} after {} instruction(s), {} object(s), {} collection(s)\n",
-                vm.instructions,
-                vm.object_count(),
-                vm.collections()
-            ));
+    // Сводка снимается до того, как среда отдаст хоста: дописать начатую
+    // строку программы нужно раньше, чем журнал скажет, чем она кончилась.
+    let outcome = vm.run_main(&program_args).map(|code| {
+        // `Environment.Exit` — не возврат из `Main`, и журнал это различает.
+        let how = if vm.exited() { format!("Environment.Exit({code})") } else { format!("Main returned {code}") };
+        let summary = format!(
+            "dotnet: {name}: {how} after {} instruction(s), {} object(s), {} collection(s)\n",
+            vm.instructions,
+            vm.object_count(),
+            vm.collections()
+        );
+        (code, summary)
+    });
+    vm.into_host().flush_out();
+    match outcome {
+        Ok((code, summary)) => {
+            error(&summary);
             exit(i64::from(code))
         }
         Err(failure) => {

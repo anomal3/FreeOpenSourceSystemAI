@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use user_progs::{error, error_num, exit, pid, sleep_ms};
+use user_progs::{Line, exit, pid, sleep_ms};
 
 /// С каким кодом заканчиваться. Не единица: единицу возвращает слишком многое,
 /// а по журналу должно быть видно, что это именно она.
@@ -26,12 +26,15 @@ const LIVE_MS: u64 = 50;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    error("svcbad: up as #");
-    error_num(pid() as i64);
-    error(", and about to fail on purpose\n");
+    Line::to_log()
+        .str("svcbad: up as #")
+        .signed(pid() as i64)
+        .str(", and about to fail on purpose")
+        .end();
     sleep_ms(LIVE_MS);
-    error("svcbad: failing with code ");
-    error_num(CODE);
-    error("\n");
+    Line::to_log()
+        .str("svcbad: failing with code ")
+        .signed(CODE)
+        .end();
     exit(CODE)
 }

@@ -36,7 +36,7 @@
 
 use core::arch::global_asm;
 
-use user_progs::{Args, cpu, exit, pid, print, print_u64, println, uptime_ms};
+use user_progs::{Args, Line, cpu, exit, pid, uptime_ms};
 
 /// Сколько витков крутит [`spin_burn`] в молчащем режиме.
 ///
@@ -110,19 +110,23 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
 
     let start = uptime_ms();
 
-    print("spin ");
-    print_u64(me);
-    println(": no system calls from here on");
+    Line::new()
+        .str("spin ")
+        .num(me)
+        .str(": no system calls from here on")
+        .end();
 
     // SAFETY: функция не трогает ни память, ни стек — только собственный
     // счётчик в регистре аргумента.
     unsafe { spin_burn(ROUNDS) };
 
-    print("spin ");
-    print_u64(me);
-    print(": done after ");
-    print_u64(uptime_ms() - start);
-    println(" ms, never yielded once");
+    Line::new()
+        .str("spin ")
+        .num(me)
+        .str(": done after ")
+        .num(uptime_ms() - start)
+        .str(" ms, never yielded once")
+        .end();
     exit(0)
 }
 
@@ -143,20 +147,18 @@ fn burn(me: u64, ms: u64) -> ! {
     // Строка собирается целиком и уходит одним вызовом: соседняя программа
     // печатает то же самое в тот же миг, и строка, отправленная кусками,
     // срослась бы с её строкой.
-    let mut line = Text::new();
-    line.push("spin ");
-    line.number(me);
-    line.push(": burned ");
-    line.number(elapsed);
-    line.push(" ms on cpus");
+    let mut line = Line::new();
+    line.str("spin ")
+        .num(me)
+        .str(": burned ")
+        .num(elapsed)
+        .str(" ms on cpus");
     for index in 0..64 {
         if seen & (1 << index) != 0 {
-            line.push(" ");
-            line.number(index);
+            line.str(" ").num(index);
         }
     }
-    line.push("\n");
-    print(line.as_str());
+    line.end();
     exit(0)
 }
 
@@ -173,52 +175,4 @@ fn parse_u64(text: &str) -> Option<u64> {
         value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
     }
     Some(value)
-}
-
-/// Строка фиксированной длины на стеке — ради одного вызова `write`.
-struct Text {
-    bytes: [u8; 192],
-    len: usize,
-}
-
-impl Text {
-    const fn new() -> Self {
-        Self { bytes: [0; 192], len: 0 }
-    }
-
-    /// Дописать текст; не поместившееся отбрасывается, а не роняет программу.
-    fn push(&mut self, text: &str) {
-        for &byte in text.as_bytes() {
-            if self.len == self.bytes.len() {
-                return;
-            }
-            self.bytes[self.len] = byte;
-            self.len += 1;
-        }
-    }
-
-    fn number(&mut self, mut value: u64) {
-        let mut digits = [0u8; 20];
-        let mut at = digits.len();
-        loop {
-            at -= 1;
-            digits[at] = b'0' + (value % 10) as u8;
-            value /= 10;
-            if value == 0 {
-                break;
-            }
-        }
-        for &digit in &digits[at..] {
-            if self.len == self.bytes.len() {
-                return;
-            }
-            self.bytes[self.len] = digit;
-            self.len += 1;
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        // Внутрь попадают только ASCII-цифры и куски `&str` целиком.
-        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
-    }
 }

@@ -490,8 +490,17 @@ fn stamp_text(payload: &[Payload], kind: Kind) -> String {
 
 /// Готовит чистый диск, на который будет ставить установщик.
 ///
-/// Файл создаётся разрежённым (`set_len` не пишет ни байта) — гигабайт нулей
-/// на диске хоста ради того, чтобы установщик их перезаписал, никому не нужен.
+/// Файл создаётся разрежённым — гигабайт нулей на диске хоста ради того, чтобы
+/// установщик их перезаписал, никому не нужен.
+///
+/// На Windows одного `set_len` для этого мало: NTFS сдвигает конец файла, но
+/// разрежённым его не делает, и первая запись в хвост (резервная GPT на
+/// последних секторах) заставляет файловую систему хоста **синхронно**
+/// заполнить нулями всё, что перед ней. На 3 ГиБ и внешнем SSD это секунды —
+/// дольше, чем драйвер NVMe прошивки ждёт ответа на команду:
+/// `NvmExpressPassThru: Timeout`, и `install4k` падал на всех четырёх сборках
+/// (полный прогон 15.10, после того как диск вырос с 2 до 3 ГиБ). Замер того
+/// же хвоста: 870 мс без флага на системном NVMe, 2 мс с флагом.
 pub fn prepare_target(arch: Arch, release: bool, size_mib: u64, fresh: bool) -> Result<PathBuf> {
     let path = paths::target_disk(arch, release);
     if let Some(parent) = path.parent() {
@@ -514,10 +523,35 @@ pub fn prepare_target(arch: Arch, release: bool, size_mib: u64, fresh: bool) -> 
     }
     let file = fs::File::create(&path)
         .with_context(|| format!("не удалось создать целевой диск {}", path.display()))?;
+    make_sparse(&path)?;
     file.set_len(size)
         .with_context(|| format!("не удалось задать размер {size} байт для {}", path.display()))?;
     say!("целевой диск: {} ({size_mib} МиБ, пустой)", path.display());
     Ok(path)
+}
+
+/// Пометить только что созданный (ещё пустой) файл разрежённым.
+///
+/// Через `fsutil`, а не `DeviceIoControl`: ради одного вызова тянуть в xtask
+/// привязки к Win32 незачем, а прав администратора `setflag` на своём файле не
+/// требует. На прочих системах `set_len` и так даёт дыру.
+#[cfg(windows)]
+fn make_sparse(path: &Path) -> Result<()> {
+    let status = std::process::Command::new("fsutil")
+        .args(["sparse", "setflag"])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .context("не удалось запустить fsutil")?;
+    if !status.success() {
+        bail!("fsutil не пометил {} разрежённым: {status}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn make_sparse(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Готовит диск с томом btrfs — тем самым образцом, что лежит в

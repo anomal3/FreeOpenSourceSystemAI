@@ -11,8 +11,8 @@
 #![no_main]
 
 use user_progs::{
-    Args, close_socket, connect, error, error_num, exit, print, println, recv, send, shutdown,
-    sleep_ms, stream, stream_state, uptime_ms, wait_connected, ERR_AGAIN,
+    Args, close_socket, connect, error, exit, recv, send, shutdown, sleep_ms, stream, stream_state,
+    uptime_ms, wait_connected, Line, ERR_AGAIN,
 };
 
 /// Сколько ждать установления связи.
@@ -58,9 +58,10 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
             continue;
         }
         if wrote < 0 {
-            error("echoc: send failed with code ");
-            error_num(wrote);
-            error("\n");
+            Line::to_log()
+                .str("echoc: send failed with code ")
+                .signed(wrote)
+                .end();
             close_socket(socket);
             exit(1);
         }
@@ -92,15 +93,15 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     }
     close_socket(socket);
 
-    print("echoc: got back ");
     // Печатается длина и само эхо: длина отвечает на вопрос «сколько дошло»,
     // текст — на вопрос «то ли самое».
-    error_num(got as i64);
-    print(" bytes: ");
+    let mut line = Line::new();
+    line.str("echoc: got back ").num(got as u64).str(" bytes: ");
     match core::str::from_utf8(&buffer[..got]) {
-        Ok(text) => println(text),
-        Err(_) => println("<not utf-8>"),
-    }
+        Ok(text) => line.str(text),
+        Err(_) => line.str("<not utf-8>"),
+    };
+    line.end();
     // Код возврата — не украшение: по нему видно, совпало ли эхо, даже когда
     // строку не с чем сравнить глазом.
     exit(i64::from(got != text.len()));

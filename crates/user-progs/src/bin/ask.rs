@@ -14,7 +14,7 @@
 #![no_std]
 #![no_main]
 
-use user_progs::{exit, print, print_u64, println, read_line, window_size};
+use user_progs::{Line, exit, print, println, read_line, window_size};
 
 /// Сколько байт отводится под ответ.
 ///
@@ -28,11 +28,13 @@ pub extern "C" fn _start() -> ! {
     // взять: программа не знает ни размера экрана, ни размера глифа, ни того,
     // есть ли вообще графика.
     let (cols, rows) = window_size();
-    print("ask: window is ");
-    print_u64(u64::from(cols));
-    print("x");
-    print_u64(u64::from(rows));
-    println(" cells");
+    Line::new()
+        .str("ask: window is ")
+        .num(u64::from(cols))
+        .str("x")
+        .num(u64::from(rows))
+        .str(" cells")
+        .end();
 
     // Очистка экрана и курсор в левый верхний угол — то, с чего начинает всякая
     // полноэкранная программа. Здесь это ещё и доказательство: ядро назовёт обе
@@ -58,9 +60,7 @@ pub extern "C" fn _start() -> ! {
         exit(1);
     }
 
-    print("ask: hello, ");
-    print(name);
-    println("");
+    Line::new().str("ask: hello, ").str(name).end();
 
     // И второй раз — чтобы было видно, что чтение не одноразовое и что позиция
     // в потоке ввода не теряется между вызовами.
@@ -68,11 +68,12 @@ pub extern "C" fn _start() -> ! {
     let mut second = [0u8; ANSWER];
     match read_line(&mut second) {
         Some(text) => {
-            print("ask: heard ");
-            print_u64(text.len() as u64);
-            print(" bytes: ");
-            print(text);
-            println("");
+            Line::new()
+                .str("ask: heard ")
+                .num(text.len() as u64)
+                .str(" bytes: ")
+                .str(text)
+                .end();
         }
         None => println("ask: end of input"),
     }

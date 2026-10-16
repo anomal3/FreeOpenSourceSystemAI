@@ -12,7 +12,7 @@
 #![no_main]
 
 use user_abi::ERR_PERMISSION;
-use user_progs::{Args, error, error_num, exit, print, println, socket};
+use user_progs::{Args, Line, exit, socket};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
@@ -20,14 +20,17 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     let args = unsafe { Args::new(argc, argv) };
     let path = args.get(0).unwrap_or("<unknown>");
 
-    print("greet: hello from a package, running as ");
-    println(path);
+    Line::new()
+        .str("greet: hello from a package, running as ")
+        .str(path)
+        .end();
 
     // И то же самое в журнал: окно оболочки снаружи не читается, а утверждение
     // фазы проверяется именно снаружи.
-    error("greet: installed from a package, running as ");
-    error(path);
-    error("\n");
+    Line::to_log()
+        .str("greet: installed from a package, running as ")
+        .str(path)
+        .end();
 
     // Проба сети. Программа её не хочет и не умеет — она существует затем,
     // чтобы показать **отказ**: манифест `hello` не просит ни одного права, а
@@ -37,13 +40,15 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // не открыться и оттого, что в системе нет сетевой карты, и такой отказ
     // о правах не говорит ничего. Различить их можно только числом.
     let fd = socket();
-    error("greet: opening a socket without asking for it returned ");
-    error_num(fd);
+    let mut line = Line::to_log();
+    line.str("greet: opening a socket without asking for it returned ")
+        .signed(fd);
     if fd == ERR_PERMISSION {
-        error(" (refused by the package permissions)\n");
+        line.str(" (refused by the package permissions)");
     } else {
-        error(" (NOT refused, which means the permissions did nothing)\n");
+        line.str(" (NOT refused, which means the permissions did nothing)");
     }
+    line.end();
 
     exit(0)
 }

@@ -9,9 +9,7 @@
 #![no_std]
 #![no_main]
 
-use user_progs::{
-    close, exit, open_write, print, print_i64, println, read, remove, sleep_ms, write,
-};
+use user_progs::{Line, close, exit, open_write, read, remove, sleep_ms, write};
 
 /// Куда писать. Каталог принадлежит пользователю сеанса — тому самому, от чьего
 /// имени установщик его и создал.
@@ -29,23 +27,24 @@ pub extern "C" fn _start() -> ! {
 
     let fd = open_write(PATH, true, true);
     if fd < 0 {
-        print("save: cannot create the file: ");
-        print_i64(fd);
-        println("");
+        Line::new()
+            .str("save: cannot create the file: ")
+            .signed(fd)
+            .end();
         exit(1)
     }
 
     let written = write(fd, TEXT.as_bytes());
     close(fd);
     if written != TEXT.len() as i64 {
-        print("save: short write: ");
-        print_i64(written);
-        println("");
+        Line::new().str("save: short write: ").signed(written).end();
         exit(1)
     }
-    print("save: wrote ");
-    print_i64(written);
-    println(" bytes");
+    Line::new()
+        .str("save: wrote ")
+        .signed(written)
+        .str(" bytes")
+        .end();
 
     // Пауза перед чтением не нужна ядру — она нужна проверке: между записью и
     // чтением файл успевает пережить смену задачи, то есть читается он с
@@ -57,17 +56,22 @@ pub extern "C" fn _start() -> ! {
     let read = read(fd, &mut buffer);
     close(fd);
     if read < 0 {
-        print("save: cannot read it back: ");
-        print_i64(read);
-        println("");
+        Line::new()
+            .str("save: cannot read it back: ")
+            .signed(read)
+            .end();
         exit(1)
     }
 
     // SAFETY: прочитано ровно то, что программа сама и записала, — а записывала
     // она строку.
     let text = unsafe { core::str::from_utf8_unchecked(&buffer[..read as usize]) };
-    print("save: read back: ");
-    print(text);
-    println("save: done");
+    // Прочитанный текст кончается переводом строки, так что это две строки
+    // журнала, отданные одним вызовом.
+    Line::new()
+        .str("save: read back: ")
+        .str(text)
+        .str("save: done")
+        .end();
     exit(0)
 }

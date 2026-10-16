@@ -91,8 +91,8 @@ use ssh::wire::{Reader, Writer};
 use ssh::{Error, Transport};
 use user_abi::Stat;
 use user_progs::{
-    ERR_AGAIN, KIND_DIRECTORY, KIND_FILE, Path, accept, bind, close, close_socket, create, error,
-    error_num, exit, launch, listen, open, pipe, random, read, recv, send, shutdown, sleep_ms, stat,
+    ERR_AGAIN, KIND_DIRECTORY, KIND_FILE, Line, Path, accept, bind, close, close_socket, create,
+    error, exit, launch, listen, open, pipe, random, read, recv, send, shutdown, sleep_ms, stat,
     stream, stream_state, uptime_ms, wait, write, yield_now,
 };
 
@@ -230,9 +230,10 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
         if client < 0 {
-            error("sshd: accept failed with code ");
-            error_num(client);
-            error("\n");
+            Line::to_log()
+                .str("sshd: accept failed with code ")
+                .signed(client)
+                .end();
             sleep_ms(100);
             continue;
         }
@@ -253,17 +254,20 @@ fn host_key() -> Option<[u8; 32]> {
         let read_bytes = read(fd, &mut seed);
         close(fd);
         if read_bytes == 32 {
-            error("sshd: host key read from ");
-            error(HOST_KEY_PATH);
-            error("\n");
+            Line::to_log()
+                .str("sshd: host key read from ")
+                .str(HOST_KEY_PATH)
+                .end();
             return Some(seed);
         }
         // Файл есть, но не тот. Перезаписывать чужой файл молча нельзя: это
         // может быть чей угодно файл, и новый ключ сменил бы отпечаток машины
         // без ведома человека.
-        error("sshd: ");
-        error(HOST_KEY_PATH);
-        error(" is not a 32-byte key; refusing to touch it\n");
+        Line::to_log()
+            .str("sshd: ")
+            .str(HOST_KEY_PATH)
+            .str(" is not a 32-byte key; refusing to touch it")
+            .end();
         return None;
     }
 
@@ -297,9 +301,10 @@ fn announce_accounts() {
     let path = passwd_path();
     match read_file(path.as_str()) {
         Some(len) if len > 0 => {
-            error("sshd: accounts come from ");
-            error(path.as_str());
-            error("\n");
+            Line::to_log()
+                .str("sshd: accounts come from ")
+                .str(path.as_str())
+                .end();
         }
         _ => {
             error("sshd: no account file here, so nobody can log in (this is a live image)\n");
@@ -513,11 +518,13 @@ fn session(client: i64, transport: &mut Transport, handshake_deadline: u64) {
                 }
                 match authenticate(client, transport, payload) {
                     Attempt::Accepted(accepted) => {
-                        error("sshd: ");
-                        error(accepted.name());
-                        error(" authenticated with a key from ");
-                        error(accepted.home());
-                        error("/.ssh/authorized_keys\n");
+                        Line::to_log()
+                            .str("sshd: ")
+                            .str(accepted.name())
+                            .str(" authenticated with a key from ")
+                            .str(accepted.home())
+                            .str("/.ssh/authorized_keys")
+                            .end();
                         let out = unsafe { &mut *(&raw mut OUTPUT) };
                         out[0] = ssh::MSG_USERAUTH_SUCCESS;
                         if send_packet(client, transport, 1).is_none() {
@@ -652,9 +659,10 @@ fn session(client: i64, transport: &mut Transport, handshake_deadline: u64) {
                 if send_packet(client, transport, 5).is_none() {
                     return;
                 }
-                error("sshd: unimplemented message ");
-                error_num(i64::from(other));
-                error("\n");
+                Line::to_log()
+                    .str("sshd: unimplemented message ")
+                    .signed(i64::from(other))
+                    .end();
             }
         }
     }
@@ -672,13 +680,14 @@ fn accept_service(client: i64, transport: &mut Transport, payload: &[u8]) -> boo
         // Имя печатается целиком, а не «не та служба»: клиент вправе спросить
         // что угодно, и разница между «спросил чужое» и «мы прочитали не то»
         // видна только по самому имени.
-        error("sshd: the client asked for a service we do not have: '");
+        let mut line = Line::to_log();
+        line.str("sshd: the client asked for a service we do not have: '");
         for byte in service.iter().take(64) {
             let shown = [if byte.is_ascii_graphic() || *byte == b' ' { *byte } else { b'?' }];
             // SAFETY: подставляется либо печатный ASCII, либо '?'.
-            error(unsafe { core::str::from_utf8_unchecked(&shown) });
+            line.str(unsafe { core::str::from_utf8_unchecked(&shown) });
         }
-        error("'\n");
+        line.str("'").end();
         disconnect(
             client,
             transport,
@@ -725,9 +734,10 @@ fn authenticate(client: i64, transport: &mut Transport, payload: &[u8]) -> Attem
     // Метод `none` клиент присылает первым всегда: так он узнаёт список того,
     // чем можно продолжать. Отказ на него — это не отказ во входе, а ответ.
     if request.method != b"publickey" {
-        error("sshd: login method ");
-        error_bytes(request.method);
-        error(" refused; only publickey is offered\n");
+        let mut line = Line::to_log();
+        line.str("sshd: login method ");
+        wire_text(&mut line, request.method);
+        line.str(" refused; only publickey is offered").end();
         return match refuse(client, transport) {
             Some(()) if request.method == b"none" => Attempt::Query,
             Some(()) => Attempt::Refused,
@@ -735,9 +745,10 @@ fn authenticate(client: i64, transport: &mut Transport, payload: &[u8]) -> Attem
         };
     }
     if request.algorithm != auth::KEY_ALGORITHM.as_bytes() {
-        error("sshd: key algorithm ");
-        error_bytes(request.algorithm);
-        error(" is not one we check\n");
+        let mut line = Line::to_log();
+        line.str("sshd: key algorithm ");
+        wire_text(&mut line, request.algorithm);
+        line.str(" is not one we check").end();
         return finish_refusal(client, transport);
     }
     let Some(key) = auth::key_from_blob(request.key_blob) else {
@@ -748,11 +759,10 @@ fn authenticate(client: i64, transport: &mut Transport, payload: &[u8]) -> Attem
         // Имя не называется в ответе клиенту — ему и так известно, что он
         // прислал, — но в журнал машины оно попадает: это единственный след
         // того, кто и подо что стучался.
-        error("sshd: no account named ");
-        error_bytes(request.user);
-        error(" in ");
-        error(passwd_path().as_str());
-        error("\n");
+        let mut line = Line::to_log();
+        line.str("sshd: no account named ");
+        wire_text(&mut line, request.user);
+        line.str(" in ").str(passwd_path().as_str()).end();
         return finish_refusal(client, transport);
     };
     if !key_authorized(&user, &key) {
@@ -839,9 +849,10 @@ fn open_channel(
     };
 
     if let Some((code, text)) = reason {
-        error("sshd: channel refused: ");
-        error(text);
-        error("\n");
+        Line::to_log()
+            .str("sshd: channel refused: ")
+            .str(text)
+            .end();
         let out = unsafe { &mut *(&raw mut OUTPUT) };
         let mut writer = Writer::new(out);
         writer.byte(ssh::MSG_CHANNEL_OPEN_FAILURE);
@@ -894,11 +905,10 @@ fn channel_request(
             if want_reply {
                 reply_to_request(client, transport, channel.peer, true)?;
             }
-            error("sshd: exec '");
-            error_bytes(command);
-            error("' for ");
-            error(user.name());
-            error("\n");
+            let mut line = Line::to_log();
+            line.str("sshd: exec '");
+            wire_text(&mut line, command);
+            line.str("' for ").str(user.name()).end();
             let status = run_in_channel(client, transport, channel, user, command);
             finish_channel(client, transport, channel, status)?;
             Some(false)
@@ -908,9 +918,10 @@ fn channel_request(
                 reply_to_request(client, transport, channel.peer, true)?;
             }
             channel.interactive = true;
-            error("sshd: interactive session for ");
-            error(user.name());
-            error("\n");
+            Line::to_log()
+                .str("sshd: interactive session for ")
+                .str(user.name())
+                .end();
             let mut sink = Sink::new(client, transport, channel);
             sink.out("FreeOS: commands here run inside sshd; 'help' lists them.\n");
             sink.out(PROMPT);
@@ -926,9 +937,10 @@ fn channel_request(
                 if want_reply {
                     reply_to_request(client, transport, channel.peer, false)?;
                 }
-                error("sshd: subsystem '");
-                error_bytes(name);
-                error("' refused; only sftp is served\n");
+                let mut line = Line::to_log();
+                line.str("sshd: subsystem '");
+                wire_text(&mut line, name);
+                line.str("' refused; only sftp is served").end();
                 return Some(true);
             }
             run_sftp(client, transport, channel, user, want_reply)
@@ -941,9 +953,10 @@ fn channel_request(
             if want_reply {
                 reply_to_request(client, transport, channel.peer, false)?;
             }
-            error("sshd: channel request '");
-            error_bytes(kind);
-            error("' refused\n");
+            let mut line = Line::to_log();
+            line.str("sshd: channel request '");
+            wire_text(&mut line, kind);
+            line.str("' refused").end();
             Some(true)
         }
     }
@@ -1080,9 +1093,10 @@ fn finish_channel(
     let len = writer.len();
     send_packet(client, transport, len)?;
 
-    error("sshd: session closed with status ");
-    error_num(i64::from(status));
-    error("\n");
+    Line::to_log()
+        .str("sshd: session closed with status ")
+        .signed(i64::from(status))
+        .end();
     Some(())
 }
 
@@ -1496,9 +1510,7 @@ fn run_sftp(
     if want_reply {
         reply_to_request(client, transport, channel.peer, true)?;
     }
-    error("sshd: sftp for ");
-    error(user.name());
-    error("\n");
+    Line::to_log().str("sshd: sftp for ").str(user.name()).end();
 
     let mut pump = Pump {
         in_write: Some(in_write),
@@ -1891,9 +1903,10 @@ fn find_user(name: &[u8]) -> Option<User> {
         // SSH. Заодно оно означает, что никакая испорченная строка не даст
         // сеансу прав суперпользователя.
         if uid == 0 {
-            error("sshd: refusing a root account from ");
-            error(passwd_path().as_str());
-            error("\n");
+            Line::to_log()
+                .str("sshd: refusing a root account from ")
+                .str(passwd_path().as_str())
+                .end();
             return None;
         }
         if home.is_empty() || home[0] != b'/' || home.len() > MAX_HOME {
@@ -1948,9 +1961,10 @@ fn key_authorized(user: &User, key: &[u8; 32]) -> bool {
     }
 
     let Some(len) = read_file(path.as_str()) else {
-        error("sshd: cannot read ");
-        error(path.as_str());
-        error("\n");
+        Line::to_log()
+            .str("sshd: cannot read ")
+            .str(path.as_str())
+            .end();
         return false;
     };
     // SAFETY: буфер статический, программа однопоточная; учётная запись уже
@@ -1959,9 +1973,10 @@ fn key_authorized(user: &User, key: &[u8; 32]) -> bool {
     if auth::authorized(file, key) {
         return true;
     }
-    error("sshd: this key is not in ");
-    error(path.as_str());
-    error("\n");
+    Line::to_log()
+        .str("sshd: this key is not in ")
+        .str(path.as_str())
+        .end();
     false
 }
 
@@ -1970,27 +1985,31 @@ fn key_authorized(user: &User, key: &[u8; 32]) -> bool {
 fn trustworthy(path: &str, user: &User, kind: u32) -> bool {
     let mut meta = Stat::default();
     if stat(path, &mut meta) < 0 {
-        error("sshd: no ");
-        error(path);
-        error("\n");
+        Line::to_log().str("sshd: no ").str(path).end();
         return false;
     }
     if meta.kind != kind {
-        error("sshd: ");
-        error(path);
-        error(" is not what it should be\n");
+        Line::to_log()
+            .str("sshd: ")
+            .str(path)
+            .str(" is not what it should be")
+            .end();
         return false;
     }
     if meta.uid != 0 && meta.uid != user.uid {
-        error("sshd: ");
-        error(path);
-        error(" belongs to somebody else; refusing to trust it\n");
+        Line::to_log()
+            .str("sshd: ")
+            .str(path)
+            .str(" belongs to somebody else; refusing to trust it")
+            .end();
         return false;
     }
     if meta.mode & 0o022 != 0 {
-        error("sshd: ");
-        error(path);
-        error(" is writable by others; refusing to trust it\n");
+        Line::to_log()
+            .str("sshd: ")
+            .str(path)
+            .str(" is writable by others; refusing to trust it")
+            .end();
         return false;
     }
     true
@@ -2013,9 +2032,11 @@ fn read_file(path: &str) -> Option<usize> {
             // может обрываться посреди строки ключа, и такой ключ не совпадёт
             // ни с чем — то есть отказ будет выглядеть как чужой ключ.
             close(fd);
-            error("sshd: ");
-            error(path);
-            error(" is too big to read\n");
+            Line::to_log()
+                .str("sshd: ")
+                .str(path)
+                .str(" is too big to read")
+                .end();
             return None;
         }
         let got = read(fd, &mut buffer[filled..]);
@@ -2065,17 +2086,19 @@ fn split_word(line: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-/// Написать в журнал то, что пришло с провода.
+/// Дописать в строку журнала то, что пришло с провода.
 ///
 /// Байты недоверенные, поэтому не-UTF-8 не печатается вовсе: управляющая
 /// последовательность, пришедшая снаружи и попавшая в терминал человека, —
 /// это уже не диагностика.
-fn error_bytes(data: &[u8]) {
+fn wire_text(line: &mut Line, data: &[u8]) {
     match core::str::from_utf8(data) {
         Ok(text) if text.bytes().all(|byte| byte.is_ascii_graphic() || byte == b' ') => {
-            error(text);
+            line.str(text);
         }
-        _ => error("<unprintable>"),
+        _ => {
+            line.str("<unprintable>");
+        }
     }
 }
 
@@ -2191,9 +2214,10 @@ fn poll_packet<'a>(client: i64, transport: &mut Transport) -> Polled<'a> {
                 // замолкает, единственный вопрос — на каком именно. В сеансе же
                 // таких строк были бы сотни, и полезной среди них ни одной.
                 if !transport.is_encrypted() {
-                    error("sshd: packet type ");
-                    error_num(i64::from(payload_buffer[0]));
-                    error("\n");
+                    Line::to_log()
+                        .str("sshd: packet type ")
+                        .signed(i64::from(payload_buffer[0]))
+                        .end();
                 }
 
                 // SAFETY: буфер статический и живёт всё время работы программы;
@@ -2217,9 +2241,10 @@ fn poll_packet<'a>(client: i64, transport: &mut Transport) -> Polled<'a> {
         // закрылся, связь оборвана или мы ждём дольше отведённого. Одна строка
         // «ничего не пришло» на все три заставляла бы гадать.
         if got != ERR_AGAIN && got < 0 {
-            error("sshd: recv failed with code ");
-            error_num(got);
-            error("\n");
+            Line::to_log()
+                .str("sshd: recv failed with code ")
+                .signed(got)
+                .end();
             return Polled::Closed;
         }
         match stream_state(client) {
@@ -2303,15 +2328,18 @@ fn still_open(client: i64) -> bool {
 }
 
 fn report(text: &str, err: Error) {
-    error(text);
-    error(" (");
-    error(match err {
+    let reason = match err {
         Error::BadLength => "bad length",
         Error::BadTag => "bad tag",
         Error::Malformed => "malformed",
         Error::NoCommonAlgorithm => "no common algorithm",
         Error::NoRoom => "no room",
         Error::OutOfOrder => "out of order",
-    });
-    error(")\n");
+    };
+    Line::to_log()
+        .str(text)
+        .str(" (")
+        .str(reason)
+        .str(")")
+        .end();
 }

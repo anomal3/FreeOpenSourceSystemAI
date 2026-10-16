@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use user_progs::{error, error_num, exit, pid, sleep_ms, uid};
+use user_progs::{Line, exit, pid, sleep_ms, uid};
 
 /// Как часто отзываться.
 ///
@@ -29,19 +29,21 @@ pub extern "C" fn _start() -> ! {
     // Первая строка — сразу, а не через пять секунд: она отвечает на вопрос
     // «служба запустилась?», и ответ, приходящий с задержкой, неотличим от
     // «нет».
-    error("svclog: up as #");
-    error_num(pid() as i64);
-    error(", running as uid ");
-    error_num(i64::from(uid()));
-    error("\n");
+    Line::to_log()
+        .str("svclog: up as #")
+        .signed(pid() as i64)
+        .str(", running as uid ")
+        .signed(i64::from(uid()))
+        .end();
 
     let mut beats: u64 = 0;
     loop {
         sleep_ms(PERIOD_MS);
         beats += 1;
-        error("svclog: alive, beat ");
-        error_num(beats as i64);
-        error("\n");
+        Line::to_log()
+            .str("svclog: alive, beat ")
+            .signed(beats as i64)
+            .end();
         // Возврата отсюда не бывает: служба заканчивается только снаружи.
         // Строчка ниже недостижима и стоит здесь ради типа.
         if beats == u64::MAX {

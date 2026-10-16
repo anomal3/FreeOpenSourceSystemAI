@@ -14,10 +14,7 @@
 #![no_std]
 #![no_main]
 
-use user_progs::{
-    Args, Dirent, KIND_DIRECTORY, close, exit, open, print, print_octal, print_u64, println,
-    readdir,
-};
+use user_progs::{Args, Dirent, KIND_DIRECTORY, Line, close, exit, open, println, readdir};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
@@ -30,13 +27,11 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
 
     let fd = open(path);
     if fd < 0 {
-        print("ls: cannot open ");
-        print(path);
         // Отказ в правах выглядит здесь так же, как отсутствие файла, и это
         // намеренно: ядро не рассказывает программе, чего именно ей не хватило,
         // — иначе перебором ошибок можно было бы узнать содержимое каталога, в
         // который заглядывать не дали.
-        println("");
+        Line::new().str("ls: cannot open ").str(path).end();
         exit(1);
     }
 
@@ -53,33 +48,36 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
         // Тот же порядок столбцов, что у команды ядра: права, владелец, размер,
         // имя. Совпадение здесь не эстетическое — две версии одного вывода,
         // расходящиеся в мелочах, заставляют читателя гадать, какую он видит.
-        print("  ");
-        print_octal(entry.mode);
-        print(" ");
-        print_u64(u64::from(entry.uid));
-        print(":");
-        print_u64(u64::from(entry.gid));
-        print(" ");
-        print_u64(entry.size);
-        print("  ");
-        print(name);
+        let mut line = Line::new();
+        line.str("  ")
+            .octal(entry.mode)
+            .str(" ")
+            .num(u64::from(entry.uid))
+            .str(":")
+            .num(u64::from(entry.gid))
+            .str(" ")
+            .num(entry.size)
+            .str("  ")
+            .str(name);
         if entry.kind == KIND_DIRECTORY {
-            print("/");
+            line.str("/");
             directories += 1;
         } else {
             files += 1;
         }
-        println("");
+        line.end();
     }
 
     close(fd);
 
-    print("ls: ");
-    print_u64(files);
-    print(" files, ");
-    print_u64(directories);
-    print(" directories in ");
-    println(path);
+    Line::new()
+        .str("ls: ")
+        .num(files)
+        .str(" files, ")
+        .num(directories)
+        .str(" directories in ")
+        .str(path)
+        .end();
 
     exit(0)
 }

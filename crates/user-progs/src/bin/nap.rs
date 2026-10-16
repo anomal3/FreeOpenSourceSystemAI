@@ -12,7 +12,7 @@
 #![no_std]
 #![no_main]
 
-use user_progs::{exit, pid, print, print_u64, println, sleep_ms, uptime_ms};
+use user_progs::{Line, exit, pid, sleep_ms, uptime_ms};
 
 /// Сколько спать.
 ///
@@ -25,21 +25,25 @@ pub extern "C" fn _start() -> ! {
     let me = pid();
     let start = uptime_ms();
 
-    print("nap ");
-    print_u64(me);
-    print(": sleeping ");
-    print_u64(NAP_MS);
-    println(" ms, asking for nothing");
+    Line::new()
+        .str("nap ")
+        .num(me)
+        .str(": sleeping ")
+        .num(NAP_MS)
+        .str(" ms, asking for nothing")
+        .end();
 
     sleep_ms(NAP_MS);
 
     // Проспать **меньше** заказанного нельзя: срок округляется вверх до целого
     // тика. Печатаем измеренное, а не заказанное, — иначе строка подтверждала
     // бы намерение, а не результат.
-    print("nap ");
-    print_u64(me);
-    print(": woke after ");
-    print_u64(uptime_ms() - start);
-    println(" ms");
+    Line::new()
+        .str("nap ")
+        .num(me)
+        .str(": woke after ")
+        .num(uptime_ms() - start)
+        .str(" ms")
+        .end();
     exit(0)
 }

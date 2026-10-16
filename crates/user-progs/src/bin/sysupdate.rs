@@ -72,8 +72,8 @@ use osupdate::drivers::{self, Catalogue};
 use osupdate::index::{self, Index};
 use osupdate::keys::{self, Trusted};
 use user_progs::{
-    Args, ERR_UPDATE_REFUSED, Line, SLOT_B, apply_update, close, config_path, error, error_num,
-    exit, http, open, print, print_u64, println, read, time_now, uid, write,
+    Args, ERR_UPDATE_REFUSED, Line, SLOT_B, apply_update, close, config_path, error, exit, http,
+    open, println, read, time_now, uid, write,
 };
 
 /// Имя файла настроек.
@@ -254,16 +254,19 @@ struct Servers {
 /// заданной полным адресом, путь — часть адреса.
 fn servers(override_path: Option<&str>) -> Option<Servers> {
     let Some(path) = config_path(CONFIG) else {
-        error("sysupdate: no ");
-        error(CONFIG);
-        error(" in /etc nor in the image defaults\n");
+        Line::to_log()
+            .str("sysupdate: no ")
+            .str(CONFIG)
+            .str(" in /etc nor in the image defaults")
+            .end();
         return None;
     };
     let fd = open(path.as_str());
     if fd < 0 {
-        error("sysupdate: cannot read ");
-        error(path.as_str());
-        error("\n");
+        Line::to_log()
+            .str("sysupdate: cannot read ")
+            .str(path.as_str())
+            .end();
         return None;
     }
     // SAFETY: статик читается и разбирается только здесь, и только этой задачей:
@@ -365,8 +368,10 @@ fn servers(override_path: Option<&str>) -> Option<Servers> {
         return None;
     }
     for index in 0..out.len {
-        print("sysupdate: repository ");
-        println(out.list[index].base.as_str());
+        Line::new()
+            .str("sysupdate: repository ")
+            .str(out.list[index].base.as_str())
+            .end();
     }
     Some(out)
 }
@@ -398,9 +403,10 @@ fn trusted_roots() -> Option<x509::Store<'static>> {
         }
         Ok(store) => Some(store),
         Err(err) => {
-            error("sysupdate: ca.pem: ");
-            error(err.text());
-            error("\n");
+            Line::to_log()
+                .str("sysupdate: ca.pem: ")
+                .str(err.text())
+                .end();
             None
         }
     }
@@ -448,18 +454,14 @@ fn offer(servers: &Servers, trust: &mut Option<http::Trust<'static>>) -> Option<
         let parsed = match Index::parse(index_text) {
             Ok(parsed) => parsed,
             Err(err) => {
-                error("sysupdate: ");
-                error(err.text());
-                error("\n");
+                Line::to_log().str("sysupdate: ").str(err.text()).end();
                 continue;
             }
         };
         let image = match parsed.image(ARCH) {
             Ok(image) => image,
             Err(err) => {
-                error("sysupdate: ");
-                error(err.text());
-                error("\n");
+                Line::to_log().str("sysupdate: ").str(err.text()).end();
                 continue;
             }
         };
@@ -560,9 +562,11 @@ fn signed_text(
 fn trusted_keys() -> Option<Trusted> {
     let fd = open(KEYS);
     if fd < 0 {
-        error("sysupdate: this system trusts no update keys (no ");
-        error(KEYS);
-        error("); refusing\n");
+        Line::to_log()
+            .str("sysupdate: this system trusts no update keys (no ")
+            .str(KEYS)
+            .str("); refusing")
+            .end();
         return None;
     }
     // SAFETY: статик принадлежит этой задаче, см. пояснение в `servers`.
@@ -631,9 +635,11 @@ fn fetch_into(
         Ok(_) => Some(filled),
         Err(err) => {
             if overflow {
-                error("sysupdate: ");
-                error(name);
-                error(" is larger than this system will read\n");
+                Line::to_log()
+                    .str("sysupdate: ")
+                    .str(name)
+                    .str(" is larger than this system will read")
+                    .end();
             } else {
                 complain(name, err);
             }
@@ -657,23 +663,19 @@ fn with_buffers<T>(body: impl FnOnce(&mut http::Buffers<'_>) -> T) -> T {
 
 /// Сказать про отказ HTTP вслух и с числом там, где число есть.
 fn complain(name: &str, err: http::Error) {
-    error("sysupdate: ");
-    error(name);
-    error(": ");
-    error(err.text());
+    let mut line = Line::to_log();
+    line.str("sysupdate: ").str(name).str(": ").str(err.text());
     if let http::Error::Status(code) = err {
-        error(" (");
-        error_num(i64::from(code));
-        error(")");
+        line.str(" (").signed(i64::from(code)).str(")");
     }
     if let http::Error::Short { got, want } = err {
-        error(" (");
-        error_num(got as i64);
-        error(" of ");
-        error_num(want as i64);
-        error(" bytes)");
+        line.str(" (")
+            .signed(got as i64)
+            .str(" of ")
+            .signed(want as i64)
+            .str(" bytes)");
     }
-    error("\n");
+    line.end();
 }
 
 /// Собрать всё, что нужно для похода в сеть: список серверов и доверие.
@@ -704,19 +706,23 @@ fn check(path: Option<&str>) -> i64 {
     let Some((servers, mut trust)) = prepare(path) else { return 1 };
     let Some(offer) = offer(&servers, &mut trust) else { return 1 };
 
-    print("sysupdate: the server offers FreeOS ");
-    print(offer.version());
-    print(" for ");
-    print(ARCH);
-    print(", ");
-    print_u64(offer.size / (1024 * 1024));
-    println(" MiB");
+    Line::new()
+        .str("sysupdate: the server offers FreeOS ")
+        .str(offer.version())
+        .str(" for ")
+        .str(ARCH)
+        .str(", ")
+        .num(offer.size / (1024 * 1024))
+        .str(" MiB")
+        .end();
 
     match installed_version() {
         Some(installed) => {
             let have = installed.as_str();
-            print("sysupdate: this system runs ");
-            println(have);
+            Line::new()
+                .str("sysupdate: this system runs ")
+                .str(have)
+                .end();
             if osupdate::newer(offer.version(), have) {
                 println("sysupdate: that is newer; run 'sysupdate get' to download it");
                 0
@@ -750,10 +756,12 @@ fn get(path: Option<&str>) -> i64 {
 
     match installed_version() {
         Some(installed) if !osupdate::newer(offer.version(), installed.as_str()) => {
-            print("sysupdate: the server offers ");
-            print(offer.version());
-            print(" and this system runs ");
-            println(installed.as_str());
+            Line::new()
+                .str("sysupdate: the server offers ")
+                .str(offer.version())
+                .str(" and this system runs ")
+                .str(installed.as_str())
+                .end();
             println("sysupdate: nothing to do");
             return 3;
         }
@@ -778,10 +786,12 @@ fn get(path: Option<&str>) -> i64 {
         return 1;
     }
 
-    print("sysupdate: downloaded and verified ");
-    print(offer.version());
-    print(" into ");
-    println(CACHE_FILE);
+    Line::new()
+        .str("sysupdate: downloaded and verified ")
+        .str(offer.version())
+        .str(" into ")
+        .str(CACHE_FILE)
+        .end();
     println("sysupdate: run 'sysupdate apply' to put it into the free slot");
     0
 }
@@ -801,9 +811,10 @@ fn download(
 ) -> bool {
     let fd = create_truncated(target);
     if fd < 0 {
-        error("sysupdate: cannot write ");
-        error(target);
-        error("\n");
+        Line::to_log()
+            .str("sysupdate: cannot write ")
+            .str(target)
+            .end();
         return false;
     }
 
@@ -814,11 +825,13 @@ fn download(
         return false;
     }
 
-    print("sysupdate: downloading ");
-    print(file);
-    print(" (");
-    print_u64(size);
-    println(" bytes)");
+    Line::new()
+        .str("sysupdate: downloading ")
+        .str(file)
+        .str(" (")
+        .num(size)
+        .str(" bytes)")
+        .end();
 
     let mut hasher = fpk::Hasher::new();
     let mut written = 0u64;
@@ -846,11 +859,13 @@ fn download(
             written += chunk.len() as u64;
             if written - reported >= 4 * 1024 * 1024 {
                 reported = written;
-                print("sysupdate: ");
-                print_u64(written / (1024 * 1024));
-                print(" of ");
-                print_u64(size / (1024 * 1024));
-                println(" MiB");
+                Line::new()
+                    .str("sysupdate: ")
+                    .num(written / (1024 * 1024))
+                    .str(" of ")
+                    .num(size / (1024 * 1024))
+                    .str(" MiB")
+                    .end();
             }
             true
         })
@@ -870,11 +885,12 @@ fn download(
     }
 
     if written != size {
-        print("sysupdate: got ");
-        print_u64(written);
-        print(" bytes and the index promised ");
-        print_u64(size);
-        println("");
+        Line::new()
+            .str("sysupdate: got ")
+            .num(written)
+            .str(" bytes and the index promised ")
+            .num(size)
+            .end();
         let _ = user_progs::remove(target);
         return false;
     }
@@ -953,15 +969,16 @@ fn driver(id: Option<&str>, path: Option<&str>) -> i64 {
 
 /// `apply`: отдать файл ядру.
 fn apply(path: &str) -> i64 {
-    print("sysupdate: applying ");
-    println(path);
+    Line::new().str("sysupdate: applying ").str(path).end();
     println("sysupdate: this takes a while; the machine stays usable meanwhile");
     let result = apply_update(path);
     match result {
         slot if slot >= 0 => {
-            print("sysupdate: slot ");
-            print(if slot == SLOT_B { "B" } else { "A" });
-            println(" is active from the next boot");
+            Line::new()
+                .str("sysupdate: slot ")
+                .str(if slot == SLOT_B { "B" } else { "A" })
+                .str(" is active from the next boot")
+                .end();
             println("sysupdate: reboot to use it; the previous slot returns by itself if it fails");
             0
         }
@@ -971,9 +988,10 @@ fn apply(path: &str) -> i64 {
             1
         }
         code => {
-            error("sysupdate: apply failed with code ");
-            error_num(code);
-            error("\n");
+            Line::to_log()
+                .str("sysupdate: apply failed with code ")
+                .signed(code)
+                .end();
             1
         }
     }

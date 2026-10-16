@@ -14,7 +14,7 @@
 
 use core::arch::global_asm;
 
-use user_progs::{pid, print, print_u64, println};
+use user_progs::{Line, pid};
 
 // Переход на самого себя. Написано ассемблером по той же причине, что и цикл в
 // `spin`: `loop {}` на Rust — это обещание компилятора, а не инструкция, и
@@ -50,9 +50,11 @@ unsafe extern "C" {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    print("forever ");
-    print_u64(pid());
-    println(": this program never ends on its own");
+    Line::new()
+        .str("forever ")
+        .num(pid())
+        .str(": this program never ends on its own")
+        .end();
 
     // SAFETY: функция не трогает ни память, ни стек и не возвращается.
     unsafe { forever_burn() }

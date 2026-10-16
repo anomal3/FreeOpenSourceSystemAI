@@ -35,7 +35,7 @@
 #![no_main]
 
 use user_progs::{
-    NetConfig, NetInfo, bind, close, close_socket, config_path, connect, error, error_num, exit,
+    Line, NetConfig, NetInfo, bind, close, close_socket, config_path, connect, error, exit,
     netconf, netinfo, open, read, recv_waiting, send_waiting, sleep_ms, socket, uptime_ms,
 };
 
@@ -132,9 +132,10 @@ pub extern "C" fn _start() -> ! {
         exit(0);
     }
 
-    error("dhcp: asking on ");
-    print_mac(info.mac);
-    error("\n");
+    let mut line = Line::to_log();
+    line.str("dhcp: asking on ");
+    mac(&mut line, info.mac);
+    line.end();
 
     loop {
         match lease(&info) {
@@ -242,11 +243,12 @@ fn exchange(info: &NetInfo, socket: i64) -> Option<Lease> {
         found?
     };
 
-    error("dhcp: offer ");
-    print_ip(offer.address);
-    error(" from ");
-    print_ip(offer.server);
-    error("\n");
+    let mut line = Line::to_log();
+    line.str("dhcp: offer ");
+    ip(&mut line, offer.address);
+    line.str(" from ");
+    ip(&mut line, offer.server);
+    line.end();
 
     // --- REQUEST ----------------------------------------------------------
     let len = build(&mut packet, info.mac, xid, REQUEST, offer.address, offer.server);
@@ -413,23 +415,25 @@ fn apply(lease: &Lease) {
     };
     let result = netconf(&config);
     if result != 0 {
-        error("dhcp: the kernel refused the configuration, code ");
-        error_num(result);
-        error("\n");
+        Line::to_log()
+            .str("dhcp: the kernel refused the configuration, code ")
+            .signed(result)
+            .end();
         return;
     }
 
-    error("dhcp: lease ");
-    print_ip(lease.address);
-    error("/");
-    error_num(i64::from(prefix(netmask)));
-    error(" gw ");
-    print_ip(lease.gateway);
-    error(" dns ");
-    print_ip(lease.dns);
-    error(" for ");
-    error_num(i64::from(lease.seconds));
-    error(" s\n");
+    // Строка собирается целиком и уходит одним вызовом — см. `Line`.
+    let mut line = Line::to_log();
+    line.str("dhcp: lease ");
+    ip(&mut line, lease.address);
+    line.str("/").num(u64::from(prefix(netmask))).str(" gw ");
+    ip(&mut line, lease.gateway);
+    line.str(" dns ");
+    ip(&mut line, lease.dns);
+    line.str(" for ")
+        .num(u64::from(lease.seconds))
+        .str(" s")
+        .end();
 }
 
 /// Длина префикса маски.
@@ -437,28 +441,30 @@ fn prefix(netmask: u32) -> u32 {
     netmask.leading_ones()
 }
 
-fn print_ip(address: u32) {
+/// Дописать адрес IPv4 в строку.
+fn ip(line: &mut Line, address: u32) {
     let bytes = address.to_be_bytes();
     for (index, byte) in bytes.iter().enumerate() {
         if index > 0 {
-            error(".");
+            line.str(".");
         }
-        error_num(i64::from(*byte));
+        line.num(u64::from(*byte));
     }
 }
 
-fn print_mac(mac: [u8; 6]) {
-    for (index, byte) in mac.iter().enumerate() {
+/// Дописать адрес MAC в строку.
+fn mac(line: &mut Line, address: [u8; 6]) {
+    for (index, byte) in address.iter().enumerate() {
         if index > 0 {
-            error(":");
+            line.str(":");
         }
-        print_hex(*byte);
+        hex(line, *byte);
     }
 }
 
-fn print_hex(byte: u8) {
+fn hex(line: &mut Line, byte: u8) {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let text = [DIGITS[usize::from(byte >> 4)], DIGITS[usize::from(byte & 0x0F)]];
     // SAFETY: обе цифры из таблицы выше — ASCII.
-    error(unsafe { core::str::from_utf8_unchecked(&text) });
+    line.str(unsafe { core::str::from_utf8_unchecked(&text) });
 }

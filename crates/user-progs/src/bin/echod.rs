@@ -26,8 +26,8 @@
 #![no_main]
 
 use user_progs::{
-    accept, bind, close_socket, error, error_num, exit, listen, recv, send, shutdown, sleep_ms,
-    stream, stream_state, uptime_ms, ERR_AGAIN,
+    accept, bind, close_socket, error, exit, listen, recv, send, shutdown, sleep_ms, stream,
+    stream_state, uptime_ms, Line, ERR_AGAIN,
 };
 
 /// Порт, на котором сервер ждёт.
@@ -73,9 +73,10 @@ pub extern "C" fn _start() -> ! {
             continue;
         }
         if client < 0 {
-            error("echod: accept failed with code ");
-            error_num(client);
-            error("\n");
+            Line::to_log()
+                .str("echod: accept failed with code ")
+                .signed(client)
+                .end();
             sleep_ms(100);
             continue;
         }
@@ -83,9 +84,11 @@ pub extern "C" fn _start() -> ! {
         error("echod: client accepted\n");
         let echoed = serve(client);
         close_socket(client);
-        error("echod: client done, ");
-        error_num(echoed as i64);
-        error(" bytes echoed\n");
+        Line::to_log()
+            .str("echod: client done, ")
+            .signed(echoed as i64)
+            .str(" bytes echoed")
+            .end();
     }
 }
 
@@ -109,9 +112,10 @@ fn serve(client: i64) -> usize {
                     continue;
                 }
                 if wrote < 0 {
-                    error("echod: send failed with code ");
-                    error_num(wrote);
-                    error("\n");
+                    Line::to_log()
+                        .str("echod: send failed with code ")
+                        .signed(wrote)
+                        .end();
                     return echoed;
                 }
                 sent += wrote as usize;

@@ -32,8 +32,8 @@
 #![no_main]
 
 use user_progs::{
-    Args, close, config_path, error, exit, http, open, print, print_u64, println, read, time_now,
-    uptime_ms, write,
+    Args, Line, close, config_path, exit, http, open, print, println, read, time_now, uptime_ms,
+    write,
 };
 
 /// Имя файла с доверенными корнями. Тот же, что читает `sysupdate`.
@@ -92,9 +92,7 @@ fn fetch(url: &str, target: Option<&str>) -> i64 {
         Some(path) => {
             let fd = user_progs::open_write(path, true, true);
             if fd < 0 {
-                error("fetch: cannot write ");
-                error(path);
-                error("\n");
+                Line::to_log().str("fetch: cannot write ").str(path).end();
                 return 1;
             }
             Some(fd)
@@ -148,37 +146,37 @@ fn fetch(url: &str, target: Option<&str>) -> i64 {
     match result {
         Ok(_) => {
             let elapsed = uptime_ms().saturating_sub(started).max(1);
-            print("fetch: ");
-            print_u64(total);
-            print(" bytes in ");
-            print_u64(elapsed);
-            print(" ms (");
-            print_u64(total * 1000 / elapsed / 1024);
-            println(" KiB/s)");
+            Line::new()
+                .str("fetch: ")
+                .num(total)
+                .str(" bytes in ")
+                .num(elapsed)
+                .str(" ms (")
+                .num(total * 1000 / elapsed / 1024)
+                .str(" KiB/s)")
+                .end();
             0
         }
         Err(err) => {
             if failed {
                 println("fetch: writing failed; is there room left?");
             } else {
-                error("fetch: ");
-                error(err.text());
+                let mut line = Line::to_log();
+                line.str("fetch: ").str(err.text());
                 // Число там, где оно есть: «ответ кончился раньше» без пары
                 // «сколько приехало из скольких» отправляет искать обрыв связи,
                 // а причина бывает совсем в другом.
                 if let http::Error::Short { got, want } = err {
-                    error(" (");
-                    user_progs::error_num(got as i64);
-                    error(" of ");
-                    user_progs::error_num(want as i64);
-                    error(" bytes)");
+                    line.str(" (")
+                        .signed(got as i64)
+                        .str(" of ")
+                        .signed(want as i64);
+                    line.str(" bytes)");
                 }
                 if let http::Error::Status(code) = err {
-                    error(" (");
-                    user_progs::error_num(i64::from(code));
-                    error(")");
+                    line.str(" (").signed(i64::from(code)).str(")");
                 }
-                error("\n");
+                line.end();
             }
             1
         }

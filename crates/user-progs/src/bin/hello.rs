@@ -7,7 +7,7 @@
 #![no_std]
 #![no_main]
 
-use user_progs::{exit, print, print_u64, println, yield_now};
+use user_progs::{Line, exit, println, yield_now};
 
 /// Точка входа. Имя `_start` — то, что записано в `ENTRY()` компоновочного
 /// сценария и что ядро возьмёт из заголовка ELF.
@@ -19,9 +19,11 @@ pub extern "C" fn _start() -> ! {
     println("hello from userspace");
     println("this code runs outside the kernel: no kernel page is reachable from here");
 
-    print("uptime as the kernel sees it: ");
-    print_u64(uptime());
-    println(" ms");
+    Line::new()
+        .str("uptime as the kernel sees it: ")
+        .num(uptime())
+        .str(" ms")
+        .end();
 
     // Уступка процессора — тоже системный вызов: планировщик кооперативный, и
     // без неё программа держала бы машину до самого конца.
@@ -37,9 +39,7 @@ pub extern "C" fn _start() -> ! {
     if now == 0 {
         println("the system does not know the time of day");
     } else {
-        print("hello: epoch ");
-        print_u64(now);
-        println(" s");
+        Line::new().str("hello: epoch ").num(now).str(" s").end();
     }
 
     println("done, exiting with code 0");

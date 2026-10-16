@@ -573,53 +573,19 @@ pub fn println(text: &str) {
 ///
 /// Своё, а не `write!`: форматирование `core::fmt` тянет за собой заметный кусок
 /// кода, а нужна одна десятичная запись.
-pub fn print_u64(mut value: u64) {
-    let mut buffer = [0u8; 20];
-    let mut index = buffer.len();
-    loop {
-        index -= 1;
-        buffer[index] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    // SAFETY: в буфер записаны только цифры ASCII.
-    print(unsafe { core::str::from_utf8_unchecked(&buffer[index..]) });
+pub fn print_u64(value: u64) {
+    Line::new().num(value).send();
 }
 
-/// Напечатать знаковое число.
+/// Напечатать знаковое число — вместе со знаком одним вызовом.
 pub fn print_i64(value: i64) {
-    if value < 0 {
-        print("-");
-        // `unsigned_abs`, а не `-value`: у самого младшего `i64`
-        // противоположного значения не существует, и обычное отрицание было бы
-        // переполнением.
-        print_u64(value.unsigned_abs());
-    } else {
-        print_u64(value as u64);
-    }
+    Line::new().signed(value).send();
 }
 
 /// Напечатать число в восьмеричной записи с ведущими нулями до четырёх знаков —
 /// то, как принято показывать права.
 pub fn print_octal(value: u32) {
-    let mut buffer = [b'0'; 11];
-    let mut index = buffer.len();
-    let mut rest = value;
-    loop {
-        index -= 1;
-        buffer[index] = b'0' + (rest % 8) as u8;
-        rest /= 8;
-        if rest == 0 {
-            break;
-        }
-    }
-    // Ведущие нули: `644` и `0644` — одно и то же число, но второе сразу
-    // сообщает, что запись восьмеричная.
-    let start = index.min(buffer.len() - 4);
-    // SAFETY: в буфер записаны только цифры ASCII.
-    print(unsafe { core::str::from_utf8_unchecked(&buffer[start..]) });
+    Line::new().octal(value).send();
 }
 
 /// Строка, которая уходит ядру **одним** системным вызовом.
@@ -740,6 +706,8 @@ impl Line {
                 break;
             }
         }
+        // Ведущие нули: `644` и `0644` — одно и то же число, но второе сразу
+        // сообщает, что запись восьмеричная.
         let start = index.min(digits.len() - 4);
         // SAFETY: в буфер записаны только цифры ASCII.
         self.str(unsafe { core::str::from_utf8_unchecked(&digits[start..]) })
@@ -762,6 +730,12 @@ impl Line {
     /// Дописать перевод строки и отдать всё ядру одним вызовом.
     pub fn end(&mut self) {
         self.str("\n");
+        self.flush();
+    }
+
+    /// Отдать накопленное ядру одним вызовом **без** перевода строки — для
+    /// приглашения перед вводом и для управляющих последовательностей экрана.
+    pub fn send(&mut self) {
         self.flush();
     }
 
@@ -957,24 +931,7 @@ pub fn error(text: &str) {
 
 /// Напечатать число в поток диагностики.
 pub fn error_num(value: i64) {
-    let negative = value < 0;
-    let mut buffer = [0u8; 21];
-    let mut index = buffer.len();
-    let mut rest = value.unsigned_abs();
-    loop {
-        index -= 1;
-        buffer[index] = b'0' + (rest % 10) as u8;
-        rest /= 10;
-        if rest == 0 {
-            break;
-        }
-    }
-    if negative {
-        index -= 1;
-        buffer[index] = b'-';
-    }
-    // SAFETY: в буфер записаны только цифры ASCII и знак.
-    error(unsafe { core::str::from_utf8_unchecked(&buffer[index..]) });
+    Line::to_log().signed(value).send();
 }
 
 /// Переименовать файл или каталог.
