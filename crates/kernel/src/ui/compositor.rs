@@ -135,6 +135,27 @@ pub struct Compositor {
     /// меняется эта картинка раз в минуту. Теперь она собирается один раз и
     /// копируется в полосы, как окно.
     under: Option<Surface>,
+    /// Сцена под летящим окном на настольном столе (фаза 64): обои, значки и
+    /// остальные окна с тенями, собранные один раз на первом кадре полёта.
+    ///
+    /// Без неё каждый кадр сворачивания и разворота рисовал всё это заново —
+    /// для разворота почти весь экран: обои со свечением, тени окон по каждой
+    /// полосе. Замер `lag` после фазы 63b: средний кадр 10–14 мс, худший
+    /// 88–130 мс. Док, летящее окно, листы и указатель рисуются поверх сцены на
+    /// каждом кадре, как раньше. Нет памяти под картинку (3,7 МБ на 1280×720) —
+    /// кадры собираются по-старому.
+    scene: Option<Surface>,
+    /// Готовые обои настольного стола и то, для чего они нарисованы: ширина,
+    /// высота, тёмная ли тема, два цвета выбранных обоев (фаза 64).
+    ///
+    /// Обои — функция только размера экрана, темы и выбранных обоев, а
+    /// считались они на каждом
+    /// кадре заново: три световых пятна на точку. Замер `lag` после фазы 63b —
+    /// в среднем кадре анимации это самый дорогой слой (6–10 мс), а в сборке
+    /// сцены под полётом — большая часть её 50–60 мс. Теперь — копирование.
+    /// Ячейка, а не поле: рисуют обои из сборки полосы, где стол только
+    /// читается.
+    wall: core::cell::RefCell<Option<(Surface, WallKey)>>,
     /// Годна ли [`Self::under`]. Сбрасывается там, где под окнами что-то
     /// меняется (см. [`Self::invalidate_under`]).
     under_valid: bool,
@@ -279,6 +300,8 @@ impl Compositor {
             start: None,
             home: super::home::Facts::default(),
             under: None,
+            scene: None,
+            wall: core::cell::RefCell::new(None),
             under_valid: false,
             under_dirty: Rect::EMPTY,
             status_text: alloc::string::String::new(),
@@ -1364,6 +1387,13 @@ impl Compositor {
             return;
         };
         super::set_animating(false);
+        // Сцена под полётом — снимок его начала. Что под ней успело
+        // измениться за полёт (терминал допечатал строку, программа
+        // перерисовалась), собиралось из снимка; один полный кадр после
+        // посадки возвращает экрану правду.
+        if self.scene.take().is_some() {
+            self.mark(self.screen.bounds());
+        }
         self.mark(flight.last);
         if flight.motion == Motion::Morph {
             crate::kprintln!(
@@ -2235,6 +2265,7 @@ impl Compositor {
         self.pointer = Pointer::new(width, height);
         self.under = None;
         self.under_valid = false;
+        self.scene = None;
         self.drag = None;
         let bottom = self.work_bottom();
         self.icons.set_area(bottom);
@@ -2314,6 +2345,7 @@ impl Compositor {
             crate::kprintln!("  keyboard    : {}", if shown { "shown" } else { "hidden" });
         }
         self.advance_flight();
+        self.build_scene();
         // След пальца по клавиатуре и язык её подписей. Анимация идёт, пока
         // летит окно или тлеет след: оболочка будит стол по этому признаку.
         let mut trail_damage = Rect::EMPTY;
@@ -2359,6 +2391,39 @@ impl Compositor {
         }
         self.damage_count = 0;
         super::note_frame_ns(crate::time::uptime_ns().wrapping_sub(started));
+    }
+
+    /// Собрать сцену под летящим окном, если она нужна и её ещё нет (фаза 64).
+    fn build_scene(&mut self) {
+        if self.flight.is_none() || self.scene.is_some() || theme::is_mobile() {
+            return;
+        }
+        let bounds = self.screen.bounds();
+        let Some(mut scene) = Surface::new(bounds.w, bounds.h, theme::palette().wall_top) else {
+            return;
+        };
+        let started = crate::time::uptime_ns();
+        self.draw_lower(&mut scene, bounds, 0);
+        crate::kprintln!(
+            "  desktop     : scene under the flight built in {} us",
+            crate::time::uptime_ns().wrapping_sub(started) / 1000
+        );
+        self.scene = Some(scene);
+    }
+
+    /// Нижние слои полосы: обои, строка состояния, значки, окна с тенями.
+    /// Общее у кадра и у сцены под полётом — чтобы сцена не разошлась с тем,
+    /// что кадр нарисовал бы сам.
+    fn draw_lower(&self, back: &mut Surface, band: Rect, dy: i32) {
+        let radius = theme::R_WINDOW * self.scale;
+        self.draw_background(back, band, dy);
+        super::statusbar::draw(back, band, dy, self.screen.width(), self.scale);
+        self.icons.draw(back, band, dy);
+        for window in self.windows.iter().filter(|window| !window.minimized && !self.hidden_by_flight(window)) {
+            let r = if window.popup { 0 } else { radius };
+            self.drop_shadow(back, window.rect, band, dy, r);
+            self.stack(back, window.surface(), window.rect, band, dy, r);
+        }
     }
 
     /// Собрать прямоугольник экрана и вывести его целиком.
@@ -2449,6 +2514,15 @@ impl Compositor {
         // рисование того, что под ними.
         let covered = self.band_covered(band);
         let t_start = crate::time::uptime_ns();
+        // Летит окно — всё, что под ним, одним копированием из сцены (фаза 64).
+        let scene = match self.scene.as_ref().filter(|_| self.flight.is_some()) {
+            Some(scene) => {
+                back.blit_from(scene, (band.x, band.y + dy), band);
+                true
+            }
+            None => false,
+        };
+        let covered = covered || scene;
         // Телефон: всё, что под окнами, — одним копированием из готовой картинки.
         let cached = match self.under.as_ref() {
             // Во время полёта — и устаревшая: пересобирать её в кадре полёта
@@ -2477,7 +2551,8 @@ impl Compositor {
         }
         let t_icons = crate::time::uptime_ns();
         let mut shadow_ns = 0u64;
-        for window in self.windows.iter().filter(|window| !window.minimized && !self.hidden_by_flight(window)) {
+        // Окна уже в сцене, если она есть.
+        for window in self.windows.iter().filter(|window| !scene && !window.minimized && !self.hidden_by_flight(window)) {
             let t0 = crate::time::uptime_ns();
             // Углы всплывающего окна не скругляются: меню рисует свою рамку
             // прямоугольником, и срезанный угол вырезал бы её.
@@ -2843,6 +2918,37 @@ impl Compositor {
             return;
         }
         let p = theme::palette();
+        // Всё, от чего обои зависят: другой размер, тема или выбранные в
+        // «Параметрах» обои — другая картинка.
+        let key = WallKey {
+            width: self.screen.width(),
+            height: self.screen.height(),
+            dark: theme::is_dark(),
+            top: p.wall_top.pixel(),
+            bottom: p.wall_bottom.pixel(),
+        };
+        {
+            let mut wall = self.wall.borrow_mut();
+            let fresh = wall.as_ref().is_some_and(|(_, made)| *made == key);
+            if !fresh {
+                *wall = None;
+                if let Some(mut picture) = Surface::new(key.width, key.height, p.wall_top) {
+                    self.draw_wallpaper(&mut picture, Rect::new(0, 0, key.width, key.height), 0);
+                    *wall = Some((picture, key));
+                }
+            }
+            if let Some((picture, ..)) = wall.as_ref() {
+                back.blit_from(picture, (rect.x, rect.y + dy), rect);
+                return;
+            }
+        }
+        // Памяти под готовые обои не нашлось — считаем по точкам, как раньше.
+        self.draw_wallpaper(back, rect, dy);
+    }
+
+    /// Обои настольного стола по точкам: см. [`Self::draw_background`].
+    fn draw_wallpaper(&self, back: &mut Surface, rect: Rect, dy: i32) {
+        let p = theme::palette();
         let width = self.screen.width().max(1) as i32;
         let height = self.screen.height().max(1) as i32;
 
@@ -3022,6 +3128,16 @@ impl Ellipse {
         let fade = UNIT - d2;
         (peak * fade / UNIT * fade / UNIT).clamp(0, 255) as u8
     }
+}
+
+/// Для чего нарисованы готовые обои — см. `Compositor::wall`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WallKey {
+    width: u32,
+    height: u32,
+    dark: bool,
+    top: u32,
+    bottom: u32,
 }
 
 /// Доля точки, накрытая скруглённым углом.

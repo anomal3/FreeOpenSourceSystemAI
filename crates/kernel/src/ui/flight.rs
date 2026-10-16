@@ -202,12 +202,21 @@ impl Flight {
             let row = back.row_mut((y + dy) as u32);
             let x0 = left.max(band.x).max(0);
             let x1 = right.min(band.right()).min(screen_w);
-            for x in x0..x1 {
-                let src_x = (((x - left) as i64 * i64::from(surface.width())) / span as i64)
-                    .min(i64::from(surface.width()) - 1) as usize;
-                if let (Some(dst), Some(src)) = (row.get_mut(x as usize), source.get(src_x)) {
-                    *dst = *src;
-                }
+            if x0 >= x1 {
+                continue;
+            }
+            // Шаг по источнику — в неподвижной точке, один раз на строку, как в
+            // [`draw_zoom`]: деление на каждой точке стоило на полном экране
+            // миллион делений за кадр (фаза 64).
+            let step = (u64::from(surface.width()) << 16) / span as u64;
+            let mut acc = (x0 - left) as u64 * step;
+            let max_x = surface.width() as usize - 1;
+            let (Some(dst), true) = (row.get_mut(x0 as usize..x1 as usize), source.len() > max_x) else {
+                continue;
+            };
+            for pixel in dst.iter_mut() {
+                *pixel = source[((acc >> 16) as usize).min(max_x)];
+                acc += step;
             }
         }
     }
