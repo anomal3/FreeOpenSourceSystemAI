@@ -1374,6 +1374,24 @@ pub const SYS_WINSTYLE: usize = 74;
 /// файла); кнопка на панели задач меняется вместе с ним.
 pub const SYS_WINTITLE: usize = 75;
 
+/// Назначить окну владельца. `(id, id владельца, флаги) -> 0` (фаза 62d).
+///
+/// Владелец — другое окно той же программы; `0` вместо него снимает связь.
+/// Подчинённое окно стоит **над** владельцем всегда: поднять владельца —
+/// значит поднять и его подчинённые следом, иначе вопрос `MessageBox`
+/// прятался бы под формой, которая ждёт ответа. С [`WIN_OWNER_MODAL`] фокус при
+/// этом достаётся подчинённому: щелчок по форме, занятой вопросом, возвращает
+/// к вопросу, как у Windows.
+///
+/// Чужое окно, само окно или его же подчинённое в роли владельца —
+/// [`ERR_NOT_FOUND`]: цепочка владельцев не бывает кольцом. Незнакомый флаг
+/// — [`ERR_UNSUPPORTED`].
+pub const SYS_WINOWNER: usize = 76;
+
+/// [`SYS_WINOWNER`]: владелец ждёт ответа подчинённого окна, и фокус при его
+/// поднятии уходит подчинённому.
+pub const WIN_OWNER_MODAL: u32 = 1;
+
 /// [`SYS_WINSTYLE`]: размер окна может менять человек — уголком и кнопкой
 /// «развернуть».
 ///
@@ -1543,7 +1561,7 @@ pub const SYSINFO_DARK: u32 = 1;
 /// продолжает работать, потому что всё, что она знала, осталось на месте.
 /// Старшая — когда что-нибудь меняет смысл; такого пока не случалось, и
 /// случаться не должно.
-pub const ABI_VERSION: u32 = 0x0001_000A;
+pub const ABI_VERSION: u32 = 0x0001_000B;
 
 /// [`SYS_DUP`]: «дай самый маленький свободный номер».
 ///
@@ -2287,6 +2305,8 @@ mod tests {
         assert_eq!(SYS_THREAD_INFO, 73);
         assert_eq!(SYS_WINSTYLE, 74);
         assert_eq!(SYS_WINTITLE, 75);
+        assert_eq!(SYS_WINOWNER, 76);
+        assert_eq!(WIN_OWNER_MODAL, 1);
         assert_eq!((PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC), (0, 1, 2, 4));
         assert_eq!((MAP_HUGE, MAP_LAZY, MAP_JIT), (1, 2, 4));
         assert_eq!((FUTEX_CHANGED, FUTEX_TIMED_OUT), (1, 2));
@@ -2321,6 +2341,7 @@ mod tests {
             SYS_DEVICES, SYS_WINRESIZE, SYS_THREAD_CREATE, SYS_SET_TLS, SYS_THREAD_EXIT,
             SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_DEVICE_OPEN, SYS_DEVICE_MAP, SYS_DEVICE_WAIT,
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
+            SYS_WINOWNER,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(
@@ -2483,7 +2504,8 @@ mod tests {
         // который меняет человек (фаза 62b).
         // 0x0001_000A — [`WIN_FOCUS`], [`WIN_KEYUP`] и [`SYS_WINTITLE`]:
         // активность окна, отпускание клавиши и заголовок на ходу (фаза 62c).
-        assert_eq!(ABI_VERSION, 0x0001_000A);
+        // 0x0001_000B — [`SYS_WINOWNER`]: владелец окна (фаза 62d).
+        assert_eq!(ABI_VERSION, 0x0001_000B);
 
         assert_eq!(FD_STDIN, 0);
         assert_eq!(FD_STDOUT, 1);

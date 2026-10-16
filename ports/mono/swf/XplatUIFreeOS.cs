@@ -44,8 +44,9 @@
 //
 // - Всплывающее окно не выходит за край своей формы: оно в её поверхности. Не
 //   влезающее сдвигается внутрь, а больше формы — обрезается.
-// - Окна с заголовком (`MessageBox`, диалоги) — отдельные окна стола; держать
-//   их поверх владельца стол не умеет.
+// - Окна с заголовком (`MessageBox`, диалоги) — отдельные окна стола; стол
+//   держит их над формой-владельцем (`freeos_window_owner`, фаза 62d), но
+//   свернуть владельца вместе с ними пока не умеет.
 //
 // Отладка: `FREEOS_MWF_DEBUG=1` печатает в stderr, что драйвер делает с окнами.
 
@@ -89,6 +90,8 @@ namespace System.Windows.Forms {
 			[DllImport (Lib)]
 			internal static extern int freeos_window_title (long id, byte[] title);
 			[DllImport (Lib)]
+			internal static extern int freeos_window_owner (long id, long owner, uint flags);
+			[DllImport (Lib)]
 			internal static extern int freeos_window_close (long id);
 			[DllImport (Lib)]
 			internal static extern int freeos_screen (out uint width, out uint height, out uint pixel_format);
@@ -104,6 +107,7 @@ namespace System.Windows.Forms {
 		const uint WIN_FOCUS = 8;
 		const uint WIN_KEYUP = 9;
 		const uint WIN_STYLE_RESIZABLE = 1;
+		const uint WIN_OWNER_MODAL = 1;
 		const int WIN_MOD_SHIFT = 1;
 		const int WIN_MOD_CTRL = 2;
 		const int WIN_MOD_ALT = 4;
@@ -143,6 +147,10 @@ namespace System.Windows.Forms {
 			// Стол попросил новый размер, и ответить ему надо, даже если форма
 			// осталась прежней: до ответа он показывает её в рамке нового размера.
 			internal bool Answer;
+			// Что о владельце уже сказано столу (`freeos_window_owner`): номер
+			// окна-владельца (ноль — нет) и флаги.
+			internal long OwnerId;
+			internal uint OwnerFlags;
 			internal bool IsOpen { get { return Id >= 0; } }
 		}
 
@@ -536,7 +544,32 @@ namespace System.Windows.Forms {
 			SetBackBuffer (top, width, height);
 			Trace ("open '{0}' {1}x{2} as window {3}", top.Title, width, height, id);
 			UpdateStyle (top, (int) hwnd.initial_style);
+			SyncOwner (top);
 			InvalidateTree (hwnd);
+		}
+
+		// Сказать столу, чьё это окно (фаза 62d, `freeos_window_owner`): форма
+		// владельца — у `MessageBox` и диалога, — и ждёт ли она ответа. Стол
+		// держит такое окно над владельцем, а модальному отдаёт фокус, когда
+		// человек щёлкает по владельцу. Зовётся, когда меняется любое из трёх:
+		// окно открылось, `SetOwner`, `SetModal`, — порядок их у `ShowDialog`
+		// не тот, в котором окно на столе уже есть.
+		void SyncOwner (TopLevel top)
+		{
+			if (top == null || !top.IsOpen || top.Host != null)
+				return;
+			TopLevel owner = top.Hwnd.owner != null ? TopOf (top.Hwnd.owner) : null;
+			long id = owner != null && owner != top && owner.IsOpen ? owner.Id : 0;
+			uint flags = id != 0 && modal_windows.Contains (top.Hwnd.Handle) ? WIN_OWNER_MODAL : 0;
+			if (id == top.OwnerId && flags == top.OwnerFlags)
+				return;
+			if (Native.freeos_window_owner (top.Id, id, flags) < 0) {
+				Trace ("the desktop refused owner {0} for window {1}", id, top.Id);
+				return;
+			}
+			top.OwnerId = id;
+			top.OwnerFlags = flags;
+			Trace ("window {0} owned by {1}, flags {2}", top.Id, id, flags);
 		}
 
 		// Размер формы с рамкой `Sizable` меняет человек — стол узнаёт об этом
@@ -1045,18 +1078,89 @@ namespace System.Windows.Forms {
 
 		internal override void ScrollWindow (IntPtr handle, Rectangle area, int XAmount, int YAmount, bool with_children)
 		{
-			// Честная прокрутка копией точек — потом; пока область просто
-			// рисуется заново, и видно то же самое, только медленнее.
 			Hwnd hwnd = Hwnd.ObjectFromHandle (handle);
 			if (hwnd != null)
-				AddExpose (hwnd, true, area);
+				Scroll (hwnd, area, XAmount, YAmount);
 		}
 
 		internal override void ScrollWindow (IntPtr handle, int XAmount, int YAmount, bool with_children)
 		{
 			Hwnd hwnd = Hwnd.ObjectFromHandle (handle);
 			if (hwnd != null)
-				AddExpose (hwnd, true, new Rectangle (Point.Empty, hwnd.ClientRect.Size));
+				Scroll (hwnd, new Rectangle (Point.Empty, hwnd.ClientRect.Size), XAmount, YAmount);
+		}
+
+		// Прокрутка сдвигом точек заднего буфера (фаза 62d), как `XCopyArea` у
+		// X11: заново рисуется только открывшаяся полоса. До этого область
+		// перерисовывалась целиком, и строка списка, уехавшая на пиксель, стоила
+		// отладочной Mono полной отрисовки всех строк.
+		//
+		// Сдвиг честен только в простом случае, а в остальных область рисуется
+		// заново, как раньше: окно ждёт перерисовки (сдвинулись бы устаревшие
+		// точки); его часть закрыта ребёнком, соседом или всплывающим окном
+		// (сдвинулись бы чужие точки); сдвиг не меньше самой области.
+		void Scroll (Hwnd hwnd, Rectangle area, int dx, int dy)
+		{
+			area.Intersect (new Rectangle (Point.Empty, hwnd.ClientRect.Size));
+			if (area.IsEmpty)
+				return;
+			// Нулевой сдвиг — это «нарисуй область заново», и на это рассчитывает
+			// сам WinForms: `ListBox` со стрелкой вниз сперва меняет начало
+			// списка, а потом зовёт прокрутку на разницу, которая уже ноль. У X11
+			// так же — пустая копия и вся область в перерисовку. Молча выйти здесь
+			// значило оставить в списке строки, которых в нём больше нет.
+			if (dx == 0 && dy == 0) {
+				AddExpose (hwnd, true, area);
+				return;
+			}
+			TopLevel top = TopOf (hwnd);
+			Point o = ClientOrigin (hwnd);
+			Rectangle surface = new Rectangle (o.X + area.X, o.Y + area.Y, area.Width, area.Height);
+			if (top == null || top.BackBits == IntPtr.Zero || hwnd.expose_pending
+				|| Math.Abs (dx) >= area.Width || Math.Abs (dy) >= area.Height
+				|| !WhollyVisible (hwnd, top, surface)) {
+				AddExpose (hwnd, true, area);
+				return;
+			}
+
+			// Куда точки переезжают внутри области; откуда — на сдвиг назад.
+			Rectangle to = surface;
+			to.Offset (dx, dy);
+			to.Intersect (surface);
+			int stride = top.Width * 4;
+			byte[] row = new byte [to.Width * 4];
+			// Порядок строк — против сдвига: строка, ещё не прочитанная, не
+			// должна оказаться затёртой.
+			for (int i = 0; i < to.Height; i++) {
+				int y = dy > 0 ? to.Bottom - 1 - i : to.Y + i;
+				IntPtr from = new IntPtr (top.BackBits.ToInt64 () + (long) (y - dy) * stride + (to.X - dx) * 4);
+				IntPtr into = new IntPtr (top.BackBits.ToInt64 () + (long) y * stride + to.X * 4);
+				Marshal.Copy (from, row, 0, row.Length);
+				Marshal.Copy (row, 0, into, row.Length);
+			}
+			top.Dirty = Union (top.Dirty, to);
+			Trace ("scroll {0:X} by {1},{2} in {3}", hwnd.Handle.ToInt64 (), dx, dy, area);
+
+			// Открывшиеся полосы — заново, в клиентских координатах окна.
+			if (dy != 0) {
+				int h = Math.Abs (dy);
+				AddExpose (hwnd, true, new Rectangle (area.X, dy > 0 ? area.Y : area.Bottom - h, area.Width, h));
+			}
+			if (dx != 0) {
+				int w = Math.Abs (dx);
+				AddExpose (hwnd, true, new Rectangle (dx > 0 ? area.X : area.Right - w, area.Y, w, area.Height));
+			}
+		}
+
+		// Видна ли эта часть поверхности у окна вся, без чужих точек поверх.
+		bool WhollyVisible (Hwnd hwnd, TopLevel top, Rectangle surface)
+		{
+			using (Region visible = VisibleRegion (hwnd, true))
+			using (Region outside = new Region (surface))
+			using (Graphics g = Graphics.FromImage (top.Back)) {
+				outside.Exclude (visible);
+				return outside.IsEmpty (g);
+			}
 		}
 
 		#endregion
@@ -1539,6 +1643,7 @@ namespace System.Windows.Forms {
 				HidePopup (hwnd);
 				ShowPopup (hwnd);
 			}
+			SyncOwner (entry);
 			return true;
 		}
 
@@ -1763,6 +1868,9 @@ namespace System.Windows.Forms {
 				if (modal_windows.Count > 0)
 					Activate (modal_windows.Peek ());
 			}
+			Hwnd hwnd = Hwnd.ObjectFromHandle (handle);
+			if (hwnd != null)
+				SyncOwner (EntryOf (hwnd));
 		}
 
 		internal override void GrabWindow (IntPtr hwnd, IntPtr ConfineToHwnd)

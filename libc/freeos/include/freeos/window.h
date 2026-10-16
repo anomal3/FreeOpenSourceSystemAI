@@ -47,6 +47,9 @@ extern "C" {
 /* Что окно умеет — `freeos_window_style`. */
 #define FREEOS_WIN_STYLE_RESIZABLE 1u
 
+/* Владелец ждёт ответа — `freeos_window_owner`. */
+#define FREEOS_WIN_OWNER_MODAL 1u
+
 /* Модификаторы в `x` события клавиши. */
 #define FREEOS_WIN_MOD_SHIFT 1
 #define FREEOS_WIN_MOD_CTRL 2
@@ -118,6 +121,11 @@ int freeos_window_style(int64_t id, uint32_t flags);
 /* Сменить заголовок окна (фаза 62c). UTF-8, не пустой и не длиннее 64 байт —
  * иначе отказ. */
 int freeos_window_title(int64_t id, const char *title);
+
+/* Назначить окну владельца — другое окно той же программы, ноль снимает связь
+ * (фаза 62d). Окно стоит над владельцем всегда; с `FREEOS_WIN_OWNER_MODAL`
+ * фокус при поднятии владельца уходит этому окну. */
+int freeos_window_owner(int64_t id, int64_t owner, uint32_t flags);
 
 /* Закрыть окно. Поверхность после этого недействительна. */
 int freeos_window_close(int64_t id);

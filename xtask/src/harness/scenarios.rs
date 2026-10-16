@@ -8845,6 +8845,16 @@ pub const ALL: &[Scenario] = &[
             Step::Type("q"),
             Step::Await("popups: key down Q", 60_000),
             Step::Await("popups: key up Q", 60_000),
+            // Фаза 62d: список 210,128 размером 80x60 прокручивается сдвигом
+            // точек — стрелка вниз за нижний край уводит его на строку.
+            // Первая строка — у верхнего края.
+            Step::Aim(Aim::Program("Mono Popups", 250, 156)),
+            Step::Click,
+            Step::Await("popups: list item 1, top 0", 60_000),
+            Step::Repeat("down", 6),
+            Step::Await("popups: list item 7, top ", 60_000),
+            Step::Wait(1_500),
+            Step::Shot("scrolled"),
             // Развернуть и вернуть: форма выкладывается по размеру, который
             // выбрал стол, и кнопка в углу едет вместе с углом.
             Step::Aim(Aim::Maximize("Mono Popups")),
@@ -8860,8 +8870,17 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Program("Mono Popups", 57, 125)),
             Step::Click,
             Step::Await("desktop     : opened 'Question'", 60_000),
+            // Фаза 62d: вопрос — подчинённое модальное окно формы
+            // (`freeos_window_owner`).
+            Step::AwaitAny("desktop     : 'Question' is modal over 'Mono Popups'", 60_000),
             Step::Wait(2_000),
             Step::Shot("question"),
+            // Щелчок по свободному месту формы поднимает её — и вопрос над ней,
+            // а фокус отдаёт вопросу: Enter ниже доходит до кнопки «Yes».
+            // Без владельца он ушёл бы выключенной форме и пропал.
+            Step::Aim(Aim::Program("Mono Popups", 40, 200)),
+            Step::Click,
+            Step::Await("desktop     : focus 'Question'", 60_000),
             Step::Key("ret"),
             Step::Await("popups: answer Yes", 60_000),
             // Заголовок на ходу (`SYS_WINTITLE`): кнопка 110,90 размером 90x30.
@@ -9367,7 +9386,8 @@ pub const ALL: &[Scenario] = &[
             // `WIN_RESIZE` (фаза 62b).
             // 65546 — `0x0001_000A`: `WIN_FOCUS`, `WIN_KEYUP` и `SYS_WINTITLE`
             // (фаза 62c).
-            Step::Await("posix: abi version 65546", 60_000),
+            // 65547 — `0x0001_000B`: `SYS_WINOWNER` (фаза 62d).
+            Step::Await("posix: abi version 65547", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».

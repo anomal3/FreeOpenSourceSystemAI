@@ -596,6 +596,94 @@ impl Compositor {
         for index in 0..uncovered_count {
             self.mark_layer(uncovered[index]);
         }
+        self.lift_owned();
+    }
+
+    /// Поднять над верхним окном его подчинённые, а над ними — их подчинённые
+    /// (фаза 62d, `user_abi::SYS_WINOWNER`).
+    ///
+    /// Фокус остаётся у поднятого окна, если среди поднятых следом нет
+    /// модального; есть — достаётся верхнему модальному: форма, ждущая ответа,
+    /// сама ввода не примет, а вопрос под ней человек бы не нашёл.
+    fn lift_owned(&mut self) {
+        let Some(raised) = self.windows.last().map(|window| window.app) else {
+            return;
+        };
+        let mut owner = raised;
+        let mut modal = None;
+        // Кольца в цепочке владельцев не бывает (см. [`Self::set_owner`]), а
+        // предел по числу окон — на случай, если однажды оно всё же появится.
+        for _ in 0..self.windows.len() {
+            // Сначала — кто, потом — перестановка: окно, уехавшее в конец
+            // списка, обход увидел бы второй раз.
+            let owned: Vec<App> = self
+                .windows
+                .iter()
+                .filter(|window| window.owner == Some(owner) && !window.minimized)
+                .map(|window| window.app)
+                .collect();
+            if owned.is_empty() {
+                break;
+            }
+            for app in owned {
+                let Some(index) = self.index_of(app) else {
+                    continue;
+                };
+                let window = self.windows.remove(index);
+                if window.modal {
+                    modal = Some(window.app);
+                }
+                let rect = window.rect;
+                self.windows.push(window);
+                self.mark_layer(rect);
+            }
+            let Some(top) = self.windows.last().map(|window| window.app) else {
+                break;
+            };
+            owner = top;
+        }
+        if owner == raised {
+            return;
+        }
+        let focused = modal.unwrap_or(raised);
+        if let Some(index) = self.index_of(focused) {
+            self.focus = index;
+        }
+        self.refresh_decorations();
+    }
+
+    /// Назначить окну `app` владельца (`None` — снять). Отказ — владелец не
+    /// найден, совпадает с окном или сам ему подчинён: цепочка владельцев не
+    /// бывает кольцом.
+    pub fn set_owner(&mut self, app: App, owner: Option<App>, modal: bool) -> bool {
+        if let Some(owner) = owner {
+            let mut step = Some(owner);
+            for _ in 0..=self.windows.len() {
+                let Some(current) = step else {
+                    break;
+                };
+                if current == app {
+                    return false;
+                }
+                let Some(window) = self.windows.iter().find(|window| window.app == current) else {
+                    return false;
+                };
+                step = window.owner;
+            }
+        }
+        let Some(window) = self.find(app) else {
+            return false;
+        };
+        window.owner = owner;
+        window.modal = modal && owner.is_some();
+        // Подчинённое окно сразу встаёт над владельцем: обычно оно и так
+        // наверху — только что открыто, — но связь могли назначить и позже.
+        if let Some(index) = owner.and_then(|owner| self.index_of(owner)) {
+            if self.focus == index {
+                self.raise(index);
+            }
+        }
+        true
     }
 
     /// Поднять нижнее окно наверх — обход по кругу.
@@ -984,6 +1072,12 @@ impl Compositor {
         };
         let window = self.windows.remove(index);
         self.invalidate_recent();
+        // Подчинённые закрытого окна остаются без владельца, а не с номером
+        // окна, которого нет: следующее окно с тем же номером их бы «усыновило».
+        for other in self.windows.iter_mut().filter(|other| other.owner == Some(app)) {
+            other.owner = None;
+            other.modal = false;
+        }
         if self.focus >= self.windows.len() {
             self.focus = self.windows.len().saturating_sub(1);
         }

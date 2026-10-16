@@ -5,8 +5,10 @@
 // кнопка, привязанная к углу, — смена размера формы столом; `MessageBox` —
 // отдельное окно стола. Фаза 62c: щелчок по другому окну стола закрывает
 // открытые меню (`WIN_FOCUS`), клавиша приходит нажатием и отпусканием порознь
-// (`WIN_KEYUP`), заголовок меняется на ходу (`freeos_window_title`). Каждое
-// действие печатается строкой, по ним сверяет сценарий `mono-popups`.
+// (`WIN_KEYUP`), заголовок меняется на ходу (`freeos_window_title`). Фаза 62d:
+// `MessageBox` — подчинённое модальное окно формы (`freeos_window_owner`), а
+// список прокручивается сдвигом точек. Каждое действие печатается строкой, по
+// ним сверяет сценарий `mono-popups`.
 //
 // Раскладка задана числами: стенд целится в точки содержимого окна
 // (`Aim::Program`), а они — клиентские точки отсюда плюс высота полосы меню.
@@ -86,6 +88,17 @@ class PopupsForm : Form
             Console.WriteLine ("popups: renamed");
         };
 
+        // Список на двадцать строк: 210,128 размером 80x60 — видно четыре,
+        // и стрелка вниз за край прокручивает его на строку.
+        ListBox list = new ListBox ();
+        list.Location = new Point (210, 128);
+        list.Size = new Size (80, 60);
+        for (int i = 1; i <= 20; i++)
+            list.Items.Add ("item " + i);
+        list.SelectedIndexChanged += delegate {
+            Console.WriteLine ("popups: list " + list.SelectedItem + ", top " + list.TopIndex);
+        };
+
         // Кнопка у правого нижнего угла: едет вместе с углом формы.
         corner = new Button ();
         corner.Text = "Corner";
@@ -122,6 +135,7 @@ class PopupsForm : Form
         Controls.Add (box);
         Controls.Add (ask);
         Controls.Add (rename);
+        Controls.Add (list);
         Controls.Add (corner);
 
         Shown += delegate {

@@ -302,6 +302,11 @@ pub struct Window {
     pub minimized_at_ms: u64,
     /// Куда вернуть окно, если оно развёрнуто. `None` — окно обычного размера.
     restore: Option<Rect>,
+    /// Окно-владелец той же программы (фаза 62d, `user_abi::SYS_WINOWNER`):
+    /// это окно всегда стоит над ним, и поднять владельца — поднять и его.
+    pub owner: Option<App>,
+    /// Владелец ждёт ответа этого окна: при его поднятии фокус уходит сюда.
+    pub modal: bool,
     /// Что изменилось в поверхности с прошлой сборки, в координатах поверхности.
     pub damage: Rect,
 }
@@ -409,6 +414,8 @@ impl Window {
             minimized: false,
             minimized_at_ms: 0,
             restore: None,
+            owner: None,
+            modal: false,
             damage: Rect::EMPTY,
         }
     }

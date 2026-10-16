@@ -109,6 +109,11 @@ int freeos_window_title(int64_t id, const char *title) {
     return code < 0 ? freeos_set_errno(code) : 0;
 }
 
+int freeos_window_owner(int64_t id, int64_t owner, uint32_t flags) {
+    long code = insist(SYS_WINOWNER, (long)id, (long)owner, (long)flags);
+    return code < 0 ? freeos_set_errno(code) : 0;
+}
+
 int freeos_window_close(int64_t id) {
     long code = insist(SYS_WINCLOSE, (long)id, 0, 0);
     return code < 0 ? freeos_set_errno(code) : 0;

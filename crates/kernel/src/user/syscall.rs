@@ -183,6 +183,8 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_WINSTYLE => winstyle(a0 as i64, a1),
         // Фаза 62c: заголовок окна меняется на ходу.
         user_abi::SYS_WINTITLE => wintitle(a0 as i64, a1, a2),
+        // Фаза 62d: у окна есть владелец.
+        user_abi::SYS_WINOWNER => winowner(a0 as i64, a1 as i64, a2),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -1884,6 +1886,31 @@ fn wintitle(id: i64, ptr: usize, len: usize) -> i64 {
         return ERR_BAD_ADDRESS;
     };
     match super::title_window(slot, title) {
+        Ok(()) => 0,
+        Err(err) => window_errno(err),
+    }
+}
+
+/// `winowner(id, owner, флаги) -> 0` (фаза 62d). Владелец — окно той же
+/// программы, ноль снимает связь.
+fn winowner(id: i64, owner: i64, flags: usize) -> i64 {
+    let slot = match own_window(id) {
+        Ok(slot) => slot,
+        Err(err) => return err,
+    };
+    let owner = if owner == 0 {
+        None
+    } else {
+        match own_window(owner) {
+            Ok(owner) => Some(owner),
+            Err(err) => return err,
+        }
+    };
+    if flags & !(user_abi::WIN_OWNER_MODAL as usize) != 0 {
+        return ERR_UNSUPPORTED;
+    }
+    let modal = flags & user_abi::WIN_OWNER_MODAL as usize != 0;
+    match super::owner_window(slot, owner, modal) {
         Ok(()) => 0,
         Err(err) => window_errno(err),
     }

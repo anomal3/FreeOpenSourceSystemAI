@@ -1386,10 +1386,14 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
             // при этом поднимается, как и от левой: меню над окном, которое
             // не в фокусе, читалось бы как меню чужого окна.
             if hit == Hit::Body {
+                let app = desktop.app_at(index);
                 desktop.raise(index);
                 log_focus(desktop);
                 let scale = desktop.scale();
-                if let Some(window) = desktop.focused_mut() {
+                // Фокус ушёл модальному подчинённому (фаза 62d) — щелчок по
+                // владельцу дальше не идёт: он только вернул человека к вопросу.
+                let redirected = desktop.focused_app() != app;
+                if let Some(window) = desktop.focused_mut().filter(|_| !redirected) {
                     if window.is_program() {
                         let local = (
                             x - window.rect.x,
@@ -1883,6 +1887,14 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
         let app = desktop.app_at(index);
         desktop.raise(index);
         log_focus(desktop);
+        // Поднятие отдало фокус модальному подчинённому окну (фаза 62d): форма
+        // ждёт ответа, и щелчок по ней только возвращает к вопросу. Дальше —
+        // ни щелчка содержимому (оно досталось бы вопросу, в чужих
+        // координатах), ни перетаскивания, ни уголка.
+        if desktop.focused_app() != app && matches!(hit, Hit::Body | Hit::Title | Hit::Resize) {
+            desktop.present();
+            return;
+        }
         match hit {
             Hit::Close => {
                 if let Some(app) = app {
@@ -2833,6 +2845,32 @@ pub fn title_window(task: u32, slot: u32, title: &str) -> Result<(), WindowError
             desktop.refresh_panel(&status_now());
             desktop.present();
         }
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Назначить окну программы владельца — её же окно `owner` (фаза 62d,
+/// `user_abi::SYS_WINOWNER`); `None` снимает связь.
+pub fn owner_window(task: u32, slot: u32, owner: Option<u32>, modal: bool) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    let owner = owner.map(|slot| App::Program(task, slot));
+    with_desktop(|desktop| {
+        if desktop.find(app).is_none() {
+            return Err(WindowError::NoWindow);
+        }
+        if !desktop.set_owner(app, owner, modal) {
+            return Err(WindowError::NoWindow);
+        }
+        if let Some(owner) = owner {
+            let kind = if modal { "modal over" } else { "owned by" };
+            kprintln!(
+                "  desktop     : '{}' is {kind} '{}'",
+                name_of(desktop, app),
+                name_of(desktop, owner)
+            );
+        }
+        desktop.present();
         Ok(())
     })
     .unwrap_or_else(|| Err(unavailable()))
