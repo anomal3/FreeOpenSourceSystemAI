@@ -761,6 +761,49 @@ pub fn stream_table() -> alloc::vec::Vec<(usize, &'static str, u16, Ipv4, u16, u
 }
 
 /// Кто прислал последнюю забранную датаграмму.
+/// Готовность сокета-дескриптора для ожидания и `SYS_POLL` (фаза 65a):
+/// `(есть что читать, можно писать, связь кончилась)`.
+///
+/// «Читать» у TCP — данные, конец потока, обрыв или ждущее соединение у
+/// слушающего: на всём этом `read` или `accept` вернутся сразу. «Писать» —
+/// соединение установлено и в буфере отправки есть место, — или оно
+/// оборвалось: `write` вернётся сразу, с ошибкой.
+pub fn stream_poll(owner: TaskId, index: usize) -> Result<(bool, bool, bool), NetError> {
+    let guard = INTERFACE.lock();
+    let iface = guard.as_ref().ok_or(NetError::NoDevice)?;
+    let conn = iface.streams.get(owner, index).map_err(NetError::Stream)?;
+    let readable = !conn.recv.is_empty()
+        || conn.peer_closed
+        || conn.reset
+        || (conn.state == stream::State::Listen && !conn.backlog.is_empty());
+    let room = conn.send.len() < stream::SEND_BUFFER;
+    let writable = conn.reset || (conn.state.is_open() && !conn.closing && room);
+    Ok((readable, writable, conn.reset || conn.peer_closed))
+}
+
+/// Что известно о соединении (фаза 65a): свой порт, собеседник, состояние,
+/// конец от собеседника, обрыв.
+pub fn stream_info(
+    owner: TaskId,
+    index: usize,
+) -> Result<(u16, Ipv4, u16, stream::State, bool, bool), NetError> {
+    let guard = INTERFACE.lock();
+    let iface = guard.as_ref().ok_or(NetError::NoDevice)?;
+    let conn = iface.streams.get(owner, index).map_err(NetError::Stream)?;
+    Ok((conn.local_port, conn.remote, conn.remote_port, conn.state, conn.peer_closed, conn.reset))
+}
+
+/// Что известно о сокете UDP (фаза 65a): свой порт, получатель, отправитель
+/// последней датаграммы, есть ли что читать.
+pub fn socket_info(
+    owner: TaskId,
+    index: usize,
+) -> Result<(u16, Option<(Ipv4, u16)>, Option<(Ipv4, u16)>, bool), NetError> {
+    let guard = INTERFACE.lock();
+    let iface = guard.as_ref().ok_or(NetError::NoDevice)?;
+    iface.sockets.describe(owner, index).map_err(NetError::Socket)
+}
+
 pub fn socket_peer(owner: TaskId, index: usize) -> Result<Option<(Ipv4, u16)>, NetError> {
     let guard = INTERFACE.lock();
     let iface = guard.as_ref().ok_or(NetError::NoDevice)?;
@@ -843,6 +886,10 @@ pub fn service_task() {
                 tcp_tick(iface);
             }
         }
+        // Пришедшее разобрано и таймеры отработали — тем, кто ждёт сокетов
+        // (фаза 65a): данные, соединение, место, конец. Замок сети к этому
+        // мгновению отпущен: ждущий проверяет сокет под ним же.
+        crate::io_events::notify();
 
         // Как ждать — решает карта, а не эта задача.
         //

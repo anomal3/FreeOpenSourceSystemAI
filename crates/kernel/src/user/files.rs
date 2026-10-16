@@ -12,7 +12,7 @@
 //!
 //! # Почему предел маленький
 //!
-//! [`MAX_OPEN_FILES`] — восемь. Таблица не растёт, и это записано в договоре с
+//! [`MAX_OPEN_FILES`] — тридцать два (до фазы 65a — восемь). Таблица не растёт, и это записано в договоре с
 //! программой: вызов, который иногда отвечает «слишком много открытых файлов»,
 //! понятнее вызова, который иногда съедает кучу ядра. Узел ext2 держит `Arc` на
 //! том и разобранный inode — сотни байт, но выделяет их куча ядра, а не
@@ -96,6 +96,9 @@ enum Slot {
     PipeRead(pipe::Reader),
     /// Пишущий конец: в него отдаёт `write`.
     PipeWrite(pipe::Writer),
+    /// Сокет (фаза 65a). Читают и пишут его не здесь, а в `sock.rs`, вне
+    /// замка программы: сокет ждёт, а таблица под замком ждать не может.
+    Socket(Arc<super::sock::Sock>),
 }
 
 /// Почему не получилось.
@@ -128,6 +131,8 @@ pub enum FdKind {
     /// выбирает по нему способ буферизации, и труба, назвавшаяся файлом,
     /// получила бы вывод, который не появляется, пока не наберётся килобайт.
     Pipe,
+    /// Сокет (фаза 65a).
+    Socket,
 }
 
 /// Что ядро знает об открытом дескрипторе — ответ [`Table::describe`].
@@ -273,7 +278,8 @@ impl Table {
             // всякого, кто в эту таблицу заглянет. Ждать умеет стандартный
             // вывод (см. `Program::stdout`) — он живёт не в таблице.
             Slot::PipeWrite(writer) => writer.write(data, false).map_err(FileError::Pipe),
-            Slot::PipeRead(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
+            // Сокет пишется в `sock.rs`, вне замка: сюда он не доходит.
+            Slot::PipeRead(_) | Slot::Socket(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
     }
 
@@ -315,7 +321,7 @@ impl Table {
                 }
                 Ok(Arc::clone(&open.node))
             }
-            Some(Slot::PipeRead(_) | Slot::PipeWrite(_)) => {
+            Some(Slot::PipeRead(_) | Slot::PipeWrite(_) | Slot::Socket(_)) => {
                 Err(FileError::Vfs(VfsError::WrongKind))
             }
             None => Err(FileError::BadFd),
@@ -345,7 +351,7 @@ impl Table {
             }
             // Не ждёт по той же причине, что и запись выше.
             Slot::PipeRead(reader) => reader.read(buf, false).map_err(FileError::Pipe),
-            Slot::PipeWrite(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
+            Slot::PipeWrite(_) | Slot::Socket(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
     }
 
@@ -400,6 +406,23 @@ impl Table {
         let slot = self.free_slot()?;
         self.slots[slot] = Some(Slot::PipeWrite(writer));
         Ok(slot + FD_FIRST)
+    }
+
+    /// Занять место под сокет (фаза 65a).
+    pub fn install_socket(&mut self, socket: super::sock::Sock) -> Result<usize, FileError> {
+        let slot = self.free_slot()?;
+        self.slots[slot] = Some(Slot::Socket(Arc::new(socket)));
+        Ok(slot + FD_FIRST)
+    }
+
+    /// Сокет за дескриптором — `None`, если там не сокет. Отдаётся ссылка:
+    /// работают с ним после того, как замок программы отпущен.
+    #[must_use]
+    pub fn socket(&self, fd: usize) -> Option<Arc<super::sock::Sock>> {
+        match self.slots.get(index_of(fd).ok()?)?.as_ref()? {
+            Slot::Socket(socket) => Some(Arc::clone(socket)),
+            _ => None,
+        }
     }
 
     /// Копия читающего конца из этого дескриптора.
@@ -458,6 +481,7 @@ impl Table {
             Slot::File(open) => Slot::File(Arc::clone(open)),
             Slot::PipeRead(reader) => Slot::PipeRead(reader.clone()),
             Slot::PipeWrite(writer) => Slot::PipeWrite(writer.clone()),
+            Slot::Socket(socket) => Slot::Socket(Arc::clone(socket)),
         };
 
         let target = if to == user_abi::DUP_ANY {
@@ -506,6 +530,13 @@ impl Table {
                 gid: 0,
                 kind: FdKind::Pipe,
             }),
+            Some(Slot::Socket(_)) => Ok(FdInfo {
+                size: 0,
+                mode: 0,
+                uid: 0,
+                gid: 0,
+                kind: FdKind::Socket,
+            }),
             None => Err(FileError::BadFd),
         }
     }
@@ -521,6 +552,7 @@ impl Table {
             Some(Slot::File(open)) => Ok((true, open.writable, false)),
             Some(Slot::PipeRead(reader)) => Ok((reader.ready(), false, reader.hangup())),
             Some(Slot::PipeWrite(writer)) => Ok((false, writer.ready(), writer.hangup())),
+            Some(Slot::Socket(socket)) => Ok(socket.readiness()),
             None => Err(FileError::BadFd),
         }
     }

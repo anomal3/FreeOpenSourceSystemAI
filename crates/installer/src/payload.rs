@@ -293,7 +293,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 50] = [
+const PROGRAMS: [(&CStr16, &str); 51] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -315,6 +315,8 @@ const PROGRAMS: [(&CStr16, &str); 50] = [
     (cstr16!("\\FREEOS\\BIN\\DHCP"), "dhcp"),
     (cstr16!("\\FREEOS\\BIN\\ECHOD"), "echod"),
     (cstr16!("\\FREEOS\\BIN\\ECHOC"), "echoc"),
+    // Проверка сокетов-дескрипторов (фаза 65a).
+    (cstr16!("\\FREEOS\\BIN\\SOCKFD"), "sockfd"),
     (cstr16!("\\FREEOS\\BIN\\SSHD"), "sshd"),
     // Файлы по SSH (фаза 38c). `sshd` запускает его от имени вошедшего; без
     // него подсистема `sftp` отвечает отказом.

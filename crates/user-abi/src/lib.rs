@@ -1415,6 +1415,36 @@ pub const SYS_WINPOPUP: usize = 77;
 /// Точка — как у [`SYS_WINPOPUP`]. Окну, открытому не им, — [`ERR_NOT_FOUND`].
 pub const SYS_WINPLACE: usize = 78;
 
+/// Открыть сокет **дескриптором**. `(вид, флаги, 0) -> дескриптор` (фаза 65a).
+///
+/// Вид — [`SOCK_UDP`] или [`SOCK_TCP`], флаги — [`SOCK_NONBLOCK`]. Ответ —
+/// обычный номер из таблицы файлов: [`SYS_READ`], [`SYS_WRITE`],
+/// [`SYS_CLOSE`], [`SYS_DUP`], [`SYS_FSTAT`] (вид [`KIND_SOCKET`]) и
+/// [`SYS_POLL`] работают на нём, как на конце канала. Остальное — адрес,
+/// соединение, приём — через [`SYS_SOCKCTL`].
+///
+/// По умолчанию сокет **блокирующий**, как в Unix: `read` ждёт данных, `write`
+/// — места, соединение — ответа собеседника. С [`SOCK_NONBLOCK`] вместо
+/// ожидания — [`ERR_AGAIN`], а соединение — [`ERR_IN_PROGRESS`].
+///
+/// # Чем это отличается от [`SYS_SOCKET`]
+///
+/// Тот отдаёт номер из своего пространства (TCP — с [`STREAM_FIRST`]), и
+/// работают с ним только сетевые вызовы, которые никогда не ждут; программы на
+/// Rust стоят на нём и остаются. Смысл старых номеров не меняется — правило
+/// договора, — поэтому дескрипторы получили свои вызовы, а не новый смысл
+/// старых. Причина — программы на C: libcurl, Mono, браузер ждут сокета-
+/// дескриптора и `poll` на нём, и эмулировать это внутри libc значило бы опрос
+/// по таймеру вместо ожидания (решение Романа, 17.10).
+pub const SYS_SOCKFD: usize = 79;
+
+/// Действие над сокетом-дескриптором. `(дескриптор, действие, аргумент) ->
+/// ответ` (фаза 65a).
+///
+/// Действия — `SOCKCTL_*`. Один вызов на все, а не по номеру на каждое: их
+/// семь, и аргумент у каждого умещается в одно число.
+pub const SYS_SOCKCTL: usize = 80;
+
 /// [`SYS_WINSTYLE`]: размер окна может менять человек — уголком и кнопкой
 /// «развернуть».
 ///
@@ -1584,7 +1614,7 @@ pub const SYSINFO_DARK: u32 = 1;
 /// продолжает работать, потому что всё, что она знала, осталось на месте.
 /// Старшая — когда что-нибудь меняет смысл; такого пока не случалось, и
 /// случаться не должно.
-pub const ABI_VERSION: u32 = 0x0001_000C;
+pub const ABI_VERSION: u32 = 0x0001_000D;
 
 /// [`SYS_DUP`]: «дай самый маленький свободный номер».
 ///
@@ -1801,6 +1831,59 @@ pub const SOCK_TCP: usize = 1;
 /// программу, что она имела в виду, — и не могут ошибиться, если она перепутала.
 pub const STREAM_FIRST: usize = 64;
 
+/// [`SYS_SOCKFD`]: не ждать — ни данных, ни места, ни соединения.
+pub const SOCK_NONBLOCK: usize = 1;
+
+/// [`SYS_SOCKCTL`]: занять порт. Аргумент — порт, ноль — любой свободный;
+/// ответ — занятый порт.
+pub const SOCKCTL_BIND: usize = 1;
+/// [`SYS_SOCKCTL`]: соединиться. Аргумент — `(адрес << 16) | порт`, адрес IPv4
+/// старшим байтом первым.
+///
+/// TCP ждёт, пока собеседник ответит: ноль — соединено, [`ERR_CONN_REFUSED`] —
+/// отказано или не ответил. С [`SOCK_NONBLOCK`] — сразу [`ERR_IN_PROGRESS`],
+/// а дождаться можно [`SYS_POLL`] с [`POLL_OUT`] и спросить исход
+/// [`SOCKCTL_INFO`]. UDP только запоминает получателя.
+pub const SOCKCTL_CONNECT: usize = 2;
+/// [`SYS_SOCKCTL`]: слушать занятый порт (TCP).
+pub const SOCKCTL_LISTEN: usize = 3;
+/// [`SYS_SOCKCTL`]: принять соединение (TCP). Ответ — новый дескриптор;
+/// блокирующий сокет ждёт, неблокирующий отвечает [`ERR_AGAIN`].
+pub const SOCKCTL_ACCEPT: usize = 4;
+/// [`SYS_SOCKCTL`]: закрыть свою половину (TCP): собеседник получит конец
+/// данных, а читать ещё можно.
+pub const SOCKCTL_SHUTDOWN: usize = 5;
+/// [`SYS_SOCKCTL`]: ждать или нет. Аргумент — единица (не ждать) или ноль.
+pub const SOCKCTL_NONBLOCK: usize = 6;
+/// [`SYS_SOCKCTL`]: что известно о сокете. Аргумент — адрес [`SockInfo`].
+pub const SOCKCTL_INFO: usize = 7;
+
+/// Что известно о сокете-дескрипторе — ответ [`SOCKCTL_INFO`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SockInfo {
+    /// Свой порт; ноль — ещё не занят.
+    pub local_port: u16,
+    /// Порт собеседника (TCP) или того, кому шлём (UDP).
+    pub remote_port: u16,
+    /// Адрес собеседника, IPv4 старшим байтом первым.
+    pub remote: u32,
+    /// Кто прислал последнюю датаграмму (UDP): адрес и порт.
+    pub from: u32,
+    pub from_port: u16,
+    /// Единица — TCP; ноль — UDP.
+    pub tcp: u8,
+    /// Единица — соединение установлено.
+    pub open: u8,
+    /// Единица — собеседник закрыл свою половину.
+    pub peer_closed: u8,
+    /// Единица — соединение оборвано (или не состоялось).
+    pub reset: u8,
+    /// Единица — сокет слушает.
+    pub listening: u8,
+    pub _reserved: u8,
+}
+
 /// Состояние соединения — ответ [`SYS_STREAMSTATE`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -1937,10 +2020,12 @@ pub const FD_FIRST: usize = 3;
 
 /// Сколько файлов программа может держать открытыми одновременно.
 ///
-/// Предел маленький и намеренно виден в договоре: таблица дескрипторов у ядра
-/// одна на программу и не растёт, а вызов, который иногда отказывает, лучше
-/// вызова, который иногда съедает всю память ядра.
-pub const MAX_OPEN_FILES: usize = 8;
+/// Предел намеренно виден в договоре: таблица дескрипторов у ядра одна на
+/// программу и не растёт, а вызов, который иногда отказывает, лучше вызова,
+/// который иногда съедает всю память ядра. До фазы 65a — восемь; с сокетами-
+/// дескрипторами (фаза 65a) в той же таблице живут и соединения, и восьми
+/// стало мало браузеру и libcurl, — тридцать два.
+pub const MAX_OPEN_FILES: usize = 32;
 
 /// Что ядро знает о файле. Ответ [`SYS_STAT`].
 ///
@@ -2040,6 +2125,9 @@ pub const KIND_PIPE: u32 = 3;
 /// открывает `Console` вовсе. Поток, уведённый запускающим в канал, отвечает
 /// [`KIND_PIPE`].
 pub const KIND_TERMINAL: u32 = 4;
+/// Сокет в [`Stat::kind`] — ответ [`SYS_FSTAT`] на сокет-дескриптор (фаза
+/// 65a, [`SYS_SOCKFD`]).
+pub const KIND_SOCKET: u32 = 5;
 
 /// Код возврата, которым ядро завершает программу, снятую из-за отказа.
 ///
@@ -2082,6 +2170,15 @@ pub const ERR_NO_SPACE: i64 = -16;
 /// просить. Слить их в один код значило бы заставить каждого просящего гадать,
 /// стоит ли пробовать ещё раз.
 pub const ERR_LIMIT: i64 = -24;
+
+/// Ошибка системного вызова: собеседник оборвал соединение (фаза 65a).
+pub const ERR_CONN_RESET: i64 = -25;
+/// Ошибка системного вызова: в соединении отказано — или собеседник не
+/// ответил (фаза 65a).
+pub const ERR_CONN_REFUSED: i64 = -26;
+/// Ошибка системного вызова: неблокирующее соединение начато и ещё идёт
+/// (фаза 65a): дождаться — [`SYS_POLL`] с [`POLL_OUT`].
+pub const ERR_IN_PROGRESS: i64 = -27;
 
 /// Ошибка системного вызова: аргумент указывает за пределы памяти программы.
 pub const ERR_BAD_ADDRESS: i64 = -3;
@@ -2331,6 +2428,7 @@ mod tests {
         assert_eq!(SYS_WINOWNER, 76);
         assert_eq!(WIN_OWNER_MODAL, 1);
         assert_eq!((SYS_WINPOPUP, SYS_WINPLACE), (77, 78));
+        assert_eq!((SYS_SOCKFD, SYS_SOCKCTL), (79, 80));
         assert_eq!((PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC), (0, 1, 2, 4));
         assert_eq!((MAP_HUGE, MAP_LAZY, MAP_JIT), (1, 2, 4));
         assert_eq!((FUTEX_CHANGED, FUTEX_TIMED_OUT), (1, 2));
@@ -2365,7 +2463,7 @@ mod tests {
             SYS_DEVICES, SYS_WINRESIZE, SYS_THREAD_CREATE, SYS_SET_TLS, SYS_THREAD_EXIT,
             SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_DEVICE_OPEN, SYS_DEVICE_MAP, SYS_DEVICE_WAIT,
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
-            SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE,
+            SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(
@@ -2505,6 +2603,7 @@ mod tests {
         assert_eq!(size_of::<NetInfo>(), 24);
         assert_eq!(size_of::<Peer>(), 8);
         assert_eq!(size_of::<StreamState>(), 4);
+        assert_eq!(size_of::<SockInfo>(), 20);
     }
 
     /// Коды ошибок и прочие числа, которые программа сравнивает с ответом.
@@ -2531,18 +2630,29 @@ mod tests {
         // 0x0001_000B — [`SYS_WINOWNER`]: владелец окна (фаза 62d).
         // 0x0001_000C — [`SYS_WINPOPUP`], [`SYS_WINPLACE`]: всплывающие окна
         // (фаза 62e).
-        assert_eq!(ABI_VERSION, 0x0001_000C);
+        // 0x0001_000D — сокеты-дескрипторы: [`SYS_SOCKFD`], [`SYS_SOCKCTL`],
+        // [`KIND_SOCKET`], три кода ошибок соединения; [`MAX_OPEN_FILES`] —
+        // тридцать два (фаза 65a).
+        assert_eq!(ABI_VERSION, 0x0001_000D);
 
         assert_eq!(FD_STDIN, 0);
         assert_eq!(FD_STDOUT, 1);
         assert_eq!(FD_STDERR, 2);
         assert_eq!(FD_FIRST, 3);
-        assert_eq!(MAX_OPEN_FILES, 8);
+        assert_eq!(MAX_OPEN_FILES, 32);
 
         assert_eq!(KIND_FILE, 1);
         assert_eq!(KIND_DIRECTORY, 2);
         assert_eq!(KIND_PIPE, 3);
         assert_eq!(KIND_TERMINAL, 4);
+        assert_eq!(KIND_SOCKET, 5);
+        assert_eq!((ERR_CONN_RESET, ERR_CONN_REFUSED, ERR_IN_PROGRESS), (-25, -26, -27));
+        assert_eq!(SOCK_NONBLOCK, 1);
+        assert_eq!(
+            (SOCKCTL_BIND, SOCKCTL_CONNECT, SOCKCTL_LISTEN, SOCKCTL_ACCEPT),
+            (1, 2, 3, 4)
+        );
+        assert_eq!((SOCKCTL_SHUTDOWN, SOCKCTL_NONBLOCK, SOCKCTL_INFO), (5, 6, 7));
 
         assert_eq!(WIN_KEY, 1);
         assert_eq!(WIN_POINTER, 2);
@@ -2577,7 +2687,7 @@ mod tests {
             ERR_TOO_MANY_FILES, ERR_IO, ERR_UNSUPPORTED, ERR_NO_FILESYSTEM, ERR_BAD_PATH,
             ERR_NO_PROGRAM, ERR_EXISTS, ERR_NOT_EMPTY, ERR_NO_SPACE, ERR_AGAIN, ERR_NO_TASK,
             ERR_TOO_MANY_TASKS, ERR_NO_NETWORK, ERR_BAD_SOCKET, ERR_BROKEN_PIPE,
-            ERR_UPDATE_REFUSED, ERR_LIMIT,
+            ERR_UPDATE_REFUSED, ERR_LIMIT, ERR_CONN_RESET, ERR_CONN_REFUSED, ERR_IN_PROGRESS,
         ] {
             assert!(code < 0, "код {code} обязан быть отрицательным");
         }

@@ -159,7 +159,7 @@ static void check_process(void) {
     struct rlimit stack;
     struct rlimit files;
     int limits = getrlimit(RLIMIT_STACK, &stack) == 0 && stack.rlim_cur >= 1024 * 1024 &&
-                 getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur == 11;
+                 getrlimit(RLIMIT_NOFILE, &files) == 0 && files.rlim_cur == 35; /* 3 + 32, фаза 65a */
     printf("cposix: stack limit %lu, open files %lu\n", (unsigned long)stack.rlim_cur,
            (unsigned long)files.rlim_cur);
     check(limits, "getrlimit tells the real stack and file limits");

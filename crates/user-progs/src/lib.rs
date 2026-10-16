@@ -1299,6 +1299,30 @@ pub fn stream() -> i64 {
     unsafe { syscall(SYS_SOCKET, SOCK_TCP, 0, 0) }
 }
 
+/// Открыть сокет-дескриптор (фаза 65a): `tcp` — поток, иначе датаграммы;
+/// `nonblock` — не ждать.
+pub fn sockfd(tcp: bool, nonblock: bool) -> i64 {
+    let kind = if tcp { SOCK_TCP } else { SOCK_UDP };
+    let flags = if nonblock { user_abi::SOCK_NONBLOCK } else { 0 };
+    // SAFETY: аргументы — числа.
+    unsafe { syscall(user_abi::SYS_SOCKFD, kind, flags, 0) }
+}
+
+/// Действие над сокетом-дескриптором (фаза 65a): `user_abi::SOCKCTL_*`.
+pub fn sockctl(fd: i64, op: usize, arg: usize) -> i64 {
+    if fd < 0 {
+        return fd;
+    }
+    // SAFETY: аргументы — числа; у `SOCKCTL_INFO` аргумент — адрес, его
+    // проверяет ядро, и его даёт [`sock_info`].
+    unsafe { syscall(user_abi::SYS_SOCKCTL, fd as usize, op, arg) }
+}
+
+/// Что известно о сокете-дескрипторе (фаза 65a).
+pub fn sock_info(fd: i64, out: &mut user_abi::SockInfo) -> i64 {
+    sockctl(fd, user_abi::SOCKCTL_INFO, out as *mut user_abi::SockInfo as usize)
+}
+
 /// Начать слушать входящие соединения.
 pub fn listen(socket: i64) -> i64 {
     if socket < 0 {

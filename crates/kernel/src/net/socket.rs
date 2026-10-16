@@ -177,6 +177,17 @@ impl Table {
     }
 
     /// Кому отправлять и с какого порта.
+    /// Что известно о сокете (фаза 65a): свой порт, получатель, отправитель
+    /// последней забранной датаграммы и есть ли в очереди ещё.
+    pub fn describe(
+        &self,
+        owner: TaskId,
+        index: usize,
+    ) -> Result<(u16, Option<(Ipv4, u16)>, Option<(Ipv4, u16)>, bool), SocketError> {
+        let socket = self.get(owner, index)?;
+        Ok((socket.local_port, socket.peer, socket.last_peer, !socket.queue.is_empty()))
+    }
+
     pub fn route(&self, owner: TaskId, index: usize) -> Result<(u16, Ipv4, u16), SocketError> {
         let socket = self.get(owner, index)?;
         if socket.local_port == 0 {

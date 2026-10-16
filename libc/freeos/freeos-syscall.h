@@ -111,7 +111,7 @@
 #define FREEOS_TTY_RAW 1
 
 /* Сколько файлов открыто у программы одновременно, самое большее. */
-#define FREEOS_MAX_OPEN_FILES 8
+#define FREEOS_MAX_OPEN_FILES 32
 
 /* Длина имени в записи каталога (`Dirent`), без завершающего нуля. */
 #define FREEOS_MAX_NAME 255

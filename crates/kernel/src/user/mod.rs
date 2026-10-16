@@ -68,6 +68,7 @@ pub mod elf;
 pub mod files;
 pub mod pipe;
 pub mod session;
+pub mod sock;
 pub mod space;
 pub mod syscall;
 

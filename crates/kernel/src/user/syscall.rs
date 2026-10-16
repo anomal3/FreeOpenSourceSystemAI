@@ -188,6 +188,9 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         // Фаза 62e: всплывающие окна — меню, списки и подсказки за краем формы.
         user_abi::SYS_WINPOPUP => winpopup(a0, a1 as i64, a2),
         user_abi::SYS_WINPLACE => winplace(a0 as i64, a1),
+        // Фаза 65a: сокет — дескриптор.
+        user_abi::SYS_SOCKFD => sockfd(a0, a1),
+        user_abi::SYS_SOCKCTL => sockctl(a0, a1, a2),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -231,6 +234,13 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
 
     if fd != FD_STDOUT && fd != FD_STDERR {
+        // Сокет ждёт места — вне замка программы (фаза 65a).
+        if let Some(Some(socket)) = super::with_current(|program| program.files.socket(fd)) {
+            return match socket.write(ptr, len) {
+                Ok(written) => written as i64,
+                Err(err) => err,
+            };
+        }
         // В файл уходят байты как есть: это данные, а не текст, и требовать от
         // них UTF-8 значило бы запретить программе сохранить что угодно, кроме
         // строки.
@@ -568,6 +578,14 @@ fn read(fd: usize, ptr: usize, len: usize) -> i64 {
         return read_input(buffer);
     }
 
+    // Сокет ждёт данных — вне замка программы (фаза 65a).
+    if let Some(Some(socket)) = super::with_current(|program| program.files.socket(fd)) {
+        return match socket.read(ptr, len) {
+            Ok(read) => read as i64,
+            Err(err) => err,
+        };
+    }
+
     match super::with_current(|program| program.files.read(fd, buffer)) {
         Some(Ok(read)) => read as i64,
         Some(Err(err)) => errno(err),
@@ -845,6 +863,86 @@ fn as_stream(index: usize) -> Option<usize> {
 }
 
 /// `socket(kind) -> номер сокета`.
+/// `sockfd(вид, флаги) -> дескриптор` (фаза 65a).
+fn sockfd(kind: usize, flags: usize) -> i64 {
+    // Право — то же, что у старого `socket`, и проверяется там же: у открытия.
+    if !super::allow(Rights::NET) {
+        return ERR_PERMISSION;
+    }
+    if flags & !user_abi::SOCK_NONBLOCK != 0 {
+        return ERR_UNSUPPORTED;
+    }
+    let tcp = match kind {
+        SOCK_UDP => false,
+        SOCK_TCP => true,
+        _ => return ERR_UNSUPPORTED,
+    };
+    let socket = match super::sock::Sock::open(tcp, flags & user_abi::SOCK_NONBLOCK != 0) {
+        Ok(socket) => socket,
+        Err(err) => return err,
+    };
+    // Места в таблице не нашлось — сокет закроется сам, уходя из области.
+    match super::with_current(|program| program.files.install_socket(socket)) {
+        Some(Ok(fd)) => fd as i64,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `sockctl(дескриптор, действие, аргумент) -> ответ` (фаза 65a).
+fn sockctl(fd: usize, op: usize, arg: usize) -> i64 {
+    let Some(Some(socket)) = super::with_current(|program| program.files.socket(fd)) else {
+        return ERR_BAD_FD;
+    };
+    let done = |result: Result<(), i64>| result.map_or_else(|err| err, |()| 0);
+    match op {
+        user_abi::SOCKCTL_BIND => {
+            let Ok(port) = u16::try_from(arg) else {
+                return ERR_BAD_ADDRESS;
+            };
+            socket.bind(port).map_or_else(|err| err, i64::from)
+        }
+        user_abi::SOCKCTL_CONNECT => {
+            let address = (arg >> 16) as u32;
+            let port = (arg & 0xffff) as u16;
+            done(socket.connect(address, port))
+        }
+        user_abi::SOCKCTL_LISTEN => done(socket.listen()),
+        user_abi::SOCKCTL_ACCEPT => {
+            let accepted = match socket.accept() {
+                Ok(accepted) => accepted,
+                Err(err) => return err,
+            };
+            match super::with_current(|program| program.files.install_socket(accepted)) {
+                Some(Ok(fd)) => fd as i64,
+                Some(Err(err)) => errno(err),
+                None => ERR_NO_PROGRAM,
+            }
+        }
+        user_abi::SOCKCTL_SHUTDOWN => done(socket.shutdown()),
+        user_abi::SOCKCTL_NONBLOCK => {
+            socket.set_nonblock(arg != 0);
+            0
+        }
+        user_abi::SOCKCTL_INFO => {
+            if arg % align_of::<user_abi::SockInfo>() != 0
+                || !space::user_can(arg, size_of::<user_abi::SockInfo>(), PageFlags::WRITE)
+            {
+                return ERR_BAD_ADDRESS;
+            }
+            match socket.info() {
+                Ok(info) => {
+                    // SAFETY: адрес проверен на выравнивание и на запись.
+                    unsafe { core::ptr::write(arg as *mut user_abi::SockInfo, info) };
+                    0
+                }
+                Err(err) => err,
+            }
+        }
+        _ => ERR_UNSUPPORTED,
+    }
+}
+
 fn socket(kind: usize) -> i64 {
     // Сеть — первое право, которое проверяется по-настоящему (манифест пакета,
     // `permissions=net`). Проверка стоит у открытия, а не у отправки: сокет,
@@ -1152,7 +1250,7 @@ fn random(ptr: usize, len: usize) -> i64 {
     len as i64
 }
 
-fn net_errno(err: NetError) -> i64 {
+pub(super) fn net_errno(err: NetError) -> i64 {
     match err {
         NetError::NoDevice | NetError::NoAddress | NetError::NoRoute => ERR_NO_NETWORK,
         // «Адрес получателя ещё выясняется» и «в очереди пусто» для программы —
@@ -1328,6 +1426,7 @@ fn fstat(fd: usize, out: usize) -> i64 {
             files::FdKind::File => KIND_FILE,
             files::FdKind::Directory => KIND_DIRECTORY,
             files::FdKind::Pipe => KIND_PIPE,
+            files::FdKind::Socket => user_abi::KIND_SOCKET,
         },
     };
     // SAFETY: адрес проверен на выравнивание и на то, что структура целиком
@@ -2113,6 +2212,9 @@ fn poll(ptr: usize, count: usize, timeout_ms: i64) -> i64 {
     };
 
     loop {
+        // Поколение событий — до просмотра (фаза 65a): событие, пришедшее
+        // между просмотром и сном, не даст уснуть.
+        let seen = crate::io_events::generation();
         let mut ready = 0;
         for index in 0..count {
             let at = ptr + index * size_of::<PollFd>();
@@ -2146,8 +2248,14 @@ fn poll(ptr: usize, count: usize, timeout_ms: i64) -> i64 {
             return 0;
         }
 
-        let slice = crate::time::uptime_ms() + 100;
-        sched::block_on_input(slice, || false);
+        // Сокеты и каналы будят сменой поколения сразу (фаза 65a); терминал
+        // своих событий в поколение не кладёт — его ловит срез в 100 мс, как
+        // было до фазы 65a.
+        let mut until = crate::time::uptime_ms() + 100;
+        if let Some(deadline) = deadline {
+            until = until.min(deadline);
+        }
+        crate::io_events::wait(seen, Some(until));
     }
 }
 

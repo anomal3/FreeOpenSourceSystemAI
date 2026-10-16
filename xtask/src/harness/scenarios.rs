@@ -1586,7 +1586,8 @@ pub const ALL: &[Scenario] = &[
             // едет, только если собрана по `ports/mono/configure.sh`, иначе 46.
             // Сорок восемь — `cjit` (фаза 59). Сорок девять — `cdraw` (фаза 61a),
             // едет, только если собрана cairo (`cargo xtask thirdparty`).
-            Step::Expect("/bin holds 49 programs"),
+            // Пятьдесят — `sockfd` (фаза 65a).
+            Step::Expect("/bin holds 50 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -8175,6 +8176,51 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "sockfd",
+        about: "Сокеты-дескрипторы (фаза 65a): сеть через read, write, poll и close — клиент к эхо-серверу хоста и сервер в системе.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 2000,
+        host_echo: true,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
+            Step::Wait(2_000),
+            // Клиент: блокирующее соединение, запись, `poll`, чтение, конец
+            // потока после `shutdown`, вид в `fstat`, неблокирующее соединение.
+            Step::Line("run /bin/sockfd 10.0.2.2 {echo}"),
+            Step::Await("sockfd: connected as descriptor", 30_000),
+            Step::Await("sockfd: echoed 'descriptor-hello' through read and write", 30_000),
+            Step::Await("sockfd: end of stream reads as zero", 30_000),
+            Step::Await("sockfd: fstat says socket", 15_000),
+            Step::Await("sockfd: nonblocking connect finished", 30_000),
+            Step::Await("sockfd: client done", 15_000),
+            // Сервер: блокирующий `accept`, эхо до конца потока клиента.
+            Step::Line("run -b /bin/sockfd serve 2000"),
+            Step::AwaitAny("sockfd: listening on port 2000", 30_000),
+            Step::TcpEcho("hello to a descriptor", 20_000),
+            Step::AwaitAny("sockfd: accepted descriptor", 15_000),
+            Step::AwaitAny("sockfd: served 21 bytes, client closed", 30_000),
+            Step::Absent("sockfd: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "tcp",
         about: "Эхо-сервер в системе: чужой клиент с хоста шлёт байты и получает их обратно.",
         target: Target::Live,
@@ -9391,7 +9437,8 @@ pub const ALL: &[Scenario] = &[
             // (фаза 62c).
             // 65547 — `0x0001_000B`: `SYS_WINOWNER` (фаза 62d).
             // 65548 — `0x0001_000C`: `SYS_WINPOPUP`, `SYS_WINPLACE` (фаза 62e).
-            Step::Await("posix: abi version 65548", 60_000),
+            // 65549 — `0x0001_000D`: сокеты-дескрипторы (фаза 65a).
+            Step::Await("posix: abi version 65549", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».

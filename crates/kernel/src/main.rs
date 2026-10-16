@@ -53,6 +53,7 @@ mod display;
 mod fs;
 mod guard;
 mod input;
+mod io_events;
 mod irq;
 mod crashlog;
 mod klog;

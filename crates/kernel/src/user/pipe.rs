@@ -143,6 +143,8 @@ impl Reader {
                     drop(inner);
                     // Разбудить писателя: в канале освободилось место.
                     sched::wake_lock(channel(&self.pipe));
+                    // И тем, кто ждёт `poll` (фаза 65a).
+                    crate::io_events::notify();
                     return Ok(read);
                 }
                 if inner.writers == 0 {
@@ -196,6 +198,8 @@ impl Drop for Reader {
         // Писатель, ждущий места, обязан узнать, что ждать больше некого:
         // иначе он спит до конца работы системы.
         sched::wake_lock(channel(&self.pipe));
+        // И тем, кто ждёт `poll` (фаза 65a).
+        crate::io_events::notify();
     }
 }
 
@@ -223,6 +227,8 @@ impl Writer {
                     let written = inner.push(data);
                     drop(inner);
                     sched::wake_lock(channel(&self.pipe));
+                    // И тем, кто ждёт `poll` (фаза 65a).
+                    crate::io_events::notify();
                     return Ok(written);
                 }
             }
@@ -274,5 +280,7 @@ impl Drop for Writer {
         // пробуждения программа, читающая пустой канал последнего писателя,
         // спит вечно, а выглядит это как зависшая команда.
         sched::wake_lock(channel(&self.pipe));
+        // И тем, кто ждёт `poll` (фаза 65a).
+        crate::io_events::notify();
     }
 }
