@@ -317,3 +317,52 @@ fn everything_reachable_from_the_root_stays_reachable() {
     );
     let _ = ROOT_INODE;
 }
+
+/// Пакетная запись файла (фаза 65f): биты карты одной записью на вызов,
+/// указатели в кэше таблицы, целые блоки подряд — одной записью на носитель.
+///
+/// Куски нарочно разного размера и не по границе блока: целые прогоны,
+/// частичные блоки в начале и в конце вызова, дозапись в начатый блок, — а
+/// файл уходит в двойную косвенность и пересекает границу группы. Проверяются
+/// три вещи: содержимое байт в байт чужим читателем; том чистый по своей
+/// проверке — ни одного блока, занятого файлом и свободного по карте, ни
+/// одного ничьего; и то же после перезаписи середины уже выделенного файла.
+#[test]
+fn a_file_written_in_batches_is_whole_and_the_volume_is_clean() {
+    for block_size in [BlockSize::B1024, BlockSize::B4096] {
+        let (mut dev, mut editor) = formatted(64 * 1024 * 1024 / 512, block_size);
+        let file = editor
+            .create(&mut dev, ROOT_INODE, "image.bin", 0o644, 0, 0)
+            .expect("файл");
+
+        // 12 МиБ: при блоке в килобайт это двойная косвенность и полторы
+        // группы по 8 МиБ, при 4 КиБ — одинарная и начало двойной.
+        let total = 12 * 1024 * 1024usize;
+        let content: Vec<u8> = (0..total).map(|at| (at * 7 + at / 4093) as u8).collect();
+        let sizes = [65_536usize, 1_460, 4_096, 65_536 + 333, 100, 8_192, 131_072];
+        let mut at = 0usize;
+        let mut turn = 0usize;
+        while at < total {
+            let take = sizes[turn % sizes.len()].min(total - at);
+            editor
+                .write_at(&mut dev, file, at as u64, &content[at..at + take])
+                .expect("запись");
+            at += take;
+            turn += 1;
+        }
+        // Перезапись середины: блоки уже выделены, пакет только пишет данные.
+        let patch = vec![0xA5u8; 200_000];
+        editor.write_at(&mut dev, file, 3_000_001, &patch).expect("правка");
+        editor.flush_everywhere(&mut dev).expect("сброс");
+        editor.mark_clean(&mut dev).expect("закрытие");
+
+        let mut expected = content.clone();
+        expected[3_000_001..3_000_001 + patch.len()].copy_from_slice(&patch);
+        let data = foreign(&dev).read("/image.bin").expect("файл читается");
+        assert_eq!(data.len(), total, "{block_size:?}");
+        assert!(data == expected, "содержимое разошлось, {block_size:?}");
+
+        let report = check(&mut dev, 0, Fix::Nothing).expect("проверка");
+        assert!(report.is_clean(), "{block_size:?}: {:?}", report.problems);
+    }
+}

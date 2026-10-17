@@ -11,6 +11,13 @@
 //! тем, что занято на самом деле, — а это единственное, что защищает уже
 //! записанные файлы от потери питания.
 //!
+//! Одно уточнение с фазы 65f: запись файла ([`Editor::write_at`]) взводит биты
+//! своих блоков одной записью карты на вызов, а не на блок. Обещание при этом
+//! то же по сути: бит на диске взведён раньше, чем на диске появится указатель
+//! на блок, — так что занятый файлом блок никогда не значится свободным.
+//! Пропажа питания посреди вызова оставляет самое большее занятые, но ничьи
+//! блоки — то, что `e2fsck` и так чинит.
+//!
 //! В памяти остаются только **счётчики**: сколько свободных блоков и inode в
 //! каждой группе. Они дублируют то, что можно пересчитать по картам, и живут в
 //! суперблоке с дескрипторами групп; [`Editor::flush`] сбрасывает их туда. Если
@@ -63,6 +70,30 @@ pub struct Editor {
     /// Измерено: запись полумегабайтного файла из сети шла 73 КиБ/с при
     /// 412 КиБ/с «в никуда».
     bitmap_cache: Option<(u32, Vec<u8>)>,
+    /// Пакетная запись внутри одного [`Editor::write_at`] (фаза 65f).
+    ///
+    /// Пока она идёт, биты карты взводятся только в [`Editor::bitmap_cache`]
+    /// (`bitmap_dirty`), указатели — только в [`Editor::table_cache`], а
+    /// подряд идущие целые блоки данных копятся в `run`. На диск всё уходит в
+    /// порядке, на котором держится обещание из заголовка модуля: **данные →
+    /// карта → таблица → inode**. Бит на диске взведён раньше, чем где-нибудь
+    /// на диске появится указатель на его блок, — то есть ни один блок не
+    /// окажется у файла, оставаясь свободным по карте. Пропажа питания
+    /// посреди пакета оставляет самое большее занятые, но ничьи блоки, —
+    /// «free blocks count wrong» у `e2fsck`, как и раньше.
+    ///
+    /// Измерено до правки: полмегабайта в файл — 1137 мс при 80 мс «в
+    /// никуда»; на каждый блок данных — ещё запись карты, чтение и запись
+    /// таблицы.
+    batching: bool,
+    bitmap_dirty: bool,
+    /// Таблица косвенности, которую правит пакет: номер блока, содержимое,
+    /// изменена ли.
+    table_cache: Option<(u32, Vec<u8>, bool)>,
+    /// Накопленные целые блоки данных: первый блок тома, смещение в данных
+    /// вызова и число блоков. Блоки подряд и данные подряд — значит, одна
+    /// запись на носитель.
+    run: Option<(u32, usize, usize)>,
     /// Штамп времени для создаваемых inode.
     time: u32,
     /// Что о состоянии тома сейчас написано **на диске**: `true` — «закрыт
@@ -89,6 +120,10 @@ impl Editor {
             block_hint: geometry.first_data_block,
             inode_hint: FIRST_INODE,
             bitmap_cache: None,
+            batching: false,
+            bitmap_dirty: false,
+            table_cache: None,
+            run: None,
             time,
             clean_on_disk: fs.was_clean(),
         };
@@ -123,6 +158,10 @@ impl Editor {
             block_hint: geometry.first_data_block,
             inode_hint: FIRST_INODE,
             bitmap_cache: None,
+            batching: false,
+            bitmap_dirty: false,
+            table_cache: None,
+            run: None,
             time,
             // Разметка только что записала суперблок с признаком «чистый»;
             // первая же правка через [`Editor::mark_dirty`] его снимет.
@@ -452,6 +491,33 @@ impl Editor {
             return Err(Error::NotADirectory);
         }
 
+        self.batching = true;
+        let written = self.write_blocks(dev, &mut inode, offset, data);
+        // Пакет закрывается и при ошибке: что успело выделиться, уходит на диск
+        // в том же порядке, а указатели на блоки, которых нет на карте, не
+        // появятся.
+        let closed = self.end_batch(dev, data);
+        self.batching = false;
+        let done = written?;
+        closed?;
+
+        let end = offset + data.len() as u64;
+        if end > inode.size {
+            inode.size = end;
+        }
+        inode.time = self.time;
+        self.write_inode(dev, number, &inode)?;
+        Ok(done)
+    }
+
+    /// Блоки одного [`Editor::write_at`]: внутри пакета, см. [`Editor::batching`].
+    fn write_blocks(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        inode: &mut InodeData,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize> {
         let block_bytes = self.geometry.block_size.bytes() as usize;
         let mut done = 0usize;
         while done < data.len() {
@@ -465,27 +531,97 @@ impl Editor {
             // одной лишней записи блока на каждый выделенный, то есть удваивает
             // цену последовательной записи файла, — и ничего не даёт.
             let whole = take == block_bytes;
-            let block = self.block_for_write(dev, &mut inode, index, !whole)?;
+            let block = self.block_for_write(dev, inode, index, !whole)?;
             if whole {
-                self.write_block(dev, block, &data[done..done + take])?;
+                self.queue_block(dev, block, done, data)?;
             } else {
                 // Частичный блок читается перед записью: остальное в нём —
                 // либо уже записанные данные файла, либо нули свежего блока, и
                 // затирать их куском буфера нельзя.
+                self.flush_run(dev, data)?;
                 let mut buf = self.read_block(dev, block)?;
                 buf[within..within + take].copy_from_slice(&data[done..done + take]);
                 self.write_block(dev, block, &buf)?;
             }
             done += take;
         }
-
-        let end = offset + data.len() as u64;
-        if end > inode.size {
-            inode.size = end;
-        }
-        inode.time = self.time;
-        self.write_inode(dev, number, &inode)?;
         Ok(done)
+    }
+
+    /// Поставить целый блок данных в очередь: к прогону, если он продолжает
+    /// его и на томе, и в данных, иначе — новым прогоном.
+    fn queue_block(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        block: u32,
+        at: usize,
+        data: &[u8],
+    ) -> Result<()> {
+        let block_bytes = self.geometry.block_size.bytes() as usize;
+        // Не больше 64 КиБ за запись: столько драйвер всё равно отдаёт
+        // устройству одним запросом.
+        let limit = (64 * 1024 / block_bytes).max(1);
+        if let Some((first, start, count)) = self.run {
+            if block == first + count as u32 && at == start + count * block_bytes && count < limit {
+                self.run = Some((first, start, count + 1));
+                return Ok(());
+            }
+            self.flush_run(dev, data)?;
+        }
+        self.run = Some((block, at, 1));
+        Ok(())
+    }
+
+    /// Записать накопленный прогон одной записью.
+    fn flush_run(&mut self, dev: &mut dyn BlockDevice, data: &[u8]) -> Result<()> {
+        let Some((first, start, count)) = self.run.take() else {
+            return Ok(());
+        };
+        let block_bytes = self.geometry.block_size.bytes() as usize;
+        if first + count as u32 > self.geometry.blocks {
+            return Err(Error::Corrupt);
+        }
+        dev.write(self.geometry.block_lba(first), &data[start..start + count * block_bytes])?;
+        Ok(())
+    }
+
+    /// Взведённые биты карты — на диск. Зовётся перед каждой записью, несущей
+    /// указатель (таблица, inode), — см. [`Editor::batching`].
+    fn commit_bitmap(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if !self.bitmap_dirty {
+            return Ok(());
+        }
+        if let Some((bitmap, buf)) = &self.bitmap_cache {
+            self.write_block(dev, *bitmap, buf)?;
+        }
+        self.bitmap_dirty = false;
+        Ok(())
+    }
+
+    /// Изменённую таблицу косвенности — на диск, после карты.
+    fn flush_table(&mut self, dev: &mut dyn BlockDevice) -> Result<()> {
+        if !matches!(self.table_cache, Some((_, _, true))) {
+            return Ok(());
+        }
+        self.commit_bitmap(dev)?;
+        if let Some((table, buf, _)) = self.table_cache.take() {
+            let written = self.write_block(dev, table, &buf);
+            // Не записалась — остаётся изменённой: следующая попытка повторит.
+            self.table_cache = Some((table, buf, written.is_err()));
+            written?;
+        }
+        Ok(())
+    }
+
+    /// Закрыть пакет: данные, карта, таблица — в этом порядке.
+    fn end_batch(&mut self, dev: &mut dyn BlockDevice, data: &[u8]) -> Result<()> {
+        let run = self.flush_run(dev, data);
+        let bitmap = self.commit_bitmap(dev);
+        let table = self.flush_table(dev);
+        // Кэш таблицы живёт только внутри пакета: вне его таблицы правят
+        // другие пути, и устаревшая копия здесь была бы вторым мнением.
+        self.table_cache = None;
+        run.and(bitmap).and(table)
     }
 
     /// Усечь или продлить файл.
@@ -731,8 +867,9 @@ impl Editor {
 
     /// Занять свободный блок.
     ///
-    /// Битовая карта читается и пишется на каждом выделении — см. заголовок
-    /// модуля о том, почему это не оптимизируется.
+    /// Битовая карта пишется на каждом выделении, кроме пакета записи файла
+    /// ([`Editor::batching`]): там взведённые биты уходят одной записью, но
+    /// раньше любого указателя на эти блоки — см. заголовок модуля.
     fn alloc_block(&mut self, dev: &mut dyn BlockDevice, zero: bool) -> Result<u32> {
         let geometry = self.geometry;
         // Два прохода: от подсказки до конца тома и от начала до подсказки.
@@ -811,6 +948,11 @@ impl Editor {
 
     /// Занять бит. `false` — он уже был занят.
     fn take_bit(&mut self, dev: &mut dyn BlockDevice, bitmap: u32, index: u32) -> Result<bool> {
+        // Другая карта — значит, взведённое в этой уходит на диск сейчас: кэш
+        // один, и держать в нём можно только одну.
+        if self.bitmap_dirty && !matches!(self.bitmap_cache, Some((cached, _)) if cached == bitmap) {
+            self.commit_bitmap(dev)?;
+        }
         let mut buf = self.read_bitmap(dev, bitmap)?;
         let at = (index / 8) as usize;
         let mask = 1u8 << (index % 8);
@@ -819,7 +961,11 @@ impl Editor {
             return Ok(false);
         }
         buf[at] |= mask;
-        self.write_block(dev, bitmap, &buf)?;
+        if self.batching {
+            self.bitmap_dirty = true;
+        } else {
+            self.write_block(dev, bitmap, &buf)?;
+        }
         self.bitmap_cache = Some((bitmap, buf));
         Ok(true)
     }
@@ -836,6 +982,7 @@ impl Editor {
 
     /// Освободить бит. `false` — он уже был свободен, и счётчик трогать нельзя.
     fn clear_bit(&mut self, dev: &mut dyn BlockDevice, bitmap: u32, index: u32) -> Result<bool> {
+        self.commit_bitmap(dev)?;
         let mut buf = self.read_bitmap(dev, bitmap)?;
         let at = (index / 8) as usize;
         let mask = 1u8 << (index % 8);
@@ -934,6 +1081,8 @@ impl Editor {
         }
         let leaf = self.alloc_data_block(dev, inode, true)?;
         put_u32(&mut buf, slot * 4, leaf);
+        // Указатель на лист — после его бита на карте.
+        self.commit_bitmap(dev)?;
         self.write_block(dev, table, &buf)?;
         Ok(leaf)
     }
@@ -947,6 +1096,9 @@ impl Editor {
         slot: usize,
         zero: bool,
     ) -> Result<u32> {
+        if self.batching {
+            return self.ensure_pointer_cached(dev, inode, table, slot, zero);
+        }
         let mut buf = self.read_block(dev, table)?;
         let existing = u32_at(&buf, slot * 4);
         if existing != 0 {
@@ -955,6 +1107,36 @@ impl Editor {
         let block = self.alloc_data_block(dev, inode, zero)?;
         put_u32(&mut buf, slot * 4, block);
         self.write_block(dev, table, &buf)?;
+        Ok(block)
+    }
+
+    /// То же внутри пакета: таблица читается один раз и пишется в конце
+    /// пакета или когда пакет переходит к другой таблице.
+    fn ensure_pointer_cached(
+        &mut self,
+        dev: &mut dyn BlockDevice,
+        inode: &mut InodeData,
+        table: u32,
+        slot: usize,
+        zero: bool,
+    ) -> Result<u32> {
+        if !matches!(self.table_cache, Some((cached, _, _)) if cached == table) {
+            self.flush_table(dev)?;
+            let buf = self.read_block(dev, table)?;
+            self.table_cache = Some((table, buf, false));
+        }
+        let existing = match &self.table_cache {
+            Some((_, buf, _)) => u32_at(buf, slot * 4),
+            None => 0,
+        };
+        if existing != 0 {
+            return Ok(existing);
+        }
+        let block = self.alloc_data_block(dev, inode, zero)?;
+        if let Some((_, buf, changed)) = &mut self.table_cache {
+            put_u32(buf, slot * 4, block);
+            *changed = true;
+        }
         Ok(block)
     }
 

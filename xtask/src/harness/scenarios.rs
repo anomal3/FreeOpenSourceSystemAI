@@ -7410,6 +7410,11 @@ pub const ALL: &[Scenario] = &[
             Step::Await("fetch: 524288 bytes in", 300_000),
             Step::Line("run /bin/fetch https://10.0.2.2:{tls}/blob -"),
             Step::Await("fetch: 524288 bytes in", 300_000),
+            // И та же половина мегабайта **в файл** на разделе состояния: так
+            // качает `sysupdate`, и с фазы 65e узкое место — здесь, а не в
+            // сети (фаза 65f). Третья строка пары выше — цена записи в ext2.
+            Step::Line("run /bin/fetch http://10.0.2.2:{repo}/blob /home/roman/blob"),
+            Step::Await("fetch: 524288 bytes in", 300_000),
             Step::Line("cat /os-release"),
             Step::Await("version=", 15_000),
             Step::Shot("update-tls"),

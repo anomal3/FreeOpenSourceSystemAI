@@ -32,8 +32,8 @@
 #![no_main]
 
 use user_progs::{
-    Args, Line, close, config_path, exit, http, open, print, println, read, time_now, uptime_ms,
-    write,
+    Args, FileWriter, Line, close, config_path, exit, http, open, print, println, read, time_now,
+    uptime_ms,
 };
 
 /// Имя файла с доверенными корнями. Тот же, что читает `sysupdate`.
@@ -44,6 +44,10 @@ static mut BODY: [u8; 8 * 1024] = [0; 8 * 1024];
 
 /// Буфер под байты с провода.
 static mut WIRE: [u8; 4 * 1024] = [0; 4 * 1024];
+
+/// Буфер записи в файл (фаза 65f): на диск — кусками по 64 КиБ, целыми
+/// блоками ext2, а не по сегменту сети.
+static mut OUTPUT: [u8; 64 * 1024] = [0; 64 * 1024];
 
 /// Буферы соединения TLS.
 static mut TLS_IO: tls::Buffers = tls::Buffers::new();
@@ -110,19 +114,16 @@ fn fetch(url: &str, target: Option<&str>) -> i64 {
     // SAFETY: то же самое.
     let body = unsafe { &mut *core::ptr::addr_of_mut!(BODY) };
     let mut io = http::Buffers { wire, body };
+    // SAFETY: то же самое.
+    let mut output = fd.map(|fd| FileWriter::new(fd, unsafe { &mut *core::ptr::addr_of_mut!(OUTPUT) }));
 
-    let result = http::get(url, trust.as_mut(), &mut io, &mut |chunk: &[u8]| {
+    let mut result = http::get(url, trust.as_mut(), &mut io, &mut |chunk: &[u8]| {
         total += chunk.len() as u64;
-        match fd {
-            Some(fd) => {
-                let mut done = 0usize;
-                while done < chunk.len() {
-                    let wrote = write(fd, &chunk[done..]);
-                    if wrote <= 0 {
-                        failed = true;
-                        return false;
-                    }
-                    done += wrote as usize;
+        match output.as_mut() {
+            Some(output) => {
+                if !output.push(chunk) {
+                    failed = true;
+                    return false;
                 }
             }
             // На экран отдаётся как есть: `fetch` без второго аргумента — это
@@ -139,6 +140,14 @@ fn fetch(url: &str, target: Option<&str>) -> i64 {
         true
     });
 
+    // Хвост из буфера — до закрытия и до отчёта о скорости: запись на диск —
+    // часть загрузки в файл.
+    if let Some(output) = output.as_mut() {
+        if result.is_ok() && !output.flush() {
+            failed = true;
+            result = Err(http::Error::SinkFailed);
+        }
+    }
     if let Some(fd) = fd {
         close(fd);
     }

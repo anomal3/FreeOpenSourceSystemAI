@@ -779,6 +779,53 @@ pub fn write(fd: i64, data: &[u8]) -> i64 {
     unsafe { syscall(SYS_WRITE, fd as usize, data.as_ptr() as usize, data.len()) }
 }
 
+/// Запись файла крупными кусками (фаза 65f).
+///
+/// Сеть отдаёт тело кусками по сегменту — полтора килобайта, меньше блока
+/// ext2, — и каждый такой `write` стоил ядру частичного блока: прочитать блок,
+/// записать его, переписать inode и сбросить счётчики тома. Здесь куски копятся
+/// в буфере вызывающего (своей кучи у программ нет) и уходят целым буфером: при
+/// буфере, кратном блоку, ядро пишет одни целые блоки.
+pub struct FileWriter<'a> {
+    fd: i64,
+    buffer: &'a mut [u8],
+    filled: usize,
+}
+
+impl<'a> FileWriter<'a> {
+    pub fn new(fd: i64, buffer: &'a mut [u8]) -> Self {
+        Self { fd, buffer, filled: 0 }
+    }
+
+    /// Принять кусок. `false` — запись не удалась (место кончилось).
+    pub fn push(&mut self, mut data: &[u8]) -> bool {
+        while !data.is_empty() {
+            let take = (self.buffer.len() - self.filled).min(data.len());
+            self.buffer[self.filled..self.filled + take].copy_from_slice(&data[..take]);
+            self.filled += take;
+            data = &data[take..];
+            if self.filled == self.buffer.len() && !self.flush() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Отдать накопленное. Зовётся в конце — иначе хвост останется в буфере.
+    pub fn flush(&mut self) -> bool {
+        let mut done = 0usize;
+        while done < self.filled {
+            let wrote = write(self.fd, &self.buffer[done..self.filled]);
+            if wrote <= 0 {
+                return false;
+            }
+            done += wrote as usize;
+        }
+        self.filled = 0;
+        true
+    }
+}
+
 /// Создать каталог.
 pub fn mkdir(path: &str, mode: u32) -> i64 {
     // SAFETY: срез живёт в памяти программы, длина — его собственная.

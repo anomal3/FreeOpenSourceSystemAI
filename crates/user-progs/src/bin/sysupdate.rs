@@ -72,8 +72,8 @@ use osupdate::drivers::{self, Catalogue};
 use osupdate::index::{self, Index};
 use osupdate::keys::{self, Trusted};
 use user_progs::{
-    Args, ERR_UPDATE_REFUSED, Line, SLOT_B, apply_update, close, config_path, error, exit, http,
-    open, println, read, time_now, uid, write,
+    Args, ERR_UPDATE_REFUSED, FileWriter, Line, SLOT_B, apply_update, close, config_path, error,
+    exit, http, open, println, read, time_now, uid,
 };
 
 /// Имя файла настроек.
@@ -132,6 +132,10 @@ static mut SCRATCH: [u8; 8 * 1024] = [0; 8 * 1024];
 /// лежит зашифрованное, только что прочитанное из сокета, в том —
 /// расшифрованное. При обычном HTTP он не используется вовсе.
 static mut WIRE: [u8; 4 * 1024] = [0; 4 * 1024];
+
+/// Буфер записи скачиваемого файла (фаза 65f): на диск уходят куски по
+/// 64 КиБ — шестнадцать целых блоков ext2, — а не по сегменту сети.
+static mut OUTPUT: [u8; 64 * 1024] = [0; 64 * 1024];
 
 /// Буфер под индекс и его подпись.
 static mut TEXT: [u8; index::LIMIT] = [0; index::LIMIT];
@@ -840,21 +844,19 @@ fn download(
     // программа неотличима от повисшей, а мерить надо тем, что видно снаружи:
     // строкой в журнале.
     let mut reported = 0u64;
-    let result = with_buffers(|io| {
+    // SAFETY: статик принадлежит этой задаче: программа однопоточная, и буфер
+    // нужен только на время этой загрузки.
+    let mut output = FileWriter::new(fd, unsafe { &mut *core::ptr::addr_of_mut!(OUTPUT) });
+    let mut result = with_buffers(|io| {
         http::get(url.as_str(), trust.as_mut(), io, &mut |chunk: &[u8]| {
             // Хеш считается **по дороге**, а не по записанному файлу: второй
             // проход означал бы прочитать двадцать пять мегабайт ещё раз — и
             // проверить не то, что приехало, а то, что прочиталось со своего же
             // диска.
             hasher.update(chunk);
-            let mut done = 0usize;
-            while done < chunk.len() {
-                let wrote = write(fd, &chunk[done..]);
-                if wrote <= 0 {
-                    failed = true;
-                    return false;
-                }
-                done += wrote as usize;
+            if !output.push(chunk) {
+                failed = true;
+                return false;
             }
             written += chunk.len() as u64;
             if written - reported >= 4 * 1024 * 1024 {
@@ -870,6 +872,12 @@ fn download(
             true
         })
     });
+    // Хвост из буфера — до закрытия: недописанный, он выглядел бы как
+    // обрыв загрузки, а размер сошёлся бы.
+    if result.is_ok() && !output.flush() {
+        failed = true;
+        result = Err(http::Error::SinkFailed);
+    }
     close(fd);
 
     if let Err(err) = result {
