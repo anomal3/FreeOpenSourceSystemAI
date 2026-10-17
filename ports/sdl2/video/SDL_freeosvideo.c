@@ -19,6 +19,7 @@
 #include <freeos/window.h>
 
 #include "SDL_video.h"
+#include "SDL_hints.h"
 #include "SDL_mouse.h"
 #include "../SDL_sysvideo.h"
 #include "../SDL_pixels_c.h"
@@ -54,6 +55,12 @@ static int FREEOS_VideoInit(_THIS)
     }
     /* RGB — красный в младшем байте: 0xXXBBGGRR. BGR — 0xXXRRGGBB. */
     window_format = pixel == FREEOS_PIXEL_RGB ? SDL_PIXELFORMAT_XBGR8888 : SDL_PIXELFORMAT_XRGB8888;
+
+    /* Рисовальщик один — программный. Программа, которая просит ускоренный
+     * (`SDL_RENDERER_ACCELERATED`, так делает doomgeneric), без подсказки
+     * получила бы отказ; по имени SDL выбирает, не глядя на флаги (фаза 68d).
+     * Переменная окружения `SDL_RENDER_DRIVER` по-прежнему сильнее. */
+    SDL_SetHintWithPriority(SDL_HINT_RENDER_DRIVER, "software", SDL_HINT_DEFAULT);
 
     SDL_zero(mode);
     mode.format = window_format;

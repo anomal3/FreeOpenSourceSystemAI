@@ -33,6 +33,7 @@
 //! слота, раздел состояния и ESP, и все три нужны системе одновременно.
 
 pub mod ahci;
+pub mod cache;
 pub mod nvme;
 
 use alloc::boxed::Box;

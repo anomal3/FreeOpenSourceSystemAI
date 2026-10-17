@@ -151,8 +151,13 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
         // Образцовые пакеты — в `/media`, туда же, куда их кладёт установщик.
         // Живая система обязана уметь ставить пакеты так же, как установленная:
         // иначе проверить `pkg` было бы можно только после установки.
+        // Кроме игр (фаза 68d): пакет Doom весит 30 МБ, и RAM-диску живой
+        // системы он не по карману — он едет только на установочный носитель.
         if !programs.is_empty() {
             for package in crate::package::build_samples(opts.arch, opts.release)? {
+                if crate::package::GAMES.contains(&package.file_name.as_str()) {
+                    continue;
+                }
                 extra.push((format!("media/{}", package.file_name), package.path));
             }
         }

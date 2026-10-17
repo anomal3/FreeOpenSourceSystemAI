@@ -169,6 +169,10 @@ pub enum Step {
     Absent(&'static str),
     /// Нажать клавишу на **настоящей** клавиатуре (имя в терминах QEMU).
     Key(&'static str),
+    /// Нажать клавишу и держать столько миллисекунд (фаза 68d): `sendkey
+    /// <клавиша> <мс>` монитора. Игра опрашивает клавиши раз в кадр, и
+    /// короткое нажатие с отпусканием попадают в один кадр — выстрела нет.
+    Hold(&'static str, u32),
     /// Нажать клавишу несколько раз.
     Repeat(&'static str, u32),
     /// Набрать текст на клавиатуре.
@@ -2006,6 +2010,69 @@ pub const ALL: &[Scenario] = &[
             Step::Await("/bin/csdl: exited with code 0", 30_000),
             Step::Tone(440),
             Step::Absent("csdl: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "doom",
+        about: "Первая игра на SDL2 (фаза 68d): пакет freedoom с носителя, doomgeneric с данными Freedoom — заставка, меню, новая игра, выстрел, крестик.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Line("run /bin/pkg install /media/freedoom-0.13.fpk"),
+            Step::Await("pkg: installed freedoom 0.13, 3 file(s)", 300_000),
+            Step::Line("run /opt/freedoom/bin/doom -iwad /opt/freedoom/freedoom1.wad"),
+            Step::Await(" adding /opt/freedoom/freedoom1.wad", 60_000),
+            // `R_Init` печатает строку без перевода, пока грузит текстуры, —
+            // ждать её нельзя; `ST_Init` — последняя строка запуска.
+            Step::Await("ST_Init: Init status bar.", 600_000),
+            // Заставка и демо крутятся сами: кадры идут, программа жива.
+            Step::Wait(5_000),
+            Step::Shot("doom-title"),
+            // Меню, «Новая игра», эпизод, сложность — четыре клавиши.
+            Step::Key("esc"),
+            Step::Wait(1_000),
+            Step::Key("ret"),
+            Step::Wait(1_000),
+            Step::Key("ret"),
+            Step::Wait(1_000),
+            Step::Key("ret"),
+            Step::Wait(4_000),
+            // Выстрел — сам Ctrl (фаза 68c), шаг вперёд — стрелка. Держать
+            // дольше кадра: в отладочной сборке кадр — десятые доли секунды.
+            Step::Hold("ctrl", 1_500),
+            Step::Hold("up", 1_500),
+            Step::Wait(2_000),
+            Step::Shot("doom-game"),
+            Step::Aim(Aim::Close("DOOM")),
+            Step::Click,
+            Step::Await("Quit requested", 30_000),
+            // Диск установленной системы переживает прогон: пакет снимается,
+            // иначе следующий прогон получит «уже установлен».
+            Step::Line("run /bin/pkg remove freedoom"),
+            Step::Await("pkg: removed freedoom", 120_000),
+            Step::Absent("I_Error"),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],

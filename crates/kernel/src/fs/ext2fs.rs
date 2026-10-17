@@ -17,6 +17,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::block::Counted;
+use crate::block::cache::Cached;
+
+/// Носитель тома: кеш блоков (фаза 68d) поверх счётчика обращений — счётчик
+/// под кешем, и считает он то, что дошло до устройства.
+type Disk = Cached<Counted>;
 use disk::BlockDevice as _;
 use crate::sync::Mutex;
 use crate::vfs::{DirEntry, FileSystem, Metadata, Node, NodeKind, VfsError, VfsResult};
@@ -35,7 +40,7 @@ struct Inner {
     /// ограничение: том, лежащий на диске SATA, смонтировать было нечем, потому
     /// что тип не совпадал. Крейт `ext2` всегда работал через
     /// `&mut dyn BlockDevice` — расходилось с ним только ядро.
-    disk: Counted,
+    disk: Disk,
     fs: ext2::Ext2,
     /// Редактор — только у тома, смонтированного на запись.
     ///
@@ -124,7 +129,7 @@ impl Ext2Fs {
         first_lba: u64,
         writable: bool,
     ) -> VfsResult<Ext2Mount> {
-        let mut disk = Counted::new(device);
+        let mut disk = Cached::new(Counted::new(device));
         let fs = ext2::Ext2::mount(&mut disk, first_lba).map_err(convert)?;
         // На томе только для чтения редактор не открывается вовсе — и не
         // только потому, что писать не собираемся: само открытие помечает том
@@ -151,7 +156,7 @@ impl Ext2Fs {
     /// место, где такую цену стоит платить не глядя.
     fn change<R>(
         &self,
-        action: impl FnOnce(&mut Counted, &mut ext2::Editor) -> VfsResult<R>,
+        action: impl FnOnce(&mut Disk, &mut ext2::Editor) -> VfsResult<R>,
     ) -> VfsResult<R> {
         let mut guard = self.inner.lock();
         // Штамп времени обновляется перед **каждой** правкой, а не один раз при
@@ -226,7 +231,7 @@ impl Ext2Mount {
             geometry.blocks,
             geometry.block_size.bytes(),
             geometry.groups,
-            guard.disk.requests(),
+            guard.disk.inner().requests(),
         )
     }
 

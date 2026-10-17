@@ -133,15 +133,20 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     fs::create_dir_all(&dir)
         .with_context(|| format!("не удалось создать каталог {}", dir.display()))?;
 
-    let mut built = Vec::new();
-    for (file_name, bytes) in [
+    let mut samples = vec![
         ("hello-1.0.fpk", hello.finish()),
         ("extra-1.0.fpk", extra.finish()),
         ("winforms-1.0.fpk", winforms.finish()),
         ("edu-1.0.fpk", edu_bytes),
         ("edu-nodev-1.0.fpk", edu_nodev.finish()),
         ("edu-raw-1.0.fpk", edu_raw.finish()),
-    ] {
+    ];
+    if let Some(game) = freedoom(arch)? {
+        samples.push(("freedoom-0.13.fpk", game));
+    }
+
+    let mut built = Vec::new();
+    for (file_name, bytes) in samples {
         let path = dir.join(file_name);
         fs::write(&path, &bytes)
             .with_context(|| format!("не удалось записать {}", path.display()))?;
@@ -149,6 +154,43 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
         built.push(Package { file_name: String::from(file_name), path });
     }
     Ok(built)
+}
+
+/// Пакеты игр: только на установочный носитель, не в RAM-диск живой системы.
+pub const GAMES: [&str; 1] = ["freedoom-0.13.fpk"];
+
+/// Doom пакетом (фаза 68d): doomgeneric на SDL2 и данные Freedoom: Phase 1.
+///
+/// Пакетом, а не в образе: данные — 29 МБ, и в RAM-диск живой системы и в
+/// каждый образ обновления им незачем. Ставится `pkg install
+/// /media/freedoom-0.13.fpk`, по `start=` стол кладёт игру в «Пуск». Обе части
+/// собирает `cargo xtask thirdparty`; нет любой — пакета нет, как нет и
+/// программ из чужих исходников.
+fn freedoom(arch: Arch) -> Result<Option<Vec<u8>>> {
+    let program = crate::cbuild::sysroot(arch).join("bin/doom");
+    let games = crate::cbuild::games_dir();
+    let wad = games.join("freedoom1.wad");
+    let license = games.join("freedoom-COPYING.txt");
+    if !program.is_file() || !wad.is_file() || !license.is_file() {
+        say!("пакет freedoom пропущен: нет {} или данных в {} — собрать: cargo xtask thirdparty", program.display(), games.display());
+        return Ok(None);
+    }
+    let mut game = Builder::new(Kind::Package, "freedoom", "0.13");
+    game.field("summary", "Doom (doomgeneric on SDL2) with Freedoom: Phase 1");
+    game.field("caption", "Freedoom");
+    game.field("about", "Doom на SDL2 с данными Freedoom");
+    game.field("start", "/opt/freedoom/bin/doom -iwad /opt/freedoom/freedoom1.wad");
+    // Окно — и файлы: Doom пишет настройки и сохранения в домашний каталог.
+    game.field("permissions", "windows files");
+    for (path, source, mode) in [
+        ("bin/doom", &program, 0o755),
+        ("freedoom1.wad", &wad, 0o644),
+        ("COPYING.txt", &license, 0o644),
+    ] {
+        let data = fs::read(source).with_context(|| format!("не удалось прочитать {}", source.display()))?;
+        game.file(&Entry { path: String::from(path), mode, uid: 0, gid: 0, data });
+    }
+    Ok(Some(game.finish()))
 }
 
 /// Пакет-драйвер учебной карты QEMU `edu`, подписанный рабочим ключом.

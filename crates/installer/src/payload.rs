@@ -542,7 +542,7 @@ const DOTNET: [(&CStr16, &str); 3] = [
 ///
 /// Их отсутствие — не отказ: пакеты собирает `xtask`, и носитель, собранный без
 /// них, остаётся годным установочным носителем.
-const PACKAGES: [(&CStr16, &str); 6] = [
+const PACKAGES: [(&CStr16, &str); 7] = [
     (cstr16!("\\FREEOS\\PKG\\HELLO.FPK"), "hello-1.0.fpk"),
     (cstr16!("\\FREEOS\\PKG\\EXTRA.FPK"), "extra-1.0.fpk"),
     // Программа WinForms пакетом (фаза N8).
@@ -551,6 +551,9 @@ const PACKAGES: [(&CStr16, &str); 6] = [
     (cstr16!("\\FREEOS\\PKG\\EDU.FPK"), "edu-1.0.fpk"),
     (cstr16!("\\FREEOS\\PKG\\EDUNODEV.FPK"), "edu-nodev-1.0.fpk"),
     (cstr16!("\\FREEOS\\PKG\\EDURAW.FPK"), "edu-raw-1.0.fpk"),
+    // Doom на SDL2 с данными Freedoom (фаза 68d) — едет, только если собран
+    // `cargo xtask thirdparty`.
+    (cstr16!("\\FREEOS\\PKG\\FREEDOOM.FPK"), "freedoom-0.13.fpk"),
 ];
 
 /// Размер файла по данным файловой системы.

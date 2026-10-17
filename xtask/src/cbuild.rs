@@ -317,6 +317,12 @@ pub const FONTS: [(&str, &str, &str); 3] = [
     ("fonts.conf", "usr/share/fontconfig", "FONTS.CNF"),
 ];
 
+/// Куда `cargo xtask thirdparty` кладёт данные игр (фаза 68d): одни на обе
+/// архитектуры. В образ они не едут — их везёт пакет `freedoom`.
+pub fn games_dir() -> PathBuf {
+    toolchain_dir().join("games")
+}
+
 /// Куда `cargo xtask thirdparty` кладёт шрифты: одни на обе архитектуры.
 pub fn fonts_dir() -> PathBuf {
     toolchain_dir().join("fonts")

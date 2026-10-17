@@ -89,6 +89,15 @@ enum How {
     /// исходниках SDL правка одна, `ports/sdl2/freeos.patch`: имя платформы и
     /// два драйвера в списках SDL.
     Sdl2,
+    /// doomgeneric (фаза 68d): его собственный `Makefile.sdl` с нашим
+    /// компилятором и SDL2 из набора; программа — `bin/doom` в sysroot.
+    /// Звук doomgeneric берёт у SDL2_mixer, которого пока нет, — поэтому из
+    /// его списка объектов убраны три звуковых (`i_sdlsound`, `i_sdlmusic`,
+    /// `mus2mid`), а без `FEATURE_SOUND` он собирает заглушки (`dummy.c`).
+    Doomgeneric,
+    /// Данные игр (фаза 68d): файлы из архива в [`cbuild::games_dir`] —
+    /// пары «путь в архиве» и «имя там».
+    Games(&'static [(&'static str, &'static str)]),
 }
 
 /// Свои ключи проекта, собираемого GNU `configure`.
@@ -147,7 +156,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 12] = [
+const PROJECTS: [Project; 14] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -449,6 +458,30 @@ const PROJECTS: [Project; 12] = [
         how: How::Sdl2,
         installs: &["lib/libSDL2.a", "include/SDL2/SDL.h", "include/SDL2/SDL_config_freeos.h", "lib/pkgconfig/sdl2.pc"],
     },
+    // Первая настоящая игра на SDL2 (фаза 68d): Doom в виде doomgeneric —
+    // Chocolate Doom, сведённый к пяти функциям платформы, с готовой из них
+    // реализацией на SDL2. Релизов у проекта нет, поэтому архив — снимок
+    // коммита; хеш снят с него (2026-10-17). GPL-2.0.
+    Project {
+        name: "doomgeneric",
+        version: "e257a09",
+        url: "https://github.com/ozkl/doomgeneric/archive/e257a09527062bfb986b6e5e0780839b6cbd5b71.tar.gz",
+        sha256: "26f8f60daa6c6e4d3c01e5eac9fb700d592dede803d13ac848154ff356b2a2e7",
+        unpacked: "doomgeneric-e257a09527062bfb986b6e5e0780839b6cbd5b71",
+        how: How::Doomgeneric,
+        installs: &["bin/doom"],
+    },
+    // Данные для неё — Freedoom: Phase 1, свободная замена Doom (BSD). Хеш —
+    // из подписанного `freedoom-0.13.0-CHECKSUM` рядом с архивом.
+    Project {
+        name: "freedoom",
+        version: "0.13.0",
+        url: "https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip",
+        sha256: "3f9b264f3e3ce503b4fb7f6bdcb1f419d93c7b546f4df3e874dd878db9688f59",
+        unpacked: "freedoom-0.13.0",
+        how: How::Games(&[("freedoom1.wad", "freedoom1.wad"), ("COPYING.txt", "freedoom-COPYING.txt")]),
+        installs: &[],
+    },
 ];
 
 /// Собрать чужие проекты под все указанные архитектуры: все или только
@@ -464,6 +497,16 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
     }
     for project in PROJECTS.iter().filter(|project| only.is_empty() || only.iter().any(|name| name == project.name)) {
         let source = fetch(project, refresh)?;
+        if let How::Games(files) = project.how {
+            let dir = cbuild::games_dir();
+            fs::create_dir_all(&dir)?;
+            for (from, to) in files {
+                fs::copy(source.join(from), dir.join(to))
+                    .with_context(|| format!("не удалось положить {from} из {}", project.name))?;
+            }
+            say!("{} {}: {} файл(а) в {}", project.name, project.version, files.len(), dir.display());
+            continue;
+        }
         if let How::Files(files) = project.how {
             let dir = cbuild::fonts_dir();
             fs::create_dir_all(&dir)?;
@@ -626,7 +669,36 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
-        How::Files(_) => return Ok(()),
+        How::Files(_) | How::Games(_) => return Ok(()),
+        How::Doomgeneric => {
+            let game = work.join("doomgeneric");
+            // Список объектов — из его же `Makefile.sdl`, без трёх звуковых
+            // (см. [`How::Doomgeneric`]).
+            let makefile = fs::read_to_string(game.join("Makefile.sdl"))?;
+            let line = makefile
+                .lines()
+                .find(|line| line.starts_with("SRC_DOOM"))
+                .context("в Makefile.sdl нет SRC_DOOM")?;
+            let objects: Vec<&str> = line
+                .split_once('=')
+                .map_or("", |(_, list)| list)
+                .split_whitespace()
+                .filter(|object| !["i_sdlsound.o", "i_sdlmusic.o", "mus2mid.o"].contains(object))
+                .collect();
+            let shell = format!("SHELL={}", make_shell()?);
+            let cc = format!("CC={triple}-cc");
+            let cflags = format!("CFLAGS=-O2 -I{prefix}/include/SDL2");
+            let ldflags = format!("LDFLAGS=-L{prefix}/lib");
+            let src = format!("SRC_DOOM={}", objects.join(" "));
+            run_make(
+                &game,
+                &["-f", "Makefile.sdl", "-j6", &shell, &cc, &cflags, &ldflags, "LIBS=-lSDL2 -lfreeos -lm", &src],
+                &format!("make doomgeneric {}", arch.name()),
+            )?;
+            fs::create_dir_all(sysroot.join("bin"))?;
+            fs::copy(game.join("doomgeneric"), sysroot.join("bin/doom"))
+                .context("doomgeneric собрался, но программы нет")?;
+        }
         How::MbedTls => {
             let ports = crate::paths::workspace_root().join("ports/mbedtls");
             // Настройки — в конец копии `mbedtls_config.h`: их увидят и сама

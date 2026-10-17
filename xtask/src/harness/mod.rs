@@ -1056,6 +1056,11 @@ fn play(
                 hmp.sendkey(name).with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(KEY_DELAY);
             }
+            Step::Hold(name, ms) => {
+                say!("  [{at:>6} мс] шаг {index}: клавиша {name} на {ms} мс");
+                hmp.sendkey(&format!("{name} {ms}")).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(Duration::from_millis(u64::from(*ms)) + KEY_DELAY);
+            }
             Step::Repeat(name, times) => {
                 say!("  [{at:>6} мс] шаг {index}: клавиша {name} ×{times}");
                 for _ in 0..*times {
