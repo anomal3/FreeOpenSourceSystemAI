@@ -544,14 +544,18 @@ fn start_graphics(info: &BootInfo, have_input: bool) {
         return;
     }
 
-    if !info.framebuffer.is_present() {
+    // Видеокарта virtio (фаза 67a) — раньше буфера от прошивки: если она
+    // есть, стол рисует в неё, и тогда буфер прошивки не нужен вовсе (у её
+    // GOP его и нет — см. `virtio::gpu`).
+    let gpu_screen = virtio_gpu_screen(info);
+    if gpu_screen.is_none() && !info.framebuffer.is_present() {
         kprintln!("  compositor  : no framebuffer; the shell will run on the serial console");
         return;
     }
 
     console::release_screen();
 
-    let framebuffer = requested_framebuffer(info);
+    let framebuffer = gpu_screen.unwrap_or_else(|| requested_framebuffer(info));
     if !ui::init(&framebuffer) {
         console::reclaim_screen();
         kprintln!("  compositor  : could not take the screen; staying on the boot console");
@@ -567,6 +571,35 @@ fn start_graphics(info: &BootInfo, have_input: bool) {
         framebuffer.height
     );
     kprintln!("  console     : screen handed over; the boot log continues on serial only");
+}
+
+/// Экран на virtio-gpu, если устройство есть (фаза 67a).
+///
+/// Размер — тот, что выбран в «Параметрах», иначе тот, что предлагает само
+/// устройство. Нет устройства или оно отказало — `None`, и стол идёт на буфер
+/// от прошивки, как до этой фазы.
+fn virtio_gpu_screen(info: &BootInfo) -> Option<boot_info::Framebuffer> {
+    // SAFETY: ядро работает на собственных таблицах страниц, RSDP пришёл в
+    // проверенном `BootInfo`.
+    let root = unsafe { pci::Root::discover(info.acpi_rsdp) }.ok()?;
+    // SAFETY: см. выше.
+    if !unsafe { virtio::gpu::probe(&root) } {
+        return None;
+    }
+    let (width, height) = match (info.requested_width, info.requested_height) {
+        (0, _) | (_, 0) => virtio::gpu::preferred()?,
+        size => size,
+    };
+    match virtio::gpu::take_screen(width, height) {
+        Ok(framebuffer) => {
+            kprintln!("  display     : {width}x{height} on virtio-gpu");
+            Some(framebuffer)
+        }
+        Err(err) => {
+            kprintln!("  display     : virtio-gpu could not show {width}x{height}: {err}");
+            None
+        }
+    }
 }
 
 /// Поставить режим, который просили в «Параметрах», если прошивка его не дала.
@@ -588,7 +621,7 @@ fn requested_framebuffer(info: &BootInfo) -> boot_info::Framebuffer {
     match display::set_mode(current, width, height) {
         Ok(framebuffer) => {
             console::adopt(&framebuffer);
-            kprintln!("  display     : {width}x{height} set at start by {}", display::DRIVER);
+            kprintln!("  display     : {width}x{height} set at start by {}", display::driver());
             framebuffer
         }
         Err(why) => {

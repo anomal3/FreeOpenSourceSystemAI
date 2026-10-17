@@ -217,6 +217,10 @@ pub enum Step {
     /// Проверить размер кадра, который показывает устройство, — по монитору
     /// QEMU, а не по словам гостя (фаза С6a).
     Screen(u32, u32),
+    /// Снять экран и проверить, что на нём **нарисовано** — не меньше 32
+    /// разных цветов (фаза 67a). У virtio-gpu картинка доходит до хоста только
+    /// по команде драйвера: забытый перенос — это чёрный кадр, а не старый.
+    Painted(&'static str),
     /// Сбросить машину, ничего не спрашивая у гостя (`system_reset` монитора).
     ///
     /// Это и есть «выдернули шнур»: система не получает ни уведомления, ни
@@ -1682,6 +1686,83 @@ pub const ALL: &[Scenario] = &[
             Step::Await("power       : confirmed in the start menu", 15_000),
             Step::Await("shutting down", 15_000),
             Step::Exits(30_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "gpu",
+        about: "Видеокарта virtio единственным экраном (фаза 67a): стол рисует в ресурс, хост показывает изменённое, режим меняется из «Параметров».",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // С `virtio-gpu-pci` стенд не ставит адаптер по умолчанию (stdvga,
+        // ramfb): экран один, и снимок снимает его (см. `xtask/src/qemu.rs`).
+        extra: &["-device", "virtio-gpu-pci"],
+        steps: &[
+            // Буфера от прошивки нет (GOP virtio-gpu — только `Blt()`), и
+            // стол заводит экран сам, на устройстве.
+            Step::AwaitAny("virtio-gpu  : at ", BOOT),
+            Step::AwaitAny("on virtio-gpu", 60_000),
+            Step::Await("freeos> ", BOOT),
+            Step::Wait(3_000),
+            // Размер, который предложило устройство, — 1280×800 у QEMU, — и
+            // стол на нём нарисован: без переноса прямоугольников к хосту
+            // кадр остался бы чёрным.
+            Step::Screen(1280, 800),
+            Step::Painted("00-boot"),
+
+            // Смена режима — новый ресурс, экран переключается на него, старый
+            // снимается. Сначала 1024×768 (первый пункт), потом обратно
+            // 1280×800 (третий).
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Key("down"),
+            Step::Key("ret"),
+            Step::Await("desktop     : opened 'Settings'", 15_000),
+            Step::Key("ret"),
+            Step::Key("ret"),
+            Step::Await("display     : 1024x768 set now by virtio-gpu", 30_000),
+            Step::Await("desktop     : 1024x768, ui scale", 30_000),
+            Step::Screen(1024, 768),
+            Step::Wait(3_000),
+            Step::Painted("01-1024x768"),
+            Step::Repeat("down", 2),
+            Step::Key("ret"),
+            Step::Await("display     : 1280x800 set now by virtio-gpu", 30_000),
+            Step::Await("desktop     : 1280x800, ui scale", 30_000),
+            Step::Screen(1280, 800),
+            Step::Wait(3_000),
+            Step::Painted("02-1280x800"),
+
+            // Окно, которое рисуется частями: терминал и набранный текст.
+            Step::Key("esc"),
+            Step::Key("f1"),
+            Step::Await("desktop     : menu opened", 15_000),
+            Step::Key("ret"),
+            // Терминал при живой загрузке уже открыт: меню выводит его вперёд.
+            Step::Await("desktop     : focus 'Terminal'", 15_000),
+            Step::Wait(2_000),
+            Step::Type("echo virtio-gpu draws"),
+            Step::Key("ret"),
+            Step::Await("virtio-gpu draws", 15_000),
+            Step::Wait(3_000),
+            Step::Painted("03-terminal"),
+            Step::Absent("virtio-gpu  : flush failed"),
             Step::Absent("KERNEL PANIC"),
         ],
     },

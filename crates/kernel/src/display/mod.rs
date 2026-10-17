@@ -75,11 +75,26 @@ fn physical(base: u64) -> u64 {
     if base >= direct { base - direct } else { base }
 }
 
-/// Имя драйвера — для журнала.
+/// Имя адаптера по умолчанию — для журнала.
 #[cfg(target_arch = "x86_64")]
-pub const DRIVER: &str = "bochs vbe";
+const DRIVER: &str = "bochs vbe";
 #[cfg(target_arch = "aarch64")]
-pub const DRIVER: &str = "ramfb";
+const DRIVER: &str = "ramfb";
+
+/// Имя драйвера, который сейчас держит экран, — для журнала.
+#[must_use]
+pub fn driver() -> &'static str {
+    if crate::virtio::gpu::active() { "virtio-gpu" } else { DRIVER }
+}
+
+/// Показать изменившийся прямоугольник (фаза 67a).
+///
+/// У stdvga и ramfb делать нечего: адаптер показывает свою память сам. У
+/// virtio-gpu картинка лежит в обычной памяти, и хосту надо сказать, что в ней
+/// изменилось, — композитор зовёт это после каждого собранного прямоугольника.
+pub fn flush(x: i32, y: i32, w: u32, h: u32) {
+    crate::virtio::gpu::flush(x, y, w, h);
+}
 
 /// Умеет ли эта машина менять режим экрана на ходу.
 ///
@@ -93,6 +108,11 @@ pub const DRIVER: &str = "ramfb";
 /// задаёт прошивка при загрузке — это надо говорить словами, а не молчанием.
 #[must_use]
 pub fn can_switch() -> bool {
+    // virtio-gpu (фаза 67a) — на обеих архитектурах: режим у него — это размер
+    // ресурса, который заводит драйвер.
+    if crate::virtio::gpu::active() {
+        return true;
+    }
     #[cfg(target_arch = "x86_64")]
     {
         bochs::present()
@@ -118,6 +138,9 @@ pub fn can_switch() -> bool {
 pub fn set_mode(current: &Framebuffer, width: u32, height: u32) -> Result<Framebuffer, DisplayError> {
     if width < 320 || height < 200 || width > 4096 || height > 4096 {
         return Err(DisplayError::Refused("mode outside 320x200..4096x4096"));
+    }
+    if crate::virtio::gpu::active() {
+        return crate::virtio::gpu::take_screen(width, height);
     }
     #[cfg(target_arch = "x86_64")]
     {

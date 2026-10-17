@@ -2318,6 +2318,8 @@ impl Compositor {
     /// панели, а ни того, ни другого у нас нет. Картинка чёрная, лампа горит.
     pub fn blank(&mut self) {
         self.screen.fill(self.screen.bounds(), Color::rgb(0, 0, 0));
+        let all = self.screen.bounds();
+        crate::display::flush(all.x, all.y, all.w, all.h);
         self.blanked = true;
     }
 
@@ -2481,6 +2483,10 @@ impl Compositor {
             top += height as i32;
         }
         self.back = back;
+        // У virtio-gpu картинка — в обычной памяти, и хост узнаёт об
+        // изменении только так (фаза 67a); у stdvga и ramfb это ничего не
+        // делает.
+        crate::display::flush(rect.x, rect.y, rect.w, rect.h);
     }
 
 

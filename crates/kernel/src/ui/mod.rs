@@ -2228,7 +2228,7 @@ fn switch_mode(desktop: &mut Compositor, width: u32, height: u32, status: &Statu
         core::sync::atomic::Ordering::Relaxed,
     );
 
-    kprintln!("  display     : {width}x{height} set now by {}", crate::display::DRIVER);
+    kprintln!("  display     : {width}x{height} set now by {}", crate::display::driver());
     // Та же строка, что при запуске: по последней такой стенд наводит мышь.
     kprintln!(
         "  desktop     : {}x{}, ui scale {}, panel {} px",

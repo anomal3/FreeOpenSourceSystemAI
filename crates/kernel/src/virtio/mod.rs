@@ -31,6 +31,7 @@
 //! к остановке системы.
 
 pub mod blk;
+pub mod gpu;
 pub mod net;
 
 use core::sync::atomic::{Ordering, fence};

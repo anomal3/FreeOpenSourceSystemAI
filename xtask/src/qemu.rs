@@ -535,9 +535,19 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     let mut cmd = Command::new(&qemu);
     cmd.current_dir(paths::workspace_root());
 
+    // Видеокарта virtio (фаза 67a) — **единственным** экраном: просит её сам
+    // сценарий (`-device virtio-gpu-pci` в его аргументах), и тогда адаптера по
+    // умолчанию нет — ни stdvga на q35, ни ramfb на virt. Иначе снимок экрана
+    // (`screendump`) снимал бы первую консоль, то есть старый адаптер, где
+    // застыл журнал загрузки, и проверка видела бы не то, что рисует драйвер.
+    let virtio_gpu = opts.extra.iter().any(|arg| arg.starts_with("virtio-gpu"));
+
     match arch {
         Arch::X86_64 => {
             cmd.args(["-machine", "q35"]);
+            if virtio_gpu {
+                cmd.args(["-vga", "none"]);
+            }
             // Носители подключаются через virtio-blk, а не через штатный для
             // q35 контроллер AHCI, и это ради ядра, а не ради прошивки.
             // Драйвер диска в FreeOS один на обе архитектуры (см.
@@ -603,7 +613,9 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
             // Нашему загрузчику нужен именно физический адрес framebuffer'а,
             // чтобы передать его ядру в boot-info и рисовать после ExitBootServices,
             // когда GOP->Blt() уже вызывать нельзя. Значит — ramfb.
-            cmd.args(["-device", "ramfb"]);
+            if !virtio_gpu {
+                cmd.args(["-device", "ramfb"]);
+            }
         }
     }
 

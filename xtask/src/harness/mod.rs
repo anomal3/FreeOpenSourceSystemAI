@@ -1496,6 +1496,21 @@ fn play(
                 say!("             {w}x{h} -> {}", png.display());
                 shots.push(png);
             }
+            Step::Painted(name) => {
+                say!("  [{at:>6} мс] шаг {index}: снимок '{name}' обязан быть нарисован");
+                let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
+                let png = ppm.with_extension("png");
+                std::fs::create_dir_all(paths::test_dir()).ok();
+                let took = hmp.screendump(&ppm).with_context(|| format!("шаг {index}"))?;
+                report_slow_shot(index, took);
+                let (w, h, colors) =
+                    shot::ppm_to_png_colors(&ppm, &png).with_context(|| format!("шаг {index}"))?;
+                say!("             {w}x{h}, {colors} цвет(ов) -> {}", png.display());
+                shots.push(png);
+                if colors < 32 {
+                    bail!("шаг {index}: на экране {colors} цвет(ов) — ничего не нарисовано");
+                }
+            }
             Step::Screen(width, height) => {
                 say!("  [{at:>6} мс] шаг {index}: экран гостя должен быть {width}x{height}");
                 // Размер спрашивается у QEMU, а не у журнала гостя: строка

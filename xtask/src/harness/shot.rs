@@ -98,6 +98,20 @@ fn parse_ppm(bytes: &[u8]) -> Result<Ppm> {
 
 /// Перевести файл PPM в PNG рядом и удалить исходник.
 pub fn ppm_to_png(ppm_path: &Path, png_path: &Path) -> Result<(u32, u32)> {
+    let (width, height, _) = convert(ppm_path, png_path)?;
+    Ok((width, height))
+}
+
+/// То же, и заодно сосчитать разные цвета кадра (фаза 67a).
+///
+/// Число цветов отличает нарисованный стол — обои с переливом, значки, текст:
+/// сотни цветов — от экрана, на который ничего не пришло: чёрного или с
+/// надписью QEMU «display not initialized», где их единицы.
+pub fn ppm_to_png_colors(ppm_path: &Path, png_path: &Path) -> Result<(u32, u32, usize)> {
+    convert(ppm_path, png_path)
+}
+
+fn convert(ppm_path: &Path, png_path: &Path) -> Result<(u32, u32, usize)> {
     let bytes = std::fs::read(ppm_path)
         .with_context(|| format!("не удалось прочитать снимок {}", ppm_path.display()))?;
     let image = parse_ppm(&bytes)
@@ -124,5 +138,7 @@ pub fn ppm_to_png(ppm_path: &Path, png_path: &Path) -> Result<(u32, u32)> {
     // ничем от него не отличается.
     std::fs::remove_file(ppm_path).ok();
 
-    Ok((image.width, image.height))
+    let colors: std::collections::HashSet<[u8; 3]> =
+        image.pixels.chunks_exact(3).map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
+    Ok((image.width, image.height, colors.len()))
 }
