@@ -443,8 +443,10 @@ const MONO: [(&CStr16, &str); 4] = [
 ///
 /// Список обязан совпадать с `MONO_BCL` в `xtask/src/cbuild.rs`. На носителе их
 /// может не быть — там, где Mono не собиралась, нет и её самой.
-const MONO_LIB: [(&CStr16, &str); 13] = [
+const MONO_LIB: [(&CStr16, &str); 15] = [
     (cstr16!("\\FREEOS\\MONOLIB\\MSCORLIB.DLL"), "usr/lib/mono/4.5/mscorlib.dll"),
+    // Фаза 66a: настройки рантайма (sysconfdir Mono — `/usr/lib`).
+    (cstr16!("\\FREEOS\\MONOLIB\\MACHINE.CFG"), "usr/lib/mono/4.5/machine.config"),
     (
         cstr16!("\\FREEOS\\MONOLIB\\SYSTEM.DLL"),
         "usr/lib/mono/gac/System/4.0.0.0__b77a5c561934e089/System.dll",
@@ -485,6 +487,11 @@ const MONO_LIB: [(&CStr16, &str); 13] = [
     (
         cstr16!("\\FREEOS\\MONOLIB\\MONOPSX.DLL"),
         "usr/lib/mono/gac/Mono.Posix/4.0.0.0__0738eb9f132ed756/Mono.Posix.dll",
+    ),
+    // Фаза 66a: на неё ссылается `HttpWebRequest`.
+    (
+        cstr16!("\\FREEOS\\MONOLIB\\MONOSEC.DLL"),
+        "usr/lib/mono/gac/Mono.Security/4.0.0.0__0738eb9f132ed756/Mono.Security.dll",
     ),
     (
         cstr16!("\\FREEOS\\MONOLIB\\MONOWEB.DLL"),

@@ -18,7 +18,7 @@
 //! том и разобранный inode — сотни байт, но выделяет их куча ядра, а не
 //! программа, и предела у неё нет.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -93,12 +93,41 @@ enum Slot {
     /// закрытие одного номера оставляет файл живым, пока цел хоть один.
     File(Arc<Open>),
     /// Читающий конец: из него берёт `read`.
-    PipeRead(pipe::Reader),
+    PipeRead(pipe::Reader, Mode),
     /// Пишущий конец: в него отдаёт `write`.
-    PipeWrite(pipe::Writer),
+    PipeWrite(pipe::Writer, Mode),
     /// Сокет (фаза 65a). Читают и пишут его не здесь, а в `sock.rs`, вне
     /// замка программы: сокет ждёт, а таблица под замком ждать не может.
     Socket(Arc<super::sock::Sock>),
+}
+
+/// Режим конца канала: ждёт ли он (фаза 66b).
+///
+/// Общий у копий дескриптора (`dup`) — как флаг открытого файла в Unix:
+/// `fcntl(F_SETFL)` на одной копии меняет и другую. Канал рождается
+/// неблокирующим — так [`SYS_PIPE`](user_abi::SYS_PIPE) работал с фазы 39,
+/// и на этом стоят программы на Rust; ждущим его делает `SYS_FDCTL`.
+#[derive(Clone)]
+struct Mode(Arc<AtomicBool>);
+
+impl Mode {
+    fn new(nonblock: bool) -> Self {
+        Self(Arc::new(AtomicBool::new(nonblock)))
+    }
+
+    fn nonblock(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn set(&self, nonblock: bool) {
+        self.0.store(nonblock, Ordering::Relaxed);
+    }
+}
+
+/// Конец ждущего канала, взятый из таблицы, чтобы ждать вне её замка.
+pub enum Waiting {
+    Read(pipe::Reader),
+    Write(pipe::Writer),
 }
 
 /// Почему не получилось.
@@ -277,9 +306,9 @@ impl Table {
             // задача, уснувшая с ним в руках, останавливает вместе с собой
             // всякого, кто в эту таблицу заглянет. Ждать умеет стандартный
             // вывод (см. `Program::stdout`) — он живёт не в таблице.
-            Slot::PipeWrite(writer) => writer.write(data, false).map_err(FileError::Pipe),
+            Slot::PipeWrite(writer, _) => writer.write(data, false).map_err(FileError::Pipe),
             // Сокет пишется в `sock.rs`, вне замка: сюда он не доходит.
-            Slot::PipeRead(_) | Slot::Socket(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
+            Slot::PipeRead(..) | Slot::Socket(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
     }
 
@@ -321,7 +350,7 @@ impl Table {
                 }
                 Ok(Arc::clone(&open.node))
             }
-            Some(Slot::PipeRead(_) | Slot::PipeWrite(_) | Slot::Socket(_)) => {
+            Some(Slot::PipeRead(..) | Slot::PipeWrite(..) | Slot::Socket(_)) => {
                 Err(FileError::Vfs(VfsError::WrongKind))
             }
             None => Err(FileError::BadFd),
@@ -350,8 +379,8 @@ impl Table {
                 Ok(read)
             }
             // Не ждёт по той же причине, что и запись выше.
-            Slot::PipeRead(reader) => reader.read(buf, false).map_err(FileError::Pipe),
-            Slot::PipeWrite(_) | Slot::Socket(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
+            Slot::PipeRead(reader, _) => reader.read(buf, false).map_err(FileError::Pipe),
+            Slot::PipeWrite(..) | Slot::Socket(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
     }
 
@@ -397,14 +426,14 @@ impl Table {
     /// существует, таблице нужно только место под его конец.
     pub fn install_read(&mut self, reader: pipe::Reader) -> Result<usize, FileError> {
         let slot = self.free_slot()?;
-        self.slots[slot] = Some(Slot::PipeRead(reader));
+        self.slots[slot] = Some(Slot::PipeRead(reader, Mode::new(true)));
         Ok(slot + FD_FIRST)
     }
 
     /// То же для пишущего конца.
     pub fn install_write(&mut self, writer: pipe::Writer) -> Result<usize, FileError> {
         let slot = self.free_slot()?;
-        self.slots[slot] = Some(Slot::PipeWrite(writer));
+        self.slots[slot] = Some(Slot::PipeWrite(writer, Mode::new(true)));
         Ok(slot + FD_FIRST)
     }
 
@@ -425,6 +454,38 @@ impl Table {
         }
     }
 
+    /// Конец **ждущего** канала за дескриптором — копией, чтобы ждать вне
+    /// замка программы (фаза 66b). `None` — там не канал или канал не ждёт:
+    /// тогда работает обычный путь через таблицу.
+    #[must_use]
+    pub fn waiting_pipe(&self, fd: usize) -> Option<Waiting> {
+        match self.slots.get(index_of(fd).ok()?)?.as_ref()? {
+            Slot::PipeRead(reader, mode) if !mode.nonblock() => Some(Waiting::Read(reader.clone())),
+            Slot::PipeWrite(writer, mode) if !mode.nonblock() => Some(Waiting::Write(writer.clone())),
+            _ => None,
+        }
+    }
+
+    /// Включить или снять «не ждать» (`SYS_FDCTL`). У файла — ничего: он не
+    /// ждёт никогда.
+    pub fn set_nonblock(&self, fd: usize, on: bool) -> Result<(), FileError> {
+        match self.slots[index_of(fd)?].as_ref().ok_or(FileError::BadFd)? {
+            Slot::PipeRead(_, mode) | Slot::PipeWrite(_, mode) => mode.set(on),
+            Slot::Socket(socket) => socket.set_nonblock(on),
+            Slot::File(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Не ждёт ли дескриптор. Файл — `true`: ждать ему нечего.
+    pub fn nonblock(&self, fd: usize) -> Result<bool, FileError> {
+        Ok(match self.slots[index_of(fd)?].as_ref().ok_or(FileError::BadFd)? {
+            Slot::PipeRead(_, mode) | Slot::PipeWrite(_, mode) => mode.nonblock(),
+            Slot::Socket(socket) => socket.nonblock(),
+            Slot::File(_) => true,
+        })
+    }
+
     /// Копия читающего конца из этого дескриптора.
     ///
     /// Копия, а не изъятие: тот, кто отдаёт конец запускаемой задаче, свой
@@ -435,7 +496,7 @@ impl Table {
     pub fn read_end(&self, fd: usize) -> Result<pipe::Reader, FileError> {
         let index = index_of(fd)?;
         match self.slots[index].as_ref().ok_or(FileError::BadFd)? {
-            Slot::PipeRead(reader) => Ok(reader.clone()),
+            Slot::PipeRead(reader, _) => Ok(reader.clone()),
             _ => Err(FileError::Vfs(VfsError::WrongKind)),
         }
     }
@@ -444,7 +505,7 @@ impl Table {
     pub fn write_end(&self, fd: usize) -> Result<pipe::Writer, FileError> {
         let index = index_of(fd)?;
         match self.slots[index].as_ref().ok_or(FileError::BadFd)? {
-            Slot::PipeWrite(writer) => Ok(writer.clone()),
+            Slot::PipeWrite(writer, _) => Ok(writer.clone()),
             _ => Err(FileError::Vfs(VfsError::WrongKind)),
         }
     }
@@ -479,8 +540,8 @@ impl Table {
         let from = index_of(fd)?;
         let copy = match self.slots[from].as_ref().ok_or(FileError::BadFd)? {
             Slot::File(open) => Slot::File(Arc::clone(open)),
-            Slot::PipeRead(reader) => Slot::PipeRead(reader.clone()),
-            Slot::PipeWrite(writer) => Slot::PipeWrite(writer.clone()),
+            Slot::PipeRead(reader, mode) => Slot::PipeRead(reader.clone(), mode.clone()),
+            Slot::PipeWrite(writer, mode) => Slot::PipeWrite(writer.clone(), mode.clone()),
             Slot::Socket(socket) => Slot::Socket(Arc::clone(socket)),
         };
 
@@ -523,7 +584,7 @@ impl Table {
             // У канала нет ни длины, ни владельца, ни прав: он не лежит на
             // носителе. Нули здесь — не заглушка, а единственный честный ответ,
             // и отличает канал от пустого файла поле `kind`.
-            Some(Slot::PipeRead(_) | Slot::PipeWrite(_)) => Ok(FdInfo {
+            Some(Slot::PipeRead(..) | Slot::PipeWrite(..)) => Ok(FdInfo {
                 size: 0,
                 mode: 0,
                 uid: 0,
@@ -550,8 +611,8 @@ impl Table {
     pub fn readiness(&self, fd: usize) -> Result<(bool, bool, bool), FileError> {
         match self.slots.get(index_of(fd)?).and_then(Option::as_ref) {
             Some(Slot::File(open)) => Ok((true, open.writable, false)),
-            Some(Slot::PipeRead(reader)) => Ok((reader.ready(), false, reader.hangup())),
-            Some(Slot::PipeWrite(writer)) => Ok((false, writer.ready(), writer.hangup())),
+            Some(Slot::PipeRead(reader, _)) => Ok((reader.ready(), false, reader.hangup())),
+            Some(Slot::PipeWrite(writer, _)) => Ok((false, writer.ready(), writer.hangup())),
             Some(Slot::Socket(socket)) => Ok(socket.readiness()),
             None => Err(FileError::BadFd),
         }

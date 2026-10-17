@@ -22,4 +22,8 @@
 #define _SC_PHYS_PAGES       140
 #define _SC_AVPHYS_PAGES     141
 
+/* `pipe2` (фаза 66b) — в POSIX.1-2024 он стандартный, а picolibc объявляет его
+ * только при `_GNU_SOURCE`. Повторное объявление совместимо с её. */
+int pipe2(int fds[2], int flags);
+
 #endif /* _UNISTD_H_ */

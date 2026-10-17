@@ -253,8 +253,11 @@ pub const FOREIGN_PROGRAMS: [&str; 3] = ["lua", "mono", "curl"];
 /// Третье поле — имя 8.3 на установочном носителе (FAT), каталог там —
 /// [`crate::arch::PAYLOAD_MONO_LIB_DIR`]. Список обязан совпадать с `MONO_LIB`
 /// в `crates/installer/src/payload.rs`.
-pub const MONO_BCL: [(&str, &str, &str); 13] = [
+pub const MONO_BCL: [(&str, &str, &str); 15] = [
     ("mscorlib.dll", "usr/lib/mono/4.5", "MSCORLIB.DLL"),
+    // Фаза 66a: настройки рантайма — схемы адресов `WebRequest` и прочее.
+    // sysconfdir Mono — `/usr/lib` (`ports/mono/configure.sh`).
+    ("machine.config", "usr/lib/mono/4.5", "MACHINE.CFG"),
     ("System.dll", "usr/lib/mono/gac/System/4.0.0.0__b77a5c561934e089", "SYSTEM.DLL"),
     ("System.Core.dll", "usr/lib/mono/gac/System.Core/4.0.0.0__b77a5c561934e089", "SYSCORE.DLL"),
     // Фаза 61b: замыкание ссылок System.Configuration — её типы System.dll
@@ -263,6 +266,9 @@ pub const MONO_BCL: [(&str, &str, &str); 13] = [
     ("System.Xml.dll", "usr/lib/mono/gac/System.Xml/4.0.0.0__b77a5c561934e089", "SYSXML.DLL"),
     ("System.Security.dll", "usr/lib/mono/gac/System.Security/4.0.0.0__b03f5f7f11d50a3a", "SYSSEC.DLL"),
     ("System.Numerics.dll", "usr/lib/mono/gac/System.Numerics/4.0.0.0__b77a5c561934e089", "SYSNUM.DLL"),
+    // Фаза 66a: на неё ссылается `HttpWebRequest` (поле поставщика TLS) — без
+    // неё не грузится и обычный HTTP.
+    ("Mono.Security.dll", "usr/lib/mono/gac/Mono.Security/4.0.0.0__0738eb9f132ed756", "MONOSEC.DLL"),
     // Фаза 61b: собрана из исходников 6.14.1 (`ports/mono/bcl.sh`); ключ у неё
     // другой — тот же, что у System.Drawing из .NET Framework.
     ("System.Drawing.dll", "usr/lib/mono/gac/System.Drawing/4.0.0.0__b03f5f7f11d50a3a", "SYSDRAW.DLL"),
@@ -1074,6 +1080,10 @@ mod tests {
             "SYS_NETINFO" => abi::SYS_NETINFO as i64,
             "SYS_SOCKFD" => abi::SYS_SOCKFD as i64,
             "SYS_SOCKCTL" => abi::SYS_SOCKCTL as i64,
+            "SYS_FDCTL" => abi::SYS_FDCTL as i64,
+            "FDCTL_NONBLOCK" => abi::FDCTL_NONBLOCK as i64,
+            "FDCTL_FLAGS" => abi::FDCTL_FLAGS as i64,
+            "FD_NONBLOCK" => abi::FD_NONBLOCK,
             "SOCK_UDP" => abi::SOCK_UDP as i64,
             "SOCK_TCP" => abi::SOCK_TCP as i64,
             "SOCK_NONBLOCK" => abi::SOCK_NONBLOCK as i64,

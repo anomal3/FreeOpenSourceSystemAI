@@ -692,9 +692,14 @@ int ioctl(int fd, unsigned long op, void *param) {
         *(int *)param = (one.revents & POLLIN) != 0 ? 1 : 0;
         return 0;
     }
-    /* Неблокирующий режим — у сокета (фаза 65b). */
+    /* Неблокирующий режим — у сокета (фаза 65b) и канала (фаза 66b): тем
+     * же путём, что `fcntl(F_SETFL)`. */
     if (op == FIONBIO) {
-        return freeos_socket_set_nonblock(fd, *(int *)param != 0);
+        int flags = fcntl(fd, F_GETFL);
+        if (flags < 0) {
+            return -1;
+        }
+        return fcntl(fd, F_SETFL, *(int *)param != 0 ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK));
     }
     errno = ENOTTY;
     return -1;
@@ -774,6 +779,21 @@ static void uname_release(char *out, size_t size) {
         }
         line = next;
     }
+}
+
+/* Имя машины (фаза 66a) — то же, что `uname` кладёт в `nodename`. */
+int gethostname(char *name, size_t size) {
+    struct utsname about;
+    if (uname(&about) != 0) {
+        return -1;
+    }
+    size_t length = strlen(about.nodename);
+    if (length + 1 > size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(name, about.nodename, length + 1);
+    return 0;
 }
 
 int uname(struct utsname *name) {

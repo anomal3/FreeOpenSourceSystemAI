@@ -15,6 +15,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -641,4 +642,67 @@ const char *gai_strerror(int code) {
     default:
         return "address lookup failed";
     }
+}
+
+/* ── Интерфейсы (фаза 66a) ─────────────────────────────────────────────── */
+
+/* Один интерфейс — карта, которую поднял `net` ядра, с адресом из
+ * `SYS_NETINFO`. Сети нет или адреса ещё нет (DHCP не ответил) — список
+ * пуст, и это успех: интерфейсов с адресом действительно нет. Всё лежит
+ * одним куском, и `freeifaddrs` отдаёт его одним `free`. */
+struct one_interface {
+    struct ifaddrs entry;
+    struct sockaddr_in address;
+    struct sockaddr_in netmask;
+    struct sockaddr_in broadcast;
+    char name[IF_NAMESIZE];
+};
+
+int getifaddrs(struct ifaddrs **list) {
+    if (list == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *list = NULL;
+    struct freeos_netinfo net;
+    long code = freeos_syscall(SYS_NETINFO, (long)&net, sizeof(net), 0);
+    if (code < 0 || !net.present || net.address == 0) {
+        return 0;
+    }
+    struct one_interface *one = calloc(1, sizeof(*one));
+    if (one == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+    strcpy(one->name, "eth0");
+    one->address.sin_family = AF_INET;
+    one->address.sin_addr.s_addr = htonl(net.address);
+    one->netmask.sin_family = AF_INET;
+    one->netmask.sin_addr.s_addr = htonl(net.netmask);
+    one->broadcast.sin_family = AF_INET;
+    one->broadcast.sin_addr.s_addr = htonl(net.address | ~net.netmask);
+    one->entry.ifa_name = one->name;
+    one->entry.ifa_flags = IFF_UP | IFF_RUNNING | IFF_BROADCAST;
+    one->entry.ifa_addr = (struct sockaddr *)&one->address;
+    one->entry.ifa_netmask = (struct sockaddr *)&one->netmask;
+    one->entry.ifa_broadaddr = (struct sockaddr *)&one->broadcast;
+    *list = &one->entry;
+    return 0;
+}
+
+void freeifaddrs(struct ifaddrs *list) {
+    free(list);
+}
+
+unsigned int if_nametoindex(const char *name) {
+    return name != NULL && strcmp(name, "eth0") == 0 ? 1 : 0;
+}
+
+char *if_indextoname(unsigned int index, char *name) {
+    if (index != 1) {
+        errno = ENXIO;
+        return NULL;
+    }
+    strcpy(name, "eth0");
+    return name;
 }

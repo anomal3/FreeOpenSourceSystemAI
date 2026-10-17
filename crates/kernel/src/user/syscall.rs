@@ -191,6 +191,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         // Фаза 65a: сокет — дескриптор.
         user_abi::SYS_SOCKFD => sockfd(a0, a1),
         user_abi::SYS_SOCKCTL => sockctl(a0, a1, a2),
+        user_abi::SYS_FDCTL => fdctl(a0, a1, a2),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -239,6 +240,13 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
             return match socket.write(ptr, len) {
                 Ok(written) => written as i64,
                 Err(err) => err,
+            };
+        }
+        // Ждущий канал — тоже вне замка (фаза 66b).
+        if let Some(Some(waiting)) = super::with_current(|program| program.files.waiting_pipe(fd)) {
+            return match waiting {
+                super::files::Waiting::Write(writer) => pipe_write_waiting(&writer, ptr, len),
+                super::files::Waiting::Read(_) => ERR_PERMISSION,
             };
         }
         // В файл уходят байты как есть: это данные, а не текст, и требовать от
@@ -583,6 +591,13 @@ fn read(fd: usize, ptr: usize, len: usize) -> i64 {
         return match socket.read(ptr, len) {
             Ok(read) => read as i64,
             Err(err) => err,
+        };
+    }
+    // Ждущий канал — тоже вне замка (фаза 66b).
+    if let Some(Some(waiting)) = super::with_current(|program| program.files.waiting_pipe(fd)) {
+        return match waiting {
+            super::files::Waiting::Read(reader) => pipe_read_waiting(&reader, ptr, len),
+            super::files::Waiting::Write(_) => ERR_PERMISSION,
         };
     }
 
@@ -2351,5 +2366,87 @@ fn vfs_errno(err: VfsError) -> i64 {
         // самого устройства для программы — одно и то же: носитель не отдал
         // данные. Подробности ушли в журнал ядра, где им и место.
         VfsError::Corrupt | VfsError::OutOfBounds | VfsError::Io | VfsError::OutOfMemory => ERR_IO,
+    }
+}
+
+/// Самое долгое одно ожидание канала. Будит его смена поколения событий
+/// (канал сам зовёт `io_events::notify`), а срок — только чтобы оглядываться
+/// на снятие задачи.
+const PIPE_SLICE_MS: u64 = 250;
+
+/// `read` из ждущего канала (фаза 66b): данные, ноль — писателей больше нет.
+///
+/// Ждёт по поколению событий, как сокет: поколение запоминается **до**
+/// попытки, и сон наступает, только если оно не сменилось, — пробуждение не
+/// теряется. Буфер перепроверяется на каждой попытке: пока задача спала,
+/// поток той же программы мог отдать эту память.
+fn pipe_read_waiting(reader: &super::pipe::Reader, ptr: usize, len: usize) -> i64 {
+    loop {
+        let seen = crate::io_events::generation();
+        if !space::user_can(ptr, len, PageFlags::WRITE) {
+            return ERR_BAD_ADDRESS;
+        }
+        // SAFETY: диапазон только что проверен на запись; до конца попытки
+        // ядро его не отдаёт.
+        let buffer = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+        match reader.read(buffer, false) {
+            Ok(read) => return read as i64,
+            Err(super::pipe::PipeError::WouldBlock) => {}
+            Err(err) => return errno(super::files::FileError::Pipe(err)),
+        }
+        // Снятие происходит на возврате в третье кольцо; ожидание без срока
+        // туда не вернулось бы никогда.
+        if super::kill_pending() {
+            return ERR_AGAIN;
+        }
+        crate::io_events::wait(seen, Some(crate::time::uptime_ms() + PIPE_SLICE_MS));
+    }
+}
+
+/// `write` в ждущий канал: отдаёт **всё**, как `write` канала в Unix, ожидая
+/// места. Читатель исчез посреди — сколько ушло, а если ничего, то
+/// `ERR_BROKEN_PIPE`.
+fn pipe_write_waiting(writer: &super::pipe::Writer, ptr: usize, len: usize) -> i64 {
+    let mut done = 0usize;
+    loop {
+        let seen = crate::io_events::generation();
+        if !space::user_can(ptr, len, PageFlags::READ) {
+            return ERR_BAD_ADDRESS;
+        }
+        // SAFETY: диапазон только что проверен на чтение.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+        match writer.write(&bytes[done..], false) {
+            Ok(written) => {
+                done += written;
+                if done == len {
+                    return len as i64;
+                }
+                continue;
+            }
+            Err(super::pipe::PipeError::WouldBlock) => {}
+            Err(super::pipe::PipeError::Broken) if done > 0 => return done as i64,
+            Err(err) => return errno(super::files::FileError::Pipe(err)),
+        }
+        if super::kill_pending() {
+            return if done > 0 { done as i64 } else { ERR_AGAIN };
+        }
+        crate::io_events::wait(seen, Some(crate::time::uptime_ms() + PIPE_SLICE_MS));
+    }
+}
+
+/// `SYS_FDCTL` (фаза 66b): режим дескриптора — см. договор.
+fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
+    let result = super::with_current(|program| match op {
+        user_abi::FDCTL_NONBLOCK => program.files.set_nonblock(fd, arg != 0).map(|()| 0),
+        user_abi::FDCTL_FLAGS => program
+            .files
+            .nonblock(fd)
+            .map(|on| if on { user_abi::FD_NONBLOCK } else { 0 }),
+        _ => Ok(ERR_UNSUPPORTED),
+    });
+    match result {
+        Some(Ok(answer)) => answer,
+        Some(Err(err)) => errno(err),
+        None => ERR_NO_PROGRAM,
     }
 }

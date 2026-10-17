@@ -8206,6 +8206,88 @@ correctly signed by the trusted CA`.
 Урок стенда: файлы проекта не правятся, пока идёт замер — каждый сценарий
 пересобирает ядро и программы в начале, и правка попадает в замер наполовину.
 
+
+## Фаза 66a — Mono с сокетами — **сделано 2026-10-17**
+
+Mono собиралась с `--enable-minimal=sockets`: в фазе 58b libc отвечала на
+сокеты `ENOSYS`. С 65b они настоящие, и `sockets` из списка убран
+(`ports/mono/configure.sh`). Сеть Mono потребовала от libc того, чего в ней
+не было:
+
+- константы групповой рассылки (`IP_MULTICAST_*`, `IP_ADD_MEMBERSHIP`,
+  `IPV6_*`) и `struct ip_mreq`, `struct ipv6_mreq` в `netinet/in.h` — числа
+  Linux; самой рассылки у ядра нет, `setsockopt` отвечает `ENOPROTOOPT`;
+- `gethostname` — имя узла из `uname`;
+- `getifaddrs`/`freeifaddrs` (`<ifaddrs.h>`) и `<net/if.h>` (`IFF_*`,
+  `if_nametoindex`): один интерфейс `eth0` с адресом, маской и
+  широковещательным адресом из `SYS_NETINFO`; без адреса — пустой список.
+  У Mono для `mono_get_local_interfaces` два пути — `SIOCGIFCONF` и
+  `getifaddrs`, — и ни одного запасного.
+
+Проверка — `ports/mono/samples/net.cs` и сценарий `mono-net`.
+
+HTTP потребовал ещё двух вещей, и обе — не код:
+
+- **`Mono.Security.dll`** — на неё ссылается поле `HttpWebRequest.tlsProvider`,
+  и без неё не грузится сам тип, то есть не работает и обычный HTTP. Лежит в
+  том же monolite, что mscorlib, — едет рядом.
+- **`machine.config`** — `WebRequest` берёт схемы адресов (`http`, `https`)
+  из секции `webRequestModules`, и без файла отвечает «URI prefix is not
+  recognized». Файл штатный, из архива 6.14.1 (`data/net_4_5`). Ищет его
+  Mono в `<sysconfdir>/mono/4.5`, и **sysconfdir теперь `/usr/lib`**, а не
+  `/etc`: у живой системы `/etc` нет вовсе, у установленной он на разделе
+  состояния и обновлением образа не меняется. Так настройки Mono лежат в
+  образе рядом с mscorlib (`/usr/lib/mono/4.5/machine.config`) и
+  обновляются вместе с ним.
+
+Ловушки сборки: `make` Mono не замечает правки `config.h` (зависимостей от
+него нет) — объектники затронутых файлов удаляются руками; у Mono для
+`mono_get_local_interfaces` нет запасного пути вовсе — без `getifaddrs` или
+`SIOCGIFCONF` она не компонуется.
+
+### Проверено
+
+Сценарий `mono-net`, обе архитектуры, `net.exe`, собранный csc .NET
+Framework: `Dns` — адрес; `TcpClient` — соединение, эхо
+`mono-sockets-hello`, `LocalEndPoint` 10.0.2.15, `RemoteEndPoint`, конец
+потока нулём; `ConnectAsync`/`ReadAsync` — эхо через поток опроса пула Mono;
+`HttpWebRequest` — `200 'hello from the host'`; `WebClient` — ответ кусками;
+404 — `WebException` с кодом; `TcpListener` — клиент с хоста, эхо 11 байт.
+Регрессия: `mono`, `mono-forms`, `dotnet`, `install`, `installed` — зелёные.
+
+## Фаза 66b — ждущие каналы — **сделано 2026-10-17**
+
+Канал из таблицы файлов с фазы 39 **не ждал никогда**: пустой отвечал
+`ERR_AGAIN`, полный тоже. На этом стоят программы на Rust (`sshd` опрашивает
+свои каналы), а libc при этом считала каналы блокирующими и `O_NONBLOCK`
+отвергала — то есть блокирующий `read` из канала в программе на C получал
+`EAGAIN` сразу, вопреки POSIX.
+
+- **Договор `0x0001_000E`: `SYS_FDCTL` (81)** — режим дескриптора:
+  `FDCTL_NONBLOCK` (включить/снять «не ждать»), `FDCTL_FLAGS` (ответ —
+  `FD_NONBLOCK`). Смысл `SYS_PIPE` не меняется: каналы рождаются
+  неблокирующими. На сокете действует как `SOCKCTL_NONBLOCK`, на файле не
+  меняет ничего.
+- **Ядро**: у конца канала в таблице — режим (`Mode`, общий у копий `dup`, как
+  флаг открытого файла в Unix). Ждущий конец берётся из таблицы копией, и
+  ждут вне замка программы — по поколению событий, как сокет (фаза 65a):
+  канал сам зовёт `io_events::notify` на каждом изменении. Запись отдаёт всё,
+  как `write` канала в Unix; читатель исчез посреди — сколько ушло, иначе
+  `ERR_BROKEN_PIPE`. Буфер программы перепроверяется после каждого
+  пробуждения.
+- **libc**: `pipe()` — ждущий (POSIX), `pipe2(O_NONBLOCK)` — нет;
+  `fcntl(F_GETFL/F_SETFL)` и `ioctl(FIONBIO)` на канале — настоящие.
+
+Проверка — `cposix` (сценарий `libc`): блокирующий `read` дожидается
+писателя из другого потока (200 мс), конец — ноль, `pipe2(O_NONBLOCK)` —
+`EAGAIN`, `fcntl` видит и снимает `O_NONBLOCK`.
+
+Регрессия, debug, обе архитектуры: `install`, `libc` (шесть новых строк
+`cposix`), `abi` (65550), `pipe`, `stdin`, `ssh-exec`, `sftp` (`sshd` на
+неблокирующих каналах — как раньше) — зелёные. `pipe2` объявлен в нашем
+`unistd.h`: в POSIX.1-2024 он стандартный, а picolibc прячет его за
+`_GNU_SOURCE`.
+
 ---
 
 # TODO — записано, но не начато

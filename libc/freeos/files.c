@@ -407,24 +407,35 @@ int dup2(int fd, int to) {
     return copy < 0 ? freeos_set_errno(copy) : (int)copy;
 }
 
-int pipe(int fds[2]) {
+/* Канал ядра рождается неблокирующим (так `SYS_PIPE` работает для программ
+ * на Rust); канал Unix — ждущим. Режим ставит `SYS_FDCTL` (фаза 66b): ждёт
+ * ядро вне замка программы, будят его изменения канала. */
+static int pipe_with_mode(int fds[2], int nonblock) {
     long packed = freeos_syscall(SYS_PIPE, 0, 0, 0);
     if (packed < 0) {
         return freeos_set_errno(packed);
     }
     fds[0] = (int)(packed >> 32);
     fds[1] = (int)(packed & 0xffffffff);
+    if (!nonblock) {
+        freeos_syscall(SYS_FDCTL, fds[0], FREEOS_FDCTL_NONBLOCK, 0);
+        freeos_syscall(SYS_FDCTL, fds[1], FREEOS_FDCTL_NONBLOCK, 0);
+    }
     return 0;
 }
 
-/* `pipe2` (фаза 60): `O_CLOEXEC` у нас и так всегда (см. `fcntl` ниже), а
- * неблокирующих каналов нет — как и у `F_SETFL`. */
+int pipe(int fds[2]) {
+    return pipe_with_mode(fds, 0);
+}
+
+/* `pipe2`: `O_CLOEXEC` у нас и так всегда (см. `fcntl` ниже), `O_NONBLOCK`
+ * — настоящий с фазы 66b. */
 int pipe2(int fds[2], int flags) {
-    if ((flags & ~O_CLOEXEC) != 0) {
-        errno = (flags & O_NONBLOCK) != 0 ? ENOSYS : EINVAL;
+    if ((flags & ~(O_CLOEXEC | O_NONBLOCK)) != 0) {
+        errno = EINVAL;
         return -1;
     }
-    return pipe(fds);
+    return pipe_with_mode(fds, (flags & O_NONBLOCK) != 0);
 }
 
 /* `fcntl` — только то, что имеет смысл при нашей модели:
@@ -436,9 +447,10 @@ int pipe2(int fds[2], int flags) {
  *   программа не наследует дескрипторов вовсе (`SYS_LAUNCH` называет её потоки
  *   поимённо). Поставить флаг — можно, снять (попросить наследования) — нельзя,
  *   `ENOSYS`;
- * - `F_GETFL` — `O_RDWR`, у неблокирующего сокета ещё `O_NONBLOCK` (фаза
- *   65b); `O_APPEND` у нас не бывает. `F_SETFL` включает и снимает
- *   `O_NONBLOCK` у сокета; у файла и канала включить его — `ENOSYS`;
+ * - `F_GETFL` — `O_RDWR`, у неблокирующего сокета и канала ещё `O_NONBLOCK`
+ *   (фазы 65b, 66b); `O_APPEND` у нас не бывает. `F_SETFL` включает и
+ *   снимает `O_NONBLOCK` у сокета и канала; у файла он ничего не меняет —
+ *   файл не ждёт и так;
  * - блокировки (`F_GETLK`, `F_SETLK`, `F_SETLKW`) — `ENOSYS`: у ядра их нет. */
 int fcntl(int fd, int cmd, ...) {
     va_list args;
@@ -470,19 +482,26 @@ int fcntl(int fd, int cmd, ...) {
         }
         return 0;
     case F_GETFL:
+        if (S_ISFIFO(info.st_mode)) {
+            long flags = freeos_syscall(SYS_FDCTL, fd, FREEOS_FDCTL_FLAGS, 0);
+            if (flags < 0) {
+                return freeos_set_errno(flags);
+            }
+            return O_RDWR | ((flags & FREEOS_FD_NONBLOCK) ? O_NONBLOCK : 0);
+        }
         return O_RDWR | (freeos_socket_is_nonblock(fd) ? O_NONBLOCK : 0);
     case F_SETFL:
-        /* `O_NONBLOCK` — у сокета (фаза 65b); у файла и канала его нет. */
-        if (S_ISSOCK(info.st_mode)) {
-            if (arg & O_APPEND) {
-                errno = ENOSYS;
-                return -1;
-            }
-            return freeos_socket_set_nonblock(fd, (arg & O_NONBLOCK) != 0);
-        }
-        if (arg & (O_NONBLOCK | O_APPEND)) {
+        if (arg & O_APPEND) {
             errno = ENOSYS;
             return -1;
+        }
+        /* `O_NONBLOCK` — у сокета (фаза 65b) и канала (фаза 66b). */
+        if (S_ISSOCK(info.st_mode)) {
+            return freeos_socket_set_nonblock(fd, (arg & O_NONBLOCK) != 0);
+        }
+        if (S_ISFIFO(info.st_mode)) {
+            long code = freeos_syscall(SYS_FDCTL, fd, FREEOS_FDCTL_NONBLOCK, (arg & O_NONBLOCK) ? 1 : 0);
+            return code < 0 ? freeos_set_errno(code) : 0;
         }
         return 0;
     default:

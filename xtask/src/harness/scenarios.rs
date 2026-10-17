@@ -4371,6 +4371,14 @@ pub const ALL: &[Scenario] = &[
             Step::Await("cposix: ok access and readlink answer by stat", 15_000),
             Step::Await("cposix: ok pipe carries bytes and poll sees them", 15_000),
             Step::Await("cposix: ok fcntl says close-on-exec", 15_000),
+            // Ждущий канал (фаза 66b): блокирующий `read` дожидается писателя
+            // из другого потока, а не отвечает `EAGAIN`.
+            Step::Await("cposix: ok pipe() gives a blocking pipe", 15_000),
+            Step::Await("cposix: ok a blocking read waits for a late writer", 15_000),
+            Step::Await("cposix: ok the end of a pipe reads as zero", 15_000),
+            Step::Await("cposix: ok pipe2(O_NONBLOCK) says EAGAIN", 15_000),
+            Step::Await("cposix: ok fcntl sees O_NONBLOCK on a pipe", 15_000),
+            Step::Await("cposix: ok fcntl turns O_NONBLOCK off", 15_000),
             // Стандартные потоки видны `fstat` (фаза 60): без этого Mono не
             // открывала `Console`.
             Step::Await("cposix: ok fstat and fcntl see the standard streams as a terminal", 15_000),
@@ -8571,6 +8579,55 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "mono-net",
+        about: "Сеть из C# на Mono (фаза 66a): TcpClient и эхо хоста, ConnectAsync/ReadAsync, HttpWebRequest и WebClient к сайту стенда, TcpListener.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 2000,
+        host_echo: true,
+        host_repo: false,
+        host_site: true,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
+            Step::Wait(2_000),
+            // Программа идёт в фоне: после клиентских проверок она ждёт
+            // клиента с хоста (`TcpEcho` ниже).
+            Step::Line("run -b /bin/mono /usr/share/mono/net.exe {echo} {site} 2000"),
+            Step::AwaitAny("net: ok Dns gives the address", 180_000),
+            Step::AwaitAny("net: echoed 'mono-sockets-hello'", 60_000),
+            Step::AwaitAny("net: ok RemoteEndPoint names the server", 30_000),
+            Step::AwaitAny("net: ok the end of stream reads as zero", 30_000),
+            // Асинхронный ввод-вывод: его ждёт поток опроса пула Mono.
+            Step::AwaitAny("net: ok ConnectAsync and ReadAsync get the echo", 60_000),
+            Step::AwaitAny("net: http 200 'hello from the host'", 60_000),
+            Step::AwaitAny("net: ok WebClient reads a chunked answer", 60_000),
+            Step::AwaitAny("net: ok a missing page is 404", 60_000),
+            Step::AwaitAny("net: done, 0 check(s) failed", 30_000),
+            // Сервер: `TcpListener`, клиент с хоста, эхо до конца его потока.
+            Step::AwaitAny("net: listening on port 2000", 30_000),
+            Step::TcpEcho("hello to C#", 30_000),
+            Step::AwaitAny("net: accepted a client from 10.0.2.2", 30_000),
+            Step::AwaitAny("net: served 11 bytes", 30_000),
+            Step::Absent("net: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "mono",
         about: "Mono 6.14.1, собранная своим configure нашим набором, исполняет чужую сборку C# и JIT-ом, и интерпретатором — с тем же выводом, что .NET Framework.",
         // Живая: программа файлов не пишет, а библиотеки классов (фаза 60)
@@ -9580,7 +9637,8 @@ pub const ALL: &[Scenario] = &[
             // 65547 — `0x0001_000B`: `SYS_WINOWNER` (фаза 62d).
             // 65548 — `0x0001_000C`: `SYS_WINPOPUP`, `SYS_WINPLACE` (фаза 62e).
             // 65549 — `0x0001_000D`: сокеты-дескрипторы (фаза 65a).
-            Step::Await("posix: abi version 65549", 60_000),
+            // 65550 — `0x0001_000E`: `SYS_FDCTL`, ждущие каналы (фаза 66b).
+            Step::Await("posix: abi version 65550", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».

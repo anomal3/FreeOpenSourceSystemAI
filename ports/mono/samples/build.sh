@@ -27,3 +27,6 @@ MSYS2_ARG_CONV_EXCL='*' "$CSC" -nologo -optimize+ -target:winexe '-out:initrd\us
 # Фаза 62b: всплывающие окна, перетаскивание, размер формы столом, главное
 # меню — строки сверяет сценарий `mono-popups`.
 MSYS2_ARG_CONV_EXCL='*' "$CSC" -nologo -optimize+ -target:winexe '-out:initrd\usr\share\mono\popups.exe' 'ports\mono\samples\popups.cs'
+# Фаза 66a: сеть — сокеты, асинхронный ввод-вывод, HTTP. Эталона строк нет:
+# программе нужны эхо-сервер и сайт хоста, их поднимает сценарий `mono-net`.
+MSYS2_ARG_CONV_EXCL='*' "$CSC" -nologo -optimize+ '-out:initrd\usr\share\mono\net.exe' 'ports\mono\samples\net.cs'

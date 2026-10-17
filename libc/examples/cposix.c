@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +26,7 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures;
@@ -143,6 +145,53 @@ static void check_pipe(void) {
 /* Стандартные потоки открыты, и `fstat` это видит (фаза 60): за ними терминал,
  * то есть символьное устройство. Mono проверяет каждый из трёх потоков
  * `fcntl(fd, F_GETFL)` и без ответа не открывает `Console`. */
+/* Ждущий канал (фаза 66b). До неё канал из таблицы файлов не ждал никогда:
+ * пустой отвечал `EAGAIN`, и блокирующий `read` программы на C возвращался
+ * сразу. Писатель здесь — второй поток, который пишет с опозданием: `read`
+ * обязан дождаться его, а не вернуть ошибку. */
+static int late_writer_fd;
+
+static void *late_writer(void *unused) {
+    (void)unused;
+    struct timespec pause = {0, 200 * 1000 * 1000};
+    nanosleep(&pause, NULL);
+    write(late_writer_fd, "late", 4);
+    return NULL;
+}
+
+static void check_waiting_pipe(void) {
+    int ends[2];
+    if (pipe(ends) != 0) {
+        fail("a blocking read waits for a late writer");
+        return;
+    }
+    check((fcntl(ends[0], F_GETFL) & O_NONBLOCK) == 0, "pipe() gives a blocking pipe");
+    late_writer_fd = ends[1];
+    pthread_t thread;
+    pthread_create(&thread, NULL, late_writer, NULL);
+    char got[8] = {0};
+    ssize_t read_now = read(ends[0], got, sizeof(got));
+    check(read_now == 4 && memcmp(got, "late", 4) == 0, "a blocking read waits for a late writer");
+    pthread_join(thread, NULL);
+    /* Писателей не осталось — блокирующий `read` видит конец, ноль. */
+    close(ends[1]);
+    check(read(ends[0], got, sizeof(got)) == 0, "the end of a pipe reads as zero");
+    close(ends[0]);
+
+    int quick[2];
+    if (pipe2(quick, O_NONBLOCK) != 0) {
+        fail("pipe2(O_NONBLOCK) says EAGAIN");
+        return;
+    }
+    errno = 0;
+    check(read(quick[0], got, sizeof(got)) == -1 && errno == EAGAIN, "pipe2(O_NONBLOCK) says EAGAIN");
+    check((fcntl(quick[0], F_GETFL) & O_NONBLOCK) != 0, "fcntl sees O_NONBLOCK on a pipe");
+    check(fcntl(quick[0], F_SETFL, 0) == 0 && (fcntl(quick[0], F_GETFL) & O_NONBLOCK) == 0,
+          "fcntl turns O_NONBLOCK off");
+    close(quick[0]);
+    close(quick[1]);
+}
+
 static void check_standard(void) {
     struct stat in;
     struct stat out;
@@ -183,6 +232,7 @@ int main(int argc, char **argv) {
     check_cwd(dir);
     check_dirs(dir);
     check_pipe();
+    check_waiting_pipe();
     check_standard();
     check_process();
     printf("cposix: done, %d check(s) failed\n", failures);

@@ -51,10 +51,17 @@ LITE="$SRC/mcs/class/lib/monolite-linux/$GUID"
 OUT=build/toolchain/mono-bcl/4.5
 [ -f "$LITE/mscorlib.dll" ] || { echo "нет $LITE/mscorlib.dll"; exit 1; }
 mkdir -p "$OUT"
+# Mono.Security (фаза 66a) — на неё ссылается поле `HttpWebRequest.tlsProvider`:
+# без неё не грузится сам тип, то есть не работает и простой HTTP.
 for name in mscorlib.dll System.dll System.Core.dll \
-  System.Configuration.dll System.Xml.dll System.Security.dll System.Numerics.dll; do
+  System.Configuration.dll System.Xml.dll System.Security.dll System.Numerics.dll \
+  Mono.Security.dll; do
   cp "$LITE/$name" "$OUT/$name"
 done
+# Настройки рантайма (фаза 66a) — штатные, из того же архива: `WebRequest` берёт
+# из них схемы адресов (`webRequestModules`). Ищет их Mono в
+# `<sysconfdir>/mono/4.5`, а sysconfdir у нас — `/usr/lib` (`configure.sh`).
+cp "$SRC/data/net_4_5/machine.config" "$OUT/machine.config"
 echo "corlib $GUID -> $OUT"
 
 # Roslyn — из самого нового установленного .NET SDK.

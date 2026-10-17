@@ -1445,6 +1445,26 @@ pub const SYS_SOCKFD: usize = 79;
 /// семь, и аргумент у каждого умещается в одно число.
 pub const SYS_SOCKCTL: usize = 80;
 
+/// Режим дескриптора: `(дескриптор, действие, аргумент) -> ответ` (фаза 66b).
+///
+/// Действия — `FDCTL_*`. Нужен ради каналов: конец канала из таблицы файлов
+/// с фазы 39 **не ждёт** — пустой отвечает [`ERR_AGAIN`], полный тоже, — и на
+/// этом стоят программы на Rust (`sshd` опрашивает свои каналы). Смысл
+/// [`SYS_PIPE`] не меняется: каналы рождаются неблокирующими. Программе,
+/// которой нужен канал Unix — ждущий, — его включают здесь; libc делает это в
+/// `pipe()` сама. Ждёт ядро вне замка программы, как у сокетов (фаза 65a).
+///
+/// На сокете действует так же, как [`SOCKCTL_NONBLOCK`]; на файле ничего не
+/// меняет — файл не ждёт никогда.
+pub const SYS_FDCTL: usize = 81;
+
+/// [`SYS_FDCTL`]: ждать или нет. Аргумент — единица (не ждать) или ноль.
+pub const FDCTL_NONBLOCK: usize = 1;
+/// [`SYS_FDCTL`]: режим дескриптора. Ответ — [`FD_NONBLOCK`] или ноль.
+pub const FDCTL_FLAGS: usize = 2;
+/// Бит ответа [`FDCTL_FLAGS`]: дескриптор не ждёт.
+pub const FD_NONBLOCK: i64 = 1;
+
 /// [`SYS_WINSTYLE`]: размер окна может менять человек — уголком и кнопкой
 /// «развернуть».
 ///
@@ -1614,7 +1634,7 @@ pub const SYSINFO_DARK: u32 = 1;
 /// продолжает работать, потому что всё, что она знала, осталось на месте.
 /// Старшая — когда что-нибудь меняет смысл; такого пока не случалось, и
 /// случаться не должно.
-pub const ABI_VERSION: u32 = 0x0001_000D;
+pub const ABI_VERSION: u32 = 0x0001_000E;
 
 /// [`SYS_DUP`]: «дай самый маленький свободный номер».
 ///
@@ -2429,6 +2449,8 @@ mod tests {
         assert_eq!(WIN_OWNER_MODAL, 1);
         assert_eq!((SYS_WINPOPUP, SYS_WINPLACE), (77, 78));
         assert_eq!((SYS_SOCKFD, SYS_SOCKCTL), (79, 80));
+        assert_eq!(SYS_FDCTL, 81);
+        assert_eq!((FDCTL_NONBLOCK, FDCTL_FLAGS, FD_NONBLOCK), (1, 2, 1));
         assert_eq!((PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC), (0, 1, 2, 4));
         assert_eq!((MAP_HUGE, MAP_LAZY, MAP_JIT), (1, 2, 4));
         assert_eq!((FUTEX_CHANGED, FUTEX_TIMED_OUT), (1, 2));
@@ -2463,7 +2485,7 @@ mod tests {
             SYS_DEVICES, SYS_WINRESIZE, SYS_THREAD_CREATE, SYS_SET_TLS, SYS_THREAD_EXIT,
             SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_DEVICE_OPEN, SYS_DEVICE_MAP, SYS_DEVICE_WAIT,
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
-            SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL,
+            SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(
@@ -2633,7 +2655,8 @@ mod tests {
         // 0x0001_000D — сокеты-дескрипторы: [`SYS_SOCKFD`], [`SYS_SOCKCTL`],
         // [`KIND_SOCKET`], три кода ошибок соединения; [`MAX_OPEN_FILES`] —
         // тридцать два (фаза 65a).
-        assert_eq!(ABI_VERSION, 0x0001_000D);
+        // 0x0001_000E — [`SYS_FDCTL`]: ждущие каналы по просьбе (фаза 66b).
+        assert_eq!(ABI_VERSION, 0x0001_000E);
 
         assert_eq!(FD_STDIN, 0);
         assert_eq!(FD_STDOUT, 1);

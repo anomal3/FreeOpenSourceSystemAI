@@ -46,23 +46,29 @@ rm -rf "$W"; mkdir -p "$W"; cd "$W"
 # /dev/random на машине сборки (здесь это Windows), а у цели источник энтропии
 # есть — `getentropy` поверх `SYS_RANDOM`, её Mono и берёт первой.
 #
-# `--prefix=/usr --sysconfdir=/etc` (фаза 60): библиотеки классов Mono ищет
+# `--prefix=/usr` (фаза 60): библиотеки классов Mono ищет
 # по пути, вшитому при сборке, — `<prefix>/lib/mono/4.5/mscorlib.dll`, — потому
 # что узнать, откуда запущена, ей не у кого (`/proc/self/exe` у нас нет). Путь
 # тот же, что у пакетов Mono для Linux: `/usr/lib/mono`, настройки — `/etc/mono`.
 # `MSYS2_ARG_CONV_EXCL` обязателен: Git Bash молча переписывает аргумент
 # `--prefix=/usr` в `--prefix=C:/Program Files/Git/usr` — путь его же
 # установки, — и Mono во FreeOS искала бы mscorlib там.
+# `--sysconfdir=/usr/lib` (фаза 66a): настройки Mono (`mono/4.5/machine.config`
+# — без него `WebRequest` не знает ни одной схемы адреса) лежат в образе, рядом
+# с mscorlib, а не в `/etc`: у живой системы `/etc` нет вовсе, у установленной
+# он на разделе состояния, и обновление образа его не меняет.
 export MSYS2_ARG_CONV_EXCL='--prefix=;--sysconfdir='
 #
-# `--enable-minimal`: без сокетов (libc отвечает на них ENOSYS) и без
-# счётчиков, отладчика и присоединения. `processes` не выключается: в 6.14 без
-# них не собирается рантайм (функции `mono_w32process_*` исчезают целиком).
-../mono-src/mono-6.14.1/configure --host=$ARCH-freeos --prefix=/usr --sysconfdir=/etc \
+# `--enable-minimal`: без счётчиков, отладчика и присоединения. `processes`
+# не выключается: в 6.14 без них не собирается рантайм (функции
+# `mono_w32process_*` исчезают целиком). Сокеты выключались до фазы 66a, пока
+# libc отвечала на них ENOSYS; с фазы 65b они настоящие (`socket.c` поверх
+# сокетов-дескрипторов ядра), и `System.Net.Sockets` работает.
+../mono-src/mono-6.14.1/configure --host=$ARCH-freeos --prefix=/usr --sysconfdir=/usr/lib \
   CXX=$ARCH-freeos-cc CXXCPP="$ARCH-freeos-cc -E" LD=$ARCH-freeos-ld OBJDUMP=$ARCH-freeos-objdump \
   ac_cv_have_dev_random=yes \
   --disable-boehm --with-sgen=yes --enable-cooperative-suspend --with-sigaltstack=no \
   --with-tls=__thread --disable-mcs-build --disable-btls --disable-nls --without-ikvm-native \
   --with-static_mono=yes --with-shared_mono=no --disable-dtrace --disable-support-build \
   --with-libgdiplus=no \
-  --enable-minimal=sockets,perfcounters,shared_perfcounters,attach,lldb,mdb
+  --enable-minimal=perfcounters,shared_perfcounters,attach,lldb,mdb

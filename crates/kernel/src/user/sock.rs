@@ -70,7 +70,7 @@ impl Sock {
         self.nonblock.store(on, Ordering::Relaxed);
     }
 
-    fn nonblock(&self) -> bool {
+    pub fn nonblock(&self) -> bool {
         self.nonblock.load(Ordering::Relaxed)
     }
 

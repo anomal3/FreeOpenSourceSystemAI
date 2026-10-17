@@ -76,6 +76,8 @@
 #define SYS_NETINFO 33
 #define SYS_SOCKFD 79
 #define SYS_SOCKCTL 80
+/* Режим дескриптора — ждущие каналы (фаза 66b). */
+#define SYS_FDCTL 81
 
 /* ── Значения, которые эти вызовы принимают и возвращают ──────────────────── */
 
@@ -112,6 +114,11 @@
 #define FREEOS_SOCKCTL_SHUTDOWN 5
 #define FREEOS_SOCKCTL_NONBLOCK 6
 #define FREEOS_SOCKCTL_INFO 7
+
+/* Действия `SYS_FDCTL` и бит его ответа (фаза 66b). */
+#define FREEOS_FDCTL_NONBLOCK 1
+#define FREEOS_FDCTL_FLAGS 2
+#define FREEOS_FD_NONBLOCK 1
 
 /* `кто` у `SYS_SPAWN`: запустить с теми же правами, что у запускающего.
  * Минус единица, а не ноль: ноль — это root, то есть совсем другая просьба. */
