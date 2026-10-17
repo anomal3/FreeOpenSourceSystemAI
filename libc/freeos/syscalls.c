@@ -27,6 +27,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <freeos/sound.h>
 #include <signal.h>
 #include <stdint.h>
 #include <string.h>
@@ -649,4 +650,16 @@ int sigprocmask(int how, const sigset_t *set, sigset_t *old) {
     (void)old;
     errno = ENOSYS;
     return -1;
+}
+
+/* ── Звук (фаза 67f) ───────────────────────────────────────────────────── */
+
+ssize_t freeos_sound_write(const void *samples, size_t bytes) {
+    long done = freeos_syscall(SYS_SOUND, FREEOS_SOUND_WRITE, (long)samples, (long)bytes);
+    return done < 0 ? freeos_set_errno(done) : (ssize_t)done;
+}
+
+int freeos_sound_drain(void) {
+    long code = freeos_syscall(SYS_SOUND, FREEOS_SOUND_DRAIN, 0, 0);
+    return code < 0 ? freeos_set_errno(code) : 0;
 }

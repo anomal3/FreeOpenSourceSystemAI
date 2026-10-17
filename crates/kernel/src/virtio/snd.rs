@@ -12,8 +12,15 @@
 //!
 //! # Чего нет
 //!
-//! Записи (поток ввода), уведомлений (`eventq`), других форматов и частот, и
-//! интерфейса для программ — пока звук играет только ядро (команда `beep`).
+//! Записи (поток ввода), уведомлений (`eventq`), других форматов и частот.
+//!
+//! # Поток, а не отдельные звуки (фаза 67f)
+//!
+//! Программа отдаёт отсчёты порциями любого размера (`SYS_SOUND`), и поток
+//! между вызовами не прерывается: недолитый период копится, пока не
+//! наполнится, поток запускается, когда в очереди два периода, а
+//! останавливается только по `drain` — когда сыграно всё. Порция в сотню
+//! кадров поэтому не превращается в период тишины с щелчком.
 
 use core::sync::atomic::{Ordering, fence};
 
@@ -74,6 +81,13 @@ struct VirtioSnd {
     slots: [DmaBuffer; SLOTS],
     /// Выходной поток, которому задан формат.
     stream: u32,
+    /// Период в очереди устройства.
+    in_flight: [bool; SLOTS],
+    /// Период, который ещё доливается: место и сколько байт в нём.
+    filling: Option<(usize, usize)>,
+    /// Поток подготовлен (`PCM_PREPARE`) и запущен (`PCM_START`).
+    prepared: bool,
+    started: bool,
 }
 
 /// Есть ли звук.
@@ -119,8 +133,39 @@ pub fn play_tone(hz: u32, ms: u32) -> Result<(), VirtioError> {
     let snd = guard.as_mut().ok_or(VirtioError::NoCapabilities)?;
     let frames = u64::from(SAMPLE_RATE) * u64::from(ms) / 1000;
     let mut tone = Tone::new(hz);
-    snd.play(frames, &mut tone)
+    let mut period = [0u8; PERIOD_BYTES];
+    let mut left = frames;
+    while left > 0 {
+        let take = left.min((PERIOD_BYTES / 4) as u64) as usize;
+        for frame in 0..take {
+            let value = tone.next().to_le_bytes();
+            period[frame * 4..frame * 4 + 2].copy_from_slice(&value);
+            period[frame * 4 + 2..frame * 4 + 4].copy_from_slice(&value);
+        }
+        snd.feed(&period[..take * 4])?;
+        left -= take as u64;
+    }
+    snd.drain()
 }
+
+/// Отдать устройству отсчёты (16 бит со знаком, два канала, 48 кГц): ждёт,
+/// пока для них найдётся место в очереди, — темп задаёт устройство.
+/// Хвост меньше периода копится до следующего вызова или до [`drain`].
+pub fn feed(bytes: &[u8]) -> Result<(), VirtioError> {
+    let mut guard = SND.lock();
+    let snd = guard.as_mut().ok_or(VirtioError::NoCapabilities)?;
+    snd.feed(bytes)
+}
+
+/// Доиграть всё отданное и остановить поток.
+pub fn drain() -> Result<(), VirtioError> {
+    let mut guard = SND.lock();
+    let snd = guard.as_mut().ok_or(VirtioError::NoCapabilities)?;
+    snd.drain()
+}
+
+/// Байт в периоде — столько стоит отдавать за раз, чтобы не ждать зря.
+pub const PERIOD: usize = PERIOD_BYTES;
 
 /// Синус на целых числах: фаза — 32-битный счётчик, отсчёт — по приближению
 /// Бхаскары I, `16x(π−x) / (5π² − 4x(π−x))`. Погрешность — доли процента:
@@ -181,7 +226,18 @@ impl VirtioSnd {
                 transport.device_config8(7),
             ])
         };
-        let mut snd = Self { _transport: transport, control, tx, command, slots, stream: 0 };
+        let mut snd = Self {
+            _transport: transport,
+            control,
+            tx,
+            command,
+            slots,
+            stream: 0,
+            in_flight: [false; SLOTS],
+            filling: None,
+            prepared: false,
+            started: false,
+        };
         snd.stream = snd.find_output(streams)?;
         snd.set_params()?;
         Ok(snd)
@@ -233,82 +289,129 @@ impl VirtioSnd {
         self.submit(8, 4)
     }
 
-    /// Сыграть `frames` кадров, которые даёт `tone`.
-    fn play(&mut self, frames: u64, tone: &mut Tone) -> Result<(), VirtioError> {
-        self.stream_command(R_PCM_PREPARE)?;
-        let frames_per_period = (PERIOD_BYTES / 4) as u64;
-        let periods = frames.div_ceil(frames_per_period).max(1);
-        let mut queued = 0u64;
-        let mut done = 0u64;
-        let mut started = false;
-        // Сначала очередь заполняется, и только потом поток запускается: иначе
-        // устройство начнёт с пустоты.
-        while queued < periods.min(SLOTS as u64) {
-            self.fill_and_offer(queued as usize, tone);
-            queued += 1;
+    /// Долить отсчёты в периоды и отдать полные устройству.
+    fn feed(&mut self, mut bytes: &[u8]) -> Result<(), VirtioError> {
+        // Кадр — четыре байта; обрывок кадра отбрасывается, а не сдвигает
+        // каналы местами до конца звука.
+        let whole = bytes.len() / 4 * 4;
+        bytes = &bytes[..whole];
+        if !self.prepared {
+            self.stream_command(R_PCM_PREPARE)?;
+            self.prepared = true;
         }
-        self.tx.kick();
-        let result = (|| {
+        while !bytes.is_empty() {
+            let (slot, used) = match self.filling {
+                Some(filling) => filling,
+                None => (self.free_slot()?, 0),
+            };
+            let take = (PERIOD_BYTES - used).min(bytes.len());
+            // SAFETY: место не в очереди устройства — его никто не читает;
+            // смещения внутри буфера периода.
+            unsafe {
+                let data = self.slots[slot].as_ptr::<u8>().add(SLOT_DATA + used);
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, take);
+            }
+            bytes = &bytes[take..];
+            if used + take == PERIOD_BYTES {
+                self.filling = None;
+                self.offer(slot, PERIOD_BYTES)?;
+            } else {
+                self.filling = Some((slot, used + take));
+            }
+        }
+        Ok(())
+    }
+
+    /// Доиграть всё и остановить поток.
+    fn drain(&mut self) -> Result<(), VirtioError> {
+        if let Some((slot, used)) = self.filling.take() {
+            self.offer(slot, used)?;
+        }
+        if self.in_flight.iter().any(|busy| *busy) && !self.started {
             self.stream_command(R_PCM_START)?;
-            started = true;
-            let deadline = crate::time::uptime_ms() + periods * 50 + 2_000;
-            while done < periods {
-                match self.tx.take_used() {
-                    Some((head, _)) => {
-                        done += 1;
-                        let slot = usize::from(head) / 3;
-                        let status = self.slot_u32(slot, SLOT_STATUS);
-                        if status != S_OK {
-                            return Err(VirtioError::RequestFailed((status & 0xff) as u8));
-                        }
-                        if queued < periods {
-                            self.fill_and_offer(slot, tone);
-                            self.tx.kick();
-                            queued += 1;
-                        }
-                    }
-                    None => {
-                        if crate::time::uptime_ms() > deadline {
-                            return Err(VirtioError::Timeout);
-                        }
-                        crate::sched::sleep_ms(2);
-                    }
-                }
+            self.started = true;
+        }
+        let result = (|| {
+            while self.in_flight.iter().any(|busy| *busy) {
+                self.reclaim(true)?;
             }
             Ok(())
         })();
-        if started {
+        if self.started {
             let _ = self.stream_command(R_PCM_STOP);
+            self.started = false;
         }
-        let _ = self.stream_command(R_PCM_RELEASE);
-        // Неотданные периоды забираются — иначе следующий звук начнётся с них.
+        if self.prepared {
+            let _ = self.stream_command(R_PCM_RELEASE);
+            self.prepared = false;
+        }
+        // Что не вернулось — забирается: следующий звук не начнётся с него.
         while self.tx.take_used().is_some() {}
+        self.in_flight = [false; SLOTS];
         result
     }
 
-    /// Заполнить период и поставить его в очередь.
-    fn fill_and_offer(&mut self, slot: usize, tone: &mut Tone) {
+    /// Свободное место под период — ждёт, пока устройство вернёт сыгранный.
+    fn free_slot(&mut self) -> Result<usize, VirtioError> {
+        loop {
+            if let Some(slot) = self.in_flight.iter().position(|busy| !*busy) {
+                return Ok(slot);
+            }
+            self.reclaim(true)?;
+        }
+    }
+
+    /// Забрать сыгранные периоды. `wait` — ждать хотя бы одного.
+    fn reclaim(&mut self, wait: bool) -> Result<(), VirtioError> {
+        // Срок — на случай устройства, которое не играет вовсе: четыре
+        // периода — меньше десятой секунды, секунда с запасом.
+        let deadline = crate::time::uptime_ms() + 1_000;
+        loop {
+            let mut any = false;
+            while let Some((head, _)) = self.tx.take_used() {
+                any = true;
+                let slot = usize::from(head) / 3;
+                if slot < SLOTS {
+                    self.in_flight[slot] = false;
+                    let status = self.slot_u32(slot, SLOT_STATUS);
+                    if status != S_OK {
+                        return Err(VirtioError::RequestFailed((status & 0xff) as u8));
+                    }
+                }
+            }
+            if any || !wait {
+                return Ok(());
+            }
+            if crate::time::uptime_ms() > deadline {
+                return Err(VirtioError::Timeout);
+            }
+            crate::sched::sleep_ms(2);
+        }
+    }
+
+    /// Отдать период устройству и, когда в очереди их два, запустить поток.
+    fn offer(&mut self, slot: usize, bytes: usize) -> Result<(), VirtioError> {
         let buffer = &self.slots[slot];
-        // SAFETY: буфер выделен на `SLOT_SIZE` и принадлежит драйверу; пока
-        // период не в очереди, устройство его не читает.
+        // SAFETY: буфер принадлежит драйверу и не в очереди устройства.
         unsafe {
             let base = buffer.as_ptr::<u8>();
             base.cast::<u32>().write_volatile(self.stream);
-            let samples = base.add(SLOT_DATA).cast::<i16>();
-            for frame in 0..PERIOD_BYTES / 4 {
-                let value = tone.next();
-                samples.add(frame * 2).write_volatile(value);
-                samples.add(frame * 2 + 1).write_volatile(value);
-            }
             base.add(SLOT_STATUS).cast::<u32>().write_volatile(0xFFFF_FFFF);
         }
         let phys = buffer.phys().as_u64();
         let head = (slot * 3) as u16;
         self.tx.set_descriptor(head, phys, 4, DESC_F_NEXT, head + 1);
-        self.tx.set_descriptor(head + 1, phys + SLOT_DATA as u64, PERIOD_BYTES as u32, DESC_F_NEXT, head + 2);
+        self.tx.set_descriptor(head + 1, phys + SLOT_DATA as u64, bytes as u32, DESC_F_NEXT, head + 2);
         self.tx.set_descriptor(head + 2, phys + SLOT_STATUS as u64, 8, DESC_F_WRITE, 0);
         fence(Ordering::SeqCst);
         self.tx.offer(head);
+        self.tx.kick();
+        self.in_flight[slot] = true;
+        if !self.started && self.in_flight.iter().filter(|busy| **busy).count() >= 2 {
+            self.stream_command(R_PCM_START)?;
+            self.started = true;
+        }
+        Ok(())
     }
 
     fn slot_u32(&self, slot: usize, at: usize) -> u32 {

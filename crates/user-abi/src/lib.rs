@@ -1465,6 +1465,26 @@ pub const FDCTL_FLAGS: usize = 2;
 /// Бит ответа [`FDCTL_FLAGS`]: дескриптор не ждёт.
 pub const FD_NONBLOCK: i64 = 1;
 
+/// Звук: `(действие, адрес, длина) -> ответ` (фаза 67f).
+///
+/// Действия — `SOUND_*`. Отсчёты — 16 бит со знаком, little-endian, два канала
+/// вперемежку, [`SOUND_RATE`] кадров в секунду; формат один, и он же у
+/// устройства, так что ядро ничего не пересчитывает. Запись **ждёт**, пока
+/// для отсчётов найдётся место в очереди устройства, — темп задаёт звуковая
+/// карта, как у записи в канал его задаёт читатель. Нет звуковой карты —
+/// [`ERR_UNSUPPORTED`].
+pub const SYS_SOUND: usize = 82;
+
+/// [`SYS_SOUND`]: отдать отсчёты. Ответ — сколько байт принято (обрывок кадра
+/// в конце не принимается).
+pub const SOUND_WRITE: usize = 1;
+/// [`SYS_SOUND`]: доиграть всё отданное и остановить поток.
+pub const SOUND_DRAIN: usize = 2;
+/// Кадров в секунду у [`SYS_SOUND`].
+pub const SOUND_RATE: u32 = 48_000;
+/// Каналов у [`SYS_SOUND`].
+pub const SOUND_CHANNELS: u32 = 2;
+
 /// [`SYS_WINSTYLE`]: размер окна может менять человек — уголком и кнопкой
 /// «развернуть».
 ///
@@ -1634,7 +1654,7 @@ pub const SYSINFO_DARK: u32 = 1;
 /// продолжает работать, потому что всё, что она знала, осталось на месте.
 /// Старшая — когда что-нибудь меняет смысл; такого пока не случалось, и
 /// случаться не должно.
-pub const ABI_VERSION: u32 = 0x0001_000E;
+pub const ABI_VERSION: u32 = 0x0001_000F;
 
 /// [`SYS_DUP`]: «дай самый маленький свободный номер».
 ///
@@ -2451,6 +2471,8 @@ mod tests {
         assert_eq!((SYS_SOCKFD, SYS_SOCKCTL), (79, 80));
         assert_eq!(SYS_FDCTL, 81);
         assert_eq!((FDCTL_NONBLOCK, FDCTL_FLAGS, FD_NONBLOCK), (1, 2, 1));
+        assert_eq!(SYS_SOUND, 82);
+        assert_eq!((SOUND_WRITE, SOUND_DRAIN, SOUND_RATE, SOUND_CHANNELS), (1, 2, 48_000, 2));
         assert_eq!((PROT_NONE, PROT_READ, PROT_WRITE, PROT_EXEC), (0, 1, 2, 4));
         assert_eq!((MAP_HUGE, MAP_LAZY, MAP_JIT), (1, 2, 4));
         assert_eq!((FUTEX_CHANGED, FUTEX_TIMED_OUT), (1, 2));
@@ -2486,6 +2508,7 @@ mod tests {
             SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_DEVICE_OPEN, SYS_DEVICE_MAP, SYS_DEVICE_WAIT,
             SYS_DMA_ALLOC, SYS_MPROTECT, SYS_THREAD_INFO, SYS_WINSTYLE, SYS_WINTITLE,
             SYS_WINOWNER, SYS_WINPOPUP, SYS_WINPLACE, SYS_SOCKFD, SYS_SOCKCTL, SYS_FDCTL,
+            SYS_SOUND,
         ];
         for (at, number) in numbers.iter().enumerate() {
             assert!(
@@ -2656,7 +2679,8 @@ mod tests {
         // [`KIND_SOCKET`], три кода ошибок соединения; [`MAX_OPEN_FILES`] —
         // тридцать два (фаза 65a).
         // 0x0001_000E — [`SYS_FDCTL`]: ждущие каналы по просьбе (фаза 66b).
-        assert_eq!(ABI_VERSION, 0x0001_000E);
+        // 0x0001_000F — [`SYS_SOUND`]: звук для программ (фаза 67f).
+        assert_eq!(ABI_VERSION, 0x0001_000F);
 
         assert_eq!(FD_STDIN, 0);
         assert_eq!(FD_STDOUT, 1);

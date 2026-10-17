@@ -192,6 +192,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_SOCKFD => sockfd(a0, a1),
         user_abi::SYS_SOCKCTL => sockctl(a0, a1, a2),
         user_abi::SYS_FDCTL => fdctl(a0, a1, a2),
+        user_abi::SYS_SOUND => sound(a0, a1, a2),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -2448,5 +2449,45 @@ fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
         Some(Ok(answer)) => answer,
         Some(Err(err)) => errno(err),
         None => ERR_NO_PROGRAM,
+    }
+}
+
+/// `SYS_SOUND` (фаза 67f): звук — см. договор.
+///
+/// Отсчёты копируются из памяти программы периодами и отдаются драйверу; между
+/// периодами — проверка снятия задачи, потому что запись ждёт звуковую карту,
+/// и ждать она может секундами. Память программы перепроверяется на каждом
+/// куске: пока задача ждала, поток той же программы мог её отдать.
+fn sound(op: usize, ptr: usize, len: usize) -> i64 {
+    if !crate::virtio::snd::present() {
+        return ERR_UNSUPPORTED;
+    }
+    match op {
+        user_abi::SOUND_WRITE => {
+            let mut chunk = alloc::vec![0u8; crate::virtio::snd::PERIOD];
+            let mut done = 0usize;
+            while done < len {
+                if super::kill_pending() {
+                    break;
+                }
+                let take = (len - done).min(chunk.len());
+                if !space::user_can(ptr + done, take, PageFlags::READ) {
+                    return if done > 0 { done as i64 } else { ERR_BAD_ADDRESS };
+                }
+                // SAFETY: диапазон только что проверен на чтение.
+                let bytes = unsafe { core::slice::from_raw_parts((ptr + done) as *const u8, take) };
+                chunk[..take].copy_from_slice(bytes);
+                if crate::virtio::snd::feed(&chunk[..take]).is_err() {
+                    return if done > 0 { done as i64 } else { ERR_IO };
+                }
+                done += take;
+            }
+            (done / 4 * 4) as i64
+        }
+        user_abi::SOUND_DRAIN => match crate::virtio::snd::drain() {
+            Ok(()) => 0,
+            Err(_) => ERR_IO,
+        },
+        _ => ERR_UNSUPPORTED,
     }
 }

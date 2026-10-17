@@ -1686,7 +1686,8 @@ pub const ALL: &[Scenario] = &[
             // Пятьдесят — `sockfd` (фаза 65a). Пятьдесят одна — `cnet` (фаза 65b).
             // Пятьдесят две — `ctls` (фаза 65c), едет, только если собран mbedTLS.
             // Пятьдесят три — `curl` (фаза 65d), если собран `thirdparty`.
-            Step::Expect("/bin holds 53 programs"),
+            // Пятьдесят четыре — `csound` (фаза 67f).
+            Step::Expect("/bin holds 54 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -1818,6 +1819,44 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_000),
             Step::Tone(440),
             Step::Absent("beep     failed"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "csound",
+        about: "Звук из программы на C (фаза 67f): SYS_SOUND через <freeos/sound.h>, порции разного размера — в WAV у QEMU тон 660 Гц.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
+        steps: &[
+            Step::AwaitAny("virtio-snd  : at ", BOOT),
+            Step::Await("freeos> ", BOOT),
+            Step::Wait(2_000),
+            // Полторы секунды — порциями в 100, 1000 и 3000 кадров: меньше
+            // периода устройства, больше и не кратно. Дыры между порциями
+            // сбили бы счёт пересечений нуля и громкий участок.
+            Step::Line("run /bin/csound 660 1500"),
+            Step::Await("csound: played 72000 frames of 660 Hz", 30_000),
+            Step::Wait(1_000),
+            Step::Tone(660),
+            Step::Absent("csound: FAILED"),
+            Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],
     },
@@ -9856,7 +9895,8 @@ pub const ALL: &[Scenario] = &[
             // 65548 — `0x0001_000C`: `SYS_WINPOPUP`, `SYS_WINPLACE` (фаза 62e).
             // 65549 — `0x0001_000D`: сокеты-дескрипторы (фаза 65a).
             // 65550 — `0x0001_000E`: `SYS_FDCTL`, ждущие каналы (фаза 66b).
-            Step::Await("posix: abi version 65550", 60_000),
+            // 65551 — `0x0001_000F`: `SYS_SOUND`, звук для программ (фаза 67f).
+            Step::Await("posix: abi version 65551", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».

@@ -167,7 +167,7 @@ pub struct CProgram {
 }
 
 /// Программы на C, которые едут в `/bin`.
-pub const C_PROGRAMS: [CProgram; 10] = [
+pub const C_PROGRAMS: [CProgram; 11] = [
     CProgram { name: "cdemo", needs: None, libs: &[], includes: &[] },
     // Переполняет свой стек нарочно: доказывает, что канарейка стека есть и у
     // программ на C. См. `libc/examples/csmash.c` и `__stack_chk_fail` в `crt0.c`.
@@ -184,6 +184,9 @@ pub const C_PROGRAMS: [CProgram; 10] = [
     // Сеть из C через сокеты BSD: клиент, сервер, имена (фаза 65b). См.
     // `libc/examples/cnet.c`.
     CProgram { name: "cnet", needs: None, libs: &[], includes: &[] },
+    // Звук из C (фаза 67f): синус порциями разного размера через
+    // `<freeos/sound.h>`. См. `libc/examples/csound.c`.
+    CProgram { name: "csound", needs: None, libs: &[], includes: &[] },
     // Память кода: функция, записанная в память и вызванная, пока второй
     // поток её исполняет, — W^X по обращению (фаза 59). См. `libc/examples/cjit.c`.
     CProgram { name: "cjit", needs: None, libs: &[], includes: &[] },
@@ -1084,6 +1087,11 @@ mod tests {
             "FDCTL_NONBLOCK" => abi::FDCTL_NONBLOCK as i64,
             "FDCTL_FLAGS" => abi::FDCTL_FLAGS as i64,
             "FD_NONBLOCK" => abi::FD_NONBLOCK,
+            "SYS_SOUND" => abi::SYS_SOUND as i64,
+            "SOUND_WRITE" => abi::SOUND_WRITE as i64,
+            "SOUND_DRAIN" => abi::SOUND_DRAIN as i64,
+            "SOUND_RATE" => i64::from(abi::SOUND_RATE),
+            "SOUND_CHANNELS" => i64::from(abi::SOUND_CHANNELS),
             "SOCK_UDP" => abi::SOCK_UDP as i64,
             "SOCK_TCP" => abi::SOCK_TCP as i64,
             "SOCK_NONBLOCK" => abi::SOCK_NONBLOCK as i64,

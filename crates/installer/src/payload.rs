@@ -293,7 +293,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 54] = [
+const PROGRAMS: [(&CStr16, &str); 55] = [
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),
@@ -364,6 +364,8 @@ const PROGRAMS: [(&CStr16, &str); 54] = [
     // Слой POSIX под чужую среду исполнения (фаза 58b).
     (cstr16!("\\FREEOS\\BIN\\CPOSIX"), "cposix"),
     (cstr16!("\\FREEOS\\BIN\\CNET"), "cnet"),
+    // Звук из C (фаза 67f).
+    (cstr16!("\\FREEOS\\BIN\\CSOUND"), "csound"),
     (cstr16!("\\FREEOS\\BIN\\CJIT"), "cjit"),
     (cstr16!("\\FREEOS\\BIN\\CDRAW"), "cdraw"),
     // HTTPS из C через mbedTLS (фаза 65c) — едет, только если он собран.

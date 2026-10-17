@@ -78,6 +78,8 @@
 #define SYS_SOCKCTL 80
 /* Режим дескриптора — ждущие каналы (фаза 66b). */
 #define SYS_FDCTL 81
+/* Звук (фаза 67f). */
+#define SYS_SOUND 82
 
 /* ── Значения, которые эти вызовы принимают и возвращают ──────────────────── */
 
@@ -119,6 +121,12 @@
 #define FREEOS_FDCTL_NONBLOCK 1
 #define FREEOS_FDCTL_FLAGS 2
 #define FREEOS_FD_NONBLOCK 1
+
+/* Действия `SYS_SOUND` и его формат (фаза 67f). */
+#define FREEOS_SOUND_WRITE 1
+#define FREEOS_SOUND_DRAIN 2
+#define FREEOS_SOUND_RATE 48000
+#define FREEOS_SOUND_CHANNELS 2
 
 /* `кто` у `SYS_SPAWN`: запустить с теми же правами, что у запускающего.
  * Минус единица, а не ноль: ноль — это root, то есть совсем другая просьба. */
