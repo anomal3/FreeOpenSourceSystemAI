@@ -50,9 +50,10 @@
 //! `keep-alive` означала бы уметь понимать, где кончился ответ, ещё одним
 //! способом.
 
-use crate::{
-    close_socket, connect, random, recv, resolve, send_waiting, shutdown, sleep_ms, stream,
-    stream_state, uptime_ms, wait_connected,
+use crate::{close, poll, random, read, resolve, sock_info, sockctl, sockfd, uptime_ms, write};
+use user_abi::{
+    ERR_AGAIN, ERR_IN_PROGRESS, POLL_IN, POLL_OUT, PollFd, SOCKCTL_CONNECT, SOCKCTL_SHUTDOWN,
+    SockInfo,
 };
 
 /// Сколько ждать установления связи.
@@ -75,6 +76,14 @@ const HANDSHAKE_TIMEOUT_MS: u64 = 60_000;
 
 /// Сколько ждать продолжения тела, если оно перестало идти.
 const BODY_STALL_MS: u64 = 30_000;
+
+/// Сколько ждать места на отправку, прежде чем назвать соединение зависшим.
+const SEND_TIMEOUT_MS: u64 = 30_000;
+
+/// Самое долгое одно ожидание данных. Срок у каждого ожидания свой (заголовок,
+/// рукопожатие, тело), и проверяется он между ожиданиями, — так что это не
+/// срок, а только то, как часто на него оглядываются.
+const WAIT_SLICE_MS: u64 = 500;
 
 /// Сколько байт заголовка ответа клиент согласен прочитать.
 ///
@@ -347,17 +356,113 @@ fn once(
     sink: &mut impl FnMut(&[u8]) -> bool,
     next: &mut Location,
 ) -> Result<Option<Response>, Error> {
-    let socket = stream();
-    if socket < 0 {
-        return Err(Error::NoSocket);
-    }
-    let result = exchange(socket, url, address, trust, io, sink, next);
-    close_socket(socket);
+    let socket = Socket::open()?;
+    let result = exchange(&socket, url, address, trust, io, sink, next);
+    socket.close();
     result
 }
 
+/// Соединение TCP — сокет-дескриптор (фаза 65e).
+///
+/// До 65e клиент сидел на старых сокетах, которые нельзя ждать: пустой сокет
+/// означал `sleep_ms(2)` и новый вопрос, и каждое такое «пока нечего» стоило
+/// тика планировщика, а на загрузке их тысячи. Дескриптор ждётся `SYS_POLL`, и
+/// ядро будит ждущего по событию сети (фаза 65a) — сразу, как пришёл сегмент.
+///
+/// Сокет неблокирующий: чтение и запись не ждут сами, ждёт [`Socket::wait`].
+/// Так у каждого ожидания остаётся свой срок и свои слова для его исхода.
+struct Socket {
+    fd: i64,
+}
+
+impl Socket {
+    fn open() -> Result<Self, Error> {
+        let fd = sockfd(true, true);
+        if fd < 0 {
+            return Err(Error::NoSocket);
+        }
+        Ok(Self { fd })
+    }
+
+    /// Соединиться и дождаться ответа собеседника.
+    fn connect(&self, address: u32, port: u16) -> Result<(), Error> {
+        let packed = ((address as usize) << 16) | usize::from(port);
+        let started = sockctl(self.fd, SOCKCTL_CONNECT, packed);
+        if started < 0 && started != ERR_IN_PROGRESS {
+            return Err(Error::NoAnswer);
+        }
+        let deadline = uptime_ms() + CONNECT_TIMEOUT_MS;
+        loop {
+            let info = self.info().ok_or(Error::NoAnswer)?;
+            if info.reset != 0 {
+                return Err(Error::NoAnswer);
+            }
+            if info.open != 0 {
+                return Ok(());
+            }
+            let now = uptime_ms();
+            if now >= deadline {
+                return Err(Error::NoAnswer);
+            }
+            self.wait(POLL_OUT, deadline - now);
+        }
+    }
+
+    /// Забрать, что есть. Ноль — в сокете пусто **или** поток кончился;
+    /// различает их [`Socket::ended`].
+    fn recv(&self, buffer: &mut [u8]) -> usize {
+        read(self.fd, buffer).max(0) as usize
+    }
+
+    /// Отдать всё, дожидаясь места в очереди отправки.
+    fn send_all(&self, mut data: &[u8]) -> Result<(), Error> {
+        let deadline = uptime_ms() + SEND_TIMEOUT_MS;
+        while !data.is_empty() {
+            let wrote = write(self.fd, data);
+            if wrote > 0 {
+                data = &data[wrote as usize..];
+                continue;
+            }
+            if wrote != ERR_AGAIN {
+                return Err(Error::Reset);
+            }
+            let now = uptime_ms();
+            if now >= deadline {
+                return Err(Error::Timeout);
+            }
+            self.wait(POLL_OUT, deadline - now);
+        }
+        Ok(())
+    }
+
+    /// Подождать готовности, но не дольше `limit_ms` и не дольше
+    /// [`WAIT_SLICE_MS`]. Что именно случилось, вызывающий спросит сам.
+    fn wait(&self, wanted: u32, limit_ms: u64) {
+        let mut entry = [PollFd { fd: self.fd, wanted, ready: 0 }];
+        poll(&mut entry, limit_ms.clamp(1, WAIT_SLICE_MS) as i64);
+    }
+
+    fn info(&self) -> Option<SockInfo> {
+        let mut out = SockInfo::default();
+        (sock_info(self.fd, &mut out) == 0).then_some(out)
+    }
+
+    /// Оборвано — или собеседник закрыл свою половину.
+    fn ended(&self) -> bool {
+        self.info().is_none_or(|info| info.reset != 0 || info.peer_closed != 0)
+    }
+
+    fn shutdown(&self) {
+        sockctl(self.fd, SOCKCTL_SHUTDOWN, 0);
+    }
+
+    fn close(self) {
+        close(self.fd);
+    }
+}
+
 fn exchange(
-    socket: i64,
+    socket: &Socket,
     url: Url<'_>,
     address: u32,
     trust: Option<&mut Trust<'_>>,
@@ -365,12 +470,7 @@ fn exchange(
     sink: &mut impl FnMut(&[u8]) -> bool,
     next: &mut Location,
 ) -> Result<Option<Response>, Error> {
-    if connect(socket, address, url.port) < 0 {
-        return Err(Error::NoAnswer);
-    }
-    if !wait_connected(socket, CONNECT_TIMEOUT_MS) {
-        return Err(Error::NoAnswer);
-    }
+    socket.connect(address, url.port)?;
 
     let mut session = match trust {
         Some(trust) => {
@@ -475,27 +575,28 @@ fn exchange(
         if wire.finished() {
             return Err(Error::Short { got: done, want: length });
         }
-        if uptime_ms().saturating_sub(quiet_since) > BODY_STALL_MS {
+        let quiet = uptime_ms().saturating_sub(quiet_since);
+        if quiet > BODY_STALL_MS {
             return Err(Error::Timeout);
         }
-        sleep_ms(2);
+        socket.wait(POLL_IN, BODY_STALL_MS - quiet);
     }
 
     // Своя половина закрывается в конце: сервер уже сказал всё, что собирался, и
     // `FIN` от нас — это единственный способ дать ему закрыть соединение, не
     // дожидаясь своего таймаута.
     wire.close();
-    shutdown(socket);
+    socket.shutdown();
     Ok(Some(Response { status, length: done }))
 }
 
 /// Провод: сокет и, если разговор защищённый, сеанс TLS поверх него.
-struct Wire<'a, 'b> {
-    socket: i64,
+struct Wire<'a, 'b, 's> {
+    socket: &'s Socket,
     session: Option<&'a mut tls::Session<'b>>,
 }
 
-impl Wire<'_, '_> {
+impl Wire<'_, '_, '_> {
     /// Довести рукопожатие до конца. Для обычного HTTP не делает ничего.
     fn handshake(&mut self, scratch: &mut [u8]) -> Result<(), Error> {
         if self.session.is_none() {
@@ -511,12 +612,12 @@ impl Wire<'_, '_> {
                 let session = self.session.as_ref().expect("проверено выше");
                 scratch.len().min(session.room())
             };
-            let read = recv(self.socket, &mut scratch[..cap]);
+            let read = self.socket.recv(&mut scratch[..cap]);
             if read > 0 {
                 let session = self.session.as_mut().expect("проверено выше");
                 let mut at = 0usize;
-                while at < read as usize {
-                    let used = session.feed(&scratch[at..read as usize]).map_err(Error::Tls)?;
+                while at < read {
+                    let used = session.feed(&scratch[at..read]).map_err(Error::Tls)?;
                     if used == 0 {
                         break;
                     }
@@ -524,15 +625,14 @@ impl Wire<'_, '_> {
                 }
                 continue;
             }
-            match stream_state(self.socket) {
-                Some(state) if state.reset != 0 => return Err(Error::Reset),
-                Some(state) if state.peer_closed != 0 => return Err(Error::Reset),
-                _ => {}
+            if self.socket.ended() {
+                return Err(Error::Reset);
             }
-            if uptime_ms() > deadline {
+            let now = uptime_ms();
+            if now > deadline {
                 return Err(Error::Timeout);
             }
-            sleep_ms(2);
+            self.socket.wait(POLL_IN, deadline - now);
         }
     }
 
@@ -566,15 +666,10 @@ impl Wire<'_, '_> {
         let Some(session) = self.session.as_mut() else {
             return Ok(());
         };
-        while !session.outgoing().is_empty() {
-            let wrote = send_waiting(self.socket, session.outgoing(), 200);
-            if wrote == crate::ERR_AGAIN {
-                return Err(Error::Timeout);
-            }
-            if wrote <= 0 {
-                return Err(Error::Reset);
-            }
-            session.consume_outgoing(wrote as usize);
+        let pending = session.outgoing().len();
+        if pending > 0 {
+            self.socket.send_all(session.outgoing())?;
+            session.consume_outgoing(pending);
         }
         Ok(())
     }
@@ -592,8 +687,7 @@ impl Wire<'_, '_> {
     /// расшифрованное или пока сокет не опустеет.
     fn read(&mut self, scratch: &mut [u8], out: &mut [u8]) -> Result<usize, Error> {
         if self.session.is_none() {
-            let read = recv(self.socket, out);
-            return Ok(read.max(0) as usize);
+            return Ok(self.socket.recv(out));
         }
         loop {
             let session = self.session.as_mut().expect("проверено выше");
@@ -620,13 +714,13 @@ impl Wire<'_, '_> {
             // Больше, чем приёмник готов взять, читать нельзя: остаток пришлось
             // бы где-то держать, а держать его негде.
             let cap = scratch.len().min(session.room());
-            let read = recv(self.socket, &mut scratch[..cap]);
-            if read <= 0 {
+            let read = self.socket.recv(&mut scratch[..cap]);
+            if read == 0 {
                 return Ok(0);
             }
             let mut at = 0usize;
-            while at < read as usize {
-                let used = session.feed(&scratch[at..read as usize]).map_err(Error::Tls)?;
+            while at < read {
+                let used = session.feed(&scratch[at..read]).map_err(Error::Tls)?;
                 if used == 0 {
                     break;
                 }
@@ -644,14 +738,10 @@ impl Wire<'_, '_> {
                 return true;
             }
         }
-        match stream_state(self.socket) {
-            Some(state) if state.reset != 0 => true,
-            // Закрытая половина при непустой очереди означает «дочитай то, что
-            // уже пришло», а не «данных больше не будет», — но здесь мы уже
-            // спросили и не получили ничего.
-            Some(state) => state.peer_closed != 0,
-            None => false,
-        }
+        // Закрытая половина при непустой очереди означает «дочитай то, что
+        // уже пришло», а не «данных больше не будет», — но здесь мы уже
+        // спросили и не получили ничего.
+        self.socket.ended()
     }
 
     fn close(&mut self) {
@@ -661,23 +751,10 @@ impl Wire<'_, '_> {
         let _ = self.flush();
     }
 
-    /// Отправить всё, повторяя попытки, пока выясняется аппаратный адрес.
-    ///
-    /// «Ещё не сейчас» отделено от «оборвалось» намеренно: первое означает, что
-    /// ARP не ответил, второе — что соединения больше нет, и человеку с этими
-    /// двумя сообщениями идти в разные стороны.
-    fn write_socket(&mut self, mut data: &[u8]) -> Result<(), Error> {
-        while !data.is_empty() {
-            let wrote = send_waiting(self.socket, data, 200);
-            if wrote == crate::ERR_AGAIN {
-                return Err(Error::Timeout);
-            }
-            if wrote <= 0 {
-                return Err(Error::Reset);
-            }
-            data = &data[wrote as usize..];
-        }
-        Ok(())
+    /// Отправить всё. «Места нет слишком долго» отделено от «оборвалось»
+    /// намеренно: с этими двумя сообщениями человеку идти в разные стороны.
+    fn write_socket(&mut self, data: &[u8]) -> Result<(), Error> {
+        self.socket.send_all(data)
     }
 }
 
@@ -686,7 +763,7 @@ impl Wire<'_, '_> {
 /// Тело почти всегда начинается **в том же буфере**: сервер отдаёт заголовок и
 /// первые килобайты файла одним сегментом.
 fn read_header(
-    wire: &mut Wire<'_, '_>,
+    wire: &mut Wire<'_, '_, '_>,
     io: &mut Buffers<'_>,
     header: &mut [u8; MAX_HEADER],
 ) -> Result<(usize, usize), Error> {
@@ -712,10 +789,11 @@ fn read_header(
         if wire.finished() {
             return Err(Error::NotHttp);
         }
-        if uptime_ms() > deadline {
+        let now = uptime_ms();
+        if now > deadline {
             return Err(Error::Timeout);
         }
-        sleep_ms(2);
+        wire.socket.wait(POLL_IN, deadline - now);
     }
 }
 

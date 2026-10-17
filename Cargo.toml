@@ -119,6 +119,28 @@ opt-level = 2
 [profile.dev.package.disk]
 opt-level = 2
 
+# Криптография и разборщики сети (фаза 65e): TLS и X.509 у `fetch` и
+# `sysupdate`, SSH у `sshd`, подписи обновлений и пакетов, разбор HTTP. Правило
+# `"*"` выше наших крейтов не касается, и они оставались без оптимизации:
+# ChaCha20 и SHA-256 по байту. Замер — в ROADMAP, фаза 65e.
+[profile.dev.package.tls]
+opt-level = 2
+
+[profile.dev.package.x509]
+opt-level = 2
+
+[profile.dev.package.ssh]
+opt-level = 2
+
+[profile.dev.package.osupdate]
+opt-level = 2
+
+[profile.dev.package.fpk]
+opt-level = 2
+
+[profile.dev.package.http]
+opt-level = 2
+
 [profile.release]
 lto = true
 opt-level = "s"
