@@ -69,6 +69,7 @@ mod serial;
 mod shell;
 mod slot;
 mod smp;
+mod sound;
 mod trust;
 mod sync;
 mod time;
@@ -468,11 +469,11 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     // обрабатывается внутри.
     unsafe { net::init(info.acpi_rsdp) };
 
-    // Звук (фаза 67e): нет устройства — нет и звука, и это не ошибка.
+    // Звук (фазы 67e, 68a): нет устройства — нет и звука, и это не ошибка.
     // SAFETY: см. выше.
     if let Ok(root) = unsafe { pci::Root::discover(info.acpi_rsdp) } {
         // SAFETY: см. выше.
-        unsafe { virtio::snd::probe(&root) };
+        unsafe { sound::probe(&root) };
     }
 
     // Постоянный адрес — сразу после карты и **до** служб. Порядок обязателен:

@@ -1581,12 +1581,12 @@ fn beep(argument: &str) {
         sprintln!("  beep     usage: beep [20..20000 Hz] [1..10000 ms]");
         return;
     }
-    if !crate::virtio::snd::present() {
+    if !crate::sound::present() {
         sprintln!("  beep     no sound device on this machine");
         return;
     }
     let started = crate::time::uptime_ms();
-    match crate::virtio::snd::play_tone(hz, ms) {
+    match crate::sound::play_tone(hz, ms) {
         Ok(()) => sprintln!(
             "  beep     played {hz} Hz for {ms} ms in {} ms",
             crate::time::uptime_ms().saturating_sub(started)

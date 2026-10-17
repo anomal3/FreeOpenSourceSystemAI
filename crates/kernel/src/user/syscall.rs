@@ -2459,12 +2459,12 @@ fn fdctl(fd: usize, op: usize, arg: usize) -> i64 {
 /// и ждать она может секундами. Память программы перепроверяется на каждом
 /// куске: пока задача ждала, поток той же программы мог её отдать.
 fn sound(op: usize, ptr: usize, len: usize) -> i64 {
-    if !crate::virtio::snd::present() {
+    if !crate::sound::present() {
         return ERR_UNSUPPORTED;
     }
     match op {
         user_abi::SOUND_WRITE => {
-            let mut chunk = alloc::vec![0u8; crate::virtio::snd::PERIOD];
+            let mut chunk = alloc::vec![0u8; crate::sound::PERIOD];
             let mut done = 0usize;
             while done < len {
                 if super::kill_pending() {
@@ -2477,14 +2477,14 @@ fn sound(op: usize, ptr: usize, len: usize) -> i64 {
                 // SAFETY: диапазон только что проверен на чтение.
                 let bytes = unsafe { core::slice::from_raw_parts((ptr + done) as *const u8, take) };
                 chunk[..take].copy_from_slice(bytes);
-                if crate::virtio::snd::feed(&chunk[..take]).is_err() {
+                if crate::sound::feed(&chunk[..take]).is_err() {
                     return if done > 0 { done as i64 } else { ERR_IO };
                 }
                 done += take;
             }
             (done / 4 * 4) as i64
         }
-        user_abi::SOUND_DRAIN => match crate::virtio::snd::drain() {
+        user_abi::SOUND_DRAIN => match crate::sound::drain() {
             Ok(()) => 0,
             Err(_) => ERR_IO,
         },

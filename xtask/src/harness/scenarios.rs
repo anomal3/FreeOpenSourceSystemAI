@@ -1823,6 +1823,45 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "hda",
+        about: "Звук на Intel HDA (фаза 68a): контроллер, кодек, путь от ЦАП к разъёму — тон 523 Гц из ядра в файле WAV у QEMU.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // Контроллер ICH6 и кодек с одним выходом — то, что QEMU называет
+        // `hda-output`; virtio-snd нет, звук может уйти только через HDA.
+        extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "intel-hda", "-device", "hda-output,audiodev=snd0"],
+        steps: &[
+            // Строку успеха выдаёт только найденный путь: «… -> pin N».
+            Step::AwaitAny(", 48000 Hz 16-bit stereo", BOOT),
+            Step::Await("freeos> ", BOOT),
+            Step::Wait(2_000),
+            Step::Line("beep 523 2000"),
+            // Кольцо контроллера — меньше пятой доли секунды: две секунды звука
+            // уходят не быстрее, чем их играет устройство.
+            Step::AtLeast("  beep     played 523 Hz for 2000 ms in ", 1_800, 30_000),
+            Step::Wait(1_000),
+            Step::Tone(523),
+            Step::Absent("beep     failed"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "csound",
         about: "Звук из программы на C (фаза 67f): SYS_SOUND через <freeos/sound.h>, порции разного размера — в WAV у QEMU тон 660 Гц.",
         target: Target::Installed,
@@ -1846,6 +1885,46 @@ pub const ALL: &[Scenario] = &[
         extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
         steps: &[
             Step::AwaitAny("virtio-snd  : at ", BOOT),
+            Step::Await("freeos> ", BOOT),
+            Step::Wait(2_000),
+            // Полторы секунды — порциями в 100, 1000 и 3000 кадров: меньше
+            // периода устройства, больше и не кратно. Дыры между порциями
+            // сбили бы счёт пересечений нуля и громкий участок.
+            Step::Line("run /bin/csound 660 1500"),
+            Step::Await("csound: played 72000 frames of 660 Hz", 30_000),
+            Step::Wait(1_000),
+            Step::Tone(660),
+            Step::Absent("csound: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "chda",
+        about: "Звук из программы на C через Intel HDA (фаза 68a): порции разного размера в кольцо контроллера, кодек с входами и выходом — в WAV у QEMU тон 660 Гц.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // `hda-duplex` — кодек со входом и выходом: поиск пути обязан пройти
+        // мимо разъёма-входа и АЦП.
+        extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd0"],
+        steps: &[
+            Step::AwaitAny(", 48000 Hz 16-bit stereo", BOOT),
             Step::Await("freeos> ", BOOT),
             Step::Wait(2_000),
             // Полторы секунды — порциями в 100, 1000 и 3000 кадров: меньше
