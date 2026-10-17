@@ -366,6 +366,25 @@ fn fill_span(
             return;
         }
     }
+    // Сплошная заливка с постоянной долей — строкой, упакованными точками
+    // (фаза 67): так заливаются полосы тени над окном и под ним, края
+    // скруглённых фигур, полупрозрачные плашки. Побайтно то же, что
+    // [`blend_pixel`] на каждую точку.
+    if let Paint::Solid(color) = paint {
+        let (Ok(row_index), Ok(start)) = (u32::try_from(y), usize::try_from(x0.max(0))) else {
+            return;
+        };
+        let over = color.pixel();
+        let weight = u32::from(strength);
+        let row = surface.row_mut(row_index);
+        let end = usize::try_from(x1).unwrap_or(0).min(row.len());
+        if start < end {
+            for under in &mut row[start..end] {
+                *under = mix_packed(*under, over, weight);
+            }
+        }
+        return;
+    }
     for x in x0..x1 {
         blend_pixel(surface, x, y, paint.color(x, y), strength);
     }
@@ -710,16 +729,8 @@ pub fn shadow(
                     .collect();
                 (lefts, rights)
             });
-            for (x, strength) in (area.x..left).zip(lefts.iter()) {
-                if *strength != 0 {
-                    blend_pixel(surface, x, y, color, scale(*strength, alpha));
-                }
-            }
-            for (x, strength) in (right..area.right()).zip(rights.iter()) {
-                if *strength != 0 {
-                    blend_pixel(surface, x, y, color, scale(*strength, alpha));
-                }
-            }
+            blend_profile(surface, y, area.x, lefts, color, alpha);
+            blend_profile(surface, y, right, rights, color, alpha);
             continue;
         }
         for x in area.x..left {
@@ -733,6 +744,49 @@ pub fn shadow(
             blend_pixel(surface, x, y, color, scale(strength, alpha));
         }
     }
+}
+
+/// Смешать с цветом пролёт строки `y` от `x0` с готовыми долями `strengths`
+/// (фаза 67). То же, что [`blend_pixel`] на каждую точку, — побайтно, — но
+/// строка берётся один раз, а смешиваются упакованные точки: канал в точке
+/// стоит на одном и том же месте и у фона, и у цвета, так что распаковывать
+/// их в [`Color`] (и каждый раз спрашивать формат машины) незачем.
+fn blend_profile(surface: &mut Surface, y: i32, x0: i32, strengths: &[u8], color: Color, alpha: Alpha) {
+    let Ok(row_index) = u32::try_from(y) else {
+        return;
+    };
+    let paint = color.pixel();
+    let row = surface.row_mut(row_index);
+    for (offset, strength) in strengths.iter().enumerate() {
+        if *strength == 0 {
+            continue;
+        }
+        let Ok(x) = usize::try_from(x0 + offset as i32) else {
+            continue;
+        };
+        let Some(under) = row.get_mut(x) else {
+            break;
+        };
+        let weight = u32::from(scale(*strength, alpha));
+        if weight == 0 {
+            continue;
+        }
+        *under = if weight == 255 { paint } else { mix_packed(*under, paint, weight) };
+    }
+}
+
+/// Смешать две упакованные точки по каналам — та же формула, что
+/// [`Color::mix`], и тот же непрозрачный старший байт, что [`Color::pixel`].
+const fn mix_packed(under: u32, over: u32, weight: u32) -> u32 {
+    let mut out = 0xFF00_0000;
+    let mut shift = 0;
+    while shift < 24 {
+        let a = (under >> shift) & 0xFF;
+        let b = (over >> shift) & 0xFF;
+        out |= ((a * (255 - weight) + b * weight) / 255) << shift;
+        shift += 8;
+    }
+    out
 }
 
 /// Насыщенность тени на расстоянии `distance` от фигуры.
@@ -1032,7 +1086,32 @@ mod shadow_tests {
     }
 
     #[test]
+    fn a_solid_span_blends_like_point_by_point() {
+        crate::use_raw_format(crate::PIXEL_RGB);
+        let backdrop = Color::rgb(0x12, 0x9A, 0xE4);
+        let ink = Color::rgb(0xF0, 0x40, 0x08);
+        for (y, x0, x1, strength) in [(5, -20, 50, 77u8), (6, 30, 400, 200), (7, 0, 64, 1), (8, 63, 64, 254), (90, 0, 10, 128)] {
+            let mut fast = Surface::new(64, 80, backdrop).expect("поверхность");
+            let mut slow = Surface::new(64, 80, backdrop).expect("поверхность");
+            fill_span(&mut fast, y, x0, x1, Paint::Solid(ink), 255, strength);
+            for x in x0..x1 {
+                blend_pixel(&mut slow, x, y, ink, strength);
+            }
+            for row in 0..80 {
+                for column in 0..64 {
+                    assert_eq!(fast.get(column, row), slow.get(column, row), "y{y} {x0}..{x1} at {column},{row}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn the_cached_shadow_matches_the_point_by_point_one() {
+        // Формат точки — как у машины: без него `Color::pixel` отвечает
+        // нулём, и обе поверхности совпали бы, оставаясь пустыми. Тот же, что
+        // ставит тест `boxdraw`: формат глобальный, тесты идут параллельно, и
+        // разные значения подменяли бы его друг другу посреди проверки.
+        crate::use_raw_format(crate::PIXEL_RGB);
         let cases = [
             (Rect::new(60, 50, 300, 200), 12, 24),
             (Rect::new(-40, -30, 260, 180), 8, 16),
@@ -1047,11 +1126,17 @@ mod shadow_tests {
             let mut reference = Surface::new(480, 360, backdrop).expect("поверхность");
             shadow(&mut cached, rect, radius, spread, Color::rgb(0, 0, 0), 120);
             shadow_reference(&mut reference, rect, radius, spread, Color::rgb(0, 0, 0), 120);
+            let mut shaded = 0usize;
             for y in 0..360 {
                 for x in 0..480 {
                     assert_eq!(cached.get(x, y), reference.get(x, y), "{rect:?} r{radius} s{spread} at {x},{y}");
+                    if reference.get(x, y) != backdrop.pixel() {
+                        shaded += 1;
+                    }
                 }
             }
+            // Тень действительно нарисована: иначе совпадение ничего не значит.
+            assert!(shaded > 1000, "{rect:?}: тени нет ({shaded} точек)");
         }
     }
 }
