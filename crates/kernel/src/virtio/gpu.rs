@@ -24,8 +24,15 @@
 //!
 //! 3D (virgl, venus), нескольких экранов, EDID и смены размера окна хоста на
 //! ходу: стол берёт размер, который устройство назвало при запуске, или тот,
-//! что выбран в «Параметрах». Указатель рисует стол сам — аппаратный курсор
-//! (очередь `cursorq`) следующим шагом.
+//! что выбран в «Параметрах».
+//!
+//! # Аппаратный курсор (фаза 67b)
+//!
+//! Стрелку рисует хост поверх экрана: её картинка — свой ресурс 64×64 с
+//! прозрачностью, отданный очереди `cursorq` (`UPDATE_CURSOR`), а движение
+//! мыши — одна короткая команда `MOVE_CURSOR`. Композитор тогда стрелку не
+//! рисует и при движении ничего не пересобирает: без курсора хоста каждое
+//! движение стоило двух прямоугольников кадра — где стрелка была и где стала.
 
 use core::sync::atomic::{Ordering, fence};
 
@@ -50,12 +57,24 @@ const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
+const CMD_UPDATE_CURSOR: u32 = 0x0300;
+const CMD_MOVE_CURSOR: u32 = 0x0301;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 
 /// Байт 0 — синий, 1 — зелёный, 2 — красный, 3 — не используется: ровно то,
 /// что `mini-ui` пишет в `u32` на little-endian (`0x00RRGGBB`).
 const FORMAT_B8G8R8X8_UNORM: u32 = 2;
+/// То же с прозрачностью в байте 3 — формат картинки курсора.
+const FORMAT_B8G8R8A8_UNORM: u32 = 1;
+
+/// Сторона картинки курсора: устройство принимает только 64×64.
+pub const CURSOR_SIDE: u32 = 64;
+/// Номер ресурса курсора — вне чередования ресурсов экрана (1 и 2).
+const CURSOR_RESOURCE: u32 = 10;
+/// Команда курсора: заголовок, место (экран, x, y, запас), ресурс, точка
+/// касания (x, y) и запас.
+const CURSOR_COMMAND_SIZE: usize = HEADER_SIZE + 32;
 
 /// Заголовок каждой команды и ответа.
 const HEADER_SIZE: usize = 24;
@@ -87,6 +106,20 @@ struct VirtioGpu {
     screen: Option<Screen>,
     /// Номер показанного ресурса.
     current: u32,
+    /// Очередь курсора и буфер её команды.
+    cursor_queue: Queue,
+    cursor_command: DmaBuffer,
+    /// Картинка курсора у хоста есть: ресурс заведён и отдан очереди.
+    cursor: Option<Cursor>,
+    /// Память ресурса курсора — заводится один раз.
+    cursor_memory: Option<PhysAddr>,
+}
+
+#[derive(Clone, Copy)]
+struct Cursor {
+    hot: (u32, u32),
+    /// Показан ли сейчас: погашенный экран прячет и стрелку.
+    shown: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -170,8 +203,65 @@ pub fn flush(x: i32, y: i32, w: u32, h: u32) {
         return;
     }
     let rect = (left, top, right - left, bottom - top);
-    if let Err(err) = gpu.transfer(rect, screen.width).and_then(|()| gpu.resource_flush(rect)) {
+    let current = gpu.current;
+    if let Err(err) = gpu.transfer(current, rect, screen.width).and_then(|()| gpu.resource_flush(rect)) {
         kprintln!("  virtio-gpu  : flush failed: {err}");
+    }
+}
+
+/// Отдать хосту картинку курсора (`CURSOR_SIDE`² точек, `0xAARRGGBB`) с
+/// точкой касания `hot` и показать её в `(x, y)`. `false` — курсора хоста
+/// нет (нет устройства или оно отказало), и стрелку рисует стол.
+pub fn cursor_show(image: &[u32], hot: (u32, u32), x: i32, y: i32) -> bool {
+    let mut guard = GPU.lock();
+    let Some(gpu) = guard.as_mut() else {
+        return false;
+    };
+    if gpu.screen.is_none() {
+        return false;
+    }
+    match gpu.make_cursor(image, hot).and_then(|()| gpu.cursor_command(CMD_UPDATE_CURSOR, CURSOR_RESOURCE, x, y)) {
+        Ok(()) => {
+            gpu.cursor = Some(Cursor { hot, shown: true });
+            true
+        }
+        Err(err) => {
+            kprintln!("  virtio-gpu  : no hardware cursor: {err}");
+            false
+        }
+    }
+}
+
+/// Передвинуть курсор хоста. Без него — ничего.
+pub fn cursor_move(x: i32, y: i32) {
+    let mut guard = GPU.lock();
+    let Some(gpu) = guard.as_mut() else {
+        return;
+    };
+    if !gpu.cursor.is_some_and(|cursor| cursor.shown) {
+        return;
+    }
+    if let Err(err) = gpu.cursor_command(CMD_MOVE_CURSOR, CURSOR_RESOURCE, x, y) {
+        kprintln!("  virtio-gpu  : cursor move failed: {err}");
+    }
+}
+
+/// Спрятать или вернуть курсор хоста — погашенный экран прячет и стрелку.
+pub fn cursor_visible(visible: bool, x: i32, y: i32) {
+    let mut guard = GPU.lock();
+    let Some(gpu) = guard.as_mut() else {
+        return;
+    };
+    let Some(cursor) = gpu.cursor else {
+        return;
+    };
+    if cursor.shown == visible {
+        return;
+    }
+    // Ресурс ноль — «курсора нет»: так спецификация велит его прятать.
+    let resource = if visible { CURSOR_RESOURCE } else { 0 };
+    if gpu.cursor_command(CMD_UPDATE_CURSOR, resource, x, y).is_ok() {
+        gpu.cursor = Some(Cursor { shown: visible, ..cursor });
     }
 }
 
@@ -190,7 +280,9 @@ impl VirtioGpu {
         // здесь нет.
         transport.negotiate(FEATURE_VERSION_1)?;
         let control = Queue::new(&transport, 0)?;
+        let cursor_queue = Queue::new(&transport, 1)?;
         let command = dma::alloc(1024).map_err(VirtioError::NoMemory)?;
+        let cursor_command = dma::alloc(CURSOR_COMMAND_SIZE).map_err(VirtioError::NoMemory)?;
         transport.set_driver_ok();
 
         let mut gpu = Self {
@@ -200,6 +292,10 @@ impl VirtioGpu {
             preferred: (1280, 800),
             screen: None,
             current: 0,
+            cursor_queue,
+            cursor_command,
+            cursor: None,
+            cursor_memory: None,
         };
         if let Some(size) = gpu.display_info()? {
             gpu.preferred = size;
@@ -301,13 +397,13 @@ impl VirtioGpu {
     }
 
     /// Перенести прямоугольник ресурса к хосту.
-    fn transfer(&mut self, rect: (u32, u32, u32, u32), stride: u32) -> Result<(), VirtioError> {
+    fn transfer(&mut self, resource: u32, rect: (u32, u32, u32, u32), stride: u32) -> Result<(), VirtioError> {
         self.header(CMD_TRANSFER_TO_HOST_2D);
         self.put_rect(HEADER_SIZE, rect);
         // Смещение первой точки прямоугольника в памяти ресурса.
         let offset = (u64::from(rect.1) * u64::from(stride) + u64::from(rect.0)) * 4;
         self.put_u64(HEADER_SIZE + 16, offset);
-        self.put_u32(HEADER_SIZE + 24, self.current);
+        self.put_u32(HEADER_SIZE + 24, resource);
         self.put_u32(HEADER_SIZE + 28, 0);
         self.submit(HEADER_SIZE + 32, HEADER_SIZE, RESP_OK_NODATA)
     }
@@ -319,6 +415,71 @@ impl VirtioGpu {
         self.put_u32(HEADER_SIZE + 16, self.current);
         self.put_u32(HEADER_SIZE + 20, 0);
         self.submit(HEADER_SIZE + 24, HEADER_SIZE, RESP_OK_NODATA)
+    }
+
+    /// Завести ресурс курсора и перенести в него картинку. Ресурс заводится
+    /// один раз: повторный вызов (стол пересоздал указатель) только
+    /// переносит картинку заново.
+    fn make_cursor(&mut self, image: &[u32], _hot: (u32, u32)) -> Result<(), VirtioError> {
+        let points = (CURSOR_SIDE * CURSOR_SIDE) as usize;
+        if image.len() != points {
+            return Err(VirtioError::RequestFailed(0));
+        }
+        let pages = (points * 4).div_ceil(PAGE_SIZE);
+        let memory = match self.cursor_memory {
+            Some(memory) => memory,
+            None => {
+                let memory = crate::mm::frame::with(|frames| frames.allocate_contiguous(pages))
+                    .flatten()
+                    .ok_or(VirtioError::NoMemory(crate::mm::dma::DmaError::NoContiguousFrames { pages }))?;
+                self.cursor_memory = Some(memory);
+                self.header(CMD_RESOURCE_CREATE_2D);
+                self.put_u32(HEADER_SIZE, CURSOR_RESOURCE);
+                self.put_u32(HEADER_SIZE + 4, FORMAT_B8G8R8A8_UNORM);
+                self.put_u32(HEADER_SIZE + 8, CURSOR_SIDE);
+                self.put_u32(HEADER_SIZE + 12, CURSOR_SIDE);
+                self.submit(HEADER_SIZE + 16, HEADER_SIZE, RESP_OK_NODATA)?;
+                self.header(CMD_RESOURCE_ATTACH_BACKING);
+                self.put_u32(HEADER_SIZE, CURSOR_RESOURCE);
+                self.put_u32(HEADER_SIZE + 4, 1);
+                self.put_u64(HEADER_SIZE + 8, memory.as_u64());
+                self.put_u32(HEADER_SIZE + 16, (pages * PAGE_SIZE) as u32);
+                self.put_u32(HEADER_SIZE + 20, 0);
+                self.submit(HEADER_SIZE + 24, HEADER_SIZE, RESP_OK_NODATA)?;
+                memory
+            }
+        };
+        // SAFETY: кадры выделены под курсор и принадлежат драйверу; прямое
+        // отображение покрывает всю память машины.
+        unsafe {
+            core::ptr::copy_nonoverlapping(image.as_ptr(), memory.to_direct_map().as_usize() as *mut u32, points);
+        }
+        self.transfer(CURSOR_RESOURCE, (0, 0, CURSOR_SIDE, CURSOR_SIDE), CURSOR_SIDE)
+    }
+
+    /// Команда очереди курсора. Ответа у неё нет: устройство только
+    /// возвращает буфер.
+    fn cursor_command(&mut self, kind: u32, resource: u32, x: i32, y: i32) -> Result<(), VirtioError> {
+        let hot = self.cursor.map_or((0, 0), |cursor| cursor.hot);
+        // SAFETY: буфер выделен на `CURSOR_COMMAND_SIZE` и принадлежит драйверу.
+        let base = unsafe { self.cursor_command.as_ptr::<u8>() };
+        let put = |at: usize, value: u32| {
+            // SAFETY: буфер выделен на `CURSOR_COMMAND_SIZE`, смещения меньше.
+            unsafe { base.add(at).cast::<u32>().write_unaligned(value) };
+        };
+        // SAFETY: см. выше.
+        unsafe { core::ptr::write_bytes(base, 0, CURSOR_COMMAND_SIZE) };
+        put(0, kind);
+        put(HEADER_SIZE, 0);
+        put(HEADER_SIZE + 4, x.max(0) as u32);
+        put(HEADER_SIZE + 8, y.max(0) as u32);
+        put(HEADER_SIZE + 16, resource);
+        put(HEADER_SIZE + 20, hot.0);
+        put(HEADER_SIZE + 24, hot.1);
+        let phys = self.cursor_command.phys().as_u64();
+        self.cursor_queue.set_descriptor(0, phys, CURSOR_COMMAND_SIZE as u32, 0, 0);
+        fence(Ordering::SeqCst);
+        self.cursor_queue.submit_and_wait(POLL_LIMIT, None)
     }
 
     // --- буфер команды -----------------------------------------------------

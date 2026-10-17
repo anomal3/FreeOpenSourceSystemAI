@@ -99,6 +99,11 @@ pub struct Compositor {
     menu: Option<Menu>,
     /// Указатель мыши — верхний слой кадра.
     pointer: Pointer,
+    /// Стрелку показывает адаптер (фаза 67b): стол её не рисует, а движение
+    /// мыши не пересобирает кадр.
+    hw_cursor: bool,
+    /// Где курсор адаптера стоит по последней команде.
+    cursor_sent: (i32, i32),
     /// Значки на самом столе — слой между фоном и окнами.
     icons: Icons,
     /// Меню по правому щелчку. Верхний слой, как и меню запуска.
@@ -322,6 +327,8 @@ impl Compositor {
             rects: 0,
             deferred: false,
             blanked: false,
+            hw_cursor: false,
+            cursor_sent: (0, 0),
         };
         compositor.panel = Panel::new(
             compositor.screen.width(),
@@ -855,6 +862,9 @@ impl Compositor {
         if !moved && !appeared {
             return;
         }
+        if self.hand_cursor(appeared) {
+            return;
+        }
         if moved {
             self.mark(before);
         }
@@ -884,6 +894,10 @@ impl Compositor {
         if !moved && !appeared {
             return (0, 0);
         }
+        if self.hand_cursor(appeared) {
+            let (to_x, to_y) = self.pointer.position();
+            return (to_x - from_x, to_y - from_y);
+        }
         if moved {
             self.mark(before);
         }
@@ -892,6 +906,37 @@ impl Compositor {
 
         let (to_x, to_y) = self.pointer.position();
         (to_x - from_x, to_y - from_y)
+    }
+
+    /// Курсор адаптера (фаза 67b): `true` — стрелку показывает адаптер, и
+    /// пересобирать под ней кадр не надо.
+    ///
+    /// Стрелка отдаётся адаптеру, когда указатель впервые появляется, — до
+    /// этого её нет и на экране стола. Адаптер, который так не умеет
+    /// (stdvga, ramfb), отвечает `false`, и всё идёт по-старому. На телефоне
+    /// стрелки нет вовсе.
+    fn hand_cursor(&mut self, appeared: bool) -> bool {
+        if theme::is_mobile() {
+            return false;
+        }
+        let (x, y) = self.pointer.position();
+        if !self.hw_cursor {
+            if !appeared {
+                return false;
+            }
+            let image = Pointer::image(crate::display::CURSOR_SIDE);
+            self.hw_cursor = crate::display::cursor_show(&image, (0, 0), x, y);
+            if self.hw_cursor {
+                self.cursor_sent = (x, y);
+                crate::kprintln!("  desktop     : the pointer is drawn by the display adapter");
+            }
+            return self.hw_cursor;
+        }
+        if self.cursor_sent != (x, y) {
+            crate::display::cursor_move(x, y);
+            self.cursor_sent = (x, y);
+        }
+        true
     }
 
     #[must_use]
@@ -2320,12 +2365,21 @@ impl Compositor {
         self.screen.fill(self.screen.bounds(), Color::rgb(0, 0, 0));
         let all = self.screen.bounds();
         crate::display::flush(all.x, all.y, all.w, all.h);
+        if self.hw_cursor {
+            let (x, y) = self.pointer.position();
+            crate::display::cursor_visible(false, x, y);
+        }
         self.blanked = true;
     }
 
     /// Зажечь обратно: весь экран объявляется изменившимся и собирается заново.
     pub fn unblank(&mut self) {
         self.blanked = false;
+        if self.hw_cursor {
+            let (x, y) = self.pointer.position();
+            crate::display::cursor_visible(true, x, y);
+            self.cursor_sent = (x, y);
+        }
         self.repaint_all();
     }
 
@@ -2339,6 +2393,11 @@ impl Compositor {
             return;
         }
         self.apply_pending_size();
+        // Указатель мог сдвинуться не мышью — смена режима ставит его в
+        // середину нового экрана. Курсор адаптера догоняет здесь.
+        if self.hw_cursor {
+            self.hand_cursor(false);
+        }
         self.rebuild_under();
         // Клавиатура — до полёта: иначе на медленной машине полёт успевал
         // кончиться в том же кадре, и порядок строк журнала «клавиатура ушла» и
@@ -2657,7 +2716,7 @@ impl Compositor {
         // следующее нажатие, — а палец уже стоит там, куда попадёт: он сам
         // виден человеку, и второй указатель на то же место означает, что
         // система показывает ему его собственный палец с опозданием на кадр.
-        if !theme::is_mobile() {
+        if !theme::is_mobile() && !self.hw_cursor {
             self.pointer.draw(back, dy);
         }
         let t_end = crate::time::uptime_ns();

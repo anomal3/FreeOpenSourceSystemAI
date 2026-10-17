@@ -96,6 +96,26 @@ pub fn flush(x: i32, y: i32, w: u32, h: u32) {
     crate::virtio::gpu::flush(x, y, w, h);
 }
 
+/// Отдать курсор адаптеру (фаза 67b): картинка `side`×`side` точек
+/// (`0xAARRGGBB`) с точкой касания `hot`. `false` — адаптер так не умеет, и
+/// стрелку рисует стол.
+pub fn cursor_show(image: &[u32], hot: (u32, u32), x: i32, y: i32) -> bool {
+    crate::virtio::gpu::cursor_show(image, hot, x, y)
+}
+
+/// Сторона картинки курсора у адаптера.
+pub const CURSOR_SIDE: u32 = crate::virtio::gpu::CURSOR_SIDE;
+
+/// Передвинуть курсор адаптера.
+pub fn cursor_move(x: i32, y: i32) {
+    crate::virtio::gpu::cursor_move(x, y);
+}
+
+/// Спрятать или вернуть курсор адаптера.
+pub fn cursor_visible(visible: bool, x: i32, y: i32) {
+    crate::virtio::gpu::cursor_visible(visible, x, y);
+}
+
 /// Умеет ли эта машина менять режим экрана на ходу.
 ///
 /// # Зачем спрашивать заранее

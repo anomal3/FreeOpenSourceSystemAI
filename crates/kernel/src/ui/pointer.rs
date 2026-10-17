@@ -125,6 +125,27 @@ impl Pointer {
         true
     }
 
+    /// Картинка стрелки для курсора адаптера (фаза 67b): `side`×`side` точек
+    /// `0xAARRGGBB`, вне стрелки — прозрачные. Те же маски, что рисует стол:
+    /// стрелка у адаптера не должна отличаться от своей.
+    #[must_use]
+    pub fn image(side: u32) -> alloc::vec::Vec<u32> {
+        let mut image = alloc::vec![0u32; (side * side) as usize];
+        let opaque = |color: Color| 0xFF00_0000 | (color.pixel() & 0x00FF_FFFF);
+        for (row, (outline, fill)) in OUTLINE.iter().zip(FILL.iter()).enumerate() {
+            for column in 0..WIDTH {
+                let bit = 1u16 << (WIDTH - 1 - column);
+                let at = row * side as usize + column as usize;
+                if outline & bit != 0 {
+                    image[at] = opaque(OUTLINE_COLOR);
+                } else if fill & bit != 0 {
+                    image[at] = opaque(FILL_COLOR);
+                }
+            }
+        }
+        image
+    }
+
     /// Нарисовать курсор в собираемой полосе кадра.
     ///
     /// `dy` — сдвиг координат экрана к координатам полосы. Курсор рисуется в

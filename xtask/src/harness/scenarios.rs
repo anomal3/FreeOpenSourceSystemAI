@@ -1762,7 +1762,51 @@ pub const ALL: &[Scenario] = &[
             Step::Await("virtio-gpu draws", 15_000),
             Step::Wait(3_000),
             Step::Painted("03-terminal"),
+
+            // Аппаратный курсор (фаза 67b): стрелку отдают адаптеру, когда
+            // указатель впервые появляется.
+            Step::Move(40, 30),
+            Step::AwaitAny("the pointer is drawn by the display adapter", 15_000),
+            // И главное: движение мыши больше не собирает кадров. Двенадцать
+            // сдвигов со стрелкой стола — двенадцать кадров минимум сверху;
+            // здесь счётчик видит только вывод самих команд в окно терминала
+            // — 8 кадров по строке текста на обеих архитектурах (17.10).
+            Step::Line("ui reset"),
+            Step::Await("frame counters reset", 15_000),
+            Step::Move(30, 20),
+            Step::Wait(150),
+            Step::Move(-25, 15),
+            Step::Wait(150),
+            Step::Move(40, -10),
+            Step::Wait(150),
+            Step::Move(-35, -20),
+            Step::Wait(150),
+            Step::Move(20, 30),
+            Step::Wait(150),
+            Step::Move(-15, -25),
+            Step::Wait(150),
+            Step::Move(45, 5),
+            Step::Wait(150),
+            Step::Move(-40, 10),
+            Step::Wait(150),
+            Step::Move(10, -35),
+            Step::Wait(150),
+            Step::Move(-20, 25),
+            Step::Wait(150),
+            Step::Move(35, -15),
+            Step::Wait(150),
+            Step::Move(-30, -5),
+            Step::Wait(150),
+            Step::Line("ui"),
+            Step::AtMost("  frame    ", 10, 15_000),
+            // Стрелка стоит там, где стол её считает: щелчок по кнопке меню
+            // попадает в неё.
+            Step::Aim(aim::Aim::MenuButton),
+            Step::Click,
+            Step::Await("desktop     : menu opened", 15_000),
             Step::Absent("virtio-gpu  : flush failed"),
+            Step::Absent("virtio-gpu  : cursor move failed"),
+            Step::Absent("no hardware cursor"),
             Step::Absent("KERNEL PANIC"),
         ],
     },
