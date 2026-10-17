@@ -468,6 +468,13 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     // обрабатывается внутри.
     unsafe { net::init(info.acpi_rsdp) };
 
+    // Звук (фаза 67e): нет устройства — нет и звука, и это не ошибка.
+    // SAFETY: см. выше.
+    if let Ok(root) = unsafe { pci::Root::discover(info.acpi_rsdp) } {
+        // SAFETY: см. выше.
+        unsafe { virtio::snd::probe(&root) };
+    }
+
     // Постоянный адрес — сразу после карты и **до** служб. Порядок обязателен:
     // `/bin/dhcp` смотрит в тот же файл и, увидев `mode=static`, отступается, а
     // аренда, приехавшая на секунду позже применения, перезаписала бы то, что

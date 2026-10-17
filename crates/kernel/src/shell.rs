@@ -741,6 +741,7 @@ fn run_command(line: &str) -> bool {
         "ui" => ui_status(argument),
         "tasks" => tasks(),
         "irq" => interrupt_wakes(argument),
+        "beep" => beep(argument),
         "clear" => {
             ui::clear_shell();
             if !ui::is_active() {
@@ -1398,6 +1399,7 @@ fn help() {
     sprintln!("  power [s]     when the screen goes dark by itself, or 'never'");
     sprintln!("  guard         the kernel's own stack canary");
     sprintln!("  irq [name]    which devices wake the system by interrupt");
+    sprintln!("  beep [hz] [ms]  play a tone (virtio-snd)");
     sprintln!("  shutdown      switch the machine off");
     sprintln!("  reboot        restart the machine");
     sprintln!("  exit          finish the boot and halt");
@@ -1567,6 +1569,29 @@ fn ui_status(argument: &str) {
     }
     for line in ui::timing_lines() {
         sprintln!("  frame    {line}");
+    }
+}
+
+/// Сыграть тон (фаза 67e): `beep [Гц] [мс]`, по умолчанию 440 Гц и секунда.
+fn beep(argument: &str) {
+    let mut words = argument.split_whitespace();
+    let hz = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(440);
+    let ms = words.next().and_then(|word| word.parse::<u32>().ok()).unwrap_or(1000);
+    if !(20..=20_000).contains(&hz) || ms == 0 || ms > 10_000 {
+        sprintln!("  beep     usage: beep [20..20000 Hz] [1..10000 ms]");
+        return;
+    }
+    if !crate::virtio::snd::present() {
+        sprintln!("  beep     no sound device on this machine");
+        return;
+    }
+    let started = crate::time::uptime_ms();
+    match crate::virtio::snd::play_tone(hz, ms) {
+        Ok(()) => sprintln!(
+            "  beep     played {hz} Hz for {ms} ms in {} ms",
+            crate::time::uptime_ms().saturating_sub(started)
+        ),
+        Err(err) => sprintln!("  beep     failed: {err}"),
     }
 }
 

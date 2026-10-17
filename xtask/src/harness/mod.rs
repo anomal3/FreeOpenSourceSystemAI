@@ -39,6 +39,7 @@ mod serial;
 mod shot;
 pub(crate) mod sshkeys;
 mod tlskeys;
+mod tone;
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -727,7 +728,13 @@ fn execute(
     };
 
     let mut extra: Vec<String> = scenario.qemu_args(arch).iter().map(|s| (*s).to_string()).collect();
-    extra.extend(scenario.extra.iter().map(|s| (*s).to_string()));
+    // `{wav}` — файл, куда QEMU пишет звук гостя (фаза 67e): свой у каждого
+    // прогона, потому что архитектуры идут параллельно. Прошлый стирается —
+    // иначе шаг `Tone` прочёл бы вчерашний звук.
+    let wav = sound_file(prefix);
+    let _ = std::fs::remove_file(&wav);
+    let wav_arg = crate::util::qemu_path(&wav)?;
+    extra.extend(scenario.extra.iter().map(|s| s.replace("{wav}", &wav_arg)));
     // Лишние аргументы QEMU для всех сценариев разом, например `-accel whpx`:
     // гостевой код тогда исполняет настоящий процессор, а не эмулятор. Нужно
     // затем, что эмулятор прощает то, чего не прощает железо, — бит Accessed
@@ -1496,6 +1503,16 @@ fn play(
                 say!("             {w}x{h} -> {}", png.display());
                 shots.push(png);
             }
+            Step::Tone(hz) => {
+                say!("  [{at:>6} мс] шаг {index}: в звуке гостя — тон {hz} Гц");
+                let (found, loud_ms) = tone::dominant(&sound_file(prefix))
+                    .with_context(|| format!("шаг {index}"))?;
+                say!("             {found} Гц, громко {loud_ms} мс");
+                let tolerance = (*hz / 50).max(5);
+                if found.abs_diff(*hz) > tolerance {
+                    bail!("шаг {index}: в звуке {found} Гц, а не {hz}");
+                }
+            }
             Step::Painted(name) => {
                 say!("  [{at:>6} мс] шаг {index}: снимок '{name}' обязан быть нарисован");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));
@@ -1530,6 +1547,11 @@ fn play(
         }
     }
     Ok(())
+}
+
+/// Файл звука гостя для прогона с этим префиксом (фаза 67e).
+fn sound_file(prefix: &str) -> PathBuf {
+    paths::test_dir().join(format!("{prefix}-sound.wav"))
 }
 
 /// Назвать вслух снимок, который делался неприлично долго.

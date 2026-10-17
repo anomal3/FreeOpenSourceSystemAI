@@ -32,6 +32,7 @@
 
 pub mod blk;
 pub mod gpu;
+pub mod snd;
 pub mod net;
 
 use core::sync::atomic::{Ordering, fence};

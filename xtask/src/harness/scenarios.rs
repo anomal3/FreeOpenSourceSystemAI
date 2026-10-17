@@ -221,6 +221,11 @@ pub enum Step {
     /// разных цветов (фаза 67a). У virtio-gpu картинка доходит до хоста только
     /// по команде драйвера: забытый перенос — это чёрный кадр, а не старый.
     Painted(&'static str),
+    /// Проверить, что в звуке гостя (`{wav}` в аргументах QEMU) есть тон этой
+    /// частоты, — с допуском в 2 % (фаза 67e). Частота меряется по
+    /// пересечениям нуля на самом громком участке: тишина или не тот тон —
+    /// провал.
+    Tone(u32),
     /// Сбросить машину, ничего не спрашивая у гостя (`system_reset` монитора).
     ///
     /// Это и есть «выдернули шнур»: система не получает ни уведомления, ни
@@ -1774,6 +1779,45 @@ pub const ALL: &[Scenario] = &[
             Step::Await("power       : confirmed in the start menu", 15_000),
             Step::Await("shutting down", 15_000),
             Step::Exits(30_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "sound",
+        about: "Звук (фаза 67e): virtio-snd, тон 440 Гц из ядра — в файле WAV у QEMU тот же тон, сыгранный в темпе устройства.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // Всё, что гость сыграет, QEMU пишет в файл: `{wav}` — свой у
+        // каждого прогона (`build/test/<префикс>-sound.wav`).
+        extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
+        steps: &[
+            Step::AwaitAny("virtio-snd  : at ", BOOT),
+            Step::Await("freeos> ", BOOT),
+            Step::Wait(2_000),
+            Step::Line("beep 440 2000"),
+            // Устройство возвращает период, когда сыграло его, — значит, две
+            // секунды звука не могут уйти быстрее двух секунд: драйвер, который
+            // свалил бы всё в очередь разом, здесь бы и попался.
+            Step::AtLeast("  beep     played 440 Hz for 2000 ms in ", 1_800, 30_000),
+            Step::Wait(1_000),
+            Step::Tone(440),
+            Step::Absent("beep     failed"),
             Step::Absent("KERNEL PANIC"),
         ],
     },
