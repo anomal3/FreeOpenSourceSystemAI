@@ -82,6 +82,13 @@ enum How {
     /// вшиваются в `libmbedcrypto.a`. Так и велит его `README` для
     /// кросс-сборки: компилятор — переменной, настройки — файлом.
     MbedTls,
+    /// SDL2 (фаза 68b): без `configure`, как SDL велит переносить себя на
+    /// новую платформу (`docs/README-porting.md`): свои настройки
+    /// (`SDL_config_freeos.h`), свои драйверы видео и звука и список
+    /// исходников (`Makefile.freeos`) — всё из `ports/sdl2`. В самих
+    /// исходниках SDL правка одна, `ports/sdl2/freeos.patch`: имя платформы и
+    /// два драйвера в списках SDL.
+    Sdl2,
 }
 
 /// Свои ключи проекта, собираемого GNU `configure`.
@@ -140,7 +147,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 11] = [
+const PROJECTS: [Project; 12] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -430,6 +437,18 @@ const PROJECTS: [Project; 11] = [
         how: How::Files(&[("ttf/DejaVuSans.ttf", "DejaVuSans.ttf"), ("LICENSE", "DejaVu-LICENSE")]),
         installs: &[],
     },
+    // Окна, ввод и звук для игр и мультимедиа (фаза 68b): на SDL2 стоит
+    // большая часть открытых 2D-игр. Хеш — тот, что GitHub публикует рядом с
+    // архивом релиза (`digest`, сверено 2026-10-17).
+    Project {
+        name: "sdl2",
+        version: "2.32.10",
+        url: "https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-2.32.10.tar.gz",
+        sha256: "5f5993c530f084535c65a6879e9b26ad441169b3e25d789d83287040a9ca5165",
+        unpacked: "SDL2-2.32.10",
+        how: How::Sdl2,
+        installs: &["lib/libSDL2.a", "include/SDL2/SDL.h", "include/SDL2/SDL_config_freeos.h", "lib/pkgconfig/sdl2.pc"],
+    },
 ];
 
 /// Собрать чужие проекты под все указанные архитектуры: все или только
@@ -636,6 +655,30 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
                      cp library/libmbedcrypto.a library/libmbedx509.a library/libmbedtls.a {prefix}/lib/"
                 ),
                 &format!("install mbedtls {}", arch.name()),
+            )?;
+        }
+        How::Sdl2 => {
+            let ports = crate::paths::workspace_root().join("ports/sdl2");
+            fs::copy(ports.join("SDL_config_freeos.h"), work.join("include/SDL_config_freeos.h"))?;
+            fs::create_dir_all(work.join("src/video/freeos"))?;
+            fs::copy(ports.join("video/SDL_freeosvideo.c"), work.join("src/video/freeos/SDL_freeosvideo.c"))?;
+            fs::create_dir_all(work.join("src/audio/freeos"))?;
+            fs::copy(ports.join("audio/SDL_freeosaudio.c"), work.join("src/audio/freeos/SDL_freeosaudio.c"))?;
+            fs::copy(ports.join("Makefile.freeos"), work.join("Makefile.freeos"))?;
+            run_shell(
+                &work,
+                &format!("patch -p1 -i {}", to_posix(&ports.join("freeos.patch"))),
+                &format!("patch sdl2 {}", arch.name()),
+            )?;
+            let shell = format!("SHELL={}", make_shell()?);
+            let cc = format!("CC={triple}-cc");
+            let ar = format!("AR={triple}-ar");
+            let install_prefix = format!("PREFIX={prefix}");
+            run_make(&work, &["-f", "Makefile.freeos", "-j6", &shell, &cc, &ar], &format!("make sdl2 {}", arch.name()))?;
+            run_make(
+                &work,
+                &["-f", "Makefile.freeos", "install", &shell, &cc, &ar, &install_prefix],
+                &format!("make install sdl2 {}", arch.name()),
             )?;
         }
         How::MakePlatform(platform) => {

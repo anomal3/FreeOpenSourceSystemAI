@@ -1,0 +1,75 @@
+# SDL2 для FreeOS (фаза 68b).
+#
+# Сборка без `configure` — так, как SDL велит переносить себя на новую
+# платформу (`docs/README-porting.md`, способ 2, и `Makefile.minimal`):
+# свой `SDL_config_freeos.h` и список исходников. Список — тот же, что у
+# `Makefile.minimal`, только вместо заглушек там, где в системе есть
+# настоящее: потоки POSIX, часы Unix, свои видео и звук.
+#
+# Зовёт `xtask thirdparty`: `make -f Makefile.freeos CC=... AR=...`, затем
+# `make -f Makefile.freeos install PREFIX=<sysroot>`.
+
+CC ?= cc
+AR ?= ar
+CFLAGS ?= -O2
+PREFIX ?= /usr
+VERSION = 2.32.10
+
+CPPFLAGS += -Iinclude
+
+DIRS = \
+	src \
+	src/atomic \
+	src/audio \
+	src/audio/dummy \
+	src/audio/freeos \
+	src/cpuinfo \
+	src/events \
+	src/file \
+	src/haptic \
+	src/haptic/dummy \
+	src/hidapi \
+	src/joystick \
+	src/joystick/dummy \
+	src/loadso/dummy \
+	src/power \
+	src/filesystem/dummy \
+	src/locale \
+	src/locale/dummy \
+	src/misc \
+	src/misc/dummy \
+	src/render \
+	src/render/software \
+	src/sensor \
+	src/sensor/dummy \
+	src/stdlib \
+	src/libm \
+	src/thread \
+	src/thread/pthread \
+	src/timer \
+	src/timer/unix \
+	src/video \
+	src/video/yuv2rgb \
+	src/video/dummy \
+	src/video/freeos
+
+SOURCES := $(foreach dir,$(DIRS),$(wildcard $(dir)/*.c))
+OBJECTS := $(patsubst %.c,obj/%.o,$(SOURCES))
+
+all: libSDL2.a
+
+obj/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+libSDL2.a: $(OBJECTS)
+	rm -f $@
+	$(AR) rcs $@ $(OBJECTS)
+
+install: libSDL2.a
+	mkdir -p $(PREFIX)/include/SDL2 $(PREFIX)/lib/pkgconfig
+	cp include/*.h $(PREFIX)/include/SDL2/
+	cp libSDL2.a $(PREFIX)/lib/
+	printf 'prefix=%s\nlibdir=$${prefix}/lib\nincludedir=$${prefix}/include\n\nName: sdl2\nDescription: Simple DirectMedia Layer\nVersion: %s\nLibs: -L$${libdir} -lSDL2 -lfreeos\nCflags: -I$${includedir}/SDL2\n' '$(PREFIX)' '$(VERSION)' > $(PREFIX)/lib/pkgconfig/sdl2.pc
+
+.PHONY: all install

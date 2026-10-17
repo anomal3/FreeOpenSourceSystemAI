@@ -1686,8 +1686,9 @@ pub const ALL: &[Scenario] = &[
             // Пятьдесят — `sockfd` (фаза 65a). Пятьдесят одна — `cnet` (фаза 65b).
             // Пятьдесят две — `ctls` (фаза 65c), едет, только если собран mbedTLS.
             // Пятьдесят три — `curl` (фаза 65d), если собран `thirdparty`.
-            // Пятьдесят четыре — `csound` (фаза 67f).
-            Step::Expect("/bin holds 54 programs"),
+            // Пятьдесят четыре — `csound` (фаза 67f). Пятьдесят пять — `csdl`
+            // (фаза 68b), если собран SDL2 (`thirdparty`).
+            Step::Expect("/bin holds 55 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -1935,6 +1936,65 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_000),
             Step::Tone(660),
             Step::Absent("csound: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "sdl",
+        about: "SDL2 (фаза 68b): окно стола через SDL_CreateWindow, программный рисовальщик, таймер, звук 44,1 кГц float моно, пересчитанный SDL, щелчок, текст и крестик.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+            // Набор — когда службы встали: см. `mono-drawing`.
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Line("run /bin/csdl 440 1500"),
+            Step::Await("csdl: shown 320x200, renderer software", 60_000),
+            Step::Await("csdl: played 1500 ms of 440 Hz", 60_000),
+            Step::Await("csdl: waiting for input", 30_000),
+            Step::Expect("csdl: SDL 2.32.10, video freeos, audio freeos"),
+            Step::Expect("csdl: ok rectangles are drawn in their colours"),
+            Step::Expect("csdl: ok a timer fires on its own thread"),
+            Step::Expect("csdl: ok the audio callback runs"),
+            Step::Wait(2_000),
+            Step::Shot("sdl"),
+            // Точка в красном прямоугольнике (20,20 размером 100x60), в
+            // координатах содержимого окна.
+            Step::Aim(Aim::Program("SDL Demo", 60, 50)),
+            Step::Click,
+            Step::Await("csdl: click 1 button 1 at 60,50", 30_000),
+            Step::Wait(1_000),
+            Step::Type("abc"),
+            Step::Await("csdl: text 'abc'", 30_000),
+            Step::Expect("csdl: key A"),
+            Step::Wait(1_000),
+            Step::Shot("sdl-used"),
+            Step::Aim(Aim::Close("SDL Demo")),
+            Step::Click,
+            Step::Await("csdl: quit", 30_000),
+            Step::Await("csdl: done, 0 check(s) failed", 30_000),
+            Step::Await("/bin/csdl: exited with code 0", 30_000),
+            Step::Tone(440),
+            Step::Absent("csdl: FAILED"),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],

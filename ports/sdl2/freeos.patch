@@ -1,0 +1,86 @@
+diff -ru a/include/SDL_config.h b/include/SDL_config.h
+--- a/include/SDL_config.h	2026-10-17 18:49:54.351232052 +0000
++++ b/include/SDL_config.h	2026-10-17 18:49:54.454233001 +0000
+@@ -47,6 +47,8 @@
+ #include "SDL_config_emscripten.h"
+ #elif defined(__NGAGE__)
+ #include "SDL_config_ngage.h"
++#elif defined(__FREEOS__)
++#include "SDL_config_freeos.h"
+ #else
+ /* This is a minimal configuration just to get SDL running on new platforms. */
+ #include "SDL_config_minimal.h"
+diff -ru a/include/SDL_platform.h b/include/SDL_platform.h
+--- a/include/SDL_platform.h	2026-10-17 18:49:54.338231932 +0000
++++ b/include/SDL_platform.h	2026-10-17 18:49:54.454233001 +0000
+@@ -140,6 +140,10 @@
+ #undef __QNXNTO__
+ #define __QNXNTO__  1
+ #endif
++#if defined(__freeos__)
++#undef __FREEOS__
++#define __FREEOS__  1
++#endif
+ #if defined(riscos) || defined(__riscos) || defined(__riscos__)
+ #undef __RISCOS__
+ #define __RISCOS__  1
+diff -ru a/src/audio/SDL_audio.c b/src/audio/SDL_audio.c
+--- a/src/audio/SDL_audio.c	2026-10-17 18:49:54.411232605 +0000
++++ b/src/audio/SDL_audio.c	2026-10-17 18:49:54.457233029 +0000
+@@ -129,6 +129,9 @@
+ #ifdef SDL_AUDIO_DRIVER_OS2
+     &OS2AUDIO_bootstrap,
+ #endif
++#ifdef SDL_AUDIO_DRIVER_FREEOS
++    &FREEOSAUDIO_bootstrap,
++#endif
+ #ifdef SDL_AUDIO_DRIVER_DISK
+     &DISKAUDIO_bootstrap,
+ #endif
+diff -ru a/src/audio/SDL_sysaudio.h b/src/audio/SDL_sysaudio.h
+--- a/src/audio/SDL_sysaudio.h	2026-10-17 18:49:54.398232485 +0000
++++ b/src/audio/SDL_sysaudio.h	2026-10-17 18:49:54.456233020 +0000
+@@ -198,6 +198,7 @@
+ extern AudioBootStrap HAIKUAUDIO_bootstrap;
+ extern AudioBootStrap COREAUDIO_bootstrap;
+ extern AudioBootStrap DISKAUDIO_bootstrap;
++extern AudioBootStrap FREEOSAUDIO_bootstrap;
+ extern AudioBootStrap DUMMYAUDIO_bootstrap;
+ extern AudioBootStrap FUSIONSOUND_bootstrap;
+ extern AudioBootStrap aaudio_bootstrap;
+diff -ru a/src/dynapi/SDL_dynapi.h b/src/dynapi/SDL_dynapi.h
+--- a/src/dynapi/SDL_dynapi.h	2026-10-17 18:49:54.362232154 +0000
++++ b/src/dynapi/SDL_dynapi.h	2026-10-17 18:49:54.455233010 +0000
+@@ -67,6 +67,8 @@
+ #define SDL_DYNAMIC_API 0 /* The N-Gage doesn't support dynamic linking either */
+ #elif defined(__3DS__)
+ #define SDL_DYNAMIC_API 0 /* devkitARM doesn't support dynamic linking */
++#elif defined(__freeos__)
++#define SDL_DYNAMIC_API 0 /* static only, there is no dlopen() */
+ #elif defined(DYNAPI_NEEDS_DLOPEN) && !defined(HAVE_DLOPEN)
+ #define SDL_DYNAMIC_API 0 /* we need dlopen(), but don't have it.... */
+ #endif
+diff -ru a/src/video/SDL_sysvideo.h b/src/video/SDL_sysvideo.h
+--- a/src/video/SDL_sysvideo.h	2026-10-17 18:49:54.372232246 +0000
++++ b/src/video/SDL_sysvideo.h	2026-10-17 18:49:54.455233010 +0000
+@@ -473,6 +473,7 @@
+ extern VideoBootStrap RPI_bootstrap;
+ extern VideoBootStrap KMSDRM_bootstrap;
+ extern VideoBootStrap KMSDRM_LEGACY_bootstrap;
++extern VideoBootStrap FREEOS_bootstrap;
+ extern VideoBootStrap DUMMY_bootstrap;
+ extern VideoBootStrap DUMMY_evdev_bootstrap;
+ extern VideoBootStrap Wayland_bootstrap;
+diff -ru a/src/video/SDL_video.c b/src/video/SDL_video.c
+--- a/src/video/SDL_video.c	2026-10-17 18:49:54.386232375 +0000
++++ b/src/video/SDL_video.c	2026-10-17 18:49:54.456233020 +0000
+@@ -145,6 +145,9 @@
+ #ifdef SDL_VIDEO_DRIVER_OFFSCREEN
+     &OFFSCREEN_bootstrap,
+ #endif
++#ifdef SDL_VIDEO_DRIVER_FREEOS
++    &FREEOS_bootstrap,
++#endif
+ #ifdef SDL_VIDEO_DRIVER_DUMMY
+     &DUMMY_bootstrap,
+ #ifdef SDL_INPUT_LINUXEV

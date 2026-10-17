@@ -167,7 +167,7 @@ pub struct CProgram {
 }
 
 /// Программы на C, которые едут в `/bin`.
-pub const C_PROGRAMS: [CProgram; 11] = [
+pub const C_PROGRAMS: [CProgram; 12] = [
     CProgram { name: "cdemo", needs: None, libs: &[], includes: &[] },
     // Переполняет свой стек нарочно: доказывает, что канарейка стека есть и у
     // программ на C. См. `libc/examples/csmash.c` и `__stack_chk_fail` в `crt0.c`.
@@ -214,6 +214,11 @@ pub const C_PROGRAMS: [CProgram; 11] = [
         libs: &["libmbedtls.a", "libmbedx509.a", "libmbedcrypto.a"],
         includes: &[],
     },
+    // SDL2 (фаза 68b): окно стола, программный рисовальщик, таймер, звук
+    // через `SYS_SOUND` и ввод — тем путём, каким ими пользуется игра. См.
+    // `libc/examples/csdl.c`.
+    // Окна SDL — функции `<freeos/window.h>`, а они в `libfreeos.a`.
+    CProgram { name: "csdl", needs: Some("libSDL2.a"), libs: &["libSDL2.a", "libfreeos.a"], includes: &["SDL2"] },
 ];
 
 /// Программы, которые собрал **не наш** компилятор и не наш рецепт.
