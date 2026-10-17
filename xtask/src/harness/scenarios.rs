@@ -775,6 +775,94 @@ const SMP_STEPS: &[Step] = &[
     Step::Absent(", 0 switches (0 forced), idle 0% of its ticks"),
 ];
 
+/// Шаги замера `lag` — общие у `lag` и `lag-gpu` (фаза 67): одни и те же
+/// жесты на двух адаптерах, чтобы числа сравнивались, а не угадывались.
+const LAG_STEPS: &[Step] = &[
+            // Загрузка по этапам: стенд печатает время начала каждого шага,
+            // значит разность соседних строк — длительность этапа. Прошивка,
+            // загрузчик, ядро до файловой системы, initrd с его оглавлением,
+            // корень и ввод, стол, службы до приглашения.
+            Step::Await("FreeOS bootloader", BOOT),
+            Step::Await(crate::version::KERNEL_BANNER, BOOT),
+            Step::Await("---- filesystem", BOOT),
+            Step::Await("---- root filesystem", BOOT),
+            Step::Await("---- display", BOOT),
+            Step::Await("---- scheduler", BOOT),
+            Step::Await("freeos> ", BOOT),
+            // Простой: два снимка планировщика с паузой между ними. Время
+            // холостой задачи (`#0 idle … ms on cpu`) за паузу, делённое на
+            // паузу, — доля простоя. Гость, который в простое крутит опрос, под
+            // эмуляцией отнимает процессор у самого себя.
+            Step::Wait(5_000),
+            Step::Line("tasks"),
+            Step::Await("% of its ticks", 15_000),
+            Step::Wait(10_000),
+            Step::Line("tasks"),
+            Step::Await("% of its ticks", 15_000),
+            // Перетаскивание: тридцать коротких отчётов, как от руки, а не один
+            // прыжок. Счётчики обнуляются перед жестом и читаются после.
+            Step::Aim(Aim::Title("Terminal")),
+            Step::Line("ui reset"),
+            Step::Await("ui       frame counters reset", 15_000),
+            Step::Press,
+            Step::Await("desktop     : drag 'Terminal'", 15_000),
+            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
+            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
+            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
+            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
+            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
+            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
+            Step::Release,
+            Step::Await("desktop     : moved 'Terminal' to ", 15_000),
+            Step::Line("ui"),
+            Step::Await("frame    wall ", 15_000),
+            // Свернуть и вернуть — анимация полёта в панель и обратно.
+            Step::Line("ui reset"),
+            Step::Await("ui       frame counters reset", 15_000),
+            Step::Aim(Aim::Minimize("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : minimized 'Terminal'", 15_000),
+            Step::Wait(2_000),
+            Step::Line("ui"),
+            Step::Await("frame    wall ", 15_000),
+            Step::Line("ui reset"),
+            Step::Await("ui       frame counters reset", 15_000),
+            Step::Aim(Aim::Icon(1)),
+            Step::DoubleClick,
+            Step::Await("desktop     : restored 'Terminal'", 15_000),
+            Step::Wait(2_000),
+            Step::Line("ui"),
+            Step::Await("frame    wall ", 15_000),
+            // Растянуть за уголок — та задержка, о которой говорил Роман
+            // (16.10): размер меняется отложенно, раз в кадр, и каждый шаг —
+            // новая поверхность окна (фаза 67).
+            Step::Aim(Aim::Grip("Terminal")),
+            Step::Line("ui reset"),
+            Step::Await("ui       frame counters reset", 15_000),
+            Step::Press,
+            Step::Await("desktop     : resizing 'Terminal'", 15_000),
+            Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4),
+            Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4),
+            Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4),
+            Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4),
+            Step::Release,
+            Step::Await("desktop     : resized 'Terminal'", 15_000),
+            Step::Line("ui"),
+            Step::Await("frame    wall ", 15_000),
+            // Развернуть на весь стол — самый большой кадр из обычных.
+            Step::Line("ui reset"),
+            Step::Await("ui       frame counters reset", 15_000),
+            Step::Aim(Aim::Maximize("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : resized 'Terminal'", 15_000),
+            Step::Wait(2_000),
+            Step::Line("ui"),
+            Step::Await("frame    wall ", 15_000),
+            Step::Line("exit"),
+            Step::Await("finishing the session", 30_000),
+            Step::Absent("KERNEL PANIC"),
+];
+
 pub const ALL: &[Scenario] = &[
     Scenario {
         name: "boot",
@@ -2132,75 +2220,36 @@ pub const ALL: &[Scenario] = &[
         // ошиблась четыре раза подряд, поэтому сначала цифры в одинаковых
         // условиях (debug и release, с ускорением и без), и только потом
         // починка.
-        steps: &[
-            // Загрузка по этапам: стенд печатает время начала каждого шага,
-            // значит разность соседних строк — длительность этапа. Прошивка,
-            // загрузчик, ядро до файловой системы, initrd с его оглавлением,
-            // корень и ввод, стол, службы до приглашения.
-            Step::Await("FreeOS bootloader", BOOT),
-            Step::Await(crate::version::KERNEL_BANNER, BOOT),
-            Step::Await("---- filesystem", BOOT),
-            Step::Await("---- root filesystem", BOOT),
-            Step::Await("---- display", BOOT),
-            Step::Await("---- scheduler", BOOT),
-            Step::Await("freeos> ", BOOT),
-            // Простой: два снимка планировщика с паузой между ними. Время
-            // холостой задачи (`#0 idle … ms on cpu`) за паузу, делённое на
-            // паузу, — доля простоя. Гость, который в простое крутит опрос, под
-            // эмуляцией отнимает процессор у самого себя.
-            Step::Wait(5_000),
-            Step::Line("tasks"),
-            Step::Await("% of its ticks", 15_000),
-            Step::Wait(10_000),
-            Step::Line("tasks"),
-            Step::Await("% of its ticks", 15_000),
-            // Перетаскивание: тридцать коротких отчётов, как от руки, а не один
-            // прыжок. Счётчики обнуляются перед жестом и читаются после.
-            Step::Aim(Aim::Title("Terminal")),
-            Step::Line("ui reset"),
-            Step::Await("ui       frame counters reset", 15_000),
-            Step::Press,
-            Step::Await("desktop     : drag 'Terminal'", 15_000),
-            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
-            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
-            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
-            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
-            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
-            Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4), Step::Move(8, 4),
-            Step::Release,
-            Step::Await("desktop     : moved 'Terminal' to ", 15_000),
-            Step::Line("ui"),
-            Step::Await("frame    wall ", 15_000),
-            // Свернуть и вернуть — анимация полёта в панель и обратно.
-            Step::Line("ui reset"),
-            Step::Await("ui       frame counters reset", 15_000),
-            Step::Aim(Aim::Minimize("Terminal")),
-            Step::Click,
-            Step::Await("desktop     : minimized 'Terminal'", 15_000),
-            Step::Wait(2_000),
-            Step::Line("ui"),
-            Step::Await("frame    wall ", 15_000),
-            Step::Line("ui reset"),
-            Step::Await("ui       frame counters reset", 15_000),
-            Step::Aim(Aim::Icon(1)),
-            Step::DoubleClick,
-            Step::Await("desktop     : restored 'Terminal'", 15_000),
-            Step::Wait(2_000),
-            Step::Line("ui"),
-            Step::Await("frame    wall ", 15_000),
-            // Развернуть на весь стол — самый большой кадр из обычных.
-            Step::Line("ui reset"),
-            Step::Await("ui       frame counters reset", 15_000),
-            Step::Aim(Aim::Maximize("Terminal")),
-            Step::Click,
-            Step::Await("desktop     : resized 'Terminal'", 15_000),
-            Step::Wait(2_000),
-            Step::Line("ui"),
-            Step::Await("frame    wall ", 15_000),
-            Step::Line("exit"),
-            Step::Await("finishing the session", 30_000),
-            Step::Absent("KERNEL PANIC"),
-        ],
+        steps: LAG_STEPS,
+    },
+    Scenario {
+        name: "lag-gpu",
+        about: "Тот же замер на virtio-gpu (фаза 67): перенос изменённого к хосту и курсор адаптера против stdvga и ramfb.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &["-device", "virtio-gpu-pci"],
+        // Сценарий меряет, а не проверяет: числа читаются из журнала, и порог
+        // здесь не стоит нарочно. Урок телефона (16–17.09) — догадка без замера
+        // ошиблась четыре раза подряд, поэтому сначала цифры в одинаковых
+        // условиях (debug и release, с ускорением и без), и только потом
+        // починка.
+        steps: LAG_STEPS,
     },
     Scenario {
         name: "tablet",

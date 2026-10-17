@@ -724,6 +724,15 @@ static BANDS: AtomicU64 = AtomicU64::new(0);
 static DRAW_NS: AtomicU64 = AtomicU64::new(0);
 static BLIT_NS: AtomicU64 = AtomicU64::new(0);
 static POINTS: AtomicU64 = AtomicU64::new(0);
+/// Перенос собранного к хосту (virtio-gpu, фаза 67a) — отдельно от вывода:
+/// у stdvga и ramfb его нет вовсе, и в одной цифре с `blit` разница между
+/// адаптерами пряталась бы.
+static FLUSH_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Записать, во что обошёлся перенос прямоугольника к хосту.
+pub fn note_flush(ns: u64) {
+    FLUSH_NS.fetch_add(ns, Ordering::Relaxed);
+}
 
 /// Записать, во что обошлась одна полоса кадра. Зовётся из композитора.
 pub fn note_band(draw_ns: u64, blit_ns: u64, points: u64) {
@@ -917,7 +926,7 @@ pub fn reset_timing() {
     for counter in [
         &FRAMES, &BANDS, &DRAW_NS, &BLIT_NS, &POINTS, &WALL_NS, &ICONS_NS, &WINDOWS_NS,
         &SHADOW_NS, &TOP_NS, &FULL_FRAMES, &PART_FRAMES, &OVERFLOWS, &PART_RECTS,
-        &RECT_POINTS, &DOCK_BANDS, &DOCK_NS, &WORST_FRAME_NS,
+        &RECT_POINTS, &DOCK_BANDS, &DOCK_NS, &WORST_FRAME_NS, &FLUSH_NS,
     ] {
         counter.store(0, Ordering::Relaxed);
     }
@@ -939,9 +948,10 @@ pub fn timing_lines() -> [alloc::string::String; 5] {
     [
         alloc::format!("{frames} frames, {bands} bands, {} Mpx", points / 1_000_000),
         alloc::format!(
-            "per frame: draw {} us, blit {} us, worst {} us",
+            "per frame: draw {} us, blit {} us, flush {} us, worst {} us",
             draw_ns / n / 1000,
             blit_ns / n / 1000,
+            FLUSH_NS.load(Ordering::Relaxed) / n / 1000,
             worst_frame_ns() / 1000,
         ),
         alloc::format!(
@@ -1490,6 +1500,13 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                     rect.y
                 );
             }
+        }
+        // Растяжение за уголок — так же, как разворот: новый прямоугольник в
+        // журнал. Без него снаружи не видно, где теперь кнопки окна, и стенд
+        // целился в «развернуть» по старому размеру (сценарий `lag`, фаза 67).
+        if let Some(app) = desktop.dragging().filter(|_| desktop.drag_resizes()) {
+            kprintln!("  desktop     : resized '{}'", name_of(desktop, app));
+            log_window(desktop, app, true);
         }
         desktop.set_drag(None);
     }

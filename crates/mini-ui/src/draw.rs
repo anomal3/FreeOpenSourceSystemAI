@@ -47,6 +47,8 @@
 //! достаёт штрих), и вся полоса заливается одним вызовом с одним покрытием.
 //! Остаётся высота, умноженная на ширину угловой зоны.
 
+use alloc::vec::Vec;
+
 use crate::{Color, Rect, Surface};
 
 /// Насыщенность в 1/255. 255 — непрозрачно.
@@ -674,6 +676,19 @@ pub fn shadow(
     let inset = shape.corner().max(reach + 1);
     let split = 2 * inset < rect.w as i32;
 
+    // И второй приём — по вертикали (фаза 67). На строках прямого участка
+    // сторон, ниже верхних скруглений и выше нижних, расстояние до фигуры от
+    // строки не зависит вовсе: снаружи по горизонтали оно — `qx − r`, внутри
+    // боковых полос — `max(qx, qy) − r`, и при `qy ≤ r − inset` это тоже
+    // `qx − r`. Значит, насыщенность боковых полос считается один раз, а все
+    // остальные такие строки только смешиваются с готовой. Замер `lag` (17.10):
+    // тень окна — 11 из 12,5 мс кадра растяжения за уголок, почти вся — корни.
+    let straight = |py: i32| {
+        (i64::from(py) - i64::from(shape.cy)).abs() - i64::from(shape.hy - shape.r)
+            <= i64::from(shape.r) - i64::from(fxi(inset))
+    };
+    let mut sides: Option<(Vec<u8>, Vec<u8>)> = None;
+
     for y in area.y..area.bottom() {
         let py = fxi(y) + HALF;
         if !split {
@@ -685,6 +700,28 @@ pub fn shadow(
         }
         let left = (rect.x + inset).clamp(area.x, area.right());
         let right = (rect.right() - inset).clamp(left, area.right());
+        if straight(py) {
+            let (lefts, rights) = sides.get_or_insert_with(|| {
+                let lefts = (area.x..left)
+                    .map(|x| shadow_alpha(shape.distance(fxi(x) + HALF, py), falloff))
+                    .collect();
+                let rights = (right..area.right())
+                    .map(|x| shadow_alpha(shape.distance(fxi(x) + HALF, py), falloff))
+                    .collect();
+                (lefts, rights)
+            });
+            for (x, strength) in (area.x..left).zip(lefts.iter()) {
+                if *strength != 0 {
+                    blend_pixel(surface, x, y, color, scale(*strength, alpha));
+                }
+            }
+            for (x, strength) in (right..area.right()).zip(rights.iter()) {
+                if *strength != 0 {
+                    blend_pixel(surface, x, y, color, scale(*strength, alpha));
+                }
+            }
+            continue;
+        }
         for x in area.x..left {
             let strength = shadow_alpha(shape.distance(fxi(x) + HALF, py), falloff);
             blend_pixel(surface, x, y, color, scale(strength, alpha));
@@ -925,6 +962,96 @@ pub fn line(
                 continue;
             }
             blend_pixel(surface, x, y, color, scale(cover, alpha));
+        }
+    }
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::*;
+
+    /// Тень до фазы 67 — точка за точкой, с корнем на каждую. Новая обязана
+    /// совпасть с ней побайтно: приём со строками прямого участка меняет
+    /// только то, сколько раз считается одно и то же.
+    #[allow(dead_code)]
+    fn shadow_reference(
+        surface: &mut Surface,
+        rect: Rect,
+        radius: u32,
+        spread: u32,
+        color: Color,
+        alpha: Alpha,
+    ) {
+        if alpha == 0 || spread == 0 || !sane(rect) {
+            return;
+        }
+        let shape = Round::new(rect, radius);
+        let reach = spread.min(LIMIT) as i32;
+        let falloff = fxu(spread);
+        let area = clip(
+            surface,
+            Rect::new(
+                rect.x.saturating_sub(reach),
+                rect.y.saturating_sub(reach),
+                rect.w.saturating_add(2 * reach as u32),
+                rect.h.saturating_add(2 * reach as u32),
+            ),
+        );
+        if area.is_empty() {
+            return;
+        }
+    
+        // Тот же приём, что в `ring`: в серединном пролёте расстояние постоянно
+        // вдоль строки, и вся полоса тени над окном или под ним заливается одним
+        // вызовом вместо тысяч корней.
+        let inset = shape.corner().max(reach + 1);
+        let split = 2 * inset < rect.w as i32;
+    
+        for y in area.y..area.bottom() {
+            let py = fxi(y) + HALF;
+            if !split {
+                for x in area.x..area.right() {
+                    let strength = shadow_alpha(shape.distance(fxi(x) + HALF, py), falloff);
+                    blend_pixel(surface, x, y, color, scale(strength, alpha));
+                }
+                continue;
+            }
+            let left = (rect.x + inset).clamp(area.x, area.right());
+            let right = (rect.right() - inset).clamp(left, area.right());
+            for x in area.x..left {
+                let strength = shadow_alpha(shape.distance(fxi(x) + HALF, py), falloff);
+                blend_pixel(surface, x, y, color, scale(strength, alpha));
+            }
+            let strength = shadow_alpha(shape.edge_distance(py), falloff);
+            fill_span(surface, y, left, right, Paint::Solid(color), alpha, strength);
+            for x in right..area.right() {
+                let strength = shadow_alpha(shape.distance(fxi(x) + HALF, py), falloff);
+                blend_pixel(surface, x, y, color, scale(strength, alpha));
+            }
+        }
+    }
+
+    #[test]
+    fn the_cached_shadow_matches_the_point_by_point_one() {
+        let cases = [
+            (Rect::new(60, 50, 300, 200), 12, 24),
+            (Rect::new(-40, -30, 260, 180), 8, 16),
+            (Rect::new(100, 80, 41, 300), 20, 30),
+            (Rect::new(10, 10, 500, 30), 14, 40),
+            (Rect::new(200, 150, 340, 260), 0, 12),
+            (Rect::new(30, 40, 120, 90), 60, 20),
+        ];
+        for (rect, radius, spread) in cases {
+            let backdrop = Color::rgb(0x30, 0x60, 0x90);
+            let mut cached = Surface::new(480, 360, backdrop).expect("поверхность");
+            let mut reference = Surface::new(480, 360, backdrop).expect("поверхность");
+            shadow(&mut cached, rect, radius, spread, Color::rgb(0, 0, 0), 120);
+            shadow_reference(&mut reference, rect, radius, spread, Color::rgb(0, 0, 0), 120);
+            for y in 0..360 {
+                for x in 0..480 {
+                    assert_eq!(cached.get(x, y), reference.get(x, y), "{rect:?} r{radius} s{spread} at {x},{y}");
+                }
+            }
         }
     }
 }

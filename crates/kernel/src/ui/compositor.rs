@@ -1078,6 +1078,12 @@ impl Compositor {
         self.drag
     }
 
+    /// Захват меняет размер окна, а не двигает его.
+    #[must_use]
+    pub const fn drag_resizes(&self) -> bool {
+        self.drag_resizes
+    }
+
     /// Сдвинуть окно, которое тащат, — или изменить его размер.
     pub fn drag_by(&mut self, dx: i32, dy: i32) {
         let Some(app) = self.drag else {
@@ -2545,7 +2551,9 @@ impl Compositor {
         // У virtio-gpu картинка — в обычной памяти, и хост узнаёт об
         // изменении только так (фаза 67a); у stdvga и ramfb это ничего не
         // делает.
+        let started = crate::time::uptime_ns();
         crate::display::flush(rect.x, rect.y, rect.w, rect.h);
+        super::note_flush(crate::time::uptime_ns().wrapping_sub(started));
     }
 
 
