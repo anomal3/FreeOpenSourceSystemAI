@@ -644,8 +644,10 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
     // — то есть проверяет совсем другой путь в драйвере, тот самый, которым
     // система живёт в VirtualBox.
     match opts.pointer {
-        Pointer::Mouse => cmd.args(["-device", &format!("usb-mouse,bus={}", opts.usb.bus())]),
-        Pointer::Tablet => cmd.args(["-device", &format!("usb-tablet,bus={}", opts.usb.bus())]),
+        // `id` — ради сценария, которому надо выдернуть мышь (фаза 67g): пока
+        // она подключена, движение QEMU отдаёт ей, а не мыши virtio.
+        Pointer::Mouse => cmd.args(["-device", &format!("usb-mouse,bus={},id=usbmouse", opts.usb.bus())]),
+        Pointer::Tablet => cmd.args(["-device", &format!("usb-tablet,bus={},id=usbmouse", opts.usb.bus())]),
     };
 
     cmd.arg("-m").arg(&opts.memory);

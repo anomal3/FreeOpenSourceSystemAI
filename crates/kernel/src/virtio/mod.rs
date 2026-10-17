@@ -32,6 +32,7 @@
 
 pub mod blk;
 pub mod gpu;
+pub mod input;
 pub mod snd;
 pub mod net;
 
@@ -327,6 +328,20 @@ impl Transport {
         };
         // SAFETY: контракт функции; окно отображено в `open`.
         unsafe { read8(base, offset) }
+    }
+
+    /// Записать байт конфигурации, специфичной для типа устройства (фаза 67g):
+    /// у virtio-input так выбирают, о чём спрашивают, — имя, виды событий,
+    /// диапазон оси.
+    ///
+    /// # Safety
+    ///
+    /// Смещение должно лежать внутри окна, объявленного возможностью.
+    pub unsafe fn device_config_write8(&self, offset: usize, value: u8) {
+        if let Some(base) = self.device {
+            // SAFETY: контракт функции; окно отображено в `open`.
+            unsafe { write8(base, offset, value) };
+        }
     }
 
     /// Прочитать поле конфигурации, специфичной для типа устройства.

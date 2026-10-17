@@ -747,6 +747,16 @@ fn start_input(info: &BootInfo) -> bool {
     // SAFETY: те же условия, что у xHCI выше.
     unsafe { usb::ohci::init(info.acpi_rsdp) };
 
+    // virtio-input (фаза 67g): клавиатура, мышь и планшет virtio — события
+    // готовые, по прерыванию. Рядом с USB, а не вместо: что из них подключено,
+    // решает машина.
+    //
+    // SAFETY: те же условия, что у xHCI выше.
+    if let Ok(root) = unsafe { pci::Root::discover(info.acpi_rsdp) } {
+        // SAFETY: см. выше.
+        unsafe { virtio::input::probe_all(&root) };
+    }
+
     let sources = input::sources();
 
     if !sources.any() {
