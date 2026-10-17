@@ -233,6 +233,9 @@ pub enum Step {
     /// пересечениям нуля на самом громком участке: тишина или не тот тон —
     /// провал.
     Tone(u32),
+    /// Проверить, что в звуке гостя хоть что-то слышно не меньше стольких
+    /// миллисекунд (фаза 68e): звуки игры — не один тон.
+    Heard(u64),
     /// Сбросить машину, ничего не спрашивая у гостя (`system_reset` монитора).
     ///
     /// Это и есть «выдернули шнур»: система не получает ни уведомления, ни
@@ -2016,7 +2019,7 @@ pub const ALL: &[Scenario] = &[
     },
     Scenario {
         name: "doom",
-        about: "Первая игра на SDL2 (фаза 68d): пакет freedoom с носителя, doomgeneric с данными Freedoom — заставка, меню, новая игра, выстрел, крестик.",
+        about: "Первая игра на SDL2 (фазы 68d, 68e): пакет freedoom с носителя, doomgeneric с данными Freedoom — заставка, меню, новая игра, выстрелы со звуком, крестик.",
         target: Target::Installed,
         usb_only: false,
         tablet: false,
@@ -2035,7 +2038,8 @@ pub const ALL: &[Scenario] = &[
         big_file: false,
         ssh_key: false,
         memory: "",
-        extra: &[],
+        // Звук (фаза 68e): эффекты Doom через SDL2_mixer, SDL и `SYS_SOUND`.
+        extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await("freeos> ", 90_000),
@@ -2065,6 +2069,8 @@ pub const ALL: &[Scenario] = &[
             Step::Hold("up", 1_500),
             Step::Wait(2_000),
             Step::Shot("doom-game"),
+            // Щелчки меню, выстрелы, шаги — в WAV у QEMU.
+            Step::Heard(500),
             Step::Aim(Aim::Close("DOOM")),
             Step::Click,
             Step::Await("Quit requested", 30_000),

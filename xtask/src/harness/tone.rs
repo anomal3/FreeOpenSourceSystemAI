@@ -17,8 +17,8 @@ use anyhow::{Context, Result, bail};
 /// Окно, по которому меряется громкость, — в кадрах.
 const WINDOW: usize = 1024;
 
-/// Самый громкий участок: частота тона на нём и его длительность в мс.
-pub fn dominant(path: &Path) -> Result<(u32, u64)> {
+/// Левый канал звука гостя и частота кадров.
+fn left_channel(path: &Path) -> Result<(Vec<i32>, u32)> {
     let bytes = std::fs::read(path).with_context(|| format!("нет звука гостя {}", path.display()))?;
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         bail!("{} — не WAV", path.display());
@@ -39,15 +39,35 @@ pub fn dominant(path: &Path) -> Result<(u32, u64)> {
         .chunks_exact(2 * channels)
         .map(|frame| i32::from(i16::from_le_bytes([frame[0], frame[1]])))
         .collect();
+    Ok((samples, rate))
+}
+
+/// Громкость окнами по [`WINDOW`] кадров: среднее абсолютное значение.
+fn loudness(samples: &[i32]) -> Vec<i64> {
+    samples
+        .chunks(WINDOW)
+        .map(|window| window.iter().map(|value| i64::from(value.abs())).sum::<i64>() / window.len() as i64)
+        .collect()
+}
+
+/// Сколько миллисекунд в звуке гостя слышно хоть что-то (фаза 68e): окна,
+/// где средняя громкость не ниже `floor`. Для звуков игры, у которых нет
+/// одного тона, — выстрел, шаги, щелчок меню.
+pub fn heard(path: &Path, floor: i64) -> Result<u64> {
+    let (samples, rate) = left_channel(path)?;
+    let loud = loudness(&samples).iter().filter(|value| **value >= floor).count() as u64;
+    Ok(loud * WINDOW as u64 * 1000 / u64::from(rate.max(1)))
+}
+
+/// Самый громкий участок: частота тона на нём и его длительность в мс.
+pub fn dominant(path: &Path) -> Result<(u32, u64)> {
+    let (samples, rate) = left_channel(path)?;
     if samples.len() < WINDOW * 4 {
         bail!("в звуке гостя {} отсчётов — почти ничего", samples.len());
     }
 
     // Громкость окнами, потом — участок, где она не ниже трети наибольшей.
-    let loudness: Vec<i64> = samples
-        .chunks(WINDOW)
-        .map(|window| window.iter().map(|value| i64::from(value.abs())).sum::<i64>() / window.len() as i64)
-        .collect();
+    let loudness = loudness(&samples);
     let peak = loudness.iter().copied().max().unwrap_or(0);
     if peak < 500 {
         bail!("в звуке гостя тишина (средняя громкость не выше {peak})");

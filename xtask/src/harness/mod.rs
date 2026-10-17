@@ -1523,6 +1523,14 @@ fn play(
                     bail!("шаг {index}: в звуке {found} Гц, а не {hz}");
                 }
             }
+            Step::Heard(min_ms) => {
+                say!("  [{at:>6} мс] шаг {index}: в звуке гостя слышно не меньше {min_ms} мс");
+                let heard = tone::heard(&sound_file(prefix), 300).with_context(|| format!("шаг {index}"))?;
+                say!("             слышно {heard} мс");
+                if heard < *min_ms {
+                    bail!("шаг {index}: слышно {heard} мс, нужно {min_ms}");
+                }
+            }
             Step::Painted(name) => {
                 say!("  [{at:>6} мс] шаг {index}: снимок '{name}' обязан быть нарисован");
                 let ppm = paths::test_dir().join(format!("{prefix}-{name}.ppm"));

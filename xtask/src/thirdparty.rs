@@ -91,8 +91,8 @@ enum How {
     Sdl2,
     /// doomgeneric (фаза 68d): его собственный `Makefile.sdl` с нашим
     /// компилятором и SDL2 из набора; программа — `bin/doom` в sysroot.
-    /// Звук doomgeneric берёт у SDL2_mixer, которого пока нет, — поэтому из
-    /// его списка объектов убраны три звуковых (`i_sdlsound`, `i_sdlmusic`,
+    /// Звук doomgeneric берёт у SDL2_mixer (фаза 68e); без него из его списка
+    /// объектов убираются три звуковых (`i_sdlsound`, `i_sdlmusic`,
     /// `mus2mid`), а без `FEATURE_SOUND` он собирает заглушки (`dummy.c`).
     Doomgeneric,
     /// Данные игр (фаза 68d): файлы из архива в [`cbuild::games_dir`] —
@@ -156,7 +156,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 14] = [
+const PROJECTS: [Project; 15] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -458,6 +458,40 @@ const PROJECTS: [Project; 14] = [
         how: How::Sdl2,
         installs: &["lib/libSDL2.a", "include/SDL2/SDL.h", "include/SDL2/SDL_config_freeos.h", "lib/pkgconfig/sdl2.pc"],
     },
+    // Микшер SDL (фаза 68e): звуковые эффекты и музыка поверх звука SDL — на
+    // нём звук у doomgeneric и у многих игр. Своим `configure`; кодеки —
+    // только встроенные в сам SDL_mixer (WAV, OGG через stb_vorbis, FLAC через
+    // dr_flac, MP3 через minimp3), без чужих библиотек. MIDI выключен: его
+    // проигрывателю нужны патчи инструментов, которых в системе нет; внешний
+    // проигрыватель (`music-cmd`) — это `fork`. Хеш — `digest` релиза на
+    // GitHub (сверено 2026-10-17).
+    Project {
+        name: "sdl2_mixer",
+        version: "2.8.2",
+        url: "https://github.com/libsdl-org/SDL_mixer/releases/download/release-2.8.2/SDL2_mixer-2.8.2.tar.gz",
+        sha256: "938dff531d00ace2296557a6599abe6f34599e2f34f0a4a08a397e2ccac8b8f7",
+        unpacked: "SDL2_mixer-2.8.2",
+        how: Autotools::plain(
+            &[
+                "--disable-sdltest",
+                "--disable-music-cmd",
+                "--disable-music-midi",
+                "--disable-music-mod",
+                "--disable-music-opus",
+                "--disable-music-wavpack",
+                "--disable-music-gme",
+                "--disable-music-ogg-vorbis",
+                "--disable-music-ogg-tremor",
+                "--disable-music-flac-libflac",
+                "--disable-music-mp3-mpg123",
+                "--enable-music-ogg-stb",
+                "--enable-music-flac-drflac",
+                "--enable-music-mp3-minimp3",
+            ],
+            &[],
+        ),
+        installs: &["lib/libSDL2_mixer.a", "include/SDL2/SDL_mixer.h", "lib/pkgconfig/SDL2_mixer.pc"],
+    },
     // Первая настоящая игра на SDL2 (фаза 68d): Doom в виде doomgeneric —
     // Chocolate Doom, сведённый к пяти функциям платформы, с готовой из них
     // реализацией на SDL2. Релизов у проекта нет, поэтому архив — снимок
@@ -679,21 +713,28 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
                 .lines()
                 .find(|line| line.starts_with("SRC_DOOM"))
                 .context("в Makefile.sdl нет SRC_DOOM")?;
+            // Со звуком — если собран SDL2_mixer (фаза 68e): весь список и
+            // `FEATURE_SOUND`, как в самом `Makefile.sdl`.
+            let sound = sysroot.join("lib/libSDL2_mixer.a").is_file();
             let objects: Vec<&str> = line
                 .split_once('=')
                 .map_or("", |(_, list)| list)
                 .split_whitespace()
-                .filter(|object| !["i_sdlsound.o", "i_sdlmusic.o", "mus2mid.o"].contains(object))
+                .filter(|object| sound || !["i_sdlsound.o", "i_sdlmusic.o", "mus2mid.o"].contains(object))
                 .collect();
             let shell = format!("SHELL={}", make_shell()?);
             let cc = format!("CC={triple}-cc");
-            let cflags = format!("CFLAGS=-O2 -I{prefix}/include/SDL2");
+            let cflags = format!(
+                "CFLAGS=-O2 -I{prefix}/include/SDL2{}",
+                if sound { " -DFEATURE_SOUND" } else { "" }
+            );
             let ldflags = format!("LDFLAGS=-L{prefix}/lib");
+            let libs = if sound { "LIBS=-lSDL2_mixer -lSDL2 -lfreeos -lm" } else { "LIBS=-lSDL2 -lfreeos -lm" };
             let src = format!("SRC_DOOM={}", objects.join(" "));
             run_make(
                 &game,
-                &["-f", "Makefile.sdl", "-j6", &shell, &cc, &cflags, &ldflags, "LIBS=-lSDL2 -lfreeos -lm", &src],
-                &format!("make doomgeneric {}", arch.name()),
+                &["-f", "Makefile.sdl", "-j6", &shell, &cc, &cflags, &ldflags, libs, &src],
+                &format!("make doomgeneric {}{}", arch.name(), if sound { " со звуком" } else { " без звука" }),
             )?;
             fs::create_dir_all(sysroot.join("bin"))?;
             fs::copy(game.join("doomgeneric"), sysroot.join("bin/doom"))
