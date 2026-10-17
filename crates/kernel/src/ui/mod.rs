@@ -67,7 +67,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use mini_ui::theme;
 use mini_ui::{Rect, Screen, Surface};
 use user_abi::{
-    WIN_CLOSE, WIN_FOCUS, WIN_KEY, WIN_KEYUP, WIN_LEAVE, WIN_MOVE, WIN_POINTER, WIN_RELEASE, WinEvent,
+    WIN_CLOSE, WIN_FOCUS, WIN_KEY, WIN_KEYUP, WIN_LEAVE, WIN_MOVE, WIN_POINTER, WIN_RELEASE, WIN_WHEEL, WinEvent,
 };
 
 use crate::input::keymap;
@@ -1336,6 +1336,22 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons) {
     }
 }
 
+/// Колесо мыши — окну программы под указателем, а пока кнопка, нажатая над
+/// окном, держится, — ему (фаза 68c, `user_abi::WIN_WHEEL`). Окнам стола
+/// колесо пока ничего не делает.
+fn wheel(desktop: &mut Compositor, x: i32, y: i32, clicks: i32) {
+    let target = if let Some((app, _)) = desktop.captured() {
+        Some(app)
+    } else if desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open() {
+        None
+    } else {
+        desktop.program_under(x, y).map(|(app, _, _)| app)
+    };
+    if let Some(window) = target.and_then(|app| desktop.find(app)) {
+        window.push_event(WinEvent { kind: WIN_WHEEL, code: 0, x: clicks, y: 0 });
+    }
+}
+
 fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     // На сколько сдвинулся курсор. У мыши это приехало в отчёте, у планшета
     // приходится вычесть одно положение из другого: устройство сообщило точку,
@@ -1366,6 +1382,9 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
     if dx != 0 || dy != 0 {
         hover(desktop, x, y, event.buttons);
+    }
+    if event.wheel != 0 {
+        wheel(desktop, x, y, event.wheel);
     }
 
     if event.pressed(Buttons::LEFT) {
@@ -2086,6 +2105,23 @@ fn program_key(event: KeyEvent) -> Option<u32> {
         KeyCode::PageDown => user_abi::WIN_KEY_PAGE_DOWN,
         KeyCode::Delete => user_abi::WIN_KEY_DELETE,
         KeyCode::Menu => user_abi::WIN_KEY_MENU,
+        // Фаза 68c: то, без чего не обходятся игры и горячие клавиши.
+        KeyCode::Insert => user_abi::WIN_KEY_INSERT,
+        KeyCode::F1 => user_abi::WIN_KEY_F1,
+        KeyCode::F2 => user_abi::WIN_KEY_F1 + 1,
+        KeyCode::F3 => user_abi::WIN_KEY_F1 + 2,
+        KeyCode::F4 => user_abi::WIN_KEY_F1 + 3,
+        KeyCode::F5 => user_abi::WIN_KEY_F1 + 4,
+        KeyCode::F6 => user_abi::WIN_KEY_F1 + 5,
+        KeyCode::F7 => user_abi::WIN_KEY_F1 + 6,
+        KeyCode::F8 => user_abi::WIN_KEY_F1 + 7,
+        KeyCode::F9 => user_abi::WIN_KEY_F1 + 8,
+        KeyCode::F10 => user_abi::WIN_KEY_F1 + 9,
+        KeyCode::F11 => user_abi::WIN_KEY_F1 + 10,
+        KeyCode::F12 => user_abi::WIN_KEY_F12,
+        KeyCode::LeftShift | KeyCode::RightShift => user_abi::WIN_KEY_SHIFT,
+        KeyCode::LeftCtrl | KeyCode::RightCtrl => user_abi::WIN_KEY_CTRL,
+        KeyCode::LeftAlt | KeyCode::RightAlt => user_abi::WIN_KEY_ALT,
         _ => return None,
     })
 }

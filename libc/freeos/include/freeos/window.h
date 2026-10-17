@@ -43,6 +43,7 @@ extern "C" {
 #define FREEOS_WIN_RESIZE 7
 #define FREEOS_WIN_FOCUS 8
 #define FREEOS_WIN_KEYUP 9
+#define FREEOS_WIN_WHEEL 10
 
 /* Что окно умеет — `freeos_window_style`. */
 #define FREEOS_WIN_STYLE_RESIZABLE 1u
@@ -67,6 +68,13 @@ extern "C" {
 #define FREEOS_WIN_KEY_PAGE_DOWN (FREEOS_WIN_KEY_NAMED + 8)
 #define FREEOS_WIN_KEY_DELETE (FREEOS_WIN_KEY_NAMED + 9)
 #define FREEOS_WIN_KEY_MENU (FREEOS_WIN_KEY_NAMED + 10)
+/* Фаза 68c: Insert, F1–F12 (`FREEOS_WIN_KEY_F1 + n - 1`) и сами модификаторы. */
+#define FREEOS_WIN_KEY_INSERT (FREEOS_WIN_KEY_NAMED + 11)
+#define FREEOS_WIN_KEY_F1 (FREEOS_WIN_KEY_NAMED + 12)
+#define FREEOS_WIN_KEY_F12 (FREEOS_WIN_KEY_NAMED + 23)
+#define FREEOS_WIN_KEY_SHIFT (FREEOS_WIN_KEY_NAMED + 24)
+#define FREEOS_WIN_KEY_CTRL (FREEOS_WIN_KEY_NAMED + 25)
+#define FREEOS_WIN_KEY_ALT (FREEOS_WIN_KEY_NAMED + 26)
 
 /* Событие окна.
  *
@@ -88,6 +96,8 @@ extern "C" {
  *   0) — фаза 62c. Приходит при смене, а не при каждом поднятии.
  * - `FREEOS_WIN_KEYUP`: клавишу отпустили (фаза 62c); поля — как у
  *   `FREEOS_WIN_KEY`. Приходит окну, которому досталось нажатие.
+ * - `FREEOS_WIN_WHEEL`: повернули колесо мыши (фаза 68c); `x` — щелчков,
+ *   больше нуля — от себя. Приходит окну под указателем.
  *
  * Вид, которого программа не знает, она пропускает: новые виды договор
  * добавляет. */

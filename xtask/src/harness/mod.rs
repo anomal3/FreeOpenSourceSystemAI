@@ -1107,6 +1107,11 @@ fn play(
                     .with_context(|| format!("шаг {index}"))?;
                 pointer = Some(to);
             }
+            Step::Wheel(dz) => {
+                say!("  [{at:>6} мс] шаг {index}: колесо на {dz}");
+                hmp.mouse_wheel(*dz).with_context(|| format!("шаг {index}"))?;
+                std::thread::sleep(KEY_DELAY);
+            }
             Step::Click => {
                 say!("  [{at:>6} мс] шаг {index}: щелчок");
                 press_button(qmp.as_deref_mut(), hmp, true)

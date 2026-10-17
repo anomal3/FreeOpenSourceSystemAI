@@ -1006,6 +1006,11 @@ pub const WIN_FOCUS: u32 = 8;
 /// второе нажатие. Приходит окну, которое получило нажатие; клавиша, нажатая до
 /// того, как окно стало активным, отпускания ему не пришлёт.
 pub const WIN_KEYUP: u32 = 9;
+/// [`WinEvent::kind`]: повернули колесо мыши (фаза 68c). [`WinEvent::x`] —
+/// на сколько щелчков: больше нуля — от себя (прокрутка вверх), меньше — к
+/// себе. Приходит окну под указателем, а пока кнопка, нажатая над окном,
+/// держится, — ему.
+pub const WIN_WHEEL: u32 = 10;
 
 /// [`WinEvent::x`] у [`WIN_KEY`]: зажат Shift.
 pub const WIN_MOD_SHIFT: i32 = 1;
@@ -1054,6 +1059,23 @@ pub const WIN_KEY_DELETE: u32 = WIN_KEY_NAMED + 9;
 /// делает то же. Именем, а не символом: символа у неё нет ни в одной
 /// раскладке.
 pub const WIN_KEY_MENU: u32 = WIN_KEY_NAMED + 10;
+
+/// Insert (фаза 68c).
+pub const WIN_KEY_INSERT: u32 = WIN_KEY_NAMED + 11;
+/// F1–F12 (фаза 68c): `WIN_KEY_F1 + n - 1` — клавиша Fn. Игры и программы
+/// с горячими клавишами без них не обходятся.
+pub const WIN_KEY_F1: u32 = WIN_KEY_NAMED + 12;
+/// F12 — последняя из ряда.
+pub const WIN_KEY_F12: u32 = WIN_KEY_F1 + 11;
+/// Сами клавиши-модификаторы (фаза 68c), левая и правая одинаково. Маска в
+/// [`WinEvent::x`] говорит, что модификатор **зажат**, когда нажимают другую
+/// клавишу; а игре нужен сам Ctrl — в Doom это выстрел. Нажатие и отпускание
+/// приходят как у всякой клавиши, [`WIN_KEY`] и [`WIN_KEYUP`].
+pub const WIN_KEY_SHIFT: u32 = WIN_KEY_NAMED + 24;
+/// Ctrl, левый или правый.
+pub const WIN_KEY_CTRL: u32 = WIN_KEY_NAMED + 25;
+/// Alt, левый или правый.
+pub const WIN_KEY_ALT: u32 = WIN_KEY_NAMED + 26;
 
 /// Самый длинный заголовок окна, который принимает ядро.
 pub const MAX_TITLE: usize = 64;
@@ -1654,7 +1676,7 @@ pub const SYSINFO_DARK: u32 = 1;
 /// продолжает работать, потому что всё, что она знала, осталось на месте.
 /// Старшая — когда что-нибудь меняет смысл; такого пока не случалось, и
 /// случаться не должно.
-pub const ABI_VERSION: u32 = 0x0001_000F;
+pub const ABI_VERSION: u32 = 0x0001_0010;
 
 /// [`SYS_DUP`]: «дай самый маленький свободный номер».
 ///
@@ -2619,6 +2641,13 @@ mod tests {
         assert_eq!((WIN_KEY, WIN_POINTER, WIN_CLOSE, WIN_MOVE, WIN_LEAVE), (1, 2, 3, 4, 5));
         assert_eq!((WIN_RELEASE, WIN_RESIZE, WIN_STYLE_RESIZABLE), (6, 7, 1));
         assert_eq!((WIN_FOCUS, WIN_KEYUP), (8, 9));
+        assert_eq!(WIN_WHEEL, 10);
+        assert_eq!(WIN_KEY_INSERT - WIN_KEY_NAMED, 11);
+        assert_eq!((WIN_KEY_F1 - WIN_KEY_NAMED, WIN_KEY_F12 - WIN_KEY_NAMED), (12, 23));
+        assert_eq!(
+            (WIN_KEY_SHIFT - WIN_KEY_NAMED, WIN_KEY_CTRL - WIN_KEY_NAMED, WIN_KEY_ALT - WIN_KEY_NAMED),
+            (24, 25, 26)
+        );
         assert_eq!((WIN_MOD_SHIFT, WIN_MOD_CTRL, WIN_MOD_ALT), (1, 2, 4));
 
         // Счётчики системы: двадцать полей, и раскладка у них проверяется по
@@ -2680,7 +2709,9 @@ mod tests {
         // тридцать два (фаза 65a).
         // 0x0001_000E — [`SYS_FDCTL`]: ждущие каналы по просьбе (фаза 66b).
         // 0x0001_000F — [`SYS_SOUND`]: звук для программ (фаза 67f).
-        assert_eq!(ABI_VERSION, 0x0001_000F);
+        // 0x0001_0010 — [`WIN_WHEEL`], [`WIN_KEY_INSERT`], F1–F12 и сами
+        // модификаторы (фаза 68c).
+        assert_eq!(ABI_VERSION, 0x0001_0010);
 
         assert_eq!(FD_STDIN, 0);
         assert_eq!(FD_STDOUT, 1);

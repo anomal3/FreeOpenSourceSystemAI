@@ -181,6 +181,9 @@ pub enum Step {
     Move(i32, i32),
     /// Навести мышь на то, что гость сам описал в журнале.
     Aim(aim::Aim),
+    /// Повернуть колесо мыши на столько щелчков (фаза 68c): `mouse_move 0 0
+    /// dz` монитора QEMU.
+    Wheel(i32),
     /// Нажать левую кнопку и отпустить её там же.
     Click,
     /// Два щелчка подряд с короткими паузами — как щёлкает человек.
@@ -1986,6 +1989,14 @@ pub const ALL: &[Scenario] = &[
             Step::Type("abc"),
             Step::Await("csdl: text 'abc'", 30_000),
             Step::Expect("csdl: key A"),
+            // Фаза 68c: F-ряд, сам Ctrl и колесо доходят до игры.
+            Step::Key("f5"),
+            Step::Await("csdl: key F5", 30_000),
+            Step::Key("ctrl"),
+            Step::Await("csdl: key Left Ctrl", 30_000),
+            // `mouse_move 0 0 1` — колесо от себя: прокрутка вверх, `y` > 0.
+            Step::Wheel(1),
+            Step::Await("csdl: wheel 0,1", 30_000),
             Step::Wait(1_000),
             Step::Shot("sdl-used"),
             Step::Aim(Aim::Close("SDL Demo")),
@@ -10080,7 +10091,8 @@ pub const ALL: &[Scenario] = &[
             // 65549 — `0x0001_000D`: сокеты-дескрипторы (фаза 65a).
             // 65550 — `0x0001_000E`: `SYS_FDCTL`, ждущие каналы (фаза 66b).
             // 65551 — `0x0001_000F`: `SYS_SOUND`, звук для программ (фаза 67f).
-            Step::Await("posix: abi version 65551", 60_000),
+            // 65552 — `0x0001_0010`: колесо, F1–F12 и модификаторы окнам (68c).
+            Step::Await("posix: abi version 65552", 60_000),
 
             // Позиция у копий дескриптора общая. Число здесь важнее слова:
             // `dup` с независимой позицией сказал бы «четыре».
@@ -10199,6 +10211,12 @@ pub const ALL: &[Scenario] = &[
             Step::Await("winshow: key named down", 30_000),
             Step::Key("left"),
             Step::Await("winshow: key named left", 30_000),
+            // Фаза 68c: F-ряд и сами модификаторы — тоже именами. F1 у стола
+            // своя — меню запуска, — поэтому F2.
+            Step::Key("f2"),
+            Step::Await("winshow: key named f2", 30_000),
+            Step::Key("ctrl"),
+            Step::Await("winshow: key named ctrl", 30_000),
 
             // И программа их различает: `q` заканчивает ожидание. Без второй
             // клавиши строка выше доказывала бы только, что события считают.

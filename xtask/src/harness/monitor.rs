@@ -159,6 +159,11 @@ impl Monitor {
         self.command_silent(&format!("mouse_move {dx} {dy}"))
     }
 
+    /// Повернуть колесо мыши на `dz` щелчков (фаза 68c).
+    pub fn mouse_wheel(&mut self, dz: i32) -> Result<()> {
+        self.command_silent(&format!("mouse_move 0 0 {dz}"))
+    }
+
     /// Нажать или отпустить кнопки мыши. Битовая карта: 1 — левая, 2 — правая,
     /// 4 — средняя; ноль означает «все отпущены».
     pub fn mouse_button(&mut self, mask: u32) -> Result<()> {

@@ -7,10 +7,10 @@
  *
  * Ввод — события окна. Договор отдаёт символ клавиши и её букву в раскладке
  * US, а не код клавиши, поэтому код SDL (`SDL_Scancode`) собирается из
- * буквы, имени клавиши или управляющего символа; клавиши без символа и без
- * имени (F-ряд, сами Shift и Ctrl) событий не дают — так обещает договор.
- * Модификаторы приходят маской при каждой клавише, и нажатие или отпускание
- * Shift, Ctrl и Alt SDL видит, когда маска меняется.
+ * буквы, имени клавиши или управляющего символа. С фазы 68c именами приходят
+ * и F1–F12, Insert и сами Shift, Ctrl и Alt; маска модификаторов при каждой
+ * клавише сверяется с тем, что SDL уже видел, — на случай модификатора,
+ * зажатого до того, как окно стало активным.
  */
 #include "../../SDL_internal.h"
 
@@ -253,6 +253,10 @@ static SDL_Scancode FREEOS_Scancode(const struct freeos_win_event *event)
     case FREEOS_WIN_KEY_PAGE_DOWN: return SDL_SCANCODE_PAGEDOWN;
     case FREEOS_WIN_KEY_DELETE: return SDL_SCANCODE_DELETE;
     case FREEOS_WIN_KEY_MENU: return SDL_SCANCODE_APPLICATION;
+    case FREEOS_WIN_KEY_INSERT: return SDL_SCANCODE_INSERT;
+    case FREEOS_WIN_KEY_SHIFT: return SDL_SCANCODE_LSHIFT;
+    case FREEOS_WIN_KEY_CTRL: return SDL_SCANCODE_LCTRL;
+    case FREEOS_WIN_KEY_ALT: return SDL_SCANCODE_LALT;
     case 0x08: return SDL_SCANCODE_BACKSPACE;
     case 0x1B: return SDL_SCANCODE_ESCAPE;
     case '\n':
@@ -260,6 +264,13 @@ static SDL_Scancode FREEOS_Scancode(const struct freeos_win_event *event)
     case '\t': return SDL_SCANCODE_TAB;
     case ' ': return SDL_SCANCODE_SPACE;
     default: break;
+    }
+    if (event->code >= FREEOS_WIN_KEY_F1 && event->code <= FREEOS_WIN_KEY_F12) {
+        return (SDL_Scancode)(SDL_SCANCODE_F1 + (event->code - FREEOS_WIN_KEY_F1));
+    }
+    if (event->code >= FREEOS_WIN_KEY_NAMED) {
+        /* Имя из будущего договора — не буква. */
+        return SDL_SCANCODE_UNKNOWN;
     }
     /* Буква раскладки US — и для Ctrl+H, и для «щ» на месте «o». */
     if (event->y != 0) {
@@ -348,7 +359,20 @@ static void FREEOS_HandleEvent(SDL_Window *window, FREEOS_Window *data, const st
     case FREEOS_WIN_KEYUP:
     {
         SDL_Scancode code = FREEOS_Scancode(event);
-        FREEOS_SyncMods(event->x);
+        int bit = event->code == FREEOS_WIN_KEY_SHIFT  ? FREEOS_WIN_MOD_SHIFT
+                  : event->code == FREEOS_WIN_KEY_CTRL ? FREEOS_WIN_MOD_CTRL
+                  : event->code == FREEOS_WIN_KEY_ALT  ? FREEOS_WIN_MOD_ALT
+                                                       : 0;
+        if (bit) {
+            /* Сам модификатор (фаза 68c): его нажатие и есть смена маски. */
+            if (event->kind == FREEOS_WIN_KEY) {
+                held_mods |= bit;
+            } else {
+                held_mods &= ~bit;
+            }
+        } else {
+            FREEOS_SyncMods(event->x);
+        }
         if (code != SDL_SCANCODE_UNKNOWN) {
             SDL_SendKeyboardKey(event->kind == FREEOS_WIN_KEY ? SDL_PRESSED : SDL_RELEASED, code);
         }
@@ -369,6 +393,9 @@ static void FREEOS_HandleEvent(SDL_Window *window, FREEOS_Window *data, const st
     case FREEOS_WIN_MOVE:
         SDL_SetMouseFocus(window);
         SDL_SendMouseMotion(window, 0, 0, event->x, event->y);
+        break;
+    case FREEOS_WIN_WHEEL:
+        SDL_SendMouseWheel(window, 0, 0.0f, (float)event->x, SDL_MOUSEWHEEL_NORMAL);
         break;
     case FREEOS_WIN_LEAVE:
         SDL_SetMouseFocus(NULL);

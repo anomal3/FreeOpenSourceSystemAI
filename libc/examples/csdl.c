@@ -90,7 +90,10 @@ static void draw(SDL_Renderer *renderer) {
 int main(int argc, char **argv) {
     int ms = argc > 2 ? atoi(argv[2]) : 1500;
     tone_hz = argc > 1 ? atof(argv[1]) : 440.0;
-    setvbuf(stdout, NULL, _IONBF, 0);
+    /* Строка — одной записью: без буфера `printf` пишет кусками, и строку
+     * разрывало сообщение ядра посреди (так было на aarch64). */
+    static char line_buffer[512];
+    setvbuf(stdout, line_buffer, _IOLBF, sizeof(line_buffer));
 
     SDL_version linked;
     SDL_GetVersion(&linked);
@@ -180,6 +183,9 @@ int main(int argc, char **argv) {
                 strcat(text, event.text.text);
             }
             printf("csdl: text '%s'\n", text);
+            break;
+        case SDL_MOUSEWHEEL:
+            printf("csdl: wheel %d,%d\n", event.wheel.x, event.wheel.y);
             break;
         case SDL_KEYDOWN:
             printf("csdl: key %s\n", SDL_GetScancodeName(event.key.keysym.scancode));

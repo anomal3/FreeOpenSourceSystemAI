@@ -85,6 +85,7 @@ pub use user_abi::{
     WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP, WIN_LEAVE, WIN_MOVE, WIN_POINTER,
     WinEvent,
 };
+use user_abi::{WIN_KEY_ALT, WIN_KEY_CTRL, WIN_KEY_F1, WIN_KEY_F12, WIN_KEY_INSERT, WIN_KEY_SHIFT};
 
 /// Как эта клавиша называется в журнале — или `None`, если она пришла символом.
 ///
@@ -104,6 +105,15 @@ pub fn key_name(code: u32) -> Option<&'static str> {
         WIN_KEY_PAGE_DOWN => "pagedown",
         WIN_KEY_DELETE => "delete",
         WIN_KEY_MENU => "menu",
+        // Фаза 68c.
+        WIN_KEY_INSERT => "insert",
+        WIN_KEY_F1..=WIN_KEY_F12 => {
+            const F: [&str; 12] = ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12"];
+            F[(code - WIN_KEY_F1) as usize]
+        }
+        WIN_KEY_SHIFT => "shift",
+        WIN_KEY_CTRL => "ctrl",
+        WIN_KEY_ALT => "alt",
         // Имя из будущего: договор обещает, что всё выше границы — имя, а не
         // символ, и программа, собранная до его выдачи, обязана это понимать, а
         // не принимать за букву.
