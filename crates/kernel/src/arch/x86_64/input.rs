@@ -278,6 +278,10 @@ fn start_serial(
     // SAFETY: порт проинициализирован самым первым действием ядра
     // (`serial::init`), поэтому `DLAB` сброшен; вход IRQ 4 размаскируется ниже,
     // уже после того, как обработчик стоит в IDT.
+    if !super::serial_present() {
+        kprintln!("  serial in   : no UART at COM1 (scratch and loopback test failed)");
+        return false;
+    }
     unsafe { super::enable_serial_rx() };
 
     let routed = route(io_apic, madt, IRQ_SERIAL, apic::VECTOR_SERIAL, destination);

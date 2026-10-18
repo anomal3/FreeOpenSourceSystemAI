@@ -116,6 +116,8 @@ const SET_AMP: u32 = 0x300;
 
 // Параметры (раздел 7.3.4).
 const P_NODE_COUNT: u32 = 0x04;
+/// Идентификатор изготовителя и модели кодека (параметр корневого узла).
+const P_VENDOR_ID: u32 = 0x00;
 const P_FUNCTION_TYPE: u32 = 0x05;
 const P_WIDGET_CAPS: u32 = 0x09;
 const P_PIN_CAPS: u32 = 0x0C;
@@ -399,7 +401,10 @@ impl Hda {
                     hda.program_stream()?;
                     return Ok(hda);
                 }
-                Err(err) => last = err,
+                Err(err) => {
+                    kprintln!("  hda         : codec {codec}: {err}");
+                    last = err;
+                }
             }
         }
         Err(last)
@@ -428,9 +433,15 @@ impl Hda {
         self.write32(GCTL, self.read32(GCTL) | GCTL_CRST);
         self.wait(|hda| hda.read32(GCTL) & GCTL_CRST != 0, 100)
             .map_err(|()| HdaError::Timeout("leaving reset"))?;
-        // Кодекам дано 521 мкс, чтобы отметиться; ждём с запасом.
+        // Кодекам дано 521 мкс, чтобы отметиться; ждём с запасом. И не по
+        // первому: на ASUS K53SD HDMI-кодек видеокарты (адрес 3) отмечался
+        // раньше Realtek (адрес 0), маска читалась сразу — и звуковой кодек
+        // оставался незамеченным (0.8). Как в Linux: ещё миллисекунда, потом
+        // маска.
         let _ = self.wait(|hda| hda.read16(STATESTS) & 0x7FFF != 0, 100);
+        spin_us(1000);
         let codecs = self.read16(STATESTS) & 0x7FFF;
+        kprintln!("  hda         : codecs at {codecs:#06x}");
         if codecs == 0 {
             return Err(HdaError::NoCodec);
         }
@@ -529,6 +540,8 @@ impl Hda {
         let first = ((count >> 16) & 0xFF) as usize;
         let last = (first + (count & 0xFF) as usize).min(MAX_NODES);
         let mut widgets = [Widget::ABSENT; MAX_NODES];
+        // Разъёмы — для журнала, если путь не найдётся (0.8, ALC на ASUS K53SD).
+        let mut pin_info = [(0u32, 0u32); MAX_NODES];
         // Разъёмы-кандидаты: (приоритет, узел).
         let mut pins: [(u8, u8); 16] = [(0, 0); 16];
         let mut pin_count = 0;
@@ -545,6 +558,7 @@ impl Hda {
             if widgets[node].kind == W_PIN {
                 let pin_caps = self.parameter(codec, node as u8, P_PIN_CAPS)?;
                 let config = self.command(codec, node as u8, GET_CONFIG_DEFAULT, 0)?;
+                pin_info[node] = (pin_caps, config);
                 if pin_caps & PINCAP_OUT == 0 || config >> 30 == PORT_NONE {
                     continue;
                 }
@@ -577,7 +591,24 @@ impl Hda {
                 self.pin_count += 1;
             }
         }
-        let dac = dac.ok_or(HdaError::NoOutput)?;
+        let Some(dac) = dac else {
+            // Граф кодека — в журнал: по нему и чинится поиск пути на чужой
+            // машине (`dmesg hda`).
+            let vendor = self.parameter(codec, 0, P_VENDOR_ID).unwrap_or(0);
+            kprintln!("  hda         : codec {codec} {vendor:08x}, AFG {afg}, nodes {first}..{last}: no DAC path");
+            for node in first..last {
+                let widget = &widgets[node];
+                let inputs = &widget.inputs[..usize::from(widget.input_count)];
+                let (pin_caps, config) = pin_info[node];
+                kprintln!(
+                    "  hda         :   node {node:#04x} type {:x} caps {:08x} in {inputs:02x?}{}",
+                    widget.kind,
+                    widget.caps,
+                    if widget.kind == W_PIN { alloc::format!(" pincaps {pin_caps:08x} config {config:08x}") } else { alloc::string::String::new() }
+                );
+            }
+            return Err(HdaError::NoOutput);
+        };
         self.dac = dac;
         self.command(codec, dac, SET_FORMAT, u32::from(FORMAT_48K_16_STEREO))?;
         self.command(codec, dac, SET_STREAM_CHANNEL, u32::from(STREAM_TAG) << 4)?;

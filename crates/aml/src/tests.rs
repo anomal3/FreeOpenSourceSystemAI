@@ -269,3 +269,23 @@ fn a_cut_virtualbox_table_is_an_error_not_a_panic() {
         let _ = routing(&VIRTUALBOX_DSDT[..cut], &mut out);
     }
 }
+
+/// DSDT ноутбука ASUS K53SD (AMI, 2011), снятая по SSH командой
+/// `acpidump DSDT <смещение> <длина>` (0.8): 80 034 байта, контрольная сумма
+/// сходится. `_PRT` корневой шины — метод `If (PICM) { Return (AR00) }
+/// Return (PR00) }`, как у всех прошивок AMI того времени.
+const ASUS_K53SD_DSDT: &[u8] = include_bytes!("../testdata/asus-k53sd-dsdt.bin");
+
+#[test]
+fn asus_k53sd_prt_method_gives_the_apic_table() {
+    let mut out = [Route { device: 0, pin: 0, gsi: 0, level: false, active_low: false }; 128];
+    let result = routing(ASUS_K53SD_DSDT, &mut out);
+    let (written, dropped) = result.expect("таблица APIC корневой шины найдена");
+    assert_eq!(dropped, 0);
+    let find = |device: u8, pin: u8| out[..written].iter().find(|r| r.device == device && r.pin == pin).copied();
+    // EHCI 1A.0 и 1D.0 — те, у которых на ноутбуке линия была неизвестна.
+    let ehci1 = find(0x1a, 0).expect("EHCI 1A, INTA");
+    let ehci2 = find(0x1d, 0).expect("EHCI 1D, INTA");
+    assert!(ehci1.gsi >= 16 && ehci2.gsi >= 16, "{ehci1:?} {ehci2:?}");
+    assert!(ehci1.level && ehci1.active_low);
+}

@@ -170,6 +170,11 @@ fn driver_for(device: &pci::Device) -> (&'static str, &'static str) {
         // бы о нём репозиторий (Д4). На x86-64 стенда это ICH9 `8086:2930`,
         // и спрашивала бы она настоящий сервер из каждого сетевого сценария.
         None if device.class == 0x0C && device.subclass == 0x05 => ("-", "not-needed"),
+        // Intel Management Engine (`8086:xxxx`, класс 07:80): прошивка в
+        // чипсете со своим процессором; системе от него ничего не нужно, а
+        // «нет драйвера» гнало бы `drvd` в репозиторий на каждой загрузке
+        // (0.8, ASUS K53SD: `8086:1c3a`).
+        None if device.vendor == 0x8086 && device.class == 0x07 && device.subclass == 0x80 => ("-", "not-needed"),
         None => ("-", "none"),
     }
 }

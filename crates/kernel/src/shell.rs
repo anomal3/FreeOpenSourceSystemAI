@@ -1444,8 +1444,19 @@ fn last_panic(argument: &str) {
 /// снимать было нечем. Строки идут в журнал (и последовательную линию), а не
 /// в окно терминала: таблица — десятки килобайт.
 fn acpidump(argument: &str) {
+    // `acpidump DSDT 0 24576` — кусок таблицы в вывод команды, а не в журнал
+    // (0.8): журнал — 32 КиБ, и DSDT ноутбука в нём не помещается; по SSH её
+    // снимают кусками (`kernel acpidump DSDT <смещение> <длина>`).
+    let mut words = argument.split_whitespace();
+    let name = words.next().unwrap_or("");
+    let window = match (words.next().map(str::parse::<usize>), words.next().map(str::parse::<usize>)) {
+        (Some(Ok(offset)), Some(Ok(length))) => Some((offset, length)),
+        (Some(Ok(offset)), None) => Some((offset, 24 * 1024)),
+        _ => None,
+    };
+    let argument = name;
     let Ok(signature) = <[u8; 4]>::try_from(argument.as_bytes()) else {
-        sprintln!("  usage: acpidump SIG   (four letters: DSDT, FACP, APIC, MCFG...)");
+        sprintln!("  usage: acpidump SIG [offset [length]]   (four letters: DSDT, FACP, APIC, MCFG...)");
         return;
     };
     let rsdp = crate::acpi::rsdp();
@@ -1468,6 +1479,19 @@ fn acpidump(argument: &str) {
             return;
         }
     };
+    if let Some((offset, length)) = window {
+        let start = offset.min(table.len());
+        let end = (start + length).min(table.len());
+        sprintln!("acpidump {argument} {} bytes, {start}..{end}", table.len());
+        for (index, chunk) in table[start..end].chunks(32).enumerate() {
+            let mut line = alloc::string::String::with_capacity(80);
+            for byte in chunk {
+                line.push_str(&alloc::format!("{byte:02x}"));
+            }
+            sprintln!("{:06x} {line}", start + index * 32);
+        }
+        return;
+    }
     crate::kprintln!("acpidump {argument} {} bytes", table.len());
     for (index, chunk) in table.chunks(32).enumerate() {
         let mut line = alloc::string::String::with_capacity(80);

@@ -46,6 +46,22 @@ const REG_FCR: u16 = 2; // FIFO Control (запись)
 const REG_LCR: u16 = 3; // Line Control
 const REG_MCR: u16 = 4; // Modem Control
 const REG_LSR: u16 = 5; // Line Status
+const REG_SCR: u16 = 7; // Scratch — восемь бит, которые 16550 просто хранит
+/// Петля: передатчик замкнут на приёмник внутри микросхемы.
+const MCR_LOOPBACK: u8 = 0x10;
+
+/// Есть ли UART на COM1 (0.8). У ноутбука ASUS K53SD порта нет, а регистр
+/// состояния читался мусором: каждый байт печати ждал передатчика сто тысяч
+/// опросов (до 24 мс с запрещёнными прерываниями), приём насчитал полтора
+/// миллиона «потерянных» байт. Проверка — как в Linux: регистр-черновик и
+/// петля.
+static UART_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Есть ли на машине COM1.
+#[must_use]
+pub fn serial_present() -> bool {
+    UART_PRESENT.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 const LCR_DLAB: u8 = 0x80; // открывает доступ к делителю вместо IER/RBR
 const LCR_8N1: u8 = 0x03; // 8 бит данных, без чётности, 1 стоп-бит
@@ -461,6 +477,30 @@ impl SerialDevice for Serial {
         // форматом 8N1, включить и очистить FIFO, поднять DTR/RTS/OUT2.
         // Никакое другое устройство в системе эти порты не использует, поэтому
         // записи ни на что больше не влияют.
+        // Есть ли тут 16550: черновик хранит записанное, петля возвращает
+        // отправленный байт. У отсутствующего порта шина отвечает 0xFF.
+        // SAFETY: те же порты COM1; запись в черновик и петля ни на что, кроме
+        // самого UART, не влияют.
+        let present = unsafe {
+            outb(base + REG_SCR, 0x5A);
+            let first = inb(base + REG_SCR) == 0x5A;
+            outb(base + REG_SCR, 0xA5);
+            let second = inb(base + REG_SCR) == 0xA5;
+            outb(base + REG_MCR, MCR_LOOPBACK | 0x0E);
+            outb(base + REG_DATA, 0xAE);
+            let mut echoed = false;
+            for _ in 0..1000 {
+                if inb(base + REG_LSR) & LSR_DATA_READY != 0 {
+                    echoed = inb(base + REG_DATA) == 0xAE;
+                    break;
+                }
+            }
+            first && second && echoed
+        };
+        UART_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
+        if !present {
+            return;
+        }
         unsafe {
             outb(base + REG_IER, 0x00);
             outb(base + REG_LCR, LCR_DLAB);
@@ -476,6 +516,9 @@ impl SerialDevice for Serial {
     }
 
     fn write_byte(&mut self, byte: u8) {
+        if !serial_present() {
+            return;
+        }
         let base = self.base;
         let mut spins = 0u32;
         loop {
@@ -510,6 +553,9 @@ impl SerialDevice for Serial {
 /// старший байт делителя и испортит скорость), а вход IRQ 4 — маршрутизирован в
 /// вектор с установленным обработчиком.
 pub unsafe fn enable_serial_rx() {
+    if !serial_present() {
+        return;
+    }
     // SAFETY: 0x3F9 — регистр разрешения прерываний COM1; условия делегированы
     // вызывающему контрактом функции.
     unsafe { outb(COM1 + REG_IER, IER_DATA_AVAILABLE) };
@@ -525,6 +571,9 @@ pub unsafe fn enable_serial_rx() {
 /// планировщик может быть уже занят нами же. Разводит одно с другим
 /// [`crate::input::ascii`], там же и разбор.
 pub fn drain_serial_rx(out: &mut [u8]) -> usize {
+    if !serial_present() {
+        return 0;
+    }
     let mut taken = 0;
     while taken < out.len() {
         // SAFETY: чтение LSR (0x3FD) — регистр состояния, побочных эффектов не
