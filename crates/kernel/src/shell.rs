@@ -512,12 +512,15 @@ fn banner() {
     // одной строки диагностики человек в этот момент не видит.
     if let Some(usb) = usb::xhci::summary() {
         if usb.occupied > 0 {
+            // За хабом устройств бывает больше, чем занятых корневых портов
+            // (фаза 68l): тогда это сказано в конце строки.
             sprintln!(
-                "USB: {} of {} port(s) brought up, {} keyboard(s), {} pointer(s).",
+                "USB: {} of {} port(s) brought up, {} keyboard(s), {} pointer(s){}.",
                 usb.devices,
                 usb.occupied,
                 usb.keyboards,
-                usb.mice
+                usb.mice,
+                if usb.hubs > 0 { alloc::format!(", behind {} hub(s)", usb.hubs) } else { alloc::string::String::new() }
             );
             // Причина отказа — тут же. «Порт занят, а устройства нет» без неё
             // означает ровно одно: садиться разбираться заново, уже с журналом,
@@ -1513,8 +1516,9 @@ fn usb_status() {
     match usb::xhci::summary() {
         Some(usb) => {
             sprintln!(
-                "  xhci     {} devices, first slot {} on port {}",
+                "  xhci     {} devices, {} hub(s), first slot {} on port {}",
                 usb.devices,
+                usb.hubs,
                 usb.slot,
                 usb.port
             );

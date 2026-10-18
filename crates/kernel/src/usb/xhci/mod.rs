@@ -44,9 +44,14 @@
 //! контроллер, поэтому передача опознаётся по номеру слота из самого события —
 //! иначе отчёт мыши достался бы клавиатуре.
 //!
-//! Хабов драйвер не проходит: на пути к устройствам их нет ни в QEMU, ни на
-//! Raspberry Pi 4, где VL805 сам является корневым хабом. Устройство за
-//! внешним хабом видно не будет, и это сказано вслух, а не обойдено.
+//! Хабы USB 2.0 драйвер проходит с фазы 68l: на настоящем ПК клавиатура и
+//! мышь часто висят за хабом — передняя панель корпуса, хаб ноутбука или
+//! монитора. Устройству за хабом контроллер нужен путь (route string, по
+//! четыре бита на ярус), а медленному устройству за быстрым хабом — ещё и
+//! транслятор этого хаба (TT). Об изменениях на своих портах хаб сообщает
+//! точкой прерываний, и разбирает их та же задача, что и корневые порты.
+//! Хабы USB 3 (свой дескриптор, `SET_HUB_DEPTH`) не проходятся: такой хаб
+//! виден системе дважды, и клавиатура с мышью висят на его половине USB 2.
 //!
 //! # Порядок инициализации
 //!
@@ -86,11 +91,42 @@ const RING_ENTRIES: usize = PAGE_SIZE / ring::TRB_LEN;
 
 /// Сколько слотов устройств ядро просит у контроллера.
 ///
-/// Четыре: клавиатура и мышь занимают по слоту, и запас на пару устройств
-/// оставлен затем, чтобы подключение третьего не требовало правки драйвера.
-/// Просить много не вредно, но каждый слот — это указатель в массиве
-/// контекстов, а массив контроллер читает целиком.
-const SLOTS_WANTED: u8 = 4;
+/// Шестнадцать с фазы 68l (было четыре): хаб занимает слот сам, а за ним —
+/// клавиатура, мышь и всё, что воткнуто рядом. Просить много не вредно, но
+/// каждый слот — это указатель в массиве контекстов, а массив контроллер
+/// читает целиком.
+const SLOTS_WANTED: u8 = 16;
+
+/// Сколько хабов подряд драйвер готов пройти — как у EHCI.
+const HUB_DEPTH_MAX: u8 = 3;
+/// Где в буфере устройства лежит карта изменений хаба: вторая половина
+/// страницы, чтобы ответ точки прерываний не затёр данные управляющей
+/// передачи к тому же хабу, идущей одновременно.
+const HUB_STATUS_OFFSET: usize = PAGE_SIZE / 2;
+/// Пауза после включения питания портов хаба, если хаб не назвал свою.
+const HUB_POWER_SETTLE_MS: u64 = 100;
+
+// Запросы хаба (USB 2.0, 11.24).
+const CLASS_HUB: u8 = 9;
+const DESC_HUB: u8 = 0x29;
+const HUB_REQ_GET_STATUS: u8 = 0;
+const HUB_REQ_CLEAR_FEATURE: u8 = 1;
+const HUB_REQ_SET_FEATURE: u8 = 3;
+const HUB_TO_HUB: u8 = 0x20;
+const HUB_TO_PORT: u8 = 0x23;
+const HUB_FROM_HUB: u8 = 0xA0;
+const HUB_FROM_PORT: u8 = 0xA3;
+const FEATURE_PORT_RESET: u8 = 4;
+const FEATURE_PORT_POWER: u8 = 8;
+/// `C_PORT_CONNECTION`; остальные признаки изменений порта идут за ним подряд.
+const FEATURE_C_PORT_FIRST: u8 = 16;
+const HUB_PORT_CONNECTION: u16 = 1 << 0;
+const HUB_PORT_ENABLE: u16 = 1 << 1;
+const HUB_PORT_RESET: u16 = 1 << 4;
+const HUB_PORT_LOW_SPEED: u16 = 1 << 9;
+const HUB_PORT_HIGH_SPEED: u16 = 1 << 10;
+const HUB_CHANGE_CONNECTION: u16 = 1 << 0;
+const HUB_CHANGE_RESET: u16 = 1 << 4;
 
 /// Минимальная версия интерфейса. `0x0090` — это xHCI 0.9, черновик, который
 /// встречался в первых чипсетах Intel и отличается расположением части полей.
@@ -198,6 +234,12 @@ pub enum XhciError {
     /// между «на порту ничего нет» и «на порту есть то, чего мы не понимаем» —
     /// это разница между «купите мышь» и «допишите разбор».
     UnknownHid,
+    /// Хаб не отдал свой дескриптор.
+    HubDescriptor,
+    /// Хаб USB 3: его драйвер не проходит.
+    SuperSpeedHub,
+    /// Хабы вложены глубже [`HUB_DEPTH_MAX`].
+    TooDeep,
 }
 
 impl core::fmt::Display for XhciError {
@@ -242,6 +284,11 @@ impl core::fmt::Display for XhciError {
                 "the HID interface declares no boot protocol and its report descriptor \
                  describes neither a pointer nor a keyboard",
             ),
+            Self::HubDescriptor => f.write_str("the hub did not return its descriptor"),
+            Self::SuperSpeedHub => f.write_str(
+                "USB 3 hubs are not walked; keyboards and mice sit on the hub's USB 2 half",
+            ),
+            Self::TooDeep => f.write_str("hubs are nested deeper than the driver goes"),
         }
     }
 }
@@ -255,8 +302,14 @@ impl From<DmaError> for XhciError {
 /// Подключённое устройство.
 struct Device {
     slot: u8,
-    /// Корневой порт, к которому она подключена.
+    /// Корневой порт, к которому она подключена — сама или через хабы.
     port: u8,
+    /// Место за хабом; у устройства на корневом порту — пустое.
+    place: Place,
+    /// Скорость: нужна детям хаба (транслятор) и его точке прерываний.
+    speed: u32,
+    /// Если это хаб — его порты.
+    hub: Option<Hub>,
     /// Контекст устройства: его заполняет контроллер, ядро только читает.
     context: DmaBuffer,
     /// Входной контекст: через него драйвер сообщает контроллеру, что менять.
@@ -296,6 +349,76 @@ struct Device {
     /// клавиатурой внутри — драйвер обслуживает только наполовину, и без этого
     /// числа вторая половина невидима.
     interface: (u8, u8),
+}
+
+/// Где устройство стоит за хабом (фаза 68l).
+#[derive(Clone, Copy, Default)]
+struct Place {
+    /// Слот хаба-родителя; ноль — устройство на корневом порту.
+    parent: u8,
+    /// Порт этого хаба.
+    hub_port: u8,
+    /// Route string: номер порта на каждом ярусе хабов, по четыре бита.
+    route: u32,
+    /// Сколько хабов над устройством.
+    depth: u8,
+    /// Транслятор для медленного устройства за быстрым хабом: слот хаба и
+    /// его порт; нули — транслятор не нужен.
+    tt: (u8, u8),
+}
+
+impl Place {
+    /// Место устройства на порту `port` хаба `hub` при скорости `speed`.
+    fn child(hub: &Device, port: u8, speed: u32) -> Self {
+        let depth = hub.place.depth;
+        // Портов с номером больше 15 в route string не бывает: поле
+        // четырёхбитное, и число портов хаба этим же и ограничено.
+        let route = hub.place.route | (u32::from(port.min(15)) << (4 * u32::from(depth)));
+        // Транслятор — у ближайшего высокоскоростного хаба на пути.
+        let tt = if speed == regs::SPEED_HIGH || speed >= regs::SPEED_SUPER {
+            (0, 0)
+        } else if hub.speed == regs::SPEED_HIGH {
+            (hub.slot, port)
+        } else {
+            hub.place.tt
+        };
+        Self { parent: hub.slot, hub_port: port, route, depth: depth + 1, tt }
+    }
+
+    /// Название места для журнала.
+    fn name(self, root: u8) -> alloc::string::String {
+        if self.parent == 0 {
+            alloc::format!("root port {root}")
+        } else {
+            alloc::format!("hub {} port {}", self.parent, self.hub_port)
+        }
+    }
+}
+
+/// Состояние хаба.
+#[derive(Clone, Copy)]
+struct Hub {
+    ports: u8,
+    /// Какие порты были заняты при последней сверке — по биту на порт.
+    connected: u32,
+    /// Карта изменений от точки прерываний хаба, ещё не разобранная: бит 0 —
+    /// сам хаб, бит N — порт N.
+    changed: u32,
+}
+
+/// Что за устройство нашлось по дескрипторам.
+enum Described {
+    Hid(HidInterface),
+    Hub(HubInterface),
+}
+
+/// Интерфейс хаба и его точка прерываний.
+#[derive(Clone, Copy)]
+struct HubInterface {
+    configuration: u8,
+    endpoint: u8,
+    max_packet_size: u16,
+    interval: u8,
 }
 
 /// Контроллер и подключённые к нему устройства.
@@ -948,9 +1071,10 @@ impl Controller {
 
             // SAFETY: см. выше.
             match unsafe { self.attach_one(port) } {
-                Ok(usb::PROTOCOL_KEYBOARD) => keyboard = true,
-                Ok(usb::PROTOCOL_MOUSE) => mouse = true,
-                Ok(_) => {}
+                Ok((k, m)) => {
+                    keyboard |= k;
+                    mouse |= m;
+                }
                 Err((stage, err)) => {
                     kprintln!("  usb         : port {port} failed while {stage}: {err}");
                     self.last_error = Some((port, stage, err));
@@ -983,9 +1107,11 @@ impl Controller {
         // SAFETY: контракт функции.
         let connected = unsafe { self.connected_mask() };
 
-        // Сначала — исчезнувшие: их слоты нужны тем, кто пришёл на их место, а
-        // слотов у контроллера всего четыре.
+        // Сначала — исчезнувшие: их слоты нужны тем, кто пришёл на их место.
+        // Вместе с хабом уходит всё, что за ним: у таких устройств тот же
+        // корневой порт.
         let mut index = 0;
+        let mut gone = false;
         while index < self.devices.len() {
             let port = self.devices[index].port;
             if connected & (1 << (port - 1)) != 0 {
@@ -994,28 +1120,18 @@ impl Controller {
             }
             let slot = self.devices[index].slot;
             kprintln!("  usb         : device on root port {port} is gone, freeing slot {slot}");
-            // SAFETY: слот выдан контроллером этому устройству.
-            unsafe { self.release_slot(slot) };
-            let device = self.devices.remove(index);
-            // Память возвращается **после** освобождения слота, и порядок здесь
-            // не формальность: пока слот жив, контроллер вправе читать контекст
-            // устройства и его кольца. Вернув буферы раньше, мы отдали бы их
-            // следующему просителю, а контроллер продолжал бы разбирать
-            // дескрипторы в чужой памяти.
-            //
-            // SAFETY: слот освобождён, дверной звонок этому устройству больше не
-            // звонит, и никаких дескрипторов в его кольцах не осталось.
-            unsafe {
-                dma::free(&device.context);
-                dma::free(&device.input);
-                dma::free(device.ep0.buffer());
-                dma::free(device.interrupt.buffer());
-                dma::free(&device.report);
-            }
+            // SAFETY: устройства на этом порту больше нет.
+            unsafe { self.forget(index) };
+            gone = true;
         }
 
         // SAFETY: см. выше.
-        let (keyboard, mouse) = unsafe { self.attach_missing() };
+        let (mut keyboard, mut mouse) = unsafe { self.attach_missing() };
+        // Хабы, приславшие карту изменений: их порты сверяются по одному.
+        // SAFETY: см. выше.
+        let (k, m, hubs_changed) = unsafe { self.scan_changed_hubs() };
+        keyboard |= k;
+        mouse |= m;
         if keyboard || mouse {
             let sources = input::sources();
             input::set_sources(input::Sources {
@@ -1025,7 +1141,54 @@ impl Controller {
             });
         }
 
-        before != self.devices.len()
+        gone || hubs_changed || before != self.devices.len()
+    }
+
+    /// Забыть устройство: освободить слот и вернуть память.
+    ///
+    /// # Safety
+    ///
+    /// Устройства с этим индексом больше нет на шине (или его подъём не
+    /// удался); дверной звонок ему больше не звонит.
+    unsafe fn forget(&mut self, index: usize) {
+        let slot = self.devices[index].slot;
+        // SAFETY: контракт функции.
+        unsafe { self.release_slot(slot) };
+        let device = self.devices.remove(index);
+        // SAFETY: см. `free_device`.
+        unsafe { free_device(&device) };
+    }
+
+    /// Забыть устройство на порту `port` хаба `hub` и всё, что за ним.
+    ///
+    /// # Safety
+    ///
+    /// См. [`Controller::forget`].
+    unsafe fn forget_subtree(&mut self, hub: u8, port: u8) {
+        let mut doomed: Vec<u8> = self
+            .devices
+            .iter()
+            .filter(|d| d.place.parent == hub && d.place.hub_port == port)
+            .map(|d| d.slot)
+            .collect();
+        // Потомки — до неподвижной точки: хабов подряд не больше трёх.
+        let mut at = 0;
+        while at < doomed.len() {
+            let parent = doomed[at];
+            for device in &self.devices {
+                if device.place.parent == parent && !doomed.contains(&device.slot) {
+                    doomed.push(device.slot);
+                }
+            }
+            at += 1;
+        }
+        for slot in doomed {
+            if let Some(index) = self.devices.iter().position(|d| d.slot == slot) {
+                kprintln!("  usb         : hub {hub} port {port}: slot {slot} is gone");
+                // SAFETY: контракт функции.
+                unsafe { self.forget(index) };
+            }
+        }
     }
 
     /// Вернуть слот контроллеру и убрать его из массива контекстов.
@@ -1060,18 +1223,19 @@ impl Controller {
         }
     }
 
-    /// Подключить одно устройство: слот, адрес, дескрипторы, конфигурация.
+    /// Подключить устройство на корневом порту.
     ///
-    /// Возвращает протокол HID, по которому устройство опознано, либо шаг, на
-    /// котором всё остановилось, вместе с ошибкой. Шаг возвращается наружу, а не
-    /// только печатается, потому что на машине без последовательного порта
-    /// печать некуда девать — а разница между «не ответило на сброс» и «не
-    /// отдало дескриптор» решает, куда смотреть дальше.
+    /// Возвращает, появились ли клавиатура и указатель — за хабом их может
+    /// оказаться несколько, — либо шаг, на котором всё остановилось, вместе с
+    /// ошибкой. Шаг возвращается наружу, а не только печатается, потому что на
+    /// машине без последовательного порта печать некуда девать — а разница
+    /// между «не ответило на сброс» и «не отдало дескриптор» решает, куда
+    /// смотреть дальше.
     ///
     /// # Safety
     ///
     /// Контроллер должен работать, а порт — иметь подключённое устройство.
-    unsafe fn attach_one(&mut self, port: u8) -> Result<u8, (Stage, XhciError)> {
+    unsafe fn attach_one(&mut self, port: u8) -> Result<(bool, bool), (Stage, XhciError)> {
         // Строка **до** сброса, а не после. Сброс порта — первое, что драйвер
         // делает с чужим устройством, и первое, что на чужой машине может не
         // вернуться; отчёт после него сообщает об успехе, а нужен признак
@@ -1084,8 +1248,24 @@ impl Controller {
             "  usb         : device on root port {port}, {}",
             regs::speed_name(speed)
         );
+        // SAFETY: порт сброшен.
+        unsafe { self.attach_device(port, Place::default(), speed) }
+    }
 
-        // SAFETY: см. выше.
+    /// Подключить одно устройство: слот, адрес, дескрипторы, конфигурация. Хаб
+    /// после подъёма сразу проходится по портам.
+    ///
+    /// # Safety
+    ///
+    /// Контроллер должен работать, порт (корневой или хаба) — сброшен и
+    /// разрешён.
+    unsafe fn attach_device(
+        &mut self,
+        port: u8,
+        place: Place,
+        speed: u32,
+    ) -> Result<(bool, bool), (Stage, XhciError)> {
+        // SAFETY: контракт функции.
         let event = unsafe {
             self.command_execute(Trb {
                 parameter: 0,
@@ -1117,6 +1297,9 @@ impl Controller {
         let mut device = Device {
             slot,
             port,
+            place,
+            speed,
+            hub: None,
             context,
             input,
             ep0,
@@ -1132,12 +1315,56 @@ impl Controller {
         };
 
         // SAFETY: контракт функции; контексты выделены и обнулены.
-        unsafe { self.address_device(&mut device, speed) }.map_err(|err| (Stage::Address, err))?;
+        let protocol = match unsafe { self.bring_up(&mut device) } {
+            Ok(protocol) => protocol,
+            Err(failure) => {
+                // Слот возвращается и при отказе: за хабом устройств бывает
+                // больше, чем при одном корневом порте, и потерянные слоты
+                // кончились бы.
+                // SAFETY: устройство не в списке, звонков ему не будет.
+                unsafe {
+                    self.release_slot(slot);
+                    free_device(&device);
+                }
+                return Err(failure);
+            }
+        };
+
+        let is_hub = device.hub.is_some();
+        self.devices.push(device);
+        // SAFETY: устройство настроено, кольцо точки прерываний готово.
+        unsafe { self.queue_reports() };
+        if is_hub {
+            // SAFETY: хаб поднят и стоит в списке устройств.
+            let (keyboard, mouse, _) = unsafe { self.scan_hub(slot) };
+            return Ok((keyboard, mouse));
+        }
+        Ok((protocol == usb::PROTOCOL_KEYBOARD, protocol == usb::PROTOCOL_MOUSE))
+    }
+
+    /// Адрес, дескрипторы и конфигурация — как хаба или как HID. Возвращает
+    /// протокол HID (у хаба — ноль).
+    ///
+    /// # Safety
+    ///
+    /// См. [`Controller::attach_device`]; слот выделен.
+    unsafe fn bring_up(&mut self, device: &mut Device) -> Result<u8, (Stage, XhciError)> {
+        let (slot, speed) = (device.slot, device.speed);
+        // SAFETY: контракт функции; контексты выделены и обнулены.
+        unsafe { self.address_device(device, speed) }.map_err(|err| (Stage::Address, err))?;
         kprintln!("  usb         : slot {slot} addressed");
 
         // SAFETY: устройство отвечает на управляющей точке.
-        let found = unsafe { self.describe_device(&mut device, speed) }
-            .map_err(|err| (Stage::Describe, err))?;
+        let found = match unsafe { self.describe_device(device, speed) }
+            .map_err(|err| (Stage::Describe, err))?
+        {
+            Described::Hid(found) => found,
+            Described::Hub(hub) => {
+                // SAFETY: см. выше.
+                unsafe { self.bring_up_hub(device, &hub) }.map_err(|err| (Stage::Configure, err))?;
+                return Ok(0);
+            }
+        };
         let micros = interval_micros(endpoint_interval(speed, found.interval));
         kprintln!(
             "  usb         : HID interface {}, endpoint {} IN, {}-byte reports every {}.{:03} ms{}",
@@ -1153,21 +1380,359 @@ impl Controller {
         device.described_by = found.report_len;
         device.interface = (found.interface, found.interfaces);
         // SAFETY: см. выше.
-        unsafe { self.configure_endpoint(&mut device, &found, speed) }
-            .map_err(|err| (Stage::Configure, err))?;
+        unsafe {
+            self.configure_endpoint(
+                device,
+                found.endpoint,
+                found.interval,
+                found.max_packet_size,
+                None,
+            )
+        }
+        .map_err(|err| (Stage::Configure, err))?;
         // SAFETY: см. выше.
         let reader =
-            unsafe { self.enable_reports(&mut device, &found) }.map_err(|err| (Stage::Enable, err))?;
+            unsafe { self.enable_reports(device, &found) }.map_err(|err| (Stage::Enable, err))?;
         let protocol = reader.protocol();
         kprintln!("  usb         : slot {slot} is a {}", reader.name());
 
         // Разборщик ставится последним: до этого момента буфер занят
         // дескрипторами, и отчёт в него ещё не запрашивался.
         device.reader = Some(reader);
-        self.devices.push(device);
-        // SAFETY: устройство настроено, кольцо точки прерываний готово.
-        unsafe { self.queue_reports() };
         Ok(protocol)
+    }
+
+    /// Поднять хаб: конфигурация, дескриптор хаба, точка прерываний, питание
+    /// портов.
+    ///
+    /// # Safety
+    ///
+    /// Устройство адресовано и описано.
+    unsafe fn bring_up_hub(&mut self, device: &mut Device, found: &HubInterface) -> Result<(), XhciError> {
+        if device.speed >= regs::SPEED_SUPER {
+            return Err(XhciError::SuperSpeedHub);
+        }
+        if device.place.depth >= HUB_DEPTH_MAX {
+            return Err(XhciError::TooDeep);
+        }
+        // SAFETY: контракт функции.
+        unsafe {
+            self.control_transfer(
+                device,
+                [0, usb::REQ_SET_CONFIGURATION, found.configuration, 0, 0, 0, 0, 0],
+                0,
+                false,
+            )
+        }?;
+        // SAFETY: хаб сконфигурирован.
+        let read = unsafe {
+            self.control_transfer(
+                device,
+                [HUB_FROM_HUB, usb::REQ_GET_DESCRIPTOR, 0, DESC_HUB, 0, 0, 9, 0],
+                9,
+                true,
+            )
+        }?;
+        if read < 7 {
+            return Err(XhciError::HubDescriptor);
+        }
+        // SAFETY: буфер выделен на страницу, прочитано `read` байт.
+        let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
+        let ports = bytes[2].min(15);
+        // Время «обдумывания» транслятора (биты 6:5 `wHubCharacteristics`) —
+        // контроллер должен знать его у высокоскоростного хаба.
+        let think_time = (u32::from(u16::from_le_bytes([bytes[3], bytes[4]])) >> 5) & 0b11;
+        let power_good = u64::from(bytes[5]) * 2;
+
+        // SAFETY: см. выше.
+        unsafe {
+            self.configure_endpoint(
+                device,
+                found.endpoint,
+                found.interval,
+                found.max_packet_size,
+                Some((ports, if device.speed == regs::SPEED_HIGH { think_time } else { 0 })),
+            )
+        }?;
+        for port in 1..=ports {
+            // SAFETY: см. выше.
+            let _ = unsafe {
+                self.control_transfer(
+                    device,
+                    [HUB_TO_PORT, HUB_REQ_SET_FEATURE, FEATURE_PORT_POWER, 0, port, 0, 0, 0],
+                    0,
+                    false,
+                )
+            };
+        }
+        sleep_ms(power_good.max(HUB_POWER_SETTLE_MS));
+
+        // Карта изменений: бит на хаб и по биту на порт.
+        device.report_len = found.max_packet_size.clamp(1, 4);
+        device.hub = Some(Hub { ports, connected: 0, changed: 0 });
+        kprintln!(
+            "  usb         : {}: hub {:04x}:{:04x} in slot {}, {}, {ports} port(s)",
+            device.place.name(device.port),
+            device.identity.0,
+            device.identity.1,
+            device.slot,
+            regs::speed_name(device.speed)
+        );
+        Ok(())
+    }
+
+    /// Пройти все порты хаба. Возвращает новые клавиатуру и указатель и
+    /// признак «что-то изменилось».
+    ///
+    /// # Safety
+    ///
+    /// Хаб в слоте `hub` поднят и стоит в списке устройств; вызов из задачи.
+    unsafe fn scan_hub(&mut self, hub: u8) -> (bool, bool, bool) {
+        let Some(ports) = self.find(hub).and_then(|d| d.hub).map(|h| h.ports) else {
+            return (false, false, false);
+        };
+        let (mut keyboard, mut mouse, mut changed) = (false, false, false);
+        for port in 1..=ports {
+            // SAFETY: контракт функции.
+            let (k, m, c) = unsafe { self.check_hub_port(hub, port) };
+            keyboard |= k;
+            mouse |= m;
+            changed |= c;
+        }
+        (keyboard, mouse, changed)
+    }
+
+    /// Хабы, приславшие карту изменений, — по одному, все их порты.
+    ///
+    /// # Safety
+    ///
+    /// Вызов из задачи, контроллер работает.
+    unsafe fn scan_changed_hubs(&mut self) -> (bool, bool, bool) {
+        let hubs: Vec<(u8, u32)> = self
+            .devices
+            .iter()
+            .filter_map(|d| d.hub.filter(|h| h.changed != 0).map(|h| (d.slot, h.changed)))
+            .collect();
+        let (mut keyboard, mut mouse, mut changed) = (false, false, false);
+        for (hub, bits) in hubs {
+            if let Some(state) = self.find_mut(hub).and_then(|d| d.hub.as_mut()) {
+                state.changed = 0;
+            }
+            if bits & 1 != 0 {
+                // Изменение у самого хаба (питание, перегрузка): признаки
+                // снимаются, иначе хаб будет присылать карту без конца.
+                // SAFETY: контракт функции.
+                unsafe { self.clear_hub_changes(hub) };
+            }
+            // SAFETY: контракт функции; хаб из списка устройств.
+            let (k, m, c) = unsafe { self.scan_hub(hub) };
+            keyboard |= k;
+            mouse |= m;
+            changed |= c;
+        }
+        (keyboard, mouse, changed)
+    }
+
+    /// Снять признаки изменений самого хаба: `C_HUB_LOCAL_POWER` и
+    /// `C_HUB_OVER_CURRENT`.
+    ///
+    /// # Safety
+    ///
+    /// См. [`Controller::scan_changed_hubs`].
+    unsafe fn clear_hub_changes(&mut self, hub: u8) {
+        // SAFETY: контракт функции.
+        let Ok(read) = (unsafe {
+            self.hub_control(hub, [HUB_FROM_HUB, HUB_REQ_GET_STATUS, 0, 0, 0, 0, 4, 0], 4, true)
+        }) else {
+            return;
+        };
+        let change = self.hub_word(hub, read, 2);
+        for feature in 0..2u8 {
+            if change & (1 << feature) != 0 {
+                // SAFETY: см. выше.
+                let _ = unsafe {
+                    self.hub_control(hub, [HUB_TO_HUB, HUB_REQ_CLEAR_FEATURE, feature, 0, 0, 0, 0, 0], 0, false)
+                };
+            }
+        }
+    }
+
+    /// Сверить один порт хаба с тем, что о нём известно, и поднять или забыть
+    /// устройство. Возвращает новые клавиатуру и указатель и признак «что-то
+    /// изменилось».
+    ///
+    /// # Safety
+    ///
+    /// См. [`Controller::scan_hub`].
+    unsafe fn check_hub_port(&mut self, hub: u8, port: u8) -> (bool, bool, bool) {
+        let nothing = (false, false, false);
+        let Some(known) = self.find(hub).and_then(|d| d.hub).map(|h| h.connected & (1 << port) != 0)
+        else {
+            return nothing;
+        };
+        // SAFETY: контракт функции.
+        let (status, change) = match unsafe { self.hub_port_status(hub, port) } {
+            Ok(state) => state,
+            Err(err) => {
+                kprintln!("  usb         : hub {hub} port {port}: the port status could not be read: {err}");
+                return nothing;
+            }
+        };
+        // Все признаки изменений снимаются: оставленный признак хаб
+        // повторял бы в карте изменений без конца.
+        for bit in 0..5u8 {
+            if change & (1 << bit) != 0 {
+                // SAFETY: см. выше.
+                let _ = unsafe { self.hub_port_feature(hub, port, false, FEATURE_C_PORT_FIRST + bit) };
+            }
+        }
+        let connected = status & HUB_PORT_CONNECTION != 0;
+        // Переподключение между двумя сверками: признак изменения стоит, а
+        // устройство, которое мы знали, на порту уже другое.
+        let replugged = known && connected && change & HUB_CHANGE_CONNECTION != 0;
+
+        if known && (!connected || replugged) {
+            // SAFETY: устройства на порту больше нет.
+            unsafe { self.forget_subtree(hub, port) };
+            self.set_hub_bit(hub, port, false);
+            if !replugged {
+                return (false, false, true);
+            }
+        }
+        if !connected || (known && !replugged) {
+            return nothing;
+        }
+
+        // Бит ставится до попытки: отказавшее устройство не должно
+        // сбрасываться заново на каждой сверке.
+        self.set_hub_bit(hub, port, true);
+        kprintln!("  usb         : hub {hub} port {port}: connected, resetting");
+        sleep_ms(PORT_DEBOUNCE_MS);
+        // SAFETY: см. выше.
+        let speed = match unsafe { self.reset_hub_port(hub, port) } {
+            Ok(speed) => speed,
+            Err(err) => {
+                kprintln!("  usb         : hub {hub} port {port} failed while {}: {err}", Stage::Reset);
+                let root = self.find(hub).map_or(0, |d| d.port);
+                self.last_error = Some((root, Stage::Reset, err));
+                return (false, false, true);
+            }
+        };
+        let Some((root, place)) = self.find(hub).map(|d| (d.port, Place::child(d, port, speed))) else {
+            return nothing;
+        };
+        kprintln!(
+            "  usb         : device on hub {hub} port {port}, {}{}",
+            regs::speed_name(speed),
+            if place.tt.0 != 0 { ", through the hub's translator" } else { "" }
+        );
+        // SAFETY: порт хаба сброшен и разрешён.
+        match unsafe { self.attach_device(root, place, speed) } {
+            Ok((keyboard, mouse)) => (keyboard, mouse, true),
+            Err((stage, err)) => {
+                kprintln!("  usb         : hub {hub} port {port} failed while {stage}: {err}");
+                self.last_error = Some((root, stage, err));
+                (false, false, true)
+            }
+        }
+    }
+
+    fn set_hub_bit(&mut self, hub: u8, port: u8, on: bool) {
+        if let Some(state) = self.find_mut(hub).and_then(|d| d.hub.as_mut()) {
+            if on {
+                state.connected |= 1 << port;
+            } else {
+                state.connected &= !(1 << port);
+            }
+        }
+    }
+
+    fn find(&self, slot: u8) -> Option<&Device> {
+        self.devices.iter().find(|d| d.slot == slot)
+    }
+
+    fn find_mut(&mut self, slot: u8) -> Option<&mut Device> {
+        self.devices.iter_mut().find(|d| d.slot == slot)
+    }
+
+    /// Слово из ответа хаба, лежащего в его буфере (`read` байт).
+    fn hub_word(&self, hub: u8, read: usize, at: usize) -> u16 {
+        match self.find(hub) {
+            Some(device) if read >= at + 2 => {
+                // SAFETY: буфер выделен на страницу; читается внутри ответа.
+                let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
+                u16::from_le_bytes([bytes[at], bytes[at + 1]])
+            }
+            _ => 0,
+        }
+    }
+
+    /// Состояние порта хаба: `(status, change)`.
+    ///
+    /// # Safety
+    ///
+    /// Хаб сконфигурирован и стоит в списке устройств.
+    unsafe fn hub_port_status(&mut self, hub: u8, port: u8) -> Result<(u16, u16), XhciError> {
+        // SAFETY: контракт функции.
+        let read = unsafe {
+            self.hub_control(hub, [HUB_FROM_PORT, HUB_REQ_GET_STATUS, 0, 0, port, 0, 4, 0], 4, true)
+        }?;
+        if read < 4 {
+            return Err(XhciError::ShortDescriptor);
+        }
+        Ok((self.hub_word(hub, read, 0), self.hub_word(hub, read, 2)))
+    }
+
+    /// `SET_FEATURE` или `CLEAR_FEATURE` у порта хаба.
+    ///
+    /// # Safety
+    ///
+    /// См. [`Controller::hub_port_status`].
+    unsafe fn hub_port_feature(&mut self, hub: u8, port: u8, set: bool, feature: u8) -> Result<(), XhciError> {
+        let request = if set { HUB_REQ_SET_FEATURE } else { HUB_REQ_CLEAR_FEATURE };
+        // SAFETY: контракт функции.
+        unsafe { self.hub_control(hub, [HUB_TO_PORT, request, feature, 0, port, 0, 0, 0], 0, false) }
+            .map(|_| ())
+    }
+
+    /// Сбросить порт хаба и узнать скорость устройства на нём (номер скорости
+    /// xHCI).
+    ///
+    /// # Safety
+    ///
+    /// См. [`Controller::hub_port_status`].
+    unsafe fn reset_hub_port(&mut self, hub: u8, port: u8) -> Result<u32, XhciError> {
+        // SAFETY: контракт функции.
+        unsafe { self.hub_port_feature(hub, port, true, FEATURE_PORT_RESET) }?;
+        let mut timeout = Timeout::new(PORT_RESET_TIMEOUT_MS);
+        loop {
+            sleep_ms(10);
+            // SAFETY: см. выше.
+            let (status, change) = unsafe { self.hub_port_status(hub, port) }?;
+            if change & HUB_CHANGE_RESET != 0
+                || (status & HUB_PORT_RESET == 0 && status & HUB_PORT_ENABLE != 0)
+            {
+                break;
+            }
+            if timeout.expired() {
+                return Err(XhciError::PortResetTimeout(port));
+            }
+        }
+        // SAFETY: см. выше.
+        let _ = unsafe { self.hub_port_feature(hub, port, false, FEATURE_C_PORT_FIRST + 4) };
+        sleep_ms(PORT_RECOVERY_MS);
+        // SAFETY: см. выше.
+        let (status, _) = unsafe { self.hub_port_status(hub, port) }?;
+        if status & HUB_PORT_ENABLE == 0 {
+            return Err(XhciError::PortResetTimeout(port));
+        }
+        Ok(if status & HUB_PORT_LOW_SPEED != 0 {
+            regs::SPEED_LOW
+        } else if status & HUB_PORT_HIGH_SPEED != 0 {
+            regs::SPEED_HIGH
+        } else {
+            regs::SPEED_FULL
+        })
     }
 
     /// Записать слово в контекст.
@@ -1228,10 +1793,21 @@ impl Controller {
         // Контекст слота. `Context Entries` = 1 означает «описана одна точка,
         // нулевая»; поле считает контексты, а не точки, поэтому единица здесь —
         // это EP0 и ничего больше.
+        //
+        // За хабом (фаза 68l) — ещё путь от корневого порта (route string) и,
+        // у медленного устройства за быстрым хабом, транслятор: слот хаба и
+        // номер его порта.
+        let place = device.place;
         // SAFETY: см. выше.
         unsafe {
-            self.write_context(&device.input, 1, 0, (1 << 27) | (speed << 20));
+            self.write_context(&device.input, 1, 0, (1 << 27) | (speed << 20) | place.route);
             self.write_context(&device.input, 1, 1, u32::from(device.port) << 16);
+            self.write_context(
+                &device.input,
+                1,
+                2,
+                u32::from(place.tt.0) | (u32::from(place.tt.1) << 8),
+            );
         }
 
         // Контекст управляющей точки. `CErr = 3` — сколько раз контроллер
@@ -1261,7 +1837,7 @@ impl Controller {
         Ok(())
     }
 
-    /// Прочитать дескрипторы и найти интерфейс клавиатуры.
+    /// Прочитать дескрипторы и понять, хаб это или HID.
     ///
     /// # Safety
     ///
@@ -1270,7 +1846,7 @@ impl Controller {
         &mut self,
         device: &mut Device,
         speed: u32,
-    ) -> Result<HidInterface, XhciError> {
+    ) -> Result<Described, XhciError> {
         // Первые восемь байт дескриптора устройства: больше читать нельзя, пока
         // неизвестен размер пакета управляющей точки, — а он лежит именно в этих
         // восьми байтах (байт 7). Классическая курица с яйцом, решённая
@@ -1310,12 +1886,17 @@ impl Controller {
         // журнала нет, это единственный способ отличить два разных устройства
         // от одного, увиденного дважды. Отказ здесь не смертелен — устройство
         // останется безымянным, и только.
+        // Класс устройства (байт 4) — оттуда же: хаб объявляет себя им.
+        let mut class = 0;
         // SAFETY: см. выше.
         if let Ok(read) = unsafe { self.get_descriptor(device, usb::DESC_DEVICE, 0, 18) } {
             // SAFETY: см. выше.
             let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
             if let Some(full) = usb::DeviceDescriptor::parse(bytes) {
                 device.identity = (full.vendor, full.product);
+            }
+            if read >= 5 {
+                class = bytes[4];
             }
         }
 
@@ -1338,7 +1919,12 @@ impl Controller {
         let read = unsafe { self.get_descriptor(device, usb::DESC_CONFIGURATION, 0, total) }?;
         // SAFETY: см. выше.
         let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
-        usb::find_hid(bytes).ok_or(XhciError::NoHid)
+        let interface_class =
+            if bytes.len() >= 18 && bytes[10] == usb::DESC_INTERFACE { bytes[14] } else { 0 };
+        if class == CLASS_HUB || interface_class == CLASS_HUB {
+            return find_hub_endpoint(bytes).map(Described::Hub).ok_or(XhciError::HubDescriptor);
+        }
+        usb::find_hid(bytes).map(Described::Hid).ok_or(XhciError::NoHid)
     }
 
     /// Сообщить контроллеру настоящий размер пакета управляющей точки.
@@ -1372,18 +1958,24 @@ impl Controller {
 
     /// Добавить точку прерываний: команда `Configure Endpoint`.
     ///
+    /// `hub` — число портов и время транслятора, если устройство — хаб:
+    /// контроллер должен знать это о хабе до первого устройства за ним.
+    ///
     /// # Safety
     ///
     /// Устройство должно быть адресовано, а кольцо точки — существовать.
     unsafe fn configure_endpoint(
         &mut self,
         device: &mut Device,
-        found: &HidInterface,
-        speed: u32,
+        endpoint: u8,
+        b_interval: u8,
+        max_packet_size: u16,
+        hub: Option<(u8, u32)>,
     ) -> Result<(), XhciError> {
+        let speed = device.speed;
         // Идентификатор контекста точки: `2 * номер + 1` для направления IN. Он
         // же — цель дверного звонка.
-        let target = found.endpoint * 2 + 1;
+        let target = endpoint * 2 + 1;
         device.interrupt_target = target;
         let context_index = usize::from(target);
 
@@ -1405,10 +1997,24 @@ impl Controller {
             // новую точку.
             let slot0 = self.read_context(&device.context, 0, 0);
             let entries = context_index as u32;
-            self.write_context(&device.input, 1, 0, (slot0 & !(0x1F << 27)) | (entries << 27));
+            let mut slot0 = (slot0 & !(0x1F << 27)) | (entries << 27);
+            if let Some((ports, think_time)) = hub {
+                // Флаг Hub, число портов, время транслятора.
+                slot0 |= 1 << 26;
+                let slot1 = self.read_context(&device.context, 0, 1);
+                self.write_context(
+                    &device.input,
+                    1,
+                    1,
+                    (slot1 & !(0xFF << 24)) | (u32::from(ports) << 24),
+                );
+                let slot2 = self.read_context(&device.context, 0, 2);
+                self.write_context(&device.input, 1, 2, (slot2 & !(0b11 << 16)) | (think_time << 16));
+            }
+            self.write_context(&device.input, 1, 0, slot0);
 
-            let interval = endpoint_interval(speed, found.interval);
-            let max_packet = u32::from(found.max_packet_size);
+            let interval = endpoint_interval(speed, b_interval);
+            let max_packet = u32::from(max_packet_size);
             // Тип точки 7 — Interrupt IN. `CErr = 3` — см. `address_device`.
             self.write_context(&device.input, context_index + 1, 0, u32::from(interval) << 16);
             self.write_context(
@@ -1651,55 +2257,43 @@ impl Controller {
         length: u16,
         is_in: bool,
     ) -> Result<usize, XhciError> {
-        /// Тип передачи в дескрипторе Setup Stage: нет данных.
-        const TRT_NO_DATA: u32 = 0 << 16;
-        /// Данные от устройства к хосту.
-        const TRT_IN: u32 = 3 << 16;
-        /// Данные от хоста к устройству.
-        const TRT_OUT: u32 = 2 << 16;
-        /// Бит 16 дескрипторов Data/Status Stage: направление IN.
-        const DIR_IN: u32 = 1 << 16;
+        let last = push_control(device, setup, length, is_in);
+        // SAFETY: контракт функции.
+        unsafe { self.finish_control(device.slot, last, length) }
+    }
 
-        let trt = if length == 0 {
-            TRT_NO_DATA
-        } else if is_in {
-            TRT_IN
-        } else {
-            TRT_OUT
-        };
+    /// Управляющая передача хабу, который уже стоит в списке устройств.
+    ///
+    /// Хаб из списка не вынимается: его точка прерываний в это время может
+    /// завершиться, и событие должно найти устройство на месте. Данные — в
+    /// начале его буфера; карта изменений лежит дальше
+    /// ([`HUB_STATUS_OFFSET`]).
+    ///
+    /// # Safety
+    ///
+    /// Хаб сконфигурирован.
+    unsafe fn hub_control(
+        &mut self,
+        hub: u8,
+        setup: [u8; 8],
+        length: u16,
+        is_in: bool,
+    ) -> Result<usize, XhciError> {
+        let device = self.find_mut(hub).ok_or(XhciError::NoDevice)?;
+        let last = push_control(device, setup, length, is_in);
+        // SAFETY: контракт функции.
+        unsafe { self.finish_control(hub, last, length) }
+    }
 
-        device.ep0.push(Trb {
-            // Восемь байт запроса едут в самом дескрипторе, а не по ссылке —
-            // отсюда флаг `IDT`. Иначе под них понадобился бы отдельный буфер
-            // DMA на каждую передачу.
-            parameter: u64::from_le_bytes(setup),
-            status: 8,
-            control: (ring::TRB_SETUP_STAGE << ring::TRB_TYPE_SHIFT) | ring::TRB_IDT | trt,
-        });
-
-        if length > 0 {
-            device.ep0.push(Trb {
-                parameter: device.report.phys().as_u64(),
-                status: u32::from(length),
-                control: (ring::TRB_DATA_STAGE << ring::TRB_TYPE_SHIFT)
-                    | if is_in { DIR_IN } else { 0 },
-            });
-        }
-
-        // Дескриптор состояния — единственный с флагом `IOC`: событие нужно одно,
-        // о завершении всей передачи. Его направление противоположно данным (у
-        // передачи без данных — IN).
-        let status_in = length == 0 || !is_in;
-        let last = device.ep0.push(Trb {
-            parameter: 0,
-            status: 0,
-            control: (ring::TRB_STATUS_STAGE << ring::TRB_TYPE_SHIFT)
-                | ring::TRB_IOC
-                | if status_in { DIR_IN } else { 0 },
-        });
-
+    /// Позвонить управляющей точке и дождаться события о последнем
+    /// дескрипторе передачи.
+    ///
+    /// # Safety
+    ///
+    /// Дескрипторы передачи уже в кольце точки 0 этого слота.
+    unsafe fn finish_control(&mut self, slot: u8, last: u64, length: u16) -> Result<usize, XhciError> {
         // SAFETY: дескрипторы записаны целиком; цель 1 — управляющая точка.
-        unsafe { self.regs.ring_doorbell(device.slot, 1) };
+        unsafe { self.regs.ring_doorbell(slot, 1) };
 
         let mut timeout = Timeout::new(TRANSFER_TIMEOUT_MS);
         loop {
@@ -1720,7 +2314,60 @@ impl Controller {
             }
         }
     }
+}
 
+/// Записать в кольцо точки 0 дескрипторы управляющей передачи. Возвращает
+/// адрес последнего — о нём придёт событие.
+fn push_control(device: &mut Device, setup: [u8; 8], length: u16, is_in: bool) -> u64 {
+    /// Тип передачи в дескрипторе Setup Stage: нет данных.
+    const TRT_NO_DATA: u32 = 0 << 16;
+    /// Данные от устройства к хосту.
+    const TRT_IN: u32 = 3 << 16;
+    /// Данные от хоста к устройству.
+    const TRT_OUT: u32 = 2 << 16;
+    /// Бит 16 дескрипторов Data/Status Stage: направление IN.
+    const DIR_IN: u32 = 1 << 16;
+
+    let trt = if length == 0 {
+        TRT_NO_DATA
+    } else if is_in {
+        TRT_IN
+    } else {
+        TRT_OUT
+    };
+
+    device.ep0.push(Trb {
+        // Восемь байт запроса едут в самом дескрипторе, а не по ссылке —
+        // отсюда флаг `IDT`. Иначе под них понадобился бы отдельный буфер
+        // DMA на каждую передачу.
+        parameter: u64::from_le_bytes(setup),
+        status: 8,
+        control: (ring::TRB_SETUP_STAGE << ring::TRB_TYPE_SHIFT) | ring::TRB_IDT | trt,
+    });
+
+    if length > 0 {
+        device.ep0.push(Trb {
+            parameter: device.report.phys().as_u64(),
+            status: u32::from(length),
+            control: (ring::TRB_DATA_STAGE << ring::TRB_TYPE_SHIFT)
+                | if is_in { DIR_IN } else { 0 },
+        });
+    }
+
+    // Дескриптор состояния — единственный с флагом `IOC`: событие нужно одно,
+    // о завершении всей передачи. Его направление противоположно данным (у
+    // передачи без данных — IN).
+    let status_in = length == 0 || !is_in;
+    device.ep0.push(Trb {
+        parameter: 0,
+        status: 0,
+        control: (ring::TRB_STATUS_STAGE << ring::TRB_TYPE_SHIFT)
+            | ring::TRB_IOC
+            | if status_in { DIR_IN } else { 0 },
+    })
+}
+
+impl Controller {
     /// Поставить в кольцо запрос отчёта.
     ///
     /// # Safety
@@ -1732,12 +2379,14 @@ impl Controller {
                 continue;
             };
             // Пока разборщика нет, устройство ещё описывается, и его буфер занят
-            // дескрипторами: запрос отчёта затёр бы их на полпути.
-            if device.queued || device.reader.is_none() {
+            // дескрипторами: запрос отчёта затёр бы их на полпути. Хаб ждёт
+            // карту изменений во второй половине буфера.
+            if device.queued || (device.reader.is_none() && device.hub.is_none()) {
                 continue;
             }
+            let offset = if device.hub.is_some() { HUB_STATUS_OFFSET } else { 0 };
             device.interrupt.push(Trb {
-                parameter: device.report.phys().as_u64(),
+                parameter: device.report.phys().as_u64() + offset as u64,
                 status: u32::from(device.report_len),
                 control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT)
                     | ring::TRB_IOC
@@ -1784,6 +2433,20 @@ impl Controller {
         }
 
         let received = (u32::from(device.report_len) - event.residual().min(u32::from(device.report_len))) as usize;
+        if let Some(hub) = device.hub.as_mut() {
+            // Карта изменений хаба: разбирать её здесь нельзя (запросы к
+            // хабу — это управляющие передачи), только запомнить и поставить
+            // признак, по которому задача сверит порты.
+            // SAFETY: буфер выделен на страницу, карта — не длиннее 4 байт.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(device.report.as_ptr::<u8>().add(HUB_STATUS_OFFSET), received)
+            };
+            for (index, byte) in bytes.iter().enumerate() {
+                hub.changed |= u32::from(*byte) << (8 * index);
+            }
+            self.ports_changed = true;
+            return;
+        }
         // SAFETY: буфер отчёта выделен на страницу; читается ровно столько, сколько
         // сообщил контроллер. `volatile` не нужен — передача уже завершена, и
         // содержимое больше не меняется, а отображение некешируемое.
@@ -1971,8 +2634,9 @@ impl Controller {
         for device in &self.devices {
             reports += device.reader.as_ref().map_or(0, Reader::reports);
         }
-        let mut attached = [Attached::default(); SLOTS_WANTED as usize];
-        for (slot, device) in attached.iter_mut().zip(self.devices.iter()) {
+        let mut attached = [Attached::default(); usb::ATTACHED_MAX];
+        let functions = || self.devices.iter().filter(|device| device.hub.is_none());
+        for (slot, device) in attached.iter_mut().zip(functions()) {
             *slot = Attached {
                 port: device.port,
                 vendor: device.identity.0,
@@ -1995,14 +2659,15 @@ impl Controller {
             .filter(|device| matches!(device.reader, Some(Reader::Mouse(_))))
             .count();
         Summary {
-            devices: self.devices.len(),
+            devices: functions().count(),
+            hubs: self.devices.len() - functions().count(),
             keyboards,
             mice,
             occupied: self.occupied,
             last_error: self.last_error,
             attached,
-            slot: self.devices.first().map_or(0, |device| device.slot),
-            port: self.devices.first().map_or(0, |device| device.port),
+            slot: functions().next().map_or(0, |device| device.slot),
+            port: functions().next().map_or(0, |device| device.port),
             reports,
             events: self.events_seen,
             errors: self.transfer_errors,
@@ -2020,8 +2685,10 @@ impl Controller {
 /// читать `summary().3` стало нельзя без подглядывания в объявление.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Summary {
-    /// Сколько устройств поднято.
+    /// Сколько устройств поднято, не считая хабов.
     pub devices: usize,
+    /// Сколько хабов пройдено (фаза 68l).
+    pub hubs: usize,
     /// Сколько из них разбираются как клавиатуры.
     ///
     /// Отдельно от [`Summary::devices`] потому, что «устройство поднялось» и
@@ -2041,7 +2708,7 @@ pub struct Summary {
     /// Массив, а не вектор: сводку спрашивают в том числе из мест, где нельзя
     /// выделять память, и четырёх записей хватает — столько же слотов драйвер
     /// просит у контроллера.
-    pub attached: [Attached; SLOTS_WANTED as usize],
+    pub attached: [Attached; usb::ATTACHED_MAX],
     /// Слот первого из них.
     pub slot: u8,
     /// Порт первого из них.
@@ -2062,6 +2729,51 @@ pub struct Summary {
     pub delivery: &'static str,
     /// Сколько раз задача просыпалась разбирать кольцо.
     pub services: u64,
+}
+
+/// Вернуть память устройства.
+///
+/// Память возвращается **после** освобождения слота, и порядок здесь не
+/// формальность: пока слот жив, контроллер вправе читать контекст устройства и
+/// его кольца. Вернув буферы раньше, мы отдали бы их следующему просителю, а
+/// контроллер продолжал бы разбирать дескрипторы в чужой памяти.
+///
+/// # Safety
+///
+/// Слот устройства освобождён, дверной звонок ему больше не звонит, и никаких
+/// дескрипторов в его кольцах не осталось.
+unsafe fn free_device(device: &Device) {
+    // SAFETY: контракт функции.
+    unsafe {
+        dma::free(&device.context);
+        dma::free(&device.input);
+        dma::free(device.ep0.buffer());
+        dma::free(device.interrupt.buffer());
+        dma::free(&device.report);
+    }
+}
+
+/// Найти в конфигурации хаба его точку прерываний IN (карта изменений).
+fn find_hub_endpoint(bytes: &[u8]) -> Option<HubInterface> {
+    let configuration = *bytes.get(5)?;
+    let mut at = 0;
+    while at + 2 <= bytes.len() {
+        let length = usize::from(bytes[at]);
+        if length < 2 || at + length > bytes.len() {
+            return None;
+        }
+        // Первая точка — у альтернативы 0, с одним транслятором.
+        if bytes[at + 1] == usb::DESC_ENDPOINT && length >= 7 && bytes[at + 2] & 0x80 != 0 {
+            return Some(HubInterface {
+                configuration,
+                endpoint: bytes[at + 2] & 0x0F,
+                max_packet_size: u16::from_le_bytes([bytes[at + 4], bytes[at + 5]]) & 0x7FF,
+                interval: bytes[at + 6],
+            });
+        }
+        at += length;
+    }
+    None
 }
 
 /// Перевести `bInterval` из дескриптора в поле `Interval` контекста точки.

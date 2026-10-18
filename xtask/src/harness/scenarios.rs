@@ -1195,6 +1195,67 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "usbhub",
+        about: "Клавиатура и мышь за хабом USB на xHCI; подключение и отключение за хабом на ходу.",
+        target: Target::Live,
+        usb_only: true,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // Хаб на третьем корневом порту, за ним вторые клавиатура и мышь.
+        // Первые два порта заняты обычными клавиатурой и указателем стенда.
+        extra: &[
+            "-device", "usb-hub,bus=xhci.0,port=3,id=hub1",
+            "-device", "usb-kbd,bus=xhci.0,port=3.1,id=hubkbd",
+            "-device", "usb-mouse,bus=xhci.0,port=3.2,id=hubmouse",
+        ],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            // Третий порт USB 2 у `qemu-xhci` — седьмой порт контроллера: первые
+            // четыре — порты USB 3.
+            Step::Expect("usb         : root port 7: hub 0409:55aa in slot"),
+            Step::Expect("usb         : device on hub "),
+            Step::Expect("port(s) brought up, 2 keyboard(s), 2 pointer(s), behind 1 hub(s)"),
+            Step::Line("usb"),
+            Step::Await("  xhci     4 devices, 1 hub(s)", 15_000),
+            // Клавиатура стенда выдернута, PS/2 выключен: дальше нажатия
+            // доходят только через клавиатуру за хабом.
+            Step::Unplug("usbkbd"),
+            Step::Await("is gone, freeing slot", 20_000),
+            Step::Wait(500),
+            Step::Type("echo hub-ok"),
+            Step::Key("ret"),
+            Step::Await("hub-ok", 15_000),
+            // Воткнуто за хаб на ходу: о нём сообщает точка прерываний хаба.
+            Step::Plug("usb-tablet,bus=xhci.0,port=3.3,id=hubtab"),
+            Step::Await("usb         : now 4 device(s)", 20_000),
+            Step::Expect("pointer, absolute"),
+            Step::Unplug("hubtab"),
+            Step::Await("port 3: slot", 20_000),
+            Step::Await("usb         : now 3 device(s)", 20_000),
+            // Хаб выдернут целиком — с ним уходит всё, что за ним.
+            Step::Unplug("hub1"),
+            Step::Await("usb         : now 1 device(s)", 20_000),
+            Step::Line("usb"),
+            Step::Await("  xhci     1 devices, 0 hub(s)", 15_000),
+            Step::Absent("the report endpoint halted"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "e1000",
         about: "Сеть работает на настоящей карте Intel 8254x, а не только на virtio-net.",
         target: Target::Live,
