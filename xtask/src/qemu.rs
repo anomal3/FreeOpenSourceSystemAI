@@ -137,6 +137,9 @@ pub enum Pointer {
 pub enum Nic {
     Virtio,
     E1000,
+    /// `usb-net` на xHCI (фаза 68p): RNDIS в первой конфигурации, ECM во
+    /// второй — то, чем раздаёт интернет телефон.
+    Usb,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -702,6 +705,7 @@ pub fn command(opts: &RunOptions, built: &Built) -> Result<Command> {
                 // `e1000` в QEMU — это 82540EM, та самая карта, под которую
                 // написан драйвер ядра.
                 Nic::E1000 => "e1000,netdev=net0",
+                Nic::Usb => "usb-net,bus=xhci.0,netdev=net0",
             },
         ]);
     } else {

@@ -816,7 +816,14 @@ fn execute(
         },
         disk_bus: scenario.disk_bus,
         network: scenario.network,
-        nic: if scenario.e1000 { Nic::E1000 } else { Nic::Virtio },
+        nic: if scenario.e1000 {
+            Nic::E1000
+        } else if scenario.name.starts_with("usbnet") {
+            // Сеть по USB (фаза 68p) — у сценариев `usbnet*`.
+            Nic::Usb
+        } else {
+            Nic::Virtio
+        },
         hostfwd,
         allow_reboot: scenario.reboots,
         direct_kernel: match scenario.target {

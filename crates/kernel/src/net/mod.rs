@@ -235,7 +235,26 @@ pub fn has_address() -> bool {
 pub unsafe fn init(rsdp: u64) {
     crate::kprintln!();
     crate::kprintln!("---- network ----------------------------------------------------");
+    // SAFETY: контракт функции.
+    unsafe { probe(rsdp) };
+    INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
+    // Карты на шине PCI нет, а сеть по USB (фаза 68p) могла подняться раньше —
+    // USB заводится до сети.
+    if !is_present() {
+        let pending = PENDING_USB.lock().take();
+        if let Some(card) = pending {
+            crate::kprintln!("  network     : no PCI card we drive; using the USB network adapter");
+            start(card);
+        }
+    }
+}
 
+/// Найти карту на шине PCI и поднять её.
+///
+/// # Safety
+///
+/// См. [`init`].
+unsafe fn probe(rsdp: u64) {
     if rsdp == 0 && !crate::pci::has_tree_host() {
         crate::kprintln!(
             "  network     : no ACPI tables and no PCIe in the device tree: no network on this machine"
@@ -311,7 +330,7 @@ pub unsafe fn init(rsdp: u64) {
                             );
                         }
                         crate::kprintln!(
-                            "  network     : drivers in this kernel: virtio-net, e1000, atl1c"
+                            "  network     : drivers in this kernel: virtio-net, e1000, atl1c, and USB RNDIS/CDC ECM"
                         );
                     }
                     return;
@@ -332,6 +351,12 @@ pub unsafe fn init(rsdp: u64) {
         }
     };
 
+    start(device);
+}
+
+/// Подключить карту к стеку и завести задачу-приёмник.
+fn start(device: alloc::boxed::Box<dyn Card>) {
+    INITIALIZED.store(true, core::sync::atomic::Ordering::Release);
     let mac = device.mac();
     crate::kprintln!("  network     : {}, hardware address {}", device.name(), eth::Display(mac));
 
@@ -372,6 +397,47 @@ pub unsafe fn init(rsdp: u64) {
         Err(err) => crate::kprintln!("  network     : the receive task did not start: {err}"),
     }
     crate::kprintln!("  network     : no address yet; set one with `ip <addr>/<bits> [gateway]`");
+}
+
+/// Сетевой стек уже прошёл выбор карты (`init`): USB-карта, пришедшая
+/// позже, подключается сразу, а не ждёт его.
+static INITIALIZED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// USB-карта, поднятая до выбора карты (фаза 68p).
+static PENDING_USB: SpinLock<Option<alloc::boxed::Box<dyn Card>>> = SpinLock::new(None);
+
+/// Принять сетевую функцию USB (фаза 68p).
+///
+/// До выбора карты она ждёт его (карта на шине PCI, если есть, главнее). После
+/// — подключается, если карты нет или прежняя тоже была USB (телефон
+/// переподключили); настоящая карта на шине USB-картой не подменяется.
+pub fn attach_usb(card: alloc::boxed::Box<dyn Card>) {
+    if !INITIALIZED.load(core::sync::atomic::Ordering::Acquire) {
+        *PENDING_USB.lock() = Some(card);
+        return;
+    }
+    let mut interface = INTERFACE.lock();
+    match interface.as_mut() {
+        Some(iface) if iface.device.name().starts_with("usb-") => {
+            crate::kprintln!(
+                "  network     : {} replaces the previous USB adapter, hardware address {}",
+                card.name(),
+                eth::Display(card.mac())
+            );
+            iface.mac = card.mac();
+            iface.device = card;
+        }
+        Some(iface) => {
+            crate::kprintln!(
+                "  network     : {} stays; the USB adapter is not used",
+                iface.device.name()
+            );
+        }
+        None => {
+            drop(interface);
+            start(card);
+        }
+    }
 }
 
 /// Есть ли в системе сетевая карта.

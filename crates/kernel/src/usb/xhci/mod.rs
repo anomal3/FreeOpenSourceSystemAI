@@ -312,6 +312,8 @@ struct Device {
     hub: Option<Hub>,
     /// Если это накопитель — его bulk-точки (фаза 68n).
     storage: Option<Storage>,
+    /// Если это сетевая функция — её bulk-точки и буферы (фаза 68p).
+    net: Option<Net>,
     /// Номер подъёма: слот после выдёргивания достаётся следующему
     /// устройству, а ссылка на накопитель не должна попасть в чужое.
     serial: u32,
@@ -416,7 +418,57 @@ enum Described {
     Hid(HidInterface),
     Hub(HubInterface),
     Storage(StorageInterface),
+    Net(NetInterface),
 }
+
+/// Сетевая функция USB (фаза 68p).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetProtocol {
+    /// RNDIS — так раздаёт интернет по кабелю Android.
+    Rndis,
+    /// CDC ECM — USB-Ethernet адаптеры (RTL8153 и подобные), модемы.
+    Ecm,
+}
+
+/// Интерфейсы сетевой функции: управляющий и интерфейс данных с bulk-точками.
+#[derive(Clone, Copy)]
+struct NetInterface {
+    protocol: NetProtocol,
+    configuration: u8,
+    control: u8,
+    data: u8,
+    /// Альтернатива интерфейса данных, у которой есть bulk-точки (у ECM — 1).
+    data_alt: u8,
+    bulk_in: u8,
+    bulk_out: u8,
+    in_packet: u16,
+    out_packet: u16,
+    /// Номер строки с адресом (ECM, `iMACAddress`); ноль — нет.
+    mac_string: u8,
+}
+
+/// Сетевая функция: кольца, буферы приёма и передачи.
+struct Net {
+    found: NetInterface,
+    bulk_in: Ring,
+    bulk_out: Ring,
+    in_target: u8,
+    out_target: u8,
+    /// Приёмные ячейки по [`NET_SLOT`] байт; адрес дескриптора у ячейки в
+    /// полёте, ноль — свободна или ждёт разбора.
+    rx: DmaBuffer,
+    rx_trb: [u64; NET_RX_SLOTS],
+    /// Принятое и не разобранное: ячейка и длина.
+    rx_done: alloc::collections::VecDeque<(usize, usize)>,
+    tx: DmaBuffer,
+    tx_trb: [u64; NET_TX_SLOTS],
+}
+
+/// Размер ячейки приёма и передачи: кадр Ethernet с заголовком RNDIS (44
+/// байта) — 1558; ячейки, выровненные на 2 КиБ, не пересекают границу 64 КиБ.
+pub const NET_SLOT: usize = 2048;
+const NET_RX_SLOTS: usize = 8;
+const NET_TX_SLOTS: usize = 8;
 
 /// Интерфейс накопителя Bulk-Only (класс 8, подкласс 6 — SCSI, протокол
 /// 0x50) и его две bulk-точки.
@@ -1226,11 +1278,12 @@ impl Controller {
     /// удался); дверной звонок ему больше не звонит.
     unsafe fn forget(&mut self, index: usize) {
         let slot = self.devices[index].slot;
+        let handle = UsbHandle { controller: self.index, serial: self.devices[index].serial };
         if self.devices[index].storage.is_some() {
-            super::storage::gone(StorageHandle {
-                controller: self.index,
-                serial: self.devices[index].serial,
-            });
+            super::storage::gone(handle);
+        }
+        if self.devices[index].net.is_some() {
+            super::net::gone(handle);
         }
         // SAFETY: контракт функции.
         unsafe { self.release_slot(slot) };
@@ -1381,6 +1434,7 @@ impl Controller {
             speed,
             hub: None,
             storage: None,
+            net: None,
             serial: SERIALS.fetch_add(1, Ordering::Relaxed),
             context,
             input,
@@ -1419,6 +1473,14 @@ impl Controller {
             // работы, а он ищет контроллер там.
             super::storage::arrived(StorageHandle { controller: self.index, serial: device.serial });
         }
+        if let Some(net) = &device.net {
+            super::net::arrived(
+                UsbHandle { controller: self.index, serial: device.serial },
+                net.found.protocol,
+                net.found.control,
+                net.found.mac_string,
+            );
+        }
         self.devices.push(device);
         // SAFETY: устройство настроено, кольцо точки прерываний готово.
         unsafe { self.queue_reports() };
@@ -1456,6 +1518,11 @@ impl Controller {
                 // SAFETY: см. выше.
                 unsafe { self.bring_up_storage(device, &found) }
                     .map_err(|err| (Stage::Configure, err))?;
+                return Ok(0);
+            }
+            Described::Net(found) => {
+                // SAFETY: см. выше.
+                unsafe { self.bring_up_net(device, &found) }.map_err(|err| (Stage::Configure, err))?;
                 return Ok(0);
             }
         };
@@ -1621,7 +1688,35 @@ impl Controller {
         let Some(storage) = device.storage.as_ref() else {
             return Err(XhciError::NoDevice);
         };
+        let rings = (storage.bulk_in.phys(), storage.bulk_out.phys());
+        // SAFETY: контракт функции; кольца выделены.
+        unsafe {
+            self.configure_bulk(device, (in_target, found.in_packet, rings.0), (out_target, found.out_packet, rings.1))
+        }?;
+        kprintln!(
+            "  usb         : slot {} is a mass storage device, interface {}, bulk IN {:#04x} OUT {:#04x}, {} KiB window",
+            device.slot,
+            found.interface,
+            found.bulk_in,
+            found.bulk_out,
+            window.1 / 1024
+        );
+        Ok(())
+    }
 
+    /// Завести пару bulk-точек одной командой `Configure Endpoint`: для каждой —
+    /// цель (идентификатор контекста), размер пакета и адрес кольца.
+    ///
+    /// # Safety
+    ///
+    /// Устройство адресовано и сконфигурировано, кольца выделены.
+    unsafe fn configure_bulk(
+        &mut self,
+        device: &Device,
+        bulk_in: (u8, u16, u64),
+        bulk_out: (u8, u16, u64),
+    ) -> Result<(), XhciError> {
+        let (in_target, out_target) = (bulk_in.0, bulk_out.0);
         // SAFETY: контракт функции; контексты выделены.
         unsafe {
             self.clear_input(device);
@@ -1636,11 +1731,11 @@ impl Controller {
             // Тип точки: 2 — Bulk OUT, 6 — Bulk IN; `CErr = 3`; средняя длина
             // передачи для bulk — 3 КиБ, как советует спецификация.
             for (target, kind, packet, ring) in [
-                (in_target, 6u32, found.in_packet, &storage.bulk_in),
-                (out_target, 2u32, found.out_packet, &storage.bulk_out),
+                (in_target, 6u32, bulk_in.1, bulk_in.2),
+                (out_target, 2u32, bulk_out.1, bulk_out.2),
             ] {
                 let index = usize::from(target) + 1;
-                let dequeue = ring.phys() | 1;
+                let dequeue = ring | 1;
                 self.write_context(&device.input, index, 0, 0);
                 self.write_context(&device.input, index, 1, (u32::from(packet) << 16) | (kind << 3) | (3 << 1));
                 self.write_context(&device.input, index, 2, dequeue as u32);
@@ -1657,15 +1752,97 @@ impl Controller {
                     | (u32::from(device.slot) << 24),
             })
         }?;
+        Ok(())
+    }
+
+    /// Поднять сетевую функцию: конфигурация, bulk-точки, альтернатива
+    /// интерфейса данных. Рукопожатие RNDIS и адрес — позже, в
+    /// [`super::net`].
+    ///
+    /// # Safety
+    ///
+    /// Устройство адресовано и описано.
+    unsafe fn bring_up_net(&mut self, device: &mut Device, found: &NetInterface) -> Result<(), XhciError> {
+        // SAFETY: контракт функции.
+        unsafe {
+            self.control_transfer(
+                device,
+                [0, usb::REQ_SET_CONFIGURATION, found.configuration, 0, 0, 0, 0, 0],
+                0,
+                false,
+            )
+        }?;
+        let in_target = (found.bulk_in & 0x0F) * 2 + 1;
+        let out_target = (found.bulk_out & 0x0F) * 2;
+        device.net = Some(Net {
+            found: *found,
+            bulk_in: Ring::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?),
+            bulk_out: Ring::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?),
+            in_target,
+            out_target,
+            rx: dma::alloc(NET_SLOT * NET_RX_SLOTS)?,
+            rx_trb: [0; NET_RX_SLOTS],
+            rx_done: alloc::collections::VecDeque::new(),
+            tx: dma::alloc(NET_SLOT * NET_TX_SLOTS)?,
+            tx_trb: [0; NET_TX_SLOTS],
+        });
+        let Some(net) = device.net.as_ref() else {
+            return Err(XhciError::NoDevice);
+        };
+        let rings = (net.bulk_in.phys(), net.bulk_out.phys());
+        // SAFETY: контракт функции; кольца выделены.
+        unsafe {
+            self.configure_bulk(device, (in_target, found.in_packet, rings.0), (out_target, found.out_packet, rings.1))
+        }?;
+        if found.data_alt != 0 {
+            // SET_INTERFACE: у ECM точки данных есть только в альтернативе 1,
+            // нулевая — «интерфейс выключен».
+            // SAFETY: см. выше.
+            unsafe {
+                self.control_transfer(device, [0x01, 11, found.data_alt, 0, found.data, 0, 0, 0], 0, false)
+            }?;
+        }
         kprintln!(
-            "  usb         : slot {} is a mass storage device, interface {}, bulk IN {:#04x} OUT {:#04x}, {} KiB window",
+            "  usb         : slot {} is a USB network adapter ({}), bulk IN {:#04x} OUT {:#04x}",
             device.slot,
-            found.interface,
+            match found.protocol {
+                NetProtocol::Rndis => "RNDIS",
+                NetProtocol::Ecm => "CDC ECM",
+            },
             found.bulk_in,
-            found.bulk_out,
-            window.1 / 1024
+            found.bulk_out
         );
         Ok(())
+    }
+
+    /// Поставить свободные приёмные ячейки сетевой функции в кольцо.
+    ///
+    /// # Safety
+    ///
+    /// Устройство с индексом `index` — сетевая функция в списке.
+    unsafe fn queue_rx(&mut self, index: usize) {
+        let device = &mut self.devices[index];
+        let slot = device.slot;
+        let Some(net) = device.net.as_mut() else {
+            return;
+        };
+        let mut rang = false;
+        for cell in 0..NET_RX_SLOTS {
+            if net.rx_trb[cell] != 0 || net.rx_done.iter().any(|(done, _)| *done == cell) {
+                continue;
+            }
+            net.rx_trb[cell] = net.bulk_in.push(Trb {
+                parameter: net.rx.phys().as_u64() + (cell * NET_SLOT) as u64,
+                status: NET_SLOT as u32,
+                control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT) | ring::TRB_IOC | (1 << 2),
+            });
+            rang = true;
+        }
+        let target = net.in_target;
+        if rang {
+            // SAFETY: дескрипторы записаны целиком до звонка.
+            unsafe { self.regs.ring_doorbell(slot, target) };
+        }
     }
 
     /// Сбросить остановленную bulk-точку накопителя: `Reset Endpoint`,
@@ -2117,8 +2294,10 @@ impl Controller {
         // журнала нет, это единственный способ отличить два разных устройства
         // от одного, увиденного дважды. Отказ здесь не смертелен — устройство
         // останется безымянным, и только.
-        // Класс устройства (байт 4) — оттуда же: хаб объявляет себя им.
+        // Класс устройства (байт 4) — оттуда же: хаб объявляет себя им. Число
+        // конфигураций (байт 17) — для сетевой функции не в первой.
         let mut class = 0;
+        let mut configurations = 1u8;
         // SAFETY: см. выше.
         if let Ok(read) = unsafe { self.get_descriptor(device, usb::DESC_DEVICE, 0, 18) } {
             // SAFETY: см. выше.
@@ -2128,6 +2307,9 @@ impl Controller {
             }
             if read >= 5 {
                 class = bytes[4];
+            }
+            if read >= 18 {
+                configurations = bytes[17];
             }
         }
 
@@ -2145,6 +2327,7 @@ impl Controller {
             u16::from_le_bytes([bytes[2], bytes[3]])
         };
         let total = total.min(PAGE_SIZE as u16);
+        let total0 = total;
 
         // SAFETY: см. выше.
         let read = unsafe { self.get_descriptor(device, usb::DESC_CONFIGURATION, 0, total) }?;
@@ -2157,6 +2340,39 @@ impl Controller {
         }
         if let Some(found) = find_storage(bytes) {
             return Ok(Described::Storage(found));
+        }
+        if let Some(found) = find_net(bytes) {
+            return Ok(Described::Net(found));
+        }
+        if usb::find_hid(bytes).is_none() && configurations > 1 {
+            // Сетевая функция бывает не в первой конфигурации: у адаптеров на
+            // RTL8153 первая — своя, а CDC ECM — во второй.
+            for index in 1..configurations.min(4) {
+                // SAFETY: см. выше.
+                let Ok(read) = (unsafe { self.get_descriptor(device, usb::DESC_CONFIGURATION, index, 9) }) else {
+                    continue;
+                };
+                if read < 9 {
+                    continue;
+                }
+                // SAFETY: см. выше.
+                let total = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
+                let total = u16::from_le_bytes([total[2], total[3]]).min(PAGE_SIZE as u16);
+                // SAFETY: см. выше.
+                let Ok(read) = (unsafe { self.get_descriptor(device, usb::DESC_CONFIGURATION, index, total) }) else {
+                    continue;
+                };
+                // SAFETY: см. выше.
+                let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
+                if let Some(found) = find_net(bytes) {
+                    return Ok(Described::Net(found));
+                }
+            }
+            // SAFETY: см. выше; первая конфигурация — обратно в буфер.
+            let read = unsafe { self.get_descriptor(device, usb::DESC_CONFIGURATION, 0, total0) }?;
+            // SAFETY: см. выше.
+            let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
+            return usb::find_hid(bytes).map(Described::Hid).ok_or(XhciError::NoHid);
         }
         usb::find_hid(bytes).map(Described::Hid).ok_or(XhciError::NoHid)
     }
@@ -2650,6 +2866,28 @@ impl Controller {
         // Событие относится к точке прерываний? Идентификатор точки — биты 20:16
         // управляющего слова.
         let endpoint = ((event.control >> 16) & 0x1F) as u8;
+        if let Some(net) = device.net.as_mut() {
+            let ok = event.completion_code() == ring::COMPLETION_SUCCESS
+                || event.completion_code() == ring::COMPLETION_SHORT_PACKET;
+            if endpoint == net.in_target {
+                if let Some(slot) = net.rx_trb.iter().position(|addr| *addr == event.parameter) {
+                    net.rx_trb[slot] = 0;
+                    // Ячейка с ошибкой просто свободна: её снова поставит
+                    // следующий приём.
+                    if ok {
+                        let len = NET_SLOT - (event.residual() as usize).min(NET_SLOT);
+                        net.rx_done.push_back((slot, len));
+                    } else {
+                        self.transfer_errors += 1;
+                    }
+                }
+            } else if endpoint == net.out_target {
+                if let Some(slot) = net.tx_trb.iter().position(|addr| *addr == event.parameter) {
+                    net.tx_trb[slot] = 0;
+                }
+            }
+            return;
+        }
         if let Some(storage) = device.storage.as_mut() {
             // Завершение bulk-передачи накопителя: запоминается для того, кто
             // его ждёт, — ждущий мог и не сам разбирать кольцо.
@@ -3009,7 +3247,90 @@ unsafe fn free_device(device: &Device) {
             dma::free(storage.bulk_out.buffer());
             dma::free(&storage.data);
         }
+        if let Some(net) = &device.net {
+            dma::free(net.bulk_in.buffer());
+            dma::free(net.bulk_out.buffer());
+            dma::free(&net.rx);
+            dma::free(&net.tx);
+        }
     }
+}
+
+/// Найти в конфигурации сетевую функцию: RNDIS или CDC ECM (фаза 68p).
+///
+/// Управляющий интерфейс опознаётся по классу: RNDIS — `E0/01/03` (так у
+/// Android) или `02/02/FF` (так у Windows-устройств), ECM — `02/06`. Интерфейс
+/// данных (`0A`) — из описателя Union, а без него — следующий за управляющим;
+/// берётся его альтернатива с двумя bulk-точками.
+fn find_net(bytes: &[u8]) -> Option<NetInterface> {
+    let configuration = *bytes.get(5)?;
+    let mut at = 0;
+    let mut control: Option<(u8, NetProtocol)> = None;
+    let mut union_data: Option<u8> = None;
+    let mut mac_string = 0;
+    // Текущий интерфейс: номер, альтернатива, класс.
+    let mut current = (0u8, 0u8, 0u8);
+    // Найденные альтернативы данных: интерфейс, альтернатива, точки.
+    let mut data: Vec<(u8, u8, Option<(u8, u16)>, Option<(u8, u16)>)> = Vec::new();
+    while at + 2 <= bytes.len() {
+        let length = usize::from(bytes[at]);
+        if length < 2 || at + length > bytes.len() {
+            break;
+        }
+        match bytes[at + 1] {
+            usb::DESC_INTERFACE if length >= 9 => {
+                let (number, alt) = (bytes[at + 2], bytes[at + 3]);
+                let (class, subclass, protocol) = (bytes[at + 5], bytes[at + 6], bytes[at + 7]);
+                current = (number, alt, class);
+                if control.is_none() {
+                    control = match (class, subclass, protocol) {
+                        (0xE0, 0x01, 0x03) | (0x02, 0x02, 0xFF) => Some((number, NetProtocol::Rndis)),
+                        (0x02, 0x06, _) => Some((number, NetProtocol::Ecm)),
+                        _ => None,
+                    };
+                }
+                if class == 0x0A {
+                    data.push((number, alt, None, None));
+                }
+            }
+            // Описатели класса CDC внутри управляющего интерфейса.
+            0x24 if length >= 5 && control.is_some_and(|(number, _)| number == current.0) => match bytes[at + 2] {
+                0x06 => union_data = union_data.or(Some(bytes[at + 4])),
+                0x0F => mac_string = bytes[at + 3],
+                _ => {}
+            },
+            usb::DESC_ENDPOINT if length >= 7 && current.2 == 0x0A && bytes[at + 3] & 0b11 == 2 => {
+                let address = bytes[at + 2];
+                let packet = u16::from_le_bytes([bytes[at + 4], bytes[at + 5]]) & 0x7FF;
+                if let Some(last) = data.last_mut() {
+                    if address & 0x80 != 0 {
+                        last.2 = last.2.or(Some((address, packet)));
+                    } else {
+                        last.3 = last.3.or(Some((address, packet)));
+                    }
+                }
+            }
+            _ => {}
+        }
+        at += length;
+    }
+    let (control, protocol) = control?;
+    let wanted = union_data.unwrap_or(control + 1);
+    let &(number, alt, bulk_in, bulk_out) =
+        data.iter().find(|(number, _, i, o)| *number == wanted && i.is_some() && o.is_some())?;
+    let ((bulk_in, in_packet), (bulk_out, out_packet)) = (bulk_in?, bulk_out?);
+    Some(NetInterface {
+        protocol,
+        configuration,
+        control,
+        data: number,
+        data_alt: alt,
+        bulk_in,
+        bulk_out,
+        in_packet,
+        out_packet,
+        mac_string,
+    })
 }
 
 /// Найти в конфигурации интерфейс накопителя Bulk-Only и его bulk-точки.
@@ -3226,6 +3547,7 @@ pub unsafe fn init(rsdp: u64) -> bool {
     *DRIVEN.lock() = controllers.iter().map(|c| c.device.address).collect();
     *CONTROLLERS.lock() = controllers;
     super::storage::settle();
+    super::net::settle();
     keyboard || mouse
 }
 
@@ -3520,6 +3842,7 @@ fn poll_hotplug(mask: u32) {
     }
     *CONTROLLERS.lock() = taken;
     super::storage::settle();
+    super::net::settle();
 }
 
 /// Поднялся ли хоть один контроллер.
@@ -3550,12 +3873,15 @@ fn interrupts_enabled() -> bool {
     CONTROLLERS.lock().iter().all(|c| c.delivery() != Delivery::Polled)
 }
 
-/// Ссылка на накопитель: контроллер и номер подъёма устройства (фаза 68n).
+/// Ссылка на устройство USB: контроллер и номер подъёма (фазы 68n, 68p).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct StorageHandle {
+pub struct UsbHandle {
     controller: usize,
     serial: u32,
 }
+
+/// Ссылка на накопитель.
+pub type StorageHandle = UsbHandle;
 
 /// Чем кончилась bulk-передача накопителя.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3743,6 +4069,127 @@ pub fn storage_reset(handle: StorageHandle) {
 
 /// Код завершения Stall Error.
 const COMPLETION_STALL: u32 = 6;
+
+/// Чем кончилась попытка передать кадр по USB-сети.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetError {
+    /// Все ячейки передачи в полёте.
+    Busy,
+    /// Устройство выдернуто.
+    Gone,
+    /// Кадр длиннее ячейки.
+    TooLong,
+}
+
+/// Исполнить `f` над контроллером и индексом сетевой функции. `None` —
+/// контроллеры заняты перечислением; `Err` — устройства нет.
+fn with_net<R>(handle: UsbHandle, f: impl FnOnce(&mut Controller, usize) -> R) -> Result<Option<R>, NetError> {
+    let mut list = CONTROLLERS.lock();
+    let Some(controller) = list.get_mut(handle.controller) else {
+        return Ok(None);
+    };
+    let Some(index) = controller.devices.iter().position(|d| d.serial == handle.serial && d.net.is_some())
+    else {
+        return Err(NetError::Gone);
+    };
+    Ok(Some(f(controller, index)))
+}
+
+/// Управляющая передача сетевой функции во время работы: `out` — данные к
+/// устройству, `in_len` — сколько ждать от него. Возвращает принятое.
+pub fn net_control(handle: UsbHandle, setup: [u8; 8], out: &[u8], in_len: u16) -> Result<Vec<u8>, NetError> {
+    let mut timeout = Timeout::new(STORAGE_TIMEOUT_MS);
+    loop {
+        let done = with_net(handle, |c, i| {
+            let device = &c.devices[i];
+            let slot = device.slot;
+            // SAFETY: страница устройства выделена и живёт, пока оно в списке.
+            let page = unsafe { device.report.as_ptr::<u8>() };
+            let length = if out.is_empty() { in_len } else { out.len().min(PAGE_SIZE) as u16 };
+            // SAFETY: страница устройства выделена и не занята — у сетевой
+            // функции она служит только управляющим передачам.
+            unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), page, out.len().min(PAGE_SIZE)) };
+            // SAFETY: устройство сконфигурировано и стоит в списке.
+            let read = unsafe { c.slot_control(slot, setup, length, out.is_empty() && in_len > 0) };
+            read.map(|read| {
+                let read = if out.is_empty() { read } else { 0 };
+                // SAFETY: страница выделена, прочитано `read` байт.
+                unsafe { core::slice::from_raw_parts(page, read) }.to_vec()
+            })
+        })?;
+        match done {
+            Some(Ok(bytes)) => return Ok(bytes),
+            Some(Err(_)) => return Err(NetError::Gone),
+            None => {}
+        }
+        if timeout.expired() {
+            return Err(NetError::Gone);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Начать приём: поставить все приёмные ячейки.
+pub fn net_start(handle: UsbHandle) {
+    // SAFETY: устройство — сетевая функция в списке.
+    let _ = with_net(handle, |c, i| unsafe { c.queue_rx(i) });
+}
+
+/// Забрать принятый кусок (ответ одной bulk-передачи) в `out`. `Ok(None)` —
+/// пока ничего.
+pub fn net_receive(handle: UsbHandle, out: &mut [u8]) -> Result<Option<usize>, NetError> {
+    let got = with_net(handle, |c, i| {
+        // SAFETY: окно регистров отображено, кольцо событий сообщено.
+        unsafe { c.drain_events(None) };
+        let net = c.devices[i].net.as_mut()?;
+        let (cell, len) = net.rx_done.pop_front()?;
+        let len = len.min(out.len());
+        // SAFETY: ячейка внутри буфера приёма, передача завершена.
+        let data = unsafe { core::slice::from_raw_parts(net.rx.as_ptr::<u8>().add(cell * NET_SLOT), len) };
+        out[..len].copy_from_slice(data);
+        // SAFETY: см. выше.
+        unsafe { c.queue_rx(i) };
+        Some(len)
+    })?;
+    Ok(got.flatten())
+}
+
+/// Отправить кусок (одну bulk-передачу). `zlp` — дописать пакет нулевой
+/// длины, если кусок кратен размеру пакета: так ECM узнаёт конец кадра.
+pub fn net_send(handle: UsbHandle, data: &[u8], zlp: bool) -> Result<(), NetError> {
+    if data.len() > NET_SLOT {
+        return Err(NetError::TooLong);
+    }
+    let sent = with_net(handle, |c, i| {
+        // SAFETY: см. `net_receive`.
+        unsafe { c.drain_events(None) };
+        let device = &mut c.devices[i];
+        let slot = device.slot;
+        let net = device.net.as_mut()?;
+        let cell = net.tx_trb.iter().position(|addr| *addr == 0)?;
+        let phys = net.tx.phys().as_u64() + (cell * NET_SLOT) as u64;
+        // SAFETY: ячейка внутри буфера передачи и свободна.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), net.tx.as_ptr::<u8>().add(cell * NET_SLOT), data.len());
+        }
+        net.tx_trb[cell] = net.bulk_out.push(Trb {
+            parameter: phys,
+            status: data.len() as u32,
+            control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT) | ring::TRB_IOC,
+        });
+        if zlp && !data.is_empty() && data.len() % usize::from(net.found.out_packet.max(1)) == 0 {
+            net.bulk_out.push(Trb { parameter: phys, status: 0, control: ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT });
+        }
+        let target = net.out_target;
+        // SAFETY: дескрипторы записаны целиком до звонка.
+        unsafe { c.regs.ring_doorbell(slot, target) };
+        Some(())
+    })?;
+    match sent {
+        Some(Some(())) => Ok(()),
+        _ => Err(NetError::Busy),
+    }
+}
 
 /// Тело задачи, обслуживающей контроллер.
 ///

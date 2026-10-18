@@ -160,18 +160,18 @@ pub struct Ring {
 }
 
 impl Ring {
-    /// Создать кольцо в уже выделенном буфере DMA.
-    ///
-    /// Буфер должен быть обнулён (это делает [`crate::mm::dma::alloc`]) и лежать
-    /// физически непрерывно — контроллер читает кольцо, ничего не зная о таблицах
-    /// страниц.
-    #[must_use]
     /// Память кольца — чтобы вернуть её, когда устройство вынули.
     #[must_use]
     pub const fn buffer(&self) -> &DmaBuffer {
         &self.buffer
     }
 
+    /// Создать кольцо в уже выделенном буфере DMA.
+    ///
+    /// Буфер должен быть обнулён (это делает [`crate::mm::dma::alloc`]) и лежать
+    /// физически непрерывно — контроллер читает кольцо, ничего не зная о таблицах
+    /// страниц.
+    #[must_use]
     pub fn new(buffer: DmaBuffer) -> Self {
         let entries = buffer.len() / TRB_LEN;
         let mut ring = Self { buffer, entries, enqueue: 0, cycle: true };
@@ -261,7 +261,6 @@ pub struct EventRing {
 }
 
 impl EventRing {
-    #[must_use]
     /// Память кольца — чтобы вернуть её, когда устройство вынули.
     #[must_use]
     pub const fn buffer(&self) -> &DmaBuffer {
