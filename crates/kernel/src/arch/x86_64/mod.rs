@@ -495,7 +495,10 @@ impl SerialDevice for Serial {
                     break;
                 }
             }
-            first && second && echoed
+            // Хватает одной из двух: VirtualBox (вывод в файл) петли не
+            // изображает, а у отсутствующего порта шина отвечает 0xFF — и
+            // черновик, и петля проваливаются вместе.
+            (first && second) || echoed
         };
         UART_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
         if !present {
