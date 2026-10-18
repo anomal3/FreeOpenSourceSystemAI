@@ -1556,6 +1556,31 @@ pub fn random(buffer: &mut [u8]) -> bool {
     result == buffer.len() as i64
 }
 
+/// Ключи SSH живой системы, найденные загрузчиком на флешке (фаза 68o).
+/// Возвращает, сколько байт записано в `buffer`; ноль — ключей нет.
+pub fn live_keys(buffer: &mut [u8]) -> usize {
+    // SAFETY: буфер живёт в памяти программы, длина — его собственная.
+    let result = unsafe { syscall(user_abi::SYS_LIVE_KEYS, buffer.as_mut_ptr() as usize, buffer.len(), 0) };
+    if result < 0 { 0 } else { result as usize }
+}
+
+/// Исполнить команду оболочки ядра (фаза 68o). `out` — не короче
+/// [`user_abi::KERNEL_COMMAND_OUT`]; ответ — сколько байт вывода или ошибка.
+pub fn kernel_command(line: &str, out: &mut [u8]) -> i64 {
+    if out.len() < user_abi::KERNEL_COMMAND_OUT {
+        return user_abi::ERR_BAD_ADDRESS;
+    }
+    // SAFETY: строка и буфер живут в памяти программы, длины — их собственные.
+    unsafe {
+        syscall(
+            user_abi::SYS_KERNEL_COMMAND,
+            line.as_ptr() as usize,
+            line.len(),
+            out.as_mut_ptr() as usize,
+        )
+    }
+}
+
 /// Спросить, что система знает о своей сети.
 pub fn netinfo(out: &mut NetInfo) -> i64 {
     // SAFETY: структура живёт в памяти программы, длина — её собственная.

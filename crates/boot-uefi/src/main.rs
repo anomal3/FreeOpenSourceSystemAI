@@ -33,6 +33,7 @@ mod graphics;
 mod handoff;
 mod initrd;
 mod kernel_image;
+mod live_keys;
 mod menu;
 mod slot;
 mod volume;
@@ -114,6 +115,8 @@ fn main() -> Status {
     };
     info.framebuffer = graphics::probe_framebuffer(policy);
     info.acpi_rsdp = find_acpi_rsdp();
+    // Ключи SSH для живой системы — с любой флешки, какую видит прошивка.
+    live_keys::find(&mut info);
 
     print_boot_info(&info);
 

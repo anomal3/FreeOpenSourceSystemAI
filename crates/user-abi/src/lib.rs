@@ -1502,6 +1502,23 @@ pub const SYS_SOUND: usize = 82;
 pub const SOUND_WRITE: usize = 1;
 /// [`SYS_SOUND`]: доиграть всё отданное и остановить поток.
 pub const SOUND_DRAIN: usize = 2;
+/// Ключи SSH живой системы: `(адрес, длина) -> сколько байт` (фаза 68o).
+///
+/// `authorized_keys`, который загрузчик нашёл в `\FREEOS\authorized_keys` на
+/// флешке; ноль — не нашёл. Только root: им пользуется `sshd`.
+pub const SYS_LIVE_KEYS: usize = 83;
+
+/// Команда оболочки ядра: `(адрес строки, длина, адрес буфера) -> сколько
+/// байт вывода` (фаза 68o).
+///
+/// Буфер — [`KERNEL_COMMAND_OUT`] байт; вывод длиннее обрезается. Только root:
+/// команды видят всю машину (`dmesg`, `pci`, `usb`, `irq`). [`ERR_AGAIN`] —
+/// другая программа исполняет свою прямо сейчас.
+pub const SYS_KERNEL_COMMAND: usize = 84;
+
+/// Размер буфера вывода [`SYS_KERNEL_COMMAND`].
+pub const KERNEL_COMMAND_OUT: usize = 64 * 1024;
+
 /// Кадров в секунду у [`SYS_SOUND`].
 pub const SOUND_RATE: u32 = 48_000;
 /// Каналов у [`SYS_SOUND`].

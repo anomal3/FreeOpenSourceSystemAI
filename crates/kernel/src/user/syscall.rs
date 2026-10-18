@@ -193,6 +193,9 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         user_abi::SYS_SOCKCTL => sockctl(a0, a1, a2),
         user_abi::SYS_FDCTL => fdctl(a0, a1, a2),
         user_abi::SYS_SOUND => sound(a0, a1, a2),
+        // Фаза 68o: вход по SSH в живую систему и команды ядра по сети.
+        user_abi::SYS_LIVE_KEYS => live_keys(a0, a1),
+        user_abi::SYS_KERNEL_COMMAND => kernel_command(a0, a1, a2),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -1253,6 +1256,61 @@ fn resolve(ptr: usize, len: usize, out: usize) -> i64 {
 /// Ограничения на длину нет: программа, попросившая мегабайт случайности,
 /// потратит его сама, а пул от этого не истощается — он не расходуемый запас,
 /// а состояние, которое прокручивается.
+/// Ключи SSH, которые загрузчик нашёл на флешке (фаза 68o).
+static LIVE_KEYS: crate::sync::SpinLock<alloc::vec::Vec<u8>> = crate::sync::SpinLock::new(alloc::vec::Vec::new());
+
+/// Запомнить ключи из `BootInfo`.
+pub fn set_live_keys(keys: &[u8]) {
+    *LIVE_KEYS.lock() = keys.to_vec();
+}
+
+/// `SYS_LIVE_KEYS`: отдать ключи root'у.
+fn live_keys(ptr: usize, len: usize) -> i64 {
+    if !super::credentials().is_root() {
+        return ERR_PERMISSION;
+    }
+    // Копия — до записи в память программы: её страница может прийти по
+    // первому касанию, а под спин-замком ждать нельзя.
+    let keys = LIVE_KEYS.lock().clone();
+    let count = keys.len().min(len);
+    if count == 0 {
+        return 0;
+    }
+    if !space::user_can(ptr, count, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: диапазон проверен по таблицам программы на запись.
+    unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, count) }.copy_from_slice(&keys[..count]);
+    count as i64
+}
+
+/// `SYS_KERNEL_COMMAND`: исполнить команду оболочки ядра и отдать вывод.
+fn kernel_command(line: usize, len: usize, out: usize) -> i64 {
+    if !super::credentials().is_root() {
+        return ERR_PERMISSION;
+    }
+    if len > 512 || !space::user_can(line, len, PageFlags::READ) {
+        return ERR_BAD_ADDRESS;
+    }
+    if !space::user_can(out, user_abi::KERNEL_COMMAND_OUT, PageFlags::WRITE) {
+        return ERR_BAD_ADDRESS;
+    }
+    // SAFETY: диапазон проверен по таблицам программы на чтение.
+    let bytes = unsafe { core::slice::from_raw_parts(line as *const u8, len) };
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return ERR_BAD_PATH;
+    };
+    let text = alloc::string::String::from(text);
+    let Some(output) = crate::shell::run_captured(&text) else {
+        return ERR_AGAIN;
+    };
+    let count = output.len().min(user_abi::KERNEL_COMMAND_OUT);
+    // SAFETY: диапазон проверен по таблицам программы на запись.
+    unsafe { core::slice::from_raw_parts_mut(out as *mut u8, count) }
+        .copy_from_slice(&output.as_bytes()[..count]);
+    count as i64
+}
+
 fn random(ptr: usize, len: usize) -> i64 {
     if len == 0 {
         return 0;

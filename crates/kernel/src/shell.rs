@@ -146,10 +146,53 @@ impl fmt::Write for Out {
 /// зажатой: это и был открытый с 21.09 дефект «задача USB готова, но не
 /// получает процессора».
 pub fn print(args: fmt::Arguments<'_>) {
+    if capture(args) {
+        return;
+    }
     let _guard = OUT.lock();
     let mut line = Line::new();
     let _ = line.write_fmt(args);
     line.flush();
+}
+
+/// Вывод команды, исполняемой по просьбе программы (`SYS_KERNEL_COMMAND`,
+/// фаза 68o): чья задача и что она уже напечатала.
+///
+/// Нужен затем, чтобы по SSH были видны `dmesg`, `pci`, `usb`, `irq` — то, чем
+/// разбирают драйвер на чужой машине, где экрана не видно. Печатает команда
+/// как обычно; печать **этой** задачи уходит в буфер, а не в окно.
+static CAPTURE: crate::sync::SpinLock<Option<(sched::TaskId, String)>> = crate::sync::SpinLock::new(None);
+
+/// Сколько вывода одной команды сохраняется.
+const CAPTURE_MAX: usize = 256 * 1024;
+
+/// Положить напечатанное в буфер захвата, если печатает захватывающая задача.
+fn capture(args: fmt::Arguments<'_>) -> bool {
+    let mut capture = CAPTURE.lock();
+    let Some((task, text)) = capture.as_mut() else {
+        return false;
+    };
+    if *task != sched::current() {
+        return false;
+    }
+    if text.len() < CAPTURE_MAX {
+        let _ = text.write_fmt(args);
+    }
+    true
+}
+
+/// Исполнить команду оболочки ядра и вернуть её вывод. `None` — другая
+/// программа исполняет свою прямо сейчас.
+pub fn run_captured(line: &str) -> Option<String> {
+    {
+        let mut capture = CAPTURE.lock();
+        if capture.is_some() {
+            return None;
+        }
+        *capture = Some((sched::current(), String::new()));
+    }
+    let _ = run_command(line);
+    CAPTURE.lock().take().map(|(_, text)| text)
 }
 
 /// Строка, собранная целиком прежде, чем уйти в вывод.

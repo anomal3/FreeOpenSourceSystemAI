@@ -306,10 +306,40 @@ fn announce_accounts() {
                 .str(path.as_str())
                 .end();
         }
+        _ if live_key_bytes() > 0 => {
+            error("sshd: live image; 'live' may log in with the keys from the boot stick\n");
+        }
         _ => {
             error("sshd: no account file here, so nobody can log in (this is a live image)\n");
         }
     }
+}
+
+/// Ключи живой системы (фаза 68o): `authorized_keys`, который загрузчик нашёл
+/// в `\FREEOS\authorized_keys` на флешке. Лежат в `FILE_BUFFER`.
+fn live_key_bytes() -> usize {
+    // SAFETY: буфер статический, программа однопоточная.
+    let buffer = unsafe { &mut *(&raw mut FILE_BUFFER) };
+    user_progs::live_keys(buffer)
+}
+
+/// Живая система: учётных записей нет вовсе, а ключи с флешки — есть.
+///
+/// Тогда пускается один человек — `live`, с правами root, как и тот, кто сидит
+/// за терминалом живой системы: правило «по сети видно ровно то же, что за
+/// терминалом» соблюдается и здесь. На установленной системе (есть
+/// `passwd`) ключи с флешки не значат ничего.
+fn live_user(name: &[u8]) -> Option<User> {
+    if name != b"live" || read_file(passwd_path().as_str()).is_some_and(|len| len > 0) {
+        return None;
+    }
+    if live_key_bytes() == 0 {
+        return None;
+    }
+    let mut user = User { name: [0; MAX_NAME], name_len: 4, home: [0; MAX_HOME], home_len: 1, uid: 0, gid: 0 };
+    user.name[..4].copy_from_slice(b"live");
+    user.home[0] = b'/';
+    Some(user)
 }
 
 /// Обслужить одно соединение от рукопожатия до конца сеанса.
@@ -518,13 +548,16 @@ fn session(client: i64, transport: &mut Transport, handshake_deadline: u64) {
                 }
                 match authenticate(client, transport, payload) {
                     Attempt::Accepted(accepted) => {
-                        Line::to_log()
-                            .str("sshd: ")
-                            .str(accepted.name())
-                            .str(" authenticated with a key from ")
-                            .str(accepted.home())
-                            .str("/.ssh/authorized_keys")
-                            .end();
+                        let mut line = Line::to_log();
+                        line.str("sshd: ").str(accepted.name());
+                        if accepted.name() == "live" && accepted.uid == 0 {
+                            line.str(" authenticated with a key from the boot stick");
+                        } else {
+                            line.str(" authenticated with a key from ")
+                                .str(accepted.home())
+                                .str("/.ssh/authorized_keys");
+                        }
+                        line.end();
                         let out = unsafe { &mut *(&raw mut OUTPUT) };
                         out[0] = ssh::MSG_USERAUTH_SUCCESS;
                         if send_packet(client, transport, 1).is_none() {
@@ -755,7 +788,8 @@ fn authenticate(client: i64, transport: &mut Transport, payload: &[u8]) -> Attem
         error("sshd: the key does not parse\n");
         return finish_refusal(client, transport);
     };
-    let Some(user) = find_user(request.user) else {
+    let live = live_user(request.user);
+    let Some(user) = live.or_else(|| find_user(request.user)) else {
         // Имя не называется в ответе клиенту — ему и так известно, что он
         // прислал, — но в журнал машины оно попадает: это единственный след
         // того, кто и подо что стучался.
@@ -765,7 +799,19 @@ fn authenticate(client: i64, transport: &mut Transport, payload: &[u8]) -> Attem
         line.str(" in ").str(passwd_path().as_str()).end();
         return finish_refusal(client, transport);
     };
-    if !key_authorized(&user, &key) {
+    let authorized = if live.is_some() {
+        let len = live_key_bytes();
+        // SAFETY: буфер статический, программа однопоточная.
+        let keys = unsafe { &(&raw const FILE_BUFFER).as_ref().unwrap()[..len] };
+        let ok = auth::authorized(keys, &key);
+        if !ok {
+            error("sshd: this key is not among the keys from the boot stick\n");
+        }
+        ok
+    } else {
+        key_authorized(&user, &key)
+    };
+    if !authorized {
         return finish_refusal(client, transport);
     }
 
@@ -1317,6 +1363,24 @@ fn run_command(line: &[u8], user: &User, sink: &mut Sink<'_>) -> u32 {
             0
         }
         b"exit" | b"logout" => 0,
+        // Команда оболочки ядра (фаза 68o): `kernel dmesg`, `kernel pci`… —
+        // только root, ядро проверяет само.
+        b"kernel" => {
+            let Ok(text) = core::str::from_utf8(rest) else {
+                sink.err("sshd: the command is not valid UTF-8\n");
+                return 2;
+            };
+            // SAFETY: буфер статический, программа однопоточная; файловый
+            // буфер здесь не занят.
+            let out = unsafe { &mut *(&raw mut KERNEL_OUT) };
+            let len = user_progs::kernel_command(text.trim(), out);
+            if len < 0 {
+                sink.err("sshd: the kernel refused the command\n");
+                return 1;
+            }
+            sink.out_bytes(&out[..len as usize]);
+            0
+        }
         // Всё остальное — программа из `/bin`, запущенная от имени вошедшего.
         // Это и есть фаза 38b: `ls` и `cat` больше не живут внутри сервера со
         // своей проверкой прав, а являются теми же самыми программами, которые
@@ -1832,6 +1896,7 @@ fn help(sink: &mut Sink<'_>) {
          \n  id              its uid, gid and home directory\
          \n  uptime          milliseconds since the machine started\
          \n  echo <text>     the text back\
+         \n  kernel <cmd>    a kernel shell command (dmesg, pci, usb, irq...), root only\
          \n  exit            end the session\
          \n\
          \n  ls /etc         a directory, by the program in /bin\
@@ -1840,6 +1905,9 @@ fn help(sink: &mut Sink<'_>) {
 }
 
 // --- учётные записи ----------------------------------------------------------
+
+/// Вывод команды ядра (`kernel …`).
+static mut KERNEL_OUT: [u8; user_abi::KERNEL_COMMAND_OUT] = [0; user_abi::KERNEL_COMMAND_OUT];
 
 /// Наибольшая длина имени, которую мы храним.
 const MAX_NAME: usize = 32;

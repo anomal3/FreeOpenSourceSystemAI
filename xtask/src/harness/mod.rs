@@ -1489,7 +1489,9 @@ fn play(
                     command => command,
                 };
                 say!("  [{at:>6} мс] шаг {index}: ssh -v на 127.0.0.1:{port} — {what}");
-                let output = run_ssh(port, run, prefix, index, patience(run.timeout_ms))
+                // Живая система впускает только `live` (фаза 68o).
+                let account = if scenario.target == Target::Live { "live" } else { sshkeys::ACCOUNT };
+                let output = run_ssh(port, run, account, prefix, index, patience(run.timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
                 for line in output.lines().filter(|line| {
                     // В отчёт попадает только то, что говорит о протоколе и о
@@ -1636,6 +1638,7 @@ fn report_slow_shot(index: usize, took: std::time::Duration) {
 fn run_ssh(
     port: u16,
     run: &scenarios::SshRun,
+    account: &str,
     prefix: &str,
     index: usize,
     // Срок — уже с поправкой на число воркеров (см. `patience` в `play`).
@@ -1688,7 +1691,7 @@ fn run_ssh(
             cmd.arg("-i").arg(sshkeys::stranger()?);
         }
     }
-    cmd.arg(format!("{}@127.0.0.1", sshkeys::ACCOUNT));
+    cmd.arg(format!("{account}@127.0.0.1"));
     if !run.command.is_empty() {
         cmd.arg(run.command);
     }
@@ -3005,6 +3008,15 @@ fn prepare_drives(
             let esp = qemu::prepare_esp(built, true)?;
             if let Some(mode) = scenarios::screen_for(scenario.name) {
                 qemu::request_screen(&esp, mode)?;
+            }
+            // Ключ для входа в живую систему (фаза 68o) — там же, где его
+            // положил бы человек: `\FREEOS\authorized_keys` на томе загрузки.
+            // Каталог ESP общий у сценариев, поэтому без ключа файл убирается.
+            let keys = esp.join("FREEOS").join("authorized_keys");
+            let _ = std::fs::remove_file(&keys);
+            if scenario.ssh_key {
+                std::fs::create_dir_all(esp.join("FREEOS"))?;
+                std::fs::copy(sshkeys::authorized()?.with_extension("pub"), &keys)?;
             }
             vec![Drive::HostDirectory(esp)]
         }

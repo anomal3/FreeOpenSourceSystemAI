@@ -456,6 +456,13 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     // не подразумеваться.
     user::session::adopt_account();
 
+    // Ключи SSH с флешки (фаза 68o): живая система впускает по ним `live`.
+    let live_keys = &info.live_keys[..(info.live_keys_len as usize).min(info.live_keys.len())];
+    if !live_keys.is_empty() {
+        user::syscall::set_live_keys(live_keys);
+        kprintln!("  live ssh    : {} byte(s) of authorized_keys from the bootloader", live_keys.len());
+    }
+
     let have_input = start_input(&info);
     start_graphics(&info, have_input);
 

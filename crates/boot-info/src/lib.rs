@@ -29,7 +29,12 @@ pub const BOOT_INFO_MAGIC: u64 = 0x4652_4545_4F53_0001;
 /// in front of the machine chose in the bootloader menu. Revision 7 added the
 /// A/B slot fields — which system this boot came from, how many attempts it has
 /// left, and whether the bootloader had already given up on the other one.
-pub const BOOT_INFO_REVISION: u32 = 8;
+/// Revision 9 added [`BootInfo::live_keys`]: SSH keys for a live boot.
+pub const BOOT_INFO_REVISION: u32 = 9;
+
+/// How many bytes of `authorized_keys` the bootloader passes for a live boot.
+/// An ed25519 line is about a hundred bytes; this holds a couple of dozen.
+pub const LIVE_KEYS_MAX: usize = 2048;
 
 /// Boot without the desktop, without services, and with the root filesystem
 /// mounted read-only.
@@ -285,6 +290,16 @@ pub struct BootInfo {
     /// knows the ESP by.
     pub requested_width: u32,
     pub requested_height: u32,
+    /// `authorized_keys` found by the bootloader in `\FREEOS\authorized_keys`
+    /// on any FAT volume the firmware can read (phase 68o), or empty.
+    ///
+    /// A live image has no accounts, so its SSH server lets nobody in. A key
+    /// put on a stick by the person holding the machine is the one way in: it
+    /// never reaches a released image, and whoever can write to the boot
+    /// stick already owns the machine. Read by the bootloader because the
+    /// firmware reads sticks on every USB controller, ours do not yet.
+    pub live_keys: [u8; LIVE_KEYS_MAX],
+    pub live_keys_len: u32,
 }
 
 /// Segment is readable.
@@ -446,6 +461,8 @@ impl BootInfo {
             _reserved: [0; 5],
             requested_width: 0,
             requested_height: 0,
+            live_keys: [0; LIVE_KEYS_MAX],
+            live_keys_len: 0,
         }
     }
 
