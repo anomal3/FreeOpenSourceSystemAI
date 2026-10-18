@@ -4,6 +4,8 @@ rem   tools\vbox\create.cmd
 rem UEFI, VMSVGA, SATA (AHCI), e1000, звук HDA с выводом null, USB OHCI с
 rem планшетом, COM1 в файл build\vbox\serial.log - журнал ядра.
 rem Чужие машины не трогаются: только FreeOS-bench.
+rem xHCI вместо OHCI (фаза 68k): VBoxManage modifyvm FreeOS-bench --usb-ohci off --usb-xhci on
+rem Мышь - tools\vbox\mouse.ps1.
 setlocal
 set VB="C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
 set VM=FreeOS-bench

@@ -27,9 +27,14 @@
 //! сотни микросекунд с запрещёнными прерываниями, то есть ровно ту болезнь, от
 //! которой прерывания лечат.
 //!
-//! Машина без MSI-X остаётся на опросе, и это видно в `usb`: счётчик `irqs`
-//! равен нулю. Отказываться от работающей клавиатуры из-за отсутствия
-//! прерываний было бы странно.
+//! Контроллер без MSI-X (Intel 7-й серии и xHCI VirtualBox, `8086:1e31`)
+//! берёт MSI, а без него — линию `INTx` по `_PRT` (фаза 68k). Линия уровневая
+//! и бывает общей, поэтому обработчик подтверждает прерывание сам, по
+//! адресам регистров, не дожидаясь лока контроллера, и не трогает чужое.
+//!
+//! Машина, где не сложился ни один путь, остаётся на опросе, и это видно в
+//! `usb`: счётчик `irqs` равен нулю. Отказываться от работающей клавиатуры из-за
+//! отсутствия прерываний было бы странно.
 //!
 //! # Сколько устройств
 //!
@@ -57,7 +62,7 @@
 pub mod regs;
 pub mod ring;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crate::acpi::AcpiError;
 use crate::input;
@@ -321,13 +326,6 @@ pub struct Controller {
     /// Устройство на шине: нужно после инициализации, чтобы настроить MSI-X —
     /// его таблица включается через конфигурационное пространство.
     device: pci::Device,
-    /// Виртуальный адрес таблицы MSI-X, если прерывания настроены. `None`
-    /// означает, что контроллер остался на опросе.
-    msix_table: Option<usize>,
-    /// Сколько прерываний пришло. Единственное, чем «работает по прерываниям»
-    /// отличается от «работает по опросу» на взгляд снаружи, — поэтому счётчик
-    /// и печатается.
-    interrupts: u64,
     /// Сколько раз задача просыпалась и разбирала кольцо.
     ///
     /// Это и есть цена опроса, выраженная числом: при опросе счётчик растёт сто
@@ -457,8 +455,6 @@ impl Controller {
             event_floods: 0,
             transfer_errors: 0,
             device,
-            msix_table: None,
-            interrupts: 0,
             services: 0,
             occupied: 0,
             last_error: None,
@@ -1797,55 +1793,44 @@ impl Controller {
         }
     }
 
-    /// Разобрать накопившиеся события и снова запросить отчёты.
-    ///
-    /// Вызывается из задачи. Когда появятся прерывания от контроллера, её будет
-    /// вызывать обработчик — больше в драйвере не изменится ничего.
     /// Перевести контроллер с опроса на прерывания.
     ///
-    /// Порядок здесь важнее обычного, и он такой: сперва обработчик, потом
-    /// таблица MSI-X, и только затем разрешение у самого контроллера. Обратный
-    /// порядок означал бы прерывание, которому некуда прийти.
+    /// Путь выбирается в порядке предпочтения: MSI-X, MSI, линия `INTx` (фаза
+    /// 68k). У xHCI VirtualBox (`8086:1e31`, как у Intel 7-й серии) MSI-X нет
+    /// вовсе, и до 68k он оставался на опросе сто раз в секунду.
     ///
-    /// Молчит, если MSI-X нет: тогда драйвер остаётся на опросе, и об этом
-    /// сообщает [`Controller::summary`]. Отказываться от работающей клавиатуры
-    /// из-за отсутствия прерываний было бы странно.
+    /// Порядок здесь важнее обычного, и он такой: сперва обработчик и адреса
+    /// для подтверждения, потом путь доставки, и только затем разрешение у
+    /// самого контроллера. Обратный порядок означал бы прерывание, которому
+    /// некуда прийти, — а для уровневой линии ещё и не снятое никем.
+    ///
+    /// Молчит, если ни один путь не сложился: тогда драйвер остаётся на опросе,
+    /// и об этом сообщает [`Controller::summary`]. Отказываться от работающей
+    /// клавиатуры из-за отсутствия прерываний было бы странно.
     ///
     /// # Safety
     ///
     /// Контроллер должен быть запущен, а кольцо событий — рабочим: прерывание
     /// может прийти немедленно после последней записи.
     unsafe fn enable_interrupts(&mut self) {
-        let Some(msix) = self.device.msix() else {
-            kprintln!("  xhci        : no MSI-X capability; events will be polled");
-            return;
-        };
-        let Some((address, data)) = crate::arch::interrupts::alloc_msi(on_interrupt) else {
-            kprintln!("  xhci        : no MSI target on this machine; events will be polled");
-            return;
-        };
-        let Some(bar) = self.device.memory_bar(msix.bir) else {
-            kprintln!("  xhci        : MSI-X table lives in BAR{} which is empty", msix.bir);
-            return;
-        };
+        let (status, iman) = self.regs.interrupt_registers();
+        ACK_STATUS.store(status, Ordering::Release);
+        ACK_IMAN.store(iman, Ordering::Release);
 
-        // Таблица лежит в том же BAR, что и регистры, но не обязана: смещение
-        // берётся из самой возможности, а не предполагается нулевым.
-        let table_page = crate::mm::PhysAddr::new(bar.as_u64() + u64::from(msix.table_offset));
-        // SAFETY: адрес получен из BAR устройства; окну нужна Device-семантика,
-        // как и остальным его регистрам.
-        let table = match unsafe { map_bar(table_page) } {
-            Ok(table) => table,
-            Err(err) => {
-                kprintln!("  xhci        : cannot map the MSI-X table ({err:?}); events will be polled");
-                return;
+        // SAFETY: контракт функции.
+        let delivery = unsafe {
+            if self.device.msix().is_some() {
+                self.enable_msix()
+            } else if self.device.msi().is_some() {
+                self.enable_msi()
+            } else {
+                self.enable_intx()
             }
         };
-
-        // SAFETY: таблица отображена, индекс 0 существует всегда (векторов не
-        // бывает ноль), обработчик уже стоит — на x86-64 он в IDT с загрузки, на
-        // AArch64 его поставил `alloc_msi`.
-        unsafe { self.device.set_msix_vector(&msix, table, 0, address, data) };
+        let Some(delivery) = delivery else {
+            return;
+        };
+        DELIVERY.store(delivery as u8, Ordering::Release);
 
         // Разрешение у контроллера — двумя битами в разных регистрах: у
         // прерывателя и общий. Нужны оба; забытый второй выглядит как
@@ -1857,37 +1842,94 @@ impl Controller {
             let command = self.regs.read_op32(regs::OP_USBCMD);
             self.regs.write_op32(regs::OP_USBCMD, command | regs::USBCMD_INTE);
         }
+    }
 
-        self.msix_table = Some(table);
+    /// MSI-X: вектор 0 таблицы.
+    ///
+    /// # Safety
+    ///
+    /// См. [`Controller::enable_interrupts`].
+    unsafe fn enable_msix(&mut self) -> Option<Delivery> {
+        let msix = self.device.msix()?;
+        let Some((address, data)) = crate::arch::interrupts::alloc_msi(on_interrupt) else {
+            kprintln!("  xhci        : no MSI target on this machine; events will be polled");
+            return None;
+        };
+        let Some(bar) = self.device.memory_bar(msix.bir) else {
+            kprintln!("  xhci        : MSI-X table lives in BAR{} which is empty", msix.bir);
+            return None;
+        };
+
+        // Таблица лежит в том же BAR, что и регистры, но не обязана: смещение
+        // берётся из самой возможности, а не предполагается нулевым.
+        let table_page = crate::mm::PhysAddr::new(bar.as_u64() + u64::from(msix.table_offset));
+        // SAFETY: адрес получен из BAR устройства; окну нужна Device-семантика,
+        // как и остальным его регистрам.
+        let table = match unsafe { map_bar(table_page) } {
+            Ok(table) => table,
+            Err(err) => {
+                kprintln!("  xhci        : cannot map the MSI-X table ({err:?}); events will be polled");
+                return None;
+            }
+        };
+
+        // SAFETY: таблица отображена, индекс 0 существует всегда (векторов не
+        // бывает ноль), обработчик уже стоит — на x86-64 он в IDT с загрузки, на
+        // AArch64 его поставил `alloc_msi`.
+        unsafe { self.device.set_msix_vector(&msix, table, 0, address, data) };
         kprintln!(
             "  xhci        : MSI-X vector 0 -> {address:#018x} data {data:#x}, {} vectors available",
             msix.vectors
         );
+        Some(Delivery::MsiX)
     }
 
-    /// Подтвердить прерывание у контроллера.
-    ///
-    /// Оба бита сбрасываются записью единицы, и оба обязательны: `EINT` в общем
-    /// состоянии и `IP` у прерывателя. Пока `IP` стоит, следующего прерывания не
-    /// будет — то есть пропуск этой записи выглядит как «прерывание пришло ровно
-    /// одно, а дальше тишина».
+    /// MSI: одно сообщение, как у AHCI.
     ///
     /// # Safety
     ///
-    /// Окно регистров отображено (оно живёт столько же, сколько контроллер).
-    unsafe fn acknowledge_interrupt(&mut self) {
-        self.interrupts += 1;
+    /// См. [`Controller::enable_interrupts`].
+    unsafe fn enable_msi(&mut self) -> Option<Delivery> {
+        let msi = self.device.msi()?;
+        let Some((address, data)) = crate::arch::interrupts::alloc_msi(on_interrupt) else {
+            kprintln!("  xhci        : no MSI target on this machine; events will be polled");
+            return None;
+        };
+        // SAFETY: возможность получена от этого же устройства, обработчик
+        // поставлен `alloc_msi` выше.
+        unsafe { self.device.set_msi_vector(&msi, address, data) };
+        kprintln!("  xhci        : no MSI-X; MSI -> {address:#018x} data {data:#x}");
+        Some(Delivery::Msi)
+    }
+
+    /// Линия `INTx` — уровневая и, возможно, общая с соседями.
+    ///
+    /// Признаки, оставшиеся с запуска, снимаются до разрешения линии: иначе
+    /// уровень поднялся бы за событие, которого задача ещё не ждёт. Сам
+    /// контроллер не поднимет линию, пока не разрешён `IMAN.IE` — это делает
+    /// вызывающий после возврата.
+    ///
+    /// # Safety
+    ///
+    /// См. [`Controller::enable_interrupts`].
+    unsafe fn enable_intx(&mut self) -> Option<Delivery> {
         // SAFETY: контракт функции.
         unsafe {
             self.regs.write_op32(regs::OP_USBSTS, regs::USBSTS_EVENT_INTERRUPT);
-            self.regs.write_interrupter32(
-                0,
-                regs::IR_IMAN,
-                regs::IMAN_INTERRUPT_ENABLE | regs::IMAN_INTERRUPT_PENDING,
-            );
+            self.regs
+                .write_interrupter32(0, regs::IR_IMAN, regs::IMAN_INTERRUPT_PENDING);
         }
+        let Some(gsi) = crate::irq::routing::request(&self.device, on_interrupt) else {
+            kprintln!("  xhci        : no MSI-X, no MSI and no interrupt line known; events will be polled");
+            return None;
+        };
+        kprintln!("  xhci        : no MSI-X or MSI; INTx on GSI {gsi}");
+        Some(Delivery::Intx)
     }
 
+    /// Разобрать накопившиеся события и снова запросить отчёты.
+    ///
+    /// Вызывается из задачи — по прерыванию или по часам.
     pub fn service(&mut self) {
         self.services += 1;
         // SAFETY: окно регистров отображено на всё время жизни контроллера.
@@ -1965,7 +2007,8 @@ impl Controller {
             events: self.events_seen,
             errors: self.transfer_errors,
             event_floods: self.event_floods,
-            interrupts: self.interrupts,
+            interrupts: INTERRUPTS.load(Ordering::Relaxed),
+            delivery: delivery(),
             services: self.services,
         }
     }
@@ -2015,6 +2058,8 @@ pub struct Summary {
     /// Сколько прерываний пришло от контроллера. Ноль при работающей
     /// клавиатуре означает, что события забирает опрос.
     pub interrupts: u64,
+    /// Каким путём: `MSI-X`, `MSI`, `INTx` или `polled`.
+    pub delivery: &'static str,
     /// Сколько раз задача просыпалась разбирать кольцо.
     pub services: u64,
 }
@@ -2139,6 +2184,55 @@ const IRQ_SOURCE: u32 = crate::irq::source::XHCI;
 /// то же, что одно, — «сходи посмотри».
 static EVENT_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// Адрес `USBSTS` — для подтверждения из обработчика без лока; ноль — пока
+/// прерывания не настраивались.
+static ACK_STATUS: AtomicUsize = AtomicUsize::new(0);
+
+/// Адрес `IMAN` прерывателя 0, см. [`ACK_STATUS`].
+static ACK_IMAN: AtomicUsize = AtomicUsize::new(0);
+
+/// Сколько прерываний пришло. Единственное, чем «работает по прерываниям»
+/// отличается от «работает по опросу» на взгляд снаружи, — поэтому счётчик и
+/// печатается.
+static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Каким путём приходят прерывания: [`Delivery`] числом.
+static DELIVERY: AtomicU8 = AtomicU8::new(Delivery::Polled as u8);
+
+/// Путь прерываний от контроллера.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Delivery {
+    /// Прерываний нет, кольцо разбирается по часам.
+    Polled = 0,
+    MsiX = 1,
+    Msi = 2,
+    /// Уровневая линия через I/O APIC или GIC.
+    Intx = 3,
+}
+
+impl Delivery {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Polled => "polled",
+            Self::MsiX => "MSI-X",
+            Self::Msi => "MSI",
+            Self::Intx => "INTx",
+        }
+    }
+}
+
+/// Путь прерываний словом — для сводки.
+fn delivery() -> &'static str {
+    match DELIVERY.load(Ordering::Acquire) {
+        1 => Delivery::MsiX,
+        2 => Delivery::Msi,
+        3 => Delivery::Intx,
+        _ => Delivery::Polled,
+    }
+    .name()
+}
+
 /// Забрать контроллер у прошивки (USB Legacy Support, xHCI 1.1, 7.1).
 ///
 /// Прошивка, у которой в настройках включена поддержка USB-клавиатуры, владеет
@@ -2197,14 +2291,40 @@ unsafe fn take_from_firmware(regs: &Registers) {
 /// он занимает сотни микросекунд, а всё это время прерывания были бы запрещены
 /// — то есть ровно та болезнь, от которой прерывания и лечат.
 ///
-/// Лок здесь брать безопасно: [`crate::sync::SpinLock`] удерживается с
-/// запрещёнными прерываниями, поэтому обработчик не может застать его занятым
-/// на этом же ядре.
+/// Подтверждение идёт по адресам [`ACK_STATUS`] и [`ACK_IMAN`], а не через
+/// лок контроллера (фаза 68k): [`poll_hotplug`] держит контроллер «в руках»
+/// сотни миллисекунд, и на уровневой линии `INTx` не снятый признак означал
+/// бы прерывание, повторяющееся без конца всё это время. Оба бита
+/// сбрасываются записью единицы, и оба обязательны: `EINT` в общем состоянии и
+/// `IP` у прерывателя — пока `IP` стоит, следующего прерывания не будет, а
+/// линия не опустится.
 pub fn on_interrupt() {
-    if let Some(controller) = CONTROLLER.lock().as_mut() {
-        // SAFETY: контроллер существует, значит его окно регистров отображено.
-        unsafe { controller.acknowledge_interrupt() };
+    let status = ACK_STATUS.load(Ordering::Acquire);
+    let iman = ACK_IMAN.load(Ordering::Acquire);
+    if status != 0 && iman != 0 {
+        // SAFETY: адреса положены `enable_interrupts` из отображённого окна
+        // регистров, которое живёт всё время работы ядра.
+        unsafe {
+            let pending = core::ptr::read_volatile(status as *const u32)
+                & regs::USBSTS_EVENT_INTERRUPT;
+            let raised = core::ptr::read_volatile(iman as *const u32)
+                & regs::IMAN_INTERRUPT_PENDING;
+            // Линия может быть общей: чужое прерывание не трогает ни
+            // контроллер, ни задачу. MSI и MSI-X приходят только от нас.
+            if pending == 0
+                && raised == 0
+                && DELIVERY.load(Ordering::Relaxed) == Delivery::Intx as u8
+            {
+                return;
+            }
+            core::ptr::write_volatile(status as *mut u32, regs::USBSTS_EVENT_INTERRUPT);
+            core::ptr::write_volatile(
+                iman as *mut u32,
+                regs::IMAN_INTERRUPT_ENABLE | regs::IMAN_INTERRUPT_PENDING,
+            );
+        }
     }
+    INTERRUPTS.fetch_add(1, Ordering::Relaxed);
     EVENT_PENDING.store(true, Ordering::Release);
     crate::sched::wake_irq(IRQ_SOURCE);
 }
@@ -2283,7 +2403,7 @@ const PORT_CHECK_PERIOD_MS: u64 = 500;
 
 /// Настроены ли прерывания. Решает, ждать задаче события или часов.
 fn interrupts_enabled() -> bool {
-    CONTROLLER.lock().as_ref().is_some_and(|c| c.msix_table.is_some())
+    DELIVERY.load(Ordering::Acquire) != Delivery::Polled as u8
 }
 
 /// Тело задачи, обслуживающей контроллер.

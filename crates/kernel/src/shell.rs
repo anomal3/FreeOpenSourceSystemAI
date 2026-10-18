@@ -1532,7 +1532,7 @@ fn usb_status() {
             if usb.interrupts == 0 {
                 sprintln!("  irqs     none, events are polled on a timer");
             } else {
-                sprintln!("  irqs     {} delivered", usb.interrupts);
+                sprintln!("  irqs     {} delivered by {}", usb.interrupts, usb.delivery);
             }
             // Пробуждения — цена опроса, выраженная числом. При опросе их сто в
             // секунду, независимо от того, происходит ли что-нибудь; по

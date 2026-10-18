@@ -427,6 +427,13 @@ impl Registers {
         unsafe { self.write_op32(offset, value) };
     }
 
+    /// Адреса `USBSTS` и `IMAN` прерывателя 0 — для обработчика прерывания,
+    /// которому нельзя ждать лока контроллера (фаза 68k).
+    #[must_use]
+    pub fn interrupt_registers(&self) -> (usize, usize) {
+        (self.op + OP_USBSTS, self.runtime + RT_INTERRUPTER_BASE + IR_IMAN)
+    }
+
     /// # Safety
     ///
     /// Смещение обязано указывать на 32-битный регистр прерывателя `index`.
