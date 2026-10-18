@@ -147,6 +147,9 @@ pub fn build_with_key(built: &Built, kind: Kind, live_key: Option<&Path>) -> Res
     }
 
     payload.push(build_file(build.number));
+    if kind == Kind::System {
+        payload.push(live_file());
+    }
     let bytes = assemble(&payload, kind)?;
 
     if let Some(parent) = image_path.parent() {
@@ -189,6 +192,16 @@ fn build_file(number: u32) -> Payload {
         path: String::from("FREEOS/BUILD"),
         data: format!("{number}\n").into_bytes(),
         source: PathBuf::from("(номер сборки)"),
+    }
+}
+
+/// Метка живого носителя `\FREEOS\LIVE` (0.8): загрузчик ставит
+/// `BOOT_LIVE`, и ядро не берёт корень установленной системы с диска машины.
+fn live_file() -> Payload {
+    Payload {
+        path: String::from("FREEOS/LIVE"),
+        data: b"live medium\n".to_vec(),
+        source: PathBuf::from("(метка живого носителя)"),
     }
 }
 
@@ -693,6 +706,9 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     // просто образ, который прошивка монтирует целиком. Ровно то же делает
     // «суперфлоппи» — носитель без таблицы разделов.
     payload.push(build_file(build.number));
+    if kind == Kind::System {
+        payload.push(live_file());
+    }
     let boot = assemble_fat(&payload)?;
 
     let readme = iso_readme(arch, kind);

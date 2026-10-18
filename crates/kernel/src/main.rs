@@ -1012,6 +1012,21 @@ fn mount_disk_root(info: &BootInfo) {
         Some(slots::Slot::A) | None => gpt::FREEOS_ROOT_TYPE,
     };
 
+    // Загрузка с живой флешки (0.8): корень установленной системы на диске
+    // не трогается — работает то, что на флешке. Иначе ядро флешки запускало
+    // `/bin` чужой версии с диска (ASUS K53SD, где стояла 0.7).
+    if info.boot_flags & boot_info::BOOT_LIVE != 0 {
+        if let Some(partition) = block::take(&found, root_type) {
+            kprintln!(
+                "  root        : live medium; the FreeOS root on {} #{} is left alone",
+                partition.source,
+                partition.unit
+            );
+        }
+        mount_data(&found, info);
+        return;
+    }
+
     let Some(partition) = block::take(&found, root_type) else {
         kprintln!("  root        : no FreeOS root partition: keeping the initrd as root");
         // Раздел данных от корня не зависит — в этом весь его смысл. Система,

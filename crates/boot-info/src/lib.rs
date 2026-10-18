@@ -71,6 +71,13 @@ pub const BOOT_UNATTENDED: u64 = 1 << 2;
 /// что сломается на этой машине следующим.
 pub const BOOT_ONE_CPU: u64 = 1 << 3;
 
+/// Booted from a live medium (`\FREEOS\LIVE` on the boot volume, written by
+/// `xtask image`/`iso`): the system on the stick runs, and a FreeOS root found
+/// on an internal disk is left alone (0.8). Without it, a stick booted on a
+/// machine with FreeOS installed ran the installed `/bin` of another version
+/// under its own kernel — ASUS K53SD.
+pub const BOOT_LIVE: u64 = 1 << 4;
+
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

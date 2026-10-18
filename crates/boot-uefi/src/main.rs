@@ -96,7 +96,7 @@ fn main() -> Status {
     // графикой, человек обязан успеть сказать об этом раньше, чем загрузчик
     // до них доберётся.
     let choice = menu::choose();
-    info.boot_flags = choice.flags | unattended_flag();
+    info.boot_flags = choice.flags | unattended_flag() | live_flag();
     // Разрешение, выбранное человеком в «Параметрах», лежит файлом на этом же
     // томе: сменить режим экрана можно только здесь, до `ExitBootServices`, и
     // ядро может лишь попросить об этом заранее. Пятый пункт меню обходит и
@@ -149,6 +149,20 @@ fn unattended_flag() -> u64 {
         Ok(Some(_)) => {
             println!("  [cfg] unattended run: the shell will close an idle session");
             boot_info::BOOT_UNATTENDED
+        }
+        _ => 0,
+    }
+}
+
+/// Живой носитель: на загрузочном томе лежит `\FREEOS\LIVE` (0.8).
+fn live_flag() -> u64 {
+    let Ok(mut volume) = volume::BootVolume::open() else {
+        return 0;
+    };
+    match volume.open_regular(uefi::cstr16!("\\FREEOS\\LIVE")) {
+        Ok(Some(_)) => {
+            println!("  [cfg] live medium: the system on this stick runs, installed roots stay untouched");
+            boot_info::BOOT_LIVE
         }
         _ => 0,
     }
