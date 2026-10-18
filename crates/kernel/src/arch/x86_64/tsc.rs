@@ -63,6 +63,11 @@ const FLAG_TMR_VAL_EXT: u32 = 1 << 8;
 /// придётся считать по тикам, как раньше.
 static FREQUENCY_HZ: AtomicU64 = AtomicU64::new(0);
 
+/// Порт и маска таймера ACPI, по которому калибровали, — для уточнения
+/// (ноль — таймера нет).
+static PM_PORT: AtomicU64 = AtomicU64::new(0);
+static PM_MASK: AtomicU64 = AtomicU64::new(0);
+
 /// Текущее значение счётчика тактов.
 #[must_use]
 pub fn counter() -> u64 {
@@ -109,11 +114,64 @@ pub unsafe fn calibrate(rsdp: u64) {
     };
 
     FREQUENCY_HZ.store(hz, Ordering::Release);
+    PM_PORT.store(u64::from(timer.port), Ordering::Relaxed);
+    PM_MASK.store(u64::from(timer.mask), Ordering::Relaxed);
     kprintln!(
         "  monotonic   : TSC at {} MHz, calibrated against the ACPI timer at port {:#06x}",
         hz / 1_000_000,
         timer.port
     );
+}
+
+/// Уточнить частоту на длинном интервале (фаза 68g) — как
+/// «Refined TSC clocksource calibration» у Linux.
+///
+/// # Зачем
+///
+/// Пятьдесят миллисекунд при загрузке хватает там, где таймер ACPI идёт ровно.
+/// В VirtualBox поверх Hyper-V (движок NEM — обычная картина на Windows 11)
+/// виртуальное время на загрузке **догоняет** отставание и идёт быстрее
+/// настоящего: калибровка попадала в догонялки и мерила TSC в 523 МГц вместо
+/// ~3,8 ГГц — часы системы шли всемеро быстрее, `beep` на 2 с «длился» 14.
+/// Сам TSC при этом настоящий: он от процессора машины.
+///
+/// Копит `ms` миллисекунд **по таймеру ACPI**, а не по текущим часам: часы
+/// могут ошибаться в разы, и «секунда» по ним оказалась бы десятой долей
+/// настоящей — замеры на таком отрезке расходились между собой на проценты.
+/// Между чтениями — сон по `step_ms`; приращения складываются по шагам,
+/// потому что 24-разрядный счётчик оборачивается за 4,7 с. `None` — таймера
+/// нет или он стоит.
+pub fn refine_sample(ms: u64, step_ms: u64, sleep_ms: impl Fn(u64)) -> Option<u64> {
+    let port = u16::try_from(PM_PORT.load(Ordering::Relaxed)).ok().filter(|port| *port != 0)?;
+    let mask = PM_MASK.load(Ordering::Relaxed) as u32;
+    let timer = PmTimer { port, mask };
+    let target = PM_TIMER_HZ * ms / 1000;
+    let start_tsc = counter();
+    let mut last = timer.read();
+    let mut total: u64 = 0;
+    let mut steps = 0u32;
+    while total < target {
+        sleep_ms(step_ms);
+        let now = timer.read();
+        total += u64::from(now.wrapping_sub(last) & mask);
+        last = now;
+        steps += 1;
+        // Страховка от стоящего таймера: десять тысяч шагов — заведомо
+        // больше любого разумного расхождения часов.
+        if steps > 10_000 {
+            return None;
+        }
+    }
+    let ticks = counter().checked_sub(start_tsc)?;
+    if total == 0 || ticks == 0 {
+        return None;
+    }
+    Some((u128::from(ticks) * u128::from(PM_TIMER_HZ) / u128::from(total)) as u64)
+}
+
+/// Принять уточнённую частоту.
+pub fn set_frequency(hz: u64) {
+    FREQUENCY_HZ.store(hz, Ordering::Release);
 }
 
 /// Таймер ACPI: порт и разрядность счётчика.

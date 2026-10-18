@@ -167,6 +167,61 @@ pub fn adopt_monotonic() {
     MONOTONIC_HZ.store(hz, Ordering::Release);
 }
 
+/// Уточнить частоту счётчика после загрузки (фаза 68g, только x86-64).
+///
+/// Служебная задача: пять замеров по четыре секунды таймера ACPI через две
+/// секунды после старта. Под NEM таймер ACPI идёт рывками: секундные замеры
+/// расходились на двадцать процентов, четырёхсекундные — на пять-шесть.
+/// Частота принимается, если не меньше четырёх замеров из пяти лежат в
+/// пределах ±5 % от медианы (один выброс не решает) и медиана расходится с
+/// принятой больше чем на 10 %. Точка отсчёта при этом переставляется на
+/// «сейчас», чтобы время не прыгнуло.
+#[cfg(target_arch = "x86_64")]
+pub fn refine_task() {
+    crate::sched::sleep_ms(2_000);
+    let current = MONOTONIC_HZ.load(Ordering::Acquire);
+    if current == 0 {
+        return;
+    }
+    let mut samples = [0u64; 5];
+    for sample in &mut samples {
+        match arch::monotonic::refine_sample(4_000, 50, crate::sched::sleep_ms) {
+            Some(hz) => *sample = hz,
+            None => return,
+        }
+    }
+    samples.sort_unstable();
+    let median = samples[2];
+    let close = samples.iter().filter(|hz| hz.abs_diff(median) * 20 <= median).count();
+    let off = median.abs_diff(current) * 10 > current;
+    if close < 4 {
+        kprintln!(
+            "  monotonic   : refinement disagrees with itself ({} .. {} MHz); keeping {} MHz",
+            samples[0] / 1_000_000,
+            samples[4] / 1_000_000,
+            current / 1_000_000
+        );
+        return;
+    }
+    if !off {
+        kprintln!("  monotonic   : refined {} MHz, the boot calibration stands", median / 1_000_000);
+        return;
+    }
+    // Перестановка точки отсчёта: «сейчас» по старой частоте становится
+    // смещением, счётчик — новой базой. Читатель между тремя записями увидит
+    // смесь старого и нового на одно чтение; ход времени после этого верен.
+    let now_ms = uptime_ms();
+    MONOTONIC_OFFSET_MS.store(now_ms, Ordering::Relaxed);
+    MONOTONIC_BASE.store(arch::monotonic::counter(), Ordering::Relaxed);
+    MONOTONIC_HZ.store(median, Ordering::Release);
+    arch::monotonic::set_frequency(median);
+    kprintln!(
+        "  monotonic   : refined the counter from {} MHz to {} MHz (the boot calibration was off)",
+        current / 1_000_000,
+        median / 1_000_000
+    );
+}
+
 /// Сколько тиков таймера отмерять при сверке хода счётчика.
 ///
 /// Десять тиков — это 100 мс при [`irq::TIMER_HZ`] = 100. Меньше нельзя:

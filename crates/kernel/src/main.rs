@@ -805,6 +805,13 @@ fn run_session(have_input: bool) -> ! {
         }
     }
 
+    // Уточнение частоты счётчика времени (фаза 68g): калибровка при загрузке
+    // ошибалась в разы в VirtualBox поверх Hyper-V — см. `time::refine_task`.
+    #[cfg(target_arch = "x86_64")]
+    if let Err(err) = sched::spawn_daemon("clock", time::refine_task) {
+        kprintln!("  spawn clock refinement failed: {err}");
+    }
+
     // Служебные задачи ввода, если архитектуре они нужны. На телефоне это опрос
     // тачскрина: прерывания у него нет, и без этой задачи указатель не двинется
     // ни разу, хотя контроллер найден и отвечает.
