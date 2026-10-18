@@ -247,8 +247,11 @@ fn bus_name(path: Option<&[u8]>) -> &'static str {
     name
 }
 
-/// Наибольшая передача, которую крейт `disk` выполняет за раз (32 КиБ при
-/// записи данных файла). Промежуточный буфер заводится сразу на неё.
+/// Размер промежуточного буфера. Передача длиннее идёт через него кусками:
+/// с фазы 65f крейт `ext2` пишет файл одной пачкой, и `FreeOs.CoreLib.dll`
+/// (539 КиБ) в прежний буфер «на наибольшую передачу» не помещался — на
+/// диске с `IoAlign` (NVMe прошивки) установка падала (полный прогон 17.10,
+/// `install4k`).
 const MAX_TRANSFER: usize = 32 * 1024;
 
 /// Носитель прошивки, представленный как [`BlockDevice`] для крейта `disk`.
@@ -306,6 +309,19 @@ impl UefiDisk {
     }
 }
 
+impl UefiDisk {
+    /// Кусок передачи через буфер: целое число секторов, не больше буфера.
+    fn chunk(&self) -> usize {
+        let block = self.block_size.max(1) as usize;
+        (MAX_TRANSFER / block).max(1) * block
+    }
+
+    /// Сколько секторов в `bytes` байтах от начала передачи.
+    fn blocks_in(&self, bytes: usize) -> u64 {
+        (bytes / self.block_size.max(1) as usize) as u64
+    }
+}
+
 /// Первые `len` байт выровненного буфера.
 ///
 /// Свободная функция, а не метод: иначе она заимствовала бы `self` целиком, и
@@ -347,14 +363,18 @@ impl BlockDevice for UefiDisk {
                 .read_blocks(self.media_id, lba, buf)
                 .map_err(|_| disk::Error::Io);
         };
-        let result = match as_bytes_mut(&mut bounce, buf.len()) {
-            Some(staging) => self
-                .io
-                .read_blocks(self.media_id, lba, staging)
-                .map_err(|_| disk::Error::Io)
-                .map(|()| buf.copy_from_slice(staging)),
-            None => Err(disk::Error::Io),
-        };
+        let result = (|| {
+            let step = self.chunk();
+            for (index, piece) in buf.chunks_mut(step).enumerate() {
+                let staging = as_bytes_mut(&mut bounce, piece.len()).ok_or(disk::Error::Io)?;
+                let at = lba + self.blocks_in(index * step);
+                self.io
+                    .read_blocks(self.media_id, at, staging)
+                    .map_err(|_| disk::Error::Io)?;
+                piece.copy_from_slice(staging);
+            }
+            Ok(())
+        })();
         self.bounce = Some(bounce);
         result
     }
@@ -366,15 +386,18 @@ impl BlockDevice for UefiDisk {
                 .write_blocks(self.media_id, lba, buf)
                 .map_err(|_| disk::Error::Io);
         };
-        let result = match as_bytes_mut(&mut bounce, buf.len()) {
-            Some(staging) => {
-                staging.copy_from_slice(buf);
+        let result = (|| {
+            let step = self.chunk();
+            for (index, piece) in buf.chunks(step).enumerate() {
+                let staging = as_bytes_mut(&mut bounce, piece.len()).ok_or(disk::Error::Io)?;
+                staging.copy_from_slice(piece);
+                let at = lba + self.blocks_in(index * step);
                 self.io
-                    .write_blocks(self.media_id, lba, staging)
-                    .map_err(|_| disk::Error::Io)
+                    .write_blocks(self.media_id, at, staging)
+                    .map_err(|_| disk::Error::Io)?;
             }
-            None => Err(disk::Error::Io),
-        };
+            Ok(())
+        })();
         self.bounce = Some(bounce);
         result
     }

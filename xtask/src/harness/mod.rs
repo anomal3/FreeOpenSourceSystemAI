@@ -283,6 +283,30 @@ fn schedule(selected: &[&'static Scenario], opts: &TestOptions) -> Result<Vec<Un
         );
     }
 
+    // Сценарий установленной системы, записанный в списке **выше**
+    // установщика, — ошибка плана, и вслух (полный прогон 17.10). Цепочка идёт
+    // в порядке списка, и такой сценарий ходит по диску прошлого прогона:
+    // `csound`, `chda`, `sdl` и `doom` стояли выше `install` и в release на
+    // x86-64 нашли систему, собранную ещё до звука. В отладочном профиле это
+    // пряталось — диск там случайно был свежим.
+    if let Some(first) = scenarios::ALL
+        .iter()
+        .position(|scenario| scenario.target == Target::Installer && !scenario.disk_bus.sector_is_4k())
+    {
+        if let Some(early) = scenarios::ALL[..first]
+            .iter()
+            .find(|scenario| scenario.target.shares_target_disk())
+        {
+            bail!(
+                "сценарий '{}' работает с установленным диском, но записан выше '{}': \
+                 цепочка идёт в порядке списка, и он застанет диск прошлого прогона.\n\
+                 Перенесите его ниже установщика в xtask/src/harness/scenarios.rs.",
+                early.name,
+                scenarios::ALL[first].name
+            );
+        }
+    }
+
     let mut chains: Vec<Unit> = Vec::new();
     let mut singles: Vec<Unit> = Vec::new();
     let mut order = 0usize;
