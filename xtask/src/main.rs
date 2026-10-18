@@ -25,6 +25,7 @@ mod diskfile;
 mod firmware;
 mod fuzz;
 mod harness;
+mod icons;
 mod image;
 mod initrd;
 mod inspect;
@@ -71,6 +72,9 @@ enum Command {
     /// Собрать загрузочный ISO — то, что можно отдать человеку или подключить
     /// к виртуальной машине.
     Iso(ImageArgs),
+    /// Перевести значки макета (`assets/icons/freeos-icons.svg`) в таблицу
+    /// `crates/mini-ui/src/iconset_data.rs`.
+    Icons,
     /// Разобрать образ диска: разделы и содержимое корневой ФС.
     Inspect(InspectArgs),
     /// Собрать набор для C: picolibc под обе архитектуры.
@@ -636,6 +640,17 @@ fn real_main() -> Result<()> {
             print_built(&built);
             let path = image::build_with_key(&built, kind, args.live_key.as_deref())?;
             image::describe(args.arch, &path, kind);
+        }
+
+        Command::Icons => {
+            let root = paths::workspace_root();
+            icons::generate(
+                &root.join("assets").join("icons").join("freeos-icons.svg"),
+                &root.join("crates").join("mini-ui").join("src").join("iconset_data.rs"),
+            )?;
+            // Предпросмотр рисует таблица, собранная в этот `xtask` прошлым
+            // запуском: после правки исходника — запустить дважды.
+            icons::preview(&root.join("build").join("icons-preview.png"))?;
         }
 
         Command::Iso(args) => {

@@ -1347,6 +1347,7 @@ dependencies = [
  "fpk",
  "freeos-cc",
  "freeos-fuzz",
+ "mini-ui",
  "osupdate",
  "png",
  "rcgen",
