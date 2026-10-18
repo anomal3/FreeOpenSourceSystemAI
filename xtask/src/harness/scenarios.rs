@@ -234,7 +234,9 @@ pub enum Step {
     /// провал.
     Tone(u32),
     /// Проверить, что в звуке гостя хоть что-то слышно не меньше стольких
-    /// миллисекунд (фаза 68e): звуки игры — не один тон.
+    /// миллисекунд (фаза 68e): звуки игры — не один тон. Порог — средняя
+    /// громкость окна 100: тишина у QEMU — ровные нули, а PC-спикер SDL
+    /// Sopwith тихий (среднее около 250).
     Heard(u64),
     /// Сбросить машину, ничего не спрашивая у гостя (`system_reset` монитора).
     ///
@@ -4481,6 +4483,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("csdl: waiting for input", 30_000),
             Step::Expect("csdl: SDL 2.32.10, video freeos, audio freeos"),
             Step::Expect("csdl: ok rectangles are drawn in their colours"),
+            // Фаза 68f: `HOME` из `/etc/system.cfg`, каталог настроек SDL.
+            Step::Expect("csdl: HOME /home/roman, pref path /home/roman/.local/share/freeos/csdl/"),
             Step::Expect("csdl: ok a timer fires on its own thread"),
             Step::Expect("csdl: ok the audio callback runs"),
             Step::Wait(2_000),
@@ -4499,6 +4503,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await("csdl: key F5", 30_000),
             Step::Key("ctrl"),
             Step::Await("csdl: key Left Ctrl", 30_000),
+            // Удержанная буква (фаза 68f): нажатие, повторы, одно отпускание.
+            Step::Hold("x", 1_500),
+            Step::Await("csdl: keyup X", 30_000),
             // `mouse_move 0 0 1` — колесо от себя: прокрутка вверх, `y` > 0.
             Step::Wheel(1),
             Step::Await("csdl: wheel 0,1", 30_000),
@@ -4511,6 +4518,59 @@ pub const ALL: &[Scenario] = &[
             Step::Await("/bin/csdl: exited with code 0", 30_000),
             Step::Tone(440),
             Step::Absent("csdl: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "sopwith",
+        about: "Вторая игра на SDL2 (фаза 68f), собранная своим configure: пакет sopwith, полёт, выстрелы и звук мотора, крестик.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Line("run /bin/pkg install /media/sopwith-2.9.0.fpk"),
+            Step::Await("pkg: installed sopwith 2.9.0, 1 file(s)", 120_000),
+            // `-n` — одиночная игра для новичка, без меню.
+            Step::Line("run /opt/sopwith/bin/sopwith -n"),
+            Step::Await("desktop     : opened 'SDL Sopwith 2.9.0' for ", 60_000),
+            Step::Wait(4_000),
+            Step::Shot("sopwith-start"),
+            // Газ — X, набор высоты — запятая, огонь — пробел.
+            Step::Wait(4_000),
+            Step::Repeat("x", 12),
+            Step::Hold("comma", 800),
+            Step::Repeat("spc", 6),
+            Step::Wait(1_500),
+            Step::Shot("sopwith-flight"),
+            Step::Aim(Aim::Close("SDL Sopwith 2.9.0")),
+            Step::Click,
+            Step::Await("/opt/sopwith/bin/sopwith: exited with code", 30_000),
+            // Диск переживает прогон — пакет снимается до проверок, которые
+            // могут упасть.
+            Step::Line("run /bin/pkg remove sopwith"),
+            Step::Await("pkg: removed sopwith", 60_000),
+            // Мотор и выстрелы — PC-спикер через звук SDL, в WAV у QEMU.
+            Step::Heard(1_000),
             Step::Absent("user        : killed by"),
             Step::Absent("KERNEL PANIC"),
         ],

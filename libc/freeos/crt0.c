@@ -68,12 +68,18 @@ extern void __libc_init_array(void);
  * ошибка системного вызова без него писала бы по базе ноль. */
 extern void freeos_threads_start(void);
 
+/* Окружение — `HOME`, `USER`, `PATH` (фаза 68f, `files.c`): ядро его не
+ * передаёт. После потоков (`setenv` берёт память из кучи под замком) и до
+ * конструкторов — чужие конструкторы вправе спросить `getenv`. */
+extern void freeos_environ_start(void);
+
 extern int main(int argc, char **argv);
 
 void _start(int argc, char **argv);
 
 void _start(int argc, char **argv) {
     freeos_threads_start();
+    freeos_environ_start();
     __libc_init_array();
     exit(main(argc, argv));
 }

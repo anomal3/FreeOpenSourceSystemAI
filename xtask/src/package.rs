@@ -144,6 +144,9 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     if let Some(game) = freedoom(arch)? {
         samples.push(("freedoom-0.13.fpk", game));
     }
+    if let Some(game) = sopwith(arch)? {
+        samples.push(("sopwith-2.9.0.fpk", game));
+    }
 
     let mut built = Vec::new();
     for (file_name, bytes) in samples {
@@ -157,7 +160,7 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
 }
 
 /// Пакеты игр: только на установочный носитель, не в RAM-диск живой системы.
-pub const GAMES: [&str; 1] = ["freedoom-0.13.fpk"];
+pub const GAMES: [&str; 2] = ["freedoom-0.13.fpk", "sopwith-2.9.0.fpk"];
 
 /// Doom пакетом (фаза 68d): doomgeneric на SDL2 и данные Freedoom: Phase 1.
 ///
@@ -190,6 +193,24 @@ fn freedoom(arch: Arch) -> Result<Option<Vec<u8>>> {
         let data = fs::read(source).with_context(|| format!("не удалось прочитать {}", source.display()))?;
         game.file(&Entry { path: String::from(path), mode, uid: 0, gid: 0, data });
     }
+    Ok(Some(game.finish()))
+}
+
+/// SDL Sopwith пакетом (фаза 68f): одна программа, данные в ней самой.
+fn sopwith(arch: Arch) -> Result<Option<Vec<u8>>> {
+    let program = crate::cbuild::sysroot(arch).join("bin/sopwith");
+    if !program.is_file() {
+        say!("пакет sopwith пропущен: нет {} — собрать: cargo xtask thirdparty", program.display());
+        return Ok(None);
+    }
+    let mut game = Builder::new(Kind::Package, "sopwith", "2.9.0");
+    game.field("summary", "SDL Sopwith, the 1984 biplane game, on SDL2");
+    game.field("caption", "Sopwith");
+    game.field("about", "биплан 1984 года на SDL2");
+    game.field("start", "/opt/sopwith/bin/sopwith");
+    game.field("permissions", "windows files");
+    let data = fs::read(&program).with_context(|| format!("не удалось прочитать {}", program.display()))?;
+    game.file(&Entry { path: String::from("bin/sopwith"), mode: 0o755, uid: 0, gid: 0, data });
     Ok(Some(game.finish()))
 }
 

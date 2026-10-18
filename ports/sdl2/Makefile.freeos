@@ -33,7 +33,7 @@ DIRS = \
 	src/joystick/dummy \
 	src/loadso/dummy \
 	src/power \
-	src/filesystem/dummy \
+	src/filesystem/unix \
 	src/locale \
 	src/locale/dummy \
 	src/misc \

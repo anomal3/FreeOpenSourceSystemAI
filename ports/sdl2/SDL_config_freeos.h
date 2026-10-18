@@ -136,7 +136,9 @@
 #define SDL_SENSOR_DISABLED 1
 #define SDL_POWER_DISABLED 1
 #define SDL_LOADSO_DUMMY 1
-#define SDL_FILESYSTEM_DUMMY 1
+/* Каталог настроек — `$HOME/.local/share/<org>/<app>` (фаза 68f: libc
+ * заводит `HOME` сама); каталог программы `/proc` не знает — `NULL`. */
+#define SDL_FILESYSTEM_UNIX 1
 #define SDL_LOCALE_DUMMY 1
 #define SDL_MISC_DUMMY 1
 

@@ -294,6 +294,18 @@ pub fn mkdir_as(cred: Credentials, path: &str, mode: u16) -> Option<VfsResult<()
     };
     let dir = match resolve_as(cred, parent, Access::WRITE)? {
         Ok(dir) => dir,
+        // Имя уже есть — «существует», а не «нет прав», даже если писать в
+        // каталог нельзя: так отвечают POSIX и Linux, и на этом стоит всякий,
+        // кто создаёт путь по частям. `SDL_GetPrefPath` создаёт
+        // `~/.local/share/…` начиная с `/home`, и отказ «нет прав» на
+        // существующем `/home` обрывал его целиком (фаза 68f). Видно имя
+        // только тому, кому родитель открыт на поиск, — проверка та же.
+        Err(VfsError::PermissionDenied) => {
+            return Some(match resolve_as(cred, path, Access::NONE)? {
+                Ok(_) => Err(VfsError::Exists),
+                Err(_) => Err(VfsError::PermissionDenied),
+            });
+        }
         Err(err) => return Some(Err(err)),
     };
     Some(dir.mkdir(name, mode, cred.uid, cred.gid).map(|_| ()))

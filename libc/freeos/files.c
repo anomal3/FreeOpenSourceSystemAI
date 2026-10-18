@@ -509,3 +509,67 @@ int fcntl(int fd, int cmd, ...) {
         return -1;
     }
 }
+
+/* Окружение программы (фаза 68f).
+ *
+ * Ядро переменных окружения программам не передаёт вовсе, и `getenv("HOME")`
+ * был пуст всегда. Чужой код ищет через него, куда класть настройки:
+ * `SDL_GetPrefPath` отвечал отказом, и SDL Sopwith не мог сохранить ни
+ * настроек, ни рекордов. Поэтому стартовый код заводит самое нужное сам:
+ *
+ * - `HOME`, `USER`, `LOGNAME` — из `/etc/system.cfg` (`user=`, `home=`): это
+ *   общедоступная копия того, что лежит в закрытом `/etc/passwd`, ровно для
+ *   программ (см. `config_text` установщика). Только если программа запущена
+ *   от этого человека; у root — `/root`, если такой каталог есть, иначе `/`.
+ * - `PATH` — `/bin`.
+ *
+ * Уже заданное не трогается. */
+static void environ_line(char *line, char *user, size_t user_len, char *home, size_t home_len) {
+    if (strncmp(line, "user=", 5) == 0) {
+        strncpy(user, line + 5, user_len - 1);
+        user[user_len - 1] = '\0';
+    } else if (strncmp(line, "home=", 5) == 0) {
+        strncpy(home, line + 5, home_len - 1);
+        home[home_len - 1] = '\0';
+    }
+}
+
+void freeos_environ_start(void) {
+    char user[64] = "";
+    char home[256] = "";
+    char text[2048];
+    struct stat info;
+
+    setenv("PATH", "/bin", 0);
+    if (getenv("HOME") != NULL) {
+        return;
+    }
+    int fd = open("/etc/system.cfg", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t got = read(fd, text, sizeof(text) - 1);
+        close(fd);
+        if (got > 0) {
+            text[got] = '\0';
+            char *line = text;
+            while (line != NULL && *line != '\0') {
+                char *next = strchr(line, '\n');
+                if (next != NULL) {
+                    *next++ = '\0';
+                }
+                environ_line(line, user, sizeof(user), home, sizeof(home));
+                line = next;
+            }
+        }
+    }
+    if (getuid() != 0 && home[0] != '\0') {
+        setenv("HOME", home, 0);
+        if (user[0] != '\0') {
+            setenv("USER", user, 0);
+            setenv("LOGNAME", user, 0);
+        }
+    } else if (getuid() == 0) {
+        setenv("HOME", stat("/root", &info) == 0 ? "/root" : "/", 0);
+        setenv("USER", "root", 0);
+        setenv("LOGNAME", "root", 0);
+    }
+}

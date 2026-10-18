@@ -108,7 +108,9 @@ struct Autotools {
     configure: &'static [&'static str],
     /// Переменные `make` — и сборке, и установке. Обычно `SUBDIRS=<библиотека>`,
     /// чтобы не собирать тесты и примеры, которым нужно то, чего в системе нет
-    /// (`fork`). `{prefix}` заменяется на sysroot архитектуры.
+    /// (`fork`). `{prefix}` заменяется на sysroot архитектуры, `{triple}` —
+    /// на триплет набора (фаза 68f: `AR={triple}-ar` проекту, чей
+    /// `configure` архиватор не ищет).
     make: &'static [&'static str],
     /// Приставки аргументов, которые sh из Git не должен переписывать как пути
     /// (`MSYS2_ARG_CONV_EXCL`, через `;`). Пусто — переписывать как обычно.
@@ -156,7 +158,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 15] = [
+const PROJECTS: [Project; 16] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -505,6 +507,22 @@ const PROJECTS: [Project; 15] = [
         how: How::Doomgeneric,
         installs: &["bin/doom"],
     },
+    // Вторая игра (фаза 68f) — и первая, которая находит SDL2 обычным путём
+    // порта: своим `configure` через `PKG_CHECK_MODULES(sdl2)` и `sdl2.pc`
+    // набора. SDL Sopwith — биплан 1984 года, данные встроены в программу,
+    // звук — PC-спикер через звук SDL. Таблицы рекордов — у человека, а не в
+    // `/var/games`. GPL-2.0; хеш — `digest` релиза на GitHub.
+    Project {
+        name: "sopwith",
+        version: "2.9.0",
+        url: "https://github.com/fragglet/sdl-sopwith/releases/download/sdl-sopwith-2.9.0/sdl-sopwith-2.9.0.tar.gz",
+        sha256: "93550d0cfddbdf19ef05c54e0b455999ba63da87f66d0cc371c89612ac04a0bb",
+        unpacked: "sdl-sopwith-2.9.0",
+        // Архиватор его `configure` не ищет (нет `AM_PROG_AR`), и `Makefile`
+        // зовёт голый `ar` — при кросс-сборке его передают переменной.
+        how: Autotools::plain(&["--with-hiscores-path="], &["AR={triple}-ar"]),
+        installs: &["bin/sopwith"],
+    },
     // Данные для неё — Freedoom: Phase 1, свободная замена Doom (BSD). Хеш —
     // из подписанного `freedoom-0.13.0-CHECKSUM` рядом с архивом.
     Project {
@@ -693,7 +711,11 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
             // в рецепты libtool без кавычек, и «C:/Program Files/…» ломает
             // первую же команду (так было и с Mono, фаза 58b).
             let shell = format!("SHELL={}", make_shell()?);
-            let vars: Vec<String> = own.make.iter().map(|var| var.replace("{prefix}", &prefix)).collect();
+            let vars: Vec<String> = own
+                .make
+                .iter()
+                .map(|var| var.replace("{prefix}", &prefix).replace("{triple}", triple))
+                .collect();
             let mut build: Vec<&str> = vec!["-j6", &shell];
             build.extend(vars.iter().map(String::as_str));
             let mut install: Vec<&str> = vec!["install", &shell];

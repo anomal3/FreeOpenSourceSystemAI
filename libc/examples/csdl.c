@@ -104,6 +104,13 @@ int main(int argc, char **argv) {
     printf("csdl: SDL %d.%d.%d, video %s, audio %s\n", linked.major, linked.minor, linked.patch,
            SDL_GetCurrentVideoDriver(), SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "none");
 
+    /* Каталог настроек (фаза 68f): `HOME` заводит libc, путь — SDL. */
+    char *pref = SDL_GetPrefPath("freeos", "csdl");
+    printf("csdl: HOME %s, pref path %s%s%s\n", getenv("HOME") ? getenv("HOME") : "(unset)",
+           pref ? pref : "(none)", pref ? "" : " - ", pref ? "" : SDL_GetError());
+    check(pref != NULL && strncmp(pref, "/home/", 6) == 0, "SDL finds a settings directory under HOME");
+    SDL_free(pref);
+
     SDL_Window *window = SDL_CreateWindow("SDL Demo", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, W, H, 0);
     SDL_Renderer *renderer = window ? SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE) : NULL;
     if (!renderer) {
@@ -188,7 +195,11 @@ int main(int argc, char **argv) {
             printf("csdl: wheel %d,%d\n", event.wheel.x, event.wheel.y);
             break;
         case SDL_KEYDOWN:
-            printf("csdl: key %s\n", SDL_GetScancodeName(event.key.keysym.scancode));
+            printf("csdl: key %s%s\n", SDL_GetScancodeName(event.key.keysym.scancode),
+                   event.key.repeat ? " (repeat)" : "");
+            break;
+        case SDL_KEYUP:
+            printf("csdl: keyup %s\n", SDL_GetScancodeName(event.key.keysym.scancode));
             break;
         case SDL_QUIT:
             printf("csdl: quit\n");
