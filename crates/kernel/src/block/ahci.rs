@@ -418,6 +418,7 @@ unsafe fn attach(device: &Device, disks: &mut Vec<AhciDisk>) -> Result<(), AhciE
         // SAFETY: контракт функции.
         match unsafe { AhciDisk::start(port, index, irq) } {
             Ok(disk) => {
+                STARTED_PORTS.fetch_or(1 << index, core::sync::atomic::Ordering::Relaxed);
                 kprintln!(
                     "  ahci        : port {index}: {} sectors of {} B ({} MiB)",
                     disk.sectors,
@@ -445,7 +446,13 @@ unsafe fn attach(device: &Device, disks: &mut Vec<AhciDisk>) -> Result<(), AhciE
 /// `base` должен указывать на отображённое окно регистров контроллера.
 unsafe fn enable_interrupts(device: &Device, base: VirtAddr) -> Option<u32> {
     let Some(msi) = device.msi() else {
-        kprintln!("  ahci        : no MSI capability; completions will be spun on");
+        // Линия — сейчас, если контроллер прерываний уже заведён, иначе позже
+        // (`late_interrupts`): на x86-64 I/O APIC заводится после дисков.
+        // SAFETY: контракт функции.
+        if let Some(source) = unsafe { enable_intx(device, base, false) } {
+            return Some(source);
+        }
+        *PENDING_INTX.lock() = Some((*device, base.as_usize()));
         return None;
     };
     let Some((address, data)) = crate::arch::interrupts::alloc_msi(on_interrupt) else {
@@ -471,6 +478,76 @@ unsafe fn enable_interrupts(device: &Device, base: VirtAddr) -> Option<u32> {
     kprintln!(
         "  ahci        : MSI -> {address:#018x} data {data:#x}, completions arrive by interrupt"
     );
+    Some(IRQ_SOURCE)
+}
+
+/// Контроллер без MSI, которому линия не досталась при подъёме: устройство и
+/// окно регистров. Берётся [`late_interrupts`].
+static PENDING_INTX: crate::sync::SpinLock<Option<(Device, usize)>> = crate::sync::SpinLock::new(None);
+
+/// Порты, поднятые `probe`, — им `late_interrupts` разрешает события.
+static STARTED_PORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Прерывания включены поздно, по линии `INTx`: ждущий читает это в момент
+/// ожидания, а не из настройки диска при подъёме.
+static LATE_INTX: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Дать линию контроллеру без MSI, если при подъёме дисков контроллер
+/// прерываний ещё не был заведён (фаза 68i). Зовётся после него.
+pub fn late_interrupts() {
+    let Some((device, base)) = PENDING_INTX.lock().take() else {
+        return;
+    };
+    let base = VirtAddr::new(base);
+    // SAFETY: окно отображено при подъёме и живёт всё время работы ядра.
+    if unsafe { enable_intx(&device, base, true) }.is_none() {
+        return;
+    }
+    let ports = STARTED_PORTS.load(core::sync::atomic::Ordering::Relaxed);
+    for index in 0..MAX_PORTS {
+        if ports & (1 << index) == 0 {
+            continue;
+        }
+        let port = VirtAddr::new(base.as_usize() + PORT_BASE + index * PORT_STRIDE);
+        // SAFETY: см. выше; порт поднят `probe`.
+        unsafe {
+            write32(port, PX_IS, u32::MAX);
+            write32(port, PX_IE, PORT_INTERRUPTS);
+        }
+    }
+    LATE_INTX.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Линия `INTx` для контроллера без MSI (фаза 68i) — как у e1000.
+///
+/// У AHCI VirtualBox (`8086:2829`) MSI нет вовсе, и до этой фазы диск там
+/// ждал завершения холостым циклом. Линия теперь известна и там (`_PRT`-метод
+/// и «чёрный ход» PIIX3 в `irq::routing`). Обработчик снимает признаки у
+/// портов и у контроллера — для уровневой линии это условие работы, — а на
+/// общей линии, если `HBA_IS` пуст, ничего не трогает.
+///
+/// # Safety
+///
+/// См. [`enable_interrupts`].
+unsafe fn enable_intx(device: &Device, base: VirtAddr, last_try: bool) -> Option<u32> {
+    // Окно и снятые признаки — до разрешения линии: прерывание может прийти
+    // сразу, и обработчик без окна не снял бы уровень.
+    CONTROLLER.store(base.as_usize(), core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: контракт функции.
+    unsafe { write32(base, HBA_IS, u32::MAX) };
+    let Some(gsi) = crate::irq::routing::request(device, on_interrupt) else {
+        CONTROLLER.store(0, core::sync::atomic::Ordering::Relaxed);
+        if last_try {
+            kprintln!("  ahci        : no MSI and no interrupt line known; completions will be spun on");
+        }
+        return None;
+    };
+    // SAFETY: контракт функции; обработчик линии стоит.
+    unsafe {
+        let ghc = read32(base, HBA_GHC);
+        write32(base, HBA_GHC, ghc | GHC_IE);
+    }
+    kprintln!("  ahci        : no MSI; INTx on GSI {gsi}, completions arrive by interrupt");
     Some(IRQ_SOURCE)
 }
 
@@ -720,7 +797,10 @@ impl AhciDisk {
     /// Окно порта должно быть отображено.
     unsafe fn wait_for_completion(&self) -> Result<(), AhciError> {
         let deadline = time::uptime_ms() + COMMAND_TIMEOUT_MS;
-        let sleep = self.irq.filter(|_| crate::sched::is_running());
+        let irq = self
+            .irq
+            .or_else(|| LATE_INTX.load(core::sync::atomic::Ordering::Acquire).then_some(IRQ_SOURCE));
+        let sleep = irq.filter(|_| crate::sched::is_running());
         loop {
             // SAFETY: контракт функции.
             let (ci, is, tfd) = unsafe {
