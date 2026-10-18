@@ -449,6 +449,8 @@ pub struct Controller {
     /// Устройство на шине: нужно после инициализации, чтобы настроить MSI-X —
     /// его таблица включается через конфигурационное пространство.
     device: pci::Device,
+    /// Место в списке контроллеров и в таблице [`ACK`].
+    index: usize,
     /// Сколько раз задача просыпалась и разбирала кольцо.
     ///
     /// Это и есть цена опроса, выраженная числом: при опросе счётчик растёт сто
@@ -480,14 +482,14 @@ pub struct Controller {
 }
 
 impl Controller {
-    /// Найти контроллер, поднять его и подключить клавиатуру.
+    /// Найти все контроллеры xHCI на шине (фаза 68m: у AMD их обычно два-три,
+    /// у Intel бывает дополнительный на отдельной микросхеме).
     ///
     /// # Safety
     ///
-    /// Ядро должно исполняться на собственных таблицах страниц, прерывания —
-    /// быть разрешены (ожидания опираются на таймер), а память с таблицами ACPI
-    /// — оставаться нетронутой.
-    pub unsafe fn init(rsdp: u64) -> Result<Self, XhciError> {
+    /// Ядро должно исполняться на собственных таблицах страниц, а память с
+    /// таблицами ACPI — оставаться нетронутой.
+    unsafe fn find_all(rsdp: u64) -> Result<Vec<pci::Device>, XhciError> {
         // SAFETY: контракт функции.
         let root = unsafe { pci::Root::discover(rsdp) }.map_err(XhciError::Acpi)?;
         kprintln!("  pci         : {root}");
@@ -500,17 +502,37 @@ impl Controller {
         // SAFETY: контракт функции.
         let census = unsafe { super::survey::take(&root) };
 
+        let mut found = Vec::new();
         // SAFETY: контракт функции.
-        let device = unsafe {
-            pci::find_by_class(&root, pci::CLASS_SERIAL_BUS, pci::SUBCLASS_USB, pci::PROG_IF_XHCI)
+        unsafe {
+            pci::for_each(&root, |device| {
+                if device.class == pci::CLASS_SERIAL_BUS
+                    && device.subclass == pci::SUBCLASS_USB
+                    && device.prog_if == pci::PROG_IF_XHCI
+                {
+                    found.push(*device);
+                }
+                true
+            });
         }
-        .ok_or_else(|| {
-            if census.found > 0 {
+        if found.is_empty() {
+            return Err(if census.found > 0 {
                 XhciError::OtherController
             } else {
                 XhciError::NoController
-            }
-        })?;
+            });
+        }
+        Ok(found)
+    }
+
+    /// Поднять контроллер. `index` — его место в списке контроллеров и в
+    /// таблице подтверждений прерываний.
+    ///
+    /// # Safety
+    ///
+    /// Ядро должно исполняться на собственных таблицах страниц, прерывания —
+    /// быть разрешены (ожидания опираются на таймер).
+    unsafe fn init(device: pci::Device, index: usize) -> Result<Self, XhciError> {
         kprintln!(
             "  xhci        : {} vendor {:#06x} device {:#06x} rev {:#04x}",
             device.address,
@@ -578,6 +600,7 @@ impl Controller {
             event_floods: 0,
             transfer_errors: 0,
             device,
+            index,
             services: 0,
             occupied: 0,
             last_error: None,
@@ -2477,8 +2500,9 @@ impl Controller {
     /// может прийти немедленно после последней записи.
     unsafe fn enable_interrupts(&mut self) {
         let (status, iman) = self.regs.interrupt_registers();
-        ACK_STATUS.store(status, Ordering::Release);
-        ACK_IMAN.store(iman, Ordering::Release);
+        let ack = &ACK[self.index];
+        ack.status.store(status, Ordering::Release);
+        ack.iman.store(iman, Ordering::Release);
 
         // SAFETY: контракт функции.
         let delivery = unsafe {
@@ -2493,7 +2517,7 @@ impl Controller {
         let Some(delivery) = delivery else {
             return;
         };
-        DELIVERY.store(delivery as u8, Ordering::Release);
+        ack.delivery.store(delivery as u8, Ordering::Release);
 
         // Разрешение у контроллера — двумя битами в разных регистрах: у
         // прерывателя и общий. Нужны оба; забытый второй выглядит как
@@ -2672,8 +2696,9 @@ impl Controller {
             events: self.events_seen,
             errors: self.transfer_errors,
             event_floods: self.event_floods,
-            interrupts: INTERRUPTS.load(Ordering::Relaxed),
-            delivery: delivery(),
+            interrupts: ACK[self.index].count.load(Ordering::Relaxed),
+            delivery: self.delivery().name(),
+            controllers: 1,
             services: self.services,
         }
     }
@@ -2725,8 +2750,11 @@ pub struct Summary {
     /// Сколько прерываний пришло от контроллера. Ноль при работающей
     /// клавиатуре означает, что события забирает опрос.
     pub interrupts: u64,
-    /// Каким путём: `MSI-X`, `MSI`, `INTx` или `polled`.
+    /// Каким путём: `MSI-X`, `MSI`, `INTx`, `polled`; у нескольких
+    /// контроллеров с разными путями — `mixed`.
     pub delivery: &'static str,
+    /// Сколько контроллеров xHCI поднято (фаза 68m).
+    pub controllers: usize,
     /// Сколько раз задача просыпалась разбирать кольцо.
     pub services: u64,
 }
@@ -2834,14 +2862,22 @@ unsafe fn map_bar(bar: PhysAddr) -> Result<usize, MapError> {
     Ok(virt.as_usize() + (bar.as_u64() - page.as_u64()) as usize)
 }
 
-/// Единственный контроллер, которым ядро распоряжается.
+/// Контроллеры, которыми ядро распоряжается (фаза 68m: все, а не первый).
 ///
 /// Глобальное состояние здесь неизбежно: опрос делает задача, а поднимает
-/// контроллер код запуска, и передать владение между ними нечем — задачи
+/// контроллеры код запуска, и передать владение между ними нечем — задачи
 /// принимают только `fn()`.
-static CONTROLLER: crate::sync::SpinLock<Option<Controller>> = crate::sync::SpinLock::new(None);
+static CONTROLLERS: crate::sync::SpinLock<Vec<Controller>> = crate::sync::SpinLock::new(Vec::new());
 
-/// Поднять контроллер и клавиатуру. Возвращает `true`, если клавиатура работает.
+/// Сколько контроллеров ядро готово поднять.
+const CONTROLLERS_MAX: usize = 4;
+
+/// Адреса поднятых контроллеров на шине — для переписи устройств. Отдельно от
+/// [`CONTROLLERS`], которые на время перечисления портов вынимаются целиком.
+static DRIVEN: crate::sync::SpinLock<Vec<pci::Address>> = crate::sync::SpinLock::new(Vec::new());
+
+/// Поднять контроллеры и устройства на них. Возвращает `true`, если нашлись
+/// клавиатура или указатель.
 ///
 /// Печатает всё, что узнала по дороге: без этого отладка драйвера, половина
 /// шагов которого не даёт признаков отказа, невозможна.
@@ -2854,20 +2890,50 @@ static CONTROLLER: crate::sync::SpinLock<Option<Controller>> = crate::sync::Spin
 /// превратится в почти вечное.
 pub unsafe fn init(rsdp: u64) -> bool {
     // SAFETY: контракт функции.
-    let mut controller = match unsafe { Controller::init(rsdp) } {
-        Ok(controller) => controller,
+    let found = match unsafe { Controller::find_all(rsdp) } {
+        Ok(found) => found,
         Err(err) => {
             kprintln!("  xhci        : unavailable: {err}");
             return false;
         }
     };
+    if found.len() > CONTROLLERS_MAX {
+        kprintln!(
+            "  xhci        : {} controllers; only the first {CONTROLLERS_MAX} are brought up",
+            found.len()
+        );
+    }
 
-    // SAFETY: контроллер работает.
-    //
-    // Контроллер остаётся поднятым, даже если ничего не нашлось, и это не
-    // упрямство: он продолжает складывать в кольцо события об изменении портов,
-    // то есть остаётся способом узнать о подключении устройства позже.
-    let (keyboard, mouse) = unsafe { controller.attach_devices() };
+    let mut controllers = Vec::new();
+    let (mut keyboard, mut mouse) = (false, false);
+    for device in found.into_iter().take(CONTROLLERS_MAX) {
+        // Отказ одного контроллера не отменяет остальные: клавиатура может
+        // висеть как раз на следующем.
+        // SAFETY: контракт функции.
+        let mut controller = match unsafe { Controller::init(device, controllers.len()) } {
+            Ok(controller) => controller,
+            Err(err) => {
+                kprintln!("  xhci        : {}: unavailable: {err}", device.address);
+                continue;
+            }
+        };
+        // SAFETY: контроллер работает.
+        //
+        // Контроллер остаётся поднятым, даже если ничего не нашлось, и это не
+        // упрямство: он продолжает складывать в кольцо события об изменении
+        // портов, то есть остаётся способом узнать о подключении устройства
+        // позже.
+        let (k, m) = unsafe { controller.attach_devices() };
+        keyboard |= k;
+        mouse |= m;
+        controllers.push(controller);
+    }
+    if controllers.is_empty() {
+        return false;
+    }
+    if controllers.len() > 1 {
+        kprintln!("  xhci        : {} controllers brought up", controllers.len());
+    }
     if !keyboard && !mouse {
         kprintln!("  usb         : no boot-protocol device on any root port");
     }
@@ -2878,8 +2944,15 @@ pub unsafe fn init(rsdp: u64) -> bool {
         mouse: sources.mouse || mouse,
         ..sources
     });
-    *CONTROLLER.lock() = Some(controller);
+    *DRIVEN.lock() = controllers.iter().map(|c| c.device.address).collect();
+    *CONTROLLERS.lock() = controllers;
     keyboard || mouse
+}
+
+/// Ведёт ли драйвер контроллер с этим адресом — для переписи устройств.
+#[must_use]
+pub fn drives(address: pci::Address) -> bool {
+    DRIVEN.lock().contains(&address)
 }
 
 /// Ярлык источника прерывания для планировщика.
@@ -2892,24 +2965,37 @@ const IRQ_SOURCE: u32 = crate::irq::source::XHCI;
 /// Пришло ли прерывание с тех пор, как задача в последний раз разбирала кольцо.
 ///
 /// Признак нужен именно как признак, а не как счётчик: задача разбирает **все**
-/// накопившиеся события за один проход, и три прерывания подряд означают ровно
-/// то же, что одно, — «сходи посмотри».
+/// накопившиеся события всех контроллеров за один проход, и три прерывания
+/// подряд означают ровно то же, что одно, — «сходи посмотри».
 static EVENT_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// Адрес `USBSTS` — для подтверждения из обработчика без лока; ноль — пока
-/// прерывания не настраивались.
-static ACK_STATUS: AtomicUsize = AtomicUsize::new(0);
+/// Что обработчику прерывания нужно знать о контроллере, не беря его лок.
+struct Ack {
+    /// Адрес `USBSTS`; ноль — прерывания не настраивались.
+    status: AtomicUsize,
+    /// Адрес `IMAN` прерывателя 0.
+    iman: AtomicUsize,
+    /// Каким путём приходят прерывания: [`Delivery`] числом.
+    delivery: AtomicU8,
+    /// Сколько прерываний пришло. Единственное, чем «работает по
+    /// прерываниям» отличается от «работает по опросу» на взгляд снаружи, —
+    /// поэтому счётчик и печатается.
+    count: AtomicU64,
+}
 
-/// Адрес `IMAN` прерывателя 0, см. [`ACK_STATUS`].
-static ACK_IMAN: AtomicUsize = AtomicUsize::new(0);
+impl Ack {
+    const fn new() -> Self {
+        Self {
+            status: AtomicUsize::new(0),
+            iman: AtomicUsize::new(0),
+            delivery: AtomicU8::new(Delivery::Polled as u8),
+            count: AtomicU64::new(0),
+        }
+    }
+}
 
-/// Сколько прерываний пришло. Единственное, чем «работает по прерываниям»
-/// отличается от «работает по опросу» на взгляд снаружи, — поэтому счётчик и
-/// печатается.
-static INTERRUPTS: AtomicU64 = AtomicU64::new(0);
-
-/// Каким путём приходят прерывания: [`Delivery`] числом.
-static DELIVERY: AtomicU8 = AtomicU8::new(Delivery::Polled as u8);
+/// По записи на контроллер, в порядке списка.
+static ACK: [Ack; CONTROLLERS_MAX] = [Ack::new(), Ack::new(), Ack::new(), Ack::new()];
 
 /// Путь прерываний от контроллера.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2924,6 +3010,15 @@ enum Delivery {
 }
 
 impl Delivery {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::MsiX,
+            2 => Self::Msi,
+            3 => Self::Intx,
+            _ => Self::Polled,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::Polled => "polled",
@@ -2934,15 +3029,53 @@ impl Delivery {
     }
 }
 
-/// Путь прерываний словом — для сводки.
-fn delivery() -> &'static str {
-    match DELIVERY.load(Ordering::Acquire) {
-        1 => Delivery::MsiX,
-        2 => Delivery::Msi,
-        3 => Delivery::Intx,
-        _ => Delivery::Polled,
+impl Controller {
+    fn delivery(&self) -> Delivery {
+        Delivery::from_u8(ACK[self.index].delivery.load(Ordering::Acquire))
     }
-    .name()
+}
+
+impl Summary {
+    /// Сложить сводки двух контроллеров.
+    fn merge(mut self, other: Self) -> Self {
+        let mut free = self.attached.iter_mut().filter(|entry| entry.port == 0);
+        for entry in other.attached.iter().filter(|entry| entry.port != 0) {
+            match free.next() {
+                Some(slot) => *slot = *entry,
+                None => break,
+            }
+        }
+        if self.devices == 0 {
+            self.slot = other.slot;
+            self.port = other.port;
+        }
+        if other.last_error.is_some() {
+            self.last_error = other.last_error;
+        }
+        if self.delivery != other.delivery {
+            self.delivery = "mixed";
+        }
+        self.devices += other.devices;
+        self.hubs += other.hubs;
+        self.keyboards += other.keyboards;
+        self.mice += other.mice;
+        self.occupied += other.occupied;
+        self.reports += other.reports;
+        self.events += other.events;
+        self.errors += other.errors;
+        self.event_floods += other.event_floods;
+        self.interrupts += other.interrupts;
+        self.services += other.services;
+        self.controllers += other.controllers;
+        self
+    }
+}
+
+/// Сводка по всем контроллерам списка.
+fn total(list: &[Controller]) -> Option<Summary> {
+    let mut iter = list.iter();
+    let first = iter.next()?.summary();
+    Some(iter.fold(first, |acc, controller| acc.merge(controller.summary())))
 }
 
 /// Забрать контроллер у прошивки (USB Legacy Support, xHCI 1.1, 7.1).
@@ -2996,24 +3129,33 @@ unsafe fn take_from_firmware(regs: &Registers) {
     }
 }
 
-/// Обработчик прерывания контроллера.
+/// Обработчик прерывания контроллеров.
 ///
 /// Делает три вещи и ни одной лишней: подтверждает прерывание у контроллера,
 /// поднимает признак и будит задачу. Разбор колец остаётся задаче, потому что
 /// он занимает сотни микросекунд, а всё это время прерывания были бы запрещены
 /// — то есть ровно та болезнь, от которой прерывания и лечат.
 ///
-/// Подтверждение идёт по адресам [`ACK_STATUS`] и [`ACK_IMAN`], а не через
-/// лок контроллера (фаза 68k): [`poll_hotplug`] держит контроллер «в руках»
-/// сотни миллисекунд, и на уровневой линии `INTx` не снятый признак означал
-/// бы прерывание, повторяющееся без конца всё это время. Оба бита
-/// сбрасываются записью единицы, и оба обязательны: `EINT` в общем состоянии и
-/// `IP` у прерывателя — пока `IP` стоит, следующего прерывания не будет, а
-/// линия не опустится.
+/// Обработчик один на все контроллеры (фаза 68m): `fn()` не несёт, от кого
+/// прерывание, поэтому подтверждаются все, у кого оно есть. У MSI и MSI-X
+/// признак `IP` контроллер снимает сам, когда сообщение ушло, — там
+/// подтверждается без проверки; общую линию `INTx` без признаков не трогаем.
+///
+/// Подтверждение идёт по адресам из [`ACK`], а не через лок контроллера (фаза
+/// 68k): [`poll_hotplug`] держит контроллеры «в руках» сотни миллисекунд, и на
+/// уровневой линии не снятый признак означал бы прерывание, повторяющееся без
+/// конца всё это время. Оба бита сбрасываются записью единицы, и оба
+/// обязательны: `EINT` в общем состоянии и `IP` у прерывателя — пока `IP`
+/// стоит, следующего прерывания не будет, а линия не опустится.
 pub fn on_interrupt() {
-    let status = ACK_STATUS.load(Ordering::Acquire);
-    let iman = ACK_IMAN.load(Ordering::Acquire);
-    if status != 0 && iman != 0 {
+    let mut ours = false;
+    for ack in &ACK {
+        let status = ack.status.load(Ordering::Acquire);
+        let iman = ack.iman.load(Ordering::Acquire);
+        let delivery = Delivery::from_u8(ack.delivery.load(Ordering::Acquire));
+        if status == 0 || iman == 0 || delivery == Delivery::Polled {
+            continue;
+        }
         // SAFETY: адреса положены `enable_interrupts` из отображённого окна
         // регистров, которое живёт всё время работы ядра.
         unsafe {
@@ -3021,13 +3163,8 @@ pub fn on_interrupt() {
                 & regs::USBSTS_EVENT_INTERRUPT;
             let raised = core::ptr::read_volatile(iman as *const u32)
                 & regs::IMAN_INTERRUPT_PENDING;
-            // Линия может быть общей: чужое прерывание не трогает ни
-            // контроллер, ни задачу. MSI и MSI-X приходят только от нас.
-            if pending == 0
-                && raised == 0
-                && DELIVERY.load(Ordering::Relaxed) == Delivery::Intx as u8
-            {
-                return;
+            if pending == 0 && raised == 0 && delivery == Delivery::Intx {
+                continue;
             }
             core::ptr::write_volatile(status as *mut u32, regs::USBSTS_EVENT_INTERRUPT);
             core::ptr::write_volatile(
@@ -3035,69 +3172,82 @@ pub fn on_interrupt() {
                 regs::IMAN_INTERRUPT_ENABLE | regs::IMAN_INTERRUPT_PENDING,
             );
         }
+        ack.count.fetch_add(1, Ordering::Relaxed);
+        ours = true;
     }
-    INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+    if !ours {
+        return;
+    }
     EVENT_PENDING.store(true, Ordering::Release);
     crate::sched::wake_irq(IRQ_SOURCE);
 }
 
-/// Разобрать накопившиеся события контроллера.
+/// Разобрать накопившиеся события контроллеров.
 ///
 /// Вызывается задачей — из обработчика прерывания её звать нельзя, см.
 /// [`on_interrupt`].
 pub fn service() {
-    if let Some(controller) = CONTROLLER.lock().as_mut() {
+    for controller in CONTROLLERS.lock().iter_mut() {
         controller.service();
     }
 }
 
-/// Появилось ли на портах что-то новое (или исчезло старое).
-fn ports_changed(compare_mask: bool) -> bool {
-    match CONTROLLER.lock().as_mut() {
+/// У каких контроллеров на портах что-то новое (или исчезло старое): по биту
+/// на контроллер.
+fn ports_changed(compare_mask: bool) -> u32 {
+    let mut changed = 0;
+    for (index, controller) in CONTROLLERS.lock().iter_mut().enumerate() {
+        // Все контроллеры, без короткого замыкания: сверка обновляет маску.
         // SAFETY: контроллер существует, значит окно его регистров отображено.
-        Some(controller) => unsafe { controller.ports_differ(compare_mask) },
-        None => false,
+        if unsafe { controller.ports_differ(compare_mask) } {
+            changed |= 1 << index;
+        }
     }
+    changed
 }
 
-/// Перечислить порты заново — то, что делает «воткнули на ходу» работающим.
+/// Перечислить порты заново у контроллеров из маски — то, что делает
+/// «воткнули на ходу» работающим.
 ///
-/// # Почему контроллер забирается из глобала целиком
+/// # Почему контроллеры забираются из глобала целиком
 ///
 /// Потому что перечисление длится сотни миллисекунд, а [`crate::sync::SpinLock`]
 /// держится с запрещёнными прерываниями: провести под ним сброс порта значило бы
 /// остановить на это время часы и планировщик — то есть те самые часы, по
 /// которым перечисление отсчитывает свои ожидания.
 ///
-/// Пока контроллер «в руках», обработчик прерывания и опрос видят пустое место и
-/// ничего не делают. Потерять этим нечего: события копятся в кольце, а разберёт
-/// их первый же вызов [`service`] после возврата.
-pub fn poll_hotplug() {
-    let taken = CONTROLLER.lock().take();
-    let Some(mut controller) = taken else {
-        return;
-    };
-    // SAFETY: контроллер работает, вызов идёт из задачи.
-    let changed = unsafe { controller.rescan() };
-    if changed {
-        let summary = controller.summary();
-        kprintln!(
-            "  usb         : now {} device(s), {} keyboard(s), {} pointer(s)",
-            summary.devices,
-            summary.keyboards,
-            summary.mice
-        );
+/// Пока контроллеры «в руках», опрос видит пустой список и ничего не делает.
+/// Потерять этим нечего: события копятся в кольцах, а разберёт их первый же
+/// вызов [`service`] после возврата.
+fn poll_hotplug(mask: u32) {
+    let mut taken = core::mem::take(&mut *CONTROLLERS.lock());
+    let mut changed = false;
+    for (index, controller) in taken.iter_mut().enumerate() {
+        if mask & (1 << index) != 0 {
+            // SAFETY: контроллер работает, вызов идёт из задачи.
+            changed |= unsafe { controller.rescan() };
+        }
     }
-    *CONTROLLER.lock() = Some(controller);
+    if changed {
+        if let Some(summary) = total(&taken) {
+            kprintln!(
+                "  usb         : now {} device(s), {} keyboard(s), {} pointer(s)",
+                summary.devices,
+                summary.keyboards,
+                summary.mice
+            );
+        }
+    }
+    *CONTROLLERS.lock() = taken;
 }
 
-/// Поднялся ли контроллер.
+/// Поднялся ли хоть один контроллер.
 ///
 /// Нужно тому, кто решает, заводить ли задачу опроса: на машине без xHCI она
 /// просыпалась бы десять раз в секунду ради вызова, которому нечего делать.
 #[must_use]
 pub fn is_present() -> bool {
-    CONTROLLER.lock().is_some()
+    !DRIVEN.lock().is_empty()
 }
 
 /// Как часто опрашивать контроллер, когда прерывания недоступны.
@@ -3113,9 +3263,10 @@ const POLL_PERIOD_MS: u64 = 10;
 /// страховка на случай, когда событие от контроллера не пришло.
 const PORT_CHECK_PERIOD_MS: u64 = 500;
 
-/// Настроены ли прерывания. Решает, ждать задаче события или часов.
+/// Настроены ли прерывания у **всех** контроллеров. Решает, ждать задаче
+/// события или часов: один контроллер на опросе — и опрашиваются все.
 fn interrupts_enabled() -> bool {
-    DELIVERY.load(Ordering::Acquire) != Delivery::Polled as u8
+    CONTROLLERS.lock().iter().all(|c| c.delivery() != Delivery::Polled)
 }
 
 /// Тело задачи, обслуживающей контроллер.
@@ -3156,8 +3307,9 @@ pub fn service_task() {
         if compare_mask {
             next_port_check = now.saturating_add(PORT_CHECK_PERIOD_MS);
         }
-        if ports_changed(compare_mask) {
-            poll_hotplug();
+        let changed = ports_changed(compare_mask);
+        if changed != 0 {
+            poll_hotplug(changed);
         }
 
         if by_interrupt {
@@ -3179,8 +3331,8 @@ pub fn service_task() {
     }
 }
 
-/// Сводка для диагностики.
+/// Сводка для диагностики — по всем контроллерам.
 #[must_use]
 pub fn summary() -> Option<Summary> {
-    CONTROLLER.lock().as_ref().map(Controller::summary)
+    total(&CONTROLLERS.lock())
 }

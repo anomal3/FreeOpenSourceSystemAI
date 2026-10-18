@@ -1516,11 +1516,12 @@ fn usb_status() {
     match usb::xhci::summary() {
         Some(usb) => {
             sprintln!(
-                "  xhci     {} devices, {} hub(s), first slot {} on port {}",
+                "  xhci     {} devices, {} hub(s), first slot {} on port {}, {} controller(s)",
                 usb.devices,
                 usb.hubs,
                 usb.slot,
-                usb.port
+                usb.port,
+                usb.controllers
             );
             sprintln!("  reports  {} parsed", usb.reports);
             sprintln!("  events   {} seen, {} transfer errors", usb.events, usb.errors);

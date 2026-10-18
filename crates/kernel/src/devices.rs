@@ -156,9 +156,10 @@ fn driver_for(device: &pci::Device) -> (&'static str, &'static str) {
     };
     match known {
         // Драйверы USB отметок не ставят: у них своя сводка, и она же отвечает,
-        // работает ли контроллер. Контроллер у машины один — на двух оба
-        // окажутся «active», и это названный предел, а не догадка.
-        Some("xhci") if crate::usb::xhci::summary().is_some() => ("xhci", "active"),
+        // работает ли контроллер. xHCI знает свои контроллеры поимённо (фаза
+        // 68m); у OHCI и EHCI на машине с двумя оба окажутся «active», и это
+        // названный предел, а не догадка.
+        Some("xhci") if crate::usb::xhci::drives(device.address) => ("xhci", "active"),
         Some("ohci") if crate::usb::ohci::summary().is_some() => ("ohci", "active"),
         Some("ehci") if crate::usb::ehci::summary().is_some() => ("ehci", "active"),
         Some(driver) => (driver, "idle"),
