@@ -237,3 +237,35 @@ fn an_entry_whose_link_is_missing_is_skipped_not_guessed() {
 
 extern crate alloc;
 extern crate std;
+
+/// DSDT VirtualBox 7.2 целиком (фаза 68i) — снята `acpidump DSDT` с машины
+/// `FreeOS-bench` (PIIX3, UEFI). `_PRT` у неё — метод: `PR00` в режиме PIC,
+/// `PR01` в режиме APIC, и `PRTA` нет. До этой фазы разбор отвечал «нет
+/// таблицы», и у всех устройств линия была неизвестна.
+const VIRTUALBOX_DSDT: &[u8] = include_bytes!("../testdata/virtualbox-7.2-dsdt.bin");
+
+#[test]
+fn virtualbox_prt_method_picks_the_apic_table() {
+    let mut out = [Route { device: 0, pin: 0, gsi: 0, level: false, active_low: false }; 128];
+    let (written, dropped) = routing(VIRTUALBOX_DSDT, &mut out).expect("таблица APIC найдена");
+    assert_eq!((written, dropped), (120, 0));
+    let find = |device: u8, pin: u8| out[..written].iter().find(|r| r.device == device && r.pin == pin).copied();
+    // Линии названы числом прямо в таблице: уровень, активный низкий.
+    let e1000 = find(3, 0).expect("e1000, INTA");
+    assert_eq!((e1000.gsi, e1000.level, e1000.active_low), (19, true, true));
+    assert_eq!(find(2, 0).map(|r| r.gsi), Some(18)); // VMSVGA
+    assert_eq!(find(5, 0).map(|r| r.gsi), Some(21)); // HDA
+    assert_eq!(find(6, 0).map(|r| r.gsi), Some(22)); // OHCI
+    assert_eq!(find(13, 0).map(|r| r.gsi), Some(21)); // AHCI
+    assert_eq!(find(5, 3).map(|r| r.gsi), Some(16));
+    // Таблица PIC (`PR00`) не выбрана: в ней одни связки, и линий выше 15 нет.
+    assert!(out[..written].iter().all(|r| (16..=23).contains(&r.gsi)));
+}
+
+#[test]
+fn a_cut_virtualbox_table_is_an_error_not_a_panic() {
+    let mut out = [Route { device: 0, pin: 0, gsi: 0, level: false, active_low: false }; 8];
+    for cut in [40, 1000, 3200, 4760, 4900] {
+        let _ = routing(&VIRTUALBOX_DSDT[..cut], &mut out);
+    }
+}

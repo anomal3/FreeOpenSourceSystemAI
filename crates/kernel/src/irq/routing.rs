@@ -130,11 +130,52 @@ pub fn init() {
             let lines = summarise(&routes[..len]);
             kprintln!("  routing     : {len} PCI route(s) from _PRT, {lines}");
             *TABLE.lock() = Some(Table { routes, len });
+            virtualbox_apic_door(rsdp, dsdt);
         }
         Err(err) => {
             kprintln!("  routing     : cannot read _PRT ({err}); PCI interrupt lines are unknown");
         }
     }
+}
+
+/// Открыть «чёрный ход» VirtualBox к I/O APIC (фаза 68i).
+///
+/// У VirtualBox с мостом PIIX3 прерывания PCI идут в I/O APIC, а не через
+/// PIC, только если в конфигурационном пространстве моста ISA (`8086:7000`,
+/// устройство 1) в байтах `0xDE` и `0xAD` записаны `0xBE` и `0xEF` — так
+/// написано в его `DevPCI.cpp` (`pciSetIrqInternal`). Записывает их сам метод
+/// `_PRT` из DSDT, в ветке режима APIC (`Store(…, SBRG.APDE)`, `APAD`), то есть
+/// система, которая метод **исполняет**. Мы его читаем (`aml`), таблицу `PR01`
+/// разбираем верно — и без этих двух байт ни одно `INTx` не доходило до
+/// входов 16–23: e1000 и OHCI работали опросом.
+///
+/// Повторяется ровно побочный эффект метода, и только там, где он есть:
+/// таблица от VirtualBox (OEM `VBOX`) и его мост PIIX3. Как `PRTA` у QEMU,
+/// это соглашение одной прошивки, и оно названо здесь поимённо.
+fn virtualbox_apic_door(rsdp: u64, dsdt: &[u8]) {
+    if dsdt.get(10..14) != Some(b"VBOX".as_slice()) {
+        return;
+    }
+    // SAFETY: прямое отображение активно; обход шины только читает.
+    let Ok(root) = (unsafe { crate::pci::Root::discover(rsdp) }) else {
+        return;
+    };
+    // SAFETY: см. выше.
+    let Some(bridge) = (unsafe { crate::pci::find_by_id(&root, 0x8086, &[0x7000]) }) else {
+        return;
+    };
+    // SAFETY: регистры за пределами стандартного заголовка моста ISA
+    // VirtualBox; запись в них — то, что сделал бы его же метод `_PRT`.
+    unsafe {
+        bridge.write_config8(0xDE, 0xBE);
+        bridge.write_config8(0xAD, 0xEF);
+    }
+    let open = bridge.config8(0xDE) == 0xBE && bridge.config8(0xAD) == 0xEF;
+    kprintln!(
+        "  routing     : VirtualBox PIIX3 at {}: PCI interrupts {} to the I/O APIC (the _PRT method's door)",
+        bridge.address,
+        if open { "go" } else { "still do not go" }
+    );
 }
 
 /// Перечислить линии, на которые ведёт таблица, — одной строкой.

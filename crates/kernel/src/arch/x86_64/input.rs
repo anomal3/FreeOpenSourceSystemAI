@@ -127,6 +127,12 @@ pub fn route_gsi(gsi: u32, vector: u8, level: bool, active_low: bool) -> bool {
     unsafe { io_apic.route(gsi, vector, destination, level, active_low) }
 }
 
+/// Сырое содержимое входа I/O APIC для `gsi` — для команды `irq`.
+#[must_use]
+pub fn gsi_entry(gsi: u32) -> Option<(u32, u32)> {
+    IO_APIC.lock().as_ref().and_then(|io_apic| io_apic.entry(gsi))
+}
+
 /// Прочитать MADT и напечатать, что в ней нашлось.
 fn describe_madt(rsdp: u64) -> Option<acpi::Madt> {
     // SAFETY: прямое отображение активно (таблицы ядра включены в

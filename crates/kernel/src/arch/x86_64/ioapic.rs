@@ -195,6 +195,18 @@ impl IoApic {
         gsi >= self.gsi_base && gsi - self.gsi_base < self.entries
     }
 
+    /// Сырое содержимое входа `gsi`: младшее и старшее слова (фаза 68i,
+    /// диагностика команды `irq`). Маска, полярность, `Remote IRR` и признак
+    /// доставки видны только здесь.
+    #[must_use]
+    pub fn entry(&self, gsi: u32) -> Option<(u32, u32)> {
+        if !self.handles(gsi) {
+            return None;
+        }
+        let register = REG_REDIRECTION_BASE + (gsi - self.gsi_base) * 2;
+        Some((self.read(register), self.read(register + 1)))
+    }
+
     /// Замаскировать все входы.
     ///
     /// # Safety

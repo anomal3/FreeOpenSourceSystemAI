@@ -26,8 +26,12 @@
 //! - **Не исполняет методы.** Если прошивка объявила `_PRT` методом, читается не
 //!   он, а таблица, которую он возвращает в режиме APIC. На машинах QEMU это
 //!   `PRTA` — имя не выдумано, а взято из их собственных таблиц (см.
-//!   [`APIC_TABLE`]). Прошивка, придумавшая другое имя, окажется неразобранной,
-//!   и ядро об этом скажет, а не промолчит.
+//!   [`APIC_TABLE`]). У других прошивок имена свои (у VirtualBox — `PR00` для
+//!   PIC и `PR01` для APIC), и тогда (фаза 68i) в теле метода собираются имена
+//!   за `Return`, каждая таблица разбирается, и берётся та, что дала больше
+//!   записей, а при равенстве — с линиями выше: у APIC они от 16. Таблица PIC
+//!   ссылается на связки, чьи `_CRS` — методы или старые дескрипторы `IRQ`, и
+//!   разбирается в ноль записей, так что выбор не случайный.
 //! - **Не строит пространство имён.** Поиск линейный, по потоку байт, и
 //!   опознаётся объявление по своему коду операции (`NameOp`, `DeviceOp`), а не
 //!   по месту в дереве. Одноимённые объекты в разных областях видимости
@@ -73,7 +77,8 @@ pub struct Route {
 /// Что не получилось.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// Ни `PRTA`, ни `_PRT` не объявлены данными.
+    /// Ни `PRTA`, ни `_PRT` не объявлены данными, а метод `_PRT` (если он
+    /// есть) не возвращает ни одной разбираемой таблицы.
     NoTable,
     /// Объявление есть, но за именем не пакет.
     NotAPackage,
@@ -104,19 +109,41 @@ pub fn routing(dsdt: &[u8], out: &mut [Route]) -> Result<(usize, usize), Error> 
     // Сначала — таблица режима APIC: если она есть, то `_PRT` наверняка метод, и
     // разбирать его нечем. Если её нет, `_PRT` объявлен данными, и он сам и
     // нужен.
-    let package = find_name(dsdt, APIC_TABLE)
-        .or_else(|| find_name(dsdt, b"_PRT"))
-        .ok_or(Error::NoTable)?;
+    if let Some(package) = find_name(dsdt, APIC_TABLE).or_else(|| find_name(dsdt, b"_PRT")) {
+        return read_table(dsdt, package, out).map(|(written, dropped, _)| (written, dropped));
+    }
+    // `_PRT` — метод (фаза 68i): из таблиц, которые он возвращает, — та, что
+    // разбирается в больше записей, при равенстве — с линиями выше.
+    let mut best: Option<(usize, usize, u32)> = None;
+    for name in returned_names(dsdt, b"_PRT").iter().flatten() {
+        let Some(package) = find_name(dsdt, name) else {
+            continue;
+        };
+        let Ok((_, total, highest)) = read_table(dsdt, package, &mut []) else {
+            continue;
+        };
+        if total > 0 && best.is_none_or(|(_, best_total, best_high)| (total, highest) > (best_total, best_high)) {
+            best = Some((package, total, highest));
+        }
+    }
+    let (package, _, _) = best.ok_or(Error::NoTable)?;
+    read_table(dsdt, package, out).map(|(written, dropped, _)| (written, dropped))
+}
 
+/// Разобрать таблицу маршрутизации, лежащую с `package`: сколько записей
+/// легло в `out`, сколько не поместилось, и самая высокая линия.
+fn read_table(dsdt: &[u8], package: usize, out: &mut [Route]) -> Result<(usize, usize, u32), Error> {
     let mut cursor = Cursor::new(dsdt, package);
     let mut entries = cursor.package_body()?;
 
     let mut written = 0usize;
     let mut dropped = 0usize;
+    let mut highest = 0u32;
     while let Some(entry) = entries.next_package() {
         let Some(route) = entry_to_route(dsdt, entry) else {
             continue;
         };
+        highest = highest.max(route.gsi);
         if written < out.len() {
             out[written] = route;
             written += 1;
@@ -124,7 +151,58 @@ pub fn routing(dsdt: &[u8], out: &mut [Route]) -> Result<(usize, usize), Error> 
             dropped += 1;
         }
     }
-    Ok((written, dropped))
+    Ok((written, dropped, highest))
+}
+
+/// Имена, которые метод `name` возвращает: `Return (ИМЯ)` в его теле — до
+/// четырёх. Условий не разбираем: какую из таблиц брать, решает
+/// [`routing`] по их содержимому.
+fn returned_names(dsdt: &[u8], name: &[u8; 4]) -> [Option<[u8; 4]>; 4] {
+    let mut names = [None; 4];
+    let Some(body) = find_method(dsdt, name) else {
+        return names;
+    };
+    let mut found = 0usize;
+    let mut at = body.start;
+    while at + 5 <= body.end && found < names.len() {
+        if dsdt[at] == OP_RETURN {
+            let candidate = &dsdt[at + 1..at + 5];
+            let plain = candidate
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_');
+            if plain {
+                let candidate = [candidate[0], candidate[1], candidate[2], candidate[3]];
+                if !names.contains(&Some(candidate)) {
+                    names[found] = Some(candidate);
+                    found += 1;
+                }
+                at += 5;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    names
+}
+
+/// Найти `Method(<имя>, ...)` и вернуть границы его тела (за байтом флагов).
+fn find_method(dsdt: &[u8], name: &[u8; 4]) -> Option<Body> {
+    let mut at = SDT_HEADER;
+    while at + 2 <= dsdt.len() {
+        if dsdt[at] == OP_METHOD {
+            let mut cursor = Cursor::new(dsdt, at + 1);
+            if let Some(len) = cursor.pkg_length() {
+                let after_length = cursor.at;
+                if dsdt.get(after_length..after_length + 4) == Some(&name[..]) {
+                    let end = (at + 1 + len).min(dsdt.len());
+                    // Имя и байт флагов.
+                    return Some(Body { start: after_length + 5, end });
+                }
+            }
+        }
+        at += 1;
+    }
+    None
 }
 
 /// Разобрать одну запись `_PRT`: адрес, вывод, источник, номер в источнике.
@@ -293,6 +371,8 @@ const EXTENDED_INTERRUPT: u8 = 0x89;
 const OP_ZERO: u8 = 0x00;
 const OP_ONE: u8 = 0x01;
 const OP_NAME: u8 = 0x08;
+const OP_METHOD: u8 = 0x14;
+const OP_RETURN: u8 = 0xA4;
 const OP_BYTE: u8 = 0x0A;
 const OP_WORD: u8 = 0x0B;
 const OP_DWORD: u8 = 0x0C;

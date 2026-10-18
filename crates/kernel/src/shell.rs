@@ -839,6 +839,7 @@ fn run_command(line: &str) -> bool {
             }
         }
         "fsck" => fsck(),
+        "acpidump" => acpidump(argument),
         "mounts" => mounts(),
         "slots" => slots(),
         "sysupdate" => sysupdate(argument),
@@ -1365,6 +1366,50 @@ fn last_panic(argument: &str) {
     }
 }
 
+/// Выгрузить таблицу ACPI шестнадцатеричными строками в журнал ядра (фаза
+/// 68i).
+///
+/// Тесты крейта `aml` стоят на байтах, снятых с настоящих машин; снимать их
+/// с машины, где разбор не удался, — первое, что нужно, и до этой команды
+/// снимать было нечем. Строки идут в журнал (и последовательную линию), а не
+/// в окно терминала: таблица — десятки килобайт.
+fn acpidump(argument: &str) {
+    let Ok(signature) = <[u8; 4]>::try_from(argument.as_bytes()) else {
+        sprintln!("  usage: acpidump SIG   (four letters: DSDT, FACP, APIC, MCFG...)");
+        return;
+    };
+    let rsdp = crate::acpi::rsdp();
+    if rsdp == 0 {
+        sprintln!("  acpidump: no ACPI tables on this machine");
+        return;
+    }
+    // SAFETY: адрес RSDP запомнен из хэндоффа, прямое отображение активно;
+    // поиск только читает таблицы.
+    // DSDT в корневой таблице нет — на неё ссылается FADT.
+    let found = if &signature == b"DSDT" {
+        unsafe { crate::acpi::dsdt(rsdp) }
+    } else {
+        unsafe { crate::acpi::find_table(rsdp, &signature) }
+    };
+    let table = match found {
+        Ok(table) => table,
+        Err(err) => {
+            sprintln!("  acpidump: {argument}: {err:?}");
+            return;
+        }
+    };
+    crate::kprintln!("acpidump {argument} {} bytes", table.len());
+    for (index, chunk) in table.chunks(32).enumerate() {
+        let mut line = alloc::string::String::with_capacity(80);
+        for byte in chunk {
+            line.push_str(&alloc::format!("{byte:02x}"));
+        }
+        crate::kprintln!("acpidump {:06x} {line}", index * 32);
+    }
+    crate::kprintln!("acpidump {argument} end");
+    sprintln!("  acpidump: {} bytes of {argument} went to the kernel log", table.len());
+}
+
 fn help() {
     sprintln!("  help          this list");
     sprintln!("  uptime        time since the timer started");
@@ -1376,6 +1421,7 @@ fn help() {
     sprintln!("  lastpanic [n] the last n lines of the log of a boot that panicked");
     sprintln!("  panic now     stop this machine with a kernel panic (to test the snapshot)");
     sprintln!("  pci           every device on the bus, with its identifiers");
+    sprintln!("  acpidump SIG  an ACPI table (DSDT, FACP, APIC...) in hex to the kernel log");
     sprintln!("  ui [reset]    compositor state and frame timing; reset zeroes it");
     sprintln!("  tasks         scheduler state");
     sprintln!("  ls [path]     list a directory of the mounted filesystem");
@@ -1647,6 +1693,21 @@ fn interrupt_wakes(argument: &str) {
     // самую опасную.
     for (gsi, users, calls) in crate::irq::routing::shared_lines() {
         sprintln!("  irq         : line GSI {gsi}: {users} device(s), {calls} interrupt(s)");
+        // Вход I/O APIC как есть (фаза 68i): вектор, полярность, уровень,
+        // маска, `Remote IRR` (бит 14) и признак доставки (бит 12).
+        #[cfg(target_arch = "x86_64")]
+        if let Some((low, high)) = crate::arch::input::gsi_entry(gsi) {
+            sprintln!(
+                "                vector {:#04x}, {}, active {}, {}{}{}, destination {:#04x} ({low:#010x} {high:#010x})",
+                low & 0xFF,
+                if low & (1 << 15) != 0 { "level" } else { "edge" },
+                if low & (1 << 13) != 0 { "low" } else { "high" },
+                if low & (1 << 16) != 0 { "masked" } else { "unmasked" },
+                if low & (1 << 14) != 0 { ", remote IRR set" } else { "" },
+                if low & (1 << 12) != 0 { ", delivery pending" } else { "" },
+                high >> 24
+            );
+        }
     }
 }
 
