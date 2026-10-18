@@ -6,6 +6,10 @@
 //! Ищет загрузчик, а не ядро: прошивка читает флешки на любом контроллере USB,
 //! а драйверы ядра — пока не на всех.
 //!
+//! Имён два: `authorized_keys` — как привык человек, и `SSHKEYS` — в 8.3,
+//! так его кладёт `cargo xtask image --live-key` (писатель FAT32 сборки длинных
+//! имён не умеет).
+//!
 //! Тома перебираются все, первый найденный файл и берётся. Тома открываются
 //! `GetProtocol`, без захвата: захват отключил бы от устройства потребителей
 //! прошивки (урок ASUS K53SD — см. `graphics.rs`).
@@ -30,8 +34,13 @@ pub fn find(info: &mut BootInfo) {
             continue;
         };
         let Ok(mut root) = fs.open_volume() else { continue };
-        let path = uefi::cstr16!("\\FREEOS\\authorized_keys");
-        let Ok(handle) = root.open(path, FileMode::Read, FileAttribute::empty()) else { continue };
+        let names = [uefi::cstr16!("\\FREEOS\\authorized_keys"), uefi::cstr16!("\\FREEOS\\SSHKEYS")];
+        let Some(handle) = names
+            .iter()
+            .find_map(|path| root.open(path, FileMode::Read, FileAttribute::empty()).ok())
+        else {
+            continue;
+        };
         let Ok(FileType::Regular(mut file)) = handle.into_type() else { continue };
         let read = match file.read(&mut info.live_keys) {
             Ok(read) => read.min(LIVE_KEYS_MAX),

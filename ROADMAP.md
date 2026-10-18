@@ -9236,6 +9236,13 @@ boot stick`), свой — `uid=0(live)`, `kernel usb` и `kernel pci` верн�
 вывод оболочки ядра. Регрессия: `install`, `ssh-shell` (вход по
 `/etc/passwd` не изменился), `boot` — зелёные.
 
+**Образ для своей флешки.** `cargo xtask image --release --live-key <ключ.pub>`
+кладёт ключ в `\FREEOS\SSHKEYS` (писатель FAT32 сборки знает только имена
+8.3; загрузчик ищет оба имени). Образ личный — в выпуск такой не уходит.
+`tools/vbox/image.cmd` грузит образ в VirtualBox и пробрасывает SSH на
+`127.0.0.1:2222`: release-образ `0.7.482` загрузился, ключ найден на ESP,
+вход `live` с ПК, `kernel usb` и `kernel pci` ответили через e1000.
+
 ## Фаза 68p — сеть по USB: RNDIS и CDC ECM — **сделано 2026-10-18**
 
 ### Зачем

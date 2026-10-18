@@ -263,6 +263,10 @@ struct ImageArgs {
     /// Собрать установочный носитель, а не образ готовой системы.
     #[arg(long)]
     installer: bool,
+    /// Положить открытый ключ SSH (`.pub`) в `\FREEOS\SSHKEYS`: живая
+    /// система впустит по нему `live` (фаза 68o). Образ становится личным.
+    #[arg(long)]
+    live_key: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -630,7 +634,7 @@ fn real_main() -> Result<()> {
                 installer: args.installer,
             })?;
             print_built(&built);
-            let path = image::build(&built, kind)?;
+            let path = image::build_with_key(&built, kind, args.live_key.as_deref())?;
             image::describe(args.arch, &path, kind);
         }
 

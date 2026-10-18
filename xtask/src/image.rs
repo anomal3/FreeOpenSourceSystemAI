@@ -118,8 +118,19 @@ struct Payload {
 
 /// Собирает образ, если он устарел, и возвращает путь к нему.
 pub fn build(built: &Built, kind: Kind) -> Result<PathBuf> {
+    build_with_key(built, kind, None)
+}
+
+/// То же, с ключом SSH для входа в живую систему (фаза 68o): файл `.pub`
+/// ложится в `\FREEOS\SSHKEYS`. Такой образ — личный, для своей флешки:
+/// в выпуск ключ не должен попасть никогда.
+pub fn build_with_key(built: &Built, kind: Kind, live_key: Option<&Path>) -> Result<PathBuf> {
     let arch = built.arch;
-    let payload = collect(built, kind)?;
+    let mut payload = collect(built, kind)?;
+    if let Some(key) = live_key {
+        payload.push(read_payload("FREEOS/SSHKEYS", key)?);
+        say!("образ: ключ SSH {} — образ личный, не для выпуска", key.display());
+    }
 
     let stamp_path = paths::disk_image_stamp(kind.slug(), arch, built.release);
     let stamp = stamp_text(&payload, kind);
