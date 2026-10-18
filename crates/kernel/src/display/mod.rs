@@ -9,7 +9,8 @@
 //! система работает в QEMU:
 //!
 //! * x86-64: стандартный VGA QEMU (PCI `1234:1111`) с интерфейсом Bochs VBE —
-//!   [`bochs`];
+//!   [`bochs`]; VMware SVGA II (`15ad:0405`) — видеокарта VirtualBox и
+//!   VMware, [`vmsvga`] (фаза 68h);
 //! * AArch64: `ramfb`, который настраивается записью файла `etc/ramfb` через
 //!   fw_cfg, — [`ramfb`].
 //!
@@ -27,6 +28,8 @@
 
 #[cfg(target_arch = "x86_64")]
 mod bochs;
+#[cfg(target_arch = "x86_64")]
+mod vmsvga;
 #[cfg(target_arch = "aarch64")]
 mod ramfb;
 
@@ -84,7 +87,20 @@ const DRIVER: &str = "ramfb";
 /// Имя драйвера, который сейчас держит экран, — для журнала.
 #[must_use]
 pub fn driver() -> &'static str {
-    if crate::virtio::gpu::active() { "virtio-gpu" } else { DRIVER }
+    if crate::virtio::gpu::active() {
+        return "virtio-gpu";
+    }
+    #[cfg(target_arch = "x86_64")]
+    if vmsvga::active() {
+        return "vmsvga";
+    }
+    DRIVER
+}
+
+/// Отметить адаптеры, которыми ядро умеет управлять, при загрузке (фаза 68h).
+pub fn claim_adapters() {
+    #[cfg(target_arch = "x86_64")]
+    vmsvga::claim();
 }
 
 /// Показать изменившийся прямоугольник (фаза 67a).
@@ -94,6 +110,9 @@ pub fn driver() -> &'static str {
 /// изменилось, — композитор зовёт это после каждого собранного прямоугольника.
 pub fn flush(x: i32, y: i32, w: u32, h: u32) {
     crate::virtio::gpu::flush(x, y, w, h);
+    // VMSVGA в режиме SVGA показывает изменённое тоже по команде (фаза 68h).
+    #[cfg(target_arch = "x86_64")]
+    vmsvga::flush(x, y, w, h);
 }
 
 /// Отдать курсор адаптеру (фаза 67b): картинка `side`×`side` точек
@@ -133,9 +152,10 @@ pub fn can_switch() -> bool {
     if crate::virtio::gpu::active() {
         return true;
     }
+    // VMSVGA (фаза 68h) — видеокарта VirtualBox по умолчанию и VMware.
     #[cfg(target_arch = "x86_64")]
     {
-        bochs::present()
+        bochs::present() || vmsvga::present()
     }
     // На `virt` экран даёт ramfb, и режим ему меняется записью в fw_cfg. Машины
     // с другим экраном у нас на этой архитектуре пока не встречалось; когда
@@ -164,6 +184,9 @@ pub fn set_mode(current: &Framebuffer, width: u32, height: u32) -> Result<Frameb
     }
     #[cfg(target_arch = "x86_64")]
     {
+        if vmsvga::active() || (!bochs::present() && vmsvga::present()) {
+            return vmsvga::set_mode(current, width, height);
+        }
         bochs::set_mode(current, width, height)
     }
     #[cfg(target_arch = "aarch64")]
