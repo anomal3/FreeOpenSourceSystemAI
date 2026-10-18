@@ -37,6 +37,7 @@ mod qmp;
 mod scenarios;
 mod serial;
 mod shot;
+mod stick;
 pub(crate) mod sshkeys;
 mod tlskeys;
 mod tone;
@@ -758,7 +759,21 @@ fn execute(
     let wav = sound_file(prefix);
     let _ = std::fs::remove_file(&wav);
     let wav_arg = crate::util::qemu_path(&wav)?;
-    extra.extend(scenario.extra.iter().map(|s| s.replace("{wav}", &wav_arg)));
+    // `{stick}` — образ флешки (фаза 68n), свой у каждого прогона и свежий:
+    // гость его не пишет, но вчерашний мог собрать прошлый код.
+    let stick_arg = if scenario.extra.iter().any(|s| s.contains("{stick}")) {
+        let stick = paths::test_dir().join(format!("{prefix}-stick.img"));
+        stick::build(&stick)?;
+        crate::util::qemu_path(&stick)?
+    } else {
+        String::new()
+    };
+    extra.extend(
+        scenario
+            .extra
+            .iter()
+            .map(|s| s.replace("{wav}", &wav_arg).replace("{stick}", &stick_arg)),
+    );
     // Лишние аргументы QEMU для всех сценариев разом, например `-accel whpx`:
     // гостевой код тогда исполняет настоящий процессор, а не эмулятор. Нужно
     // затем, что эмулятор прощает то, чего не прощает железо, — бит Accessed

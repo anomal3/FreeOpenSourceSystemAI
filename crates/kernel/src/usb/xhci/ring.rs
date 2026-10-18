@@ -50,6 +50,10 @@ pub const TRB_ADDRESS_DEVICE: u32 = 11;
 pub const TRB_CONFIGURE_ENDPOINT: u32 = 12;
 pub const TRB_EVALUATE_CONTEXT: u32 = 13;
 pub const TRB_NO_OP_COMMAND: u32 = 23;
+/// Сбросить остановленную точку (фаза 68n: накопитель отвечает Stall).
+pub const TRB_RESET_ENDPOINT: u32 = 14;
+/// Переставить позицию чтения кольца точки после сброса.
+pub const TRB_SET_TR_DEQUEUE: u32 = 16;
 /// События, которые кладёт контроллер.
 pub const TRB_TRANSFER_EVENT: u32 = 32;
 pub const TRB_COMMAND_COMPLETION: u32 = 33;
@@ -216,6 +220,13 @@ impl Ring {
             (base.add(8) as *mut u32).write_volatile(trb.status);
             (base.add(12) as *mut u32).write_volatile(trb.control);
         }
+    }
+
+    /// Куда будет записан следующий дескриптор, вместе с битом цикла — то,
+    /// что сообщает контроллеру `Set TR Dequeue Pointer` после сброса точки.
+    #[must_use]
+    pub fn enqueue_pointer(&self) -> u64 {
+        self.buffer.phys().as_u64() + (self.enqueue * TRB_LEN) as u64 + u64::from(self.cycle)
     }
 
     /// Положить дескриптор в кольцо. Возвращает его физический адрес — по нему

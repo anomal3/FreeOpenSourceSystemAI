@@ -526,6 +526,16 @@ fn banner() {
             // означает ровно одно: садиться разбираться заново, уже с журналом,
             // которого на этой машине не бывает.
             for device in usb.attached.iter().filter(|device| device.port != 0) {
+                // Накопителю (фаза 68n) интерфейсы HID и протокол не к лицу.
+                if device.kind == "storage" {
+                    sprintln!(
+                        "     port {}: {:04x}:{:04x} mass storage",
+                        device.port,
+                        device.vendor,
+                        device.product
+                    );
+                    continue;
+                }
                 sprintln!(
                     "     port {}: {:04x}:{:04x} {} on interface {} of {}, {}",
                     device.port,
@@ -578,6 +588,16 @@ fn banner() {
                 usb.mice
             );
             for device in usb.attached.iter().filter(|device| device.port != 0) {
+                // Накопителю (фаза 68n) интерфейсы HID и протокол не к лицу.
+                if device.kind == "storage" {
+                    sprintln!(
+                        "     port {}: {:04x}:{:04x} mass storage",
+                        device.port,
+                        device.vendor,
+                        device.product
+                    );
+                    continue;
+                }
                 sprintln!(
                     "     port {}: {:04x}:{:04x} {} on interface {} of {}, {}",
                     device.port,

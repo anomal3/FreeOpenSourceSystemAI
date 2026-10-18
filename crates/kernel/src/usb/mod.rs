@@ -39,6 +39,7 @@
 pub mod ehci;
 pub mod hid;
 pub mod ohci;
+pub mod storage;
 pub mod survey;
 pub mod xhci;
 

@@ -310,6 +310,11 @@ struct Device {
     speed: u32,
     /// Если это хаб — его порты.
     hub: Option<Hub>,
+    /// Если это накопитель — его bulk-точки (фаза 68n).
+    storage: Option<Storage>,
+    /// Номер подъёма: слот после выдёргивания достаётся следующему
+    /// устройству, а ссылка на накопитель не должна попасть в чужое.
+    serial: u32,
     /// Контекст устройства: его заполняет контроллер, ядро только читает.
     context: DmaBuffer,
     /// Входной контекст: через него драйвер сообщает контроллеру, что менять.
@@ -410,7 +415,53 @@ struct Hub {
 enum Described {
     Hid(HidInterface),
     Hub(HubInterface),
+    Storage(StorageInterface),
 }
+
+/// Интерфейс накопителя Bulk-Only (класс 8, подкласс 6 — SCSI, протокол
+/// 0x50) и его две bulk-точки.
+#[derive(Clone, Copy)]
+struct StorageInterface {
+    configuration: u8,
+    interface: u8,
+    /// Адреса точек с битом направления — для `CLEAR_FEATURE(ENDPOINT_HALT)`.
+    bulk_in: u8,
+    bulk_out: u8,
+    in_packet: u16,
+    out_packet: u16,
+}
+
+/// Накопитель: кольца bulk-точек, буфер данных и ожидаемое завершение.
+struct Storage {
+    found: StorageInterface,
+    bulk_in: Ring,
+    bulk_out: Ring,
+    /// Идентификаторы контекстов точек — они же цели дверного звонка.
+    in_target: u8,
+    out_target: u8,
+    /// Буфер данных. Одна передача — внутри окна `window`, не пересекающего
+    /// границу 64 КиБ: так дескриптор передачи всегда один и цепочки не нужны.
+    data: DmaBuffer,
+    window: (usize, usize),
+    /// Адрес дескриптора, завершения которого ждут, и само завершение: код и
+    /// остаток. Ставит [`Controller::handle_transfer_event`], кто бы ни
+    /// разбирал кольцо событий.
+    awaited: u64,
+    done: Option<(u32, u32)>,
+}
+
+/// Размер буфера данных накопителя.
+const STORAGE_BUFFER: usize = 32 * 1024;
+/// Где в странице устройства лежат блоки команды (CBW) и состояния (CSW).
+const STORAGE_CBW_OFFSET: usize = 0;
+const STORAGE_CSW_OFFSET: usize = 512;
+/// Класс, подкласс и протокол накопителя Bulk-Only с командами SCSI.
+const CLASS_STORAGE: u8 = 8;
+const SUBCLASS_SCSI: u8 = 6;
+const PROTOCOL_BULK_ONLY: u8 = 0x50;
+
+/// Счётчик подъёмов — см. [`Device::serial`].
+static SERIALS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
 /// Интерфейс хаба и его точка прерываний.
 #[derive(Clone, Copy)]
@@ -1175,6 +1226,12 @@ impl Controller {
     /// удался); дверной звонок ему больше не звонит.
     unsafe fn forget(&mut self, index: usize) {
         let slot = self.devices[index].slot;
+        if self.devices[index].storage.is_some() {
+            super::storage::gone(StorageHandle {
+                controller: self.index,
+                serial: self.devices[index].serial,
+            });
+        }
         // SAFETY: контракт функции.
         unsafe { self.release_slot(slot) };
         let device = self.devices.remove(index);
@@ -1323,6 +1380,8 @@ impl Controller {
             place,
             speed,
             hub: None,
+            storage: None,
+            serial: SERIALS.fetch_add(1, Ordering::Relaxed),
             context,
             input,
             ep0,
@@ -1354,6 +1413,12 @@ impl Controller {
         };
 
         let is_hub = device.hub.is_some();
+        if device.storage.is_some() {
+            // Опрос накопителя и монтирование — после возврата контроллеров в
+            // список: команды SCSI идут тем же путём, что и чтение во время
+            // работы, а он ищет контроллер там.
+            super::storage::arrived(StorageHandle { controller: self.index, serial: device.serial });
+        }
         self.devices.push(device);
         // SAFETY: устройство настроено, кольцо точки прерываний готово.
         unsafe { self.queue_reports() };
@@ -1385,6 +1450,12 @@ impl Controller {
             Described::Hub(hub) => {
                 // SAFETY: см. выше.
                 unsafe { self.bring_up_hub(device, &hub) }.map_err(|err| (Stage::Configure, err))?;
+                return Ok(0);
+            }
+            Described::Storage(found) => {
+                // SAFETY: см. выше.
+                unsafe { self.bring_up_storage(device, &found) }
+                    .map_err(|err| (Stage::Configure, err))?;
                 return Ok(0);
             }
         };
@@ -1504,6 +1575,136 @@ impl Controller {
         Ok(())
     }
 
+    /// Поднять накопитель: конфигурация и две bulk-точки. Команды SCSI — позже,
+    /// в [`super::storage`].
+    ///
+    /// # Safety
+    ///
+    /// Устройство адресовано и описано.
+    unsafe fn bring_up_storage(&mut self, device: &mut Device, found: &StorageInterface) -> Result<(), XhciError> {
+        // SAFETY: контракт функции.
+        unsafe {
+            self.control_transfer(
+                device,
+                [0, usb::REQ_SET_CONFIGURATION, found.configuration, 0, 0, 0, 0, 0],
+                0,
+                false,
+            )
+        }?;
+        let in_target = (found.bulk_in & 0x0F) * 2 + 1;
+        let out_target = (found.bulk_out & 0x0F) * 2;
+        let data = dma::alloc(STORAGE_BUFFER)?;
+        // Окно без границы 64 КиБ внутри: дескриптор передачи не вправе её
+        // пересекать, а цепочка дескрипторов ради одной команды ни к чему.
+        let phys = data.phys().as_u64() as usize;
+        let boundary = (phys | 0xFFFF) + 1;
+        let window = if phys + STORAGE_BUFFER <= boundary {
+            (0, STORAGE_BUFFER)
+        } else if boundary - phys >= phys + STORAGE_BUFFER - boundary {
+            (0, boundary - phys)
+        } else {
+            (boundary - phys, phys + STORAGE_BUFFER - boundary)
+        };
+        // Состояние ставится до команды: при её отказе буферы вернёт
+        // `free_device`.
+        device.storage = Some(Storage {
+            found: *found,
+            bulk_in: Ring::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?),
+            bulk_out: Ring::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?),
+            in_target,
+            out_target,
+            data,
+            window,
+            awaited: 0,
+            done: None,
+        });
+        let Some(storage) = device.storage.as_ref() else {
+            return Err(XhciError::NoDevice);
+        };
+
+        // SAFETY: контракт функции; контексты выделены.
+        unsafe {
+            self.clear_input(device);
+            self.write_context(&device.input, 0, 1, 1 | (1 << in_target) | (1 << out_target));
+            for dword in 0..4 {
+                let value = self.read_context(&device.context, 0, dword);
+                self.write_context(&device.input, 1, dword, value);
+            }
+            let slot0 = self.read_context(&device.context, 0, 0);
+            let entries = u32::from(in_target.max(out_target));
+            self.write_context(&device.input, 1, 0, (slot0 & !(0x1F << 27)) | (entries << 27));
+            // Тип точки: 2 — Bulk OUT, 6 — Bulk IN; `CErr = 3`; средняя длина
+            // передачи для bulk — 3 КиБ, как советует спецификация.
+            for (target, kind, packet, ring) in [
+                (in_target, 6u32, found.in_packet, &storage.bulk_in),
+                (out_target, 2u32, found.out_packet, &storage.bulk_out),
+            ] {
+                let index = usize::from(target) + 1;
+                let dequeue = ring.phys() | 1;
+                self.write_context(&device.input, index, 0, 0);
+                self.write_context(&device.input, index, 1, (u32::from(packet) << 16) | (kind << 3) | (3 << 1));
+                self.write_context(&device.input, index, 2, dequeue as u32);
+                self.write_context(&device.input, index, 3, (dequeue >> 32) as u32);
+                self.write_context(&device.input, index, 4, 3072);
+            }
+        }
+        // SAFETY: входной контекст заполнен.
+        unsafe {
+            self.command_execute(Trb {
+                parameter: device.input.phys().as_u64(),
+                status: 0,
+                control: (ring::TRB_CONFIGURE_ENDPOINT << ring::TRB_TYPE_SHIFT)
+                    | (u32::from(device.slot) << 24),
+            })
+        }?;
+        kprintln!(
+            "  usb         : slot {} is a mass storage device, interface {}, bulk IN {:#04x} OUT {:#04x}, {} KiB window",
+            device.slot,
+            found.interface,
+            found.bulk_in,
+            found.bulk_out,
+            window.1 / 1024
+        );
+        Ok(())
+    }
+
+    /// Сбросить остановленную bulk-точку накопителя: `Reset Endpoint`,
+    /// `Set TR Dequeue Pointer` и `CLEAR_FEATURE(ENDPOINT_HALT)` устройству.
+    ///
+    /// # Safety
+    ///
+    /// Устройство с индексом `index` — накопитель в списке.
+    unsafe fn recover_endpoint(&mut self, index: usize, dir_in: bool) {
+        let device = &self.devices[index];
+        let slot = device.slot;
+        let Some(storage) = device.storage.as_ref() else {
+            return;
+        };
+        let (target, address, dequeue) = if dir_in {
+            (storage.in_target, storage.found.bulk_in, storage.bulk_in.enqueue_pointer())
+        } else {
+            (storage.out_target, storage.found.bulk_out, storage.bulk_out.enqueue_pointer())
+        };
+        let on = (u32::from(target) << 16) | (u32::from(slot) << 24);
+        // SAFETY: контракт функции.
+        unsafe {
+            if let Err(err) = self.command_execute(Trb {
+                parameter: 0,
+                status: 0,
+                control: (ring::TRB_RESET_ENDPOINT << ring::TRB_TYPE_SHIFT) | on,
+            }) {
+                kprintln!("  usb-storage : resetting endpoint {address:#04x} failed: {err}");
+            }
+            let _ = self.command_execute(Trb {
+                parameter: dequeue,
+                status: 0,
+                control: (ring::TRB_SET_TR_DEQUEUE << ring::TRB_TYPE_SHIFT) | on,
+            });
+            // CLEAR_FEATURE(ENDPOINT_HALT) точке: получатель — точка (2).
+            let _ = self.slot_control(slot, [0x02, 1, 0, 0, address, 0, 0, 0], 0, false);
+        }
+    }
+
     /// Пройти все порты хаба. Возвращает новые клавиатуру и указатель и
     /// признак «что-то изменилось».
     ///
@@ -1565,7 +1766,7 @@ impl Controller {
     unsafe fn clear_hub_changes(&mut self, hub: u8) {
         // SAFETY: контракт функции.
         let Ok(read) = (unsafe {
-            self.hub_control(hub, [HUB_FROM_HUB, HUB_REQ_GET_STATUS, 0, 0, 0, 0, 4, 0], 4, true)
+            self.slot_control(hub, [HUB_FROM_HUB, HUB_REQ_GET_STATUS, 0, 0, 0, 0, 4, 0], 4, true)
         }) else {
             return;
         };
@@ -1574,7 +1775,7 @@ impl Controller {
             if change & (1 << feature) != 0 {
                 // SAFETY: см. выше.
                 let _ = unsafe {
-                    self.hub_control(hub, [HUB_TO_HUB, HUB_REQ_CLEAR_FEATURE, feature, 0, 0, 0, 0, 0], 0, false)
+                    self.slot_control(hub, [HUB_TO_HUB, HUB_REQ_CLEAR_FEATURE, feature, 0, 0, 0, 0, 0], 0, false)
                 };
             }
         }
@@ -1698,7 +1899,7 @@ impl Controller {
     unsafe fn hub_port_status(&mut self, hub: u8, port: u8) -> Result<(u16, u16), XhciError> {
         // SAFETY: контракт функции.
         let read = unsafe {
-            self.hub_control(hub, [HUB_FROM_PORT, HUB_REQ_GET_STATUS, 0, 0, port, 0, 4, 0], 4, true)
+            self.slot_control(hub, [HUB_FROM_PORT, HUB_REQ_GET_STATUS, 0, 0, port, 0, 4, 0], 4, true)
         }?;
         if read < 4 {
             return Err(XhciError::ShortDescriptor);
@@ -1714,7 +1915,7 @@ impl Controller {
     unsafe fn hub_port_feature(&mut self, hub: u8, port: u8, set: bool, feature: u8) -> Result<(), XhciError> {
         let request = if set { HUB_REQ_SET_FEATURE } else { HUB_REQ_CLEAR_FEATURE };
         // SAFETY: контракт функции.
-        unsafe { self.hub_control(hub, [HUB_TO_PORT, request, feature, 0, port, 0, 0, 0], 0, false) }
+        unsafe { self.slot_control(hub, [HUB_TO_PORT, request, feature, 0, port, 0, 0, 0], 0, false) }
             .map(|_| ())
     }
 
@@ -1884,7 +2085,14 @@ impl Controller {
         // выделен на страницу, читается ровно столько, сколько передано.
         let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
         let desc = usb::DeviceDescriptor::parse(bytes).ok_or(XhciError::ShortDescriptor)?;
-        let max_packet = desc.max_packet_size0;
+        // У USB 3 поле — показатель степени: 9 означает 512 байт (фаза 68n,
+        // накопитель VirtualBox). Записать в контекст девятку значило бы
+        // попросить у контроллера пакеты по 9 байт.
+        let max_packet = if speed >= regs::SPEED_SUPER {
+            1u16 << desc.max_packet_size0.min(15)
+        } else {
+            u16::from(desc.max_packet_size0)
+        };
         kprintln!(
             "  usb         : USB {}.{:02x} device, {}-byte control packets",
             desc.usb_version >> 8,
@@ -1898,9 +2106,9 @@ impl Controller {
         // значением, которое было записано в контекст (см. `address_device`), а
         // не с чем-то отдельно взятым: расхождение возможно только у low- и
         // full-speed, где предполагалось 8, а разрешены и 16, 32, 64.
-        if u16::from(max_packet) != regs::default_max_packet_size(speed) {
+        if max_packet != regs::default_max_packet_size(speed) {
             // SAFETY: см. выше.
-            unsafe { self.update_max_packet(device, u16::from(max_packet)) }?;
+            unsafe { self.update_max_packet(device, max_packet) }?;
         }
 
         // Полный дескриптор устройства — ради одних только идентификаторов.
@@ -1946,6 +2154,9 @@ impl Controller {
             if bytes.len() >= 18 && bytes[10] == usb::DESC_INTERFACE { bytes[14] } else { 0 };
         if class == CLASS_HUB || interface_class == CLASS_HUB {
             return find_hub_endpoint(bytes).map(Described::Hub).ok_or(XhciError::HubDescriptor);
+        }
+        if let Some(found) = find_storage(bytes) {
+            return Ok(Described::Storage(found));
         }
         usb::find_hid(bytes).map(Described::Hid).ok_or(XhciError::NoHid)
     }
@@ -2285,17 +2496,18 @@ impl Controller {
         unsafe { self.finish_control(device.slot, last, length) }
     }
 
-    /// Управляющая передача хабу, который уже стоит в списке устройств.
+    /// Управляющая передача устройству, которое уже стоит в списке: хабу или
+    /// накопителю.
     ///
-    /// Хаб из списка не вынимается: его точка прерываний в это время может
-    /// завершиться, и событие должно найти устройство на месте. Данные — в
-    /// начале его буфера; карта изменений лежит дальше
+    /// Устройство из списка не вынимается: точка прерываний хаба в это время
+    /// может завершиться, и событие должно найти устройство на месте. Данные —
+    /// в начале его буфера; карта изменений хаба лежит дальше
     /// ([`HUB_STATUS_OFFSET`]).
     ///
     /// # Safety
     ///
     /// Хаб сконфигурирован.
-    unsafe fn hub_control(
+    unsafe fn slot_control(
         &mut self,
         hub: u8,
         setup: [u8; 8],
@@ -2438,6 +2650,16 @@ impl Controller {
         // Событие относится к точке прерываний? Идентификатор точки — биты 20:16
         // управляющего слова.
         let endpoint = ((event.control >> 16) & 0x1F) as u8;
+        if let Some(storage) = device.storage.as_mut() {
+            // Завершение bulk-передачи накопителя: запоминается для того, кто
+            // его ждёт, — ждущий мог и не сам разбирать кольцо.
+            if (endpoint == storage.in_target || endpoint == storage.out_target)
+                && event.parameter == storage.awaited
+            {
+                storage.done = Some((event.completion_code(), event.residual()));
+            }
+            return;
+        }
         if endpoint != device.interrupt_target {
             return;
         }
@@ -2665,7 +2887,11 @@ impl Controller {
                 port: device.port,
                 vendor: device.identity.0,
                 product: device.identity.1,
-                kind: device.reader.as_ref().map_or("unknown", Reader::name),
+                kind: match (&device.reader, &device.storage) {
+                    (Some(reader), _) => reader.name(),
+                    (None, Some(_)) => "storage",
+                    (None, None) => "unknown",
+                },
                 descriptor: device.described_by,
                 interface: device.interface.0,
                 interfaces: device.interface.1,
@@ -2778,7 +3004,60 @@ unsafe fn free_device(device: &Device) {
         dma::free(device.ep0.buffer());
         dma::free(device.interrupt.buffer());
         dma::free(&device.report);
+        if let Some(storage) = &device.storage {
+            dma::free(storage.bulk_in.buffer());
+            dma::free(storage.bulk_out.buffer());
+            dma::free(&storage.data);
+        }
     }
+}
+
+/// Найти в конфигурации интерфейс накопителя Bulk-Only и его bulk-точки.
+fn find_storage(bytes: &[u8]) -> Option<StorageInterface> {
+    let configuration = *bytes.get(5)?;
+    let mut at = 0;
+    let mut inside = None;
+    let (mut bulk_in, mut bulk_out) = (None, None);
+    while at + 2 <= bytes.len() {
+        let length = usize::from(bytes[at]);
+        if length < 2 || at + length > bytes.len() {
+            return None;
+        }
+        match bytes[at + 1] {
+            usb::DESC_INTERFACE if length >= 9 => {
+                if inside.is_some() && bulk_in.is_some() && bulk_out.is_some() {
+                    break;
+                }
+                let matches = bytes[at + 5] == CLASS_STORAGE
+                    && bytes[at + 6] == SUBCLASS_SCSI
+                    && bytes[at + 7] == PROTOCOL_BULK_ONLY;
+                inside = matches.then_some(bytes[at + 2]);
+                bulk_in = None;
+                bulk_out = None;
+            }
+            // Точка типа bulk (биты 1:0 атрибутов — 2).
+            usb::DESC_ENDPOINT if length >= 7 && inside.is_some() && bytes[at + 3] & 0b11 == 2 => {
+                let address = bytes[at + 2];
+                let packet = u16::from_le_bytes([bytes[at + 4], bytes[at + 5]]) & 0x7FF;
+                if address & 0x80 != 0 {
+                    bulk_in = bulk_in.or(Some((address, packet)));
+                } else {
+                    bulk_out = bulk_out.or(Some((address, packet)));
+                }
+            }
+            _ => {}
+        }
+        at += length;
+    }
+    let ((bulk_in, in_packet), (bulk_out, out_packet)) = (bulk_in?, bulk_out?);
+    Some(StorageInterface {
+        configuration,
+        interface: inside?,
+        bulk_in,
+        bulk_out,
+        in_packet,
+        out_packet,
+    })
 }
 
 /// Найти в конфигурации хаба его точку прерываний IN (карта изменений).
@@ -2946,6 +3225,7 @@ pub unsafe fn init(rsdp: u64) -> bool {
     });
     *DRIVEN.lock() = controllers.iter().map(|c| c.device.address).collect();
     *CONTROLLERS.lock() = controllers;
+    super::storage::settle();
     keyboard || mouse
 }
 
@@ -3239,6 +3519,7 @@ fn poll_hotplug(mask: u32) {
         }
     }
     *CONTROLLERS.lock() = taken;
+    super::storage::settle();
 }
 
 /// Поднялся ли хоть один контроллер.
@@ -3268,6 +3549,200 @@ const PORT_CHECK_PERIOD_MS: u64 = 500;
 fn interrupts_enabled() -> bool {
     CONTROLLERS.lock().iter().all(|c| c.delivery() != Delivery::Polled)
 }
+
+/// Ссылка на накопитель: контроллер и номер подъёма устройства (фаза 68n).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StorageHandle {
+    controller: usize,
+    serial: u32,
+}
+
+/// Чем кончилась bulk-передача накопителя.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BulkError {
+    /// Устройство выдернуто.
+    Gone,
+    /// Передача не завершилась за отведённое время.
+    Timeout,
+    /// Точка ответила Stall; она уже сброшена.
+    Stalled,
+    /// Иной код завершения.
+    Failed(u32),
+}
+
+/// Какой буфер накопителя участвует в передаче.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StorageBuffer {
+    /// Блок команды (CBW), 31 байт.
+    Command,
+    /// Блок состояния (CSW), 13 байт.
+    Status,
+    /// Окно данных.
+    Data,
+}
+
+/// Сколько ждать одной bulk-передачи: накопитель вправе думать над командой
+/// секунды — раскрутка диска за мостом USB, запись во флеш.
+const STORAGE_TIMEOUT_MS: u64 = 10_000;
+
+/// Почему до устройства не дотянуться прямо сейчас.
+enum Reach {
+    /// Контроллеры «в руках» у перечисления портов — подождать.
+    Busy,
+    /// Устройства больше нет.
+    Gone,
+}
+
+/// Исполнить `f` над контроллером и индексом устройства-накопителя.
+fn with_storage<R>(handle: StorageHandle, f: impl FnOnce(&mut Controller, usize) -> R) -> Result<R, Reach> {
+    let mut list = CONTROLLERS.lock();
+    let Some(controller) = list.get_mut(handle.controller) else {
+        return Err(Reach::Busy);
+    };
+    let Some(index) = controller
+        .devices
+        .iter()
+        .position(|d| d.serial == handle.serial && d.storage.is_some())
+    else {
+        return Err(Reach::Gone);
+    };
+    Ok(f(controller, index))
+}
+
+/// Размер окна данных накопителя.
+#[must_use]
+pub fn storage_window(handle: StorageHandle) -> Option<usize> {
+    with_storage(handle, |c, i| c.devices[i].storage.as_ref().map_or(0, |s| s.window.1)).ok()
+}
+
+/// Доступ к блоку команды (CBW), блоку состояния (CSW) и окну данных — под
+/// локом контроллера, на время `f`.
+pub fn with_storage_buffers<R>(
+    handle: StorageHandle,
+    f: impl FnOnce(&mut [u8], &mut [u8], &mut [u8]) -> R,
+) -> Option<R> {
+    with_storage(handle, |c, i| {
+        let device = &c.devices[i];
+        let storage = device.storage.as_ref()?;
+        // SAFETY: страница устройства и буфер данных выделены и живут, пока
+        // устройство в списке, а список заперт; срезы не пересекаются.
+        let (command, status, data) = unsafe {
+            let page = device.report.as_ptr::<u8>();
+            (
+                core::slice::from_raw_parts_mut(page.add(STORAGE_CBW_OFFSET), 31),
+                core::slice::from_raw_parts_mut(page.add(STORAGE_CSW_OFFSET), 13),
+                core::slice::from_raw_parts_mut(storage.data.as_ptr::<u8>().add(storage.window.0), storage.window.1),
+            )
+        };
+        Some(f(command, status, data))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Bulk-передача накопителя: `len` байт буфера `buffer`, к устройству или от
+/// него. Возвращает, сколько байт прошло.
+///
+/// Дескриптор ставится под локом контроллера, а завершение ждётся без него:
+/// событие разбирает тот, кто первым возьмёт кольцо, — эта же функция или
+/// задача USB, — а [`Controller::handle_transfer_event`] запоминает его у
+/// устройства.
+pub fn storage_bulk(handle: StorageHandle, dir_in: bool, buffer: StorageBuffer, len: usize) -> Result<usize, BulkError> {
+    let mut timeout = Timeout::new(STORAGE_TIMEOUT_MS);
+    // Поставить дескриптор.
+    loop {
+        let queued = with_storage(handle, |c, i| {
+            let device = &mut c.devices[i];
+            let slot = device.slot;
+            let page = device.report.phys().as_u64();
+            let Some(storage) = device.storage.as_mut() else {
+                return;
+            };
+            let phys = match buffer {
+                StorageBuffer::Command => page + STORAGE_CBW_OFFSET as u64,
+                StorageBuffer::Status => page + STORAGE_CSW_OFFSET as u64,
+                StorageBuffer::Data => storage.data.phys().as_u64() + storage.window.0 as u64,
+            };
+            let len = match buffer {
+                StorageBuffer::Data => len.min(storage.window.1),
+                _ => len,
+            };
+            let (ring, target) = if dir_in {
+                (&mut storage.bulk_in, storage.in_target)
+            } else {
+                (&mut storage.bulk_out, storage.out_target)
+            };
+            storage.done = None;
+            storage.awaited = ring.push(Trb {
+                parameter: phys,
+                status: len as u32,
+                // Короткий пакет от устройства — событие (ISP), а не тишина.
+                control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT)
+                    | ring::TRB_IOC
+                    | if dir_in { 1 << 2 } else { 0 },
+            });
+            // SAFETY: дескриптор записан целиком до звонка.
+            unsafe { c.regs.ring_doorbell(slot, target) };
+        });
+        match queued {
+            Ok(()) => break,
+            Err(Reach::Gone) => return Err(BulkError::Gone),
+            Err(Reach::Busy) => {}
+        }
+        if timeout.expired() {
+            return Err(BulkError::Timeout);
+        }
+        core::hint::spin_loop();
+    }
+    // Дождаться завершения.
+    loop {
+        let done = with_storage(handle, |c, i| {
+            // SAFETY: окно регистров отображено, кольцо событий сообщено.
+            unsafe { c.drain_events(None) };
+            c.devices[i].storage.as_mut().and_then(|s| s.done.take())
+        });
+        match done {
+            Ok(Some((code, residual))) => {
+                if code == ring::COMPLETION_SUCCESS || code == ring::COMPLETION_SHORT_PACKET {
+                    return Ok(len - (residual as usize).min(len));
+                }
+                if code == COMPLETION_STALL {
+                    // SAFETY: устройство — накопитель в списке.
+                    let _ = with_storage(handle, |c, i| unsafe { c.recover_endpoint(i, dir_in) });
+                    return Err(BulkError::Stalled);
+                }
+                return Err(BulkError::Failed(code));
+            }
+            Ok(None) | Err(Reach::Busy) => {}
+            Err(Reach::Gone) => return Err(BulkError::Gone),
+        }
+        if timeout.expired() {
+            return Err(BulkError::Timeout);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Сброс Bulk-Only (класс 8, запрос `0xFF`) и снятие остановки с обеих точек —
+/// то, что спецификация велит после ошибки фазы.
+pub fn storage_reset(handle: StorageHandle) {
+    let _ = with_storage(handle, |c, i| {
+        let device = &c.devices[i];
+        let slot = device.slot;
+        let Some(interface) = device.storage.as_ref().map(|s| s.found.interface) else {
+            return;
+        };
+        // SAFETY: устройство — накопитель в списке.
+        unsafe {
+            let _ = c.slot_control(slot, [0x21, 0xFF, 0, 0, interface, 0, 0, 0], 0, false);
+            c.recover_endpoint(i, true);
+            c.recover_endpoint(i, false);
+        }
+    });
+}
+
+/// Код завершения Stall Error.
+const COMPLETION_STALL: u32 = 6;
 
 /// Тело задачи, обслуживающей контроллер.
 ///

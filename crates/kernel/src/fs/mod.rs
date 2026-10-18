@@ -115,6 +115,12 @@ pub fn mount_volume_at(prefix: &'static str, fs: Arc<dyn FileSystem>) {
     insert_mount(prefix, prefix, fs);
 }
 
+/// Снять ФС с префикса (фаза 68n: выдернутая флешка). Открытые на ней
+/// файлы держат том сами и дальше получают ошибки устройства.
+pub fn unmount(prefix: &str) {
+    MOUNTS.lock().retain(|mount| mount.prefix != prefix);
+}
+
 fn insert_mount(prefix: &'static str, strip: &'static str, fs: Arc<dyn FileSystem>) {
     let mut mounts = MOUNTS.lock();
     mounts.retain(|mount| mount.prefix != prefix);
