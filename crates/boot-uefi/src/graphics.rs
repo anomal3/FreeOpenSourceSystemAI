@@ -203,6 +203,17 @@ pub fn requested_mode() -> Option<(usize, usize)> {
     Some((width, height))
 }
 
+/// Номер сборки образа — из файла `\FREEOS\BUILD`, который кладёт `xtask`.
+/// Нет файла или в нём не число — ноль.
+pub fn build_number() -> u32 {
+    let Ok(mut volume) = crate::volume::BootVolume::open() else { return 0 };
+    let path = uefi::cstr16!("\\FREEOS\\BUILD");
+    let Ok(Some(mut file)) = volume.open_regular(path) else { return 0 };
+    let mut buffer = [0u8; 16];
+    let Ok(read) = file.read(&mut buffer) else { return 0 };
+    core::str::from_utf8(&buffer[..read]).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0)
+}
+
 /// Открывает GOP, описывает текущий режим и рисует тестовую картинку.
 ///
 /// Headless-машина (или прошивка без GOP) — не ошибка: возвращаем

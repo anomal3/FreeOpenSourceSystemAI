@@ -117,6 +117,7 @@ fn main() -> Status {
     info.acpi_rsdp = find_acpi_rsdp();
     // Ключи SSH для живой системы — с любой флешки, какую видит прошивка.
     live_keys::find(&mut info);
+    info.build = graphics::build_number();
 
     print_boot_info(&info);
 

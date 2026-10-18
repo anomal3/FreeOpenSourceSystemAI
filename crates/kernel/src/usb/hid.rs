@@ -181,6 +181,31 @@ impl Reader {
     }
 }
 
+/// Дескриптор отчётов интерфейса — в журнал: что понял разборщик и сами
+/// байты, по 16 в строке (0.8). Нужен там, где устройство не опознаётся, а
+/// журнал — единственное, что можно принести с чужой машины.
+pub fn log_descriptor(driver: &str, interface: u8, bytes: &[u8]) {
+    let parsed = usb_hid::parse(bytes);
+    let pointer = parsed.pointer.map_or(alloc::string::String::from("no pointer"), |map| {
+        alloc::format!(
+            "pointer ({}, report id {}, {} buttons{})",
+            if map.is_absolute() { "absolute" } else { "relative" },
+            map.report_id,
+            map.button_count(),
+            if map.has_wheel() { ", wheel" } else { "" }
+        )
+    });
+    let keyboard = parsed.keyboard.map_or("no keyboard", |_| "keyboard");
+    crate::kprintln!("  {driver:<11} : interface {interface} report descriptor {} bytes: {pointer}, {keyboard}", bytes.len());
+    for (row, chunk) in bytes.chunks(16).enumerate() {
+        let mut line = alloc::string::String::new();
+        for byte in chunk {
+            line.push_str(&alloc::format!(" {byte:02x}"));
+        }
+        crate::kprintln!("  {driver:<11} :   {:04x}:{line}", row * 16);
+    }
+}
+
 /// Кто будет разбирать отчёты и на каком протоколе.
 ///
 /// Возвращает разборщик и признак «на boot-протоколе»; `None` означает, что

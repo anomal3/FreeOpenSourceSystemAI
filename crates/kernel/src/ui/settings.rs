@@ -1171,7 +1171,7 @@ impl SettingsView {
         let lines = line_h(ctx, Role::Title) + line_h(ctx, Role::MonoSmall);
         let top = card.y + (card.h as i32 - lines) / 2;
         pass.text_clipped(Role::Title, text_x, top, room, &name, p.ink);
-        let sub = format!("uid {uid} \u{00b7} {} {}", arch::ARCH_NAME, env!("CARGO_PKG_VERSION"));
+        let sub = format!("uid {uid} \u{00b7} {} {}", arch::ARCH_NAME, crate::version_text());
         pass.text_clipped(Role::MonoSmall, text_x, top + line_h(ctx, Role::Title), room, &sub, p.ink4);
         chevron(pass, card);
         pass.section(card, Self::index_of(Section::Users));

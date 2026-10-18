@@ -30,7 +30,8 @@ pub const BOOT_INFO_MAGIC: u64 = 0x4652_4545_4F53_0001;
 /// A/B slot fields — which system this boot came from, how many attempts it has
 /// left, and whether the bootloader had already given up on the other one.
 /// Revision 9 added [`BootInfo::live_keys`]: SSH keys for a live boot.
-pub const BOOT_INFO_REVISION: u32 = 9;
+/// Revision 10 added [`BootInfo::build`]: the build number of the image.
+pub const BOOT_INFO_REVISION: u32 = 10;
 
 /// How many bytes of `authorized_keys` the bootloader passes for a live boot.
 /// An ed25519 line is about a hundred bytes; this holds a couple of dozen.
@@ -300,6 +301,10 @@ pub struct BootInfo {
     /// firmware reads sticks on every USB controller, ours do not yet.
     pub live_keys: [u8; LIVE_KEYS_MAX],
     pub live_keys_len: u32,
+    /// Build number of the image (`\FREEOS\BUILD`, written by `xtask`), or
+    /// zero. Shown in "About" next to the version: images of one version are
+    /// rebuilt many times a day, and only the number tells them apart.
+    pub build: u32,
 }
 
 /// Segment is readable.
@@ -463,6 +468,7 @@ impl BootInfo {
             requested_height: 0,
             live_keys: [0; LIVE_KEYS_MAX],
             live_keys_len: 0,
+            build: 0,
         }
     }
 

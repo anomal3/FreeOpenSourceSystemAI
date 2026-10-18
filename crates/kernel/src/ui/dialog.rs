@@ -54,7 +54,8 @@ pub enum Dialog {
 /// работы, которое сдвигалось бы только от щелчка по окну, выглядело бы
 /// сломанным. Подпись у строки говорит об этом прямо.
 pub struct AboutFacts {
-    pub version: &'static str,
+    /// Версия с номером сборки: `0.8.482`.
+    pub version: alloc::string::String,
     pub arch: &'static str,
     pub screen: (u32, u32),
     pub free_mib: u64,

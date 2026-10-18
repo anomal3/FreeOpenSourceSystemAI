@@ -520,7 +520,7 @@ static LAST_TOTAL_MIB: AtomicU64 = AtomicU64::new(0);
 /// Сведения для окна «О системе» — на момент его открытия.
 fn about_facts(desktop: &Compositor) -> AboutFacts {
     AboutFacts {
-        version: crate::VERSION,
+        version: crate::version_text(),
         arch: arch::ARCH_NAME,
         screen: (desktop.screen_width(), desktop.screen_height()),
         free_mib: LAST_FREE_MIB.load(Ordering::Relaxed),

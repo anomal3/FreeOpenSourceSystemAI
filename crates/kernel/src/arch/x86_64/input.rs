@@ -32,6 +32,9 @@ const IRQ_KEYBOARD: u8 = 1;
 /// IRQ шины ISA для COM1.
 const IRQ_SERIAL: u8 = 4;
 
+/// IRQ шины ISA мыши PS/2 (второй порт i8042) — тачпад ноутбука.
+const IRQ_PS2_MOUSE: u8 = 12;
+
 /// Адрес окна I/O APIC, если ACPI недоступен.
 ///
 /// Значение не выдумано: оно предписано спецификацией MP (Intel MultiProcessor
@@ -62,13 +65,13 @@ pub fn init(info: &BootInfo) -> Sources {
     };
 
     let destination = destination();
+    let (keyboard, mouse) = start_ps2(&io_apic, madt.as_ref(), destination);
     let sources = Sources {
-        keyboard: start_keyboard(&io_apic, madt.as_ref(), destination),
+        keyboard,
         serial: start_serial(&io_apic, madt.as_ref(), destination),
-        // Мышь на этой машине бывает только через USB: второй порт i8042
-        // (PS/2-мышь) драйвером не обслуживается и не будет — он остался бы
-        // кодом, которого нет на второй архитектуре.
-        mouse: false,
+        // Мышь PS/2 — это тачпад ноутбука (0.8): до K53SD считалось, что мышь
+        // бывает только по USB, и тачпад оставался мёртвым.
+        mouse,
     };
 
     // Кнопка питания заводится здесь по той же причине, по которой здесь стоит
@@ -211,19 +214,42 @@ fn attach_io_apic(madt: Option<&acpi::Madt>) -> Option<ioapic::IoApic> {
     }
 }
 
-/// Настроить клавиатуру и завести её прерывание.
+/// Настроить клавиатуру и мышь PS/2 и завести их прерывания. Возвращает,
+/// поднялись ли клавиатура и мышь.
+fn start_ps2(
+    io_apic: &ioapic::IoApic,
+    madt: Option<&acpi::Madt>,
+    destination: Option<Destination>,
+) -> (bool, bool) {
+    // SAFETY: вызывается однократно и до размаскирования входов I/O APIC, то
+    // есть обработчик прерывания не может вклиниться в последовательность
+    // настройки и забрать из буфера ответ устройства.
+    let devices = match unsafe { i8042::init() } {
+        Ok(devices) => devices,
+        Err(err) => {
+            kprintln!("  keyboard    : PS/2 unavailable: {err}");
+            return (false, false);
+        }
+    };
+    let keyboard = devices.keyboard && start_keyboard(io_apic, madt, destination);
+    let mouse = devices.mouse && {
+        let routed = route(io_apic, madt, IRQ_PS2_MOUSE, apic::VECTOR_PS2_MOUSE, destination);
+        if routed {
+            kprintln!("  mouse       : PS/2 on vector {:#04x} (IRQ 12)", apic::VECTOR_PS2_MOUSE);
+        } else {
+            kprintln!("  mouse       : PS/2 mouse configured but IRQ 12 could not be routed");
+        }
+        routed
+    };
+    (keyboard, mouse)
+}
+
+/// Завести прерывание клавиатуры.
 fn start_keyboard(
     io_apic: &ioapic::IoApic,
     madt: Option<&acpi::Madt>,
     destination: Option<Destination>,
 ) -> bool {
-    // SAFETY: вызывается однократно и до размаскирования входа I/O APIC, то есть
-    // обработчик прерывания не может вклиниться в последовательность настройки и
-    // забрать из буфера ответ клавиатуры.
-    if let Err(err) = unsafe { i8042::init() } {
-        kprintln!("  keyboard    : PS/2 unavailable: {err}");
-        return false;
-    }
 
     let routed = route(io_apic, madt, IRQ_KEYBOARD, apic::VECTOR_KEYBOARD, destination);
     if routed {

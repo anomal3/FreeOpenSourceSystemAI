@@ -37,6 +37,22 @@
 //! Набор 1 удобнее набора 2 ровно одним: отпускание в нём — это тот же код со
 //! старшим битом, а не префикс `0xF0` перед кодом. Один бит вместо состояния
 //! автомата.
+//!
+//! # Настоящий ноутбук (0.8)
+//!
+//! На ASUS K53SD не заработали ни клавиатура, ни тачпад. Прежняя настройка
+//! отказывалась целиком на первом же шаге без ACK — самотесте контроллера,
+//! сбросе клавиатуры, выборе набора, — а контроллеры ноутбуков (это
+//! встроенный контроллер, EC) отвечают на эти команды как попало; Linux
+//! самотест на x86 по умолчанию и не делает. Теперь обязательны только порты и
+//! конфигурация, а каждая команда клавиатуре — попытка: отказ записывается в
+//! журнал, и клавиатура остаётся такой, какой её оставила прошивка (а в меню
+//! прошивки она работала).
+//!
+//! Тачпад ноутбука — это мышь PS/2 на втором порту: пока драйвер не включит
+//! особый режим, Synaptics и Elantech шлют обычные пакеты по три байта.
+//! Второй порт теперь обслуживается: `0xD4` перед каждой командой мыши, сброс,
+//! умолчания, включение отчётов, IRQ 12.
 
 use super::interrupts::without_interrupts;
 use super::{inb, io_wait, outb};
@@ -52,20 +68,23 @@ const PORT_COMMAND: u16 = 0x64;
 const STATUS_OUTPUT_FULL: u8 = 1 << 0;
 /// Бит 1: входной буфер занят, писать пока нельзя.
 const STATUS_INPUT_FULL: u8 = 1 << 1;
+/// Бит 5: байт в выходном буфере — от мыши (второго порта).
+const STATUS_AUX: u8 = 1 << 5;
 
 // --- Команды контроллера (в порт 0x64) ----------------------------------------
 
 const CMD_READ_CONFIG: u8 = 0x20;
 const CMD_WRITE_CONFIG: u8 = 0x60;
 const CMD_DISABLE_PORT2: u8 = 0xA7;
-const CMD_SELF_TEST: u8 = 0xAA;
+const CMD_ENABLE_PORT2: u8 = 0xA8;
+const CMD_TEST_PORT2: u8 = 0xA9;
 const CMD_TEST_PORT1: u8 = 0xAB;
+/// Следующий байт в порт данных — мыши, а не клавиатуре.
+const CMD_WRITE_PORT2: u8 = 0xD4;
 const CMD_DISABLE_PORT1: u8 = 0xAD;
 const CMD_ENABLE_PORT1: u8 = 0xAE;
 
-/// Ответ на успешный самотест контроллера.
-const SELF_TEST_PASSED: u8 = 0x55;
-/// Ответ на успешный тест первого порта.
+/// Ответ на успешный тест порта.
 const PORT_TEST_PASSED: u8 = 0x00;
 
 // --- Биты конфигурации --------------------------------------------------------
@@ -118,10 +137,6 @@ const MAX_RESENDS: u32 = 3;
 pub enum Ps2Error {
     /// Порт состояния читается как 0xFF: контроллера на этой машине нет.
     Absent,
-    /// Самотест контроллера не прошёл.
-    SelfTestFailed(u8),
-    /// Первый порт неисправен.
-    PortTestFailed(u8),
     /// Контроллер не отвечает: ожидание превысило [`WAIT_SPINS`].
     Timeout,
     /// Клавиатура не подтвердила команду.
@@ -132,8 +147,6 @@ impl core::fmt::Display for Ps2Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Absent => f.write_str("no i8042 controller on this machine"),
-            Self::SelfTestFailed(got) => write!(f, "controller self-test returned {got:#04x}"),
-            Self::PortTestFailed(got) => write!(f, "keyboard port test returned {got:#04x}"),
             Self::Timeout => f.write_str("the controller stopped responding"),
             Self::NoAck(got) => write!(f, "the keyboard answered {got:#04x} instead of ACK"),
         }
@@ -202,20 +215,47 @@ fn keyboard_command(command: u8) -> Result<(), Ps2Error> {
     Err(Ps2Error::NoAck(KBD_RESEND))
 }
 
-/// Поднять контроллер и клавиатуру.
+/// Что поднялось на контроллере.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ps2Devices {
+    /// Клавиатура (первый порт).
+    pub keyboard: bool,
+    /// Мышь или тачпад (второй порт).
+    pub mouse: bool,
+}
+
+/// Отправить команду мыши (второй порт) и дождаться подтверждения.
+fn mouse_command(command: u8) -> Result<(), Ps2Error> {
+    for _ in 0..MAX_RESENDS {
+        write_port(PORT_COMMAND, CMD_WRITE_PORT2)?;
+        write_port(PORT_DATA, command)?;
+        match read_data()? {
+            KBD_ACK => return Ok(()),
+            KBD_RESEND => continue,
+            other => return Err(Ps2Error::NoAck(other)),
+        }
+    }
+    Err(Ps2Error::NoAck(KBD_RESEND))
+}
+
+/// Поднять контроллер, клавиатуру и мышь.
 ///
-/// Прерывание при выходе разрешено в самом контроллере (бит 0 конфигурации), но
-/// до процессора оно не дойдёт, пока вход не размаскирован в I/O APIC — это
-/// делает вызывающий. Разделение сознательное: пока обработчик не установлен,
+/// Прерывания при выходе разрешены в самом контроллере, но до процессора они
+/// не дойдут, пока входы не размаскированы в I/O APIC — это делает
+/// вызывающий. Разделение сознательное: пока обработчик не установлен,
 /// прерываний быть не должно.
+///
+/// Обязательны здесь только доступ к портам и конфигурация; всё, что дальше, —
+/// попытки, и их отказы печатаются, а не обрывают настройку (см. заголовок
+/// модуля, «Настоящий ноутбук»).
 ///
 /// # Safety
 ///
 /// Функция монопольно распоряжается портами 0x60/0x64. Вызывать один раз и до
-/// того, как размаскирован вход I/O APIC: последовательность настройки читает
-/// ответы клавиатуры из того же буфера, откуда их взял бы обработчик прерывания,
+/// того, как размаскированы входы I/O APIC: последовательность настройки читает
+/// ответы устройств из того же буфера, откуда их взял бы обработчик прерывания,
 /// и параллельный обработчик съел бы ожидаемый ACK.
-pub unsafe fn init() -> Result<(), Ps2Error> {
+pub unsafe fn init() -> Result<Ps2Devices, Ps2Error> {
     // SAFETY: чтение регистра состояния.
     if unsafe { inb(PORT_COMMAND) } == 0xFF {
         return Err(Ps2Error::Absent);
@@ -230,66 +270,123 @@ pub unsafe fn init() -> Result<(), Ps2Error> {
 
     // Конфигурация читается, а не собирается с нуля: в ней есть биты, значение
     // которых зависит от платформы (системный флаг), и обнулять их наугад
-    // незачем.
+    // незачем. Прерывания выключены до конца настройки.
     write_port(PORT_COMMAND, CMD_READ_CONFIG)?;
-    let config = read_data()?;
-    let config = (config | CONFIG_TRANSLATION | CONFIG_PORT2_CLOCK_OFF)
-        & !(CONFIG_PORT1_CLOCK_OFF | CONFIG_PORT2_INTERRUPT | CONFIG_PORT1_INTERRUPT);
+    let original = read_data()?;
+    let config = (original | CONFIG_TRANSLATION) & !(CONFIG_PORT1_INTERRUPT | CONFIG_PORT2_INTERRUPT);
     write_port(PORT_COMMAND, CMD_WRITE_CONFIG)?;
     write_port(PORT_DATA, config)?;
+    crate::kprintln!("  ps2         : controller config {original:#04x} -> {config:#04x}");
 
-    // Самотест: единственная проверка, отличающая «контроллер есть» от
-    // «контроллер отвечает». Некоторые реализации после него сбрасывают
-    // конфигурацию, поэтому она записывается ещё раз ниже.
-    write_port(PORT_COMMAND, CMD_SELF_TEST)?;
-    match read_data()? {
-        SELF_TEST_PASSED => {}
-        other => return Err(Ps2Error::SelfTestFailed(other)),
-    }
-
+    // Самотеста контроллера (0xAA) нет намеренно: на части ноутбуков он
+    // сбрасывает контроллер, и клавиатура после него молчит; Linux на x86 его
+    // по умолчанию не делает. Тест порта — только для журнала.
     write_port(PORT_COMMAND, CMD_TEST_PORT1)?;
-    match read_data()? {
-        PORT_TEST_PASSED => {}
-        other => return Err(Ps2Error::PortTestFailed(other)),
-    }
-
-    write_port(PORT_COMMAND, CMD_ENABLE_PORT1)?;
-
-    // Клавиатура: сброс, затем явный выбор набора кодов. Сброс нужен потому, что
-    // прошивка оставляет её в неизвестном состоянии — в том числе с включённым
-    // сканированием и накопленными в буфере кодами.
-    keyboard_command(KBD_DISABLE_SCANNING)?;
-    flush();
-    keyboard_command(KBD_RESET)?;
-    // После ACK клавиатура сообщает результат самотеста. Ответ приходит с
-    // задержкой в несколько миллисекунд, поэтому ждём его отдельно.
     match read_data() {
-        Ok(KBD_SELF_TEST_PASSED) => {}
-        // Не все реализации присылают этот байт (QEMU присылает). Отказываться
-        // из-за его отсутствия неправильно: клавиатура уже подтвердила сброс.
-        Ok(_) | Err(_) => flush(),
+        Ok(PORT_TEST_PASSED) => {}
+        Ok(other) => crate::kprintln!("  ps2         : keyboard port test returned {other:#04x}; trying anyway"),
+        Err(err) => crate::kprintln!("  ps2         : keyboard port test: {err}; trying anyway"),
     }
-
-    write_port(PORT_DATA, KBD_SET_SCANCODE_SET)?;
-    match read_data()? {
-        KBD_ACK => {}
-        other => return Err(Ps2Error::NoAck(other)),
-    }
-    write_port(PORT_DATA, SCANCODE_SET_2)?;
-    match read_data()? {
-        KBD_ACK => {}
-        other => return Err(Ps2Error::NoAck(other)),
-    }
-
-    keyboard_command(KBD_ENABLE_SCANNING)?;
+    write_port(PORT_COMMAND, CMD_ENABLE_PORT1)?;
     flush();
 
-    // Прерывание разрешается последним действием: к этому моменту в буфере
-    // ничего нашего не осталось, и первый же байт будет настоящим нажатием.
-    write_port(PORT_COMMAND, CMD_WRITE_CONFIG)?;
-    write_port(PORT_DATA, config | CONFIG_PORT1_INTERRUPT)?;
+    let keyboard = start_keyboard();
+    let mouse = start_mouse();
 
-    Ok(())
+    // Прерывания разрешаются последним действием: к этому моменту в буфере
+    // ничего нашего не осталось, и первый же байт будет настоящим.
+    let mut config = config & !CONFIG_PORT1_CLOCK_OFF;
+    config |= CONFIG_PORT1_INTERRUPT;
+    if mouse {
+        config = (config & !CONFIG_PORT2_CLOCK_OFF) | CONFIG_PORT2_INTERRUPT;
+    } else {
+        config |= CONFIG_PORT2_CLOCK_OFF;
+    }
+    flush();
+    write_port(PORT_COMMAND, CMD_WRITE_CONFIG)?;
+    write_port(PORT_DATA, config)?;
+    Ok(Ps2Devices { keyboard, mouse })
+}
+
+/// Клавиатура: сброс, набор кодов 2 (контроллер переводит в 1), сканирование.
+/// Каждый шаг — попытка: прошивка уже оставила клавиатуру работающей.
+fn start_keyboard() -> bool {
+    let mut answered = false;
+    let note = |step: &str, result: Result<(), Ps2Error>| match result {
+        Ok(()) => true,
+        Err(err) => {
+            crate::kprintln!("  ps2         : keyboard {step}: {err}; keeping the firmware's setup");
+            false
+        }
+    };
+    let _ = note("disable scanning", keyboard_command(KBD_DISABLE_SCANNING));
+    flush();
+    if note("reset", keyboard_command(KBD_RESET)) {
+        answered = true;
+        // После ACK клавиатура сообщает результат самотеста — не все.
+        match read_data() {
+            Ok(KBD_SELF_TEST_PASSED) => {}
+            Ok(_) | Err(_) => flush(),
+        }
+    }
+    if note("scancode set", keyboard_command(KBD_SET_SCANCODE_SET))
+        && note("scancode set 2", keyboard_command(SCANCODE_SET_2))
+    {
+        answered = true;
+    }
+    answered |= note("enable scanning", keyboard_command(KBD_ENABLE_SCANNING));
+    flush();
+    if !answered {
+        crate::kprintln!("  ps2         : the keyboard answers no command; listening anyway");
+    }
+    // Клавиатура включена в любом случае: молчание на команды ещё не значит
+    // молчание на клавиши.
+    true
+}
+
+/// Мышь (тачпад) на втором порту: есть ли порт, сброс, умолчания, отчёты.
+fn start_mouse() -> bool {
+    if write_port(PORT_COMMAND, CMD_ENABLE_PORT2).is_err() || write_port(PORT_COMMAND, CMD_TEST_PORT2).is_err() {
+        return false;
+    }
+    match read_data() {
+        Ok(PORT_TEST_PASSED) => {}
+        Ok(other) => {
+            crate::kprintln!("  ps2         : no mouse port (test returned {other:#04x})");
+            let _ = write_port(PORT_COMMAND, CMD_DISABLE_PORT2);
+            return false;
+        }
+        Err(_) => {
+            crate::kprintln!("  ps2         : no mouse port");
+            let _ = write_port(PORT_COMMAND, CMD_DISABLE_PORT2);
+            return false;
+        }
+    }
+    let _ = write_port(PORT_COMMAND, CMD_ENABLE_PORT2);
+    flush();
+    if let Err(err) = mouse_command(KBD_RESET) {
+        crate::kprintln!("  ps2         : nothing answers on the mouse port ({err})");
+        let _ = write_port(PORT_COMMAND, CMD_DISABLE_PORT2);
+        return false;
+    }
+    // После сброса: 0xAA (самотест) и номер устройства (0 — обычная мышь).
+    let test = read_data().unwrap_or(0);
+    let id = read_data().unwrap_or(0xFF);
+    flush();
+    // Умолчания (100 отчётов в секунду, обычный режим) и включение отчётов.
+    let defaults = mouse_command(0xF6);
+    let enable = mouse_command(KBD_ENABLE_SCANNING);
+    match (defaults, enable) {
+        (_, Ok(())) => {
+            crate::kprintln!("  ps2         : mouse on port 2 (self-test {test:#04x}, id {id:#04x}), 3-byte packets");
+            true
+        }
+        (_, Err(err)) => {
+            crate::kprintln!("  ps2         : the mouse did not enable reporting: {err}");
+            let _ = write_port(PORT_COMMAND, CMD_DISABLE_PORT2);
+            false
+        }
+    }
 }
 
 // --- Разбор scancode set 1 ----------------------------------------------------
@@ -339,8 +436,52 @@ pub fn on_interrupt() {
         }
         // SAFETY: байт есть; чтение извлекает его из буфера.
         let byte = unsafe { inb(PORT_DATA) };
-        feed(byte);
+        if status & STATUS_AUX != 0 {
+            feed_mouse(byte);
+        } else {
+            feed(byte);
+        }
     }
+}
+
+/// Пакет мыши, собираемый по байту.
+struct MousePacket {
+    bytes: [u8; 3],
+    len: usize,
+}
+
+static MOUSE: SpinLock<MousePacket> = SpinLock::new(MousePacket { bytes: [0; 3], len: 0 });
+
+/// Принять байт мыши; третий байт пакета — событие.
+///
+/// Первый байт пакета узнаётся по биту 3 (всегда единица): потерянный байт
+/// иначе сдвинул бы все следующие пакеты, и курсор поехал бы наискось.
+fn feed_mouse(byte: u8) {
+    let packet = {
+        let Some(mut mouse) = MOUSE.try_lock() else {
+            return;
+        };
+        if mouse.len == 0 && byte & 0x08 == 0 {
+            return;
+        }
+        let at = mouse.len;
+        mouse.bytes[at] = byte;
+        mouse.len += 1;
+        if mouse.len < 3 {
+            return;
+        }
+        mouse.len = 0;
+        mouse.bytes
+    };
+    let [flags, x, y] = packet;
+    // Переполнение (биты 6 и 7) — приращение недостоверно, пакет выбрасывается.
+    if flags & 0xC0 != 0 {
+        return;
+    }
+    let dx = i32::from(x) - if flags & 0x10 != 0 { 256 } else { 0 };
+    let dy = i32::from(y) - if flags & 0x20 != 0 { 256 } else { 0 };
+    // У PS/2 «вверх» — плюс, у экрана — минус.
+    crate::input::post_pointer(dx, -dy, 0, crate::input::Buttons::from_bits(flags & 0x07));
 }
 
 /// Скормить декодеру один scancode.
@@ -518,7 +659,11 @@ pub fn poll_once() -> bool {
         }
         // SAFETY: байт есть.
         let byte = unsafe { inb(PORT_DATA) };
-        feed(byte);
+        if status & STATUS_AUX != 0 {
+            feed_mouse(byte);
+        } else {
+            feed(byte);
+        }
         true
     })
 }

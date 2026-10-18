@@ -314,6 +314,10 @@ struct Device {
     storage: Option<Storage>,
     /// Если это сетевая функция — её bulk-точки и буферы (фаза 68p).
     net: Option<Net>,
+    /// Остальные интерфейсы HID того же устройства (0.8): у приёмника
+    /// «клавиатура с тачпадом» нулевой интерфейс — клавиатура, а указатель —
+    /// первый, и без них тачпад молчал.
+    extra: Vec<ExtraHid>,
     /// Номер подъёма: слот после выдёргивания достаётся следующему
     /// устройству, а ссылка на накопитель не должна попасть в чужое.
     serial: u32,
@@ -413,9 +417,22 @@ struct Hub {
     changed: u32,
 }
 
+/// Ещё один интерфейс HID устройства: своя точка прерываний на том же слоте.
+struct ExtraHid {
+    interface: u8,
+    interrupt: Ring,
+    target: u8,
+    report: DmaBuffer,
+    report_len: u16,
+    reader: Reader,
+    queued: bool,
+    described_by: u16,
+}
+
 /// Что за устройство нашлось по дескрипторам.
 enum Described {
-    Hid(HidInterface),
+    /// Первый интерфейс HID и остальные.
+    Hid(HidInterface, Vec<HidInterface>),
     Hub(HubInterface),
     Storage(StorageInterface),
     Net(NetInterface),
@@ -1435,6 +1452,7 @@ impl Controller {
             hub: None,
             storage: None,
             net: None,
+            extra: Vec::new(),
             serial: SERIALS.fetch_add(1, Ordering::Relaxed),
             context,
             input,
@@ -1489,7 +1507,13 @@ impl Controller {
             let (keyboard, mouse, _) = unsafe { self.scan_hub(slot) };
             return Ok((keyboard, mouse));
         }
-        Ok((protocol == usb::PROTOCOL_KEYBOARD, protocol == usb::PROTOCOL_MOUSE))
+        let extra = |want: u8| {
+            self.find(slot).is_some_and(|d| d.extra.iter().any(|entry| entry.reader.protocol() == want))
+        };
+        Ok((
+            protocol == usb::PROTOCOL_KEYBOARD || extra(usb::PROTOCOL_KEYBOARD),
+            protocol == usb::PROTOCOL_MOUSE || extra(usb::PROTOCOL_MOUSE),
+        ))
     }
 
     /// Адрес, дескрипторы и конфигурация — как хаба или как HID. Возвращает
@@ -1505,10 +1529,10 @@ impl Controller {
         kprintln!("  usb         : slot {slot} addressed");
 
         // SAFETY: устройство отвечает на управляющей точке.
-        let found = match unsafe { self.describe_device(device, speed) }
+        let (found, others) = match unsafe { self.describe_device(device, speed) }
             .map_err(|err| (Stage::Describe, err))?
         {
-            Described::Hid(found) => found,
+            Described::Hid(found, others) => (found, others),
             Described::Hub(hub) => {
                 // SAFETY: см. выше.
                 unsafe { self.bring_up_hub(device, &hub) }.map_err(|err| (Stage::Configure, err))?;
@@ -1560,7 +1584,90 @@ impl Controller {
         // Разборщик ставится последним: до этого момента буфер занят
         // дескрипторами, и отчёт в него ещё не запрашивался.
         device.reader = Some(reader);
+        for other in others {
+            // Отказ второго интерфейса не отменяет первого.
+            // SAFETY: устройство сконфигурировано, буфер ещё свободен.
+            if let Err(err) = unsafe { self.bring_up_extra(device, &other) } {
+                kprintln!("  usb         : slot {slot} interface {} stopped: {err}", other.interface);
+            }
+        }
         Ok(protocol)
+    }
+
+    /// Поднять ещё один интерфейс HID: точка прерываний на том же слоте,
+    /// протокол и разборщик — без повторного `SET_CONFIGURATION`, который
+    /// сбросил бы уже настроенные точки.
+    ///
+    /// # Safety
+    ///
+    /// Устройство сконфигурировано; буфер `device.report` свободен.
+    unsafe fn bring_up_extra(&mut self, device: &mut Device, found: &HidInterface) -> Result<(), XhciError> {
+        let target = found.endpoint * 2 + 1;
+        let interrupt = Ring::new(dma::alloc(RING_ENTRIES * ring::TRB_LEN)?);
+        let report = dma::alloc(PAGE_SIZE)?;
+        let speed = device.speed;
+        // SAFETY: контракт функции; контексты выделены.
+        unsafe {
+            self.clear_input(device);
+            self.write_context(&device.input, 0, 1, 1 | (1 << target));
+            for dword in 0..4 {
+                let value = self.read_context(&device.context, 0, dword);
+                self.write_context(&device.input, 1, dword, value);
+            }
+            let slot0 = self.read_context(&device.context, 0, 0);
+            let entries = ((slot0 >> 27) & 0x1F).max(u32::from(target));
+            self.write_context(&device.input, 1, 0, (slot0 & !(0x1F << 27)) | (entries << 27));
+            let index = usize::from(target) + 1;
+            let interval = endpoint_interval(speed, found.interval);
+            let packet = u32::from(found.max_packet_size);
+            self.write_context(&device.input, index, 0, u32::from(interval) << 16);
+            self.write_context(&device.input, index, 1, (packet << 16) | (7 << 3) | (3 << 1));
+            let dequeue = interrupt.phys() | 1;
+            self.write_context(&device.input, index, 2, dequeue as u32);
+            self.write_context(&device.input, index, 3, (dequeue >> 32) as u32);
+            self.write_context(&device.input, index, 4, packet | (packet << 16));
+        }
+        // SAFETY: входной контекст заполнен.
+        let configured = unsafe {
+            self.command_execute(Trb {
+                parameter: device.input.phys().as_u64(),
+                status: 0,
+                control: (ring::TRB_CONFIGURE_ENDPOINT << ring::TRB_TYPE_SHIFT) | (u32::from(device.slot) << 24),
+            })
+        };
+        let reader = configured.and_then(|_| {
+            // SAFETY: точка заведена, буфер свободен.
+            unsafe { self.enable_interface(device, found) }
+        });
+        let reader = match reader {
+            Ok(reader) => reader,
+            Err(err) => {
+                // SAFETY: точка в контексте осталась без дескрипторов в кольце.
+                unsafe {
+                    dma::free(interrupt.buffer());
+                    dma::free(&report);
+                }
+                return Err(err);
+            }
+        };
+        kprintln!(
+            "  usb         : slot {} interface {} is a {} too, endpoint {} IN",
+            device.slot,
+            found.interface,
+            reader.name(),
+            found.endpoint
+        );
+        device.extra.push(ExtraHid {
+            interface: found.interface,
+            interrupt,
+            target,
+            report,
+            report_len: found.max_packet_size.clamp(1, PAGE_SIZE as u16),
+            reader,
+            queued: false,
+            described_by: found.report_len,
+        });
+        Ok(())
     }
 
     /// Поднять хаб: конфигурация, дескриптор хаба, точка прерываний, питание
@@ -2372,9 +2479,9 @@ impl Controller {
             let read = unsafe { self.get_descriptor(device, usb::DESC_CONFIGURATION, 0, total0) }?;
             // SAFETY: см. выше.
             let bytes = unsafe { core::slice::from_raw_parts(device.report.as_ptr::<u8>(), read) };
-            return usb::find_hid(bytes).map(Described::Hid).ok_or(XhciError::NoHid);
+            return hid_interfaces(bytes);
         }
-        usb::find_hid(bytes).map(Described::Hid).ok_or(XhciError::NoHid)
+        hid_interfaces(bytes)
     }
 
     /// Сообщить контроллеру настоящий размер пакета управляющей точки.
@@ -2518,7 +2625,16 @@ impl Controller {
                 false,
             )
         }?;
+        // SAFETY: устройство сконфигурировано.
+        unsafe { self.enable_interface(device, found) }
+    }
 
+    /// Дескриптор отчётов, протокол и `SET_IDLE` одного интерфейса HID.
+    ///
+    /// # Safety
+    ///
+    /// Устройство сконфигурировано, буфер отчётов свободен.
+    unsafe fn enable_interface(&mut self, device: &mut Device, found: &HidInterface) -> Result<Reader, XhciError> {
         // SAFETY: устройство сконфигурировано, буфер отчётов ещё свободен —
         // разборщик поставят после возврата отсюда.
         let described = unsafe { self.read_report_descriptor(device, found) };
@@ -2851,6 +2967,25 @@ impl Controller {
             // SAFETY: дескриптор записан целиком до звонка.
             unsafe { self.regs.ring_doorbell(slot, target) };
         }
+        // Остальные интерфейсы HID — тем же порядком.
+        for index in 0..self.devices.len() {
+            let slot = self.devices[index].slot;
+            for extra in 0..self.devices[index].extra.len() {
+                let entry = &mut self.devices[index].extra[extra];
+                if entry.queued {
+                    continue;
+                }
+                entry.interrupt.push(Trb {
+                    parameter: entry.report.phys().as_u64(),
+                    status: u32::from(entry.report_len),
+                    control: (ring::TRB_NORMAL << ring::TRB_TYPE_SHIFT) | ring::TRB_IOC | (1 << 2),
+                });
+                entry.queued = true;
+                let target = entry.target;
+                // SAFETY: дескриптор записан целиком до звонка.
+                unsafe { self.regs.ring_doorbell(slot, target) };
+            }
+        }
     }
 
     /// Разобрать событие о завершении передачи.
@@ -2896,6 +3031,19 @@ impl Controller {
             {
                 storage.done = Some((event.completion_code(), event.residual()));
             }
+            return;
+        }
+        if let Some(entry) = device.extra.iter_mut().find(|entry| entry.target == endpoint) {
+            entry.queued = false;
+            if !event.is_success() {
+                self.transfer_errors += 1;
+                return;
+            }
+            let received = usize::from(entry.report_len)
+                - (event.residual() as usize).min(usize::from(entry.report_len));
+            // SAFETY: буфер выделен на страницу, передача завершена.
+            let report = unsafe { core::slice::from_raw_parts(entry.report.as_ptr::<u8>(), received) };
+            entry.reader.handle_report(report);
             return;
         }
         if endpoint != device.interrupt_target {
@@ -3117,11 +3265,13 @@ impl Controller {
         let mut reports = 0;
         for device in &self.devices {
             reports += device.reader.as_ref().map_or(0, Reader::reports);
+            reports += device.extra.iter().map(|entry| entry.reader.reports()).sum::<u64>();
         }
         let mut attached = [Attached::default(); usb::ATTACHED_MAX];
         let functions = || self.devices.iter().filter(|device| device.hub.is_none());
-        for (slot, device) in attached.iter_mut().zip(functions()) {
-            *slot = Attached {
+        // По записи на интерфейс: второй интерфейс HID — своя строка.
+        let entries = functions().flat_map(|device| {
+            let first = Attached {
                 port: device.port,
                 vendor: device.identity.0,
                 product: device.identity.1,
@@ -3134,18 +3284,31 @@ impl Controller {
                 interface: device.interface.0,
                 interfaces: device.interface.1,
             };
+            core::iter::once(first).chain(device.extra.iter().map(move |entry| Attached {
+                port: device.port,
+                vendor: device.identity.0,
+                product: device.identity.1,
+                kind: entry.reader.name(),
+                descriptor: entry.described_by,
+                interface: entry.interface,
+                interfaces: device.interface.1,
+            }))
+        });
+        for (slot, entry) in attached.iter_mut().zip(entries) {
+            *slot = entry;
         }
 
-        let keyboards = self
-            .devices
-            .iter()
-            .filter(|device| matches!(device.reader, Some(Reader::Keyboard(_))))
-            .count();
-        let mice = self
-            .devices
-            .iter()
-            .filter(|device| matches!(device.reader, Some(Reader::Mouse(_))))
-            .count();
+        let count = |want: u8| {
+            self.devices
+                .iter()
+                .map(|device| {
+                    usize::from(device.reader.as_ref().is_some_and(|r| r.protocol() == want))
+                        + device.extra.iter().filter(|entry| entry.reader.protocol() == want).count()
+                })
+                .sum::<usize>()
+        };
+        let keyboards = count(usb::PROTOCOL_KEYBOARD);
+        let mice = count(usb::PROTOCOL_MOUSE);
         Summary {
             devices: functions().count(),
             hubs: self.devices.len() - functions().count(),
@@ -3247,6 +3410,10 @@ unsafe fn free_device(device: &Device) {
             dma::free(storage.bulk_out.buffer());
             dma::free(&storage.data);
         }
+        for entry in &device.extra {
+            dma::free(entry.interrupt.buffer());
+            dma::free(&entry.report);
+        }
         if let Some(net) = &device.net {
             dma::free(net.bulk_in.buffer());
             dma::free(net.bulk_out.buffer());
@@ -3254,6 +3421,13 @@ unsafe fn free_device(device: &Device) {
             dma::free(&net.tx);
         }
     }
+}
+
+/// Все интерфейсы HID конфигурации: первый и остальные.
+fn hid_interfaces(bytes: &[u8]) -> Result<Described, XhciError> {
+    let found = usb::find_hid(bytes).ok_or(XhciError::NoHid)?;
+    let others = (1..found.interfaces).filter_map(|index| usb::find_hid_nth(bytes, index)).collect();
+    Ok(Described::Hid(found, others))
 }
 
 /// Найти в конфигурации сетевую функцию: RNDIS или CDC ECM (фаза 68p).

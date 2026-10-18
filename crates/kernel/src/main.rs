@@ -114,6 +114,19 @@ const VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION_MINOR")
 );
 
+/// Номер сборки образа (`\FREEOS\BUILD` через загрузчик); ноль — неизвестен.
+static BUILD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Версия словами для человека: `0.8.482` — версия и номер сборки, или просто
+/// `0.8`, если номера нет (запуск стендом без образа).
+#[must_use]
+pub fn version_text() -> alloc::string::String {
+    match BUILD.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => alloc::string::String::from(VERSION),
+        build => alloc::format!("{VERSION}.{build}"),
+    }
+}
+
 /// Точка входа ядра на x86-64.
 ///
 /// ABI указан явно и `extern "C"` здесь был бы ошибкой. Загрузчик собран под
@@ -455,6 +468,11 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     // случаях — «проверки прав сегодня никому не откажут» обязано быть видно, а
     // не подразумеваться.
     user::session::adopt_account();
+
+    BUILD.store(info.build, core::sync::atomic::Ordering::Relaxed);
+    if info.build != 0 {
+        kprintln!("  build       : FreeOS {}", version_text());
+    }
 
     // Ключи SSH с флешки (фаза 68o): живая система впускает по ним `live`.
     let live_keys = &info.live_keys[..(info.live_keys_len as usize).min(info.live_keys.len())];

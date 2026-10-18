@@ -146,6 +146,7 @@ pub fn build_with_key(built: &Built, kind: Kind, live_key: Option<&Path>) -> Res
         return Ok(image_path);
     }
 
+    payload.push(build_file(build.number));
     let bytes = assemble(&payload, kind)?;
 
     if let Some(parent) = image_path.parent() {
@@ -175,6 +176,20 @@ pub fn build_with_key(built: &Built, kind: Kind, live_key: Option<&Path>) -> Res
     }
 
     Ok(image_path)
+}
+
+/// Файл `\FREEOS\BUILD`: номер сборки для окна «О системе» (0.8).
+///
+/// Кладётся **после** того, как слепок посчитан: номер выводится из слепка, и
+/// войди файл в него, номер зависел бы сам от себя. Содержимое образа при этом
+/// по-прежнему определяется исходниками — номер меняется ровно тогда, когда
+/// меняется код.
+fn build_file(number: u32) -> Payload {
+    Payload {
+        path: String::from("FREEOS/BUILD"),
+        data: format!("{number}\n").into_bytes(),
+        source: PathBuf::from("(номер сборки)"),
+    }
 }
 
 /// Читает всё, что должно попасть на ESP.
@@ -653,7 +668,7 @@ pub fn prepare_btrfs_disk(arch: Arch, release: bool) -> Result<PathBuf> {
 /// носитель целиком, а ISO — подключить одним пунктом меню гипервизора.
 pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     let arch = built.arch;
-    let payload = collect(built, kind)?;
+    let mut payload = collect(built, kind)?;
 
     let stamp_path = paths::iso_stamp(kind.slug(), arch, built.release);
     // Ревизия формата входит в слепок, и это не перестраховка: правка самого
@@ -661,7 +676,8 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     // актуальным и не пересобирался. Ровно так и вышло при переходе каталога
     // El Torito на секционную раскладку — исправленный код собрал тот же файл,
     // и загрузка «по-прежнему» не работала.
-    const ISO_FORMAT_REVISION: u32 = 2;
+    // Ревизия 3 — файл `\FREEOS\BUILD` с номером сборки (0.8).
+    const ISO_FORMAT_REVISION: u32 = 3;
     let stamp = format!("iso-format={ISO_FORMAT_REVISION}
 {}", stamp_text(&payload, kind));
     let build = version::resolve_build(&stamp_path, &stamp)?;
@@ -676,6 +692,7 @@ pub fn build_iso(built: &Built, kind: Kind) -> Result<PathBuf> {
     // Том FAT32 собирается без разметки вокруг: внутри ISO он не раздел, а
     // просто образ, который прошивка монтирует целиком. Ровно то же делает
     // «суперфлоппи» — носитель без таблицы разделов.
+    payload.push(build_file(build.number));
     let boot = assemble_fat(&payload)?;
 
     let readme = iso_readme(arch, kind);

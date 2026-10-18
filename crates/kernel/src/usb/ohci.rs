@@ -199,6 +199,12 @@ const RESET_TIMEOUT_MS: u64 = 100;
 const TRANSFER_TIMEOUT_MS: u64 = 500;
 /// Сколько ждать окончания сброса порта.
 const PORT_RESET_TIMEOUT_MS: u64 = 500;
+/// Сколько раз пробовать сброс порта, прежде чем оставить устройство (0.8).
+const RESET_RETRIES: u8 = 5;
+/// Дебаунс подключения перед сбросом (USB 2.0, 7.1.7.3) — как у xHCI и EHCI.
+/// Без него VirtualBox, ещё захватывающий настоящее устройство у хоста,
+/// сброса не завершал (приёмник «клавиатура с тачпадом», 0.8).
+const DEBOUNCE_MS: u64 = 100;
 /// Пауза после сброса порта: спецификация USB требует дать устройству время на
 /// восстановление, прежде чем обращаться к нему.
 const PORT_RECOVERY_MS: u64 = 20;
@@ -566,6 +572,10 @@ pub struct Controller {
     occupied: usize,
     /// Маска занятых портов на момент последней сверки.
     connected: u32,
+    /// Сколько раз подряд не удался сброс порта — по порту (0.8). Такой порт
+    /// не считается разобранным, и следующая сверка пробует снова, но не больше
+    /// [`RESET_RETRIES`] раз: сломанное устройство не должно сбрасываться вечно.
+    reset_failures: [u8; 32],
     /// Сколько передач завершилось ошибкой.
     errors: u64,
     /// Сколько раз задача просыпалась обслуживать контроллер.
@@ -637,6 +647,7 @@ impl Controller {
             ports: 0,
             occupied: 0,
             connected: 0,
+            reset_failures: [0; 32],
             errors: 0,
             services: 0,
             last_error: None,
@@ -843,6 +854,7 @@ impl Controller {
             return Err((Stage::Reset, OhciError::TooMany));
         }
 
+        sleep_ms(DEBOUNCE_MS);
         // SAFETY: контракт функции.
         let low_speed = unsafe { self.reset_port(index) }.map_err(|err| (Stage::Reset, err))?;
 
@@ -911,6 +923,11 @@ impl Controller {
         device.report_len = found.max_packet_size.clamp(1, 64);
         device.interface = (found.interface, found.interfaces);
         device.reader = Some(reader);
+
+        if found.interfaces > 1 {
+            // SAFETY: устройство сконфигурировано.
+            unsafe { self.describe_other_interfaces(&device, max_packet, found.interfaces) };
+        }
 
         // SAFETY: устройство сконфигурировано, буфер отчётов свободен.
         unsafe { self.open_interrupt_endpoint(&device, &found) };
@@ -1016,6 +1033,69 @@ impl Controller {
         // SAFETY: см. выше.
         let bytes = unsafe { core::slice::from_raw_parts(self.transfer_data(), read) };
         usb::find_hid(bytes).ok_or(OhciError::NoHid)
+    }
+
+    /// Остальные интерфейсы HID составного устройства — в журнал: что из их
+    /// дескрипторов отчётов понял разборщик, и сами байты (0.8).
+    ///
+    /// OHCI поднимает только первый интерфейс; беспроводной приёмник «клавиатура
+    /// с тачпадом» держит указатель во втором, и на ноутбуке с EHCI (который
+    /// второй поднимает) указатель не заработал. Байты дескриптора — это то, по
+    /// чему чинится разбор, а взять их на чужой машине больше неоткуда.
+    ///
+    /// # Safety
+    ///
+    /// Устройство сконфигурировано.
+    unsafe fn describe_other_interfaces(&mut self, device: &Device, max_packet: u16, interfaces: u8) {
+        // SAFETY: контракт функции.
+        let Ok(read) = (unsafe { self.get_descriptor(device, usb::DESC_CONFIGURATION, 0, 9, max_packet) }) else {
+            return;
+        };
+        if read < 9 {
+            return;
+        }
+        // SAFETY: буфер выделен на страницу.
+        let total = {
+            let bytes = unsafe { core::slice::from_raw_parts(self.transfer_data(), read) };
+            u16::from_le_bytes([bytes[2], bytes[3]]).min(TRANSFER_DATA_MAX as u16)
+        };
+        // SAFETY: см. выше.
+        let Ok(read) = (unsafe { self.get_descriptor(device, usb::DESC_CONFIGURATION, 0, total, max_packet) })
+        else {
+            return;
+        };
+        // SAFETY: см. выше.
+        let config = unsafe { core::slice::from_raw_parts(self.transfer_data(), read) };
+        let others: Vec<HidInterface> = (1..interfaces).filter_map(|index| usb::find_hid_nth(config, index)).collect();
+        for other in others {
+            kprintln!(
+                "  ohci        : interface {} too: protocol {}, endpoint {} IN, {}-byte packets, report descriptor {} bytes",
+                other.interface,
+                other.protocol,
+                other.endpoint,
+                other.max_packet_size,
+                other.report_len
+            );
+            let length = other.report_len.min(TRANSFER_DATA_MAX as u16);
+            let setup = [
+                usb::REQ_DIR_IN | usb::REQ_RECIPIENT_INTERFACE,
+                usb::REQ_GET_DESCRIPTOR,
+                0,
+                usb::DESC_REPORT,
+                other.interface,
+                0,
+                length as u8,
+                (length >> 8) as u8,
+            ];
+            // SAFETY: см. выше.
+            let Ok(read) = (unsafe { self.control_transfer(device, max_packet, setup, length, true) }) else {
+                kprintln!("  ohci        : interface {}: the report descriptor could not be read", other.interface);
+                continue;
+            };
+            // SAFETY: см. выше.
+            let bytes = unsafe { core::slice::from_raw_parts(self.transfer_data(), read) };
+            super::hid::log_descriptor("ohci", other.interface, bytes);
+        }
     }
 
     /// Выбрать конфигурацию, прочитать дескриптор отчётов и договориться о
@@ -1536,6 +1616,7 @@ impl Controller {
         }
 
         // Новые порты поднимаются тем же путём, что при загрузке.
+        let mut retry = 0u32;
         for port_index in 0..self.ports {
             if mask & (1 << port_index) == 0 {
                 continue;
@@ -1544,17 +1625,31 @@ impl Controller {
             if self.devices.iter().any(|device| device.port == port) {
                 continue;
             }
+            if self.reset_failures[port_index] >= RESET_RETRIES {
+                continue;
+            }
             // SAFETY: контракт функции.
             match unsafe { self.attach_port(port_index) } {
-                Ok(()) => {}
+                Ok(()) => self.reset_failures[port_index] = 0,
                 Err((stage, err)) => {
                     kprintln!("  ohci        : port {port} stopped while {stage}: {err}");
                     self.last_error = Some((port, stage, err));
+                    if stage == Stage::Reset {
+                        self.reset_failures[port_index] += 1;
+                        retry |= 1 << port_index;
+                    }
                 }
             }
         }
 
-        self.connected = mask;
+        // Порт, где не прошёл сброс, не считается разобранным: маска не
+        // совпадёт с портами, и следующая сверка попробует ещё раз.
+        self.connected = mask & !retry;
+        for port_index in 0..self.ports.min(32) {
+            if mask & (1 << port_index) == 0 {
+                self.reset_failures[port_index] = 0;
+            }
+        }
         self.occupied = mask.count_ones() as usize;
 
         let sources = input::sources();

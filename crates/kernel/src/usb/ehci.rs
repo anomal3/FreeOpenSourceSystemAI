@@ -1192,7 +1192,9 @@ impl Controller {
         };
 
         // SAFETY: контракт функции; управляющая точка — первой записи.
-        let (reader, described_by) = unsafe { self.enable_reports_on(owner.pipe(), owner.place, found) }?;
+        // Без `SET_CONFIGURATION`: устройство уже сконфигурировано первой
+        // записью, и повтор сбросил бы ему настроенные точки (0.8).
+        let (reader, described_by) = unsafe { self.enable_reports_on(owner.pipe(), owner.place, found, false) }?;
         satellite.described_by = described_by;
         satellite.reader = Some(reader);
         // SAFETY: страница спутника выделена и обнулена.
@@ -1426,7 +1428,7 @@ impl Controller {
     unsafe fn enable_reports(&mut self, device: &mut Device, found: &HidInterface) -> Result<Reader, EhciError> {
         let pipe = device.pipe();
         // SAFETY: контракт функции.
-        let (reader, described_by) = unsafe { self.enable_reports_on(pipe, device.place, found) }?;
+        let (reader, described_by) = unsafe { self.enable_reports_on(pipe, device.place, found, true) }?;
         device.described_by = described_by;
         Ok(reader)
     }
@@ -1449,11 +1451,18 @@ impl Controller {
         pipe: Pipe,
         place: Place,
         found: &HidInterface,
+        configure: bool,
     ) -> Result<(Reader, u16), EhciError> {
-        // SAFETY: контракт функции.
-        unsafe {
-            self.control_transfer(pipe, [0, usb::REQ_SET_CONFIGURATION, found.configuration, 0, 0, 0, 0, 0], 0, false)
-        }?;
+        // `SET_CONFIGURATION` — только первому интерфейсу. Второй раз он
+        // сбрасывает устройству состояние уже открытых точек, и у приёмника
+        // «клавиатура с тачпадом» на ноутбуке (0.8) тачпад так и молчал; в
+        // xHCI, где второй интерфейс поднимается без повтора, он работает.
+        if configure {
+            // SAFETY: контракт функции.
+            unsafe {
+                self.control_transfer(pipe, [0, usb::REQ_SET_CONFIGURATION, found.configuration, 0, 0, 0, 0, 0], 0, false)
+            }?;
+        }
 
         // SAFETY: устройство сконфигурировано.
         let described = unsafe { self.read_report_descriptor(pipe, place, found) };

@@ -8146,7 +8146,7 @@ pub const ALL: &[Scenario] = &[
             Step::Line("slots"),
             Step::Await("booted from slot A", 15_000),
             Step::Line("cat /os-release"),
-            Step::Await("version=0.7", 15_000),
+            Step::Await("version=0.8", 15_000),
             // Файл человека, который обязан пережить смену системы целиком.
             // Пауза, а не ожидание приглашения: приглашение к этому моменту уже
             // напечатано, и ждать второго — значит ждать вечно. Пауза же
@@ -8167,7 +8167,7 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("sysupdate   : root image written"),
             Step::Wait(2_000),
 
-            Step::Line("sysupdate apply /media/freeos-0.8.fpk"),
+            Step::Line("sysupdate apply /media/freeos-0.9.fpk"),
             // Подпись годного сходится, и система говорит об этом словами.
             Step::Await("signature checks out against one of", 60_000),
             // Сроки те же, что у `update-net`, и подняты по той же причине:
@@ -8197,7 +8197,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("freeos> ", 60_000),
             // Версия новая: это и есть «система обновилась».
             Step::Line("cat /os-release"),
-            Step::Await("version=0.8", 15_000),
+            Step::Await("version=0.9", 15_000),
             Step::Line("slots"),
             Step::Await("booted from slot B", 15_000),
             // А состояние — прежнее: и учётная запись, и файл, записанный до
@@ -8281,7 +8281,7 @@ pub const ALL: &[Scenario] = &[
             // она новее установленного.
             Step::Line("sysupdate check"),
             Step::Await("the index is signed by a key this system trusts", 90_000),
-            Step::Await("the server offers FreeOS 0.9", 30_000),
+            Step::Await("the server offers FreeOS 0.10", 30_000),
             Step::Await("that is newer", 30_000),
             Step::Wait(2_000),
 
@@ -8294,7 +8294,7 @@ pub const ALL: &[Scenario] = &[
             // отладочном ядре под эмуляцией. Программа печатает ход каждые
             // четыре мегабайта — по журналу видно, что она движется, а не
             // висит.
-            Step::Await("downloaded and verified 0.9", 2_400_000),
+            Step::Await("downloaded and verified 0.10", 2_400_000),
             // Ждём **терминал**, а не две секунды. Разница стоила трёх полных
             // прогонов подряд, и всякий раз на x86-64: программа напечатала
             // последнюю строку, но оболочка ещё убирает за ней — печатает
@@ -8321,7 +8321,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await("freeos> ", 120_000),
             Step::Line("cat /os-release"),
-            Step::Await("version=0.9", 15_000),
+            Step::Await("version=0.10", 15_000),
             // Умолчания приехали вместе с образом.
             Step::Expect("services    : described by /usr/share/defaults/etc/services"),
             // А правка человека пережила смену системы целиком: она на разделе
@@ -8396,7 +8396,7 @@ pub const ALL: &[Scenario] = &[
             // Третий: TLS 1.3 с сертификатом на **адрес** (iPAddress в SAN),
             // проверенной цепочкой и подписанным индексом.
             Step::Await("the index is signed by a key this system trusts", 120_000),
-            Step::Await("the server offers FreeOS 0.9", 30_000),
+            Step::Await("the server offers FreeOS 0.10", 30_000),
             Step::Wait(1_000),
 
             // И объёмная загрузка по тому же каналу: полмегабайта — это сотни
