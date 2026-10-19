@@ -115,6 +115,23 @@ static ADAPTER: SpinLock<Option<Adapter>> = SpinLock::new(None);
 /// Экран уже переведён в родное разрешение этим драйвером.
 static ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Регистры прошивки до первого переключения — чтобы вернуть её растянутую
+/// картинку, если человек выберет в «Параметрах» её режим.
+#[derive(Clone, Copy)]
+struct Firmware {
+    pf_ctl: u32,
+    pf_win_pos: u32,
+    pf_win_sz: u32,
+    pipesrc: u32,
+    stride: u32,
+    linoff: u32,
+    tileoff: u32,
+    width: u32,
+    height: u32,
+}
+
+static FIRMWARE: SpinLock<Option<Firmware>> = SpinLock::new(None);
+
 impl Adapter {
     fn read(&self, offset: usize) -> u32 {
         // SAFETY: окно регистров отображено как память устройства, смещение —
@@ -262,8 +279,56 @@ pub fn set_mode(current: &Framebuffer, width: u32, height: u32) -> Result<Frameb
     let surface = base.checked_sub(adapter.aperture).ok_or(DisplayError::Refused("the picture is outside the aperture"))?;
     let pipe = adapter.active_pipe(surface).ok_or(DisplayError::Refused("no pipe shows the firmware picture"))?;
     let (panel_w, panel_h) = adapter.timings(pipe);
-    if (width, height) != (panel_w, panel_h) && (width, height) != adapter.source(pipe) {
-        return Err(DisplayError::Refused("only the panel's own mode can be set without changing clocks"));
+    let firmware = *FIRMWARE.lock();
+
+    // Обратно к режиму прошивки: её регистры — на место, масштабировщик снова
+    // растягивает её картинку на панель.
+    if let Some(saved) = firmware.filter(|saved| (saved.width, saved.height) == (width, height)) {
+        let stride = saved.stride;
+        let len = (u64::from(stride) * u64::from(height)) as usize;
+        let len = len.next_multiple_of(PAGE_SIZE);
+        let phys = PhysAddr::new(base);
+        let virt = phys.to_direct_map();
+        // SAFETY: память кадра адаптера; отображение уже есть с прошлого
+        // переключения или шире — повторное с теми же правами безвредно.
+        unsafe { crate::arch::map_active(virt, phys, len, PageFlags::READ | PageFlags::WRITE | PageFlags::WRITE_COMBINE) }
+            .map_err(|_| DisplayError::OutOfMemory)?;
+        adapter.write(pipesrc(pipe), saved.pipesrc);
+        adapter.write(dspstride(pipe), saved.stride);
+        if adapter.generation <= 6 {
+            adapter.write(dsplinoff(pipe), saved.linoff);
+        }
+        adapter.write(dsptileoff(pipe), saved.tileoff);
+        adapter.write(pf_win_pos(pipe), saved.pf_win_pos);
+        adapter.write(pf_win_sz(pipe), saved.pf_win_sz);
+        adapter.write(pf_ctl(pipe), saved.pf_ctl);
+        adapter.write(dspsurf(pipe), adapter.read(dspsurf(pipe)));
+        ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+        return Ok(Framebuffer {
+            base: virt.as_usize() as u64,
+            size: len as u64,
+            width,
+            height,
+            stride: stride / 4,
+            format: current.format,
+        });
+    }
+    if (width, height) != (panel_w, panel_h) {
+        return Err(DisplayError::Refused("only the panel's own mode and the firmware's can be set without changing clocks"));
+    }
+    if firmware.is_none() {
+        let (fw_w, fw_h) = adapter.source(pipe);
+        *FIRMWARE.lock() = Some(Firmware {
+            pf_ctl: adapter.read(pf_ctl(pipe)),
+            pf_win_pos: adapter.read(pf_win_pos(pipe)),
+            pf_win_sz: adapter.read(pf_win_sz(pipe)),
+            pipesrc: adapter.read(pipesrc(pipe)),
+            stride: adapter.read(dspstride(pipe)),
+            linoff: adapter.read(dsplinoff(pipe)),
+            tileoff: adapter.read(dsptileoff(pipe)),
+            width: fw_w,
+            height: fw_h,
+        });
     }
 
     // Шаг строки кратен 64 байтам — требование плоскости.
@@ -351,25 +416,31 @@ pub fn command(current: &Framebuffer, argument: &str) -> Vec<String> {
                 adapter.aperture
             ));
             let surface = super::physical(current.base).saturating_sub(adapter.aperture);
-            out.push(format!("intel: firmware picture {}x{} stride {} at aperture offset {surface:#x}", current.width, current.height, current.stride));
+            out.push(format!(
+                "intel: desktop picture {}x{} stride {} at aperture offset {surface:#x}, {}",
+                current.width,
+                current.height,
+                current.stride,
+                if active() { "native mode set by this driver" } else { "the firmware's mode" }
+            ));
             for pipe in 0..3 {
                 let conf = adapter.read(pipeconf(pipe));
                 if conf & ENABLE == 0 {
-                    out.push(format!("intel: pipe {} off", b'A' + pipe as u8));
+                    out.push(format!("intel: pipe {} off", char::from(b'A' + pipe as u8)));
                     continue;
                 }
                 let (w, h) = adapter.timings(pipe);
                 let (sw, sh) = adapter.source(pipe);
                 out.push(format!(
                     "intel: pipe {} timings {w}x{h}, source {sw}x{sh}, fitter {:#010x} pos {:#010x} size {:#010x}",
-                    b'A' + pipe as u8,
+                    char::from(b'A' + pipe as u8),
                     adapter.read(pf_ctl(pipe)),
                     adapter.read(pf_win_pos(pipe)),
                     adapter.read(pf_win_sz(pipe))
                 ));
                 out.push(format!(
                     "intel: plane {} control {:#010x} stride {} surface {:#x}",
-                    b'A' + pipe as u8,
+                    char::from(b'A' + pipe as u8),
                     adapter.read(dspcntr(pipe)),
                     adapter.read(dspstride(pipe)),
                     adapter.read(dspsurf(pipe))
@@ -388,6 +459,7 @@ pub fn command(current: &Framebuffer, argument: &str) -> Vec<String> {
             drop(guard);
             match native(current) {
                 Some((w, h)) => out.push(format!("intel: the panel is {w}x{h} and the firmware stretches its picture; 'intel native' switches")),
+                None if active() => out.push(String::from("intel: the panel runs its own mode; Settings can switch back to the firmware's")),
                 None => out.push(String::from("intel: the firmware picture is already the panel's own mode")),
             }
         }
