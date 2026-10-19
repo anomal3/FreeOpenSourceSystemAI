@@ -162,8 +162,9 @@ impl SettingsView {
         let mounts = format!("Точек монтирования: {}", fs::mounted().len());
         y = row(pass, x, y, w, Some(Fi::Drive), "Хранилище", &mounts, Ctl::Nav, Some(Deed::Open(Section::Storage)));
         let packages = match &self.cache.packages {
+            Some(Ok(list)) if list.is_empty() => String::from("Пока не установлено ни одного"),
             Some(Ok(list)) => format!("Установлено: {}", list.len()),
-            _ => String::from("Пока ни одного: реестра /var/lib/pkg нет"),
+            _ => String::from("Реестр пакетов не прочитан"),
         };
         y = row(pass, x, y, w, Some(Fi::Package), "Пакеты", &packages, Ctl::Nav, Some(Deed::Open(Section::Packages)));
 
@@ -932,7 +933,13 @@ fn accounts() -> Vec<(String, u32, u32)> {
 pub(super) fn packages() -> Result<Vec<String>, String> {
     const REGISTRY: &str = "/var/lib/pkg";
     let listing = fs::list(REGISTRY).ok_or_else(|| "файловой системы нет".to_string())?;
-    let entries = listing.map_err(|err| format!("{err:?}"))?;
+    let entries = match listing {
+        Ok(entries) => entries,
+        // Каталога реестра нет — значит, ничего ещё не ставили (живая система,
+        // свежая установка). Это пустой список, а не отказ.
+        Err(crate::vfs::VfsError::NotFound) => return Ok(Vec::new()),
+        Err(err) => return Err(format!("{err:?}")),
+    };
     let mut names: Vec<String> = entries
         .into_iter()
         .filter(|entry| entry.name.ends_with(".pkg"))
