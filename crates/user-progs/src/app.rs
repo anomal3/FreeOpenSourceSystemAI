@@ -28,7 +28,7 @@ use mini_ui::paint::Ctx;
 use mini_ui::{Rect, Surface, theme};
 
 use crate::{
-    SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_POINTER, Window, exit, monotonic_ms, nanosleep,
+    SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_POINTER, WIN_WHEEL, Window, exit, monotonic_ms, nanosleep,
     println, sysinfo,
 };
 
@@ -77,6 +77,11 @@ pub trait App {
 
     /// Раз в период: свежие счётчики системы. Здесь перечитывают данные.
     fn tick(&mut self, _info: &SysInfo) -> bool {
+        false
+    }
+
+    /// Колесо мыши: положительное — от себя (фаза 69c).
+    fn wheel(&mut self, _clicks: i32) -> bool {
         false
     }
 
@@ -188,6 +193,7 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                 WIN_KEY => app.key(event.code),
                 WIN_POINTER if event.code == RIGHT_BUTTON => app.click_right(area, ctx, event.x, event.y),
                 WIN_POINTER => app.click(area, ctx, event.x, event.y),
+                WIN_WHEEL => app.wheel(event.x),
                 _ => false,
             };
             if handled {

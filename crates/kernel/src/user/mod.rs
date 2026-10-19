@@ -3612,6 +3612,16 @@ impl core::fmt::Display for KillError {
 /// Путь и uid программы в слоте — для диспетчера задач. `None` — слот не
 /// исполняет программу.
 #[must_use]
+/// Сколько страниц своей памяти у программы задачи в этом слоте (фаза 69c).
+pub fn program_pages(slot: usize) -> Option<usize> {
+    let process = {
+        let table = PROGRAMS.lock();
+        table.get(slot)?.as_ref()?.clone()
+    };
+    let program = process.lock();
+    Some(program.space.owned_pages())
+}
+
 pub fn program_facts(slot: usize) -> Option<(alloc::string::String, u32)> {
     // Ссылка клонируется под локом таблицы, а читается уже без него: печать
     // этой строки идёт из `tasks`, и держать на ней лок, который ждёт каждый

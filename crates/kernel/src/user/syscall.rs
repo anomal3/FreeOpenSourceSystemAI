@@ -1825,19 +1825,23 @@ fn tasks(ptr: usize, len: usize) -> i64 {
             Some((path, uid)) => {
                 let kind = if task.daemon { "service" } else { "program" };
                 let name = path.rsplit('/').next().unwrap_or(task.name);
+                let pages = super::program_pages(task.slot).unwrap_or(0);
                 alloc::format!(
-                    "{}\t{name}\t{}\t{}\t{kind}\t{uid}\t{path}\n",
+                    "{}\t{name}\t{}\t{}\t{kind}\t{uid}\t{path}\t{}\t{pages}\n",
                     task.id.as_u32(),
                     task.state,
-                    task.cpu_ms
+                    task.cpu_ms,
+                    task.switches
                 )
             }
+            // У задачи ядра своих страниц нет: стек и куча — ядерные.
             None => alloc::format!(
-                "{}\t{}\t{}\t{}\tkernel\t-\t\n",
+                "{}\t{}\t{}\t{}\tkernel\t-\t\t{}\t-\n",
                 task.id.as_u32(),
                 task.name,
                 task.state,
-                task.cpu_ms
+                task.cpu_ms,
+                task.switches
             ),
         };
         let bytes = line.as_bytes();

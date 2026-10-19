@@ -1423,6 +1423,8 @@ pub struct TaskFacts {
     /// Вместе с незакрытым отрезком исполняющейся задачи, как в [`dump`].
     pub cpu_ms: u64,
     pub daemon: bool,
+    /// Сколько раз задачу ставили на процессор (фаза 69c, диспетчер задач).
+    pub switches: u64,
 }
 
 /// Снимок всех задач — для `SYS_TASKS`.
@@ -1446,6 +1448,7 @@ pub fn snapshot() -> alloc::vec::Vec<TaskFacts> {
             state: task.state,
             cpu_ms: task.cpu_ms + running,
             daemon: task.daemon,
+            switches: task.switches,
         });
     }
     out

@@ -55,6 +55,10 @@ pub const WINDOW_SLOT: usize = VirtAddr::new(super::WINDOW_BASE).table_index(ROO
 /// Адресное пространство одной программы.
 pub struct Space {
     root: PhysAddr,
+    /// Сколько страниц памяти программы отображено её собственными кадрами
+    /// (фаза 69c — колонка «Память» диспетчера задач). Кадры окна и чужие
+    /// ([`Space::map_frames`]) сюда не входят: ими владеет не программа.
+    owned: usize,
 }
 
 impl Space {
@@ -70,7 +74,7 @@ impl Space {
         // для вызывающего неотличимо от исчерпания пула.
         .unwrap_or(Err(MapError::OutOfFrames))?;
 
-        Ok(Self { root })
+        Ok(Self { root, owned: 0 })
     }
 
     /// Отобразить страницу в память программы.
@@ -89,13 +93,23 @@ impl Space {
         // SAFETY: корень принадлежит этому объекту и жив, пока жив он; таблицы
         // ядра активны, и записи правятся через прямое отображение.
         let mut space = unsafe { arch::space_at(self.root) };
-        crate::mm::frame::with(|frames| {
+        let result = crate::mm::frame::with(|frames| {
             // SAFETY: адрес лежит в окне программы, которое ядро ни подо что
             // другое не использует, — увести из-под работающего кода это
             // отображение не может.
             unsafe { space.map(virt, phys, flags, frames) }
         })
-        .unwrap_or(Err(MapError::OutOfFrames))
+        .unwrap_or(Err(MapError::OutOfFrames));
+        if result.is_ok() {
+            self.owned += 1;
+        }
+        result
+    }
+
+    /// Сколько страниц у программы своих.
+    #[must_use]
+    pub const fn owned_pages(&self) -> usize {
+        self.owned
     }
 
     /// Физический адрес корневой таблицы — то, что уезжает в `CR3`/`TTBR0_EL1`.
@@ -239,12 +253,15 @@ impl Space {
             done += made;
 
             if let Some(err) = failure {
+                // Отображённое засчитывается, чтобы снятие ниже его и вычло.
+                self.owned += done;
                 // SAFETY: снимается ровно то, что отображено этим вызовом.
                 unsafe { self.unmap_range(base, done, false) };
                 return Err(err);
             }
         }
 
+        self.owned += pages;
         Ok(blocks)
     }
 
@@ -345,6 +362,7 @@ impl Space {
             done = at.max(done + 1);
         }
 
+        self.owned = self.owned.saturating_sub(freed);
         freed
     }
 
