@@ -1187,7 +1187,7 @@ struct Program {
     icon: Icon,
 }
 
-static PROGRAMS: [Program; 6] = [
+static PROGRAMS: [Program; 8] = [
     Program {
         file: "files",
         args: "",
@@ -1212,6 +1212,21 @@ static PROGRAMS: [Program; 6] = [
         caption: "Диспетчер устройств",
         about: "устройства и их драйверы",
         icon: Icon::Devices,
+    },
+    // Свои блокнот и калькулятор (фаза 70b) — первое, что ищут в «Пуске».
+    Program {
+        file: "notepad",
+        args: "",
+        caption: "Блокнот",
+        about: "простой текстовый редактор",
+        icon: Icon::File,
+    },
+    Program {
+        file: "calc",
+        args: "",
+        caption: "Калькулятор",
+        about: "обычный калькулятор",
+        icon: Icon::Grid,
     },
     // Примеры WinForms — со стола, а не только набором в терминале: формы под
     // Mono (фазы 62a–62b) и витрина своей среды .NET (та же, что плиткой

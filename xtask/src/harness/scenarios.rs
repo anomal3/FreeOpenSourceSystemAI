@@ -2035,7 +2035,7 @@ pub const ALL: &[Scenario] = &[
             // Пятьдесят три — `curl` (фаза 65d), если собран `thirdparty`.
             // Пятьдесят четыре — `csound` (фаза 67f). Пятьдесят пять — `csdl`
             // (фаза 68b), если собран SDL2 (`thirdparty`).
-            Step::Expect("/bin holds 55 programs"),
+            Step::Expect("/bin holds 57 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -8903,6 +8903,84 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : closed 'Settings'", 15_000),
             Step::Wait(2_000),
 
+            Step::Line("shutdown"),
+            Step::Exits(30_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
+        name: "notepad",
+        about: "Свои блокнот и калькулятор (фаза 70b): набрать текст, сохранить, прочитать оболочкой; посчитать с клавиатуры.",
+        // Установленная система: блокноту нужен каталог, в который можно писать.
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await("freeos> ", BOOT),
+            Step::Wait(2_000),
+            // Остаток прошлого прогона — прочь: файла быть не должно, блокнот
+            // обязан сказать «новый файл».
+            Step::Line("rm /home/roman/note.txt"),
+            Step::Wait(1_000),
+            Step::Line("run -b /bin/notepad /home/roman/note.txt"),
+            Step::Await("window      : 'Notepad' at", 30_000),
+            Step::Await("notepad: new file /home/roman/note.txt", 15_000),
+            Step::Wait(1_000),
+            Step::Type("hello fossai"),
+            Step::Key("ret"),
+            Step::Type("second line"),
+            Step::Wait(1_000),
+            Step::Shot("01-typed"),
+            Step::Key("ctrl-s"),
+            // «hello fossai\nsecond line\n» — двадцать пять байт.
+            Step::Await("notepad: saved /home/roman/note.txt, 25 byte(s)", 15_000),
+            Step::Key("ctrl-w"),
+            Step::Await("notepad: closing on request", 15_000),
+            Step::Await("desktop     : closed the window of ", 15_000),
+            Step::Wait(1_000),
+            Step::Line("cat /home/roman/note.txt"),
+            Step::Await("second line", 15_000),
+            // Открыть заново: блокнот читает то, что записал.
+            Step::Line("run -b /bin/notepad /home/roman/note.txt"),
+            Step::Await("notepad: opened /home/roman/note.txt, 3 line(s)", 30_000),
+            Step::Wait(1_000),
+            Step::Key("ctrl-w"),
+            Step::Await("notepad: closing on request", 15_000),
+            Step::Await("desktop     : closed the window of ", 15_000),
+            Step::Wait(1_000),
+
+            // ── Калькулятор ──────────────────────────────────────────────────
+            Step::Line("run -b /bin/calc"),
+            Step::Await("window      : 'Calculator' at", 30_000),
+            Step::Wait(1_000),
+            Step::Type("12+30="),
+            Step::Await("calc: 12 + 30 = 42", 15_000),
+            // Дробь с запятой и деление: 7,5 / 2 = 3,75.
+            Step::Type("7,5/2="),
+            Step::Await("calc: 7,5 / 2 = 3,75", 15_000),
+            Step::Wait(1_000),
+            Step::Shot("02-calc"),
+            Step::Key("ctrl-w"),
+            Step::Await("calc: closing on request", 15_000),
+            Step::Wait(1_000),
+            Step::Line("rm /home/roman/note.txt"),
+            Step::Wait(1_000),
             Step::Line("shutdown"),
             Step::Exits(30_000),
             Step::Absent("KERNEL PANIC"),

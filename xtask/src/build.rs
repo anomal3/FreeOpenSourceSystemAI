@@ -317,11 +317,12 @@ fn user_triple(arch: Arch) -> &'static str {
 }
 
 /// Имена пользовательских программ. Они же — имена файлов в `/bin`.
-pub const USER_PROGRAMS: [&str; 41] = [
+pub const USER_PROGRAMS: [&str; 43] = [
     "hello", "crash", "peek", "perms", "count", "spin", "forever", "nap", "save", "wc", "ls",
     "ask", "vec", "mc", "pkg", "init", "svclog", "svcbad", "dhcp", "echod", "echoc", "sockfd", "sshd",
     "cat", "sysupdate", "fetch", "memtest", "filemap", "posix", "winshow", "sysmon", "files",
     "taskmgr", "devmgr", "dotnet", "sftp-server", "big", "smash", "httpd", "threads", "drvd",
+    "notepad", "calc",
 ];
 
 /// Программы, которые в `/bin` **не** едут.

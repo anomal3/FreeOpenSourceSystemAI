@@ -595,6 +595,18 @@ impl Files {
             }
             return true;
         }
+        // Фаза 70b: текст открывается в блокноте — его там можно и поправить.
+        // Всё прочее — на просмотр, как раньше.
+        if is_text(&name) {
+            let line = format!("/bin/notepad {target}");
+            let id = spawn(&line);
+            if id >= 0 {
+                println(&format!("files: started '{line}' as #{id}"));
+                self.note = Some(format!("«{name}» открыт в блокноте"));
+                return true;
+            }
+            println(&format!("files: cannot start '{line}': error {id}"));
+        }
         self.preview = Some(read_preview(&name, &target));
         true
     }
@@ -2460,6 +2472,18 @@ impl Files {
             None => self.report(),
         }
     }
+}
+
+/// Текстовый ли файл — по расширению: открывать его в блокноте (фаза 70b).
+fn is_text(name: &str) -> bool {
+    const TEXT: [&str; 18] = [
+        "txt", "md", "cfg", "conf", "ini", "log", "c", "h", "rs", "toml", "json", "csv", "sh", "py", "lua", "cs", "xml", "html",
+    ];
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    TEXT.contains(&ext.as_str())
 }
 
 /// С какого каталога начать.
