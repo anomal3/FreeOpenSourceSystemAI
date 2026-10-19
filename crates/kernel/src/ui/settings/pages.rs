@@ -249,7 +249,7 @@ impl SettingsView {
         let screen = format!("{} × {}", self.screen.0, self.screen.1);
         y = row(pass, x, y, w, Some(Fi::Monitor), "Экран", "", Ctl::Mono(&screen), None);
         let pci = self.cache.devices.lines().filter(|line| line.starts_with("pci\t")).count();
-        let missing = self.cache.devices.lines().filter(|line| line.starts_with("pci\t") && line.ends_with("\tnone")).count();
+        let missing = self.cache.devices.lines().filter(|line| line.starts_with("pci\t") && line.split('\t').nth(5) == Some("none")).count();
         let bus = format!("{pci} · без драйвера {missing}");
         y = row(pass, x, y, w, Some(Fi::Layers), "Устройства PCI", "Подробно — в «Диспетчере устройств»", Ctl::Value(&bus), None);
         y = row(pass, x, y, w, Some(Fi::Info), "Загрузка", "", Ctl::Value("UEFI"), None);

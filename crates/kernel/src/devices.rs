@@ -184,6 +184,19 @@ fn driver_for(device: &pci::Device) -> (&'static str, &'static str) {
 pub fn report() -> String {
     let mut out = String::new();
 
+    // Системные устройства (фаза 69d): процессоры, память, прошивка, кадровый
+    // буфер. Это не шина, но человек ищет их в диспетчере устройств первыми —
+    // «сколько у меня ядер и памяти».
+    for cpu in 0..crate::smp::online() {
+        let _ = writeln!(out, "sys\tcpu {cpu}\t{}\tprocessor\tkernel\tactive", crate::arch::ARCH_NAME);
+    }
+    // Память — из снимка стола, а не из пула кадров: перепись спрашивают и
+    // «Параметры» под замком стола, и брать под ним замок пула незачем.
+    let (_, total_mib) = crate::ui::memory_mib();
+    let _ = writeln!(out, "sys\tmemory\t{total_mib} MiB\tmemory\tkernel\tactive");
+    let _ = writeln!(out, "sys\tfirmware\tUEFI\tfirmware\t-\tnot-needed");
+    let _ = writeln!(out, "sys\tdisplay\t{}\tframebuffer\t{}\tactive", crate::display::driver(), crate::display::driver());
+
     let rsdp = crate::acpi::rsdp();
     // Без ACPI шина бывает только из дерева устройств — `discover` найдёт её сам.
     if rsdp != 0 || pci::has_tree_host() {
@@ -202,13 +215,16 @@ pub fn report() -> String {
             }
             for device in &found {
                 let (driver, state) = driver_for(device);
+                // Седьмое поле — способ прерывания (фаза 69d, вкладка
+                // «Ресурсы» диспетчера устройств).
                 let _ = writeln!(
                     out,
-                    "pci\t{}\t{:04x}:{:04x}\t{}\t{driver}\t{state}",
+                    "pci\t{}\t{:04x}:{:04x}\t{}\t{driver}\t{state}\t{}",
                     device.address,
                     device.vendor,
                     device.device,
                     class_name(device.class, device.subclass, device.prog_if),
+                    signalling(device),
                 );
             }
         }
@@ -283,28 +299,7 @@ pub fn census_text() -> String {
                 String::from("NO DRIVER IN THIS KERNEL")
             }
         };
-        // Чем устройство умеет прерывать. Спрашивается у самого устройства, а
-        // не берётся из справочника: «у этой модели есть MSI» — утверждение о
-        // модели, а нужно утверждение об этой машине. Без этой колонки вопрос
-        // «почему драйвер остался на опросе» приходится выяснять правкой кода.
-        let signalling = match (device.msix(), device.msi()) {
-            (Some(msix), _) => alloc::format!("MSI-X x{}", msix.vectors),
-            (None, Some(_)) => String::from("MSI"),
-            // У устройства без MSI остаётся линия, и её номер — не свойство
-            // устройства, а разводка платы: он приходит из таблицы прошивки.
-            // «INTA» без номера означало бы, что маршрутизация не прочитана, и
-            // это разные положения дел, которые нельзя показывать одинаково.
-            (None, None) => match device.interrupt_pin() {
-                None => String::from("no interrupt"),
-                Some(pin) => {
-                    let name = ["INTA", "INTB", "INTC", "INTD"][usize::from(pin)];
-                    match crate::irq::routing::line_for(device.address, pin) {
-                        Some(line) => alloc::format!("{name} -> GSI {}", line.gsi),
-                        None => alloc::format!("{name}, line unknown"),
-                    }
-                }
-            },
-        };
+        let signalling = signalling(device);
         let _ = writeln!(
             out,
             "{} {:04x}:{:04x} class {:02x}:{:02x}:{:02x} {:<24} {:<16} -- {verdict}",
@@ -320,6 +315,33 @@ pub fn census_text() -> String {
     }
     let _ = writeln!(out, "{} function(s) on the bus, {without} of them without a driver", found.len());
     out
+}
+
+/// Чем устройство умеет прерывать.
+///
+/// Спрашивается у самого устройства, а не берётся из справочника: «у этой
+/// модели есть MSI» — утверждение о модели, а нужно утверждение об этой
+/// машине. Без этого вопрос «почему драйвер остался на опросе» приходится
+/// выяснять правкой кода.
+fn signalling(device: &pci::Device) -> String {
+    match (device.msix(), device.msi()) {
+        (Some(msix), _) => alloc::format!("MSI-X x{}", msix.vectors),
+        (None, Some(_)) => String::from("MSI"),
+        // У устройства без MSI остаётся линия, и её номер — не свойство
+        // устройства, а разводка платы: он приходит из таблицы прошивки.
+        // «INTA» без номера означало бы, что маршрутизация не прочитана, и это
+        // разные положения дел, которые нельзя показывать одинаково.
+        (None, None) => match device.interrupt_pin() {
+            None => String::from("no interrupt"),
+            Some(pin) => {
+                let name = ["INTA", "INTB", "INTC", "INTD"][usize::from(pin)];
+                match crate::irq::routing::line_for(device.address, pin) {
+                    Some(line) => alloc::format!("{name} -> GSI {}", line.gsi),
+                    None => alloc::format!("{name}, line unknown"),
+                }
+            }
+        },
+    }
 }
 
 /// Напечатать перепись в журнал загрузки.
