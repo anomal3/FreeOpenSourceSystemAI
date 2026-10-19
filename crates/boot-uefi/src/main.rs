@@ -97,6 +97,9 @@ fn main() -> Status {
     // до них доберётся.
     let choice = menu::choose();
     info.boot_flags = choice.flags | unattended_flag() | live_flag();
+    if choice.keep_display {
+        info.boot_flags |= boot_info::BOOT_FIRMWARE_DISPLAY;
+    }
     // Разрешение, выбранное человеком в «Параметрах», лежит файлом на этом же
     // томе: сменить режим экрана можно только здесь, до `ExitBootServices`, и
     // ядро может лишь попросить об этом заранее. Пятый пункт меню обходит и

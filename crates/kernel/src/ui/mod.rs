@@ -125,7 +125,7 @@ static LAST_ICON: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32:
 /// Возвращает `false`, если экрана нет или памяти под окна не хватило. Ядро в
 /// этом случае продолжает работать с оболочкой в серийной консоли — графика не
 /// является условием работы системы.
-pub fn init(fb: &boot_info::Framebuffer) -> bool {
+pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     let Some(screen) = Screen::new(fb) else {
         return false;
     };
@@ -209,6 +209,13 @@ pub fn init(fb: &boot_info::Framebuffer) -> bool {
         (u64::from(desktop.screen_width()) << 32) | u64::from(desktop.screen_height()),
         core::sync::atomic::Ordering::Relaxed,
     );
+
+    // Родное разрешение панели, которое прошивка не дала (фаза 70c), — сразу,
+    // до первого окна программы: переезжать столу потом дороже.
+    if let Some(native) = crate::display::probe(fb, boot_flags) {
+        let status = status_now();
+        change_mode(&mut desktop, native, &status);
+    }
 
     *DESKTOP.lock() = Some(desktop);
     GRAPHICS.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -1007,10 +1014,23 @@ pub fn set_screen_off(off: bool) -> bool {
 
 pub fn tick() {
     let status = status_now();
+    let request = MODE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed);
     with_desktop(|desktop| {
+        if request != 0 {
+            change_mode(desktop, ((request >> 32) as u32, request as u32), &status);
+        }
         desktop.refresh_panel(&status);
         desktop.present();
     });
+}
+
+/// Смена режима, заказанная не из «Параметров» — командой оболочки ядра
+/// (`intel native`, фаза 70c). Ноль — заказа нет; исполняет [`tick`].
+static MODE_REQUEST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Заказать смену режима экрана столу.
+pub fn request_mode(width: u32, height: u32) {
+    MODE_REQUEST.store((u64::from(width) << 32) | u64::from(height), core::sync::atomic::Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------

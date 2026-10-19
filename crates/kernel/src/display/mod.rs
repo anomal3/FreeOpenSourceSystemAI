@@ -29,6 +29,8 @@
 #[cfg(target_arch = "x86_64")]
 mod bochs;
 #[cfg(target_arch = "x86_64")]
+pub mod intel;
+#[cfg(target_arch = "x86_64")]
 mod vmsvga;
 #[cfg(target_arch = "aarch64")]
 mod ramfb;
@@ -94,6 +96,10 @@ pub fn driver() -> &'static str {
     if vmsvga::active() {
         return "vmsvga";
     }
+    #[cfg(target_arch = "x86_64")]
+    if intel::active() {
+        return "intel";
+    }
     DRIVER
 }
 
@@ -152,10 +158,11 @@ pub fn can_switch() -> bool {
     if crate::virtio::gpu::active() {
         return true;
     }
-    // VMSVGA (фаза 68h) — видеокарта VirtualBox по умолчанию и VMware.
+    // VMSVGA (фаза 68h) — видеокарта VirtualBox по умолчанию и VMware;
+    // Intel (фаза 70c) — только к родному разрешению панели.
     #[cfg(target_arch = "x86_64")]
     {
-        bochs::present() || vmsvga::present()
+        bochs::present() || vmsvga::present() || native().is_some()
     }
     // На `virt` экран даёт ramfb, и режим ему меняется записью в fw_cfg. Машины
     // с другим экраном у нас на этой архитектуре пока не встречалось; когда
@@ -164,6 +171,71 @@ pub fn can_switch() -> bool {
     {
         true
     }
+}
+
+/// Родное разрешение панели, которое прошивка не дала (фаза 70c): оно
+/// запоминается при запуске стола ([`probe`]).
+static NATIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Узнать при запуске стола, есть ли у экрана режим лучше, чем дала прошивка.
+///
+/// Сейчас это одна Intel-графика с масштабировщиком панели. Пятый пункт меню
+/// загрузки (`BOOT_FIRMWARE_DISPLAY`) запрещает и это: им возвращают машину,
+/// у которой экран от перенастройки гаснет.
+pub fn probe(current: &Framebuffer, boot_flags: u64) -> Option<(u32, u32)> {
+    if boot_flags & boot_info::BOOT_FIRMWARE_DISPLAY != 0 {
+        crate::kprintln!("  display     : keeping the firmware's mode, as the boot menu asked");
+        return None;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let found = intel::native(current);
+        match found {
+            Some((w, h)) => {
+                NATIVE.store((u64::from(w) << 32) | u64::from(h), core::sync::atomic::Ordering::Relaxed);
+                FIRMWARE.store(
+                    (u64::from(current.width) << 32) | u64::from(current.height),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                crate::kprintln!(
+                    "  display     : the panel is {w}x{h}, the firmware stretches {}x{} onto it",
+                    current.width,
+                    current.height
+                );
+            }
+            None => {}
+        }
+        found
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = current;
+        None
+    }
+}
+
+/// Режим, который дала прошивка, — второй пункт списка у Intel.
+static FIRMWARE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Режимы, которые этот экран умеет на ходу, — для «Параметров».
+///
+/// У стандартных адаптеров эмуляторов — общий список; у Intel-графики —
+/// только два: режим прошивки и родной режим панели (частот этот драйвер не
+/// меняет, а другие размеры без них — та же растяжка, что и была).
+#[must_use]
+pub fn modes(common: &[(u32, u32)]) -> alloc::vec::Vec<(u32, u32)> {
+    let firmware = FIRMWARE.load(core::sync::atomic::Ordering::Relaxed);
+    match native() {
+        Some(native) if firmware != 0 => alloc::vec![((firmware >> 32) as u32, firmware as u32), native],
+        _ => common.to_vec(),
+    }
+}
+
+/// Родной режим панели, если [`probe`] его нашёл.
+#[must_use]
+pub fn native() -> Option<(u32, u32)> {
+    let packed = NATIVE.load(core::sync::atomic::Ordering::Relaxed);
+    (packed != 0).then(|| ((packed >> 32) as u32, packed as u32))
 }
 
 /// Переключить экран в `width`×`height`.
@@ -186,6 +258,9 @@ pub fn set_mode(current: &Framebuffer, width: u32, height: u32) -> Result<Frameb
     {
         if vmsvga::active() || (!bochs::present() && vmsvga::present()) {
             return vmsvga::set_mode(current, width, height);
+        }
+        if intel::active() || native().is_some() {
+            return intel::set_mode(current, width, height);
         }
         bochs::set_mode(current, width, height)
     }

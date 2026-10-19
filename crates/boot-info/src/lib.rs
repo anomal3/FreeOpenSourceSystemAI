@@ -78,6 +78,11 @@ pub const BOOT_ONE_CPU: u64 = 1 << 3;
 /// under its own kernel — ASUS K53SD.
 pub const BOOT_LIVE: u64 = 1 << 4;
 
+/// Boot-menu item 5, "keep the firmware's display mode" (70c): the kernel
+/// must not reprogram the display either — no native-resolution switch on
+/// Intel graphics. This is the way back for a machine whose screen goes dark.
+pub const BOOT_FIRMWARE_DISPLAY: u64 = 1 << 5;
+
 /// Which instruction set the bootloader was built for.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

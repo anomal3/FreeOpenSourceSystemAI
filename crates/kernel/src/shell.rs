@@ -908,6 +908,8 @@ fn run_command(line: &str) -> bool {
         "acpidump" => acpidump(argument),
         "mounts" => mounts(),
         "slots" => slots(),
+        #[cfg(target_arch = "x86_64")]
+        "intel" => intel(argument),
         "sysupdate" => sysupdate(argument),
         "power" => power_settings(argument),
         "guard" => guard_command(argument),
@@ -1513,6 +1515,8 @@ fn help() {
     sprintln!("  usb           xHCI controller state");
     sprintln!("  dmesg [n]     the last n lines of the kernel log (40 by default)");
     sprintln!("  lastpanic [n] the last n lines of the log of a boot that panicked");
+    #[cfg(target_arch = "x86_64")]
+    sprintln!("  intel [native|peek|poke]  Intel graphics: panel, pipes, native mode");
     sprintln!("  panic now     stop this machine with a kernel panic (to test the snapshot)");
     sprintln!("  pci           every device on the bus, with its identifiers");
     sprintln!("  acpidump SIG  an ACPI table (DSDT, FACP, APIC...) in hex to the kernel log");
@@ -2307,5 +2311,25 @@ fn show(path: &str) {
         }
         Some(Err(err)) => sprintln!("  {path}: {err}"),
         None => sprintln!("  no filesystem is mounted"),
+    }
+}
+
+/// `intel`: что видит драйвер встроенной графики Intel (фаза 70c);
+/// `intel native` — перевести экран в родное разрешение панели.
+#[cfg(target_arch = "x86_64")]
+fn intel(argument: &str) {
+    let current = crate::ui::framebuffer();
+    if argument.trim() == "native" {
+        match crate::display::intel::native(&current) {
+            Some((w, h)) => {
+                crate::ui::request_mode(w, h);
+                sprintln!("  intel: {w}x{h} requested; the desktop switches on its next tick");
+            }
+            None => sprintln!("  intel: nothing to switch: no stretched firmware picture on Intel graphics"),
+        }
+        return;
+    }
+    for line in crate::display::intel::command(&current, argument) {
+        sprintln!("  {line}");
     }
 }

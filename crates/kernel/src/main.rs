@@ -592,7 +592,7 @@ fn start_graphics(info: &BootInfo, have_input: bool) {
     console::release_screen();
 
     let framebuffer = gpu_screen.unwrap_or_else(|| requested_framebuffer(info));
-    if !ui::init(&framebuffer) {
+    if !ui::init(&framebuffer, info.boot_flags) {
         console::reclaim_screen();
         kprintln!("  compositor  : could not take the screen; staying on the boot console");
         return;

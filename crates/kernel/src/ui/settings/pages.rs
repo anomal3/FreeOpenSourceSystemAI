@@ -184,7 +184,7 @@ impl SettingsView {
         let switchable = crate::display::can_switch();
         let mut y = pass.group(x, y, w, "Разрешение экрана");
         if switchable {
-            for (width, height) in MODES {
+            for (width, height) in crate::display::modes(&MODES) {
                 let label = format!("{width} × {height}");
                 let current = (width, height) == self.screen;
                 y = row(pass, x, y, w, None, &label, "", Ctl::Radio(current), Some(Deed::Mode(width, height)));
