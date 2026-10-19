@@ -129,7 +129,7 @@ fn chosen(what: &str, flags: u64) -> Choice {
 fn show() {
     println!("");
     println!("---- boot menu --------------------------------------------------");
-    println!("  1. Start FreeOS normally            (Enter)");
+    println!("  1. Start FossAi normally            (Enter)");
     println!("  2. Safe mode: no desktop, read-only root");
     println!("  3. Check the root volume, then start");
     println!("  4. Safe mode and check the volume");

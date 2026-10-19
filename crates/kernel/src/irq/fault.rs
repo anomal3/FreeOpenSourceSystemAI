@@ -117,7 +117,7 @@ pub fn handle(fault: Fault, ctx: TrapContext) -> ! {
     }
     kprintln!("  uptime      : {} ms", crate::time::uptime_ms());
     kprintln!();
-    kprintln!("FreeOS kernel: halted by an unrecoverable fault.");
+    kprintln!("FossAi kernel: halted by an unrecoverable fault.");
     arch::halt();
 }
 

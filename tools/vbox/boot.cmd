@@ -15,7 +15,7 @@ powershell -c "Start-Sleep 3"
 pushd "%ROOT%"
 cargo xtask iso --arch x86_64 > "%DIR%\iso.log" 2>&1 || (popd & exit /b 1)
 popd
-for /f "delims=" %%i in ('powershell -c "(Get-ChildItem '%ROOT%\build\ISO\FreeOS_*_x86_64_*.iso' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName"') do set ISO=%%i
+for /f "delims=" %%i in ('powershell -c "(Get-ChildItem '%ROOT%\build\ISO\FossAi_*_x86_64_*.iso' | Sort-Object LastWriteTime | Select-Object -Last 1).FullName"') do set ISO=%%i
 %VB% storageattach %VM% --storagectl SATA --port 1 --device 0 --type dvddrive --medium "%ISO%" || exit /b 1
 del /q "%DIR%\serial.log" 2>nul
 %VB% startvm %VM% --type headless || exit /b 1

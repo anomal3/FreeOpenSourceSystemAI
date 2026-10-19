@@ -48,7 +48,11 @@ use crate::disks::{self, Disk};
 use crate::logln;
 
 /// Имя, под которым запись видна в меню прошивки.
-const DESCRIPTION: &str = "FreeOS";
+const DESCRIPTION: &str = "FossAi";
+
+/// Описание записи до переименования (0.8): её установщик тоже узнаёт своей и
+/// переписывает, а не заводит вторую рядом.
+const LEGACY_DESCRIPTION: &str = "FreeOS";
 
 /// Путь к загрузчику на ESP — тот самый запасной, который кладёт установщик.
 ///
@@ -198,9 +202,15 @@ fn variable_name(slot: u16) -> CString16 {
         .unwrap_or_else(|_| CString16::try_from("Boot0000").expect("восемь букв ASCII"))
 }
 
-/// Найти свою прежнюю запись — ту, у которой описание «FreeOS».
+/// Найти свою прежнюю запись — ту, у которой описание «FossAi» (или «FreeOS»,
+/// как систему звали до 0.8).
 fn existing_slot() -> Option<u16> {
-    let wanted: Vec<u16> = DESCRIPTION.encode_utf16().chain(core::iter::once(0)).collect();
+    [DESCRIPTION, LEGACY_DESCRIPTION].into_iter().find_map(slot_named)
+}
+
+/// Запись загрузки с таким описанием.
+fn slot_named(description: &str) -> Option<u16> {
+    let wanted: Vec<u16> = description.encode_utf16().chain(core::iter::once(0)).collect();
     for slot in 0..MAX_SLOTS {
         let name = variable_name(slot);
         let Ok((data, _)) = runtime::get_variable_boxed(&name, &VariableVendor::GLOBAL_VARIABLE)
@@ -256,7 +266,7 @@ fn put_first(slot: u16) -> bool {
     }
     match runtime::set_variable(&name, &VariableVendor::GLOBAL_VARIABLE, BOOT_VARIABLE, &bytes) {
         Ok(()) => {
-            logln!("[install] BootOrder: FreeOS first, {} entry(ies) total", order.len());
+            logln!("[install] BootOrder: FossAi first, {} entry(ies) total", order.len());
             true
         }
         Err(err) => {

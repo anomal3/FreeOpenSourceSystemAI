@@ -43,7 +43,7 @@ const VENDOR: u16 = 0x18d1;
 const PRODUCT: u16 = 0xd00d;
 
 /// Строки, на которые ссылаются дескрипторы. Порядок задаёт номера.
-const STRINGS: [&str; 3] = ["FreeOS", "FreeOS phone", "dandelion"];
+const STRINGS: [&str; 3] = ["FossAi", "FossAi phone", "dandelion"];
 
 /// Наибольший ответ на нулевой точке.
 ///

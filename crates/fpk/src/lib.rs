@@ -172,7 +172,7 @@ impl Error {
     pub const fn text(self) -> &'static str {
         match self {
             Self::Short => "the file is shorter than a package header",
-            Self::NotAPackage => "this is not a FreeOS package",
+            Self::NotAPackage => "this is not a FossAi package",
             Self::Version(_) => "the package format version is not supported",
             Self::UnknownKind(_) => "the package declares a kind this system does not know",
             Self::BadLength => "the lengths in the header do not add up",

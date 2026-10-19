@@ -65,7 +65,7 @@ pub fn stranger() -> Result<SigningKey> {
 pub fn trusted_text() -> Result<String> {
     let working = release()?;
     let mut text = String::new();
-    text.push_str("# FreeOS trusted update keys, one per line: ed25519 <64 hex digits> <comment>\n");
+    text.push_str("# FossAi trusted update keys, one per line: ed25519 <64 hex digits> <comment>\n");
     text.push_str("# This file arrives with the system image and is replaced with it, so a new\n");
     text.push_str("# version can bring a new key. Removing every line disables updates.\n");
     text.push_str(&format!(

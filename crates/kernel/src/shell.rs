@@ -528,7 +528,7 @@ fn power_settings(argument: &str) {
 /// от экрана, а перенос длинной фразы посередине слова читается как сбой вывода,
 /// хотя это правильное поведение.
 fn banner() {
-    sprintln!("FreeOS shell. 'help' for commands, 'exit' to finish.");
+    sprintln!("FossAi shell. 'help' for commands, 'exit' to finish.");
     if ui::is_active() {
         let (cols, rows) = ui::shell_size();
         sprintln!("Window {cols}x{rows}. Tab raises the window below.");

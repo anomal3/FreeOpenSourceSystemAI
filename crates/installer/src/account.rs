@@ -107,7 +107,7 @@ impl Draft {
         let digest = derive(&self.password, salt);
 
         let mut out = String::new();
-        out.push_str("# FreeOS accounts, written by the installer\n");
+        out.push_str("# FossAi accounts, written by the installer\n");
         out.push_str("# name:uid:gid:mode:home:algorithm:salt:digest\n");
         out.push_str(
             "# The digest is NOT produced by a key derivation function; see\n\

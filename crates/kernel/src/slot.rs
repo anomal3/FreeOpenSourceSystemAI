@@ -379,7 +379,7 @@ pub fn apply(path: &str) -> Result<Slot, Error> {
         // систему поверх работающей.
     }
 
-    kprintln!("  sysupdate   : writing FreeOS {version} into slot {}", target.name());
+    kprintln!("  sysupdate   : writing FossAi {version} into slot {}", target.name());
 
     // --- шаг 1: образ корня в неактивный раздел ---------------------------
     let (_, root_device, root_lba, root_sectors) = layout

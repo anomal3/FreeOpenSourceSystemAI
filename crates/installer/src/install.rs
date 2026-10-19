@@ -656,7 +656,7 @@ const _: () = ();
 /// Содержимое `/os-release`.
 fn os_release_text() -> String {
     let mut out = String::new();
-    out.push_str("# FreeOS release, written by the installer\n");
+    out.push_str("# FossAi release, written by the installer\n");
     out.push_str(&format!("version={}\n", env!("CARGO_PKG_VERSION")));
     out
 }
@@ -664,7 +664,7 @@ fn os_release_text() -> String {
 /// Содержимое файла настроек.
 fn config_text(settings: &Settings, account: &Draft) -> String {
     let mut out = String::new();
-    out.push_str("# FreeOS system configuration, written by the installer\n");
+    out.push_str("# FossAi system configuration, written by the installer\n");
     out.push_str(&format!("language={}\n", settings.language.tag()));
     out.push_str(&format!("keyboard={}\n", settings.keyboard));
     out.push_str(&format!("timezone={}\n", settings.timezone));

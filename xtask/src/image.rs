@@ -49,8 +49,8 @@ impl Kind {
     /// Часть имени файла образа.
     const fn slug(self) -> &'static str {
         match self {
-            Kind::System => "FreeOS",
-            Kind::Installer => "FreeOS-Installer",
+            Kind::System => "FossAi",
+            Kind::Installer => "FossAi-Installer",
         }
     }
 

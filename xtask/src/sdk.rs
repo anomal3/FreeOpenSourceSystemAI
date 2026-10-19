@@ -299,7 +299,7 @@ pub fn build_package(arch: Arch) -> Result<crate::package::Package> {
     let mut builder = Builder::new(Kind::Package, &name, version);
     builder.field(
         "summary",
-        "Headers, libraries and link script for building C programs for FreeOS",
+        "Headers, libraries and link script for building C programs for FossAi",
     );
 
     let mut files = 0usize;

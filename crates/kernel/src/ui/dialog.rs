@@ -276,7 +276,7 @@ fn paragraph(ctx: Ctx, s: &mut Surface, role: Role, x: i32, y: &mut i32, width: 
 
 fn draw_about(ctx: Ctx, s: &mut Surface, x: i32, y: &mut i32, width: u32, facts: &AboutFacts) {
     let p = ctx.palette;
-    paint::text(ctx, s, Role::Heading, x, *y, &format!("FreeOS {}", facts.version), p.ink);
+    paint::text(ctx, s, Role::Heading, x, *y, &format!("FossAi {}", facts.version), p.ink);
     *y += line(ctx, Role::Heading) + ctx.px(4) as i32;
     paragraph(
         ctx,

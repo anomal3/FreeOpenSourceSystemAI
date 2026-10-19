@@ -269,7 +269,7 @@ fn arch_name() -> &'static str {
 
 fn print_banner() {
     println!("================================================================");
-    println!("  FreeOS bootloader (boot-uefi)");
+    println!("  FossAi bootloader (boot-uefi)");
     println!("================================================================");
     println!("  target arch     : {}", arch_name());
     println!("  UEFI revision   : {}", system::uefi_revision());

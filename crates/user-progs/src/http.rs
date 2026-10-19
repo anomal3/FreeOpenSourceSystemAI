@@ -497,7 +497,7 @@ fn exchange(
         url.path,
         " HTTP/1.1\r\nHost: ",
         url.host,
-        "\r\nUser-Agent: FreeOS-sysupdate/1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        "\r\nUser-Agent: FossAi-sysupdate/1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
     ];
     wire.request(&parts, io.wire)?;
     // Сказать «я всё» нельзя: половина закрывается вместе с возможностью

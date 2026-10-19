@@ -203,7 +203,7 @@ pub fn store() {
     // Причина — первой строкой: файл открывают, чтобы узнать, **почему**, а
     // сама паника лежит в самом конце шестнадцати килобайт журнала.
     let head = alloc::format!(
-        "FreeOS panic snapshot: {}
+        "FossAi panic snapshot: {}
 {} bytes of the kernel log follow; the panic is at the end.
 
 ",

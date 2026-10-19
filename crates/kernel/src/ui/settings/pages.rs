@@ -85,7 +85,7 @@ impl SettingsView {
             let tx = shot.right() + ctx.px(16) as i32;
             let room = (card.right() - ctx.px(14) as i32 - tx).max(0) as u32;
             let mut ty = card.y + ctx.px(26) as i32;
-            pass.text(Role::Title, tx, ty, room, "FreeOS", p.ink);
+            pass.text(Role::Title, tx, ty, room, "FossAi", p.ink);
             ty += line_h(ctx, Role::Title) + ctx.px(4) as i32;
             let version = format!("{} · {}", crate::version_text(), arch::ARCH_NAME);
             pass.text(Role::Caption, tx, ty, room, &version, p.ink3);
@@ -257,7 +257,7 @@ impl SettingsView {
 
         y = pass.group(x, y, w, "Система");
         y = row(pass, x, y, w, Some(Fi::Info), "Версия", "", Ctl::Mono(&crate::version_text()), None);
-        y = row(pass, x, y, w, Some(Fi::FileCode), "Ядро", "Написано с нуля на Rust, без std", Ctl::Value("FreeOS"), None);
+        y = row(pass, x, y, w, Some(Fi::FileCode), "Ядро", "Написано с нуля на Rust, без std", Ctl::Value("FossAi"), None);
         let uptime = crate::time::uptime_ms() / 1000;
         let up = format!("{} ч {:02} мин", uptime / 3600, (uptime / 60) % 60);
         y = row(pass, x, y, w, Some(Fi::Clock), "Время работы", "", Ctl::Value(&up), None);
@@ -449,7 +449,7 @@ impl SettingsView {
             let room = (brect.x - tx - ctx.px(12) as i32).max(0) as u32;
             let both = line_h(ctx, Role::Title) + ctx.px(4) as i32 + line_h(ctx, Role::Caption);
             let ty = card.y + (card.h as i32 - both) / 2;
-            let title = format!("FreeOS {}", crate::version_text());
+            let title = format!("FossAi {}", crate::version_text());
             pass.text(Role::Title, tx, ty, room, &title, p.ink);
             let sub = match crate::slot::booted() {
                 Some(slot) => format!("Загружена со слота {}", slot.name()),
@@ -541,7 +541,7 @@ fn keyboard(pass: &mut Pass, x: i32, y: i32, w: u32) {
     y = pass.group(x, y, w, "Горячие клавиши");
     for (title, desc, keys) in [
         ("Переключить раскладку", "", "Alt+Shift"),
-        ("Меню FreeOS", "", "F1"),
+        ("Меню FossAi", "", "F1"),
         ("Закрыть окно", "", "Ctrl+W"),
         ("Прервать программу", "В терминале", "Ctrl+C"),
     ] {

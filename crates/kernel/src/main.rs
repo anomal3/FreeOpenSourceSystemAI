@@ -185,7 +185,7 @@ pub(crate) fn start(boot_info: *const BootInfo) -> ! {
 
     let Some(info) = validate(boot_info) else {
         kprintln!();
-        kprintln!("FreeOS kernel: refusing to boot, see above. Halting.");
+        kprintln!("FossAi kernel: refusing to boot, see above. Halting.");
         arch::halt();
     };
 
@@ -471,7 +471,7 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
 
     BUILD.store(info.build, core::sync::atomic::Ordering::Relaxed);
     if info.build != 0 {
-        kprintln!("  build       : FreeOS {}", version_text());
+        kprintln!("  build       : FossAi {}", version_text());
     }
 
     // Ключи SSH с флешки (фаза 68o): живая система впускает по ним `live`.
@@ -1018,7 +1018,7 @@ fn mount_disk_root(info: &BootInfo) {
     if info.boot_flags & boot_info::BOOT_LIVE != 0 {
         if let Some(partition) = block::take(&found, root_type) {
             kprintln!(
-                "  root        : live medium; the FreeOS root on {} #{} is left alone",
+                "  root        : live medium; the FossAi root on {} #{} is left alone",
                 partition.source,
                 partition.unit
             );
@@ -1028,7 +1028,7 @@ fn mount_disk_root(info: &BootInfo) {
     }
 
     let Some(partition) = block::take(&found, root_type) else {
-        kprintln!("  root        : no FreeOS root partition: keeping the initrd as root");
+        kprintln!("  root        : no FossAi root partition: keeping the initrd as root");
         // Раздел данных от корня не зависит — в этом весь его смысл. Система,
         // живущая на initrd, обязана увидеть его так же, как установленная:
         // иначе «подключить диск с данными» работало бы только после установки.
@@ -1627,7 +1627,7 @@ fn banner(info: &BootInfo, addr: usize) {
     // машине, когда имя файла уже не видно. «Phase 8 bring-up» здесь стояло с
     // восьмой фазы и врало все следующие тринадцать — номер фазы держится в
     // README и в истории, а не в баннере.
-    kprintln!(" FreeOS {} kernel", VERSION);
+    kprintln!(" FossAi {} kernel", VERSION);
     kprintln!(" architecture : {}", arch::ARCH_NAME);
     kprintln!("================================================================");
     kprintln!("BootInfo @ {addr:#018x}");

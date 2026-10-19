@@ -799,7 +799,7 @@ const LAG_STEPS: &[Step] = &[
             // значит разность соседних строк — длительность этапа. Прошивка,
             // загрузчик, ядро до файловой системы, initrd с его оглавлением,
             // корень и ввод, стол, службы до приглашения.
-            Step::Await("FreeOS bootloader", BOOT),
+            Step::Await("FossAi bootloader", BOOT),
             Step::Await(crate::version::KERNEL_BANNER, BOOT),
             Step::Await("---- filesystem", BOOT),
             Step::Await("---- root filesystem", BOOT),
@@ -912,7 +912,7 @@ pub const ALL: &[Scenario] = &[
             // загрузка aarch64 не уложилась в них дважды подряд, а с запасом
             // проходит. Срок шага отвечает на вопрос «не повисло ли», а не
             // «сколько это должно занимать».
-            Step::Await("FreeOS shell.", BOOT),
+            Step::Await("FossAi shell.", BOOT),
             Step::Await("freeos> ", 30_000),
             Step::Line("uptime"),
             Step::Await("timer ticks", 10_000),
@@ -4130,7 +4130,7 @@ pub const ALL: &[Scenario] = &[
             // же, как рабочий, вплоть до этой строки. Ровно так и выяснилось,
             // что двух записей в каталоге мало: носитель виделся как `FS0:
             // CDROM`, а прошивка уходила в UEFI Shell.
-            Step::Await("FreeOS bootloader", BOOT),
+            Step::Await("FossAi bootloader", BOOT),
             Step::Await(crate::version::KERNEL_BANNER, 60_000),
             Step::Await("freeos> ", 60_000),
             // Система работает целиком, а не «дошла до приглашения»: initrd
@@ -4528,7 +4528,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("FreeOS installer", BOOT),
+            Step::Await("FossAi installer", BOOT),
             Step::Await("[disk]", 30_000),
             // Список дисков отсортирован так, что установочный носитель уходит
             // вниз: под курсором по умолчанию — цель установки.
@@ -4568,7 +4568,7 @@ pub const ALL: &[Scenario] = &[
             // Загрузочная запись заводится в самом конце, до строки «finished»:
             // порядок шагов повторяет порядок строк, а не порядок событий.
             Step::Await("[install] boot entry Boot", 240_000),
-            Step::Await("[install] BootOrder: FreeOS first", 15_000),
+            Step::Await("[install] BootOrder: FossAi first", 15_000),
             Step::Await("[install] finished", 30_000),
             Step::Expect("[install] state: /etc/passwd"),
             Step::Wait(1_000),
@@ -5197,7 +5197,7 @@ pub const ALL: &[Scenario] = &[
             // в конце журнала. Хвост целиком — в `lastpanic` выше по сценарию
             // `panic-snapshot`; здесь довольно, что файл больше показанного.
             Step::Line("cat /var/log/last-panic.log"),
-            Step::Await("FreeOS panic snapshot: at ", 30_000),
+            Step::Await("FossAi panic snapshot: at ", 30_000),
             Step::Await("requested from the shell", 15_000),
             Step::Await("bytes of the kernel log follow", 15_000),
             Step::Await("4096 of ", 15_000),
@@ -6914,7 +6914,7 @@ pub const ALL: &[Scenario] = &[
             // машине, где клавиатура приходит по USB, до её инициализации
             // прошивкой нажимать некуда, поэтому нужны вторые — их ловит
             // поздний опрос, тот, что идёт перед самой передачей управления.
-            Step::Await("FreeOS bootloader", BOOT),
+            Step::Await("FossAi bootloader", BOOT),
             Step::Repeat("s", 8),
             Step::Await("---- boot menu", 120_000),
             // Четвёртый пункт: безопасный режим **и** проверка тома. Проверяем
@@ -6973,7 +6973,7 @@ pub const ALL: &[Scenario] = &[
             // В меню попадаем так же, как в `recovery`: клавиши жмутся заранее
             // и ещё раз, когда загрузчик заговорил.
             Step::Repeat("s", 4),
-            Step::Await("FreeOS bootloader", BOOT),
+            Step::Await("FossAi bootloader", BOOT),
             Step::Repeat("s", 8),
             Step::Await("---- boot menu", 120_000),
             // Пункт для машины, у которой экран гаснет от смены режима (ASUS
@@ -7017,7 +7017,7 @@ pub const ALL: &[Scenario] = &[
         steps: &[
             // В меню попадаем так же, как в `recovery`.
             Step::Repeat("s", 4),
-            Step::Await("FreeOS bootloader", BOOT),
+            Step::Await("FossAi bootloader", BOOT),
             Step::Repeat("s", 8),
             Step::Await("---- boot menu", 120_000),
             // Пункт для машины, которая встаёт при запуске остальных
@@ -8294,7 +8294,7 @@ pub const ALL: &[Scenario] = &[
             // она новее установленного.
             Step::Line("sysupdate check"),
             Step::Await("the index is signed by a key this system trusts", 90_000),
-            Step::Await("the server offers FreeOS 0.10", 30_000),
+            Step::Await("the server offers FossAi 0.10", 30_000),
             Step::Await("that is newer", 30_000),
             Step::Wait(2_000),
 
@@ -8409,7 +8409,7 @@ pub const ALL: &[Scenario] = &[
             // Третий: TLS 1.3 с сертификатом на **адрес** (iPAddress в SAN),
             // проверенной цепочкой и подписанным индексом.
             Step::Await("the index is signed by a key this system trusts", 120_000),
-            Step::Await("the server offers FreeOS 0.10", 30_000),
+            Step::Await("the server offers FossAi 0.10", 30_000),
             Step::Wait(1_000),
 
             // И объёмная загрузка по тому же каналу: полмегабайта — это сотни
@@ -8940,7 +8940,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("FreeOS installer", BOOT),
+            Step::Await("FossAi installer", BOOT),
             Step::Await("[disk]", 30_000),
             Step::Wait(1_500),
             Step::Key("ret"),
@@ -9482,7 +9482,7 @@ pub const ALL: &[Scenario] = &[
             // Строка канарейки приходит в самом начале загрузки, а приглашение
             // — в самом конце: между ними вся остальная загрузка, и срок здесь
             // тот же, что у `boot`, а не «шестьдесят секунд на всякий случай».
-            Step::Await("FreeOS shell.", BOOT),
+            Step::Await("FossAi shell.", BOOT),
             Step::Await("freeos> ", 30_000),
 
             // Состояние — словами: «случайное значение», а не само значение.
@@ -10831,7 +10831,7 @@ pub const ALL: &[Scenario] = &[
             // Диск есть, корня FreeOS на нём нет — и это часть проверки:
             // раздел данных обязан находиться сам по себе, а не как довесок к
             // установленной системе.
-            Step::Await("root        : no FreeOS root partition", BOOT),
+            Step::Await("root        : no FossAi root partition", BOOT),
             // Дальше — то, что ядро вычитало из ЧУЖОГО тома. Метка и поколение
             // взяты из суперблока, число кусков — из дерева кусков, то есть
             // одной этой строкой доказан весь путь до B-деревьев.
@@ -11200,7 +11200,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("root        : no FreeOS root partition", BOOT),
+            Step::Await("root        : no FossAi root partition", BOOT),
             // Писатель открыл чужой том: отказ писателя назывался бы здесь же,
             // с причиной, и том остался бы на чтение.
             Step::Await("data        : btrfs at LBA", 60_000),

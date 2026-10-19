@@ -19,7 +19,7 @@ use crate::payload::What;
 use crate::screen::Display;
 
 /// Название программы. Одно на оба языка: это имя, а не слово.
-const APP: &str = "FreeOS";
+const APP: &str = "FossAi";
 
 /// Всего шагов с вопросами — то, что видно в правом верхнем углу.
 const TOTAL_STAGES: u32 = 7;

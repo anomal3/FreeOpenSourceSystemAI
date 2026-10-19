@@ -235,7 +235,7 @@ pub mod build {
     #[must_use]
     pub fn render(offers: &[Offer<'_>]) -> String {
         let mut out = String::new();
-        out.push_str("# FreeOS driver catalogue: which package drives a device the kernel does not know.\n");
+        out.push_str("# FossAi driver catalogue: which package drives a device the kernel does not know.\n");
         out.push_str("# Signed by drivers.sig; the signature covers this file byte for byte.\n");
         out.push_str("# One [driver] record per package and architecture.\n");
         out.push_str(&alloc::format!("format={}\n", super::FORMAT));

@@ -1,4 +1,4 @@
-FreeOS initrd -- FAT32 RAM disk image
+FossAi initrd -- FAT32 RAM disk image
 =====================================
 
 Everything in the initrd/ directory of the source tree is packed, recursively,

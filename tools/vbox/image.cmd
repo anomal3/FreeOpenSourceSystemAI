@@ -1,7 +1,7 @@
 @echo off
 rem Стенд VirtualBox: загрузить образ флешки (cargo xtask image) как диск
 rem SATA и пробросить SSH гостя на 127.0.0.1:2222 (фаза 68o).
-rem   tools\vbox\image.cmd build\FreeOS_..._x86_64_release.img
+rem   tools\vbox\image.cmd build\FossAi_..._x86_64_release.img
 rem Дальше: ssh -p 2222 -i <ключ> live@127.0.0.1 "kernel usb"
 setlocal
 set VB="C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"

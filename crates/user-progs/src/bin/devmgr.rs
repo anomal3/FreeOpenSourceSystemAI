@@ -952,7 +952,7 @@ impl Manager {
                     ("Тип", kind.to_string()),
                     ("Шина", device.bus.long().to_string()),
                     ("Расположение", device.location()),
-                    ("Источник", String::from("FreeOS")),
+                    ("Источник", String::from("FossAi")),
                     ("Состояние", device.state.title().to_string()),
                 ];
                 y = facts_table(ctx, s, area, y, &facts);
@@ -962,7 +962,7 @@ impl Manager {
                 let facts: Vec<(&str, String)> = match &device.driver {
                     Some(driver) => vec![
                         ("Драйвер", driver.clone()),
-                        ("Где живёт", String::from("Встроен в ядро FreeOS")),
+                        ("Где живёт", String::from("Встроен в ядро FossAi")),
                         ("Состояние", device.state.title().to_string()),
                         ("Выгрузка", String::from("Нельзя: драйверы ядра не выгружаются")),
                     ],

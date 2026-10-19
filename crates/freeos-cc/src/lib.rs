@@ -154,6 +154,7 @@ pub fn compile_flags(target: Target) -> Vec<String> {
         "-fPIE".into(),
         "-D__freeos__=1".into(),
         "-D__FreeOS__=1".into(),
+        "-D__FossAi__=1".into(),
         "-D_POSIX_THREADS=1".into(),
         "-D_POSIX_MONOTONIC_CLOCK=200112L".into(),
     ];
@@ -502,7 +503,7 @@ pub fn answer_query(target: Target, args: &[String]) -> Option<Query> {
             "--version" | "-version" => {
                 return Some(Query::Answer(
                     format!(
-                        "{} (FreeOS SDK {}) clang-based\n",
+                        "{} (FossAi SDK {}) clang-based\n",
                         target.sdk_triple(),
                         env!("CARGO_PKG_VERSION")
                     ),

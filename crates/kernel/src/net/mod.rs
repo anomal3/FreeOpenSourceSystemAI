@@ -1774,7 +1774,7 @@ fn resolve_with(
 /// [`SpinLock`] нельзя — он держит прерывания запрещёнными.
 pub fn ping(target: Ipv4, sequence: u16, timeout_ms: u64) -> Result<u64, NetError> {
     /// Данные эхо-запроса: их отвечающий обязан вернуть без изменений.
-    const PAYLOAD: &[u8] = b"FreeOS says hello, please send it back";
+    const PAYLOAD: &[u8] = b"FossAi says hello, please send it back";
 
     let started = crate::time::uptime_ms();
     let deadline = started + timeout_ms;

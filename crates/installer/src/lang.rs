@@ -134,7 +134,7 @@ pub static ENGLISH: Strings = Strings {
     language_heading: "Language",
     language_body: "Choose the language of the installer.",
 
-    welcome_heading: "FreeOS installation",
+    welcome_heading: "FossAi installation",
     welcome_body: "This installer erases one disk of your choice, writes a GPT partition table \
                    with an EFI system partition and a root partition, and copies FreeOS onto \
                    the EFI partition.\nNothing is written until you confirm the disk.",
@@ -151,7 +151,7 @@ pub static ENGLISH: Strings = Strings {
     confirm_warning: "The disk below will be erased completely. This cannot be undone.",
     confirm_scheme: "Partition layout:",
     confirm_esp: "EFI system partition, FAT32",
-    confirm_root: "FreeOS root partition, ext2",
+    confirm_root: "FossAi root partition, ext2",
     confirm_no: "No, go back",
     confirm_yes: "Yes, erase this disk and install",
 
@@ -207,7 +207,7 @@ pub static RUSSIAN: Strings = Strings {
     language_heading: "Язык",
     language_body: "Выберите язык установщика.",
 
-    welcome_heading: "Установка FreeOS",
+    welcome_heading: "Установка FossAi",
     welcome_body: "Установщик стирает один выбранный вами диск, создает на нем таблицу \
                    разделов GPT с системным разделом EFI и корневым разделом, а затем \
                    переносит FreeOS на системный раздел.\nДо подтверждения выбора диска на \
@@ -226,7 +226,7 @@ pub static RUSSIAN: Strings = Strings {
     confirm_warning: "Диск ниже будет стерт полностью. Отменить это будет нельзя.",
     confirm_scheme: "Разметка:",
     confirm_esp: "системный раздел EFI, FAT32",
-    confirm_root: "корневой раздел FreeOS, ext2",
+    confirm_root: "корневой раздел FossAi, ext2",
     confirm_no: "Нет, вернуться назад",
     confirm_yes: "Да, стереть этот диск и установить",
 

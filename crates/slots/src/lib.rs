@@ -306,7 +306,7 @@ impl State {
         // здесь было бы удобнее, но оно удержало бы `out` заимствованным ровно
         // до того места, где сумму надо посчитать.
         for piece in [
-            "# FreeOS slot state; the bootloader rewrites this on every boot\n",
+            "# FossAi slot state; the bootloader rewrites this on every boot\n",
             "active=",
             self.active.letter(),
             "\nprevious=",

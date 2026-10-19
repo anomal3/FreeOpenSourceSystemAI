@@ -169,14 +169,14 @@ fn main() -> Status {
         return Status::ABORTED;
     }
     log::init();
-    logln!("FreeOS installer");
+    logln!("FossAi installer");
 
     let Some(mut display) = Display::open() else {
         // Единственное место, где установщик пишет в консоль прошивки: экрана
         // у него нет, а молчать нельзя. Дальше вывод идёт только в
         // последовательный порт — консоль прошивки рисовала бы поверх
         // интерфейса.
-        println!("FreeOS installer: no linear framebuffer, cannot draw the interface.");
+        println!("FossAi installer: no linear framebuffer, cannot draw the interface.");
         println!("The machine offers no GOP mode with a framebuffer address.");
         logln!("[boot] no framebuffer, giving up");
         return Status::UNSUPPORTED;

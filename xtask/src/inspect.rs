@@ -79,7 +79,7 @@ pub fn image(path: &Path) -> Result<()> {
 
     let Some(root) = table.find(gpt::FREEOS_ROOT_TYPE) else {
         say!();
-        say!("корневого раздела FreeOS на образе нет");
+        say!("корневого раздела FossAi на образе нет");
         return Ok(());
     };
 

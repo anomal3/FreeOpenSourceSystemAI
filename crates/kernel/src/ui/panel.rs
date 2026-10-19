@@ -47,7 +47,7 @@ use mini_ui::theme::{self, Palette};
 use super::window::App;
 
 /// Надпись на кнопке меню.
-const BRAND: &str = "FreeOS";
+const BRAND: &str = "FossAi";
 
 /// Заголовок колонки меню.
 const APPS_TITLE: &str = "ПРИЛОЖЕНИЯ";
@@ -73,7 +73,7 @@ const SEARCH_HINT: &str = "Поиск";
 
 /// Подпись кнопки «Пуск» на телефоне. Имя системы, а не слово «Пуск»: кнопка
 /// широкая, места хватает, и человек читает, чем он пользуется.
-const DOCK_BRAND: &str = "FreeOS";
+const DOCK_BRAND: &str = "FossAi";
 
 /// Заливка плавающего слоя, сведённая к непрозрачному цвету.
 ///

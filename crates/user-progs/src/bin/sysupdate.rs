@@ -711,7 +711,7 @@ fn check(path: Option<&str>) -> i64 {
     let Some(offer) = offer(&servers, &mut trust) else { return 1 };
 
     Line::new()
-        .str("sysupdate: the server offers FreeOS ")
+        .str("sysupdate: the server offers FossAi ")
         .str(offer.version())
         .str(" for ")
         .str(ARCH)

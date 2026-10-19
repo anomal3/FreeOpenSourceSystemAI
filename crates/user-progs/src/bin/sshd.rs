@@ -969,7 +969,7 @@ fn channel_request(
                 .str(user.name())
                 .end();
             let mut sink = Sink::new(client, transport, channel);
-            sink.out("FreeOS: commands here run inside sshd; 'help' lists them.\n");
+            sink.out("FossAi: commands here run inside sshd; 'help' lists them.\n");
             sink.out(PROMPT);
             sink.finish(channel);
             Some(true)

@@ -111,7 +111,7 @@ impl Builder {
     #[must_use]
     pub fn finish(&self) -> Vec<u8> {
         let mut manifest = String::new();
-        manifest.push_str("# FreeOS package manifest\n");
+        manifest.push_str("# FossAi package manifest\n");
         manifest.push_str(&alloc::format!("name={}\n", self.name));
         manifest.push_str(&alloc::format!("version={}\n", self.version));
         manifest.push_str(&alloc::format!("kind={}\n", self.kind.tag()));

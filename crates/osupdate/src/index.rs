@@ -244,7 +244,7 @@ pub mod build {
     #[must_use]
     pub fn render(offers: &[Offer<'_>]) -> String {
         let mut out = String::new();
-        out.push_str("# FreeOS update repository index.\n");
+        out.push_str("# FossAi update repository index.\n");
         out.push_str("# Signed by index.sig; the signature covers this file byte for byte.\n");
         out.push_str("# One [image] record per architecture, and only what is offered now.\n");
         out.push_str(&alloc::format!("format={}\n", super::FORMAT));

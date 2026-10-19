@@ -374,7 +374,7 @@ fn fill(base: u64, bytes: u64, colour: u32) {
 /// на одной из двух машин. Тот самый «угаданный адрес», на котором система уже
 /// спотыкалась на чужом гипервизоре.
 fn report(fdt: &Fdt<'_>, uart: &Uart) {
-    uart.puts("\r\nFreeOS bare image: the bootloader started us.\r\n");
+    uart.puts("\r\nFossAi bare image: the bootloader started us.\r\n");
 
     if let Some(root) = fdt.nodes().next() {
         if let Some(model) = root.property_str("model") {

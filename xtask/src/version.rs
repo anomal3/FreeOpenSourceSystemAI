@@ -34,7 +34,7 @@ pub const VERSION: &str = concat!(
 /// одинаково рад и свежему ядру, и тому, что осталось от прошлой сборки. Теперь
 /// совпадение версии в баннере с версией сборки проверяется каждым прогоном.
 pub const KERNEL_BANNER: &str = concat!(
-    "FreeOS ",
+    "FossAi ",
     env!("CARGO_PKG_VERSION_MAJOR"),
     ".",
     env!("CARGO_PKG_VERSION_MINOR"),

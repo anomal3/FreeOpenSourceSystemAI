@@ -946,7 +946,7 @@ fn from_disk(conn: &mut Conn, dir: &str, rest: &str, stats: &mut Stats) -> bool 
         && conn.put(http::mime::of(path.as_str()))
         && conn.put("\r\nConnection: ")
         && conn.put(if conn.keep_alive { "keep-alive" } else { "close" })
-        && conn.put("\r\nServer: FreeOS-httpd/1\r\n\r\n");
+        && conn.put("\r\nServer: FossAi-httpd/1\r\n\r\n");
     if !ok {
         close(fd);
         return refuse(conn, 500, "Internal Server Error", stats);
@@ -1012,7 +1012,7 @@ fn metrics(conn: &mut Conn, stats: &mut Stats) -> bool {
         && conn.put_num(body.len as u64)
         && conn.put("\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nConnection: ")
         && conn.put(if conn.keep_alive { "keep-alive" } else { "close" })
-        && conn.put("\r\nServer: FreeOS-httpd/1\r\n\r\n")
+        && conn.put("\r\nServer: FossAi-httpd/1\r\n\r\n")
         && (matches!(conn.method, Method::Head) || conn.put(body.as_str()));
     if !ok {
         conn.keep_alive = false;
@@ -1046,7 +1046,7 @@ fn refuse(conn: &mut Conn, status: u16, reason: &'static str, stats: &mut Stats)
         && conn.put(reason)
         && conn.put("\r\nContent-Length: ")
         && conn.put_num(body_len as u64)
-        && conn.put("\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nServer: FreeOS-httpd/1\r\n\r\n")
+        && conn.put("\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nServer: FossAi-httpd/1\r\n\r\n")
         && (matches!(conn.method, Method::Head) || (conn.put(reason) && conn.put("\n")));
     if !ok {
         // Даже отказ не поместился — сказать нечего, кроме как закрыться.
@@ -1104,7 +1104,7 @@ fn proxy_to(
     ok = ok && conn.put(" HTTP/1.1\r\nHost: ") && conn.put(proxy.name.as_str());
     // Собеседнику говорим `close`: держать с ним живое соединение означало бы
     // вести учёт чужих соединений, а их у нас столько же, сколько своих.
-    ok = ok && conn.put("\r\nConnection: close\r\nAccept: */*\r\nUser-Agent: FreeOS-httpd/1\r\n");
+    ok = ok && conn.put("\r\nConnection: close\r\nAccept: */*\r\nUser-Agent: FossAi-httpd/1\r\n");
     // Кто на самом деле спрашивает. Поле не выдумано нами — так его пишут все
     // прокси, и по нему тот, кого мы проксируем, видит настоящего клиента, а
     // не нас.
@@ -1287,7 +1287,7 @@ fn hear_upstream(conn: &mut Conn, stats: &mut Stats) -> bool {
     ok = ok
         && conn.put("\r\nConnection: ")
         && conn.put(if conn.keep_alive { "keep-alive" } else { "close" })
-        && conn.put("\r\nServer: FreeOS-httpd/1\r\n\r\n");
+        && conn.put("\r\nServer: FossAi-httpd/1\r\n\r\n");
     if ok && extra > 0 && !matches!(conn.method, Method::Head) {
         ok = conn.out_len + extra <= OUT;
         if ok {
