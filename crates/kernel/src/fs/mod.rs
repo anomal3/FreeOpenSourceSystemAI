@@ -223,6 +223,33 @@ pub fn mounted() -> Vec<(&'static str, &'static str)> {
     out
 }
 
+/// Место на томах, куда пишут: первая точка монтирования тома, всего и
+/// свободно (фаза 69b, «Параметры» → «Хранилище»).
+///
+/// Ветки раздела состояния (`/etc`, `/home`, `/var`, `/opt`) — один том, и
+/// показывать его четыре раза значило бы обещать четыре диска.
+pub fn space() -> Vec<(&'static str, u64, u64)> {
+    // Спрашивать тома — после замка таблицы: том берёт свой замок, и держать
+    // их вложенно незачем.
+    let volumes: Vec<(&'static str, Arc<dyn FileSystem>)> =
+        MOUNTS.lock().iter().rev().map(|mount| (mount.prefix, Arc::clone(&mount.fs))).collect();
+    let mut out: Vec<(&'static str, u64, u64)> = Vec::new();
+    for (prefix, fs) in volumes {
+        let Some((total, free)) = fs.space() else {
+            continue;
+        };
+        if out.iter().any(|(_, t, f)| *t == total && *f == free) {
+            continue;
+        }
+        if out.try_reserve(1).is_err() {
+            break;
+        }
+        let point = if prefix.is_empty() { "/" } else { prefix };
+        out.push((point, total, free));
+    }
+    out
+}
+
 /// Найти узел по пути, проверяя права на каждом шаге.
 ///
 /// Проверяется не только сам файл. Чтобы дойти до `/root/notes.txt`, нужно

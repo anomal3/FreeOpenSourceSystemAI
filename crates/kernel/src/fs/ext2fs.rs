@@ -311,6 +311,14 @@ impl FileSystem for Ext2Mount {
         Some(self.summary())
     }
 
+    fn space(&self) -> Option<(u64, u64)> {
+        let guard = self.0.inner.lock();
+        let editor = guard.editor.as_ref()?;
+        let geometry = editor.geometry();
+        let total = u64::from(geometry.blocks) * u64::from(geometry.block_size.bytes());
+        Some((total, editor.free_bytes()))
+    }
+
     /// Переименовать: то же содержимое под другим именем.
     ///
     /// Номера каталогов выясняются **до** захвата редактора: разбор пути сам

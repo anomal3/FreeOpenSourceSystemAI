@@ -999,9 +999,15 @@ impl Window {
 
     /// Передать клавишу содержимому. `true` — окно её обработало.
     pub fn handle_key(&mut self, code: KeyCode) -> bool {
+        self.handle_typed(code, None)
+    }
+
+    /// То же, что [`Self::handle_key`], но с символом, который клавиша даёт в
+    /// текущей раскладке: «Параметрам» он нужен для поля поиска (фаза 69b).
+    pub fn handle_typed(&mut self, code: KeyCode, ch: Option<char>) -> bool {
         match &mut self.content {
             Content::Settings(view) => {
-                if !view.handle(code) {
+                if !view.handle(code, ch) {
                     return false;
                 }
                 self.redraw_content();
@@ -1109,6 +1115,27 @@ impl Window {
         match &mut self.content {
             Content::Settings(view) => view.take_title_change(),
             Content::Text(_) | Content::Dialog(_) | Content::Program(_) => false,
+        }
+    }
+
+    /// Колесо мыши над окном ядра. `true` — содержимое сдвинулось и
+    /// перерисовано.
+    pub fn wheel(&mut self, clicks: i32) -> bool {
+        let moved = match &mut self.content {
+            Content::Settings(view) => view.wheel(clicks),
+            Content::Text(_) | Content::Dialog(_) | Content::Program(_) => false,
+        };
+        if moved {
+            self.redraw_content();
+        }
+        moved
+    }
+
+    /// Чего «Параметры» просят у стола (фаза 69b).
+    pub fn took_request(&mut self) -> Option<super::settings::Request> {
+        match &mut self.content {
+            Content::Settings(view) => view.take_request(),
+            Content::Text(_) | Content::Dialog(_) | Content::Program(_) => None,
         }
     }
 

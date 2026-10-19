@@ -35,6 +35,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use mini_ui::draw;
 use mini_ui::glyphicon::{self, Icon};
@@ -740,10 +741,7 @@ impl Panel {
         // Правый край считается раньше кнопок: место под трей занято всегда, а
         // кнопкам достаётся то, что осталось. Наоборот было бы хуже — десяток
         // открытых окон вытеснил бы часы за край экрана.
-        let clock = match status.clock.as_deref() {
-            Some(clock) => String::from(clock),
-            None => alloc::format!("up {}", uptime_text(status.uptime_ms)),
-        };
+        let clock = clock_line(status);
         let lang = crate::input::keymap::layout().label();
         let mono = ctx.face(Role::Mono);
         let body = ctx.face(Role::Body);
@@ -1752,6 +1750,51 @@ fn list_programs() -> Vec<String> {
     names
 }
 
+/// Показывать ли время работы рядом с часами («Параметры» → «Dock и панель
+/// задач», фаза 69b). Атомики, а не поле панели: настройку читает и
+/// загрузка (`prefs::adopt`), когда панели ещё нет.
+static SHOW_UPTIME: AtomicBool = AtomicBool::new(false);
+/// Показывать ли дату рядом с часами.
+static SHOW_DATE: AtomicBool = AtomicBool::new(false);
+
+/// Что из двух показывает панель.
+#[must_use]
+pub fn shows(pref: super::settings::PanelPref) -> bool {
+    match pref {
+        super::settings::PanelPref::Uptime => SHOW_UPTIME.load(Ordering::Relaxed),
+        super::settings::PanelPref::Date => SHOW_DATE.load(Ordering::Relaxed),
+    }
+}
+
+pub fn set_shows(pref: super::settings::PanelPref, on: bool) {
+    match pref {
+        super::settings::PanelPref::Uptime => SHOW_UPTIME.store(on, Ordering::Relaxed),
+        super::settings::PanelPref::Date => SHOW_DATE.store(on, Ordering::Relaxed),
+    }
+}
+
+/// Строка часов справа: дата, время работы и часы — что включено.
+///
+/// Без часов реального времени остаётся только время работы, как и было: оно
+/// одно отвечает на вопрос «который час» честно.
+fn clock_line(status: &Status) -> String {
+    let Some(clock) = status.clock.as_deref() else {
+        return alloc::format!("up {}", uptime_text(status.uptime_ms));
+    };
+    let mut line = String::new();
+    if SHOW_UPTIME.load(Ordering::Relaxed) {
+        let seconds = status.uptime_ms / 1000;
+        line.push_str(&alloc::format!("up {}:{:02}  ", seconds / 3600, (seconds / 60) % 60));
+    }
+    if SHOW_DATE.load(Ordering::Relaxed) {
+        if let Some(now) = crate::time::now_local() {
+            line.push_str(&alloc::format!("{:02}.{:02}.{}  ", now.day, now.month, now.year));
+        }
+    }
+    line.push_str(clock);
+    line
+}
+
 /// Время работы в виде `Ч:ММ:СС`.
 fn uptime_text(ms: u64) -> String {
     let seconds = ms / 1000;
@@ -1825,6 +1868,14 @@ impl Fingerprint {
                 }
             }
             None => clock ^= status.uptime_ms / 1000,
+        }
+        // Время работы на панели — с точностью до минуты; дата меняется
+        // вместе с часами, её свёртка уже учтена.
+        if SHOW_UPTIME.load(Ordering::Relaxed) {
+            clock ^= (status.uptime_ms / 60_000).wrapping_mul(0x9E37_79B9) ^ 1;
+        }
+        if SHOW_DATE.load(Ordering::Relaxed) {
+            clock ^= 2;
         }
         Self {
             windows: hash,

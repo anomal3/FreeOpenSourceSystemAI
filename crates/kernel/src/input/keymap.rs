@@ -125,6 +125,14 @@ pub fn set_layout(layout: Layout) {
     crate::kprintln!("  keyboard    : layout {} ({})", layout.label(), layout.tag());
 }
 
+/// Запомнить раскладку в `/etc/system.cfg` — там же, где её оставил
+/// установщик (фаза 69b, «Параметры» → «Клавиатура»).
+pub fn store_layout(layout: Layout) -> Result<(), crate::vfs::VfsError> {
+    let text = crate::config::text("system.cfg", 4096);
+    let updated = crate::config::replace_key(&text, "keyboard", layout.tag());
+    crate::config::write("system.cfg", &updated)
+}
+
 /// Переключить на другую из двух. Возвращает новую.
 pub fn toggle_layout() -> Layout {
     let next = layout().other();

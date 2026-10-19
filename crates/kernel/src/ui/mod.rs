@@ -1349,6 +1349,17 @@ fn wheel(desktop: &mut Compositor, x: i32, y: i32, clicks: i32) {
     };
     if let Some(window) = target.and_then(|app| desktop.find(app)) {
         window.push_event(WinEvent { kind: WIN_WHEEL, code: 0, x: clicks, y: 0 });
+        return;
+    }
+    // Окно ядра под указателем — «Параметры» прокручиваются (фаза 69b).
+    if target.is_none() && desktop.dragging().is_none() && !desktop.menu_open() && !desktop.context_open() {
+        let moved = desktop
+            .window_under(x, y)
+            .and_then(|app| desktop.find(app))
+            .is_some_and(|window| window.wheel(clicks));
+        if moved {
+            desktop.present();
+        }
     }
 }
 
@@ -1986,6 +1997,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 let mut answer = None;
                 let mut title_changed = false;
                 let mut mode = None;
+                let mut request = None;
                 let mut pressed = None;
                 // Окно, в которое попали, а не активное: у обычного окна после
                 // поднятия это одно и то же, а всплывающее (фаза 62e) фокуса не
@@ -2012,6 +2024,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                     }
                     Some(window) => {
                         window.handle_click(x, y);
+                        request = window.took_request();
                         answer = window.take_answer();
                         let title = window.took_title_change();
                         let look = window.took_theme_change();
@@ -2035,6 +2048,9 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 apply_look_change(desktop, changed, title_changed, status);
                 if let Some(mode) = mode {
                     change_mode(desktop, mode, status);
+                }
+                if let Some(request) = request {
+                    settings_request(desktop, request, status);
                 }
             }
         }
@@ -2209,16 +2225,21 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
         }
         Some(_) => {
             if event.pressed {
+                let ch = keymap::char_for(event);
                 let outcome = desktop.focused_mut().map(|window| {
-                    let handled = window.handle_key(event.code);
+                    let handled = window.handle_typed(event.code, ch);
                     (
                         handled,
                         window.took_theme_change(),
                         window.took_title_change(),
                         window.took_mode_request(),
+                        window.took_request(),
                     )
                 });
-                if let Some((handled, look, title, mode)) = outcome {
+                if let Some((handled, look, title, mode, request)) = outcome {
+                    if let Some(request) = request {
+                        settings_request(desktop, request, status);
+                    }
                     // С клавиатуры вид меняется так же, как мышью: раньше
                     // тема, выбранная стрелками и Enter, перекрашивала одно
                     // окно, а стол оставался прежним до следующего щелчка.
@@ -2581,7 +2602,7 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         }
         context::Action::ClockSettings => {
             desktop.close_context();
-            open_settings(desktop, Section::Clock, status);
+            open_settings(desktop, Section::Time, status);
         }
         context::Action::SwitchLayout => {
             desktop.close_context();
@@ -2617,11 +2638,24 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
             desktop.refresh_panel(status);
         }
         TrayItem::Network => open_settings(desktop, Section::Network, status),
-        TrayItem::Clock => open_settings(desktop, Section::Clock, status),
+        TrayItem::Clock => open_settings(desktop, Section::Time, status),
     }
 }
 
 /// Открыть «Параметры» на заданном разделе.
+/// Выполнить просьбу «Параметров»: открыть вопрос о питании или
+/// перерисовать панель.
+fn settings_request(desktop: &mut Compositor, request: settings::Request, status: &Status) {
+    match request {
+        settings::Request::Shutdown => launch(desktop, App::Shutdown),
+        settings::Request::Restart => launch(desktop, App::Restart),
+        settings::Request::Panel => {}
+    }
+    kprintln!("  desktop     : settings asked for {request:?}");
+    desktop.refresh_panel(status);
+    desktop.present();
+}
+
 fn open_settings(desktop: &mut Compositor, section: Section, status: &Status) {
     launch(desktop, App::Settings);
     if let Some(window) = desktop.find(App::Settings) {

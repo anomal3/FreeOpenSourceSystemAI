@@ -67,6 +67,18 @@ pub fn adopt() {
             crate::kprintln!("  power       : screen off after {seconds} s, from {path}");
         }
     }
+    // Что показывает панель рядом с часами (фаза 69b).
+    for (pref, key) in [
+        (super::settings::PanelPref::Uptime, "panel_uptime"),
+        (super::settings::PanelPref::Date, "panel_date"),
+    ] {
+        match sysconf::value(text, key) {
+            Some("on") => super::panel::set_shows(pref, true),
+            Some("off") => super::panel::set_shows(pref, false),
+            _ => continue,
+        }
+        crate::kprintln!("  desktop     : {key} {} from {}", sysconf::value(text, key).unwrap_or(""), path);
+    }
     if let Some(height) = sysconf::title_bar(text) {
         if mini_ui::theme::set_title_h(height) {
             crate::kprintln!("  desktop     : title bar {height} px from {path}");
@@ -106,6 +118,15 @@ pub fn store_screen_off(seconds: u32) -> Result<(), crate::vfs::VfsError> {
 /// Запомнить высоту заголовка.
 pub fn store_title_bar(height: u32) -> Result<(), crate::vfs::VfsError> {
     store_key("titlebar", &alloc::format!("{height}"))
+}
+
+/// Запомнить, что показывает панель.
+pub fn store_panel(pref: super::settings::PanelPref, on: bool) -> Result<(), crate::vfs::VfsError> {
+    let key = match pref {
+        super::settings::PanelPref::Uptime => "panel_uptime",
+        super::settings::PanelPref::Date => "panel_date",
+    };
+    store_key(key, if on { "on" } else { "off" })
 }
 
 /// Правится одна строка файла, остальные остаются как были.

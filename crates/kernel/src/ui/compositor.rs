@@ -509,6 +509,13 @@ impl Compositor {
         Some((window.app, x - window.rect.x, y - top))
     }
 
+    /// Окно ядра (не программы) под точкой — для колеса мыши (фаза 69b).
+    pub fn window_under(&self, x: i32, y: i32) -> Option<App> {
+        let (index, hit) = self.window_at(x, y)?;
+        let window = self.windows.get(index)?;
+        (hit == Hit::Body && !window.is_program()).then_some(window.app)
+    }
+
     /// См. [`Self::hovered`].
     pub const fn hovered(&self) -> Option<App> {
         self.hovered
