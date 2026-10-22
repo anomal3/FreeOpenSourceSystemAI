@@ -150,6 +150,15 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     if let Some(llm) = llama(arch)? {
         samples.push(("llama-0.7.0.fpk", llm));
     }
+    // Корень программ Linux (фаза 71b) — готовым пакетом от `xtask thirdparty`.
+    if arch == Arch::X86_64 {
+        let path = crate::debian::package_path();
+        if path.is_file() {
+            samples.push((crate::debian::PACKAGE_FILE, fs::read(&path)?));
+        } else {
+            say!("пакет debian пропущен: нет {} — собрать: cargo xtask thirdparty --only debian", path.display());
+        }
+    }
 
     let mut built = Vec::new();
     for (file_name, bytes) in samples {
@@ -164,7 +173,7 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
 
 /// Пакеты игр: только на установочный носитель, не в RAM-диск живой системы.
 /// Там же llama.cpp (фаза 70d) — по той же причине: десятки мегабайт.
-pub const GAMES: [&str; 3] = ["freedoom-0.13.fpk", "sopwith-2.9.0.fpk", "llama-0.7.0.fpk"];
+pub const GAMES: [&str; 4] = ["freedoom-0.13.fpk", "sopwith-2.9.0.fpk", "llama-0.7.0.fpk", "debian-12.fpk"];
 
 /// llama.cpp пакетом (фаза 70d): программы llama.cpp, проверка библиотеки
 /// C++ (`cxxdemo`) и маленькая модель stories15M — чтобы было что запустить

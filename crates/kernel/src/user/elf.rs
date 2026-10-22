@@ -12,8 +12,9 @@
 //! сдвигаются на одно и то же число. Перемещения внутри образа ядро **не**
 //! применяет — это делает стартовый код программы (`user_progs::start`), потому
 //! что страницы образа читаются по обращению и при запуске их у ядра нет.
-//! Программа, которой нужен динамический загрузчик (`PT_INTERP`), отвергается:
-//! загрузчика у системы нет.
+//! Программа, которой нужен динамический загрузчик (`PT_INTERP`), — программа
+//! Linux (фаза 71b): ядро кладёт рядом её `ld-linux`. Своих динамических
+//! программ у системы нет; на AArch64 такая программа отвергается.
 //!
 //! # Данные здесь недоверенные
 //!
@@ -253,6 +254,9 @@ impl<'a> Image<'a> {
         for index in 0..phnum {
             let at = phoff + index * phentsize;
             match u32(bytes, at) {
+                // Динамический загрузчик (фаза 71b) — признак программы Linux:
+                // своих динамических программ у системы нет.
+                PT_INTERP if cfg!(target_arch = "x86_64") => linux = true,
                 PT_INTERP => return Err(ElfError::NeedsInterpreter),
                 PT_NOTE => {
                     let offset = u64(bytes, at + 8) as usize;
@@ -296,6 +300,14 @@ impl<'a> Image<'a> {
             }
         }
         found
+    }
+
+    /// Где в файле лежит путь к динамическому загрузчику (`PT_INTERP`):
+    /// смещение и длина с завершающим нулём. `None` — программа статическая.
+    pub fn interp(&self) -> Option<(usize, usize)> {
+        (0..self.phnum).map(|index| self.phoff + index * self.phentsize).find_map(|at| {
+            (u32(self.bytes, at) == PT_INTERP).then(|| (u64(self.bytes, at + 8) as usize, u64(self.bytes, at + 32) as usize))
+        })
     }
 
     /// Число заголовков программы и размер одного (`AT_PHNUM`, `AT_PHENT`).

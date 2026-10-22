@@ -37,6 +37,7 @@ mod qemu;
 mod repo;
 mod sdk;
 mod thirdparty;
+mod debian;
 mod util;
 mod version;
 

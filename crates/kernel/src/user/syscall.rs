@@ -1419,7 +1419,7 @@ fn mprotect(addr: usize, len: usize, prot: usize) -> i64 {
 /// разница эта нужна не журналу, а программе: на первый ответ разумно
 /// подождать или сдаться, на второй — попросить меньше. Один код на оба
 /// заставил бы её гадать.
-fn mmap_errno(err: super::MmapError) -> i64 {
+pub(crate) fn mmap_errno(err: super::MmapError) -> i64 {
     match err {
         super::MmapError::BadRequest => ERR_BAD_ADDRESS,
         super::MmapError::Limit => ERR_LIMIT,
@@ -2399,7 +2399,7 @@ fn readiness_of(fd: usize, wanted: u32) -> u32 {
     }
 }
 
-fn errno(err: FileError) -> i64 {
+pub(crate) fn errno(err: FileError) -> i64 {
     match err {
         FileError::NoFilesystem => ERR_NO_FILESYSTEM,
         FileError::BadFd => ERR_BAD_FD,
@@ -2413,7 +2413,7 @@ fn errno(err: FileError) -> i64 {
     }
 }
 
-fn vfs_errno(err: VfsError) -> i64 {
+pub(crate) fn vfs_errno(err: VfsError) -> i64 {
     match err {
         VfsError::NotFound => ERR_NOT_FOUND,
         VfsError::PermissionDenied => ERR_PERMISSION,

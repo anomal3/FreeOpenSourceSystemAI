@@ -500,6 +500,12 @@ struct ImageBacking {
     /// считаются и не вытесняются — выброшенная страница данных вернулась бы
     /// из файла в исходном виде.
     resident: Resident,
+    /// Страницы области бывали записываемыми (фаза 71b): ни одна не
+    /// вытесняется. Программа Linux сначала получает `.data` на запись, правит
+    /// перемещения и делает её только для чтения (`mprotect`, RELRO) — чистой
+    /// с виду страница от этого не становится, и прочитанная заново из файла
+    /// она вернулась бы без правок.
+    pinned: bool,
     /// Сколько раз страницу пришлось читать с носителя.
     reads: u64,
     /// Сколько раз страницу выбросили, чтобы освободить место.
@@ -796,6 +802,9 @@ pub struct Program {
     /// Граница `brk` программы Linux: начало, нынешний конец и конец резерва.
     /// Резерв — ленивая область, заводится при первом `brk`.
     pub brk: (usize, usize, usize),
+    /// Текущий каталог программы Linux (фаза 71b) — так, как его видит она;
+    /// у родных программ текущий каталог держит libc.
+    pub linux_cwd: alloc::string::String,
 }
 
 impl Drop for Program {
@@ -977,6 +986,102 @@ impl Program {
         Ok(base)
     }
 
+    /// `mmap` программы Linux (фаза 71b): безымянная память или кусок файла с
+    /// любыми правами, кроме записи и исполнения сразу; `fixed` — ровно по
+    /// адресу `addr`, сняв всё, что там лежало (`MAP_FIXED`).
+    ///
+    /// Кусок файла становится областью того же вида, что сегмент образа
+    /// ([`Source::Image`]): страница читается по обращению, а записанная —
+    /// частная копия программы, в файл не уходит (`MAP_PRIVATE`). Так `ld.so`
+    /// раскладывает библиотеки: резервирует место под всю библиотеку первым
+    /// `mmap`, кладёт сегменты поверх `MAP_FIXED` и `.bss` — безымянной памятью.
+    pub(crate) fn linux_mmap(
+        &mut self,
+        addr: usize,
+        len: usize,
+        prot: usize,
+        fixed: bool,
+        file: Option<(Arc<dyn Node>, u64)>,
+    ) -> Result<usize, MmapError> {
+        use user_abi::{PROT_EXEC, PROT_READ, PROT_WRITE};
+        if len == 0 || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+            return Err(MmapError::BadRequest);
+        }
+        if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+            return Err(MmapError::WriteExecute);
+        }
+        let flags = if prot == 0 {
+            PageFlags::NONE
+        } else {
+            let mut flags = PageFlags::READ | PageFlags::USER;
+            if prot & PROT_WRITE != 0 {
+                flags |= PageFlags::WRITE;
+            }
+            if prot & PROT_EXEC != 0 {
+                flags |= PageFlags::EXEC;
+            }
+            flags
+        };
+        let pages = len.div_ceil(PAGE_SIZE);
+        let bytes = pages.checked_mul(PAGE_SIZE).ok_or(MmapError::BadRequest)?;
+        let base = if fixed {
+            // Только там, где программе вообще положена память: окно образа
+            // и области памяти по запросу ([`owns`]).
+            if addr % PAGE_SIZE != 0 || !owns(addr, bytes) {
+                return Err(MmapError::BadRequest);
+            }
+            self.clear_range(addr, bytes)?;
+            if self.mappings.len() >= MAX_MAPPINGS {
+                return Err(MmapError::Limit);
+            }
+            addr
+        } else {
+            self.reserve(len, PAGE_SIZE)?.0
+        };
+        let source = match file {
+            Some((node, offset)) => {
+                if offset % PAGE_SIZE as u64 != 0 {
+                    return Err(MmapError::BadRequest);
+                }
+                Source::Image(ImageBacking {
+                    node,
+                    offset,
+                    file_bytes: bytes,
+                    flags,
+                    resident: Resident::default(),
+                    pinned: flags.contains(PageFlags::WRITE),
+                    reads: 0,
+                    evictions: 0,
+                })
+            }
+            None => Source::Anonymous(Anon { flags, lazy: true, jit: false }),
+        };
+        self.remember(Mapping { base, pages, blocks: 0, source });
+        Ok(base)
+    }
+
+    /// Снять всё, что лежит в `[addr, addr + bytes)`, — для `MAP_FIXED`.
+    /// Пусто — не отказ: «положи сюда» о пустом месте и просит. Задетая
+    /// область, которую резать нельзя (стек, поверхность окна), — отказ.
+    fn clear_range(&mut self, addr: usize, bytes: usize) -> Result<(), MmapError> {
+        let end = addr.checked_add(bytes).ok_or(MmapError::BadRequest)?;
+        let first = self.mappings.partition_point(|region| region.end() <= addr);
+        let mut any = false;
+        for region in self.mappings[first..].iter().take_while(|region| region.base < end) {
+            if !self.divisible(region) {
+                return Err(MmapError::BadRequest);
+            }
+            any = true;
+        }
+        if !any {
+            return Ok(());
+        }
+        // `unmap_pieces` и снимет, и разрежет края, и вернёт кадры; а страницы,
+        // которых в таблице областей нет (стек, страница процесса), [`owns`]
+        // к этому месту уже не пустил.
+        self.unmap_pieces(addr, bytes / PAGE_SIZE, true)
+    }
+
     /// Отвести место под поверхность окна и отобразить в неё свежие кадры.
     ///
     /// Возвращает адрес поверхности в памяти программы и физический адрес
@@ -1148,8 +1253,16 @@ impl Program {
     /// распоряжается», а вещи со своим смыслом; кусок крупной страницы не
     /// снять, не разбив её на пятьсот двенадцать обычных, а разбивать таблицы
     /// ядро не умеет намеренно (см. `arch::unmap`).
-    fn divisible(region: &Mapping) -> bool {
-        matches!(region.source, Source::Anonymous(_)) && region.blocks == 0
+    ///
+    /// У программы Linux (фаза 71b) — и сегменты с носителя: свои библиотеки
+    /// она раскладывает сама (`ld.so` — через `mmap` с `MAP_FIXED`), сама их
+    /// режет и меняет им права.
+    fn divisible(&self, region: &Mapping) -> bool {
+        match region.source {
+            Source::Anonymous(_) => region.blocks == 0,
+            Source::Image(_) => self.linux,
+            _ => false,
+        }
     }
 
     /// Разрезать область, внутри которой лежит `addr`, на две — по `addr`.
@@ -1166,18 +1279,52 @@ impl Program {
         if region.base == addr {
             return;
         }
-        let Source::Anonymous(anon) = region.source else {
-            unreachable!("делимость области проверяется до разреза");
-        };
         let left = (addr - region.base) / PAGE_SIZE;
-        let right = Mapping {
-            base: addr,
-            pages: region.pages - left,
-            blocks: 0,
-            source: Source::Anonymous(anon),
+        let source = match &mut region.source {
+            Source::Anonymous(anon) => Source::Anonymous(*anon),
+            // Сегмент с носителя (фаза 71b): правая часть начинается в файле
+            // дальше на длину левой; счёт отображённых страниц делится
+            // пересчётом ниже.
+            Source::Image(image) => {
+                let cut = left * PAGE_SIZE;
+                let right = ImageBacking {
+                    node: Arc::clone(&image.node),
+                    offset: image.offset + cut as u64,
+                    file_bytes: image.file_bytes.saturating_sub(cut),
+                    flags: image.flags,
+                    resident: Resident::default(),
+                    pinned: image.pinned,
+                    reads: 0,
+                    evictions: 0,
+                };
+                image.file_bytes = image.file_bytes.min(cut);
+                Source::Image(right)
+            }
+            _ => unreachable!("делимость области проверяется до разреза"),
         };
+        let right = Mapping { base: addr, pages: region.pages - left, blocks: 0, source };
         region.pages = left;
         self.mappings.insert(index + 1, right);
+        self.recount_resident(index);
+        self.recount_resident(index + 1);
+    }
+
+    /// Пересчитать чистые отображённые страницы сегмента с носителя — после
+    /// разреза, когда прежний счёт относился к двум областям разом.
+    fn recount_resident(&mut self, index: usize) {
+        let root = self.space.root();
+        let (base, pages) = (self.mappings[index].base, self.mappings[index].pages);
+        let Source::Image(image) = &mut self.mappings[index].source else {
+            return;
+        };
+        if image.pinned {
+            image.resident = Resident::default();
+            return;
+        }
+        let present = (0..pages)
+            .filter(|page| arch::translate(root, VirtAddr::new(base + page * PAGE_SIZE)).is_some())
+            .count();
+        image.resident = Resident { pages: present, hand: 0 };
     }
 
     /// Сколько новых записей в таблице понадобится, чтобы разрезать области
@@ -1208,7 +1355,7 @@ impl Program {
         let touched = self.mappings[first..].iter().take_while(|region| region.base < end);
         let mut any = false;
         for region in touched {
-            if !Self::divisible(region) {
+            if !self.divisible(region) {
                 return Err(MmapError::BadRequest);
             }
             any = true;
@@ -1290,7 +1437,7 @@ impl Program {
             // Права страниц памяти кода меняет ядро само, по обращению
             // (фаза 59), и второй хозяин у них был бы лишним.
             let jit = matches!(region.source, Source::Anonymous(Anon { jit: true, .. }));
-            if region.base > covered || !Self::divisible(region) || jit {
+            if region.base > covered || !self.divisible(region) || jit {
                 return Err(MmapError::BadRequest);
             }
             covered = region.end();
@@ -1313,11 +1460,23 @@ impl Program {
             if base >= end {
                 break;
             }
-            let Source::Anonymous(anon) = &mut self.mappings[index].source else {
-                unreachable!("покрытие проверено выше");
+            let page_flags = match &mut self.mappings[index].source {
+                Source::Anonymous(anon) => {
+                    anon.flags = flags;
+                    anon.page_flags()
+                }
+                Source::Image(image) => {
+                    image.flags = flags;
+                    // Стала записываемой — значит, её страницы больше не
+                    // копия файла (см. `ImageBacking::pinned`).
+                    if flags.contains(PageFlags::WRITE) {
+                        image.pinned = true;
+                        image.resident = Resident::default();
+                    }
+                    if flags.contains(PageFlags::USER) { flags } else { PageFlags::READ }
+                }
+                _ => unreachable!("покрытие проверено выше"),
             };
-            anon.flags = flags;
-            let page_flags = anon.page_flags();
             for page in 0..pages {
                 let virt = VirtAddr::new(base + page * PAGE_SIZE);
                 let Some((phys, _)) = arch::translate(root, virt) else {
@@ -1364,7 +1523,7 @@ impl Program {
         }
         // Сегмент собственного образа программа не снимает: код, который
         // исполняется, и данные, по которым он ходит, уходят вместе с ней.
-        if matches!(self.mappings[index].source, Source::Image(..)) {
+        if matches!(self.mappings[index].source, Source::Image(..)) && !self.linux {
             return Err(MmapError::BadRequest);
         }
 
@@ -1391,6 +1550,9 @@ impl Program {
             // ей неоткуда.
             Source::ThreadStack => region.pages - 1,
             Source::File(file) => file.resident.pages,
+            // Сегмент программы Linux (фаза 71b): записанные страницы в счёт
+            // не идут, сверять не с чем.
+            Source::Image(..) if self.linux => freed,
             // Сюда не приходят: поверхность и сегмент образа отсеяны проверками
             // выше. Ветки существуют затем, чтобы новый вид области нельзя было
             // завести, не ответив на вопрос, сколько кадров он обязан вернуть.
@@ -1553,8 +1715,9 @@ impl Program {
             }
             Source::Image(image) => {
                 // Запись в сегмент кода или данных только на чтение — ошибка
-                // программы, а не повод подложить ей страницу.
-                if write && !image.flags.contains(PageFlags::WRITE) {
+                // программы, а не повод подложить ей страницу. «Никак»
+                // (`PROT_NONE` у программы Linux, фаза 71b) — любое обращение.
+                if (write && !image.flags.contains(PageFlags::WRITE)) || !image.flags.contains(PageFlags::USER) {
                     return None;
                 }
                 let start = page * PAGE_SIZE;
@@ -1617,10 +1780,10 @@ impl Program {
 
         let region_pages = self.mappings[index].pages;
         let root = self.space.root();
-        let (what, resident, reads, evictions) = match &mut self.mappings[index].source {
-            Source::File(file) => ("file mapping", &mut file.resident, &mut file.reads, &mut file.evictions),
+        let (what, resident, reads, evictions, pinned) = match &mut self.mappings[index].source {
+            Source::File(file) => ("file mapping", &mut file.resident, &mut file.reads, &mut file.evictions, false),
             Source::Image(image) => {
-                ("program image", &mut image.resident, &mut image.reads, &mut image.evictions)
+                ("program image", &mut image.resident, &mut image.reads, &mut image.evictions, image.pinned)
             }
             _ => return Commit::Mapped,
         };
@@ -1637,7 +1800,7 @@ impl Program {
 
         // Страница на запись — своя с этого момента: в файле её нет в том виде,
         // в каком её оставит программа, и выбрасывать её нельзя.
-        if !plan.clean {
+        if !plan.clean || pinned {
             return Commit::Mapped;
         }
         resident.pages += 1;
@@ -2448,7 +2611,7 @@ fn place_linux_args(
     path: &str,
     args: &[&str],
     layout: Layout,
-    entry: usize,
+    _entry: usize,
     start: LinuxStart,
     cred: Credentials,
 ) -> usize {
@@ -2543,9 +2706,9 @@ fn place_linux_args(
         (AT_PHENT, start.phent),
         (AT_PHNUM, start.phnum),
         (AT_PAGESZ, PAGE_SIZE),
-        (AT_BASE, 0),
+        (AT_BASE, start.interp_base),
         (AT_FLAGS, 0),
-        (AT_ENTRY, entry),
+        (AT_ENTRY, start.program_entry),
         (AT_UID, cred.uid as usize),
         (AT_EUID, cred.uid as usize),
         (AT_GID, cred.gid as usize),
@@ -2694,6 +2857,11 @@ struct LinuxStart {
     phdr: usize,
     phnum: usize,
     phent: usize,
+    /// Точка входа самой программы (`AT_ENTRY`) — даже когда вход в
+    /// динамический загрузчик.
+    program_entry: usize,
+    /// Куда лёг динамический загрузчик (`AT_BASE`); ноль — его нет.
+    interp_base: usize,
 }
 
 /// Выбрать место позиционно-независимой программе (ASLR, часть 2).
@@ -2720,30 +2888,16 @@ fn image_bias(image: &elf::Image<'_>) -> Result<usize, Error> {
         .ok_or(Error::Elf(elf::ElfError::OutOfWindow))
 }
 
-/// Разложить программу по её адресному пространству и вернуть точку входа.
-///
-/// «Разложить» с фазы 54 значит записать сегменты в таблицу областей: ни одна
-/// страница образа здесь не читается и не отображается — первое обращение к
-/// ней придёт отказом страницы, и [`Program::fault_in`] прочитает её из файла.
-/// Стек — исключение: его верхняя страница нужна сразу, под аргументы, а
-/// остальные дешевле выдать здесь, чем ловить шестнадцать отказов на первом
-/// же вызове.
-fn load(
+/// Записать сегменты одного образа ELF в таблицу областей (со сдвигом
+/// `bias`) — программы или её динамического загрузчика (фаза 71b). Общие
+/// страницы двух сегментов читаются и отображаются сразу, остальные — по
+/// обращению.
+fn map_segments(
     space: &mut Space,
     node: &Arc<dyn Node>,
-    header: &[u8],
-    file_len: usize,
-    stack_top: usize,
-) -> Result<Loaded, Error> {
-    let image = elf::Image::parse(header, file_len).map_err(Error::Elf)?;
-    // Программы Linux (фаза 71a) — пока только на x86-64: на AArch64 вход у них
-    // тот же `svc`, что у родных, и отличать их ядро ещё не умеет.
-    if image.linux && !cfg!(target_arch = "x86_64") {
-        return Err(Error::Elf(elf::ElfError::Unsupported));
-    }
-    let bias = if image.position_independent { image_bias(&image)? } else { 0 };
-    let tls = image.tls((WINDOW_BASE, WINDOW_BASE + IMAGE_LIMIT_BYTES), bias).map_err(Error::Elf)?;
-
+    image: &elf::Image<'_>,
+    bias: usize,
+) -> Result<Vec<Mapping>, Error> {
     // Сегменты по возрастанию адреса. Права уже в понятиях страниц.
     struct Seg {
         vaddr: usize,
@@ -2878,6 +3032,7 @@ fn load(
                             file_bytes,
                             flags: seg.flags,
                             resident: Resident::default(),
+                            pinned: seg.flags.contains(PageFlags::WRITE),
                             reads: 0,
                             evictions: 0,
                         }),
@@ -2894,6 +3049,77 @@ fn load(
         for region in &mut mappings {
             prefetch(space, region)?;
         }
+    }
+    Ok(mappings)
+}
+
+/// Разложить программу по её адресному пространству и вернуть точку входа.
+///
+/// «Разложить» с фазы 54 значит записать сегменты в таблицу областей: ни одна
+/// страница образа здесь не читается и не отображается — первое обращение к
+/// ней придёт отказом страницы, и [`Program::fault_in`] прочитает её из файла.
+/// Стек — исключение: его верхняя страница нужна сразу, под аргументы, а
+/// остальные дешевле выдать здесь, чем ловить шестнадцать отказов на первом
+/// же вызове.
+fn load(
+    space: &mut Space,
+    node: &Arc<dyn Node>,
+    header: &[u8],
+    file_len: usize,
+    stack_top: usize,
+    cred: Credentials,
+) -> Result<Loaded, Error> {
+    let image = elf::Image::parse(header, file_len).map_err(Error::Elf)?;
+    // Программы Linux (фаза 71a) — пока только на x86-64: на AArch64 вход у них
+    // тот же `svc`, что у родных, и отличать их ядро ещё не умеет.
+    if image.linux && !cfg!(target_arch = "x86_64") {
+        return Err(Error::Elf(elf::ElfError::Unsupported));
+    }
+    let bias = if image.position_independent { image_bias(&image)? } else { 0 };
+    let tls = image.tls((WINDOW_BASE, WINDOW_BASE + IMAGE_LIMIT_BYTES), bias).map_err(Error::Elf)?;
+
+    let mut mappings = map_segments(space, node, &image, bias)?;
+
+    // Динамический загрузчик программы Linux (фаза 71b): `ld-linux` ложится
+    // в окно образа сразу за программой, и вход — в него, а он сам найдёт и
+    // разложит библиотеки и передаст управление `AT_ENTRY`.
+    let mut interp_base = 0;
+    let mut interp_entry = None;
+    if let Some((offset, len)) = image.interp() {
+        let mut path = [0u8; 256];
+        if len == 0 || len > path.len() {
+            return Err(Error::Elf(elf::ElfError::BadSegment));
+        }
+        node.read_at(offset as u64, &mut path[..len]).map_err(Error::Read)?;
+        let end = path[..len].iter().position(|byte| *byte == 0).unwrap_or(len);
+        let interp_path = core::str::from_utf8(&path[..end]).map_err(|_| Error::Elf(elf::ElfError::BadSegment))?;
+        let full = crate::linux_path::resolve(interp_path, cred);
+        let interp_node: Arc<dyn Node> = match crate::fs::resolve_as(cred, &full, Access::SEARCH) {
+            Some(Ok(found)) => Arc::from(found),
+            Some(Err(err)) => return Err(Error::Read(err)),
+            None => return Err(Error::NoFilesystem),
+        };
+        let (interp_header, interp_len) = read_header(&*interp_node)?;
+        let interp = elf::Image::parse(&interp_header, interp_len).map_err(Error::Elf)?;
+        if !interp.position_independent || interp.interp().is_some() {
+            return Err(Error::Elf(elf::ElfError::Unsupported));
+        }
+        let (_, program_high) = image.span().map_err(Error::Elf)?;
+        let (low, high) = interp.span().map_err(Error::Elf)?;
+        let at = (program_high + bias).next_multiple_of(PAGE_SIZE) + PAGE_SIZE;
+        let interp_bias = at.checked_sub(low & !(PAGE_SIZE - 1)).ok_or(Error::Elf(elf::ElfError::OutOfWindow))?;
+        if high + interp_bias > WINDOW_BASE + IMAGE_LIMIT_BYTES {
+            return Err(Error::Elf(elf::ElfError::OutOfWindow));
+        }
+        let more = map_segments(space, &interp_node, &interp, interp_bias)?;
+        if mappings.len() + more.len() > 2 * MAX_IMAGE_SEGMENTS {
+            return Err(Error::TooManySegments);
+        }
+        mappings.try_reserve(more.len()).map_err(|_| Error::OutOfMemory)?;
+        mappings.extend(more);
+        mappings.sort_by_key(|region| region.base);
+        interp_base = interp_bias;
+        interp_entry = Some(interp.entry + interp_bias);
     }
 
     let mut stack_top_frame = PhysAddr::new(0);
@@ -2985,11 +3211,12 @@ fn load(
         return Err(Error::Map(err));
     }
 
-    let entry = image.entry.checked_add(bias).ok_or(Error::Elf(elf::ElfError::OutOfWindow))?;
+    let program_entry = image.entry.checked_add(bias).ok_or(Error::Elf(elf::ElfError::OutOfWindow))?;
+    let entry = interp_entry.unwrap_or(program_entry);
     let linux = if image.linux {
         let (phnum, phent) = image.phdr_geometry();
         let phdr = image.phdr_vaddr().map_or(0, |vaddr| vaddr + bias);
-        Some(LinuxStart { phdr, phnum, phent })
+        Some(LinuxStart { phdr, phnum, phent, program_entry, interp_base })
     } else {
         None
     };
@@ -3065,7 +3292,7 @@ fn run(
     // сдвинуты на случайное (ASLR). Образ пока стоит там, куда его поставил
     // компоновщик, — для его сдвига программы нужно собирать иначе (PIE).
     let layout = Layout::random();
-    let loaded = load(&mut space, &node, &header, file_len, layout.stack_top)?;
+    let loaded = load(&mut space, &node, &header, file_len, layout.stack_top, cred)?;
     let entry = loaded.entry;
     let root = space.root();
 
@@ -3122,6 +3349,7 @@ fn run(
             jit: JitStats::default(),
             linux: loaded.linux.is_some(),
             brk: (0, 0, 0),
+            linux_cwd: alloc::string::String::from("/"),
         })));
     }
     // Признак поднимается после того, как процесс попал в таблицу: обработчик

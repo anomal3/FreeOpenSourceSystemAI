@@ -111,6 +111,9 @@ enum How {
     /// Модель для llama.cpp (фаза 70d): файл GGUF как есть, не архив, — в
     /// [`cbuild::games_dir`] под своим именем.
     Model,
+    /// Корень программ Linux из пакетов Debian (фаза 71b): не один архив, а
+    /// десяток `.deb` со своими хешами — см. [`crate::debian`].
+    Debian,
 }
 
 /// Что распаковывать из архива LLVM для [`How::LlvmRuntimes`]: сборка
@@ -178,7 +181,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 19] = [
+const PROJECTS: [Project; 20] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -592,6 +595,18 @@ const PROJECTS: [Project; 19] = [
         how: How::Model,
         installs: &[],
     },
+    // Корень для программ Linux (фаза 71b): glibc, bash, coreutils из Debian 12.
+    // Адреса и хеши пакетов — в `crate::debian`; здесь хеш индекса `Packages`
+    // bookworm, из которого они выписаны (2026-10-22).
+    Project {
+        name: "debian",
+        version: "12",
+        url: "https://snapshot.debian.org/archive/debian/20261020T000000Z/dists/bookworm/main/binary-amd64/Packages.xz",
+        sha256: "9e0b5aabb2465b3d2e7a7fe27f9913846277833f7a2826e7767acccff5b588c5",
+        unpacked: "debian",
+        how: How::Debian,
+        installs: &[],
+    },
 ];
 
 /// Собрать чужие проекты под все указанные архитектуры: все или только
@@ -606,6 +621,12 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
         bail!("нет чужого проекта «{unknown}»; есть: {}", known.join(", "));
     }
     for project in PROJECTS.iter().filter(|project| only.is_empty() || only.iter().any(|name| name == project.name)) {
+        if project.how == How::Debian {
+            for &arch in arches {
+                crate::debian::build(arch)?;
+            }
+            continue;
+        }
         let source = fetch(project, refresh)?;
         if project.how == How::Model {
             let dir = cbuild::games_dir();
@@ -921,7 +942,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
-        How::Files(_) | How::Games(_) | How::Model => return Ok(()),
+        How::Files(_) | How::Games(_) | How::Model | How::Debian => return Ok(()),
         How::Doomgeneric => {
             let game = work.join("doomgeneric");
             // Список объектов — из его же `Makefile.sdl`, без трёх звуковых

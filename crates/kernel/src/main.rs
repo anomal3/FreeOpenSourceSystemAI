@@ -60,6 +60,7 @@ mod klog;
 mod latency;
 #[cfg(target_arch = "x86_64")]
 mod linux;
+mod linux_path;
 mod mm;
 mod net;
 mod pci;

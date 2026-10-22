@@ -9853,12 +9853,68 @@ AArch64; загрузка модели — 7–10 с. `install`, `cthreads`, `cm
 `openat`/`read`/`fstat` своего файла, `ENOENT`. `cthreads`, `cmem`,
 `userspace`, `aslr`, `canary`, `mmap` — зелёные на обеих архитектурах.
 
-### Дальше — 71b
+## Фаза 71b — программы Debian с glibc — **сделано 2026-10-22**
 
-Динамические программы: `ld-linux-x86-64.so.2` по `PT_INTERP` (ядро
-загружает его рядом с программой и отдаёт `AT_BASE`), `MAP_FIXED`,
-отображение файла на запись с копированием, `mprotect` по образу,
-`/compat/linux` из пакетов Debian — и Debian `bash`, `ls`.
+### Что стало
+
+- **Динамический загрузчик.** У программы с `PT_INTERP` ядро читает путь,
+  находит `ld-linux` (в корне Debian), раскладывает его в окне образа сразу
+  за программой (`map_segments` — общая раскладка сегментов для обоих) и
+  входит в него; `AT_BASE` — куда лёг загрузчик, `AT_ENTRY` — вход самой
+  программы.
+- **`mmap` программы Linux** (`Program::linux_mmap`): кусок файла с любыми
+  правами, кроме записи и исполнения сразу, — область того же вида, что
+  сегмент образа: страница читается по обращению, записанная — частная копия
+  (`MAP_PRIVATE`); `MAP_FIXED` снимает всё под адресом и кладёт новое. `munmap`
+  и `mprotect` режут такие области; страницы области, побывавшей
+  записываемой, не вытесняются (`ImageBacking::pinned`): после RELRO они
+  выглядят чистыми, но прочитанные заново из файла вернулись бы без правок
+  `ld.so`.
+- **Корень Debian** (`crate::linux_path`) **перекрывает** системный, как
+  эмуляционный путь Linuxulator: абсолютный путь программы Linux сначала
+  ищется в `/opt/debian`, потом как есть. Свой текущий каталог у программы
+  Linux (`getcwd`, `chdir`, относительные пути).
+- **Вызовы**: `pread64`, `getdents64`, `access`/`faccessat`/`faccessat2`,
+  `readlink` (`/proc/self/exe`), `fcntl`, `dup`/`dup2`/`dup3`, `wait4`
+  (`ECHILD`), `kill` с сигналом 0, `umask`, `gettimeofday`, `time`,
+  `getrusage`, `sysinfo`, `times`, группы процессов и сеансы, `fadvise64`;
+  `statx`, `statfs` — `ENOSYS` (glibc и libselinux обходятся). `open`,
+  `stat`, `fstat` — напрямую через файловую систему ядра, с путями Linux.
+- **Пакет `debian-12.fpk`** (`cargo xtask thirdparty --only debian`,
+  `xtask::debian`): libc6, bash, coreutils, base-files и семь библиотек
+  Debian 12 с архива-снимка `snapshot.debian.org` (зеркало держит только
+  последнюю правку выпуска — закреплённый хеш сломался бы с первым же
+  исправлением glibc); хеш каждого пакета из `Packages`. `.deb` разбирается
+  своим кодом (`ar`, `xz` через `lzma-rs`, tar с pax и длинными именами GNU);
+  символьные ссылки становятся копиями — ссылок в файловых системах FossAi
+  нет. 190 файлов, 17 МиБ; на установочном носителе, как игры.
+
+### Ловушки
+
+1. **`TCGETS` — 36 байт, а не 60.** `struct termios` ядра Linux короче, чем
+   у glibc; лишние байты затёрли её буфер на стеке, и `echo` упал с «stack
+   smashing detected».
+2. **Номер узла в `fstat` — по файлу, не по дескриптору.** `ld.so` узнаёт
+   загруженную библиотеку по (dev, ino); `libc.so.6`, открытая под тем же
+   номером 3, что до неё `libselinux.so.1`, сошла за неё — «version
+   GLIBC_2.28 not found» у `ls`.
+
+### Проверено
+
+Новый сценарий **`linux-debian`** (установленная система): `pkg install
+debian-12.fpk`, затем Debian `echo hello from Debian`, `cat /etc/os-release`
+(«Debian GNU/Linux 12 (bookworm)»), `uname -a` («Linux fossai 6.1.0-fossai
+#1 FossAi x86_64 GNU/Linux»), `ls /` (`bin etc lib lib64 usr` — корень
+Debian), `bash --version` («GNU bash, version 5.2.15(1)-release»), все с
+кодом 0. `linux`, `cmem`, `mmap`, `filemap`, `userspace`, `installed`, `llama`
+— зелёные.
+
+### Дальше — 71c
+
+Потоки (`clone` с `CLONE_VM|CLONE_THREAD`, `futex` целиком, `set_tid_address`
+с очисткой), сигналы (доставка, `rt_sigreturn`, `sigaltstack`), `/proc/self`,
+`/dev/null|zero|urandom`, дескриптор каталога в `*at`, `poll` — то, без чего
+не живут `bash` в диалоге и многопоточные программы.
 
 # Полный прогон 17.10 — 407 из 428, один дефект установщика
 

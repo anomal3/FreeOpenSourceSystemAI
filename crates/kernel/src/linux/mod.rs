@@ -22,17 +22,22 @@
 //! Родные программы сюда не попадают: `syscall` у программы, не помеченной
 //! как программа Linux, — `-ENOSYS`.
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::mem::size_of;
 
 use user_abi::{
-    CLOCK_MONOTONIC, CLOCK_REALTIME, MAP_LAZY, SYS_CLOCK, SYS_CLOSE, SYS_EXIT, SYS_FSTAT, SYS_FUTEX_WAIT,
-    SYS_FUTEX_WAKE, SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_ISATTY, SYS_MMAP, SYS_MPROTECT, SYS_MUNMAP,
-    SYS_NANOSLEEP, SYS_OPEN, SYS_RANDOM, SYS_READ, SYS_SEEK, SYS_SET_TLS, SYS_STAT, SYS_WRITE, SYS_YIELD,
+    CLOCK_MONOTONIC, CLOCK_REALTIME, SYS_CLOCK, SYS_CLOSE, SYS_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_GETGID,
+    SYS_GETPID, SYS_GETUID, SYS_ISATTY, SYS_MPROTECT, SYS_MUNMAP, SYS_NANOSLEEP, SYS_RANDOM, SYS_READ, SYS_SEEK,
+    SYS_SET_TLS, SYS_WRITE, SYS_YIELD,
 };
 
 use crate::kprintln;
 use crate::mm::PageFlags;
+use crate::user::files::FdKind;
 use crate::user::space;
+use crate::vfs::NodeKind;
+use crate::vfs::perm::Access;
 
 /// Номера вызовов Linux x86-64 (`arch/x86/entry/syscalls/syscall_64.tbl`).
 mod nr {
@@ -77,12 +82,47 @@ mod nr {
     pub const PRLIMIT64: usize = 302;
     pub const GETRANDOM: usize = 318;
     pub const RSEQ: usize = 334;
+    pub const PREAD64: usize = 17;
+    pub const ACCESS: usize = 21;
+    pub const DUP: usize = 32;
+    pub const DUP2: usize = 33;
+    pub const WAIT4: usize = 61;
+    pub const KILL: usize = 62;
+    pub const FCNTL: usize = 72;
+    pub const GETCWD: usize = 79;
+    pub const CHDIR: usize = 80;
+    pub const READLINK: usize = 89;
+    pub const UMASK: usize = 95;
+    pub const GETTIMEOFDAY: usize = 96;
+    pub const GETRUSAGE: usize = 98;
+    pub const SYSINFO: usize = 99;
+    pub const TIMES: usize = 100;
+    pub const SETPGID: usize = 109;
+    pub const GETPGRP: usize = 111;
+    pub const SETSID: usize = 112;
+    pub const GETGROUPS: usize = 115;
+    pub const GETPGID: usize = 121;
+    pub const GETSID: usize = 124;
+    pub const TIME: usize = 201;
+    pub const GETDENTS64: usize = 217;
+    pub const FADVISE64: usize = 221;
+    pub const TGKILL: usize = 234;
+    pub const READLINKAT: usize = 267;
+    pub const FACCESSAT: usize = 269;
+    pub const DUP3: usize = 292;
+    pub const STATX: usize = 332;
+    pub const STATFS: usize = 137;
+    pub const FSTATFS: usize = 138;
+    pub const FACCESSAT2: usize = 439;
 }
 
 /// `errno` Linux, которые здесь отдаются.
 mod e {
     pub const EPERM: i64 = 1;
     pub const ENOENT: i64 = 2;
+    pub const ECHILD: i64 = 10;
+    pub const EISDIR: i64 = 21;
+    pub const ERANGE: i64 = 34;
     pub const ESRCH: i64 = 3;
     pub const EIO: i64 = 5;
     pub const EBADF: i64 = 9;
@@ -172,6 +212,46 @@ pub unsafe fn syscall(number: usize, args: [usize; 6]) -> i64 {
             nr::OPEN => open_at(AT_FDCWD, a0, a1),
             nr::OPENAT => open_at(a0, a1, a2),
             nr::STAT | nr::LSTAT => stat_path(AT_FDCWD, a0, a1),
+            nr::PREAD64 => pread(a0, a1, a2, a3),
+            nr::ACCESS => access(AT_FDCWD, a0, a1),
+            nr::FACCESSAT | nr::FACCESSAT2 => access(a0, a1, a2),
+            nr::GETDENTS64 => getdents(a0, a1, a2),
+            nr::GETCWD => getcwd(a0, a1),
+            nr::CHDIR => chdir(a0),
+            nr::READLINK => readlink(AT_FDCWD, a0, a1, a2),
+            nr::READLINKAT => readlink(a0, a1, a2, a3),
+            nr::FCNTL => fcntl(a0, a1, a2),
+            nr::DUP => errno(native(user_abi::SYS_DUP, a0, user_abi::DUP_ANY, 0)),
+            nr::DUP2 | nr::DUP3 => {
+                if a0 == a1 {
+                    a1 as i64
+                } else {
+                    errno(native(user_abi::SYS_DUP, a0, a1, 0))
+                }
+            }
+            // Детей у программы Linux пока нет (`fork` — фаза 71d).
+            nr::WAIT4 => -e::ECHILD,
+            // Сигнал «0» — проверка, жив ли процесс; другие сигналы — 71c.
+            nr::KILL | nr::TGKILL => {
+                let signal = if number == nr::KILL { a1 } else { a2 };
+                if signal == 0 { 0 } else { -e::ENOSYS }
+            }
+            nr::UMASK => 0o022,
+            nr::GETTIMEOFDAY => gettimeofday(a0),
+            nr::TIME => time(a0),
+            nr::GETRUSAGE => zero_out(a1, 144),
+            nr::SYSINFO => sysinfo(a0),
+            nr::TIMES => times(a0),
+            // Группы процессов и сеансы: процесс один и сам себе группа.
+            nr::SETPGID => 0,
+            nr::GETPGRP | nr::SETSID | nr::GETPGID | nr::GETSID => errno(native(SYS_GETPID, 0, 0, 0)),
+            nr::GETGROUPS => 0,
+            // `statx` glibc пробует первым и, получив `ENOSYS`, берёт
+            // `newfstatat` — его здесь и хватает.
+            nr::STATX => -e::ENOSYS,
+            // Сведений о томе ядро не отдаёт (как и `statvfs` родной libc);
+            // libselinux так ищет `selinuxfs` и, не найдя, работает без него.
+            nr::STATFS | nr::FSTATFS => -e::ENOSYS,
             nr::NEWFSTATAT => {
                 // `AT_EMPTY_PATH` с пустым путём — это `fstat` дескриптора.
                 if a3 & AT_EMPTY_PATH != 0 && c_string_len(a1) == Some(0) {
@@ -193,8 +273,9 @@ pub unsafe fn syscall(number: usize, args: [usize; 6]) -> i64 {
             nr::RT_SIGACTION | nr::RT_SIGPROCMASK | nr::SIGALTSTACK => 0,
             nr::IOCTL => ioctl(a0, a1, a2),
             nr::SCHED_YIELD => errno(native(SYS_YIELD, 0, 0, 0)),
-            // Совет о памяти — совет: не принять его можно всегда.
-            nr::MADVISE => 0,
+            // Совет о памяти или о чтении файла — совет: не принять его можно
+            // всегда.
+            nr::MADVISE | nr::FADVISE64 => 0,
             nr::NANOSLEEP => nanosleep(a0),
             nr::GETPID | nr::GETTID => errno(native(SYS_GETPID, 0, 0, 0)),
             nr::GETPPID => 1,
@@ -230,11 +311,13 @@ fn unknown(number: usize) -> i64 {
 const AT_FDCWD: usize = -100isize as usize;
 const AT_EMPTY_PATH: usize = 0x1000;
 
-/// Длина строки C в памяти программы — не больше [`MAX_PATH`]; `None` — адрес
+/// Самый длинный путь, который здесь принимается (`PATH_MAX` Linux — 4096).
+const PATH_MAX: usize = 4095;
+
+/// Длина строки C в памяти программы — не больше [`PATH_MAX`]; `None` — адрес
 /// не читается или строка длиннее.
 fn c_string_len(ptr: usize) -> Option<usize> {
-    const MAX_PATH: usize = 255;
-    for len in 0..=MAX_PATH {
+    for len in 0..=PATH_MAX {
         if !space::user_can(ptr + len, 1, PageFlags::READ) {
             return None;
         }
@@ -247,36 +330,94 @@ fn c_string_len(ptr: usize) -> Option<usize> {
     None
 }
 
-/// Путь от каталога `dir`: пока только абсолютный и от текущего (`AT_FDCWD`) —
-/// текущий каталог у программы Linux один, корень. `None` — непонятный путь.
-fn path_of(dir: usize, ptr: usize) -> Result<usize, i64> {
+/// Путь из памяти программы — строкой ядра.
+fn user_string(ptr: usize) -> Result<String, i64> {
     let len = c_string_len(ptr).ok_or(-e::EFAULT)?;
-    if len == 0 {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| -e::ENOMEM)?;
+    for at in 0..len {
+        // SAFETY: строка проверена на чтение в `c_string_len`.
+        bytes.push(unsafe { core::ptr::read_volatile((ptr + at) as *const u8) });
+    }
+    String::from_utf8(bytes).map_err(|_| -e::ENOENT)
+}
+
+/// Свернуть `.` и `..` в абсолютном пути. Ссылок в системе нет, и путь по
+/// тексту — это путь по диску.
+fn normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = String::with_capacity(path.len() + 1);
+    for part in &parts {
+        out.push('/');
+        out.push_str(part);
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// Путь `ptr` от каталога `dir` — так, как его видит программа Linux:
+/// абсолютный, свёрнутый. Относительный — от её текущего каталога; от
+/// дескриптора каталога — пока отказ (`ENOTDIR`): программы, которым это
+/// нужно, придут со своими сценариями.
+fn linux_path(dir: usize, ptr: usize) -> Result<String, i64> {
+    let path = user_string(ptr)?;
+    if path.is_empty() {
         return Err(-e::ENOENT);
     }
-    // SAFETY: байт проверен в `c_string_len`.
-    let first = unsafe { core::ptr::read_volatile(ptr as *const u8) };
-    if first != b'/' && dir != AT_FDCWD {
-        // Путь от дескриптора каталога — фаза 71b.
+    if path.starts_with('/') {
+        return Ok(normalize(&path));
+    }
+    if dir != AT_FDCWD {
         return Err(-e::ENOTDIR);
     }
-    if first != b'/' {
-        // Без текущего каталога относительный путь — от корня; родной `open`
-        // примет его только абсолютным.
-        return Err(-e::ENOENT);
-    }
-    Ok(len)
+    let cwd = crate::user::with_current(|program| program.linux_cwd.clone()).unwrap_or_else(|| String::from("/"));
+    let mut joined = cwd;
+    joined.push('/');
+    joined.push_str(&path);
+    Ok(normalize(&joined))
+}
+
+/// Тот же путь — в системе: корень Debian перекрывает системный
+/// ([`crate::linux_path`]).
+fn system_path(dir: usize, ptr: usize) -> Result<String, i64> {
+    let path = linux_path(dir, ptr)?;
+    Ok(crate::linux_path::resolve(&path, crate::user::credentials()))
+}
+
+fn file_errno(err: crate::user::files::FileError) -> i64 {
+    errno(crate::user::syscall::errno(err))
+}
+
+fn vfs_errno(err: crate::vfs::VfsError) -> i64 {
+    errno(crate::user::syscall::vfs_errno(err))
 }
 
 /// `openat(dir, path, flags)`.
-unsafe fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
+fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     const O_ACCMODE: usize = 3;
     const O_CREAT: usize = 0o100;
+    const O_EXCL: usize = 0o200;
     const O_TRUNC: usize = 0o1000;
-    let len = match path_of(dir, ptr) {
-        Ok(len) => len,
+    const O_DIRECTORY: usize = 0o200_000;
+    let path = match system_path(dir, ptr) {
+        Ok(path) => path,
         Err(err) => return err,
     };
+    let cred = crate::user::credentials();
+    if flags & O_CREAT != 0 && flags & O_EXCL != 0 && matches!(crate::fs::resolve_as(cred, &path, Access::NONE), Some(Ok(_))) {
+        return -e::EEXIST;
+    }
     let mut native_flags = 0;
     if flags & O_ACCMODE != 0 {
         native_flags |= user_abi::O_WRITE;
@@ -287,8 +428,19 @@ unsafe fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     if flags & O_TRUNC != 0 {
         native_flags |= user_abi::O_TRUNC;
     }
-    // SAFETY: из ловушки третьего кольца — контракт `syscall`.
-    errno(unsafe { native(SYS_OPEN, ptr, len, native_flags) })
+    let fd = match crate::user::with_current(|program| program.files.open(cred, &path, native_flags)) {
+        Some(Ok(fd)) => fd,
+        Some(Err(err)) => return file_errno(err),
+        None => return -e::ESRCH,
+    };
+    if flags & O_DIRECTORY != 0 {
+        let kind = crate::user::with_current(|program| program.files.describe(fd).map(|info| info.kind));
+        if !matches!(kind, Some(Ok(FdKind::Directory))) {
+            crate::user::with_current(|program| program.files.close(fd));
+            return -e::ENOTDIR;
+        }
+    }
+    fd as i64
 }
 
 /// `struct stat` Linux x86-64 — 144 байта.
@@ -312,59 +464,349 @@ struct LinuxStat {
     _reserved: [i64; 3],
 }
 
-/// Родной ответ `stat`/`fstat` (`user_abi::Stat`) — он короче линуксового и
-/// пишется в тот же буфер программы, после чего перекладывается.
-fn relay_stat(out: usize, code: i64) -> i64 {
-    if code < 0 {
-        return errno(code);
+/// Биты вида файла в `st_mode`.
+const S_IFDIR: u32 = 0o040_000;
+const S_IFREG: u32 = 0o100_000;
+const S_IFIFO: u32 = 0o010_000;
+const S_IFCHR: u32 = 0o020_000;
+const S_IFSOCK: u32 = 0o140_000;
+
+/// Записать `struct stat` в память программы.
+fn put_stat(out: usize, kind: u32, mode: u16, uid: u32, gid: u32, size: u64, mtime: u32, ino: u64) -> i64 {
+    if out % 8 != 0 || !space::user_can(out, size_of::<LinuxStat>(), PageFlags::WRITE) {
+        return -e::EFAULT;
     }
-    // SAFETY: родной обработчик только что записал сюда `Stat`, проверив
-    // адрес на выравнивание и запись; буфер Linux длиннее.
-    let native = unsafe { core::ptr::read(out as *const user_abi::Stat) };
-    let kind = match native.kind {
-        user_abi::KIND_DIRECTORY => 0o040_000,
-        user_abi::KIND_PIPE => 0o010_000,
-        user_abi::KIND_TERMINAL => 0o020_000,
-        user_abi::KIND_SOCKET => 0o140_000,
-        _ => 0o100_000,
-    };
+    let time = [i64::from(mtime), 0];
     let value = LinuxStat {
-        // Номер узла — не ноль: glibc и утилиты сравнивают пары (dev, ino), и
-        // нули у всех сделали бы все файлы одним. Настоящих номеров ядро не
-        // отдаёт; размер в нём — лучше, чем ничего, пока их нет (фаза 71b).
-        ino: native.size.max(1),
-        nlink: 1,
-        mode: kind | (native.mode & 0o7777),
-        uid: native.uid,
-        gid: native.gid,
-        size: native.size as i64,
+        // Номер узла — не ноль: утилиты сравнивают пары (dev, ino), и нули у
+        // всех сделали бы все файлы одним. Настоящих номеров ядро не отдаёт;
+        // вместо них — свёртка пути (`ino_of`).
+        dev: 1,
+        ino: ino.max(1),
+        nlink: if kind == S_IFDIR { 2 } else { 1 },
+        mode: kind | (u32::from(mode) & 0o7777),
+        uid,
+        gid,
+        size: size as i64,
         blksize: 4096,
-        blocks: native.size.div_ceil(512) as i64,
+        blocks: size.div_ceil(512) as i64,
+        atime: time,
+        mtime: time,
+        ctime: time,
         ..LinuxStat::default()
     };
-    // SAFETY: буфер проверен вызывающим на запись `LinuxStat` целиком.
-    unsafe { core::ptr::write_unaligned(out as *mut LinuxStat, value) };
+    // SAFETY: буфер проверен на запись `LinuxStat` целиком.
+    unsafe { core::ptr::write(out as *mut LinuxStat, value) };
     0
 }
 
-unsafe fn fstat(fd: usize, out: usize) -> i64 {
-    if out % 8 != 0 || !space::user_can(out, size_of::<LinuxStat>(), PageFlags::WRITE) {
-        return -e::EFAULT;
+/// «Номер узла» по пути: FNV-1a. Одинаков у одного файла при каждом вызове,
+/// разный у разных — большего утилитам от него не нужно.
+fn ino_of(path: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
-    // SAFETY: контракт `syscall`.
-    relay_stat(out, unsafe { native(SYS_FSTAT, fd, out, 0) })
+    hash
 }
 
-unsafe fn stat_path(dir: usize, ptr: usize, out: usize) -> i64 {
-    if out % 8 != 0 || !space::user_can(out, size_of::<LinuxStat>(), PageFlags::WRITE) {
-        return -e::EFAULT;
-    }
-    let len = match path_of(dir, ptr) {
-        Ok(len) => len,
+fn stat_path(dir: usize, ptr: usize, out: usize) -> i64 {
+    let path = match system_path(dir, ptr) {
+        Ok(path) => path,
         Err(err) => return err,
     };
-    // SAFETY: контракт `syscall`.
-    relay_stat(out, unsafe { native(SYS_STAT, ptr, len, out) })
+    let node = match crate::fs::resolve_as(crate::user::credentials(), &path, Access::NONE) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return vfs_errno(err),
+        None => return -e::ENOENT,
+    };
+    let meta = node.metadata();
+    let kind = match meta.kind {
+        NodeKind::Directory => S_IFDIR,
+        NodeKind::File => S_IFREG,
+    };
+    put_stat(out, kind, meta.mode, meta.uid, meta.gid, meta.size, meta.mtime, ino_of(&path))
+}
+
+fn fstat(fd: usize, out: usize) -> i64 {
+    match crate::user::with_current(|program| program.files.describe(fd)) {
+        Some(Ok(info)) => {
+            let kind = match info.kind {
+                FdKind::File => S_IFREG,
+                FdKind::Directory => S_IFDIR,
+                FdKind::Pipe => S_IFIFO,
+                FdKind::Socket => S_IFSOCK,
+            };
+            // Номер узла — по самому открытому файлу, а не по номеру
+            // дескриптора: `ld.so` узнаёт уже загруженную библиотеку по паре
+            // (dev, ino), и `libc.so.6`, открытая под тем же номером 3, что до
+            // неё `libselinux.so.1`, сошла бы за неё (первый прогон `ls`, 71b).
+            let ino = match crate::user::with_current(|program| program.files.node(fd)) {
+                Some(Ok(node)) => alloc::sync::Arc::as_ptr(&node) as *const () as usize as u64,
+                _ => 0x1000 + fd as u64,
+            };
+            put_stat(out, kind, info.mode, info.uid, info.gid, info.size, 0, ino)
+        }
+        // Стандартные потоки в таблице не лежат: за ними терминал.
+        Some(Err(_)) if fd <= 2 => put_stat(out, S_IFCHR, 0o620, 0, 0, 0, 0, 0x100 + fd as u64),
+        Some(Err(err)) => file_errno(err),
+        None => -e::ESRCH,
+    }
+}
+
+/// `pread64(fd, buf, count, offset)` — чтение с места, не двигая позицию.
+fn pread(fd: usize, buf: usize, count: usize, offset: usize) -> i64 {
+    const CHUNK: usize = 64 * 1024;
+    if !space::user_can(buf, count, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    let node = match crate::user::with_current(|program| program.files.node(fd)) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return file_errno(err),
+        None => return -e::ESRCH,
+    };
+    if node.metadata().kind == NodeKind::Directory {
+        return -e::EISDIR;
+    }
+    let mut chunk = Vec::new();
+    if chunk.try_reserve_exact(CHUNK.min(count)).is_err() {
+        return -e::ENOMEM;
+    }
+    chunk.resize(CHUNK.min(count), 0);
+    let mut done = 0;
+    while done < count {
+        let want = (count - done).min(CHUNK);
+        let got = match node.read_at((offset + done) as u64, &mut chunk[..want]) {
+            Ok(got) => got,
+            Err(err) if done == 0 => return vfs_errno(err),
+            Err(_) => break,
+        };
+        // SAFETY: весь буфер программы проверен на запись выше.
+        unsafe { core::ptr::copy_nonoverlapping(chunk.as_ptr(), (buf + done) as *mut u8, got) };
+        done += got;
+        if got < want {
+            break;
+        }
+    }
+    done as i64
+}
+
+/// `access(path, mode)`: `F_OK` — есть ли путь; `R_OK`, `W_OK`, `X_OK` —
+/// по праву каждое.
+fn access(dir: usize, ptr: usize, mode: usize) -> i64 {
+    let path = match system_path(dir, ptr) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let cred = crate::user::credentials();
+    let mut wants = [Access::NONE; 4];
+    let mut count = 1;
+    for (bit, want) in [(4, Access::READ), (2, Access::WRITE), (1, Access::SEARCH)] {
+        if mode & bit != 0 {
+            wants[count] = want;
+            count += 1;
+        }
+    }
+    for want in &wants[..count] {
+        match crate::fs::resolve_as(cred, &path, *want) {
+            Some(Ok(_)) => {}
+            Some(Err(err)) => return vfs_errno(err),
+            None => return -e::ENOENT,
+        }
+    }
+    0
+}
+
+/// `getdents64(fd, buf, count)`: записи `linux_dirent64` по одной из
+/// перечисления каталога, пока помещается ещё одна самая длинная.
+fn getdents(fd: usize, buf: usize, count: usize) -> i64 {
+    /// Самая длинная запись: 19 байт заголовка, имя до 255 и ноль, по 8.
+    const LONGEST: usize = 280;
+    if !space::user_can(buf, count, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    if count < LONGEST {
+        return -e::EINVAL;
+    }
+    let mut written = 0;
+    while count - written >= LONGEST {
+        let entry = match crate::user::with_current(|program| program.files.next_entry(fd)) {
+            Some(Ok(Some(entry))) => entry,
+            Some(Ok(None)) => break,
+            Some(Err(err)) if written == 0 => return file_errno(err),
+            _ => break,
+        };
+        let name = entry.name.as_bytes();
+        let name = &name[..name.len().min(255)];
+        let reclen = (19 + name.len() + 1).next_multiple_of(8);
+        let kind: u8 = match entry.kind {
+            NodeKind::Directory => 4,
+            NodeKind::File => 8,
+        };
+        let at = buf + written;
+        // SAFETY: место под запись проверено (`LONGEST` в остатке буфера).
+        unsafe {
+            core::ptr::write_bytes(at as *mut u8, 0, reclen);
+            core::ptr::write_unaligned(at as *mut u64, ino_of(&entry.name));
+            core::ptr::write_unaligned((at + 8) as *mut i64, (written + reclen) as i64);
+            core::ptr::write_unaligned((at + 16) as *mut u16, reclen as u16);
+            core::ptr::write((at + 18) as *mut u8, kind);
+            core::ptr::copy_nonoverlapping(name.as_ptr(), (at + 19) as *mut u8, name.len());
+        }
+        written += reclen;
+    }
+    written as i64
+}
+
+/// `getcwd(buf, size)`: ответ — длина с завершающим нулём.
+fn getcwd(buf: usize, size: usize) -> i64 {
+    let cwd = crate::user::with_current(|program| program.linux_cwd.clone()).unwrap_or_else(|| String::from("/"));
+    if size < cwd.len() + 1 {
+        return -e::ERANGE;
+    }
+    if !space::user_can(buf, cwd.len() + 1, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    // SAFETY: проверено строкой выше.
+    unsafe {
+        core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf as *mut u8, cwd.len());
+        core::ptr::write((buf + cwd.len()) as *mut u8, 0);
+    }
+    (cwd.len() + 1) as i64
+}
+
+fn chdir(ptr: usize) -> i64 {
+    let path = match linux_path(AT_FDCWD, ptr) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let full = crate::linux_path::resolve(&path, crate::user::credentials());
+    match crate::fs::resolve_as(crate::user::credentials(), &full, Access::SEARCH) {
+        Some(Ok(node)) if node.metadata().kind == NodeKind::Directory => {
+            crate::user::with_current(|program| program.linux_cwd = path);
+            0
+        }
+        Some(Ok(_)) => -e::ENOTDIR,
+        Some(Err(err)) => vfs_errno(err),
+        None => -e::ENOENT,
+    }
+}
+
+/// `readlink`: ссылок в системе нет, кроме `/proc/self/exe` — путь программы.
+fn readlink(dir: usize, ptr: usize, buf: usize, size: usize) -> i64 {
+    let path = match linux_path(dir, ptr) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if path == "/proc/self/exe" {
+        let exe = crate::user::with_current(|program| String::from(crate::linux_path::shown(&program.path)))
+            .unwrap_or_default();
+        let len = exe.len().min(size);
+        if !space::user_can(buf, len, PageFlags::WRITE) {
+            return -e::EFAULT;
+        }
+        // SAFETY: проверено строкой выше.
+        unsafe { core::ptr::copy_nonoverlapping(exe.as_ptr(), buf as *mut u8, len) };
+        return len as i64;
+    }
+    let full = crate::linux_path::resolve(&path, crate::user::credentials());
+    match crate::fs::resolve_as(crate::user::credentials(), &full, Access::NONE) {
+        // Есть, но не ссылка — так и отвечает Linux.
+        Some(Ok(_)) => -e::EINVAL,
+        Some(Err(err)) => vfs_errno(err),
+        None => -e::ENOENT,
+    }
+}
+
+/// `fcntl`: копия дескриптора и флаги, которых у дескриптора нет.
+unsafe fn fcntl(fd: usize, cmd: usize, _arg: usize) -> i64 {
+    const F_DUPFD: usize = 0;
+    const F_GETFD: usize = 1;
+    const F_SETFD: usize = 2;
+    const F_GETFL: usize = 3;
+    const F_SETFL: usize = 4;
+    const F_DUPFD_CLOEXEC: usize = 1030;
+    match cmd {
+        // SAFETY: контракт `syscall`.
+        F_DUPFD | F_DUPFD_CLOEXEC => errno(unsafe { native(user_abi::SYS_DUP, fd, user_abi::DUP_ANY, 0) }),
+        // `exec` у программ Linux ещё нет — закрывать при нём нечего.
+        F_GETFD | F_SETFD => {
+            if fd > 2 && !matches!(crate::user::with_current(|program| program.files.describe(fd)), Some(Ok(_))) {
+                return -e::EBADF;
+            }
+            0
+        }
+        // Чтение и запись — `O_RDWR`.
+        F_GETFL => 2,
+        F_SETFL => 0,
+        _ => -e::EINVAL,
+    }
+}
+
+fn zero_out(ptr: usize, len: usize) -> i64 {
+    if !space::user_can(ptr, len, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    // SAFETY: проверено строкой выше.
+    unsafe { core::ptr::write_bytes(ptr as *mut u8, 0, len) };
+    0
+}
+
+fn gettimeofday(out: usize) -> i64 {
+    if out == 0 {
+        return 0;
+    }
+    if !space::user_can(out, 16, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    let seconds = crate::time::now_unix().unwrap_or(0);
+    let micros = (crate::time::uptime_ns() % 1_000_000_000) / 1000;
+    // SAFETY: проверено строкой выше.
+    unsafe { core::ptr::write_unaligned(out as *mut [u64; 2], [seconds, micros]) };
+    0
+}
+
+fn time(out: usize) -> i64 {
+    let seconds = crate::time::now_unix().unwrap_or(0);
+    if out != 0 {
+        if !space::user_can(out, 8, PageFlags::WRITE) {
+            return -e::EFAULT;
+        }
+        // SAFETY: проверено строкой выше.
+        unsafe { core::ptr::write_unaligned(out as *mut u64, seconds) };
+    }
+    seconds as i64
+}
+
+/// `sysinfo`: время работы и память машины.
+fn sysinfo(out: usize) -> i64 {
+    const SIZE: usize = 112;
+    if zero_out(out, SIZE) != 0 {
+        return -e::EFAULT;
+    }
+    let frames = crate::mm::frame::stats();
+    let uptime = crate::time::uptime_ms() / 1000;
+    // SAFETY: буфер проверен и обнулён `zero_out`; смещения — по `struct
+    // sysinfo` x86-64: uptime 0, totalram 32, freeram 40, procs 80,
+    // mem_unit 104.
+    unsafe {
+        core::ptr::write_unaligned(out as *mut u64, uptime);
+        core::ptr::write_unaligned((out + 32) as *mut u64, (frames.total * crate::mm::PAGE_SIZE) as u64);
+        core::ptr::write_unaligned((out + 40) as *mut u64, (frames.free * crate::mm::PAGE_SIZE) as u64);
+        core::ptr::write_unaligned((out + 80) as *mut u16, 1);
+        core::ptr::write_unaligned((out + 104) as *mut u32, 1);
+    }
+    0
+}
+
+/// `times`: процессорного времени по процессу ядро не считает — нули; ответ —
+/// время работы в тиках по 10 мс (`AT_CLKTCK` = 100).
+fn times(out: usize) -> i64 {
+    if out != 0 && zero_out(out, 32) != 0 {
+        return -e::EFAULT;
+    }
+    (crate::time::uptime_ms() / 10) as i64
 }
 
 /// `writev` — по куску родным `write`.
@@ -395,37 +837,33 @@ unsafe fn writev(fd: usize, iov: usize, count: usize) -> i64 {
     total
 }
 
-/// `mmap`: безымянная память и файл только на чтение — то, что умеет ядро.
-/// Адрес — подсказка, и ею пренебрегают; `MAP_FIXED` — фаза 71b.
-unsafe fn mmap(_addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> i64 {
+/// `mmap`: безымянная память или кусок файла с любыми правами, кроме записи
+/// и исполнения сразу; `MAP_FIXED` — ровно по адресу (фаза 71b). Общая
+/// запись в файл (`MAP_SHARED` с `PROT_WRITE`) — отказ: в файл отображение не
+/// пишет.
+fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> i64 {
+    const MAP_SHARED: usize = 0x01;
     const MAP_FIXED: usize = 0x10;
     const MAP_ANONYMOUS: usize = 0x20;
-    if flags & MAP_FIXED != 0 {
-        return -e::EINVAL;
-    }
-    if flags & MAP_ANONYMOUS != 0 {
-        // SAFETY: контракт `syscall`.
-        let base = unsafe { native(SYS_MMAP, len, MAP_LAZY, 0) };
-        if base < 0 {
-            return errno(base);
+    const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
+    let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+    let file = if flags & MAP_ANONYMOUS != 0 {
+        None
+    } else {
+        if flags & MAP_SHARED != 0 && prot & user_abi::PROT_WRITE != 0 {
+            return -e::EACCES;
         }
-        if prot != user_abi::PROT_READ | user_abi::PROT_WRITE {
-            // SAFETY: контракт `syscall`.
-            let done = unsafe { native(SYS_MPROTECT, base as usize, len, prot) };
-            if done < 0 {
-                // SAFETY: контракт `syscall`.
-                unsafe { native(SYS_MUNMAP, base as usize, len, 0) };
-                return errno(done);
-            }
+        match crate::user::with_current(|program| program.files.node(fd)) {
+            Some(Ok(node)) => Some((node, offset as u64)),
+            Some(Err(err)) => return file_errno(err),
+            None => return -e::ESRCH,
         }
-        return base;
+    };
+    match crate::user::with_current(|program| program.linux_mmap(addr, len, prot, fixed, file)) {
+        Some(Ok(base)) => base as i64,
+        Some(Err(err)) => errno(crate::user::syscall::mmap_errno(err)),
+        None => -e::ESRCH,
     }
-    if prot & user_abi::PROT_WRITE != 0 {
-        // Запись в отображение файла — фаза 71b (копия при записи).
-        return -e::EACCES;
-    }
-    // SAFETY: контракт `syscall`.
-    errno(unsafe { native(user_abi::SYS_MMAP_FILE, fd, offset, len) })
 }
 
 /// `ioctl`: терминалу — `TCGETS` и размер окна, остальным — «не терминал».
@@ -442,13 +880,18 @@ unsafe fn ioctl(fd: usize, request: usize, arg: usize) -> i64 {
     }
     match request {
         TCGETS => {
-            // `struct termios` — 60 байт. Нули — «сырой» режим без флагов;
-            // программе этого хватает, чтобы узнать, что перед ней терминал.
-            if !space::user_can(arg, 60, PageFlags::WRITE) {
+            // `struct termios` **ядра** Linux — 36 байт: четыре слова флагов,
+            // `c_line` и 19 управляющих символов. У glibc своя, на 60, и
+            // перекладывает она в неё сама: записать 60 значило бы затереть её
+            // буфер на стеке вместе с канарейкой (так и было в первом прогоне
+            // 71b — «stack smashing detected» у `echo`). Нули — «сырой» режим
+            // без флагов; узнать, что перед ней терминал, программе хватает.
+            const KERNEL_TERMIOS: usize = 36;
+            if !space::user_can(arg, KERNEL_TERMIOS, PageFlags::WRITE) {
                 return -e::EFAULT;
             }
             // SAFETY: проверено строкой выше.
-            unsafe { core::ptr::write_bytes(arg as *mut u8, 0, 60) };
+            unsafe { core::ptr::write_bytes(arg as *mut u8, 0, KERNEL_TERMIOS) };
             0
         }
         TIOCGWINSZ => {

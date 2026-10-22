@@ -180,7 +180,7 @@ pub unsafe fn enable_linux_syscall(cpu: usize) {
     // дописывается, остальные биты (LME, NXE) не трогаются.
     unsafe {
         super::wrmsr(IA32_STAR, star);
-        super::wrmsr(IA32_LSTAR, x86_linux_syscall_entry as usize as u64);
+        super::wrmsr(IA32_LSTAR, x86_linux_syscall_entry as *const () as usize as u64);
         super::wrmsr(IA32_FMASK, SYSCALL_FMASK);
         super::wrmsr(IA32_KERNEL_GS_BASE, gdt::tss_address(cpu));
         super::wrmsr(IA32_EFER, super::rdmsr(IA32_EFER) | EFER_SCE);

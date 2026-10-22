@@ -682,6 +682,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "lzma-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+dependencies = [
+ "byteorder",
+ "crc",
+]
+
+[[package]]
 name = "mini-ui"
 version = "0.8.0"
 dependencies = [
@@ -1347,6 +1357,7 @@ dependencies = [
  "fpk",
  "freeos-cc",
  "freeos-fuzz",
+ "lzma-rs",
  "mini-ui",
  "osupdate",
  "png",
