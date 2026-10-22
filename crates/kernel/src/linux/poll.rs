@@ -105,10 +105,13 @@ pub fn pipe(fds: usize, flags: usize) -> i64 {
         return super::errno(packed);
     }
     let (read_fd, write_fd) = ((packed >> 32) as usize, (packed & 0xFFFF_FFFF) as usize);
+    const O_CLOEXEC: usize = 0o2_000_000;
     let nonblock = flags & O_NONBLOCK != 0;
     crate::user::with_current(|program| {
         let _ = program.files.set_nonblock(read_fd, nonblock);
         let _ = program.files.set_nonblock(write_fd, nonblock);
+        program.files.set_cloexec(read_fd, flags & O_CLOEXEC != 0);
+        program.files.set_cloexec(write_fd, flags & O_CLOEXEC != 0);
     });
     let pair: [i32; 2] = [read_fd as i32, write_fd as i32];
     // SAFETY: проверено выше.

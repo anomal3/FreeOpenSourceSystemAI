@@ -129,13 +129,90 @@ pub fn sigaltstack(new: usize, old: usize) -> i64 {
     0
 }
 
-/// `kill(pid, sig)`: процессов Linux, кроме себя, ядро ещё не знает (71d).
+/// `kill(pid, sig)`. Себе — как `raise`; другому процессу (фаза 71d) — по
+/// его обработчику: есть — сигнал ждёт его главный поток на выходе из
+/// вызова, нет — процесс снимается (или сигнал пропускается, если его
+/// действие по умолчанию — ничего). Группы процессов (`pid` 0 и
+/// отрицательные) — как сам процесс: группа у каждого своя.
 pub fn kill(pid: usize, sig: usize) -> i64 {
-    let own = crate::user::with_current(|program| program.linux_pid).unwrap_or(0) as usize;
-    if pid != 0 && pid != own && pid as isize != -1 {
-        return -e::ESRCH;
+    let own = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
+    let pid = pid as i32;
+    let target = if pid == 0 || pid == -1 { own } else { pid.unsigned_abs() };
+    if target == own {
+        return raise_on(sched::current_slot(), sig);
     }
-    raise_on(sched::current_slot(), sig)
+    if sig > 64 {
+        return -e::EINVAL;
+    }
+    let me = crate::user::credentials();
+    // Ребёнок, только что рождённый `fork`, может ещё не дойти до своей
+    // задачи — в таблице программ его пока нет. Записан — значит будет.
+    let mut found = find_process(target);
+    for _ in 0..1000 {
+        if found.is_some() || !super::process::is_starting(target) {
+            break;
+        }
+        sched::sleep_ms(1);
+        found = find_process(target);
+    }
+    match found {
+        None => -e::ESRCH,
+        Some((_, process)) => {
+            let owner = process.lock().credentials();
+            if !me.is_root() && owner.uid != me.uid {
+                return -e::EPERM;
+            }
+            drop(process);
+            if sig != 0 {
+                send_to_process(target, sig, false);
+            }
+            0
+        }
+    }
+}
+
+/// Главный поток процесса Linux `pid`: слот и процесс.
+fn find_process(pid: u32) -> Option<(usize, alloc::sync::Arc<crate::sync::Mutex<crate::user::Program>>)> {
+    let (slot, state) = sched::lookup(sched::TaskId::new(pid))?;
+    if state == sched::TaskState::Finished {
+        return None;
+    }
+    let process = crate::user::process_at(slot)?;
+    let same = process.lock().linux_pid == pid;
+    same.then_some((slot, process))
+}
+
+/// Послать сигнал процессу `pid` (не себе). `only_handled` — только если у
+/// него есть обработчик (`SIGCHLD` родителю: без обработчика он ничего не
+/// значит и не должен прерывать его `poll`).
+pub fn send_to_process(pid: u32, sig: usize, only_handled: bool) {
+    let Some((slot, process)) = find_process(pid) else {
+        return;
+    };
+    let id = sched::TaskId::new(pid);
+    let handler = process.lock().linux_actions[sig].handler;
+    match handler {
+        SIG_IGN if sig != SIGKILL => {}
+        0 if only_handled => {}
+        // Остановки нет — нечем и останавливать; продолжение — тем более.
+        0 if ignored_by_default(sig) || (SIGSTOP..=22).contains(&sig) => {}
+        0 => {
+            {
+                let mut program = process.lock();
+                program.linux_signal = Some(sig as u8);
+                program.kill_requested = true;
+            }
+            drop(process);
+            crate::kprintln!("  linux       : process #{pid} killed by signal {sig}");
+            sched::wake_input();
+            sched::wake(id);
+        }
+        _ => {
+            drop(process);
+            LINUX_PENDING[slot].fetch_or(bit(sig), Ordering::Relaxed);
+            sched::wake(id);
+        }
+    }
 }
 
 /// `tgkill(tgid, tid, sig)` / `tkill(tid, sig)`.
@@ -203,6 +280,7 @@ pub fn deliver(frame: &mut crate::arch::TrapFrame) {
         0 if ignored_by_default(sig) => {}
         0 => {
             crate::kprintln!("  linux       : killed by signal {sig}");
+            crate::user::with_current(|program| program.linux_signal = Some(sig as u8));
             // SAFETY: из системного вызова третьего кольца.
             unsafe { crate::arch::return_to_kernel(128 + sig as i64) }
         }

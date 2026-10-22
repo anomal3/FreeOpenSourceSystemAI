@@ -238,7 +238,10 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
     // чтения некому.
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
 
-    if fd != FD_STDOUT && fd != FD_STDERR {
+    // Номер, уведённый `dup2` программы Linux, ведёт туда же, куда исходный
+    // поток; занятый файлом ноль, единица или двойка — в таблицу (фаза 71d).
+    let standard = standard(fd);
+    if !matches!(standard, Some(FD_STDOUT | FD_STDERR)) {
         // Сокет ждёт места — вне замка программы (фаза 65a).
         if let Some(Some(socket)) = super::with_current(|program| program.files.socket(fd)) {
             return match socket.write(ptr, len) {
@@ -263,6 +266,7 @@ fn write(fd: usize, ptr: usize, len: usize) -> i64 {
         };
     }
 
+    let fd = standard.unwrap_or(fd);
     // Диагностика уходит в журнал, минуя окно. Это не оформление, а разделение
     // каналов: программа, рисующая весь экран, обязана иметь место, куда сказать
     // слово, не испортив картинку, — а проверить её снаружи можно только по
@@ -578,7 +582,7 @@ fn read(fd: usize, ptr: usize, len: usize) -> i64 {
     // только ядро, а оно сейчас здесь.
     let buffer = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
 
-    if fd == FD_STDIN {
+    if standard(fd) == Some(FD_STDIN) {
         // Ввод перенаправлен в канал — читаем оттуда и **ждём**, как ждал бы
         // терминал. Ноль означает конец: писателей у канала не осталось.
         if let Some(Some(stdin)) = super::with_current(|program| program.stdin.clone()) {
@@ -1469,11 +1473,11 @@ fn fstat(fd: usize, out: usize) -> i64 {
     // Стандартные потоки в таблице не лежат (см. `isatty`): за ними терминал
     // или конец канала, выданный запускающим. Отвечаем и на них (фаза 60) —
     // по `fstat` libc узнаёт, открыт ли дескриптор вообще.
-    let standard = super::with_current(|program| match fd {
-        FD_STDIN => Some(program.stdin.is_some()),
-        FD_STDOUT => Some(program.stdout.is_some()),
-        FD_STDERR => Some(false),
-        _ => None,
+    let standard = super::with_current(|program| match program.files.std_target(fd) {
+        Some(FD_STDIN) => Some(program.stdin.is_some()),
+        Some(FD_STDOUT) => Some(program.stdout.is_some()),
+        Some(_) => Some(false),
+        None => None,
     });
     let info = match super::with_current(|program| program.files.describe(fd)) {
         Some(Ok(info)) => info,
@@ -1520,6 +1524,14 @@ fn fstat(fd: usize, out: usize) -> i64 {
 /// остальное — таблицу, и только ради того, чтобы отличить «не терминал» от
 /// «такого дескриптора нет».
 fn isatty(fd: usize) -> i64 {
+    let Some(fd) = standard(fd).or_else(|| (fd >= 3).then_some(fd)) else {
+        // Номер 0–2 программы Linux, занятый не потоком (фаза 71d).
+        return match super::with_current(|program| program.files.describe(fd)) {
+            Some(Ok(_)) => 0,
+            Some(Err(err)) => errno(err),
+            None => ERR_NO_PROGRAM,
+        };
+    };
     if fd == FD_STDIN {
         return match super::with_current(|program| program.stdin.is_some()) {
             Some(true) => 0,
@@ -2345,7 +2357,8 @@ fn poll(ptr: usize, count: usize, timeout_ms: i64) -> i64 {
 
 /// Что готово у одного дескриптора — в терминах договора.
 pub(crate) fn readiness_of(fd: usize, wanted: u32) -> u32 {
-    if fd == FD_STDIN {
+    let standard = standard(fd);
+    if standard == Some(FD_STDIN) {
         return match super::with_current(|program| program.stdin.clone()) {
             Some(Some(stdin)) => {
                 let mut ready = 0;
@@ -2365,7 +2378,7 @@ pub(crate) fn readiness_of(fd: usize, wanted: u32) -> u32 {
             None => POLL_BAD,
         };
     }
-    if fd == FD_STDOUT || fd == FD_STDERR {
+    if let Some(fd @ (FD_STDOUT | FD_STDERR)) = standard {
         return match super::with_current(|program| program.stdout.clone()) {
             Some(Some(stdout)) if fd == FD_STDOUT => {
                 let mut ready = 0;
@@ -2558,4 +2571,12 @@ fn sound(op: usize, ptr: usize, len: usize) -> i64 {
         },
         _ => ERR_UNSUPPORTED,
     }
+}
+
+/// Стандартный поток за дескриптором `fd`: `Some(0..=2)` — прежний путь
+/// (терминал, канал запускающего, журнал), `None` — место таблицы. Нужен
+/// программам Linux (фаза 71d): у них `dup2` уводит потоки на другие номера и
+/// занимает 0–2 файлами и каналами; у родной это просто номера 0–2.
+fn standard(fd: usize) -> Option<usize> {
+    super::with_current(|program| program.files.std_target(fd)).unwrap_or((fd < 3).then_some(fd))
 }

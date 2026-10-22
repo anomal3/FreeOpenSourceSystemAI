@@ -13,12 +13,17 @@ const CLONE_PARENT_SETTID: usize = 0x100000;
 const CLONE_CHILD_CLEARTID: usize = 0x200000;
 const CLONE_CHILD_SETTID: usize = 0x1000000;
 
+const CLONE_VFORK: usize = 0x4000;
+
 /// `clone(flags, stack, parent_tid, child_tid, tls)` — порядок аргументов
-/// x86-64. Только поток (`CLONE_VM | CLONE_THREAD`); новый процесс (`fork`,
-/// `vfork`) — фаза 71d.
+/// x86-64. Поток — `CLONE_VM | CLONE_THREAD`; без `CLONE_THREAD` — новый
+/// процесс (фаза 71d): `fork`, `vfork`, `posix_spawn`.
 pub fn clone(frame: &crate::arch::TrapFrame, flags: usize, stack: usize, parent_tid: usize, child_tid: usize, tls: usize) -> i64 {
-    if flags & (CLONE_VM | CLONE_THREAD) != CLONE_VM | CLONE_THREAD {
-        return -e::ENOSYS;
+    if flags & CLONE_THREAD == 0 {
+        return clone_process(frame, flags, stack, parent_tid, child_tid, tls);
+    }
+    if flags & CLONE_VM == 0 {
+        return -e::EINVAL;
     }
     let mut regs = *frame;
     regs.rax = 0;
@@ -43,6 +48,36 @@ pub fn clone(frame: &crate::arch::TrapFrame, flags: usize, stack: usize, parent_
         }
     }
     i64::from(tid)
+}
+
+/// Новый процесс — копия текущего (фаза 71d). `CLONE_VM` без `CLONE_THREAD`
+/// (`vfork`, `posix_spawn` glibc) общей памяти не даёт — ребёнок получает
+/// копию, — а `CLONE_VFORK` держит родителя, пока ребёнок не сделает
+/// `execve` или не кончится: этого порядка `posix_spawn` и ждёт. Сигнал
+/// конца (младший байт флагов) — всегда `SIGCHLD`.
+fn clone_process(frame: &crate::arch::TrapFrame, flags: usize, stack: usize, parent_tid: usize, child_tid: usize, tls: usize) -> i64 {
+    let mut regs = *frame;
+    regs.rax = 0;
+    if stack != 0 {
+        regs.rsp = stack as u64;
+    }
+    let tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { crate::arch::user_tls() };
+    let set = if flags & CLONE_CHILD_SETTID != 0 { child_tid } else { 0 };
+    let clear = if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 };
+    let id = match crate::user::spawn_linux_process(regs, tls, set, clear) {
+        Ok(id) => id,
+        Err(crate::user::ThreadError::TooManyTasks) => return -e::EAGAIN,
+        Err(_) => return -e::ENOMEM,
+    };
+    let pid = id.as_u32();
+    if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 && space::user_can(parent_tid, 4, PageFlags::WRITE) {
+        // SAFETY: адрес проверен на запись в пространстве родителя.
+        unsafe { core::ptr::write_volatile(parent_tid as *mut u32, pid) };
+    }
+    if flags & CLONE_VFORK != 0 {
+        super::process::wait_vfork(pid);
+    }
+    i64::from(pid)
 }
 
 /// `clone3(args, size)`: то же, что `clone`, аргументы — структурой.

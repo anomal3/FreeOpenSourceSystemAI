@@ -67,6 +67,10 @@ const DEV_PACKAGES: [(&str, &str); 2] = [
 /// Проверочные программы на glibc: исходник в `libc/linux` и путь в корне.
 const CHECKS: [(&str, &str); 1] = [("check.c", "usr/libexec/fossai/linuxcheck")];
 
+/// Проверочные сценарии оболочки (фаза 71d): исходник в `libc/linux` и путь в
+/// корне. Запускаются через `#!/bin/bash`.
+const SCRIPTS: [(&str, &str); 1] = [("forkcheck.sh", "usr/libexec/fossai/forkcheck")];
+
 /// Что в корень не попадает: справка, документация, переводы — читать их в
 /// системе нечем; модули перекодировок glibc (`gconv`, 250 файлов) нужны
 /// только `iconv`.
@@ -132,6 +136,13 @@ pub fn build(arch: Arch) -> Result<()> {
         let program = build_check(&sysroot, source)?;
         root.insert(String::from(place), Node::File { data: fs::read(&program)?, mode: 0o755 });
     }
+    for (source, place) in SCRIPTS {
+        let data = fs::read(cbuild::libc_dir().join("linux").join(source))?;
+        root.insert(String::from(place), Node::File { data, mode: 0o755 });
+    }
+    // `/bin/sh` у Debian — от `dash`, которого здесь нет; `system()` и
+    // `popen()` glibc зовут именно его (фаза 71d). Ссылка на bash — копией.
+    root.entry(String::from("bin/sh")).or_insert_with(|| Node::Link(String::from("bash")));
 
     pack(&root)
 }

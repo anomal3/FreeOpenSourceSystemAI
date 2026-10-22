@@ -99,6 +99,26 @@ enum Slot {
     /// Сокет (фаза 65a). Читают и пишут его не здесь, а в `sock.rs`, вне
     /// замка программы: сокет ждёт, а таблица под замком ждать не может.
     Socket(Arc<super::sock::Sock>),
+    /// Стандартный поток, с которым программа запущена (фаза 71d): терминал
+    /// или канал запускающего — то, что раньше стояло за номерами 0, 1 и 2
+    /// без всякой таблицы. Местом таблицы он стал у программ Linux: `dup2`
+    /// уводит его на другой номер и возвращает обратно, `close(0)`
+    /// освобождает ноль. Читают и пишут его не здесь — номер потока узнаёт
+    /// [`Table::std_target`], и дальше работает прежний путь.
+    Std(u8),
+}
+
+impl Slot {
+    /// Ещё одна ссылка на то же самое (`dup`, `fork`).
+    fn copy(&self) -> Self {
+        match self {
+            Self::File(open) => Self::File(Arc::clone(open)),
+            Self::PipeRead(reader, mode) => Self::PipeRead(reader.clone(), mode.clone()),
+            Self::PipeWrite(writer, mode) => Self::PipeWrite(writer.clone(), mode.clone()),
+            Self::Socket(socket) => Self::Socket(Arc::clone(socket)),
+            Self::Std(stream) => Self::Std(*stream),
+        }
+    }
 }
 
 /// Режим конца канала: ждёт ли он (фаза 66b).
@@ -189,12 +209,127 @@ pub enum Whence {
 /// `i + FD_FIRST`.
 pub struct Table {
     slots: [Option<Slot>; MAX_OPEN_FILES],
+    /// Номера 0, 1 и 2 программы Linux (фаза 71d). У родной программы они
+    /// пусты и не используются: её стандартные потоки — не места таблицы.
+    std: [Option<Slot>; FD_FIRST],
+    /// Номера 0–2 — места таблицы (программа Linux).
+    linux: bool,
+    /// `FD_CLOEXEC` по номеру дескриптора: закрыть при `execve`.
+    cloexec: u64,
 }
 
 impl Table {
     #[must_use]
     pub const fn new() -> Self {
-        Self { slots: [const { None }; MAX_OPEN_FILES] }
+        Self { slots: [const { None }; MAX_OPEN_FILES], std: [const { None }; FD_FIRST], linux: false, cloexec: 0 }
+    }
+
+    /// Таблица программы Linux: номера 0–2 заняты стандартными потоками и
+    /// дальше ведут себя как всякий дескриптор (фаза 71d).
+    #[must_use]
+    pub const fn new_linux() -> Self {
+        Self {
+            slots: [const { None }; MAX_OPEN_FILES],
+            std: [Some(Slot::Std(0)), Some(Slot::Std(1)), Some(Slot::Std(2))],
+            linux: true,
+            cloexec: 0,
+        }
+    }
+
+    /// Копия таблицы для `fork` (фаза 71d): те же открытые файлы и концы
+    /// каналов — ссылками, с общими позициями, как у `dup`.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        let copy = |slot: &Option<Slot>| slot.as_ref().map(Slot::copy);
+        Self {
+            slots: core::array::from_fn(|index| copy(&self.slots[index])),
+            std: core::array::from_fn(|index| copy(&self.std[index])),
+            linux: self.linux,
+            cloexec: self.cloexec,
+        }
+    }
+
+    /// Место таблицы под номером `fd`.
+    fn cell(&self, fd: usize) -> Result<&Option<Slot>, FileError> {
+        if fd < FD_FIRST && self.linux {
+            return Ok(&self.std[fd]);
+        }
+        Ok(&self.slots[index_of(fd)?])
+    }
+
+    fn cell_mut(&mut self, fd: usize) -> Result<&mut Option<Slot>, FileError> {
+        if fd < FD_FIRST && self.linux {
+            return Ok(&mut self.std[fd]);
+        }
+        Ok(&mut self.slots[index_of(fd)?])
+    }
+
+    /// Положить в свободное место `fd`; `FD_CLOEXEC` у нового — снят.
+    fn put(&mut self, fd: usize, slot: Slot) {
+        if let Ok(cell) = self.cell_mut(fd) {
+            *cell = Some(slot);
+        }
+        self.set_cloexec(fd, false);
+    }
+
+    /// Наименьший свободный номер не меньше `min` (у Linux — считая 0–2).
+    fn free_fd(&self, min: usize) -> Result<usize, FileError> {
+        let first = if self.linux { 0 } else { FD_FIRST };
+        (first.max(min)..FD_FIRST + MAX_OPEN_FILES)
+            .find(|&fd| matches!(self.cell(fd), Ok(None)))
+            .ok_or(FileError::TooManyFiles)
+    }
+
+    /// Стандартный поток за дескриптором: `Some(0..=2)` — читать и писать
+    /// прежним путём (терминал, канал запускающего, журнал), `None` — место
+    /// таблицы. У родной программы это просто номера 0–2.
+    #[must_use]
+    pub fn std_target(&self, fd: usize) -> Option<usize> {
+        if !self.linux {
+            return (fd < FD_FIRST).then_some(fd);
+        }
+        match self.cell(fd) {
+            Ok(Some(Slot::Std(stream))) => Some(usize::from(*stream)),
+            _ => None,
+        }
+    }
+
+    /// Поставить или снять `FD_CLOEXEC`.
+    pub fn set_cloexec(&mut self, fd: usize, on: bool) {
+        if fd < 64 {
+            if on {
+                self.cloexec |= 1 << fd;
+            } else {
+                self.cloexec &= !(1 << fd);
+            }
+        }
+    }
+
+    /// Стоит ли `FD_CLOEXEC`; `Err` — дескриптора нет.
+    pub fn cloexec(&self, fd: usize) -> Result<bool, FileError> {
+        match self.cell(fd)? {
+            Some(_) => Ok(fd < 64 && self.cloexec & (1 << fd) != 0),
+            None => Err(FileError::BadFd),
+        }
+    }
+
+    /// Закрыть всё, что помечено `FD_CLOEXEC` (`execve`). Возвращает,
+    /// сколько закрыто.
+    pub fn close_on_exec(&mut self) -> usize {
+        let mut closed = 0;
+        for fd in 0..FD_FIRST + MAX_OPEN_FILES {
+            if fd < 64 && self.cloexec & (1 << fd) != 0 && self.close(fd).is_ok() {
+                closed += 1;
+            }
+        }
+        self.cloexec = 0;
+        closed
+    }
+
+    /// Занят ли номер.
+    #[must_use]
+    pub fn is_open(&self, fd: usize) -> bool {
+        matches!(self.cell(fd), Ok(Some(_)))
     }
 
     /// Открыть файл от имени `cred`.
@@ -241,26 +376,22 @@ impl Table {
             node.truncate(0).map_err(FileError::Vfs)?;
         }
 
-        let slot = self
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .ok_or(FileError::TooManyFiles)?;
-        self.slots[slot] = Some(Slot::File(Arc::new(Open {
+        let fd = self.free_fd(0)?;
+        self.put(fd, Slot::File(Arc::new(Open {
             node: Arc::from(node),
             offset: AtomicU64::new(0),
             writable,
             entries,
         })));
-        Ok(slot + FD_FIRST)
+        Ok(fd)
     }
 
     /// Положить в таблицу узел, сделанный ядром в памяти (фаза 71c): файлы
     /// `/proc` и устройства `/dev` программ Linux.
     pub fn install_node(&mut self, node: Arc<dyn Node>, writable: bool) -> Result<usize, FileError> {
-        let slot = self.slots.iter().position(Option::is_none).ok_or(FileError::TooManyFiles)?;
-        self.slots[slot] = Some(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None })));
-        Ok(slot + FD_FIRST)
+        let fd = self.free_fd(0)?;
+        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None })));
+        Ok(fd)
     }
 
     /// Создать файл с заданными правами и открыть его на запись.
@@ -282,24 +413,19 @@ impl Table {
             .ok_or(FileError::NoFilesystem)?
             .map_err(FileError::Vfs)?;
 
-        let slot = self
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .ok_or(FileError::TooManyFiles)?;
-        self.slots[slot] = Some(Slot::File(Arc::new(Open {
+        let fd = self.free_fd(0)?;
+        self.put(fd, Slot::File(Arc::new(Open {
             node: Arc::from(node),
             offset: AtomicU64::new(0),
             writable: true,
             entries: None,
         })));
-        Ok(slot + FD_FIRST)
+        Ok(fd)
     }
 
     /// Записать в дескриптор. Возвращает, сколько записано.
     pub fn write(&mut self, fd: usize, data: &[u8]) -> Result<usize, FileError> {
-        let index = index_of(fd)?;
-        match self.slots[index].as_mut().ok_or(FileError::BadFd)? {
+        match self.cell_mut(fd)?.as_mut().ok_or(FileError::BadFd)? {
             Slot::File(open) => {
                 if !open.writable {
                     return Err(FileError::Vfs(VfsError::PermissionDenied));
@@ -316,7 +442,8 @@ impl Table {
             // вывод (см. `Program::stdout`) — он живёт не в таблице.
             Slot::PipeWrite(writer, _) => writer.write(data, false).map_err(FileError::Pipe),
             // Сокет пишется в `sock.rs`, вне замка: сюда он не доходит.
-            Slot::PipeRead(..) | Slot::Socket(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
+            // Стандартный поток пишется прежним путём (`std_target`).
+            Slot::PipeRead(..) | Slot::Socket(_) | Slot::Std(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
     }
 
@@ -326,8 +453,7 @@ impl Table {
     /// заводить для него второй счётчик значило бы объяснять, какой из двух
     /// двигает `seek`.
     pub fn next_entry(&mut self, fd: usize) -> Result<Option<DirEntry>, FileError> {
-        let index = index_of(fd)?;
-        let open = Self::as_file(self.slots[index].as_mut())?;
+        let open = Self::as_file(self.cell_mut(fd)?.as_mut())?;
         let entries = open.entries.as_ref().ok_or(FileError::Vfs(VfsError::WrongKind))?;
 
         let at = open.offset.load(Ordering::Relaxed) as usize;
@@ -351,14 +477,14 @@ impl Table {
     /// канала нет ни длины, ни смещения — читать его можно только вперёд и
     /// только один раз.
     pub fn node(&self, fd: usize) -> Result<Arc<dyn Node>, FileError> {
-        match self.slots.get(index_of(fd)?).and_then(Option::as_ref) {
+        match self.cell(fd)?.as_ref() {
             Some(Slot::File(open)) => {
                 if open.entries.is_some() {
                     return Err(FileError::Vfs(VfsError::WrongKind));
                 }
                 Ok(Arc::clone(&open.node))
             }
-            Some(Slot::PipeRead(..) | Slot::PipeWrite(..) | Slot::Socket(_)) => {
+            Some(Slot::PipeRead(..) | Slot::PipeWrite(..) | Slot::Socket(_) | Slot::Std(_)) => {
                 Err(FileError::Vfs(VfsError::WrongKind))
             }
             None => Err(FileError::BadFd),
@@ -368,8 +494,7 @@ impl Table {
     /// Прочитать из дескриптора в буфер. Возвращает, сколько прочитано; ноль —
     /// это конец файла, а не ошибка.
     pub fn read(&mut self, fd: usize, buf: &mut [u8]) -> Result<usize, FileError> {
-        let index = index_of(fd)?;
-        match self.slots[index].as_mut().ok_or(FileError::BadFd)? {
+        match self.cell_mut(fd)?.as_mut().ok_or(FileError::BadFd)? {
             Slot::File(open) => {
                 // У каталога байтов нет: читать его как файл — это вопрос не к
                 // правам, а к тому, что такое каталог. Программа, спутавшая одно
@@ -388,7 +513,7 @@ impl Table {
             }
             // Не ждёт по той же причине, что и запись выше.
             Slot::PipeRead(reader, _) => reader.read(buf, false).map_err(FileError::Pipe),
-            Slot::PipeWrite(..) | Slot::Socket(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
+            Slot::PipeWrite(..) | Slot::Socket(_) | Slot::Std(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
     }
 
@@ -401,8 +526,7 @@ impl Table {
     /// обрезание до нуля превратило бы ошибку в счёте программы в тихо неверные
     /// данные.
     pub fn seek(&mut self, fd: usize, offset: i64, whence: Whence) -> Result<u64, FileError> {
-        let index = index_of(fd)?;
-        let open = Self::as_file(self.slots[index].as_mut())?;
+        let open = Self::as_file(self.cell_mut(fd)?.as_mut())?;
         let base = match whence {
             Whence::Set => 0,
             Whence::Current => open.offset.load(Ordering::Relaxed),
@@ -421,8 +545,9 @@ impl Table {
 
     /// Закрыть дескриптор.
     pub fn close(&mut self, fd: usize) -> Result<(), FileError> {
-        let index = index_of(fd)?;
-        match self.slots[index].take() {
+        let taken = self.cell_mut(fd)?.take();
+        self.set_cloexec(fd, false);
+        match taken {
             Some(_) => Ok(()),
             None => Err(FileError::BadFd),
         }
@@ -433,30 +558,30 @@ impl Table {
     /// Отдельно от [`Table::open`] потому, что открывать нечего: канал уже
     /// существует, таблице нужно только место под его конец.
     pub fn install_read(&mut self, reader: pipe::Reader) -> Result<usize, FileError> {
-        let slot = self.free_slot()?;
-        self.slots[slot] = Some(Slot::PipeRead(reader, Mode::new(true)));
-        Ok(slot + FD_FIRST)
+        let fd = self.free_fd(0)?;
+        self.put(fd, Slot::PipeRead(reader, Mode::new(true)));
+        Ok(fd)
     }
 
     /// То же для пишущего конца.
     pub fn install_write(&mut self, writer: pipe::Writer) -> Result<usize, FileError> {
-        let slot = self.free_slot()?;
-        self.slots[slot] = Some(Slot::PipeWrite(writer, Mode::new(true)));
-        Ok(slot + FD_FIRST)
+        let fd = self.free_fd(0)?;
+        self.put(fd, Slot::PipeWrite(writer, Mode::new(true)));
+        Ok(fd)
     }
 
     /// Занять место под сокет (фаза 65a).
     pub fn install_socket(&mut self, socket: super::sock::Sock) -> Result<usize, FileError> {
-        let slot = self.free_slot()?;
-        self.slots[slot] = Some(Slot::Socket(Arc::new(socket)));
-        Ok(slot + FD_FIRST)
+        let fd = self.free_fd(0)?;
+        self.put(fd, Slot::Socket(Arc::new(socket)));
+        Ok(fd)
     }
 
     /// Сокет за дескриптором — `None`, если там не сокет. Отдаётся ссылка:
     /// работают с ним после того, как замок программы отпущен.
     #[must_use]
     pub fn socket(&self, fd: usize) -> Option<Arc<super::sock::Sock>> {
-        match self.slots.get(index_of(fd).ok()?)?.as_ref()? {
+        match self.cell(fd).ok()?.as_ref()? {
             Slot::Socket(socket) => Some(Arc::clone(socket)),
             _ => None,
         }
@@ -467,7 +592,7 @@ impl Table {
     /// тогда работает обычный путь через таблицу.
     #[must_use]
     pub fn waiting_pipe(&self, fd: usize) -> Option<Waiting> {
-        match self.slots.get(index_of(fd).ok()?)?.as_ref()? {
+        match self.cell(fd).ok()?.as_ref()? {
             Slot::PipeRead(reader, mode) if !mode.nonblock() => Some(Waiting::Read(reader.clone())),
             Slot::PipeWrite(writer, mode) if !mode.nonblock() => Some(Waiting::Write(writer.clone())),
             _ => None,
@@ -477,20 +602,20 @@ impl Table {
     /// Включить или снять «не ждать» (`SYS_FDCTL`). У файла — ничего: он не
     /// ждёт никогда.
     pub fn set_nonblock(&self, fd: usize, on: bool) -> Result<(), FileError> {
-        match self.slots[index_of(fd)?].as_ref().ok_or(FileError::BadFd)? {
+        match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
             Slot::PipeRead(_, mode) | Slot::PipeWrite(_, mode) => mode.set(on),
             Slot::Socket(socket) => socket.set_nonblock(on),
-            Slot::File(_) => {}
+            Slot::File(_) | Slot::Std(_) => {}
         }
         Ok(())
     }
 
     /// Не ждёт ли дескриптор. Файл — `true`: ждать ему нечего.
     pub fn nonblock(&self, fd: usize) -> Result<bool, FileError> {
-        Ok(match self.slots[index_of(fd)?].as_ref().ok_or(FileError::BadFd)? {
+        Ok(match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
             Slot::PipeRead(_, mode) | Slot::PipeWrite(_, mode) => mode.nonblock(),
             Slot::Socket(socket) => socket.nonblock(),
-            Slot::File(_) => true,
+            Slot::File(_) | Slot::Std(_) => true,
         })
     }
 
@@ -502,8 +627,7 @@ impl Table {
     /// о чём программа не просила. Цена ошибки при этом названа в договоре:
     /// незакрытый конец — это конец файла, который не наступит никогда.
     pub fn read_end(&self, fd: usize) -> Result<pipe::Reader, FileError> {
-        let index = index_of(fd)?;
-        match self.slots[index].as_ref().ok_or(FileError::BadFd)? {
+        match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
             Slot::PipeRead(reader, _) => Ok(reader.clone()),
             _ => Err(FileError::Vfs(VfsError::WrongKind)),
         }
@@ -511,16 +635,10 @@ impl Table {
 
     /// Копия пишущего конца из этого дескриптора.
     pub fn write_end(&self, fd: usize) -> Result<pipe::Writer, FileError> {
-        let index = index_of(fd)?;
-        match self.slots[index].as_ref().ok_or(FileError::BadFd)? {
+        match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
             Slot::PipeWrite(writer, _) => Ok(writer.clone()),
             _ => Err(FileError::Vfs(VfsError::WrongKind)),
         }
-    }
-
-    /// Свободное место или отказ.
-    fn free_slot(&self) -> Result<usize, FileError> {
-        self.slots.iter().position(Option::is_none).ok_or(FileError::TooManyFiles)
     }
 
     /// Место таблицы как файл.
@@ -545,29 +663,33 @@ impl Table {
     /// бывают. Если копируют дескриптор сам в себя, не делается ничего — иначе
     /// закрытие места уничтожило бы то, что мы собираемся в него положить.
     pub fn dup(&mut self, fd: usize, to: usize) -> Result<usize, FileError> {
-        let from = index_of(fd)?;
-        let copy = match self.slots[from].as_ref().ok_or(FileError::BadFd)? {
-            Slot::File(open) => Slot::File(Arc::clone(open)),
-            Slot::PipeRead(reader, mode) => Slot::PipeRead(reader.clone(), mode.clone()),
-            Slot::PipeWrite(writer, mode) => Slot::PipeWrite(writer.clone(), mode.clone()),
-            Slot::Socket(socket) => Slot::Socket(Arc::clone(socket)),
-        };
+        let copy = self.cell(fd)?.as_ref().ok_or(FileError::BadFd)?.copy();
 
         let target = if to == user_abi::DUP_ANY {
-            self.free_slot()?
+            self.free_fd(0)?
         } else {
-            // Стандартные потоки местами таблицы не являются, и подменить их
-            // записью в ней нечем — см. договор `SYS_DUP`.
-            let target = index_of(to).map_err(|_| FileError::Vfs(VfsError::Unsupported))?;
-            if target == from {
+            // Стандартные потоки родной программы местами таблицы не
+            // являются, и подменить их записью в ней нечем — см. договор
+            // `SYS_DUP`. У программы Linux они места (фаза 71d).
+            if self.cell(to).is_err() {
+                return Err(FileError::Vfs(VfsError::Unsupported));
+            }
+            if to == fd {
                 return Ok(fd);
             }
-            self.slots[target] = None;
-            target
+            to
         };
 
-        self.slots[target] = Some(copy);
-        Ok(target + FD_FIRST)
+        self.put(target, copy);
+        Ok(target)
+    }
+
+    /// `fcntl(F_DUPFD)`: копия на наименьший свободный номер не меньше `min`.
+    pub fn dup_from(&mut self, fd: usize, min: usize) -> Result<usize, FileError> {
+        let copy = self.cell(fd)?.as_ref().ok_or(FileError::BadFd)?.copy();
+        let target = self.free_fd(min)?;
+        self.put(target, copy);
+        Ok(target)
     }
 
     /// Что лежит за дескриптором — для `SYS_FSTAT` и `SYS_ISATTY`.
@@ -575,7 +697,7 @@ impl Table {
     /// Отдаёт готовые числа, а не узел: у канала узла нет вовсе, и вызывающему
     /// пришлось бы разбирать два случая там, где вопрос у него один.
     pub fn describe(&self, fd: usize) -> Result<FdInfo, FileError> {
-        match self.slots.get(index_of(fd)?).and_then(Option::as_ref) {
+        match self.cell(fd)?.as_ref() {
             Some(Slot::File(open)) => {
                 let meta = open.node.metadata();
                 Ok(FdInfo {
@@ -606,6 +728,9 @@ impl Table {
                 gid: 0,
                 kind: FdKind::Socket,
             }),
+            // Стандартный поток описывает тот, кто знает, что за ним
+            // (`std_target`): терминал или канал запускающего.
+            Some(Slot::Std(_)) => Err(FileError::Vfs(VfsError::WrongKind)),
             None => Err(FileError::BadFd),
         }
     }
@@ -617,11 +742,12 @@ impl Table {
     /// чтение с конца немедленно возвращает ноль, а запись идёт на носитель.
     /// Так отвечает `poll` на файл везде, где он есть.
     pub fn readiness(&self, fd: usize) -> Result<(bool, bool, bool), FileError> {
-        match self.slots.get(index_of(fd)?).and_then(Option::as_ref) {
+        match self.cell(fd)?.as_ref() {
             Some(Slot::File(open)) => Ok((true, open.writable, false)),
             Some(Slot::PipeRead(reader, _)) => Ok((reader.ready(), false, reader.hangup())),
             Some(Slot::PipeWrite(writer, _)) => Ok((false, writer.ready(), writer.hangup())),
             Some(Slot::Socket(socket)) => Ok(socket.readiness()),
+            Some(Slot::Std(_)) => Ok((true, true, false)),
             None => Err(FileError::BadFd),
         }
     }

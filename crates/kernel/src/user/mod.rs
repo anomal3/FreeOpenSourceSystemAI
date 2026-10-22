@@ -808,6 +808,12 @@ pub struct Program {
     /// Номер процесса Linux (фаза 71c) — задачи главного потока: `getpid` у
     /// всех потоков один, `gettid` — свой.
     pub linux_pid: u32,
+    /// Номер родителя (`getppid`, фаза 71d): кто сделал `fork`; ноль —
+    /// запущен системой.
+    pub linux_ppid: u32,
+    /// Процесс снят сигналом (фаза 71d): `wait4` родителя узнаёт номер
+    /// сигнала, а не код выхода.
+    pub linux_signal: Option<u8>,
     /// Пути открытых каталогов — так, как их видит программа Linux: на них
     /// опираются пути `*at` от дескриптора (фаза 71c).
     pub linux_dirs: Vec<(usize, alloc::string::String)>,
@@ -2629,18 +2635,21 @@ fn place_args(frame: PhysAddr, args: &[&str], layout: Layout) -> (usize, usize, 
 /// парами «ключ, значение» до `AT_NULL`; выше — строки и 16 случайных байт
 /// (`AT_RANDOM`, из них glibc берёт канарейку стека и ключ указателей).
 /// Возвращает вершину стека — адрес `argc`, выровненный на 16 (System V ABI,
-/// 3.4.1). Как и у [`place_args`], место — одна верхняя страница: лишние
-/// аргументы отбрасываются.
+/// 3.4.1).
+///
+/// Место — жадная часть стека (фаза 71d; до неё — одна верхняя страница):
+/// строкам — верхние [`LINUX_ARG_BYTES`], указателям — то, что под ними.
+/// Что не поместилось, отбрасывается. `env` — окружение от `execve`; `None` —
+/// запуск системой, окружение по умолчанию.
 fn place_linux_args(
-    frame: PhysAddr,
+    frames: &[PhysAddr; STACK_PAGES],
     path: &str,
     args: &[&str],
+    env: Option<&[&str]>,
     layout: Layout,
-    _entry: usize,
     start: LinuxStart,
     cred: Credentials,
 ) -> usize {
-    const AREA: usize = PAGE_SIZE;
     // Ключи `auxv` (`<elf.h>` Linux).
     const AT_NULL: usize = 0;
     const AT_PHDR: usize = 3;
@@ -2661,56 +2670,66 @@ fn place_linux_args(
     const AT_RANDOM: usize = 25;
     const AT_HWCAP2: usize = 26;
     const AT_EXECFN: usize = 31;
-    /// Окружение, с которым программа Linux появляется на свет. Своего
-    /// окружения у запуска пока нет; это — минимум, без которого оболочки и
+    /// Окружение, с которым программа Linux появляется на свет, если её
+    /// запускает система, а не `execve`: минимум, без которого оболочки и
     /// утилиты ищут программы и дом наугад.
     const ENV: [&str; 4] = ["PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/", "TERM=linux", "LANG=C.UTF-8"];
+    /// Сколько указателей `argv` и `envp` вместе помещается под строками.
+    const MAX_POINTERS: usize = (STACK_PAGES * PAGE_SIZE - LINUX_ARG_BYTES) / size_of::<usize>() - 64;
 
-    let base = layout.stack_top - AREA;
-    let page = frame_bytes(frame);
-    let mut top = AREA;
-    // Строку — в страницу сверху вниз; ответ — её адрес в памяти программы.
-    // Не влезла — `None`, и место под указатели остаётся.
-    let put = |bytes: &[u8], top: &mut usize| -> Option<usize> {
+    let low = layout.stack_top - STACK_PAGES * PAGE_SIZE;
+    // Байты — по адресу программы, через кадры жадной части стека.
+    let write = |at: usize, bytes: &[u8]| {
+        for (index, byte) in bytes.iter().enumerate() {
+            let offset = at + index - low;
+            // SAFETY: адрес внутри жадной части стека — его проверяют `put` и
+            // счёт указателей; кадры её выданы под эту программу и видны
+            // через прямое отображение.
+            unsafe { frame_bytes(frames[offset / PAGE_SIZE]).add(offset % PAGE_SIZE).write(*byte) };
+        }
+    };
+    let floor = layout.stack_top - LINUX_ARG_BYTES;
+    let mut top = layout.stack_top;
+    // Строку — сверху вниз; ответ — её адрес в памяти программы. Не влезла —
+    // `None`, и место под указатели остаётся.
+    let mut put = |bytes: &[u8]| -> Option<usize> {
         let need = bytes.len() + 1;
-        if *top < need + AREA / 2 {
+        if top - floor < need {
             return None;
         }
-        *top -= need;
-        // SAFETY: `top` и длина проверены — запись внутри страницы стека.
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.add(*top), bytes.len());
-            page.add(*top + bytes.len()).write(0);
-        }
-        Some(base + *top)
+        top -= need;
+        write(top, bytes);
+        write(top + bytes.len(), &[0]);
+        Some(top)
     };
-    let execfn = put(path.as_bytes(), &mut top).unwrap_or(0);
-    let platform = put(b"x86_64", &mut top).unwrap_or(0);
+    let execfn = put(path.as_bytes()).unwrap_or(0);
+    let platform = put(b"x86_64").unwrap_or(0);
     let mut random = [0u8; 16];
     let _ = crate::random::fill(&mut random);
-    let random_at = put(&random[..15], &mut top).map_or(0, |at| {
-        // Шестнадцатый байт — на место завершающего нуля, который `put`
-        // дописал: случайных байт нужно ровно шестнадцать.
-        // SAFETY: адрес только что выдан внутри этой страницы.
-        unsafe { page.add(at - base + 15).write(random[15]) };
-        at
-    });
-    let mut argv = [0usize; 64];
+    // Шестнадцать случайных байт: `put` дописал бы семнадцатым ноль — он
+    // безвреден и остаётся.
+    let random_at = put(&random).unwrap_or(0);
+    let mut pointers: Vec<usize> = Vec::new();
     let mut argc = 0;
-    for arg in args.iter().take(argv.len()) {
-        match put(arg.as_bytes(), &mut top) {
+    for arg in args {
+        if pointers.len() >= MAX_POINTERS || pointers.try_reserve(1).is_err() {
+            break;
+        }
+        match put(arg.as_bytes()) {
             Some(at) => {
-                argv[argc] = at;
+                pointers.push(at);
                 argc += 1;
             }
             None => break,
         }
     }
-    let mut envp = [0usize; ENV.len()];
     let mut envc = 0;
-    for var in ENV {
-        if let Some(at) = put(var.as_bytes(), &mut top) {
-            envp[envc] = at;
+    for var in env.unwrap_or(&ENV) {
+        if pointers.len() >= MAX_POINTERS || pointers.try_reserve(1).is_err() {
+            break;
+        }
+        if let Some(at) = put(var.as_bytes()) {
+            pointers.push(at);
             envc += 1;
         }
     }
@@ -2749,20 +2768,18 @@ fn place_linux_args(
     ];
 
     let words = 1 + (argc + 1) + (envc + 1) + 2 * auxv.len();
-    let stack = (base + top - words * size_of::<usize>()) & !15;
-    let mut at = stack - base;
+    let stack = (top.min(floor) - words * size_of::<usize>()) & !15;
+    let mut at = stack;
     let mut push = |value: usize| {
-        // SAFETY: место под вектор — нижняя половина страницы, которую `put`
-        // строкам не отдаёт (`AREA / 2`), а слов в нём меньше пятисот.
-        unsafe { page.add(at).cast::<usize>().write_unaligned(value) };
+        write(at, &value.to_ne_bytes());
         at += size_of::<usize>();
     };
     push(argc);
-    for &pointer in &argv[..argc] {
+    for &pointer in &pointers[..argc] {
         push(pointer);
     }
     push(0);
-    for &pointer in &envp[..envc] {
+    for &pointer in &pointers[argc..] {
         push(pointer);
     }
     push(0);
@@ -2772,6 +2789,10 @@ fn place_linux_args(
     }
     stack
 }
+
+/// Сколько байт жадной части стека программы Linux отдаётся строкам
+/// аргументов и окружения (фаза 71d): двенадцать страниц из шестнадцати.
+const LINUX_ARG_BYTES: usize = 12 * PAGE_SIZE;
 
 /// Выделить кадр под страницу программы.
 fn take_frame() -> Result<PhysAddr, Error> {
@@ -2870,6 +2891,8 @@ fn prefetch(space: &mut Space, region: &mut Mapping) -> Result<(), Error> {
 struct Loaded {
     entry: usize,
     stack_top_frame: PhysAddr,
+    /// Кадры жадной части стека снизу вверх (фаза 71d).
+    stack_frames: [PhysAddr; STACK_PAGES],
     mappings: Vec<Mapping>,
     /// Что нужно стеку программы Linux (фаза 71a); `None` — программа наша.
     linux: Option<LinuxStart>,
@@ -3147,14 +3170,13 @@ fn load(
         interp_entry = Some(interp.entry + interp_bias);
     }
 
-    let mut stack_top_frame = PhysAddr::new(0);
+    let mut stack_frames = [PhysAddr::new(0); STACK_PAGES];
     for page in 0..STACK_PAGES {
         let frame = take_frame()?;
         // Верхняя страница — та, в которую упирается вершина стека, и именно
-        // в неё лягут аргументы.
-        if page == STACK_PAGES - 1 {
-            stack_top_frame = frame;
-        }
+        // в неё лягут аргументы; программе Linux — и в те, что под ней
+        // (фаза 71d: окружение `execve` бывает в десятки килобайт).
+        stack_frames[page] = frame;
         // SAFETY: кадр только что выделен под эту программу и больше никому не
         // принадлежит; при разборе пространства он вернётся в пул. Стек —
         // обычная память программы на чтение и запись.
@@ -3245,7 +3267,7 @@ fn load(
     } else {
         None
     };
-    Ok(Loaded { entry, stack_top_frame, mappings, linux })
+    Ok(Loaded { entry, stack_top_frame: stack_frames[STACK_PAGES - 1], stack_frames, mappings, linux })
 }
 
 /// Напечатать то, ради чего фаза затевалась: где лежит программа и чего о ней
@@ -3326,7 +3348,7 @@ fn run(
     // оба соглашения о вызовах, и невыровненный стек ломается не сразу, а на
     // первой же операции с вектором.
     let (argc, argv, stack) = match loaded.linux {
-        Some(start) => (0, 0, place_linux_args(loaded.stack_top_frame, path, args, layout, entry, start, cred)),
+        Some(start) => (0, 0, place_linux_args(&loaded.stack_frames, path, args, None, layout, start, cred)),
         None => place_args(loaded.stack_top_frame, args, layout),
     };
     let linux = loaded.linux.is_some();
@@ -3359,7 +3381,7 @@ fn run(
         }
         *entry = Some(Arc::new(Mutex::new(Program {
             space,
-            files: files::Table::new(),
+            files: if linux { files::Table::new_linux() } else { files::Table::new() },
             kill_requested: false,
             ending: false,
             cred,
@@ -3376,6 +3398,8 @@ fn run(
             brk: (0, 0, 0),
             linux_cwd: alloc::string::String::from("/"),
             linux_pid: sched::current().as_u32(),
+            linux_ppid: 0,
+            linux_signal: None,
             linux_dirs: Vec::new(),
             linux_actions: [LinuxAction::default(); 65],
             linux_exit: None,
@@ -3417,6 +3441,16 @@ fn run(
     };
 
     // Сюда возвращаются оба пути: и `exit`, и снятие программы после отказа.
+    Ok(finish(slot, code))
+}
+
+/// Разобрать процесс, главный поток которого только что вернулся из
+/// третьего кольца с кодом `code`: общий конец [`run`] и процесса, рождённого
+/// `fork` (фаза 71d). Возвращает тот же код.
+fn finish(slot: usize, code: i64) -> i64 {
+    // Номер процесса и то, чем он кончился, — для `wait4` родителя (фаза
+    // 71d); берутся до разбора, пока процесс ещё в таблице.
+    let ended = with_current(|program| (program.linux_pid, program.linux_signal));
     //
     // Первым делом — остальные потоки: конец главного потока — конец
     // процесса, как в POSIX. Без этого поток, спящий на ожидании без срока
@@ -3497,7 +3531,15 @@ fn run(
         kprintln!("  user        : closed {sockets} socket(s) the program left open");
     }
 
-    Ok(code)
+    // Родитель узнаёт о конце последним — когда память уже вернулась в пул:
+    // `wait4` обещает, что от ребёнка ничего не осталось.
+    #[cfg(target_arch = "x86_64")]
+    if let Some((pid, signal)) = ended {
+        crate::linux::process_ended(pid, code, signal);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = ended;
+    code
 }
 
 /// Сколько стека ядра отводится задаче, исполняющей программу.
@@ -3848,6 +3890,374 @@ pub fn same_process(slot: usize) -> bool {
     };
     let table = PROGRAMS.lock();
     table.get(slot).and_then(Option::as_ref).is_some_and(|other| Arc::ptr_eq(other, &process))
+}
+
+/// Процесс в слоте `slot` — ссылкой (фаза 71d: `kill` и `SIGCHLD` другому
+/// процессу Linux). `None` — слот программы не исполняет.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn process_at(slot: usize) -> Option<Arc<Mutex<Program>>> {
+    let table = PROGRAMS.lock();
+    table.get(slot).and_then(Option::as_ref).cloned()
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Mapping {
+    /// Копия записи для `fork` (фаза 71d). `None` — область чужая
+    /// (поверхность окна, устройство), и копировать её нельзя.
+    ///
+    /// Крупных страниц у копии нет — [`Space::duplicate`] раскладывает их на
+    /// обычные, — поэтому и счёт блоков у неё ноль.
+    fn fork_copy(&self) -> Option<Self> {
+        let resident = |from: &Resident| Resident { pages: from.pages, hand: from.hand };
+        let source = match &self.source {
+            Source::Anonymous(anon) => Source::Anonymous(*anon),
+            Source::ThreadStack => Source::ThreadStack,
+            Source::File(file) => Source::File(FileBacking {
+                node: Arc::clone(&file.node),
+                offset: file.offset,
+                resident: resident(&file.resident),
+                reads: 0,
+                evictions: 0,
+            }),
+            Source::Image(image) => Source::Image(ImageBacking {
+                node: Arc::clone(&image.node),
+                offset: image.offset,
+                file_bytes: image.file_bytes,
+                flags: image.flags,
+                resident: resident(&image.resident),
+                pinned: image.pinned,
+                reads: 0,
+                evictions: 0,
+            }),
+            Source::Surface(..) | Source::Device => return None,
+        };
+        Some(Self { base: self.base, pages: self.pages, blocks: 0, source })
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Program {
+    /// Копия процесса для `fork` (фаза 71d): память — страница в страницу,
+    /// открытые файлы — ссылками (позиции общие, как у `dup`), обработчики
+    /// сигналов, текущий каталог и `brk` — как у родителя. Номер процесса
+    /// новому ставит его задача, родитель — этот.
+    ///
+    /// Программе с окном или устройством копии нет: их кадры принадлежат не
+    /// ей, и у двух процессов оказались бы общие чужие кадры.
+    fn fork_copy(&self) -> Result<Self, MmapError> {
+        if self.has_surface() || self.devices.iter().any(Option::is_some) || !self.dma.is_empty() {
+            return Err(MmapError::BadRequest);
+        }
+        let mut mappings = Vec::new();
+        mappings.try_reserve(self.mappings.len()).map_err(|_| MmapError::NoMemory)?;
+        for region in &self.mappings {
+            mappings.push(region.fork_copy().ok_or(MmapError::BadRequest)?);
+        }
+        let space = self.space.duplicate().map_err(|_| MmapError::NoMemory)?;
+        Ok(Self {
+            space,
+            files: self.files.fork(),
+            kill_requested: false,
+            ending: false,
+            cred: self.cred,
+            rights: self.rights,
+            path: self.path.clone(),
+            stdin: self.stdin.clone(),
+            stdout: self.stdout.clone(),
+            mappings,
+            mmap_start: self.mmap_start,
+            devices: [const { None }; user_abi::MAX_DEVICES],
+            dma: Vec::new(),
+            jit: JitStats::default(),
+            linux: self.linux,
+            brk: self.brk,
+            linux_cwd: self.linux_cwd.clone(),
+            linux_pid: 0,
+            linux_ppid: self.linux_pid,
+            linux_signal: None,
+            linux_dirs: self.linux_dirs.clone(),
+            linux_actions: self.linux_actions,
+            linux_exit: None,
+            linux_stack: self.linux_stack,
+        })
+    }
+}
+
+/// Что задача нового процесса должна знать (`fork`, фаза 71d).
+#[cfg(target_arch = "x86_64")]
+struct ForkStart {
+    process: Arc<Mutex<Program>>,
+    /// Регистры родителя в момент `fork`, с нулём в RAX.
+    regs: arch::TrapFrame,
+    tls: u64,
+    /// `CLONE_CHILD_SETTID`: куда в памяти **ребёнка** записать его номер.
+    set_tid: usize,
+    /// `CLONE_CHILD_CLEARTID`.
+    clear_tid: usize,
+    /// Маска сигналов и запасной стек — от потока, сделавшего `fork`.
+    mask: u64,
+    altstack: (usize, usize),
+    stack: (usize, usize),
+}
+
+/// Завести новый процесс Linux — копию текущего (`fork`, `vfork`, `clone`
+/// без `CLONE_THREAD`, фаза 71d). Ребёнок продолжит с той же инструкции, что
+/// родитель, с нулём в RAX. Возвращает задачу ребёнка — она же его номер.
+#[cfg(target_arch = "x86_64")]
+pub fn spawn_linux_process(
+    regs: arch::TrapFrame,
+    tls: u64,
+    set_tid: usize,
+    clear_tid: usize,
+) -> Result<sched::TaskId, ThreadError> {
+    let parent = current_process().ok_or(ThreadError::NoProgram)?;
+    // Копия — под замком родителя: пока память переписывается, его потоки не
+    // меняют ни таблиц, ни областей.
+    let program = parent.lock().fork_copy().map_err(|_| ThreadError::NoMemory)?;
+    drop(parent);
+    let ppid = program.linux_ppid;
+    let slot = sched::current_slot();
+    let start = alloc::boxed::Box::new(ForkStart {
+        process: Arc::new(Mutex::new(program)),
+        regs,
+        tls,
+        set_tid,
+        clear_tid,
+        mask: LINUX_SIGMASK[slot].load(Ordering::Relaxed),
+        altstack: (LINUX_ALTSTACK[slot].0.load(Ordering::Relaxed), LINUX_ALTSTACK[slot].1.load(Ordering::Relaxed)),
+        stack: current_stack(),
+    });
+    let raw = alloc::boxed::Box::into_raw(start);
+    match sched::spawn_raw("program", PROGRAM_STACK_SIZE, linux_fork_entry, raw as usize) {
+        Ok(id) => {
+            if sched::is_daemon() {
+                sched::mark_daemon(id);
+            }
+            // Записывают оба — и родитель, и ребёнок в начале своей задачи: кто
+            // бы ни успел первым, `wait4` родителя ребёнка уже видит, а конец
+            // ребёнка, случись он раньше этой строки, не теряется.
+            crate::linux::register_child(ppid, id.as_u32());
+            Ok(id)
+        }
+        Err(err) => {
+            // SAFETY: указатель получен из `Box::into_raw` строкой выше; копия
+            // процесса уходит вместе с ним, и `Drop` пространства вернёт кадры.
+            drop(unsafe { alloc::boxed::Box::from_raw(raw) });
+            Err(match err {
+                sched::SpawnError::OutOfMemory => ThreadError::NoMemory,
+                sched::SpawnError::TooManyTasks => ThreadError::TooManyTasks,
+            })
+        }
+    }
+}
+
+/// Точка входа задачи нового процесса: занять слот копией, войти в неё с
+/// регистрами родителя, а по выходу разобрать — как [`run`].
+#[cfg(target_arch = "x86_64")]
+extern "C" fn linux_fork_entry(arg: usize) -> ! {
+    arch::interrupts::enable();
+    // SAFETY: указатель выделен в `spawn_linux_process` и передан ровно один раз.
+    let start = unsafe { alloc::boxed::Box::from_raw(arg as *mut ForkStart) };
+    let slot = sched::current_slot();
+    let pid = sched::current().as_u32();
+    let (root, ppid) = {
+        let mut program = start.process.lock();
+        program.linux_pid = pid;
+        (program.space.root(), program.linux_ppid)
+    };
+    crate::linux::register_child(ppid, pid);
+    {
+        let mut table = PROGRAMS.lock();
+        if let Some(entry) = table.get_mut(slot) {
+            *entry = Some(Arc::clone(&start.process));
+        }
+    }
+    LINUX_SIGMASK[slot].store(start.mask, Ordering::Relaxed);
+    LINUX_PENDING[slot].store(0, Ordering::Relaxed);
+    LINUX_ALTSTACK[slot].0.store(start.altstack.0, Ordering::Relaxed);
+    LINUX_ALTSTACK[slot].1.store(start.altstack.1, Ordering::Relaxed);
+    LINUX_CLEAR_TID[slot].store(start.clear_tid, Ordering::Relaxed);
+    set_stack(slot, start.stack.0, start.stack.1);
+    IN_USER[slot].store(true, Ordering::Release);
+    kprintln!("  user        : {} forked from #{ppid}, runs at {:#018x}", sched::current(), start.regs.rip);
+    sched::set_current_tls(start.tls);
+    sched::set_current_space(Some(root));
+    // SAFETY: корень принадлежит живому процессу — ссылка на него в таблице.
+    unsafe { arch::activate_space(root) };
+    if start.set_tid != 0 && space::user_can(start.set_tid, 4, PageFlags::WRITE) {
+        // SAFETY: адрес проверен на запись в пространстве ребёнка — оно активно.
+        unsafe { core::ptr::write_volatile(start.set_tid as *mut u32, pid) };
+    }
+    let regs = start.regs;
+    // Ссылка из заявки уходит до входа: процесс держит таблица, и разбор в
+    // `finish` должен застать её последней.
+    drop(start);
+
+    // SAFETY: регистры — родительские из кадра `syscall` третьего кольца,
+    // селекторы пользовательские; память — копия родительской.
+    let code = unsafe { arch::enter_user_regs(&regs) };
+    let code = finish(slot, code);
+    kprintln!("  user        : {} (Linux process) finished with code {code}", sched::current());
+    sched::exit_current_with(code)
+}
+
+/// Почему не получилось `execve` (фаза 71d) — сверх [`Error`].
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy)]
+pub enum ExecError {
+    /// Файл не годится или не читается — как у запуска.
+    Load(Error),
+    /// Вызвал не главный поток, или остальные потоки не кончились вовремя.
+    Busy,
+}
+
+/// `execve` программы Linux (фаза 71d): заменить образ текущего процесса
+/// программой `path` (путь ядра). Номер процесса, открытые файлы (кроме
+/// `FD_CLOEXEC`), текущий каталог и маска сигналов остаются; память, потоки
+/// и обработчики сигналов — нет. Программа может быть и родной: тогда процесс
+/// перестаёт быть программой Linux.
+///
+/// При успехе `frame` — регистры входа в новую программу; при отказе процесс
+/// цел и продолжает, как был.
+#[cfg(target_arch = "x86_64")]
+pub fn exec(frame: &mut arch::TrapFrame, path: &str, args: &[&str], env: &[&str]) -> Result<(), ExecError> {
+    let process = current_process().ok_or(ExecError::Busy)?;
+    let slot = sched::current_slot();
+    let (cred, pid) = {
+        let program = process.lock();
+        (program.cred, program.linux_pid)
+    };
+    if pid != sched::current().as_u32() {
+        return Err(ExecError::Busy);
+    }
+    let node = match crate::fs::resolve_as(cred, path, Access::SEARCH) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return Err(ExecError::Load(Error::Read(err))),
+        None => return Err(ExecError::Load(Error::NoFilesystem)),
+    };
+    let node: Arc<dyn Node> = Arc::from(node);
+    let (header, file_len) = read_header(&*node).map_err(ExecError::Load)?;
+    let mut space = Space::new().map_err(|err| ExecError::Load(Error::Map(err)))?;
+    let layout = Layout::random();
+    let loaded = load(&mut space, &node, &header, file_len, layout.stack_top, cred).map_err(ExecError::Load)?;
+    let entry = loaded.entry;
+
+    // Дальше пути назад нет — но сначала остальные потоки: их задачи стоят
+    // на старом пространстве, и разобрать его можно только без них.
+    if !stop_other_threads(slot, &process) {
+        return Err(ExecError::Busy);
+    }
+
+    let (argc, argv, stack) = match loaded.linux {
+        Some(start) => (0, 0, place_linux_args(&loaded.stack_frames, crate::linux_path::shown(path), args, Some(env), layout, start, cred)),
+        None => place_args(loaded.stack_top_frame, args, layout),
+    };
+    let root = space.root();
+    let (old_space, old_mappings) = {
+        let mut program = process.lock();
+        let old_space = core::mem::replace(&mut program.space, space);
+        let old_mappings = core::mem::replace(&mut program.mappings, loaded.mappings);
+        program.mmap_start = layout.mmap_start;
+        program.brk = (0, 0, 0);
+        program.linux = loaded.linux.is_some();
+        program.path = alloc::string::String::from(path);
+        program.linux_stack = (layout.stack_top - MAIN_STACK_PAGES * PAGE_SIZE, layout.stack_top);
+        program.jit = JitStats::default();
+        program.linux_exit = None;
+        // Обработчики — адреса в старой памяти; «пропускать» остаётся.
+        const SIG_IGN: usize = 1;
+        for action in &mut program.linux_actions {
+            if action.handler != SIG_IGN {
+                *action = LinuxAction::default();
+            }
+        }
+        program.files.close_on_exec();
+        let Program { files, linux_dirs, .. } = &mut *program;
+        linux_dirs.retain(|(fd, _)| files.is_open(*fd));
+        (old_space, old_mappings)
+    };
+    // Знание раньше действия — как при запуске: вытеснение между строками
+    // вернёт задачу уже на новый корень.
+    sched::set_current_space(Some(root));
+    // SAFETY: корень построен копией ядерного; старое пространство разбирается
+    // только ниже, когда процессор на нём уже не стоит.
+    unsafe { arch::activate_space(root) };
+    drop(old_mappings);
+    drop(old_space);
+
+    sched::set_current_tls(0);
+    set_stack(slot, layout.stack_top - MAIN_STACK_PAGES * PAGE_SIZE, layout.stack_top);
+    LINUX_ALTSTACK[slot].0.store(0, Ordering::Relaxed);
+    LINUX_ALTSTACK[slot].1.store(0, Ordering::Relaxed);
+    LINUX_CLEAR_TID[slot].store(0, Ordering::Relaxed);
+
+    // Регистры входа: всё по нулям, как у нового процесса; селекторы — те же
+    // пользовательские, прерывания разрешены.
+    let (cs, ss, vector) = (frame.cs, frame.ss, frame.vector);
+    // SAFETY: `TrapFrame` — шестнадцать слов без инвариантов, нули годятся.
+    *frame = unsafe { core::mem::zeroed() };
+    frame.cs = cs;
+    frame.ss = ss;
+    frame.vector = vector;
+    frame.rflags = 0x202;
+    frame.rip = entry as u64;
+    if loaded.linux.is_some() {
+        frame.rsp = stack as u64;
+    } else {
+        // Родной вход — как у `enter_user`: аргументы в регистрах, «адрес
+        // возврата» `_start` — ноль под вершиной.
+        // SAFETY: жадная страница стека новой программы, пространство активно.
+        unsafe { core::ptr::write_volatile((stack - 8) as *mut u64, 0) };
+        frame.rsp = (stack - 8) as u64;
+        frame.rdi = argc as u64;
+        frame.rsi = argv as u64;
+    }
+    kprintln!("  user        : {} execve '{path}', entry {entry:#018x}", sched::current());
+    Ok(())
+}
+
+/// Снять остальные потоки процесса и дождаться, пока их задачи уйдут с его
+/// пространства (`execve`). `false` — не ушли за две секунды.
+#[cfg(target_arch = "x86_64")]
+fn stop_other_threads(slot: usize, process: &Arc<Mutex<Program>>) -> bool {
+    let others = || -> Vec<usize> {
+        let table = PROGRAMS.lock();
+        table
+            .iter()
+            .enumerate()
+            .filter(|(other, entry)| *other != slot && entry.as_ref().is_some_and(|p| Arc::ptr_eq(p, process)))
+            .map(|(other, _)| other)
+            .collect()
+    };
+    let first = others();
+    if first.is_empty() {
+        return true;
+    }
+    {
+        let mut program = process.lock();
+        program.kill_requested = true;
+        program.ending = true;
+    }
+    for other in &first {
+        if let Some(id) = sched::id_of_slot(*other) {
+            sched::wake(id);
+        }
+    }
+    let deadline = crate::time::uptime_ms() + 2000;
+    let done = loop {
+        if others().is_empty() {
+            break true;
+        }
+        if crate::time::uptime_ms() >= deadline {
+            break false;
+        }
+        sched::sleep_ms(1);
+    };
+    let mut program = process.lock();
+    program.kill_requested = false;
+    program.ending = false;
+    done
 }
 
 /// `/proc/self/maps` программы Linux (фаза 71c): области по возрастанию, с
@@ -4493,8 +4903,8 @@ pub unsafe fn check_kill() {
     if !is_running() {
         return;
     }
-    let Some((kill, ending, linux_exit)) =
-        with_current(|program| (program.kill_requested, program.ending, program.linux_exit))
+    let Some((kill, ending, linux_exit, signal)) =
+        with_current(|program| (program.kill_requested, program.ending, program.linux_exit, program.linux_signal))
     else {
         return;
     };
@@ -4511,6 +4921,10 @@ pub unsafe fn check_kill() {
 
     if ending {
         kprintln!("  thread      : {} ends with its process", sched::current());
+    } else if let Some(sig) = signal {
+        // Сигнал от другого процесса Linux (фаза 71d) — обычный конец
+        // программы, а не снятие по команде.
+        kprintln!("  linux       : task {} ends by signal {sig}", sched::current());
     } else {
         kprintln!("  user        : killed by request, task {}", sched::current());
     }

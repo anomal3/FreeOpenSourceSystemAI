@@ -106,6 +106,56 @@ impl Space {
         result
     }
 
+    /// Копия пространства для `fork` (фаза 71d): каждая отображённая страница
+    /// окна — в свой новый кадр, с тем же содержимым и теми же правами.
+    ///
+    /// Копия честная, а не «копирование при записи»: кадр у страницы один
+    /// владелец, и разбор пространства при выходе возвращает в пул всё, что
+    /// под окном, не спрашивая, чьё оно. Общие кадры потребовали бы счёта
+    /// ссылок на кадр — это следующий шаг, когда копирование станет дорого.
+    /// Неотображённое (ленивое, не тронутое) не стоит ничего: таблицы обходят
+    /// пустые куски целиком ([`arch::unmapped_run`]).
+    ///
+    /// Окно разбирается на обычные страницы: крупная страница копируется
+    /// пятьюстами двенадцатью обычными.
+    ///
+    /// Чужих кадров (поверхность окна, регистры устройства) в пространстве
+    /// быть не должно — их копия отдала бы два владельца одним кадрам;
+    /// проверяет это вызывающий.
+    #[cfg(target_arch = "x86_64")]
+    pub fn duplicate(&self) -> Result<Self, MapError> {
+        let mut copy = Self::new()?;
+        let end = super::WINDOW_BASE + (1usize << 39);
+        let mut virt = super::WINDOW_BASE;
+        while virt < end {
+            let at = VirtAddr::new(virt);
+            let Some((phys, flags)) = arch::translate(self.root, at) else {
+                virt += arch::unmapped_run(self.root, at) * PAGE_SIZE;
+                continue;
+            };
+            let frame = crate::mm::frame::with(|frames| {
+                if frames.stats().free <= super::RESERVE_FRAMES {
+                    return None;
+                }
+                frames.allocate()
+            })
+            .flatten()
+            .ok_or(MapError::OutOfFrames)?;
+            // SAFETY: оба кадра видны через прямое отображение; исходный
+            // принадлежит этому пространству и жив (вызывающий держит процесс),
+            // новый только что выдан и не принадлежит никому.
+            unsafe { core::ptr::copy_nonoverlapping(super::frame_bytes(phys), super::frame_bytes(frame), PAGE_SIZE) };
+            // SAFETY: кадр наш, адрес — в окне копии и ещё свободен: обход идёт
+            // по возрастанию, каждую страницу по разу.
+            if let Err(err) = unsafe { copy.map(at, frame, flags) } {
+                super::return_frame(frame);
+                return Err(err);
+            }
+            virt += PAGE_SIZE;
+        }
+        Ok(copy)
+    }
+
     /// Сколько страниц у программы своих.
     #[must_use]
     pub const fn owned_pages(&self) -> usize {

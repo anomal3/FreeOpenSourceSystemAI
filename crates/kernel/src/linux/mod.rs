@@ -33,9 +33,12 @@ use user_abi::{
 };
 
 mod poll;
+mod process;
 mod signal;
 mod special;
 mod thread;
+
+pub use process::{process_ended, register_child};
 
 use crate::kprintln;
 use crate::mm::PageFlags;
@@ -134,6 +137,9 @@ mod nr {
     pub const PIPE2: usize = 293;
     pub const MEMBARRIER: usize = 324;
     pub const CLONE3: usize = 435;
+    pub const FORK: usize = 57;
+    pub const VFORK: usize = 58;
+    pub const EXECVE: usize = 59;
 }
 
 /// `errno` Linux, которые здесь отдаются.
@@ -244,7 +250,7 @@ pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
 /// # Safety
 ///
 /// Как у [`syscall`].
-unsafe fn dispatch(number: usize, args: [usize; 6], frame: &crate::arch::TrapFrame) -> i64 {
+unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::TrapFrame) -> i64 {
     let [a0, a1, a2, a3, a4, a5] = args;
     // SAFETY (для всех `native` ниже): контракт функции.
     unsafe {
@@ -269,15 +275,12 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &crate::arch::TrapFra
             nr::READLINKAT => readlink(a0, a1, a2, a3),
             nr::FCNTL => fcntl(a0, a1, a2),
             nr::DUP => errno(native(user_abi::SYS_DUP, a0, user_abi::DUP_ANY, 0)),
-            nr::DUP2 | nr::DUP3 => {
-                if a0 == a1 {
-                    a1 as i64
-                } else {
-                    errno(native(user_abi::SYS_DUP, a0, a1, 0))
-                }
-            }
-            // Детей у программы Linux пока нет (`fork` — фаза 71d).
-            nr::WAIT4 => -e::ECHILD,
+            nr::DUP2 => dup3(a0, a1, 0, true),
+            nr::DUP3 => dup3(a0, a1, a2, false),
+            nr::WAIT4 => process::wait4(a0, a1, a2, a3),
+            nr::FORK => thread::clone(frame, SIGCHLD, 0, 0, 0, 0),
+            nr::VFORK => thread::clone(frame, CLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0, 0, 0),
+            nr::EXECVE => process::execve(frame, a0, a1, a2),
             nr::UMASK => 0o022,
             nr::GETTIMEOFDAY => gettimeofday(a0),
             nr::TIME => time(a0),
@@ -338,7 +341,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &crate::arch::TrapFra
             nr::NANOSLEEP => nanosleep(a0),
             nr::GETPID => crate::user::with_current(|program| program.linux_pid).unwrap_or(1) as i64,
             nr::GETTID => errno(native(SYS_GETPID, 0, 0, 0)),
-            nr::GETPPID => 1,
+            nr::GETPPID => process::getppid(),
             nr::GETUID | nr::GETEUID => errno(native(SYS_GETUID, 0, 0, 0)),
             nr::GETGID | nr::GETEGID => errno(native(SYS_GETGID, 0, 0, 0)),
             nr::UNAME => uname(a0),
@@ -360,6 +363,36 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &crate::arch::TrapFra
             nr::RSEQ => -e::ENOSYS,
             _ => unknown(number),
         }
+    }
+}
+
+const SIGCHLD: usize = 17;
+const CLONE_VM: usize = 0x100;
+const CLONE_VFORK: usize = 0x4000;
+const O_CLOEXEC: usize = 0o2_000_000;
+
+/// `dup2`/`dup3`: копия на заданный номер; `dup3` с `O_CLOEXEC` ставит
+/// `FD_CLOEXEC` копии. `dup2` сам в себя — проверка, что номер открыт;
+/// `dup3` сам в себя — `EINVAL`.
+fn dup3(fd: usize, to: usize, flags: usize, dup2: bool) -> i64 {
+    if fd == to {
+        if !dup2 {
+            return -e::EINVAL;
+        }
+        return match crate::user::with_current(|program| program.files.is_open(fd)) {
+            Some(true) => fd as i64,
+            _ => -e::EBADF,
+        };
+    }
+    let result = crate::user::with_current(|program| {
+        let fd = program.files.dup(fd, to)?;
+        program.files.set_cloexec(fd, flags & O_CLOEXEC != 0);
+        Ok(fd)
+    });
+    match result {
+        Some(Ok(fd)) => fd as i64,
+        Some(Err(err)) => file_errno(err),
+        None => -e::ESRCH,
     }
 }
 
@@ -479,7 +512,11 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
         Err(err) => return err,
     };
     if let Some((node, writable)) = special::node(&linux) {
-        return match crate::user::with_current(|program| program.files.install_node(node, writable)) {
+        return match crate::user::with_current(|program| {
+            let fd = program.files.install_node(node, writable)?;
+            program.files.set_cloexec(fd, flags & O_CLOEXEC != 0);
+            Ok(fd)
+        }) {
             Some(Ok(fd)) => fd as i64,
             Some(Err(err)) => file_errno(err),
             None => -e::ESRCH,
@@ -516,6 +553,9 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     if flags & O_DIRECTORY != 0 && !directory {
         crate::user::with_current(|program| program.files.close(fd));
         return -e::ENOTDIR;
+    }
+    if flags & O_CLOEXEC != 0 {
+        crate::user::with_current(|program| program.files.set_cloexec(fd, true));
     }
     if directory {
         crate::user::with_current(|program| {
@@ -621,6 +661,25 @@ fn stat_path(dir: usize, ptr: usize, out: usize) -> i64 {
 }
 
 fn fstat(fd: usize, out: usize) -> i64 {
+    // Стандартный поток — на каком бы номере он ни стоял (фаза 71d): канал
+    // запускающего или терминал.
+    let standard = crate::user::with_current(|program| {
+        program.files.std_target(fd).map(|stream| {
+            let piped = match stream {
+                0 => program.stdin.is_some(),
+                1 => program.stdout.is_some(),
+                _ => false,
+            };
+            (stream, piped)
+        })
+    });
+    if let Some(Some((stream, piped))) = standard {
+        return if piped {
+            put_stat(out, S_IFIFO, 0o600, 0, 0, 0, 0, 0x100 + stream as u64)
+        } else {
+            put_stat(out, S_IFCHR, 0o620, 0, 0, 0, 0, 0x100 + stream as u64)
+        };
+    }
     match crate::user::with_current(|program| program.files.describe(fd)) {
         Some(Ok(info)) => {
             let kind = match info.kind {
@@ -639,8 +698,6 @@ fn fstat(fd: usize, out: usize) -> i64 {
             };
             put_stat(out, kind, info.mode, info.uid, info.gid, info.size, 0, ino)
         }
-        // Стандартные потоки в таблице не лежат: за ними терминал.
-        Some(Err(_)) if fd <= 2 => put_stat(out, S_IFCHR, 0o620, 0, 0, 0, 0, 0x100 + fd as u64),
         Some(Err(err)) => file_errno(err),
         None => -e::ESRCH,
     }
@@ -814,28 +871,48 @@ fn readlink(dir: usize, ptr: usize, buf: usize, size: usize) -> i64 {
     }
 }
 
-/// `fcntl`: копия дескриптора и флаги, которых у дескриптора нет.
-unsafe fn fcntl(fd: usize, cmd: usize, _arg: usize) -> i64 {
+/// `fcntl`: копия дескриптора, `FD_CLOEXEC` (фаза 71d) и «не ждать».
+unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
     const F_DUPFD: usize = 0;
     const F_GETFD: usize = 1;
     const F_SETFD: usize = 2;
     const F_GETFL: usize = 3;
     const F_SETFL: usize = 4;
     const F_DUPFD_CLOEXEC: usize = 1030;
-    match cmd {
-        // SAFETY: контракт `syscall`.
-        F_DUPFD | F_DUPFD_CLOEXEC => errno(unsafe { native(user_abi::SYS_DUP, fd, user_abi::DUP_ANY, 0) }),
-        // `exec` у программ Linux ещё нет — закрывать при нём нечего.
-        F_GETFD | F_SETFD => {
-            if fd > 2 && !matches!(crate::user::with_current(|program| program.files.describe(fd)), Some(Ok(_))) {
-                return -e::EBADF;
+    const FD_CLOEXEC: usize = 1;
+    const O_NONBLOCK: usize = 0o4000;
+    let result = crate::user::with_current(|program| {
+        let files = &mut program.files;
+        match cmd {
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                let copy = files.dup_from(fd, arg)?;
+                files.set_cloexec(copy, cmd == F_DUPFD_CLOEXEC);
+                Ok(copy as i64)
             }
-            0
+            F_GETFD => Ok(if files.cloexec(fd)? { FD_CLOEXEC as i64 } else { 0 }),
+            F_SETFD => {
+                files.cloexec(fd)?;
+                files.set_cloexec(fd, arg & FD_CLOEXEC != 0);
+                Ok(0)
+            }
+            // Чтение и запись — `O_RDWR`; у ждущего канала — без `O_NONBLOCK`.
+            F_GETFL => {
+                files.cloexec(fd)?;
+                let nonblock = files.describe(fd).is_ok_and(|info| info.kind == FdKind::Pipe) && files.nonblock(fd)?;
+                Ok(if nonblock { 2 | O_NONBLOCK as i64 } else { 2 })
+            }
+            F_SETFL => {
+                files.cloexec(fd)?;
+                files.set_nonblock(fd, arg & O_NONBLOCK != 0)?;
+                Ok(0)
+            }
+            _ => Ok(-e::EINVAL),
         }
-        // Чтение и запись — `O_RDWR`.
-        F_GETFL => 2,
-        F_SETFL => 0,
-        _ => -e::EINVAL,
+    });
+    match result {
+        Some(Ok(answer)) => answer,
+        Some(Err(err)) => file_errno(err),
+        None => -e::ESRCH,
     }
 }
 

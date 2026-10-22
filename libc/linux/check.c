@@ -7,7 +7,9 @@
  * `pthread_join` (clone3 и CLONE_CHILD_CLEARTID), замки и условные переменные
  * (futex с WAIT_BITSET и абсолютным сроком), `__thread` (FS у каждого потока
  * свой), сигналы с обработчиком и `rt_sigreturn`, `sysconf` по `/sys`,
- * границы стека главного потока по `/proc/self/maps`.
+ * границы стека главного потока по `/proc/self/maps`. С фазы 71d — процессы:
+ * `fork` и `waitpid`, `SIGCHLD`, канал и `dup2` в `execve`, `posix_spawn` с
+ * окружением, `vfork`, `kill` другому процессу, `FD_CLOEXEC` при `execve`.
  *
  * Строки — `linuxcheck: ok <что>` или `linuxcheck: FAILED <что>`; итог —
  * `linuxcheck: N failed`, код выхода — то же N.
@@ -21,10 +23,12 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -80,8 +84,30 @@ static void *wait_for_signal(void *arg) {
     return (void *)(long)thread_signal;
 }
 
+static volatile sig_atomic_t got_child;
+static void on_child(int sig) {
+    (void)sig;
+    got_child = 1;
+}
+
+/* Прочитать канал до конца файла. */
+static void drain(int fd, char *out, size_t size) {
+    size_t have = 0;
+    ssize_t got;
+    while (have + 1 < size && (got = read(fd, out + have, size - 1 - have)) > 0) have += (size_t)got;
+    out[have] = 0;
+}
+
+extern char **environ;
+
 int main(int argc, char **argv) {
-    (void)argc;
+    /* Ребёнок после `execve` самого себя: `--fds закрытый открытый` — первый
+     * закрыт `FD_CLOEXEC`, второй унаследован. */
+    if (argc == 4 && strcmp(argv[1], "--fds") == 0) {
+        int closed = fcntl(atoi(argv[2]), F_GETFD) == -1 && errno == EBADF;
+        int open = fcntl(atoi(argv[3]), F_GETFD) == 0;
+        return closed && open ? 0 : 1;
+    }
     printf("linuxcheck: %s, glibc %s\n", argv[0], gnu_get_libc_version());
 
     /* Потоки и замок: неатомарный счётчик сходится только под замком. */
@@ -218,6 +244,100 @@ int main(int argc, char **argv) {
         free(big);
     }
     check(big_ok, "malloc of 64 MiB");
+
+    /* Процессы (фаза 71d). */
+    struct sigaction child_action;
+    memset(&child_action, 0, sizeof child_action);
+    child_action.sa_handler = on_child;
+    sigaction(SIGCHLD, &child_action, NULL);
+    int copy = 5;
+    pid_t me = getpid();
+    pid_t child = fork();
+    if (child == 0) {
+        copy = 7;
+        _exit(getppid() == me && copy == 7 ? 42 : 1);
+    }
+    int status = 0;
+    pid_t reaped = child > 0 ? waitpid(child, &status, 0) : -1;
+    check(child > 0 && reaped == child && WIFEXITED(status) && WEXITSTATUS(status) == 42 && copy == 5,
+          "fork, getppid, _exit and waitpid; memory is a copy");
+    for (int i = 0; i < 100 && !got_child; i++) sched_yield();
+    check(got_child, "SIGCHLD reaches the parent");
+
+    int out[2];
+    char text[128];
+    int piped2 = pipe(out) == 0;
+    pid_t echo = piped2 ? fork() : -1;
+    if (echo == 0) {
+        dup2(out[1], 1);
+        close(out[0]);
+        close(out[1]);
+        execl("/bin/echo", "echo", "from", "exec", (char *)NULL);
+        _exit(127);
+    }
+    if (piped2) close(out[1]);
+    drain(out[0], text, sizeof text);
+    if (piped2) close(out[0]);
+    status = -1;
+    if (echo > 0) waitpid(echo, &status, 0);
+    check(strcmp(text, "from exec\n") == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "fork, dup2 to stdout, execve, and a pipe read to EOF");
+
+    int spawn_out[2];
+    pid_t spawned = -1;
+    if (pipe(spawn_out) == 0) {
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_adddup2(&actions, spawn_out[1], 1);
+        posix_spawn_file_actions_addclose(&actions, spawn_out[0]);
+        char *spawn_argv[] = {"env", NULL};
+        char *spawn_env[] = {"FOSSAI_PHASE=71d", NULL};
+        if (posix_spawn(&spawned, "/usr/bin/env", &actions, NULL, spawn_argv, spawn_env) != 0) spawned = -1;
+        posix_spawn_file_actions_destroy(&actions);
+        close(spawn_out[1]);
+        drain(spawn_out[0], text, sizeof text);
+        close(spawn_out[0]);
+    }
+    status = -1;
+    if (spawned > 0) waitpid(spawned, &status, 0);
+    check(spawned > 0 && strcmp(text, "FOSSAI_PHASE=71d\n") == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "posix_spawn with file actions and an environment");
+
+    pid_t forked = vfork();
+    if (forked == 0) _exit(3);
+    status = -1;
+    if (forked > 0) waitpid(forked, &status, 0);
+    check(forked > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 3, "vfork and _exit");
+
+    pid_t sleeper = fork();
+    if (sleeper == 0) {
+        for (;;) {
+            struct timespec nap = {0, 10000000};
+            nanosleep(&nap, NULL);
+        }
+    }
+    status = -1;
+    int killed = sleeper > 0 && kill(sleeper, SIGTERM) == 0 && waitpid(sleeper, &status, 0) == sleeper;
+    check(killed && WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM, "kill another process, WTERMSIG");
+
+    int closing = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    int keeping = open("/dev/null", O_RDONLY);
+    int flagged = fcntl(closing, F_GETFD) == FD_CLOEXEC && fcntl(keeping, F_GETFD) == 0;
+    pid_t self = fork();
+    if (self == 0) {
+        char closed_fd[16], open_fd[16];
+        snprintf(closed_fd, sizeof closed_fd, "%d", closing);
+        snprintf(open_fd, sizeof open_fd, "%d", keeping);
+        execl("/proc/self/exe", argv[0], "--fds", closed_fd, open_fd, (char *)NULL);
+        _exit(127);
+    }
+    status = -1;
+    if (self > 0) waitpid(self, &status, 0);
+    check(flagged && WIFEXITED(status) && WEXITSTATUS(status) == 0, "execve closes FD_CLOEXEC and keeps the rest");
+    close(closing);
+    close(keeping);
+
+    check(waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD, "no children left: ECHILD");
 
     printf("linuxcheck: %d failed\n", failed);
     return failed;
