@@ -2234,6 +2234,12 @@ fn futex_wake(addr: usize, count: usize) -> i64 {
     sched::wake_futex(key, count) as i64
 }
 
+/// Разбудить до `count` ждущих на `addr` — изнутри ядра: выход потока Linux
+/// (`CLONE_CHILD_CLEARTID`, фаза 71c).
+pub(crate) fn futex_wake_at(addr: usize, count: usize) -> i64 {
+    futex_wake(addr, count)
+}
+
 /// `winclose(id) -> 0`.
 fn winclose(id: i64) -> i64 {
     let slot = match own_window(id) {
@@ -2338,7 +2344,7 @@ fn poll(ptr: usize, count: usize, timeout_ms: i64) -> i64 {
 }
 
 /// Что готово у одного дескриптора — в терминах договора.
-fn readiness_of(fd: usize, wanted: u32) -> u32 {
+pub(crate) fn readiness_of(fd: usize, wanted: u32) -> u32 {
     if fd == FD_STDIN {
         return match super::with_current(|program| program.stdin.clone()) {
             Some(Some(stdin)) => {

@@ -266,6 +266,7 @@ static IDT: Racy<Idt> = Racy::new(Idt([GateDescriptor::MISSING; IDT_ENTRIES]));
 /// Порядок полей обязан совпадать с порядком `push` в [`global_asm!`] ниже,
 /// прочитанным задом наперёд: первый `push` оказывается по старшему адресу.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct TrapFrame {
     pub r15: u64,
     pub r14: u64,
@@ -462,10 +463,9 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
     // хочется: номер вектора по определению не шире байта.
     // Вызов программы Linux (фаза 71a) — до маски: его «вектор» шире байта.
     if frame.vector == LINUX_SYSCALL_MARK {
-        let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9].map(|value| value as usize);
         // SAFETY: кадр сложен входом `syscall` из третьего кольца, то есть
         // `enter_user` исполняется и вернуться есть куда.
-        frame.rax = unsafe { crate::linux::syscall(frame.rax as usize, args) } as u64;
+        unsafe { crate::linux::syscall(frame) };
         // SAFETY: см. тот же вызов у родного системного вызова ниже.
         unsafe { crate::user::check_kill() };
         return;

@@ -255,6 +255,14 @@ impl Table {
         Ok(slot + FD_FIRST)
     }
 
+    /// Положить в таблицу узел, сделанный ядром в памяти (фаза 71c): файлы
+    /// `/proc` и устройства `/dev` программ Linux.
+    pub fn install_node(&mut self, node: Arc<dyn Node>, writable: bool) -> Result<usize, FileError> {
+        let slot = self.slots.iter().position(Option::is_none).ok_or(FileError::TooManyFiles)?;
+        self.slots[slot] = Some(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None })));
+        Ok(slot + FD_FIRST)
+    }
+
     /// Создать файл с заданными правами и открыть его на запись.
     ///
     /// Отличается от [`Table::open`] с `O_CREATE` двумя вещами, и обе намеренны:

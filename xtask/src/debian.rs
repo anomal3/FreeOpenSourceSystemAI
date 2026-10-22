@@ -39,7 +39,7 @@ use crate::{cbuild, sdk};
 const SNAPSHOT: &str = "https://snapshot.debian.org/archive/debian/20261020T000000Z/";
 
 /// Пакеты: путь в архиве и SHA-256 из `Packages` bookworm того же дня.
-const PACKAGES: [(&str, &str); 11] = [
+const PACKAGES: [(&str, &str); 12] = [
     ("pool/main/g/glibc/libc6_2.36-9+deb12u14_amd64.deb", "ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf"),
     ("pool/main/n/ncurses/libtinfo6_6.4-4_amd64.deb", "072d908f38f51090ca28ca5afa3b46b2957dc61fe35094c0b851426859a49a51"),
     ("pool/main/b/bash/bash_5.2.15-2+b13_amd64.deb", "82130bb6a560cd2a7234d8018baf73f188f5dd56413d5aa0accc987b2197a6a1"),
@@ -51,7 +51,21 @@ const PACKAGES: [(&str, &str); 11] = [
     ("pool/main/g/gmp/libgmp10_6.2.1+dfsg1-1.1_amd64.deb", "187aedef2ed763f425c1e523753b9719677633c7eede660401739e9c893482bd"),
     ("pool/main/b/base-files/base-files_12.4+deb12u15_amd64.deb", "3eb1ea6d85488f488cc2a163b98ad640ef88cee4c79287cf14e361aaf6206f47"),
     ("pool/main/libc/libcap2/libcap2_2.66-4+deb12u3+b1_amd64.deb", "8d684c673e7483802a5c447834b0df6fce006eb3a7109e1be412f5ad425bb24f"),
+    // `libgcc_s.so.1`: glibc подгружает её для `pthread_exit` и отмены потоков
+    // (раскрутка стека) — фаза 71c.
+    ("pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_amd64.deb", "3016e62cb4b7cd8038822870601f5ed131befe942774d0f745622cc77d8a88f7"),
 ];
+
+/// Пакеты только для сборки проверочных программ (фаза 71c): заголовки glibc
+/// и ядра, `crt1.o`, `libc.so`. В систему они не едут — из них и из корня
+/// складывается sysroot, которым clang собирает программу для Linux.
+const DEV_PACKAGES: [(&str, &str); 2] = [
+    ("pool/main/g/glibc/libc6-dev_2.36-9+deb12u14_amd64.deb", "0218fc2befcd784c1b0c6292c0a137ce89fad054efaa579ad083bee0f2c01aae"),
+    ("pool/main/l/linux/linux-libc-dev_6.1.176-1_amd64.deb", "8bb258735b9dffbb111da778ebdd024750878e435ffd9dfcadcb6762ede6b4cf"),
+];
+
+/// Проверочные программы на glibc: исходник в `libc/linux` и путь в корне.
+const CHECKS: [(&str, &str); 1] = [("check.c", "usr/libexec/fossai/linuxcheck")];
 
 /// Что в корень не попадает: справка, документация, переводы — читать их в
 /// системе нечем; модули перекодировок glibc (`gconv`, 250 файлов) нужны
@@ -90,7 +104,41 @@ pub fn build(arch: Arch) -> Result<()> {
     let cache = sdk::root().join("thirdparty/debian");
     fs::create_dir_all(&cache)?;
     let mut root: BTreeMap<String, Node> = BTreeMap::new();
-    for (pool, sha256) in PACKAGES {
+    unpack(&cache, &PACKAGES, &mut root)?;
+
+    // Sysroot для сборки: корень плюс пакеты разработчика — на диск, ссылки
+    // копиями (lld читает `libc.so` — сценарий с абсолютными путями внутри
+    // sysroot).
+    let mut dev: BTreeMap<String, Node> = BTreeMap::new();
+    unpack(&cache, &PACKAGES, &mut dev)?;
+    unpack(&cache, &DEV_PACKAGES, &mut dev)?;
+    let sysroot = sdk::root().join("debian-sysroot");
+    let _ = fs::remove_dir_all(&sysroot);
+    for (path, node) in &dev {
+        let data = match node {
+            Node::Dir => continue,
+            Node::File { data, .. } => data,
+            Node::Link(_) => match follow(&dev, path, 0) {
+                Some((data, _)) => data,
+                None => continue,
+            },
+        };
+        let target = sysroot.join(path);
+        fs::create_dir_all(target.parent().unwrap())?;
+        fs::write(&target, data)?;
+    }
+    say!("debian: sysroot для сборки — {}", sysroot.display());
+    for (source, place) in CHECKS {
+        let program = build_check(&sysroot, source)?;
+        root.insert(String::from(place), Node::File { data: fs::read(&program)?, mode: 0o755 });
+    }
+
+    pack(&root)
+}
+
+/// Скачать (или взять из кеша) пакеты, сверить хеши и разложить в `root`.
+fn unpack(cache: &std::path::Path, packages: &[(&str, &str)], root: &mut BTreeMap<String, Node>) -> Result<()> {
+    for &(pool, sha256) in packages {
         let name = pool.rsplit('/').next().unwrap_or(pool);
         let file = cache.join(name);
         if !file.is_file() || digest(&fs::read(&file)?) != sha256 {
@@ -112,22 +160,55 @@ pub fn build(arch: Arch) -> Result<()> {
             bail!("хеш {name} не тот: приехало {got}, ожидалось {sha256}; файл оставлен: {}", file.display());
         }
         let data = data_tar(&bytes).with_context(|| format!("{name}: не разобран архив .deb"))?;
-        let added = read_tar(&data, &mut root).with_context(|| format!("{name}: не разобран data.tar"))?;
+        let added = read_tar(&data, root).with_context(|| format!("{name}: не разобран data.tar"))?;
         say!("debian: {name} — {added} записей");
     }
+    Ok(())
+}
 
+/// Собрать проверочную программу на glibc clang-ом с sysroot Debian.
+fn build_check(sysroot: &std::path::Path, source: &str) -> Result<PathBuf> {
+    let clang = cbuild::llvm_tool("clang")?;
+    let work = sdk::root().join("linux/glibc");
+    fs::create_dir_all(&work)?;
+    let output = work.join(source.trim_end_matches(".c"));
+    let lib = sysroot.join("usr/lib/x86_64-linux-gnu");
+    let mut cmd = std::process::Command::new(&clang);
+    cmd.arg("--target=x86_64-linux-gnu")
+        .arg(format!("--sysroot={}", sysroot.display()))
+        .args(["-O2", "-Wall", "-Werror", "-fPIE", "-pie", "-fuse-ld=lld", "-nostdlib"])
+        .arg("-Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2")
+        .arg(lib.join("Scrt1.o"))
+        .arg(lib.join("crti.o"))
+        .arg(cbuild::libc_dir().join("linux").join(source))
+        .arg(format!("-L{}", lib.display()))
+        .arg(format!("-L{}", sysroot.join("lib/x86_64-linux-gnu").display()))
+        .arg("-lc")
+        .arg(lib.join("crtn.o"))
+        .arg("-o")
+        .arg(&output);
+    say!("> clang (glibc) {source}");
+    let status = cmd.status().context("не удалось запустить clang")?;
+    if !status.success() {
+        bail!("{source} не собрался ({status})");
+    }
+    Ok(output)
+}
+
+/// Собрать `debian-12.fpk` из корня.
+fn pack(root: &BTreeMap<String, Node>) -> Result<()> {
     let mut builder = Builder::new(Kind::Package, "debian", "12");
     builder.field("summary", "Debian 12 (bookworm) root for Linux programs: glibc, bash, coreutils");
     builder.field("about", "корень для программ Linux из пакетов Debian 12");
     let (mut files, mut bytes, mut links) = (0usize, 0usize, 0usize);
-    for (path, node) in &root {
+    for (path, node) in root {
         if SKIP.iter().any(|skip| path.starts_with(skip)) {
             continue;
         }
         let (data, mode) = match node {
             Node::Dir => continue,
             Node::File { data, mode } => (data.clone(), *mode),
-            Node::Link(_) => match follow(&root, path, 0) {
+            Node::Link(_) => match follow(root, path, 0) {
                 // Ссылка на файл — копия файла. На каталог (их в этих пакетах
                 // нет) или в никуда — пропуск, с именем в журнале.
                 Some((data, mode)) => {

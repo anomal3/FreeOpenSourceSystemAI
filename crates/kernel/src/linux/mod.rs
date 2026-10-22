@@ -27,10 +27,15 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use user_abi::{
-    CLOCK_MONOTONIC, CLOCK_REALTIME, SYS_CLOCK, SYS_CLOSE, SYS_EXIT, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_GETGID,
+    CLOCK_MONOTONIC, CLOCK_REALTIME, SYS_CLOCK, SYS_CLOSE, SYS_FUTEX_WAIT, SYS_FUTEX_WAKE, SYS_GETGID,
     SYS_GETPID, SYS_GETUID, SYS_ISATTY, SYS_MPROTECT, SYS_MUNMAP, SYS_NANOSLEEP, SYS_RANDOM, SYS_READ, SYS_SEEK,
     SYS_SET_TLS, SYS_WRITE, SYS_YIELD,
 };
+
+mod poll;
+mod signal;
+mod special;
+mod thread;
 
 use crate::kprintln;
 use crate::mm::PageFlags;
@@ -114,12 +119,28 @@ mod nr {
     pub const STATFS: usize = 137;
     pub const FSTATFS: usize = 138;
     pub const FACCESSAT2: usize = 439;
+    pub const POLL: usize = 7;
+    pub const RT_SIGRETURN: usize = 15;
+    pub const PIPE: usize = 22;
+    pub const CLONE: usize = 56;
+    pub const GETPRIORITY: usize = 140;
+    pub const SETPRIORITY: usize = 141;
+    pub const SCHED_GETSCHEDULER: usize = 145;
+    pub const PRCTL: usize = 157;
+    pub const TKILL: usize = 200;
+    pub const SCHED_SETAFFINITY: usize = 203;
+    pub const CLOCK_NANOSLEEP: usize = 230;
+    pub const PPOLL: usize = 271;
+    pub const PIPE2: usize = 293;
+    pub const MEMBARRIER: usize = 324;
+    pub const CLONE3: usize = 435;
 }
 
 /// `errno` Linux, которые здесь отдаются.
 mod e {
     pub const EPERM: i64 = 1;
     pub const ENOENT: i64 = 2;
+    pub const EINTR: i64 = 4;
     pub const ECHILD: i64 = 10;
     pub const EISDIR: i64 = 21;
     pub const ERANGE: i64 = 34;
@@ -195,20 +216,46 @@ unsafe fn native(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
 ///
 /// Только из обработчика ловушки, пришедшей из третьего кольца: `exit` не
 /// возвращается.
-pub unsafe fn syscall(number: usize, args: [usize; 6]) -> i64 {
-    let [a0, a1, a2, a3, a4, _a5] = args;
+pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
     match crate::user::with_current(|program| program.linux) {
         Some(true) => {}
         // `syscall` из родной программы: таблицы Linux ей не положено.
-        _ => return -e::ENOSYS,
+        _ => {
+            frame.rax = (-e::ENOSYS) as u64;
+            return;
+        }
     }
+    let number = frame.rax as usize;
+    // `rt_sigreturn` возвращает не ответ, а прерванные регистры целиком.
+    if number == nr::RT_SIGRETURN {
+        signal::sigreturn(frame);
+        return;
+    }
+    let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9].map(|value| value as usize);
+    // SAFETY: контракт функции.
+    let result = unsafe { dispatch(number, args, frame) };
+    frame.rax = result as u64;
+    // Пришедшие сигналы доставляются на выходе из вызова (фаза 71c).
+    signal::deliver(frame);
+}
+
+/// Разобрать вызов по номеру.
+///
+/// # Safety
+///
+/// Как у [`syscall`].
+unsafe fn dispatch(number: usize, args: [usize; 6], frame: &crate::arch::TrapFrame) -> i64 {
+    let [a0, a1, a2, a3, a4, a5] = args;
     // SAFETY (для всех `native` ниже): контракт функции.
     unsafe {
         match number {
             nr::READ => errno(native(SYS_READ, a0, a1, a2)),
             nr::WRITE => errno(native(SYS_WRITE, a0, a1, a2)),
             nr::WRITEV => writev(a0, a1, a2),
-            nr::CLOSE => errno(native(SYS_CLOSE, a0, 0, 0)),
+            nr::CLOSE => {
+                crate::user::with_current(|program| program.linux_dirs.retain(|(fd, _)| *fd != a0));
+                errno(native(SYS_CLOSE, a0, 0, 0))
+            }
             nr::OPEN => open_at(AT_FDCWD, a0, a1),
             nr::OPENAT => open_at(a0, a1, a2),
             nr::STAT | nr::LSTAT => stat_path(AT_FDCWD, a0, a1),
@@ -231,11 +278,6 @@ pub unsafe fn syscall(number: usize, args: [usize; 6]) -> i64 {
             }
             // Детей у программы Linux пока нет (`fork` — фаза 71d).
             nr::WAIT4 => -e::ECHILD,
-            // Сигнал «0» — проверка, жив ли процесс; другие сигналы — 71c.
-            nr::KILL | nr::TGKILL => {
-                let signal = if number == nr::KILL { a1 } else { a2 };
-                if signal == 0 { 0 } else { -e::ENOSYS }
-            }
             nr::UMASK => 0o022,
             nr::GETTIMEOFDAY => gettimeofday(a0),
             nr::TIME => time(a0),
@@ -270,29 +312,50 @@ pub unsafe fn syscall(number: usize, args: [usize; 6]) -> i64 {
             // Сигналов в системе пока нет (фаза 71c): обработчик запоминать
             // некому, и ни один сигнал не придёт. Отказ здесь уронил бы glibc
             // на старте без всякой пользы.
-            nr::RT_SIGACTION | nr::RT_SIGPROCMASK | nr::SIGALTSTACK => 0,
+            nr::RT_SIGACTION => signal::sigaction(a0, a1, a2, a3),
+            nr::RT_SIGPROCMASK => signal::sigprocmask(a0, a1, a2, a3),
+            nr::SIGALTSTACK => signal::sigaltstack(a0, a1),
+            nr::KILL => signal::kill(a0, a1),
+            nr::TKILL => signal::tgkill(0, a0, a1),
+            nr::TGKILL => signal::tgkill(a0, a1, a2),
+            nr::CLONE => thread::clone(frame, a0, a1, a2, a3, a4),
+            nr::CLONE3 => thread::clone3(frame, a0, a1),
+            nr::POLL => poll::poll(a0, a1, a2 as i32 as i64),
+            nr::PPOLL => poll::ppoll(a0, a1, a2),
+            nr::PIPE => poll::pipe(a0, 0),
+            nr::PIPE2 => poll::pipe(a0, a1),
+            nr::PRCTL => thread::prctl(a0, a1),
+            nr::SCHED_SETAFFINITY | nr::SETPRIORITY => 0,
+            nr::GETPRIORITY => 20,
+            nr::SCHED_GETSCHEDULER => 0,
+            nr::CLOCK_NANOSLEEP => clock_nanosleep(a0, a1, a2),
+            nr::MEMBARRIER => -e::ENOSYS,
             nr::IOCTL => ioctl(a0, a1, a2),
             nr::SCHED_YIELD => errno(native(SYS_YIELD, 0, 0, 0)),
             // Совет о памяти или о чтении файла — совет: не принять его можно
             // всегда.
             nr::MADVISE | nr::FADVISE64 => 0,
             nr::NANOSLEEP => nanosleep(a0),
-            nr::GETPID | nr::GETTID => errno(native(SYS_GETPID, 0, 0, 0)),
+            nr::GETPID => crate::user::with_current(|program| program.linux_pid).unwrap_or(1) as i64,
+            nr::GETTID => errno(native(SYS_GETPID, 0, 0, 0)),
             nr::GETPPID => 1,
             nr::GETUID | nr::GETEUID => errno(native(SYS_GETUID, 0, 0, 0)),
             nr::GETGID | nr::GETEGID => errno(native(SYS_GETGID, 0, 0, 0)),
             nr::UNAME => uname(a0),
             nr::ARCH_PRCTL => arch_prctl(a0, a1),
-            nr::FUTEX => futex(a0, a1, a2, a3),
+            nr::FUTEX => futex(a0, a1, a2, a3, a4, a5),
             nr::SCHED_GETAFFINITY => affinity(a1, a2),
-            // Поток один (фаза 71c добавит `clone`): адрес очистки при выходе
-            // потока помнить незачем, ответ — номер потока.
-            nr::SET_TID_ADDRESS => errno(native(SYS_GETPID, 0, 0, 0)),
+            // Адрес, который ядро обнулит при выходе потока (фаза 71c).
+            nr::SET_TID_ADDRESS => {
+                crate::user::LINUX_CLEAR_TID[crate::sched::current_slot()].store(a0, core::sync::atomic::Ordering::Relaxed);
+                errno(native(SYS_GETPID, 0, 0, 0))
+            }
             nr::SET_ROBUST_LIST => 0,
             nr::CLOCK_GETTIME => clock_gettime(a0, a1),
             nr::PRLIMIT64 => prlimit(a1, a2, a3),
             nr::GETRANDOM => errno(native(SYS_RANDOM, a0, a1, 0)),
-            nr::EXIT | nr::EXIT_GROUP => native(SYS_EXIT, a0, 0, 0),
+            nr::EXIT => thread::exit(a0),
+            nr::EXIT_GROUP => thread::exit_group(a0),
             // `rseq` — оптимизация glibc; `ENOSYS` она понимает и обходится без.
             nr::RSEQ => -e::ENOSYS,
             _ => unknown(number),
@@ -378,21 +441,22 @@ fn linux_path(dir: usize, ptr: usize) -> Result<String, i64> {
     if path.starts_with('/') {
         return Ok(normalize(&path));
     }
-    if dir != AT_FDCWD {
-        return Err(-e::ENOTDIR);
-    }
-    let cwd = crate::user::with_current(|program| program.linux_cwd.clone()).unwrap_or_else(|| String::from("/"));
-    let mut joined = cwd;
+    // От дескриптора каталога — по пути, под которым каталог открыт (фаза
+    // 71c); от текущего — по текущему каталогу.
+    let base = if dir == AT_FDCWD {
+        crate::user::with_current(|program| program.linux_cwd.clone()).unwrap_or_else(|| String::from("/"))
+    } else {
+        match crate::user::with_current(|program| {
+            program.linux_dirs.iter().find(|(fd, _)| *fd == dir).map(|(_, path)| path.clone())
+        }) {
+            Some(Some(path)) => path,
+            _ => return Err(-e::ENOTDIR),
+        }
+    };
+    let mut joined = base;
     joined.push('/');
     joined.push_str(&path);
     Ok(normalize(&joined))
-}
-
-/// Тот же путь — в системе: корень Debian перекрывает системный
-/// ([`crate::linux_path`]).
-fn system_path(dir: usize, ptr: usize) -> Result<String, i64> {
-    let path = linux_path(dir, ptr)?;
-    Ok(crate::linux_path::resolve(&path, crate::user::credentials()))
 }
 
 fn file_errno(err: crate::user::files::FileError) -> i64 {
@@ -410,10 +474,24 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     const O_EXCL: usize = 0o200;
     const O_TRUNC: usize = 0o1000;
     const O_DIRECTORY: usize = 0o200_000;
-    let path = match system_path(dir, ptr) {
+    let linux = match linux_path(dir, ptr) {
         Ok(path) => path,
         Err(err) => return err,
     };
+    if let Some((node, writable)) = special::node(&linux) {
+        return match crate::user::with_current(|program| program.files.install_node(node, writable)) {
+            Some(Ok(fd)) => fd as i64,
+            Some(Err(err)) => file_errno(err),
+            None => -e::ESRCH,
+        };
+    }
+    // `/proc/self/exe` — файл самой программы.
+    let linux = if linux == "/proc/self/exe" {
+        crate::user::with_current(|program| String::from(crate::linux_path::shown(&program.path))).unwrap_or(linux)
+    } else {
+        linux
+    };
+    let path = crate::linux_path::resolve(&linux, crate::user::credentials());
     let cred = crate::user::credentials();
     if flags & O_CREAT != 0 && flags & O_EXCL != 0 && matches!(crate::fs::resolve_as(cred, &path, Access::NONE), Some(Ok(_))) {
         return -e::EEXIST;
@@ -433,12 +511,17 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
         Some(Err(err)) => return file_errno(err),
         None => return -e::ESRCH,
     };
-    if flags & O_DIRECTORY != 0 {
-        let kind = crate::user::with_current(|program| program.files.describe(fd).map(|info| info.kind));
-        if !matches!(kind, Some(Ok(FdKind::Directory))) {
-            crate::user::with_current(|program| program.files.close(fd));
-            return -e::ENOTDIR;
-        }
+    let kind = crate::user::with_current(|program| program.files.describe(fd).map(|info| info.kind));
+    let directory = matches!(kind, Some(Ok(FdKind::Directory)));
+    if flags & O_DIRECTORY != 0 && !directory {
+        crate::user::with_current(|program| program.files.close(fd));
+        return -e::ENOTDIR;
+    }
+    if directory {
+        crate::user::with_current(|program| {
+            program.linux_dirs.retain(|(other, _)| *other != fd);
+            program.linux_dirs.push((fd, linux));
+        });
     }
     fd as i64
 }
@@ -512,10 +595,18 @@ fn ino_of(path: &str) -> u64 {
 }
 
 fn stat_path(dir: usize, ptr: usize, out: usize) -> i64 {
-    let path = match system_path(dir, ptr) {
+    let linux = match linux_path(dir, ptr) {
         Ok(path) => path,
         Err(err) => return err,
     };
+    if special::exists(&linux) {
+        let kind = if linux.starts_with("/dev/") { S_IFCHR } else { S_IFREG };
+        return put_stat(out, kind, 0o666, 0, 0, 0, 0, ino_of(&linux));
+    }
+    if matches!(linux.as_str(), "/proc" | "/proc/self" | "/dev" | "/sys") {
+        return put_stat(out, S_IFDIR, 0o555, 0, 0, 0, 0, ino_of(&linux));
+    }
+    let path = crate::linux_path::resolve(&linux, crate::user::credentials());
     let node = match crate::fs::resolve_as(crate::user::credentials(), &path, Access::NONE) {
         Some(Ok(node)) => node,
         Some(Err(err)) => return vfs_errno(err),
@@ -595,10 +686,14 @@ fn pread(fd: usize, buf: usize, count: usize, offset: usize) -> i64 {
 /// `access(path, mode)`: `F_OK` — есть ли путь; `R_OK`, `W_OK`, `X_OK` —
 /// по праву каждое.
 fn access(dir: usize, ptr: usize, mode: usize) -> i64 {
-    let path = match system_path(dir, ptr) {
+    let linux = match linux_path(dir, ptr) {
         Ok(path) => path,
         Err(err) => return err,
     };
+    if special::exists(&linux) {
+        return 0;
+    }
+    let path = crate::linux_path::resolve(&linux, crate::user::credentials());
     let cred = crate::user::credentials();
     let mut wants = [Access::NONE; 4];
     let mut count = 1;
@@ -982,14 +1077,28 @@ unsafe fn arch_prctl(code: usize, addr: usize) -> i64 {
     }
 }
 
-/// `futex`: ожидание и пробуждение — то, на чём стоят замки glibc.
-unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize) -> i64 {
+/// `futex`: ожидание и пробуждение — то, на чём стоят замки, условные
+/// переменные и `pthread_join` glibc.
+///
+/// `WAIT_BITSET` и `WAKE_BITSET` — как `WAIT` и `WAKE` без маски: лишнее
+/// пробуждение законно, код вокруг `futex` перепроверяет условие сам. Срок
+/// `WAIT_BITSET` — **абсолютный** (по монотонным часам или, с
+/// `FUTEX_CLOCK_REALTIME`, по времени суток). `REQUEUE` и `CMP_REQUEUE`
+/// будят и тех, кого просили переложить: перекладывать очередь ядро не умеет,
+/// а разбуженный перепроверит и уснёт снова.
+unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usize, value3: usize) -> i64 {
     const FUTEX_WAIT: usize = 0;
     const FUTEX_WAKE: usize = 1;
+    const FUTEX_REQUEUE: usize = 3;
+    const FUTEX_CMP_REQUEUE: usize = 4;
+    const FUTEX_WAKE_OP: usize = 5;
+    const FUTEX_WAIT_BITSET: usize = 9;
+    const FUTEX_WAKE_BITSET: usize = 10;
     const FUTEX_PRIVATE: usize = 128;
     const FUTEX_CLOCK_REALTIME: usize = 256;
-    match op & !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME) {
-        FUTEX_WAIT => {
+    let command = op & !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
+    match command {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             // Срок Linux — `timespec`; родной — миллисекунды, ноль — без срока.
             let ms = if timeout == 0 {
                 0
@@ -999,7 +1108,22 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize) -> i64 {
                 }
                 // SAFETY: проверено строкой выше.
                 let [seconds, nanos] = unsafe { core::ptr::read_unaligned(timeout as *const [u64; 2]) };
-                (seconds.saturating_mul(1000).saturating_add(nanos.div_ceil(1_000_000))).max(1) as usize
+                let wanted = u128::from(seconds) * 1_000_000_000 + u128::from(nanos);
+                let left = if command == FUTEX_WAIT_BITSET {
+                    let now = if op & FUTEX_CLOCK_REALTIME != 0 {
+                        u128::from(crate::time::now_unix().unwrap_or(0)) * 1_000_000_000
+                            + u128::from(crate::time::uptime_ns() % 1_000_000_000)
+                    } else {
+                        u128::from(crate::time::uptime_ns())
+                    };
+                    if wanted <= now {
+                        return -e::ETIMEDOUT;
+                    }
+                    wanted - now
+                } else {
+                    wanted
+                };
+                (left.div_ceil(1_000_000) as usize).max(1)
             };
             // SAFETY: контракт `syscall`.
             let code = unsafe { native(SYS_FUTEX_WAIT, addr, value, ms) };
@@ -1012,9 +1136,60 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize) -> i64 {
             }
         }
         // SAFETY: контракт `syscall`.
-        FUTEX_WAKE => errno(unsafe { native(SYS_FUTEX_WAKE, addr, value, 0) }),
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => errno(unsafe { native(SYS_FUTEX_WAKE, addr, value, 0) }),
+        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            if command == FUTEX_CMP_REQUEUE {
+                if !space::user_can(addr, 4, PageFlags::READ) {
+                    return -e::EFAULT;
+                }
+                // SAFETY: проверено строкой выше.
+                if unsafe { core::ptr::read_volatile(addr as *const u32) } as usize != value3 {
+                    return -e::EAGAIN;
+                }
+            }
+            // SAFETY: контракт `syscall`.
+            let woken = unsafe { native(SYS_FUTEX_WAKE, addr, usize::MAX, 0) };
+            // SAFETY: контракт `syscall`.
+            let moved = unsafe { native(SYS_FUTEX_WAKE, addr2, usize::MAX, 0) };
+            errno(woken.max(0) + moved.max(0))
+        }
+        FUTEX_WAKE_OP => {
+            // `*addr2 = op(*addr2)`, разбудить на `addr` и — если сравнение
+            // сошлось — на `addr2`. Здесь будятся оба: лишнее пробуждение законно.
+            let _ = (timeout, value3);
+            // SAFETY: контракт `syscall`.
+            let woken = unsafe { native(SYS_FUTEX_WAKE, addr, value, 0) };
+            // SAFETY: контракт `syscall`.
+            let other = unsafe { native(SYS_FUTEX_WAKE, addr2, usize::MAX, 0) };
+            errno(woken.max(0) + other.max(0))
+        }
         _ => -e::ENOSYS,
     }
+}
+
+/// `clock_nanosleep(clock, flags, req)`: `TIMER_ABSTIME` — срок абсолютный.
+unsafe fn clock_nanosleep(clock: usize, flags: usize, req: usize) -> i64 {
+    const TIMER_ABSTIME: usize = 1;
+    if !space::user_can(req, 16, PageFlags::READ) {
+        return -e::EFAULT;
+    }
+    // SAFETY: проверено строкой выше.
+    let [seconds, nanos] = unsafe { core::ptr::read_unaligned(req as *const [u64; 2]) };
+    let (mut seconds, mut nanos) = (seconds, nanos);
+    if flags & TIMER_ABSTIME != 0 {
+        let wanted = u128::from(seconds) * 1_000_000_000 + u128::from(nanos);
+        let now = if clock == CLOCK_REALTIME {
+            u128::from(crate::time::now_unix().unwrap_or(0)) * 1_000_000_000
+                + u128::from(crate::time::uptime_ns() % 1_000_000_000)
+        } else {
+            u128::from(crate::time::uptime_ns())
+        };
+        let left = wanted.saturating_sub(now);
+        seconds = (left / 1_000_000_000) as u64;
+        nanos = (left % 1_000_000_000) as u64;
+    }
+    // SAFETY: контракт `syscall`.
+    errno(unsafe { native(SYS_NANOSLEEP, seconds as usize, nanos as usize, 0) })
 }
 
 /// `sched_getaffinity`: маска из всех процессоров машины.

@@ -9909,12 +9909,64 @@ Debian), `bash --version` («GNU bash, version 5.2.15(1)-release»), все с
 кодом 0. `linux`, `cmem`, `mmap`, `filemap`, `userspace`, `installed`, `llama`
 — зелёные.
 
-### Дальше — 71c
+## Фаза 71c — потоки, сигналы, /proc и /dev для программ Linux — **сделано 2026-10-22**
 
-Потоки (`clone` с `CLONE_VM|CLONE_THREAD`, `futex` целиком, `set_tid_address`
-с очисткой), сигналы (доставка, `rt_sigreturn`, `sigaltstack`), `/proc/self`,
-`/dev/null|zero|urandom`, дескриптор каталога в `*at`, `poll` — то, без чего
-не живут `bash` в диалоге и многопоточные программы.
+### Что стало
+
+- **Потоки**: `clone` и `clone3` с `CLONE_VM|CLONE_THREAD` — новый поток
+  продолжает с той же инструкции и с регистрами родителя (RAX = 0, свой
+  стек, свой FS при `CLONE_SETTLS`): на этом стоят обёртки glibc. Вход —
+  `arch::enter_user_regs` (кадр копируется на стек ядра и уходит эпилогом
+  `isr_common`). `CLONE_PARENT_SETTID`/`CHILD_SETTID`; `CLONE_CHILD_CLEARTID`
+  и `set_tid_address` — при выходе потока ядро обнуляет адрес и будит
+  ждущих: так `pthread_join` узнаёт конец. `getpid` у потоков общий, `gettid`
+  свой; `exit` — конец потока, `exit_group` из любого — конец процесса с
+  кодом. `prctl` (имя, флаги) — принимается.
+- **futex**: `WAIT_BITSET`/`WAKE_BITSET` (маска не различается — лишнее
+  пробуждение законно), абсолютный срок по монотонным часам или времени
+  суток, `REQUEUE`/`CMP_REQUEUE`/`WAKE_OP` — будят всех, кого касаются.
+  `clock_nanosleep` с `TIMER_ABSTIME`.
+- **Сигналы**: `rt_sigaction` (на процесс), маски `rt_sigprocmask` и
+  `sigaltstack` (на поток), `kill`/`tkill`/`tgkill` — себе и соседнему потоку
+  (его будят). Доставка — на выходе из системного вызова: кадр `rt_sigframe`
+  x86-64 (адрес `sa_restorer`, `ucontext` с регистрами и маской, `siginfo`) на
+  стеке или запасном стеке, вход в обработчик; `rt_sigreturn` возвращает
+  регистры и маску. FPU в кадр не кладётся: доставка только с границы
+  системного вызова, а через неё векторные регистры не живут. Без
+  обработчика — действие по умолчанию (конец с кодом 128 + сигнал или
+  пропуск для `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`).
+- **Особые файлы** (`linux::special`): `/dev/null`, `/dev/zero`,
+  `/dev/urandom`; `/proc/self/maps` (со строкой `[stack]` — по ней glibc
+  находит границы стека главного потока), `status`, `stat`, `cmdline`, `comm`,
+  `/proc/cpuinfo` (флаги по CPUID), `/proc/meminfo`, `/proc/version`,
+  `/sys/devices/system/cpu/online` (по нему `sysconf(_SC_NPROCESSORS_ONLN)`).
+  Узлы в памяти кладёт в таблицу дескрипторов `Table::install_node`.
+- **`poll`, `ppoll`** — по той же готовности, что у родного `poll`; сигнал
+  прерывает ожидание (`EINTR`). **`pipe`, `pipe2`** — канал Linux ждущий.
+- **Пути `*at` от дескриптора каталога**: путь открытого каталога
+  запоминается (`Program::linux_dirs`). `open("/proc/self/exe")` — файл
+  программы.
+- **Проверочная программа на glibc** `libc/linux/check.c` — собирается clang
+  с sysroot из пакетов Debian `libc6-dev` и `linux-libc-dev` (на диске
+  `build/toolchain/debian-sysroot`, в систему не едет) и кладётся в
+  `debian-12.fpk` как `/usr/libexec/fossai/linuxcheck`; в корень добавлен
+  `libgcc-s1` (раскрутка для `pthread_exit`).
+
+### Проверено
+
+`linux-debian`: `linuxcheck` — 14 из 14 (четыре потока с замком, `__thread` и
+значение `pthread_join`, `pthread_cond_timedwait` по монотонным часам,
+`sysconf`, границы стека по `/proc/self/maps`, `raise` с обработчиком и
+`siginfo`, заблокированный сигнал до снятия блокировки, `pthread_kill`
+соседнему потоку, устройства, `/proc`, канал с `poll`, `openat`/`fstatat` от
+дескриптора каталога, `chdir`/`getcwd`, `malloc` 64 МиБ). `linux`, `cthreads`,
+`userspace`, `mmap`, `installed`, `llama` — зелёные.
+
+### Дальше — 71d
+
+Процессы: `fork` с копированием при записи, `vfork`/`posix_spawn`,
+`execve`, `wait4`, `SIGCHLD` — то, без чего `bash` не запускает команды, а
+Chromium — свои процессы.
 
 # Полный прогон 17.10 — 407 из 428, один дефект установщика
 

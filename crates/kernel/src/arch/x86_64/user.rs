@@ -122,6 +122,55 @@ global_asm!(
     "xor ecx, ecx",
     "iretq",
 
+    // --- вход в программу с полным набором регистров (фаза 71c) ---
+    //
+    // rdi — указатель на кадр в раскладке `TrapFrame` (тот, что сложил вход
+    // `syscall` родителя). Как `x86_enter_user`: шесть регистров ядра — на
+    // стек, вершина — планировщику; дальше кадр копируется на стек ядра и
+    // уходит тем же эпилогом, что у `isr_common`: пятнадцать `pop` и `iretq`.
+    ".balign 16",
+    ".globl x86_enter_user_regs",
+    ".hidden x86_enter_user_regs",
+    "x86_enter_user_regs:",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov r12, rdi",
+    "mov rdi, rsp",
+    "sub rsp, 8",
+    "call {remember}",
+    "add rsp, 8",
+    // 22 слова кадра: 15 регистров, «вектор», код ошибки и пять слов `iretq`.
+    "sub rsp, 176",
+    "mov rsi, r12",
+    "mov rdi, rsp",
+    "mov rcx, 22",
+    "cld",
+    "rep movsq",
+    "mov ax, {user_ss}",
+    "mov ds, ax",
+    "mov es, ax",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "add rsp, 16",
+    "iretq",
+
     ".balign 16",
     ".globl x86_return_to_kernel",
     ".hidden x86_return_to_kernel",
@@ -156,6 +205,19 @@ global_asm!(
 unsafe extern "C" {
     fn x86_enter_user(entry: usize, stack: usize, argc: usize, argv: usize, linux: usize) -> i64;
     fn x86_return_to_kernel(code: i64) -> !;
+    fn x86_enter_user_regs(regs: *const super::interrupts::TrapFrame) -> i64;
+}
+
+/// Войти в программу с регистрами из кадра `regs` (фаза 71c: поток Linux
+/// после `clone` продолжает с родительскими регистрами).
+///
+/// # Safety
+///
+/// Кадр — из третьего кольца: селекторы пользовательские, RIP и RSP — адреса
+/// программы, флаги с разрешёнными прерываниями.
+pub unsafe fn enter_user_regs(regs: &super::interrupts::TrapFrame) -> i64 {
+    // SAFETY: контракт функции.
+    unsafe { x86_enter_user_regs(regs) }
 }
 
 /// Уйти в третье кольцо и вернуться с кодом, который программа передала в

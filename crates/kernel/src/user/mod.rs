@@ -75,7 +75,7 @@ pub mod syscall;
 use core::fmt::Write as _;
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use alloc::vec::Vec;
 
 use crate::mm::{FrameAllocator, HUGE_PAGE_FRAMES, HUGE_PAGE_SIZE, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
@@ -728,7 +728,7 @@ pub struct Program {
     /// задаче и о состоянии этой не знает ничего. Разбирает флаг [`check_kill`]
     /// — на границе возврата в третье кольцо, где заведомо нет ни удерживаемого
     /// лока, ни половины начатой работы.
-    kill_requested: bool,
+    pub kill_requested: bool,
     /// Главный поток вышел, и остальные потоки снимаются вместе с процессом
     /// (фаза 60): по POSIX конец `main` — конец процесса. Снимает их тот же
     /// [`check_kill`] — `kill_requested` при этом тоже поднят, — а признак
@@ -805,6 +805,31 @@ pub struct Program {
     /// Текущий каталог программы Linux (фаза 71b) — так, как его видит она;
     /// у родных программ текущий каталог держит libc.
     pub linux_cwd: alloc::string::String,
+    /// Номер процесса Linux (фаза 71c) — задачи главного потока: `getpid` у
+    /// всех потоков один, `gettid` — свой.
+    pub linux_pid: u32,
+    /// Пути открытых каталогов — так, как их видит программа Linux: на них
+    /// опираются пути `*at` от дескриптора (фаза 71c).
+    pub linux_dirs: Vec<(usize, alloc::string::String)>,
+    /// Обработчики сигналов (`rt_sigaction`): адрес, флаги, `sa_restorer`,
+    /// маска — по номеру сигнала, общие у всех потоков (фаза 71c).
+    pub linux_actions: [crate::user::LinuxAction; 65],
+    /// `exit_group` из потока, а не из главного (фаза 71c): процесс кончается
+    /// с этим кодом.
+    pub linux_exit: Option<i64>,
+    /// Стек главного потока `[низ, верх)` — строка `[stack]` в
+    /// `/proc/self/maps`: по ней glibc узнаёт границы стека главного потока
+    /// (`pthread_getattr_np`).
+    pub linux_stack: (usize, usize),
+}
+
+/// Обработчик сигнала программы Linux (фаза 71c).
+#[derive(Clone, Copy, Default)]
+pub struct LinuxAction {
+    pub handler: usize,
+    pub flags: usize,
+    pub restorer: usize,
+    pub mask: u64,
 }
 
 impl Drop for Program {
@@ -3350,6 +3375,11 @@ fn run(
             linux: loaded.linux.is_some(),
             brk: (0, 0, 0),
             linux_cwd: alloc::string::String::from("/"),
+            linux_pid: sched::current().as_u32(),
+            linux_dirs: Vec::new(),
+            linux_actions: [LinuxAction::default(); 65],
+            linux_exit: None,
+            linux_stack: (layout.stack_top - MAIN_STACK_PAGES * PAGE_SIZE, layout.stack_top),
         })));
     }
     // Признак поднимается после того, как процесс попал в таблицу: обработчик
@@ -3697,6 +3727,177 @@ impl core::fmt::Display for ThreadError {
             Self::NoMemory => f.write_str("no room for the thread stack"),
             Self::TooManyTasks => f.write_str("the task table is full"),
         }
+    }
+}
+
+/// Адрес, который ядро обнулит и по которому разбудит ждущих, когда поток
+/// Linux кончится (`CLONE_CHILD_CLEARTID`, `set_tid_address`, фаза 71c): так
+/// `pthread_join` glibc узнаёт, что поток вышел. По слоту задачи.
+pub static LINUX_CLEAR_TID: [AtomicUsize; sched::MAX_TASKS] = [const { AtomicUsize::new(0) }; sched::MAX_TASKS];
+
+/// Маска заблокированных сигналов потока Linux и пришедшие к нему (фаза 71c).
+pub static LINUX_SIGMASK: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(0) }; sched::MAX_TASKS];
+pub static LINUX_PENDING: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(0) }; sched::MAX_TASKS];
+/// Запасной стек сигналов потока Linux (`sigaltstack`): начало и размер.
+pub static LINUX_ALTSTACK: [(AtomicUsize, AtomicUsize); sched::MAX_TASKS] =
+    [const { (AtomicUsize::new(0), AtomicUsize::new(0)) }; sched::MAX_TASKS];
+
+/// Что новая задача должна знать о потоке Linux (`clone`, фаза 71c).
+#[cfg(target_arch = "x86_64")]
+struct LinuxThreadStart {
+    process: Arc<Mutex<Program>>,
+    /// Регистры, с которыми поток войдёт в программу: родительские в момент
+    /// `clone`, с нулём в RAX и своим стеком.
+    regs: arch::TrapFrame,
+    /// База TLS (FS) потока.
+    tls: u64,
+    clear_tid: usize,
+}
+
+/// Завести поток программы Linux (`clone` с `CLONE_VM|CLONE_THREAD`): он
+/// продолжит с той же инструкции и с теми же регистрами, что родитель, — на
+/// этом стоят обёртки `clone`/`clone3` glibc. Стек дал сам процесс.
+#[cfg(target_arch = "x86_64")]
+pub fn spawn_linux_thread(regs: arch::TrapFrame, tls: u64, clear_tid: usize) -> Result<sched::TaskId, ThreadError> {
+    let process = current_process().ok_or(ThreadError::NoProgram)?;
+    let mask = LINUX_SIGMASK[sched::current_slot()].load(Ordering::Relaxed);
+    let start = alloc::boxed::Box::new(LinuxThreadStart { process, regs, tls, clear_tid });
+    let raw = alloc::boxed::Box::into_raw(start);
+    match sched::spawn_raw("thread", PROGRAM_STACK_SIZE, linux_thread_entry, raw as usize) {
+        Ok(id) => {
+            // Маска сигналов наследуется (как у Linux). Слот нового потока
+            // известен только по номеру; пишем до того, как он войдёт в
+            // программу, — он ещё ждёт у планировщика или в начале батута.
+            if let Some((slot, _)) = sched::lookup(id) {
+                LINUX_SIGMASK[slot].store(mask, Ordering::Relaxed);
+                LINUX_PENDING[slot].store(0, Ordering::Relaxed);
+            }
+            Ok(id)
+        }
+        Err(err) => {
+            // SAFETY: указатель получен из `Box::into_raw` строкой выше.
+            drop(unsafe { alloc::boxed::Box::from_raw(raw) });
+            Err(match err {
+                sched::SpawnError::OutOfMemory => ThreadError::NoMemory,
+                sched::SpawnError::TooManyTasks => ThreadError::TooManyTasks,
+            })
+        }
+    }
+}
+
+/// Точка входа задачи потока Linux. Как [`thread_entry`], но стек — не свой
+/// (его выдал процесс, им он и распоряжается), а при выходе ядро обнуляет
+/// `clear_tid` и будит ждущих на нём.
+#[cfg(target_arch = "x86_64")]
+extern "C" fn linux_thread_entry(arg: usize) -> ! {
+    arch::interrupts::enable();
+    // SAFETY: указатель выделен в `spawn_linux_thread` и передан ровно один раз.
+    let start = unsafe { alloc::boxed::Box::from_raw(arg as *mut LinuxThreadStart) };
+    let slot = sched::current_slot();
+    let root = start.process.lock().space.root();
+    {
+        let mut table = PROGRAMS.lock();
+        if let Some(entry) = table.get_mut(slot) {
+            *entry = Some(Arc::clone(&start.process));
+        }
+    }
+    LINUX_CLEAR_TID[slot].store(start.clear_tid, Ordering::Relaxed);
+    LINUX_ALTSTACK[slot].0.store(0, Ordering::Relaxed);
+    LINUX_ALTSTACK[slot].1.store(0, Ordering::Relaxed);
+    // Границы стека ядро не знает — их знает glibc; хватит вершины.
+    set_stack(slot, start.regs.rsp as usize, start.regs.rsp as usize);
+    IN_USER[slot].store(true, Ordering::Release);
+    kprintln!("  thread      : {} (Linux) runs at {:#018x}", sched::current(), start.regs.rip);
+    sched::set_current_tls(start.tls);
+    sched::set_current_space(Some(root));
+    // SAFETY: корень принадлежит живому процессу — ссылка на него у нас.
+    unsafe { arch::activate_space(root) };
+
+    // SAFETY: регистры — родительские из кадра `syscall` третьего кольца,
+    // селекторы в них пользовательские; стек дала программа.
+    let code = unsafe { arch::enter_user_regs(&start.regs) };
+
+    // Поток кончился: обнулить `clear_tid` и разбудить ждущего `pthread_join`.
+    // Пространство ещё активно — мы на его таблицах.
+    let clear = LINUX_CLEAR_TID[slot].swap(0, Ordering::Relaxed);
+    if clear != 0 && space::user_can(clear, 4, PageFlags::WRITE) {
+        // SAFETY: адрес проверен на запись в пространстве этого процесса.
+        unsafe { core::ptr::write_volatile(clear as *mut u32, 0) };
+        let _ = syscall::futex_wake_at(clear, 1);
+    }
+    IN_USER[slot].store(false, Ordering::Release);
+    sched::set_current_space(None);
+    // SAFETY: таблицы ядра активированы при запуске системы.
+    unsafe { arch::activate_kernel_space() };
+    {
+        let mut table = PROGRAMS.lock();
+        if let Some(entry) = table.get_mut(slot) {
+            *entry = None;
+        }
+    }
+    kprintln!("  thread      : {} (Linux) finished with code {code}", sched::current());
+    drop(start);
+    sched::exit_current_with(code)
+}
+
+/// Принадлежит ли задача слота `slot` тому же процессу, что текущая
+/// (`tgkill` соседнему потоку, фаза 71c).
+pub fn same_process(slot: usize) -> bool {
+    let Some(process) = current_process() else {
+        return false;
+    };
+    let table = PROGRAMS.lock();
+    table.get(slot).and_then(Option::as_ref).is_some_and(|other| Arc::ptr_eq(other, &process))
+}
+
+/// `/proc/self/maps` программы Linux (фаза 71c): области по возрастанию, с
+/// правами и путём файла, стек главного потока — `[stack]`.
+impl Program {
+    /// От чьего имени исполняется программа.
+    pub fn credentials(&self) -> Credentials {
+        self.cred
+    }
+
+    pub fn linux_maps(&self) -> alloc::string::String {
+        use core::fmt::Write;
+        let mut out = alloc::string::String::new();
+        let exe = crate::linux_path::shown(&self.path);
+        let (stack_low, stack_high) = self.linux_stack;
+        let mut stack_done = false;
+        for region in &self.mappings {
+            // Стек главного потока — одной строкой: ленивая часть записана
+            // областью, жадная — нет.
+            if region.base >= stack_low && region.end() <= stack_high {
+                continue;
+            }
+            if !stack_done && region.base >= stack_high {
+                let _ = writeln!(out, "{stack_low:x}-{stack_high:x} rw-p 00000000 00:00 0 [stack]");
+                stack_done = true;
+            }
+            let (flags, name, offset) = match &region.source {
+                Source::Anonymous(anon) => (anon.flags, "", 0),
+                Source::ThreadStack => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, "", 0),
+                Source::Image(image) => (image.flags, exe, image.offset),
+                Source::File(file) => (PageFlags::READ | PageFlags::USER, "", file.offset),
+                _ => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, "", 0),
+            };
+            let user = flags.contains(PageFlags::USER);
+            let _ = writeln!(
+                out,
+                "{:x}-{:x} {}{}{}p {:08x} 00:00 0 {}",
+                region.base,
+                region.end(),
+                if user { 'r' } else { '-' },
+                if user && flags.contains(PageFlags::WRITE) { 'w' } else { '-' },
+                if user && flags.contains(PageFlags::EXEC) { 'x' } else { '-' },
+                offset,
+                name
+            );
+        }
+        if !stack_done {
+            let _ = writeln!(out, "{stack_low:x}-{stack_high:x} rw-p 00000000 00:00 0 [stack]");
+        }
+        out
     }
 }
 
@@ -4292,11 +4493,20 @@ pub unsafe fn check_kill() {
     if !is_running() {
         return;
     }
-    let Some((kill, ending)) = with_current(|program| (program.kill_requested, program.ending)) else {
+    let Some((kill, ending, linux_exit)) =
+        with_current(|program| (program.kill_requested, program.ending, program.linux_exit))
+    else {
         return;
     };
     if !kill {
         return;
+    }
+    // `exit_group` программы Linux из потока (фаза 71c): процесс кончается с
+    // её кодом, а не как снятый.
+    if let Some(code) = linux_exit {
+        IN_USER[sched::current_slot()].store(false, Ordering::Release);
+        // SAFETY: см. ниже.
+        unsafe { arch::return_to_kernel(code) }
     }
 
     if ending {

@@ -88,7 +88,9 @@ pub use aarch64::build_kernel_address_space;
 /// переменной арх-слоя, а на двух процессорах такая переменная одна на двух
 /// исполняющих программы.
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::user::{enter_linux_user, enter_user, return_to_kernel};
+pub use x86_64::user::{enter_linux_user, enter_user, enter_user_regs, return_to_kernel};
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::interrupts::TrapFrame;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::user::{enter_user, return_to_kernel};
 
