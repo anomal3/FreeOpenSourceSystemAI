@@ -1148,6 +1148,30 @@ pub fn translate(root: PhysAddr, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)
     Some((PhysAddr::new(leaf & DESC_ADDR_MASK), leaf_flags(leaf)))
 }
 
+/// Сколько страниц подряд, начиная с `virt`, заведомо не отображено (фаза
+/// 70e): до следующей границы того уровня, на котором дерево обрывается.
+/// Единица — когда сказать больше нельзя (см. x86-64).
+pub fn unmapped_run(root: PhysAddr, virt: VirtAddr) -> usize {
+    let mut table = root;
+    let mut level = ROOT_LEVEL;
+    while level > LEAF_LEVEL {
+        // SAFETY: на первой итерации это корень переданного дерева, дальше —
+        // адрес из его же записи; таблицы видны через прямое отображение.
+        let desc = unsafe { ptr::read_volatile(table_entry(table, virt.table_index(level))) };
+        if desc & DESC_VALID == 0 {
+            let span = 1usize << (9 * (level - LEAF_LEVEL));
+            let page = virt.as_usize() / PAGE_SIZE;
+            return span - page % span;
+        }
+        if desc & DESC_TABLE == 0 {
+            return 1;
+        }
+        table = PhysAddr::new(desc & DESC_ADDR_MASK);
+        level -= 1;
+    }
+    1
+}
+
 /// Снять отображение одной страницы и вернуть кадр, который под ней лежал.
 ///
 /// `None` означает «страница и так не отображена» — то есть работа уже сделана,

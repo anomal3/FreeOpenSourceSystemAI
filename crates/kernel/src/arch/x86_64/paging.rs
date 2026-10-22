@@ -694,6 +694,32 @@ pub fn translate(root: PhysAddr, virt: VirtAddr) -> Option<(PhysAddr, PageFlags)
     Some((leaf.addr(), leaf_flags(leaf.0)))
 }
 
+/// Сколько страниц подряд, начиная с `virt`, заведомо не отображено (фаза
+/// 70e): до следующей границы того уровня, на котором дерево обрывается.
+///
+/// Нужна снятию большой ленивой области: у восьми гибибайт, из которых
+/// тронуты две страницы, обход по одной странице — два миллиона спусков по
+/// таблицам ради «ничего нет». Единица — когда сказать больше нельзя
+/// (листовая таблица есть, или под адресом крупная страница).
+pub fn unmapped_run(root: PhysAddr, virt: VirtAddr) -> usize {
+    let mut table = root;
+    for level in (LEVEL_PT + 1..=LEVEL_PML4).rev() {
+        // SAFETY: на первой итерации это корень переданного дерева, дальше —
+        // адрес из его же записи; таблицы видны через прямое отображение.
+        let entry = unsafe { ptr::read_volatile(table_entry(table, virt.table_index(level))) };
+        if !entry.is_present() {
+            let span = 1usize << (9 * (level - LEVEL_PT));
+            let page = virt.as_usize() / PAGE_SIZE;
+            return span - page % span;
+        }
+        if entry.is_huge() {
+            return 1;
+        }
+        table = entry.addr();
+    }
+    1
+}
+
 /// Снять отображение одной страницы и вернуть кадр, который под ней лежал.
 ///
 /// `None` означает «страница и так не отображена» — то есть работа уже сделана,

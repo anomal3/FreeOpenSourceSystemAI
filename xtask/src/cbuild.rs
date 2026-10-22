@@ -735,7 +735,7 @@ pub fn build_c_programs(arch: Arch) -> Result<Vec<(&'static str, PathBuf)>> {
     // Слой ОС и стартовый код собираются один раз на архитектуру: они одни и те
     // же для всех программ.
     let mut common = Vec::new();
-    for name in ["crt0", "syscalls", "threads", "posix", "files", "socket"] {
+    for name in ["crt0", "syscalls", "threads", "posix", "files", "socket", "malloc"] {
         let source = libc_dir().join("freeos").join(format!("{name}.c"));
         let object = work.join(format!("{name}.o"));
         compile(arch, &source, &object, &includes)?;

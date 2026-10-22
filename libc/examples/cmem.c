@@ -326,6 +326,45 @@ static void check_heap(void) {
     ok("heap grows between mmaps");
 }
 
+/* Память больше машины — адресами (фаза 70e). До неё задача получала
+ * полгигабайта по запросу и 128 МиБ кучи; модель llama.cpp весит гигабайты.
+ * Восемь гибибайт ленивого `mmap` и гибибайт `malloc` на машине в 512 МиБ:
+ * пройти это может только система без предела на задачу, а машину не выбирает
+ * — касаются лишь первой и последней страницы. */
+static void check_big(void) {
+    const size_t big = 8UL * 1024 * 1024 * 1024;
+    unsigned char *area = mmap(NULL, big, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (area == MAP_FAILED) {
+        fail("8 GiB of addresses");
+        return;
+    }
+    area[0] = 1;
+    area[big - 1] = 2;
+    int good = area[0] == 1 && area[big - 1] == 2 && area[big / 2] == 0;
+    munmap(area, big);
+    if (good) {
+        ok("8 GiB of addresses");
+    } else {
+        fail("8 GiB of addresses");
+    }
+
+    const size_t gib = 1024UL * 1024 * 1024;
+    unsigned char *block = malloc(gib);
+    if (block == NULL) {
+        fail("1 GiB from malloc");
+        return;
+    }
+    block[0] = 3;
+    block[gib - 1] = 4;
+    good = block[0] == 3 && block[gib - 1] == 4;
+    free(block);
+    if (good) {
+        ok("1 GiB from malloc");
+    } else {
+        fail("1 GiB from malloc");
+    }
+}
+
 /* Нарушения. Каждое снимает программу, и строка после него не печатается. */
 static int violate(const char *how) {
     volatile unsigned char *page = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -372,6 +411,7 @@ int main(int argc, char **argv) {
     check_code();
     check_none();
     check_heap();
+    check_big();
     printf("cmem: done, %d check(s) failed\n", failures);
     return failures == 0 ? 0 : 1;
 }

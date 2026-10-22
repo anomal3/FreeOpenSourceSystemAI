@@ -57,6 +57,12 @@ __attribute__((noreturn)) void __stack_chk_fail(void) {
     _exit(134);
 }
 
+/* Куча — наша (`malloc.c`, dlmalloc, фаза 70e), а не picolibc. Ссылка стоит
+ * здесь по той же причине, что и `__stack_chk_fail` выше: `crt0.o` всегда
+ * первый, и программа, которая сама `malloc` не зовёт (его зовёт её stdio),
+ * всё равно вытянет его из `libfreeos.a` раньше, чем из `libc.a`. */
+__attribute__((used)) void *(*const freeos_malloc_ref)(size_t) = malloc;
+
 /* Конструкторы: `__attribute__((constructor))` и статические объекты C++.
  * picolibc собирает их указатели в секцию, а зовёт вот этим. Объявлено здесь, а
  * не взято из заголовка, потому что заголовка у этой функции нет — она часть

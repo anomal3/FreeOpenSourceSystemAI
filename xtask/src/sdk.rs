@@ -204,6 +204,10 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
     // Сокеты BSD, имена хостов и служб (фаза 65b).
     let socket = work.join("socket.o");
     cbuild::compile(arch, &cbuild::libc_dir().join("freeos/socket.c"), &socket, &includes)?;
+    // Куча — dlmalloc (фаза 70e): picolibc обнуляет каждый блок и не отдаёт
+    // память назад; см. `libc/freeos/malloc.c`.
+    let malloc = work.join("malloc.o");
+    cbuild::compile(arch, &cbuild::libc_dir().join("freeos/malloc.c"), &malloc, &includes)?;
     let archive = lib.join("libfreeos.a");
     // Архив пересоздаётся, а не дополняется: `llvm-ar r` в существующий файл
     // оставил бы там объектник от прошлой архитектуры, если каталог когда-то
@@ -220,6 +224,7 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
         .arg(&files)
         .arg(&window)
         .arg(&socket)
+        .arg(&malloc)
         .status()
         .with_context(|| format!("не удалось запустить {}", ar.display()))?;
     if !status.success() {
