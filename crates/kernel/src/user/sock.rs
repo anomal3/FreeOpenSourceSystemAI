@@ -250,6 +250,99 @@ impl Sock {
         net::stream_shutdown(self.owner, self.index).map_err(super::syscall::net_errno)
     }
 
+    // ---- неждущие операции для слоя Linux (фаза 71f) ----------------------
+    //
+    // Буфер — ядра, а не программы, и ни одна не ждёт: «пока нечего» —
+    // `ERR_AGAIN`, ждёт слой Linux сам (`linux::ipc::wait_io`).
+
+    /// Завести сокет от имени процесса `owner` (номер главного потока): его
+    /// сокеты закрываются, когда кончается процесс, а не поток, который их
+    /// открыл.
+    pub fn open_as(tcp: bool, owner: TaskId) -> Result<Self, i64> {
+        let index = if tcp { net::stream_open(owner) } else { net::socket_open(owner) }
+            .map_err(super::syscall::net_errno)?;
+        Ok(Self { tcp, index, owner, nonblock: AtomicBool::new(true) })
+    }
+
+    pub fn is_tcp(&self) -> bool {
+        self.tcp
+    }
+
+    /// Прочитать, что есть: TCP — байты (ноль — собеседник закрыл), UDP —
+    /// датаграмму с адресом отправителя.
+    pub fn recv_now(&self, buffer: &mut [u8]) -> Result<(usize, Option<(u32, u16)>), i64> {
+        if self.tcp {
+            return match net::stream_recv(self.owner, self.index, buffer) {
+                Ok(0) => match net::stream_info(self.owner, self.index) {
+                    Ok((_, _, _, _, true, false)) => Ok((0, None)),
+                    Ok((_, _, _, _, _, true)) => Err(ERR_CONN_RESET),
+                    Ok(_) => Err(ERR_AGAIN),
+                    Err(err) => Err(super::syscall::net_errno(err)),
+                },
+                Ok(read) => Ok((read, None)),
+                Err(NetError::Stream(stream::StreamError::Reset)) => Err(ERR_CONN_RESET),
+                Err(err) => Err(super::syscall::net_errno(err)),
+            };
+        }
+        match net::socket_recv(self.owner, self.index) {
+            Ok(Some(datagram)) => {
+                let take = datagram.data.len().min(buffer.len());
+                buffer[..take].copy_from_slice(&datagram.data[..take]);
+                Ok((take, Some((datagram.from.0, datagram.port))))
+            }
+            Ok(None) => Err(ERR_AGAIN),
+            Err(err) => Err(super::syscall::net_errno(err)),
+        }
+    }
+
+    /// Отдать, сколько примет стек.
+    pub fn send_now(&self, data: &[u8]) -> Result<usize, i64> {
+        if !self.tcp {
+            return match net::socket_send(self.owner, self.index, data) {
+                Ok(taken) => Ok(taken),
+                Err(NetError::Pending) => Err(ERR_AGAIN),
+                Err(err) => Err(super::syscall::net_errno(err)),
+            };
+        }
+        match net::stream_send(self.owner, self.index, data) {
+            Ok(taken) => Ok(taken),
+            Err(NetError::Stream(stream::StreamError::Reset)) => Err(ERR_CONN_RESET),
+            Err(err) => Err(super::syscall::net_errno(err)),
+        }
+    }
+
+    /// Начать соединение (TCP) или запомнить собеседника (UDP), не ожидая.
+    pub fn start_connect(&self, address: u32, port: u16) -> Result<(), i64> {
+        let to = Ipv4(address);
+        if !self.tcp {
+            return net::socket_connect(self.owner, self.index, to, port).map(|_| ()).map_err(super::syscall::net_errno);
+        }
+        net::stream_connect(self.owner, self.index, to, port).map_err(super::syscall::net_errno)
+    }
+
+    /// Чем кончилось соединение: `None` — ещё идёт.
+    pub fn connected(&self) -> Option<Result<(), i64>> {
+        if !self.tcp {
+            return Some(Ok(()));
+        }
+        match net::stream_info(self.owner, self.index) {
+            Ok((_, _, _, _, _, true)) => Some(Err(ERR_CONN_REFUSED)),
+            Ok((_, _, _, state, _, _)) if state.is_open() => Some(Ok(())),
+            Ok((_, _, _, stream::State::Closed, _, _)) => Some(Err(ERR_CONN_REFUSED)),
+            Ok(_) => None,
+            Err(err) => Some(Err(super::syscall::net_errno(err))),
+        }
+    }
+
+    /// Принять соединение, если оно есть.
+    pub fn accept_now(&self) -> Result<Self, i64> {
+        match net::stream_accept(self.owner, self.index) {
+            Ok(Some(index)) => Ok(Self { tcp: true, index, owner: self.owner, nonblock: AtomicBool::new(true) }),
+            Ok(None) => Err(ERR_AGAIN),
+            Err(err) => Err(super::syscall::net_errno(err)),
+        }
+    }
+
     /// Что известно о сокете.
     pub fn info(&self) -> Result<SockInfo, i64> {
         let mut info = SockInfo { tcp: u8::from(self.tcp), ..SockInfo::default() };

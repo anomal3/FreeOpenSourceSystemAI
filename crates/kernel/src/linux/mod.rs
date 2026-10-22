@@ -34,6 +34,7 @@ use user_abi::{
 
 mod poll;
 mod ipc;
+mod net;
 mod process;
 mod signal;
 mod special;
@@ -172,6 +173,7 @@ mod nr {
     pub const EVENTFD2: usize = 290;
     pub const EPOLL_CREATE1: usize = 291;
     pub const MEMFD_CREATE: usize = 319;
+    pub const SENDMMSG: usize = 307;
 }
 
 /// `errno` Linux, которые здесь отдаются.
@@ -293,26 +295,30 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::WRITE => ipc::object_write(a0, a1, a2).unwrap_or_else(|| errno(native(SYS_WRITE, a0, a1, a2))),
             nr::WRITEV => ipc::object_writev(a0, a1, a2).unwrap_or_else(|| writev(a0, a1, a2)),
             nr::READV => ipc::object_readv(a0, a1, a2).unwrap_or_else(|| readv(a0, a1, a2)),
+            // `AF_INET` — родной стек (фаза 71f), остальное — `AF_UNIX`.
+            nr::SOCKET if a0 == 2 => net::socket(a1),
             nr::SOCKET => ipc::socket(a0, a1),
             nr::SOCKETPAIR => ipc::socketpair(a0, a1, a3),
-            nr::BIND => ipc::bind(a0, a1, a2),
-            nr::LISTEN => ipc::listen(a0),
-            nr::CONNECT => ipc::connect(a0, a1, a2),
-            nr::ACCEPT => ipc::accept(a0, a1, a2, 0),
-            nr::ACCEPT4 => ipc::accept(a0, a1, a2, a3),
-            nr::SHUTDOWN => ipc::shutdown(a0, a1),
-            nr::GETSOCKNAME => ipc::sockname(a0, a1, a2, false),
-            nr::GETPEERNAME => ipc::sockname(a0, a1, a2, true),
-            nr::GETSOCKOPT => ipc::getsockopt(a0, a1, a2, a3, a4),
+            nr::BIND => net::bind(a0, a1, a2).unwrap_or_else(|| ipc::bind(a0, a1, a2)),
+            nr::LISTEN => net::listen(a0).unwrap_or_else(|| ipc::listen(a0)),
+            nr::CONNECT => net::connect(a0, a1, a2).unwrap_or_else(|| ipc::connect(a0, a1, a2)),
+            nr::ACCEPT => net::accept(a0, a1, a2, 0).unwrap_or_else(|| ipc::accept(a0, a1, a2, 0)),
+            nr::ACCEPT4 => net::accept(a0, a1, a2, a3).unwrap_or_else(|| ipc::accept(a0, a1, a2, a3)),
+            nr::SHUTDOWN => net::shutdown(a0, a1).unwrap_or_else(|| ipc::shutdown(a0, a1)),
+            nr::GETSOCKNAME => net::sockname(a0, a1, a2, false).unwrap_or_else(|| ipc::sockname(a0, a1, a2, false)),
+            nr::GETPEERNAME => net::sockname(a0, a1, a2, true).unwrap_or_else(|| ipc::sockname(a0, a1, a2, true)),
+            nr::GETSOCKOPT => net::getsockopt(a0, a1, a2, a3, a4).unwrap_or_else(|| ipc::getsockopt(a0, a1, a2, a3, a4)),
+            nr::SETSOCKOPT if net::is_inet(a0) => 0,
             nr::SETSOCKOPT => match ipc::getsockopt(a0, 1, 3, 0, 0) {
                 // Проверка, что это сокет; самих настроек у сокета нет.
                 err if err == -e::EBADF || err == -e::ENOTSOCK => err,
                 _ => 0,
             },
-            nr::SENDMSG => ipc::sendmsg(a0, a1, a2),
-            nr::RECVMSG => ipc::recvmsg(a0, a1, a2),
-            nr::SENDTO => ipc::sendto(a0, a1, a2, a3),
-            nr::RECVFROM => ipc::recvfrom(a0, a1, a2, a3, a4, args[5]),
+            nr::SENDMSG => net::sendmsg(a0, a1, a2).unwrap_or_else(|| ipc::sendmsg(a0, a1, a2)),
+            nr::SENDMMSG => net::sendmmsg(a0, a1, a2, a3),
+            nr::RECVMSG => net::recvmsg(a0, a1, a2).unwrap_or_else(|| ipc::recvmsg(a0, a1, a2)),
+            nr::SENDTO => net::sendto(a0, a1, a2, a3, a4, args[5]).unwrap_or_else(|| ipc::sendto(a0, a1, a2, a3)),
+            nr::RECVFROM => net::recvfrom(a0, a1, a2, a3, a4, args[5]).unwrap_or_else(|| ipc::recvfrom(a0, a1, a2, a3, a4, args[5])),
             nr::EVENTFD => ipc::eventfd(a0, 0),
             nr::EVENTFD2 => ipc::eventfd(a0, a1),
             nr::TIMERFD_CREATE => ipc::timerfd_create(a0, a1),

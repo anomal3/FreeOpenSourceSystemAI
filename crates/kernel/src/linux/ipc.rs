@@ -52,7 +52,7 @@ const MAX_RIGHTS: usize = 253;
 
 // ---- память программы --------------------------------------------------------
 
-fn get<T: Copy>(addr: usize) -> Result<T, i64> {
+pub(super) fn get<T: Copy>(addr: usize) -> Result<T, i64> {
     if !space::user_can(addr, size_of::<T>(), PageFlags::READ) {
         return Err(-e::EFAULT);
     }
@@ -60,7 +60,7 @@ fn get<T: Copy>(addr: usize) -> Result<T, i64> {
     Ok(unsafe { core::ptr::read_unaligned(addr as *const T) })
 }
 
-fn put<T: Copy>(addr: usize, value: T) -> Result<(), i64> {
+pub(super) fn put<T: Copy>(addr: usize, value: T) -> Result<(), i64> {
     if !space::user_can(addr, size_of::<T>(), PageFlags::WRITE) {
         return Err(-e::EFAULT);
     }
@@ -69,7 +69,7 @@ fn put<T: Copy>(addr: usize, value: T) -> Result<(), i64> {
     Ok(())
 }
 
-fn read_user(addr: usize, len: usize) -> Result<Vec<u8>, i64> {
+pub(super) fn read_user(addr: usize, len: usize) -> Result<Vec<u8>, i64> {
     let mut out = Vec::new();
     out.try_reserve_exact(len).map_err(|_| -e::ENOMEM)?;
     if len == 0 {
@@ -83,7 +83,7 @@ fn read_user(addr: usize, len: usize) -> Result<Vec<u8>, i64> {
     Ok(out)
 }
 
-fn write_user(addr: usize, data: &[u8]) -> Result<(), i64> {
+pub(super) fn write_user(addr: usize, data: &[u8]) -> Result<(), i64> {
     if data.is_empty() {
         return Ok(());
     }
@@ -108,7 +108,7 @@ fn iovecs(iov: usize, count: usize) -> Result<Vec<(usize, usize)>, i64> {
 /// Повторять `op`, пока он отвечает `-EAGAIN` (если дескриптор ждущий): между
 /// попытками — сон до смены поколения событий, не дольше 100 мс и не дольше
 /// `deadline`. Сигнал или снятие — `-EINTR`.
-fn wait_io<T>(nonblock: bool, deadline: impl Fn() -> Option<u64>, mut op: impl FnMut() -> Result<T, i64>) -> Result<T, i64> {
+pub(super) fn wait_io<T>(nonblock: bool, deadline: impl Fn() -> Option<u64>, mut op: impl FnMut() -> Result<T, i64>) -> Result<T, i64> {
     loop {
         let seen = crate::io_events::generation();
         match op() {

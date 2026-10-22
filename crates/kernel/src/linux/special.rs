@@ -114,6 +114,10 @@ pub fn exists(path: &str) -> bool {
 
 /// Содержимое файла `/proc` или `/sys`.
 fn text(path: &str) -> Option<String> {
+    // Настройки сети для резолвера glibc (фаза 71f).
+    if let Some(bytes) = super::net::special_file(path) {
+        return String::from_utf8(bytes).ok();
+    }
     let cpus = crate::smp::online().max(1);
     if let Some(rest) = self_relative(path) {
         let (pid, name, maps, uid, gid) = crate::user::with_current(|program| {

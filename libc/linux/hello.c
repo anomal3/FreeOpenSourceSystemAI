@@ -81,10 +81,16 @@ static void out_num(u64 v) {
 }
 
 static int failed;
+/* Строка проверки уходит одним `write`: по кускам её разрывали строки других
+ * задач (`init: ...`), и стенд не находил её целиком. */
 static void check(int good, const char *what) {
-    out(good ? "linux: ok " : "linux: FAILED ");
-    out(what);
-    out("\n");
+    char line[160];
+    const char *head = good ? "linux: ok " : "linux: FAILED ";
+    u64 len = 0;
+    for (const char *s = head; *s && len < sizeof line - 2; s++) line[len++] = *s;
+    for (const char *s = what; *s && len < sizeof line - 2; s++) line[len++] = *s;
+    line[len++] = '\n';
+    sys3(SYS_write, 1, line, len);
     if (!good) failed++;
 }
 

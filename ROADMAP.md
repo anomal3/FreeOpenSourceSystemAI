@@ -9800,12 +9800,16 @@ AArch64; загрузка модели — 7–10 с. `install`, `cthreads`, `cm
 - **71e** — межпроцессное: сокеты `AF_UNIX` (`socketpair`, `SCM_RIGHTS`),
   `memfd_create` и `MAP_SHARED` между процессами, `eventfd`, `epoll`,
   `timerfd`.
-- **71f** — Chromium без окна: `chrome --headless --no-sandbox --dump-dom
-  <адрес>` скачивает и разбирает страницу (сеть — родной стек, имена — NSS
-  через `/etc/resolv.conf`).
-- **71g** — сервер Wayland поверх окон стола (`wl_shm`, `xdg_shell`,
+- **71f** — сеть: `AF_INET` поверх родного стека, имена через
+  `/etc/resolv.conf` (выделена из бывшей 71f 23.10 — Chromium без неё не
+  начать, а проверить её можно и без него).
+- **71g** — `fork` с копированием при записи (в 71d память копируется
+  целиком).
+- **71h** — Chromium без окна: `chrome --headless --no-sandbox --dump-dom
+  <адрес>` скачивает и разбирает страницу.
+- **71i** — сервер Wayland поверх окон стола (`wl_shm`, `xdg_shell`,
   клавиатура и мышь): Chromium в окне.
-- **71h** — Wine (драйвер `winewayland`): `notepad.exe`.
+- **71j** — Wine (драйвер `winewayland`): `notepad.exe`.
 
 Каждая фаза — свой сценарий стенда; размер вехи — XL, недели работы.
 
@@ -10091,6 +10095,49 @@ Chromium — свои процессы.
 
 Сеть для программ Linux: `AF_INET`/`AF_INET6` поверх родного стека (TCP,
 UDP), имена через `/etc/resolv.conf` — без неё Chromium не скачает страницу.
+## Фаза 71f — сеть программ Linux: AF_INET поверх родного стека — **сделано 2026-10-23**
+
+### Что стало
+
+- **Сокет `AF_INET`** (`linux::net::InetSocket`) — объект таблицы
+  дескрипторов, как сокеты `AF_UNIX` 71e, над родным `user::sock::Sock`. У
+  `Sock` появились неждущие операции с буферами ядра (`recv_now`,
+  `send_now`, `start_connect`, `connected`, `accept_now`) и `open_as`:
+  сокет программы Linux заводится от имени **процесса** (номер главного
+  потока) — его сокеты закрываются с процессом, а не с потоком, открывшим
+  их.
+- TCP: `connect` (ждущий и неждущий — `EINPROGRESS`, готовность на запись,
+  `SO_ERROR`), `bind`, `listen`, `accept`/`accept4`, `shutdown`,
+  `getsockname`/`getpeername`, `getsockopt` (`SO_ERROR`, `SO_TYPE`, буферы,
+  уровень TCP — нули), `setsockopt` — принимается. UDP: `connect`,
+  `sendto`/`recvfrom` с адресом, `sendmsg`/`recvmsg` с именем, `sendmmsg` (им
+  резолвер glibc шлёт запросы A и AAAA разом). `read`/`write`/`poll`/`epoll`
+  — как у всех объектов. Вызовы сокетов разбираются по типу: `AF_INET` —
+  `linux::net`, иначе `linux::ipc`.
+- `AF_INET6` — `EAFNOSUPPORT`: стек знает только IPv4, glibc переходит на
+  IPv4 сама.
+- **Файлы для резолвера glibc** (в `linux::special`): `/etc/resolv.conf` —
+  сервер имён из DHCP, `/etc/hosts` — только `localhost`,
+  `/etc/nsswitch.conf` — `hosts: files dns`.
+
+Известное ограничение: сокет, унаследованный ребёнком `fork`, принадлежит
+процессу-родителю и закрывается, когда родитель кончится.
+
+### Проверено
+
+Новый сценарий `linux-net` (x86-64): программа на glibc `netcheck`
+(`libc/linux/netcheck.c`, в пакете `/usr/libexec/fossai/netcheck`) — 8 из 8:
+`getaddrinfo` числом, `connect`/`write`/`read` к эхо-серверу хоста,
+`getsockname`/`getpeername`, `shutdown` и конец файла, неждущее соединение
+с `poll` и `SO_ERROR`, `epoll` над сокетом, `ECONNREFUSED`, `/etc/resolv.conf`,
+`getaddrinfo("example.com")` через DNS (резолвер хоста, как у `cnet`); сервер
+`netcheck serve 2000` — `bind`, `listen`, `accept` клиента с хоста и эхо.
+`linux-debian`, `cnet`, `tcp`, `sockfd`, `linux` — зелёные.
+
+### Дальше — 71g
+
+`fork` с копированием при записи: в 71d память копируется целиком, а
+Chromium делает `fork` процессов с сотнями мегабайт.
 
 # Полный прогон 17.10 — 407 из 428, один дефект установщика
 
