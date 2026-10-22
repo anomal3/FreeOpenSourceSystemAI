@@ -106,28 +106,28 @@ impl Space {
         result
     }
 
-    /// Копия пространства для `fork` (фаза 71d): каждая отображённая страница
-    /// окна — в свой новый кадр, с тем же содержимым и теми же правами.
+    /// Копия пространства для `fork` (фазы 71d, 71g). Что делать с каждой
+    /// отображённой страницей окна, решает `class` ([`Dup`]):
     ///
-    /// Копия честная, а не «копирование при записи»: кадр у страницы один
-    /// владелец, и разбор пространства при выходе возвращает в пул всё, что
-    /// под окном, не спрашивая, чьё оно. Общие кадры потребовали бы счёта
-    /// ссылок на кадр — это следующий шаг, когда копирование станет дорого.
-    /// Неотображённое (ленивое, не тронутое) не стоит ничего: таблицы обходят
-    /// пустые куски целиком ([`arch::unmapped_run`]).
+    /// * [`Dup::Share`] — тот же кадр у обоих (счёт владельцев в пуле кадров,
+    ///   `share`). Страница на запись становится у **обоих** страницей только
+    ///   на чтение: первая запись любого из них придёт отказом, и
+    ///   [`super::Program::cow_break`] даст ему свою копию. Отсюда «копирование
+    ///   при записи»: `fork` стоит таблиц, а не памяти.
+    /// * [`Dup::Copy`] — свой кадр с тем же содержимым (память кода, крупные
+    ///   страницы, то, что не записано в таблице областей); и если разделить
+    ///   кадр не вышло.
+    /// * [`Dup::Skip`] — не переносить (разделяемая память: её страницы ребёнок
+    ///   получит отказами из того же объекта).
     ///
-    /// Окно разбирается на обычные страницы: крупная страница копируется
-    /// пятьюстами двенадцатью обычными.
-    ///
-    /// Чужих кадров (поверхность окна, регистры устройства) в пространстве
-    /// быть не должно — их копия отдала бы два владельца одним кадрам;
-    /// проверяет это вызывающий.
-    ///
-    /// `skip` — адреса, которые не копируются (разделяемая память, фаза 71e:
-    /// её страницы ребёнок получит отказами из того же объекта).
+    /// Неотображённое не стоит ничего: пустые куски обходятся целиком
+    /// ([`arch::unmapped_run`]). Возвращает копию и признак «у родителя
+    /// страницы на запись стали только на чтение» — тогда вызывающий обязан
+    /// сбросить трансляции на всех процессорах, где живут потоки родителя.
     #[cfg(target_arch = "x86_64")]
-    pub fn duplicate(&self, skip: &dyn Fn(usize) -> bool) -> Result<Self, MapError> {
+    pub fn duplicate(&mut self, class: &dyn Fn(usize) -> Dup) -> Result<(Self, bool), MapError> {
         let mut copy = Self::new()?;
+        let mut downgraded = false;
         let end = super::WINDOW_BASE + (1usize << 39);
         let mut virt = super::WINDOW_BASE;
         while virt < end {
@@ -136,7 +136,29 @@ impl Space {
                 virt += arch::unmapped_run(self.root, at) * PAGE_SIZE;
                 continue;
             };
-            if skip(virt) {
+            let how = class(virt);
+            if how == Dup::Skip {
+                virt += PAGE_SIZE;
+                continue;
+            }
+            if how == Dup::Share && crate::mm::frame::with(|frames| frames.share(phys)).unwrap_or(false) {
+                let shared = flags.without(PageFlags::WRITE);
+                if flags.contains(PageFlags::WRITE) {
+                    // SAFETY: тот же кадр под тем же адресом, только без записи;
+                    // кадр по-прежнему принадлежит этому пространству (и теперь
+                    // ещё копии).
+                    if let Err(err) = unsafe { self.remap(at, phys, shared) } {
+                        Self::unshare(phys);
+                        return Err(err);
+                    }
+                    downgraded = true;
+                }
+                // SAFETY: кадр разделён (счёт владельцев учёл копию), адрес в
+                // окне копии свободен: обход идёт по возрастанию.
+                if let Err(err) = unsafe { copy.map(at, phys, shared) } {
+                    Self::unshare(phys);
+                    return Err(err);
+                }
                 virt += PAGE_SIZE;
                 continue;
             }
@@ -152,15 +174,36 @@ impl Space {
             // принадлежит этому пространству и жив (вызывающий держит процесс),
             // новый только что выдан и не принадлежит никому.
             unsafe { core::ptr::copy_nonoverlapping(super::frame_bytes(phys), super::frame_bytes(frame), PAGE_SIZE) };
-            // SAFETY: кадр наш, адрес — в окне копии и ещё свободен: обход идёт
-            // по возрастанию, каждую страницу по разу.
+            // SAFETY: кадр наш, адрес — в окне копии и ещё свободен.
             if let Err(err) = unsafe { copy.map(at, frame, flags) } {
                 super::return_frame(frame);
                 return Err(err);
             }
             virt += PAGE_SIZE;
         }
-        Ok(copy)
+        Ok((copy, downgraded))
+    }
+
+    /// Вернуть кадру одного владельца (разделение не удалось довести).
+    fn unshare(phys: PhysAddr) {
+        crate::mm::frame::with(|frames| {
+            // SAFETY: `share` только что учёл лишнего владельца — `free`
+            // снимет именно его, кадр останется на месте.
+            unsafe { frames.free(phys) };
+        });
+    }
+
+    /// Поставить по адресу, где уже стоит страница, кадр `phys` с правами
+    /// `flags` — без счёта своих страниц: кадр тот же или уже учтён.
+    ///
+    /// # Safety
+    ///
+    /// Как у [`Space::map`]; прежний кадр под адресом вызывающий снимает или
+    /// оставляет сам.
+    pub unsafe fn remap(&mut self, virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> Result<(), MapError> {
+        // SAFETY: корень принадлежит этому объекту; условие делегировано.
+        let mut space = unsafe { arch::space_at(self.root) };
+        crate::mm::frame::with(|frames| unsafe { space.map(virt, phys, flags, frames) }).unwrap_or(Err(MapError::OutOfFrames))
     }
 
     /// Сколько страниц у программы своих.
@@ -529,6 +572,14 @@ impl Space {
 
         removed
     }
+}
+
+/// Что `fork` делает со страницей ([`Space::duplicate`], фаза 71g).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Dup {
+    Share,
+    Copy,
+    Skip,
 }
 
 /// Сколько страниц обрабатывается за один захват замка пула кадров.

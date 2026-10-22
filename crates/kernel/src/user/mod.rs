@@ -1556,6 +1556,15 @@ impl Program {
                 // этом процессоре.
                 // SAFETY: страница принадлежит безымянной области этой
                 // программы; кадр под ней не меняется.
+                // Кадр, разделённый `fork` (фаза 71g), остаётся только на
+                // чтение: право записи он получит копией, по отказу.
+                let page_flags = if page_flags.contains(PageFlags::WRITE)
+                    && crate::mm::frame::with(|frames| frames.is_shared(phys)).unwrap_or(false)
+                {
+                    page_flags.without(PageFlags::WRITE)
+                } else {
+                    page_flags
+                };
                 if unsafe { self.space.map(virt, phys, page_flags) }.is_err() {
                     failed = true;
                 }
@@ -1823,6 +1832,67 @@ impl Program {
             }
             Source::Anonymous(_) | Source::Surface(..) | Source::ThreadStack | Source::Device => None,
         }
+    }
+
+    /// Запись в страницу, кадр которой разделён после `fork` (фаза 71g):
+    /// дать странице свой кадр — копию — или, если владелец остался один,
+    /// вернуть ей право записи. `false` — это не такая страница (запись в
+    /// чтение-только остаётся нарушением прав).
+    fn cow_break(&mut self, page_addr: usize, shared: bool) -> bool {
+        let Some(index) = self.region_at(page_addr) else {
+            return false;
+        };
+        let flags = match &self.mappings[index].source {
+            Source::Anonymous(anon) if !anon.jit && anon.flags.contains(PageFlags::WRITE) => anon.page_flags(),
+            Source::ThreadStack => PageFlags::READ | PageFlags::WRITE | PageFlags::USER,
+            Source::Image(image)
+                if image.flags.contains(PageFlags::WRITE) && image.flags.contains(PageFlags::USER) =>
+            {
+                image.flags
+            }
+            _ => return false,
+        };
+        let virt = VirtAddr::new(page_addr);
+        let Some((phys, now)) = arch::translate(self.space.root(), virt) else {
+            // Страницу сняли, пока шли к замку: повтор разберётся сам.
+            return true;
+        };
+        if now.contains(PageFlags::WRITE) {
+            // Уже разорвал другой поток.
+            return true;
+        }
+        let sole = !crate::mm::frame::with(|frames| frames.is_shared(phys)).unwrap_or(false);
+        if sole {
+            // Остальные владельцы ушли — кадр наш целиком.
+            // SAFETY: тот же кадр под тем же адресом, право записи даёт область.
+            return unsafe { self.space.remap(virt, phys, flags) }.is_ok();
+        }
+        let Some(fresh) = take_frame_reserved() else {
+            return false;
+        };
+        // SAFETY: оба кадра видны через прямое отображение; старый жив — его
+        // держит и эта страница, и другие владельцы.
+        unsafe { core::ptr::copy_nonoverlapping(frame_bytes(phys), frame_bytes(fresh), PAGE_SIZE) };
+        // Снять старую запись без возврата кадра, сбросить трансляции, затем
+        // поставить свой кадр и отдать старому одного владельца.
+        // SAFETY: страница принадлежит области этой программы.
+        unsafe { self.space.unmap_range_keep(virt, 1) };
+        if shared {
+            arch::flush_user_translations();
+        }
+        // SAFETY: адрес свободен (снят строкой выше), кадр наш.
+        if unsafe { self.space.remap(virt, fresh, flags) }.is_err() {
+            // SAFETY: возвращаем старую страницу как была.
+            let _ = unsafe { self.space.remap(virt, phys, now) };
+            return_frame(fresh);
+            return false;
+        }
+        crate::mm::frame::with(|frames| {
+            // SAFETY: кадр разделён (`is_shared`) — `free` снимет с него одного
+            // владельца, нас, и в пул его не вернёт.
+            unsafe { frames.free(phys) };
+        });
+        true
     }
 
     /// Вторая половина отказа в разделяемой памяти (фаза 71e): кадр — объекта,
@@ -4018,7 +4088,7 @@ impl Program {
     ///
     /// Программе с окном или устройством копии нет: их кадры принадлежат не
     /// ей, и у двух процессов оказались бы общие чужие кадры.
-    fn fork_copy(&self) -> Result<Self, MmapError> {
+    fn fork_copy(&mut self) -> Result<Self, MmapError> {
         if self.has_surface() || self.devices.iter().any(Option::is_some) || !self.dma.is_empty() {
             return Err(MmapError::BadRequest);
         }
@@ -4027,16 +4097,31 @@ impl Program {
         for region in &self.mappings {
             mappings.push(region.fork_copy().ok_or(MmapError::BadRequest)?);
         }
-        // Разделяемую память не копируем: у ребёнка она та же, и её страницы
-        // придут к нему отказами из того же объекта.
-        let shared: Vec<(usize, usize)> = self
-            .mappings
-            .iter()
-            .filter(|region| matches!(region.source, Source::Shared(_)))
-            .map(|region| (region.base, region.end()))
-            .collect();
-        let skip = |addr: usize| shared.iter().any(|&(base, end)| addr >= base && addr < end);
-        let space = self.space.duplicate(&skip).map_err(|_| MmapError::NoMemory)?;
+        // Что делать со страницей, решает её область (фаза 71g): своя память
+        // и страницы файлов — общим кадром с копированием при записи;
+        // память кода (её права переключает ядро) и крупные страницы — копией;
+        // разделяемая память — никак, её страницы ребёнок получит отказами из
+        // того же объекта. Страницы вне таблицы областей (жадная часть стека,
+        // страница процесса) — копией: их единицы.
+        let mappings_now = &self.mappings;
+        let class = |addr: usize| -> space::Dup {
+            let index = mappings_now.partition_point(|region| region.end() <= addr);
+            match mappings_now.get(index).filter(|region| region.base <= addr) {
+                Some(region) => match &region.source {
+                    Source::Shared(_) => space::Dup::Skip,
+                    Source::Anonymous(anon) if anon.jit || region.blocks > 0 => space::Dup::Copy,
+                    Source::Anonymous(_) | Source::ThreadStack | Source::Image(_) | Source::File(_) => space::Dup::Share,
+                    Source::Surface(..) | Source::Device => space::Dup::Skip,
+                },
+                None => space::Dup::Copy,
+            }
+        };
+        let (space, downgraded) = self.space.duplicate(&class).map_err(|_| MmapError::NoMemory)?;
+        // Страницы родителя стали только на чтение — его потоки на других
+        // процессорах не должны писать по старым трансляциям.
+        if downgraded {
+            arch::flush_user_translations();
+        }
         Ok(Self {
             space,
             files: self.files.fork(),
@@ -4725,6 +4810,12 @@ pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     // подкачка тут ни при чём. Кроме памяти кода (фаза 59): у неё «не те
     // права» — обычное состояние, и отказ означает «переключи».
     if present {
+        // Запись в страницу, разделённую `fork` (фаза 71g).
+        if access == Touch::Write
+            && with_current_shared(|program, shared| program.cow_break(page_addr, shared)) == Some(true)
+        {
+            return true;
+        }
         let slot = sched::current_slot();
         return match with_current_shared(|program, shared| program.jit_flip(page_addr, access, slot, shared)) {
             Some(Flip::Done) => true,

@@ -298,6 +298,13 @@ impl PageFlags {
         Self(self.0 | other.0)
     }
 
+    /// Те же права без `other` (фаза 71g: страница на запись становится
+    /// страницей только на чтение до копирования).
+    #[must_use]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     /// Права из флагов сегмента ELF, которые передал загрузчик.
     #[must_use]
     pub const fn from_segment_flags(flags: u32) -> Self {

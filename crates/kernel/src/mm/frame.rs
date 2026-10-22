@@ -155,6 +155,12 @@ pub struct BitmapFrameAllocator {
     /// номером страницы в восьмибитном поле `SIPI`. На AArch64 оперативной
     /// памяти так низко нет вовсе, и поле остаётся пустым.
     low_frame: Option<PhysAddr>,
+    /// Счёт **лишних** владельцев кадра по номеру (фаза 71g: `fork` с
+    /// копированием при записи) — `u16` на кадр, в кадрах самого пула.
+    /// Заводится при первом разделении; ноль — у кадра один владелец, и
+    /// `free` возвращает его в пул; больше нуля — `free` только уменьшает
+    /// счёт.
+    shares: Option<PhysAddr>,
 }
 
 /// Верхняя граница кадра под код запуска: 640 КиБ.
@@ -246,6 +252,7 @@ impl BitmapFrameAllocator {
             phys_offset: 0,
             cursor: 0,
             low_frame: None,
+            shares: None,
         };
 
         // Всё занято, пока карта памяти не докажет обратное.
@@ -299,6 +306,53 @@ impl BitmapFrameAllocator {
         }
 
         Ok(this)
+    }
+
+    /// Указатель на счётчик лишних владельцев кадра `index` (таблица есть).
+    fn share_slot(&self, table: PhysAddr, index: usize) -> *mut u16 {
+        (self.access(table).as_usize() as *mut u16).wrapping_add(index)
+    }
+
+    /// Отдать кадр ещё одному владельцу (фаза 71g). `false` — нельзя: таблицы
+    /// не завести (памяти нет) или счёт упёрся в предел; тогда вызывающий
+    /// копирует страницу.
+    pub fn share(&mut self, frame: PhysAddr) -> bool {
+        let index = (frame.as_u64() >> PAGE_SHIFT) as usize;
+        if index >= self.frames || !self.is_used(index) {
+            return false;
+        }
+        let table = match self.shares {
+            Some(table) => table,
+            None => {
+                let pages = (self.frames * 2).div_ceil(PAGE_SIZE);
+                let Some(table) = self.allocate_contiguous(pages) else {
+                    return false;
+                };
+                self.shares = Some(table);
+                table
+            }
+        };
+        let slot = self.share_slot(table, index);
+        // SAFETY: таблица — `frames` счётчиков в кадрах, выданных под неё и
+        // видных через нынешнее смещение доступа; индекс меньше `frames`.
+        unsafe {
+            if *slot == u16::MAX {
+                return false;
+            }
+            *slot += 1;
+        }
+        true
+    }
+
+    /// Есть ли у кадра другие владельцы.
+    #[must_use]
+    pub fn is_shared(&self, frame: PhysAddr) -> bool {
+        let index = (frame.as_u64() >> PAGE_SHIFT) as usize;
+        match self.shares {
+            // SAFETY: см. `share`.
+            Some(table) if index < self.frames => unsafe { *self.share_slot(table, index) > 0 },
+            _ => false,
+        }
     }
 
     /// Забрать кадр, отложенный под код запуска процессоров. Отдаётся один раз.
@@ -620,6 +674,18 @@ impl FrameAllocator for BitmapFrameAllocator {
         if !self.is_used(index) {
             kprintln!("mm: double free of frame {:?}, ignored", frame);
             return;
+        }
+        // Разделённый кадр (фаза 71g): уходит один владелец, кадр остаётся
+        // остальным.
+        if let Some(table) = self.shares {
+            let slot = self.share_slot(table, index);
+            // SAFETY: см. `share`.
+            unsafe {
+                if *slot > 0 {
+                    *slot -= 1;
+                    return;
+                }
+            }
         }
         self.set_free(index);
         self.free += 1;

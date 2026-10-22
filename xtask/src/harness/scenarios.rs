@@ -5114,6 +5114,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await("linuxcheck: ok vfork and _exit", 30_000),
             Step::Await("linuxcheck: ok kill another process, WTERMSIG", 30_000),
             Step::Await("linuxcheck: ok execve closes FD_CLOEXEC and keeps the rest", 60_000),
+            // Фаза 71g: копирование при записи.
+            Step::Await("linuxcheck: ok fork of 64 MiB is copy-on-write", 60_000),
+            Step::Await("linuxcheck: ok writes after fork stay private both ways", 30_000),
             Step::Await("linuxcheck: ok no children left: ECHILD", 30_000),
             Step::Await("linuxcheck: 0 failed", 30_000),
             Step::Await("/opt/debian/usr/libexec/fossai/linuxcheck: exited with code 0", 30_000),

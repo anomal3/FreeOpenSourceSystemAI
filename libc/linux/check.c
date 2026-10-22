@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -99,6 +100,11 @@ static void drain(int fd, char *out, size_t size) {
 }
 
 extern char **environ;
+
+static int exited_with_zero(pid_t pid) {
+    int status = -1;
+    return pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
 
 int main(int argc, char **argv) {
     /* Ребёнок после `execve` самого себя: `--fds закрытый открытый` — первый
@@ -336,6 +342,39 @@ int main(int argc, char **argv) {
     check(flagged && WIFEXITED(status) && WEXITSTATUS(status) == 0, "execve closes FD_CLOEXEC and keeps the rest");
     close(closing);
     close(keeping);
+
+    /* Копирование при записи (фаза 71g): fork процесса с 64 МиБ своей
+     * памяти почти не тратит память, а записи после fork у каждого свои. */
+    size_t big_size = 64u << 20;
+    char *cow = malloc(big_size);
+    if (cow) memset(cow, 1, big_size);
+    struct sysinfo mem_before;
+    sysinfo(&mem_before);
+    int up[2], down[2];
+    int cow_pipes = cow && pipe(up) == 0 && pipe(down) == 0;
+    pid_t cow_child = cow_pipes ? fork() : -1;
+    if (cow_child == 0) {
+        struct sysinfo mem_during;
+        sysinfo(&mem_during);
+        long spent = (long)mem_before.freeram - (long)mem_during.freeram;
+        char before_write = cow[12345];
+        cow[12345] = 9;
+        write(up[1], &spent, sizeof spent);
+        write(up[1], &before_write, 1);
+        char go;
+        read(down[0], &go, 1);
+        _exit(cow[54321] == 1 ? 0 : 1);
+    }
+    long spent = -1;
+    char child_saw = 0;
+    int reported = cow_child > 0 && read(up[0], &spent, sizeof spent) == sizeof spent && read(up[0], &child_saw, 1) == 1;
+    if (cow) cow[54321] = 7;
+    if (cow_pipes) write(down[1], "g", 1);
+    int child_private = exited_with_zero(cow_child);
+    printf("linuxcheck: fork of 64 MiB took %ld KiB\n", spent / 1024);
+    check(reported && child_saw == 1 && spent >= 0 && spent < (16L << 20), "fork of 64 MiB is copy-on-write");
+    check(child_private && cow && cow[12345] == 1, "writes after fork stay private both ways");
+    free(cow);
 
     check(waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD, "no children left: ECHILD");
 
