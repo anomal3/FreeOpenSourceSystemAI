@@ -33,6 +33,7 @@ use user_abi::{
 };
 
 mod poll;
+mod ipc;
 mod process;
 mod signal;
 mod special;
@@ -140,6 +141,37 @@ mod nr {
     pub const FORK: usize = 57;
     pub const VFORK: usize = 58;
     pub const EXECVE: usize = 59;
+    pub const READV: usize = 19;
+    pub const SOCKET: usize = 41;
+    pub const CONNECT: usize = 42;
+    pub const ACCEPT: usize = 43;
+    pub const SENDTO: usize = 44;
+    pub const RECVFROM: usize = 45;
+    pub const SENDMSG: usize = 46;
+    pub const RECVMSG: usize = 47;
+    pub const SHUTDOWN: usize = 48;
+    pub const BIND: usize = 49;
+    pub const LISTEN: usize = 50;
+    pub const GETSOCKNAME: usize = 51;
+    pub const GETPEERNAME: usize = 52;
+    pub const SOCKETPAIR: usize = 53;
+    pub const SETSOCKOPT: usize = 54;
+    pub const GETSOCKOPT: usize = 55;
+    pub const FTRUNCATE: usize = 77;
+    pub const UNLINK: usize = 87;
+    pub const EPOLL_CREATE: usize = 213;
+    pub const EPOLL_WAIT: usize = 232;
+    pub const EPOLL_CTL: usize = 233;
+    pub const UNLINKAT: usize = 263;
+    pub const EPOLL_PWAIT: usize = 281;
+    pub const TIMERFD_CREATE: usize = 283;
+    pub const EVENTFD: usize = 284;
+    pub const TIMERFD_SETTIME: usize = 286;
+    pub const TIMERFD_GETTIME: usize = 287;
+    pub const ACCEPT4: usize = 288;
+    pub const EVENTFD2: usize = 290;
+    pub const EPOLL_CREATE1: usize = 291;
+    pub const MEMFD_CREATE: usize = 319;
 }
 
 /// `errno` Linux, которые здесь отдаются.
@@ -255,9 +287,45 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
     // SAFETY (для всех `native` ниже): контракт функции.
     unsafe {
         match number {
-            nr::READ => errno(native(SYS_READ, a0, a1, a2)),
-            nr::WRITE => errno(native(SYS_WRITE, a0, a1, a2)),
-            nr::WRITEV => writev(a0, a1, a2),
+            // Объекты слоя Linux (фаза 71e) читаются и пишутся здесь, всё
+            // остальное — родным путём.
+            nr::READ => ipc::object_read(a0, a1, a2).unwrap_or_else(|| errno(native(SYS_READ, a0, a1, a2))),
+            nr::WRITE => ipc::object_write(a0, a1, a2).unwrap_or_else(|| errno(native(SYS_WRITE, a0, a1, a2))),
+            nr::WRITEV => ipc::object_writev(a0, a1, a2).unwrap_or_else(|| writev(a0, a1, a2)),
+            nr::READV => ipc::object_readv(a0, a1, a2).unwrap_or_else(|| readv(a0, a1, a2)),
+            nr::SOCKET => ipc::socket(a0, a1),
+            nr::SOCKETPAIR => ipc::socketpair(a0, a1, a3),
+            nr::BIND => ipc::bind(a0, a1, a2),
+            nr::LISTEN => ipc::listen(a0),
+            nr::CONNECT => ipc::connect(a0, a1, a2),
+            nr::ACCEPT => ipc::accept(a0, a1, a2, 0),
+            nr::ACCEPT4 => ipc::accept(a0, a1, a2, a3),
+            nr::SHUTDOWN => ipc::shutdown(a0, a1),
+            nr::GETSOCKNAME => ipc::sockname(a0, a1, a2, false),
+            nr::GETPEERNAME => ipc::sockname(a0, a1, a2, true),
+            nr::GETSOCKOPT => ipc::getsockopt(a0, a1, a2, a3, a4),
+            nr::SETSOCKOPT => match ipc::getsockopt(a0, 1, 3, 0, 0) {
+                // Проверка, что это сокет; самих настроек у сокета нет.
+                err if err == -e::EBADF || err == -e::ENOTSOCK => err,
+                _ => 0,
+            },
+            nr::SENDMSG => ipc::sendmsg(a0, a1, a2),
+            nr::RECVMSG => ipc::recvmsg(a0, a1, a2),
+            nr::SENDTO => ipc::sendto(a0, a1, a2, a3),
+            nr::RECVFROM => ipc::recvfrom(a0, a1, a2, a3, a4, args[5]),
+            nr::EVENTFD => ipc::eventfd(a0, 0),
+            nr::EVENTFD2 => ipc::eventfd(a0, a1),
+            nr::TIMERFD_CREATE => ipc::timerfd_create(a0, a1),
+            nr::TIMERFD_SETTIME => ipc::timerfd_settime(a0, a1, a2, a3),
+            nr::TIMERFD_GETTIME => ipc::timerfd_gettime(a0, a1),
+            nr::EPOLL_CREATE => ipc::epoll_create(0),
+            nr::EPOLL_CREATE1 => ipc::epoll_create(a0),
+            nr::EPOLL_CTL => ipc::epoll_ctl(a0, a1, a2, a3),
+            nr::EPOLL_WAIT | nr::EPOLL_PWAIT => ipc::epoll_wait(a0, a1, a2, a3 as i32 as i64),
+            nr::MEMFD_CREATE => ipc::memfd_create(a0, a1),
+            nr::FTRUNCATE => ftruncate(a0, a1),
+            nr::UNLINK => unlink(AT_FDCWD, a0),
+            nr::UNLINKAT => unlink(a0, a1),
             nr::CLOSE => {
                 crate::user::with_current(|program| program.linux_dirs.retain(|(fd, _)| *fd != a0));
                 errno(native(SYS_CLOSE, a0, 0, 0))
@@ -511,6 +579,9 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
         Ok(path) => path,
         Err(err) => return err,
     };
+    if let Some(answer) = ipc::open_shm(&linux, flags) {
+        return answer;
+    }
     if let Some((node, writable)) = special::node(&linux) {
         return match crate::user::with_current(|program| {
             let fd = program.files.install_node(node, writable)?;
@@ -639,11 +710,14 @@ fn stat_path(dir: usize, ptr: usize, out: usize) -> i64 {
         Ok(path) => path,
         Err(err) => return err,
     };
+    if ipc::shm_exists(&linux) {
+        return put_stat(out, S_IFREG, 0o600, 0, 0, 0, 0, ino_of(&linux));
+    }
     if special::exists(&linux) {
         let kind = if linux.starts_with("/dev/") { S_IFCHR } else { S_IFREG };
         return put_stat(out, kind, 0o666, 0, 0, 0, 0, ino_of(&linux));
     }
-    if matches!(linux.as_str(), "/proc" | "/proc/self" | "/dev" | "/sys") {
+    if matches!(linux.as_str(), "/proc" | "/proc/self" | "/dev" | "/sys" | "/dev/shm") {
         return put_stat(out, S_IFDIR, 0o555, 0, 0, 0, 0, ino_of(&linux));
     }
     let path = crate::linux_path::resolve(&linux, crate::user::credentials());
@@ -661,6 +735,11 @@ fn stat_path(dir: usize, ptr: usize, out: usize) -> i64 {
 }
 
 fn fstat(fd: usize, out: usize) -> i64 {
+    // Объект слоя Linux (фаза 71e): сокет или «анонимный узел».
+    if let Some(Some((object, _))) = crate::user::with_current(|program| program.files.object(fd)) {
+        let ino = alloc::sync::Arc::as_ptr(&object) as *const () as usize as u64;
+        return put_stat(out, object.mode(), 0o600, 0, 0, 0, 0, ino);
+    }
     // Стандартный поток — на каком бы номере он ни стоял (фаза 71d): канал
     // запускающего или терминал.
     let standard = crate::user::with_current(|program| {
@@ -687,6 +766,8 @@ fn fstat(fd: usize, out: usize) -> i64 {
                 FdKind::Directory => S_IFDIR,
                 FdKind::Pipe => S_IFIFO,
                 FdKind::Socket => S_IFSOCK,
+                // Объекты отвечают выше; сюда не доходят.
+                FdKind::Object => 0,
             };
             // Номер узла — по самому открытому файлу, а не по номеру
             // дескриптора: `ld.so` узнаёт уже загруженную библиотеку по паре
@@ -1019,19 +1100,35 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
     const MAP_ANONYMOUS: usize = 0x20;
     const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
     let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+    let shared_flag = flags & MAP_SHARED != 0;
+    let mut shared = None;
     let file = if flags & MAP_ANONYMOUS != 0 {
+        // Общая безымянная (фаза 71e): видна и ребёнку после `fork`.
+        if shared_flag {
+            shared = Some((crate::user::shm::SharedMem::new(len as u64), 0));
+        }
         None
     } else {
-        if flags & MAP_SHARED != 0 && prot & user_abi::PROT_WRITE != 0 {
-            return -e::EACCES;
-        }
-        match crate::user::with_current(|program| program.files.node(fd)) {
-            Some(Ok(node)) => Some((node, offset as u64)),
+        let node = match crate::user::with_current(|program| program.files.node(fd)) {
+            Some(Ok(node)) => node,
             Some(Err(err)) => return file_errno(err),
             None => return -e::ESRCH,
+        };
+        // `memfd` и `/dev/shm` — общими кадрами (фаза 71e).
+        match node.shared_memory() {
+            Some(mem) if shared_flag => {
+                shared = Some((mem, offset as u64));
+                None
+            }
+            _ => {
+                if shared_flag && prot & user_abi::PROT_WRITE != 0 {
+                    return -e::EACCES;
+                }
+                Some((node, offset as u64))
+            }
         }
     };
-    match crate::user::with_current(|program| program.linux_mmap(addr, len, prot, fixed, file)) {
+    match crate::user::with_current(|program| program.linux_mmap(addr, len, prot, fixed, file, shared)) {
         Some(Ok(base)) => base as i64,
         Some(Err(err)) => errno(crate::user::syscall::mmap_errno(err)),
         None => -e::ESRCH,
@@ -1305,4 +1402,63 @@ fn prlimit(resource: usize, _new: usize, old: usize) -> i64 {
         unsafe { core::ptr::write_unaligned(old as *mut [u64; 2], value) };
     }
     0
+}
+
+/// `readv` — по куску родным `read`.
+unsafe fn readv(fd: usize, iov: usize, count: usize) -> i64 {
+    if count > 1024 || !space::user_can(iov, count * 16, PageFlags::READ) {
+        return -e::EINVAL;
+    }
+    let mut total = 0i64;
+    for index in 0..count {
+        // SAFETY: массив `iovec` проверен на чтение выше.
+        let (base, len) = unsafe {
+            let entry = (iov + index * 16) as *const usize;
+            (core::ptr::read_unaligned(entry), core::ptr::read_unaligned(entry.add(1)))
+        };
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: контракт `syscall`.
+        let got = unsafe { native(SYS_READ, fd, base, len) };
+        if got < 0 {
+            return if total > 0 { total } else { errno(got) };
+        }
+        total += got;
+        if (got as usize) < len {
+            break;
+        }
+    }
+    total
+}
+
+/// `ftruncate(fd, length)` — длина открытого файла (и `memfd`, фаза 71e).
+fn ftruncate(fd: usize, length: usize) -> i64 {
+    match crate::user::with_current(|program| program.files.node(fd)) {
+        Some(Ok(node)) => match node.truncate(length as u64) {
+            Ok(()) => 0,
+            Err(err) => vfs_errno(err),
+        },
+        Some(Err(err)) => file_errno(err),
+        None => -e::ESRCH,
+    }
+}
+
+/// `unlink`/`unlinkat`: `/dev/shm` — имя разделяемой памяти, остальное —
+/// файл на диске (фаза 71e).
+fn unlink(dir: usize, ptr: usize) -> i64 {
+    let linux = match linux_path(dir, ptr) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    if let Some(answer) = ipc::unlink_shm(&linux) {
+        return answer;
+    }
+    let cred = crate::user::credentials();
+    let path = crate::linux_path::resolve(&linux, cred);
+    match crate::fs::remove_as(cred, &path) {
+        Some(Ok(())) => 0,
+        Some(Err(err)) => vfs_errno(err),
+        None => -e::ENOENT,
+    }
 }

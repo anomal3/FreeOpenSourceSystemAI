@@ -106,6 +106,38 @@ enum Slot {
     /// освобождает ноль. Читают и пишут его не здесь — номер потока узнаёт
     /// [`Table::std_target`], и дальше работает прежний путь.
     Std(u8),
+    /// Объект слоя Linux (фаза 71e): сокет `AF_UNIX`, `eventfd`, `timerfd`,
+    /// `epoll`. Читает и пишет его сам слой Linux — вне замка программы.
+    Object(Arc<dyn Object>, Mode),
+}
+
+/// Объект ядра за дескриптором программы Linux (фаза 71e).
+///
+/// Ошибки — `-errno` Linux: объекты есть только у программ Linux. Ни один
+/// метод не ждёт: «пока нечего» — `-EAGAIN`, а ждёт вызывающий, вне замков.
+pub trait Object: Send + Sync {
+    fn read(&self, buf: &mut [u8]) -> Result<usize, i64>;
+    fn write(&self, data: &[u8]) -> Result<usize, i64>;
+    /// `(есть что читать, есть куда писать, другая сторона закрыта)`.
+    fn readiness(&self) -> (bool, bool, bool);
+    /// Тип для `fstat` (`S_IF*`); ноль — «анонимный узел» (`eventfd`).
+    fn mode(&self) -> u32;
+    /// Когда готовность может смениться сама, по времени (`timerfd`) — в
+    /// миллисекундах работы системы.
+    fn deadline(&self) -> Option<u64> {
+        None
+    }
+    fn as_any(&self) -> &dyn core::any::Any;
+}
+
+/// Дескриптор, вынутый для передачи другому процессу (`SCM_RIGHTS`, фаза
+/// 71e): ссылка на то же открытое.
+pub struct Handle(Slot);
+
+impl Clone for Handle {
+    fn clone(&self) -> Self {
+        Self(self.0.copy())
+    }
 }
 
 impl Slot {
@@ -117,6 +149,7 @@ impl Slot {
             Self::PipeWrite(writer, mode) => Self::PipeWrite(writer.clone(), mode.clone()),
             Self::Socket(socket) => Self::Socket(Arc::clone(socket)),
             Self::Std(stream) => Self::Std(*stream),
+            Self::Object(object, mode) => Self::Object(Arc::clone(object), mode.clone()),
         }
     }
 }
@@ -182,6 +215,8 @@ pub enum FdKind {
     Pipe,
     /// Сокет (фаза 65a).
     Socket,
+    /// Объект слоя Linux (фаза 71e).
+    Object,
 }
 
 /// Что ядро знает об открытом дескрипторе — ответ [`Table::describe`].
@@ -332,6 +367,44 @@ impl Table {
         matches!(self.cell(fd), Ok(Some(_)))
     }
 
+    /// Положить объект слоя Linux (фаза 71e).
+    pub fn install_object(&mut self, object: Arc<dyn Object>, nonblock: bool) -> Result<usize, FileError> {
+        let fd = self.free_fd(0)?;
+        self.put(fd, Slot::Object(object, Mode::new(nonblock)));
+        Ok(fd)
+    }
+
+    /// Объект за дескриптором и «не ждать» — ссылкой, чтобы работать вне
+    /// замка. `None` — там не объект.
+    #[must_use]
+    pub fn object(&self, fd: usize) -> Option<(Arc<dyn Object>, bool)> {
+        match self.cell(fd).ok()?.as_ref()? {
+            Slot::Object(object, mode) => Some((Arc::clone(object), mode.nonblock())),
+            _ => None,
+        }
+    }
+
+    /// Срок, к которому готовность дескриптора может смениться сама.
+    #[must_use]
+    pub fn deadline(&self, fd: usize) -> Option<u64> {
+        match self.cell(fd).ok()?.as_ref()? {
+            Slot::Object(object, _) => object.deadline(),
+            _ => None,
+        }
+    }
+
+    /// Ссылка на открытое за `fd` — для передачи (`SCM_RIGHTS`).
+    pub fn handle(&self, fd: usize) -> Result<Handle, FileError> {
+        Ok(Handle(self.cell(fd)?.as_ref().ok_or(FileError::BadFd)?.copy()))
+    }
+
+    /// Положить переданное на наименьший свободный номер.
+    pub fn install_handle(&mut self, handle: Handle) -> Result<usize, FileError> {
+        let fd = self.free_fd(0)?;
+        self.put(fd, handle.0);
+        Ok(fd)
+    }
+
     /// Открыть файл от имени `cred`.
     ///
     /// Права проверяются здесь и только здесь: дальше дескриптор уже открыт, и
@@ -443,7 +516,7 @@ impl Table {
             Slot::PipeWrite(writer, _) => writer.write(data, false).map_err(FileError::Pipe),
             // Сокет пишется в `sock.rs`, вне замка: сюда он не доходит.
             // Стандартный поток пишется прежним путём (`std_target`).
-            Slot::PipeRead(..) | Slot::Socket(_) | Slot::Std(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
+            Slot::PipeRead(..) | Slot::Socket(_) | Slot::Std(_) | Slot::Object(..) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
     }
 
@@ -484,7 +557,7 @@ impl Table {
                 }
                 Ok(Arc::clone(&open.node))
             }
-            Some(Slot::PipeRead(..) | Slot::PipeWrite(..) | Slot::Socket(_) | Slot::Std(_)) => {
+            Some(Slot::PipeRead(..) | Slot::PipeWrite(..) | Slot::Socket(_) | Slot::Std(_) | Slot::Object(..)) => {
                 Err(FileError::Vfs(VfsError::WrongKind))
             }
             None => Err(FileError::BadFd),
@@ -513,7 +586,7 @@ impl Table {
             }
             // Не ждёт по той же причине, что и запись выше.
             Slot::PipeRead(reader, _) => reader.read(buf, false).map_err(FileError::Pipe),
-            Slot::PipeWrite(..) | Slot::Socket(_) | Slot::Std(_) => Err(FileError::Vfs(VfsError::PermissionDenied)),
+            Slot::PipeWrite(..) | Slot::Socket(_) | Slot::Std(_) | Slot::Object(..) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
     }
 
@@ -603,7 +676,7 @@ impl Table {
     /// ждёт никогда.
     pub fn set_nonblock(&self, fd: usize, on: bool) -> Result<(), FileError> {
         match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
-            Slot::PipeRead(_, mode) | Slot::PipeWrite(_, mode) => mode.set(on),
+            Slot::PipeRead(_, mode) | Slot::PipeWrite(_, mode) | Slot::Object(_, mode) => mode.set(on),
             Slot::Socket(socket) => socket.set_nonblock(on),
             Slot::File(_) | Slot::Std(_) => {}
         }
@@ -613,7 +686,7 @@ impl Table {
     /// Не ждёт ли дескриптор. Файл — `true`: ждать ему нечего.
     pub fn nonblock(&self, fd: usize) -> Result<bool, FileError> {
         Ok(match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
-            Slot::PipeRead(_, mode) | Slot::PipeWrite(_, mode) => mode.nonblock(),
+            Slot::PipeRead(_, mode) | Slot::PipeWrite(_, mode) | Slot::Object(_, mode) => mode.nonblock(),
             Slot::Socket(socket) => socket.nonblock(),
             Slot::File(_) | Slot::Std(_) => true,
         })
@@ -731,6 +804,7 @@ impl Table {
             // Стандартный поток описывает тот, кто знает, что за ним
             // (`std_target`): терминал или канал запускающего.
             Some(Slot::Std(_)) => Err(FileError::Vfs(VfsError::WrongKind)),
+            Some(Slot::Object(..)) => Ok(FdInfo { size: 0, mode: 0o600, uid: 0, gid: 0, kind: FdKind::Object }),
             None => Err(FileError::BadFd),
         }
     }
@@ -748,6 +822,7 @@ impl Table {
             Some(Slot::PipeWrite(writer, _)) => Ok((false, writer.ready(), writer.hangup())),
             Some(Slot::Socket(socket)) => Ok(socket.readiness()),
             Some(Slot::Std(_)) => Ok((true, true, false)),
+            Some(Slot::Object(object, _)) => Ok(object.readiness()),
             None => Err(FileError::BadFd),
         }
     }

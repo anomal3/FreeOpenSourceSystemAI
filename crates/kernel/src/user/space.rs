@@ -122,8 +122,11 @@ impl Space {
     /// Чужих кадров (поверхность окна, регистры устройства) в пространстве
     /// быть не должно — их копия отдала бы два владельца одним кадрам;
     /// проверяет это вызывающий.
+    ///
+    /// `skip` — адреса, которые не копируются (разделяемая память, фаза 71e:
+    /// её страницы ребёнок получит отказами из того же объекта).
     #[cfg(target_arch = "x86_64")]
-    pub fn duplicate(&self) -> Result<Self, MapError> {
+    pub fn duplicate(&self, skip: &dyn Fn(usize) -> bool) -> Result<Self, MapError> {
         let mut copy = Self::new()?;
         let end = super::WINDOW_BASE + (1usize << 39);
         let mut virt = super::WINDOW_BASE;
@@ -133,6 +136,10 @@ impl Space {
                 virt += arch::unmapped_run(self.root, at) * PAGE_SIZE;
                 continue;
             };
+            if skip(virt) {
+                virt += PAGE_SIZE;
+                continue;
+            }
             let frame = crate::mm::frame::with(|frames| {
                 if frames.stats().free <= super::RESERVE_FRAMES {
                     return None;
@@ -513,8 +520,10 @@ impl Space {
                     // обычном снятии: крупная страница снимается целиком.
                     done += count;
                 }
-                // Страницы нет — законно: область могли снять раньше.
-                None => done += 1,
+                // Страницы нет — законно: область могли снять раньше или не
+                // касаться вовсе (разделяемая память, фаза 71e) — пустые куски
+                // целиком.
+                None => done += arch::unmapped_run(root, virt),
             }
         }
 

@@ -10032,6 +10032,65 @@ Chromium — свои процессы.
 Межпроцессное: `AF_UNIX` (`socketpair`, `SCM_RIGHTS`) — bash уже спрашивает
 `socket`/`getpeername`; `memfd_create` и `MAP_SHARED` между процессами,
 `eventfd`, `epoll`, `timerfd`. Копирование при записи для `fork`.
+## Фаза 71e — межпроцессное: AF_UNIX, epoll, eventfd, timerfd, memfd — **сделано 2026-10-23**
+
+### Что стало
+
+- **Объекты слоя Linux в таблице дескрипторов** (`files::Object`,
+  `Slot::Object`): ссылка, общая у копий (`dup`, `fork`, `SCM_RIGHTS`).
+  Объект не ждёт никогда — «пока нечего» отвечает `-EAGAIN`, а ждёт
+  `linux::ipc::wait_io` вне всех замков, на поколении `io_events`, которое
+  объект сменяет, когда у него что-то готово; сигнал и снятие — `EINTR`.
+  `read`/`write`/`readv`/`writev` на объект идут сюда, остальное — родным
+  путём. `fstat` — `S_IFSOCK` или «анонимный узел». `poll` видит готовность
+  объектов и срок таймера.
+- **Сокеты `AF_UNIX`** (`linux::ipc`): `socket`, `socketpair`, `bind`,
+  `listen`, `connect`, `accept`/`accept4`, `shutdown`, `getsockname`,
+  `getpeername`, `getsockopt` (`SO_TYPE`, `SO_ERROR`, `SO_PEERCRED`, размеры
+  буферов), `setsockopt` (принимается), `sendmsg`/`recvmsg` с `SCM_RIGHTS`
+  (и `MSG_CMSG_CLOEXEC`, `MSG_PEEK`, `MSG_DONTWAIT`), `sendto`/`recvfrom` без
+  адреса. Типы `SOCK_STREAM`, `SOCK_SEQPACKET`, `SOCK_DGRAM` (парой). Два
+  направления — очереди пакетов по 256 КиБ; у потокового чтение
+  останавливается на пакете с дескрипторами, чтобы права пришли со своими
+  байтами. Имена — пути и абстрактные, в памяти ядра (файла на диске не
+  появляется). Сеть (`AF_INET`) — `EAFNOSUPPORT`, она — следующей фазой.
+- **`eventfd`/`eventfd2`** (счётчик и семафор), **`timerfd`**
+  (`timerfd_create`/`settime`/`gettime`, монотонные часы и время суток,
+  однократный и с интервалом, `TFD_TIMER_ABSTIME`), **`epoll`**
+  (`epoll_create1`, `epoll_ctl`, `epoll_wait`/`epoll_pwait`; уровень,
+  `EPOLLET` — сообщается только ставшее готовым с прошлого опроса,
+  `EPOLLONESHOT`). Набор хранит номера дескрипторов, а не открытые файлы, как
+  Linux; вложенный `epoll` не опрашивается.
+- **Разделяемая память** (`user::shm`): `SharedMem` — кадры объекта, а не
+  программы, приходят по первому касанию. Новый вид области
+  `Source::Shared`: отказ страницы берёт кадр у объекта и отображает его
+  чужим (`map_frames`), снятие — без возврата в пул (`unmap_range_keep`, со
+  сбросом трансляций на всех процессорах у многопоточных), до разбора
+  пространства — в `Drop` программы и при `execve`. Область режется
+  (`munmap` куском, `mprotect`). `fork` такие страницы не копирует: ребёнок
+  получает их отказами из того же объекта. Источники: `memfd_create`
+  (`ShmNode` — файл над объектом, `read`/`write`/`ftruncate`), `/dev/shm/имя`
+  (`shm_open`, `shm_unlink`), `MAP_SHARED|MAP_ANONYMOUS`. `Node::shared_memory`
+  отличает такой файл от обычного.
+- `ftruncate`, `unlink`/`unlinkat` (файлы на диске и `/dev/shm`), `readv`.
+
+### Проверено
+
+`linux-debian`: новая программа на glibc `ipccheck` (`libc/linux/ipccheck.c`,
+в пакете `/usr/libexec/fossai/ipccheck`) — 11 из 11: пара сокетов между
+процессами и конец файла после выхода собеседника, границы
+`SOCK_SEQPACKET`, конец канала через `SCM_RIGHTS` другому процессу,
+`bind`/`listen`/`accept`/`connect` по абстрактному имени, `SO_PEERCRED`,
+`eventfd`, `timerfd` однократный и с интервалом, `epoll` над сокетом и
+таймером, `memfd` с `MAP_SHARED` между родителем и ребёнком (и `pread` через
+дескриптор), `MAP_SHARED|MAP_ANONYMOUS` после `fork`, `shm_open` со вторым
+отображением и `shm_unlink`. Прежние `linuxcheck` 22/22 и `forkcheck` 10/10 —
+зелёные; регрессия — см. коммит.
+
+### Дальше — 71f
+
+Сеть для программ Linux: `AF_INET`/`AF_INET6` поверх родного стека (TCP,
+UDP), имена через `/etc/resolv.conf` — без неё Chromium не скачает страницу.
 
 # Полный прогон 17.10 — 407 из 428, один дефект установщика
 

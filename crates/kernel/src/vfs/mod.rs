@@ -240,6 +240,12 @@ pub trait Node: Send + Sync {
     fn rmdir(&self, _name: &str) -> VfsResult<()> {
         Err(VfsError::Unsupported)
     }
+
+    /// Разделяемая память за файлом (фаза 71e: `memfd`, `/dev/shm`) — её
+    /// `mmap(MAP_SHARED)` отображает общими кадрами. У обычного файла — нет.
+    fn shared_memory(&self) -> Option<alloc::sync::Arc<crate::user::shm::SharedMem>> {
+        None
+    }
 }
 
 /// Чем закончилась проверка тома.

@@ -1505,6 +1505,7 @@ fn fstat(fd: usize, out: usize) -> i64 {
             files::FdKind::Directory => KIND_DIRECTORY,
             files::FdKind::Pipe => KIND_PIPE,
             files::FdKind::Socket => user_abi::KIND_SOCKET,
+            files::FdKind::Object => KIND_PIPE,
         },
     };
     // SAFETY: адрес проверен на выравнивание и на то, что структура целиком

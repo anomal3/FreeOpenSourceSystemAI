@@ -68,6 +68,7 @@ pub mod elf;
 pub mod files;
 pub mod pipe;
 pub mod session;
+pub mod shm;
 pub mod sock;
 pub mod space;
 pub mod syscall;
@@ -398,6 +399,19 @@ enum Source {
     /// область снимается без возврата кадров, в [`Program::release_devices`],
     /// и `munmap` её не снимает.
     Device,
+    /// Разделяемой памятью (фаза 71e): кадры принадлежат объекту
+    /// [`shm::SharedMem`] — их видят все, кто его отобразил, — и снимаются без
+    /// возврата в пул (см. модуль [`shm`]).
+    Shared(SharedBacking),
+}
+
+/// Область разделяемой памяти: чья память, с какой её страницы и с какими
+/// правами.
+struct SharedBacking {
+    mem: Arc<shm::SharedMem>,
+    /// Номер страницы объекта, отвечающей началу области.
+    first: usize,
+    flags: PageFlags,
 }
 
 /// Безымянная область: с какими правами её страницы и когда приходят кадры.
@@ -840,6 +854,10 @@ pub struct LinuxAction {
 
 impl Drop for Program {
     fn drop(&mut self) {
+        // Кадры разделяемой памяти — не наши: снять их до разбора
+        // пространства (поля уничтожаются после этой функции), иначе разбор
+        // вернул бы их в пул из-под живого объекта (фаза 71e).
+        release_shared(&mut self.space, &self.mappings, false);
         // Строка только у тех, кто памятью кода пользовался: по ней видно,
         // сколько стоило W^X, — и ждал ли кто-нибудь чужой записи.
         let jit = &self.jit;
@@ -1033,6 +1051,7 @@ impl Program {
         prot: usize,
         fixed: bool,
         file: Option<(Arc<dyn Node>, u64)>,
+        shared: Option<(Arc<shm::SharedMem>, u64)>,
     ) -> Result<usize, MmapError> {
         use user_abi::{PROT_EXEC, PROT_READ, PROT_WRITE};
         if len == 0 || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
@@ -1069,8 +1088,16 @@ impl Program {
         } else {
             self.reserve(len, PAGE_SIZE)?.0
         };
-        let source = match file {
-            Some((node, offset)) => {
+        let source = match (shared, file) {
+            // Разделяемая память (фаза 71e): `memfd`, `/dev/shm`, `MAP_SHARED |
+            // MAP_ANONYMOUS`.
+            (Some((mem, offset)), _) => {
+                if offset % PAGE_SIZE as u64 != 0 {
+                    return Err(MmapError::BadRequest);
+                }
+                Source::Shared(SharedBacking { mem, first: (offset / PAGE_SIZE as u64) as usize, flags })
+            }
+            (None, Some((node, offset))) => {
                 if offset % PAGE_SIZE as u64 != 0 {
                     return Err(MmapError::BadRequest);
                 }
@@ -1085,7 +1112,7 @@ impl Program {
                     evictions: 0,
                 })
             }
-            None => Source::Anonymous(Anon { flags, lazy: true, jit: false }),
+            (None, None) => Source::Anonymous(Anon { flags, lazy: true, jit: false }),
         };
         self.remember(Mapping { base, pages, blocks: 0, source });
         Ok(base)
@@ -1292,6 +1319,7 @@ impl Program {
         match region.source {
             Source::Anonymous(_) => region.blocks == 0,
             Source::Image(_) => self.linux,
+            Source::Shared(_) => true,
             _ => false,
         }
     }
@@ -1331,6 +1359,11 @@ impl Program {
                 image.file_bytes = image.file_bytes.min(cut);
                 Source::Image(right)
             }
+            Source::Shared(shared) => Source::Shared(SharedBacking {
+                mem: Arc::clone(&shared.mem),
+                first: shared.first + left,
+                flags: shared.flags,
+            }),
             _ => unreachable!("делимость области проверяется до разреза"),
         };
         let right = Mapping { base: addr, pages: region.pages - left, blocks: 0, source };
@@ -1404,9 +1437,7 @@ impl Program {
         let count = self.mappings[first..].iter().take_while(|region| region.base < end).count();
         let removed: Vec<Mapping> = self.mappings.drain(first..first + count).collect();
         for region in removed {
-            // SAFETY: область только что вынута из таблицы этой программы, то
-            // есть кадры под ней принадлежат ей одной.
-            let freed = unsafe { self.space.unmap_range(VirtAddr::new(region.base), region.pages, shared) };
+            let freed = release_region(&mut self.space, &region, shared);
             // Жадная область обязана вернуть каждую страницу — в этом и смысл
             // проверки, что таблицы не разошлись с записью. У ленивой
             // отображено ровно то, чего коснулись, и сверять не с чем.
@@ -1506,6 +1537,10 @@ impl Program {
                     }
                     if flags.contains(PageFlags::USER) { flags } else { PageFlags::READ }
                 }
+                Source::Shared(memory) => {
+                    memory.flags = flags;
+                    if flags.contains(PageFlags::USER) { flags } else { PageFlags::READ }
+                }
                 _ => unreachable!("покрытие проверено выше"),
             };
             for page in 0..pages {
@@ -1558,11 +1593,9 @@ impl Program {
             return Err(MmapError::BadRequest);
         }
 
-        // SAFETY: область выдана этой же программе и записана в её таблице, то
-        // есть кадры под ней принадлежат ей одной.
-        let freed = unsafe { self.space.unmap_range(VirtAddr::new(addr), pages, shared) };
-
         let region = self.mappings.remove(index);
+        let freed = release_region(&mut self.space, &region, shared);
+        let _ = pages;
         // Сколько страниц обязано было вернуться — вопрос к источнику: у
         // безымянной области отображены все, у отображённого файла только
         // подкачанные. Разница между «страниц меньше, потому что их и не
@@ -1584,6 +1617,8 @@ impl Program {
             // Сегмент программы Linux (фаза 71b): записанные страницы в счёт
             // не идут, сверять не с чем.
             Source::Image(..) if self.linux => freed,
+            // Разделяемая: снято то, чего касались, кадры остались объекту.
+            Source::Shared(_) => freed,
             // Сюда не приходят: поверхность и сегмент образа отсеяны проверками
             // выше. Ветки существуют затем, чтобы новый вид области нельзя было
             // завести, не ответив на вопрос, сколько кадров он обязан вернуть.
@@ -1715,7 +1750,7 @@ impl Program {
                 } else {
                     anon.flags
                 };
-                Some(FaultPlan { node: None, offset: 0, want: 0, flags, clean: false })
+                Some(FaultPlan { node: None, offset: 0, want: 0, flags, clean: false, shared: None })
             }
             // Ленивая безымянная память (фаза 56): страница из ниоткуда, то
             // есть кадр с нулями, — если права области пускают такое
@@ -1728,7 +1763,7 @@ impl Program {
                 {
                     return None;
                 }
-                Some(FaultPlan { node: None, offset: 0, want: 0, flags: anon.page_flags(), clean: false })
+                Some(FaultPlan { node: None, offset: 0, want: 0, flags: anon.page_flags(), clean: false, shared: None })
             }
             Source::File(file) => {
                 // Отображение только на чтение, и попытка записи — не отказ
@@ -1742,6 +1777,7 @@ impl Program {
                     want: PAGE_SIZE,
                     flags: PageFlags::READ | PageFlags::USER,
                     clean: true,
+                    shared: None,
                 })
             }
             Source::Image(image) => {
@@ -1761,6 +1797,7 @@ impl Program {
                     want: image.file_bytes.saturating_sub(start).min(PAGE_SIZE),
                     flags: image.flags,
                     clean: !image.flags.contains(PageFlags::WRITE),
+                    shared: None,
                 })
             }
             // Жадная безымянная область отображена целиком с самого начала,
@@ -1771,7 +1808,37 @@ impl Program {
             // Отказ в стеке потока — это переполнение, пришедшее в сторожевую
             // страницу, и подкладывать ему память значило бы отменить сторожа.
             // Регистры устройства и память DMA отображены целиком сразу.
+            Source::Shared(memory) => {
+                if (write && !memory.flags.contains(PageFlags::WRITE)) || !memory.flags.contains(PageFlags::USER) {
+                    return None;
+                }
+                Some(FaultPlan {
+                    node: None,
+                    offset: 0,
+                    want: 0,
+                    flags: memory.flags,
+                    clean: false,
+                    shared: Some((Arc::clone(&memory.mem), memory.first + page)),
+                })
+            }
             Source::Anonymous(_) | Source::Surface(..) | Source::ThreadStack | Source::Device => None,
+        }
+    }
+
+    /// Вторая половина отказа в разделяемой памяти (фаза 71e): кадр — объекта,
+    /// отображается чужим (без счёта своих страниц и без возврата при снятии).
+    fn fault_commit_shared(&mut self, page_addr: usize, frame: PhysAddr, flags: PageFlags) -> Commit {
+        if self.region_at(page_addr).is_none() {
+            return Commit::Failed;
+        }
+        if arch::translate(self.space.root(), VirtAddr::new(page_addr)).is_some() {
+            return Commit::Raced;
+        }
+        // SAFETY: кадр живёт, пока жив объект, а объект держит область этой
+        // программы; снимается область через `release_region`, без возврата.
+        match unsafe { self.space.map_frames(VirtAddr::new(page_addr), frame, 1, flags) } {
+            Ok(()) => Commit::Mapped,
+            Err(_) => Commit::Failed,
         }
     }
 
@@ -2016,6 +2083,9 @@ struct FaultPlan {
     want: usize,
     flags: PageFlags,
     clean: bool,
+    /// Разделяемая память (фаза 71e): объект и номер его страницы — кадр не
+    /// читается, а берётся у объекта.
+    shared: Option<(Arc<shm::SharedMem>, usize)>,
 }
 
 /// Пора ли отображениям файлов отдавать страницы сверх [`RESIDENT_MAX_PAGES`]
@@ -3732,7 +3802,7 @@ pub fn futex_key(addr: usize) -> Option<usize> {
         program.mappings.iter().any(|region| {
             addr >= region.base
                 && addr < region.base + region.pages * PAGE_SIZE
-                && matches!(region.source, Source::Anonymous(_) | Source::ThreadStack)
+                && matches!(region.source, Source::Anonymous(_) | Source::ThreadStack | Source::Shared(_))
         })
     })
     .unwrap_or(false);
@@ -3930,6 +4000,9 @@ impl Mapping {
                 reads: 0,
                 evictions: 0,
             }),
+            Source::Shared(shared) => {
+                Source::Shared(SharedBacking { mem: Arc::clone(&shared.mem), first: shared.first, flags: shared.flags })
+            }
             Source::Surface(..) | Source::Device => return None,
         };
         Some(Self { base: self.base, pages: self.pages, blocks: 0, source })
@@ -3954,7 +4027,16 @@ impl Program {
         for region in &self.mappings {
             mappings.push(region.fork_copy().ok_or(MmapError::BadRequest)?);
         }
-        let space = self.space.duplicate().map_err(|_| MmapError::NoMemory)?;
+        // Разделяемую память не копируем: у ребёнка она та же, и её страницы
+        // придут к нему отказами из того же объекта.
+        let shared: Vec<(usize, usize)> = self
+            .mappings
+            .iter()
+            .filter(|region| matches!(region.source, Source::Shared(_)))
+            .map(|region| (region.base, region.end()))
+            .collect();
+        let skip = |addr: usize| shared.iter().any(|&(base, end)| addr >= base && addr < end);
+        let space = self.space.duplicate(&skip).map_err(|_| MmapError::NoMemory)?;
         Ok(Self {
             space,
             files: self.files.fork(),
@@ -4183,6 +4265,8 @@ pub fn exec(frame: &mut arch::TrapFrame, path: &str, args: &[&str], env: &[&str]
     // SAFETY: корень построен копией ядерного; старое пространство разбирается
     // только ниже, когда процессор на нём уже не стоит.
     unsafe { arch::activate_space(root) };
+    let mut old_space = old_space;
+    release_shared(&mut old_space, &old_mappings, false);
     drop(old_mappings);
     drop(old_space);
 
@@ -4288,6 +4372,7 @@ impl Program {
                 Source::Anonymous(anon) => (anon.flags, "", 0),
                 Source::ThreadStack => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, "", 0),
                 Source::Image(image) => (image.flags, exe, image.offset),
+                Source::Shared(shared) => (shared.flags, "/dev/shm", (shared.first * PAGE_SIZE) as u64),
                 Source::File(file) => (PageFlags::READ | PageFlags::USER, "", file.offset),
                 _ => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, "", 0),
             };
@@ -4658,6 +4743,16 @@ pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     let Some(plan) = with_current(|program| program.fault_plan(page_addr, access)).flatten() else {
         return false;
     };
+    if let Some((memory, page)) = &plan.shared {
+        let Some(frame) = memory.frame(*page) else {
+            return false;
+        };
+        let flags = plan.flags;
+        return !matches!(
+            with_current(|program| program.fault_commit_shared(page_addr, frame, flags)),
+            None | Some(Commit::Failed)
+        );
+    }
 
     // Шаг второй, без замка: кадр и чтение. Замок пула отпускается до чтения:
     // путь чтения берёт засыпающие мьютексы, а держать под ними `SpinLock`,
@@ -4957,4 +5052,29 @@ pub unsafe fn faulted(what: &str, at: usize, addr: usize) -> ! {
     // SAFETY: контракт функции — программа запущена, значит `enter_user`
     // действительно исполняется и его кадр на стеке ядра цел.
     unsafe { arch::return_to_kernel(user_abi::EXIT_FAULTED) }
+}
+
+/// Снять область из таблицы `region` с пространства: свои кадры — в пул,
+/// кадры разделяемой памяти — объекту (фаза 71e). Возвращает, сколько страниц
+/// снято.
+fn release_region(space: &mut Space, region: &Mapping, shared: bool) -> usize {
+    if let Source::Shared(_) = region.source {
+        // SAFETY: страницы области отображены `map_frames` из объекта, который
+        // держит эта же запись; в пул они не уходят.
+        let removed = unsafe { space.unmap_range_keep(VirtAddr::new(region.base), region.pages) };
+        if shared && removed > 0 {
+            arch::flush_user_translations();
+        }
+        return removed;
+    }
+    // SAFETY: область вынута из таблицы этой программы, то есть кадры под ней
+    // принадлежат ей одной.
+    unsafe { space.unmap_range(VirtAddr::new(region.base), region.pages, shared) }
+}
+
+/// Снять с пространства все области разделяемой памяти — перед его разбором.
+fn release_shared(space: &mut Space, mappings: &[Mapping], shared: bool) {
+    for region in mappings.iter().filter(|region| matches!(region.source, Source::Shared(_))) {
+        release_region(space, region, shared);
+    }
 }

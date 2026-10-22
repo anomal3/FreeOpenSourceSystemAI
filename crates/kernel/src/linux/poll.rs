@@ -88,6 +88,16 @@ fn wait(fds: usize, count: usize, deadline: Option<u64>) -> i64 {
         if let Some(deadline) = deadline {
             until = until.min(deadline);
         }
+        // `timerfd` становится готов сам, по времени (фаза 71e).
+        for index in 0..count {
+            // SAFETY: массив проверен на запись выше.
+            let fd = unsafe { core::ptr::read_unaligned((fds + index * 8) as *const i32) };
+            if fd >= 0 {
+                if let Some(at) = crate::user::with_current(|program| program.files.deadline(fd as usize)).flatten() {
+                    until = until.min(at.max(crate::time::uptime_ms() + 1));
+                }
+            }
+        }
         crate::io_events::wait(seen, Some(until));
     }
 }
