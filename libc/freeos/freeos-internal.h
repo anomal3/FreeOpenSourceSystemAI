@@ -29,4 +29,7 @@ int freeos_socket_is_nonblock(int fd);
 /* Дескриптор закрыт — забыть о нём (`close`). */
 void freeos_socket_forget(int fd);
 
+/* Забыть путь каталога, открытого под `fd` (`openat`, фаза 70d), — зовёт `close`. */
+void freeos_dirfd_forget(int fd);
+
 #endif

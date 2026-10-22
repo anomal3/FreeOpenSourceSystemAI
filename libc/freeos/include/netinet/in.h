@@ -70,6 +70,29 @@ struct sockaddr_in6 {
 #define IPV6_MULTICAST_LOOP 19
 #define IPV6_JOIN_GROUP 20
 #define IPV6_LEAVE_GROUP 21
+/* Фаза 70d: cpp-httplib (его тянет llama.cpp) ставит `IPV6_V6ONLY` всякому
+ * слушающему сокету и разбирает адреса макросами `IN6_IS_ADDR_*`. IPv6 в
+ * системе нет: `setsockopt` с этим параметром отвечает отказом, а сокета
+ * `AF_INET6` не создать вовсе, — но собираться код обязан. Число — Linux. */
+#define IPV6_V6ONLY 26
+
+#define IN6_IS_ADDR_UNSPECIFIED(a) \
+    ((a)->__s6_addr32[0] == 0 && (a)->__s6_addr32[1] == 0 && \
+     (a)->__s6_addr32[2] == 0 && (a)->__s6_addr32[3] == 0)
+#define IN6_IS_ADDR_LOOPBACK(a) \
+    ((a)->__s6_addr32[0] == 0 && (a)->__s6_addr32[1] == 0 && \
+     (a)->__s6_addr32[2] == 0 && (a)->s6_addr[12] == 0 && (a)->s6_addr[13] == 0 && \
+     (a)->s6_addr[14] == 0 && (a)->s6_addr[15] == 1)
+#define IN6_IS_ADDR_MULTICAST(a) ((a)->s6_addr[0] == 0xff)
+#define IN6_IS_ADDR_LINKLOCAL(a) ((a)->s6_addr[0] == 0xfe && ((a)->s6_addr[1] & 0xc0) == 0x80)
+#define IN6_IS_ADDR_SITELOCAL(a) ((a)->s6_addr[0] == 0xfe && ((a)->s6_addr[1] & 0xc0) == 0xc0)
+#define IN6_IS_ADDR_V4MAPPED(a) \
+    ((a)->__s6_addr32[0] == 0 && (a)->__s6_addr32[1] == 0 && \
+     (a)->s6_addr[8] == 0 && (a)->s6_addr[9] == 0 && \
+     (a)->s6_addr[10] == 0xff && (a)->s6_addr[11] == 0xff)
+#define IN6_IS_ADDR_V4COMPAT(a) \
+    ((a)->__s6_addr32[0] == 0 && (a)->__s6_addr32[1] == 0 && \
+     (a)->__s6_addr32[2] == 0 && !IN6_IS_ADDR_UNSPECIFIED(a) && !IN6_IS_ADDR_LOOPBACK(a))
 
 struct ip_mreq {
     struct in_addr imr_multiaddr;

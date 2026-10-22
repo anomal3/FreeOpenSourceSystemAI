@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -189,6 +190,8 @@ int rmdir(const char *path) {
     return code < 0 ? freeos_set_errno(code) : 0;
 }
 
+static void dirfd_remember(int fd, const char *path);
+
 /* Каталог — дескриптор, открытый `SYS_OPEN`, из которого `SYS_READDIR` отдаёт
  * по записи. Список фиксируется при открытии (так обещает ядро), поэтому
  * `rewinddir` — это повторное открытие, а не сдвиг позиции. */
@@ -210,6 +213,11 @@ DIR *opendir(const char *path) {
         return NULL;
     }
     dir->fd = fd;
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = freeos_path(path, buf);
+    if (full != NULL) {
+        dirfd_remember(fd, full);
+    }
     return dir;
 }
 
@@ -247,6 +255,144 @@ int closedir(DIR *dir) {
 }
 
 int dirfd(DIR *dir) { return dir->fd; }
+
+/* ── Пути от каталога: `openat` и соседи (фаза 70d) ─────────────────────────
+ *
+ * Их зовёт `std::filesystem` из libc++ (`remove_all` идёт по дереву через
+ * `openat`, `fdopendir` и `unlinkat`). У ядра нет пути «от дескриптора» —
+ * каждый вызов получает путь целиком. Поэтому libc помнит, какой путь открыт
+ * под каким дескриптором каталога: `openat` и `opendir` записывают, `close`
+ * стирает. Дескриптор, которого в таблице нет (каталог открыт голым `open`,
+ * или таблица полна), — `EBADF`: честнее, чем угадывать путь. */
+
+#define DIRFD_SLOTS 64
+
+static struct {
+    int fd;
+    int used; /* таблица в .bss: ноль — свободно */
+    char path[FREEOS_PATH_LIMIT + 1];
+} dirfds[DIRFD_SLOTS];
+
+static void dirfd_remember(int fd, const char *path) {
+    for (int index = 0; index < DIRFD_SLOTS; index++) {
+        if (!dirfds[index].used) {
+            dirfds[index].used = 1;
+            dirfds[index].fd = fd;
+            strncpy(dirfds[index].path, path, FREEOS_PATH_LIMIT);
+            dirfds[index].path[FREEOS_PATH_LIMIT] = '\0';
+            return;
+        }
+    }
+}
+
+void freeos_dirfd_forget(int fd) {
+    for (int index = 0; index < DIRFD_SLOTS; index++) {
+        if (dirfds[index].used && dirfds[index].fd == fd) {
+            dirfds[index].used = 0;
+        }
+    }
+}
+
+/* Путь `path` от каталога `dir`: абсолютный и `AT_FDCWD` — как у всех
+ * функций с путём, иначе — к пути, под которым `dir` был открыт. */
+static const char *at_path(int dir, const char *path, char *buf) {
+    if (path == NULL || path[0] == '\0' || path[0] == '/' || dir == AT_FDCWD) {
+        return freeos_path(path, buf);
+    }
+    for (int index = 0; index < DIRFD_SLOTS; index++) {
+        if (dirfds[index].used && dirfds[index].fd == dir) {
+            size_t len = strlen(dirfds[index].path);
+            memcpy(buf, dirfds[index].path, len + 1);
+            return push_path(buf, &len, path) == 0 ? buf : NULL;
+        }
+    }
+    errno = EBADF;
+    return NULL;
+}
+
+int openat(int dir, const char *path, int flags, ...) {
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = at_path(dir, path, buf);
+    if (full == NULL) {
+        return -1;
+    }
+    int fd = open(full, flags & ~O_DIRECTORY);
+    if (fd < 0) {
+        return -1;
+    }
+    struct stat info;
+    if (fstat(fd, &info) == 0 && S_ISDIR(info.st_mode)) {
+        dirfd_remember(fd, full);
+    } else if (flags & O_DIRECTORY) {
+        close(fd);
+        errno = ENOTDIR;
+        return -1;
+    }
+    return fd;
+}
+
+DIR *fdopendir(int fd) {
+    struct stat info;
+    if (fstat(fd, &info) != 0) {
+        return NULL;
+    }
+    if (!S_ISDIR(info.st_mode)) {
+        errno = ENOTDIR;
+        return NULL;
+    }
+    DIR *dir = calloc(1, sizeof(*dir));
+    if (dir == NULL) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    dir->fd = fd;
+    return dir;
+}
+
+int unlinkat(int dir, const char *path, int flags) {
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = at_path(dir, path, buf);
+    if (full == NULL) {
+        return -1;
+    }
+    return (flags & AT_REMOVEDIR) ? rmdir(full) : unlink(full);
+}
+
+int fchmodat(int dir, const char *path, mode_t mode, int flags) {
+    (void)flags;
+    char buf[FREEOS_PATH_LIMIT + 1];
+    const char *full = at_path(dir, path, buf);
+    return full == NULL ? -1 : chmod(full, mode);
+}
+
+/* Обрезать файл ядро умеет только до нуля — открытием с `O_TRUNC`; любая
+ * другая длина — `ENOSYS`, как у `ftruncate`. */
+int truncate(const char *path, off_t length) {
+    if (length != 0) {
+        errno = ENOSYS;
+        return -1;
+    }
+    int fd = open(path, O_WRONLY | O_TRUNC);
+    if (fd < 0) {
+        return -1;
+    }
+    return close(fd);
+}
+
+/* Сведений о свободном месте на томе ядро не отдаёт: вызова нет. */
+int statvfs(const char *path, struct statvfs *out) {
+    (void)path;
+    (void)out;
+    errno = ENOSYS;
+    return -1;
+}
+
+int fstatvfs(int fd, struct statvfs *out) {
+    (void)fd;
+    (void)out;
+    errno = ENOSYS;
+    return -1;
+}
 
 /* ── Пути, которых у нас нет ─────────────────────────────────────────────── */
 

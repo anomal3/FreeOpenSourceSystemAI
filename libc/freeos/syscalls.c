@@ -136,6 +136,7 @@ int close(int fd) {
         return freeos_set_errno(code);
     }
     freeos_socket_forget(fd);
+    freeos_dirfd_forget(fd);
     return 0;
 }
 

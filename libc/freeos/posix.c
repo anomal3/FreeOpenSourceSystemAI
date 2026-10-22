@@ -855,3 +855,25 @@ int munlock(const void *addr, size_t len) {
     errno = ENOSYS;
     return -1;
 }
+
+/* Приоритеты процессов (фаза 70d: `common` llama.cpp зовёт `setpriority`).
+ * Уступчивости (`nice`) у планировщика нет: все задачи равны, и это ровно
+ * приоритет 0. Его `getpriority` и называет, а `setpriority` принимает; любой
+ * другой — `ENOSYS`, а не молчаливый успех: программа, повысившая себе
+ * приоритет, обязана узнать, что он остался прежним. */
+int getpriority(int which, id_t who) {
+    (void)which;
+    (void)who;
+    errno = 0;
+    return 0;
+}
+
+int setpriority(int which, id_t who, int value) {
+    (void)which;
+    (void)who;
+    if (value == 0) {
+        return 0;
+    }
+    errno = ENOSYS;
+    return -1;
+}

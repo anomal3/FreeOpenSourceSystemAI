@@ -4987,6 +4987,60 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "llama",
+        about: "Библиотека C++ и llama.cpp на процессоре (фаза 70d): пакет llama с носителя, cxxdemo (исключения, RTTI, потоки, regex), llama-simple пишет сказку моделью stories15M.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        // `-cpu max`: ggml x86-64 собран с AVX (наименьшее у машин, где
+        // систему запускают), а `qemu64` по умолчанию его не знает. Два
+        // процессора — потоки ggml на разных ядрах.
+        extra: &["-cpu", "max", "-smp", "2"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Line("run /bin/pkg install /media/llama-0.7.0.fpk"),
+            Step::Await("pkg: installed llama 0.7.0, 5 file(s)", 300_000),
+            Step::Line("run /opt/llama/bin/cxxdemo"),
+            Step::Await("cxx: iostream says hello", 60_000),
+            Step::Await("cxx: 0 failed", 10_000),
+            Step::Await("/opt/llama/bin/cxxdemo: exited with code 0", 30_000),
+            Step::Line("run /opt/llama/bin/llama-simple -m /opt/llama/models/stories15M-q4_0.gguf -n 32 Once upon a time"),
+            Step::Await("main: decoded 32 tokens in", 600_000),
+            // Жадный выбор, текст одинаков на обеих архитектурах: «Once upon
+            // a time, there was a little girl named Lily. She loved to play
+            // outside and explore the world around her…». Целиком его не
+            // ждать: слова идут по одному, вперемешку со строками ядра о
+            // потоках ggml, — поэтому по словам.
+            Step::Expect(" little"),
+            Step::Expect(" girl"),
+            Step::Expect(" named"),
+            Step::Expect(" explore"),
+            Step::Await("/opt/llama/bin/llama-simple: exited with code 0", 60_000),
+            Step::Line("run /bin/pkg remove llama"),
+            Step::Await("pkg: removed llama", 120_000),
+            Step::Absent("cxx: FAILED"),
+            Step::Absent("user        : killed by"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "doom",
         about: "Первая игра на SDL2 (фазы 68d, 68e): пакет freedoom с носителя, doomgeneric с данными Freedoom — заставка, меню, новая игра, выстрелы со звуком, крестик.",
         target: Target::Installed,

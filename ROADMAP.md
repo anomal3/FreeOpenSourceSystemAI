@@ -9615,6 +9615,101 @@ ASUS K53SD (HD3000, `8086:0116`, поколение 6), сборка 0.8.503 с 
 проверен). В QEMU графики Intel нет: `display`, `vmsvga`, `gpu`, `boot`,
 `display-keep` — зелёные, то есть другие машины переключение не задело.
 
+## Фаза 70d — библиотека C++ и llama.cpp на процессоре — **сделано 2026-10-22**
+
+### Зачем
+
+Языковые модели — одна из целей вехи, и llama.cpp — первый шаг к ним: на
+процессоре, без видеокарты. Заодно это первая большая программа на C++ —
+до сих пор у набора был язык C++ без его библиотеки (фаза 61b).
+
+### Что стало
+
+- **Стандартная библиотека C++**: libc++, libc++abi и libunwind из LLVM
+  22.1.8 — той же версии, что clang набора, — их собственной сборкой
+  «runtimes» на CMake (`cargo xtask thirdparty --only libcxx`). С
+  исключениями, RTTI, потоками, `steady_clock`, `std::filesystem`, локалями и
+  `std::regex`. Из архива LLVM (160 МиБ) распаковывается только нужное.
+- **Обёртка компилятора**: имена `x86_64-freeos-c++` (`g++`, `clang++`),
+  файлы ответов `@файл` (ими пользуются CMake и Ninja), заголовки libc++
+  впереди сишных, `-D_GNU_SOURCE` у C++ на обеих архитектурах. Программа на
+  C++ компонуется со своим сценарием **`freeos-cxx.ld`** — он выводится из
+  `user.ld` и отличается одним: таблицы раскрутки стека (`.eh_frame`,
+  `.eh_frame_hdr`, `.gcc_except_table`) не выброшены, а лежат в сегменте
+  только для чтения с границами для libunwind. Программам на C и Rust
+  таблицы не нужны и по-прежнему выбрасываются.
+- **Файл набора для CMake**: `build/toolchain/<арх>-freeos.cmake` (`xtask
+  sdk`) — `cmake -DCMAKE_TOOLCHAIN_FILE=…` собирает под FossAi, как
+  `--host=x86_64-freeos` у `configure`. Нужны CMake и Ninja на машине
+  сборки (`winget install Kitware.CMake Ninja-build.Ninja`).
+- **llama.cpp 0.7.0** — его собственным CMake, без правок исходников:
+  `llama-simple`, `llama-completion` (диалог), `llama-bench`. ggml для
+  x86-64 собран с AVX и без AVX2/FMA/F16C — наименьшее у машин, где систему
+  запускают (Sandy Bridge, ноутбук K53SD); для AArch64 — базовый ARMv8.
+- **Пакет `llama-0.7.0.fpk`** на установочном носителе (как игры — 55 МБ в
+  RAM-диск живой системы не кладутся): программы, `cxxdemo` и модель
+  **stories15M** (Q4_0, 19 МБ, сказки по-английски). `pkg install
+  /media/llama-0.7.0.fpk`, затем `/opt/llama/bin/llama-simple -m
+  /opt/llama/models/stories15M-q4_0.gguf Once upon a time`.
+- **libc**, по списку неразрешённых имён:
+  - `openat`, `fdopendir`, `unlinkat`, `fchmodat` — у ядра нет пути «от
+    дескриптора», и libc помнит путь каталога, открытого `openat` или
+    `opendir` (стирает `close`); неизвестный дескриптор — `EBADF`;
+  - `truncate` — только до нуля, как умеет ядро; `statvfs` — `ENOSYS`;
+  - `__cxa_thread_atexit` — деструкторы `thread_local` (libc++abi даёт его
+    только системам, которые CMake считает `UNIX`);
+  - `getpriority`/`setpriority` — приоритет 0, и только он;
+  - пустой `libpthread.a`, как у musl; свой `<poll.h>` с `extern "C"`;
+    `struct timeval` в `<sys/socket.h>`; `IPV6_V6ONLY` и `IN6_IS_ADDR_*`
+    (собраться обязан встроенный в llama.cpp cpp-httplib; IPv6 в системе нет).
+
+### Ловушки
+
+1. **`_POSIX_TIMERS`.** `steady_clock` libc++ берёт из
+   `clock_gettime(CLOCK_MONOTONIC)`, но узнаёт о нём по этому макросу, а он
+   обещает и таймеры POSIX, которых нет. Макрос задан только сборке самой
+   libc++, не всем программам.
+2. **Ошибка LLVM в `regex.cpp` на x86-64.** У newlib/picolibc маски
+   классов символов — `char`, и там, где он знаковый, `blank` (0x80) — это
+   −128, которое не сужается в `unsigned short`. LLVM проверяет libc++ с
+   picolibc только на ARM. Сборка — с `-Wno-c++11-narrowing`; значение,
+   приведённое назад к `char`, верное, лишнее одно: `[[:blank:]]` принимает `_`.
+3. **Разные заголовки у двух архитектур.** clang с линуксовым триплетом
+   (x86-64) в C++ сам ставит `_GNU_SOURCE`, как g++, а с голым
+   `aarch64-unknown-none-elf` — нет, и picolibc прятала от libc++ на AArch64
+   `locale_t` и `newlocale`. Теперь макрос ставит обёртка.
+4. **`#pragma comment(lib, "pthread")`** в libunwind и libc++abi — архив
+   с таким именем обязан быть, отсюда пустой `libpthread.a`.
+5. **У `poll.h` picolibc нет `extern "C"`** — C++ искал `poll` под
+   искажённым именем.
+6. **Установщик переносит пакеты с носителя по своему списку**
+   (`installer/src/payload.rs`): пакет, собранный и положенный на носитель,
+   до `/media` установленной системы без строчки там не доезжает.
+
+### Проверено
+
+Новый сценарий **`llama`** (установленная система, `-cpu max -smp 2`):
+`cxxdemo` — 14 проверок из 14 (исключение через три кадра с деструкторами,
+RTTI, `std::thread`/`mutex`, `thread_local`, `wait_for` по сроку,
+`exception_ptr` между потоками, `regex`, `to_chars`/`from_chars`, iostream);
+`llama-simple` пишет 32 токена — на обеих архитектурах одно и то же: «Once
+upon a time, there was a little girl named Lily. She loved to play outside
+and explore the world around her. One day, she went on a walk in». В QEMU
+без ускорения и с отладочным ядром — 0,53 токена/с на x86-64 и 0,38 на
+AArch64; загрузка модели — 7–10 с. `install`, `cthreads`, `cmem`, `cnet`,
+`canary` — зелёные на обеих архитектурах.
+
+### Что дальше
+
+- Настоящая модель (Qwen, SmolLM — сотни мегабайт): упрётся в окно
+  отображений задачи **512 МиБ** (`MMAP_MAX_BYTES`) и кучу в 128 МиБ —
+  поднять. Проверить на K53SD с флешки и замерить скорость на железе.
+- ggml без OpenMP создаёт потоки заново на каждый граф (три на токен), а
+  ядро печатает строку о каждом новом потоке — шум в журнале и лишняя
+  работа; посмотреть постоянный пул потоков ggml.
+- Сборка ggml с AVX2/FMA для машин новее 2013 года — второй вариант
+  программы или выбор при запуске.
+
 # Полный прогон 17.10 — 407 из 428, один дефект установщика
 
 `--full` на `569e904` (фазы 67–68e): 428 прогонов, 152 минуты в три потока.

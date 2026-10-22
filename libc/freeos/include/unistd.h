@@ -24,6 +24,8 @@
 
 /* `pipe2` (фаза 66b) — в POSIX.1-2024 он стандартный, а picolibc объявляет его
  * только при `_GNU_SOURCE`. Повторное объявление совместимо с её. */
+_BEGIN_STD_C
 int pipe2(int fds[2], int flags);
+_END_STD_C
 
 #endif /* _UNISTD_H_ */

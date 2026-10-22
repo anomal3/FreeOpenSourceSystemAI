@@ -147,6 +147,9 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     if let Some(game) = sopwith(arch)? {
         samples.push(("sopwith-2.9.0.fpk", game));
     }
+    if let Some(llm) = llama(arch)? {
+        samples.push(("llama-0.7.0.fpk", llm));
+    }
 
     let mut built = Vec::new();
     for (file_name, bytes) in samples {
@@ -160,7 +163,34 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
 }
 
 /// Пакеты игр: только на установочный носитель, не в RAM-диск живой системы.
-pub const GAMES: [&str; 2] = ["freedoom-0.13.fpk", "sopwith-2.9.0.fpk"];
+/// Там же llama.cpp (фаза 70d) — по той же причине: десятки мегабайт.
+pub const GAMES: [&str; 3] = ["freedoom-0.13.fpk", "sopwith-2.9.0.fpk", "llama-0.7.0.fpk"];
+
+/// llama.cpp пакетом (фаза 70d): программы llama.cpp, проверка библиотеки
+/// C++ (`cxxdemo`) и маленькая модель stories15M — чтобы было что запустить
+/// сразу. Свою модель человек кладёт рядом и называет ключом `-m`. Всё
+/// собирает `cargo xtask thirdparty`; нет чего-нибудь — пакета нет.
+fn llama(arch: Arch) -> Result<Option<Vec<u8>>> {
+    let bin = crate::cbuild::sysroot(arch).join("bin");
+    let model = crate::cbuild::games_dir().join("stories15M-q4_0.gguf");
+    let programs = ["llama-simple", "llama-completion", "llama-bench", "cxxdemo"];
+    if let Some(missing) = programs.iter().map(|name| bin.join(name)).chain([model.clone()]).find(|path| !path.is_file()) {
+        say!("пакет llama пропущен: нет {} — собрать: cargo xtask thirdparty", missing.display());
+        return Ok(None);
+    }
+    let mut llm = Builder::new(Kind::Package, "llama", "0.7.0");
+    llm.field("summary", "llama.cpp: language models on the CPU, with the stories15M model");
+    llm.field("about", "языковые модели на процессоре (llama.cpp)");
+    // Модель читается отображением файла.
+    llm.field("permissions", "files");
+    for name in programs {
+        let data = fs::read(bin.join(name)).with_context(|| format!("не удалось прочитать {name}"))?;
+        llm.file(&Entry { path: format!("bin/{name}"), mode: 0o755, uid: 0, gid: 0, data });
+    }
+    let data = fs::read(&model).with_context(|| format!("не удалось прочитать {}", model.display()))?;
+    llm.file(&Entry { path: String::from("models/stories15M-q4_0.gguf"), mode: 0o644, uid: 0, gid: 0, data });
+    Ok(Some(llm.finish()))
+}
 
 /// Doom пакетом (фаза 68d): doomgeneric на SDL2 и данные Freedoom: Phase 1.
 ///

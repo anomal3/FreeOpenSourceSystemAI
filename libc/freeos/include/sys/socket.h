@@ -14,6 +14,10 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+/* `struct timeval` — значение `SO_RCVTIMEO`/`SO_SNDTIMEO`. Как в BSD, где
+ * `<sys/socket.h>` даёт его сам; у glibc он приходит через `<sys/types.h>`,
+ * и cpp-httplib (фаза 70d) на это полагается. */
+#include <sys/_timeval.h>
 
 #ifdef __cplusplus
 extern "C" {

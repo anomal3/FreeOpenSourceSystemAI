@@ -438,27 +438,106 @@ fn classify_file(name: &str) -> Option<Input> {
 
 /// Исходник на C++ (фаза 61b): язык clang знает по окончанию сам.
 ///
-/// Набор даёт **язык**, но не его библиотеку: libc++, libc++abi и раскрутки
-/// стека в системе нет. Поэтому C++ здесь — без исключений и без RTTI
-/// ([`CXX_FLAGS`]), а `new`, `std::string` и `<vector>` не найдутся — громко, на
-/// компиляции или компоновке, а не молча. Нужно это не для программ на C++, а
-/// для чужих `configure`: libgdiplus (`AC_PROG_CXX`) отказывается собираться,
-/// если компилятор C++ не собирает `int main () { return 0; }`, хотя сама
-/// библиотека написана на C, а C++ у неё — только тесты.
+/// С фазы 70d у набора есть и библиотека — libc++, libc++abi и libunwind из
+/// LLVM (`cargo xtask thirdparty --only libcxx`), а с ней исключения и RTTI.
+/// Пока её нет, C++ остаётся языком без библиотеки ([`CXX_BARE_FLAGS`]): так
+/// его и видели чужие `configure` до 70d — libgdiplus (`AC_PROG_CXX`)
+/// отказывается собираться, если компилятор C++ не собирает
+/// `int main () { return 0; }`, хотя сама библиотека написана на C.
 fn is_cxx_source(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [".cpp", ".cc", ".cxx", ".c++"].iter().any(|suffix| lower.ends_with(suffix))
 }
 
-/// Флаги исходника на C++: то, что потребовало бы библиотеки C++, выключено
-/// (см. [`is_cxx_source`]).
+/// Флаг исходника на C++ всегда.
 ///
 /// `-fhosted` отменяет общий `-ffreestanding` ([`compile_flags`]), и не ради
 /// библиотеки: в C++ без среды исполнения `main` — обычная функция, и clang
 /// искажает её имя (`_Z4mainv`). В C имена не искажаются, и там этого не видно;
 /// здесь `_start` не находил `main`, и `configure` libgdiplus решал, что
 /// компилятора C++ нет.
-const CXX_FLAGS: [&str; 3] = ["-fhosted", "-fno-exceptions", "-fno-rtti"];
+///
+/// `-D_GNU_SOURCE` — как у g++ на Linux, где его ставит сам драйвер: clang с
+/// линуксовым триплетом (наш x86-64, см. [`triple`]) делает это и здесь, а с
+/// голым `aarch64-unknown-none-elf` — нет, и picolibc прятала от libc++ на
+/// AArch64 `locale_t`, `newlocale`, `strtod_l` (фаза 70d). Одна архитектура не
+/// должна видеть другие заголовки, чем вторая.
+const CXX_FLAGS: [&str; 2] = ["-fhosted", "-D_GNU_SOURCE=1"];
+
+/// Флаги C++, пока libc++ в наборе нет: то, что потребовало бы библиотеки, —
+/// выключено. Стоят **перед** флагами вызова, и `-fexceptions -frtti` вызова
+/// их перебивают: так собирается сама libc++ — ей исключения нужны раньше,
+/// чем она установлена.
+const CXX_BARE_FLAGS: [&str; 2] = ["-fno-exceptions", "-fno-rtti"];
+
+/// Каталог заголовков libc++ в sysroot. Есть он — у C++ есть библиотека.
+fn cxx_headers(sysroot: &Path) -> Option<PathBuf> {
+    let dir = sysroot.join("include/c++/v1");
+    dir.join("__config").is_file().then_some(dir)
+}
+
+/// Библиотеки C++ (фаза 70d), дописываемые к компоновке программы на C++ —
+/// перед [`SDK_LIBRARIES`]: libc++ зовёт libc++abi, та — libunwind, а все
+/// вместе — libc.
+const CXX_LIBRARIES: [&str; 3] = ["-lc++", "-lc++abi", "-lunwind"];
+
+/// Позвали ли обёртку как компилятор C++ (`x86_64-freeos-c++`): так CMake и
+/// `configure` компонуют программы на C++, отдавая одни объектники.
+fn is_cxx_tool(tool: &str) -> bool {
+    matches!(tool, "c++" | "g++" | "clang++")
+}
+
+/// Раскрыть файлы ответов (`@файл`): CMake с Ninja кладут в них длинные
+/// списки объектников, а у Windows предел командной строки — 32 КиБ. Слова
+/// разделяются пробелами, кавычки `"…"` и `'…'` держат пробелы внутри, `\`
+/// перед кавычкой или `\` — экранирование, как у GCC. Файла нет — аргумент
+/// остаётся как есть: так поступает и clang.
+pub fn expand_response_files(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg.strip_prefix('@').map(std::fs::read_to_string) {
+            Some(Ok(text)) => out.extend(split_response(&text)),
+            _ => out.push(arg),
+        }
+    }
+    out
+}
+
+fn split_response(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (_, '\\') if matches!(chars.peek(), Some('"' | '\'' | '\\')) => {
+                word.push(chars.next().unwrap());
+                in_word = true;
+            }
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
 
 /// Чем именно интересуется чужой скрипт, если собирать нечего.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -523,10 +602,25 @@ pub fn answer_query(target: Target, args: &[String]) -> Option<Query> {
 /// программа собирается против чужого `stdio.h`, а линкуется с нашей libc.
 /// Расхождение при этом не обязано быть ошибкой сборки — оно бывает разной
 /// раскладкой `FILE`, то есть падением на первом же `printf`.
-pub fn compile_command(target: Target, sysroot: &Path, clang: &Path) -> Command {
+///
+/// У C++ (`cxx`) заголовки libc++ идут **перед** заголовками libc: её
+/// `<cmath>`, `<stdlib.h>` и прочие обёртки подключают сишные через
+/// `#include_next`, и в обратном порядке их бы не нашли.
+pub fn compile_command(target: Target, sysroot: &Path, clang: &Path, cxx: bool) -> Command {
     let mut cmd = Command::new(clang);
     cmd.args(compile_flags(target));
     cmd.arg("-nostdinc");
+    if cxx {
+        cmd.args(CXX_FLAGS);
+        match cxx_headers(sysroot) {
+            Some(dir) => {
+                cmd.arg(format!("-isystem{}", dir.display()));
+            }
+            None => {
+                cmd.args(CXX_BARE_FLAGS);
+            }
+        }
+    }
     cmd.arg(format!("-isystem{}", sysroot.join("include").display()));
     if let Some(builtin) = clang_builtin_includes(clang) {
         cmd.arg(format!("-idirafter{}", builtin.display()));
@@ -545,7 +639,7 @@ const SDK_LIBRARIES: [&str; 3] = ["-lfreeos", "-lc", "-lclang_rt.builtins"];
 /// Точка входа обёртки. Возвращает код, с которым надо выйти.
 pub fn run(argv: Vec<String>) -> i32 {
     let argv0 = argv.first().cloned().unwrap_or_default();
-    let args: Vec<String> = argv.into_iter().skip(1).collect();
+    let args: Vec<String> = expand_response_files(argv.into_iter().skip(1).collect());
 
     let Some((target, tool)) = parse_program_name(&argv0) else {
         eprintln!(
@@ -568,7 +662,7 @@ pub fn run(argv: Vec<String>) -> i32 {
     if tool == "pkg-config" {
         return pkgconfig::run(target, &args);
     }
-    if tool != "cc" && tool != "gcc" && tool != "clang" {
+    if tool != "cc" && tool != "gcc" && tool != "clang" && !is_cxx_tool(&tool) {
         eprintln!("{argv0}: инструмент `{tool}` набор не поставляет");
         return 2;
     }
@@ -594,7 +688,7 @@ pub fn run(argv: Vec<String>) -> i32 {
         None => {}
     }
 
-    match compile_and_link(target, &args) {
+    match compile_and_link(target, &args, is_cxx_tool(&tool)) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("{argv0}: {err}");
@@ -614,7 +708,7 @@ fn forward(path: &Path, args: &[String]) -> i32 {
     }
 }
 
-fn compile_and_link(target: Target, args: &[String]) -> Result<i32, String> {
+fn compile_and_link(target: Target, args: &[String], cxx_tool: bool) -> Result<i32, String> {
     let clang = find_tool("clang")?;
     let sysroot = sysroot(target)?;
     if !sysroot.join("include/stdio.h").is_file() {
@@ -627,11 +721,9 @@ fn compile_and_link(target: Target, args: &[String]) -> Result<i32, String> {
     let (mode, inv) = parse_arguments(args);
 
     if mode == Mode::CompileOnly {
-        let mut cmd = compile_command(target, &sysroot, &clang);
+        let cxx = inv.inputs.iter().any(|input| matches!(input, Input::Source(path) if is_cxx_source(path)));
+        let mut cmd = compile_command(target, &sysroot, &clang, cxx);
         cmd.args(&inv.compile);
-        if inv.inputs.iter().any(|input| matches!(input, Input::Source(path) if is_cxx_source(path))) {
-            cmd.args(CXX_FLAGS);
-        }
         for input in &inv.inputs {
             match input {
                 Input::Source(path) | Input::Object(path) => cmd.arg(path),
@@ -656,11 +748,8 @@ fn compile_and_link(target: Target, args: &[String]) -> Result<i32, String> {
             Input::Source(path) => {
                 number += 1;
                 let object = work.join(format!("in{number}.o"));
-                let mut cmd = compile_command(target, &sysroot, &clang);
+                let mut cmd = compile_command(target, &sysroot, &clang, is_cxx_source(path));
                 cmd.args(&inv.compile);
-                if is_cxx_source(path) {
-                    cmd.args(CXX_FLAGS);
-                }
                 cmd.arg("-c").arg(path).arg("-o").arg(&object);
                 let code = status_of(cmd);
                 if code != 0 {
@@ -674,9 +763,15 @@ fn compile_and_link(target: Target, args: &[String]) -> Result<i32, String> {
         }
     }
 
+    // Программа на C++ с библиотекой C++: позвали как `c++` или дали
+    // исходник на C++. Ей нужны libc++ и таблицы раскрутки стека, поэтому и
+    // сценарий у неё свой (`freeos-cxx.ld`, см. `xtask::sdk`).
+    let cxx = cxx_headers(&sysroot).is_some()
+        && (cxx_tool || inv.inputs.iter().any(|input| matches!(input, Input::Source(path) if is_cxx_source(path))));
+
     let lld = find_tool("ld.lld")?;
     let lib = sysroot.join("lib");
-    let script = lib.join("freeos.ld");
+    let script = lib.join(if cxx { "freeos-cxx.ld" } else { "freeos.ld" });
     if !script.is_file() {
         let _ = std::fs::remove_dir_all(&work);
         return Err(format!(
@@ -696,12 +791,20 @@ fn compile_and_link(target: Target, args: &[String]) -> Result<i32, String> {
     // читает файл программы целиком в кучу, прежде чем разобрать заголовки, и
     // сегмент, уехавший за предел чтения, выглядел бы как испорченный файл.
     cmd.arg("--strip-debug");
+    if cxx {
+        // Указатель на таблицы раскрутки: по нему libunwind ищет запись
+        // функции двоичным поиском, а не перебором всего `.eh_frame`.
+        cmd.arg("--eh-frame-hdr");
+    }
     cmd.arg("-o").arg(&output);
     // Стартовый код — первым и всегда: точка входа программы живёт в нём.
     cmd.arg(lib.join("crt0.o"));
     cmd.args(&objects);
     cmd.args(&inv.link);
     cmd.arg(format!("-L{}", lib.display()));
+    if cxx {
+        cmd.args(CXX_LIBRARIES);
+    }
     cmd.args(SDK_LIBRARIES);
     let code = status_of(cmd);
     let _ = std::fs::remove_dir_all(&work);
@@ -778,6 +881,18 @@ mod tests {
         assert!(is_cxx_source("x.c++"));
         assert!(!is_cxx_source("x.c"));
         assert!(!is_cxx_source("x.s"));
+    }
+
+    /// Файл ответов CMake: пробелы внутри кавычек и экранированные кавычки
+    /// остаются частью слова.
+    #[test]
+    fn response_files_split_like_gcc() {
+        assert_eq!(
+            split_response("a.o  \"dir with space/b.o\"\n-DX=\\\"y\\\" 'c d'\r\n"),
+            vec!["a.o", "dir with space/b.o", "-DX=\"y\"", "c d"]
+        );
+        assert_eq!(split_response("\"\""), vec![""]);
+        assert!(is_cxx_tool("c++") && is_cxx_tool("clang++") && !is_cxx_tool("cc"));
     }
 
     /// Порядок входов сохраняется: объектник, библиотека, снова объектник.

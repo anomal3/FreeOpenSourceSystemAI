@@ -98,7 +98,27 @@ enum How {
     /// Данные игр (фаза 68d): файлы из архива в [`cbuild::games_dir`] —
     /// пары «путь в архиве» и «имя там».
     Games(&'static [(&'static str, &'static str)]),
+    /// Стандартная библиотека C++ (фаза 70d): libunwind, libc++abi и libc++
+    /// из исходников LLVM той же версии, что clang набора, — их собственной
+    /// сборкой «runtimes» на CMake, так, как LLVM собирает их для picolibc
+    /// (`libcxx/cmake/caches/Armv7M-picolibc.cmake`), но с потоками, часами,
+    /// файловой системой и локалями: у нас они есть. Из архива всего
+    /// LLVM (160 МиБ) распаковывается только нужное ([`LLVM_MEMBERS`]).
+    LlvmRuntimes,
+    /// llama.cpp (фаза 70d): своим CMake с файлом набора
+    /// ([`sdk::cmake_toolchain`]); программы из списка — в `bin/` sysroot.
+    LlamaCpp(&'static [&'static str]),
+    /// Модель для llama.cpp (фаза 70d): файл GGUF как есть, не архив, — в
+    /// [`cbuild::games_dir`] под своим именем.
+    Model,
 }
+
+/// Что распаковывать из архива LLVM для [`How::LlvmRuntimes`]: сборка
+/// «runtimes», три библиотеки, общие модули CMake и llvm-libc — из неё
+/// libc++ берёт разбор чисел с плавающей точкой (`from_chars`,
+/// `libc/shared`). Тесты не нужны — их десятки тысяч файлов, а
+/// `LLVM_INCLUDE_TESTS` выключен.
+const LLVM_MEMBERS: [&str; 7] = ["runtimes", "libunwind", "libcxxabi", "libcxx", "libc", "cmake", "llvm/cmake"];
 
 /// Свои ключи проекта, собираемого GNU `configure`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,7 +178,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 16] = [
+const PROJECTS: [Project; 19] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -534,6 +554,44 @@ const PROJECTS: [Project; 16] = [
         how: How::Games(&[("freedoom1.wad", "freedoom1.wad"), ("COPYING.txt", "freedoom-COPYING.txt")]),
         installs: &[],
     },
+    // Стандартная библиотека C++ (фаза 70d) — ради llama.cpp, а за ней всего,
+    // что написано на C++. Версия — та же, что у clang набора (22.1.8): заголовки
+    // libc++ рассчитаны на свой компилятор. Хеш — `digest` архива в релизе
+    // LLVM на GitHub (сверено 2026-10-22). Apache-2.0 с исключением LLVM.
+    Project {
+        name: "libcxx",
+        version: "22.1.8",
+        url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/llvm-project-22.1.8.src.tar.xz",
+        sha256: "922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a9965888",
+        unpacked: "llvm-project-22.1.8.src",
+        how: How::LlvmRuntimes,
+        installs: &["lib/libc++.a", "lib/libc++abi.a", "lib/libunwind.a", "include/c++/v1/__config", "bin/cxxdemo"],
+    },
+    // Языковые модели на процессоре (фаза 70d): ggml и llama.cpp. Архив —
+    // метка выпуска на GitHub, хеш снят с него (2026-10-22). MIT.
+    Project {
+        name: "llama",
+        version: "0.7.0",
+        url: "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.7.0.tar.gz",
+        sha256: "55d67acf3ad2ad747a9bbeb75f9f0e173dbcc0d1753a471038a90c819421c5e1",
+        unpacked: "llama.cpp-0.7.0",
+        how: How::LlamaCpp(&["llama-simple", "llama-completion", "llama-bench"]),
+        installs: &["bin/llama-simple", "bin/llama-completion", "bin/llama-bench"],
+    },
+    // Модель для проверки: stories15M (llama2.c Андрея Карпаты, обучена на
+    // TinyStories), в GGUF у ggml-org, Q4_0, 19 МБ. Пишет детские сказки
+    // по-английски — узнаваемый текст из 15 миллионов параметров, который в
+    // QEMU появляется за секунды. Хеш — LFS-`oid` файла на Hugging Face
+    // (сверено 2026-10-22). MIT.
+    Project {
+        name: "stories15m",
+        version: "q4_0",
+        url: "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf",
+        sha256: "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739",
+        unpacked: "stories15M-q4_0.gguf",
+        how: How::Model,
+        installs: &[],
+    },
 ];
 
 /// Собрать чужие проекты под все указанные архитектуры: все или только
@@ -549,6 +607,14 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
     }
     for project in PROJECTS.iter().filter(|project| only.is_empty() || only.iter().any(|name| name == project.name)) {
         let source = fetch(project, refresh)?;
+        if project.how == How::Model {
+            let dir = cbuild::games_dir();
+            fs::create_dir_all(&dir)?;
+            fs::copy(&source, dir.join(project.unpacked))
+                .with_context(|| format!("не удалось положить {}", source.display()))?;
+            say!("{} {}: {}", project.name, project.version, dir.join(project.unpacked).display());
+            continue;
+        }
         if let How::Games(files) = project.how {
             let dir = cbuild::games_dir();
             fs::create_dir_all(&dir)?;
@@ -595,7 +661,8 @@ fn fetch(project: &Project, refresh: bool) -> Result<PathBuf> {
     let root = dir();
     fs::create_dir_all(&root)?;
     let source = root.join(project.unpacked);
-    if source.is_dir() && !refresh {
+    let model = project.how == How::Model;
+    if (source.is_dir() || (model && source.is_file())) && !refresh {
         say!("исходники на месте: {}", source.display());
         return Ok(source);
     }
@@ -638,14 +705,21 @@ fn fetch(project: &Project, refresh: bool) -> Result<PathBuf> {
         );
     }
     say!("хеш архива совпал: {got}");
+    // Модель — сам файл: распаковывать нечего.
+    if model {
+        return Ok(archive);
+    }
 
-    let status = Command::new("tar")
-        .current_dir(&root)
+    let mut tar = Command::new("tar");
+    tar.current_dir(&root)
         // `-xf` без буквы сжатия: tar узнаёт gzip и xz по содержимому.
         .arg("-xf")
-        .arg(archive.file_name().unwrap())
-        .status()
-        .context("не удалось запустить tar")?;
+        .arg(archive.file_name().unwrap());
+    if project.how == How::LlvmRuntimes {
+        tar.args(["--exclude", "*/test/*"]);
+        tar.args(LLVM_MEMBERS.iter().map(|member| format!("{}/{member}", project.unpacked)));
+    }
+    let status = tar.status().context("не удалось запустить tar")?;
     if !status.success() {
         bail!("не распаковался {} ({status})", archive.display());
     }
@@ -668,12 +742,134 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
     // Каждый раз с чистого дерева: `configure` кеширует результаты проверок в
     // самом `Makefile`, и второй прогон после правки набора собрал бы старыми.
     let _ = fs::remove_dir_all(&work);
-    copy_tree(source, &work)?;
+    // CMake собирает вне дерева исходников: копия не нужна, каталог `work` —
+    // только каталог сборки.
+    if matches!(project.how, How::LlvmRuntimes | How::LlamaCpp(_)) {
+        fs::create_dir_all(&work)?;
+    } else {
+        copy_tree(source, &work)?;
+    }
 
     let triple = cbuild::c_target(arch).sdk_triple();
     let prefix = to_posix(&sysroot);
 
     match project.how {
+        How::LlvmRuntimes => {
+            // Заголовки прошлой сборки убираются: обёртка, увидев их, решила
+            // бы, что библиотека уже есть, и собирала бы её против неё самой.
+            let _ = fs::remove_dir_all(sysroot.join("include/c++"));
+            run_cmake(
+                &source.join("runtimes"),
+                &work,
+                arch,
+                &[
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    &format!("-DCMAKE_INSTALL_PREFIX={prefix}"),
+                    // Проверки компилятора — без компоновки: программу на C++
+                    // скомпоновать ещё не с чем, её библиотеку здесь и собирают.
+                    "-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY",
+                    // Обёртка без libc++ выключает исключения и RTTI; самой
+                    // libc++ они нужны (libunwind выключает их себе сама — её
+                    // флаг идёт позже).
+                    //
+                    // `_POSIX_TIMERS` — только здесь: `steady_clock` libc++
+                    // берёт из `clock_gettime(CLOCK_MONOTONIC)`, но узнаёт о нём
+                    // по этому макросу, а он обещает и таймеры POSIX
+                    // (`timer_create`), которых в системе нет. Объявить его
+                    // всем программам значило бы соврать чужим `configure`;
+                    // libc++ из всего обещанного зовёт одни часы.
+                    //
+                    // `-Wno-c++11-narrowing` — ради `regex.cpp`: маски классов
+                    // символов у newlib и picolibc — `char`, и на x86-64, где
+                    // `char` знаковый, `blank` (0x80) — это −128, которое в
+                    // `unsigned short` таблицы имён классов не сужается без
+                    // потерь. LLVM проверяет libc++ с picolibc только на ARM, где
+                    // `char` беззнаковый. Значение, приведённое обратно к
+                    // `char`, остаётся 0x80 — классы работают; лишнее только
+                    // то, что `[[:blank:]]` вслед за `[[:print:]]` принимает `_`.
+                    "-DCMAKE_CXX_FLAGS=-fexceptions -frtti -D_POSIX_TIMERS=1 -Wno-c++11-narrowing",
+                    "-DLLVM_ENABLE_RUNTIMES=libunwind;libcxxabi;libcxx",
+                    "-DRUNTIMES_USE_LIBC=picolibc",
+                    "-DLLVM_INCLUDE_TESTS=OFF",
+                    "-DLLVM_INCLUDE_DOCS=OFF",
+                    // libunwind без динамического компоновщика: таблицы
+                    // раскрутки ищет по границам из `freeos-cxx.ld`.
+                    "-DLIBUNWIND_IS_BAREMETAL=ON",
+                    "-DLIBUNWIND_ENABLE_SHARED=OFF",
+                    "-DLIBUNWIND_ENABLE_STATIC=ON",
+                    "-DLIBUNWIND_INCLUDE_TESTS=OFF",
+                    "-DLIBCXXABI_ENABLE_SHARED=OFF",
+                    "-DLIBCXXABI_ENABLE_STATIC=ON",
+                    "-DLIBCXXABI_USE_LLVM_UNWINDER=ON",
+                    "-DLIBCXXABI_ENABLE_STATIC_UNWINDER=ON",
+                    "-DLIBCXXABI_INCLUDE_TESTS=OFF",
+                    "-DLIBCXX_ENABLE_SHARED=OFF",
+                    "-DLIBCXX_ENABLE_STATIC=ON",
+                    "-DLIBCXX_CXX_ABI=libcxxabi",
+                    "-DLIBCXX_HAS_PTHREAD_API=ON",
+                    "-DLIBCXX_ENABLE_TIME_ZONE_DATABASE=OFF",
+                    "-DLIBCXX_INCLUDE_BENCHMARKS=OFF",
+                    "-DLIBCXX_INCLUDE_TESTS=OFF",
+                    // Модули C++20 ставятся отдельным деревом, которое никто
+                    // здесь не читает.
+                    "-DLIBCXX_INSTALL_MODULES=OFF",
+                    // Как в `Armv7M-picolibc.cmake`: где разделяемых библиотек
+                    // нет, CMake превращает их цели в статические, и имена
+                    // столкнулись бы (CMake issue 25759).
+                    "-DLIBCXX_SHARED_OUTPUT_NAME=c++-shared",
+                    "-DLIBCXXABI_SHARED_OUTPUT_NAME=c++abi-shared",
+                    "-DLIBUNWIND_SHARED_OUTPUT_NAME=unwind-shared",
+                ],
+            )?;
+            run_ninja(&work, &[], &format!("ninja libcxx {}", arch.name()))?;
+            run_ninja(&work, &["install"], &format!("ninja install libcxx {}", arch.name()))?;
+            // Проверочная программа — обычной обёрткой `c++`, как собрал бы
+            // её всякий: если библиотека не компонуется, это видно здесь, а
+            // не на середине сборки llama.cpp.
+            fs::create_dir_all(sysroot.join("bin"))?;
+            let demo = crate::paths::workspace_root().join("libc/examples/cxxdemo.cpp");
+            let mut cmd = Command::new(sdk::tool_path(arch, "c++"));
+            cmd.args(["-O2", "-std=c++17"]).arg(&demo).arg("-o").arg(sysroot.join("bin/cxxdemo"));
+            run(cmd, &format!("c++ cxxdemo {}", arch.name()))?;
+        }
+        How::LlamaCpp(programs) => {
+            let mut options = vec![
+                "-DCMAKE_BUILD_TYPE=Release".to_string(),
+                "-DBUILD_SHARED_LIBS=OFF".into(),
+                // Под процессор машины сборки собирать нельзя — запускать
+                // будут на другой; набор векторных команд назван ниже.
+                "-DGGML_NATIVE=OFF".into(),
+                "-DGGML_OPENMP=OFF".into(),
+                "-DGGML_CCACHE=OFF".into(),
+                "-DLLAMA_BUILD_TESTS=OFF".into(),
+                "-DLLAMA_BUILD_SERVER=OFF".into(),
+                "-DLLAMA_BUILD_APP=OFF".into(),
+                "-DLLAMA_BUILD_UI=OFF".into(),
+                // Скачивание моделей по HTTPS (OpenSSL) и запуск процессов — не
+                // нужны: модель приносят файлом.
+                "-DLLAMA_OPENSSL=OFF".into(),
+                "-DLLAMA_SUBPROCESS=OFF".into(),
+            ];
+            if arch == Arch::X86_64 {
+                // Наименьшее общее у машин, на которых систему запускают:
+                // AVX есть с Sandy Bridge (2011, ноутбук K53SD), AVX2, FMA и
+                // F16C — с Haswell и Ivy Bridge, их у него нет.
+                options.extend(
+                    ["-DGGML_SSE42=ON", "-DGGML_AVX=ON", "-DGGML_AVX2=OFF", "-DGGML_FMA=OFF", "-DGGML_F16C=OFF", "-DGGML_BMI2=OFF"]
+                        .map(String::from),
+                );
+            }
+            let options: Vec<&str> = options.iter().map(String::as_str).collect();
+            run_cmake(source, &work, arch, &options)?;
+            let mut targets = vec!["-j6"];
+            targets.extend(programs.iter().copied());
+            run_ninja(&work, &targets, &format!("ninja llama {}", arch.name()))?;
+            fs::create_dir_all(sysroot.join("bin"))?;
+            for program in programs {
+                fs::copy(work.join("bin").join(program), sysroot.join("bin").join(program))
+                    .with_context(|| format!("{program} собрался, но программы нет в {}", work.join("bin").display()))?;
+            }
+        }
         How::Configure => {
             // `--static`: разделяемых библиотек в этой системе нет вовсе — нет
             // ни динамического компоновщика, ни отображения чужого образа в
@@ -725,7 +921,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
-        How::Files(_) | How::Games(_) => return Ok(()),
+        How::Files(_) | How::Games(_) | How::Model => return Ok(()),
         How::Doomgeneric => {
             let game = work.join("doomgeneric");
             // Список объектов — из его же `Makefile.sdl`, без трёх звуковых
@@ -881,6 +1077,59 @@ fn run_shell(dir: &Path, script: &str, what: &str) -> Result<()> {
     cmd.current_dir(dir).arg("-c").arg(script);
     with_sdk_path(&mut cmd);
     run(cmd, what)
+}
+
+/// `cmake` с генератором Ninja и файлом набора (фаза 70d): исходники в
+/// `source`, сборка в `build`.
+fn run_cmake(source: &Path, build: &Path, arch: Arch, options: &[&str]) -> Result<()> {
+    let toolchain = sdk::cmake_toolchain(arch);
+    if !toolchain.is_file() {
+        bail!("нет файла набора для CMake {}\nСобрать: cargo xtask sdk", toolchain.display());
+    }
+    let mut cmd = Command::new(find_cmake()?);
+    cmd.arg("-G")
+        .arg("Ninja")
+        .arg("-S")
+        .arg(source)
+        .arg("-B")
+        .arg(build)
+        .arg(format!("-DCMAKE_MAKE_PROGRAM={}", to_posix(&find_ninja()?)))
+        .arg(format!("-DCMAKE_TOOLCHAIN_FILE={}", to_posix(&toolchain)))
+        .args(options);
+    with_sdk_path(&mut cmd);
+    run(cmd, &format!("cmake {} {}", source.display(), arch.name()))
+}
+
+fn run_ninja(build: &Path, args: &[&str], what: &str) -> Result<()> {
+    let mut cmd = Command::new(find_ninja()?);
+    cmd.arg("-C").arg(build).args(args);
+    with_sdk_path(&mut cmd);
+    run(cmd, what)
+}
+
+/// Найти `cmake`: winget ставит его машинно, на PATH он может не попасть.
+fn find_cmake() -> Result<PathBuf> {
+    if let Ok(found) = cbuild::llvm_tool("cmake") {
+        return Ok(found);
+    }
+    let path = Path::new(r"C:\Program Files\CMake\bin\cmake.exe");
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    bail!("не найден cmake: llama.cpp и libc++ собираются им.\nПоставить: winget install --id Kitware.CMake --exact")
+}
+
+fn find_ninja() -> Result<PathBuf> {
+    if let Ok(found) = cbuild::llvm_tool("ninja") {
+        return Ok(found);
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let path = Path::new(&local).join(r"Microsoft\WinGet\Links\ninja.exe");
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    bail!("не найден ninja.\nПоставить: winget install --id Ninja-build.Ninja --exact")
 }
 
 fn run_make(dir: &Path, args: &[&str], what: &str) -> Result<()> {

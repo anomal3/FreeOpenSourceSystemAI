@@ -242,10 +242,63 @@ void freeos_threads_start(void) {
 
 static void run_destructors(struct freeos_thread *self);
 
+/* ── Деструкторы `thread_local` C++ (фаза 70d) ──────────────────────────────
+ *
+ * Объект C++ с `thread_local` и нетривиальным деструктором компилятор
+ * регистрирует вызовом `__cxa_thread_atexit` при первом обращении в потоке.
+ * libc++abi даёт его только там, где CMake считает систему `UNIX`, а наш
+ * набор для CMake — `Generic`; поэтому он здесь, рядом с выходом потока.
+ * Порядок — обратный регистрации, как у деструкторов статических объектов, и
+ * раньше деструкторов ключей, как у glibc. У главного потока список
+ * проходит `exit` (обработчик `atexit`, поставленный при первой регистрации):
+ * сам он через `finish` не уходит. `dso` не нужен — разделяемых библиотек нет. */
+
+struct thread_dtor {
+    void (*dtor)(void *);
+    void *object;
+    struct thread_dtor *next;
+};
+
+static __thread struct thread_dtor *thread_dtors;
+
+static void run_thread_dtors(void) {
+    struct thread_dtor *entry;
+    /* Деструктор вправе обратиться к новому `thread_local` — тот встанет в
+     * голову списка, и цикл дойдёт и до него. */
+    while ((entry = thread_dtors) != NULL) {
+        thread_dtors = entry->next;
+        entry->dtor(entry->object);
+        free(entry);
+    }
+}
+
+static pthread_once_t thread_dtors_at_exit = PTHREAD_ONCE_INIT;
+
+static void install_exit_hook(void) { atexit(run_thread_dtors); }
+
+int __cxa_thread_atexit(void (*dtor)(void *), void *object, void *dso);
+
+int __cxa_thread_atexit(void (*dtor)(void *), void *object, void *dso) {
+    (void)dso;
+    struct thread_dtor *entry = malloc(sizeof(*entry));
+    if (entry == NULL) {
+        return -1;
+    }
+    entry->dtor = dtor;
+    entry->object = object;
+    entry->next = thread_dtors;
+    thread_dtors = entry;
+    if (current == &main_thread) {
+        pthread_once(&thread_dtors_at_exit, install_exit_hook);
+    }
+    return 0;
+}
+
 /* Уйти: деструкторы ключей, результат — ждущему, и выход из ядра. После
  * `done = 1` структуру и блок TLS вправе освободить другой поток, поэтому
  * дальше — только системные вызовы, ни одного обращения к ним. */
 __attribute__((noreturn)) static void finish(struct freeos_thread *self, void *result) {
+    run_thread_dtors();
     run_destructors(self);
     self->result = result;
     unsigned int was = __atomic_exchange_n(&self->state, EXITED, __ATOMIC_ACQ_REL);

@@ -55,8 +55,9 @@ pub fn bin_dir() -> PathBuf {
 /// подставляет к триплету, когда ему сказали `--host=x86_64-freeos`. Не найдя
 /// `x86_64-freeos-ar`, autoconf молча берёт хостовый `ar` — и собирает архив
 /// формата хоста, который наш компоновщик не прочтёт.
-pub const TOOLS: [&str; 10] = [
-    "cc", "gcc", "ar", "ranlib", "nm", "strip", "objcopy", "objdump", "ld", "pkg-config",
+pub const TOOLS: [&str; 13] = [
+    "cc", "gcc", "c++", "g++", "clang++", "ar", "ranlib", "nm", "strip", "objcopy", "objdump", "ld",
+    "pkg-config",
 ];
 
 /// Полный путь к обёртке набора для этой цели.
@@ -83,6 +84,9 @@ pub fn install() -> Result<()> {
         populate_sysroot(arch)?;
     }
     build_wrappers()?;
+    for arch in Arch::ALL {
+        write_cmake_toolchain(arch)?;
+    }
     say!("набор установлен: {}", root().display());
     say!("проверить: {} --version", tool_path(Arch::X86_64, "cc").display());
     Ok(())
@@ -119,10 +123,16 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
     // Компоновочный сценарий. Тот же, что у программ на Rust, и это не
     // экономия: раскладка задана требованиями ядра — адрес 512 ГиБ, страницы,
     // разведённые по правам, — и второй сценарий разъехался бы с первым молча.
-    copy(
-        &paths::workspace_root().join("crates/user-progs/user.ld"),
-        &lib.join("freeos.ld"),
-    )?;
+    let script = paths::workspace_root().join("crates/user-progs/user.ld");
+    copy(&script, &lib.join("freeos.ld"))?;
+    // Тот же сценарий для программ на C++ (фаза 70d) — с таблицами раскрутки.
+    fs::write(lib.join("freeos-cxx.ld"), cxx_script(&fs::read_to_string(&script)?)?)?;
+
+    // Пустой `libpthread.a`, как у musl: потоки — в libc и `libfreeos.a`, а
+    // `-lpthread` просят и чужие `Makefile`, и сами объектники libunwind и
+    // libc++abi (`#pragma comment(lib, "pthread")`, фаза 70d) — без архива
+    // с этим именем компоновщик отказывает.
+    fs::write(lib.join("libpthread.a"), b"!<arch>\n")?;
 
     // Вспомогательные подпрограммы компилятора: деление `__int128`, программная
     // плавающая точка, `memcpy` там, где компилятор решил позвать его сам.
@@ -218,6 +228,78 @@ fn populate_sysroot(arch: Arch) -> Result<()> {
 
     say!("sysroot {}: {}", arch.name(), sysroot.display());
     Ok(())
+}
+
+/// Файл набора для CMake (фаза 70d): `cmake -DCMAKE_TOOLCHAIN_FILE=<он>`.
+pub fn cmake_toolchain(arch: Arch) -> PathBuf {
+    root().join(format!("{}-freeos.cmake", arch.name()))
+}
+
+/// Написать файл набора для CMake — то, что для `configure` делают имена
+/// обёрток с приставкой триплета. Система — `Generic` (CMake не знает нашей
+/// и без собственного модуля платформы ответил бы предупреждением): без
+/// разделяемых библиотек, программы без расширения, архивы `lib*.a`. Чем
+/// отличить нас, проекту скажет `FOSSAI`. Библиотеки и заголовки CMake ищет
+/// только в sysroot: найденный `zlib.h` хоста собрал бы чужое.
+fn write_cmake_toolchain(arch: Arch) -> Result<()> {
+    let path = |tool: &str| tool_path(arch, tool).display().to_string().replace('\\', "/");
+    let sysroot = cbuild::sysroot(arch).display().to_string().replace('\\', "/");
+    let text = format!(
+        "# Набор FossAi для CMake ({arch}). Пишет `cargo xtask sdk`; правки затрутся.\n\
+         set(CMAKE_SYSTEM_NAME Generic)\n\
+         set(CMAKE_SYSTEM_PROCESSOR {arch})\n\
+         set(FOSSAI TRUE)\n\
+         set(CMAKE_C_COMPILER \"{cc}\")\n\
+         set(CMAKE_CXX_COMPILER \"{cxx}\")\n\
+         set(CMAKE_ASM_COMPILER \"{cc}\")\n\
+         set(CMAKE_AR \"{ar}\")\n\
+         set(CMAKE_RANLIB \"{ranlib}\")\n\
+         set(CMAKE_FIND_ROOT_PATH \"{sysroot}\")\n\
+         set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)\n\
+         set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)\n\
+         set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)\n\
+         set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)\n",
+        arch = arch.name(),
+        cc = path("cc"),
+        cxx = path("c++"),
+        ar = path("ar"),
+        ranlib = path("ranlib"),
+    );
+    fs::write(cmake_toolchain(arch), text)?;
+    Ok(())
+}
+
+/// Сценарий компоновки программы на C++ (фаза 70d): `user.ld`, в котором
+/// таблицы раскрутки стека не выброшены, а лежат в сегменте только для чтения.
+///
+/// Исключение C++ без них не летит: `__cxa_throw` зовёт libunwind, а та ищет
+/// запись функции через `.eh_frame_hdr` (его строит `--eh-frame-hdr`) по
+/// границам `__eh_frame_hdr_start`/`__eh_frame_start` — так libunwind
+/// работает без динамического компоновщика (`LIBUNWIND_IS_BAREMETAL`).
+/// `.gcc_except_table` — таблицы `catch` функций; без имени в сценарии она
+/// была бы «сиротой». Программам на C и Rust таблицы не нужны, и выбрасывать
+/// их из всех ради C++ незачем, отсюда второй сценарий — но выведенный из
+/// первого, а не переписанный рядом: раскладка у них обязана совпадать.
+fn cxx_script(base: &str) -> Result<String> {
+    let text = base.replace("\r\n", "\n");
+    let discard = "        *(.eh_frame)\n        *(.eh_frame_hdr)\n";
+    let anchor = "    . = ALIGN(0x1000);\n    .data ALIGN(0x1000)";
+    if !text.contains(discard) || !text.contains(anchor) {
+        bail!("user.ld изменился: не найдено, куда положить таблицы раскрутки C++");
+    }
+    let tables = "    /* Таблицы раскрутки стека для исключений C++ (фаза 70d). */\n\
+                  \x20   .eh_frame_hdr : {\n\
+                  \x20       PROVIDE_HIDDEN(__eh_frame_hdr_start = .);\n\
+                  \x20       KEEP(*(.eh_frame_hdr))\n\
+                  \x20       PROVIDE_HIDDEN(__eh_frame_hdr_end = .);\n\
+                  \x20   }\n\
+                  \x20   .eh_frame : {\n\
+                  \x20       PROVIDE_HIDDEN(__eh_frame_start = .);\n\
+                  \x20       KEEP(*(.eh_frame))\n\
+                  \x20       PROVIDE_HIDDEN(__eh_frame_end = .);\n\
+                  \x20   }\n\
+                  \x20   .gcc_except_table : { *(.gcc_except_table .gcc_except_table.*) }\n\n";
+    Ok(text.replace(discard, "").replacen(anchor, &format!("{tables}{anchor}"), 1))
 }
 
 /// Собрать обёртку и разложить её под всеми именами, которых ждёт `configure`.
@@ -401,6 +483,18 @@ mod tests {
                 "`{expected}` не выставлен: autoconf возьмёт хостовый"
             );
         }
+    }
+
+    /// Сценарий C++ выводится из `user.ld`: таблицы раскрутки не выброшены и
+    /// лежат до сегмента данных, остальное — то же самое.
+    #[test]
+    fn cxx_script_keeps_unwind_tables() {
+        let base = include_str!("../../crates/user-progs/user.ld");
+        let cxx = cxx_script(base).expect("сценарий C++");
+        assert!(!cxx.contains("        *(.eh_frame)\n        *(.eh_frame_hdr)\n"));
+        let tables = cxx.find("__eh_frame_hdr_start").expect("границы таблиц");
+        assert!(tables < cxx.find(".data ALIGN(0x1000)").unwrap());
+        assert!(cxx.contains("__stack_chk_guard") && cxx.contains(".init_array"));
     }
 }
 
