@@ -148,6 +148,13 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
         // Шрифты (фаза 61) — всегда, если подготовлены.
         let with_mono = programs.iter().any(|(name, _)| *name == "mono");
         extra.extend(crate::cbuild::foreign_files(with_mono).into_iter().map(|file| (file.image, file.host)));
+        // Проверочные программы Linux (фаза 71a) — в `/compat/linux/bin`.
+        if !programs.is_empty() {
+            match crate::cbuild::build_linux_programs(opts.arch) {
+                Ok(built) => extra.extend(built),
+                Err(err) => say!("программы Linux пропущены: {err}"),
+            }
+        }
         // Образцовые пакеты — в `/media`, туда же, куда их кладёт установщик.
         // Живая система обязана уметь ставить пакеты так же, как установленная:
         // иначе проверить `pkg` было бы можно только после установки.

@@ -58,6 +58,8 @@ mod irq;
 mod crashlog;
 mod klog;
 mod latency;
+#[cfg(target_arch = "x86_64")]
+mod linux;
 mod mm;
 mod net;
 mod pci;

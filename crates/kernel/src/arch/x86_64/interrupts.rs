@@ -136,6 +136,57 @@ const GATE_PRESENT: u8 = 1 << 7;
 /// раздаёт контроллеру прерываний.
 pub const VECTOR_SYSCALL: u8 = 0x80;
 
+/// Номер «вектора» в кадре, сложенном входом `syscall` программы Linux (фаза
+/// 71a). Шире байта нарочно: настоящий вектор так выглядеть не может, и
+/// `dispatch` узнаёт вызов Linux раньше, чем отрежет номер до байта.
+const LINUX_SYSCALL_MARK: u64 = 0x100;
+
+/// MSR входа `syscall` (SDM, Vol. 3A, 5.8.8).
+const IA32_EFER: u32 = 0xC000_0080;
+const IA32_STAR: u32 = 0xC000_0081;
+const IA32_LSTAR: u32 = 0xC000_0082;
+const IA32_FMASK: u32 = 0xC000_0084;
+const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+/// `EFER.SCE` — разрешить `syscall`/`sysret`.
+const EFER_SCE: u64 = 1 << 0;
+/// Флаги, которые `syscall` снимает при входе: TF, DF, IF, IOPL, AC, NT — как у
+/// Linux. Главное здесь IF: до того как стек сменён, прерывание пришло бы на
+/// стек программы.
+const SYSCALL_FMASK: u64 = 0x47700;
+
+/// Разрешить инструкцию `syscall` на этом процессоре (фаза 71a).
+///
+/// Родные программы входят в ядро `int 0x80`; `syscall` исполняют программы
+/// Linux — по этому ядро и отличает одних от других, без признака у задачи.
+/// Заглушка (`x86_linux_syscall_entry`) меняет стек сама: процессор при
+/// `syscall` стек не трогает. Стек ядра она берёт из `RSP0` TSS этого
+/// процессора — адрес TSS лежит в `KERNEL_GS_BASE`, и `swapgs` делает его
+/// доступным на две инструкции. `GS` в остальном ядро не использует, а у
+/// программы его база возвращается на место тут же.
+///
+/// # Safety
+///
+/// На процессоре `cpu`, после загрузки его TSS.
+pub unsafe fn enable_linux_syscall(cpu: usize) {
+    unsafe extern "C" {
+        fn x86_linux_syscall_entry();
+    }
+    // `STAR`: селекторы ядра для входа (CS = 0x08, SS = 0x10) и база
+    // пользовательских для `sysret` (SS = база + 8, CS = база + 16) — GDT
+    // разложена именно так: данные пользователя перед кодом.
+    let user_base = u64::from(gdt::USER_DATA_SELECTOR) - 8;
+    let star = (user_base << 48) | (u64::from(KERNEL_CODE_SELECTOR) << 32);
+    // SAFETY: запись архитектурных MSR этого процессора; `EFER` читается и
+    // дописывается, остальные биты (LME, NXE) не трогаются.
+    unsafe {
+        super::wrmsr(IA32_STAR, star);
+        super::wrmsr(IA32_LSTAR, x86_linux_syscall_entry as usize as u64);
+        super::wrmsr(IA32_FMASK, SYSCALL_FMASK);
+        super::wrmsr(IA32_KERNEL_GS_BASE, gdt::tss_address(cpu));
+        super::wrmsr(IA32_EFER, super::rdmsr(IA32_EFER) | EFER_SCE);
+    }
+}
+
 /// Одна запись IDT (SDM, Vol. 3A, 6.14.1).
 ///
 /// Адрес обработчика разрезан на три куска — наследие 32-битного формата, в
@@ -314,8 +365,36 @@ global_asm!(
     "jmp isr_common",
     ".set isr_vector, isr_vector + 1",
     ".endr",
+
+    // --- вход `syscall` программы Linux (фаза 71a) ---
+    //
+    // Процессор положил RIP в RCX, RFLAGS в R11 и снял IF; стек — всё ещё
+    // программы. Здесь складывается тот же кадр, что у `int 0x80` из третьего
+    // кольца (SS, RSP, RFLAGS, CS, RIP, код ошибки, «вектор»), и дальше путь
+    // общий — `isr_common`, `dispatch`, `iretq`. Стек ядра — `RSP0` из TSS
+    // (смещение 4), место для RSP программы на два слова — неиспользуемый
+    // `RSP2` (смещение 20); TSS этого процессора — в `KERNEL_GS_BASE`.
+    ".balign 16",
+    ".globl x86_linux_syscall_entry",
+    ".hidden x86_linux_syscall_entry",
+    "x86_linux_syscall_entry:",
+    "swapgs",
+    "mov qword ptr gs:[20], rsp",
+    "mov rsp, qword ptr gs:[4]",
+    "push {user_ss}",
+    "push qword ptr gs:[20]",
+    "swapgs",
+    "push r11",
+    "push {user_cs}",
+    "push rcx",
+    "push 0",
+    "push {linux_mark}",
+    "jmp isr_common",
     ".popsection",
     dispatch = sym dispatch,
+    user_ss = const gdt::USER_DATA_SELECTOR as u64,
+    user_cs = const gdt::USER_CODE_SELECTOR as u64,
+    linux_mark = const LINUX_SYSCALL_MARK,
 );
 
 unsafe extern "C" {
@@ -381,6 +460,16 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
     // на стеке окажется 0xFFFF_FFFF_FFFF_FF80 вместо 0x80. Сейчас он выбирает
     // `push imm32` и такого не происходит, но зависеть от этого выбора не
     // хочется: номер вектора по определению не шире байта.
+    // Вызов программы Linux (фаза 71a) — до маски: его «вектор» шире байта.
+    if frame.vector == LINUX_SYSCALL_MARK {
+        let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9].map(|value| value as usize);
+        // SAFETY: кадр сложен входом `syscall` из третьего кольца, то есть
+        // `enter_user` исполняется и вернуться есть куда.
+        frame.rax = unsafe { crate::linux::syscall(frame.rax as usize, args) } as u64;
+        // SAFETY: см. тот же вызов у родного системного вызова ниже.
+        unsafe { crate::user::check_kill() };
+        return;
+    }
     let vector = (frame.vector & 0xFF) as u8;
 
     // Системный вызов разбирается до всего остального: его номер лежит выше

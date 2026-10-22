@@ -694,6 +694,50 @@ pub fn builtins(arch: Arch) -> PathBuf {
         .join("libclang_rt.builtins.a")
 }
 
+/// Проверочные программы Linux (фаза 71a): исходники в `libc/linux`, путь в
+/// образе — `/compat/linux/bin/<имя>`.
+const LINUX_PROGRAMS: [&str; 1] = ["hello"];
+
+/// Собрать проверочные программы Linux — только под x86-64 (слой Linux на
+/// AArch64 ещё не умеет отличать их вход от родного).
+///
+/// Не нашим набором, а clang с триплетом Linux: это программы **для Linux**,
+/// и ничего от FossAi в них быть не должно. Без libc (её в системе для Linux
+/// пока нет — фаза 71b), статическая PIE: ядро кладёт её куда хочет, а
+/// перемещений, которые некому применить, программа не содержит.
+pub fn build_linux_programs(arch: Arch) -> Result<Vec<(String, PathBuf)>> {
+    if arch != Arch::X86_64 {
+        return Ok(Vec::new());
+    }
+    let clang = llvm_tool("clang")?;
+    let work = paths::workspace_root().join("build/toolchain/linux").join(arch.name());
+    std::fs::create_dir_all(&work)?;
+    let mut built = Vec::new();
+    for name in LINUX_PROGRAMS {
+        let source = libc_dir().join("linux").join(format!("{name}.c"));
+        let output = work.join(name);
+        let mut cmd = Command::new(&clang);
+        cmd.args([
+            "--target=x86_64-unknown-linux-gnu",
+            "-O2",
+            "-Wall",
+            "-Werror",
+            "-ffreestanding",
+            "-fno-builtin",
+            "-fno-stack-protector",
+            "-fPIE",
+            "-nostdlib",
+            "-static-pie",
+            "-fuse-ld=lld",
+            "-Wl,-z,max-page-size=0x1000",
+        ]);
+        cmd.arg(&source).arg("-o").arg(&output);
+        run(cmd, &format!("clang (Linux) {}", source.display()))?;
+        built.push((format!("compat/linux/bin/{name}"), output));
+    }
+    Ok(built)
+}
+
 /// Собрать программы на C. Возвращает пути к готовым файлам.
 ///
 /// Порядок библиотек при компоновке не произволен: сначала наши объектники,

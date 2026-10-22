@@ -47,8 +47,14 @@ const MACHINE: u16 = 183;
 const PT_LOAD: u32 = 1;
 /// Путь к динамическому загрузчику.
 const PT_INTERP: u32 = 3;
+/// Заметки: здесь ищется метка ABI GNU (фаза 71a).
+const PT_NOTE: u32 = 4;
+/// Где в памяти лежит сама таблица заголовков программы.
+const PT_PHDR: u32 = 6;
 /// Шаблон хранилища потока: `.tdata` и `.tbss` (фаза 57).
 const PT_TLS: u32 = 7;
+/// Тип заметки `NT_GNU_ABI_TAG` с именем `GNU`: «программа для Linux».
+const NT_GNU_ABI_TAG: u32 = 1;
 
 /// Биты `p_flags` program header'а. Порядок обратен привычному по `readelf`
 /// написанию «RWX» и обратен конвенции [`boot_info`] — см. [`Segment::flags`].
@@ -97,6 +103,36 @@ impl fmt::Display for ElfError {
             }
         }
     }
+}
+
+/// Есть ли в заметках `bytes[offset..offset + size]` метка ABI GNU. Заметки за
+/// прочитанным началом файла не видны — тогда «нет»: у программ Linux метка
+/// лежит в первых страницах, сразу за таблицей заголовков.
+fn has_gnu_abi_tag(bytes: &[u8], offset: usize, size: usize) -> bool {
+    let Some(end) = offset.checked_add(size) else {
+        return false;
+    };
+    if end > bytes.len() {
+        return false;
+    }
+    let mut at = offset;
+    while at + 12 <= end {
+        let namesz = u32(bytes, at) as usize;
+        let descsz = u32(bytes, at + 4) as usize;
+        let kind = u32(bytes, at + 8);
+        let name = at + 12;
+        let Some(desc) = name.checked_add(namesz.next_multiple_of(4)) else {
+            return false;
+        };
+        if kind == NT_GNU_ABI_TAG && namesz == 4 && desc <= end && &bytes[name..name + 4] == b"GNU\0" {
+            return true;
+        }
+        let Some(next) = desc.checked_add(descsz.next_multiple_of(4)) else {
+            return false;
+        };
+        at = next;
+    }
+    false
 }
 
 /// Шаблон хранилища потока (`PT_TLS`) — то, что libc копирует в блок каждого
@@ -167,6 +203,11 @@ pub struct Image<'a> {
     pub entry: usize,
     /// Позиционно-независимая (`ET_DYN`): место ей выбирает ядро.
     pub position_independent: bool,
+    /// Программа Linux (фаза 71a): с меткой ABI GNU в заметках или с
+    /// динамическим загрузчиком. Ей нужен стек Linux (`argc`, `argv`, `envp`,
+    /// `auxv`) и вход `syscall`. Так узнаёт программы Linux и FreeBSD — по
+    /// «клейму» ELF, а не по пути: наши программы метки не несут.
+    pub linux: bool,
     /// Смещение таблицы заголовков программы и её геометрия.
     phoff: usize,
     phentsize: usize,
@@ -208,9 +249,17 @@ impl<'a> Image<'a> {
             return Err(ElfError::Truncated);
         }
 
+        let mut linux = false;
         for index in 0..phnum {
-            if u32(bytes, phoff + index * phentsize) == PT_INTERP {
-                return Err(ElfError::NeedsInterpreter);
+            let at = phoff + index * phentsize;
+            match u32(bytes, at) {
+                PT_INTERP => return Err(ElfError::NeedsInterpreter),
+                PT_NOTE => {
+                    let offset = u64(bytes, at + 8) as usize;
+                    let size = u64(bytes, at + 32) as usize;
+                    linux |= has_gnu_abi_tag(bytes, offset, size);
+                }
+                _ => {}
             }
         }
 
@@ -219,10 +268,39 @@ impl<'a> Image<'a> {
             file_len,
             entry,
             position_independent: kind == TYPE_DYN,
+            linux,
             phoff,
             phentsize,
             phnum,
         })
+    }
+
+    /// Адрес таблицы заголовков программы в памяти — без сдвига образа
+    /// (`AT_PHDR` для программы Linux, фаза 71a). `PT_PHDR`, если он есть,
+    /// иначе — сегмент, в файловую часть которого таблица попала.
+    pub fn phdr_vaddr(&self) -> Option<usize> {
+        let mut found = None;
+        for index in 0..self.phnum {
+            let at = self.phoff + index * self.phentsize;
+            match u32(self.bytes, at) {
+                PT_PHDR => return Some(u64(self.bytes, at + 16) as usize),
+                PT_LOAD if found.is_none() => {
+                    let offset = u64(self.bytes, at + 8) as usize;
+                    let vaddr = u64(self.bytes, at + 16) as usize;
+                    let filesz = u64(self.bytes, at + 32) as usize;
+                    if offset <= self.phoff && self.phoff < offset.saturating_add(filesz) {
+                        found = Some(vaddr + (self.phoff - offset));
+                    }
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// Число заголовков программы и размер одного (`AT_PHNUM`, `AT_PHENT`).
+    pub fn phdr_geometry(&self) -> (usize, usize) {
+        (self.phnum, self.phentsize)
     }
 
     /// Охват образа: наименьший адрес и конец наибольшего сегмента — так, как

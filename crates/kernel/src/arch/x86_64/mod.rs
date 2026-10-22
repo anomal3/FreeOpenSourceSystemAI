@@ -272,6 +272,13 @@ const IA32_FS_BASE: u32 = 0xC000_0100;
 static FS_BASE_NOW: [core::sync::atomic::AtomicU64; crate::smp::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; crate::smp::MAX_CPUS];
 
+/// База хранилища потока программы, которая сейчас на этом процессоре
+/// (`arch_prctl(ARCH_GET_FS)` программы Linux, фаза 71a).
+#[must_use]
+pub fn user_tls() -> u64 {
+    FS_BASE_NOW[crate::smp::cpu()].load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Поставить базу хранилища потока, если она отличается от нынешней.
 pub fn set_user_tls(base: u64) {
     let cpu = crate::smp::cpu();

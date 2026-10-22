@@ -790,6 +790,12 @@ pub struct Program {
     dma: Vec<crate::mm::dma::DmaBuffer>,
     /// Счёт переключений памяти кода (фаза 59).
     jit: JitStats,
+    /// Программа Linux (фаза 71a): её системные вызовы — по таблице Linux
+    /// (`crate::linux`), а родной `int 0x80` ей не положен.
+    pub linux: bool,
+    /// Граница `brk` программы Linux: начало, нынешний конец и конец резерва.
+    /// Резерв — ленивая область, заводится при первом `brk`.
+    pub brk: (usize, usize, usize),
 }
 
 impl Drop for Program {
@@ -1907,6 +1913,35 @@ fn current_process() -> Option<Arc<Mutex<Program>>> {
     table.get(slot).and_then(Option::as_ref).cloned()
 }
 
+/// Сколько адресов отводится под `brk` программы Linux (фаза 71a).
+///
+/// Шестьдесят четыре гибибайта — адреса, а не память: резерв ленивый, как и
+/// куча родной libc. glibc растит через `brk` кучу `malloc` и, не получив,
+/// уходит в `mmap` — потолок здесь значит лишь, когда она туда уйдёт.
+const BRK_RESERVE: usize = 64 << 30;
+
+/// `brk(want)` программы Linux: отвечает новым концом или, если сдвинуть
+/// нельзя, прежним (у `brk` Linux ошибки нет — есть старый ответ). Резерв
+/// заводится при первом вызове; `brk(0)` — «где конец сейчас».
+pub fn linux_brk(want: usize) -> usize {
+    with_current(|program| {
+        if program.brk.0 == 0 {
+            match program.mmap(BRK_RESERVE, user_abi::MAP_LAZY) {
+                Ok(base) => program.brk = (base, base, base + BRK_RESERVE),
+                Err(_) => return 0,
+            }
+        }
+        let (base, now, end) = program.brk;
+        if want >= base && want <= end {
+            program.brk.1 = want;
+            want
+        } else {
+            now
+        }
+    })
+    .unwrap_or(0)
+}
+
 /// Сделать что-нибудь с программой текущей задачи.
 ///
 /// `None`, если задача программы не исполняет, — например, когда системный
@@ -2401,6 +2436,155 @@ fn place_args(frame: PhysAddr, args: &[&str], layout: Layout) -> (usize, usize, 
     (pointers.len(), argv, stack)
 }
 
+/// Сложить стек программы Linux (фаза 71a) так, как его складывает `execve`:
+/// на вершине `argc`, за ним `argv` с нулём, `envp` с нулём и вектор `auxv`
+/// парами «ключ, значение» до `AT_NULL`; выше — строки и 16 случайных байт
+/// (`AT_RANDOM`, из них glibc берёт канарейку стека и ключ указателей).
+/// Возвращает вершину стека — адрес `argc`, выровненный на 16 (System V ABI,
+/// 3.4.1). Как и у [`place_args`], место — одна верхняя страница: лишние
+/// аргументы отбрасываются.
+fn place_linux_args(
+    frame: PhysAddr,
+    path: &str,
+    args: &[&str],
+    layout: Layout,
+    entry: usize,
+    start: LinuxStart,
+    cred: Credentials,
+) -> usize {
+    const AREA: usize = PAGE_SIZE;
+    // Ключи `auxv` (`<elf.h>` Linux).
+    const AT_NULL: usize = 0;
+    const AT_PHDR: usize = 3;
+    const AT_PHENT: usize = 4;
+    const AT_PHNUM: usize = 5;
+    const AT_PAGESZ: usize = 6;
+    const AT_BASE: usize = 7;
+    const AT_FLAGS: usize = 8;
+    const AT_ENTRY: usize = 9;
+    const AT_UID: usize = 11;
+    const AT_EUID: usize = 12;
+    const AT_GID: usize = 13;
+    const AT_EGID: usize = 14;
+    const AT_PLATFORM: usize = 15;
+    const AT_HWCAP: usize = 16;
+    const AT_CLKTCK: usize = 17;
+    const AT_SECURE: usize = 23;
+    const AT_RANDOM: usize = 25;
+    const AT_HWCAP2: usize = 26;
+    const AT_EXECFN: usize = 31;
+    /// Окружение, с которым программа Linux появляется на свет. Своего
+    /// окружения у запуска пока нет; это — минимум, без которого оболочки и
+    /// утилиты ищут программы и дом наугад.
+    const ENV: [&str; 4] = ["PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/", "TERM=linux", "LANG=C.UTF-8"];
+
+    let base = layout.stack_top - AREA;
+    let page = frame_bytes(frame);
+    let mut top = AREA;
+    // Строку — в страницу сверху вниз; ответ — её адрес в памяти программы.
+    // Не влезла — `None`, и место под указатели остаётся.
+    let put = |bytes: &[u8], top: &mut usize| -> Option<usize> {
+        let need = bytes.len() + 1;
+        if *top < need + AREA / 2 {
+            return None;
+        }
+        *top -= need;
+        // SAFETY: `top` и длина проверены — запись внутри страницы стека.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.add(*top), bytes.len());
+            page.add(*top + bytes.len()).write(0);
+        }
+        Some(base + *top)
+    };
+    let execfn = put(path.as_bytes(), &mut top).unwrap_or(0);
+    let platform = put(b"x86_64", &mut top).unwrap_or(0);
+    let mut random = [0u8; 16];
+    let _ = crate::random::fill(&mut random);
+    let random_at = put(&random[..15], &mut top).map_or(0, |at| {
+        // Шестнадцатый байт — на место завершающего нуля, который `put`
+        // дописал: случайных байт нужно ровно шестнадцать.
+        // SAFETY: адрес только что выдан внутри этой страницы.
+        unsafe { page.add(at - base + 15).write(random[15]) };
+        at
+    });
+    let mut argv = [0usize; 64];
+    let mut argc = 0;
+    for arg in args.iter().take(argv.len()) {
+        match put(arg.as_bytes(), &mut top) {
+            Some(at) => {
+                argv[argc] = at;
+                argc += 1;
+            }
+            None => break,
+        }
+    }
+    let mut envp = [0usize; ENV.len()];
+    let mut envc = 0;
+    for var in ENV {
+        if let Some(at) = put(var.as_bytes(), &mut top) {
+            envp[envc] = at;
+            envc += 1;
+        }
+    }
+
+    let hwcap = {
+        // `AT_HWCAP` на x86-64 — EDX функции 1 CPUID, как у Linux.
+        #[cfg(target_arch = "x86_64")]
+        {
+            core::arch::x86_64::__cpuid(1).edx as usize
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            0
+        }
+    };
+    let auxv = [
+        (AT_PHDR, start.phdr),
+        (AT_PHENT, start.phent),
+        (AT_PHNUM, start.phnum),
+        (AT_PAGESZ, PAGE_SIZE),
+        (AT_BASE, 0),
+        (AT_FLAGS, 0),
+        (AT_ENTRY, entry),
+        (AT_UID, cred.uid as usize),
+        (AT_EUID, cred.uid as usize),
+        (AT_GID, cred.gid as usize),
+        (AT_EGID, cred.gid as usize),
+        (AT_PLATFORM, platform),
+        (AT_HWCAP, hwcap),
+        (AT_CLKTCK, 100),
+        (AT_SECURE, 0),
+        (AT_RANDOM, random_at),
+        (AT_HWCAP2, 0),
+        (AT_EXECFN, execfn),
+        (AT_NULL, 0),
+    ];
+
+    let words = 1 + (argc + 1) + (envc + 1) + 2 * auxv.len();
+    let stack = (base + top - words * size_of::<usize>()) & !15;
+    let mut at = stack - base;
+    let mut push = |value: usize| {
+        // SAFETY: место под вектор — нижняя половина страницы, которую `put`
+        // строкам не отдаёт (`AREA / 2`), а слов в нём меньше пятисот.
+        unsafe { page.add(at).cast::<usize>().write_unaligned(value) };
+        at += size_of::<usize>();
+    };
+    push(argc);
+    for &pointer in &argv[..argc] {
+        push(pointer);
+    }
+    push(0);
+    for &pointer in &envp[..envc] {
+        push(pointer);
+    }
+    push(0);
+    for (key, value) in auxv {
+        push(key);
+        push(value);
+    }
+    stack
+}
+
 /// Выделить кадр под страницу программы.
 fn take_frame() -> Result<PhysAddr, Error> {
     crate::mm::frame::with(|frames| frames.allocate())
@@ -2499,6 +2683,17 @@ struct Loaded {
     entry: usize,
     stack_top_frame: PhysAddr,
     mappings: Vec<Mapping>,
+    /// Что нужно стеку программы Linux (фаза 71a); `None` — программа наша.
+    linux: Option<LinuxStart>,
+}
+
+/// Сведения о программе Linux для её вектора `auxv` (фаза 71a).
+#[derive(Clone, Copy)]
+struct LinuxStart {
+    /// Таблица заголовков программы в памяти (`AT_PHDR`).
+    phdr: usize,
+    phnum: usize,
+    phent: usize,
 }
 
 /// Выбрать место позиционно-независимой программе (ASLR, часть 2).
@@ -2541,6 +2736,11 @@ fn load(
     stack_top: usize,
 ) -> Result<Loaded, Error> {
     let image = elf::Image::parse(header, file_len).map_err(Error::Elf)?;
+    // Программы Linux (фаза 71a) — пока только на x86-64: на AArch64 вход у них
+    // тот же `svc`, что у родных, и отличать их ядро ещё не умеет.
+    if image.linux && !cfg!(target_arch = "x86_64") {
+        return Err(Error::Elf(elf::ElfError::Unsupported));
+    }
     let bias = if image.position_independent { image_bias(&image)? } else { 0 };
     let tls = image.tls((WINDOW_BASE, WINDOW_BASE + IMAGE_LIMIT_BYTES), bias).map_err(Error::Elf)?;
 
@@ -2786,7 +2986,14 @@ fn load(
     }
 
     let entry = image.entry.checked_add(bias).ok_or(Error::Elf(elf::ElfError::OutOfWindow))?;
-    Ok(Loaded { entry, stack_top_frame, mappings })
+    let linux = if image.linux {
+        let (phnum, phent) = image.phdr_geometry();
+        let phdr = image.phdr_vaddr().map_or(0, |vaddr| vaddr + bias);
+        Some(LinuxStart { phdr, phnum, phent })
+    } else {
+        None
+    };
+    Ok(Loaded { entry, stack_top_frame, mappings, linux })
 }
 
 /// Напечатать то, ради чего фаза затевалась: где лежит программа и чего о ней
@@ -2866,7 +3073,11 @@ fn run(
     // стека при этом опускается под них и выравнивается на 16: этого требуют
     // оба соглашения о вызовах, и невыровненный стек ломается не сразу, а на
     // первой же операции с вектором.
-    let (argc, argv, stack) = place_args(loaded.stack_top_frame, args, layout);
+    let (argc, argv, stack) = match loaded.linux {
+        Some(start) => (0, 0, place_linux_args(loaded.stack_top_frame, path, args, layout, entry, start, cred)),
+        None => place_args(loaded.stack_top_frame, args, layout),
+    };
+    let linux = loaded.linux.is_some();
 
     let id = sched::current();
     kprintln!(
@@ -2909,6 +3120,8 @@ fn run(
             devices: [const { None }; user_abi::MAX_DEVICES],
             dma: Vec::new(),
             jit: JitStats::default(),
+            linux: loaded.linux.is_some(),
+            brk: (0, 0, 0),
         })));
     }
     // Признак поднимается после того, как процесс попал в таблицу: обработчик
@@ -2931,7 +3144,19 @@ fn run(
     // SAFETY: точка входа и стек лежат в окне, только что отображённом
     // доступным из пользовательского режима; стек ловушки выставит сам вход в
     // третье кольцо.
-    let code = unsafe { arch::enter_user(entry, stack, argc, argv) };
+    #[cfg(target_arch = "x86_64")]
+    let code = if linux {
+        // SAFETY: то же, что ниже; стек сложен по правилам Linux.
+        unsafe { arch::enter_linux_user(entry, stack) }
+    } else {
+        // SAFETY: см. ниже.
+        unsafe { arch::enter_user(entry, stack, argc, argv) }
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let code = {
+        let _ = linux;
+        unsafe { arch::enter_user(entry, stack, argc, argv) }
+    };
 
     // Сюда возвращаются оба пути: и `exit`, и снятие программы после отказа.
     //

@@ -49,13 +49,15 @@ global_asm!(
     ".hidden x86_enter_user",
     "x86_enter_user:",
     // rdi — точка входа, rsi — вершина пользовательского стека, rdx — argc,
-    // rcx — адрес массива argv в памяти программы.
+    // rcx — адрес массива argv в памяти программы, r8 — не ноль у программы
+    // Linux (фаза 71a): ей стек отдаётся как есть, `rsp` указывает на `argc`.
     "push rbx",
     "push rbp",
     "push r12",
     "push r13",
     "push r14",
     "push r15",
+    "mov rbx, r8",
     // Аргументы переживают вызов планировщика в регистрах, которые вызываемый
     // обязан сохранить; прежние значения этих регистров уже лежат на стеке.
     "mov r12, rdi",
@@ -81,8 +83,13 @@ global_asm!(
     // `call`. Ядро приходит сюда не вызовом, а `iretq`, поэтому смещение
     // приходится создать самому. В освободившееся слово кладётся ноль: это
     // «адрес возврата» для `_start`, возвращаться которому некуда.
+    // У программы Linux вершина — уже `argc` (System V ABI, 3.4.1): ни слова
+    // поверх, и `rdx` (функция для `atexit`) будет нулём ниже.
+    "test rbx, rbx",
+    "jnz 2f",
     "sub rsi, 8",
     "mov qword ptr [rsi], 0",
+    "2:",
     // Кадр для `iretq`, сверху вниз: SS, RSP, RFLAGS, CS, RIP.
     "push {user_ss}",
     "push rsi",
@@ -147,7 +154,7 @@ global_asm!(
 );
 
 unsafe extern "C" {
-    fn x86_enter_user(entry: usize, stack: usize, argc: usize, argv: usize) -> i64;
+    fn x86_enter_user(entry: usize, stack: usize, argc: usize, argv: usize, linux: usize) -> i64;
     fn x86_return_to_kernel(code: i64) -> !;
 }
 
@@ -161,7 +168,18 @@ unsafe extern "C" {
 /// [`super::gdt::init`]).
 pub unsafe fn enter_user(entry: usize, stack: usize, argc: usize, argv: usize) -> i64 {
     // SAFETY: контракт функции.
-    unsafe { x86_enter_user(entry, stack, argc, argv) }
+    unsafe { x86_enter_user(entry, stack, argc, argv, 0) }
+}
+
+/// Уйти в программу Linux (фаза 71a): `stack` указывает на `argc`, за ним —
+/// `argv`, `envp` и `auxv`, как их кладёт `execve` Linux.
+///
+/// # Safety
+///
+/// Те же условия, что у [`enter_user`].
+pub unsafe fn enter_linux_user(entry: usize, stack: usize) -> i64 {
+    // SAFETY: контракт функции.
+    unsafe { x86_enter_user(entry, stack, 0, 0, 1) }
 }
 
 /// Вернуться в ядро из обработчика, бросив пользовательский контекст.

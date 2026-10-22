@@ -9809,6 +9809,57 @@ AArch64; загрузка модели — 7–10 с. `install`, `cthreads`, `cm
 
 Каждая фаза — свой сценарий стенда; размер вехи — XL, недели работы.
 
+## Фаза 71a — первая программа Linux — **сделано 2026-10-22**
+
+### Что стало
+
+- **Клеймо ELF.** Программа Linux узнаётся по заметке `NT_GNU_ABI_TAG`
+  («GNU», тип 1) или по `PT_INTERP` — так узнаёт их FreeBSD; наши программы
+  метки не несут (`elf::Image::linux`). Программы с `PT_INTERP` пока
+  отвергаются — динамический загрузчик будет в 71b. На AArch64 программа
+  Linux — отказ «не для этой машины».
+- **Стек `execve`.** Программе Linux ядро кладёт на вершину `argc`, `argv`,
+  `envp` (`PATH`, `HOME`, `TERM`, `LANG`) и вектор `auxv`: `AT_PHDR`,
+  `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_UID`…`AT_EGID`,
+  `AT_PLATFORM`, `AT_HWCAP` (CPUID), `AT_CLKTCK`, `AT_RANDOM` (16 случайных
+  байт), `AT_EXECFN`; `rsp` при входе указывает на `argc`
+  (`arch::enter_linux_user`).
+- **Вход `syscall`** (x86-64): `EFER.SCE`, `STAR`, `LSTAR`, `FMASK` на каждом
+  процессоре. Процессор при `syscall` стек не меняет; заглушка берёт стек ядра
+  из `RSP0` TSS — адрес TSS лежит в `KERNEL_GS_BASE`, и `swapgs` открывает его
+  на две инструкции (`RSP2` служит ячейкой для стека программы). Кадр —
+  такой же, как у `int 0x80`, и дальше путь общий, до `iretq`. Родные
+  программы входят `int 0x80`, программы Linux — `syscall`: ядро отличает их
+  по способу входа, а `syscall` у родной программы — `-ENOSYS`.
+- **`crate::linux`** — таблица перевода: `read`, `write`, `writev`, `open`,
+  `openat`, `close`, `stat`/`lstat`/`fstat`/`newfstatat` (раскладка `struct
+  stat` Linux), `lseek`, `mmap` (безымянная и файл на чтение), `mprotect`,
+  `munmap`, `brk` (ленивый резерв 64 ГиБ), `ioctl` (`TCGETS`, `TIOCGWINSZ`),
+  `nanosleep`, `clock_gettime`, `uname` (Linux 6.1.0-fossai), `arch_prctl`
+  (FS), `futex` (ожидание и пробуждение), `sched_getaffinity`, `prlimit64`,
+  `getrandom`, `getpid`/`gettid`/`get*id`, `exit`/`exit_group`, `rseq` —
+  `ENOSYS`. Коды ошибок ядра переводятся в `errno` Linux. Неизвестный вызов —
+  `-ENOSYS` и строка в журнале «system call N is not implemented»: по ним
+  растёт таблица.
+- **Проверочная программа** `libc/linux/hello.c` — Linux x86-64 без libc,
+  собранная clang с триплетом Linux статической PIE, в
+  `/compat/linux/bin/hello` живой системы.
+
+### Проверено
+
+Новый сценарий **`linux`**: 14 проверок из 14 — `argv`, окружение, `auxv`,
+`AT_PHDR`, `uname`, `getpid`, `brk` на мегабайт, `mmap`/`munmap`, TLS через
+`arch_prctl` и чтение `%fs:8`, `nanosleep` по монотонным часам, `getrandom`,
+`openat`/`read`/`fstat` своего файла, `ENOENT`. `cthreads`, `cmem`,
+`userspace`, `aslr`, `canary`, `mmap` — зелёные на обеих архитектурах.
+
+### Дальше — 71b
+
+Динамические программы: `ld-linux-x86-64.so.2` по `PT_INTERP` (ядро
+загружает его рядом с программой и отдаёт `AT_BASE`), `MAP_FIXED`,
+отображение файла на запись с копированием, `mprotect` по образу,
+`/compat/linux` из пакетов Debian — и Debian `bash`, `ls`.
+
 # Полный прогон 17.10 — 407 из 428, один дефект установщика
 
 `--full` на `569e904` (фазы 67–68e): 428 прогонов, 152 минуты в три потока.

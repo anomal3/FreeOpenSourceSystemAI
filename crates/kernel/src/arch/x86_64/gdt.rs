@@ -391,6 +391,8 @@ pub fn init() {
         // «доступный»; флаг гарантирует, что этот `ltr` — первый.
         unsafe { load_tss(tss_selector(0)) };
         INSTALLED.store(true, Ordering::Relaxed);
+        // SAFETY: TSS этого процессора загружен строкой выше.
+        unsafe { super::interrupts::enable_linux_syscall(0) };
     });
 }
 
@@ -423,7 +425,15 @@ pub unsafe fn load_secondary(cpu: usize) {
     unsafe {
         load_gdt(&raw const pointer);
         load_tss(tss_selector(cpu));
+        super::interrupts::enable_linux_syscall(cpu);
     }
+}
+
+/// Адрес TSS процессора `cpu` — для входа `syscall` программ Linux (фаза
+/// 71a): заглушка берёт из него стек ядра (`RSP0`) через `swapgs`.
+#[must_use]
+pub fn tss_address(cpu: usize) -> u64 {
+    TSS[cpu].get() as u64
 }
 
 /// Селектор TSS процессора `cpu`.
