@@ -39,7 +39,7 @@ use crate::{cbuild, sdk};
 const SNAPSHOT: &str = "https://snapshot.debian.org/archive/debian/20261020T000000Z/";
 
 /// Пакеты: путь в архиве и SHA-256 из `Packages` bookworm того же дня.
-const PACKAGES: [(&str, &str); 12] = [
+pub(crate) const PACKAGES: [(&str, &str); 12] = [
     ("pool/main/g/glibc/libc6_2.36-9+deb12u14_amd64.deb", "ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf"),
     ("pool/main/n/ncurses/libtinfo6_6.4-4_amd64.deb", "072d908f38f51090ca28ca5afa3b46b2957dc61fe35094c0b851426859a49a51"),
     ("pool/main/b/bash/bash_5.2.15-2+b13_amd64.deb", "82130bb6a560cd2a7234d8018baf73f188f5dd56413d5aa0accc987b2197a6a1"),
@@ -97,7 +97,7 @@ pub fn package_path() -> PathBuf {
 }
 
 /// Одна запись корня.
-enum Node {
+pub(crate) enum Node {
     File { data: Vec<u8>, mode: u32 },
     Link(String),
     Dir,
@@ -152,7 +152,7 @@ pub fn build(arch: Arch) -> Result<()> {
 }
 
 /// Скачать (или взять из кеша) пакеты, сверить хеши и разложить в `root`.
-fn unpack(cache: &std::path::Path, packages: &[(&str, &str)], root: &mut BTreeMap<String, Node>) -> Result<()> {
+pub(crate) fn unpack(cache: &std::path::Path, packages: &[(&str, &str)], root: &mut BTreeMap<String, Node>) -> Result<()> {
     for &(pool, sha256) in packages {
         let name = pool.rsplit('/').next().unwrap_or(pool);
         let file = cache.join(name);
@@ -253,7 +253,7 @@ fn pack(root: &BTreeMap<String, Node>) -> Result<()> {
 
 /// Куда ведёт ссылка `path` — до файла; `None` — в никуда, на каталог или по
 /// кругу.
-fn follow<'a>(root: &'a BTreeMap<String, Node>, path: &str, depth: usize) -> Option<(&'a Vec<u8>, u32)> {
+pub(crate) fn follow<'a>(root: &'a BTreeMap<String, Node>, path: &str, depth: usize) -> Option<(&'a Vec<u8>, u32)> {
     if depth > 16 {
         return None;
     }

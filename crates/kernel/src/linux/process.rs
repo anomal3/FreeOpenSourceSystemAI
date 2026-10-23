@@ -168,7 +168,15 @@ pub fn wait4(pid: usize, status: usize, options: usize, rusage: usize) -> i64 {
             list.iter().position(|child| wanted(child) && child.status.is_some()).map(|index| list.remove(index))
         };
         if let Some(child) = found {
-            // SAFETY: оба адреса проверены на запись выше; пространство — наше.
+            // Проверка — заново: пока ждали, другой поток мог сделать `fork`, и
+            // страница стала только на чтение до копирования (фаза 71g); ядро
+            // пишет своими правами, и проверка её и скопирует.
+            if (status != 0 && !space::user_can(status, 4, PageFlags::WRITE))
+                || (rusage != 0 && !space::user_can(rusage, RUSAGE, PageFlags::WRITE))
+            {
+                return -e::EFAULT;
+            }
+            // SAFETY: оба адреса проверены на запись строками выше.
             unsafe {
                 if status != 0 {
                     core::ptr::write_unaligned(status as *mut i32, child.status.unwrap_or(0));
@@ -238,15 +246,22 @@ pub fn execve(frame: &mut crate::arch::TrapFrame, path: usize, argv: usize, envp
         linux
     };
     let mut bytes = 0;
-    let args = match user_vector(argv, &mut bytes) {
-        Ok(args) => args,
-        Err(err) => return err,
+    let vectors = user_vector(argv, &mut bytes).and_then(|args| Ok((args, user_vector(envp, &mut bytes)?)));
+    let (args, env) = match vectors {
+        Ok(found) => found,
+        Err(err) => {
+            crate::kprintln!("  linux       : execve '{linux}': arguments refused ({err}, {bytes} bytes)");
+            return err;
+        }
     };
-    let env = match user_vector(envp, &mut bytes) {
-        Ok(env) => env,
-        Err(err) => return err,
-    };
-    exec_linux(frame, linux, args, &env, 0)
+    let shown = linux.clone();
+    let result = exec_linux(frame, linux, args, &env, 0);
+    // Отказ `execve` у ребёнка виден снаружи только кодом 127 — причину
+    // ядро говорит само (фаза 71h).
+    if result < 0 {
+        crate::kprintln!("  linux       : execve '{shown}' failed: {result}");
+    }
+    result
 }
 
 /// `execve` по пути Linux: сценарий с `#!` — через его интерпретатор,

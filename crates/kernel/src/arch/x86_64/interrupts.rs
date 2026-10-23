@@ -674,6 +674,30 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
         return;
     }
 
+    // Ядро пишет в память программы и натыкается на страницу только на чтение
+    // (фаза 71h). Так бывает законно: ядро проверило буфер (`user_can`), а
+    // соседний поток программы между проверкой и записью сделал `fork`, и
+    // страница стала разделённой до копирования (71g). Проверять ещё раз
+    // бесполезно — `fork` идёт параллельно, — поэтому отказ разбирается, как у
+    // самой программы: копия страницы, и запись повторяется. Только запись в
+    // присутствующую страницу окна программы, из системного вызова с открытыми
+    // прерываниями — то есть без удерживаемых `SpinLock`; всё остальное, как и
+    // прежде, — остановка машины.
+    if vector == VECTOR_PAGE_FAULT
+        && frame.cs & 3 == 0
+        && frame.rflags & 0x200 != 0
+        && frame.error & (PF_PRESENT | PF_WRITE) == PF_PRESENT | PF_WRITE
+        && crate::user::is_running()
+    {
+        let addr = read_cr2();
+        if crate::user::owns(addr, 1) {
+            enable();
+            if crate::user::fault_in(addr, crate::user::Touch::Write, true) {
+                return;
+            }
+        }
+    }
+
     match vector {
         VECTOR_PAGE_FAULT => page_fault(frame),
         VECTOR_BREAKPOINT => breakpoint(frame),

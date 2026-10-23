@@ -20,6 +20,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -243,20 +244,30 @@ pub enum Whence {
 /// Таблица дескрипторов одной программы. Место `i` — это дескриптор
 /// `i + FD_FIRST`.
 pub struct Table {
-    slots: [Option<Slot>; MAX_OPEN_FILES],
+    /// Места `FD_FIRST..`; растёт по мере надобности до [`Table::limit`]
+    /// (фаза 71h — у программы Linux мест до [`LINUX_MAX_FILES`]).
+    slots: alloc::vec::Vec<Option<Slot>>,
     /// Номера 0, 1 и 2 программы Linux (фаза 71d). У родной программы они
     /// пусты и не используются: её стандартные потоки — не места таблицы.
     std: [Option<Slot>; FD_FIRST],
     /// Номера 0–2 — места таблицы (программа Linux).
     linux: bool,
     /// `FD_CLOEXEC` по номеру дескриптора: закрыть при `execve`.
-    cloexec: u64,
+    cloexec: BTreeSet<usize>,
 }
+
+/// Сколько дескрипторов у программы Linux (фаза 71h): Chromium держит их
+/// сотнями — сокеты, разделяемая память, концы каналов детей. Родной программе
+/// по-прежнему [`MAX_OPEN_FILES`] — это её договор.
+pub const LINUX_MAX_FILES: usize = 1024;
+
+/// Пустое место — для ответа о номере за концом выросшей части таблицы.
+static EMPTY: Option<Slot> = None;
 
 impl Table {
     #[must_use]
     pub const fn new() -> Self {
-        Self { slots: [const { None }; MAX_OPEN_FILES], std: [const { None }; FD_FIRST], linux: false, cloexec: 0 }
+        Self { slots: alloc::vec::Vec::new(), std: [const { None }; FD_FIRST], linux: false, cloexec: BTreeSet::new() }
     }
 
     /// Таблица программы Linux: номера 0–2 заняты стандартными потоками и
@@ -264,10 +275,10 @@ impl Table {
     #[must_use]
     pub const fn new_linux() -> Self {
         Self {
-            slots: [const { None }; MAX_OPEN_FILES],
+            slots: alloc::vec::Vec::new(),
             std: [Some(Slot::Std(0)), Some(Slot::Std(1)), Some(Slot::Std(2))],
             linux: true,
-            cloexec: 0,
+            cloexec: BTreeSet::new(),
         }
     }
 
@@ -277,26 +288,45 @@ impl Table {
     pub fn fork(&self) -> Self {
         let copy = |slot: &Option<Slot>| slot.as_ref().map(Slot::copy);
         Self {
-            slots: core::array::from_fn(|index| copy(&self.slots[index])),
+            slots: self.slots.iter().map(copy).collect(),
             std: core::array::from_fn(|index| copy(&self.std[index])),
             linux: self.linux,
-            cloexec: self.cloexec,
+            cloexec: self.cloexec.clone(),
         }
     }
 
-    /// Место таблицы под номером `fd`.
+    /// Место таблицы под номером `fd`. У программы Linux номер — `int`:
+    /// значат только младшие 32 бита регистра (фаза 71h).
     fn cell(&self, fd: usize) -> Result<&Option<Slot>, FileError> {
+        let fd = if self.linux { fd as u32 as usize } else { fd };
         if fd < FD_FIRST && self.linux {
             return Ok(&self.std[fd]);
         }
-        Ok(&self.slots[index_of(fd)?])
+        let index = self.index_of(fd)?;
+        Ok(self.slots.get(index).unwrap_or(&EMPTY))
+    }
+
+    /// Сколько номеров дескрипторов (сверх 0–2) у программы может быть.
+    fn limit(&self) -> usize {
+        if self.linux { LINUX_MAX_FILES } else { MAX_OPEN_FILES }
+    }
+
+    /// Номер места в таблице по дескриптору.
+    fn index_of(&self, fd: usize) -> Result<usize, FileError> {
+        fd.checked_sub(FD_FIRST).filter(|index| *index < self.limit()).ok_or(FileError::BadFd)
     }
 
     fn cell_mut(&mut self, fd: usize) -> Result<&mut Option<Slot>, FileError> {
+        let fd = if self.linux { fd as u32 as usize } else { fd };
         if fd < FD_FIRST && self.linux {
             return Ok(&mut self.std[fd]);
         }
-        Ok(&mut self.slots[index_of(fd)?])
+        let index = self.index_of(fd)?;
+        if index >= self.slots.len() {
+            self.slots.try_reserve(index + 1 - self.slots.len()).map_err(|_| FileError::TooManyFiles)?;
+            self.slots.resize_with(index + 1, || None);
+        }
+        Ok(&mut self.slots[index])
     }
 
     /// Положить в свободное место `fd`; `FD_CLOEXEC` у нового — снят.
@@ -310,7 +340,7 @@ impl Table {
     /// Наименьший свободный номер не меньше `min` (у Linux — считая 0–2).
     fn free_fd(&self, min: usize) -> Result<usize, FileError> {
         let first = if self.linux { 0 } else { FD_FIRST };
-        (first.max(min)..FD_FIRST + MAX_OPEN_FILES)
+        (first.max(min)..FD_FIRST + self.limit())
             .find(|&fd| matches!(self.cell(fd), Ok(None)))
             .ok_or(FileError::TooManyFiles)
     }
@@ -331,19 +361,18 @@ impl Table {
 
     /// Поставить или снять `FD_CLOEXEC`.
     pub fn set_cloexec(&mut self, fd: usize, on: bool) {
-        if fd < 64 {
-            if on {
-                self.cloexec |= 1 << fd;
-            } else {
-                self.cloexec &= !(1 << fd);
-            }
+        let fd = fd as u32 as usize;
+        if on {
+            self.cloexec.insert(fd);
+        } else {
+            self.cloexec.remove(&fd);
         }
     }
 
     /// Стоит ли `FD_CLOEXEC`; `Err` — дескриптора нет.
     pub fn cloexec(&self, fd: usize) -> Result<bool, FileError> {
         match self.cell(fd)? {
-            Some(_) => Ok(fd < 64 && self.cloexec & (1 << fd) != 0),
+            Some(_) => Ok(self.cloexec.contains(&(fd as u32 as usize))),
             None => Err(FileError::BadFd),
         }
     }
@@ -352,12 +381,11 @@ impl Table {
     /// сколько закрыто.
     pub fn close_on_exec(&mut self) -> usize {
         let mut closed = 0;
-        for fd in 0..FD_FIRST + MAX_OPEN_FILES {
-            if fd < 64 && self.cloexec & (1 << fd) != 0 && self.close(fd).is_ok() {
+        for fd in core::mem::take(&mut self.cloexec) {
+            if self.close(fd).is_ok() {
                 closed += 1;
             }
         }
-        self.cloexec = 0;
         closed
     }
 
@@ -463,7 +491,10 @@ impl Table {
     /// `/proc` и устройства `/dev` программ Linux.
     pub fn install_node(&mut self, node: Arc<dyn Node>, writable: bool) -> Result<usize, FileError> {
         let fd = self.free_fd(0)?;
-        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None })));
+        // Каталог в памяти (`/proc`, фаза 71h) — со снимком имён, как у
+        // открытого с диска.
+        let entries = if node.metadata().kind == NodeKind::Directory { node.list().ok() } else { None };
+        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries })));
         Ok(fd)
     }
 
@@ -684,6 +715,25 @@ impl Table {
     }
 
     /// Не ждёт ли дескриптор. Файл — `true`: ждать ему нечего.
+    /// Режим доступа для `fcntl(F_GETFL)` программы Linux (фаза 71h):
+    /// `O_RDONLY` (0), `O_WRONLY` (1) или `O_RDWR` (2) — как открыто.
+    pub fn access_mode(&self, fd: usize) -> Result<u32, FileError> {
+        Ok(match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
+            Slot::File(open) => {
+                if open.writable {
+                    2
+                } else {
+                    0
+                }
+            }
+            Slot::PipeRead(..) => 0,
+            Slot::PipeWrite(..) => 1,
+            Slot::Socket(_) | Slot::Object(..) => 2,
+            Slot::Std(0) => 0,
+            Slot::Std(_) => 1,
+        })
+    }
+
     pub fn nonblock(&self, fd: usize) -> Result<bool, FileError> {
         Ok(match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
             Slot::PipeRead(_, mode) | Slot::PipeWrite(_, mode) | Slot::Object(_, mode) => mode.nonblock(),
@@ -838,9 +888,3 @@ impl Table {
     }
 }
 
-/// Номер места в таблице по дескриптору.
-fn index_of(fd: usize) -> Result<usize, FileError> {
-    fd.checked_sub(FD_FIRST)
-        .filter(|index| *index < MAX_OPEN_FILES)
-        .ok_or(FileError::BadFd)
-}

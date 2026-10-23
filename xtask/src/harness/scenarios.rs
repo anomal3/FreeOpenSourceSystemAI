@@ -175,6 +175,9 @@ pub enum Step {
     Hold(&'static str, u32),
     /// Нажать клавишу несколько раз.
     Repeat(&'static str, u32),
+    /// То же, но только на этой архитектуре (фаза 71h): списки на носителях
+    /// архитектур бывают разной длины — пакеты Linux есть только у x86-64.
+    RepeatOn(Arch, &'static str, u32),
     /// Набрать текст на клавиатуре.
     Type(&'static str),
     /// Отправить строку в серийную линию, завершив переводом строки.
@@ -5214,6 +5217,48 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "chromium",
+        about: "Chromium без окна (фаза 71h): chromium-headless-shell из Debian 12 скачивает страницу с хоста, исполняет её JavaScript и печатает DOM.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: true,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "2G",
+        // `-cpu max`: сборка Chromium ждёт SSE4/AVX, которых нет у `qemu64`.
+        extra: &["-cpu", "max", "-smp", "2"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await("freeos> ", 90_000),
+            Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Line("run /bin/pkg install /media/debian-12.fpk"),
+            Step::Await("pkg: installed debian 12, ", 300_000),
+            Step::Line("run /bin/pkg install /media/linuxweb-150.fpk"),
+            Step::Await("pkg: installed chromium 150, ", 1_800_000),
+            Step::Line("run /opt/debian/bin/bash /opt/chromium/bin/chromium --headless --dump-dom http://10.0.2.2:{site}/page.html"),
+            Step::Await("Chromium on FossAi runs JavaScript", 300_000),
+            Step::Await("/opt/debian/bin/bash: exited with code 0", 120_000),
+            Step::Line("run /bin/pkg remove chromium"),
+            Step::Await("pkg: removed chromium", 300_000),
+            Step::Line("run /bin/pkg remove debian"),
+            Step::Await("pkg: removed debian", 120_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "doom",
         about: "Первая игра на SDL2 (фазы 68d, 68e): пакет freedoom с носителя, doomgeneric с данными Freedoom — заставка, меню, новая игра, выстрелы со звуком, крестик.",
         target: Target::Installed,
@@ -7677,6 +7722,9 @@ pub const ALL: &[Scenario] = &[
             // установленной системы), `hello`. Ставим `hello` — `extra`
             // требует его и не встал бы.
             Step::Repeat("down", 5),
+            // На x86-64 в списке первым ещё `debian-12` (корень программ
+            // Linux, фаза 71b): там до `hello` на строку дальше.
+            Step::RepeatOn(Arch::X86_64, "down", 1),
             Step::Key("ret"),
             Step::Await("settings    : started '/bin/pkg install /media/hello-1.0.fpk'", 15_000),
             Step::Await("pkg: installed hello 1.0, 2 file(s)", 60_000),

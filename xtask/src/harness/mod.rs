@@ -881,6 +881,7 @@ fn execute(
         ports,
         workers,
         data_disk.as_deref(),
+        arch,
     );
 
     // Провал, а гость ещё жив, — снять, где стоят процессоры. Журнал серийной
@@ -928,6 +929,8 @@ fn play(
     workers: u16,
     // Диск с томом btrfs — для проверки с хоста после выключения.
     data_disk: Option<&Path>,
+    // Архитектура прогона — для шагов только на ней (`Step::RepeatOn`).
+    arch: Arch,
 ) -> Result<()> {
     let started = Instant::now();
     // Где сейчас указатель. Мышь относительная, абсолютных координат у неё нет,
@@ -1106,6 +1109,15 @@ fn play(
                 say!("  [{at:>6} мс] шаг {index}: клавиша {name} на {ms} мс");
                 hmp.sendkey(&format!("{name} {ms}")).with_context(|| format!("шаг {index}"))?;
                 std::thread::sleep(Duration::from_millis(u64::from(*ms)) + KEY_DELAY);
+            }
+            Step::RepeatOn(only, name, times) => {
+                if *only == arch {
+                    say!("  [{at:>6} мс] шаг {index}: клавиша {name} ×{times} ({only:?})");
+                    for _ in 0..*times {
+                        hmp.sendkey(name).with_context(|| format!("шаг {index}"))?;
+                        std::thread::sleep(KEY_DELAY);
+                    }
+                }
             }
             Step::Repeat(name, times) => {
                 say!("  [{at:>6} мс] шаг {index}: клавиша {name} ×{times}");
@@ -2612,6 +2624,19 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                 let body = "hello from the host\n";
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
+            // Страница для Chromium (фаза 71h): заголовок меняет скрипт —
+            // по выводу `--dump-dom` видно, что JavaScript исполнился.
+            "/page.html" => {
+                let body = "<!DOCTYPE html><html><head><title>FossAi</title></head><body>\
+                    <h1 id=\"title\">Chromium on FossAi</h1>\
+                    <script>document.getElementById('title').textContent += ' runs JavaScript';</script>\
+                    </body></html>\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .into_bytes()

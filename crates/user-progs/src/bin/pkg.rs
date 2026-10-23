@@ -60,7 +60,11 @@ static mut MANIFEST: [u8; fpk::MAX_MANIFEST] = [0; fpk::MAX_MANIFEST];
 static mut KEYFILE: [u8; 4096] = [0; 4096];
 
 /// Буфер, которым переливается содержимое файлов.
-static mut CHUNK: [u8; 4096] = [0; 4096];
+///
+/// 128 КиБ, а не страница (фаза 71h): пакет Chromium — 230 МБ, и по 4 КиБ это
+/// шестьдесят тысяч записей, каждая со своим обновлением метаданных ext2, —
+/// четверть часа. Память программы с фазы 70e предела на задачу не имеет.
+static mut CHUNK: [u8; 128 * 1024] = [0; 128 * 1024];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {

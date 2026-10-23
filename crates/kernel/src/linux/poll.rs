@@ -38,6 +38,11 @@ fn wait(fds: usize, count: usize, deadline: Option<u64>) -> i64 {
     }
     loop {
         let seen = crate::io_events::generation();
+        // Заново на каждой попытке (фаза 71h): пока мы спали, другой поток
+        // мог отдать или защитить эту память, а пишет ядро своими правами.
+        if !space::user_can(fds, count * 8, PageFlags::WRITE) {
+            return -e::EFAULT;
+        }
         let mut ready = 0;
         for index in 0..count {
             let at = fds + index * 8;
@@ -106,6 +111,12 @@ fn wait(fds: usize, count: usize, deadline: Option<u64>) -> i64 {
 /// (родной рождается неждущим).
 pub fn pipe(fds: usize, flags: usize) -> i64 {
     const O_NONBLOCK: usize = 0o4000;
+    const O_DIRECT: usize = 0o40_000;
+    const O_CLOEXEC_FLAG: usize = 0o2_000_000;
+    let flags = flags as u32 as usize;
+    if flags & !(O_NONBLOCK | O_DIRECT | O_CLOEXEC_FLAG) != 0 {
+        return -e::EINVAL;
+    }
     if !space::user_can(fds, 8, PageFlags::WRITE) {
         return -e::EFAULT;
     }

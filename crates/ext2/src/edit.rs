@@ -634,10 +634,15 @@ impl Editor {
 
         if size < inode.size {
             let keep = size.div_ceil(block_bytes) as usize;
-            let had = inode.size.div_ceil(block_bytes) as usize;
-            for index in (keep..had).rev() {
-                self.free_file_block(dev, &mut inode, index)?;
-            }
+            // По таблицам целиком, с картой в кэше (фаза 71h): прежний путь —
+            // запись карты и таблицы на каждый блок — удалял файл в 200 МБ
+            // дольше пяти минут.
+            self.batching = true;
+            let shrunk = self.shrink(dev, &mut inode, keep);
+            let committed = self.commit_bitmap(dev);
+            self.batching = false;
+            shrunk?;
+            committed?;
             // Хвост последнего блока обнуляется: если файл потом снова
             // вырастет, там иначе проступит прежнее содержимое — то самое,
             // которое усечением и убирали.
@@ -982,7 +987,16 @@ impl Editor {
 
     /// Освободить бит. `false` — он уже был свободен, и счётчик трогать нельзя.
     fn clear_bit(&mut self, dev: &mut dyn BlockDevice, bitmap: u32, index: u32) -> Result<bool> {
-        self.commit_bitmap(dev)?;
+        // Внутри пакета (усечение, фаза 71h) — как у `take_bit`: биты копятся
+        // в кэше и уходят на диск при смене карты или в конце. Указатели на
+        // освобождаемые блоки к этому времени уже стёрты на диске, так что
+        // пропажа питания оставит самое большее занятые, но ничьи блоки.
+        if self.batching && self.bitmap_dirty && !matches!(self.bitmap_cache, Some((cached, _)) if cached == bitmap) {
+            self.commit_bitmap(dev)?;
+        }
+        if !self.batching {
+            self.commit_bitmap(dev)?;
+        }
         let mut buf = self.read_bitmap(dev, bitmap)?;
         let at = (index / 8) as usize;
         let mask = 1u8 << (index % 8);
@@ -991,9 +1005,106 @@ impl Editor {
             return Ok(false);
         }
         buf[at] &= !mask;
-        self.write_block(dev, bitmap, &buf)?;
+        if self.batching {
+            self.bitmap_dirty = true;
+        } else {
+            self.write_block(dev, bitmap, &buf)?;
+        }
         self.bitmap_cache = Some((bitmap, buf));
         Ok(true)
+    }
+
+    /// Освободить хвост таблицы косвенности с места `from` (фаза 71h): таблица
+    /// читается и пишется один раз, а не по разу на блок, — и пишется **до**
+    /// того, как блоки уйдут на карту. Возвращает, опустела ли таблица и
+    /// сколько блоков освобождено.
+    fn free_table_tail(&mut self, dev: &mut dyn BlockDevice, table: u32, from: usize) -> Result<(bool, u32)> {
+        let mut buf = self.read_block(dev, table)?;
+        let pointers = buf.len() / 4;
+        let mut freed: Vec<u32> = Vec::new();
+        for slot in from..pointers {
+            let block = u32_at(&buf, slot * 4);
+            if block != 0 {
+                freed.try_reserve(1).map_err(|_| Error::NoSpace)?;
+                freed.push(block);
+                put_u32(&mut buf, slot * 4, 0);
+            }
+        }
+        let empty = buf.chunks(4).all(|word| word == [0, 0, 0, 0]);
+        // Пишется и опустевшая: пока на неё указывает внешняя таблица, на
+        // диске она не должна называть блоки, уже свободные по карте.
+        if !freed.is_empty() {
+            self.write_block(dev, table, &buf)?;
+        }
+        for block in &freed {
+            self.free_block(dev, *block)?;
+        }
+        Ok((empty, freed.len() as u32))
+    }
+
+    /// Усечь блоки файла до `keep` первых — по таблицам целиком (фаза 71h).
+    fn shrink(&mut self, dev: &mut dyn BlockDevice, inode: &mut InodeData, keep: usize) -> Result<()> {
+        let pointers = self.geometry.block_size.pointers_per_block() as usize;
+        let per_block = self.geometry.sectors_per_block();
+        let single_limit = DIRECT_BLOCKS + pointers;
+        // Двойная косвенность: листья, потом внешняя таблица.
+        let outer = inode.blocks[DOUBLE_INDIRECT_INDEX];
+        if outer != 0 {
+            let first_leaf = keep.saturating_sub(single_limit) / pointers;
+            let original = self.read_block(dev, outer)?;
+            let mut outer_buf = crate::write::try_clone(&original)?;
+            for leaf_slot in first_leaf..pointers {
+                let leaf = u32_at(&original, leaf_slot * 4);
+                if leaf == 0 {
+                    continue;
+                }
+                let start = single_limit + leaf_slot * pointers;
+                let from = keep.saturating_sub(start).min(pointers);
+                let (empty, freed) = self.free_table_tail(dev, leaf, from)?;
+                inode.sectors = inode.sectors.saturating_sub(freed * per_block);
+                if empty {
+                    put_u32(&mut outer_buf, leaf_slot * 4, 0);
+                }
+            }
+            let outer_empty = outer_buf.chunks(4).all(|word| word == [0, 0, 0, 0]);
+            if outer_buf != original {
+                self.write_block(dev, outer, &outer_buf)?;
+            }
+            // Опустевшие листья — на карту, когда на них уже никто не указывает.
+            for leaf_slot in first_leaf..pointers {
+                let leaf = u32_at(&original, leaf_slot * 4);
+                if leaf != 0 && u32_at(&outer_buf, leaf_slot * 4) == 0 {
+                    self.free_block(dev, leaf)?;
+                    inode.sectors = inode.sectors.saturating_sub(per_block);
+                }
+            }
+            if outer_empty {
+                inode.blocks[DOUBLE_INDIRECT_INDEX] = 0;
+                self.free_block(dev, outer)?;
+                inode.sectors = inode.sectors.saturating_sub(per_block);
+            }
+        }
+        // Одинарная косвенность.
+        let single = inode.blocks[INDIRECT_INDEX];
+        if single != 0 && keep < single_limit {
+            let (empty, freed) = self.free_table_tail(dev, single, keep.saturating_sub(DIRECT_BLOCKS))?;
+            inode.sectors = inode.sectors.saturating_sub(freed * per_block);
+            if empty {
+                inode.blocks[INDIRECT_INDEX] = 0;
+                self.free_block(dev, single)?;
+                inode.sectors = inode.sectors.saturating_sub(per_block);
+            }
+        }
+        // Прямые указатели.
+        for index in keep.min(DIRECT_BLOCKS)..DIRECT_BLOCKS {
+            let block = inode.blocks[index];
+            if block != 0 {
+                inode.blocks[index] = 0;
+                self.free_block(dev, block)?;
+                inode.sectors = inode.sectors.saturating_sub(per_block);
+            }
+        }
+        Ok(())
     }
 
     // --- блоки файла -------------------------------------------------------
@@ -1172,101 +1283,6 @@ impl Editor {
         }
         let buf = self.read_block(dev, table)?;
         Ok(u32_at(&buf, slot * 4))
-    }
-
-    /// Освободить `index`-й блок файла и, если она опустела, таблицу над ним.
-    ///
-    /// Вызывается от конца файла к началу — только при таком порядке
-    /// опустевшая таблица обнаруживается сразу, а не остаётся висеть занятой.
-    fn free_file_block(
-        &mut self,
-        dev: &mut dyn BlockDevice,
-        inode: &mut InodeData,
-        index: usize,
-    ) -> Result<()> {
-        let pointers = self.geometry.block_size.pointers_per_block() as usize;
-        let single_limit = DIRECT_BLOCKS + pointers;
-        let double_limit = single_limit + pointers * pointers;
-
-        if index < DIRECT_BLOCKS {
-            let block = inode.blocks[index];
-            if block != 0 {
-                self.free_block(dev, block)?;
-                inode.blocks[index] = 0;
-                inode.sectors = inode.sectors.saturating_sub(self.geometry.sectors_per_block());
-            }
-            return Ok(());
-        }
-
-        if index < single_limit {
-            let table = inode.blocks[INDIRECT_INDEX];
-            let empty = self.free_pointer(dev, inode, table, index - DIRECT_BLOCKS)?;
-            if empty {
-                self.free_block(dev, table)?;
-                inode.blocks[INDIRECT_INDEX] = 0;
-                inode.sectors = inode.sectors.saturating_sub(self.geometry.sectors_per_block());
-            }
-            return Ok(());
-        }
-
-        if index < double_limit {
-            let outer = inode.blocks[DOUBLE_INDIRECT_INDEX];
-            if outer == 0 {
-                return Ok(());
-            }
-            let offset = index - single_limit;
-            let leaf = self.pointer_at(dev, outer, offset / pointers)?;
-            let leaf_empty = self.free_pointer(dev, inode, leaf, offset % pointers)?;
-            if leaf_empty {
-                self.free_block(dev, leaf)?;
-                inode.sectors = inode.sectors.saturating_sub(self.geometry.sectors_per_block());
-                let outer_empty = self.clear_pointer(dev, outer, offset / pointers)?;
-                if outer_empty {
-                    self.free_block(dev, outer)?;
-                    inode.blocks[DOUBLE_INDIRECT_INDEX] = 0;
-                    inode.sectors =
-                        inode.sectors.saturating_sub(self.geometry.sectors_per_block());
-                }
-            }
-            return Ok(());
-        }
-        Err(Error::Unsupported)
-    }
-
-    /// Освободить блок, на который указывает `slot` таблицы. Возвращает
-    /// `true`, если таблица опустела.
-    fn free_pointer(
-        &mut self,
-        dev: &mut dyn BlockDevice,
-        inode: &mut InodeData,
-        table: u32,
-        slot: usize,
-    ) -> Result<bool> {
-        if table == 0 {
-            return Ok(false);
-        }
-        let mut buf = self.read_block(dev, table)?;
-        let block = u32_at(&buf, slot * 4);
-        if block != 0 {
-            self.free_block(dev, block)?;
-            inode.sectors = inode.sectors.saturating_sub(self.geometry.sectors_per_block());
-            put_u32(&mut buf, slot * 4, 0);
-            self.write_block(dev, table, &buf)?;
-        }
-        Ok(buf.chunks(4).all(|word| word == [0, 0, 0, 0]))
-    }
-
-    /// Обнулить указатель в таблице. Возвращает `true`, если таблица опустела.
-    fn clear_pointer(
-        &mut self,
-        dev: &mut dyn BlockDevice,
-        table: u32,
-        slot: usize,
-    ) -> Result<bool> {
-        let mut buf = self.read_block(dev, table)?;
-        put_u32(&mut buf, slot * 4, 0);
-        self.write_block(dev, table, &buf)?;
-        Ok(buf.chunks(4).all(|word| word == [0, 0, 0, 0]))
     }
 
     // --- inode -------------------------------------------------------------

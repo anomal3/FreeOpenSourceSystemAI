@@ -33,7 +33,9 @@ use user_abi::{
 };
 
 mod poll;
+mod fsops;
 mod ipc;
+pub mod recent;
 mod net;
 mod process;
 mod signal;
@@ -174,6 +176,35 @@ mod nr {
     pub const EPOLL_CREATE1: usize = 291;
     pub const MEMFD_CREATE: usize = 319;
     pub const SENDMMSG: usize = 307;
+    pub const PWRITE64: usize = 18;
+    pub const FLOCK: usize = 73;
+    pub const FSYNC: usize = 74;
+    pub const FDATASYNC: usize = 75;
+    pub const RENAME: usize = 82;
+    pub const MKDIR: usize = 83;
+    pub const RMDIR: usize = 84;
+    pub const LINK: usize = 86;
+    pub const SYMLINK: usize = 88;
+    pub const CHMOD: usize = 90;
+    pub const FCHMOD: usize = 91;
+    pub const FCHOWN: usize = 93;
+    pub const GETRESUID: usize = 118;
+    pub const GETRESGID: usize = 120;
+    pub const SCHED_SETPARAM: usize = 142;
+    pub const SCHED_GETPARAM: usize = 143;
+    pub const SCHED_SETSCHEDULER: usize = 144;
+    pub const SCHED_GET_PRIORITY_MAX: usize = 146;
+    pub const SCHED_GET_PRIORITY_MIN: usize = 147;
+    pub const CLOCK_GETRES: usize = 229;
+    pub const MKDIRAT: usize = 258;
+    pub const RENAMEAT: usize = 264;
+    pub const LINKAT: usize = 265;
+    pub const SYMLINKAT: usize = 266;
+    pub const FCHMODAT: usize = 268;
+    pub const SYNC_FILE_RANGE: usize = 277;
+    pub const UTIMENSAT: usize = 280;
+    pub const FALLOCATE: usize = 285;
+    pub const RENAMEAT2: usize = 316;
 }
 
 /// `errno` Linux, которые здесь отдаются.
@@ -274,6 +305,7 @@ pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
     let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9].map(|value| value as usize);
     // SAFETY: контракт функции.
     let result = unsafe { dispatch(number, args, frame) };
+    recent::record(number, args, result);
     frame.rax = result as u64;
     // Пришедшие сигналы доставляются на выходе из вызова (фаза 71c).
     signal::deliver(frame);
@@ -330,6 +362,33 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::EPOLL_WAIT | nr::EPOLL_PWAIT => ipc::epoll_wait(a0, a1, a2, a3 as i32 as i64),
             nr::MEMFD_CREATE => ipc::memfd_create(a0, a1),
             nr::FTRUNCATE => ftruncate(a0, a1),
+            // Фаза 71h — то, чего потребовал Chromium.
+            nr::PWRITE64 => fsops::pwrite(a0, a1, a2, a3),
+            nr::MKDIR => fsops::mkdir(AT_FDCWD, a0, a1),
+            nr::MKDIRAT => fsops::mkdir(a0, a1, a2),
+            nr::RENAME => fsops::rename(AT_FDCWD, a0, AT_FDCWD, a1, 0),
+            nr::RENAMEAT => fsops::rename(a0, a1, a2, a3, 0),
+            nr::RENAMEAT2 => fsops::rename(a0, a1, a2, a3, a4),
+            nr::RMDIR => fsops::rmdir(a0),
+            nr::FALLOCATE => fsops::fallocate(a0, a1, a2, a3),
+            nr::CLOCK_GETRES => fsops::clock_getres(a0, a1),
+            nr::GETRESUID => fsops::getres(a0, a1, a2, false),
+            nr::GETRESGID => fsops::getres(a0, a1, a2, true),
+            // Жёстких и символических ссылок файловая система не знает —
+            // ответ, как у FAT: «нельзя».
+            nr::LINK | nr::LINKAT | nr::SYMLINK | nr::SYMLINKAT => -e::EPERM,
+            // Данные пишутся сразу, блокировок между процессами одного
+            // пользователя нет, прав и времени файла программа Linux не меняет:
+            // согласиться — честный ответ.
+            nr::FSYNC | nr::FDATASYNC | nr::SYNC_FILE_RANGE | nr::FLOCK => 0,
+            nr::CHMOD | nr::FCHMOD | nr::FCHMODAT | nr::FCHOWN | nr::UTIMENSAT => 0,
+            nr::SCHED_GET_PRIORITY_MAX | nr::SCHED_GET_PRIORITY_MIN => 0,
+            // Приоритет `SCHED_OTHER` — ноль; поменять его нечем.
+            nr::SCHED_GETPARAM => match ipc::put(a1, 0i32) {
+                Ok(()) => 0,
+                Err(err) => err,
+            },
+            nr::SCHED_SETPARAM | nr::SCHED_SETSCHEDULER => 0,
             nr::UNLINK => unlink(AT_FDCWD, a0),
             nr::UNLINKAT => unlink(a0, a1),
             nr::CLOSE => {
@@ -368,9 +427,11 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             // `statx` glibc пробует первым и, получив `ENOSYS`, берёт
             // `newfstatat` — его здесь и хватает.
             nr::STATX => -e::ENOSYS,
-            // Сведений о томе ядро не отдаёт (как и `statvfs` родной libc);
-            // libselinux так ищет `selinuxfs` и, не найдя, работает без него.
-            nr::STATFS | nr::FSTATFS => -e::ENOSYS,
+            // Сведения о томе (фаза 71h): Chromium по `statvfs("/dev/shm")`
+            // решает, где держать разделяемую память. libselinux ищет так
+            // `selinuxfs` — по типу тома его не находит и работает без него.
+            nr::STATFS => fsops::statfs(Some(a0), 0, a1),
+            nr::FSTATFS => fsops::statfs(None, a0, a1),
             nr::NEWFSTATAT => {
                 // `AT_EMPTY_PATH` с пустым путём — это `fstat` дескриптора.
                 if a3 & AT_EMPTY_PATH != 0 && c_string_len(a1) == Some(0) {
@@ -589,9 +650,15 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
         return answer;
     }
     if let Some((node, writable)) = special::node(&linux) {
+        let directory = node.metadata().kind == NodeKind::Directory;
         return match crate::user::with_current(|program| {
             let fd = program.files.install_node(node, writable)?;
             program.files.set_cloexec(fd, flags & O_CLOEXEC != 0);
+            // Каталог `/proc` (фаза 71h) — путь для `openat` от него.
+            if directory {
+                program.linux_dirs.retain(|(other, _)| *other != fd);
+                program.linux_dirs.push((fd, linux.clone()));
+            }
             Ok(fd)
         }) {
             Some(Ok(fd)) => fd as i64,
@@ -716,6 +783,23 @@ fn stat_path(dir: usize, ptr: usize, out: usize) -> i64 {
         Ok(path) => path,
         Err(err) => return err,
     };
+    // `/proc/self/fd/N` — ссылка на открытое; `stat` идёт по ней, то есть
+    // это `fstat` дескриптора (фаза 71h: песочница Chromium так проверяет
+    // открытые дескрипторы). `/proc/self/task/<tid>` — каталог потока.
+    if let Some(number) = linux.strip_prefix("/proc/self/fd/") {
+        return match number.parse::<usize>() {
+            Ok(fd) => fstat(fd, out),
+            Err(_) => -e::ENOENT,
+        };
+    }
+    if let Some(tid) = linux.strip_prefix("/proc/self/task/") {
+        // Только живой поток этого процесса: песочница Chromium, остановив
+        // поток, ждёт, когда его каталог исчезнет.
+        return match tid.parse::<u32>() {
+            Ok(tid) if crate::user::thread_alive(tid) => put_stat(out, S_IFDIR, 0o555, 0, 0, 0, 0, ino_of(&linux)),
+            _ => -e::ENOENT,
+        };
+    }
     if ipc::shm_exists(&linux) {
         return put_stat(out, S_IFREG, 0o600, 0, 0, 0, 0, ino_of(&linux));
     }
@@ -723,8 +807,17 @@ fn stat_path(dir: usize, ptr: usize, out: usize) -> i64 {
         let kind = if linux.starts_with("/dev/") { S_IFCHR } else { S_IFREG };
         return put_stat(out, kind, 0o666, 0, 0, 0, 0, ino_of(&linux));
     }
-    if matches!(linux.as_str(), "/proc" | "/proc/self" | "/dev" | "/sys" | "/dev/shm") {
-        return put_stat(out, S_IFDIR, 0o555, 0, 0, 0, 0, ino_of(&linux));
+    if special::is_directory(&linux) || matches!(linux.as_str(), "/dev" | "/sys" | "/dev/shm") {
+        let done = put_stat(out, S_IFDIR, 0o555, 0, 0, 0, 0, ino_of(&linux));
+        // `/proc/self/task`: ссылок — «.», «..» и по одной на поток. Песочница
+        // Chromium считает потоки именно так (фаза 71h).
+        if done == 0 && linux == "/proc/self/task" {
+            let links = 2 + crate::user::thread_count() as u64;
+            // SAFETY: `put_stat` только что записал сюда `struct stat`
+            // целиком; `st_nlink` — третье слово.
+            unsafe { core::ptr::write_unaligned((out + 16) as *mut u64, links) };
+        }
+        return done;
     }
     let path = crate::linux_path::resolve(&linux, crate::user::credentials());
     let node = match crate::fs::resolve_as(crate::user::credentials(), &path, Access::NONE) {
@@ -780,7 +873,12 @@ fn fstat(fd: usize, out: usize) -> i64 {
             // (dev, ino), и `libc.so.6`, открытая под тем же номером 3, что до
             // неё `libselinux.so.1`, сошла бы за неё (первый прогон `ls`, 71b).
             let ino = match crate::user::with_current(|program| program.files.node(fd)) {
-                Some(Ok(node)) => alloc::sync::Arc::as_ptr(&node) as *const () as usize as u64,
+                // Разделяемая память — по самому объекту памяти (фаза 71h):
+                // Chromium открывает `/dev/shm/имя` дважды и сверяет номера.
+                Some(Ok(node)) => match node.shared_memory() {
+                    Some(mem) => alloc::sync::Arc::as_ptr(&mem) as usize as u64,
+                    None => alloc::sync::Arc::as_ptr(&node) as *const () as usize as u64,
+                },
                 _ => 0x1000 + fd as u64,
             };
             put_stat(out, kind, info.mode, info.uid, info.gid, info.size, 0, ino)
@@ -966,6 +1064,8 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
     const F_GETFL: usize = 3;
     const F_SETFL: usize = 4;
     const F_DUPFD_CLOEXEC: usize = 1030;
+    const F_ADD_SEALS: usize = 1033;
+    const F_GET_SEALS: usize = 1034;
     const FD_CLOEXEC: usize = 1;
     const O_NONBLOCK: usize = 0o4000;
     let result = crate::user::with_current(|program| {
@@ -983,11 +1083,18 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
                 Ok(0)
             }
             // Чтение и запись — `O_RDWR`; у ждущего канала — без `O_NONBLOCK`.
+            // Режим доступа — как открыт (фаза 71h: Chromium проверяет, что
+            // дескриптор «только на чтение» разделяемой памяти и правда такой).
             F_GETFL => {
                 files.cloexec(fd)?;
                 let nonblock = files.describe(fd).is_ok_and(|info| info.kind == FdKind::Pipe) && files.nonblock(fd)?;
-                Ok(if nonblock { 2 | O_NONBLOCK as i64 } else { 2 })
+                let access = files.access_mode(fd)? as i64;
+                Ok(if nonblock { access | O_NONBLOCK as i64 } else { access })
             }
+            // Печати `memfd`: принимаются и не держатся — запрет, которого
+            // никто не нарушает, ничего не стоит не проверять.
+            F_ADD_SEALS => files.cloexec(fd).map(|_| 0),
+            F_GET_SEALS => files.cloexec(fd).map(|_| 0),
             F_SETFL => {
                 files.cloexec(fd)?;
                 files.set_nonblock(fd, arg & O_NONBLOCK != 0)?;
@@ -1101,6 +1208,11 @@ unsafe fn writev(fd: usize, iov: usize, count: usize) -> i64 {
 /// запись в файл (`MAP_SHARED` с `PROT_WRITE`) — отказ: в файл отображение не
 /// пишет.
 fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: usize) -> i64 {
+    // `int fd` — младшие 32 бита регистра: старшие компилятор вправе оставить
+    // любыми (Chromium кладёт туда соседнее значение, фаза 71h).
+    let fd = fd as u32 as usize;
+    let flags = flags as u32 as usize;
+    let prot = prot as u32 as usize;
     const MAP_SHARED: usize = 0x01;
     const MAP_FIXED: usize = 0x10;
     const MAP_ANONYMOUS: usize = 0x20;
@@ -1202,10 +1314,24 @@ unsafe fn clock_gettime(clock: usize, out: usize) -> i64 {
     const MONOTONIC_LIKE: [usize; 3] = [4, 6, 7];
     /// `CLOCK_REALTIME_COARSE`.
     const REALTIME_COARSE: usize = 5;
+    /// `CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_THREAD_CPUTIME_ID`.
+    const CPUTIME: [usize; 2] = [2, 3];
     let clock = match clock {
         CLOCK_REALTIME | REALTIME_COARSE => CLOCK_REALTIME,
         CLOCK_MONOTONIC => CLOCK_MONOTONIC,
         other if MONOTONIC_LIKE.contains(&other) => CLOCK_MONOTONIC,
+        // Процессорное время (фаза 71h; Chromium меряет им свои задачи) —
+        // своего потока; часы другого потока (`pthread_getcpuclockid`,
+        // отрицательный номер) и процесса — тоже его: точнее ядро не считает.
+        other if CPUTIME.contains(&other) || (other as i32) < 0 => {
+            if !space::user_can(out, 16, PageFlags::WRITE) {
+                return -e::EFAULT;
+            }
+            let ms = crate::sched::cpu_ms(crate::sched::current()).unwrap_or(0);
+            // SAFETY: проверено строкой выше.
+            unsafe { core::ptr::write_unaligned(out as *mut [u64; 2], [ms / 1000, (ms % 1000) * 1_000_000]) };
+            return 0;
+        }
         _ => return -e::EINVAL,
     };
     // SAFETY: контракт `syscall`.

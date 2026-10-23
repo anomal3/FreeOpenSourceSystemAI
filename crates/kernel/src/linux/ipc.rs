@@ -988,6 +988,11 @@ pub fn eventfd(initial: usize, flags: usize) -> i64 {
     const EFD_SEMAPHORE: usize = 1;
     const EFD_NONBLOCK: usize = 0o4000;
     const EFD_CLOEXEC: usize = 0o2_000_000;
+    // Неизвестный флаг — `EINVAL`: Chromium проверяет так, есть ли вызов.
+    let flags = flags as u32 as usize;
+    if flags & !(EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC) != 0 {
+        return -e::EINVAL;
+    }
     let object = Arc::new(EventFd { count: Mutex::new(initial as u32 as u64), semaphore: flags & EFD_SEMAPHORE != 0 });
     install(object, flags & EFD_NONBLOCK != 0, flags & EFD_CLOEXEC != 0)
 }
@@ -1083,7 +1088,8 @@ impl Object for TimerFd {
 pub fn timerfd_create(clock: usize, flags: usize) -> i64 {
     const TFD_NONBLOCK: usize = 0o4000;
     const TFD_CLOEXEC: usize = 0o2_000_000;
-    if clock > 7 {
+    let flags = flags as u32 as usize;
+    if clock > 11 || flags & !(TFD_NONBLOCK | TFD_CLOEXEC) != 0 {
         return -e::EINVAL;
     }
     let object = Arc::new(TimerFd { clock, timer: Mutex::new(Timer::default()) });
@@ -1213,6 +1219,10 @@ impl Object for Epoll {
 
 pub fn epoll_create(flags: usize) -> i64 {
     const EPOLL_CLOEXEC: usize = 0o2_000_000;
+    let flags = flags as u32 as usize;
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return -e::EINVAL;
+    }
     install(Arc::new(Epoll { interests: Mutex::new(Vec::new()) }), false, flags & EPOLL_CLOEXEC != 0)
 }
 
@@ -1371,8 +1381,19 @@ pub fn epoll_wait(epfd: usize, out: usize, max: usize, timeout: i64) -> i64 {
 /// можно отобразить в нескольких процессах.
 pub fn memfd_create(name: usize, flags: usize) -> i64 {
     const MFD_CLOEXEC: usize = 1;
-    if super::user_string(name).is_err() {
-        return -e::EFAULT;
+    /// `MFD_CLOEXEC`, `ALLOW_SEALING`, `HUGETLB`, `NOEXEC_SEAL`, `EXEC` и
+    /// размер крупной страницы (биты 26–31).
+    const KNOWN: usize = 0x1f | (0x3f << 26);
+    // Неизвестный флаг — `EINVAL`, как у Linux: Chromium спрашивает
+    // `memfd_create("", ~0)` и по `EINVAL` узнаёт, что вызов есть (фаза 71h).
+    let flags = flags as u32 as usize;
+    if flags & !KNOWN != 0 {
+        return -e::EINVAL;
+    }
+    match super::user_string(name) {
+        Ok(text) if text.len() > 249 => return -e::EINVAL,
+        Ok(_) => {}
+        Err(_) => return -e::EFAULT,
     }
     let node = Arc::new(crate::user::shm::ShmNode(crate::user::shm::SharedMem::new(0)));
     match crate::user::with_current(|program| {
@@ -1407,7 +1428,9 @@ pub fn open_shm(linux: &str, flags: usize) -> Option<i64> {
         let _ = crate::vfs::Node::truncate(&node, 0);
     }
     Some(match crate::user::with_current(|program| {
-        let fd = program.files.install_node(Arc::new(node), true)?;
+        // На запись — только если так и открыли: Chromium держит второй
+        // дескриптор «только на чтение» и проверяет его режим.
+        let fd = program.files.install_node(Arc::new(node), flags & 3 != 0)?;
         program.files.set_cloexec(fd, flags & O_CLOEXEC != 0);
         Ok(fd)
     }) {

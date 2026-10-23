@@ -103,8 +103,70 @@ pub fn node(path: &str) -> Option<(Arc<dyn Node>, bool)> {
     if let Some(device) = device {
         return Some((Arc::new(DeviceNode(device)), true));
     }
+    if let Some(names) = directory(path) {
+        return Some((Arc::new(DirNode(names)), false));
+    }
     let text = text(path)?;
     Some((Arc::new(TextNode(text.into_bytes())), false))
+}
+
+/// Каталог в памяти: имена — снимок в момент открытия (фаза 71h).
+struct DirNode(Vec<(String, NodeKind)>);
+
+impl Node for DirNode {
+    fn metadata(&self) -> Metadata {
+        Metadata { kind: NodeKind::Directory, size: 0, mode: 0o555, uid: 0, gid: 0, mtime: 0 }
+    }
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        Err(VfsError::WrongKind)
+    }
+    fn list(&self) -> VfsResult<Vec<DirEntry>> {
+        Ok(self
+            .0
+            .iter()
+            .map(|(name, kind)| DirEntry { name: name.clone(), kind: *kind, size: 0, mode: 0o555, uid: 0, gid: 0, mtime: 0 })
+            .collect())
+    }
+    fn lookup(&self, _name: &str) -> VfsResult<Box<dyn Node>> {
+        Err(VfsError::NotFound)
+    }
+}
+
+/// Есть ли такой особый каталог (`stat`, фаза 71h).
+pub fn is_directory(path: &str) -> bool {
+    directory(path).is_some()
+}
+
+/// Каталоги `/proc` (фаза 71h): Chromium открывает `/proc` и
+/// `/proc/self/task` дескриптором каталога, а `/proc/self/fd` перечисляет,
+/// чтобы закрыть лишнее в ребёнке.
+fn directory(path: &str) -> Option<Vec<(String, NodeKind)>> {
+    let file = |name: &str| (String::from(name), NodeKind::File);
+    let dir = |name: &str| (String::from(name), NodeKind::Directory);
+    match path {
+        "/proc" => Some(alloc::vec![dir("self"), file("cpuinfo"), file("meminfo"), file("version")]),
+        "/proc/self" | "/proc/thread-self" => Some(alloc::vec![
+            file("maps"),
+            file("status"),
+            file("stat"),
+            file("cmdline"),
+            file("comm"),
+            file("exe"),
+            dir("fd"),
+            dir("task")
+        ]),
+        "/proc/self/fd" => {
+            let fds = crate::user::with_current(|program| {
+                (0..1024 + 3).filter(|fd| program.files.is_open(*fd)).collect::<Vec<usize>>()
+            })?;
+            Some(fds.into_iter().map(|fd| (format!("{fd}"), NodeKind::File)).collect())
+        }
+        "/proc/self/task" => {
+            let tid = crate::sched::current().as_u32();
+            Some(alloc::vec![(format!("{tid}"), NodeKind::Directory)])
+        }
+        _ => None,
+    }
 }
 
 /// Есть ли такой особый путь — для `stat` и `access`.

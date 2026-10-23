@@ -158,6 +158,13 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
         } else {
             say!("пакет debian пропущен: нет {} — собрать: cargo xtask thirdparty --only debian", path.display());
         }
+        // Chromium без окна (фаза 71h) — тоже от `xtask thirdparty`.
+        let path = crate::chromium::package_path();
+        if path.is_file() {
+            samples.push((crate::chromium::PACKAGE_FILE, fs::read(&path)?));
+        } else {
+            say!("пакет chromium пропущен: нет {} — собрать: cargo xtask thirdparty --only chromium", path.display());
+        }
     }
 
     let mut built = Vec::new();
@@ -173,7 +180,8 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
 
 /// Пакеты игр: только на установочный носитель, не в RAM-диск живой системы.
 /// Там же llama.cpp (фаза 70d) — по той же причине: десятки мегабайт.
-pub const GAMES: [&str; 4] = ["freedoom-0.13.fpk", "sopwith-2.9.0.fpk", "llama-0.7.0.fpk", "debian-12.fpk"];
+pub const GAMES: [&str; 5] =
+    ["freedoom-0.13.fpk", "sopwith-2.9.0.fpk", "llama-0.7.0.fpk", "debian-12.fpk", "linuxweb-150.fpk"];
 
 /// llama.cpp пакетом (фаза 70d): программы llama.cpp, проверка библиотеки
 /// C++ (`cxxdemo`) и маленькая модель stories15M — чтобы было что запустить

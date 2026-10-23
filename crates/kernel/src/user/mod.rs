@@ -3868,22 +3868,24 @@ pub fn futex_key(addr: usize) -> Option<usize> {
     if !space::user_can(addr, 4, PageFlags::READ | PageFlags::WRITE | PageFlags::USER) {
         return None;
     }
-    let own_memory = with_current(|program| {
-        program.mappings.iter().any(|region| {
-            addr >= region.base
-                && addr < region.base + region.pages * PAGE_SIZE
-                && matches!(region.source, Source::Anonymous(_) | Source::ThreadStack | Source::Shared(_))
-        })
-    })
-    .unwrap_or(false);
-    // Стек и данные самой программы в таблицу областей не записаны — они не
-    // выдавались по запросу. Для них ответ даёт раскладка: всё, что ниже
-    // [`MMAP_BASE`], принадлежит образу и стеку, и вытеснению не подлежит,
-    // кроме страниц образа только на чтение — а писать в них программа всё
-    // равно не может, и `user_can` выше это уже отверг.
-    if !own_memory && addr >= MMAP_BASE {
-        return None;
+    // Ключ — виртуальный адрес внутри процесса (фаза 71h), как у Linux для
+    // всего, кроме общей памяти. Физический адрес не годится с тех пор, как
+    // есть `fork` с копированием при записи (71g): страница с замком после
+    // `fork` разделена, первая запись переносит её в другой кадр, и ждущий
+    // остаётся на старом ключе, а будящий будит по новому. Процесс в ключе —
+    // старшими битами (адрес окна меньше 2^40); совпадение у двух процессов
+    // дало бы лишнее пробуждение, а лишнее пробуждение законно.
+    let process = current_process()?;
+    let shared = process.lock().mappings.iter().any(|region| {
+        addr >= region.base && addr < region.end() && matches!(region.source, Source::Shared(_))
+    });
+    if !shared {
+        let tag = (Arc::as_ptr(&process) as usize >> 4) & 0x7F_FFFF;
+        return Some((1 << 63) | (tag << 40) | addr);
     }
+    // Общая память (71e) — по кадру: её кадры у объекта и не переезжают, а
+    // видят её разные процессы под разными адресами.
+    drop(process);
     let root = current_space_root()?;
     arch::translate(root, VirtAddr::new(addr)).map(|(phys, _)| phys.as_u64() as usize + addr % PAGE_SIZE)
 }
@@ -4020,6 +4022,25 @@ extern "C" fn linux_thread_entry(arg: usize) -> ! {
     kprintln!("  thread      : {} (Linux) finished with code {code}", sched::current());
     drop(start);
     sched::exit_current_with(code)
+}
+
+/// Сколько потоков у процесса текущей задачи (`/proc/self/task`, фаза 71h).
+#[must_use]
+pub fn thread_count() -> usize {
+    let Some(process) = current_process() else {
+        return 1;
+    };
+    let table = PROGRAMS.lock();
+    table.iter().flatten().filter(|other| Arc::ptr_eq(other, &process)).count().max(1)
+}
+
+/// Жив ли поток `tid` текущего процесса (`/proc/self/task/<tid>`, фаза 71h).
+#[must_use]
+pub fn thread_alive(tid: u32) -> bool {
+    match sched::lookup(sched::TaskId::new(tid)) {
+        Some((slot, state)) => state != sched::TaskState::Finished && same_process(slot),
+        None => false,
+    }
 }
 
 /// Принадлежит ли задача слота `slot` тому же процессу, что текущая
@@ -5139,6 +5160,18 @@ pub unsafe fn faulted(what: &str, at: usize, addr: usize) -> ! {
         "  user        : killed by {what} at {at:#018x} (address {addr:#018x}), task {}",
         sched::current()
     );
+    // Программа Linux (фаза 71h): байты инструкции и последние системные
+    // вызовы потока — большие программы падают на своих проверках молча.
+    #[cfg(target_arch = "x86_64")]
+    if with_current(|program| program.linux) == Some(true) {
+        if space::user_can(at, 8, PageFlags::READ) {
+            // SAFETY: проверено строкой выше; пространство программы активно.
+            let bytes = unsafe { core::ptr::read_unaligned(at as *const [u8; 8]) };
+            kprintln!("  linux       : instruction bytes {bytes:02x?}");
+        }
+        crate::linux::recent::dump();
+        crate::linux::recent::reset(sched::current_slot());
+    }
     IN_USER[sched::current_slot()].store(false, Ordering::Release);
     // SAFETY: контракт функции — программа запущена, значит `enter_user`
     // действительно исполняется и его кадр на стеке ядра цел.
