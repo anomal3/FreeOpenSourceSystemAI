@@ -10,6 +10,7 @@
  * границы стека главного потока по `/proc/self/maps`. С фазы 71d — процессы:
  * `fork` и `waitpid`, `SIGCHLD`, канал и `dup2` в `execve`, `posix_spawn` с
  * окружением, `vfork`, `kill` другому процессу, `FD_CLOEXEC` при `execve`.
+ * Ожидание сигнала — `sigsuspend`, `sigpending`, `sigtimedwait`.
  *
  * Строки — `linuxcheck: ok <что>` или `linuxcheck: FAILED <что>`; итог —
  * `linuxcheck: N failed`, код выхода — то же N.
@@ -342,6 +343,46 @@ int main(int argc, char **argv) {
     check(flagged && WIFEXITED(status) && WEXITSTATUS(status) == 0, "execve closes FD_CLOEXEC and keeps the rest");
     close(closing);
     close(keeping);
+
+    /* Ожидание сигнала: sigsuspend спит до сигнала с обработчиком и
+     * возвращает прежнюю маску; sigtimedwait забирает заблокированный сигнал
+     * без обработчика, а пустое ожидание кончается сроком. */
+    sigset_t usr1, empty, mask_after;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    sigemptyset(&empty);
+    sigprocmask(SIG_BLOCK, &usr1, NULL);
+    got_signal = 0;
+    pid_t poker = fork();
+    if (poker == 0) {
+        struct timespec nap = {0, 50000000};
+        nanosleep(&nap, NULL);
+        kill(getppid(), SIGUSR1);
+        _exit(0);
+    }
+    int suspended = poker > 0 && sigsuspend(&empty) == -1 && errno == EINTR;
+    sigprocmask(SIG_BLOCK, NULL, &mask_after);
+    int usr1_held = sigismember(&mask_after, SIGUSR1);
+    sigprocmask(SIG_UNBLOCK, &usr1, NULL);
+    check(suspended && got_signal == SIGUSR1 && usr1_held && exited_with_zero(poker),
+          "sigsuspend sleeps until a signal and restores the mask");
+
+    sigset_t usr2, waiting;
+    sigemptyset(&usr2);
+    sigaddset(&usr2, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &usr2, NULL);
+    got_signal = 0;
+    raise(SIGUSR2);
+    sigemptyset(&waiting);
+    int listed = sigpending(&waiting) == 0 && sigismember(&waiting, SIGUSR2);
+    siginfo_t taken_info;
+    struct timespec second = {1, 0};
+    int taken = sigtimedwait(&usr2, &taken_info, &second) == SIGUSR2 && taken_info.si_signo == SIGUSR2;
+    struct timespec short_wait = {0, 50000000};
+    long long before_wait = now_ns();
+    int timed_out = sigtimedwait(&usr2, NULL, &short_wait) == -1 && errno == EAGAIN && now_ns() - before_wait >= 40000000;
+    sigprocmask(SIG_UNBLOCK, &usr2, NULL);
+    check(listed && taken && timed_out && got_signal == 0, "sigpending and sigtimedwait take a blocked signal");
 
     /* Копирование при записи (фаза 71g): fork процесса с 64 МиБ своей
      * памяти почти не тратит память, а записи после fork у каждого свои. */

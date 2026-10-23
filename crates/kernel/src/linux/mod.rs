@@ -128,6 +128,10 @@ mod nr {
     pub const FACCESSAT2: usize = 439;
     pub const POLL: usize = 7;
     pub const RT_SIGRETURN: usize = 15;
+    pub const PAUSE: usize = 34;
+    pub const RT_SIGPENDING: usize = 127;
+    pub const RT_SIGTIMEDWAIT: usize = 128;
+    pub const RT_SIGSUSPEND: usize = 130;
     pub const PIPE: usize = 22;
     pub const CLONE: usize = 56;
     pub const GETPRIORITY: usize = 140;
@@ -453,6 +457,10 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::RT_SIGACTION => signal::sigaction(a0, a1, a2, a3),
             nr::RT_SIGPROCMASK => signal::sigprocmask(a0, a1, a2, a3),
             nr::SIGALTSTACK => signal::sigaltstack(a0, a1),
+            nr::RT_SIGSUSPEND => signal::sigsuspend(a0, a1),
+            nr::PAUSE => signal::pause(),
+            nr::RT_SIGPENDING => signal::sigpending(a0, a1),
+            nr::RT_SIGTIMEDWAIT => signal::sigtimedwait(a0, a1, a2, a3),
             nr::KILL => signal::kill(a0, a1),
             nr::TKILL => signal::tgkill(0, a0, a1),
             nr::TGKILL => signal::tgkill(a0, a1, a2),

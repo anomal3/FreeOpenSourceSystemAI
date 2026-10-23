@@ -5117,6 +5117,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("linuxcheck: ok vfork and _exit", 30_000),
             Step::Await("linuxcheck: ok kill another process, WTERMSIG", 30_000),
             Step::Await("linuxcheck: ok execve closes FD_CLOEXEC and keeps the rest", 60_000),
+            Step::Await("linuxcheck: ok sigsuspend sleeps until a signal and restores the mask", 30_000),
+            Step::Await("linuxcheck: ok sigpending and sigtimedwait take a blocked signal", 30_000),
             // Фаза 71g: копирование при записи.
             Step::Await("linuxcheck: ok fork of 64 MiB is copy-on-write", 60_000),
             Step::Await("linuxcheck: ok writes after fork stay private both ways", 30_000),

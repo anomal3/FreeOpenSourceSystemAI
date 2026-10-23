@@ -32,7 +32,18 @@
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+
+/// Сколько [`SpinLock`] держит каждый процессор (фаза 71h). Отказ страницы в
+/// ядре разбирается как отказ программы (копия разделённой страницы) только
+/// там, где ни одного не держит: разбор берёт локи и может уснуть.
+static SPIN_HELD: [AtomicU32; crate::smp::MAX_CPUS] = [const { AtomicU32::new(0) }; crate::smp::MAX_CPUS];
+
+/// Держит ли этот процессор хоть один [`SpinLock`]. Звать с запрещёнными
+/// прерываниями — иначе ответ может относиться к соседнему процессору.
+pub fn spin_held() -> bool {
+    SPIN_HELD[crate::smp::cpu()].load(Ordering::Relaxed) != 0
+}
 
 /// Глобальная переменная, к которой обращаются через сырой указатель.
 ///
@@ -125,6 +136,7 @@ impl<T> SpinLock<T> {
                 core::hint::spin_loop();
             }
         }
+        SPIN_HELD[me].fetch_add(1, Ordering::Relaxed);
 
         SpinGuard { lock: self, irq_was_enabled, since, at: core::panic::Location::caller() }
     }
@@ -155,7 +167,10 @@ impl<T> SpinLock<T> {
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Some(SpinGuard { lock: self, irq_was_enabled, since, at }),
+                Ok(_) => {
+                    SPIN_HELD[me].fetch_add(1, Ordering::Relaxed);
+                    return Some(SpinGuard { lock: self, irq_was_enabled, since, at });
+                }
                 Err(holder) if holder == me => {
                     // Захват не удался — состояние прерываний надо вернуть,
                     // иначе неудачная попытка молча оставила бы их запрещёнными.
@@ -206,6 +221,8 @@ impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
         // Порядок обратный захвату: сначала отпустить лок, потом вернуть
         // прерывания. Иначе обработчик успел бы прийти на ещё удерживаемый лок.
+        // Прерывания ещё запрещены: процессор тот же, что брал лок.
+        SPIN_HELD[crate::smp::cpu()].fetch_sub(1, Ordering::Relaxed);
         self.lock.owner.store(FREE, Ordering::Release);
         if self.irq_was_enabled {
             crate::latency::irq_off_ended(self.since, self.at);

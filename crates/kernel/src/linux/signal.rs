@@ -1,5 +1,6 @@
 //! Сигналы программ Linux (фаза 71c): обработчики, маски, доставка на выходе
-//! из системного вызова и `rt_sigreturn`.
+//! из системного вызова и `rt_sigreturn`; ожидание сигнала — `rt_sigsuspend`,
+//! `pause`, `rt_sigtimedwait`.
 //!
 //! # Когда сигнал доставляется
 //!
@@ -10,7 +11,7 @@
 //! через неё (обычный вызов функции в C) векторные регистры не живут.
 //! Отказы страниц и прочие исключения программу снимают, как и прежде.
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::e;
 use crate::mm::PageFlags;
@@ -257,6 +258,174 @@ fn ignored_by_default(sig: usize) -> bool {
     matches!(sig, 17 | 18 | 23 | 28)
 }
 
+// ---- ожидание сигнала ----------------------------------------------------------
+
+/// Маска, которую вернёт `rt_sigreturn` после обработчика сигнала, прервавшего
+/// `rt_sigsuspend`: пока поток ждал, действовала временная. [`NO_MASK`] — нет
+/// такой (маска без `SIGKILL` и `SIGSTOP` никогда не бывает полной).
+static SUSPENDED_MASK: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(NO_MASK) }; sched::MAX_TASKS];
+const NO_MASK: u64 = u64::MAX;
+
+/// Выбросить пришедшие незаблокированные сигналы, которые ничего не делают
+/// (`SIG_IGN` и пропускаемые по умолчанию): ожидание сигнала их не замечает.
+fn drop_ignored(slot: usize) {
+    let ready = LINUX_PENDING[slot].load(Ordering::Relaxed) & !LINUX_SIGMASK[slot].load(Ordering::Relaxed);
+    if ready == 0 {
+        return;
+    }
+    let ignored = crate::user::with_current(|program| {
+        (1..=64)
+            .filter(|&sig| ready & bit(sig) != 0)
+            .filter(|&sig| match program.linux_actions[sig].handler {
+                SIG_IGN => true,
+                0 => ignored_by_default(sig),
+                _ => false,
+            })
+            .fold(0, |set, sig| set | bit(sig))
+    })
+    .unwrap_or(0);
+    LINUX_PENDING[slot].fetch_and(!ignored, Ordering::Relaxed);
+}
+
+/// Ждать, пока `ready` не ответит `Some` или не настанет `until`; между
+/// проверками — сон до пробуждения (его шлёт `kill`), не дольше 100 мс.
+/// Снятие процесса — `None`.
+fn wait_for<T>(until: Option<u64>, mut ready: impl FnMut() -> Option<T>) -> Option<T> {
+    loop {
+        let seen = crate::io_events::generation();
+        if let Some(found) = ready() {
+            return Some(found);
+        }
+        let now = crate::time::uptime_ms();
+        if crate::user::kill_pending() || until.is_some_and(|at| now >= at) {
+            return None;
+        }
+        let nap = until.map_or(now + 100, |at| at.min(now + 100));
+        crate::io_events::wait(seen, Some(nap));
+    }
+}
+
+/// Прочитать `sigset_t` ядра (64 бита) из памяти программы.
+fn read_set(set: usize, size: usize) -> Result<u64, i64> {
+    if size != 8 {
+        return Err(-e::EINVAL);
+    }
+    if !space::user_can(set, 8, PageFlags::READ) {
+        return Err(-e::EFAULT);
+    }
+    // SAFETY: проверено строкой выше.
+    Ok(unsafe { core::ptr::read_unaligned(set as *const u64) })
+}
+
+/// `rt_sigsuspend(mask, size)`: заменить маску на `mask` и спать, пока не
+/// придёт сигнал с обработчиком (или снимающий процесс). Ответ всегда
+/// `-EINTR`; обработчик вызывается на выходе из этого же вызова, а прежнюю
+/// маску ему в `ucontext` кладёт [`deliver`] — после обработчика действует она.
+pub fn sigsuspend(mask: usize, size: usize) -> i64 {
+    match read_set(mask, size) {
+        Ok(set) => suspend(set),
+        Err(err) => err,
+    }
+}
+
+/// `pause()` — `rt_sigsuspend` с той же маской.
+pub fn pause() -> i64 {
+    suspend(LINUX_SIGMASK[sched::current_slot()].load(Ordering::Relaxed))
+}
+
+fn suspend(set: u64) -> i64 {
+    let slot = sched::current_slot();
+    let old = LINUX_SIGMASK[slot].load(Ordering::Relaxed);
+    LINUX_SIGMASK[slot].store(set & !UNBLOCKABLE, Ordering::Relaxed);
+    let woke = wait_for(None, || {
+        drop_ignored(slot);
+        pending().then_some(())
+    });
+    if woke.is_some() {
+        SUSPENDED_MASK[slot].store(old, Ordering::Relaxed);
+    } else {
+        LINUX_SIGMASK[slot].store(old, Ordering::Relaxed);
+    }
+    -e::EINTR
+}
+
+/// `rt_sigpending(set, size)`: пришедшие, но заблокированные сигналы.
+pub fn sigpending(set: usize, size: usize) -> i64 {
+    if size != 8 {
+        return -e::EINVAL;
+    }
+    if !space::user_can(set, 8, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    let slot = sched::current_slot();
+    let waiting = LINUX_PENDING[slot].load(Ordering::Relaxed) & LINUX_SIGMASK[slot].load(Ordering::Relaxed);
+    // SAFETY: проверено строкой выше.
+    unsafe { core::ptr::write_unaligned(set as *mut u64, waiting) };
+    0
+}
+
+/// `rt_sigtimedwait(set, info, timeout, size)`: забрать сигнал из `set`, не
+/// вызывая обработчик, — ответ его номер. Не пришёл до `timeout` (`NULL` —
+/// ждать сколько угодно) — `-EAGAIN`; пришёл другой, с обработчиком, —
+/// `-EINTR`. Ждать так можно только заблокированные сигналы: незаблокированный
+/// ушёл бы обработчику раньше, — это забота программы, как и у Linux.
+pub fn sigtimedwait(set: usize, info: usize, timeout: usize, size: usize) -> i64 {
+    let wanted = match read_set(set, size) {
+        Ok(wanted) => wanted & !UNBLOCKABLE,
+        Err(err) => return err,
+    };
+    if info != 0 && !space::user_can(info, SIGINFO, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    let until = if timeout == 0 {
+        None
+    } else {
+        if !space::user_can(timeout, 16, PageFlags::READ) {
+            return -e::EFAULT;
+        }
+        // SAFETY: проверено строкой выше.
+        let [seconds, nanos] = unsafe { core::ptr::read_unaligned(timeout as *const [i64; 2]) };
+        if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
+            return -e::EINVAL;
+        }
+        let ms = (seconds as u64).saturating_mul(1000).saturating_add((nanos as u64).div_ceil(1_000_000));
+        Some(crate::time::uptime_ms().saturating_add(ms))
+    };
+    let slot = sched::current_slot();
+    enum Woke {
+        Taken(usize),
+        Other,
+    }
+    let woke = wait_for(until, || {
+        let taken = LINUX_PENDING[slot].load(Ordering::Relaxed) & wanted;
+        if taken != 0 {
+            let sig = taken.trailing_zeros() as usize + 1;
+            LINUX_PENDING[slot].fetch_and(!bit(sig), Ordering::Relaxed);
+            return Some(Woke::Taken(sig));
+        }
+        drop_ignored(slot);
+        pending().then_some(Woke::Other)
+    });
+    match woke {
+        Some(Woke::Taken(sig)) => {
+            if info != 0 {
+                let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
+                // SAFETY: проверено в начале вызова.
+                unsafe {
+                    core::ptr::write_bytes(info as *mut u8, 0, SIGINFO);
+                    core::ptr::write_unaligned(info as *mut i32, sig as i32);
+                    core::ptr::write_unaligned((info + 8) as *mut i32, -6);
+                    core::ptr::write_unaligned((info + 16) as *mut u32, pid);
+                }
+            }
+            sig as i64
+        }
+        Some(Woke::Other) => -e::EINTR,
+        None if crate::user::kill_pending() => -e::EINTR,
+        None => -e::EAGAIN,
+    }
+}
+
 /// Размеры кадра сигнала: `struct ucontext` ядра x86-64 и `siginfo_t`.
 const UCONTEXT: usize = 304;
 const SIGINFO: usize = 128;
@@ -269,13 +438,23 @@ const SIGMASK_AT: usize = 296;
 pub fn deliver(frame: &mut crate::arch::TrapFrame) {
     let slot = sched::current_slot();
     let mask = LINUX_SIGMASK[slot].load(Ordering::Relaxed);
+    // После `rt_sigsuspend` сигнал выбирается по временной маске, а
+    // обработчику достаётся прежняя.
+    let suspended = SUSPENDED_MASK[slot].swap(NO_MASK, Ordering::Relaxed);
     let ready = LINUX_PENDING[slot].load(Ordering::Relaxed) & !mask;
     if ready == 0 {
+        if suspended != NO_MASK {
+            LINUX_SIGMASK[slot].store(suspended, Ordering::Relaxed);
+        }
         return;
     }
     let sig = ready.trailing_zeros() as usize + 1;
     LINUX_PENDING[slot].fetch_and(!bit(sig), Ordering::Relaxed);
     let action = crate::user::with_current(|program| program.linux_actions[sig]).unwrap_or_default();
+    let (mask, handled_mask) = if suspended == NO_MASK { (mask, mask) } else { (suspended, mask) };
+    if action.handler == 0 || action.handler == SIG_IGN {
+        LINUX_SIGMASK[slot].store(mask, Ordering::Relaxed);
+    }
     match action.handler {
         0 if ignored_by_default(sig) => {}
         0 => {
@@ -285,11 +464,21 @@ pub fn deliver(frame: &mut crate::arch::TrapFrame) {
             unsafe { crate::arch::return_to_kernel(128 + sig as i64) }
         }
         SIG_IGN => {}
-        handler => enter_handler(frame, slot, sig, action, handler, mask),
+        handler => enter_handler(frame, slot, sig, action, handler, mask, handled_mask),
     }
 }
 
-fn enter_handler(frame: &mut crate::arch::TrapFrame, slot: usize, sig: usize, action: LinuxAction, handler: usize, mask: u64) {
+/// `mask` — что вернёт `rt_sigreturn`, `during` — к чему на время обработчика
+/// добавятся его `sa_mask` и сам сигнал (у `rt_sigsuspend` они разные).
+fn enter_handler(
+    frame: &mut crate::arch::TrapFrame,
+    slot: usize,
+    sig: usize,
+    action: LinuxAction,
+    handler: usize,
+    mask: u64,
+    during: u64,
+) {
     let (alt_sp, alt_size) = (LINUX_ALTSTACK[slot].0.load(Ordering::Relaxed), LINUX_ALTSTACK[slot].1.load(Ordering::Relaxed));
     let user_sp = frame.rsp as usize;
     let on_alt = alt_size != 0 && user_sp > alt_sp && user_sp <= alt_sp + alt_size;
@@ -327,7 +516,7 @@ fn enter_handler(frame: &mut crate::arch::TrapFrame, slot: usize, sig: usize, ac
         core::ptr::write_unaligned((info + 8) as *mut i32, -6);
         core::ptr::write_unaligned((info + 16) as *mut u32, pid);
     }
-    let mut next = mask | action.mask;
+    let mut next = during | action.mask;
     if action.flags & SA_NODEFER == 0 {
         next |= bit(sig);
     }
