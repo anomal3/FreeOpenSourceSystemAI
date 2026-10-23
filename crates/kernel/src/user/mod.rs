@@ -1118,6 +1118,38 @@ impl Program {
         Ok(base)
     }
 
+    /// `madvise(MADV_DONTNEED)` программы Linux (фаза 71i): страницы
+    /// безымянной ленивой памяти в `[addr, addr + len)` отдаются, и следующее
+    /// касание получает нулевую страницу — как у Linux. На это рассчитывает
+    /// `malloc` glibc: сжимая арену потока, он отдаёт хвост так и потом
+    /// выдаёт его из `calloc` без обнуления. Пока вызов был «ничего не
+    /// делать», `calloc` возвращал прежнее содержимое, и `dlopen` в потоке
+    /// падал на мусоре в новом `link_map`.
+    ///
+    /// Остальная память (файлы, разделяемая, жадная) не трогается: у Linux
+    /// её содержимое после такого совета тоже остаётся тем, что было.
+    pub(crate) fn linux_discard(&mut self, addr: usize, len: usize, shared: bool) {
+        let start = addr & !(PAGE_SIZE - 1);
+        let end = addr.saturating_add(len).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let first = self.mappings.partition_point(|region| region.end() <= start);
+        let ranges: Vec<(usize, usize)> = self.mappings[first..]
+            .iter()
+            .take_while(|region| region.base < end)
+            .filter(|region| matches!(region.source, Source::Anonymous(Anon { lazy: true, .. })))
+            .map(|region| {
+                let from = region.base.max(start);
+                (from, (region.end().min(end) - from) / PAGE_SIZE)
+            })
+            .filter(|(_, pages)| *pages > 0)
+            .collect();
+        for (from, pages) in ranges {
+            // SAFETY: страницы — безымянной памяти этой программы; кадр,
+            // разделённый после `fork`, пул вернёт, только когда его отпустят
+            // все (счётчик владельцев, фаза 71g).
+            unsafe { self.space.unmap_range(VirtAddr::new(from), pages, shared) };
+        }
+    }
+
     /// Снять всё, что лежит в `[addr, addr + bytes)`, — для `MAP_FIXED`.
     /// Пусто — не отказ: «положи сюда» о пустом месте и просит. Задетая
     /// область, которую резать нельзя (стек, поверхность окна), — отказ.
@@ -2812,8 +2844,10 @@ fn place_linux_args(
     const AT_EXECFN: usize = 31;
     /// Окружение, с которым программа Linux появляется на свет, если её
     /// запускает система, а не `execve`: минимум, без которого оболочки и
-    /// утилиты ищут программы и дом наугад.
-    const ENV: [&str; 4] = ["PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/", "TERM=linux", "LANG=C.UTF-8"];
+    /// утилиты ищут программы и дом наугад. Дом — того, кто вошёл (фаза 71i):
+    /// с `HOME=/` профиль Chromium ложился в корень Debian, и пакет `debian`
+    /// после удаления оставлял непустой `/opt/debian`.
+    const ENV: [&str; 3] = ["PATH=/usr/local/bin:/usr/bin:/bin", "TERM=linux", "LANG=C.UTF-8"];
     /// Сколько указателей `argv` и `envp` вместе помещается под строками.
     const MAX_POINTERS: usize = (STACK_PAGES * PAGE_SIZE - LINUX_ARG_BYTES) / size_of::<usize>() - 64;
 
@@ -2864,7 +2898,9 @@ fn place_linux_args(
         }
     }
     let mut envc = 0;
-    for var in env.unwrap_or(&ENV) {
+    let home = alloc::format!("HOME={}", crate::ui::context::home_dir());
+    let defaults = [ENV[0], home.as_str(), ENV[1], ENV[2]];
+    for var in env.unwrap_or(&defaults) {
         if pointers.len() >= MAX_POINTERS || pointers.try_reserve(1).is_err() {
             break;
         }

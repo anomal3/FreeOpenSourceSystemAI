@@ -56,7 +56,10 @@ use crate::sched::TaskId;
 /// ([`RECEIVE_BUFFER`] и [`SEND_BUFFER`]) — это `VecDeque`, которые ничего не
 /// занимают, пока в соединение не пришёл первый байт. Пустой слот стоит
 /// размера `Option<Connection>`.
-pub const MAX_STREAMS: usize = 16;
+///
+/// 64 с фазы 71i: Chromium держит по несколько соединений на сайт и
+/// заранее открывает запасные.
+pub const MAX_STREAMS: usize = 64;
 
 /// Сколько байт помещается в приёмный буфер соединения.
 ///

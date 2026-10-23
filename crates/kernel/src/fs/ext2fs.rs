@@ -354,6 +354,13 @@ impl FileSystem for Ext2Mount {
 }
 
 /// Узел тома: файл или каталог.
+///
+/// `inode` — снимок на момент открытия: из него берутся только номер и вид.
+/// Длину, карту блоков и записи каталога каждый вызов читает заново (фаза
+/// 71i): узел живёт, пока открыт файл, а запись через него же или через
+/// другой дескриптор файл растит — и снимок, по которому читали раньше,
+/// отвечал по старой длине и старым блокам. SQLite, читающая назад только что
+/// записанную страницу, получала нули и считала базу испорченной.
 struct Ext2Node {
     fs: Arc<Ext2Fs>,
     inode: ext2::Inode,
@@ -361,7 +368,12 @@ struct Ext2Node {
 
 impl Node for Ext2Node {
     fn metadata(&self) -> Metadata {
-        metadata_of(&self.inode)
+        let mut guard = self.fs.inner.lock();
+        let Inner { disk, fs, .. } = &mut *guard;
+        match fs.inode(disk, self.inode.number) {
+            Ok(inode) => metadata_of(&inode),
+            Err(_) => metadata_of(&self.inode),
+        }
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -370,13 +382,15 @@ impl Node for Ext2Node {
         }
         let mut guard = self.fs.inner.lock();
         let Inner { disk, fs, .. } = &mut *guard;
-        fs.read_at(disk, &self.inode, offset, buf).map_err(convert)
+        let inode = fs.inode(disk, self.inode.number).map_err(convert)?;
+        fs.read_at(disk, &inode, offset, buf).map_err(convert)
     }
 
     fn list(&self) -> VfsResult<Vec<DirEntry>> {
         let mut guard = self.fs.inner.lock();
         let Inner { disk, fs, .. } = &mut *guard;
-        let entries = fs.list(disk, &self.inode).map_err(convert)?;
+        let current = fs.inode(disk, self.inode.number).map_err(convert)?;
+        let entries = fs.list(disk, &current).map_err(convert)?;
 
         let mut out = Vec::new();
         out.try_reserve_exact(entries.len())
@@ -404,8 +418,9 @@ impl Node for Ext2Node {
         let inode = {
             let mut guard = self.fs.inner.lock();
             let Inner { disk, fs, .. } = &mut *guard;
+            let current = fs.inode(disk, self.inode.number).map_err(convert)?;
             let entry = fs
-                .lookup(disk, &self.inode, name)
+                .lookup(disk, &current, name)
                 .map_err(convert)?
                 .ok_or(VfsError::NotFound)?;
             fs.inode(disk, entry.inode).map_err(convert)?

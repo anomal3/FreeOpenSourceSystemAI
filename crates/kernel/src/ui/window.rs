@@ -316,6 +316,9 @@ pub struct Window {
     pub anchor: (i32, i32),
     /// Что изменилось в поверхности с прошлой сборки, в координатах поверхности.
     pub damage: Rect,
+    /// Окну нужны коды клавиш, а не символы (окна сервера Wayland, фаза 71i):
+    /// каждое нажатие и отпускание — [`super::WIN_RAWKEY`] с кодом evdev.
+    pub raw_keys: bool,
 }
 
 /// Наименьший размер окна в пикселях.
@@ -449,6 +452,7 @@ impl Window {
             popup: false,
             anchor: (0, 0),
             damage: Rect::EMPTY,
+            raw_keys: false,
         }
     }
 
@@ -1331,6 +1335,15 @@ impl Window {
             self.draw_grip();
         }
         self.damage = self.damage.union(&copied);
+    }
+
+    /// Поверхность программы — чтобы ядро нарисовало в ней само (сервер
+    /// Wayland, фаза 71i: у его окон программы-владельца поверхности нет).
+    pub fn program_pixels(&mut self) -> Option<&mut Surface> {
+        match &mut self.content {
+            Content::Program(view) => Some(&mut view.pixels),
+            _ => None,
+        }
     }
 
     /// Положить событие в очередь окна. `false` — очередь полна.

@@ -141,6 +141,25 @@ impl Clone for Handle {
     }
 }
 
+impl Handle {
+    /// Разделяемая память за дескриптором (`memfd`, `/dev/shm`) — так сервер
+    /// Wayland в ядре читает буферы `wl_shm` (фаза 71i).
+    #[must_use]
+    pub fn shared_memory(&self) -> Option<Arc<super::shm::SharedMem>> {
+        match &self.0 {
+            Slot::File(open) => open.node.shared_memory(),
+            _ => None,
+        }
+    }
+
+    /// Дескриптор на узел, открытый ядром, — чтобы отдать его программе
+    /// (`SCM_RIGHTS`; раскладка клавиатуры Wayland, фаза 71i).
+    #[must_use]
+    pub fn of_node(node: Arc<dyn Node>, writable: bool) -> Self {
+        Self(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None })))
+    }
+}
+
 impl Slot {
     /// Ещё одна ссылка на то же самое (`dup`, `fork`).
     fn copy(&self) -> Self {

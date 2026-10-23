@@ -12,7 +12,7 @@ use crate::user::space;
 /// Куда в системе ляжет **новый** путь Linux `linux`: в корень Debian, если
 /// там есть его родительский каталог, иначе — как есть. `linux_path::resolve`
 /// для этого не годится: он смотрит, есть ли сам путь, а его ещё нет.
-fn place(linux: &str) -> String {
+pub(super) fn place(linux: &str) -> String {
     let cred = crate::user::credentials();
     let (parent, name) = match linux.rsplit_once('/') {
         Some(("", name)) => ("/", name),
@@ -50,6 +50,9 @@ pub fn rename(old_dir: usize, old: usize, new_dir: usize, new: usize, flags: usi
         (Ok(from), Ok(to)) => (from, to),
         (Err(err), _) | (_, Err(err)) => return err,
     };
+    if super::links::rename(&from, &to) {
+        return 0;
+    }
     let cred = crate::user::credentials();
     let from = crate::linux_path::resolve(&from, cred);
     let existing = crate::linux_path::resolve(&to, cred);

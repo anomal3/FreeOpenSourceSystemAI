@@ -2228,6 +2228,13 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
         // это имя выдано: остальные (F-ряд, цифровой блок) событий по-прежнему
         // не дают. См. [`WinEvent::code`], там сказано, почему это честнее.
         Some(app @ App::Program(..)) => {
+            // Окно сервера Wayland (фаза 71i): каждая клавиша — кодом evdev,
+            // и нажатие, и отпускание; символы считает сам клиент по раскладке.
+            if let Some(window) = desktop.find(app).filter(|window| window.raw_keys) {
+                let key = WinEvent { kind: WIN_RAWKEY, code: event.code.evdev(), x: i32::from(event.pressed), y: 0 };
+                window.push_event(key);
+                return None;
+            }
             if event.pressed {
                 if let Some(code) = program_key(event) {
                     // Модификаторы и буква клавиши — фаза N7h: без них сочетание
@@ -2936,6 +2943,42 @@ pub fn commit_window(task: u32, slot: u32, area: Option<Rect>) -> Result<(), Win
             return Err(WindowError::NoWindow);
         };
         window.commit(area);
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Вид события окна, которого нет в договоре с программами: код клавиши
+/// evdev (`code`) и нажатие (`x` = 1) или отпускание (`x` = 0). Получают
+/// его только окна, попросившие [`raw_keys_window`], — окна сервера Wayland
+/// в ядре (фаза 71i); родным программам он не приходит.
+pub const WIN_RAWKEY: u32 = 0x100;
+
+/// Окну программы — коды клавиш вместо символов (фаза 71i).
+pub fn raw_keys_window(task: u32, slot: u32) -> Result<(), WindowError> {
+    with_desktop(|desktop| {
+        let window = desktop.find(App::Program(task, slot)).ok_or(WindowError::NoWindow)?;
+        window.raw_keys = true;
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Нарисовать в поверхности окна программы и показать `area` (фаза 71i):
+/// так рисует сервер Wayland в ядре — у его окон нет кадров в чужом
+/// адресном пространстве, поверхность принадлежит самому окну.
+pub fn paint_window(task: u32, slot: u32, area: Rect, paint: impl FnOnce(&mut Surface)) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let Some(window) = desktop.find(app) else {
+            return Err(WindowError::NoWindow);
+        };
+        let Some(pixels) = window.program_pixels() else {
+            return Err(WindowError::NoWindow);
+        };
+        paint(pixels);
+        window.commit(Some(area));
         desktop.present();
         Ok(())
     })

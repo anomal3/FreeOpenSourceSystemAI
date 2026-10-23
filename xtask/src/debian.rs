@@ -65,10 +65,11 @@ const DEV_PACKAGES: [(&str, &str); 2] = [
 ];
 
 /// Проверочные программы на glibc: исходник в `libc/linux` и путь в корне.
-const CHECKS: [(&str, &str); 3] = [
+const CHECKS: [(&str, &str); 4] = [
     ("check.c", "usr/libexec/fossai/linuxcheck"),
     ("ipccheck.c", "usr/libexec/fossai/ipccheck"),
     ("netcheck.c", "usr/libexec/fossai/netcheck"),
+    ("waylandcheck.c", "usr/libexec/fossai/waylandcheck"),
 ];
 
 /// Проверочные сценарии оболочки (фаза 71d): исходник в `libc/linux` и путь в

@@ -610,8 +610,8 @@ const PROJECTS: [Project; 21] = [
         how: How::Debian,
         installs: &[],
     },
-    // Chromium без окна (фаза 71h): `chromium-headless-shell` и библиотеки,
-    // которые он загружает; индекс — тот же `Packages` bookworm.
+    // Chromium (фазы 71h, 71i): `chromium` и библиотеки, которые он
+    // загружает; индекс — тот же `Packages` bookworm.
     Project {
         name: "chromium",
         version: "150",

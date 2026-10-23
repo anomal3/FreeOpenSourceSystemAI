@@ -13,6 +13,15 @@
 //!
 //! Кадры приходят по первому касанию — отказом страницы в любом из процессов
 //! или записью через дескриптор, — и до конца жизни объекта не уходят.
+//!
+//! # Файл на диске, отображённый на запись (фаза 71i)
+//!
+//! `MAP_SHARED | PROT_WRITE` обычного файла (индекс кэша Chromium, SQLite) —
+//! тоже такой объект: [`SharedMem::of_file`] заполняет его куском файла, а
+//! записанное уходит обратно в файл, когда объект уходит (снято последнее
+//! отображение) или по [`SharedMem::flush`]. Видно это всем, кто отобразил
+//! тот же объект (и детям после `fork`); другому `mmap` того же файла —
+//! только после записи обратно.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -31,12 +40,80 @@ pub struct SharedMem {
     frames: Mutex<BTreeMap<usize, PhysAddr>>,
     /// Длина в байтах (`ftruncate`).
     size: AtomicU64,
+    /// Файл, кусок которого отображён на запись: куда возвращать записанное.
+    file: Option<FileBack>,
 }
+
+/// Кусок файла `[start, end)` за объектом.
+struct FileBack {
+    node: Arc<dyn Node>,
+    start: u64,
+    end: u64,
+}
+
+/// Больше этого отображать на запись не возьмёмся: кусок читается целиком.
+const MAX_FILE_MAP: usize = 64 << 20;
 
 impl SharedMem {
     #[must_use]
     pub fn new(size: u64) -> Arc<Self> {
-        Arc::new(Self { frames: Mutex::new(BTreeMap::new()), size: AtomicU64::new(size) })
+        Arc::new(Self { frames: Mutex::new(BTreeMap::new()), size: AtomicU64::new(size), file: None })
+    }
+
+    /// Кусок файла `[offset, offset + len)` для `MAP_SHARED` на запись:
+    /// прочитан сразу, записанное вернётся в файл. `None` — велик или не
+    /// прочитался.
+    pub fn of_file(node: Arc<dyn Node>, offset: u64, len: usize) -> Option<Arc<Self>> {
+        if len > MAX_FILE_MAP {
+            return None;
+        }
+        let end = offset.checked_add(len as u64)?;
+        let size = node.metadata().size;
+        let mem = Arc::new(Self {
+            frames: Mutex::new(BTreeMap::new()),
+            size: AtomicU64::new(size),
+            file: Some(FileBack { node: Arc::clone(&node), start: offset, end }),
+        });
+        let mut page = alloc::vec![0u8; PAGE_SIZE];
+        let mut at = offset;
+        while at < end.min(size) {
+            let take = ((end.min(size) - at) as usize).min(PAGE_SIZE);
+            let got = node.read_at(at, &mut page[..take]).ok()?;
+            if got == 0 {
+                break;
+            }
+            let data = &page[..got];
+            mem.copy(at, got, |frame, done, step| {
+                // SAFETY: `done + step <= got`; кадр — см. `copy`.
+                unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(done), frame, step) };
+            })
+            .ok()?;
+            at += got as u64;
+        }
+        Some(mem)
+    }
+
+    /// Вернуть записанное в файл (`msync`, снятие отображения): страницы, к
+    /// которым прикасались, в пределах нынешней длины файла.
+    pub fn flush(&self) {
+        let Some(back) = &self.file else {
+            return;
+        };
+        let size = back.node.metadata().size;
+        let end = back.end.min(size);
+        let pages: alloc::vec::Vec<(usize, PhysAddr)> = self.frames.lock().iter().map(|(page, frame)| (*page, *frame)).collect();
+        for (page, frame) in pages {
+            let from = (page * PAGE_SIZE) as u64;
+            let to = (from + PAGE_SIZE as u64).min(end);
+            let from = from.max(back.start);
+            if from >= to {
+                continue;
+            }
+            let inside = (from % PAGE_SIZE as u64) as usize;
+            // SAFETY: кадр принадлежит объекту и жив, пока жив он.
+            let bytes = unsafe { core::slice::from_raw_parts(super::frame_bytes(frame).add(inside), (to - from) as usize) };
+            let _ = back.node.write_at(from, bytes);
+        }
     }
 
     #[must_use]
@@ -62,6 +139,18 @@ impl SharedMem {
         Some(frame)
     }
 
+    /// Прочитать `buf.len()` байт с `offset` — без оглядки на длину файла
+    /// (сервер Wayland читает буфер в пределах пула, который ему объявили).
+    /// `false` — кадров не осталось.
+    pub fn read(&self, offset: u64, buf: &mut [u8]) -> bool {
+        let out = buf.as_mut_ptr();
+        self.copy(offset, buf.len(), |frame, done, take| {
+            // SAFETY: `done + take <= buf.len()`; кадр — см. `copy`.
+            unsafe { core::ptr::copy_nonoverlapping(frame, out.add(done), take) };
+        })
+        .is_ok()
+    }
+
     fn copy(&self, offset: u64, len: usize, mut each: impl FnMut(*mut u8, usize, usize)) -> VfsResult<()> {
         let mut done = 0;
         while done < len {
@@ -81,6 +170,7 @@ impl SharedMem {
 
 impl Drop for SharedMem {
     fn drop(&mut self) {
+        self.flush();
         let frames = core::mem::take(&mut *self.frames.lock());
         crate::mm::frame::with(|pool| {
             for frame in frames.into_values() {

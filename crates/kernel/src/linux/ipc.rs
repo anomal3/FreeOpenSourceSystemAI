@@ -452,6 +452,53 @@ impl Object for UnixSocket {
     }
 }
 
+// ---- соединения ядра (сервер Wayland, фаза 71i) ------------------------------
+
+/// Имя AF_UNIX, которое слушает само ядро, а не программа: к нему
+/// подключаются обычным `connect`, а соединения забирает задача ядра.
+pub(super) struct KernelListener(Arc<Listener>);
+
+impl KernelListener {
+    /// Занять имя; `None` — его уже слушают.
+    pub(super) fn bind(name: &[u8]) -> Option<Self> {
+        let mut names = NAMES.lock();
+        names.retain(|(_, live)| live.strong_count() > 0);
+        if names.iter().any(|(other, _)| other == name) {
+            return None;
+        }
+        let listener = Arc::new(Listener { queue: Mutex::new(VecDeque::new()) });
+        names.push((name.to_vec(), Arc::downgrade(&listener)));
+        Some(Self(listener))
+    }
+
+    /// Следующее пришедшее соединение, не ожидая.
+    pub(super) fn accept(&self) -> Option<KernelConn> {
+        self.0.queue.lock().pop_front().map(KernelConn)
+    }
+}
+
+/// Соединение на стороне ядра: серверная половина пары, которую создал
+/// `connect` программы.
+pub(super) struct KernelConn(Arc<UnixSocket>);
+
+impl KernelConn {
+    /// Прочитать, что есть: `(байты, дескрипторы)`; `Ok((0, _))` — программа
+    /// закрыла свой конец, `-EAGAIN` — пока пусто.
+    pub(super) fn recv(&self, buf: &mut [u8]) -> Result<(usize, Vec<Handle>), i64> {
+        self.0.with_endpoint(|endpoint| endpoint.recv(buf, false).map(|(count, rights, _)| (count, rights)))
+    }
+
+    /// Отправить; ответ — сколько байт ушло (поток: может быть меньше).
+    pub(super) fn send(&self, data: &[u8], rights: Vec<Handle>) -> Result<usize, i64> {
+        self.0.with_endpoint(|endpoint| endpoint.send(data, rights))
+    }
+
+    /// Процесс Linux по ту сторону.
+    pub(super) fn peer_pid(&self) -> u32 {
+        self.0.with_endpoint(|endpoint| Ok(endpoint.peer_pid.load(Ordering::Relaxed))).unwrap_or(0)
+    }
+}
+
 fn socket_of(fd: usize) -> Result<(Arc<dyn Object>, bool), i64> {
     let (object, nonblock) = match crate::user::with_current(|program| (program.files.object(fd), program.files.is_open(fd))) {
         Some((Some(found), _)) => found,
@@ -611,6 +658,8 @@ pub fn connect(fd: usize, addr: usize, len: usize) -> i64 {
         Ok(name) => name,
         Err(err) => return err,
     };
+    // Сервер Wayland ядра встаёт по первому обращению (фаза 71i).
+    super::wayland::serve_if_named(&name);
     let listener = NAMES.lock().iter().find(|(other, _)| *other == name).and_then(|(_, live)| live.upgrade());
     let Some(listener) = listener else {
         return -e::ECONNREFUSED;
@@ -995,6 +1044,59 @@ pub fn eventfd(initial: usize, flags: usize) -> i64 {
     }
     let object = Arc::new(EventFd { count: Mutex::new(initial as u32 as u64), semaphore: flags & EFD_SEMAPHORE != 0 });
     install(object, flags & EFD_NONBLOCK != 0, flags & EFD_CLOEXEC != 0)
+}
+
+// ---- inotify -------------------------------------------------------------------
+
+/// `inotify` (фаза 71i): наблюдение принимается, событий не бывает — файлы
+/// в системе меняют только сами программы. Chromium без него не поднимает
+/// сетевую службу (наблюдает `/etc/resolv.conf` и `/etc/hosts`).
+struct Inotify {
+    next: Mutex<i32>,
+}
+
+impl Object for Inotify {
+    fn read(&self, _buf: &mut [u8]) -> Result<usize, i64> {
+        Err(-e::EAGAIN)
+    }
+    fn write(&self, _data: &[u8]) -> Result<usize, i64> {
+        Err(-e::EINVAL)
+    }
+    fn readiness(&self) -> (bool, bool, bool) {
+        (false, false, false)
+    }
+    fn mode(&self) -> u32 {
+        0
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// `inotify_init1(flags)` (и `inotify_init` с нулём).
+pub fn inotify_init(flags: usize) -> i64 {
+    const IN_NONBLOCK: usize = 0o4000;
+    const IN_CLOEXEC: usize = 0o2_000_000;
+    let flags = flags as u32 as usize;
+    if flags & !(IN_NONBLOCK | IN_CLOEXEC) != 0 {
+        return -e::EINVAL;
+    }
+    install(Arc::new(Inotify { next: Mutex::new(1) }), flags & IN_NONBLOCK != 0, flags & IN_CLOEXEC != 0)
+}
+
+/// `inotify_add_watch(fd, path, mask)`: номер наблюдения.
+pub fn inotify_add_watch(fd: usize) -> i64 {
+    match object_of(fd) {
+        Ok((object, _)) => match object.as_any().downcast_ref::<Inotify>() {
+            Some(inotify) => {
+                let mut next = inotify.next.lock();
+                *next += 1;
+                i64::from(*next - 1)
+            }
+            None => -e::EINVAL,
+        },
+        Err(err) => err,
+    }
 }
 
 // ---- timerfd -------------------------------------------------------------------

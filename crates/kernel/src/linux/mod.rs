@@ -35,12 +35,14 @@ use user_abi::{
 mod poll;
 mod fsops;
 mod ipc;
+mod links;
 pub mod recent;
 mod net;
 mod process;
 mod signal;
 mod special;
 mod thread;
+mod wayland;
 
 pub use process::{process_ended, register_child};
 
@@ -182,6 +184,16 @@ mod nr {
     pub const SENDMMSG: usize = 307;
     pub const PWRITE64: usize = 18;
     pub const FLOCK: usize = 73;
+    pub const CREAT: usize = 85;
+    pub const MSYNC: usize = 26;
+    pub const MREMAP: usize = 25;
+    pub const SENDFILE: usize = 40;
+    pub const MINCORE: usize = 27;
+    pub const FCHDIR: usize = 81;
+    pub const INOTIFY_INIT: usize = 253;
+    pub const INOTIFY_ADD_WATCH: usize = 254;
+    pub const INOTIFY_RM_WATCH: usize = 255;
+    pub const INOTIFY_INIT1: usize = 294;
     pub const FSYNC: usize = 74;
     pub const FDATASYNC: usize = 75;
     pub const RENAME: usize = 82;
@@ -223,6 +235,7 @@ mod e {
     pub const EIO: i64 = 5;
     pub const EBADF: i64 = 9;
     pub const EAGAIN: i64 = 11;
+    pub const EOPNOTSUPP: i64 = 95;
     pub const ENOMEM: i64 = 12;
     pub const EACCES: i64 = 13;
     pub const EFAULT: i64 = 14;
@@ -378,9 +391,11 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::CLOCK_GETRES => fsops::clock_getres(a0, a1),
             nr::GETRESUID => fsops::getres(a0, a1, a2, false),
             nr::GETRESGID => fsops::getres(a0, a1, a2, true),
-            // Жёстких и символических ссылок файловая система не знает —
-            // ответ, как у FAT: «нельзя».
-            nr::LINK | nr::LINKAT | nr::SYMLINK | nr::SYMLINKAT => -e::EPERM,
+            // Жёстких ссылок файловая система не знает — ответ, как у FAT:
+            // «нельзя». Символические — в памяти слоя Linux (фаза 71i).
+            nr::LINK | nr::LINKAT => -e::EPERM,
+            nr::SYMLINK => links::symlink(a0, AT_FDCWD, a1),
+            nr::SYMLINKAT => links::symlink(a0, a1, a2),
             // Данные пишутся сразу, блокировок между процессами одного
             // пользователя нет, прав и времени файла программа Linux не меняет:
             // согласиться — честный ответ.
@@ -400,14 +415,23 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
                 errno(native(SYS_CLOSE, a0, 0, 0))
             }
             nr::OPEN => open_at(AT_FDCWD, a0, a1),
+            // `creat` — `open` с `O_CREAT | O_WRONLY | O_TRUNC`.
+            nr::CREAT => open_at(AT_FDCWD, a0, 0o1101),
             nr::OPENAT => open_at(a0, a1, a2),
-            nr::STAT | nr::LSTAT => stat_path(AT_FDCWD, a0, a1),
+            nr::STAT => stat_path(AT_FDCWD, a0, a1, true),
+            nr::LSTAT => stat_path(AT_FDCWD, a0, a1, false),
             nr::PREAD64 => pread(a0, a1, a2, a3),
             nr::ACCESS => access(AT_FDCWD, a0, a1),
             nr::FACCESSAT | nr::FACCESSAT2 => access(a0, a1, a2),
             nr::GETDENTS64 => getdents(a0, a1, a2),
             nr::GETCWD => getcwd(a0, a1),
             nr::CHDIR => chdir(a0),
+            nr::FCHDIR => fchdir(a0),
+            // Расширенных атрибутов файловые системы не хранят (фаза 71i:
+            // `ls` спрашивает метки безопасности): «не поддерживается», а
+            // список атрибутов — пустой.
+            188..=193 | 197..=199 => -e::EOPNOTSUPP,
+            194..=196 => 0,
             nr::READLINK => readlink(AT_FDCWD, a0, a1, a2),
             nr::READLINKAT => readlink(a0, a1, a2, a3),
             nr::FCNTL => fcntl(a0, a1, a2),
@@ -441,7 +465,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
                 if a3 & AT_EMPTY_PATH != 0 && c_string_len(a1) == Some(0) {
                     fstat(a0, a2)
                 } else {
-                    stat_path(a0, a1, a2)
+                    stat_path(a0, a1, a2, a3 & AT_SYMLINK_NOFOLLOW == 0)
                 }
             }
             nr::FSTAT => fstat(a0, a1),
@@ -480,7 +504,31 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::SCHED_YIELD => errno(native(SYS_YIELD, 0, 0, 0)),
             // Совет о памяти или о чтении файла — совет: не принять его можно
             // всегда.
-            nr::MADVISE | nr::FADVISE64 => 0,
+            nr::MADVISE => madvise(a0, a1, a2),
+            nr::MREMAP => mremap(a0, a1, a2, a3),
+            nr::SENDFILE => sendfile(a0, a1, a2, a3),
+            nr::INOTIFY_INIT => ipc::inotify_init(0),
+            nr::INOTIFY_INIT1 => ipc::inotify_init(a0),
+            nr::INOTIFY_ADD_WATCH => ipc::inotify_add_watch(a0),
+            nr::INOTIFY_RM_WATCH => 0,
+            // Какие страницы в памяти: все — подкачки нет, а ленивая
+            // страница придёт по первому касанию так же быстро.
+            nr::MINCORE => {
+                let pages = a1.div_ceil(4096);
+                if a0 % 4096 != 0 {
+                    -e::EINVAL
+                } else if !space::user_can(a2, pages, PageFlags::WRITE) {
+                    -e::EFAULT
+                } else {
+                    // SAFETY: проверено строкой выше.
+                    unsafe { core::ptr::write_bytes(a2 as *mut u8, 1, pages) };
+                    0
+                }
+            }
+            nr::FADVISE64 => 0,
+            // Записанное в отображённый файл уходит в него при снятии
+            // отображения (фаза 71i), не раньше: `msync` этого не ускоряет.
+            nr::MSYNC => 0,
             nr::NANOSLEEP => nanosleep(a0),
             nr::GETPID => crate::user::with_current(|program| program.linux_pid).unwrap_or(1) as i64,
             nr::GETTID => errno(native(SYS_GETPID, 0, 0, 0)),
@@ -549,6 +597,7 @@ fn unknown(number: usize) -> i64 {
 
 const AT_FDCWD: usize = -100isize as usize;
 const AT_EMPTY_PATH: usize = 0x1000;
+const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 
 /// Самый длинный путь, который здесь принимается (`PATH_MAX` Linux — 4096).
 const PATH_MAX: usize = 4095;
@@ -618,7 +667,11 @@ fn linux_path(dir: usize, ptr: usize) -> Result<String, i64> {
         return Ok(normalize(&path));
     }
     // От дескриптора каталога — по пути, под которым каталог открыт (фаза
-    // 71c); от текущего — по текущему каталогу.
+    // 71c); от текущего — по текущему каталогу. Дескриптор — `int`: glibc
+    // кладёт `AT_FDCWD` в регистр 32-битным (`0xffffff9c`), старшие биты не
+    // в счёт (фаза 71i — до того любой относительный путь от `AT_FDCWD`
+    // отвечал `ENOTDIR`).
+    let dir = dir as u32 as i32 as isize as usize;
     let base = if dir == AT_FDCWD {
         crate::user::with_current(|program| program.linux_cwd.clone()).unwrap_or_else(|| String::from("/"))
     } else {
@@ -651,7 +704,7 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     const O_TRUNC: usize = 0o1000;
     const O_DIRECTORY: usize = 0o200_000;
     let linux = match linux_path(dir, ptr) {
-        Ok(path) => path,
+        Ok(path) => links::follow(&path),
         Err(err) => return err,
     };
     if let Some(answer) = ipc::open_shm(&linux, flags) {
@@ -680,10 +733,17 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     } else {
         linux
     };
-    let path = crate::linux_path::resolve(&linux, crate::user::credentials());
     let cred = crate::user::credentials();
-    if flags & O_CREAT != 0 && flags & O_EXCL != 0 && matches!(crate::fs::resolve_as(cred, &path, Access::NONE), Some(Ok(_))) {
+    let mut path = crate::linux_path::resolve(&linux, cred);
+    let exists = matches!(crate::fs::resolve_as(cred, &path, Access::NONE), Some(Ok(_)));
+    if flags & O_CREAT != 0 && flags & O_EXCL != 0 && exists {
         return -e::EEXIST;
+    }
+    // Новый файл ложится туда же, куда `mkdir` кладёт новый каталог (фаза
+    // 71i): иначе файл в только что созданном каталоге профиля искался бы
+    // не там, где каталог.
+    if flags & O_CREAT != 0 && !exists {
+        path = fsops::place(&linux);
     }
     let mut native_flags = 0;
     if flags & O_ACCMODE != 0 {
@@ -745,6 +805,7 @@ const S_IFREG: u32 = 0o100_000;
 const S_IFIFO: u32 = 0o010_000;
 const S_IFCHR: u32 = 0o020_000;
 const S_IFSOCK: u32 = 0o140_000;
+const S_IFLNK: u32 = 0o120_000;
 
 /// Записать `struct stat` в память программы.
 fn put_stat(out: usize, kind: u32, mode: u16, uid: u32, gid: u32, size: u64, mtime: u32, ino: u64) -> i64 {
@@ -786,11 +847,20 @@ fn ino_of(path: &str) -> u64 {
     hash
 }
 
-fn stat_path(dir: usize, ptr: usize, out: usize) -> i64 {
+/// `stat` (`follow`) и `lstat` по пути.
+fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
     let linux = match linux_path(dir, ptr) {
         Ok(path) => path,
         Err(err) => return err,
     };
+    // Символическая ссылка (фаза 71i): `lstat` — она сама, `stat` — то, на
+    // что она указывает.
+    if let Some(text) = links::target(&linux) {
+        if !follow {
+            return put_stat(out, S_IFLNK, 0o777, 0, 0, text.len() as u64, 0, ino_of(&linux));
+        }
+    }
+    let linux = links::follow(&linux);
     // `/proc/self/fd/N` — ссылка на открытое; `stat` идёт по ней, то есть
     // это `fstat` дескриптора (фаза 71h: песочница Chromium так проверяет
     // открытые дескрипторы). `/proc/self/task/<tid>` — каталог потока.
@@ -1038,12 +1108,31 @@ fn chdir(ptr: usize) -> i64 {
     }
 }
 
+/// `fchdir` — в каталог, открытый дескриптором (фаза 71i: `mkdir -p`
+/// coreutils идёт по пути так); его путь запомнил `openat`.
+fn fchdir(fd: usize) -> i64 {
+    let answer = crate::user::with_current(|program| {
+        match program.linux_dirs.iter().find(|(other, _)| *other == fd).map(|(_, path)| path.clone()) {
+            Some(path) => {
+                program.linux_cwd = path;
+                0
+            }
+            None if program.files.is_open(fd) => -e::ENOTDIR,
+            None => -e::EBADF,
+        }
+    });
+    answer.unwrap_or(-e::ESRCH)
+}
+
 /// `readlink`: ссылок в системе нет, кроме `/proc/self/exe` — путь программы.
 fn readlink(dir: usize, ptr: usize, buf: usize, size: usize) -> i64 {
     let path = match linux_path(dir, ptr) {
         Ok(path) => path,
         Err(err) => return err,
     };
+    if let Some(answer) = links::read(&path, buf, size) {
+        return answer;
+    }
     if path == "/proc/self/exe" {
         let exe = crate::user::with_current(|program| String::from(crate::linux_path::shown(&program.path)))
             .unwrap_or_default();
@@ -1074,6 +1163,13 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
     const F_DUPFD_CLOEXEC: usize = 1030;
     const F_ADD_SEALS: usize = 1033;
     const F_GET_SEALS: usize = 1034;
+    const F_GETLK: usize = 5;
+    const F_SETLK: usize = 6;
+    const F_SETLKW: usize = 7;
+    const F_OFD_GETLK: usize = 36;
+    const F_OFD_SETLK: usize = 37;
+    const F_OFD_SETLKW: usize = 38;
+    const F_UNLCK: i16 = 2;
     const FD_CLOEXEC: usize = 1;
     const O_NONBLOCK: usize = 0o4000;
     let result = crate::user::with_current(|program| {
@@ -1103,6 +1199,21 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
             // никто не нарушает, ничего не стоит не проверять.
             F_ADD_SEALS => files.cloexec(fd).map(|_| 0),
             F_GET_SEALS => files.cloexec(fd).map(|_| 0),
+            // Блокировки записей (фаза 71i: LevelDB и SQLite профиля
+            // Chromium): между процессами одного пользователя спорить не о
+            // чем — всякая блокировка удаётся, а спросившему отвечают
+            // «свободно».
+            F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => files.cloexec(fd).map(|_| 0),
+            F_GETLK | F_OFD_GETLK => files.cloexec(fd).map(|_| {
+                // `struct flock`: первое поле — `l_type`.
+                if space::user_can(arg, 2, PageFlags::WRITE) {
+                    // SAFETY: проверено строкой выше.
+                    unsafe { core::ptr::write_unaligned(arg as *mut i16, F_UNLCK) };
+                    0
+                } else {
+                    -e::EFAULT
+                }
+            }),
             F_SETFL => {
                 files.cloexec(fd)?;
                 files.set_nonblock(fd, arg & O_NONBLOCK != 0)?;
@@ -1246,12 +1357,21 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
                 shared = Some((mem, offset as u64));
                 None
             }
-            _ => {
-                if shared_flag && prot & user_abi::PROT_WRITE != 0 {
-                    return -e::EACCES;
+            // Файл на диске на запись (фаза 71i): разделяемая память с его
+            // куском, записанное вернётся в файл (см. `shm`).
+            _ if shared_flag && prot & user_abi::PROT_WRITE != 0 => {
+                if offset % 4096 != 0 {
+                    return -e::EINVAL;
                 }
-                Some((node, offset as u64))
+                match crate::user::shm::SharedMem::of_file(node, offset as u64, len) {
+                    Some(mem) => {
+                        shared = Some((mem, offset as u64));
+                        None
+                    }
+                    None => return -e::ENOMEM,
+                }
             }
+            _ => Some((node, offset as u64)),
         }
     };
     match crate::user::with_current(|program| program.linux_mmap(addr, len, prot, fixed, file, shared)) {
@@ -1259,6 +1379,126 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
         Some(Err(err)) => errno(crate::user::syscall::mmap_errno(err)),
         None => -e::ESRCH,
     }
+}
+
+/// `mremap(old, old_size, new_size, flags)` (фаза 71i: сетевая служба
+/// Chromium без него выходит). Сжать — снять хвост на месте; вырасти — только
+/// с `MREMAP_MAYMOVE`: новая безымянная область, содержимое переносится, старая
+/// снимается. Разделяемую память перенос не сохраняет разделяемой — такой
+/// просьбы пока не было.
+fn mremap(old: usize, old_size: usize, new_size: usize, flags: usize) -> i64 {
+    const MREMAP_MAYMOVE: usize = 1;
+    const PAGE: usize = 4096;
+    if old % PAGE != 0 || new_size == 0 || flags & !MREMAP_MAYMOVE != 0 {
+        return -e::EINVAL;
+    }
+    let old_size = old_size.div_ceil(PAGE) * PAGE;
+    let new_size = new_size.div_ceil(PAGE) * PAGE;
+    if new_size <= old_size {
+        if new_size < old_size {
+            // SAFETY: контракт `syscall`.
+            let done = errno(unsafe { native(SYS_MUNMAP, old + new_size, old_size - new_size, 0) });
+            if done < 0 {
+                return done;
+            }
+        }
+        return old as i64;
+    }
+    if flags & MREMAP_MAYMOVE == 0 {
+        return -e::ENOMEM;
+    }
+    if !space::user_can(old, old_size, PageFlags::READ) {
+        return -e::EFAULT;
+    }
+    const PROT_RW: usize = 3;
+    const MAP_PRIVATE_ANONYMOUS: usize = 0x22;
+    let new = mmap(0, new_size, PROT_RW, MAP_PRIVATE_ANONYMOUS, usize::MAX, 0);
+    if new < 0 {
+        return new;
+    }
+    let new = new as usize;
+    if !space::user_can(new, old_size, PageFlags::WRITE) {
+        return -e::ENOMEM;
+    }
+    // SAFETY: обе области проверены выше и не пересекаются (новая выдана
+    // только что).
+    unsafe { core::ptr::copy_nonoverlapping(old as *const u8, new as *mut u8, old_size) };
+    // SAFETY: контракт `syscall`.
+    unsafe { native(SYS_MUNMAP, old, old_size, 0) };
+    new as i64
+}
+
+/// `sendfile(out, in, offset, count)` между файлами (фаза 71i: Chromium
+/// копирует так файлы профиля). Не файл с обеих сторон — `EINVAL`: так
+/// программа узнаёт, что пора копировать чтением и записью.
+fn sendfile(out: usize, input: usize, offset_ptr: usize, count: usize) -> i64 {
+    const SEEK_SET: usize = 0;
+    const SEEK_CUR: usize = 1;
+    let nodes = crate::user::with_current(|program| (program.files.node(input), program.files.node(out)));
+    let (from, to) = match nodes {
+        Some((Ok(from), Ok(to))) => (from, to),
+        Some(_) => return -e::EINVAL,
+        None => return -e::ESRCH,
+    };
+    let start = if offset_ptr == 0 {
+        // SAFETY: контракт `syscall`.
+        let at = errno(unsafe { native(SYS_SEEK, input, 0, SEEK_CUR) });
+        if at < 0 {
+            return at;
+        }
+        at as u64
+    } else {
+        if !space::user_can(offset_ptr, 8, PageFlags::WRITE) {
+            return -e::EFAULT;
+        }
+        // SAFETY: проверено строкой выше.
+        unsafe { core::ptr::read_unaligned(offset_ptr as *const u64) }
+    };
+    // SAFETY: контракт `syscall`.
+    let out_at = errno(unsafe { native(SYS_SEEK, out, 0, SEEK_CUR) });
+    if out_at < 0 {
+        return -e::EINVAL;
+    }
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    let mut done = 0usize;
+    while done < count {
+        let want = (count - done).min(buf.len());
+        let got = match from.read_at(start + done as u64, &mut buf[..want]) {
+            Ok(0) => break,
+            Ok(got) => got,
+            Err(err) if done == 0 => return vfs_errno(err),
+            Err(_) => break,
+        };
+        match to.write_at(out_at as u64 + done as u64, &buf[..got]) {
+            Ok(_) => done += got,
+            Err(err) if done == 0 => return vfs_errno(err),
+            Err(_) => break,
+        }
+    }
+    // SAFETY: контракт `syscall`.
+    unsafe { native(SYS_SEEK, out, out_at as usize + done, SEEK_SET) };
+    if offset_ptr == 0 {
+        // SAFETY: контракт `syscall`.
+        unsafe { native(SYS_SEEK, input, start as usize + done, SEEK_SET) };
+    } else {
+        // SAFETY: проверено выше.
+        unsafe { core::ptr::write_unaligned(offset_ptr as *mut u64, start + done as u64) };
+    }
+    done as i64
+}
+
+/// `madvise`: совет — совет, и не принять его можно всегда, кроме
+/// `MADV_DONTNEED`: после него безымянная память читается нулями, и glibc на
+/// это рассчитывает (фаза 71i, см. `Program::linux_discard`).
+fn madvise(addr: usize, len: usize, advice: usize) -> i64 {
+    const MADV_DONTNEED: usize = 4;
+    if addr % 4096 != 0 {
+        return -e::EINVAL;
+    }
+    if advice == MADV_DONTNEED {
+        crate::user::with_current_shared(|program, shared| program.linux_discard(addr, len, shared));
+    }
+    0
 }
 
 /// `ioctl`: терминалу — `TCGETS` и размер окна, остальным — «не терминал».
@@ -1413,9 +1653,13 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
     let command = op & !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
     match command {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            // Срок Linux — `timespec`; родной — миллисекунды, ноль — без срока.
-            let ms = if timeout == 0 {
-                0
+            // Срок Linux — `timespec`; здесь — момент по часам работы системы
+            // в наносекундах, `None` — без срока. Родное ожидание меряет
+            // миллисекундами и может проснуться на их долю раньше: тогда ждём
+            // остаток (фаза 71i — `pthread_cond_timedwait` возвращался
+            // раньше срока).
+            let deadline = if timeout == 0 {
+                None
             } else {
                 if !space::user_can(timeout, 16, PageFlags::READ) {
                     return -e::EFAULT;
@@ -1423,30 +1667,39 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
                 // SAFETY: проверено строкой выше.
                 let [seconds, nanos] = unsafe { core::ptr::read_unaligned(timeout as *const [u64; 2]) };
                 let wanted = u128::from(seconds) * 1_000_000_000 + u128::from(nanos);
-                let left = if command == FUTEX_WAIT_BITSET {
-                    let now = if op & FUTEX_CLOCK_REALTIME != 0 {
-                        u128::from(crate::time::now_unix().unwrap_or(0)) * 1_000_000_000
-                            + u128::from(crate::time::uptime_ns() % 1_000_000_000)
+                let uptime = u128::from(crate::time::uptime_ns());
+                Some(if command == FUTEX_WAIT_BITSET {
+                    if op & FUTEX_CLOCK_REALTIME != 0 {
+                        let now = u128::from(crate::time::now_unix().unwrap_or(0)) * 1_000_000_000 + uptime % 1_000_000_000;
+                        uptime + wanted.saturating_sub(now)
                     } else {
-                        u128::from(crate::time::uptime_ns())
-                    };
-                    if wanted <= now {
-                        return -e::ETIMEDOUT;
+                        wanted
                     }
-                    wanted - now
                 } else {
-                    wanted
-                };
-                (left.div_ceil(1_000_000) as usize).max(1)
+                    uptime + wanted
+                })
             };
-            // SAFETY: контракт `syscall`.
-            let code = unsafe { native(SYS_FUTEX_WAIT, addr, value, ms) };
-            match code {
-                // Родные «значение уже другое» и «срок вышел» — положительные
-                // ответы; у Linux это `EAGAIN` и `ETIMEDOUT`.
-                user_abi::FUTEX_CHANGED => -e::EAGAIN,
-                user_abi::FUTEX_TIMED_OUT => -e::ETIMEDOUT,
-                code => errno(code),
+            loop {
+                let ms = match deadline {
+                    None => 0,
+                    Some(at) => {
+                        let now = u128::from(crate::time::uptime_ns());
+                        if at <= now {
+                            return -e::ETIMEDOUT;
+                        }
+                        ((at - now).div_ceil(1_000_000) as usize).max(1)
+                    }
+                };
+                // SAFETY: контракт `syscall`.
+                let code = unsafe { native(SYS_FUTEX_WAIT, addr, value, ms) };
+                match code {
+                    // Родные «значение уже другое» и «срок вышел» — положительные
+                    // ответы; у Linux это `EAGAIN` и `ETIMEDOUT` (последний —
+                    // только когда срок и правда прошёл: см. выше).
+                    user_abi::FUTEX_CHANGED => return -e::EAGAIN,
+                    user_abi::FUTEX_TIMED_OUT if deadline.is_some() => continue,
+                    code => return errno(code),
+                }
             }
         }
         // SAFETY: контракт `syscall`.
@@ -1593,6 +1846,9 @@ fn unlink(dir: usize, ptr: usize) -> i64 {
     };
     if let Some(answer) = ipc::unlink_shm(&linux) {
         return answer;
+    }
+    if links::remove(&linux) {
+        return 0;
     }
     let cred = crate::user::credentials();
     let path = crate::linux_path::resolve(&linux, cred);

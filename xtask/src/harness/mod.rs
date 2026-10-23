@@ -2618,6 +2618,7 @@ fn start_host_site() -> Result<(HostServer, u16)> {
             .and_then(|line| line.split(' ').nth(1))
             .unwrap_or("/")
             .to_string();
+        say!("             сайт хоста: GET {path}");
 
         let answer: Vec<u8> = match path.as_str() {
             "/hello.txt" => {

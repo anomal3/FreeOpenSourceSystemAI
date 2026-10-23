@@ -29,8 +29,9 @@ use alloc::vec::Vec;
 use crate::net::ipv4::Ipv4;
 use crate::sched::TaskId;
 
-/// Сколько сокетов бывает в системе одновременно.
-pub const MAX_SOCKETS: usize = 8;
+/// Сколько сокетов бывает в системе одновременно. 64 с фазы 71i: у Chromium
+/// их по нескольку на каждый запрос имён.
+pub const MAX_SOCKETS: usize = 64;
 
 /// Сколько датаграмм ждёт в очереди одного сокета.
 const QUEUE_DEPTH: usize = 8;

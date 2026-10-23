@@ -1,6 +1,7 @@
 #!/bin/bash
 # Оболочка Linux на процессах (фаза 71d): подстановка команды, конвейер,
-# коды выхода детей, сценарий через `#!`, фоновая задача, `wait` и `kill`.
+# коды выхода детей, сценарий через `#!`, фоновая задача, `wait` и `kill`;
+# с фазы 71i — `mkdir -p` в домашнем каталоге и относительный путь.
 #
 # Едет в пакете `debian-12.fpk` как `/usr/libexec/fossai/forkcheck`; строки —
 # `forkcheck: ok <что>` или `forkcheck: FAILED <что>`, итог — `forkcheck: N
@@ -40,6 +41,11 @@ victim=$!
 kill $victim
 wait $victim
 ok "kill a background job" "$?" "143"
+mkdir -p "$HOME/.fossai-check/a/b"
+made=$?
+ok "mkdir -p in the home directory" "$made $([ -d "$HOME/.fossai-check/a/b" ] && echo dir)" "0 dir"
+ok "a relative path from the current directory" "$(cd "$HOME/.fossai-check" && ls -d a)" "a"
+rm -r "$HOME/.fossai-check"
 
 echo "forkcheck: $fails failed"
 exit $fails
