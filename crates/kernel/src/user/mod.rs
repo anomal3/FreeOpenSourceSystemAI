@@ -4737,6 +4737,7 @@ extern "C" fn program_entry(arg: usize) -> ! {
     let rights = rights.intersect(rights_of_path(path));
     let code = match run(path, &args[..argc], cred, rights, stdin, stdout) {
         Ok(code) => {
+            crate::shell::note_exit(code);
             if code == user_abi::EXIT_KILLED {
                 report_line(path, "killed by request");
             } else if code == user_abi::EXIT_FAULTED {

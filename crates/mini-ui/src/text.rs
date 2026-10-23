@@ -13,6 +13,8 @@
 //! 900×520 — разница в тридцать раз на каждое нажатие клавиши. Разница
 //! чувствуется руками: экран — память устройства, и запись в него стоит дорого.
 
+use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::boxdraw;
@@ -268,28 +270,33 @@ pub fn draw_text_at(
 /// Шестнадцать цветов терминала — те самые, которые ANSI нумерует от 30 до 37 и
 /// от 90 до 97.
 ///
-/// Значения взяты не из спецификации (её в этой части нет вовсе — цвета там
-/// названы словами), а подобраны под тёмный фон системы: «чёрный» чуть светлее
-/// фона окна, иначе текст им напечатанный исчезал бы совсем, а яркая половина
-/// действительно ярче тусклой, а не просто другая.
+/// Схема Campbell — та, что у Windows Terminal и консоли Windows 10 по
+/// умолчанию (терминал T5): почти чёрный фон, светло-серый текст, цвета,
+/// подобранные под этот фон. Свою схему, подогнанную под синеватую заливку
+/// окон, сменила она: терминал — не окно стола, у него свой фон.
 pub const PALETTE: [Color; 16] = [
-    Color::rgb(0x14, 0x20, 0x2C), // 0 чёрный
-    Color::rgb(0xC0, 0x4C, 0x50), // 1 красный
-    Color::rgb(0x5E, 0xA8, 0x74), // 2 зелёный
-    Color::rgb(0xC0, 0xA0, 0x50), // 3 жёлтый
-    Color::rgb(0x3C, 0x8C, 0xC8), // 4 синий
-    Color::rgb(0xA0, 0x70, 0xB8), // 5 пурпурный
-    Color::rgb(0x50, 0xA8, 0xB0), // 6 голубой
-    Color::rgb(0xD8, 0xE2, 0xEC), // 7 белый
-    Color::rgb(0x4A, 0x5C, 0x70), // 8 яркий чёрный (серый)
-    Color::rgb(0xE0, 0x70, 0x74), // 9 яркий красный
-    Color::rgb(0x86, 0xD0, 0x9C), // 10 яркий зелёный
-    Color::rgb(0xE8, 0xC8, 0x78), // 11 яркий жёлтый
-    Color::rgb(0x6C, 0xB4, 0xE8), // 12 яркий синий
-    Color::rgb(0xC8, 0x98, 0xE0), // 13 яркий пурпурный
-    Color::rgb(0x7C, 0xD0, 0xD8), // 14 яркий голубой
-    Color::rgb(0xFF, 0xFF, 0xFF), // 15 яркий белый
+    Color::rgb(0x0C, 0x0C, 0x0C), // 0 чёрный
+    Color::rgb(0xC5, 0x0F, 0x1F), // 1 красный
+    Color::rgb(0x13, 0xA1, 0x0E), // 2 зелёный
+    Color::rgb(0xC1, 0x9C, 0x00), // 3 жёлтый
+    Color::rgb(0x00, 0x37, 0xDA), // 4 синий
+    Color::rgb(0x88, 0x17, 0x98), // 5 пурпурный
+    Color::rgb(0x3A, 0x96, 0xDD), // 6 голубой
+    Color::rgb(0xCC, 0xCC, 0xCC), // 7 белый
+    Color::rgb(0x76, 0x76, 0x76), // 8 яркий чёрный (серый)
+    Color::rgb(0xE7, 0x48, 0x56), // 9 яркий красный
+    Color::rgb(0x16, 0xC6, 0x0C), // 10 яркий зелёный
+    Color::rgb(0xF9, 0xF1, 0xA5), // 11 яркий жёлтый
+    Color::rgb(0x3B, 0x78, 0xFF), // 12 яркий синий
+    Color::rgb(0xB4, 0x00, 0x9E), // 13 яркий пурпурный
+    Color::rgb(0x61, 0xD6, 0xD6), // 14 яркий голубой
+    Color::rgb(0xF2, 0xF2, 0xF2), // 15 яркий белый
 ];
+
+/// Фон терминала (Campbell).
+pub const TERM_BG: Color = PALETTE[0];
+/// Текст терминала по умолчанию (Campbell).
+pub const TERM_FG: Color = PALETTE[7];
 
 /// Цвет из 256-цветной палитры xterm по номеру.
 ///
@@ -388,7 +395,31 @@ pub struct TextGrid {
     cursor_enabled: bool,
     /// Что изменилось с прошлого [`TextGrid::take_damage`].
     damage: Rect,
+    /// Строки, ушедшие за верхний край (терминал T5): колесо и Shift+PgUp
+    /// показывают их снова. Старые — в начале.
+    scrollback: VecDeque<Line>,
+    /// Сколько строк ушло за верх за всё время. Вместе с номером строки на
+    /// экране даёт сквозной номер строки, который не меняется, пока она
+    /// едет вверх, — по нему держится выделение.
+    scrolled: u64,
+    /// На сколько строк вид поднят над живым экраном; ноль — смотрим на
+    /// живой экран и рисуем вывод сразу.
+    view: u32,
+    /// Выделение мышью: откуда начали и докуда дотянули — сквозная строка и
+    /// столбец.
+    selection: Option<((u64, u32), (u64, u32))>,
 }
+
+/// Строка прокрутки: знаки и цвета без пробелов в конце.
+struct Line {
+    cells: Vec<char>,
+    attrs: Vec<Attr>,
+}
+
+/// Сколько строк помнит прокрутка. Строки хранятся без хвостовых пробелов, и
+/// обычный вывод — это десяток-другой знаков на строку: пять тысяч строк
+/// обходятся в сотни килобайт, а не в мегабайты полной ширины окна.
+pub const SCROLLBACK: usize = 5000;
 
 /// Шаг табуляции в символах.
 const TAB_STOP: u32 = 8;
@@ -431,6 +462,10 @@ impl TextGrid {
             cursor_drawn: false,
             cursor_enabled: false,
             damage: Rect::EMPTY,
+            scrollback: VecDeque::new(),
+            scrolled: 0,
+            view: 0,
+            selection: None,
         })
     }
 
@@ -464,16 +499,211 @@ impl TextGrid {
     pub fn recolor(&mut self, surface: &mut Surface, fg: Color, bg: Color) {
         self.fg = fg;
         self.bg = bg;
+        self.repaint(surface);
+    }
+
+    /// Нарисовать всё видимое заново: живой экран или поднятый вид, с
+    /// выделением, и курсор, если смотрим на живой экран.
+    fn repaint(&mut self, surface: &mut Surface) {
         let area = self.area();
-        surface.fill(area, bg);
+        surface.fill(area, self.bg);
         self.cursor_drawn = false;
-        for row in 0..self.rows {
+        self.repaint_rows(surface, 0, self.rows);
+        self.mark(area);
+        if self.view == 0 && self.cursor_enabled {
+            self.draw_cursor(surface);
+        }
+    }
+
+    /// Перерисовать строки вида `from..to` (номера строк на экране).
+    fn repaint_rows(&mut self, surface: &mut Surface, from: u32, to: u32) {
+        for row in from..to.min(self.rows) {
+            let line = self.line_of_row(row);
             for col in 0..self.cols {
-                let ch = self.cells[(row * self.cols + col) as usize];
-                self.draw_cell(surface, col, row, ch);
+                let (ch, attr) = self.cell_at(line, col);
+                let selected = self.is_selected(line, col);
+                self.paint_cell(surface, col, row, ch, attr, selected);
             }
         }
-        self.mark(area);
+    }
+
+    /// Сквозной номер строки, которая видна в строке экрана `row`.
+    fn line_of_row(&self, row: u32) -> u64 {
+        (self.scrolled + u64::from(row)).saturating_sub(u64::from(self.view))
+    }
+
+    /// Знак и цвет по сквозному номеру строки — с экрана или из прокрутки.
+    fn cell_at(&self, line: u64, col: u32) -> (char, Attr) {
+        if line >= self.scrolled {
+            let row = (line - self.scrolled) as u32;
+            if row < self.rows && col < self.cols {
+                let index = (row * self.cols + col) as usize;
+                return (self.cells[index], self.attrs[index]);
+            }
+            return (' ', Attr::DEFAULT);
+        }
+        let first = self.scrolled - self.scrollback.len() as u64;
+        let Some(stored) = line.checked_sub(first).and_then(|index| self.scrollback.get(index as usize)) else {
+            return (' ', Attr::DEFAULT);
+        };
+        match (stored.cells.get(col as usize), stored.attrs.get(col as usize)) {
+            (Some(&ch), Some(&attr)) => (ch, attr),
+            _ => (' ', Attr::DEFAULT),
+        }
+    }
+
+    fn is_selected(&self, line: u64, col: u32) -> bool {
+        let Some((from, to)) = self.selection_bounds() else {
+            return false;
+        };
+        (line, col) >= from && (line, col) < to
+    }
+
+    /// Выделение по порядку: начало включительно, конец — нет.
+    fn selection_bounds(&self) -> Option<((u64, u32), (u64, u32))> {
+        let (anchor, head) = self.selection?;
+        let (from, to) = if anchor <= head { (anchor, head) } else { (head, anchor) };
+        // Ячейка, на которой стоит мышь, входит в выделение: тянут «до этой
+        // буквы включительно».
+        let to = (to.0, to.1 + 1);
+        (from != to).then_some((from, to))
+    }
+
+    /// Сколько строк помнит прокрутка сейчас.
+    #[must_use]
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// На сколько строк вид поднят над живым экраном.
+    #[must_use]
+    pub const fn view_offset(&self) -> u32 {
+        self.view
+    }
+
+    /// Поднять вид на `delta` строк (отрицательное — опустить). `true`, если
+    /// вид сдвинулся.
+    pub fn scroll_view(&mut self, surface: &mut Surface, delta: i32) -> bool {
+        let limit = self.scrollback.len().min(u32::MAX as usize) as i64;
+        let wanted = (i64::from(self.view) + i64::from(delta)).clamp(0, limit) as u32;
+        if wanted == self.view {
+            return false;
+        }
+        if self.view == 0 {
+            self.erase_cursor(surface);
+        }
+        self.view = wanted;
+        self.repaint(surface);
+        true
+    }
+
+    /// Вернуть вид к живому экрану.
+    pub fn scroll_to_bottom(&mut self, surface: &mut Surface) -> bool {
+        self.scroll_view(surface, -(self.view.min(i32::MAX as u32) as i32))
+    }
+
+    /// Ячейка под точкой поверхности: сквозная строка и столбец. Точка за
+    /// краем сетки прижимается к нему — выделение тянут и за пределы окна.
+    #[must_use]
+    pub fn point_to_cell(&self, x: i32, y: i32) -> (u64, u32) {
+        let col = ((x - self.origin.0 as i32).max(0) as u32 / self.cell.0).min(self.cols - 1);
+        let row = ((y - self.origin.1 as i32).max(0) as u32 / self.cell.1).min(self.rows - 1);
+        (self.line_of_row(row), col)
+    }
+
+    /// Начать или продолжить выделение: `anchor` — где нажали, `head` — где
+    /// мышь сейчас. Перерисовываются только строки, где оно изменилось.
+    pub fn select(&mut self, surface: &mut Surface, anchor: (u64, u32), head: (u64, u32)) {
+        let before = self.selection_bounds();
+        self.selection = Some((anchor, head));
+        let after = self.selection_bounds();
+        self.repaint_lines(surface, before, after);
+    }
+
+    /// Снять выделение. `true`, если оно было.
+    pub fn clear_selection(&mut self, surface: &mut Surface) -> bool {
+        let before = self.selection_bounds();
+        self.selection = None;
+        if before.is_none() {
+            return false;
+        }
+        self.repaint_lines(surface, before, None);
+        true
+    }
+
+    /// Перерисовать строки, которые задевает хоть одно из двух выделений.
+    fn repaint_lines(
+        &mut self,
+        surface: &mut Surface,
+        a: Option<((u64, u32), (u64, u32))>,
+        b: Option<((u64, u32), (u64, u32))>,
+    ) {
+        let lines = [a, b].into_iter().flatten().flat_map(|(from, to)| [from.0, to.0]);
+        let (Some(low), Some(high)) = (lines.clone().min(), lines.max()) else {
+            return;
+        };
+        let top = self.line_of_row(0);
+        let from = low.saturating_sub(top).min(u64::from(self.rows)) as u32;
+        let to = (high + 1).saturating_sub(top).min(u64::from(self.rows)) as u32;
+        let had_cursor = self.cursor_drawn;
+        self.erase_cursor(surface);
+        self.repaint_rows(surface, from, to);
+        if had_cursor {
+            self.draw_cursor(surface);
+        }
+    }
+
+    /// Выделенный текст: строки через `\n`, без пробелов в конце строк.
+    #[must_use]
+    pub fn selected_text(&self) -> String {
+        let mut text = String::new();
+        let Some((from, to)) = self.selection_bounds() else {
+            return text;
+        };
+        for line in from.0..=to.0 {
+            let first = if line == from.0 { from.1 } else { 0 };
+            let last = if line == to.0 { to.1.min(self.cols) } else { self.cols };
+            let start = text.len();
+            for col in first..last {
+                text.push(self.cell_at(line, col).0);
+            }
+            let trimmed = text[start..].trim_end().len();
+            text.truncate(start + trimmed);
+            if line != to.0 {
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    /// Уложить строку экрана в прокрутку, когда она уходит за верх.
+    fn keep_line(&mut self, row: u32) {
+        let start = (row * self.cols) as usize;
+        let cells = &self.cells[start..start + self.cols as usize];
+        let attrs = &self.attrs[start..start + self.cols as usize];
+        let len = (0..cells.len())
+            .rev()
+            .find(|&at| cells[at] != ' ' || attrs[at] != Attr::DEFAULT)
+            .map_or(0, |at| at + 1);
+        let mut line = Line { cells: Vec::new(), attrs: Vec::new() };
+        // Памяти не хватило — строка просто не запоминается: прокрутка —
+        // удобство, и ронять из-за неё вывод нельзя.
+        if line.cells.try_reserve_exact(len).is_err() || line.attrs.try_reserve_exact(len).is_err() {
+            self.scrollback.clear();
+            self.scrolled += 1;
+            return;
+        }
+        line.cells.extend_from_slice(&cells[..len]);
+        line.attrs.extend_from_slice(&attrs[..len]);
+        if self.scrollback.len() >= SCROLLBACK {
+            self.scrollback.pop_front();
+        }
+        if self.scrollback.try_reserve(1).is_ok() {
+            self.scrollback.push_back(line);
+        } else {
+            self.scrollback.clear();
+        }
+        self.scrolled += 1;
     }
 
     /// Забрать накопленную область изменений и начать копить заново.
@@ -527,14 +757,18 @@ impl TextGrid {
         }
         attrs.resize(len, Attr::DEFAULT);
 
-        // Строки переносятся с начала, а не с конца: терминал печатает сверху
-        // вниз, и при уменьшении окна человек скорее ждёт увидеть начало вывода,
-        // чем его хвост. Прокрутка к последней строке — отдельное решение,
-        // которого у этого окна пока нет.
+        // Строки переносятся с начала: терминал печатает сверху вниз. Если
+        // строка курсора в новую высоту не влезает, верхние строки уходят в
+        // прокрутку (терминал T5) — так строка, где набирают, остаётся на
+        // виду, а ушедшее можно поднять колесом.
+        let shift = (self.row + 1).saturating_sub(rows);
+        for row in 0..shift {
+            self.keep_line(row);
+        }
         let keep_cols = cols.min(self.cols) as usize;
-        let keep_rows = rows.min(self.rows) as usize;
+        let keep_rows = rows.min(self.rows - shift) as usize;
         for row in 0..keep_rows {
-            let from = row * self.cols as usize;
+            let from = (row + shift as usize) * self.cols as usize;
             let to = row * cols as usize;
             cells[to..to + keep_cols].copy_from_slice(&self.cells[from..from + keep_cols]);
             attrs[to..to + keep_cols].copy_from_slice(&self.attrs[from..from + keep_cols]);
@@ -546,7 +780,9 @@ impl TextGrid {
         self.cells = cells;
         self.attrs = attrs;
         self.col = self.col.min(cols - 1);
-        self.row = self.row.min(rows - 1);
+        self.row = (self.row - shift).min(rows - 1);
+        self.view = 0;
+        self.selection = None;
         // Курсор нарисован на прежней поверхности, которой больше нет.
         self.cursor_drawn = false;
 
@@ -570,6 +806,8 @@ impl TextGrid {
         self.col = 0;
         self.row = 0;
         self.cursor_drawn = false;
+        self.view = 0;
+        self.selection = None;
         let area = self.area();
         surface.fill(area, self.bg);
         self.mark(area);
@@ -728,6 +966,7 @@ impl TextGrid {
     fn draw_cursor(&mut self, surface: &mut Surface) {
         if !self.cursor_enabled
             || self.cursor_drawn
+            || self.view > 0
             || self.col >= self.cols
             || self.row >= self.rows
         {
@@ -761,9 +1000,24 @@ impl TextGrid {
         self.draw_cell(surface, self.col, self.row, ch);
     }
 
+    /// Нарисовать ячейку живого экрана. Пока вид поднят, живой экран не
+    /// виден, и рисовать его некуда: он перерисуется целиком, когда вид
+    /// опустят.
     fn draw_cell(&mut self, surface: &mut Surface, col: u32, row: u32, ch: char) {
+        if self.view > 0 {
+            return;
+        }
+        let attr = self.attrs[(row * self.cols + col) as usize];
+        let selected = self.selection.is_some() && self.is_selected(self.scrolled + u64::from(row), col);
+        self.paint_cell(surface, col, row, ch, attr, selected);
+    }
+
+    /// Нарисовать ячейку в строке экрана `row` знаком и цветом, какие даны;
+    /// выделенная — с обменом текста и фона.
+    fn paint_cell(&mut self, surface: &mut Surface, col: u32, row: u32, ch: char, attr: Attr, selected: bool) {
         let cell = self.cell_rect(col, row);
-        let (fg, bg) = self.colors(self.attrs[(row * self.cols + col) as usize]);
+        let (fg, bg) = self.colors(attr);
+        let (fg, bg) = if selected { (bg, fg) } else { (fg, bg) };
         // Фон заливается всегда, а не только под непробельным знаком: ячейка
         // рисуется поверх прежней, и остаток старого глифа иначе просвечивал бы
         // сквозь новый — сглаженный знак не закрывает собой всю ячейку.
@@ -796,6 +1050,7 @@ impl TextGrid {
     /// Сдвинуть содержимое на строку вверх.
     fn scroll(&mut self, surface: &mut Surface) {
         let cols = self.cols as usize;
+        self.keep_line(0);
         self.cells.copy_within(cols.., 0);
         self.attrs.copy_within(cols.., 0);
         let last = (self.rows as usize - 1) * cols;
@@ -805,12 +1060,27 @@ impl TextGrid {
         // ним значило бы, что теневой буфер описывает не то, что на экране.
         self.attrs[last..].fill(Attr::DEFAULT);
 
-        // Пиксели сдвигаются сдвигом, а не перерисовкой глифов: копирование
-        // внутри обычной памяти на порядок дешевле, чем нарисовать заново
-        // несколько тысяч ячеек.
-        let area = self.area();
-        surface.scroll_up(area, self.cell.1, self.bg);
-        self.mark(area);
+        if self.view > 0 {
+            // Вид поднят: те же строки остаются на месте — он поднимается
+            // вместе с ними, как в Windows Terminal, и вывод не уносит из-под
+            // глаз то, что читают.
+            // Упёрлись в начало прокрутки — самая старая строка ушла, и вид
+            // всё-таки меняется.
+            let limit = self.scrollback.len() as u32;
+            if self.view < limit {
+                self.view += 1;
+            } else {
+                self.view = limit;
+                self.repaint(surface);
+            }
+        } else {
+            // Пиксели сдвигаются сдвигом, а не перерисовкой глифов:
+            // копирование внутри обычной памяти на порядок дешевле, чем
+            // нарисовать заново несколько тысяч ячеек.
+            let area = self.area();
+            surface.scroll_up(area, self.cell.1, self.bg);
+            self.mark(area);
+        }
 
         self.col = 0;
         self.row = self.rows - 1;

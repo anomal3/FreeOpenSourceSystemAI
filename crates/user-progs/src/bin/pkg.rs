@@ -26,11 +26,13 @@
 //! положено, и своя запись о том же самом разошлась бы с манифестом ровно в
 //! той мере, в какой её потом правили бы порознь.
 //!
-//! # Чего здесь нет
+//! # Пакет по имени и зависимости
 //!
-//! Разрешения зависимостей. Манифест их переносит, `install` проверяет, что
-//! названные пакеты уже стоят, и отказывается ставить поверх пустоты — но
-//! **искать** недостающее негде: репозитория нет, потому что нет сети.
+//! `pkg install chromium` — без пути: пакет ищется на носителе `/media` (по
+//! имени из манифеста или по началу имени файла), и недостающие зависимости
+//! (`requires=`) ставятся оттуда же первыми (фаза 71i: Chromium тянет корень
+//! Debian). Путь к файлу по-прежнему годится. Репозитория в сети нет — только
+//! то, что лежит на носителе.
 
 #![no_std]
 #![no_main]
@@ -89,7 +91,7 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
 }
 
 fn usage() -> i64 {
-    println("  usage: pkg install <file.fpk>");
+    println("  usage: pkg install <name | file.fpk>");
     println("         pkg list");
     println("         pkg verify [name]");
     println("         pkg remove <name>");
@@ -97,6 +99,125 @@ fn usage() -> i64 {
 }
 
 // --- установка --------------------------------------------------------------
+
+/// Где искать пакет, названный по имени.
+const MEDIA: &str = "/media";
+
+/// Сколько уровней зависимостей разбирать — от петли в манифестах.
+const MAX_DEPTH: u32 = 4;
+
+/// Поставить пакет: файл по пути или пакет по имени с носителя, вместе с
+/// недостающими зависимостями.
+fn install(argument: &str) -> i64 {
+    install_with_requirements(argument, 0)
+}
+
+fn install_with_requirements(argument: &str, depth: u32) -> i64 {
+    let mut found = Path::new();
+    let path = if argument.contains('/') {
+        argument
+    } else {
+        if !find_on_media(argument, &mut found) {
+            Line::new()
+                .str("pkg: no package '")
+                .str(argument)
+                .str("' on ")
+                .str(MEDIA)
+                .end();
+            return 1;
+        }
+        found.as_str()
+    };
+    if depth < MAX_DEPTH {
+        let mut names = [[0u8; 64]; 8];
+        let mut lengths = [0usize; 8];
+        let count = requirements(path, &mut names, &mut lengths);
+        for index in 0..count {
+            let Ok(required) = core::str::from_utf8(&names[index][..lengths[index]]) else {
+                continue;
+            };
+            if is_installed(required) {
+                continue;
+            }
+            Line::new().str("pkg: ").str(required).str(" is needed first; installing it").end();
+            let code = install_with_requirements(required, depth + 1);
+            if code != 0 {
+                return code;
+            }
+        }
+    }
+    install_file(path)
+}
+
+/// Имена зависимостей пакета в файле `path` (не больше восьми).
+fn requirements(path: &str, names: &mut [[u8; 64]; 8], lengths: &mut [usize; 8]) -> usize {
+    let fd = open(path);
+    if fd < 0 {
+        return 0;
+    }
+    let mut count = 0;
+    if let Ok(header) = read_header(fd) {
+        // SAFETY: программа однопоточна; буфер манифеста занят только до
+        // конца этой функции.
+        let buffer = unsafe { &mut *core::ptr::addr_of_mut!(MANIFEST) };
+        if let Ok(manifest) = read_manifest(fd, &header, buffer) {
+            for required in manifest.requires().take(8) {
+                if required.len() <= 64 {
+                    names[count][..required.len()].copy_from_slice(required.as_bytes());
+                    lengths[count] = required.len();
+                    count += 1;
+                }
+            }
+        }
+    }
+    close(fd);
+    count
+}
+
+/// Найти на носителе пакет по имени: имя из манифеста или начало имени
+/// файла до версии (`linuxweb` у `linuxweb-150.fpk`).
+fn find_on_media(name: &str, out: &mut Path) -> bool {
+    let dir = open(MEDIA);
+    if dir < 0 {
+        return false;
+    }
+    let mut entry = Dirent::default();
+    let mut found = false;
+    while !found && readdir(dir, &mut entry) {
+        let Some(file) = entry.name() else { continue };
+        let Some(stem) = file.strip_suffix(".fpk") else { continue };
+        let mut path = Path::new();
+        if !path.push(MEDIA) || !path.join(file) {
+            continue;
+        }
+        let by_file = stem.rsplit_once('-').map_or(stem, |(base, _)| base) == name || stem == name;
+        let by_manifest = by_file || manifest_name_is(path.as_str(), name);
+        if by_manifest {
+            *out = path;
+            found = true;
+        }
+    }
+    close(dir);
+    found
+}
+
+/// Называет ли манифест пакета в файле `path` его именем `name`.
+fn manifest_name_is(path: &str, name: &str) -> bool {
+    let fd = open(path);
+    if fd < 0 {
+        return false;
+    }
+    let mut matches = false;
+    if let Ok(header) = read_header(fd) {
+        // SAFETY: см. [`requirements`].
+        let buffer = unsafe { &mut *core::ptr::addr_of_mut!(MANIFEST) };
+        if let Ok(manifest) = read_manifest(fd, &header, buffer) {
+            matches = matches!(manifest.name(), Ok(found) if found == name);
+        }
+    }
+    close(fd);
+    matches
+}
 
 /// Поставить пакет из файла.
 ///
@@ -107,7 +228,7 @@ fn usage() -> i64 {
 /// транзакция, и лучше, чем тишина; настоящая транзакция потребовала бы
 /// переименования каталога целиком, а `rename` на непустом каталоге эта ФС не
 /// умеет.
-fn install(path: &str) -> i64 {
+fn install_file(path: &str) -> i64 {
     let fd = open(path);
     if fd < 0 {
         Line::new()

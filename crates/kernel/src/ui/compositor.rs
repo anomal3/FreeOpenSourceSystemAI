@@ -570,6 +570,12 @@ impl Compositor {
         }
     }
 
+    /// Снять захват указателя целиком: окно программы отдало кнопку столу
+    /// (`ui::begin_move`, фаза 71i), отпускание ему уже не обещано.
+    pub fn drop_capture(&mut self) {
+        self.captured = None;
+    }
+
     /// Кнопку `button` отпустили. Ответ — окно, которому об этом сказать; захват
     /// кончается, когда отпущены все кнопки.
     pub fn release_capture(&mut self, button: u32) -> Option<App> {
@@ -1032,6 +1038,15 @@ impl Compositor {
     /// Помечается объединение сетки **до** и **после**: удалённый файл
     /// освобождает ячейку, которую иначе никто не стёр бы, и она осталась бы на
     /// экране до первой чужой перерисовки.
+    /// Поставили или сняли пакет со значком — перечитать значки.
+    pub fn reload_icons_if_packages_changed(&mut self) {
+        if self.icons.packages_changed() {
+            self.reload_icons();
+            let (total, entries) = self.icons.counts();
+            crate::kprintln!("  desktop     : packages changed, {total} icons ({entries} from the desktop folder)");
+        }
+    }
+
     pub fn reload_icons(&mut self) {
         self.invalidate_under();
         let before = self.icons.bounds();

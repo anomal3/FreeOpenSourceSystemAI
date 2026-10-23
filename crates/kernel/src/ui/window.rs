@@ -319,6 +319,15 @@ pub struct Window {
     /// Окну нужны коды клавиш, а не символы (окна сервера Wayland, фаза 71i):
     /// каждое нажатие и отпускание — [`super::WIN_RAWKEY`] с кодом evdev.
     pub raw_keys: bool,
+    /// Без заголовка и рамки стола: рамку рисует сама программа (окна сервера
+    /// Wayland — Chromium рисует вкладки, «свернуть», «развернуть» и
+    /// «закрыть» сам, фаза 71i). В отличие от всплывающего, у такого окна
+    /// есть кнопка на панели и фокус; двигают и растягивают его по просьбе
+    /// программы (`ui::begin_move`, `ui::begin_resize`).
+    pub frameless: bool,
+    /// Где в текстовом окне нажали левую кнопку — начало выделения мышью
+    /// (терминал T5): сквозная строка и столбец сетки.
+    select_from: Option<(u64, u32)>,
 }
 
 /// Наименьший размер окна в пикселях.
@@ -344,12 +353,15 @@ impl Window {
     #[must_use]
     pub fn text(app: App, rect: Rect, scale: u32) -> Option<Self> {
         let ctx = Ctx::scaled(scale);
-        let back = theme::window_bg();
-        let surface = Surface::new(rect.w, rect.h, back)?;
+        // Терминал — почти чёрный при любой теме, как у терминалов Linux и
+        // Windows Terminal (T5); заливка окна остаётся под заголовком.
+        let back = mini_ui::text::TERM_BG;
+        let mut surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
+        surface.fill(content_area(&surface, Window::title_height(scale)), back);
         let grid = TextGrid::new(
             content_area(&surface, Window::title_height(scale)).shrink(ctx.px(4)),
             ctx.face(Role::Mono),
-            ctx.palette.ink2,
+            mini_ui::text::TERM_FG,
             back,
         )?;
         let mut window = Self::wrap(app, rect, surface, Content::Text(grid), scale, own(app.caption())?);
@@ -426,7 +438,7 @@ impl Window {
     /// Высота полосы заголовка **этого** окна: у всплывающего её нет.
     #[must_use]
     pub fn bar(&self) -> u32 {
-        if self.popup { 0 } else { Self::title_height(self.scale) }
+        if self.popup || self.frameless { 0 } else { Self::title_height(self.scale) }
     }
 
     fn wrap(
@@ -453,6 +465,8 @@ impl Window {
             anchor: (0, 0),
             damage: Rect::EMPTY,
             raw_keys: false,
+            frameless: false,
+            select_from: None,
         }
     }
 
@@ -657,9 +671,9 @@ impl Window {
         if !self.rect.contains(x, y) {
             return None;
         }
-        // У всплывающего окна нет ни заголовка, ни кнопок, ни уголка: всё
-        // окно — содержимое.
-        if self.popup {
+        // У всплывающего окна и окна без рамки нет ни заголовка, ни кнопок,
+        // ни уголка: всё окно — содержимое.
+        if self.popup || self.frameless {
             return Some(Hit::Body);
         }
         let local = (x - self.rect.x, y - self.rect.y);
@@ -691,7 +705,9 @@ impl Window {
     /// Уголок размера: три точки в правом нижнем углу — у окна, которому размер
     /// менять можно.
     fn draw_grip(&mut self) {
-        if !self.resizable() {
+        // Окно без рамки растягивают по просьбе программы, а не за уголок —
+        // точки легли бы поверх её рисунка.
+        if !self.resizable() || self.frameless {
             return;
         }
         let ctx = self.ctx();
@@ -719,9 +735,9 @@ impl Window {
     /// заголовок и содержимое отличаются на две единицы яркости, и граница
     /// между ними не читается вовсе.
     pub fn draw_decorations(&mut self, focused: bool) {
-        // Заголовка и обводки у всплывающего окна нет: меню и список рисуют
-        // свою рамку сами.
-        if self.popup {
+        // Заголовка и обводки у всплывающего окна и окна без рамки нет: меню,
+        // список, Chromium рисуют свою рамку сами.
+        if self.popup || self.frameless {
             return;
         }
         let ctx = self.ctx();
@@ -855,18 +871,17 @@ impl Window {
     /// содержимое. Разделение не косметическое: фокус живёт у композитора, и
     /// окно, взявшееся угадывать его само, ошибётся на первом же переключении.
     pub fn restyle(&mut self) {
-        let ctx = self.ctx();
-        let back = theme::window_bg();
         let bar = self.bar();
         match &mut self.content {
             Content::Text(grid) => {
                 // Заливается вся область содержимого, а не только сетка: в
                 // высоту окна редко помещается целое число строк, и остаток
                 // внизу — несколько точек, а то и полтора десятка — иначе
-                // остаётся полосой прежней темы под самой рамкой.
+                // остаётся полосой прежней темы под самой рамкой. Цвета
+                // терминала от темы не зависят (T5).
                 let area = content_area(&self.surface, bar);
-                self.surface.fill(area, back);
-                grid.recolor(&mut self.surface, ctx.palette.ink2, back);
+                self.surface.fill(area, mini_ui::text::TERM_BG);
+                grid.recolor(&mut self.surface, mini_ui::text::TERM_FG, mini_ui::text::TERM_BG);
                 grid.take_damage();
                 self.damage = self.damage.union(&area);
             }
@@ -1127,12 +1142,96 @@ impl Window {
     pub fn wheel(&mut self, clicks: i32) -> bool {
         let moved = match &mut self.content {
             Content::Settings(view) => view.wheel(clicks),
-            Content::Text(_) | Content::Dialog(_) | Content::Program(_) => false,
+            // Терминал: три строки на щелчок колеса, как у Windows Terminal.
+            Content::Text(_) => return self.term_scroll(clicks * 3),
+            Content::Dialog(_) | Content::Program(_) => false,
         };
         if moved {
             self.redraw_content();
         }
         moved
+    }
+
+    /// Поднять вид терминала на `rows` строк прокрутки (отрицательное —
+    /// опустить). `true`, если вид сдвинулся.
+    pub fn term_scroll(&mut self, rows: i32) -> bool {
+        let Content::Text(grid) = &mut self.content else {
+            return false;
+        };
+        let moved = grid.scroll_view(&mut self.surface, rows);
+        self.damage = self.damage.union(&grid.take_damage());
+        moved
+    }
+
+    /// Вернуть вид терминала к живому экрану. `true`, если он был поднят.
+    pub fn term_scroll_to_bottom(&mut self) -> bool {
+        let Content::Text(grid) = &mut self.content else {
+            return false;
+        };
+        let moved = grid.scroll_to_bottom(&mut self.surface);
+        self.damage = self.damage.union(&grid.take_damage());
+        moved
+    }
+
+    /// Вид терминала: на сколько строк поднят и сколько строк в прокрутке.
+    #[must_use]
+    pub fn term_view(&self) -> (u32, usize) {
+        match &self.content {
+            Content::Text(grid) => (grid.view_offset(), grid.scrollback_len()),
+            _ => (0, 0),
+        }
+    }
+
+    /// Нажатие левой кнопки в текстовом окне — начало выделения; прежнее
+    /// выделение снимается. Точка — экранная.
+    pub fn term_select_start(&mut self, x: i32, y: i32) -> bool {
+        let Content::Text(grid) = &mut self.content else {
+            return false;
+        };
+        let cell = grid.point_to_cell(x - self.rect.x, y - self.rect.y);
+        grid.clear_selection(&mut self.surface);
+        self.select_from = Some(cell);
+        self.damage = self.damage.union(&grid.take_damage());
+        true
+    }
+
+    /// Мышь с нажатой кнопкой ушла в точку `x, y`: выделение тянется за ней.
+    pub fn term_select_to(&mut self, x: i32, y: i32) -> bool {
+        let (Content::Text(grid), Some(anchor)) = (&mut self.content, self.select_from) else {
+            return false;
+        };
+        let head = grid.point_to_cell(x - self.rect.x, y - self.rect.y);
+        grid.select(&mut self.surface, anchor, head);
+        self.damage = self.damage.union(&grid.take_damage());
+        true
+    }
+
+    /// Кнопку отпустили: выделение закончено. Возвращает выделенный текст.
+    pub fn term_select_end(&mut self) -> Option<String> {
+        self.select_from.take()?;
+        let Content::Text(grid) = &self.content else {
+            return None;
+        };
+        Some(grid.selected_text()).filter(|text| !text.is_empty())
+    }
+
+    /// Выделенный в терминале текст (пустой — выделения нет).
+    #[must_use]
+    pub fn term_selection(&self) -> String {
+        match &self.content {
+            Content::Text(grid) => grid.selected_text(),
+            _ => String::new(),
+        }
+    }
+
+    /// Снять выделение в терминале. `true`, если оно было.
+    pub fn term_clear_selection(&mut self) -> bool {
+        let Content::Text(grid) = &mut self.content else {
+            return false;
+        };
+        let had = grid.clear_selection(&mut self.surface);
+        self.damage = self.damage.union(&grid.take_damage());
+        had
     }
 
     /// Чего «Параметры» просят у стола (фаза 69b).
@@ -1207,6 +1306,7 @@ impl Window {
         let inner = content_area(&surface, Self::title_height(self.scale)).shrink(self.ctx().px(4));
         match &mut self.content {
             Content::Text(grid) => {
+                surface.fill(content_area(&surface, Self::title_height(self.scale)), mini_ui::text::TERM_BG);
                 if !grid.rebind(&mut surface, inner) {
                     return false;
                 }
@@ -1233,9 +1333,15 @@ impl Window {
         self.draw_decorations(false);
         self.damage = Rect::new(0, 0, w, h);
         if self.is_program() {
-            self.ask_resize(w, h.saturating_sub(Self::title_height(self.scale)));
+            self.ask_resize(w, h.saturating_sub(self.bar()));
         }
         true
+    }
+
+    /// Развёрнуто ли окно на всю рабочую область.
+    #[must_use]
+    pub const fn is_maximized(&self) -> bool {
+        self.restore.is_some()
     }
 
     /// Развернуть окно на всю рабочую область — или вернуть прежний размер.
@@ -1291,6 +1397,18 @@ impl Window {
     /// — сменилось ли имя; то же имя второй раз не стоит кадра.
     pub fn set_title(&mut self, title: &str, focused: bool) -> bool {
         if !self.is_program() || self.title == title {
+            return false;
+        }
+        self.title.clear();
+        self.title.push_str(title);
+        self.draw_decorations(focused);
+        true
+    }
+
+    /// Сменить подпись любого окна (терминал T4: «Терминал — выполняется
+    /// …»). В отличие от [`Self::set_title`], и окну ядра.
+    pub fn set_caption(&mut self, title: &str, focused: bool) -> bool {
+        if self.title == title {
             return false;
         }
         self.title.clear();

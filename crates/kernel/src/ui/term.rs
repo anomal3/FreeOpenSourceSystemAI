@@ -56,6 +56,13 @@ enum State {
     Escape,
     /// Получен `ESC [`, копим параметры до финального байта.
     Csi,
+    /// Получен `ESC ]` — команда операционной системы (OSC) до `BEL` или
+    /// `ESC \`. Терминал T4: метки оболочки `OSC 133` (начало приглашения,
+    /// начало ввода — как shell integration у Windows Terminal); на экран
+    /// ничего не выводят и глотаются целиком.
+    Osc,
+    /// `ESC` внутри OSC: если следом `\` — конец.
+    OscEscape,
 }
 
 struct Parser {
@@ -143,6 +150,7 @@ pub fn feed(mut window: Option<&mut Window>, text: &str) {
             }
             State::Escape => match byte {
                 b'[' => parser.state = State::Csi,
+                b']' => parser.state = State::Osc,
                 // `ESC O …` — последовательности VT100 в «прикладном» режиме
                 // клавиатуры. На выводе они не значат ничего, но пришедшую
                 // печатать нельзя: это команда, а не текст.
@@ -151,6 +159,18 @@ pub fn feed(mut window: Option<&mut Window>, text: &str) {
                 // двух байтов; ни одна из них здесь не выполняется.
                 _ => parser.reset(),
             },
+            State::Osc => match byte {
+                0x07 => parser.reset(),
+                0x1B => parser.state = State::OscEscape,
+                _ => {}
+            },
+            State::OscEscape => {
+                if byte == b'\\' {
+                    parser.reset();
+                } else {
+                    parser.state = State::Osc;
+                }
+            }
             State::Csi => {
                 match byte {
                     b'0'..=b'9' => {

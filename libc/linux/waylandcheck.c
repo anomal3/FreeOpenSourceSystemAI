@@ -3,8 +3,9 @@
  * Говорит на проводе сам — так проверяется сервер, а не библиотека клиента:
  * реестр и привязка глобальных объектов, форматы `wl_shm`, окно
  * `xdg_toplevel` с `configure`, буфер из `memfd` (дескриптор через
- * `SCM_RIGHTS`), `wl_buffer.release` и `wl_callback.done` кадра, вход
- * указателя в окно, раскладка XKB дескриптором и клавиша `a`. Окно — градиент 320x200 с рамкой.
+ * `SCM_RIGHTS`), `wl_callback.done` кадра, `wl_buffer.release` прежнего
+ * буфера, когда показан следующий, вход указателя в окно, раскладка XKB
+ * дескриптором и клавиша `a`. Окно — градиент 320x200 с рамкой.
  *
  * Едет в пакете `debian-12.fpk` как `/usr/libexec/fossai/waylandcheck`.
  * Строки — `waylandcheck: ok <что>` или `waylandcheck: FAILED <что>`; итог —
@@ -78,7 +79,7 @@ static void end(void) { end_fd(-1); }
 
 enum {
     ID_DISPLAY = 1, ID_REGISTRY, ID_SYNC, ID_COMPOSITOR, ID_SHM, ID_WM, ID_SEAT,
-    ID_SURFACE, ID_XDG, ID_TOPLEVEL, ID_POOL, ID_BUFFER, ID_FRAME, ID_POINTER, ID_SYNC2, ID_KEYBOARD
+    ID_SURFACE, ID_XDG, ID_TOPLEVEL, ID_POOL, ID_BUFFER, ID_FRAME, ID_POINTER, ID_SYNC2, ID_KEYBOARD, ID_BUFFER2
 };
 
 static uint32_t global_compositor, global_shm, global_wm, global_seat;
@@ -253,8 +254,10 @@ int main(void) {
 
     const int width = 320, height = 200, stride = width * 4;
     int fd = memfd_create("waylandcheck", MFD_CLOEXEC);
-    int sized = fd >= 0 && ftruncate(fd, stride * height) == 0;
-    uint32_t *pixels = sized ? mmap(NULL, (size_t)stride * height, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+    /* Два буфера в одном пуле: сервер держит показанный, пока его не сменит
+     * следующий, и только тогда возвращает (`release`). */
+    int sized = fd >= 0 && ftruncate(fd, 2 * stride * height) == 0;
+    uint32_t *pixels = sized ? mmap(NULL, (size_t)2 * stride * height, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
     if (pixels != MAP_FAILED) {
         for (int y = 0; y < height; y++)
             for (int x = 0; x < width; x++) {
@@ -262,10 +265,11 @@ int main(void) {
                 uint32_t r = (uint32_t)(x * 255 / width), g = (uint32_t)(y * 255 / height), b = 160;
                 pixels[y * width + x] = border ? 0xffffffffu : (0xffu << 24) | (r << 16) | (g << 8) | b;
             }
+        memcpy(pixels + width * height, pixels, (size_t)stride * height);
     }
     begin(ID_SHM, 0); /* create_pool */
     put(ID_POOL);
-    put((uint32_t)(stride * height));
+    put((uint32_t)(2 * stride * height));
     end_fd(fd);
     begin(ID_POOL, 0); /* create_buffer */
     put(ID_BUFFER);
@@ -291,9 +295,26 @@ int main(void) {
     end();
     begin(ID_SURFACE, 6); /* commit */
     end();
-    wait_for(&released, 5000);
     wait_for(&frame_done, 5000);
-    check(pixels != MAP_FAILED && released && frame_done, "a memfd buffer is shown, released and the frame is done");
+    check(pixels != MAP_FAILED && frame_done, "a memfd buffer is shown and the frame is done");
+
+    begin(ID_POOL, 0); /* create_buffer: вторая половина пула */
+    put(ID_BUFFER2);
+    put((uint32_t)(stride * height));
+    put(width);
+    put(height);
+    put(stride);
+    put(0);
+    end();
+    begin(ID_SURFACE, 1);
+    put(ID_BUFFER2);
+    put(0);
+    put(0);
+    end();
+    begin(ID_SURFACE, 6);
+    end();
+    wait_for(&released, 5000);
+    check(released, "the first buffer is released once the second is shown");
 
     printf("waylandcheck: waiting for the pointer\n");
     fflush(stdout);

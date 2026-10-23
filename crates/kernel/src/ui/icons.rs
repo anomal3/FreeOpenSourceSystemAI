@@ -148,9 +148,48 @@ pub struct Icons {
     /// Ширина экрана и верх сетки — на телефоне (см. [`Icons::set_span`]).
     width: u32,
     top: u32,
+    /// Имена записей реестра пакетов при последнем перечитывании: сменились —
+    /// значки пакетов пора перечитать (см. [`Icons::packages_changed`]).
+    packages: String,
+}
+
+/// Имена и длины записей реестра пакетов одной строкой — дешёвая подпись
+/// «что установлено». Длина — потому что `pkg` заводит запись раньше, чем
+/// дописывает её: по одному имени стол прочёл бы её пустой и больше не
+/// перечитал.
+fn package_signature() -> String {
+    let mut out = String::new();
+    if let Some(Ok(entries)) = crate::fs::list(super::panel::REGISTRY) {
+        for entry in entries {
+            out.push_str(&entry.name);
+            out.push_str(&alloc::format!(":{}/", entry.size));
+        }
+    }
+    out
+}
+
+/// Картинка значка пакета по имени из манифеста.
+fn icon_named(name: &str) -> Icon {
+    match name {
+        "network" => Icon::Network,
+        "terminal" => Icon::Terminal,
+        "folder" => Icon::Folder,
+        "chart" => Icon::Chart,
+        "display" => Icon::Display,
+        "settings" => Icon::Settings,
+        _ => Icon::Package,
+    }
 }
 
 impl Icons {
+    /// Поставили или сняли пакет с тех пор, как значки читались (фаза 71i:
+    /// значок Chromium появляется после `pkg install` сам). Спрашивает
+    /// [`crate::ui::tick`] раз в секунду.
+    #[must_use]
+    pub fn packages_changed(&self) -> bool {
+        package_signature() != self.packages
+    }
+
     #[must_use]
     pub fn new(scale: u32) -> Self {
         let mut icons = Self {
@@ -162,6 +201,7 @@ impl Icons {
             face_at: Rect::EMPTY,
             width: 0,
             top: 0,
+            packages: String::new(),
         };
         icons.items = system_items();
         icons
@@ -225,6 +265,16 @@ impl Icons {
 
         self.items = system_items();
         self.selected = None;
+        // Программы установленных пакетов, попросившие значок (`desktop=yes`
+        // в манифесте, фаза 71i): после системных, до файлов стола.
+        self.packages = package_signature();
+        for launcher in super::panel::list_packages().into_iter().filter(|launcher| launcher.desktop) {
+            self.items.push(Item {
+                kind: Kind::Program(icon_named(&launcher.icon)),
+                label: launcher.caption,
+                path: Some(launcher.start),
+            });
+        }
 
         let base = super::context::desktop_dir();
         let Some(Ok(entries)) = crate::fs::list(&base) else {

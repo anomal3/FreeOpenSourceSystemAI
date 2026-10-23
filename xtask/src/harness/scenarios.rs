@@ -14,6 +14,12 @@
 //! время прогона; здесь опечатку в имени клавиши ловит компилятор.
 
 use super::aim::{self, Aim};
+
+/// Приглашение оболочки ядра готово к вводу: метка начала ввода `OSC 133;B`
+/// (терминал T4, shell integration как у Windows Terminal). Текст
+/// приглашения — `пользователь@fossai:каталог$` — меняется с каталогом, метка
+/// — нет.
+pub const PROMPT: &str = "\x1b]133;B\x07";
 use crate::arch::Arch;
 use crate::qemu::DiskBus;
 
@@ -760,7 +766,7 @@ pub fn forgotten_on_state(name: &str) -> &'static [&'static str] {
 /// строка самой программы о том, на каких процессорах она побывала.
 const SMP_STEPS: &[Step] = &[
     Step::Await("smp         : 4 of 4 processors online", BOOT),
-    Step::Await("freeos> ", BOOT),
+    Step::Await(PROMPT, BOOT),
     Step::Line("run -b /bin/spin 6000"),
     Step::Capture("started as #", 15_000),
     Step::Line("run -b /bin/spin 6000"),
@@ -808,7 +814,7 @@ const LAG_STEPS: &[Step] = &[
             Step::Await("---- root filesystem", BOOT),
             Step::Await("---- display", BOOT),
             Step::Await("---- scheduler", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Простой: два снимка планировщика с паузой между ними. Время
             // холостой задачи (`#0 idle … ms on cpu`) за паузу, делённое на
             // паузу, — доля простоя. Гость, который в простое крутит опрос, под
@@ -916,7 +922,7 @@ pub const ALL: &[Scenario] = &[
             // проходит. Срок шага отвечает на вопрос «не повисло ли», а не
             // «сколько это должно занимать».
             Step::Await("FossAi shell.", BOOT),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             Step::Line("uptime"),
             Step::Await("timer ticks", 10_000),
             Step::Line("mem"),
@@ -977,7 +983,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Ядро перечисляет только поднявшиеся источники. PS/2 на этой машине
             // выключен, значит клавиатура здесь может быть только USB.
             Step::Expect("Input: keyboard"),
@@ -1041,7 +1047,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // xHCI на этой машине нет вовсе, и PS/2 выключён: всё, что ниже,
             // может работать только через OHCI. Без этой строки сценарий
             // проверял бы «ввод работает», а не «работает второй драйвер».
@@ -1102,7 +1108,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // xHCI и OHCI на этой машине нет, PS/2 выключен: всё, что ниже,
             // может работать только через EHCI.
             Step::Expect("xhci        : unavailable"),
@@ -1174,7 +1180,7 @@ pub const ALL: &[Scenario] = &[
         // только вывод INTA. Так выглядит xHCI VirtualBox (`8086:1e31`).
         extra: &["-global", "qemu-xhci.msix=off", "-global", "qemu-xhci.msi=off"],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Expect("xhci        : no MSI-X or MSI; INTx on GSI"),
             Step::Expect("port(s) brought up, 1 keyboard(s), 1 pointer(s)"),
             // PS/2 выключен: нажатия доходят только через xHCI.
@@ -1226,7 +1232,7 @@ pub const ALL: &[Scenario] = &[
             "-device", "usb-mouse,bus=xhci.0,port=3.2,id=hubmouse",
         ],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Третий порт USB 2 у `qemu-xhci` — седьмой порт контроллера: первые
             // четыре — порты USB 3.
             Step::Expect("usb         : root port 7: hub 0409:55aa in slot"),
@@ -1287,7 +1293,7 @@ pub const ALL: &[Scenario] = &[
             "-drive", "if=none,id=stick2,format=raw,readonly=on,file={stick}",
         ],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Expect("is a mass storage device"),
             Step::Expect("131072 sectors of 512 B (64 MiB)"),
             Step::Expect("usb-storage : FAT32 volume 'FREEOSUSB' (MBR, LBA 2048) mounted read-only at /usb"),
@@ -1458,7 +1464,7 @@ pub const ALL: &[Scenario] = &[
             "-device", "usb-tablet,bus=xhci2.0,id=tab2",
         ],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Expect("xhci        : MSI-X vector 0"),
             Step::Expect("xhci        : no MSI-X or MSI; INTx on GSI"),
             Step::Expect("xhci        : 2 controllers brought up"),
@@ -1512,7 +1518,7 @@ pub const ALL: &[Scenario] = &[
             // придуман нами.
             Step::Await("network     : e1000, hardware address", BOOT),
             Step::Absent("no network card attached"),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
 
             // Перепись шины называет карту и её драйвер. Это же проверка новой
             // команды `pci`: строка на стенде обязана совпадать с той, которую
@@ -1585,7 +1591,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Главное утверждение: `wc` считает **чужой** вывод и доходит до
             // конца файла. Не дойти до него — самый вероятный отказ этой фазы:
             // забытый где-нибудь конец канала оставляет `wc` ждать вечно, и
@@ -1631,7 +1637,7 @@ pub const ALL: &[Scenario] = &[
         steps: &[
             Step::Await("display     : 720x1600 set at start", BOOT),
             Step::Await("keyboard    : shown", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Wait(1500),
             Step::Shot("01-home"),
             // Экранная клавиатура печатает в оболочку: быстрая команда `free`,
@@ -1838,6 +1844,143 @@ pub const ALL: &[Scenario] = &[
         ],
     },
     Scenario {
+        name: "terminal",
+        about: "Терминал T1–T5: правка строки с курсором, история (↑, поиск по началу, Ctrl+R, `history`), дополнение по Tab, `cd`/`pwd`, Esc и Ctrl+U, приглашение с меткой OSC 133 и кодом возврата, прокрутка вывода, выделение мышью, копирование и вставка.",
+        target: Target::Live,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "",
+        extra: &[],
+        steps: &[
+            Step::Await(PROMPT, BOOT),
+            // Вставка посреди строки: `echo ac`, ←, `b` — выйдет `abc`.
+            Step::Type("echo ac"),
+            Step::Key("left"),
+            Step::Type("b"),
+            Step::Key("ret"),
+            Step::Await("  abc", 15_000),
+            Step::Await(PROMPT, 15_000),
+            // Home и Delete: `Xecho de` → Home, Delete — `echo de`.
+            Step::Type("Xecho de"),
+            Step::Key("home"),
+            Step::Key("delete"),
+            Step::Key("ret"),
+            Step::Await("  de", 15_000),
+            Step::Await(PROMPT, 15_000),
+            // Слово назад (Ctrl+W) и вставка вырезанного (Ctrl+Y).
+            Step::Type("echo one two"),
+            Step::Key("ctrl-w"),
+            Step::Key("ctrl-w"),
+            Step::Key("ctrl-y"),
+            Step::Key("ret"),
+            Step::Await("  one", 15_000),
+            Step::Await(PROMPT, 15_000),
+            // Esc очищает строку, Ctrl+U — до начала.
+            Step::Type("garbage"),
+            Step::Key("esc"),
+            Step::Type("junk"),
+            Step::Key("ctrl-u"),
+            Step::Type("echo clean"),
+            Step::Key("ret"),
+            Step::Await("  clean", 15_000),
+            Step::Absent("unknown command 'garbage"),
+            Step::Absent("unknown command 'junk"),
+            Step::Await(PROMPT, 15_000),
+            // История: ↑ — последняя команда.
+            Step::Key("up"),
+            Step::Key("ret"),
+            Step::Await("  clean", 15_000),
+            Step::Await(PROMPT, 15_000),
+            // Поиск по началу: `echo a` и ↑ — последняя на `echo a`, то есть
+            // `echo abc`, а не более новая `echo clean`.
+            Step::Type("echo a"),
+            Step::Key("up"),
+            Step::Key("ret"),
+            Step::Await("  abc", 15_000),
+            Step::Await(PROMPT, 15_000),
+            // Ctrl+R: поиск по подстроке.
+            Step::Key("ctrl-r"),
+            Step::Type("de"),
+            Step::Key("ret"),
+            Step::Await("  de", 15_000),
+            Step::Await(PROMPT, 15_000),
+            // Tab: `ech` — это и `echo`, и `/bin/echoc`; дополняется общее
+            // начало `echo`.
+            Step::Type("ech"),
+            Step::Key("tab"),
+            Step::Type(" tabbed"),
+            Step::Key("ret"),
+            Step::Await("  tabbed", 15_000),
+            Step::Await(PROMPT, 15_000),
+            // Каталог: `cd /bin`, `pwd`, путь по Tab относительно него.
+            Step::Line("cd /bin"),
+            Step::Await(PROMPT, 15_000),
+            Step::Line("pwd"),
+            Step::Await("/bin", 15_000),
+            Step::Await(PROMPT, 15_000),
+            Step::Line("history"),
+            Step::Await("echo abc", 15_000),
+            Step::Await(PROMPT, 15_000),
+            Step::Shot("terminal"),
+            // Код возврата (T4): `cat` несуществующего файла кончается
+            // единицей, и приглашение показывает её красным `[1]`.
+            Step::Line("run /bin/cat /nope"),
+            Step::Await("exited with code 1", 15_000),
+            Step::Await("\x1b[91m[1] ", 15_000),
+            Step::Await(PROMPT, 15_000),
+            // Прокрутка (T5): вывод длиннее окна, Shift+PgUp поднимает вид,
+            // клавиша набора возвращает его к живому экрану.
+            Step::Line("dmesg"),
+            Step::Await(PROMPT, 30_000),
+            Step::Key("shift-pgup"),
+            Step::Await("terminal    : view ", 15_000),
+            Step::Shot("terminal-scrolled"),
+            Step::Key("shift-pgdn"),
+            Step::Await("terminal    : view 0 lines back", 15_000),
+            Step::Key("shift-pgup"),
+            Step::Await("terminal    : view ", 15_000),
+            Step::Type("e"),
+            Step::Await("terminal    : view 0 lines back", 15_000),
+            Step::Key("esc"),
+            // Выделение мышью, Ctrl+Shift+C и Ctrl+Shift+V.
+            // Первый щелчок по окну без фокуса только поднимает его. Тянут
+            // от левого края через две строки: хвосты строк пусты, а пробелы
+            // в конце строки выделение не копирует.
+            Step::Aim(Aim::Title("Terminal")),
+            Step::Move(-120, 60),
+            Step::Click,
+            Step::Wait(500),
+            Step::Press,
+            Step::Move(60, 10),
+            Step::Move(60, 10),
+            Step::Release,
+            Step::Await("terminal    : selected ", 15_000),
+            Step::Key("ctrl-shift-c"),
+            Step::Await("terminal    : copied ", 15_000),
+            Step::Key("ctrl-shift-v"),
+            Step::Await("terminal    : pasted ", 15_000),
+            Step::Key("esc"),
+            Step::Line("echo after paste"),
+            Step::Await("  after paste", 15_000),
+            Step::Await(PROMPT, 15_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    Scenario {
         name: "desktop",
         about: "Меню запуска открывает программу, окно двигается и закрывается, фокус возвращается.",
         target: Target::Live,
@@ -1869,7 +2012,7 @@ pub const ALL: &[Scenario] = &[
             // печатает раньше, чем оболочка здоровается. Ожидание приглашения
             // уводит курсор за неё, и всё, что ищет вперёд, её уже не находит.
             Step::AtLeast("desktop     : start menu lists ", 7, BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Стол не печатает ничего сам по себе, поэтому все проверки здесь
             // опираются на строки, которые оконный менеджер пишет в журнал.
             // Иначе фазу мог бы проверить только человек, глядящий на экран.
@@ -1950,8 +2093,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("files: entered '/", 15_000),
             Step::Wait(2_500),
             Step::Shot("03-files-open"),
-            Step::Repeat("ctrl-right", 2),
-            Step::Key("ctrl-down"),
+            Step::Repeat("meta_l-right", 2),
+            Step::Key("meta_l-down"),
             Step::Wait(400),
             Step::Shot("04-moved"),
             // Обойти окна по кругу и убедиться, что оболочка по-прежнему
@@ -1977,12 +2120,12 @@ pub const ALL: &[Scenario] = &[
             Step::Await("after-move", 10_000),
             Step::Key("alt-tab"),
             Step::Await("desktop     : focus 'Files'", 5_000),
-            // Ctrl+W теперь **просьба**, а не приказ: окно закрывает сама
-            // программа, и ядру остаётся снять его за ней. Три строки, а не
+            // Alt+F4 (до терминала T1 — Ctrl+W) теперь **просьба**, а не
+            // приказ: окно закрывает сама программа, и ядру остаётся снять его за ней. Три строки, а не
             // одна, и каждая своя: система попросила, программа согласилась,
             // окно снято. Пропади средняя — и «программа послушалась» стало бы
             // неотличимо от «ядро закрыло окно само».
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("desktop     : close requested of 'Files'", 15_000),
             Step::Await("files: closing on request", 15_000),
             Step::Await("desktop     : closed the window of ", 15_000),
@@ -2053,7 +2196,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("window      : 'Files' at", 30_000),
             Step::Wait(2_000),
             Step::Shot("07-program-ran"),
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("desktop     : close requested of 'Files'", 15_000),
             Step::Await("desktop     : closed the window of ", 15_000),
             Step::Await("desktop     : focus 'Terminal'", 15_000),
@@ -2160,7 +2303,7 @@ pub const ALL: &[Scenario] = &[
         extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
         steps: &[
             Step::AwaitAny("virtio-snd  : at ", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Wait(2_000),
             Step::Line("beep 440 2000"),
             // Устройство возвращает период, когда сыграло его, — значит, две
@@ -2200,7 +2343,7 @@ pub const ALL: &[Scenario] = &[
         steps: &[
             // Строку успеха выдаёт только найденный путь: «… -> pin N».
             Step::AwaitAny(", 48000 Hz 16-bit stereo", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Wait(2_000),
             Step::Line("beep 523 2000"),
             // Кольцо контроллера — меньше пятой доли секунды: две секунды звука
@@ -2237,7 +2380,7 @@ pub const ALL: &[Scenario] = &[
         steps: &[
             Step::AwaitAny("as a keyboard", BOOT),
             Step::AwaitAny("as a mouse", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Wait(2_000),
             // Пока USB подключены, QEMU отдаёт ввод им: выдёргиваются оба, и
             // дальше ввод может прийти только через virtio.
@@ -2284,7 +2427,7 @@ pub const ALL: &[Scenario] = &[
         steps: &[
             Step::AwaitAny("15ad:0405 class 03:00:00 vga display", BOOT),
             Step::AwaitAny("-- vmsvga, working", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Wait(3_000),
             Step::Painted("00-firmware-mode"),
             // «Параметры» → «Экран»: первый пункт — 1024×768, третий — 1280×800.
@@ -2355,7 +2498,7 @@ pub const ALL: &[Scenario] = &[
             // стол заводит экран сам, на устройстве.
             Step::AwaitAny("virtio-gpu  : at ", BOOT),
             Step::AwaitAny("on virtio-gpu", 60_000),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Wait(3_000),
             // Размер, который предложило устройство, — 1280×800 у QEMU, — и
             // стол на нём нарисован: без переноса прямоугольников к хосту
@@ -2474,7 +2617,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Key("f1"),
             Step::Await("desktop     : menu opened", 15_000),
             Step::Key("down"),
@@ -2551,7 +2694,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Мышь — второе устройство на контроллере. Строка ниже доказывает,
             // что перечисление портов дошло до неё, а не остановилось на
             // клавиатуре.
@@ -2830,7 +2973,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Планшет не объявляет boot-протокола вовсе, и единственный способ
             // узнать, что в его отчёте, — прочитать дескриптор. Строка ниже и
             // есть доказательство того, что он прочитан и понят: и то, что
@@ -2907,7 +3050,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // На старте машина знает про два устройства: клавиатуру и мышь.
             Step::Line("usb"),
             Step::Await("  xhci     2 devices", 15_000),
@@ -2980,7 +3123,7 @@ pub const ALL: &[Scenario] = &[
         // оставалась без таймера — то есть без всего, что зависит от времени.
         extra: &["-machine", "pit=off"],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Первый источник обязан отказать: иначе сценарий проверяет не то,
             // ради чего заведён.
             Step::Expect("calibration against the PIT failed"),
@@ -3021,7 +3164,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("ls /bin"),
             Step::Await("hello", 15_000),
             // Первая программа: печатает через системный вызов, спрашивает у
@@ -3094,7 +3237,7 @@ pub const ALL: &[Scenario] = &[
             // **ей**, и разбирать его будет уже оболочка — правильно, но на
             // такт позже. Ожидание убирает лишний источник неопределённости из
             // сценария, который проверяет не это.
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Вторая ломается нарочно. До Phase 12a обращение по нулевому
             // адресу означало панику ядра и остановку машины.
             Step::Line("run /bin/crash"),
@@ -3220,7 +3363,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Сценарий сверяет число занятых кадров между двумя `mem`, а в это
             // время ещё крутится sshd: без сети он трижды не может открыть порт и
             // перезапускается, и каждый его старт и выход двигают счёт. Ждём, пока
@@ -3316,7 +3459,7 @@ pub const ALL: &[Scenario] = &[
         memory: "2G",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
 
             // Счёта свободных кадров целиком здесь нет, и это решение, а не
             // упущение. Сначала он тут стоял — как в сценарии `mmap`: снять
@@ -3437,7 +3580,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Пока это проверка механизма, а не масштаба: файл берётся тот, что
             // и так лежит в образе. Настоящая проверка фазы — файл, который в
             // память не помещается, — стоит отдельно и на установленном диске,
@@ -3519,7 +3662,7 @@ pub const ALL: &[Scenario] = &[
             // x86-64 и PL011 на AArch64.
             Step::Await("serial in   : ", BOOT),
             Step::Raw(b"echo typed-during-boot\n"),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Команда, набранная в глухой промежуток, дошла целиком и
             // исполнилась. Это и есть утверждение: не «счётчик красив», а
             // «система приняла ввод тогда, когда раньше не принимала».
@@ -3641,7 +3784,7 @@ pub const ALL: &[Scenario] = &[
         // пойдёт настоящее железо.
         extra: &["-cpu", "max"],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Ядро обязано сказать, чем именно оно сохраняет состояние: на
             // машине без XSAVE это FXSAVE, и размер области там другой.
             // Строка заодно доказывает, что фаза вообще включена.
@@ -3698,7 +3841,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Вытеснение обязано быть включено, а не собрано: строку печатает
             // сам планировщик, читая свой флаг.
             Step::Line("tasks"),
@@ -3806,7 +3949,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("run -b /bin/forever"),
             // Номер задачи не выдумывается сценарием, а берётся из строки,
             // которую напечатала система. Константа здесь уже подводила: одна
@@ -3882,7 +4025,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("run /bin/threads"),
             Step::Await("threads: starting 4 threads", 30_000),
             // Сумма обязана сойтись ТОЧНО, и это первая из трёх проверок:
@@ -3953,7 +4096,7 @@ pub const ALL: &[Scenario] = &[
         extra: &["-smp", "4"],
         steps: &[
             Step::Await("smp         : 4 of 4 processors online", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("run /bin/threads tlb"),
             Step::Await("threads: the writer is on cpu", 30_000),
             Step::Await("threads: making the page read-only under the writer", 30_000),
@@ -3996,7 +4139,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("run -b /bin/nap"),
             Step::Await("started as #", 15_000),
             // Поиск по всему выводу, а не вперёд от курсора: программа запущена
@@ -4079,7 +4222,7 @@ pub const ALL: &[Scenario] = &[
             // поведению. Меньше ставить нельзя: часы прошивки округлены до
             // секунды, и пара секунд разницы законна.
             Step::Clock("clock       : ", 10, BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Второе утверждение: часы идут. `date` печатает не то число,
             // которое пришло от прошивки, а сумму точки отсчёта и тиков
             // таймера, и она обязана сойтись с хостом так же.
@@ -4136,7 +4279,7 @@ pub const ALL: &[Scenario] = &[
             // CDROM`, а прошивка уходила в UEFI Shell.
             Step::Await("FossAi bootloader", BOOT),
             Step::Await(crate::version::KERNEL_BANNER, 60_000),
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
             // Система работает целиком, а не «дошла до приглашения»: initrd
             // смонтирован, файлы читаются. Диска у неё при этом нет вовсе —
             // носитель только для чтения, и это тот самый режим, в котором её
@@ -4173,7 +4316,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Смещения в байтах, а не номера страниц: у стека случайны и
             // страница (девять бит), и место внутри неё (семь), и совпадение
             // двух запусков — один шанс на 65 536, а не на 512. Прогон,
@@ -4245,7 +4388,7 @@ pub const ALL: &[Scenario] = &[
         steps: &[
             // Участок занят: карта машины описала его как свободную память.
             Step::Await("crashlog    : 64 KiB at 0x", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Холодный старт снимка не приносит — иначе проверка ниже ничего
             // бы не доказывала.
             Step::Line("lastpanic"),
@@ -4262,7 +4405,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("crashlog    : the previous boot panicked", BOOT),
             // Причина — сразу в журнале новой загрузки, без команды.
             Step::Await("requested from the shell", 15_000),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("lastpanic 60"),
             Step::Await("stopping the machine on request", 15_000),
             Step::Await("*** KERNEL PANIC ***", 15_000),
@@ -4270,7 +4413,7 @@ pub const ALL: &[Scenario] = &[
             // без паники ничего не принесёт.
             Step::Reset,
             Step::Await("crashlog    : 64 KiB at 0x", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("lastpanic"),
             Step::Await("the previous boot left no panic snapshot", 15_000),
             Step::Line("exit"),
@@ -4346,7 +4489,7 @@ pub const ALL: &[Scenario] = &[
             // И вторая шина за ней: xHCI с его собственными MSI-X, клавиатура
             // опознана по дескриптору отчёта.
             Step::Await("usb         : slot 1 is a keyboard", 60_000),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Том прочитан по-настоящему, а не только смонтирован.
             Step::Line("cat /data/hello.txt"),
             Step::Await("hello from btrfs", 30_000),
@@ -4427,7 +4570,7 @@ pub const ALL: &[Scenario] = &[
             // Второе, и главное: прерывания доходят. Тик таймера — единственное,
             // чем это проверяется: без него планировщик стоит, а оболочка не
             // отвечает вовсе.
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("uptime"),
             Step::Await("timer ticks", 15_000),
             // Ввод по UART тоже приходит прерыванием, и то, что оболочка
@@ -4463,7 +4606,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Именно этот путь прежний стенд проверить не мог: канал Windows
             // съедал 0x0D, и до гостя не доезжало ничего.
             Step::Raw(b"echo cr-ok\r"),
@@ -4499,7 +4642,7 @@ pub const ALL: &[Scenario] = &[
             // На VVFAT таблицы разделов не существует вовсе — QEMU синтезирует
             // её на лету. Значит, разметку проверяет только этот сценарий.
             Step::Await(crate::version::KERNEL_BANNER, BOOT),
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
             Step::Line("echo image-ok"),
             Step::Await("image-ok", 15_000),
             Step::Line("exit"),
@@ -4629,7 +4772,7 @@ pub const ALL: &[Scenario] = &[
             // единственная проверка, которая связывает выбор человека при
             // установке с тем, что система показывает потом.
             Step::Await("timezone    : UTC+03:00 from /etc/system.cfg", 30_000),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             // Меню рабочего стола на установленной системе: здесь корень ext2,
             // и «создать папку» действительно создаёт её — в отличие от живого
             // носителя, где хранить нечего. Каталог стола заводится по дороге,
@@ -4811,7 +4954,7 @@ pub const ALL: &[Scenario] = &[
         extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
         steps: &[
             Step::AwaitAny("virtio-snd  : at ", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Wait(2_000),
             // Полторы секунды — порциями в 100, 1000 и 3000 кадров: меньше
             // периода устройства, больше и не кратно. Дыры между порциями
@@ -4851,7 +4994,7 @@ pub const ALL: &[Scenario] = &[
         extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd0"],
         steps: &[
             Step::AwaitAny(", 48000 Hz 16-bit stereo", BOOT),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Wait(2_000),
             // Полторы секунды — порциями в 100, 1000 и 3000 кадров: меньше
             // периода устройства, больше и не кратно. Дыры между порциями
@@ -4889,7 +5032,7 @@ pub const ALL: &[Scenario] = &[
         extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             // Набор — когда службы встали: см. `mono-drawing`.
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("run /bin/csdl 440 1500"),
@@ -4961,7 +5104,7 @@ pub const ALL: &[Scenario] = &[
         extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("run /bin/pkg install /media/sopwith-2.9.0.fpk"),
             Step::Await("pkg: installed sopwith 2.9.0, 1 file(s)", 120_000),
@@ -5017,7 +5160,7 @@ pub const ALL: &[Scenario] = &[
         extra: &["-cpu", "max", "-smp", "2"],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("run /bin/pkg install /media/llama-0.7.0.fpk"),
             Step::Await("pkg: installed llama 0.7.0, 5 file(s)", 300_000),
@@ -5068,7 +5211,7 @@ pub const ALL: &[Scenario] = &[
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("run /bin/pkg install /media/debian-12.fpk"),
             Step::Await("pkg: installed debian 12, ", 300_000),
@@ -5190,7 +5333,7 @@ pub const ALL: &[Scenario] = &[
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("run /bin/pkg install /media/debian-12.fpk"),
@@ -5244,7 +5387,7 @@ pub const ALL: &[Scenario] = &[
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("run /bin/pkg install /media/debian-12.fpk"),
             Step::Await("pkg: installed debian 12, ", 300_000),
@@ -5255,7 +5398,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("waylandcheck: ok wl_keyboard sends an XKB keymap through a descriptor", 30_000),
             Step::Await("waylandcheck: ok xdg_toplevel gets configure", 30_000),
             Step::Await("wayland     : #", 30_000),
-            Step::Await("waylandcheck: ok a memfd buffer is shown, released and the frame is done", 30_000),
+            Step::Await("waylandcheck: ok a memfd buffer is shown and the frame is done", 30_000),
+            Step::Await("waylandcheck: ok the first buffer is released once the second is shown", 30_000),
             Step::Await("waylandcheck: waiting for the pointer", 30_000),
             Step::Painted("waylandcheck"),
             Step::Aim(Aim::Title("waylandcheck")),
@@ -5299,7 +5443,7 @@ pub const ALL: &[Scenario] = &[
         extra: &["-cpu", "max", "-smp", "2"],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("run /bin/pkg install /media/debian-12.fpk"),
@@ -5340,13 +5484,18 @@ pub const ALL: &[Scenario] = &[
         extra: &["-cpu", "max", "-smp", "2"],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
-            Step::Line("run /bin/pkg install /media/debian-12.fpk"),
+            // Одной командой и по имени: пакет — с носителя, корень Debian,
+            // который он требует, `pkg` ставит сам и первым.
+            Step::Line("pkg install chromium"),
+            Step::Await("pkg: debian is needed first; installing it", 60_000),
             Step::Await("pkg: installed debian 12, ", 300_000),
-            Step::Line("run /bin/pkg install /media/linuxweb-150.fpk"),
             Step::Await("pkg: installed chromium 150, ", 1_800_000),
+            // Значок Chromium на столе появляется сам — пятый, первый после
+            // системных.
+            Step::Await("desktop     : packages changed, 5 icons", 30_000),
             Step::Line("run -b /opt/debian/bin/bash /opt/chromium/bin/chromium --enable-logging=stderr --log-level=0 http://10.0.2.2:{site}/page.html"),
             Step::Await("wayland     : client #", 300_000),
             Step::Await("wayland     : #", 300_000),
@@ -5361,13 +5510,51 @@ pub const ALL: &[Scenario] = &[
             Step::Move(1, 0),
             Step::Wait(2_000),
             Step::Painted("chromium"),
+            // Развернуть: `configure` с размером экрана и новый буфер того же
+            // размера (до фазы 71i с этим кончалась куча ядра).
+            Step::Aim(Aim::Maximize("Untitled - Chromium")),
+            Step::Click,
+            Step::Await("window      : 'FossAi - Chromium' at 0,0", 30_000),
+            Step::Wait(60_000),
+            Step::Move(1, 0),
+            Step::Wait(2_000),
+            Step::Painted("chromium-maximized"),
+            // Контекстное меню страницы — всплывающее окно (`xdg_popup`);
+            // щелчок мимо закрывает его (`popup_done`).
+            Step::Aim(Aim::Program("FossAi - Chromium", 400, 400)),
+            Step::RightClick,
+            Step::Await("popup ", 120_000),
+            Step::Wait(20_000),
+            Step::Move(1, 0),
+            Step::Shot("chromium-menu"),
+            Step::Aim(Aim::Program("FossAi - Chromium", 200, 600)),
+            Step::Click,
+            Step::Await("popup closed", 60_000),
+            Step::Wait(5_000),
             // Крестик стола — `xdg_toplevel.close`; Chromium закрывается сам.
-            // Место окна стенд знает по строке открытия — с прежним именем.
-            Step::Aim(Aim::Close("Untitled - Chromium")),
+            Step::Aim(Aim::Close("FossAi - Chromium")),
             Step::Click,
             Step::Await("/opt/debian/bin/bash: exited with code 0", 120_000),
+            // Второй запуск — двойным щелчком по значку на столе. Оболочка
+            // лежит поверх значков — убрать её с дороги; набранное без окна в
+            // фокусе всё равно уходит ей.
+            Step::Aim(Aim::Minimize("Terminal")),
+            Step::Click,
+            Step::Await("desktop     : minimized 'Terminal'", 15_000),
+            Step::Aim(Aim::Icon(4)),
+            Step::DoubleClick,
+            Step::Await("desktop     : started '/opt/debian/bin/bash /opt/chromium/bin/chromium'", 30_000),
+            Step::Await("wayland     : client #", 300_000),
+            Step::Await("wayland     : #", 300_000),
+            Step::Wait(30_000),
+            Step::Move(1, 0),
+            Step::Painted("chromium-from-icon"),
+            Step::Key("ctrl-shift-w"),
+            Step::Await("wayland     : client #", 120_000),
+            Step::Wait(5_000),
             Step::Line("run /bin/pkg remove chromium"),
             Step::Await("pkg: removed chromium", 300_000),
+            Step::Await("desktop     : packages changed, 4 icons", 30_000),
             Step::Line("run /bin/pkg remove debian"),
             Step::Await("pkg: removed debian", 120_000),
             Step::Absent("protocol error on object"),
@@ -5399,7 +5586,7 @@ pub const ALL: &[Scenario] = &[
         extra: &["-audiodev", "wav,id=snd0,path={wav}", "-device", "virtio-sound-pci,audiodev=snd0"],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             Step::Line("run /bin/pkg install /media/freedoom-0.13.fpk"),
             Step::Await("pkg: installed freedoom 0.13, 3 file(s)", 300_000),
@@ -5467,7 +5654,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Сценарий начинается с уборки, и это не аккуратность: диск
             // переживает прогон, а записанное — переживает диск. Без уборки
             // повторный запуск этого сценария падал бы на «имя уже занято», то
@@ -5482,9 +5669,9 @@ pub const ALL: &[Scenario] = &[
             // строки, стенд ждёт ответа. Ровно так это и выглядело на обеих
             // сборках AArch64, прежде чем сюда добавились эти два шага.
             Step::Line("rm /home/roman/notes/first.txt"),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             Step::Line("rm /home/roman/notes"),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Каталог, файл и его содержимое — всё создаётся здесь и сейчас, на
             // том самом разделе, который записал установщик.
             Step::Line("mkdir /home/roman/notes"),
@@ -5560,7 +5747,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("panic now"),
             Step::Await("stopping the machine on request", 15_000),
             Step::Await("this log is kept in memory", 15_000),
@@ -5579,7 +5766,7 @@ pub const ALL: &[Scenario] = &[
             // Паника оставила тома открытыми, и загрузка это видит — но пишет
             // всё равно: раздел состояния смонтирован на запись.
             Step::Await("crashlog    : saved to /var/log/last-panic.log", 60_000),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Файл читается с диска, а не из памяти. Причина — первой строкой:
             // `cat` оболочки показывает первые четыре килобайта, а паника лежит
             // в конце журнала. Хвост целиком — в `lastpanic` выше по сценарию
@@ -5643,7 +5830,7 @@ pub const ALL: &[Scenario] = &[
             // Устройство отдаётся на пути выхода программы.
             Step::Await("is free again", 15_000),
             // Приглашение могло появиться раньше, чем `drvd` закончил.
-            Step::AwaitAny("freeos> ", BOOT),
+            Step::AwaitAny(PROMPT, BOOT),
             Step::Line("irq driver0"),
             Step::Await("driver0 woke the system", 15_000),
             // Второй запуск: место, вектор и карта отданы и берутся заново.
@@ -5662,14 +5849,14 @@ pub const ALL: &[Scenario] = &[
             Step::Await("pkg: edu-raw asks for the right to devices and is not signed", 60_000),
             // Уборка: сценарий `pkg` дальше по цепочке считает пакеты на диске.
             Step::Line("run /bin/pkg remove edu-nodev"),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             // `edu` поставил `drvd` от root, и оболочке (uid 1000) его не снять:
             // `pkg` обязан отказать и **оставить** запись в реестре. Снимает
             // его стенд перед следующей загрузкой (`forgotten_on_state`).
             Step::Line("run /bin/pkg remove edu"),
             Step::Await("cannot remove /opt/edu/bin/edudrv", 30_000),
             Step::Await("pkg: edu stays installed: 1 file(s) could not be removed", 30_000),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),
@@ -5699,7 +5886,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Установленная система, а не живая, и это не выбор из удобства:
             // корень живой — образ initrd в FAT, и писать в него нельзя. Файл,
             // который программа создаёт и читает обратно, — половина того, что
@@ -5812,7 +5999,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("run /bin/zdemo"),
             // Версия печатается самой zlib из её же заголовка. Строка
             // доказывает, что слинкована именно чужая библиотека, а не наша
@@ -5862,7 +6049,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("run /bin/cmem"),
             Step::Await("cmem: starting", 30_000),
             // Резерв в 64 МиБ не стоит кадров, касание — стоит, `munmap`
@@ -5904,7 +6091,7 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run /bin/cmem touch-none"),
             Step::Await("cmem: reading a PROT_NONE page", 30_000),
             Step::Await("user        : killed by", 15_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             Step::Absent("cmem: FAILED"),
             // Таблицы не разошлись с записями ни при одном разрезе.
             Step::Absent("user        : WARNING"),
@@ -5936,7 +6123,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("run /compat/linux/bin/hello one two"),
             Step::Await("linux: hello from a Linux program, argc 3", 30_000),
             Step::Await("linux: ok argv ends with a null pointer", 15_000),
@@ -5985,7 +6172,7 @@ pub const ALL: &[Scenario] = &[
         // по очереди на одном.
         extra: &["-smp", "4"],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("run /bin/cthreads"),
             // Первая строка напечатана `printf` уже при живом TLS: `errno` и
             // замок кучи в многопоточной picolibc лежат в блоке потока, и без
@@ -6038,7 +6225,7 @@ pub const ALL: &[Scenario] = &[
         // на одной странице по-настоящему, а не по очереди на одном.
         extra: &["-smp", "4"],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("run /bin/cjit"),
             Step::Await("cjit: code memory at ", 30_000),
             Step::Await("cjit: ok write and execute without MAP_JIT is refused", 30_000),
@@ -6087,22 +6274,22 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Уборка перед началом — по той же причине, что и в сценарии
             // `write`: диск переживает прогон, и второй запуск иначе падал бы
             // на «имя уже занято». Между строками ждём приглашения: приёмный
             // FIFO гостя не держит две команды подряд, пока тот перерисовывает
             // окно.
             Step::Line("rm /home/roman/one.txt"),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             Step::Line("rm /home/roman/mcdir/one.txt"),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             Step::Line("rm /home/roman/mcdir/two.txt"),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             Step::Line("rm /home/roman/mcdir/zed.txt"),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             Step::Line("rm /home/roman/mcdir"),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Каталог с одним предсказуемым файлом. Проверять `mc` на `/bin`
             // было бы нельзя: порядок записей каталога — тот, в котором они
             // лежат на носителе, и «второй сверху» означало бы разное на разных
@@ -6219,7 +6406,7 @@ pub const ALL: &[Scenario] = &[
             // промежуток, пропала бы — что и происходило, пока этой строки
             // здесь не было.
             Step::Await("tty         : foreground released", 15_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // И главное: сделанное программой пережило её саму. Проверяет это
             // оболочка — другой код, другая задача, ядро вместо третьего кольца.
             Step::Line("cat /home/roman/one.txt"),
@@ -6262,7 +6449,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Шаблон `dotnet new console` без единой правки. Живая система, а не
             // установленная: сборки только читаются, а initrd везёт их сам.
             Step::Line("dotnet /usr/share/dotnet/samples/hello.dll"),
@@ -6271,7 +6458,7 @@ pub const ALL: &[Scenario] = &[
             // Строка итога — доказательство, что `Main` дошёл до `ret`, а не что
             // программа успела напечатать и упала.
             Step::Await("dotnet: hello.dll: Main returned 0", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Арифметика трёх ширин, рекурсия, циклы, switch, склейка строк и
             // кириллица. Каждая строка — та же, что печатает настоящий dotnet
             // (сверено `cargo xtask clr-check` и тестом `clr-vm`).
@@ -6292,7 +6479,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("Привет из IL", 60_000),
             Step::Await("arith: done", 60_000),
             Step::Await("dotnet: arith.dll: Main returned 0", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N3a: классы, виртуальные вызовы, интерфейсы, статические
             // конструкторы, структуры и упаковка поверх своей базовой библиотеки
             // на C#. Строки выбраны так, что каждая ломается от своего дефекта:
@@ -6317,7 +6504,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("objects: done", 60_000),
             // Main возвращает число созданных животных — три.
             Step::Await("dotnet: objects.dll: Main returned 3", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N3b: исключения. Порядок строк и есть проверка: фильтр
             // печатает раньше `finally` внутренних кадров (два прохода, как в
             // CLR), исключение из `finally` заменяет летящее, а исключения самой
@@ -6337,7 +6524,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("loop 43", 60_000),
             Step::Await("exceptions: done", 60_000),
             Step::Await("dotnet: exceptions.dll: Main returned 43", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N3c: обобщения, специализированные и ссылочными, и значимыми
             // типами, статика у каждого экземпляра обобщённого типа, делегаты,
             // замыкания, события и интерполяция строк.
@@ -6354,7 +6541,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("interpolated: привет, мир! 3 x (7, семь) = 21", 60_000),
             Step::Await("generics: done", 60_000),
             Step::Await("dotnet: generics.dll: Main returned 22", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N3d: сборщик мусора. Программа выделяет около 70 МиБ при
             // куче `/bin/dotnet` в 16 и проверяет каждое живое значение сама:
             // без сборки она не дожила бы, с пропущенным корнем напечатала бы
@@ -6371,7 +6558,7 @@ pub const ALL: &[Scenario] = &[
             // файле: подстрока «0 collection(s)» совпала бы и с «10», и с
             // законным нулём у `hello` выше.
             Step::Await("dotnet: gc.dll: Main returned 6", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N4a: строки, форматирование, разбор, StringBuilder, Math.
             Step::Line("dotnet /usr/share/dotnet/samples/text.dll"),
             Step::Await("text: start", 60_000),
@@ -6384,7 +6571,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("True True Ж 65 True True", 60_000),
             Step::Await("text: done", 60_000),
             Step::Await("dotnet: text.dll: Main returned 77", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N4b: коллекции, массивы как IList<T>, итераторы.
             Step::Line("dotnet /usr/share/dotnet/samples/collections.dll"),
             Step::Await("collections: start", 60_000),
@@ -6396,7 +6583,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("words: finally", 60_000),
             Step::Await("collections: done", 60_000),
             Step::Await("dotnet: collections.dll: Main returned 6", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N4c: дробные числа — печать, форматы, разбор, Math, float.
             Step::Line("dotnet /usr/share/dotnet/samples/floats.dll"),
             Step::Await("floats: start", 60_000),
@@ -6408,7 +6595,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("1.6439345666815615 3.1406380562059946 3FFA4D8E550A946E", 60_000),
             Step::Await("floats: done", 60_000),
             Step::Await("dotnet: floats.dll: Main returned 41", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N4d: перечисления — имена, флаги, форматы, разбор.
             Step::Line("dotnet /usr/share/dotnet/samples/enums.dll"),
             Step::Await("enums: start", 60_000),
@@ -6417,7 +6604,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("Requested value 'nope' was not found.", 60_000),
             Step::Await("enums: done", 60_000),
             Step::Await("dotnet: enums.dll: Main returned 6", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N4d: Linq и большие массивы примитивов — четыре мегабайта
             // `byte[]` в куче программы на 16 МиБ.
             Step::Line("dotnet /usr/share/dotnet/samples/linq.dll"),
@@ -6429,7 +6616,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("4000000 1000000 8496120 1229 234 3999", 120_000),
             Step::Await("linq: done", 60_000),
             Step::Await("dotnet: linq.dll: Main returned 29", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N5b: время и окружение. Даты от фиксированного мига печатаются
             // как у dotnet; строка `now:` проверяет часы ядра (год не 1970) и
             // пояс из настроек, `slept:` — сон и монотонные часы, `machine:` —
@@ -6450,7 +6637,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("machine: True True", 60_000),
             Step::Await("time: done", 60_000),
             Step::Await("dotnet: time.dll: Environment.Exit(21)", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N10: PriorityQueue — файл dotnet/runtime в corelib без правки.
             // Раскладка кучи (`heap`) и порядок равных приоритетов (`ties`)
             // совпадают с dotnet только при том же алгоритме; `copied` и
@@ -6470,7 +6657,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("dijkstra A=0 B=7 C=9 F=11 E=20 D=20", 60_000),
             Step::Await("pqueue: done", 60_000),
             Step::Await("dotnet: pqueue.dll: Main returned 20", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N10b: ещё шесть коллекций из dotnet/runtime. `set ops` идёт
             // через stackalloc (localloc среды), `stack:` — через упаковку int
             // при копировании в object[], `tree copy` — через красно-чёрное
@@ -6487,7 +6674,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("union: 1,3,5,6,7,8,9,11,13,100 | 5,6,7 | 1,3,9,11,13 | 2,4,5,6,7,9,11,13", 60_000),
             Step::Await("sorted: done", 60_000),
             Step::Await("dotnet: sorted.dll: Main returned 42", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Nullable<T>: пустое значение упаковывается в null, полное — в сам T.
             Step::Line("dotnet /usr/share/dotnet/samples/nullable.dll"),
             Step::Await("nullable: start", 60_000),
@@ -6497,7 +6684,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("struct: Point (3, 4) 4 True", 60_000),
             Step::Await("list: 2 107 10||-3", 60_000),
             Step::Await("dotnet: nullable.dll: Main returned 11", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N10c: List<T> и сортировка из dotnet/runtime. Строка `large`
             // — порядок равных ключей после неустойчивой сортировки .NET.
             Step::Line("dotnet /usr/share/dotnet/samples/listsort.dll"),
@@ -6508,7 +6695,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("read only: 7 5 True NotSupportedException: Collection is read-only.", 60_000),
             Step::Await("set: a,b,d True True False", 60_000),
             Step::Await("dotnet: listsort.dll: Main returned 16", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N10d: Dictionary и HashSet из dotnet/runtime. `order` — порядок
             // обхода после удалений и повторных вставок, `trimmed` — простое
             // число из таблицы HashHelpers, `span` — поиск по срезу знаков.
@@ -6520,7 +6707,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("union: 31,21,7,11,13,5,17,19 8 23 59", 60_000),
             Step::Await("words: Apple,banana,Cherry True True False True Apple,banana,date True True Apple", 60_000),
             Step::Await("dotnet: dict.dll: Main returned 21", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N11: async/await. `first` — начало метода идёт синхронно, конец
             // продолжением; `all` — три задачи с разными задержками; `cancel` —
             // отмена Task.Delay; `delay` — таймеры очереди идут по часам.
@@ -6533,7 +6720,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("cancel: TaskCanceledException: A task was canceled. | Canceled True True", 60_000),
             Step::Await("continue: 4 42", 60_000),
             Step::Await("dotnet: asyncs.dll: Main returned 30", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N6a: окно WinForms. Форма открывается окном программы,
             // рисует себя в Paint, получает щелчок мышью в своих координатах и
             // закрывается крестиком стола — FormClosing и FormClosed с причиной
@@ -6562,7 +6749,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("dotnet: form.dll: Main returned 17", 30_000),
             // `focus 'Terminal'` стол печатает раньше, при закрытии окна, — ждать
             // его здесь значит искать позади курсора.
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N6b: шаблон `dotnet new winforms` с кнопкой и надписью из
             // дизайнера, без единой правки сгенерированного кода. Стенд щёлкает
             // по середине кнопки — (12, 12) и 94×29 из дизайнера; масштаба по DPI
@@ -6586,7 +6773,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("closed: UserClosing Clicked 2 times", 30_000),
             Step::Await("dotnet: window 'Form1' closed after", 30_000),
             Step::Await("dotnet: winforms.dll: Main returned 0", 30_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N7a: клавиатура. Щелчок ставит фокус в поле ввода, клавиатура
             // QEMU набирает `hello`, Backspace стирает букву, Alt+Shift
             // переключает раскладку, и те же клавиши `ghbdtn` приезжают словом
@@ -6618,7 +6805,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("dotnet: window 'Controls' closed after", 30_000),
             Step::Await("dotnet: controls.dll: Main returned 0", 30_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N7b: списки. Щелчок по первой строке списка, дальше стрелки —
             // высота строки у шрифта FreeOS своя, и целиться мышью ниже первой
             // строки значило бы угадывать. Щелчок по выпадающему списку
@@ -6649,7 +6836,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("dotnet: window 'Lists' closed after", 30_000),
             Step::Await("dotnet: lists.dll: Main returned 0", 30_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N7c: таймер и окна сообщений. Таймер тикает трижды и
             // останавливается сам. Кнопка открывает модальное окно «Question»:
             // его кнопки стенд находит от правого нижнего угла, «Yes» — вторая
@@ -6678,7 +6865,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("closed: UserClosing 3", 30_000),
             Step::Await("dotnet: dialogs.dll: Main returned 0", 30_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N7d: меню, Dock и Anchor. Пункт «File» открывается щелчком, а
             // строки выбираются стрелками и Enter: высота строки у шрифта FreeOS
             // своя. Стрелка вправо переходит к «View». Кнопка «Grow» прижата к
@@ -6715,7 +6902,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("dotnet: window 'Layout' closed after", 30_000),
             Step::Await("dotnet: layout.dll: Main returned 0", 30_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N7e: переключатели, полоса хода и ползунок. Щелчок по
             // «Medium» снимает отметку с «Small»; щелчок по ползунку ставит
             // значение по месту щелчка — восьмая отметка из десяти, — а
@@ -6738,7 +6925,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("closed: UserClosing Level 9", 30_000),
             Step::Await("dotnet: choices.dll: Main returned 0", 30_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N7f: вкладки и строка состояния. Щелчок по заголовку первой
             // вкладки даёт ей фокус, стрелка вправо переходит ко второй — ширина
             // заголовков зависит от шрифта. Флажок на второй странице стоит под
@@ -6761,7 +6948,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("closed: UserClosing Enabled: True", 30_000),
             Step::Await("dotnet: tabs.dll: Main returned 0", 30_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N7g: поле со стрелками и decimal. Щелчок по верхней стрелке
             // первого поля — у правого края, в верхней половине — прибавляет
             // шаг и даёт полю фокус; стрелка вверх на клавиатуре прибавляет ещё.
@@ -6780,7 +6967,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("closed: UserClosing 12", 30_000),
             Step::Await("dotnet: numbers.dll: Main returned 0", 30_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N7h: клавиатура и мышь у формы. Клавиши и строки — те же, что
             // у пробы в Windows (`build/n7h/keyprobe`, нажатия keybd_event):
             // число набирается в поле и принимается по Enter; Tab идёт от поля
@@ -6853,7 +7040,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("closed: UserClosing 100 False True False", 30_000),
             Step::Await("dotnet: keys.dll: Main returned 0", 30_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Фаза N8: «Файлы» запускают .NET-программу. Рядом с `winforms.dll`
             // лежит её `.runtimeconfig.json` — так её оставляет `dotnet build`,
             // — и Enter по ней не открывает просмотр, а запускает `/bin/dotnet`.
@@ -6905,7 +7092,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Каждая строка — та же, что печатает GDI+ на Windows (сверено
             // `cargo xtask clr-check` и тестом `clr-vm`): точки прочитаны из
             // Bitmap. Строки выбраны так, что каждая ломается от своего дефекта
@@ -6954,7 +7141,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("closed: UserClosing", 60_000),
             Step::Await("drawing: done", 30_000),
             Step::Await("dotnet: drawing.dll: Main returned 9", 30_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             Step::Absent("dotnet: error"),
             Step::Absent("KERNEL PANIC"),
         ],
@@ -6998,7 +7185,7 @@ pub const ALL: &[Scenario] = &[
             // следующий отказ скажет, встал ли стол, — а не только то, что
             // приглашения нет.
             Step::Await("console     : screen handed over", 60_000),
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
             Step::Line("cat /home/roman/notes/first.txt"),
             Step::Await("persisted-by-the-shell", 15_000),
             Step::Line("cat /home/roman/from-a-program.txt"),
@@ -7045,7 +7232,7 @@ pub const ALL: &[Scenario] = &[
             // относительные пути программы считаются от `/home/roman` (фаза N5a).
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await("console     : screen handed over", 60_000),
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
             Step::Line("dotnet /usr/share/dotnet/samples/files.dll"),
             Step::Await("files: start", 60_000),
             Step::Await("31 3 [first line|вторая строка|third] 43 208 вторая 43", 60_000),
@@ -7055,7 +7242,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("False app.log,b.txt,moved.txt", 60_000),
             Step::Await("files: done", 60_000),
             Step::Await("dotnet: files.dll: Main returned 13", 60_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
             // Оболочка видит, что программа оставила.
             Step::Line("cat /home/roman/n5-files/from-dotnet.txt"),
             Step::Await("written by a C# program", 15_000),
@@ -7096,7 +7283,7 @@ pub const ALL: &[Scenario] = &[
         memory: "256M",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Считаем кадры до, чтобы сверить после.
             //
             // Прогрева, каким начинается сценарий `mmap`, здесь нет, и это
@@ -7218,7 +7405,7 @@ pub const ALL: &[Scenario] = &[
             // чём стоит строить проверку. Обе интересные ситуации сценарий
             // создаёт сам, ниже.
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
 
             // --- случай первый: машину бросили ---------------------------
             //
@@ -7231,7 +7418,7 @@ pub const ALL: &[Scenario] = &[
             // Вторая загрузка обязана сказать, что том закрыт не был. Строка
             // печатается при монтировании и до всякой оболочки.
             Step::Await("state       : volume was NOT unmounted cleanly", BOOT),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             // Данные при этом целы: том грязный — это про счётчики, а не про
             // содержимое файлов.
             Step::Line("cat /home/roman/crash.txt"),
@@ -7245,7 +7432,7 @@ pub const ALL: &[Scenario] = &[
             // Третья загрузка — и вот теперь том обязан быть чистым. Это и есть
             // всё утверждение фазы 27, целиком и в одной строке.
             Step::Await("state       : volume was unmounted cleanly", BOOT),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
 
             // --- случай третий: машину выключили --------------------------
             //
@@ -7286,7 +7473,7 @@ pub const ALL: &[Scenario] = &[
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             // Проверка живого тома: она ничего не чинит и на исправной системе
             // обязана молчать. Если бы она находила «поломки» на работающей
             // машине, всё остальное в этом сценарии ничего не значило бы.
@@ -7307,7 +7494,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await("fsck        : checking the state volume (it was not closed cleanly)", 60_000),
             Step::Await("fsck        : state: ", 60_000),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             // Данные на месте: проверка чинит счётчики, а не выбрасывает файлы.
             Step::Line("cat /home/roman/crash.txt"),
             Step::Await("written-before-the-crash", 15_000),
@@ -7374,7 +7561,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("fsck        : checking the root volume (asked for", 60_000),
             Step::Await("root        : mounted read-only", 60_000),
             Step::Await("compositor  : not started, safe mode", 30_000),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             // Читать можно всё.
             Step::Line("cat /etc/system.cfg"),
             Step::Await("language=", 15_000),
@@ -7505,7 +7692,7 @@ pub const ALL: &[Scenario] = &[
             // какого входа. Без этой строки «нажали и выключилось» не отличить
             // от «нажали, а выключил кто-то другой».
             Step::Await("power       : power button on vector", BOOT),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             Step::PowerButton,
             // Нажатие видит обработчик прерывания, а печатает задача: строка
             // приходит уже из неё.
@@ -7555,7 +7742,7 @@ pub const ALL: &[Scenario] = &[
             // Дальше — обычная жизнь системы, но каждое обращение к диску идёт
             // через новый драйвер: чтение файла установщика...
             Step::Await("account     : /etc/passwd", 30_000),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             Step::Line("cat /etc/system.cfg"),
             Step::Await("language=", 15_000),
             // ...и запись, которой у драйвера свой путь. Файл читается обратно
@@ -7614,7 +7801,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("on nvme #0 at LBA", 30_000),
             Step::Await("root        : ext2 at LBA", 30_000),
             Step::Await("account     : /etc/passwd", 30_000),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             // Чтение через очередь ввода-вывода — она отдельная от
             // административной, и до этой строки ни одной команды в ней не было.
             Step::Line("cat /etc/system.cfg"),
@@ -7658,15 +7845,15 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Уборка перед началом — по той же причине, что в сценарии `write`:
             // диск переживает прогон, и второй запуск иначе падал бы на «уже
             // установлен». Отказы уборки не проверяются: на свежей системе
             // сносить нечего.
             Step::Line("run /bin/pkg remove extra"),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             Step::Line("run /bin/pkg remove hello"),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
 
             // Зависимость проверяется **до** первой записи: пакет, которому
             // нужен `hello`, обязан не встать, пока того нет.
@@ -7863,7 +8050,7 @@ pub const ALL: &[Scenario] = &[
             // достаётся активному окну, а активно сейчас окно «Параметры».
             // Строка `exit`, приехавшая по серийной линии, ушла бы в него и
             // пропала — первый прогон именно так и встал.
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("desktop     : closed 'Settings'", 15_000),
             Step::Wait(2_000),
             Step::Line("exit"),
@@ -7894,7 +8081,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Ждать «sshd сдался» здесь НЕ надо: гонке подкачки службы не
             // мешают, а на этот шаг ложился отдельный редкий дефект aarch64 —
             // init печатает «reading services» и замолкает, служб не поднимая
@@ -7959,7 +8146,7 @@ pub const ALL: &[Scenario] = &[
             Step::Capture("init: started 'logger' as #", 60_000),
             // Приглашение печатает оболочка, а строки выше — init; порядок между
             // ними не определён, и на x86-64 приглашение уже приходило раньше.
-            Step::AwaitAny("freeos> ", 60_000),
+            Step::AwaitAny(PROMPT, 60_000),
             // `AwaitAny`, а не `Await` и не `Expect`. Строку печатает **служба**,
             // приглашение — оболочка, и порядок между двумя задачами не
             // определён: на AArch64 он оказался обратным, и ожидание приглашения
@@ -8238,7 +8425,7 @@ pub const ALL: &[Scenario] = &[
         steps: &[
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", BOOT),
             Step::AwaitAny("sshd: listening on port 22", 90_000),
-            Step::AwaitAny("freeos> ", 90_000),
+            Step::AwaitAny(PROMPT, 90_000),
             Step::Wait(1_000),
 
             // 1. Четыре мебибайта в гостя. Такой файл не проходит ни одним
@@ -8456,7 +8643,7 @@ pub const ALL: &[Scenario] = &[
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
 
             Step::Line("run -b /bin/httpd --mount /files /media"),
@@ -8506,7 +8693,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Файл, который обязан пережить всё происходящее. Он на разделе
             // состояния, а слоты меняют только систему — но утверждать это надо
             // проверкой, а не рассуждением.
@@ -8541,7 +8728,7 @@ pub const ALL: &[Scenario] = &[
             // (фаза 60b): в отладочной сборке загрузка выросла до 56–57 с, и
             // третья попытка 29.09 за срок не уложилась.
             Step::Await("root        : cannot mount ext2", BOOT),
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
             // Дальше шнур выдёргивается дважды: система не подтвердилась, и
             // каждая загрузка тратит попытку.
             Step::Reset,
@@ -8562,7 +8749,7 @@ pub const ALL: &[Scenario] = &[
             // раньше, чем нашёлся корень, было бы нечем.
             Step::Await("root        : ext2 at LBA", 180_000),
             Step::Await("slot        : this boot came back to the previous slot", 60_000),
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
             // Файлы человека на месте: раздел состояния слоты не трогают.
             Step::Line("cat /home/roman/k.txt"),
             Step::Await("keep-me", 15_000),
@@ -8598,7 +8785,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // На старте — прежняя версия и прежний слот. «Прежняя» — это
             // версия рабочего дерева, а не буква: обновление в `/media` несёт
             // `UPDATE_VERSION`, заведомо более новую, и проверка состоит в том,
@@ -8654,7 +8841,7 @@ pub const ALL: &[Scenario] = &[
             // Подтверждение — то, из-за отсутствия которого система откатилась
             // бы обратно.
             Step::Await("slot        : slot B confirmed", 60_000),
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
             // Версия новая: это и есть «система обновилась».
             Step::Line("cat /os-release"),
             Step::Await("version=0.9", 15_000),
@@ -8724,7 +8911,7 @@ pub const ALL: &[Scenario] = &[
             // Сама строка — половина фазы про умолчания: список служб взят из
             // образа, потому что установщик его в `/etc` больше не пишет.
             Step::Await("services    : described by /usr/share/defaults/etc/services", BOOT),
-            Step::Await("freeos> ", 120_000),
+            Step::Await(PROMPT, 120_000),
             // Сеть поднимает служба, без единой команды.
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 120_000),
             Step::Wait(2_000),
@@ -8779,7 +8966,7 @@ pub const ALL: &[Scenario] = &[
             Step::Line("reboot"),
             // Загрузка с другого слота — и версия, приехавшая по сети.
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 120_000),
+            Step::Await(PROMPT, 120_000),
             Step::Line("cat /os-release"),
             Step::Await("version=0.10", 15_000),
             // Умолчания приехали вместе с образом.
@@ -8820,7 +9007,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 120_000),
             Step::Wait(2_000),
 
@@ -8943,7 +9130,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("edudrv: 10! = 3628800 by interrupt", 30_000),
             Step::Await("edudrv: 64 bytes went to the card and back by DMA", 30_000),
             Step::Await("is free again", 15_000),
-            Step::AwaitAny("freeos> ", BOOT),
+            Step::AwaitAny(PROMPT, BOOT),
             Step::Wait(2_000),
 
             // Каталог с чужой подписью отвергается до единого скачанного
@@ -8995,7 +9182,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
 
             // ── Оболочка ─────────────────────────────────────────────────────
             //
@@ -9057,7 +9244,7 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_500),
             Step::Shot("03-friendly-again"),
 
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("files: closing on request", 15_000),
             Step::Await("desktop     : focus 'Terminal'", 15_000),
             Step::Line("exit"),
@@ -9092,7 +9279,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // До правки — DHCP: адрес приносит служба, и это видно в журнале.
             // Строка нужна как отправная точка: без неё «адрес 10.0.2.15 после
             // перезагрузки» ничего не доказывал бы — его и так дал бы DHCP.
@@ -9207,13 +9394,13 @@ pub const ALL: &[Scenario] = &[
             // Окно закрывается **до** команды оболочке: ввод достаётся активному
             // окну, и строка, приехавшая по серийной линии, ушла бы в него и
             // пропала. Куплено красным прогоном 47c.
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("desktop     : closed 'Settings'", 15_000),
             Step::Wait(2_000),
 
             // ── Перезагрузка: то, ради чего фаза ─────────────────────────────
             Step::Line("reboot"),
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Пояс приехал из файла, а не из умолчания.
             Step::AwaitAny("timezone    : UTC+05:30 from /etc/system.cfg", 60_000),
             // Тема — тоже: до этой фазы она не сохранялась нигде.
@@ -9346,7 +9533,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("settings    : opened 'USB-устройства'", 15_000),
 
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("desktop     : closed 'Settings'", 15_000),
             Step::Wait(2_000),
 
@@ -9379,7 +9566,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Wait(2_000),
             // Остаток прошлого прогона — прочь: файла быть не должно, блокнот
             // обязан сказать «новый файл».
@@ -9397,7 +9584,7 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ctrl-s"),
             // «hello fossai\nsecond line\n» — двадцать пять байт.
             Step::Await("notepad: saved /home/roman/note.txt, 25 byte(s)", 15_000),
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("notepad: closing on request", 15_000),
             Step::Await("desktop     : closed the window of ", 15_000),
             Step::Wait(1_000),
@@ -9407,7 +9594,7 @@ pub const ALL: &[Scenario] = &[
             Step::Line("run -b /bin/notepad /home/roman/note.txt"),
             Step::Await("notepad: opened /home/roman/note.txt, 3 line(s)", 30_000),
             Step::Wait(1_000),
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("notepad: closing on request", 15_000),
             Step::Await("desktop     : closed the window of ", 15_000),
             Step::Wait(1_000),
@@ -9423,7 +9610,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("calc: 7,5 / 2 = 3,75", 15_000),
             Step::Wait(1_000),
             Step::Shot("02-calc"),
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("calc: closing on request", 15_000),
             Step::Wait(1_000),
             Step::Line("rm /home/roman/note.txt"),
@@ -9542,7 +9729,7 @@ pub const ALL: &[Scenario] = &[
             // таблицы inode найдены по верным адресам, а не по формуле,
             // делённой на 512.
             Step::Await("account     : /etc/passwd", 30_000),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
             Step::Line("cat /etc/system.cfg"),
             Step::Await("language=", 15_000),
             Step::Line("echo written-on-4kn > /home/roman/sector4k.txt"),
@@ -9595,7 +9782,7 @@ pub const ALL: &[Scenario] = &[
             // ожидания бывает только у задачи, которая **действительно** спит
             // на прерывании. Драйвер мог бы сказать «настроено» и всё равно
             // крутиться на будильнике — здесь это было бы видно.
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
             Step::Line("tasks"),
             Step::Await("waiting for device (with a deadline)", 15_000),
 
@@ -9743,7 +9930,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
             Step::Wait(2_000),
             // Клиент эхо-сервера хоста — тем же кодом, что под Linux.
@@ -9790,7 +9977,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 120_000),
             Step::Wait(2_000),
             // Свой корень: рукопожатие, проверенная цепочка, имя — адрес в
@@ -9833,7 +10020,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 120_000),
             Step::Wait(2_000),
             // Что собрано: версия и TLS — mbedTLS, не наш `crates/tls`.
@@ -10008,7 +10195,7 @@ pub const ALL: &[Scenario] = &[
             // — в самом конце: между ними вся остальная загрузка, и срок здесь
             // тот же, что у `boot`, а не «шестьдесят секунд на всякий случай».
             Step::Await("FossAi shell.", BOOT),
-            Step::Await("freeos> ", 30_000),
+            Step::Await(PROMPT, 30_000),
 
             // Состояние — словами: «случайное значение», а не само значение.
             Step::Line("guard"),
@@ -10054,7 +10241,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
 
             // Умолчание сначала называется вслух: настройка, о которой система
             // молчит, ничем не отличается от её отсутствия.
@@ -10131,7 +10318,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::AwaitAny("dhcp: lease 10.0.2.15/24", 60_000),
             Step::Wait(2_000),
             // Программа идёт в фоне: после клиентских проверок она ждёт
@@ -10182,7 +10369,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // `--version` проходит разбор аргументов, инициализацию eglib и
             // печать сведений о сборке — без единой сборки IL. Строка версии и
             // строки настроек — те, что Mono печатает о себе сама: по ним видно,
@@ -10266,7 +10453,7 @@ pub const ALL: &[Scenario] = &[
             // Установленная система, а не «живая»: половина проверки — про
             // файлы, а корень живой системы лежит в памяти и только на чтение.
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
 
             // Сначала — что программа вообще запускается и знает, кто она.
             Step::Line("lua -v"),
@@ -10348,7 +10535,7 @@ pub const ALL: &[Scenario] = &[
             // Корень — ext2 на диске, а не RAM-диск: всё ниже прочитано с того,
             // что записал установщик (фаза 60, `MONO_LIB` в его списке).
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             // mscorlib — в `4.5`, остальное — в GAC: иначе Mono их не найдёт.
             Step::Line("ls /usr/lib/mono/4.5"),
             Step::Await("mscorlib.dll", 15_000),
@@ -10399,7 +10586,7 @@ pub const ALL: &[Scenario] = &[
             // Установленная система: System.Drawing, образец и настройка
             // fontconfig лежат там, куда их положил установщик (фаза 61b).
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             // Длинная строка, набранная, пока стартуют службы, теряла символы
             // (aarch64, 28.09): эхо ввода перемешивалось с их выводом. `drvd` —
             // служба на один проход, и её конец — это «службы встали».
@@ -10462,7 +10649,7 @@ pub const ALL: &[Scenario] = &[
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             // Набор — когда службы встали: см. `mono-drawing`.
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             // `forms.exe` собран csc из .NET Framework (`ports/mono/samples/
@@ -10526,7 +10713,7 @@ pub const ALL: &[Scenario] = &[
         extra: &[],
         steps: &[
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             // Набор — когда службы встали: см. `mono-drawing`.
             Step::AwaitAny("init: 'drvd' finished", 60_000),
             // `popups.exe` собран csc из .NET Framework (`ports/mono/samples/
@@ -10709,7 +10896,7 @@ pub const ALL: &[Scenario] = &[
             // только на чтение), а шрифт лежит там, куда его положил
             // установщик (`FONTS` в его списке).
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("freeos> ", 90_000),
+            Step::Await(PROMPT, 90_000),
             // Пути — по умолчанию программы (`/home/roman/cdraw.png`, DejaVu из
             // `/usr/share/fonts`): длинная строка, набранная, пока стартуют
             // службы, теряла символы.
@@ -11145,7 +11332,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             Step::Line("run /bin/posix"),
 
             // Каждое утверждение ждётся отдельно и по порядку печати: программа
@@ -11238,7 +11425,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
 
             // Запуск уходит в **серийную линию**: оболочка читает её независимо
             // от того, какое окно на столе в фокусе. Это важно для шагов ниже —
@@ -11366,7 +11553,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("4096 B sectors, 16384 B nodes", 10_000),
             Step::Await("data        : mounted read-write", 10_000),
             Step::Await("/data comes from the data partition", 10_000),
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
 
             // Каталог: имена приходят из дерева, а размеры и права — из inode
             // каждого файла, то есть на каждое имя идёт отдельный спуск.
@@ -11451,7 +11638,7 @@ pub const ALL: &[Scenario] = &[
             // Первый шаг — это вся загрузка, и срок у него общий (`BOOT`):
             // шестьдесят секунд перестало хватать, когда initrd повёз Mono.
             Step::Await("data        : mounted read-write", BOOT),
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
             Step::Line("mkdir /data/c4"),
             Step::Await("created /data/c4", 30_000),
             Step::Line("run -b /bin/files /data/c4"),
@@ -11534,7 +11721,7 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_000),
             Step::Shot("08-properties"),
             Step::Key("esc"),
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("files: closing on request", 15_000),
             Step::Absent("KERNEL PANIC"),
         ],
@@ -11562,7 +11749,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Та же причина, что у `taskmgr`: строка, набранная под шум трёх
             // падений `sshd`, теряется.
             Step::Await("init: 'sshd' failed 3 time(s) in a row, giving up", 60_000),
@@ -11613,7 +11800,7 @@ pub const ALL: &[Scenario] = &[
         memory: "",
         extra: &[],
         steps: &[
-            Step::Await("freeos> ", BOOT),
+            Step::Await(PROMPT, BOOT),
             // Без сети `sshd` три раза падает и печатает об этом, а строка,
             // набранная в серийную линию под этот шум, теряется (см. заметку
             // об UART). Дождаться, пока супервизор сдастся.
@@ -11686,7 +11873,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("taskmgr: services: 4 described, ", 15_000),
             Step::Wait(800),
             Step::Shot("06-services"),
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("taskmgr: closing on request", 15_000),
             Step::Await("desktop     : closed the window of ", 15_000),
             // Из меню трея: пятый пункт, над ним две черты.
@@ -11697,7 +11884,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("desktop     : started '/bin/taskmgr'", 15_000),
             Step::Await("window      : 'Task Manager' at", 30_000),
-            Step::Key("ctrl-w"),
+            Step::Key("alt-f4"),
             Step::Await("taskmgr: closing on request", 15_000),
             Step::Absent("KERNEL PANIC"),
         ],
@@ -11730,7 +11917,7 @@ pub const ALL: &[Scenario] = &[
             // с причиной, и том остался бы на чтение.
             Step::Await("data        : btrfs at LBA", 60_000),
             Step::Await("data        : mounted read-write", 10_000),
-            Step::Await("freeos> ", 60_000),
+            Step::Await(PROMPT, 60_000),
 
             // Новый каталог и встроенный файл: данные лежат в листе дерева.
             Step::Line("mkdir /data/notes"),
@@ -11802,7 +11989,7 @@ pub const ALL: &[Scenario] = &[
             Step::Raw(b"\x1b[21~"),
             Step::Await("mc: done", 15_000),
             Step::Await("tty         : foreground released", 15_000),
-            Step::Await("freeos> ", 15_000),
+            Step::Await(PROMPT, 15_000),
 
             // Копия читается программой, то есть сектор за сектором со сверкой
             // суммы, которую посчитал наш писатель.

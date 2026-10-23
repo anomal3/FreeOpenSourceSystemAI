@@ -542,7 +542,9 @@ fn keyboard(pass: &mut Pass, x: i32, y: i32, w: u32) {
     for (title, desc, keys) in [
         ("Переключить раскладку", "", "Alt+Shift"),
         ("Меню FossAi", "", "F1"),
-        ("Закрыть окно", "", "Ctrl+W"),
+        ("Закрыть окно", "", "Alt+F4"),
+        ("Переключить окно", "", "Alt+Tab"),
+        ("Сдвинуть окно", "", "Win+стрелки"),
         ("Прервать программу", "В терминале", "Ctrl+C"),
     ] {
         y = row(pass, x, y, w, Some(Fi::Keyboard), title, desc, Ctl::Mono(keys), None);

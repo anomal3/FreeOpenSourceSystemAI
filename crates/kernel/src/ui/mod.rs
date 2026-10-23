@@ -21,7 +21,7 @@
 //! Порядок разбора, сверху вниз:
 //!
 //! 1. открытое меню — пока оно открыто, оно забирает всё;
-//! 2. сочетания оконного менеджера (Meta, Alt+Tab, Ctrl+W, Ctrl+стрелки);
+//! 2. сочетания оконного менеджера (Meta, Alt+Tab, Alt+F4, Win+стрелки);
 //! 3. активное окно, если оно умеет обрабатывать клавиши (файловый менеджер);
 //! 4. оболочка — но только если активно именно её окно.
 //!
@@ -113,6 +113,17 @@ pub fn framebuffer() -> boot_info::Framebuffer {
 /// Обычные статики, а не поле стола: стол вынимается из-под замка на время
 /// работы, и класть в него состояние, которое нужно **между** двумя вызовами,
 /// значит гадать, тот ли это стол.
+/// Буфер обмена стола (терминал T5): Ctrl+Shift+C в терминале кладёт сюда
+/// выделенное, Ctrl+Shift+V и правая кнопка — набирают его.
+static CLIPBOARD: SpinLock<String> = SpinLock::new(String::new());
+
+/// Левую кнопку нажали в терминале и держат: движение мыши тянет выделение.
+static SELECTING: AtomicBool = AtomicBool::new(false);
+
+/// Самое длинное, что вставка набирает за раз: вставка идёт нажатиями
+/// клавиш через очередь ввода, а у очереди есть дно.
+const PASTE_LIMIT: usize = 1000;
+
 static LAST_ICON_CLICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static LAST_ICON: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
@@ -1020,6 +1031,7 @@ pub fn tick() {
             change_mode(desktop, ((request >> 32) as u32, request as u32), &status);
         }
         desktop.refresh_panel(&status);
+        desktop.reload_icons_if_packages_changed();
         desktop.present();
     });
 }
@@ -1215,8 +1227,11 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
             desktop.present();
             return None;
         }
-        KeyCode::W if event.mods.contains(Modifiers::CTRL) => {
-            // Окно программы закрывает сама программа, и Ctrl+W для неё —
+        // Alt+F4, как в Windows. До терминала T1 это был Ctrl+W, и окну он не
+        // доставался: в терминале Ctrl+W стирает слово, в Chromium закрывает
+        // вкладку, а стол закрывал им всё окно.
+        KeyCode::F4 if event.mods.contains(Modifiers::ALT) => {
+            // Окно программы закрывает сама программа, и Alt+F4 для неё —
             // такая же просьба, как крестик. Иначе сочетание отнимало бы у неё
             // и окно, и возможность спросить «сохранить?».
             let focused = desktop.focused_app();
@@ -1237,8 +1252,10 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
             desktop.present();
             return None;
         }
+        // Win+стрелки двигают окно (до T1 — Ctrl+стрелки: в терминале и
+        // Chromium это переходы по словам).
         KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-            if event.mods.contains(Modifiers::CTRL) =>
+            if event.mods.contains(Modifiers::META) =>
         {
             let (dx, dy) = match event.code {
                 KeyCode::Left => (-MOVE_STEP, 0),
@@ -1373,10 +1390,13 @@ fn wheel(desktop: &mut Compositor, x: i32, y: i32, clicks: i32) {
     }
     // Окно ядра под указателем — «Параметры» прокручиваются (фаза 69b).
     if target.is_none() && desktop.dragging().is_none() && !desktop.menu_open() && !desktop.context_open() {
-        let moved = desktop
-            .window_under(x, y)
-            .and_then(|app| desktop.find(app))
-            .is_some_and(|window| window.wheel(clicks));
+        let moved = desktop.window_under(x, y).and_then(|app| desktop.find(app)).is_some_and(|window| {
+            let moved = window.wheel(clicks);
+            if moved && window.app == App::Terminal {
+                log_terminal_view(window);
+            }
+            moved
+        });
         if moved {
             desktop.present();
         }
@@ -1413,6 +1433,11 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
     if dx != 0 || dy != 0 {
         hover(desktop, x, y, event.buttons);
+        if event.buttons.contains(Buttons::LEFT) && SELECTING.load(Ordering::Relaxed) {
+            if let Some(window) = desktop.find(App::Terminal) {
+                window.term_select_to(x, y);
+            }
+        }
     }
     if event.wheel != 0 {
         wheel(desktop, x, y, event.wheel);
@@ -1455,7 +1480,18 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 let redirected = desktop.focused_app() != app && !popup;
                 let target = app.and_then(|app| desktop.find(app));
                 if let Some(window) = target.filter(|_| !redirected) {
-                    if window.is_program() {
+                    // Терминал: правая кнопка копирует выделенное, а без
+                    // выделения вставляет — как в Windows Terminal и PuTTY.
+                    if window.app == App::Terminal {
+                        let selection = window.term_selection();
+                        if selection.is_empty() {
+                            paste_clipboard();
+                        } else {
+                            window.term_clear_selection();
+                            kprintln!("  terminal    : copied {} chars", selection.chars().count());
+                            *CLIPBOARD.lock() = selection;
+                        }
+                    } else if window.is_program() {
                         let local = (x - window.rect.x, y - window.rect.y - window.bar() as i32);
                         window.push_event(WinEvent {
                             kind: WIN_POINTER,
@@ -1476,7 +1512,9 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 Some(index) => {
                     desktop.select_icon(Some(index));
                     match desktop.icon_kind(index) {
-                        Some(icons::Kind::App(_)) => (&context::Action::ON_APP[..], "icon"),
+                        // Программа (в том числе из пакета) — не файл: ни
+                        // переименовать, ни удалить её со стола нечем.
+                        Some(icons::Kind::App(_) | icons::Kind::Program(_)) => (&context::Action::ON_APP[..], "icon"),
                         Some(_) => (&context::Action::ON_ENTRY[..], "entry"),
                         None => (&context::Action::ON_DESKTOP[..], "desktop"),
                     }
@@ -1518,6 +1556,11 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
     if event.released(Buttons::LEFT) {
         release_pointer(desktop, x, y, 1);
+        if SELECTING.swap(false, Ordering::Relaxed) {
+            if let Some(text) = desktop.find(App::Terminal).and_then(Window::term_select_end) {
+                kprintln!("  terminal    : selected {} chars", text.chars().count());
+            }
+        }
         match desktop.keyboard_release() {
             keyboard::Release::Nothing | keyboard::Release::Language => {}
             keyboard::Release::Key(action) => type_on_screen(desktop, action),
@@ -2043,6 +2086,9 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                         false
                     }
                     Some(window) => {
+                        if window.app == App::Terminal && window.term_select_start(x, y) {
+                            SELECTING.store(true, Ordering::Relaxed);
+                        }
                         window.handle_click(x, y);
                         request = window.took_request();
                         answer = window.take_answer();
@@ -2100,6 +2146,96 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
         (Some(_), Answer::Close) => kprintln!("  desktop     : '{}' cancelled", app.title()),
         (None, _) => {}
     }
+}
+
+/// Клавиши самого окна терминала (терминал T5), а не оболочки: прокрутка
+/// вывода, копирование и вставка. `true` — клавиша съедена.
+///
+/// Сочетания — как в Windows Terminal: Shift+PgUp/PgDn листают страницу,
+/// Ctrl+Shift+↑/↓ — строку, Ctrl+Shift+Home/End — в начало и в конец;
+/// Ctrl+Shift+C копирует (просто Ctrl+C — тоже, если есть выделение, иначе
+/// это прерывание), Ctrl+Shift+V, Ctrl+V и Shift+Insert вставляют. Любая
+/// другая клавиша возвращает вид к живому экрану: набирают там.
+fn terminal_key(desktop: &mut Compositor, event: KeyEvent) -> bool {
+    let shift = event.mods.contains(Modifiers::SHIFT);
+    let ctrl = event.mods.contains(Modifiers::CTRL);
+    let Some(window) = desktop.find(App::Terminal) else {
+        return false;
+    };
+    let page = window.size_in_cells().1.saturating_sub(1).max(1) as i32;
+    let scroll = match event.code {
+        KeyCode::PageUp if shift => Some(page),
+        KeyCode::PageDown if shift => Some(-page),
+        KeyCode::Up if ctrl && shift => Some(1),
+        KeyCode::Down if ctrl && shift => Some(-1),
+        KeyCode::Home if ctrl && shift => Some(i32::MAX / 2),
+        KeyCode::End if ctrl && shift => Some(-(i32::MAX / 2)),
+        _ => None,
+    };
+    if let Some(rows) = scroll {
+        if window.term_scroll(rows) {
+            log_terminal_view(window);
+        }
+        desktop.present();
+        return true;
+    }
+    let selection = window.term_selection();
+    if event.code == KeyCode::C && ctrl && (shift || !selection.is_empty()) {
+        if !selection.is_empty() {
+            window.term_clear_selection();
+            kprintln!("  terminal    : copied {} chars", selection.chars().count());
+            *CLIPBOARD.lock() = selection;
+        }
+        desktop.present();
+        return true;
+    }
+    if (event.code == KeyCode::V && ctrl) || (event.code == KeyCode::Insert && shift && !ctrl) {
+        window.term_scroll_to_bottom();
+        desktop.present();
+        paste_clipboard();
+        return true;
+    }
+    let modifier = matches!(
+        event.code,
+        KeyCode::LeftShift
+            | KeyCode::RightShift
+            | KeyCode::LeftCtrl
+            | KeyCode::RightCtrl
+            | KeyCode::LeftAlt
+            | KeyCode::RightAlt
+            | KeyCode::LeftMeta
+            | KeyCode::RightMeta
+    );
+    if !modifier && window.term_scroll_to_bottom() {
+        log_terminal_view(window);
+        desktop.present();
+    }
+    false
+}
+
+/// Где сейчас вид терминала — в журнал: снаружи прокрутку иначе видно только
+/// на снимке.
+fn log_terminal_view(window: &Window) {
+    let (back, kept) = window.term_view();
+    kprintln!("  terminal    : view {back} lines back of {kept}");
+}
+
+/// Набрать содержимое буфера обмена в терминал — нажатиями, как с клавиатуры.
+/// Переводы строк становятся пробелами: вставка не должна запускать команды,
+/// которых человек не видел.
+fn paste_clipboard() {
+    let text: String = CLIPBOARD
+        .lock()
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(PASTE_LIMIT)
+        .collect();
+    let text = text.trim_end();
+    if text.is_empty() {
+        return;
+    }
+    kprintln!("  terminal    : pasted {} chars", text.chars().count());
+    type_text(text, false);
 }
 
 /// Чем эта клавиша приедет в окно программы, и приедет ли вообще.
@@ -2222,7 +2358,12 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
         // Окна оболочки может не быть вовсе (его закрыли) — тогда ввод всё
         // равно уходит ей: иначе система осталась бы без единственного места,
         // где можно набрать команду.
-        Some(App::Terminal) | None => Some(event),
+        Some(App::Terminal) | None => {
+            if event.pressed && terminal_key(desktop, event) {
+                return None;
+            }
+            Some(event)
+        }
         // Окно программы получает символ, а не код клавиши; отпускание —
         // выше, по таблице нажатий. Клавише без символа даётся имя из договора — но только той, которой
         // это имя выдано: остальные (F-ряд, цифровой блок) событий по-прежнему
@@ -2850,6 +2991,13 @@ fn request_close(desktop: &mut Compositor, app: App) -> bool {
 /// поверх кадров, которые выдал и которыми владеет [`crate::user`]. Окно живёт
 /// ровно столько же, сколько они, и снимает их тот же путь, что снимает окно.
 pub fn open_window(task: u32, slot: u32, title: &str, pixels: Surface) -> Result<(), WindowError> {
+    open_window_framed(task, slot, title, pixels, true)
+}
+
+/// То же, что [`open_window`], но окно может быть без рамки стола (`framed`
+/// — `false`): заголовок и кнопки рисует сама программа (фаза 71i, окна
+/// сервера Wayland).
+pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, framed: bool) -> Result<(), WindowError> {
     let app = App::Program(task, slot);
     let (w, h) = (pixels.width(), pixels.height());
     with_desktop(|desktop| {
@@ -2860,7 +3008,7 @@ pub fn open_window(task: u32, slot: u32, title: &str, pixels: Surface) -> Result
         // Окно выше поверхности на полосу заголовка: программа просит место
         // **под содержимое**, а полосу рисует ядро. Считать иначе значило бы
         // отдавать ей окно, в котором её же рисунок наполовину под заголовком.
-        let full_h = h.saturating_add(Window::title_height(scale));
+        let full_h = if framed { h.saturating_add(Window::title_height(scale)) } else { h };
         let screen = desktop.screen_width();
         let work = desktop.work_bottom().max(1) as u32;
         let rect = Rect::new(
@@ -2869,8 +3017,12 @@ pub fn open_window(task: u32, slot: u32, title: &str, pixels: Surface) -> Result
             w,
             full_h,
         );
-        let window =
+        let mut window =
             Window::program(app, rect, scale, title, pixels).ok_or(WindowError::NoMemory)?;
+        if !framed {
+            window.frameless = true;
+            window.redraw_content();
+        }
         desktop.push(window);
         kprintln!(
             "  desktop     : opened '{title}' for {}",
@@ -2947,6 +3099,99 @@ pub fn commit_window(task: u32, slot: u32, area: Option<Rect>) -> Result<(), Win
         Ok(())
     })
     .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Начать перетаскивание окна программы (фаза 71i, `xdg_toplevel.move`):
+/// программа без рамки стола, нажав кнопку на своей полосе заголовка, просит
+/// стол тащить окно, пока кнопка не отпущена. Захват указателя программой
+/// снимается — дальше движения достаются столу.
+pub fn begin_move(task: u32, slot: u32) -> Result<(), WindowError> {
+    begin_drag(task, slot, false)
+}
+
+/// Начать изменение размера окна программы (`xdg_toplevel.resize`): как
+/// уголок стола — тянется правый нижний угол, какой бы край ни взяли.
+pub fn begin_resize(task: u32, slot: u32) -> Result<(), WindowError> {
+    begin_drag(task, slot, true)
+}
+
+fn begin_drag(task: u32, slot: u32, resize: bool) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        if desktop.index_of(app).is_none() {
+            return Err(WindowError::NoWindow);
+        }
+        desktop.drop_capture();
+        if resize {
+            desktop.set_resize_drag(app);
+            kprintln!("  desktop     : resizing '{}'", name_of(desktop, app));
+        } else {
+            desktop.set_drag(Some(app));
+            kprintln!("  desktop     : drag '{}'", name_of(desktop, app));
+        }
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Развернуть (`on`) или вернуть окно программы (`xdg_toplevel.set_maximized`
+/// и `unset_maximized`). Уже в нужном состоянии — ничего.
+pub fn maximize_window(task: u32, slot: u32, on: bool) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        let now = desktop.find(app).ok_or(WindowError::NoWindow)?.is_maximized();
+        if now != on && desktop.toggle_maximize(app) {
+            kprintln!("  desktop     : resized '{}'", name_of(desktop, app));
+            log_window(desktop, app, true);
+            desktop.present();
+        }
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Развёрнуто ли окно программы.
+#[must_use]
+pub fn window_maximized(task: u32, slot: u32) -> bool {
+    with_desktop(|desktop| desktop.find(App::Program(task, slot)).is_some_and(|window| window.is_maximized())).unwrap_or(false)
+}
+
+/// Где окно программы стоит на экране — всплывающим окнам Wayland, чтобы
+/// меню у края экрана открывалось в другую сторону (фаза 71i).
+pub fn window_rect(task: u32, slot: u32) -> Option<Rect> {
+    with_desktop(|desktop| desktop.rect_of(App::Program(task, slot))).flatten()
+}
+
+/// Свернуть окно программы (`xdg_toplevel.set_minimized`).
+pub fn minimize_window(task: u32, slot: u32) -> Result<(), WindowError> {
+    let app = App::Program(task, slot);
+    with_desktop(|desktop| {
+        if desktop.minimize(app) {
+            kprintln!("  desktop     : minimized '{}'", name_of(desktop, app));
+            log_focus(desktop);
+            desktop.refresh_panel(&status_now());
+            desktop.present();
+        }
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
+/// Подпись окна терминала: `Some` — что в нём сейчас выполняется (терминал
+/// T4), `None` — обычная. Видна в заголовке и на кнопке панели задач.
+pub fn shell_status(status: Option<&str>) {
+    with_desktop(|desktop| {
+        let focused = desktop.focused_app() == Some(App::Terminal);
+        let caption = match status {
+            Some(status) => alloc::format!("{} — {status}", App::Terminal.caption()),
+            None => String::from(App::Terminal.caption()),
+        };
+        let changed = desktop.find(App::Terminal).is_some_and(|window| window.set_caption(&caption, focused));
+        if changed {
+            desktop.refresh_panel(&status_now());
+            desktop.present();
+        }
+    });
 }
 
 /// Вид события окна, которого нет в договоре с программами: код клавиши

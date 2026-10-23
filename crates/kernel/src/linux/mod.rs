@@ -244,6 +244,7 @@ mod e {
     pub const EINVAL: i64 = 22;
     pub const EMFILE: i64 = 24;
     pub const ENOTTY: i64 = 25;
+    pub const ENODEV: i64 = 19;
     pub const EPIPE: i64 = 32;
     pub const ENOSYS: i64 = 38;
     pub const ENOTEMPTY: i64 = 39;
@@ -1370,6 +1371,16 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
                     }
                     None => return -e::ENOMEM,
                 }
+            }
+            // Общее чтение файла, открытого на запись, — отказ: отображение
+            // берёт снимок страниц и не увидит последующих `pwrite`. SQLite
+            // (базы профиля Chromium) читает базу именно так, а пишет мимо — и
+            // видела бы старые страницы («Profile error occurred»). На отказ
+            // она отвечает чтением через `read`.
+            _ if shared_flag
+                && crate::user::with_current(|program| program.files.access_mode(fd)).is_some_and(|mode| mode.is_ok_and(|mode| mode != 0)) =>
+            {
+                return -e::ENODEV;
             }
             _ => Some((node, offset as u64)),
         }

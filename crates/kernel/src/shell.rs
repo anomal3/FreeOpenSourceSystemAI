@@ -24,19 +24,54 @@ use core::fmt::{self, Write};
 use alloc::string::String;
 
 use crate::input::line::{Edit, LineEditor};
-use crate::input::{self, KeyCode};
+use crate::input::{self, KeyCode, KeyEvent};
 use crate::sync::Mutex;
 use crate::vfs::perm::Access;
 use crate::vfs::{NodeKind, VfsError};
 use crate::{fs, irq, kprint, mm, sched, time, tty, ui, usb, user};
 
-/// Приглашение к вводу — ярко-зелёным, как в макете телефона (экран 06).
-///
-/// Цвет охватывает и пробел за `>`, и это не небрежность: стенд ищет в линии
-/// строку `freeos> ` целиком, и сброс цвета между `>` и пробелом разорвал бы
-/// её для каждого сценария разом. Цвет отличает приглашение от вывода команд —
-/// на экране телефона без него всё сливается в один столбец.
-const PROMPT: &str = "\x1b[92mfreeos> \x1b[0m";
+mod complete;
+mod history;
+
+/// Метки оболочки для терминала — shell integration, как у Windows Terminal
+/// (`OSC 133`): начало приглашения, начало ввода, начало выполнения команды и
+/// её конец с кодом. На экране их не видно (терминал их глотает), а стенд
+/// ждёт приглашение по метке начала ввода: текст приглашения теперь меняется
+/// вместе с каталогом и пользователем (терминал T4).
+const MARK_PROMPT: &str = "\x1b]133;A\x07";
+pub const MARK_INPUT: &str = "\x1b]133;B\x07";
+const MARK_RUN: &str = "\x1b]133;C\x07";
+
+/// Текущий каталог оболочки (`cd`, `pwd`, относительные пути).
+static CWD: Mutex<String> = Mutex::new(String::new());
+
+/// История команд — общая для приглашения и команды `history`.
+static HISTORY: Mutex<history::History> = Mutex::new(history::History::new());
+
+/// Код возврата последней команды (терминал T4): ненулевой приглашение
+/// показывает красным `[N]`, как это делают темы bash и PowerShell.
+static LAST_EXIT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// Чем закончилась последняя программа: её задача и код. Программа кладёт
+/// сюда код сама, уходя ([`note_exit`]), а оболочка забирает его, если это
+/// была её программа переднего плана.
+static EXITED: crate::sync::SpinLock<Option<(sched::TaskId, i64)>> = crate::sync::SpinLock::new(None);
+
+/// Программа текущей задачи закончилась с кодом `code`.
+pub fn note_exit(code: i64) {
+    *EXITED.lock() = Some((sched::current(), code));
+}
+
+/// Текущий каталог; пустой — домашний того, кто вошёл.
+fn cwd() -> String {
+    let now = CWD.lock().clone();
+    if now.is_empty() { ui::context::home_dir() } else { now }
+}
+
+/// Ширина окна оболочки в символах; ноль — окна нет (серийная консоль).
+fn shell_cols() -> usize {
+    if ui::is_active() { ui::shell_size().0 as usize } else { 0 }
+}
 
 /// Сколько секунд ждать ввода, прежде чем закончить сеанс, когда набирать
 /// некому.
@@ -309,9 +344,12 @@ pub fn task() {
 
     banner();
     ui::set_cursor(true);
-    sprint!("{PROMPT}");
 
     let mut editor = LineEditor::new();
+    HISTORY.lock().load();
+    let mut tabs = 0u32;
+    let mut search: Option<Search> = None;
+    show_prompt(&mut editor);
     let mut idle_since = time::uptime_ms();
     let mut status_at = 0u64;
 
@@ -349,8 +387,31 @@ pub fn task() {
             let Some(event) = ui::dispatch(event) else {
                 continue;
             };
-            match editor.handle(event, &mut Out) {
+            // Поиск по истории (Ctrl+R) разбирает клавиши сам, пока не кончится.
+            if let Some(state) = search.as_mut() {
+                if !event.pressed {
+                    continue;
+                }
+                let outcome = search_key(state, event, &mut editor, &HISTORY.lock());
+                match outcome {
+                    SearchEnd::Continue => continue,
+                    SearchEnd::Edit => {
+                        search = None;
+                        continue;
+                    }
+                    SearchEnd::Run => search = None,
+                }
+            }
+            let tab = event.pressed && event.code == KeyCode::Tab;
+            let result = editor.handle(event, &mut Out);
+            if event.pressed && !matches!(event.code, KeyCode::LeftShift | KeyCode::RightShift | KeyCode::LeftCtrl | KeyCode::RightCtrl | KeyCode::LeftAlt | KeyCode::RightAlt) {
+                tabs = if tab { tabs + 1 } else { 0 };
+            }
+            match result {
                 Edit::Submitted => {
+                    HISTORY.lock().add(editor.as_str());
+                    LAST_EXIT.store(0, core::sync::atomic::Ordering::Relaxed);
+                    sprint!("{MARK_RUN}");
                     let done = run_command(editor.as_str());
                     editor.clear();
                     // Отсчёт простоя начинается **после** команды, а не до неё.
@@ -376,7 +437,7 @@ pub fn task() {
                             return;
                         }
                         Replay::Ran => {}
-                        Replay::Nothing => sprint!("{PROMPT}"),
+                        Replay::Nothing => show_prompt(&mut editor),
                     }
                     // И ещё раз — **после** отложенных команд, по той же
                     // причине, по которой отсчёт сдвинут выше. Отложенная
@@ -397,7 +458,7 @@ pub fn task() {
                     // быстрее, и та же команда идёт обычным путём.
                     idle_since = time::uptime_ms();
                 }
-                Edit::Cancelled => sprint!("{PROMPT}"),
+                Edit::Cancelled => show_prompt(&mut editor),
                 Edit::EndOfInput => {
                     sprintln!("  end of input");
                     ui::set_cursor(false);
@@ -406,12 +467,22 @@ pub fn task() {
                 Edit::Full => {
                     sprintln!();
                     sprintln!("  the line is full ({} bytes)", input::line::MAX_LINE);
-                    sprint!("{PROMPT}{}", editor.as_str());
+                    show_prompt(&mut editor);
                 }
-                Edit::Unhandled(code) => {
-                    handle_key(code, &editor);
+                Edit::Unhandled(event) => {
+                    let started = handle_key(event, &mut editor, &mut HISTORY.lock(), tabs);
+                    if let Some(started) = started {
+                        search = Some(started);
+                    }
                 }
-                Edit::Ignored | Edit::Inserted | Edit::Erased => {}
+                Edit::Inserted | Edit::Erased => HISTORY.lock().reset(),
+                Edit::Ignored | Edit::Moved => {}
+            }
+            // Серая подсказка из истории — после каждой клавиши, пока курсор в
+            // конце строки.
+            if search.is_none() {
+                let hint = HISTORY.lock().suggest(editor.as_str()).map(|line| String::from(&line[editor.as_str().len()..]));
+                editor.set_hint(hint.as_deref(), &mut Out);
             }
         }
 
@@ -531,7 +602,7 @@ fn banner() {
     sprintln!("FossAi shell. 'help' for commands, 'exit' to finish.");
     if ui::is_active() {
         let (cols, rows) = ui::shell_size();
-        sprintln!("Window {cols}x{rows}. Tab raises the window below.");
+        sprintln!("Window {cols}x{rows}. Alt+Tab raises the window below; Tab completes.");
     }
     // Перечисляем только то, что действительно поднялось. Обещать клавиатуру на
     // машине, где её нет, — это заставить человека искать неисправность там, где
@@ -663,14 +734,168 @@ fn banner() {
     sprintln!();
 }
 
-/// Клавиши, которые не относятся к правке строки.
+/// Клавиши, которые не относятся к правке строки: история (↑, ↓, Ctrl+P,
+/// Ctrl+N), дополнение (Tab), экран (Ctrl+L), поиск (Ctrl+R — ответ: начать
+/// его). `tabs` — сколько раз подряд нажат Tab, считая этот.
 ///
 /// Сочетаний рабочего стола здесь нет и быть не должно: их разобрал
 /// [`ui::dispatch`] до того, как событие дошло до оболочки.
-fn handle_key(code: KeyCode, editor: &LineEditor) {
+fn handle_key(event: KeyEvent, editor: &mut LineEditor, history: &mut history::History, tabs: u32) -> Option<Search> {
+    let ch = event.to_char();
+    match (event.code, ch) {
+        (KeyCode::Up, _) | (_, Some('\u{10}')) => {
+            if let Some(line) = history.older(editor.as_str()).map(String::from) {
+                editor.replace(&line, &mut Out);
+            }
+        }
+        (KeyCode::Down, _) | (_, Some('\u{e}')) => {
+            if let Some(line) = history.newer(editor.as_str()) {
+                editor.replace(&line, &mut Out);
+            }
+        }
+        (KeyCode::Tab, _) => complete_word(editor, tabs),
+        (_, Some('\u{c}')) => {
+            ui::clear_shell();
+            show_prompt(editor);
+        }
+        (_, Some('\u{12}')) => {
+            let state = Search { query: String::new(), index: history.len(), found: None, saved: String::from(editor.as_str()) };
+            draw_search(&state, editor);
+            return Some(state);
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Tab: единственный вариант — подставить, несколько — общее начало, второй
+/// Tab подряд — список колонками под строкой.
+fn complete_word(editor: &mut LineEditor, tabs: u32) {
+    let before = String::from(editor.before_cursor());
+    let found = complete::complete(&before, &cwd());
+    match found.candidates.len() {
+        0 => {}
+        1 => {
+            let (text, dir) = &found.candidates[0];
+            let mut text = text.clone();
+            text.push(if *dir { '/' } else { ' ' });
+            editor.replace_word(found.start, &text, &mut Out);
+        }
+        _ => {
+            let common = found.common_prefix();
+            if common.len() > before.len() - found.start {
+                editor.replace_word(found.start, &common, &mut Out);
+            } else if tabs >= 2 {
+                list_candidates(&found);
+                show_prompt(editor);
+            }
+        }
+    }
+}
+
+/// Варианты колонками, как у bash: каталоги — синим со `/`.
+fn list_candidates(found: &complete::Completion) {
     sprintln!();
-    sprintln!("  key: {}", code.name());
-    sprint!("{PROMPT}{}", editor.as_str());
+    let names: alloc::vec::Vec<String> = found
+        .candidates
+        .iter()
+        .map(|(text, dir)| {
+            let name = text.rsplit('/').find(|part| !part.is_empty()).unwrap_or(text);
+            if *dir { alloc::format!("{name}/") } else { String::from(name) }
+        })
+        .collect();
+    let widest = names.iter().map(|name| name.chars().count()).max().unwrap_or(1) + 2;
+    let per_row = (shell_cols().max(40) / widest).max(1);
+    for (index, name) in names.iter().enumerate() {
+        let pad = widest - name.chars().count();
+        if name.ends_with('/') {
+            sprint!("\x1b[94m{name}\x1b[0m{:pad$}", "");
+        } else {
+            sprint!("{name}{:pad$}", "");
+        }
+        if (index + 1) % per_row == 0 || index + 1 == names.len() {
+            sprintln!();
+        }
+    }
+}
+
+/// Поиск по истории (Ctrl+R), как `reverse-i-search` в bash.
+struct Search {
+    query: String,
+    /// Искать старше этой команды.
+    index: usize,
+    found: Option<usize>,
+    /// Строка до поиска — вернётся по Esc.
+    saved: String,
+}
+
+/// Чем кончилась клавиша в поиске.
+enum SearchEnd {
+    Continue,
+    /// Поиск окончен, найденное — в строке для правки.
+    Edit,
+    /// Поиск окончен, Enter — выполнить (его разберёт главный цикл).
+    Run,
+}
+
+/// Перерисовать строку поиска: `(поиск 'запрос'): найденное`.
+fn draw_search(state: &Search, editor: &mut LineEditor) {
+    editor.to_prompt_start(&mut Out);
+    let label = alloc::format!("(поиск '{}'): ", state.query);
+    sprint!("\x1b[J\x1b[93m{label}\x1b[0m");
+    let width = label.chars().count();
+    editor.reprint(width, shell_cols(), &mut Out);
+}
+
+fn search_key(state: &mut Search, event: KeyEvent, editor: &mut LineEditor, history: &history::History) -> SearchEnd {
+    let ch = event.to_char();
+    match (event.code, ch) {
+        (KeyCode::Enter | KeyCode::KeypadEnter, _) => {
+            finish_search(editor);
+            return SearchEnd::Run;
+        }
+        (KeyCode::Escape, _) | (_, Some('\u{7}')) => {
+            let saved = core::mem::take(&mut state.saved);
+            editor.clear();
+            editor.preload(saved.as_bytes());
+            finish_search(editor);
+            return SearchEnd::Edit;
+        }
+        (KeyCode::Backspace, _) => {
+            state.query.pop();
+            state.index = history.len();
+        }
+        (_, Some('\u{12}')) => {
+            // Следующая, ещё старше.
+            if let Some(found) = state.found {
+                state.index = found;
+            }
+        }
+        (_, Some(ch)) if (ch as u32) >= 0x20 => {
+            state.query.push(ch);
+            state.index = history.len();
+        }
+        // Стрелки и прочее — выйти в правку с найденным.
+        (KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End | KeyCode::Up | KeyCode::Down, _) => {
+            finish_search(editor);
+            return SearchEnd::Edit;
+        }
+        _ => return SearchEnd::Continue,
+    }
+    let found = history.search(&state.query, state.index);
+    state.found = found.map(|(index, _)| index);
+    let text = found.map_or_else(String::new, |(_, line)| String::from(line));
+    editor.clear();
+    editor.preload(text.as_bytes());
+    draw_search(state, editor);
+    SearchEnd::Continue
+}
+
+/// Вернуть обычное приглашение с найденным в строке.
+fn finish_search(editor: &mut LineEditor) {
+    editor.to_prompt_start(&mut Out);
+    sprint!("\x1b[J");
+    show_prompt(editor);
 }
 
 /// Обновить панель задач.
@@ -705,6 +930,19 @@ fn update_status() {
 /// команда оболочки и так печатает его в строку, а `Cow` в сигнатуре стоил бы
 /// времени жизни у каждого места вызова.
 fn human_path(argument: &str) -> Option<String> {
+    // `~` — дом, относительный путь — от текущего каталога (терминал T4).
+    let home = ui::context::home_dir();
+    let expanded = if argument == "~" {
+        home
+    } else if let Some(rest) = argument.strip_prefix("~/") {
+        alloc::format!("{home}/{rest}")
+    } else if !argument.starts_with('/') && !argument.contains(':') && !argument.contains('\\') {
+        alloc::format!("{}/{argument}", cwd())
+    } else {
+        String::from(argument)
+    };
+    let argument = normalize(&expanded);
+    let argument = argument.as_str();
     match sysconf::winpath::accept(argument) {
         sysconf::winpath::Accepted::AsIs(path) => Some(String::from(path)),
         sysconf::winpath::Accepted::Translated(path) => Some(path),
@@ -719,6 +957,46 @@ fn human_path(argument: &str) -> Option<String> {
     }
 }
 
+/// Свернуть `.` и `..` в абсолютном пути.
+fn normalize(path: &str) -> String {
+    if !path.starts_with('/') {
+        return String::from(path);
+    }
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let mut out = String::new();
+    for part in parts {
+        out.push('/');
+        out.push_str(part);
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
+
+/// `cd [каталог]`: без аргумента — домой.
+fn change_dir(argument: &str) {
+    let target = if argument.is_empty() { Some(ui::context::home_dir()) } else { human_path(argument) };
+    let Some(target) = target else {
+        return;
+    };
+    match fs::resolve_as(user::session::credentials(), &target, Access::SEARCH) {
+        Some(Ok(node)) if node.metadata().kind == NodeKind::Directory => *CWD.lock() = target,
+        Some(Ok(_)) => sprintln!("  cd: {argument}: not a directory"),
+        Some(Err(err)) => sprintln!("  cd: {argument}: {err}"),
+        None => sprintln!("  cd: {argument}: no such directory"),
+    }
+}
+
 /// Выполнить команду. Возвращает `true`, если сеанс пора закончить.
 fn run_command(line: &str) -> bool {
     let line = line.trim();
@@ -729,6 +1007,9 @@ fn run_command(line: &str) -> bool {
 
     match command {
         "" => {}
+        "cd" => change_dir(argument),
+        "pwd" => sprintln!("{}", cwd()),
+        "history" => show_history(),
         "help" => help(),
         "uptime" => sprintln!("  {} ms, {} timer ticks", time::uptime_ms(), irq::ticks()),
         "date" => date(),
@@ -815,7 +1096,7 @@ fn run_command(line: &str) -> bool {
             }
         }
         "ls" => {
-            let Some(path) = human_path(if argument.is_empty() { "/" } else { argument }) else {
+            let Some(path) = human_path(if argument.is_empty() { "." } else { argument }) else {
                 return false;
             };
             list(&path);
@@ -1380,7 +1661,7 @@ fn sysupdate(argument: &str) {
     line.push_str(argument);
 
     match user::spawn(&line, crate::vfs::perm::Credentials::ROOT) {
-        Ok(id) => foreground(id),
+        Ok(id) => foreground(id, "sysupdate"),
         Err(err) => {
             sprintln!("  sysupdate: {SYSUPDATE}: {err}");
             sprintln!("  sysupdate: this system image has no update program");
@@ -1868,7 +2149,7 @@ fn run_program(argument: &str) {
             if background {
                 sprintln!("  {path}: started as {id}");
             } else {
-                foreground(id);
+                foreground(id, line);
             }
         }
         Err(err) => sprintln!("  {path}: {err}"),
@@ -1925,7 +2206,7 @@ fn run_pipeline(left: &str, right: &str, background: bool) {
     // Ждём **вторую**: она печатает то, ради чего конвейер и запущен. Первая
     // закончится сама — либо дописав, либо получив отказ, когда читателя не
     // станет.
-    foreground(consumer);
+    foreground(consumer, right);
 }
 
 /// Первое слово строки — для сообщения об ошибке.
@@ -1948,12 +2229,28 @@ fn first_word(line: &str) -> &str {
 ///
 /// # Кому достаётся нажатие
 ///
-/// Сначала рабочему столу: его сочетания (`Tab`, `Ctrl+W`, меню) работают и
+/// Сначала рабочему столу: его сочетания (`Alt+Tab`, `Alt+F4`, меню) работают и
 /// поверх программы, потому что окна — это система, а не собственность
 /// программы. Дальше — только если фокус на окне терминала: клавиша, набранная
 /// в окне файлового менеджера, к программе отношения не имеет.
-fn foreground(id: sched::TaskId) {
+///
+/// `label` — что выполняется: пока ждём, оно стоит в заголовке окна
+/// терминала и на кнопке панели вместе с секундами (терминал T4), а после
+/// долгой команды её время печатается серым.
+fn foreground(id: sched::TaskId, label: &str) {
     tty::set_foreground(Some(id));
+    let started = time::uptime_ms();
+    // Имя — программа без пути и первый аргумент: `pkg install`, а не весь
+    // путь к пакету.
+    let short = {
+        let mut words = label.split_whitespace();
+        let program = words.next().unwrap_or(label);
+        let program = program.rsplit('/').next().unwrap_or(program);
+        match words.next() {
+            Some(argument) => alloc::format!("{program} {argument}"),
+            None => String::from(program),
+        }
+    };
     // Строка редактора нужна только в построчном режиме; в прямом байты уезжают
     // в терминал сразу.
     let mut editor = LineEditor::new();
@@ -1969,6 +2266,8 @@ fn foreground(id: sched::TaskId) {
         if ui::animating() || now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
             status_at = now;
             update_status();
+            let seconds = now.saturating_sub(started) / 1000;
+            ui::shell_status(Some(&alloc::format!("{short} · {seconds} с")));
         }
 
         while let Some(event) = input::next_pointer() {
@@ -2015,7 +2314,7 @@ fn foreground(id: sched::TaskId) {
                     sprintln!("  the line is full ({} bytes)", input::line::MAX_LINE);
                 }
                 Edit::Cancelled | Edit::Unhandled(_) | Edit::Ignored | Edit::Inserted
-                | Edit::Erased => {}
+                | Edit::Erased | Edit::Moved => {}
             }
         }
 
@@ -2047,6 +2346,22 @@ fn foreground(id: sched::TaskId) {
         tty::push(editor.as_str().as_bytes());
     }
     tty::set_foreground(None);
+    ui::shell_status(None);
+    // Код — как его показывает bash: снятая программа — 130 (Ctrl+C), убитая
+    // ядром — 139 (как от SIGSEGV).
+    let exited = EXITED.lock().filter(|(task, _)| *task == id).map(|(_, code)| code);
+    if let Some(code) = exited {
+        let shown = match code {
+            user_abi::EXIT_KILLED => 130,
+            user_abi::EXIT_FAULTED => 139,
+            code => code,
+        };
+        LAST_EXIT.store(shown, core::sync::atomic::Ordering::Relaxed);
+    }
+    let spent = time::uptime_ms().saturating_sub(started);
+    if spent >= 2000 {
+        sprintln!("\x1b[90m  {short}: {}.{} с\x1b[0m", spent / 1000, spent % 1000 / 100);
+    }
 }
 
 /// Чем кончился разбор остатка терминала.
@@ -2106,7 +2421,7 @@ fn replay_pending(editor: &mut LineEditor) -> Replay {
             if run_command(text) {
                 return Replay::Finished;
             }
-            sprint!("{PROMPT}");
+            show_prompt(editor);
             start = at + 1;
         }
 
@@ -2332,4 +2647,38 @@ fn intel(argument: &str) {
     for line in crate::display::intel::command(&current, argument) {
         sprintln!("  {line}");
     }
+}
+
+/// `history`: команды с номерами, как в bash.
+fn show_history() {
+    let history = HISTORY.lock();
+    for index in 0..history.len() {
+        if let Some(line) = history.get(index) {
+            sprintln!("{:>5}  {line}", index + 1);
+        }
+    }
+}
+
+/// Напечатать приглашение `пользователь@fossai:каталог$` и уже набранное,
+/// как в bash, и сказать редактору, где начинается ввод.
+fn show_prompt(editor: &mut LineEditor) {
+    let user = user::session::with_name(|name| if name.is_empty() || name == "?" { String::from("root") } else { String::from(name) });
+    let dir = cwd();
+    let home = ui::context::home_dir();
+    let shown = if dir == home {
+        String::from("~")
+    } else if let Some(rest) = dir.strip_prefix(home.as_str()).filter(|rest| rest.starts_with('/')) {
+        alloc::format!("~{rest}")
+    } else {
+        dir
+    };
+    let mark = if user == "root" { '#' } else { '$' };
+    let last = LAST_EXIT.load(core::sync::atomic::Ordering::Relaxed);
+    let status = if last == 0 { String::new() } else { alloc::format!("[{last}] ") };
+    sprint!(
+        "{MARK_PROMPT}\x1b[91m{status}\x1b[92m{user}@fossai\x1b[0m:\x1b[94m{shown}\x1b[0m{mark} {MARK_INPUT}{}",
+        editor.as_str()
+    );
+    let width = status.chars().count() + user.chars().count() + 7 + 1 + shown.chars().count() + 2;
+    editor.begin(width, shell_cols());
 }

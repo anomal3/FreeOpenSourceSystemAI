@@ -284,6 +284,13 @@ pub fn build(arch: Arch) -> Result<()> {
     let mut builder = Builder::new(Kind::Package, "chromium", "150");
     builder.field("summary", "Chromium 150 from Debian 12 with the libraries it loads; windows through the kernel Wayland server");
     builder.field("about", "Chromium для программ Linux: в окне стола и без окна");
+    // Строка в меню «FossAi» и значок на столе (фаза 71i): запуск — через
+    // bash корня Debian, как из терминала.
+    builder.field("caption", "Chromium");
+    builder.field("start", "/opt/debian/bin/bash /opt/chromium/bin/chromium");
+    builder.field("desktop", "yes");
+    builder.field("icon", "network");
+    builder.field("permissions", "windows files net");
     builder.requires("debian");
     let mut bytes = 0usize;
     for (path, data, mode) in &files {

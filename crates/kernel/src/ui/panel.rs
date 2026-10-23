@@ -1108,20 +1108,26 @@ pub enum Choice {
 /// названный предел списка [`PROGRAMS`] здесь снят: `start=` — чем её
 /// запускать, `caption=` и `about=` — как её назвать. Пакет без `start=` в меню
 /// не попадает: это библиотека или данные, запускать там нечего.
-struct Launcher {
+pub(super) struct Launcher {
     name: String,
-    caption: String,
+    pub(super) caption: String,
     about: String,
-    start: String,
+    pub(super) start: String,
     /// Что пакет просит у системы (`permissions=` в манифесте). Отсутствие
     /// строки — пусто, а не «всё»: см. [`fpk::Manifest::rights`].
     rights: fpk::Rights,
+    /// Значок на рабочем столе (`desktop=yes`, фаза 71i).
+    pub(super) desktop: bool,
+    /// Картинка значка по имени (`icon=`): `network`, `terminal`, `folder`…
+    pub(super) icon: String,
 }
+
+/// Где лежат записи установленных пакетов.
+pub(super) const REGISTRY: &str = "/var/lib/pkg";
 
 /// Пакеты со строкой запуска — по имени, чтобы порядок строк не зависел от
 /// порядка записей в каталоге.
-fn list_packages() -> Vec<Launcher> {
-    const REGISTRY: &str = "/var/lib/pkg";
+pub(super) fn list_packages() -> Vec<Launcher> {
     // Предел манифеста в контейнере — 32 КиБ (`fpk::MAX_MANIFEST`); запись
     // реестра — тот же манифест.
     const LIMIT: usize = 32 * 1024;
@@ -1163,6 +1169,8 @@ fn list_packages() -> Vec<Launcher> {
             about: String::from(about),
             start: String::from(start),
             rights,
+            desktop: sysconf::value(text, "desktop") == Some("yes"),
+            icon: String::from(sysconf::value(text, "icon").unwrap_or("package")),
         });
     }
     launchers.sort_by(|a, b| a.name.cmp(&b.name));
