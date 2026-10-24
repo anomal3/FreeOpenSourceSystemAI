@@ -4835,10 +4835,11 @@ pub const ALL: &[Scenario] = &[
             Step::Expect("for entry"),
             Step::Wait(1_500),
             Step::Shot("02-entry-menu"),
-            // «Переименовать» — второй пункт. Строка приходит заполненной
-            // прежним именем; Ctrl+U стирает её целиком, дальше набирается
-            // новое имя на настоящей клавиатуре.
-            Step::Aim(Aim::ContextItem(1, 0)),
+            // «Переименовать» — третий пункт, после черты: у папки сверху
+            // «Открыть» и «Открыть в терминале», как в Windows (24.10).
+            // Строка приходит заполненной прежним именем; Ctrl+U стирает её
+            // целиком, дальше набирается новое имя на настоящей клавиатуре.
+            Step::Aim(Aim::ContextItem(2, 1)),
             Step::Click,
             Step::Wait(1_500),
             Step::Shot("03-rename"),
@@ -4866,7 +4867,7 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Icon(4)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(2, 0)),
+            Step::Aim(Aim::ContextItem(3, 1)),
             Step::Click,
             Step::Wait(1_500),
             Step::Shot("04-delete-confirm"),

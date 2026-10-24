@@ -157,6 +157,30 @@ pub struct Icons {
     packages: String,
 }
 
+/// Подписи ярлыков, убранных со стола «Удалить ярлык», через `|`.
+static HIDDEN: crate::sync::SpinLock<String> = crate::sync::SpinLock::new(String::new());
+
+/// Список убранных ярлыков — из настроек при загрузке.
+pub fn set_hidden(list: &str) {
+    *HIDDEN.lock() = String::from(list);
+}
+
+/// Убрать ярлык с подписью `label` со стола; вернуть новый список.
+pub fn hide(label: &str) -> String {
+    let mut hidden = HIDDEN.lock();
+    if !hidden.split('|').any(|item| item == label) {
+        if !hidden.is_empty() {
+            hidden.push('|');
+        }
+        hidden.push_str(label);
+    }
+    hidden.clone()
+}
+
+fn is_hidden(label: &str) -> bool {
+    HIDDEN.lock().split('|').any(|item| !item.is_empty() && item == label)
+}
+
 /// Имена и длины записей реестра пакетов одной строкой — дешёвая подпись
 /// «что установлено». Длина — потому что `pkg` заводит запись раньше, чем
 /// дописывает её: по одному имени стол прочёл бы её пустой и больше не
@@ -261,7 +285,7 @@ impl Icons {
         self.packages = package_signature();
         // Пакет могли поставить заново с другим значком.
         super::appicon::forget();
-        for launcher in super::panel::list_packages().into_iter().filter(|launcher| launcher.desktop) {
+        for launcher in super::panel::list_packages().into_iter().filter(|launcher| launcher.desktop && !is_hidden(&launcher.caption)) {
             self.items.push(Item {
                 kind: Kind::Program(super::appicon::named(&launcher.icon)),
                 label: launcher.caption,

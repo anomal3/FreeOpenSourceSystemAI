@@ -812,9 +812,11 @@ impl Panel {
                 NetState::Up => p.ink,
                 NetState::NoAddress | NetState::Absent => p.ink3,
             };
+            // Проводная сеть — монитор, как значок Ethernet в Windows (24.10:
+            // глобус с крестом читался как «нет сети» и при сети).
             glyphicon::draw(
                 &mut self.surface,
-                Icon::Network,
+                Icon::Display,
                 x,
                 plate.y + (plate.h as i32 - glyph as i32) / 2,
                 glyph,
@@ -1171,6 +1173,9 @@ pub(super) struct Launcher {
     pub(super) desktop: bool,
     /// Картинка значка по имени (`icon=`): `network`, `terminal`, `folder`…
     pub(super) icon: String,
+    /// Какие файлы программа открывает (`opens=txt,log`): она появляется в
+    /// «Открыть с помощью» у файлов с этими расширениями.
+    pub(super) opens: String,
 }
 
 /// Где лежат записи установленных пакетов.
@@ -1222,6 +1227,7 @@ pub(super) fn list_packages() -> Vec<Launcher> {
             rights,
             desktop: sysconf::value(text, "desktop") == Some("yes"),
             icon: String::from(sysconf::value(text, "icon").unwrap_or("package")),
+            opens: String::from(sysconf::value(text, "opens").unwrap_or("")),
         });
     }
     launchers.sort_by(|a, b| a.name.cmp(&b.name));

@@ -115,6 +115,10 @@ pub fn framebuffer() -> boot_info::Framebuffer {
 /// Обычные статики, а не поле стола: стол вынимается из-под замка на время
 /// работы, и класть в него состояние, которое нужно **между** двумя вызовами,
 /// значит гадать, тот ли это стол.
+/// Окна группы, показанные списком над кнопкой панели задач, — по номерам
+/// пунктов меню.
+static GROUP: SpinLock<alloc::vec::Vec<App>> = SpinLock::new(alloc::vec::Vec::new());
+
 /// Буфер обмена стола (терминал T5): Ctrl+Shift+C в терминале кладёт сюда
 /// выделенное, Ctrl+Shift+V и правая кнопка — набирают его.
 static CLIPBOARD: SpinLock<String> = SpinLock::new(String::new());
@@ -1500,6 +1504,9 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         // тогда, когда ничего не выбрано, относилось бы неизвестно к чему —
         // а на столе это означало бы удалённый наугад файл. `None` — целились
         // в окно или в кнопку панели: у них своего меню пока нет.
+        // Пункты меню файла собираются по месту: «Открыть с помощью» у
+        // каждого файла свой.
+        let file_items: alloc::vec::Vec<context::Action>;
         let target: Option<(&[context::Action], &str)> = if desktop.context_open() {
             desktop.close_context();
             None
@@ -1558,11 +1565,22 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
             Some(match desktop.icon_at(x, y) {
                 Some(index) => {
                     desktop.select_icon(Some(index));
+                    // Меню по тому, во что целились (как в Windows): ярлык
+                    // программы, системный значок, папка, файл.
                     match desktop.icon_kind(index) {
-                        // Программа (в том числе из пакета) — не файл: ни
-                        // переименовать, ни удалить её со стола нечем.
+                        Some(icons::Kind::Program(_)) if desktop.icon_is_shortcut(index) => {
+                            (&context::Action::ON_PROGRAM[..], "icon")
+                        }
                         Some(icons::Kind::App(_) | icons::Kind::Program(_)) => (&context::Action::ON_APP[..], "icon"),
-                        Some(_) => (&context::Action::ON_ENTRY[..], "entry"),
+                        Some(icons::Kind::Folder) => (&context::Action::ON_FOLDER[..], "entry"),
+                        Some(_) => {
+                            // Файл: «Открыть» и «Открыть с помощью» —
+                            // программы, которые умеют этот тип.
+                            let handlers = desktop.icon_path(index).map(|path| file_handlers(&path)).unwrap_or_default();
+                            file_items = file_menu(handlers.len().min(6));
+                            desktop.context_handlers(handlers);
+                            (&file_items[..], "entry")
+                        }
                         None => (&context::Action::ON_DESKTOP[..], "desktop"),
                     }
                 }
@@ -1982,12 +2000,23 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                 // того, что за активным, — как Ctrl+щелчок в Windows 11.
                 let members = if panel::labels() { alloc::vec::Vec::new() } else { desktop.group_members(app) };
                 if members.len() > 1 {
-                    let focused = desktop.focused_app();
-                    let next = match members.iter().position(|member| Some(*member) == focused) {
-                        Some(at) => members[(at + 1) % members.len()],
-                        None => members[members.len() - 1],
-                    };
-                    launch(desktop, next);
+                    // Над кнопкой — список окон этой программы, щелчок
+                    // выбирает нужное (как в Windows 11; 24.10: перебор по
+                    // очереди не давал выбрать конкретное окно).
+                    let members: alloc::vec::Vec<App> = members.into_iter().take(12).collect();
+                    let labels = members
+                        .iter()
+                        .map(|member| (name_of(desktop, *member), String::new()))
+                        .collect::<alloc::vec::Vec<_>>();
+                    let items: alloc::vec::Vec<context::Action> =
+                        (0..members.len()).map(|index| context::Action::Window(index as u8)).collect();
+                    *GROUP.lock() = members;
+                    let button = desktop.button_of(app).unwrap_or(Rect::new(x, y, 1, 1));
+                    desktop.context_handlers(labels);
+                    desktop.open_context(button.x, button.y, &items);
+                    if let Some(rect) = desktop.context_rect() {
+                        kprintln!("  desktop     : context menu at {},{} {}x{} for group", rect.x, rect.y, rect.w, rect.h);
+                    }
                     desktop.refresh_panel(status);
                     return;
                 }
@@ -2727,6 +2756,16 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
             };
             start(desktop, &command);
         }
+        // Файл, для которого есть программа (текст — «Блокнот»), открывается
+        // ею, как двойной щелчок в Windows.
+        Some(icons::Kind::File) if desktop.icon_path(index).is_some_and(|path| !file_handlers(&path).is_empty()) => {
+            let Some(path) = desktop.icon_path(index) else {
+                return;
+            };
+            if let Some((_, command)) = file_handlers(&path).into_iter().next() {
+                start(desktop, &alloc::format!("{command} {path}"));
+            }
+        }
         // Файл или каталог со стола. До 47c здесь поднималось окно ядра и ему
         // говорили `reveal`; теперь путь уезжает **аргументом** программе.
         // Разбор на слова делает сама задача, кавычек он не знает — имя с
@@ -2744,6 +2783,42 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
     }
 }
 
+/// Пункты меню файла с `count` программами «Открыть с помощью».
+fn file_menu(count: usize) -> alloc::vec::Vec<context::Action> {
+    let mut items = alloc::vec::Vec::with_capacity(count + 3);
+    items.push(context::Action::Open);
+    for index in 0..count {
+        items.push(context::Action::OpenWith(index as u8));
+    }
+    items.push(context::Action::Rename);
+    items.push(context::Action::Delete);
+    items
+}
+
+/// Расширения, которые открывает «Блокнот».
+const TEXT_EXTENSIONS: [&str; 16] =
+    ["txt", "log", "md", "cfg", "conf", "ini", "json", "xml", "csv", "sh", "c", "h", "rs", "py", "toml", "yaml"];
+
+/// Программы, которые открывают файл `path`: подпись и команда (путь
+/// допишется). Свои — «Блокнот» для текста; пакетные — по `opens=` их
+/// манифеста (поставили Notepad++ — он появится здесь).
+fn file_handlers(path: &str) -> alloc::vec::Vec<(String, String)> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let extension = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    let mut out = alloc::vec::Vec::new();
+    if TEXT_EXTENSIONS.contains(&extension.as_str()) || extension.is_empty() {
+        out.push((String::from("Блокнот"), String::from("/bin/notepad")));
+    }
+    if !extension.is_empty() {
+        for launcher in panel::list_packages() {
+            if launcher.opens.split(',').any(|ext| ext.trim().eq_ignore_ascii_case(&extension)) {
+                out.push((launcher.caption.clone(), launcher.start.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// Запустить программу третьего кольца по готовой командной строке.
 ///
 /// Ждать её нельзя — этот код работает внутри разбора события ввода, — поэтому
@@ -2751,7 +2826,12 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
 /// программа откроет сама, и сама же о нём скажет.
 fn start(desktop: &mut Compositor, command: &str) {
     match crate::user::spawn(command, crate::user::session::credentials()) {
-        Ok(id) => kprintln!("  desktop     : started '{command}' as {id}"),
+        Ok(id) => {
+            kprintln!("  desktop     : started '{command}' as {id}");
+            // Курсор «программа запускается» — пока не откроется окно, но не
+            // дольше полуминуты (Chromium под эмулятором открывается долго).
+            desktop.pointer_busy(30_000);
+        }
         Err(err) => {
             kprintln!("  desktop     : cannot start '{command}': {err}");
             // Отказ виден только в журнале, а человек смотрит на стол. Поднять
@@ -2848,6 +2928,59 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         context::Action::TaskManager => {
             desktop.close_context();
             run_choice(desktop, panel::Choice::Program("taskmgr", ""));
+            desktop.refresh_panel(status);
+        }
+        context::Action::Window(number) => {
+            desktop.close_context();
+            let chosen = GROUP.lock().get(usize::from(number)).copied();
+            if let Some(app) = chosen {
+                launch(desktop, app);
+            }
+            desktop.refresh_panel(status);
+        }
+        context::Action::OpenWith(number) => {
+            desktop.close_context();
+            if let (Some(command), Some((path, _))) = (desktop.context_handler(number), selected_entry(desktop)) {
+                start(desktop, &alloc::format!("{command} {path}"));
+            }
+            desktop.refresh_panel(status);
+        }
+        context::Action::OpenLocation => {
+            desktop.close_context();
+            // Ярлык пакета: команда запуска, и каталог программы в ней —
+            // `/opt/<имя>/…`.
+            if let Some((command, _)) = selected_entry(desktop) {
+                let place = command
+                    .split_whitespace()
+                    .rev()
+                    .find_map(|word| word.strip_prefix("/opt/").map(|rest| rest.split('/').next().unwrap_or("")))
+                    .filter(|name| !name.is_empty())
+                    .map(|name| alloc::format!("/opt/{name}"));
+                match place {
+                    Some(place) => start(desktop, &alloc::format!("/bin/files {place}")),
+                    None => start(desktop, "/bin/files /bin"),
+                }
+            }
+            desktop.refresh_panel(status);
+        }
+        context::Action::DeleteShortcut => {
+            desktop.close_context();
+            if let Some((_, label)) = selected_entry(desktop) {
+                let list = icons::hide(&label);
+                let _ = prefs::store_hidden_shortcuts(&list);
+                kprintln!("  desktop     : shortcut '{label}' removed from the desktop");
+                desktop.reload_icons();
+                log_icons(desktop);
+            }
+        }
+        context::Action::OpenInTerminal => {
+            desktop.close_context();
+            if let Some((path, _)) = selected_entry(desktop) {
+                launch(desktop, App::Terminal);
+                type_text(&alloc::format!("cd {path}"), false);
+                crate::input::post(KeyCode::Enter, true);
+                crate::input::post(KeyCode::Enter, false);
+            }
             desktop.refresh_panel(status);
         }
         context::Action::Refresh => {
@@ -3092,6 +3225,11 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
             Window::program(app, rect, scale, title, pixels).ok_or(WindowError::NoMemory)?;
         window.art = Some(art);
         window.group = group;
+        desktop.pointer_idle();
+        // Заголовок нарисован при создании окна, до значка — перерисовать.
+        if framed {
+            window.draw_decorations(true);
+        }
         if !framed {
             window.frameless = true;
             window.redraw_content();

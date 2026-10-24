@@ -55,13 +55,30 @@ pub struct Pointer {
     /// Рисовать стрелку на машине без мыши значит обещать то, чего нет: человек
     /// будет искать, чем её двигать.
     visible: bool,
+    /// До какого времени (мс) рядом со стрелкой крутится круг «программа
+    /// запускается», как в Windows. Ноль — не крутится.
+    busy_until: u64,
 }
+
+/// Поле круга «программа запускается» справа снизу от стрелки.
+const SPIN_SIDE: u32 = 16;
 
 impl Pointer {
     /// Указатель в середине экрана, ещё невидимый.
     #[must_use]
     pub const fn new(width: u32, height: u32) -> Self {
-        Self { x: (width / 2) as i32, y: (height / 2) as i32, visible: false }
+        Self { x: (width / 2) as i32, y: (height / 2) as i32, visible: false, busy_until: 0 }
+    }
+
+    /// Показывать круг «программа запускается» до `until` (мс от запуска).
+    pub fn set_busy(&mut self, until: u64) {
+        self.busy_until = until;
+    }
+
+    /// Крутится ли круг сейчас.
+    #[must_use]
+    pub fn is_busy(&self, now: u64) -> bool {
+        self.busy_until != 0 && now < self.busy_until
     }
 
     #[must_use]
@@ -77,7 +94,23 @@ impl Pointer {
     /// Прямоугольник, который занимает картинка курсора.
     #[must_use]
     pub const fn rect(&self) -> Rect {
+        // С кругом — шире и ниже: курсор, сжавшийся без круга, обязан стереть
+        // и то место, где круг был.
+        if self.busy_until != 0 {
+            return Rect::new(self.x, self.y, WIDTH + SPIN_SIDE, HEIGHT + SPIN_SIDE / 2);
+        }
         Rect::new(self.x, self.y, WIDTH, HEIGHT)
+    }
+
+    /// Круг погас — указатель снова просто стрелка. Возвращает прямоугольник,
+    /// который занимал круг (его надо перерисовать), если он был.
+    pub fn clear_busy(&mut self) -> Option<Rect> {
+        if self.busy_until == 0 {
+            return None;
+        }
+        let was = self.rect();
+        self.busy_until = 0;
+        Some(was)
     }
 
     /// Сдвинуть указатель, оставив его на экране.
@@ -159,5 +192,19 @@ impl Pointer {
         // задаёт, что окажется сверху при округлении координат.
         surface.draw_bitmap((self.x, self.y + dy), &OUTLINE, WIDTH, OUTLINE_COLOR);
         surface.draw_bitmap((self.x, self.y + dy), &FILL, WIDTH, FILL_COLOR);
+        let now = crate::time::uptime_ms();
+        if self.is_busy(now) {
+            // Восемь точек по кругу, яркая бежит — 100 мс на шаг.
+            const SPOTS: [(i32, i32); 8] = [(0, -5), (4, -4), (5, 0), (4, 4), (0, 5), (-4, 4), (-5, 0), (-4, -4)];
+            let cx = self.x + WIDTH as i32 + SPIN_SIDE as i32 / 2 - 2;
+            let cy = self.y + dy + HEIGHT as i32 - 2;
+            let head = (now / 100) as usize % SPOTS.len();
+            for (index, (sx, sy)) in SPOTS.iter().enumerate() {
+                let age = (head + SPOTS.len() - index) % SPOTS.len();
+                let alpha = 255u32.saturating_sub(age as u32 * 30) as u8;
+                mini_ui::draw::circle(surface, cx + sx, cy + sy, 2, OUTLINE_COLOR, alpha);
+                mini_ui::draw::circle(surface, cx + sx, cy + sy, 1, Color::rgb(0x3B, 0x82, 0xF6), alpha);
+            }
+        }
     }
 }

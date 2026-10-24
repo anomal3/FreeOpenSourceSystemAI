@@ -67,6 +67,10 @@ pub fn adopt() {
             crate::kprintln!("  power       : screen off after {seconds} s, from {path}");
         }
     }
+    // Ярлыки, убранные со стола «Удалить ярлык» (24.10).
+    if let Some(list) = sysconf::value(text, "hidden_shortcuts") {
+        super::icons::set_hidden(list);
+    }
     // Что показывает панель рядом с часами (фаза 69b).
     for (pref, key) in [
         (super::settings::PanelPref::Uptime, "panel_uptime"),
@@ -120,6 +124,11 @@ pub fn store_screen_off(seconds: u32) -> Result<(), crate::vfs::VfsError> {
 /// Запомнить высоту заголовка.
 pub fn store_title_bar(height: u32) -> Result<(), crate::vfs::VfsError> {
     store_key("titlebar", &alloc::format!("{height}"))
+}
+
+/// Запомнить ярлыки, убранные со стола (подписи через `|`).
+pub fn store_hidden_shortcuts(list: &str) -> Result<(), crate::vfs::VfsError> {
+    store_key("hidden_shortcuts", list)
 }
 
 /// Запомнить, что показывает панель.

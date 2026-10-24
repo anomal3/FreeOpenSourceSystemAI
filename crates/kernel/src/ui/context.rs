@@ -64,6 +64,8 @@ const ROW_GAP: u32 = 1;
 const ROW_PAD: u32 = 10;
 /// Сторона значка в строке.
 const ICON: u32 = 14;
+/// Скругление карточки меню — как у меню Windows 11, меньше, чем у окон.
+pub const MENU_RADIUS: u32 = 6;
 /// Просвет между значком и подписью.
 const ICON_GAP: u32 = 10;
 /// Поле разделителя сверху и снизу.
@@ -105,11 +107,23 @@ pub enum Action {
     /// стоял с пометкой «функция запланирована»: правило дома — нереализованное
     /// показывать, а не прятать.
     TaskManager,
+    /// Открыть файлом программу из списка «Открыть с помощью» (номер в
+    /// [`ContextMenu::handlers`]).
+    OpenWith(u8),
+    /// Открыть в «Файлах» каталог, где лежит программа ярлыка.
+    OpenLocation,
+    /// Убрать ярлык программы со стола (сама программа остаётся).
+    DeleteShortcut,
+    /// Терминал в этом каталоге.
+    OpenInTerminal,
+    /// Окно номер `n` группы на панели задач: список окон одной программы
+    /// над её кнопкой (как в Windows 11), подписи — в [`ContextMenu::handlers`].
+    Window(u8),
 }
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 12] = [
+    const ALL: [Action; 15] = [
         Action::Open,
         Action::Rename,
         Action::Delete,
@@ -122,6 +136,9 @@ impl Action {
         Action::NetworkSettings,
         Action::ClockSettings,
         Action::TaskManager,
+        Action::OpenLocation,
+        Action::DeleteShortcut,
+        Action::OpenInTerminal,
     ];
 
     /// Пункты меню, открытого на пустом месте стола.
@@ -146,9 +163,17 @@ impl Action {
         Action::Refresh,
     ];
 
+    /// Меню папки на столе — как в Windows: открыть, терминал здесь, затем
+    /// правка.
+    pub const ON_FOLDER: [Action; 4] = [Action::Open, Action::OpenInTerminal, Action::Rename, Action::Delete];
+
+    /// Меню ярлыка программы из пакета: открыть, где лежит, убрать ярлык.
+    /// «Обновить» на значке программы не нужен (Роман, 24.10).
+    pub const ON_PROGRAM: [Action; 3] = [Action::Open, Action::OpenLocation, Action::DeleteShortcut];
+
     /// Пункты меню, открытого на системном значке: переименовать «Settings»
     /// нечем, а открыть его — можно.
-    pub const ON_APP: [Action; 2] = [Action::Open, Action::Refresh];
+    pub const ON_APP: [Action; 1] = [Action::Open];
 
     /// Пункты меню, открытого правой кнопкой на трее и пустом месте панели.
     ///
@@ -190,6 +215,12 @@ impl Action {
             Action::NetworkSettings => "Параметры сети",
             Action::ClockSettings => "Дата и время",
             Action::TaskManager => "Диспетчер задач",
+            // Подпись с именем программы даёт меню: см. [`ContextMenu::label`].
+            Action::OpenWith(_) => "Открыть с помощью",
+            Action::OpenLocation => "Открыть расположение файла",
+            Action::DeleteShortcut => "Удалить ярлык",
+            Action::OpenInTerminal => "Открыть в терминале",
+            Action::Window(_) => "Окно",
         }
     }
 
@@ -200,7 +231,8 @@ impl Action {
     /// них по-своему.
     const fn group(self) -> u8 {
         match self {
-            Action::Open | Action::Rename | Action::Delete => 0,
+            Action::Open | Action::OpenWith(_) | Action::OpenLocation | Action::OpenInTerminal | Action::Window(_) => 0,
+            Action::Rename | Action::Delete | Action::DeleteShortcut => 5,
             Action::NewFolder | Action::NewTextFile => 1,
             Action::Theme | Action::DisplaySettings | Action::Refresh => 2,
             Action::SwitchLayout => 3,
@@ -218,8 +250,12 @@ impl Action {
     fn icon(self) -> Option<Icon> {
         match self {
             Action::Open => Some(Icon::ChevronRight),
+            Action::OpenWith(_) => Some(Icon::File),
+            Action::OpenLocation => Some(Icon::Folder),
+            Action::OpenInTerminal => Some(Icon::Terminal),
+            Action::Window(_) => Some(Icon::Display),
             Action::Rename => None,
-            Action::Delete => Some(Icon::Close),
+            Action::Delete | Action::DeleteShortcut => Some(Icon::Close),
             Action::NewFolder => Some(Icon::Folder),
             Action::NewTextFile => Some(Icon::File),
             Action::Theme => Some(if theme::is_dark() { Icon::Sun } else { Icon::Moon }),
@@ -281,6 +317,11 @@ pub struct ContextMenu {
     work_bottom: i32,
     /// Ответ последнего действия — показывается строкой внизу меню.
     note: Option<String>,
+    /// Программы «Открыть с помощью» для файла этого открытия: подпись и
+    /// команда, к которой допишется путь.
+    handlers: Vec<(String, String)>,
+    /// Ширина экрана при открытии: расширенная карточка не уезжает за край.
+    screen_w: u32,
 }
 
 impl ContextMenu {
@@ -307,7 +348,11 @@ impl ContextMenu {
         // обработчике события ввода — и остаться без меню, когда её не дали.
         let height = height_for(ctx, &Action::ON_ENTRY)
             .max(height_for(ctx, &Action::ON_DESKTOP))
-            .max(height_for(ctx, &Action::ON_TRAY));
+            .max(height_for(ctx, &Action::ON_TRAY))
+            // Список окон группы на панели задач — до двенадцати строк.
+            .max(height_for(ctx, &[Action::Window(0); 12]))
+            // Файл с шестью программами «Открыть с помощью».
+            .max(height_for(ctx, &[Action::Open; 9]));
         let surface = Surface::new(width, height, theme::wall_average(theme::palette()))?;
         Some(Self {
             surface,
@@ -320,7 +365,44 @@ impl ContextMenu {
             damage: Rect::EMPTY,
             work_bottom: i32::MAX,
             note: None,
+            handlers: Vec::new(),
+            screen_w: u32::MAX / 2,
         })
+    }
+
+    /// Программы «Открыть с помощью» для следующего открытия.
+    pub fn set_handlers(&mut self, handlers: Vec<(String, String)>) {
+        self.handlers = handlers;
+    }
+
+    /// Команда программы `index` из «Открыть с помощью».
+    #[must_use]
+    pub fn handler(&self, index: u8) -> Option<&str> {
+        self.handlers.get(usize::from(index)).map(|(_, command)| command.as_str())
+    }
+
+    /// Подпись пункта: у «Открыть с помощью» — с именем программы.
+    fn label(&self, action: Action) -> String {
+        match action {
+            Action::OpenWith(index) => match self.handlers.get(usize::from(index)) {
+                Some((name, _)) => alloc::format!("Открыть с помощью: {name}"),
+                None => String::from(action.title()),
+            },
+            Action::Window(index) => match self.handlers.get(usize::from(index)) {
+                Some((name, _)) => name.clone(),
+                None => String::from(action.title()),
+            },
+            _ => String::from(action.title()),
+        }
+    }
+
+    /// Ширина карточки под эти пункты: по самой длинной подписи, без пустоты
+    /// справа (Роман, 24.10: «к чему такие отступы справа»).
+    fn width_for(&self, ctx: Ctx) -> u32 {
+        let face = ctx.face(Role::Body);
+        let widest = self.items.iter().map(|action| face.width(&self.label(*action))).max().unwrap_or(0);
+        let width = widest + ctx.px(ICON + ICON_GAP) + ctx.px((CARD_PAD + ROW_PAD) * 2) + ctx.px(12);
+        width.clamp(ctx.px(180), self.surface.width())
     }
 
     #[must_use]
@@ -351,8 +433,10 @@ impl ContextMenu {
         self.items.clear();
         self.items.extend_from_slice(items);
         self.work_bottom = work_bottom;
+        self.screen_w = screen.0;
         let ctx = self.ctx();
-        self.rect.h = height_for(ctx, &self.items).min(self.surface.height());
+        self.rect.w = self.width_for(ctx);
+        self.rect.h = rows_height(ctx, &self.items).min(self.surface.height());
         let max_x = (screen.0 as i32 - self.rect.w as i32).max(0);
         let max_y = (work_bottom - self.rect.h as i32).max(0);
         self.rect.x = x.clamp(0, max_x);
@@ -395,6 +479,7 @@ impl ContextMenu {
 
     /// Начать набор нового имени.
     pub fn start_rename(&mut self, name: &str) {
+        self.widen();
         self.mode = Mode::Rename { from: name.to_string(), text: name.to_string() };
         self.note = None;
         self.fit(rename_height(self.ctx()));
@@ -407,10 +492,22 @@ impl ContextMenu {
     /// корзины в системе нет, — и «нажал не туда» здесь означает потерянный
     /// файл.
     pub fn start_confirm(&mut self, name: &str) {
+        self.widen();
         self.mode = Mode::Confirm { name: name.to_string() };
         self.note = None;
         self.fit(confirm_height(self.ctx()));
         self.redraw();
+    }
+
+    /// Поле имени и вопрос об удалении шире пунктов: подсказки под ними
+    /// длинные. Карточка расширяется влево, если справа не хватает экрана.
+    fn widen(&mut self) {
+        let wide = self.surface.width();
+        if self.rect.w < wide {
+            self.rect.w = wide;
+            let max_x = (self.screen_w as i32 - wide as i32).max(0);
+            self.rect.x = self.rect.x.clamp(0, max_x);
+        }
     }
 
     /// Подогнать карточку под новую высоту, не дав ей выехать вниз.
@@ -544,6 +641,8 @@ impl ContextMenu {
     pub fn set_note(&mut self, note: impl Into<String>) {
         self.note = Some(note.into());
         self.mode = Mode::Menu;
+        let full = height_for(self.ctx(), &self.items);
+        self.fit(full);
         self.redraw();
     }
 
@@ -556,9 +655,12 @@ impl ContextMenu {
         // Внутренности карточки лежат на стекле, а не на обоях: сведи их поверх
         // обоев — и строка под указателем окажется на полтона мимо той
         // подложки, на которой она нарисована.
-        let glass = ctx.flat(p.glass);
+        // Своя подложка — цвет окна, а не обоев под стеклом (Роман, 24.10:
+        // меню сливалось со столом), и скругление меньше, как у меню
+        // Windows 11.
+        let glass = ctx.flat(p.win);
         let inner = ctx.on(glass);
-        let radius = ctx.px(theme::R_CARD);
+        let radius = ctx.px(MENU_RADIUS);
         let layout = plan(ctx, card, &self.items);
 
         {
@@ -585,7 +687,18 @@ impl ContextMenu {
                     );
                 }
                 for (index, slot) in layout.rows.iter().enumerate() {
-                    draw_row(inner, s, slot, index == selected);
+                    let label = match slot.action {
+                        Action::OpenWith(number) => match self.handlers.get(usize::from(number)) {
+                            Some((name, _)) => alloc::format!("Открыть с помощью: {name}"),
+                            None => String::from(slot.action.title()),
+                        },
+                        Action::Window(number) => match self.handlers.get(usize::from(number)) {
+                            Some((name, _)) => name.clone(),
+                            None => String::from(slot.action.title()),
+                        },
+                        other => String::from(other.title()),
+                    };
+                    draw_row(inner, s, slot, &label, index == selected);
                 }
             }
             Mode::Rename { text, .. } => {
@@ -700,6 +813,14 @@ fn height_for(ctx: Ctx, items: &[Action]) -> u32 {
     bottom.max(0) as u32
 }
 
+/// Высота карточки без строки ответа внизу: пока ответа нет, пустая полоса
+/// под пунктами выглядела бы недорисованной (24.10).
+fn rows_height(ctx: Ctx, items: &[Action]) -> u32 {
+    let layout = plan(ctx, Rect::new(0, 0, 0, 0), items);
+    let last = layout.rows.last().map_or(0, |slot| slot.rect.bottom());
+    (last + ctx.px(CARD_PAD) as i32).max(0) as u32
+}
+
 /// Высота карточки, занятой набором имени.
 ///
 /// Считается отдельно, а не берётся от списка пунктов: поверхность заведена
@@ -724,11 +845,11 @@ fn confirm_height(ctx: Ctx) -> u32 {
 }
 
 /// Нарисовать строку меню.
-fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, selected: bool) {
+fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool) {
     let p = ctx.palette;
     // Удаление — единственный пункт, после которого нечего вернуть, и красным
     // оно названо ровно поэтому.
-    let danger = slot.action == Action::Delete;
+    let danger = matches!(slot.action, Action::Delete | Action::DeleteShortcut);
     let r = ctx.px(theme::R_CHIP);
     if selected {
         if danger {
@@ -769,7 +890,7 @@ fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, selected: bool) {
         x,
         paint::baseline(ctx, Role::Body, slot.rect),
         (slot.rect.right() - pad as i32 - x).max(0) as u32,
-        slot.action.title(),
+        label,
         ink,
     );
 }

@@ -666,11 +666,7 @@ impl Compositor {
                 caption: window.caption().into(),
                 focused: index == self.focus,
                 minimized: window.minimized,
-                art: window.art.clone().unwrap_or_else(|| super::appicon::Art::Glyph(
-                    if window.app == super::window::App::Terminal { mini_ui::glyphicon::Icon::Terminal } else { window.app.icon() },
-                    window.app.tone(),
-                    window.app == super::window::App::Terminal,
-                )),
+                art: window.icon_art(),
                 group: if window.group.is_empty() { alloc::string::String::from(window.app.title()) } else { window.group.clone() },
             })
             .collect()
@@ -900,6 +896,21 @@ impl Compositor {
         }
         let after = self.pointer.rect();
         self.mark(after);
+    }
+
+    /// Программа запускается: рядом со стрелкой крутится круг, пока она не
+    /// откроет окно (или не выйдет срок `ms`).
+    pub fn pointer_busy(&mut self, ms: u64) {
+        self.pointer.set_busy(crate::time::uptime_ms() + ms);
+        self.mark(self.pointer.rect());
+        super::set_animating(true);
+    }
+
+    /// Окно появилось — круг больше не нужен.
+    pub fn pointer_idle(&mut self) {
+        if let Some(was) = self.pointer.clear_busy() {
+            self.mark(was);
+        }
     }
 
     /// Поставить указатель туда, куда показало устройство, и пометить
@@ -2248,6 +2259,31 @@ impl Compositor {
         }
     }
 
+    /// Программы «Открыть с помощью» для следующего открытия меню.
+    pub fn context_handlers(&mut self, handlers: alloc::vec::Vec<(alloc::string::String, alloc::string::String)>) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.set_handlers(handlers);
+        }
+    }
+
+    /// Команда программы «Открыть с помощью» номер `index`.
+    #[must_use]
+    pub fn context_handler(&self, index: u8) -> Option<alloc::string::String> {
+        self.context.as_ref().and_then(|menu| menu.handler(index)).map(alloc::string::String::from)
+    }
+
+    /// Где на экране кнопка окна на панели задач.
+    #[must_use]
+    pub fn button_of(&self, app: App) -> Option<Rect> {
+        self.panel.as_ref().and_then(|panel| panel.anchor(app))
+    }
+
+    /// Ярлык программы ли это (из пакета, со стрелкой).
+    #[must_use]
+    pub fn icon_is_shortcut(&self, index: usize) -> bool {
+        self.icons.item(index).is_some_and(|item| item.shortcut.is_some())
+    }
+
     /// Показать в меню ответ действия — оно остаётся открытым.
     pub fn context_note(&mut self, note: &str) {
         if let Some(menu) = self.context.as_mut() {
@@ -2464,7 +2500,16 @@ impl Compositor {
             trail = keyboard.trail_visible() || keyboard.holding();
         }
         self.mark(trail_damage);
-        super::set_animating(self.flight.is_some() || trail);
+        // Круг «программа запускается» крутится, пока не выйдет срок: на
+        // каждый кадр — его место заново.
+        let now = crate::time::uptime_ms();
+        let spinning = self.pointer.is_busy(now);
+        if spinning {
+            self.mark(self.pointer.rect());
+        } else if let Some(was) = self.pointer.clear_busy() {
+            self.mark(was);
+        }
+        super::set_animating(self.flight.is_some() || trail || spinning);
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
             return;
@@ -2747,7 +2792,7 @@ impl Compositor {
         }
         if let Some(menu) = self.context.as_ref() {
             if menu.is_open() {
-                let r = theme::R_CARD * self.scale;
+                let r = super::context::MENU_RADIUS * self.scale;
                 self.drop_shadow(back, menu.rect, band, dy, r);
                 self.stack(back, menu.surface(), menu.rect, band, dy, r);
             }

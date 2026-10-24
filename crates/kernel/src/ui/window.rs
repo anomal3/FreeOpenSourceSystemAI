@@ -807,8 +807,9 @@ impl Window {
             badge_side,
             badge_side,
         );
-        let tone = if focused { self.app.tone() } else { paint::Tone::Muted };
-        paint::badge(ctx, &mut self.surface, badge, tone);
+        // Значок программы, как на панели задач (24.10: был цветной квадрат
+        // без знака — «квадратик цветной»).
+        self.icon_art().draw(ctx, &mut self.surface, badge);
 
         // Кнопки нарисованы всегда, а не только у активного окна: кнопка,
         // появляющаяся при наведении, потребовала бы следить за указателем и
@@ -912,6 +913,16 @@ impl Window {
             // перекраски значило бы завести половину протокола.
             Content::Program(_) => {}
         }
+    }
+
+    /// Значок программы окна: свой у программы (из пакета или по таблице),
+    /// у окон ядра — значок набора на плитке.
+    #[must_use]
+    pub fn icon_art(&self) -> super::appicon::Art {
+        self.art.clone().unwrap_or_else(|| {
+            let terminal = self.app == App::Terminal;
+            super::appicon::Art::Glyph(if terminal { Icon::Terminal } else { self.app.icon() }, self.app.tone(), terminal)
+        })
     }
 
     /// Напечатать в окно. Действует только на текстовые окна.
