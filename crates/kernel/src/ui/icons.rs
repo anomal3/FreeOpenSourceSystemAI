@@ -611,8 +611,22 @@ impl Icons {
                 }
             }
             None => {
-                let (icon, tone, filled) = art(&item.kind);
-                paint::icon_tile(ctx, back, tile, icon, tone, filled);
+                // Значки макета (72d): у программы — свой, у папки и файла —
+                // по имени и расширению; нет такого — плитка со знаком.
+                let design = match &item.kind {
+                    Kind::Folder => super::appicon::file_icon(&item.label, true),
+                    Kind::File => super::appicon::file_icon(&item.label, false),
+                    Kind::App(app) => super::appicon::design_for(app.icon()),
+                    Kind::Program(icon) => super::appicon::design_for(*icon),
+                    _ => None,
+                };
+                match design {
+                    Some(image) => image.draw(back, tile),
+                    None => {
+                        let (icon, tone, filled) = art(&item.kind);
+                        paint::icon_tile(ctx, back, tile, icon, tone, filled);
+                    }
+                }
             }
         }
 

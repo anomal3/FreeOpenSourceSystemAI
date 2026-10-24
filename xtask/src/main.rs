@@ -676,10 +676,15 @@ fn real_main() -> Result<()> {
                 std::fs::write(logo.join(out), &fimg)?;
                 println!("логотип: {png} → {out} ({} КиБ)", fimg.len() / 1024);
             }
-            // Курсоры — FIMG того же размера, что PNG (32 и 48).
-            let cursors = paths::workspace_root().join("assets").join("cursors");
-            for side in [32u32, 48] {
-                let dir = cursors.join(side.to_string());
+            // Курсоры — FIMG того же размера, что PNG (32 и 48); значки
+            // программ и файлов (72d) — 64.
+            let assets = paths::workspace_root().join("assets");
+            for (dir, side) in [
+                (assets.join("cursors").join("32"), 32u32),
+                (assets.join("cursors").join("48"), 48),
+                (assets.join("icons").join("app"), 64),
+                (assets.join("icons").join("file"), 64),
+            ] {
                 let mut count = 0;
                 for entry in std::fs::read_dir(&dir)? {
                     let path = entry?.path();
@@ -689,7 +694,7 @@ fn real_main() -> Result<()> {
                         count += 1;
                     }
                 }
-                println!("курсоры {side}: {count}");
+                println!("{}: {count}", dir.display());
             }
         }
 

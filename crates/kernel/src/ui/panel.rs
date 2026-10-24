@@ -1791,7 +1791,10 @@ fn draw_row(m: Metrics, s: &mut Surface, row: &MenuRow, label: &str, note: &str,
         if selected {
             paint::row(ctx, s, row.rect, RowState::Selected);
         }
-        paint::icon_tile(ctx, s, tile, row.icon, row.tone, selected);
+        match super::appicon::design_for(row.icon) {
+            Some(image) => image.draw(s, tile),
+            None => paint::icon_tile(ctx, s, tile, row.icon, row.tone, selected),
+        }
     }
 
     let role = if selected { Role::Title } else { Role::Body };
