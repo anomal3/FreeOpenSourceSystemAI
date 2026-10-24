@@ -215,6 +215,8 @@ pub struct Compositor {
     /// этом не меняется. Свёрнутое тоже показывается — иначе не узнать,
     /// какое из одинаково названных окон какое.
     peek: Option<App>,
+    /// Миниатюры окон над кнопкой панели (72e).
+    thumbs: Option<super::thumbs::Thumbs>,
     /// Активное окно, о котором программам уже сказано (фаза 62c, `WIN_FOCUS`).
     ///
     /// Сверяется с [`Self::focused_app`] после каждого действия со столом, а не
@@ -325,6 +327,7 @@ impl Compositor {
             pending_size: None,
             hovered: None,
             peek: None,
+            thumbs: None,
             reported_focus: None,
             held_keys: [None; 8],
             captured: None,
@@ -2358,6 +2361,149 @@ impl Compositor {
         }
     }
 
+    /// Открыть миниатюры окон `apps` над кнопкой окна `anchor` (72e).
+    /// Возвращает место полосы.
+    pub fn open_thumbs(&mut self, apps: Vec<App>, anchor: App) -> Option<Rect> {
+        let button = self.button_of(anchor)?;
+        let panel_top = self.panel.as_ref().map_or(self.screen.height() as i32, |panel| panel.rect.y);
+        self.close_thumbs();
+        let thumbs = super::thumbs::Thumbs::new(apps, button, self.screen.width(), panel_top, self.scale);
+        let rect = thumbs.rect;
+        self.thumbs = Some(thumbs);
+        self.mark_layer(rect);
+        Some(rect)
+    }
+
+    /// Убрать миниатюры.
+    pub fn close_thumbs(&mut self) {
+        if let Some(thumbs) = self.thumbs.take() {
+            self.mark_layer(thumbs.rect);
+        }
+        self.set_peek(None);
+    }
+
+    #[must_use]
+    pub fn thumbs_open(&self) -> bool {
+        self.thumbs.is_some()
+    }
+
+    /// Место полосы и кнопка под ней.
+    #[must_use]
+    pub fn thumbs_area(&self) -> Option<(Rect, Rect)> {
+        self.thumbs.as_ref().map(|thumbs| (thumbs.rect, thumbs.button))
+    }
+
+    /// Окна в полосе по порядку.
+    #[must_use]
+    pub fn thumbs_apps(&self) -> Vec<App> {
+        self.thumbs.as_ref().map(|thumbs| thumbs.apps.clone()).unwrap_or_default()
+    }
+
+    /// Окно карточки под точкой и попала ли точка в крестик.
+    #[must_use]
+    pub fn thumbs_hit(&self, x: i32, y: i32) -> Option<(App, bool)> {
+        let thumbs = self.thumbs.as_ref()?;
+        let (index, cross) = thumbs.hit(x, y, self.scale)?;
+        Some((thumbs.apps[index], cross))
+    }
+
+    /// Указатель над полосой: подсветить карточку и показать её окно поверх
+    /// всех («подсмотр»).
+    pub fn thumbs_hover(&mut self, x: i32, y: i32) {
+        let scale = self.scale;
+        let Some(thumbs) = self.thumbs.as_mut() else {
+            return;
+        };
+        let hit = thumbs.hit(x, y, scale);
+        let (hovered, cross) = (hit.map(|(index, _)| index), hit.is_some_and(|(_, cross)| cross));
+        if thumbs.hovered == hovered && thumbs.cross == cross {
+            return;
+        }
+        thumbs.hovered = hovered;
+        thumbs.cross = cross;
+        let rect = thumbs.rect;
+        let peek = hovered.map(|index| thumbs.apps[index]);
+        self.mark(rect);
+        self.set_peek(peek);
+    }
+
+    /// Нарисовать полосу миниатюр в полосе кадра.
+    fn draw_thumbs(&self, back: &mut Surface, band: Rect, dy: i32, thumbs: &super::thumbs::Thumbs) {
+        use super::thumbs::{HEAD_H, PAD, SHOT_H, SHOT_W, Thumbs};
+        use mini_ui::glyphicon::{self, Icon};
+        use mini_ui::typeface::Role;
+        let ctx = mini_ui::paint::Ctx::scaled(self.scale);
+        let p = ctx.palette;
+        let px = |value: u32| value * self.scale;
+        let radius = px(theme::R_WINDOW);
+        self.drop_shadow(back, thumbs.rect, band, dy, radius);
+        let strip = thumbs.rect.translate(0, dy);
+        let fill = p.tb1.over(p.tb2.color);
+        draw::rounded(back, strip, radius, fill, 255);
+        draw::rounded_stroke(back, strip, radius, p.line3.color, p.line3.alpha);
+        let ctx = ctx.on(fill);
+        for (index, card) in thumbs.cards.iter().enumerate() {
+            let Some(window) = self.windows.iter().find(|window| window.app == thumbs.apps[index]) else {
+                continue;
+            };
+            let hovered = thumbs.hovered == Some(index);
+            let at = card.translate(0, dy);
+            if hovered {
+                draw::rounded(back, at, px(6), p.btnhov.over(fill), 255);
+                draw::rounded_stroke(back, at, px(6), p.acc, 255);
+            }
+            // Заголовок: значок 16, имя окна, у наведённой — крестик.
+            let icon = Rect::new(at.x + px(PAD) as i32, at.y + px(4 + 4) as i32, px(16), px(16));
+            window.icon_art().draw(ctx, back, icon);
+            let cross = Thumbs::cross_rect(*card, self.scale).translate(0, dy);
+            let text_x = icon.right() + px(8) as i32;
+            let room = (cross.x - px(4) as i32 - text_x).max(0) as u32;
+            let head = Rect::new(at.x, at.y + px(4) as i32, at.w, px(HEAD_H));
+            mini_ui::paint::text_clipped(ctx, back, Role::Body, text_x, mini_ui::paint::baseline(ctx, Role::Body, head), room, window.caption(), p.ink);
+            if hovered {
+                let plate = if thumbs.cross { Color::rgb(0xE8, 0x3B, 0x2C) } else { p.bad };
+                draw::rounded(back, cross, px(4), plate, 255);
+                let glyph = px(10);
+                glyphicon::draw(
+                    back,
+                    Icon::Close,
+                    cross.x + (cross.w as i32 - glyph as i32) / 2,
+                    cross.y + (cross.h as i32 - glyph as i32) / 2,
+                    glyph,
+                    Color::rgb(0xFF, 0xFF, 0xFF),
+                    255,
+                );
+            }
+            // Миниатюра: окно, вписанное в 200×124 с сохранением пропорций.
+            let shot = Rect::new(at.x + px(PAD) as i32, at.y + px(PAD + HEAD_H) as i32, px(SHOT_W), px(SHOT_H));
+            back.fill(shot, p.sunk.over(fill));
+            let src = window.surface();
+            let (sw, sh) = (src.width().max(1), src.height().max(1));
+            let (dw, dh) = if u64::from(sw) * u64::from(shot.h) > u64::from(sh) * u64::from(shot.w) {
+                (shot.w, (u64::from(sh) * u64::from(shot.w) / u64::from(sw)).max(1) as u32)
+            } else {
+                ((u64::from(sw) * u64::from(shot.h) / u64::from(sh)).max(1) as u32, shot.h)
+            };
+            let ox = shot.x + (shot.w as i32 - dw as i32) / 2;
+            let oy = shot.y + (shot.h as i32 - dh as i32) / 2;
+            for ty in 0..dh as i32 {
+                let target = oy + ty;
+                if target < 0 || target >= back.height() as i32 {
+                    continue;
+                }
+                let sy = (ty as u64 * u64::from(sh) / u64::from(dh)) as u32;
+                let line: Vec<u32> = (0..dw).map(|tx| src.row(sy)[(u64::from(tx) * u64::from(sw) / u64::from(dw)) as usize]).collect();
+                let row = back.row_mut(target as u32);
+                for (tx, pixel) in line.into_iter().enumerate() {
+                    let x = ox + tx as i32;
+                    if x >= 0 && (x as usize) < row.len() {
+                        row[x as usize] = pixel;
+                    }
+                }
+            }
+        }
+    }
+
     /// Снять подсветку пункта меню стола.
     pub fn context_select_none(&mut self) {
         if let Some(menu) = self.context.as_mut() {
@@ -2872,6 +3018,13 @@ impl Compositor {
             if menu.is_open() {
                 self.drop_shadow(back, menu.rect, band, dy, radius);
                 self.stack(back, menu.surface(), menu.rect, band, dy, radius);
+            }
+        }
+        if let Some(thumbs) = self.thumbs.as_ref() {
+            let halo = self.halo() as i32;
+            let grown = Rect::new(thumbs.rect.x - halo, thumbs.rect.y - halo, thumbs.rect.w + halo as u32 * 2, thumbs.rect.h + halo as u32 * 2);
+            if !grown.intersect(&band).is_empty() {
+                self.draw_thumbs(back, band, dy, thumbs);
             }
         }
         if let Some(menu) = self.context.as_ref() {

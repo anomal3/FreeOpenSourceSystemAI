@@ -60,6 +60,7 @@ pub mod start;
 pub mod tray;
 pub mod statusbar;
 pub mod term;
+pub mod thumbs;
 pub mod wallart;
 pub mod window;
 
@@ -157,7 +158,9 @@ pub fn hover_tick() {
 /// кнопку и, когда пора, открыть над ней список окон.
 fn hover_button(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     let over = match desktop.panel_at(x, y) {
-        Some(PanelHit::Window(app)) if !desktop.context_open() && !desktop.menu_open() && desktop.dragging().is_none() => {
+        Some(PanelHit::Window(app))
+            if !desktop.context_open() && !desktop.menu_open() && !desktop.thumbs_open() && desktop.dragging().is_none() =>
+        {
             Some(app)
         }
         _ => None,
@@ -181,24 +184,91 @@ fn hover_button(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
     };
     if let Some(app) = due {
         *HOVER_BUTTON.lock() = None;
-        open_group_list(desktop, app, status, true, false);
+        open_thumbs_for(desktop, app, status, true);
     }
 }
 
-/// Список окон программы над её кнопкой на панели задач: строка на окно, у
-/// строки под указателем — крестик «закрыть». `hovered` — открыт наведением
-/// и закроется, когда указатель уйдёт; `with_close` — снизу «Закрыть окно»
-/// («Закрыть все окна»): меню правой кнопки.
-fn open_group_list(desktop: &mut Compositor, app: App, status: &Status, hovered: bool, with_close: bool) {
+/// Миниатюры окон программы над её кнопкой (72e, макет 04). `hovered` —
+/// открыты наведением и закроются, когда указатель уйдёт.
+fn open_thumbs_for(desktop: &mut Compositor, app: App, status: &Status, hovered: bool) {
     let mut members = if panel::labels() { alloc::vec::Vec::new() } else { desktop.group_members(app) };
     if members.is_empty() {
         members.push(app);
     }
-    members.truncate(12);
-    open_list_of(desktop, app, members, status, hovered, with_close);
+    let anchor = members[0];
+    if let Some(rect) = desktop.open_thumbs(members, anchor) {
+        *HOVER_LIST.lock() = hovered.then(|| desktop.button_of(anchor).unwrap_or(rect));
+        kprintln!(
+            "  desktop     : thumbnails at {},{} {}x{}{}",
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            if hovered { " (hover)" } else { "" }
+        );
+    }
+    desktop.refresh_panel(status);
 }
 
-/// То же для готового списка окон `members` над кнопкой окна `anchor`.
+/// Указатель над открытыми миниатюрами: подсветка карточки; открытые
+/// наведением закрываются, когда указатель ушёл и с них, и с кнопки.
+fn hover_thumbs(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
+    let hover_list = *HOVER_LIST.lock();
+    if let (Some(button), Some((strip, _))) = (hover_list, desktop.thumbs_area()) {
+        let keep = strip.union(&button);
+        let margin = 8;
+        let inside = x >= keep.x - margin && x < keep.right() + margin && y >= keep.y - margin && y < keep.bottom() + margin;
+        if !inside {
+            *HOVER_LIST.lock() = None;
+            desktop.close_thumbs();
+            kprintln!("  desktop     : thumbnails closed");
+            desktop.refresh_panel(status);
+            return;
+        }
+    }
+    desktop.thumbs_hover(x, y);
+}
+
+/// Щелчок при открытых миниатюрах. `true` — щелчок забран.
+fn press_thumbs(desktop: &mut Compositor, x: i32, y: i32, status: &Status) -> bool {
+    let hovered = HOVER_LIST.lock().is_some();
+    match desktop.thumbs_hit(x, y) {
+        // Крестик: окно закрывается, полоса остаётся с оставшимися.
+        Some((app, true)) => {
+            let rest: alloc::vec::Vec<App> = desktop.thumbs_apps().into_iter().filter(|other| *other != app).collect();
+            close_from_panel(desktop, app);
+            let rest: alloc::vec::Vec<App> = rest.into_iter().filter(|other| desktop.index_of(*other).is_some()).collect();
+            match rest.first().copied() {
+                Some(anchor) => {
+                    desktop.open_thumbs(rest, anchor);
+                }
+                None => {
+                    *HOVER_LIST.lock() = None;
+                    desktop.close_thumbs();
+                }
+            }
+            desktop.refresh_panel(status);
+            true
+        }
+        Some((app, false)) => {
+            *HOVER_LIST.lock() = None;
+            desktop.close_thumbs();
+            launch(desktop, app);
+            desktop.refresh_panel(status);
+            true
+        }
+        None => {
+            *HOVER_LIST.lock() = None;
+            desktop.close_thumbs();
+            kprintln!("  desktop     : thumbnails closed");
+            // Открытые наведением щелчка мимо себя не съедают.
+            !hovered
+        }
+    }
+}
+
+/// Список окон `members` строками над кнопкой окна `anchor` (меню стола; с
+/// 72e над кнопкой панели — миниатюры, см. [`open_thumbs_for`]).
 fn open_list_of(
     desktop: &mut Compositor,
     anchor: App,
@@ -231,6 +301,25 @@ fn open_list_of(
             rect.h,
             if hovered { " (hover)" } else { "" }
         );
+    }
+    desktop.refresh_panel(status);
+}
+
+/// Меню кнопки панели правой кнопкой (макет 11): «Закрыть окно» или
+/// «Закрыть все окна».
+fn open_close_menu(desktop: &mut Compositor, app: App, status: &Status) {
+    let mut members = if panel::labels() { alloc::vec::Vec::new() } else { desktop.group_members(app) };
+    if members.is_empty() {
+        members.push(app);
+    }
+    let item = if members.len() > 1 { context::Action::CloseAll } else { context::Action::CloseOne };
+    let (x, y) = desktop.pointer_position();
+    let button = desktop.button_of(app).unwrap_or(Rect::new(x, y, 1, 1));
+    *GROUP.lock() = members;
+    desktop.open_context(button.x, button.y, &[item]);
+    desktop.context_select_none();
+    if let Some(rect) = desktop.context_rect() {
+        kprintln!("  desktop     : context menu at {},{} {}x{} for button", rect.x, rect.y, rect.w, rect.h);
     }
     desktop.refresh_panel(status);
 }
@@ -1690,6 +1779,8 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
     }
     if desktop.context_open() {
         hover_context(desktop, x, y, status);
+    } else if desktop.thumbs_open() {
+        hover_thumbs(desktop, x, y, status);
     } else {
         hover_button(desktop, x, y, status);
     }
@@ -1823,7 +1914,11 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                 // «Закрыть окно» («Закрыть все окна»).
                 PanelHit::Window(app) => {
                     *HOVER_BUTTON.lock() = None;
-                    open_group_list(desktop, app, status, false, true);
+                    if desktop.thumbs_open() {
+                        *HOVER_LIST.lock() = None;
+                        desktop.close_thumbs();
+                    }
+                    open_close_menu(desktop, app, status);
                     None
                 }
                 PanelHit::Menu
@@ -2235,6 +2330,11 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         }
     }
 
+    // 0-thumbs. Миниатюры окон над панелью (72e).
+    if desktop.thumbs_open() && press_thumbs(desktop, x, y, status) {
+        return;
+    }
+
     // 0. Меню стола — оно поверх всего, включая меню запуска.
     if desktop.context_open() {
         // Пока в меню набирают имя или отвечают на вопрос об удалении, щелчок
@@ -2323,7 +2423,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                     // Над кнопкой — список окон этой программы, щелчок
                     // выбирает нужное (как в Windows 11; 24.10: перебор по
                     // очереди не давал выбрать конкретное окно).
-                    open_group_list(desktop, app, status, false, false);
+                    open_thumbs_for(desktop, app, status, false);
                     return;
                 }
                 // Щелчок по кнопке активного окна сворачивает его — так ведёт

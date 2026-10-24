@@ -2914,6 +2914,15 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::EmptyBelow),
             Step::Click,
             Step::Await("desktop     : context menu closed", 15_000),
+            // Миниатюры (72e, макет 04): указатель на кнопке свёрнутого
+            // терминала — над ней полоса с карточкой; ушёл — полоса закрылась.
+            Step::Aim(Aim::TaskButton(0)),
+            Step::Await("desktop     : thumbnails at", 15_000),
+            Step::Move(0, -60),
+            Step::Wait(1_000),
+            Step::Shot("12-thumbnails"),
+            Step::Aim(Aim::Empty),
+            Step::Await("desktop     : thumbnails closed", 15_000),
             Step::Aim(Aim::Icon(1)),
             Step::DoubleClick,
             Step::Await("desktop     : restored 'Terminal'", 15_000),
