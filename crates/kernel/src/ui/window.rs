@@ -30,9 +30,10 @@
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use mini_ui::draw;
-use mini_ui::glyphicon::Icon;
+use mini_ui::glyphicon::{self, Icon};
 use mini_ui::text::TextGrid;
 use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface};
@@ -220,9 +221,27 @@ pub enum Hit {
     Resize,
     /// Полоса заголовка: за неё окно таскают.
     Title,
+    /// Вкладка терминала (номер сессии): переключиться на неё.
+    Tab(usize),
+    /// Крестик вкладки терминала: закрыть её.
+    TabClose(usize),
+    /// «+» на полосе вкладок: новая вкладка.
+    TabNew,
     /// Всё остальное.
     Body,
 }
+
+/// Вкладка терминала, которой сейчас не видно: её сетка копит вывод.
+pub struct TermTab {
+    pub session: usize,
+    pub grid: TextGrid,
+}
+
+/// Высота полосы вкладок терминала (как у Windows Terminal — под
+/// заголовком, всегда видна).
+const STRIP_H: u32 = 30;
+/// Наибольшая ширина вкладки.
+const TAB_W: u32 = 200;
 
 /// Содержимое окна.
 pub enum Content {
@@ -330,6 +349,15 @@ pub struct Window {
     select_from: Option<(u64, u32)>,
     /// Значок программы окна (у окон ядра — `None`: значок даёт [`App`]).
     pub art: Option<super::appicon::Art>,
+    /// Вкладки терминала в порядке полосы — номера сессий. Пусто — окно
+    /// без вкладок.
+    tab_order: Vec<usize>,
+    /// Вкладки, которых не видно (сетка видимой — в `content`).
+    tabs: Vec<TermTab>,
+    /// Сессия видимой вкладки.
+    session: usize,
+    /// Подписи вкладок: сессия и что в ней идёт.
+    tab_titles: Vec<(usize, String)>,
     /// По чему окна складываются в одну кнопку панели задач: путь программы.
     /// Пусто — окно ядра, группа по [`App`].
     pub group: String,
@@ -362,14 +390,18 @@ impl Window {
         // Windows Terminal (T5); заливка окна остаётся под заголовком.
         let back = mini_ui::text::TERM_BG;
         let mut surface = Surface::new(rect.w, rect.h, theme::window_bg())?;
+        let strip = app == App::Terminal && !theme::is_mobile();
         surface.fill(content_area(&surface, Window::title_height(scale)), back);
         let grid = TextGrid::new(
-            content_area(&surface, Window::title_height(scale)).shrink(ctx.px(4)),
+            grid_area(&surface, scale, strip),
             ctx.face(Role::Mono),
             mini_ui::text::TERM_FG,
             back,
         )?;
         let mut window = Self::wrap(app, rect, surface, Content::Text(grid), scale, own(app.caption())?);
+        if strip {
+            window.tab_order.push(0);
+        }
         window.draw_decorations(false);
         Some(window)
     }
@@ -474,6 +506,10 @@ impl Window {
             select_from: None,
             art: None,
             group: String::new(),
+            tab_order: Vec::new(),
+            tabs: Vec::new(),
+            session: 0,
+            tab_titles: Vec::new(),
         }
     }
 
@@ -711,6 +747,22 @@ impl Window {
         if local.1 < title_bottom {
             return Some(Hit::Title);
         }
+        if !self.tab_order.is_empty() && local.1 < title_bottom + self.ctx().px(STRIP_H) as i32 {
+            let (tabs, plus) = self.strip_layout();
+            if plus.contains(local.0, local.1) {
+                return Some(Hit::TabNew);
+            }
+            for (session, tab, close) in tabs {
+                if close.contains(local.0, local.1) {
+                    return Some(Hit::TabClose(session));
+                }
+                if tab.contains(local.0, local.1) {
+                    return Some(Hit::Tab(session));
+                }
+            }
+            // Пустое место полосы — как заголовок: за него таскают.
+            return Some(Hit::Title);
+        }
         // Уголок проверяется после заголовка: у окна ростом с полосу заголовка
         // они пересекаются, и таскать такое окно важнее, чем тянуть его за
         // размер.
@@ -810,6 +862,7 @@ impl Window {
         // Значок программы, как на панели задач (24.10: был цветной квадрат
         // без знака — «квадратик цветной»).
         self.icon_art().draw(ctx, &mut self.surface, badge);
+        self.draw_strip(focused);
 
         // Кнопки нарисованы всегда, а не только у активного окна: кнопка,
         // появляющаяся при наведении, потребовала бы следить за указателем и
@@ -902,6 +955,9 @@ impl Window {
                 self.surface.fill(area, mini_ui::text::TERM_BG);
                 grid.recolor(&mut self.surface, mini_ui::text::TERM_FG, mini_ui::text::TERM_BG);
                 grid.take_damage();
+                for tab in &mut self.tabs {
+                    tab.grid.recolor(&mut self.surface, mini_ui::text::TERM_FG, mini_ui::text::TERM_BG);
+                }
                 self.damage = self.damage.union(&area);
             }
             Content::Settings(_) | Content::Dialog(_) => self.redraw_content(),
@@ -913,6 +969,212 @@ impl Window {
             // перекраски значило бы завести половину протокола.
             Content::Program(_) => {}
         }
+    }
+
+    /// Вкладки терминала в порядке полосы (номера сессий).
+    #[must_use]
+    pub fn tab_sessions(&self) -> &[usize] {
+        &self.tab_order
+    }
+
+    /// Сессия видимой вкладки.
+    #[must_use]
+    pub const fn active_session(&self) -> usize {
+        self.session
+    }
+
+    /// Есть ли у окна полоса вкладок.
+    #[must_use]
+    pub fn has_tabs(&self) -> bool {
+        !self.tab_order.is_empty()
+    }
+
+    /// Добавить вкладку сессии `session` и показать её. `false` — не
+    /// терминал или нет памяти под сетку.
+    pub fn add_tab(&mut self, session: usize) -> bool {
+        if self.tab_order.is_empty() || self.tab_order.contains(&session) {
+            return false;
+        }
+        let ctx = self.ctx();
+        let area = grid_area(&self.surface, self.scale, true);
+        let Some(mut grid) = TextGrid::new(area, ctx.face(Role::Mono), mini_ui::text::TERM_FG, mini_ui::text::TERM_BG) else {
+            return false;
+        };
+        grid.hide();
+        self.tabs.push(TermTab { session, grid });
+        self.tab_order.push(session);
+        self.switch_tab(session);
+        true
+    }
+
+    /// Показать вкладку сессии `session`.
+    pub fn switch_tab(&mut self, session: usize) -> bool {
+        if session == self.session {
+            return false;
+        }
+        let Some(index) = self.tabs.iter().position(|tab| tab.session == session) else {
+            return false;
+        };
+        let Content::Text(current) = &mut self.content else {
+            return false;
+        };
+        let mut incoming = self.tabs.swap_remove(index);
+        core::mem::swap(current, &mut incoming.grid);
+        // `incoming.grid` — бывшая видимая.
+        incoming.grid.hide();
+        incoming.session = self.session;
+        self.tabs.push(incoming);
+        self.session = session;
+        let area = content_area(&self.surface, self.bar() + self.ctx().px(STRIP_H));
+        self.surface.fill(area, mini_ui::text::TERM_BG);
+        if let Content::Text(grid) = &mut self.content {
+            grid.show(&mut self.surface);
+            grid.take_damage();
+        }
+        self.damage = self.damage.union(&area);
+        self.draw_strip(true);
+        true
+    }
+
+    /// Убрать вкладку сессии `session`; видимую сменяет соседняя.
+    pub fn remove_tab(&mut self, session: usize) -> bool {
+        let Some(at) = self.tab_order.iter().position(|item| *item == session) else {
+            return false;
+        };
+        if self.tab_order.len() == 1 {
+            return false;
+        }
+        if session == self.session {
+            let next = if at + 1 < self.tab_order.len() { self.tab_order[at + 1] } else { self.tab_order[at - 1] };
+            self.switch_tab(next);
+        }
+        self.tabs.retain(|tab| tab.session != session);
+        self.tab_order.remove(at);
+        self.tab_titles.retain(|(item, _)| *item != session);
+        self.draw_strip(true);
+        true
+    }
+
+    /// Выполнить `action` над сеткой сессии `session`, видимой или нет: на
+    /// время действия её сетка становится содержимым окна, а скрытая ничего
+    /// не рисует.
+    pub fn with_session<R>(&mut self, session: usize, action: impl FnOnce(&mut Self) -> R) -> R {
+        if session == self.session || self.tab_order.is_empty() {
+            return action(self);
+        }
+        let Some(index) = self.tabs.iter().position(|tab| tab.session == session) else {
+            return action(self);
+        };
+        let Content::Text(current) = &mut self.content else {
+            return action(self);
+        };
+        core::mem::swap(current, &mut self.tabs[index].grid);
+        let result = action(self);
+        if let Content::Text(current) = &mut self.content {
+            core::mem::swap(current, &mut self.tabs[index].grid);
+        }
+        result
+    }
+
+    /// Подпись вкладки сессии `session` (что в ней идёт).
+    pub fn set_tab_title(&mut self, session: usize, title: &str) {
+        match self.tab_titles.iter_mut().find(|(item, _)| *item == session) {
+            Some((_, old)) if old == title => return,
+            Some((_, old)) => *old = String::from(title),
+            None => self.tab_titles.push((session, String::from(title))),
+        }
+        self.draw_strip(true);
+    }
+
+    fn tab_title(&self, session: usize) -> String {
+        self.tab_titles
+            .iter()
+            .find(|(item, _)| *item == session)
+            .map_or_else(|| alloc::format!("Терминал {}", session + 1), |(_, title)| title.clone())
+    }
+
+    /// Где на полосе вкладки (сессия, вкладка, крестик) и «+».
+    fn strip_layout(&self) -> (Vec<(usize, Rect, Rect)>, Rect) {
+        let ctx = self.ctx();
+        let top = Self::title_height(self.scale) as i32;
+        let h = ctx.px(STRIP_H);
+        let pad = ctx.px(6);
+        let plus_w = ctx.px(28);
+        let count = self.tab_order.len().max(1) as u32;
+        let room = self.surface.width().saturating_sub(pad * 2 + plus_w + ctx.px(4));
+        let width = (room / count).min(ctx.px(TAB_W)).max(ctx.px(60));
+        let mut out = Vec::new();
+        let mut x = pad as i32;
+        for session in &self.tab_order {
+            let tab = Rect::new(x, top + ctx.px(3) as i32, width, h - ctx.px(3));
+            let side = ctx.px(16);
+            let close = Rect::new(tab.right() - (side + ctx.px(6)) as i32, tab.y + (tab.h as i32 - side as i32) / 2, side, side);
+            out.push((*session, tab, close));
+            x += (width + ctx.px(2)) as i32;
+        }
+        let plus = Rect::new(x + ctx.px(2) as i32, top + ctx.px(4) as i32, plus_w, h - ctx.px(8));
+        (out, plus)
+    }
+
+    /// Нарисовать полосу вкладок: видимая — цвета терминала, остальные —
+    /// приглушённые; крестик у каждой, «+» в конце.
+    fn draw_strip(&mut self, focused: bool) {
+        if self.tab_order.is_empty() || self.popup || self.frameless {
+            return;
+        }
+        let ctx = self.ctx();
+        let p = ctx.palette;
+        let top = Self::title_height(self.scale) as i32;
+        let h = ctx.px(STRIP_H);
+        let strip = Rect::new(0, top, self.surface.width(), h);
+        self.surface.fill(strip, ctx.flat(if focused { p.tb2 } else { p.tb2 }));
+        let (tabs, plus) = self.strip_layout();
+        for (session, tab, close) in tabs {
+            let active = session == self.session;
+            if active {
+                draw::rounded(&mut self.surface, Rect::new(tab.x, tab.y, tab.w, tab.h + ctx.px(6)), ctx.px(6), mini_ui::text::TERM_BG, 255);
+            }
+            let title = self.tab_title(session);
+            let ink = if active { mini_ui::text::TERM_FG } else { p.ink4 };
+            let glyph = ctx.px(12);
+            glyphicon::draw(
+                &mut self.surface,
+                Icon::Terminal,
+                tab.x + ctx.px(8) as i32,
+                tab.y + (tab.h as i32 - glyph as i32) / 2,
+                glyph,
+                ink,
+                255,
+            );
+            let text_x = tab.x + ctx.px(26) as i32;
+            paint::text_clipped(
+                ctx,
+                &mut self.surface,
+                Role::Body,
+                text_x,
+                paint::baseline(ctx, Role::Body, tab),
+                (close.x - text_x - ctx.px(4) as i32).max(0) as u32,
+                &title,
+                ink,
+            );
+            let cross = ctx.px(10);
+            glyphicon::draw(
+                &mut self.surface,
+                Icon::Close,
+                close.x + (close.w as i32 - cross as i32) / 2,
+                close.y + (close.h as i32 - cross as i32) / 2,
+                cross,
+                p.ink4,
+                255,
+            );
+        }
+        // «+» — две черты: в наборе значков плюса нет.
+        let arm = ctx.px(10) as i32;
+        let (cx, cy) = (plus.x + plus.w as i32 / 2, plus.y + plus.h as i32 / 2);
+        let thick = ctx.px(2).max(1);
+        self.surface.fill(Rect::new(cx - arm / 2, cy - thick as i32 / 2, arm as u32, thick), p.ink3);
+        self.surface.fill(Rect::new(cx - thick as i32 / 2, cy - arm / 2, thick, arm as u32), p.ink3);
+        self.damage = self.damage.union(&strip);
     }
 
     /// Значок программы окна: свой у программы (из пакета или по таблице),
@@ -1332,12 +1594,15 @@ impl Window {
         let Some(mut surface) = Surface::new(w, h, theme::window_bg()) else {
             return false;
         };
-        let inner = content_area(&surface, Self::title_height(self.scale)).shrink(self.ctx().px(4));
+        let inner = grid_area(&surface, self.scale, !self.tab_order.is_empty());
         match &mut self.content {
             Content::Text(grid) => {
                 surface.fill(content_area(&surface, Self::title_height(self.scale)), mini_ui::text::TERM_BG);
                 if !grid.rebind(&mut surface, inner) {
                     return false;
+                }
+                for tab in &mut self.tabs {
+                    let _ = tab.grid.rebind(&mut surface, inner);
                 }
             }
             // Список файлов и «Параметры» рисуют себя от размера области, и
@@ -1563,6 +1828,14 @@ fn own(text: &str) -> Option<String> {
 /// Поля не отнимаются: их назначает само содержимое, и они у списка файлов и у
 /// «Параметров» разные. Отнимать их здесь значило бы, что боковая колонка,
 /// которая обязана доходить до края окна, до него не доходит.
+/// Где лежит сетка терминала: область содержимого без полосы вкладок и с
+/// полем в четыре точки.
+fn grid_area(surface: &Surface, scale: u32, strip: bool) -> Rect {
+    let ctx = Ctx::scaled(scale);
+    let top = Window::title_height(scale) + if strip { ctx.px(STRIP_H) } else { 0 };
+    content_area(surface, top).shrink(ctx.px(4))
+}
+
 fn content_area(surface: &Surface, top: u32) -> Rect {
     Rect::new(
         0,

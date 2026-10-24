@@ -106,13 +106,23 @@ impl Buffer {
     }
 }
 
-static BUFFER: SpinLock<Buffer> = SpinLock::new(Buffer::new());
+/// Свой терминал у каждой вкладки (`sched::session`): ввод, программа
+/// переднего плана, режим. Сессия — текущей задачи: оболочка вкладки и её
+/// программы попадают в один и тот же.
+const SESSIONS: usize = crate::sched::MAX_SESSIONS;
+
+static BUFFER: [SpinLock<Buffer>; SESSIONS] = [const { SpinLock::new(Buffer::new()) }; SESSIONS];
 
 /// Задача, которой достаётся ввод. [`NO_TASK`] — никакой.
-static FOREGROUND: AtomicU32 = AtomicU32::new(NO_TASK);
+static FOREGROUND: [AtomicU32; SESSIONS] = [const { AtomicU32::new(NO_TASK) }; SESSIONS];
 
 /// Прямой режим: нажатия едут байтами, без сборки строки и без эха.
-static RAW: AtomicBool = AtomicBool::new(false);
+static RAW: [AtomicBool; SESSIONS] = [const { AtomicBool::new(false) }; SESSIONS];
+
+/// Терминал текущей задачи.
+fn here() -> usize {
+    crate::sched::session()
+}
 
 /// Сколько байт программы прочитали за всё время работы.
 ///
@@ -135,13 +145,13 @@ static READ_BYTES: AtomicU64 = AtomicU64::new(0);
 /// ветках.
 pub fn set_foreground(task: Option<TaskId>) {
     if task.is_some() {
-        let mut buffer = BUFFER.lock();
+        let mut buffer = BUFFER[here()].lock();
         buffer.head = 0;
         buffer.len = 0;
         buffer.eof = false;
     }
-    RAW.store(false, Ordering::Relaxed);
-    FOREGROUND.store(task.map_or(NO_TASK, TaskId::as_u32), Ordering::Relaxed);
+    RAW[here()].store(false, Ordering::Relaxed);
+    FOREGROUND[here()].store(task.map_or(NO_TASK, TaskId::as_u32), Ordering::Relaxed);
     // Строка в журнале — единственное, чем снаружи видно, кому достаётся ввод.
     // Снимок экрана этого не показывает, а без неё «клавиша уехала в программу»
     // и «клавиша потерялась» выглядят одинаково.
@@ -154,7 +164,17 @@ pub fn set_foreground(task: Option<TaskId>) {
 /// Какая задача сейчас на переднем плане.
 #[must_use]
 pub fn foreground() -> Option<TaskId> {
-    match FOREGROUND.load(Ordering::Relaxed) {
+    match FOREGROUND[here()].load(Ordering::Relaxed) {
+        NO_TASK => None,
+        raw => Some(TaskId::new(raw)),
+    }
+}
+
+/// Программа переднего плана терминала `session` (закрыть вкладку — снять
+/// её программу).
+#[must_use]
+pub fn foreground_of(session: usize) -> Option<TaskId> {
+    match FOREGROUND[session.min(SESSIONS - 1)].load(Ordering::Relaxed) {
         NO_TASK => None,
         raw => Some(TaskId::new(raw)),
     }
@@ -162,14 +182,14 @@ pub fn foreground() -> Option<TaskId> {
 
 /// Перевести терминал в прямой режим или вернуть в канонический.
 pub fn set_raw(raw: bool) {
-    RAW.store(raw, Ordering::Relaxed);
+    RAW[here()].store(raw, Ordering::Relaxed);
     crate::kprintln!("  tty         : {} mode", if raw { "raw" } else { "canonical" });
 }
 
 /// В прямом ли режиме терминал.
 #[must_use]
 pub fn is_raw() -> bool {
-    RAW.load(Ordering::Relaxed)
+    RAW[here()].load(Ordering::Relaxed)
 }
 
 /// Положить байты, набранные человеком, и разбудить того, кто их ждёт.
@@ -178,7 +198,7 @@ pub fn is_raw() -> bool {
 /// проснулся бы, ничего не нашёл и уснул бы снова — до срока.
 pub fn push(bytes: &[u8]) {
     {
-        let mut buffer = BUFFER.lock();
+        let mut buffer = BUFFER[here()].lock();
         for byte in bytes {
             buffer.push(*byte);
         }
@@ -196,7 +216,7 @@ pub fn push(bytes: &[u8]) {
 /// решит, что с этим делать. Так же ведёт себя всякий tty, и разница
 /// осмысленная — «ввод кончился» и «тебя убили» требуют от программы разного.
 pub fn push_eof() {
-    BUFFER.lock().eof = true;
+    BUFFER[here()].lock().eof = true;
     crate::sched::wake_input();
 }
 
@@ -204,7 +224,7 @@ pub fn push_eof() {
 /// различить их можно по [`at_eof`].
 pub fn read(out: &mut [u8]) -> usize {
     let mut written = 0;
-    let mut buffer = BUFFER.lock();
+    let mut buffer = BUFFER[here()].lock();
     while written < out.len() {
         let Some(byte) = buffer.pop() else {
             break;
@@ -228,7 +248,7 @@ pub fn read(out: &mut [u8]) -> usize {
 /// строки было бы хуже, чем не отдавать ничего: команда, у которой начало
 /// набрано до конца программы, а конец после, разъехалась бы на две.
 pub fn take_all(out: &mut [u8]) -> usize {
-    let mut buffer = BUFFER.lock();
+    let mut buffer = BUFFER[here()].lock();
     let mut written = 0;
     while written < out.len() {
         let Some(byte) = buffer.pop() else { break };
@@ -244,14 +264,22 @@ pub fn take_all(out: &mut [u8]) -> usize {
 /// ли, а засыпать нельзя ни при непрочитанных байтах, ни при конце ввода.
 #[must_use]
 pub fn ready() -> bool {
-    let buffer = BUFFER.lock();
+    ready_in(here())
+}
+
+/// То же для терминала `session` — для условия ожидания: оно исполняется
+/// под замком планировщика, а узнать сессию текущей задачи там нельзя (тот
+/// же замок).
+#[must_use]
+pub fn ready_in(session: usize) -> bool {
+    let buffer = BUFFER[session.min(SESSIONS - 1)].lock();
     buffer.len != 0 || buffer.eof
 }
 
 /// Кончился ли ввод.
 #[must_use]
 pub fn at_eof() -> bool {
-    BUFFER.lock().eof
+    BUFFER[here()].lock().eof
 }
 
 /// Сколько байт программы прочитали с начала работы.
@@ -263,7 +291,7 @@ pub fn read_bytes() -> u64 {
 /// Сколько байт потеряно переполнением.
 #[must_use]
 pub fn dropped() -> u64 {
-    BUFFER.lock().dropped
+    BUFFER[here()].lock().dropped
 }
 
 /// Сколько байт может занять одно нажатие в прямом режиме.

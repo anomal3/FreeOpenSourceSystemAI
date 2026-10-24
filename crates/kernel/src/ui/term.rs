@@ -98,7 +98,10 @@ impl Parser {
     }
 }
 
-static PARSER: SpinLock<Parser> = SpinLock::new(Parser::new());
+/// Свой разбор у каждой вкладки: последовательность, начатая программой
+/// одной вкладки, не должна доедать вывод другой.
+static PARSER: [SpinLock<Parser>; crate::sched::MAX_SESSIONS] =
+    [const { SpinLock::new(Parser::new()) }; crate::sched::MAX_SESSIONS];
 
 /// Сколько последовательностей уже названо в журнале.
 static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -111,8 +114,8 @@ static LOGGED: AtomicU64 = AtomicU64::new(0);
 /// при этом идёт как обычно, и это существенно: состояние автомата принадлежит
 /// терминалу, а не окну, и последовательность, разорванная пополам чужой
 /// перерисовкой, обязана доехать целой.
-pub fn feed(mut window: Option<&mut Window>, text: &str) {
-    let mut parser = PARSER.lock();
+pub fn feed(session: usize, mut window: Option<&mut Window>, text: &str) {
+    let mut parser = PARSER[session.min(crate::sched::MAX_SESSIONS - 1)].lock();
 
     // Печатаемые куски копятся и уходят в окно одной строкой: вывод по символу
     // означал бы снятие и возврат курсора на каждый знак, то есть три записи в

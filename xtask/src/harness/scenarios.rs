@@ -1977,6 +1977,35 @@ pub const ALL: &[Scenario] = &[
             Step::Line("echo after paste"),
             Step::Await("  after paste", 15_000),
             Step::Await(PROMPT, 15_000),
+            // Вкладки (как в Windows Terminal): Ctrl+Shift+T — новая со своей
+            // оболочкой и своим каталогом; Ctrl+Tab — соседняя; Ctrl+Shift+W
+            // и `exit` закрывают вкладку.
+            Step::Key("ctrl-shift-t"),
+            Step::Await("terminal    : tab 2 opened", 15_000),
+            Step::Await(PROMPT, 15_000),
+            Step::Line("cd /bin"),
+            Step::Await(PROMPT, 15_000),
+            Step::Line("pwd"),
+            Step::Await("/bin", 15_000),
+            Step::Await(PROMPT, 15_000),
+            Step::Shot("terminal-tab2"),
+            Step::Key("ctrl-tab"),
+            Step::Await("terminal    : tab 1 active", 15_000),
+            Step::Line("echo back-in-first"),
+            Step::Await("  back-in-first", 15_000),
+            Step::Await(PROMPT, 15_000),
+            Step::Key("ctrl-tab"),
+            Step::Await("terminal    : tab 2 active", 15_000),
+            Step::Key("ctrl-shift-w"),
+            Step::Await("terminal    : tab 2 closed", 15_000),
+            Step::Key("ctrl-shift-t"),
+            Step::Await("terminal    : tab 2 opened", 15_000),
+            Step::Await(PROMPT, 15_000),
+            Step::Line("exit"),
+            Step::Await("terminal    : tab 2 closed", 15_000),
+            Step::Line("echo first-tab-alive"),
+            Step::Await("  first-tab-alive", 15_000),
+            Step::Await(PROMPT, 15_000),
             Step::Absent("KERNEL PANIC"),
         ],
     },
@@ -5520,7 +5549,10 @@ pub const ALL: &[Scenario] = &[
             // размера (до фазы 71i с этим кончалась куча ядра).
             Step::Aim(Aim::Maximize("Untitled - Chromium")),
             Step::Click,
-            Step::Await("window      : 'FossAi - Chromium' at 0,0", 30_000),
+            // До двух минут: Chromium в отладочном ядре под эмулятором бывает
+            // занят запуском очередного процесса, и щелчок разбирается не
+            // сразу (24.10: 30 с не хватило).
+            Step::Await("window      : 'FossAi - Chromium' at 0,0", 120_000),
             Step::Wait(60_000),
             Step::Move(1, 0),
             Step::Wait(2_000),

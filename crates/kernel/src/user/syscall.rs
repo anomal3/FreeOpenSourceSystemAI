@@ -652,7 +652,8 @@ fn read_input(buffer: &mut [u8]) -> i64 {
         // планировщика — то есть пробуждение можно потерять. Со сроком потеря
         // стоит десятой доли секунды, без срока — всей программы.
         let deadline = crate::time::uptime_ms() + 100;
-        sched::block_on_input(deadline, crate::tty::ready);
+        let session = sched::session();
+        sched::block_on_input(deadline, || crate::tty::ready_in(session));
     }
 }
 

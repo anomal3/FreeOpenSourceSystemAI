@@ -32,6 +32,7 @@ use crate::{fs, irq, kprint, mm, sched, time, tty, ui, usb, user};
 
 mod complete;
 mod history;
+pub mod session;
 
 /// Метки оболочки для терминала — shell integration, как у Windows Terminal
 /// (`OSC 133`): начало приглашения, начало ввода, начало выполнения команды и
@@ -43,10 +44,11 @@ pub const MARK_INPUT: &str = "\x1b]133;B\x07";
 const MARK_RUN: &str = "\x1b]133;C\x07";
 
 /// Текущий каталог оболочки (`cd`, `pwd`, относительные пути).
-static CWD: Mutex<String> = Mutex::new(String::new());
+static CWD: [Mutex<String>; sched::MAX_SESSIONS] = [const { Mutex::new(String::new()) }; sched::MAX_SESSIONS];
 
 /// История команд — общая для приглашения и команды `history`.
-static HISTORY: Mutex<history::History> = Mutex::new(history::History::new());
+static HISTORY: [Mutex<history::History>; sched::MAX_SESSIONS] =
+    [const { Mutex::new(history::History::new()) }; sched::MAX_SESSIONS];
 
 /// Следующее событие указателя. На столе подряд идущие движения сливаются в
 /// одно (кадр на пачку, а не на каждое); на телефоне — нет: путь пальца по
@@ -57,21 +59,23 @@ fn next_pointer() -> Option<input::PointerEvent> {
 
 /// Код возврата последней команды (терминал T4): ненулевой приглашение
 /// показывает красным `[N]`, как это делают темы bash и PowerShell.
-static LAST_EXIT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+static LAST_EXIT: [core::sync::atomic::AtomicI64; sched::MAX_SESSIONS] =
+    [const { core::sync::atomic::AtomicI64::new(0) }; sched::MAX_SESSIONS];
 
 /// Чем закончилась последняя программа: её задача и код. Программа кладёт
 /// сюда код сама, уходя ([`note_exit`]), а оболочка забирает его, если это
 /// была её программа переднего плана.
-static EXITED: crate::sync::SpinLock<Option<(sched::TaskId, i64)>> = crate::sync::SpinLock::new(None);
+static EXITED: [crate::sync::SpinLock<Option<(sched::TaskId, i64)>>; sched::MAX_SESSIONS] =
+    [const { crate::sync::SpinLock::new(None) }; sched::MAX_SESSIONS];
 
 /// Программа текущей задачи закончилась с кодом `code`.
 pub fn note_exit(code: i64) {
-    *EXITED.lock() = Some((sched::current(), code));
+    *EXITED[sched::session()].lock() = Some((sched::current(), code));
 }
 
 /// Текущий каталог; пустой — домашний того, кто вошёл.
 fn cwd() -> String {
-    let now = CWD.lock().clone();
+    let now = CWD[sched::session()].lock().clone();
     if now.is_empty() { ui::context::home_dir() } else { now }
 }
 
@@ -334,6 +338,41 @@ macro_rules! sprintln {
 /// Возвращается, когда сеанс закончен: по команде `exit`, по Ctrl+D или по
 /// истечении времени без ввода.
 pub fn task() {
+    run(true);
+    // Сеанс кончился — вкладки уходят вместе с ним.
+    session::close_all();
+}
+
+/// Следующая клавиша оболочки. Первая вкладка (`primary`) разбирает весь
+/// ввод стола и раздаёт клавиши видимой вкладке; остальные читают только
+/// свою очередь.
+fn next_key(primary: bool, me: usize) -> Option<KeyEvent> {
+    if !primary {
+        return session::next(me);
+    }
+    loop {
+        let event = input::next_event()?;
+        let Some(event) = ui::dispatch(event) else {
+            continue;
+        };
+        let active = ui::active_session();
+        if active != 0 && session::alive(active) {
+            session::push(active, event);
+            continue;
+        }
+        return Some(event);
+    }
+}
+
+/// Счётчик, по которому оболочка просыпается: ввод стола у первой
+/// вкладки, своя очередь у остальных.
+fn input_seq(primary: bool, me: usize) -> u64 {
+    if primary { input::sequence() } else { session::seq(me) }
+}
+
+/// Тело оболочки вкладки. Возвращается, когда сеанс вкладки закончен.
+fn run(primary: bool) {
+    let me = sched::session();
     // Дать демонстрационным задачам договорить: их вывод и набираемая строка
     // идут в одну консоль, и перемешивать их незачем.
     //
@@ -349,11 +388,13 @@ pub fn task() {
         sched::sleep_ms(POLL_PERIOD_MS);
     }
 
-    banner();
+    if primary {
+        banner();
+    }
     ui::set_cursor(true);
 
     let mut editor = LineEditor::new();
-    HISTORY.lock().load();
+    HISTORY[sched::session()].lock().load();
     let mut tabs = 0u32;
     let mut search: Option<Search> = None;
     show_prompt(&mut editor);
@@ -365,41 +406,49 @@ pub fn task() {
         // после этой строки, изменит его и не даст задаче уснуть в конце витка.
         // Прочитать его после разбора значило бы оставить окно, в котором
         // событие уже пришло, а спящий его проспал.
-        let seen = input::sequence();
+        let seen = input_seq(primary, me);
+        if !primary && session::closing(me) {
+            ui::set_cursor(false);
+            return;
+        }
 
         let now = time::uptime_ms();
         // Пока идёт анимация, стол собирает кадр на каждом витке: полёт окна
         // живёт по часам, а не по событиям, и без этого кадров между двумя
         // касаниями не было бы вовсе.
-        if ui::animating() || now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
+        if primary && (ui::animating() || now.saturating_sub(status_at) >= STATUS_PERIOD_MS) {
             status_at = now;
             update_status();
+        }
+        if primary {
+            for request in ui::take_tab_requests() {
+                match request {
+                    ui::TabRequest::New => session::open(),
+                    ui::TabRequest::Close(tab) => session::close(tab),
+                }
+            }
         }
 
         // Отчёты мыши разбираются перед клавишами: они меняют, какое окно
         // активно, и разобрать их после значило бы отдать нажатие тому окну,
         // которое было активным до щелчка.
-        while let Some(event) = next_pointer() {
+        // Указатель разбирает только первая вкладка — он общий на стол.
+        while let Some(event) = if primary { next_pointer() } else { None } {
             idle_since = time::uptime_ms();
             ui::dispatch_pointer(event);
         }
 
-        while let Some(event) = input::next_event() {
+        // Рабочий стол смотрит на событие первым: меню, переключение и
+        // перемещение окон, а также ввод в окно другой программы — всё это
+        // до оболочки не доходит (см. [`next_key`]).
+        while let Some(event) = next_key(primary, me) {
             idle_since = time::uptime_ms();
-            // Рабочий стол смотрит на событие первым: меню, переключение и
-            // перемещение окон, а также ввод в окно другой программы — всё это
-            // до оболочки не доходит. Оболочка — одна из программ, а не хозяин
-            // клавиатуры, и без стола (машина без фреймбуфера) события просто
-            // проходят насквозь.
-            let Some(event) = ui::dispatch(event) else {
-                continue;
-            };
             // Поиск по истории (Ctrl+R) разбирает клавиши сам, пока не кончится.
             if let Some(state) = search.as_mut() {
                 if !event.pressed {
                     continue;
                 }
-                let outcome = search_key(state, event, &mut editor, &HISTORY.lock());
+                let outcome = search_key(state, event, &mut editor, &HISTORY[sched::session()].lock());
                 match outcome {
                     SearchEnd::Continue => continue,
                     SearchEnd::Edit => {
@@ -416,8 +465,8 @@ pub fn task() {
             }
             match result {
                 Edit::Submitted => {
-                    HISTORY.lock().add(editor.as_str());
-                    LAST_EXIT.store(0, core::sync::atomic::Ordering::Relaxed);
+                    HISTORY[sched::session()].lock().add(editor.as_str());
+                    LAST_EXIT[sched::session()].store(0, core::sync::atomic::Ordering::Relaxed);
                     sprint!("{MARK_RUN}");
                     let done = run_command(editor.as_str());
                     editor.clear();
@@ -477,18 +526,18 @@ pub fn task() {
                     show_prompt(&mut editor);
                 }
                 Edit::Unhandled(event) => {
-                    let started = handle_key(event, &mut editor, &mut HISTORY.lock(), tabs);
+                    let started = handle_key(event, &mut editor, &mut HISTORY[sched::session()].lock(), tabs);
                     if let Some(started) = started {
                         search = Some(started);
                     }
                 }
-                Edit::Inserted | Edit::Erased => HISTORY.lock().reset(),
+                Edit::Inserted | Edit::Erased => HISTORY[sched::session()].lock().reset(),
                 Edit::Ignored | Edit::Moved => {}
             }
             // Серая подсказка из истории — после каждой клавиши, пока курсор в
             // конце строки.
             if search.is_none() {
-                let hint = HISTORY.lock().suggest(editor.as_str()).map(|line| String::from(&line[editor.as_str().len()..]));
+                let hint = HISTORY[sched::session()].lock().suggest(editor.as_str()).map(|line| String::from(&line[editor.as_str().len()..]));
                 editor.set_hint(hint.as_deref(), &mut Out);
             }
         }
@@ -502,7 +551,7 @@ pub fn task() {
         } else {
             IDLE_TIMEOUT_HUMAN_SECONDS
         };
-        if time::uptime_ms().saturating_sub(idle_since) >= limit * 1000 {
+        if primary && time::uptime_ms().saturating_sub(idle_since) >= limit * 1000 {
             sprintln!();
             sprintln!("  no input for {limit} s, finishing the session");
             ui::set_cursor(false);
@@ -520,7 +569,9 @@ pub fn task() {
         // опрос: будить стол чаще без дела значит отнимать процессор у всех.
         // Бездействие проверяется здесь, а не таймером: это единственное место
         // в системе, которое просыпается само и при этом вправе брать замки.
-        crate::power::idle_tick();
+        if primary {
+            crate::power::idle_tick();
+        }
 
         // Пока экран погашен, часы в окне состояния не видит никто, и будить
         // машину десять раз в секунду ради них — трата, ради устранения
@@ -536,7 +587,11 @@ pub fn task() {
         // Срок — во времени, а не в тиках: тики теряются (см.
         // `sched::block_on_irq_until`).
         let deadline = time::uptime_ms() + period;
-        sched::block_on_input(deadline, || input::sequence() != seen);
+        if primary {
+            sched::block_on_input(deadline, || input::sequence() != seen);
+        } else {
+            sched::block_on_input(deadline, || session::seq(me) != seen);
+        }
     }
 }
 
@@ -997,7 +1052,7 @@ fn change_dir(argument: &str) {
         return;
     };
     match fs::resolve_as(user::session::credentials(), &target, Access::SEARCH) {
-        Some(Ok(node)) if node.metadata().kind == NodeKind::Directory => *CWD.lock() = target,
+        Some(Ok(node)) if node.metadata().kind == NodeKind::Directory => *CWD[sched::session()].lock() = target,
         Some(Ok(_)) => sprintln!("  cd: {argument}: not a directory"),
         Some(Err(err)) => sprintln!("  cd: {argument}: {err}"),
         None => sprintln!("  cd: {argument}: no such directory"),
@@ -2265,8 +2320,15 @@ fn foreground(id: sched::TaskId, label: &str) {
     let mut editor = LineEditor::new();
     let mut status_at = 0u64;
 
+    let me = sched::session();
+    let primary = me == 0;
+    let mut killed = false;
     while running(id) {
-        let seen = input::sequence();
+        let seen = input_seq(primary, me);
+        if !primary && session::closing(me) && !killed {
+            killed = true;
+            let _ = user::request_kill(id);
+        }
 
         let now = time::uptime_ms();
         // Пока идёт анимация, стол собирает кадр на каждом витке: полёт окна
@@ -2274,7 +2336,9 @@ fn foreground(id: sched::TaskId, label: &str) {
         // касаниями не было бы вовсе.
         if ui::animating() || now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
             status_at = now;
-            update_status();
+            if primary {
+                update_status();
+            }
             // Без счётчика секунд: подпись, меняющаяся раз в секунду, —
             // перестройка панели и кадр стола каждую секунду, пока идёт
             // программа, а программе (игре со звуком) нужен процессор.
@@ -2282,14 +2346,19 @@ fn foreground(id: sched::TaskId, label: &str) {
             ui::shell_status(Some(&alloc::format!("{short} · идёт")));
         }
 
-        while let Some(event) = next_pointer() {
+        if primary {
+            for request in ui::take_tab_requests() {
+                match request {
+                    ui::TabRequest::New => session::open(),
+                    ui::TabRequest::Close(tab) => session::close(tab),
+                }
+            }
+        }
+        while let Some(event) = if primary { next_pointer() } else { None } {
             ui::dispatch_pointer(event);
         }
 
-        while let Some(event) = input::next_event() {
-            let Some(event) = ui::dispatch(event) else {
-                continue;
-            };
+        while let Some(event) = next_key(primary, me) {
             // Ctrl+C проверяется до всего остального и в обоих режимах:
             // полноэкранная программа, ушедшая в цикл, иначе не снималась бы
             // ничем, кроме перезагрузки.
@@ -2345,7 +2414,11 @@ fn foreground(id: sched::TaskId, label: &str) {
         // Срок — во времени, а не в тиках: тики теряются (см.
         // `sched::block_on_irq_until`).
         let deadline = time::uptime_ms() + period;
-        sched::block_on_input(deadline, || input::sequence() != seen);
+        if primary {
+            sched::block_on_input(deadline, || input::sequence() != seen);
+        } else {
+            sched::block_on_input(deadline, || session::seq(me) != seen);
+        }
     }
 
     // Строка, набранная наполовину к моменту, когда программа закончилась,
@@ -2361,14 +2434,14 @@ fn foreground(id: sched::TaskId, label: &str) {
     ui::shell_status(None);
     // Код — как его показывает bash: снятая программа — 130 (Ctrl+C), убитая
     // ядром — 139 (как от SIGSEGV).
-    let exited = EXITED.lock().filter(|(task, _)| *task == id).map(|(_, code)| code);
+    let exited = EXITED[sched::session()].lock().filter(|(task, _)| *task == id).map(|(_, code)| code);
     if let Some(code) = exited {
         let shown = match code {
             user_abi::EXIT_KILLED => 130,
             user_abi::EXIT_FAULTED => 139,
             code => code,
         };
-        LAST_EXIT.store(shown, core::sync::atomic::Ordering::Relaxed);
+        LAST_EXIT[sched::session()].store(shown, core::sync::atomic::Ordering::Relaxed);
     }
     let spent = time::uptime_ms().saturating_sub(started);
     if spent >= 2000 {
@@ -2663,7 +2736,7 @@ fn intel(argument: &str) {
 
 /// `history`: команды с номерами, как в bash.
 fn show_history() {
-    let history = HISTORY.lock();
+    let history = HISTORY[sched::session()].lock();
     for index in 0..history.len() {
         if let Some(line) = history.get(index) {
             sprintln!("{:>5}  {line}", index + 1);
@@ -2685,7 +2758,7 @@ fn show_prompt(editor: &mut LineEditor) {
         dir
     };
     let mark = if user == "root" { '#' } else { '$' };
-    let last = LAST_EXIT.load(core::sync::atomic::Ordering::Relaxed);
+    let last = LAST_EXIT[sched::session()].load(core::sync::atomic::Ordering::Relaxed);
     let status = if last == 0 { String::new() } else { alloc::format!("[{last}] ") };
     let red = if last == 0 { "" } else { "\x1b[91m" };
     sprint!(

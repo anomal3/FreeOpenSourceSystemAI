@@ -326,13 +326,12 @@ fn with_desktop<R>(action: impl FnOnce(&mut Compositor) -> R) -> Option<R> {
     // очереди до следующего кадра — а следующего могло и не быть.
     loop {
         let mut slot = DESKTOP.lock();
-        let text = core::mem::take(&mut *DEFERRED.lock());
-        if text.is_empty() {
+        let Some((session, text)) = take_deferred() else {
             *slot = Some(desktop);
             return Some(result);
-        }
+        };
         drop(slot);
-        term::feed(desktop.find(App::Terminal), &text);
+        feed_session(&mut desktop, session, &text);
         desktop.present();
     }
 }
@@ -353,7 +352,57 @@ fn with_desktop<R>(action: impl FnOnce(&mut Compositor) -> R) -> Option<R> {
 /// просьбу не вытеснять его, и на одном процессоре задача, которая стол
 /// вернёт, так и не получила бы времени. Поэтому текст кладётся сюда, а вливает
 /// его тот, кто стол возвращает.
-static DEFERRED: SpinLock<String> = SpinLock::new(String::new());
+static DEFERRED: [SpinLock<String>; crate::sched::MAX_SESSIONS] =
+    [const { SpinLock::new(String::new()) }; crate::sched::MAX_SESSIONS];
+
+/// Отложенный вывод какой-нибудь вкладки — забрать целиком.
+fn take_deferred() -> Option<(usize, String)> {
+    for (session, queue) in DEFERRED.iter().enumerate() {
+        let text = core::mem::take(&mut *queue.lock());
+        if !text.is_empty() {
+            return Some((session, text));
+        }
+    }
+    None
+}
+
+/// Вывод вкладки `session` — в её сетку (видимую или нет).
+fn feed_session(desktop: &mut Compositor, session: usize, text: &str) {
+    match desktop.find(App::Terminal) {
+        Some(window) => window.with_session(session, |window| term::feed(session, Some(window), text)),
+        None => term::feed(session, None, text),
+    }
+}
+
+/// Вкладка терминала на экране — ввод с клавиатуры уходит её оболочке.
+static ACTIVE_SESSION: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Что попросили сделать со вкладками терминала. Исполняет оболочка первой
+/// вкладки вне стола: новая вкладка — это новая задача, а заводить её под
+/// замком стола нельзя.
+#[derive(Clone, Copy, Debug)]
+pub enum TabRequest {
+    New,
+    Close(usize),
+}
+
+static TAB_REQUESTS: SpinLock<alloc::vec::Vec<TabRequest>> = SpinLock::new(alloc::vec::Vec::new());
+
+fn request_tab(request: TabRequest) {
+    TAB_REQUESTS.lock().push(request);
+    crate::sched::wake_input();
+}
+
+/// Забрать просьбы о вкладках (их исполняет оболочка).
+pub fn take_tab_requests() -> alloc::vec::Vec<TabRequest> {
+    core::mem::take(&mut *TAB_REQUESTS.lock())
+}
+
+/// Сессия видимой вкладки терминала.
+#[must_use]
+pub fn active_session() -> usize {
+    ACTIVE_SESSION.load(Ordering::Relaxed)
+}
 
 /// Сколько отложенного вывода держится, прежде чем лишнее отбрасывается.
 ///
@@ -400,12 +449,8 @@ fn report_focus(desktop: &mut Compositor) {
 
 /// Влить отложенный вывод в окно оболочки.
 fn flush_deferred(desktop: &mut Compositor) {
-    loop {
-        let text = core::mem::take(&mut *DEFERRED.lock());
-        if text.is_empty() {
-            return;
-        }
-        term::feed(desktop.find(App::Terminal), &text);
+    while let Some((session, text)) = take_deferred() {
+        feed_session(desktop, session, &text);
         desktop.present();
     }
 }
@@ -527,7 +572,19 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
         // панели задач, а там окно программы к этому времени уже существует —
         // кнопка на панели без окна не рисуется.
         App::Program(..) => None,
-        other => Window::text(other, rect, scale),
+        other => {
+            // Терминал открывается заново — с одной вкладкой; оболочки
+            // прежних вкладок закрываются (их сеток больше нет).
+            if other == App::Terminal {
+                ACTIVE_SESSION.store(0, Ordering::Relaxed);
+                for session in 1..crate::sched::MAX_SESSIONS {
+                    if crate::shell::session::alive(session) {
+                        request_tab(TabRequest::Close(session));
+                    }
+                }
+            }
+            Window::text(other, rect, scale)
+        }
     }
 }
 
@@ -648,8 +705,9 @@ static META_ARMED: AtomicBool = AtomicBool::new(false);
 /// курсор, очищать экран, менять цвет. Всё, что не последовательность,
 /// попадает в сетку символов как раньше.
 pub fn write(text: &str) {
+    let session = crate::sched::session();
     let shown = with_desktop(|desktop| {
-        term::feed(desktop.find(App::Terminal), text);
+        feed_session(desktop, session, text);
         desktop.present();
     });
     if shown.is_some() {
@@ -666,7 +724,7 @@ pub fn write(text: &str) {
         write(text);
         return;
     }
-    let mut queue = DEFERRED.lock();
+    let mut queue = DEFERRED[session].lock();
     if queue.len() + text.len() <= DEFERRED_MAX && queue.try_reserve(text.len()).is_ok() {
         queue.push_str(text);
         return;
@@ -675,7 +733,7 @@ pub fn write(text: &str) {
     drop(slot);
     // Разбор всё равно идёт: терминал обязан помнить, что ему сказали, иначе
     // последовательность, разрезанная потерей, испортила бы и следующий вывод.
-    term::feed(None, text);
+    term::feed(session, None, text);
     let before = DROPPED_OUTPUT.fetch_add(text.len() as u64, Ordering::Relaxed);
     if before == 0 {
         // Прямо в серийную линию: `kprintln!` при поднятой графике попробовал бы
@@ -688,12 +746,68 @@ pub fn write(text: &str) {
 
 /// Очистить окно оболочки.
 pub fn clear_shell() {
-    with_window(App::Terminal, Window::clear);
+    let session = crate::sched::session();
+    with_window(App::Terminal, |window| window.with_session(session, Window::clear));
 }
 
 /// Показывать ли курсор в окне оболочки.
 pub fn set_cursor(visible: bool) {
-    with_window(App::Terminal, |window| window.set_cursor(visible));
+    let session = crate::sched::session();
+    with_window(App::Terminal, |window| window.with_session(session, |window| window.set_cursor(visible)));
+}
+
+/// Открыть во окне терминала вкладку сессии `session` и показать её.
+pub fn add_tab(session: usize) -> bool {
+    with_desktop(|desktop| {
+        let Some(window) = desktop.find(App::Terminal) else {
+            return false;
+        };
+        let added = window.add_tab(session);
+        if added {
+            ACTIVE_SESSION.store(session, Ordering::Relaxed);
+            kprintln!("  terminal    : tab {} opened", session + 1);
+            desktop.present();
+        }
+        added
+    })
+    .unwrap_or(false)
+}
+
+/// Убрать вкладку сессии `session` (её оболочка закончилась).
+pub fn remove_tab(session: usize) {
+    with_desktop(|desktop| {
+        if let Some(window) = desktop.find(App::Terminal) {
+            if window.remove_tab(session) {
+                ACTIVE_SESSION.store(window.active_session(), Ordering::Relaxed);
+                kprintln!("  terminal    : tab {} closed", session + 1);
+            }
+        }
+        desktop.present();
+    });
+}
+
+/// Показать вкладку сессии `session`.
+fn switch_tab(desktop: &mut Compositor, session: usize) {
+    if let Some(window) = desktop.find(App::Terminal) {
+        if window.switch_tab(session) {
+            ACTIVE_SESSION.store(session, Ordering::Relaxed);
+            kprintln!("  terminal    : tab {} active", session + 1);
+        }
+    }
+    desktop.present();
+}
+
+/// Соседняя вкладка (`forward` — правее, по кругу).
+fn cycle_tab(desktop: &mut Compositor, forward: bool) {
+    let next = desktop.find(App::Terminal).and_then(|window| {
+        let order = window.tab_sessions();
+        let at = order.iter().position(|item| *item == window.active_session())?;
+        let count = order.len();
+        (count > 1).then(|| order[if forward { (at + 1) % count } else { (at + count - 1) % count }])
+    });
+    if let Some(next) = next {
+        switch_tab(desktop, next);
+    }
 }
 
 /// Сделать что-нибудь с окном программы и вывести изменения на экран.
@@ -2143,6 +2257,10 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                     kprintln!("  desktop     : resizing '{}'", name_of(desktop, app));
                 }
             }
+            // Полоса вкладок терминала.
+            Hit::Tab(session) => switch_tab(desktop, session),
+            Hit::TabClose(session) => request_tab(TabRequest::Close(session)),
+            Hit::TabNew => request_tab(TabRequest::New),
             Hit::Title => {
                 desktop.set_drag(app);
                 if let Some(app) = app {
@@ -2259,6 +2377,22 @@ fn terminal_key(desktop: &mut Compositor, event: KeyEvent) -> bool {
     let Some(window) = desktop.find(App::Terminal) else {
         return false;
     };
+    // Вкладки, как в Windows Terminal: Ctrl+Shift+T — новая, Ctrl+Shift+W —
+    // закрыть, Ctrl+Tab и Ctrl+Shift+Tab — соседняя.
+    if ctrl && shift && event.code == KeyCode::T {
+        request_tab(TabRequest::New);
+        return true;
+    }
+    if ctrl && shift && event.code == KeyCode::W {
+        if window.tab_sessions().len() > 1 {
+            request_tab(TabRequest::Close(window.active_session()));
+        }
+        return true;
+    }
+    if ctrl && event.code == KeyCode::Tab {
+        cycle_tab(desktop, !shift);
+        return true;
+    }
     let page = window.size_in_cells().1.saturating_sub(1).max(1) as i32;
     let scroll = match event.code {
         KeyCode::PageUp if shift => Some(page),
@@ -3391,7 +3525,18 @@ pub fn minimize_window(task: u32, slot: u32) -> Result<(), WindowError> {
 /// Подпись окна терминала: `Some` — что в нём сейчас выполняется (терминал
 /// T4), `None` — обычная. Видна в заголовке и на кнопке панели задач.
 pub fn shell_status(status: Option<&str>) {
+    let session = crate::sched::session();
     with_desktop(|desktop| {
+        if let Some(window) = desktop.find(App::Terminal) {
+            if window.has_tabs() {
+                let title = status.map_or_else(|| alloc::format!("Терминал {}", session + 1), String::from);
+                window.set_tab_title(session, &title);
+            }
+        }
+        if session != active_session() {
+            desktop.present();
+            return;
+        }
         let focused = desktop.focused_app() == Some(App::Terminal);
         let caption = match status {
             Some(status) => alloc::format!("{} — {status}", App::Terminal.caption()),

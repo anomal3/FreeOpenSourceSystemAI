@@ -109,7 +109,7 @@ pub use task::{
 };
 
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use alloc::boxed::Box;
 
@@ -522,6 +522,9 @@ pub fn spawn_raw(
     };
 
     let id = TaskId::new(sched.next_id);
+    // Сессия терминала — от того, кто порождает.
+    let parent = sched.current();
+    SESSION[slot].store(SESSION[parent].load(Ordering::Relaxed), Ordering::Relaxed);
     // Контекст ведёт в общий батут, а настоящая точка входа ждёт в самой задаче:
     // первое, что обязан сделать новый стек, — снять метку с того, кто уступил
     // ему процессор (см. [`task_start`]).
@@ -533,6 +536,27 @@ pub fn spawn_raw(
     sched.next_id += 1;
     sched.tasks[slot] = Some(boxed);
     Ok(id)
+}
+
+/// Сколько сессий терминала (вкладок) бывает одновременно.
+pub const MAX_SESSIONS: usize = 8;
+
+/// Вкладка терминала, которой принадлежит задача: её ввод, её вывод, её
+/// программа переднего плана. Наследуется при порождении — программа,
+/// запущенная во вкладке, и её дети печатают туда же. Ноль — первая вкладка
+/// (и всё, что запущено не из терминала: службы, стол).
+static SESSION: [AtomicU8; MAX_TASKS] = [const { AtomicU8::new(0) }; MAX_TASKS];
+
+/// Сессия терминала текущей задачи.
+#[must_use]
+pub fn session() -> usize {
+    usize::from(SESSION[current_slot()].load(Ordering::Relaxed)).min(MAX_SESSIONS - 1)
+}
+
+/// Отнести текущую задачу к сессии `session` (задача оболочки вкладки — при
+/// старте).
+pub fn set_session(session: usize) {
+    SESSION[current_slot()].store(session.min(MAX_SESSIONS - 1) as u8, Ordering::Relaxed);
 }
 
 /// Задать базу хранилища потока для исполняющейся задачи.

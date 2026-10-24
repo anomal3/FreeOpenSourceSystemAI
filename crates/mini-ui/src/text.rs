@@ -408,6 +408,10 @@ pub struct TextGrid {
     /// Выделение мышью: откуда начали и докуда дотянули — сквозная строка и
     /// столбец.
     selection: Option<((u64, u32), (u64, u32))>,
+    /// Сетка не на экране — вкладка терминала, которую сейчас не видно:
+    /// вывод в неё копится в теневом буфере и прокрутке, а в поверхность не
+    /// рисуется ничего. Показывает её [`TextGrid::show`].
+    hidden: bool,
 }
 
 /// Строка прокрутки: знаки и цвета без пробелов в конце.
@@ -466,7 +470,26 @@ impl TextGrid {
             scrolled: 0,
             view: 0,
             selection: None,
+            hidden: false,
         })
+    }
+
+    /// Убрать сетку с экрана: дальше она только копит вывод.
+    pub fn hide(&mut self) {
+        self.hidden = true;
+        self.cursor_drawn = false;
+    }
+
+    /// Показать сетку снова — нарисовать всё, что накопилось.
+    pub fn show(&mut self, surface: &mut Surface) {
+        self.hidden = false;
+        self.repaint(surface);
+    }
+
+    /// Не на экране ли сетка.
+    #[must_use]
+    pub const fn is_hidden(&self) -> bool {
+        self.hidden
     }
 
     #[must_use]
@@ -505,6 +528,9 @@ impl TextGrid {
     /// Нарисовать всё видимое заново: живой экран или поднятый вид, с
     /// выделением, и курсор, если смотрим на живой экран.
     fn repaint(&mut self, surface: &mut Surface) {
+        if self.hidden {
+            return;
+        }
         let area = self.area();
         surface.fill(area, self.bg);
         self.cursor_drawn = false;
@@ -786,7 +812,9 @@ impl TextGrid {
         // Курсор нарисован на прежней поверхности, которой больше нет.
         self.cursor_drawn = false;
 
-        surface.fill(self.area(), self.bg);
+        if !self.hidden {
+            surface.fill(self.area(), self.bg);
+        }
         for row in 0..rows {
             for col in 0..cols {
                 let ch = self.cells[(row * cols + col) as usize];
@@ -795,7 +823,9 @@ impl TextGrid {
                 }
             }
         }
-        self.damage = self.area();
+        if !self.hidden {
+            self.damage = self.area();
+        }
         true
     }
 
@@ -808,6 +838,9 @@ impl TextGrid {
         self.cursor_drawn = false;
         self.view = 0;
         self.selection = None;
+        if self.hidden {
+            return;
+        }
         let area = self.area();
         surface.fill(area, self.bg);
         self.mark(area);
@@ -967,6 +1000,7 @@ impl TextGrid {
         if !self.cursor_enabled
             || self.cursor_drawn
             || self.view > 0
+            || self.hidden
             || self.col >= self.cols
             || self.row >= self.rows
         {
@@ -1004,7 +1038,7 @@ impl TextGrid {
     /// виден, и рисовать его некуда: он перерисуется целиком, когда вид
     /// опустят.
     fn draw_cell(&mut self, surface: &mut Surface, col: u32, row: u32, ch: char) {
-        if self.view > 0 {
+        if self.view > 0 || self.hidden {
             return;
         }
         let attr = self.attrs[(row * self.cols + col) as usize];
@@ -1060,7 +1094,9 @@ impl TextGrid {
         // ним значило бы, что теневой буфер описывает не то, что на экране.
         self.attrs[last..].fill(Attr::DEFAULT);
 
-        if self.view > 0 {
+        if self.hidden {
+            // Не на экране — сдвигать нечего.
+        } else if self.view > 0 {
             // Вид поднят: те же строки остаются на месте — он поднимается
             // вместе с ними, как в Windows Terminal, и вывод не уносит из-под
             // глаз то, что читают.
