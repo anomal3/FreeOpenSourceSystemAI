@@ -119,6 +119,171 @@ pub fn framebuffer() -> boot_info::Framebuffer {
 /// пунктов меню.
 static GROUP: SpinLock<alloc::vec::Vec<App>> = SpinLock::new(alloc::vec::Vec::new());
 
+/// Кнопка панели задач под указателем и с какого мига он на ней стоит.
+///
+/// Список окон над кнопкой открывается наведением, как в Windows (24.10:
+/// «Файлы приходится нажимать, а в Windows при наведении работает»), но не
+/// сразу: указатель, проезжающий по панели, открывал бы по списку на кнопку.
+static HOVER_BUTTON: SpinLock<Option<(App, u64)>> = SpinLock::new(None);
+
+/// Список окон открыт наведением — тогда здесь кнопка, над которой он стоит:
+/// указатель ушёл и с неё, и со списка — список закрывается сам.
+static HOVER_LIST: SpinLock<Option<Rect>> = SpinLock::new(None);
+
+/// Сколько держать указатель на кнопке до списка — как у Windows.
+const HOVER_OPEN_MS: u64 = 400;
+
+/// Ждёт ли стол, не откроется ли список окон по наведению: оболочке тогда
+/// надо будить его чаще (см. [`hover_tick`]).
+#[must_use]
+pub fn hover_pending() -> bool {
+    HOVER_BUTTON.lock().is_some()
+}
+
+/// Открыть список окон над кнопкой, если указатель простоял на ней
+/// [`HOVER_OPEN_MS`]: движений мыши в это время нет, и проверить больше
+/// некому.
+pub fn hover_tick() {
+    let status = status_now();
+    with_desktop(|desktop| {
+        let (x, y) = desktop.pointer_position();
+        hover_button(desktop, x, y, &status);
+        desktop.present();
+    });
+}
+
+/// Указатель над панелью задач без открытых меню: отсчитать наведение на
+/// кнопку и, когда пора, открыть над ней список окон.
+fn hover_button(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
+    let over = match desktop.panel_at(x, y) {
+        Some(PanelHit::Window(app)) if !desktop.context_open() && !desktop.menu_open() && desktop.dragging().is_none() => {
+            Some(app)
+        }
+        _ => None,
+    };
+    let now = crate::time::uptime_ms();
+    let due = {
+        let mut hover = HOVER_BUTTON.lock();
+        match (over, *hover) {
+            (None, _) => {
+                *hover = None;
+                None
+            }
+            (Some(app), Some((was, since))) if app == was => {
+                (now.saturating_sub(since) >= HOVER_OPEN_MS).then_some(app)
+            }
+            (Some(app), _) => {
+                *hover = Some((app, now));
+                None
+            }
+        }
+    };
+    if let Some(app) = due {
+        *HOVER_BUTTON.lock() = None;
+        open_group_list(desktop, app, status, true, false);
+    }
+}
+
+/// Список окон программы над её кнопкой на панели задач: строка на окно, у
+/// строки под указателем — крестик «закрыть». `hovered` — открыт наведением
+/// и закроется, когда указатель уйдёт; `with_close` — снизу «Закрыть окно»
+/// («Закрыть все окна»): меню правой кнопки.
+fn open_group_list(desktop: &mut Compositor, app: App, status: &Status, hovered: bool, with_close: bool) {
+    let mut members = if panel::labels() { alloc::vec::Vec::new() } else { desktop.group_members(app) };
+    if members.is_empty() {
+        members.push(app);
+    }
+    members.truncate(12);
+    open_list_of(desktop, app, members, status, hovered, with_close);
+}
+
+/// То же для готового списка окон `members` над кнопкой окна `anchor`.
+fn open_list_of(
+    desktop: &mut Compositor,
+    anchor: App,
+    members: alloc::vec::Vec<App>,
+    status: &Status,
+    hovered: bool,
+    with_close: bool,
+) {
+    let labels = members.iter().map(|member| (name_of(desktop, *member), String::new())).collect::<alloc::vec::Vec<_>>();
+    let mut items: alloc::vec::Vec<context::Action> =
+        (0..members.len()).map(|index| context::Action::Window(index as u8)).collect();
+    if with_close {
+        items.push(if members.len() > 1 { context::Action::CloseAll } else { context::Action::CloseOne });
+    }
+    let (x, y) = desktop.pointer_position();
+    let button = desktop.button_of(anchor).unwrap_or(Rect::new(x, y, 1, 1));
+    *GROUP.lock() = members;
+    desktop.context_handlers(labels);
+    desktop.open_context(button.x, button.y, &items);
+    // Подсветка — у строки под указателем, а не у первой: список открылся
+    // под рукой, и указатель стоит на кнопке, а не в нём.
+    desktop.context_select_none();
+    *HOVER_LIST.lock() = hovered.then_some(button);
+    if let Some(rect) = desktop.context_rect() {
+        kprintln!(
+            "  desktop     : context menu at {},{} {}x{} for group{}",
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            if hovered { " (hover)" } else { "" }
+        );
+    }
+    desktop.refresh_panel(status);
+}
+
+/// Закрыть окно так же, как его крестик: окно программы закрывает она сама.
+fn close_from_panel(desktop: &mut Compositor, app: App) {
+    // Имя — до закрытия: у окна программы оно живёт в самом окне.
+    let name = name_of(desktop, app);
+    if request_close(desktop, app) {
+        kprintln!("  desktop     : close requested of '{name}'");
+    } else if desktop.close(app) {
+        kprintln!("  desktop     : closed '{name}'");
+    }
+    log_focus(desktop);
+}
+
+/// Указатель над открытым меню стола: подсветить пункт под ним, у списка
+/// окон — показать окно строки поверх всех; список, открытый наведением,
+/// закрыть, когда указатель ушёл и с него, и с кнопки.
+fn hover_context(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
+    if desktop.context_editing() {
+        return;
+    }
+    let hover_list = *HOVER_LIST.lock();
+    if let (Some(button), Some(list)) = (hover_list, desktop.context_rect()) {
+        let keep = list.union(&button);
+        let margin = 8;
+        let inside = x >= keep.x - margin && x < keep.right() + margin && y >= keep.y - margin && y < keep.bottom() + margin;
+        if !inside {
+            *HOVER_LIST.lock() = None;
+            desktop.close_context();
+            kprintln!("  desktop     : context menu closed");
+            desktop.refresh_panel(status);
+            return;
+        }
+    }
+    match desktop.context_action_at(x, y) {
+        Some(action) => {
+            desktop.context_select(action);
+            let peek = match action {
+                context::Action::Window(number) | context::Action::CloseWindow(number) => {
+                    GROUP.lock().get(usize::from(number)).copied()
+                }
+                _ => None,
+            };
+            desktop.set_peek(peek);
+        }
+        None => {
+            desktop.context_select_none();
+            desktop.set_peek(None);
+        }
+    }
+}
+
 /// Буфер обмена стола (терминал T5): Ctrl+Shift+C в терминале кладёт сюда
 /// выделенное, Ctrl+Shift+V и правая кнопка — набирают его.
 static CLIPBOARD: SpinLock<String> = SpinLock::new(String::new());
@@ -1480,7 +1645,7 @@ pub fn dispatch_pointer(event: PointerEvent) {
 /// кончается, и окну под указателем говорится, что оно теперь его, — а
 /// захватившему, если указатель ушёл, что ушёл: пока держали кнопку, ни того,
 /// ни другого оно не слышало.
-fn release_pointer(desktop: &mut Compositor, x: i32, y: i32, button: u32) {
+fn release_pointer(desktop: &mut Compositor, x: i32, y: i32, button: u32, status: &Status) {
     let Some(app) = desktop.release_capture(button) else {
         return;
     };
@@ -1492,7 +1657,7 @@ fn release_pointer(desktop: &mut Compositor, x: i32, y: i32, button: u32) {
     if desktop.captured().is_none() {
         // Прежнее окно под указателем — то, что захватило: над ним нажимали.
         desktop.set_hovered(Some(app));
-        hover(desktop, x, y, Buttons::NONE);
+        hover(desktop, x, y, Buttons::NONE, status);
     }
 }
 
@@ -1502,7 +1667,7 @@ fn release_pointer(desktop: &mut Compositor, x: i32, y: i32, button: u32) {
 /// всплывает и в Windows. Пока тащат окно или открыто меню стола, указатель
 /// принадлежит им, и программе не достаётся ничего — иначе подсказка всплывала
 /// бы под открытым меню запуска.
-fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons) {
+fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &Status) {
     let mut mask = 0;
     if buttons.contains(Buttons::LEFT) {
         mask |= 1;
@@ -1521,6 +1686,11 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons) {
             }
         }
         return;
+    }
+    if desktop.context_open() {
+        hover_context(desktop, x, y, status);
+    } else {
+        hover_button(desktop, x, y, status);
     }
     let busy = desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open();
     let under = if busy { None } else { desktop.program_under(x, y) };
@@ -1597,7 +1767,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         desktop.keyboard_stroke_to(x, y);
     }
     if dx != 0 || dy != 0 {
-        hover(desktop, x, y, event.buttons);
+        hover(desktop, x, y, event.buttons, status);
         if event.buttons.contains(Buttons::LEFT) && SELECTING.load(Ordering::Relaxed) {
             if let Some(window) = desktop.find(App::Terminal) {
                 window.term_select_to(x, y);
@@ -1627,8 +1797,14 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         } else if let Some(hit) = desktop.panel_at(x, y) {
             match hit {
                 PanelHit::Tray(_) | PanelHit::Empty => Some((&context::Action::ON_TRAY[..], "tray")),
+                // Меню кнопки окна, как в Windows: окна программы и
+                // «Закрыть окно» («Закрыть все окна»).
+                PanelHit::Window(app) => {
+                    *HOVER_BUTTON.lock() = None;
+                    open_group_list(desktop, app, status, false, true);
+                    None
+                }
                 PanelHit::Menu
-                | PanelHit::Window(_)
                 | PanelHit::Missing(_)
                 | PanelHit::Stack
                 | PanelHit::Search => None,
@@ -1731,10 +1907,10 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         }
     }
     if event.released(Buttons::RIGHT) {
-        release_pointer(desktop, x, y, 2);
+        release_pointer(desktop, x, y, 2, status);
     }
     if event.released(Buttons::LEFT) {
-        release_pointer(desktop, x, y, 1);
+        release_pointer(desktop, x, y, 1, status);
         if SELECTING.swap(false, Ordering::Relaxed) {
             if let Some(text) = desktop.find(App::Terminal).and_then(Window::term_select_end) {
                 kprintln!("  terminal    : selected {} chars", text.chars().count());
@@ -2055,6 +2231,13 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                 context_action(desktop, action, status);
                 return;
             }
+            // Список, открытый наведением, щелчка мимо себя не съедает:
+            // человек его не открывал, и щелчок по кнопке под ним обязан
+            // сделать то, что сделал бы без списка.
+            None if HOVER_LIST.lock().take().is_some() => {
+                desktop.close_context();
+                kprintln!("  desktop     : context menu closed");
+            }
             None => {
                 desktop.close_context();
                 kprintln!("  desktop     : context menu closed");
@@ -2112,26 +2295,13 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                 // Кнопка, за которой несколько окон одной программы (панель
                 // без подписей): щелчок перебирает их по очереди, начиная с
                 // того, что за активным, — как Ctrl+щелчок в Windows 11.
+                *HOVER_BUTTON.lock() = None;
                 let members = if panel::labels() { alloc::vec::Vec::new() } else { desktop.group_members(app) };
                 if members.len() > 1 {
                     // Над кнопкой — список окон этой программы, щелчок
                     // выбирает нужное (как в Windows 11; 24.10: перебор по
                     // очереди не давал выбрать конкретное окно).
-                    let members: alloc::vec::Vec<App> = members.into_iter().take(12).collect();
-                    let labels = members
-                        .iter()
-                        .map(|member| (name_of(desktop, *member), String::new()))
-                        .collect::<alloc::vec::Vec<_>>();
-                    let items: alloc::vec::Vec<context::Action> =
-                        (0..members.len()).map(|index| context::Action::Window(index as u8)).collect();
-                    *GROUP.lock() = members;
-                    let button = desktop.button_of(app).unwrap_or(Rect::new(x, y, 1, 1));
-                    desktop.context_handlers(labels);
-                    desktop.open_context(button.x, button.y, &items);
-                    if let Some(rect) = desktop.context_rect() {
-                        kprintln!("  desktop     : context menu at {},{} {}x{} for group", rect.x, rect.y, rect.w, rect.h);
-                    }
-                    desktop.refresh_panel(status);
+                    open_group_list(desktop, app, status, false, false);
                     return;
                 }
                 // Щелчок по кнопке активного окна сворачивает его — так ведёт
@@ -3065,10 +3235,36 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             desktop.refresh_panel(status);
         }
         context::Action::Window(number) => {
+            *HOVER_LIST.lock() = None;
             desktop.close_context();
             let chosen = GROUP.lock().get(usize::from(number)).copied();
             if let Some(app) = chosen {
                 launch(desktop, app);
+            }
+            desktop.refresh_panel(status);
+        }
+        // Крестик в строке списка: окно закрывается, список остаётся с
+        // оставшимися — как в Windows 11.
+        context::Action::CloseWindow(number) => {
+            let hovered = HOVER_LIST.lock().take().is_some();
+            desktop.close_context();
+            let mut members = GROUP.lock().clone();
+            if usize::from(number) < members.len() {
+                let app = members.remove(usize::from(number));
+                close_from_panel(desktop, app);
+            }
+            members.retain(|member| desktop.index_of(*member).is_some());
+            if let Some(anchor) = members.first().copied() {
+                open_list_of(desktop, anchor, members, status, hovered, false);
+            }
+            desktop.refresh_panel(status);
+        }
+        context::Action::CloseOne | context::Action::CloseAll => {
+            *HOVER_LIST.lock() = None;
+            desktop.close_context();
+            let members = GROUP.lock().clone();
+            for app in members {
+                close_from_panel(desktop, app);
             }
             desktop.refresh_panel(status);
         }

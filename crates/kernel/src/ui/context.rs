@@ -119,6 +119,14 @@ pub enum Action {
     /// Окно номер `n` группы на панели задач: список окон одной программы
     /// над её кнопкой (как в Windows 11), подписи — в [`ContextMenu::handlers`].
     Window(u8),
+    /// Крестик в строке окна `n` того же списка — закрыть это окно, как в
+    /// списке окон Windows 11. Отдельной строкой не рисуется: это правый край
+    /// строки [`Action::Window`].
+    CloseWindow(u8),
+    /// «Закрыть окно» в меню кнопки панели задач (правая кнопка).
+    CloseOne,
+    /// «Закрыть все окна» — то же для кнопки, за которой их несколько.
+    CloseAll,
 }
 
 impl Action {
@@ -221,6 +229,9 @@ impl Action {
             Action::DeleteShortcut => "Удалить ярлык",
             Action::OpenInTerminal => "Открыть в терминале",
             Action::Window(_) => "Окно",
+            Action::CloseWindow(_) => "Закрыть",
+            Action::CloseOne => "Закрыть окно",
+            Action::CloseAll => "Закрыть все окна",
         }
     }
 
@@ -231,8 +242,13 @@ impl Action {
     /// них по-своему.
     const fn group(self) -> u8 {
         match self {
-            Action::Open | Action::OpenWith(_) | Action::OpenLocation | Action::OpenInTerminal | Action::Window(_) => 0,
-            Action::Rename | Action::Delete | Action::DeleteShortcut => 5,
+            Action::Open
+            | Action::OpenWith(_)
+            | Action::OpenLocation
+            | Action::OpenInTerminal
+            | Action::Window(_)
+            | Action::CloseWindow(_) => 0,
+            Action::Rename | Action::Delete | Action::DeleteShortcut | Action::CloseOne | Action::CloseAll => 5,
             Action::NewFolder | Action::NewTextFile => 1,
             Action::Theme | Action::DisplaySettings | Action::Refresh => 2,
             Action::SwitchLayout => 3,
@@ -255,7 +271,9 @@ impl Action {
             Action::OpenInTerminal => Some(Icon::Terminal),
             Action::Window(_) => Some(Icon::Display),
             Action::Rename => None,
-            Action::Delete | Action::DeleteShortcut => Some(Icon::Close),
+            Action::Delete | Action::DeleteShortcut | Action::CloseWindow(_) | Action::CloseOne | Action::CloseAll => {
+                Some(Icon::Close)
+            }
             Action::NewFolder => Some(Icon::Folder),
             Action::NewTextFile => Some(Icon::File),
             Action::Theme => Some(if theme::is_dark() { Icon::Sun } else { Icon::Moon }),
@@ -322,6 +340,8 @@ pub struct ContextMenu {
     handlers: Vec<(String, String)>,
     /// Ширина экрана при открытии: расширенная карточка не уезжает за край.
     screen_w: u32,
+    /// Указатель стоит на крестике выбранной строки окна.
+    cross: bool,
 }
 
 impl ContextMenu {
@@ -367,6 +387,7 @@ impl ContextMenu {
             note: None,
             handlers: Vec::new(),
             screen_w: u32::MAX / 2,
+            cross: false,
         })
     }
 
@@ -401,7 +422,8 @@ impl ContextMenu {
     fn width_for(&self, ctx: Ctx) -> u32 {
         let face = ctx.face(Role::Body);
         let widest = self.items.iter().map(|action| face.width(&self.label(*action))).max().unwrap_or(0);
-        let width = widest + ctx.px(ICON + ICON_GAP) + ctx.px((CARD_PAD + ROW_PAD) * 2) + ctx.px(12);
+        let cross = if self.items.iter().any(|action| matches!(action, Action::Window(_))) { ctx.px(CROSS) } else { 0 };
+        let width = widest + ctx.px(ICON + ICON_GAP) + ctx.px((CARD_PAD + ROW_PAD) * 2) + ctx.px(12) + cross;
         width.clamp(ctx.px(180), self.surface.width())
     }
 
@@ -442,6 +464,7 @@ impl ContextMenu {
         self.rect.x = x.clamp(0, max_x);
         self.rect.y = y.clamp(0, max_y);
         self.selected = 0;
+        self.cross = false;
         self.mode = Mode::Menu;
         self.note = None;
         self.open = true;
@@ -460,12 +483,13 @@ impl ContextMenu {
             return None;
         }
         let local = (x - self.rect.x, y - self.rect.y);
-        let layout = plan(self.ctx(), self.card(), &self.items);
-        layout
-            .rows
-            .iter()
-            .find(|slot| slot.rect.contains(local.0, local.1))
-            .map(|slot| slot.action)
+        let ctx = self.ctx();
+        let layout = plan(ctx, self.card(), &self.items);
+        let slot = layout.rows.iter().find(|slot| slot.rect.contains(local.0, local.1))?;
+        Some(match slot.action {
+            Action::Window(number) if cross_rect(ctx, slot.rect).contains(local.0, local.1) => Action::CloseWindow(number),
+            action => action,
+        })
     }
 
     /// Карточка — вся поверхность целиком.
@@ -593,15 +617,17 @@ impl ContextMenu {
 
     fn menu_key(&mut self, code: KeyCode) -> Reply {
         match code {
+            // Подсветки может не быть вовсе — указатель ушёл с карточки
+            // ([`Self::select_none`]); тогда стрелки начинают с края.
             KeyCode::Up => {
                 let count = self.items.len().max(1);
-                self.selected = (self.selected + count - 1) % count;
+                self.selected = if self.selected >= count { count - 1 } else { (self.selected + count - 1) % count };
                 self.redraw();
                 Reply::Handled
             }
             KeyCode::Down => {
                 let count = self.items.len().max(1);
-                self.selected = (self.selected + 1) % count;
+                self.selected = if self.selected >= count { 0 } else { (self.selected + 1) % count };
                 self.redraw();
                 Reply::Handled
             }
@@ -616,11 +642,25 @@ impl ContextMenu {
 
     /// Поставить выделение на пункт под указателем.
     pub fn select_action(&mut self, action: Action) {
-        if let Some(index) = self.items.iter().position(|item| *item == action) {
-            if index != self.selected {
+        let (row, cross) = match action {
+            Action::CloseWindow(number) => (Action::Window(number), true),
+            other => (other, false),
+        };
+        if let Some(index) = self.items.iter().position(|item| *item == row) {
+            if index != self.selected || cross != self.cross {
                 self.selected = index;
+                self.cross = cross;
                 self.redraw();
             }
+        }
+    }
+
+    /// Убрать подсветку: указатель ушёл с карточки.
+    pub fn select_none(&mut self) {
+        if self.selected != usize::MAX {
+            self.selected = usize::MAX;
+            self.cross = false;
+            self.redraw();
         }
     }
 
@@ -699,6 +739,9 @@ impl ContextMenu {
                         other => String::from(other.title()),
                     };
                     draw_row(inner, s, slot, &label, index == selected);
+                    if matches!(slot.action, Action::Window(_)) {
+                        draw_cross(inner, s, slot.rect, index == selected, index == selected && self.cross);
+                    }
                 }
             }
             Mode::Rename { text, .. } => {
@@ -844,6 +887,43 @@ fn confirm_height(ctx: Ctx) -> u32 {
     ctx.px(CARD_PAD + 4) + chip + ctx.px(10) + body + ctx.px(10) + hint + ctx.px(CARD_PAD + 4)
 }
 
+/// Ширина места под крестик в строке окна.
+const CROSS: u32 = 28;
+
+/// Где в строке окна крестик «закрыть».
+fn cross_rect(ctx: Ctx, row: Rect) -> Rect {
+    let side = ctx.px(CROSS);
+    Rect::new(row.right() - side as i32, row.y, side, row.h)
+}
+
+/// Крестик «закрыть» в строке окна: виден у строки под указателем, на самом
+/// крестике — красной плашкой, как у кнопки закрытия окна.
+fn draw_cross(ctx: Ctx, s: &mut Surface, row: Rect, shown: bool, hot: bool) {
+    if !shown {
+        return;
+    }
+    let p = ctx.palette;
+    let zone = cross_rect(ctx, row);
+    let pad = ctx.px(3);
+    let chip = Rect::new(zone.x + pad as i32, zone.y + pad as i32, zone.w - pad * 2, zone.h - pad * 2);
+    let ink = if hot {
+        draw::rounded(s, chip, ctx.px(theme::R_CHIP), ctx.flat(p.badbg), 255);
+        p.bad_ink
+    } else {
+        paint::row_ink(ctx, RowState::Selected)
+    };
+    let icon = ctx.px(12);
+    glyphicon::draw(
+        s,
+        Icon::Close,
+        chip.x + (chip.w as i32 - icon as i32) / 2,
+        chip.y + (chip.h as i32 - icon as i32) / 2,
+        icon,
+        ink,
+        255,
+    );
+}
+
 /// Нарисовать строку меню.
 fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool) {
     let p = ctx.palette;
@@ -883,13 +963,14 @@ fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool)
     // Отступ подписи один и тот же со значком и без него: строка без картинки,
     // подтянутая к краю, ломает колонку подписей.
     let x = slot.rect.x + (pad + icon + ctx.px(ICON_GAP)) as i32;
+    let right = if matches!(slot.action, Action::Window(_)) { cross_rect(ctx, slot.rect).x } else { slot.rect.right() - pad as i32 };
     paint::text_clipped(
         ctx,
         s,
         Role::Body,
         x,
         paint::baseline(ctx, Role::Body, slot.rect),
-        (slot.rect.right() - pad as i32 - x).max(0) as u32,
+        (right - x).max(0) as u32,
         label,
         ink,
     );

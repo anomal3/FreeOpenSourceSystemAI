@@ -361,7 +361,13 @@ pub struct Window {
     /// По чему окна складываются в одну кнопку панели задач: путь программы.
     /// Пусто — окно ядра, группа по [`App`].
     pub group: String,
+    /// Номер в порядке создания: по нему стоят кнопки панели задач. Список
+    /// окон стола упорядочен по глубине и меняется при каждом поднятии.
+    pub born: u64,
 }
+
+/// Счётчик для [`Window::born`].
+static BORN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Наименьший размер окна в пикселях.
 ///
@@ -510,6 +516,7 @@ impl Window {
             tabs: Vec::new(),
             session: 0,
             tab_titles: Vec::new(),
+            born: BORN.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
         }
     }
 

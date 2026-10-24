@@ -420,6 +420,11 @@ fn run(primary: bool) {
             status_at = now;
             update_status();
         }
+        // Указатель стоит на кнопке панели задач: список окон над ней
+        // открывается по времени, а не по событию (см. `ui::hover_tick`).
+        if primary && ui::is_active() && ui::hover_pending() {
+            ui::hover_tick();
+        }
         if primary {
             for request in ui::take_tab_requests() {
                 match request {
@@ -2334,6 +2339,9 @@ fn foreground(id: sched::TaskId, label: &str) {
         // Пока идёт анимация, стол собирает кадр на каждом витке: полёт окна
         // живёт по часам, а не по событиям, и без этого кадров между двумя
         // касаниями не было бы вовсе.
+        if primary && ui::is_active() && ui::hover_pending() {
+            ui::hover_tick();
+        }
         if ui::animating() || now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
             status_at = now;
             if primary {

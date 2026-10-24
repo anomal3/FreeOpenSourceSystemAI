@@ -176,33 +176,64 @@ pub fn adopt_monotonic() {
 /// пределах ±5 % от медианы (один выброс не решает) и медиана расходится с
 /// принятой больше чем на 10 %. Точка отсчёта при этом переставляется на
 /// «сейчас», чтобы время не прыгнуло.
+///
+/// Замеры разошлись — не повод оставить загрузочную частоту: она мерилась
+/// пятьдесят миллисекунд в самые догонялки и ошибается не на проценты, а в
+/// разы (24.10: 549 МГц при замерах 2782..4969). Тогда замеры продолжаются, и
+/// берётся среднее по всему отрезку: рывок виртуального времени — это
+/// отставание на доли секунды, и на минуте оно даёт проценты. Отрезок
+/// кончается, когда среднее за последние двенадцать секунд сдвинулось меньше
+/// чем на 2 %, но не позже минуты.
 #[cfg(target_arch = "x86_64")]
 pub fn refine_task() {
+    /// Наибольшее число четырёхсекундных замеров — минута.
+    const MOST: usize = 15;
+
+    if arch::monotonic::reported() {
+        return;
+    }
     crate::sched::sleep_ms(2_000);
     let current = MONOTONIC_HZ.load(Ordering::Acquire);
     if current == 0 {
         return;
     }
-    let mut samples = [0u64; 5];
-    for sample in &mut samples {
+    let mut samples = [0u64; MOST];
+    for sample in &mut samples[..5] {
         match arch::monotonic::refine_sample(4_000, 50, crate::sched::sleep_ms) {
             Some(hz) => *sample = hz,
             None => return,
         }
     }
-    samples.sort_unstable();
-    let median = samples[2];
-    let close = samples.iter().filter(|hz| hz.abs_diff(median) * 20 <= median).count();
-    let off = median.abs_diff(current) * 10 > current;
+    let mut first = [0u64; 5];
+    first.copy_from_slice(&samples[..5]);
+    first.sort_unstable();
+    let mut median = first[2];
+    let close = first.iter().filter(|hz| hz.abs_diff(median) * 20 <= median).count();
     if close < 4 {
         kprintln!(
-            "  monotonic   : refinement disagrees with itself ({} .. {} MHz); keeping {} MHz",
-            samples[0] / 1_000_000,
-            samples[4] / 1_000_000,
-            current / 1_000_000
+            "  monotonic   : refinement disagrees with itself ({} .. {} MHz); averaging over a longer span",
+            first[0] / 1_000_000,
+            first[4] / 1_000_000
         );
-        return;
+        // Замеры равной длины по таймеру ACPI: среднее их частот и есть
+        // частота на всём отрезке.
+        let mean = |samples: &[u64]| samples.iter().sum::<u64>() / samples.len() as u64;
+        let mut count = 5;
+        while count < MOST {
+            match arch::monotonic::refine_sample(4_000, 50, crate::sched::sleep_ms) {
+                Some(hz) => samples[count] = hz,
+                None => break,
+            }
+            count += 1;
+            let (now, before) = (mean(&samples[..count]), mean(&samples[..count - 3]));
+            if now.abs_diff(before) * 50 <= now {
+                break;
+            }
+        }
+        median = mean(&samples[..count]);
+        kprintln!("  monotonic   : {} MHz on average over {} s", median / 1_000_000, count * 4);
     }
+    let off = median.abs_diff(current) * 10 > current;
     if !off {
         kprintln!("  monotonic   : refined {} MHz, the boot calibration stands", median / 1_000_000);
         return;

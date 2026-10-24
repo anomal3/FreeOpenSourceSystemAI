@@ -208,6 +208,11 @@ pub struct Compositor {
     /// Нужно одному: сказать окну, что указатель ушёл. Узнать это из текущего
     /// движения нельзя — оно достаётся уже другому окну или столу.
     hovered: Option<App>,
+    /// Окно, показанное поверх всех, пока указатель стоит на его строке в
+    /// списке окон панели задач (как «подсмотр» в Windows): порядок окон при
+    /// этом не меняется. Свёрнутое тоже показывается — иначе не узнать,
+    /// какое из одинаково названных окон какое.
+    peek: Option<App>,
     /// Активное окно, о котором программам уже сказано (фаза 62c, `WIN_FOCUS`).
     ///
     /// Сверяется с [`Self::focused_app`] после каждого действия со столом, а не
@@ -316,6 +321,7 @@ impl Compositor {
             moved: None,
             pending_size: None,
             hovered: None,
+            peek: None,
             reported_focus: None,
             held_keys: [None; 8],
             captured: None,
@@ -525,6 +531,19 @@ impl Compositor {
         self.hovered = app;
     }
 
+    /// Показать окно `app` поверх всех (см. [`Self::peek`]); `None` — убрать.
+    pub fn set_peek(&mut self, app: Option<App>) {
+        if self.peek == app {
+            return;
+        }
+        for old in [self.peek, app].into_iter().flatten() {
+            if let Some(rect) = self.windows.iter().find(|window| window.app == old).map(|window| window.rect) {
+                self.mark_layer(rect);
+            }
+        }
+        self.peek = app;
+    }
+
     /// Запомнить, что нажатие `key` ушло окну `app` событием `event`.
     pub fn hold_key(&mut self, key: KeyCode, app: App, event: WinEvent) {
         // Повтор зажатой клавиши занимает то же место, а не новое.
@@ -655,10 +674,15 @@ impl Compositor {
     ///
     /// Именно порядок создания: кнопка, переезжающая с места на место при каждом
     /// переключении окон, — это кнопка, в которую нельзя попасть.
+    ///
+    /// Список окон упорядочен по глубине — поднятое окно уезжает в его конец, —
+    /// поэтому кнопки сортируются по [`Window::born`] (24.10: свёрнутые
+    /// «Параметры» и «Файлы» менялись местами при разворачивании).
     pub fn buttons(&self) -> super::panel::Windows {
-        self.windows
-            .iter()
-            .enumerate()
+        let mut order: Vec<(usize, &Window)> = self.windows.iter().enumerate().collect();
+        order.sort_by_key(|(_, window)| window.born);
+        order
+            .into_iter()
             // Всплывающему окну кнопка не положена: меню — часть формы.
             .filter(|(_, window)| !window.popup)
             .map(|(index, window)| super::panel::Entry {
@@ -2291,8 +2315,16 @@ impl Compositor {
         }
     }
 
+    /// Снять подсветку пункта меню стола.
+    pub fn context_select_none(&mut self) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.select_none();
+        }
+    }
+
     /// Закрыть меню стола и стереть его с экрана.
     pub fn close_context(&mut self) {
+        self.set_peek(None);
         let rect = self.context.as_ref().map(|menu| menu.rect);
         if let Some(menu) = self.context.as_mut() {
             menu.close();
@@ -2724,6 +2756,12 @@ impl Compositor {
             self.drop_shadow(back, window.rect, band, dy, r);
             shadow_ns += crate::time::uptime_ns().wrapping_sub(t0);
             self.stack(back, window.surface(), window.rect, band, dy, r);
+        }
+        if let Some(window) = self.peek.filter(|_| !scene).and_then(|app| self.windows.iter().find(|window| window.app == app)) {
+            if !window.rect.intersect(&band).is_empty() {
+                self.drop_shadow(back, window.rect, band, dy, radius);
+                self.stack(back, window.surface(), window.rect, band, dy, radius);
+            }
         }
         let t_windows = crate::time::uptime_ns();
         // Клавиатура — над окнами и вместо дока: в макете окно с клавиатурой

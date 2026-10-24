@@ -35,7 +35,7 @@
 //! попадает. Когда управление питанием появится, проверка появится вместе с
 //! ним, и это отмечено здесь, чтобы не выяснять потом.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::kprintln;
 
@@ -103,6 +103,16 @@ pub fn frequency() -> u64 {
 /// `rsdp` обязан быть либо нулём, либо адресом настоящего RSDP в отображённой
 /// памяти: разбор таблиц читает по указателям из них.
 pub unsafe fn calibrate(rsdp: u64) {
+    // Гипервизор, назвавший частоту сам, знает её точнее любого замера: его
+    // таймер ACPI — это то самое виртуальное время, которое под NEM идёт
+    // рывками (24.10: 549 МГц вместо 3,8 ГГц, двойной щелчок не ловился,
+    // анимации пролетали всемеро быстрее).
+    if let Some(hz) = hypervisor_hz() {
+        FREQUENCY_HZ.store(hz, Ordering::Release);
+        REPORTED.store(true, Ordering::Relaxed);
+        kprintln!("  monotonic   : TSC at {} MHz, reported by the hypervisor", hz / 1_000_000);
+        return;
+    }
     let Some(timer) = (unsafe { PmTimer::find(rsdp) }) else {
         kprintln!("  monotonic   : no ACPI timer to calibrate against; time will follow ticks");
         return;
@@ -121,6 +131,50 @@ pub unsafe fn calibrate(rsdp: u64) {
         hz / 1_000_000,
         timer.port
     );
+}
+
+/// Частоту назвал гипервизор — уточнять её по таймеру ACPI незачем.
+static REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Назвал ли частоту гипервизор (тогда уточнение не нужно).
+#[must_use]
+pub fn reported() -> bool {
+    REPORTED.load(Ordering::Relaxed)
+}
+
+/// Частота TSC со слов гипервизора, в герцах.
+///
+/// Два способа, оба — как у Linux (`vmware_get_tsc_khz`, `hv_get_tsc_khz`):
+/// лист `0x4000_0010` (его ввела VMware, повторяют VirtualBox с провайдером
+/// `minimal` и QEMU) отдаёт в `EAX` частоту в килогерцах; Hyper-V — и
+/// VirtualBox с провайдером `hyperv` — даёт её в MSR `0x4000_0022`, если в
+/// `CPUID.4000_0003H:EAX[11]` объявлен доступ к нему. Лист `0x4000_0010` у
+/// Hyper-V значит другое, поэтому он спрашивается только у остальных.
+/// Ответ вне 100 МГц..20 ГГц не принимается: такой частоты у TSC не бывает.
+fn hypervisor_hz() -> Option<u64> {
+    // CPUID.1:ECX[31] — «работаю под гипервизором»; на железе листов
+    // `0x4000_xxxx` нет, и ответ на них — мусор из последнего базового листа.
+    if super::cpuid(1, 0).ecx & (1 << 31) == 0 {
+        return None;
+    }
+    let top = super::cpuid(0x4000_0000, 0);
+    let mut vendor = [0u8; 12];
+    vendor[..4].copy_from_slice(&top.ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&top.ecx.to_le_bytes());
+    vendor[8..].copy_from_slice(&top.edx.to_le_bytes());
+    let hz = if &vendor == b"Microsoft Hv" {
+        if top.eax < 0x4000_0003 || super::cpuid(0x4000_0003, 0).eax & (1 << 11) == 0 {
+            return None;
+        }
+        // SAFETY: MSR объявлен доступным в `CPUID.4000_0003H:EAX[11]`.
+        unsafe { super::rdmsr(0x4000_0022) }
+    } else {
+        if top.eax < 0x4000_0010 {
+            return None;
+        }
+        u64::from(super::cpuid(0x4000_0010, 0).eax) * 1000
+    };
+    (100_000_000..=20_000_000_000).contains(&hz).then_some(hz)
 }
 
 /// Уточнить частоту на длинном интервале (фаза 68g) — как
