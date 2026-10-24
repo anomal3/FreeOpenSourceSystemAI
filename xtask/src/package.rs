@@ -629,13 +629,35 @@ pub fn place_updates(
     fs.mark_dirty(&mut dev)
         .map_err(|err| anyhow::anyhow!("не удалось пометить том используемым: {err}"))?;
 
+    // Освободить место под три контейнера по 112 МБ. С фазы 71i установщик
+    // кладёт в `/media` пакеты Linux (корень Debian и Chromium — 400 МБ), и на
+    // корне в 511 МиБ контейнеры рядом с ними не помещались: `rollback` и
+    // `update` падали на «no free blocks left» в полном прогоне 24.10. Всё,
+    // что этим файлам нужно, идёт в цепочке раньше (`linux-debian` …
+    // `chromium-window`, `httpd-load` с большим файлом); после `install` они
+    // снова на месте.
+    let media = fs
+        .lookup(&mut dev, ext2::ROOT_INODE, "media")
+        .map_err(|err| anyhow::anyhow!("не удалось прочитать корень образа: {err}"))?;
+    if let Some((dir, _)) = media {
+        for name in [crate::debian::PACKAGE_FILE, crate::chromium::PACKAGE_FILE, BIG_FILE_NAME] {
+            match fs.unlink(&mut dev, dir, name) {
+                Ok(()) => say!("стенд: /media/{name} убран, чтобы освободить место под обновления"),
+                Err(ext2::Error::NotFound) => {}
+                Err(err) => return Err(anyhow::anyhow!("не удалось убрать /media/{name}: {err}")),
+            }
+        }
+    }
+
     for package in [&good, &broken, &forged] {
         let data = fs::read(&package.path)
             .with_context(|| format!("не удалось прочитать {}", package.path.display()))?;
         let target = format!("media/{}", package.file_name);
         // Файл мог остаться от прошлого прогона: диск переживает прогон, а
         // записанное переживает диск.
-        let _ = fs.unlink(&mut dev, ext2::ROOT_INODE, &package.file_name);
+        if let Some((dir, _)) = media {
+            let _ = fs.unlink(&mut dev, dir, &package.file_name);
+        }
         match fs.write_file_path(&mut dev, &target, &data, 0o644, 0, 0) {
             Ok(_) => {}
             Err(ext2::Error::Exists) => {

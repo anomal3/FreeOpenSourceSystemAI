@@ -2851,7 +2851,11 @@ fn press_right(qmp: Option<&mut qmp::Qmp>, hmp: &mut monitor::Monitor, down: boo
 /// Файл разрежённый (`image::prepare_target`, на Windows — с флагом NTFS), и
 /// лишний гигабайт ничего не стоит ни на диске, ни во времени прогона. Без
 /// флага стоил: `install4k` не дожидался ответа NVMe (полный прогон 15.10).
-const TARGET_DISK_MIB: u64 = 3072;
+///
+/// Четыре гигабайта — с 24.10: пакет обновления вырос до 175 МБ (Wayland и
+/// прочее ядро фаз 71), и три пакета снова не помещались рядом с системой и
+/// играми на носителе (полный прогон 24.10).
+const TARGET_DISK_MIB: u64 = 4096;
 
 /// Диск, на который ставил установщик.
 fn prepare_installed_disk(arch: Arch, release: bool) -> Result<PathBuf> {

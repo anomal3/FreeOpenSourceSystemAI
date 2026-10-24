@@ -2554,7 +2554,10 @@ pub const ALL: &[Scenario] = &[
             // И главное: движение мыши больше не собирает кадров. Двенадцать
             // сдвигов со стрелкой стола — двенадцать кадров минимум сверху;
             // здесь счётчик видит только вывод самих команд в окно терминала
-            // — 8 кадров по строке текста на обеих архитектурах (17.10).
+            // — 8 кадров по строке текста на обеих архитектурах (17.10), 16 с
+            // приглашением терминала T1 (24.10: метки OSC 133 и цвета —
+            // несколько записей на приглашение). Предел 20: двенадцать
+            // кадров от мыши его всё равно перешагнули бы.
             Step::Line("ui reset"),
             Step::Await("frame counters reset", 15_000),
             Step::Move(30, 20),
@@ -2582,7 +2585,7 @@ pub const ALL: &[Scenario] = &[
             Step::Move(-30, -5),
             Step::Wait(150),
             Step::Line("ui"),
-            Step::AtMost("  frame    ", 10, 15_000),
+            Step::AtMost("  frame    ", 20, 15_000),
             // Стрелка стоит там, где стол её считает: щелчок по кнопке меню
             // попадает в неё.
             Step::Aim(aim::Aim::MenuButton),
@@ -3677,7 +3680,9 @@ pub const ALL: &[Scenario] = &[
             // является (правило дома).
             Step::Await("term        : CSI 2J", 15_000),
             Step::Await("term        : CSI 1;1H", 15_000),
-            Step::Await("ask: name?", 15_000),
+            // Текст программы и строки разбора приходят в линию в своём
+            // порядке: вопрос может стоять и до строки о `CSI`.
+            Step::AwaitAny("ask: name?", 15_000),
             // Вот оно, главное утверждение фазы: набранная строка ушла не в
             // редактор оболочки, а **в программу**, и вернулась её ответом.
             Step::Line("roman"),
@@ -8029,7 +8034,9 @@ pub const ALL: &[Scenario] = &[
             // Linux, фаза 71b): там до `hello` на строку дальше.
             Step::RepeatOn(Arch::X86_64, "down", 1),
             Step::Key("ret"),
-            Step::Await("settings    : started '/bin/pkg install /media/hello-1.0.fpk'", 15_000),
+            // Пакет с носителя «Параметры» ставят по имени — так `pkg` сам
+            // тянет его зависимости (24.10).
+            Step::Await("settings    : started '/bin/pkg install hello'", 15_000),
             Step::Await("pkg: installed hello 1.0, 2 file(s)", 60_000),
             // Перечитать список: окно рисует то, что видит, а увидеть новое
             // оно может только заново пройдясь по реестру.
@@ -12022,6 +12029,43 @@ pub const ALL: &[Scenario] = &[
                 ],
                 gone: &["/mixed.bin", "/many/f0000", "/dir/sub"],
             }),
+        ],
+    },
+    // Последним в списке и намеренно: оставляет Chromium установленным, чтобы
+    // после него можно было открыть систему руками (`cargo xtask run
+    // --installed --net`) и сразу увидеть значок. Цепочке установленной
+    // системы после него мешать нечему — следующая начнётся с `install`.
+    Scenario {
+        name: "chromium-ready",
+        about: "Поставить Chromium одной командой и оставить — для ручного просмотра (`xtask run --installed --net`).",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: true,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "2G",
+        extra: &["-cpu", "max", "-smp", "2"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::Line("pkg install chromium"),
+            Step::Await("pkg: installed chromium 150, ", 1_800_000),
+            Step::Await("desktop     : packages changed, 5 icons", 30_000),
+            Step::Line("shutdown"),
+            Step::Exits(60_000),
+            Step::Absent("KERNEL PANIC"),
         ],
     },
 ];

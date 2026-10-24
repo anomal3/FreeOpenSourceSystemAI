@@ -1076,7 +1076,17 @@ impl SettingsView {
                     empty.then(|| Report::bad("файлов .fpk не нашлось ни в /media, ни дома".to_string()));
             }
             Deed::Install(path) => {
-                let line = format!("/bin/pkg install {path}");
+                // Пакет с носителя — по имени: так `pkg` сам ставит и его
+                // зависимости (имя файла до последнего `-`, как его ищет `pkg`).
+                let by_name = path
+                    .strip_prefix("/media/")
+                    .and_then(|file| file.strip_suffix(".fpk"))
+                    .and_then(|stem| stem.rsplit_once('-').map(|(name, _)| name))
+                    .filter(|name| !name.is_empty() && !name.contains('/'));
+                let line = match by_name {
+                    Some(name) => format!("/bin/pkg install {name}"),
+                    None => format!("/bin/pkg install {path}"),
+                };
                 self.report = Some(pages::run(&line, "pkg install"));
                 self.programs = Programs::List;
                 self.action = 0;

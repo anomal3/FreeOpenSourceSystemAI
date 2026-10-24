@@ -460,7 +460,20 @@ impl LineEditor {
         self.buf[at..at + encoded.len()].copy_from_slice(encoded);
         self.len = self.len - replaced + encoded.len();
         self.cursor = at + encoded.len();
-        if self.echo && at + encoded.len() == self.len && replaced == 0 && self.hint_len == 0 && !self.pending_mismatch(at) {
+        let at_end = at + encoded.len() == self.len && replaced == 0;
+        if self.echo && at_end && self.hint_len >= encoded.len() && self.hint[..encoded.len()] == *encoded && !self.pending_mismatch(at) {
+            // Набирают то, что предлагает подсказка: знак ложится поверх её
+            // серой буквы, а остаток подсказки уже на экране. Перерисовка
+            // подсказки на каждый знак — сотня байт вывода на нажатие, и по
+            // последовательной линии ввод, приходящий быстрее, терялся
+            // (приёмник переполнялся, пока оболочка печатала).
+            let mut tmp = [0u8; 4];
+            self.put(out, ch.encode_utf8(&mut tmp));
+            self.hint.copy_within(encoded.len()..self.hint_len, 0);
+            self.hint_len -= encoded.len();
+            return Edit::Inserted;
+        }
+        if self.echo && at_end && self.hint_len == 0 && !self.pending_mismatch(at) {
             // Самый частый случай — символ в конец строки: напечатать его, и
             // всё. Без перерисовки хвоста, которого нет.
             let mut tmp = [0u8; 4];

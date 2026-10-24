@@ -106,8 +106,12 @@ const MEDIA: &str = "/media";
 /// Сколько уровней зависимостей разбирать — от петли в манифестах.
 const MAX_DEPTH: u32 = 4;
 
-/// Поставить пакет: файл по пути или пакет по имени с носителя, вместе с
-/// недостающими зависимостями.
+/// Поставить пакет: файл по пути или пакет по имени с носителя.
+///
+/// Как `dpkg -i` и `apt install`: файл, названный путём, ставится сам по себе
+/// и без зависимостей отказывает («requires X, which is not installed»), а
+/// пакет, названный по имени, тянет недостающие зависимости с того же
+/// носителя.
 fn install(argument: &str) -> i64 {
     install_with_requirements(argument, 0)
 }
@@ -128,7 +132,7 @@ fn install_with_requirements(argument: &str, depth: u32) -> i64 {
         }
         found.as_str()
     };
-    if depth < MAX_DEPTH {
+    if depth < MAX_DEPTH && !argument.contains('/') {
         let mut names = [[0u8; 64]; 8];
         let mut lengths = [0usize; 8];
         let count = requirements(path, &mut names, &mut lengths);

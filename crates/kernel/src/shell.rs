@@ -2266,8 +2266,11 @@ fn foreground(id: sched::TaskId, label: &str) {
         if ui::animating() || now.saturating_sub(status_at) >= STATUS_PERIOD_MS {
             status_at = now;
             update_status();
-            let seconds = now.saturating_sub(started) / 1000;
-            ui::shell_status(Some(&alloc::format!("{short} · {seconds} с")));
+            // Без счётчика секунд: подпись, меняющаяся раз в секунду, —
+            // перестройка панели и кадр стола каждую секунду, пока идёт
+            // программа, а программе (игре со звуком) нужен процессор.
+            // Сколько шло, оболочка скажет после.
+            ui::shell_status(Some(&alloc::format!("{short} · идёт")));
         }
 
         while let Some(event) = input::next_pointer() {
@@ -2675,8 +2678,9 @@ fn show_prompt(editor: &mut LineEditor) {
     let mark = if user == "root" { '#' } else { '$' };
     let last = LAST_EXIT.load(core::sync::atomic::Ordering::Relaxed);
     let status = if last == 0 { String::new() } else { alloc::format!("[{last}] ") };
+    let red = if last == 0 { "" } else { "\x1b[91m" };
     sprint!(
-        "{MARK_PROMPT}\x1b[91m{status}\x1b[92m{user}@fossai\x1b[0m:\x1b[94m{shown}\x1b[0m{mark} {MARK_INPUT}{}",
+        "{MARK_PROMPT}{red}{status}\x1b[92m{user}@fossai\x1b[0m:\x1b[94m{shown}\x1b[0m{mark} {MARK_INPUT}{}",
         editor.as_str()
     );
     let width = status.chars().count() + user.chars().count() + 7 + 1 + shown.chars().count() + 2;
