@@ -1215,7 +1215,7 @@ pub(super) struct Launcher {
     pub(super) start: String,
     /// Что пакет просит у системы (`permissions=` в манифесте). Отсутствие
     /// строки — пусто, а не «всё»: см. [`fpk::Manifest::rights`].
-    rights: fpk::Rights,
+    pub(super) rights: fpk::Rights,
     /// Значок на рабочем столе (`desktop=yes`, фаза 71i).
     pub(super) desktop: bool,
     /// Картинка значка по имени (`icon=`): `network`, `terminal`, `folder`…

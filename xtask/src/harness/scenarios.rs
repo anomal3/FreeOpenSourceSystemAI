@@ -12115,6 +12115,10 @@ pub const ALL: &[Scenario] = &[
             Step::Line("pkg install chromium"),
             Step::Await("pkg: installed chromium 150, ", 1_800_000),
             Step::Await("desktop     : packages changed, 5 icons", 30_000),
+            // Уведомление «Chromium установлен» (72h-2, макет 19).
+            Step::Await("desktop     : notification '", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("notification"),
             Step::Line("shutdown"),
             Step::Exits(60_000),
             Step::Absent("KERNEL PANIC"),

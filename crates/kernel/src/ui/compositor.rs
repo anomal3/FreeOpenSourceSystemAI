@@ -219,6 +219,9 @@ pub struct Compositor {
     thumbs: Option<super::thumbs::Thumbs>,
     /// Окно трея (72h-1).
     tray_pop: Option<super::traypop::TrayPop>,
+    /// Уведомление (72h-2) и пакеты, о которых стол уже знает.
+    toast: Option<super::toast::Toast>,
+    known_packages: Option<Vec<alloc::string::String>>,
     /// Активное окно, о котором программам уже сказано (фаза 62c, `WIN_FOCUS`).
     ///
     /// Сверяется с [`Self::focused_app`] после каждого действия со столом, а не
@@ -331,6 +334,8 @@ impl Compositor {
             peek: None,
             thumbs: None,
             tray_pop: None,
+            toast: None,
+            known_packages: None,
             reported_focus: None,
             held_keys: [None; 8],
             captured: None,
@@ -1135,11 +1140,59 @@ impl Compositor {
     /// экране до первой чужой перерисовки.
     /// Поставили или сняли пакет со значком — перечитать значки.
     pub fn reload_icons_if_packages_changed(&mut self) {
+        // Что стоит сейчас — запоминается при первом взгляде, чтобы о уже
+        // стоявших программах не уведомлять.
+        if self.known_packages.is_none() {
+            self.known_packages = Some(super::panel::list_packages().into_iter().map(|launcher| launcher.name).collect());
+        }
         if self.icons.packages_changed() {
             self.reload_icons();
             let (total, entries) = self.icons.counts();
             crate::kprintln!("  desktop     : packages changed, {total} icons ({entries} from the desktop folder)");
+            // Новая программа — уведомление «… установлен» (72h-2, макет 19).
+            let packages = super::panel::list_packages();
+            let known = self.known_packages.take().unwrap_or_default();
+            let fresh = packages.iter().find(|launcher| !known.contains(&launcher.name) && !launcher.start.is_empty());
+            if let Some(launcher) = fresh {
+                let art = super::appicon::of_manifest(&launcher.icon);
+                let panel_top = self.panel.as_ref().map_or(self.screen.height() as i32, |panel| panel.rect.y);
+                if let Some(toast) = super::toast::Toast::new(
+                    &launcher.caption,
+                    &art,
+                    launcher.start.clone(),
+                    launcher.rights,
+                    self.screen.width(),
+                    panel_top,
+                    self.scale,
+                ) {
+                    self.close_toast();
+                    self.mark_layer(toast.rect);
+                    self.toast = Some(toast);
+                    crate::kprintln!("  desktop     : notification '{} установлен'", launcher.caption);
+                }
+            }
+            self.known_packages = Some(packages.into_iter().map(|launcher| launcher.name).collect());
         }
+    }
+
+    /// Убрать уведомление; вернуть, что оно запускало бы.
+    pub fn close_toast(&mut self) -> Option<(alloc::string::String, fpk::Rights)> {
+        let toast = self.toast.take()?;
+        self.mark_layer(toast.rect);
+        Some((toast.start, toast.rights))
+    }
+
+    /// Убрать уведомление, если вышел его срок.
+    pub fn expire_toast(&mut self) {
+        if self.toast.as_ref().is_some_and(|toast| crate::time::uptime_ms() >= toast.until_ms) {
+            self.close_toast();
+            crate::kprintln!("  desktop     : notification expired");
+        }
+    }
+
+    #[must_use]
+    pub fn toast_hit(&self, x: i32, y: i32) -> Option<super::toast::Hit> {
+        self.toast.as_ref().and_then(|toast| toast.hit(x, y))
     }
 
     pub fn reload_icons(&mut self) {
@@ -3056,6 +3109,11 @@ impl Compositor {
                 self.drop_shadow(back, menu.rect, band, dy, radius);
                 self.stack(back, menu.surface(), menu.rect, band, dy, radius);
             }
+        }
+        if let Some(toast) = self.toast.as_ref() {
+            let r = theme::R_WINDOW * self.scale;
+            self.drop_shadow(back, toast.rect, band, dy, r);
+            self.stack(back, toast.surface(), toast.rect, band, dy, r);
         }
         if let Some(pop) = self.tray_pop.as_ref() {
             let r = theme::R_WINDOW * self.scale;

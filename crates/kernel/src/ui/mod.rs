@@ -61,6 +61,7 @@ pub mod tray;
 pub mod statusbar;
 pub mod term;
 pub mod thumbs;
+pub mod toast;
 pub mod traypop;
 pub mod wallart;
 pub mod window;
@@ -1453,6 +1454,7 @@ pub fn tick() {
         }
         desktop.refresh_panel(&status);
         desktop.reload_icons_if_packages_changed();
+        desktop.expire_toast();
         desktop.present();
     });
 }
@@ -2329,6 +2331,24 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
             }
             return;
         }
+    }
+
+    // 0-toast. Уведомление (72h-2): «Открыть» запускает программу.
+    if let Some(hit) = desktop.toast_hit(x, y) {
+        match hit {
+            toast::Hit::Open => {
+                if let Some((start, rights)) = desktop.close_toast() {
+                    run_choice(desktop, panel::Choice::Command(start, rights));
+                }
+            }
+            toast::Hit::Close => {
+                desktop.close_toast();
+                kprintln!("  desktop     : notification closed");
+            }
+            toast::Hit::Inside => {}
+        }
+        desktop.refresh_panel(status);
+        return;
     }
 
     // 0-tray. Окно трея (72h-1).
