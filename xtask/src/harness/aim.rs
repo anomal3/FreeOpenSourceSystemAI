@@ -275,9 +275,11 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
             PANEL_INSET + 4 + 22,
             height - PANEL_INSET - PANEL_H / 2,
         ),
+        // Середина полосы, а не треть: с 72h у терминала в левой половине
+        // заголовка — вкладки, а за вкладку окно не таскают.
         Aim::Title(title) => {
             let rect = window(log, title)?;
-            (rect.x + rect.w / 3, rect.y + TITLE_H * ui_scale(log)? / 2)
+            (rect.x + rect.w / 2, rect.y + TITLE_H * ui_scale(log)? / 2)
         }
         // Кнопки заголовка стоят справа налево вплотную к краю: ширина 46,
         // во всю высоту полосы (72b). Числа те же, что в `theme.rs`, и

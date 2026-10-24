@@ -740,6 +740,21 @@ impl Window {
         if self.close_button().contains(local.0, local.1) {
             return Some(Hit::Close);
         }
+        // Вкладки в заголовке (72h, макет 15).
+        if !self.tab_order.is_empty() && !theme::is_mobile() && local.1 < Self::title_height(self.scale) as i32 {
+            let (tabs, plus) = self.strip_layout();
+            if plus.contains(local.0, local.1) {
+                return Some(Hit::TabNew);
+            }
+            for (session, tab, close) in tabs {
+                if close.contains(local.0, local.1) {
+                    return Some(Hit::TabClose(session));
+                }
+                if tab.contains(local.0, local.1) {
+                    return Some(Hit::Tab(session));
+                }
+            }
+        }
         // Кнопки «развернуть» на телефоне нет: окно там и так во весь экран, и
         // разворачивать его некуда. Проверка снята вместе с самой кнопкой —
         // иначе место, где её нарисовали бы, продолжало бы нажиматься.
@@ -753,7 +768,7 @@ impl Window {
         if local.1 < title_bottom {
             return Some(Hit::Title);
         }
-        if !self.tab_order.is_empty() && local.1 < title_bottom + self.ctx().px(STRIP_H) as i32 {
+        if !self.tab_order.is_empty() && local.1 < title_bottom + self.strip_h() as i32 {
             let (tabs, plus) = self.strip_layout();
             if plus.contains(local.0, local.1) {
                 return Some(Hit::TabNew);
@@ -883,6 +898,9 @@ impl Window {
         // под крестик, читается как ошибка отрисовки.
         let text_x = badge.right() + ctx.px(8) as i32;
         let room = (self.minimize_button().x - ctx.px(12) as i32 - text_x).max(0) as u32;
+        // Вкладки в заголовке: подпись — только имя программы перед ними.
+        let tabs_here = !self.tab_order.is_empty() && !theme::is_mobile();
+        let room = if tabs_here { ctx.face(Role::Body).width(self.app.caption()).min(room) } else { room };
         let ink = if focused { p.ink } else { p.ink4 };
         paint::text_clipped(
             ctx,
@@ -1065,7 +1083,7 @@ impl Window {
         incoming.session = self.session;
         self.tabs.push(incoming);
         self.session = session;
-        let area = content_area(&self.surface, self.bar() + self.ctx().px(STRIP_H));
+        let area = content_area(&self.surface, self.bar() + self.strip_h());
         self.surface.fill(area, mini_ui::text::TERM_BG);
         if let Content::Text(grid) = &mut self.content {
             grid.show(&mut self.surface);
@@ -1133,18 +1151,31 @@ impl Window {
             .map_or_else(|| alloc::format!("Терминал {}", session + 1), |(_, title)| title.clone())
     }
 
+    /// Высота своей полосы вкладок под заголовком: на ПК вкладки в заголовке.
+    fn strip_h(&self) -> u32 {
+        if self.tab_order.is_empty() || !theme::is_mobile() { 0 } else { self.ctx().px(STRIP_H) }
+    }
+
     /// Где на полосе вкладки (сессия, вкладка, крестик) и «+».
     fn strip_layout(&self) -> (Vec<(usize, Rect, Rect)>, Rect) {
         let ctx = self.ctx();
-        let top = Self::title_height(self.scale) as i32;
-        let h = ctx.px(STRIP_H);
-        let pad = ctx.px(6);
+        // ПК (72h, макет 15): вкладки в заголовке — после значка и подписи,
+        // до кнопок окна. Телефон — своей полосой под заголовком.
+        let in_title = !theme::is_mobile();
+        let (top, h, left, right) = if in_title {
+            let title = Self::title_height(self.scale);
+            let label = ctx.face(Role::Body).width(self.app.caption());
+            let left = ctx.px(12 + 16 + 8) + label + ctx.px(14);
+            (0, title, left, (self.minimize_button().x - ctx.px(8) as i32).max(0) as u32)
+        } else {
+            (Self::title_height(self.scale) as i32, ctx.px(STRIP_H), ctx.px(6), self.surface.width().saturating_sub(ctx.px(6)))
+        };
         let plus_w = ctx.px(28);
         let count = self.tab_order.len().max(1) as u32;
-        let room = self.surface.width().saturating_sub(pad * 2 + plus_w + ctx.px(4));
+        let room = right.saturating_sub(left + plus_w + ctx.px(4));
         let width = (room / count).min(ctx.px(TAB_W)).max(ctx.px(60));
         let mut out = Vec::new();
-        let mut x = pad as i32;
+        let mut x = left as i32;
         for session in &self.tab_order {
             let tab = Rect::new(x, top + ctx.px(3) as i32, width, h - ctx.px(3));
             let side = ctx.px(16);
@@ -1164,15 +1195,30 @@ impl Window {
         }
         let ctx = self.ctx();
         let p = ctx.palette;
-        let top = Self::title_height(self.scale) as i32;
-        let h = ctx.px(STRIP_H);
-        let strip = Rect::new(0, top, self.surface.width(), h);
-        self.surface.fill(strip, ctx.flat(if focused { p.tb2 } else { p.tb2 }));
+        let strip = if theme::is_mobile() {
+            let top = Self::title_height(self.scale) as i32;
+            let strip = Rect::new(0, top, self.surface.width(), ctx.px(STRIP_H));
+            self.surface.fill(strip, ctx.flat(p.tb2));
+            strip
+        } else {
+            // В заголовке: место вкладок заливается цветом полосы заново —
+            // вкладки меняются чаще заголовка.
+            let (tabs, plus) = self.strip_layout();
+            let from = tabs.first().map_or(plus.x, |(_, tab, _)| tab.x);
+            let strip = Rect::new(from, 0, (self.minimize_button().x - from).max(0) as u32, Self::title_height(self.scale));
+            self.surface.fill(strip, ctx.flat(if focused { p.tb1 } else { p.tb2 }));
+            strip
+        };
         let (tabs, plus) = self.strip_layout();
         for (session, tab, close) in tabs {
             let active = session == self.session;
             if active {
-                draw::rounded(&mut self.surface, Rect::new(tab.x, tab.y, tab.w, tab.h + ctx.px(6)), ctx.px(6), mini_ui::text::TERM_BG, 255);
+                // Видимая вкладка сливается с терминалом под ней.
+                draw::rounded(&mut self.surface, Rect::new(tab.x, tab.y, tab.w, tab.h + ctx.px(8)), ctx.px(6), mini_ui::text::TERM_BG, 255);
+                if !theme::is_mobile() {
+                    let bottom = Self::title_height(self.scale) as i32;
+                    self.surface.fill(Rect::new(tab.x, bottom - ctx.px(2) as i32, tab.w, ctx.px(2)), mini_ui::text::TERM_BG);
+                }
             }
             let title = self.tab_title(session);
             let ink = if active { mini_ui::text::TERM_FG } else { p.ink4 };
@@ -1877,7 +1923,9 @@ fn own(text: &str) -> Option<String> {
 /// полем в четыре точки.
 fn grid_area(surface: &Surface, scale: u32, strip: bool) -> Rect {
     let ctx = Ctx::scaled(scale);
-    let top = Window::title_height(scale) + if strip { ctx.px(STRIP_H) } else { 0 };
+    // С 72h вкладки ПК — в заголовке (макет 15), своя полоса только у
+    // телефона.
+    let top = Window::title_height(scale) + if strip && theme::is_mobile() { ctx.px(STRIP_H) } else { 0 };
     content_area(surface, top).shrink(ctx.px(4))
 }
 
