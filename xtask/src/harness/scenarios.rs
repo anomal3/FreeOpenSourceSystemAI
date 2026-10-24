@@ -9513,15 +9513,15 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Repeat("down", 9),
             Step::Key("ret"),
-            Step::Await("settings    : title bar 52 saved", 15_000),
-            Step::Await("desktop     : title bar 52 px", 15_000),
+            Step::Await("settings    : title bar 40 saved", 15_000),
+            Step::Await("desktop     : title bar 40 px", 15_000),
             Step::Wait(1_500),
             Step::Shot("06-personalized"),
             // Заголовок — обратно к обычному: на его высоту рассчитаны прицелы
             // стенда в остальных сценариях цепочки.
             Step::Key("up"),
             Step::Key("ret"),
-            Step::Await("settings    : title bar 44 saved", 15_000),
+            Step::Await("settings    : title bar 32 saved", 15_000),
 
             // «Время и язык» (десятый раздел, из пятого пять вниз): седьмой
             // пояс сверху — UTC+03:00, тот, что записал установщик.

@@ -522,6 +522,19 @@ impl Compositor {
         (hit == Hit::Body && !window.is_program()).then_some(window.app)
     }
 
+    /// Подсветить кнопку заголовка под указателем (72b). `x, y` — точка
+    /// экрана; вне кнопок подсветка снимается.
+    pub fn hover_title(&mut self, x: i32, y: i32) {
+        let under = self.window_at(x, y).and_then(|(index, hit)| {
+            matches!(hit, Hit::Close | Hit::Maximize | Hit::Minimize).then(|| (self.windows[index].app, hit))
+        });
+        let focus = self.focus;
+        for (index, window) in self.windows.iter_mut().enumerate() {
+            let hot = under.filter(|(app, _)| *app == window.app).map(|(_, hit)| hit);
+            window.set_hot(hot, index == focus);
+        }
+    }
+
     /// См. [`Self::hovered`].
     pub const fn hovered(&self) -> Option<App> {
         self.hovered
@@ -2788,8 +2801,10 @@ impl Compositor {
             if !panel.rect.intersect(&band).is_empty() {
                 super::note_dock_band();
                 let t0 = crate::time::uptime_ns();
-                self.drop_shadow(back, panel.rect, band, dy, radius);
-                self.stack(back, panel.surface(), panel.rect, band, dy, radius);
+                // Панель ПК — во всю ширину и без скругления (72b).
+                let r = if theme::is_mobile() { radius } else { 0 };
+                self.drop_shadow(back, panel.rect, band, dy, r);
+                self.stack(back, panel.surface(), panel.rect, band, dy, r);
                 // Док считается отдельно от прочих верхних слоёв: он попадает
                 // в девять-двенадцать полос, а `top` стоит восемь миллисекунд,
                 // и одно с другим не сходится. Пока время не разведено, любое

@@ -36,10 +36,10 @@ use mini_ui::draw;
 use mini_ui::glyphicon::{self, Icon};
 use mini_ui::text::TextGrid;
 use mini_ui::typeface::Role;
-use mini_ui::{Rect, Surface};
+use mini_ui::{Color, Rect, Surface};
 use user_abi::WinEvent;
 
-use mini_ui::paint::{self, Ctx, Weight};
+use mini_ui::paint::{self, Ctx};
 use super::dialog::{Answer, Dialog, DialogView};
 use super::settings::SettingsView;
 use mini_ui::theme;
@@ -364,6 +364,8 @@ pub struct Window {
     /// Номер в порядке создания: по нему стоят кнопки панели задач. Список
     /// окон стола упорядочен по глубине и меняется при каждом поднятии.
     pub born: u64,
+    /// Кнопка заголовка под указателем (72b): подсвечена, крестик — красным.
+    hot: Option<Hit>,
 }
 
 /// Счётчик для [`Window::born`].
@@ -517,6 +519,7 @@ impl Window {
             session: 0,
             tab_titles: Vec::new(),
             born: BORN.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            hot: None,
         }
     }
 
@@ -667,19 +670,15 @@ impl Window {
     ///
     /// Порядок как у окон, к которым человек привык: крестик крайний справа,
     /// потому что промахнуться мимо него — это закрыть окно, а не свернуть.
+    ///
+    /// С 72b — как в Windows и в макете (экран 13): плоские, во всю высоту
+    /// полосы, шириной [`theme::TITLE_BTN`], вплотную друг к другу и к краю.
     fn title_button(&self, from_right: u32) -> Rect {
         let scale = self.scale;
-        let size = theme::TITLE_BTN * scale;
-        let gap = theme::TITLE_GAP * scale;
-        let margin = 10 * scale;
-        let step = size + gap;
-        let right = self.surface.width() as i32 - margin as i32;
-        Rect::new(
-            right - (size + step * from_right) as i32,
-            (Self::title_height(scale) as i32 - size as i32) / 2,
-            size,
-            size,
-        )
+        let width = theme::TITLE_BTN * scale;
+        let step = width + theme::TITLE_GAP * scale;
+        let right = self.surface.width() as i32;
+        Rect::new(right - (width + step * from_right) as i32, 0, width, Self::title_height(scale))
     }
 
     /// Кнопка закрытия в координатах поверхности.
@@ -834,16 +833,10 @@ impl Window {
         // Первая версия обходила это полосой на `radius` выше нужного, и она
         // молча закрашивала четырнадцать верхних точек содержимого: у
         // терминала верхняя строка оказывалась срезанной пополам.
-        let top = if focused { p.tb1 } else { p.tb2 };
-        let bottom = p.tb2;
-        draw::rounded_gradient(
-            &mut self.surface,
-            bar,
-            0,
-            ctx.flat(top),
-            ctx.flat(bottom),
-            255,
-        );
+        // Заливка сплошная (72b): у активного окна полоса светлее, у
+        // неактивного — цвета окна.
+        let fill = ctx.flat(if focused { p.tb1 } else { p.tb2 });
+        self.surface.fill(bar, fill);
         draw::hline(
             &mut self.surface,
             0,
@@ -859,9 +852,9 @@ impl Window {
         // Значок программы: тот же скруглённый квадрат, что у неё на столе и в
         // меню. Он и опознаёт окно быстрее заголовка — цвет читается раньше
         // текста.
-        let badge_side = ctx.px(18);
+        let badge_side = ctx.px(16);
         let badge = Rect::new(
-            ctx.px(16) as i32,
+            ctx.px(12) as i32,
             (title_h as i32 - badge_side as i32) / 2,
             badge_side,
             badge_side,
@@ -879,38 +872,24 @@ impl Window {
         // предлагает вернуть прежний размер, и одинаковый значок в обоих
         // случаях означал бы, что человек нажимает наугад.
         let restore_icon = if self.restore.is_some() { Icon::Restore } else { Icon::Maximize };
-        let weight = if focused { Weight::Normal } else { Weight::Ghost };
         // Кнопки заголовка. На телефоне «развернуть» не рисуется вовсе: окно и
         // так во весь экран, разворачивать его некуда, а кнопка, которая ничего
         // не меняет, — это обещание, которого система не держит.
         let mobile = theme::is_mobile();
-        for (button, icon, weight, only_desktop) in [
-            (self.minimize_button(), Icon::Minimize, weight, false),
-            (self.maximize_button(), restore_icon, weight, true),
-            (
-                self.close_button(),
-                Icon::Close,
-                if focused { Weight::Danger } else { Weight::Ghost },
-                false,
-            ),
-        ] {
-            if mobile && only_desktop {
-                continue;
-            }
-            paint::icon_button(ctx, &mut self.surface, button, icon, weight, false);
-        }
+        let _ = (restore_icon, mobile);
+        self.paint_title_buttons(focused);
 
         // Заголовок кончается там, где начинаются кнопки: подпись, заехавшая
         // под крестик, читается как ошибка отрисовки.
-        let text_x = badge.right() + ctx.px(11) as i32;
+        let text_x = badge.right() + ctx.px(8) as i32;
         let room = (self.minimize_button().x - ctx.px(12) as i32 - text_x).max(0) as u32;
         let ink = if focused { p.ink } else { p.ink4 };
         paint::text_clipped(
             ctx,
             &mut self.surface,
-            Role::Title,
+            Role::Body,
             text_x,
-            paint::baseline(ctx, Role::Title, bar),
+            paint::baseline(ctx, Role::Body, bar),
             room,
             &self.title,
             ink,
@@ -942,6 +921,60 @@ impl Window {
         self.damage = self.damage.union(&Rect::new(0, bounds.h as i32 - 1, bounds.w, 1));
         self.damage = self.damage.union(&Rect::new(0, 0, 1, bounds.h));
         self.damage = self.damage.union(&Rect::new(bounds.w as i32 - 1, 0, 1, bounds.h));
+    }
+
+    /// Кнопки заголовка: плоские знаки (72b, макет 13), у неактивного окна —
+    /// приглушённые; под указателем — плашка наведения, у крестика —
+    /// красная.
+    fn paint_title_buttons(&mut self, focused: bool) {
+        let ctx = self.ctx();
+        let p = ctx.palette;
+        let fill = ctx.flat(if focused { p.tb1 } else { p.tb2 });
+        let restore_icon = if self.restore.is_some() { Icon::Restore } else { Icon::Maximize };
+        let glyph = ctx.px(10);
+        for (button, icon, hit, only_desktop) in [
+            (self.minimize_button(), Icon::Minimize, Hit::Minimize, false),
+            (self.maximize_button(), restore_icon, Hit::Maximize, true),
+            (self.close_button(), Icon::Close, Hit::Close, false),
+        ] {
+            if theme::is_mobile() && only_desktop {
+                continue;
+            }
+            let hot = self.hot == Some(hit);
+            let (plate, ink) = match (hot, hit) {
+                (true, Hit::Close) => (p.bad, Color::rgb(0xFF, 0xFF, 0xFF)),
+                (true, _) => (p.btnhov.over(fill), p.ink),
+                (false, _) => (fill, if focused { p.ink2 } else { p.ink4 }),
+            };
+            self.surface.fill(button, plate);
+            glyphicon::draw(
+                &mut self.surface,
+                icon,
+                button.x + (button.w as i32 - glyph as i32) / 2,
+                button.y + (button.h as i32 - glyph as i32) / 2,
+                glyph,
+                ink,
+                255,
+            );
+        }
+    }
+
+    /// Подсветить кнопку заголовка под указателем (`None` — никакую).
+    /// Перерисовываются только кнопки и обводка окна над ними.
+    pub fn set_hot(&mut self, hot: Option<Hit>, focused: bool) {
+        let hot = hot.filter(|hit| matches!(hit, Hit::Close | Hit::Maximize | Hit::Minimize));
+        if self.hot == hot || self.popup || self.frameless {
+            return;
+        }
+        self.hot = hot;
+        self.paint_title_buttons(focused);
+        let ctx = self.ctx();
+        let p = ctx.palette;
+        let bounds = self.surface.bounds();
+        let edge = if focused { p.line3 } else { p.line2 };
+        draw::rounded_stroke(&mut self.surface, bounds, ctx.px(theme::R_WINDOW), edge.color, edge.alpha);
+        let row = self.minimize_button().union(&self.close_button());
+        self.damage = self.damage.union(&row);
     }
 
     /// Перекрасить окно под текущую тему.

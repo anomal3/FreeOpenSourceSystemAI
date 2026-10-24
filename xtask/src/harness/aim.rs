@@ -147,18 +147,18 @@ fn field(log: &str, label: &str) -> Result<i32> {
 }
 
 /// Высота полосы заголовка окна. `theme::TITLE_H`.
-const TITLE_H: i32 = 44;
-/// Сторона кнопки заголовка. `theme::TITLE_BTN`.
-const TITLE_BTN: i32 = 30;
+const TITLE_H: i32 = 32;
+/// Ширина кнопки заголовка. `theme::TITLE_BTN`.
+const TITLE_BTN: i32 = 46;
 /// Зазор между кнопками заголовка. `theme::TITLE_GAP`.
-const TITLE_GAP: i32 = 6;
-/// Отступ ряда кнопок от правого края окна.
-const TITLE_MARGIN: i32 = 10;
+const TITLE_GAP: i32 = 0;
+/// Отступ ряда кнопок от правого края окна: с 72b кнопки вплотную к краю.
+const TITLE_MARGIN: i32 = 0;
 
 /// Высота панели задач. `theme::PANEL_H`.
-const PANEL_H: i32 = 52;
+const PANEL_H: i32 = 48;
 /// Отступ панели задач от краёв экрана. `theme::PANEL_INSET`.
-const PANEL_INSET: i32 = 14;
+const PANEL_INSET: i32 = 0;
 
 /// Сетка значков стола. Всё — из `theme.rs`.
 const ICON_CELL_W: i32 = 110;
@@ -266,20 +266,18 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
     let (width, height) = screen(log)?;
     let point = match aim {
         Aim::Corner => (0, 0),
-        // Панель задач больше не приклеена к краю: она плавает с отступом
-        // `PANEL_INSET` от каждого края, и щелчок в самый угол попадает теперь
-        // в обои. Прицел — середина кнопки «FreeOS»: она стоит первой, отступ
-        // от края плашки 12, высота 34.
+        // Прицел — середина кнопки «Пуск»: с 72b это квадрат 44×40 со знаком
+        // FossAi у самого левого края панели (поле плашки 4).
         Aim::MenuButton => (
-            PANEL_INSET + 12 + 40,
+            PANEL_INSET + 4 + 22,
             height - PANEL_INSET - PANEL_H / 2,
         ),
         Aim::Title(title) => {
             let rect = window(log, title)?;
             (rect.x + rect.w / 3, rect.y + TITLE_H * ui_scale(log)? / 2)
         }
-        // Кнопки заголовка стоят справа налево с отступом 10 от края: сторона
-        // 30, зазор 6, то есть шаг 36. Числа те же, что в `theme.rs`, и
+        // Кнопки заголовка стоят справа налево вплотную к краю: ширина 46,
+        // во всю высоту полосы (72b). Числа те же, что в `theme.rs`, и
         // разойтись им нельзя — прицел, посчитанный по старой геометрии, молча
         // попадает в кнопку соседа, а это «свернул вместо закрыл».
         Aim::Close(title) => title_button(log, title, 0)?,

@@ -1693,6 +1693,13 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
     } else {
         hover_button(desktop, x, y, status);
     }
+    // Кнопки заголовка подсвечиваются под указателем, пока его не держат
+    // меню и перетаскивание.
+    if desktop.dragging().is_none() && !desktop.menu_open() && !desktop.context_open() {
+        desktop.hover_title(x, y);
+    } else {
+        desktop.hover_title(-1, -1);
+    }
     let busy = desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open();
     let under = if busy { None } else { desktop.program_under(x, y) };
     let now = under.map(|(app, _, _)| app);
@@ -2637,6 +2644,15 @@ fn paste_clipboard() {
         return;
     }
     kprintln!("  terminal    : pasted {} chars", text.chars().count());
+    // Ctrl и Shift от Ctrl+Shift+V ещё зажаты: без отпускания вставленные
+    // буквы приехали бы сочетаниями — «r» открывала поиск по истории, «t» —
+    // новую вкладку (72b: выделение стенда захватило другие слова).
+    {
+        use crate::input::{self, KeyCode};
+        for key in [KeyCode::LeftCtrl, KeyCode::RightCtrl, KeyCode::LeftShift, KeyCode::RightShift, KeyCode::LeftAlt, KeyCode::RightAlt] {
+            input::post(key, false);
+        }
+    }
     type_text(text, false);
 }
 

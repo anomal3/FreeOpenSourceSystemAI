@@ -169,7 +169,13 @@ impl Metrics {
     }
 
     /// Ширина кнопки меню — она же начало всего, что стоит правее.
+    ///
+    /// С логотипом (72b) — квадратная кнопка со знаком, как остальные
+    /// кнопки панели; без него — значок и подпись «FossAi».
     fn brand_width(self) -> u32 {
+        if !theme::is_mobile() && super::appicon::logo().is_some() {
+            return self.btn_h + self.ctx.px(4);
+        }
         self.side * 2 + self.glyph() + self.gap + self.ctx.face(Role::Title).width(BRAND)
     }
 
@@ -718,8 +724,13 @@ impl Panel {
         // композитор, смешав их с обоями, и нарисованное здесь скругление
         // означало бы, что углы срезаются дважды.
         self.surface.fill(plate, ctx.under);
-        draw::rounded_stroke(&mut self.surface, plate, m.round, p.line3.color, p.line3.alpha);
-        draw::crown(&mut self.surface, plate, m.round, p.crown.color, p.crown.alpha);
+        if theme::is_mobile() {
+            draw::rounded_stroke(&mut self.surface, plate, m.round, p.line3.color, p.line3.alpha);
+            draw::crown(&mut self.surface, plate, m.round, p.crown.color, p.crown.alpha);
+        } else {
+            // Панель во всю ширину (72b): черта только сверху, как в Windows.
+            draw::hline(&mut self.surface, 0, 0, plate.w, p.line2.color, p.line2.alpha);
+        }
 
         // Телефон: док вместо панели задач. Кнопок окон здесь нет и быть не
         // может — окно на телефоне одно и во весь экран, переключать нечего.
@@ -734,7 +745,12 @@ impl Panel {
         // кнопкам достаётся то, что осталось. Наоборот было бы хуже — десяток
         // открытых окон вытеснил бы часы за край экрана.
         let clock = clock_line(status);
-        let lang = crate::input::keymap::layout().label();
+        let date = date_line(status);
+        // Раскладка — как в трее Windows: «РУС» и «ENG».
+        let lang = match crate::input::keymap::layout() {
+            crate::input::keymap::Layout::Ru => "РУС",
+            crate::input::keymap::Layout::Us => "ENG",
+        };
         let mono = ctx.face(Role::Mono);
         let body = ctx.face(Role::Body);
         // Шаг между значками трея — шире зазора кнопок: значки не кнопки в
@@ -742,7 +758,10 @@ impl Panel {
         // одна надпись «RU 12:30».
         let step = ctx.px(14);
         let glyph = m.glyph();
-        let mut status_w = glyph + step + body.width(lang) + step + mono.width(&clock);
+        let caption = ctx.face(Role::Caption);
+        let clock_w = body.width(&clock).max(date.as_deref().map_or(0, |date| caption.width(date)));
+        let _ = mono;
+        let mut status_w = glyph + step + body.width(lang) + step + clock_w;
         // Совсем узкий экран: показать всё нельзя, и тогда правого края нет
         // вовсе. Обрезанное наполовину число хуже отсутствующего — по нему не
         // понять, что именно обрезано.
@@ -768,9 +787,9 @@ impl Panel {
                     draw::rounded(&mut self.surface, layout.brand, m.round_row, p.hover2.color, p.hover2.alpha);
                     draw::rounded_stroke(&mut self.surface, layout.brand, m.round_row, p.accline.color, p.accline.alpha);
                 }
-                let side = glyph + ctx.px(8);
+                let side = m.icon();
                 let at = Rect::new(
-                    layout.brand.x + m.side as i32 - ctx.px(4) as i32,
+                    layout.brand.x + (layout.brand.w as i32 - side as i32) / 2,
                     layout.brand.y + (layout.brand.h as i32 - side as i32) / 2,
                     side,
                     side,
@@ -792,15 +811,17 @@ impl Panel {
                 );
             }
         }
-        paint::text(
-            ctx,
-            &mut self.surface,
-            Role::Title,
-            layout.brand.x + (m.side + glyph + m.gap) as i32,
-            paint::baseline(ctx, Role::Title, layout.brand),
-            BRAND,
-            ink,
-        );
+        if logo.is_none() {
+            paint::text(
+                ctx,
+                &mut self.surface,
+                Role::Title,
+                layout.brand.x + (m.side + glyph + m.gap) as i32,
+                paint::baseline(ctx, Role::Title, layout.brand),
+                BRAND,
+                ink,
+            );
+        }
 
         draw::vline(
             &mut self.surface,
@@ -860,18 +881,20 @@ impl Panel {
             self.tray.push((TrayItem::Layout, Rect::new(x - half, plate.y, width + step, plate.h)));
             x += (width + step) as i32;
 
-            let width = paint::text(
-                ctx,
-                &mut self.surface,
-                Role::Mono,
-                x,
-                paint::baseline(ctx, Role::Mono, plate),
-                &clock,
-                p.ink,
-            );
+            // Часы и дата в две строки, прижаты вправо, как в Windows.
+            let right = x + clock_w as i32;
+            match &date {
+                Some(date) => {
+                    let line = i32::from(caption.line);
+                    let top = plate.y + (plate.h as i32 - i32::from(body.line) - line) / 2;
+                    paint::text_right(ctx, &mut self.surface, Role::Body, right, top, &clock, p.ink);
+                    paint::text_right(ctx, &mut self.surface, Role::Caption, right, top + i32::from(body.line), date, p.ink3);
+                }
+                None => paint::text_right(ctx, &mut self.surface, Role::Body, right, paint::baseline(ctx, Role::Body, plate), &clock, p.ink),
+            }
             self.tray.push((
                 TrayItem::Clock,
-                Rect::new(x - half, plate.y, width + m.plate_pad(), plate.h),
+                Rect::new(x - half, plate.y, clock_w + m.plate_pad(), plate.h),
             ));
         }
 
@@ -923,7 +946,9 @@ impl Panel {
             );
         }
         // Полоска состояния — у нижнего края кнопки.
-        let (width, color) = if active { (ctx.px(16), p.acc) } else { (ctx.px(6), p.ink5) };
+        // Полоска как в макете (02): у активного — акцентная 24×3, у прочих —
+        // серая 6×3.
+        let (width, color) = if active { (ctx.px(24).min(rect.w), p.acc) } else { (ctx.px(6), p.ink5) };
         let thick = ctx.px(3);
         let bar_x = if labelled {
             icon_rect.x + (side as i32 - width as i32) / 2
@@ -1851,7 +1876,7 @@ fn list_programs() -> Vec<String> {
 /// загрузка (`prefs::adopt`), когда панели ещё нет.
 static SHOW_UPTIME: AtomicBool = AtomicBool::new(false);
 /// Показывать ли дату рядом с часами.
-static SHOW_DATE: AtomicBool = AtomicBool::new(false);
+static SHOW_DATE: AtomicBool = AtomicBool::new(true);
 
 /// Кнопки панели задач с подписями — по кнопке на окно, как «Никогда не
 /// объединять» в Windows 11. Без подписей (по умолчанию) — только значки, и
@@ -1897,13 +1922,19 @@ fn clock_line(status: &Status) -> String {
         let seconds = status.uptime_ms / 1000;
         line.push_str(&alloc::format!("up {}:{:02}  ", seconds / 3600, (seconds / 60) % 60));
     }
-    if SHOW_DATE.load(Ordering::Relaxed) {
-        if let Some(now) = crate::time::now_local() {
-            line.push_str(&alloc::format!("{:02}.{:02}.{}  ", now.day, now.month, now.year));
-        }
-    }
     line.push_str(clock);
     line
+}
+
+/// Дата под часами (72b): строкой ниже, как в трее Windows. `None` — дату не
+/// показывать или она неизвестна.
+fn date_line(status: &Status) -> Option<String> {
+    status.clock.as_ref()?;
+    if !SHOW_DATE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let now = crate::time::now_local()?;
+    Some(alloc::format!("{:02}.{:02}.{}", now.day, now.month, now.year))
 }
 
 /// Время работы в виде `Ч:ММ:СС`.
