@@ -82,8 +82,9 @@ enum Command {
     /// Перевести значки макета (`assets/icons/freeos-icons.svg`) в таблицу
     /// `crates/mini-ui/src/iconset_data.rs`.
     Icons,
-    /// Перевести обои макета (`assets/wallpaper/*.png`) в QOI, а логотип
-    /// (`assets/logo/*.png`) — в FIMG: то и другое ядро вшивает в себя.
+    /// Перевести обои макета (`assets/wallpaper/*.png`) в QOI, а логотип и
+    /// курсоры (`assets/logo`, `assets/cursors`) — в FIMG: всё это ядро
+    /// вшивает в себя.
     Wallpaper,
     /// Разобрать образ диска: разделы и содержимое корневой ФС.
     Inspect(InspectArgs),
@@ -674,6 +675,21 @@ fn real_main() -> Result<()> {
                 let fimg = fimg::from_png_side(&std::fs::read(logo.join(png))?, 128)?;
                 std::fs::write(logo.join(out), &fimg)?;
                 println!("логотип: {png} → {out} ({} КиБ)", fimg.len() / 1024);
+            }
+            // Курсоры — FIMG того же размера, что PNG (32 и 48).
+            let cursors = paths::workspace_root().join("assets").join("cursors");
+            for side in [32u32, 48] {
+                let dir = cursors.join(side.to_string());
+                let mut count = 0;
+                for entry in std::fs::read_dir(&dir)? {
+                    let path = entry?.path();
+                    if path.extension().is_some_and(|ext| ext == "png") {
+                        let fimg = fimg::from_png_side(&std::fs::read(&path)?, side)?;
+                        std::fs::write(path.with_extension("fimg"), &fimg)?;
+                        count += 1;
+                    }
+                }
+                println!("курсоры {side}: {count}");
             }
         }
 

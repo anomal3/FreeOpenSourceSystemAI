@@ -1700,6 +1700,20 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
     } else {
         desktop.hover_title(-1, -1);
     }
+    // Форма курсора (72c): растяжка у уголка и пока тянут, текст над
+    // терминалом, иначе стрелка.
+    let shape = if desktop.resizing() {
+        pointer::Shape::ResizeNwse
+    } else if desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open() {
+        pointer::Shape::Arrow
+    } else {
+        match desktop.window_at(x, y) {
+            Some((_, Hit::Resize)) => pointer::Shape::ResizeNwse,
+            Some((index, Hit::Body)) if desktop.app_at(index) == Some(App::Terminal) => pointer::Shape::Text,
+            _ => pointer::Shape::Arrow,
+        }
+    };
+    desktop.set_pointer_shape(shape);
     let busy = desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open();
     let under = if busy { None } else { desktop.program_under(x, y) };
     let now = under.map(|(app, _, _)| app);

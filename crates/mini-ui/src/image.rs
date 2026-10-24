@@ -44,6 +44,15 @@ impl Image {
         Some(Self { width, height, rgba })
     }
 
+    /// Точка `R G B A` (за краем — прозрачная).
+    #[must_use]
+    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        if x >= self.width || y >= self.height {
+            return [0; 4];
+        }
+        self.rgba[(y * self.width + x) as usize]
+    }
+
     /// Нарисовать картинку в квадрат `rect` с прозрачностью.
     ///
     /// Уменьшение — усреднением по площади (иначе значок 128×128 в 24 точки

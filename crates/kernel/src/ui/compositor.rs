@@ -104,6 +104,8 @@ pub struct Compositor {
     hw_cursor: bool,
     /// Где курсор адаптера стоит по последней команде.
     cursor_sent: (i32, i32),
+    /// Какая картинка у курсора адаптера (форма или кадр круга, 72c).
+    cursor_key: usize,
     /// Значки на самом столе — слой между фоном и окнами.
     icons: Icons,
     /// Меню по правому щелчку. Верхний слой, как и меню запуска.
@@ -287,7 +289,8 @@ impl Compositor {
     /// сборки кадра, из которых вторая проверялась бы только на машине, где не
     /// хватило памяти, — то есть никогда.
     pub fn new(screen: Screen, scale: u32) -> Option<Self> {
-        let pointer = Pointer::new(screen.width(), screen.height());
+        let mut pointer = Pointer::new(screen.width(), screen.height());
+        pointer.set_scale(scale);
         let rows = (BAND_BYTES / (screen.width().max(1) * 4)).clamp(BAND_MIN, BAND_MAX);
         let wall = theme::palette().wall_top;
         let back = Surface::new(screen.width(), rows.min(screen.height().max(1)), wall)?;
@@ -335,6 +338,7 @@ impl Compositor {
             blanked: false,
             hw_cursor: false,
             cursor_sent: (0, 0),
+            cursor_key: usize::MAX,
         };
         compositor.panel = Panel::new(
             compositor.screen.width(),
@@ -1002,19 +1006,39 @@ impl Compositor {
             if !appeared {
                 return false;
             }
-            let image = Pointer::image(crate::display::CURSOR_SIDE);
-            self.hw_cursor = crate::display::cursor_show(&image, (0, 0), x, y);
+            let (image, hot) = self.pointer.image(crate::display::CURSOR_SIDE);
+            self.hw_cursor = crate::display::cursor_show(&image, hot, x, y);
             if self.hw_cursor {
                 self.cursor_sent = (x, y);
+                self.cursor_key = self.pointer.image_key();
                 crate::kprintln!("  desktop     : the pointer is drawn by the display adapter");
             }
             return self.hw_cursor;
         }
-        if self.cursor_sent != (x, y) {
+        // Другая форма или кадр круга — картинку отдать заново.
+        let key = self.pointer.image_key();
+        if key != self.cursor_key {
+            let (image, hot) = self.pointer.image(crate::display::CURSOR_SIDE);
+            crate::display::cursor_show(&image, hot, x, y);
+            self.cursor_key = key;
+            self.cursor_sent = (x, y);
+        } else if self.cursor_sent != (x, y) {
             crate::display::cursor_move(x, y);
             self.cursor_sent = (x, y);
         }
         true
+    }
+
+    /// Сменить форму курсора (72c): стрелка, текст, растяжка…
+    pub fn set_pointer_shape(&mut self, shape: super::pointer::Shape) {
+        if !self.pointer.set_shape(shape) {
+            return;
+        }
+        if self.hw_cursor {
+            self.hand_cursor(false);
+        } else {
+            self.mark(self.pointer.rect());
+        }
     }
 
     #[must_use]
@@ -1158,6 +1182,12 @@ impl Compositor {
         self.drag = Some(app);
         self.drag_from = self.rect_of(app).map_or((0, 0), |rect| (rect.x, rect.y));
         self.drag_resizes = true;
+    }
+
+    /// Тянут ли окно за уголок (а не переносят).
+    #[must_use]
+    pub const fn resizing(&self) -> bool {
+        self.drag.is_some() && self.drag_resizes
     }
 
     #[must_use]
@@ -2434,6 +2464,7 @@ impl Compositor {
         // него. Видимость вернёт ближайший кадр (см. [`Self::sync_keyboard`]).
         self.keyboard = Keyboard::new(width, height, self.scale);
         self.pointer = Pointer::new(width, height);
+        self.pointer.set_scale(self.scale);
         self.under = None;
         self.under_valid = false;
         self.scene = None;
