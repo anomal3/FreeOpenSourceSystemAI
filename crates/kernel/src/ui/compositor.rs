@@ -217,6 +217,8 @@ pub struct Compositor {
     peek: Option<App>,
     /// Миниатюры окон над кнопкой панели (72e).
     thumbs: Option<super::thumbs::Thumbs>,
+    /// Окно трея (72h-1).
+    tray_pop: Option<super::traypop::TrayPop>,
     /// Активное окно, о котором программам уже сказано (фаза 62c, `WIN_FOCUS`).
     ///
     /// Сверяется с [`Self::focused_app`] после каждого действия со столом, а не
@@ -328,6 +330,7 @@ impl Compositor {
             hovered: None,
             peek: None,
             thumbs: None,
+            tray_pop: None,
             reported_focus: None,
             held_keys: [None; 8],
             captured: None,
@@ -2374,6 +2377,40 @@ impl Compositor {
         Some(rect)
     }
 
+    /// Открыть окно трея над значком `item`. `false` — не вышло.
+    pub fn open_tray_pop(&mut self, kind: super::traypop::Kind, item: super::panel::TrayItem) -> bool {
+        let Some(panel) = self.panel.as_ref() else { return false };
+        let Some(anchor) = panel.tray_rect(item) else { return false };
+        let panel_top = panel.rect.y;
+        let Some(pop) = super::traypop::TrayPop::new(kind, anchor, self.screen.width(), panel_top, self.scale) else {
+            return false;
+        };
+        self.mark_layer(pop.rect);
+        self.tray_pop = Some(pop);
+        true
+    }
+
+    pub fn close_tray_pop(&mut self) {
+        if let Some(pop) = self.tray_pop.take() {
+            self.mark_layer(pop.rect);
+        }
+    }
+
+    #[must_use]
+    pub fn tray_pop_kind(&self) -> Option<super::traypop::Kind> {
+        self.tray_pop.as_ref().map(|pop| pop.kind)
+    }
+
+    #[must_use]
+    pub fn tray_pop_hit(&self, x: i32, y: i32) -> Option<super::traypop::Action> {
+        self.tray_pop.as_ref().and_then(|pop| pop.hit(x, y))
+    }
+
+    #[must_use]
+    pub fn tray_pop_contains(&self, x: i32, y: i32) -> bool {
+        self.tray_pop.as_ref().is_some_and(|pop| pop.rect.contains(x, y))
+    }
+
     /// Убрать миниатюры.
     pub fn close_thumbs(&mut self) {
         if let Some(thumbs) = self.thumbs.take() {
@@ -3019,6 +3056,11 @@ impl Compositor {
                 self.drop_shadow(back, menu.rect, band, dy, radius);
                 self.stack(back, menu.surface(), menu.rect, band, dy, radius);
             }
+        }
+        if let Some(pop) = self.tray_pop.as_ref() {
+            let r = theme::R_WINDOW * self.scale;
+            self.drop_shadow(back, pop.rect, band, dy, r);
+            self.stack(back, pop.surface(), pop.rect, band, dy, r);
         }
         if let Some(thumbs) = self.thumbs.as_ref() {
             let halo = self.halo() as i32;

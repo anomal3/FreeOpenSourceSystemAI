@@ -61,6 +61,7 @@ pub mod tray;
 pub mod statusbar;
 pub mod term;
 pub mod thumbs;
+pub mod traypop;
 pub mod wallart;
 pub mod window;
 
@@ -2330,6 +2331,11 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         }
     }
 
+    // 0-tray. Окно трея (72h-1).
+    if desktop.tray_pop_kind().is_some() && press_tray_pop(desktop, x, y, status) {
+        return;
+    }
+
     // 0-thumbs. Миниатюры окон над панелью (72e).
     if desktop.thumbs_open() && press_thumbs(desktop, x, y, status) {
         return;
@@ -3474,14 +3480,44 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
 /// Язык переключается щелчком, как в Windows; сеть и часы открывают свой
 /// раздел «Параметров» — ровно тот, а не окно с первого раздела.
 fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
-    match item {
-        TrayItem::Layout => {
-            keymap::toggle_layout();
-            desktop.refresh_panel(status);
-        }
-        TrayItem::Network => open_settings(desktop, Section::Network, status),
-        TrayItem::Clock => open_settings(desktop, Section::Time, status),
+    // Окно трея над значком (72h-1, макет 05); второй щелчок его закрывает.
+    let kind = match item {
+        TrayItem::Layout => traypop::Kind::Layout,
+        TrayItem::Network => traypop::Kind::Network,
+        TrayItem::Clock => traypop::Kind::Calendar,
+    };
+    let was = desktop.tray_pop_kind();
+    desktop.close_tray_pop();
+    if was != Some(kind) && desktop.open_tray_pop(kind, item) {
+        kprintln!("  desktop     : tray popup {kind:?} opened");
     }
+    desktop.refresh_panel(status);
+}
+
+/// Щелчок при открытом окне трея. `true` — щелчок забран.
+fn press_tray_pop(desktop: &mut Compositor, x: i32, y: i32, status: &Status) -> bool {
+    if let Some(action) = desktop.tray_pop_hit(x, y) {
+        desktop.close_tray_pop();
+        match action {
+            traypop::Action::Layout(layout) => {
+                keymap::set_layout(layout);
+                desktop.refresh_panel(status);
+            }
+            traypop::Action::LanguageSettings | traypop::Action::ClockSettings => open_settings(desktop, Section::Time, status),
+            traypop::Action::NetworkSettings => open_settings(desktop, Section::Network, status),
+        }
+        return true;
+    }
+    if desktop.tray_pop_contains(x, y) {
+        return true;
+    }
+    // Щелчок мимо закрывает окно; по значку трея — тоже, и дальше не идёт
+    // (иначе окно открылось бы снова).
+    let on_tray = matches!(desktop.panel_at(x, y), Some(PanelHit::Tray(_)));
+    desktop.close_tray_pop();
+    kprintln!("  desktop     : tray popup closed");
+    desktop.refresh_panel(status);
+    on_tray
 }
 
 /// Открыть «Параметры» на заданном разделе.

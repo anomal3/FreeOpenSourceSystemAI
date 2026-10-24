@@ -617,6 +617,12 @@ impl Panel {
     /// На телефоне это стопка (а пока её нет — «Пуск»), на столе — кнопка окна
     /// на панели задач. `None` — кнопки у окна нет (не поместилась).
     #[must_use]
+    /// Где значок трея `item` на экране (72h-1: над ним — его окно).
+    #[must_use]
+    pub fn tray_rect(&self, item: TrayItem) -> Option<Rect> {
+        self.tray.iter().find(|(known, _)| *known == item).map(|(_, rect)| rect.translate(self.rect.x, self.rect.y))
+    }
+
     pub fn anchor(&self, app: App) -> Option<Rect> {
         let local = if let Some(dock) = self.dock {
             if !dock.stack.is_empty() {
