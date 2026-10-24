@@ -49,6 +49,16 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::arch::Arch;
 
+/// Линейные значки макета в порядке `mini_ui::glyphicon::LINE` — списки
+/// обязаны совпадать.
+const LINE_ICONS: [&str; 39] = [
+    "monitor", "computer", "keyboard", "drive", "user", "package", "update", "service", "clock", "power",
+    "file-text", "info", "network-wired", "open-terminal", "folder", "settings", "process", "device",
+    "drive-system", "usb", "cpu", "shield", "file", "view-tiles", "search", "back", "forward", "up", "ok",
+    "close", "minimize", "maximize", "restore", "chevron-down", "chevron-right", "brightness", "night-light",
+    "camera", "chevron-up",
+];
+
 /// Обои стола: исходник из макета Романа и то, что вшивает ядро.
 const WALLPAPERS: [(&str, &str); 1] = [("fossai-wallpaper-fhd.png", "fossai-1920x1080.qoi")];
 
@@ -696,6 +706,17 @@ fn real_main() -> Result<()> {
                 }
                 println!("{}: {count}", dir.display());
             }
+            // Линейные значки (72i) — маски прозрачности 32×32, по байту на
+            // точку, одним файлом в порядке `mini_ui::glyphicon::LINE`.
+            let line = assets.join("icons").join("line");
+            let mut masks = Vec::new();
+            for name in LINE_ICONS {
+                let (width, height, rgba) = fimg::decode(&std::fs::read(line.join(format!("{name}.png")))?)?;
+                anyhow::ensure!(width == 32 && height == 32, "{name}.png: не 32×32");
+                masks.extend(rgba.chunks_exact(4).map(|px| px[3]));
+            }
+            std::fs::write(line.join("glyphs.bin"), &masks)?;
+            println!("линейные значки: {} → glyphs.bin ({} КиБ)", LINE_ICONS.len(), masks.len() / 1024);
         }
 
         Command::Iso(args) => {

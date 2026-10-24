@@ -466,6 +466,11 @@ pub fn draw(surface: &mut Surface, icon: Icon, x: i32, y: i32, size: u32, color:
     if size == 0 || alpha == 0 {
         return;
     }
+    // С 72i — линейный значок макета, если он есть.
+    if let Some(index) = line_index(icon) {
+        draw_mask(surface, index, x, y, size, color, alpha);
+        return;
+    }
     // Толщина в десятых точки. Единица снизу — не осторожность ради
     // осторожности: значок в две точки шириной дал бы ноль, и штрих исчез бы
     // целиком вместо того, чтобы стать тонким.
@@ -643,4 +648,59 @@ fn sin(angle: u32) -> i32 {
 /// Косинус — тот же синус, сдвинутый на четверть оборота.
 fn cos(angle: u32) -> i32 {
     sin(angle + 64)
+}
+
+// ── Линейные значки макета (фаза 72i) ──────────────────────────────────────
+
+/// Маски 32×32 (байт на точку — прозрачность) линейных значков макета Романа:
+/// `assets/icons/line/glyphs.bin`, собирает `cargo xtask wallpaper`. Порядок —
+/// [`LINE`], тот же, что `LINE_ICONS` в `xtask/src/main.rs`.
+static MASKS: &[u8] = include_bytes!("../../../assets/icons/line/glyphs.bin");
+
+/// Сторона маски.
+const MASK: u32 = 32;
+
+/// Значки набора, у которых есть линейный значок макета, по порядку масок.
+const LINE: [Icon; 39] = [
+    Icon::Display, Icon::Computer, Icon::Keyboard, Icon::Disk, Icon::User, Icon::Package, Icon::Update,
+    Icon::Service, Icon::Clock, Icon::Power, Icon::Log, Icon::Info, Icon::Network, Icon::Terminal, Icon::Folder,
+    Icon::Settings, Icon::Chart, Icon::Devices, Icon::Partition, Icon::Removable, Icon::Pci, Icon::Shield,
+    Icon::File, Icon::Grid, Icon::Search, Icon::Back, Icon::Forward, Icon::Up, Icon::Check, Icon::Close,
+    Icon::Minimize, Icon::Maximize, Icon::Restore, Icon::ChevronDown, Icon::ChevronRight, Icon::Sun, Icon::Moon,
+    Icon::Camera, Icon::ChevronUp,
+];
+
+fn line_index(icon: Icon) -> Option<usize> {
+    let index = LINE.iter().position(|known| *known == icon)?;
+    (MASKS.len() >= (index + 1) * (MASK * MASK) as usize).then_some(index)
+}
+
+/// Нарисовать маску `index` в квадрат `size` цветом `color`: уменьшение —
+/// усреднением по площади, увеличение — ближайшей точкой.
+fn draw_mask(surface: &mut Surface, index: usize, x: i32, y: i32, size: u32, color: Color, alpha: u8) {
+    let mask = &MASKS[index * (MASK * MASK) as usize..(index + 1) * (MASK * MASK) as usize];
+    for ty in 0..size {
+        let sy0 = ty * MASK / size;
+        let sy1 = ((ty + 1) * MASK / size).max(sy0 + 1).min(MASK);
+        for tx in 0..size {
+            let sx0 = tx * MASK / size;
+            let sx1 = ((tx + 1) * MASK / size).max(sx0 + 1).min(MASK);
+            let (mut sum, mut n) = (0u32, 0u32);
+            for sy in sy0..sy1 {
+                for sx in sx0..sx1 {
+                    sum += u32::from(mask[(sy * MASK + sx) as usize]);
+                    n += 1;
+                }
+            }
+            // Мелкий значок светлеет от усреднения тонкого штриха — его
+            // уплотняют, чтобы линия оставалась линией.
+            let cover = sum / n.max(1);
+            let cover = if size < 20 { (cover * 3 / 2).min(255) } else { cover };
+            if cover == 0 {
+                continue;
+            }
+            let a = (cover * u32::from(alpha) / 255) as u8;
+            crate::draw::blend_pixel(surface, x + tx as i32, y + ty as i32, color, a);
+        }
+    }
 }

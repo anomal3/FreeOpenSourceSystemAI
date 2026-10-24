@@ -859,7 +859,7 @@ impl Panel {
             // глобус с крестом читался как «нет сети» и при сети).
             glyphicon::draw(
                 &mut self.surface,
-                Icon::Display,
+                Icon::Network,
                 x,
                 plate.y + (plate.h as i32 - glyph as i32) / 2,
                 glyph,
