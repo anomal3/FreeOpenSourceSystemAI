@@ -1198,6 +1198,7 @@ version = "0.8.0"
 name = "user-progs"
 version = "0.8.0"
 dependencies = [
+ "calendar",
  "clr-vm",
  "fpk",
  "http",

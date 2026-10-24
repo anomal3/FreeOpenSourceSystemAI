@@ -140,6 +140,8 @@ struct Row {
     uid: u32,
     gid: u32,
     size: u64,
+    /// Время изменения, секунды эпохи Unix; ноль — неизвестно.
+    mtime: u32,
     /// Для тома на странице «Этот компьютер» — его файловая система; у
     /// записи каталога пусто. Одна структура на обе страницы: выделение,
     /// клавиши и оба вида списка тогда работают одинаково.
@@ -157,6 +159,7 @@ impl Row {
             uid: entry.uid,
             gid: entry.gid,
             size: entry.size,
+            mtime: entry.mtime,
             volume: String::new(),
         }
     }
@@ -171,6 +174,7 @@ impl Row {
             uid: 0,
             gid: 0,
             size: 0,
+            mtime: 0,
             volume: kind.to_string(),
         }
     }
@@ -199,6 +203,148 @@ impl Row {
             (Icon::File, Tone::Muted, false)
         }
     }
+}
+
+/// Значки файлов, папок и мест из макета Романа (72g, FIMG 64) — те же, что
+/// у стола (`crates/kernel/src/ui/appicon.rs`).
+static FILE_ICONS: [(&str, &[u8]); 39] = [
+    ("doc-archive", include_bytes!("../../../../assets/icons/file/doc-archive.fimg").as_slice()),
+    ("doc-audio", include_bytes!("../../../../assets/icons/file/doc-audio.fimg").as_slice()),
+    ("doc-code", include_bytes!("../../../../assets/icons/file/doc-code.fimg").as_slice()),
+    ("doc-disk-image", include_bytes!("../../../../assets/icons/file/doc-disk-image.fimg").as_slice()),
+    ("doc-document", include_bytes!("../../../../assets/icons/file/doc-document.fimg").as_slice()),
+    ("doc-executable", include_bytes!("../../../../assets/icons/file/doc-executable.fimg").as_slice()),
+    ("doc-font", include_bytes!("../../../../assets/icons/file/doc-font.fimg").as_slice()),
+    ("doc-fpk", include_bytes!("../../../../assets/icons/file/doc-fpk.fimg").as_slice()),
+    ("doc-image", include_bytes!("../../../../assets/icons/file/doc-image.fimg").as_slice()),
+    ("doc-pdf", include_bytes!("../../../../assets/icons/file/doc-pdf.fimg").as_slice()),
+    ("doc-presentation", include_bytes!("../../../../assets/icons/file/doc-presentation.fimg").as_slice()),
+    ("doc-spreadsheet", include_bytes!("../../../../assets/icons/file/doc-spreadsheet.fimg").as_slice()),
+    ("doc-text", include_bytes!("../../../../assets/icons/file/doc-text.fimg").as_slice()),
+    ("doc-unknown", include_bytes!("../../../../assets/icons/file/doc-unknown.fimg").as_slice()),
+    ("doc-video", include_bytes!("../../../../assets/icons/file/doc-video.fimg").as_slice()),
+    ("folder", include_bytes!("../../../../assets/icons/file/folder.fimg").as_slice()),
+    ("folder-desktop", include_bytes!("../../../../assets/icons/file/folder-desktop.fimg").as_slice()),
+    ("folder-documents", include_bytes!("../../../../assets/icons/file/folder-documents.fimg").as_slice()),
+    ("folder-downloads", include_bytes!("../../../../assets/icons/file/folder-downloads.fimg").as_slice()),
+    ("folder-empty", include_bytes!("../../../../assets/icons/file/folder-empty.fimg").as_slice()),
+    ("folder-full", include_bytes!("../../../../assets/icons/file/folder-full.fimg").as_slice()),
+    ("folder-music", include_bytes!("../../../../assets/icons/file/folder-music.fimg").as_slice()),
+    ("folder-open", include_bytes!("../../../../assets/icons/file/folder-open.fimg").as_slice()),
+    ("folder-pictures", include_bytes!("../../../../assets/icons/file/folder-pictures.fimg").as_slice()),
+    ("folder-videos", include_bytes!("../../../../assets/icons/file/folder-videos.fimg").as_slice()),
+    ("overlay-error", include_bytes!("../../../../assets/icons/file/overlay-error.fimg").as_slice()),
+    ("overlay-lock", include_bytes!("../../../../assets/icons/file/overlay-lock.fimg").as_slice()),
+    ("overlay-shared", include_bytes!("../../../../assets/icons/file/overlay-shared.fimg").as_slice()),
+    ("overlay-shortcut-arrow", include_bytes!("../../../../assets/icons/file/overlay-shortcut-arrow.fimg").as_slice()),
+    ("overlay-sync", include_bytes!("../../../../assets/icons/file/overlay-sync.fimg").as_slice()),
+    ("place-external-drive", include_bytes!("../../../../assets/icons/file/place-external-drive.fimg").as_slice()),
+    ("place-local-disk", include_bytes!("../../../../assets/icons/file/place-local-disk.fimg").as_slice()),
+    ("place-network-folder", include_bytes!("../../../../assets/icons/file/place-network-folder.fimg").as_slice()),
+    ("place-optical", include_bytes!("../../../../assets/icons/file/place-optical.fimg").as_slice()),
+    ("place-system-disk", include_bytes!("../../../../assets/icons/file/place-system-disk.fimg").as_slice()),
+    ("place-this-pc", include_bytes!("../../../../assets/icons/file/place-this-pc.fimg").as_slice()),
+    ("place-trash-empty", include_bytes!("../../../../assets/icons/file/place-trash-empty.fimg").as_slice()),
+    ("place-trash-full", include_bytes!("../../../../assets/icons/file/place-trash-full.fimg").as_slice()),
+    ("place-usb-stick", include_bytes!("../../../../assets/icons/file/place-usb-stick.fimg").as_slice()),
+];
+
+/// Разобранные значки: имя и картинка. Разбираются при первом показе.
+type IconCache = core::cell::RefCell<Vec<(&'static str, Option<mini_ui::image::Image>)>>;
+
+/// Нарисовать значок макета `name` в `rect`. `false` — такого нет.
+fn draw_design_icon(cache: &IconCache, s: &mut Surface, rect: Rect, name: &str) -> bool {
+    let mut cache = cache.borrow_mut();
+    if !cache.iter().any(|(known, _)| *known == name) {
+        let Some((known, bytes)) = FILE_ICONS.iter().find(|(known, _)| *known == name) else {
+            return false;
+        };
+        cache.push((known, mini_ui::image::Image::parse(bytes)));
+    }
+    match cache.iter().find(|(known, _)| *known == name) {
+        Some((_, Some(image))) => {
+            image.draw(s, rect);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Значок и тип файла по имени, как в Проводнике.
+fn file_kind(name: &str, directory: bool) -> (&'static str, &'static str) {
+    if directory {
+        return (
+            match name {
+                "Desktop" | "Рабочий стол" => "folder-desktop",
+                "Documents" | "Документы" => "folder-documents",
+                "Downloads" | "Загрузки" => "folder-downloads",
+                "Music" | "Музыка" => "folder-music",
+                "Pictures" | "Изображения" => "folder-pictures",
+                "Videos" | "Видео" => "folder-videos",
+                _ => "folder",
+            },
+            "Папка с файлами",
+        );
+    }
+    let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "txt" | "log" | "md" | "cfg" | "conf" | "ini" => ("doc-text", "Текстовый документ"),
+        "doc" | "docx" | "odt" | "rtf" => ("doc-document", "Документ"),
+        "xls" | "xlsx" | "ods" | "csv" => ("doc-spreadsheet", "Электронная таблица"),
+        "ppt" | "pptx" | "odp" => ("doc-presentation", "Презентация"),
+        "pdf" => ("doc-pdf", "Документ PDF"),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "fimg" | "qoi" => ("doc-image", "Изображение"),
+        "mp4" | "mkv" | "avi" | "webm" | "mov" => ("doc-video", "Видео"),
+        "mp3" | "wav" | "ogg" | "flac" => ("doc-audio", "Звук"),
+        "zip" | "tar" | "gz" | "xz" | "7z" | "rar" | "deb" => ("doc-archive", "Архив"),
+        "rs" | "c" | "h" | "cpp" | "py" | "js" | "lua" | "cs" | "sh" | "html" | "css" | "json" => ("doc-code", "Исходный код"),
+        "exe" | "dll" | "elf" => ("doc-executable", "Приложение"),
+        "fpk" => ("doc-fpk", "Пакет FossAi"),
+        "img" | "iso" | "vdi" => ("doc-disk-image", "Образ диска"),
+        "ttf" | "otf" => ("doc-font", "Шрифт"),
+        _ => ("doc-unknown", "Файл"),
+    }
+}
+
+/// Размер по-человечески: «48 КБ», «1,2 МБ».
+fn human_size(bytes: u64) -> String {
+    const K: u64 = 1024;
+    if bytes < K {
+        format!("{bytes} Б")
+    } else if bytes < K * K {
+        format!("{} КБ", bytes.div_ceil(K))
+    } else if bytes < K * K * K {
+        let tenths = bytes * 10 / (K * K);
+        if tenths < 100 { format!("{},{} МБ", tenths / 10, tenths % 10) } else { format!("{} МБ", tenths / 10) }
+    } else {
+        let tenths = bytes * 10 / (K * K * K);
+        format!("{},{} ГБ", tenths / 10, tenths % 10)
+    }
+}
+
+/// Смещение местного времени, минуты (из `/etc/system.cfg`, как у ядра).
+fn local_offset() -> i32 {
+    let fd = open("/etc/system.cfg");
+    if fd < 0 {
+        return 0;
+    }
+    let mut buffer = [0u8; 2048];
+    let got = read(fd, &mut buffer);
+    close(fd);
+    if got <= 0 {
+        return 0;
+    }
+    let text = core::str::from_utf8(&buffer[..got as usize]).unwrap_or("");
+    sysconf::value(text, "timezone").and_then(sysconf::parse_offset).unwrap_or(0)
+}
+
+/// «дд.мм.гггг чч:мм»; ноль — пусто.
+fn date_text(mtime: u32, offset: i32) -> String {
+    if mtime == 0 {
+        return String::new();
+    }
+    let local = calendar::DateTime::from_unix(i64::from(mtime) + i64::from(offset) * 60);
+    format!("{:02}.{:02}.{} {:02}:{:02}", local.day, local.month, local.year, local.hour, local.minute)
 }
 
 /// Просмотр файла.
@@ -363,6 +509,10 @@ struct Files {
     /// Ответ последнего действия — в строке состояния, пока не будет
     /// следующего действия.
     note: Option<String>,
+    /// Значки макета (72g).
+    icons: IconCache,
+    /// Смещение местного времени для дат, минуты.
+    offset: i32,
 }
 
 impl Files {
@@ -383,6 +533,8 @@ impl Files {
             menu: None,
             props: None,
             note: None,
+            icons: IconCache::default(),
+            offset: local_offset(),
         };
         view.reload();
         view
@@ -1580,11 +1732,11 @@ impl Files {
         s.fill(side, ctx.flat(p.panel));
         draw::vline(s, side.right() - 1, side.y, side.h, p.line.color, p.line.alpha);
         let inner = ctx.on(theme::panel_bg());
-        let pad = ctx.px(12);
+        let pad = ctx.px(10);
 
         for slot in place_slots(inner, side, &self.home) {
-            if let Some(head) = slot.head {
-                paint::caps(inner, s, side.x + ctx.px(16) as i32, slot.head_y, head);
+            if slot.head.is_some() {
+                draw::hline(s, slot.rect.x, slot.head_y + ctx.px(6) as i32, slot.rect.w, p.line2.color, p.line2.alpha);
             }
             let state = if slot.path == self.path {
                 RowState::Selected
@@ -1592,44 +1744,46 @@ impl Files {
                 RowState::Idle
             };
             paint::row(inner, s, slot.rect, state);
-            // В боковой колонке подпись уместна больше всего: это ровно те
-            // места, у которых знакомое имя есть, и человек ищет их глазами, а
-            // не читает путь.
-            let shown = place_label(&slot.path, self.friendly);
+            let side_icon = ctx.px(18);
+            let icon = Rect::new(slot.rect.x + pad as i32, slot.rect.y + (slot.rect.h as i32 - side_icon as i32) / 2, side_icon, side_icon);
+            draw_design_icon(&self.icons, s, icon, place_icon(&slot.path, &self.home));
+            let shown = place_title(&slot.path, &self.home);
+            let x = icon.right() + ctx.px(10) as i32;
             paint::text_clipped(
                 inner,
                 s,
-                Role::Mono,
-                slot.rect.x + pad as i32,
-                paint::baseline(inner, Role::Mono, slot.rect),
-                slot.rect.w.saturating_sub(pad * 2),
+                Role::Body,
+                x,
+                paint::baseline(inner, Role::Body, slot.rect),
+                (slot.rect.right() - x - pad as i32).max(0) as u32,
                 shown,
                 paint::row_ink(inner, state),
             );
         }
     }
 
-    /// Список файлов: заголовок столбцов и строки.
+    /// Список файлов (72g, макет 14): «Имя», «Дата изменения», «Тип»,
+    /// «Размер»; значки — из макета, по типу файла.
     fn draw_list(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
         let p = ctx.palette;
         if plan.list.is_empty() {
             return;
         }
+        // Столбцы справа налево: размер, тип, дата. На узком окне — только
+        // размер.
+        let wide = plan.list.w > ctx.px(560);
+        let size_right = plan.list.right() - ctx.px(16) as i32;
+        let type_x = size_right - ctx.px(80 + 140) as i32;
+        let date_x = type_x - ctx.px(135) as i32;
 
         if !plan.header.is_empty() {
-            let x = plan.header.x + ctx.px(24) as i32;
-            let y = paint::baseline(ctx, Role::MonoCaps, plan.header);
-            paint::caps(ctx, s, x, y, "ИМЯ");
-            let tail = ctx
-                .face(Role::MonoCaps)
-                .width_tracked("РАЗМЕР", theme::CAPS_TRACKING * ctx.scale);
-            paint::caps(
-                ctx,
-                s,
-                plan.header.right() - ctx.px(22) as i32 - tail as i32,
-                y,
-                "РАЗМЕР",
-            );
+            let y = paint::baseline(ctx, Role::Caption, plan.header);
+            paint::text(ctx, s, Role::Caption, plan.header.x + ctx.px(18) as i32, y, "Имя", p.ink4);
+            if wide {
+                paint::text(ctx, s, Role::Caption, date_x, y, "Дата изменения", p.ink4);
+                paint::text(ctx, s, Role::Caption, type_x, y, "Тип", p.ink4);
+            }
+            paint::text_right(ctx, s, Role::Caption, size_right, y, "Размер", p.ink4);
             draw::hline(
                 s,
                 plan.header.x + ctx.px(12) as i32,
@@ -1668,8 +1822,8 @@ impl Files {
                 rect.x + ctx.px(10) as i32,
                 paint::baseline(ctx, Role::Body, rect),
                 rect.w.saturating_sub(ctx.px(20)),
-                "Пусто",
-                p.ink5,
+                "Эта папка пуста",
+                p.ink4,
             );
             return;
         }
@@ -1683,59 +1837,45 @@ impl Files {
             let state = if selected { RowState::Selected } else { RowState::Idle };
             paint::row(ctx, s, rect, state);
 
-            let tile_side = ctx.px(26);
-            let tile = Rect::new(
-                rect.x + ctx.px(6) as i32,
-                rect.y + (rect.h as i32 - tile_side as i32) / 2,
-                tile_side,
-                tile_side,
-            );
-            let (icon, tone, filled) = row.icon();
-            paint::icon_tile(ctx, s, tile, icon, tone, filled);
+            let side = ctx.px(18);
+            let icon = Rect::new(rect.x + ctx.px(8) as i32, rect.y + (rect.h as i32 - side as i32) / 2, side, side);
+            let (kind_icon, kind_name) = if row.is_volume() {
+                (if row.name == "/" { "place-system-disk" } else if row.name.starts_with("/usb") { "place-usb-stick" } else { "place-local-disk" }, "Диск")
+            } else {
+                file_kind(&row.name, row.directory)
+            };
+            if !draw_design_icon(&self.icons, s, icon, kind_icon) {
+                let (glyph, tone, filled) = row.icon();
+                paint::icon_tile(ctx, s, icon, glyph, tone, filled);
+            }
 
-            // Размер и права прижаты к правому краю: выровненные по левому краю
-            // случайной длины имени, столбцы чисел не читаются вовсе.
-            let mut right = rect.right() - ctx.px(10) as i32;
-            let small = paint::baseline(ctx, Role::MonoSmall, rect);
+            let small = paint::baseline(ctx, Role::Body, rect);
             let size = if row.is_volume() {
                 row.volume.clone()
             } else if row.directory {
-                String::from("—")
+                String::new()
             } else {
-                size_text(row.size)
+                human_size(row.size)
             };
-            paint::text_right(ctx, s, Role::MonoSmall, right, small, &size, p.ink4);
-            right -= ctx.px(76) as i32;
-            if rect.w > ctx.px(360) && !row.is_volume() {
-                let meta = format!("{:04o} {}:{}", row.mode & 0o7777, row.uid, row.gid);
-                paint::text_right(ctx, s, Role::MonoSmall, right, small, &meta, p.ink4);
-                right -= ctx.px(120) as i32;
+            paint::text_right(ctx, s, Role::Body, size_right, small, &size, p.ink3);
+            let mut right = size_right - ctx.px(90) as i32;
+            if wide {
+                // Программа в `/bin` — «Приложение», что бы ни было в имени.
+                let kind = if !row.directory && row.program && row.mode & 0o111 != 0 { "Приложение" } else { kind_name };
+                paint::text_clipped(ctx, s, Role::Body, type_x, small, (size_right - ctx.px(90) as i32 - type_x).max(0) as u32, kind, p.ink3);
+                paint::text_clipped(ctx, s, Role::Body, date_x, small, ctx.px(140), &date_text(row.mtime, self.offset), p.ink3);
+                right = date_x - ctx.px(12) as i32;
             }
 
-            let name_x = tile.right() + ctx.px(10) as i32;
+            let name_x = icon.right() + ctx.px(10) as i32;
             let room = (right - name_x).max(0) as u32;
-            let (role, ink) = if selected {
-                (Role::Title, p.ink)
-            } else if row.directory {
-                (Role::Label, p.ink2)
-            } else {
-                (Role::Body, p.ink3)
-            };
+            let ink = if selected { p.ink } else { p.ink2 };
             let shown = if row.is_volume() {
                 volume_title(&row.name)
             } else {
                 self.shown_name(row).to_string()
             };
-            paint::text_clipped(
-                ctx,
-                s,
-                role,
-                name_x,
-                paint::baseline(ctx, role, rect),
-                room,
-                &shown,
-                ink,
-            );
+            paint::text_clipped(ctx, s, Role::Body, name_x, small, room, &shown, ink);
         }
         if self.on_computer() {
             let grid = Grid {
@@ -1810,11 +1950,15 @@ impl Files {
         } else if self.on_computer() {
             format!("{} томов    двойной щелчок — открыть    правая кнопка — меню", self.rows.len())
         } else {
-            format!(
-                "{} объектов    двойной щелчок — открыть    правая кнопка — меню    Backspace — вверх    V — {}",
-                self.rows.len(),
-                if self.friendly { "настоящие имена" } else { "знакомый вид" }
-            )
+            // Как в Проводнике (72g): число объектов и выбранное с размером.
+            let mut text = format!("{} объектов", self.rows.len());
+            if let Some(row) = self.rows.get(self.selected) {
+                text.push_str("  |  Выбрано: 1");
+                if !row.directory {
+                    text.push_str(&format!("  {}", human_size(row.size)));
+                }
+            }
+            text
         };
         kit::status_bar(ctx, s, plan.status, &text);
     }
@@ -2065,33 +2209,56 @@ struct PlaceSlot {
 /// Список короткий и составлен из того, что в системе точно есть: «Этот
 /// компьютер», корень, дом, стол и два системных каталога. Закладок человек
 /// пока не заводит — заводить их некуда, файла настроек у стола нет.
-fn places(home: &str) -> [(Option<&'static str>, String); 6] {
-    [
-        (Some("МЕСТА"), String::from(COMPUTER)),
-        (None, String::from("/")),
-        (None, home.to_string()),
-        (None, format!("{home}/Desktop")),
-        (Some("СИСТЕМА"), String::from("/bin")),
-        (None, String::from("/etc")),
-    ]
+fn places(home: &str) -> Vec<(Option<&'static str>, String)> {
+    // Как в Проводнике (72g, макет 14): дом и его папки, черта, «Этот
+    // компьютер» и диски. Папка дома показывается, только если она есть.
+    let mut out = alloc::vec![(None, home.to_string())];
+    for name in ["Desktop", "Downloads", "Documents", "Pictures", "Music", "Videos"] {
+        let path = format!("{home}/{name}");
+        let mut info = Stat::default();
+        if stat(&path, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
+            out.push((None, path));
+        }
+    }
+    out.push((Some("—"), String::from(COMPUTER)));
+    out.push((None, String::from("/")));
+    let mut info = Stat::default();
+    if stat("/usb", &mut info) >= 0 && info.kind == KIND_DIRECTORY {
+        out.push((None, String::from("/usb")));
+    }
+    out
 }
 
-/// Как называется место в боковой колонке.
-///
-/// Корень здесь — «Локальный диск (C:)», а не «Этот компьютер»: тем именем
-/// подписана страница томов строкой выше, и два одинаковых имени подряд
-/// читались бы как одно место, нарисованное дважды.
-fn place_label(path: &str, friendly: bool) -> &str {
-    if path == COMPUTER {
-        return "Этот компьютер";
+/// Подпись места в боковой колонке (72g).
+fn place_title<'a>(path: &'a str, home: &str) -> &'a str {
+    if path == home {
+        return "Главная";
     }
-    if !friendly {
-        return path;
+    match path.rsplit('/').next().unwrap_or(path) {
+        _ if path == COMPUTER => "Этот компьютер",
+        _ if path == "/" => "Системный диск",
+        _ if path == "/usb" => "USB-накопитель",
+        "Desktop" => "Рабочий стол",
+        "Downloads" => "Загрузки",
+        "Documents" => "Документы",
+        "Pictures" => "Изображения",
+        "Music" => "Музыка",
+        "Videos" => "Видео",
+        _ => path,
     }
-    if path == "/" {
-        return "Локальный диск (C:)";
+}
+
+/// Значок места в боковой колонке (72g).
+fn place_icon(path: &str, home: &str) -> &'static str {
+    if path == home {
+        return "folder";
     }
-    sysconf::winpath::label(path).unwrap_or(path)
+    match path {
+        COMPUTER => "place-this-pc",
+        "/" => "place-system-disk",
+        "/usb" => "place-usb-stick",
+        _ => file_kind(path.rsplit('/').next().unwrap_or(path), true).0,
+    }
 }
 
 /// Имя тома на странице «Этот компьютер».
@@ -2152,7 +2319,7 @@ fn place_slots(ctx: Ctx, side: Rect, home: &str) -> Vec<PlaceSlot> {
     let padx = ctx.px(16);
     let row_h = ctx.px(32);
     let gap = ctx.px(2);
-    let caps_h = u32::from(ctx.face(Role::MonoCaps).line) + ctx.px(12);
+    let caps_h = ctx.px(14);
     let mut y = side.y + ctx.px(10) as i32;
     let mut out = Vec::new();
 
@@ -2202,16 +2369,6 @@ fn parent_of(path: &str) -> String {
     }
 }
 
-/// Размер в виде, который читается с одного взгляда.
-fn size_text(bytes: u64) -> String {
-    if bytes < 10 * 1024 {
-        format!("{bytes}")
-    } else if bytes < 10 * 1024 * 1024 {
-        format!("{}K", bytes / 1024)
-    } else {
-        format!("{}M", bytes / (1024 * 1024))
-    }
-}
 
 /// Прочитать каталог. Возвращает строки и сколько записей не поместилось.
 ///
