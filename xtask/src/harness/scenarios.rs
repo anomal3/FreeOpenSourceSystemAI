@@ -4974,6 +4974,22 @@ pub const ALL: &[Scenario] = &[
             // сценария, то есть сотни обращений к диску.
             Step::Line("irq virtio-blk"),
             Step::Await("virtio-blk woke the system", 15_000),
+            // Экран блокировки (72h-4, макет 20): Win+L, любая клавиша —
+            // карточка входа; чужой пароль не пускает, пароль установки
+            // («freeos») — пускает.
+            Step::Key("meta_l-l"),
+            Step::Await("desktop     : locked", 15_000),
+            Step::Wait(1_500),
+            Step::Shot("lock"),
+            Step::Key("spc"),
+            Step::Type("wrong"),
+            Step::Key("ret"),
+            Step::Await("desktop     : wrong password", 15_000),
+            Step::Type("freeos"),
+            Step::Wait(500),
+            Step::Shot("login"),
+            Step::Key("ret"),
+            Step::Await("desktop     : unlocked", 15_000),
             Step::Line("exit"),
             Step::Await("finishing the session", 15_000),
             Step::Absent("KERNEL PANIC"),

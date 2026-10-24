@@ -47,6 +47,7 @@ pub mod compositor;
 pub mod context;
 pub mod dialog;
 pub mod icons;
+pub mod lock;
 pub mod panel;
 pub mod powersheet;
 pub mod pointer;
@@ -1455,6 +1456,7 @@ pub fn tick() {
         desktop.refresh_panel(&status);
         desktop.reload_icons_if_packages_changed();
         desktop.expire_toast();
+        desktop.refresh_lock_clock();
         desktop.present();
     });
 }
@@ -1579,6 +1581,25 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         desktop.refresh_panel(status);
         return None;
     }
+    // Экран блокировки (72h-4) забирает все клавиши.
+    if desktop.locked() {
+        if event.pressed {
+            let outcome = desktop.lock_key(
+                keymap::char_for(event),
+                event.code == KeyCode::Enter,
+                event.code == KeyCode::Backspace,
+                event.code == KeyCode::Escape,
+            );
+            if outcome == lock::Outcome::Unlock {
+                kprintln!("  desktop     : unlocked");
+                desktop.refresh_panel(status);
+            } else if desktop.locked() && event.code == KeyCode::Enter {
+                kprintln!("  desktop     : wrong password");
+            }
+        }
+        return None;
+    }
+
     // Alt+Shift — раскладка, и раньше всего остального: сочетание из двух
     // модификаторов не значит ничего ни для меню, ни для окна, а трей обязан
     // показать новую раскладку в том же кадре.
@@ -1636,6 +1657,12 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
         // не через каждый эмулятор, а стол без меню — это набор окон.
         KeyCode::F1 => {
             toggle_menu(desktop, status);
+            return None;
+        }
+        // Win+L — заблокировать, как в Windows (72h-4).
+        KeyCode::L if event.mods.contains(Modifiers::META) => {
+            desktop.lock_screen();
+            kprintln!("  desktop     : locked");
             return None;
         }
         // Alt+Tab по кругу поднимает окна. До фазы N7h это делал голый Tab, и
@@ -2331,6 +2358,17 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
             }
             return;
         }
+    }
+
+    // 0-lock. Экран блокировки (72h-4) забирает щелчок.
+    if desktop.locked() {
+        // Кнопка питания на экране блокировки выключает сразу, как в
+        // Windows: выключить машину вправе и тот, кто пароля не знает.
+        if desktop.lock_click(x, y) == lock::Outcome::Power {
+            kprintln!("  desktop     : shutdown from the lock screen");
+            crate::power::request(false, crate::power::Source::Desktop);
+        }
+        return;
     }
 
     // 0-toast. Уведомление (72h-2): «Открыть» запускает программу.

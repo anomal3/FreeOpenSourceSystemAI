@@ -219,6 +219,8 @@ pub struct Compositor {
     thumbs: Option<super::thumbs::Thumbs>,
     /// Окно трея (72h-1).
     tray_pop: Option<super::traypop::TrayPop>,
+    /// Экран блокировки (72h-4) и его готовая картинка во весь экран.
+    lock: Option<(super::lock::Lock, Surface)>,
     /// Уведомление (72h-2) и пакеты, о которых стол уже знает.
     toast: Option<super::toast::Toast>,
     known_packages: Option<Vec<alloc::string::String>>,
@@ -336,6 +338,7 @@ impl Compositor {
             tray_pop: None,
             toast: None,
             known_packages: None,
+            lock: None,
             reported_focus: None,
             held_keys: [None; 8],
             captured: None,
@@ -1173,6 +1176,74 @@ impl Compositor {
             }
             self.known_packages = Some(packages.into_iter().map(|launcher| launcher.name).collect());
         }
+    }
+
+    /// Закрыть стол экраном блокировки (Win+L).
+    pub fn lock_screen(&mut self) {
+        if self.lock.is_some() {
+            return;
+        }
+        let (w, h) = (self.screen.width(), self.screen.height());
+        let Some(surface) = Surface::new(w, h, theme::palette().wall_top) else {
+            return;
+        };
+        self.lock = Some((super::lock::Lock::new(), surface));
+        self.redraw_lock();
+    }
+
+    /// Перерисовать экран блокировки: обои и то, что поверх.
+    pub fn redraw_lock(&mut self) {
+        let Some((mut lock, mut surface)) = self.lock.take() else {
+            return;
+        };
+        let full = surface.bounds();
+        self.draw_background(&mut surface, full, 0);
+        lock.draw(&mut surface, self.scale);
+        self.lock = Some((lock, surface));
+        self.repaint_all();
+    }
+
+    #[must_use]
+    pub fn locked(&self) -> bool {
+        self.lock.is_some()
+    }
+
+    /// Часы на экране блокировки устарели — перерисовать.
+    pub fn refresh_lock_clock(&mut self) {
+        let stale = self.lock.as_ref().is_some_and(|(lock, _)| lock.shown_clock != crate::time::clock_text().unwrap_or_default());
+        if stale {
+            self.redraw_lock();
+        }
+    }
+
+    /// Клавиша на экране блокировки.
+    pub fn lock_key(&mut self, ch: Option<char>, enter: bool, backspace: bool, escape: bool) -> super::lock::Outcome {
+        let Some((lock, _)) = self.lock.as_mut() else {
+            return super::lock::Outcome::Nothing;
+        };
+        let outcome = lock.key(ch, enter, backspace, escape);
+        self.after_lock(outcome)
+    }
+
+    /// Щелчок на экране блокировки.
+    pub fn lock_click(&mut self, x: i32, y: i32) -> super::lock::Outcome {
+        let Some((lock, _)) = self.lock.as_mut() else {
+            return super::lock::Outcome::Nothing;
+        };
+        let outcome = lock.click(x, y);
+        self.after_lock(outcome)
+    }
+
+    fn after_lock(&mut self, outcome: super::lock::Outcome) -> super::lock::Outcome {
+        match outcome {
+            super::lock::Outcome::Redraw => self.redraw_lock(),
+            super::lock::Outcome::Unlock => {
+                self.lock = None;
+                self.repaint_all();
+            }
+            _ => {}
+        }
+        outcome
     }
 
     /// Убрать уведомление; вернуть, что оно запускало бы.
@@ -2972,6 +3043,14 @@ impl Compositor {
     /// тень окна ложится на всё, что ниже него, и не задевает то, что выше.
     fn compose_band(&self, back: &mut Surface, band: Rect) {
         let dy = -band.y;
+        // Экран блокировки закрывает всё; поверх — только указатель.
+        if let Some((_, picture)) = self.lock.as_ref() {
+            back.blit_from(picture, (band.x, band.y + dy), band);
+            if !theme::is_mobile() && !self.hw_cursor {
+                self.pointer.draw(back, dy);
+            }
+            return;
+        }
         let radius = theme::R_WINDOW * self.scale;
         // Разложение сборки по слоям. Общее число уже сказало, что виновата
         // сборка, а не вывод; теперь надо знать, какой её кусок, — иначе

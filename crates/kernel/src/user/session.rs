@@ -142,3 +142,58 @@ fn parse_line(line: &str) -> Option<Account<'_>> {
 
     Some(Account { name, uid, gid })
 }
+
+/// Проверить пароль того, от чьего имени идёт сеанс (экран блокировки, фаза
+/// 72h-4). `None` — пароля у учётной записи нет (живая система, `root`) или
+/// файла нет: тогда спрашивать нечего.
+///
+/// Отпечаток — тот, что пишет установщик (`crates/installer/src/account.rs`):
+/// соль и многократный FNV-1a, алгоритм в строке, `fnv1a64-<раунды>`. Это не
+/// KDF и от подбора не защищает; экран блокировки защищает ровно от того,
+/// от чего защищает отпечаток, — от случайного прохожего.
+#[must_use]
+pub fn verify_password(password: &str) -> Option<bool> {
+    let (bytes, _) = config::read(PASSWD, PASSWD_LIMIT)?;
+    let text = core::str::from_utf8(&bytes).ok()?;
+    let name = with_name(|name| alloc::string::String::from(name));
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let fields: alloc::vec::Vec<&str> = line.split(':').collect();
+        if fields.len() < 8 || fields[0] != name {
+            continue;
+        }
+        let rounds = fields[5].strip_prefix("fnv1a64-")?.parse::<u32>().ok()?;
+        let salt = u64::from_str_radix(fields[6], 16).ok()?;
+        let digest = u64::from_str_radix(fields[7], 16).ok()?;
+        return Some(derive(password, salt, rounds) == digest);
+    }
+    None
+}
+
+/// Многократный прогон хеша — тот же, что у установщика.
+fn derive(password: &str, salt: u64, rounds: u32) -> u64 {
+    let mut state = salt;
+    for round in 0..rounds {
+        state = mix(state ^ hash_bytes(password.as_bytes()));
+        state = mix(state ^ u64::from(round));
+    }
+    state
+}
+
+/// FNV-1a, 64 бита.
+fn hash_bytes(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Финализатор SplitMix64.
+const fn mix(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
