@@ -621,8 +621,12 @@ fn dock(pass: &mut Pass, x: i32, y: i32, w: u32) {
     y = row(pass, x, y, w, Some(Fi::Clock), "Показывать аптайм", "Время и время работы отвечают на разные вопросы", Ctl::Toggle(uptime), Some(Deed::Panel(PanelPref::Uptime, !uptime)));
     let date = super::super::panel::shows(PanelPref::Date);
     y = row(pass, x, y, w, Some(Fi::Calendar), "Показывать дату", "", Ctl::Toggle(date), Some(Deed::Panel(PanelPref::Date, !date)));
-    y = pass.group(x, y, w, "Поведение");
-    y = row(pass, x, y, w, Some(Fi::Dock), "Вид", "Плашка над обоями, кнопки окон с подписями", Ctl::Value("Панель задач"), None);
+    // Как «Объединять кнопки панели задач» в Windows 11: значок на программу
+    // (окна стопкой) или кнопка с подписью на каждое окно.
+    y = pass.group(x, y, w, "Кнопки окон");
+    let labels = super::super::panel::shows(PanelPref::Labels);
+    y = row(pass, x, y, w, Some(Fi::Dock), "Только значки", "Окна одной программы — в одной кнопке, как в Windows 11", Ctl::Radio(!labels), Some(Deed::Panel(PanelPref::Labels, false)));
+    y = row(pass, x, y, w, Some(Fi::Dock), "Значки и подписи", "Кнопка с названием на каждое окно", Ctl::Radio(labels), Some(Deed::Panel(PanelPref::Labels, true)));
     row(pass, x, y, w, Some(Fi::Keyboard), "Раскладка в трее", "Щелчок переключает, как Alt+Shift", Ctl::Value("Показывается"), None);
 }
 

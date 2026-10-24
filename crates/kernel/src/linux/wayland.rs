@@ -485,6 +485,8 @@ struct Client {
     /// Нажатые модификаторы и включённые замки (маски `MOD_*`).
     mods_down: u32,
     mods_locked: u32,
+    /// Нажатые клавиши (коды evdev): повтор ядра отличается от нажатия.
+    keys_down: Vec<u32>,
     seat_version: u32,
     broken: bool,
 }
@@ -512,6 +514,7 @@ impl Client {
             keyboard_on: None,
             mods_down: 0,
             mods_locked: 0,
+            keys_down: Vec::new(),
             seat_version: 1,
             broken: false,
         }
@@ -1364,6 +1367,23 @@ impl Client {
                             self.keyboard_enter(surface);
                         }
                         let (code, pressed) = (event.code, event.x != 0);
+                        let held = self.keys_down.contains(&code);
+                        if pressed && held {
+                            // Повтор ядра: для клиента — отпустили и нажали.
+                            self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 3).u32(serial).u32(time).u32(code).u32(0));
+                        }
+                        if !pressed && !held {
+                            // Отпускание клавиши, нажатой до фокуса, — клиенту
+                            // оно ни к чему.
+                            continue;
+                        }
+                        if pressed {
+                            if !held {
+                                self.keys_down.push(code);
+                            }
+                        } else {
+                            self.keys_down.retain(|key| *key != code);
+                        }
                         let state = u32::from(pressed);
                         self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 3).u32(serial).u32(time).u32(code).u32(state));
                         self.key_modifiers(code, pressed);
@@ -1432,8 +1452,13 @@ impl Client {
         }
         self.out_fds.push(Handle::of_node(node, false));
         self.send(Msg::new(keyboard, 0).u32(KEYMAP_XKB_V1).u32(text.len() as u32));
+        // Повтора у клиента нет (частота 0): зажатую клавишу повторяет ядро,
+        // как typematic PS/2, а сервер шлёт повтор отпусканием и нажатием.
+        // Повтор клиента считает от его собственного таймера, и медленный
+        // клиент (Chromium под эмулятором) успевал «дожать» букву два-двенадцать
+        // раз, прежде чем прочитать отпускание.
         if self.seat_version >= 4 {
-            self.send(Msg::new(keyboard, 5).i32(25).i32(600));
+            self.send(Msg::new(keyboard, 5).i32(0).i32(600));
         }
         if let Some(surface) = self.keyboard_on {
             let serial = self.next_serial();
@@ -1448,6 +1473,7 @@ impl Client {
         }
         self.keyboard_on = Some(surface);
         self.mods_down = 0;
+        self.keys_down.clear();
         let locked = self.mods_locked;
         self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 1).u32(serial).u32(surface).bytes(&[]));
         self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 4).u32(serial).u32(0).u32(0).u32(locked).u32(0));

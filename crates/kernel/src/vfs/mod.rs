@@ -243,6 +243,13 @@ pub trait Node: Send + Sync {
 
     /// Разделяемая память за файлом (фаза 71e: `memfd`, `/dev/shm`) — её
     /// `mmap(MAP_SHARED)` отображает общими кадрами. У обычного файла — нет.
+    /// Чем файл узнаётся в кэше страниц (`mm::pagecache`): том и номер
+    /// файла на нём. `None` — страницы этого файла не кэшируются (у ФС нет
+    /// постоянного номера файла или она не сообщает о записи в него).
+    fn cache_key(&self) -> Option<(usize, u64)> {
+        None
+    }
+
     fn shared_memory(&self) -> Option<alloc::sync::Arc<crate::user::shm::SharedMem>> {
         None
     }

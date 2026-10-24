@@ -328,6 +328,11 @@ pub struct Window {
     /// Где в текстовом окне нажали левую кнопку — начало выделения мышью
     /// (терминал T5): сквозная строка и столбец сетки.
     select_from: Option<(u64, u32)>,
+    /// Значок программы окна (у окон ядра — `None`: значок даёт [`App`]).
+    pub art: Option<super::appicon::Art>,
+    /// По чему окна складываются в одну кнопку панели задач: путь программы.
+    /// Пусто — окно ядра, группа по [`App`].
+    pub group: String,
 }
 
 /// Наименьший размер окна в пикселях.
@@ -467,6 +472,8 @@ impl Window {
             raw_keys: false,
             frameless: false,
             select_from: None,
+            art: None,
+            group: String::new(),
         }
     }
 
@@ -671,12 +678,23 @@ impl Window {
         if !self.rect.contains(x, y) {
             return None;
         }
-        // У всплывающего окна и окна без рамки нет ни заголовка, ни кнопок,
-        // ни уголка: всё окно — содержимое.
+        let local = (x - self.rect.x, y - self.rect.y);
+        // У окна без рамки (Chromium) заголовок и кнопки рисует программа, а
+        // тянуть за край ей нечем: тень с краем, за который тянут в Linux,
+        // лежит за пределами окна, и стол её срезает. Уголок размера —
+        // невидимый, полоса в несколько точек у правого нижнего угла.
+        if self.frameless && !self.popup && self.resizable() && !self.is_maximized() {
+            let edge = (GRIP / 2) as i32;
+            let (w, h) = (self.rect.w as i32, self.rect.h as i32);
+            if local.0 >= w - edge && local.1 >= h - edge {
+                return Some(Hit::Resize);
+            }
+        }
+        // У всплывающего окна и окна без рамки нет ни заголовка, ни кнопок:
+        // всё окно — содержимое.
         if self.popup || self.frameless {
             return Some(Hit::Body);
         }
-        let local = (x - self.rect.x, y - self.rect.y);
         if self.close_button().contains(local.0, local.1) {
             return Some(Hit::Close);
         }

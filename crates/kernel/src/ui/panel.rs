@@ -168,11 +168,6 @@ impl Metrics {
         self.ctx.px(14)
     }
 
-    /// Кружок состояния окна.
-    const fn dot(self) -> u32 {
-        self.ctx.px(8)
-    }
-
     /// Ширина кнопки меню — она же начало всего, что стоит правее.
     fn brand_width(self) -> u32 {
         self.side * 2 + self.glyph() + self.gap + self.ctx.face(Role::Title).width(BRAND)
@@ -183,7 +178,12 @@ impl Metrics {
     /// Подпись приходит строкой, а не выводится из [`App`]: у окна программы
     /// имя своё, и спросить его у перечисления нечем.
     fn button_width(self, caption: &str, state: ButtonState) -> u32 {
-        self.side * 2 + self.dot() + self.gap + self.ctx.face(state.role()).width(caption)
+        self.side + self.icon() + self.gap + self.ctx.face(state.role()).width(caption)
+    }
+
+    /// Сторона значка программы на кнопке панели задач.
+    const fn icon(self) -> u32 {
+        self.ctx.px(24)
     }
 
     /// Сторона плитки в шапке меню.
@@ -268,14 +268,6 @@ impl ButtonState {
             Self::Active => p.ink2,
             Self::Idle => p.ink3,
             Self::Minimized => p.ink5,
-        }
-    }
-
-    /// Цвет кружка состояния.
-    const fn dot(self, p: &Palette) -> Color {
-        match self {
-            Self::Active => p.ok,
-            _ => p.ink6,
         }
     }
 }
@@ -760,7 +752,7 @@ impl Panel {
 
         let layout = panel_layout(m, plate, windows, status_w);
         self.brand = layout.brand;
-        self.buttons = layout.buttons;
+        self.buttons = layout.buttons.clone();
 
         // Кнопка меню. Открытое меню переворачивает градиент: кнопка выглядит
         // вдавленной, и это единственное, чем «меню открыто» отличается от
@@ -803,42 +795,8 @@ impl Panel {
             p.line2.alpha,
         );
 
-        for (entry, (_, rect)) in windows.iter().zip(self.buttons.iter()) {
-            let rect = *rect;
-            let state = ButtonState::of(entry.focused, entry.minimized);
-            if state == ButtonState::Active {
-                draw::rounded(&mut self.surface, rect, m.round_row, p.ghost.color, p.ghost.alpha);
-                draw::rounded_stroke(
-                    &mut self.surface,
-                    rect,
-                    m.round_row,
-                    p.btnline.color,
-                    p.btnline.alpha,
-                );
-            }
-            // Кружок — это состояние окна, а не украшение: зелёный у активного,
-            // тусклый у прочих. Он же держит подписи на одной вертикали,
-            // сколько бы кнопок ни стояло рядом.
-            let dot = m.dot();
-            draw::circle(
-                &mut self.surface,
-                rect.x + (m.side + dot / 2) as i32,
-                rect.y + rect.h as i32 / 2,
-                dot / 2,
-                state.dot(p),
-                255,
-            );
-            let role = state.role();
-            paint::text_clipped(
-                ctx,
-                &mut self.surface,
-                role,
-                rect.x + (m.side + dot + m.gap) as i32,
-                paint::baseline(ctx, role, rect),
-                rect.w.saturating_sub(m.side * 2 + dot + m.gap),
-                &entry.caption,
-                state.ink(p),
-            );
+        for slot in &layout.slots {
+            self.draw_slot(ctx, m, slot, windows);
         }
 
         self.tray.clear();
@@ -902,6 +860,62 @@ impl Panel {
         self.damage = self.surface.bounds();
     }
 
+    /// Кнопка панели задач: значок программы (с подписью, если панель
+    /// подписана) и полоска под ним, как в Windows 11 — длинная акцентная у
+    /// активного окна, короткая серая у открытых и свёрнутых. Кнопка, за
+    /// которой несколько окон, лежит стопкой: за ней край второй плашки.
+    fn draw_slot(&mut self, ctx: Ctx, m: Metrics, slot: &Slot, windows: &[Entry]) {
+        let p = ctx.palette;
+        let rect = slot.rect;
+        let members: Vec<&Entry> = slot.members.iter().filter_map(|index| windows.get(*index)).collect();
+        let Some(first) = members.first() else {
+            return;
+        };
+        let active = members.iter().any(|entry| entry.focused && !entry.minimized);
+        let all_minimized = members.iter().all(|entry| entry.minimized);
+        if members.len() > 1 {
+            // Стопка: край второй плашки правее на пару точек.
+            let behind = rect.translate(ctx.px(3) as i32, 0);
+            draw::rounded(&mut self.surface, behind, m.round_row, ctx.flat(p.ghost), 255);
+            draw::rounded_stroke(&mut self.surface, behind, m.round_row, p.btnline.color, p.btnline.alpha);
+        }
+        if active || members.len() > 1 {
+            let edge = if active { p.btnline } else { p.line2 };
+            draw::rounded(&mut self.surface, rect, m.round_row, ctx.flat(p.ghost), 255);
+            draw::rounded_stroke(&mut self.surface, rect, m.round_row, edge.color, edge.alpha);
+        }
+        let side = m.icon();
+        let labelled = !slot.label.is_empty();
+        let icon_x = if labelled { rect.x + m.side as i32 / 2 } else { rect.x + (rect.w as i32 - side as i32) / 2 };
+        let icon_rect = Rect::new(icon_x, rect.y + (rect.h as i32 - side as i32) / 2 - ctx.px(1) as i32, side, side);
+        first.art.draw(ctx, &mut self.surface, icon_rect);
+        if labelled {
+            let state = ButtonState::of(active, all_minimized);
+            let role = state.role();
+            let x = icon_rect.right() + m.gap as i32;
+            paint::text_clipped(
+                ctx,
+                &mut self.surface,
+                role,
+                x,
+                paint::baseline(ctx, role, rect),
+                (rect.right() - x - (m.side / 2) as i32).max(0) as u32,
+                &slot.label,
+                state.ink(p),
+            );
+        }
+        // Полоска состояния — у нижнего края кнопки.
+        let (width, color) = if active { (ctx.px(16), p.acc) } else { (ctx.px(6), p.ink5) };
+        let thick = ctx.px(3);
+        let bar_x = if labelled {
+            icon_rect.x + (side as i32 - width as i32) / 2
+        } else {
+            rect.x + (rect.w as i32 - width as i32) / 2
+        };
+        let bar = Rect::new(bar_x, rect.bottom() - thick as i32 - ctx.px(1) as i32, width, thick);
+        draw::rounded(&mut self.surface, bar, (thick / 2).max(1), color, 255);
+    }
+
     #[must_use]
     pub const fn surface(&self) -> &Surface {
         &self.surface
@@ -923,6 +937,16 @@ struct PanelLayout {
     /// Разделитель между кнопкой меню и кнопками окон.
     divider: Rect,
     buttons: Buttons,
+    /// Что нарисовано в каждой кнопке.
+    slots: Vec<Slot>,
+}
+
+/// Кнопка панели задач: место, окна за ней (номера в списке окон) и
+/// подпись — пустая, когда панель без подписей.
+struct Slot {
+    rect: Rect,
+    members: Vec<usize>,
+    label: String,
 }
 
 /// Раскладка дока на телефоне: две кнопки по краям и поиск посередине.
@@ -1064,22 +1088,49 @@ fn panel_layout(m: Metrics, plate: Rect, windows: &[Entry], status_w: u32) -> Pa
     let mut x = divider.right() + rule as i32;
     let limit =
         plate.right() - (pad + status_w) as i32 - if status_w > 0 { m.gap as i32 } else { 0 };
-    // Кнопка уже этой не расскажет ничего: кружок, поля и три-четыре знака
-    // подписи. Всё, что короче, — не сокращённая кнопка, а мусор в строке.
-    let least = m.side * 2 + m.dot() + m.gap + m.ctx.px(24);
     let mut buttons = Buttons::new();
-    for entry in windows {
-        let room = (limit - x).max(0) as u32;
-        if room < least {
-            break;
+    let mut slots = Vec::new();
+    if LABELS.load(Ordering::Relaxed) {
+        // По кнопке на окно: значок и подпись. Уже этой кнопка не расскажет
+        // ничего: значок, поля и три-четыре знака подписи.
+        let least = m.side + m.icon() + m.gap + m.ctx.px(24);
+        for (index, entry) in windows.iter().enumerate() {
+            let room = (limit - x).max(0) as u32;
+            if room < least {
+                break;
+            }
+            let state = ButtonState::of(entry.focused, entry.minimized);
+            let width = m.button_width(&entry.caption, state).min(room).min(m.ctx.px(220));
+            let rect = Rect::new(x, y, width, m.btn_h);
+            buttons.push((entry.app, rect));
+            slots.push(Slot { rect, members: alloc::vec![index], label: entry.caption.clone() });
+            x += (width + m.gap / 2) as i32;
         }
-        let state = ButtonState::of(entry.focused, entry.minimized);
-        let width = m.button_width(&entry.caption, state).min(room);
-        buttons.push((entry.app, Rect::new(x, y, width, m.btn_h)));
-        x += (width + m.gap) as i32;
+    } else {
+        // Только значки, окна одной программы — в одной кнопке, в порядке
+        // первого окна группы: кнопки не переезжают при переключении окон.
+        let width = m.btn_h + m.ctx.px(4);
+        let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+        for (index, entry) in windows.iter().enumerate() {
+            match groups.iter_mut().find(|(key, _)| *key == entry.group.as_str()) {
+                Some((_, members)) => members.push(index),
+                None => groups.push((entry.group.as_str(), alloc::vec![index])),
+            }
+        }
+        for (_, members) in groups {
+            if x + width as i32 > limit {
+                break;
+            }
+            let rect = Rect::new(x, y, width, m.btn_h);
+            for index in &members {
+                buttons.push((windows[*index].app, rect));
+            }
+            slots.push(Slot { rect, members, label: String::new() });
+            x += (width + m.gap / 2) as i32;
+        }
     }
 
-    PanelLayout { brand, divider, buttons }
+    PanelLayout { brand, divider, buttons, slots }
 }
 
 /// Что выбрано в меню запуска.
@@ -1109,7 +1160,7 @@ pub enum Choice {
 /// запускать, `caption=` и `about=` — как её назвать. Пакет без `start=` в меню
 /// не попадает: это библиотека или данные, запускать там нечего.
 pub(super) struct Launcher {
-    name: String,
+    pub(super) name: String,
     pub(super) caption: String,
     about: String,
     pub(super) start: String,
@@ -1780,12 +1831,24 @@ static SHOW_UPTIME: AtomicBool = AtomicBool::new(false);
 /// Показывать ли дату рядом с часами.
 static SHOW_DATE: AtomicBool = AtomicBool::new(false);
 
+/// Кнопки панели задач с подписями — по кнопке на окно, как «Никогда не
+/// объединять» в Windows 11. Без подписей (по умолчанию) — только значки, и
+/// окна одной программы в одной кнопке.
+static LABELS: AtomicBool = AtomicBool::new(false);
+
+/// Подписаны ли кнопки панели задач.
+#[must_use]
+pub fn labels() -> bool {
+    LABELS.load(Ordering::Relaxed)
+}
+
 /// Что из двух показывает панель.
 #[must_use]
 pub fn shows(pref: super::settings::PanelPref) -> bool {
     match pref {
         super::settings::PanelPref::Uptime => SHOW_UPTIME.load(Ordering::Relaxed),
         super::settings::PanelPref::Date => SHOW_DATE.load(Ordering::Relaxed),
+        super::settings::PanelPref::Labels => LABELS.load(Ordering::Relaxed),
     }
 }
 
@@ -1793,6 +1856,7 @@ pub fn set_shows(pref: super::settings::PanelPref, on: bool) {
     match pref {
         super::settings::PanelPref::Uptime => SHOW_UPTIME.store(on, Ordering::Relaxed),
         super::settings::PanelPref::Date => SHOW_DATE.store(on, Ordering::Relaxed),
+        super::settings::PanelPref::Labels => LABELS.store(on, Ordering::Relaxed),
     }
 }
 
@@ -1842,6 +1906,10 @@ pub struct Entry {
     pub caption: String,
     pub focused: bool,
     pub minimized: bool,
+    /// Значок программы окна.
+    pub art: super::appicon::Art,
+    /// Окна с одним ключом — одна кнопка, когда панель без подписей.
+    pub group: String,
 }
 
 /// Список окон для панели.
@@ -1877,9 +1945,14 @@ impl Fingerprint {
                 hash ^= u64::from(*byte);
                 hash = hash.wrapping_mul(0x1000_0000_01b3);
             }
-            hash ^= u64::from(entry.focused) | (u64::from(entry.minimized) << 1);
+            for byte in entry.group.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x1000_0000_01b3);
+            }
+            hash ^= u64::from(entry.focused) | (u64::from(entry.minimized) << 1) | (u64::from(entry.art.is_image()) << 2);
             hash = hash.wrapping_mul(0x1000_0000_01b3);
         }
+        hash ^= u64::from(LABELS.load(Ordering::Relaxed)) << 7;
         // Часы показываются с точностью до минуты, время работы — до секунды;
         // и то и другое приходит готовой строкой, поэтому сворачивается так же.
         let mut clock = 0xcbf2_9ce4_8422_2325u64;

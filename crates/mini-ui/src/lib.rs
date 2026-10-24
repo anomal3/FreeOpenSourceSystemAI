@@ -44,6 +44,8 @@ pub mod boxdraw;
 pub mod draw;
 pub mod font;
 pub mod glyphicon;
+/// Картинки FIMG — значки программ из пакетов.
+pub mod image;
 pub mod iconset;
 pub mod iconset_data;
 /// Общий набор элементов программ с окнами: панели, вкладки, таблица, меню

@@ -666,8 +666,25 @@ impl Compositor {
                 caption: window.caption().into(),
                 focused: index == self.focus,
                 minimized: window.minimized,
+                art: window.art.clone().unwrap_or_else(|| super::appicon::Art::Glyph(
+                    if window.app == super::window::App::Terminal { mini_ui::glyphicon::Icon::Terminal } else { window.app.icon() },
+                    window.app.tone(),
+                    window.app == super::window::App::Terminal,
+                )),
+                group: if window.group.is_empty() { alloc::string::String::from(window.app.title()) } else { window.group.clone() },
             })
             .collect()
+    }
+
+    /// Окна той же программы, что `app`, — в порядке кнопок панели (одна
+    /// кнопка на программу, когда панель без подписей).
+    #[must_use]
+    pub fn group_members(&self, app: App) -> Vec<App> {
+        let entries = self.buttons();
+        let Some(group) = entries.iter().find(|entry| entry.app == app).map(|entry| entry.group.clone()) else {
+            return Vec::new();
+        };
+        entries.into_iter().filter(|entry| entry.group == group).map(|entry| entry.app).collect()
     }
 
     /// Поднять окно с номером `index` наверх и сделать активным.

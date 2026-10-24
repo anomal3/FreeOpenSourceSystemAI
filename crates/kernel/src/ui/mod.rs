@@ -42,6 +42,7 @@
 // ядра, и рисовать теми же цветами обязаны обе стороны границы привилегий —
 // иначе файловый менеджер выглядит на этом столе чужой программой. Зависимостей
 // от ядра у них не было ни одной, так что переезд свёлся к переносу двух файлов.
+pub mod appicon;
 pub mod compositor;
 pub mod context;
 pub mod dialog;
@@ -91,10 +92,11 @@ const MOVE_STEP: i32 = 32;
 
 /// За сколько миллисекунд два щелчка считаются двойным.
 ///
-/// Полсекунды — то, к чему человек привык за тридцать лет чужих рабочих столов.
-/// Меньше — и двойной щелчок не засчитывается у того, кто не торопится; больше —
-/// и два отдельных щелчка по одному значку случайно открывают программу.
-const DOUBLE_CLICK_MS: u64 = 500;
+/// Полсекунды — то, к чему человек привык за тридцать лет чужих рабочих столов,
+/// но время здесь меряется в миг разбора щелчка, а не нажатия: под нагрузкой
+/// (Chromium под VirtualBox, 24.10) второй щелчок разбирался позже и двойным
+/// не засчитывался. Отсюда запас до 700 мс.
+const DOUBLE_CLICK_MS: u64 = 700;
 
 static DESKTOP: SpinLock<Option<Compositor>> = SpinLock::new(None);
 
@@ -1930,6 +1932,20 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
                 }
             }
             PanelHit::Window(app) => {
+                // Кнопка, за которой несколько окон одной программы (панель
+                // без подписей): щелчок перебирает их по очереди, начиная с
+                // того, что за активным, — как Ctrl+щелчок в Windows 11.
+                let members = if panel::labels() { alloc::vec::Vec::new() } else { desktop.group_members(app) };
+                if members.len() > 1 {
+                    let focused = desktop.focused_app();
+                    let next = match members.iter().position(|member| Some(*member) == focused) {
+                        Some(at) => members[(at + 1) % members.len()],
+                        None => members[members.len() - 1],
+                    };
+                    launch(desktop, next);
+                    desktop.refresh_panel(status);
+                    return;
+                }
                 // Щелчок по кнопке активного окна сворачивает его — так ведёт
                 // себя панель задач везде, где человек её видел, и другого
                 // способа свернуть окно без мыши у кнопки нет.
@@ -3000,6 +3016,9 @@ pub fn open_window(task: u32, slot: u32, title: &str, pixels: Surface) -> Result
 pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, framed: bool) -> Result<(), WindowError> {
     let app = App::Program(task, slot);
     let (w, h) = (pixels.width(), pixels.height());
+    // Значок и группа на панели — по программе задачи. Считаются до стола:
+    // путь программы лежит под её замком, а под замком стола его не берут.
+    let (art, group) = appicon::of_task(task, title);
     with_desktop(|desktop| {
         if desktop.index_of(app).is_some() {
             return Err(WindowError::Exists);
@@ -3019,6 +3038,8 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         );
         let mut window =
             Window::program(app, rect, scale, title, pixels).ok_or(WindowError::NoMemory)?;
+        window.art = Some(art);
+        window.group = group;
         if !framed {
             window.frameless = true;
             window.redraw_content();

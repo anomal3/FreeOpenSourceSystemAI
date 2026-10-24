@@ -1876,6 +1876,8 @@ fn memory() {
         frames.total,
         frames.free_bytes() / (1024 * 1024)
     );
+    // Общие страницы файлов программ: прочитаны один раз на все процессы.
+    sprintln!("  cache    {} page(s) of program files shared", mm::pagecache::pages());
     let heap = mm::heap::stats();
     sprintln!("  heap     {} bytes free of {}", heap.free, mm::HEAP_SIZE);
     let (used, total) = mm::dma::stats();

@@ -56,6 +56,8 @@
 pub mod dma;
 pub mod frame;
 pub mod heap;
+/// Общие страницы файлов программ — одна копия на все процессы.
+pub mod pagecache;
 
 use core::fmt;
 use core::ops::{BitOr, BitOrAssign};

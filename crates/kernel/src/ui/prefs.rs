@@ -71,6 +71,7 @@ pub fn adopt() {
     for (pref, key) in [
         (super::settings::PanelPref::Uptime, "panel_uptime"),
         (super::settings::PanelPref::Date, "panel_date"),
+        (super::settings::PanelPref::Labels, "panel_labels"),
     ] {
         match sysconf::value(text, key) {
             Some("on") => super::panel::set_shows(pref, true),
@@ -125,6 +126,7 @@ pub fn store_panel(pref: super::settings::PanelPref, on: bool) -> Result<(), cra
     let key = match pref {
         super::settings::PanelPref::Uptime => "panel_uptime",
         super::settings::PanelPref::Date => "panel_date",
+        super::settings::PanelPref::Labels => "panel_labels",
     };
     store_key(key, if on { "on" } else { "off" })
 }

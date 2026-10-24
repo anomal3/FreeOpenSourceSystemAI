@@ -39,6 +39,7 @@ mod sdk;
 mod thirdparty;
 mod chromium;
 mod debian;
+mod fimg;
 mod util;
 mod version;
 

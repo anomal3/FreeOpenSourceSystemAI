@@ -109,6 +109,10 @@ pub struct Item {
     /// файл, переименовать и удалить его нечем. По отсутствию пути меню и
     /// решает, что предлагать человеку.
     pub path: Option<String>,
+    /// Ярлык программы из пакета: её собственный значок (картинка или
+    /// значок набора) и стрелка ярлыка в углу, как в Windows. `None` — значок
+    /// системы, папка или файл.
+    pub shortcut: Option<super::appicon::Art>,
 }
 
 /// Значки стола: их места и то, какой из них выбран.
@@ -166,19 +170,6 @@ fn package_signature() -> String {
         }
     }
     out
-}
-
-/// Картинка значка пакета по имени из манифеста.
-fn icon_named(name: &str) -> Icon {
-    match name {
-        "network" => Icon::Network,
-        "terminal" => Icon::Terminal,
-        "folder" => Icon::Folder,
-        "chart" => Icon::Chart,
-        "display" => Icon::Display,
-        "settings" => Icon::Settings,
-        _ => Icon::Package,
-    }
 }
 
 impl Icons {
@@ -268,11 +259,14 @@ impl Icons {
         // Программы установленных пакетов, попросившие значок (`desktop=yes`
         // в манифесте, фаза 71i): после системных, до файлов стола.
         self.packages = package_signature();
+        // Пакет могли поставить заново с другим значком.
+        super::appicon::forget();
         for launcher in super::panel::list_packages().into_iter().filter(|launcher| launcher.desktop) {
             self.items.push(Item {
-                kind: Kind::Program(icon_named(&launcher.icon)),
+                kind: Kind::Program(super::appicon::named(&launcher.icon)),
                 label: launcher.caption,
                 path: Some(launcher.start),
+                shortcut: Some(super::appicon::of_manifest(&launcher.icon)),
             });
         }
 
@@ -303,6 +297,7 @@ impl Icons {
                 kind: if directory { Kind::Folder } else { Kind::File },
                 label: name,
                 path: Some(path),
+                shortcut: None,
             });
         }
 
@@ -578,8 +573,18 @@ impl Icons {
             side,
             side,
         );
-        let (icon, tone, filled) = art(&item.kind);
-        paint::icon_tile(ctx, back, tile, icon, tone, filled);
+        match &item.shortcut {
+            // Ярлык программы: её значок — картинка без плитки, как в Windows,
+            // или значок набора на плитке — и стрелка ярлыка в углу.
+            Some(art) => {
+                art.draw(ctx, back, tile);
+                mini_ui::image::draw_shortcut_arrow(back, tile);
+            }
+            None => {
+                let (icon, tone, filled) = art(&item.kind);
+                paint::icon_tile(ctx, back, tile, icon, tone, filled);
+            }
+        }
 
         // Подпись — до двух строк. Одна строка обрезала бы «This computer» на
         // «This comp…», а три сделали бы сетку неровной: высота ячейки задана
@@ -673,11 +678,13 @@ fn system_items() -> Vec<Item> {
         kind: Kind::Program(Icon::Folder),
         label: FILES_LABEL.to_string(),
         path: Some(FILES_COMMAND.to_string()),
+        shortcut: None,
     });
     out.extend(SYSTEM.iter().map(|app| Item {
         kind: Kind::App(*app),
         label: app.caption().to_string(),
         path: None,
+        shortcut: None,
     }));
     out
 }
@@ -693,16 +700,17 @@ fn mobile_items() -> Vec<Item> {
         kind: Kind::Program(icon),
         label: label.to_string(),
         path: Some(command.to_string()),
+        shortcut: None,
     };
-    let app = |app: App, label: &str| Item { kind: Kind::App(app), label: label.to_string(), path: None };
-    let missing = |what, icon, label: &str| Item { kind: Kind::Missing(what, icon), label: label.to_string(), path: None };
+    let app = |app: App, label: &str| Item { kind: Kind::App(app), label: label.to_string(), path: None, shortcut: None };
+    let missing = |what, icon, label: &str| Item { kind: Kind::Missing(what, icon), label: label.to_string(), path: None, shortcut: None };
     let mut out = Vec::new();
     out.push(missing("phone", Icon::Display, "Телефон"));
     out.push(app(App::Terminal, "Терминал"));
     out.push(app(App::Settings, "Настройки"));
     out.push(program(Icon::Folder, FILES_LABEL, FILES_COMMAND));
     out.push(program(Icon::Disk, "Диски", "/bin/devmgr"));
-    out.push(Item { kind: Kind::Shortcut(App::Settings, Icon::Package), label: "Пакеты".to_string(), path: None });
+    out.push(Item { kind: Kind::Shortcut(App::Settings, Icon::Package), label: "Пакеты".to_string(), path: None, shortcut: None });
     out.push(program(Icon::Chart, "Монитор", "/bin/sysmon"));
     out.push(missing("log", Icon::Log, "Журнал"));
     // Витрина образцов .NET: все формы WinForms и консольные образцы одной

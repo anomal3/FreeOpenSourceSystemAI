@@ -253,6 +253,25 @@ pub fn build(arch: Arch) -> Result<()> {
         }
     }
     files.push((String::from("fonts/fonts.conf"), FONTS_CONF.as_bytes().to_vec(), 0o644));
+    // Значок программы — её собственный, из `hicolor` пакета (ярлык на столе
+    // и кнопка панели задач рисуют его, как в Windows).
+    let icon = ["128x128", "256x256", "64x64", "48x48"].iter().find_map(|size| {
+        follow(&extra, &format!("usr/share/icons/hicolor/{size}/apps/chromium.png"), 0).map(|(data, _)| data.clone())
+    });
+    let icon_field = match icon.as_deref().map(crate::fimg::from_png) {
+        Some(Ok(fimg)) => {
+            files.push((String::from("icon.fimg"), fimg, 0o644));
+            "/opt/chromium/icon.fimg"
+        }
+        Some(Err(err)) => {
+            say!("chromium: значок не разобран ({err}), будет значок набора");
+            "network"
+        }
+        None => {
+            say!("chromium: значка в пакетах нет, будет значок набора");
+            "network"
+        }
+    };
     // `--jitless`: V8 без JIT. Ядро не даёт памяти «на запись и исполнение
     // сразу» (W^X), а JIT V8 просит именно её; интерпретатор её не просит.
     // Окно — через сервер Wayland ядра (фаза 71i); с `--headless` Chromium
@@ -289,7 +308,7 @@ pub fn build(arch: Arch) -> Result<()> {
     builder.field("caption", "Chromium");
     builder.field("start", "/opt/debian/bin/bash /opt/chromium/bin/chromium");
     builder.field("desktop", "yes");
-    builder.field("icon", "network");
+    builder.field("icon", icon_field);
     builder.field("permissions", "windows files net");
     builder.requires("debian");
     let mut bytes = 0usize;

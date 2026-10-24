@@ -300,6 +300,9 @@ pub enum PanelPref {
     Uptime,
     /// Дата рядом с часами.
     Date,
+    /// Подписи на кнопках панели задач: кнопка на окно вместо значка на
+    /// программу.
+    Labels,
 }
 
 /// Чего окно просит у стола: сделать это само оно не может.
@@ -986,6 +989,7 @@ impl SettingsView {
                 let tag = match pref {
                     PanelPref::Uptime => "uptime",
                     PanelPref::Date => "date",
+                    PanelPref::Labels => "labels",
                 };
                 self.report = Some(match super::prefs::store_panel(pref, on) {
                     Ok(()) => {

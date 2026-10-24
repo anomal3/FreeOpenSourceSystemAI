@@ -4089,6 +4089,16 @@ pub fn same_process(slot: usize) -> bool {
     table.get(slot).and_then(Option::as_ref).is_some_and(|other| Arc::ptr_eq(other, &process))
 }
 
+/// Откуда запущена программа задачи `task` — стол по нему находит значок
+/// окна и группу кнопки на панели задач. `None` — задача не программа.
+#[must_use]
+pub fn path_of_task(task: u32) -> Option<alloc::string::String> {
+    let (slot, _) = sched::lookup(sched::TaskId::new(task))?;
+    let process = PROGRAMS.lock().get(slot).and_then(Option::as_ref).cloned()?;
+    let path = process.lock().path.clone();
+    Some(path)
+}
+
 /// Процесс в слоте `slot` — ссылкой (фаза 71d: `kill` и `SIGCHLD` другому
 /// процессу Linux). `None` — слот программы не исполняет.
 #[cfg(target_arch = "x86_64")]
@@ -4908,8 +4918,29 @@ pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     // запрещающий прерывания, — прямая дорога в тупик. Замок программ
     // отпущен тоже — иначе программа, отказавшая в это же время, ждала бы не
     // носитель, а этот замок, внутри своего обработчика.
-    let Some(frame) = take_frame_reserved() else {
-        return false;
+    // Чистая страница файла — сначала из кэша страниц: её мог прочитать
+    // любой процесс, отображающий тот же файл (`mm::pagecache`).
+    let cache_file = if plan.clean && plan.want > 0 { plan.node.as_ref().and_then(|node| node.cache_key()) } else { None };
+    if let Some(file) = cache_file {
+        if let Some(frame) = crate::mm::pagecache::take(file, plan.offset, plan.want) {
+            let commit = with_current_shared(|program, shared| program.fault_commit(page_addr, frame, &plan, shared))
+                .unwrap_or(Commit::Failed);
+            if !matches!(commit, Commit::Mapped) {
+                // Снимаем своего владельца; кадр остаётся кэшу.
+                return_frame(frame);
+            }
+            return !matches!(commit, Commit::Failed);
+        }
+    }
+    let frame = match take_frame_reserved() {
+        Some(frame) => frame,
+        // Память на исходе — сначала отдаёт кэш страниц то, что держит
+        // только он.
+        None if crate::mm::pagecache::shrink(256) > 0 => match take_frame_reserved() {
+            Some(frame) => frame,
+            None => return false,
+        },
+        None => return false,
     };
     // SAFETY: кадр только что выдан аллокатором, принадлежит нам одним и
     // виден через прямое отображение. Читаем в него **мимо** адресов
@@ -4935,6 +4966,10 @@ pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     // проверить стоит: первая же выдача кадров без обнуления открыла бы
     // программе чужие данные, и молча.
     debug_assert!(buffer[read..].iter().all(|byte| *byte == 0));
+    // Прочитанное целиком — в кэш: следующему процессу диск не понадобится.
+    if let Some(file) = cache_file.filter(|_| read == plan.want) {
+        crate::mm::pagecache::keep(file, plan.offset, plan.want, frame);
+    }
 
     // Шаг третий, снова под замком: отобразить и учесть.
     let commit = with_current_shared(|program, shared| program.fault_commit(page_addr, frame, &plan, shared))

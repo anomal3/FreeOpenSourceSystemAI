@@ -328,6 +328,13 @@ impl FileSystem for Ext2Mount {
         let (new_parent, new_name) = split_parent(new)?;
         let old_dir = self.0.directory_number(old_parent)?;
         let new_dir = self.0.directory_number(new_parent)?;
+        // Переименование поверх существующего файла удаляет тот: его
+        // страницы в кэше больше не его.
+        if let Ok(target) = self.resolve(new) {
+            if let Some(key) = target.cache_key() {
+                crate::mm::pagecache::forget(key);
+            }
+        }
 
         self.0.change(|disk, editor| {
             editor
@@ -367,6 +374,10 @@ struct Ext2Node {
 }
 
 impl Node for Ext2Node {
+    fn cache_key(&self) -> Option<(usize, u64)> {
+        (self.inode.kind == ext2::FileType::Regular).then(|| self.key())
+    }
+
     fn metadata(&self) -> Metadata {
         let mut guard = self.fs.inner.lock();
         let Inner { disk, fs, .. } = &mut *guard;
@@ -432,6 +443,7 @@ impl Node for Ext2Node {
         if self.inode.kind != ext2::FileType::Regular {
             return Err(VfsError::WrongKind);
         }
+        crate::mm::pagecache::forget(self.key());
         self.fs.change(|disk, editor| {
             editor
                 .write_at(disk, self.inode.number, offset, data)
@@ -443,6 +455,7 @@ impl Node for Ext2Node {
         if self.inode.kind != ext2::FileType::Regular {
             return Err(VfsError::WrongKind);
         }
+        crate::mm::pagecache::forget(self.key());
         self.fs.change(|disk, editor| {
             editor
                 .truncate(disk, self.inode.number, size)
@@ -469,6 +482,13 @@ impl Node for Ext2Node {
     }
 
     fn unlink(&self, name: &str) -> VfsResult<()> {
+        // Номер inode уйдёт под новый файл — его страницы в кэше больше не
+        // этого файла.
+        if let Ok(child) = self.lookup(name) {
+            if let Some(key) = child.cache_key() {
+                crate::mm::pagecache::forget(key);
+            }
+        }
         self.fs.change(|disk, editor| {
             editor
                 .unlink(disk, self.inode.number, name)
@@ -486,6 +506,11 @@ impl Node for Ext2Node {
 }
 
 impl Ext2Node {
+    /// Ключ файла в кэше страниц: том и номер inode.
+    fn key(&self) -> (usize, u64) {
+        (Arc::as_ptr(&self.fs) as *const () as usize, u64::from(self.inode.number))
+    }
+
     /// Узел по номеру inode — то, что возвращают создающие операции.
     ///
     /// Inode перечитывается с диска, а не собирается из того, что мы только что
