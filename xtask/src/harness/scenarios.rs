@@ -9495,14 +9495,15 @@ pub const ALL: &[Scenario] = &[
             Step::Repeat("down", 3),
             Step::Key("ret"),
             Step::Await("settings    : accent violet saved", 15_000),
-            Step::Await("desktop     : theme dark, accent violet, wallpaper night", 15_000),
+            Step::Await("desktop     : theme dark, accent violet, wallpaper fossai", 15_000),
             // Обои — своя страница, «Фон». Backspace — назад в
             // «Персонализацию», на строку «Цвета»; строкой выше — «Фон».
+            // Первые обои — картинка FossAi (72a), «Океан» — третий.
             Step::Key("backspace"),
             Step::Await("settings    : back to 'Персонализация'", 15_000),
             Step::Key("up"),
             Step::Key("ret"),
-            Step::Key("down"),
+            Step::Repeat("down", 2),
             Step::Key("ret"),
             Step::Await("settings    : wallpaper ocean saved", 15_000),
             // Заголовок окна — внизу «Цветов», за темами и акцентами: девятый

@@ -197,7 +197,11 @@ impl DialogView {
             Dialog::Power { .. } => (Icon::Power, Tone::Bad),
         };
         let tile = Rect::new(area.x + pad, area.y + pad, ctx.px(TILE), ctx.px(TILE));
-        paint::icon_tile(ctx, s, tile, icon, tone, true);
+        // «О системе» — логотип FossAi на плитке (фаза 72a).
+        match super::appicon::logo_tile().filter(|_| matches!(self.dialog, Dialog::About(_))) {
+            Some(logo) => logo.draw(s, tile),
+            None => paint::icon_tile(ctx, s, tile, icon, tone, true),
+        }
 
         let x = tile.right() + ctx.px(16) as i32;
         let width = (area.right() - pad - x).max(0) as u32;

@@ -3135,7 +3135,10 @@ impl Compositor {
             if !fresh {
                 *wall = None;
                 if let Some(mut picture) = Surface::new(key.width, key.height, p.wall_top) {
-                    self.draw_wallpaper(&mut picture, Rect::new(0, 0, key.width, key.height), 0);
+                    let drawn = theme::wallpaper() == theme::Wallpaper::Fossai && super::wallart::paint(&mut picture);
+                    if !drawn {
+                        self.draw_wallpaper(&mut picture, Rect::new(0, 0, key.width, key.height), 0);
+                    }
                     *wall = Some((picture, key));
                 }
             }

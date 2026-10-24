@@ -757,25 +757,41 @@ impl Panel {
         // Кнопка меню. Открытое меню переворачивает градиент: кнопка выглядит
         // вдавленной, и это единственное, чем «меню открыто» отличается от
         // «меню закрыто» — заливка другим цветом читалась бы как другая кнопка.
-        let (top, bottom) = if menu_open { (p.acc2, p.acc) } else { (p.acc, p.acc2) };
-        draw::rounded_gradient(&mut self.surface, layout.brand, m.round_row, top, bottom, 255);
-        draw::rounded_stroke(
-            &mut self.surface,
-            layout.brand,
-            m.round_row,
-            p.accline.color,
-            p.accline.alpha,
-        );
+        // С логотипом (фаза 72a) кнопка — знак FossAi на прозрачной плашке,
+        // как «Пуск» в макете; открытое меню — плашка подсвечена.
+        let logo = super::appicon::logo();
         let glyph = m.glyph();
-        glyphicon::draw(
-            &mut self.surface,
-            Icon::Grid,
-            layout.brand.x + m.side as i32,
-            layout.brand.y + (layout.brand.h as i32 - glyph as i32) / 2,
-            glyph,
-            WHITE,
-            255,
-        );
+        let ink = if logo.is_some() { p.ink } else { WHITE };
+        match &logo {
+            Some(logo) => {
+                if menu_open {
+                    draw::rounded(&mut self.surface, layout.brand, m.round_row, p.hover2.color, p.hover2.alpha);
+                    draw::rounded_stroke(&mut self.surface, layout.brand, m.round_row, p.accline.color, p.accline.alpha);
+                }
+                let side = glyph + ctx.px(8);
+                let at = Rect::new(
+                    layout.brand.x + m.side as i32 - ctx.px(4) as i32,
+                    layout.brand.y + (layout.brand.h as i32 - side as i32) / 2,
+                    side,
+                    side,
+                );
+                logo.draw(&mut self.surface, at);
+            }
+            None => {
+                let (top, bottom) = if menu_open { (p.acc2, p.acc) } else { (p.acc, p.acc2) };
+                draw::rounded_gradient(&mut self.surface, layout.brand, m.round_row, top, bottom, 255);
+                draw::rounded_stroke(&mut self.surface, layout.brand, m.round_row, p.accline.color, p.accline.alpha);
+                glyphicon::draw(
+                    &mut self.surface,
+                    Icon::Grid,
+                    layout.brand.x + m.side as i32,
+                    layout.brand.y + (layout.brand.h as i32 - glyph as i32) / 2,
+                    glyph,
+                    WHITE,
+                    255,
+                );
+            }
+        }
         paint::text(
             ctx,
             &mut self.surface,
@@ -783,7 +799,7 @@ impl Panel {
             layout.brand.x + (m.side + glyph + m.gap) as i32,
             paint::baseline(ctx, Role::Title, layout.brand),
             BRAND,
-            WHITE,
+            ink,
         );
 
         draw::vline(

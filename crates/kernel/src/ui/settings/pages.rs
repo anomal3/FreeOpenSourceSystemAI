@@ -575,7 +575,7 @@ fn wallpaper(pass: &mut Pass, x: i32, y: i32, w: u32) {
         }
     }
     let y = y + (tile_h + label_h) as i32 + ctx.px(8) as i32;
-    pass.note(x, y, w, "Градиент и разметка точками; рисуются, а не хранятся.");
+    pass.note(x, y, w, "FossAi — картинка из макета, растягивается под экран; остальные — градиент с разметкой точками.");
 }
 
 fn colors(pass: &mut Pass, x: i32, y: i32, w: u32) {

@@ -75,6 +75,34 @@ pub fn image(path: &str) -> Option<Arc<Image>> {
     image
 }
 
+/// Логотип FossAi — знак и знак на плитке (фаза 72a), FIMG 128×128 из
+/// `assets/logo`: «Пуск», «О системе». Вшит в ядро, как и обои.
+static LOGO: &[u8] = include_bytes!("../../../../assets/logo/fossai-logo.fimg");
+static LOGO_TILE: &[u8] = include_bytes!("../../../../assets/logo/fossai-logo-tile.fimg");
+
+/// Разобранные логотипы: распаковываются один раз.
+static LOGOS: SpinLock<Option<(Arc<Image>, Arc<Image>)>> = SpinLock::new(None);
+
+fn logos() -> Option<(Arc<Image>, Arc<Image>)> {
+    let mut logos = LOGOS.lock();
+    if logos.is_none() {
+        *logos = Image::parse(LOGO).map(Arc::new).zip(Image::parse(LOGO_TILE).map(Arc::new));
+    }
+    logos.clone()
+}
+
+/// Знак FossAi с прозрачностью.
+#[must_use]
+pub fn logo() -> Option<Arc<Image>> {
+    logos().map(|(mark, _)| mark)
+}
+
+/// Знак FossAi на плитке — значок «О системе».
+#[must_use]
+pub fn logo_tile() -> Option<Arc<Image>> {
+    logos().map(|(_, tile)| tile)
+}
+
 /// Забыть прочитанное: пакет сняли или поставили заново.
 pub fn forget() {
     CACHE.lock().clear();

@@ -347,8 +347,13 @@ impl Accent {
 }
 
 /// Обои: два цвета градиента и цвет точек разметки, свои для каждой темы.
+///
+/// [`Wallpaper::Fossai`] — картинка из макета Романа (фаза 72a), обои по
+/// умолчанию; её цвета здесь — средние по картинке, для того, что лежит на
+/// обоях полупрозрачным (меню, док).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Wallpaper {
+    Fossai,
     Night,
     Ocean,
     Sunset,
@@ -356,12 +361,13 @@ pub enum Wallpaper {
 }
 
 impl Wallpaper {
-    pub const ALL: [Wallpaper; 4] =
-        [Wallpaper::Night, Wallpaper::Ocean, Wallpaper::Sunset, Wallpaper::Graphite];
+    pub const ALL: [Wallpaper; 5] =
+        [Wallpaper::Fossai, Wallpaper::Night, Wallpaper::Ocean, Wallpaper::Sunset, Wallpaper::Graphite];
 
     #[must_use]
     pub const fn tag(self) -> &'static str {
         match self {
+            Wallpaper::Fossai => "fossai",
             Wallpaper::Night => "night",
             Wallpaper::Ocean => "ocean",
             Wallpaper::Sunset => "sunset",
@@ -372,6 +378,7 @@ impl Wallpaper {
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
+            Wallpaper::Fossai => "FossAi",
             Wallpaper::Night => "Ночь",
             Wallpaper::Ocean => "Океан",
             Wallpaper::Sunset => "Закат",
@@ -390,10 +397,11 @@ impl Wallpaper {
 
     const fn from_index(index: usize) -> Self {
         match index {
-            1 => Wallpaper::Ocean,
-            2 => Wallpaper::Sunset,
-            3 => Wallpaper::Graphite,
-            _ => Wallpaper::Night,
+            1 => Wallpaper::Night,
+            2 => Wallpaper::Ocean,
+            3 => Wallpaper::Sunset,
+            4 => Wallpaper::Graphite,
+            _ => Wallpaper::Fossai,
         }
     }
 }
@@ -435,7 +443,13 @@ struct WallColors {
     light: (Color, Color, Ink),
 }
 
-const WALLS: [WallColors; 4] = [
+const WALLS: [WallColors; 5] = [
+    // Обои FossAi: середина картинки и низ у волн. Светлой темы у картинки
+    // нет — она одна на обе.
+    WallColors {
+        dark: (Color::rgb(0x0C, 0x2A, 0x7E), Color::rgb(0x06, 0x14, 0x46), Ink::rgba(0x2A, 0x4A, 0x9A, 0)),
+        light: (Color::rgb(0x0C, 0x2A, 0x7E), Color::rgb(0x06, 0x14, 0x46), Ink::rgba(0x2A, 0x4A, 0x9A, 0)),
+    },
     WallColors {
         dark: (Color::rgb(0x16, 0x25, 0x3F), Color::rgb(0x0A, 0x12, 0x20), Ink::rgba(0x2A, 0x3A, 0x52, 153)),
         light: (Color::rgb(0xDC, 0xE7, 0xF7), Color::rgb(0xEA, 0xEE, 0xF6), Ink::rgba(0xA9, 0xB6, 0xC9, 153)),
@@ -475,14 +489,14 @@ const fn styled(dark: bool, accent: usize, wall: usize) -> Palette {
     p
 }
 
-const fn build_palettes() -> [[[Palette; 4]; 5]; 2] {
-    let mut out = [[[DARK; 4]; 5]; 2];
+const fn build_palettes() -> [[[Palette; 5]; 5]; 2] {
+    let mut out = [[[DARK; 5]; 5]; 2];
     let mut theme = 0;
     while theme < 2 {
         let mut accent = 0;
         while accent < 5 {
             let mut wall = 0;
-            while wall < 4 {
+            while wall < 5 {
                 out[theme][accent][wall] = styled(theme == 0, accent, wall);
                 wall += 1;
             }
@@ -494,7 +508,7 @@ const fn build_palettes() -> [[[Palette; 4]; 5]; 2] {
 }
 
 /// Все сочетания: `[тёмная|светлая][акцент][обои]`.
-static PALETTES: [[[Palette; 4]; 5]; 2] = build_palettes();
+static PALETTES: [[[Palette; 5]; 5]; 2] = build_palettes();
 
 static ACCENT: AtomicU8 = AtomicU8::new(0);
 static WALLPAPER: AtomicU8 = AtomicU8::new(0);
@@ -558,7 +572,7 @@ pub fn set_title_h(height: u32) -> bool {
 pub fn palette() -> &'static Palette {
     let theme = if DARK_THEME.load(Ordering::Relaxed) { 0 } else { 1 };
     let accent = (ACCENT.load(Ordering::Relaxed) as usize).min(4);
-    let wall = (WALLPAPER.load(Ordering::Relaxed) as usize).min(3);
+    let wall = (WALLPAPER.load(Ordering::Relaxed) as usize).min(4);
     &PALETTES[theme][accent][wall]
 }
 

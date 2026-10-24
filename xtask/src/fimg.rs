@@ -14,8 +14,12 @@ pub const SIDE: u32 = 64;
 
 /// PNG → FIMG `SIDE × SIDE`.
 pub fn from_png(png: &[u8]) -> Result<Vec<u8>> {
+    from_png_side(png, SIDE)
+}
+
+/// PNG → FIMG `side × side` (логотип FossAi — 128, фаза 72a).
+pub fn from_png_side(png: &[u8], side: u32) -> Result<Vec<u8>> {
     let (width, height, rgba) = decode(png)?;
-    let side = SIDE;
     let mut out = Vec::with_capacity(8 + (side * side * 4) as usize);
     out.extend_from_slice(b"FIMG");
     out.extend_from_slice(&(side as u16).to_le_bytes());
@@ -50,7 +54,7 @@ pub fn from_png(png: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Разобрать PNG в `RGBA`.
-fn decode(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+pub fn decode(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     if png.get(..8) != Some(b"\x89PNG\r\n\x1a\n".as_slice()) {
         bail!("не PNG");
     }

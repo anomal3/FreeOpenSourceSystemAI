@@ -60,6 +60,7 @@ pub mod start;
 pub mod tray;
 pub mod statusbar;
 pub mod term;
+pub mod wallart;
 pub mod window;
 
 use alloc::string::String;

@@ -1189,6 +1189,11 @@ impl Window {
     #[must_use]
     pub fn icon_art(&self) -> super::appicon::Art {
         self.art.clone().unwrap_or_else(|| {
+            if self.app == App::About {
+                if let Some(logo) = super::appicon::logo_tile() {
+                    return super::appicon::Art::Image(logo);
+                }
+            }
             let terminal = self.app == App::Terminal;
             super::appicon::Art::Glyph(if terminal { Icon::Terminal } else { self.app.icon() }, self.app.tone(), terminal)
         })

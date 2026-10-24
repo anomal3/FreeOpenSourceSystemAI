@@ -604,6 +604,12 @@ impl Icons {
                 art.draw(ctx, back, tile);
                 mini_ui::image::draw_shortcut_arrow(back, tile);
             }
+            // «О системе» — логотип FossAi на плитке (фаза 72a).
+            None if matches!(item.kind, Kind::App(App::About)) && super::appicon::logo_tile().is_some() => {
+                if let Some(logo) = super::appicon::logo_tile() {
+                    logo.draw(back, tile);
+                }
+            }
             None => {
                 let (icon, tone, filled) = art(&item.kind);
                 paint::icon_tile(ctx, back, tile, icon, tone, filled);
@@ -615,7 +621,15 @@ impl Icons {
         // числом, и третья строка выехала бы на соседнюю ячейку.
         let pad = ctx.px(CELL_PAD);
         let room = cell.w.saturating_sub(pad * 2);
-        let ink = if selected { p.ink } else { p.ink2 };
+        // На картинке FossAi подпись белая при любой теме — картинка тёмная и
+        // одна на обе темы (как подписи на обоях Windows).
+        let ink = if theme::wallpaper() == theme::Wallpaper::Fossai {
+            mini_ui::Color::rgb(0xFF, 0xFF, 0xFF)
+        } else if selected {
+            p.ink
+        } else {
+            p.ink2
+        };
         let step = u32::from(ctx.face(Role::Label).line);
         let mut y = tile.bottom() + ctx.px(theme::ICON_LABEL_GAP) as i32;
         let (first, second) = wrap(ctx, &item.label, room);
@@ -663,6 +677,11 @@ fn centered(
 ) {
     let width = ctx.face(Role::Label).width(line).min(room);
     let x = cell.x + (cell.w as i32 - width as i32) / 2;
+    // Тень под подписью на картинке: светлые места обоев иначе съедают буквы.
+    if theme::wallpaper() == theme::Wallpaper::Fossai {
+        let shift = ctx.px(1) as i32;
+        mini_ui::typeface::draw_clipped(s, ctx.face(Role::Label), x + shift, y + shift, line, room, mini_ui::Color::rgb(0, 0, 0), 150);
+    }
     paint::text_clipped(ctx, s, Role::Label, x, y, room, line, ink);
 }
 

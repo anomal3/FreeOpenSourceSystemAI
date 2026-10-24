@@ -41,12 +41,16 @@ mod chromium;
 mod debian;
 mod fimg;
 mod util;
+mod wallpaper;
 mod version;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::arch::Arch;
+
+/// Обои стола: исходник из макета Романа и то, что вшивает ядро.
+const WALLPAPERS: [(&str, &str); 1] = [("fossai-wallpaper-fhd.png", "fossai-1920x1080.qoi")];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -78,6 +82,9 @@ enum Command {
     /// Перевести значки макета (`assets/icons/freeos-icons.svg`) в таблицу
     /// `crates/mini-ui/src/iconset_data.rs`.
     Icons,
+    /// Перевести обои макета (`assets/wallpaper/*.png`) в QOI, а логотип
+    /// (`assets/logo/*.png`) — в FIMG: то и другое ядро вшивает в себя.
+    Wallpaper,
     /// Разобрать образ диска: разделы и содержимое корневой ФС.
     Inspect(InspectArgs),
     /// Собрать набор для C: picolibc под обе архитектуры.
@@ -654,6 +661,20 @@ fn real_main() -> Result<()> {
             // Предпросмотр рисует таблица, собранная в этот `xtask` прошлым
             // запуском: после правки исходника — запустить дважды.
             icons::preview(&root.join("build").join("icons-preview.png"))?;
+        }
+
+        Command::Wallpaper => {
+            let dir = paths::workspace_root().join("assets").join("wallpaper");
+            for (png, qoi) in WALLPAPERS {
+                wallpaper::generate(&dir.join(png), &dir.join(qoi))?;
+            }
+            // Логотип — FIMG 128×128: «Пуск», «О системе».
+            let logo = paths::workspace_root().join("assets").join("logo");
+            for (png, out) in [("fossai-logo-128.png", "fossai-logo.fimg"), ("fossai-logo-tile-128.png", "fossai-logo-tile.fimg")] {
+                let fimg = fimg::from_png_side(&std::fs::read(logo.join(png))?, 128)?;
+                std::fs::write(logo.join(out), &fimg)?;
+                println!("логотип: {png} → {out} ({} КиБ)", fimg.len() / 1024);
+            }
         }
 
         Command::Iso(args) => {
