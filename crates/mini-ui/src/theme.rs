@@ -646,6 +646,8 @@ pub const TITLE_BTN: u32 = 46;
 pub const TITLE_GAP: u32 = 0;
 /// Высота панели инструментов внутри окна.
 pub const TOOLBAR_H: u32 = 48;
+/// Высота панели команд под адресом (72g, макет 14).
+pub const COMMAND_H: u32 = 40;
 /// Высота строки состояния.
 pub const STATUS_H: u32 = 30;
 /// Высота строки бокового списка.

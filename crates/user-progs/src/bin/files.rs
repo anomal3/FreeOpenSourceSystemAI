@@ -511,6 +511,9 @@ struct Files {
     note: Option<String>,
     /// Значки макета (72g).
     icons: IconCache,
+    /// Поиск в текущей папке (72g): набранное и стоит ли в поле курсор.
+    query: String,
+    searching: bool,
     /// Смещение местного времени для дат, минуты.
     offset: i32,
 }
@@ -534,6 +537,8 @@ impl Files {
             props: None,
             note: None,
             icons: IconCache::default(),
+            query: String::new(),
+            searching: false,
             offset: local_offset(),
         };
         view.reload();
@@ -577,15 +582,100 @@ impl Files {
                         .cmp(&a.directory)
                         .then_with(|| a.name.cmp(&b.name))
                 });
+                // Поиск (72g): остаются записи, в имени которых есть набранное.
+                if !self.query.is_empty() {
+                    let query = self.query.to_lowercase();
+                    let path = self.path.clone();
+                    let friendly = self.friendly;
+                    self.rows.retain(|row| {
+                        let shown = if friendly { sysconf::winpath::label(&join(&path, &row.name)).unwrap_or(&row.name) } else { &row.name };
+                        row.name.to_lowercase().contains(&query) || shown.to_lowercase().contains(&query)
+                    });
+                }
             }
             Err(text) => self.error = Some(text),
         }
+    }
+
+    /// Клавиша, пока курсор в поле поиска.
+    fn key_search(&mut self, code: u32) -> bool {
+        match code {
+            ESCAPE => {
+                self.searching = false;
+                if !self.query.is_empty() {
+                    self.query.clear();
+                    self.reload();
+                }
+                true
+            }
+            ENTER => {
+                self.searching = false;
+                true
+            }
+            BACKSPACE => {
+                if self.query.pop().is_some() {
+                    self.reload();
+                    println(&format!("files: search '{}'", self.query));
+                }
+                true
+            }
+            WIN_KEY_UP | WIN_KEY_DOWN => {
+                self.searching = false;
+                self.on_key(code)
+            }
+            _ => match char::from_u32(code) {
+                Some(ch) if !ch.is_control() && self.query.chars().count() < 40 => {
+                    self.query.push(ch);
+                    self.reload();
+                    println(&format!("files: search '{}'", self.query));
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+
+    /// Кнопка панели команд (72g).
+    fn run_command(&mut self, command: Command) -> bool {
+        let row = self.rows.get(self.selected).filter(|row| !row.is_volume()).map(|row| row.name.clone());
+        match command {
+            Command::NewFolder => {
+                self.create_new(true);
+            }
+            Command::Rename => {
+                let Some(name) = row else { return false };
+                self.open_menu(None, Some(self.selected));
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.mode = MenuMode::Rename(name);
+                }
+            }
+            Command::Delete => {
+                if row.is_none() {
+                    return false;
+                }
+                self.open_menu(None, Some(self.selected));
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.mode = MenuMode::Confirm;
+                }
+            }
+            Command::Properties => {
+                if self.rows.get(self.selected).is_some() {
+                    self.show_props(self.selected);
+                } else {
+                    self.show_folder_props();
+                }
+            }
+        }
+        true
     }
 
     /// Обработать клавишу. `true` — картинку надо перерисовать.
     fn on_key(&mut self, code: u32) -> bool {
         if self.menu.is_some() {
             return self.key_menu(code);
+        }
+        if self.searching && self.preview.is_none() && self.props.is_none() {
+            return self.key_search(code);
         }
         if self.preview.is_some() {
             return self.key_preview(code);
@@ -1123,6 +1213,8 @@ impl Files {
         }
         self.back.push(core::mem::replace(&mut self.path, path));
         self.forward.clear();
+        self.query.clear();
+        self.searching = false;
         self.preview = None;
         // Ответ прошлого действия относился к прошлому каталогу.
         self.note = None;
@@ -1199,7 +1291,26 @@ impl Files {
             return true;
         }
 
+        // Вид переехал в строку состояния (макет 14): две кнопки справа.
+        if plan.view[0].contains(x, y) || plan.view[1].contains(x, y) {
+            let tiles = plan.view[1].contains(x, y);
+            if tiles != self.tiles {
+                self.tiles = tiles;
+                println(&format!("files: view {}", if self.tiles { "tiles" } else { "table" }));
+                return true;
+            }
+            return false;
+        }
+        if let Some((command, _)) = plan.commands.iter().find(|(_, rect)| rect.contains(x, y)) {
+            self.searching = false;
+            return self.run_command(*command);
+        }
         if plan.toolbar.contains(x, y) {
+            let was = self.searching;
+            self.searching = plan.search.contains(x, y);
+            if self.searching {
+                return !was;
+            }
             if plan.nav[0].contains(x, y) {
                 return self.go_back();
             }
@@ -1209,16 +1320,29 @@ impl Files {
             if plan.nav[2].contains(x, y) {
                 return self.go_up();
             }
-            if plan.view[0].contains(x, y) || plan.view[1].contains(x, y) {
-                let tiles = plan.view[0].contains(x, y);
-                if tiles != self.tiles {
-                    self.tiles = tiles;
-                    println(&format!("files: view {}", if self.tiles { "tiles" } else { "table" }));
-                    return true;
+            if plan.refresh.contains(x, y) {
+                self.reload();
+                return true;
+            }
+            // Звено адреса — переход в него.
+            if plan.path.contains(x, y) {
+                let face = ctx.face(Role::Body);
+                let mut at = plan.path.x + ctx.px(12) as i32;
+                for (label, path) in breadcrumb(&self.path, &self.home) {
+                    let width = face.width(&label) as i32;
+                    if x >= at && x < at + width {
+                        if path != self.path {
+                            self.go_to(path);
+                            return true;
+                        }
+                        return false;
+                    }
+                    at += width + ctx.px(CRUMB_GAP) as i32;
                 }
             }
-            return false;
+            return was;
         }
+        self.searching = false;
 
         if let Some(side) = plan.side {
             if side.contains(x, y) {
@@ -1577,7 +1701,7 @@ impl Files {
             x,
             y,
             room,
-            "Диспетчер устройств — функция запланирована",
+            "Устройства и драйверы — «Диспетчер устройств» в «Пуске»",
             p.ink4,
         );
     }
@@ -1668,58 +1792,74 @@ impl Files {
         for (rect, (icon, enabled)) in plan.nav.iter().zip(states) {
             nav_button(bar, s, *rect, icon, enabled);
         }
+        nav_button(bar, s, plan.refresh, Icon::Update, true);
 
-        // Переключатель вида: две вкладки в одной лунке, как в эскизе.
-        if !plan.view_box.is_empty() {
-            paint::sunk(bar, s, plan.view_box, ctx.px(theme::R_ROW));
-            for (rect, (label, active)) in plan
-                .view
-                .iter()
-                .zip([("Плитка", self.tiles), ("Таблица", !self.tiles)])
-            {
-                if active {
-                    draw::rounded(s, *rect, ctx.px(theme::R_TAB), ctx.flat(p.btn), 255);
-                    draw::rounded_stroke(s, *rect, ctx.px(theme::R_TAB), p.btnline.color, p.btnline.alpha);
+        // Адрес звеньями, как в Проводнике: «Этот компьютер › Системный диск
+        // › bin».
+        if !plan.path.is_empty() {
+            paint::sunk(bar, s, plan.path, ctx.px(theme::R_ROW));
+            let pad = ctx.px(12);
+            let y = paint::baseline(bar, Role::Body, plan.path);
+            let right = plan.path.right() - pad as i32;
+            let mut x = plan.path.x + pad as i32;
+            let links = breadcrumb(&self.path, &self.home);
+            let last = links.len().saturating_sub(1);
+            for (index, (label, _)) in links.iter().enumerate() {
+                let room = (right - x).max(0) as u32;
+                let used = paint::text_clipped(bar, s, Role::Body, x, y, room, label, if index == last { p.ink } else { p.ink3 });
+                x += used as i32;
+                // Разделитель — значок «›»: в шрифте такого знака нет.
+                if index != last && x + (CRUMB_GAP * ctx.scale) as i32 <= right {
+                    let glyph = ctx.px(10);
+                    glyphicon::draw(s, Icon::ChevronRight, x + ctx.px(5) as i32, plan.path.y + (plan.path.h as i32 - glyph as i32) / 2, glyph, p.ink4, 255);
+                    x += ctx.px(CRUMB_GAP) as i32;
                 }
-                paint::text_centered(
-                    bar,
-                    s,
-                    Role::Caption,
-                    *rect,
-                    label,
-                    if active { p.ink2 } else { p.ink4 },
-                );
+            }
+            if let Some(preview) = self.preview.as_ref() {
+                paint::text_clipped(bar, s, Role::Body, x, y, (right - x).max(0) as u32, &format!("  ·  {}", preview.name), p.ink4);
             }
         }
 
-        if plan.path.is_empty() {
-            return;
+        // Поиск: «Поиск: <папка>», с курсором, пока в поле печатают.
+        if !plan.search.is_empty() {
+            paint::sunk(bar, s, plan.search, ctx.px(theme::R_ROW));
+            if self.searching {
+                draw::rounded_stroke(s, plan.search, ctx.px(theme::R_ROW), p.acc, 255);
+            }
+            let glyph = ctx.px(13);
+            glyphicon::draw(s, Icon::Search, plan.search.x + ctx.px(10) as i32, plan.search.y + (plan.search.h as i32 - glyph as i32) / 2, glyph, p.ink4, 255);
+            let x = plan.search.x + ctx.px(30) as i32;
+            let room = (plan.search.right() - x - ctx.px(8) as i32).max(0) as u32;
+            let y = paint::baseline(bar, Role::Body, plan.search);
+            if self.query.is_empty() && !self.searching {
+                let here = breadcrumb(&self.path, &self.home).last().map(|(label, _)| label.clone()).unwrap_or_default();
+                paint::text_clipped(bar, s, Role::Body, x, y, room, &format!("Поиск: {here}"), p.ink4);
+            } else {
+                let used = paint::text_clipped(bar, s, Role::Body, x, y, room, &self.query, p.ink);
+                if self.searching {
+                    s.fill(Rect::new(x + used as i32 + 1, plan.search.y + ctx.px(8) as i32, 1, plan.search.h - ctx.px(16)), p.acc);
+                }
+            }
         }
-        paint::sunk(bar, s, plan.path, ctx.px(theme::R_ROW));
-        // Путь виден только здесь, поэтому он рисуется и в просмотре файла:
-        // иначе, открыв файл, человек перестаёт понимать, где находится.
-        let place = if self.on_computer() {
-            String::from("/  Этот компьютер")
-        } else {
-            self.path.clone()
-        };
-        let shown = match self.preview.as_ref() {
-            Some(preview) => format!("{place}  ·  {}", preview.name),
-            None => place,
-        };
-        let pad = ctx.px(12);
-        let mut x = plan.path.x + pad as i32;
-        let mut room = plan.path.w.saturating_sub(pad * 2);
-        let y = paint::baseline(bar, Role::Mono, plan.path);
-        // Первая косая — акцентом: она отмечает корень, от которого читается
-        // всё остальное, и без неё путь сливается в одну серую строку.
-        if let Some(rest) = shown.strip_prefix('/') {
-            let used = paint::text(bar, s, Role::Mono, x, y, "/", p.acc_ink);
-            x += used as i32;
-            room = room.saturating_sub(used);
-            paint::text_clipped(bar, s, Role::Mono, x, y, room, rest, p.ink3);
-        } else {
-            paint::text_clipped(bar, s, Role::Mono, x, y, room, &shown, p.ink3);
+
+        // Панель команд (макет 14): значок и подпись.
+        if let Some(first) = plan.commands.first() {
+            let row = Rect::new(plan.toolbar.x, first.1.y - ctx.px(4) as i32, plan.toolbar.w, first.1.h + ctx.px(8));
+            s.fill(row, ctx.flat(p.panel));
+            draw::hline(s, row.x, row.bottom() - 1, row.w, p.line.color, p.line.alpha);
+            let inner = ctx.on(theme::panel_bg());
+            for (command, rect) in &plan.commands {
+                let (icon, label) = command.look();
+                let enabled = match command {
+                    Command::Rename | Command::Delete => self.rows.get(self.selected).is_some_and(|row| !row.is_volume()) && !self.on_computer(),
+                    Command::NewFolder => !self.on_computer(),
+                    _ => true,
+                };
+                let ink = if enabled { p.ink2 } else { p.ink5 };
+                let glyph = ctx.px(14);
+                glyphicon::draw(s, icon, rect.x + ctx.px(8) as i32, rect.y + (rect.h as i32 - glyph as i32) / 2, glyph, ink, 255);
+                paint::text(inner, s, Role::Body, rect.x + ctx.px(28) as i32, paint::baseline(inner, Role::Body, *rect), label, ink);
+            }
         }
     }
 
@@ -1961,6 +2101,18 @@ impl Files {
             text
         };
         kit::status_bar(ctx, s, plan.status, &text);
+        // Вид — две кнопки справа (макет 14): таблица и плитка.
+        let p = ctx.palette;
+        for (rect, (icon, active)) in plan.view.iter().zip([(Icon::Log, !self.tiles), (Icon::Grid, self.tiles)]) {
+            if rect.is_empty() {
+                continue;
+            }
+            if active {
+                draw::rounded(s, *rect, ctx.px(theme::R_ROW), ctx.flat(p.btn), 255);
+            }
+            let glyph = ctx.px(12);
+            glyphicon::draw(s, icon, rect.x + (rect.w as i32 - glyph as i32) / 2, rect.y + (rect.h as i32 - glyph as i32) / 2, glyph, if active { p.ink } else { p.ink4 }, 255);
+        }
     }
 
     /// Первая показанная строка при таком числе видимых.
@@ -2025,7 +2177,13 @@ struct Plan {
     /// «Назад», «вперёд», «вверх» — в этом порядке.
     nav: [Rect; 3],
     path: Rect,
-    /// Лунка переключателя вида и две его вкладки: плитка, таблица.
+    /// «Обновить» и поле поиска (72g).
+    refresh: Rect,
+    search: Rect,
+    /// Панель команд под адресом.
+    commands: Vec<(Command, Rect)>,
+    /// Лунка переключателя вида и две его кнопки: таблица, плитка (в строке
+    /// состояния справа).
     view_box: Rect,
     view: [Rect; 2],
     side: Option<Rect>,
@@ -2104,41 +2262,54 @@ fn layout(ctx: Ctx, area: Rect) -> Plan {
         *slot = Rect::new(x, btn_y, btn, btn);
         x += (btn + gap) as i32;
     }
+    let refresh = Rect::new(x, btn_y, btn, btn);
+    x += (btn + gap) as i32;
 
     let path_h = ctx.px(32);
     let path_x = x + ctx.px(4) as i32;
+    let field_y = toolbar.y + (toolbar_h as i32 - path_h as i32) / 2;
 
-    // Переключатель вида справа; на узком окне его нет — путь важнее.
-    let tab_w = ctx.px(72);
-    let tab_h = ctx.px(26);
-    let box_w = tab_w * 2 + ctx.px(6);
-    let (view_box, view, path_right) = if area.w > ctx.px(560) {
-        let box_x = area.right() - pad as i32 - box_w as i32;
-        let box_y = toolbar.y + (toolbar_h as i32 - path_h as i32) / 2;
-        let view_box = Rect::new(box_x, box_y, box_w, path_h);
-        let tab_y = box_y + (path_h as i32 - tab_h as i32) / 2;
-        let tabs = [
-            Rect::new(box_x + ctx.px(3) as i32, tab_y, tab_w, tab_h),
-            Rect::new(box_x + (ctx.px(3) + tab_w) as i32, tab_y, tab_w, tab_h),
-        ];
-        (view_box, tabs, box_x - ctx.px(8) as i32)
+    // Поиск справа; на узком окне его нет — адрес важнее.
+    let (search, path_right) = if area.w > ctx.px(560) {
+        let width = ctx.px(220);
+        let x = area.right() - pad as i32 - width as i32;
+        (Rect::new(x, field_y, width, path_h), x - ctx.px(8) as i32)
     } else {
-        (Rect::EMPTY, [Rect::EMPTY; 2], area.right() - pad as i32)
+        (Rect::EMPTY, area.right() - pad as i32)
     };
+    let path = Rect::new(path_x, field_y, (path_right - path_x).max(0) as u32, path_h);
 
-    let path_w = (path_right - path_x).max(0) as u32;
-    let path = Rect::new(
-        path_x,
-        toolbar.y + (toolbar_h as i32 - path_h as i32) / 2,
-        path_w,
-        path_h,
-    );
+    // Панель команд: «Создать папку», «Переименовать», «Удалить»,
+    // «Свойства».
+    let command_h = ctx.px(theme::COMMAND_H).min(area.h.saturating_sub(toolbar_h));
+    let mut commands = Vec::new();
+    if command_h > 0 {
+        let face = ctx.face(Role::Body);
+        let mut cx = area.x + pad as i32 - ctx.px(6) as i32;
+        let cy = toolbar.bottom() + ctx.px(4) as i32;
+        for command in [Command::NewFolder, Command::Rename, Command::Delete, Command::Properties] {
+            let width = ctx.px(36) + face.width(command.look().1);
+            let rect = Rect::new(cx, cy, width, command_h.saturating_sub(ctx.px(8)));
+            if rect.right() > area.right() - pad as i32 {
+                break;
+            }
+            commands.push((command, rect));
+            cx += (width + ctx.px(4)) as i32;
+        }
+    }
 
     let status_h = ctx.px(theme::STATUS_H);
     let status_y = (area.bottom() - status_h as i32).max(toolbar.bottom());
     let status = Rect::new(area.x, status_y, area.w, status_h);
+    let view_w = ctx.px(28);
+    let view_h = status_h.saturating_sub(ctx.px(8));
+    let view_y = status.y + ctx.px(4) as i32;
+    let view = [
+        Rect::new(status.right() - pad as i32 - (view_w * 2 + ctx.px(4)) as i32, view_y, view_w, view_h),
+        Rect::new(status.right() - pad as i32 - view_w as i32, view_y, view_w, view_h),
+    ];
 
-    let top = toolbar.bottom();
+    let top = toolbar.bottom() + command_h as i32;
     let bottom = status.y;
     let body_h = (bottom - top).max(0) as u32;
 
@@ -2164,7 +2335,10 @@ fn layout(ctx: Ctx, area: Rect) -> Plan {
         toolbar,
         nav,
         path,
-        view_box,
+        refresh,
+        search,
+        commands,
+        view_box: Rect::EMPTY,
         view,
         side,
         header,
@@ -2173,6 +2347,62 @@ fn layout(ctx: Ctx, area: Rect) -> Plan {
         row_h: ctx.px(32),
         row_gap: ctx.px(2),
     }
+}
+
+/// Кнопки панели команд «Файлов» (72g, макет 14).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Command {
+    NewFolder,
+    Rename,
+    Delete,
+    Properties,
+}
+
+impl Command {
+    /// Значок и подпись.
+    fn look(self) -> (Icon, &'static str) {
+        match self {
+            Command::NewFolder => (Icon::Folder, "Создать папку"),
+            Command::Rename => (Icon::File, "Переименовать"),
+            Command::Delete => (Icon::Close, "Удалить"),
+            Command::Properties => (Icon::Info, "Свойства"),
+        }
+    }
+}
+
+/// Место под разделитель звеньев адреса.
+const CRUMB_GAP: u32 = 20;
+
+/// Звенья адреса: подпись и куда ведёт (72g). Дом — «Главная», корень —
+/// «Этот компьютер › Системный диск».
+fn breadcrumb(path: &str, home: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if path == COMPUTER {
+        out.push((String::from("Этот компьютер"), String::from(COMPUTER)));
+        return out;
+    }
+    let (mut current, rest) = if path == home || path.starts_with(&format!("{home}/")) {
+        out.push((String::from("Главная"), home.to_string()));
+        (home.to_string(), &path[home.len()..])
+    } else {
+        out.push((String::from("Этот компьютер"), String::from(COMPUTER)));
+        out.push((String::from("Системный диск"), String::from("/")));
+        (String::new(), path)
+    };
+    for part in rest.split('/').filter(|part| !part.is_empty()) {
+        current = format!("{current}/{part}");
+        let label = match part {
+            "Desktop" => "Рабочий стол",
+            "Downloads" => "Загрузки",
+            "Documents" => "Документы",
+            "Pictures" => "Изображения",
+            "Music" => "Музыка",
+            "Videos" => "Видео",
+            _ => sysconf::winpath::label(&current).unwrap_or(part),
+        };
+        out.push((label.to_string(), current.clone()));
+    }
+    out
 }
 
 /// Кнопка навигации: доступная — с подложкой, недоступная — одним значком.
@@ -2264,7 +2494,7 @@ fn place_icon(path: &str, home: &str) -> &'static str {
 /// Имя тома на странице «Этот компьютер».
 fn volume_title(point: &str) -> String {
     match point {
-        "/" => String::from("Локальный диск (C:)"),
+        "/" => String::from("Системный диск"),
         "/data" => String::from("Данные (/data)"),
         other => other.to_string(),
     }

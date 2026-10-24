@@ -297,7 +297,7 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         Aim::TaskButton(n) => (PANEL_INSET + 79 + n * 48, height - PANEL_INSET - PANEL_H / 2),
         Aim::FilesRow(n) => {
             let rect = window(log, "Files")?;
-            (rect.x + 340, rect.y + TITLE_H + 48 + 27 + n * 34 + 16)
+            (rect.x + 340, rect.y + TITLE_H + 48 + 40 + 27 + n * 34 + 16)
         }
         Aim::FilesBody => {
             let rect = window(log, "Files")?;
