@@ -773,6 +773,11 @@ pub struct PointerEvent {
     /// модификаторов в [`KeyEvent`]: потребитель разбирает очередь позже, чем
     /// она наполняется, и «нажата ли сейчас кнопка» — ответ про другое время.
     pub changed: Buttons,
+    /// Когда отчёт пришёл (мс от запуска). Двойной щелчок меряется по нему,
+    /// а не по времени разбора: стол разбирает очередь между кадрами, и под
+    /// нагрузкой (1080p в VirtualBox, 24.10) два быстрых щелчка разбирались с
+    /// разницей больше порога и двойным не засчитывались.
+    pub at_ms: u64,
 }
 
 impl PointerEvent {
@@ -783,6 +788,7 @@ impl PointerEvent {
         wheel: 0,
         buttons: Buttons::NONE,
         changed: Buttons::NONE,
+        at_ms: 0,
     };
 
     /// Нажата ли эта кнопка именно этим событием.
@@ -841,6 +847,7 @@ pub fn post_pointer(dx: i32, dy: i32, wheel: i32, buttons: Buttons) {
         // Заполняется в [`enqueue_pointer`]: какие кнопки изменились, знает
         // очередь — только она помнит их прошлое состояние.
         changed: Buttons::NONE,
+        at_ms: 0,
     });
 }
 
@@ -855,6 +862,7 @@ pub fn post_pointer_at(x: u16, y: u16, wheel: i32, buttons: Buttons) {
         wheel,
         buttons,
         changed: Buttons::NONE,
+        at_ms: 0,
     });
 }
 
@@ -895,7 +903,7 @@ fn enqueue_pointer(event: PointerEvent) {
     }
 
     let tail = (queue.head + queue.len) % POINTER_CAPACITY;
-    queue.events[tail] = PointerEvent { changed, ..event };
+    queue.events[tail] = PointerEvent { changed, at_ms: crate::time::uptime_ms(), ..event };
     queue.len += 1;
 }
 
@@ -909,6 +917,37 @@ pub fn next_pointer() -> Option<PointerEvent> {
     let event = queue.events[queue.head];
     queue.head = (queue.head + 1) % POINTER_CAPACITY;
     queue.len -= 1;
+    Some(event)
+}
+
+/// Забрать следующее событие указателя, слив с ним идущие следом движения
+/// без смены кнопок: стол собирает кадр на каждое событие, и под нагрузкой
+/// очередь из двадцати движений означала двадцать кадров, а курсор догонял
+/// мышь рывками (24.10). Нажатия и отпускания не сливаются никогда.
+#[must_use]
+pub fn next_pointer_merged() -> Option<PointerEvent> {
+    let mut queue = POINTER.lock();
+    if queue.len == 0 {
+        return None;
+    }
+    let mut event = queue.events[queue.head];
+    queue.head = (queue.head + 1) % POINTER_CAPACITY;
+    queue.len -= 1;
+    while event.changed.0 == 0 && queue.len > 0 {
+        let next = queue.events[queue.head];
+        if next.changed.0 != 0 || next.buttons.0 != event.buttons.0 {
+            break;
+        }
+        queue.head = (queue.head + 1) % POINTER_CAPACITY;
+        queue.len -= 1;
+        event.dx += next.dx;
+        event.dy += next.dy;
+        event.wheel += next.wheel;
+        if next.absolute.is_some() {
+            event.absolute = next.absolute;
+        }
+        event.at_ms = next.at_ms;
+    }
     Some(event)
 }
 

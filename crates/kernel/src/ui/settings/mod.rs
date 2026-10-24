@@ -303,6 +303,8 @@ pub enum PanelPref {
     /// Подписи на кнопках панели задач: кнопка на окно вместо значка на
     /// программу.
     Labels,
+    /// Анимация окон (открытие, сворачивание, разворот).
+    Animations,
 }
 
 /// Чего окно просит у стола: сделать это само оно не может.
@@ -990,6 +992,7 @@ impl SettingsView {
                     PanelPref::Uptime => "uptime",
                     PanelPref::Date => "date",
                     PanelPref::Labels => "labels",
+                    PanelPref::Animations => "animations",
                 };
                 self.report = Some(match super::prefs::store_panel(pref, on) {
                     Ok(()) => {

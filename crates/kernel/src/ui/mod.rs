@@ -892,6 +892,51 @@ pub fn timing() -> (u64, u64, u64, u64, u64) {
 /// один на 200 мс дают в среднем 5 мс, а палец чувствует именно двести.
 static WORST_FRAME_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Анимация окон включена в «Параметрах» (по умолчанию — да).
+static ANIMATIONS: AtomicBool = AtomicBool::new(true);
+
+/// Сколько стоит кадр во весь экран, наносекунды, — сглаженная оценка по
+/// собранным кадрам. Ноль — ещё не мерили.
+static SCREEN_FRAME_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Дороже — анимация не играется: за 240 мс полёта успело бы нарисоваться
+/// меньше восьми кадров, и вместо движения вышли бы рывки (1080p в
+/// VirtualBox: три кадра на открытие окна, 24.10). Так же поступает Windows
+/// на медленной машине.
+const ANIMATION_FRAME_BUDGET_NS: u64 = 30_000_000;
+
+/// Учесть кадр: `points` из `screen` точек собрано за `ns`. Кадры меньше
+/// четверти экрана в оценку не идут — их цена складывается из постоянных
+/// расходов больше, чем из площади.
+pub fn note_screen_cost(ns: u64, points: u64, screen: u64) {
+    if points == 0 || screen == 0 || points * 4 < screen {
+        return;
+    }
+    let full = ns.saturating_mul(screen) / points;
+    let old = SCREEN_FRAME_NS.load(Ordering::Relaxed);
+    let new = if old == 0 { full } else { (old * 3 + full) / 4 };
+    SCREEN_FRAME_NS.store(new, Ordering::Relaxed);
+}
+
+/// Играть ли анимации окон: включены и машина успевает их рисовать.
+#[must_use]
+pub fn animations_allowed() -> bool {
+    // Телефону анимация — часть жестов (окно улетает в стопку дока), и
+    // отключать её по цене кадра там нельзя.
+    ANIMATIONS.load(Ordering::Relaxed)
+        && (theme::is_mobile() || SCREEN_FRAME_NS.load(Ordering::Relaxed) <= ANIMATION_FRAME_BUDGET_NS)
+}
+
+/// Включена ли анимация окон в «Параметрах».
+#[must_use]
+pub fn animations_enabled() -> bool {
+    ANIMATIONS.load(Ordering::Relaxed)
+}
+
+pub fn set_animations(on: bool) {
+    ANIMATIONS.store(on, Ordering::Relaxed);
+}
+
 /// Записать длительность кадра, если он хуже прежнего худшего.
 pub fn note_frame_ns(ns: u64) {
     WORST_FRAME_NS.fetch_max(ns, Ordering::Relaxed);
@@ -1446,7 +1491,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
 
     if event.pressed(Buttons::LEFT) {
-        press(desktop, x, y, status);
+        press(desktop, x, y, status, event.at_ms);
     }
     // Правая кнопка: меню стола там, где щёлкнули. Пока оно открыто, левая
     // кнопка выбирает в нём пункт — этим и занимается `press`.
@@ -1729,7 +1774,7 @@ fn type_on_screen(desktop: &mut Compositor, action: keyboard::Action) {
 /// порядком рисования: щелчок должен доставаться тому, кого человек видит под
 /// стрелкой. Обратный порядок означал бы, что кнопка, накрытая меню,
 /// срабатывает сквозь него.
-fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
+fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) {
     // 0а. Шторка — поверх всего остального, и разбирается первой.
     //
     // Открытая шторка съедает нажатие целиком: нажатие внутрь пока ничего не
@@ -1986,7 +2031,8 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
         // Второй щелчок по тому же значку в пределах [`DOUBLE_CLICK_MS`]
         // открывает его. Порог во времени, а не «щелчок с Shift» и не
         // «одиночный открывает»: так это работает у всех, кто видел стол.
-        let now = crate::time::uptime_ms();
+        // Время прихода нажатия, а не разбора (см. `PointerEvent::at_ms`).
+        let now = if at_ms == 0 { crate::time::uptime_ms() } else { at_ms };
         let last = LAST_ICON_CLICK.swap(now, core::sync::atomic::Ordering::Relaxed);
         let key = index as u32;
         let same = LAST_ICON.swap(key, core::sync::atomic::Ordering::Relaxed) == key;
@@ -1995,6 +2041,12 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
         // туда же само собой. Палец между двумя нажатиями уходит с экрана, и
         // повторить попадание в ту же точку за полсекунды — задача, которую
         // человек не должен решать, чтобы открыть программу.
+        // Второй щелчок по тому же значку, не засчитанный двойным, — в
+        // журнал с зазором: иначе «двойной щелчок не работает» снаружи не
+        // разобрать (VirtualBox, 24.10).
+        if same && now.saturating_sub(last) > DOUBLE_CLICK_MS && now.saturating_sub(last) < 3_000 {
+            kprintln!("  desktop     : second click on the icon after {} ms, not a double click", now.saturating_sub(last));
+        }
         if theme::is_mobile() || (same && now.saturating_sub(last) <= DOUBLE_CLICK_MS) {
             open_icon(desktop, index);
             desktop.refresh_panel(status);

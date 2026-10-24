@@ -471,7 +471,7 @@ impl Compositor {
     /// Начать рост окна из плитки (`open`) или уход в неё.
     fn start_zoom(&mut self, app: App, rect: Rect, open: bool) -> bool {
         self.finish_flight();
-        if self.panel.is_none() || rect.is_empty() {
+        if self.panel.is_none() || rect.is_empty() || !super::animations_allowed() {
             return false;
         }
         // Плитки нет — окно растёт из середины своего места, с четырёх пятых.
@@ -1261,7 +1261,7 @@ impl Compositor {
         // Окно перетекает в новый размер. Поверхность уже нового размера и
         // готова: `Window::resize` перерисовал её.
         self.finish_flight();
-        if self.panel.is_some() && !before.is_empty() && !after.is_empty() {
+        if self.panel.is_some() && !before.is_empty() && !after.is_empty() && super::animations_allowed() {
             self.flight = Some(Flight::morph(app, after, before, crate::time::uptime_ns()));
             super::set_animating(true);
         }
@@ -1433,7 +1433,7 @@ impl Compositor {
     /// разглядит, а держать список ради этого незачем.
     fn start_flight(&mut self, app: App, rect: Rect, restore: bool) -> bool {
         self.finish_flight();
-        if self.panel.is_none() {
+        if self.panel.is_none() || !super::animations_allowed() {
             return false;
         }
         self.flight = Some(Flight::new(app, rect, restore, crate::time::uptime_ns()));
@@ -2482,21 +2482,28 @@ impl Compositor {
             self.rects += 1;
             self.damage_overflow = false;
             self.damage_count = 0;
-            super::note_frame_ns(crate::time::uptime_ns().wrapping_sub(started));
+            let spent = crate::time::uptime_ns().wrapping_sub(started);
+            super::note_frame_ns(spent);
+            super::note_screen_cost(spent, 1, 1);
             return;
         }
         super::note_partial_frame(self.damage_count as u64);
 
+        let mut points = 0u64;
         for index in 0..self.damage_count {
             let rect = self.damage[index].intersect(&self.screen.bounds());
             if !rect.is_empty() {
                 super::note_rect(u64::from(rect.w) * u64::from(rect.h));
+                points += u64::from(rect.w) * u64::from(rect.h);
                 self.compose(rect);
                 self.rects += 1;
             }
         }
         self.damage_count = 0;
-        super::note_frame_ns(crate::time::uptime_ns().wrapping_sub(started));
+        let spent = crate::time::uptime_ns().wrapping_sub(started);
+        super::note_frame_ns(spent);
+        let screen = self.screen.bounds();
+        super::note_screen_cost(spent, points, u64::from(screen.w) * u64::from(screen.h));
     }
 
     /// Собрать сцену под летящим окном, если она нужна и её ещё нет (фаза 64).

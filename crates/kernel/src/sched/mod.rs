@@ -310,6 +310,20 @@ impl Scheduler {
     /// ничьей — и её было видно в `tasks` вместо «исполняется».
     fn pick_next(&self, cpu: usize) -> Option<usize> {
         let current = self.cpus[cpu].current;
+        // Сначала разбуженные вводом: указатель и стол не должны ждать в
+        // общей очереди за десятками потоков Chromium (24.10: мышь замирала на
+        // секунды, пока он запускался).
+        for step in 1..MAX_TASKS {
+            let slot = (current + step) % MAX_TASKS;
+            if is_idle_slot(slot) {
+                continue;
+            }
+            if let Some(task) = &self.tasks[slot] {
+                if task.boost && task.state == TaskState::Ready && task.cpu.is_none() {
+                    return Some(slot);
+                }
+            }
+        }
         for step in 1..MAX_TASKS {
             let slot = (current + step) % MAX_TASKS;
             if is_idle_slot(slot) {
@@ -833,6 +847,7 @@ pub fn wake_irq(source: u32) {
             task.state = TaskState::Ready;
             // Не ноль, даже если часы ещё на нуле: ноль значит «отметки нет».
             task.woken_by_irq_ms = crate::time::uptime_ms().max(1);
+            task.boost = true;
             woken += 1;
         }
     }
@@ -840,6 +855,10 @@ pub fn wake_irq(source: u32) {
     // может разойтись с тем, что видит следующий вызов. Стоит это одной записи
     // в атомик — на фоне обхода таблицы задач под локом это ничто.
     crate::irq::note_wake(source, woken);
+    drop(sched);
+    if woken > 0 {
+        ask_reschedule();
+    }
 }
 
 /// Разбудить тех, кто ждёт лок по адресу `address`.
@@ -916,10 +935,29 @@ pub fn wake_input() {
     let Some(mut sched) = SCHED.try_lock() else {
         return;
     };
+    let mut woke = false;
     for task in sched.tasks.iter_mut().flatten() {
         if matches!(task.state, TaskState::Blocked(Wait::Input(_))) {
             task.state = TaskState::Ready;
+            task.boost = true;
+            woke = true;
         }
+    }
+    drop(sched);
+    if woke {
+        ask_reschedule();
+    }
+}
+
+/// Попросить все процессоры переключиться на ближайшем тике: разбуженная
+/// задача с [`Task::boost`] получит процессор сразу, а не по истечении
+/// чужого кванта.
+fn ask_reschedule() {
+    if !PREEMPTION.load(Ordering::Relaxed) {
+        return;
+    }
+    for flag in &NEED_RESCHED {
+        flag.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1107,6 +1145,7 @@ fn schedule_with(cause: Cause) {
                             task.state = TaskState::Running;
                             task.cpu = Some(cpu);
                             task.switches += 1;
+                            task.boost = false;
                             task.ran_since_ms = now;
                             if task.woken_by_irq_ms != 0 {
                                 let waited = now.saturating_sub(task.woken_by_irq_ms);

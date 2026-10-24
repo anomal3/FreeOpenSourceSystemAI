@@ -48,6 +48,13 @@ static CWD: Mutex<String> = Mutex::new(String::new());
 /// История команд — общая для приглашения и команды `history`.
 static HISTORY: Mutex<history::History> = Mutex::new(history::History::new());
 
+/// Следующее событие указателя. На столе подряд идущие движения сливаются в
+/// одно (кадр на пачку, а не на каждое); на телефоне — нет: путь пальца по
+/// экранной клавиатуре и есть набранное слово.
+fn next_pointer() -> Option<input::PointerEvent> {
+    if mini_ui::theme::is_mobile() { input::next_pointer() } else { input::next_pointer_merged() }
+}
+
 /// Код возврата последней команды (терминал T4): ненулевой приглашение
 /// показывает красным `[N]`, как это делают темы bash и PowerShell.
 static LAST_EXIT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
@@ -372,7 +379,7 @@ pub fn task() {
         // Отчёты мыши разбираются перед клавишами: они меняют, какое окно
         // активно, и разобрать их после значило бы отдать нажатие тому окну,
         // которое было активным до щелчка.
-        while let Some(event) = input::next_pointer() {
+        while let Some(event) = next_pointer() {
             idle_since = time::uptime_ms();
             ui::dispatch_pointer(event);
         }
@@ -2275,7 +2282,7 @@ fn foreground(id: sched::TaskId, label: &str) {
             ui::shell_status(Some(&alloc::format!("{short} · идёт")));
         }
 
-        while let Some(event) = input::next_pointer() {
+        while let Some(event) = next_pointer() {
             ui::dispatch_pointer(event);
         }
 

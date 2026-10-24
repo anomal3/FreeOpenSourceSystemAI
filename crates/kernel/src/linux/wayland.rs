@@ -389,11 +389,30 @@ struct SurfaceState {
     shown: Option<(u32, Buffer)>,
     role: Role,
     children: Vec<u32>,
+    /// Что клиент объявил изменившимся (`damage`, `damage_buffer`) до
+    /// `commit`, в точках поверхности.
+    damage: Rect,
+    /// Изменившееся с прошлой отрисовки окна: стол перерисовывает только это
+    /// (до 24.10 окно Chromium копировалось целиком на каждый кадр, даже на
+    /// мигание курсора).
+    ready: Rect,
+    /// Перерисовать целиком: новый буфер без объявленных изменений или
+    /// другого размера.
+    full: bool,
 }
 
 impl SurfaceState {
     fn new() -> Self {
-        Self { pending: None, frames: Vec::new(), shown: None, role: Role::None, children: Vec::new() }
+        Self {
+            pending: None,
+            frames: Vec::new(),
+            shown: None,
+            role: Role::None,
+            children: Vec::new(),
+            damage: Rect::EMPTY,
+            ready: Rect::EMPTY,
+            full: true,
+        }
     }
 }
 
@@ -923,6 +942,18 @@ impl Client {
                     state.frames.push(callback);
                 }
             }
+            // `damage` и `damage_buffer`: при масштабе 1 координаты одни.
+            2 | 9 => {
+                let (x, y, w, h) = (args.i32()?, args.i32()?, args.i32()?, args.i32()?);
+                if let Some(Obj::Surface(state)) = self.objects.get_mut(&id) {
+                    let (x0, y0) = (x.max(0), y.max(0));
+                    let (x1, y1) = (x.saturating_add(w).min(8192), y.saturating_add(h).min(8192));
+                    if x1 > x0 && y1 > y0 {
+                        let rect = Rect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32);
+                        state.damage = state.damage.union(&rect);
+                    }
+                }
+            }
             6 => self.commit(id),
             _ => {}
         }
@@ -1036,13 +1067,29 @@ impl Client {
             _ => return,
         };
         self.frames_due.extend(frames);
+        let attached = pending.is_some();
+        if let Some(Obj::Surface(state)) = self.objects.get_mut(&id) {
+            let damage = core::mem::replace(&mut state.damage, Rect::EMPTY);
+            state.ready = state.ready.union(&damage);
+            // Новый буфер без объявленных изменений — клиент не сказал, что
+            // в нём другое; перерисовать целиком безопаснее.
+            if attached && damage.is_empty() {
+                state.full = true;
+            }
+        }
         if let Some(next) = pending {
             let shown = next.and_then(|buffer| match self.objects.get(&buffer) {
                 Some(Obj::Buffer(buf)) => Some((buffer, buf.clone())),
                 _ => None,
             });
             let old = match self.objects.get_mut(&id) {
-                Some(Obj::Surface(state)) => core::mem::replace(&mut state.shown, shown),
+                Some(Obj::Surface(state)) => {
+                    let size = |shown: &Option<(u32, Buffer)>| shown.as_ref().map(|(_, buf)| (buf.width, buf.height));
+                    if size(&state.shown) != size(&shown) {
+                        state.full = true;
+                    }
+                    core::mem::replace(&mut state.shown, shown)
+                }
                 _ => None,
             };
             // Прежний буфер больше не читается — вернуть его клиенту.
@@ -1129,11 +1176,14 @@ impl Client {
         let (gw, gh) = (gw.clamp(1, 4096), gh.clamp(1, 4096));
         let mut layers = Vec::new();
         self.layers(surface, -gx, -gy, 0, &mut layers);
+        let damaged = self.damaged(surface, -gx, -gy, 0);
         let win = &mut self.wins[index];
         let pid = self.pid;
+        let mut whole = win.dirty;
         win.dirty = true;
         match win.open {
             None => {
+                whole = true;
                 let Some(pixels) = Surface::new(gw, gh, theme::window_bg()) else {
                     return;
                 };
@@ -1154,14 +1204,64 @@ impl Client {
                 if crate::ui::resize_window(pid, win.slot, pixels).is_err() {
                     return;
                 }
+                whole = true;
                 win.open = Some((gw, gh));
             }
             Some(_) => {}
         }
         let swap = mini_ui::format_code() == user_abi::PIXEL_RGB;
-        let area = Rect::new(0, 0, gw, gh);
-        let painted = crate::ui::paint_window(pid, win.slot, area, |target| paint(target, &layers, swap));
+        let bounds = Rect::new(0, 0, gw, gh);
+        // Только изменившееся — кроме первого кадра, смены размера и повтора
+        // после занятого стола (тогда неизвестно, что уже нарисовано).
+        let area = match damaged {
+            _ if whole => bounds,
+            None => bounds,
+            Some(rect) => rect.intersect(&bounds),
+        };
+        if area.is_empty() {
+            win.dirty = false;
+            return;
+        }
+        let painted = crate::ui::paint_window(pid, win.slot, area, |target| paint(target, &layers, swap, area));
         win.dirty = painted.is_err();
+        if painted.is_ok() {
+            self.clear_damage(surface, 0);
+        }
+    }
+
+    /// Изменившееся в поверхности и её подповерхностях с прошлой отрисовки,
+    /// в координатах окна. `None` — перерисовать целиком.
+    fn damaged(&self, id: u32, dx: i32, dy: i32, depth: u32) -> Option<Rect> {
+        let Some(Obj::Surface(state)) = self.objects.get(&id) else {
+            return Some(Rect::EMPTY);
+        };
+        if state.full || depth >= 8 {
+            return None;
+        }
+        let mut area = if state.ready.is_empty() { Rect::EMPTY } else { state.ready.translate(dx, dy) };
+        for child in &state.children {
+            if let Some(Obj::Surface(SurfaceState { role: Role::Sub { x, y, .. }, .. })) = self.objects.get(child) {
+                area = area.union(&self.damaged(*child, dx + x, dy + y, depth + 1)?);
+            }
+        }
+        Some(area)
+    }
+
+    /// Нарисовано — забыть изменения поверхности и подповерхностей.
+    fn clear_damage(&mut self, id: u32, depth: u32) {
+        let children = match self.objects.get_mut(&id) {
+            Some(Obj::Surface(state)) => {
+                state.ready = Rect::EMPTY;
+                state.full = false;
+                state.children.clone()
+            }
+            _ => return,
+        };
+        if depth < 8 {
+            for child in children {
+                self.clear_damage(child, depth + 1);
+            }
+        }
     }
 
     /// Показать всплывающее окно: открыть над окном-владельцем при первом
@@ -1208,7 +1308,7 @@ impl Client {
         }
         let swap = mini_ui::format_code() == user_abi::PIXEL_RGB;
         let area = Rect::new(0, 0, gw, gh);
-        let painted = crate::ui::paint_window(pid, pop.slot, area, |target| paint(target, &layers, swap));
+        let painted = crate::ui::paint_window(pid, pop.slot, area, |target| paint(target, &layers, swap, area));
         pop.dirty = painted.is_err();
     }
 
@@ -1560,30 +1660,39 @@ struct Layer {
 
 /// Нарисовать слои в поверхность окна — строками прямо из памяти клиентов.
 /// `swap` — у экрана красный в младшем байте (у `wl_shm` — синий).
-fn paint(target: &mut Surface, layers: &[Layer], swap: bool) {
+fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect) {
     let (tw, th) = (target.width(), target.height());
-    let to_screen = |pixel: u32| if swap { (pixel & 0xff00_ff00) | ((pixel >> 16) & 0xff) | ((pixel & 0xff) << 16) } else { pixel };
-    let fill = to_screen(BACKDROP) & 0xff_ffff;
-    for y in 0..th {
-        target.row_mut(y).fill(fill);
-    }
-    let mut row = Vec::new();
-    if row.try_reserve_exact(tw as usize * 4).is_err() {
+    let area = area.intersect(&Rect::new(0, 0, tw, th));
+    if area.is_empty() {
         return;
     }
-    row.resize(tw as usize * 4, 0u8);
+    let (ax0, ax1) = (area.x, area.right());
+    let (ay0, ay1) = (area.y, area.bottom());
+    let to_screen = |pixel: u32| if swap { (pixel & 0xff00_ff00) | ((pixel >> 16) & 0xff) | ((pixel & 0xff) << 16) } else { pixel };
+    let fill = to_screen(BACKDROP) & 0xff_ffff;
+    for y in ay0..ay1 {
+        target.row_mut(y as u32)[ax0 as usize..ax1 as usize].fill(fill);
+    }
+    let mut row = Vec::new();
+    if row.try_reserve_exact(area.w as usize * 4).is_err() {
+        return;
+    }
+    row.resize(area.w as usize * 4, 0u8);
     for layer in layers {
         let buf = &layer.buf;
-        let x0 = layer.x.max(0);
-        let x1 = (layer.x + buf.width as i32).min(tw as i32);
+        let x0 = layer.x.max(ax0);
+        let x1 = (layer.x + buf.width as i32).min(ax1);
         if x0 >= x1 {
             continue;
         }
         let count = (x1 - x0) as usize;
         let first_column = (x0 - layer.x) as u64;
-        for sy in 0..buf.height {
+        // Только строки слоя, попадающие в изменившуюся область.
+        let sy0 = (ay0 - layer.y).max(0) as u32;
+        let sy1 = ((ay1 - layer.y).max(0) as u32).min(buf.height);
+        for sy in sy0..sy1 {
             let ty = sy as i32 + layer.y;
-            if ty < 0 || ty >= th as i32 {
+            if ty < ay0 || ty >= ay1 {
                 continue;
             }
             let at = buf.offset + u64::from(sy) * u64::from(buf.stride) + first_column * 4;

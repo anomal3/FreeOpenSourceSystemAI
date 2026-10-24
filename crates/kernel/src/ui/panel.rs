@@ -1849,6 +1849,7 @@ pub fn shows(pref: super::settings::PanelPref) -> bool {
         super::settings::PanelPref::Uptime => SHOW_UPTIME.load(Ordering::Relaxed),
         super::settings::PanelPref::Date => SHOW_DATE.load(Ordering::Relaxed),
         super::settings::PanelPref::Labels => LABELS.load(Ordering::Relaxed),
+        super::settings::PanelPref::Animations => super::animations_enabled(),
     }
 }
 
@@ -1857,6 +1858,7 @@ pub fn set_shows(pref: super::settings::PanelPref, on: bool) {
         super::settings::PanelPref::Uptime => SHOW_UPTIME.store(on, Ordering::Relaxed),
         super::settings::PanelPref::Date => SHOW_DATE.store(on, Ordering::Relaxed),
         super::settings::PanelPref::Labels => LABELS.store(on, Ordering::Relaxed),
+        super::settings::PanelPref::Animations => super::set_animations(on),
     }
 }
 

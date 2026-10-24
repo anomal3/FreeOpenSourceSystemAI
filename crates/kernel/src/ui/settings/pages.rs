@@ -174,6 +174,10 @@ impl SettingsView {
         y = row(pass, x, y, w, Some(Fi::Moon), "Тёмная тема", "", Ctl::Toggle(dark), Some(Deed::Theme(!dark)));
         let uptime = super::super::panel::shows(PanelPref::Uptime);
         y = row(pass, x, y, w, Some(Fi::Clock), "Показывать аптайм на панели", "Время работы рядом с часами", Ctl::Toggle(uptime), Some(Deed::Panel(PanelPref::Uptime, !uptime)));
+        // Как «Эффекты анимации» в Windows. На медленной машине анимация и
+        // включённая не играется — стол сам видит, что кадры не успевают.
+        let animations = super::super::panel::shows(PanelPref::Animations);
+        y = row(pass, x, y, w, Some(Fi::Monitor), "Анимация окон", "Открытие, сворачивание и разворот окон", Ctl::Toggle(animations), Some(Deed::Panel(PanelPref::Animations, !animations)));
         row(pass, x, y, w, Some(Fi::Palette), "Акцентный цвет", "", Ctl::NavValue(theme::accent().title()), Some(Deed::Open(Section::Colors)));
     }
 
