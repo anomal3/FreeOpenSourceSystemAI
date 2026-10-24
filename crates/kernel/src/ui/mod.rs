@@ -1623,7 +1623,7 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
     }
 
     if desktop.menu_open() {
-        handle_menu(desktop, event.code, status);
+        handle_menu(desktop, event, status);
         return None;
     }
 
@@ -3064,7 +3064,8 @@ fn toggle_menu(desktop: &mut Compositor, status: &Status) {
 }
 
 /// Разобрать клавишу, пока меню открыто.
-fn handle_menu(desktop: &mut Compositor, code: KeyCode, status: &Status) {
+fn handle_menu(desktop: &mut Compositor, event: KeyEvent, status: &Status) {
+    let code = event.code;
     let Some(menu) = desktop.menu_mut() else {
         return;
     };
@@ -3072,8 +3073,14 @@ fn handle_menu(desktop: &mut Compositor, code: KeyCode, status: &Status) {
     let mut launching = None;
     let mut closed = false;
     match code {
-        KeyCode::Up => menu.move_selection(false),
-        KeyCode::Down => menu.move_selection(true),
+        KeyCode::Up | KeyCode::Left => menu.move_selection(false),
+        KeyCode::Down | KeyCode::Right => menu.move_selection(true),
+        // Поиск (72f): набранное отбирает программы, Backspace стирает.
+        KeyCode::Backspace => {
+            if menu.backspace() {
+                kprintln!("  desktop     : menu search '{}'", menu.query());
+            }
+        }
         KeyCode::Enter => {
             launching = menu.selection();
             menu.close();
@@ -3083,7 +3090,12 @@ fn handle_menu(desktop: &mut Compositor, code: KeyCode, status: &Status) {
             menu.close();
             closed = true;
         }
-        _ => return,
+        _ => match keymap::char_for(event) {
+            Some(ch) if !event.mods.contains(Modifiers::CTRL) && !event.mods.contains(Modifiers::ALT) && menu.type_char(ch) => {
+                kprintln!("  desktop     : menu search '{}'", menu.query());
+            }
+            _ => return,
+        },
     }
 
     if closed {

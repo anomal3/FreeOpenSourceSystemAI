@@ -1449,6 +1449,49 @@ pub struct Menu {
     packages: Vec<Launcher>,
     /// Ширина колонки строк.
     width: u32,
+    /// Набранное в поле поиска (72f): строки отбираются по подписи.
+    query: String,
+    /// Строки, видимые при этом запросе, — номера в `items`. Выбор `row` —
+    /// номер здесь.
+    visible: Vec<usize>,
+}
+
+/// «Пуск» ПК по макету (72f, экран 06): размеры.
+mod start_menu {
+    /// Поле карточки.
+    pub const PAD: u32 = 16;
+    /// Поле поиска.
+    pub const SEARCH_H: u32 = 36;
+    /// Заголовок секции.
+    pub const TITLE_H: u32 = 28;
+    /// Ячейка закреплённой программы и число столбцов.
+    pub const CELL_W: u32 = 76;
+    pub const CELL_H: u32 = 78;
+    pub const COLUMNS: u32 = 6;
+    /// Зазор между колонками и ширина правой колонки «Все программы».
+    pub const GAP: u32 = 24;
+    pub const LIST_W: u32 = 236;
+    /// Строка списка и строка буквы.
+    pub const LIST_ROW: u32 = 26;
+    pub const LETTER_ROW: u32 = 18;
+    /// Нижняя полоса: пользователь и питание.
+    pub const FOOT_H: u32 = 60;
+    /// Наибольшая высота карточки.
+    pub const MAX_H: u32 = 600;
+}
+
+/// Ячейка нового «Пуска»: где она и какая строка `items` за ней.
+struct StartCell {
+    rect: Rect,
+    index: usize,
+    kind: CellKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellKind {
+    Pinned,
+    Listed,
+    Power,
 }
 
 impl Menu {
@@ -1506,20 +1549,27 @@ impl Menu {
             let full_h = (panel_top - top as i32).max(1) as u32;
             (full_w, full_h, full_w.saturating_sub(m.pad * 2))
         } else {
-            (card_w, card_h, width)
+            // Макет 06: закреплённые сеткой слева, все программы справа.
+            use start_menu::*;
+            let _ = (card_w, card_h);
+            let w = ctx.px(PAD * 2 + CELL_W * COLUMNS + GAP + LIST_W);
+            let h = ctx.px(MAX_H).min((panel_top as u32).saturating_sub(ctx.px(8)));
+            (w.min(screen_w), h, width)
         };
 
         let surface = Surface::new(card_w, card_h, glass_bg())?;
         // Левый край карточки — ровно левый край плашки панели: одна вертикаль
         // на весь стол читается как порядок, две почти совпадающие — как ошибка
         // отрисовки. На телефоне поле своё — под скруглённые углы экрана.
-        let left = if theme::is_mobile() { ctx.px(theme::M_INSET) } else { m.inset };
+        let left = if theme::is_mobile() { ctx.px(theme::M_INSET) } else { m.inset + ctx.px(8) };
+        let lift = if theme::is_mobile() { 0 } else { ctx.px(8) as i32 };
         let rect = Rect::new(
             left as i32,
-            panel_top - surface.height() as i32,
+            panel_top - surface.height() as i32 - lift,
             surface.width(),
             surface.height(),
         );
+        let visible = (0..items.len()).collect();
         Some(Self {
             surface,
             rect,
@@ -1531,7 +1581,44 @@ impl Menu {
             bin_programs: names.len(),
             packages,
             width,
+            query: String::new(),
+            visible,
         })
+    }
+
+    /// Набрать знак в поле поиска (72f). `true` — запрос изменился.
+    pub fn type_char(&mut self, ch: char) -> bool {
+        if theme::is_mobile() || ch.is_control() || self.query.chars().count() >= 32 {
+            return false;
+        }
+        self.query.push(ch);
+        self.refilter();
+        true
+    }
+
+    /// Стереть последний знак запроса.
+    pub fn backspace(&mut self) -> bool {
+        if self.query.pop().is_none() {
+            return false;
+        }
+        self.refilter();
+        true
+    }
+
+    /// Отобрать строки по запросу: подпись содержит его, без учёта регистра.
+    fn refilter(&mut self) {
+        let query = self.query.to_lowercase();
+        self.visible = (0..self.items.len())
+            .filter(|index| query.is_empty() || self.items[*index].caption(&self.packages).to_lowercase().contains(&query))
+            .collect();
+        self.row = 0;
+        self.redraw();
+    }
+
+    /// Запрос в журнал.
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
     }
 
     #[must_use]
@@ -1563,6 +1650,8 @@ impl Menu {
         self.open = !self.open;
         if self.open {
             self.row = 0;
+            self.query.clear();
+            self.visible = (0..self.items.len()).collect();
             self.redraw();
         }
         self.open
@@ -1589,6 +1678,11 @@ impl Menu {
             return None;
         }
         let (x, y) = (x - self.rect.x, y - self.rect.y);
+        if !theme::is_mobile() {
+            // Номер в `visible`: им считается выбор.
+            let index = self.start_cells().into_iter().find(|cell| cell.rect.contains(x, y))?.index;
+            return self.visible.iter().position(|visible| *visible == index);
+        }
         self.layout().rows.iter().find(|row| row.rect.contains(x, y)).map(|row| row.index)
     }
 
@@ -1596,6 +1690,7 @@ impl Menu {
     #[must_use]
     pub fn choice_at(&self, x: i32, y: i32) -> Option<Choice> {
         let index = self.row_at(x, y)?;
+        let index = if theme::is_mobile() { index } else { *self.visible.get(index)? };
         self.items.get(index).and_then(|item| item.choice(&self.packages))
     }
 
@@ -1611,7 +1706,7 @@ impl Menu {
 
     /// Сдвинуть выбор, по кругу.
     pub fn move_selection(&mut self, forward: bool) {
-        let count = self.items.len();
+        let count = if theme::is_mobile() { self.items.len() } else { self.visible.len() };
         if count == 0 {
             return;
         }
@@ -1622,7 +1717,8 @@ impl Menu {
     /// Что выбрано сейчас.
     #[must_use]
     pub fn selection(&self) -> Option<Choice> {
-        self.items.get(self.row).and_then(|item| item.choice(&self.packages))
+        let index = if theme::is_mobile() { self.row } else { *self.visible.get(self.row)? };
+        self.items.get(index).and_then(|item| item.choice(&self.packages))
     }
 
     #[must_use]
@@ -1690,7 +1786,168 @@ impl Menu {
         }
     }
 
+    /// Ячейки нового «Пуска» в координатах карточки: закреплённые сеткой,
+    /// все программы списком по алфавиту, кнопки питания внизу справа.
+    fn start_cells(&self) -> Vec<StartCell> {
+        use start_menu::*;
+        let ctx = desk_ctx(self.scale);
+        let card = self.surface.bounds();
+        let px = |value: u32| ctx.px(value);
+        let mut cells = Vec::new();
+        let top = card.y + px(PAD + SEARCH_H + 12 + TITLE_H) as i32;
+        let foot = card.bottom() - px(FOOT_H) as i32;
+        // Закреплённые — всё, кроме питания, в порядке меню.
+        let programs: Vec<usize> = self.visible.iter().copied().filter(|index| !self.items[*index].danger()).collect();
+        for (n, index) in programs.iter().enumerate() {
+            let (col, row) = (n as u32 % COLUMNS, n as u32 / COLUMNS);
+            let rect = Rect::new(card.x + px(PAD + col * CELL_W) as i32, top + px(row * CELL_H) as i32, px(CELL_W), px(CELL_H));
+            if rect.bottom() > foot {
+                break;
+            }
+            cells.push(StartCell { rect, index: *index, kind: CellKind::Pinned });
+        }
+        // Все программы по алфавиту, с буквами.
+        let mut sorted = programs.clone();
+        sorted.sort_by_key(|index| self.items[*index].caption(&self.packages).to_lowercase());
+        let x = card.x + px(PAD + CELL_W * COLUMNS + GAP) as i32;
+        let mut y = top;
+        let mut letter = None;
+        for index in sorted {
+            let first = self.items[index].caption(&self.packages).chars().next().map(|ch| ch.to_uppercase().next().unwrap_or(ch));
+            if first != letter {
+                letter = first;
+                y += px(LETTER_ROW) as i32;
+            }
+            let rect = Rect::new(x, y, px(LIST_W), px(LIST_ROW));
+            if rect.bottom() > foot - px(8) as i32 {
+                break;
+            }
+            cells.push(StartCell { rect, index, kind: CellKind::Listed });
+            y += px(LIST_ROW) as i32;
+        }
+        // Питание: «Завершение работы» и «Перезагрузка» — кнопки справа внизу.
+        let side = px(36);
+        let mut bx = card.right() - px(PAD) as i32 - side as i32;
+        for index in self.visible.iter().rev().copied().filter(|index| self.items[*index].danger()) {
+            let rect = Rect::new(bx, foot + (px(FOOT_H) as i32 - side as i32) / 2, side, side);
+            cells.push(StartCell { rect, index, kind: CellKind::Power });
+            bx -= (side + px(8)) as i32;
+        }
+        cells
+    }
+
+    /// Нарисовать новый «Пуск» (72f, макет 06).
+    fn redraw_start(&mut self) {
+        use start_menu::*;
+        let ctx = desk_ctx(self.scale);
+        let p = ctx.palette;
+        let card = self.surface.bounds();
+        let px = |value: u32| ctx.px(value);
+        let fill = p.tb1.over(p.tb2.color);
+        self.surface.fill(card, fill);
+        draw::rounded_stroke(&mut self.surface, card, px(theme::R_WINDOW), p.line3.color, p.line3.alpha);
+        let ctx = ctx.on(fill);
+
+        // Поиск.
+        let field = Rect::new(card.x + px(PAD) as i32, card.y + px(PAD) as i32, card.w - px(PAD * 2), px(SEARCH_H));
+        draw::rounded(&mut self.surface, field, px(theme::R_ROW), p.sunk.over(fill), 255);
+        draw::rounded_stroke(&mut self.surface, field, px(theme::R_ROW), p.line3.color, p.line3.alpha);
+        let glyph = px(14);
+        glyphicon::draw(&mut self.surface, Icon::Search, field.x + px(12) as i32, field.y + (field.h as i32 - glyph as i32) / 2, glyph, p.ink4, 255);
+        let text_x = field.x + px(34) as i32;
+        let room = field.right().saturating_sub(text_x + px(12) as i32).max(0) as u32;
+        if self.query.is_empty() {
+            paint::text_clipped(ctx, &mut self.surface, Role::Body, text_x, paint::baseline(ctx, Role::Body, field), room, "Поиск программ", p.ink4);
+        } else {
+            let used = paint::text_clipped(ctx, &mut self.surface, Role::Body, text_x, paint::baseline(ctx, Role::Body, field), room, &self.query, p.ink);
+            let caret = Rect::new(text_x + used as i32 + 1, field.y + px(9) as i32, px(1).max(1), field.h - px(18));
+            self.surface.fill(caret, p.acc);
+        }
+
+        // Заголовки секций.
+        let titles_y = card.y + px(PAD + SEARCH_H + 12) as i32;
+        let title_row = Rect::new(card.x + px(PAD) as i32, titles_y, px(CELL_W * COLUMNS), px(TITLE_H));
+        paint::text(ctx, &mut self.surface, Role::Title, title_row.x + px(4) as i32, paint::baseline(ctx, Role::Title, title_row), "Закреплённые", p.ink);
+        let list_x = card.x + px(PAD + CELL_W * COLUMNS + GAP) as i32;
+        paint::text(ctx, &mut self.surface, Role::Title, list_x + px(8) as i32, paint::baseline(ctx, Role::Title, title_row), "Все программы", p.ink);
+
+        // Нижняя полоса: черта, пользователь, питание.
+        let foot = card.bottom() - px(FOOT_H) as i32;
+        draw::hline(&mut self.surface, card.x, foot, card.w, p.line2.color, p.line2.alpha);
+        let user = crate::user::session::with_name(|name| String::from(name));
+        let user = if user.is_empty() { String::from("root") } else { user };
+        let avatar = Rect::new(card.x + px(PAD) as i32, foot + (px(FOOT_H) as i32 - px(32) as i32) / 2, px(32), px(32));
+        draw::rounded(&mut self.surface, avatar, px(16), p.acc, 255);
+        let initial: String = user.chars().next().map(|ch| ch.to_uppercase().collect()).unwrap_or_default();
+        paint::text_centered(ctx.on(p.acc), &mut self.surface, Role::Title, avatar, &initial, WHITE);
+        let name_row = Rect::new(avatar.right() + px(12) as i32, avatar.y, px(200), avatar.h);
+        paint::text(ctx, &mut self.surface, Role::Body, name_row.x, paint::baseline(ctx, Role::Body, name_row), &user, p.ink);
+
+        let selected = self.visible.get(self.row).copied();
+        let cells = self.start_cells();
+        let mut letter = None;
+        for cell in &cells {
+            let item = self.items[cell.index];
+            let chosen = Some(cell.index) == selected;
+            match cell.kind {
+                CellKind::Pinned => {
+                    if chosen {
+                        draw::rounded(&mut self.surface, cell.rect, px(theme::R_ROW), p.btnhov.over(fill), 255);
+                    }
+                    let side = px(32);
+                    let icon = Rect::new(cell.rect.x + (cell.rect.w as i32 - side as i32) / 2, cell.rect.y + px(10) as i32, side, side);
+                    draw_item_icon(ctx, &mut self.surface, icon, item);
+                    let label = Rect::new(cell.rect.x + px(2) as i32, icon.bottom() + px(6) as i32, cell.rect.w - px(4), px(18));
+                    let caption = item.caption(&self.packages);
+                    let width = ctx.face(Role::Caption).width(caption).min(label.w);
+                    paint::text_clipped(ctx, &mut self.surface, Role::Caption, label.x + (label.w as i32 - width as i32) / 2, label.y, label.w, caption, p.ink2);
+                }
+                CellKind::Listed => {
+                    let caption = item.caption(&self.packages);
+                    let first = caption.chars().next().map(|ch| ch.to_uppercase().next().unwrap_or(ch));
+                    if first != letter {
+                        letter = first;
+                        let mark: String = first.map(String::from).unwrap_or_default();
+                        let row = Rect::new(cell.rect.x + px(8) as i32, cell.rect.y - px(LETTER_ROW) as i32, px(40), px(LETTER_ROW));
+                        paint::text(ctx, &mut self.surface, Role::Label, row.x, paint::baseline(ctx, Role::Label, row), &mark, p.acc_ink);
+                    }
+                    if chosen {
+                        draw::rounded(&mut self.surface, cell.rect, px(theme::R_ROW), p.btnhov.over(fill), 255);
+                    }
+                    let side = px(20);
+                    let icon = Rect::new(cell.rect.x + px(8) as i32, cell.rect.y + (cell.rect.h as i32 - side as i32) / 2, side, side);
+                    draw_item_icon(ctx, &mut self.surface, icon, item);
+                    let x = icon.right() + px(10) as i32;
+                    paint::text_clipped(ctx, &mut self.surface, Role::Body, x, paint::baseline(ctx, Role::Body, cell.rect), (cell.rect.right() - x).max(0) as u32, caption, p.ink2);
+                }
+                CellKind::Power => {
+                    let plate = if chosen { p.btnhov.over(fill) } else { p.btn.over(fill) };
+                    draw::rounded(&mut self.surface, cell.rect, px(theme::R_ROW), plate, 255);
+                    let glyph = px(16);
+                    let icon = if matches!(item, Item::App(App::Restart)) { Icon::Update } else { Icon::Power };
+                    let ink = if chosen { p.bad_ink } else { p.ink2 };
+                    glyphicon::draw(&mut self.surface, icon, cell.rect.x + (cell.rect.w as i32 - glyph as i32) / 2, cell.rect.y + (cell.rect.h as i32 - glyph as i32) / 2, glyph, ink, 255);
+                }
+            }
+        }
+        // Подпись выбранной кнопки питания — слева от кнопок.
+        if let Some(cell) = cells.iter().find(|cell| cell.kind == CellKind::Power && Some(cell.index) == selected) {
+            let caption = self.items[cell.index].caption(&self.packages);
+            let leftmost = cells.iter().filter(|cell| cell.kind == CellKind::Power).map(|cell| cell.rect.x).min().unwrap_or(cell.rect.x);
+            paint::text_right(ctx, &mut self.surface, Role::Body, leftmost - px(10) as i32, paint::baseline(ctx, Role::Body, cell.rect), caption, p.bad_ink);
+        }
+        if self.visible.is_empty() {
+            let row = Rect::new(card.x + px(PAD) as i32, titles_y + px(TITLE_H + 12) as i32, px(CELL_W * COLUMNS), px(24));
+            paint::text(ctx, &mut self.surface, Role::Body, row.x + px(4) as i32, row.y, "Ничего не найдено", p.ink4);
+        }
+        self.damage = self.surface.bounds();
+    }
+
     fn redraw(&mut self) {
+        if !theme::is_mobile() {
+            self.redraw_start();
+            return;
+        }
         let ctx = desk_ctx(self.scale);
         let m = Metrics::new(ctx);
         let p = ctx.palette;
@@ -1748,6 +2005,14 @@ impl Menu {
         }
 
         self.damage = self.surface.bounds();
+    }
+}
+
+/// Значок строки «Пуска»: значок макета, если есть, иначе знак на плитке.
+fn draw_item_icon(ctx: Ctx, s: &mut Surface, rect: Rect, item: Item) {
+    match super::appicon::design_for(item.icon()) {
+        Some(image) => image.draw(s, rect),
+        None => paint::icon_tile(ctx, s, rect, item.icon(), item.tone(), false),
     }
 }
 
