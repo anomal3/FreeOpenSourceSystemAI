@@ -867,10 +867,14 @@ const LAG_STEPS: &[Step] = &[
             Step::Await("ui       frame counters reset", 15_000),
             Step::Press,
             Step::Await("desktop     : resizing 'Terminal'", 15_000),
-            Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4),
-            Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4),
-            Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4),
-            Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4), Step::Move(6, 4),
+            // По вертикали — по точке: окно стоит у самой панели, и шаг 4
+            // уводил указатель за нижний край экрана; стенд считал его там,
+            // где его нет, и следующий щелчок уходил выше окна (полный
+            // прогон 25.10).
+            Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1),
+            Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1),
+            Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1),
+            Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1), Step::Move(6, 1),
             Step::Release,
             Step::Await("desktop     : resized 'Terminal'", 15_000),
             Step::Line("ui"),
@@ -5581,7 +5585,7 @@ pub const ALL: &[Scenario] = &[
             Step::Painted("chromium"),
             // Развернуть: `configure` с размером экрана и новый буфер того же
             // размера (до фазы 71i с этим кончалась куча ядра).
-            Step::Aim(Aim::Maximize("Untitled - Chromium")),
+            Step::Aim(Aim::Frameless("Untitled - Chromium", 1)),
             Step::Click,
             // До двух минут: Chromium в отладочном ядре под эмулятором бывает
             // занят запуском очередного процесса, и щелчок разбирается не
@@ -5604,7 +5608,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("popup closed", 60_000),
             Step::Wait(5_000),
             // Крестик стола — `xdg_toplevel.close`; Chromium закрывается сам.
-            Step::Aim(Aim::Close("FossAi - Chromium")),
+            Step::Aim(Aim::Frameless("FossAi - Chromium", 0)),
             Step::Click,
             Step::Await("/opt/debian/bin/bash: exited with code 0", 120_000),
             // Второй запуск — двойным щелчком по значку на столе. Оболочка

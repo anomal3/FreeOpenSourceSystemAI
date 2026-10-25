@@ -47,6 +47,10 @@ pub enum Aim {
     Minimize(&'static str),
     /// Кнопка «развернуть» — вторая справа.
     Maximize(&'static str),
+    /// Кнопки окна без рамки стола (Chromium рисует их сам): своя геометрия
+    /// — квадраты 30 с зазором 6 и полем 10, середина на высоте 22. Номер
+    /// справа налево, как у [`Aim::Close`] / [`Aim::Maximize`].
+    Frameless(&'static str, i32),
     /// Уголок изменения размера — правый нижний угол окна.
     Grip(&'static str),
     /// Значок рабочего стола по его номеру сверху, считая с нуля.
@@ -275,17 +279,24 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
             PANEL_INSET + 4 + 22,
             height - PANEL_INSET - PANEL_H / 2,
         ),
-        // Середина полосы, а не треть: с 72h у терминала в левой половине
-        // заголовка — вкладки, а за вкладку окно не таскают.
+        // Пустое место полосы перед кнопками окна: с 72h у терминала слева в
+        // заголовке — вкладки и «+», а за них окно не таскают.
         Aim::Title(title) => {
             let rect = window(log, title)?;
-            (rect.x + rect.w / 2, rect.y + TITLE_H * ui_scale(log)? / 2)
+            let scale = ui_scale(log)?;
+            (rect.x + rect.w - (3 * TITLE_BTN + 40) * scale, rect.y + TITLE_H * scale / 2)
         }
         // Кнопки заголовка стоят справа налево вплотную к краю: ширина 46,
         // во всю высоту полосы (72b). Числа те же, что в `theme.rs`, и
         // разойтись им нельзя — прицел, посчитанный по старой геометрии, молча
         // попадает в кнопку соседа, а это «свернул вместо закрыл».
         Aim::Close(title) => title_button(log, title, 0)?,
+        Aim::Frameless(title, from_right) => {
+            let rect = window(log, title)?;
+            let scale = ui_scale(log)?;
+            let right = rect.x + rect.w - 10 * scale;
+            (right - from_right * 36 * scale - 15 * scale, rect.y + 22 * scale)
+        }
         Aim::Maximize(title) => title_button(log, title, 1)?,
         Aim::Minimize(title) => title_button(log, title, 2)?,
         Aim::Grip(title) => {

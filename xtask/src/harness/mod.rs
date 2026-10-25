@@ -2080,6 +2080,26 @@ impl Drop for HostServer {
 ///
 /// Соединения обслуживаются по одному и намеренно: гость подключается
 /// последовательно, а пул потоков ради этого — лишний способ отказать.
+/// Дочитать, что гость ещё шлёт, прежде чем закрыть сокет («мягкое
+/// закрытие»).
+///
+/// Закрыть сокет с непрочитанными байтами — значит послать `RST`, а `RST`
+/// у гостя выбрасывает ответ, который тот ещё не дочитал. Так терялся индекс
+/// в `update-tls` и каталог в `driver-net` (полный прогон 25.10): гость слал
+/// `close_notify` уже после нашего `FIN`, Windows отвечала сбросом.
+fn linger(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let mut scratch = [0u8; 1024];
+    let until = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < until {
+        match stream.read(&mut scratch) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
 fn serve<F>(listener: std::net::TcpListener, handle: F) -> Result<HostServer>
 where
     F: Fn(std::net::TcpStream) + Send + 'static,
@@ -2267,6 +2287,7 @@ fn start_host_tls_repo(
             }
             stream.flush().ok();
             stream.shutdown(std::net::Shutdown::Write).ok();
+            linger(&mut stream);
         }
     })?;
     say!("стенд: сервер обновлений по HTTPS слушает {port}");
@@ -2364,6 +2385,7 @@ fn start_host_repo(root: PathBuf, port: u16) -> Result<HostServer> {
             // Гость дочитывает тело по длине и закрывается сам; наш `FIN` нужен
             // ему только затем, чтобы не ждать своего таймаута на прощание.
             stream.shutdown(std::net::Shutdown::Write).ok();
+            linger(&mut stream);
         }
     })?;
     say!("стенд: сервер обновлений слушает {port}, каталог отдаётся гостю");
