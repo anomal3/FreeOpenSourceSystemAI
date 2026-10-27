@@ -117,6 +117,9 @@ enum How {
     /// Chromium без окна из Debian 12 (фаза 71h): семь десятков `.deb` со
     /// своими хешами — см. [`crate::chromium`].
     Chromium,
+    /// Java (JetBrains Runtime 25) из дистрибутива Rider для Linux — см.
+    /// [`crate::java`].
+    Java,
 }
 
 /// Что распаковывать из архива LLVM для [`How::LlvmRuntimes`]: сборка
@@ -184,7 +187,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 21] = [
+const PROJECTS: [Project; 22] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -621,6 +624,17 @@ const PROJECTS: [Project; 21] = [
         how: How::Chromium,
         installs: &[],
     },
+    // Java для программ Linux: JBR из архива Rider (адрес и хеш — в
+    // `crate::java`, архив качает он сам и держит в кеше: 2,4 ГБ).
+    Project {
+        name: "java",
+        version: "25",
+        url: crate::java::RIDER_URL,
+        sha256: crate::java::RIDER_SHA256,
+        unpacked: "rider",
+        how: How::Java,
+        installs: &[],
+    },
 ];
 
 /// Собрать чужие проекты под все указанные архитектуры: все или только
@@ -644,6 +658,12 @@ pub fn build_all(arches: &[Arch], refresh: bool, only: &[String]) -> Result<()> 
         if project.how == How::Chromium {
             for &arch in arches {
                 crate::chromium::build(arch)?;
+            }
+            continue;
+        }
+        if project.how == How::Java {
+            for &arch in arches {
+                crate::java::build(arch)?;
             }
             continue;
         }
@@ -962,7 +982,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         }
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
-        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium => return Ok(()),
+        How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java => return Ok(()),
         How::Doomgeneric => {
             let game = work.join("doomgeneric");
             // Список объектов — из его же `Makefile.sdl`, без трёх звуковых

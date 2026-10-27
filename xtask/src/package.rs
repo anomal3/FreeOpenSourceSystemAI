@@ -165,6 +165,13 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
         } else {
             say!("пакет chromium пропущен: нет {} — собрать: cargo xtask thirdparty --only chromium", path.display());
         }
+        // Java (JBR из дистрибутива Rider) — тоже от `xtask thirdparty`.
+        let path = crate::java::package_path();
+        if path.is_file() {
+            samples.push((crate::java::PACKAGE_FILE, fs::read(&path)?));
+        } else {
+            say!("пакет java пропущен: нет {} — собрать: cargo xtask thirdparty --only java", path.display());
+        }
     }
 
     let mut built = Vec::new();
@@ -180,8 +187,8 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
 
 /// Пакеты игр: только на установочный носитель, не в RAM-диск живой системы.
 /// Там же llama.cpp (фаза 70d) — по той же причине: десятки мегабайт.
-pub const GAMES: [&str; 5] =
-    ["freedoom-0.13.fpk", "sopwith-2.9.0.fpk", "llama-0.7.0.fpk", "debian-12.fpk", "linuxweb-150.fpk"];
+pub const GAMES: [&str; 6] =
+    ["freedoom-0.13.fpk", "sopwith-2.9.0.fpk", "llama-0.7.0.fpk", "debian-12.fpk", "linuxweb-150.fpk", "jbr-25.fpk"];
 
 /// llama.cpp пакетом (фаза 70d): программы llama.cpp, проверка библиотеки
 /// C++ (`cxxdemo`) и маленькая модель stories15M — чтобы было что запустить
@@ -640,7 +647,7 @@ pub fn place_updates(
         .lookup(&mut dev, ext2::ROOT_INODE, "media")
         .map_err(|err| anyhow::anyhow!("не удалось прочитать корень образа: {err}"))?;
     if let Some((dir, _)) = media {
-        for name in [crate::debian::PACKAGE_FILE, crate::chromium::PACKAGE_FILE, BIG_FILE_NAME] {
+        for name in [crate::debian::PACKAGE_FILE, crate::chromium::PACKAGE_FILE, crate::java::PACKAGE_FILE, BIG_FILE_NAME] {
             match fs.unlink(&mut dev, dir, name) {
                 Ok(()) => say!("стенд: /media/{name} убран, чтобы освободить место под обновления"),
                 Err(ext2::Error::NotFound) => {}

@@ -464,8 +464,115 @@ pub fn deliver(frame: &mut crate::arch::TrapFrame) {
             unsafe { crate::arch::return_to_kernel(128 + sig as i64) }
         }
         SIG_IGN => {}
-        handler => enter_handler(frame, slot, sig, action, handler, mask, handled_mask),
+        handler => enter_handler(frame, slot, sig, action, handler, mask, handled_mask, None),
     }
+}
+
+/// Отказ процессора — для кадра сигнала: `si_code`, `si_addr` и то, что Linux
+/// кладёт в `mcontext` (`err`, `trapno`, `cr2`).
+#[derive(Clone, Copy)]
+struct Fault {
+    code: i32,
+    addr: u64,
+    trapno: u64,
+    err: u64,
+}
+
+/// Отказ процессора в программе Linux — сигналом, как у Linux: `SIGSEGV` на
+/// отказ страницы и общую защиту, `SIGFPE` на деление, `SIGILL` на
+/// недопустимую инструкцию, `SIGTRAP` на точку останова, `SIGBUS` на
+/// выравнивание. `true` — кадр построен, и возврат из исключения войдёт в
+/// обработчик; `false` — обработчика нет или сигнал заблокирован, и программу
+/// снимают, как раньше.
+///
+/// # Зачем
+///
+/// Java (HotSpot) держится на этом: проверки на `null` в скомпилированном
+/// коде — это чтение по нулевому адресу и `SIGSEGV`, деление на ноль — `SIGFPE`,
+/// остановка потоков — чтение защищённой страницы. Первое, что она делает при
+/// запуске, — нарочно читает нулевой адрес и ждёт свой обработчик.
+pub fn deliver_fault(frame: &mut crate::arch::TrapFrame, vector: u8, addr: usize) -> bool {
+    const SIGILL: usize = 4;
+    const SIGTRAP: usize = 5;
+    const SIGBUS: usize = 7;
+    const SIGFPE: usize = 8;
+    const SIGSEGV: usize = 11;
+    /// Бит «страница присутствует» в коде ошибки #PF.
+    const PF_PRESENT: u64 = 1;
+    let (sig, code, at) = match vector {
+        // FPE_INTDIV.
+        0 => (SIGFPE, 1, frame.rip),
+        // TRAP_BRKPT.
+        3 => (SIGTRAP, 1, 0),
+        // ILL_ILLOPN.
+        6 => (SIGILL, 2, frame.rip),
+        // SI_KERNEL: у общей защиты адреса нет.
+        13 => (SIGSEGV, 0x80, 0),
+        // SEGV_ACCERR, если страница есть, иначе SEGV_MAPERR.
+        14 => (SIGSEGV, if frame.error & PF_PRESENT != 0 { 2 } else { 1 }, addr as u64),
+        // FPE_FLTINV — x87 и SSE.
+        16 | 19 => (SIGFPE, 7, frame.rip),
+        // BUS_ADRALN.
+        17 => (SIGBUS, 1, addr as u64),
+        _ => return false,
+    };
+    let Some((true, action)) = crate::user::with_current(|program| (program.linux, program.linux_actions[sig])) else {
+        return false;
+    };
+    let slot = sched::current_slot();
+    let mask = LINUX_SIGMASK[slot].load(Ordering::Relaxed);
+    if action.handler == 0 || action.handler == SIG_IGN || mask & bit(sig) != 0 {
+        return false;
+    }
+    let fault = Fault { code, addr: at, trapno: u64::from(vector), err: frame.error };
+    enter_handler(frame, slot, sig, action, action.handler, mask, mask, Some(fault));
+    true
+}
+
+/// Область `FXSAVE` в кадре сигнала — `uc_mcontext.fpregs` у Linux.
+const FPSTATE: usize = 512;
+/// Смещение `fpregs` в `mcontext`: за 23 регистрами.
+const FPREGS_AT: usize = MCONTEXT_AT + 23 * 8;
+
+/// Сохранить x87 и SSE программы в её память.
+///
+/// Регистры процессора сейчас — её: ядро SSE не трогает, а планировщик
+/// сохраняет и возвращает их на каждом переключении (`arch::fpu`).
+///
+/// # Safety
+///
+/// `area` выровнен на 16 и проверен на запись.
+unsafe fn save_fpu(area: usize) {
+    // SAFETY: контракт функции.
+    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) area, options(nostack, preserves_flags)) };
+}
+
+/// Вернуть x87 и SSE из кадра сигнала — через копию в ядре, с проверенным
+/// `MXCSR`: зарезервированный бит в нём — общая защита в самом ядре.
+fn restore_fpu(area: usize) {
+    if area == 0 || area % 16 != 0 || !space::user_can(area, FPSTATE, PageFlags::READ) {
+        return;
+    }
+    // Выравнивание — вручную, внутри буфера с запасом. `align(16)` у
+    // переменной на стеке здесь не работает: стек ядра в ловушке выровнен на
+    // восемь, а компилятор считает его выровненным на шестнадцать — и
+    // `fxrstor64` по адресу `…e8` был общей защитой в нулевом кольце.
+    let mut buffer = [0u8; FPSTATE + 16];
+    let skew = buffer.as_ptr().align_offset(16);
+    let copy = &mut buffer[skew..skew + FPSTATE];
+    // SAFETY: проверено выше.
+    unsafe { core::ptr::copy_nonoverlapping(area as *const u8, copy.as_mut_ptr(), FPSTATE) };
+    let field = |copy: &[u8], at: usize| u32::from_le_bytes(copy[at..at + 4].try_into().unwrap_or([0; 4]));
+    // `MXCSR_MASK` (смещение 28) из `fxsave` этого же процессора; ноль значит
+    // маску по умолчанию.
+    let allowed = match field(copy, 28) {
+        0 => 0xFFBF,
+        mask => mask,
+    };
+    let mxcsr = field(copy, 24) & allowed;
+    copy[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+    // SAFETY: область своя, выровнена на 16, `MXCSR` без зарезервированных битов.
+    unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) copy.as_ptr(), options(nostack, preserves_flags)) };
 }
 
 /// `mask` — что вернёт `rt_sigreturn`, `during` — к чему на время обработчика
@@ -478,19 +585,26 @@ fn enter_handler(
     handler: usize,
     mask: u64,
     during: u64,
+    fault: Option<Fault>,
 ) {
     let (alt_sp, alt_size) = (LINUX_ALTSTACK[slot].0.load(Ordering::Relaxed), LINUX_ALTSTACK[slot].1.load(Ordering::Relaxed));
     let user_sp = frame.rsp as usize;
     let on_alt = alt_size != 0 && user_sp > alt_sp && user_sp <= alt_sp + alt_size;
     let base = if action.flags & SA_ONSTACK != 0 && alt_size != 0 && !on_alt { alt_sp + alt_size } else { user_sp - 128 };
+    // Над кадром — область `FXSAVE`, выровненная на 16: обработчик вправе
+    // испортить регистры SSE, а прерванный код (скомпилированная Java) их
+    // ждёт обратно.
+    let fpstate = (base - FPSTATE) & !15;
     let total = 8 + UCONTEXT + SIGINFO;
     // После «call» обработчика `rsp + 8` кратен 16.
-    let sp = ((base - total) & !15) - 8;
-    if !space::user_can(sp, total, PageFlags::WRITE) {
+    let sp = ((fpstate - total) & !15) - 8;
+    if !space::user_can(sp, fpstate + FPSTATE - sp, PageFlags::WRITE) {
         crate::kprintln!("  linux       : no room for a signal frame, killed by signal {sig}");
-        // SAFETY: из системного вызова третьего кольца.
+        // SAFETY: из системного вызова или исключения третьего кольца.
         unsafe { crate::arch::return_to_kernel(128 + sig as i64) }
     }
+    // SAFETY: выровнено и проверено на запись строкой выше.
+    unsafe { save_fpu(fpstate) };
     let uc = sp + 8;
     let info = uc + UCONTEXT;
     let f = frame;
@@ -510,11 +624,25 @@ fn enter_handler(
         // cs, gs, fs, ss — по 16 бит.
         let csgsfs = (f.cs & 0xFFFF) | ((f.ss & 0xFFFF) << 48);
         core::ptr::write_unaligned((uc + MCONTEXT_AT + 144) as *mut u64, csgsfs);
+        core::ptr::write_unaligned((uc + FPREGS_AT) as *mut u64, fpstate as u64);
         core::ptr::write_unaligned((uc + SIGMASK_AT) as *mut u64, mask);
-        // siginfo: si_signo, si_errno, si_code (SI_TKILL = -6), pid, uid.
         core::ptr::write_unaligned(info as *mut i32, sig as i32);
-        core::ptr::write_unaligned((info + 8) as *mut i32, -6);
-        core::ptr::write_unaligned((info + 16) as *mut u32, pid);
+        match fault {
+            // Отказ: `si_code` и `si_addr`; в `mcontext` — `err`, `trapno`,
+            // `cr2` (регистры 19, 20 и 22).
+            Some(fault) => {
+                core::ptr::write_unaligned((info + 8) as *mut i32, fault.code);
+                core::ptr::write_unaligned((info + 16) as *mut u64, fault.addr);
+                core::ptr::write_unaligned((uc + MCONTEXT_AT + 19 * 8) as *mut u64, fault.err);
+                core::ptr::write_unaligned((uc + MCONTEXT_AT + 20 * 8) as *mut u64, fault.trapno);
+                core::ptr::write_unaligned((uc + MCONTEXT_AT + 22 * 8) as *mut u64, fault.addr);
+            }
+            // Сигнал от процесса: si_code SI_TKILL (-6), pid.
+            None => {
+                core::ptr::write_unaligned((info + 8) as *mut i32, -6);
+                core::ptr::write_unaligned((info + 16) as *mut u32, pid);
+            }
+        }
     }
     let mut next = during | action.mask;
     if action.flags & SA_NODEFER == 0 {
@@ -544,12 +672,14 @@ pub fn sigreturn(frame: &mut crate::arch::TrapFrame) {
         unsafe { crate::arch::return_to_kernel(128 + 11) }
     }
     // SAFETY: кадр проверен на чтение выше.
-    let (gregs, mask) = unsafe {
+    let (gregs, mask, fpregs) = unsafe {
         (
             core::ptr::read_unaligned((uc + MCONTEXT_AT) as *const [u64; 18]),
             core::ptr::read_unaligned((uc + SIGMASK_AT) as *const u64),
+            core::ptr::read_unaligned((uc + FPREGS_AT) as *const u64),
         )
     };
+    restore_fpu(fpregs as usize);
     let f = frame;
     [f.r8, f.r9, f.r10, f.r11, f.r12, f.r13, f.r14, f.r15, f.rdi, f.rsi, f.rbp, f.rbx, f.rdx, f.rax, f.rcx, f.rsp, f.rip] =
         [gregs[0], gregs[1], gregs[2], gregs[3], gregs[4], gregs[5], gregs[6], gregs[7], gregs[8], gregs[9], gregs[10], gregs[11], gregs[12], gregs[13], gregs[14], gregs[15], gregs[16]];

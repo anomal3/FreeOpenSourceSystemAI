@@ -38,6 +38,8 @@ mod repo;
 mod sdk;
 mod thirdparty;
 mod chromium;
+mod java;
+mod rider;
 mod debian;
 mod fimg;
 mod util;

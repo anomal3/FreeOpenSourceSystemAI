@@ -1231,9 +1231,9 @@ pub(super) const REGISTRY: &str = "/var/lib/pkg";
 /// Пакеты со строкой запуска — по имени, чтобы порядок строк не зависел от
 /// порядка записей в каталоге.
 pub(super) fn list_packages() -> Vec<Launcher> {
-    // Предел манифеста в контейнере — 32 КиБ (`fpk::MAX_MANIFEST`); запись
-    // реестра — тот же манифест.
-    const LIMIT: usize = 32 * 1024;
+    // Предел манифеста в контейнере (`fpk::MAX_MANIFEST`); запись реестра —
+    // тот же манифест.
+    const LIMIT: usize = fpk::MAX_MANIFEST;
     let Some(Ok(entries)) = crate::fs::list(REGISTRY) else {
         return Vec::new();
     };

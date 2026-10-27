@@ -65,6 +65,14 @@ impl Ipv4 {
         self.0 == Self::BROADCAST.0
     }
 
+    /// `127.0.0.1` — адрес петли без сетевой карты.
+    pub const LOOPBACK: Ipv4 = Ipv4(0x7F00_0001);
+
+    /// Сеть петли `127.0.0.0/8`: пакеты туда не покидают машину.
+    pub const fn is_loopback(self) -> bool {
+        self.0 >> 24 == 127
+    }
+
     /// Лежит ли адрес в той же сети, что и `self`, при данной маске.
     pub const fn same_network(self, other: Ipv4, mask: Ipv4) -> bool {
         self.0 & mask.0 == other.0 & mask.0

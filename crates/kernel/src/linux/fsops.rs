@@ -190,9 +190,11 @@ pub fn statfs(path: Option<usize>, fd: usize, out: usize) -> i64 {
     0
 }
 
-/// `clock_getres`: точность часов — наносекунда.
+/// `clock_getres`: точность часов — наносекунда. Отрицательный номер — часы
+/// процессорного времени потока или процесса (`pthread_getcpuclockid`): их
+/// понимает и `clock_gettime`, и Java спрашивает о них при запуске.
 pub fn clock_getres(clock: usize, out: usize) -> i64 {
-    if clock > 11 {
+    if clock > 11 && (clock as i32) >= 0 {
         return -e::EINVAL;
     }
     if out != 0 {

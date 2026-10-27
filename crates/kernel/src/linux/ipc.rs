@@ -617,11 +617,25 @@ pub fn bind(fd: usize, addr: usize, len: usize) -> i64 {
     {
         let names = NAMES.lock();
         if names.iter().any(|(other, live)| *other == name && live.strong_count() > 0) {
+            crate::kprintln!("  linux       : bind '{}': the name is listened on already", alloc::string::String::from_utf8_lossy(&name));
             return -EADDRINUSE;
         }
     }
     *unix(&object).name.lock() = Some(name);
     0
+}
+
+/// `unlink` пути, который слушает сокет: у Linux имя сокета — файл, и его
+/// удаление освобождает имя, хотя слушающий сокет жив (он остаётся без имени,
+/// и новые `connect` до него не дойдут). Так делает netty (Rider): стирает
+/// старый файл сокета и занимает имя заново. Здесь файлов у сокетов нет, и
+/// стирается запись имени. `true` — такое имя было.
+pub fn unlink_socket(linux: &str) -> bool {
+    let mut names = NAMES.lock();
+    let listened = names.iter().any(|(name, live)| name.as_slice() == linux.as_bytes() && live.strong_count() > 0);
+    // Заодно — записи слушателей, которых уже нет.
+    names.retain(|(name, live)| live.strong_count() > 0 && name.as_slice() != linux.as_bytes());
+    listened
 }
 
 pub fn listen(fd: usize) -> i64 {

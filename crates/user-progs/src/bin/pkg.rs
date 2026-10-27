@@ -302,6 +302,16 @@ fn install_file(path: &str) -> i64 {
         close(fd);
         return 1;
     }
+    // Память «на запись и исполнение» (JIT) пока ставится без вопроса, но
+    // вслух: окно «программа просит JIT — разрешить?» для пакетов без
+    // доверенной подписи записано в ROADMAP («Разрешение JIT»).
+    if rights.contains(Rights::JIT) {
+        Line::new()
+            .str("pkg: ")
+            .str(name)
+            .str(" asks for jit: its Linux programs may write and run their own machine code")
+            .end();
+    }
     for drive in manifest.drives() {
         match drive {
             Some((vendor, device)) => {

@@ -546,6 +546,13 @@ extern "C" fn dispatch(frame: *mut TrapFrame) {
             }
         }
 
+        // Программа Linux со своим обработчиком получает сигнал, как у Linux
+        // (`SIGSEGV`, `SIGFPE`, `SIGILL`…): на этом держится Java. Возврат
+        // отсюда войдёт в обработчик.
+        if crate::linux::signal::deliver_fault(frame, vector, addr) {
+            return;
+        }
+
         // SAFETY: `is_running` подтвердил, что кадр `enter_user` на стеке ядра
         // цел.
         unsafe { crate::user::faulted(vector_name(vector), frame.rip as usize, addr) };

@@ -205,6 +205,44 @@ struct Interface {
     last_reply: Option<Reply>,
     /// Счётчик исходящих пакетов IPv4 — он же их идентификатор.
     next_id: u16,
+    /// Петля: кадры для `127.0.0.0/8` и для своего же адреса. Карте они не
+    /// отдаются — их разбирает сетевая задача, как принятые (см.
+    /// [`send_ipv4`]). Так устроено `lo` у Linux, и на этом держатся
+    /// программы, говорящие сами с собой по TCP: интерфейс Rider и его
+    /// движок .NET.
+    looped: alloc::collections::VecDeque<alloc::vec::Vec<u8>>,
+}
+
+/// «Карта» машины без сети: только петля (`lo`). Наружу ничего не уходит и
+/// ничего не приходит; картой для трея и DHCP она не считается ([`PRESENT`]
+/// не поднимается).
+struct Loopback;
+
+/// Имя, по которому петлю узнают: настоящая карта, пришедшая позже, её
+/// заменяет (см. [`attach_usb`]).
+const LOOPBACK_NAME: &str = "loopback";
+
+impl Card for Loopback {
+    fn name(&self) -> &'static str {
+        LOOPBACK_NAME
+    }
+    fn mac(&self) -> [u8; 6] {
+        [0; 6]
+    }
+    fn send(&mut self, _frame: &[u8]) -> Result<(), CardError> {
+        Ok(())
+    }
+    fn receive(&mut self, _frame: &mut [u8; FRAME_MAX]) -> Option<usize> {
+        None
+    }
+    fn stats(&self) -> Stats {
+        Stats::default()
+    }
+    // Кадры петли будят задачу тем же путём, что прерывание карты, — и
+    // молчащая машина без сети не просыпается двести раз в секунду ради опроса.
+    fn interrupts(&self) -> bool {
+        true
+    }
 }
 
 static INTERFACE: SpinLock<Option<Interface>> = SpinLock::new(None);
@@ -246,6 +284,36 @@ pub unsafe fn init(rsdp: u64) {
             crate::kprintln!("  network     : no PCI card we drive; using the USB network adapter");
             start(card);
         }
+    }
+    if !is_present() {
+        start_loopback();
+    }
+}
+
+/// Сеть без карты: одна петля, `127.0.0.1/8`, как `lo` у Linux.
+///
+/// Без неё на машине без сети не открывался ни один сокет (`Network is
+/// down`), а программы, говорящие сами с собой по TCP, этого не переживают:
+/// интерфейс Rider связан со своим движком .NET соединением на `127.0.0.1`.
+fn start_loopback() {
+    *INTERFACE.lock() = Some(Interface {
+        device: alloc::boxed::Box::new(Loopback),
+        mac: [0; 6],
+        address: Ipv4::LOOPBACK,
+        netmask: Ipv4::from_bytes([255, 0, 0, 0]),
+        gateway: Ipv4::UNSPECIFIED,
+        table: arp::Table::new(),
+        sockets: socket::Table::new(),
+        streams: stream::Streams::new(),
+        counters: Counters::default(),
+        dns: Ipv4::UNSPECIFIED,
+        last_reply: None,
+        next_id: 1,
+        looped: alloc::collections::VecDeque::new(),
+    });
+    match crate::sched::spawn_daemon("net", service_task) {
+        Ok(id) => crate::kprintln!("  network     : no card; loopback 127.0.0.1/8 only, task {id}"),
+        Err(err) => crate::kprintln!("  network     : the loopback task did not start: {err}"),
     }
 }
 
@@ -374,6 +442,7 @@ fn start(device: alloc::boxed::Box<dyn Card>) {
         dns: Ipv4::UNSPECIFIED,
         last_reply: None,
         next_id: 1,
+        looped: alloc::collections::VecDeque::new(),
     });
 
     // Задача-приёмник заводится сразу и служебной: она работает, пока работает
@@ -418,6 +487,16 @@ pub fn attach_usb(card: alloc::boxed::Box<dyn Card>) {
     }
     let mut interface = INTERFACE.lock();
     match interface.as_mut() {
+        // Была одна петля — карта занимает её место; петля остаётся в
+        // `send_ipv4` и без собственного интерфейса.
+        Some(iface) if iface.device.name() == LOOPBACK_NAME => {
+            crate::kprintln!("  network     : {}, hardware address {}", card.name(), eth::Display(card.mac()));
+            iface.mac = card.mac();
+            iface.device = card;
+            iface.address = Ipv4::UNSPECIFIED;
+            iface.netmask = Ipv4::UNSPECIFIED;
+            PRESENT.store(true, core::sync::atomic::Ordering::Release);
+        }
         Some(iface) if iface.device.name().starts_with("usb-") => {
             crate::kprintln!(
                 "  network     : {} replaces the previous USB adapter, hardware address {}",
@@ -920,12 +999,6 @@ pub fn arp_table() -> alloc::vec::Vec<(Ipv4, Mac, u64)> {
 /// шестнадцать кадров подряд с запрещёнными прерываниями.
 pub fn service_task() {
     let mut frame = [0u8; FRAME_MAX];
-    // Спрашивается один раз: карту не меняют на ходу, а спрашивать под локом
-    // на каждом обороте значило бы брать лок ради ответа, который не меняется.
-    let interrupts = INTERFACE
-        .lock()
-        .as_ref()
-        .is_some_and(|iface| iface.device.interrupts());
     loop {
         loop {
             let mut guard = INTERFACE.lock();
@@ -942,16 +1015,36 @@ pub fn service_task() {
             // «ответили на него» незачем.
             handle(iface, &frame[..len]);
         }
+        // Петля — тем же разбором. Ответ на кадр петли может лечь в ту же
+        // очередь (SYN → SYN-ACK), и он разберётся этим же циклом.
+        loop {
+            let mut guard = INTERFACE.lock();
+            let Some(iface) = guard.as_mut() else {
+                return;
+            };
+            let Some(looped) = iface.looped.pop_front() else {
+                break;
+            };
+            handle(iface, &looped);
+        }
 
         // Таймеры TCP крутятся здесь же, а не отдельной задачей: повторная
         // передача — это отправка, и делать её из второго места значило бы
         // второй лок или второй порядок его захвата.
-        {
+        //
+        // Заодно — как ждать дальше. Спрашивается на каждом обороте, а не раз
+        // при старте: петлю машины без сети (`Loopback`, будит как прерывание)
+        // может заменить пришедшая позже USB-карта без прерываний.
+        let interrupts = {
             let mut guard = INTERFACE.lock();
-            if let Some(iface) = guard.as_mut() {
-                tcp_tick(iface);
+            match guard.as_mut() {
+                Some(iface) => {
+                    tcp_tick(iface);
+                    iface.device.interrupts()
+                }
+                None => false,
             }
-        }
+        };
         // Пришедшее разобрано и таймеры отработали — тем, кто ждёт сокетов
         // (фаза 65a): данные, соединение, место, конец. Замок сети к этому
         // мгновению отпущен: ждущий проверяет сокет под ним же.
@@ -1073,6 +1166,9 @@ fn handle_ipv4(iface: &mut Interface, payload: &[u8]) {
     // пакет наш. Остальное не наше: маршрутизацией мы не занимаемся, и молча
     // обрабатывать чужой пакет значило бы притворяться маршрутизатором.
     let ours = packet.destination == iface.address
+        // Петля (`127.0.0.0/8`): такие пакеты приходят только из своей же
+        // очереди, наружу они не уходят.
+        || packet.destination.is_loopback()
         || packet.destination.is_broadcast()
         || (!iface.netmask.is_unspecified()
             && packet.destination == iface.address.network_broadcast(iface.netmask))
@@ -1604,6 +1700,25 @@ fn send_ipv4(
     protocol: u8,
     payload: &[u8],
 ) -> Result<(), NetError> {
+    // Петля: себе — не в карту, а в очередь, которую сетевая задача разберёт
+    // как принятые кадры. Адрес отправителя — свой, тот же, что в
+    // контрольной сумме TCP и UDP; ответ на него снова попадёт сюда.
+    if destination.is_loopback() || (!iface.address.is_unspecified() && destination == iface.address) {
+        let total = eth::HEADER + ipv4::HEADER + payload.len();
+        if total > FRAME_MAX {
+            return Err(NetError::Device(CardError::TooLong(total)));
+        }
+        let id = iface.next_id;
+        iface.next_id = iface.next_id.wrapping_add(1);
+        let mut frame = alloc::vec![0u8; total];
+        eth::write_header(&mut frame, iface.mac, iface.mac, eth::TYPE_IPV4);
+        ipv4::write_header(&mut frame[eth::HEADER..], iface.address, destination, protocol, payload.len(), id);
+        frame[eth::HEADER + ipv4::HEADER..].copy_from_slice(payload);
+        iface.looped.push_back(frame);
+        on_interrupt();
+        return Ok(());
+    }
+
     // Отправлять, не имея адреса, вообще-то нельзя: ответ пришёл бы на
     // `0.0.0.0`. Ровно одно исключение — широковещательный пакет, и оно не
     // придумано для удобства: клиент DHCP обязан спросить адрес **до** того, как

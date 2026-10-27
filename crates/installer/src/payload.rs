@@ -545,7 +545,7 @@ const DOTNET: [(&CStr16, &str); 3] = [
 ///
 /// Их отсутствие — не отказ: пакеты собирает `xtask`, и носитель, собранный без
 /// них, остаётся годным установочным носителем.
-const PACKAGES: [(&CStr16, &str); 11] = [
+const PACKAGES: [(&CStr16, &str); 12] = [
     (cstr16!("\\FREEOS\\PKG\\HELLO.FPK"), "hello-1.0.fpk"),
     (cstr16!("\\FREEOS\\PKG\\EXTRA.FPK"), "extra-1.0.fpk"),
     // Программа WinForms пакетом (фаза N8).
@@ -565,6 +565,8 @@ const PACKAGES: [(&CStr16, &str); 11] = [
     (cstr16!("\\FREEOS\\PKG\\DEBIAN.FPK"), "debian-12.fpk"),
     // Chromium без окна (фаза 71h) — тоже только если собран.
     (cstr16!("\\FREEOS\\PKG\\LINUXWEB.FPK"), "linuxweb-150.fpk"),
+    // Java (JetBrains Runtime 25 из дистрибутива Rider) — тоже только если собран.
+    (cstr16!("\\FREEOS\\PKG\\JBR.FPK"), "jbr-25.fpk"),
 ];
 
 /// Размер файла по данным файловой системы.

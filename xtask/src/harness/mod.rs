@@ -2879,6 +2879,18 @@ fn press_right(qmp: Option<&mut qmp::Qmp>, hmp: &mut monitor::Monitor, down: boo
 /// играми на носителе (полный прогон 24.10).
 const TARGET_DISK_MIB: u64 = 4096;
 
+/// Размер целевого диска: [`TARGET_DISK_MIB`] или `FOSSAI_TARGET_MIB` из
+/// окружения. Нужно Rider (`crate::rider`): 4,5 ГБ в `/opt` не помещаются в
+/// треть четырёх гигабайт, которую установщик отдаёт разделу состояния, — его
+/// цепочку запускают с `FOSSAI_TARGET_MIB=24576` (`install`, затем `rider`).
+fn target_disk_mib() -> u64 {
+    std::env::var("FOSSAI_TARGET_MIB")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|mib| *mib >= TARGET_DISK_MIB)
+        .unwrap_or(TARGET_DISK_MIB)
+}
+
 /// Диск, на который ставил установщик.
 fn prepare_installed_disk(arch: Arch, release: bool) -> Result<PathBuf> {
     let disk = paths::target_disk(arch, release);
@@ -3085,7 +3097,7 @@ fn prepare_drives(
             // Порядок важен: прошивка перебирает носители в порядке подключения,
             // и загрузочный раздел на этот момент есть только у первого.
             Drive::Image(image::build(built, image::Kind::Installer)?),
-            Drive::Image(image::prepare_target(arch, built.release, TARGET_DISK_MIB, true)?),
+            Drive::Image(image::prepare_target(arch, built.release, target_disk_mib(), true)?),
         ],
         Target::Iso => vec![Drive::Cdrom(image::build_iso(built, image::Kind::System)?)],
         Target::Installed => {
@@ -3123,6 +3135,11 @@ fn prepare_drives(
             // `crate::package::place_big_file`).
             if scenario.big_file {
                 crate::package::place_big_file(&disk)?;
+            }
+            // Rider — тем же приёмом: шесть гигабайт носителем на FAT32 не
+            // привезти (см. `crate::rider`).
+            if scenario.name == "rider" {
+                crate::rider::place(&disk)?;
             }
             // Ключ — тем же приёмом и до запуска: так же, как человек положил бы
             // его в `~/.ssh/authorized_keys`, сидя за этой машиной. Почему не

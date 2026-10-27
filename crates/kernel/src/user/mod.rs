@@ -810,6 +810,10 @@ pub struct Program {
     dma: Vec<crate::mm::dma::DmaBuffer>,
     /// Счёт переключений памяти кода (фаза 59).
     jit: JitStats,
+    /// Пакет исполняемого файла дал право [`Rights::JIT`]: запрос программы
+    /// Linux на память «на запись и исполнение» становится памятью кода, а не
+    /// отказом. Ставится при запуске и при `execve` (см. [`jit_of_path`]).
+    jit_allowed: bool,
     /// Программа Linux (фаза 71a): её системные вызовы — по таблице Linux
     /// (`crate::linux`), а родной `int 0x80` ей не положен.
     pub linux: bool,
@@ -1057,10 +1061,16 @@ impl Program {
         if len == 0 || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
             return Err(MmapError::BadRequest);
         }
-        if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        // «На запись и исполнение» — память кода (фаза 59), если пакет дал
+        // право, и только безымянная: файл и разделяемую память переключать
+        // по обращению значило бы переключать её и у второго владельца.
+        let jit = prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0;
+        if jit && (!self.jit_allowed || file.is_some() || shared.is_some()) {
             return Err(MmapError::WriteExecute);
         }
-        let flags = if prot == 0 {
+        let flags = if jit {
+            PageFlags::READ | PageFlags::WRITE | PageFlags::USER
+        } else if prot == 0 {
             PageFlags::NONE
         } else {
             let mut flags = PageFlags::READ | PageFlags::USER;
@@ -1112,7 +1122,7 @@ impl Program {
                     evictions: 0,
                 })
             }
-            (None, None) => Source::Anonymous(Anon { flags, lazy: true, jit: false }),
+            (None, None) => Source::Anonymous(Anon { flags, lazy: true, jit }),
         };
         self.remember(Mapping { base, pages, blocks: 0, source });
         Ok(base)
@@ -1503,10 +1513,15 @@ impl Program {
         if len == 0 || addr % PAGE_SIZE != 0 || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
             return Err(MmapError::BadRequest);
         }
-        if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        // «На запись и исполнение» — только с правом пакета, и область
+        // становится памятью кода (см. [`Program::linux_mmap`]).
+        let jit = prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0;
+        if jit && !self.jit_allowed {
             return Err(MmapError::WriteExecute);
         }
-        let flags = if prot == 0 {
+        let flags = if jit {
+            PageFlags::READ | PageFlags::WRITE | PageFlags::USER
+        } else if prot == 0 {
             PageFlags::NONE
         } else {
             let mut flags = PageFlags::READ | PageFlags::USER;
@@ -1529,10 +1544,16 @@ impl Program {
         let mut covered = addr;
         for region in self.mappings[first..].iter().take_while(|region| region.base < end) {
             // Права страниц памяти кода меняет ядро само, по обращению
-            // (фаза 59), и второй хозяин у них был бы лишним.
-            let jit = matches!(region.source, Source::Anonymous(Anon { jit: true, .. }));
-            if region.base > covered || !self.divisible(region) || jit {
+            // (фаза 59), и второй хозяин у них был бы лишним — кроме программы
+            // с правом [`Rights::JIT`]: JIT Linux сам решает, где у него код, и
+            // отдаёт память то в «запись и исполнение», то обратно.
+            let code = matches!(region.source, Source::Anonymous(Anon { jit: true, .. }));
+            if region.base > covered || !self.divisible(region) || (code && !self.jit_allowed) {
                 return Err(MmapError::BadRequest);
+            }
+            // Памятью кода становится только безымянная память.
+            if jit && !matches!(region.source, Source::Anonymous(_)) {
+                return Err(MmapError::WriteExecute);
             }
             covered = region.end();
         }
@@ -1557,6 +1578,10 @@ impl Program {
             let page_flags = match &mut self.mappings[index].source {
                 Source::Anonymous(anon) => {
                     anon.flags = flags;
+                    // Страницы памяти кода приходят по обращению, поэтому
+                    // ей нужна ленивость: снятая страница — не потеря.
+                    anon.jit = jit;
+                    anon.lazy |= jit;
                     anon.page_flags()
                 }
                 Source::Image(image) => {
@@ -1874,8 +1899,13 @@ impl Program {
         let Some(index) = self.region_at(page_addr) else {
             return false;
         };
+        // Память кода, ставшей ею после `fork` (`mprotect` программы Linux на
+        // «запись и исполнение»): общий кадр копируется так же, а свой
+        // переключает [`Program::jit_flip`] — со своим счётом и ожиданием.
+        let code = matches!(self.mappings[index].source, Source::Anonymous(Anon { jit: true, .. }));
         let flags = match &self.mappings[index].source {
-            Source::Anonymous(anon) if !anon.jit && anon.flags.contains(PageFlags::WRITE) => anon.page_flags(),
+            Source::Anonymous(anon) if anon.jit => PageFlags::READ | PageFlags::WRITE | PageFlags::USER,
+            Source::Anonymous(anon) if anon.flags.contains(PageFlags::WRITE) => anon.page_flags(),
             Source::ThreadStack => PageFlags::READ | PageFlags::WRITE | PageFlags::USER,
             Source::Image(image)
                 if image.flags.contains(PageFlags::WRITE) && image.flags.contains(PageFlags::USER) =>
@@ -1894,6 +1924,9 @@ impl Program {
             return true;
         }
         let sole = !crate::mm::frame::with(|frames| frames.is_shared(phys)).unwrap_or(false);
+        if sole && code {
+            return false;
+        }
         if sole {
             // Остальные владельцы ушли — кадр наш целиком.
             // SAFETY: тот же кадр под тем же адресом, право записи даёт область.
@@ -2629,36 +2662,51 @@ pub fn credentials() -> Credentials {
 ///
 /// Всё, что лежит не в `/opt/<имя>/`, прав не ограничивает: [`Rights::ALL`].
 fn rights_of_path(path: &str) -> Rights {
+    package_rights(path).unwrap_or(Rights::ALL)
+}
+
+/// Права из манифеста пакета, которому принадлежит файл; `None` — файл не
+/// пакета.
+///
+/// Читает реестр, то есть спит на диске: под замком программы не звать.
+fn package_rights(path: &str) -> Option<Rights> {
     /// Реестр установленного: в нём лежит манифест как есть.
     const REGISTRY: &str = "/var/lib/pkg";
     /// Предел манифеста в контейнере — он же предел записи реестра.
-    const LIMIT: usize = 32 * 1024;
+    const LIMIT: usize = fpk::MAX_MANIFEST;
 
-    let Some(rest) = path.strip_prefix("/opt/") else {
-        return Rights::ALL;
-    };
+    let rest = path.strip_prefix("/opt/")?;
     // Имя пакета — первый кусок пути. Файл прямо в `/opt` пакету не
     // принадлежит: пакеты раскладываются по каталогам.
-    let Some((name, _)) = rest.split_once('/') else {
-        return Rights::ALL;
-    };
+    let (name, _) = rest.split_once('/')?;
     if name.is_empty() || !fpk::is_safe_component(name) {
-        return Rights::ALL;
+        return None;
     }
 
     let record = alloc::format!("{REGISTRY}/{name}.pkg");
     // Записи нет или она не читается — значит каталог в `/opt` создан не
     // пакетом. Ограничивать нечем: реестр и есть то место, где права названы.
     let Some(Ok((bytes, _))) = crate::fs::read(&record, LIMIT) else {
-        return Rights::ALL;
+        return None;
     };
-    let Ok(text) = core::str::from_utf8(&bytes) else {
-        return Rights::ALL;
-    };
+    let text = core::str::from_utf8(&bytes).ok()?;
     // Непонятое имя права даёт пустой набор, а не «всё»: «не понял, значит
     // можно» — ровно та ошибка, ради которой всё это затевалось.
-    sysconf::value(text, "permissions")
-        .map_or(Rights::NONE, |list| Rights::parse(list).unwrap_or(Rights::NONE))
+    Some(
+        sysconf::value(text, "permissions")
+            .map_or(Rights::NONE, |list| Rights::parse(list).unwrap_or(Rights::NONE)),
+    )
+}
+
+/// Можно ли программе из этого файла память «на запись и исполнение»
+/// ([`Rights::JIT`]).
+///
+/// Только по манифесту пакета, которому файл принадлежит, — не по набору
+/// запуска: в [`Rights::ALL`] этого права нет, а между меню и программой
+/// бывает чужой файл (`start=` у Chromium — это `bash` корня Debian, пакета
+/// без прав). Файл не из пакета права не получает никогда.
+fn jit_of_path(path: &str) -> bool {
+    package_rights(path).is_some_and(|rights| rights.contains(Rights::JIT))
 }
 
 /// Что разрешено программе, исполняющейся сейчас.
@@ -3542,6 +3590,8 @@ fn run(
         kprintln!("  user        : {id} may use {}", rights.write_names(&mut names));
     }
     report(&space, entry, &loaded.mappings);
+    // До замка таблицы: ответ читается с диска.
+    let jit_allowed = jit_of_path(path);
 
     let slot = sched::current_slot();
     {
@@ -3570,6 +3620,7 @@ fn run(
             devices: [const { None }; user_abi::MAX_DEVICES],
             dma: Vec::new(),
             jit: JitStats::default(),
+            jit_allowed,
             linux: loaded.linux.is_some(),
             brk: (0, 0, 0),
             linux_cwd: alloc::string::String::from("/"),
@@ -4204,6 +4255,7 @@ impl Program {
             devices: [const { None }; user_abi::MAX_DEVICES],
             dma: Vec::new(),
             jit: JitStats::default(),
+            jit_allowed: self.jit_allowed,
             linux: self.linux,
             brk: self.brk,
             linux_cwd: self.linux_cwd.clone(),
@@ -4376,6 +4428,9 @@ pub fn exec(frame: &mut arch::TrapFrame, path: &str, args: &[&str], env: &[&str]
     let layout = Layout::random();
     let loaded = load(&mut space, &node, &header, file_len, layout.stack_top, cred).map_err(ExecError::Load)?;
     let entry = loaded.entry;
+    // Право на память кода — у нового файла, не у старого: `bash` корня
+    // Debian, запускающий Chromium, его не имеет, а Chromium имеет.
+    let jit_allowed = jit_of_path(path);
 
     // Дальше пути назад нет — но сначала остальные потоки: их задачи стоят
     // на старом пространстве, и разобрать его можно только без них.
@@ -4398,6 +4453,7 @@ pub fn exec(frame: &mut arch::TrapFrame, path: &str, args: &[&str], env: &[&str]
         program.path = alloc::string::String::from(path);
         program.linux_stack = (layout.stack_top - MAIN_STACK_PAGES * PAGE_SIZE, layout.stack_top);
         program.jit = JitStats::default();
+        program.jit_allowed = jit_allowed;
         program.linux_exit = None;
         // Обработчики — адреса в старой памяти; «пропускать» остаётся.
         const SIG_IGN: usize = 1;

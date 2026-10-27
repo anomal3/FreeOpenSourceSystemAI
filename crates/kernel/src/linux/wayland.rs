@@ -190,13 +190,23 @@ impl Args<'_> {
 // ---- объекты --------------------------------------------------------------------
 
 /// Глобальные объекты: номер в реестре, интерфейс, версия.
-const GLOBALS: [(u32, &str, u32); 6] = [
+const GLOBALS: [(u32, &str, u32); 8] = [
     (1, "wl_compositor", 4),
     (2, "wl_subcompositor", 1),
     (3, "wl_shm", 1),
     (4, "xdg_wm_base", 2),
     (5, "wl_seat", 5),
     (6, "wl_output", 2),
+    // Буфер обмена и перетаскивание. Пока — объекты, принимающие запросы, и
+    // ни одного предложения данных: Java (AWT на Wayland) без этого глобала не
+    // заводит окно вовсе («Can't bind to the wl_data_device_manager»), а
+    // настоящий обмен — следующий шаг.
+    (7, "wl_data_device_manager", 3),
+    // Размер поверхности, отличный от буфера. Последний из шести глобалов,
+    // без которых AWT на Wayland не заводится (их список — строки «Can't bind
+    // to the … interface» в `libawt_wlawt.so`). Масштаба экрана у нас нет —
+    // окно приходит в размер буфера, и `set_destination` его не меняет.
+    (8, "wp_viewporter", 1),
 ];
 
 const SHM_ARGB8888: u32 = 0;
@@ -475,6 +485,11 @@ enum Obj {
     Pointer,
     Keyboard,
     Output,
+    DataDeviceManager,
+    DataSource,
+    DataDevice,
+    Viewporter,
+    Viewport,
 }
 
 /// Номера окон стола у клиентов Wayland — отдельно от номеров родных окон
@@ -690,6 +705,41 @@ impl Client {
                 let made = if opcode == 0 { Obj::Surface(SurfaceState::new()) } else { Obj::Region };
                 self.objects.insert(new, made);
             }
+            // `create_data_source(id)`, `get_data_device(id, seat)`.
+            Obj::DataDeviceManager => {
+                let new = args.u32()?;
+                let made = if opcode == 0 { Obj::DataSource } else { Obj::DataDevice };
+                self.objects.insert(new, made);
+            }
+            // `offer`, `destroy`, `set_actions`: предложение запоминать некому —
+            // буфера обмена между клиентами пока нет.
+            Obj::DataSource => {
+                if opcode == 1 {
+                    self.delete(id);
+                }
+            }
+            // `start_drag`, `set_selection`, `release`.
+            Obj::DataDevice => {
+                if opcode == 2 {
+                    self.delete(id);
+                }
+            }
+            // `destroy`, `get_viewport(id, surface)`.
+            Obj::Viewporter => match opcode {
+                0 => self.delete(id),
+                1 => {
+                    let new = args.u32()?;
+                    self.objects.insert(new, Obj::Viewport);
+                }
+                _ => {}
+            },
+            // `destroy`, `set_source`, `set_destination`: окно стола — в размер
+            // буфера, масштаба нет.
+            Obj::Viewport => {
+                if opcode == 0 {
+                    self.delete(id);
+                }
+            }
             Obj::Subcompositor => match opcode {
                 0 => self.delete(id),
                 1 => {
@@ -883,6 +933,8 @@ impl Client {
             3 => Obj::Shm,
             4 => Obj::WmBase,
             5 => Obj::Seat,
+            7 => Obj::DataDeviceManager,
+            8 => Obj::Viewporter,
             _ => Obj::Output,
         };
         self.objects.insert(new, object);

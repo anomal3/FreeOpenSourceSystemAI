@@ -272,8 +272,10 @@ pub fn build(arch: Arch) -> Result<()> {
             "network"
         }
     };
-    // `--jitless`: V8 без JIT. Ядро не даёт памяти «на запись и исполнение
-    // сразу» (W^X), а JIT V8 просит именно её; интерпретатор её не просит.
+    // JIT V8 включён: память «на запись и исполнение», которую он просит,
+    // ядро даёт пакету с правом `jit` памятью кода (страница переключается
+    // между записью и исполнением по обращению, W^X сохраняется). До этого
+    // стоял `--jitless` — JavaScript только интерпретатором.
     // Окно — через сервер Wayland ядра (фаза 71i); с `--headless` Chromium
     // окна не открывает, и платформа ему не нужна.
     // `--ipc-connection-timeout`: дочерний процесс ждёт соединения от
@@ -297,7 +299,7 @@ pub fn build(arch: Arch) -> Result<()> {
         platform=--ozone-platform=wayland\n\
         case \" $* \" in *\" --headless\"*) platform= ;; esac\n\
         exec /opt/chromium/chrome/chromium --no-sandbox --no-zygote --disable-gpu $platform \\\n\
-          --js-flags=--jitless --no-first-run --no-default-browser-check --password-store=basic --ipc-connection-timeout=120 \"$@\"\n";
+          --no-first-run --no-default-browser-check --password-store=basic --ipc-connection-timeout=120 \"$@\"\n";
     files.push((String::from("bin/chromium"), script.as_bytes().to_vec(), 0o755));
 
     let mut builder = Builder::new(Kind::Package, "chromium", "150");
@@ -309,7 +311,7 @@ pub fn build(arch: Arch) -> Result<()> {
     builder.field("start", "/opt/debian/bin/bash /opt/chromium/bin/chromium");
     builder.field("desktop", "yes");
     builder.field("icon", icon_field);
-    builder.field("permissions", "windows files net");
+    builder.field("permissions", "windows files net jit");
     builder.requires("debian");
     let mut bytes = 0usize;
     for (path, data, mode) in &files {
@@ -324,7 +326,7 @@ pub fn build(arch: Arch) -> Result<()> {
 }
 
 /// `DT_NEEDED` разделяемого объекта ELF64 (x86-64, little-endian).
-fn needed(elf: &[u8]) -> Result<Vec<String>> {
+pub(crate) fn needed(elf: &[u8]) -> Result<Vec<String>> {
     let word = |at: usize| -> Result<u64> {
         Ok(u64::from_le_bytes(elf.get(at..at + 8).context("короткий ELF")?.try_into()?))
     };

@@ -3422,7 +3422,9 @@ pub const ALL: &[Scenario] = &[
             // время ещё крутится sshd: без сети он трижды не может открыть порт и
             // перезапускается, и каждый его старт и выход двигают счёт. Ждём, пока
             // он сдастся, — тогда между замерами не меняется ничего.
-            Step::AwaitAny("init: 'sshd' failed 3 time(s) in a row, giving up", 120_000),
+            // С 27.10 у машины без сети есть петля (`lo`), и `sshd` не падает трижды,
+            // а слушает 127.0.0.1 и засыпает в ожидании — этого и ждём.
+            Step::AwaitAny("sshd: listening on port 22", 120_000),
             // Прогон на мегабайте — до всякого счёта, и он тут не «на всякий
             // случай». Первый запуск любой программы стоит того, что запуском
             // не является: файл читается с диска впервые, разбирается его ELF,
@@ -3586,7 +3588,9 @@ pub const ALL: &[Scenario] = &[
             // Поэтому сначала ждём, пока служба сдастся: иначе `AtLeast` брал
             // первую строку после курсора, и под другой раскладкой времени ею
             // оказывалась строка `sshd` (так и было 26.09 на x86-64).
-            Step::AwaitAny("'sshd' failed 3 time(s) in a row, giving up", 60_000),
+            // С 27.10 у машины без сети есть петля (`lo`), и `sshd` не падает трижды,
+            // а слушает 127.0.0.1 и засыпает в ожидании — этого и ждём.
+            Step::AwaitAny("sshd: listening on port 22", 60_000),
             Step::Line("run /bin/memtest 8 huge keep"),
             Step::Await("memtest: leaving the region to the teardown", 60_000),
             Step::AtLeast("space released, ", 2048 + 17, 60_000),
@@ -7387,7 +7391,14 @@ pub const ALL: &[Scenario] = &[
             // Поэтому счёт начинается там, где система перестала шевелиться
             // сама по себе. Строка приходит после третьего отказа, то есть
             // через несколько секунд после приглашения.
-            Step::Await("init: 'sshd' failed 3 time(s) in a row, giving up", 60_000),
+            // С 27.10 у машины без сети есть петля (`lo`), и `sshd` не падает
+            // трижды, а слушает 127.0.0.1. Но строка `listening` — не конец
+            // его запуска: за ней он читает `/etc/passwd`, и `mem` между ними
+            // разошёлся со вторым на три кадра. Ждём последнюю строку запуска
+            // и конец `drvd`, который тоже кончался после замера.
+            Step::AwaitAny("sshd: accounts come from", 60_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Wait(2_000),
             Step::Line("mem"),
             Step::Capture("  frames   ", 15_000),
 
@@ -11831,7 +11842,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await(PROMPT, BOOT),
             // Та же причина, что у `taskmgr`: строка, набранная под шум трёх
             // падений `sshd`, теряется.
-            Step::Await("init: 'sshd' failed 3 time(s) in a row, giving up", 60_000),
+            // С 27.10 у машины без сети есть петля (`lo`), и `sshd` не падает трижды,
+            // а слушает 127.0.0.1 и засыпает в ожидании — этого и ждём.
+            Step::AwaitAny("sshd: listening on port 22", 60_000),
             Step::Wait(1_000),
             Step::Line("run -b /bin/devmgr"),
             Step::Await("window      : 'Device Manager' at", 30_000),
@@ -11883,7 +11896,9 @@ pub const ALL: &[Scenario] = &[
             // Без сети `sshd` три раза падает и печатает об этом, а строка,
             // набранная в серийную линию под этот шум, теряется (см. заметку
             // об UART). Дождаться, пока супервизор сдастся.
-            Step::Await("init: 'sshd' failed 3 time(s) in a row, giving up", 60_000),
+            // С 27.10 у машины без сети есть петля (`lo`), и `sshd` не падает трижды,
+            // а слушает 127.0.0.1 и засыпает в ожидании — этого и ждём.
+            Step::AwaitAny("sshd: listening on port 22", 60_000),
             Step::Wait(1_000),
             // Жертва: монитор системы — программа с окном, которую не жалко.
             Step::Line("run -b /bin/sysmon"),
@@ -12101,6 +12116,121 @@ pub const ALL: &[Scenario] = &[
                 ],
                 gone: &["/mixed.bin", "/many/f0000", "/dir/sub"],
             }),
+        ],
+    },
+    // Java (JetBrains Runtime 25 из дистрибутива Rider): первый шаг к Rider.
+    // Без права `jit` HotSpot не доходит даже до `-version` — память «на
+    // запись и исполнение» ему нужна под интерпретатор, который он строит при
+    // запуске.
+    Scenario {
+        name: "java",
+        about: "Java 25 (JBR из Rider) для программ Linux: -version, программа из исходника с JIT, окно Swing через Wayland.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "2G",
+        extra: &["-cpu", "max", "-smp", "2"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // По имени: корень Debian, который пакет требует, `pkg` ставит сам.
+            Step::Line("pkg install java"),
+            Step::Await("pkg: java asks for jit", 300_000),
+            Step::Await("pkg: installed java 25, ", 900_000),
+            Step::Line("run /opt/debian/bin/bash /opt/java/bin/java -version"),
+            Step::Await("openjdk version \"25.0.4\"", 300_000),
+            Step::Await("/opt/debian/bin/bash: exited with code 0", 60_000),
+            // Из исходника: компилятор Java (`jdk.compiler`) работает в той же
+            // машине, а цикл на пятьдесят миллионов шагов без JIT занял бы
+            // минуты.
+            Step::Line("run /opt/debian/bin/bash /opt/java/bin/java /opt/java/samples/Hello.java"),
+            Step::Await("java: hello from OpenJDK 64-Bit Server VM 25.0.4", 600_000),
+            Step::Await("java: loop sum 149999997", 120_000),
+            Step::Await("/opt/debian/bin/bash: exited with code 0", 60_000),
+            Step::Await("user        : jit: ", 30_000),
+            // Окно Swing через сервер Wayland ядра (`WLToolkit`): с `self-test`
+            // программа нажимает кнопку сама и через двадцать секунд выходит.
+            Step::Line("run -b /opt/debian/bin/bash /opt/java/bin/java /opt/java/samples/Window.java self-test"),
+            // Клиент Wayland подключается раньше, чем программа напечатает
+            // имя тулкита, поэтому его строку здесь не ждём: ожидание
+            // проскочило бы до «client gone» в самом конце.
+            Step::Await("java: toolkit sun.awt.wl.WLToolkit", 600_000),
+            Step::Await("java: window shown", 300_000),
+            Step::Await("java: clicked 1", 60_000),
+            Step::Await("wayland     : #", 60_000),
+            Step::Move(1, 0),
+            Step::Painted("java-window"),
+            Step::Await("/opt/debian/bin/bash: exited with code 0", 120_000),
+            Step::Line("pkg remove java"),
+            Step::Await("pkg: removed java", 300_000),
+            Step::Line("pkg remove debian"),
+            Step::Await("pkg: removed debian", 300_000),
+            Step::Absent("protocol error on object"),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
+    // Rider: стенд раскладывает его в `/opt/rider` до запуска (`crate::rider`;
+    // 4,5 ГБ носителем на FAT32 не привезти), диску нужно
+    // `FOSSAI_TARGET_MIB=24576` ещё на `install`. Сценарий доказывает одно —
+    // окно Rider на столе; дальше смотрит человек (`xtask run --installed`).
+    Scenario {
+        name: "rider",
+        about: "JetBrains Rider для Linux: Java-интерфейс через Wayland и .NET ReSharper — окно на столе.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        ssh_key: false,
+        memory: "8G",
+        extra: &["-cpu", "max", "-smp", "4"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // Библиотеки Wayland и шрифты Rider берёт из пакета `java`. Он мог
+            // остаться от сценария `java`, упавшего до `pkg remove`, — тогда
+            // `pkg` откажет «already installed», и это тоже годится.
+            Step::Line("pkg install java"),
+            Step::Await("/bin/pkg: exited with code", 900_000),
+            Step::Line("run /bin/pkg list"),
+            Step::Await("  java  25", 60_000),
+            Step::Line("run -b /opt/debian/bin/bash /opt/rider/fossai/rider"),
+            Step::Await("wayland     : client #", 1_200_000),
+            Step::Await("wayland     : #", 1_200_000),
+            Step::Wait(120_000),
+            Step::Move(1, 0),
+            Step::Painted("rider"),
+            Step::Wait(300_000),
+            Step::Move(1, 0),
+            Step::Painted("rider-later"),
+            Step::Absent("KERNEL PANIC"),
         ],
     },
     // Последним в списке и намеренно: оставляет Chromium установленным, чтобы

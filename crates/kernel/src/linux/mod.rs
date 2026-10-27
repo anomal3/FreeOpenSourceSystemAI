@@ -39,7 +39,7 @@ mod links;
 pub mod recent;
 mod net;
 mod process;
-mod signal;
+pub mod signal;
 mod special;
 mod thread;
 mod wayland;
@@ -87,6 +87,7 @@ mod nr {
     pub const GETTID: usize = 186;
     pub const FUTEX: usize = 202;
     pub const SCHED_GETAFFINITY: usize = 204;
+    pub const GETCPU: usize = 309;
     pub const SET_TID_ADDRESS: usize = 218;
     pub const CLOCK_GETTIME: usize = 228;
     pub const EXIT_GROUP: usize = 231;
@@ -540,6 +541,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::ARCH_PRCTL => arch_prctl(a0, a1),
             nr::FUTEX => futex(a0, a1, a2, a3, a4, a5),
             nr::SCHED_GETAFFINITY => affinity(a1, a2),
+            nr::GETCPU => getcpu(a0, a1),
             // Адрес, который ядро обнулит при выходе потока (фаза 71c).
             nr::SET_TID_ADDRESS => {
                 crate::user::LINUX_CLEAR_TID[crate::sched::current_slot()].store(a0, core::sync::atomic::Ordering::Relaxed);
@@ -1770,6 +1772,26 @@ unsafe fn clock_nanosleep(clock: usize, flags: usize, req: usize) -> i64 {
     errno(unsafe { native(SYS_NANOSLEEP, seconds as usize, nanos as usize, 0) })
 }
 
+/// `getcpu(cpu, node)`: на каком процессоре задача сейчас; узел NUMA один.
+///
+/// Без него Java (HotSpot) не запускается: на отказ она идёт запасным путём
+/// старого Linux — прыжком на страницу `vsyscall` (`0xffffffffff600800`),
+/// которой здесь нет, и падает отказом страницы.
+fn getcpu(cpu: usize, node: usize) -> i64 {
+    let here = crate::smp::cpu() as u32;
+    for (at, value) in [(cpu, here), (node, 0)] {
+        if at == 0 {
+            continue;
+        }
+        if !space::user_can(at, 4, PageFlags::WRITE) {
+            return -e::EFAULT;
+        }
+        // SAFETY: проверено строкой выше.
+        unsafe { core::ptr::write_unaligned(at as *mut u32, value) };
+    }
+    0
+}
+
 /// `sched_getaffinity`: маска из всех процессоров машины.
 fn affinity(len: usize, out: usize) -> i64 {
     let cpus = crate::smp::online().max(1);
@@ -1857,6 +1879,9 @@ fn unlink(dir: usize, ptr: usize) -> i64 {
     };
     if let Some(answer) = ipc::unlink_shm(&linux) {
         return answer;
+    }
+    if ipc::unlink_socket(&linux) {
+        return 0;
     }
     if links::remove(&linux) {
         return 0;
