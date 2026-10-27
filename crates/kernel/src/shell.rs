@@ -92,12 +92,11 @@ fn shell_cols() -> usize {
 /// зависло».
 const IDLE_TIMEOUT_SECONDS: u64 = 20;
 
-/// Предел простоя для человека за машиной.
-///
-/// Двадцати секунд ему не хватает: он читает баннер, смотрит на окна, думает —
-/// и сеанс закрывается у него на глазах, посреди работы. Полчаса — это «машину
-/// забыли включённой», а не «человек задумался».
-const IDLE_TIMEOUT_HUMAN_SECONDS: u64 = 30 * 60;
+// Для человека за машиной предела простоя нет вовсе. Раньше было полчаса, и
+// это выглядело как зависание: первая вкладка разбирает ввод всего рабочего
+// стола, и с её концом стол переставал отвечать на мышь и клавиши, хотя
+// картинка оставалась. За забытую включённой машину отвечает гашение экрана
+// (`power::idle_tick`), а не конец сеанса.
 
 /// Как часто обновлять окно состояния.
 const STATUS_PERIOD_MS: u64 = 500;
@@ -551,14 +550,9 @@ fn run(primary: bool) {
         // клавиатура есть и у гостя стенда, а сценарий ею как раз и набирает.
         // Метку ставит загрузчик по файлу на разделе, который собирает стенд
         // (см. `boot_info::BOOT_UNATTENDED`).
-        let limit = if crate::unattended() {
-            IDLE_TIMEOUT_SECONDS
-        } else {
-            IDLE_TIMEOUT_HUMAN_SECONDS
-        };
-        if primary && time::uptime_ms().saturating_sub(idle_since) >= limit * 1000 {
+        if primary && crate::unattended() && time::uptime_ms().saturating_sub(idle_since) >= IDLE_TIMEOUT_SECONDS * 1000 {
             sprintln!();
-            sprintln!("  no input for {limit} s, finishing the session");
+            sprintln!("  no input for {IDLE_TIMEOUT_SECONDS} s, finishing the session");
             ui::set_cursor(false);
             return;
         }
