@@ -59,16 +59,26 @@ use crate::sched::TaskId;
 ///
 /// 64 с фазы 71i: Chromium держит по несколько соединений на сайт и
 /// заранее открывает запасные.
-pub const MAX_STREAMS: usize = 64;
+///
+/// 2048 с фазы 74, и таблица растёт по мере надобности (слоты — в куче, а не
+/// массивом в интерфейсе): Rider говорит со своим движком через петлю
+/// десятками соединений, и вместе с Chromium 64 кончались — Chromium получал
+/// «Too many open files» на каждый новый сокет и обрывы, а Rider ждал
+/// соединения, которого не было (VirtualBox, 29.10).
+pub const MAX_STREAMS: usize = 2048;
 
 /// Сколько байт помещается в приёмный буфер соединения.
 ///
 /// Это же значение объявляется собеседнику как окно: обещать больше, чем можем
 /// сложить, — верный способ потерять данные, которые нам разрешили прислать.
-pub const RECEIVE_BUFFER: usize = 8192;
+///
+/// 64 КиБ без одного (фаза 74; было 8 КиБ): окно в 16 бит без масштабирования
+/// — его предел. С 8 КиБ скачивание упиралось в восемь килобайт за круг
+/// сети: при 50 мс это 160 КБ/с, страницы Chromium грузились минутами.
+pub const RECEIVE_BUFFER: usize = 65535;
 
 /// Сколько байт программа может отдать на отправку, не дожидаясь подтверждений.
-pub const SEND_BUFFER: usize = 8192;
+pub const SEND_BUFFER: usize = 64 * 1024;
 
 /// Сколько ждать до первой повторной передачи.
 const RTO_MS: u64 = 300;
@@ -322,7 +332,7 @@ impl Connection {
 
 /// Все соединения системы.
 pub struct Streams {
-    slots: [Option<Connection>; MAX_STREAMS],
+    slots: alloc::vec::Vec<Option<Connection>>,
 }
 
 /// Почему не вышло.
@@ -360,7 +370,7 @@ impl core::fmt::Display for StreamError {
 
 impl Streams {
     pub const fn new() -> Self {
-        Self { slots: [const { None }; MAX_STREAMS] }
+        Self { slots: alloc::vec::Vec::new() }
     }
 
     pub fn open(&mut self, owner: TaskId) -> Result<usize, StreamError> {
@@ -369,8 +379,17 @@ impl Streams {
         Ok(index)
     }
 
-    fn free_slot(&self) -> Option<usize> {
-        self.slots.iter().position(Option::is_none)
+    /// Свободный слот; нет — новый в конце таблицы, пока она меньше
+    /// [`MAX_STREAMS`].
+    fn free_slot(&mut self) -> Option<usize> {
+        if let Some(index) = self.slots.iter().position(Option::is_none) {
+            return Some(index);
+        }
+        if self.slots.len() >= MAX_STREAMS || self.slots.try_reserve(1).is_err() {
+            return None;
+        }
+        self.slots.push(None);
+        Some(self.slots.len() - 1)
     }
 
     pub fn get(&self, owner: TaskId, index: usize) -> Result<&Connection, StreamError> {
@@ -530,7 +549,7 @@ impl Streams {
     /// Закрыть всё, что принадлежит задаче. Возвращает, сколько закрыто.
     pub fn close_owner(&mut self, owner: TaskId) -> usize {
         let mut closed = 0;
-        for index in 0..MAX_STREAMS {
+        for index in 0..self.slots.len() {
             if self.slots[index].as_ref().is_some_and(|conn| conn.owner == owner) {
                 self.close(index);
                 closed += 1;
@@ -569,13 +588,12 @@ impl Streams {
 
     /// Сколько времени осталось до ближайшего срабатывания таймера.
     pub fn indices(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..MAX_STREAMS).filter(|index| self.slots[*index].is_some())
+        (0..self.slots.len()).filter(|index| self.slots[*index].is_some())
     }
 
     /// Истёк ли `TIME_WAIT`.
     pub fn expired(&self, index: usize, now: u64) -> bool {
-        self.slots[index]
-            .as_ref()
+        self.slots.get(index).and_then(Option::as_ref)
             .is_some_and(|conn| conn.state == State::TimeWait && now >= conn.expires_at)
     }
 }
