@@ -28,7 +28,7 @@ use mini_ui::paint::Ctx;
 use mini_ui::{Rect, Surface, theme};
 
 use crate::{
-    SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_POINTER, WIN_WHEEL, Window, exit, monotonic_ms, nanosleep,
+    SYSINFO_DARK, SysInfo, WIN_CLOSE, WIN_KEY, WIN_POINTER, WIN_RESIZE, WIN_WHEEL, Window, exit, monotonic_ms, nanosleep,
     println, sysinfo,
 };
 
@@ -94,7 +94,19 @@ pub trait App {
     fn quits_on_q(&self) -> bool {
         true
     }
+
+    /// Можно ли тянуть окно за край и разворачивать. Программы каркаса
+    /// получают размер окна в каждом вызове (`area`) и раскладку считают
+    /// заново, поэтому умеют это все; отказывается тот, у кого раскладка
+    /// рассчитана на один размер (калькулятор).
+    fn resizable(&self) -> bool {
+        true
+    }
 }
+
+/// Самое маленькое окно, до которого программу каркаса можно сжать.
+const MIN_W: u32 = 320;
+const MIN_H: u32 = 200;
 
 /// Паспорт программы.
 pub struct Spec {
@@ -168,9 +180,14 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
         exit(1)
     };
 
-    let area = Rect::new(0, 0, width, height);
+    let mut area = Rect::new(0, 0, width, height);
     println(&format!("{}: window '{}' opened, {width}x{height}", spec.name, spec.title));
     let mut app = make(Ctx::scaled(scale), area);
+    // Тянуть за край и разворачивать — как всякое окно (Роман, 27.10:
+    // «Файлы» нельзя было растянуть, а терминал можно).
+    if app.resizable() {
+        let _ = window.set_resizable(true);
+    }
 
     let mut dark = info.flags & SYSINFO_DARK != 0;
     let mut next = monotonic_ms() + spec.period_ms;
@@ -194,6 +211,22 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                 WIN_POINTER if event.code == RIGHT_BUTTON => app.click_right(area, ctx, event.x, event.y),
                 WIN_POINTER => app.click(area, ctx, event.x, event.y),
                 WIN_WHEEL => app.wheel(event.x),
+                // Новый размер от стола: поверхность выдаётся заново, прежние
+                // пиксели после ответа недействительны.
+                WIN_RESIZE => {
+                    let (w, h) = ((event.x.max(0) as u32).max(MIN_W), (event.y.max(0) as u32).max(MIN_H));
+                    if window.resize(w, h).is_ok() {
+                        let base = window.pixels().as_mut_ptr();
+                        // SAFETY: ядро только что отобразило ровно `w * h`
+                        // точек по этому адресу; прежняя поверхность больше не
+                        // используется — она заменяется здесь же.
+                        if let Some(fresh) = unsafe { Surface::from_raw(base, w, h) } {
+                            surface = fresh;
+                            area = Rect::new(0, 0, w, h);
+                        }
+                    }
+                    true
+                }
                 _ => false,
             };
             if handled {

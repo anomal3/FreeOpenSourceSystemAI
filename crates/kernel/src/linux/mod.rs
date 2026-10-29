@@ -39,6 +39,7 @@ mod links;
 pub mod recent;
 mod net;
 mod process;
+pub mod profile;
 pub mod signal;
 mod special;
 mod thread;
@@ -322,8 +323,10 @@ pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
         return;
     }
     let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9].map(|value| value as usize);
+    let started = crate::time::uptime_ns();
     // SAFETY: контракт функции.
     let result = unsafe { dispatch(number, args, frame) };
+    profile::count(number, crate::time::uptime_ns().saturating_sub(started));
     recent::record(number, args, result);
     frame.rax = result as u64;
     // Пришедшие сигналы доставляются на выходе из вызова (фаза 71c).
@@ -401,7 +404,11 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             // Данные пишутся сразу, блокировок между процессами одного
             // пользователя нет, прав и времени файла программа Linux не меняет:
             // согласиться — честный ответ.
-            nr::FSYNC | nr::FDATASYNC | nr::SYNC_FILE_RANGE | nr::FLOCK => 0,
+            nr::FSYNC | nr::FDATASYNC | nr::SYNC_FILE_RANGE => {
+                crate::fs::writeback_all();
+                0
+            }
+            nr::FLOCK => 0,
             nr::CHMOD | nr::FCHMOD | nr::FCHMODAT | nr::FCHOWN | nr::UTIMENSAT => 0,
             nr::SCHED_GET_PRIORITY_MAX | nr::SCHED_GET_PRIORITY_MIN => 0,
             // Приоритет `SCHED_OTHER` — ноль; поменять его нечем.

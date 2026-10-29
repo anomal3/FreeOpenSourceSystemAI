@@ -76,6 +76,20 @@ const CHECKS: [(&str, &str); 4] = [
 /// корне. Запускаются через `#!/bin/bash`.
 const SCRIPTS: [(&str, &str); 1] = [("forkcheck.sh", "usr/libexec/fossai/forkcheck")];
 
+/// Браузер по умолчанию для программ Linux: так ссылку открывает всякая
+/// программа — Rider (вход в аккаунт JetBrains), Java (`Desktop.browse`),
+/// сценарии. Пока это Chromium, если он поставлен (`pkg install chromium`).
+const BROWSER: &str = "#!/bin/bash\n\
+    # Браузер по умолчанию FossAi для программ Linux: Chromium.\n\
+    if [ -x /opt/chromium/bin/chromium ]; then\n\
+    \texec /bin/bash /opt/chromium/bin/chromium \"$@\"\n\
+    fi\n\
+    echo \"$(basename \"$0\"): no browser is installed (pkg install chromium)\" >&2\n\
+    exit 3\n";
+
+/// Имена, под которыми программы ищут браузер.
+const BROWSER_NAMES: [&str; 4] = ["usr/bin/xdg-open", "usr/bin/x-www-browser", "usr/bin/www-browser", "usr/bin/sensible-browser"];
+
 /// Что в корень не попадает: справка, документация, переводы — читать их в
 /// системе нечем; модули перекодировок glibc (`gconv`, 250 файлов) нужны
 /// только `iconv`.
@@ -144,6 +158,9 @@ pub fn build(arch: Arch) -> Result<()> {
     for (source, place) in SCRIPTS {
         let data = fs::read(cbuild::libc_dir().join("linux").join(source))?;
         root.insert(String::from(place), Node::File { data, mode: 0o755 });
+    }
+    for place in BROWSER_NAMES {
+        root.insert(String::from(place), Node::File { data: BROWSER.as_bytes().to_vec(), mode: 0o755 });
     }
     // `/bin/sh` у Debian — от `dash`, которого здесь нет; `system()` и
     // `popen()` glibc зовут именно его (фаза 71d). Ссылка на bash — копией.

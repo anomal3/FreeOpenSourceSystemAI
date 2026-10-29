@@ -3138,7 +3138,7 @@ fn prepare_drives(
             }
             // Rider — тем же приёмом: шесть гигабайт носителем на FAT32 не
             // привезти (см. `crate::rider`).
-            if scenario.name == "rider" {
+            if matches!(scenario.name, "rider" | "vbox-show") {
                 crate::rider::place(&disk)?;
             }
             // Ключ — тем же приёмом и до запуска: так же, как человек положил бы

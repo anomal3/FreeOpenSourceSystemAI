@@ -46,7 +46,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use mini_ui::{Rect, Surface, theme};
 
@@ -65,6 +65,41 @@ pub const SOCKET: &[u8] = b"/run/user/0/wayland-0";
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 static LISTENER: Mutex<Option<KernelListener>> = Mutex::new(None);
+
+// ---- буфер обмена ---------------------------------------------------------------
+//
+// Выделение (`wl_data_device.set_selection`) — одно на всех клиентов: какой
+// клиент им владеет, его `wl_data_source` и форматы. Текст сервер у себя не
+// держит: клиенту, попросившему вставку (`wl_data_offer.receive`), владелец
+// пишет его сам — в канал, который сервер ему передаёт (`wl_data_source.send`).
+// Так устроено у любого сервера Wayland, и так Chromium и Rider (Java)
+// обмениваются текстом (Роман, 27.10: «не могу скопировать из браузера и
+// вставить в Rider»).
+
+/// Чьё выделение и что в нём.
+struct Selection {
+    owner: u64,
+    source: u32,
+    mimes: Vec<String>,
+}
+
+static SELECTION: Mutex<Option<Selection>> = Mutex::new(None);
+/// Растёт при каждой смене выделения: клиент, у которого своё число
+/// отстало, получает новое предложение.
+static SELECTION_GEN: AtomicU32 = AtomicU32::new(1);
+
+/// Просьба к клиенту-владельцу, которую он выполнит на своём шаге.
+enum ToOwner {
+    /// `wl_data_source.send(mime, fd)`: написать данные в этот канал.
+    Send { source: u32, mime: String, fd: Handle },
+    /// `wl_data_source.cancelled`: выделение перешло к другому.
+    Cancelled { source: u32 },
+}
+
+static TO_OWNER: Mutex<Vec<(u64, ToOwner)>> = Mutex::new(Vec::new());
+/// Номер клиента для буфера обмена: у одного процесса бывает несколько
+/// соединений, и номер процесса их не различает.
+static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 
 /// Поднять сервер, если программа подключается к [`SOCKET`].
 pub fn serve_if_named(name: &[u8]) {
@@ -384,8 +419,10 @@ enum Role {
     Toplevel(u32),
     /// Всплывающее: номер `xdg_surface`.
     Popup(u32),
-    /// Подповерхность: родитель и место в нём.
-    Sub { parent: u32, x: i32, y: i32 },
+    /// Подповерхность: родитель, место в нём и лежит ли она **под** ним
+    /// (`wl_subsurface.place_below` родителя). Порядок среди сестёр — порядок
+    /// в `children` родителя.
+    Sub { parent: u32, x: i32, y: i32, below: bool },
 }
 
 struct SurfaceState {
@@ -486,8 +523,11 @@ enum Obj {
     Keyboard,
     Output,
     DataDeviceManager,
-    DataSource,
+    /// Источник данных клиента и форматы, которые он предложил.
+    DataSource(Vec<String>),
     DataDevice,
+    /// Предложение выделения, которое сервер прислал клиенту.
+    DataOffer,
     Viewporter,
     Viewport,
 }
@@ -514,11 +554,24 @@ struct Client {
     /// того как кадр показан.
     frames_due: Vec<u32>,
     pointer_on: Option<u32>,
+    /// Где указатель на ней был в последнем `motion` — чтобы не слать
+    /// движения, которого не было.
+    pointer_at: Option<(i32, i32)>,
     /// Поверхность с фокусом клавиатуры.
     keyboard_on: Option<u32>,
     /// Нажатые модификаторы и включённые замки (маски `MOD_*`).
     mods_down: u32,
     mods_locked: u32,
+    /// Группа раскладки, о которой знает клиент: 0 — английская, 1 —
+    /// русская (`wayland.xkb`). Сверяется с языком системы на каждой клавише.
+    group: u32,
+    /// Номер клиента для буфера обмена ([`NEXT_KEY`]).
+    key: u64,
+    /// Какое поколение выделения клиент уже видел ([`SELECTION_GEN`]).
+    selection_seen: u32,
+    /// Следующий номер объекта, созданного сервером (`wl_data_offer`):
+    /// сервер нумерует свои с `0xff000000`.
+    next_server_id: u32,
     /// Нажатые клавиши (коды evdev): повтор ядра отличается от нажатия.
     keys_down: Vec<u32>,
     seat_version: u32,
@@ -545,9 +598,14 @@ impl Client {
             serial: 0,
             frames_due: Vec::new(),
             pointer_on: None,
+            pointer_at: None,
             keyboard_on: None,
             mods_down: 0,
             mods_locked: 0,
+            group: 0,
+            key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
+            selection_seen: SELECTION_GEN.load(Ordering::Acquire),
+            next_server_id: 0xff00_0000,
             keys_down: Vec::new(),
             seat_version: 1,
             broken: false,
@@ -615,6 +673,8 @@ impl Client {
             }
         }
         if !self.broken {
+            self.sync_selection();
+            self.serve_owner();
             self.window_events(time);
             self.popup_events(time);
             for index in 0..self.wins.len() {
@@ -708,22 +768,57 @@ impl Client {
             // `create_data_source(id)`, `get_data_device(id, seat)`.
             Obj::DataDeviceManager => {
                 let new = args.u32()?;
-                let made = if opcode == 0 { Obj::DataSource } else { Obj::DataDevice };
-                self.objects.insert(new, made);
-            }
-            // `offer`, `destroy`, `set_actions`: предложение запоминать некому —
-            // буфера обмена между клиентами пока нет.
-            Obj::DataSource => {
-                if opcode == 1 {
-                    self.delete(id);
+                if opcode == 0 {
+                    self.objects.insert(new, Obj::DataSource(Vec::new()));
+                } else {
+                    self.objects.insert(new, Obj::DataDevice);
+                    // Новому устройству — нынешнее выделение на ближайшем шаге.
+                    self.selection_seen = SELECTION_GEN.load(Ordering::Acquire).wrapping_sub(1);
                 }
             }
-            // `start_drag`, `set_selection`, `release`.
-            Obj::DataDevice => {
-                if opcode == 2 {
+            // `offer(mime)`, `destroy`, `set_actions`.
+            Obj::DataSource(_) => match opcode {
+                0 => {
+                    let mime = args.string()?;
+                    if let Some(Obj::DataSource(mimes)) = self.objects.get_mut(&id) {
+                        if mimes.len() < 32 && !mimes.contains(&mime) {
+                            mimes.push(mime);
+                        }
+                    }
+                }
+                1 => {
+                    self.forget_source(id);
                     self.delete(id);
                 }
-            }
+                _ => {}
+            },
+            // `start_drag`, `set_selection(source, serial)`, `release`.
+            Obj::DataDevice => match opcode {
+                1 => {
+                    let source = args.u32()?;
+                    self.set_selection(source);
+                }
+                2 => self.delete(id),
+                _ => {}
+            },
+            // `accept`, `receive(mime, fd)`, `destroy`, `finish`, `set_actions`.
+            Obj::DataOffer => match opcode {
+                1 => {
+                    let mime = args.string()?;
+                    let Some(fd) = self.fds.pop_front() else {
+                        self.fail(id, 2, "receive without a descriptor");
+                        return Ok(());
+                    };
+                    // Канал — владельцу выделения; нет владельца — канал
+                    // закроется здесь, и клиент прочтёт пустоту.
+                    if let Some(owner) = SELECTION.lock().as_ref().map(|selection| (selection.owner, selection.source)) {
+                        TO_OWNER.lock().push((owner.0, ToOwner::Send { source: owner.1, mime, fd }));
+                        crate::io_events::notify();
+                    }
+                }
+                2 => self.delete(id),
+                _ => {}
+            },
             // `destroy`, `get_viewport(id, surface)`.
             Obj::Viewporter => match opcode {
                 0 => self.delete(id),
@@ -747,7 +842,7 @@ impl Client {
                     let surface = args.u32()?;
                     let parent = args.u32()?;
                     if let Some(Obj::Surface(state)) = self.objects.get_mut(&surface) {
-                        state.role = Role::Sub { parent, x: 0, y: 0 };
+                        state.role = Role::Sub { parent, x: 0, y: 0, below: false };
                     }
                     if let Some(Obj::Surface(state)) = self.objects.get_mut(&parent) {
                         state.children.push(surface);
@@ -766,10 +861,19 @@ impl Client {
                     1 => {
                         let (x, y) = (args.i32()?, args.i32()?);
                         if let Some(Obj::Surface(state)) = self.objects.get_mut(&surface) {
-                            if let Role::Sub { parent, .. } = state.role {
-                                state.role = Role::Sub { parent, x, y };
+                            if let Role::Sub { parent, below, .. } = state.role {
+                                state.role = Role::Sub { parent, x, y, below };
                             }
                         }
+                    }
+                    // `place_above(sibling)`, `place_below(sibling)`. Java
+                    // (AWT на Wayland) кладёт тень окна подповерхностью **под**
+                    // окно; без этого полупрозрачная тень ложилась поверх
+                    // содержимого, и окно выглядело как под тёмной плёнкой
+                    // (Rider в VirtualBox, 27.10).
+                    2 | 3 => {
+                        let sibling = args.u32()?;
+                        self.restack(surface, sibling, opcode == 3);
                     }
                     _ => {}
                 }
@@ -1099,6 +1203,58 @@ impl Client {
         Ok(())
     }
 
+    /// `wl_subsurface.place_above`/`place_below`: переставить подповерхность
+    /// над или под `sibling` — родителем или сестрой. Над родителем — значит
+    /// первой из лежащих над ним, под родителем — последней из лежащих под.
+    fn restack(&mut self, surface: u32, sibling: u32, below: bool) {
+        let Some(Obj::Surface(SurfaceState { role: Role::Sub { parent, x, y, .. }, .. })) = self.objects.get(&surface) else {
+            return;
+        };
+        let (parent, x, y) = (*parent, *x, *y);
+        let sibling_below = match self.objects.get(&sibling) {
+            Some(Obj::Surface(SurfaceState { role: Role::Sub { parent: other, below, .. }, .. })) if *other == parent => Some(*below),
+            _ => None,
+        };
+        // Сестра — встать рядом с ней на её сторону от родителя; родитель —
+        // на выбранную сторону.
+        let (side, anchor) = match sibling_below {
+            Some(side) if sibling != parent => (side, Some(sibling)),
+            _ => (below, None),
+        };
+        if let Some(Obj::Surface(state)) = self.objects.get_mut(&surface) {
+            state.role = Role::Sub { parent, x, y, below: side };
+        }
+        let sides: Vec<(u32, bool)> = match self.objects.get(&parent) {
+            Some(Obj::Surface(state)) => state
+                .children
+                .iter()
+                .map(|child| {
+                    let side = match self.objects.get(child) {
+                        Some(Obj::Surface(SurfaceState { role: Role::Sub { below, .. }, .. })) => *below,
+                        _ => false,
+                    };
+                    (*child, side)
+                })
+                .collect(),
+            _ => return,
+        };
+        let Some(Obj::Surface(state)) = self.objects.get_mut(&parent) else {
+            return;
+        };
+        state.children.retain(|child| *child != surface);
+        let at = match anchor {
+            Some(anchor) => {
+                let index = state.children.iter().position(|child| *child == anchor).unwrap_or(state.children.len());
+                if below { index } else { index + 1 }
+            }
+            // Сразу над родителем — первой из лежащих над ним; сразу под —
+            // последней из лежащих под.
+            None => sides.iter().filter(|(child, side)| *child != surface && *side).count(),
+        };
+        let at = at.min(state.children.len());
+        state.children.insert(at, surface);
+    }
+
     /// Отцепить подповерхность от родителя.
     fn unparent(&mut self, surface: u32) {
         let parent = match self.objects.get(&surface) {
@@ -1407,18 +1563,29 @@ impl Client {
         let Some(Obj::Surface(state)) = self.objects.get(&id) else {
             return;
         };
-        if let Some((_, buf)) = &state.shown {
-            if out.try_reserve(1).is_err() {
-                return;
+        // Сначала лежащие под поверхностью (тень окна Java), потом она сама,
+        // потом лежащие над ней — каждая группа в порядке `children`.
+        for under in [true, false] {
+            if !under {
+                if let Some((_, buf)) = &state.shown {
+                    if out.try_reserve(1).is_err() {
+                        return;
+                    }
+                    // Поверх того, что под ней, поверхность смешивается по
+                    // альфе; нижний слой окна — копией, как было.
+                    let blend = (depth > 0 || !out.is_empty()) && buf.format == SHM_ARGB8888;
+                    out.push(Layer { buf: buf.clone(), x: dx, y: dy, blend });
+                }
             }
-            out.push(Layer { buf: buf.clone(), x: dx, y: dy, blend: depth > 0 && buf.format == SHM_ARGB8888 });
-        }
-        if depth >= 8 {
-            return;
-        }
-        for child in &state.children {
-            if let Some(Obj::Surface(SurfaceState { role: Role::Sub { x, y, .. }, .. })) = self.objects.get(child) {
-                self.layers(*child, dx + x, dy + y, depth + 1, out);
+            if depth >= 8 {
+                continue;
+            }
+            for child in &state.children {
+                if let Some(Obj::Surface(SurfaceState { role: Role::Sub { x, y, below, .. }, .. })) = self.objects.get(child) {
+                    if *below == under {
+                        self.layers(*child, dx + x, dy + y, depth + 1, out);
+                    }
+                }
             }
         }
     }
@@ -1455,6 +1622,107 @@ impl Client {
         while !self.wins.is_empty() {
             self.close_win(0);
         }
+        // Ушедший клиент не напишет своё выделение никому.
+        let mut selection = SELECTION.lock();
+        if selection.as_ref().is_some_and(|held| held.owner == self.key) {
+            *selection = None;
+            SELECTION_GEN.fetch_add(1, Ordering::AcqRel);
+        }
+        drop(selection);
+        TO_OWNER.lock().retain(|(owner, _)| *owner != self.key);
+    }
+
+    /// `wl_data_device.set_selection(source)`: выделение — этого клиента
+    /// (или ничьё, если `source` ноль). Прежний владелец узнаёт, что его
+    /// источник больше не нужен.
+    fn set_selection(&mut self, source: u32) {
+        let mimes = match self.objects.get(&source) {
+            Some(Obj::DataSource(mimes)) => Some(mimes.clone()),
+            _ => None,
+        };
+        let mut selection = SELECTION.lock();
+        if mimes.is_none() && selection.as_ref().is_some_and(|held| held.owner != self.key) {
+            // Чужое выделение снимать «ничем» нельзя.
+            return;
+        }
+        if let Some(old) = selection.take() {
+            if !(old.owner == self.key && old.source == source) {
+                TO_OWNER.lock().push((old.owner, ToOwner::Cancelled { source: old.source }));
+            }
+        }
+        *selection = mimes.map(|mimes| Selection { owner: self.key, source, mimes });
+        SELECTION_GEN.fetch_add(1, Ordering::AcqRel);
+        drop(selection);
+        crate::io_events::notify();
+    }
+
+    /// Источник уничтожен — если выделение было на нём, оно пропадает.
+    fn forget_source(&mut self, source: u32) {
+        let mut selection = SELECTION.lock();
+        if selection.as_ref().is_some_and(|held| held.owner == self.key && held.source == source) {
+            *selection = None;
+            SELECTION_GEN.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Выделение сменилось — каждому `wl_data_device` клиента новое
+    /// предложение (`data_offer`, форматы, `selection`) или «пусто».
+    fn sync_selection(&mut self) {
+        let generation = SELECTION_GEN.load(Ordering::Acquire);
+        if generation == self.selection_seen {
+            return;
+        }
+        self.selection_seen = generation;
+        let devices: Vec<u32> = self.objects.iter().filter(|(_, obj)| matches!(obj, Obj::DataDevice)).map(|(id, _)| *id).collect();
+        if devices.is_empty() {
+            return;
+        }
+        let mimes = SELECTION.lock().as_ref().map(|selection| selection.mimes.clone());
+        for device in devices {
+            match &mimes {
+                Some(mimes) => {
+                    let offer = self.next_server_id;
+                    self.next_server_id = self.next_server_id.wrapping_add(1).max(0xff00_0000);
+                    self.objects.insert(offer, Obj::DataOffer);
+                    self.send(Msg::new(device, 0).u32(offer));
+                    for mime in mimes {
+                        self.send(Msg::new(offer, 0).str(mime));
+                    }
+                    self.send(Msg::new(device, 5).u32(offer));
+                }
+                None => self.send(Msg::new(device, 5).u32(0)),
+            }
+        }
+    }
+
+    /// Просьбы к этому клиенту как к владельцу выделения: написать данные в
+    /// канал (`send`) или забыть источник (`cancelled`).
+    fn serve_owner(&mut self) {
+        let mine: Vec<ToOwner> = {
+            let mut queue = TO_OWNER.lock();
+            if !queue.iter().any(|(owner, _)| *owner == self.key) {
+                return;
+            }
+            let all: Vec<(u64, ToOwner)> = queue.drain(..).collect();
+            let (mine, rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|(owner, _)| *owner == self.key);
+            *queue = rest;
+            mine.into_iter().map(|(_, request)| request).collect()
+        };
+        for request in mine {
+            match request {
+                ToOwner::Send { source, mime, fd } => {
+                    if matches!(self.objects.get(&source), Some(Obj::DataSource(_))) {
+                        self.out_fds.push(fd);
+                        self.send(Msg::new(source, 1).str(&mime));
+                    }
+                }
+                ToOwner::Cancelled { source } => {
+                    if matches!(self.objects.get(&source), Some(Obj::DataSource(_))) {
+                        self.send(Msg::new(source, 2));
+                    }
+                }
+            }
+        }
     }
 
     /// События столовых окон — клиенту.
@@ -1483,6 +1751,12 @@ impl Client {
                         self.pointer_motion(surface, x, y, time);
                         let button = if event.code == 2 { BTN_RIGHT } else { BTN_LEFT };
                         let state = u32::from(event.kind == user_abi::WIN_POINTER);
+                        // Нажатие — в журнал: «щелчок не доходит до программы»
+                        // иначе снаружи не разобрать (крестик диалога Java,
+                        // 27.10).
+                        if state == 1 {
+                            kprintln!("  wayland     : #{} press at {x},{y} of surface {surface}", self.pid);
+                        }
                         self.pointer_send(|pointer, serial| Msg::new(pointer, 3).u32(serial).u32(time).u32(button).u32(state));
                     }
                     user_abi::WIN_WHEEL => {
@@ -1518,6 +1792,7 @@ impl Client {
                         if self.keyboard_on != Some(surface) {
                             self.keyboard_enter(surface);
                         }
+                        self.sync_group();
                         let (code, pressed) = (event.code, event.x != 0);
                         let held = self.keys_down.contains(&code);
                         if pressed && held {
@@ -1573,6 +1848,12 @@ impl Client {
                         self.pointer_motion(surface, x, y, time);
                         let button = if event.code == 2 { BTN_RIGHT } else { BTN_LEFT };
                         let state = u32::from(event.kind == user_abi::WIN_POINTER);
+                        // Нажатие — в журнал: «щелчок не доходит до программы»
+                        // иначе снаружи не разобрать (крестик диалога Java,
+                        // 27.10).
+                        if state == 1 {
+                            kprintln!("  wayland     : #{} press at {x},{y} of surface {surface}", self.pid);
+                        }
                         self.pointer_send(|pointer, serial| Msg::new(pointer, 3).u32(serial).u32(time).u32(button).u32(state));
                     }
                     user_abi::WIN_WHEEL => {
@@ -1615,7 +1896,7 @@ impl Client {
         if let Some(surface) = self.keyboard_on {
             let serial = self.next_serial();
             self.send(Msg::new(keyboard, 1).u32(serial).u32(surface).bytes(&[]));
-            self.send(Msg::new(keyboard, 4).u32(serial).u32(self.mods_down).u32(0).u32(self.mods_locked).u32(0));
+            self.send(Msg::new(keyboard, 4).u32(serial).u32(self.mods_down).u32(0).u32(self.mods_locked).u32(self.group));
         }
     }
 
@@ -1626,9 +1907,23 @@ impl Client {
         self.keyboard_on = Some(surface);
         self.mods_down = 0;
         self.keys_down.clear();
-        let locked = self.mods_locked;
+        self.group = layout_group();
+        let (locked, group) = (self.mods_locked, self.group);
         self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 1).u32(serial).u32(surface).bytes(&[]));
-        self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 4).u32(serial).u32(0).u32(0).u32(locked).u32(0));
+        self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 4).u32(serial).u32(0).u32(0).u32(locked).u32(group));
+    }
+
+    /// Язык системы сменился (Alt+Shift, трей) — сказать клиенту новую
+    /// группу раскладки до клавиши, иначе Chromium печатал бы латиницей
+    /// при включённой русской (Роман, 27.10).
+    fn sync_group(&mut self) {
+        let group = layout_group();
+        if group == self.group {
+            return;
+        }
+        self.group = group;
+        let (down, locked) = (self.mods_down, self.mods_locked);
+        self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 4).u32(serial).u32(down).u32(0).u32(locked).u32(group));
     }
 
     /// Пересчитать модификаторы после клавиши `code` и сообщить, если они
@@ -1653,8 +1948,8 @@ impl Client {
             }
         }
         if (self.mods_down, self.mods_locked) != (down, locked) {
-            let (down, locked) = (self.mods_down, self.mods_locked);
-            self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 4).u32(serial).u32(down).u32(0).u32(locked).u32(0));
+            let (down, locked, group) = (self.mods_down, self.mods_locked, self.group);
+            self.keyboard_send(|keyboard, serial| Msg::new(keyboard, 4).u32(serial).u32(down).u32(0).u32(locked).u32(group));
         }
     }
 
@@ -1674,7 +1969,14 @@ impl Client {
             }
             self.pointer_on = Some(surface);
             self.pointer_send(|pointer, serial| Msg::new(pointer, 0).u32(serial).u32(surface).fixed(x).fixed(y));
+        } else if self.pointer_at == Some((x, y)) {
+            // Указатель не сдвинулся — движения не было. Лишнее `motion`
+            // между нажатием и отпусканием AWT (Java) считает перетаскиванием
+            // и отменяет щелчок: крестик и кнопки окон Java не нажимались
+            // (диалог лицензии Rider, 27.10).
+            return;
         }
+        self.pointer_at = Some((x, y));
         self.pointer_send(|pointer, _| Msg::new(pointer, 2).u32(time).fixed(x).fixed(y));
     }
 
@@ -1690,6 +1992,11 @@ impl Client {
             self.send(Msg::new(pointer, 5));
         }
     }
+}
+
+/// Группа `wayland.xkb` для языка системы: 0 — английская, 1 — русская.
+fn layout_group() -> u32 {
+    u32::from(crate::input::keymap::layout() == crate::input::keymap::Layout::Ru)
 }
 
 /// Закрыть окно стола, переждав занятый стол.

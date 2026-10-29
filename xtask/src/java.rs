@@ -105,6 +105,13 @@ const FONTS_CONF: &str = "<?xml version=\"1.0\"?>\n\
     \t<alias><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>\n\
     </fontconfig>\n";
 
+/// Подробный журнал AWT на Wayland (`sun.awt.wl`) в стандартный вывод
+/// ошибок.
+const WL_LOG: &str = "handlers=java.util.logging.ConsoleHandler\n\
+    java.util.logging.ConsoleHandler.level=ALL\n\
+    .level=WARNING\n\
+    sun.awt.wl.level=ALL\n";
+
 /// Раскладки XKB в пакете `xkb-data`.
 const XKB_DIR: &str = "usr/share/X11/xkb/";
 
@@ -153,8 +160,9 @@ const HELLO: &str = "public class Hello {\n\
     \t}\n\
     }\n";
 
-/// Окно Swing: надпись и кнопка; с `self-test` нажимает её сам и через
-/// двадцать секунд закрывается — стенду хватает времени снять окно.
+/// Окно Swing: надпись и кнопка; с `self-test` нажимает её сам и открывает
+/// модальный диалог (как «Manage Licenses» у Rider) — его и окно закрывает
+/// крестиком стола стенд. Через три минуты выходит само, если не закрыли.
 const WINDOW: &str = "import javax.swing.*;\n\
     import java.awt.*;\n\
     public class Window {\n\
@@ -176,11 +184,25 @@ const WINDOW: &str = "import javax.swing.*;\n\
     \t\t\tframe.add(button, BorderLayout.SOUTH);\n\
     \t\t\tframe.setSize(360, 200);\n\
     \t\t\tframe.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);\n\
+    \t\t\tframe.addWindowListener(new java.awt.event.WindowAdapter() {\n\
+    \t\t\t\tpublic void windowClosing(java.awt.event.WindowEvent e) { System.out.println(\"java: window closing\"); }\n\
+    \t\t\t});\n\
     \t\t\tframe.setVisible(true);\n\
     \t\t\tSystem.out.println(\"java: window shown\");\n\
     \t\t\tif (self) {\n\
     \t\t\t\tbutton.doClick();\n\
-    \t\t\t\tnew javax.swing.Timer(20000, e -> System.exit(0)).start();\n\
+    \t\t\t\tSwingUtilities.invokeLater(() -> {\n\
+    \t\t\t\t\tJDialog dialog = new JDialog(frame, \"Java dialog\", true);\n\
+    \t\t\t\t\tdialog.add(new JLabel(\"A modal dialog\", SwingConstants.CENTER));\n\
+    \t\t\t\t\tdialog.setSize(280, 150);\n\
+    \t\t\t\t\tdialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);\n\
+    \t\t\t\t\tdialog.addWindowListener(new java.awt.event.WindowAdapter() {\n\
+    \t\t\t\t\t\tpublic void windowOpened(java.awt.event.WindowEvent e) { System.out.println(\"java: dialog shown\"); }\n\
+    \t\t\t\t\t\tpublic void windowClosed(java.awt.event.WindowEvent e) { System.out.println(\"java: dialog closed\"); }\n\
+    \t\t\t\t\t});\n\
+    \t\t\t\t\tdialog.setVisible(true);\n\
+    \t\t\t\t});\n\
+    \t\t\t\tnew javax.swing.Timer(180000, e -> System.exit(0)).start();\n\
     \t\t\t}\n\
     \t\t});\n\
     \t}\n\
@@ -432,6 +454,9 @@ pub fn build(arch: Arch) -> Result<()> {
     }
     files.push((String::from("samples/Hello.java"), HELLO.as_bytes().to_vec(), 0o644));
     files.push((String::from("samples/Window.java"), WINDOW.as_bytes().to_vec(), 0o644));
+    // Журнал AWT на Wayland — для разбора: `-Djava.util.logging.config.file=
+    // /opt/java/samples/wl-log.properties`.
+    files.push((String::from("samples/wl-log.properties"), WL_LOG.as_bytes().to_vec(), 0o644));
 
     // Запуск — сценарий bash: у `java` нет `RUNPATH` на наши библиотеки, а
     // окна — только через Wayland (`WLToolkit`): X11 в системе нет.

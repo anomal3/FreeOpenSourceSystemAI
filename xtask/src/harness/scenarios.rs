@@ -12148,6 +12148,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("root        : ext2 at LBA", BOOT),
             Step::Await(PROMPT, 90_000),
             Step::AwaitAny("init: 'drvd' finished", 60_000),
+            // Остаток прогона, упавшего до `pkg remove`, — снять: иначе `pkg`
+            // ответит «already installed». Нет пакета — тоже ответ.
+            Step::Line("run /bin/pkg remove java"),
+            Step::Await("/bin/pkg: exited with code", 300_000),
             // По имени: корень Debian, который пакет требует, `pkg` ставит сам.
             Step::Line("pkg install java"),
             Step::Await("pkg: java asks for jit", 300_000),
@@ -12162,7 +12166,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await("java: hello from OpenJDK 64-Bit Server VM 25.0.4", 600_000),
             Step::Await("java: loop sum 149999997", 120_000),
             Step::Await("/opt/debian/bin/bash: exited with code 0", 60_000),
-            Step::Await("user        : jit: ", 30_000),
+            // Где угодно в выводе: строку печатает уборка программы, и в
+            // отладочной сборке она бывает раньше «exited with code».
+            Step::AwaitAny("user        : jit: ", 30_000),
             // Окно Swing через сервер Wayland ядра (`WLToolkit`): с `self-test`
             // программа нажимает кнопку сама и через двадцать секунд выходит.
             Step::Line("run -b /opt/debian/bin/bash /opt/java/bin/java /opt/java/samples/Window.java self-test"),
@@ -12175,6 +12181,19 @@ pub const ALL: &[Scenario] = &[
             Step::Await("wayland     : #", 60_000),
             Step::Move(1, 0),
             Step::Painted("java-window"),
+            // Модальный диалог — как «Manage Licenses» у Rider, который Роман
+            // не смог закрыть (27.10). Крестик стола — сначала у диалога, потом
+            // у окна; программа говорит, что получила каждый.
+            Step::Await("java: dialog shown", 120_000),
+            Step::Wait(3_000),
+            Step::Move(1, 0),
+            Step::Shot("java-dialog"),
+            Step::Aim(Aim::Close("Java dialog")),
+            Step::Click,
+            Step::Await("java: dialog closed", 60_000),
+            Step::Aim(Aim::Close("Java on FossAi")),
+            Step::Click,
+            Step::Await("java: window closing", 60_000),
             Step::Await("/opt/debian/bin/bash: exited with code 0", 120_000),
             Step::Line("pkg remove java"),
             Step::Await("pkg: removed java", 300_000),
@@ -12233,6 +12252,50 @@ pub const ALL: &[Scenario] = &[
             Step::Absent("KERNEL PANIC"),
         ],
     },
+    // Диск для показа в VirtualBox (Роман проверяет сам): Rider разложен
+    // стендом, Java и Chromium поставлены, система выключена чисто. Без
+    // запуска Rider — это двенадцать минут QEMU, которые здесь не нужны.
+    // Цепочка: `FOSSAI_TARGET_MIB=24576`, `install`, `vbox-show`, затем
+    // `tools\vbox\installed.cmd gui release`.
+    Scenario {
+        name: "vbox-show",
+        about: "Диск для VirtualBox: Rider (раскладывает стенд), Java и Chromium поставлены, выключение.",
+        target: Target::Installed,
+        usb_only: false,
+        tablet: false,
+        ohci: false,
+        ehci: false,
+        disk_bus: DiskBus::Virtio,
+        network: false,
+        e1000: false,
+        guest_port: 0,
+        host_echo: false,
+        host_repo: false,
+        host_site: false,
+        arches: &[Arch::X86_64],
+        reboots: false,
+        updates: false,
+        big_file: false,
+        // Ключ стенда в `~/.ssh` — чтобы смотреть VirtualBox изнутри по SSH
+        // (127.0.0.1:2222), не трогая экран, за которым сидит Роман.
+        ssh_key: true,
+        memory: "2G",
+        extra: &["-cpu", "max", "-smp", "2"],
+        steps: &[
+            Step::Await("root        : ext2 at LBA", BOOT),
+            Step::Await(PROMPT, 90_000),
+            Step::AwaitAny("init: 'drvd' finished", 60_000),
+            Step::Line("pkg install java"),
+            Step::Await("/bin/pkg: exited with code", 900_000),
+            Step::Line("pkg install chromium"),
+            Step::Await("/bin/pkg: exited with code", 1_800_000),
+            Step::Line("run /bin/pkg list"),
+            Step::Await("  chromium  150", 60_000),
+            Step::Line("shutdown"),
+            Step::Exits(60_000),
+            Step::Absent("KERNEL PANIC"),
+        ],
+    },
     // Последним в списке и намеренно: оставляет Chromium установленным, чтобы
     // после него можно было открыть систему руками (`cargo xtask run
     // --installed --net`) и сразу увидеть значок. Цепочке установленной
@@ -12264,7 +12327,9 @@ pub const ALL: &[Scenario] = &[
             Step::Await(PROMPT, 90_000),
             Step::Line("pkg install chromium"),
             Step::Await("pkg: installed chromium 150, ", 1_800_000),
-            Step::Await("desktop     : packages changed, 5 icons", 30_000),
+            // Число значков не проверяется: сценарий собирает и диск для
+            // показа, на котором до Chromium бывает поставлен Rider.
+            Step::Await("desktop     : packages changed, ", 30_000),
             // Уведомление «Chromium установлен» (72h-2, макет 19).
             Step::Await("desktop     : notification '", 15_000),
             Step::Wait(1_500),

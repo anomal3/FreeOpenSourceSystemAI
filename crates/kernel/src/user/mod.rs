@@ -865,6 +865,10 @@ impl Drop for Program {
         // Строка только у тех, кто памятью кода пользовался: по ней видно,
         // сколько стоило W^X, — и ждал ли кто-нибудь чужой записи.
         let jit = &self.jit;
+        let rwx = jit.rwx.load(core::sync::atomic::Ordering::Relaxed);
+        if rwx > 0 {
+            kprintln!("  user        : jit: {rwx} code pages writable and executable at once");
+        }
         if jit.to_write + jit.to_execute > 0 {
             kprintln!(
                 "  user        : jit: {} flips to write, {} to execute, {} waits",
@@ -1811,7 +1815,10 @@ impl Program {
             // состоянии, какого просит обращение, — исполнение получает
             // исполняемую, остальные записываемую.
             Source::Anonymous(anon) if anon.jit => {
-                let flags = if access == Touch::Execute {
+                let flags = if self.rwx_code() {
+                    self.jit.rwx.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    RWX_CODE
+                } else if access == Touch::Execute {
                     PageFlags::READ | PageFlags::EXEC | PageFlags::USER
                 } else {
                     anon.flags
@@ -2096,6 +2103,24 @@ impl Program {
             // `munmap`). Повтор инструкции разберётся с этим обычным путём.
             return Flip::Done;
         };
+        // Программа с правом `jit`: страница становится записываемой и
+        // исполняемой разом, и переключать её больше не придётся.
+        if self.rwx_code() && access != Touch::Read {
+            if now.contains(PageFlags::WRITE) && now.contains(PageFlags::EXEC) {
+                return Flip::Done;
+            }
+            // SAFETY: см. ниже — тот же кадр, другие права.
+            if unsafe { self.space.map(virt, phys, RWX_CODE) }.is_err() {
+                kprintln!("  user        : WARNING: jit could not make the page at {page_addr:#x} writable and executable");
+                return Flip::Refused;
+            }
+            if shared {
+                arch::flush_user_translations();
+            }
+            arch::sync_instructions(phys);
+            self.jit.to_execute += 1;
+            return Flip::Done;
+        }
         let flags = match access {
             // Читать можно в обоих состояниях, и отказ на чтении присутствующей
             // страницы к переключению отношения не имеет.
@@ -2144,6 +2169,23 @@ impl Program {
             arch::sync_instructions(phys);
         }
         Flip::Done
+    }
+}
+
+/// Права страницы памяти кода у программы с правом пакета `jit`: запись и
+/// исполнение разом, как у Linux (фаза 73, см. [`PageFlags::JIT`]).
+const RWX_CODE: PageFlags = PageFlags::READ
+    .union(PageFlags::WRITE)
+    .union(PageFlags::EXEC)
+    .union(PageFlags::USER)
+    .union(PageFlags::JIT);
+
+impl Program {
+    /// Отдавать ли память кода сразу на запись и исполнение — программе
+    /// Linux, чей пакет назвал право `jit`. Родная память кода (`MAP_JIT`,
+    /// Mono) переключается по обращению, как прежде.
+    fn rwx_code(&self) -> bool {
+        self.linux && self.jit_allowed
     }
 }
 
@@ -2196,6 +2238,9 @@ struct JitStats {
     to_execute: u64,
     /// Сколько раз исполнение ждало чужую запись.
     waits: u64,
+    /// Сколько страниц кода отдано сразу на запись и исполнение (право
+    /// пакета `jit`); счётчик атомарный — отказ планируют по `&self`.
+    rwx: core::sync::atomic::AtomicU64,
 }
 
 /// Исход второй половины отказа — [`Program::fault_commit`].

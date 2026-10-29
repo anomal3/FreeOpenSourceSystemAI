@@ -316,6 +316,11 @@ impl Plan {
 }
 
 impl App for Calc {
+    /// Кнопки калькулятора — сетка одного размера, как у Windows.
+    fn resizable(&self) -> bool {
+        false
+    }
+
     fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
         let p = ctx.palette;
         s.fill(area, theme::window_bg());

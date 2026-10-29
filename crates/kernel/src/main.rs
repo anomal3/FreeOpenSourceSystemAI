@@ -839,6 +839,10 @@ fn run_session(have_input: bool) -> ! {
         }
     }
 
+    if let Err(err) = sched::spawn_daemon("writeback", fs::writeback_task) {
+        kprintln!("  fs          : the writeback task did not start: {err}");
+    }
+
     // Уточнение частоты счётчика времени (фаза 68g): калибровка при загрузке
     // ошибалась в разы в VirtualBox поверх Hyper-V — см. `time::refine_task`.
     #[cfg(target_arch = "x86_64")]

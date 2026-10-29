@@ -653,7 +653,7 @@ pub fn socket_send(owner: TaskId, index: usize, data: &[u8]) -> Result<usize, Ne
     let (local_port, destination, remote_port) =
         iface.sockets.route(owner, index).map_err(NetError::Socket)?;
 
-    let source = iface.address;
+    let source = source_for(iface, destination);
     let mut message = [0u8; udp::HEADER + socket::MAX_DATAGRAM];
     let len = udp::write(
         &mut message,
@@ -1472,7 +1472,7 @@ fn tcp_reject(iface: &mut Interface, source: Ipv4, segment: &tcp::Segment<'_>) {
         payload: &[],
     };
     let mut buffer = [0u8; tcp::HEADER + 4];
-    let len = tcp::write(&mut buffer, iface.address, source, &out);
+    let len = tcp::write(&mut buffer, source_for(iface, source), source, &out);
     if send_ipv4(iface, source, ipv4::PROTOCOL_TCP, &buffer[..len]).is_ok() {
         iface.counters.tcp_out += 1;
         iface.counters.tcp_resets += 1;
@@ -1562,7 +1562,7 @@ fn tcp_pump(iface: &mut Interface, index: usize) {
             payload: &payload[..take],
         };
         let mut buffer = [0u8; tcp::HEADER + 4 + tcp::MSS];
-        let source = iface.address;
+        let source = source_for(iface, remote);
         let len = tcp::write(&mut buffer, source, remote, &out);
 
         match send_ipv4(iface, remote, ipv4::PROTOCOL_TCP, &buffer[..len]) {
@@ -1688,6 +1688,18 @@ fn tcp_tick(iface: &mut Interface) {
     }
 }
 
+/// Адрес отправителя для пакета на `destination`: в сеть петли — `127.0.0.1`,
+/// как у Linux, иначе — свой.
+///
+/// Один и тот же в заголовке IP и в контрольной сумме TCP/UDP. С адресом
+/// машины ответ сервера на петле приходил «от» `10.0.2.15`, а соединение
+/// клиента было записано как соединение с `127.0.0.1`: ответ своего
+/// соединения не находил, стек отвечал `RST`, и вход в Rider через Chromium
+/// кончался «localhost refused to connect» (27.10).
+fn source_for(iface: &Interface, destination: Ipv4) -> Ipv4 {
+    if destination.is_loopback() { Ipv4::LOOPBACK } else { iface.address }
+}
+
 /// Отправить пакет IPv4.
 ///
 /// Возвращает [`NetError::Pending`], если аппаратный адрес получателя ещё
@@ -1712,7 +1724,7 @@ fn send_ipv4(
         iface.next_id = iface.next_id.wrapping_add(1);
         let mut frame = alloc::vec![0u8; total];
         eth::write_header(&mut frame, iface.mac, iface.mac, eth::TYPE_IPV4);
-        ipv4::write_header(&mut frame[eth::HEADER..], iface.address, destination, protocol, payload.len(), id);
+        ipv4::write_header(&mut frame[eth::HEADER..], source_for(iface, destination), destination, protocol, payload.len(), id);
         frame[eth::HEADER + ipv4::HEADER..].copy_from_slice(payload);
         iface.looped.push_back(frame);
         on_interrupt();

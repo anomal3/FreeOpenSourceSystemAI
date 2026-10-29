@@ -119,11 +119,11 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         SYS_READ => read(a0, a1, a2),
         SYS_SEEK => seek(a0, a1 as i64, a2),
         SYS_READDIR => readdir(a0, a1, a2),
-        SYS_CLOSE => close(a0),
+        SYS_CLOSE => settled(close(a0)),
         SYS_STAT => stat(a0, a1, a2),
-        SYS_MKDIR => mkdir(a0, a1, a2),
-        SYS_REMOVE => remove(a0, a1),
-        SYS_RENAME => rename(a0, a1, a2),
+        SYS_MKDIR => settled(mkdir(a0, a1, a2)),
+        SYS_REMOVE => settled(remove(a0, a1)),
+        SYS_RENAME => settled(rename(a0, a1, a2)),
         // Размер окна — два числа в одном: столбцы в старшей половине, строки в
         // младшей. Нули означают, что окна нет, и это честный ответ, а не
         // ошибка: система работает и в серийной консоли.
@@ -535,6 +535,21 @@ fn wait(id: usize, flags: usize) -> i64 {
 }
 
 /// `mkdir(ptr, len, mode) -> 0`.
+/// Довести отложенные записи до носителя после правки, сделанной родной
+/// программой (фаза 74).
+///
+/// Отложенная запись тома — ради программ Linux, пишущих тысячами мелких
+/// кусков (Rider); у них есть `fsync`. Родные программы (`pkg`, «Параметры»,
+/// «Файлы») написаны в расчёте на то, что закрытый файл и удалённое имя уже на
+/// диске, — и выключение питания следом не должно их отменять. Сброс чистого
+/// тома ничего не стоит.
+fn settled(result: i64) -> i64 {
+    if !crate::user::with_current(|program| program.linux).unwrap_or(true) {
+        crate::fs::writeback_all();
+    }
+    result
+}
+
 fn mkdir(ptr: usize, len: usize, mode: usize) -> i64 {
     let mut buffer = [0u8; MAX_PATH];
     let path = match copy_path(ptr, len, &mut buffer) {

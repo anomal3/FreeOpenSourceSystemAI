@@ -49,7 +49,28 @@ struct FileBack {
     node: Arc<dyn Node>,
     start: u64,
     end: u64,
+    /// Отпечаток каждой страницы, какой она лежит в файле: при записи обратно
+    /// страница с тем же отпечатком пропускается. Без этого назад писалось
+    /// всё, чего касались, — и IntelliJ (Rider), отображающая индексы на
+    /// запись, а пишущая в них мало, при выходе десятками тысяч записей по
+    /// 4 КБ занимала файловую систему на минуты: система «висла» (27.10).
+    clean: Mutex<BTreeMap<usize, u64>>,
 }
+
+/// Отпечаток страницы: FNV-1a по 64 битам. Не защита, а сравнение «та же ли
+/// страница», и столкновение здесь — один не записанный кусок, который
+/// программа и так меняла бы под `msync`.
+fn fingerprint(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for chunk in bytes.chunks_exact(8) {
+        hash ^= u64::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]]);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Сколько читать или писать за раз у куска файла: подряд, а не по странице.
+const FILE_RUN: usize = 256 * 1024;
 
 /// Больше этого отображать на запись не возьмёмся: кусок читается целиком.
 const MAX_FILE_MAP: usize = 64 << 20;
@@ -72,17 +93,19 @@ impl SharedMem {
         let mem = Arc::new(Self {
             frames: Mutex::new(BTreeMap::new()),
             size: AtomicU64::new(size),
-            file: Some(FileBack { node: Arc::clone(&node), start: offset, end }),
+            file: Some(FileBack { node: Arc::clone(&node), start: offset, end, clean: Mutex::new(BTreeMap::new()) }),
         });
-        let mut page = alloc::vec![0u8; PAGE_SIZE];
+        // Кусками по [`FILE_RUN`]: одно чтение файловой системы вместо
+        // шестидесяти четырёх.
+        let mut chunk = alloc::vec![0u8; FILE_RUN];
         let mut at = offset;
         while at < end.min(size) {
-            let take = ((end.min(size) - at) as usize).min(PAGE_SIZE);
-            let got = node.read_at(at, &mut page[..take]).ok()?;
+            let take = ((end.min(size) - at) as usize).min(FILE_RUN);
+            let got = node.read_at(at, &mut chunk[..take]).ok()?;
             if got == 0 {
                 break;
             }
-            let data = &page[..got];
+            let data = &chunk[..got];
             mem.copy(at, got, |frame, done, step| {
                 // SAFETY: `done + step <= got`; кадр — см. `copy`.
                 unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(done), frame, step) };
@@ -90,29 +113,75 @@ impl SharedMem {
             .ok()?;
             at += got as u64;
         }
+        mem.remember_clean();
         Some(mem)
     }
 
-    /// Вернуть записанное в файл (`msync`, снятие отображения): страницы, к
-    /// которым прикасались, в пределах нынешней длины файла.
+    /// Запомнить отпечатки всех страниц — такими они лежат в файле.
+    fn remember_clean(&self) {
+        let Some(back) = &self.file else {
+            return;
+        };
+        let pages: Vec<(usize, PhysAddr)> = self.frames.lock().iter().map(|(page, frame)| (*page, *frame)).collect();
+        let mut clean = back.clean.lock();
+        for (page, frame) in pages {
+            // SAFETY: кадр принадлежит объекту и жив, пока жив он.
+            let bytes = unsafe { core::slice::from_raw_parts(super::frame_bytes(frame), PAGE_SIZE) };
+            clean.insert(page, fingerprint(bytes));
+        }
+    }
+
+    /// Вернуть записанное в файл (`msync`, снятие отображения): только
+    /// страницы, которые изменились с тех пор, как были прочитаны или
+    /// записаны (см. [`FileBack::clean`]), — и подряд идущие одним вызовом.
     pub fn flush(&self) {
         let Some(back) = &self.file else {
             return;
         };
         let size = back.node.metadata().size;
         let end = back.end.min(size);
-        let pages: alloc::vec::Vec<(usize, PhysAddr)> = self.frames.lock().iter().map(|(page, frame)| (*page, *frame)).collect();
+        let pages: Vec<(usize, PhysAddr)> = self.frames.lock().iter().map(|(page, frame)| (*page, *frame)).collect();
+        let mut clean = back.clean.lock();
+        // Изменившиеся страницы — `(страница, кадр, отпечаток)`.
+        let mut dirty: Vec<(usize, PhysAddr, u64)> = Vec::new();
         for (page, frame) in pages {
-            let from = (page * PAGE_SIZE) as u64;
-            let to = (from + PAGE_SIZE as u64).min(end);
-            let from = from.max(back.start);
-            if from >= to {
-                continue;
-            }
-            let inside = (from % PAGE_SIZE as u64) as usize;
             // SAFETY: кадр принадлежит объекту и жив, пока жив он.
-            let bytes = unsafe { core::slice::from_raw_parts(super::frame_bytes(frame).add(inside), (to - from) as usize) };
-            let _ = back.node.write_at(from, bytes);
+            let bytes = unsafe { core::slice::from_raw_parts(super::frame_bytes(frame), PAGE_SIZE) };
+            let print = fingerprint(bytes);
+            if clean.get(&page) != Some(&print) {
+                dirty.push((page, frame, print));
+            }
+        }
+        let mut run: Vec<u8> = Vec::new();
+        let mut index = 0;
+        while index < dirty.len() {
+            // Отрезок подряд идущих страниц, не длиннее [`FILE_RUN`].
+            let mut last = index;
+            while last + 1 < dirty.len() && dirty[last + 1].0 == dirty[last].0 + 1 && (last + 2 - index) * PAGE_SIZE <= FILE_RUN {
+                last += 1;
+            }
+            run.clear();
+            let mut run_from = 0u64;
+            for &(page, frame, _) in &dirty[index..=last] {
+                let from = ((page * PAGE_SIZE) as u64).max(back.start);
+                let to = ((page * PAGE_SIZE + PAGE_SIZE) as u64).min(end);
+                if from >= to {
+                    continue;
+                }
+                if run.is_empty() {
+                    run_from = from;
+                }
+                let inside = (from % PAGE_SIZE as u64) as usize;
+                // SAFETY: кадр принадлежит объекту и жив, пока жив он.
+                let bytes = unsafe { core::slice::from_raw_parts(super::frame_bytes(frame).add(inside), (to - from) as usize) };
+                run.extend_from_slice(bytes);
+            }
+            if !run.is_empty() && back.node.write_at(run_from, &run).is_ok() {
+                for &(page, _, print) in &dirty[index..=last] {
+                    clean.insert(page, print);
+                }
+            }
+            index = last + 1;
         }
     }
 

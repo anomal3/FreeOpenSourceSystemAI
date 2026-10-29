@@ -69,6 +69,8 @@ const MANIFEST: &str = "# FossAi package manifest\n\
     about=Rider: среда разработки C# от JetBrains\n\
     caption=Rider\n\
     start=/opt/debian/bin/bash /opt/rider/fossai/rider\n\
+    desktop=yes\n\
+    icon=/opt/rider/fossai/icon.fimg\n\
     permissions=windows files net jit\n";
 
 /// Параметры Java-машины Rider: его собственные плюс окна через Wayland, без
@@ -91,6 +93,8 @@ const SCRIPT: &str = "#!/bin/bash\n\
     export TMPDIR=${TMPDIR:-$HOME}\n\
     # ICU в системе нет: .NET внутри Rider — без языковых таблиц.\n\
     export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1\n\
+    # Ссылки (вход в аккаунт JetBrains) — в браузер по умолчанию: xdg-open корня Debian.\n\
+    export BROWSER=/usr/bin/xdg-open\n\
     export RIDER_VM_OPTIONS=/opt/rider/fossai/rider64.vmoptions\n\
     exec /opt/rider/bin/rider \"$@\"\n";
 
@@ -122,6 +126,7 @@ pub fn place(disk_path: &Path) -> Result<()> {
 
     let mut links: BTreeMap<String, String> = BTreeMap::new();
     let mut vmoptions: Option<Vec<u8>> = None;
+    let mut logo: Option<Vec<u8>> = None;
     let (mut files, mut bytes) = (0usize, 0u64);
     let mut failure: Option<anyhow::Error> = None;
     let keep = |path: &str| {
@@ -141,6 +146,9 @@ pub fn place(disk_path: &Path) -> Result<()> {
             Item::File { data, mode } => {
                 if rest == "bin/rider64.vmoptions" {
                     vmoptions = Some(data.clone());
+                }
+                if rest == "bin/rider.png" {
+                    logo = Some(data.clone());
                 }
                 files += 1;
                 bytes += data.len() as u64;
@@ -169,6 +177,11 @@ pub fn place(disk_path: &Path) -> Result<()> {
     };
     write(&mut fs, &mut dev, "opt/rider/fossai/rider64.vmoptions", &options, 0o644)?;
     write(&mut fs, &mut dev, "opt/rider/fossai/rider", SCRIPT.as_bytes(), 0o755)?;
+    // Значок на столе и на панели — свой, логотип Rider (`bin/rider.png`,
+    // 128×128), как у Chromium: не значок набора.
+    let logo = logo.context("в архиве Rider нет bin/rider.png")?;
+    let icon = crate::fimg::from_png(&logo).context("bin/rider.png не разобран")?;
+    write(&mut fs, &mut dev, "opt/rider/fossai/icon.fimg", &icon, 0o644)?;
     if let Some(parent) = lookup_path(&mut fs, &mut dev, "var/lib/pkg")? {
         let _ = fs.unlink(&mut dev, parent, "rider.pkg");
     }

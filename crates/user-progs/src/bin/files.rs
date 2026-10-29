@@ -2798,6 +2798,21 @@ impl App for Files {
         self.on_click_right(area, ctx, x, y)
     }
 
+    /// Колесо — три строки за щелчок, как у Проводника: в списке ведёт
+    /// выделение (за ним едет и видимая часть), в просмотре листает текст.
+    /// В открытом меню и в поле переименования колесо ничего не делает.
+    fn wheel(&mut self, clicks: i32) -> bool {
+        if self.menu.is_some() || clicks == 0 {
+            return false;
+        }
+        let key = if clicks > 0 { WIN_KEY_UP } else { WIN_KEY_DOWN };
+        let mut changed = false;
+        for _ in 0..clicks.unsigned_abs().saturating_mul(3).min(60) {
+            changed |= self.on_key(key);
+        }
+        changed
+    }
+
     fn after_input(&mut self) {
         self.report_if_moved();
     }

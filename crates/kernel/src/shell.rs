@@ -1060,6 +1060,14 @@ fn change_dir(argument: &str) {
 
 /// Выполнить команду. Возвращает `true`, если сеанс пора закончить.
 fn run_command(line: &str) -> bool {
+    let done = run_builtin(line);
+    // Команда человека — как правка родной программы (фаза 74): написанное
+    // ею на диске сразу, а не через пять секунд. Чистый том это не трогает.
+    crate::fs::writeback_all();
+    done
+}
+
+fn run_builtin(line: &str) -> bool {
     let line = line.trim();
     let (command, argument) = match line.split_once(' ') {
         Some((command, rest)) => (command, rest.trim()),
@@ -1148,6 +1156,8 @@ fn run_command(line: &str) -> bool {
         }
         "ui" => ui_status(argument),
         "tasks" => tasks(),
+        #[cfg(target_arch = "x86_64")]
+        "lxstat" => linux_stat(argument),
         "irq" => interrupt_wakes(argument),
         "beep" => beep(argument),
         "clear" => {
@@ -1931,11 +1941,15 @@ fn date() {
 
 fn memory() {
     let frames = mm::frame::stats();
+    // Кэш блоков (фаза 74) — как `buff/cache` у Linux: в «занято» не входит,
+    // показывается отдельно.
+    let cached = crate::block::cache::held_frames();
     sprintln!(
-        "  frames   {} of {} used, {} MiB free",
-        frames.used(),
+        "  frames   {} of {} used, {} MiB free, {} MiB block cache",
+        frames.used().saturating_sub(cached),
         frames.total,
-        frames.free_bytes() / (1024 * 1024)
+        frames.free_bytes() / (1024 * 1024),
+        cached * 4 / 1024
     );
     // Общие страницы файлов программ: прочитаны один раз на все процессы.
     sprintln!("  cache    {} page(s) of program files shared", mm::pagecache::pages());
@@ -2082,6 +2096,33 @@ fn beep(argument: &str) {
             crate::time::uptime_ms().saturating_sub(started)
         ),
         Err(err) => sprintln!("  beep     failed: {err}"),
+    }
+}
+
+/// Команда `lxstat [reset]`: на что программы Linux тратят время — системные
+/// вызовы по убыванию суммарного времени (`crate::linux::profile`).
+#[cfg(target_arch = "x86_64")]
+fn linux_stat(argument: &str) {
+    let reset = argument.trim() == "reset";
+    let rows = crate::linux::profile::report(reset);
+    let total: u64 = rows.iter().map(|row| row.2).sum();
+    sprintln!("  linux calls: {} kinds, {} ms in all", rows.len(), total / 1_000_000);
+    sprintln!(
+        "  caches: blocks {} MiB, program pages {} MiB",
+        crate::block::cache::held_frames() * 4 / 1024,
+        crate::mm::pagecache::pages() * 4 / 1024
+    );
+    sprintln!("     nr name                calls        ms   us/call");
+    for (number, calls, nanos) in rows.iter().take(30) {
+        sprintln!(
+            "  {number:5} {:<16} {calls:9} {:9} {:9}",
+            crate::linux::profile::name(*number),
+            nanos / 1_000_000,
+            nanos / 1_000 / (*calls).max(1)
+        );
+    }
+    if reset {
+        sprintln!("  (counters reset)");
     }
 }
 

@@ -49,6 +49,9 @@ struct Inner {
     /// писать нечем. Флаг `read_only` рядом с редактором позволял бы забыть
     /// проверку в одном из путей записи; отсутствующий редактор — не позволяет.
     editor: Option<ext2::Editor>,
+    /// Том помечен чистым (`sync`): первая правка обязана сперва сбросить
+    /// признак «используется» на носитель, и только потом менять данные.
+    marked_clean: bool,
 }
 
 /// Смонтированный том.
@@ -129,7 +132,7 @@ impl Ext2Fs {
         first_lba: u64,
         writable: bool,
     ) -> VfsResult<Ext2Mount> {
-        let mut disk = Cached::new(Counted::new(device));
+        let mut disk = Cached::deferred(Counted::new(device));
         let fs = ext2::Ext2::mount(&mut disk, first_lba).map_err(convert)?;
         // На томе только для чтения редактор не открывается вовсе — и не
         // только потому, что писать не собираемся: само открытие помечает том
@@ -137,12 +140,15 @@ impl Ext2Fs {
         // трогающий том, которого он обещал не трогать, был бы издевательством
         // над словом «безопасный».
         let editor = if writable {
-            Some(ext2::Editor::open(&mut disk, first_lba).map_err(convert)?)
+            let editor = ext2::Editor::open(&mut disk, first_lba).map_err(convert)?;
+            // Признак «используется» — на носитель сразу, до любой правки.
+            disk.flush().map_err(|_| VfsError::Io)?;
+            Some(editor)
         } else {
             None
         };
         Ok(Ext2Mount(Arc::new(Self {
-            inner: Mutex::new(Inner { disk, fs, editor }),
+            inner: Mutex::new(Inner { disk, fs, editor, marked_clean: false }),
         })))
     }
 
@@ -168,7 +174,7 @@ impl Ext2Fs {
         // чем машина включилась.
         // Тому только для чтения редактора нет вовсе, и запись отказывает
         // здесь — до того, как что-нибудь на диске изменится.
-        let Inner { disk, editor, .. } = &mut *guard;
+        let Inner { disk, editor, marked_clean, .. } = &mut *guard;
         let Some(editor) = editor.as_mut() else {
             return Err(VfsError::ReadOnly);
         };
@@ -179,6 +185,9 @@ impl Ext2Fs {
         // а потом система продолжила работать, признак надо вернуть, и вернуть
         // до того, как на диске что-то изменится.
         editor.mark_dirty(disk).map_err(convert)?;
+        if core::mem::take(marked_clean) {
+            disk.flush().map_err(|_| VfsError::Io)?;
+        }
         let result = action(disk, editor)?;
         editor.flush(disk).map_err(convert)?;
         Ok(result)
@@ -356,7 +365,19 @@ impl FileSystem for Ext2Mount {
         // один раз, а не на каждую запись файла.
         editor.flush_everywhere(disk).map_err(convert)?;
         disk.flush().map_err(|_| VfsError::Io)?;
-        editor.mark_clean(disk).map_err(convert)
+        editor.mark_clean(disk).map_err(convert)?;
+        disk.flush().map_err(|_| VfsError::Io)?;
+        guard.marked_clean = true;
+        Ok(())
+    }
+
+    /// Довести отложенные записи до носителя (без закрытия тома).
+    fn writeback(&self) -> VfsResult<()> {
+        let mut guard = self.0.inner.lock();
+        if !guard.disk.is_dirty() {
+            return Ok(());
+        }
+        guard.disk.flush().map_err(|_| VfsError::Io)
     }
 }
 

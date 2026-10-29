@@ -1,4 +1,4 @@
-//! Кеш блоков файловой системы (фаза 68d).
+//! Кеш блоков файловой системы (фаза 68d, в кадрах памяти — фаза 74).
 //!
 //! # Зачем
 //!
@@ -12,29 +12,88 @@
 //!
 //! # Как устроен
 //!
-//! Обёртка над носителем: чтение одного блока файловой системы (не длиннее
-//! [`MAX_UNIT`]) запоминается по номеру сектора, повторное отдаётся из
-//! памяти. Длинные чтения — отрезки подряд идущих блоков — идут мимо: их
-//! запоминать незачем, крейт сам читает их одним запросом. Запись идёт на
-//! носитель всегда (кеш не откладывает её) и выбрасывает всё, что
-//! пересекается с записанным, — устаревший блок отдан не будет.
+//! Обёртка над носителем: блок файловой системы (не длиннее [`MAX_UNIT`])
+//! запоминается по номеру сектора, повторное чтение отдаётся из памяти.
+//! Длинное чтение, кратное [`MAX_UNIT`], режется на блоки: что есть — из
+//! памяти, отрезки пропусков — одним запросом каждый, и прочитанное тоже
+//! запоминается (до фазы 74 длинные чтения шли мимо, и Rider перечитывал
+//! одни и те же файлы с диска).
 //!
-//! Вытеснение — «часы»: у записи бит обращения, стрелка обходит записи по
-//! кругу и выбрасывает первую, к которой с прошлого круга не обращались.
+//! Блоки лежат в **кадрах физической памяти**, а не в куче ядра (64 МиБ на
+//! всё): кэш растёт, пока свободно больше четверти памяти, до 1/16 всей
+//! памяти на все тома вместе ([`budget`]). Дальше — вытеснение «часами»: у
+//! записи бит обращения, стрелка обходит записи по кругу и берёт первую, к
+//! которой с прошлого круга не обращались.
+//!
+//! # Отложенная запись (фаза 74)
+//!
+//! Для ext2 кэш включается в режиме отложенной записи ([`Cached::deferred`]):
+//! блок, кратный [`MAX_UNIT`] или короче его, не уходит на носитель сразу, а
+//! остаётся в кэше помеченным грязным; повторная запись того же блока
+//! (счётчики тома, суперблок, карты) просто заменяет прежнюю. Сброс —
+//! [`Cached::write_back`]: грязные блоки по возрастанию номера, подряд идущие
+//! склеены в один запрос. Вызывают его `flush`, служебная задача раз в
+//! несколько секунд, `fsync`/`sync` и выключение. Как у Linux на ext2 без
+//! журнала: внезапное выключение теряет последние секунды, а `fsck` чинит
+//! том. Чтение или запись другой геометрии поверх грязного блока сперва
+//! сбрасывают всё грязное — чужая геометрия не склеивается.
+//!
+//! Правило, на котором держится верность: запись **выбрасывает** все записи
+//! кэша, пересекающиеся с ней иначе, чем точным совпадением, — поэтому
+//! найденная по точному ключу запись всегда последнее слово о своих секторах.
 
-use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Сколько блоков помнить: 1024 блока — 4 МиБ при блоке в 4 КиБ.
-const CAPACITY: usize = 1024;
-/// Длиннее этого чтение не запоминается.
+use crate::mm::{FrameAllocator, PhysAddr};
+
+/// Длиннее этого блок не запоминается (и длинные запросы режутся на такие).
 const MAX_UNIT: usize = 4096;
+/// Самый длинный склеенный запрос при сбросе.
+const MAX_RUN: usize = 256 * 1024;
+/// Больше скольких грязных блоков не копить (64 МиБ) — дальше сброс.
+const MAX_DIRTY: usize = 16 * 1024;
+/// Самая длинная запись, которая откладывается (длиннее — сразу на носитель).
+const MAX_DEFERRED_WRITE: usize = 1024 * 1024;
+
+/// Сколько кадров держат кэши всех томов.
+static HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// Предел кадров на все кэши блоков: 1/16 памяти, от 4 до 512 МиБ.
+fn budget(total: usize) -> usize {
+    (total / 16).clamp(1024, 128 * 1024)
+}
+
+/// Сколько кадров держат кэши блоков (для диагностики).
+#[must_use]
+pub fn held_frames() -> usize {
+    HELD.load(Ordering::Relaxed)
+}
 
 struct Entry {
     lba: u64,
-    data: Box<[u8]>,
+    frame: PhysAddr,
+    len: usize,
     used: bool,
+    dirty: bool,
+}
+
+impl Entry {
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: кадр принадлежит этому кэшу и виден через прямое
+        // отображение; `len` не больше страницы.
+        unsafe { core::slice::from_raw_parts(self.frame.to_direct_map().as_usize() as *const u8, self.len) }
+    }
+
+    fn fill(&mut self, data: &[u8]) {
+        self.len = data.len();
+        // SAFETY: см. `bytes`; кадр ничем больше не отображён.
+        unsafe {
+            core::slice::from_raw_parts_mut(self.frame.to_direct_map().as_usize() as *mut u8, data.len())
+                .copy_from_slice(data);
+        }
+    }
 }
 
 /// Носитель с кешем блоков.
@@ -43,11 +102,27 @@ pub struct Cached<D> {
     entries: Vec<Entry>,
     index: BTreeMap<u64, usize>,
     hand: usize,
+    /// Режим отложенной записи включён.
+    deferred: bool,
+    /// Ключи грязных записей (записаны в кэш, но не на носитель).
+    dirty: BTreeSet<u64>,
 }
 
 impl<D: disk::BlockDevice> Cached<D> {
     pub fn new(inner: D) -> Self {
-        Self { inner, entries: Vec::new(), index: BTreeMap::new(), hand: 0 }
+        Self { inner, entries: Vec::new(), index: BTreeMap::new(), hand: 0, deferred: false, dirty: BTreeSet::new() }
+    }
+
+    /// Кэш с отложенной записью.
+    pub fn deferred(inner: D) -> Self {
+        let mut cache = Self::new(inner);
+        cache.deferred = true;
+        cache
+    }
+
+    /// Есть ли не сброшенное.
+    pub fn is_dirty(&self) -> bool {
+        !self.dirty.is_empty()
     }
 
     /// Носитель под кешем.
@@ -60,56 +135,251 @@ impl<D: disk::BlockDevice> Cached<D> {
         (bytes as u64).div_ceil(sector)
     }
 
-    /// Запомнить прочитанный блок.
-    fn remember(&mut self, lba: u64, data: &[u8]) {
-        if self.entries.len() < CAPACITY {
-            if self.entries.try_reserve(1).is_err() {
-                return;
-            }
-            self.index.insert(lba, self.entries.len());
-            self.entries.push(Entry { lba, data: data.into(), used: false });
-            return;
+    /// Записать грязные блоки на носитель (без `flush` самого носителя).
+    pub fn write_back(&mut self) -> disk::Result<()> {
+        if self.dirty.is_empty() {
+            return Ok(());
         }
-        // Часы: первая запись без обращения с прошлого круга.
-        loop {
+        let keys: Vec<u64> = self.dirty.iter().copied().collect();
+        let mut run: Vec<u8> = Vec::new();
+        let mut run_lba = 0u64;
+        let mut run_keys: Vec<u64> = Vec::new();
+        for lba in keys {
+            let Some(&slot) = self.index.get(&lba) else {
+                self.dirty.remove(&lba);
+                continue;
+            };
+            let len = self.entries[slot].len;
+            let end = run_lba + self.sectors(run.len());
+            if !run.is_empty() && (end != lba || run.len() + len > MAX_RUN) {
+                self.flush_run(run_lba, &run, &run_keys)?;
+                run.clear();
+                run_keys.clear();
+            }
+            if run.is_empty() {
+                run_lba = lba;
+            }
+            run.extend_from_slice(self.entries[slot].bytes());
+            run_keys.push(lba);
+        }
+        if !run.is_empty() {
+            self.flush_run(run_lba, &run, &run_keys)?;
+        }
+        Ok(())
+    }
+
+    /// Записать склеенный отрезок и снять с его блоков пометку «грязный».
+    /// Не записалось — блоки остаются грязными.
+    fn flush_run(&mut self, lba: u64, run: &[u8], keys: &[u64]) -> disk::Result<()> {
+        self.inner.write(lba, run)?;
+        for key in keys {
+            self.dirty.remove(key);
+            if let Some(&slot) = self.index.get(key) {
+                self.entries[slot].dirty = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Пересекается ли `[lba, lba + count)` с грязным блоком, который не
+    /// совпадает с одним из кусков `[lba + k·unit, +unit_len)` целиком.
+    fn dirty_overlaps(&self, lba: u64, count: u64, unit_len: usize) -> bool {
+        if self.dirty.is_empty() {
+            return false;
+        }
+        let back = self.sectors(MAX_UNIT);
+        let unit = self.sectors(unit_len).max(1);
+        let start = lba.saturating_sub(back);
+        let end = lba.saturating_add(count);
+        self.dirty.range(start..end).any(|key| {
+            let len = self.index.get(key).map_or(0, |&slot| self.entries[slot].len);
+            let span = self.sectors(len);
+            let exact = *key >= lba && (key - lba) % unit == 0 && len == unit_len && key + span <= end;
+            key + span > lba && !exact
+        })
+    }
+
+    /// Свободный слот под новую запись: новый кадр, пока позволяет память,
+    /// иначе — вытесненная «часами» чистая запись. `None` — всё грязное или
+    /// кадров нет совсем.
+    fn slot_for_new(&mut self) -> Option<usize> {
+        let held = HELD.load(Ordering::Relaxed);
+        let mut pressure = false;
+        let grown = crate::mm::frame::with(|frames| {
+            let stats = frames.stats();
+            pressure = stats.free <= stats.total / 8;
+            if held >= budget(stats.total) || stats.free <= stats.total / 4 {
+                return None;
+            }
+            frames.allocate()
+        })
+        .flatten();
+        // Памяти мало (программам) — кэш отдаёт по кадру на каждый новый блок,
+        // пока не сожмётся до 1 МиБ.
+        if pressure && self.entries.len() > 256 {
+            self.release_one();
+        }
+        if let Some(frame) = grown {
+            if self.entries.try_reserve(1).is_ok() {
+                HELD.fetch_add(1, Ordering::Relaxed);
+                self.entries.push(Entry { lba: u64::MAX, frame, len: 0, used: false, dirty: false });
+                return Some(self.entries.len() - 1);
+            }
+            // SAFETY: кадр только что выдан и никуда не попал.
+            crate::mm::frame::with(|frames| unsafe { frames.free(frame) });
+        }
+        if self.entries.is_empty() {
+            return None;
+        }
+        // Часы: первая чистая запись без обращения с прошлого круга. Два
+        // круга без находки — всё грязное или всё в ходу.
+        for _ in 0..self.entries.len() * 2 {
             let slot = self.hand;
             self.hand = (self.hand + 1) % self.entries.len();
             let entry = &mut self.entries[slot];
+            if entry.dirty {
+                continue;
+            }
             if entry.used {
                 entry.used = false;
                 continue;
             }
-            self.index.remove(&entry.lba);
-            if entry.data.len() == data.len() {
-                entry.data.copy_from_slice(data);
-            } else {
-                entry.data = data.into();
+            if entry.lba != u64::MAX {
+                let lba = entry.lba;
+                entry.lba = u64::MAX;
+                self.index.remove(&lba);
             }
-            entry.lba = lba;
-            self.index.insert(lba, slot);
-            return;
+            return Some(slot);
         }
+        None
     }
 
-    /// Выбросить всё, что пересекается с секторами `[lba, lba + count)`.
-    fn forget(&mut self, lba: u64, count: u64) {
+    /// Отдать в пул кадр одной чистой записи.
+    fn release_one(&mut self) {
+        let Some(slot) = (0..self.entries.len())
+            .map(|step| (self.hand + step) % self.entries.len())
+            .find(|&slot| !self.entries[slot].dirty)
+        else {
+            return;
+        };
+        let entry = self.entries.swap_remove(slot);
+        if entry.lba != u64::MAX {
+            self.index.remove(&entry.lba);
+        }
+        // Последняя запись встала на место ушедшей — её ключ теперь там.
+        if slot < self.entries.len() {
+            let moved = self.entries[slot].lba;
+            if moved != u64::MAX {
+                self.index.insert(moved, slot);
+            }
+        }
+        if self.hand >= self.entries.len() {
+            self.hand = 0;
+        }
+        // SAFETY: кадр принадлежал этой записи и ничем не отображён.
+        crate::mm::frame::with(|frames| unsafe { frames.free(entry.frame) });
+        HELD.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Положить блок в кэш (заменив запись с тем же ключом). `false` — места
+    /// нет (кадров нет, всё грязное).
+    fn put(&mut self, lba: u64, data: &[u8], dirty: bool) -> bool {
+        let slot = match self.index.get(&lba) {
+            Some(&slot) => slot,
+            None => {
+                let Some(slot) = self.slot_for_new() else {
+                    return false;
+                };
+                self.entries[slot].lba = lba;
+                self.index.insert(lba, slot);
+                slot
+            }
+        };
+        let entry = &mut self.entries[slot];
+        entry.fill(data);
+        entry.used = true;
+        entry.dirty |= dirty;
+        if entry.dirty {
+            self.dirty.insert(lba);
+        }
+        true
+    }
+
+    /// Выбросить всё, что пересекается с секторами `[lba, lba + count)`,
+    /// кроме кусков `[lba + k·unit, +unit_len)` (их перепишут на месте).
+    /// Грязных среди выбрасываемых быть не должно — их сбросили раньше.
+    fn forget(&mut self, lba: u64, count: u64, unit_len: usize) {
         // Запись может начинаться раньше `lba` и заходить в диапазон: самая
         // длинная — `MAX_UNIT` байт, поэтому смотреть назад дальше не нужно.
         let back = self.sectors(MAX_UNIT);
+        let unit = self.sectors(unit_len).max(1);
         let start = lba.saturating_sub(back);
         let end = lba.saturating_add(count);
         let stale: Vec<(u64, usize)> =
             self.index.range(start..end).map(|(key, slot)| (*key, *slot)).collect();
         for (key, slot) in stale {
-            let span = self.sectors(self.entries[slot].data.len());
-            if key + span > lba {
+            let len = self.entries[slot].len;
+            let span = self.sectors(len);
+            let exact = key >= lba && (key - lba) % unit == 0 && len == unit_len && key + span <= end;
+            if key + span > lba && !exact {
                 self.index.remove(&key);
-                // Слот остаётся занятым, но без ключа — его переиспользуют
-                // часы: запись без обращения, ключа в индексе нет.
-                self.entries[slot].used = false;
-                self.entries[slot].lba = u64::MAX;
+                self.dirty.remove(&key);
+                let entry = &mut self.entries[slot];
+                entry.used = false;
+                entry.dirty = false;
+                entry.lba = u64::MAX;
             }
         }
+    }
+
+    /// Чтение, кратное [`MAX_UNIT`]: по блокам, пропуски — отрезками.
+    fn read_units(&mut self, lba: u64, buf: &mut [u8]) -> disk::Result<()> {
+        let unit = self.sectors(MAX_UNIT);
+        let units = buf.len() / MAX_UNIT;
+        let mut at = 0;
+        while at < units {
+            let key = lba + at as u64 * unit;
+            if let Some(&slot) = self.index.get(&key) {
+                let entry = &mut self.entries[slot];
+                if entry.len == MAX_UNIT {
+                    buf[at * MAX_UNIT..(at + 1) * MAX_UNIT].copy_from_slice(entry.bytes());
+                    entry.used = true;
+                    at += 1;
+                    continue;
+                }
+            }
+            // Отрезок пропусков: до первого блока, который есть в кэше.
+            let mut miss_end = at + 1;
+            while miss_end < units && !self.index.contains_key(&(lba + miss_end as u64 * unit)) {
+                miss_end += 1;
+            }
+            let part = &mut buf[at * MAX_UNIT..miss_end * MAX_UNIT];
+            self.inner.read(key, part)?;
+            for k in at..miss_end {
+                let chunk_key = lba + k as u64 * unit;
+                if !self.put(chunk_key, &buf[k * MAX_UNIT..(k + 1) * MAX_UNIT], false) {
+                    break;
+                }
+            }
+            at = miss_end;
+        }
+        Ok(())
+    }
+}
+
+impl<D> Drop for Cached<D> {
+    fn drop(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let count = self.entries.len();
+        crate::mm::frame::with(|frames| {
+            for entry in &self.entries {
+                // SAFETY: кадры выдавались этому кэшу и ничем не отображены.
+                unsafe { frames.free(entry.frame) };
+            }
+        });
+        HELD.fetch_sub(count, Ordering::Relaxed);
     }
 }
 
@@ -127,34 +397,71 @@ impl<D: disk::BlockDevice> disk::BlockDevice for Cached<D> {
     }
 
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> disk::Result<()> {
+        let count = self.sectors(buf.len());
         if buf.len() > MAX_UNIT {
+            let units = buf.len() % MAX_UNIT == 0;
+            if self.dirty_overlaps(lba, count, if units { MAX_UNIT } else { usize::MAX }) {
+                self.write_back()?;
+            }
+            if units {
+                return self.read_units(lba, buf);
+            }
             return self.inner.read(lba, buf);
         }
         if let Some(&slot) = self.index.get(&lba) {
             let entry = &mut self.entries[slot];
-            if entry.data.len() == buf.len() {
-                buf.copy_from_slice(&entry.data);
+            if entry.len == buf.len() {
+                buf.copy_from_slice(entry.bytes());
                 entry.used = true;
                 return Ok(());
             }
         }
-        self.inner.read(lba, buf)?;
-        if self.index.contains_key(&lba) {
-            // Тот же сектор, другая длина: прежняя запись уступает новой.
-            let count = self.sectors(buf.len());
-            self.forget(lba, count);
+        if self.dirty_overlaps(lba, count, buf.len()) {
+            self.write_back()?;
         }
-        self.remember(lba, buf);
+        self.inner.read(lba, buf)?;
+        self.put(lba, buf, false);
         Ok(())
     }
 
     fn write(&mut self, lba: u64, buf: &[u8]) -> disk::Result<()> {
         let count = self.sectors(buf.len());
-        self.forget(lba, count);
-        self.inner.write(lba, buf)
+        // Геометрия записи: один блок до `MAX_UNIT` или ряд блоков по нему.
+        let unit_len = if buf.len() <= MAX_UNIT {
+            buf.len()
+        } else if buf.len() % MAX_UNIT == 0 {
+            MAX_UNIT
+        } else {
+            usize::MAX
+        };
+        if self.dirty_overlaps(lba, count, unit_len) {
+            self.write_back()?;
+        }
+        self.forget(lba, count, unit_len);
+        let defer = self.deferred && unit_len != usize::MAX && buf.len() <= MAX_DEFERRED_WRITE;
+        if !defer {
+            self.inner.write(lba, buf)?;
+        }
+        // Кэш получает записанное в любом случае: следующее чтение — из
+        // памяти. Не легло (места нет) — пишется на носитель сейчас.
+        let unit = self.sectors(unit_len.min(MAX_UNIT)).max(1);
+        let pieces = if unit_len == usize::MAX { 0 } else { buf.len().div_ceil(unit_len) };
+        for k in 0..pieces {
+            let piece = &buf[k * unit_len..((k + 1) * unit_len).min(buf.len())];
+            let key = lba + k as u64 * unit;
+            if !self.put(key, piece, defer) && defer {
+                self.forget(key, self.sectors(piece.len()), usize::MAX);
+                self.inner.write(key, piece)?;
+            }
+        }
+        if self.dirty.len() >= MAX_DIRTY {
+            self.write_back()?;
+        }
+        Ok(())
     }
 
     fn flush(&mut self) -> disk::Result<()> {
+        self.write_back()?;
         self.inner.flush()
     }
 }

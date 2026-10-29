@@ -390,7 +390,9 @@ impl AddressSpace for PageTable {
             return Err(MapError::Misaligned);
         }
         // Контракт трейта: такая страница не должна появиться даже по ошибке.
-        if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) {
+        // Одно исключение, и оно названо флагом: память кода программы с
+        // правом пакета `jit` (`PageFlags::JIT`, фаза 73).
+        if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) && !flags.contains(PageFlags::JIT) {
             return Err(MapError::WriteExecute);
         }
 
