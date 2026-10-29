@@ -282,6 +282,10 @@ pub fn build(arch: Arch) -> Result<()> {
     // браузера 15 с и уходит; браузер, занятый профилем в отладочной сборке
     // под эмулятором, не успевает — сетевая служба и страницы уходили, не
     // начав работать.
+    // `--disable-features=HttpsUpgrades,…`: набранный без схемы адрес
+    // Chromium 150 сам переписывает на https и на сервере только с HTTP
+    // (`svn…:9999`, 29.10) получает обрыв рукопожатия без отката на http.
+    // Сайты с https перенаправляют на него сами.
     let script = "#!/bin/bash\n\
         # Chromium (фазы 71h, 71i): библиотеки и шрифты — рядом, песочницы нет.\n\
         export LD_LIBRARY_PATH=/opt/chromium/lib\n\
@@ -299,7 +303,8 @@ pub fn build(arch: Arch) -> Result<()> {
         platform=--ozone-platform=wayland\n\
         case \" $* \" in *\" --headless\"*) platform= ;; esac\n\
         exec /opt/chromium/chrome/chromium --no-sandbox --no-zygote --disable-gpu $platform \\\n\
-          --no-first-run --no-default-browser-check --password-store=basic --ipc-connection-timeout=120 \"$@\"\n";
+          --no-first-run --no-default-browser-check --password-store=basic --ipc-connection-timeout=120 \\\n\
+          --disable-features=HttpsUpgrades,OmniboxDefaultTypedNavigationsToHttps \"$@\"\n";
     files.push((String::from("bin/chromium"), script.as_bytes().to_vec(), 0o755));
 
     let mut builder = Builder::new(Kind::Package, "chromium", "150");

@@ -1742,20 +1742,22 @@ impl Client {
                 };
                 let (x, y) = (event.x + gx, event.y + gy);
                 match event.kind {
-                    user_abi::WIN_MOVE => self.pointer_motion(surface, x, y, time),
+                    user_abi::WIN_MOVE => {
+                        self.pointer_motion_at(surface, x, y, time);
+                    }
                     // Щелчок мимо открытого меню закрывает его и дальше не
                     // идёт — как у сервера с захватом указателя.
                     user_abi::WIN_POINTER if self.dismiss_popups(true) => self.swallow_release = true,
                     user_abi::WIN_RELEASE if self.swallow_release => self.swallow_release = false,
                     user_abi::WIN_POINTER | user_abi::WIN_RELEASE => {
-                        self.pointer_motion(surface, x, y, time);
+                        let target = self.pointer_motion_at(surface, x, y, time);
                         let button = if event.code == 2 { BTN_RIGHT } else { BTN_LEFT };
                         let state = u32::from(event.kind == user_abi::WIN_POINTER);
                         // Нажатие — в журнал: «щелчок не доходит до программы»
                         // иначе снаружи не разобрать (крестик диалога Java,
                         // 27.10).
                         if state == 1 {
-                            kprintln!("  wayland     : #{} press at {x},{y} of surface {surface}", self.pid);
+                            kprintln!("  wayland     : #{} press at {x},{y} of surface {target}", self.pid);
                         }
                         self.pointer_send(|pointer, serial| Msg::new(pointer, 3).u32(serial).u32(time).u32(button).u32(state));
                     }
@@ -1766,9 +1768,10 @@ impl Client {
                         self.pointer_send(|pointer, _| Msg::new(pointer, 4).u32(time).u32(0).fixed(-clicks * 10));
                     }
                     user_abi::WIN_LEAVE => {
-                        if self.pointer_on == Some(surface) {
+                        // Указатель мог стоять на подповерхности этого окна.
+                        if let Some(on) = self.pointer_on.filter(|on| self.root_of(*on) == surface) {
                             self.pointer_on = None;
-                            self.pointer_send(|pointer, serial| Msg::new(pointer, 1).u32(serial).u32(surface));
+                            self.pointer_send(|pointer, serial| Msg::new(pointer, 1).u32(serial).u32(on));
                         }
                     }
                     user_abi::WIN_RESIZE => self.configure(index, event.x, event.y),
@@ -1843,16 +1846,18 @@ impl Client {
                 };
                 let (x, y) = (event.x + gx, event.y + gy);
                 match event.kind {
-                    user_abi::WIN_MOVE => self.pointer_motion(surface, x, y, time),
+                    user_abi::WIN_MOVE => {
+                        self.pointer_motion_at(surface, x, y, time);
+                    }
                     user_abi::WIN_POINTER | user_abi::WIN_RELEASE => {
-                        self.pointer_motion(surface, x, y, time);
+                        let target = self.pointer_motion_at(surface, x, y, time);
                         let button = if event.code == 2 { BTN_RIGHT } else { BTN_LEFT };
                         let state = u32::from(event.kind == user_abi::WIN_POINTER);
                         // Нажатие — в журнал: «щелчок не доходит до программы»
                         // иначе снаружи не разобрать (крестик диалога Java,
                         // 27.10).
                         if state == 1 {
-                            kprintln!("  wayland     : #{} press at {x},{y} of surface {surface}", self.pid);
+                            kprintln!("  wayland     : #{} press at {x},{y} of surface {target}", self.pid);
                         }
                         self.pointer_send(|pointer, serial| Msg::new(pointer, 3).u32(serial).u32(time).u32(button).u32(state));
                     }
@@ -1862,9 +1867,10 @@ impl Client {
                         self.pointer_send(|pointer, _| Msg::new(pointer, 4).u32(time).u32(0).fixed(-clicks * 10));
                     }
                     user_abi::WIN_LEAVE => {
-                        if self.pointer_on == Some(surface) {
+                        // Указатель мог стоять на подповерхности этого окна.
+                        if let Some(on) = self.pointer_on.filter(|on| self.root_of(*on) == surface) {
                             self.pointer_on = None;
-                            self.pointer_send(|pointer, serial| Msg::new(pointer, 1).u32(serial).u32(surface));
+                            self.pointer_send(|pointer, serial| Msg::new(pointer, 1).u32(serial).u32(on));
                         }
                     }
                     _ => {}
@@ -1960,6 +1966,63 @@ impl Client {
         for keyboard in keyboards {
             self.send(make(keyboard, serial));
         }
+    }
+
+    /// Указатель над окном `root` в точке `(x, y)`: событие — той поверхности,
+    /// что под ним (подповерхность — в её координатах). Возвращает её.
+    ///
+    /// Подсказки Chromium — «сохранить пароль», «восстановить вкладки»,
+    /// автозаполнение — не всплывающие окна, а подповерхности главного; пока
+    /// указатель всегда шёл главной поверхности, щелчок по подсказке Chromium
+    /// принимал за щелчок по странице под ней (Роман, 29.10).
+    fn pointer_motion_at(&mut self, root: u32, x: i32, y: i32, time: u32) -> u32 {
+        let (target, lx, ly) = self.surface_at(root, x, y, 0).unwrap_or((root, x, y));
+        self.pointer_motion(target, lx, ly, time);
+        target
+    }
+
+    /// Самая верхняя поверхность дерева `id` с буфером под точкой `(x, y)`
+    /// (в координатах `id`): над ней лежащие подповерхности — сверху вниз,
+    /// она сама, под ней лежащие.
+    fn surface_at(&self, id: u32, x: i32, y: i32, depth: u32) -> Option<(u32, i32, i32)> {
+        let Some(Obj::Surface(state)) = self.objects.get(&id) else {
+            return None;
+        };
+        let child_hit = |under: bool| -> Option<(u32, i32, i32)> {
+            if depth >= 8 {
+                return None;
+            }
+            for child in state.children.iter().rev() {
+                if let Some(Obj::Surface(SurfaceState { role: Role::Sub { x: cx, y: cy, below, .. }, .. })) = self.objects.get(child) {
+                    if *below == under {
+                        if let Some(hit) = self.surface_at(*child, x - cx, y - cy, depth + 1) {
+                            return Some(hit);
+                        }
+                    }
+                }
+            }
+            None
+        };
+        if let Some(hit) = child_hit(false) {
+            return Some(hit);
+        }
+        if let Some((_, buf)) = &state.shown {
+            if x >= 0 && y >= 0 && (x as u32) < buf.width && (y as u32) < buf.height {
+                return Some((id, x, y));
+            }
+        }
+        child_hit(true)
+    }
+
+    /// Корень дерева подповерхностей.
+    fn root_of(&self, mut id: u32) -> u32 {
+        for _ in 0..8 {
+            match self.objects.get(&id) {
+                Some(Obj::Surface(SurfaceState { role: Role::Sub { parent, .. }, .. })) => id = *parent,
+                _ => break,
+            }
+        }
+        id
     }
 
     fn pointer_motion(&mut self, surface: u32, x: i32, y: i32, time: u32) {
