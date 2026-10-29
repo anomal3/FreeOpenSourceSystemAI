@@ -661,6 +661,14 @@ impl Editor {
         self.write_inode(dev, number, &inode)
     }
 
+    /// Сменить права inode (младшие 12 бит `mode`); вид файла остаётся.
+    pub fn set_mode(&mut self, dev: &mut dyn BlockDevice, number: u32, mode: u16) -> Result<()> {
+        let mut inode = self.read_inode(dev, number)?;
+        inode.mode = (inode.mode & !0o7777) | (mode & 0o7777);
+        inode.time = self.time;
+        self.write_inode(dev, number, &inode)
+    }
+
     /// Удалить файл из каталога.
     ///
     /// Каталог этим не удаляется — для него есть [`Editor::rmdir`], и разница

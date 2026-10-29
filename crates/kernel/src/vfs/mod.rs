@@ -221,6 +221,11 @@ pub trait Node: Send + Sync {
         Err(VfsError::Unsupported)
     }
 
+    /// Сменить права (младшие 12 бит) — `chmod` (фаза 74).
+    fn chmod(&self, _mode: u16) -> VfsResult<()> {
+        Err(VfsError::Unsupported)
+    }
+
     /// Создать в этом каталоге пустой файл и вернуть его.
     fn create(&self, _name: &str, _mode: u16, _uid: u32, _gid: u32) -> VfsResult<Box<dyn Node>> {
         Err(VfsError::Unsupported)

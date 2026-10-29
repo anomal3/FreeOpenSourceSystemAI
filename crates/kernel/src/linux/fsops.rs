@@ -27,6 +27,38 @@ pub(super) fn place(linux: &str) -> String {
     out
 }
 
+/// `chmod`/`fchmodat` (фаза 74; до неё — «успех» без дела). Rider
+/// распаковывает свои программы и ставит им `+x`; без этого их запуск
+/// получал `EACCES`, и Rider не поднимал свою половину на .NET.
+pub fn chmod(dir: usize, ptr: usize, mode: usize) -> i64 {
+    let linux = match linux_path(dir, ptr) {
+        Ok(path) => path,
+        Err(err) => return err,
+    };
+    let cred = crate::user::credentials();
+    let path = crate::linux_path::resolve(&linux, cred);
+    match crate::fs::chmod_as(cred, &path, (mode & 0o7777) as u16) {
+        Some(Ok(())) => 0,
+        // Тому, что не умеет права (FAT, корень только для чтения), — как раньше.
+        Some(Err(crate::vfs::VfsError::Unsupported | crate::vfs::VfsError::ReadOnly)) => 0,
+        Some(Err(err)) => vfs_errno(err),
+        None => -e::ENOENT,
+    }
+}
+
+/// `fchmod`.
+pub fn fchmod(fd: usize, mode: usize) -> i64 {
+    let node = match crate::user::with_current(|program| program.files.node(fd)) {
+        Some(Ok(node)) => node,
+        Some(Err(err)) => return file_errno(err),
+        None => return -e::ESRCH,
+    };
+    match crate::fs::chmod_node(crate::user::credentials(), &*node, (mode & 0o7777) as u16) {
+        Ok(()) | Err(crate::vfs::VfsError::Unsupported | crate::vfs::VfsError::ReadOnly) => 0,
+        Err(err) => vfs_errno(err),
+    }
+}
+
 /// `mkdir`/`mkdirat`.
 pub fn mkdir(dir: usize, ptr: usize, mode: usize) -> i64 {
     let linux = match linux_path(dir, ptr) {

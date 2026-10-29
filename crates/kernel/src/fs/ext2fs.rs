@@ -615,6 +615,11 @@ impl Node for Ext2Node {
         })
     }
 
+    fn chmod(&self, mode: u16) -> VfsResult<()> {
+        let number = self.inode.number;
+        self.fs.change(&[Touched::Inode(number)], |disk, editor| editor.set_mode(disk, number, mode).map_err(convert))
+    }
+
     fn create(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
         let dir = self.inode.number;
         let number = self.fs.change(&[Touched::Entry(dir, name), Touched::Inode(dir)], |disk, editor| {

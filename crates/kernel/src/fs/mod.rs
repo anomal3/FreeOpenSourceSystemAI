@@ -320,6 +320,23 @@ pub fn create_as(cred: Credentials, path: &str, mode: u16) -> Option<VfsResult<B
 }
 
 /// Создать каталог по пути от имени `cred`.
+/// Сменить права файла `path` (фаза 74): владельцу и root.
+pub fn chmod_as(cred: Credentials, path: &str, mode: u16) -> Option<VfsResult<()>> {
+    let node = match resolve_as(cred, path, Access::NONE)? {
+        Ok(node) => node,
+        Err(err) => return Some(Err(err)),
+    };
+    Some(chmod_node(cred, &*node, mode))
+}
+
+/// Сменить права узла: владельцу и root.
+pub fn chmod_node(cred: Credentials, node: &dyn Node, mode: u16) -> VfsResult<()> {
+    if cred.uid != 0 && node.metadata().uid != cred.uid {
+        return Err(VfsError::PermissionDenied);
+    }
+    node.chmod(mode)
+}
+
 pub fn mkdir_as(cred: Credentials, path: &str, mode: u16) -> Option<VfsResult<()>> {
     let (parent, name) = match split_parent(path) {
         Ok(pair) => pair,

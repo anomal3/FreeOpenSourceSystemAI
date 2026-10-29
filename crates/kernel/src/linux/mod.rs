@@ -407,7 +407,10 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
                 0
             }
             nr::FLOCK => 0,
-            nr::CHMOD | nr::FCHMOD | nr::FCHMODAT | nr::FCHOWN | nr::UTIMENSAT => 0,
+            nr::CHMOD => fsops::chmod(AT_FDCWD, a0, a1),
+            nr::FCHMODAT => fsops::chmod(a0, a1, a2),
+            nr::FCHMOD => fsops::fchmod(a0, a1),
+            nr::FCHOWN | nr::UTIMENSAT => 0,
             nr::SCHED_GET_PRIORITY_MAX | nr::SCHED_GET_PRIORITY_MIN => 0,
             // Приоритет `SCHED_OTHER` — ноль; поменять его нечем.
             nr::SCHED_GETPARAM => match ipc::put(a1, 0i32) {
