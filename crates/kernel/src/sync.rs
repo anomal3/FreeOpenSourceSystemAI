@@ -267,7 +267,13 @@ impl<T> Drop for SpinGuard<'_, T> {
 /// значит держатель мьютекса не получит процессора и не отпустит его никогда.
 /// Обратный порядок безопасен. Поэтому цепочки локов переводятся целиком, а не
 /// по одному звену: вывод оболочки → композитор → файловая система.
+/// `repr(C)` и владелец первым полем — ради сторожа замков
+/// (`sched::lock_watch_task`): он знает только адрес замка, на котором спит
+/// задача, и читает владельца по нему, не зная `T`.
+#[repr(C)]
 pub struct Mutex<T> {
+    /// Слот задачи-владельца плюс один; ноль — свободен (диагностика).
+    owner: core::sync::atomic::AtomicUsize,
     locked: AtomicBool,
     value: UnsafeCell<T>,
 }
@@ -279,7 +285,7 @@ unsafe impl<T: Send> Send for Mutex<T> {}
 
 impl<T> Mutex<T> {
     pub const fn new(value: T) -> Self {
-        Self { locked: AtomicBool::new(false), value: UnsafeCell::new(value) }
+        Self { owner: core::sync::atomic::AtomicUsize::new(0), locked: AtomicBool::new(false), value: UnsafeCell::new(value) }
     }
 
     /// Захватить лок, уснув, если он занят.
@@ -291,6 +297,7 @@ impl<T> Mutex<T> {
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                self.owner.store(crate::sched::running_slot() + 1, Ordering::Relaxed);
                 return MutexGuard { lock: self };
             }
 
@@ -341,6 +348,7 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
+        self.lock.owner.store(0, Ordering::Relaxed);
         self.lock.locked.store(false, Ordering::Release);
         // Будим после освобождения, а не до: разбуженная задача первым делом
         // попробует захватить лок, и застать его ещё занятым значило бы отправить

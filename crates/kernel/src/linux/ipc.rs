@@ -237,6 +237,8 @@ struct Packet {
     /// Сколько байт пакета уже прочитано (потоковый сокет).
     used: usize,
     rights: Vec<Handle>,
+    /// Кто послал: pid Linux, uid, gid (`SCM_CREDENTIALS`).
+    sender: (u32, u32, u32),
 }
 
 #[derive(Default)]
@@ -278,7 +280,11 @@ impl Endpoint {
         )
     }
 
-    fn send(&self, data: &[u8], rights: Vec<Handle>) -> Result<usize, i64> {
+    /// `from` — отправитель ([`sender`]), взятый вызывающим **до** замков
+    /// сокета: `sender` берёт замок процесса, а закрытие сокета под замком
+    /// процесса берёт замки сокета — обратный порядок был взаимной
+    /// блокировкой (Rider вставал намертво, 29.10).
+    fn send(&self, data: &[u8], rights: Vec<Handle>, from: (u32, u32, u32)) -> Result<usize, i64> {
         let mut queue = self.tx.0.lock();
         if queue.no_reader || queue.no_writer {
             return Err(-e::EPIPE);
@@ -303,24 +309,25 @@ impl Endpoint {
         }
         queue.packets.try_reserve(1).map_err(|_| -e::ENOMEM)?;
         queue.bytes += take;
-        queue.packets.push_back(Packet { data: data[..take].to_vec(), used: 0, rights });
+        queue.packets.push_back(Packet { data: data[..take].to_vec(), used: 0, rights, sender: from });
         drop(queue);
         crate::io_events::notify();
         Ok(take)
     }
 
-    /// Прочитать: `(сколько байт, дескрипторы, пакет обрезан)`.
-    fn recv(&self, buf: &mut [u8], peek: bool) -> Result<(usize, Vec<Handle>, bool), i64> {
+    /// Прочитать: `(сколько байт, дескрипторы, пакет обрезан, отправитель)`.
+    fn recv(&self, buf: &mut [u8], peek: bool) -> Result<(usize, Vec<Handle>, bool, (u32, u32, u32)), i64> {
         let mut queue = self.rx.0.lock();
         if queue.packets.is_empty() {
-            return if queue.no_writer { Ok((0, Vec::new(), false)) } else { Err(-e::EAGAIN) };
+            return if queue.no_writer { Ok((0, Vec::new(), false, (0, 0, 0))) } else { Err(-e::EAGAIN) };
         }
+        let sender = queue.packets.front().map_or((0, 0, 0), |packet| packet.sender);
         if self.packets {
             let packet = if peek {
                 let front = queue.packets.front().ok_or(-e::EAGAIN)?;
                 let take = front.data.len().min(buf.len());
                 buf[..take].copy_from_slice(&front.data[..take]);
-                return Ok((take, Vec::new(), front.data.len() > take));
+                return Ok((take, Vec::new(), front.data.len() > take, sender));
             } else {
                 queue.packets.pop_front().ok_or(-e::EAGAIN)?
             };
@@ -329,7 +336,7 @@ impl Endpoint {
             crate::io_events::notify();
             let take = packet.data.len().min(buf.len());
             buf[..take].copy_from_slice(&packet.data[..take]);
-            return Ok((take, packet.rights, packet.data.len() > take));
+            return Ok((take, packet.rights, packet.data.len() > take, sender));
         }
         let mut done = 0;
         let mut rights = Vec::new();
@@ -362,7 +369,7 @@ impl Endpoint {
         if !peek {
             crate::io_events::notify();
         }
-        Ok((done, rights, false))
+        Ok((done, rights, false, sender))
     }
 
     fn readiness(&self) -> (bool, bool, bool) {
@@ -411,6 +418,8 @@ enum State {
 
 pub struct UnixSocket {
     kind: u32,
+    /// `SO_PASSCRED`: `recvmsg` прикладывает `SCM_CREDENTIALS` отправителя.
+    passcred: core::sync::atomic::AtomicBool,
     state: Mutex<State>,
     name: Mutex<Option<Vec<u8>>>,
     peer_name: Mutex<Option<Vec<u8>>>,
@@ -418,7 +427,13 @@ pub struct UnixSocket {
 
 impl UnixSocket {
     fn new(kind: u32, state: State) -> Self {
-        Self { kind, state: Mutex::new(state), name: Mutex::new(None), peer_name: Mutex::new(None) }
+        Self {
+            kind,
+            passcred: core::sync::atomic::AtomicBool::new(false),
+            state: Mutex::new(state),
+            name: Mutex::new(None),
+            peer_name: Mutex::new(None),
+        }
     }
 
     fn with_endpoint<R>(&self, f: impl FnOnce(&Endpoint) -> Result<R, i64>) -> Result<R, i64> {
@@ -432,10 +447,11 @@ impl UnixSocket {
 
 impl Object for UnixSocket {
     fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
-        self.with_endpoint(|endpoint| endpoint.recv(buf, false).map(|(count, _, _)| count))
+        self.with_endpoint(|endpoint| endpoint.recv(buf, false).map(|(count, ..)| count))
     }
     fn write(&self, data: &[u8]) -> Result<usize, i64> {
-        self.with_endpoint(|endpoint| endpoint.send(data, Vec::new()))
+        let from = sender();
+        self.with_endpoint(|endpoint| endpoint.send(data, Vec::new(), from))
     }
     fn readiness(&self) -> (bool, bool, bool) {
         match &*self.state.lock() {
@@ -485,12 +501,13 @@ impl KernelConn {
     /// Прочитать, что есть: `(байты, дескрипторы)`; `Ok((0, _))` — программа
     /// закрыла свой конец, `-EAGAIN` — пока пусто.
     pub(super) fn recv(&self, buf: &mut [u8]) -> Result<(usize, Vec<Handle>), i64> {
-        self.0.with_endpoint(|endpoint| endpoint.recv(buf, false).map(|(count, rights, _)| (count, rights)))
+        self.0.with_endpoint(|endpoint| endpoint.recv(buf, false).map(|(count, rights, ..)| (count, rights)))
     }
 
     /// Отправить; ответ — сколько байт ушло (поток: может быть меньше).
     pub(super) fn send(&self, data: &[u8], rights: Vec<Handle>) -> Result<usize, i64> {
-        self.0.with_endpoint(|endpoint| endpoint.send(data, rights))
+        let from = sender();
+        self.0.with_endpoint(|endpoint| endpoint.send(data, rights, from))
     }
 
     /// Процесс Linux по ту сторону.
@@ -767,7 +784,8 @@ pub fn getsockopt(fd: usize, level: usize, option: usize, value: usize, len_at: 
     let socket = unix(&object);
     let answer: Vec<u8> = match option {
         SO_TYPE => socket.kind.to_ne_bytes().to_vec(),
-        SO_ERROR | SO_PASSCRED => 0u32.to_ne_bytes().to_vec(),
+        SO_ERROR => 0u32.to_ne_bytes().to_vec(),
+        SO_PASSCRED => u32::from(socket.passcred.load(Ordering::Relaxed)).to_ne_bytes().to_vec(),
         SO_SNDBUF | SO_RCVBUF => (CHANNEL_BYTES as u32).to_ne_bytes().to_vec(),
         SO_DOMAIN => (AF_UNIX as u32).to_ne_bytes().to_vec(),
         SO_PEERCRED => {
@@ -792,6 +810,32 @@ pub fn getsockopt(fd: usize, level: usize, option: usize, value: usize, len_at: 
         return err;
     }
     0
+}
+
+/// `setsockopt`: из настроек сокета `AF_UNIX` действует `SO_PASSCRED`
+/// (zygote Chromium узнаёт по нему настоящий pid потомка); остальные
+/// принимаются молча.
+pub fn setsockopt(fd: usize, level: usize, option: usize, value: usize, len: usize) -> i64 {
+    const SOL_SOCKET: usize = 1;
+    const SO_PASSCRED: usize = 16;
+    let (object, _) = match socket_of(fd) {
+        Ok(found) => found,
+        Err(err) => return err,
+    };
+    if level == SOL_SOCKET && option == SO_PASSCRED && len >= 4 {
+        match get::<u32>(value) {
+            Ok(on) => unix(&object).passcred.store(on != 0, Ordering::Relaxed),
+            Err(err) => return err,
+        }
+    }
+    0
+}
+
+/// Отправитель для `SCM_CREDENTIALS`: pid Linux, uid, gid текущей программы.
+fn sender() -> (u32, u32, u32) {
+    let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
+    let cred = crate::user::credentials();
+    (pid, cred.uid, cred.gid)
 }
 
 /// `sendmsg(fd, msg, flags)` и `sendto` без адреса.
@@ -832,13 +876,14 @@ pub fn sendto(fd: usize, buf: usize, len: usize, flags: usize) -> i64 {
 
 fn send(object: &Arc<dyn Object>, nonblock: bool, data: &[u8], rights: Vec<Handle>) -> i64 {
     let socket = unix(object);
+    let from = sender();
     let mut rights = Some(rights);
     let mut done = 0;
     loop {
         let sent = wait_io(nonblock, || None, || {
             socket.with_endpoint(|endpoint| {
                 let attached = rights.clone().unwrap_or_default();
-                let count = endpoint.send(&data[done..], attached)?;
+                let count = endpoint.send(&data[done..], attached, from)?;
                 rights = None;
                 Ok(count)
             })
@@ -916,17 +961,21 @@ pub fn recvmsg(fd: usize, msg: usize, flags: usize) -> i64 {
     let got = wait_io(nonblock || flags & MSG_DONTWAIT != 0, || None, || {
         socket.with_endpoint(|endpoint| endpoint.recv(&mut buffer, flags & MSG_PEEK != 0))
     });
-    let (read, rights, truncated) = match got {
+    let (read, rights, truncated, from) = match got {
         Ok(got) => got,
         Err(err) => return err,
     };
+    // `SCM_CREDENTIALS` — первым, если сокет его просил и место есть.
+    let creds = control != 0 && control_len >= 28 && socket.passcred.load(Ordering::Relaxed);
+    let (control, control_len, creds_len) =
+        if creds { (control + 32, control_len.saturating_sub(32), 32.min(control_len)) } else { (control, control_len, 0) };
     if let Err(err) = scatter(&parts, &buffer[..read]) {
         return err;
     }
     let mut msg_flags = if truncated { MSG_TRUNC } else { 0 };
     // Дескрипторы — в таблицу и в управляющие данные, сколько поместится.
     let mut fds: Vec<i32> = Vec::new();
-    let room = if control == 0 { 0 } else { control_len.saturating_sub(16) / 4 };
+    let room = if control == 0 || control_len < 16 { 0 } else { (control_len - 16) / 4 };
     for (index, handle) in rights.into_iter().enumerate() {
         if index >= room {
             msg_flags |= MSG_CTRUNC;
@@ -959,6 +1008,23 @@ pub fn recvmsg(fd: usize, msg: usize, flags: usize) -> i64 {
         Ok(written) => written,
         Err(err) => return err,
     };
+    let written = if creds {
+        let header = (|| -> Result<(), i64> {
+            let at = control - 32;
+            put(at, 28usize)?;
+            put(at + 8, 1i32)?;
+            put(at + 12, 2i32)?;
+            put(at + 16, from.0)?;
+            put(at + 20, from.1)?;
+            put(at + 24, from.2)
+        })();
+        if let Err(err) = header {
+            return err;
+        }
+        creds_len + written
+    } else {
+        written
+    };
     let result = (|| -> Result<(), i64> {
         // Имени у отправителя нет: `msg_namelen` = 0.
         if get::<usize>(msg)? != 0 {
@@ -986,7 +1052,7 @@ pub fn recvfrom(fd: usize, buf: usize, len: usize, flags: usize, addr: usize, le
         socket.with_endpoint(|endpoint| endpoint.recv(&mut buffer, flags & MSG_PEEK != 0))
     });
     match got {
-        Ok((read, _, _)) => match write_user(buf, &buffer[..read]).and_then(|()| put_name(addr, len_at, None)) {
+        Ok((read, ..)) => match write_user(buf, &buffer[..read]).and_then(|()| put_name(addr, len_at, None)) {
             Ok(()) => read as i64,
             Err(err) => err,
         },

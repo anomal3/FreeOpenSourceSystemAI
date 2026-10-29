@@ -1727,7 +1727,7 @@ fn map_devices(
 
 /// Куча ядра: `HEAP_SIZE` байт по `HEAP_BASE`, обычная память на запись.
 fn map_heap(space: &mut PageTables, alloc: &mut impl FrameAllocator) -> Result<(), MapError> {
-    for index in 0..HEAP_SIZE / PAGE_SIZE {
+    for index in 0..crate::mm::heap_size() / PAGE_SIZE {
         let frame = alloc.allocate().ok_or(MapError::OutOfFrames)?;
         // SAFETY: `HEAP_BASE` лежит в верхней половине, где до сих пор не было
         // ни одного отображения, — ничего работающего перекрыть невозможно.

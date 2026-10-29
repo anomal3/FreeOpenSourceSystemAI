@@ -60,9 +60,22 @@ const MAX_DEFERRED_WRITE: usize = 1024 * 1024;
 /// Сколько кадров держат кэши всех томов.
 static HELD: AtomicUsize = AtomicUsize::new(0);
 
-/// Предел кадров на все кэши блоков: 1/16 памяти, от 4 до 512 МиБ.
+/// Предел кадров на все кэши блоков: 1/16 памяти, от 4 до 256 МиБ.
+///
+/// Потолок — из-за кучи ядра (64 МиБ на всё): запись кэша — 32 байта в
+/// массиве и узел индекса, на 64 тысячи блоков это уже 4–5 МиБ кучи.
 fn budget(total: usize) -> usize {
-    (total / 16).clamp(1024, 128 * 1024)
+    (total / 16).clamp(1024, 64 * 1024)
+}
+
+/// Свободной кучи ядра меньше этого — кэши не растут (фаза 74: Rider с
+/// Chromium в VirtualBox исчерпали кучу, и ядро упало).
+pub const HEAP_RESERVE: usize = 16 * 1024 * 1024;
+
+/// Хватает ли кучи ядра, чтобы кэшам расти.
+#[must_use]
+pub fn heap_roomy() -> bool {
+    crate::mm::heap::stats().free > HEAP_RESERVE
 }
 
 /// Сколько кадров держат кэши блоков (для диагностики).
@@ -137,9 +150,17 @@ impl<D: disk::BlockDevice> Cached<D> {
 
     /// Записать грязные блоки на носитель (без `flush` самого носителя).
     pub fn write_back(&mut self) -> disk::Result<()> {
+        self.write_back_some(usize::MAX).map(|_| ())
+    }
+
+    /// Записать грязные блоки, но не больше примерно `limit` байт; `true` —
+    /// грязное ещё осталось. Порциями пишет служебная задача: между ними
+    /// отпускается замок тома, и чтение из кэша не ждёт всего сброса.
+    pub fn write_back_some(&mut self, limit: usize) -> disk::Result<bool> {
         if self.dirty.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
+        let mut flushed = 0usize;
         let keys: Vec<u64> = self.dirty.iter().copied().collect();
         let mut run: Vec<u8> = Vec::new();
         let mut run_lba = 0u64;
@@ -153,8 +174,12 @@ impl<D: disk::BlockDevice> Cached<D> {
             let end = run_lba + self.sectors(run.len());
             if !run.is_empty() && (end != lba || run.len() + len > MAX_RUN) {
                 self.flush_run(run_lba, &run, &run_keys)?;
+                flushed += run.len();
                 run.clear();
                 run_keys.clear();
+                if flushed >= limit {
+                    return Ok(!self.dirty.is_empty());
+                }
             }
             if run.is_empty() {
                 run_lba = lba;
@@ -165,7 +190,7 @@ impl<D: disk::BlockDevice> Cached<D> {
         if !run.is_empty() {
             self.flush_run(run_lba, &run, &run_keys)?;
         }
-        Ok(())
+        Ok(!self.dirty.is_empty())
     }
 
     /// Записать склеенный отрезок и снять с его блоков пометку «грязный».
@@ -205,10 +230,11 @@ impl<D: disk::BlockDevice> Cached<D> {
     fn slot_for_new(&mut self) -> Option<usize> {
         let held = HELD.load(Ordering::Relaxed);
         let mut pressure = false;
+        let roomy = heap_roomy();
         let grown = crate::mm::frame::with(|frames| {
             let stats = frames.stats();
             pressure = stats.free <= stats.total / 8;
-            if held >= budget(stats.total) || stats.free <= stats.total / 4 {
+            if !roomy || held >= budget(stats.total) || stats.free <= stats.total / 4 {
                 return None;
             }
             frames.allocate()
@@ -220,6 +246,12 @@ impl<D: disk::BlockDevice> Cached<D> {
             self.release_one();
         }
         if let Some(frame) = grown {
+            // Массив резервируется сразу под весь предел: удвоение посреди
+            // работы просило бы у кучи цельный кусок в мегабайты.
+            if self.entries.capacity() == self.entries.len() && self.entries.is_empty() {
+                let whole = crate::mm::frame::stats().total;
+                let _ = self.entries.try_reserve_exact(budget(whole));
+            }
             if self.entries.try_reserve(1).is_ok() {
                 HELD.fetch_add(1, Ordering::Relaxed);
                 self.entries.push(Entry { lba: u64::MAX, frame, len: 0, used: false, dirty: false });

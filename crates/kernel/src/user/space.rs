@@ -174,6 +174,16 @@ impl Space {
             // принадлежит этому пространству и жив (вызывающий держит процесс),
             // новый только что выдан и не принадлежит никому.
             unsafe { core::ptr::copy_nonoverlapping(super::frame_bytes(phys), super::frame_bytes(frame), PAGE_SIZE) };
+            // Запись и исполнение разом в таблице бывают только у памяти кода
+            // программы с правом `jit`; программный флаг `JIT` в таблицу не
+            // попадает, и из `translate` он не возвращается — без него
+            // построитель отверг бы копию, и `fork`/`posix_spawn` у Java
+            // отвечал `ENOMEM` (Rider не запускал ни `xdg-open`, ни `git`).
+            let flags = if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) {
+                flags.union(PageFlags::JIT)
+            } else {
+                flags
+            };
             // SAFETY: кадр наш, адрес — в окне копии и ещё свободен.
             if let Err(err) = unsafe { copy.map(at, frame, flags) } {
                 super::return_frame(frame);

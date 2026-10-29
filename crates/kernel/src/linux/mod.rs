@@ -89,6 +89,8 @@ mod nr {
     pub const FUTEX: usize = 202;
     pub const SCHED_GETAFFINITY: usize = 204;
     pub const GETCPU: usize = 309;
+    pub const CAPGET: usize = 125;
+    pub const CAPSET: usize = 126;
     pub const SET_TID_ADDRESS: usize = 218;
     pub const CLOCK_GETTIME: usize = 228;
     pub const EXIT_GROUP: usize = 231;
@@ -363,11 +365,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::GETPEERNAME => net::sockname(a0, a1, a2, true).unwrap_or_else(|| ipc::sockname(a0, a1, a2, true)),
             nr::GETSOCKOPT => net::getsockopt(a0, a1, a2, a3, a4).unwrap_or_else(|| ipc::getsockopt(a0, a1, a2, a3, a4)),
             nr::SETSOCKOPT if net::is_inet(a0) => 0,
-            nr::SETSOCKOPT => match ipc::getsockopt(a0, 1, 3, 0, 0) {
-                // Проверка, что это сокет; самих настроек у сокета нет.
-                err if err == -e::EBADF || err == -e::ENOTSOCK => err,
-                _ => 0,
-            },
+            nr::SETSOCKOPT => ipc::setsockopt(a0, a1, a2, a3, a4),
             nr::SENDMSG => net::sendmsg(a0, a1, a2).unwrap_or_else(|| ipc::sendmsg(a0, a1, a2)),
             nr::SENDMMSG => net::sendmmsg(a0, a1, a2, a3),
             nr::RECVMSG => net::recvmsg(a0, a1, a2).unwrap_or_else(|| ipc::recvmsg(a0, a1, a2)),
@@ -549,6 +547,8 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::FUTEX => futex(a0, a1, a2, a3, a4, a5),
             nr::SCHED_GETAFFINITY => affinity(a1, a2),
             nr::GETCPU => getcpu(a0, a1),
+            nr::CAPGET => capget(a0, a1),
+            nr::CAPSET => capset(a0, a1),
             // Адрес, который ядро обнулит при выходе потока (фаза 71c).
             nr::SET_TID_ADDRESS => {
                 crate::user::LINUX_CLEAR_TID[crate::sched::current_slot()].store(a0, core::sync::atomic::Ordering::Relaxed);
@@ -1777,6 +1777,47 @@ unsafe fn clock_nanosleep(clock: usize, flags: usize, req: usize) -> i64 {
     }
     // SAFETY: контракт `syscall`.
     errno(unsafe { native(SYS_NANOSLEEP, seconds as usize, nanos as usize, 0) })
+}
+
+/// Версия заголовка `capget`/`capset` (`_LINUX_CAPABILITY_VERSION_3`).
+const CAP_VERSION_3: u32 = 0x2008_0522;
+
+/// `capget(header, data)`: возможностей (capabilities) Linux у программ нет —
+/// все наборы пустые. Chromium спрашивает их в процессе zygote.
+fn capget(header: usize, data: usize) -> i64 {
+    if !space::user_can(header, 8, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    // SAFETY: проверено строкой выше.
+    let version = unsafe { core::ptr::read_unaligned(header as *const u32) };
+    if version != CAP_VERSION_3 {
+        // SAFETY: то же.
+        unsafe { core::ptr::write_unaligned(header as *mut u32, CAP_VERSION_3) };
+        return if data == 0 { 0 } else { -e::EINVAL };
+    }
+    if data == 0 {
+        return 0;
+    }
+    if !space::user_can(data, 24, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    // SAFETY: проверено строкой выше; два набора по три слова.
+    unsafe { core::ptr::write_bytes(data as *mut u8, 0, 24) };
+    0
+}
+
+/// `capset(header, data)`: сбросить возможности можно всегда (их и так нет),
+/// получить — нельзя. Zygote Chromium сбрасывает их в каждом потомке.
+fn capset(header: usize, data: usize) -> i64 {
+    if !space::user_can(header, 8, PageFlags::READ) || !space::user_can(data, 24, PageFlags::READ) {
+        return -e::EFAULT;
+    }
+    // SAFETY: проверено строкой выше.
+    let words = unsafe { core::ptr::read_unaligned(data as *const [u32; 6]) };
+    if words.iter().any(|&word| word != 0) {
+        return -e::EPERM;
+    }
+    0
 }
 
 /// `getcpu(cpu, node)`: на каком процессоре задача сейчас; узел NUMA один.

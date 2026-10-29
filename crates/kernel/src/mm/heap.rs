@@ -147,7 +147,7 @@ unsafe impl GlobalAlloc for KernelHeap {
             stats.used / 1024,
             stats.free / 1024
         );
-        kprintln!("  range     : {:#018x}..{:#018x}", HEAP_BASE, HEAP_BASE + HEAP_SIZE);
+        kprintln!("  range     : {:#018x}..{:#018x}", HEAP_BASE, HEAP_BASE + crate::mm::heap_size());
         if stats.free >= layout.size() {
             kprintln!("  cause     : free memory is fragmented, no single block fits");
         }
@@ -197,7 +197,7 @@ pub unsafe fn init() -> Result<HeapStats, HeapError> {
 
     // SAFETY: тот же контракт: диапазон отображён, доступен на запись и не
     // используется ничем другим.
-    let heap = unsafe { Heap::new(HEAP_BASE as *mut u8, HEAP_SIZE) };
+    let heap = unsafe { Heap::new(HEAP_BASE as *mut u8, crate::mm::heap_size()) };
     let stats = HeapStats { size: heap.size(), used: heap.used(), free: heap.free() };
     *slot = Some(heap);
     Ok(stats)
@@ -221,7 +221,7 @@ unsafe fn verify_backing() -> Result<(), HeapError> {
     const PATTERN: u64 = 0xA5A5_1DEA_0BAD_C0DE;
 
     let base = HEAP_BASE as *mut u64;
-    let pages = HEAP_SIZE / PAGE_SIZE;
+    let pages = crate::mm::heap_size() / PAGE_SIZE;
     let stride = PAGE_SIZE / size_of::<u64>();
 
     for page in 0..pages {

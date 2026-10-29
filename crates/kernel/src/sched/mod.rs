@@ -109,7 +109,7 @@ pub use task::{
 };
 
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 
@@ -251,6 +251,67 @@ struct Scheduler {
 }
 
 static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
+
+/// Слот задачи, исполняющейся на процессоре, — без замка планировщика
+/// (владелец мьютекса для сторожа замков).
+static RUNNING_SLOT: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+/// С какой миллисекунды задача спит на замке, и о каком замке уже сказано.
+static LOCK_SINCE: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+static LOCK_REPORTED: [AtomicUsize; MAX_TASKS] = [const { AtomicUsize::new(0) }; MAX_TASKS];
+
+/// Слот задачи на этом процессоре (без замка планировщика).
+#[must_use]
+pub fn running_slot() -> usize {
+    RUNNING_SLOT[smp::cpu()].load(Ordering::Relaxed)
+}
+
+/// Сторож замков (фаза 74): раз в 5 с ищет задачи, спящие на мьютексе
+/// дольше 15 с, и печатает цепочку «кто ждёт — кто держит — чего ждёт
+/// держатель». Только по таблице планировщика: имя программы спрашивается у
+/// таблицы программ под её замком, а взаимная блокировка как раз на нём
+/// (Rider в VirtualBox, 29.10) повесила бы и сторожа.
+pub fn lock_watch_task() {
+    loop {
+        sleep_ms(5_000);
+        let now = crate::time::uptime_ms();
+        let mut found: alloc::vec::Vec<(usize, &'static str, usize, u64, usize, &'static str, Option<(&'static str, u64)>)> =
+            alloc::vec::Vec::new();
+        {
+            let sched = SCHED.lock();
+            for (slot, entry) in sched.tasks.iter().enumerate() {
+                let Some(task) = entry else { continue };
+                let TaskState::Blocked(Wait::Lock(address)) = task.state else { continue };
+                let since = LOCK_SINCE[slot].load(Ordering::Relaxed);
+                if since == 0 || now.saturating_sub(since) < 15_000 || LOCK_REPORTED[slot].load(Ordering::Relaxed) == address {
+                    continue;
+                }
+                LOCK_REPORTED[slot].store(address, Ordering::Relaxed);
+                // SAFETY: задача спит на этом мьютексе, значит он жив; первое
+                // поле `Mutex` — владелец (`repr(C)`).
+                let owner = unsafe { (*(address as *const AtomicUsize)).load(Ordering::Relaxed) };
+                let (holder_name, holder_state) = match owner.checked_sub(1).and_then(|h| sched.tasks.get(h)?.as_ref()) {
+                    Some(holder) => (holder.name, holder.state.waiting_for()),
+                    None => ("?", None),
+                };
+                if found.try_reserve(1).is_ok() {
+                    found.push((slot, task.name, address, now - since, owner.wrapping_sub(1), holder_name, holder_state));
+                }
+            }
+        }
+        for (slot, name, address, waited, holder, holder_name, holder_state) in found {
+            match holder_state {
+                Some((what, number)) => kprintln!(
+                    "  lockwatch   : #{slot} {name} waits {} s for the lock at {address:#x}, held by #{holder} {holder_name}, which is {what} {number:#x}",
+                    waited / 1000
+                ),
+                None => kprintln!(
+                    "  lockwatch   : #{slot} {name} waits {} s for the lock at {address:#x}, held by #{holder} {holder_name} (running or ready)",
+                    waited / 1000
+                ),
+            }
+        }
+    }
+}
 
 /// Принадлежит ли слот холостой задаче какого-нибудь процессора.
 const fn is_idle_slot(slot: usize) -> bool {
@@ -794,6 +855,7 @@ pub fn block_on_lock(address: usize, free: impl FnOnce() -> bool) {
         if let Some(task) = sched.tasks[current].as_mut() {
             task.state = TaskState::Blocked(Wait::Lock(address));
         }
+        LOCK_SINCE[current].store(crate::time::uptime_ms().max(1), Ordering::Relaxed);
     }
     schedule();
 }
@@ -1183,6 +1245,7 @@ fn schedule_with(cause: Cause) {
                         let state = &mut sched.cpus[cpu];
                         state.previous = Some(current);
                         state.current = next;
+                        RUNNING_SLOT[cpu].store(next, Ordering::Relaxed);
                         state.switches += 1;
                         if cause == Cause::Preempted {
                             state.forced += 1;
@@ -1344,6 +1407,7 @@ pub fn prepare_cpu(index: usize) -> Option<usize> {
     let mut sched = SCHED.lock();
     sched.tasks[index] = Some(boxed);
     sched.cpus[index].current = index;
+    RUNNING_SLOT[index].store(index, Ordering::Relaxed);
     Some(top)
 }
 

@@ -1471,7 +1471,7 @@ fn map_framebuffer(
 
 /// Куча ядра: [`HEAP_SIZE`] байт свежих кадров по [`HEAP_BASE`].
 fn map_heap(space: &mut PageTable, alloc: &mut impl FrameAllocator) -> Result<(), BuildError> {
-    for page in 0..HEAP_SIZE / PAGE_SIZE {
+    for page in 0..crate::mm::heap_size() / PAGE_SIZE {
         let frame = alloc.allocate().ok_or(MapError::OutOfFrames)?;
         // SAFETY: дерево ещё не активно, а диапазон кучи в нём до сих пор пуст —
         // ничего работающего это отображение не задевает. Кадр только что выдан

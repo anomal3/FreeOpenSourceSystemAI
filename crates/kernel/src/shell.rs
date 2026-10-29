@@ -1954,7 +1954,7 @@ fn memory() {
     // Общие страницы файлов программ: прочитаны один раз на все процессы.
     sprintln!("  cache    {} page(s) of program files shared", mm::pagecache::pages());
     let heap = mm::heap::stats();
-    sprintln!("  heap     {} bytes free of {}", heap.free, mm::HEAP_SIZE);
+    sprintln!("  heap     {} bytes free of {}", heap.free, mm::heap_size());
     let (used, total) = mm::dma::stats();
     // Пик печатается рядом с текущим потому, что именно их расхождение
     // отвечает на вопрос «течёт ли»: устройство, воткнутое и вынутое десять
@@ -2108,9 +2108,10 @@ fn linux_stat(argument: &str) {
     let total: u64 = rows.iter().map(|row| row.2).sum();
     sprintln!("  linux calls: {} kinds, {} ms in all", rows.len(), total / 1_000_000);
     sprintln!(
-        "  caches: blocks {} MiB, program pages {} MiB",
+        "  caches: blocks {} MiB, program pages {} MiB; kernel heap {} KiB free",
         crate::block::cache::held_frames() * 4 / 1024,
-        crate::mm::pagecache::pages() * 4 / 1024
+        crate::mm::pagecache::pages() * 4 / 1024,
+        crate::mm::heap::stats().free / 1024
     );
     sprintln!("     nr name                calls        ms   us/call");
     for (number, calls, nanos) in rows.iter().take(30) {

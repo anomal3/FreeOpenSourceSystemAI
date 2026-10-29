@@ -13,6 +13,8 @@
 //! одновременных запроса в одну очередь не отправить.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -57,6 +59,68 @@ struct Inner {
 /// Смонтированный том.
 pub struct Ext2Fs {
     inner: Mutex<Inner>,
+    /// Кэш имён и inode (фаза 74): `stat` и `open` уже виденного не берут
+    /// замок тома. Заполняется и чистится только под замком тома (`inner`),
+    /// поэтому устаревшее в него не попадает: правка и её отметка в кэше —
+    /// одно действие под одним замком.
+    meta: crate::sync::SpinLock<Meta>,
+}
+
+/// Сколько имён и inode помнить, прежде чем начать заново.
+const META_LIMIT: usize = 20_000;
+
+#[derive(Default)]
+struct Meta {
+    /// Каталог → имя → inode; `None` — имени нет (отрицательный ответ: слой
+    /// Linux ищет каждый путь сперва внутри корня Debian).
+    names: BTreeMap<u32, BTreeMap<String, Option<u32>>>,
+    inodes: BTreeMap<u32, ext2::Inode>,
+    count: usize,
+}
+
+/// Что правка тома сделала устаревшим в кэше имён.
+enum Touched<'a> {
+    Inode(u32),
+    Entry(u32, &'a str),
+    All,
+}
+
+impl Meta {
+    fn forget(&mut self, touched: &[Touched<'_>]) {
+        for item in touched {
+            match item {
+                Touched::Inode(number) => {
+                    self.inodes.remove(number);
+                }
+                Touched::Entry(dir, name) => {
+                    if let Some(names) = self.names.get_mut(dir) {
+                        names.remove(*name);
+                    }
+                }
+                Touched::All => {
+                    *self = Self::default();
+                }
+            }
+        }
+    }
+
+    fn room(&mut self) {
+        self.count += 1;
+        // Куча ядра одна на всё (64 МиБ): кэш имён уступает её первым.
+        if self.count > META_LIMIT || (self.count % 256 == 0 && !crate::block::cache::heap_roomy()) {
+            *self = Self::default();
+        }
+    }
+
+    fn keep_inode(&mut self, inode: &ext2::Inode) {
+        self.room();
+        self.inodes.insert(inode.number, inode.clone());
+    }
+
+    fn keep_name(&mut self, dir: u32, name: &str, number: Option<u32>) {
+        self.room();
+        self.names.entry(dir).or_default().insert(String::from(name), number);
+    }
 }
 
 /// То, что отдаётся в [`crate::fs::set_root`].
@@ -149,6 +213,7 @@ impl Ext2Fs {
         };
         Ok(Ext2Mount(Arc::new(Self {
             inner: Mutex::new(Inner { disk, fs, editor, marked_clean: false }),
+            meta: crate::sync::SpinLock::new(Meta::default()),
         })))
     }
 
@@ -162,6 +227,7 @@ impl Ext2Fs {
     /// место, где такую цену стоит платить не глядя.
     fn change<R>(
         &self,
+        touched: &[Touched<'_>],
         action: impl FnOnce(&mut Disk, &mut ext2::Editor) -> VfsResult<R>,
     ) -> VfsResult<R> {
         let mut guard = self.inner.lock();
@@ -188,9 +254,24 @@ impl Ext2Fs {
         if core::mem::take(marked_clean) {
             disk.flush().map_err(|_| VfsError::Io)?;
         }
-        let result = action(disk, editor)?;
+        let result = action(disk, editor);
+        // Кэш имён чистится и при отказе: правка могла успеть наполовину.
+        self.meta.lock().forget(touched);
+        let result = result?;
         editor.flush(disk).map_err(convert)?;
         Ok(result)
+    }
+
+    /// Inode по номеру: из кэша имён, иначе с тома (под замком тома).
+    fn inode(&self, number: u32) -> VfsResult<ext2::Inode> {
+        if let Some(inode) = self.meta.lock().inodes.get(&number) {
+            return Ok(inode.clone());
+        }
+        let mut guard = self.inner.lock();
+        let Inner { disk, fs, .. } = &mut *guard;
+        let inode = fs.inode(disk, number).map_err(convert)?;
+        self.meta.lock().keep_inode(&inode);
+        Ok(inode)
     }
 
     fn root_inode(&self) -> VfsResult<ext2::Inode> {
@@ -345,7 +426,7 @@ impl FileSystem for Ext2Mount {
             }
         }
 
-        self.0.change(|disk, editor| {
+        self.0.change(&[Touched::All], |disk, editor| {
             editor
                 .rename(disk, old_dir, old_name, new_dir, new_name)
                 .map_err(convert)
@@ -372,12 +453,23 @@ impl FileSystem for Ext2Mount {
     }
 
     /// Довести отложенные записи до носителя (без закрытия тома).
+    ///
+    /// Порциями по 4 МиБ с отпусканием замка между ними: сброс десятков
+    /// мегабайт иначе держал бы замок тома, и все `stat`/`open` ждали бы его.
     fn writeback(&self) -> VfsResult<()> {
-        let mut guard = self.0.inner.lock();
-        if !guard.disk.is_dirty() {
-            return Ok(());
+        const PORTION: usize = 4 * 1024 * 1024;
+        loop {
+            let mut guard = self.0.inner.lock();
+            if !guard.disk.is_dirty() {
+                return Ok(());
+            }
+            let more = guard.disk.write_back_some(PORTION).map_err(|_| VfsError::Io)?;
+            if !more {
+                return guard.disk.flush().map_err(|_| VfsError::Io);
+            }
+            drop(guard);
+            crate::sched::yield_now();
         }
-        guard.disk.flush().map_err(|_| VfsError::Io)
     }
 }
 
@@ -400,9 +492,7 @@ impl Node for Ext2Node {
     }
 
     fn metadata(&self) -> Metadata {
-        let mut guard = self.fs.inner.lock();
-        let Inner { disk, fs, .. } = &mut *guard;
-        match fs.inode(disk, self.inode.number) {
+        match self.fs.inode(self.inode.number) {
             Ok(inode) => metadata_of(&inode),
             Err(_) => metadata_of(&self.inode),
         }
@@ -412,10 +502,28 @@ impl Node for Ext2Node {
         if self.inode.kind != ext2::FileType::Regular {
             return Err(VfsError::WrongKind);
         }
-        let mut guard = self.fs.inner.lock();
-        let Inner { disk, fs, .. } = &mut *guard;
-        let inode = fs.inode(disk, self.inode.number).map_err(convert)?;
-        fs.read_at(disk, &inode, offset, buf).map_err(convert)
+        let inode = self.fs.inode(self.inode.number)?;
+        // Через буфер ядра: под замком тома память программы не трогается.
+        // `buf` у `read` — её память, и копирование в неё может отказать
+        // страницей; обработчику нужен замок процесса, а его держит, скажем,
+        // `munmap` файла `MAP_SHARED`, который сбрасывает страницы и ждёт
+        // этот же замок тома — взаимная блокировка (Rider, 29.10).
+        let mut bounce = bounce_buffer(buf.len())?;
+        let mut done = 0;
+        while done < buf.len() {
+            let take = (buf.len() - done).min(bounce.len());
+            let got = {
+                let mut guard = self.fs.inner.lock();
+                let Inner { disk, fs, .. } = &mut *guard;
+                fs.read_at(disk, &inode, offset + done as u64, &mut bounce[..take]).map_err(convert)?
+            };
+            buf[done..done + got].copy_from_slice(&bounce[..got]);
+            done += got;
+            if got < take {
+                break;
+            }
+        }
+        Ok(done)
     }
 
     fn list(&self) -> VfsResult<Vec<DirEntry>> {
@@ -447,15 +555,26 @@ impl Node for Ext2Node {
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Box<dyn Node>> {
-        let inode = {
-            let mut guard = self.fs.inner.lock();
-            let Inner { disk, fs, .. } = &mut *guard;
-            let current = fs.inode(disk, self.inode.number).map_err(convert)?;
-            let entry = fs
-                .lookup(disk, &current, name)
-                .map_err(convert)?
-                .ok_or(VfsError::NotFound)?;
-            fs.inode(disk, entry.inode).map_err(convert)?
+        let dir = self.inode.number;
+        let known = self.fs.meta.lock().names.get(&dir).and_then(|names| names.get(name).copied());
+        let inode = match known {
+            Some(None) => return Err(VfsError::NotFound),
+            Some(Some(number)) => self.fs.inode(number)?,
+            None => {
+                let current = self.fs.inode(dir)?;
+                let mut guard = self.fs.inner.lock();
+                let Inner { disk, fs, .. } = &mut *guard;
+                let entry = fs.lookup(disk, &current, name).map_err(convert)?;
+                let Some(entry) = entry else {
+                    self.fs.meta.lock().keep_name(dir, name, None);
+                    return Err(VfsError::NotFound);
+                };
+                let inode = fs.inode(disk, entry.inode).map_err(convert)?;
+                let mut meta = self.fs.meta.lock();
+                meta.keep_name(dir, name, Some(inode.number));
+                meta.keep_inode(&inode);
+                inode
+            }
         };
         Ok(Box::new(Ext2Node { fs: Arc::clone(&self.fs), inode }))
     }
@@ -465,11 +584,23 @@ impl Node for Ext2Node {
             return Err(VfsError::WrongKind);
         }
         crate::mm::pagecache::forget(self.key());
-        self.fs.change(|disk, editor| {
-            editor
-                .write_at(disk, self.inode.number, offset, data)
-                .map_err(convert)
-        })
+        // Через буфер ядра, по той же причине, что и в `read_at`.
+        let mut bounce = bounce_buffer(data.len())?;
+        let mut done = 0;
+        while done < data.len() {
+            let take = (data.len() - done).min(bounce.len());
+            bounce[..take].copy_from_slice(&data[done..done + take]);
+            let piece = &bounce[..take];
+            let at = offset + done as u64;
+            let wrote = self.fs.change(&[Touched::Inode(self.inode.number)], |disk, editor| {
+                editor.write_at(disk, self.inode.number, at, piece).map_err(convert)
+            })?;
+            done += wrote;
+            if wrote < take {
+                break;
+            }
+        }
+        Ok(done)
     }
 
     fn truncate(&self, size: u64) -> VfsResult<()> {
@@ -477,7 +608,7 @@ impl Node for Ext2Node {
             return Err(VfsError::WrongKind);
         }
         crate::mm::pagecache::forget(self.key());
-        self.fs.change(|disk, editor| {
+        self.fs.change(&[Touched::Inode(self.inode.number)], |disk, editor| {
             editor
                 .truncate(disk, self.inode.number, size)
                 .map_err(convert)
@@ -485,7 +616,8 @@ impl Node for Ext2Node {
     }
 
     fn create(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
-        let number = self.fs.change(|disk, editor| {
+        let dir = self.inode.number;
+        let number = self.fs.change(&[Touched::Entry(dir, name), Touched::Inode(dir)], |disk, editor| {
             editor
                 .create(disk, self.inode.number, name, mode, uid, gid)
                 .map_err(convert)
@@ -494,7 +626,8 @@ impl Node for Ext2Node {
     }
 
     fn mkdir(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
-        let number = self.fs.change(|disk, editor| {
+        let dir = self.inode.number;
+        let number = self.fs.change(&[Touched::Entry(dir, name), Touched::Inode(dir)], |disk, editor| {
             editor
                 .mkdir(disk, self.inode.number, name, mode, uid, gid)
                 .map_err(convert)
@@ -505,12 +638,17 @@ impl Node for Ext2Node {
     fn unlink(&self, name: &str) -> VfsResult<()> {
         // Номер inode уйдёт под новый файл — его страницы в кэше больше не
         // этого файла.
+        let mut child_number = None;
         if let Ok(child) = self.lookup(name) {
             if let Some(key) = child.cache_key() {
                 crate::mm::pagecache::forget(key);
+                child_number = u32::try_from(key.1).ok();
             }
         }
-        self.fs.change(|disk, editor| {
+        let dir = self.inode.number;
+        // Номер ребёнка неизвестен (каталог, не нашёлся) — забыть всё.
+        let child = child_number.map_or(Touched::All, Touched::Inode);
+        self.fs.change(&[Touched::Entry(dir, name), Touched::Inode(dir), child], |disk, editor| {
             editor
                 .unlink(disk, self.inode.number, name)
                 .map_err(convert)
@@ -518,12 +656,22 @@ impl Node for Ext2Node {
     }
 
     fn rmdir(&self, name: &str) -> VfsResult<()> {
-        self.fs.change(|disk, editor| {
+        self.fs.change(&[Touched::All], |disk, editor| {
             editor
                 .rmdir(disk, self.inode.number, name)
                 .map_err(convert)
         })
     }
+}
+
+/// Буфер ядра для чтения и записи через него: не длиннее 256 КиБ.
+fn bounce_buffer(len: usize) -> VfsResult<Vec<u8>> {
+    const CHUNK: usize = 256 * 1024;
+    let size = len.clamp(1, CHUNK);
+    let mut bounce = Vec::new();
+    bounce.try_reserve_exact(size).map_err(|_| VfsError::OutOfMemory)?;
+    bounce.resize(size, 0);
+    Ok(bounce)
 }
 
 impl Ext2Node {
@@ -538,11 +686,7 @@ impl Ext2Node {
     /// записали: так возвращённый узел описывает том, а не наши намерения
     /// насчёт него.
     fn child(&self, number: u32) -> VfsResult<Box<dyn Node>> {
-        let inode = {
-            let mut guard = self.fs.inner.lock();
-            let Inner { disk, fs, .. } = &mut *guard;
-            fs.inode(disk, number).map_err(convert)?
-        };
+        let inode = self.fs.inode(number)?;
         Ok(Box::new(Ext2Node { fs: Arc::clone(&self.fs), inode }))
     }
 }

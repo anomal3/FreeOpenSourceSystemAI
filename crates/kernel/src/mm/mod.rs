@@ -117,6 +117,32 @@ pub const HEAP_BASE: usize = 0xFFFF_C000_0000_0000;
 /// где памяти мало.
 pub const HEAP_SIZE: usize = 64 * 1024 * 1024;
 
+/// Самая большая куча ядра (фаза 74).
+pub const HEAP_MAX: usize = 512 * 1024 * 1024;
+
+/// Размер кучи этой загрузки — см. [`choose_heap_size`].
+static HEAP_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(HEAP_SIZE);
+
+/// Сколько байт у кучи ядра в этой загрузке.
+#[must_use]
+pub fn heap_size() -> usize {
+    HEAP_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Выбрать размер кучи по памяти машины: 1/64 памяти, от [`HEAP_SIZE`] до
+/// [`HEAP_MAX`], кратно 2 МиБ (фаза 74).
+///
+/// [`HEAP_SIZE`] остаётся нижней границей — телефон и машины до 4 ГБ живут с
+/// прежними 64 МиБ, и путь нехватки на них проверяется по-прежнему. На машине
+/// с 16 ГБ Rider с Chromium исчерпывали 64 МиБ (кэши ФС, сокеты, Wayland) —
+/// ядро падало `KERNEL HEAP EXHAUSTED`. Вызывается один раз, после
+/// аллокатора кадров и до построения таблиц.
+pub fn choose_heap_size(total_frames: usize) {
+    const STEP: usize = 2 * 1024 * 1024;
+    let bytes = (total_frames.saturating_mul(PAGE_SIZE) / 64).clamp(HEAP_SIZE, HEAP_MAX) / STEP * STEP;
+    HEAP_BYTES.store(bytes, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Начало окна буферов DMA.
 ///
 /// Отдельное окно, а не кусок кучи, потому что этим страницам нужен другой

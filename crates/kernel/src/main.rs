@@ -258,6 +258,7 @@ fn take_over_memory(info: &BootInfo) {
         stats.free,
         stats.free_bytes() / (1024 * 1024)
     );
+    mm::choose_heap_size(stats.total);
     // Участок под снимок паники занимается до первого же выданного кадра:
     // таблицы страниц ниже легли бы поверх снимка прошлой загрузки.
     crashlog::claim();
@@ -300,7 +301,7 @@ fn take_over_memory(info: &BootInfo) {
     match unsafe { mm::heap::init() } {
         Ok(stats) => kprintln!(
             "  heap        : {} MiB at {:#018x} ({} bytes free)",
-            mm::HEAP_SIZE / (1024 * 1024),
+            mm::heap_size() / (1024 * 1024),
             mm::HEAP_BASE,
             stats.free
         ),
@@ -839,6 +840,9 @@ fn run_session(have_input: bool) -> ! {
         }
     }
 
+    if let Err(err) = sched::spawn_daemon("lockwatch", sched::lock_watch_task) {
+        kprintln!("  sched       : the lock watch task did not start: {err}");
+    }
     if let Err(err) = sched::spawn_daemon("writeback", fs::writeback_task) {
         kprintln!("  fs          : the writeback task did not start: {err}");
     }
