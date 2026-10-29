@@ -24,6 +24,14 @@ pub fn resolve(path: &str, cred: Credentials) -> String {
     if !path.starts_with('/') || path == LINUX_ROOT || path.starts_with("/opt/debian/") {
         return String::from(path);
     }
+    // `/tmp` — общий временный каталог на разделе состояния (фаза 74).
+    if let Some(rest) = path.strip_prefix("/tmp") {
+        if rest.is_empty() || rest.starts_with('/') {
+            let mut out = String::from("/var/tmp");
+            out.push_str(rest);
+            return out;
+        }
+    }
     let mut inside = String::with_capacity(LINUX_ROOT.len() + path.len());
     inside.push_str(LINUX_ROOT);
     if path != "/" {

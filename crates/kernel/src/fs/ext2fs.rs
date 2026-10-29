@@ -225,6 +225,7 @@ impl Ext2Fs {
     /// под новый файл блок, уже занятый старым. Не потеря счётчиков, а потеря
     /// данных. Цена — с десяток записей блоков на операцию, и это ровно то
     /// место, где такую цену стоит платить не глядя.
+    #[track_caller]
     fn change<R>(
         &self,
         touched: &[Touched<'_>],
@@ -263,6 +264,7 @@ impl Ext2Fs {
     }
 
     /// Inode по номеру: из кэша имён, иначе с тома (под замком тома).
+    #[track_caller]
     fn inode(&self, number: u32) -> VfsResult<ext2::Inode> {
         if let Some(inode) = self.meta.lock().inodes.get(&number) {
             return Ok(inode.clone());
@@ -669,14 +671,48 @@ impl Node for Ext2Node {
     }
 }
 
-/// Буфер ядра для чтения и записи через него: не длиннее 256 КиБ.
-fn bounce_buffer(len: usize) -> VfsResult<Vec<u8>> {
-    const CHUNK: usize = 256 * 1024;
-    let size = len.clamp(1, CHUNK);
+/// Длина буфера ядра для чтения и записи через него.
+const BOUNCE: usize = 256 * 1024;
+
+/// Запас буферов: выделять 256 КиБ из кучи на каждый `read` значило рвать
+/// её на куски (фаза 74 — Rider в VirtualBox упирался в аллокатор).
+static BOUNCES: crate::sync::SpinLock<Vec<Vec<u8>>> = crate::sync::SpinLock::new(Vec::new());
+
+/// Буфер ядра из запаса; уходя, возвращается в запас.
+struct Bounce(Vec<u8>);
+
+impl core::ops::Deref for Bounce {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Bounce {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+impl Drop for Bounce {
+    fn drop(&mut self) {
+        let buffer = core::mem::take(&mut self.0);
+        let mut pool = BOUNCES.lock();
+        if pool.len() < 16 && pool.try_reserve(1).is_ok() {
+            pool.push(buffer);
+        }
+    }
+}
+
+/// Буфер ядра для чтения и записи через него: всегда [`BOUNCE`] байт.
+fn bounce_buffer(_len: usize) -> VfsResult<Bounce> {
+    if let Some(buffer) = BOUNCES.lock().pop() {
+        return Ok(Bounce(buffer));
+    }
     let mut bounce = Vec::new();
-    bounce.try_reserve_exact(size).map_err(|_| VfsError::OutOfMemory)?;
-    bounce.resize(size, 0);
-    Ok(bounce)
+    bounce.try_reserve_exact(BOUNCE).map_err(|_| VfsError::OutOfMemory)?;
+    bounce.resize(BOUNCE, 0);
+    Ok(Bounce(bounce))
 }
 
 impl Ext2Node {

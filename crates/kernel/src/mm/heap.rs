@@ -87,6 +87,62 @@ struct KernelHeap {
 #[global_allocator]
 static HEAP: KernelHeap = KernelHeap { inner: SpinLock::new(None) };
 
+/// Мелкие блоки — по классам размеров (фаза 74): 16, 32 … 2048 байт.
+///
+/// Список свободного у `linked_list_allocator` — один на всё, и поиск в нём
+/// линейный. С кучей в сотни мегабайт и тысячами мелких выделений (кэши ФС,
+/// сокеты, Wayland) каждое выделение обходило тысячи блоков с выключенными
+/// прерываниями — Rider в VirtualBox «вставал»: держатель замка тома сидел в
+/// аллокаторе, остальные процессоры ждали его в сбросе трансляций. Здесь
+/// мелкий блок берётся из списка своего класса за O(1); списки пополняются
+/// кусками по 64 КиБ и в общую кучу не возвращаются.
+const CLASSES: usize = 8;
+const SMALLEST: usize = 16;
+const LARGEST: usize = SMALLEST << (CLASSES - 1);
+const CHUNK: usize = 64 * 1024;
+
+/// Головы списков свободных блоков классов (адрес блока, ноль — пусто);
+/// в первом слове свободного блока — адрес следующего.
+static SMALL: SpinLock<[usize; CLASSES]> = SpinLock::new([0; CLASSES]);
+
+/// Класс блока под `layout`, если он мелкий.
+fn class_of(layout: Layout) -> Option<usize> {
+    let size = layout.size().max(layout.align()).max(SMALLEST);
+    if size > LARGEST {
+        return None;
+    }
+    Some(size.next_power_of_two().trailing_zeros() as usize - SMALLEST.trailing_zeros() as usize)
+}
+
+/// Взять мелкий блок класса `class`; пусто — нарезать кусок из общей кучи.
+fn small_alloc(class: usize) -> *mut u8 {
+    {
+        let mut heads = SMALL.lock();
+        let head = heads[class];
+        if head != 0 {
+            // SAFETY: свободный блок класса хранит в первом слове следующий.
+            heads[class] = unsafe { *(head as *const usize) };
+            return head as *mut u8;
+        }
+    }
+    let size = SMALLEST << class;
+    // SAFETY: размер и выравнивание ненулевые, степени двойки.
+    let chunk = unsafe { GlobalAlloc::alloc(&HEAP, Layout::from_size_align_unchecked(CHUNK, 4096)) };
+    if chunk.is_null() {
+        return chunk;
+    }
+    // Первый блок — вызывающему, остальные — в список.
+    let mut heads = SMALL.lock();
+    let mut at = chunk as usize + size;
+    while at + size <= chunk as usize + CHUNK {
+        // SAFETY: блок внутри только что выданного куска, ничей.
+        unsafe { *(at as *mut usize) = heads[class] };
+        heads[class] = at;
+        at += size;
+    }
+    chunk
+}
+
 /// Чем кончилась попытка выделения.
 ///
 /// Отдельное значение нужно ровно затем, чтобы диагностика печаталась уже после
@@ -106,6 +162,11 @@ enum Outcome {
 // `Layout`. Гонок нет: доступ к `Heap` возможен только через `SpinLock`.
 unsafe impl GlobalAlloc for KernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if let Some(class) = class_of(layout) {
+            if self.inner.lock().is_some() {
+                return small_alloc(class);
+            }
+        }
         let outcome = {
             let mut slot = self.inner.lock();
             match slot.as_mut() {
@@ -158,6 +219,13 @@ unsafe impl GlobalAlloc for KernelHeap {
         let Some(block) = NonNull::new(ptr) else {
             return;
         };
+        if let Some(class) = class_of(layout) {
+            let mut heads = SMALL.lock();
+            // SAFETY: блок класса `class` выдан `small_alloc` и больше не нужен.
+            unsafe { *(ptr as *mut usize) = heads[class] };
+            heads[class] = ptr as usize;
+            return;
+        }
         {
             let mut slot = self.inner.lock();
             if let Some(heap) = slot.as_mut() {

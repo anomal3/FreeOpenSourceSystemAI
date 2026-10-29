@@ -150,6 +150,11 @@ mod nr {
     pub const PPOLL: usize = 271;
     pub const PIPE2: usize = 293;
     pub const MEMBARRIER: usize = 324;
+    pub const MLOCK: usize = 149;
+    pub const MUNLOCK: usize = 150;
+    pub const MLOCKALL: usize = 151;
+    pub const MUNLOCKALL: usize = 152;
+    pub const MLOCK2: usize = 325;
     pub const CLONE3: usize = 435;
     pub const FORK: usize = 57;
     pub const VFORK: usize = 58;
@@ -255,6 +260,7 @@ mod e {
     pub const ENOTSOCK: i64 = 88;
     pub const ENETDOWN: i64 = 100;
     pub const ECONNRESET: i64 = 104;
+    pub const ENOSPC: i64 = 28;
     pub const ETIMEDOUT: i64 = 110;
     pub const ECONNREFUSED: i64 = 111;
     pub const EINPROGRESS: i64 = 115;
@@ -348,8 +354,10 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             // Объекты слоя Linux (фаза 71e) читаются и пишутся здесь, всё
             // остальное — родным путём.
             nr::READ => ipc::object_read(a0, a1, a2).unwrap_or_else(|| errno(native(SYS_READ, a0, a1, a2))),
-            nr::WRITE => ipc::object_write(a0, a1, a2).unwrap_or_else(|| errno(native(SYS_WRITE, a0, a1, a2))),
-            nr::WRITEV => ipc::object_writev(a0, a1, a2).unwrap_or_else(|| writev(a0, a1, a2)),
+            // У записи «места нет» — полный диск, а не память (фаза 74:
+            // Rider показывал «Cannot allocate memory» на переполненном томе).
+            nr::WRITE => no_space(ipc::object_write(a0, a1, a2).unwrap_or_else(|| errno(native(SYS_WRITE, a0, a1, a2)))),
+            nr::WRITEV => no_space(ipc::object_writev(a0, a1, a2).unwrap_or_else(|| writev(a0, a1, a2))),
             nr::READV => ipc::object_readv(a0, a1, a2).unwrap_or_else(|| readv(a0, a1, a2)),
             // `AF_INET` — родной стек (фаза 71f), остальное — `AF_UNIX`.
             nr::SOCKET if a0 == 2 => net::socket(a1),
@@ -383,7 +391,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::MEMFD_CREATE => ipc::memfd_create(a0, a1),
             nr::FTRUNCATE => ftruncate(a0, a1),
             // Фаза 71h — то, чего потребовал Chromium.
-            nr::PWRITE64 => fsops::pwrite(a0, a1, a2, a3),
+            nr::PWRITE64 => no_space(fsops::pwrite(a0, a1, a2, a3)),
             nr::MKDIR => fsops::mkdir(AT_FDCWD, a0, a1),
             nr::MKDIRAT => fsops::mkdir(a0, a1, a2),
             nr::RENAME => fsops::rename(AT_FDCWD, a0, AT_FDCWD, a1, 0),
@@ -509,7 +517,10 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::GETPRIORITY => 20,
             nr::SCHED_GETSCHEDULER => 0,
             nr::CLOCK_NANOSLEEP => clock_nanosleep(a0, a1, a2),
-            nr::MEMBARRIER => -e::ENOSYS,
+            // Подкачки нет — память и так не выгружается (CoreCLR закрепляет
+            // служебную страницу, фаза 74).
+            nr::MLOCK | nr::MUNLOCK | nr::MLOCKALL | nr::MUNLOCKALL | nr::MLOCK2 => 0,
+            nr::MEMBARRIER => membarrier(a0),
             nr::IOCTL => ioctl(a0, a1, a2),
             nr::SCHED_YIELD => errno(native(SYS_YIELD, 0, 0, 0)),
             // Совет о памяти или о чтении файла — совет: не принять его можно
@@ -706,7 +717,15 @@ fn file_errno(err: crate::user::files::FileError) -> i64 {
 }
 
 fn vfs_errno(err: crate::vfs::VfsError) -> i64 {
+    if err == crate::vfs::VfsError::NoSpace {
+        return -e::ENOSPC;
+    }
     errno(crate::user::syscall::vfs_errno(err))
+}
+
+/// Ответ записи: `ENOMEM` родного «места нет» — это `ENOSPC`.
+fn no_space(answer: i64) -> i64 {
+    if answer == -e::ENOMEM { -e::ENOSPC } else { answer }
 }
 
 /// `openat(dir, path, flags)`.
@@ -1821,6 +1840,26 @@ fn capset(header: usize, data: usize) -> i64 {
         return -e::EPERM;
     }
     0
+}
+
+/// `membarrier(cmd, …)` (фаза 74): барьер памяти на всех процессорах, где
+/// идут потоки процесса. Сброс трансляций — прерывание на каждом процессоре —
+/// сериализует их исполнение, это и есть барьер. CoreCLR (половина Rider на
+/// .NET) без него уходил в обход через `mlock` и не поднимался.
+fn membarrier(cmd: usize) -> i64 {
+    const QUERY: usize = 0;
+    const GLOBAL: usize = 1;
+    const PRIVATE_EXPEDITED: usize = 8;
+    const REGISTER_PRIVATE_EXPEDITED: usize = 16;
+    match cmd {
+        QUERY => (GLOBAL | PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED) as i64,
+        GLOBAL | PRIVATE_EXPEDITED => {
+            crate::arch::flush_user_translations();
+            0
+        }
+        REGISTER_PRIVATE_EXPEDITED => 0,
+        _ => -e::EINVAL,
+    }
 }
 
 /// `getcpu(cpu, node)`: на каком процессоре задача сейчас; узел NUMA один.

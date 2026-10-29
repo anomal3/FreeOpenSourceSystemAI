@@ -39,7 +39,7 @@ use crate::{cbuild, sdk};
 const SNAPSHOT: &str = "https://snapshot.debian.org/archive/debian/20261020T000000Z/";
 
 /// Пакеты: путь в архиве и SHA-256 из `Packages` bookworm того же дня.
-pub(crate) const PACKAGES: [(&str, &str); 12] = [
+pub(crate) const PACKAGES: [(&str, &str); 15] = [
     ("pool/main/g/glibc/libc6_2.36-9+deb12u14_amd64.deb", "ba4f88f73dbc3ae9055f3c20f4523bfdbaf1ad13ff95e258924f77d20b4fbedf"),
     ("pool/main/n/ncurses/libtinfo6_6.4-4_amd64.deb", "072d908f38f51090ca28ca5afa3b46b2957dc61fe35094c0b851426859a49a51"),
     ("pool/main/b/bash/bash_5.2.15-2+b13_amd64.deb", "82130bb6a560cd2a7234d8018baf73f188f5dd56413d5aa0accc987b2197a6a1"),
@@ -54,6 +54,11 @@ pub(crate) const PACKAGES: [(&str, &str); 12] = [
     // `libgcc_s.so.1`: glibc подгружает её для `pthread_exit` и отмены потоков
     // (раскрутка стека) — фаза 71c.
     ("pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_amd64.deb", "3016e62cb4b7cd8038822870601f5ed131befe942774d0f745622cc77d8a88f7"),
+    // Для .NET Microsoft (половина Rider на .NET, фаза 74): хост `apphost`
+    // написан на C++, сеть с TLS — через OpenSSL, сжатие — zlib.
+    ("pool/main/g/gcc-12/libstdc++6_12.2.0-14+deb12u1_amd64.deb", "5cd3171216d4ab0fc911cfe9c35509bf2dd8f47761c43b7f6a4296701551a24d"),
+    ("pool/main/o/openssl/libssl3_3.0.20-1~deb12u2_amd64.deb", "89be24b41bff568ee6e7caf5680a3d808e80315ed92e407056ce0fa7a5bda025"),
+    ("pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb", "d7dd1d1411fedf27f5e27650a6eff20ef294077b568f4c8c5e51466dc7c08ce4"),
 ];
 
 /// Пакеты только для сборки проверочных программ (фаза 71c): заголовки glibc

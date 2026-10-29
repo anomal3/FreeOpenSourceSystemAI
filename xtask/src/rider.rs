@@ -13,11 +13,10 @@
 //!
 //! # Что не кладётся
 //!
-//! То, что к C# отношения не имеет или требует того, чего в системе нет:
-//! отладчик C++ с GDB и LLDB (1,2 ГБ), локальная модель автодополнения
-//! (`fullLine`, 434 МБ), встроенный Chromium (`jcef`, 379 МБ — ему нужен X11),
-//! RenderDoc, сервер удалённой разработки (свой Xvfb), двоичные файлы
-//! ReSharper под ARM, musl, Windows и macOS. Остаётся ~4,5 ГБ.
+//! Двоичные файлы ReSharper под ARM, musl, Windows и macOS и каркасы macOS.
+//! Плагины — все (до фазы 74 выбрасывались отладчик C++, `fullLine`, `jcef`,
+//! RenderDoc и сервер удалённой разработки, и Rider не запускал свою половину
+//! на .NET).
 //!
 //! # Запуск
 //!
@@ -39,15 +38,21 @@ use crate::java::{Item, RIDER_TOP, rider_archive, stream_tar};
 const BUILD: &str = "262.10968.170";
 
 /// Пропускаемое — пути внутри каталога Rider.
-const SKIP: [&str; 17] = [
+///
+/// Плагины кладутся все (с фазы 74): их список зашит в реестр модулей Rider
+/// (`modules/module-descriptors.dat`), и перед запуском своей половины на
+/// .NET Rider обходит каталог каждого — выброшенный `cidr-debugger-plugin`
+/// обрывал запуск ReSharperHost на `NoSuchFileException`.
+const SKIP: [&str; 14] = [
     "bin/JBDevice.framework/",
     "bin/Bridge.framework/",
+    // Тяжёлые плагины без дела в системе: отладчик C++ с GDB/LLDB (1,2 ГБ),
+    // локальная модель (434 МБ), встроенный Chromium (379 МБ, ему нужен X11).
+    // Каталоги их остаются с пометкой (`SKIPPED_PLUGINS`): Rider перечисляет
+    // каждый, а целиком они не влезали в раздел состояния стенда.
     "plugins/cidr-debugger-plugin/",
     "plugins/fullLine/",
     "plugins/jcef-plugin/",
-    "plugins/rider-plugins-renderdoc/",
-    "plugins/remote-dev-server/",
-    "bin/remote-dev-server",
     "lib/ReSharperHost/linux-arm64/",
     "lib/ReSharperHost/linux-arm/",
     "lib/ReSharperHost/linux-musl-x64/",
@@ -58,6 +63,9 @@ const SKIP: [&str; 17] = [
     "lib/ReSharperHost/runtimes/win",
     "lib/ReSharperHost/runtimes/linux-musl",
 ];
+
+/// Каталоги пропущенных плагинов: кладутся с файлом-пометкой.
+const SKIPPED_PLUGINS: [&str; 3] = ["plugins/cidr-debugger-plugin", "plugins/fullLine", "plugins/jcef-plugin"];
 
 /// Запись реестра: манифест, как его оставил бы `pkg`.
 const MANIFEST: &str = "# FossAi package manifest\n\
@@ -93,6 +101,12 @@ const SCRIPT: &str = "#!/bin/bash\n\
     export TMPDIR=${TMPDIR:-$HOME}\n\
     # ICU в системе нет: .NET внутри Rider — без языковых таблиц.\n\
     export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1\n\
+    # JIT .NET — сразу в память «запись+исполнение» (право пакета jit), без\n\
+    # двойного отображения memfd, которое .NET держит по умолчанию.\n\
+    export DOTNET_EnableWriteXorExecute=0\n\
+    # Куча .NET не больше 4 ГиБ: иначе сборщик мусора резервирует сотни\n\
+    # гигабайт адресов разом — больше окна программы, и .NET падает «Out of memory».\n\
+    export DOTNET_GCHeapHardLimit=0x100000000\n\
     # Ссылки (вход в аккаунт JetBrains) — в браузер по умолчанию: xdg-open корня Debian.\n\
     export BROWSER=/usr/bin/xdg-open\n\
     export RIDER_VM_OPTIONS=/opt/rider/fossai/rider64.vmoptions\n\
@@ -177,6 +191,10 @@ pub fn place(disk_path: &Path) -> Result<()> {
     };
     write(&mut fs, &mut dev, "opt/rider/fossai/rider64.vmoptions", &options, 0o644)?;
     write(&mut fs, &mut dev, "opt/rider/fossai/rider", SCRIPT.as_bytes(), 0o755)?;
+    for plugin in SKIPPED_PLUGINS {
+        let place = format!("opt/rider/{plugin}/FOSSAI-SKIPPED");
+        write(&mut fs, &mut dev, &place, b"not placed by the FossAi bench: no room on the bench disk\n", 0o644)?;
+    }
     // Значок на столе и на панели — свой, логотип Rider (`bin/rider.png`,
     // 128×128), как у Chromium: не значок набора.
     let logo = logo.context("в архиве Rider нет bin/rider.png")?;

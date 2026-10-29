@@ -690,6 +690,11 @@ pub fn stream_open(owner: TaskId) -> Result<usize, NetError> {
 pub fn stream_bind(owner: TaskId, index: usize, port: u16) -> Result<u16, NetError> {
     let mut guard = INTERFACE.lock();
     let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    // Порт 0 — «выбери сам», как у Linux: свободный эфемерный сразу, и
+    // `getsockname` его называет. Java (`ServerSocket(0)`) читает порт сразу
+    // после `bind` и на нуле отвечает «Not bound» — Rider так и не открывал
+    // сокет для своей половины на .NET (фаза 74).
+    let port = if port == 0 { iface.sockets.pick_port().map_err(NetError::Socket)? } else { port };
     iface.streams.bind(owner, index, port).map_err(NetError::Stream)
 }
 
@@ -697,6 +702,11 @@ pub fn stream_bind(owner: TaskId, index: usize, port: u16) -> Result<u16, NetErr
 pub fn stream_listen(owner: TaskId, index: usize) -> Result<(), NetError> {
     let mut guard = INTERFACE.lock();
     let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
+    // `listen` без `bind` — тоже эфемерный порт, как у Linux.
+    if iface.streams.get_mut(owner, index).map_err(NetError::Stream)?.local_port == 0 {
+        let port = iface.sockets.pick_port().map_err(NetError::Socket)?;
+        iface.streams.bind(owner, index, port).map_err(NetError::Stream)?;
+    }
     iface.streams.listen(owner, index).map_err(NetError::Stream)
 }
 

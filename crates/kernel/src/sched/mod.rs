@@ -274,7 +274,7 @@ pub fn lock_watch_task() {
     loop {
         sleep_ms(5_000);
         let now = crate::time::uptime_ms();
-        let mut found: alloc::vec::Vec<(usize, &'static str, usize, u64, usize, &'static str, Option<(&'static str, u64)>)> =
+        let mut found: alloc::vec::Vec<(usize, &'static str, usize, u64, usize, &'static str, Option<(&'static str, u64)>, usize)> =
             alloc::vec::Vec::new();
         {
             let sched = SCHED.lock();
@@ -289,16 +289,23 @@ pub fn lock_watch_task() {
                 // SAFETY: задача спит на этом мьютексе, значит он жив; первое
                 // поле `Mutex` — владелец (`repr(C)`).
                 let owner = unsafe { (*(address as *const AtomicUsize)).load(Ordering::Relaxed) };
+                // SAFETY: второе поле — место захвата (`Location` или ноль).
+                let site = unsafe { (*((address + 8) as *const AtomicUsize)).load(Ordering::Relaxed) };
                 let (holder_name, holder_state) = match owner.checked_sub(1).and_then(|h| sched.tasks.get(h)?.as_ref()) {
                     Some(holder) => (holder.name, holder.state.waiting_for()),
                     None => ("?", None),
                 };
                 if found.try_reserve(1).is_ok() {
-                    found.push((slot, task.name, address, now - since, owner.wrapping_sub(1), holder_name, holder_state));
+                    found.push((slot, task.name, address, now - since, owner.wrapping_sub(1), holder_name, holder_state, site));
                 }
             }
         }
-        for (slot, name, address, waited, holder, holder_name, holder_state) in found {
+        for (slot, name, address, waited, holder, holder_name, holder_state, site) in found {
+            if site != 0 {
+                // SAFETY: место пишет `Mutex::lock` — `&'static Location`.
+                let at = unsafe { &*(site as *const core::panic::Location<'static>) };
+                kprintln!("  lockwatch   : the lock at {address:#x} was taken at {}:{}", at.file(), at.line());
+            }
             match holder_state {
                 Some((what, number)) => kprintln!(
                     "  lockwatch   : #{slot} {name} waits {} s for the lock at {address:#x}, held by #{holder} {holder_name}, which is {what} {number:#x}",

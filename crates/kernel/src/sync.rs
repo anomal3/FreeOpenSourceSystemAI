@@ -274,6 +274,14 @@ impl<T> Drop for SpinGuard<'_, T> {
 pub struct Mutex<T> {
     /// Слот задачи-владельца плюс один; ноль — свободен (диагностика).
     owner: core::sync::atomic::AtomicUsize,
+    /// Где взят: `&'static Location` захватившего вызова (диагностика).
+    site: core::sync::atomic::AtomicUsize,
+    /// Сколько задач собирается уснуть или спит на этом замке (фаза 74):
+    /// без ждущих освобождение не трогает планировщик. Раньше каждое
+    /// освобождение брало общий замок планировщика и обходило все задачи —
+    /// с десятками потоков Rider процессоры толпились на нём, и окно Rider
+    /// рисовалось минутами.
+    waiters: core::sync::atomic::AtomicUsize,
     locked: AtomicBool,
     value: UnsafeCell<T>,
 }
@@ -285,12 +293,14 @@ unsafe impl<T: Send> Send for Mutex<T> {}
 
 impl<T> Mutex<T> {
     pub const fn new(value: T) -> Self {
-        Self { owner: core::sync::atomic::AtomicUsize::new(0), locked: AtomicBool::new(false), value: UnsafeCell::new(value) }
+        Self { owner: core::sync::atomic::AtomicUsize::new(0), site: core::sync::atomic::AtomicUsize::new(0), waiters: core::sync::atomic::AtomicUsize::new(0), locked: AtomicBool::new(false), value: UnsafeCell::new(value) }
     }
 
     /// Захватить лок, уснув, если он занят.
     #[must_use = "лок освобождается при уничтожении охранника; проигнорировать его значит сразу же отпустить"]
+    #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, T> {
+        let site = core::panic::Location::caller() as *const core::panic::Location<'static> as usize;
         loop {
             if self
                 .locked
@@ -298,6 +308,7 @@ impl<T> Mutex<T> {
                 .is_ok()
             {
                 self.owner.store(crate::sched::running_slot() + 1, Ordering::Relaxed);
+                self.site.store(site, Ordering::Relaxed);
                 return MutexGuard { lock: self };
             }
 
@@ -309,9 +320,14 @@ impl<T> Mutex<T> {
             // освобождение между нашей проверкой и засыпанием либо увидит
             // проверка, либо застанет нас уже спящими: потерянного пробуждения
             // не бывает ни на одном процессоре, ни на нескольких.
+            // Счёт ждущих — до проверки: освобождающий снимает флаг и потом
+            // читает счёт (оба `SeqCst`), так что либо он увидит нас и
+            // разбудит, либо мы увидим замок свободным и спать не ляжем.
+            self.waiters.fetch_add(1, Ordering::SeqCst);
             crate::sched::block_on_lock(self.address(), || {
-                !self.locked.load(Ordering::Relaxed)
+                !self.locked.load(Ordering::SeqCst)
             });
+            self.waiters.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -349,10 +365,12 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.owner.store(0, Ordering::Relaxed);
-        self.lock.locked.store(false, Ordering::Release);
+        self.lock.locked.store(false, Ordering::SeqCst);
         // Будим после освобождения, а не до: разбуженная задача первым делом
         // попробует захватить лок, и застать его ещё занятым значило бы отправить
-        // её спать второй раз.
-        crate::sched::wake_lock(self.lock.address());
+        // её спать второй раз. Ждущих нет — планировщик не трогаем.
+        if self.lock.waiters.load(Ordering::SeqCst) != 0 {
+            crate::sched::wake_lock(self.lock.address());
+        }
     }
 }

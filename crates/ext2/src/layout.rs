@@ -265,6 +265,18 @@ impl Geometry {
             return Err(Error::TooSmall);
         }
 
+        // Хвостовая группа короче своих служебных структур (или едва длиннее)
+        // — её не берут, как `mke2fs` (порог 50 блоков сверх служебных): том
+        // короче на эту каплю, но форматируется. Раньше такой размер раздела
+        // давал «too small», и установка падала от того, что системный раздел
+        // подрос на несколько мегабайт (фаза 74).
+        let last = groups - 1;
+        if last > 0 && geometry.blocks_in_group(last) <= geometry.group_overhead_blocks(last) + 50 {
+            let keep_blocks = u64::from(first_data_block) + u64::from(last) * u64::from(blocks_per_group);
+            let keep_sectors = keep_blocks * block_bytes / u64::from(sector_size);
+            return Self::plan_with_on(first_lba, keep_sectors, block_size, sector_size);
+        }
+
         Ok(geometry)
     }
 

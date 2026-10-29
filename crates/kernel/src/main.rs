@@ -1097,6 +1097,18 @@ fn mount_disk_root(info: &BootInfo) {
     fs::set_root(alloc::boxed::Box::new(mount));
 
     mount_state(&found, info);
+    // `/tmp` программ Linux — `/var/tmp` раздела состояния (фаза 74): корень
+    // системы только для чтения, а .NET (половина Rider) без временного
+    // каталога не поднимается. Общий для всех, как у Linux: 1777.
+    let root = crate::vfs::perm::Credentials::ROOT;
+    let _ = fs::mkdir_as(root, "/var/tmp", 0o1777);
+    let _ = fs::chmod_as(root, "/var/tmp", 0o1777);
+    // Каталоги именованных мьютексов .NET (`/tmp/.dotnet/shm`): .NET создаёт
+    // только верхний, а без второго его мьютексы не открываются.
+    for dir in ["/var/tmp/.dotnet", "/var/tmp/.dotnet/shm"] {
+        let _ = fs::mkdir_as(root, dir, 0o777);
+        let _ = fs::chmod_as(root, dir, 0o777);
+    }
     // Раздел состояния — единственное место, куда система пишет: снимок паники
     // прошлой загрузки ложится туда.
     crashlog::store();

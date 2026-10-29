@@ -2390,6 +2390,7 @@ pub fn linux_brk(want: usize) -> usize {
 ///
 /// `None`, если задача программы не исполняет, — например, когда системный
 /// вызов пришёл неизвестно откуда.
+#[track_caller]
 pub fn with_current<R>(f: impl FnOnce(&mut Program) -> R) -> Option<R> {
     // Порядок локов всегда один: таблица, потом процесс, — и второй берётся
     // после того, как первый отпущен. Два лока одновременно не удерживаются
@@ -2412,6 +2413,7 @@ pub fn with_current<R>(f: impl FnOnce(&mut Program) -> R) -> Option<R> {
 /// Считаются ссылки на процесс: по одной у каждого потока в таблице
 /// программ и одна наша. Лишняя ссылка, которую держит кто-то мимоходом
 /// (диспетчер задач), даёт лишний сброс — это дорого, но не неверно.
+#[track_caller]
 pub fn with_current_shared<R>(f: impl FnOnce(&mut Program, bool) -> R) -> Option<R> {
     let process = current_process()?;
     let shared = Arc::strong_count(&process) > 2;
