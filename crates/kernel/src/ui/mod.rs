@@ -4070,6 +4070,10 @@ pub fn title_window(task: u32, slot: u32, title: &str) -> Result<(), WindowError
         };
         if window.set_title(title, focused) {
             kprintln!("  desktop     : #{task} window is now called '{title}'");
+            // И место под новым именем: стенд наводит мышь по имени, а первое
+            // имя у окна бывает разным (Chromium с zygote открывает окно уже
+            // с адресом страницы, а не «Untitled»).
+            log_window(desktop, app, focused);
             // Кнопка на панели задач носит то же имя.
             desktop.refresh_panel(&status_now());
             desktop.present();

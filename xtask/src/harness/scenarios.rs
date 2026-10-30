@@ -5589,7 +5589,7 @@ pub const ALL: &[Scenario] = &[
             Step::Painted("chromium"),
             // Развернуть: `configure` с размером экрана и новый буфер того же
             // размера (до фазы 71i с этим кончалась куча ядра).
-            Step::Aim(Aim::Frameless("Untitled - Chromium", 1)),
+            Step::Aim(Aim::Frameless("FossAi - Chromium", 1)),
             Step::Click,
             // До двух минут: Chromium в отладочном ядре под эмулятором бывает
             // занят запуском очередного процесса, и щелчок разбирается не

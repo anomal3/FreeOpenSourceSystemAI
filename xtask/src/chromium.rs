@@ -286,6 +286,9 @@ pub fn build(arch: Arch) -> Result<()> {
     // Chromium 150 сам переписывает на https и на сервере только с HTTP
     // (`svn…:9999`, 29.10) получает обрыв рукопожатия без отката на http.
     // Сайты с https перенаправляют на него сами.
+    // Zygote включён (30.10, очередь «попробовать», пункт 1): GPU и служебные
+    // процессы рождает несандбоксный zygote, страницы — обычный; страница —
+    // `fork` готовой заготовки, без `execve` и загрузки сотни библиотек.
     let script = "#!/bin/bash\n\
         # Chromium (фазы 71h, 71i): библиотеки и шрифты — рядом, песочницы нет.\n\
         export LD_LIBRARY_PATH=/opt/chromium/lib\n\
@@ -302,7 +305,7 @@ pub fn build(arch: Arch) -> Result<()> {
         export TMPDIR=${TMPDIR:-$HOME}\n\
         platform=--ozone-platform=wayland\n\
         case \" $* \" in *\" --headless\"*) platform= ;; esac\n\
-        exec /opt/chromium/chrome/chromium --no-sandbox --no-zygote --disable-gpu $platform \\\n\
+        exec /opt/chromium/chrome/chromium --no-sandbox --disable-gpu $platform \\\n\
           --no-first-run --no-default-browser-check --password-store=basic --ipc-connection-timeout=120 \\\n\
           --disable-features=HttpsUpgrades,OmniboxDefaultTypedNavigationsToHttps \"$@\"\n";
     files.push((String::from("bin/chromium"), script.as_bytes().to_vec(), 0o755));
