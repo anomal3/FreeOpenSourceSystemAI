@@ -1550,6 +1550,27 @@ pub fn epoll_report(slot: usize, epfd: usize) {
 
 /// `epoll_wait(epfd, events, max, timeout_ms)` и `epoll_pwait` (маска сигналов
 /// не меняется: доставка и так только на выходе из вызова).
+/// Дескрипторы, чтение из которых вернуло `EAGAIN` с прошлого сообщения
+/// `epoll` о них: (pid Linux, дескриптор). Для фронта `EPOLLET`.
+static DRAINED: crate::sync::SpinLock<alloc::collections::BTreeSet<(u32, usize)>> =
+    crate::sync::SpinLock::new(alloc::collections::BTreeSet::new());
+
+/// Чтение из `fd` текущего процесса дошло до дна (`EAGAIN`).
+pub fn note_drained(fd: usize) {
+    let Some(pid) = crate::user::with_current(|program| program.linux_pid) else { return };
+    let mut drained = DRAINED.lock();
+    // Дескриптор не в `epoll` — отметку никто не заберёт: набор не растёт
+    // без предела (лишняя отметка даст разве что одно лишнее событие).
+    if drained.len() >= 4096 {
+        drained.clear();
+    }
+    drained.insert((pid, fd));
+}
+
+fn take_drained(pid: u32, fd: usize) -> bool {
+    DRAINED.lock().remove(&(pid, fd))
+}
+
 pub fn epoll_wait(epfd: usize, out: usize, max: usize, timeout: i64) -> i64 {
     let object = match epoll_of(epfd) {
         Ok(object) => object,
@@ -1599,6 +1620,7 @@ pub fn epoll_wait(epfd: usize, out: usize, max: usize, timeout: i64) -> i64 {
             }
         }
         let mut found: Vec<(u32, u64)> = Vec::new();
+        let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
         {
             let mut interests = epoll.interests.lock();
             for (fd, bits) in ready {
@@ -1607,16 +1629,20 @@ pub fn epoll_wait(epfd: usize, out: usize, max: usize, timeout: i64) -> i64 {
                 };
                 let mut report = bits & (interest.events | EPOLLHUP | EPOLLERR);
                 if interest.events & EPOLLET != 0 {
-                    // «Стало готово» по сравнению с прошлым опросом теряет
-                    // фронт, если программа дочитала до `EAGAIN`, а новые байты
-                    // пришли раньше следующего `epoll_wait`: оба опроса видят
-                    // «готово», и событие не приходит никогда (фаза 74: .NET
-                    // ждал вывода ребёнка вечно). Чтение поэтому сообщается,
-                    // пока есть что читать: программа с `EPOLLET` и так читает
-                    // до `EAGAIN`, лишнее событие ей безвредно. Запись и обрыв
-                    // — по-прежнему фронтом: «можно писать» у сокета почти
-                    // всегда, и уровнем оно крутило бы ожидание вхолостую.
-                    let fresh = (report & EPOLLIN) | (report & !EPOLLIN & !interest.last);
+                    // Фронт чтения. «Стало готово» по сравнению с прошлым
+                    // опросом теряет событие, если программа дочитала до
+                    // `EAGAIN`, а новые байты пришли раньше следующего
+                    // `epoll_wait`: оба опроса видят «готово» (фаза 74: .NET
+                    // ждал вывода ребёнка вечно). А «сообщать, пока есть что
+                    // читать» (7cafaba) крутило вхолостую тех, кто по событию
+                    // читает не сразу: движок сокетов .NET запоминает событие и
+                    // читает, только когда есть запрос, — 18 млн `epoll_wait`
+                    // за 15 с у Rider (30.10). Поэтому: готовность появилась —
+                    // или программа с прошлого сообщения дочитала до дна.
+                    let was_in = interest.last & EPOLLIN != 0;
+                    let in_now = report & EPOLLIN != 0;
+                    let fresh_in = in_now && (!was_in || take_drained(pid, fd));
+                    let fresh = if fresh_in { EPOLLIN } else { 0 } | (report & !EPOLLIN & !interest.last);
                     interest.last = report;
                     report = fresh;
                 }

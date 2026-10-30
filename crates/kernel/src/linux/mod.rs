@@ -337,6 +337,11 @@ pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
     // SAFETY: контракт функции.
     let result = unsafe { dispatch(number, args, frame) };
     profile::count(number, crate::time::uptime_ns().saturating_sub(started));
+    // Чтение до дна (`EAGAIN`) — для фронта `EPOLLET` (см. `ipc::note_drained`):
+    // read, readv, recvfrom, recvmsg, recvmmsg.
+    if result == -11 && matches!(number, 0 | 19 | 45 | 47 | 299) {
+        ipc::note_drained(args[0]);
+    }
     recent::record(number, args, result);
     recent::begin(usize::MAX, &args);
     frame.rax = result as u64;
