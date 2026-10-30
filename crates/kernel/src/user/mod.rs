@@ -5054,6 +5054,65 @@ pub fn prepare_write(ptr: usize, len: usize) {
     }
 }
 
+/// Окно упреждающего чтения страниц файла.
+const READ_AHEAD: usize = 128 * 1024;
+
+/// Запас буферов окна — не просить у кучи 128 КиБ на каждый отказ.
+static AHEAD_BUFFERS: crate::sync::SpinLock<Vec<Vec<u8>>> = crate::sync::SpinLock::new(Vec::new());
+
+/// Прочитать страницу файла с `offset` в `page` — и заодно окно за ней.
+///
+/// Фаза 74, 30.10: отказ страницы читал с диска ровно её, 4 КиБ, а Chromium
+/// и Rider при запуске трогают десятки мегабайт кода библиотек вразброс —
+/// тысячи обращений к диску. Окно в [`READ_AHEAD`] читается одним вызовом
+/// (у ext2 — одним запросом к устройству), полные страницы за отказавшей
+/// ложатся в кэш страниц, и следующие отказы берут их оттуда. Так делает и
+/// Linux (readahead, fault-around). Вернуть, сколько байт легло в `page`;
+/// `None` — чтение отказало.
+fn read_ahead(node: &dyn crate::vfs::Node, file: (usize, u64), offset: u64, page: &mut [u8]) -> Option<usize> {
+    // Окно — пока страницы подряд не в кэше и памяти хватает.
+    let mut pages = 1;
+    while pages < READ_AHEAD / PAGE_SIZE
+        && !crate::mm::pagecache::has(file, offset + (pages * PAGE_SIZE) as u64, PAGE_SIZE)
+    {
+        pages += 1;
+    }
+    let roomy = crate::mm::frame::stats().free > RESERVE_FRAMES * 4 && crate::mm::pagecache::roomy(pages);
+    if pages == 1 || !roomy {
+        return node.read_at(offset, &mut page[..PAGE_SIZE]).ok();
+    }
+    let mut window = AHEAD_BUFFERS.lock().pop().unwrap_or_default();
+    if window.len() < READ_AHEAD {
+        if window.try_reserve_exact(READ_AHEAD - window.len()).is_err() {
+            return node.read_at(offset, &mut page[..PAGE_SIZE]).ok();
+        }
+        window.resize(READ_AHEAD, 0);
+    }
+    let result = node.read_at(offset, &mut window[..pages * PAGE_SIZE]);
+    let outcome = result.ok().map(|read| {
+        let first = read.min(PAGE_SIZE);
+        page[..first].copy_from_slice(&window[..first]);
+        // Остальные — только целыми страницами: ключ кэша — полная страница.
+        for k in 1..read / PAGE_SIZE {
+            let Some(frame) = take_frame_reserved() else { break };
+            // SAFETY: кадр только что выдан, принадлежит нам и виден через
+            // прямое отображение.
+            let bytes = unsafe { core::slice::from_raw_parts_mut(frame_bytes(frame), PAGE_SIZE) };
+            bytes.copy_from_slice(&window[k * PAGE_SIZE..(k + 1) * PAGE_SIZE]);
+            crate::mm::pagecache::keep(file, offset + (k * PAGE_SIZE) as u64, PAGE_SIZE, frame);
+            // Кэш стал владельцем (или страницу уже положил сосед) — свой
+            // владелец снимается.
+            return_frame(frame);
+        }
+        first
+    });
+    let mut pool = AHEAD_BUFFERS.lock();
+    if pool.len() < 8 && pool.try_reserve(1).is_ok() {
+        pool.push(window);
+    }
+    outcome
+}
+
 #[must_use]
 pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     let page_addr = addr & !(PAGE_SIZE - 1);
@@ -5135,6 +5194,16 @@ pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
         // ленивая безымянная память, у которой файла нет вовсе.
         _ if plan.want == 0 => 0,
         None => 0,
+        // Полная чистая страница файла — с упреждающим чтением.
+        Some(node) if cache_file.is_some() && plan.want == PAGE_SIZE => {
+            match read_ahead(node.as_ref(), cache_file.unwrap_or_default(), plan.offset, buffer) {
+                Some(read) => read,
+                None => {
+                    return_frame(frame);
+                    return false;
+                }
+            }
+        }
         Some(node) => match node.read_at(plan.offset, &mut buffer[..plan.want]) {
             Ok(read) => read,
             Err(_) => {

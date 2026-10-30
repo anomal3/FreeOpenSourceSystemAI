@@ -548,6 +548,25 @@ impl SerialDevice for Serial {
         // отправляет его в линию и ничего больше не затрагивает.
         unsafe { outb(base + REG_DATA, byte) };
     }
+
+    fn try_send(&mut self, bytes: &[u8]) -> usize {
+        if !serial_present() {
+            return bytes.len();
+        }
+        let base = self.base;
+        // SAFETY: чтение LSR без побочных эффектов (см. `write_byte`).
+        if unsafe { inb(base + REG_LSR) } & LSR_THR_EMPTY == 0 {
+            return 0;
+        }
+        // FIFO включено при `init`, и «передатчик пуст» значит пусто всё
+        // FIFO — шестнадцать байт ложатся без ожидания.
+        let take = bytes.len().min(16);
+        for &byte in &bytes[..take] {
+            // SAFETY: см. `write_byte`; в пустое FIFO на 16 байт.
+            unsafe { outb(base + REG_DATA, byte) };
+        }
+        take
+    }
 }
 
 /// Разрешить прерывание по приходу байта на COM1.
@@ -635,6 +654,9 @@ pub fn halt() -> ! {
     // SAFETY: возврата из этой функции не предусмотрено, поэтому запрет
     // прерываний ничего не ломает — никакой код после неё не выполнится.
     unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
+    // Тиков больше не будет: очередь линии дописывается сейчас, иначе
+    // последние строки (паника, отказ) остались бы в памяти.
+    crate::serial::drain_and_stop_queue();
     loop {
         // SAFETY: `hlt` при запрещённых прерываниях лишь останавливает конвейер;
         // память и стек не затрагиваются.

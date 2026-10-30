@@ -665,6 +665,26 @@ impl SerialDevice for Serial {
         // этот регистр лежит по нулевому смещению.
         unsafe { self.write(REG_DR, u32::from(byte)) };
     }
+
+    fn try_send(&mut self, bytes: &[u8]) -> usize {
+        let mut sent = 0;
+        while sent < bytes.len() {
+            // SAFETY: чтение регистра состояния не имеет побочных эффектов.
+            let ready = unsafe {
+                match self.kind {
+                    Kind::Pl011 => self.read(REG_FR) & FR_TXFF == 0,
+                    Kind::Ns16550 => self.read(NS16550_LSR) & NS16550_THRE != 0,
+                }
+            };
+            if !ready {
+                break;
+            }
+            // SAFETY: см. `write_byte`.
+            unsafe { self.write(REG_DR, u32::from(bytes[sent])) };
+            sent += 1;
+        }
+        sent
+    }
 }
 
 /// 16550: регистр состояния линии. Регистры разнесены по четыре байта, поэтому
@@ -824,6 +844,9 @@ pub fn halt() -> ! {
     // SAFETY: из функции нет возврата, поэтому маскирование прерываний уже
     // ни на какой последующий код повлиять не может.
     unsafe { asm!("msr daifset, #0b1111", options(nomem, nostack, preserves_flags)) };
+    // Тиков больше не будет: очередь линии дописывается сейчас, иначе
+    // последние строки (паника, отказ) остались бы в памяти.
+    crate::serial::drain_and_stop_queue();
     loop {
         // SAFETY: `wfi` при замаскированных прерываниях просто останавливает
         // ядро; память и стек не затрагиваются.

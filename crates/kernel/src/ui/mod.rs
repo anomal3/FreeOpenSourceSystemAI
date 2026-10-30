@@ -568,6 +568,7 @@ pub fn screen_size() -> (u32, u32) {
 /// прерываний к нему не обращаются вовсе.
 fn with_desktop<R>(action: impl FnOnce(&mut Compositor) -> R) -> Option<R> {
     let mut desktop = DESKTOP.lock().take()?;
+    let _held = Held::start();
     // Вывод, отложенный, пока стол был у другого, — раньше своего действия:
     // иначе строки программы встали бы на экран не в том порядке, в каком она
     // их напечатала.
@@ -592,6 +593,37 @@ fn with_desktop<R>(action: impl FnOnce(&mut Compositor) -> R) -> Option<R> {
         feed_session(&mut desktop, session, &text);
         desktop.present();
     }
+}
+
+/// Самое долгое удержание стола (нс) и кем — задача по имени (фаза 74,
+/// 30.10: «стол замирает, пока открывается программа Linux» — чтобы искать
+/// числом, а не на глаз). Видно в команде `ui`.
+static HELD_WORST_NS: AtomicU64 = AtomicU64::new(0);
+static HELD_WORST_BY: SpinLock<&'static str> = SpinLock::new("");
+/// Дольше всего ввод ждал свободного стола (нс).
+static INPUT_WAIT_WORST_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Засекает удержание стола от взятия до возврата.
+struct Held(u64);
+
+impl Held {
+    fn start() -> Self {
+        Self(crate::time::uptime_ns())
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let spent = crate::time::uptime_ns().saturating_sub(self.0);
+        if HELD_WORST_NS.fetch_max(spent, Ordering::Relaxed) < spent {
+            *HELD_WORST_BY.lock() = crate::sched::current_name();
+        }
+    }
+}
+
+/// Учесть, сколько событие ввода ждало стол.
+fn note_input_wait(ns: u64) {
+    INPUT_WAIT_WORST_NS.fetch_max(ns, Ordering::Relaxed);
 }
 
 /// Вывод в окно оболочки, пришедший, пока стол был вынут другой задачей.
@@ -1367,7 +1399,8 @@ pub fn reset_timing() {
     for counter in [
         &FRAMES, &BANDS, &DRAW_NS, &BLIT_NS, &POINTS, &WALL_NS, &ICONS_NS, &WINDOWS_NS,
         &SHADOW_NS, &TOP_NS, &FULL_FRAMES, &PART_FRAMES, &OVERFLOWS, &PART_RECTS,
-        &RECT_POINTS, &DOCK_BANDS, &DOCK_NS, &WORST_FRAME_NS, &FLUSH_NS,
+        &RECT_POINTS, &DOCK_BANDS, &DOCK_NS, &WORST_FRAME_NS, &FLUSH_NS, &HELD_WORST_NS,
+        &INPUT_WAIT_WORST_NS,
     ] {
         counter.store(0, Ordering::Relaxed);
     }
@@ -1381,7 +1414,7 @@ pub fn reset_timing() {
 /// микросекундах, сборка и вывод порознь (см. `Compositor::compose`), и рядом
 /// худший кадр: среднее прячет именно то, что человек называет лагом.
 #[must_use]
-pub fn timing_lines() -> [alloc::string::String; 5] {
+pub fn timing_lines() -> [alloc::string::String; 6] {
     let (frames, bands, draw_ns, blit_ns, points) = timing();
     let n = frames.max(1);
     let (full, part, overflows, rects) = damage_timing();
@@ -1407,6 +1440,12 @@ pub fn timing_lines() -> [alloc::string::String; 5] {
             windows / n / 1000,
             shadow / n / 1000,
             top / n / 1000,
+        ),
+        alloc::format!(
+            "desktop held at most {} ms by {}, input waited at most {} ms",
+            HELD_WORST_NS.load(Ordering::Relaxed) / 1_000_000,
+            *HELD_WORST_BY.lock(),
+            INPUT_WAIT_WORST_NS.load(Ordering::Relaxed) / 1_000_000,
         ),
     ]
 }
@@ -1495,6 +1534,7 @@ pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
     // [`tick`]. Так бывает всякий раз — за нажатием едет его отпускание, а
     // отпускание окна не перерисовывает.
     let defer = crate::input::has_events();
+    let since = crate::time::uptime_ns();
     for attempt in 0..INPUT_TRIES {
         let answer = with_desktop(|desktop| {
             desktop.set_deferred(defer);
@@ -1506,6 +1546,7 @@ pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
             answer
         });
         if let Some(answer) = answer {
+            note_input_wait(crate::time::uptime_ns().saturating_sub(since));
             return answer;
         }
         // Графики нет вовсе — ждать нечего, событие идёт прямо в оболочку, как
@@ -1738,9 +1779,11 @@ pub fn dispatch_pointer(event: PointerEvent) {
     // после этого приходит исправно, но мимо: в журнале это выглядит как
     // «не нажалась кнопка меню», а не как «потерялось движение мыши».
     let tries = INPUT_TRIES;
+    let since = crate::time::uptime_ns();
 
     for attempt in 0..tries {
         if with_desktop(|desktop| pointer_on(desktop, event, &status)).is_some() {
+            note_input_wait(crate::time::uptime_ns().saturating_sub(since));
             return;
         }
         if !graphics() {

@@ -48,6 +48,19 @@ pub fn take(file: (usize, u64), offset: u64, want: usize) -> Option<PhysAddr> {
     crate::mm::frame::with(|frames| frames.share(frame)).unwrap_or(false).then_some(frame)
 }
 
+/// Есть ли страница в кэше (для упреждающего чтения: читать её незачем).
+#[must_use]
+pub fn has(file: (usize, u64), offset: u64, want: usize) -> bool {
+    CACHE.lock().contains_key(&(file, offset, want))
+}
+
+/// Есть ли у кэша место ещё под `pages` страниц.
+#[must_use]
+pub fn roomy(pages: usize) -> bool {
+    let total = crate::mm::frame::stats().total;
+    CACHE.lock().len() + pages < total / SHARE_OF_MEMORY
+}
+
 /// Положить прочитанную страницу: кэш становится ещё одним владельцем
 /// кадра. Страница уже есть (её прочитал соседний процесс) — не кладётся.
 pub fn keep(file: (usize, u64), offset: u64, want: usize, frame: PhysAddr) {

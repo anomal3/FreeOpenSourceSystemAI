@@ -321,6 +321,13 @@ pub fn lock_watch_task() {
 }
 
 /// Принадлежит ли слот холостой задаче какого-нибудь процессора.
+/// Задача ядра, обслуживающая человека: стол и оболочка (`shell`), сервер
+/// Wayland, драйверы ввода (USB, тачскрин телефона). Им процессор — раньше
+/// общей очереди (см. [`Sched::pick_next`]).
+fn serves_person(name: &str) -> bool {
+    matches!(name, "shell" | "wayland" | "usb" | "ehci" | "ohci" | "touch")
+}
+
 const fn is_idle_slot(slot: usize) -> bool {
     slot < MAX_CPUS
 }
@@ -388,6 +395,23 @@ impl Scheduler {
             }
             if let Some(task) = &self.tasks[slot] {
                 if task.boost && task.state == TaskState::Ready && task.cpu.is_none() {
+                    return Some(slot);
+                }
+            }
+        }
+        // Затем — задачи, которые обслуживают человека (стол, Wayland, ввод),
+        // не только сразу после прерывания: стол, ждущий сам себя через
+        // `sleep_ms`, и Wayland, держащий стол, иначе стояли в общей очереди
+        // за десятками потоков Chromium или Rider — по кванту на каждый, и
+        // стол «замирал» (30.10). Они почти всё время спят, и программам
+        // остаётся всё, что им не нужно.
+        for step in 1..MAX_TASKS {
+            let slot = (current + step) % MAX_TASKS;
+            if is_idle_slot(slot) {
+                continue;
+            }
+            if let Some(task) = &self.tasks[slot] {
+                if task.state == TaskState::Ready && task.cpu.is_none() && serves_person(task.name) {
                     return Some(slot);
                 }
             }
