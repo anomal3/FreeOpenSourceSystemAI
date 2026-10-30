@@ -196,6 +196,9 @@ pub struct Writer {
     /// Операция сорвалась на середине, и память больше не описывает ничего
     /// согласованного. Такая транзакция не доедет до диска.
     broken: bool,
+    /// Группы блоков и занятые отрезки для размещения данных (см.
+    /// [`Writer::allocate_data`]); `None` — построить заново.
+    space: Option<(Vec<Group>, Vec<(u64, u64)>)>,
 }
 
 impl Writer {
@@ -306,6 +309,7 @@ impl Writer {
             next_inode: 0,
             time: 0,
             broken: false,
+            space: None,
         };
         writer.validate()?;
 
@@ -642,6 +646,9 @@ impl Writer {
         }
         disk::check_device(dev)?;
         let generation = self.generation + 1;
+        // Фиксация меняет занятость (освобождённые экстенты, новые узлы):
+        // список для размещения данных строится заново после неё.
+        self.space = None;
 
         if self.tree(objectid::FS_TREE)?.dirty {
             self.broken = true;
@@ -701,6 +708,7 @@ impl Writer {
         let root_index = self.tree_index(objectid::ROOT_TREE)?;
         self.trees[root_index].items = root;
         self.generation = generation;
+        self.space = None;
         Ok(())
     }
 
@@ -1496,16 +1504,32 @@ impl Writer {
     // --- место ----------------------------------------------------------------
 
     /// Отдать под данные до `want` байт подряд.
+    ///
+    /// Группы и занятые отрезки — из [`Writer::space`], а не обходом всего
+    /// дерева экстентов на каждый экстент (так было до 30.10: запись тысяч
+    /// файлов стоила квадрата). Между фиксациями занятость только растёт —
+    /// освобождает `settle_data`, — поэтому отданное просто дописывается.
     fn allocate_data(&mut self, want: u64) -> Result<(u64, u64)> {
         for attempt in 0..2 {
-            let extent = &self.tree(objectid::EXTENT_TREE)?.items;
-            let groups = groups(extent)?;
-            let busy = busy_ranges(extent, self.nodesize)?;
-            if let Some(found) = self.first_free(BLOCK_GROUP_DATA, &groups, &busy, want, true)? {
+            if self.space.is_none() {
+                let extent = &self.tree(objectid::EXTENT_TREE)?.items;
+                self.space = Some((groups(extent)?, busy_ranges(extent, self.nodesize)?));
+            }
+            let found = match &self.space {
+                Some((groups, busy)) => self.first_free(BLOCK_GROUP_DATA, groups, busy, want, true)?,
+                None => None,
+            };
+            if let Some(found) = found {
+                if let Some((_, busy)) = self.space.as_mut() {
+                    let at = busy.partition_point(|&(start, _)| start < found.0);
+                    busy.try_reserve(1).map_err(|_| Error::NoMemory)?;
+                    busy.insert(at, found);
+                }
                 return Ok(found);
             }
             if attempt == 0 {
                 self.allocate_chunk(BLOCK_GROUP_DATA, want)?;
+                self.space = None;
             }
         }
         Err(Error::NoSpace)
