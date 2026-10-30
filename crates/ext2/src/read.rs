@@ -476,6 +476,25 @@ impl Ext2 {
         Ok(done)
     }
 
+    /// Номера блоков файла с `first`-го, `out.len()` штук; 0 — дыра.
+    ///
+    /// Отображение отдельно от чтения нужно ядру: таблицы косвенности
+    /// читаются под замком тома (их меняет редактор), а сами данные — мимо
+    /// него, и `stat` соседнего потока не стоит за ожиданием диска.
+    pub fn blocks(&self, dev: &mut dyn BlockDevice, inode: &Inode, first: u32, out: &mut [u32]) -> Result<()> {
+        if inode.kind != FileType::Regular {
+            return Err(Error::NotADirectory);
+        }
+        let mut cache = Pointers::new();
+        for (k, slot) in out.iter_mut().enumerate() {
+            *slot = self.block_of_cached(dev, inode, first + k as u32, &mut cache)?.unwrap_or(0);
+            if *slot >= self.geometry.blocks {
+                return Err(Error::Corrupt);
+            }
+        }
+        Ok(())
+    }
+
     /// То же, что [`Ext2::block_of`], но с запомненной таблицей косвенности.
     fn block_of_cached(
         &self,

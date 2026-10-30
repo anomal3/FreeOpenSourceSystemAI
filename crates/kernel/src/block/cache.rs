@@ -42,7 +42,7 @@
 //! кэша, пересекающиеся с ней иначе, чем точным совпадением, — поэтому
 //! найденная по точному ключу запись всегда последнее слово о своих секторах.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -119,11 +119,84 @@ pub struct Cached<D> {
     deferred: bool,
     /// Ключи грязных записей (записаны в кэш, но не на носитель).
     dirty: BTreeSet<u64>,
+    /// Номер последней записи ([`Cached::write`]) — для чтения мимо замка.
+    generation: u64,
+    /// Последние [`RECENT`] записей: `(номер, сектор, секторов)`.
+    recent: VecDeque<(u64, u64, u64)>,
 }
+
+/// Сколько последних записей помнить для [`Cached::written_since`].
+const RECENT: usize = 64;
 
 impl<D: disk::BlockDevice> Cached<D> {
     pub fn new(inner: D) -> Self {
-        Self { inner, entries: Vec::new(), index: BTreeMap::new(), hand: 0, deferred: false, dirty: BTreeSet::new() }
+        Self {
+            inner,
+            entries: Vec::new(),
+            index: BTreeMap::new(),
+            hand: 0,
+            deferred: false,
+            dirty: BTreeSet::new(),
+            generation: 0,
+            recent: VecDeque::new(),
+        }
+    }
+
+    /// Номер последней записи: снимается перед чтением мимо замка тома.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Писали ли в `[lba, lba + count)` после записи номер `since`. Журнал
+    /// переполнился (записей было больше [`RECENT`]) — «да»: лучше лишний раз
+    /// перечитать, чем положить в кэш устаревшее.
+    pub fn written_since(&self, since: u64, lba: u64, count: u64) -> bool {
+        if self.generation == since {
+            return false;
+        }
+        if self.recent.front().is_none_or(|(first, _, _)| *first > since + 1) {
+            return true;
+        }
+        self.recent
+            .iter()
+            .any(|(number, at, len)| *number > since && *at < lba + count && lba < at + len)
+    }
+
+    /// Блок в [`MAX_UNIT`] байт из кэша, без обращения к носителю. `false` —
+    /// его нет целиком или рядом грязное другой геометрии (тогда читать надо
+    /// обычным путём).
+    pub fn peek(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+        if buf.len() != MAX_UNIT {
+            return false;
+        }
+        if let Some(&slot) = self.index.get(&lba) {
+            let entry = &mut self.entries[slot];
+            if entry.len == MAX_UNIT {
+                buf.copy_from_slice(entry.bytes());
+                entry.used = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Можно ли читать `[lba, lba + bytes)` (блоки по [`MAX_UNIT`], которых
+    /// нет в кэше) с носителя мимо кэша: грязного другой геометрии рядом нет.
+    /// Грязный блок той же геометрии лежит в кэше и отдаётся [`Cached::peek`].
+    pub fn clean_on_media(&self, lba: u64, bytes: usize) -> bool {
+        !self.dirty_overlaps(lba, self.sectors(bytes), MAX_UNIT)
+    }
+
+    /// Принять прочитанное с носителя мимо замка: блоки по [`MAX_UNIT`],
+    /// только чистыми и только туда, где записи ещё нет.
+    pub fn adopt(&mut self, lba: u64, data: &[u8]) {
+        let unit = self.sectors(MAX_UNIT);
+        for (k, piece) in data.chunks_exact(MAX_UNIT).enumerate() {
+            let key = lba + k as u64 * unit;
+            if !self.index.contains_key(&key) && !self.put(key, piece, false) {
+                break;
+            }
+        }
     }
 
     /// Кэш с отложенной записью.
@@ -458,6 +531,16 @@ impl<D: disk::BlockDevice> disk::BlockDevice for Cached<D> {
 
     fn write(&mut self, lba: u64, buf: &[u8]) -> disk::Result<()> {
         let count = self.sectors(buf.len());
+        self.generation += 1;
+        if self.recent.len() >= RECENT {
+            self.recent.pop_front();
+        }
+        if self.recent.try_reserve(1).is_ok() {
+            self.recent.push_back((self.generation, lba, count));
+        } else {
+            // Не записалось в журнал — пусть журнал считается переполненным.
+            self.recent.clear();
+        }
         // Геометрия записи: один блок до `MAX_UNIT` или ряд блоков по нему.
         let unit_len = if buf.len() <= MAX_UNIT {
             buf.len()

@@ -23,7 +23,46 @@ use crate::block::cache::Cached;
 
 /// Носитель тома: кеш блоков (фаза 68d) поверх счётчика обращений — счётчик
 /// под кешем, и считает он то, что дошло до устройства.
-type Disk = Cached<Counted>;
+type Disk = Cached<Lane>;
+
+/// Устройство тома под своим замком (фаза 74): кэш блоков ходит к нему под
+/// замком тома, а чтение данных файла — мимо замка тома
+/// ([`Ext2Node::read_at`]), чтобы `stat` и `open` соседей не ждали диска.
+/// Порядок замков прежний: том, потом устройство.
+#[derive(Clone)]
+struct Lane(Arc<Mutex<Counted>>);
+
+impl Lane {
+    fn requests(&self) -> u64 {
+        self.0.lock().requests()
+    }
+}
+
+impl disk::BlockDevice for Lane {
+    fn sector_size(&self) -> u32 {
+        self.0.lock().sector_size()
+    }
+
+    fn sector_count(&self) -> u64 {
+        self.0.lock().sector_count()
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.0.lock().is_read_only()
+    }
+
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> disk::Result<()> {
+        self.0.lock().read(lba, buf)
+    }
+
+    fn write(&mut self, lba: u64, buf: &[u8]) -> disk::Result<()> {
+        self.0.lock().write(lba, buf)
+    }
+
+    fn flush(&mut self) -> disk::Result<()> {
+        self.0.lock().flush()
+    }
+}
 use disk::BlockDevice as _;
 use crate::sync::Mutex;
 use crate::vfs::{DirEntry, FileSystem, Metadata, Node, NodeKind, VfsError, VfsResult};
@@ -64,6 +103,8 @@ pub struct Ext2Fs {
     /// поэтому устаревшее в него не попадает: правка и её отметка в кэше —
     /// одно действие под одним замком.
     meta: crate::sync::SpinLock<Meta>,
+    /// То же устройство, что под кэшем в `inner`, — для чтения мимо замка тома.
+    lane: Lane,
 }
 
 /// Сколько имён и inode помнить, прежде чем начать заново.
@@ -196,7 +237,8 @@ impl Ext2Fs {
         first_lba: u64,
         writable: bool,
     ) -> VfsResult<Ext2Mount> {
-        let mut disk = Cached::deferred(Counted::new(device));
+        let lane = Lane(Arc::new(Mutex::new(Counted::new(device))));
+        let mut disk = Cached::deferred(lane.clone());
         let fs = ext2::Ext2::mount(&mut disk, first_lba).map_err(convert)?;
         // На томе только для чтения редактор не открывается вовсе — и не
         // только потому, что писать не собираемся: само открытие помечает том
@@ -214,6 +256,7 @@ impl Ext2Fs {
         Ok(Ext2Mount(Arc::new(Self {
             inner: Mutex::new(Inner { disk, fs, editor, marked_clean: false }),
             meta: crate::sync::SpinLock::new(Meta::default()),
+            lane,
         })))
     }
 
@@ -509,20 +552,23 @@ impl Node for Ext2Node {
             return Err(VfsError::WrongKind);
         }
         let inode = self.fs.inode(self.inode.number)?;
+        if offset >= inode.size {
+            return Ok(0);
+        }
+        let want = buf.len().min(usize::try_from(inode.size - offset).unwrap_or(usize::MAX));
         // Через буфер ядра: под замком тома память программы не трогается.
         // `buf` у `read` — её память, и копирование в неё может отказать
         // страницей; обработчику нужен замок процесса, а его держит, скажем,
         // `munmap` файла `MAP_SHARED`, который сбрасывает страницы и ждёт
         // этот же замок тома — взаимная блокировка (Rider, 29.10).
-        let mut bounce = bounce_buffer(buf.len())?;
+        let mut bounce = bounce_buffer(want)?;
         let mut done = 0;
-        while done < buf.len() {
-            let take = (buf.len() - done).min(bounce.len());
-            let got = {
-                let mut guard = self.fs.inner.lock();
-                let Inner { disk, fs, .. } = &mut *guard;
-                fs.read_at(disk, &inode, offset + done as u64, &mut bounce[..take]).map_err(convert)?
-            };
+        while done < want {
+            let at = offset + done as u64;
+            // Кусок, чьи блоки целиком помещаются в буфер.
+            let within = (at % BLOCK as u64) as usize;
+            let take = (want - done).min(bounce.len() - within);
+            let got = self.read_piece(&inode, at, take, &mut bounce)?;
             buf[done..done + got].copy_from_slice(&bounce[..got]);
             done += got;
             if got < take {
@@ -719,7 +765,88 @@ fn bounce_buffer(_len: usize) -> VfsResult<Bounce> {
     Ok(Bounce(bounce))
 }
 
+/// Блок тома, который читается мимо замка (у других — только под замком).
+const BLOCK: usize = 4096;
+
 impl Ext2Node {
+    /// Прочитать `take` байт файла с `at` в начало `bounce`; `at % BLOCK +
+    /// take` не больше длины `bounce`.
+    ///
+    /// Фаза 74: ожидание диска — вне замка тома. Под замком — только
+    /// отображение блоков (таблицы косвенности почти всегда в кэше) и то,
+    /// что уже лежит в кэше блоков; пропуски читаются с устройства без замка
+    /// тома, и прочитанное ложится в кэш, только если в эти секторы за это
+    /// время никто не писал. Писали — кусок перечитывается обычным путём под
+    /// замком: данные чтения, начатого до записи, ещё годны, а кэшу нужна
+    /// верность навсегда.
+    fn read_piece(&self, inode: &ext2::Inode, at: u64, take: usize, bounce: &mut [u8]) -> VfsResult<usize> {
+        let locked = |guard: &mut Inner, bounce: &mut [u8]| {
+            let Inner { disk, fs, .. } = guard;
+            fs.read_at(disk, inode, at, &mut bounce[..take]).map_err(convert)
+        };
+        let within = (at % BLOCK as u64) as usize;
+        let count = (within + take).div_ceil(BLOCK);
+        let first = u32::try_from(at / BLOCK as u64).map_err(|_| VfsError::Unsupported)?;
+        // Отрезки пропусков: (первый блок куска, блоков, сектор).
+        let mut runs: Vec<(usize, usize, u64)> = Vec::new();
+        let since = {
+            let mut guard = self.fs.inner.lock();
+            if guard.fs.geometry().block_size.bytes() as usize != BLOCK || count * BLOCK > bounce.len() {
+                return locked(&mut guard, bounce);
+            }
+            let Inner { disk, fs, .. } = &mut *guard;
+            let mut map = [0u32; BOUNCE / BLOCK];
+            fs.blocks(disk, inode, first, &mut map[..count]).map_err(convert)?;
+            let geometry = fs.geometry();
+            for k in 0..count {
+                let slice = &mut bounce[k * BLOCK..(k + 1) * BLOCK];
+                if map[k] == 0 {
+                    slice.fill(0);
+                    continue;
+                }
+                let lba = geometry.block_lba(map[k]);
+                if disk.peek(lba, slice) {
+                    continue;
+                }
+                match runs.last_mut() {
+                    Some((start, len, _)) if *start + *len == k && map[k] == map[*start] + *len as u32 => *len += 1,
+                    _ => {
+                        if runs.try_reserve(1).is_err() {
+                            return locked(&mut guard, bounce);
+                        }
+                        runs.push((k, 1, lba));
+                    }
+                }
+            }
+            if runs.is_empty() {
+                bounce.copy_within(within..within + take, 0);
+                return Ok(take);
+            }
+            if runs.iter().any(|&(_, len, lba)| !disk.clean_on_media(lba, len * BLOCK)) {
+                return locked(&mut guard, bounce);
+            }
+            disk.generation()
+        };
+        let mut lane = self.fs.lane.clone();
+        for &(start, len, lba) in &runs {
+            lane.read(lba, &mut bounce[start * BLOCK..(start + len) * BLOCK]).map_err(|_| VfsError::Io)?;
+        }
+        let mut guard = self.fs.inner.lock();
+        let sector = u64::from(guard.disk.sector_size().max(1));
+        let stale = runs
+            .iter()
+            .any(|&(_, len, lba)| guard.disk.written_since(since, lba, (len * BLOCK) as u64 / sector));
+        if stale {
+            return locked(&mut guard, bounce);
+        }
+        for &(start, len, lba) in &runs {
+            guard.disk.adopt(lba, &bounce[start * BLOCK..(start + len) * BLOCK]);
+        }
+        drop(guard);
+        bounce.copy_within(within..within + take, 0);
+        Ok(take)
+    }
+
     /// Ключ файла в кэше страниц: том и номер inode.
     fn key(&self) -> (usize, u64) {
         (Arc::as_ptr(&self.fs) as *const () as usize, u64::from(self.inode.number))
