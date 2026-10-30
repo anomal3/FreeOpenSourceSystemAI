@@ -31,7 +31,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::java::{Item, RIDER_TOP, rider_archive, stream_tar};
+use crate::java::{Item, RIDER_TOP, cached_download, rider_archive, stream_tar};
 
 /// Номер сборки — метка в `/opt/rider/fossai/placed`: тот же Rider второй раз
 /// не раскладывается.
@@ -64,6 +64,13 @@ const SKIP: [&str; 14] = [
     "lib/ReSharperHost/runtimes/linux-musl",
 ];
 
+/// .NET SDK для сборки проектов из Rider (у Rider только среда исполнения, а
+/// его кнопка «Install» качает SDK через `curl`, которого в системе нет).
+/// SHA-512 Microsoft (`releases.json` 10.0) сверен вручную; здесь — SHA-256
+/// того же архива: стенд умеет только его.
+const DOTNET_SDK_URL: &str = "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.403/dotnet-sdk-10.0.403-linux-x64.tar.gz";
+const DOTNET_SDK_SHA256: &str = "cd7224fe8e8ba57c15f1601439ff8785a1a72b54ae5c89dd5302a32dcfbddf18";
+
 /// Каталоги пропущенных плагинов: кладутся с файлом-пометкой.
 const SKIPPED_PLUGINS: [&str; 3] = ["plugins/cidr-debugger-plugin", "plugins/fullLine", "plugins/jcef-plugin"];
 
@@ -80,6 +87,20 @@ const MANIFEST: &str = "# FossAi package manifest\n\
     desktop=yes\n\
     icon=/opt/rider/fossai/icon.fimg\n\
     permissions=windows files net jit\n";
+
+/// Запись реестра для .NET SDK в `/opt/dotnet`: без неё у `dotnet` нет права
+/// `jit`, и его JIT падает на первой странице «запись+исполнение» (Rider
+/// создаёт проекты и собирает их этим `dotnet`).
+const DOTNET_MANIFEST: &str = "# FossAi package manifest\n\
+    name=dotnet\n\
+    version=10.0.403\n\
+    kind=package\n\
+    requires=debian\n\
+    summary=.NET SDK 10.0.403 for Linux, placed by the bench next to Rider\n\
+    about=.NET SDK: сборка проектов C# для Rider\n\
+    caption=.NET SDK\n\
+    desktop=no\n\
+    permissions=files net jit\n";
 
 /// Параметры Java-машины Rider: его собственные плюс окна через Wayland, без
 /// окна согласия на сбор данных при первом запуске и с кучей поменьше — у
@@ -107,8 +128,20 @@ const SCRIPT: &str = "#!/bin/bash\n\
     # Куча .NET не больше 4 ГиБ: иначе сборщик мусора резервирует сотни\n\
     # гигабайт адресов разом — больше окна программы, и .NET падает «Out of memory».\n\
     export DOTNET_GCHeapHardLimit=0x100000000\n\
+    # Сервер диагностики .NET (сокет для dotnet-trace и профилировщиков) у\n\
+    # нас не поднимается и крутит poll на несвязанном сокете — выключен.\n\
+    export DOTNET_EnableDiagnostics=0\n\
     # Ссылки (вход в аккаунт JetBrains) — в браузер по умолчанию: xdg-open корня Debian.\n\
     export BROWSER=/usr/bin/xdg-open\n\
+    # .NET SDK для сборки проектов (стенд кладёт его в /opt/dotnet).\n\
+    export DOTNET_ROOT=/opt/dotnet\n\
+    export PATH=/opt/dotnet:$PATH\n\
+    export DOTNET_CLI_TELEMETRY_OPTOUT=1\n\
+    export DOTNET_NOLOGO=1\n\
+    # Первый запуск dotnet — настройка NuGet и кэш шаблонов, на стенде это\n\
+    # десятки секунд; Rider ждёт шаблоны 30 секунд и сдаётся (Unable to\n\
+    # expand project template). Пока поднимается Rider — прогреть в фоне.\n\
+    if [ ! -d \"$HOME/.templateengine\" ]; then (dotnet new list >/dev/null 2>&1 &); fi\n\
     export RIDER_VM_OPTIONS=/opt/rider/fossai/rider64.vmoptions\n\
     exec /opt/rider/bin/rider \"$@\"\n";
 
@@ -191,6 +224,25 @@ pub fn place(disk_path: &Path) -> Result<()> {
     };
     write(&mut fs, &mut dev, "opt/rider/fossai/rider64.vmoptions", &options, 0o644)?;
     write(&mut fs, &mut dev, "opt/rider/fossai/rider", SCRIPT.as_bytes(), 0o755)?;
+    // .NET SDK — в /opt/dotnet.
+    let sdk_archive = cached_download(DOTNET_SDK_URL, DOTNET_SDK_SHA256)?;
+    let (mut sdk_files, mut sdk_failure) = (0usize, None::<anyhow::Error>);
+    stream_tar(&sdk_archive, |path| !path.is_empty(), |path, item| {
+        if sdk_failure.is_some() {
+            return;
+        }
+        if let Item::File { data, mode } = item {
+            let place = format!("opt/dotnet/{path}");
+            sdk_files += 1;
+            if let Err(err) = fs.write_file_path(&mut dev, &place, &data, (mode & 0o7777) as u16, 0, 0) {
+                sdk_failure = Some(anyhow::anyhow!("не удалось записать /{place}: {err}"));
+            }
+        }
+    })?;
+    if let Some(err) = sdk_failure {
+        return Err(err);
+    }
+    say!("стенд: .NET SDK 10.0.403 — {sdk_files} файлов в /opt/dotnet");
     for plugin in SKIPPED_PLUGINS {
         let place = format!("opt/rider/{plugin}/FOSSAI-SKIPPED");
         write(&mut fs, &mut dev, &place, b"not placed by the FossAi bench: no room on the bench disk\n", 0o644)?;
@@ -202,8 +254,10 @@ pub fn place(disk_path: &Path) -> Result<()> {
     write(&mut fs, &mut dev, "opt/rider/fossai/icon.fimg", &icon, 0o644)?;
     if let Some(parent) = lookup_path(&mut fs, &mut dev, "var/lib/pkg")? {
         let _ = fs.unlink(&mut dev, parent, "rider.pkg");
+        let _ = fs.unlink(&mut dev, parent, "dotnet.pkg");
     }
     write(&mut fs, &mut dev, "var/lib/pkg/rider.pkg", MANIFEST.as_bytes(), 0o644)?;
+    write(&mut fs, &mut dev, "var/lib/pkg/dotnet.pkg", DOTNET_MANIFEST.as_bytes(), 0o644)?;
     write(&mut fs, &mut dev, "opt/rider/fossai/placed", BUILD.as_bytes(), 0o644)?;
 
     fs.flush_everywhere(&mut dev)

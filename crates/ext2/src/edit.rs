@@ -360,7 +360,11 @@ impl Editor {
         if self.lookup(dev, new_parent, new_name)?.is_some() {
             return Err(Error::Exists);
         }
-        if kind == DIR_TYPE_DIRECTORY && old_parent != new_parent {
+        // Каталог в другого родителя (фаза 74: .NET создаёт свои каталоги
+        // `mkdtemp` + `rename` в соседний каталог). Нельзя только внутрь себя
+        // самого: дерево стало бы петлёй, оторванной от корня.
+        let moves_directory = kind == DIR_TYPE_DIRECTORY && old_parent != new_parent;
+        if moves_directory && self.is_within(dev, new_parent, number)? {
             return Err(Error::Unsupported);
         }
         // Переименование в себя же — не работа, но и не ошибка: спрашивающий
@@ -372,10 +376,58 @@ impl Editor {
         self.mark_dirty(dev)?;
         self.add_entry(dev, new_parent, new_name, number, kind)?;
         self.remove_entry(dev, old_parent, old_name)?;
-        // Счётчик ссылок не трогается: имя переехало, а не удвоилось. Каталог
-        // при этом остаётся в том же родителе (проверено выше), поэтому «..» и
-        // ссылки родителей тоже неизменны.
+        // Счётчик ссылок самого inode не трогается: имя переехало, а не
+        // удвоилось. У переехавшего каталога «..» теперь ведёт к новому
+        // родителю, и ссылка этой «..» переходит от старого к новому.
+        if moves_directory {
+            self.set_dotdot(dev, number, new_parent)?;
+            self.bump_links(dev, new_parent, 1)?;
+            self.bump_links(dev, old_parent, -1)?;
+        }
         Ok(())
+    }
+
+    /// Лежит ли каталог `dir` внутри `ancestor` (или это он сам) — по цепочке
+    /// «..» до корня.
+    fn is_within(&mut self, dev: &mut dyn BlockDevice, mut dir: u32, ancestor: u32) -> Result<bool> {
+        // Глубже не бывает: цепочка длиннее — испорченный том с петлёй.
+        for _ in 0..4096 {
+            if dir == ancestor {
+                return Ok(true);
+            }
+            if dir == ROOT_INODE {
+                return Ok(false);
+            }
+            match self.lookup(dev, dir, "..")? {
+                Some((parent, _)) if parent != dir => dir = parent,
+                _ => return Ok(false),
+            }
+        }
+        Err(Error::Corrupt)
+    }
+
+    /// Переписать запись «..» каталога `dir` на `parent`.
+    fn set_dotdot(&mut self, dev: &mut dyn BlockDevice, dir: u32, parent: u32) -> Result<()> {
+        let inode = self.read_inode(dev, dir)?;
+        let block = self.directory_block(dev, &inode, 0)?;
+        if block == 0 {
+            return Err(Error::Corrupt);
+        }
+        let mut buf = self.read_block(dev, block)?;
+        let mut at = 0usize;
+        while at + 8 <= buf.len() {
+            let rec_len = u16_at(&buf, at + 4) as usize;
+            if rec_len < 8 || at + rec_len > buf.len() {
+                return Err(Error::Corrupt);
+            }
+            let name_len = buf[at + 6] as usize;
+            if u32_at(&buf, at) != 0 && name_len == 2 && buf.get(at + 8..at + 10) == Some(b"..") {
+                put_u32(&mut buf, at, parent);
+                return self.write_block(dev, block, &buf);
+            }
+            at += rec_len;
+        }
+        Err(Error::Corrupt)
     }
 
     /// Есть ли в каталоге что-нибудь, кроме «.» и «..».

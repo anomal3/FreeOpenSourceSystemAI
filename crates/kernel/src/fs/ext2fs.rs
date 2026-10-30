@@ -493,6 +493,10 @@ impl Node for Ext2Node {
         (self.inode.kind == ext2::FileType::Regular).then(|| self.key())
     }
 
+    fn file_id(&self) -> Option<(usize, u64)> {
+        Some(self.key())
+    }
+
     fn metadata(&self) -> Metadata {
         match self.fs.inode(self.inode.number) {
             Ok(inode) => metadata_of(&inode),

@@ -180,6 +180,13 @@ impl Reader {
     pub fn hangup(&self) -> bool {
         self.pipe.inner.lock().writers == 0
     }
+
+    /// `(адрес, читателей, писателей)` — для журнала.
+    #[must_use]
+    pub fn state(&self) -> (usize, usize, usize) {
+        let inner = self.pipe.inner.lock();
+        (channel(&self.pipe), inner.readers, inner.writers)
+    }
 }
 
 impl Clone for Reader {
@@ -260,6 +267,13 @@ impl Writer {
     #[must_use]
     pub fn hangup(&self) -> bool {
         self.pipe.inner.lock().readers == 0
+    }
+
+    /// `(адрес, читателей, писателей)` — для журнала.
+    #[must_use]
+    pub fn state(&self) -> (usize, usize, usize) {
+        let inner = self.pipe.inner.lock();
+        (channel(&self.pipe), inner.readers, inner.writers)
     }
 }
 

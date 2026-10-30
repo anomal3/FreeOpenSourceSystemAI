@@ -6,6 +6,7 @@ use crate::user::space;
 
 const POLLIN: u16 = 0x1;
 const POLLOUT: u16 = 0x4;
+const POLLERR: u16 = 0x8;
 const POLLHUP: u16 = 0x10;
 const POLLNVAL: u16 = 0x20;
 
@@ -59,15 +60,24 @@ fn wait(fds: usize, count: usize, deadline: Option<u64>) -> i64 {
                     wanted |= user_abi::POLL_OUT;
                 }
                 let got = crate::user::syscall::readiness_of(fd as usize, wanted);
+                // Как у Linux: `POLLIN`/`POLLOUT` — только если о них
+                // просили; `POLLHUP`/`POLLERR`/`POLLNVAL` — всегда. И если ждут
+                // записи, а собеседника нет (канал без читателя), — `POLLERR`:
+                // иначе программа, ждущая только `POLLOUT`, получала `POLLIN |
+                // POLLHUP`, не видела ни того, ни ошибки и опрашивала снова —
+                // миллионы раз в секунду (.NET Rider, фаза 74).
                 let mut revents = 0;
-                if got & user_abi::POLL_IN != 0 {
+                if got & user_abi::POLL_IN != 0 && events & POLLIN != 0 {
                     revents |= POLLIN;
                 }
-                if got & user_abi::POLL_OUT != 0 {
+                if got & user_abi::POLL_OUT != 0 && events & POLLOUT != 0 {
                     revents |= POLLOUT;
                 }
                 if got & user_abi::POLL_HUP != 0 {
                     revents |= POLLHUP;
+                    if events & POLLOUT != 0 && events & POLLIN == 0 {
+                        revents |= POLLERR;
+                    }
                 }
                 if got & user_abi::POLL_BAD != 0 {
                     revents |= POLLNVAL;
@@ -78,6 +88,11 @@ fn wait(fds: usize, count: usize, deadline: Option<u64>) -> i64 {
             unsafe { core::ptr::write_unaligned((at + 6) as *mut u16, revents) };
             if revents != 0 {
                 ready += 1;
+                let pid = u64::from(crate::user::with_current(|program| program.linux_pid).unwrap_or(0));
+                super::profile::POLL_LAST.store(
+                    pid << 48 | (fd as u64 & 0xffff) << 32 | u64::from(events) << 16 | u64::from(revents),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
             }
         }
         if ready > 0 {

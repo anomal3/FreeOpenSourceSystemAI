@@ -232,6 +232,11 @@ fn text(path: &str) -> Option<String> {
                 kib(frames.free)
             ))
         }
+        // Учётные записи в формате Linux (фаза 74). Свой `/etc/passwd`
+        // системы — другого формата, с отпечатками паролей и правами `0640`:
+        // `getpwuid` glibc получал `EACCES`, и .NET (`dotnet new`) крутил
+        // попытки узнать домашний каталог. Здесь — без отпечатков, для всех.
+        "/etc/passwd" | "/etc/group" => Some(accounts_text(path == "/etc/group")),
         "/proc/version" => Some(String::from("Linux version 6.1.0-fossai (FossAi) #1 SMP\n")),
         "/proc/sys/kernel/osrelease" => Some(String::from("6.1.0-fossai\n")),
         "/sys/devices/system/cpu/online" | "/sys/devices/system/cpu/possible" | "/sys/devices/system/cpu/present" => {
@@ -239,6 +244,34 @@ fn text(path: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `/etc/passwd` (или `/etc/group`) Linux из учётных записей системы: `root`
+/// и записи `/etc/passwd` системы (`имя:uid:gid:права:дом:…`).
+fn accounts_text(group: bool) -> String {
+    let mut out = if group { String::from("root:x:0:\n") } else { String::from("root:x:0:0:root:/root:/bin/sh\n") };
+    let Some((bytes, _)) = crate::config::read("passwd", 8 * 1024) else {
+        return out;
+    };
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        return out;
+    };
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let fields: Vec<&str> = line.split(':').collect();
+        let (Some(name), Some(uid), Some(gid)) = (fields.first(), fields.get(1), fields.get(2)) else {
+            continue;
+        };
+        if name.is_empty() || *name == "root" || uid.parse::<u32>().is_err() || gid.parse::<u32>().is_err() {
+            continue;
+        }
+        let home = fields.get(4).copied().filter(|home| home.starts_with('/')).unwrap_or("/");
+        if group {
+            out.push_str(&format!("{name}:x:{gid}:\n"));
+        } else {
+            out.push_str(&format!("{name}:x:{uid}:{gid}:{name}:{home}:/bin/sh\n"));
+        }
+    }
+    out
 }
 
 fn program_cred(program: &crate::user::Program) -> (u32, u32) {

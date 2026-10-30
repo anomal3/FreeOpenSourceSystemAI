@@ -34,7 +34,7 @@ use user_abi::{
 
 mod poll;
 mod fsops;
-mod ipc;
+pub(crate) mod ipc;
 mod links;
 pub mod recent;
 mod net;
@@ -105,6 +105,7 @@ mod nr {
     pub const DUP: usize = 32;
     pub const DUP2: usize = 33;
     pub const WAIT4: usize = 61;
+    pub const WAITID: usize = 247;
     pub const KILL: usize = 62;
     pub const FCNTL: usize = 72;
     pub const GETCWD: usize = 79;
@@ -332,10 +333,12 @@ pub unsafe fn syscall(frame: &mut crate::arch::TrapFrame) {
     }
     let args = [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9].map(|value| value as usize);
     let started = crate::time::uptime_ns();
+    recent::begin(number, &args);
     // SAFETY: контракт функции.
     let result = unsafe { dispatch(number, args, frame) };
     profile::count(number, crate::time::uptime_ns().saturating_sub(started));
     recent::record(number, args, result);
+    recent::begin(usize::MAX, &args);
     frame.rax = result as u64;
     // Пришедшие сигналы доставляются на выходе из вызова (фаза 71c).
     signal::deliver(frame);
@@ -457,6 +460,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::DUP2 => dup3(a0, a1, 0, true),
             nr::DUP3 => dup3(a0, a1, a2, false),
             nr::WAIT4 => process::wait4(a0, a1, a2, a3),
+            nr::WAITID => process::waitid(a0, a1, a2, a3, a4),
             nr::FORK => thread::clone(frame, SIGCHLD, 0, 0, 0, 0),
             nr::VFORK => thread::clone(frame, CLONE_VM | CLONE_VFORK | SIGCHLD, 0, 0, 0, 0),
             nr::EXECVE => process::execve(frame, a0, a1, a2),
@@ -801,6 +805,11 @@ fn open_at(dir: usize, ptr: usize, flags: usize) -> i64 {
     if flags & O_CLOEXEC != 0 {
         crate::user::with_current(|program| program.files.set_cloexec(fd, true));
     }
+    // `O_APPEND` (фаза 74): запись — в конец файла.
+    const O_APPEND: usize = 0o2000;
+    if flags & O_APPEND != 0 {
+        crate::user::with_current(|program| program.files.set_append(fd, true));
+    }
     if directory {
         crate::user::with_current(|program| {
             program.linux_dirs.retain(|(other, _)| *other != fd);
@@ -879,6 +888,14 @@ fn ino_of(path: &str) -> u64 {
     hash
 }
 
+/// Номер узла по самому файлу (фаза 74): номер inode и том в старших битах.
+/// Один и тот же у `stat` по пути и у `fstat` открытого — по нему `rm -rf`
+/// и `ls -R` (fts) проверяют, что спустились в тот каталог, который видели.
+fn ino_of_node(node: &dyn crate::vfs::Node) -> Option<u64> {
+    let (volume, number) = node.file_id()?;
+    Some((((volume >> 4) as u64 & 0xffff) << 32) | number)
+}
+
 /// `stat` (`follow`) и `lstat` по пути.
 fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
     let linux = match linux_path(dir, ptr) {
@@ -940,7 +957,8 @@ fn stat_path(dir: usize, ptr: usize, out: usize, follow: bool) -> i64 {
         NodeKind::Directory => S_IFDIR,
         NodeKind::File => S_IFREG,
     };
-    put_stat(out, kind, meta.mode, meta.uid, meta.gid, meta.size, meta.mtime, ino_of(&path))
+    let ino = ino_of_node(&*node).unwrap_or_else(|| ino_of(&path));
+    put_stat(out, kind, meta.mode, meta.uid, meta.gid, meta.size, meta.mtime, ino)
 }
 
 fn fstat(fd: usize, out: usize) -> i64 {
@@ -982,12 +1000,13 @@ fn fstat(fd: usize, out: usize) -> i64 {
             // дескриптора: `ld.so` узнаёт уже загруженную библиотеку по паре
             // (dev, ino), и `libc.so.6`, открытая под тем же номером 3, что до
             // неё `libselinux.so.1`, сошла бы за неё (первый прогон `ls`, 71b).
-            let ino = match crate::user::with_current(|program| program.files.node(fd)) {
+            let ino = match crate::user::with_current(|program| program.files.file_or_dir(fd)) {
                 // Разделяемая память — по самому объекту памяти (фаза 71h):
                 // Chromium открывает `/dev/shm/имя` дважды и сверяет номера.
+                // Файл и каталог тома — по номеру inode, как `stat` по пути.
                 Some(Ok(node)) => match node.shared_memory() {
                     Some(mem) => alloc::sync::Arc::as_ptr(&mem) as usize as u64,
-                    None => alloc::sync::Arc::as_ptr(&node) as *const () as usize as u64,
+                    None => ino_of_node(&*node).unwrap_or(alloc::sync::Arc::as_ptr(&node) as *const () as usize as u64),
                 },
                 _ => 0x1000 + fd as u64,
             };
@@ -1225,7 +1244,8 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
                 files.cloexec(fd)?;
                 let nonblock = files.describe(fd).is_ok_and(|info| info.kind == FdKind::Pipe) && files.nonblock(fd)?;
                 let access = files.access_mode(fd)? as i64;
-                Ok(if nonblock { access | O_NONBLOCK as i64 } else { access })
+                let append = if files.append(fd) { 0o2000 } else { 0 };
+                Ok(if nonblock { access | O_NONBLOCK as i64 | append } else { access | append })
             }
             // Печати `memfd`: принимаются и не держатся — запрет, которого
             // никто не нарушает, ничего не стоит не проверять.
@@ -1249,6 +1269,7 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
             F_SETFL => {
                 files.cloexec(fd)?;
                 files.set_nonblock(fd, arg & O_NONBLOCK != 0)?;
+                files.set_append(fd, arg & 0o2000 != 0)?;
                 Ok(0)
             }
             _ => Ok(-e::EINVAL),
@@ -1722,6 +1743,12 @@ unsafe fn futex(addr: usize, op: usize, value: usize, timeout: usize, addr2: usi
                 })
             };
             loop {
+                // Сигнал, пришедший, пока поток был вне ядра, доставляется на
+                // выходе из вызова — а ожидание без срока до выхода не дойдёт
+                // никогда (фаза 74: `SIGCHLD` .NET). Как у Linux — `EINTR`.
+                if signal::pending() {
+                    return -e::EINTR;
+                }
                 let ms = match deadline {
                     None => 0,
                     Some(at) => {
@@ -1970,9 +1997,8 @@ fn unlink(dir: usize, ptr: usize) -> i64 {
     if let Some(answer) = ipc::unlink_shm(&linux) {
         return answer;
     }
-    if ipc::unlink_socket(&linux) {
-        return 0;
-    }
+    // Имя сокета освобождается, и его файл (фаза 74) стирается ниже.
+    let socket = ipc::unlink_socket(&linux);
     if links::remove(&linux) {
         return 0;
     }
@@ -1980,6 +2006,7 @@ fn unlink(dir: usize, ptr: usize) -> i64 {
     let path = crate::linux_path::resolve(&linux, cred);
     match crate::fs::remove_as(cred, &path) {
         Some(Ok(())) => 0,
+        _ if socket => 0,
         Some(Err(err)) => vfs_errno(err),
         None => -e::ENOENT,
     }

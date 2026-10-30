@@ -255,6 +255,14 @@ pub trait Node: Send + Sync {
         None
     }
 
+    /// Постоянное имя файла **или каталога**: том и номер на нём (фаза 74,
+    /// `st_ino` программ Linux — один и тот же у `stat` по пути и у `fstat`
+    /// открытого, иначе `rm -rf` и `ls -R` считают каталог подменённым).
+    /// `None` — постоянного номера нет.
+    fn file_id(&self) -> Option<(usize, u64)> {
+        None
+    }
+
     fn shared_memory(&self) -> Option<alloc::sync::Arc<crate::user::shm::SharedMem>> {
         None
     }

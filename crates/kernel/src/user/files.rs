@@ -79,6 +79,10 @@ struct Open {
     /// квадратичность: иначе каждая запись стоила бы полного перечисления, а
     /// каждое перечисление — чтения inode на каждое имя.
     entries: Option<Vec<DirEntry>>,
+    /// `O_APPEND` Linux (фаза 74): каждая запись — в конец файла, какой бы ни
+    /// была позиция. Без него журналы, дописываемые от запуска к запуску
+    /// (`idea.log` Rider), писались с начала и затирали сами себя.
+    append: AtomicBool,
 }
 
 /// Что лежит в месте таблицы.
@@ -156,7 +160,7 @@ impl Handle {
     /// (`SCM_RIGHTS`; раскладка клавиатуры Wayland, фаза 71i).
     #[must_use]
     pub fn of_node(node: Arc<dyn Node>, writable: bool) -> Self {
-        Self(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None })))
+        Self(Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries: None, append: AtomicBool::new(false) })))
     }
 }
 
@@ -502,6 +506,7 @@ impl Table {
             offset: AtomicU64::new(0),
             writable,
             entries,
+            append: AtomicBool::new(false),
         })));
         Ok(fd)
     }
@@ -513,7 +518,7 @@ impl Table {
         // Каталог в памяти (`/proc`, фаза 71h) — со снимком имён, как у
         // открытого с диска.
         let entries = if node.metadata().kind == NodeKind::Directory { node.list().ok() } else { None };
-        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries })));
+        self.put(fd, Slot::File(Arc::new(Open { node, offset: AtomicU64::new(0), writable, entries, append: AtomicBool::new(false) })));
         Ok(fd)
     }
 
@@ -542,6 +547,7 @@ impl Table {
             offset: AtomicU64::new(0),
             writable: true,
             entries: None,
+            append: AtomicBool::new(false),
         })));
         Ok(fd)
     }
@@ -553,7 +559,11 @@ impl Table {
                 if !open.writable {
                     return Err(FileError::Vfs(VfsError::PermissionDenied));
                 }
-                let at = open.offset.load(Ordering::Relaxed);
+                let at = if open.append.load(Ordering::Relaxed) {
+                    open.node.metadata().size
+                } else {
+                    open.offset.load(Ordering::Relaxed)
+                };
                 let written = open.node.write_at(at, data).map_err(FileError::Vfs)?;
                 open.offset.store(at + written as u64, Ordering::Relaxed);
                 Ok(written)
@@ -568,6 +578,23 @@ impl Table {
             // Стандартный поток пишется прежним путём (`std_target`).
             Slot::PipeRead(..) | Slot::Socket(_) | Slot::Std(_) | Slot::Object(..) => Err(FileError::Vfs(VfsError::PermissionDenied)),
         }
+    }
+
+    /// Поставить или снять `O_APPEND` у открытого файла (фаза 74).
+    pub fn set_append(&self, fd: usize, on: bool) -> Result<(), FileError> {
+        match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
+            Slot::File(open) => {
+                open.append.store(on, Ordering::Relaxed);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Стоит ли `O_APPEND` (для `F_GETFL`).
+    #[must_use]
+    pub fn append(&self, fd: usize) -> bool {
+        matches!(self.cell(fd), Ok(Some(Slot::File(open))) if open.append.load(Ordering::Relaxed))
     }
 
     /// Взять очередную запись каталога. `None` — записи кончились.
@@ -610,6 +637,16 @@ impl Table {
             Some(Slot::PipeRead(..) | Slot::PipeWrite(..) | Slot::Socket(_) | Slot::Std(_) | Slot::Object(..)) => {
                 Err(FileError::Vfs(VfsError::WrongKind))
             }
+            None => Err(FileError::BadFd),
+        }
+    }
+
+    /// Узел за дескриптором — файл **или каталог** (`fchmod`, фаза 74: .NET
+    /// ставит права каталогу своих именованных мьютексов по дескриптору).
+    pub fn file_or_dir(&self, fd: usize) -> Result<Arc<dyn Node>, FileError> {
+        match self.cell(fd)?.as_ref() {
+            Some(Slot::File(open)) => Ok(Arc::clone(&open.node)),
+            Some(_) => Err(FileError::Vfs(VfsError::WrongKind)),
             None => Err(FileError::BadFd),
         }
     }
@@ -772,6 +809,16 @@ impl Table {
         match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
             Slot::PipeRead(reader, _) => Ok(reader.clone()),
             _ => Err(FileError::Vfs(VfsError::WrongKind)),
+        }
+    }
+
+    /// Канал за дескриптором для журнала: `(адрес, читателей, писателей)`.
+    #[must_use]
+    pub fn pipe_state(&self, fd: usize) -> Option<(usize, usize, usize)> {
+        match self.cell(fd).ok()?.as_ref()? {
+            Slot::PipeRead(reader, _) => Some(reader.state()),
+            Slot::PipeWrite(writer, _) => Some(writer.state()),
+            _ => None,
         }
     }
 

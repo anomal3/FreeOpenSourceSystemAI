@@ -7,7 +7,8 @@
 //! ответ на вопрос «почему». Кольцо по слоту задачи, без замков: пишет только
 //! сам поток, читает — он же, когда падает.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use alloc::string::String;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::sched;
 
@@ -45,7 +46,9 @@ fn path_arg(number: usize) -> Option<usize> {
 /// Напечатать необычный отказ (фаза 71i: так нашлось, на чём спотыкается
 /// профиль Chromium). Первые [`FAILED_LIMIT`] на всю систему.
 fn show_failure(number: usize, args: [usize; 6], result: i64) {
-    if result >= 0 || routine(-result) || FAILED_SHOWN.fetch_add(1, Ordering::Relaxed) >= FAILED_LIMIT {
+    // `readlink` не ссылки — `EINVAL`: так .NET и glibc спрашивают «ссылка
+    // ли это» на каждом шаге пути, и эти строки вытесняли остальные.
+    if result >= 0 || routine(-result) || (number == 89 && result == -22) || FAILED_SHOWN.fetch_add(1, Ordering::Relaxed) >= FAILED_LIMIT {
         return;
     }
     let [a0, a1, a2, a3, ..] = args;
@@ -53,15 +56,84 @@ fn show_failure(number: usize, args: [usize; 6], result: i64) {
     crate::kprintln!("  linux       : {} {number}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}) = {result} {path}", sched::current());
 }
 
+/// Трассировка (`kernel lxtrace <имя>`, фаза 74): печатать каждый вызов
+/// программ, чей файл кончается на это имя. Пусто — выключена.
+static TRACE: crate::sync::SpinLock<String> = crate::sync::SpinLock::new(String::new());
+static TRACING: AtomicBool = AtomicBool::new(false);
+/// Сколько строк трассировки ещё можно напечатать.
+static TRACE_LEFT: AtomicUsize = AtomicUsize::new(0);
+
+/// Включить трассировку программ с именем `name` (`off` или пусто — выключить).
+pub fn set_trace(name: &str) {
+    let name = name.trim();
+    let on = !name.is_empty() && name != "off";
+    *TRACE.lock() = if on { String::from(name) } else { String::new() };
+    TRACE_LEFT.store(20_000, Ordering::Relaxed);
+    TRACING.store(on, Ordering::Relaxed);
+}
+
+fn trace(number: usize, args: [usize; 6], result: i64) {
+    // Удачные `mprotect`, `madvise`, `clock_gettime` и `sched_yield` JIT
+    // делает тысячами — они съедали весь запас строк.
+    if result >= 0 && matches!(number, 10 | 24 | 28 | 228) {
+        return;
+    }
+    let Some(path) = crate::user::with_current(|program| program.path.clone()) else { return };
+    let matches = {
+        let name = TRACE.lock();
+        !name.is_empty() && path.ends_with(name.as_str())
+    };
+    if !matches || TRACE_LEFT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err() {
+        return;
+    }
+    // Пути — у вызовов с путём и у `rename`/`renameat`/`mkdir`/`unlinkat`.
+    let path_of = |index: usize| super::user_string(args[index]).ok().unwrap_or_default();
+    let shown = match number {
+        82 => alloc::format!("{} -> {}", path_of(0), path_of(1)),
+        264 | 316 => alloc::format!("{} -> {}", path_of(1), path_of(3)),
+        83 => path_of(0),
+        258 | 263 => path_of(1),
+        _ => path_arg(number).map(path_of).unwrap_or_default(),
+    };
+    let [a0, a1, a2, a3, ..] = args;
+    crate::kprintln!("  trace {} {number}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}) = {result} {shown}", sched::current());
+}
+
 /// Запомнить вызов текущего потока.
 pub fn record(number: usize, args: [usize; 6], result: i64) {
     show_failure(number, args, result);
+    if TRACING.load(Ordering::Relaxed) {
+        trace(number, args, result);
+    }
     let slot = sched::current_slot();
     let at = NEXT[slot].fetch_add(1, Ordering::Relaxed) % DEPTH;
     let [a0, a1, a2, a3, a4, a5] = args.map(|arg| arg as u64);
     let values = [number as u64, a0, a1, a2, a3, a4, a5, result as u64];
     for (cell, value) in RING[slot][at].0.iter().zip(values) {
         cell.store(value, Ordering::Relaxed);
+    }
+}
+
+/// Последние `count` вызовов потока слота `slot` (для `tasks`, фаза 74): у
+/// зависшего потока видно, что он делал перед тем, как встать.
+pub fn dump_slot(slot: usize, count: usize) {
+    let Some(next) = NEXT.get(slot).map(|next| next.load(Ordering::Relaxed)) else { return };
+    for index in next.saturating_sub(count.min(DEPTH))..next {
+        let entry = &RING[slot][index % DEPTH].0;
+        let [number, a0, a1, a2, a3, _, _, result] = [0, 1, 2, 3, 4, 5, 6, 7].map(|field| entry[field].load(Ordering::Relaxed));
+        crate::kprintln!("         was {number}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}) = {}", result as i64);
+    }
+}
+
+/// Последние вызовы текущего потока без путей — для мест под замками, где
+/// читать память программы нельзя.
+pub fn dump_plain() {
+    let slot = sched::current_slot();
+    let next = NEXT[slot].load(Ordering::Relaxed);
+    for index in next.saturating_sub(DEPTH)..next {
+        let entry = &RING[slot][index % DEPTH].0;
+        let [number, a0, a1, a2, a3, _, _, result] = [0, 1, 2, 3, 4, 5, 6, 7].map(|field| entry[field].load(Ordering::Relaxed));
+        crate::kprintln!("    {number:>3}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}) = {}", result as i64);
     }
 }
 
@@ -85,7 +157,42 @@ pub fn dump() {
     }
 }
 
+/// Вызов, который поток выполняет сейчас (номер), — для журнала событий
+/// внутри вызова: «последний писатель канала ушёл — каким вызовом».
+static CURRENT: [AtomicU64; sched::MAX_TASKS] = [const { AtomicU64::new(u64::MAX) }; sched::MAX_TASKS];
+/// Первые четыре аргумента текущего вызова — для `tasks`.
+static CURRENT_ARGS: [[AtomicU64; 4]; sched::MAX_TASKS] =
+    [const { [const { AtomicU64::new(0) }; 4] }; sched::MAX_TASKS];
+
+/// Поток входит в вызов `number` (`usize::MAX` — выходит).
+pub fn begin(number: usize, args: &[usize; 6]) {
+    let slot = sched::current_slot();
+    for (cell, value) in CURRENT_ARGS[slot].iter().zip(args) {
+        cell.store(*value as u64, Ordering::Relaxed);
+    }
+    CURRENT[slot].store(number as u64, Ordering::Relaxed);
+}
+
+/// Вызов, в котором стоит поток слота `slot`: номер и четыре аргумента.
+#[must_use]
+pub fn in_call(slot: usize) -> Option<[u64; 5]> {
+    let number = CURRENT.get(slot)?.load(Ordering::Relaxed);
+    if number == u64::MAX {
+        return None;
+    }
+    let [a0, a1, a2, a3] = [0, 1, 2, 3].map(|index| CURRENT_ARGS[slot][index].load(Ordering::Relaxed));
+    Some([number, a0, a1, a2, a3])
+}
+
+/// Номер вызова, который выполняет текущий поток (`u64::MAX` — вне вызова
+/// Linux).
+#[must_use]
+pub fn current() -> u64 {
+    CURRENT[sched::current_slot()].load(Ordering::Relaxed)
+}
+
 /// Забыть вызовы слота — новый поток или процесс начинает с чистого кольца.
 pub fn reset(slot: usize) {
     NEXT[slot].store(0, Ordering::Relaxed);
+    CURRENT[slot].store(u64::MAX, Ordering::Relaxed);
 }

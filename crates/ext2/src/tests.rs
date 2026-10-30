@@ -15,7 +15,7 @@ use std::vec;
 use disk::{BlockDevice, MemDisk};
 use ext4_view::Ext4;
 
-use crate::layout::BlockSize;
+use crate::layout::{BlockSize, DIR_TYPE_DIRECTORY};
 use crate::read::{Ext2, FileType};
 use crate::edit::Editor;
 use crate::write::{FormatOptions, format_with};
@@ -807,10 +807,12 @@ fn renaming_onto_an_existing_name_is_refused() {
     assert_eq!(fs.read_to_string("/two.txt").expect("второй"), "second");
 }
 
-/// Каталог не переезжает к другому родителю: внутри него лежит «..», и оставить
-/// его указывающим на прежнего родителя значило бы испортить дерево.
+/// Каталог переезжает к другому родителю (фаза 74: так .NET создаёт свои
+/// каталоги — `mkdtemp` рядом и `rename` внутрь): его «..» ведёт к новому
+/// родителю, ссылка этой «..» переходит от старого к новому. Внутрь самого
+/// себя — нельзя: дерево стало бы петлёй.
 #[test]
-fn renaming_a_directory_across_parents_is_refused() {
+fn renaming_a_directory_across_parents_moves_its_parent_link() {
     let (mut dev, mut writer) = formatted(HALF_GIB_SECTORS, BlockSize::B1024);
     writer.flush(&mut dev).expect("сброс");
 
@@ -818,26 +820,39 @@ fn renaming_a_directory_across_parents_is_refused() {
     let target = editor
         .mkdir(&mut dev, ROOT_INODE, "target", 0o755, 0, 0)
         .expect("приёмник");
-    editor
+    let moving = editor
         .mkdir(&mut dev, ROOT_INODE, "moving", 0o755, 0, 0)
         .expect("каталог");
+    editor
+        .create_file(&mut dev, moving, "inside.txt", b"inside", 0o644, 0, 0)
+        .expect("файл внутри");
 
+    // Внутрь себя и внутрь своего потомка — отказ.
     assert!(matches!(
-        editor.rename(&mut dev, ROOT_INODE, "moving", target, "moved"),
+        editor.rename(&mut dev, ROOT_INODE, "moving", moving, "self"),
         Err(Error::Unsupported)
     ));
-
-    // А на месте — можно: родитель тот же, «..» не меняется.
     editor
-        .rename(&mut dev, ROOT_INODE, "moving", ROOT_INODE, "renamed")
-        .expect("переименование на месте");
+        .rename(&mut dev, ROOT_INODE, "moving", target, "moved")
+        .expect("перенос к другому родителю");
+    assert!(matches!(
+        editor.rename(&mut dev, ROOT_INODE, "target", moving, "loop"),
+        Err(Error::Unsupported)
+    ));
+    assert_eq!(editor.lookup(&mut dev, moving, "..").expect("чтение"), Some((target, DIR_TYPE_DIRECTORY)));
     editor.flush(&mut dev).expect("сброс");
 
-    // Проверяет это чужой драйвер, а не наш: каталог обязан быть виден под
-    // новым именем и не виден под старым.
+    // Проверяет это чужой драйвер, а не наш.
     let fs = foreign(&dev);
-    assert!(fs.exists("/renamed").expect("новое имя читается"));
+    assert!(fs.exists("/target/moved").expect("новое имя читается"));
     assert!(!fs.exists("/moving").expect("старое имя читается"));
+    assert_eq!(fs.read_to_string("/target/moved/inside.txt").expect("содержимое"), "inside");
+
+    // Ссылки: у корня — «.», «..» и «..» одного подкаталога (`target`); у
+    // `target` — своя запись, «.» и «..» переехавшего.
+    let mount = Ext2::mount(&mut dev, 0).expect("монтирование");
+    assert_eq!(mount.root(&mut dev).expect("корень").links, 3);
+    assert_eq!(editor.read_inode(&mut dev, target).expect("ссылки").links, 3);
 }
 
 /// Суперблок, объявивший в группе больше inode, чем бит в блоке, отвергается.

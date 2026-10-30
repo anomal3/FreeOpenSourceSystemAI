@@ -1692,6 +1692,16 @@ pub fn dump() {
             } else {
                 kprintln!("       {why} {value}");
             }
+            // В каком вызове Linux стоит (фаза 74): по ключу futex не понять,
+            // чего ждёт поток программы, а по номеру и аргументам — видно.
+            #[cfg(target_arch = "x86_64")]
+            if let Some([number, a0, a1, a2, a3]) = crate::linux::recent::in_call(entry.slot) {
+                kprintln!("       in linux call {number}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x})");
+                crate::linux::recent::dump_slot(entry.slot, 8);
+                if number == 232 || number == 281 {
+                    crate::linux::ipc::epoll_report(entry.slot, a0 as usize);
+                }
+            }
         }
         // Только у тех, кого будило прерывание: у прочих ответа нет, а ноль
         // выглядел бы как «ждала мгновенно».

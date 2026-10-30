@@ -210,25 +210,30 @@ const WINDOW: &str = "import javax.swing.*;\n\
 
 /// Скачать (или взять из кеша) дистрибутив Rider и сверить хеш.
 pub fn rider_archive() -> Result<PathBuf> {
+    cached_download(RIDER_URL, RIDER_SHA256)
+}
+
+/// Скачать `url` в кеш `thirdparty/rider` (или взять оттуда) со сверкой SHA-256.
+pub fn cached_download(url: &str, sha256: &str) -> Result<PathBuf> {
     let cache = sdk::root().join("thirdparty/rider");
     fs::create_dir_all(&cache)?;
-    let file = cache.join(RIDER_URL.rsplit('/').next().unwrap_or("rider.tar.gz"));
-    if file.is_file() && file_digest(&file)? == RIDER_SHA256 {
+    let file = cache.join(url.rsplit('/').next().unwrap_or("download.tar.gz"));
+    if file.is_file() && file_digest(&file)? == sha256 {
         return Ok(file);
     }
-    say!("> curl {RIDER_URL}");
+    say!("> curl {url}");
     let status = std::process::Command::new("curl")
         .args(["--location", "--fail", "--silent", "--show-error", "--output"])
         .arg(&file)
-        .arg(RIDER_URL)
+        .arg(url)
         .status()
         .context("не удалось запустить curl")?;
     if !status.success() {
-        bail!("не скачался {RIDER_URL} ({status})");
+        bail!("не скачался {url} ({status})");
     }
     let got = file_digest(&file)?;
-    if got != RIDER_SHA256 {
-        bail!("хеш Rider не тот: приехало {got}, ожидалось {RIDER_SHA256}; файл оставлен: {}", file.display());
+    if got != sha256 {
+        bail!("хеш не тот: приехало {got}, ожидалось {sha256}; файл оставлен: {}", file.display());
     }
     Ok(file)
 }

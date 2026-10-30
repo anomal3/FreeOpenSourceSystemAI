@@ -209,9 +209,20 @@ pub fn send_to_process(pid: u32, sig: usize, only_handled: bool) {
             sched::wake(id);
         }
         _ => {
+            // Как у Linux: сигнал процессу получает поток, который его не
+            // заблокировал (фаза 74). .NET держит `SIGCHLD` заблокированным
+            // не во всех потоках; отдать его главному с маской — значит, что
+            // обработчик не запустится никогда, и `Process.WaitForExit` ждёт
+            // вечно (`dotnet new` вставал после запуска `chmod`).
+            let threads = crate::user::slots_of(&process);
             drop(process);
-            LINUX_PENDING[slot].fetch_or(bit(sig), Ordering::Relaxed);
-            sched::wake(id);
+            let open = |slot: usize| LINUX_SIGMASK[slot].load(Ordering::Relaxed) & bit(sig) == 0;
+            let target = if open(slot) { slot } else { threads.iter().copied().find(|&other| open(other)).unwrap_or(slot) };
+            LINUX_PENDING[target].fetch_or(bit(sig), Ordering::Relaxed);
+            match sched::id_of_slot(target) {
+                Some(thread) if target != slot => sched::wake(thread),
+                _ => sched::wake(id),
+            }
         }
     }
 }

@@ -624,6 +624,8 @@ fn read(fd: usize, ptr: usize, len: usize) -> i64 {
         };
     }
 
+    // Страницы буфера — до замка процесса (см. `prepare_write`).
+    super::prepare_write(ptr, len);
     match super::with_current(|program| program.files.read(fd, buffer)) {
         Some(Ok(read)) => read as i64,
         Some(Err(err)) => errno(err),

@@ -872,6 +872,34 @@ pub fn stream_close(owner: TaskId, index: usize) -> Result<(), NetError> {
     // Проверка владельца обязательна и здесь: закрыть чужое соединение —
     // это разорвать чужую связь.
     iface.streams.get(owner, index).map_err(NetError::Stream)?;
+    // Закрывают, не дочитав, — обрыв (`RST`), как у Linux (RFC 2525, 2.17).
+    // Иначе собеседник, писавший в заполненное нами окно, ждёт его открытия
+    // вечно: читать больше некому (фаза 74 — половина Rider на .NET встала в
+    // `sendto` к закрывшемуся окну Rider, и шаблоны проектов не загрузились).
+    let abort = iface.streams.get(owner, index).ok().and_then(|conn| {
+        (!conn.recv.is_empty() && !conn.reset && conn.state != stream::State::Listen)
+            .then_some((conn.local_port, conn.remote, conn.remote_port, conn.snd_nxt))
+    });
+    if let Some((local_port, remote, remote_port, sequence)) = abort {
+        let out = tcp::Outgoing {
+            source_port: local_port,
+            destination_port: remote_port,
+            sequence,
+            acknowledgement: 0,
+            flags: tcp::RST,
+            window: 0,
+            with_mss: false,
+            payload: &[],
+        };
+        let mut buffer = [0u8; tcp::HEADER + 4];
+        let len = tcp::write(&mut buffer, source_for(iface, remote), remote, &out);
+        if send_ipv4(iface, remote, ipv4::PROTOCOL_TCP, &buffer[..len]).is_ok() {
+            iface.counters.tcp_out += 1;
+            iface.counters.tcp_resets += 1;
+        }
+        iface.streams.close(index);
+        return Ok(());
+    }
     {
         let conn = iface.streams.get_mut(owner, index).map_err(NetError::Stream)?;
         // Соединение, которое ещё не установилось, просто забывается (RFC 793,

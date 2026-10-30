@@ -18,11 +18,23 @@ const SLOTS: usize = 512;
 
 static CALLS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static NANOS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+/// Кто последним делал вызов (слот задачи) — чтобы найти, кто крутится.
+static LAST: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+/// Последний готовый ответ `poll`: дескриптор и `revents` (диагностика
+/// пустых циклов опроса).
+pub static POLL_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// Кто последним делал вызов `number`.
+#[must_use]
+pub fn last_caller(number: usize) -> u64 {
+    LAST.get(number).map_or(0, |last| last.load(Ordering::Relaxed))
+}
 
 /// Учесть вызов `number`, длившийся `nanos`.
 pub fn count(number: usize, nanos: u64) {
     if number < SLOTS {
         CALLS[number].fetch_add(1, Ordering::Relaxed);
+        LAST[number].store(crate::sched::running_slot() as u64, Ordering::Relaxed);
         NANOS[number].fetch_add(nanos, Ordering::Relaxed);
     }
 }

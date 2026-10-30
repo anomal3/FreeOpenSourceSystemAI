@@ -48,7 +48,7 @@ pub fn chmod(dir: usize, ptr: usize, mode: usize) -> i64 {
 
 /// `fchmod`.
 pub fn fchmod(fd: usize, mode: usize) -> i64 {
-    let node = match crate::user::with_current(|program| program.files.node(fd)) {
+    let node = match crate::user::with_current(|program| program.files.file_or_dir(fd)) {
         Some(Ok(node)) => node,
         Some(Err(err)) => return file_errno(err),
         None => return -e::ESRCH,
@@ -186,7 +186,7 @@ pub fn statfs(path: Option<usize>, fd: usize, out: usize) -> i64 {
             Ok(linux) => linux == "/dev/shm" || linux.starts_with("/dev/shm/"),
             Err(err) => return err,
         },
-        None => match crate::user::with_current(|program| program.files.node(fd)) {
+        None => match crate::user::with_current(|program| program.files.file_or_dir(fd)) {
             Some(Ok(node)) => node.shared_memory().is_some(),
             Some(Err(err)) => return file_errno(err),
             None => return -e::ESRCH,

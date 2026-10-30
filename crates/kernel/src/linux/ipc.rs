@@ -416,6 +416,45 @@ enum State {
     Connected(Endpoint),
 }
 
+/// Вид объекта дескриптора — для диагностики (`lxstat`).
+pub fn object_kind(fd: usize) -> &'static str {
+    let Some(Some((object, _))) = crate::user::with_current(|program| program.files.object(fd)) else {
+        return match crate::user::with_current(|program| program.files.describe(fd).map(|info| info.kind)) {
+            Some(Ok(crate::user::files::FdKind::File)) => "file",
+            Some(Ok(crate::user::files::FdKind::Directory)) => "dir",
+            Some(Ok(crate::user::files::FdKind::Pipe)) => "pipe",
+            Some(Ok(crate::user::files::FdKind::Socket)) => "native socket",
+            Some(Ok(crate::user::files::FdKind::Object)) => "object",
+            _ => "?",
+        };
+    };
+    let any = object.as_any();
+    if let Some(socket) = any.downcast_ref::<UnixSocket>() {
+        return match &*socket.state.lock() {
+            State::Connected(_) => "unix connected",
+            State::Listening(_) => "unix listening",
+            State::Fresh => "unix fresh",
+        };
+    }
+    if any.is::<EventFd>() {
+        return "eventfd";
+    }
+    if any.is::<TimerFd>() {
+        return "timerfd";
+    }
+    if any.is::<Epoll>() {
+        return "epoll";
+    }
+    if any.is::<Inotify>() {
+        return "inotify";
+    }
+    "other object"
+}
+
+pub static POLL_KIND: crate::sync::SpinLock<&'static str> = crate::sync::SpinLock::new("");
+/// Канал последнего готового `poll`: `(адрес, читателей, писателей)`.
+pub static POLL_PIPE: crate::sync::SpinLock<(usize, usize, usize)> = crate::sync::SpinLock::new((0, 0, 0));
+
 pub struct UnixSocket {
     kind: u32,
     /// `SO_PASSCRED`: `recvmsg` прикладывает `SCM_CREDENTIALS` отправителя.
@@ -636,6 +675,23 @@ pub fn bind(fd: usize, addr: usize, len: usize) -> i64 {
         if names.iter().any(|(other, live)| *other == name && live.strong_count() > 0) {
             crate::kprintln!("  linux       : bind '{}': the name is listened on already", alloc::string::String::from_utf8_lossy(&name));
             return -EADDRINUSE;
+        }
+    }
+    // Имя-путь — ещё и файл, как у Linux (фаза 74): Rider проверяет, что
+    // файл его сокета есть (иначе перезапускает сервер без конца), .NET — тоже.
+    // Брошенный файл прошлого слушателя (живого имени нет) — стирается.
+    if name.first().is_some_and(|byte| *byte == b'/') {
+        if let Ok(linux) = core::str::from_utf8(&name) {
+            let cred = crate::user::credentials();
+            let path = super::fsops::place(linux);
+            let _ = crate::fs::remove_as(cred, &path);
+            match crate::fs::create_as(cred, &path, 0o755) {
+                Some(Ok(_)) => {}
+                Some(Err(crate::vfs::VfsError::PermissionDenied)) => return -e::EACCES,
+                Some(Err(crate::vfs::VfsError::NotFound)) | None => return -e::ENOENT,
+                // Файл не лёг иначе (только чтение и т. п.) — имя всё равно служит.
+                Some(Err(_)) => {}
+            }
         }
     }
     *unix(&object).name.lock() = Some(name);
@@ -1465,6 +1521,33 @@ pub fn epoll_ctl(epfd: usize, op: usize, fd: usize, event: usize) -> i64 {
     0
 }
 
+/// Что слушает `epoll` `epfd` процесса слота `slot` и что сейчас готово —
+/// для `tasks` (фаза 74): у потока, вставшего в `epoll_wait`, видно, не
+/// пропущено ли событие.
+pub fn epoll_report(slot: usize, epfd: usize) {
+    let Some(process) = crate::user::process_at(slot) else { return };
+    let program = process.lock();
+    let Some((object, _)) = program.files.object(epfd) else { return };
+    let Some(epoll) = object.as_any().downcast_ref::<Epoll>() else { return };
+    let interests = epoll.interests.lock();
+    for interest in interests.iter().take(24) {
+        let state = match program.files.object(interest.fd) {
+            Some((other, _)) => other.readiness(),
+            None => program.files.readiness(interest.fd).unwrap_or((false, false, false)),
+        };
+        crate::kprintln!(
+            "         epoll {epfd}: fd {} events {:#x} last {:#x} off {} -> read {} write {} hup {}",
+            interest.fd,
+            interest.events,
+            interest.last,
+            interest.disabled,
+            state.0,
+            state.1,
+            state.2
+        );
+    }
+}
+
 /// `epoll_wait(epfd, events, max, timeout_ms)` и `epoll_pwait` (маска сигналов
 /// не меняется: доставка и так только на выходе из вызова).
 pub fn epoll_wait(epfd: usize, out: usize, max: usize, timeout: i64) -> i64 {
@@ -1505,6 +1588,10 @@ pub fn epoll_wait(epfd: usize, out: usize, max: usize, timeout: i64) -> i64 {
             }
             if got & user_abi::POLL_HUP != 0 {
                 bits |= EPOLLHUP | (events & EPOLLRDHUP);
+                // Ждут записи, а собеседника нет — ошибка, как у Linux.
+                if events & EPOLLOUT != 0 && events & EPOLLIN == 0 {
+                    bits |= EPOLLERR;
+                }
             }
             ready.push((fd, bits));
             if let Some(at) = crate::user::with_current(|program| program.files.deadline(fd)).flatten() {
@@ -1520,7 +1607,16 @@ pub fn epoll_wait(epfd: usize, out: usize, max: usize, timeout: i64) -> i64 {
                 };
                 let mut report = bits & (interest.events | EPOLLHUP | EPOLLERR);
                 if interest.events & EPOLLET != 0 {
-                    let fresh = report & !interest.last;
+                    // «Стало готово» по сравнению с прошлым опросом теряет
+                    // фронт, если программа дочитала до `EAGAIN`, а новые байты
+                    // пришли раньше следующего `epoll_wait`: оба опроса видят
+                    // «готово», и событие не приходит никогда (фаза 74: .NET
+                    // ждал вывода ребёнка вечно). Чтение поэтому сообщается,
+                    // пока есть что читать: программа с `EPOLLET` и так читает
+                    // до `EAGAIN`, лишнее событие ей безвредно. Запись и обрыв
+                    // — по-прежнему фронтом: «можно писать» у сокета почти
+                    // всегда, и уровнем оно крутило бы ожидание вхолостую.
+                    let fresh = (report & EPOLLIN) | (report & !EPOLLIN & !interest.last);
                     interest.last = report;
                     report = fresh;
                 }

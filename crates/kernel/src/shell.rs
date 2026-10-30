@@ -1158,6 +1158,11 @@ fn run_builtin(line: &str) -> bool {
         "tasks" => tasks(),
         #[cfg(target_arch = "x86_64")]
         "lxstat" => linux_stat(argument),
+        #[cfg(target_arch = "x86_64")]
+        "lxtrace" => {
+            crate::linux::recent::set_trace(argument);
+            sprintln!("  lxtrace: {}", if argument.is_empty() || argument == "off" { "off" } else { argument });
+        }
         "irq" => interrupt_wakes(argument),
         "beep" => beep(argument),
         "clear" => {
@@ -2113,13 +2118,27 @@ fn linux_stat(argument: &str) {
         crate::mm::pagecache::pages() * 4 / 1024,
         crate::mm::heap::stats().free / 1024
     );
-    sprintln!("     nr name                calls        ms   us/call");
+    let poll = crate::linux::profile::POLL_LAST.load(core::sync::atomic::Ordering::Relaxed);
+    sprintln!(
+        "  last ready poll: pid {} fd {} ({}) events {:#x} revents {:#x}",
+        poll >> 48,
+        (poll >> 32) & 0xffff,
+        *crate::linux::ipc::POLL_KIND.lock(),
+        (poll >> 16) & 0xffff,
+        poll & 0xffff
+    );
+    let (pipe, readers, writers) = *crate::linux::ipc::POLL_PIPE.lock();
+    if pipe != 0 {
+        sprintln!("  its pipe: {pipe:#x}, readers {readers}, writers {writers}");
+    }
+    sprintln!("     nr name               calls        ms   us/call  last");
     for (number, calls, nanos) in rows.iter().take(30) {
         sprintln!(
-            "  {number:5} {:<16} {calls:9} {:9} {:9}",
+            "  {number:5} {:<16} {calls:9} {:9} {:9}  #{}",
             crate::linux::profile::name(*number),
             nanos / 1_000_000,
-            nanos / 1_000 / (*calls).max(1)
+            nanos / 1_000 / (*calls).max(1),
+            crate::linux::profile::last_caller(*number)
         );
     }
     if reset {

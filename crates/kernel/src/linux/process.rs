@@ -197,6 +197,85 @@ pub fn wait4(pid: usize, status: usize, options: usize, rusage: usize) -> i64 {
     }
 }
 
+/// `waitid(idtype, id, infop, options, rusage)` (фаза 74). .NET узнаёт им о
+/// конце детей (`WEXITED | WNOHANG | WNOWAIT`), не забирая статус; без него
+/// `Process` в Rider.Backend ломался после первого же кончившегося ребёнка.
+pub fn waitid(idtype: usize, id: usize, info: usize, options: usize, rusage: usize) -> i64 {
+    const P_ALL: usize = 0;
+    const P_PID: usize = 1;
+    const P_PGID: usize = 2;
+    const WNOHANG: usize = 1;
+    const WEXITED: usize = 4;
+    const WNOWAIT: usize = 0x0100_0000;
+    const INFO: usize = 128;
+    const RUSAGE: usize = 144;
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    if !matches!(idtype, P_ALL | P_PID | P_PGID) || options & WEXITED == 0 {
+        // Остановленных и продолженных детей не бывает: ждать их — вечно.
+        return -e::EINVAL;
+    }
+    if info != 0 && !space::user_can(info, INFO, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    if rusage != 0 && !space::user_can(rusage, RUSAGE, PageFlags::WRITE) {
+        return -e::EFAULT;
+    }
+    let me = own_pid();
+    let wanted = |child: &Child| child.parent == me && (idtype != P_PID || child.pid == id as u32);
+    loop {
+        let seen = crate::io_events::generation();
+        let found = {
+            let mut list = CHILDREN.lock();
+            if !list.iter().any(wanted) {
+                return -e::ECHILD;
+            }
+            let index = list.iter().position(|child| wanted(child) && child.status.is_some());
+            match index {
+                Some(index) if options & WNOWAIT != 0 => Some((list[index].pid, list[index].status.unwrap_or(0))),
+                Some(index) => {
+                    let child = list.remove(index);
+                    Some((child.pid, child.status.unwrap_or(0)))
+                }
+                None => None,
+            }
+        };
+        if found.is_none() && options & WNOHANG == 0 {
+            if crate::user::kill_pending() || super::signal::pending() {
+                return -e::EINTR;
+            }
+            crate::io_events::wait(seen, Some(crate::time::uptime_ms() + 100));
+            continue;
+        }
+        if (info != 0 && !space::user_can(info, INFO, PageFlags::WRITE))
+            || (rusage != 0 && !space::user_can(rusage, RUSAGE, PageFlags::WRITE))
+        {
+            return -e::EFAULT;
+        }
+        // SAFETY: оба адреса проверены на запись строками выше.
+        unsafe {
+            if info != 0 {
+                // Нет кончившегося ребёнка при `WNOHANG` — нули (`si_pid` 0).
+                core::ptr::write_bytes(info as *mut u8, 0, INFO);
+                if let Some((pid, status)) = found {
+                    // `wait4`-статус: сигнал в младших 7 битах, иначе код << 8.
+                    let (code, value) = if status & 0x7f != 0 { (CLD_KILLED, status & 0x7f) } else { (CLD_EXITED, (status >> 8) & 0xff) };
+                    let at = info as *mut i32;
+                    at.write_unaligned(SIGCHLD as i32);
+                    at.add(2).write_unaligned(code);
+                    at.add(4).write_unaligned(pid as i32);
+                    at.add(5).write_unaligned(0);
+                    at.add(6).write_unaligned(value);
+                }
+            }
+            if rusage != 0 {
+                core::ptr::write_bytes(rusage as *mut u8, 0, RUSAGE);
+            }
+        }
+        return 0;
+    }
+}
+
 /// Сколько указателей и байт строк принимает `execve` (у Linux — четверть
 /// стека; здесь — сколько помещается в жадную часть стека).
 const MAX_VECTOR: usize = 1900;

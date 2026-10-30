@@ -302,7 +302,11 @@ pub const RESERVE_FRAMES: usize = 8 * 1024 * 1024 / PAGE_SIZE;
 /// среды исполнения, к которым идёт веха) держат тысячи областей, а запись
 /// так и стоит полсотни байт — потолок таблицы в 800 КиБ на задачу, и
 /// платит их только та, что столько заняла.
-const MAX_MAPPINGS: usize = 16 * 1024;
+///
+/// 65 530 с фазы 74 — как `vm.max_map_count` у Linux: .NET (половина Rider)
+/// дробит резерв кучи на тысячи кусков `mprotect`-ом и на шестнадцати
+/// тысячах получал `ENOMEM` даже от `munmap` — и падал по `SIGSEGV`.
+const MAX_MAPPINGS: usize = 65_530;
 
 /// Сколько сегментов может быть у образа программы.
 ///
@@ -1376,6 +1380,30 @@ impl Program {
     /// Места в таблице и делимость проверяет вызывающий **до** первого
     /// разреза: отказ посреди работы оставил бы таблицу разрезанной, а память
     /// — нетронутой, и следующий вызов увидел бы не то, что выдавали.
+    /// Склеить соседние безымянные области с одинаковыми правами в
+    /// `[addr, end)` и на её краях — как VMA у Linux (фаза 74). Без этого
+    /// `mprotect` по кускам резерва (так .NET открывает свою кучу) плодил по
+    /// области на кусок, и программа упиралась в [`MAX_MAPPINGS`].
+    fn merge_around(&mut self, addr: usize, end: usize) {
+        let mut index = self.mappings.partition_point(|region| region.end() < addr).saturating_sub(1);
+        while index + 1 < self.mappings.len() && self.mappings[index].base <= end {
+            let (left, right) = (&self.mappings[index], &self.mappings[index + 1]);
+            let same = match (&left.source, &right.source) {
+                (Source::Anonymous(a), Source::Anonymous(b)) => {
+                    a.flags == b.flags && a.lazy == b.lazy && a.jit == b.jit
+                }
+                _ => false,
+            };
+            if same && left.blocks == 0 && right.blocks == 0 && left.end() == right.base {
+                let pages = right.pages;
+                self.mappings[index].pages += pages;
+                self.mappings.remove(index + 1);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
     fn split_at(&mut self, addr: usize) {
         let Some(index) = self.region_at(addr) else {
             return;
@@ -1641,6 +1669,7 @@ impl Program {
             kprintln!("  user        : WARNING: mprotect could not rewrite a page at {addr:#x}");
             return Err(MmapError::NoMemory);
         }
+        self.merge_around(addr, end);
         Ok(())
     }
 
@@ -4206,6 +4235,20 @@ pub fn process_at(slot: usize) -> Option<Arc<Mutex<Program>>> {
     table.get(slot).and_then(Option::as_ref).cloned()
 }
 
+/// Слоты всех потоков процесса `process` (фаза 74: сигнал процессу Linux
+/// получает поток, который его не заблокировал, не обязательно главный).
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn slots_of(process: &Arc<Mutex<Program>>) -> alloc::vec::Vec<usize> {
+    let table = PROGRAMS.lock();
+    table
+        .iter()
+        .enumerate()
+        .filter(|(_, other)| other.as_ref().is_some_and(|other| Arc::ptr_eq(other, process)))
+        .map(|(slot, _)| slot)
+        .collect()
+}
+
 #[cfg(target_arch = "x86_64")]
 impl Mapping {
     /// Копия записи для `fork` (фаза 71d). `None` — область чужая
@@ -4477,7 +4520,16 @@ pub fn exec(frame: &mut arch::TrapFrame, path: &str, args: &[&str], env: &[&str]
     let entry = loaded.entry;
     // Право на память кода — у нового файла, не у старого: `bash` корня
     // Debian, запускающий Chromium, его не имеет, а Chromium имеет.
-    let jit_allowed = jit_of_path(path);
+    //
+    // Файл не из пакета (фаза 74: программа, только что собранная `dotnet
+    // build` в домашнем каталоге) права своего не имеет — он наследует его от
+    // запускающего: `dotnet run` с правом `jit` запускает свою же сборку, и
+    // без права та падала на первой странице JIT. Файл пакета — только по
+    // своему манифесту, как раньше.
+    let jit_allowed = match package_rights(path) {
+        Some(rights) => rights.contains(Rights::JIT),
+        None => process.lock().jit_allowed,
+    };
 
     // Дальше пути назад нет — но сначала остальные потоки: их задачи стоят
     // на старом пространстве, и разобрать его можно только без них.
@@ -4974,6 +5026,34 @@ pub fn owns(ptr: usize, len: usize) -> bool {
 /// Отсюда правило для [`space::user_can`], который тоже сюда ходит: его нельзя
 /// звать изнутри [`with_current`]. Сегодня ни один системный вызов так не
 /// делает, и это проверено, а не предположено.
+/// Подготовить буфер программы к записи ядром **до** замка процесса (фаза
+/// 74): разделённые `fork`-ом страницы — копией, ленивые — кадром. Иначе
+/// копирование под замком процесса (чтение файла) встречает отказ страницы,
+/// а обработчику нужен тот же замок — поток ждал сам себя, и вставал весь
+/// Rider (после `posix_spawn` его страницы разделены).
+pub fn prepare_write(ptr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let Some(root) = with_current(|program| program.space.root()) else {
+        return;
+    };
+    let end = ptr.saturating_add(len);
+    let mut page = ptr & !(PAGE_SIZE - 1);
+    while page < end {
+        match arch::translate(root, VirtAddr::new(page)) {
+            Some((_, flags)) if flags.contains(PageFlags::WRITE) => {}
+            Some(_) => {
+                let _ = fault_in(page, Touch::Write, true);
+            }
+            None => {
+                let _ = fault_in(page, Touch::Write, false);
+            }
+        }
+        page += PAGE_SIZE;
+    }
+}
+
 #[must_use]
 pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     let page_addr = addr & !(PAGE_SIZE - 1);
