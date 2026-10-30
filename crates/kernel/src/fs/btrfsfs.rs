@@ -7,22 +7,26 @@
 //! по-разному, расходятся в мелочах, которые потом объясняются как «на btrfs
 //! почему-то иначе».
 //!
-//! # Одна операция — одна транзакция
+//! # Отложенная фиксация (фаза 74, 30.10)
 //!
-//! Каждое изменение — запись, создание, удаление, переименование — фиксируется
-//! до возврата из вызова. Решение то же, что у ext2 со сбросом счётчиков после
-//! каждой операции, но причина здесь своя.
+//! До 30.10 каждое изменение фиксировалось до возврата из вызова: читатель
+//! ([`btrfs::Btrfs`]) видит только диск, а второй путь чтения казался лишним
+//! (фаза 50d). Для `/data`, куда пишет человек, так было терпимо; для дома и
+//! `/opt` с Rider и Debian — нет: копирование кусками по 4 КиБ было
+//! транзакцией на кусок с записью суперблока.
 //!
-//! Читатель ([`btrfs::Btrfs`]) видит только то, что уже на диске. Отложи мы
-//! фиксацию — между записью и фиксацией `cat` показывал бы прежнее содержимое,
-//! а чтобы этого не было, понадобился бы второй путь чтения, по деревьям в
-//! памяти писателя. Два пути чтения одного тома — это два способа прочитать не
-//! то, и проверять пришлось бы оба.
+//! Теперь правки копятся в памяти писателя, а фиксация — служебной задачей
+//! раз в 5 с ([`FileSystem::writeback`], как сброс ext2), по `sync`/`fsync`,
+//! при выключении, после правок родных программ и каждые [`MAX_PENDING`]
+//! операций. Пока писатель открыт, **читают его**: inode, каталоги и
+//! экстенты — из его памяти, данные — с носителя со сверкой сумм. Читатель с
+//! диска остаётся тому только на чтение и проверке.
 //!
-//! Цена названа: фиксация перестраивает тронутые деревья целиком (см. заголовок
-//! `crates/btrfs/src/write.rs`), и копирование кусками по 512 байт — это
-//! транзакция на кусок. Для `/data`, куда пишет человек, а не база данных, это
-//! приемлемо; замер — в разделе фазы 50d в `ROADMAP.md`.
+//! Цена: внезапное выключение теряет правки последних секунд, как у Linux, —
+//! но том остаётся прежним целым, а не испорченным: на диске всегда последняя
+//! завершённая транзакция. И операция, сорвавшаяся на середине (кончилось
+//! место, отказал носитель), теряет вместе с собой всю незафиксированную
+//! пачку: память писателя больше не согласована, и он открывается с диска.
 //!
 //! # Читатель после фиксации открывается заново
 //!
@@ -70,7 +74,12 @@ struct Inner {
     writer: Option<btrfs::Writer>,
     /// Почему писателя нет, хотя его просили.
     refused: Option<VfsError>,
+    /// Сколько операций ждут фиксации.
+    pending: usize,
 }
+
+/// Больше скольких незафиксированных операций не копить.
+const MAX_PENDING: usize = 4096;
 
 /// Смонтированный том.
 pub struct BtrfsFs {
@@ -170,17 +179,17 @@ impl BtrfsFs {
             (None, None)
         };
         Ok(BtrfsMount(Arc::new(Self {
-            inner: Mutex::new(Inner { disk, fs, first_lba, writer, refused }),
+            inner: Mutex::new(Inner { disk, fs, first_lba, writer, refused, pending: 0 }),
         })))
     }
 
-    /// Выполнить изменение тома и зафиксировать его.
+    /// Выполнить изменение тома; фиксация — позже ([`Inner::commit`]).
     fn change<R>(
         &self,
         action: impl FnOnce(&mut Counted, &mut btrfs::Writer, u64) -> Result<R, btrfs::Error>,
     ) -> VfsResult<R> {
         let mut guard = self.inner.lock();
-        let Inner { disk, fs, first_lba, writer, refused } = &mut *guard;
+        let Inner { disk, writer, .. } = &mut *guard;
         let Some(active) = writer.as_mut() else {
             return Err(VfsError::ReadOnly);
         };
@@ -188,10 +197,30 @@ impl BtrfsFs {
         // Часов нет — ноль, а не выдуманная дата.
         let time = crate::time::now_unix().unwrap_or(0);
         let outcome = action(disk, active, time);
+        guard.pending += 1;
 
-        // Фиксация зовётся и после отказа. Отказ до первой правки оставляет
-        // транзакцию пустой, и фиксация ничего не пишет; отказ на середине
-        // возвращается отсюда же как `Aborted` — и писатель открывается заново.
+        // Отказ — фиксация сразу. Отказ до первой правки оставляет память
+        // согласованной, и фиксируется накопленное; отказ на середине
+        // возвращается из фиксации как `Aborted` — и писатель открывается
+        // заново.
+        if outcome.is_err() || guard.pending >= MAX_PENDING {
+            let committed = guard.commit();
+            let result = outcome.map_err(convert)?;
+            committed?;
+            return Ok(result);
+        }
+        outcome.map_err(convert)
+    }
+}
+
+impl Inner {
+    /// Зафиксировать накопленное; после отказа — открыть писатель с диска.
+    fn commit(&mut self) -> VfsResult<()> {
+        let Inner { disk, fs, first_lba, writer, refused, pending } = self;
+        let Some(active) = writer.as_mut() else {
+            return Ok(());
+        };
+        *pending = 0;
         let committed = active.commit(disk);
         let generation = active.generation();
         if committed.is_err() {
@@ -216,9 +245,15 @@ impl BtrfsFs {
                 }
             }
         }
-        let result = outcome.map_err(convert)?;
-        committed.map_err(convert)?;
-        Ok(result)
+        committed.map_err(convert)
+    }
+
+    /// Inode по номеру: у писателя — из его памяти, иначе с диска.
+    fn inode(&mut self, number: u64) -> VfsResult<btrfs::Inode> {
+        match self.writer.as_ref() {
+            Some(writer) => writer.inode(number).map_err(convert),
+            None => self.fs.inode(&mut self.disk, number).map_err(convert),
+        }
     }
 }
 
@@ -289,6 +324,8 @@ impl BtrfsMount {
     fn summary(&self) -> VfsResult<crate::vfs::CheckSummary> {
         let report = {
             let mut guard = self.0.inner.lock();
+            // Проверка обходит диск: сперва на него должно лечь накопленное.
+            guard.commit()?;
             let Inner { disk, fs, .. } = &mut *guard;
             fs.check(disk).map_err(convert)?
         };
@@ -325,8 +362,14 @@ impl FileSystem for BtrfsMount {
     fn root(&self) -> VfsResult<Box<dyn Node>> {
         let inode = {
             let mut guard = self.0.inner.lock();
-            let Inner { disk, fs, .. } = &mut *guard;
-            fs.root(disk).map_err(convert)?
+            let number = match guard.writer.as_ref() {
+                Some(writer) => writer.resolve("/").map_err(convert)?,
+                None => {
+                    let Inner { disk, fs, .. } = &mut *guard;
+                    fs.root(disk).map_err(convert)?.number
+                }
+            };
+            guard.inode(number)?
         };
         Ok(Box::new(BtrfsNode { fs: Arc::clone(&self.0), inode }))
     }
@@ -335,19 +378,28 @@ impl FileSystem for BtrfsMount {
         Some(self.summary())
     }
 
-    /// Довести записанное до носителя.
+    /// Зафиксировать накопленное и довести до носителя.
     ///
-    /// Незафиксированного здесь не бывает: каждая операция зафиксирована до
-    /// возврата. `flush` всё равно зовётся — он дёшев, а «записано» без него
-    /// значит «лежит в кеше диска». Помечать том чистым не нужно: такого
-    /// признака у btrfs нет, его работу делает смена суперблока.
+    /// `flush` зовётся и после фиксации (она сама его делает): он дёшев, а
+    /// «записано» без него значит «лежит в кеше диска». Помечать том чистым не
+    /// нужно: такого признака у btrfs нет, его работу делает смена суперблока.
     fn sync(&self) -> VfsResult<()> {
         let mut guard = self.0.inner.lock();
-        let Inner { disk, writer, .. } = &mut *guard;
-        if writer.is_none() {
+        if guard.writer.is_none() {
             return Ok(());
         }
-        disk.flush().map_err(|_| VfsError::Io)
+        guard.commit()?;
+        guard.disk.flush().map_err(|_| VfsError::Io)
+    }
+
+    /// Фиксация накопленного — служебной задачей раз в 5 с, `fsync` и после
+    /// правок родных программ (как сброс у ext2).
+    fn writeback(&self) -> VfsResult<()> {
+        let mut guard = self.0.inner.lock();
+        if guard.pending == 0 {
+            return Ok(());
+        }
+        guard.commit()
     }
 
     /// Переименовать: то же содержимое под другим именем.
@@ -373,8 +425,13 @@ struct BtrfsNode {
 }
 
 impl Node for BtrfsNode {
+    /// Свежий inode, а не снимок открытия: запись через этот или другой
+    /// дескриптор меняет длину и время.
     fn metadata(&self) -> Metadata {
-        metadata_of(&self.inode)
+        match self.fs.inner.lock().inode(self.inode.number) {
+            Ok(inode) => metadata_of(&inode),
+            Err(_) => metadata_of(&self.inode),
+        }
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -382,14 +439,23 @@ impl Node for BtrfsNode {
             return Err(VfsError::WrongKind);
         }
         let mut guard = self.fs.inner.lock();
-        let Inner { disk, fs, .. } = &mut *guard;
-        fs.read_at(disk, &self.inode, offset, buf).map_err(convert)
+        let Inner { disk, fs, writer, .. } = &mut *guard;
+        if let Some(writer) = writer.as_ref() {
+            return writer.read_at(disk, self.inode.number, offset, buf).map_err(convert);
+        }
+        let inode = fs.inode(disk, self.inode.number).map_err(convert)?;
+        fs.read_at(disk, &inode, offset, buf).map_err(convert)
     }
 
     fn list(&self) -> VfsResult<Vec<DirEntry>> {
         let mut guard = self.fs.inner.lock();
-        let Inner { disk, fs, .. } = &mut *guard;
-        let entries = fs.list(disk, &self.inode).map_err(convert)?;
+        let entries = match guard.writer.as_ref() {
+            Some(writer) => writer.list(self.inode.number).map_err(convert)?,
+            None => {
+                let Inner { disk, fs, .. } = &mut *guard;
+                fs.list(disk, &self.inode).map_err(convert)?
+            }
+        };
 
         let mut out = Vec::new();
         out.try_reserve_exact(entries.len())
@@ -398,7 +464,7 @@ impl Node for BtrfsNode {
             // Права и размер живут в inode, а не в записи каталога — читать
             // приходится каждый. Та же цена, что у ext2, и по той же причине
             // приемлемая: перечисление вызывает человек, а не горячий путь.
-            let node = fs.inode(disk, entry.inode).map_err(convert)?;
+            let node = guard.inode(entry.inode)?;
             out.push(DirEntry {
                 name: entry.name,
                 kind: kind_of(entry.kind),
@@ -415,12 +481,19 @@ impl Node for BtrfsNode {
     fn lookup(&self, name: &str) -> VfsResult<Box<dyn Node>> {
         let inode = {
             let mut guard = self.fs.inner.lock();
-            let Inner { disk, fs, .. } = &mut *guard;
-            let entry = fs
-                .lookup(disk, &self.inode, name)
-                .map_err(convert)?
-                .ok_or(VfsError::NotFound)?;
-            fs.inode(disk, entry.inode).map_err(convert)?
+            let number = match guard.writer.as_ref() {
+                Some(writer) => {
+                    if self.inode.kind != btrfs::FileType::Directory {
+                        return Err(VfsError::WrongKind);
+                    }
+                    writer.lookup(self.inode.number, name).map_err(convert)?
+                }
+                None => {
+                    let Inner { disk, fs, .. } = &mut *guard;
+                    fs.lookup(disk, &self.inode, name).map_err(convert)?.map(|entry| entry.inode)
+                }
+            };
+            guard.inode(number.ok_or(VfsError::NotFound)?)?
         };
         Ok(Box::new(BtrfsNode { fs: Arc::clone(&self.fs), inode }))
     }
@@ -474,17 +547,10 @@ impl Node for BtrfsNode {
 }
 
 impl BtrfsNode {
-    /// Узел по номеру inode — то, что возвращают создающие операции.
-    ///
-    /// Inode читается уже открытым заново читателем, то есть с диска: так
-    /// возвращённый узел описывает зафиксированный том, а не наши намерения
-    /// насчёт него.
+    /// Узел по номеру inode — то, что возвращают создающие операции. Inode —
+    /// из памяти писателя: создание ещё не зафиксировано.
     fn child(&self, number: u64) -> VfsResult<Box<dyn Node>> {
-        let inode = {
-            let mut guard = self.fs.inner.lock();
-            let Inner { disk, fs, .. } = &mut *guard;
-            fs.inode(disk, number).map_err(convert)?
-        };
+        let inode = self.fs.inner.lock().inode(number)?;
         Ok(Box::new(BtrfsNode { fs: Arc::clone(&self.fs), inode }))
     }
 }

@@ -50,7 +50,7 @@ use crate::chunk::ChunkMap;
 use crate::crc32c;
 use crate::layout::*;
 use crate::node::{self, Stamp};
-use crate::read::{parse_dir_item, read_superblock};
+use crate::read::{DirEntry, Inode, parse_dir_item, read_superblock};
 use crate::tree::Volume;
 use crate::{Error, Result, try_zeroed};
 
@@ -434,6 +434,138 @@ impl Writer {
             raw = &raw[used..];
         }
         Ok(None)
+    }
+
+    // --- чтение из памяти --------------------------------------------------------
+    //
+    // С 30.10 ядро фиксирует не каждую правку, а раз в несколько секунд и по
+    // `sync`, и пока писатель открыт, читают **его**: читатель с диска видел
+    // бы прежний том. Те же деревья в памяти, по которым правки и делаются;
+    // данные — с носителя, со сверкой сумм, как у читателя.
+
+    /// Inode по номеру.
+    pub fn inode(&self, number: u64) -> Result<Inode> {
+        let fs = self.tree(objectid::FS_TREE)?;
+        let at = find(&fs.items, Key::new(number, item_type::INODE_ITEM, 0)).map_err(|_| Error::NotFound)?;
+        Inode::parse(number, &fs.items[at].1)
+    }
+
+    /// Записи каталога в порядке создания (`DIR_INDEX`), как у читателя.
+    pub fn list(&self, dir: u64) -> Result<Vec<DirEntry>> {
+        if !self.is_directory(dir)? {
+            return Err(Error::NotADirectory);
+        }
+        let fs = self.tree(objectid::FS_TREE)?;
+        let first = fs.items.partition_point(|(key, _)| *key < Key::first(dir, item_type::DIR_INDEX));
+        let mut out = Vec::new();
+        for (key, raw) in &fs.items[first..] {
+            if key.objectid != dir || key.kind != item_type::DIR_INDEX {
+                break;
+            }
+            push(&mut out, parse_dir_item(raw)?.0)?;
+        }
+        Ok(out)
+    }
+
+    /// Прочитать до `buf.len()` байт файла с `offset`; у конца файла — меньше.
+    pub fn read_at(&self, dev: &mut dyn BlockDevice, number: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        /// Длиннее за одно обращение к носителю не читается.
+        const RUN: u64 = 256 * 1024;
+        let (size, flags) = self.regular_inode(number)?;
+        if offset >= size {
+            return Ok(0);
+        }
+        let want = (size - offset).min(buf.len() as u64) as usize;
+        let fs = self.tree(objectid::FS_TREE)?;
+        let sector = u64::from(self.sectorsize);
+        let device_sector = u64::from(dev.sector_size());
+        let is_extent = |key: &Key| key.objectid == number && key.kind == item_type::EXTENT_DATA;
+        let mut scratch = Vec::new();
+        let mut done = 0usize;
+        while done < want {
+            let position = offset + done as u64;
+            let next = fs.items.partition_point(|(key, _)| *key <= Key::new(number, item_type::EXTENT_DATA, position));
+            // Где кончается дыра: следующий экстент или конец файла.
+            let gap_end = fs.items.get(next).filter(|(key, _)| is_extent(key)).map_or(size, |(key, _)| key.offset).min(size);
+            let hole = |buf: &mut [u8], done: usize| -> Result<usize> {
+                let take = (gap_end.saturating_sub(position) as usize).min(want - done);
+                if take == 0 {
+                    return Err(Error::Corrupt);
+                }
+                buf[done..done + take].fill(0);
+                Ok(take)
+            };
+            let Some((key, raw)) = next.checked_sub(1).map(|at| &fs.items[at]).filter(|(key, _)| is_extent(key)) else {
+                done += hole(buf, done)?;
+                continue;
+            };
+            if raw.len() <= EXTENT_TYPE {
+                return Err(Error::Corrupt);
+            }
+            if raw[EXTENT_COMPRESSION] != 0 || raw[EXTENT_ENCRYPTION] != 0 {
+                return Err(Error::Unsupported);
+            }
+            let within = position - key.offset;
+            if raw[EXTENT_TYPE] == EXTENT_TYPE_INLINE {
+                let ram = u64_at(raw, EXTENT_RAM_BYTES);
+                let data = &raw[EXTENT_INLINE_DATA..];
+                if (data.len() as u64) < ram {
+                    return Err(Error::Corrupt);
+                }
+                if within >= ram {
+                    done += hole(buf, done)?;
+                    continue;
+                }
+                let take = ((ram - within) as usize).min(want - done);
+                buf[done..done + take].copy_from_slice(&data[within as usize..within as usize + take]);
+                done += take;
+                continue;
+            }
+            if raw.len() < EXTENT_REGULAR_SIZE {
+                return Err(Error::Corrupt);
+            }
+            let length = u64_at(raw, EXTENT_NUM_BYTES);
+            if within >= length {
+                done += hole(buf, done)?;
+                continue;
+            }
+            let take = (length - within).min((want - done) as u64).min(RUN) as usize;
+            let bytenr = u64_at(raw, EXTENT_DISK_BYTENR);
+            if bytenr == 0 || raw[EXTENT_TYPE] == EXTENT_TYPE_PREALLOC {
+                buf[done..done + take].fill(0);
+                done += take;
+                continue;
+            }
+            let logical = bytenr + u64_at(raw, EXTENT_OFFSET) + within;
+            let start = align_down(logical, sector);
+            let stop = align_up(logical + take as u64, sector);
+            let (physical, run) = self.chunks.translate(start)?;
+            if run < stop - start || physical % device_sector != 0 {
+                return Err(Error::Corrupt);
+            }
+            scratch.clear();
+            resize(&mut scratch, (stop - start) as usize)?;
+            dev.read(self.first_lba + physical / device_sector, &mut scratch)?;
+            if flags & INODE_FLAG_NODATASUM == 0 {
+                for (n, piece) in scratch.chunks_exact(sector as usize).enumerate() {
+                    match self.stored_checksum(start + n as u64 * sector)? {
+                        Some(sum) if crc32c::checksum(piece) == sum => {}
+                        Some(_) => return Err(Error::BadChecksum),
+                        None => return Err(Error::Corrupt),
+                    }
+                }
+            }
+            let from = (logical - start) as usize;
+            buf[done..done + take].copy_from_slice(&scratch[from..from + take]);
+            done += take;
+        }
+        Ok(done)
+    }
+
+    /// Есть ли не зафиксированные правки.
+    #[must_use]
+    pub fn pending(&self) -> bool {
+        self.trees.iter().any(|tree| tree.dirty)
     }
 
     /// Создать каталог.

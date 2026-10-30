@@ -70,6 +70,33 @@ pub struct Inode {
     flags: u64,
 }
 
+impl Inode {
+    /// Разобрать `INODE_ITEM` — общий разбор для читателя и для писателя,
+    /// который отвечает по своей памяти (отложенная фиксация).
+    pub(crate) fn parse(number: u64, raw: &[u8]) -> Result<Self> {
+        if raw.len() < INODE_ITEM_SIZE {
+            return Err(Error::Corrupt);
+        }
+        let mode = u32_at(raw, INODE_MODE);
+        let kind = match mode & MODE_FORMAT_MASK {
+            MODE_DIRECTORY => FileType::Directory,
+            MODE_REGULAR => FileType::Regular,
+            _ => FileType::Other,
+        };
+        Ok(Self {
+            number,
+            kind,
+            mode: (mode & 0o7777) as u16,
+            uid: u32_at(raw, INODE_UID),
+            gid: u32_at(raw, INODE_GID),
+            size: u64_at(raw, INODE_SIZE_FIELD),
+            links: u32_at(raw, INODE_NLINK),
+            mtime: u64_at(raw, INODE_MTIME) as i64,
+            flags: u64_at(raw, INODE_FLAGS),
+        })
+    }
+}
+
 /// Запись каталога.
 #[derive(Debug, Clone)]
 pub struct DirEntry {
@@ -246,28 +273,7 @@ impl Btrfs {
         if cursor.key() != Some(key) {
             return Err(Error::NotFound);
         }
-        let raw = cursor.item()?;
-        if raw.len() < INODE_ITEM_SIZE {
-            return Err(Error::Corrupt);
-        }
-
-        let mode = u32_at(raw, INODE_MODE);
-        let kind = match mode & MODE_FORMAT_MASK {
-            MODE_DIRECTORY => FileType::Directory,
-            MODE_REGULAR => FileType::Regular,
-            _ => FileType::Other,
-        };
-        Ok(Inode {
-            number,
-            kind,
-            mode: (mode & 0o7777) as u16,
-            uid: u32_at(raw, INODE_UID),
-            gid: u32_at(raw, INODE_GID),
-            size: u64_at(raw, INODE_SIZE_FIELD),
-            links: u32_at(raw, INODE_NLINK),
-            mtime: u64_at(raw, INODE_MTIME) as i64,
-            flags: u64_at(raw, INODE_FLAGS),
-        })
+        Inode::parse(number, cursor.item()?)
     }
 
     /// Найти узел по абсолютному пути.

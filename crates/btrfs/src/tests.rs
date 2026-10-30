@@ -651,6 +651,46 @@ fn writes_files_and_directories_that_our_reader_reads_back() {
     assert_eq!(report.sectors, 1 + 257);
 }
 
+fn writer_read(writer: &Writer, disk: &mut MemDisk, number: u64, offset: u64, len: usize) -> Vec<u8> {
+    let mut out = alloc::vec![0u8; len];
+    let got = writer.read_at(disk, number, offset, &mut out).unwrap();
+    out.truncate(got);
+    out
+}
+
+#[test]
+fn the_writer_reads_what_it_has_not_committed_yet() {
+    // Отложенная фиксация (30.10): пока писатель открыт, ядро читает его
+    // память, а не диск. Здесь — всё, что запись умеет оставить в памяти до
+    // фиксации, и сверка с тем, что после фиксации читает читатель с диска.
+    let mut disk = fresh_volume(128);
+    let mut writer = Writer::open(&mut disk, 0).unwrap();
+    let dir = writer.create_directory(256, "d", &dir_attrs()).unwrap();
+    let small = writer.create_file(&mut disk, dir, "small", b"inline text\n", &attrs()).unwrap();
+    let mut expected = pattern(300_077, 5);
+    let big = writer.create_file(&mut disk, dir, "big", &expected, &attrs()).unwrap();
+    let patch = pattern(10_000, 9);
+    writer.write_at(&mut disk, big, 123_457, &patch, 1_789_300_001).unwrap();
+    expected[123_457..133_457].copy_from_slice(&patch);
+    writer.truncate(&mut disk, big, 400_000, 1_789_300_002).unwrap();
+    expected.resize(400_000, 0);
+
+    assert_eq!(writer_read(&writer, &mut disk, small, 0, 100), b"inline text\n");
+    assert_eq!(writer_read(&writer, &mut disk, big, 0, 500_000), expected);
+    assert_eq!(writer_read(&writer, &mut disk, big, 299_000, 5000), &expected[299_000..304_000]);
+    assert_eq!(writer_read(&writer, &mut disk, big, 400_000, 10), b"");
+    assert_eq!(writer.inode(big).unwrap().size, 400_000);
+    let names: Vec<String> = writer.list(dir).unwrap().into_iter().map(|entry| entry.name).collect();
+    assert_eq!(names, ["small", "big"]);
+
+    assert!(writer.pending());
+    writer.commit(&mut disk).unwrap();
+    assert!(!writer.pending());
+    assert_eq!(read_path(&mut disk, "/d/big"), expected);
+    assert_eq!(writer_read(&writer, &mut disk, big, 0, 500_000), expected);
+    assert_clean(&mut disk);
+}
+
 /// Носитель, который считает записанные байты.
 struct Counting {
     inner: MemDisk,
