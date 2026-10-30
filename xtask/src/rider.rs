@@ -105,10 +105,18 @@ const DOTNET_MANIFEST: &str = "# FossAi package manifest\n\
 /// Параметры Java-машины Rider: его собственные плюс окна через Wayland, без
 /// окна согласия на сбор данных при первом запуске и с кучей поменьше — у
 /// машины стенда восемь гигабайт на всё.
+///
+/// `idea.filewatcher.disabled` (30.10): `fsnotifier` — статическая программа
+/// под адрес `0x400000`, а память программ у нас — с 512 ГиБ (ниже живёт
+/// ядро), и `execve` отвечает `ENOEXEC`; Rider перезапускал его десятки раз
+/// и показывал «File watcher failed repeatedly». До переезда ядра в верхнюю
+/// половину (нужен и Wine) — без наблюдателя: изменения снаружи Rider видит
+/// при обновлении проекта.
 const VMOPTIONS_EXTRA: &str = "-Dawt.toolkit.name=WLToolkit\n\
     -Djb.consents.confirmation.enabled=false\n\
     -Djb.privacy.policy.text=<!--999.999-->\n\
-    -Dide.show.tips.on.startup.default.value=false\n";
+    -Dide.show.tips.on.startup.default.value=false\n\
+    -Didea.filewatcher.disabled=true\n";
 
 const SCRIPT: &str = "#!/bin/bash\n\
     # Rider на FossAi: библиотеки Wayland и шрифты — из пакета java, окна через Wayland.\n\
