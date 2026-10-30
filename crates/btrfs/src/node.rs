@@ -76,12 +76,14 @@ pub(crate) fn leaf(
     Ok(node)
 }
 
-/// Внутренний узел: первый ключ каждого потомка и его адрес.
+/// Внутренний узел: первый ключ каждого потомка, его адрес и поколение.
 ///
-/// Поколение потомка берётся из печати транзакции: внутренний узел
-/// перестраивается только вместе со всеми своими потомками.
+/// Поколение — **самого потомка** (из его заголовка): с 30.10 нетронутый
+/// узел переживает фиксацию на прежнем месте, и указатель на него обязан
+/// назвать поколение, в котором тот записан, — иначе ядро Linux и `btrfs
+/// check` видят «parent transid verify failed».
 pub(crate) fn internal(
-    children: &[(Key, u64)],
+    children: &[(Key, u64, u64)],
     address: u64,
     owner: u64,
     level: u8,
@@ -95,11 +97,11 @@ pub(crate) fn internal(
         return Err(Error::Corrupt);
     }
     let mut node = try_zeroed(stamp.nodesize as usize)?;
-    for (index, (key, child)) in children.iter().enumerate() {
+    for (index, (key, child, generation)) in children.iter().enumerate() {
         let at = HEADER_SIZE + index * KEY_PTR_SIZE;
         key.store(&mut node, at);
         put_u64(&mut node, at + KEY_SIZE, *child);
-        put_u64(&mut node, at + KEY_SIZE + 8, stamp.generation);
+        put_u64(&mut node, at + KEY_SIZE + 8, *generation);
     }
     header(&mut node, address, owner, children.len(), level, stamp);
     seal(&mut node);

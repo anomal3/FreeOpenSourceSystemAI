@@ -112,11 +112,46 @@ struct Tree {
     id: u64,
     /// Все элементы, по возрастанию ключа.
     items: Items,
-    /// Узлы, из которых дерево состоит на диске сейчас: (адрес, уровень).
-    /// Последний — корень.
-    nodes: Vec<(u64, u8)>,
+    /// Узлы, из которых дерево состоит на диске сейчас, по уровням (0 —
+    /// листья) и внутри уровня по ключу. На верхнем уровне один узел — корень.
+    levels: Vec<Vec<Placed>>,
     dirty: bool,
 }
+
+impl Tree {
+    fn node_count(&self) -> usize {
+        self.levels.iter().map(Vec::len).sum()
+    }
+}
+
+/// Узел на диске — то, что фиксации нужно, чтобы оставить его на месте.
+///
+/// С 30.10 фиксация пишет не дерево целиком, а только узлы, чьё содержимое
+/// изменилось: элементы раскладываются по прежним границам листьев, и лист,
+/// чьи элементы совпали с прежними (по числу и хешу), остаётся на своём
+/// адресе со своим поколением и своей записью в дереве экстентов. Внутренний
+/// узел остаётся, если остались все его потомки. Rider и Debian на томе — это
+/// тысячи листьев, а правка трогает единицы.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placed {
+    address: u64,
+    first: Key,
+    generation: u64,
+    /// Хеш содержимого: элементы листа или указатели внутреннего узла.
+    hash: u64,
+    count: usize,
+}
+
+/// Узел новой раскладки: прежний или новый (диапазон элементов у листа,
+/// диапазон узлов уровня ниже у внутреннего).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Kept(Placed),
+    New { start: usize, end: usize },
+}
+
+/// Раскладка дерева по уровням; на верхнем один узел.
+type Layout = Vec<Vec<Slot>>;
 
 /// Группа блоков: кусок, отданный под один вид содержимого.
 #[derive(Clone, Copy)]
@@ -129,7 +164,12 @@ struct Group {
 /// Раскладка фиксации, посчитанная до первой записи.
 struct Plan {
     rebuilt: Vec<usize>,
+    /// Раскладка каждого перестраиваемого дерева.
+    layouts: Vec<Layout>,
+    /// Адреса **новых** узлов каждого дерева: уровень за уровнем, по ключу.
     placed: Vec<Vec<(u64, u8)>>,
+    /// Корень каждого дерева: адрес, уровень, поколение.
+    tops: Vec<(u64, u8, u64)>,
     extent: Items,
     free_space: Items,
     root: Items,
@@ -477,14 +517,14 @@ impl Writer {
             self.broken = false;
         }
 
-        let plan = match self.plan(generation) {
+        let plan = match self.plan_any(generation) {
             // Метаданным не хватило места. Кусок заводится в памяти — это
             // согласованное добавление, и оно просто уедет в эту же фиксацию.
             Err(Error::NoSpace) => {
-                let nodes: usize = self.trees.iter().map(|tree| tree.nodes.len()).sum();
+                let nodes: usize = self.trees.iter().map(Tree::node_count).sum();
                 let estimate = (nodes as u64 + 16) * u64::from(self.nodesize) * 2;
                 self.allocate_chunk(BLOCK_GROUP_METADATA, estimate)?;
-                self.plan(generation)?
+                self.plan_any(generation)?
             }
             other => other?,
         };
@@ -495,6 +535,7 @@ impl Writer {
             chunk_uuid: self.chunk_uuid,
             generation,
         };
+        let mut levels = Vec::new();
         for (slot, &index) in plan.rebuilt.iter().enumerate() {
             let tree = &self.trees[index];
             let items = match tree.id {
@@ -503,9 +544,11 @@ impl Writer {
                 objectid::ROOT_TREE => &plan.root,
                 _ => &tree.items,
             };
-            for (address, node) in build_tree(items, &plan.placed[slot], tree.id, &stamp)? {
+            let (nodes, built) = build_tree(items, &plan.layouts[slot], &plan.placed[slot], tree.id, &stamp)?;
+            for (address, node) in nodes {
                 self.write_logical(dev, address, &node)?;
             }
+            push(&mut levels, built)?;
         }
         dev.flush()?;
 
@@ -513,10 +556,10 @@ impl Writer {
         self.write_superblocks(dev, sb)?;
 
         // Записано — теперь и память описывает новое состояние.
-        let Plan { rebuilt, placed, extent, free_space, root, .. } = plan;
-        for (index, nodes) in rebuilt.into_iter().zip(placed) {
+        let Plan { rebuilt, extent, free_space, root, .. } = plan;
+        for (index, built) in rebuilt.into_iter().zip(levels) {
             let tree = &mut self.trees[index];
-            tree.nodes = nodes;
+            tree.levels = built;
             tree.dirty = false;
         }
         let extent_index = self.tree_index(objectid::EXTENT_TREE)?;
@@ -1514,56 +1557,86 @@ impl Writer {
 
     // --- фиксация ---------------------------------------------------------------
 
-    /// Посчитать раскладку фиксации, ничего не меняя.
-    fn plan(&self, generation: u64) -> Result<Plan> {
+    /// Раскладка с прежними узлами; не сошлась — прежним способом, всё
+    /// тронутое заново. Второй путь — страховка: он тот, что жил до 30.10.
+    fn plan_any(&self, generation: u64) -> Result<Plan> {
+        match self.plan(generation, true) {
+            Err(Error::Unsupported) => self.plan(generation, false),
+            other => other,
+        }
+    }
+
+    /// Посчитать раскладку фиксации, ничего не меняя. `reuse` — оставлять
+    /// нетронутые узлы на месте.
+    fn plan(&self, generation: u64, reuse: bool) -> Result<Plan> {
         let nodesize = u64::from(self.nodesize);
         let extent_index = self.tree_index(objectid::EXTENT_TREE)?;
         let free_index = self.tree_index(objectid::FREE_SPACE_TREE)?;
         let root_index = self.tree_index(objectid::ROOT_TREE)?;
+        let derived = [extent_index, free_index, root_index];
 
         // Перестраивается всё тронутое и три дерева, которые меняются от любой
         // перестройки: экстентов (новые узлы), свободного места и корней.
         let mut rebuilt = Vec::new();
         for (index, tree) in self.trees.iter().enumerate() {
-            if tree.dirty || [extent_index, free_index, root_index].contains(&index) {
+            if tree.dirty || derived.contains(&index) {
                 push(&mut rebuilt, index)?;
             }
         }
 
-        // Старые узлы перестраиваемых деревьев: записи о них уходят, а место
-        // остаётся занятым до конца фиксации — на них ссылается суперблок.
-        let mut old = Vec::new();
+        // Все прежние узлы перестраиваемых деревьев остаются занятыми до конца
+        // фиксации — на них ссылается суперблок; записи уходят только у
+        // заменённых.
+        let groups = groups(&self.trees[extent_index].items)?;
+        let mut taken = busy_ranges(&self.trees[extent_index].items, self.nodesize)?;
         for &index in &rebuilt {
-            for &(address, _) in &self.trees[index].nodes {
-                push(&mut old, address)?;
+            for placed in self.trees[index].levels.iter().flatten() {
+                push(&mut taken, (placed.address, nodesize))?;
             }
-        }
-        old.sort_unstable();
-
-        let mut base_extent = Vec::new();
-        for (key, raw) in &self.trees[extent_index].items {
-            let record_of_old_node = matches!(key.kind, item_type::METADATA_ITEM | item_type::EXTENT_ITEM)
-                && old.binary_search(&key.objectid).is_ok();
-            if !record_of_old_node {
-                push(&mut base_extent, (*key, copy(raw)?))?;
-            }
-        }
-        let groups = groups(&base_extent)?;
-        let mut taken = busy_ranges(&base_extent, self.nodesize)?;
-        for &address in &old {
-            push(&mut taken, (address, nodesize))?;
         }
         taken.sort_unstable();
 
-        let mut shapes = Vec::new();
+        // Корень дерева корней — всегда новый: его поколение обязано совпасть
+        // с поколением суперблока.
+        let mut layouts = Vec::new();
         for &index in &rebuilt {
-            push(&mut shapes, shape(&self.trees[index].items, self.nodesize)?)?;
+            let tree = &self.trees[index];
+            push(&mut layouts, layout(&tree.items, &tree.levels, self.nodesize, reuse, index == root_index)?)?;
         }
 
         for _ in 0..MAX_ROUNDS {
+            let mut shapes = Vec::new();
+            for layout in &layouts {
+                push(&mut shapes, layout.iter().map(|level| level.iter().filter(|slot| matches!(slot, Slot::New { .. })).count()).collect())?;
+            }
             let placed = self.place(&rebuilt, &shapes, &groups, &taken)?;
 
-            let mut extent = clone_items(&base_extent)?;
+            // Заменённые узлы: прежние, которых нет среди оставленных.
+            let mut replaced = Vec::new();
+            for (slot, &index) in rebuilt.iter().enumerate() {
+                let mut kept = Vec::new();
+                for entry in layouts[slot].iter().flatten() {
+                    if let Slot::Kept(placed) = entry {
+                        push(&mut kept, placed.address)?;
+                    }
+                }
+                kept.sort_unstable();
+                for placed in self.trees[index].levels.iter().flatten() {
+                    if kept.binary_search(&placed.address).is_err() {
+                        push(&mut replaced, placed.address)?;
+                    }
+                }
+            }
+            replaced.sort_unstable();
+
+            let mut extent = Vec::new();
+            for (key, raw) in &self.trees[extent_index].items {
+                let record_of_old_node = matches!(key.kind, item_type::METADATA_ITEM | item_type::EXTENT_ITEM)
+                    && replaced.binary_search(&key.objectid).is_ok();
+                if !record_of_old_node {
+                    push(&mut extent, (*key, copy(raw)?))?;
+                }
+            }
             for (slot, &index) in rebuilt.iter().enumerate() {
                 for &(address, level) in &placed[slot] {
                     let owner = self.trees[index].id;
@@ -1580,22 +1653,31 @@ impl Writer {
             let used = set_group_usage(&mut extent, self.nodesize)?;
             let free_space = free_space_items(&extent, &groups, self.nodesize)?;
 
+            let mut tops = Vec::new();
+            for (slot, layout) in layouts.iter().enumerate() {
+                push(&mut tops, top_of(layout, &placed[slot], generation)?)?;
+            }
+
             let mut root = clone_items(&self.trees[root_index].items)?;
             for (slot, &index) in rebuilt.iter().enumerate() {
                 let tree = &self.trees[index];
                 if tree.id == objectid::ROOT_TREE || tree.id == objectid::CHUNK_TREE {
                     continue;
                 }
-                let (address, level) = top(&placed[slot])?;
+                let (address, level, root_generation) = tops[slot];
+                let nodes: usize = layouts[slot].iter().map(Vec::len).sum();
                 let at = find(&root, Key::new(tree.id, item_type::ROOT_ITEM, 0)).map_err(|_| Error::Corrupt)?;
                 let raw = &mut root[at].1;
-                put_u64(raw, ROOT_ITEM_GENERATION, generation);
+                // Поколение корня, а не транзакции: нетронутое дерево
+                // сохраняет прежний корень, и читающий сверяет его заголовок
+                // именно с этим числом.
+                put_u64(raw, ROOT_ITEM_GENERATION, root_generation);
                 put_u64(raw, ROOT_ITEM_BYTENR, address);
                 raw[ROOT_ITEM_LEVEL] = level;
-                put_u64(raw, ROOT_ITEM_BYTES_USED, placed[slot].len() as u64 * nodesize);
+                put_u64(raw, ROOT_ITEM_BYTES_USED, nodes as u64 * nodesize);
                 // Второе поколение обязано совпасть с первым: по расхождению
                 // ядро узнаёт элемент, записанный старым ядром.
-                put_u64(raw, ROOT_ITEM_GENERATION_V2, generation);
+                put_u64(raw, ROOT_ITEM_GENERATION_V2, root_generation);
                 if tree.id == objectid::FS_TREE && tree.dirty {
                     put_u64(raw, ROOT_ITEM_CTRANSID, generation);
                     put_u64(raw, ROOT_ITEM_CTIME, self.time);
@@ -1603,8 +1685,10 @@ impl Writer {
                 }
             }
 
+            // Раскладка трёх вычисляемых деревьев зависит от их новых
+            // элементов, а те — от раскладки всех: подбор до неподвижной точки.
             let mut next = Vec::new();
-            for &index in &rebuilt {
+            for (slot, &index) in rebuilt.iter().enumerate() {
                 let items = if index == extent_index {
                     &extent
                 } else if index == free_index {
@@ -1612,14 +1696,16 @@ impl Writer {
                 } else if index == root_index {
                     &root
                 } else {
-                    &self.trees[index].items
+                    push(&mut next, layouts[slot].clone())?;
+                    continue;
                 };
-                push(&mut next, shape(items, self.nodesize)?)?;
+                let tree = &self.trees[index];
+                push(&mut next, layout(items, &tree.levels, self.nodesize, reuse, index == root_index)?)?;
             }
-            if next == shapes {
-                return Ok(Plan { rebuilt, placed, extent, free_space, root, used });
+            if next == layouts {
+                return Ok(Plan { rebuilt, layouts, placed, tops, extent, free_space, root, used });
             }
-            shapes = next;
+            layouts = next;
         }
         // Не сошлось — это ошибка подсчёта, а не свойство тома.
         Err(Error::Unsupported)
@@ -1671,15 +1757,18 @@ impl Writer {
         };
 
         let root_slot = slot_of(objectid::ROOT_TREE).ok_or(Error::Corrupt)?;
-        let (root, root_level) = top(&plan.placed[root_slot])?;
+        let (root, root_level, root_generation) = plan.tops[root_slot];
+        if root_generation != generation {
+            return Err(Error::Corrupt);
+        }
         put_u64(&mut sb, SB_GENERATION, generation);
         put_u64(&mut sb, SB_ROOT, root);
         sb[SB_ROOT_LEVEL] = root_level;
         if let Some(slot) = slot_of(objectid::CHUNK_TREE) {
-            let (chunk_root, chunk_level) = top(&plan.placed[slot])?;
+            let (chunk_root, chunk_level, chunk_generation) = plan.tops[slot];
             put_u64(&mut sb, SB_CHUNK_ROOT, chunk_root);
             sb[SB_CHUNK_ROOT_LEVEL] = chunk_level;
-            put_u64(&mut sb, SB_CHUNK_ROOT_GENERATION, generation);
+            put_u64(&mut sb, SB_CHUNK_ROOT_GENERATION, chunk_generation);
         }
         put_u64(&mut sb, SB_BYTES_USED, plan.used);
 
@@ -1791,11 +1880,12 @@ fn load_tree(volume: &mut Volume, dev: &mut dyn BlockDevice, id: u64, root: u64,
     if level as usize >= MAX_DEPTH {
         return Err(Error::Corrupt);
     }
-    let mut tree = Tree { id, items: Vec::new(), nodes: Vec::new(), dirty: false };
-    // Обход в глубину слева направо: элементы приходят уже упорядоченными.
-    // Узлы записываются в порядке «сначала потомки, корень последним» не
-    // обязательно — порядок узлов нужен только при перестройке, а старый список
-    // используется лишь как множество адресов. Корень кладётся последним явно.
+    let mut tree = Tree { id, items: Vec::new(), levels: Vec::new(), dirty: false };
+    for _ in 0..=level {
+        push(&mut tree.levels, Vec::new())?;
+    }
+    // Обход в глубину слева направо: элементы приходят уже упорядоченными, и
+    // узлы каждого уровня — тоже.
     let mut stack = Vec::new();
     push(&mut stack, (root, level))?;
     while let Some((address, expected)) = stack.pop() {
@@ -1804,114 +1894,317 @@ fn load_tree(volume: &mut Volume, dev: &mut dyn BlockDevice, id: u64, root: u64,
         if header.level != expected {
             return Err(Error::Corrupt);
         }
-        if address != root {
-            push(&mut tree.nodes, (address, expected))?;
-        }
         let count = header.nritems as usize;
+        let mut hash = Hasher::new();
+        let first;
         if expected == 0 {
+            first = if count == 0 { Key::new(0, 0, 0) } else { leaf_key(&node, 0) };
             tree.items.try_reserve(count).map_err(|_| Error::NoMemory)?;
             for index in 0..count {
                 let key = leaf_key(&node, index);
-                tree.items.push((key, copy(leaf_item(&node, index)?)?));
+                let data = leaf_item(&node, index)?;
+                hash.item(key, data);
+                tree.items.push((key, copy(data)?));
             }
         } else {
             if count == 0 {
                 return Err(Error::Corrupt);
             }
+            first = node_key(&node, 0);
+            for index in 0..count {
+                hash.child(node_key(&node, index), node_child(&node, index), node_child_generation(&node, index));
+            }
             for index in (0..count).rev() {
                 push(&mut stack, (node_child(&node, index), expected - 1))?;
             }
         }
+        let placed = Placed { address, first, generation: header.generation, hash: hash.finish(), count };
+        push(&mut tree.levels[expected as usize], placed)?;
     }
-    push(&mut tree.nodes, (root, level))?;
+    if tree.levels.last().map(Vec::len) != Some(1) {
+        return Err(Error::Corrupt);
+    }
     // Порядок, в котором их положили чужие руки, проверяется, а не принимается:
     // на непорядке двоичный поиск находит не то, что есть.
     if tree.items.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(Error::Corrupt);
     }
+    // Узлы уровня — по возрастанию первого ключа: по их границам фиксация
+    // раскладывает элементы.
+    if tree.levels.iter().any(|level| level.windows(2).any(|pair| pair[0].first >= pair[1].first)) {
+        return Err(Error::Corrupt);
+    }
     Ok(tree)
+}
+
+/// Хеш содержимого узла (FNV-1a, 64 бита): по нему фиксация узнаёт узел,
+/// который можно оставить на месте. Совпадение числа элементов проверяется
+/// отдельно.
+struct Hasher(u64);
+
+impl Hasher {
+    const fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn key(&mut self, key: Key) {
+        self.bytes(&key.objectid.to_le_bytes());
+        self.bytes(&[key.kind]);
+        self.bytes(&key.offset.to_le_bytes());
+    }
+
+    fn item(&mut self, key: Key, data: &[u8]) {
+        self.key(key);
+        self.bytes(&(data.len() as u32).to_le_bytes());
+        self.bytes(data);
+    }
+
+    fn child(&mut self, key: Key, address: u64, generation: u64) {
+        self.key(key);
+        self.bytes(&address.to_le_bytes());
+        self.bytes(&generation.to_le_bytes());
+    }
+
+    const fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+fn hash_items(items: &[(Key, Vec<u8>)]) -> u64 {
+    let mut hash = Hasher::new();
+    for (key, data) in items {
+        hash.item(*key, data);
+    }
+    hash.finish()
 }
 
 // --- раскладка --------------------------------------------------------------------
 
-/// Где начинается каждый лист, если укладывать элементы подряд.
-fn pack(items: &Items, nodesize: u32) -> Result<Vec<usize>> {
+/// Уложить листьями подряд элементы `[start, end)`.
+fn pack_leaves(items: &Items, start: usize, end: usize, nodesize: u32, out: &mut Vec<Slot>) -> Result<()> {
     let capacity = node::leaf_capacity(nodesize);
-    let mut starts = Vec::new();
-    push(&mut starts, 0)?;
+    let mut from = start;
     let mut used = 0usize;
-    for (index, (_, data)) in items.iter().enumerate() {
+    for (index, (_, data)) in items.iter().enumerate().take(end).skip(start) {
         let need = ITEM_SIZE + data.len();
         if need > capacity {
             return Err(Error::Unsupported);
         }
         if used + need > capacity {
-            push(&mut starts, index)?;
+            push(out, Slot::New { start: from, end: index })?;
+            from = index;
             used = 0;
         }
         used += need;
     }
-    Ok(starts)
+    if from < end {
+        push(out, Slot::New { start: from, end })?;
+    }
+    Ok(())
 }
 
-/// Сколько узлов на каждом уровне займёт дерево.
-fn shape(items: &Items, nodesize: u32) -> Result<Vec<usize>> {
+/// Уложить внутренними узлами подряд узлы уровня ниже `[start, end)`.
+fn pack_internal(start: usize, end: usize, nodesize: u32, out: &mut Vec<Slot>) -> Result<()> {
     let per_node = node::pointers_per_node(nodesize);
-    let mut count = pack(items, nodesize)?.len();
-    let mut levels = Vec::new();
-    push(&mut levels, count)?;
-    while count > 1 {
-        count = count.div_ceil(per_node);
-        push(&mut levels, count)?;
+    let mut from = start;
+    while from < end {
+        let to = (from + per_node).min(end);
+        push(out, Slot::New { start: from, end: to })?;
+        from = to;
     }
-    if levels.len() > MAX_DEPTH {
-        return Err(Error::Unsupported);
-    }
-    Ok(levels)
+    Ok(())
 }
 
-/// Собрать узлы дерева по раскладке и розданным адресам.
-fn build_tree(items: &Items, placed: &[(u64, u8)], owner: u64, stamp: &Stamp) -> Result<Vec<(u64, Vec<u8>)>> {
-    let starts = pack(items, stamp.nodesize)?;
-    let per_node = node::pointers_per_node(stamp.nodesize);
-    let mut addresses = placed.iter();
+/// Разложить записи уровня (`keys` — первый ключ каждой) по границам прежних
+/// узлов этого уровня: прежний узел остаётся, если его отрезок совпал
+/// (`same`), подряд идущие несовпавшие отрезки укладываются заново (`pack`).
+fn relay(
+    keys: &[Key],
+    old: &[Placed],
+    mut same: impl FnMut(&Placed, usize, usize) -> bool,
+    mut pack: impl FnMut(usize, usize, &mut Vec<Slot>) -> Result<()>,
+) -> Result<Vec<Slot>> {
     let mut out = Vec::new();
-
-    let mut level_entries: Vec<(Key, u64)> = Vec::new();
-    for (n, &start) in starts.iter().enumerate() {
-        let end = starts.get(n + 1).copied().unwrap_or(items.len());
-        let &(address, level) = addresses.next().ok_or(Error::Corrupt)?;
-        if level != 0 {
-            return Err(Error::Corrupt);
-        }
-        let leaf = node::leaf(&items[start..end], address, owner, stamp)?;
-        let first = items.get(start).map_or(Key::new(0, 0, 0), |(key, _)| *key);
-        push(&mut level_entries, (first, address))?;
-        push(&mut out, (address, leaf))?;
+    if old.is_empty() {
+        pack(0, keys.len(), &mut out)?;
+        return Ok(out);
     }
-
-    let mut level = 1u8;
-    while level_entries.len() > 1 {
-        let mut upper = Vec::new();
-        for children in level_entries.chunks(per_node) {
-            let &(address, placed_level) = addresses.next().ok_or(Error::Corrupt)?;
-            if placed_level != level {
-                return Err(Error::Corrupt);
+    // Начало несовпавшего хвоста, который ещё не уложен.
+    let mut pending: Option<usize> = None;
+    for (n, placed) in old.iter().enumerate() {
+        let start = if n == 0 { 0 } else { keys.partition_point(|key| *key < placed.first) };
+        let end = old.get(n + 1).map_or(keys.len(), |next| keys.partition_point(|key| *key < next.first));
+        if end > start && end - start == placed.count && same(placed, start, end) {
+            if let Some(from) = pending.take() {
+                pack(from, start, &mut out)?;
             }
-            push(&mut out, (address, node::internal(children, address, owner, level, stamp)?))?;
-            push(&mut upper, (children[0].0, address))?;
+            push(&mut out, Slot::Kept(*placed))?;
+        } else if pending.is_none() {
+            pending = Some(start);
         }
-        level_entries = upper;
-        level += 1;
     }
-    if addresses.next().is_some() {
-        return Err(Error::Corrupt);
+    if let Some(from) = pending {
+        pack(from, keys.len(), &mut out)?;
     }
     Ok(out)
 }
 
-fn top(placed: &[(u64, u8)]) -> Result<(u64, u8)> {
-    placed.last().copied().ok_or(Error::Corrupt)
+/// Раскладка дерева: что остаётся на месте, что пишется заново.
+///
+/// `reuse = false` — всё заново (так было до 30.10). `new_root` — корень
+/// новый в любом случае (дерево корней: его поколение — поколение
+/// суперблока).
+fn layout(items: &Items, old: &[Vec<Placed>], nodesize: u32, reuse: bool, new_root: bool) -> Result<Layout> {
+    let none: &[Placed] = &[];
+    let old_level = |level: usize| if reuse { old.get(level).map_or(none, Vec::as_slice) } else { none };
+
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(items.len()).map_err(|_| Error::NoMemory)?;
+    keys.extend(items.iter().map(|(key, _)| *key));
+    let mut leaves = relay(
+        &keys,
+        old_level(0),
+        |placed, start, end| hash_items(&items[start..end]) == placed.hash,
+        |start, end, out| pack_leaves(items, start, end, nodesize, out),
+    )?;
+    // Пустое дерево — один пустой лист; других пустых листьев не бывает.
+    if leaves.is_empty() {
+        push(&mut leaves, Slot::New { start: 0, end: 0 })?;
+    }
+    let mut out: Layout = Vec::new();
+    let mut below_keys: Vec<Key> = Vec::new();
+    for slot in &leaves {
+        push(
+            &mut below_keys,
+            match *slot {
+                Slot::Kept(placed) => placed.first,
+                Slot::New { start, .. } => items.get(start).map_or(Key::new(0, 0, 0), |(key, _)| *key),
+            },
+        )?;
+    }
+    push(&mut out, leaves)?;
+
+    while out.last().map_or(0, Vec::len) > 1 {
+        if out.len() >= MAX_DEPTH {
+            return Err(Error::Unsupported);
+        }
+        let below = out.last().ok_or(Error::Corrupt)?;
+        let level = relay(
+            &below_keys,
+            old_level(out.len()),
+            |placed, start, end| {
+                let mut hash = Hasher::new();
+                for slot in &below[start..end] {
+                    let Slot::Kept(child) = slot else { return false };
+                    hash.child(child.first, child.address, child.generation);
+                }
+                hash.finish() == placed.hash
+            },
+            |start, end, out| pack_internal(start, end, nodesize, out),
+        )?;
+        let mut keys = Vec::new();
+        for slot in &level {
+            push(
+                &mut keys,
+                match *slot {
+                    Slot::Kept(placed) => placed.first,
+                    Slot::New { start, .. } => below_keys[start],
+                },
+            )?;
+        }
+        below_keys = keys;
+        push(&mut out, level)?;
+    }
+
+    if new_root {
+        let top = out.len() - 1;
+        let end = if top == 0 { items.len() } else { out[top - 1].len() };
+        if let Some(slot @ Slot::Kept(_)) = out[top].first_mut() {
+            *slot = Slot::New { start: 0, end };
+        }
+    }
+    Ok(out)
+}
+
+/// Собрать новые узлы дерева по раскладке и розданным адресам; вместе с
+/// ними — раскладку, какой она станет на диске.
+fn build_tree(
+    items: &Items,
+    layout: &Layout,
+    placed: &[(u64, u8)],
+    owner: u64,
+    stamp: &Stamp,
+) -> Result<(Vec<(u64, Vec<u8>)>, Vec<Vec<Placed>>)> {
+    let mut addresses = placed.iter();
+    let mut out = Vec::new();
+    let mut built: Vec<Vec<Placed>> = Vec::new();
+    for (level, slots) in layout.iter().enumerate() {
+        let mut row = Vec::new();
+        for slot in slots {
+            let placed = match *slot {
+                Slot::Kept(placed) => placed,
+                Slot::New { start, end } => {
+                    let &(address, placed_level) = addresses.next().ok_or(Error::Corrupt)?;
+                    if usize::from(placed_level) != level {
+                        return Err(Error::Corrupt);
+                    }
+                    if level == 0 {
+                        let slice = &items[start..end];
+                        let first = slice.first().map_or(Key::new(0, 0, 0), |(key, _)| *key);
+                        push(&mut out, (address, node::leaf(slice, address, owner, stamp)?))?;
+                        Placed { address, first, generation: stamp.generation, hash: hash_items(slice), count: end - start }
+                    } else {
+                        let below = built.get(level - 1).ok_or(Error::Corrupt)?;
+                        let children = below.get(start..end).ok_or(Error::Corrupt)?;
+                        let mut pointers = Vec::new();
+                        let mut hash = Hasher::new();
+                        for child in children {
+                            push(&mut pointers, (child.first, child.address, child.generation))?;
+                            hash.child(child.first, child.address, child.generation);
+                        }
+                        push(&mut out, (address, node::internal(&pointers, address, owner, level as u8, stamp)?))?;
+                        Placed {
+                            address,
+                            first: pointers.first().ok_or(Error::Corrupt)?.0,
+                            generation: stamp.generation,
+                            hash: hash.finish(),
+                            count: end - start,
+                        }
+                    }
+                }
+            };
+            push(&mut row, placed)?;
+        }
+        push(&mut built, row)?;
+    }
+    if addresses.next().is_some() {
+        return Err(Error::Corrupt);
+    }
+    Ok((out, built))
+}
+
+/// Корень раскладки: адрес, уровень, поколение. Новые узлы раздаются
+/// уровень за уровнем, и новый корень — последний из них.
+fn top_of(layout: &Layout, placed: &[(u64, u8)], generation: u64) -> Result<(u64, u8, u64)> {
+    let level = layout.len().checked_sub(1).ok_or(Error::Corrupt)?;
+    match layout[level].as_slice() {
+        [Slot::Kept(placed)] => Ok((placed.address, level as u8, placed.generation)),
+        [Slot::New { .. }] => {
+            let &(address, placed_level) = placed.last().ok_or(Error::Corrupt)?;
+            if usize::from(placed_level) != level {
+                return Err(Error::Corrupt);
+            }
+            Ok((address, level as u8, generation))
+        }
+        _ => Err(Error::Corrupt),
+    }
 }
 
 /// Группы блоков, как их описывает дерево экстентов.

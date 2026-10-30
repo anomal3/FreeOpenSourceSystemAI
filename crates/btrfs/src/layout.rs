@@ -325,6 +325,11 @@ pub(crate) fn node_child(node: &[u8], index: usize) -> u64 {
     u64_at(node, HEADER_SIZE + index * KEY_PTR_SIZE + KEY_SIZE)
 }
 
+/// Поколение `index`-го потомка, как его записал родитель.
+pub(crate) fn node_child_generation(node: &[u8], index: usize) -> u64 {
+    u64_at(node, HEADER_SIZE + index * KEY_PTR_SIZE + KEY_SIZE + 8)
+}
+
 // --- куски -------------------------------------------------------------------
 
 /// Размер описания куска без полос.

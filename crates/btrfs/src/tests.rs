@@ -651,6 +651,72 @@ fn writes_files_and_directories_that_our_reader_reads_back() {
     assert_eq!(report.sectors, 1 + 257);
 }
 
+/// Носитель, который считает записанные байты.
+struct Counting {
+    inner: MemDisk,
+    written: usize,
+}
+
+impl BlockDevice for Counting {
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+
+    fn sector_count(&self) -> u64 {
+        self.inner.sector_count()
+    }
+
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> core::result::Result<(), disk::Error> {
+        self.inner.read(lba, buf)
+    }
+
+    fn write(&mut self, lba: u64, buf: &[u8]) -> core::result::Result<(), disk::Error> {
+        self.written += buf.len();
+        self.inner.write(lba, buf)
+    }
+
+    fn flush(&mut self) -> core::result::Result<(), disk::Error> {
+        self.inner.flush()
+    }
+}
+
+#[test]
+fn a_small_edit_rewrites_a_few_nodes_not_whole_trees() {
+    // Фиксация пишет только узлы, чьё содержимое изменилось (30.10): на томе
+    // с тремя тысячами файлов — около сотни листьев — одна новая запись
+    // трогает единицы узлов. И после нового открытия (раскладка прочитана с
+    // диска), и во второй фиксации того же писателя (раскладка из памяти).
+    let mut dev = Counting { inner: fresh_volume(128), written: 0 };
+    {
+        let mut writer = Writer::open(&mut dev, 0).unwrap();
+        let dir = writer.create_directory(256, "many", &dir_attrs()).unwrap();
+        for n in 0..3000u32 {
+            let text = format!("file {n}\n");
+            writer.create_file(&mut dev, dir, &format!("f{n:04}"), text.as_bytes(), &attrs()).unwrap();
+        }
+        writer.commit(&mut dev).unwrap();
+    }
+    let whole = dev.written;
+    let nodesize = 16 * 1024;
+    assert!(whole > 60 * nodesize, "первая фиксация мала для проверки: {whole} байт");
+
+    let mut writer = Writer::open(&mut dev, 0).unwrap();
+    for (round, name) in ["one.txt", "two.txt"].into_iter().enumerate() {
+        let before = dev.written;
+        writer.create_file(&mut dev, 256, name, b"small\n", &attrs()).unwrap();
+        writer.commit(&mut dev).unwrap();
+        let wrote = dev.written - before;
+        assert!(wrote < 16 * nodesize, "правка {round} записала {} узлов из ~{}", wrote / nodesize, whole / nodesize);
+    }
+    drop(writer);
+
+    let mut disk = dev.inner;
+    assert_eq!(read_path(&mut disk, "/two.txt"), b"small\n");
+    assert_eq!(read_path(&mut disk, "/many/f2999"), b"file 2999\n");
+    let report = assert_clean(&mut disk);
+    assert_eq!((report.files, report.directories), (3002, 2));
+}
+
 #[test]
 fn many_transactions_reuse_the_space_they_free() {
     // Каждая фиксация перестраивает дерево ФС на новом месте. Без повторного
