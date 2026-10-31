@@ -168,6 +168,21 @@ pub trait BlockDevice {
 
     /// Довести записи до носителя.
     fn flush(&mut self) -> Result<()>;
+
+    /// Чтение, которое можно вести из нескольких потоков сразу, мимо замка
+    /// вокруг носителя: драйвер с несколькими командами в полёте (AHCI) отдаёт
+    /// его здесь, обёртки передают дальше. `None` — так нельзя, читать через
+    /// [`BlockDevice::read`] под замком.
+    fn parallel(&self) -> Option<alloc::sync::Arc<dyn ParallelRead>> {
+        None
+    }
+}
+
+/// Чтение без исключительного доступа — см. [`BlockDevice::parallel`].
+pub trait ParallelRead: Send + Sync {
+    /// Прочитать `buf.len() / sector_size` секторов с `lba` — как
+    /// [`BlockDevice::read`], но по общей ссылке.
+    fn read_parallel(&self, lba: u64, buf: &mut [u8]) -> Result<()>;
 }
 
 /// Проверяет, что с носителем вообще можно работать.

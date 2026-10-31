@@ -239,6 +239,12 @@ fn text(path: &str) -> Option<String> {
         "/etc/passwd" | "/etc/group" => Some(accounts_text(path == "/etc/group")),
         "/proc/version" => Some(String::from("Linux version 6.1.0-fossai (FossAi) #1 SMP\n")),
         "/proc/sys/kernel/osrelease" => Some(String::from("6.1.0-fossai\n")),
+        // Пределы `inotify` (31.10): `fsnotifier` Rider читает предел
+        // наблюдений первым делом и без файла выходит с кодом 2. Числа — как у
+        // Linux 6.x; своих пределов у нашего `inotify` нет.
+        "/proc/sys/fs/inotify/max_user_watches" => Some(String::from("524288\n")),
+        "/proc/sys/fs/inotify/max_user_instances" => Some(String::from("128\n")),
+        "/proc/sys/fs/inotify/max_queued_events" => Some(String::from("16384\n")),
         "/sys/devices/system/cpu/online" | "/sys/devices/system/cpu/possible" | "/sys/devices/system/cpu/present" => {
             Some(if cpus == 1 { String::from("0\n") } else { format!("0-{}\n", cpus - 1) })
         }

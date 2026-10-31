@@ -181,6 +181,12 @@ impl Reader {
         self.pipe.inner.lock().writers == 0
     }
 
+    /// Есть ли в канале непрочитанные байты.
+    #[must_use]
+    pub fn has_data(&self) -> bool {
+        self.pipe.inner.lock().len > 0
+    }
+
     /// `(адрес, читателей, писателей)` — для журнала.
     #[must_use]
     pub fn state(&self) -> (usize, usize, usize) {

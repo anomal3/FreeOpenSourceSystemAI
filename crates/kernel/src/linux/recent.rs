@@ -81,7 +81,8 @@ fn trace(number: usize, args: [usize; 6], result: i64) {
     let Some(path) = crate::user::with_current(|program| program.path.clone()) else { return };
     let matches = {
         let name = TRACE.lock();
-        !name.is_empty() && path.ends_with(name.as_str())
+        // Несколько имён — через запятую.
+        name.split(',').any(|one| !one.is_empty() && path.ends_with(one))
     };
     if !matches || TRACE_LEFT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err() {
         return;
@@ -93,6 +94,24 @@ fn trace(number: usize, args: [usize; 6], result: i64) {
         264 | 316 => alloc::format!("{} -> {}", path_of(1), path_of(3)),
         83 => path_of(0),
         258 | 263 => path_of(1),
+        // `poll`/`ppoll`: первые записи `pollfd` — `fd/events/revents`; по ним
+        // видно, что именно «готово» у программы, крутящей опрос.
+        7 | 271 if crate::user::space::user_can(args[0], args[1].min(4) * 8, crate::mm::PageFlags::READ) => {
+            let mut text = String::new();
+            for index in 0..args[1].min(4) {
+                // SAFETY: проверено условием ветки.
+                let at = args[0] + index * 8;
+                let (fd, events, revents) = unsafe {
+                    (
+                        core::ptr::read_unaligned(at as *const i32),
+                        core::ptr::read_unaligned((at + 4) as *const u16),
+                        core::ptr::read_unaligned((at + 6) as *const u16),
+                    )
+                };
+                text.push_str(&alloc::format!("fd {fd} ev {events:#x} rev {revents:#x}; "));
+            }
+            text
+        }
         _ => path_arg(number).map(path_of).unwrap_or_default(),
     };
     let [a0, a1, a2, a3, ..] = args;

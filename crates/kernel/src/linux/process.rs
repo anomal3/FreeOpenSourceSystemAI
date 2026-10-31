@@ -322,7 +322,9 @@ pub fn execve(frame: &mut crate::arch::TrapFrame, path: usize, argv: usize, envp
     let linux = if linux == "/proc/self/exe" {
         crate::user::with_current(|program| String::from(crate::linux_path::shown(&program.path))).unwrap_or(linux)
     } else {
-        linux
+        // По ссылкам Linux, в том числе через каталог-ссылку посреди пути
+        // (`jetbrainsd` Rider, 31.10.2026).
+        super::links::follow(&linux)
     };
     let mut bytes = 0;
     let vectors = user_vector(argv, &mut bytes).and_then(|args| Ok((args, user_vector(envp, &mut bytes)?)));

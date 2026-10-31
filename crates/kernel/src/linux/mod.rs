@@ -149,6 +149,8 @@ mod nr {
     pub const SCHED_SETAFFINITY: usize = 203;
     pub const CLOCK_NANOSLEEP: usize = 230;
     pub const PPOLL: usize = 271;
+    pub const SELECT: usize = 23;
+    pub const PSELECT6: usize = 270;
     pub const PIPE2: usize = 293;
     pub const MEMBARRIER: usize = 324;
     pub const MLOCK: usize = 149;
@@ -519,6 +521,8 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             nr::CLONE3 => thread::clone3(frame, a0, a1),
             nr::POLL => poll::poll(a0, a1, a2 as i32 as i64),
             nr::PPOLL => poll::ppoll(a0, a1, a2),
+            nr::SELECT => poll::select(a0 as u32 as usize, a1, a2, a3, a4),
+            nr::PSELECT6 => poll::pselect(a0 as u32 as usize, a1, a2, a3, a4),
             nr::PIPE => poll::pipe(a0, 0),
             nr::PIPE2 => poll::pipe(a0, a1),
             nr::PRCTL => thread::prctl(a0, a1),
@@ -675,6 +679,19 @@ fn normalize(path: &str) -> String {
             }
             other => parts.push(other),
         }
+    }
+    // `/proc/<свой номер>` — то же, что `/proc/self` (31.10.2026): `jetbrainsd`
+    // Rider (GraalVM) ищет свою библиотеку JNA через `readlink("/proc/<pid>/exe")`
+    // и `stat("/proc/<pid>")`, а ядро понимало только `self` — он падал с
+    // кодом 101, и Rider перезапускал его десятки раз.
+    let own = if parts.len() >= 2 && parts[0] == "proc" && parts[1].bytes().all(|byte| byte.is_ascii_digit()) {
+        let pid = crate::user::with_current(|program| program.linux_pid).unwrap_or(0);
+        pid != 0 && parts[1].parse::<u32>().ok() == Some(pid)
+    } else {
+        false
+    };
+    if own {
+        parts[1] = "self";
     }
     let mut out = String::with_capacity(path.len() + 1);
     for part in &parts {

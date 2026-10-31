@@ -51,6 +51,8 @@
 //! стоит одно чтение за другим.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU32, Ordering};
 use alloc::vec::Vec;
 
 use crate::mm::dma::{self, DmaBuffer, DmaError};
@@ -90,6 +92,8 @@ const GHC_IE: u32 = 1 << 1;
 const CAP_S64A: u32 = 1 << 31;
 /// `CAP.NP` — число портов минус один, младшие пять бит.
 const CAP_NP_MASK: u32 = 0x1F;
+/// `CAP.SNCQ`: контроллер умеет очередь команд устройства (NCQ).
+const CAP_SNCQ: u32 = 1 << 30;
 
 /// Начало области портов и шаг между ними.
 const PORT_BASE: usize = 0x100;
@@ -113,6 +117,8 @@ const PX_SSTS: usize = 0x28;
 const PX_SCTL: usize = 0x2C;
 const PX_SERR: usize = 0x30;
 const PX_CI: usize = 0x38;
+/// `PxSACT`: теги команд NCQ, которые устройство ещё не завершило.
+const PX_SACT: usize = 0x34;
 
 /// `PxCMD.ST` — обрабатывать команды.
 const CMD_ST: u32 = 1 << 0;
@@ -171,6 +177,9 @@ const ATA_READ_DMA_EXT: u8 = 0x25;
 const ATA_WRITE_DMA_EXT: u8 = 0x35;
 /// Сбросить кеш записи на носитель.
 const ATA_FLUSH_CACHE_EXT: u8 = 0xEA;
+/// `READ FPDMA QUEUED` и `WRITE FPDMA QUEUED` — чтение и запись очередью NCQ.
+const ATA_READ_FPDMA: u8 = 0x60;
+const ATA_WRITE_FPDMA: u8 = 0x61;
 
 /// Тип FIS «регистры, от хоста к устройству».
 const FIS_TYPE_H2D: u8 = 0x27;
@@ -186,9 +195,16 @@ const IDENTIFY_BYTES: usize = 512;
 /// сообщением.
 pub const SECTOR_SIZE: usize = 512;
 
-/// Наибольшая передача за одну команду. Столько же, сколько у virtio-blk, и по
-/// той же причине: буфер выделяется один раз на всё время работы.
-const MAX_TRANSFER: usize = 64 * 1024;
+/// Наибольшая передача за одну команду; буфер выделяется один раз на всё время
+/// работы.
+///
+/// Было 64 КиБ, как у virtio-blk. Запросы сверху крупнее: упреждающее чтение
+/// страниц — окнами до мегабайта, ext2 режет их по 256 КиБ и склеивает
+/// смежные блоки в одно чтение. На 64 КиБ каждый такой кусок становился
+/// четырьмя полными кругами «команда — ожидание — копирование», и диск стоял,
+/// пока шло копирование (31.10.2026: запуск Rider упирается в диск). Один
+/// элемент PRDT берёт до 4 МиБ.
+const MAX_TRANSFER: usize = 256 * 1024;
 
 /// Сколько ждать, пока порт остановится или запустится.
 const PORT_TIMEOUT_MS: u64 = 1_000;
@@ -297,32 +313,69 @@ impl core::fmt::Display for AhciError {
 /// структуры контроллера, которую пришлось бы держать под замком. Окно
 /// регистров отображено один раз на весь контроллер, а порт помнит адрес своей
 /// части.
+///
+/// Сам порт — [`Port`] за `Arc`: чтения идут через него из нескольких потоков
+/// сразу ([`disk::ParallelRead`]), запись и сброс — через этот объект под
+/// замком носителя, но тем же порядком слотов.
 pub struct AhciDisk {
+    port: Arc<Port>,
+    /// Номер порта — он же имя диска в журнале.
+    port_index: usize,
+    sectors: u64,
+    /// Размер логического сектора, объявленный самим диском.
+    sector_size: usize,
+}
+
+/// Сколько слотов команд драйвер ведёт одновременно (31.10.2026).
+///
+/// Было — один, слот 0: каждое чтение ждало предыдущее, и сотни потоков
+/// Rider, взявших отказ страницы, стояли к диску в очередь. Несколько команд
+/// сразу — только очередью NCQ (`READ/WRITE FPDMA QUEUED`, тег = слот):
+/// обычные команды ATA устройство исключительные, и первая проба — четыре
+/// слота с `READ DMA EXT` — в VirtualBox под нагрузкой кончалась командами,
+/// которые не завершались никогда. Без NCQ (у контроллера или диска) — один
+/// слот, как раньше. Четыре — не больше `CAP.NCS` и глубины очереди диска,
+/// и это 1 МиБ буферов DMA на порт.
+///
+/// **Пока один.** NCQ проходит все сценарии в QEMU (обе архитектуры), но в
+/// VirtualBox под запуском Chromium команды очереди — сначала запись среди
+/// чтений, потом и чтение, когда записи стали исключительными, — не
+/// завершались (таймаут 10 с), и порт заклинивало: восстановления после
+/// таймаута у драйвера нет. До разбора (что именно ждёт эмуляция VirtualBox
+/// и сброс порта после ошибки — ROADMAP «Скорость диска») — прежний путь:
+/// одна команда, без очереди, чтение под замком носителя.
+const SLOTS: usize = 1;
+
+/// Слот команды: своя таблица (FIS и один элемент PRDT) и свой буфер данных.
+struct Slot {
+    table: DmaBuffer,
+    data: DmaBuffer,
+}
+
+/// Порт: регистры, список команд и слоты — общий для всех, кто читает.
+pub struct Port {
     /// Регистры порта.
-    port: VirtAddr,
-    /// Список команд: 32 заголовка по 32 байта. Используется слот 0.
+    regs: VirtAddr,
+    /// Список команд: 32 заголовка по 32 байта, заняты первые `slots.len()`.
     ///
     /// Буферы хранятся не потому, что нужны их адреса — те уже записаны в
     /// регистры порта, — а потому, что освобождение буфера, на который смотрит
     /// работающее устройство, отдало бы его следующему просителю. Пока живёт
     /// диск, живут и они.
-    #[allow(dead_code)]
     command_list: DmaBuffer,
     /// Область, куда контроллер складывает ответы устройства.
     #[allow(dead_code)]
     received_fis: DmaBuffer,
-    /// Таблица команды слота 0: FIS и один элемент PRDT.
-    table: DmaBuffer,
-    /// Буфер данных, через который проходят все чтения и записи.
-    data: DmaBuffer,
-    /// Номер порта — он же имя диска в журнале.
-    port_index: usize,
+    slots: Vec<Slot>,
+    /// Занятые слоты, по биту на слот.
+    busy: AtomicU32,
     /// Ярлык прерывания, если контроллер согласился его присылать. `None` —
     /// ждём холостым циклом, как ядро ждало всегда.
     irq: Option<u32>,
     sectors: u64,
-    /// Размер логического сектора, объявленный самим диском.
     sector_size: usize,
+    /// Чтение и запись — очередью NCQ (несколько слотов). Иначе слот один.
+    ncq: bool,
 }
 
 /// Найти контроллеры AHCI и поднять все диски, какие за ними есть.
@@ -399,6 +452,8 @@ unsafe fn attach(device: &Device, disks: &mut Vec<AhciDisk>) -> Result<(), AhciE
     // этому моменту уже должно быть известно, писать туда что-то или ноль.
     // SAFETY: окно отображено, режим AHCI включён выше.
     let irq = unsafe { enable_interrupts(device, base) };
+    // Слотов команд у контроллера — `CAP.NCS + 1`.
+    let slots = ((cap >> 8) & 0x1F) as usize + 1;
 
     for index in 0..MAX_PORTS {
         if ports & (1 << index) == 0 {
@@ -416,14 +471,15 @@ unsafe fn attach(device: &Device, disks: &mut Vec<AhciDisk>) -> Result<(), AhciE
         }
 
         // SAFETY: контракт функции.
-        match unsafe { AhciDisk::start(port, index, irq) } {
+        match unsafe { AhciDisk::start(port, index, irq, slots, cap & CAP_SNCQ != 0) } {
             Ok(disk) => {
                 STARTED_PORTS.fetch_or(1 << index, core::sync::atomic::Ordering::Relaxed);
                 kprintln!(
-                    "  ahci        : port {index}: {} sectors of {} B ({} MiB)",
+                    "  ahci        : port {index}: {} sectors of {} B ({} MiB), {}",
                     disk.sectors,
                     disk.sector_size,
                     disk.sectors * disk.sector_size as u64 / (1024 * 1024),
+                    if disk.slots() > 1 { alloc::format!("NCQ, {} commands at once", disk.slots()) } else { alloc::format!("one command at a time") },
                 );
                 disks.push(disk);
             }
@@ -574,39 +630,42 @@ unsafe fn map_window(phys: PhysAddr) -> Result<VirtAddr, AhciError> {
 }
 
 impl AhciDisk {
-    /// Подготовить порт и опознать диск за ним.
+    /// Подготовить порт и опознать диск за ним; `slots` — сколько слотов
+    /// команд у контроллера (`CAP.NCS`).
     ///
     /// # Safety
     ///
     /// `port` должен указывать на отображённое окно регистров порта.
-    unsafe fn start(port: VirtAddr, port_index: usize, irq: Option<u32>) -> Result<Self, AhciError> {
+    unsafe fn start(regs: VirtAddr, port_index: usize, irq: Option<u32>, slots: usize, ncq: bool) -> Result<Self, AhciError> {
         // SAFETY: контракт функции.
-        unsafe { stop(port) }?;
+        unsafe { stop(regs) }?;
 
         let command_list = dma::alloc(32 * 32).map_err(AhciError::NoMemory)?;
         let received_fis = dma::alloc(256).map_err(AhciError::NoMemory)?;
-        let table = dma::alloc(0x80 + 16).map_err(AhciError::NoMemory)?;
-        let data = dma::alloc(MAX_TRANSFER).map_err(AhciError::NoMemory)?;
+        let first = Slot {
+            table: dma::alloc(0x80 + 16).map_err(AhciError::NoMemory)?,
+            data: dma::alloc(MAX_TRANSFER).map_err(AhciError::NoMemory)?,
+        };
 
         // SAFETY: контракт функции; буферы выделены и обнулены аллокатором DMA.
         unsafe {
-            write32(port, PX_CLB, command_list.phys().as_u64() as u32);
-            write32(port, PX_CLBU, (command_list.phys().as_u64() >> 32) as u32);
-            write32(port, PX_FB, received_fis.phys().as_u64() as u32);
-            write32(port, PX_FBU, (received_fis.phys().as_u64() >> 32) as u32);
+            write32(regs, PX_CLB, command_list.phys().as_u64() as u32);
+            write32(regs, PX_CLBU, (command_list.phys().as_u64() >> 32) as u32);
+            write32(regs, PX_FB, received_fis.phys().as_u64() as u32);
+            write32(regs, PX_FBU, (received_fis.phys().as_u64() >> 32) as u32);
             // Ошибки, накопленные прошивкой, сбрасываются записью единиц в те же
             // биты: иначе первая же проверка после команды увидит чужую ошибку и
             // объявит отказом наше исправное чтение.
-            write32(port, PX_SERR, u32::MAX);
-            write32(port, PX_IS, u32::MAX);
+            write32(regs, PX_SERR, u32::MAX);
+            write32(regs, PX_IS, u32::MAX);
             // События порта разрешаются, только если прерывание действительно
             // настроено. Разрешить их без обработчика — верный способ получить
             // бесконечный уровневый прерыватель на общей линии.
-            write32(port, PX_IE, if irq.is_some() { PORT_INTERRUPTS } else { 0 });
+            write32(regs, PX_IE, if irq.is_some() { PORT_INTERRUPTS } else { 0 });
         }
 
         // SAFETY: контракт функции.
-        unsafe { start_port(port) }?;
+        unsafe { start_port(regs) }?;
 
         // Подпись читается **после** запуска порта, и это не порядок ради
         // порядка. `PxSIG` заполняется тем, что устройство прислало первым
@@ -617,7 +676,7 @@ impl AhciDisk {
         // отвечал `0xFFFFFFFF` — «устройства нет» там, где оно есть.
         //
         // SAFETY: контракт функции.
-        let sig = unsafe { read32(port, PX_SIG) };
+        let sig = unsafe { read32(regs, PX_SIG) };
         if sig != SIG_ATA {
             // Привод CD (ATAPI) и порт-множитель отвечают другой подписью.
             // Пропустить их — не потеря: команды у них свои, и притвориться,
@@ -625,19 +684,32 @@ impl AhciDisk {
             return Err(AhciError::NotAta(sig));
         }
 
-        let mut disk = Self {
-            port,
+        let mut port = Port {
+            regs,
             command_list,
             received_fis,
-            table,
-            data,
-            port_index,
+            slots: alloc::vec![first],
+            busy: AtomicU32::new(0),
             irq,
             sectors: 0,
             sector_size: SECTOR_SIZE,
+            ncq: false,
         };
-        disk.identify()?;
-        Ok(disk)
+        let depth = port.identify()?;
+        // NCQ — если умеют оба: контроллер (`CAP.SNCQ`) и диск (слово 76).
+        port.ncq = ncq && depth > 1 && SLOTS > 1;
+        let slots = if port.ncq { slots.min(depth) } else { 1 };
+        // Остальные слоты — только у настоящего диска: окно DMA не
+        // освобождается, и тратить его на привод CD незачем. Не хватило окна —
+        // работаем на тех, что есть.
+        for _ in 1..slots.clamp(1, SLOTS) {
+            let (Ok(table), Ok(data)) = (dma::alloc(0x80 + 16), dma::alloc(MAX_TRANSFER)) else {
+                break;
+            };
+            port.slots.push(Slot { table, data });
+        }
+        let (sectors, sector_size) = (port.sectors, port.sector_size);
+        Ok(Self { port: Arc::new(port), port_index, sectors, sector_size })
     }
 
     /// Номер порта, за которым стоит этот диск.
@@ -646,24 +718,34 @@ impl AhciDisk {
         self.port_index
     }
 
+    /// Сколько слотов команд ведёт порт.
+    #[must_use]
+    pub fn slots(&self) -> usize {
+        self.port.slots.len()
+    }
+}
+
+impl Port {
     /// Спросить диск, что он такое.
     ///
     /// Нужны две вещи: сколько у него секторов и какого они размера. Первое
     /// лежит в словах 100–103 (48-битная ёмкость), второе приходится собирать из
     /// слова 106 и пары 117–118 — поле, которого у старых дисков нет, и тогда
     /// сектор равен 512 по умолчанию.
-    fn identify(&mut self) -> Result<(), AhciError> {
-        self.run(ATA_IDENTIFY, 0, 0, IDENTIFY_BYTES, false)?;
-
+    fn identify(&mut self) -> Result<usize, AhciError> {
+        let slot = self.acquire();
+        let result = self.run(slot, ATA_IDENTIFY, 0, 0, IDENTIFY_BYTES, false);
         // SAFETY: буфер выделен на MAX_TRANSFER байт, читаются первые 512.
         let words: [u16; 256] = unsafe {
             let mut words = [0u16; 256];
-            let src = self.data.as_ptr::<u16>();
+            let src = self.slots[slot].data.as_ptr::<u16>();
             for (index, word) in words.iter_mut().enumerate() {
                 *word = src.add(index).read_volatile();
             }
             words
         };
+        self.release(slot);
+        result?;
 
         let sectors = u64::from(words[100])
             | (u64::from(words[101]) << 16)
@@ -689,27 +771,108 @@ impl AhciDisk {
 
         self.sectors = sectors;
         self.sector_size = sector_size as usize;
-        Ok(())
+        // Глубина очереди NCQ: слово 76 бит 8 — диск умеет NCQ, слово 75 биты
+        // 4:0 — глубина минус один. Ноль — NCQ нет.
+        let depth = if words[76] != 0xFFFF && words[76] & (1 << 8) != 0 {
+            usize::from(words[75] & 0x1F) + 1
+        } else {
+            0
+        };
+        Ok(depth)
     }
 
-    /// Выполнить одну команду в слоте 0.
+    /// Ярлык, на котором можно спать, ожидая порт; `None` — ждать циклом
+    /// (прерывания нет или планировщик ещё не запущен).
+    fn sleep_source(&self) -> Option<u32> {
+        self.irq
+            .or_else(|| LATE_INTX.load(core::sync::atomic::Ordering::Acquire).then_some(IRQ_SOURCE))
+            .filter(|_| crate::sched::is_running())
+    }
+
+    /// Занять свободный слот; все заняты — подождать.
+    fn acquire(&self) -> usize {
+        let all = (1u32 << self.slots.len()) - 1;
+        loop {
+            let busy = self.busy.load(Ordering::Acquire);
+            if busy & all != all {
+                let slot = (!busy & all).trailing_zeros() as usize;
+                if self
+                    .busy
+                    .compare_exchange(busy, busy | (1 << slot), Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return slot;
+                }
+                continue;
+            }
+            match self.sleep_source() {
+                // Слот освобождает задача, а не прерывание; она же будит
+                // ждущих (`release`). Срок — на случай разминувшихся.
+                Some(source) => crate::sched::block_on_irq_until(source, SLEEP_SLICE_MS, || {
+                    self.busy.load(Ordering::Acquire) & all != all
+                }),
+                None => core::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// Занять порт целиком — для команды вне очереди (сброс кеша) при NCQ:
+    /// такую команду нельзя выдавать, пока в очереди есть команды NCQ.
+    /// Возвращает слот, в котором её выполнять.
+    fn acquire_all(&self) -> usize {
+        let all = (1u32 << self.slots.len()) - 1;
+        loop {
+            if self.busy.compare_exchange(0, all, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return 0;
+            }
+            match self.sleep_source() {
+                Some(source) => crate::sched::block_on_irq_until(source, SLEEP_SLICE_MS, || {
+                    self.busy.load(Ordering::Acquire) == 0
+                }),
+                None => core::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// Освободить всё, занятое [`Port::acquire_all`].
+    fn release_all(&self) {
+        self.busy.store(0, Ordering::Release);
+        if self.sleep_source().is_some() {
+            crate::sched::wake_irq(IRQ_SOURCE);
+        }
+    }
+
+    /// Освободить слот и разбудить ждущих свободного.
+    fn release(&self, slot: usize) {
+        self.busy.fetch_and(!(1 << slot), Ordering::AcqRel);
+        if self.sleep_source().is_some() {
+            crate::sched::wake_irq(IRQ_SOURCE);
+        }
+    }
+
+    /// Выполнить одну команду в слоте `slot` (занятом вызывающим).
     ///
     /// `write` означает направление передачи: данные идут от нас к устройству.
     /// Флаг попадает в заголовок команды, и перепутать его — значит записать
     /// туда, откуда собирались читать.
     fn run(
-        &mut self,
+        &self,
+        slot: usize,
         command: u8,
         lba: u64,
         count: u16,
         bytes: usize,
         write: bool,
     ) -> Result<(), AhciError> {
-        // Заголовок команды слота 0.
+        let table = self.slots[slot].table;
+        let data = self.slots[slot].data;
+        let queued = matches!(command, ATA_READ_FPDMA | ATA_WRITE_FPDMA);
+        // Заголовок команды слота.
         //
-        // SAFETY: список команд выделен на 32 заголовка; пишется нулевой.
+        // SAFETY: список команд выделен на 32 заголовка по 32 байта; слот
+        // занят вызывающим, и этот заголовок больше никто не пишет.
         unsafe {
-            let header = self.command_list.as_ptr::<u32>();
+            let header = self.command_list.as_ptr::<u32>().add(slot * 8);
             // Длина FIS в двойных словах (пять), направление, и один элемент
             // PRDT в старшей половине слова.
             let mut dw0 = 5u32;
@@ -723,8 +886,8 @@ impl AhciDisk {
             // Сколько байт передано — заполняет контроллер; обнуляется, чтобы
             // прошлое значение не было принято за нынешнее.
             header.add(1).write_volatile(0);
-            header.add(2).write_volatile(self.table.phys().as_u64() as u32);
-            header.add(3).write_volatile((self.table.phys().as_u64() >> 32) as u32);
+            header.add(2).write_volatile(table.phys().as_u64() as u32);
+            header.add(3).write_volatile((table.phys().as_u64() >> 32) as u32);
             for index in 4..8 {
                 header.add(index).write_volatile(0);
             }
@@ -733,9 +896,9 @@ impl AhciDisk {
         // FIS команды и элемент PRDT.
         //
         // SAFETY: таблица выделена на FIS (0x80 байт с запасом) и один элемент
-        // PRDT сразу за ней.
+        // PRDT сразу за ней; она принадлежит слоту.
         unsafe {
-            let fis = self.table.as_ptr::<u8>();
+            let fis = table.as_ptr::<u8>();
             for index in 0..0x80usize {
                 fis.add(index).write_volatile(0);
             }
@@ -751,13 +914,21 @@ impl AhciDisk {
             fis.add(8).write_volatile((lba >> 24) as u8);
             fis.add(9).write_volatile((lba >> 32) as u8);
             fis.add(10).write_volatile((lba >> 40) as u8);
-            fis.add(12).write_volatile(count as u8);
-            fis.add(13).write_volatile((count >> 8) as u8);
+            if queued {
+                // NCQ: число секторов — в поле «features», тег — в старших
+                // пяти битах поля «count».
+                fis.add(3).write_volatile(count as u8);
+                fis.add(11).write_volatile((count >> 8) as u8);
+                fis.add(12).write_volatile((slot as u8) << 3);
+            } else {
+                fis.add(12).write_volatile(count as u8);
+                fis.add(13).write_volatile((count >> 8) as u8);
+            }
 
             if bytes > 0 {
                 let prdt = fis.add(0x80).cast::<u32>();
-                prdt.write_volatile(self.data.phys().as_u64() as u32);
-                prdt.add(1).write_volatile((self.data.phys().as_u64() >> 32) as u32);
+                prdt.write_volatile(data.phys().as_u64() as u32);
+                prdt.add(1).write_volatile((data.phys().as_u64() >> 32) as u32);
                 prdt.add(2).write_volatile(0);
                 // Счётчик байт хранится «на единицу меньше» — ноль означает один
                 // байт, а не пустую передачу.
@@ -771,15 +942,25 @@ impl AhciDisk {
 
         // SAFETY: окно порта отображено.
         unsafe {
-            // Прошлые признаки завершения снимаются до запуска, иначе первое же
-            // чтение `PxIS` покажет ошибку от предыдущей команды.
-            write32(self.port, PX_IS, u32::MAX);
-            wait_not_busy(self.port, PORT_TIMEOUT_MS)?;
-            write32(self.port, PX_CI, 1);
+            // Прошлые признаки и ожидание «не занят» — только когда в полёте нет
+            // других команд: при соседях `BSY` — норма, а их признаки снимает
+            // обработчик прерывания.
+            let busy = self.busy.load(Ordering::Acquire);
+            if busy == 1 << slot || busy == (1u32 << self.slots.len()) - 1 && !queued {
+                write32(self.regs, PX_IS, u32::MAX);
+                wait_not_busy(self.regs, PORT_TIMEOUT_MS)?;
+            }
+            // Команде NCQ тег — в `PxSACT` до `PxCI`. В обоих регистрах
+            // единица ставит бит, ноль ничего не трогает — соседние слоты
+            // запись своего бита не задевает.
+            if queued {
+                write32(self.regs, PX_SACT, 1 << slot);
+            }
+            write32(self.regs, PX_CI, 1 << slot);
         }
 
         // SAFETY: см. выше.
-        unsafe { self.wait_for_completion() }?;
+        unsafe { self.wait_for_completion(slot, queued) }?;
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -795,19 +976,20 @@ impl AhciDisk {
     /// # Safety
     ///
     /// Окно порта должно быть отображено.
-    unsafe fn wait_for_completion(&self) -> Result<(), AhciError> {
+    unsafe fn wait_for_completion(&self, slot: usize, queued: bool) -> Result<(), AhciError> {
         let deadline = time::uptime_ms() + COMMAND_TIMEOUT_MS;
-        let irq = self
-            .irq
-            .or_else(|| LATE_INTX.load(core::sync::atomic::Ordering::Acquire).then_some(IRQ_SOURCE));
-        let sleep = irq.filter(|_| crate::sched::is_running());
+        let sleep = self.sleep_source();
+        let bit = 1u32 << slot;
+        // Команда NCQ закончена, когда устройство сняло её тег в `PxSACT`;
+        // `PxCI` снимается раньше — как только команда принята в очередь.
+        let pending = if queued { PX_SACT } else { PX_CI };
         loop {
             // SAFETY: контракт функции.
             let (ci, is, tfd) = unsafe {
                 (
-                    read32(self.port, PX_CI),
-                    read32(self.port, PX_IS),
-                    read32(self.port, PX_TFD),
+                    read32(self.regs, PX_CI) | read32(self.regs, pending),
+                    read32(self.regs, PX_IS),
+                    read32(self.regs, PX_TFD),
                 )
             };
             // Ошибка проверяется раньше завершения: при отказе устройство может
@@ -816,7 +998,7 @@ impl AhciDisk {
             if is & IS_TFES != 0 || tfd & TFD_ERR != 0 {
                 return Err(AhciError::Failed(tfd));
             }
-            if ci & 1 == 0 {
+            if ci & bit == 0 {
                 return Ok(());
             }
             if time::uptime_ms() >= deadline {
@@ -824,7 +1006,7 @@ impl AhciDisk {
             }
             match sleep {
                 Some(source) => {
-                    let port = self.port;
+                    let regs = self.regs;
                     // Условие проверяется ещё раз и уже под локом планировщика:
                     // между проверкой выше и засыпанием прерывание могло прийти,
                     // и без этой проверки задача уснула бы после того, как её
@@ -833,9 +1015,9 @@ impl AhciDisk {
                     crate::sched::block_on_irq_until(source, SLEEP_SLICE_MS, || {
                         // SAFETY: окно порта отображено всё время жизни диска.
                         let (ci, is, tfd) = unsafe {
-                            (read32(port, PX_CI), read32(port, PX_IS), read32(port, PX_TFD))
+                            (read32(regs, PX_CI) | read32(regs, pending), read32(regs, PX_IS), read32(regs, PX_TFD))
                         };
-                        ci & 1 == 0 || is & IS_TFES != 0 || tfd & TFD_ERR != 0
+                        ci & bit == 0 || is & IS_TFES != 0 || tfd & TFD_ERR != 0
                     });
                 }
                 None => core::hint::spin_loop(),
@@ -845,11 +1027,11 @@ impl AhciDisk {
 
     /// Прочитать сектора в буфер вызывающего.
     ///
-    /// Данные идут через буфер DMA, а не напрямую: срез вызывающего живёт в
-    /// куче, которая не обязана быть физически непрерывной, — устройству же
+    /// Данные идут через буфер DMA слота, а не напрямую: срез вызывающего живёт
+    /// в куче, которая не обязана быть физически непрерывной, — устройству же
     /// сообщается физический адрес. Ровно то же самое и по той же причине
     /// делает virtio-blk.
-    pub fn read_sectors(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), AhciError> {
+    pub fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), AhciError> {
         if buf.is_empty() || buf.len() % self.sector_size != 0 {
             return Err(AhciError::BadTransfer);
         }
@@ -857,49 +1039,65 @@ impl AhciDisk {
         while done < buf.len() {
             let chunk = (buf.len() - done).min(MAX_TRANSFER);
             let sectors = chunk / self.sector_size;
-            self.run(
-                ATA_READ_DMA_EXT,
+            let slot = self.acquire();
+            let result = self.run(
+                slot,
+                if self.ncq { ATA_READ_FPDMA } else { ATA_READ_DMA_EXT },
                 lba + (done / self.sector_size) as u64,
                 sectors as u16,
                 chunk,
                 false,
-            )?;
-            // SAFETY: буфер выделен на MAX_TRANSFER байт, `chunk` не больше.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    self.data.as_ptr::<u8>(),
-                    buf.as_mut_ptr().add(done),
-                    chunk,
-                );
+            );
+            if result.is_ok() {
+                // SAFETY: буфер слота выделен на MAX_TRANSFER байт, `chunk` не
+                // больше; слот наш до `release`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        self.slots[slot].data.as_ptr::<u8>(),
+                        buf.as_mut_ptr().add(done),
+                        chunk,
+                    );
+                }
             }
+            self.release(slot);
+            result?;
             done += chunk;
         }
         Ok(())
     }
 
     /// Записать сектора.
-    pub fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), AhciError> {
+    pub fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), AhciError> {
         if buf.is_empty() || buf.len() % self.sector_size != 0 {
             return Err(AhciError::BadTransfer);
         }
         let mut done = 0usize;
         while done < buf.len() {
             let chunk = (buf.len() - done).min(MAX_TRANSFER);
-            // SAFETY: буфер выделен на MAX_TRANSFER байт, `chunk` не больше.
+            // Запись — на пустом порту, не вперемешку с чтениями очереди: в
+            // VirtualBox запись среди чтений NCQ не завершалась никогда
+            // (31.10.2026), а писать параллельно незачем — запись идёт из кэша
+            // в фоне, ждут чтения.
+            let slot = self.acquire_all();
+            // SAFETY: буфер слота выделен на MAX_TRANSFER байт, `chunk` не
+            // больше; порт наш до `release_all`.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     buf.as_ptr().add(done),
-                    self.data.as_ptr::<u8>(),
+                    self.slots[slot].data.as_ptr::<u8>(),
                     chunk,
                 );
             }
-            self.run(
+            let result = self.run(
+                slot,
                 ATA_WRITE_DMA_EXT,
                 lba + (done / self.sector_size) as u64,
                 (chunk / self.sector_size) as u16,
                 chunk,
                 true,
-            )?;
+            );
+            self.release_all();
+            result?;
             done += chunk;
         }
         Ok(())
@@ -911,9 +1109,26 @@ impl AhciDisk {
     /// устройство обязано писать немедленно, у диска ATA есть кеш записи, и
     /// команда сброса — единственное, что отделяет «записали» от «переживёт
     /// выключение питания». Для системы, которая обещает не терять данные при
-    /// сбое питания, это не мелочь.
-    pub fn flush_cache(&mut self) -> Result<(), AhciError> {
-        self.run(ATA_FLUSH_CACHE_EXT, 0, 0, 0, false)
+    /// сбое питания, это не мелочь. Записи синхронны: к этому вызову все они
+    /// уже завершены.
+    pub fn flush_cache(&self) -> Result<(), AhciError> {
+        // Сброс кеша — команда вне очереди: при NCQ — только на пустом порту.
+        let slot = self.acquire_all();
+        let result = self.run(slot, ATA_FLUSH_CACHE_EXT, 0, 0, 0, false);
+        self.release_all();
+        result
+    }
+}
+
+impl disk::ParallelRead for Port {
+    fn read_parallel(&self, lba: u64, buf: &mut [u8]) -> disk::Result<()> {
+        if lba + (buf.len() / self.sector_size) as u64 > self.sectors {
+            return Err(disk::Error::OutOfRange);
+        }
+        self.read_sectors(lba, buf).map_err(|err| {
+            kprintln!("ahci: read at LBA {lba} failed: {err}");
+            disk::Error::Io
+        })
     }
 }
 
@@ -1080,30 +1295,29 @@ impl disk::BlockDevice for AhciDisk {
     }
 
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> disk::Result<()> {
-        if lba + (buf.len() / self.sector_size) as u64 > self.sectors {
-            return Err(disk::Error::OutOfRange);
-        }
-        self.read_sectors(lba, buf).map_err(|err| {
-            kprintln!("ahci: read at LBA {lba} failed: {err}");
-            disk::Error::Io
-        })
+        disk::ParallelRead::read_parallel(&*self.port, lba, buf)
     }
 
     fn write(&mut self, lba: u64, buf: &[u8]) -> disk::Result<()> {
         if lba + (buf.len() / self.sector_size) as u64 > self.sectors {
             return Err(disk::Error::OutOfRange);
         }
-        self.write_sectors(lba, buf).map_err(|err| {
+        self.port.write_sectors(lba, buf).map_err(|err| {
             kprintln!("ahci: write at LBA {lba} failed: {err}");
             disk::Error::Io
         })
     }
 
     fn flush(&mut self) -> disk::Result<()> {
-        self.flush_cache().map_err(|err| {
+        self.port.flush_cache().map_err(|err| {
             kprintln!("ahci: flush failed: {err}");
             disk::Error::Io
         })
+    }
+
+    fn parallel(&self) -> Option<Arc<dyn disk::ParallelRead>> {
+        // Один слот — параллельности нет, и путь под замком ничем не хуже.
+        (self.port.slots.len() > 1).then(|| Arc::clone(&self.port) as Arc<dyn disk::ParallelRead>)
     }
 }
 
@@ -1115,8 +1329,11 @@ impl AhciDisk {
     }
 }
 
-// SAFETY: структура владеет своими буферами DMA и окном регистров, которое
-// отображено на всё время жизни ядра. Ничего разделяемого между потоками в ней
-// нет, а одновременный доступ исключён замком выше по стеку — тем же, что у
-// virtio-blk: у порта одна очередь команд, и два запроса в неё не отправить.
-unsafe impl Send for AhciDisk {}
+// SAFETY: порт владеет своими буферами DMA и окном регистров, которое
+// отображено на всё время жизни ядра. Общее между потоками — маска занятых
+// слотов (атомарная) и регистры: каждый пишет только заголовок, таблицу и
+// буфер своего слота и только бит своего слота в `PxCI` (запись нуля его не
+// трогает). Поля, которые меняются, меняются до того, как порт стал общим.
+unsafe impl Send for Port {}
+// SAFETY: см. выше.
+unsafe impl Sync for Port {}

@@ -931,6 +931,16 @@ impl Table {
     /// Обычный файл готов всегда, и это не упрощение: у него нечего ждать —
     /// чтение с конца немедленно возвращает ноль, а запись идёт на носитель.
     /// Так отвечает `poll` на файл везде, где он есть.
+    /// Читающий конец канала, в котором нет ни байта: `Some(true)`. Для
+    /// `poll` программ Linux — пустой канал без писателей у Linux только
+    /// `POLLHUP`, без `POLLIN` (см. `linux::poll`).
+    pub fn pipe_empty(&self, fd: usize) -> Option<bool> {
+        match self.cell(fd).ok()?.as_ref() {
+            Some(Slot::PipeRead(reader, _)) => Some(!reader.has_data()),
+            _ => None,
+        }
+    }
+
     pub fn readiness(&self, fd: usize) -> Result<(bool, bool, bool), FileError> {
         match self.cell(fd)?.as_ref() {
             Some(Slot::File(open)) => Ok((true, open.writable, false)),

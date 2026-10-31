@@ -29,10 +29,18 @@ type Disk = Cached<Lane>;
 /// замком тома, а чтение данных файла — мимо замка тома
 /// ([`Ext2Node::read_at`]), чтобы `stat` и `open` соседей не ждали диска.
 /// Порядок замков прежний: том, потом устройство.
+///
+/// Чтения — мимо замка, если носитель это умеет ([`disk::ParallelRead`],
+/// 31.10.2026): несколько потоков дочитывают свои страницы с диска сразу.
 #[derive(Clone)]
-struct Lane(Arc<Mutex<Counted>>);
+struct Lane(Arc<Mutex<Counted>>, Option<Arc<dyn disk::ParallelRead>>);
 
 impl Lane {
+    fn new(device: alloc::boxed::Box<dyn disk::BlockDevice + Send>) -> Self {
+        let parallel = device.parallel();
+        Self(Arc::new(Mutex::new(Counted::new(device))), parallel)
+    }
+
     fn requests(&self) -> u64 {
         self.0.lock().requests()
     }
@@ -52,7 +60,10 @@ impl disk::BlockDevice for Lane {
     }
 
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> disk::Result<()> {
-        self.0.lock().read(lba, buf)
+        match &self.1 {
+            Some(parallel) => parallel.read_parallel(lba, buf),
+            None => self.0.lock().read(lba, buf),
+        }
     }
 
     fn write(&mut self, lba: u64, buf: &[u8]) -> disk::Result<()> {
@@ -237,7 +248,7 @@ impl Ext2Fs {
         first_lba: u64,
         writable: bool,
     ) -> VfsResult<Ext2Mount> {
-        let lane = Lane(Arc::new(Mutex::new(Counted::new(device))));
+        let lane = Lane::new(device);
         let mut disk = Cached::deferred(lane.clone());
         let fs = ext2::Ext2::mount(&mut disk, first_lba).map_err(convert)?;
         // На томе только для чтения редактор не открывается вовсе — и не

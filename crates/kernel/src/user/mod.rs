@@ -4759,10 +4759,23 @@ impl Program {
                 Source::File(file) => (PageFlags::READ | PageFlags::USER, "", file.offset),
                 _ => (PageFlags::READ | PageFlags::WRITE | PageFlags::USER, "", 0),
             };
+            // Устройство и номер узла у отображённого файла — настоящие, а не
+            // `00:00 0` (31.10.2026): `jetbrainsd` Rider (GraalVM) ищет себя
+            // по своей строке `maps`, и строка с нулевым узлом для него —
+            // безымянная память («Could not determine code source location»).
+            let inode = match &region.source {
+                Source::Image(image) => image.node.file_id().map_or(1, |(volume, number)| {
+                    (((volume >> 4) as u64 & 0xffff) << 32) | number
+                }),
+                _ => 0,
+            };
+            // `00:01` — то же устройство, что `st_dev = 1` у `stat` Linux: пары
+            // (dev, ino) из `maps` и `fstat` обязаны сходиться.
+            let device = if inode != 0 { "00:01" } else { "00:00" };
             let user = flags.contains(PageFlags::USER);
             let _ = writeln!(
                 out,
-                "{:x}-{:x} {}{}{}p {:08x} 00:00 0 {}",
+                "{:x}-{:x} {}{}{}p {:08x} {device} {inode} {}",
                 region.base,
                 region.end(),
                 if user { 'r' } else { '-' },

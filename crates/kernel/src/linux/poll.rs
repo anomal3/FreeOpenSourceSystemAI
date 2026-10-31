@@ -49,41 +49,7 @@ fn wait(fds: usize, count: usize, deadline: Option<u64>) -> i64 {
             let at = fds + index * 8;
             // SAFETY: массив проверен на запись выше.
             let (fd, events) = unsafe { (core::ptr::read_unaligned(at as *const i32), core::ptr::read_unaligned((at + 4) as *const u16)) };
-            let revents = if fd < 0 {
-                0
-            } else {
-                let mut wanted = 0;
-                if events & POLLIN != 0 {
-                    wanted |= user_abi::POLL_IN;
-                }
-                if events & POLLOUT != 0 {
-                    wanted |= user_abi::POLL_OUT;
-                }
-                let got = crate::user::syscall::readiness_of(fd as usize, wanted);
-                // Как у Linux: `POLLIN`/`POLLOUT` — только если о них
-                // просили; `POLLHUP`/`POLLERR`/`POLLNVAL` — всегда. И если ждут
-                // записи, а собеседника нет (канал без читателя), — `POLLERR`:
-                // иначе программа, ждущая только `POLLOUT`, получала `POLLIN |
-                // POLLHUP`, не видела ни того, ни ошибки и опрашивала снова —
-                // миллионы раз в секунду (.NET Rider, фаза 74).
-                let mut revents = 0;
-                if got & user_abi::POLL_IN != 0 && events & POLLIN != 0 {
-                    revents |= POLLIN;
-                }
-                if got & user_abi::POLL_OUT != 0 && events & POLLOUT != 0 {
-                    revents |= POLLOUT;
-                }
-                if got & user_abi::POLL_HUP != 0 {
-                    revents |= POLLHUP;
-                    if events & POLLOUT != 0 && events & POLLIN == 0 {
-                        revents |= POLLERR;
-                    }
-                }
-                if got & user_abi::POLL_BAD != 0 {
-                    revents |= POLLNVAL;
-                }
-                revents
-            };
+            let revents = if fd < 0 { 0 } else { revents_of(fd as usize, events) };
             // SAFETY: тот же проверенный массив.
             unsafe { core::ptr::write_unaligned((at + 6) as *mut u16, revents) };
             if revents != 0 {
@@ -117,6 +83,160 @@ fn wait(fds: usize, count: usize, deadline: Option<u64>) -> i64 {
                     until = until.min(at.max(crate::time::uptime_ms() + 1));
                 }
             }
+        }
+        crate::io_events::wait(seen, Some(until));
+    }
+}
+
+/// Что ответить `poll` о дескрипторе `fd`, у которого спрашивают `events`.
+fn revents_of(fd: usize, events: u16) -> u16 {
+    let mut wanted = 0;
+    if events & POLLIN != 0 {
+        wanted |= user_abi::POLL_IN;
+    }
+    if events & POLLOUT != 0 {
+        wanted |= user_abi::POLL_OUT;
+    }
+    let got = crate::user::syscall::readiness_of(fd, wanted);
+    // Как у Linux: `POLLIN`/`POLLOUT` — только если о них просили;
+    // `POLLHUP`/`POLLERR`/`POLLNVAL` — всегда. И если ждут записи, а
+    // собеседника нет (канал без читателя), — `POLLERR`: иначе программа,
+    // ждущая только `POLLOUT`, получала `POLLIN | POLLHUP`, не видела ни того,
+    // ни ошибки и опрашивала снова — миллионы раз в секунду (.NET Rider,
+    // фаза 74).
+    let mut revents = 0;
+    // Пустой канал без писателей у Linux — только `POLLHUP`, без `POLLIN`
+    // (31.10.2026). Родной `poll` отвечает «читай» и в конце файла, а поток
+    // `.NET SynchManager` на `POLLIN | POLLHUP` не читал и не засыпал:
+    // миллионы опросов за запуск Rider, процессор занят с первой секунды.
+    let empty_hangup = got & user_abi::POLL_HUP != 0
+        && crate::user::with_current(|program| program.files.pipe_empty(fd)).flatten() == Some(true);
+    if got & user_abi::POLL_IN != 0 && events & POLLIN != 0 && !empty_hangup {
+        revents |= POLLIN;
+    }
+    if got & user_abi::POLL_OUT != 0 && events & POLLOUT != 0 {
+        revents |= POLLOUT;
+    }
+    if got & user_abi::POLL_HUP != 0 {
+        revents |= POLLHUP;
+        if events & POLLOUT != 0 && events & POLLIN == 0 {
+            revents |= POLLERR;
+        }
+    }
+    if got & user_abi::POLL_BAD != 0 {
+        revents |= POLLNVAL;
+    }
+    revents
+}
+
+/// `select(n, readfds, writefds, exceptfds, timeval)` (31.10.2026: `fsnotifier`
+/// Rider ждёт им ввод и `inotify`). Срок `timeval` — секунды и микросекунды,
+/// `NULL` — без срока. Остаток срока обратно не пишется: на это не полагается
+/// никто из тех, кого мы запускаем.
+pub fn select(count: usize, read: usize, write: usize, except: usize, timeout: usize) -> i64 {
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        if !space::user_can(timeout, 16, PageFlags::READ) {
+            return -e::EFAULT;
+        }
+        // SAFETY: проверено строкой выше.
+        let [seconds, micros] = unsafe { core::ptr::read_unaligned(timeout as *const [u64; 2]) };
+        Some(crate::time::uptime_ms() + seconds.saturating_mul(1000) + micros.div_ceil(1000))
+    };
+    select_until(count, read, write, except, deadline)
+}
+
+/// `pselect6(n, readfds, writefds, exceptfds, timespec, sigmask)`.
+pub fn pselect(count: usize, read: usize, write: usize, except: usize, timeout: usize) -> i64 {
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        if !space::user_can(timeout, 16, PageFlags::READ) {
+            return -e::EFAULT;
+        }
+        // SAFETY: проверено строкой выше.
+        let [seconds, nanos] = unsafe { core::ptr::read_unaligned(timeout as *const [u64; 2]) };
+        Some(crate::time::uptime_ms() + seconds.saturating_mul(1000) + nanos.div_ceil(1_000_000))
+    };
+    select_until(count, read, write, except, deadline)
+}
+
+/// Наборы `fd_set` — битовые карты по 64 дескриптора в слове.
+fn select_until(count: usize, read: usize, write: usize, except: usize, deadline: Option<u64>) -> i64 {
+    const FD_SETSIZE: usize = 1024;
+    if count > FD_SETSIZE {
+        return -e::EINVAL;
+    }
+    let words = count.div_ceil(64);
+    let load = |set: usize| -> Result<[u64; FD_SETSIZE / 64], i64> {
+        let mut out = [0u64; FD_SETSIZE / 64];
+        if set != 0 && words > 0 {
+            if !space::user_can(set, words * 8, PageFlags::WRITE) {
+                return Err(-e::EFAULT);
+            }
+            for (index, word) in out.iter_mut().take(words).enumerate() {
+                // SAFETY: проверено выше.
+                *word = unsafe { core::ptr::read_unaligned((set + index * 8) as *const u64) };
+            }
+        }
+        Ok(out)
+    };
+    let (want_read, want_write) = match (load(read), load(write)) {
+        (Ok(read), Ok(write)) => (read, write),
+        (Err(err), _) | (_, Err(err)) => return err,
+    };
+    if except != 0 && load(except).is_err() {
+        return -e::EFAULT;
+    }
+    loop {
+        let seen = crate::io_events::generation();
+        let mut got_read = [0u64; FD_SETSIZE / 64];
+        let mut got_write = [0u64; FD_SETSIZE / 64];
+        let mut ready = 0i64;
+        for fd in 0..count {
+            let (word, bit) = (fd / 64, 1u64 << (fd % 64));
+            let r = want_read[word] & bit != 0;
+            let w = want_write[word] & bit != 0;
+            if !r && !w {
+                continue;
+            }
+            let events = if r { POLLIN } else { 0 } | if w { POLLOUT } else { 0 };
+            let revents = revents_of(fd, events);
+            if revents & POLLNVAL != 0 {
+                return -e::EBADF;
+            }
+            if r && revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+                got_read[word] |= bit;
+                ready += 1;
+            }
+            if w && revents & (POLLOUT | POLLERR) != 0 {
+                got_write[word] |= bit;
+                ready += 1;
+            }
+        }
+        let timed_out = deadline.is_some_and(|deadline| crate::time::uptime_ms() >= deadline);
+        if ready > 0 || timed_out {
+            for (set, got) in [(read, &got_read), (write, &got_write), (except, &[0u64; FD_SETSIZE / 64])] {
+                if set == 0 {
+                    continue;
+                }
+                if !space::user_can(set, words * 8, PageFlags::WRITE) {
+                    return -e::EFAULT;
+                }
+                for (index, word) in got.iter().take(words).enumerate() {
+                    // SAFETY: проверено строкой выше.
+                    unsafe { core::ptr::write_unaligned((set + index * 8) as *mut u64, *word) };
+                }
+            }
+            return ready;
+        }
+        if crate::user::kill_pending() || super::signal::pending() {
+            return -e::EINTR;
+        }
+        let mut until = crate::time::uptime_ms() + 100;
+        if let Some(deadline) = deadline {
+            until = until.min(deadline);
         }
         crate::io_events::wait(seen, Some(until));
     }

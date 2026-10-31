@@ -41,7 +41,7 @@ use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{apic, gdt, paging, rdmsr};
-use crate::mm::{PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
+use crate::mm::PhysAddr;
 use crate::smp::Found;
 
 /// Как архитектура называет аппаратный номер процессора — для журнала.

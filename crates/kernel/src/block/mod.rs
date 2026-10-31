@@ -190,6 +190,10 @@ impl disk::BlockDevice for Counted {
     fn flush(&mut self) -> disk::Result<()> {
         self.inner.flush()
     }
+
+    fn parallel(&self) -> Option<Arc<dyn disk::ParallelRead>> {
+        self.inner.parallel()
+    }
 }
 
 /// Носитель, которым пользуются несколько потребителей сразу.
@@ -210,14 +214,23 @@ impl disk::BlockDevice for Counted {
 /// Всегда «сначала файловая система, потом носитель». Цикла не возникает,
 /// потому что обратного порядка не существует: носитель не знает ни об одной
 /// файловой системе и ничего у них не спрашивает.
+///
+/// # Чтение без замка (31.10.2026)
+///
+/// Замок держался и всё время ожидания диска: сотни потоков Rider, взявших
+/// отказ страницы, читали с диска строго по одному. Драйвер, умеющий вести
+/// несколько команд сразу (AHCI), отдаёт [`disk::ParallelRead`] — чтения идут
+/// через него мимо замка; запись и сброс по-прежнему под замком.
 pub struct Shared {
     inner: Arc<Mutex<Counted>>,
+    parallel: Option<Arc<dyn disk::ParallelRead>>,
 }
 
 impl Shared {
     #[must_use]
     pub fn new(device: Box<dyn disk::BlockDevice + Send>) -> Self {
-        Self { inner: Arc::new(Mutex::new(Counted::new(device))) }
+        let parallel = device.parallel();
+        Self { inner: Arc::new(Mutex::new(Counted::new(device))), parallel }
     }
 
     /// Сколько раз обращались к носителю — суммарно, всеми, кто его делит.
@@ -229,7 +242,7 @@ impl Shared {
 
 impl Clone for Shared {
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self { inner: Arc::clone(&self.inner), parallel: self.parallel.clone() }
     }
 }
 
@@ -247,7 +260,10 @@ impl disk::BlockDevice for Shared {
     }
 
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> disk::Result<()> {
-        self.inner.lock().read(lba, buf)
+        match &self.parallel {
+            Some(parallel) => parallel.read_parallel(lba, buf),
+            None => self.inner.lock().read(lba, buf),
+        }
     }
 
     fn write(&mut self, lba: u64, buf: &[u8]) -> disk::Result<()> {
@@ -256,6 +272,10 @@ impl disk::BlockDevice for Shared {
 
     fn flush(&mut self) -> disk::Result<()> {
         self.inner.lock().flush()
+    }
+
+    fn parallel(&self) -> Option<Arc<dyn disk::ParallelRead>> {
+        self.parallel.clone()
     }
 }
 

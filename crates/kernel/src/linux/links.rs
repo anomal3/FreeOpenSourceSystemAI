@@ -58,21 +58,46 @@ pub fn target(linux: &str) -> Option<String> {
 
 /// Пройти ссылки: путь, на который в итоге указывает `linux` (сам он, если
 /// это не ссылка). Относительная ссылка — от её каталога.
+///
+/// Ссылкой может быть и каталог посреди пути (31.10.2026): `jetbrainsd` Rider
+/// держит `bundles/current` → `extract/…` и запускает себя как
+/// `bundles/current/jetbrainsd/bin/jetbrainsd`. Пока сверялся только путь
+/// целиком, такой запуск отвечал `ENOENT`, и Rider перезапускал демон
+/// десятки раз. Поэтому ищется самый длинный префикс пути (по границе
+/// имён), который сам ссылка, и остаток пути дописывается к её цели.
 pub fn follow(linux: &str) -> String {
     let mut path = String::from(linux);
     for _ in 0..MAX_HOPS {
-        let Some(next) = target(&path) else {
+        let hit = {
+            let links = LINKS.lock();
+            if links.is_empty() {
+                return path;
+            }
+            let mut end = path.len();
+            loop {
+                if let Some(next) = links.get(&path[..end]) {
+                    break Some((end, next.clone()));
+                }
+                match path[..end].rfind('/') {
+                    Some(at) if at > 0 => end = at,
+                    _ => break None,
+                }
+            }
+        };
+        let Some((end, next)) = hit else {
             break;
         };
-        path = if next.starts_with('/') {
-            normalize(&next)
+        let mut joined = if next.starts_with('/') {
+            next
         } else {
-            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            let parent = path[..end].rsplit_once('/').map_or("", |(parent, _)| parent);
             let mut joined = String::from(parent);
             joined.push('/');
             joined.push_str(&next);
-            normalize(&joined)
+            joined
         };
+        joined.push_str(&path[end..]);
+        path = normalize(&joined);
     }
     path
 }
