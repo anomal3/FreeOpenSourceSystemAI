@@ -1,10 +1,10 @@
 //! Раздел состояния готового образа — с хоста, до запуска: ext2 или btrfs.
 //!
-//! С 31.10 установщик размечает состояние под btrfs (ext2 — по метке
-//! `\FREEOS\STATEEXT.CFG`, см. [`STATE_EXT2_MARK`]), а стенд кладёт туда
-//! настройки, ключи SSH и Rider. Формат узнаётся пробой первых байт тома, как
-//! это делает ядро; всё, что стенду нужно от тома, — здесь, одним набором
-//! операций на оба формата.
+//! С 31.10 установщик умеет размечать состояние под btrfs (по метке
+//! `\FREEOS\STATEBTR.CFG`, см. [`STATE_BTRFS_MARK`]; по умолчанию ext2), а
+//! стенд кладёт туда настройки, ключи SSH и Rider. Формат узнаётся пробой
+//! первых байт тома, как это делает ядро; всё, что стенду нужно от тома, —
+//! здесь, одним набором операций на оба формата.
 
 use std::path::Path;
 
@@ -13,14 +13,13 @@ use disk::BlockDevice as _;
 
 use crate::diskfile::DiskFile;
 
-/// Метка на установочном носителе: раздел состояния — ext2, как до 31.10.
-/// Стенд кладёт её, когда `FOSSAI_STATE_FS=ext2`, чтобы путь ext2 оставался
-/// проверенным: на нём живут уже установленные машины.
-pub const STATE_EXT2_MARK: &str = "STATEEXT.CFG";
+/// Метка на установочном носителе: раздел состояния — btrfs. Стенд кладёт
+/// её, когда `FOSSAI_STATE_FS=btrfs`.
+pub const STATE_BTRFS_MARK: &str = "STATEBTR.CFG";
 
-/// Просит ли прогон раздел состояния ext2.
-pub fn ext2_requested() -> bool {
-    std::env::var("FOSSAI_STATE_FS").is_ok_and(|value| value.eq_ignore_ascii_case("ext2"))
+/// Просит ли прогон раздел состояния btrfs.
+pub fn btrfs_requested() -> bool {
+    std::env::var("FOSSAI_STATE_FS").is_ok_and(|value| value.eq_ignore_ascii_case("btrfs"))
 }
 
 enum Fs {

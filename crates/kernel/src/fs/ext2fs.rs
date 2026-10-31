@@ -33,15 +33,15 @@ type Disk = Cached<Lane>;
 /// Чтения — мимо замка, если носитель это умеет ([`disk::ParallelRead`],
 /// 31.10.2026): несколько потоков дочитывают свои страницы с диска сразу.
 #[derive(Clone)]
-struct Lane(Arc<Mutex<Counted>>, Option<Arc<dyn disk::ParallelRead>>);
+pub(super) struct Lane(Arc<Mutex<Counted>>, Option<Arc<dyn disk::ParallelRead>>);
 
 impl Lane {
-    fn new(device: alloc::boxed::Box<dyn disk::BlockDevice + Send>) -> Self {
+    pub(super) fn new(device: alloc::boxed::Box<dyn disk::BlockDevice + Send>) -> Self {
         let parallel = device.parallel();
         Self(Arc::new(Mutex::new(Counted::new(device))), parallel)
     }
 
-    fn requests(&self) -> u64 {
+    pub(super) fn requests(&self) -> u64 {
         self.0.lock().requests()
     }
 }

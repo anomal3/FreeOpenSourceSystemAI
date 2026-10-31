@@ -96,7 +96,7 @@ mod write;
 
 pub use check::{Problem, Report, describe};
 pub use format::{FormatOptions, MIN_VOLUME_BYTES, format};
-pub use write::{Attributes, Writer};
+pub use write::{Attributes, ReadPiece, Writer};
 pub use layout::{Key, item_type};
 pub use read::{Btrfs, DirEntry, FileType, Inode, detect};
 

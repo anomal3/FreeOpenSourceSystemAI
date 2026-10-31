@@ -56,7 +56,6 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::block::Counted;
 use crate::sync::Mutex;
 use crate::vfs::{DirEntry, FileSystem, Metadata, Node, NodeKind, VfsError, VfsResult};
 use disk::BlockDevice as _;
@@ -66,7 +65,11 @@ use disk::BlockDevice as _;
 /// файла шло на носитель). Запись — сквозная: копирование при записи пишет
 /// только на новые места, а запись выбрасывает из кэша всё, что с ней
 /// пересекается, — освобождённый и занятый заново экстент не отдаст старого.
-type Disk = crate::block::cache::Cached<Counted>;
+///
+/// Устройство — за своим замком ([`super::ext2fs::Lane`]): данные файлов
+/// читаются мимо замка тома (31.10, см. [`BtrfsNode::read_piece`]).
+type Disk = crate::block::cache::Cached<Lane>;
+use super::ext2fs::Lane;
 
 /// Диск вместе с разобранным на нём томом.
 struct Inner {
@@ -94,6 +97,8 @@ const MAX_PENDING: usize = 4096;
 /// Смонтированный том.
 pub struct BtrfsFs {
     inner: Mutex<Inner>,
+    /// То же устройство, что под кэшем, — для чтения мимо замка тома.
+    lane: Lane,
 }
 
 /// То, что отдаётся в [`crate::fs::mount_at`].
@@ -176,7 +181,8 @@ impl BtrfsFs {
         first_lba: u64,
         writable: bool,
     ) -> VfsResult<BtrfsMount> {
-        let mut disk = Disk::new(Counted::new(device));
+        let lane = Lane::new(device);
+        let mut disk = Disk::new(lane.clone());
         let fs = btrfs::Btrfs::mount(&mut disk, first_lba).map_err(convert)?;
         // Открытие писателя ничего не пишет: оно читает метаданные тома в
         // память. Том, от которого писатель отказался, остаётся нетронутым.
@@ -190,6 +196,7 @@ impl BtrfsFs {
         };
         let mounted = Arc::new(Self {
             inner: Mutex::new(Inner { disk, fs, first_lba, writer, refused, pending: 0, volume: 0 }),
+            lane,
         });
         mounted.inner.lock().volume = Arc::as_ptr(&mounted) as *const () as usize;
         Ok(BtrfsMount(mounted))
@@ -293,7 +300,7 @@ impl BtrfsMount {
             total,
             used,
             guard.fs.chunks(),
-            guard.disk.inner().requests(),
+            self.0.lane.requests(),
         )
     }
 
@@ -484,17 +491,7 @@ impl Node for BtrfsNode {
         while done < buf.len() {
             let take = (buf.len() - done).min(bounce.len());
             let at = offset + done as u64;
-            let got = {
-                let mut guard = self.fs.inner.lock();
-                let Inner { disk, fs, writer, .. } = &mut *guard;
-                match writer.as_mut() {
-                    Some(writer) => writer.read_at(disk, self.inode.number, at, &mut bounce[..take]),
-                    None => fs
-                        .inode(disk, self.inode.number)
-                        .and_then(|inode| fs.read_at(disk, &inode, at, &mut bounce[..take])),
-                }
-                .map_err(convert)?
-            };
+            let got = self.read_piece(at, &mut bounce[..take])?;
             buf[done..done + got].copy_from_slice(&bounce[..got]);
             done += got;
             if got < take {
@@ -625,6 +622,110 @@ impl Node for BtrfsNode {
 }
 
 impl BtrfsNode {
+    /// Прочитать кусок файла с `at` в `buf` целиком под замком тома.
+    fn read_locked(&self, at: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        let mut guard = self.fs.inner.lock();
+        let Inner { disk, fs, writer, .. } = &mut *guard;
+        match writer.as_mut() {
+            Some(writer) => writer.read_at(disk, self.inode.number, at, buf),
+            None => fs.inode(disk, self.inode.number).and_then(|inode| fs.read_at(disk, &inode, at, buf)),
+        }
+        .map_err(convert)
+    }
+
+    /// Прочитать кусок файла (31.10, как у ext2): под замком тома — только
+    /// разметка (экстенты и суммы из памяти писателя) и то, что уже в кэше
+    /// блоков; пропуски читаются с устройства **без** замка тома и сверяются
+    /// с суммами, взятыми при разметке, — `stat` и `open` соседей не ждут
+    /// диска. Сумма не сошлась (экстент освободили и заняли заново) или в эти
+    /// секторы за время чтения писали — кусок перечитывается под замком.
+    fn read_piece(&self, at: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        const BLOCK: usize = 4096;
+        // Куски с носителя, которых нет в кэше: (номер куска, данные).
+        let mut misses: Vec<(usize, Vec<u8>)> = Vec::new();
+        let (pieces, since) = {
+            let mut guard = self.fs.inner.lock();
+            let Inner { disk, writer, .. } = &mut *guard;
+            let Some(writer) = writer.as_mut() else {
+                drop(guard);
+                return self.read_locked(at, buf);
+            };
+            let pieces = writer.plan_read(disk, self.inode.number, at, buf.len()).map_err(convert)?;
+            let mut done = 0usize;
+            for (n, piece) in pieces.iter().enumerate() {
+                let len = piece.len();
+                match piece {
+                    btrfs::ReadPiece::Zero(_) | btrfs::ReadPiece::Bytes(_) => {
+                        piece.fill(disk, &mut Vec::new(), &mut buf[done..]).map_err(convert)?;
+                    }
+                    btrfs::ReadPiece::Disk { lba, bytes, skip, take, .. } => {
+                        let mut data = Vec::new();
+                        data.try_reserve_exact(*bytes).map_err(|_| VfsError::OutOfMemory)?;
+                        data.resize(*bytes, 0);
+                        let unit = (BLOCK as u64) / u64::from(disk.sector_size().max(1));
+                        let cached = *bytes % BLOCK == 0
+                            && data.chunks_exact_mut(BLOCK).enumerate().all(|(k, block)| disk.peek(lba + k as u64 * unit, block));
+                        if cached {
+                            buf[done..done + take].copy_from_slice(&data[*skip..*skip + *take]);
+                        } else {
+                            if misses.try_reserve(1).is_err() {
+                                drop(guard);
+                                return self.read_locked(at, buf);
+                            }
+                            misses.push((n, data));
+                        }
+                    }
+                }
+                done += len;
+            }
+            if misses.is_empty() {
+                return Ok(done);
+            }
+            (pieces, disk.generation())
+        };
+
+        let mut lane = self.fs.lane.clone();
+        for (n, data) in &mut misses {
+            let btrfs::ReadPiece::Disk { lba, .. } = &pieces[*n] else { continue };
+            if lane.read(*lba, data).is_err() || pieces[*n].verify(data).is_err() {
+                return self.read_locked(at, buf);
+            }
+        }
+
+        let mut guard = self.fs.inner.lock();
+        let sector = u64::from(guard.disk.sector_size().max(1));
+        let stale = misses.iter().any(|(n, data)| match &pieces[*n] {
+            btrfs::ReadPiece::Disk { lba, .. } => guard.disk.written_since(since, *lba, data.len() as u64 / sector),
+            _ => false,
+        });
+        if stale {
+            drop(guard);
+            return self.read_locked(at, buf);
+        }
+        for (n, data) in &misses {
+            if let btrfs::ReadPiece::Disk { lba, .. } = &pieces[*n] {
+                guard.disk.adopt(*lba, data);
+            }
+        }
+        drop(guard);
+
+        // Сборка: смещение каждого куска в `buf` — сумма длин до него.
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(pieces.len()).map_err(|_| VfsError::OutOfMemory)?;
+        let mut done = 0usize;
+        for piece in &pieces {
+            offsets.push(done);
+            done += piece.len();
+        }
+        for (n, data) in &misses {
+            if let btrfs::ReadPiece::Disk { skip, take, .. } = &pieces[*n] {
+                let at = offsets[*n];
+                buf[at..at + take].copy_from_slice(&data[*skip..*skip + *take]);
+            }
+        }
+        Ok(done)
+    }
+
     /// Том и номер файла — ключ кэша страниц и постоянное имя (`st_ino`).
     fn key(&self) -> (usize, u64) {
         (Arc::as_ptr(&self.fs) as *const () as usize, self.inode.number)

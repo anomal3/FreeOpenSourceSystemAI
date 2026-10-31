@@ -109,6 +109,62 @@ pub struct Attributes {
     pub time: u64,
 }
 
+/// Кусок размеченного чтения ([`Writer::plan_read`]).
+#[derive(Debug)]
+pub enum ReadPiece {
+    /// Дыра или неразмеченный экстент: нули.
+    Zero(usize),
+    /// Встроенные в элемент данные.
+    Bytes(Vec<u8>),
+    /// С носителя: `bytes` с сектора `lba` (по секторам тома), из них —
+    /// `take` с `skip`. `sums` — сумма на каждый сектор тома (`None` —
+    /// файл без сумм).
+    Disk { lba: u64, bytes: usize, skip: usize, take: usize, sector: usize, sums: Option<Vec<u32>> },
+}
+
+impl ReadPiece {
+    /// Сколько байт файла даёт кусок.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            ReadPiece::Zero(len) => *len,
+            ReadPiece::Bytes(data) => data.len(),
+            ReadPiece::Disk { take, .. } => *take,
+        }
+    }
+
+    /// Прочитать кусок в начало `out` (`scratch` — буфер под сектора);
+    /// возвращает длину. Отказ сверки — [`Error::BadChecksum`]: тот, кто
+    /// читал мимо замка, перечитывает под замком (экстент могли освободить
+    /// и занять заново).
+    pub fn fill(&self, dev: &mut dyn BlockDevice, scratch: &mut Vec<u8>, out: &mut [u8]) -> Result<usize> {
+        match self {
+            ReadPiece::Zero(len) => out[..*len].fill(0),
+            ReadPiece::Bytes(data) => out[..data.len()].copy_from_slice(data),
+            ReadPiece::Disk { lba, bytes, skip, take, .. } => {
+                scratch.clear();
+                resize(scratch, *bytes)?;
+                dev.read(*lba, scratch)?;
+                self.verify(scratch)?;
+                out[..*take].copy_from_slice(&scratch[*skip..*skip + *take]);
+            }
+        }
+        Ok(self.len())
+    }
+
+    /// Сверить прочитанные сектора с суммами.
+    pub fn verify(&self, data: &[u8]) -> Result<()> {
+        if let ReadPiece::Disk { sector, sums: Some(sums), .. } = self {
+            for (piece, sum) in data.chunks_exact(*sector).zip(sums) {
+                if crc32c::checksum(piece) != *sum {
+                    return Err(Error::BadChecksum);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Одно дерево в памяти.
 struct Tree {
     id: u64,
@@ -623,35 +679,49 @@ impl Writer {
 
     /// Прочитать до `buf.len()` байт файла с `offset`; у конца файла — меньше.
     pub fn read_at(&mut self, dev: &mut dyn BlockDevice, number: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let pieces = self.plan_read(dev, number, offset, buf.len())?;
+        let mut scratch = Vec::new();
+        let mut done = 0usize;
+        for piece in &pieces {
+            done += piece.fill(dev, &mut scratch, &mut buf[done..])?;
+        }
+        Ok(done)
+    }
+
+    /// Разметить чтение до `len` байт файла с `offset`: что взять с носителя
+    /// (и с какими суммами сверить), что нулями, что из элемента. Носителя
+    /// не трогает, кроме подгрузки листьев: ядро размечает под замком тома, а
+    /// читает и сверяет без него (31.10 — как ext2), см. [`ReadPiece::fill`].
+    pub fn plan_read(&mut self, dev: &mut dyn BlockDevice, number: u64, offset: u64, len: usize) -> Result<Vec<ReadPiece>> {
         /// Длиннее за одно обращение к носителю не читается.
         const RUN: u64 = 256 * 1024;
         self.ensure_objects(dev, &[number])?;
         let (size, flags) = self.regular_inode(number)?;
+        let mut out = Vec::new();
         if offset >= size {
-            return Ok(0);
+            return Ok(out);
         }
-        let want = (size - offset).min(buf.len() as u64) as usize;
+        let want = (size - offset).min(len as u64) as usize;
         let fs = self.tree(objectid::FS_TREE)?;
         let sector = u64::from(self.sectorsize);
         let device_sector = u64::from(dev.sector_size());
         let is_extent = |key: &Key| key.objectid == number && key.kind == item_type::EXTENT_DATA;
-        let mut scratch = Vec::new();
         let mut done = 0usize;
         while done < want {
             let position = offset + done as u64;
             let next = fs.items.partition_point(|(key, _)| *key <= Key::new(number, item_type::EXTENT_DATA, position));
             // Где кончается дыра: следующий экстент или конец файла.
             let gap_end = fs.items.get(next).filter(|(key, _)| is_extent(key)).map_or(size, |(key, _)| key.offset).min(size);
-            let hole = |buf: &mut [u8], done: usize| -> Result<usize> {
+            let hole = |out: &mut Vec<ReadPiece>, done: usize| -> Result<usize> {
                 let take = (gap_end.saturating_sub(position) as usize).min(want - done);
                 if take == 0 {
                     return Err(Error::Corrupt);
                 }
-                buf[done..done + take].fill(0);
+                push(out, ReadPiece::Zero(take))?;
                 Ok(take)
             };
             let Some((key, raw)) = next.checked_sub(1).map(|at| &fs.items[at]).filter(|(key, _)| is_extent(key)) else {
-                done += hole(buf, done)?;
+                done += hole(&mut out, done)?;
                 continue;
             };
             if raw.len() <= EXTENT_TYPE {
@@ -668,11 +738,11 @@ impl Writer {
                     return Err(Error::Corrupt);
                 }
                 if within >= ram {
-                    done += hole(buf, done)?;
+                    done += hole(&mut out, done)?;
                     continue;
                 }
                 let take = ((ram - within) as usize).min(want - done);
-                buf[done..done + take].copy_from_slice(&data[within as usize..within as usize + take]);
+                push(&mut out, ReadPiece::Bytes(copy(&data[within as usize..within as usize + take])?))?;
                 done += take;
                 continue;
             }
@@ -681,13 +751,13 @@ impl Writer {
             }
             let length = u64_at(raw, EXTENT_NUM_BYTES);
             if within >= length {
-                done += hole(buf, done)?;
+                done += hole(&mut out, done)?;
                 continue;
             }
             let take = (length - within).min((want - done) as u64).min(RUN) as usize;
             let bytenr = u64_at(raw, EXTENT_DISK_BYTENR);
             if bytenr == 0 || raw[EXTENT_TYPE] == EXTENT_TYPE_PREALLOC {
-                buf[done..done + take].fill(0);
+                push(&mut out, ReadPiece::Zero(take))?;
                 done += take;
                 continue;
             }
@@ -698,23 +768,29 @@ impl Writer {
             if run < stop - start || physical % device_sector != 0 {
                 return Err(Error::Corrupt);
             }
-            scratch.clear();
-            resize(&mut scratch, (stop - start) as usize)?;
-            dev.read(self.first_lba + physical / device_sector, &mut scratch)?;
-            if flags & INODE_FLAG_NODATASUM == 0 {
-                for (n, piece) in scratch.chunks_exact(sector as usize).enumerate() {
-                    match self.stored_checksum(start + n as u64 * sector)? {
-                        Some(sum) if crc32c::checksum(piece) == sum => {}
-                        Some(_) => return Err(Error::BadChecksum),
-                        None => return Err(Error::Corrupt),
-                    }
+            let sums = if flags & INODE_FLAG_NODATASUM == 0 {
+                let mut sums = Vec::new();
+                for n in 0..(stop - start) / sector {
+                    push(&mut sums, self.stored_checksum(start + n * sector)?.ok_or(Error::Corrupt)?)?;
                 }
-            }
-            let from = (logical - start) as usize;
-            buf[done..done + take].copy_from_slice(&scratch[from..from + take]);
+                Some(sums)
+            } else {
+                None
+            };
+            push(
+                &mut out,
+                ReadPiece::Disk {
+                    lba: self.first_lba + physical / device_sector,
+                    bytes: (stop - start) as usize,
+                    skip: (logical - start) as usize,
+                    take,
+                    sector: sector as usize,
+                    sums,
+                },
+            )?;
             done += take;
         }
-        Ok(done)
+        Ok(out)
     }
 
     /// Есть ли не зафиксированные правки.
