@@ -125,6 +125,14 @@ pub fn name(number: usize) -> &'static str {
         293 => "pipe2",
         318 => "getrandom",
         332 => "statx",
+        // Не вызовы — отказы страниц (`user::fault_in`).
+        500 => "#pf missing",
+        501 => "#pf write (cow/jit)",
+        502 => "#pf exec (jit)",
+        503 => "#pf shared",
+        504 => "#pf page cache",
+        505 => "#pf anon",
+        506 => "#pf file read",
         _ => "",
     }
 }

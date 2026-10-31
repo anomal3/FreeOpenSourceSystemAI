@@ -5054,8 +5054,36 @@ pub fn prepare_write(ptr: usize, len: usize) {
     }
 }
 
-/// Окно упреждающего чтения страниц файла.
+/// Окно упреждающего чтения страниц файла — начальное и наибольшее.
 const READ_AHEAD: usize = 128 * 1024;
+const READ_AHEAD_MAX: usize = 1024 * 1024;
+
+/// Последние окна по файлам: (файл, где окно кончилось, его длина). Отказ
+/// ровно на конце прошлого окна того же файла — чтение подряд, и окно
+/// удваивается до [`READ_AHEAD_MAX`], как у Linux (30.10: холодный запуск
+/// Chromium — 17,8 тыс. чтений файла по 0,8 мс, при 4 мкс на попадание в кэш).
+static AHEAD_WINDOWS: crate::sync::SpinLock<[((usize, u64), u64, usize); 16]> =
+    crate::sync::SpinLock::new([((0, 0), 0, 0); 16]);
+
+/// Длина окна для отказа на `offset` файла `file`.
+fn ahead_window(file: (usize, u64), offset: u64) -> usize {
+    let windows = AHEAD_WINDOWS.lock();
+    windows
+        .iter()
+        .find(|(key, end, _)| *key == file && *end == offset)
+        .map_or(READ_AHEAD, |(_, _, len)| (len * 2).min(READ_AHEAD_MAX))
+}
+
+/// Запомнить окно `[offset, offset + len)` файла `file`.
+fn remember_window(file: (usize, u64), offset: u64, len: usize) {
+    let mut windows = AHEAD_WINDOWS.lock();
+    let end = offset + len as u64;
+    let slot = windows
+        .iter()
+        .position(|(key, _, _)| *key == file)
+        .unwrap_or_else(|| (file.1 as usize ^ file.0 >> 4) % windows.len());
+    windows[slot] = (file, end, len);
+}
 
 /// Запас буферов окна — не просить у кучи 128 КиБ на каждый отказ.
 static AHEAD_BUFFERS: crate::sync::SpinLock<Vec<Vec<u8>>> = crate::sync::SpinLock::new(Vec::new());
@@ -5070,23 +5098,24 @@ static AHEAD_BUFFERS: crate::sync::SpinLock<Vec<Vec<u8>>> = crate::sync::SpinLoc
 /// Linux (readahead, fault-around). Вернуть, сколько байт легло в `page`;
 /// `None` — чтение отказало.
 fn read_ahead(node: &dyn crate::vfs::Node, file: (usize, u64), offset: u64, page: &mut [u8]) -> Option<usize> {
-    // Окно — пока страницы подряд не в кэше и памяти хватает.
+    // Окно — пока страницы подряд не в кэше и памяти хватает; при чтении
+    // подряд оно растёт (см. [`ahead_window`]).
+    let limit = ahead_window(file, offset) / PAGE_SIZE;
     let mut pages = 1;
-    while pages < READ_AHEAD / PAGE_SIZE
-        && !crate::mm::pagecache::has(file, offset + (pages * PAGE_SIZE) as u64, PAGE_SIZE)
-    {
+    while pages < limit && !crate::mm::pagecache::has(file, offset + (pages * PAGE_SIZE) as u64, PAGE_SIZE) {
         pages += 1;
     }
     let roomy = crate::mm::frame::stats().free > RESERVE_FRAMES * 4 && crate::mm::pagecache::roomy(pages);
     if pages == 1 || !roomy {
         return node.read_at(offset, &mut page[..PAGE_SIZE]).ok();
     }
+    remember_window(file, offset, pages * PAGE_SIZE);
     let mut window = AHEAD_BUFFERS.lock().pop().unwrap_or_default();
-    if window.len() < READ_AHEAD {
-        if window.try_reserve_exact(READ_AHEAD - window.len()).is_err() {
+    if window.len() < READ_AHEAD_MAX {
+        if window.try_reserve_exact(READ_AHEAD_MAX - window.len()).is_err() {
             return node.read_at(offset, &mut page[..PAGE_SIZE]).ok();
         }
-        window.resize(READ_AHEAD, 0);
+        window.resize(READ_AHEAD_MAX, 0);
     }
     let result = node.read_at(offset, &mut window[..pages * PAGE_SIZE]);
     let outcome = result.ok().map(|read| {
@@ -5113,8 +5142,40 @@ fn read_ahead(node: &dyn crate::vfs::Node, file: (usize, u64), offset: u64, page
     outcome
 }
 
+/// Отказ страницы — и его учёт в `lxstat` (30.10): число и время по видам —
+/// 500 «страницы не было» (файл, кэш, пустая память), 501 «запись в
+/// присутствующую» (копирование при записи, JIT), 502 «исполнение или чтение
+/// присутствующей» (JIT): запуск программы Linux — это в основном отказы.
 #[must_use]
 pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
+    let started = crate::time::uptime_ns();
+    let done = fault_in_inner(addr, access, present);
+    // Слой Linux — только на x86-64; там и счёт.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let kind = match (present, access) {
+            (false, _) => FAULT_KIND[sched::current_slot()].swap(500, Ordering::Relaxed) as usize,
+            (true, Touch::Write) => 501,
+            (true, _) => 502,
+        };
+        crate::linux::profile::count(kind, crate::time::uptime_ns().saturating_sub(started));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = started;
+    done
+}
+
+/// Вид последнего отказа «страницы не было» у потока слота — для `lxstat`:
+/// 503 общая память, 504 из кэша страниц, 505 пустая (без файла), 506 чтение
+/// файла; 500 — не дошёл до решения.
+static FAULT_KIND: [core::sync::atomic::AtomicU16; sched::MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU16::new(500) }; sched::MAX_TASKS];
+
+fn note_fault_kind(kind: u16) {
+    FAULT_KIND[sched::current_slot()].store(kind, Ordering::Relaxed);
+}
+
+fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
     let page_addr = addr & !(PAGE_SIZE - 1);
     // Страница на месте, а обращение не прошло — это нарушение прав, и
     // подкачка тут ни при чём. Кроме памяти кода (фаза 59): у неё «не те
@@ -5145,6 +5206,7 @@ pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
         return false;
     };
     if let Some((memory, page)) = &plan.shared {
+        note_fault_kind(503);
         let Some(frame) = memory.frame(*page) else {
             return false;
         };
@@ -5163,8 +5225,40 @@ pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     // Чистая страница файла — сначала из кэша страниц: её мог прочитать
     // любой процесс, отображающий тот же файл (`mm::pagecache`).
     let cache_file = if plan.clean && plan.want > 0 { plan.node.as_ref().and_then(|node| node.cache_key()) } else { None };
+    // Страница файла, отображённого на запись приватно (`.data` библиотек,
+    // `MAP_PRIVATE` с правом записи), — тоже через кэш страниц, но копией:
+    // кадр программы станет её собственным, делить его нельзя (30.10: такие
+    // отказы шли мимо кэша и окна, по 4 КиБ с диска на каждый — 17,6 тыс.
+    // чтений по 0,8 мс на холодный запуск Chromium).
+    let private_file = if !plan.clean && plan.want == PAGE_SIZE && plan.shared.is_none() {
+        plan.node.as_ref().and_then(|node| node.cache_key())
+    } else {
+        None
+    };
+    if let Some(file) = private_file {
+        if let Some(cached) = crate::mm::pagecache::take(file, plan.offset, PAGE_SIZE) {
+            let copy = take_frame_reserved();
+            if let Some(frame) = copy {
+                // SAFETY: оба кадра видны через прямое отображение; `frame`
+                // только что выдан и принадлежит нам одним, `cached` — кадр
+                // кэша, у которого мы сейчас один из владельцев.
+                unsafe { core::ptr::copy_nonoverlapping(frame_bytes(cached), frame_bytes(frame), PAGE_SIZE) };
+            }
+            return_frame(cached);
+            if let Some(frame) = copy {
+                note_fault_kind(504);
+                let commit = with_current_shared(|program, shared| program.fault_commit(page_addr, frame, &plan, shared))
+                    .unwrap_or(Commit::Failed);
+                if !matches!(commit, Commit::Mapped) {
+                    return_frame(frame);
+                }
+                return !matches!(commit, Commit::Failed);
+            }
+        }
+    }
     if let Some(file) = cache_file {
         if let Some(frame) = crate::mm::pagecache::take(file, plan.offset, plan.want) {
+            note_fault_kind(504);
             let commit = with_current_shared(|program, shared| program.fault_commit(page_addr, frame, &plan, shared))
                 .unwrap_or(Commit::Failed);
             if !matches!(commit, Commit::Mapped) {
@@ -5189,14 +5283,16 @@ pub fn fault_in(addr: usize, access: Touch, present: bool) -> bool {
     // программы: обращение по `page_addr` вызвало бы тот же отказ, который
     // мы сейчас и обрабатываем.
     let buffer = unsafe { core::slice::from_raw_parts_mut(frame_bytes(frame), PAGE_SIZE) };
+    note_fault_kind(if plan.want == 0 || plan.node.is_none() { 505 } else { 506 });
     let read = match &plan.node {
         // Страница целиком за файловой частью сегмента — чистый `.bss`; или
         // ленивая безымянная память, у которой файла нет вовсе.
         _ if plan.want == 0 => 0,
         None => 0,
-        // Полная чистая страница файла — с упреждающим чтением.
-        Some(node) if cache_file.is_some() && plan.want == PAGE_SIZE => {
-            match read_ahead(node.as_ref(), cache_file.unwrap_or_default(), plan.offset, buffer) {
+        // Полная страница файла (чистая или приватная) — с упреждающим
+        // чтением: соседние ложатся в кэш, сама страница — только чистая.
+        Some(node) if cache_file.or(private_file).is_some() && plan.want == PAGE_SIZE => {
+            match read_ahead(node.as_ref(), cache_file.or(private_file).unwrap_or_default(), plan.offset, buffer) {
                 Some(read) => read,
                 None => {
                     return_frame(frame);
