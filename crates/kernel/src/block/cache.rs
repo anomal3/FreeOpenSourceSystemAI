@@ -211,6 +211,11 @@ impl<D: disk::BlockDevice> Cached<D> {
         !self.dirty.is_empty()
     }
 
+    /// Сколько блоков ждут сброса.
+    pub fn dirty_blocks(&self) -> usize {
+        self.dirty.len()
+    }
+
     /// Носитель под кешем.
     pub const fn inner(&self) -> &D {
         &self.inner
