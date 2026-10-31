@@ -626,6 +626,25 @@ fn note_input_wait(ns: u64) {
     INPUT_WAIT_WORST_NS.fetch_max(ns, Ordering::Relaxed);
 }
 
+/// Событие ввода вынуто из очереди и ждёт свободного стола (см.
+/// [`crate::sched`]: пока так, стол и Wayland идут вне очереди программ).
+static INPUT_WAITING: AtomicBool = AtomicBool::new(false);
+
+/// Ждёт ли ввод стол прямо сейчас.
+#[must_use]
+pub fn input_waiting() -> bool {
+    INPUT_WAITING.load(Ordering::Relaxed)
+}
+
+/// Снимает [`INPUT_WAITING`], когда событие дошло (или сдалось).
+struct InputWaiting;
+
+impl Drop for InputWaiting {
+    fn drop(&mut self) {
+        INPUT_WAITING.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Вывод в окно оболочки, пришедший, пока стол был вынут другой задачей.
 ///
 /// # Дефект, ради которого очередь заведена (фаза С9)
@@ -1535,6 +1554,7 @@ pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
     // отпускание окна не перерисовывает.
     let defer = crate::input::has_events();
     let since = crate::time::uptime_ns();
+    let _waiting = InputWaiting;
     for attempt in 0..INPUT_TRIES {
         let answer = with_desktop(|desktop| {
             desktop.set_deferred(defer);
@@ -1557,6 +1577,7 @@ pub fn dispatch(event: KeyEvent) -> Option<KeyEvent> {
         // Стол вынут из-под замка: кто-то собирает кадр. Ждём — см.
         // [`INPUT_TRIES`], — но только между попытками, а не после последней.
         if attempt + 1 < INPUT_TRIES {
+            INPUT_WAITING.store(true, Ordering::Relaxed);
             crate::sched::sleep_ms(INPUT_PAUSE_MS);
         }
     }
@@ -1780,6 +1801,7 @@ pub fn dispatch_pointer(event: PointerEvent) {
     // «не нажалась кнопка меню», а не как «потерялось движение мыши».
     let tries = INPUT_TRIES;
     let since = crate::time::uptime_ns();
+    let _waiting = InputWaiting;
 
     for attempt in 0..tries {
         if with_desktop(|desktop| pointer_on(desktop, event, &status)).is_some() {
@@ -1796,6 +1818,7 @@ pub fn dispatch_pointer(event: PointerEvent) {
         // команда, набранная в серийную линию, терялась целиком, потому что
         // читает эту линию та же задача.
         if attempt + 1 < tries {
+            INPUT_WAITING.store(true, Ordering::Relaxed);
             crate::sched::sleep_ms(INPUT_PAUSE_MS);
         }
     }

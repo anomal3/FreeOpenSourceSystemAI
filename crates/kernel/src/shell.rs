@@ -2652,7 +2652,14 @@ fn save(path: &str, text: &str) {
     let mut line = String::from(text);
     line.push('\n');
     match node.write_at(0, line.as_bytes()) {
-        Ok(written) => sprintln!("  wrote {written} bytes to {path}"),
+        Ok(written) => {
+            // На носитель сразу, как у родных программ (`syscall::settled`):
+            // отложенная запись тома (фаза 74) иначе держала бы строку в
+            // памяти до пяти секунд, и сброс машины её терял (сценарий
+            // `power`, 31.10).
+            fs::writeback_all();
+            sprintln!("  wrote {written} bytes to {path}");
+        }
         Err(err) => sprintln!("  {path}: {err}"),
     }
 }

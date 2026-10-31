@@ -656,6 +656,13 @@ pub fn has_events() -> bool {
     QUEUE.lock().len != 0
 }
 
+/// То же для планировщика, без ожидания замка: занят — значит в очередь
+/// как раз кладут, и событие считается пришедшим.
+#[must_use]
+pub fn has_events_now() -> bool {
+    QUEUE.try_lock().is_none_or(|queue| queue.len != 0)
+}
+
 /// Текущее состояние модификаторов.
 #[must_use]
 pub fn modifiers() -> Modifiers {

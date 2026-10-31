@@ -321,11 +321,22 @@ pub fn lock_watch_task() {
 }
 
 /// Принадлежит ли слот холостой задаче какого-нибудь процессора.
-/// Задача ядра, обслуживающая человека: стол и оболочка (`shell`), сервер
-/// Wayland, драйверы ввода (USB, тачскрин телефона). Им процессор — раньше
-/// общей очереди (см. [`Sched::pick_next`]).
-fn serves_person(name: &str) -> bool {
-    matches!(name, "shell" | "wayland" | "usb" | "ehci" | "ohci" | "touch")
+/// Очередь вне очереди программ (см. [`Sched::pick_next`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rank {
+    /// Драйверы, отвечающие на прерывания: ввод (USB, тачскрин телефона) и
+    /// сеть — всегда первыми; они крошечные и почти всё время спят.
+    Driver,
+    /// Стол и оболочка (`shell`), сервер Wayland — пока человек ждёт ответа.
+    Desktop,
+}
+
+fn rank_of(name: &str) -> Option<Rank> {
+    match name {
+        "usb" | "ehci" | "ohci" | "touch" | "net" => Some(Rank::Driver),
+        "shell" | "wayland" => Some(Rank::Desktop),
+        _ => None,
+    }
 }
 
 const fn is_idle_slot(slot: usize) -> bool {
@@ -399,20 +410,31 @@ impl Scheduler {
                 }
             }
         }
-        // Затем — задачи, которые обслуживают человека (стол, Wayland, ввод),
-        // не только сразу после прерывания: стол, ждущий сам себя через
-        // `sleep_ms`, и Wayland, держащий стол, иначе стояли в общей очереди
-        // за десятками потоков Chromium или Rider — по кванту на каждый, и
-        // стол «замирал» (30.10). Они почти всё время спят, и программам
-        // остаётся всё, что им не нужно.
-        for step in 1..MAX_TASKS {
-            let slot = (current + step) % MAX_TASKS;
-            if is_idle_slot(slot) {
-                continue;
+        // Затем — задачи, которые обслуживают человека, не только сразу после
+        // прерывания: стол, ждущий сам себя через `sleep_ms`, и Wayland,
+        // держащий стол, иначе стояли в общей очереди за десятками потоков
+        // Chromium или Rider — по кванту на каждый, и стол «замирал» (30.10).
+        // Драйверы ввода — всегда (они крошечные); стол и Wayland — пока
+        // человек ждёт ответа (ввод в очереди или ждёт стола): всё время
+        // впереди программ они отнимали процессор у игры, чьи кадры собирают
+        // (`sopwith` на одном процессоре слышал 0,16 с звука вместо секунды).
+        // Драйверы — раньше стола: стол, обрабатывающий набранную команду,
+        // не должен задерживать сеть (сценарий `net` видел её «готовой»
+        // вместо «ждёт устройство»).
+        let waiting = crate::input::has_events_now() || crate::ui::input_waiting();
+        for rank in [Rank::Driver, Rank::Desktop] {
+            if rank == Rank::Desktop && !waiting {
+                break;
             }
-            if let Some(task) = &self.tasks[slot] {
-                if task.state == TaskState::Ready && task.cpu.is_none() && serves_person(task.name) {
-                    return Some(slot);
+            for step in 1..MAX_TASKS {
+                let slot = (current + step) % MAX_TASKS;
+                if is_idle_slot(slot) {
+                    continue;
+                }
+                if let Some(task) = &self.tasks[slot] {
+                    if task.state == TaskState::Ready && task.cpu.is_none() && rank_of(task.name) == Some(rank) {
+                        return Some(slot);
+                    }
                 }
             }
         }
