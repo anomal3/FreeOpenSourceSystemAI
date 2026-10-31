@@ -421,7 +421,7 @@ unsafe fn dispatch(number: usize, args: [usize; 6], frame: &mut crate::arch::Tra
             // пользователя нет, прав и времени файла программа Linux не меняет:
             // согласиться — честный ответ.
             nr::FSYNC | nr::FDATASYNC | nr::SYNC_FILE_RANGE => {
-                crate::fs::writeback_all();
+                crate::fs::fsync_all();
                 0
             }
             nr::FLOCK => 0,

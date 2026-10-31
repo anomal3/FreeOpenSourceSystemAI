@@ -526,6 +526,13 @@ pub fn writeback_all() {
     }
 }
 
+/// `fsync`/`fdatasync` программы: [`FileSystem::fsync`] всех томов.
+pub fn fsync_all() {
+    for (_, fs) in distinct(true) {
+        let _ = fs.fsync();
+    }
+}
+
 /// Служебная задача: раз в 5 секунд сбрасывает отложенные записи.
 pub fn writeback_task() {
     loop {

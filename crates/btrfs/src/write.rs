@@ -242,6 +242,10 @@ struct Plan<'a> {
     free_space: Items,
     root: Items,
     used: u64,
+    /// Группы и занятые отрезки нового состояния — готовый [`Writer::space`]
+    /// после фиксации (31.10: раньше он строился заново обходом всего
+    /// дерева экстентов при первой же записи после фиксации).
+    space: (Vec<Group>, Vec<(u64, u64)>),
 }
 
 /// Том, открытый на запись.
@@ -267,6 +271,9 @@ pub struct Writer {
     /// Группы блоков и занятые отрезки для размещения данных (см.
     /// [`Writer::allocate_data`]); `None` — построить заново.
     space: Option<(Vec<Group>, Vec<(u64, u64)>)>,
+    /// С какого адреса искать место под данные: конец прошлого размещения
+    /// ([`Writer::first_free`]).
+    data_hint: u64,
     /// Inode, чьи элементы `EXTENT_DATA` менялись с прошлой фиксации, и
     /// экстенты, на которые они ссылались до первой правки (см.
     /// [`Writer::settle_data`]).
@@ -382,6 +389,7 @@ impl Writer {
             time: 0,
             broken: false,
             space: None,
+            data_hint: 0,
             touched: BTreeMap::new(),
             loaded_limit: LOADED_ITEMS_LIMIT,
         };
@@ -923,7 +931,7 @@ impl Writer {
         let sb = self.next_superblock(&plan, generation)?;
         // Из взгляда на прежнее дерево экстентов — только своё (новые и
         // изменённые элементы): дальше память правится на месте.
-        let Plan { rebuilt, extent, replaced, free_space, root, .. } = plan;
+        let Plan { rebuilt, extent, replaced, free_space, root, space, .. } = plan;
         let changed = owned_part(extent)?;
         self.write_superblocks(dev, sb)?;
 
@@ -948,7 +956,9 @@ impl Writer {
         let root_index = self.tree_index(objectid::ROOT_TREE)?;
         self.trees[root_index].items = root;
         self.generation = generation;
-        self.space = None;
+        // Занятость нового состояния уже посчитана подбором (узлы и
+        // экстенты данных) — готовый список, а не обход дерева заново.
+        self.space = Some(space);
         self.unload_if_large();
         Ok(())
     }
@@ -1931,10 +1941,15 @@ impl Writer {
                 self.space = Some((groups(extent)?, busy_ranges(extent, self.nodesize)?));
             }
             let found = match &self.space {
-                Some((groups, busy)) => self.first_free(BLOCK_GROUP_DATA, groups, busy, want, true)?,
+                Some((groups, busy)) => match self.first_free(BLOCK_GROUP_DATA, groups, busy, want, true, self.data_hint)? {
+                    Some(found) => Some(found),
+                    None if self.data_hint > 0 => self.first_free(BLOCK_GROUP_DATA, groups, busy, want, true, 0)?,
+                    None => None,
+                },
                 None => None,
             };
             if let Some(found) = found {
+                self.data_hint = found.0 + found.1;
                 if let Some((_, busy)) = self.space.as_mut() {
                     let at = busy.partition_point(|&(start, _)| start < found.0);
                     busy.try_reserve(1).map_err(|_| Error::NoMemory)?;
@@ -1954,6 +1969,10 @@ impl Writer {
     ///
     /// `partial` — годится ли кусок короче `want` (данным годится: файл ляжет в
     /// несколько экстентов; узлу — нет).
+    ///
+    /// `from` — не раньше этого адреса (31.10: данные ищутся с места прошлого
+    /// размещения — на томе с Rider перед первой дырой сотни тысяч занятых
+    /// отрезков, и поиск с начала стоил миллисекунды на каждую запись).
     fn first_free(
         &self,
         kind: u64,
@@ -1961,14 +1980,18 @@ impl Writer {
         busy: &[(u64, u64)],
         want: u64,
         partial: bool,
+        from: u64,
     ) -> Result<Option<(u64, u64)>> {
         let align = u64::from(self.sectorsize);
         for group in groups.iter().filter(|group| group.kind == kind) {
             let end = group.start + group.length;
+            if end <= from {
+                continue;
+            }
             let mirrors = self.mirrors(group)?;
-            let mut index = busy.partition_point(|&(start, len)| start + len <= group.start);
-            let mut mirror = 0;
-            let mut cursor = group.start;
+            let mut cursor = group.start.max(from);
+            let mut index = busy.partition_point(|&(start, len)| start + len <= cursor);
+            let mut mirror = mirrors.partition_point(|&(start, len)| start + len <= cursor);
             loop {
                 let next_busy = busy.get(index).copied().filter(|&(start, _)| start < end);
                 let next_mirror = mirrors.get(mirror).copied();
@@ -2286,7 +2309,8 @@ impl Writer {
                 push(&mut next, again)?;
             }
             if next == layouts {
-                return Ok(Plan { rebuilt, layouts, placed, tops, extent, replaced, free_space, root, used });
+                let space = (groups, busy);
+                return Ok(Plan { rebuilt, layouts, placed, tops, extent, replaced, free_space, root, used, space });
             }
             layouts = next;
         }
@@ -2317,11 +2341,15 @@ impl Writer {
                 BLOCK_GROUP_METADATA
             };
             let mut nodes = Vec::new();
+            // Первая дыра не раньше прошлого узла этого вида: всё до него уже
+            // занято — тот же «первый подходящий», без прохода с начала.
+            let mut hint = 0u64;
             for (level, &count) in shapes[slot].iter().enumerate() {
                 for _ in 0..count {
                     let (address, _) = self
-                        .first_free(kind, groups, &busy, nodesize, false)?
+                        .first_free(kind, groups, &busy, nodesize, false, hint)?
                         .ok_or(Error::NoSpace)?;
+                    hint = address;
                     let at = busy.partition_point(|&(start, _)| start < address);
                     busy.try_reserve(1).map_err(|_| Error::NoMemory)?;
                     busy.insert(at, (address, nodesize));
@@ -2590,7 +2618,11 @@ fn unsupported_fs_item(key: &Key, raw: &[u8]) -> bool {
 
 /// Сколько элементов дерева ФС держать подгруженными после фиксации; больше
 /// — выгрузить всё (всё уже на диске).
-const LOADED_ITEMS_LIMIT: usize = 100_000;
+///
+/// Было 100 тыс.: подгруженное лежит одним массивом, и каждая вставка
+/// сдвигает его целиком — `mkdir` (четыре вставки) у Rider стоила 11 мс
+/// (31.10, VirtualBox). Листья подгружаются обратно из кэша блоков дёшево.
+const LOADED_ITEMS_LIMIT: usize = 16_384;
 
 /// Хеш содержимого узла (64 бита): по нему фиксация узнаёт узел, который
 /// можно оставить на месте. Совпадение числа элементов проверяется отдельно.
