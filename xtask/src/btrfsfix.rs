@@ -292,9 +292,9 @@ pub fn linux_check() -> Result<()> {
     {
         let fail = broken("наш писатель отказал");
         let mut writer = btrfs::Writer::open(&mut disk, 0).map_err(&fail)?;
-        let etc = writer.create_directory(256, "etc", &attrs(0o755)).map_err(&fail)?;
-        let home = writer.create_directory(256, "home", &attrs(0o755)).map_err(&fail)?;
-        let roman = writer.create_directory(home, "roman", &attrs(0o700)).map_err(&fail)?;
+        let etc = writer.create_directory(&mut disk, 256, "etc", &attrs(0o755)).map_err(&fail)?;
+        let home = writer.create_directory(&mut disk, 256, "home", &attrs(0o755)).map_err(&fail)?;
+        let roman = writer.create_directory(&mut disk, home, "roman", &attrs(0o700)).map_err(&fail)?;
         writer.create_file(&mut disk, etc, "hostname", b"freeos\n", &attrs(0o644)).map_err(&fail)?;
         writer.create_file(&mut disk, etc, "empty", b"", &attrs(0o600)).map_err(&fail)?;
         writer.create_file(&mut disk, etc, "mixed.bin", &mixed, &attrs(0o644)).map_err(&fail)?;
@@ -302,7 +302,7 @@ pub fn linux_check() -> Result<()> {
         // Двадцать мегабайт не помещаются в начальный кусок данных: писателю
         // приходится завести новый.
         writer.create_file(&mut disk, 256, "twenty.bin", &twenty, &attrs(0o644)).map_err(&fail)?;
-        let many = writer.create_directory(256, "many", &attrs(0o755)).map_err(&fail)?;
+        let many = writer.create_directory(&mut disk, 256, "many", &attrs(0o755)).map_err(&fail)?;
         for number in 0..300 {
             let text = format!("file {number:03}\n");
             writer
@@ -357,9 +357,9 @@ pub fn linux_check() -> Result<()> {
     {
         let fail = broken("наш писатель поверх Linux отказал");
         let mut writer = btrfs::Writer::open(&mut disk, 0).map_err(&fail)?;
-        let dir = writer.create_directory(256, "again", &attrs(0o755)).map_err(&fail)?;
+        let dir = writer.create_directory(&mut disk, 256, "again", &attrs(0o755)).map_err(&fail)?;
         writer.create_file(&mut disk, dir, "again.bin", &again, &attrs(0o644)).map_err(&fail)?;
-        let linuxdir = writer.resolve("/linuxdir").map_err(&fail)?;
+        let linuxdir = writer.resolve(&mut disk, "/linuxdir").map_err(&fail)?;
         writer
             .create_file(&mut disk, linuxdir, "ours-in-linux-dir.txt", b"ours, next to linux\n", &attrs(0o644))
             .map_err(&fail)?;
@@ -391,23 +391,23 @@ pub fn linux_check() -> Result<()> {
         let time = now();
         let mut writer = btrfs::Writer::open(&mut disk, 0).map_err(&fail)?;
         // Посреди нашего экстента: он делится на остатки с общей ссылкой.
-        let node = writer.resolve("/twenty.bin").map_err(&fail)?;
+        let node = writer.resolve(&mut disk, "/twenty.bin").map_err(&fail)?;
         writer.write_at(&mut disk, node, 9_000_001, &patch, time).map_err(&fail)?;
         // Экстенты этого файла сделало ядро Linux.
-        let node = writer.resolve("/linuxdir/rand.bin").map_err(&fail)?;
+        let node = writer.resolve(&mut disk, "/linuxdir/rand.bin").map_err(&fail)?;
         writer.write_at(&mut disk, node, 1_500_000, &rand_patch, time).map_err(&fail)?;
         writer.write_at(&mut disk, node, 3_000_000, b"appended by freeos", time).map_err(&fail)?;
-        let node = writer.resolve("/home/roman/big.bin").map_err(&fail)?;
+        let node = writer.resolve(&mut disk, "/home/roman/big.bin").map_err(&fail)?;
         writer.truncate(&mut disk, node, 5000, time).map_err(&fail)?;
-        writer.unlink(256, "second.txt", time).map_err(&fail)?;
-        let many = writer.resolve("/many").map_err(&fail)?;
-        let etc = writer.resolve("/etc").map_err(&fail)?;
-        writer.rename(many, "f000", etc, "renamed-from-many", time).map_err(&fail)?;
-        let gone = writer.create_directory(256, "gone", &attrs(0o755)).map_err(&fail)?;
+        writer.unlink(&mut disk, 256, "second.txt", time).map_err(&fail)?;
+        let many = writer.resolve(&mut disk, "/many").map_err(&fail)?;
+        let etc = writer.resolve(&mut disk, "/etc").map_err(&fail)?;
+        writer.rename(&mut disk, many, "f000", etc, "renamed-from-many", time).map_err(&fail)?;
+        let gone = writer.create_directory(&mut disk, 256, "gone", &attrs(0o755)).map_err(&fail)?;
         writer.create_file(&mut disk, gone, "tmp", b"tmp", &attrs(0o644)).map_err(&fail)?;
-        writer.unlink(gone, "tmp", time).map_err(&fail)?;
-        writer.remove_directory(256, "gone", time).map_err(&fail)?;
-        let node = writer.resolve("/etc/hostname").map_err(&fail)?;
+        writer.unlink(&mut disk, gone, "tmp", time).map_err(&fail)?;
+        writer.remove_directory(&mut disk, 256, "gone", time).map_err(&fail)?;
+        let node = writer.resolve(&mut disk, "/etc/hostname").map_err(&fail)?;
         writer.write_at(&mut disk, node, 0, b"freeos-edited\n", time).map_err(&fail)?;
         writer.commit(&mut disk).map_err(&fail)?;
     }
@@ -431,9 +431,9 @@ pub fn linux_check() -> Result<()> {
     {
         let time = now();
         let mut writer = btrfs::Writer::open(&mut disk, 0).map_err(&fail)?;
-        let node = writer.resolve("/twenty.bin").map_err(&fail)?;
+        let node = writer.resolve(&mut disk, "/twenty.bin").map_err(&fail)?;
         writer.write_at(&mut disk, node, 8_999_990, b"QQQQQQQQQQ", time).map_err(&fail)?;
-        let node = writer.resolve("/home/roman/big.bin").map_err(&fail)?;
+        let node = writer.resolve(&mut disk, "/home/roman/big.bin").map_err(&fail)?;
         writer.write_at(&mut disk, node, 50, b"after linux truncate", time).map_err(&fail)?;
         writer.commit(&mut disk).map_err(&fail)?;
     }

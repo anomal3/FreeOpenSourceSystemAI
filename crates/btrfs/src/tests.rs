@@ -603,9 +603,9 @@ fn assert_clean(disk: &mut MemDisk) -> crate::Report {
 fn writes_files_and_directories_that_our_reader_reads_back() {
     let mut disk = fresh_volume(128);
     let mut writer = Writer::open(&mut disk, 0).expect("том не открылся на запись");
-    let etc = writer.create_directory(256, "etc", &dir_attrs()).unwrap();
-    let home = writer.create_directory(256, "home", &dir_attrs()).unwrap();
-    let roman = writer.create_directory(home, "roman", &dir_attrs()).unwrap();
+    let etc = writer.create_directory(&mut disk, 256, "etc", &dir_attrs()).unwrap();
+    let home = writer.create_directory(&mut disk, 256, "home", &dir_attrs()).unwrap();
+    let roman = writer.create_directory(&mut disk, home, "roman", &dir_attrs()).unwrap();
     // Три вида файла: встроенный, пустой (экстента нет вовсе) и обычный.
     writer.create_file(&mut disk, etc, "hostname", b"freeos\n", &attrs()).unwrap();
     writer.create_file(&mut disk, etc, "empty", b"", &attrs()).unwrap();
@@ -613,7 +613,7 @@ fn writes_files_and_directories_that_our_reader_reads_back() {
     writer.create_file(&mut disk, etc, "mixed.bin", &mixed, &attrs()).unwrap();
     let big = pattern(1024 * 1024 + 123, 2);
     writer.create_file(&mut disk, roman, "big.bin", &big, &attrs()).unwrap();
-    assert_eq!(writer.resolve("/home/roman").unwrap(), roman, "писатель видит несохранённое");
+    assert_eq!(writer.resolve(&mut disk, "/home/roman").unwrap(), roman, "писатель видит несохранённое");
 
     // До фиксации том на диске прежний: данные уже записаны, но на них не
     // ссылается ни один суперблок.
@@ -651,7 +651,7 @@ fn writes_files_and_directories_that_our_reader_reads_back() {
     assert_eq!(report.sectors, 1 + 257);
 }
 
-fn writer_read(writer: &Writer, disk: &mut MemDisk, number: u64, offset: u64, len: usize) -> Vec<u8> {
+fn writer_read(writer: &mut Writer, disk: &mut MemDisk, number: u64, offset: u64, len: usize) -> Vec<u8> {
     let mut out = alloc::vec![0u8; len];
     let got = writer.read_at(disk, number, offset, &mut out).unwrap();
     out.truncate(got);
@@ -665,7 +665,7 @@ fn the_writer_reads_what_it_has_not_committed_yet() {
     // фиксации, и сверка с тем, что после фиксации читает читатель с диска.
     let mut disk = fresh_volume(128);
     let mut writer = Writer::open(&mut disk, 0).unwrap();
-    let dir = writer.create_directory(256, "d", &dir_attrs()).unwrap();
+    let dir = writer.create_directory(&mut disk, 256, "d", &dir_attrs()).unwrap();
     let small = writer.create_file(&mut disk, dir, "small", b"inline text\n", &attrs()).unwrap();
     let mut expected = pattern(300_077, 5);
     let big = writer.create_file(&mut disk, dir, "big", &expected, &attrs()).unwrap();
@@ -675,19 +675,19 @@ fn the_writer_reads_what_it_has_not_committed_yet() {
     writer.truncate(&mut disk, big, 400_000, 1_789_300_002).unwrap();
     expected.resize(400_000, 0);
 
-    assert_eq!(writer_read(&writer, &mut disk, small, 0, 100), b"inline text\n");
-    assert_eq!(writer_read(&writer, &mut disk, big, 0, 500_000), expected);
-    assert_eq!(writer_read(&writer, &mut disk, big, 299_000, 5000), &expected[299_000..304_000]);
-    assert_eq!(writer_read(&writer, &mut disk, big, 400_000, 10), b"");
-    assert_eq!(writer.inode(big).unwrap().size, 400_000);
-    let names: Vec<String> = writer.list(dir).unwrap().into_iter().map(|entry| entry.name).collect();
+    assert_eq!(writer_read(&mut writer, &mut disk, small, 0, 100), b"inline text\n");
+    assert_eq!(writer_read(&mut writer, &mut disk, big, 0, 500_000), expected);
+    assert_eq!(writer_read(&mut writer, &mut disk, big, 299_000, 5000), &expected[299_000..304_000]);
+    assert_eq!(writer_read(&mut writer, &mut disk, big, 400_000, 10), b"");
+    assert_eq!(writer.inode(&mut disk, big).unwrap().size, 400_000);
+    let names: Vec<String> = writer.list(&mut disk, dir).unwrap().into_iter().map(|entry| entry.name).collect();
     assert_eq!(names, ["small", "big"]);
 
     assert!(writer.pending());
     writer.commit(&mut disk).unwrap();
     assert!(!writer.pending());
     assert_eq!(read_path(&mut disk, "/d/big"), expected);
-    assert_eq!(writer_read(&writer, &mut disk, big, 0, 500_000), expected);
+    assert_eq!(writer_read(&mut writer, &mut disk, big, 0, 500_000), expected);
     assert_clean(&mut disk);
 }
 
@@ -729,7 +729,7 @@ fn a_small_edit_rewrites_a_few_nodes_not_whole_trees() {
     let mut dev = Counting { inner: fresh_volume(128), written: 0 };
     {
         let mut writer = Writer::open(&mut dev, 0).unwrap();
-        let dir = writer.create_directory(256, "many", &dir_attrs()).unwrap();
+        let dir = writer.create_directory(&mut dev, 256, "many", &dir_attrs()).unwrap();
         for n in 0..3000u32 {
             let text = format!("file {n}\n");
             writer.create_file(&mut dev, dir, &format!("f{n:04}"), text.as_bytes(), &attrs()).unwrap();
@@ -767,7 +767,7 @@ fn commit_cost_on_a_big_volume() {
     let mut dev = Counting { inner: fresh_volume(512), written: 0 };
     let mut writer = Writer::open(&mut dev, 0).unwrap();
     for d in 0..20u32 {
-        let dir = writer.create_directory(256, &format!("d{d:02}"), &dir_attrs()).unwrap();
+        let dir = writer.create_directory(&mut dev, 256, &format!("d{d:02}"), &dir_attrs()).unwrap();
         for n in 0..1000u32 {
             let body = pattern(if n % 10 == 0 { 9000 } else { 300 }, n as u8);
             writer.create_file(&mut dev, dir, &format!("f{n:04}"), &body, &attrs()).unwrap();
@@ -786,6 +786,65 @@ fn commit_cost_on_a_big_volume() {
 }
 
 #[test]
+fn a_big_fs_tree_is_loaded_leaf_by_leaf_and_survives_edits() {
+    // Дерево ФС большого тома подгружается листьями (31.10): после нового
+    // открытия в памяти — только то, чего касались. Правки в середине дерева,
+    // перенос между каталогами, выгрузка после фиксации и подгрузка заново —
+    // и всё, чего не трогали, читается с диска прежним.
+    let mut dev = Counting { inner: fresh_volume(256), written: 0 };
+    {
+        let mut writer = Writer::open(&mut dev, 0).unwrap();
+        for d in 0..6u32 {
+            let dir = writer.create_directory(&mut dev, 256, &format!("d{d}"), &dir_attrs()).unwrap();
+            for n in 0..800u32 {
+                let body = pattern(if n % 50 == 0 { 9000 } else { 200 }, (d * 7 + n) as u8);
+                writer.create_file(&mut dev, dir, &format!("f{n:03}"), &body, &attrs()).unwrap();
+            }
+        }
+        writer.commit(&mut dev).unwrap();
+    }
+
+    let mut writer = Writer::open(&mut dev, 0).unwrap();
+    let total = 6 * 800 * 4;
+    assert!(writer.loaded_items() < total / 4, "открытие подгрузило {} элементов из ~{total}", writer.loaded_items());
+    writer.set_loaded_limit(1);
+
+    let d2 = writer.resolve(&mut dev, "/d2").unwrap();
+    let d4 = writer.resolve(&mut dev, "/d4").unwrap();
+    let f100 = writer.resolve(&mut dev, "/d2/f100").unwrap();
+    let mut expected = pattern(9000, (2 * 7 + 100) as u8);
+    assert_eq!(writer_read(&mut writer, &mut dev.inner, f100, 0, 20_000), expected);
+    let patch = pattern(5000, 77);
+    writer.write_at(&mut dev, f100, 1000, &patch, LATER).unwrap();
+    expected[1000..6000].copy_from_slice(&patch);
+    writer.unlink(&mut dev, d2, "f200", LATER).unwrap();
+    writer.rename(&mut dev, d2, "f300", d4, "moved", LATER).unwrap();
+    writer.create_file(&mut dev, d4, "new.bin", &pattern(12_000, 5), &attrs()).unwrap();
+    writer.commit(&mut dev).unwrap();
+    assert_eq!(writer.loaded_items(), 0, "после фиксации выгружено не всё");
+
+    // Подгрузка заново после выгрузки — и вторая правка рядом.
+    writer.truncate(&mut dev, f100, 3000, LATER).unwrap();
+    expected.truncate(3000);
+    writer.commit(&mut dev).unwrap();
+    drop(writer);
+
+    let mut disk = dev.inner;
+    assert_eq!(read_path(&mut disk, "/d2/f100"), expected);
+    assert_eq!(read_path(&mut disk, "/d4/moved"), pattern(9000, (2 * 7 + 300) as u8));
+    assert_eq!(read_path(&mut disk, "/d4/new.bin"), pattern(12_000, 5));
+    assert_eq!(read_path(&mut disk, "/d5/f799"), pattern(200, (5 * 7 + 799) as u8));
+    assert_eq!(read_path(&mut disk, "/d0/f000"), pattern(9000, 0));
+    {
+        let mut fs = Btrfs::mount(&mut disk, 0).unwrap();
+        assert_eq!(fs.resolve(&mut disk, "/d2/f200").err(), Some(Error::NotFound));
+        assert_eq!(fs.resolve(&mut disk, "/d2/f300").err(), Some(Error::NotFound));
+    }
+    let report = assert_clean(&mut disk);
+    assert_eq!((report.files, report.directories), (6 * 800, 7));
+}
+
+#[test]
 fn many_transactions_reuse_the_space_they_free() {
     // Каждая фиксация перестраивает дерево ФС на новом месте. Без повторного
     // использования освобождённых узлов сорок транзакций исписали бы
@@ -795,7 +854,7 @@ fn many_transactions_reuse_the_space_they_free() {
     for round in 0..40u32 {
         let mut writer =
             Writer::open(&mut disk, 0).unwrap_or_else(|err| panic!("круг {round}: {err}"));
-        let dir = writer.create_directory(256, &format!("round{round:02}"), &dir_attrs()).unwrap();
+        let dir = writer.create_directory(&mut disk, 256, &format!("round{round:02}"), &dir_attrs()).unwrap();
         for n in 0..60u32 {
             let text = format!("round {round} file {n}\n");
             writer.create_file(&mut disk, dir, &format!("f{n:03}"), text.as_bytes(), &attrs()).unwrap();
@@ -835,7 +894,7 @@ fn writes_into_a_volume_that_mkfs_and_linux_made() {
     // Linux, и ни одного байта не писал этот крейт.
     let mut disk = fixture();
     let mut writer = Writer::open(&mut disk, 0).expect("том от mkfs.btrfs не открылся на запись");
-    let dir = writer.resolve("/dir").unwrap();
+    let dir = writer.resolve(&mut disk, "/dir").unwrap();
     writer.create_file(&mut disk, dir, "ours.txt", b"written by freeos\n", &attrs()).unwrap();
     let blob = pattern(300_000, 4);
     writer.create_file(&mut disk, 256, "ours.bin", &blob, &attrs()).unwrap();
@@ -874,7 +933,7 @@ fn an_interrupted_commit_leaves_the_old_volume_or_the_new_one() {
         let finished = {
             let mut attempt = || -> crate::Result<()> {
                 let mut writer = Writer::open(&mut dev, 0)?;
-                let dir = writer.create_directory(256, "after", &dir_attrs())?;
+                let dir = writer.create_directory(&mut dev, 256, "after", &dir_attrs())?;
                 writer.create_file(&mut dev, dir, "payload.bin", &payload, &attrs())?;
                 writer.commit(&mut dev)
             };
@@ -910,10 +969,10 @@ fn the_writer_refuses_what_it_must() {
     let mut writer = Writer::open(&mut disk, 0).unwrap();
     let file = writer.create_file(&mut disk, 256, "file", b"x", &attrs()).unwrap();
     assert_eq!(writer.create_file(&mut disk, 256, "file", b"y", &attrs()).err(), Some(Error::Exists));
-    assert_eq!(writer.create_directory(file, "sub", &dir_attrs()).err(), Some(Error::NotADirectory));
-    assert_eq!(writer.create_directory(256, "a/b", &dir_attrs()).err(), Some(Error::BadName));
-    assert_eq!(writer.create_directory(256, "", &dir_attrs()).err(), Some(Error::BadName));
-    assert_eq!(writer.create_directory(4242, "x", &dir_attrs()).err(), Some(Error::NotFound));
+    assert_eq!(writer.create_directory(&mut disk, file, "sub", &dir_attrs()).err(), Some(Error::NotADirectory));
+    assert_eq!(writer.create_directory(&mut disk, 256, "a/b", &dir_attrs()).err(), Some(Error::BadName));
+    assert_eq!(writer.create_directory(&mut disk, 256, "", &dir_attrs()).err(), Some(Error::BadName));
+    assert_eq!(writer.create_directory(&mut disk, 4242, "x", &dir_attrs()).err(), Some(Error::NotFound));
     // Отказы до изменений транзакцию не портят.
     writer.commit(&mut disk).unwrap();
     assert_eq!(read_path(&mut disk, "/file"), b"x");
@@ -1034,19 +1093,19 @@ fn deleting_frees_data_and_checksums() {
     let mut writer = Writer::open(&mut disk, 0).unwrap();
     let big = pattern(4 * MIB as usize, 11);
     writer.create_file(&mut disk, 256, "big.bin", &big, &attrs()).unwrap();
-    let dir = writer.create_directory(256, "dir", &dir_attrs()).unwrap();
+    let dir = writer.create_directory(&mut disk, 256, "dir", &dir_attrs()).unwrap();
     writer.create_file(&mut disk, dir, "inside.txt", b"inside\n", &attrs()).unwrap();
     writer.commit(&mut disk).unwrap();
     let before = Btrfs::mount(&mut disk, 0).unwrap().usage().1;
 
-    assert_eq!(writer.unlink(256, "dir", LATER).err(), Some(Error::IsADirectory));
-    assert_eq!(writer.remove_directory(256, "big.bin", LATER).err(), Some(Error::NotADirectory));
-    assert_eq!(writer.remove_directory(256, "dir", LATER).err(), Some(Error::NotEmpty));
-    assert_eq!(writer.unlink(256, "nothing", LATER).err(), Some(Error::NotFound));
+    assert_eq!(writer.unlink(&mut disk, 256, "dir", LATER).err(), Some(Error::IsADirectory));
+    assert_eq!(writer.remove_directory(&mut disk, 256, "big.bin", LATER).err(), Some(Error::NotADirectory));
+    assert_eq!(writer.remove_directory(&mut disk, 256, "dir", LATER).err(), Some(Error::NotEmpty));
+    assert_eq!(writer.unlink(&mut disk, 256, "nothing", LATER).err(), Some(Error::NotFound));
 
-    writer.unlink(256, "big.bin", LATER).unwrap();
-    writer.unlink(dir, "inside.txt", LATER).unwrap();
-    writer.remove_directory(256, "dir", LATER).unwrap();
+    writer.unlink(&mut disk, 256, "big.bin", LATER).unwrap();
+    writer.unlink(&mut disk, dir, "inside.txt", LATER).unwrap();
+    writer.remove_directory(&mut disk, 256, "dir", LATER).unwrap();
     writer.commit(&mut disk).unwrap();
 
     let mut fs = Btrfs::mount(&mut disk, 0).unwrap();
@@ -1064,19 +1123,19 @@ fn deleting_frees_data_and_checksums() {
 fn renames_within_and_across_directories() {
     let mut disk = fresh_volume(128);
     let mut writer = Writer::open(&mut disk, 0).unwrap();
-    let a = writer.create_directory(256, "a", &dir_attrs()).unwrap();
-    let b = writer.create_directory(256, "b", &dir_attrs()).unwrap();
+    let a = writer.create_directory(&mut disk, 256, "a", &dir_attrs()).unwrap();
+    let b = writer.create_directory(&mut disk, 256, "b", &dir_attrs()).unwrap();
     writer.create_file(&mut disk, a, "x", b"moved\n", &attrs()).unwrap();
     writer.create_file(&mut disk, b, "taken", b"taken\n", &attrs()).unwrap();
-    writer.create_directory(a, "sub", &dir_attrs()).unwrap();
+    writer.create_directory(&mut disk, a, "sub", &dir_attrs()).unwrap();
     writer.commit(&mut disk).unwrap();
 
-    writer.rename(a, "x", a, "y", LATER).unwrap();
-    writer.rename(a, "y", b, "z", LATER).unwrap();
-    assert_eq!(writer.rename(b, "z", b, "taken", LATER).err(), Some(Error::Exists));
-    assert_eq!(writer.rename(a, "sub", b, "sub", LATER).err(), Some(Error::Unsupported));
-    writer.rename(a, "sub", a, "renamed", LATER).unwrap();
-    assert_eq!(writer.rename(a, "nothing", a, "other", LATER).err(), Some(Error::NotFound));
+    writer.rename(&mut disk, a, "x", a, "y", LATER).unwrap();
+    writer.rename(&mut disk, a, "y", b, "z", LATER).unwrap();
+    assert_eq!(writer.rename(&mut disk, b, "z", b, "taken", LATER).err(), Some(Error::Exists));
+    assert_eq!(writer.rename(&mut disk, a, "sub", b, "sub", LATER).err(), Some(Error::Unsupported));
+    writer.rename(&mut disk, a, "sub", a, "renamed", LATER).unwrap();
+    assert_eq!(writer.rename(&mut disk, a, "nothing", a, "other", LATER).err(), Some(Error::NotFound));
     writer.commit(&mut disk).unwrap();
 
     assert_eq!(read_path(&mut disk, "/b/z"), b"moved\n");
@@ -1114,14 +1173,14 @@ fn rewriting_a_file_again_and_again_reuses_its_space() {
 fn edits_on_a_volume_that_mkfs_and_linux_made() {
     let mut disk = fixture();
     let mut writer = Writer::open(&mut disk, 0).unwrap();
-    let big = writer.resolve("/dir/big.bin").unwrap();
+    let big = writer.resolve(&mut disk, "/dir/big.bin").unwrap();
     // Экстенты этого файла сделало ядро Linux.
     writer.write_at(&mut disk, big, 1_000_000, b"FREEOS", LATER).unwrap();
-    let mixed = writer.resolve("/mixed.bin").unwrap();
+    let mixed = writer.resolve(&mut disk, "/mixed.bin").unwrap();
     writer.truncate(&mut disk, mixed, 1000, LATER).unwrap();
-    writer.unlink(256, "holes.bin", LATER).unwrap();
-    let dir = writer.resolve("/dir").unwrap();
-    writer.rename(256, "hello.txt", dir, "hello2.txt", LATER).unwrap();
+    writer.unlink(&mut disk, 256, "holes.bin", LATER).unwrap();
+    let dir = writer.resolve(&mut disk, "/dir").unwrap();
+    writer.rename(&mut disk, 256, "hello.txt", dir, "hello2.txt", LATER).unwrap();
     writer.commit(&mut disk).unwrap();
 
     let data = read_path(&mut disk, "/dir/big.bin");
@@ -1161,9 +1220,9 @@ fn an_interrupted_edit_leaves_the_old_volume_or_the_new_one() {
         let finished = {
             let mut attempt = || -> crate::Result<()> {
                 let mut writer = Writer::open(&mut dev, 0)?;
-                let file = writer.resolve("/data.bin")?;
+                let file = writer.resolve(&mut dev, "/data.bin")?;
                 writer.write_at(&mut dev, file, 100_000, &patch, LATER)?;
-                writer.unlink(256, "other.txt", LATER)?;
+                writer.unlink(&mut dev, 256, "other.txt", LATER)?;
                 writer.commit(&mut dev)
             };
             attempt().is_ok()

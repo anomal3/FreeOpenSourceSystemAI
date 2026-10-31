@@ -250,8 +250,8 @@ impl Inner {
 
     /// Inode по номеру: у писателя — из его памяти, иначе с диска.
     fn inode(&mut self, number: u64) -> VfsResult<btrfs::Inode> {
-        match self.writer.as_ref() {
-            Some(writer) => writer.inode(number).map_err(convert),
+        match self.writer.as_mut() {
+            Some(writer) => writer.inode(&mut self.disk, number).map_err(convert),
             None => self.fs.inode(&mut self.disk, number).map_err(convert),
         }
     }
@@ -362,12 +362,10 @@ impl FileSystem for BtrfsMount {
     fn root(&self) -> VfsResult<Box<dyn Node>> {
         let inode = {
             let mut guard = self.0.inner.lock();
-            let number = match guard.writer.as_ref() {
-                Some(writer) => writer.resolve("/").map_err(convert)?,
-                None => {
-                    let Inner { disk, fs, .. } = &mut *guard;
-                    fs.root(disk).map_err(convert)?.number
-                }
+            let Inner { disk, writer, fs, .. } = &mut *guard;
+            let number = match writer.as_mut() {
+                Some(writer) => writer.resolve(disk, "/").map_err(convert)?,
+                None => fs.root(disk).map_err(convert)?.number,
             };
             guard.inode(number)?
         };
@@ -410,10 +408,10 @@ impl FileSystem for BtrfsMount {
     fn rename(&self, old: &str, new: &str) -> VfsResult<()> {
         let (old_parent, old_name) = split_parent(old)?;
         let (new_parent, new_name) = split_parent(new)?;
-        self.0.change(|_, writer, time| {
-            let from = writer.resolve(old_parent)?;
-            let to = writer.resolve(new_parent)?;
-            writer.rename(from, old_name, to, new_name, time)
+        self.0.change(|disk, writer, time| {
+            let from = writer.resolve(disk, old_parent)?;
+            let to = writer.resolve(disk, new_parent)?;
+            writer.rename(disk, from, old_name, to, new_name, time)
         })
     }
 }
@@ -440,7 +438,7 @@ impl Node for BtrfsNode {
         }
         let mut guard = self.fs.inner.lock();
         let Inner { disk, fs, writer, .. } = &mut *guard;
-        if let Some(writer) = writer.as_ref() {
+        if let Some(writer) = writer.as_mut() {
             return writer.read_at(disk, self.inode.number, offset, buf).map_err(convert);
         }
         let inode = fs.inode(disk, self.inode.number).map_err(convert)?;
@@ -449,12 +447,10 @@ impl Node for BtrfsNode {
 
     fn list(&self) -> VfsResult<Vec<DirEntry>> {
         let mut guard = self.fs.inner.lock();
-        let entries = match guard.writer.as_ref() {
-            Some(writer) => writer.list(self.inode.number).map_err(convert)?,
-            None => {
-                let Inner { disk, fs, .. } = &mut *guard;
-                fs.list(disk, &self.inode).map_err(convert)?
-            }
+        let Inner { disk, writer, fs, .. } = &mut *guard;
+        let entries = match writer.as_mut() {
+            Some(writer) => writer.list(disk, self.inode.number).map_err(convert)?,
+            None => fs.list(disk, &self.inode).map_err(convert)?,
         };
 
         let mut out = Vec::new();
@@ -481,17 +477,15 @@ impl Node for BtrfsNode {
     fn lookup(&self, name: &str) -> VfsResult<Box<dyn Node>> {
         let inode = {
             let mut guard = self.fs.inner.lock();
-            let number = match guard.writer.as_ref() {
+            let Inner { disk, writer, fs, .. } = &mut *guard;
+            let number = match writer.as_mut() {
                 Some(writer) => {
                     if self.inode.kind != btrfs::FileType::Directory {
                         return Err(VfsError::WrongKind);
                     }
-                    writer.lookup(self.inode.number, name).map_err(convert)?
+                    writer.lookup(disk, self.inode.number, name).map_err(convert)?
                 }
-                None => {
-                    let Inner { disk, fs, .. } = &mut *guard;
-                    fs.lookup(disk, &self.inode, name).map_err(convert)?.map(|entry| entry.inode)
-                }
+                None => fs.lookup(disk, &self.inode, name).map_err(convert)?.map(|entry| entry.inode),
             };
             guard.inode(number.ok_or(VfsError::NotFound)?)?
         };
@@ -527,22 +521,22 @@ impl Node for BtrfsNode {
 
     fn mkdir(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
         let parent = self.inode.number;
-        let number = self.fs.change(|_, writer, time| {
+        let number = self.fs.change(|disk, writer, time| {
             let attrs = btrfs::Attributes { mode, uid, gid, time };
-            writer.create_directory(parent, name, &attrs)
+            writer.create_directory(disk, parent, name, &attrs)
         })?;
         self.child(number)
     }
 
     fn unlink(&self, name: &str) -> VfsResult<()> {
         let parent = self.inode.number;
-        self.fs.change(|_, writer, time| writer.unlink(parent, name, time))
+        self.fs.change(|disk, writer, time| writer.unlink(disk, parent, name, time))
     }
 
     fn rmdir(&self, name: &str) -> VfsResult<()> {
         let parent = self.inode.number;
         self.fs
-            .change(|_, writer, time| writer.remove_directory(parent, name, time))
+            .change(|disk, writer, time| writer.remove_directory(disk, parent, name, time))
     }
 }
 

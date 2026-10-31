@@ -117,6 +117,9 @@ struct Tree {
     /// листья) и внутри уровня по ключу. На верхнем уровне один узел — корень.
     levels: Vec<Vec<Placed>>,
     dirty: bool,
+    /// Листья подгружаются по требованию (31.10, дерево ФС): в `items` —
+    /// элементы только тех листьев, у которых `Placed::loaded`.
+    paged: bool,
 }
 
 impl Tree {
@@ -141,6 +144,10 @@ struct Placed {
     /// Хеш содержимого: элементы листа или указатели внутреннего узла.
     hash: u64,
     count: usize,
+    /// Элементы листа лежат в `Tree::items` (у внутренних узлов — всегда).
+    /// Неподгруженный лист заведомо не тронут: на месте при любой фиксации,
+    /// `hash` и `count` у него не известны.
+    loaded: bool,
 }
 
 /// Узел новой раскладки: прежний или новый (диапазон элементов у листа,
@@ -204,6 +211,9 @@ pub struct Writer {
     /// экстенты, на которые они ссылались до первой правки (см.
     /// [`Writer::settle_data`]).
     touched: BTreeMap<u64, Vec<u64>>,
+    /// Порог выгрузки дерева ФС после фиксации ([`LOADED_ITEMS_LIMIT`];
+    /// тесты ставят меньше, чтобы проверить выгрузку и подгрузку заново).
+    loaded_limit: usize,
 }
 
 impl Writer {
@@ -287,13 +297,10 @@ impl Writer {
             if raw.len() < ROOT_ITEM_SIZE {
                 return Err(Error::Unsupported);
             }
-            let tree = load_tree(
-                &mut volume,
-                dev,
-                key.objectid,
-                u64_at(raw, ROOT_ITEM_BYTENR),
-                raw[ROOT_ITEM_LEVEL],
-            )?;
+            // Дерево ФС — без листьев, по требованию: на томе с Debian и
+            // Rider его элементы — сотни мегабайт кучи ядра.
+            let load = if key.objectid == objectid::FS_TREE { load_tree_paged } else { load_tree };
+            let tree = load(&mut volume, dev, key.objectid, u64_at(raw, ROOT_ITEM_BYTENR), raw[ROOT_ITEM_LEVEL])?;
             trees.push(tree);
         }
         trees.push(chunk_tree);
@@ -316,9 +323,24 @@ impl Writer {
             broken: false,
             space: None,
             touched: BTreeMap::new(),
+            loaded_limit: LOADED_ITEMS_LIMIT,
         };
         writer.validate()?;
 
+        // Наибольший номер inode — в последнем листе, начатом номером из
+        // обычного диапазона (за ним — особые объекты с огромными номерами).
+        let mut writer = writer;
+        let last_first = {
+            let fs = writer.tree(objectid::FS_TREE)?;
+            fs.levels[0]
+                .iter()
+                .rev()
+                .find(|leaf| leaf.first.objectid <= objectid::LAST_FREE)
+                .map(|leaf| leaf.first)
+        };
+        if let Some(first) = last_first {
+            writer.ensure_range(dev, first, Key::new(objectid::LAST_FREE + 1, 0, 0))?;
+        }
         let highest = writer
             .tree(objectid::FS_TREE)?
             .items
@@ -327,7 +349,8 @@ impl Writer {
             .filter(|number| (objectid::FIRST_FREE..=objectid::LAST_FREE).contains(number))
             .max()
             .unwrap_or(objectid::FIRST_FREE);
-        Ok(Self { next_inode: highest + 1, ..writer })
+        writer.next_inode = highest + 1;
+        Ok(writer)
     }
 
     /// Убедиться, что в дереве экстентов нет ничего, что перестройка испортит.
@@ -393,16 +416,9 @@ impl Writer {
         }
         // Сжатый или шифрованный экстент нельзя переписать по сектору, а
         // длинные обратные ссылки (сотни жёстких ссылок) мы не разбираем.
-        for (key, raw) in &self.tree(objectid::FS_TREE)?.items {
-            match key.kind {
-                item_type::EXTENT_DATA => {
-                    if raw.len() <= EXTENT_TYPE || raw[EXTENT_COMPRESSION] != 0 || raw[EXTENT_ENCRYPTION] != 0 {
-                        return Err(Error::Unsupported);
-                    }
-                }
-                item_type::INODE_EXTREF => return Err(Error::Unsupported),
-                _ => {}
-            }
+        // Подгружаемые листья проверяются при подгрузке.
+        if self.tree(objectid::FS_TREE)?.items.iter().any(|(key, raw)| unsupported_fs_item(key, raw)) {
+            return Err(Error::Unsupported);
         }
         Ok(())
     }
@@ -413,21 +429,143 @@ impl Writer {
         self.generation
     }
 
-    /// Найти inode по абсолютному пути — в памяти, с учётом ещё не
-    /// зафиксированного.
-    pub fn resolve(&self, path: &str) -> Result<u64> {
-        let mut node = objectid::FIRST_FREE;
-        for component in path.split('/').filter(|part| !part.is_empty() && *part != ".") {
-            if !self.is_directory(node)? {
-                return Err(Error::NotADirectory);
-            }
-            node = self.lookup(node, component)?.ok_or(Error::NotFound)?;
+    // --- подгрузка листьев дерева ФС ---------------------------------------------
+
+    /// Узел дерева по логическому адресу — с носителя, со сверкой суммы,
+    /// адреса и тома (без кэша: фиксация переиспользует адреса).
+    fn read_node(&self, dev: &mut dyn BlockDevice, address: u64) -> Result<Vec<u8>> {
+        let (physical, run) = self.chunks.translate(address)?;
+        let size = self.nodesize as usize;
+        let sector = u64::from(dev.sector_size());
+        if run < size as u64 || physical % sector != 0 {
+            return Err(Error::Corrupt);
+        }
+        let mut node = try_zeroed(size)?;
+        dev.read(self.first_lba + physical / sector, &mut node)?;
+        if u32_at(&node, 0) != crc32c::checksum(&node[CSUM_SIZE..]) {
+            return Err(Error::BadChecksum);
+        }
+        if u64_at(&node, HDR_BYTENR) != address || node[HDR_FSID..HDR_FSID + 16] != self.fsid {
+            return Err(Error::Corrupt);
         }
         Ok(node)
     }
 
+    /// Подгрузить листья дерева ФС, задевающие ключи `[from, to)`. Всякая
+    /// правка и всякое чтение дерева ФС идут после этого — по номерам
+    /// объектов, которых они касаются ([`Writer::ensure_objects`]).
+    fn ensure_range(&mut self, dev: &mut dyn BlockDevice, from: Key, to: Key) -> Result<()> {
+        let index = self.tree_index(objectid::FS_TREE)?;
+        if !self.trees[index].paged {
+            return Ok(());
+        }
+        let mut wanted = Vec::new();
+        {
+            let leaves = &self.trees[index].levels[0];
+            let first = leaves.partition_point(|leaf| leaf.first <= from).saturating_sub(1);
+            for (n, leaf) in leaves.iter().enumerate().skip(first) {
+                if n > first && leaf.first >= to {
+                    break;
+                }
+                if !leaf.loaded {
+                    push(&mut wanted, n)?;
+                }
+            }
+        }
+        for n in wanted {
+            let placed = self.trees[index].levels[0][n];
+            let node = self.read_node(dev, placed.address)?;
+            let header = Header::parse(&node)?;
+            if header.level != 0 || header.generation != placed.generation {
+                return Err(Error::Corrupt);
+            }
+            let count = header.nritems as usize;
+            let mut parsed: Items = Vec::new();
+            parsed.try_reserve_exact(count).map_err(|_| Error::NoMemory)?;
+            let mut hash = Hasher::new();
+            for at in 0..count {
+                let key = leaf_key(&node, at);
+                let data = leaf_item(&node, at)?;
+                if unsupported_fs_item(&key, data) {
+                    return Err(Error::Unsupported);
+                }
+                hash.item(key, data);
+                parsed.push((key, copy(data)?));
+            }
+            if parsed.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+                || parsed.first().is_some_and(|(key, _)| *key != placed.first)
+            {
+                return Err(Error::Corrupt);
+            }
+            let items = &mut self.trees[index].items;
+            let at = items.partition_point(|(key, _)| *key < placed.first);
+            items.try_reserve(parsed.len()).map_err(|_| Error::NoMemory)?;
+            items.splice(at..at, parsed);
+            let leaf = &mut self.trees[index].levels[0][n];
+            leaf.loaded = true;
+            leaf.hash = hash.finish();
+            leaf.count = count;
+        }
+        Ok(())
+    }
+
+    /// Порог выгрузки дерева ФС после фиксации — для проверок.
+    #[cfg(test)]
+    pub(crate) fn set_loaded_limit(&mut self, limit: usize) {
+        self.loaded_limit = limit;
+    }
+
+    /// Сколько элементов дерева ФС сейчас в памяти — для проверок.
+    #[cfg(test)]
+    pub(crate) fn loaded_items(&self) -> usize {
+        self.tree(objectid::FS_TREE).map_or(0, |tree| tree.items.len())
+    }
+
+    /// Подгрузить элементы объектов (inode) `numbers`.
+    fn ensure_objects(&mut self, dev: &mut dyn BlockDevice, numbers: &[u64]) -> Result<()> {
+        for &number in numbers {
+            self.ensure_range(dev, Key::new(number, 0, 0), Key::new(number.saturating_add(1), 0, 0))?;
+        }
+        Ok(())
+    }
+
+    /// После фиксации: подгружено слишком много — выгрузить всё (всё уже на
+    /// диске, и следующая правка подгрузит своё заново).
+    fn unload_if_large(&mut self) {
+        let Ok(index) = self.tree_index(objectid::FS_TREE) else { return };
+        let tree = &mut self.trees[index];
+        if !tree.paged || tree.items.len() <= self.loaded_limit || tree.dirty {
+            return;
+        }
+        tree.items = Vec::new();
+        for leaf in &mut tree.levels[0] {
+            leaf.loaded = false;
+        }
+    }
+
+    /// Найти inode по абсолютному пути — в памяти, с учётом ещё не
+    /// зафиксированного.
+    pub fn resolve(&mut self, dev: &mut dyn BlockDevice, path: &str) -> Result<u64> {
+        let mut node = objectid::FIRST_FREE;
+        for component in path.split('/').filter(|part| !part.is_empty() && *part != ".") {
+            self.ensure_objects(dev, &[node])?;
+            if !self.is_directory(node)? {
+                return Err(Error::NotADirectory);
+            }
+            node = self.find_name(node, component)?.ok_or(Error::NotFound)?;
+        }
+        self.ensure_objects(dev, &[node])?;
+        Ok(node)
+    }
+
     /// Найти имя в каталоге.
-    pub fn lookup(&self, parent: u64, name: &str) -> Result<Option<u64>> {
+    pub fn lookup(&mut self, dev: &mut dyn BlockDevice, parent: u64, name: &str) -> Result<Option<u64>> {
+        self.ensure_objects(dev, &[parent])?;
+        self.find_name(parent, name)
+    }
+
+    /// То же, что [`Writer::lookup`], по уже подгруженному каталогу.
+    fn find_name(&self, parent: u64, name: &str) -> Result<Option<u64>> {
         check_name(name)?;
         let fs = self.tree(objectid::FS_TREE)?;
         let key = Key::new(parent, item_type::DIR_ITEM, crc32c::name_hash(name.as_bytes()));
@@ -454,14 +592,16 @@ impl Writer {
     // данные — с носителя, со сверкой сумм, как у читателя.
 
     /// Inode по номеру.
-    pub fn inode(&self, number: u64) -> Result<Inode> {
+    pub fn inode(&mut self, dev: &mut dyn BlockDevice, number: u64) -> Result<Inode> {
+        self.ensure_objects(dev, &[number])?;
         let fs = self.tree(objectid::FS_TREE)?;
         let at = find(&fs.items, Key::new(number, item_type::INODE_ITEM, 0)).map_err(|_| Error::NotFound)?;
         Inode::parse(number, &fs.items[at].1)
     }
 
     /// Записи каталога в порядке создания (`DIR_INDEX`), как у читателя.
-    pub fn list(&self, dir: u64) -> Result<Vec<DirEntry>> {
+    pub fn list(&mut self, dev: &mut dyn BlockDevice, dir: u64) -> Result<Vec<DirEntry>> {
+        self.ensure_objects(dev, &[dir])?;
         if !self.is_directory(dir)? {
             return Err(Error::NotADirectory);
         }
@@ -478,9 +618,10 @@ impl Writer {
     }
 
     /// Прочитать до `buf.len()` байт файла с `offset`; у конца файла — меньше.
-    pub fn read_at(&self, dev: &mut dyn BlockDevice, number: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    pub fn read_at(&mut self, dev: &mut dyn BlockDevice, number: u64, offset: u64, buf: &mut [u8]) -> Result<usize> {
         /// Длиннее за одно обращение к носителю не читается.
         const RUN: u64 = 256 * 1024;
+        self.ensure_objects(dev, &[number])?;
         let (size, flags) = self.regular_inode(number)?;
         if offset >= size {
             return Ok(0);
@@ -579,7 +720,8 @@ impl Writer {
     }
 
     /// Создать каталог.
-    pub fn create_directory(&mut self, parent: u64, name: &str, attrs: &Attributes) -> Result<u64> {
+    pub fn create_directory(&mut self, dev: &mut dyn BlockDevice, parent: u64, name: &str, attrs: &Attributes) -> Result<u64> {
+        self.ensure_objects(dev, &[parent, self.next_inode])?;
         self.prepare(parent, name)?;
         let number = self.next_inode;
         let generation = self.generation + 1;
@@ -608,6 +750,7 @@ impl Writer {
         data: &[u8],
         attrs: &Attributes,
     ) -> Result<u64> {
+        self.ensure_objects(dev, &[parent, self.next_inode])?;
         self.prepare(parent, name)?;
         let number = self.next_inode;
         let generation = self.generation + 1;
@@ -715,6 +858,7 @@ impl Writer {
         self.trees[root_index].items = root;
         self.generation = generation;
         self.space = None;
+        self.unload_if_large();
         Ok(())
     }
 
@@ -741,6 +885,7 @@ impl Writer {
         if self.broken {
             return Err(Error::Aborted);
         }
+        self.ensure_objects(dev, &[number])?;
         let (size, _) = self.regular_inode(number)?;
         if data.is_empty() {
             return Ok(0);
@@ -789,6 +934,7 @@ impl Writer {
         if self.broken {
             return Err(Error::Aborted);
         }
+        self.ensure_objects(dev, &[number])?;
         let (old_size, _) = self.regular_inode(number)?;
         let sector = u64::from(self.sectorsize);
 
@@ -828,12 +974,14 @@ impl Writer {
     ///
     /// Каталог так не удаляется — для него [`Writer::remove_directory`]. Данные
     /// освобождаются при фиксации, когда на экстент не останется ссылок.
-    pub fn unlink(&mut self, parent: u64, name: &str, time: u64) -> Result<()> {
+    pub fn unlink(&mut self, dev: &mut dyn BlockDevice, parent: u64, name: &str, time: u64) -> Result<()> {
         if self.broken {
             return Err(Error::Aborted);
         }
         check_name(name)?;
+        self.ensure_objects(dev, &[parent])?;
         let (number, file_type) = self.entry(parent, name)?.ok_or(Error::NotFound)?;
+        self.ensure_objects(dev, &[number])?;
         if file_type == FILE_TYPE_DIRECTORY {
             return Err(Error::IsADirectory);
         }
@@ -846,12 +994,14 @@ impl Writer {
     }
 
     /// Удалить пустой каталог.
-    pub fn remove_directory(&mut self, parent: u64, name: &str, time: u64) -> Result<()> {
+    pub fn remove_directory(&mut self, dev: &mut dyn BlockDevice, parent: u64, name: &str, time: u64) -> Result<()> {
         if self.broken {
             return Err(Error::Aborted);
         }
         check_name(name)?;
+        self.ensure_objects(dev, &[parent])?;
         let (number, file_type) = self.entry(parent, name)?.ok_or(Error::NotFound)?;
+        self.ensure_objects(dev, &[number])?;
         if file_type != FILE_TYPE_DIRECTORY {
             return Err(Error::NotADirectory);
         }
@@ -877,6 +1027,7 @@ impl Writer {
     /// только готовая транзакция целиком.
     pub fn rename(
         &mut self,
+        dev: &mut dyn BlockDevice,
         old_parent: u64,
         old_name: &str,
         new_parent: u64,
@@ -888,7 +1039,9 @@ impl Writer {
         }
         check_name(old_name)?;
         check_name(new_name)?;
+        self.ensure_objects(dev, &[old_parent, new_parent])?;
         let (number, file_type) = self.entry(old_parent, old_name)?.ok_or(Error::NotFound)?;
+        self.ensure_objects(dev, &[number])?;
         if !self.is_directory(new_parent)? {
             return Err(Error::NotADirectory);
         }
@@ -1427,7 +1580,7 @@ impl Writer {
         if !self.is_directory(parent)? {
             return Err(Error::NotADirectory);
         }
-        if self.lookup(parent, name)?.is_some() {
+        if self.find_name(parent, name)?.is_some() {
             return Err(Error::Exists);
         }
         if self.next_inode > objectid::LAST_FREE {
@@ -2128,7 +2281,7 @@ fn load_tree(volume: &mut Volume, dev: &mut dyn BlockDevice, id: u64, root: u64,
     if level as usize >= MAX_DEPTH {
         return Err(Error::Corrupt);
     }
-    let mut tree = Tree { id, items: Vec::new(), levels: Vec::new(), dirty: false };
+    let mut tree = Tree { id, items: Vec::new(), levels: Vec::new(), dirty: false, paged: false };
     for _ in 0..=level {
         push(&mut tree.levels, Vec::new())?;
     }
@@ -2166,7 +2319,7 @@ fn load_tree(volume: &mut Volume, dev: &mut dyn BlockDevice, id: u64, root: u64,
                 push(&mut stack, (node_child(&node, index), expected - 1))?;
             }
         }
-        let placed = Placed { address, first, generation: header.generation, hash: hash.finish(), count };
+        let placed = Placed { address, first, generation: header.generation, hash: hash.finish(), count, loaded: true };
         push(&mut tree.levels[expected as usize], placed)?;
     }
     if tree.levels.last().map(Vec::len) != Some(1) {
@@ -2184,6 +2337,78 @@ fn load_tree(volume: &mut Volume, dev: &mut dyn BlockDevice, id: u64, root: u64,
     }
     Ok(tree)
 }
+
+/// Дерево без листьев (31.10, дерево ФС большого тома): читаются только
+/// внутренние узлы, лист известен по указателю родителя — адрес, первый ключ,
+/// поколение — и подгружается по требованию ([`Writer::ensure_range`]).
+/// Дерево из одного листа читается целиком.
+fn load_tree_paged(volume: &mut Volume, dev: &mut dyn BlockDevice, id: u64, root: u64, level: u8) -> Result<Tree> {
+    if level == 0 {
+        let mut tree = load_tree(volume, dev, id, root, level)?;
+        tree.paged = true;
+        return Ok(tree);
+    }
+    if level as usize >= MAX_DEPTH {
+        return Err(Error::Corrupt);
+    }
+    let mut tree = Tree { id, items: Vec::new(), levels: Vec::new(), dirty: false, paged: true };
+    for _ in 0..=level {
+        push(&mut tree.levels, Vec::new())?;
+    }
+    let mut stack = Vec::new();
+    push(&mut stack, (root, level))?;
+    while let Some((address, expected)) = stack.pop() {
+        let node = volume.read_node(dev, address)?;
+        let header = Header::parse(&node)?;
+        let count = header.nritems as usize;
+        if header.level != expected || expected == 0 || count == 0 {
+            return Err(Error::Corrupt);
+        }
+        let mut hash = Hasher::new();
+        for index in 0..count {
+            let (key, child, generation) = (node_key(&node, index), node_child(&node, index), node_child_generation(&node, index));
+            hash.child(key, child, generation);
+            if expected == 1 {
+                let leaf = Placed { address: child, first: key, generation, hash: 0, count: 0, loaded: false };
+                push(&mut tree.levels[0], leaf)?;
+            } else {
+                push(&mut stack, (child, expected - 1))?;
+            }
+        }
+        let placed = Placed {
+            address,
+            first: node_key(&node, 0),
+            generation: header.generation,
+            hash: hash.finish(),
+            count,
+            loaded: true,
+        };
+        push(&mut tree.levels[expected as usize], placed)?;
+    }
+    for level in &mut tree.levels {
+        level.sort_unstable_by_key(|placed| placed.first);
+    }
+    if tree.levels.last().map(Vec::len) != Some(1)
+        || tree.levels.iter().any(|level| level.windows(2).any(|pair| pair[0].first >= pair[1].first))
+    {
+        return Err(Error::Corrupt);
+    }
+    Ok(tree)
+}
+
+/// Элемент дерева ФС, который писатель не умеет переписать: сжатый или
+/// шифрованный экстент, длинные обратные ссылки (сотни жёстких ссылок).
+fn unsupported_fs_item(key: &Key, raw: &[u8]) -> bool {
+    match key.kind {
+        item_type::EXTENT_DATA => raw.len() <= EXTENT_TYPE || raw[EXTENT_COMPRESSION] != 0 || raw[EXTENT_ENCRYPTION] != 0,
+        item_type::INODE_EXTREF => true,
+        _ => false,
+    }
+}
+
+/// Сколько элементов дерева ФС держать подгруженными после фиксации; больше
+/// — выгрузить всё (всё уже на диске).
+const LOADED_ITEMS_LIMIT: usize = 100_000;
 
 /// Хеш содержимого узла (FNV-1a, 64 бита): по нему фиксация узнаёт узел,
 /// который можно оставить на месте. Совпадение числа элементов проверяется
@@ -2289,6 +2514,19 @@ fn relay(
     for (n, placed) in old.iter().enumerate() {
         let start = if n == 0 { 0 } else { keys.partition_point(|key| *key < placed.first) };
         let end = old.get(n + 1).map_or(keys.len(), |next| keys.partition_point(|key| *key < next.first));
+        // Неподгруженный лист не тронут по определению — на месте. Элементы в
+        // его диапазоне значили бы, что правку сделали мимо подгрузки, и
+        // честнее отказать, чем потерять его содержимое.
+        if !placed.loaded {
+            if end > start {
+                return Err(Error::Corrupt);
+            }
+            if let Some(from) = pending.take() {
+                pack(from, start, &mut out)?;
+            }
+            push(&mut out, Slot::Kept(*placed))?;
+            continue;
+        }
         if end > start && end - start == placed.count && same(placed, start, end) {
             if let Some(from) = pending.take() {
                 pack(from, start, &mut out)?;
@@ -2310,6 +2548,11 @@ fn relay(
 /// новый в любом случае (дерево корней: его поколение — поколение
 /// суперблока).
 fn layout(items: &Items, old: &[Vec<Placed>], nodesize: u32, reuse: bool, new_root: bool) -> Result<Layout> {
+    // «Всё заново» для дерева с неподгруженными листьями выбросило бы их
+    // элементы — их нет в `items`.
+    if !reuse && old.first().is_some_and(|leaves| leaves.iter().any(|leaf| !leaf.loaded)) {
+        return Err(Error::Unsupported);
+    }
     let none: &[Placed] = &[];
     let old_level = |level: usize| if reuse { old.get(level).map_or(none, Vec::as_slice) } else { none };
 
@@ -2407,7 +2650,7 @@ fn build_tree(
                         let slice = &items[start..end];
                         let first = slice.first().map_or(Key::new(0, 0, 0), |(key, _)| *key);
                         push(&mut out, (address, node::leaf(slice, address, owner, stamp)?))?;
-                        Placed { address, first, generation: stamp.generation, hash: hash_items(slice), count: end - start }
+                        Placed { address, first, generation: stamp.generation, hash: hash_items(slice), count: end - start, loaded: true }
                     } else {
                         let below = built.get(level - 1).ok_or(Error::Corrupt)?;
                         let children = below.get(start..end).ok_or(Error::Corrupt)?;
@@ -2424,6 +2667,7 @@ fn build_tree(
                             generation: stamp.generation,
                             hash: hash.finish(),
                             count: end - start,
+                            loaded: true,
                         }
                     }
                 }
