@@ -44,8 +44,8 @@ pub(crate) fn seal(block: &mut [u8]) {
 /// другу: проверка дерева в ядре Linux требует, чтобы конец данных элемента
 /// совпадал с началом данных предыдущего. Промежуток наш читатель пережил бы,
 /// а ядро — нет.
-pub(crate) fn leaf(
-    items: &[(Key, Vec<u8>)],
+pub(crate) fn leaf<D: AsRef<[u8]>>(
+    items: &[(Key, D)],
     address: u64,
     owner: u64,
     stamp: &Stamp,
@@ -59,6 +59,7 @@ pub(crate) fn leaf(
     // Смещение данных считается от конца заголовка.
     let mut end = nodesize - HEADER_SIZE;
     for (index, (key, data)) in items.iter().enumerate() {
+        let data = data.as_ref();
         // Сюда может привести только ошибка раскладки по листьям, и она обязана
         // стать отказом, а не узлом, в котором данные налезли на таблицу.
         if data.len() > end || end - data.len() < table {

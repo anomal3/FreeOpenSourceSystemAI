@@ -764,12 +764,18 @@ fn a_small_edit_rewrites_a_few_nodes_not_whole_trees() {
 #[test]
 #[ignore]
 fn commit_cost_on_a_big_volume() {
-    let mut dev = Counting { inner: fresh_volume(512), written: 0 };
+    // `BIG_DIRS` каталогов по тысяче файлов; `BIG_EXTENTS=1` — каждый файл
+    // с экстентом (как у Debian и Rider), иначе каждый десятый.
+    let dirs: u32 = std::env::var("BIG_DIRS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let extents = std::env::var("BIG_EXTENTS").is_ok_and(|v| v == "1");
+    let mib = if extents { 64 + u64::from(dirs) * 12 } else { 512 };
+    let mut dev = Counting { inner: fresh_volume(mib), written: 0 };
     let mut writer = Writer::open(&mut dev, 0).unwrap();
-    for d in 0..20u32 {
+    for d in 0..dirs {
         let dir = writer.create_directory(&mut dev, 256, &format!("d{d:02}"), &dir_attrs()).unwrap();
         for n in 0..1000u32 {
-            let body = pattern(if n % 10 == 0 { 9000 } else { 300 }, n as u8);
+            let big = extents || n % 10 == 0;
+            let body = pattern(if big { 5000 } else { 300 }, n as u8);
             writer.create_file(&mut dev, dir, &format!("f{n:04}"), &body, &attrs()).unwrap();
         }
     }
