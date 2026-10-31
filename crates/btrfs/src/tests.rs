@@ -757,6 +757,34 @@ fn a_small_edit_rewrites_a_few_nodes_not_whole_trees() {
     assert_eq!((report.files, report.directories), (3002, 2));
 }
 
+/// Замер, не проверка (`cargo test -p btrfs --release -- --ignored --nocapture
+/// commit_cost`): сколько стоит фиксация одной маленькой правки на томе с
+/// двадцатью тысячами файлов — то, что осталось у писателя больших томов
+/// (хеш всех узлов, вывод деревьев экстентов и свободного места).
+#[test]
+#[ignore]
+fn commit_cost_on_a_big_volume() {
+    let mut dev = Counting { inner: fresh_volume(512), written: 0 };
+    let mut writer = Writer::open(&mut dev, 0).unwrap();
+    for d in 0..20u32 {
+        let dir = writer.create_directory(256, &format!("d{d:02}"), &dir_attrs()).unwrap();
+        for n in 0..1000u32 {
+            let body = pattern(if n % 10 == 0 { 9000 } else { 300 }, n as u8);
+            writer.create_file(&mut dev, dir, &format!("f{n:04}"), &body, &attrs()).unwrap();
+        }
+    }
+    let started = std::time::Instant::now();
+    writer.commit(&mut dev).unwrap();
+    std::println!("first commit: {:?}, {} KiB written", started.elapsed(), dev.written / 1024);
+    for round in 0..3 {
+        let before = dev.written;
+        let started = std::time::Instant::now();
+        writer.create_file(&mut dev, 256, &format!("small{round}"), b"x\n", &attrs()).unwrap();
+        writer.commit(&mut dev).unwrap();
+        std::println!("small edit commit: {:?}, {} KiB written", started.elapsed(), (dev.written - before) / 1024);
+    }
+}
+
 #[test]
 fn many_transactions_reuse_the_space_they_free() {
     // Каждая фиксация перестраивает дерево ФС на новом месте. Без повторного
