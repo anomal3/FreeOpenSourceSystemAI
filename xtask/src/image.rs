@@ -127,6 +127,16 @@ pub fn build(built: &Built, kind: Kind) -> Result<PathBuf> {
 pub fn build_with_key(built: &Built, kind: Kind, live_key: Option<&Path>) -> Result<PathBuf> {
     let arch = built.arch;
     let mut payload = collect(built, kind)?;
+    // Раздел состояния — ext2, как до 31.10 (`FOSSAI_STATE_FS=ext2`): метка
+    // для установщика. Входит в слепок — смена выбора пересобирает образ.
+    if kind == Kind::Installer && crate::statefs::ext2_requested() {
+        payload.push(Payload {
+            path: format!("FREEOS/{}", crate::statefs::STATE_EXT2_MARK),
+            data: b"state ext2\n".to_vec(),
+            source: PathBuf::from("(FOSSAI_STATE_FS=ext2)"),
+        });
+        say!("образ: раздел состояния будет ext2 (FOSSAI_STATE_FS=ext2)");
+    }
     if let Some(key) = live_key {
         payload.push(read_payload("FREEOS/SSHKEYS", key)?);
         say!("образ: ключ SSH {} — образ личный, не для выпуска", key.display());

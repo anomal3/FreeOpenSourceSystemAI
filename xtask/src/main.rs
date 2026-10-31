@@ -40,6 +40,7 @@ mod thirdparty;
 mod chromium;
 mod java;
 mod rider;
+mod statefs;
 mod debian;
 mod fimg;
 mod util;

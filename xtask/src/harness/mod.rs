@@ -1004,6 +1004,11 @@ fn play(
                 line.wait_for(&needle, patience(*timeout_ms))
                     .with_context(|| format!("шаг {index}"))?;
             }
+            Step::AwaitOneOf(needles, timeout_ms) => {
+                say!("  [{at:>6} мс] шаг {index}: ждём одну из {needles:?}");
+                line.wait_for_one_of(needles, patience(*timeout_ms))
+                    .with_context(|| format!("шаг {index}"))?;
+            }
             Step::AwaitAny(needle, timeout_ms) => {
                 let needle = fill(needle, &captured, &captured2);
                 say!("  [{at:>6} мс] шаг {index}: ждём {needle:?} где угодно в выводе");
@@ -2955,8 +2960,6 @@ pub const NET_UPDATE_VERSION: &str = "0.10";
 /// это часть проверки: в образе лежит эталон с другим адресом, и взять систему
 /// обязана правку.
 fn place_update_config(disk_path: &std::path::Path, ports: HostPorts) -> Result<()> {
-    use disk::BlockDevice as _;
-
     let text = format!(
         "# Written by the harness: the update servers live on the host.\n\
          #\n\
@@ -2972,23 +2975,12 @@ fn place_update_config(disk_path: &std::path::Path, ports: HostPorts) -> Result<
         ports.repo, ports.stranger, ports.tls
     );
 
-    let mut dev = crate::diskfile::DiskFile::open(disk_path, 512)?;
-    let table = disk::gpt::read(&mut dev)
-        .map_err(|err| anyhow::anyhow!("на образе {} нет GPT: {err}", disk_path.display()))?;
-    let state = table
-        .find(disk::gpt::FREEOS_STATE_TYPE)
-        .ok_or_else(|| anyhow::anyhow!("на образе нет раздела состояния"))?;
-
-    let mut fs = ext2::Editor::open(&mut dev, state.first_lba)
-        .map_err(|err| anyhow::anyhow!("раздел состояния не открывается: {err}"))?;
-    fs.mark_dirty(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось пометить том используемым: {err}"))?;
-    match fs.write_file_path(&mut dev, "etc/update.cfg", text.as_bytes(), 0o644, 0, 0) {
-        Ok(_) => say!("стенд: гостю положен /etc/update.cfg на 10.0.2.2:{}", ports.repo),
+    let mut fs = crate::statefs::StateVolume::open(disk_path)?;
+    match fs.write_file_path("etc/update.cfg", text.as_bytes(), 0o644, 0, 0)? {
+        Some(_) => say!("стенд: гостю положен /etc/update.cfg на 10.0.2.2:{}", ports.repo),
         // Уже лежит с прошлого прогона, и содержимое то же самое: адрес и порт
-        // здесь постоянные. Перезаписи `ext2::Editor` не умеет.
-        Err(ext2::Error::Exists) => say!("стенд: /etc/update.cfg у гостя уже лежит"),
-        Err(err) => bail!("не удалось записать /etc/update.cfg: {err}"),
+        // здесь постоянные.
+        None => say!("стенд: /etc/update.cfg у гостя уже лежит"),
     }
 
     // Корень, которому гость будет доверять. Кладётся правкой человека, в
@@ -2996,19 +2988,11 @@ fn place_update_config(disk_path: &std::path::Path, ports: HostPorts) -> Result<
     // выпущенном ISO ему делать нечего — ровно то же рассуждение, что у ключа
     // SSH (см. заголовок `sshkeys`).
     let ca = tlskeys::trusted()?.root_pem;
-    match fs.write_file_path(&mut dev, "etc/ca.pem", ca.as_bytes(), 0o644, 0, 0) {
-        Ok(_) => say!("стенд: гостю положен /etc/ca.pem с корнем стенда"),
-        Err(ext2::Error::Exists) => say!("стенд: /etc/ca.pem у гостя уже лежит"),
-        Err(err) => bail!("не удалось записать /etc/ca.pem: {err}"),
+    match fs.write_file_path("etc/ca.pem", ca.as_bytes(), 0o644, 0, 0)? {
+        Some(_) => say!("стенд: гостю положен /etc/ca.pem с корнем стенда"),
+        None => say!("стенд: /etc/ca.pem у гостя уже лежит"),
     }
-
-    fs.flush_everywhere(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось сбросить раздел состояния: {err}"))?;
-    fs.mark_clean(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось пометить том чистым: {err}"))?;
-    dev.flush()
-        .map_err(|err| anyhow::anyhow!("не удалось сбросить образ: {err}"))?;
-    Ok(())
+    fs.finish()
 }
 
 /// Стереть пути с раздела состояния гостя — до запуска.
@@ -3017,55 +3001,13 @@ fn place_update_config(disk_path: &std::path::Path, ports: HostPorts) -> Result<
 /// см. [`ext2::Editor::rmdir`]). Отсутствующее пропускается: на свежем диске
 /// стирать нечего, и это не ошибка.
 fn forget_on_state(disk_path: &std::path::Path, paths: &[&str]) -> Result<()> {
-    use disk::BlockDevice as _;
-
-    let mut dev = crate::diskfile::DiskFile::open(disk_path, 512)?;
-    let table = disk::gpt::read(&mut dev)
-        .map_err(|err| anyhow::anyhow!("на образе {} нет GPT: {err}", disk_path.display()))?;
-    let state = table
-        .find(disk::gpt::FREEOS_STATE_TYPE)
-        .ok_or_else(|| anyhow::anyhow!("на образе нет раздела состояния"))?;
-    let mut fs = ext2::Editor::open(&mut dev, state.first_lba)
-        .map_err(|err| anyhow::anyhow!("раздел состояния не открывается: {err}"))?;
-    fs.mark_dirty(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось пометить том используемым: {err}"))?;
-
+    let mut fs = crate::statefs::StateVolume::open(disk_path)?;
     for path in paths {
-        let (parent_path, name) = path.rsplit_once('/').unwrap_or(("", path));
-        // Родитель ищется по звеньям; не нашёлся — стирать нечего.
-        let mut parent = Some(ext2::ROOT_INODE);
-        for component in parent_path.split('/').filter(|part| !part.is_empty()) {
-            parent = match parent {
-                Some(dir) => fs
-                    .lookup(&mut dev, dir, component)
-                    .map_err(|err| anyhow::anyhow!("не удалось прочитать /{parent_path}: {err}"))?
-                    .map(|(number, _)| number),
-                None => None,
-            };
+        if fs.remove_path(path)? {
+            say!("стенд: у гостя стёрт /{path}");
         }
-        let Some(parent) = parent else { continue };
-        let Some((_, kind)) = fs
-            .lookup(&mut dev, parent, name)
-            .map_err(|err| anyhow::anyhow!("не удалось прочитать /{path}: {err}"))?
-        else {
-            continue;
-        };
-        let result = if kind == ext2::DIR_TYPE_DIRECTORY {
-            fs.rmdir(&mut dev, parent, name)
-        } else {
-            fs.unlink(&mut dev, parent, name)
-        };
-        result.map_err(|err| anyhow::anyhow!("не удалось стереть /{path}: {err}"))?;
-        say!("стенд: у гостя стёрт /{path}");
     }
-
-    fs.flush_everywhere(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось сбросить раздел состояния: {err}"))?;
-    fs.mark_clean(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось пометить том чистым: {err}"))?;
-    dev.flush()
-        .map_err(|err| anyhow::anyhow!("не удалось сбросить образ: {err}"))?;
-    Ok(())
+    fs.finish()
 }
 
 /// Носители машины для сценария.

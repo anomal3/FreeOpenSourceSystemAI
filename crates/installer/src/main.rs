@@ -473,6 +473,7 @@ fn perform(display: &mut Display, app: &mut App, payload: &mut Payload) {
         timezone: &timezone,
         entropy: entropy(&target),
         unix_time: install::unix_now(),
+        state_ext2: payload.has(uefi::cstr16!("\\FREEOS\\STATEEXT.CFG")),
     };
 
     let result = install::run(

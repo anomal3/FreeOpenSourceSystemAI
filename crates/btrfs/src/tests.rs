@@ -1139,21 +1139,82 @@ fn renames_within_and_across_directories() {
     writer.rename(&mut disk, a, "x", a, "y", LATER).unwrap();
     writer.rename(&mut disk, a, "y", b, "z", LATER).unwrap();
     assert_eq!(writer.rename(&mut disk, b, "z", b, "taken", LATER).err(), Some(Error::Exists));
-    assert_eq!(writer.rename(&mut disk, a, "sub", b, "sub", LATER).err(), Some(Error::Unsupported));
     writer.rename(&mut disk, a, "sub", a, "renamed", LATER).unwrap();
     assert_eq!(writer.rename(&mut disk, a, "nothing", a, "other", LATER).err(), Some(Error::NotFound));
+    // Каталог — в другого родителя, с содержимым (`mkdtemp` и перенос на
+    // место, как делает .NET), но не внутрь самого себя.
+    let tmp = writer.create_directory(&mut disk, b, "tmp1234", &dir_attrs()).unwrap();
+    writer.create_file(&mut disk, tmp, "payload", b"inside\n", &attrs()).unwrap();
+    let deep = writer.create_directory(&mut disk, tmp, "deep", &dir_attrs()).unwrap();
+    assert_eq!(writer.rename(&mut disk, b, "tmp1234", deep, "loop", LATER).err(), Some(Error::Unsupported));
+    assert_eq!(writer.rename(&mut disk, b, "tmp1234", tmp, "self", LATER).err(), Some(Error::Unsupported));
+    writer.rename(&mut disk, b, "tmp1234", a, "done", LATER).unwrap();
     writer.commit(&mut disk).unwrap();
 
     assert_eq!(read_path(&mut disk, "/b/z"), b"moved\n");
+    assert_eq!(read_path(&mut disk, "/a/done/payload"), b"inside\n");
     let mut fs = Btrfs::mount(&mut disk, 0).unwrap();
     assert_eq!(fs.resolve(&mut disk, "/a/x").err(), Some(Error::NotFound));
     assert_eq!(fs.resolve(&mut disk, "/a/y").err(), Some(Error::NotFound));
+    assert_eq!(fs.resolve(&mut disk, "/b/tmp1234").err(), Some(Error::NotFound));
     let a_node = fs.resolve(&mut disk, "/a").unwrap();
     let names: Vec<String> = fs.list(&mut disk, &a_node).unwrap().into_iter().map(|entry| entry.name).collect();
-    assert_eq!(names, ["renamed"]);
+    assert_eq!(names, ["renamed", "done"]);
     drop(fs);
     let report = assert_clean(&mut disk);
-    assert_eq!((report.files, report.directories), (2, 4));
+    assert_eq!((report.files, report.directories), (3, 6));
+}
+
+#[test]
+fn paths_are_created_the_way_the_installer_needs() {
+    let mut disk = fresh_volume(128);
+    let mut writer = Writer::open(&mut disk, 0).unwrap();
+    let owner = Attributes { mode: 0o600, uid: 1000, gid: 1000, time: LATER };
+    writer.write_file_path(&mut disk, "/home/roman/.ssh/authorized_keys", b"ssh-ed25519 AAAA\n", &owner).unwrap();
+    assert_eq!(
+        writer.write_file_path(&mut disk, "home/roman/.ssh/authorized_keys", b"again", &owner).err(),
+        Some(Error::Exists)
+    );
+    let opt = writer.create_dir_path(&mut disk, "/opt", &Attributes { mode: 0o755, uid: 1000, gid: 1000, time: LATER }).unwrap();
+    assert_eq!(writer.create_dir_path(&mut disk, "opt/", &dir_attrs()).unwrap(), opt);
+    assert_eq!(
+        writer.create_dir_path(&mut disk, "/home/roman/.ssh/authorized_keys/x", &dir_attrs()).err(),
+        Some(Error::NotADirectory)
+    );
+    writer.commit(&mut disk).unwrap();
+    drop(writer);
+
+    let mut fs = Btrfs::mount(&mut disk, 0).unwrap();
+    let ssh = fs.resolve(&mut disk, "/home/roman/.ssh").unwrap();
+    assert_eq!((ssh.mode, ssh.uid, ssh.gid), (0o755, 1000, 1000));
+    let key = fs.resolve(&mut disk, "/home/roman/.ssh/authorized_keys").unwrap();
+    assert_eq!((key.mode, key.uid), (0o600, 1000));
+    drop(fs);
+    assert_eq!(read_path(&mut disk, "/home/roman/.ssh/authorized_keys"), b"ssh-ed25519 AAAA\n");
+    assert_clean(&mut disk);
+}
+
+#[test]
+fn chmod_changes_only_the_permission_bits() {
+    let mut disk = fresh_volume(128);
+    let mut writer = Writer::open(&mut disk, 0).unwrap();
+    let file = writer.create_file(&mut disk, 256, "run.sh", b"#!/bin/sh\n", &attrs()).unwrap();
+    let dir = writer.create_directory(&mut disk, 256, "box", &dir_attrs()).unwrap();
+    writer.commit(&mut disk).unwrap();
+    writer.set_mode(&mut disk, file, 0o4755, LATER).unwrap();
+    writer.set_mode(&mut disk, dir, 0o1777, LATER).unwrap();
+    assert_eq!(writer.inode(&mut disk, file).unwrap().mode, 0o4755);
+    writer.commit(&mut disk).unwrap();
+    drop(writer);
+
+    let mut fs = Btrfs::mount(&mut disk, 0).unwrap();
+    let node = fs.resolve(&mut disk, "/run.sh").unwrap();
+    assert_eq!((node.kind, node.mode), (FileType::Regular, 0o4755));
+    let node = fs.resolve(&mut disk, "/box").unwrap();
+    assert_eq!((node.kind, node.mode), (FileType::Directory, 0o1777));
+    drop(fs);
+    assert_eq!(read_path(&mut disk, "/run.sh"), b"#!/bin/sh\n");
+    assert_clean(&mut disk);
 }
 
 #[test]

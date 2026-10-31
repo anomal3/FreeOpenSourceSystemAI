@@ -120,8 +120,6 @@ pub fn place_authorized_key(disk_path: &Path, private: &Path) -> Result<()> {
 /// как испорченный ключ. Поэтому ключ, которого в файле нет, дописывается в
 /// конец; тот, что есть, не пишется второй раз.
 pub fn authorize_public_key(disk_path: &Path, public: &Path) -> Result<()> {
-    use disk::BlockDevice as _;
-
     let mut line = std::fs::read(public)
         .with_context(|| format!("не удалось прочитать {}", public.display()))?;
     // `sshd` этой системы проверяет только Ed25519 — ключ другого типа лёг бы
@@ -139,26 +137,9 @@ pub fn authorize_public_key(disk_path: &Path, public: &Path) -> Result<()> {
         line.push(b'\n');
     }
 
-    let mut dev = crate::diskfile::DiskFile::open(disk_path, 512)?;
-
     // Что уже лежит — читается до правки и тем же крейтом, которым прочтёт
-    // система.
-    let existing: Option<Vec<u8>> = {
-        let table = disk::gpt::read(&mut dev)
-            .map_err(|err| anyhow::anyhow!("на образе {} нет GPT: {err}", disk_path.display()))?;
-        let state = table
-            .find(disk::gpt::FREEOS_STATE_TYPE)
-            .ok_or_else(|| anyhow::anyhow!("на образе нет раздела состояния"))?;
-        let fs = ext2::Ext2::mount(&mut dev, state.first_lba)
-            .map_err(|err| anyhow::anyhow!("раздел состояния не монтируется: {err}"))?;
-        match fs.resolve(&mut dev, &format!("/home/{ACCOUNT}/.ssh/authorized_keys")) {
-            Ok(inode) => Some(
-                fs.read_file(&mut dev, &inode)
-                    .map_err(|err| anyhow::anyhow!("authorized_keys не читается: {err}"))?,
-            ),
-            Err(_) => None,
-        }
-    };
+    // система (ext2 или btrfs — по пробе тома).
+    let existing = crate::statefs::read_file(disk_path, &format!("home/{ACCOUNT}/.ssh/authorized_keys"))?;
     if let Some(existing) = &existing {
         let known = String::from_utf8_lossy(existing)
             .lines()
@@ -168,36 +149,23 @@ pub fn authorize_public_key(disk_path: &Path, public: &Path) -> Result<()> {
             return Ok(());
         }
     }
-    let table = disk::gpt::read(&mut dev)
-        .map_err(|err| anyhow::anyhow!("на образе {} нет GPT: {err}", disk_path.display()))?;
     // Домашние каталоги живут на разделе состояния, а не на корневом: корень
-    // смонтирован только на чтение и заменяется целиком при обновлении.
-    let state = table
-        .find(disk::gpt::FREEOS_STATE_TYPE)
-        .ok_or_else(|| anyhow::anyhow!("на образе нет раздела состояния"))?;
-
-    let mut fs = ext2::Editor::open(&mut dev, state.first_lba)
-        .map_err(|err| anyhow::anyhow!("раздел состояния не открывается: {err}"))?;
-    // Том помечается используемым на время правки и чистым в конце — так же,
-    // как это делает установщик. Без этого система при следующей загрузке
-    // объявила бы состояние грязным и проверила бы его целиком.
-    fs.mark_dirty(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось пометить том используемым: {err}"))?;
+    // смонтирован только на чтение и заменяется целиком при обновлении. Том
+    // ext2 помечается используемым на время правки и чистым в конце — так же,
+    // как это делает установщик (`StateVolume`).
+    let mut fs = crate::statefs::StateVolume::open(disk_path)?;
 
     // `.ssh` — `0700` и владелец тот же, что у домашнего каталога: `sshd`
     // отказывается доверять файлу ключей, лежащему там, куда может писать
     // кто-то ещё, и проверка эта настоящая, а не наша выдумка.
     let ssh_dir = format!("home/{ACCOUNT}/.ssh");
-    let dir = fs
-        .create_dir_path(&mut dev, &ssh_dir, 0o700, FIRST_UID, FIRST_UID)
-        .map_err(|err| anyhow::anyhow!("не удалось создать /{ssh_dir}: {err}"))?;
+    fs.create_dir_path(&ssh_dir, 0o700, FIRST_UID, FIRST_UID)?;
 
     let target = format!("{ssh_dir}/authorized_keys");
-    let present = fs
-        .lookup(&mut dev, dir, "authorized_keys")
-        .map_err(|err| anyhow::anyhow!("не удалось заглянуть в /{ssh_dir}: {err}"))?;
+    let present = fs.lookup_path(&target)?;
     match (present, existing) {
-        (Some((number, _)), Some(existing)) => {
+        (Some(found), Some(existing)) => {
+            let number = found.number;
             // Файл есть, ключа в нём нет — дописать в конец. Если последняя
             // строка без перевода, он ставится первым: иначе новый ключ
             // склеился бы с последним в одну негодную строку.
@@ -206,24 +174,16 @@ pub fn authorize_public_key(disk_path: &Path, public: &Path) -> Result<()> {
                 tail.push(b'\n');
             }
             tail.extend_from_slice(&line);
-            fs.write_at(&mut dev, number, existing.len() as u64, &tail)
+            fs.write_at(number, existing.len() as u64, &tail)
                 .map_err(|err| anyhow::anyhow!("не удалось дописать /{target}: {err}"))?;
             say!("стенд: ключ {} дописан в /{target}", public.display());
         }
         _ => {
-            fs.write_file_path(&mut dev, &target, &line, 0o600, FIRST_UID, FIRST_UID)
-                .map_err(|err| anyhow::anyhow!("не удалось записать /{target}: {err}"))?;
+            fs.write_file_path(&target, &line, 0o600, FIRST_UID, FIRST_UID)?;
             say!("стенд: ключ положен в /{target} ({} байт)", line.len());
         }
     }
-
-    fs.flush_everywhere(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось сбросить раздел состояния: {err}"))?;
-    fs.mark_clean(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось пометить том чистым: {err}"))?;
-    dev.flush()
-        .map_err(|err| anyhow::anyhow!("не удалось сбросить образ: {err}"))?;
-    Ok(())
+    fs.finish()
 }
 
 #[cfg(test)]
@@ -272,26 +232,20 @@ mod check {
         // И читается обратно тем же кодом, которым его прочтёт система: важно
         // не только содержимое, но и владелец с режимом — `sshd` откажется
         // доверять файлу с чужим владельцем или открытым на запись каталогом.
-        let mut dev = crate::diskfile::DiskFile::open(&disk, 512).expect("образ открывается");
-        let table = disk::gpt::read(&mut dev).expect("GPT читается");
-        let state = table
-            .find(disk::gpt::FREEOS_STATE_TYPE)
-            .expect("раздел состояния есть");
-        let fs = ext2::Ext2::mount(&mut dev, state.first_lba).expect("том монтируется");
-        for (path, mode, kind) in [
-            ("/home/roman/.ssh", 0o700u16, ext2::FileType::Directory),
-            ("/home/roman/.ssh/authorized_keys", 0o600, ext2::FileType::Regular),
+        for (path, mode, directory) in [
+            ("/home/roman/.ssh", 0o700u16, true),
+            ("/home/roman/.ssh/authorized_keys", 0o600, false),
         ] {
-            let inode = fs.resolve(&mut dev, path).expect("узел находится");
-            assert_eq!(inode.kind, kind, "{path}");
-            assert_eq!(inode.mode & 0o777, mode, "{path}");
-            assert_eq!(inode.uid, super::FIRST_UID, "{path}");
-            assert_eq!(inode.gid, super::FIRST_UID, "{path}");
+            let (is_dir, node_mode, uid, gid) =
+                crate::statefs::stat(&disk, path).expect("том читается").expect("узел находится");
+            assert_eq!(is_dir, directory, "{path}");
+            assert_eq!(node_mode & 0o777, mode, "{path}");
+            assert_eq!(uid, super::FIRST_UID, "{path}");
+            assert_eq!(gid, super::FIRST_UID, "{path}");
         }
-        let inode = fs
-            .resolve(&mut dev, "/home/roman/.ssh/authorized_keys")
+        let data = crate::statefs::read_file(&disk, "/home/roman/.ssh/authorized_keys")
+            .expect("том читается")
             .expect("файл находится");
-        let data = fs.read_file(&mut dev, &inode).expect("файл читается");
         assert!(data.starts_with(b"ssh-ed25519 "), "это ключ ssh-ed25519");
     }
 }

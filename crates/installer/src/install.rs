@@ -167,6 +167,10 @@ pub struct Settings<'a> {
     /// Передаётся снаружи, а не берётся здесь: часы доступны только через
     /// runtime-сервисы UEFI, о которых крейты разметки знать не должны.
     pub unix_time: u32,
+    /// Раздел состояния — ext2, как до 31.10 (метка `\FREEOS\STATEEXT.CFG` на
+    /// носителе; стенд кладёт её, чтобы путь ext2 оставался проверенным:
+    /// на нём живут уже установленные машины). Иначе — btrfs.
+    pub state_ext2: bool,
 }
 
 /// Путь на корневом разделе, куда ложится файл учётных записей.
@@ -508,18 +512,29 @@ fn write_state(
     progress: &mut impl FnMut(u32, Step),
 ) -> Result<(), Error> {
     progress(5, Step::Config);
-    let options = ext2::FormatOptions {
-        label: STATE_LABEL,
-        uuid: expand(settings.entropy, b"freeos-state-fs"),
-        time: settings.unix_time,
+    let uuid = expand(settings.entropy, b"freeos-state-fs");
+    let bytes = range.sectors() * dev.sector_size() as u64;
+    // btrfs — с 31.10 (переезд состояния по плану фазы 50d): копирование при
+    // записи, новое состояние — одной записью суперблока, суммы данных.
+    // ext2 — по метке на носителе или на разделе меньше, чем btrfs берёт.
+    let mut fs = if settings.state_ext2 || bytes < btrfs::MIN_VOLUME_BYTES {
+        let options = ext2::FormatOptions { label: STATE_LABEL, uuid, time: settings.unix_time };
+        let mut fs = ext2::format(dev, range.first_lba, range.sectors(), &options)?;
+        fs.mark_dirty(dev)?;
+        logln!(
+            "[install] state: ext2, {} blocks of {} bytes",
+            fs.geometry().blocks,
+            fs.geometry().block_size.bytes(),
+        );
+        StateFs::Ext2(fs)
+    } else {
+        let options = btrfs::FormatOptions { label: STATE_LABEL, uuid, time: u64::from(settings.unix_time) };
+        btrfs::format(dev, range.first_lba, range.sectors(), &options).map_err(state_error)?;
+        let writer = btrfs::Writer::open(dev, range.first_lba).map_err(state_error)?;
+        logln!("[install] state: btrfs, {} MiB", bytes / (1024 * 1024));
+        StateFs::Btrfs(writer, u64::from(settings.unix_time))
     };
-    let mut fs = ext2::format(dev, range.first_lba, range.sectors(), &options)?;
-    fs.mark_dirty(dev)?;
-    logln!(
-        "[install] state: ext2, {} blocks of {} bytes",
-        fs.geometry().blocks,
-        fs.geometry().block_size.bytes(),
-    );
+    let fs = &mut fs;
 
     // Права проставляются сразу и настоящие, хотя проверять их пока некому:
     // выставить их позже значит на какое-то время оставить файл учётных
@@ -622,9 +637,75 @@ fn write_state(
 
     logln!("[install] state: /etc/passwd, /etc/system.cfg, /{home}, /opt");
 
-    fs.flush_everywhere(dev)?;
-    fs.mark_clean(dev)?;
-    Ok(())
+    fs.finish(dev)
+}
+
+/// Раздел состояния, который заполняет установщик: ext2 или btrfs.
+enum StateFs {
+    Ext2(ext2::Editor),
+    /// Писатель и время для всех создаваемых.
+    Btrfs(btrfs::Writer, u64),
+}
+
+impl StateFs {
+    fn create_dir_path(&mut self, dev: &mut UefiDisk, path: &str, mode: u16, uid: u32, gid: u32) -> Result<(), Error> {
+        match self {
+            StateFs::Ext2(fs) => {
+                fs.create_dir_path(dev, path, mode, uid, gid)?;
+            }
+            StateFs::Btrfs(writer, time) => {
+                let attrs = btrfs::Attributes { mode, uid, gid, time: *time };
+                writer.create_dir_path(dev, path, &attrs).map_err(state_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_file_path(
+        &mut self,
+        dev: &mut UefiDisk,
+        path: &str,
+        data: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), Error> {
+        match self {
+            StateFs::Ext2(fs) => {
+                fs.write_file_path(dev, path, data, mode, uid, gid)?;
+            }
+            StateFs::Btrfs(writer, time) => {
+                let attrs = btrfs::Attributes { mode, uid, gid, time: *time };
+                writer.write_file_path(dev, path, data, &attrs).map_err(state_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Довести до носителя: ext2 — сброс и метка «закрыт чисто», btrfs —
+    /// фиксация (смена суперблока) и сброс кэша диска.
+    fn finish(&mut self, dev: &mut UefiDisk) -> Result<(), Error> {
+        match self {
+            StateFs::Ext2(fs) => {
+                fs.flush_everywhere(dev)?;
+                fs.mark_clean(dev)?;
+            }
+            StateFs::Btrfs(writer, _) => {
+                writer.commit(dev).map_err(state_error)?;
+                dev.flush()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Отказ btrfs на разделе состояния.
+fn state_error(err: btrfs::Error) -> Error {
+    logln!("[install] the state filesystem (btrfs) failed: {err}");
+    match err {
+        btrfs::Error::TooSmall => Error::TooSmall,
+        _ => Error::RootFs,
+    }
 }
 
 /// Затереть суперблок раздела.

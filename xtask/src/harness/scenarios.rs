@@ -144,6 +144,9 @@ pub enum Step {
     /// стоит строку с номером задачи из [`Step::Capture`] — иначе одно и то же
     /// совпадение засчитается дважды.
     AwaitAny(&'static str, u64),
+    /// Дождаться первой по выводу из нескольких подстрок — где поведение
+    /// законно разное: раздел состояния ext2 или btrfs (31.10).
+    AwaitOneOf(&'static [&'static str], u64),
     /// Дождаться числа за подстрокой и сверить его с часами **хоста**.
     ///
     /// Число — секунды эпохи Unix; допуск задаётся в секундах. Существует
@@ -7514,8 +7517,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("wrote 17 bytes", 15_000),
             Step::Reset,
             // Вторая загрузка обязана сказать, что том закрыт не был. Строка
-            // печатается при монтировании и до всякой оболочки.
-            Step::Await("state       : volume was NOT unmounted cleanly", BOOT),
+            // печатается при монтировании и до всякой оболочки. У btrfs
+            // (состояние с 31.10) признака нет вовсе: на диске всегда последняя
+            // завершённая транзакция, — и проверяется то, что данные целы.
+            Step::AwaitOneOf(&["state       : volume was NOT unmounted cleanly", "state       : btrfs at LBA"], BOOT),
             Step::Await(PROMPT, 30_000),
             // Данные при этом целы: том грязный — это про счётчики, а не про
             // содержимое файлов.
@@ -7529,7 +7534,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("power       : ", 15_000),
             // Третья загрузка — и вот теперь том обязан быть чистым. Это и есть
             // всё утверждение фазы 27, целиком и в одной строке.
-            Step::Await("state       : volume was unmounted cleanly", BOOT),
+            Step::AwaitOneOf(&["state       : volume was unmounted cleanly", "state       : btrfs at LBA"], BOOT),
             Step::Await(PROMPT, 30_000),
 
             // --- случай третий: машину выключили --------------------------
@@ -7590,8 +7595,10 @@ pub const ALL: &[Scenario] = &[
             // поставленный по порядку событий в голове, а не в журнале, ждал бы
             // строку, которая уже проехала.
             Step::Await("root        : ext2 at LBA", BOOT),
-            Step::Await("fsck        : checking the state volume (it was not closed cleanly)", 60_000),
-            Step::Await("fsck        : state: ", 60_000),
+            // ext2: «том закрыт не был» и проверка при загрузке; btrfs
+            // проверять при загрузке нечего — на диске последняя завершённая
+            // транзакция.
+            Step::AwaitOneOf(&["fsck        : state: ", "state       : btrfs at LBA"], 60_000),
             Step::Await(PROMPT, 30_000),
             // Данные на месте: проверка чинит счётчики, а не выбрасывает файлы.
             Step::Line("cat /home/roman/crash.txt"),

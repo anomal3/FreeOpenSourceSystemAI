@@ -153,29 +153,17 @@ const SCRIPT: &str = "#!/bin/bash\n\
 
 /// Разложить Rider в раздел состояния образа `disk_path`.
 pub fn place(disk_path: &Path) -> Result<()> {
-    use disk::BlockDevice as _;
-
-    let mut dev = crate::diskfile::DiskFile::open(disk_path, 512)?;
-    let table = disk::gpt::read(&mut dev)
-        .map_err(|err| anyhow::anyhow!("на образе {} нет GPT: {err}", disk_path.display()))?;
-    let state = table
-        .find(disk::gpt::FREEOS_STATE_TYPE)
-        .ok_or_else(|| anyhow::anyhow!("на образе нет раздела состояния"))?;
-    let mut fs = ext2::Editor::open(&mut dev, state.first_lba)
-        .map_err(|err| anyhow::anyhow!("раздел состояния не открывается: {err}"))?;
-
     // Уже лежит тот же — второй раз не раскладываем: это минуты записи.
-    let placed = lookup_path(&mut fs, &mut dev, "opt/rider/fossai/placed")?;
-    if let Some(number) = placed {
-        if fs.size_of(&mut dev, number).ok() == Some(BUILD.len() as u64) {
+    if let Some(placed) = crate::statefs::read_file(disk_path, "opt/rider/fossai/placed")? {
+        if placed.len() == BUILD.len() {
             say!("стенд: Rider {BUILD} уже разложен в /opt/rider");
             return Ok(());
         }
     }
 
     let archive = rider_archive()?;
-    fs.mark_dirty(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось пометить том используемым: {err}"))?;
+    // ext2 или btrfs — по пробе тома; btrfs фиксируется по ходу раскладки.
+    let mut fs = crate::statefs::StateVolume::open(disk_path)?;
 
     let mut links: BTreeMap<String, String> = BTreeMap::new();
     let mut vmoptions: Option<Vec<u8>> = None;
@@ -208,8 +196,10 @@ pub fn place(disk_path: &Path) -> Result<()> {
                 if files % 2000 == 0 {
                     say!("стенд: Rider — {files} файлов, {} МиБ", bytes >> 20);
                 }
-                if let Err(err) = fs.write_file_path(&mut dev, &place, &data, (mode & 0o7777) as u16, 0, 0) {
-                    failure = Some(anyhow::anyhow!("не удалось записать /{place}: {err}"));
+                match fs.write_file_path(&place, &data, (mode & 0o7777) as u16, 0, 0) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => failure = Some(anyhow::anyhow!("/{place} уже есть")),
+                    Err(err) => failure = Some(err),
                 }
             }
         }
@@ -225,11 +215,14 @@ pub fn place(disk_path: &Path) -> Result<()> {
     // `auto` выбирает X11, если не уверен в Wayland, — своё значение ниже
     // перекрывает его: последнее слово у последней строки.
     options.extend_from_slice(VMOPTIONS_EXTRA.as_bytes());
-    let write = |fs: &mut ext2::Editor, dev: &mut crate::diskfile::DiskFile, path: &str, data: &[u8], mode: u16| {
-        fs.write_file_path(dev, path, data, mode, 0, 0).map_err(|err| anyhow::anyhow!("не удалось записать /{path}: {err}"))
+    let write = |fs: &mut crate::statefs::StateVolume, path: &str, data: &[u8], mode: u16| -> Result<()> {
+        match fs.write_file_path(path, data, mode, 0, 0)? {
+            Some(_) => Ok(()),
+            None => Err(anyhow::anyhow!("/{path} уже есть")),
+        }
     };
-    write(&mut fs, &mut dev, "opt/rider/fossai/rider64.vmoptions", &options, 0o644)?;
-    write(&mut fs, &mut dev, "opt/rider/fossai/rider", SCRIPT.as_bytes(), 0o755)?;
+    write(&mut fs, "opt/rider/fossai/rider64.vmoptions", &options, 0o644)?;
+    write(&mut fs, "opt/rider/fossai/rider", SCRIPT.as_bytes(), 0o755)?;
     // .NET SDK — в /opt/dotnet.
     let sdk_archive = cached_download(DOTNET_SDK_URL, DOTNET_SDK_SHA256)?;
     let (mut sdk_files, mut sdk_failure) = (0usize, None::<anyhow::Error>);
@@ -240,8 +233,10 @@ pub fn place(disk_path: &Path) -> Result<()> {
         if let Item::File { data, mode } = item {
             let place = format!("opt/dotnet/{path}");
             sdk_files += 1;
-            if let Err(err) = fs.write_file_path(&mut dev, &place, &data, (mode & 0o7777) as u16, 0, 0) {
-                sdk_failure = Some(anyhow::anyhow!("не удалось записать /{place}: {err}"));
+            match fs.write_file_path(&place, &data, (mode & 0o7777) as u16, 0, 0) {
+                Ok(Some(_)) => {}
+                Ok(None) => sdk_failure = Some(anyhow::anyhow!("/{place} уже есть")),
+                Err(err) => sdk_failure = Some(err),
             }
         }
     })?;
@@ -251,38 +246,19 @@ pub fn place(disk_path: &Path) -> Result<()> {
     say!("стенд: .NET SDK 10.0.403 — {sdk_files} файлов в /opt/dotnet");
     for plugin in SKIPPED_PLUGINS {
         let place = format!("opt/rider/{plugin}/FOSSAI-SKIPPED");
-        write(&mut fs, &mut dev, &place, b"not placed by the FossAi bench: no room on the bench disk\n", 0o644)?;
+        write(&mut fs, &place, b"not placed by the FossAi bench: no room on the bench disk\n", 0o644)?;
     }
     // Значок на столе и на панели — свой, логотип Rider (`bin/rider.png`,
     // 128×128), как у Chromium: не значок набора.
     let logo = logo.context("в архиве Rider нет bin/rider.png")?;
     let icon = crate::fimg::from_png(&logo).context("bin/rider.png не разобран")?;
-    write(&mut fs, &mut dev, "opt/rider/fossai/icon.fimg", &icon, 0o644)?;
-    if let Some(parent) = lookup_path(&mut fs, &mut dev, "var/lib/pkg")? {
-        let _ = fs.unlink(&mut dev, parent, "rider.pkg");
-        let _ = fs.unlink(&mut dev, parent, "dotnet.pkg");
-    }
-    write(&mut fs, &mut dev, "var/lib/pkg/rider.pkg", MANIFEST.as_bytes(), 0o644)?;
-    write(&mut fs, &mut dev, "var/lib/pkg/dotnet.pkg", DOTNET_MANIFEST.as_bytes(), 0o644)?;
-    write(&mut fs, &mut dev, "opt/rider/fossai/placed", BUILD.as_bytes(), 0o644)?;
-
-    fs.flush_everywhere(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось сбросить раздел состояния: {err}"))?;
-    fs.mark_clean(&mut dev)
-        .map_err(|err| anyhow::anyhow!("не удалось пометить том чистым: {err}"))?;
-    dev.flush().map_err(|err| anyhow::anyhow!("не удалось сбросить образ: {err}"))?;
+    write(&mut fs, "opt/rider/fossai/icon.fimg", &icon, 0o644)?;
+    fs.remove_path("var/lib/pkg/rider.pkg")?;
+    fs.remove_path("var/lib/pkg/dotnet.pkg")?;
+    write(&mut fs, "var/lib/pkg/rider.pkg", MANIFEST.as_bytes(), 0o644)?;
+    write(&mut fs, "var/lib/pkg/dotnet.pkg", DOTNET_MANIFEST.as_bytes(), 0o644)?;
+    write(&mut fs, "opt/rider/fossai/placed", BUILD.as_bytes(), 0o644)?;
+    fs.finish()?;
     say!("стенд: Rider {BUILD} разложен в /opt/rider — {files} файлов, {} МиБ", bytes >> 20);
     Ok(())
-}
-
-/// Номер inode по пути от корня тома; `None` — нет такого.
-fn lookup_path(fs: &mut ext2::Editor, dev: &mut crate::diskfile::DiskFile, path: &str) -> Result<Option<u32>> {
-    let mut at = ext2::ROOT_INODE;
-    for component in path.split('/').filter(|part| !part.is_empty()) {
-        match fs.lookup(dev, at, component).map_err(|err| anyhow::anyhow!("не удалось прочитать /{path}: {err}"))? {
-            Some((number, _)) => at = number,
-            None => return Ok(None),
-        }
-    }
-    Ok(Some(at))
 }

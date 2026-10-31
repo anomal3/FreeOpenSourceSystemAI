@@ -598,6 +598,11 @@ fn stat(root: &mut Directory, path: &CStr16, what: What) -> Result<u64, Error> {
 }
 
 impl Payload {
+    /// Лежит ли на носителе файл (метки вроде `\FREEOS\STATEEXT.CFG`).
+    pub fn has(&mut self, path: &CStr16) -> bool {
+        self.root.open(path, FileMode::Read, FileAttribute::empty()).is_ok()
+    }
+
     /// Суммарный объём переносимого.
     #[must_use]
     pub fn total_bytes(&self) -> u64 {

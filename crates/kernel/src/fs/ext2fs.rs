@@ -733,14 +733,14 @@ impl Node for Ext2Node {
 }
 
 /// Длина буфера ядра для чтения и записи через него.
-const BOUNCE: usize = 256 * 1024;
+pub(super) const BOUNCE: usize = 256 * 1024;
 
 /// Запас буферов: выделять 256 КиБ из кучи на каждый `read` значило рвать
 /// её на куски (фаза 74 — Rider в VirtualBox упирался в аллокатор).
 static BOUNCES: crate::sync::SpinLock<Vec<Vec<u8>>> = crate::sync::SpinLock::new(Vec::new());
 
-/// Буфер ядра из запаса; уходя, возвращается в запас.
-struct Bounce(Vec<u8>);
+/// Буфер ядра из запаса; уходя, возвращается в запас. Общий с btrfs.
+pub(super) struct Bounce(Vec<u8>);
 
 impl core::ops::Deref for Bounce {
     type Target = [u8];
@@ -766,7 +766,7 @@ impl Drop for Bounce {
 }
 
 /// Буфер ядра для чтения и записи через него: всегда [`BOUNCE`] байт.
-fn bounce_buffer(_len: usize) -> VfsResult<Bounce> {
+pub(super) fn bounce_buffer(_len: usize) -> VfsResult<Bounce> {
     if let Some(buffer) = BOUNCES.lock().pop() {
         return Ok(Bounce(buffer));
     }

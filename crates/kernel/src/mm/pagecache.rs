@@ -92,6 +92,21 @@ pub fn forget(file: (usize, u64)) {
     });
 }
 
+/// Забыть страницы всех файлов тома: его память о незафиксированном пропала
+/// (писатель btrfs открыт заново после отказа).
+pub fn forget_volume(volume: usize) {
+    let numbers: alloc::vec::Vec<u64> = {
+        let cache = CACHE.lock();
+        let mut numbers: alloc::vec::Vec<u64> =
+            cache.range(((volume, 0), 0, 0)..=((volume, u64::MAX), u64::MAX, usize::MAX)).map(|(key, _)| key.0.1).collect();
+        numbers.dedup();
+        numbers
+    };
+    for number in numbers {
+        forget((volume, number));
+    }
+}
+
 /// Отдать до `want` кадров, которые держит только кэш (память на исходе).
 /// Возвращает, сколько отдано.
 pub fn shrink(want: usize) -> usize {

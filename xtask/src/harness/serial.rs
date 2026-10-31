@@ -164,6 +164,32 @@ impl SerialLine {
         }
     }
 
+    /// Дождаться первой по выводу из нескольких подстрок (после курсора).
+    pub fn wait_for_one_of(&mut self, needles: &[&str], timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let guard = self.buffer.lock().expect("буфер линии");
+                let tail = guard.text.get(self.cursor..).unwrap_or("");
+                let first = needles
+                    .iter()
+                    .filter_map(|needle| tail.find(needle).map(|index| (index, needle.len())))
+                    .min();
+                if let Some((index, len)) = first {
+                    self.cursor += index + len;
+                    return Ok(());
+                }
+                if guard.closed {
+                    bail!("серийная линия закрылась, не дождавшись ни одной из {needles:?}");
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("за {} с не дождались ни одной из {needles:?}", timeout.as_secs());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// Дождаться подстроки и прочитать десятичное число сразу за ней.
     ///
     /// Нужно там, где сценарий должен сослаться на то, что система назвала сама:

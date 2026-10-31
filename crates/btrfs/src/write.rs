@@ -1036,8 +1036,9 @@ impl Writer {
     /// Переименовать или перенести.
     ///
     /// Семантика та же, что у `ext2::Editor::rename`, и по тем же причинам:
-    /// занятое имя — отказ [`Error::Exists`], а не молчаливая замена, и каталог
-    /// не переносится в другого родителя. Новое имя появляется раньше, чем
+    /// занятое имя — отказ [`Error::Exists`], а не молчаливая замена (замену
+    /// делает слой выше), и каталог не переносится внутрь самого себя
+    /// ([`Error::Unsupported`]). Новое имя появляется раньше, чем
     /// исчезает старое, — но в btrfs это порядок в памяти: на диск уходит
     /// только готовая транзакция целиком.
     pub fn rename(
@@ -1063,8 +1064,25 @@ impl Writer {
         if self.entry(new_parent, new_name)?.is_some() {
             return Err(Error::Exists);
         }
+        // Каталог переносится и в другого родителя (31.10: .NET и Rider
+        // делают `mkdtemp` и переносят готовый каталог на место — как ext2 с
+        // фазы 74), но не внутрь самого себя: путь от нового родителя к корню
+        // не должен проходить через переносимый каталог.
         if file_type == FILE_TYPE_DIRECTORY && old_parent != new_parent {
-            return Err(Error::Unsupported);
+            let mut at = new_parent;
+            for _ in 0..4096 {
+                if at == number {
+                    return Err(Error::Unsupported);
+                }
+                let up = self.parent_of(dev, at)?;
+                if up == at {
+                    break;
+                }
+                at = up;
+            }
+            if at != objectid::FIRST_FREE {
+                return Err(Error::Corrupt);
+            }
         }
         self.broken = true;
         self.link(new_parent, new_name.as_bytes(), number, file_type, time)?;
@@ -1076,6 +1094,53 @@ impl Writer {
         put_u32(raw, INODE_CTIME + 8, 0);
         self.time = time;
         self.broken = false;
+        Ok(())
+    }
+
+    /// `mkdir -p`: каталоги пути от корня, недостающие — с `attrs`. Возвращает
+    /// номер последнего. Для установщика и стенда (как
+    /// `ext2::Editor::create_dir_path`).
+    pub fn create_dir_path(&mut self, dev: &mut dyn BlockDevice, path: &str, attrs: &Attributes) -> Result<u64> {
+        let mut node = objectid::FIRST_FREE;
+        for component in path.split('/').filter(|part| !part.is_empty() && *part != ".") {
+            node = match self.lookup(dev, node, component)? {
+                Some(found) => {
+                    if self.inode(dev, found)?.kind != crate::FileType::Directory {
+                        return Err(Error::NotADirectory);
+                    }
+                    found
+                }
+                None => self.create_directory(dev, node, component, attrs)?,
+            };
+        }
+        Ok(node)
+    }
+
+    /// Создать файл по пути с содержимым; недостающие каталоги — `0755` с
+    /// владельцем файла. Занятое имя — [`Error::Exists`] (стенд узнаёт по
+    /// нему «уже лежит»), как `ext2::Editor::write_file_path`.
+    pub fn write_file_path(&mut self, dev: &mut dyn BlockDevice, path: &str, data: &[u8], attrs: &Attributes) -> Result<u64> {
+        let trimmed = path.trim_end_matches('/');
+        let (parent, name) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+        let parent = self.create_dir_path(dev, parent, &Attributes { mode: 0o755, ..*attrs })?;
+        self.create_file(dev, parent, name, data, attrs)
+    }
+
+    /// Сменить права (младшие 12 бит режима) — `chmod`. Вид файла не
+    /// меняется.
+    pub fn set_mode(&mut self, dev: &mut dyn BlockDevice, number: u64, mode: u16, time: u64) -> Result<()> {
+        if self.broken {
+            return Err(Error::Aborted);
+        }
+        self.ensure_objects(dev, &[number])?;
+        let generation = self.generation + 1;
+        let raw = self.inode_mut(number)?;
+        let old = u32_at(raw, INODE_MODE);
+        put_u32(raw, INODE_MODE, (old & !0o7777) | u32::from(mode & 0o7777));
+        put_u64(raw, INODE_TRANSID, generation);
+        put_u64(raw, INODE_CTIME, time);
+        put_u32(raw, INODE_CTIME + 8, 0);
+        self.time = time;
         Ok(())
     }
 
@@ -1353,6 +1418,20 @@ impl Writer {
         }
         self.time = time;
         Ok(())
+    }
+
+    /// Родитель каталога — по его обратной ссылке; у корня родитель он сам.
+    fn parent_of(&mut self, dev: &mut dyn BlockDevice, number: u64) -> Result<u64> {
+        if number == objectid::FIRST_FREE {
+            return Ok(number);
+        }
+        self.ensure_objects(dev, &[number])?;
+        let fs = self.tree(objectid::FS_TREE)?;
+        let at = fs.items.partition_point(|(key, _)| *key < Key::first(number, item_type::INODE_REF));
+        match fs.items.get(at) {
+            Some((key, _)) if key.objectid == number && key.kind == item_type::INODE_REF => Ok(key.offset),
+            _ => Err(Error::Corrupt),
+        }
     }
 
     /// Запись каталога по имени: номер inode и тип.

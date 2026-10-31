@@ -61,9 +61,16 @@ use crate::sync::Mutex;
 use crate::vfs::{DirEntry, FileSystem, Metadata, Node, NodeKind, VfsError, VfsResult};
 use disk::BlockDevice as _;
 
+/// Носитель тома: кэш блоков в кадрах памяти поверх счётчика запросов (с
+/// 31.10, когда на btrfs переехали `/home` и `/opt`: без кэша каждое чтение
+/// файла шло на носитель). Запись — сквозная: копирование при записи пишет
+/// только на новые места, а запись выбрасывает из кэша всё, что с ней
+/// пересекается, — освобождённый и занятый заново экстент не отдаст старого.
+type Disk = crate::block::cache::Cached<Counted>;
+
 /// Диск вместе с разобранным на нём томом.
 struct Inner {
-    disk: Counted,
+    disk: Disk,
     /// Читатель. Смотрит на последнюю завершённую транзакцию — и только на неё.
     fs: btrfs::Btrfs,
     first_lba: u64,
@@ -76,6 +83,9 @@ struct Inner {
     refused: Option<VfsError>,
     /// Сколько операций ждут фиксации.
     pending: usize,
+    /// Адрес тома — первая половина ключа кэша страниц его файлов
+    /// ([`BtrfsNode::key`]).
+    volume: usize,
 }
 
 /// Больше скольких незафиксированных операций не копить.
@@ -166,7 +176,7 @@ impl BtrfsFs {
         first_lba: u64,
         writable: bool,
     ) -> VfsResult<BtrfsMount> {
-        let mut disk = Counted::new(device);
+        let mut disk = Disk::new(Counted::new(device));
         let fs = btrfs::Btrfs::mount(&mut disk, first_lba).map_err(convert)?;
         // Открытие писателя ничего не пишет: оно читает метаданные тома в
         // память. Том, от которого писатель отказался, остаётся нетронутым.
@@ -178,15 +188,17 @@ impl BtrfsFs {
         } else {
             (None, None)
         };
-        Ok(BtrfsMount(Arc::new(Self {
-            inner: Mutex::new(Inner { disk, fs, first_lba, writer, refused, pending: 0 }),
-        })))
+        let mounted = Arc::new(Self {
+            inner: Mutex::new(Inner { disk, fs, first_lba, writer, refused, pending: 0, volume: 0 }),
+        });
+        mounted.inner.lock().volume = Arc::as_ptr(&mounted) as *const () as usize;
+        Ok(BtrfsMount(mounted))
     }
 
     /// Выполнить изменение тома; фиксация — позже ([`Inner::commit`]).
     fn change<R>(
         &self,
-        action: impl FnOnce(&mut Counted, &mut btrfs::Writer, u64) -> Result<R, btrfs::Error>,
+        action: impl FnOnce(&mut Disk, &mut btrfs::Writer, u64) -> Result<R, btrfs::Error>,
     ) -> VfsResult<R> {
         let mut guard = self.inner.lock();
         let Inner { disk, writer, .. } = &mut *guard;
@@ -216,7 +228,7 @@ impl BtrfsFs {
 impl Inner {
     /// Зафиксировать накопленное; после отказа — открыть писатель с диска.
     fn commit(&mut self) -> VfsResult<()> {
-        let Inner { disk, fs, first_lba, writer, refused, pending } = self;
+        let Inner { disk, fs, first_lba, writer, refused, pending, volume } = self;
         let Some(active) = writer.as_mut() else {
             return Ok(());
         };
@@ -224,6 +236,9 @@ impl Inner {
         let committed = active.commit(disk);
         let generation = active.generation();
         if committed.is_err() {
+            // Страницы, прочитанные из памяти писателя, могли описывать
+            // незафиксированное — его больше нет.
+            crate::mm::pagecache::forget_volume(*volume);
             match btrfs::Writer::open(disk, *first_lba) {
                 Ok(fresh) => *writer = Some(fresh),
                 Err(err) => {
@@ -278,7 +293,7 @@ impl BtrfsMount {
             total,
             used,
             guard.fs.chunks(),
-            guard.disk.requests(),
+            guard.disk.inner().requests(),
         )
     }
 
@@ -376,6 +391,15 @@ impl FileSystem for BtrfsMount {
         Some(self.summary())
     }
 
+    /// Место по последней зафиксированной транзакции: незафиксированное
+    /// добавит не больше нескольких секунд правок.
+    fn space(&self) -> Option<(u64, u64)> {
+        let guard = self.0.inner.lock();
+        guard.writer.as_ref()?;
+        let (total, used) = guard.fs.usage();
+        Some((total, total.saturating_sub(used)))
+    }
+
     /// Зафиксировать накопленное и довести до носителя.
     ///
     /// `flush` зовётся и после фиксации (она сама его делает): он дёшев, а
@@ -408,6 +432,13 @@ impl FileSystem for BtrfsMount {
     fn rename(&self, old: &str, new: &str) -> VfsResult<()> {
         let (old_parent, old_name) = split_parent(old)?;
         let (new_parent, new_name) = split_parent(new)?;
+        // Переименование поверх существующего файла удаляет тот: его
+        // страницы в кэше больше не его.
+        if let Ok(target) = self.resolve(new) {
+            if let Some(key) = target.cache_key() {
+                crate::mm::pagecache::forget(key);
+            }
+        }
         self.0.change(|disk, writer, time| {
             let from = writer.resolve(disk, old_parent)?;
             let to = writer.resolve(disk, new_parent)?;
@@ -423,6 +454,14 @@ struct BtrfsNode {
 }
 
 impl Node for BtrfsNode {
+    fn cache_key(&self) -> Option<(usize, u64)> {
+        (self.inode.kind == btrfs::FileType::Regular).then(|| self.key())
+    }
+
+    fn file_id(&self) -> Option<(usize, u64)> {
+        Some(self.key())
+    }
+
     /// Свежий inode, а не снимок открытия: запись через этот или другой
     /// дескриптор меняет длину и время.
     fn metadata(&self) -> Metadata {
@@ -432,17 +471,37 @@ impl Node for BtrfsNode {
         }
     }
 
+    /// Через буфер ядра, кусками, как у ext2: под замком тома память программы
+    /// не трогается (её страница может отказать, а обработчику нужен замок
+    /// процесса, который держит, скажем, `munmap`, ждущий этот же том), и
+    /// между кусками замок отпускается — длинное чтение не держит остальных.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         if self.inode.kind != btrfs::FileType::Regular {
             return Err(VfsError::WrongKind);
         }
-        let mut guard = self.fs.inner.lock();
-        let Inner { disk, fs, writer, .. } = &mut *guard;
-        if let Some(writer) = writer.as_mut() {
-            return writer.read_at(disk, self.inode.number, offset, buf).map_err(convert);
+        let mut bounce = super::ext2fs::bounce_buffer(buf.len())?;
+        let mut done = 0;
+        while done < buf.len() {
+            let take = (buf.len() - done).min(bounce.len());
+            let at = offset + done as u64;
+            let got = {
+                let mut guard = self.fs.inner.lock();
+                let Inner { disk, fs, writer, .. } = &mut *guard;
+                match writer.as_mut() {
+                    Some(writer) => writer.read_at(disk, self.inode.number, at, &mut bounce[..take]),
+                    None => fs
+                        .inode(disk, self.inode.number)
+                        .and_then(|inode| fs.read_at(disk, &inode, at, &mut bounce[..take])),
+                }
+                .map_err(convert)?
+            };
+            buf[done..done + got].copy_from_slice(&bounce[..got]);
+            done += got;
+            if got < take {
+                break;
+            }
         }
-        let inode = fs.inode(disk, self.inode.number).map_err(convert)?;
-        fs.read_at(disk, &inode, offset, buf).map_err(convert)
+        Ok(done)
     }
 
     fn list(&self) -> VfsResult<Vec<DirEntry>> {
@@ -492,22 +551,42 @@ impl Node for BtrfsNode {
         Ok(Box::new(BtrfsNode { fs: Arc::clone(&self.fs), inode }))
     }
 
+    /// Через буфер ядра, по той же причине, что и `read_at`.
     fn write_at(&self, offset: u64, data: &[u8]) -> VfsResult<usize> {
         if self.inode.kind != btrfs::FileType::Regular {
             return Err(VfsError::WrongKind);
         }
+        crate::mm::pagecache::forget(self.key());
         let number = self.inode.number;
-        self.fs
-            .change(|disk, writer, time| writer.write_at(disk, number, offset, data, time))
+        let mut bounce = super::ext2fs::bounce_buffer(data.len())?;
+        let mut done = 0;
+        while done < data.len() {
+            let take = (data.len() - done).min(bounce.len());
+            bounce[..take].copy_from_slice(&data[done..done + take]);
+            let piece = &bounce[..take];
+            let at = offset + done as u64;
+            let wrote = self.fs.change(|disk, writer, time| writer.write_at(disk, number, at, piece, time))?;
+            done += wrote;
+            if wrote < take {
+                break;
+            }
+        }
+        Ok(done)
     }
 
     fn truncate(&self, size: u64) -> VfsResult<()> {
         if self.inode.kind != btrfs::FileType::Regular {
             return Err(VfsError::WrongKind);
         }
+        crate::mm::pagecache::forget(self.key());
         let number = self.inode.number;
         self.fs
             .change(|disk, writer, time| writer.truncate(disk, number, size, time))
+    }
+
+    fn chmod(&self, mode: u16) -> VfsResult<()> {
+        let number = self.inode.number;
+        self.fs.change(|disk, writer, time| writer.set_mode(disk, number, mode, time))
     }
 
     fn create(&self, name: &str, mode: u16, uid: u32, gid: u32) -> VfsResult<Box<dyn Node>> {
@@ -529,6 +608,11 @@ impl Node for BtrfsNode {
     }
 
     fn unlink(&self, name: &str) -> VfsResult<()> {
+        if let Ok(child) = self.lookup(name) {
+            if let Some(key) = child.cache_key() {
+                crate::mm::pagecache::forget(key);
+            }
+        }
         let parent = self.inode.number;
         self.fs.change(|disk, writer, time| writer.unlink(disk, parent, name, time))
     }
@@ -541,6 +625,11 @@ impl Node for BtrfsNode {
 }
 
 impl BtrfsNode {
+    /// Том и номер файла — ключ кэша страниц и постоянное имя (`st_ino`).
+    fn key(&self) -> (usize, u64) {
+        (Arc::as_ptr(&self.fs) as *const () as usize, self.inode.number)
+    }
+
     /// Узел по номеру inode — то, что возвращают создающие операции. Inode —
     /// из памяти писателя: создание ещё не зафиксировано.
     fn child(&self, number: u64) -> VfsResult<Box<dyn Node>> {

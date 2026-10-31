@@ -1224,12 +1224,48 @@ fn mount_state(found: &[block::Partition], info: &BootInfo) {
     };
     let first_lba = partition.first_lba;
     let mut device = partition.device;
-    check_volume("state", &mut device, first_lba, info.check_disk());
 
     // Раздел состояния — единственный, куда система пишет. В безопасном режиме
     // он тоже открывается только на чтение: смысл режима в том, чтобы у системы
     // было как можно меньше возможностей что-нибудь испортить.
     let writable = !info.safe_mode();
+
+    // С 31.10 состояние может быть и btrfs (переезд по плану фазы 50d): формат
+    // — пробой, как у раздела данных. Проверки ext2 ему не нужно — суммы
+    // сверяются при чтении, а новое состояние становится настоящим одной
+    // записью суперблока.
+    if btrfs::detect(&mut device, first_lba) {
+        let mount = match fs::BtrfsFs::mount(alloc::boxed::Box::new(device), first_lba, writable) {
+            Ok(mount) => mount,
+            Err(err) => {
+                kprintln!("  state       : cannot mount btrfs at LBA {first_lba}: {err}");
+                kprintln!("  state       : /etc and /home stay on the root volume");
+                return;
+            }
+        };
+        let (_, total, used, _, _) = mount.stats();
+        kprintln!(
+            "  state       : btrfs at LBA {first_lba}, {} MiB, {} MiB used",
+            total / (1024 * 1024),
+            used / (1024 * 1024)
+        );
+        if writable && !mount.writable() {
+            if let Some(err) = mount.refused() {
+                kprintln!("  state       : the writer refused the volume ({err}), mounted read-only");
+            }
+        }
+        let shared: alloc::sync::Arc<dyn crate::vfs::FileSystem> = alloc::sync::Arc::new(mount);
+        for branch in STATE_BRANCHES {
+            fs::mount_at(branch, alloc::sync::Arc::clone(&shared));
+            kprintln!("  state       : {branch} comes from the state partition");
+        }
+        if !writable {
+            kprintln!("  state       : mounted read-only, nothing will be written to it");
+        }
+        return;
+    }
+
+    check_volume("state", &mut device, first_lba, info.check_disk());
     let mount = match fs::Ext2Fs::mount(alloc::boxed::Box::new(device), first_lba, writable) {
         Ok(mount) => mount,
         Err(err) => {
