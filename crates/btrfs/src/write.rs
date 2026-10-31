@@ -42,6 +42,7 @@
 //! дублированные и RAID-куски, тома без дерева свободного места. Каждый случай —
 //! [`Error::Unsupported`] при открытии, а не порча при фиксации.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use disk::BlockDevice;
@@ -199,6 +200,10 @@ pub struct Writer {
     /// Группы блоков и занятые отрезки для размещения данных (см.
     /// [`Writer::allocate_data`]); `None` — построить заново.
     space: Option<(Vec<Group>, Vec<(u64, u64)>)>,
+    /// Inode, чьи элементы `EXTENT_DATA` менялись с прошлой фиксации, и
+    /// экстенты, на которые они ссылались до первой правки (см.
+    /// [`Writer::settle_data`]).
+    touched: BTreeMap<u64, Vec<u64>>,
 }
 
 impl Writer {
@@ -310,6 +315,7 @@ impl Writer {
             time: 0,
             broken: false,
             space: None,
+            touched: BTreeMap::new(),
         };
         writer.validate()?;
 
@@ -942,6 +948,7 @@ impl Writer {
     /// Остатки слева и справа продолжают ссылаться на прежний экстент со
     /// сдвинутым `extent offset` — ровно так, как их оставляет ядро Linux.
     fn punch(&mut self, number: u64, start: u64, stop: u64) -> Result<()> {
+        self.touch(number)?;
         let fs = self.tree_index(objectid::FS_TREE)?;
         let items = &mut self.trees[fs].items;
         let first = items.partition_point(|(key, _)| *key < Key::first(number, item_type::EXTENT_DATA));
@@ -1101,11 +1108,45 @@ impl Writer {
     }
 
     fn remove_extent_items(&mut self, number: u64) -> Result<()> {
+        self.touch(number)?;
         self.remove_range(Key::first(number, item_type::EXTENT_DATA), Key::first(number, item_type::EXTENT_DATA + 1))
     }
 
     fn remove_inode_items(&mut self, number: u64) -> Result<()> {
+        self.touch(number)?;
         self.remove_range(Key::new(number, 0, 0), Key::new(number + 1, 0, 0))
+    }
+
+    /// Экстенты данных, на которые сейчас ссылается inode.
+    fn extent_bytenrs(&self, number: u64) -> Result<Vec<u64>> {
+        let fs = self.tree(objectid::FS_TREE)?;
+        let first = fs.items.partition_point(|(key, _)| *key < Key::first(number, item_type::EXTENT_DATA));
+        let mut out = Vec::new();
+        for (key, raw) in &fs.items[first..] {
+            if key.objectid != number || key.kind != item_type::EXTENT_DATA {
+                break;
+            }
+            if raw.len() >= EXTENT_REGULAR_SIZE && raw[EXTENT_TYPE] != EXTENT_TYPE_INLINE {
+                let bytenr = u64_at(raw, EXTENT_DISK_BYTENR);
+                if bytenr != 0 {
+                    push(&mut out, bytenr)?;
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Элементы `EXTENT_DATA` inode сейчас изменятся: запомнить, на какие
+    /// экстенты он ссылался до первой правки с прошлой фиксации.
+    fn touch(&mut self, number: u64) -> Result<()> {
+        if self.touched.contains_key(&number) {
+            return Ok(());
+        }
+        let old = self.extent_bytenrs(number)?;
+        self.touched.insert(number, old);
+        Ok(())
     }
 
     fn remove_range(&mut self, from: Key, to: Key) -> Result<()> {
@@ -1206,124 +1247,174 @@ impl Writer {
     /// Привести дерево экстентов и дерево сумм в соответствие дереву ФС.
     ///
     /// Ссылки на экстенты данных не правятся по ходу операций, а выводятся
-    /// здесь из элементов `EXTENT_DATA` — тем же приёмом, каким дерево
-    /// свободного места выводится из дерева экстентов. Экстент, на который не
-    /// осталось ссылок, исчезает, а вместе с ним — суммы его секторов.
+    /// здесь из элементов `EXTENT_DATA` — но с 31.10 только для экстентов,
+    /// которых касались правленные inode (`touched`): до этого фиксация
+    /// обходила всё дерево ФС и всё дерево сумм, а для тома с Debian и Rider
+    /// это сотни тысяч элементов на каждую фиксацию. Ссылки нетронутых inode
+    /// на те же экстенты переносятся из прежнего элемента как есть; экстент,
+    /// на который не осталось ссылок, исчезает вместе с суммами своих
+    /// секторов.
     fn settle_data(&mut self, generation: u64) -> Result<()> {
+        let touched = core::mem::take(&mut self.touched);
+        if touched.is_empty() {
+            return Ok(());
+        }
         // (адрес экстента, его длина, inode, смещение начала экстента в файле)
         let mut refs = Vec::new();
-        for (key, raw) in &self.tree(objectid::FS_TREE)?.items {
-            if key.kind != item_type::EXTENT_DATA
-                || raw.len() < EXTENT_REGULAR_SIZE
-                || raw[EXTENT_TYPE] == EXTENT_TYPE_INLINE
-            {
-                continue;
+        let mut candidates = Vec::new();
+        {
+            let fs = self.tree(objectid::FS_TREE)?;
+            for (&number, old) in &touched {
+                for &bytenr in old {
+                    push(&mut candidates, bytenr)?;
+                }
+                let first = fs.items.partition_point(|(key, _)| *key < Key::first(number, item_type::EXTENT_DATA));
+                for (key, raw) in &fs.items[first..] {
+                    if key.objectid != number || key.kind != item_type::EXTENT_DATA {
+                        break;
+                    }
+                    if raw.len() < EXTENT_REGULAR_SIZE || raw[EXTENT_TYPE] == EXTENT_TYPE_INLINE {
+                        continue;
+                    }
+                    let bytenr = u64_at(raw, EXTENT_DISK_BYTENR);
+                    if bytenr == 0 {
+                        continue;
+                    }
+                    let start = key.offset.wrapping_sub(u64_at(raw, EXTENT_OFFSET));
+                    push(&mut refs, (bytenr, u64_at(raw, EXTENT_DISK_NUM_BYTES), key.objectid, start))?;
+                    push(&mut candidates, bytenr)?;
+                }
             }
-            let bytenr = u64_at(raw, EXTENT_DISK_BYTENR);
-            if bytenr == 0 {
-                continue;
-            }
-            let start = key.offset.wrapping_sub(u64_at(raw, EXTENT_OFFSET));
-            push(&mut refs, (bytenr, u64_at(raw, EXTENT_DISK_NUM_BYTES), key.objectid, start))?;
         }
         refs.sort_unstable();
+        candidates.sort_unstable();
+        candidates.dedup();
 
         let extent = self.tree_index(objectid::EXTENT_TREE)?;
-        let old = core::mem::take(&mut self.trees[extent].items);
-        let mut kept = Vec::new();
-        kept.try_reserve_exact(old.len()).map_err(|_| Error::NoMemory)?;
-        let mut previous = Vec::new();
-        for (key, raw) in old {
-            if key.kind == item_type::EXTENT_ITEM {
-                push(&mut previous, (key.objectid, raw))?;
-            } else {
-                kept.push((key, raw));
-            }
-        }
-
-        let mut live = Vec::new();
-        let mut at = 0;
-        while at < refs.len() {
-            let (bytenr, length) = (refs[at].0, refs[at].1);
+        let mut freed = Vec::new();
+        for bytenr in candidates {
+            // Новые ссылки правленных inode на этот экстент.
+            let from = refs.partition_point(|r| r.0 < bytenr);
+            let to = refs.partition_point(|r| r.0 <= bytenr);
             let mut group: Vec<(u64, u64, u32)> = Vec::new();
-            while at < refs.len() && refs[at].0 == bytenr {
-                if refs[at].1 != length {
+            let mut length = None;
+            for &(_, len, owner, start) in &refs[from..to] {
+                if length.is_some_and(|known| known != len) {
                     return Err(Error::Corrupt);
                 }
-                let (owner, start) = (refs[at].2, refs[at].3);
+                length = Some(len);
                 match group.last_mut() {
                     Some(last) if last.0 == owner && last.1 == start => last.2 += 1,
                     _ => push(&mut group, (owner, start, 1))?,
                 }
-                at += 1;
             }
-            let found = previous.binary_search_by_key(&bytenr, |(address, _)| *address).ok();
-            let record = match found {
-                // Экстент старый и ссылки на него те же — элемент остаётся
-                // байт в байт. Порядок нескольких встроенных ссылок ядро
-                // сверяет по хешу, которого мы не считаем, так что чужой
-                // элемент с несколькими ссылками переносится только нетронутым.
-                Some(index) if data_refs(&previous[index].1)? == group => copy(&previous[index].1)?,
-                _ if group.len() == 1 => {
-                    let item_generation = found.map_or(generation, |index| u64_at(&previous[index].1, EXTENT_ITEM_GENERATION));
-                    let (owner, start, count) = group[0];
-                    item(DATA_EXTENT_ITEM_SIZE, |raw| {
-                        put_u64(raw, EXTENT_ITEM_REFS, u64::from(count));
-                        put_u64(raw, EXTENT_ITEM_GENERATION, item_generation);
-                        put_u64(raw, EXTENT_ITEM_FLAGS, EXTENT_FLAG_DATA);
-                        raw[EXTENT_ITEM_SIZE] = item_type::EXTENT_DATA_REF;
-                        put_u64(raw, EXTENT_ITEM_SIZE + DATA_REF_ROOT, objectid::FS_TREE);
-                        put_u64(raw, EXTENT_ITEM_SIZE + DATA_REF_OBJECTID, owner);
-                        put_u64(raw, EXTENT_ITEM_SIZE + DATA_REF_OFFSET, start);
-                        put_u32(raw, EXTENT_ITEM_SIZE + DATA_REF_COUNT, count);
-                    })?
+            let items = &mut self.trees[extent].items;
+            let at = items.partition_point(|(key, _)| *key < Key::first(bytenr, item_type::EXTENT_ITEM));
+            let old = items.get(at).filter(|(key, _)| key.objectid == bytenr && key.kind == item_type::EXTENT_ITEM);
+            // Ссылки нетронутых inode — из прежнего элемента.
+            let previous = match old {
+                Some((key, raw)) => {
+                    let refs = data_refs(raw)?;
+                    for &(owner, start, count) in refs.iter().filter(|r| !touched.contains_key(&r.0)) {
+                        push(&mut group, (owner, start, count))?;
+                    }
+                    if length.is_some_and(|known| known != key.offset) {
+                        return Err(Error::Corrupt);
+                    }
+                    length = Some(key.offset);
+                    Some((refs, u64_at(raw, EXTENT_ITEM_GENERATION)))
                 }
-                _ => return Err(Error::Unsupported),
+                None => None,
             };
-            push(&mut kept, (Key::new(bytenr, item_type::EXTENT_ITEM, length), record))?;
-            push(&mut live, (bytenr, length))?;
-        }
-        kept.sort_unstable_by_key(|(key, _)| *key);
-        self.trees[extent].items = kept;
-        self.trees[extent].dirty = true;
-
-        // Суммы: оставить только сектора живых экстентов и заново нарезать
-        // элементы по подряд идущим секторам.
-        let sector = u64::from(self.sectorsize);
-        let csum = self.tree_index(objectid::CSUM_TREE)?;
-        let mut sums = Vec::new();
-        for (key, raw) in &self.trees[csum].items {
-            if key.objectid != objectid::EXTENT_CSUM || key.kind != item_type::EXTENT_CSUM {
+            group.sort_unstable_by_key(|r| (r.0, r.1));
+            let Some(length) = length else { continue };
+            if group.is_empty() {
+                if previous.is_some() {
+                    items.remove(at);
+                    push(&mut freed, (bytenr, length))?;
+                }
                 continue;
             }
-            for index in 0..raw.len() / 4 {
-                let address = key.offset + index as u64 * sector;
-                let owner = live.partition_point(|&(start, _)| start <= address);
-                if owner > 0 && address < live[owner - 1].0 + live[owner - 1].1 {
-                    push(&mut sums, (address, u32_at(raw, index * 4)))?;
-                }
+            // Экстент и ссылки на него те же — элемент остаётся байт в байт.
+            // Порядок нескольких встроенных ссылок ядро сверяет по хешу,
+            // которого мы не считаем, так что чужой элемент с несколькими
+            // ссылками переносится только нетронутым.
+            if previous.as_ref().is_some_and(|(refs, _)| *refs == group) {
+                continue;
             }
-        }
-        let mut items = Vec::new();
-        let mut index = 0;
-        while index < sums.len() {
-            let first = sums[index].0;
-            let mut count = 1;
-            while index + count < sums.len()
-                && (count as u64) < CSUM_ITEM_SECTORS
-                && sums[index + count].0 == first + count as u64 * sector
-            {
-                count += 1;
+            if group.len() != 1 {
+                return Err(Error::Unsupported);
             }
-            let body = item(count * 4, |raw| {
-                for k in 0..count {
-                    put_u32(raw, k * 4, sums[index + k].1);
-                }
+            let item_generation = previous.as_ref().map_or(generation, |(_, made)| *made);
+            let (owner, start, count) = group[0];
+            let record = item(DATA_EXTENT_ITEM_SIZE, |raw| {
+                put_u64(raw, EXTENT_ITEM_REFS, u64::from(count));
+                put_u64(raw, EXTENT_ITEM_GENERATION, item_generation);
+                put_u64(raw, EXTENT_ITEM_FLAGS, EXTENT_FLAG_DATA);
+                raw[EXTENT_ITEM_SIZE] = item_type::EXTENT_DATA_REF;
+                put_u64(raw, EXTENT_ITEM_SIZE + DATA_REF_ROOT, objectid::FS_TREE);
+                put_u64(raw, EXTENT_ITEM_SIZE + DATA_REF_OBJECTID, owner);
+                put_u64(raw, EXTENT_ITEM_SIZE + DATA_REF_OFFSET, start);
+                put_u32(raw, EXTENT_ITEM_SIZE + DATA_REF_COUNT, count);
             })?;
-            push(&mut items, (Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, first), body))?;
-            index += count;
+            let key = Key::new(bytenr, item_type::EXTENT_ITEM, length);
+            if previous.is_some() {
+                items[at] = (key, record);
+            } else {
+                insert(items, key, record)?;
+            }
         }
-        self.trees[csum].items = items;
+        self.trees[extent].dirty = true;
+
+        // Суммы освобождённых экстентов — вырезать их сектора.
+        for (start, length) in freed {
+            self.remove_checksums(start, length)?;
+        }
+        Ok(())
+    }
+
+    /// Вырезать из дерева сумм сектора `[start, start + length)`: элементы,
+    /// задевающие отрезок, режутся на левый и правый остатки.
+    fn remove_checksums(&mut self, start: u64, length: u64) -> Result<()> {
+        let sector = u64::from(self.sectorsize);
+        let end = start + length;
+        let csum = self.tree_index(objectid::CSUM_TREE)?;
+        let items = &mut self.trees[csum].items;
+        // Элемент, начатый раньше `start`, может заходить в отрезок.
+        let probe = Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, start);
+        let mut at = items.partition_point(|(key, _)| *key < probe).saturating_sub(1);
+        let mut remainders = Vec::new();
+        while at < items.len() {
+            let (key, raw) = &items[at];
+            if key.objectid != objectid::EXTENT_CSUM || key.kind != item_type::EXTENT_CSUM {
+                if key.offset >= end || key.objectid > objectid::EXTENT_CSUM {
+                    break;
+                }
+                at += 1;
+                continue;
+            }
+            let item_start = key.offset;
+            let item_end = item_start + (raw.len() / 4) as u64 * sector;
+            if item_start >= end {
+                break;
+            }
+            if item_end <= start {
+                at += 1;
+                continue;
+            }
+            let (_, raw) = items.remove(at);
+            if item_start < start {
+                let keep = ((start - item_start) / sector) as usize * 4;
+                push(&mut remainders, (Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, item_start), copy(&raw[..keep])?))?;
+            }
+            if item_end > end {
+                let skip = ((end - item_start) / sector) as usize * 4;
+                push(&mut remainders, (Key::new(objectid::EXTENT_CSUM, item_type::EXTENT_CSUM, end), copy(&raw[skip..])?))?;
+            }
+        }
+        for (key, raw) in remainders {
+            insert(items, key, raw)?;
+        }
         self.trees[csum].dirty = true;
         Ok(())
     }
@@ -1399,6 +1490,7 @@ impl Writer {
     /// Разложить данные по экстентам начиная со смещения `file_offset` (кратного
     /// сектору); возвращает занятые байты.
     fn write_extents(&mut self, dev: &mut dyn BlockDevice, number: u64, file_offset: u64, data: &[u8]) -> Result<u64> {
+        self.touch(number)?;
         let sector = u64::from(self.sectorsize);
         let aligned = (data.len() as u64).div_ceil(sector) * sector;
         let generation = self.generation + 1;
