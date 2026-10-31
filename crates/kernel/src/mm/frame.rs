@@ -155,6 +155,10 @@ pub struct BitmapFrameAllocator {
     /// номером страницы в восьмибитном поле `SIPI`. На AArch64 оперативной
     /// памяти так низко нет вовсе, и поле остаётся пустым.
     low_frame: Option<PhysAddr>,
+    /// Второй такой кадр — корень таблиц, на которых просыпается процессор
+    /// (x86-64): `CR3` пишется ещё в 32-разрядном режиме, адрес обязан лежать
+    /// ниже 4 ГБ, а у ядра в верхней половине нижней памяти в таблицах нет.
+    low_root: Option<PhysAddr>,
     /// Счёт **лишних** владельцев кадра по номеру (фаза 71g: `fork` с
     /// копированием при записи) — `u16` на кадр, в кадрах самого пула.
     /// Заводится при первом разделении; ноль — у кадра один владелец, и
@@ -252,6 +256,7 @@ impl BitmapFrameAllocator {
             phys_offset: 0,
             cursor: 0,
             low_frame: None,
+            low_root: None,
             shares: None,
         };
 
@@ -303,6 +308,10 @@ impl BitmapFrameAllocator {
         if let Some(index) = (1..low_limit).rev().find(|&index| !this.is_used(index)) {
             this.reserve(index);
             this.low_frame = Some(frame_addr(index));
+        }
+        if let Some(index) = (1..low_limit).rev().find(|&index| !this.is_used(index)) {
+            this.reserve(index);
+            this.low_root = Some(frame_addr(index));
         }
 
         Ok(this)
@@ -358,6 +367,11 @@ impl BitmapFrameAllocator {
     /// Забрать кадр, отложенный под код запуска процессоров. Отдаётся один раз.
     pub fn take_low_frame(&mut self) -> Option<PhysAddr> {
         self.low_frame.take()
+    }
+
+    /// Забрать кадр под корень таблиц запуска процессоров. Отдаётся один раз.
+    pub fn take_low_root(&mut self) -> Option<PhysAddr> {
+        self.low_root.take()
     }
 
     /// Пометить свободными полные кадры, попадающие в `[start, start + len)`.
@@ -767,6 +781,11 @@ pub fn stats() -> FrameStats {
 /// один раз.
 pub fn take_low_frame() -> Option<PhysAddr> {
     with(BitmapFrameAllocator::take_low_frame).flatten()
+}
+
+/// Забрать второй кадр ниже 640 КиБ — под корень таблиц запуска процессоров.
+pub fn take_low_root() -> Option<PhysAddr> {
+    with(BitmapFrameAllocator::take_low_root).flatten()
 }
 
 /// Перевести глобальный аллокатор на прямое отображение физической памяти.

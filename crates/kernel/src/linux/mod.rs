@@ -1394,7 +1394,22 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
     const MAP_FIXED: usize = 0x10;
     const MAP_ANONYMOUS: usize = 0x20;
     const MAP_FIXED_NOREPLACE: usize = 0x10_0000;
-    let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+    let mut fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+    // Нижняя половина адресов — программам (ядро наверху, 31.10.2026):
+    // `MAP_FIXED_NOREPLACE` на занятое — `EEXIST`, как у Linux; подсказка без
+    // `MAP_FIXED` в нижней области исполняется, если место свободно (Wine и Go
+    // просят адреса так).
+    let bytes = len.div_ceil(4096).saturating_mul(4096);
+    if flags & MAP_FIXED == 0 && addr != 0 && len != 0 {
+        let free = crate::user::with_current(|program| program.low_range_free(addr, bytes)).unwrap_or(false);
+        if flags & MAP_FIXED_NOREPLACE != 0 {
+            if !free && addr < crate::user::WINDOW_BASE {
+                return -e::EEXIST;
+            }
+        } else if free {
+            fixed = true;
+        }
+    }
     let shared_flag = flags & MAP_SHARED != 0;
     let mut shared = None;
     let file = if flags & MAP_ANONYMOUS != 0 {

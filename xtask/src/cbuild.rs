@@ -698,6 +698,20 @@ pub fn builtins(arch: Arch) -> PathBuf {
 /// образе — `/compat/linux/bin/<имя>`.
 const LINUX_PROGRAMS: [&str; 1] = ["hello"];
 
+/// Общие флаги проверочных программ Linux.
+const LINUX_COMMON: [&str; 10] = [
+    "-Wl,-z,max-page-size=0x1000",
+    "--target=x86_64-unknown-linux-gnu",
+    "-O2",
+    "-Wall",
+    "-Werror",
+    "-ffreestanding",
+    "-fno-builtin",
+    "-fno-stack-protector",
+    "-nostdlib",
+    "-fuse-ld=lld",
+];
+
 /// Собрать проверочные программы Linux — только под x86-64 (слой Linux на
 /// AArch64 ещё не умеет отличать их вход от родного).
 ///
@@ -717,23 +731,20 @@ pub fn build_linux_programs(arch: Arch) -> Result<Vec<(String, PathBuf)>> {
         let source = libc_dir().join("linux").join(format!("{name}.c"));
         let output = work.join(name);
         let mut cmd = Command::new(&clang);
-        cmd.args([
-            "--target=x86_64-unknown-linux-gnu",
-            "-O2",
-            "-Wall",
-            "-Werror",
-            "-ffreestanding",
-            "-fno-builtin",
-            "-fno-stack-protector",
-            "-fPIE",
-            "-nostdlib",
-            "-static-pie",
-            "-fuse-ld=lld",
-            "-Wl,-z,max-page-size=0x1000",
-        ]);
+        cmd.args(LINUX_COMMON).args(["-fPIE", "-static-pie"]);
         cmd.arg(&source).arg("-o").arg(&output);
         run(cmd, &format!("clang (Linux) {}", source.display()))?;
         built.push((format!("compat/linux/bin/{name}"), output));
+
+        // Та же программа с фиксированным адресом `0x400000` — как Go и
+        // статические утилиты (`fsnotifier` Rider). Грузится только с ядром в
+        // верхней половине (31.10.2026): раньше эти адреса занимало оно.
+        let fixed = work.join(format!("{name}-fixed"));
+        let mut cmd = Command::new(&clang);
+        cmd.args(LINUX_COMMON).args(["-fno-PIE", "-static","-Wl,--image-base=0x400000"]);
+        cmd.arg(&source).arg("-o").arg(&fixed);
+        run(cmd, &format!("clang (Linux, fixed address) {}", source.display()))?;
+        built.push((format!("compat/linux/bin/{name}-fixed"), fixed));
     }
     Ok(built)
 }

@@ -625,6 +625,18 @@ pub fn init(fb: &Framebuffer) -> bool {
     true
 }
 
+/// Перевести консоль с identity-адреса буфера прошивки на прямое отображение —
+/// перед снятием identity (ядро в верхней половине, x86-64).
+#[cfg(target_arch = "x86_64")]
+pub fn move_to_direct_map() {
+    if let Some(console) = CONSOLE.lock().as_mut() {
+        let base = console.fb.base as usize;
+        if base < crate::mm::PHYS_MAP_BASE {
+            console.fb.base = (base + crate::mm::PHYS_MAP_BASE) as *mut u32;
+        }
+    }
+}
+
 /// Перевести консоль на новый фреймбуфер после смены режима (фаза С6a).
 ///
 /// Экран в это время принадлежит столу, поэтому ничего не рисуется. Нужна

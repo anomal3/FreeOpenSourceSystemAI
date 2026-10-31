@@ -331,10 +331,6 @@ unsafe fn put(page: *mut u8, at: usize, value: u64) {
 /// причины — свойства машины, а не сбои: запускать их на такой машине этим
 /// способом нельзя.
 pub fn prepare() -> Result<(), &'static str> {
-    let root = paging::kernel_root().as_u64();
-    if root >= 1 << 32 {
-        return Err("the kernel page tables lie above 4 GiB, beyond a 32-bit CR3");
-    }
     let start = (&raw const smp_trampoline_start) as usize;
     let size = (&raw const smp_trampoline_end) as usize - start;
     if size > TRAMPOLINE_STACK - 64 {
@@ -343,7 +339,19 @@ pub fn prepare() -> Result<(), &'static str> {
     let Some(frame) = crate::mm::frame::take_low_frame() else {
         return Err("no free page below 640 KiB for the start-up code");
     };
+    let Some(start_root) = crate::mm::frame::take_low_root() else {
+        return Err("no second free page below 640 KiB for the start-up tables");
+    };
     let base = frame.as_u64();
+    // Просыпается процессор на своём корне: верхняя половина ядра плюс одна
+    // страница трамплина на её же адресе. В таблицах ядра нижней памяти нет —
+    // ядро живёт в верхней половине, нижняя отдана программам. Первое, что
+    // делает [`secondary_entry`], — уходит на корень ядра.
+    // SAFETY: таблицы ядра активны; оба кадра отложены и принадлежат только нам.
+    if unsafe { paging::build_start_root(start_root, frame) }.is_err() {
+        return Err("the start-up page cannot be mapped");
+    }
+    let root = start_root.as_u64();
     let page = frame.to_direct_map().as_mut_ptr::<u8>();
 
     let (cr0, cr4): (u64, u64);
@@ -371,26 +379,6 @@ pub fn prepare() -> Result<(), &'static str> {
         put(page, offset(&raw const smp_trampoline_cr3), root);
         put(page, offset(&raw const smp_trampoline_cr4), cr4 & !CR4_PCIDE);
         put(page, offset(&raw const smp_trampoline_efer), efer);
-    }
-
-    // После включения страниц процессор выбирает следующую инструкцию по
-    // тождественному адресу страницы — а прямое отображение памяти запрещает
-    // исполнение. Страница получает право исполнения и теряет право записи:
-    // писать в неё дальше будет только загрузочный процессор, и только через
-    // прямое отображение.
-    //
-    // SAFETY: таблицы ядра активны; адрес — тождественное отображение кадра,
-    // который принадлежит только трамплину.
-    let mapped = unsafe {
-        paging::map_active(
-            VirtAddr::new(base as usize),
-            frame,
-            PAGE_SIZE,
-            PageFlags::READ | PageFlags::EXEC,
-        )
-    };
-    if mapped.is_err() {
-        return Err("the start-up page cannot be made executable");
     }
 
     TRAMPOLINE.store(base, Ordering::Release);
@@ -470,6 +458,10 @@ fn delay_ms(ms: u64) {
 /// ни одного лока, включая лок вывода), потом прерывания, потом векторные
 /// расширения.
 extern "sysv64" fn secondary_entry(index: usize) -> ! {
+    // С корня запуска (нижняя страница трамплина плюс верхняя половина) — на
+    // корень ядра: он содержит всё то же наверху, а трамплин больше не нужен.
+    // SAFETY: таблицы ядра построены и активны на загрузочном процессоре.
+    unsafe { paging::activate_kernel_space() };
     // SAFETY: загрузочный подготовил TSS этого процессора до запуска, и это
     // первый код на нём; ни одного лока до этой строки не взято.
     unsafe { gdt::load_secondary(index) };

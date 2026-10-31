@@ -195,6 +195,241 @@ pub fn kernel_root() -> PhysAddr {
     }
 }
 
+/// На сколько ядро сдвинулось от адреса загрузки: ноль до [`move_kernel_high`],
+/// [`PHYS_MAP_BASE`] после — образ исполняется из прямого отображения.
+static KERNEL_SHIFT: AtomicU64 = AtomicU64::new(0);
+
+/// См. [`KERNEL_SHIFT`].
+#[must_use]
+pub fn kernel_shift() -> usize {
+    KERNEL_SHIFT.load(Ordering::Relaxed) as usize
+}
+
+unsafe extern "C" {
+    /// Заголовок ELF самого ядра: `rust-lld` кладёт его в начало первого
+    /// `PT_LOAD` и определяет этот символ, если на него сослаться.
+    static __ehdr_start: u8;
+}
+
+const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const DT_NULL: i64 = 0;
+const DT_RELA: i64 = 7;
+const DT_RELASZ: i64 = 8;
+const R_X86_64_RELATIVE: u32 = 8;
+
+/// Переезд ядра в верхнюю половину — стадия A (31.10.2026).
+///
+/// Загрузчик положил PIE по физическому адресу и поправил `.rela.dyn` под
+/// него; исполняться так ядро может только пока жива identity-копия нижней
+/// памяти, а она занимает адреса, которые нужны программам Linux и Wine
+/// (`0x400000`, всё ниже 4 ГБ). Образ уже отображён второй раз — в прямом
+/// отображении, с теми же правами ([`map_kernel_image`]); здесь абсолютные
+/// адреса образа сдвигаются туда же, а продолжение [`switch_stack`] прыгает
+/// уже наверх.
+///
+/// Сдвигается **значение**, если оно указывает внутрь образа, а не пишется
+/// заново `база + addend`: до этой точки ядро уже успело записать в часть
+/// таких мест свои значения (указатели, заменённые при запуске), и вернуть их
+/// к исходным значило бы тихо откатить начальную настройку. Значение вне
+/// образа — чужое (куча, ноль) и остаётся как есть.
+///
+/// Identity после этого ещё живо: указатели, полученные до переезда (адреса
+/// возврата на старом стеке, сохранённые в данных до этой точки), остаются
+/// рабочими. Снимает его стадия C.
+///
+/// # Safety
+///
+/// Таблицы ядра активны (образ виден в прямом отображении), прерывания ещё не
+/// настроены, второй процессор не запущен.
+pub unsafe fn move_kernel_high() {
+    let shift = PHYS_MAP_BASE as u64;
+    // Символ определён компоновщиком; берётся только адрес.
+    //
+    // `black_box` обязателен: адрес приходит из GOT, а её запись — сама место
+    // релокации. Без него компилятор перечитывает адрес из GOT посреди цикла,
+    // получает уже сдвинутый и сужает проверку «внутри образа» до пустой.
+    let image = core::hint::black_box(&raw const __ehdr_start as u64);
+    // SAFETY: заголовок ELF и таблица программных заголовков лежат в начале
+    // первого `PT_LOAD`, загруженного загрузчиком; поля читаются по
+    // смещениям ELF64.
+    let (phoff, phnum) = unsafe {
+        (
+            ptr::read_unaligned((image + 0x20) as *const u64),
+            ptr::read_unaligned((image + 0x38) as *const u16),
+        )
+    };
+    let mut end = image;
+    let mut dynamic = 0u64;
+    for index in 0..u64::from(phnum) {
+        let header = image + phoff + index * 56;
+        // SAFETY: см. выше, `phnum` записей по 56 байт.
+        let (kind, vaddr, memsz) = unsafe {
+            (
+                ptr::read_unaligned(header as *const u32),
+                ptr::read_unaligned((header + 16) as *const u64),
+                ptr::read_unaligned((header + 40) as *const u64),
+            )
+        };
+        match kind {
+            PT_LOAD => end = end.max(image + vaddr + memsz),
+            PT_DYNAMIC => dynamic = image + vaddr,
+            _ => {}
+        }
+    }
+    if dynamic == 0 {
+        crate::kprintln!("paging: the kernel has no PT_DYNAMIC; staying where loaded");
+        return;
+    }
+
+    let (mut rela, mut relasz) = (0u64, 0u64);
+    let mut entry = dynamic;
+    loop {
+        // SAFETY: `.dynamic` загружен и кончается записью `DT_NULL`.
+        let (tag, value) = unsafe {
+            (ptr::read(entry as *const i64), ptr::read((entry + 8) as *const u64))
+        };
+        match tag {
+            DT_NULL => break,
+            DT_RELA => rela = image + value,
+            DT_RELASZ => relasz = value,
+            _ => {}
+        }
+        entry += 16;
+    }
+
+    // Часть мест лежит в `.data.rel.ro`, которое уже только на чтение: на время
+    // правки снимаем `CR0.WP`, как и загрузчик правил их до разметки.
+    let cr0 = read_cr0();
+    // SAFETY: прерываний и других процессоров ещё нет — окно без защиты от
+    // записи никто не застанет.
+    unsafe { write_cr0(cr0 & !CR0_WP) };
+    let mut moved = 0usize;
+    let mut place = rela;
+    while place < rela + relasz {
+        // SAFETY: таблица `.rela.dyn` загружена, записи по 24 байта.
+        let (offset, info) =
+            unsafe { (ptr::read(place as *const u64), ptr::read((place + 8) as *const u64)) };
+        place += 24;
+        if info as u32 != R_X86_64_RELATIVE {
+            continue;
+        }
+        let slot = (image + offset) as *mut u64;
+        // SAFETY: место релокации лежит внутри образа — его правил загрузчик.
+        unsafe {
+            let value = ptr::read_volatile(slot);
+            if (image..=end).contains(&value) {
+                ptr::write_volatile(slot, value + shift);
+                moved += 1;
+            }
+        }
+    }
+    // SAFETY: возвращаем ровно прежнее значение.
+    unsafe { write_cr0(cr0) };
+    KERNEL_SHIFT.store(shift, Ordering::Relaxed);
+    crate::kprintln!(
+        "  kernel      : {moved} addresses moved to {:#018x} (upper half)",
+        image + shift
+    );
+}
+
+/// Снять identity-копию нижней памяти — стадия C переезда (31.10.2026).
+///
+/// Зовётся, когда ядро уже исполняется наверху, на своём стеке, и всё, что
+/// шло к памяти по физическому адресу (`BootInfo`, кадровый буфер, initrd),
+/// переведено на прямое отображение. С этого момента нижняя половина в
+/// таблицах ядра пуста: обращение туда из ядра — честный отказ страницы, а
+/// адреса свободны для программ. Таблицы identity возвращаются в пул (сами
+/// страницы — нет: это та же память, что видна через прямое отображение).
+///
+/// # Safety
+///
+/// Ядро исполняется в верхней половине, других процессоров нет, и ни один
+/// живой указатель не смотрит в нижнюю половину.
+pub unsafe fn drop_identity() {
+    let root = kernel_root();
+    let mut tables = 0usize;
+    crate::mm::frame::with(|frames| {
+        for index in 0..ENTRIES_PER_TABLE / 2 {
+            let slot = table_entry(root, index);
+            // SAFETY: корень — целый кадр в прямом отображении.
+            let entry = unsafe { ptr::read_volatile(slot) };
+            if !entry.is_present() {
+                continue;
+            }
+            // SAFETY: запись снимается до освобождения её таблиц.
+            unsafe { ptr::write_volatile(slot, Entry(0)) };
+            // SAFETY: поддерево построено `map` этого модуля только под
+            // identity и больше нигде не разделяется.
+            unsafe { free_tables(entry.addr(), LEVEL_PML4 - 1, frames, &mut tables) };
+        }
+    });
+    // Перезапись CR3 сбрасывает все трансляции снятой половины.
+    // SAFETY: корень ядра отображает исполняющийся код и стек наверху.
+    unsafe { write_cr3(root) };
+    crate::kprintln!(
+        "  kernel      : identity map dropped ({} KiB of tables freed), lower half free",
+        tables * PAGE_SIZE / 1024
+    );
+}
+
+/// Вернуть в пул таблицу уровня `level` и таблицы под ней, но не страницы.
+///
+/// # Safety
+///
+/// Таблица никем больше не используется.
+unsafe fn free_tables(table: PhysAddr, level: usize, alloc: &mut impl FrameAllocator, tables: &mut usize) {
+    if level > LEVEL_PT {
+        for index in 0..ENTRIES_PER_TABLE {
+            // SAFETY: таблица — целый кадр в прямом отображении.
+            let entry = unsafe { ptr::read_volatile(table_entry(table, index)) };
+            if entry.is_present() && !entry.is_huge() {
+                // SAFETY: см. контракт функции.
+                unsafe { free_tables(entry.addr(), level - 1, alloc, tables) };
+            }
+        }
+    }
+    // SAFETY: см. контракт функции.
+    unsafe { alloc.free(table) };
+    *tables += 1;
+}
+
+/// Корень таблиц, на котором просыпаются остальные процессоры.
+///
+/// Верхняя половина — записи корня ядра (общие таблицы под ними), нижняя —
+/// одна страница `trampoline` на её же адресе, только чтение и исполнение:
+/// процессор включает страницы, стоя на ней. Корень ядра нижней памяти не
+/// содержит, поэтому трамплину нужен свой.
+///
+/// # Safety
+///
+/// Таблицы ядра активны; `root` и `trampoline` — кадры, принадлежащие
+/// вызывающему.
+pub unsafe fn build_start_root(root: PhysAddr, trampoline: PhysAddr) -> Result<(), MapError> {
+    let kernel = kernel_root();
+    for index in 0..ENTRIES_PER_TABLE {
+        let entry = if index >= ENTRIES_PER_TABLE / 2 {
+            // SAFETY: корень ядра — целый кадр в прямом отображении.
+            unsafe { ptr::read_volatile(table_entry(kernel, index)) }
+        } else {
+            Entry(0)
+        };
+        // SAFETY: кадр корня принадлежит вызывающему.
+        unsafe { ptr::write_volatile(table_entry(root, index), entry) };
+    }
+    // SAFETY: см. контракт; дерево ещё нигде не активно.
+    let mut space = unsafe { space_at(root) };
+    crate::mm::frame::with(|frames| unsafe {
+        space.map(
+            VirtAddr::new(trampoline.as_u64() as usize),
+            trampoline,
+            PageFlags::READ | PageFlags::EXEC,
+            frames,
+        )
+    })
+    .ok_or(MapError::OutOfFrames)?
+}
+
 /// Нижняя граница стека ядра — самый младший адрес, который ещё отображён.
 pub const KERNEL_STACK_BOTTOM: usize = STACK_TOP - STACK_SIZE;
 
@@ -642,7 +877,10 @@ pub unsafe fn new_user_space(
         // Запись окна обнуляется, а не копируется: в дереве ядра её быть не
         // должно вовсе, но если она там почему-то окажется, программа получила
         // бы чужую память вместо своей — и обнаружилось бы это не сразу.
-        let entry = if index == window_slot {
+        // Вся нижняя половина — программе (ядро в верхней половине): даже
+        // если у ядра там что-то окажется, `free_user_space` не должен
+        // освободить его таблицы как программные.
+        let entry = if index == window_slot || index < ENTRIES_PER_TABLE / 2 {
             Entry(0)
         } else {
             // SAFETY: обе таблицы — целые кадры, доступные через прямое
@@ -875,6 +1113,21 @@ pub unsafe fn free_user_space(
 ) -> (usize, usize) {
     let mut tables = 0usize;
     let mut pages = 0usize;
+
+    // Ядро в верхней половине (31.10.2026): вся нижняя половина корня —
+    // программы, не только окно (нижняя область программ Linux под ним).
+    // У ядра там записей нет, общих таблиц под ними тоже.
+    for index in (0..ENTRIES_PER_TABLE / 2).filter(|&index| index != window_slot) {
+        let slot = table_entry(root, index);
+        // SAFETY: корень — целый кадр в прямом отображении.
+        let entry = unsafe { ptr::read_volatile(slot) };
+        if entry.is_present() && !entry.is_huge() {
+            // SAFETY: запись создана `map` для этой программы.
+            unsafe { free_subtree(entry.addr(), LEVEL_PML4 - 1, alloc, &mut tables, &mut pages) };
+        }
+        // SAFETY: тот же слот того же кадра.
+        unsafe { ptr::write_volatile(slot, Entry(0)) };
+    }
 
     if window_slot < ENTRIES_PER_TABLE {
         let slot = table_entry(root, window_slot);
@@ -1435,6 +1688,9 @@ fn map_kernel_image(
         // уточняет права, а не переносит страницу.
         unsafe {
             space.map_range(VirtAddr::new(base as usize), PhysAddr::new(base), len, flags, alloc)?;
+            // Тот же сегмент с теми же правами — в прямом отображении: сюда ядро
+            // переезжает сразу после включения таблиц (см. [`move_kernel_high`]).
+            space.map_range(PhysAddr::new(base).to_direct_map(), PhysAddr::new(base), len, flags, alloc)?;
         }
         crate::kprintln!("paging: kernel segment {base:#018x}..{end:#018x} {flags:?}");
     }
@@ -1465,6 +1721,19 @@ fn map_framebuffer(
             PageFlags::READ | PageFlags::WRITE | PageFlags::DEVICE,
             alloc,
         )?;
+        // И в прямом отображении: identity снимается сразу после переезда ядра
+        // наверх, а консоль и стол переходят на этот адрес. Буфер обычно не
+        // описан картой памяти (это окно устройства), и сам он туда не попал.
+        // С объединением записей — как его отображают драйверы экрана.
+        if end <= PHYS_MAP_LIMIT {
+            space.map_range(
+                PhysAddr::new(base).to_direct_map(),
+                PhysAddr::new(base),
+                (end - base) as usize,
+                PageFlags::READ | PageFlags::WRITE | PageFlags::WRITE_COMBINE,
+                alloc,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1582,7 +1851,9 @@ pub unsafe fn switch_stack<T>(
             "push 0",         // фиктивный адрес возврата + выравнивание под ABI
             "jmp {entry}",
             top = in(reg) stack_top.as_usize(),
-            entry = in(reg) entry as usize,
+            // Адрес продолжения взят относительно `rip`, то есть ещё по адресу
+            // загрузки; после [`move_kernel_high`] прыжок уводит ядро наверх.
+            entry = in(reg) entry as usize + kernel_shift(),
             in("rdi") arg,    // первый аргумент System V
             options(noreturn),
         )

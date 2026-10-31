@@ -263,6 +263,17 @@ impl<'a> Image<'a> {
                     let size = u64(bytes, at + 32) as usize;
                     linux |= has_gnu_abi_tag(bytes, offset, size);
                 }
+                // Программа с фиксированным адресом ниже окна программ —
+                // статическая программа Linux (`0x400000`: Go, `fsnotifier`
+                // Rider), даже без заметки ABI: родные собраны под окно
+                // (`user.ld`). Ядро в верхней половине — нижние адреса ей
+                // доступны (31.10.2026).
+                PT_LOAD if cfg!(target_arch = "x86_64")
+                    && kind == TYPE_EXEC
+                    && (u64(bytes, at + 16) as usize) < super::WINDOW_BASE =>
+                {
+                    linux = true;
+                }
                 _ => {}
             }
         }

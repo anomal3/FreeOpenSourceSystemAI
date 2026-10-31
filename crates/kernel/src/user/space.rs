@@ -128,8 +128,9 @@ impl Space {
     pub fn duplicate(&mut self, class: &dyn Fn(usize) -> Dup) -> Result<(Self, bool), MapError> {
         let mut copy = Self::new()?;
         let mut downgraded = false;
+        // С нижней области программ Linux ([`super::LOW_BASE`]) до конца окна.
         let end = super::WINDOW_BASE + (1usize << 39);
-        let mut virt = super::WINDOW_BASE;
+        let mut virt = super::LOW_BASE;
         while virt < end {
             let at = VirtAddr::new(virt);
             let Some((phys, flags)) = arch::translate(self.root, at) else {

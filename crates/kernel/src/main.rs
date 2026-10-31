@@ -288,6 +288,14 @@ fn take_over_memory(info: &BootInfo) {
     unsafe { space.activate() };
     kprintln!("  page tables : active, W^X applied to the kernel image");
 
+    // Ядро — в верхнюю половину: адреса образа сдвигаются в прямое отображение,
+    // прыжок наверх делает переключение стека ниже (стадия A, x86-64).
+    // SAFETY: таблицы активны, прерываний и других процессоров ещё нет.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        arch::move_kernel_high()
+    };
+
     probe_framebuffer(info);
 
     // Физическая память теперь доступна и через прямое отображение; аллокатор
@@ -367,7 +375,26 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     // заново по исходному физическому адресу — он по-прежнему отображён.
     // SAFETY: адрес прошёл полную проверку в `validate` до переключения стека,
     // а память под ним отображена как `BootloaderReclaimable` и пока цела.
-    let info = unsafe { ptr::read(boot_info as *const BootInfo) };
+    //
+    // На x86-64 — через прямое отображение: identity снимается ниже.
+    #[cfg(target_arch = "x86_64")]
+    let boot_info = boot_info + mm::PHYS_MAP_BASE;
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+    let mut info = unsafe { ptr::read(boot_info as *const BootInfo) };
+
+    // Ядро в верхней половине (x86-64): всё, что смотрело в память по
+    // физическому адресу, — на прямое отображение, и identity долой. Нижняя
+    // половина адресов с этого места принадлежит программам.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if info.framebuffer.is_present() {
+            info.framebuffer.base += mm::PHYS_MAP_BASE as u64;
+        }
+        console::move_to_direct_map();
+        // SAFETY: ядро исполняется наверху на своём стеке; других процессоров
+        // нет; указатели на физические адреса переведены строками выше.
+        unsafe { arch::drop_identity() };
+    }
     // Запоминается сразу: метку читает оболочка, а до неё ещё вся загрузка, и
     // класть такое «где-нибудь по дороге» — способ однажды прочитать ноль.
     UNATTENDED.store(info.unattended(), core::sync::atomic::Ordering::Relaxed);
@@ -376,6 +403,9 @@ extern "C" fn resume_on_kernel_stack(boot_info: usize) -> ! {
     kprintln!("---- running on the kernel's own stack --------------------------");
     kprintln!("  stack top   : {:#018x}", mm::STACK_TOP);
     kprintln!("  guard page  : {:#018x} (unmapped)", mm::STACK_TOP - mm::STACK_SIZE - mm::PAGE_SIZE);
+    // Адрес функции берётся относительно `rip`: по нему видно, откуда ядро
+    // исполняется — после переезда это верхняя половина.
+    kprintln!("  code        : {:#018x}", resume_on_kernel_stack as *const () as usize);
 
     verify_heap();
 

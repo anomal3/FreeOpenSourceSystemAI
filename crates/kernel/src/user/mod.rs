@@ -101,6 +101,27 @@ use space::Space;
 /// перестало бы быть обходом одного поддерева (см. [`space::WINDOW_SLOT`]).
 pub const WINDOW_BASE: usize = 0x0000_0080_0000_0000;
 
+/// Нижняя граница памяти программы Linux (x86-64, 31.10.2026).
+///
+/// Ядро живёт в верхней половине, и нижние 512 ГиБ под окном программ свободны:
+/// статическая программа Linux с фиксированным адресом (`0x400000`), `mmap` с
+/// `MAP_FIXED` по низким адресам (а дальше — Wine: `0x400000`, `0x140000000`,
+/// всё ниже 4 ГБ) ложатся сюда. Первые 64 КиБ не выдаются никогда — как
+/// `vm.mmap_min_addr` у Linux: разыменование нуля остаётся отказом. Родная
+/// раскладка (окно, стек, память по запросу, страница процесса) не меняется.
+/// На AArch64 нижней области нет: граница совпадает с окном.
+#[cfg(target_arch = "x86_64")]
+pub const LOW_BASE: usize = 0x1_0000;
+#[cfg(not(target_arch = "x86_64"))]
+pub const LOW_BASE: usize = WINDOW_BASE;
+
+/// Куда разрешено лечь сегментам образа: окно образа, а программе Linux с
+/// фиксированным адресом — и всё ниже него, от [`LOW_BASE`].
+fn image_window(image: &elf::Image<'_>) -> (usize, usize) {
+    let low = if image.linux && !image.position_independent { LOW_BASE } else { WINDOW_BASE };
+    (low, WINDOW_BASE + IMAGE_LIMIT_BYTES)
+}
+
 /// Сколько адресов отведено под образ программы.
 ///
 /// Гибибайт — и это предел адресов, а не памяти. С фазы 54 образ **не
@@ -1166,6 +1187,21 @@ impl Program {
             // все (счётчик владельцев, фаза 71g).
             unsafe { self.space.unmap_range(VirtAddr::new(from), pages, shared) };
         }
+    }
+
+    /// Свободен ли `[addr, addr + bytes)` в нижней области программ Linux
+    /// ([`LOW_BASE`]..окно): для подсказки адреса `mmap` и
+    /// `MAP_FIXED_NOREPLACE`. В нижней области всё занятое записано в таблице
+    /// областей — стек и страница процесса живут в окне.
+    pub(crate) fn low_range_free(&self, addr: usize, bytes: usize) -> bool {
+        let Some(end) = addr.checked_add(bytes) else {
+            return false;
+        };
+        if addr % PAGE_SIZE != 0 || addr < LOW_BASE || end > WINDOW_BASE {
+            return false;
+        }
+        let first = self.mappings.partition_point(|region| region.end() <= addr);
+        self.mappings.get(first).is_none_or(|region| region.base >= end)
     }
 
     /// Снять всё, что лежит в `[addr, addr + bytes)`, — для `MAP_FIXED`.
@@ -3289,14 +3325,14 @@ fn map_segments(
         flags: PageFlags,
     }
     let mut segs: Vec<Seg> = Vec::new();
-    for segment in image.segments((WINDOW_BASE, WINDOW_BASE + IMAGE_LIMIT_BYTES), bias) {
+    for segment in image.segments(image_window(image), bias) {
         let segment = segment.map_err(Error::Elf)?;
         let flags = PageFlags::from_segment_flags(segment.flags).union(PageFlags::USER);
         // Проверка до первой записи в таблицу, а не в отказе страницы:
         // отказать на середине запуска значит оставить программу без половины
         // сегментов, о которых уже никто не спрашивал.
         if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) {
-            return Err(Error::WriteExecute((segment.vaddr - WINDOW_BASE) / PAGE_SIZE));
+            return Err(Error::WriteExecute(segment.vaddr.wrapping_sub(WINDOW_BASE) / PAGE_SIZE));
         }
         if segs.len() >= MAX_IMAGE_SEGMENTS {
             return Err(Error::TooManySegments);
@@ -3350,7 +3386,7 @@ fn map_segments(
             flags = flags.union(seg.flags);
         }
         if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) {
-            return Err(Error::WriteExecute(page - WINDOW_BASE / PAGE_SIZE));
+            return Err(Error::WriteExecute(page.wrapping_sub(WINDOW_BASE / PAGE_SIZE)));
         }
         let frame = take_frame()?;
         // SAFETY: кадр только что выдан под эту программу, обнулён по договору
@@ -3458,7 +3494,7 @@ fn load(
         return Err(Error::Elf(elf::ElfError::Unsupported));
     }
     let bias = if image.position_independent { image_bias(&image)? } else { 0 };
-    let tls = image.tls((WINDOW_BASE, WINDOW_BASE + IMAGE_LIMIT_BYTES), bias).map_err(Error::Elf)?;
+    let tls = image.tls(image_window(&image), bias).map_err(Error::Elf)?;
 
     let mut mappings = map_segments(space, node, &image, bias)?;
 
@@ -3489,7 +3525,13 @@ fn load(
         let (_, program_high) = image.span().map_err(Error::Elf)?;
         let (low, high) = interp.span().map_err(Error::Elf)?;
         let at = (program_high + bias).next_multiple_of(PAGE_SIZE) + PAGE_SIZE;
-        let interp_bias = at.checked_sub(low & !(PAGE_SIZE - 1)).ok_or(Error::Elf(elf::ElfError::OutOfWindow))?;
+        // Программа ниже окна (фиксированный адрес) — загрузчик в окно, на
+        // случайное место, как у Linux он ложится высоко: низ остаётся её.
+        let interp_bias = if program_high + bias <= WINDOW_BASE {
+            image_bias(&interp)?
+        } else {
+            at.checked_sub(low & !(PAGE_SIZE - 1)).ok_or(Error::Elf(elf::ElfError::OutOfWindow))?
+        };
         if high + interp_bias > WINDOW_BASE + IMAGE_LIMIT_BYTES {
             return Err(Error::Elf(elf::ElfError::OutOfWindow));
         }
@@ -5030,12 +5072,14 @@ pub fn owns(ptr: usize, len: usize) -> bool {
         return false;
     };
     let in_image = ptr >= WINDOW_BASE && end <= WINDOW_BASE + IMAGE_LIMIT_BYTES;
+    // Нижняя область программ Linux ([`LOW_BASE`]); на AArch64 она пуста.
+    let in_low = ptr >= LOW_BASE && end <= WINDOW_BASE;
     // Вся полоса, куда стек может встать при любом сдвиге, — по той же причине,
     // по которой ниже названа вся область памяти по запросу.
     let in_stack = ptr >= STACK_LOWEST && end <= STACK_TOP;
     let in_mmap = (ptr >= MMAP_BASE && end <= MMAP_BASE + MMAP_LOW_BYTES)
         || (ptr >= MMAP_HIGH_BASE && end <= MMAP_HIGH_END);
-    in_image || in_stack || in_mmap
+    in_image || in_stack || in_mmap || in_low
 }
 
 

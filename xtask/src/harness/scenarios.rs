@@ -6223,6 +6223,15 @@ pub const ALL: &[Scenario] = &[
             Step::Await("linux: ok a missing file is ENOENT", 15_000),
             Step::Await("linux: 0 failed", 15_000),
             Step::Await("exited with code 0", 15_000),
+            // Та же программа с фиксированным адресом `0x400000` — в нижней
+            // половине, которую ядро отдало программам (31.10.2026).
+            Step::Line("run /compat/linux/bin/hello-fixed one two"),
+            Step::Await("linux: hello from a Linux program, argc 3", 30_000),
+            Step::Await("linux: ok AT_PHDR points at the program headers", 15_000),
+            Step::Await("linux: ok brk grows by a megabyte", 15_000),
+            Step::Await("linux: ok anonymous mmap and munmap", 15_000),
+            Step::Await("linux: 0 failed", 15_000),
+            Step::Await("exited with code 0", 15_000),
             Step::Absent("linux: FAILED"),
             Step::Absent("is not implemented"),
             Step::Absent("user        : killed by"),

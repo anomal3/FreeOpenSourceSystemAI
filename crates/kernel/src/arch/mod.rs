@@ -129,6 +129,9 @@ pub use x86_64::{port_read32, port_write32, vbe_read, vbe_write};
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::map_active;
+/// Ядро — в верхнюю половину адресов (только x86-64, см. `paging`).
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::paging::{drop_identity, move_kernel_high};
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::paging::map_active;
 
