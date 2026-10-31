@@ -1996,6 +1996,40 @@ impl Program {
         true
     }
 
+    /// Вслед за отказом в ленивой безымянной памяти — до `count - 1` следующих
+    /// отсутствующих страниц той же области, кадрами с нулями (30.10).
+    ///
+    /// Rider при запуске трогает кучи JVM и .NET страница за страницей: 403
+    /// тыс. отказов по 54 мкс, и все — через замок одной программы, за которым
+    /// стоят сотня её потоков. Linux тут выдаёт память крупными страницами;
+    /// здесь — окрестность в 32 КиБ: отказов до восьми раз меньше, лишней
+    /// памяти — не больше 28 КиБ на место касания. Останавливается на первой
+    /// уже отображённой странице и на краю области; память кода не трогает.
+    fn fault_around_anon(&mut self, page_addr: usize, flags: PageFlags, count: usize) {
+        let Some(index) = self.region_at(page_addr) else { return };
+        let region = &self.mappings[index];
+        let Source::Anonymous(anon) = &region.source else { return };
+        if !anon.lazy || anon.jit {
+            return;
+        }
+        let end = region.base + region.pages * PAGE_SIZE;
+        let root = self.space.root();
+        for k in 1..count {
+            let addr = page_addr + k * PAGE_SIZE;
+            if addr >= end || arch::translate(root, VirtAddr::new(addr)).is_some() {
+                break;
+            }
+            let Some(frame) = take_frame_reserved() else { break };
+            // SAFETY: кадр только что выдан (с нулями) и принадлежит нам; адрес
+            // — в той же области этой программы, и страницы под ним нет
+            // (проверено строкой выше под тем же замком).
+            if unsafe { self.space.map(VirtAddr::new(addr), frame, flags) }.is_err() {
+                return_frame(frame);
+                break;
+            }
+        }
+    }
+
     /// Вторая половина отказа в разделяемой памяти (фаза 71e): кадр — объекта,
     /// отображается чужим (без счёта своих страниц и без возврата при снятии).
     fn fault_commit_shared(&mut self, page_addr: usize, frame: PhysAddr, flags: PageFlags) -> Commit {
@@ -5319,9 +5353,17 @@ fn fault_in_inner(addr: usize, access: Touch, present: bool) -> bool {
         crate::mm::pagecache::keep(file, plan.offset, plan.want, frame);
     }
 
-    // Шаг третий, снова под замком: отобразить и учесть.
-    let commit = with_current_shared(|program, shared| program.fault_commit(page_addr, frame, &plan, shared))
-        .unwrap_or(Commit::Failed);
+    // Шаг третий, снова под замком: отобразить и учесть. Безымянной памяти —
+    // и соседние страницы (см. [`Program::fault_around_anon`]).
+    let anonymous = plan.node.is_none() && plan.want == 0 && plan.shared.is_none();
+    let commit = with_current_shared(|program, shared| {
+        let commit = program.fault_commit(page_addr, frame, &plan, shared);
+        if anonymous && matches!(commit, Commit::Mapped) {
+            program.fault_around_anon(page_addr, plan.flags, 8);
+        }
+        commit
+    })
+    .unwrap_or(Commit::Failed);
     match commit {
         Commit::Mapped => true,
         Commit::Raced => {
