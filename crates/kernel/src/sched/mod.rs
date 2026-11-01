@@ -136,7 +136,15 @@ use crate::sync::SpinLock;
 /// не хватало на первую же страницу (`pthread_create` — `EAGAIN`). Стек ядра
 /// задаче выдаётся при запуске, поэтому пустые места стоят только записи в
 /// таблицах по слотам.
-pub const MAX_TASKS: usize = 256 + MAX_CPUS;
+///
+/// Тысяча двадцать четыре с 01.11: Rider (Java и .NET) сам держит около
+/// двухсот потоков, и рядом с ним каждый процесс вкладки Chromium получал
+/// `EAGAIN` на `pthread_create`, выходил с кодом 191 — и браузер закрывался
+/// на первой же странице. Пустой слот — восемь байт в таблице задач и около
+/// восьмисот в журнале вызовов (`linux::recent`); обходы планировщика идут
+/// только до отметки занятых слотов (`Scheduler::high`): по всей тысяче
+/// отладочное ядро не успевало (сценарий `smp`).
+pub const MAX_TASKS: usize = 1024 + MAX_CPUS;
 
 /// Длина кванта в тиках таймера: 10 мс.
 ///
@@ -246,6 +254,10 @@ struct Scheduler {
     /// Откуда брать следующий идентификатор. Не совпадает с номером слота:
     /// слоты переиспользуются, идентификаторы — нет.
     next_id: u32,
+    /// Слотов от начала таблицы, хоть раз занятых: дальше пусто, и обходы
+    /// (выбор следующей задачи на каждом переключении, будильники на каждом
+    /// тике) идут только до этой отметки, а не по всем [`MAX_TASKS`].
+    high: usize,
     /// Запущено ли планирование. До [`run`] переключаться не на что и не с чего.
     running: bool,
 }
@@ -278,7 +290,7 @@ pub fn lock_watch_task() {
             alloc::vec::Vec::new();
         {
             let sched = SCHED.lock();
-            for (slot, entry) in sched.tasks.iter().enumerate() {
+            for (slot, entry) in sched.slots().iter().enumerate() {
                 let Some(task) = entry else { continue };
                 let TaskState::Blocked(Wait::Lock(address)) = task.state else { continue };
                 let since = LOCK_SINCE[slot].load(Ordering::Relaxed);
@@ -352,7 +364,7 @@ impl Scheduler {
             cpus[index].current = index;
             index += 1;
         }
-        Self { tasks: [const { None }; MAX_TASKS], cpus, next_id: 1, running: false }
+        Self { tasks: [const { None }; MAX_TASKS], cpus, next_id: 1, high: MAX_CPUS, running: false }
     }
 
     /// Слот задачи, исполняющейся на процессоре вызывающего.
@@ -369,6 +381,15 @@ impl Scheduler {
     /// никем не исполняется. Второй проход появился вместе с программами-
     /// задачами: каждая команда `run` создаёт новую, и таблица кончилась бы на
     /// тридцать второй программе.
+    fn slots(&self) -> &[Option<Box<Task>>] {
+        &self.tasks[..self.high]
+    }
+
+    fn slots_mut(&mut self) -> &mut [Option<Box<Task>>] {
+        let high = self.high;
+        &mut self.tasks[..high]
+    }
+
     fn free_slot(&self) -> Option<usize> {
         if let Some(empty) = (MAX_CPUS..MAX_TASKS).find(|&i| self.tasks[i].is_none()) {
             return Some(empty);
@@ -399,8 +420,8 @@ impl Scheduler {
         // Сначала разбуженные вводом: указатель и стол не должны ждать в
         // общей очереди за десятками потоков Chromium (24.10: мышь замирала на
         // секунды, пока он запускался).
-        for step in 1..MAX_TASKS {
-            let slot = (current + step) % MAX_TASKS;
+        for step in 1..self.high {
+            let slot = (current + step) % self.high;
             if is_idle_slot(slot) {
                 continue;
             }
@@ -426,8 +447,8 @@ impl Scheduler {
             if rank == Rank::Desktop && !waiting {
                 break;
             }
-            for step in 1..MAX_TASKS {
-                let slot = (current + step) % MAX_TASKS;
+            for step in 1..self.high {
+                let slot = (current + step) % self.high;
                 if is_idle_slot(slot) {
                     continue;
                 }
@@ -438,8 +459,8 @@ impl Scheduler {
                 }
             }
         }
-        for step in 1..MAX_TASKS {
-            let slot = (current + step) % MAX_TASKS;
+        for step in 1..self.high {
+            let slot = (current + step) % self.high;
             if is_idle_slot(slot) {
                 continue;
             }
@@ -469,7 +490,7 @@ impl Scheduler {
     /// Возвращает `true`, если кто-то проснулся.
     fn wake_expired(&mut self, now: u64) -> bool {
         let mut woke = false;
-        for task in self.tasks.iter_mut().flatten() {
+        for task in self.slots_mut().iter_mut().flatten() {
             let due = match task.state {
                 TaskState::Blocked(
                     Wait::Until(tick)
@@ -489,7 +510,7 @@ impl Scheduler {
 
     /// Разбудить тех, кто ждал завершения задачи `id`.
     fn wake_waiters(&mut self, id: TaskId) {
-        for task in self.tasks.iter_mut().flatten() {
+        for task in self.slots_mut().iter_mut().flatten() {
             if task.state == TaskState::Blocked(Wait::Task(id)) {
                 task.state = TaskState::Ready;
             }
@@ -506,7 +527,7 @@ impl Scheduler {
     /// Возвращает число освобождённых стеков.
     fn reap(&mut self) -> usize {
         let mut freed = 0;
-        for (slot, entry) in self.tasks.iter_mut().enumerate() {
+        for (slot, entry) in self.slots_mut().iter_mut().enumerate() {
             if is_idle_slot(slot) {
                 continue;
             }
@@ -591,7 +612,7 @@ pub fn spawn_daemon(name: &'static str, entry: fn()) -> Result<TaskId, SpawnErro
 /// Объявить уже созданную задачу служебной.
 pub fn mark_daemon(id: TaskId) {
     let mut sched = SCHED.lock();
-    if let Some(task) = sched.tasks.iter_mut().flatten().find(|task| task.id == id) {
+    if let Some(task) = sched.slots_mut().iter_mut().flatten().find(|task| task.id == id) {
         task.daemon = true;
     }
 }
@@ -649,6 +670,7 @@ pub fn spawn_raw(
 
     sched.next_id += 1;
     sched.tasks[slot] = Some(boxed);
+    sched.high = sched.high.max(slot + 1);
     Ok(id)
 }
 
@@ -973,7 +995,7 @@ pub fn block_on_irq(source: u32, ready: impl FnOnce() -> bool) {
 pub fn wake_irq(source: u32) {
     let mut woken = 0usize;
     let mut sched = SCHED.lock();
-    for task in sched.tasks.iter_mut().flatten() {
+    for task in sched.slots_mut().iter_mut().flatten() {
         // Оба вида ожидания прерывания, и это не перечисление ради полноты:
         // обработчик не знает и не должен знать, поставил ли ждущий себе
         // будильник. Пропущенный здесь вариант выглядел бы как «прерывания
@@ -1008,7 +1030,7 @@ pub fn wake_irq(source: u32) {
 /// очереди, и не сумевшие уснут снова.
 pub fn wake_lock(address: usize) {
     let mut sched = SCHED.lock();
-    for task in sched.tasks.iter_mut().flatten() {
+    for task in sched.slots_mut().iter_mut().flatten() {
         if task.state == TaskState::Blocked(Wait::Lock(address)) {
             task.state = TaskState::Ready;
         }
@@ -1053,7 +1075,7 @@ pub fn block_on_futex(key: usize, until: Option<u64>, ready: impl FnOnce() -> bo
 pub fn wake_futex(key: usize, count: usize) -> usize {
     let mut sched = SCHED.lock();
     let mut woken = 0usize;
-    for task in sched.tasks.iter_mut().flatten() {
+    for task in sched.slots_mut().iter_mut().flatten() {
         if count != 0 && woken >= count {
             break;
         }
@@ -1077,7 +1099,7 @@ pub fn wake_input() {
         return;
     };
     let mut woke = false;
-    for task in sched.tasks.iter_mut().flatten() {
+    for task in sched.slots_mut().iter_mut().flatten() {
         if matches!(task.state, TaskState::Blocked(Wait::Input(_))) {
             task.state = TaskState::Ready;
             task.boost = true;
@@ -1575,7 +1597,7 @@ pub fn switch_count() -> u64 {
 #[must_use]
 pub fn cpu_ms(id: TaskId) -> Option<u64> {
     let sched = SCHED.lock();
-    let task = sched.tasks.iter().flatten().find(|task| task.id == id)?;
+    let task = sched.slots().iter().flatten().find(|task| task.id == id)?;
     let running = if task.ran_since_ms == 0 {
         0
     } else {
@@ -1621,7 +1643,7 @@ pub fn snapshot() -> alloc::vec::Vec<TaskFacts> {
     let sched = SCHED.lock();
     let now = crate::time::uptime_ms();
     let mut out = alloc::vec::Vec::new();
-    for (slot, entry) in sched.tasks.iter().enumerate() {
+    for (slot, entry) in sched.slots().iter().enumerate() {
         let Some(task) = entry else {
             continue;
         };
@@ -1672,7 +1694,7 @@ pub fn dump() {
     let rows = {
         let sched = SCHED.lock();
         let mut rows: alloc::vec::Vec<Row> = alloc::vec::Vec::new();
-        for (slot, entry) in sched.tasks.iter().enumerate() {
+        for (slot, entry) in sched.slots().iter().enumerate() {
             let Some(entry) = entry else { continue };
             if rows.try_reserve(1).is_err() {
                 break;
