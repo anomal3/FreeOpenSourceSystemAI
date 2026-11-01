@@ -27,6 +27,7 @@ members = [
     "crates/swipe",
     "crates/sysconf",
     "crates/tls",
+    "crates/ttf",
     "crates/usb-hid",
     "crates/user-abi",
     "crates/user-progs",

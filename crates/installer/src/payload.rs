@@ -234,7 +234,7 @@ pub fn probe() -> Result<Payload, Error> {
 
     // Шрифты (фаза 61) — тем же шагом. Без них не рисуется текст: ни у cairo,
     // ни у `System.Drawing`.
-    for (source, target) in FONTS {
+    for (source, target) in FONTS.into_iter().chain(SYSTEM_FONTS) {
         match stat(&mut root, source, What::Defaults) {
             Ok(size) => {
                 logln!("[payload] font {source}: {size} bytes");
@@ -520,6 +520,31 @@ const FONTS: [(&CStr16, &str); 3] = [
     (cstr16!("\\FREEOS\\FONTS\\DEJAVU.TXT"), "usr/share/fonts/dejavu/DejaVu-LICENSE"),
     // Настройка fontconfig (фаза 61b) — в образе, а не в `/etc`.
     (cstr16!("\\FREEOS\\FONTS\\FONTS.CNF"), "usr/share/fontconfig/fonts.conf"),
+];
+
+/// Шрифты системы (02.11). Список обязан совпадать с `SYSTEM_FONTS` в
+/// `xtask/src/cbuild.rs`.
+const SYSTEM_FONTS: [(&CStr16, &str); 20] = [
+    (cstr16!("\\FREEOS\\FONTS\\INTER.TTF"), "usr/share/fonts/fossai/Inter.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\INTEROFL.TXT"), "usr/share/fonts/fossai/Inter-OFL.txt"),
+    (cstr16!("\\FREEOS\\FONTS\\JBMONO.TTF"), "usr/share/fonts/fossai/JetBrainsMono.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\JBMOFL.TXT"), "usr/share/fonts/fossai/JetBrainsMono-OFL.txt"),
+    (cstr16!("\\FREEOS\\FONTS\\DVSANS.TTF"), "usr/share/fonts/fossai/DejaVuSans.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\DVMONO.TTF"), "usr/share/fonts/fossai/DejaVuSansMono.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\DVSERIF.TTF"), "usr/share/fonts/fossai/DejaVuSerif.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\DVLIC.TXT"), "usr/share/fonts/fossai/DejaVu-LICENSE.txt"),
+    (cstr16!("\\FREEOS\\FONTS\\FIRACODE.TTF"), "usr/share/fonts/fossai/FiraCode.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\FIRAOFL.TXT"), "usr/share/fonts/fossai/FiraCode-OFL.txt"),
+    (cstr16!("\\FREEOS\\FONTS\\SRCCODE.TTF"), "usr/share/fonts/fossai/SourceCodePro.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\SRCOFL.TXT"), "usr/share/fonts/fossai/SourceCodePro-OFL.txt"),
+    (cstr16!("\\FREEOS\\FONTS\\NOTOSANS.TTF"), "usr/share/fonts/fossai/NotoSans.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\NOTOOFL.TXT"), "usr/share/fonts/fossai/NotoSans-OFL.txt"),
+    (cstr16!("\\FREEOS\\FONTS\\NOTOMONO.TTF"), "usr/share/fonts/fossai/NotoSansMono.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\NOTOMOFL.TXT"), "usr/share/fonts/fossai/NotoSansMono-OFL.txt"),
+    (cstr16!("\\FREEOS\\FONTS\\PLEXMONO.TTF"), "usr/share/fonts/fossai/IBMPlexMono-Regular.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\PLEXOFL.TXT"), "usr/share/fonts/fossai/IBMPlexMono-OFL.txt"),
+    (cstr16!("\\FREEOS\\FONTS\\HACK.TTF"), "usr/share/fonts/fossai/Hack-Regular.ttf"),
+    (cstr16!("\\FREEOS\\FONTS\\HACKLIC.TXT"), "usr/share/fonts/fossai/Hack-LICENSE.md"),
 ];
 
 /// Страница, которую веб-сервер отдаёт по умолчанию, и её оформление.

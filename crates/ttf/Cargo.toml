@@ -1,0 +1,13 @@
+[package]
+name = "ttf"
+description = "TrueType parsing and anti-aliased glyph rasterization for system fonts (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -317,6 +317,38 @@ pub const FONTS: [(&str, &str, &str); 3] = [
     ("fonts.conf", "usr/share/fontconfig", "FONTS.CNF"),
 ];
 
+/// Шрифты системы (02.11, Блокнот): TrueType из `assets/fonts` — в
+/// репозитории, поэтому едут всегда. Рисует их своя растеризация
+/// (`crates/ttf`). Список обязан совпадать с `SYSTEM_FONTS` в
+/// `crates/installer/src/payload.rs`.
+pub const SYSTEM_FONTS: [(&str, &str, &str); 20] = [
+    ("Inter.ttf", "usr/share/fonts/fossai", "INTER.TTF"),
+    ("Inter-OFL.txt", "usr/share/fonts/fossai", "INTEROFL.TXT"),
+    ("JetBrainsMono.ttf", "usr/share/fonts/fossai", "JBMONO.TTF"),
+    ("JetBrainsMono-OFL.txt", "usr/share/fonts/fossai", "JBMOFL.TXT"),
+    ("DejaVuSans.ttf", "usr/share/fonts/fossai", "DVSANS.TTF"),
+    ("DejaVuSansMono.ttf", "usr/share/fonts/fossai", "DVMONO.TTF"),
+    ("DejaVuSerif.ttf", "usr/share/fonts/fossai", "DVSERIF.TTF"),
+    ("DejaVu-LICENSE.txt", "usr/share/fonts/fossai", "DVLIC.TXT"),
+    ("FiraCode.ttf", "usr/share/fonts/fossai", "FIRACODE.TTF"),
+    ("FiraCode-OFL.txt", "usr/share/fonts/fossai", "FIRAOFL.TXT"),
+    ("SourceCodePro.ttf", "usr/share/fonts/fossai", "SRCCODE.TTF"),
+    ("SourceCodePro-OFL.txt", "usr/share/fonts/fossai", "SRCOFL.TXT"),
+    ("NotoSans.ttf", "usr/share/fonts/fossai", "NOTOSANS.TTF"),
+    ("NotoSans-OFL.txt", "usr/share/fonts/fossai", "NOTOOFL.TXT"),
+    ("NotoSansMono.ttf", "usr/share/fonts/fossai", "NOTOMONO.TTF"),
+    ("NotoSansMono-OFL.txt", "usr/share/fonts/fossai", "NOTOMOFL.TXT"),
+    ("IBMPlexMono-Regular.ttf", "usr/share/fonts/fossai", "PLEXMONO.TTF"),
+    ("IBMPlexMono-OFL.txt", "usr/share/fonts/fossai", "PLEXOFL.TXT"),
+    ("Hack-Regular.ttf", "usr/share/fonts/fossai", "HACK.TTF"),
+    ("Hack-LICENSE.md", "usr/share/fonts/fossai", "HACKLIC.TXT"),
+];
+
+/// Где лежат шрифты системы.
+pub fn system_fonts_dir() -> PathBuf {
+    paths::workspace_root().join("assets/fonts")
+}
+
 /// Куда `cargo xtask thirdparty` кладёт данные игр (фаза 68d): одни на обе
 /// архитектуры. В образ они не едут — их везёт пакет `freedoom`.
 pub fn games_dir() -> PathBuf {
@@ -359,6 +391,7 @@ pub fn foreign_files(with_mono: bool) -> Vec<ForeignFile> {
         ));
     }
     out.extend(foreign_group(&FONTS, &fonts_dir(), crate::arch::PAYLOAD_FONTS_DIR, "шрифты", "cargo xtask thirdparty"));
+    out.extend(foreign_group(&SYSTEM_FONTS, &system_fonts_dir(), crate::arch::PAYLOAD_FONTS_DIR, "шрифты системы", "assets/fonts"));
     out
 }
 

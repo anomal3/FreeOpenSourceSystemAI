@@ -1108,6 +1108,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ttf"
+version = "0.8.0"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1209,6 +1213,7 @@ dependencies = [
  "ssh",
  "sysconf",
  "tls",
+ "ttf",
  "user-abi",
  "x509",
 ]

@@ -19,6 +19,10 @@
 //!   расширению, сменить — меню «Синтаксис» или щелчок по имени языка в строке
 //!   состояния.
 //!
+//! * Шрифт и размер (Вид → Шрифт…): шрифты системы из `/usr/share/fonts/fossai`
+//!   (TrueType, растеризуются на лету — `crates/ttf`) или встроенный
+//!   моноширинный; выбор помнится в `~/.config/notepad.cfg`.
+//!
 //! Перенос строк выключен: длинная строка уезжает вправо вслед за кареткой.
 //! Текст — UTF-8; файл, который не UTF-8, не открывается, а не превращается в
 //! мусор при сохранении.
@@ -28,8 +32,10 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
+use core::cell::RefCell;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -72,6 +78,59 @@ const STATUS_H: u32 = 28;
 const GUTTER_CHARS: usize = 4;
 /// Строка выпадающего меню и окна выбора файла.
 const ITEM_H: u32 = 30;
+/// Где шрифты системы.
+const FONTS_DIR: &str = "/usr/share/fonts/fossai";
+/// Размеры на выбор, точки.
+const SIZES: [u32; 10] = [10, 11, 12, 13, 14, 16, 18, 20, 24, 28];
+/// Самый большой файл шрифта.
+const MAX_FONT: usize = 8 * 1024 * 1024;
+const F10: u32 = user_abi::WIN_KEY_F1 + 9;
+
+/// Шрифт TrueType в работе: растры глифов для текущего размера.
+struct Face {
+    font: ttf::Font,
+    px: f32,
+    cache: BTreeMap<char, ttf::Bitmap>,
+}
+
+impl Face {
+    fn load(path: &str) -> Option<Self> {
+        let data = read_bytes(path, MAX_FONT)?;
+        Some(Self { font: ttf::Font::parse(data)?, px: 0.0, cache: BTreeMap::new() })
+    }
+
+    /// Размер в точках экрана; другой — растры заново.
+    fn set_px(&mut self, px: f32) {
+        if self.px != px {
+            self.px = px;
+            self.cache.clear();
+        }
+    }
+
+    fn glyph(&mut self, ch: char) -> &ttf::Bitmap {
+        let (font, px) = (&self.font, self.px);
+        self.cache.entry(ch).or_insert_with(|| font.rasterize(ch, px))
+    }
+}
+
+/// Шрифт текста: встроенный моноширинный (`face: None`) или с диска.
+struct TextFont {
+    face: Option<RefCell<Face>>,
+    label: String,
+    path: Option<String>,
+    size: u32,
+}
+
+/// Окно «Шрифт»: список шрифтов, размеры, образец.
+struct FontDialog {
+    /// Подпись и путь (`None` — встроенный).
+    fonts: Vec<(String, Option<String>)>,
+    font: usize,
+    size: usize,
+    /// Стрелки ходят по шрифтам (0) или размерам (1); Tab — переключить.
+    focus: u8,
+    preview: Option<RefCell<Face>>,
+}
 
 /// Место в тексте: строка и номер **символа** в ней (не байта).
 type Pos = (usize, usize);
@@ -119,6 +178,7 @@ enum Cmd {
     Delete,
     SelectAll,
     LineNumbers,
+    Font,
     Lang(usize),
 }
 
@@ -185,6 +245,8 @@ struct Editor {
     ask_save: Option<Then>,
     quit: bool,
     home: String,
+    font: TextFont,
+    font_dialog: Option<FontDialog>,
 }
 
 impl Editor {
@@ -213,7 +275,10 @@ impl Editor {
             ask_save: None,
             quit: false,
             home: home_dir(),
+            font: TextFont { face: None, label: String::from(BUILTIN_FONT), path: None, size: 12 },
+            font_dialog: None,
         };
+        editor.load_font_settings();
         if let Some(path) = path {
             editor.load(path);
         }
@@ -737,7 +802,10 @@ impl Editor {
                 item("Удалить", "Del", Cmd::Delete, 1),
                 item("Выделить всё", "Ctrl+A", Cmd::SelectAll, 2),
             ],
-            Menu::View => vec![item(if self.numbers { "✓ Номера строк" } else { "   Номера строк" }, "", Cmd::LineNumbers, 0)],
+            Menu::View => vec![
+                item(if self.numbers { "✓ Номера строк" } else { "   Номера строк" }, "", Cmd::LineNumbers, 0),
+                item("Шрифт…", "", Cmd::Font, 1),
+            ],
             Menu::Syntax => Lang::ALL
                 .iter()
                 .enumerate()
@@ -769,10 +837,219 @@ impl Editor {
             Cmd::Delete => self.delete(),
             Cmd::SelectAll => self.select_all(),
             Cmd::LineNumbers => self.numbers = !self.numbers,
+            Cmd::Font => self.open_font_dialog(),
             Cmd::Lang(index) => self.set_lang(Lang::ALL[index]),
         }
         self.follow();
     }
+}
+
+impl Editor {
+    fn settings_path(&self) -> String {
+        format!("{}/.config/notepad.cfg", self.home)
+    }
+
+    /// Прочитать выбранный шрифт и размер.
+    fn load_font_settings(&mut self) {
+        let Some(text) = read_bytes(&self.settings_path(), 4096).and_then(|bytes| String::from_utf8(bytes).ok()) else {
+            return;
+        };
+        let size = sysconf::value(&text, "size").and_then(|value| value.trim().parse::<u32>().ok()).filter(|size| (8..=48).contains(size)).unwrap_or(12);
+        let path = sysconf::value(&text, "font").map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
+        let label = path.as_deref().map_or_else(|| String::from(BUILTIN_FONT), |path| font_label(path.rsplit('/').next().unwrap_or(path)));
+        self.set_font(label, path, size);
+    }
+
+    fn set_font(&mut self, label: String, path: Option<String>, size: u32) {
+        let face = path.as_deref().and_then(Face::load);
+        // Не открылся — встроенный: текст обязан остаться видимым.
+        let (label, path) = if path.is_some() && face.is_none() { (String::from(BUILTIN_FONT), None) } else { (label, path) };
+        println(&format!("notepad: font {label} {size}"));
+        self.font = TextFont { face: face.map(RefCell::new), label, path, size };
+    }
+
+    fn save_font_settings(&self) {
+        let dir = format!("{}/.config", self.home);
+        let _ = user_progs::mkdir(&dir, 0o755);
+        let text = format!("font={}\nsize={}\n", self.font.path.as_deref().unwrap_or(""), self.font.size);
+        let fd = open_write(&self.settings_path(), true, true);
+        if fd >= 0 {
+            write(fd, text.as_bytes());
+            close(fd);
+        }
+    }
+
+    fn open_font_dialog(&mut self) {
+        let fonts = system_fonts();
+        let font = fonts.iter().position(|(_, path)| *path == self.font.path).unwrap_or(0);
+        let size = SIZES.iter().position(|size| *size == self.font.size).unwrap_or(2);
+        let mut dialog = FontDialog { fonts, font, size, focus: 0, preview: None };
+        dialog.load_preview();
+        println(&format!("notepad: font dialog, {} font(s)", dialog.fonts.len()));
+        self.font_dialog = Some(dialog);
+    }
+
+    fn font_accept(&mut self) {
+        let Some(dialog) = self.font_dialog.take() else {
+            return;
+        };
+        let (label, path) = dialog.fonts[dialog.font].clone();
+        self.set_font(label, path, SIZES[dialog.size]);
+        self.save_font_settings();
+        self.note = Some(format!("Шрифт: {} {}", self.font.label, self.font.size));
+    }
+
+    fn font_key(&mut self, code: u32) {
+        let Some(dialog) = self.font_dialog.as_mut() else {
+            return;
+        };
+        match code {
+            ESCAPE => self.font_dialog = None,
+            ENTER => self.font_accept(),
+            TAB | WIN_KEY_LEFT | WIN_KEY_RIGHT => dialog.focus = 1 - dialog.focus.min(1),
+            WIN_KEY_UP | WIN_KEY_DOWN => {
+                let down = code == WIN_KEY_DOWN;
+                if dialog.focus == 0 {
+                    let last = dialog.fonts.len() - 1;
+                    dialog.font = if down { (dialog.font + 1).min(last) } else { dialog.font.saturating_sub(1) };
+                    dialog.load_preview();
+                } else {
+                    dialog.size = if down { (dialog.size + 1).min(SIZES.len() - 1) } else { dialog.size.saturating_sub(1) };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn font_click(&mut self, ctx: Ctx, area: Rect, x: i32, y: i32) {
+        let plan = font_plan(ctx, area);
+        if plan.ok.contains(x, y) {
+            self.font_accept();
+            return;
+        }
+        if plan.cancel.contains(x, y) {
+            self.font_dialog = None;
+            return;
+        }
+        let Some(dialog) = self.font_dialog.as_mut() else {
+            return;
+        };
+        let row = |list: Rect| ((y - list.y - ctx.px(2) as i32).max(0) as u32 / ctx.px(ITEM_H)) as usize;
+        if plan.fonts.contains(x, y) {
+            let index = row(plan.fonts) + font_first(ctx, &plan, dialog.font);
+            if index < dialog.fonts.len() {
+                dialog.font = index;
+                dialog.focus = 0;
+                dialog.load_preview();
+            }
+        } else if plan.sizes.contains(x, y) {
+            let index = row(plan.sizes);
+            if index < SIZES.len() {
+                dialog.size = index;
+                dialog.focus = 1;
+            }
+        }
+    }
+
+    fn draw_font_dialog(&self, s: &mut Surface, ctx: Ctx, area: Rect) {
+        let Some(dialog) = &self.font_dialog else {
+            return;
+        };
+        let p = ctx.palette;
+        draw::blend_rect(s, area, mini_ui::Color::rgb(0, 0, 0), 90);
+        let plan = font_plan(ctx, area);
+        let inner = kit::card(ctx, s, plan.card);
+        let pad = ctx.px(20) as i32;
+        paint::text(inner, s, Role::Title, plan.card.x + pad, plan.card.y + pad, "Шрифт", p.ink);
+        for (list, focused) in [(plan.fonts, dialog.focus == 0), (plan.sizes, dialog.focus == 1)] {
+            paint::sunk(inner, s, list, ctx.px(6));
+            if focused {
+                draw::rounded_stroke(s, list, ctx.px(6), p.acc, 255);
+            }
+        }
+        let row_rect = |list: Rect, index: usize| Rect::new(list.x + ctx.px(4) as i32, list.y + ctx.px(2) as i32 + (index as u32 * ctx.px(ITEM_H)) as i32, list.w - ctx.px(8), ctx.px(ITEM_H));
+        let first = font_first(ctx, &plan, dialog.font);
+        let visible = (plan.fonts.h / ctx.px(ITEM_H)) as usize;
+        for (index, (label, _)) in dialog.fonts.iter().enumerate().skip(first).take(visible) {
+            let row = row_rect(plan.fonts, index - first);
+            if index == dialog.font {
+                draw::rounded(s, row, ctx.px(4), p.acc, 60);
+            }
+            paint::text_clipped(inner, s, Role::Body, row.x + ctx.px(10) as i32, paint::baseline(ctx, Role::Body, row), row.w - ctx.px(20), label, p.ink);
+        }
+        for (index, size) in SIZES.iter().enumerate().take((plan.sizes.h / ctx.px(ITEM_H)) as usize) {
+            let row = row_rect(plan.sizes, index);
+            if index == dialog.size {
+                draw::rounded(s, row, ctx.px(4), p.acc, 60);
+            }
+            paint::text(inner, s, Role::Body, row.x + ctx.px(10) as i32, paint::baseline(ctx, Role::Body, row), &format!("{size}"), p.ink);
+        }
+        // Образец — выбранным шрифтом и размером.
+        paint::sunk(inner, s, plan.preview, ctx.px(6));
+        let sample = "Съешь же ещё этих булок. fn main() { 42 }";
+        let size = ctx.px(SIZES[dialog.size]) as f32;
+        let clip = Rect::new(plan.preview.x + ctx.px(8) as i32, plan.preview.y, plan.preview.w - ctx.px(16), plan.preview.h);
+        match &dialog.preview {
+            Some(face) => {
+                let mut face = face.borrow_mut();
+                face.set_px(size);
+                let metrics = face.font.line_metrics(face.px);
+                let base = plan.preview.y + (plan.preview.h as i32 - metrics.line as i32) / 2 + metrics.ascent as i32;
+                let mut pen = clip.x as f32;
+                for ch in sample.chars() {
+                    let glyph = face.glyph(ch);
+                    blit_glyph(s, glyph, pen as i32 + glyph.left, base + glyph.top, p.ink, clip);
+                    pen += glyph.advance;
+                }
+            }
+            None => {
+                paint::text_clipped(inner, s, Role::Mono, clip.x, paint::baseline(ctx, Role::Mono, plan.preview), clip.w, sample, p.ink);
+            }
+        }
+        paint::text_clipped(inner, s, Role::Caption, plan.card.x + pad, plan.ok.y + ctx.px(8) as i32, (plan.ok.x - plan.card.x - pad - ctx.px(8) as i32).max(0) as u32, "Tab — шрифт / размер · Enter — готово", p.ink4);
+        paint::button(inner, s, plan.ok, Weight::Primary, "ОК", false);
+        paint::button(inner, s, plan.cancel, Weight::Normal, "Отмена", false);
+    }
+}
+
+impl FontDialog {
+    fn load_preview(&mut self) {
+        self.preview = self.fonts.get(self.font).and_then(|(_, path)| path.as_deref()).and_then(Face::load).map(RefCell::new);
+    }
+}
+
+/// Первая показанная строка списка шрифтов: выбранная всегда видна.
+fn font_first(ctx: Ctx, plan: &FontPlan, selected: usize) -> usize {
+    let visible = (plan.fonts.h / ctx.px(ITEM_H)).max(1) as usize;
+    (selected + 1).saturating_sub(visible)
+}
+
+/// Окно «Шрифт»: карточка, список шрифтов, размеры, образец, кнопки.
+struct FontPlan {
+    card: Rect,
+    fonts: Rect,
+    sizes: Rect,
+    preview: Rect,
+    ok: Rect,
+    cancel: Rect,
+}
+
+fn font_plan(ctx: Ctx, area: Rect) -> FontPlan {
+    let w = ctx.px(540).min(area.w.saturating_sub(ctx.px(24)));
+    let h = ctx.px(470).min(area.h.saturating_sub(ctx.px(24)));
+    let card = Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, w, h);
+    let pad = ctx.px(20) as i32;
+    let top = card.y + pad + ctx.px(36) as i32;
+    let bw = ctx.px(120);
+    let by = card.bottom() - pad - ctx.px(32) as i32;
+    let preview = Rect::new(card.x + pad, by - ctx.px(14 + 56) as i32, w - ctx.px(40), ctx.px(56));
+    let list_h = (preview.y - ctx.px(12) as i32 - top).max(0) as u32;
+    let sizes_w = ctx.px(90);
+    let fonts = Rect::new(card.x + pad, top, w - ctx.px(40) - sizes_w - ctx.px(10), list_h);
+    let sizes = Rect::new(fonts.right() + ctx.px(10) as i32, top, sizes_w, list_h);
+    let cancel = Rect::new(card.right() - pad - bw as i32, by, bw, ctx.px(32));
+    let ok = Rect::new(cancel.x - ctx.px(8) as i32 - bw as i32, by, bw, ctx.px(32));
+    FontPlan { card, fonts, sizes, preview, ok, cancel }
 }
 
 impl FileDialog {
@@ -907,52 +1184,153 @@ fn ink(ctx: Ctx, kind: Kind) -> mini_ui::Color {
     }
 }
 
+/// Подпись встроенного шрифта.
+const BUILTIN_FONT: &str = "Встроенный моноширинный";
+
+/// Где текст по горизонтали и как высока строка.
+struct TextMetrics {
+    /// Левый край текста.
+    x: i32,
+    gutter_w: u32,
+    line_h: i32,
+    /// Базовая линия от верха строки.
+    ascent: i32,
+    /// Ширина «0» — столбец для PageDown и прокрутки.
+    zero_w: f32,
+}
+
 impl Editor {
-    /// Где текст: левый край текста и ширина знака, высота строки.
-    fn text_geometry(&self, ctx: Ctx, plan: &Plan) -> (i32, u32, i32, u32) {
-        let face = ctx.face(Role::Mono);
-        let line_h = i32::from(face.line) + ctx.px(2) as i32;
-        let char_w = face.width("0").max(1);
-        let gutter_w = if self.numbers { char_w * (GUTTER_CHARS as u32 + 1) + ctx.px(12) } else { 0 };
-        let text_x = plan.text.x + gutter_w as i32 + ctx.px(10) as i32;
-        (text_x, char_w, line_h, gutter_w)
+    fn metrics(&self, ctx: Ctx, plan: &Plan) -> TextMetrics {
+        let mono = ctx.face(Role::Mono);
+        let digit_w = mono.width("0").max(1);
+        let gutter_w = if self.numbers { digit_w * (GUTTER_CHARS as u32 + 1) + ctx.px(12) } else { 0 };
+        let x = plan.text.x + gutter_w as i32 + ctx.px(10) as i32;
+        match &self.font.face {
+            Some(face) => {
+                let mut face = face.borrow_mut();
+                face.set_px(ctx.px(self.font.size) as f32);
+                let metrics = face.font.line_metrics(face.px);
+                let zero_w = face.font.advance('0', face.px).max(1.0);
+                TextMetrics { x, gutter_w, line_h: metrics.line as i32 + 1 + ctx.px(2) as i32, ascent: (metrics.ascent + 0.5) as i32, zero_w }
+            }
+            None => TextMetrics { x, gutter_w, line_h: i32::from(mono.line) + ctx.px(2) as i32, ascent: 0, zero_w: digit_w as f32 },
+        }
+    }
+
+    /// Шаг пера знака.
+    fn advance(&self, metrics: &TextMetrics, ch: char) -> f32 {
+        match &self.font.face {
+            Some(face) => {
+                let face = face.borrow();
+                let ch = if ch == '\t' { ' ' } else { ch };
+                face.font.advance(ch, face.px)
+            }
+            None => metrics.zero_w,
+        }
+    }
+
+    /// Нарисовать кусок строки с `x` (верх строки — `y`); ответ — `x` после него.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_piece(&self, s: &mut Surface, ctx: Ctx, metrics: &TextMetrics, x: f32, y: i32, text: &str, color: mini_ui::Color, clip: Rect) -> f32 {
+        match &self.font.face {
+            None => {
+                let count = text.chars().count() as f32;
+                let visible: String = text.chars().map(|c| if c == '\t' { ' ' } else { c }).collect();
+                let width = ((clip.right() as f32 - x).max(0.0) as u32).min((count * metrics.zero_w) as u32 + 1);
+                paint::text_clipped(ctx, s, Role::Mono, x as i32, y, width, &visible, color);
+                x + count * metrics.zero_w
+            }
+            Some(face) => {
+                let mut face = face.borrow_mut();
+                let mut pen = x;
+                for ch in text.chars() {
+                    let ch = if ch == '\t' { ' ' } else { ch };
+                    let glyph = face.glyph(ch);
+                    if pen >= clip.right() as f32 {
+                        break;
+                    }
+                    blit_glyph(s, glyph, pen as i32 + glyph.left, y + metrics.ascent + glyph.top, color, clip);
+                    pen += glyph.advance;
+                }
+                pen
+            }
+        }
+    }
+
+    /// Столбец под точкой `x` строки `row`.
+    fn col_at(&self, metrics: &TextMetrics, row: usize, x: i32) -> usize {
+        let Some(line) = self.lines.get(row) else {
+            return 0;
+        };
+        let mut pen = metrics.x as f32;
+        for (col, ch) in line.chars().enumerate().skip(self.left) {
+            let step = self.advance(metrics, ch);
+            if (x as f32) < pen + step / 2.0 {
+                return col;
+            }
+            pen += step;
+        }
+        line.chars().count()
     }
 
     fn draw_text(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
         let p = ctx.palette;
-        let face = ctx.face(Role::Mono);
-        let (text_x, char_w, line_h, gutter_w) = self.text_geometry(ctx, plan);
-        let gutter = Rect::new(plan.text.x, plan.text.y, gutter_w, plan.text.h);
+        let metrics = self.metrics(ctx, plan);
+        let gutter = Rect::new(plan.text.x, plan.text.y, metrics.gutter_w, plan.text.h);
         if self.numbers {
             s.fill(gutter, ctx.flat(p.panel));
             draw::vline(s, gutter.right() - 1, gutter.y, gutter.h, p.line.color, p.line.alpha);
         }
-        let rows = ((plan.text.h as i32 - ctx.px(12) as i32) / line_h).max(1) as usize;
-        let cols = ((plan.text.right() - text_x - ctx.px(10) as i32).max(0) as u32 / char_w).max(1) as usize;
+        let right = plan.text.right() - ctx.px(10) as i32;
+        let clip = Rect::new(metrics.x, plan.text.y, (right - metrics.x).max(0) as u32, plan.text.h);
+        let rows = ((plan.text.h as i32 - ctx.px(12) as i32) / metrics.line_h).max(1) as usize;
+        let cols = (((right - metrics.x).max(0) as f32) / metrics.zero_w).max(1.0) as usize;
         self.page_rows.set(rows);
         self.page_cols.set(cols);
         let top_y = plan.text.y + ctx.px(6) as i32;
         let selection = self.selection();
-        let busy = self.dialog.is_some() || self.ask_save.is_some();
+        let busy = self.dialog.is_some() || self.ask_save.is_some() || self.font_dialog.is_some();
         for offset in 0..rows {
             let index = self.top + offset;
             let Some(line) = self.lines.get(index) else {
                 break;
             };
-            let y = top_y + offset as i32 * line_h;
-            if index == self.row && selection.is_none() {
-                draw::blend_rect(s, Rect::new(gutter.right(), y - 1, (plan.text.right() - gutter.right()).max(0) as u32, line_h as u32), p.hover1.color, p.hover1.alpha);
+            let y = top_y + offset as i32 * metrics.line_h;
+            // Где начинается каждый показанный знак (и конец строки).
+            let mut pos: Vec<f32> = Vec::new();
+            let mut pen = metrics.x as f32;
+            for ch in line.chars().skip(self.left) {
+                pos.push(pen);
+                if pen > right as f32 {
+                    break;
+                }
+                pen += self.advance(&metrics, ch);
             }
-            // Выделенное — подложкой акцента под знаками.
+            pos.push(pen);
+            let x_at = |col: usize| -> f32 {
+                let index = col.saturating_sub(self.left);
+                match pos.get(index) {
+                    Some(x) => *x,
+                    None => pos.last().copied().unwrap_or(metrics.x as f32) + (index + 1 - pos.len()) as f32 * metrics.zero_w,
+                }
+            };
+            if index == self.row && selection.is_none() {
+                draw::blend_rect(s, Rect::new(gutter.right(), y - 1, (plan.text.right() - gutter.right()).max(0) as u32, metrics.line_h as u32), p.hover1.color, p.hover1.alpha);
+            }
+            // Выделенное — подложкой акцента под знаками; перевод строки — ширина «0».
             if let Some((start, end)) = selection {
                 if index >= start.0 && index <= end.0 {
                     let from = if index == start.0 { start.1 } else { 0 };
-                    let to = if index == end.0 { end.1 } else { line.chars().count() + 1 };
-                    let from = from.max(self.left);
-                    let to = to.min(self.left + cols);
-                    if to > from {
-                        let x = text_x + ((from - self.left) as u32 * char_w) as i32;
-                        draw::blend_rect(s, Rect::new(x, y - 1, (to - from) as u32 * char_w, line_h as u32), p.acc, 90);
+                    let len = line.chars().count();
+                    let to = if index == end.0 { end.1 } else { len };
+                    let x0 = x_at(from.max(self.left));
+                    let mut x1 = x_at(to.max(self.left));
+                    if index != end.0 {
+                        x1 += metrics.zero_w;
+                    }
+                    let x1 = x1.min(right as f32);
+                    if x1 > x0 {
+                        draw::blend_rect(s, Rect::new(x0 as i32, y - 1, (x1 - x0) as u32, metrics.line_h as u32), p.acc, 90);
                     }
                 }
             }
@@ -960,21 +1338,21 @@ impl Editor {
                 let number = format!("{}", index + 1);
                 paint::text_right(ctx, s, Role::Mono, gutter.right() - ctx.px(8) as i32, y, &number, if index == self.row { p.ink2 } else { p.ink5 });
             }
-            // По кускам подсветки — каждый своим цветом, по сетке столбцов.
+            // По кускам подсветки — каждый своим цветом.
             let mut state = self.state_at(index);
             for (from, to, kind) in syntax::spans(self.lang, line, &mut state) {
                 let from = from.max(self.left);
-                let to = to.min(self.left + cols);
-                if from >= to {
+                if from >= to || from >= self.left + pos.len() {
                     continue;
                 }
-                let piece: String = line.chars().skip(from).take(to - from).map(|c| if c == '\t' { ' ' } else { c }).collect();
-                let x = text_x + ((from - self.left) as u32 * char_w) as i32;
-                paint::text_clipped(ctx, s, Role::Mono, x, y, (to - from) as u32 * char_w, &piece, ink(ctx, kind));
+                let piece: String = line.chars().skip(from).take(to - from).collect();
+                self.draw_piece(s, ctx, &metrics, x_at(from), y, &piece, ink(ctx, kind), clip);
             }
             if index == self.row && !busy && self.col >= self.left {
-                let cx = text_x + ((self.col - self.left) as u32 * char_w) as i32;
-                s.fill(Rect::new(cx, y, ctx.px(2), face.line as u32), p.acc);
+                let cx = x_at(self.col) as i32;
+                if cx <= right {
+                    s.fill(Rect::new(cx, y, ctx.px(2), (metrics.line_h - ctx.px(2) as i32).max(1) as u32), p.acc);
+                }
             }
         }
     }
@@ -1121,10 +1499,15 @@ impl App for Editor {
         }
         self.draw_dropdown(s, ctx, area, &plan);
         self.draw_dialog(s, ctx, area);
+        self.draw_font_dialog(s, ctx, area);
         self.draw_ask(s, ctx, area);
     }
 
     fn key_with(&mut self, code: u32, mods: i32, latin: u32) -> bool {
+        if self.font_dialog.is_some() {
+            self.font_key(code);
+            return true;
+        }
         if self.dialog.is_some() {
             self.dialog_key(code);
             return true;
@@ -1169,6 +1552,11 @@ impl App for Editor {
                 }
                 _ => self.lang_menu = None,
             }
+            return true;
+        }
+        // F10 — полоса меню, как в Windows.
+        if code == F10 {
+            self.menu = Some((Menu::File, 0));
             return true;
         }
         self.note = None;
@@ -1259,6 +1647,10 @@ impl App for Editor {
 
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = Plan::new(ctx, area);
+        if self.font_dialog.is_some() {
+            self.font_click(ctx, area, x, y);
+            return true;
+        }
         if self.dialog.is_some() {
             self.dialog_click(ctx, area, x, y);
             return true;
@@ -1306,9 +1698,9 @@ impl App for Editor {
             return true;
         }
         if plan.text.contains(x, y) {
-            let (text_x, char_w, line_h, _) = self.text_geometry(ctx, &plan);
-            let row = self.top + ((y - plan.text.y - ctx.px(6) as i32).max(0) / line_h) as usize;
-            let col = self.left + ((x - text_x).max(0) + char_w as i32 / 2) as usize / char_w as usize;
+            let metrics = self.metrics(ctx, &plan);
+            let row = (self.top + ((y - plan.text.y - ctx.px(6) as i32).max(0) / metrics.line_h) as usize).min(self.lines.len() - 1);
+            let col = self.col_at(&metrics, row, x);
             self.move_caret(row, col, false);
             return true;
         }
@@ -1483,6 +1875,86 @@ fn home_dir() -> String {
         }
     }
     String::from("/home")
+}
+
+/// Положить растр глифа цветом `color` по его покрытию, не выходя за `clip`.
+fn blit_glyph(s: &mut Surface, glyph: &ttf::Bitmap, x: i32, y: i32, color: mini_ui::Color, clip: Rect) {
+    let w = glyph.width as i32;
+    for (row, line) in glyph.coverage.chunks(w.max(1) as usize).enumerate() {
+        let py = y + row as i32;
+        if py < clip.y || py >= clip.bottom() || py < 0 {
+            continue;
+        }
+        for (column, coverage) in line.iter().enumerate() {
+            let px = x + column as i32;
+            if *coverage == 0 || px < clip.x || px >= clip.right() || px < 0 {
+                continue;
+            }
+            let under = mini_ui::Color::from_pixel(s.get(px as u32, py as u32));
+            s.put(px as u32, py as u32, under.mix(color, *coverage).pixel());
+        }
+    }
+}
+
+/// Прочитать файл целиком, не больше `limit` байт.
+fn read_bytes(path: &str, limit: usize) -> Option<Vec<u8>> {
+    let fd = open(path);
+    if fd < 0 {
+        return None;
+    }
+    let size = file_size(fd);
+    if size <= 0 || size as usize > limit {
+        close(fd);
+        return None;
+    }
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(size as usize).is_err() {
+        close(fd);
+        return None;
+    }
+    buffer.resize(size as usize, 0u8);
+    let mut got = 0usize;
+    while got < buffer.len() {
+        let step = read(fd, &mut buffer[got..]);
+        if step <= 0 {
+            break;
+        }
+        got += step as usize;
+    }
+    close(fd);
+    buffer.truncate(got);
+    Some(buffer)
+}
+
+/// Подпись шрифта по имени файла.
+fn font_label(file: &str) -> String {
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    match stem {
+        "Inter" => String::from("Inter"),
+        "JetBrainsMono" => String::from("JetBrains Mono"),
+        "DejaVuSans" => String::from("DejaVu Sans"),
+        "DejaVuSansMono" => String::from("DejaVu Sans Mono"),
+        "DejaVuSerif" => String::from("DejaVu Serif"),
+        "FiraCode" => String::from("Fira Code"),
+        "SourceCodePro" => String::from("Source Code Pro"),
+        "NotoSans" => String::from("Noto Sans"),
+        "NotoSansMono" => String::from("Noto Sans Mono"),
+        "IBMPlexMono-Regular" => String::from("IBM Plex Mono"),
+        "Hack-Regular" => String::from("Hack"),
+        other => other.to_string(),
+    }
+}
+
+/// Шрифты системы: встроенный и всё `.ttf` из [`FONTS_DIR`].
+fn system_fonts() -> Vec<(String, Option<String>)> {
+    let mut fonts: Vec<(String, Option<String>)> = list_dir(FONTS_DIR)
+        .into_iter()
+        .filter(|(name, folder)| !folder && name.to_ascii_lowercase().ends_with(".ttf"))
+        .map(|(name, _)| (font_label(&name), Some(join(FONTS_DIR, &name))))
+        .collect();
+    fonts.sort();
+    fonts.insert(0, (String::from(BUILTIN_FONT), None));
+    fonts
 }
 
 fn error_text(code: i64) -> &'static str {
