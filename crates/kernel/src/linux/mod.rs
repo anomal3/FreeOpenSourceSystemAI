@@ -1279,16 +1279,10 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
             // чем — всякая блокировка удаётся, а спросившему отвечают
             // «свободно».
             F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => files.cloexec(fd).map(|_| 0),
-            F_GETLK | F_OFD_GETLK => files.cloexec(fd).map(|_| {
-                // `struct flock`: первое поле — `l_type`.
-                if space::user_can(arg, 2, PageFlags::WRITE) {
-                    // SAFETY: проверено строкой выше.
-                    unsafe { core::ptr::write_unaligned(arg as *mut i16, F_UNLCK) };
-                    0
-                } else {
-                    -e::EFAULT
-                }
-            }),
+            // Ответ пишется в память программы ниже, уже без замка: подгрузка
+            // страницы в `user_can` берёт тот же замок программы, и поток
+            // ждал сам себя (Chromium, «Restore pages» через SQLite).
+            F_GETLK | F_OFD_GETLK => files.cloexec(fd).map(|_| 0),
             F_SETFL => {
                 files.cloexec(fd)?;
                 files.set_nonblock(fd, arg & O_NONBLOCK != 0)?;
@@ -1299,6 +1293,15 @@ unsafe fn fcntl(fd: usize, cmd: usize, arg: usize) -> i64 {
         }
     });
     match result {
+        Some(Ok(_)) if matches!(cmd, F_GETLK | F_OFD_GETLK) => {
+            // `struct flock`: первое поле — `l_type`.
+            if !space::user_can(arg, 2, PageFlags::WRITE) {
+                return -e::EFAULT;
+            }
+            // SAFETY: проверено строкой выше.
+            unsafe { core::ptr::write_unaligned(arg as *mut i16, F_UNLCK) };
+            0
+        }
         Some(Ok(answer)) => answer,
         Some(Err(err)) => file_errno(err),
         None => -e::ESRCH,
