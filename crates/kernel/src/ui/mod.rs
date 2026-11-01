@@ -391,6 +391,17 @@ fn hover_context(desktop: &mut Compositor, x: i32, y: i32, status: &Status) {
 /// выделенное, Ctrl+Shift+V и правая кнопка — набирают его.
 static CLIPBOARD: SpinLock<String> = SpinLock::new(String::new());
 
+/// Текст буфера обмена — копией (`SYS_CLIPBOARD`).
+#[must_use]
+pub fn clipboard() -> String {
+    CLIPBOARD.lock().clone()
+}
+
+/// Положить текст в буфер обмена (`SYS_CLIPBOARD`).
+pub fn set_clipboard(text: String) {
+    *CLIPBOARD.lock() = text;
+}
+
 /// Левую кнопку нажали в терминале и держат: движение мыши тянет выделение.
 static SELECTING: AtomicBool = AtomicBool::new(false);
 

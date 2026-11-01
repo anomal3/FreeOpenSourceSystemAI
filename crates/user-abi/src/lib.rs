@@ -1524,6 +1524,20 @@ pub const SYS_LIVE_KEYS: usize = 83;
 /// другая программа исполняет свою прямо сейчас.
 pub const SYS_KERNEL_COMMAND: usize = 84;
 
+/// Буфер обмена стола (02.11): `(действие, адрес, длина)`. Один на систему —
+/// тот же, что у терминала (Ctrl+Shift+C/V), Блокнота и «Файлов».
+///
+/// [`CLIP_SET`] — положить текст UTF-8 (не длиннее [`CLIP_MAX`]); ответ —
+/// ноль. [`CLIP_GET`] — забрать в буфер; ответ — длина **всего** текста (буфер
+/// короче — обрезано, повторить с большим).
+pub const SYS_CLIPBOARD: usize = 85;
+/// [`SYS_CLIPBOARD`]: положить.
+pub const CLIP_SET: usize = 1;
+/// [`SYS_CLIPBOARD`]: забрать.
+pub const CLIP_GET: usize = 2;
+/// Самый длинный текст буфера обмена.
+pub const CLIP_MAX: usize = 4 * 1024 * 1024;
+
 /// Размер буфера вывода [`SYS_KERNEL_COMMAND`].
 pub const KERNEL_COMMAND_OUT: usize = 64 * 1024;
 

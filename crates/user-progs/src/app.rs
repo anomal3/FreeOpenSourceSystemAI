@@ -65,6 +65,23 @@ pub trait App {
         false
     }
 
+    /// Клавиша с модификаторами (`WIN_MOD_*`) и латинской буквой клавиши —
+    /// для сочетаний (Shift+стрелки, Ctrl+Shift+S). По умолчанию — [`App::key`].
+    fn key_with(&mut self, code: u32, _mods: i32, _latin: u32) -> bool {
+        self.key(code)
+    }
+
+    /// Окно просят закрыть (крестик, Alt+F4). `false` — не сейчас: программа
+    /// спросит «Сохранить изменения?» и закроется сама ([`App::wants_quit`]).
+    fn close_requested(&mut self) -> bool {
+        true
+    }
+
+    /// Программа решила закрыться (ответ на свой вопрос перед закрытием).
+    fn wants_quit(&self) -> bool {
+        false
+    }
+
     /// Щелчок левой кнопкой в точке окна.
     fn click(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
         false
@@ -199,15 +216,16 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
         while let Some(event) = window.next_event() {
             let ctx = Ctx::scaled(scale);
             let handled = match event.kind {
-                WIN_CLOSE => {
+                WIN_CLOSE if app.close_requested() => {
                     reason = "request";
                     break 'live;
                 }
+                WIN_CLOSE => true,
                 WIN_KEY if event.code == QUIT && app.quits_on_q() => {
                     reason = "'q'";
                     break 'live;
                 }
-                WIN_KEY => app.key(event.code),
+                WIN_KEY => app.key_with(event.code, event.x, event.y.max(0) as u32),
                 WIN_POINTER if event.code == RIGHT_BUTTON => app.click_right(area, ctx, event.x, event.y),
                 WIN_POINTER => app.click(area, ctx, event.x, event.y),
                 WIN_WHEEL => app.wheel(event.x),
@@ -232,6 +250,10 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
             if handled {
                 app.after_input();
                 dirty = true;
+            }
+            if app.wants_quit() {
+                reason = "request";
+                break 'live;
             }
         }
 

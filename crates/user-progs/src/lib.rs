@@ -1573,6 +1573,35 @@ pub fn live_keys(buffer: &mut [u8]) -> usize {
     if result < 0 { 0 } else { result as usize }
 }
 
+/// Положить текст в буфер обмена стола (02.11).
+pub fn clipboard_set(text: &str) -> bool {
+    // SAFETY: строка живёт в памяти программы, длина — её собственная.
+    let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_SET, text.as_ptr() as usize, text.len()) };
+    result == 0
+}
+
+/// Текст буфера обмена стола.
+#[must_use]
+pub fn clipboard_get() -> alloc::string::String {
+    let mut buffer = alloc::vec![0u8; 4096];
+    loop {
+        // SAFETY: буфер живёт в памяти программы, длина — его собственная.
+        let result = unsafe { syscall(user_abi::SYS_CLIPBOARD, user_abi::CLIP_GET, buffer.as_mut_ptr() as usize, buffer.len()) };
+        if result < 0 {
+            return alloc::string::String::new();
+        }
+        let total = result as usize;
+        if total <= buffer.len() {
+            buffer.truncate(total);
+            return alloc::string::String::from_utf8(buffer).unwrap_or_default();
+        }
+        if total > user_abi::CLIP_MAX || buffer.try_reserve_exact(total - buffer.len()).is_err() {
+            return alloc::string::String::new();
+        }
+        buffer.resize(total, 0);
+    }
+}
+
 /// Исполнить команду оболочки ядра (фаза 68o). `out` — не короче
 /// [`user_abi::KERNEL_COMMAND_OUT`]; ответ — сколько байт вывода или ошибка.
 pub fn kernel_command(line: &str, out: &mut [u8]) -> i64 {

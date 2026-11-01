@@ -196,6 +196,7 @@ pub unsafe fn handle(number: usize, a0: usize, a1: usize, a2: usize) -> i64 {
         // Фаза 68o: вход по SSH в живую систему и команды ядра по сети.
         user_abi::SYS_LIVE_KEYS => live_keys(a0, a1),
         user_abi::SYS_KERNEL_COMMAND => kernel_command(a0, a1, a2),
+        user_abi::SYS_CLIPBOARD => clipboard(a0, a1, a2),
         // Фаза 47b: счётчики системы — их показывает программа, а не ядро.
         SYS_SYSINFO => sysinfo(a0),
         // Фаза С4: тома для «Моего компьютера».
@@ -1304,6 +1305,40 @@ fn live_keys(ptr: usize, len: usize) -> i64 {
     // SAFETY: диапазон проверен по таблицам программы на запись.
     unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, count) }.copy_from_slice(&keys[..count]);
     count as i64
+}
+
+/// `SYS_CLIPBOARD`: положить текст в буфер обмена стола или забрать его.
+fn clipboard(action: usize, ptr: usize, len: usize) -> i64 {
+    match action {
+        user_abi::CLIP_SET => {
+            if len > user_abi::CLIP_MAX || (len > 0 && !space::user_can(ptr, len, PageFlags::READ)) {
+                return ERR_BAD_ADDRESS;
+            }
+            // Копия — до замка: страница программы может прийти по касанию.
+            let bytes = if len == 0 { &[][..] } else {
+                // SAFETY: диапазон проверен по таблицам программы на чтение.
+                unsafe { core::slice::from_raw_parts(ptr as *const u8, len) }
+            };
+            let Ok(text) = core::str::from_utf8(bytes) else {
+                return ERR_BAD_PATH;
+            };
+            crate::ui::set_clipboard(alloc::string::String::from(text));
+            0
+        }
+        user_abi::CLIP_GET => {
+            let text = crate::ui::clipboard();
+            let count = text.len().min(len);
+            if count > 0 {
+                if !space::user_can(ptr, count, PageFlags::WRITE) {
+                    return ERR_BAD_ADDRESS;
+                }
+                // SAFETY: диапазон проверен по таблицам программы на запись.
+                unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, count) }.copy_from_slice(&text.as_bytes()[..count]);
+            }
+            text.len() as i64
+        }
+        _ => ERR_UNSUPPORTED,
+    }
 }
 
 /// `SYS_KERNEL_COMMAND`: исполнить команду оболочки ядра и отдать вывод.
