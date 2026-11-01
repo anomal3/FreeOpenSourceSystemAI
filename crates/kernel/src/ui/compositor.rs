@@ -2451,9 +2451,14 @@ impl Compositor {
 
         if let Some(menu) = self.context.as_mut() {
             let damage = menu.take_damage();
+            let sub = menu.take_sub_damage();
             if !damage.is_empty() {
                 let rect = damage.translate(menu.rect.x, menu.rect.y);
                 self.mark(rect);
+            }
+            // Подменю появляется и уходит целиком — вместе с тенью.
+            if !sub.is_empty() {
+                self.mark_layer(sub);
             }
         }
 
@@ -2535,9 +2540,20 @@ impl Compositor {
 
     /// Накрывает ли меню стола эту точку.
     pub fn context_contains(&self, x: i32, y: i32) -> bool {
-        self.context
-            .as_ref()
-            .is_some_and(|menu| menu.is_open() && menu.rect.contains(x, y))
+        self.context.as_ref().is_some_and(|menu| menu.contains(x, y))
+    }
+
+    /// Погасить пункты открытого меню стола.
+    pub fn context_set_off(&mut self, off: alloc::vec::Vec<Action>) {
+        if let Some(menu) = self.context.as_mut() {
+            menu.set_off(off);
+        }
+    }
+
+    /// Нажимается ли пункт открытого меню стола.
+    #[must_use]
+    pub fn context_enabled(&self, action: Action) -> bool {
+        self.context.as_ref().is_some_and(|menu| menu.is_enabled(action))
     }
 
     pub fn context_action_at(&self, x: i32, y: i32) -> Option<Action> {
@@ -3348,6 +3364,10 @@ impl Compositor {
                 let r = super::context::MENU_RADIUS * self.scale;
                 self.drop_shadow(back, menu.rect, band, dy, r);
                 self.stack(back, menu.surface(), menu.rect, band, dy, r);
+                if let Some((surface, rect)) = menu.sub_layer() {
+                    self.drop_shadow(back, rect, band, dy, r);
+                    self.stack(back, surface, rect, band, dy, r);
+                }
             }
         }
         // Шторка — поверх всего, включая док: она и открывается затем, чтобы

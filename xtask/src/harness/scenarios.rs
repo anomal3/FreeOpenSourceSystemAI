@@ -2857,12 +2857,12 @@ pub const ALL: &[Scenario] = &[
             // из него задевает **всё** — обои, значки, панель, оба открытых
             // окна, — то есть ровно то, что ломается, если перекрасить не всех.
             //
-            // Пункт третий сверху, и над ним одна разделительная черта: пункты
-            // «создать» отделены от «тема / настройки / обновить».
+            // Пункт седьмой сверху, над ним две черты (макет 07: вид,
+            // сортировка, обновить | создать | экран, персонализация, тема).
             Step::Aim(Aim::EmptyRight),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(2, 1)),
+            Step::Aim(Aim::ContextItem(6, 2)),
             Step::Click,
             Step::Await("desktop     : theme light", 15_000),
             Step::Wait(2_000),
@@ -2872,7 +2872,7 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::EmptyRight),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(2, 1)),
+            Step::Aim(Aim::ContextItem(6, 2)),
             Step::Click,
             Step::Await("desktop     : theme dark", 15_000),
             Step::Wait(2_000),
@@ -2913,7 +2913,10 @@ pub const ALL: &[Scenario] = &[
             // каталогов не заводят. Меню обязано сказать это словами, а не
             // «operation not supported»; создание же проверяется на
             // установленной системе, где корень ext2 (сценарий `installed`).
-            Step::Aim(Aim::ContextItem(0, 0)),
+            Step::Aim(Aim::ContextItem(3, 1)),
+            Step::Click,
+            Step::Await("desktop     : submenu at", 15_000),
+            Step::Aim(Aim::SubItem(0, 0)),
             Step::Click,
             Step::Await("cannot create: the live system cannot store files", 15_000),
             Step::Wait(1_500),
@@ -4875,7 +4878,10 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Empty),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(0, 0)),
+            Step::Aim(Aim::ContextItem(3, 1)),
+            Step::Click,
+            Step::Await("desktop     : submenu at", 15_000),
+            Step::Aim(Aim::SubItem(0, 0)),
             Step::Click,
             Step::Await("desktop     : created 'Новая папка' in /home/roman/Desktop", 15_000),
             // Меню закрывается само, и новая папка сразу просит имя (02.11).
@@ -4899,12 +4905,12 @@ pub const ALL: &[Scenario] = &[
             Step::Expect("for entry"),
             Step::Wait(1_500),
             Step::Shot("02-entry-menu"),
-            // «Переименовать» — третий пункт, после черты: у папки сверху
-            // «Открыть» и «Открыть в терминале», как в Windows (24.10).
+            // «Переименовать» — седьмой пункт, после двух черт (макет 09:
+            // открыть… | вырезать, копировать | переименовать, удалить).
             // Поле открывается на месте подписи с выделенным именем (02.11):
             // набранное заменяет его, Enter принимает. Меню закрывается
             // сразу — оно больше не забирает ввод.
-            Step::Aim(Aim::ContextItem(2, 1)),
+            Step::Aim(Aim::ContextItem(6, 2)),
             Step::Click,
             Step::Await("desktop     : naming 'Новая папка'", 15_000),
             Step::Wait(1_500),
@@ -4924,7 +4930,7 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Icon(5)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(3, 1)),
+            Step::Aim(Aim::ContextItem(7, 2)),
             Step::Click,
             Step::Wait(1_500),
             Step::Shot("04-delete-confirm"),
@@ -4958,7 +4964,10 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Empty),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(1, 0)),
+            Step::Aim(Aim::ContextItem(3, 1)),
+            Step::Click,
+            Step::Await("desktop     : submenu at", 15_000),
+            Step::Aim(Aim::SubItem(1, 0)),
             Step::Click,
             Step::Await("desktop     : created 'Новый текстовый документ.txt' in /home/roman/Desktop", 15_000),
             Step::Await("desktop     : naming 'Новый текстовый документ.txt'", 15_000),
@@ -4966,13 +4975,17 @@ pub const ALL: &[Scenario] = &[
             Step::Key("ret"),
             Step::Await("note.txt'", 15_000),
             Step::Await("desktop     : icons 6, 1 from /home/roman/Desktop", 15_000),
-            // Меню файла: Открыть, Открыть с помощью: Блокнот, Выбрать другую
-            // программу…, черта, Переименовать, Удалить.
+            // Меню файла (макет 10): Открыть, Открыть с помощью › | Вырезать,
+            // Копировать | Переименовать, Удалить | Свойства. В подменю —
+            // Блокнот | Выбрать другую программу….
             Step::Aim(Aim::Icon(5)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
             Step::Expect("for entry"),
-            Step::Aim(Aim::ContextItem(2, 0)),
+            Step::Aim(Aim::ContextItem(1, 0)),
+            Step::Click,
+            Step::Await("desktop     : submenu at", 15_000),
+            Step::Aim(Aim::SubItem(1, 1)),
             Step::Click,
             Step::Await("desktop     : opened 'Open with' for '/home/roman/Desktop/note.txt'", 15_000),
             Step::Wait(1_500),
@@ -4990,7 +5003,7 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Icon(5)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
-            Step::Aim(Aim::ContextItem(4, 1)),
+            Step::Aim(Aim::ContextItem(5, 2)),
             Step::Click,
             Step::Wait(1_000),
             Step::Key("y"),

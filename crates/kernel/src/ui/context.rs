@@ -54,22 +54,29 @@ use mini_ui::theme;
 use crate::input::{KeyCode, KeyEvent};
 use crate::vfs::perm::Access;
 
-/// Поле внутри карточки.
-const CARD_PAD: u32 = 8;
+/// Поле внутри карточки (макет 07–12: 4).
+const CARD_PAD: u32 = 4;
 /// Высота строки меню.
 const ROW_H: u32 = 32;
 /// Зазор между строками.
-const ROW_GAP: u32 = 1;
-/// Поле внутри строки.
+const ROW_GAP: u32 = 0;
+/// Поле для ответа и вопроса — шире, чем у строки.
 const ROW_PAD: u32 = 10;
+/// Поле строки слева и справа (макет: 8 и 10).
+const ROW_PAD_L: u32 = 8;
+const ROW_PAD_R: u32 = 10;
 /// Сторона значка в строке.
-const ICON: u32 = 14;
+const ICON: u32 = 16;
+/// Просвет между подписью и сочетанием клавиш справа.
+const KEYS_GAP: u32 = 32;
+/// Место под стрелку подменю.
+const ARROW: u32 = 24;
 /// Скругление карточки меню — как у меню Windows 11, меньше, чем у окон.
 pub const MENU_RADIUS: u32 = 6;
 /// Просвет между значком и подписью.
 const ICON_GAP: u32 = 10;
 /// Поле разделителя сверху и снизу.
-const SEP_PAD: u32 = 5;
+const SEP_PAD: u32 = 4;
 /// Подсказка под вопросом об удалении — она же задаёт наименьшую ширину меню.
 const CONFIRM_HINT: &str = "Y — удалить    N — оставить";
 
@@ -128,11 +135,43 @@ pub enum Action {
     Properties,
     /// «Выбрать другую программу…» — окно «Как открыть этот файл?».
     ChooseProgram,
+    /// Пункт с подменю (›).
+    Submenu(Sub),
+    /// «Персонализация» — «Параметры» на разделе оформления.
+    Personalize,
+    /// «Открыть в новом окне» — «Файлы» на этой папке.
+    OpenNewWindow,
+    /// «По имени» — значки стола по порядку, без запомненных мест.
+    SortName,
+    // Дальше — то, чего в системе пока нет: пункты стоят серыми (правило
+    // дома — нереализованное показывать, а не прятать).
+    NewShortcut,
+    ViewLarge,
+    ViewMedium,
+    ViewSmall,
+    SortType,
+    SortDate,
+    RunAsAdmin,
+    PinTaskbar,
+    PinStart,
+    PinQuick,
+    Compress,
+    Cut,
+    Copy,
+}
+
+/// Какое подменю открывает пункт.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sub {
+    View,
+    Sort,
+    New,
+    OpenWith,
 }
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 18] = [
+    const ALL: [Action; 35] = [
         Action::Open,
         Action::Rename,
         Action::Delete,
@@ -151,6 +190,23 @@ impl Action {
         Action::EmptyTrash,
         Action::Properties,
         Action::ChooseProgram,
+        Action::Submenu(Sub::OpenWith),
+        Action::Personalize,
+        Action::OpenNewWindow,
+        Action::SortName,
+        Action::NewShortcut,
+        Action::ViewLarge,
+        Action::ViewMedium,
+        Action::ViewSmall,
+        Action::SortType,
+        Action::SortDate,
+        Action::RunAsAdmin,
+        Action::PinTaskbar,
+        Action::PinStart,
+        Action::PinQuick,
+        Action::Compress,
+        Action::Cut,
+        Action::Copy,
     ];
 
     /// Меню корзины (макет 12): открыть, очистить, свойства.
@@ -162,12 +218,19 @@ impl Action {
     /// Тема стоит здесь, а не только в «Параметрах», по той же причине, по
     /// которой обои меняют щелчком по столу: это свойство самого стола, и идти
     /// за ним в окно настроек человек не должен.
-    pub const ON_DESKTOP: [Action; 5] = [
-        Action::NewFolder,
-        Action::NewTextFile,
-        Action::Theme,
-        Action::DisplaySettings,
+    ///
+    /// Макет 07: вид, сортировка, обновить; «Создать ›»; экран и
+    /// персонализация; терминал. Тема — сверх макета, третьей в группе
+    /// оформления.
+    pub const ON_DESKTOP: [Action; 8] = [
+        Action::Submenu(Sub::View),
+        Action::Submenu(Sub::Sort),
         Action::Refresh,
+        Action::Submenu(Sub::New),
+        Action::DisplaySettings,
+        Action::Personalize,
+        Action::Theme,
+        Action::OpenInTerminal,
     ];
 
     /// Пункты меню, открытого на файле или каталоге стола.
@@ -180,11 +243,46 @@ impl Action {
 
     /// Меню папки на столе — как в Windows: открыть, терминал здесь, затем
     /// правка.
-    pub const ON_FOLDER: [Action; 4] = [Action::Open, Action::OpenInTerminal, Action::Rename, Action::Delete];
+    /// Макет 09.
+    pub const ON_FOLDER: [Action; 10] = [
+        Action::Open,
+        Action::OpenNewWindow,
+        Action::OpenInTerminal,
+        Action::PinQuick,
+        Action::Cut,
+        Action::Copy,
+        Action::Rename,
+        Action::Delete,
+        Action::Compress,
+        Action::Properties,
+    ];
+
+    /// Меню файла (макет 10): «Открыть с помощью ›» — подменю.
+    pub const ON_FILE: [Action; 7] = [
+        Action::Open,
+        Action::Submenu(Sub::OpenWith),
+        Action::Cut,
+        Action::Copy,
+        Action::Rename,
+        Action::Delete,
+        Action::Properties,
+    ];
+
+    /// Меню кнопки панели задач (макет 11).
+    pub const ON_BUTTON: [Action; 3] = [Action::PinTaskbar, Action::CloseOne, Action::CloseAll];
 
     /// Меню ярлыка программы из пакета: открыть, где лежит, убрать ярлык.
     /// «Обновить» на значке программы не нужен (Роман, 24.10).
-    pub const ON_PROGRAM: [Action; 3] = [Action::Open, Action::OpenLocation, Action::DeleteShortcut];
+    /// Макет 08.
+    pub const ON_PROGRAM: [Action; 7] = [
+        Action::Open,
+        Action::RunAsAdmin,
+        Action::OpenLocation,
+        Action::PinTaskbar,
+        Action::PinStart,
+        Action::DeleteShortcut,
+        Action::Properties,
+    ];
 
     /// Пункты меню, открытого на системном значке: переименовать «Settings»
     /// нечем, а открыть его — можно.
@@ -207,8 +305,8 @@ impl Action {
             Action::Open => "Открыть",
             Action::Rename => "Переименовать",
             Action::Delete => "Удалить",
-            Action::NewFolder => "Создать папку",
-            Action::NewTextFile => "Создать текстовый файл",
+            Action::NewFolder => "Папку",
+            Action::NewTextFile => "Текстовый документ",
             // Пункт называется тем, что произойдёт, а не тем, что есть сейчас:
             // «Тёмная тема» при включённой тёмной читается как признак, а не
             // как действие, и человек нажимает её, чтобы «включить», получая
@@ -220,7 +318,7 @@ impl Action {
                     "Тёмная тема"
                 }
             }
-            Action::DisplaySettings => "Настройки экрана",
+            Action::DisplaySettings => "Параметры экрана",
             Action::Refresh => "Обновить",
             // Как и тема: пункт назван тем, что произойдёт.
             Action::SwitchLayout => match crate::input::keymap::layout().other() {
@@ -242,6 +340,26 @@ impl Action {
             Action::EmptyTrash => "Очистить корзину",
             Action::Properties => "Свойства",
             Action::ChooseProgram => "Выбрать другую программу…",
+            Action::Submenu(Sub::View) => "Вид",
+            Action::Submenu(Sub::Sort) => "Сортировка",
+            Action::Submenu(Sub::New) => "Создать",
+            Action::Submenu(Sub::OpenWith) => "Открыть с помощью",
+            Action::Personalize => "Персонализация",
+            Action::OpenNewWindow => "Открыть в новом окне",
+            Action::SortName => "По имени",
+            Action::NewShortcut => "Ярлык",
+            Action::ViewLarge => "Крупные значки",
+            Action::ViewMedium => "Обычные значки",
+            Action::ViewSmall => "Мелкие значки",
+            Action::SortType => "По типу",
+            Action::SortDate => "По дате изменения",
+            Action::RunAsAdmin => "Запуск от имени администратора",
+            Action::PinTaskbar => "Закрепить на панели задач",
+            Action::PinStart => "Закрепить в «Пуске»",
+            Action::PinQuick => "Закрепить в панели быстрого доступа",
+            Action::Compress => "Сжать в архив",
+            Action::Cut => "Вырезать",
+            Action::Copy => "Копировать",
         }
     }
 
@@ -254,15 +372,25 @@ impl Action {
         match self {
             Action::Open
             | Action::OpenWith(_)
-            | Action::ChooseProgram
+            | Action::Submenu(Sub::OpenWith)
+            | Action::OpenNewWindow
+            | Action::RunAsAdmin
+            | Action::PinQuick
             | Action::OpenLocation
             | Action::OpenInTerminal
             | Action::Window(_)
             | Action::CloseWindow(_) => 0,
             Action::Rename | Action::Delete | Action::DeleteShortcut | Action::CloseOne | Action::CloseAll | Action::EmptyTrash => 5,
             Action::Properties => 6,
-            Action::NewFolder | Action::NewTextFile => 1,
-            Action::Theme | Action::DisplaySettings | Action::Refresh => 2,
+            Action::NewFolder | Action::NewTextFile | Action::NewShortcut | Action::Submenu(Sub::New) => 1,
+            Action::Theme | Action::DisplaySettings | Action::Personalize => 2,
+            Action::Refresh | Action::Submenu(Sub::View) | Action::Submenu(Sub::Sort) => 7,
+            Action::Cut | Action::Copy => 8,
+            Action::Compress => 9,
+            Action::PinTaskbar | Action::PinStart => 10,
+            Action::ChooseProgram => 11,
+            Action::ViewLarge | Action::ViewMedium | Action::ViewSmall => 12,
+            Action::SortName | Action::SortType | Action::SortDate => 12,
             Action::SwitchLayout => 3,
             Action::NetworkSettings | Action::ClockSettings => 2,
             Action::TaskManager => 4,
@@ -296,9 +424,56 @@ impl Action {
             Action::ClockSettings => Some(Icon::Clock),
             Action::TaskManager => Some(Icon::Chart),
             Action::EmptyTrash => Some(Icon::Close),
-            Action::Properties => None,
-            Action::ChooseProgram => Some(Icon::Grid),
+            Action::Properties => Some(Icon::Info),
+            Action::ChooseProgram => None,
+            Action::Submenu(Sub::View) => Some(Icon::Grid),
+            Action::Submenu(Sub::Sort) => Some(Icon::ChevronDown),
+            Action::Submenu(Sub::New) => Some(Icon::Folder),
+            Action::Submenu(Sub::OpenWith) => Some(Icon::File),
+            Action::Personalize => Some(Icon::Settings),
+            Action::OpenNewWindow => Some(Icon::Maximize),
+            Action::NewShortcut => Some(Icon::Forward),
+            Action::ViewLarge | Action::ViewMedium | Action::ViewSmall => Some(Icon::Grid),
+            Action::SortName | Action::SortType | Action::SortDate => None,
+            Action::RunAsAdmin => Some(Icon::Shield),
+            Action::PinTaskbar | Action::PinStart | Action::PinQuick => None,
+            Action::Compress => Some(Icon::Package),
+            Action::Cut | Action::Copy => None,
         }
+    }
+
+    /// Сочетание клавиш справа от подписи (макет: серым, мельче).
+    const fn keys(self) -> Option<&'static str> {
+        match self {
+            Action::Refresh => Some("F5"),
+            Action::Rename => Some("F2"),
+            Action::Delete => Some("Del"),
+            Action::Cut => Some("Ctrl+X"),
+            Action::Copy => Some("Ctrl+C"),
+            Action::Properties => Some("Alt+Enter"),
+            _ => None,
+        }
+    }
+
+    /// Есть ли за пунктом действие. Нет — пункт серый и не нажимается.
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        !matches!(
+            self,
+            Action::NewShortcut
+                | Action::ViewLarge
+                | Action::ViewMedium
+                | Action::ViewSmall
+                | Action::SortType
+                | Action::SortDate
+                | Action::RunAsAdmin
+                | Action::PinTaskbar
+                | Action::PinStart
+                | Action::PinQuick
+                | Action::Compress
+                | Action::Cut
+                | Action::Copy
+        )
     }
 }
 
@@ -354,6 +529,22 @@ pub struct ContextMenu {
     screen_w: u32,
     /// Указатель стоит на крестике выбранной строки окна.
     cross: bool,
+    /// Пункты, погашенные этим открытием (у одного окна «Закрыть все окна»).
+    off: Vec<Action>,
+    /// Подменю (›): своя поверхность рядом с карточкой. Заводится вместе с
+    /// меню, а не при открытии подменю — память в разборе ввода не просят.
+    sub_surface: Surface,
+    sub_items: Vec<Action>,
+    /// Где подменю на экране.
+    pub sub_rect: Rect,
+    /// Номер пункта карточки, чьё подменю открыто.
+    sub_parent: Option<usize>,
+    sub_selected: usize,
+    /// Клавиши идут в подменю (вошли в него стрелкой вправо).
+    sub_focus: bool,
+    /// Что перерисовать на экране под подменю: оно появилось, сменилось или
+    /// ушло. В координатах экрана.
+    sub_damage: Rect,
 }
 
 impl ContextMenu {
@@ -367,7 +558,8 @@ impl ContextMenu {
         for action in Action::ALL {
             widest = widest.max(ctx.face(Role::Body).width(action.title()));
         }
-        let content = ctx.px(ICON + ICON_GAP) + widest;
+        let keys = ctx.face(Role::Caption).width("Alt+Enter") + ctx.px(KEYS_GAP);
+        let content = ctx.px(ICON + ICON_GAP) + widest + keys;
         let hint = ctx.face(Role::Caption).width(CONFIRM_HINT);
         let width = content.max(hint) + ctx.px((CARD_PAD + ROW_PAD) * 2);
 
@@ -377,12 +569,18 @@ impl ContextMenu {
         // обработчике события ввода — и остаться без меню, когда её не дали.
         let height = height_for(ctx, &Action::ON_ENTRY)
             .max(height_for(ctx, &Action::ON_DESKTOP))
+            .max(height_for(ctx, &Action::ON_FOLDER))
+            .max(height_for(ctx, &Action::ON_PROGRAM))
             .max(height_for(ctx, &Action::ON_TRAY))
             // Список окон группы на панели задач — до двенадцати строк.
             .max(height_for(ctx, &[Action::Window(0); 12]))
             // Файл с шестью программами «Открыть с помощью».
             .max(height_for(ctx, &[Action::Open; 9]));
         let surface = Surface::new(width, height, theme::wall_average(theme::palette()))?;
+        // Подменю: до шести программ «Открыть с помощью» и «Выбрать другую».
+        let mut longest_sub = [Action::OpenWith(0); 7];
+        longest_sub[6] = Action::ChooseProgram;
+        let sub_surface = Surface::new(width, rows_height(ctx, &longest_sub), theme::wall_average(theme::palette()))?;
         Some(Self {
             surface,
             rect: Rect::new(0, 0, width, height),
@@ -397,7 +595,125 @@ impl ContextMenu {
             handlers: Vec::new(),
             screen_w: u32::MAX / 2,
             cross: false,
+            off: Vec::new(),
+            sub_surface,
+            sub_items: Vec::new(),
+            sub_rect: Rect::EMPTY,
+            sub_parent: None,
+            sub_selected: usize::MAX,
+            sub_focus: false,
+            sub_damage: Rect::EMPTY,
         })
+    }
+
+    /// Погасить пункты этого открытия (их действие сейчас ни к чему).
+    pub fn set_off(&mut self, off: Vec<Action>) {
+        self.off = off;
+        self.redraw();
+    }
+
+    /// Нажимается ли пункт.
+    #[must_use]
+    pub fn is_enabled(&self, action: Action) -> bool {
+        action.enabled() && !self.off.contains(&action)
+    }
+
+    /// Пункты подменю.
+    fn sub_items_for(&self, sub: Sub) -> Vec<Action> {
+        match sub {
+            Sub::View => alloc::vec![Action::ViewLarge, Action::ViewMedium, Action::ViewSmall],
+            Sub::Sort => alloc::vec![Action::SortName, Action::SortType, Action::SortDate],
+            Sub::New => alloc::vec![Action::NewFolder, Action::NewTextFile, Action::NewShortcut],
+            Sub::OpenWith => {
+                let mut items: Vec<Action> = (0..self.handlers.len().min(6)).map(|index| Action::OpenWith(index as u8)).collect();
+                items.push(Action::ChooseProgram);
+                items
+            }
+        }
+    }
+
+    /// Открыть подменю пункта `index` — справа от карточки, первая строка
+    /// вровень с пунктом (макет: `left: 100% + 8`, `top: −5`); не влезает
+    /// справа — слева.
+    fn open_sub(&mut self, index: usize) {
+        let Some(Action::Submenu(sub)) = self.items.get(index).copied() else {
+            return;
+        };
+        if self.sub_parent == Some(index) {
+            return;
+        }
+        self.close_sub();
+        let ctx = self.ctx();
+        let items = self.sub_items_for(sub);
+        let width = self.width_of(ctx, &items).min(self.sub_surface.width());
+        let height = rows_height(ctx, &items).min(self.sub_surface.height());
+        let layout = plan(ctx, self.card(), &self.items);
+        let row_y = layout.rows.get(index).map_or(0, |slot| slot.rect.y);
+        let gap = ctx.px(CARD_PAD) as i32;
+        let mut x = self.rect.right() + gap;
+        if x + width as i32 > self.screen_w as i32 {
+            x = self.rect.x - gap - width as i32;
+        }
+        let y = (self.rect.y + row_y - ctx.px(CARD_PAD) as i32).clamp(0, (self.work_bottom - height as i32).max(0));
+        self.sub_items = items;
+        self.sub_rect = Rect::new(x.max(0), y, width, height);
+        self.sub_parent = Some(index);
+        self.sub_selected = usize::MAX;
+        self.sub_focus = false;
+        self.redraw_sub();
+        crate::kprintln!(
+            "  desktop     : submenu at {},{} {}x{}",
+            self.sub_rect.x,
+            self.sub_rect.y,
+            self.sub_rect.w,
+            self.sub_rect.h
+        );
+    }
+
+    /// Закрыть подменю, оставив карточку.
+    fn close_sub(&mut self) {
+        if self.sub_parent.take().is_some() {
+            self.sub_damage = self.sub_damage.union(&self.sub_rect);
+            self.sub_focus = false;
+        }
+    }
+
+    /// Подменю на экране, если открыто: поверхность и место.
+    #[must_use]
+    pub fn sub_layer(&self) -> Option<(&Surface, Rect)> {
+        self.sub_parent.filter(|_| self.open).map(|_| (&self.sub_surface, self.sub_rect))
+    }
+
+    /// Забрать изменившееся под подменю — в координатах экрана.
+    pub fn take_sub_damage(&mut self) -> Rect {
+        core::mem::replace(&mut self.sub_damage, Rect::EMPTY)
+    }
+
+    /// Накрывает ли меню (с подменю) точку экрана.
+    #[must_use]
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        self.open && (self.rect.contains(x, y) || (self.sub_parent.is_some() && self.sub_rect.contains(x, y)))
+    }
+
+    fn redraw_sub(&mut self) {
+        let ctx = self.ctx();
+        let p = ctx.palette;
+        let card = Rect::new(0, 0, self.sub_rect.w, self.sub_rect.h);
+        let glass = ctx.flat(p.win);
+        let inner = ctx.on(glass);
+        let radius = ctx.px(MENU_RADIUS);
+        let layout = plan(ctx, card, &self.sub_items);
+        let labels: Vec<String> = self.sub_items.iter().map(|action| self.label(*action)).collect();
+        let enabled: Vec<bool> = self.sub_items.iter().map(|action| self.is_enabled(*action)).collect();
+        let s = &mut self.sub_surface;
+        s.fill(Rect::new(0, 0, s.width(), card.h), glass);
+        draw::rounded_stroke(s, card, radius, p.line3.color, p.line3.alpha);
+        draw::crown(s, card, radius, p.crown.color, p.crown.alpha);
+        draw_lines(inner, s, card, &layout.lines);
+        for (index, slot) in layout.rows.iter().enumerate() {
+            draw_row(inner, s, slot, &labels[index], index == self.sub_selected, enabled[index]);
+        }
+        self.sub_damage = self.sub_damage.union(&self.sub_rect);
     }
 
     /// Программы «Открыть с помощью» для следующего открытия.
@@ -414,11 +730,7 @@ impl ContextMenu {
     /// Подпись пункта: у «Открыть с помощью» — с именем программы.
     fn label(&self, action: Action) -> String {
         match action {
-            Action::OpenWith(index) => match self.handlers.get(usize::from(index)) {
-                Some((name, _)) => alloc::format!("Открыть с помощью: {name}"),
-                None => String::from(action.title()),
-            },
-            Action::Window(index) => match self.handlers.get(usize::from(index)) {
+            Action::OpenWith(index) | Action::Window(index) => match self.handlers.get(usize::from(index)) {
                 Some((name, _)) => name.clone(),
                 None => String::from(action.title()),
             },
@@ -428,12 +740,25 @@ impl ContextMenu {
 
     /// Ширина карточки под эти пункты: по самой длинной подписи, без пустоты
     /// справа (Роман, 24.10: «к чему такие отступы справа»).
-    fn width_for(&self, ctx: Ctx) -> u32 {
+    fn width_of(&self, ctx: Ctx, items: &[Action]) -> u32 {
         let face = ctx.face(Role::Body);
-        let widest = self.items.iter().map(|action| face.width(&self.label(*action))).max().unwrap_or(0);
-        let cross = if self.items.iter().any(|action| matches!(action, Action::Window(_))) { ctx.px(CROSS) } else { 0 };
-        let width = widest + ctx.px(ICON + ICON_GAP) + ctx.px((CARD_PAD + ROW_PAD) * 2) + ctx.px(12) + cross;
-        width.clamp(ctx.px(180), self.surface.width())
+        let small = ctx.face(Role::Caption);
+        let widest = items
+            .iter()
+            .map(|action| {
+                let tail = match (action.keys(), action) {
+                    (Some(keys), _) => small.width(keys) + ctx.px(KEYS_GAP),
+                    (None, Action::Submenu(_)) => ctx.px(ARROW + 12),
+                    _ => 0,
+                };
+                face.width(&self.label(*action)) + tail
+            })
+            .max()
+            .unwrap_or(0);
+        let cross = if items.iter().any(|action| matches!(action, Action::Window(_))) { ctx.px(CROSS) } else { 0 };
+        let width = widest + ctx.px(ICON + ICON_GAP) + ctx.px(CARD_PAD * 2 + ROW_PAD_L + ROW_PAD_R) + ctx.px(12) + cross;
+        // Макет: наименьшая ширина меню — 200.
+        width.clamp(ctx.px(200), self.surface.width())
     }
 
     #[must_use]
@@ -466,7 +791,7 @@ impl ContextMenu {
         self.work_bottom = work_bottom;
         self.screen_w = screen.0;
         let ctx = self.ctx();
-        self.rect.w = self.width_for(ctx);
+        self.rect.w = self.width_of(ctx, &self.items);
         self.rect.h = rows_height(ctx, &self.items).min(self.surface.height());
         let max_x = (screen.0 as i32 - self.rect.w as i32).max(0);
         let max_y = (work_bottom - self.rect.h as i32).max(0);
@@ -476,19 +801,30 @@ impl ContextMenu {
         self.cross = false;
         self.mode = Mode::Menu;
         self.note = None;
+        self.close_sub();
         self.open = true;
         self.redraw();
     }
 
     pub fn close(&mut self) {
+        self.close_sub();
         self.open = false;
         self.mode = Mode::Menu;
+        self.off.clear();
     }
 
     /// Пункт под точкой экрана.
     #[must_use]
     pub fn action_at(&self, x: i32, y: i32) -> Option<Action> {
-        if self.is_editing() || !self.rect.contains(x, y) {
+        if self.is_editing() {
+            return None;
+        }
+        if self.sub_parent.is_some() && self.sub_rect.contains(x, y) {
+            let local = (x - self.sub_rect.x, y - self.sub_rect.y);
+            let layout = plan(self.ctx(), Rect::new(0, 0, self.sub_rect.w, self.sub_rect.h), &self.sub_items);
+            return layout.rows.iter().find(|slot| slot.rect.contains(local.0, local.1)).map(|slot| slot.action);
+        }
+        if !self.rect.contains(x, y) {
             return None;
         }
         let local = (x - self.rect.x, y - self.rect.y);
@@ -565,6 +901,39 @@ impl ContextMenu {
     }
 
     fn menu_key(&mut self, code: KeyCode) -> Reply {
+        if self.sub_focus && self.sub_parent.is_some() {
+            let count = self.sub_items.len().max(1);
+            return match code {
+                KeyCode::Up => {
+                    self.sub_selected = if self.sub_selected >= count { count - 1 } else { (self.sub_selected + count - 1) % count };
+                    self.redraw_sub();
+                    Reply::Handled
+                }
+                KeyCode::Down => {
+                    self.sub_selected = if self.sub_selected >= count { 0 } else { (self.sub_selected + 1) % count };
+                    self.redraw_sub();
+                    Reply::Handled
+                }
+                KeyCode::Enter => match self.sub_items.get(self.sub_selected).copied() {
+                    Some(action) if self.is_enabled(action) => Reply::Run(action),
+                    _ => Reply::Handled,
+                },
+                KeyCode::Left | KeyCode::Escape => {
+                    self.close_sub();
+                    self.redraw();
+                    Reply::Handled
+                }
+                _ => Reply::Ignored,
+            };
+        }
+        // Подменю — стрелкой вправо или Enter: войти в него.
+        if let (KeyCode::Right | KeyCode::Enter, Some(Action::Submenu(_))) = (code, self.items.get(self.selected).copied()) {
+            self.open_sub(self.selected);
+            self.sub_focus = true;
+            self.sub_selected = 0;
+            self.redraw_sub();
+            return Reply::Handled;
+        }
         match code {
             // Подсветки может не быть вовсе — указатель ушёл с карточки
             // ([`Self::select_none`]); тогда стрелки начинают с края.
@@ -581,7 +950,8 @@ impl ContextMenu {
                 Reply::Handled
             }
             KeyCode::Enter => match self.items.get(self.selected).copied() {
-                Some(action) => Reply::Run(action),
+                Some(action) if self.is_enabled(action) => Reply::Run(action),
+                Some(_) => Reply::Handled,
                 None => Reply::Close,
             },
             KeyCode::Escape => Reply::Close,
@@ -591,6 +961,30 @@ impl ContextMenu {
 
     /// Поставить выделение на пункт под указателем.
     pub fn select_action(&mut self, action: Action) {
+        // Пункт подменю — подсветить там; карточка остаётся как есть.
+        if self.sub_parent.is_some() {
+            if let Some(index) = self.sub_items.iter().position(|item| *item == action) {
+                if index != self.sub_selected {
+                    self.sub_selected = index;
+                    self.redraw_sub();
+                }
+                // В карточке подсвечен пункт этого подменю, а не тот, над
+                // которым указатель прошёл по дороге.
+                if let Some(parent) = self.sub_parent.filter(|parent| *parent != self.selected) {
+                    self.selected = parent;
+                    self.redraw();
+                }
+                return;
+            }
+        }
+        // Указатель на пункте с подменю открывает его. На обычном пункте
+        // подменю не закрывается: по дороге к нему указатель проходит над
+        // соседними строками (Windows ждёт для этого полсекунды).
+        if let Some(index) = self.items.iter().position(|item| *item == action) {
+            if matches!(action, Action::Submenu(_)) {
+                self.open_sub(index);
+            }
+        }
         let (row, cross) = match action {
             Action::CloseWindow(number) => (Action::Window(number), true),
             other => (other, false),
@@ -606,6 +1000,10 @@ impl ContextMenu {
 
     /// Убрать подсветку: указатель ушёл с карточки.
     pub fn select_none(&mut self) {
+        if self.sub_selected != usize::MAX && self.sub_parent.is_some() {
+            self.sub_selected = usize::MAX;
+            self.redraw_sub();
+        }
         if self.selected != usize::MAX {
             self.selected = usize::MAX;
             self.cross = false;
@@ -621,6 +1019,9 @@ impl ContextMenu {
     /// перерисовать место, где его нет, значит тратить кадр впустую.
     pub fn restyle(&mut self) {
         self.redraw();
+        if self.sub_parent.is_some() {
+            self.redraw_sub();
+        }
         if !self.open {
             self.damage = Rect::EMPTY;
         }
@@ -664,30 +1065,15 @@ impl ContextMenu {
 
         match &self.mode {
             Mode::Menu => {
-                let selected = self.selected;
+                // Без подсветки под указателем — подсвечен пункт, чьё подменю
+                // открыто.
+                let selected = if self.selected < self.items.len() { self.selected } else { self.sub_parent.unwrap_or(usize::MAX) };
+                let labels: Vec<String> = self.items.iter().map(|action| self.label(*action)).collect();
+                let enabled: Vec<bool> = self.items.iter().map(|action| self.is_enabled(*action)).collect();
                 let s = &mut self.surface;
-                for y in &layout.lines {
-                    paint::separator(
-                        inner,
-                        s,
-                        card.x + ctx.px(CARD_PAD + ROW_PAD) as i32,
-                        *y,
-                        card.w.saturating_sub(ctx.px((CARD_PAD + ROW_PAD) * 2)),
-                    );
-                }
+                draw_lines(inner, s, card, &layout.lines);
                 for (index, slot) in layout.rows.iter().enumerate() {
-                    let label = match slot.action {
-                        Action::OpenWith(number) => match self.handlers.get(usize::from(number)) {
-                            Some((name, _)) => alloc::format!("Открыть с помощью: {name}"),
-                            None => String::from(slot.action.title()),
-                        },
-                        Action::Window(number) => match self.handlers.get(usize::from(number)) {
-                            Some((name, _)) => name.clone(),
-                            None => String::from(slot.action.title()),
-                        },
-                        other => String::from(other.title()),
-                    };
-                    draw_row(inner, s, slot, &label, index == selected);
+                    draw_row(inner, s, slot, &labels[index], index == selected, enabled[index]);
                     if matches!(slot.action, Action::Window(_)) {
                         draw_cross(inner, s, slot.rect, index == selected, index == selected && self.cross);
                     }
@@ -848,56 +1234,54 @@ fn draw_cross(ctx: Ctx, s: &mut Surface, row: Rect, shown: bool, hot: bool) {
     );
 }
 
-/// Нарисовать строку меню.
-fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool) {
-    let p = ctx.palette;
-    // Удаление — единственный пункт, после которого нечего вернуть, и красным
-    // оно названо ровно поэтому.
-    let danger = matches!(slot.action, Action::Delete | Action::DeleteShortcut);
-    let r = ctx.px(theme::R_CHIP);
-    if selected {
-        if danger {
-            draw::rounded(s, slot.rect, r, ctx.flat(p.badbg), 255);
-            draw::rounded_stroke(s, slot.rect, r, p.badline, 255);
-        } else {
-            paint::row(ctx, s, slot.rect, RowState::Selected);
-        }
+/// Черты между группами — от края пункта до края пункта.
+fn draw_lines(ctx: Ctx, s: &mut Surface, card: Rect, lines: &[i32]) {
+    let inset = ctx.px(CARD_PAD + ROW_PAD_L);
+    for y in lines {
+        paint::separator(ctx, s, card.x + inset as i32, *y, card.w.saturating_sub(inset * 2));
     }
-    let ink = if danger {
-        p.bad_ink
-    } else if selected {
-        paint::row_ink(ctx, RowState::Selected)
+}
+
+/// Нарисовать строку меню (макет 07–12): значок 16, подпись, справа —
+/// сочетание клавиш серым или стрелка подменю. Подсветка — плоская, как
+/// `--hov` макета; погашенный пункт — серый и без подсветки.
+fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool, enabled: bool) {
+    let p = ctx.palette;
+    let lit = selected && enabled;
+    if lit {
+        paint::row(ctx, s, slot.rect, RowState::Hover);
+    }
+    let ink = if !enabled {
+        p.ink4
+    } else if lit {
+        p.ink
     } else {
         p.ink2
     };
 
-    let pad = ctx.px(ROW_PAD);
+    let pad_l = ctx.px(ROW_PAD_L);
+    let pad_r = ctx.px(ROW_PAD_R);
     let icon = ctx.px(ICON);
     if let Some(glyph) = slot.action.icon() {
-        glyphicon::draw(
-            s,
-            glyph,
-            slot.rect.x + pad as i32,
-            slot.rect.y + (slot.rect.h as i32 - icon as i32) / 2,
-            icon,
-            ink,
-            255,
-        );
+        glyphicon::draw(s, glyph, slot.rect.x + pad_l as i32, slot.rect.y + (slot.rect.h as i32 - icon as i32) / 2, icon, ink, 255);
+    }
+    // Справа: сочетание или стрелка подменю.
+    let mut right = if matches!(slot.action, Action::Window(_)) { cross_rect(ctx, slot.rect).x } else { slot.rect.right() - pad_r as i32 };
+    if let Some(keys) = slot.action.keys() {
+        let face = ctx.face(Role::Caption);
+        let width = face.width(keys);
+        let kx = right - width as i32;
+        paint::text_clipped(ctx, s, Role::Caption, kx, paint::baseline(ctx, Role::Caption, slot.rect), width, keys, p.ink4);
+        right = kx - ctx.px(KEYS_GAP) as i32 + ctx.px(8) as i32;
+    } else if matches!(slot.action, Action::Submenu(_)) {
+        let arrow = ctx.px(12);
+        glyphicon::draw(s, Icon::ChevronRight, right - arrow as i32, slot.rect.y + (slot.rect.h as i32 - arrow as i32) / 2, arrow, p.ink4, 255);
+        right -= ctx.px(ARROW) as i32;
     }
     // Отступ подписи один и тот же со значком и без него: строка без картинки,
     // подтянутая к краю, ломает колонку подписей.
-    let x = slot.rect.x + (pad + icon + ctx.px(ICON_GAP)) as i32;
-    let right = if matches!(slot.action, Action::Window(_)) { cross_rect(ctx, slot.rect).x } else { slot.rect.right() - pad as i32 };
-    paint::text_clipped(
-        ctx,
-        s,
-        Role::Body,
-        x,
-        paint::baseline(ctx, Role::Body, slot.rect),
-        (right - x).max(0) as u32,
-        label,
-        ink,
-    );
+    let x = slot.rect.x + (pad_l + icon + ctx.px(ICON_GAP)) as i32;
+    paint::text_clipped(ctx, s, Role::Body, x, paint::baseline(ctx, Role::Body, slot.rect), (right - x).max(0) as u32, label, ink);
 }
 
 /// Вопрос об удалении.

@@ -102,6 +102,9 @@ pub enum Aim {
     /// числе видна сразу — щелчок попадает в соседний пункт, и прогон валится
     /// на строке, которой не дождался.
     ContextItem(usize, i32),
+    /// Пункт открытого подменю (›) меню стола — так же: номер и черты над
+    /// ним. Место подменю — из строки `desktop     : submenu at`.
+    SubItem(usize, i32),
     /// Середина окна.
     Middle(&'static str),
     /// Точка экрана как есть. Для раскладок, которые стенд не пересчитывает, —
@@ -176,10 +179,10 @@ const ICON_TILE: i32 = 46;
 
 /// Строка меню стола и поле вокруг списка.
 const CONTEXT_ROW_H: i32 = 32;
-const CONTEXT_ROW_GAP: i32 = 1;
-const CONTEXT_PAD: i32 = 8;
+const CONTEXT_ROW_GAP: i32 = 0;
+const CONTEXT_PAD: i32 = 4;
 /// Поле разделительной черты сверху и снизу.
-const CONTEXT_SEP_PAD: i32 = 5;
+const CONTEXT_SEP_PAD: i32 = 4;
 
 /// Середина кнопки заголовка, считая справа налево.
 fn title_button(log: &str, title: &str, from_right: i32) -> Result<(i32, i32)> {
@@ -246,6 +249,16 @@ fn context_menu(log: &str) -> Result<Rect> {
         .filter_map(parse_placement)
         .last()
         .context("в журнале нет открытого меню рабочего стола")
+}
+
+/// Где открыто подменю меню стола.
+fn context_submenu(log: &str) -> Result<Rect> {
+    let marker = "desktop     : submenu at ";
+    log.lines()
+        .filter_map(|line| line.split(marker).nth(1))
+        .filter_map(parse_placement)
+        .last()
+        .context("в журнале нет открытого подменю")
 }
 
 /// `53,48 800x576 (focused)` → прямоугольник.
@@ -340,8 +353,8 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         // сдвигается, чтобы не выехать, и прицел по точке щелчка попадал бы
         // мимо. Строка — высота глифа на масштаб меню плюс отступы по четыре
         // точки; масштаб меню ограничен двойкой самим столом.
-        Aim::ContextItem(index, breaks) => {
-            let rect = context_menu(log)?;
+        Aim::ContextItem(index, breaks) | Aim::SubItem(index, breaks) => {
+            let rect = if matches!(aim, Aim::SubItem(..)) { context_submenu(log)? } else { context_menu(log)? };
             let scale = ui_scale(log)?;
             let row = (CONTEXT_ROW_H + CONTEXT_ROW_GAP) * scale;
             let gap = (CONTEXT_SEP_PAD * 2 + 1) * scale;

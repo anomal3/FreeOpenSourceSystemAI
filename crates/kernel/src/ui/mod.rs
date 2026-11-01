@@ -309,18 +309,27 @@ fn open_list_of(
     desktop.refresh_panel(status);
 }
 
-/// Меню кнопки панели правой кнопкой (макет 11): «Закрыть окно» или
-/// «Закрыть все окна».
+/// Меню кнопки панели правой кнопкой (макет 11): «Закрепить на панели
+/// задач», «Закрыть окно», «Закрыть все окна».
 fn open_close_menu(desktop: &mut Compositor, app: App, status: &Status) {
     let mut members = if panel::labels() { alloc::vec::Vec::new() } else { desktop.group_members(app) };
     if members.is_empty() {
         members.push(app);
     }
-    let item = if members.len() > 1 { context::Action::CloseAll } else { context::Action::CloseOne };
+    // Окно кнопки — первым: «Закрыть окно» закрывает его, «Закрыть все
+    // окна» — всю группу (у одного окна второй пункт погашен).
+    if let Some(at) = members.iter().position(|member| *member == app) {
+        let first = members.remove(at);
+        members.insert(0, first);
+    }
+    let single = members.len() < 2;
     let (x, y) = desktop.pointer_position();
     let button = desktop.button_of(app).unwrap_or(Rect::new(x, y, 1, 1));
     *GROUP.lock() = members;
-    desktop.open_context(button.x, button.y, &[item]);
+    desktop.open_context(button.x, button.y, &context::Action::ON_BUTTON);
+    if single {
+        desktop.context_set_off(alloc::vec![context::Action::CloseAll]);
+    }
     desktop.context_select_none();
     if let Some(rect) = desktop.context_rect() {
         kprintln!("  desktop     : context menu at {},{} {}x{} for button", rect.x, rect.y, rect.w, rect.h);
@@ -2135,9 +2144,8 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         // тогда, когда ничего не выбрано, относилось бы неизвестно к чему —
         // а на столе это означало бы удалённый наугад файл. `None` — целились
         // в окно или в кнопку панели: у них своего меню пока нет.
-        // Пункты меню файла собираются по месту: «Открыть с помощью» у
-        // каждого файла свой.
-        let file_items: alloc::vec::Vec<context::Action>;
+        // «Открыть с помощью ›» у каждого файла свой — программы приходят
+        // меню перед открытием (`context_handlers`).
         let target: Option<(&[context::Action], &str)> = if desktop.context_open() {
             desktop.close_context();
             None
@@ -2225,9 +2233,8 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                             // Файл: «Открыть» и «Открыть с помощью» —
                             // программы, которые умеют этот тип.
                             let handlers = desktop.icon_path(index).map(|path| file_handlers(&path)).unwrap_or_default();
-                            file_items = file_menu(handlers.len().min(6));
                             desktop.context_handlers(handlers);
-                            (&file_items[..], "entry")
+                            (&context::Action::ON_FILE[..], "entry")
                         }
                         None => (&context::Action::ON_DESKTOP[..], "desktop"),
                     }
@@ -3603,20 +3610,6 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
     }
 }
 
-/// Пункты меню файла с `count` программами «Открыть с помощью».
-fn file_menu(count: usize) -> alloc::vec::Vec<context::Action> {
-    let mut items = alloc::vec::Vec::with_capacity(count + 3);
-    items.push(context::Action::Open);
-    for index in 0..count {
-        items.push(context::Action::OpenWith(index as u8));
-    }
-    items.push(context::Action::ChooseProgram);
-    items.push(context::Action::Rename);
-    items.push(context::Action::Delete);
-    items
-}
-
-
 /// Программы, которые открывают файл `path`: подпись и команда (путь
 /// допишется). Свои — «Блокнот» для текста; пакетные — по `opens=` их
 /// манифеста (поставили Notepad++ — он появится здесь).
@@ -3675,7 +3668,49 @@ fn start(desktop: &mut Compositor, command: &str) {
 /// правах» — оба ответа человек обязан увидеть, а закрывшееся меню не сказало
 /// бы ни того, ни другого.
 fn context_action(desktop: &mut Compositor, action: context::Action, status: &Status) {
+    // Серый пункт не нажимается: меню остаётся как было.
+    if !desktop.context_enabled(action) {
+        return;
+    }
     match action {
+        // Пункт с подменю ничего не делает сам: подменю открыл указатель.
+        context::Action::Submenu(_) => {}
+        context::Action::NewShortcut
+        | context::Action::ViewLarge
+        | context::Action::ViewMedium
+        | context::Action::ViewSmall
+        | context::Action::SortType
+        | context::Action::SortDate
+        | context::Action::RunAsAdmin
+        | context::Action::PinTaskbar
+        | context::Action::PinStart
+        | context::Action::PinQuick
+        | context::Action::Compress
+        | context::Action::Cut
+        | context::Action::Copy => {}
+        context::Action::Personalize => {
+            desktop.close_context();
+            open_settings(desktop, Section::Personal, status);
+        }
+        context::Action::OpenNewWindow => {
+            desktop.close_context();
+            if let Some((path, _)) = selected_entry(desktop) {
+                start(desktop, &alloc::format!("/bin/files {path}"));
+            }
+            desktop.refresh_panel(status);
+        }
+        // «Сортировка → По имени»: значки по порядку, запомненные места
+        // забыты.
+        context::Action::SortName => {
+            desktop.close_context();
+            icons::set_places("");
+            if let Err(err) = prefs::store_icon_places("") {
+                kprintln!("  desktop     : icon places not saved: {err}");
+            }
+            desktop.reload_icons();
+            log_icons(desktop);
+            kprintln!("  desktop     : icons sorted by name");
+        }
         context::Action::Open => {
             desktop.close_context();
             if let Some(index) = desktop.icon_selection() {
@@ -3714,9 +3749,16 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             (count, _) => desktop.context_confirm(&alloc::format!("Объектов в корзине: {count}"), true),
         },
         context::Action::Properties => {
-            let (count, bytes) = trash::usage();
-            desktop.context_note(&alloc::format!("{}: объектов {count}, {}", trash::LABEL, human_size(bytes)));
-            kprintln!("  desktop     : trash has {count} items, {bytes} bytes");
+            let trash_selected = desktop.icon_selection().is_some_and(|index| matches!(desktop.icon_kind(index), Some(icons::Kind::Trash(_))));
+            if trash_selected {
+                let (count, bytes) = trash::usage();
+                desktop.context_note(&alloc::format!("{}: объектов {count}, {}", trash::LABEL, human_size(bytes)));
+                kprintln!("  desktop     : trash has {count} items, {bytes} bytes");
+            } else if let Some((path, label)) = selected_entry(desktop) {
+                let note = entry_facts(&path, &label);
+                kprintln!("  desktop     : properties of '{path}': {note}");
+                desktop.context_note(&note);
+            }
         }
         context::Action::NewFolder | context::Action::NewTextFile => {
             let directory = action == context::Action::NewFolder;
@@ -3820,7 +3862,8 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             *HOVER_LIST.lock() = None;
             desktop.close_context();
             let members = GROUP.lock().clone();
-            for app in members {
+            let count = if action == context::Action::CloseOne { 1 } else { members.len() };
+            for app in members.into_iter().take(count) {
                 close_from_panel(desktop, app);
             }
             desktop.refresh_panel(status);
@@ -3869,7 +3912,9 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         }
         context::Action::OpenInTerminal => {
             desktop.close_context();
-            if let Some((path, _)) = selected_entry(desktop) {
+            // На пустом месте стола — каталог стола.
+            let target = selected_entry(desktop).map(|(path, _)| path).or_else(|| Some(context::desktop_dir()));
+            if let Some(path) = target {
                 launch(desktop, App::Terminal);
                 type_text(&alloc::format!("cd {path}"), false);
                 crate::input::post(KeyCode::Enter, true);
@@ -4082,6 +4127,24 @@ fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status
             desktop.present();
             true
         }
+    }
+}
+
+/// «Свойства» записи стола одной строкой: тип и размер (у ярлыка — команда).
+fn entry_facts(path: &str, label: &str) -> String {
+    // У ярлыка в пути — команда запуска: такого файла нет, и ответ — она сама.
+    match crate::fs::resolve_as(crate::user::session::credentials(), path, crate::vfs::perm::Access::NONE) {
+        Some(Ok(node)) => {
+            let meta = node.metadata();
+            let directory = meta.kind == crate::vfs::NodeKind::Directory;
+            let kind = sysconf::filetypes::kind_of(label, directory);
+            if directory {
+                alloc::format!("{label} — {}", kind.name.to_lowercase())
+            } else {
+                alloc::format!("{label} — {}, {}", kind.name.to_lowercase(), human_size(meta.size))
+            }
+        }
+        _ => alloc::format!("{label}: {path}"),
     }
 }
 
