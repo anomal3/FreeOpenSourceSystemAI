@@ -21,8 +21,9 @@ use crate::config;
 /// Имя файла настроек.
 pub const CONFIG: &str = "desktop.cfg";
 
-/// Сколько байт читать: файл — две строки.
-const LIMIT: usize = 4 * 1024;
+/// Сколько байт читать. Строки короткие, кроме мест значков стола (путь на
+/// значок, до [`super::icons`] сотни штук) — им и нужен запас.
+const LIMIT: usize = 16 * 1024;
 
 /// Прочитать тему при загрузке и применить её.
 ///
@@ -66,6 +67,15 @@ pub fn adopt() {
         } else {
             crate::kprintln!("  power       : screen off after {seconds} s, from {path}");
         }
+    }
+    // Масштаб стола, выбранный вручную (01.11).
+    if let Some(choice) = sysconf::value(text, "scale").and_then(mini_ui::theme::scale_choice_from_tag) {
+        mini_ui::theme::set_scale_choice(choice);
+        crate::kprintln!("  desktop     : scale {} from {}", mini_ui::theme::scale_choice_tag(choice), path);
+    }
+    // Места значков на столе (01.11).
+    if let Some(places) = sysconf::value(text, "icon_places") {
+        super::icons::set_places(places);
     }
     // Ярлыки, убранные со стола «Удалить ярлык» (24.10).
     if let Some(list) = sysconf::value(text, "hidden_shortcuts") {
@@ -124,6 +134,16 @@ pub fn store_screen_off(seconds: u32) -> Result<(), crate::vfs::VfsError> {
 /// Запомнить высоту заголовка.
 pub fn store_title_bar(height: u32) -> Result<(), crate::vfs::VfsError> {
     store_key("titlebar", &alloc::format!("{height}"))
+}
+
+/// Запомнить выбор масштаба.
+pub fn store_scale(choice: u32) -> Result<(), crate::vfs::VfsError> {
+    store_key("scale", mini_ui::theme::scale_choice_tag(choice))
+}
+
+/// Запомнить места значков стола (`место=ключ` через `|`).
+pub fn store_icon_places(list: &str) -> Result<(), crate::vfs::VfsError> {
+    store_key("icon_places", list)
 }
 
 /// Запомнить ярлыки, убранные со стола (подписи через `|`).

@@ -291,7 +291,27 @@ impl Section {
 }
 
 /// Разрешения, которые можно попросить у прошивки.
-pub const MODES: [(u32, u32); 5] = [(1024, 768), (1280, 720), (1280, 800), (1600, 900), (1920, 1080)];
+///
+/// Первые три стоят на своих местах: сценарий `vmsvga` идёт по списку
+/// клавишами (первый — 1024×768, третий — 1280×800). Выше 1920×1080 — с 01.11
+/// (Роман: «2K нет»): VMSVGA и virtio-gpu умеют до 4096 по стороне, а
+/// режим, которого адаптер не тянет, отклоняет сам драйвер со своей причиной.
+pub const MODES: [(u32, u32); 14] = [
+    (1024, 768),
+    (1280, 720),
+    (1280, 800),
+    (1366, 768),
+    (1440, 900),
+    (1600, 900),
+    (1680, 1050),
+    (1920, 1080),
+    (1920, 1200),
+    (2560, 1080),
+    (2560, 1440),
+    (2560, 1600),
+    (3440, 1440),
+    (3840, 2160),
+];
 
 /// Что панель задач показывает рядом с часами (фаза 69b).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -324,6 +344,8 @@ enum Deed {
     /// Перейти на страницу (строка со стрелкой, результат поиска).
     Open(Section),
     Mode(u32, u32),
+    /// Масштаб стола: 0 — по ширине экрана, 1 — 100 %, 2 — 200 %.
+    Scale(u32),
     Theme(bool),
     Accent(theme::Accent),
     Wallpaper(theme::Wallpaper),
@@ -921,6 +943,16 @@ impl SettingsView {
             Deed::Mode(width, height) => {
                 self.remembered = Some(crate::slot::request_screen_mode(width, height));
                 self.mode_request = Some((width, height));
+            }
+            Deed::Scale(choice) => {
+                theme::set_scale_choice(choice);
+                self.report = Some(match super::prefs::store_scale(choice) {
+                    Ok(()) => {
+                        kprintln!("  settings    : scale {} saved", theme::scale_choice_tag(choice));
+                        Report::ok(String::from("масштаб запомнен, применится после перезагрузки"))
+                    }
+                    Err(err) => Report::bad(format!("масштаб не запомнен: {err}")),
+                });
             }
             Deed::Theme(dark) => {
                 if theme::set_dark(dark) {

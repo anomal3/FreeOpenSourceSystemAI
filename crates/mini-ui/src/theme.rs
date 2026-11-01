@@ -791,3 +791,50 @@ pub const fn geometry_scale(width: u32, height: u32) -> u32 {
     }
     1
 }
+
+/// Множитель с учётом выбора человека: 0 — по экрану ([`geometry_scale`]),
+/// 1 или 2 — заданный в «Параметрах» (01.11: на мониторе 2560 автоматические
+/// 200 % слишком крупны, а выбрать было нечем).
+#[must_use]
+pub const fn geometry_scale_for(choice: u32, width: u32, height: u32) -> u32 {
+    match choice {
+        1 | 2 => choice,
+        _ => geometry_scale(width, height),
+    }
+}
+
+/// Выбор масштаба, запомненный в настройках (0 — авто, 1, 2). Действует он
+/// с запуска стола: стол перестраивать на ходу дорого и рискованно.
+static SCALE_CHOICE: AtomicU8 = AtomicU8::new(0);
+
+/// Запомнить выбор масштаба.
+pub fn set_scale_choice(choice: u32) {
+    SCALE_CHOICE.store(if choice <= 2 { choice as u8 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Выбор масштаба: 0 — авто, 1 — 100 %, 2 — 200 %.
+#[must_use]
+pub fn scale_choice() -> u32 {
+    u32::from(SCALE_CHOICE.load(Ordering::Relaxed))
+}
+
+/// Слово выбора для файла настроек и журнала.
+#[must_use]
+pub const fn scale_choice_tag(choice: u32) -> &'static str {
+    match choice {
+        1 => "100",
+        2 => "200",
+        _ => "auto",
+    }
+}
+
+/// Выбор из слова файла настроек.
+#[must_use]
+pub fn scale_choice_from_tag(tag: &str) -> Option<u32> {
+    match tag {
+        "auto" => Some(0),
+        "100" => Some(1),
+        "200" => Some(2),
+        _ => None,
+    }
+}

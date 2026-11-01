@@ -546,7 +546,7 @@ fn sqrt(value: f64) -> f64 {
 pub extern "C" fn _start(_argc: usize, _argv: *const *const u8) -> ! {
     let info = app::start(&SPEC);
     // Калькулятор — узкий и высокий, как в Windows, а не две трети экрана.
-    let scale = theme::geometry_scale(info.screen_w.max(1), info.screen_h.max(1));
+    let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
     let width = (340 * scale).min(info.screen_w);
     let height = (520 * scale).min(info.screen_h.saturating_sub(80 * scale)).max(360);
     app::run(&SPEC, &info, (width, height), |_, _| Calc::new())

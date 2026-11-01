@@ -1130,9 +1130,64 @@ impl Compositor {
     /// Выделить значок (или снять выделение).
     pub fn select_icon(&mut self, index: Option<usize>) {
         let damage = self.icons.select(index);
+        self.icon_damage(damage);
+    }
+
+    /// Перерисовать то, что значки задели.
+    fn icon_damage(&mut self, damage: Rect) {
         self.invalidate_under_rect(damage);
         if !damage.is_empty() {
             self.mark(damage);
+        }
+    }
+
+    /// Ctrl+щелчок по значку: добавить к выделению или убрать.
+    pub fn toggle_icon(&mut self, index: usize) {
+        let damage = self.icons.toggle(index);
+        self.icon_damage(damage);
+    }
+
+    /// Сделать выделенный значок главным, не снимая остального выделения.
+    pub fn focus_icon(&mut self, index: usize) {
+        self.icons.focus(index);
+    }
+
+    /// Выделен ли значок.
+    #[must_use]
+    pub fn icon_marked(&self, index: usize) -> bool {
+        self.icons.is_marked(index)
+    }
+
+    /// Номера выделенных значков.
+    #[must_use]
+    pub fn marked_icons(&self) -> alloc::vec::Vec<usize> {
+        self.icons.marked()
+    }
+
+    /// Рамка выделения на столе (`None` — отпустили); `add` — что было
+    /// выделено до неё и остаётся (с Ctrl).
+    pub fn icon_band(&mut self, band: Option<Rect>, add: &[usize]) {
+        let damage = self.icons.set_band(band, add);
+        self.icon_damage(damage);
+    }
+
+    /// Нести выделенные значки: сдвиг от точки, где их взяли.
+    pub fn lift_icons(&mut self, dx: i32, dy: i32) {
+        let damage = self.icons.lift(dx, dy);
+        self.icon_damage(damage);
+    }
+
+    /// Положить несомые значки по сетке и запомнить их места.
+    pub fn drop_icons(&mut self) {
+        let before = self.icons.bounds();
+        let (damage, places) = self.icons.drop_lifted();
+        self.icon_damage(damage.union(&before).union(&self.icons.bounds()));
+        if let Some(places) = places {
+            super::icons::set_places(&places);
+            match super::prefs::store_icon_places(&places) {
+                Ok(()) => crate::kprintln!("  desktop     : icons moved, places saved"),
+                Err(err) => crate::kprintln!("  desktop     : icons moved, places not saved: {err}"),
+            }
         }
     }
 

@@ -121,8 +121,20 @@ pub struct Icons {
     scale: u32,
     /// Системные значки и содержимое каталога стола, в порядке показа.
     items: Vec<Item>,
-    /// Выбранный значок — номер в [`Icons::items`].
+    /// Выбранный значок — номер в [`Icons::items`]: тот, по которому щёлкнули
+    /// последним (к нему относится меню и «Открыть»).
     selected: Option<usize>,
+    /// Выделенные значки, по одному признаку на значок (01.11): рамкой,
+    /// Ctrl+щелчком, а переносятся они вместе.
+    marked: Vec<bool>,
+    /// Место каждого значка в сетке (номер ячейки по столбцам). Значки не
+    /// обязаны идти подряд: человек ставит их, куда перетащил, как в Windows.
+    slots: Vec<usize>,
+    /// Рамка выделения, пока её тянут.
+    band: Option<Rect>,
+    /// Насколько сдвинуты выделенные значки, пока их несут: они рисуются
+    /// поверх готовой картинки сетки, а в ней их нет.
+    lift: Option<(i32, i32)>,
     /// Сколько значков помещается в столбец.
     ///
     /// Считается от рабочей области, а не задано числом: на 800×600 в столбец
@@ -155,6 +167,24 @@ pub struct Icons {
     /// Имена записей реестра пакетов при последнем перечитывании: сменились —
     /// значки пакетов пора перечитать (см. [`Icons::packages_changed`]).
     packages: String,
+}
+
+/// Места значков, запомненные в `desktop.cfg` (`место=ключ` через `|`).
+static PLACES: crate::sync::SpinLock<String> = crate::sync::SpinLock::new(String::new());
+
+/// Дальше этой ячейки значок не ставится: запись в файле настроек могла
+/// испортиться, а сетка в тысячи столбцов — это картинка шире любой памяти.
+const MAX_SLOT: usize = 4096;
+
+/// Места значков — из настроек при загрузке.
+pub fn set_places(list: &str) {
+    *PLACES.lock() = String::from(list);
+}
+
+/// По чему значок узнаётся в файле мест: путь (файл стола, команда ярлыка),
+/// у системного — подпись.
+fn key_of(item: &Item) -> &str {
+    item.path.as_deref().unwrap_or(&item.label)
 }
 
 /// Подписи ярлыков, убранных со стола «Удалить ярлык», через `|`.
@@ -211,6 +241,10 @@ impl Icons {
             scale,
             items: Vec::new(),
             selected: None,
+            marked: Vec::new(),
+            slots: Vec::new(),
+            band: None,
+            lift: None,
             rows: 1,
             face: None,
             face_at: Rect::EMPTY,
@@ -219,7 +253,64 @@ impl Icons {
             packages: String::new(),
         };
         icons.items = system_items();
+        icons.place_items();
         icons
+    }
+
+    /// Расставить значки: каждому — его запомненное место, если оно свободно,
+    /// остальным — первые свободные ячейки по порядку. Выделение сбрасывается
+    /// до длины списка.
+    fn place_items(&mut self) {
+        let count = self.items.len();
+        self.marked.resize(count, false);
+        self.marked.truncate(count);
+        self.slots = alloc::vec![usize::MAX; count];
+        if theme::is_mobile() {
+            // На телефоне сетка рядами по порядку: перетаскивания там нет.
+            self.slots = (0..count).collect();
+            return;
+        }
+        let places = PLACES.lock();
+        let mut taken: Vec<usize> = Vec::new();
+        for (index, item) in self.items.iter().enumerate() {
+            let key = key_of(item);
+            let saved = places.split('|').find_map(|entry| {
+                let (slot, name) = entry.split_once('=')?;
+                (name == key).then(|| slot.parse::<usize>().ok()).flatten()
+            });
+            if let Some(slot) = saved.filter(|slot| *slot < MAX_SLOT && !taken.contains(slot)) {
+                self.slots[index] = slot;
+                taken.push(slot);
+            }
+        }
+        drop(places);
+        let mut next = 0;
+        for index in 0..count {
+            if self.slots[index] != usize::MAX {
+                continue;
+            }
+            while taken.contains(&next) {
+                next += 1;
+            }
+            self.slots[index] = next;
+            taken.push(next);
+        }
+    }
+
+    /// Места значков строкой для файла настроек: `место=ключ` через `|`.
+    fn places_text(&self) -> String {
+        let mut text = String::new();
+        for (index, item) in self.items.iter().enumerate() {
+            let key = key_of(item);
+            if key.contains('|') || key.contains('\n') {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push('|');
+            }
+            text.push_str(&alloc::format!("{}={key}", self.slots[index]));
+        }
+        text
     }
 
     /// Контекст отрисовки.
@@ -277,9 +368,19 @@ impl Icons {
             .selected
             .and_then(|index| self.items.get(index))
             .and_then(|item| item.path.clone());
+        let keep_marked: Vec<String> = self
+            .items
+            .iter()
+            .zip(&self.marked)
+            .filter(|(_, marked)| **marked)
+            .map(|(item, _)| String::from(key_of(item)))
+            .collect();
 
         self.items = system_items();
         self.selected = None;
+        self.marked.clear();
+        self.band = None;
+        self.lift = None;
         // Программы установленных пакетов, попросившие значок (`desktop=yes`
         // в манифесте, фаза 71i): после системных, до файлов стола.
         self.packages = package_signature();
@@ -302,7 +403,7 @@ impl Icons {
             // файлов. Картинку сетки собрать заново и здесь: без этого на
             // свежей установке значки пакетов (Chromium, Rider) числились, но
             // не рисовались — выход был раньше `rebuild` (VirtualBox, 27.10).
-            self.rebuild();
+            self.settle(keep.as_deref(), &keep_marked);
             return;
         };
 
@@ -329,8 +430,20 @@ impl Icons {
             });
         }
 
+        self.settle(keep.as_deref(), &keep_marked);
+    }
+
+    /// Конец перечитывания: места, выделение по ключам, картинка сетки.
+    fn settle(&mut self, keep: Option<&str>, keep_marked: &[String]) {
+        self.place_items();
         if let Some(path) = keep {
-            self.selected = self.index_of_path(&path);
+            self.selected = self.index_of_path(path);
+        }
+        for index in 0..self.items.len() {
+            self.marked[index] = keep_marked.iter().any(|key| key == key_of(&self.items[index]));
+        }
+        if let Some(index) = self.selected {
+            self.marked[index] = true;
         }
         self.rebuild();
     }
@@ -371,11 +484,17 @@ impl Icons {
         if theme::is_mobile() {
             return self.cell_mobile(index, ctx);
         }
+        self.place(self.slots.get(index).copied().unwrap_or(index))
+    }
+
+    /// Прямоугольник ячейки сетки с номером `slot` (по столбцам).
+    fn place(&self, slot: usize) -> Rect {
+        let ctx = self.ctx();
         let margin = ctx.px(theme::ICON_MARGIN) as i32;
         let step_x = ctx.px(theme::ICON_CELL_W + theme::ICON_GAP);
         let step_y = ctx.px(theme::ICON_CELL_H + theme::ICON_GAP);
-        let column = index as u32 / self.rows.max(1);
-        let row = index as u32 % self.rows.max(1);
+        let column = slot as u32 / self.rows.max(1);
+        let row = slot as u32 % self.rows.max(1);
         Rect::new(
             margin + (column * step_x) as i32,
             margin + (row * step_y) as i32,
@@ -430,7 +549,10 @@ impl Icons {
             );
         }
         let ctx = self.ctx();
-        let columns = (self.items.len() as u32).div_ceil(self.rows.max(1)).max(1);
+        // По самому дальнему занятому месту, а не по числу значков: значок,
+        // перенесённый в пятый столбец, тоже должен попасть в картинку сетки.
+        let last = self.slots.iter().copied().max().unwrap_or(0).max(self.items.len().saturating_sub(1));
+        let columns = (last as u32 + 1).div_ceil(self.rows.max(1)).max(1);
         Rect::new(
             ctx.px(theme::ICON_MARGIN) as i32,
             ctx.px(theme::ICON_MARGIN) as i32,
@@ -476,19 +598,152 @@ impl Icons {
     /// Выбрать значок. Возвращает область, которую надо перерисовать.
     pub fn select(&mut self, index: Option<usize>) -> Rect {
         let index = index.filter(|index| *index < self.items.len());
-        if self.selected == index {
+        let only = |marked: &[bool]| marked.iter().enumerate().all(|(at, on)| *on == (Some(at) == index));
+        if self.selected == index && only(&self.marked) {
             return Rect::EMPTY;
         }
-        let previous = self.selected;
         self.selected = index;
         // Перерисовать надо и то, что перестало быть выбранным: подсветка
         // снимается ровно так же, как ставится.
         let mut damage = Rect::EMPTY;
-        for slot in [previous, index].into_iter().flatten() {
-            damage = damage.union(&self.cell(slot));
+        for at in 0..self.items.len() {
+            let on = Some(at) == index;
+            if self.marked[at] != on {
+                self.marked[at] = on;
+                damage = damage.union(&self.cell(at));
+            }
+        }
+        if let Some(at) = index {
+            damage = damage.union(&self.cell(at));
         }
         self.rebuild();
         damage
+    }
+
+    /// Ctrl+щелчок: добавить значок к выделению или убрать из него.
+    pub fn toggle(&mut self, index: usize) -> Rect {
+        if index >= self.items.len() {
+            return Rect::EMPTY;
+        }
+        self.marked[index] = !self.marked[index];
+        self.selected = if self.marked[index] {
+            Some(index)
+        } else {
+            self.marked.iter().position(|on| *on)
+        };
+        self.rebuild();
+        self.cell(index)
+    }
+
+    /// Сделать выделенный значок главным (к нему — «Открыть», «Переименовать»),
+    /// не трогая остального выделения.
+    pub fn focus(&mut self, index: usize) {
+        if self.is_marked(index) {
+            self.selected = Some(index);
+        }
+    }
+
+    /// Выделен ли значок.
+    #[must_use]
+    pub fn is_marked(&self, index: usize) -> bool {
+        self.marked.get(index).copied().unwrap_or(false)
+    }
+
+    /// Номера выделенных значков.
+    #[must_use]
+    pub fn marked(&self) -> Vec<usize> {
+        (0..self.items.len()).filter(|at| self.marked[*at]).collect()
+    }
+
+    /// Рамка выделения: выделены ровно значки, которых она касается
+    /// (`add` — к прежнему выделению, с Ctrl). `None` — рамку отпустили.
+    /// Возвращает, что перерисовать.
+    pub fn set_band(&mut self, band: Option<Rect>, add: &[usize]) -> Rect {
+        let mut damage = self.band.unwrap_or(Rect::EMPTY);
+        self.band = band;
+        if let Some(band) = band {
+            damage = damage.union(&band);
+            let mut changed = false;
+            for at in 0..self.items.len() {
+                let on = add.contains(&at) || !self.cell(at).intersect(&band).is_empty();
+                if self.marked[at] != on {
+                    self.marked[at] = on;
+                    changed = true;
+                    damage = damage.union(&self.cell(at));
+                }
+            }
+            if changed {
+                self.selected = self.marked.iter().position(|on| *on);
+                self.rebuild();
+            }
+        }
+        damage
+    }
+
+    /// Нести выделенные значки: сдвиг от точки, где их взяли. Первый сдвиг
+    /// убирает их из картинки сетки — дальше они рисуются поверх неё.
+    pub fn lift(&mut self, dx: i32, dy: i32) -> Rect {
+        let before = self.lifted_area();
+        let first = self.lift.is_none();
+        self.lift = Some((dx, dy));
+        if first {
+            self.rebuild();
+        }
+        before.union(&self.lifted_area())
+    }
+
+    /// Где сейчас нарисованы несомые значки (с поправкой на сдвиг).
+    fn lifted_area(&self) -> Rect {
+        let Some((dx, dy)) = self.lift else {
+            return Rect::EMPTY;
+        };
+        let mut area = Rect::EMPTY;
+        for at in self.marked() {
+            area = area.union(&self.cell(at).translate(dx, dy));
+            area = area.union(&self.cell(at));
+        }
+        area
+    }
+
+    /// Положить несомые значки: каждый встаёт в ячейку под тем местом, куда
+    /// его донесли; занятая чужим значком — ближайшая свободная за ней.
+    /// Возвращает, что перерисовать, и строку мест для настроек, если места
+    /// изменились.
+    pub fn drop_lifted(&mut self) -> (Rect, Option<String>) {
+        let damage = self.lifted_area();
+        let Some((dx, dy)) = self.lift.take() else {
+            return (damage, None);
+        };
+        let ctx = self.ctx();
+        let step_x = ctx.px(theme::ICON_CELL_W + theme::ICON_GAP) as i32;
+        let step_y = ctx.px(theme::ICON_CELL_H + theme::ICON_GAP) as i32;
+        let rows = self.rows.max(1) as i32;
+        // Сдвиг в ячейках — по ближайшей, как прилипание к сетке у Windows.
+        let shift_c = (dx + dx.signum() * step_x / 2) / step_x.max(1);
+        let shift_r = (dy + dy.signum() * step_y / 2) / step_y.max(1);
+        let moving = self.marked();
+        if moving.is_empty() || (shift_c == 0 && shift_r == 0) {
+            self.rebuild();
+            return (damage, None);
+        }
+        let mut taken: Vec<usize> = (0..self.items.len()).filter(|at| !self.marked[*at]).map(|at| self.slots[at]).collect();
+        for &at in &moving {
+            let slot = self.slots[at] as i32;
+            let column = (slot / rows + shift_c).max(0);
+            let row = (slot % rows + shift_r).clamp(0, rows - 1);
+            let mut target = (column * rows + row) as usize;
+            while taken.contains(&target) && target < MAX_SLOT {
+                target += 1;
+            }
+            self.slots[at] = target.min(MAX_SLOT - 1);
+            taken.push(self.slots[at]);
+        }
+        self.rebuild();
+        let mut area = damage;
+        for &at in &moving {
+            area = area.union(&self.cell(at));
+        }
+        (area, Some(self.places_text()))
     }
 
     /// Нарисовать значки, попадающие в полосу кадра.
@@ -499,6 +754,29 @@ impl Icons {
     /// обрезка была обязательной: нарисованный целиком ради задетого края,
     /// значок ложился поверх закрывающего его окна.
     pub fn draw(&self, back: &mut Surface, band: Rect, dy: i32) {
+        self.draw_grid(back, band, dy);
+        // Несомые значки — поверх сетки, со сдвигом от своих мест.
+        if let Some((lx, ly)) = self.lift {
+            for at in self.marked() {
+                let cell = self.cell(at).translate(lx, ly);
+                if !cell.intersect(&band).is_empty() {
+                    self.draw_one(back, cell, dy, &self.items[at], true);
+                }
+            }
+        }
+        // Рамка выделения: полупрозрачная заливка и обводка цветом акцента.
+        if let Some(rect) = self.band {
+            let visible = rect.intersect(&band);
+            if !visible.is_empty() {
+                let p = self.ctx().palette;
+                draw::blend_rect(back, visible.translate(0, dy), p.hover2.color, p.hover2.alpha);
+                draw::rounded_stroke(back, rect.translate(0, dy), 0, p.accline.color, p.accline.alpha);
+            }
+        }
+    }
+
+    /// Сетка значков (без несомых) — в полосу кадра.
+    fn draw_grid(&self, back: &mut Surface, band: Rect, dy: i32) {
         // Готовая картинка — одним копированием той части, что попала в полосу.
         if let Some(face) = self.face.as_ref() {
             let visible = self.face_at.intersect(&band);
@@ -535,11 +813,11 @@ impl Icons {
         }
         for index in 0..self.items.len() {
             let cell = self.cell(index);
-            if cell.intersect(&band).is_empty() {
+            if cell.intersect(&band).is_empty() || (self.lift.is_some() && self.is_marked(index)) {
                 continue;
             }
             let item = &self.items[index];
-            self.draw_one(back, cell, dy, item, self.selected == Some(index));
+            self.draw_one(back, cell, dy, item, self.is_marked(index));
         }
     }
 
@@ -563,11 +841,14 @@ impl Icons {
             return;
         };
         for index in 0..self.items.len() {
+            // Несомые значки в картинку не входят: их рисует `draw` поверх.
+            if self.lift.is_some() && self.is_marked(index) {
+                continue;
+            }
             let cell = self.cell(index);
             let local = cell.translate(-area.x, -area.y);
             let item = &self.items[index];
-            let selected = self.selected == Some(index);
-            self.draw_one(&mut face, local, 0, item, selected);
+            self.draw_one(&mut face, local, 0, item, self.is_marked(index));
         }
         self.face = Some(face);
         self.face_at = area;

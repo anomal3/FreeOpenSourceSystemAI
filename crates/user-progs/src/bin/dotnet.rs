@@ -130,7 +130,8 @@ impl Console {
         };
         mini_ui::use_raw_format(info.pixel_format);
         mini_ui::theme::set_dark(info.flags & SYSINFO_DARK != 0);
-        let tier = mini_ui::paint::Ctx::scaled(mini_ui::theme::geometry_scale(
+        let tier = mini_ui::paint::Ctx::scaled(mini_ui::theme::geometry_scale_for(
+            user_abi::sysinfo_scale_choice(info.flags),
             info.screen_w,
             info.screen_h,
         ))

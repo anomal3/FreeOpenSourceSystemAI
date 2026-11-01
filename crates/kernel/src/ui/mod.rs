@@ -391,6 +391,20 @@ const PASTE_LIMIT: usize = 1000;
 static LAST_ICON_CLICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static LAST_ICON: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
 
+/// Что делает левая кнопка, нажатая на столе, пока её держат (01.11).
+enum IconGesture {
+    /// Нажали на значок: дальше его (и всё выделенное) несут.
+    Carry { x0: i32, y0: i32, moved: bool },
+    /// Нажали на пустое место: тянут рамку; `keep` — выделенное до неё (Ctrl).
+    Band { x0: i32, y0: i32, keep: alloc::vec::Vec<usize> },
+}
+
+/// Жест левой кнопки на столе; кончается отпусканием.
+static ICON_GESTURE: SpinLock<Option<IconGesture>> = SpinLock::new(None);
+
+/// С какого сдвига нажатие на значок становится переносом, а не щелчком.
+const CARRY_THRESHOLD: i32 = 4;
+
 // ---------------------------------------------------------------------------
 // Запуск
 // ---------------------------------------------------------------------------
@@ -400,6 +414,15 @@ static LAST_ICON: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32:
 /// Возвращает `false`, если экрана нет или памяти под окна не хватило. Ядро в
 /// этом случае продолжает работать с оболочкой в серийной консоли — графика не
 /// является условием работы системы.
+/// Выбор масштаба, с которым поднялся стол (0 — по экрану, 1, 2): его
+/// получают программы в `SysInfo::flags`.
+static APPLIED_SCALE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Выбор масштаба, действующий с запуска стола.
+pub fn applied_scale_choice() -> u32 {
+    APPLIED_SCALE.load(Ordering::Relaxed)
+}
+
 pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     let Some(screen) = Screen::new(fb) else {
         return false;
@@ -411,12 +434,14 @@ pub fn init(fb: &boot_info::Framebuffer, boot_flags: u64) -> bool {
     // Спрашивается она у экрана, а не у настройки: человек, включивший систему
     // на телефоне, не должен сначала объяснять ей, что это телефон.
     theme::set_form(theme::form_for(screen.width(), screen.height()));
-    let scale = theme::geometry_scale(screen.width(), screen.height());
     // Тема читается **до** создания композитора: палитра выбирается один раз,
     // при сборке первого кадра, и тема, применённая после, потребовала бы
     // перекрасить всё заново — то есть показать человеку вспышку чужого цвета
-    // на каждой загрузке.
+    // на каждой загрузке. Масштаб — после неё: выбор человека лежит там же.
     prefs::adopt();
+    let choice = theme::scale_choice();
+    APPLIED_SCALE.store(choice, Ordering::Relaxed);
+    let scale = theme::geometry_scale_for(choice, screen.width(), screen.height());
     // Буфер кадра — условие работы стола, а не украшение: без него собирать
     // картинку негде. Не хватило памяти — система работает в серийной линии,
     // ровно как на машине без фреймбуфера.
@@ -1947,6 +1972,59 @@ fn wheel(desktop: &mut Compositor, x: i32, y: i32, clicks: i32) {
     }
 }
 
+/// Левую кнопку, нажатую на столе, ведут: несут значки или тянут рамку.
+fn icon_gesture_to(desktop: &mut Compositor, x: i32, y: i32) {
+    let mut gesture = ICON_GESTURE.lock();
+    match gesture.as_mut() {
+        Some(IconGesture::Carry { x0, y0, moved }) => {
+            if !*moved && (x - *x0).abs() + (y - *y0).abs() < CARRY_THRESHOLD {
+                return;
+            }
+            *moved = true;
+            let (dx, dy) = (x - *x0, y - *y0);
+            drop(gesture);
+            desktop.lift_icons(dx, dy);
+        }
+        Some(IconGesture::Band { x0, y0, keep }) => {
+            let band = Rect::new(
+                (*x0).min(x),
+                (*y0).min(y),
+                (x - *x0).unsigned_abs().max(1),
+                (y - *y0).unsigned_abs().max(1),
+            );
+            let keep = core::mem::take(keep);
+            desktop.icon_band(Some(band), &keep);
+            if let Some(IconGesture::Band { keep: slot, .. }) = gesture.as_mut() {
+                *slot = keep;
+            }
+        }
+        None => {}
+    }
+}
+
+/// Левую кнопку отпустили: положить значки по сетке или убрать рамку.
+fn icon_gesture_end(desktop: &mut Compositor) {
+    let Some(gesture) = ICON_GESTURE.lock().take() else {
+        return;
+    };
+    match gesture {
+        IconGesture::Carry { moved: true, .. } => {
+            desktop.drop_icons();
+            // Перенос — не щелчок: следующий щелчок не должен стать вторым
+            // щелчком двойного.
+            LAST_ICON.store(u32::MAX, core::sync::atomic::Ordering::Relaxed);
+        }
+        IconGesture::Carry { .. } => {}
+        IconGesture::Band { .. } => {
+            desktop.icon_band(None, &[]);
+            let marked = desktop.marked_icons().len();
+            if marked > 0 {
+                kprintln!("  desktop     : {marked} icon(s) selected by the frame");
+            }
+        }
+    }
+}
+
 fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     // На сколько сдвинулся курсор. У мыши это приехало в отчёте, у планшета
     // приходится вычесть одно положение из другого: устройство сообщило точку,
@@ -1974,6 +2052,9 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     if (dx != 0 || dy != 0) && event.buttons.contains(Buttons::LEFT) {
         // Палец ведут по экранной клавиатуре: путь копится до отпускания.
         desktop.keyboard_stroke_to(x, y);
+    }
+    if (dx != 0 || dy != 0) && event.buttons.contains(Buttons::LEFT) {
+        icon_gesture_to(desktop, x, y);
     }
     if dx != 0 || dy != 0 {
         hover(desktop, x, y, event.buttons, status);
@@ -2067,7 +2148,13 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         } else {
             Some(match desktop.icon_at(x, y) {
                 Some(index) => {
-                    desktop.select_icon(Some(index));
+                    // По выделенному — меню для всего выделенного (как в
+                    // Windows), по невыделенному — выделить только его.
+                    if desktop.icon_marked(index) {
+                        desktop.focus_icon(index);
+                    } else {
+                        desktop.select_icon(Some(index));
+                    }
                     // Меню по тому, во что целились (как в Windows): ярлык
                     // программы, системный значок, папка, файл.
                     match desktop.icon_kind(index) {
@@ -2123,6 +2210,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         release_pointer(desktop, x, y, 2, status);
     }
     if event.released(Buttons::LEFT) {
+        icon_gesture_end(desktop);
         release_pointer(desktop, x, y, 1, status);
         if SELECTING.swap(false, Ordering::Relaxed) {
             if let Some(text) = desktop.find(App::Terminal).and_then(Window::term_select_end) {
@@ -2592,7 +2680,24 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
 
     // 3. Значки на столе — ниже окон, но выше фона.
     if let Some(index) = desktop.icon_at(x, y) {
-        desktop.select_icon(Some(index));
+        let ctrl = crate::input::modifiers().contains(Modifiers::CTRL);
+        if ctrl && !theme::is_mobile() {
+            // Ctrl+щелчок — добавить к выделению или убрать, как в Windows;
+            // двойным щелчком он не считается.
+            desktop.toggle_icon(index);
+            LAST_ICON.store(u32::MAX, core::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        // По выделенному значку — выделение остаётся: так его тянут
+        // вместе с остальными. По невыделенному — выделен только он.
+        if desktop.icon_marked(index) {
+            desktop.focus_icon(index);
+        } else {
+            desktop.select_icon(Some(index));
+        }
+        if !theme::is_mobile() {
+            *ICON_GESTURE.lock() = Some(IconGesture::Carry { x0: x, y0: y, moved: false });
+        }
         // Второй щелчок по тому же значку в пределах [`DOUBLE_CLICK_MS`]
         // открывает его. Порог во времени, а не «щелчок с Shift» и не
         // «одиночный открывает»: так это работает у всех, кто видел стол.
@@ -2620,8 +2725,17 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
     }
     // Щелчок по пустому столу снимает выделение: выбранным обязано оставаться
     // то, во что человек целился последним, а не то, что он выбрал минуту назад
-    // и уже забыл.
-    desktop.select_icon(None);
+    // и уже забыл. С Ctrl — остаётся, и рамка добавляет к нему.
+    let on_desktop = desktop.window_at(x, y).is_none() && !theme::is_mobile();
+    let ctrl = crate::input::modifiers().contains(Modifiers::CTRL);
+    let keep = if on_desktop && ctrl { desktop.marked_icons() } else { alloc::vec::Vec::new() };
+    if keep.is_empty() {
+        desktop.select_icon(None);
+    }
+    if on_desktop {
+        // Отсюда тянут рамку выделения (01.11).
+        *ICON_GESTURE.lock() = Some(IconGesture::Band { x0: x, y0: y, keep });
+    }
 
     // 4. Окна.
     if let Some((index, hit)) = desktop.window_at(x, y) {
@@ -3440,10 +3554,17 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             Some((_, label)) => desktop.context_rename(&label),
             None => desktop.context_note("nothing is selected"),
         },
-        context::Action::Delete => match selected_entry(desktop) {
-            Some((_, label)) => desktop.context_confirm(&label),
-            None => desktop.context_note("nothing is selected"),
-        },
+        context::Action::Delete => {
+            let entries = selected_entries(desktop);
+            match entries.as_slice() {
+                [] => match selected_entry(desktop) {
+                    Some((_, label)) => desktop.context_confirm(&label),
+                    None => desktop.context_note("nothing is selected"),
+                },
+                [(_, label)] => desktop.context_confirm(label),
+                many => desktop.context_confirm(&alloc::format!("{} объектов", many.len())),
+            }
+        }
         context::Action::NewFolder | context::Action::NewTextFile => {
             let directory = action == context::Action::NewFolder;
             match context::create_entry(directory) {
@@ -3667,6 +3788,20 @@ fn open_settings(desktop: &mut Compositor, section: Section, status: &Status) {
     desktop.refresh_panel(status);
 }
 
+/// Выделенные файлы и каталоги стола, когда выделено больше одного значка
+/// (01.11: рамкой или Ctrl+щелчком); иначе пусто — работает [`selected_entry`].
+fn selected_entries(desktop: &Compositor) -> alloc::vec::Vec<(String, String)> {
+    let marked = desktop.marked_icons();
+    if marked.len() < 2 {
+        return alloc::vec::Vec::new();
+    }
+    marked
+        .into_iter()
+        .filter(|index| matches!(desktop.icon_kind(*index), Some(icons::Kind::Folder | icons::Kind::File)))
+        .filter_map(|index| Some((desktop.icon_path(index)?, desktop.icon_label(index)?)))
+        .collect()
+}
+
 /// Что выбрано на столе, если это файл или каталог: путь и подпись.
 ///
 /// Системный значок сюда не попадает: у него нет пути, а переименовать
@@ -3729,20 +3864,37 @@ fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status
             true
         }
         context::Reply::Delete => {
-            match selected_entry(desktop) {
-                Some((path, label)) => match context::delete_entry(&path) {
+            // Всё выделенное, что лежит в каталоге стола; если выделен один
+            // значок — прежний путь (он же для единственного файла).
+            let mut entries = selected_entries(desktop);
+            if entries.is_empty() {
+                entries.extend(selected_entry(desktop));
+            }
+            if entries.is_empty() {
+                desktop.context_note("nothing is selected");
+            }
+            let (mut deleted, mut last_error) = (0usize, None);
+            for (path, _) in &entries {
+                match context::delete_entry(path) {
                     Ok(()) => {
                         kprintln!("  desktop     : deleted '{path}'");
-                        desktop.context_note(&alloc::format!("deleted {label}"));
-                        desktop.reload_icons();
-                        log_icons(desktop);
+                        deleted += 1;
                     }
                     Err(err) => {
                         kprintln!("  desktop     : cannot delete '{path}': {err}");
-                        desktop.context_note(&err);
+                        last_error = Some(err);
                     }
-                },
-                None => desktop.context_note("nothing is selected"),
+                }
+            }
+            match (deleted, last_error) {
+                (_, Some(err)) => desktop.context_note(&err),
+                (1, None) => desktop.context_note(&alloc::format!("deleted {}", entries[0].1)),
+                (n, None) if n > 1 => desktop.context_note(&alloc::format!("deleted {n} items")),
+                _ => {}
+            }
+            if deleted > 0 {
+                desktop.reload_icons();
+                log_icons(desktop);
             }
             desktop.present();
             true

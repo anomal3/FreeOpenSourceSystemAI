@@ -165,7 +165,7 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
     // телефоне порог по ширине не срабатывает вовсе, и содержимое окна
     // рисовалось бы вдвое мельче рамки, которую вокруг него рисует стол.
     theme::set_form(theme::form_for(info.screen_w.max(1), info.screen_h.max(1)));
-    let scale = theme::geometry_scale(info.screen_w.max(1), info.screen_h.max(1));
+    let scale = theme::geometry_scale_for(user_abi::sysinfo_scale_choice(info.flags), info.screen_w.max(1), info.screen_h.max(1));
 
     let Some(mut window) = open_patiently(spec, width, height) else {
         println(&format!("{}: FAILED the desktop never freed up; no window", spec.name));

@@ -1675,6 +1675,28 @@ pub const PIXEL_BGR: u32 = 2;
 /// события «тема изменилась» договор не знает.
 pub const SYSINFO_DARK: u32 = 1;
 
+/// [`SysInfo::flags`]: масштаб стола задан человеком — 100 % (01.11).
+///
+/// Ни этого бита, ни [`SYSINFO_SCALE_200`] — масштаб по размеру экрана
+/// (`mini_ui::theme::geometry_scale`), как программа и считала раньше: старая
+/// программа, бит не знающая, рисует так же, как до него.
+pub const SYSINFO_SCALE_100: u32 = 2;
+
+/// [`SysInfo::flags`]: масштаб стола задан человеком — 200 %.
+pub const SYSINFO_SCALE_200: u32 = 4;
+
+/// Выбор масштаба из [`SysInfo::flags`]: 0 — по экрану, 1 или 2 — задан.
+#[must_use]
+pub const fn sysinfo_scale_choice(flags: u32) -> u32 {
+    if flags & SYSINFO_SCALE_200 != 0 {
+        2
+    } else if flags & SYSINFO_SCALE_100 != 0 {
+        1
+    } else {
+        0
+    }
+}
+
 /// Версия договора между ядром и программой.
 ///
 /// # Что эта версия обещает
