@@ -337,14 +337,17 @@ pub struct AhciDisk {
 /// слот, как раньше. Четыре — не больше `CAP.NCS` и глубины очереди диска,
 /// и это 1 МиБ буферов DMA на порт.
 ///
-/// **Четыре с 01.11.** В VirtualBox очередь не работала по трём причинам,
-/// найденным по дампу регистров при таймауте: завершение команды NCQ
-/// ждалось по `PxCI | PxSACT`, а VirtualBox снимает только тег в `PxSACT`
-/// (Linux тоже смотрит лишь на `PxSACT`); «все слоты заняты» принималось за
-/// «порт наш целиком» и ждало «не занят» при соседях; после ошибки порт не
-/// сбрасывался. Теперь — завершение по `PxSACT`, явный флаг исключительной
-/// команды, сброс порта с повтором ([`Port::run`]).
-const SLOTS: usize = 4;
+/// **Снова один (01.11).** Найдено и исправлено по дампу регистров:
+/// завершение NCQ — по `PxSACT` (VirtualBox оставляет `PxCI`), явный флаг
+/// исключительной команды, сброс порта с повтором ([`Port::run`]), чтения
+/// в полёте не пересекаются ([`Port::acquire_range`]). С этим на ext2 в
+/// VirtualBox — ни одной ошибки и чтение страницы 3,2 → 2,1 мс; но под
+/// btrfs-состоянием эмуляция VirtualBox теряла команду очереди даже
+/// единственную в полёте («CI 0x2 SACT 0x2»), а после сброса порта
+/// отвечала отказом устройства (`TFD 0x171`) на всё. Стабильность важнее:
+/// очередь включается здесь, когда будет железо (или эмуляция), на которой
+/// её можно проверить.
+const SLOTS: usize = 1;
 
 /// Срок команды очереди NCQ (мс): обычно миллисекунды, за сроком — сброс
 /// порта и повтор.
@@ -389,6 +392,8 @@ pub struct Port {
     resets: AtomicU32,
     /// Идёт сброс порта: команды не выдаются.
     recovering: core::sync::atomic::AtomicBool,
+    /// Секторы чтения в полёте по слотам (`(0, 0)` — свободен).
+    ranges: crate::sync::SpinLock<[(u64, u64); SLOTS]>,
 }
 
 /// Найти контроллеры AHCI и поднять все диски, какие за ними есть.
@@ -711,6 +716,7 @@ impl AhciDisk {
             draining: core::sync::atomic::AtomicBool::new(false),
             resets: AtomicU32::new(0),
             recovering: core::sync::atomic::AtomicBool::new(false),
+            ranges: crate::sync::SpinLock::new([(0, 0); SLOTS]),
         };
         let depth = port.identify()?;
         // NCQ — если умеют оба: контроллер (`CAP.SNCQ`) и диск (слово 76).
@@ -834,6 +840,35 @@ impl Port {
         }
     }
 
+    /// Занять слот под чтение `[lba, lba + sectors)`, не пересекающееся ни с
+    /// одной командой в полёте: две команды очереди на одни и те же секторы
+    /// (два потока дочитывают одну страницу) эмуляция VirtualBox отвергала
+    /// отказом устройства, и повтор падал так же (01.11, btrfs-состояние).
+    fn acquire_range(&self, lba: u64, sectors: u64) -> usize {
+        if self.slots.len() == 1 {
+            return self.acquire();
+        }
+        let end = lba + sectors;
+        loop {
+            let slot = self.acquire();
+            {
+                let mut ranges = self.ranges.lock();
+                let clash = ranges.iter().enumerate().any(|(n, &(start, stop))| n != slot && start < end && lba < stop);
+                if !clash {
+                    ranges[slot] = (lba, end);
+                    return slot;
+                }
+            }
+            self.release(slot);
+            match self.sleep_source() {
+                Some(source) => crate::sched::block_on_irq_until(source, SLEEP_SLICE_MS, || {
+                    !self.ranges.lock().iter().any(|&(start, stop)| start < end && lba < stop)
+                }),
+                None => core::hint::spin_loop(),
+            }
+        }
+    }
+
     /// Занять порт целиком — для команды вне очереди (сброс кеша) при NCQ:
     /// такую команду нельзя выдавать, пока в очереди есть команды NCQ.
     /// Возвращает слот, в котором её выполнять.
@@ -870,6 +905,9 @@ impl Port {
 
     /// Освободить слот и разбудить ждущих свободного.
     fn release(&self, slot: usize) {
+        if self.slots.len() > 1 {
+            self.ranges.lock()[slot] = (0, 0);
+        }
         self.busy.fetch_and(!(1 << slot), Ordering::AcqRel);
         if self.sleep_source().is_some() {
             crate::sched::wake_irq(IRQ_SOURCE);
@@ -1103,6 +1141,20 @@ impl Port {
             // и не снять бит слота, и ожидание превратилось бы в таймаут с
             // невнятным сообщением вместо конкретного «диск ответил ошибкой».
             if is & IS_TFES != 0 || tfd & TFD_ERR != 0 {
+                static SAID: AtomicU32 = AtomicU32::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 20 {
+                    // SAFETY: контракт функции.
+                    unsafe {
+                        kprintln!(
+                            "ahci: error slot {slot} queued {queued}: CI {:#x} SACT {:#x} IS {:#x} TFD {tfd:#x} SERR {:#x} busy {:#x}",
+                            read32(self.regs, PX_CI),
+                            read32(self.regs, PX_SACT),
+                            is,
+                            read32(self.regs, PX_SERR),
+                            self.busy.load(Ordering::Acquire)
+                        );
+                    }
+                }
                 return Err(AhciError::Failed(tfd));
             }
             if ci & bit == 0 {
@@ -1161,7 +1213,8 @@ impl Port {
         while done < buf.len() {
             let chunk = (buf.len() - done).min(MAX_TRANSFER);
             let sectors = chunk / self.sector_size;
-            let slot = self.acquire();
+            let at = lba + (done / self.sector_size) as u64;
+            let slot = self.acquire_range(at, sectors as u64);
             let result = self.run(
                 slot,
                 if self.ncq { ATA_READ_FPDMA } else { ATA_READ_DMA_EXT },
