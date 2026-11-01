@@ -9792,6 +9792,25 @@ pub const ALL: &[Scenario] = &[
             Step::Await("notepad: closing on request", 15_000),
             Step::Await("desktop     : closed the window of ", 15_000),
             Step::Wait(1_000),
+            // Подсветка синтаксиса (02.11): язык — по расширению, текст —
+            // кусками своих цветов. Снимок — для глаза.
+            Step::Line("run -b /bin/notepad /home/roman/main.rs"),
+            Step::Await("notepad: syntax Rust", 30_000),
+            Step::Await("notepad: new file /home/roman/main.rs", 15_000),
+            Step::Wait(1_000),
+            Step::Type("fn main() {"),
+            Step::Key("ret"),
+            Step::Type("let x = 42; // answer"),
+            Step::Key("ret"),
+            Step::Type("println!(\"hi\");"),
+            Step::Wait(1_000),
+            Step::Shot("02-syntax"),
+            Step::Key("ctrl-s"),
+            Step::Await("notepad: saved /home/roman/main.rs", 15_000),
+            Step::Key("alt-f4"),
+            Step::Await("notepad: closing on request", 15_000),
+            Step::Await("desktop     : closed the window of ", 15_000),
+            Step::Wait(1_000),
 
             // ── Калькулятор ──────────────────────────────────────────────────
             Step::Line("run -b /bin/calc"),

@@ -14,6 +14,9 @@
 //! создать новый (Ctrl+N). Перенос строк выключен: длинная строка уезжает
 //! вправо вслед за кареткой. Текст — UTF-8; файл, который не UTF-8, не
 //! открывается, а не превращается в мусор при сохранении.
+//!
+//! Подсветка синтаксиса (02.11, как в Notepad++): язык — по расширению,
+//! сменить — щелчком по его имени в строке состояния (`mini_ui::syntax`).
 
 #![no_std]
 #![no_main]
@@ -29,6 +32,7 @@ use mini_ui::draw;
 use mini_ui::iconset::{self, Fi};
 use mini_ui::kit;
 use mini_ui::paint::{self, Ctx, Weight};
+use mini_ui::syntax::{self, Kind, Lang};
 use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface, theme};
 use user_progs::app::{self, App, Spec};
@@ -85,6 +89,13 @@ struct Editor {
     /// PageDown листал ровно на экран.
     page_rows: core::cell::Cell<usize>,
     page_cols: core::cell::Cell<usize>,
+    /// Язык подсветки.
+    lang: Lang,
+    /// Открыто меню языков: подсвеченный пункт.
+    lang_menu: Option<usize>,
+    /// Состояние подсветки (внутри ли блочного комментария) на начало каждой
+    /// строки — до `valid` включительно; правка строки сбрасывает хвост.
+    states: core::cell::RefCell<Vec<syntax::State>>,
 }
 
 impl Editor {
@@ -101,11 +112,45 @@ impl Editor {
             note: None,
             page_rows: core::cell::Cell::new(20),
             page_cols: core::cell::Cell::new(80),
+            lang: Lang::Plain,
+            lang_menu: None,
+            states: core::cell::RefCell::new(Vec::new()),
         };
         if let Some(path) = path {
             editor.load(path);
         }
         editor
+    }
+
+    /// Строка `row` изменилась: состояния подсветки после неё — заново.
+    fn touch(&self, row: usize) {
+        self.states.borrow_mut().truncate(row + 1);
+    }
+
+    /// Состояние подсветки на начало строки `row`.
+    fn state_at(&self, row: usize) -> syntax::State {
+        let mut states = self.states.borrow_mut();
+        if states.is_empty() {
+            states.push(false);
+        }
+        while states.len() <= row && states.len() <= self.lines.len() {
+            let index = states.len() - 1;
+            let mut state = states[index];
+            if let Some(line) = self.lines.get(index) {
+                let _ = syntax::spans(self.lang, line, &mut state);
+            }
+            states.push(state);
+        }
+        states.get(row).copied().unwrap_or(false)
+    }
+
+    /// Сменить язык подсветки.
+    fn set_lang(&mut self, lang: Lang) {
+        if self.lang != lang {
+            self.lang = lang;
+            self.states.borrow_mut().clear();
+            println(&format!("notepad: syntax {}", lang.name()));
+        }
     }
 
     fn title(&self) -> String {
@@ -130,6 +175,8 @@ impl Editor {
                 self.top = 0;
                 self.left = 0;
                 self.dirty = false;
+                self.touch(0);
+                self.set_lang(Lang::detect(path));
                 self.note = Some(format!("Открыт {path}: строк {}", self.lines.len()));
                 println(&format!("notepad: opened {path}, {} line(s)", self.lines.len()));
             }
@@ -139,6 +186,7 @@ impl Editor {
                 // работать и тогда, когда заметки ещё нет.
                 if why == "нет такого файла" {
                     self.path = Some(path.to_string());
+                    self.set_lang(Lang::detect(path));
                     self.note = Some(format!("Новый файл {path}"));
                     println(&format!("notepad: new file {path}"));
                 } else {
@@ -191,6 +239,7 @@ impl Editor {
         self.left = 0;
         self.path = None;
         self.dirty = false;
+        self.touch(0);
         self.note = Some(String::from("Новый документ"));
     }
 
@@ -213,6 +262,7 @@ impl Editor {
         line.insert(at, ch);
         self.col += 1;
         self.dirty = true;
+        self.touch(self.row);
     }
 
     fn newline(&mut self) {
@@ -226,6 +276,7 @@ impl Editor {
         self.col = indent.chars().count();
         self.lines.insert(self.row, indent + &rest);
         self.dirty = true;
+        self.touch(self.row - 1);
     }
 
     fn backspace(&mut self) {
@@ -242,6 +293,7 @@ impl Editor {
             self.lines[self.row].push_str(&line);
             self.dirty = true;
         }
+        self.touch(self.row);
     }
 
     fn delete(&mut self) {
@@ -255,6 +307,7 @@ impl Editor {
             self.lines[self.row].push_str(&next);
             self.dirty = true;
         }
+        self.touch(self.row);
     }
 
     fn move_to(&mut self, row: usize, col: usize) {
@@ -299,6 +352,7 @@ impl Editor {
                 match ask {
                     Ask::Open => self.load(&path),
                     Ask::SaveAs => {
+                        self.set_lang(Lang::detect(&path));
                         self.path = Some(path);
                         self.save();
                     }
@@ -339,6 +393,8 @@ struct Plan {
     buttons: [Rect; 4],
     text: Rect,
     status: Rect,
+    /// Имя языка справа в строке состояния — щелчок открывает меню языков.
+    lang: Rect,
 }
 
 const BUTTONS: [(Fi, &str); 4] = [(Fi::Plus, "Новый"), (Fi::FolderOpen, "Открыть"), (Fi::Download, "Сохранить"), (Fi::Copy, "Как…")];
@@ -356,7 +412,33 @@ impl Plan {
             buttons[index] = Rect::new(x, toolbar.y + (toolbar.h - bh) as i32 / 2, w, bh);
             x += (w + ctx.px(4)) as i32;
         }
-        Self { toolbar, buttons, text, status }
+        let lang_w = ctx.px(150);
+        let lang = Rect::new(status.right() - lang_w as i32, status.y, lang_w, status.h);
+        Self { toolbar, buttons, text, status, lang }
+    }
+
+    /// Меню языков — над строкой состояния, у правого края.
+    fn lang_menu(&self, ctx: Ctx, area: Rect) -> (Rect, Vec<kit::Entry<'static>>) {
+        let entries: Vec<kit::Entry<'static>> = Lang::ALL
+            .iter()
+            .map(|lang| kit::Entry { title: lang.name(), icon: None, danger: false, group: u8::from(*lang != Lang::Plain) })
+            .collect();
+        let size = kit::menu_size(ctx, &entries);
+        let rect = kit::place((self.lang.right() - size.0 as i32, self.status.y - size.1 as i32), size, area);
+        (rect, entries)
+    }
+}
+
+/// Цвет куска подсветки.
+fn ink(ctx: Ctx, kind: Kind) -> mini_ui::Color {
+    let p = ctx.palette;
+    match kind {
+        Kind::Text => p.ink,
+        Kind::Keyword => p.acc_ink,
+        Kind::String => p.ok_ink,
+        Kind::Number => p.warn,
+        Kind::Comment => p.ink4,
+        Kind::Name => p.bad_ink,
     }
 }
 
@@ -403,8 +485,18 @@ impl App for Editor {
             }
             let number = format!("{}", index + 1);
             paint::text_right(ctx, s, Role::Mono, gutter.right() - ctx.px(8) as i32, y, &number, if index == self.row { p.ink2 } else { p.ink5 });
-            let visible: String = line.chars().skip(self.left).take(cols).map(|c| if c == '\t' { ' ' } else { c }).collect();
-            paint::text_clipped(ctx, s, Role::Mono, text_x, y, cols as u32 * char_w, &visible, p.ink);
+            // По кускам подсветки — каждый своим цветом, по сетке столбцов.
+            let mut state = self.state_at(index);
+            for (from, to, kind) in syntax::spans(self.lang, line, &mut state) {
+                let from = from.max(self.left);
+                let to = to.min(self.left + cols);
+                if from >= to {
+                    continue;
+                }
+                let piece: String = line.chars().skip(from).take(to - from).map(|c| if c == '\t' { ' ' } else { c }).collect();
+                let x = text_x + ((from - self.left) as u32 * char_w) as i32;
+                paint::text_clipped(ctx, s, Role::Mono, x, y, (to - from) as u32 * char_w, &piece, ink(ctx, kind));
+            }
             if index == self.row && self.prompt.is_none() {
                 let before: String = line.chars().skip(self.left).take(self.col.saturating_sub(self.left)).map(|c| if c == '\t' { ' ' } else { c }).collect();
                 let cx = text_x + face.width(&before) as i32;
@@ -419,7 +511,19 @@ impl App for Editor {
         };
         kit::status_bar(ctx, s, plan.status, &left);
         let right = format!("Строка {}, столбец {}  ·  UTF-8  ·  строк {}", self.row + 1, self.col + 1, self.lines.len());
-        paint::text_right(ctx, s, Role::Caption, plan.status.right() - ctx.px(14) as i32, paint::baseline(ctx, Role::Caption, plan.status), &right, p.ink4);
+        paint::text_right(ctx, s, Role::Caption, plan.lang.x - ctx.px(14) as i32, paint::baseline(ctx, Role::Caption, plan.status), &right, p.ink4);
+        // Язык — как кнопка: щелчок открывает меню.
+        draw::vline(s, plan.lang.x, plan.lang.y + ctx.px(6) as i32, plan.lang.h - ctx.px(12), p.line.color, p.line.alpha);
+        if self.lang_menu.is_some() {
+            draw::blend_rect(s, plan.lang, p.hover1.color, p.hover1.alpha);
+        }
+        let g = ctx.px(12);
+        iconset::draw(s, Fi::ChevronDown, plan.lang.right() - (g + ctx.px(12)) as i32, plan.lang.y + (plan.lang.h - g) as i32 / 2, g, p.ink3, 255);
+        paint::text_clipped(ctx, s, Role::Caption, plan.lang.x + ctx.px(12) as i32, paint::baseline(ctx, Role::Caption, plan.lang), plan.lang.w - ctx.px(36), self.lang.name(), p.ink2);
+        if let Some(selected) = self.lang_menu {
+            let (rect, entries) = plan.lang_menu(ctx, area);
+            kit::draw_menu(ctx, s, rect, &entries, selected);
+        }
 
         // ── Поле пути ───────────────────────────────────────────────────────
         if let Some(prompt) = &self.prompt {
@@ -446,6 +550,18 @@ impl App for Editor {
     fn key(&mut self, code: u32) -> bool {
         if self.prompt.is_some() {
             self.prompt_key(code);
+            return true;
+        }
+        if let Some(selected) = self.lang_menu {
+            match code {
+                WIN_KEY_UP => self.lang_menu = Some(selected.saturating_sub(1)),
+                WIN_KEY_DOWN => self.lang_menu = Some((selected + 1).min(Lang::ALL.len() - 1)),
+                ENTER => {
+                    self.lang_menu = None;
+                    self.set_lang(Lang::ALL[selected]);
+                }
+                _ => self.lang_menu = None,
+            }
             return true;
         }
         self.note = None;
@@ -503,6 +619,18 @@ impl App for Editor {
             return true;
         }
         let plan = Plan::new(ctx, area);
+        if self.lang_menu.is_some() {
+            let (rect, entries) = plan.lang_menu(ctx, area);
+            if let Some(index) = kit::menu_hit(ctx, rect, &entries, x, y) {
+                self.set_lang(Lang::ALL[index]);
+            }
+            self.lang_menu = None;
+            return true;
+        }
+        if plan.lang.contains(x, y) {
+            self.lang_menu = Some(Lang::ALL.iter().position(|lang| *lang == self.lang).unwrap_or(0));
+            return true;
+        }
         for (index, rect) in plan.buttons.iter().enumerate() {
             if rect.contains(x, y) {
                 match index {

@@ -61,6 +61,8 @@ pub mod kit;
 pub mod paint;
 /// Картинки QOI — обои стола (фаза 72a).
 pub mod qoi;
+/// Подсветка синтаксиса Блокнота (02.11).
+pub mod syntax;
 pub mod text;
 /// Палитра и размеры. См. [`paint`] — переехала оттуда же и по той же причине.
 pub mod theme;
