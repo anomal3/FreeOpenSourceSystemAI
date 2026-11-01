@@ -43,6 +43,7 @@ pub mod profile;
 pub mod signal;
 mod special;
 mod thread;
+pub mod vdso;
 mod wayland;
 
 pub use process::{process_ended, register_child};

@@ -293,7 +293,10 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 58] = [
+const PROGRAMS: [(&CStr16, &str); 59] = [
+    // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
+    // но едет тем же путём — так он есть и на установленной системе.
+    (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
     (cstr16!("\\FREEOS\\BIN\\HELLO"), "hello"),
     (cstr16!("\\FREEOS\\BIN\\CRASH"), "crash"),
     (cstr16!("\\FREEOS\\BIN\\PEEK"), "peek"),

@@ -2131,7 +2131,8 @@ struct MenuLayout {
 /// не считается: это надзиратель за службами, он уже работает, и запускать его
 /// по имени незачем.
 fn list_programs() -> Vec<String> {
-    const HIDDEN: [&str; 1] = ["init"];
+    // `vdso` — код времени программ Linux, а не программа (01.11.2026).
+    const HIDDEN: [&str; 2] = ["init", "vdso"];
     let Some(Ok(entries)) = crate::fs::list("/bin") else {
         return Vec::new();
     };

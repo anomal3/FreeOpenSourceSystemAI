@@ -165,6 +165,42 @@ pub fn adopt_monotonic() {
     MONOTONIC_OFFSET_MS.store(uptime_from_ticks(), Ordering::Relaxed);
     MONOTONIC_BASE.store(arch::monotonic::counter(), Ordering::Relaxed);
     MONOTONIC_HZ.store(hz, Ordering::Release);
+    #[cfg(target_arch = "x86_64")]
+    crate::linux::vdso::refresh();
+}
+
+/// Часы для vDSO программ Linux (01.11.2026): основание счётчика, время
+/// работы в наносекундах в момент основания, частота счётчика и время суток
+/// в наносекундах в момент загрузки (`None` — времени суток система не
+/// знает). `None` целиком — время идёт тиками, и считать его по счётчику
+/// программе нельзя.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn vdso_clock() -> Option<(u64, u64, u64, Option<i64>)> {
+    let hz = MONOTONIC_HZ.load(Ordering::Acquire);
+    if hz == 0 {
+        return None;
+    }
+    let base = MONOTONIC_BASE.load(Ordering::Relaxed);
+    let base_ns = MONOTONIC_OFFSET_MS.load(Ordering::Relaxed).saturating_mul(1_000_000);
+    Some((base, base_ns, hz, realtime_base_ns()))
+}
+
+/// Время суток в наносекундах минус время работы: `realtime = это + uptime_ns`.
+fn realtime_base_ns() -> Option<i64> {
+    let epoch = BOOT_EPOCH.load(Ordering::Acquire);
+    if epoch == 0 {
+        return None;
+    }
+    let at_ms = EPOCH_AT_UPTIME_MS.load(Ordering::Relaxed);
+    Some(epoch as i64 * 1_000_000_000 - at_ms as i64 * 1_000_000)
+}
+
+/// Время суток в наносекундах эпохи Unix — тем же счётом, что у vDSO (у
+/// программы Linux системный вызов и vDSO обязаны отвечать одно и то же).
+#[must_use]
+pub fn realtime_ns() -> Option<u64> {
+    realtime_base_ns().map(|base| (base + uptime_ns() as i64).max(0) as u64)
 }
 
 /// Уточнить частоту счётчика после загрузки (фаза 68g, только x86-64).
@@ -246,6 +282,8 @@ pub fn refine_task() {
     MONOTONIC_BASE.store(arch::monotonic::counter(), Ordering::Relaxed);
     MONOTONIC_HZ.store(median, Ordering::Release);
     arch::monotonic::set_frequency(median);
+    #[cfg(target_arch = "x86_64")]
+    crate::linux::vdso::refresh();
     kprintln!(
         "  monotonic   : refined the counter from {} MHz to {} MHz (the boot calibration was off)",
         current / 1_000_000,
@@ -384,6 +422,8 @@ pub fn adopt_boot_clock(seconds: u64, sampled_at: u64) {
     let seconds = seconds + elapsed_ms / 1000;
     EPOCH_AT_UPTIME_MS.store(uptime_ms(), Ordering::Relaxed);
     BOOT_EPOCH.store(seconds, Ordering::Release);
+    #[cfg(target_arch = "x86_64")]
+    crate::linux::vdso::refresh();
     // Метка у этой строки своя, и это не косметика: стенд берёт число, стоящее
     // сразу за `clock       : `, и вторая строка с той же меткой подсунула бы
     // ему миллисекунды вместо секунд эпохи. Ровно так это и выяснилось.

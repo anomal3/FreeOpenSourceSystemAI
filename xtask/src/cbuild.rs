@@ -749,6 +749,49 @@ pub fn build_linux_programs(arch: Arch) -> Result<Vec<(String, PathBuf)>> {
     Ok(built)
 }
 
+/// Имя vDSO в `/bin` (8.3 — носитель установщика на FAT без длинных имён).
+pub const LINUX_VDSO: &str = "vdso";
+
+/// Собрать vDSO программ Linux (01.11.2026): время без входа в ядро. Едет в
+/// `/bin` вместе с программами — так он попадает и в образ живой системы, и на
+/// установленную, и в обновления; ядро читает его при первом запуске
+/// программы Linux и отображает каждой со страницей данных времени перед ним
+/// (`libc/linux/vdso.lds`). Только x86-64.
+pub fn build_linux_vdso(arch: Arch) -> Result<Option<PathBuf>> {
+    if arch != Arch::X86_64 {
+        return Ok(None);
+    }
+    let clang = llvm_tool("clang")?;
+    let work = paths::workspace_root().join("build/toolchain/linux").join(arch.name());
+    std::fs::create_dir_all(&work)?;
+    let dir = libc_dir().join("linux");
+    let vdso = work.join("vdso.so");
+    let mut cmd = Command::new(&clang);
+    cmd.args([
+        "--target=x86_64-unknown-linux-gnu",
+        "-O2",
+        "-Wall",
+        "-Werror",
+        "-ffreestanding",
+        "-fno-builtin",
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "-fPIC",
+        "-shared",
+        "-nostdlib",
+        "-fuse-ld=lld",
+        "-Wl,--hash-style=both",
+        "-Wl,-soname=linux-vdso.so.1",
+        "-Wl,--no-undefined",
+        "-Wl,-z,max-page-size=0x1000",
+    ]);
+    cmd.arg(format!("-Wl,-T,{}", dir.join("vdso.lds").display()));
+    cmd.arg(format!("-Wl,--version-script={}", dir.join("vdso.map").display()));
+    cmd.arg(dir.join("vdso.c")).arg("-o").arg(&vdso);
+    run(cmd, "clang (Linux vDSO) vdso.c")?;
+    Ok(Some(vdso))
+}
+
 /// Собрать программы на C. Возвращает пути к готовым файлам.
 ///
 /// Порядок библиотек при компоновке не произволен: сначала наши объектники,

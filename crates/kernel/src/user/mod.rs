@@ -3036,6 +3036,7 @@ fn place_linux_args(
     const AT_RANDOM: usize = 25;
     const AT_HWCAP2: usize = 26;
     const AT_EXECFN: usize = 31;
+    const AT_SYSINFO_EHDR: usize = 33;
     /// Окружение, с которым программа Linux появляется на свет, если её
     /// запускает система, а не `execve`: минимум, без которого оболочки и
     /// утилиты ищут программы и дом наугад. Дом — того, кто вошёл (фаза 71i):
@@ -3134,6 +3135,8 @@ fn place_linux_args(
         (AT_RANDOM, random_at),
         (AT_HWCAP2, 0),
         (AT_EXECFN, execfn),
+        // vDSO (01.11.2026): нет — ключ с нулём, glibc его так и понимает.
+        (AT_SYSINFO_EHDR, start.vdso),
         (AT_NULL, 0),
     ];
 
@@ -3280,6 +3283,17 @@ struct LinuxStart {
     program_entry: usize,
     /// Куда лёг динамический загрузчик (`AT_BASE`); ноль — его нет.
     interp_base: usize,
+    /// Код vDSO (`AT_SYSINFO_EHDR`, 01.11.2026); ноль — его нет.
+    vdso: usize,
+}
+
+/// Где лежит vDSO программы Linux: у верхнего края полосы между стеком и
+/// памятью по запросу (страница данных времени и код за ней). Полоса
+/// остаётся полосой почти целиком — четыре мегабайта против нескольких
+/// страниц.
+#[cfg(target_arch = "x86_64")]
+fn vdso_base(code_pages: usize) -> usize {
+    MMAP_BASE - (1 + code_pages) * PAGE_SIZE
 }
 
 /// Выбрать место позиционно-независимой программе (ASLR, часть 2).
@@ -3639,7 +3653,37 @@ fn load(
     let linux = if image.linux {
         let (phnum, phent) = image.phdr_geometry();
         let phdr = image.phdr_vaddr().map_or(0, |vaddr| vaddr + bias);
-        Some(LinuxStart { phdr, phnum, phent, program_entry, interp_base })
+        // vDSO (01.11.2026): страница данных времени — только на чтение, код
+        // — на чтение и исполнение; кадры общие у всех программ.
+        #[allow(unused_mut)]
+        let mut vdso = 0;
+        #[cfg(target_arch = "x86_64")]
+        if let Some(found) = crate::linux::vdso::image() {
+            let base = vdso_base(found.code_pages);
+            mappings.push(Mapping {
+                base,
+                pages: 1,
+                blocks: 0,
+                source: Source::Shared(SharedBacking {
+                    mem: Arc::clone(&found.mem),
+                    first: 0,
+                    flags: PageFlags::READ | PageFlags::USER,
+                }),
+            });
+            mappings.push(Mapping {
+                base: base + PAGE_SIZE,
+                pages: found.code_pages,
+                blocks: 0,
+                source: Source::Shared(SharedBacking {
+                    mem: found.mem,
+                    first: 1,
+                    flags: PageFlags::READ | PageFlags::EXEC | PageFlags::USER,
+                }),
+            });
+            mappings.sort_by_key(|region| region.base);
+            vdso = base + PAGE_SIZE;
+        }
+        Some(LinuxStart { phdr, phnum, phent, program_entry, interp_base, vdso })
     } else {
         None
     };

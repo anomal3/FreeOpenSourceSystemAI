@@ -1591,15 +1591,12 @@ fn clock(kind: usize, out: usize) -> i64 {
             let ns = time::uptime_ns();
             Timespec { seconds: ns / NANOS, nanos: (ns % NANOS) as u32, _reserved: 0 }
         }
-        CLOCK_REALTIME => match time::now_unix() {
-            // Доли секунды берутся у монотонного счётчика: время суток система
-            // знает с точностью до секунды — столько ей сказала прошивка, — а
-            // растёт оно ровно так же, как время работы.
-            Some(seconds) => Timespec {
-                seconds,
-                nanos: (time::uptime_ns() % NANOS) as u32,
-                _reserved: 0,
-            },
+        CLOCK_REALTIME => match time::realtime_ns() {
+            // Время суток от прошивки плюс прошедшее по монотонному счётчику —
+            // тем же счётом, что у vDSO программ Linux (01.11.2026): до этого
+            // секунды и доли брались из разных мест, и ответы vDSO и вызова
+            // расходились бы на доли секунды.
+            Some(ns) => Timespec { seconds: ns / NANOS, nanos: (ns % NANOS) as u32, _reserved: 0 },
             // Ноль означает «времени суток система не знает» — тот же ответ,
             // что у `SYS_TIME`. Долей к нему не приписывается: у показания,
             // которого нет, нет и долей.

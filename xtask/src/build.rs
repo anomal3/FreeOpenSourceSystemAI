@@ -133,6 +133,12 @@ pub fn build_all(opts: &BuildOptions) -> Result<Built> {
             Ok(built) => programs.extend(built),
             Err(err) => say!("программы на C пропущены: {err}"),
         }
+        // vDSO программ Linux (01.11.2026) — в `/bin`, как программы.
+        match crate::cbuild::build_linux_vdso(opts.arch) {
+            Ok(Some(vdso)) => programs.push((crate::cbuild::LINUX_VDSO, vdso)),
+            Ok(None) => {}
+            Err(err) => say!("vDSO программ Linux пропущен: {err}"),
+        }
     }
     let programs = programs;
 
@@ -817,6 +823,7 @@ mod tests {
             .copied()
             .chain(crate::cbuild::C_PROGRAMS.iter().map(|program| program.name))
             .chain(crate::cbuild::FOREIGN_PROGRAMS)
+            .chain([crate::cbuild::LINUX_VDSO])
             .collect();
 
         let missing: Vec<&&str> = expected
