@@ -122,11 +122,15 @@ pub enum Action {
     CloseOne,
     /// «Закрыть все окна» — то же для кнопки, за которой их несколько.
     CloseAll,
+    /// «Очистить корзину» — стереть её содержимое безвозвратно.
+    EmptyTrash,
+    /// «Свойства» корзины: сколько в ней и сколько места занимает.
+    Properties,
 }
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 15] = [
+    const ALL: [Action; 17] = [
         Action::Open,
         Action::Rename,
         Action::Delete,
@@ -142,7 +146,12 @@ impl Action {
         Action::OpenLocation,
         Action::DeleteShortcut,
         Action::OpenInTerminal,
+        Action::EmptyTrash,
+        Action::Properties,
     ];
+
+    /// Меню корзины (макет 12): открыть, очистить, свойства.
+    pub const ON_TRASH: [Action; 3] = [Action::Open, Action::EmptyTrash, Action::Properties];
 
     /// Пункты меню, открытого на пустом месте стола.
     /// Пункты меню, открытого на пустом месте стола.
@@ -227,6 +236,8 @@ impl Action {
             Action::CloseWindow(_) => "Закрыть",
             Action::CloseOne => "Закрыть окно",
             Action::CloseAll => "Закрыть все окна",
+            Action::EmptyTrash => "Очистить корзину",
+            Action::Properties => "Свойства",
         }
     }
 
@@ -243,7 +254,8 @@ impl Action {
             | Action::OpenInTerminal
             | Action::Window(_)
             | Action::CloseWindow(_) => 0,
-            Action::Rename | Action::Delete | Action::DeleteShortcut | Action::CloseOne | Action::CloseAll => 5,
+            Action::Rename | Action::Delete | Action::DeleteShortcut | Action::CloseOne | Action::CloseAll | Action::EmptyTrash => 5,
+            Action::Properties => 6,
             Action::NewFolder | Action::NewTextFile => 1,
             Action::Theme | Action::DisplaySettings | Action::Refresh => 2,
             Action::SwitchLayout => 3,
@@ -278,6 +290,8 @@ impl Action {
             Action::NetworkSettings => Some(Icon::Network),
             Action::ClockSettings => Some(Icon::Clock),
             Action::TaskManager => Some(Icon::Chart),
+            Action::EmptyTrash => Some(Icon::Close),
+            Action::Properties => None,
         }
     }
 }
@@ -286,8 +300,9 @@ impl Action {
 enum Mode {
     /// Обычный список пунктов.
     Menu,
-    /// Ждём подтверждения удаления.
-    Confirm { name: String },
+    /// Ждём подтверждения удаления: `forever` — стереть (очистка корзины),
+    /// иначе — перенести в корзину.
+    Confirm { name: String, forever: bool },
 }
 
 /// Что меню просит сделать в ответ на клавишу.
@@ -302,8 +317,10 @@ pub enum Reply {
     Close,
     /// Выполнить пункт.
     Run(Action),
-    /// Удаление подтверждено.
+    /// Перенос в корзину подтверждён.
     Delete,
+    /// Очистка корзины подтверждена.
+    EmptyTrash,
 }
 
 /// Меню стола: где оно, что в нём выбрано и чем оно занято.
@@ -487,14 +504,11 @@ impl ContextMenu {
         Rect::new(0, 0, self.rect.w, self.rect.h)
     }
 
-    /// Спросить, точно ли удалять.
-    ///
-    /// Спрашивается всегда, а не только у каталога: отменить удаление нечем —
-    /// корзины в системе нет, — и «нажал не туда» здесь означает потерянный
-    /// файл.
-    pub fn start_confirm(&mut self, name: &str) {
+    /// Спросить, точно ли удалять: `forever` — стереть безвозвратно (очистка
+    /// корзины), иначе — перенести в корзину (макет 18).
+    pub fn start_confirm(&mut self, name: &str, forever: bool) {
         self.widen();
-        self.mode = Mode::Confirm { name: name.to_string() };
+        self.mode = Mode::Confirm { name: name.to_string(), forever };
         self.note = None;
         self.fit(confirm_height(self.ctx()));
         self.redraw();
@@ -531,7 +545,8 @@ impl ContextMenu {
         }
         match &mut self.mode {
             Mode::Menu => self.menu_key(event.code),
-            Mode::Confirm { .. } => match event.code {
+            Mode::Confirm { forever, .. } => match event.code {
+                KeyCode::Y | KeyCode::Enter if *forever => Reply::EmptyTrash,
                 KeyCode::Y | KeyCode::Enter => Reply::Delete,
                 KeyCode::N | KeyCode::Escape => {
                     self.mode = Mode::Menu;
@@ -672,9 +687,9 @@ impl ContextMenu {
                     }
                 }
             }
-            Mode::Confirm { name } => {
+            Mode::Confirm { name, forever } => {
                 let s = &mut self.surface;
-                draw_confirm(inner, s, card, name);
+                draw_confirm(inner, s, card, name, *forever);
             }
         }
 
@@ -880,15 +895,16 @@ fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool)
 }
 
 /// Вопрос об удалении.
-fn draw_confirm(ctx: Ctx, s: &mut Surface, card: Rect, name: &str) {
+fn draw_confirm(ctx: Ctx, s: &mut Surface, card: Rect, name: &str, forever: bool) {
     let p = ctx.palette;
     let pad = ctx.px(CARD_PAD + ROW_PAD);
     let left = card.x + pad as i32;
     let width = card.w.saturating_sub(pad * 2);
     let mut y = card.y + ctx.px(CARD_PAD + 4) as i32;
 
-    let chip = Rect::new(left, y, paint::chip_width(ctx, "УДАЛИТЬ НАВСЕГДА"), ctx.px(22));
-    paint::chip(ctx, s, chip, "УДАЛИТЬ НАВСЕГДА", Tone::Bad);
+    let (title, tone) = if forever { ("УДАЛИТЬ НАВСЕГДА", Tone::Bad) } else { ("В КОРЗИНУ", Tone::Warn) };
+    let chip = Rect::new(left, y, paint::chip_width(ctx, title), ctx.px(22));
+    paint::chip(ctx, s, chip, title, tone);
     y += (chip.h + ctx.px(10)) as i32;
 
     paint::text_clipped(ctx, s, Role::Body, left, y, width, name, p.ink2);
@@ -998,19 +1014,6 @@ pub fn base_name(path: &str) -> &str {
     }
 }
 
-/// Удалить запись каталога стола.
-///
-/// Непустой каталог не удаляется, и это не ограничение реализации: рекурсивное
-/// удаление по одному нажатию — самая дорогая ошибка, какую может совершить
-/// рабочий стол. Отказ приходит от файловой системы и пересказывается как есть.
-pub fn delete_entry(path: &str) -> Result<(), String> {
-    match crate::fs::remove_as(crate::user::session::credentials(), path) {
-        Some(Ok(())) => Ok(()),
-        Some(Err(err)) => Err(alloc::format!("{err}")),
-        None => Err("no filesystem is mounted".to_string()),
-    }
-}
-
 /// Есть ли уже что-нибудь по этому пути.
 fn exists(path: &str) -> bool {
     crate::fs::resolve_as(crate::user::session::credentials(), path, Access::NONE)
@@ -1023,7 +1026,7 @@ fn exists(path: &str) -> bool {
 /// образ initrd, в котором нет ни `/root`, ни `/home`, и создание одного лишь
 /// последнего звена кончалось отказом «нет такого файла» — верным по сути и
 /// бесполезным для человека, который просто нажал «создать папку».
-fn ensure_dir(path: &str) -> Result<(), String> {
+pub(crate) fn ensure_dir(path: &str) -> Result<(), String> {
     let mut built = String::new();
     for part in path.split('/').filter(|part| !part.is_empty()) {
         built.push('/');

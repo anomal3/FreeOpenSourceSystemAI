@@ -64,6 +64,7 @@ pub mod term;
 pub mod thumbs;
 pub mod toast;
 pub mod traypop;
+pub mod trash;
 pub mod wallart;
 pub mod window;
 
@@ -2205,6 +2206,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                         }
                         Some(icons::Kind::App(_) | icons::Kind::Program(_)) => (&context::Action::ON_APP[..], "icon"),
                         Some(icons::Kind::Folder) => (&context::Action::ON_FOLDER[..], "entry"),
+                        Some(icons::Kind::Trash(_)) => (&context::Action::ON_TRASH[..], "trash"),
                         Some(_) => {
                             // Файл: «Открыть» и «Открыть с помощью» —
                             // программы, которые умеют этот тип.
@@ -3500,6 +3502,15 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
             };
             start(desktop, &command);
         }
+        // Корзина — «Файлы» в её каталоге (он заводится, если корзина ещё
+        // ни разу не понадобилась: окно на несуществующем пути было бы пустым
+        // местом без объяснений).
+        Some(icons::Kind::Trash(_)) => {
+            let files = trash::files_dir();
+            let _ = context::ensure_dir(&files);
+            start(desktop, &alloc::format!("/bin/files {files}"));
+            kprintln!("  desktop     : opened the trash");
+        }
         // Файл, для которого есть программа (текст — «Блокнот»), открывается
         // ею, как двойной щелчок в Windows.
         Some(icons::Kind::File) if desktop.icon_path(index).is_some_and(|path| !file_handlers(&path).is_empty()) => {
@@ -3619,12 +3630,21 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             let entries = selected_entries(desktop);
             match entries.as_slice() {
                 [] => match selected_entry(desktop) {
-                    Some((_, label)) => desktop.context_confirm(&label),
+                    Some((_, label)) => desktop.context_confirm(&label, false),
                     None => desktop.context_note("nothing is selected"),
                 },
-                [(_, label)] => desktop.context_confirm(label),
-                many => desktop.context_confirm(&alloc::format!("{} объектов", many.len())),
+                [(_, label)] => desktop.context_confirm(label, false),
+                many => desktop.context_confirm(&alloc::format!("{} объектов", many.len()), false),
             }
+        }
+        context::Action::EmptyTrash => match trash::usage() {
+            (0, _) => desktop.context_note("Корзина пуста"),
+            (count, _) => desktop.context_confirm(&alloc::format!("Объектов в корзине: {count}"), true),
+        },
+        context::Action::Properties => {
+            let (count, bytes) = trash::usage();
+            desktop.context_note(&alloc::format!("{}: объектов {count}, {}", trash::LABEL, human_size(bytes)));
+            kprintln!("  desktop     : trash has {count} items, {bytes} bytes");
         }
         context::Action::NewFolder | context::Action::NewTextFile => {
             let directory = action == context::Action::NewFolder;
@@ -3944,9 +3964,9 @@ fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status
             }
             let (mut deleted, mut last_error) = (0usize, None);
             for (path, _) in &entries {
-                match context::delete_entry(path) {
-                    Ok(()) => {
-                        kprintln!("  desktop     : deleted '{path}'");
+                match trash::trash(path) {
+                    Ok(name) => {
+                        kprintln!("  desktop     : deleted '{path}' to the trash as '{name}'");
                         deleted += 1;
                     }
                     Err(err) => {
@@ -3968,6 +3988,40 @@ fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status
             desktop.present();
             true
         }
+        context::Reply::EmptyTrash => {
+            match trash::empty() {
+                Ok(count) => {
+                    kprintln!("  desktop     : emptied the trash, {count} items");
+                    desktop.context_note(&alloc::format!("Стёрто объектов: {count}"));
+                }
+                Err(err) => {
+                    kprintln!("  desktop     : cannot empty the trash: {err}");
+                    desktop.context_note(&err);
+                }
+            }
+            desktop.reload_icons();
+            desktop.present();
+            true
+        }
+    }
+}
+
+/// Размер для человека: «12 КБ», «3,4 МБ».
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["КБ", "МБ", "ГБ", "ТБ"];
+    if bytes < 1024 {
+        return alloc::format!("{bytes} байт");
+    }
+    let mut value = bytes * 10 / 1024;
+    let mut unit = 0;
+    while value >= 10 * 1024 && unit + 1 < UNITS.len() {
+        value /= 1024;
+        unit += 1;
+    }
+    if value >= 100 {
+        alloc::format!("{} {}", value / 10, UNITS[unit])
+    } else {
+        alloc::format!("{},{} {}", value / 10, value % 10, UNITS[unit])
     }
 }
 

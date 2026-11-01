@@ -2551,11 +2551,12 @@ impl Compositor {
         }
     }
 
-    /// Спросить в меню, точно ли удалять.
-    pub fn context_confirm(&mut self, name: &str) {
+    /// Спросить в меню, точно ли удалять: `forever` — стереть (очистка
+    /// корзины), иначе — в корзину.
+    pub fn context_confirm(&mut self, name: &str, forever: bool) {
         let before = self.context.as_ref().map(|menu| menu.rect);
         if let Some(menu) = self.context.as_mut() {
-            menu.start_confirm(name);
+            menu.start_confirm(name, forever);
         }
         self.mark_shrunk(before);
     }

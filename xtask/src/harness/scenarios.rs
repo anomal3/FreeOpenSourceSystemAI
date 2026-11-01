@@ -4851,7 +4851,7 @@ pub const ALL: &[Scenario] = &[
             // Строка печатается при запуске стола, то есть **до** приглашения,
             // которого сценарий дождался выше, — поэтому проверка по всему
             // журналу, а не ожидание вперёд от курсора.
-            Step::Expect("desktop     : icons 4, 0 from /home/roman/Desktop"),
+            Step::Expect("desktop     : icons 5, 0 from /home/roman/Desktop"),
             // Монитор системы запускается **вручную**, и это не забывчивость
             // сценария. С фазы 47b он программа (`/bin/sysmon`), а службой быть
             // не должен: открытие окна держит стол сотни миллисекунд, и всё,
@@ -4882,7 +4882,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : context menu closed", 15_000),
             // Созданное обязано появиться **на столе**, а не только на диске:
             // четыре системных значка плюс один из каталога.
-            Step::Await("desktop     : icons 5, 1 from /home/roman/Desktop", 15_000),
+            Step::Await("desktop     : icons 6, 1 from /home/roman/Desktop", 15_000),
             Step::Await("desktop     : naming 'Новая папка'", 15_000),
             // Щелчок мимо поля оставляет предложенное имя.
             Step::Aim(Aim::EmptyBelow),
@@ -4893,7 +4893,7 @@ pub const ALL: &[Scenario] = &[
             // Меню на самом значке: пункты у него другие — открыть,
             // переименовать, удалить. Значок пятый сверху, то есть первый после
             // системных.
-            Step::Aim(Aim::Icon(4)),
+            Step::Aim(Aim::Icon(5)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
             Step::Expect("for entry"),
@@ -4915,13 +4915,13 @@ pub const ALL: &[Scenario] = &[
                 "desktop     : renamed '/home/roman/Desktop/Новая папка' to 'Reports'",
                 15_000,
             ),
-            Step::Await("desktop     : icons 5, 1 from /home/roman/Desktop", 15_000),
+            Step::Await("desktop     : icons 6, 1 from /home/roman/Desktop", 15_000),
             Step::Line("ls /home/roman/Desktop"),
             Step::Await("Reports", 15_000),
-            // Удаление спрашивает подтверждения: отменить его нечем, корзины в
-            // системе нет. Отвечает на вопрос клавиша, а не щелчок — пунктов в
-            // меню в этот момент не нарисовано.
-            Step::Aim(Aim::Icon(4)),
+            // Удаление спрашивает подтверждения и переносит в корзину (02.11).
+            // Отвечает на вопрос клавиша, а не щелчок — пунктов в меню в этот
+            // момент не нарисовано.
+            Step::Aim(Aim::Icon(5)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
             Step::Aim(Aim::ContextItem(3, 1)),
@@ -4929,8 +4929,26 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(1_500),
             Step::Shot("04-delete-confirm"),
             Step::Key("y"),
-            Step::Await("desktop     : deleted '/home/roman/Desktop/Reports'", 15_000),
-            Step::Await("desktop     : icons 4, 0 from /home/roman/Desktop", 15_000),
+            Step::Await("desktop     : deleted '/home/roman/Desktop/Reports' to the trash as 'Reports'", 15_000),
+            Step::Await("desktop     : icons 5, 0 from /home/roman/Desktop", 15_000),
+            Step::Aim(Aim::EmptyBelow),
+            Step::Click,
+            Step::Await("desktop     : context menu closed", 15_000),
+            Step::Line("ls /home/roman/.local/share/Trash/info"),
+            Step::Await("Reports.trashinfo", 15_000),
+            // Меню корзины (она — пятый значок, последний из системных):
+            // открыть, очистить, свойства. Очистка спрашивает и стирает.
+            Step::Aim(Aim::Icon(4)),
+            Step::RightClick,
+            Step::Await("desktop     : context menu at", 15_000),
+            Step::Expect("for trash"),
+            Step::Wait(1_500),
+            Step::Shot("05-trash-menu"),
+            Step::Aim(Aim::ContextItem(1, 1)),
+            Step::Click,
+            Step::Wait(1_000),
+            Step::Key("y"),
+            Step::Await("desktop     : emptied the trash, 1 items", 15_000),
             Step::Aim(Aim::EmptyBelow),
             Step::Click,
             Step::Await("desktop     : context menu closed", 15_000),
@@ -5574,7 +5592,7 @@ pub const ALL: &[Scenario] = &[
             Step::Await("pkg: installed chromium 150, ", 1_800_000),
             // Значок Chromium на столе появляется сам — пятый, первый после
             // системных.
-            Step::Await("desktop     : packages changed, 5 icons", 30_000),
+            Step::Await("desktop     : packages changed, 6 icons", 30_000),
             Step::Line("run -b /opt/debian/bin/bash /opt/chromium/bin/chromium --enable-logging=stderr --log-level=0 http://10.0.2.2:{site}/page.html"),
             Step::Await("wayland     : client #", 300_000),
             Step::Await("wayland     : #", 300_000),
@@ -5623,7 +5641,7 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Minimize("Terminal")),
             Step::Click,
             Step::Await("desktop     : minimized 'Terminal'", 15_000),
-            Step::Aim(Aim::Icon(4)),
+            Step::Aim(Aim::Icon(5)),
             Step::DoubleClick,
             Step::Await("desktop     : started '/opt/debian/bin/bash /opt/chromium/bin/chromium'", 30_000),
             Step::Await("wayland     : client #", 300_000),
@@ -5636,7 +5654,7 @@ pub const ALL: &[Scenario] = &[
             Step::Wait(5_000),
             Step::Line("run /bin/pkg remove chromium"),
             Step::Await("pkg: removed chromium", 300_000),
-            Step::Await("desktop     : packages changed, 4 icons", 30_000),
+            Step::Await("desktop     : packages changed, 5 icons", 30_000),
             Step::Line("run /bin/pkg remove debian"),
             Step::Await("pkg: removed debian", 120_000),
             Step::Absent("protocol error on object"),

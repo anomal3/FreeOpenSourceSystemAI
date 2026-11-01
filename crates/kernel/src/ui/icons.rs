@@ -93,6 +93,8 @@ pub enum Kind {
     /// Команду держит поле `path` записи — то же, в котором у файла лежит его
     /// путь. Два поля под одно «что открыть» разошлись бы при первой правке.
     Program(Icon),
+    /// Корзина (`ui::trash`); `true` — в ней что-то лежит.
+    Trash(bool),
     /// Каталог в каталоге стола.
     Folder,
     /// Файл там же.
@@ -1021,6 +1023,7 @@ impl Icons {
                     Kind::File => super::appicon::file_icon(&item.label, false),
                     Kind::App(app) => super::appicon::design_for(app.icon()),
                     Kind::Program(icon) => super::appicon::design_for(*icon),
+                    Kind::Trash(full) => super::appicon::design(if *full { "place-trash-full" } else { "place-trash-empty" }),
                     _ => None,
                 };
                 match design {
@@ -1109,6 +1112,7 @@ fn art(kind: &Kind) -> (Icon, Tone, bool) {
         Kind::Missing(what, icon) => (*icon, Tone::Accent, *what == "phone"),
         Kind::Folder => (Icon::Folder, Tone::Muted, false),
         Kind::File => (Icon::File, Tone::Muted, false),
+        Kind::Trash(_) => (Icon::Close, Tone::Muted, false),
     }
 }
 
@@ -1176,6 +1180,13 @@ fn system_items() -> Vec<Item> {
         path: None,
         shortcut: None,
     }));
+    // Корзина — последней из системных; её место запоминается по подписи.
+    out.push(Item {
+        kind: Kind::Trash(!super::trash::is_empty()),
+        label: super::trash::LABEL.to_string(),
+        path: None,
+        shortcut: None,
+    });
     out
 }
 

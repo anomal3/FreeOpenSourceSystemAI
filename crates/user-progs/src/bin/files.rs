@@ -63,8 +63,8 @@ use user_progs::app::{self, App, Spec};
 use user_progs::{
     Args, SysInfo, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT,
     WIN_KEY_MENU, WIN_KEY_NAMED, WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP,
-    close, create, mkdir, monotonic_ms, mounts, open, println, read, readdir_raw, remove, rename,
-    spawn, stat, sysinfo,
+    close, create, mkdir, monotonic_ms, mounts, open, open_write, println, read, readdir_raw, remove,
+    rename, spawn, stat, sysinfo, time_now, write,
 };
 
 /// Имя окна.
@@ -370,6 +370,10 @@ enum MenuItem {
     NewFolder,
     NewTextFile,
     Refresh,
+    /// Вернуть из корзины туда, откуда удалили.
+    Restore,
+    /// Стереть всё содержимое корзины.
+    EmptyTrash,
 }
 
 impl MenuItem {
@@ -388,6 +392,12 @@ impl MenuItem {
     /// Пункты на томе.
     const ON_VOLUME: [MenuItem; 2] = [MenuItem::Open, MenuItem::Properties];
 
+    /// Пункты на удалённом — в корзине (макет 12): вернуть, стереть.
+    const ON_TRASHED: [MenuItem; 3] = [MenuItem::Restore, MenuItem::Delete, MenuItem::Properties];
+
+    /// Пункты на пустом месте корзины.
+    const ON_TRASH: [MenuItem; 2] = [MenuItem::EmptyTrash, MenuItem::Refresh];
+
     fn title(self) -> &'static str {
         match self {
             MenuItem::Open => "Открыть",
@@ -398,6 +408,8 @@ impl MenuItem {
             MenuItem::NewFolder => "Создать папку",
             MenuItem::NewTextFile => "Создать текстовый файл",
             MenuItem::Refresh => "Обновить",
+            MenuItem::Restore => "Восстановить",
+            MenuItem::EmptyTrash => "Очистить корзину",
         }
     }
 
@@ -410,13 +422,15 @@ impl MenuItem {
             MenuItem::NewFolder => Some(Icon::Folder),
             MenuItem::NewTextFile => Some(Icon::File),
             MenuItem::Refresh => Some(Icon::Update),
+            MenuItem::Restore => Some(Icon::Back),
+            MenuItem::EmptyTrash => Some(Icon::Close),
         }
     }
 
     /// Группа — между разными группами черта.
     const fn group(self) -> u8 {
         match self {
-            MenuItem::Open | MenuItem::Rename | MenuItem::Delete => 0,
+            MenuItem::Open | MenuItem::Rename | MenuItem::Delete | MenuItem::Restore | MenuItem::EmptyTrash => 0,
             MenuItem::CopyPath | MenuItem::Properties => 1,
             MenuItem::NewFolder | MenuItem::NewTextFile => 2,
             MenuItem::Refresh => 3,
@@ -424,7 +438,7 @@ impl MenuItem {
     }
 
     const fn danger(self) -> bool {
-        matches!(self, MenuItem::Delete)
+        matches!(self, MenuItem::Delete | MenuItem::EmptyTrash)
     }
 }
 
@@ -516,11 +530,16 @@ struct Files {
     searching: bool,
     /// Смещение местного времени для дат, минуты.
     offset: i32,
+    /// Каталог корзины (`~/.local/share/Trash`, как у freedesktop; её же
+    /// пополняет «Удалить» на столе).
+    trash: String,
 }
 
 impl Files {
     fn new(path: String, home: String) -> Self {
+        let trash = format!("{home}/.local/share/Trash");
         let mut view = Self {
+            trash,
             path,
             back: Vec::new(),
             forward: Vec::new(),
@@ -867,7 +886,9 @@ impl Files {
     fn open_menu(&mut self, at: Option<(i32, i32)>, target: Option<usize>) {
         let items: &[MenuItem] = match target.and_then(|index| self.rows.get(index)) {
             Some(row) if row.is_volume() => &MenuItem::ON_VOLUME,
+            Some(_) if self.in_trash() => &MenuItem::ON_TRASHED,
             Some(_) => &MenuItem::ON_ENTRY,
+            None if self.in_trash() => &MenuItem::ON_TRASH,
             None if self.on_computer() => &MenuItem::ON_VOLUME[1..],
             None => &MenuItem::ON_FOLDER,
         };
@@ -1025,7 +1046,130 @@ impl Files {
                 self.close_menu();
                 self.reload();
             }
+            MenuItem::Restore => {
+                self.close_menu();
+                if let Some(index) = target {
+                    self.restore(index);
+                }
+            }
+            MenuItem::EmptyTrash => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.target = None;
+                    menu.mode = MenuMode::Confirm;
+                }
+            }
         }
+    }
+
+    /// Открыта ли корзина.
+    fn in_trash(&self) -> bool {
+        self.path == format!("{}/files", self.trash)
+    }
+
+    /// Перенести `path` в корзину. `Err` — код отказа переноса.
+    fn move_to_trash(&self, path: &str) -> Result<String, i64> {
+        let files = format!("{}/files", self.trash);
+        let info = format!("{}/info", self.trash);
+        make_dirs(&files)?;
+        make_dirs(&info)?;
+        let base = path.rsplit('/').next().unwrap_or(path);
+        let (stem, extension) = match base.rfind('.') {
+            Some(at) if at > 0 => (&base[..at], &base[at..]),
+            _ => (base, ""),
+        };
+        let mut name = None;
+        for attempt in 1..=1000u32 {
+            let candidate = if attempt == 1 { base.to_string() } else { format!("{stem} ({attempt}){extension}") };
+            if !exists(&join(&files, &candidate)) && !exists(&format!("{info}/{candidate}.trashinfo")) {
+                name = Some(candidate);
+                break;
+            }
+        }
+        let name = name.ok_or(user_abi::ERR_EXISTS)?;
+        let info_path = format!("{info}/{name}.trashinfo");
+        let mut text = format!("[Trash Info]\nPath={}\n", percent_encode(path));
+        let now = time_now();
+        if now > 0 {
+            let t = calendar::DateTime::from_unix(now as i64 + i64::from(self.offset) * 60);
+            text.push_str(&format!(
+                "DeletionDate={:04}-{:02}-{:02}T{:02}:{:02}:{:02}\n",
+                t.year, t.month, t.day, t.hour, t.minute, t.second
+            ));
+        }
+        write_file(&info_path, text.as_bytes())?;
+        let code = rename(path, &join(&files, &name));
+        if code < 0 {
+            remove(&info_path);
+            return Err(code);
+        }
+        Ok(name)
+    }
+
+    /// Вернуть строку корзины на место, откуда её удалили.
+    fn restore(&mut self, index: usize) {
+        let Some(row) = self.rows.get(index) else {
+            return;
+        };
+        let name = row.name.clone();
+        let info_path = format!("{}/info/{name}.trashinfo", self.trash);
+        let Some(original) = read_small(&info_path).and_then(|text| trash_origin(&text)) else {
+            println(&format!("files: no record where '{name}' came from"));
+            self.note = Some(format!("Неизвестно, откуда удалено «{name}»"));
+            return;
+        };
+        let parent = parent_of(&original);
+        let _ = make_dirs(&parent);
+        let base = original.rsplit('/').next().unwrap_or(&original).to_string();
+        let (stem, extension) = match base.rfind('.') {
+            Some(at) if at > 0 => (base[..at].to_string(), base[at..].to_string()),
+            _ => (base.clone(), String::new()),
+        };
+        // Место занято — рядом под свободным именем, как в Windows.
+        let mut target = join(&parent, &base);
+        for attempt in 2..=1000u32 {
+            if !exists(&target) {
+                break;
+            }
+            target = join(&parent, &format!("{stem} ({attempt}){extension}"));
+        }
+        let code = rename(&join(&self.path, &name), &target);
+        if code < 0 {
+            println(&format!("files: restore of '{name}' failed: {code}"));
+            self.note = Some(format!("Не удалось восстановить: {}", error_text(code)));
+            return;
+        }
+        remove(&info_path);
+        println(&format!("files: restored '{name}' to '{target}'"));
+        self.note = Some(format!("Восстановлено в {target}"));
+        let keep = self.selected.min(index);
+        self.reload();
+        self.selected = keep.min(self.rows.len().saturating_sub(1));
+    }
+
+    /// Стереть всё содержимое корзины.
+    fn empty_trash(&mut self) {
+        let files = format!("{}/files", self.trash);
+        let names: Vec<String> = match list_dir(&files) {
+            Ok((rows, _)) => rows.into_iter().map(|row| row.name).collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut count = 0;
+        let mut failed = None;
+        for name in &names {
+            let code = remove_tree(&join(&files, name), 0);
+            if code < 0 {
+                failed = Some(code);
+                continue;
+            }
+            remove(&format!("{}/info/{name}.trashinfo", self.trash));
+            count += 1;
+        }
+        println(&format!("files: emptied the trash, {count} items"));
+        self.note = Some(match failed {
+            Some(code) => format!("Стёрто {count}, не удалось: {}", error_text(code)),
+            None => format!("Корзина очищена: стёрто объектов {count}"),
+        });
+        self.reload();
     }
 
     /// Переименовать строку меню в `name`.
@@ -1061,10 +1205,14 @@ impl Files {
         }
     }
 
-    /// Удалить строку меню.
+    /// Удалить строку меню; без строки (в корзине) — очистить корзину.
     fn finish_delete(&mut self) {
         let Some(index) = self.menu.as_ref().and_then(|menu| menu.target) else {
+            let empty = self.in_trash();
             self.close_menu();
+            if empty {
+                self.empty_trash();
+            }
             return;
         };
         let Some(row) = self.rows.get(index) else {
@@ -1073,15 +1221,35 @@ impl Files {
         };
         let name = row.name.clone();
         let path = join(&self.path, &name);
-        let code = remove(&path);
         self.close_menu();
-        if code < 0 {
-            println(&format!("files: delete of '{name}' failed: {code}"));
-            self.note = Some(format!("Не удалось удалить: {}", error_text(code)));
-            return;
+        // В корзине «Удалить» стирает навсегда, вне её — переносит в
+        // корзину. С тома, где корзины нет (другой диск, `rename` между
+        // томами не бывает), — стирается, как раньше, и об этом сказано.
+        let trashed = if self.in_trash() || path.starts_with(&format!("{}/", self.trash)) { None } else { Some(self.move_to_trash(&path)) };
+        match trashed {
+            Some(Ok(as_name)) => {
+                println(&format!("files: deleted '{name}' to the trash as '{as_name}'"));
+                self.note = Some(format!("«{name}» — в корзине"));
+            }
+            Some(Err(code)) if code != user_abi::ERR_UNSUPPORTED && code != user_abi::ERR_PERMISSION => {
+                println(&format!("files: delete of '{name}' failed: {code}"));
+                self.note = Some(format!("Не удалось удалить: {}", error_text(code)));
+                return;
+            }
+            _ => {
+                let code = if self.in_trash() { remove_tree(&path, 0) } else { remove(&path) };
+                if code < 0 {
+                    println(&format!("files: delete of '{name}' failed: {code}"));
+                    self.note = Some(format!("Не удалось удалить: {}", error_text(code)));
+                    return;
+                }
+                if self.in_trash() {
+                    remove(&format!("{}/info/{name}.trashinfo", self.trash));
+                }
+                println(&format!("files: deleted '{name}'"));
+                self.note = Some(format!("Удалено навсегда «{name}»"));
+            }
         }
-        println(&format!("files: deleted '{name}'"));
-        self.note = Some(format!("Удалено «{name}»"));
         let keep = self.selected.min(index);
         self.reload();
         self.selected = keep.min(self.rows.len().saturating_sub(1));
@@ -1754,7 +1922,12 @@ impl Files {
                     .target
                     .and_then(|index| self.rows.get(index))
                     .map_or(String::new(), |row| row.name.clone());
-                paint::text_clipped(inner, s, Role::Body, x, y, room, &format!("Удалить «{name}»?"), p.ink);
+                let question = match (menu.target, self.in_trash()) {
+                    (None, _) => String::from("Очистить корзину? Всё в ней сотрётся навсегда"),
+                    (Some(_), true) => format!("Удалить «{name}» навсегда?"),
+                    (Some(_), false) => format!("Переместить «{name}» в корзину?"),
+                };
+                paint::text_clipped(inner, s, Role::Body, x, y, room, &question, p.ink);
                 y += ctx.px(30) as i32;
                 let btn_w = ctx.px(120);
                 let btn_h = ctx.px(30);
@@ -2450,6 +2623,7 @@ fn places(home: &str) -> Vec<(Option<&'static str>, String)> {
             out.push((None, path));
         }
     }
+    out.push((None, format!("{home}/.local/share/Trash/files")));
     out.push((Some("—"), String::from(COMPUTER)));
     out.push((None, String::from("/")));
     let mut info = Stat::default();
@@ -2468,6 +2642,7 @@ fn place_title<'a>(path: &'a str, home: &str) -> &'a str {
         _ if path == COMPUTER => "Этот компьютер",
         _ if path == "/" => "Системный диск",
         _ if path == "/usb" => "USB-накопитель",
+        _ if path.ends_with("/.local/share/Trash/files") => "Корзина",
         "Desktop" => "Рабочий стол",
         "Downloads" => "Загрузки",
         "Documents" => "Документы",
@@ -2487,6 +2662,9 @@ fn place_icon(path: &str, home: &str) -> &'static str {
         COMPUTER => "place-this-pc",
         "/" => "place-system-disk",
         "/usb" => "place-usb-stick",
+        _ if path.ends_with("/.local/share/Trash/files") => {
+            if dir_has_entries(path) { "place-trash-full" } else { "place-trash-empty" }
+        }
         _ => file_kind(path.rsplit('/').next().unwrap_or(path), true).0,
     }
 }
@@ -2599,6 +2777,143 @@ fn parent_of(path: &str) -> String {
     }
 }
 
+
+/// Домашний каталог: `/root` у нулевого uid, иначе каталог в `/home`,
+/// принадлежащий этому uid (`/home`, если такого нет).
+fn home_dir() -> String {
+    let me = user_progs::uid();
+    if me == 0 {
+        return String::from("/root");
+    }
+    if let Ok((rows, _)) = list_dir("/home") {
+        for row in rows {
+            let path = join("/home", &row.name);
+            let mut info = Stat::default();
+            if stat(&path, &mut info) >= 0 && info.kind == KIND_DIRECTORY && info.uid == me {
+                return path;
+            }
+        }
+    }
+    String::from("/home")
+}
+
+fn exists(path: &str) -> bool {
+    let mut info = Stat::default();
+    stat(path, &mut info) >= 0
+}
+
+/// Есть ли в каталоге хоть одна запись, кроме «.» и «..».
+fn dir_has_entries(path: &str) -> bool {
+    let fd = open(path);
+    if fd < 0 {
+        return false;
+    }
+    let mut entry = Dirent::default();
+    let mut found = false;
+    while readdir_raw(fd, &mut entry) > 0 {
+        let len = (entry.name_len as usize).min(entry.name.len());
+        if &entry.name[..len] != b"." && &entry.name[..len] != b".." {
+            found = true;
+            break;
+        }
+    }
+    close(fd);
+    found
+}
+
+/// Создать каталог вместе с недостающими родителями.
+fn make_dirs(path: &str) -> Result<(), i64> {
+    let mut built = String::new();
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        built.push('/');
+        built.push_str(part);
+        if exists(&built) {
+            continue;
+        }
+        let code = mkdir(&built, 0o755);
+        if code < 0 && code != user_abi::ERR_EXISTS {
+            return Err(code);
+        }
+    }
+    Ok(())
+}
+
+/// Записать маленький файл целиком.
+fn write_file(path: &str, data: &[u8]) -> Result<(), i64> {
+    let fd = open_write(path, true, true);
+    if fd < 0 {
+        return Err(fd);
+    }
+    let code = write(fd, data);
+    close(fd);
+    if code < 0 { Err(code) } else { Ok(()) }
+}
+
+/// Прочитать маленький текстовый файл (до 4 КиБ).
+fn read_small(path: &str) -> Option<String> {
+    let fd = open(path);
+    if fd < 0 {
+        return None;
+    }
+    let mut buffer = [0u8; 4096];
+    let got = read(fd, &mut buffer);
+    close(fd);
+    if got <= 0 {
+        return None;
+    }
+    core::str::from_utf8(&buffer[..got as usize]).ok().map(String::from)
+}
+
+/// Стереть файл или каталог со всем содержимым — только в корзине.
+fn remove_tree(path: &str, depth: u32) -> i64 {
+    let mut info = Stat::default();
+    if stat(path, &mut info) < 0 {
+        return user_abi::ERR_NOT_FOUND;
+    }
+    if info.kind == KIND_DIRECTORY && depth < 64 {
+        if let Ok((rows, _)) = list_dir(path) {
+            for row in rows {
+                let code = remove_tree(&join(path, &row.name), depth + 1);
+                if code < 0 {
+                    return code;
+                }
+            }
+        }
+    }
+    remove(path)
+}
+
+/// Путь в процентной записи `.trashinfo` (freedesktop).
+fn percent_encode(path: &str) -> String {
+    let mut out = String::new();
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Откуда удалено — `Path=` из `.trashinfo`.
+fn trash_origin(text: &str) -> Option<String> {
+    let value = text.lines().find_map(|line| line.trim().strip_prefix("Path="))?.trim();
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            out.push(u8::from_str_radix(value.get(at + 1..at + 3)?, 16).ok()?);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    let path = String::from_utf8(out).ok()?;
+    path.starts_with('/').then_some(path)
+}
 
 /// Прочитать каталог. Возвращает строки и сколько записей не поместилось.
 ///
@@ -2762,11 +3077,11 @@ pub extern "C" fn _start(argc: usize, argv: *const *const u8) -> ! {
     // Графика, формат точки и тема — у каркаса (`user_progs::app`, фаза С8).
     let info = app::start(&SPEC);
     let start = starting_dir(args.get(1));
-    let home = if user_progs::uid() == 0 { "/root" } else { "/home" };
+    let home = home_dir();
     let size = window_size(&info);
 
     app::run(&SPEC, &info, size, move |_, _| {
-        let view = Files::new(start, home.to_string());
+        let view = Files::new(start, home);
         // Что именно прочитано — в журнал, по разу на каждый каталог.
         // Нарисованное на экране снаружи не проверить, а строка проверяется:
         // она и отличает «список показан» от «окно нарисовано пустым».
