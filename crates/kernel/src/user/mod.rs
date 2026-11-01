@@ -1157,6 +1157,23 @@ impl Program {
         Ok(base)
     }
 
+    /// Разделяемая память, отображённая с адреса `addr`: объект, смещение этого
+    /// адреса в нём и права записи — для `mremap`, которому переносить такую
+    /// область надо тем же объектом, а не копией (01.11: пул буферов окна
+    /// Java растёт через `mremap`, и копия оставляла серверу Wayland старые
+    /// кадры — окно Rider после растягивания рисовалось полосами).
+    pub(crate) fn linux_shared_at(&self, addr: usize) -> Option<(Arc<shm::SharedMem>, u64, bool)> {
+        let index = self.mappings.partition_point(|region| region.end() <= addr);
+        let region = self.mappings.get(index).filter(|region| region.base <= addr)?;
+        match &region.source {
+            Source::Shared(shared) => {
+                let page = shared.first + (addr - region.base) / PAGE_SIZE;
+                Some((Arc::clone(&shared.mem), (page * PAGE_SIZE) as u64, shared.flags.contains(PageFlags::WRITE)))
+            }
+            _ => None,
+        }
+    }
+
     /// `madvise(MADV_DONTNEED)` программы Linux (фаза 71i): страницы
     /// безымянной ленивой памяти в `[addr, addr + len)` отдаются, и следующее
     /// касание получает нулевую страницу — как у Linux. На это рассчитывает

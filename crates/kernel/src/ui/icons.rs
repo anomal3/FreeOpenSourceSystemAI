@@ -115,6 +115,28 @@ pub struct Item {
     pub shortcut: Option<super::appicon::Art>,
 }
 
+/// Правка подписи значка на месте.
+pub struct Edit {
+    /// Номер значка в [`Icons::items`].
+    pub index: usize,
+    /// Что набрано.
+    pub text: String,
+    /// Имя выделено целиком: первая же буква заменяет его, Backspace стирает.
+    pub all: bool,
+}
+
+/// Чем кончилась клавиша в поле имени.
+pub enum EditReply {
+    /// Клавиша не для поля.
+    Ignored,
+    /// Набрано или стёрто — перерисовать.
+    Changed,
+    /// Enter: принять имя (может совпадать с прежним).
+    Commit(String),
+    /// Esc: оставить как было.
+    Cancel,
+}
+
 /// Значки стола: их места и то, какой из них выбран.
 pub struct Icons {
     /// Масштаб — тот же, что у всего стола.
@@ -135,6 +157,9 @@ pub struct Icons {
     /// Насколько сдвинуты выделенные значки, пока их несут: они рисуются
     /// поверх готовой картинки сетки, а в ней их нет.
     lift: Option<(i32, i32)>,
+    /// Подпись, которую правят на месте (02.11: «Создать → Папку» и F2, как в
+    /// Windows): поле вместо подписи, имя выделено целиком.
+    edit: Option<Edit>,
     /// Сколько значков помещается в столбец.
     ///
     /// Считается от рабочей области, а не задано числом: на 800×600 в столбец
@@ -245,6 +270,7 @@ impl Icons {
             slots: Vec::new(),
             band: None,
             lift: None,
+            edit: None,
             rows: 1,
             face: None,
             face_at: Rect::EMPTY,
@@ -381,6 +407,7 @@ impl Icons {
         self.marked.clear();
         self.band = None;
         self.lift = None;
+        self.edit = None;
         // Программы установленных пакетов, попросившие значок (`desktop=yes`
         // в манифесте, фаза 71i): после системных, до файлов стола.
         self.packages = package_signature();
@@ -635,6 +662,97 @@ impl Icons {
         self.cell(index)
     }
 
+    /// Начать правку подписи значка `index`: поле с его именем, выделенным
+    /// целиком. Значок становится единственным выделенным.
+    pub fn start_edit(&mut self, index: usize) -> Rect {
+        let Some(item) = self.items.get(index) else {
+            return Rect::EMPTY;
+        };
+        let text = item.label.clone();
+        let mut damage = self.select(Some(index));
+        self.edit = Some(Edit { index, text, all: true });
+        self.rebuild();
+        damage = damage.union(&self.cell(index));
+        damage
+    }
+
+    /// Что правится: номер значка и набранное.
+    #[must_use]
+    pub fn editing(&self) -> Option<(usize, &str)> {
+        self.edit.as_ref().map(|edit| (edit.index, edit.text.as_str()))
+    }
+
+    /// Закончить правку (имя уже принято или отменено). Возвращает, что
+    /// перерисовать.
+    pub fn end_edit(&mut self) -> Rect {
+        let Some(edit) = self.edit.take() else {
+            return Rect::EMPTY;
+        };
+        self.rebuild();
+        self.cell(edit.index)
+    }
+
+    /// Клавиша в поле имени.
+    pub fn edit_key(&mut self, code: crate::input::KeyCode, ch: Option<char>, ctrl: bool) -> EditReply {
+        use crate::input::KeyCode;
+        let Some(edit) = self.edit.as_mut() else {
+            return EditReply::Ignored;
+        };
+        let reply = match code {
+            KeyCode::Enter => return EditReply::Commit(edit.text.trim().to_string()),
+            KeyCode::Escape => return EditReply::Cancel,
+            KeyCode::Backspace => {
+                if edit.all {
+                    edit.text.clear();
+                    edit.all = false;
+                } else {
+                    edit.text.pop();
+                }
+                EditReply::Changed
+            }
+            // Ctrl+U — стереть всё, Ctrl+A — выделить всё, как в оболочке и
+            // в полях Windows.
+            KeyCode::U if ctrl => {
+                edit.text.clear();
+                edit.all = false;
+                EditReply::Changed
+            }
+            KeyCode::A if ctrl => {
+                edit.all = true;
+                EditReply::Changed
+            }
+            // Стрелки снимают выделение: дальше правят с конца имени.
+            KeyCode::Left | KeyCode::Right | KeyCode::End | KeyCode::Home => {
+                edit.all = false;
+                EditReply::Changed
+            }
+            _ => match ch {
+                // Косая черта — это путь, а не имя.
+                Some(ch) if !ctrl && ch != '/' && !ch.is_control() => {
+                    if edit.all {
+                        edit.text.clear();
+                        edit.all = false;
+                    }
+                    if edit.text.chars().count() < 255 {
+                        edit.text.push(ch);
+                    }
+                    EditReply::Changed
+                }
+                // Прочее (Tab, F-клавиши) полю не нужно, но и мимо не идёт:
+                // пока правят имя, клавиатура принадлежит полю.
+                _ => EditReply::Changed,
+            },
+        };
+        self.rebuild();
+        reply
+    }
+
+    /// Ячейка правимого значка — что перерисовать после клавиши.
+    #[must_use]
+    pub fn edit_area(&self) -> Rect {
+        self.edit.as_ref().map_or(Rect::EMPTY, |edit| self.cell(edit.index))
+    }
+
     /// Сделать выделенный значок главным (к нему — «Открыть», «Переименовать»),
     /// не трогая остального выделения.
     pub fn focus(&mut self, index: usize) {
@@ -760,7 +878,7 @@ impl Icons {
             for at in self.marked() {
                 let cell = self.cell(at).translate(lx, ly);
                 if !cell.intersect(&band).is_empty() {
-                    self.draw_one(back, cell, dy, &self.items[at], true);
+                    self.draw_one(back, cell, dy, at, &self.items[at], true);
                 }
             }
         }
@@ -817,7 +935,7 @@ impl Icons {
                 continue;
             }
             let item = &self.items[index];
-            self.draw_one(back, cell, dy, item, self.is_marked(index));
+            self.draw_one(back, cell, dy, index, item, self.is_marked(index));
         }
     }
 
@@ -848,14 +966,14 @@ impl Icons {
             let cell = self.cell(index);
             let local = cell.translate(-area.x, -area.y);
             let item = &self.items[index];
-            self.draw_one(&mut face, local, 0, item, self.is_marked(index));
+            self.draw_one(&mut face, local, 0, index, item, self.is_marked(index));
         }
         self.face = Some(face);
         self.face_at = area;
     }
 
     /// Нарисовать один значок в полосе кадра.
-    fn draw_one(&self, back: &mut Surface, cell: Rect, dy: i32, item: &Item, selected: bool) {
+    fn draw_one(&self, back: &mut Surface, cell: Rect, dy: i32, index: usize, item: &Item, selected: bool) {
         // Всё считается в координатах экрана, а в полосу переводится одним
         // сдвигом здесь: две системы координат внутри рисующего кода — это две
         // возможности перепутать, и обе выглядят как значок, уехавший на
@@ -931,6 +1049,36 @@ impl Icons {
         };
         let step = u32::from(ctx.face(Role::Label).line);
         let mut y = tile.bottom() + ctx.px(theme::ICON_LABEL_GAP) as i32;
+        // Подпись правят на месте: поле на всю ширину ячейки, набранное — с
+        // конца, если не влезает; выделенное целиком — на заливке акцента.
+        if let Some(edit) = self.edit.as_ref().filter(|edit| edit.index == index) {
+            let face = ctx.face(Role::Label);
+            let inset = ctx.px(2) as i32;
+            let field = Rect::new(cell.x + inset, y - inset, cell.w.saturating_sub(inset as u32 * 2), step + inset as u32 * 2);
+            draw::rounded(back, field, ctx.px(3), p.sunk.color, 255);
+            draw::rounded_stroke(back, field, ctx.px(3), p.acc, 255);
+            let room = field.w.saturating_sub(ctx.px(8));
+            // Не влезает — видно хвост: правят и набирают с конца.
+            let mut shown = edit.text.as_str();
+            while face.width(shown) > room && !shown.is_empty() {
+                let mut chars = shown.chars();
+                chars.next();
+                shown = chars.as_str();
+            }
+            let text_x = field.x + ctx.px(4) as i32;
+            let width = face.width(shown);
+            if edit.all && !shown.is_empty() {
+                let mark = Rect::new(text_x - 1, y, width + 2, step);
+                draw::blend_rect(back, mark, p.acc, 200);
+                paint::text_clipped(ctx, back, Role::Label, text_x, y, room, shown, p.acc_ink);
+            } else {
+                paint::text_clipped(ctx, back, Role::Label, text_x, y, room, shown, p.ink);
+                // Каретка — за последней буквой.
+                let caret_x = text_x + width as i32 + 1;
+                draw::vline(back, caret_x, y, step, p.ink, 255);
+            }
+            return;
+        }
         let (first, second) = wrap(ctx, &item.label, room);
         centered(ctx, back, cell, y, room, &first, ink);
         if let Some(second) = second {

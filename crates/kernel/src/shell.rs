@@ -1163,6 +1163,13 @@ fn run_builtin(line: &str) -> bool {
             crate::linux::recent::set_trace(argument);
             sprintln!("  lxtrace: {}", if argument.is_empty() || argument == "off" { "off" } else { argument });
         }
+        // Запросы и события сервера Wayland — в серийную линию (`on`/`off`).
+        #[cfg(target_arch = "x86_64")]
+        "wltrace" => {
+            let on = argument == "on";
+            crate::linux::wayland::set_trace(on);
+            sprintln!("  wltrace: {}", if on { "on" } else { "off" });
+        }
         "irq" => interrupt_wakes(argument),
         "beep" => beep(argument),
         "clear" => {

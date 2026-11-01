@@ -208,6 +208,15 @@ impl App {
     }
 }
 
+/// Стороны окна, которые двигает [`Hit::Resize`].
+pub const EDGE_LEFT: u8 = 1;
+pub const EDGE_RIGHT: u8 = 2;
+pub const EDGE_TOP: u8 = 4;
+pub const EDGE_BOTTOM: u8 = 8;
+
+/// Ширина полосы у края окна, за которую его тянут, — в точках до масштаба.
+const EDGE_GRAB: u32 = 6;
+
 /// Во что попадает указатель внутри окна.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
@@ -217,8 +226,10 @@ pub enum Hit {
     Minimize,
     /// Кнопка «развернуть» — она же «вернуть прежний размер».
     Maximize,
-    /// Уголок в правом нижнем углу: за него окно тянут за размер.
-    Resize,
+    /// Край или угол окна: за него окно тянут за размер. Какие стороны
+    /// двигаются — [`EDGE_LEFT`] и прочие (01.11: раньше — только правый
+    /// нижний уголок).
+    Resize(u8),
     /// Полоса заголовка: за неё окно таскают.
     Title,
     /// Вкладка терминала (номер сессии): переключиться на неё.
@@ -721,15 +732,14 @@ impl Window {
             return None;
         }
         let local = (x - self.rect.x, y - self.rect.y);
-        // У окна без рамки (Chromium) заголовок и кнопки рисует программа, а
-        // тянуть за край ей нечем: тень с краем, за который тянут в Linux,
-        // лежит за пределами окна, и стол её срезает. Уголок размера —
-        // невидимый, полоса в несколько точек у правого нижнего угла.
-        if self.frameless && !self.popup && self.resizable() && !self.is_maximized() {
-            let edge = (GRIP / 2) as i32;
-            let (w, h) = (self.rect.w as i32, self.rect.h as i32);
-            if local.0 >= w - edge && local.1 >= h - edge {
-                return Some(Hit::Resize);
+        // Края и углы — за них окно тянут за размер, у любого окна, которому
+        // размер менять можно, и с рамкой, и без (Chromium, Rider: их тень, за
+        // которую тянут в Linux, стол срезает). Полоса узкая, а у углов —
+        // шире, как у Windows: в угол целиться труднее.
+        if !self.popup && self.resizable() && !self.is_maximized() && !theme::is_mobile() {
+            let edges = self.edges_at(local.0, local.1);
+            if edges != 0 {
+                return Some(Hit::Resize(edges));
             }
         }
         // У всплывающего окна и окна без рамки нет ни заголовка, ни кнопок:
@@ -788,9 +798,43 @@ impl Window {
         // они пересекаются, и таскать такое окно важнее, чем тянуть его за
         // размер.
         if self.resizable() && self.resize_grip().contains(local.0, local.1) {
-            return Some(Hit::Resize);
+            return Some(Hit::Resize(EDGE_RIGHT | EDGE_BOTTOM));
         }
         Some(Hit::Body)
+    }
+
+    /// Какие края окна под точкой `local` (координаты окна): полоса
+    /// [`EDGE_GRAB`] у каждой стороны, у углов — вдвое шире вдоль стороны.
+    fn edges_at(&self, x: i32, y: i32) -> u8 {
+        let grab = ((EDGE_GRAB * self.scale.max(1)) as i32).max(3);
+        let corner = grab * 3;
+        let (w, h) = (self.rect.w as i32, self.rect.h as i32);
+        let mut edges = 0;
+        if x < grab {
+            edges |= EDGE_LEFT;
+        } else if x >= w - grab {
+            edges |= EDGE_RIGHT;
+        }
+        if y < grab {
+            edges |= EDGE_TOP;
+        } else if y >= h - grab {
+            edges |= EDGE_BOTTOM;
+        }
+        // Угол «с запасом»: рядом с углом на сторону — тоже угол.
+        if edges == EDGE_LEFT || edges == EDGE_RIGHT {
+            if y < corner {
+                edges |= EDGE_TOP;
+            } else if y >= h - corner {
+                edges |= EDGE_BOTTOM;
+            }
+        } else if edges == EDGE_TOP || edges == EDGE_BOTTOM {
+            if x < corner {
+                edges |= EDGE_LEFT;
+            } else if x >= w - corner {
+                edges |= EDGE_RIGHT;
+            }
+        }
+        edges
     }
 
     /// Уголок размера: три точки в правом нижнем углу — у окна, которому размер

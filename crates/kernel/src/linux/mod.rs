@@ -44,7 +44,7 @@ pub mod signal;
 mod special;
 mod thread;
 pub mod vdso;
-mod wayland;
+pub mod wayland;
 
 pub use process::{process_ended, register_child};
 
@@ -1488,8 +1488,8 @@ fn mmap(addr: usize, len: usize, prot: usize, flags: usize, fd: usize, offset: u
 /// `mremap(old, old_size, new_size, flags)` (фаза 71i: сетевая служба
 /// Chromium без него выходит). Сжать — снять хвост на месте; вырасти — только
 /// с `MREMAP_MAYMOVE`: новая безымянная область, содержимое переносится, старая
-/// снимается. Разделяемую память перенос не сохраняет разделяемой — такой
-/// просьбы пока не было.
+/// снимается. Разделяемая память (`memfd`, `/dev/shm`) переносится тем же
+/// объектом: новая область отображает его с того же места, копии нет.
 fn mremap(old: usize, old_size: usize, new_size: usize, flags: usize) -> i64 {
     const MREMAP_MAYMOVE: usize = 1;
     const PAGE: usize = 4096;
@@ -1510,6 +1510,23 @@ fn mremap(old: usize, old_size: usize, new_size: usize, flags: usize) -> i64 {
     }
     if flags & MREMAP_MAYMOVE == 0 {
         return -e::ENOMEM;
+    }
+    // Разделяемая память — тем же объектом: и программа, и сервер Wayland
+    // (и второй процесс после `fork`) должны видеть одни кадры. Копия в
+    // безымянную память оставляла их без новых записей программы.
+    if let Some((mem, offset, writable)) = crate::user::with_current(|program| program.linux_shared_at(old)).flatten() {
+        const PROT_READ: usize = 1;
+        const PROT_WRITE: usize = 2;
+        let prot = if writable { PROT_READ | PROT_WRITE } else { PROT_READ };
+        let mapped = crate::user::with_current(|program| program.linux_mmap(0, new_size, prot, false, None, Some((mem, offset))));
+        let new = match mapped {
+            Some(Ok(base)) => base,
+            Some(Err(err)) => return errno(crate::user::syscall::mmap_errno(err)),
+            None => return -e::ESRCH,
+        };
+        // SAFETY: контракт `syscall`.
+        unsafe { native(SYS_MUNMAP, old, old_size, 0) };
+        return new as i64;
     }
     if !space::user_can(old, old_size, PageFlags::READ) {
         return -e::EFAULT;

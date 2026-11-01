@@ -203,7 +203,12 @@ pub struct Compositor {
     /// Числа со знаком и без ограничений: это «где сейчас палец», а пределы
     /// ставятся при применении. Так окно, упёршееся в наименьший размер, на
     /// обратном ходу снова следует за пальцем, а не отстаёт на накопленное.
-    pending_size: Option<(App, i32, i32)>,
+    ///
+    /// Прямоугольник целиком (`x, y, w, h`): тянуть можно за любой край, и у
+    /// левого и верхнего вместе с размером едет угол окна (01.11).
+    pending_size: Option<(App, i32, i32, i32, i32)>,
+    /// Какие края тянут ([`super::window::EDGE_LEFT`] и прочие).
+    resize_edges: u8,
     /// Окно программы, над содержимым которого указатель был в прошлый раз
     /// (фаза N7h).
     ///
@@ -332,6 +337,7 @@ impl Compositor {
             drag_resizes: false,
             moved: None,
             pending_size: None,
+            resize_edges: 0,
             hovered: None,
             peek: None,
             thumbs: None,
@@ -1147,6 +1153,32 @@ impl Compositor {
         self.icon_damage(damage);
     }
 
+    /// Начать правку подписи значка на месте.
+    pub fn start_icon_edit(&mut self, index: usize) {
+        let damage = self.icons.start_edit(index);
+        self.icon_damage(damage);
+    }
+
+    /// Правится ли подпись: номер значка и набранное.
+    #[must_use]
+    pub fn icon_editing(&self) -> Option<(usize, alloc::string::String)> {
+        self.icons.editing().map(|(index, text)| (index, alloc::string::String::from(text)))
+    }
+
+    /// Клавиша в поле имени значка.
+    pub fn icon_edit_key(&mut self, code: crate::input::KeyCode, ch: Option<char>, ctrl: bool) -> super::icons::EditReply {
+        let reply = self.icons.edit_key(code, ch, ctrl);
+        let damage = self.icons.edit_area();
+        self.icon_damage(damage);
+        reply
+    }
+
+    /// Закончить правку подписи.
+    pub fn end_icon_edit(&mut self) {
+        let damage = self.icons.end_edit();
+        self.icon_damage(damage);
+    }
+
     /// Сделать выделенный значок главным, не снимая остального выделения.
     pub fn focus_icon(&mut self, index: usize) {
         self.icons.focus(index);
@@ -1362,11 +1394,19 @@ impl Compositor {
         }
     }
 
-    /// Начать изменение размера окна: тот же захват, другое действие.
-    pub fn set_resize_drag(&mut self, app: App) {
+    /// Начать изменение размера окна за края `edges`: тот же захват, другое
+    /// действие.
+    pub fn set_resize_drag(&mut self, app: App, edges: u8) {
         self.drag = Some(app);
         self.drag_from = self.rect_of(app).map_or((0, 0), |rect| (rect.x, rect.y));
         self.drag_resizes = true;
+        self.resize_edges = if edges == 0 { super::window::EDGE_RIGHT | super::window::EDGE_BOTTOM } else { edges };
+    }
+
+    /// За какие края тянут окно сейчас.
+    #[must_use]
+    pub const fn resize_edges(&self) -> u8 {
+        self.resize_edges
     }
 
     /// Тянут ли окно за уголок (а не переносят).
@@ -1406,11 +1446,24 @@ impl Compositor {
             let Some(before) = self.windows.get(index).map(|window| window.rect) else {
                 return;
             };
-            let (w, h) = match self.pending_size {
-                Some((pending, w, h)) if pending == app => (w, h),
-                _ => (before.w as i32, before.h as i32),
+            let (mut x, mut y, mut w, mut h) = match self.pending_size {
+                Some((pending, x, y, w, h)) if pending == app => (x, y, w, h),
+                _ => (before.x, before.y, before.w as i32, before.h as i32),
             };
-            self.pending_size = Some((app, w + dx, h + dy));
+            let edges = self.resize_edges;
+            if edges & super::window::EDGE_LEFT != 0 {
+                x += dx;
+                w -= dx;
+            } else if edges & super::window::EDGE_RIGHT != 0 {
+                w += dx;
+            }
+            if edges & super::window::EDGE_TOP != 0 {
+                y += dy;
+                h -= dy;
+            } else if edges & super::window::EDGE_BOTTOM != 0 {
+                h += dy;
+            }
+            self.pending_size = Some((app, x, y, w, h));
             return;
         }
         let Some(window) = self.windows.get_mut(index) else {
@@ -2230,11 +2283,12 @@ impl Compositor {
     /// опозданием — Роман так и описал. Последний размер к моменту кадра — это
     /// всё, что человек увидит.
     fn apply_pending_size(&mut self) {
-        let Some((app, w, h)) = self.pending_size.take() else {
+        let Some((app, _, _, w, h)) = self.pending_size.take() else {
             return;
         };
         let width = self.screen.width();
         let bottom = self.work_bottom();
+        let edges = self.resize_edges;
         let Some(index) = self.index_of(app) else {
             return;
         };
@@ -2242,11 +2296,24 @@ impl Compositor {
             return;
         };
         let before = window.rect;
-        let limit_w = width.saturating_sub(before.x.max(0) as u32);
-        let limit_h = (bottom - before.y).max(0) as u32;
+        let (left, top) = (edges & super::window::EDGE_LEFT != 0, edges & super::window::EDGE_TOP != 0);
+        // Левый и верхний края тянут к краю экрана, правый и нижний — к
+        // правому краю и панели; противоположная сторона стоит на месте.
+        let limit_w = if left { before.right().max(0) as u32 } else { width.saturating_sub(before.x.max(0) as u32) };
+        let limit_h = if top { before.bottom().max(0) as u32 } else { (bottom - before.y).max(0) as u32 };
         let w = (w.max(0) as u32).min(limit_w);
         let h = (h.max(0) as u32).min(limit_h);
-        if !window.resize(w, h) || window.rect == before {
+        if !window.resize(w, h) {
+            return;
+        }
+        // Окно могло упереться в наименьший размер: угол ставится от
+        // неподвижной стороны по тому размеру, что получился.
+        if left || top {
+            let new_x = if left { before.right() - window.rect.w as i32 } else { before.x };
+            let new_y = if top { before.bottom() - window.rect.h as i32 } else { before.y };
+            window.move_within(new_x - window.rect.x, new_y - window.rect.y, width, bottom);
+        }
+        if window.rect == before {
             return;
         }
         let after = window.rect;
@@ -2466,15 +2533,6 @@ impl Compositor {
             Some(menu) => menu.handle_key(event),
             None => Reply::Ignored,
         }
-    }
-
-    /// Перевести меню в набор нового имени.
-    pub fn context_rename(&mut self, name: &str) {
-        let before = self.context.as_ref().map(|menu| menu.rect);
-        if let Some(menu) = self.context.as_mut() {
-            menu.start_rename(name);
-        }
-        self.mark_shrunk(before);
     }
 
     /// Спросить в меню, точно ли удалять.

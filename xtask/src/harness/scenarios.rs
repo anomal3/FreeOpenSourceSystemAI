@@ -4877,13 +4877,17 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : context menu at", 15_000),
             Step::Aim(Aim::ContextItem(0, 0)),
             Step::Click,
-            Step::Await("desktop     : created 'New folder' in /home/roman/Desktop", 15_000),
+            Step::Await("desktop     : created 'Новая папка' in /home/roman/Desktop", 15_000),
+            // Меню закрывается само, и новая папка сразу просит имя (02.11).
+            Step::Await("desktop     : context menu closed", 15_000),
             // Созданное обязано появиться **на столе**, а не только на диске:
             // четыре системных значка плюс один из каталога.
             Step::Await("desktop     : icons 5, 1 from /home/roman/Desktop", 15_000),
+            Step::Await("desktop     : naming 'Новая папка'", 15_000),
+            // Щелчок мимо поля оставляет предложенное имя.
             Step::Aim(Aim::EmptyBelow),
             Step::Click,
-            Step::Await("desktop     : context menu closed", 15_000),
+            Step::Await("desktop     : named 'Новая папка'", 15_000),
             Step::Wait(2_000),
             Step::Shot("01-desktop-folder"),
             // Меню на самом значке: пункты у него другие — открыть,
@@ -4897,28 +4901,21 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("02-entry-menu"),
             // «Переименовать» — третий пункт, после черты: у папки сверху
             // «Открыть» и «Открыть в терминале», как в Windows (24.10).
-            // Строка приходит заполненной прежним именем; Ctrl+U стирает её
-            // целиком, дальше набирается новое имя на настоящей клавиатуре.
+            // Поле открывается на месте подписи с выделенным именем (02.11):
+            // набранное заменяет его, Enter принимает. Меню закрывается
+            // сразу — оно больше не забирает ввод.
             Step::Aim(Aim::ContextItem(2, 1)),
             Step::Click,
+            Step::Await("desktop     : naming 'Новая папка'", 15_000),
             Step::Wait(1_500),
             Step::Shot("03-rename"),
-            Step::Key("ctrl-u"),
             Step::Type("Reports"),
             Step::Key("ret"),
             Step::Await(
-                "desktop     : renamed '/home/roman/Desktop/New folder' to 'Reports'",
+                "desktop     : renamed '/home/roman/Desktop/Новая папка' to 'Reports'",
                 15_000,
             ),
             Step::Await("desktop     : icons 5, 1 from /home/roman/Desktop", 15_000),
-            // Меню закрывается **до** команды оболочке, и это не уборка за
-            // собой: пока оно открыто, оно забирает весь ввод — в том числе
-            // перевод строки, приехавший по серийной линии. Первый прогон
-            // упал ровно на этом: `Enter` от команды `ls` попал в меню и
-            // запустил «переименовать» второй раз.
-            Step::Aim(Aim::EmptyBelow),
-            Step::Click,
-            Step::Await("desktop     : context menu closed", 15_000),
             Step::Line("ls /home/roman/Desktop"),
             Step::Await("Reports", 15_000),
             // Удаление спрашивает подтверждения: отменить его нечем, корзины в
@@ -4938,7 +4935,7 @@ pub const ALL: &[Scenario] = &[
             Step::Click,
             Step::Await("desktop     : context menu closed", 15_000),
             // Каталог стола остаётся пустым, и это условие повторяемости:
-            // созданное предыдущим прогоном заняло бы имя «New folder», а
+            // созданное предыдущим прогоном заняло бы имя «Новая папка», а
             // проверки выше считают значки поимённо. Сам каталог остаётся —
             // его завело создание папки, и это тоже проверка: на живом носителе
             // он не заводится вовсе.

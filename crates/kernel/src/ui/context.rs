@@ -46,12 +46,12 @@ use alloc::vec::Vec;
 
 use mini_ui::draw;
 use mini_ui::glyphicon::{self, Icon};
-use mini_ui::typeface::{Face, Role};
+use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface};
 
 use mini_ui::paint::{self, Ctx, RowState, Tone};
 use mini_ui::theme;
-use crate::input::{KeyCode, KeyEvent, Modifiers};
+use crate::input::{KeyCode, KeyEvent};
 use crate::vfs::perm::Access;
 
 /// Поле внутри карточки.
@@ -70,12 +70,7 @@ pub const MENU_RADIUS: u32 = 6;
 const ICON_GAP: u32 = 10;
 /// Поле разделителя сверху и снизу.
 const SEP_PAD: u32 = 5;
-/// Высота поля ввода имени.
-const FIELD_H: u32 = 30;
-
-/// Подсказка под полем ввода имени — она же задаёт наименьшую ширину меню.
-const RENAME_HINT: &str = "Enter — переименовать    Esc — отмена    Ctrl+U — очистить";
-/// Подсказка под вопросом об удалении.
+/// Подсказка под вопросом об удалении — она же задаёт наименьшую ширину меню.
 const CONFIRM_HINT: &str = "Y — удалить    N — оставить";
 
 /// Что предлагает меню.
@@ -291,17 +286,13 @@ impl Action {
 enum Mode {
     /// Обычный список пунктов.
     Menu,
-    /// Набирается новое имя.
-    Rename { from: String, text: String },
     /// Ждём подтверждения удаления.
     Confirm { name: String },
 }
 
 /// Что меню просит сделать в ответ на клавишу.
 ///
-/// Отдельный тип, а не `Option<Action>`: переименование приносит с собой
-/// набранную строку, и втискивать её в перечисление пунктов значило бы иметь
-/// пункт, у которого есть данные ровно в одном случае из семи.
+/// Имя значку дают не здесь, а на месте подписи (02.11, `icons::Edit`).
 pub enum Reply {
     /// Клавиша меню не понадобилась — пусть её разбирает кто-нибудь ещё.
     Ignored,
@@ -311,8 +302,6 @@ pub enum Reply {
     Close,
     /// Выполнить пункт.
     Run(Action),
-    /// Переименовать выбранное в это имя.
-    Rename(String),
     /// Удаление подтверждено.
     Delete,
 }
@@ -356,10 +345,7 @@ impl ContextMenu {
             widest = widest.max(ctx.face(Role::Body).width(action.title()));
         }
         let content = ctx.px(ICON + ICON_GAP) + widest;
-        let hint = ctx
-            .face(Role::Caption)
-            .width(RENAME_HINT)
-            .max(ctx.face(Role::Caption).width(CONFIRM_HINT));
+        let hint = ctx.face(Role::Caption).width(CONFIRM_HINT);
         let width = content.max(hint) + ctx.px((CARD_PAD + ROW_PAD) * 2);
 
         // Поверхность — на самое длинное меню, какое бывает; показывается из
@@ -501,15 +487,6 @@ impl ContextMenu {
         Rect::new(0, 0, self.rect.w, self.rect.h)
     }
 
-    /// Начать набор нового имени.
-    pub fn start_rename(&mut self, name: &str) {
-        self.widen();
-        self.mode = Mode::Rename { from: name.to_string(), text: name.to_string() };
-        self.note = None;
-        self.fit(rename_height(self.ctx()));
-        self.redraw();
-    }
-
     /// Спросить, точно ли удалять.
     ///
     /// Спрашивается всегда, а не только у каталога: отменить удаление нечем —
@@ -562,55 +539,6 @@ impl ContextMenu {
                     Reply::Handled
                 }
                 _ => Reply::Handled,
-            },
-            Mode::Rename { from, text } => match event.code {
-                KeyCode::Escape => {
-                    self.mode = Mode::Menu;
-                    self.redraw();
-                    Reply::Handled
-                }
-                KeyCode::Backspace => {
-                    text.pop();
-                    self.redraw();
-                    Reply::Handled
-                }
-                // Строка приходит заполненной прежним именем — так правят
-                // букву, не набирая всё заново. Заменить имя целиком стоило бы
-                // тогда десяти нажатий Backspace, поэтому здесь то же
-                // сочетание, что стирает строку в любой оболочке.
-                KeyCode::U if event.mods.contains(Modifiers::CTRL) => {
-                    text.clear();
-                    self.redraw();
-                    Reply::Handled
-                }
-                KeyCode::Enter => {
-                    let name = text.trim().to_string();
-                    // Имя, не изменившееся или пустое, — это отказ от
-                    // переименования, а не переименование в ничто. Молча
-                    // выполнить его значило бы получить `rename(a, a)` и в
-                    // лучшем случае ничего, в худшем — потерянную запись.
-                    if name.is_empty() || name == *from {
-                        self.mode = Mode::Menu;
-                        self.redraw();
-                        return Reply::Handled;
-                    }
-                    Reply::Rename(name)
-                }
-                _ => {
-                    // Косая черта в имени — это путь, а не имя: переименование
-                    // с ней увело бы файл в другой каталог, чего человек,
-                    // набирающий имя под значком, не просил.
-                    match event.to_char() {
-                        Some(ch) if ch != '/' && ch != '\n' && !ch.is_control() => {
-                            if text.chars().count() < NAME_LIMIT {
-                                text.push(ch);
-                                self.redraw();
-                            }
-                            Reply::Handled
-                        }
-                        _ => Reply::Handled,
-                    }
-                }
             },
         }
     }
@@ -744,10 +672,6 @@ impl ContextMenu {
                     }
                 }
             }
-            Mode::Rename { text, .. } => {
-                let s = &mut self.surface;
-                draw_rename(inner, s, card, text);
-            }
             Mode::Confirm { name } => {
                 let s = &mut self.surface;
                 draw_confirm(inner, s, card, name);
@@ -780,12 +704,6 @@ impl ContextMenu {
         core::mem::replace(&mut self.damage, Rect::EMPTY)
     }
 }
-
-/// Сколько знаков помещается в имя.
-///
-/// Предел ext2 — 255 байт, но набранное имя рисуется в меню, и строка, которую
-/// негде показать, — это ввод вслепую.
-const NAME_LIMIT: usize = 64;
 
 /// Одна строка меню и место, которое она занимает.
 struct Slot {
@@ -862,21 +780,6 @@ fn rows_height(ctx: Ctx, items: &[Action]) -> u32 {
     let layout = plan(ctx, Rect::new(0, 0, 0, 0), items);
     let last = layout.rows.last().map_or(0, |slot| slot.rect.bottom());
     (last + ctx.px(CARD_PAD) as i32).max(0) as u32
-}
-
-/// Высота карточки, занятой набором имени.
-///
-/// Считается отдельно, а не берётся от списка пунктов: поверхность заведена
-/// под самый длинный список раз и навсегда, и если карточку рисовать во всю её
-/// высоту, под подсказкой остаётся пустая треть. Пустота внизу читается как
-/// «здесь что-то не нарисовалось».
-fn rename_height(ctx: Ctx) -> u32 {
-    let caps = u32::from(ctx.face(Role::MonoCaps).line);
-    let hint = u32::from(ctx.face(Role::Caption).line);
-    // Слагаемые те же и в том же порядке, что в [`draw_rename`], — иначе
-    // подпись однажды уедет под нижний край, и заметит это только глаз.
-    ctx.px(CARD_PAD + 6) + caps + ctx.px(10) + ctx.px(FIELD_H) + ctx.px(10) + hint
-        + ctx.px(CARD_PAD + 6)
 }
 
 /// Высота карточки с вопросом об удалении.
@@ -976,51 +879,6 @@ fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool)
     );
 }
 
-/// Поле ввода нового имени.
-fn draw_rename(ctx: Ctx, s: &mut Surface, card: Rect, text: &str) {
-    let p = ctx.palette;
-    let pad = ctx.px(CARD_PAD + ROW_PAD);
-    let left = card.x + pad as i32;
-    let width = card.w.saturating_sub(pad * 2);
-    let mut y = card.y + ctx.px(CARD_PAD + 6) as i32;
-
-    paint::caps(ctx, s, left, y, "НОВОЕ ИМЯ");
-    y += (u32::from(ctx.face(Role::MonoCaps).line) + ctx.px(10)) as i32;
-
-    let field = Rect::new(left, y, width, ctx.px(FIELD_H));
-    let r = ctx.px(theme::R_CHIP);
-    paint::sunk(ctx, s, field, r);
-    // Кольцо снаружи и обводка по краю: поле, в которое сейчас набирают, обязано
-    // отличаться от поля, которое просто нарисовано, — иначе непонятно, куда
-    // уходят нажатия.
-    draw::rounded_stroke(s, field, r, p.acc, 255);
-    let ring = Rect::new(
-        field.x - ctx.px(2) as i32,
-        field.y - ctx.px(2) as i32,
-        field.w + ctx.px(4),
-        field.h + ctx.px(4),
-    );
-    draw::rounded_stroke(s, ring, r + ctx.px(2), p.acctint.color, p.acctint.alpha);
-
-    // Показывается **хвост** строки: набирают в конце, и уехавший за край
-    // курсор выглядел бы как переставший отвечать ввод.
-    let inner = ctx.px(10);
-    let room = field.w.saturating_sub(inner * 2 + ctx.px(4));
-    let shown = tail(ctx.face(Role::Mono), text, room);
-    let baseline = paint::baseline(ctx, Role::Mono, field);
-    let used = paint::text(ctx, s, Role::Mono, field.x + inner as i32, baseline, &shown, p.ink2);
-    let caret = Rect::new(
-        field.x + (inner + used) as i32 + ctx.px(1) as i32,
-        field.y + (field.h as i32 - ctx.px(15) as i32) / 2,
-        ctx.px(1),
-        ctx.px(15),
-    );
-    s.fill(caret, p.acc);
-
-    y += (field.h + ctx.px(10)) as i32;
-    paint::text_clipped(ctx, s, Role::Caption, left, y, width, RENAME_HINT, p.ink5);
-}
-
 /// Вопрос об удалении.
 fn draw_confirm(ctx: Ctx, s: &mut Surface, card: Rect, name: &str) {
     let p = ctx.palette;
@@ -1037,25 +895,6 @@ fn draw_confirm(ctx: Ctx, s: &mut Surface, card: Rect, name: &str) {
     y += (u32::from(ctx.face(Role::Body).line) + ctx.px(10)) as i32;
 
     paint::text_clipped(ctx, s, Role::Caption, left, y, width, CONFIRM_HINT, p.bad_ink);
-}
-
-/// Оставить хвост строки — то, что набирают прямо сейчас.
-fn tail(face: &Face, text: &str, room: u32) -> String {
-    if face.width(text) <= room {
-        return text.to_string();
-    }
-    let mark = face.width("…");
-    let room = room.saturating_sub(mark);
-    let count = text.chars().count();
-    for skip in 1..=count {
-        let candidate: String = text.chars().skip(skip).collect();
-        if face.width(&candidate) <= room {
-            let mut out = String::from("…");
-            out.push_str(&candidate);
-            return out;
-        }
-    }
-    String::from("…")
 }
 
 /// Каталог стола — там появляется всё, что создаётся его меню.
@@ -1083,21 +922,19 @@ pub fn home_dir() -> String {
 /// Создать в каталоге стола каталог или пустой файл с незанятым именем.
 ///
 /// Возвращает имя того, что получилось, либо объяснение отказа. Имя
-/// подбирается с номером — «New folder», «New folder 2» и так далее: молча
-/// писать поверх уже существующего нельзя, а переименовать созданное человек
-/// теперь может прямо на столе.
+/// подбирается с номером в скобках, как в Windows, — «Новая папка», «Новая
+/// папка (2)» и так далее: молча писать поверх уже существующего нельзя, а
+/// имя человек сразу правит на месте подписи.
 pub fn create_entry(directory: bool) -> Result<String, String> {
     let base = desktop_dir();
     ensure_dir(&base)?;
 
-    let stem = if directory { "New folder" } else { "New file.txt" };
-    for attempt in 1..=32u32 {
+    let (stem, extension) = if directory { ("Новая папка", "") } else { ("Новый текстовый документ", ".txt") };
+    for attempt in 1..=256u32 {
         let name = if attempt == 1 {
-            stem.to_string()
-        } else if directory {
-            alloc::format!("New folder {attempt}")
+            alloc::format!("{stem}{extension}")
         } else {
-            alloc::format!("New file {attempt}.txt")
+            alloc::format!("{stem} ({attempt}){extension}")
         };
         let path = alloc::format!("{base}/{name}");
         if exists(&path) {

@@ -405,6 +405,10 @@ static ICON_GESTURE: SpinLock<Option<IconGesture>> = SpinLock::new(None);
 /// С какого сдвига нажатие на значок становится переносом, а не щелчком.
 const CARRY_THRESHOLD: i32 = 4;
 
+/// Последний щелчок был по столу (значку или пустому месту), а не по окну:
+/// F2 тогда переименовывает значок.
+static DESK_FOCUS: AtomicBool = AtomicBool::new(false);
+
 // ---------------------------------------------------------------------------
 // Запуск
 // ---------------------------------------------------------------------------
@@ -1715,6 +1719,30 @@ fn dispatch_on(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Op
     }
     META_ARMED.store(false, Ordering::Relaxed);
 
+    // Имя значка правят на месте: пока поле открыто, клавиатура — его.
+    if desktop.icon_editing().is_some() {
+        let ctrl = event.mods.contains(Modifiers::CTRL);
+        match desktop.icon_edit_key(event.code, keymap::char_for(event), ctrl) {
+            icons::EditReply::Commit(name) => finish_icon_edit(desktop, Some(name)),
+            icons::EditReply::Cancel => finish_icon_edit(desktop, None),
+            icons::EditReply::Changed | icons::EditReply::Ignored => {}
+        }
+        desktop.present();
+        return None;
+    }
+    // F2 — переименовать выделенный значок, если последний щелчок был по
+    // столу: иначе F2 принадлежит окну (у `mc` это меню).
+    if event.code == KeyCode::F2 && DESK_FOCUS.load(Ordering::Relaxed) {
+        if let Some(index) = desktop.icon_selection() {
+            if matches!(desktop.icon_kind(index), Some(icons::Kind::Folder | icons::Kind::File)) {
+                desktop.start_icon_edit(index);
+                kprintln!("  desktop     : naming '{}'", desktop.icon_label(index).unwrap_or_default());
+                desktop.present();
+                return None;
+            }
+        }
+    }
+
     // Win+Пробел — второе сочетание раскладки, то, к которому привыкли в
     // Windows 8 и позже. Alt+Shift выше — то, к которому привыкли раньше.
     if event.code == KeyCode::Space && event.mods.contains(Modifiers::META) {
@@ -1915,12 +1943,12 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
     // Форма курсора (72c): растяжка у уголка и пока тянут, текст над
     // терминалом, иначе стрелка.
     let shape = if desktop.resizing() {
-        pointer::Shape::ResizeNwse
+        resize_shape(desktop.resize_edges())
     } else if desktop.dragging().is_some() || desktop.menu_open() || desktop.context_open() {
         pointer::Shape::Arrow
     } else {
         match desktop.window_at(x, y) {
-            Some((_, Hit::Resize)) => pointer::Shape::ResizeNwse,
+            Some((_, Hit::Resize(edges))) => resize_shape(edges),
             Some((index, Hit::Body)) if desktop.app_at(index) == Some(App::Terminal) => pointer::Shape::Text,
             _ => pointer::Shape::Arrow,
         }
@@ -1939,6 +1967,20 @@ fn hover(desktop: &mut Compositor, x: i32, y: i32, buttons: Buttons, status: &St
         if let Some(window) = desktop.find(app) {
             window.push_move(WinEvent { kind: WIN_MOVE, code: mask, x: local_x, y: local_y });
         }
+    }
+}
+
+/// Курсор для краёв окна, за которые тянут.
+fn resize_shape(edges: u8) -> pointer::Shape {
+    use window::{EDGE_BOTTOM, EDGE_LEFT, EDGE_RIGHT, EDGE_TOP};
+    let horizontal = edges & (EDGE_LEFT | EDGE_RIGHT) != 0;
+    let vertical = edges & (EDGE_TOP | EDGE_BOTTOM) != 0;
+    match (horizontal, vertical) {
+        (true, false) => pointer::Shape::ResizeEw,
+        (false, true) => pointer::Shape::ResizeNs,
+        _ if edges & EDGE_LEFT != 0 && edges & EDGE_TOP != 0 => pointer::Shape::ResizeNwse,
+        _ if edges & EDGE_RIGHT != 0 && edges & EDGE_BOTTOM != 0 => pointer::Shape::ResizeNwse,
+        _ => pointer::Shape::ResizeNesw,
     }
 }
 
@@ -2384,6 +2426,17 @@ fn type_on_screen(desktop: &mut Compositor, action: keyboard::Action) {
 /// стрелкой. Обратный порядок означал бы, что кнопка, накрытая меню,
 /// срабатывает сквозь него.
 fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) {
+    // Щелчок мимо поля имени значка принимает набранное, как в Windows;
+    // по самому значку — правка продолжается.
+    if let Some((index, text)) = desktop.icon_editing() {
+        if desktop.icon_at(x, y) == Some(index) {
+            return;
+        }
+        finish_icon_edit(desktop, Some(text.trim().into()));
+    }
+    // Куда пришёлся щелчок — для F2 (см. [`DESK_FOCUS`]).
+    DESK_FOCUS.store(desktop.window_at(x, y).is_none() && desktop.panel_at(x, y).is_none(), Ordering::Relaxed);
+
     // 0а. Шторка — поверх всего остального, и разбирается первой.
     //
     // Открытая шторка съедает нажатие целиком: нажатие внутрь пока ничего не
@@ -2747,7 +2800,7 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         // ни щелчка содержимому (оно досталось бы вопросу, в чужих
         // координатах), ни перетаскивания, ни уголка.
         let popup = app.is_some_and(|app| desktop.is_popup(app));
-        if desktop.focused_app() != app && !popup && matches!(hit, Hit::Body | Hit::Title | Hit::Resize) {
+        if desktop.focused_app() != app && !popup && matches!(hit, Hit::Body | Hit::Title | Hit::Resize(_)) {
             desktop.present();
             return;
         }
@@ -2787,9 +2840,9 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                     }
                 }
             }
-            Hit::Resize => {
+            Hit::Resize(edges) => {
                 if let Some(app) = app {
-                    desktop.set_resize_drag(app);
+                    desktop.set_resize_drag(app, edges);
                     kprintln!("  desktop     : resizing '{}'", name_of(desktop, app));
                 }
             }
@@ -3550,8 +3603,16 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         // «Переименовать» и «удалить» ничего не делают сразу: первое просит
         // имя, второе — подтверждения. Действие происходит в ответе на
         // клавишу, см. [`handle_context_key`].
+        // «Переименовать» — поле на месте подписи, как F2.
         context::Action::Rename => match selected_entry(desktop) {
-            Some((_, label)) => desktop.context_rename(&label),
+            Some((_, label)) => {
+                desktop.close_context();
+                kprintln!("  desktop     : context menu closed");
+                if let Some(index) = desktop.icon_selection() {
+                    desktop.start_icon_edit(index);
+                    kprintln!("  desktop     : naming '{label}'");
+                }
+            }
             None => desktop.context_note("nothing is selected"),
         },
         context::Action::Delete => {
@@ -3574,11 +3635,21 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
                         name,
                         context::desktop_dir()
                     );
-                    desktop.context_note(&alloc::format!("created {name}"));
+                    // Меню закрывается, а новое сразу просит имя — на месте
+                    // подписи, выделенным целиком (как в Windows, 02.11): Enter
+                    // оставляет предложенное.
+                    desktop.close_context();
+                    kprintln!("  desktop     : context menu closed");
                     // Созданное обязано появиться и на столе, и в открытом
                     // менеджере: иначе «создал» видно только на слово.
                     desktop.reload_icons();
                     log_icons(desktop);
+                    let path = alloc::format!("{}/{name}", context::desktop_dir());
+                    desktop.select_icon_path(&path);
+                    if let Some(index) = desktop.icon_selection() {
+                        desktop.start_icon_edit(index);
+                        kprintln!("  desktop     : naming '{name}'");
+                    }
                 }
                 Err(err) => {
                     kprintln!("  desktop     : cannot create: {err}");
@@ -3788,6 +3859,29 @@ fn open_settings(desktop: &mut Compositor, section: Section, status: &Status) {
     desktop.refresh_panel(status);
 }
 
+/// Закончить правку подписи значка: `Some(имя)` — принять, `None` — отменить.
+/// Имя, совпавшее с прежним (или пустое), — это «оставить как есть».
+fn finish_icon_edit(desktop: &mut Compositor, accept: Option<String>) {
+    let Some((index, _)) = desktop.icon_editing() else {
+        return;
+    };
+    let (path, label) = (desktop.icon_path(index), desktop.icon_label(index).unwrap_or_default());
+    desktop.end_icon_edit();
+    match (accept, path) {
+        (Some(name), Some(path)) if !name.is_empty() && name != label => match context::rename_entry(&path, &name) {
+            Ok(target) => {
+                kprintln!("  desktop     : renamed '{path}' to '{}'", context::base_name(&target));
+                desktop.reload_icons();
+                desktop.select_icon_path(&target);
+                log_icons(desktop);
+            }
+            Err(err) => kprintln!("  desktop     : cannot rename '{path}': {err}"),
+        },
+        (Some(_), _) => kprintln!("  desktop     : named '{label}'"),
+        (None, _) => kprintln!("  desktop     : naming '{label}' cancelled"),
+    }
+}
+
 /// Выделенные файлы и каталоги стола, когда выделено больше одного значка
 /// (01.11: рамкой или Ctrl+щелчком); иначе пусто — работает [`selected_entry`].
 fn selected_entries(desktop: &Compositor) -> alloc::vec::Vec<(String, String)> {
@@ -3835,31 +3929,6 @@ fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status
         context::Reply::Run(action) => {
             context_action(desktop, action, status);
             desktop.refresh_panel(status);
-            desktop.present();
-            true
-        }
-        context::Reply::Rename(name) => {
-            match selected_entry(desktop) {
-                Some((path, _)) => match context::rename_entry(&path, &name) {
-                    Ok(target) => {
-                        let new_name = context::base_name(&target);
-                        kprintln!("  desktop     : renamed '{path}' to '{new_name}'");
-                        desktop.context_note(&alloc::format!("renamed to {new_name}"));
-                        desktop.reload_icons();
-                        // Выделение остаётся на том же файле под новым именем:
-                        // иначе следующий пункт меню — «удалить» — относился бы
-                        // к пустоте, и человек, переименовавший файл и решивший
-                        // его убрать, получил бы «ничего не выбрано».
-                        desktop.select_icon_path(&target);
-                        log_icons(desktop);
-                    }
-                    Err(err) => {
-                        kprintln!("  desktop     : cannot rename '{path}': {err}");
-                        desktop.context_note(&err);
-                    }
-                },
-                None => desktop.context_note("nothing is selected"),
-            }
             desktop.present();
             true
         }
@@ -4102,24 +4171,24 @@ pub fn commit_window(task: u32, slot: u32, area: Option<Rect>) -> Result<(), Win
 /// стол тащить окно, пока кнопка не отпущена. Захват указателя программой
 /// снимается — дальше движения достаются столу.
 pub fn begin_move(task: u32, slot: u32) -> Result<(), WindowError> {
-    begin_drag(task, slot, false)
+    begin_drag(task, slot, None)
 }
 
-/// Начать изменение размера окна программы (`xdg_toplevel.resize`): как
-/// уголок стола — тянется правый нижний угол, какой бы край ни взяли.
-pub fn begin_resize(task: u32, slot: u32) -> Result<(), WindowError> {
-    begin_drag(task, slot, true)
+/// Начать изменение размера окна программы (`xdg_toplevel.resize`) за края
+/// `edges` ([`window::EDGE_LEFT`] и прочие; 0 — правый нижний угол).
+pub fn begin_resize(task: u32, slot: u32, edges: u8) -> Result<(), WindowError> {
+    begin_drag(task, slot, Some(edges))
 }
 
-fn begin_drag(task: u32, slot: u32, resize: bool) -> Result<(), WindowError> {
+fn begin_drag(task: u32, slot: u32, resize: Option<u8>) -> Result<(), WindowError> {
     let app = App::Program(task, slot);
     with_desktop(|desktop| {
         if desktop.index_of(app).is_none() {
             return Err(WindowError::NoWindow);
         }
         desktop.drop_capture();
-        if resize {
-            desktop.set_resize_drag(app);
+        if let Some(edges) = resize {
+            desktop.set_resize_drag(app, edges);
             kprintln!("  desktop     : resizing '{}'", name_of(desktop, app));
         } else {
             desktop.set_drag(Some(app));

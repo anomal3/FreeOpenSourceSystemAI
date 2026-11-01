@@ -101,6 +101,14 @@ static TO_OWNER: Mutex<Vec<(u64, ToOwner)>> = Mutex::new(Vec::new());
 /// соединений, и номер процесса их не различает.
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 
+/// Печатать запросы клиентов и события сервера (`kernel wltrace on`).
+static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Включить или выключить трассировку протокола.
+pub fn set_trace(on: bool) {
+    TRACE.store(on, Ordering::Relaxed);
+}
+
 /// Поднять сервер, если программа подключается к [`SOCKET`].
 pub fn serve_if_named(name: &[u8]) {
     if name != SOCKET || STARTED.swap(true, Ordering::AcqRel) {
@@ -532,6 +540,40 @@ enum Obj {
     Viewport,
 }
 
+impl Obj {
+    /// Имя интерфейса — для `wltrace`.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Display => "wl_display",
+            Self::Registry => "wl_registry",
+            Self::Callback => "wl_callback",
+            Self::Compositor => "wl_compositor",
+            Self::Subcompositor => "wl_subcompositor",
+            Self::Region => "wl_region",
+            Self::Shm => "wl_shm",
+            Self::Pool(_) => "wl_shm_pool",
+            Self::Buffer(_) => "wl_buffer",
+            Self::Surface(_) => "wl_surface",
+            Self::Subsurface(_) => "wl_subsurface",
+            Self::WmBase => "xdg_wm_base",
+            Self::Positioner(_) => "xdg_positioner",
+            Self::XdgSurface(_) => "xdg_surface",
+            Self::Toplevel => "xdg_toplevel",
+            Self::Popup => "xdg_popup",
+            Self::Seat => "wl_seat",
+            Self::Pointer => "wl_pointer",
+            Self::Keyboard => "wl_keyboard",
+            Self::Output => "wl_output",
+            Self::DataDeviceManager => "wl_data_device_manager",
+            Self::DataSource(_) => "wl_data_source",
+            Self::DataDevice => "wl_data_device",
+            Self::DataOffer => "wl_data_offer",
+            Self::Viewporter => "wp_viewporter",
+            Self::Viewport => "wp_viewport",
+        }
+    }
+}
+
 /// Номера окон стола у клиентов Wayland — отдельно от номеров родных окон
 /// той же задачи.
 const FIRST_SLOT: u32 = 0x1000;
@@ -614,6 +656,13 @@ impl Client {
 
     fn send(&mut self, msg: Msg) {
         let data = msg.finish();
+        if TRACE.load(Ordering::Relaxed) && data.len() >= 8 {
+            let id = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+            let opcode = u32::from_ne_bytes([data[4], data[5], data[6], data[7]]) & 0xffff;
+            let words: Vec<u32> = data[8..].chunks_exact(4).take(4).map(|w| u32::from_ne_bytes([w[0], w[1], w[2], w[3]])).collect();
+            let kind = self.objects.get(&id).map_or("?", Obj::name);
+            kprintln!("  wltrace #{} <- {id} {kind}.{opcode} {words:?}", self.pid);
+        }
         self.out.extend_from_slice(&data);
     }
 
@@ -668,6 +717,11 @@ impl Client {
             }
             let body: Vec<u8> = self.input[8..size].to_vec();
             self.input.drain(..size);
+            if TRACE.load(Ordering::Relaxed) {
+                let words: Vec<u32> = body.chunks_exact(4).take(6).map(|w| u32::from_ne_bytes([w[0], w[1], w[2], w[3]])).collect();
+                let kind = self.objects.get(&id).map_or("?", Obj::name);
+                kprintln!("  wltrace #{} -> {id} {kind}.{opcode} {words:?}", self.pid);
+            }
             if self.request(id, opcode, &body).is_err() {
                 self.fail(id, 1, "malformed request");
             }
@@ -971,11 +1025,30 @@ impl Client {
                     // Рамку Chromium рисует сам (окно без рамки стола), и о
                     // перетаскивании, размере и кнопках просит стол он.
                     5 | 6 | 9 | 10 | 13 => {
+                        // `resize(seat, serial, edges)`: у Wayland верх 1, низ 2,
+                        // лево 4, право 8 — у стола свои биты.
+                        let edges = if opcode == 6 {
+                            let (_seat, _serial, wl) = (args.u32()?, args.u32()?, args.u32()?);
+                            let mut edges = 0u8;
+                            for (bit, ours) in [
+                                (1, crate::ui::window::EDGE_TOP),
+                                (2, crate::ui::window::EDGE_BOTTOM),
+                                (4, crate::ui::window::EDGE_LEFT),
+                                (8, crate::ui::window::EDGE_RIGHT),
+                            ] {
+                                if wl & bit != 0 {
+                                    edges |= ours;
+                                }
+                            }
+                            edges
+                        } else {
+                            0
+                        };
                         if let Some(win) = self.wins.iter().find(|win| win.toplevel == id && win.open.is_some()) {
                             let (pid, slot) = (self.pid, win.slot);
                             let _ = match opcode {
                                 5 => crate::ui::begin_move(pid, slot),
-                                6 => crate::ui::begin_resize(pid, slot),
+                                6 => crate::ui::begin_resize(pid, slot, edges),
                                 9 => crate::ui::maximize_window(pid, slot, true),
                                 10 => crate::ui::maximize_window(pid, slot, false),
                                 _ => crate::ui::minimize_window(pid, slot),
