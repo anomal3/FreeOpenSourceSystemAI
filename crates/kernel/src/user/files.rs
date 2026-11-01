@@ -132,6 +132,11 @@ pub trait Object: Send + Sync {
     fn deadline(&self) -> Option<u64> {
         None
     }
+    /// Сколько байт можно прочитать сразу (`FIONREAD`); `None` — объект не
+    /// знает, тогда ответ — по готовности.
+    fn pending(&self) -> Option<usize> {
+        None
+    }
     fn as_any(&self) -> &dyn core::any::Any;
 }
 
@@ -282,7 +287,13 @@ pub struct Table {
 /// Сколько дескрипторов у программы Linux (фаза 71h): Chromium держит их
 /// сотнями — сокеты, разделяемая память, концы каналов детей. Родной программе
 /// по-прежнему [`MAX_OPEN_FILES`] — это её договор.
-pub const LINUX_MAX_FILES: usize = 1024;
+///
+/// 65536 с 01.11 — жёсткий предел (`RLIMIT_NOFILE`), мягкий — 1024, как у
+/// Linux. Java поднимает мягкий до жёсткого и держит по дескриптору на
+/// каждый запущенный процесс до сборки мусора: Rider, перезапускающий
+/// фоновую службу каждые несколько секунд, упирался в 1024 («Too many open
+/// files» у `ProcessBuilder`). Таблица растёт по мере надобности.
+pub const LINUX_MAX_FILES: usize = 65536;
 
 /// Пустое место — для ответа о номере за концом выросшей части таблицы.
 static EMPTY: Option<Slot> = None;
@@ -939,6 +950,17 @@ impl Table {
             Some(Slot::PipeRead(reader, _)) => Some(!reader.has_data()),
             _ => None,
         }
+    }
+
+    /// Сколько байт можно прочитать сразу — `ioctl(FIONREAD)` программы Linux.
+    /// Java спрашивает его на каждом чтении через `BufferedInputStream`.
+    pub fn pending(&self, fd: usize) -> Result<usize, FileError> {
+        Ok(match self.cell(fd)?.as_ref().ok_or(FileError::BadFd)? {
+            Slot::PipeRead(reader, _) => reader.buffered(),
+            Slot::Socket(socket) => socket.pending().unwrap_or(usize::from(socket.readiness().0)),
+            Slot::Object(object, _) => object.pending().unwrap_or(usize::from(object.readiness().0)),
+            Slot::File(_) | Slot::PipeWrite(..) | Slot::Std(_) => 0,
+        })
     }
 
     pub fn readiness(&self, fd: usize) -> Result<(bool, bool, bool), FileError> {

@@ -1609,6 +1609,40 @@ fn madvise(addr: usize, len: usize, advice: usize) -> i64 {
 unsafe fn ioctl(fd: usize, request: usize, arg: usize) -> i64 {
     const TCGETS: usize = 0x5401;
     const TIOCGWINSZ: usize = 0x5413;
+    const FIONREAD: usize = 0x541B;
+    const FIONBIO: usize = 0x5421;
+    // Не терминальные: сокеты, каналы, объекты. Без `FIONREAD` Java на каждом
+    // чтении сокета получала `ENOTTY` («Inappropriate ioctl for device») и
+    // рвала соединение — так Rider терял связь со своей половиной на .NET
+    // и не получал шаблоны проектов (01.11). Память программы — вне замка.
+    match request {
+        FIONREAD => {
+            if !space::user_can(arg, 4, PageFlags::WRITE) {
+                return -e::EFAULT;
+            }
+            let count = match crate::user::with_current(|program| program.files.pending(fd)) {
+                Some(Ok(count)) => count.min(i32::MAX as usize) as i32,
+                Some(Err(err)) => return file_errno(err),
+                None => return -e::ESRCH,
+            };
+            // SAFETY: проверено выше.
+            unsafe { core::ptr::write_unaligned(arg as *mut i32, count) };
+            return 0;
+        }
+        FIONBIO => {
+            if !space::user_can(arg, 4, PageFlags::READ) {
+                return -e::EFAULT;
+            }
+            // SAFETY: проверено выше.
+            let on = unsafe { core::ptr::read_unaligned(arg as *const i32) } != 0;
+            return match crate::user::with_current(|program| program.files.set_nonblock(fd, on)) {
+                Some(Ok(())) => 0,
+                Some(Err(err)) => file_errno(err),
+                None => -e::ESRCH,
+            };
+        }
+        _ => {}
+    }
     // SAFETY: контракт `syscall`.
     let tty = unsafe { native(SYS_ISATTY, fd, 0, 0) };
     if tty < 0 {
@@ -1979,7 +2013,7 @@ fn prlimit(resource: usize, _new: usize, old: usize) -> i64 {
         }
         let value = match resource {
             RLIMIT_STACK => [8 << 20, INFINITY],
-            RLIMIT_NOFILE => [1024, 1024],
+            RLIMIT_NOFILE => [1024, crate::user::files::LINUX_MAX_FILES as u64],
             _ => [INFINITY, INFINITY],
         };
         // SAFETY: проверено строкой выше.

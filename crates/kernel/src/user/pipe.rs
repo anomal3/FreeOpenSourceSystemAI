@@ -187,6 +187,12 @@ impl Reader {
         self.pipe.inner.lock().len > 0
     }
 
+    /// Сколько непрочитанных байт в канале (`FIONREAD`).
+    #[must_use]
+    pub fn buffered(&self) -> usize {
+        self.pipe.inner.lock().len
+    }
+
     /// `(адрес, читателей, писателей)` — для журнала.
     #[must_use]
     pub fn state(&self) -> (usize, usize, usize) {

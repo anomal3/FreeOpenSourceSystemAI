@@ -268,6 +268,14 @@ impl Sock {
         self.tcp
     }
 
+    /// Сколько принятых байт ждут чтения (TCP); у датаграмм — `None`.
+    pub fn pending(&self) -> Option<usize> {
+        if !self.tcp {
+            return None;
+        }
+        net::stream_pending(self.owner, self.index).ok()
+    }
+
     /// Прочитать, что есть: TCP — байты (ноль — собеседник закрыл), UDP —
     /// датаграмму с адресом отправителя.
     pub fn recv_now(&self, buffer: &mut [u8]) -> Result<(usize, Option<(u32, u16)>), i64> {

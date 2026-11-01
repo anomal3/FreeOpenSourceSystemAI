@@ -976,6 +976,13 @@ pub fn stream_info(
     Ok((conn.local_port, conn.remote, conn.remote_port, conn.state, conn.peer_closed, conn.reset))
 }
 
+/// Сколько принятых байт соединения ждут программу (`FIONREAD`).
+pub fn stream_pending(owner: TaskId, index: usize) -> Result<usize, NetError> {
+    let guard = INTERFACE.lock();
+    let iface = guard.as_ref().ok_or(NetError::NoDevice)?;
+    Ok(iface.streams.get(owner, index).map_err(NetError::Stream)?.recv.len())
+}
+
 /// Что известно о сокете UDP (фаза 65a): свой порт, получатель, отправитель
 /// последней датаграммы, есть ли что читать.
 pub fn socket_info(

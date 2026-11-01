@@ -117,6 +117,9 @@ impl Object for InetSocket {
             _ => self.sock.readiness(),
         }
     }
+    fn pending(&self) -> Option<usize> {
+        if self.tcp() { self.sock.pending() } else { None }
+    }
     fn mode(&self) -> u32 {
         S_IFSOCK
     }
