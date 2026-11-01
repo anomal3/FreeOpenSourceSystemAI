@@ -484,6 +484,9 @@ struct Win {
     configured: bool,
     /// Перерисовка не прошла (стол был занят) — повторить.
     dirty: bool,
+    /// В окне есть прозрачные точки (тень и скругления, которые рисует
+    /// программа) — так сказано столу (`ui::alpha_window`).
+    see_through: bool,
     /// У окна фокус стола (состояние `activated` в `configure`).
     active: bool,
     /// Заголовок не дошёл до стола (он был занят) — повторить.
@@ -503,6 +506,8 @@ struct Pop {
     geometry: Option<(i32, i32, u32, u32)>,
     open: Option<(u32, u32)>,
     dirty: bool,
+    /// Есть прозрачные точки (скруглённая подсказка JBR) — сказано столу.
+    see_through: bool,
     /// Меню взяло захват: щелчок мимо закрывает его.
     grab: bool,
     /// Клиенту уже сказано `popup_done`.
@@ -1210,6 +1215,7 @@ impl Client {
                     open: None,
                     configured: false,
                     dirty: false,
+                    see_through: false,
                     active: true,
                     title_due: false,
                 });
@@ -1253,6 +1259,7 @@ impl Client {
                     geometry: None,
                     open: None,
                     dirty: false,
+                    see_through: false,
                     grab: false,
                     done: false,
                 });
@@ -1503,9 +1510,22 @@ impl Client {
             win.dirty = false;
             return;
         }
-        let painted = crate::ui::paint_window(pid, win.slot, area, |target| paint(target, &layers, swap, area));
+        let alpha = has_alpha(&layers);
+        let mut clear = false;
+        let painted = crate::ui::paint_window(pid, win.slot, area, |target| clear = paint(target, &layers, swap, area, alpha));
         win.dirty = painted.is_err();
         if painted.is_ok() {
+            // Прозрачность помнится до перерисовки целиком: частичная видит
+            // только свой кусок.
+            let see_through = clear || (win.see_through && area != bounds);
+            if see_through != win.see_through {
+                // Тень и форму рисует программа, если не сказала, где тело
+                // окна (`set_window_geometry`): иначе поля вокруг — её тень.
+                let shaped = win.geometry.is_none();
+                if crate::ui::alpha_window(pid, win.slot, see_through, shaped).is_ok() {
+                    win.see_through = see_through;
+                }
+            }
             self.clear_damage(surface, 0);
         }
     }
@@ -1589,8 +1609,15 @@ impl Client {
         }
         let swap = mini_ui::format_code() == user_abi::PIXEL_RGB;
         let area = Rect::new(0, 0, gw, gh);
-        let painted = crate::ui::paint_window(pid, pop.slot, area, |target| paint(target, &layers, swap, area));
+        let alpha = has_alpha(&layers);
+        let mut clear = false;
+        let painted = crate::ui::paint_window(pid, pop.slot, area, |target| clear = paint(target, &layers, swap, area, alpha));
         pop.dirty = painted.is_err();
+        // Подсказка со скруглёнными углами: тень и форма — её, прямоугольная
+        // тень стола под ней была бы видна.
+        if painted.is_ok() && clear != pop.see_through && crate::ui::alpha_window(pid, pop.slot, clear, true).is_ok() {
+            pop.see_through = clear;
+        }
     }
 
     /// Убрать окно стола всплывающего, оставив его запись (буфер сняли).
@@ -2153,24 +2180,36 @@ struct Layer {
     blend: bool,
 }
 
+/// Может ли окно быть прозрачным: нижний слой с альфой. Нижний XRGB
+/// закрывает всё, что над ним смешивается.
+fn has_alpha(layers: &[Layer]) -> bool {
+    layers.first().is_some_and(|layer| layer.buf.format == SHM_ARGB8888)
+}
+
 /// Нарисовать слои в поверхность окна — строками прямо из памяти клиентов.
 /// `swap` — у экрана красный в младшем байте (у `wl_shm` — синий).
-fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect) {
+///
+/// `alpha` — альфа остаётся в старшем байте (цвет умножен на неё, как у
+/// Wayland), под слоями — прозрачность, а не подложка: тень и скругления,
+/// которые рисует программа, стол смешает с тем, что под окном. Ответ —
+/// нашлась ли в `area` хоть одна не вполне непрозрачная точка.
+fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect, alpha: bool) -> bool {
     let (tw, th) = (target.width(), target.height());
     let area = area.intersect(&Rect::new(0, 0, tw, th));
     if area.is_empty() {
-        return;
+        return false;
     }
     let (ax0, ax1) = (area.x, area.right());
     let (ay0, ay1) = (area.y, area.bottom());
     let to_screen = |pixel: u32| if swap { (pixel & 0xff00_ff00) | ((pixel >> 16) & 0xff) | ((pixel & 0xff) << 16) } else { pixel };
-    let fill = to_screen(BACKDROP) & 0xff_ffff;
+    let keep = if alpha { u32::MAX } else { 0xff_ffff };
+    let fill = if alpha { 0 } else { to_screen(BACKDROP) & keep };
     for y in ay0..ay1 {
         target.row_mut(y as u32)[ax0 as usize..ax1 as usize].fill(fill);
     }
     let mut row = Vec::new();
     if row.try_reserve_exact(area.w as usize * 4).is_err() {
-        return;
+        return false;
     }
     row.resize(area.w as usize * 4, 0u8);
     for layer in layers {
@@ -2192,7 +2231,7 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect) {
             }
             let at = buf.offset + u64::from(sy) * u64::from(buf.stride) + first_column * 4;
             if !buf.mem.read(at, &mut row[..count * 4]) {
-                return;
+                return false;
             }
             let out = &mut target.row_mut(ty as u32)[x0 as usize..x1 as usize];
             for (pixel, bytes) in out.iter_mut().zip(row.chunks_exact(4)) {
@@ -2201,26 +2240,10 @@ fn paint(target: &mut Surface, layers: &[Layer], swap: bool, area: Rect) {
                     src |= 0xff00_0000;
                 }
                 let src = to_screen(src);
-                *pixel = if layer.blend { over(src, *pixel) } else { src } & 0xff_ffff;
+                *pixel = if layer.blend { mini_ui::over(src, *pixel) } else { src } & keep;
             }
         }
     }
+    alpha && (ay0..ay1).any(|y| target.row(y as u32)[ax0 as usize..ax1 as usize].iter().any(|pixel| pixel >> 24 != 0xff))
 }
 
-/// `src` поверх `dst` (альфа заранее умножена, как у Wayland).
-fn over(src: u32, dst: u32) -> u32 {
-    let alpha = src >> 24;
-    if alpha == 0xff {
-        return src;
-    }
-    if alpha == 0 {
-        return dst;
-    }
-    let inverse = 255 - alpha;
-    let channel = |shift: u32| {
-        let s = (src >> shift) & 0xff;
-        let d = (dst >> shift) & 0xff;
-        (s + d * inverse / 255).min(255) << shift
-    };
-    channel(0) | channel(8) | channel(16) | 0xff00_0000
-}

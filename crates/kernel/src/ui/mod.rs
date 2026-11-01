@@ -4286,6 +4286,21 @@ pub fn raw_keys_window(task: u32, slot: u32) -> Result<(), WindowError> {
     .unwrap_or_else(|| Err(unavailable()))
 }
 
+/// Окно программы с прозрачными точками (альфа в старшем байте поверхности,
+/// цвет умножен на неё): стол смешивает его с тем, что под ним; `shaped` —
+/// тень и форму рисует программа, своей тени стол не кладёт. Так рисуют окна
+/// сервера Wayland с буфером ARGB (Rider, подсказки JBR).
+pub fn alpha_window(task: u32, slot: u32, translucent: bool, shaped: bool) -> Result<(), WindowError> {
+    with_desktop(|desktop| {
+        if !desktop.set_alpha(App::Program(task, slot), translucent, shaped) {
+            return Err(WindowError::NoWindow);
+        }
+        desktop.present();
+        Ok(())
+    })
+    .unwrap_or_else(|| Err(unavailable()))
+}
+
 /// Нарисовать в поверхности окна программы и показать `area` (фаза 71i):
 /// так рисует сервер Wayland в ядре — у его окон нет кадров в чужом
 /// адресном пространстве, поверхность принадлежит самому окну.

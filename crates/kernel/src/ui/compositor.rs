@@ -525,6 +525,22 @@ impl Compositor {
         self.windows.iter_mut().find(|window| window.app == app)
     }
 
+    /// Окно стало прозрачным или непрозрачным (см. [`Window::translucent`]):
+    /// перерисовать его место вместе с тенью — она появляется или уходит.
+    pub fn set_alpha(&mut self, app: App, translucent: bool, shaped: bool) -> bool {
+        let Some(window) = self.find(app) else {
+            return false;
+        };
+        let shaped = translucent && shaped;
+        if (window.translucent, window.shaped) != (translucent, shaped) {
+            window.translucent = translucent;
+            window.shaped = shaped;
+            let rect = window.rect;
+            self.mark_layer(rect);
+        }
+        true
+    }
+
     /// Окно программы, над **содержимым** которого стоит точка, и эта точка
     /// внутри его поверхности. Заголовок и рамка — не содержимое: программа их
     /// не рисует и событий о них не ждёт.
@@ -3075,8 +3091,10 @@ impl Compositor {
         self.icons.draw(back, band, dy);
         for window in self.windows.iter().filter(|window| !window.minimized && !self.hidden_by_flight(window)) {
             let r = if window.popup { 0 } else { radius };
-            self.drop_shadow(back, window.rect, band, dy, r);
-            self.stack(back, window.surface(), window.rect, band, dy, r);
+            if !window.shaped {
+                self.drop_shadow(back, window.rect, band, dy, r);
+            }
+            self.stack_window(back, window, band, dy, r);
         }
     }
 
@@ -3225,14 +3243,18 @@ impl Compositor {
             // Углы всплывающего окна не скругляются: меню рисует свою рамку
             // прямоугольником, и срезанный угол вырезал бы её.
             let r = if window.popup { 0 } else { radius };
-            self.drop_shadow(back, window.rect, band, dy, r);
+            if !window.shaped {
+                self.drop_shadow(back, window.rect, band, dy, r);
+            }
             shadow_ns += crate::time::uptime_ns().wrapping_sub(t0);
-            self.stack(back, window.surface(), window.rect, band, dy, r);
+            self.stack_window(back, window, band, dy, r);
         }
         if let Some(window) = self.peek.filter(|_| !scene).and_then(|app| self.windows.iter().find(|window| window.app == app)) {
             if !window.rect.intersect(&band).is_empty() {
-                self.drop_shadow(back, window.rect, band, dy, radius);
-                self.stack(back, window.surface(), window.rect, band, dy, radius);
+                if !window.shaped {
+                    self.drop_shadow(back, window.rect, band, dy, radius);
+                }
+                self.stack_window(back, window, band, dy, radius);
             }
         }
         let t_windows = crate::time::uptime_ns();
@@ -3461,7 +3483,8 @@ impl Compositor {
         // картинке. Обратная ошибка стоила бы угла, сквозь который видно
         // мусор, и такой запас брать нельзя.
         let radius = (theme::R_WINDOW * self.scale) as i32;
-        self.windows.iter().filter(|window| !window.minimized && !self.hidden_by_flight(window)).any(|window| {
+        // Окно с прозрачными точками полосу не накрывает: сквозь него видно.
+        self.windows.iter().filter(|window| !window.minimized && !window.translucent && !self.hidden_by_flight(window)).any(|window| {
             let rect = window.rect;
             // Полоса целиком внутри окна по горизонтали и по вертикали, и при
             // этом не задевает ни верхний, ни нижний угол.
@@ -3481,6 +3504,22 @@ impl Compositor {
             placed.h + margin * 2,
         );
         !grown.intersect(&band).is_empty()
+    }
+
+    /// Положить окно в полосу: непрозрачное — со срезанными углами,
+    /// прозрачное — смешав с тем, что под ним (углы и тень у него свои).
+    fn stack_window(&self, back: &mut Surface, window: &Window, band: Rect, dy: i32, radius: u32) {
+        if !window.translucent {
+            self.stack(back, window.surface(), window.rect, band, dy, radius);
+            return;
+        }
+        let placed = window.rect;
+        let overlap = placed.intersect(&band);
+        if overlap.is_empty() {
+            return;
+        }
+        let src = Rect::new(overlap.x - placed.x, overlap.y - placed.y, overlap.w, overlap.h);
+        back.blend_from(window.surface(), (overlap.x, overlap.y + dy), src);
     }
 
     /// Положить в полосу ту часть слоя, которая в неё попадает, срезав углы.

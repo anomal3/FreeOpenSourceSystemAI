@@ -199,6 +199,28 @@ impl Color {
     }
 }
 
+/// Точка `src` поверх `dst`: альфа в старшем байте, цвет заранее умножен на
+/// неё (как у Wayland). Порядок красного и синего не важен — каналы
+/// считаются одинаково; альфа результата — по тому же правилу.
+#[must_use]
+#[inline]
+pub fn over(src: u32, dst: u32) -> u32 {
+    let alpha = src >> 24;
+    if alpha == 0xff {
+        return src;
+    }
+    if alpha == 0 {
+        return dst;
+    }
+    let inverse = 255 - alpha;
+    let channel = |shift: u32| {
+        let s = (src >> shift) & 0xff;
+        let d = (dst >> shift) & 0xff;
+        (s + (d * inverse + 127) / 255).min(255) << shift
+    };
+    channel(0) | channel(8) | channel(16) | channel(24)
+}
+
 /// Смешать два значения канала. Отдельная функция, а не замыкание внутри
 /// [`Color::mix`]: в `const fn` замыкания вызывать нельзя.
 const fn blend(a: u8, b: u8, weight: u8) -> u8 {
@@ -494,6 +516,37 @@ impl Surface {
             let start = ((visible.y as u32 + row) as usize) * stride + visible.x as usize;
             let len = slice.len();
             self.as_mut_slice()[start..start + len].copy_from_slice(slice);
+        }
+    }
+
+    /// Положить часть другой поверхности поверх этой — по альфе её точек.
+    ///
+    /// Альфа источника — в старшем байте, цвет заранее умножен на неё (так у
+    /// Wayland). Нужно окнам с прозрачными тенью и углами, которые рисует
+    /// сама программа: они ложатся на то, что под ними, а не на подложку.
+    /// Результат непрозрачен — это кадр, под ним ничего нет.
+    pub fn blend_from(&mut self, source: &Self, dst: (i32, i32), src_rect: Rect) {
+        let src = src_rect.intersect(&source.bounds());
+        if src.is_empty() {
+            return;
+        }
+        let placed = Rect::new(dst.0, dst.1, src.w, src.h);
+        let visible = placed.intersect(&self.bounds());
+        if visible.is_empty() {
+            return;
+        }
+        let skip_x = (visible.x - placed.x) as u32;
+        let skip_y = (visible.y - placed.y) as u32;
+        let stride = self.width as usize;
+        for row in 0..visible.h {
+            let line = source.row(src.y as u32 + skip_y + row);
+            let from = (src.x as u32 + skip_x) as usize;
+            let slice = &line[from..from + visible.w as usize];
+            let start = ((visible.y as u32 + row) as usize) * stride + visible.x as usize;
+            let target = &mut self.as_mut_slice()[start..start + slice.len()];
+            for (pixel, &top) in target.iter_mut().zip(slice) {
+                *pixel = over(top, *pixel) | OPAQUE;
+            }
         }
     }
 
