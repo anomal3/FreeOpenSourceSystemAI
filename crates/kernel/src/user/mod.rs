@@ -4416,7 +4416,11 @@ impl Program {
     ///
     /// Программе с окном или устройством копии нет: их кадры принадлежат не
     /// ей, и у двух процессов оказались бы общие чужие кадры.
-    fn fork_copy(&mut self) -> Result<Self, MmapError> {
+    ///
+    /// `shared_vm` — ребёнок с `CLONE_VM` ([`space::Space::duplicate`]): кадры
+    /// общие с теми же правами, память кода и страницы вне таблицы областей
+    /// тоже общие, а не копии.
+    fn fork_copy(&mut self, shared_vm: bool) -> Result<Self, MmapError> {
         if self.has_surface() || self.devices.iter().any(Option::is_some) || !self.dma.is_empty() {
             return Err(MmapError::BadRequest);
         }
@@ -4437,14 +4441,16 @@ impl Program {
             match mappings_now.get(index).filter(|region| region.base <= addr) {
                 Some(region) => match &region.source {
                     Source::Shared(_) => space::Dup::Skip,
-                    Source::Anonymous(anon) if anon.jit || region.blocks > 0 => space::Dup::Copy,
+                    Source::Anonymous(_) if region.blocks > 0 => space::Dup::Copy,
+                    Source::Anonymous(anon) if anon.jit && !shared_vm => space::Dup::Copy,
                     Source::Anonymous(_) | Source::ThreadStack | Source::Image(_) | Source::File(_) => space::Dup::Share,
                     Source::Surface(..) | Source::Device => space::Dup::Skip,
                 },
+                None if shared_vm => space::Dup::Share,
                 None => space::Dup::Copy,
             }
         };
-        let (space, downgraded) = self.space.duplicate(&class).map_err(|_| MmapError::NoMemory)?;
+        let (space, downgraded) = self.space.duplicate(&class, shared_vm).map_err(|_| MmapError::NoMemory)?;
         // Страницы родителя стали только на чтение — его потоки на других
         // процессорах не должны писать по старым трансляциям.
         if downgraded {
@@ -4506,11 +4512,12 @@ pub fn spawn_linux_process(
     tls: u64,
     set_tid: usize,
     clear_tid: usize,
+    shared_vm: bool,
 ) -> Result<sched::TaskId, ThreadError> {
     let parent = current_process().ok_or(ThreadError::NoProgram)?;
     // Копия — под замком родителя: пока память переписывается, его потоки не
     // меняют ни таблиц, ни областей.
-    let program = parent.lock().fork_copy().map_err(|_| ThreadError::NoMemory)?;
+    let program = parent.lock().fork_copy(shared_vm).map_err(|_| ThreadError::NoMemory)?;
     drop(parent);
     let ppid = program.linux_ppid;
     let slot = sched::current_slot();

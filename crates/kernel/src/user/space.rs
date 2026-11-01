@@ -124,8 +124,15 @@ impl Space {
     /// ([`arch::unmapped_run`]). Возвращает копию и признак «у родителя
     /// страницы на запись стали только на чтение» — тогда вызывающий обязан
     /// сбросить трансляции на всех процессорах, где живут потоки родителя.
+    ///
+    /// `shared_vm` (01.11.2026) — ребёнок с `CLONE_VM` (`vfork`,
+    /// `posix_spawn` glibc): кадры [`Dup::Share`] он получает с теми же
+    /// правами, что у родителя, и права родителя не трогаются. У Linux такой
+    /// ребёнок и вовсе живёт в памяти родителя до `execve`; без этого каждый
+    /// запуск процесса из Java делал всю память JVM «только на чтение», и она
+    /// заново отказывала на каждой записи (Rider — 316 тыс. отказов).
     #[cfg(target_arch = "x86_64")]
-    pub fn duplicate(&mut self, class: &dyn Fn(usize) -> Dup) -> Result<(Self, bool), MapError> {
+    pub fn duplicate(&mut self, class: &dyn Fn(usize) -> Dup, shared_vm: bool) -> Result<(Self, bool), MapError> {
         let mut copy = Self::new()?;
         let mut downgraded = false;
         // С нижней области программ Linux ([`super::LOW_BASE`]) до конца окна.
@@ -143,6 +150,23 @@ impl Space {
                 continue;
             }
             if how == Dup::Share && crate::mm::frame::with(|frames| frames.share(phys)).unwrap_or(false) {
+                if shared_vm {
+                    // Общий кадр с теми же правами (память кода с правом `jit`
+                    // — запись и исполнение разом, с программным флагом).
+                    let same = if flags.contains(PageFlags::WRITE) && flags.contains(PageFlags::EXEC) {
+                        flags.union(PageFlags::JIT)
+                    } else {
+                        flags
+                    };
+                    // SAFETY: кадр разделён (счёт владельцев учёл копию), адрес
+                    // в окне копии свободен: обход идёт по возрастанию.
+                    if let Err(err) = unsafe { copy.map(at, phys, same) } {
+                        Self::unshare(phys);
+                        return Err(err);
+                    }
+                    virt += PAGE_SIZE;
+                    continue;
+                }
                 let shared = flags.without(PageFlags::WRITE);
                 if flags.contains(PageFlags::WRITE) {
                     // SAFETY: тот же кадр под тем же адресом, только без записи;

@@ -64,7 +64,7 @@ fn clone_process(frame: &crate::arch::TrapFrame, flags: usize, stack: usize, par
     let tls = if flags & CLONE_SETTLS != 0 { tls as u64 } else { crate::arch::user_tls() };
     let set = if flags & CLONE_CHILD_SETTID != 0 { child_tid } else { 0 };
     let clear = if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 };
-    let id = match crate::user::spawn_linux_process(regs, tls, set, clear) {
+    let id = match crate::user::spawn_linux_process(regs, tls, set, clear, flags & CLONE_VM != 0) {
         Ok(id) => id,
         Err(crate::user::ThreadError::TooManyTasks) => return -e::EAGAIN,
         Err(_) => return -e::ENOMEM,
