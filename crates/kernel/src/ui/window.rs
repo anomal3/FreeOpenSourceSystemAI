@@ -69,6 +69,8 @@ pub enum App {
     Shutdown,
     /// Подтверждение перезагрузки.
     Restart,
+    /// «Как открыть этот файл?» — выбор программы для файла (02.11, макет 18).
+    OpenWith,
     /// Окно пользовательской программы (фаза 47a).
     ///
     /// Внутри — номер задачи, а **не** имя. Имя у такого окна своё, приезжает
@@ -131,6 +133,7 @@ impl App {
             App::Settings => "Параметры",
             App::Shutdown => "Выключение",
             App::Restart => "Перезагрузка",
+            App::OpenWith => "Открыть с помощью",
             // Запас, а не подпись: у окна программы есть собственное имя, и
             // берут его из окна ([`Window::caption`]), а не отсюда. Сюда
             // попадают, когда окна уже нет, — например, печатая в журнал о
@@ -172,6 +175,7 @@ impl App {
             App::About => Icon::Info,
             App::Settings => Icon::Settings,
             App::Shutdown | App::Restart => Icon::Power,
+            App::OpenWith => Icon::File,
             App::Program(..) => Icon::Package,
         }
     }
@@ -185,6 +189,7 @@ impl App {
             App::Settings => "Settings",
             App::Shutdown => "Shut down",
             App::Restart => "Restart",
+            App::OpenWith => "Open with",
             // Имя программы в журнал печатает не это: оно приезжает из окна, а
             // здесь стоит родовое слово — на случай, когда окна уже нет.
             App::Program(..) => "Program",
@@ -200,6 +205,7 @@ impl App {
             App::Settings => "экран, программы, обновление",
             App::Shutdown => "закрыть том и выключить",
             App::Restart => "закрыть том и запустить снова",
+            App::OpenWith => "выбрать программу для файла",
             // В меню запуска окна программ не попадают: их открывает сама
             // программа, а не человек со стола. Строка здесь затем, что разбор
             // обязан быть полным.
@@ -1706,6 +1712,15 @@ impl Window {
         match &mut self.content {
             Content::Dialog(view) => view.take_answer(),
             Content::Text(_) | Content::Settings(_) | Content::Program(_) => None,
+        }
+    }
+
+    /// Что выбрано в «Как открыть этот файл?» (см. [`DialogView::open_with_choice`]).
+    #[must_use]
+    pub fn open_with_choice(&self) -> Option<(String, String, String, bool)> {
+        match &self.content {
+            Content::Dialog(view) => view.open_with_choice(),
+            _ => None,
         }
     }
 

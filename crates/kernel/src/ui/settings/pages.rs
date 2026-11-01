@@ -59,6 +59,7 @@ impl SettingsView {
             Section::Apps => self.apps(pass, x, y, w),
             Section::Packages => self.packages_page(pass, x, y, w),
             Section::Services => services(pass, x, y, w),
+            Section::DefaultApps => default_apps(pass, x, y, w),
             Section::Accounts => accounts_page(pass, x, y, w),
             Section::Time => time(pass, x, y, w),
             Section::Privacy => privacy(pass, x, y, w),
@@ -389,6 +390,7 @@ impl SettingsView {
         };
         let mut y = row(pass, x, y, w, Some(Fi::Package), "Пакеты", &count, Ctl::Nav, Some(Deed::Open(Section::Packages)));
         y = nav_row(pass, x, y, w, Section::Services);
+        y = nav_row(pass, x, y, w, Section::DefaultApps);
         y = pass.group(x, y, w, "Установка");
         row(pass, x, y, w, Some(Fi::Download), "Установить пакет из файла", ".fpk раскладывается в /opt/<имя>, запись — в /var/lib/pkg", Ctl::Button("Обзор…", Weight::Primary), Some(Deed::ChooseFile));
     }
@@ -521,6 +523,36 @@ impl SettingsView {
 }
 
 // ── Страницы без состояния окна ─────────────────────────────────────────────
+
+/// Расширения на странице «Программы по умолчанию» — те, что встречаются
+/// чаще всего; строка показывается, если файл открывает хоть одна программа.
+const DEFAULT_EXTENSIONS: [&str; 14] = ["txt", "md", "log", "json", "html", "png", "jpg", "pdf", "mp3", "mp4", "zip", "rs", "py", "sh"];
+
+// ── Программы по умолчанию ──────────────────────────────────────────────────
+
+fn default_apps(pass: &mut Pass, x: i32, y: i32, w: u32) {
+    let mut y = pass.group(x, y, w, "Какой программой открывать файлы");
+    let mut shown = 0;
+    for ext in DEFAULT_EXTENSIONS {
+        let choices = super::super::file_handlers(&format!("file.{ext}"));
+        let Some((name, _)) = choices.first() else {
+            continue;
+        };
+        let kind = sysconf::filetypes::kind_of(&format!("file.{ext}"), false);
+        let title = format!("{} (.{ext})", kind.name);
+        let note = if super::super::prefs::open_with(ext).is_some() { "выбрано вами" } else { "по умолчанию" };
+        // Одна программа — менять не на что; несколько — кнопка по кругу.
+        y = if choices.len() > 1 {
+            row(pass, x, y, w, Some(Fi::Apps), &title, note, Ctl::Button(name, Weight::Normal), Some(Deed::OpenWith(ext)))
+        } else {
+            row(pass, x, y, w, Some(Fi::Apps), &title, note, Ctl::Value(name), None)
+        };
+        shown += 1;
+    }
+    if shown == 0 {
+        row(pass, x, y, w, Some(Fi::Info), "Нет программ для файлов", "Поставьте пакет, который открывает файлы (opens= в манифесте)", Ctl::None, None);
+    }
+}
 
 fn nav_row(pass: &mut Pass, x: i32, y: i32, w: u32, section: Section) -> i32 {
     row(pass, x, y, w, Some(section.icon()), section.title(), section.blurb(), Ctl::Nav, Some(Deed::Open(section)))

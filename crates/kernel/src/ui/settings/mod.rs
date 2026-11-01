@@ -70,6 +70,8 @@ pub enum Section {
     Apps,
     Packages,
     Services,
+    /// Программы по умолчанию (02.11, макет 16): какой открывать типы файлов.
+    DefaultApps,
     Accounts,
     Time,
     Privacy,
@@ -97,7 +99,7 @@ const NAV: [Section; 13] = [
 ];
 
 /// Все страницы — для поиска.
-const ALL: [Section; 23] = [
+const ALL: [Section; 24] = [
     Section::Home,
     Section::System,
     Section::Display,
@@ -116,6 +118,7 @@ const ALL: [Section; 23] = [
     Section::Apps,
     Section::Packages,
     Section::Services,
+    Section::DefaultApps,
     Section::Accounts,
     Section::Time,
     Section::Privacy,
@@ -145,6 +148,7 @@ impl Section {
             Section::Apps => "Приложения",
             Section::Packages => "Пакеты",
             Section::Services => "Службы",
+            Section::DefaultApps => "Программы по умолчанию",
             Section::Accounts => "Учётные записи",
             Section::Time => "Время и язык",
             Section::Privacy => "Конфиденциальность",
@@ -169,7 +173,7 @@ impl Section {
             }
             Section::Keyboard | Section::Usb => Some(Section::Devices),
             Section::Wallpaper | Section::Colors => Some(Section::Personal),
-            Section::Packages | Section::Services => Some(Section::Apps),
+            Section::Packages | Section::Services | Section::DefaultApps => Some(Section::Apps),
             _ => None,
         }
     }
@@ -200,6 +204,7 @@ impl Section {
             Section::Apps => Fi::Apps,
             Section::Packages => Fi::Package,
             Section::Services => Fi::Server,
+            Section::DefaultApps => Fi::Apps,
             Section::Accounts => Fi::User,
             Section::Time => Fi::Clock,
             Section::Privacy => Fi::Shield,
@@ -252,6 +257,7 @@ impl Section {
             Section::Apps => "Пакеты и службы",
             Section::Packages => "Установленные .fpk в /opt",
             Section::Services => "Что запускает /bin/init",
+            Section::DefaultApps => "Какой программой открывать файлы",
             Section::Accounts => "Кто может входить в систему",
             Section::Time => "Часовой пояс, раскладка, язык",
             Section::Privacy => "Что система делает с вашими данными",
@@ -281,6 +287,7 @@ impl Section {
             Section::Apps => "приложения программы",
             Section::Packages => "пакеты fpk установить удалить pkg",
             Section::Services => "службы init services",
+            Section::DefaultApps => "программы по умолчанию открыть с помощью тип файла расширение блокнот",
             Section::Accounts => "учётные записи пользователь uid root",
             Section::Time => "время дата часовой пояс язык",
             Section::Privacy => "конфиденциальность безопасность телеметрия права w^x",
@@ -369,6 +376,8 @@ enum Deed {
     Restart,
     /// Запустить программу (проводник).
     Launch(&'static str),
+    /// Следующая программа для расширения (программы по умолчанию).
+    OpenWith(&'static str),
 }
 
 /// Какое из двух полей раздела «Сеть» правится.
@@ -1150,6 +1159,24 @@ impl SettingsView {
             Deed::Shutdown => self.request = Some(Request::Shutdown),
             Deed::Restart => self.request = Some(Request::Restart),
             Deed::Launch(path) => self.report = Some(pages::run(path, path)),
+            Deed::OpenWith(ext) => {
+                // По кругу — в порядке подписей, а не списка: выбранная
+                // программа в списке всегда первая, и «следующая» по нему
+                // ходила бы между двумя.
+                let mut choices = super::file_handlers(&format!("file.{ext}"));
+                let current = choices.first().map(|(_, command)| command.clone());
+                choices.sort_by(|a, b| a.0.cmp(&b.0));
+                let at = choices.iter().position(|(_, command)| Some(command) == current.as_ref()).unwrap_or(0);
+                if let Some((name, command)) = choices.get((at + 1) % choices.len().max(1)).cloned() {
+                    self.report = Some(match super::prefs::store_open_with(ext, &command) {
+                        Ok(()) => {
+                            kprintln!("  settings    : .{ext} files open with '{command}'");
+                            Report::ok(format!(".{ext} — {name}"))
+                        }
+                        Err(err) => Report::bad(format!("не запомнено: {err}")),
+                    });
+                }
+            }
         }
         self.scroll = self.scroll.max(0);
     }

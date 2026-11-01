@@ -126,11 +126,13 @@ pub enum Action {
     EmptyTrash,
     /// «Свойства» корзины: сколько в ней и сколько места занимает.
     Properties,
+    /// «Выбрать другую программу…» — окно «Как открыть этот файл?».
+    ChooseProgram,
 }
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 17] = [
+    const ALL: [Action; 18] = [
         Action::Open,
         Action::Rename,
         Action::Delete,
@@ -148,6 +150,7 @@ impl Action {
         Action::OpenInTerminal,
         Action::EmptyTrash,
         Action::Properties,
+        Action::ChooseProgram,
     ];
 
     /// Меню корзины (макет 12): открыть, очистить, свойства.
@@ -238,6 +241,7 @@ impl Action {
             Action::CloseAll => "Закрыть все окна",
             Action::EmptyTrash => "Очистить корзину",
             Action::Properties => "Свойства",
+            Action::ChooseProgram => "Выбрать другую программу…",
         }
     }
 
@@ -250,6 +254,7 @@ impl Action {
         match self {
             Action::Open
             | Action::OpenWith(_)
+            | Action::ChooseProgram
             | Action::OpenLocation
             | Action::OpenInTerminal
             | Action::Window(_)
@@ -292,6 +297,7 @@ impl Action {
             Action::TaskManager => Some(Icon::Chart),
             Action::EmptyTrash => Some(Icon::Close),
             Action::Properties => None,
+            Action::ChooseProgram => Some(Icon::Grid),
         }
     }
 }

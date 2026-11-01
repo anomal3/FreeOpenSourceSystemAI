@@ -270,40 +270,11 @@ fn draw_design_icon(cache: &IconCache, s: &mut Surface, rect: Rect, name: &str) 
     }
 }
 
-/// Значок и тип файла по имени, как в Проводнике.
+/// Значок и тип файла по имени, как в Проводнике (таблица — общая со
+/// столом, `sysconf::filetypes`).
 fn file_kind(name: &str, directory: bool) -> (&'static str, &'static str) {
-    if directory {
-        return (
-            match name {
-                "Desktop" | "Рабочий стол" => "folder-desktop",
-                "Documents" | "Документы" => "folder-documents",
-                "Downloads" | "Загрузки" => "folder-downloads",
-                "Music" | "Музыка" => "folder-music",
-                "Pictures" | "Изображения" => "folder-pictures",
-                "Videos" | "Видео" => "folder-videos",
-                _ => "folder",
-            },
-            "Папка с файлами",
-        );
-    }
-    let ext = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
-    match ext.as_str() {
-        "txt" | "log" | "md" | "cfg" | "conf" | "ini" => ("doc-text", "Текстовый документ"),
-        "doc" | "docx" | "odt" | "rtf" => ("doc-document", "Документ"),
-        "xls" | "xlsx" | "ods" | "csv" => ("doc-spreadsheet", "Электронная таблица"),
-        "ppt" | "pptx" | "odp" => ("doc-presentation", "Презентация"),
-        "pdf" => ("doc-pdf", "Документ PDF"),
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "fimg" | "qoi" => ("doc-image", "Изображение"),
-        "mp4" | "mkv" | "avi" | "webm" | "mov" => ("doc-video", "Видео"),
-        "mp3" | "wav" | "ogg" | "flac" => ("doc-audio", "Звук"),
-        "zip" | "tar" | "gz" | "xz" | "7z" | "rar" | "deb" => ("doc-archive", "Архив"),
-        "rs" | "c" | "h" | "cpp" | "py" | "js" | "lua" | "cs" | "sh" | "html" | "css" | "json" => ("doc-code", "Исходный код"),
-        "exe" | "dll" | "elf" => ("doc-executable", "Приложение"),
-        "fpk" => ("doc-fpk", "Пакет FossAi"),
-        "img" | "iso" | "vdi" => ("doc-disk-image", "Образ диска"),
-        "ttf" | "otf" => ("doc-font", "Шрифт"),
-        _ => ("doc-unknown", "Файл"),
-    }
+    let kind = sysconf::filetypes::kind_of(name, directory);
+    (kind.icon, kind.name)
 }
 
 /// Размер по-человечески: «48 КБ», «1,2 МБ».
@@ -855,6 +826,17 @@ impl Files {
                 self.note = Some(format!("Запущено «{name}»"));
             }
             return true;
+        }
+        // Выбор человека («Всегда открывать этой программой») — первым.
+        if let Some(command) = chosen_program(&name) {
+            let line = format!("{command} {target}");
+            let id = spawn(&line);
+            if id >= 0 {
+                println(&format!("files: started '{line}' as #{id}"));
+                self.note = Some(format!("Открыто «{name}»"));
+                return true;
+            }
+            println(&format!("files: cannot start '{line}': error {id}"));
         }
         // Фаза 70b: текст открывается в блокноте — его там можно и поправить.
         // Всё прочее — на просмотр, как раньше.
@@ -2849,6 +2831,30 @@ fn write_file(path: &str, data: &[u8]) -> Result<(), i64> {
     if code < 0 { Err(code) } else { Ok(()) }
 }
 
+/// Прочитать текстовый файл до `limit` байт.
+fn read_small_limit(path: &str, limit: usize) -> Option<String> {
+    let fd = open(path);
+    if fd < 0 {
+        return None;
+    }
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(limit).is_err() {
+        close(fd);
+        return None;
+    }
+    buffer.resize(limit, 0u8);
+    let mut got = 0usize;
+    while got < limit {
+        let step = read(fd, &mut buffer[got..]);
+        if step <= 0 {
+            break;
+        }
+        got += step as usize;
+    }
+    close(fd);
+    String::from_utf8(buffer[..got].to_vec()).ok()
+}
+
 /// Прочитать маленький текстовый файл (до 4 КиБ).
 fn read_small(path: &str) -> Option<String> {
     let fd = open(path);
@@ -3193,14 +3199,20 @@ impl Files {
 
 /// Текстовый ли файл — по расширению: открывать его в блокноте (фаза 70b).
 fn is_text(name: &str) -> bool {
-    const TEXT: [&str; 18] = [
-        "txt", "md", "cfg", "conf", "ini", "log", "c", "h", "rs", "toml", "json", "csv", "sh", "py", "lua", "cs", "xml", "html",
-    ];
-    let Some((_, ext)) = name.rsplit_once('.') else {
-        return false;
-    };
-    let ext = ext.to_ascii_lowercase();
-    TEXT.contains(&ext.as_str())
+    sysconf::filetypes::is_text(name)
+}
+
+/// Программа, которой человек велел открывать файлы этого расширения
+/// («Всегда открывать этой программой» на столе, `open_with=` в
+/// `/etc/desktop.cfg`).
+fn chosen_program(name: &str) -> Option<String> {
+    let ext = sysconf::filetypes::extension(name);
+    if ext.is_empty() {
+        return None;
+    }
+    let text = read_small_limit("/etc/desktop.cfg", 16 * 1024)?;
+    let list = sysconf::value(&text, "open_with")?;
+    sysconf::filetypes::chosen(list, &ext).map(String::from)
 }
 
 /// С какого каталога начать.

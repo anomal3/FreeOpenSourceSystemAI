@@ -21,6 +21,11 @@ use crate::config;
 /// Имя файла настроек.
 pub const CONFIG: &str = "desktop.cfg";
 
+/// Какой программой открывать файлы — строка `open_with=` (см.
+/// `sysconf::filetypes`): нужна на каждом двойном щелчке, читать файл на
+/// каждый незачем.
+static OPEN_WITH: crate::sync::SpinLock<alloc::string::String> = crate::sync::SpinLock::new(alloc::string::String::new());
+
 /// Сколько байт читать. Строки короткие, кроме мест значков стола (путь на
 /// значок, до [`super::icons`] сотни штук) — им и нужен запас.
 const LIMIT: usize = 16 * 1024;
@@ -76,6 +81,10 @@ pub fn adopt() {
     // Места значков на столе (01.11).
     if let Some(places) = sysconf::value(text, "icon_places") {
         super::icons::set_places(places);
+    }
+    // Программы для типов файлов (02.11, «Всегда открывать этой программой»).
+    if let Some(list) = sysconf::value(text, "open_with") {
+        *OPEN_WITH.lock() = alloc::string::String::from(list);
     }
     // Ярлыки, убранные со стола «Удалить ярлык» (24.10).
     if let Some(list) = sysconf::value(text, "hidden_shortcuts") {
@@ -149,6 +158,19 @@ pub fn store_icon_places(list: &str) -> Result<(), crate::vfs::VfsError> {
 /// Запомнить ярлыки, убранные со стола (подписи через `|`).
 pub fn store_hidden_shortcuts(list: &str) -> Result<(), crate::vfs::VfsError> {
     store_key("hidden_shortcuts", list)
+}
+
+/// Программа, выбранная для расширения `ext`.
+#[must_use]
+pub fn open_with(ext: &str) -> Option<alloc::string::String> {
+    sysconf::filetypes::chosen(&OPEN_WITH.lock(), ext).map(alloc::string::String::from)
+}
+
+/// Запомнить программу для расширения.
+pub fn store_open_with(ext: &str, command: &str) -> Result<(), crate::vfs::VfsError> {
+    let list = sysconf::filetypes::with_choice(&OPEN_WITH.lock(), ext, command);
+    *OPEN_WITH.lock() = list.clone();
+    store_key("open_with", &list)
 }
 
 /// Запомнить, что показывает панель.

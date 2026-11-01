@@ -2109,6 +2109,7 @@ impl Compositor {
                     App::Settings => alloc::string::String::from("параметры системы"),
                     App::About => alloc::string::String::from("о системе"),
                     App::Shutdown | App::Restart => alloc::string::String::from("вопрос о питании"),
+                    App::OpenWith => alloc::string::String::from("выбор программы"),
                     App::Program(task, _) => alloc::format!("задача #{task}"),
                 },
                 age: tray::age_text(now.saturating_sub(window.minimized_at_ms)),

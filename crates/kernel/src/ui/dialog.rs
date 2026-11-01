@@ -21,6 +21,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use mini_ui::draw;
 use mini_ui::glyphicon::Icon;
@@ -46,7 +47,28 @@ pub enum Dialog {
     About(AboutFacts),
     /// Вопрос о выключении (`restart: false`) или перезагрузке.
     Power { restart: bool },
+    /// «Как открыть этот файл?» (макет 18): программы списком, флажок
+    /// «Всегда открывать этой программой».
+    OpenWith(OpenWith),
 }
+
+/// Выбор программы для файла.
+pub struct OpenWith {
+    /// Полный путь файла — его и откроет выбранная программа.
+    pub path: String,
+    /// Расширение — для него запоминается выбор.
+    pub ext: String,
+    pub kind: sysconf::filetypes::Kind,
+    /// Подпись и команда, к которой допишется путь. Первая — рекомендуемая.
+    pub choices: Vec<(String, String)>,
+    pub selected: usize,
+    pub always: bool,
+}
+
+/// Строк списка, не больше: окно не растёт под длинный список.
+const OPEN_WITH_ROWS: usize = 5;
+/// Высота строки программы (макет: 48).
+const CHOICE_H: u32 = 48;
 
 /// Сведения «О системе» — снимок на момент открытия окна.
 ///
@@ -70,6 +92,8 @@ pub enum Answer {
     Close,
     /// «Выключить», «Перезагрузить».
     Confirm,
+    /// «ОК» в выборе программы.
+    Open,
 }
 
 /// Кнопка на своём месте.
@@ -97,7 +121,7 @@ impl DialogView {
         // по привычке в только что открывшемся окне, не должен гасить машину.
         let focus = match dialog {
             Dialog::Power { .. } => 1,
-            Dialog::About(_) => 0,
+            Dialog::About(_) | Dialog::OpenWith(_) => 0,
         };
         Self { dialog, focus, answer: None }
     }
@@ -106,7 +130,7 @@ impl DialogView {
     const fn count(&self) -> usize {
         match self.dialog {
             Dialog::About(_) => 1,
-            Dialog::Power { .. } => 2,
+            Dialog::Power { .. } | Dialog::OpenWith(_) => 2,
         }
     }
 
@@ -114,6 +138,7 @@ impl DialogView {
     const fn answer_at(&self, index: usize) -> Answer {
         match (&self.dialog, index) {
             (Dialog::Power { .. }, 0) => Answer::Confirm,
+            (Dialog::OpenWith(_), 0) => Answer::Open,
             _ => Answer::Close,
         }
     }
@@ -123,14 +148,18 @@ impl DialogView {
     /// Прижаты к правому нижнему углу и идут слева направо: действие, потом
     /// отмена — так стоят кнопки в диалогах, к которым человек привык.
     fn layout(&self, area: Rect, ctx: Ctx) -> [Option<Button>; 2] {
-        let specs: [Option<(Answer, Weight, &'static str)>; 2] = match self.dialog {
+        let specs: [Option<(Answer, Weight, &'static str)>; 2] = match &self.dialog {
             Dialog::About(_) => [Some((Answer::Close, Weight::Primary, "Закрыть")), None],
             Dialog::Power { restart } => [
                 Some((
                     Answer::Confirm,
                     Weight::Danger,
-                    if restart { "Перезагрузить" } else { "Выключить" },
+                    if *restart { "Перезагрузить" } else { "Выключить" },
                 )),
+                Some((Answer::Close, Weight::Normal, "Отмена")),
+            ],
+            Dialog::OpenWith(_) => [
+                Some((Answer::Open, Weight::Primary, "ОК")),
                 Some((Answer::Close, Weight::Normal, "Отмена")),
             ],
         };
@@ -159,6 +188,26 @@ impl DialogView {
     /// Разобрать клавишу. `true` — окно ею воспользовалось.
     pub fn handle(&mut self, code: KeyCode) -> bool {
         let count = self.count();
+        if let Dialog::OpenWith(choice) = &mut self.dialog {
+            let shown = choice.choices.len().min(OPEN_WITH_ROWS);
+            match code {
+                KeyCode::Up => {
+                    choice.selected = choice.selected.saturating_sub(1);
+                    return true;
+                }
+                KeyCode::Down => {
+                    if choice.selected + 1 < shown {
+                        choice.selected += 1;
+                    }
+                    return true;
+                }
+                KeyCode::Space => {
+                    choice.always = !choice.always;
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match code {
             KeyCode::Tab | KeyCode::Right => self.focus = (self.focus + 1) % count,
             KeyCode::Left => self.focus = (self.focus + count - 1) % count,
@@ -171,6 +220,17 @@ impl DialogView {
 
     /// Разобрать щелчок в координатах поверхности окна.
     pub fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        if let Dialog::OpenWith(choice) = &mut self.dialog {
+            let (rows, check) = choice_layout(area, ctx, choice.choices.len());
+            if let Some(index) = rows.iter().position(|row| row.contains(x, y)) {
+                choice.selected = index;
+                return true;
+            }
+            if check.contains(x, y) {
+                choice.always = !choice.always;
+                return true;
+            }
+        }
         for (index, button) in self.layout(area, ctx).iter().enumerate() {
             if let Some(button) = button {
                 if button.rect.contains(x, y) {
@@ -183,6 +243,17 @@ impl DialogView {
         false
     }
 
+    /// Что выбрано в «Как открыть этот файл?»: путь, расширение, команда и
+    /// «всегда».
+    #[must_use]
+    pub fn open_with_choice(&self) -> Option<(String, String, String, bool)> {
+        let Dialog::OpenWith(choice) = &self.dialog else {
+            return None;
+        };
+        let (_, command) = choice.choices.get(choice.selected)?;
+        Some((choice.path.clone(), choice.ext.clone(), command.clone(), choice.always))
+    }
+
     /// Забрать ответ, если его дали.
     pub fn take_answer(&mut self) -> Option<Answer> {
         self.answer.take()
@@ -190,10 +261,14 @@ impl DialogView {
 
     /// Нарисовать содержимое в области под заголовком.
     pub fn draw(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
-        let p = ctx.palette;
         let pad = ctx.px(PAD) as i32;
+        if let Dialog::OpenWith(choice) = &self.dialog {
+            draw_open_with(ctx, s, area, choice);
+            self.draw_buttons(s, area, ctx);
+            return;
+        }
         let (icon, tone) = match self.dialog {
-            Dialog::About(_) => (Icon::Info, Tone::Accent),
+            Dialog::About(_) | Dialog::OpenWith(_) => (Icon::Info, Tone::Accent),
             Dialog::Power { .. } => (Icon::Power, Tone::Bad),
         };
         let tile = Rect::new(area.x + pad, area.y + pad, ctx.px(TILE), ctx.px(TILE));
@@ -209,8 +284,14 @@ impl DialogView {
         match &self.dialog {
             Dialog::About(facts) => draw_about(ctx, s, x, &mut y, width, facts),
             Dialog::Power { restart } => draw_power(ctx, s, x, &mut y, width, *restart),
+            Dialog::OpenWith(_) => {}
         }
+        self.draw_buttons(s, area, ctx);
+    }
 
+    /// Черта и кнопки внизу.
+    fn draw_buttons(&self, s: &mut Surface, area: Rect, ctx: Ctx) {
+        let p = ctx.palette;
         let buttons = self.layout(area, ctx);
         // Черта над кнопками отделяет ответ от сообщения: без неё кнопки
         // читаются как продолжение текста.
@@ -237,6 +318,86 @@ impl DialogView {
             }
         }
     }
+}
+
+/// Где строки программ и флажок «всегда» в окне выбора программы.
+fn choice_layout(area: Rect, ctx: Ctx, count: usize) -> (Vec<Rect>, Rect) {
+    let pad = ctx.px(PAD) as i32;
+    let x = area.x + pad;
+    let w = area.w.saturating_sub(ctx.px(PAD) * 2);
+    // Шапка: значок типа 40 и две строки рядом с ним.
+    let mut y = area.y + pad + ctx.px(40 + 16) as i32;
+    let mut rows = Vec::new();
+    for _ in 0..count.min(OPEN_WITH_ROWS) {
+        rows.push(Rect::new(x, y, w, ctx.px(CHOICE_H)));
+        y += ctx.px(CHOICE_H + 2) as i32;
+    }
+    y += ctx.px(14) as i32;
+    let check = Rect::new(x, y, w, ctx.px(24));
+    (rows, check)
+}
+
+/// «Как открыть этот файл?» по макету 18.
+fn draw_open_with(ctx: Ctx, s: &mut Surface, area: Rect, choice: &OpenWith) {
+    let p = ctx.palette;
+    let pad = ctx.px(PAD) as i32;
+    let icon = Rect::new(area.x + pad, area.y + pad, ctx.px(40), ctx.px(40));
+    match super::appicon::design(choice.kind.icon) {
+        Some(image) => image.draw(s, icon),
+        None => paint::icon_tile(ctx, s, icon, Icon::File, Tone::Accent, false),
+    }
+    let x = icon.right() + ctx.px(14) as i32;
+    let width = (area.right() - pad - x).max(0) as u32;
+    paint::text_clipped(ctx, s, Role::Heading, x, icon.y, width, "Как открыть этот файл?", p.ink);
+    let name = choice.path.rsplit('/').next().unwrap_or(&choice.path);
+    let what = format!("{name} — {}", choice.kind.name.to_lowercase());
+    paint::text_clipped(ctx, s, Role::Caption, x, icon.y + line(ctx, Role::Heading) + ctx.px(2) as i32, width, &what, p.ink3);
+
+    let (rows, check) = choice_layout(area, ctx, choice.choices.len());
+    let r = ctx.px(6);
+    for (index, (row, (label, _))) in rows.iter().zip(&choice.choices).enumerate() {
+        let selected = index == choice.selected;
+        if selected {
+            draw::rounded(s, *row, r, p.acc, 60);
+            draw::rounded_stroke(s, *row, r, p.acc, 255);
+        }
+        let tile = Rect::new(row.x + ctx.px(12) as i32, row.y + (row.h as i32 - ctx.px(28) as i32) / 2, ctx.px(28), ctx.px(28));
+        let glyph = if label == "Блокнот" { Icon::File } else { Icon::Package };
+        paint::icon_tile(ctx, s, tile, glyph, Tone::Accent, false);
+        let text_x = tile.right() + ctx.px(14) as i32;
+        let radio = ctx.px(8);
+        let text_w = (row.right() - text_x - ctx.px(40) as i32).max(0) as u32;
+        if index == 0 {
+            let top = row.y + (row.h as i32 - line(ctx, Role::Body) - line(ctx, Role::Caption)) / 2;
+            paint::text_clipped(ctx, s, Role::Body, text_x, top, text_w, label, p.ink);
+            paint::text_clipped(ctx, s, Role::Caption, text_x, top + line(ctx, Role::Body), text_w, "рекомендуется", p.ink4);
+        } else {
+            paint::text_clipped(ctx, s, Role::Body, text_x, paint::baseline(ctx, Role::Body, *row), text_w, label, p.ink);
+        }
+        let cx = row.right() - ctx.px(24) as i32;
+        let cy = row.y + row.h as i32 / 2;
+        draw::circle_outline(s, cx, cy, radio, ctx.px(2).max(1), if selected { p.acc } else { p.ink4 }, 255);
+        if selected {
+            draw::circle(s, cx, cy, radio / 2, p.acc, 255);
+        }
+    }
+
+    let side = ctx.px(14);
+    let bx = Rect::new(check.x, check.y + (check.h as i32 - side as i32) / 2, side, side);
+    if choice.always {
+        draw::rounded(s, bx, ctx.px(3), p.acc, 255);
+        glyphicon_check(s, bx, p.acc_ink);
+    } else {
+        draw::rounded_stroke(s, bx, ctx.px(3), p.ink4, 255);
+    }
+    let label_x = bx.right() + ctx.px(10) as i32;
+    let label_w = (check.right() - label_x).max(0) as u32;
+    paint::text_clipped(ctx, s, Role::Body, label_x, paint::baseline(ctx, Role::Body, check), label_w, "Всегда открывать этой программой", p.ink2);
+}
+
+/// Галочка во флажке.
+fn glyphicon_check(s: &mut Surface, rect: Rect, color: Color) {
+    mini_ui::glyphicon::draw(s, Icon::Check, rect.x, rect.y, rect.w, color, 255);
 }
 
 /// Высота строки начертания в точках.

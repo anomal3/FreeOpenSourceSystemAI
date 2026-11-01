@@ -864,6 +864,18 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
         // Подтверждение встаёт по центру и заметно меньше остальных: это вопрос
         // с двумя кнопками, и окно размером с терминал выглядело бы как ещё одна
         // программа, а не как «система ждёт от вас ответа».
+        // «Как открыть этот файл?» — по макету 18: 480 на 500.
+        App::OpenWith => {
+            let scale = desktop.scale();
+            let w = (480 * scale).min(width);
+            let h = (500 * scale).min(work);
+            Rect::new(
+                ((width.saturating_sub(w)) / 2) as i32,
+                ((work.saturating_sub(h)) / 2) as i32,
+                w,
+                h,
+            )
+        }
         App::Shutdown | App::Restart => {
             let scale = desktop.scale();
             let w = (500 * scale).min(width);
@@ -906,6 +918,8 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
         App::Shutdown | App::Restart => {
             Window::dialog(app, rect, scale, Dialog::Power { restart: app == App::Restart })
         }
+        // Окну выбора программы нужен файл — его строит [`choose_program`].
+        App::OpenWith => None,
         // Окно программы строится не здесь, и построить его столу нечем: ему
         // нужны кадры, которые выдаёт [`crate::user`]. Сюда приходят с меню и с
         // панели задач, а там окно программы к этому времени уже существует —
@@ -2942,6 +2956,11 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
 /// этом состоянии не будет. Поэтому здесь поднимается просьба, а гасит систему
 /// задача (см. [`crate::power`]).
 fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
+    let choice = if app == App::OpenWith && answer == Answer::Open {
+        desktop.find(app).and_then(|window| window.open_with_choice())
+    } else {
+        None
+    };
     if desktop.close(app) {
         kprintln!("  desktop     : closed '{}'", app.title());
     }
@@ -2950,7 +2969,47 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
             crate::power::request(restart, crate::power::Source::Desktop);
         }
         (Some(_), Answer::Close) => kprintln!("  desktop     : '{}' cancelled", app.title()),
-        (None, _) => {}
+        _ => {}
+    }
+    // «ОК» в «Как открыть этот файл?»: открыть и, если отмечено, запомнить.
+    if let Some((path, ext, command, always)) = choice {
+        if always && !ext.is_empty() {
+            match prefs::store_open_with(&ext, &command) {
+                Ok(()) => kprintln!("  desktop     : .{ext} files open with '{command}'"),
+                Err(err) => kprintln!("  desktop     : cannot remember the program for .{ext}: {err}"),
+            }
+        }
+        start(desktop, &alloc::format!("{command} {path}"));
+    }
+}
+
+/// Окно «Как открыть этот файл?» для `path` (макет 18). Программ нет — сказать
+/// об этом и открыть в «Файлах», как раньше.
+fn choose_program(desktop: &mut Compositor, path: &str) {
+    let choices = file_handlers(path);
+    if choices.is_empty() {
+        kprintln!("  desktop     : no program opens '{path}'");
+        start(desktop, &alloc::format!("/bin/files {path}"));
+        return;
+    }
+    if desktop.close(App::OpenWith) {
+        kprintln!("  desktop     : closed '{}'", App::OpenWith.title());
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let ext = sysconf::filetypes::extension(name);
+    let dialog = Dialog::OpenWith(dialog::OpenWith {
+        path: String::from(path),
+        ext,
+        kind: sysconf::filetypes::kind_of(name, false),
+        choices,
+        selected: 0,
+        always: true,
+    });
+    let rect = layout(desktop, App::OpenWith);
+    if let Some(window) = Window::dialog(App::OpenWith, rect, desktop.scale(), dialog) {
+        desktop.push(window);
+        kprintln!("  desktop     : opened '{}' for '{path}'", App::OpenWith.title());
+        log_focus(desktop);
     }
 }
 
@@ -3162,7 +3221,7 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
     // Диалог разбирает клавиши раньше остальных окон: набирать в нём нечего, а
     // ответ закрывает окно, и закрыть его может только стол.
     if let Some(app) = desktop.focused_app() {
-        if app == App::About || app.confirms_power().is_some() {
+        if app == App::About || app == App::OpenWith || app.confirms_power().is_some() {
             if event.pressed {
                 // `Y` и `N` у вопроса о питании остались с тех пор, когда кнопок
                 // не было: на них стоит стенд, а человеку они не мешают.
@@ -3512,13 +3571,19 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
             kprintln!("  desktop     : opened the trash");
         }
         // Файл, для которого есть программа (текст — «Блокнот»), открывается
-        // ею, как двойной щелчок в Windows.
+        // ею, как двойной щелчок в Windows. Выбрано «всегда» или программа одна — сразу ею; несколько и
+        // выбора нет — спросить, как Windows («Как открыть этот файл?»).
         Some(icons::Kind::File) if desktop.icon_path(index).is_some_and(|path| !file_handlers(&path).is_empty()) => {
             let Some(path) = desktop.icon_path(index) else {
                 return;
             };
-            if let Some((_, command)) = file_handlers(&path).into_iter().next() {
-                start(desktop, &alloc::format!("{command} {path}"));
+            let name = path.rsplit('/').next().unwrap_or(&path);
+            let chosen = prefs::open_with(&sysconf::filetypes::extension(name));
+            let handlers = file_handlers(&path);
+            match (chosen, handlers.len()) {
+                (Some(command), _) => start(desktop, &alloc::format!("{command} {path}")),
+                (None, 1) => start(desktop, &alloc::format!("{} {path}", handlers[0].1)),
+                (None, _) => choose_program(desktop, &path),
             }
         }
         // Файл или каталог со стола. До 47c здесь поднималось окно ядра и ему
@@ -3545,23 +3610,21 @@ fn file_menu(count: usize) -> alloc::vec::Vec<context::Action> {
     for index in 0..count {
         items.push(context::Action::OpenWith(index as u8));
     }
+    items.push(context::Action::ChooseProgram);
     items.push(context::Action::Rename);
     items.push(context::Action::Delete);
     items
 }
 
-/// Расширения, которые открывает «Блокнот».
-const TEXT_EXTENSIONS: [&str; 16] =
-    ["txt", "log", "md", "cfg", "conf", "ini", "json", "xml", "csv", "sh", "c", "h", "rs", "py", "toml", "yaml"];
 
 /// Программы, которые открывают файл `path`: подпись и команда (путь
 /// допишется). Свои — «Блокнот» для текста; пакетные — по `opens=` их
 /// манифеста (поставили Notepad++ — он появится здесь).
 fn file_handlers(path: &str) -> alloc::vec::Vec<(String, String)> {
     let name = path.rsplit('/').next().unwrap_or(path);
-    let extension = name.rsplit_once('.').map(|(_, ext)| ext.to_ascii_lowercase()).unwrap_or_default();
+    let extension = sysconf::filetypes::extension(name);
     let mut out = alloc::vec::Vec::new();
-    if TEXT_EXTENSIONS.contains(&extension.as_str()) || extension.is_empty() {
+    if sysconf::filetypes::is_text(name) || extension.is_empty() {
         out.push((String::from("Блокнот"), String::from("/bin/notepad")));
     }
     if !extension.is_empty() {
@@ -3570,6 +3633,15 @@ fn file_handlers(path: &str) -> alloc::vec::Vec<(String, String)> {
                 out.push((launcher.caption.clone(), launcher.start.clone()));
             }
         }
+    }
+    // Выбранная человеком — первой («по умолчанию»), даже если её нет в списке
+    // (пакет переустановили без `opens=`).
+    if let Some(command) = prefs::open_with(&extension) {
+        let entry = match out.iter().position(|(_, start)| *start == command) {
+            Some(at) => out.remove(at),
+            None => (String::from(command.rsplit('/').next().unwrap_or(&command)), command),
+        };
+        out.insert(0, entry);
     }
     out
 }
@@ -3750,6 +3822,13 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             let members = GROUP.lock().clone();
             for app in members {
                 close_from_panel(desktop, app);
+            }
+            desktop.refresh_panel(status);
+        }
+        context::Action::ChooseProgram => {
+            desktop.close_context();
+            if let Some((path, _)) = selected_entry(desktop) {
+                choose_program(desktop, &path);
             }
             desktop.refresh_panel(status);
         }
