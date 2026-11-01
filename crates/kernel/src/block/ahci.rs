@@ -337,14 +337,18 @@ pub struct AhciDisk {
 /// слот, как раньше. Четыре — не больше `CAP.NCS` и глубины очереди диска,
 /// и это 1 МиБ буферов DMA на порт.
 ///
-/// **Пока один.** NCQ проходит все сценарии в QEMU (обе архитектуры), но в
-/// VirtualBox под запуском Chromium команды очереди — сначала запись среди
-/// чтений, потом и чтение, когда записи стали исключительными, — не
-/// завершались (таймаут 10 с), и порт заклинивало: восстановления после
-/// таймаута у драйвера нет. До разбора (что именно ждёт эмуляция VirtualBox
-/// и сброс порта после ошибки — ROADMAP «Скорость диска») — прежний путь:
-/// одна команда, без очереди, чтение под замком носителя.
-const SLOTS: usize = 1;
+/// **Четыре с 01.11.** В VirtualBox очередь не работала по трём причинам,
+/// найденным по дампу регистров при таймауте: завершение команды NCQ
+/// ждалось по `PxCI | PxSACT`, а VirtualBox снимает только тег в `PxSACT`
+/// (Linux тоже смотрит лишь на `PxSACT`); «все слоты заняты» принималось за
+/// «порт наш целиком» и ждало «не занят» при соседях; после ошибки порт не
+/// сбрасывался. Теперь — завершение по `PxSACT`, явный флаг исключительной
+/// команды, сброс порта с повтором ([`Port::run`]).
+const SLOTS: usize = 4;
+
+/// Срок команды очереди NCQ (мс): обычно миллисекунды, за сроком — сброс
+/// порта и повтор.
+const QUEUED_TIMEOUT_MS: u64 = 2_000;
 
 /// Слот команды: своя таблица (FIS и один элемент PRDT) и свой буфер данных.
 struct Slot {
@@ -376,6 +380,15 @@ pub struct Port {
     sector_size: usize,
     /// Чтение и запись — очередью NCQ (несколько слотов). Иначе слот один.
     ncq: bool,
+    /// Порт занят целиком командой вне очереди ([`Port::acquire_all`]).
+    exclusive: core::sync::atomic::AtomicBool,
+    /// Команда вне очереди ждёт пустого порта: новые чтения не берут слоты,
+    /// иначе поток чтений не дал бы ей места никогда.
+    draining: core::sync::atomic::AtomicBool,
+    /// Сколько раз порт сбрасывали после отказа ([`Port::recover`]).
+    resets: AtomicU32,
+    /// Идёт сброс порта: команды не выдаются.
+    recovering: core::sync::atomic::AtomicBool,
 }
 
 /// Найти контроллеры AHCI и поднять все диски, какие за ними есть.
@@ -694,6 +707,10 @@ impl AhciDisk {
             sectors: 0,
             sector_size: SECTOR_SIZE,
             ncq: false,
+            exclusive: core::sync::atomic::AtomicBool::new(false),
+            draining: core::sync::atomic::AtomicBool::new(false),
+            resets: AtomicU32::new(0),
+            recovering: core::sync::atomic::AtomicBool::new(false),
         };
         let depth = port.identify()?;
         // NCQ — если умеют оба: контроллер (`CAP.SNCQ`) и диск (слово 76).
@@ -794,7 +811,8 @@ impl Port {
         let all = (1u32 << self.slots.len()) - 1;
         loop {
             let busy = self.busy.load(Ordering::Acquire);
-            if busy & all != all {
+            let draining = self.draining.load(Ordering::Acquire);
+            if busy & all != all && !draining {
                 let slot = (!busy & all).trailing_zeros() as usize;
                 if self
                     .busy
@@ -809,7 +827,7 @@ impl Port {
                 // Слот освобождает задача, а не прерывание; она же будит
                 // ждущих (`release`). Срок — на случай разминувшихся.
                 Some(source) => crate::sched::block_on_irq_until(source, SLEEP_SLICE_MS, || {
-                    self.busy.load(Ordering::Acquire) & all != all
+                    self.busy.load(Ordering::Acquire) & all != all && !self.draining.load(Ordering::Acquire)
                 }),
                 None => core::hint::spin_loop(),
             }
@@ -822,7 +840,13 @@ impl Port {
     fn acquire_all(&self) -> usize {
         let all = (1u32 << self.slots.len()) - 1;
         loop {
+            // Пока ждём — новые чтения слотов не берут (`draining`), и порт
+            // опустеет за время уже выданных команд.
+            if self.slots.len() > 1 {
+                self.draining.store(true, Ordering::Release);
+            }
             if self.busy.compare_exchange(0, all, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                self.exclusive.store(true, Ordering::Release);
                 return 0;
             }
             match self.sleep_source() {
@@ -836,6 +860,8 @@ impl Port {
 
     /// Освободить всё, занятое [`Port::acquire_all`].
     fn release_all(&self) {
+        self.exclusive.store(false, Ordering::Release);
+        self.draining.store(false, Ordering::Release);
         self.busy.store(0, Ordering::Release);
         if self.sleep_source().is_some() {
             crate::sched::wake_irq(IRQ_SOURCE);
@@ -856,6 +882,76 @@ impl Port {
     /// Флаг попадает в заголовок команды, и перепутать его — значит записать
     /// туда, откуда собирались читать.
     fn run(
+        &self,
+        slot: usize,
+        command: u8,
+        lba: u64,
+        count: u16,
+        bytes: usize,
+        write: bool,
+    ) -> Result<(), AhciError> {
+        // Отказ или потерянная команда — сброс порта и повтор (01.11: в
+        // VirtualBox команда очереди изредка не завершается, а после ошибки
+        // порт без сброса отказывал на всё подряд). Команда, ждавшая во время
+        // чужого сброса, тоже повторяется: её «готово» после сброса ничего
+        // не значит — сброс снимает все биты.
+        const ATTEMPTS: usize = 3;
+        let mut last = Err(AhciError::CommandTimeout);
+        for attempt in 0..ATTEMPTS {
+            self.wait_recovery();
+            let epoch = self.resets.load(Ordering::Acquire);
+            match self.issue(slot, command, lba, count, bytes, write) {
+                Ok(()) if self.resets.load(Ordering::Acquire) == epoch => return Ok(()),
+                Ok(()) => last = Err(AhciError::CommandTimeout),
+                Err(err) => {
+                    last = Err(err);
+                    if attempt + 1 < ATTEMPTS {
+                        self.recover(epoch);
+                    }
+                }
+            }
+        }
+        last
+    }
+
+    /// Дождаться конца чужого сброса порта.
+    fn wait_recovery(&self) {
+        while self.recovering.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Сбросить порт после отказа (один раз на эпоху: кто опоздал — просто
+    /// повторит команду): остановить, снять ошибки, пересобрать связь и
+    /// запустить заново.
+    fn recover(&self, seen: u32) {
+        loop {
+            if self.resets.load(Ordering::Acquire) != seen {
+                return;
+            }
+            if self.recovering.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if self.resets.load(Ordering::Acquire) == seen {
+            // SAFETY: окно порта отображено всё время жизни диска; список
+            // команд и область ответов остаются прежними (их адреса в
+            // регистрах порта сброс не трогает).
+            let result = unsafe {
+                let _ = stop(self.regs);
+                write32(self.regs, PX_SERR, u32::MAX);
+                write32(self.regs, PX_IS, u32::MAX);
+                start_port(self.regs)
+            };
+            kprintln!("ahci: port reset after a failed command ({})", if result.is_ok() { "ok" } else { "failed" });
+            self.resets.fetch_add(1, Ordering::AcqRel);
+        }
+        self.recovering.store(false, Ordering::Release);
+    }
+
+    /// Выдать команду и дождаться её (одна попытка, см. [`Port::run`]).
+    fn issue(
         &self,
         slot: usize,
         command: u8,
@@ -945,8 +1041,11 @@ impl Port {
             // Прошлые признаки и ожидание «не занят» — только когда в полёте нет
             // других команд: при соседях `BSY` — норма, а их признаки снимает
             // обработчик прерывания.
+            // Порт целиком наш — отмечено явно: «все слоты заняты» бывает и
+            // у четырёх обычных чтений сразу, и ждать тогда «не занят» —
+            // значит ждать, пока закончат соседи (таймаут, 31.10).
             let busy = self.busy.load(Ordering::Acquire);
-            if busy == 1 << slot || busy == (1u32 << self.slots.len()) - 1 && !queued {
+            if busy == 1 << slot || self.exclusive.load(Ordering::Acquire) {
                 write32(self.regs, PX_IS, u32::MAX);
                 wait_not_busy(self.regs, PORT_TIMEOUT_MS)?;
             }
@@ -954,6 +1053,13 @@ impl Port {
             // единица ставит бит, ноль ничего не трогает — соседние слоты
             // запись своего бита не задевает.
             if queued {
+                // Бит слота в `PxCI` от прошлой команды очереди мог ещё стоять
+                // (VirtualBox снимает его не сразу), а запись поверх стоящего
+                // бита контроллер вправе не заметить — дождаться, пока снимется.
+                let deadline = time::uptime_ms() + PORT_TIMEOUT_MS;
+                while read32(self.regs, PX_CI) & (1 << slot) != 0 && time::uptime_ms() < deadline {
+                    core::hint::spin_loop();
+                }
                 write32(self.regs, PX_SACT, 1 << slot);
             }
             write32(self.regs, PX_CI, 1 << slot);
@@ -977,7 +1083,9 @@ impl Port {
     ///
     /// Окно порта должно быть отображено.
     unsafe fn wait_for_completion(&self, slot: usize, queued: bool) -> Result<(), AhciError> {
-        let deadline = time::uptime_ms() + COMMAND_TIMEOUT_MS;
+        // Команда очереди, потерянная эмуляцией, ждётся недолго: за сроком —
+        // сброс порта и повтор ([`Port::run`]), а не десять секунд стояния.
+        let deadline = time::uptime_ms() + if queued { QUEUED_TIMEOUT_MS } else { COMMAND_TIMEOUT_MS };
         let sleep = self.sleep_source();
         let bit = 1u32 << slot;
         // Команда NCQ закончена, когда устройство сняло её тег в `PxSACT`;
@@ -985,12 +1093,11 @@ impl Port {
         let pending = if queued { PX_SACT } else { PX_CI };
         loop {
             // SAFETY: контракт функции.
+            // Команда NCQ закончена по `PxSACT`, и только по нему, как у Linux
+            // (libahci): VirtualBox снимает тег в `PxSACT`, а бит `PxCI` оставляет
+            // (01.11: «CI 0x8 SACT 0x0» у завершённой команды — и таймаут).
             let (ci, is, tfd) = unsafe {
-                (
-                    read32(self.regs, PX_CI) | read32(self.regs, pending),
-                    read32(self.regs, PX_IS),
-                    read32(self.regs, PX_TFD),
-                )
+                (read32(self.regs, pending), read32(self.regs, PX_IS), read32(self.regs, PX_TFD))
             };
             // Ошибка проверяется раньше завершения: при отказе устройство может
             // и не снять бит слота, и ожидание превратилось бы в таймаут с
@@ -1002,6 +1109,21 @@ impl Port {
                 return Ok(());
             }
             if time::uptime_ms() >= deadline {
+                // Что видит контроллер в этот момент — для разбора зависаний
+                // очереди в VirtualBox (31.10–01.11).
+                // SAFETY: контракт функции.
+                unsafe {
+                    kprintln!(
+                        "ahci: timeout slot {slot} queued {queued}: CI {:#x} SACT {:#x} IS {:#x} TFD {:#x} SERR {:#x} CMD {:#x} busy {:#x}",
+                        read32(self.regs, PX_CI),
+                        read32(self.regs, PX_SACT),
+                        read32(self.regs, PX_IS),
+                        read32(self.regs, PX_TFD),
+                        read32(self.regs, PX_SERR),
+                        read32(self.regs, PX_CMD),
+                        self.busy.load(Ordering::Acquire)
+                    );
+                }
                 return Err(AhciError::CommandTimeout);
             }
             match sleep {
@@ -1015,7 +1137,7 @@ impl Port {
                     crate::sched::block_on_irq_until(source, SLEEP_SLICE_MS, || {
                         // SAFETY: окно порта отображено всё время жизни диска.
                         let (ci, is, tfd) = unsafe {
-                            (read32(regs, PX_CI) | read32(regs, pending), read32(regs, PX_IS), read32(regs, PX_TFD))
+                            (read32(regs, pending), read32(regs, PX_IS), read32(regs, PX_TFD))
                         };
                         ci & bit == 0 || is & IS_TFES != 0 || tfd & TFD_ERR != 0
                     });
