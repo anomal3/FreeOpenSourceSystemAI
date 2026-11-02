@@ -167,10 +167,12 @@ pub struct Settings<'a> {
     /// Передаётся снаружи, а не берётся здесь: часы доступны только через
     /// runtime-сервисы UEFI, о которых крейты разметки знать не должны.
     pub unix_time: u32,
-    /// Раздел состояния — btrfs (метка `\FREEOS\STATEBTR.CFG` на носителе).
-    /// По умолчанию ext2: замер 31.10 в VirtualBox — на btrfs окно Rider
-    /// 50 с против 27,5 с на ext2, Chromium 8,1 против 5,8 (см. ROADMAP).
-    pub state_btrfs: bool,
+    /// Раздел состояния — ext2 (метка `\FREEOS\STATEEXT.CFG` на носителе).
+    /// С 02.11 по умолчанию btrfs (решение Романа): FAT не держит файлов
+    /// больше 4 ГиБ, а ext2 после отказа не восстанавливается — btrfs
+    /// пишет копией и после сброса открывается на последней фиксации.
+    /// ext2 остался откатом для сравнения скорости (см. ROADMAP).
+    pub state_ext2: bool,
 }
 
 /// Путь на корневом разделе, куда ложится файл учётных записей.
@@ -514,10 +516,9 @@ fn write_state(
     progress(5, Step::Config);
     let uuid = expand(settings.entropy, b"freeos-state-fs");
     let bytes = range.sectors() * dev.sector_size() as u64;
-    // btrfs — по метке на носителе (переезд состояния по плану фазы 50d
-    // готов, но пока медленнее ext2 на запуске программ); ext2 — по
-    // умолчанию и на разделе меньше, чем btrfs берёт.
-    let mut fs = if !settings.state_btrfs || bytes < btrfs::MIN_VOLUME_BYTES {
+    // btrfs — по умолчанию (02.11); ext2 — по метке на носителе и на
+    // разделе меньше, чем btrfs берёт.
+    let mut fs = if settings.state_ext2 || bytes < btrfs::MIN_VOLUME_BYTES {
         let options = ext2::FormatOptions { label: STATE_LABEL, uuid, time: settings.unix_time };
         let mut fs = ext2::format(dev, range.first_lba, range.sectors(), &options)?;
         fs.mark_dirty(dev)?;
