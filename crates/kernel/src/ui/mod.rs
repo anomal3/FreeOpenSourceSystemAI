@@ -2148,6 +2148,9 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
     if (dx != 0 || dy != 0) && event.buttons.contains(Buttons::LEFT) {
         icon_gesture_to(desktop, x, y);
+        if VOLUME_DRAG.load(Ordering::Relaxed) {
+            drag_volume(desktop, x, status);
+        }
     }
     if dx != 0 || dy != 0 {
         hover(desktop, x, y, event.buttons, status);
@@ -2223,6 +2226,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
                         }
                     } else if window.is_program() {
                         let local = (x - window.rect.x, y - window.rect.y - window.bar() as i32);
+                        window.push_event(WinEvent { kind: user_abi::WIN_MODS, code: program_mods(crate::input::modifiers()) as u32, x: 0, y: 0 });
                         window.push_event(WinEvent {
                             kind: WIN_POINTER,
                             code: 2,
@@ -2303,6 +2307,13 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
     if event.released(Buttons::LEFT) {
         icon_gesture_end(desktop);
+        if VOLUME_DRAG.swap(false, Ordering::Relaxed) {
+            let value = crate::sound::volume();
+            if let Err(err) = prefs::store_volume(value) {
+                kprintln!("  desktop     : volume not saved: {err}");
+            }
+            kprintln!("  desktop     : volume {value} (dragged)");
+        }
         release_pointer(desktop, x, y, 1, status);
         if SELECTING.swap(false, Ordering::Relaxed) {
             if let Some(text) = desktop.find(App::Terminal).and_then(Window::term_select_end) {
@@ -2929,7 +2940,9 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                         // когда окно сдвинули.
                         let local = (x - window.rect.x, y - window.rect.y - window.bar() as i32);
                         // Единица — левая кнопка; правая приходит двойкой из
-                        // разбора правой кнопки ниже.
+                        // разбора правой кнопки ниже. Перед нажатием —
+                        // модификаторы (Ctrl+щелчок в «Файлах», 02.11).
+                        window.push_event(WinEvent { kind: user_abi::WIN_MODS, code: program_mods(crate::input::modifiers()) as u32, x: 0, y: 0 });
                         window.push_event(WinEvent {
                             kind: WIN_POINTER,
                             code: 1,
@@ -3001,6 +3014,10 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
                 Answer::Confirm => {
                     if let App::Program(task, _) = target {
                         HUNG_KILL.store(task, Ordering::Relaxed);
+                    }
+                    // Не спрашивать снова, пока задачу снимают.
+                    if let Some(window) = desktop.find(target) {
+                        window.close_asked = 0;
                     }
                     kprintln!("  desktop     : ending the program that does not respond");
                 }
@@ -4009,6 +4026,21 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
     desktop.refresh_panel(status);
 }
 
+/// Ползунок громкости тянут: левую кнопку нажали на нём и держат.
+static VOLUME_DRAG: AtomicBool = AtomicBool::new(false);
+
+/// Тянут ползунок громкости — значение за указателем; запоминается при
+/// отпускании.
+fn drag_volume(desktop: &mut Compositor, x: i32, status: &Status) {
+    if let Some(value) = desktop.tray_pop_volume_at(x) {
+        if value != crate::sound::volume() {
+            crate::sound::set_volume(value);
+            desktop.tray_pop_refresh();
+            desktop.repaint_panel(status);
+        }
+    }
+}
+
 /// Громкость до «выключить звук» — к ней возвращает второй щелчок.
 static LAST_VOLUME: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(100);
 
@@ -4031,11 +4063,10 @@ fn press_tray_pop(desktop: &mut Compositor, x: i32, y: i32, status: &Status) -> 
                 kprintln!("  desktop     : volume not saved: {err}");
             }
             kprintln!("  desktop     : volume {value}");
-            desktop.close_tray_pop();
-            if let Some(kind) = kind {
-                let item = if kind == traypop::Kind::Quick { TrayItem::Bell } else { TrayItem::Volume };
-                desktop.open_tray_pop(kind, item);
-            }
+            let _ = kind;
+            // Нажали на ползунке — дальше его тянут (см. [`drag_volume`]).
+            VOLUME_DRAG.store(matches!(action, traypop::Action::Volume(_)), Ordering::Relaxed);
+            desktop.tray_pop_refresh();
             desktop.repaint_panel(status);
             return true;
         }
@@ -4048,6 +4079,10 @@ fn press_tray_pop(desktop: &mut Compositor, x: i32, y: i32, status: &Status) -> 
             traypop::Action::LanguageSettings | traypop::Action::ClockSettings => open_settings(desktop, Section::Time, status),
             traypop::Action::NetworkSettings => open_settings(desktop, Section::Network, status),
             traypop::Action::Settings => open_settings(desktop, Section::Home, status),
+            traypop::Action::ClearNotes => {
+                toast::clear_notes();
+                kprintln!("  desktop     : notifications cleared");
+            }
             traypop::Action::Volume(_) | traypop::Action::Mute => {}
         }
         return true;

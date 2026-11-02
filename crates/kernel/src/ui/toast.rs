@@ -41,9 +41,56 @@ pub struct Toast {
     cross: Rect,
 }
 
+/// Уведомление в истории (колокол трея, 02.11): заголовок, текст и когда.
+#[derive(Clone)]
+pub struct Note {
+    pub title: alloc::string::String,
+    pub text: alloc::string::String,
+    pub at_ms: u64,
+}
+
+/// Сколько уведомлений помнить.
+const NOTES_MAX: usize = 20;
+
+/// История уведомлений — новые первыми.
+static NOTES: crate::sync::SpinLock<alloc::vec::Vec<Note>> = crate::sync::SpinLock::new(alloc::vec::Vec::new());
+
+/// Запомнить уведомление.
+pub fn remember(title: &str, text: &str) {
+    let mut notes = NOTES.lock();
+    if notes.try_reserve(1).is_err() {
+        return;
+    }
+    notes.insert(0, Note { title: alloc::string::String::from(title), text: alloc::string::String::from(text), at_ms: crate::time::uptime_ms() });
+    notes.truncate(NOTES_MAX);
+}
+
+/// Уведомления, новые первыми.
+#[must_use]
+pub fn notes() -> alloc::vec::Vec<Note> {
+    NOTES.lock().clone()
+}
+
+/// Забыть все («Очистить»).
+pub fn clear_notes() {
+    NOTES.lock().clear();
+}
+
+/// «сейчас», «5 мин назад», «2 ч назад».
+#[must_use]
+pub fn ago(at_ms: u64) -> alloc::string::String {
+    let minutes = crate::time::uptime_ms().saturating_sub(at_ms) / 60_000;
+    match minutes {
+        0 => alloc::string::String::from("сейчас"),
+        1..=59 => alloc::format!("{minutes} мин назад"),
+        _ => alloc::format!("{} ч назад", minutes / 60),
+    }
+}
+
 impl Toast {
     #[must_use]
     pub fn new(caption: &str, art: &Art, start: String, rights: fpk::Rights, screen_w: u32, panel_top: i32, scale: u32) -> Option<Self> {
+        remember(&alloc::format!("{caption} установлен"), "Пакеты · программа готова к запуску");
         let ctx = Ctx::scaled(scale);
         let p = ctx.palette;
         let px = |value: u32| value * scale;

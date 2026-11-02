@@ -42,6 +42,8 @@ pub enum Action {
     Mute,
     /// «Параметры» (шестерня быстрых настроек).
     Settings,
+    /// «Очистить» историю уведомлений.
+    ClearNotes,
 }
 
 /// Открытое окно трея.
@@ -89,7 +91,11 @@ impl TrayPop {
         let (w, h) = match kind {
             Kind::Layout => (px(180), px(PAD + 24 + 32 * 2 + 9 + 32 + 12)),
             Kind::Volume => (px(300), px(PAD + 28 + 8 + 36 + 22 + PAD)),
-            Kind::Quick => (px(360), px(PAD + 28 + 40 + 12 + 28 + 64 * 2 + 8 + 12 + 36 * 2 + 12 + 40 + 8)),
+            Kind::Quick => {
+                // Уведомлений — до трёх строк по 44, иначе одна «нет новых».
+                let notes = super::toast::notes().len().clamp(1, 3) as u32;
+                (px(360), px(PAD + 28 + notes * 44 + 12 + 28 + 64 * 2 + 8 + 12 + 36 * 2 + 12 + 40 + 8))
+            }
             Kind::Network => (px(320), px(PAD + 28 + 8 + 52 + 16 + 32 + PAD)),
             Kind::Calendar => (px(CELL * 7 + PAD * 2), px(PAD + 28 + 18 + 12 + 24 + CELL_H * 6 + 8 + 32 + 12)),
         };
@@ -120,6 +126,18 @@ impl TrayPop {
             }
         }
         self.rows.iter().find(|(rect, _)| rect.contains(x, y)).map(|(_, action)| *action)
+    }
+
+    /// Громкость под точкой `x` экрана — для ползунка, который тянут.
+    #[must_use]
+    pub fn volume_at(&self, x: i32) -> Option<u8> {
+        let track = self.slider?;
+        Some(((x - track.x).clamp(0, track.w as i32) * 100 / track.w.max(1) as i32) as u8)
+    }
+
+    /// Перерисовать с текущими значениями (громкость сменилась).
+    pub fn refresh(&mut self, scale: u32) {
+        self.redraw(scale);
     }
 
     fn redraw(&mut self, scale: u32) {
@@ -160,9 +178,30 @@ impl TrayPop {
                 let head = Rect::new(left, y, inner_w, px(28));
                 paint::text(ctx, s, Role::Title, left, paint::baseline(ctx, Role::Title, head), "Уведомления", p.ink);
                 y += px(28) as i32;
-                let empty = Rect::new(left, y, inner_w, px(40));
-                paint::text(ctx, s, Role::Body, left, paint::baseline(ctx, Role::Body, empty), "Нет новых уведомлений", p.ink4);
-                y += px(40 + 12) as i32;
+                let notes = super::toast::notes();
+                if notes.is_empty() {
+                    let empty = Rect::new(left, y, inner_w, px(44));
+                    paint::text(ctx, s, Role::Body, left, paint::baseline(ctx, Role::Body, empty), "Нет новых уведомлений", p.ink4);
+                    y += px(44) as i32;
+                } else {
+                    // «Очистить» — справа от заголовка.
+                    let label = "Очистить";
+                    let cw = ctx.face(Role::Caption).width(label) + px(12);
+                    let clear = Rect::new(bounds.right() - px(PAD) as i32 - cw as i32, px(PAD) as i32, cw, px(28));
+                    paint::text_right(ctx, s, Role::Caption, clear.right(), paint::baseline(ctx, Role::Caption, clear), label, p.acc_ink);
+                    rows.push((clear.translate(ox, oy), Action::ClearNotes));
+                    for note in notes.iter().take(3) {
+                        let row = Rect::new(left, y, inner_w, px(44));
+                        iconset::draw(s, Fi::Bell, left, row.y + px(4) as i32, px(16), p.ink3, 255);
+                        let tx = left + px(26) as i32;
+                        let room = (row.right() - tx).max(0) as u32;
+                        paint::text_clipped(ctx, s, Role::Body, tx, row.y + px(2) as i32, room.saturating_sub(px(80)), &note.title, p.ink);
+                        paint::text_right(ctx, s, Role::Caption, row.right(), row.y + px(4) as i32, &super::toast::ago(note.at_ms), p.ink4);
+                        paint::text_clipped(ctx, s, Role::Caption, tx, row.y + px(22) as i32, room, &note.text, p.ink3);
+                        y += px(44) as i32;
+                    }
+                }
+                y += px(12) as i32;
                 draw::hline(s, left, y - px(6) as i32, inner_w, p.line2.color, p.line2.alpha);
                 let head = Rect::new(left, y, inner_w, px(28));
                 paint::text(ctx, s, Role::Strong, left, paint::baseline(ctx, Role::Strong, head), "Быстрые настройки", p.ink2);

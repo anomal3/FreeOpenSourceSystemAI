@@ -411,6 +411,10 @@ impl Compositor {
     /// Добавить окно наверх и сделать активным.
     pub fn push(&mut self, window: Window) {
         let rect = window.rect;
+        // Диалог затемняет весь стол под собой (макет 18) — перерисовать всё.
+        if dims(window.app) {
+            self.repaint_all();
+        }
         self.windows.push(window);
         self.focus = self.windows.len() - 1;
         self.refresh_decorations();
@@ -1611,6 +1615,9 @@ impl Compositor {
         let Some(index) = self.index_of(app) else {
             return false;
         };
+        if dims(app) {
+            self.repaint_all();
+        }
         let window = self.windows.remove(index);
         self.invalidate_recent();
         // Окно ниже активного уехало из списка — номер активного съехал на одно.
@@ -1828,7 +1835,8 @@ impl Compositor {
         // измениться за полёт (терминал допечатал строку, программа
         // перерисовалась), собиралось из снимка; один полный кадр после
         // посадки возвращает экрану правду.
-        if self.scene.take().is_some() {
+        // Сел диалог, который затемняет стол, — затемнение по всему экрану.
+        if self.scene.take().is_some() || dims(flight.app) {
             self.mark(self.screen.bounds());
         }
         self.mark(flight.last);
@@ -2530,8 +2538,14 @@ impl Compositor {
     pub fn open_context(&mut self, x: i32, y: i32, items: &[Action]) {
         let screen = (self.screen.width(), self.screen.height());
         let bottom = self.work_bottom();
-        if let Some(menu) = self.context.as_mut() {
+        let rect = self.context.as_mut().map(|menu| {
             menu.open_at(x, y, screen, bottom, items);
+            menu.rect
+        });
+        // Вместе с тенью: метка самого меню — только его прямоугольник, и
+        // тень в первом кадре ложилась не везде (полоска под меню, 02.11).
+        if let Some(rect) = rect {
+            self.mark_layer(rect);
         }
     }
 
@@ -2691,6 +2705,25 @@ impl Compositor {
     #[must_use]
     pub fn tray_pop_hit(&self, x: i32, y: i32) -> Option<super::traypop::Action> {
         self.tray_pop.as_ref().and_then(|pop| pop.hit(x, y))
+    }
+
+    /// Громкость под `x` ползунка открытого окна трея.
+    #[must_use]
+    pub fn tray_pop_volume_at(&self, x: i32) -> Option<u8> {
+        self.tray_pop.as_ref().and_then(|pop| pop.volume_at(x))
+    }
+
+    /// Перерисовать открытое окно трея.
+    pub fn tray_pop_refresh(&mut self) {
+        let scale = self.scale;
+        let rect = match self.tray_pop.as_mut() {
+            Some(pop) => {
+                pop.refresh(scale);
+                pop.rect
+            }
+            None => return,
+        };
+        self.mark(rect);
     }
 
     #[must_use]
@@ -3277,6 +3310,10 @@ impl Compositor {
             // Углы всплывающего окна не скругляются: меню рисует свою рамку
             // прямоугольником, и срезанный угол вырезал бы её.
             let r = if window.popup { 0 } else { radius };
+            // Диалог поверх всего — под ним стол затемнён на 40 % (макет 18).
+            if dims(window.app) {
+                draw::blend_rect(back, Rect::new(band.x, band.y + dy, band.w, band.h), Color::rgb(0, 0, 0), 102);
+            }
             if !window.shaped {
                 self.drop_shadow(back, window.rect, band, dy, r);
             }
@@ -3972,4 +4009,9 @@ fn uncovered(from: Rect, to: Rect) -> impl Iterator<Item = Rect> {
         parts[3] = Rect::new(overlap.right(), overlap.y, gap(overlap.right(), from.right()), overlap.h);
     }
     parts.into_iter().filter(|part| !part.is_empty())
+}
+
+/// Затемняет ли окно стол под собой: диалоги, которые ждут ответа (макет 18).
+fn dims(app: App) -> bool {
+    matches!(app, App::OpenWith | App::Hung | App::Shutdown | App::Restart)
 }

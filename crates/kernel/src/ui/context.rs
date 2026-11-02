@@ -46,6 +46,7 @@ use alloc::vec::Vec;
 
 use mini_ui::draw;
 use mini_ui::glyphicon::{self, Icon};
+use mini_ui::iconset::{self, Fi};
 use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface};
 
@@ -439,6 +440,25 @@ impl Action {
             Action::PinTaskbar | Action::PinStart | Action::PinQuick => None,
             Action::Compress => Some(Icon::Package),
             Action::Cut | Action::Copy => None,
+        }
+    }
+
+    /// Значок из набора макета (02.11) — для пунктов, у которых в старом
+    /// наборе своего нет. Есть — рисуется вместо [`Action::icon`].
+    const fn line_icon(self) -> Option<Fi> {
+        match self {
+            Action::Cut => Some(Fi::Cut),
+            Action::Copy => Some(Fi::Copy),
+            Action::Rename => Some(Fi::Rename),
+            Action::Delete | Action::EmptyTrash | Action::DeleteShortcut => Some(Fi::Trash),
+            Action::PinTaskbar | Action::PinStart | Action::PinQuick => Some(Fi::Pin),
+            Action::Submenu(Sub::Sort) => Some(Fi::Sort),
+            Action::Compress => Some(Fi::Compress),
+            Action::RunAsAdmin => Some(Fi::ShieldAdmin),
+            Action::OpenInTerminal => Some(Fi::OpenTerminal),
+            Action::Personalize => Some(Fi::Palette),
+            Action::Refresh => Some(Fi::Refresh),
+            _ => None,
         }
     }
 
@@ -1261,7 +1281,9 @@ fn draw_row(ctx: Ctx, s: &mut Surface, slot: &Slot, label: &str, selected: bool,
     let pad_l = ctx.px(ROW_PAD_L);
     let pad_r = ctx.px(ROW_PAD_R);
     let icon = ctx.px(ICON);
-    if let Some(glyph) = slot.action.icon() {
+    if let Some(line) = slot.action.line_icon() {
+        iconset::draw(s, line, slot.rect.x + pad_l as i32, slot.rect.y + (slot.rect.h as i32 - icon as i32) / 2, icon, ink, 255);
+    } else if let Some(glyph) = slot.action.icon() {
         glyphicon::draw(s, glyph, slot.rect.x + pad_l as i32, slot.rect.y + (slot.rect.h as i32 - icon as i32) / 2, icon, ink, 255);
     }
     // Справа: сочетание или стрелка подменю.

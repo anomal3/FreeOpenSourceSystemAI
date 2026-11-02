@@ -1999,6 +1999,8 @@ impl Files {
         // «второй по той же строке не позже [`DOUBLE_CLICK_MS`]».
         let now = monotonic_ms();
         let double = matches!(self.last_click, Some((last, at)) if last == index && now.saturating_sub(at) <= DOUBLE_CLICK_MS);
+        // Простой щелчок снимает отметки — как в Проводнике.
+        self.picked.clear();
         self.selected = index;
         if double {
             self.last_click = None;
@@ -4055,6 +4057,35 @@ impl App for Files {
     }
 
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        self.on_click(area, ctx, x, y)
+    }
+
+    /// Ctrl+щелчок — отметить строку или снять отметку; Shift+щелчок —
+    /// отметить всё от выбранной до этой (как в Проводнике).
+    fn click_with(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32, mods: i32) -> bool {
+        let idle = self.menu.is_none() && self.pop.is_none() && self.job.is_none() && self.props.is_none() && self.preview.is_none();
+        if mods & (WIN_MOD_CTRL | WIN_MOD_SHIFT) != 0 && idle && !self.on_computer() {
+            let plan = layout(ctx, area);
+            if plan.list.contains(x, y) {
+                if let Some(index) = self.row_at(&plan, ctx, x, y) {
+                    if mods & WIN_MOD_SHIFT != 0 {
+                        let (from, to) = (self.selected.min(index), self.selected.max(index));
+                        self.picked.extend(from..=to);
+                    } else {
+                        if self.picked.is_empty() && self.selected != index {
+                            self.picked.insert(self.selected);
+                        }
+                        if !self.picked.remove(&index) {
+                            self.picked.insert(index);
+                        }
+                    }
+                    self.selected = index;
+                    self.last_click = None;
+                    println(&format!("files: {} item(s) marked", self.picked.len()));
+                    return true;
+                }
+            }
+        }
         self.on_click(area, ctx, x, y)
     }
 

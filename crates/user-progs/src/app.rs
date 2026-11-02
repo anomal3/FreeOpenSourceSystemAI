@@ -94,6 +94,12 @@ pub trait App {
         false
     }
 
+    /// Щелчок левой кнопкой с модификаторами (`WIN_MOD_*`): Ctrl+щелчок,
+    /// Shift+щелчок. По умолчанию — [`App::click`].
+    fn click_with(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32, _mods: i32) -> bool {
+        self.click(area, ctx, x, y)
+    }
+
     /// Щелчок правой кнопкой.
     fn click_right(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
         false
@@ -217,6 +223,8 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
     let mut next = monotonic_ms() + spec.period_ms;
     let mut dirty = true;
     let mut frames = 0u64;
+    // Модификаторы последнего нажатия кнопки мыши (`WIN_MODS` перед ним).
+    let mut pointer_mods = 0i32;
     let reason;
 
     'live: loop {
@@ -233,8 +241,15 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                     break 'live;
                 }
                 WIN_KEY => app.key_with(event.code, event.x, event.y.max(0) as u32),
-                WIN_POINTER if event.code == RIGHT_BUTTON => app.click_right(area, ctx, event.x, event.y),
-                WIN_POINTER => app.click(area, ctx, event.x, event.y),
+                WIN_POINTER if event.code == RIGHT_BUTTON => {
+                    pointer_mods = 0;
+                    app.click_right(area, ctx, event.x, event.y)
+                }
+                user_abi::WIN_MODS => {
+                    pointer_mods = event.code as i32;
+                    false
+                }
+                WIN_POINTER => app.click_with(area, ctx, event.x, event.y, core::mem::take(&mut pointer_mods)),
                 WIN_WHEEL => app.wheel(event.x),
                 // Новый размер от стола: поверхность выдаётся заново, прежние
                 // пиксели после ответа недействительны.
