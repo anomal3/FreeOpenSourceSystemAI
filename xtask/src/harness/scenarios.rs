@@ -12016,6 +12016,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("files: properties of 'ask'", 15_000),
             Step::Wait(1_000),
             Step::Shot("08-properties"),
+            // Вкладка «Подробно» (макет 14): владелец, группа, права.
+            Step::Key("right"),
+            Step::Wait(800),
+            Step::Shot("09-properties-details"),
             Step::Key("esc"),
             Step::Key("alt-f4"),
             Step::Await("files: closing on request", 15_000),

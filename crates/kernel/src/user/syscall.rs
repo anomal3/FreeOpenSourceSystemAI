@@ -2043,9 +2043,13 @@ fn mounts(ptr: usize, len: usize) -> i64 {
     // доступны ей на запись; ядро и программа не исполняются одновременно.
     let out = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
     let mut written = 0usize;
-    for (point, kind) in crate::fs::mounted() {
+    // Место — третьим и четвёртым полем (02.11), `-` — том о нём не знает.
+    for (point, kind, space) in crate::fs::mounted_space() {
         let point = if point.is_empty() { "/" } else { point };
-        let line = alloc::format!("{point}\t{kind}\n");
+        let line = match space {
+            Some((total, free)) => alloc::format!("{point}\t{kind}\t{total}\t{free}\n"),
+            None => alloc::format!("{point}\t{kind}\t-\t-\n"),
+        };
         let bytes = line.as_bytes();
         if written + bytes.len() > len {
             break;

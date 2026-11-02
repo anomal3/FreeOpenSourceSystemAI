@@ -223,6 +223,15 @@ pub fn mounted() -> Vec<(&'static str, &'static str)> {
     out
 }
 
+/// Точки монтирования с файловой системой и местом (всего, свободно; `None` —
+/// том о месте не знает): для «Этого компьютера» в «Файлах» (`SYS_MOUNTS`).
+pub fn mounted_space() -> Vec<(&'static str, &'static str, Option<(u64, u64)>)> {
+    // Спрашивать тома — после замка таблицы, как у [`space`].
+    let volumes: Vec<(&'static str, Arc<dyn FileSystem>)> =
+        MOUNTS.lock().iter().rev().map(|mount| (mount.prefix, Arc::clone(&mount.fs))).collect();
+    volumes.into_iter().map(|(prefix, fs)| (prefix, fs.name(), fs.space())).collect()
+}
+
 /// Место на томах, куда пишут: первая точка монтирования тома, всего и
 /// свободно (фаза 69b, «Параметры» → «Хранилище»).
 ///

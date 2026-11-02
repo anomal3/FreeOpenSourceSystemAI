@@ -148,6 +148,8 @@ struct Row {
     /// записи каталога пусто. Одна структура на обе страницы: выделение,
     /// клавиши и оба вида списка тогда работают одинаково.
     volume: String,
+    /// У тома — свободно, байт (`size` — всего); ноль у `size` — неизвестно.
+    free: u64,
 }
 
 impl Row {
@@ -163,11 +165,12 @@ impl Row {
             size: entry.size,
             mtime: entry.mtime,
             volume: String::new(),
+            free: 0,
         }
     }
 
-    /// Том: имя — точка монтирования.
-    fn volume(point: &str, kind: &str) -> Self {
+    /// Том: имя — точка монтирования; место — всего и свободно (ноль — неизвестно).
+    fn volume(point: &str, kind: &str, total: u64, free: u64) -> Self {
         Self {
             name: point.to_string(),
             directory: true,
@@ -175,9 +178,10 @@ impl Row {
             mode: 0,
             uid: 0,
             gid: 0,
-            size: 0,
+            size: total,
             mtime: 0,
             volume: kind.to_string(),
+            free,
         }
     }
 
@@ -452,8 +456,13 @@ struct Menu {
 /// Свойства записи — карточка на месте списка, как просмотр файла.
 struct Props {
     name: String,
-    path: String,
     rows: Vec<(&'static str, String)>,
+    /// Вкладка «Подробно» (макет 14): владелец, группа, права.
+    details: Vec<(&'static str, String)>,
+    /// Права для таблицы «Владелец / Группа / Остальные»; `None` — нет вкладки.
+    mode: Option<u32>,
+    /// Открытая вкладка: 0 — «Общие», 1 — «Подробно».
+    tab: u8,
 }
 
 /// Состояние менеджера.
@@ -1010,9 +1019,16 @@ impl Files {
             return self.key_preview(code);
         }
         if self.props.is_some() {
-            if matches!(code, ESCAPE | BACKSPACE | WIN_KEY_LEFT) {
+            if matches!(code, ESCAPE | BACKSPACE | ENTER) {
                 self.props = None;
                 return true;
+            }
+            // Вкладки — Tab и стрелками.
+            if let Some(props) = self.props.as_mut().filter(|props| props.mode.is_some()) {
+                if matches!(code, 0x09 | WIN_KEY_LEFT | WIN_KEY_RIGHT) {
+                    props.tab = 1 - props.tab.min(1);
+                    return true;
+                }
             }
             return false;
         }
@@ -1662,17 +1678,34 @@ impl Files {
             } else {
                 "Файл"
             };
-            rows.push(("Тип", String::from(kind)));
-            rows.push(("Расположение", self.path.clone()));
-            rows.push(("Путь в стиле Windows", sysconf::winpath::to_windows(&path)));
+            // Тип по реестру (как в Проводнике): «Текстовый документ (.txt)».
+            let ext = sysconf::filetypes::extension(&row.name);
+            let type_name = file_kind(&row.name, row.directory).1;
+            let shown_kind = if row.directory || ext.is_empty() { String::from(if kind == "Папка" { type_name } else { kind }) } else { format!("{type_name} (.{ext})") };
+            rows.push(("Тип файла", shown_kind));
             if !row.directory {
-                rows.push(("Размер", format!("{} байт", row.size)));
+                if let Some(program) = opens_with(&row.name) {
+                    rows.push(("Открывается в", program));
+                }
             }
-            rows.push(("Права", format!("{:04o}", row.mode & 0o7777)));
-            rows.push(("Владелец", format!("uid {} · gid {}", row.uid, row.gid)));
+            rows.push(("Расположение", self.path.clone()));
+            if !row.directory {
+                rows.push(("Размер", format!("{} ({} байт)", human_size(row.size), group_digits(row.size))));
+            }
+            if row.mtime != 0 {
+                rows.push(("Изменён", long_date(row.mtime, self.offset)));
+            }
+            rows.push(("Путь в стиле Windows", sysconf::winpath::to_windows(&path)));
+        }
+        let mut details = Vec::new();
+        let mode = (!row.is_volume()).then_some(row.mode);
+        if !row.is_volume() {
+            details.push(("Владелец", user_name(row.uid)));
+            details.push(("Группа", group_name(row.gid)));
+            details.push(("Права", format!("{}  ({:04o})", rwx(row.mode, row.directory), row.mode & 0o7777)));
         }
         println(&format!("files: properties of '{}'", row.name));
-        self.props = Some(Props { name: row.name.clone(), path, rows });
+        self.props = Some(Props { name: row.name.clone(), rows, details, mode, tab: 0 });
     }
 
     /// Свойства самого каталога.
@@ -1703,7 +1736,7 @@ impl Files {
             self.path.clone()
         };
         println(&format!("files: properties of '{name}'"));
-        self.props = Some(Props { name, path: self.path.clone(), rows });
+        self.props = Some(Props { name, rows, details: Vec::new(), mode: None, tab: 0 });
     }
 
     /// Перейти в каталог, запомнив, откуда пришли.
@@ -1924,9 +1957,33 @@ impl Files {
             }
         }
 
+        // Окно свойств: вкладки и «ОК»; мимо карточки — закрыть.
+        if self.props.is_some() && self.preview.is_none() {
+            let (card, tabs, ok) = Self::props_plan(ctx, &plan);
+            if ok.contains(x, y) || !card.contains(x, y) {
+                self.props = None;
+                return true;
+            }
+            if let (Some(index), Some(props)) = (tabs.iter().position(|tab| tab.contains(x, y)), self.props.as_mut()) {
+                if index == 0 || props.mode.is_some() {
+                    props.tab = index as u8;
+                    return true;
+                }
+            }
+            return false;
+        }
+        // «Этот компьютер»: плитка папки — сразу в неё.
+        if self.on_computer() && self.preview.is_none() && self.props.is_none() {
+            let (folders, _, _, _) = self.computer_layout(ctx, &plan);
+            if let Some((path, _)) = folders.into_iter().find(|(_, cell)| cell.contains(x, y)) {
+                self.go_to(path);
+                return true;
+            }
+        }
         // В просмотре и в свойствах списка нет, и щёлкать в нём не по чему:
         // «попал в невидимую строку» — это выбор вслепую.
-        if self.preview.is_some() || self.props.is_some() || !plan.list.contains(x, y) {
+        let body = if self.on_computer() { plan.list.union(&plan.header) } else { plan.list };
+        if self.preview.is_some() || self.props.is_some() || !body.contains(x, y) {
             return false;
         }
         let Some(index) = self.row_at(&plan, ctx, x, y) else {
@@ -1971,6 +2028,10 @@ impl Files {
 
     /// Строка списка под точкой — в таблице или в плитке.
     fn row_at(&self, plan: &Plan, ctx: Ctx, x: i32, y: i32) -> Option<usize> {
+        if self.on_computer() {
+            let (_, cards, _, _) = self.computer_layout(ctx, plan);
+            return cards.iter().position(|card| card.contains(x, y));
+        }
         if self.tiles {
             let grid = plan.grid(ctx);
             if grid.cols == 0 || grid.rows == 0 {
@@ -2074,17 +2135,115 @@ impl Files {
         }
         if let Some(preview) = self.preview.as_ref() {
             self.draw_preview(surface, ctx, &plan, preview);
-        } else if let Some(props) = self.props.as_ref() {
-            self.draw_props(surface, ctx, &plan, props);
+        } else if self.on_computer() && self.error.is_none() {
+            self.draw_computer(surface, ctx, &plan);
         } else if self.tiles {
             self.draw_tiles(surface, ctx, &plan);
         } else {
             self.draw_list(surface, ctx, &plan);
         }
+        // Свойства — окном поверх списка (макет 14).
+        if let (None, Some(props)) = (self.preview.as_ref(), self.props.as_ref()) {
+            self.draw_props(surface, ctx, &plan, props);
+        }
         self.draw_status(surface, ctx, &plan);
         self.draw_menu(surface, ctx, area);
         self.draw_pop(surface, ctx, area, &plan);
         self.draw_job(surface, ctx, &plan);
+    }
+
+    /// «Этот компьютер» (макет 14): плитки папок дома и карточки дисков.
+    fn computer_layout(&self, ctx: Ctx, plan: &Plan) -> (Vec<(String, Rect)>, Vec<Rect>, i32, i32) {
+        let area = plan.list.union(&plan.header);
+        let pad = ctx.px(16) as i32;
+        let mut y = area.y + pad;
+        let folders_head = y;
+        y += ctx.px(24) as i32;
+        let mut folders = Vec::new();
+        let (cell_w, cell_h) = (ctx.px(112), ctx.px(104));
+        let mut x = area.x + pad;
+        for name in ["Desktop", "Downloads", "Documents", "Pictures", "Music", "Videos"] {
+            let path = format!("{}/{name}", self.home);
+            if !exists(&path) {
+                continue;
+            }
+            if x + cell_w as i32 > area.right() - pad {
+                x = area.x + pad;
+                y += cell_h as i32;
+            }
+            folders.push((path, Rect::new(x, y, cell_w, cell_h)));
+            x += cell_w as i32 + ctx.px(4) as i32;
+        }
+        if !folders.is_empty() {
+            y += cell_h as i32 + ctx.px(12) as i32;
+        }
+        let disks_head = y;
+        y += ctx.px(28) as i32;
+        // Сетка карточек: не уже 300, сколько поместится в ряд.
+        let room = (area.w as i32 - pad * 2).max(0) as u32;
+        let gap = ctx.px(12);
+        let per_row = ((room + gap) / (ctx.px(300) + gap)).max(1);
+        let card_w = (room.saturating_sub(gap * (per_row - 1))) / per_row;
+        let card_h = ctx.px(84);
+        let mut cards = Vec::new();
+        for index in 0..self.rows.len() {
+            let column = index as u32 % per_row;
+            let line = index as u32 / per_row;
+            cards.push(Rect::new(area.x + pad + (column * (card_w + gap)) as i32, y + (line * (card_h + gap)) as i32, card_w, card_h));
+        }
+        (folders, cards, folders_head, disks_head)
+    }
+
+    fn draw_computer(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
+        let p = ctx.palette;
+        let area = plan.list.union(&plan.header);
+        let (folders, cards, folders_head, disks_head) = self.computer_layout(ctx, plan);
+        let x = area.x + ctx.px(16) as i32;
+        if !folders.is_empty() {
+            paint::text(ctx, s, Role::Strong, x, folders_head, "Папки", p.ink2);
+        }
+        for (path, cell) in &folders {
+            let side = ctx.px(48);
+            let icon = Rect::new(cell.x + (cell.w as i32 - side as i32) / 2, cell.y + ctx.px(8) as i32, side, side);
+            draw_design_icon(&self.icons, s, icon, place_icon(path, &self.home));
+            let label = place_title(path, &self.home);
+            let w = ctx.face(Role::Body).width(label).min(cell.w) as i32;
+            paint::text_clipped(ctx, s, Role::Body, cell.x + (cell.w as i32 - w) / 2, icon.bottom() + ctx.px(8) as i32, cell.w, label, p.ink2);
+        }
+        paint::text(ctx, s, Role::Strong, x, disks_head, "Устройства и диски", p.ink2);
+        for (index, (row, card)) in self.rows.iter().zip(&cards).enumerate() {
+            if card.y >= area.bottom() {
+                break;
+            }
+            let state = if index == self.selected { RowState::Selected } else { RowState::Idle };
+            draw::rounded(s, *card, ctx.px(8), ctx.flat(p.btn), 255);
+            paint::row(ctx, s, *card, state);
+            let side = ctx.px(48);
+            let icon = Rect::new(card.x + ctx.px(14) as i32, card.y + (card.h as i32 - side as i32) / 2, side, side);
+            let art = if row.name == "/" { "place-system-disk" } else if row.name.starts_with("/usb") { "place-usb-stick" } else { "place-local-disk" };
+            draw_design_icon(&self.icons, s, icon, art);
+            let tx = icon.right() + ctx.px(14) as i32;
+            let room = (card.right() - tx - ctx.px(14) as i32).max(0) as u32;
+            let mut ty = card.y + ctx.px(14) as i32;
+            paint::text_clipped(ctx, s, Role::Body, tx, ty, room, &volume_title(&row.name), p.ink);
+            ty += ctx.px(24) as i32;
+            if row.size > 0 {
+                let used = row.size.saturating_sub(row.free);
+                let percent = (used * 100 / row.size.max(1)).min(100);
+                let bar = Rect::new(tx, ty, room, ctx.px(8));
+                draw::rounded(s, bar, ctx.px(4), p.line.color, p.line.alpha);
+                let fill = (u64::from(bar.w) * percent / 100) as u32;
+                if fill > 0 {
+                    // Почти полный диск — красным (макет: больше 85 %).
+                    draw::rounded(s, Rect::new(bar.x, bar.y, fill, bar.h), ctx.px(4), if percent > 85 { p.bad } else { p.acc }, 255);
+                }
+                ty += ctx.px(14) as i32;
+                let facts = format!("{} свободно из {}", human_size(row.free), human_size(row.size));
+                paint::text_clipped(ctx, s, Role::Caption, tx, ty, room, &facts, p.ink3);
+            } else {
+                paint::text_clipped(ctx, s, Role::Caption, tx, ty, room, &format!("{} · место не считается", row.volume), p.ink4);
+            }
+        }
     }
 
     /// Выпавшее меню «Сортировка» / «Вид»: где и какие пункты.
@@ -2138,7 +2297,7 @@ impl Files {
         paint::text_clipped(inner, s, Role::Body, x, y, room, &what, p.ink2);
         y += ctx.px(28) as i32;
         let bar = Rect::new(x, y, room, ctx.px(10));
-        draw::rounded(s, bar, ctx.px(5), p.line.color, 255);
+        draw::rounded(s, bar, ctx.px(5), p.line.color, p.line.alpha);
         let fill = (u64::from(bar.w) * percent.min(100) / 100) as u32;
         if fill > 0 {
             draw::rounded(s, Rect::new(bar.x, bar.y, fill, bar.h), ctx.px(5), p.acc, 255);
@@ -2158,50 +2317,105 @@ impl Files {
         paint::button(inner, s, cancel, Weight::Normal, "Отмена", false);
     }
 
-    /// Карточка свойств на месте списка.
+    /// Окно свойств (макет 14): где карточка, вкладки и кнопка «ОК».
+    fn props_plan(ctx: Ctx, plan: &Plan) -> (Rect, [Rect; 2], Rect) {
+        let area = plan.list.union(&plan.header);
+        let w = ctx.px(440).min(area.w.saturating_sub(ctx.px(24)));
+        let h = ctx.px(500).min(area.h.saturating_sub(ctx.px(16)));
+        let card = Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 2, w, h);
+        let pad = ctx.px(20) as i32;
+        let tab_y = card.y + ctx.px(52) as i32;
+        let face = ctx.face(Role::Body);
+        let general = Rect::new(card.x + pad, tab_y, face.width("Общие") + ctx.px(24), ctx.px(32));
+        let details = Rect::new(general.right() + ctx.px(4) as i32, tab_y, face.width("Подробно") + ctx.px(24), ctx.px(32));
+        let ok = Rect::new(card.right() - pad - ctx.px(110) as i32, card.bottom() - pad - ctx.px(32) as i32, ctx.px(110), ctx.px(32));
+        (card, [general, details], ok)
+    }
+
     fn draw_props(&self, s: &mut Surface, ctx: Ctx, plan: &Plan, props: &Props) {
         let p = ctx.palette;
         let area = plan.list.union(&plan.header);
         if area.is_empty() {
             return;
         }
-        let pad = ctx.px(20);
-        let card = Rect::new(
-            area.x + pad as i32,
-            area.y + pad as i32,
-            area.w.saturating_sub(pad * 2).min(ctx.px(560)),
-            area.h.saturating_sub(pad * 2),
-        );
-        paint::card(ctx, s, card);
-        let inner = ctx.px(18);
-        let mut y = card.y + inner as i32;
-        let x = card.x + inner as i32;
-        let room = card.w.saturating_sub(inner * 2);
-        paint::text_clipped(ctx, s, Role::Title, x, y, room, &props.name, p.ink);
-        y += i32::from(ctx.face(Role::Title).line) + ctx.px(4) as i32;
-        paint::text_clipped(ctx, s, Role::Mono, x, y, room, &props.path, p.ink4);
-        y += i32::from(ctx.face(Role::Mono).line) + ctx.px(12) as i32;
-        paint::separator(ctx, s, x, y, room);
-        y += ctx.px(12) as i32;
-        let label_w = ctx.px(190);
-        let step = i32::from(ctx.face(Role::Body).line) + ctx.px(10) as i32;
-        for (label, value) in &props.rows {
-            if y + step > card.bottom() - inner as i32 {
-                break;
+        let (card, tabs, ok) = Self::props_plan(ctx, plan);
+        let inner = kit::card(ctx, s, card);
+        let pad = ctx.px(20) as i32;
+        let x = card.x + pad;
+        let room = card.w.saturating_sub(ctx.px(40));
+        paint::text_clipped(inner, s, Role::Title, x, card.y + pad, room, &format!("Свойства: {}", props.name), p.ink);
+        // Вкладки — с подчёркиванием акцентом у открытой.
+        let with_details = props.mode.is_some();
+        for (index, (rect, label)) in tabs.iter().zip(["Общие", "Подробно"]).enumerate() {
+            if index == 1 && !with_details {
+                continue;
             }
-            paint::text_clipped(ctx, s, Role::Caption, x, y, label_w, label, p.ink4);
-            paint::text_clipped(
-                ctx,
-                s,
-                Role::Body,
-                x + label_w as i32,
-                y,
-                room.saturating_sub(label_w),
-                value,
-                p.ink2,
-            );
+            let active = props.tab as usize == index;
+            paint::text(inner, s, Role::Body, rect.x + ctx.px(12) as i32, paint::baseline(inner, Role::Body, *rect), label, if active { p.ink } else { p.ink3 });
+            if active {
+                s.fill(Rect::new(rect.x + ctx.px(8) as i32, rect.bottom() - ctx.px(2) as i32, rect.w - ctx.px(16), ctx.px(2)), p.acc);
+            }
+        }
+        draw::hline(s, card.x + pad, tabs[0].bottom(), room, p.line.color, p.line.alpha);
+        let mut y = tabs[0].bottom() + ctx.px(16) as i32;
+        let label_w = ctx.px(112);
+        // Шаг строк — по месту: в низком окне строки плотнее, а не вылезают.
+        let free = (ok.y - y) as u32;
+        let wanted = if props.tab == 0 { props.rows.len() as u32 + 2 } else { props.details.len() as u32 + 6 };
+        let line = u32::from(ctx.face(Role::Body).line);
+        let step = (free / wanted.max(1)).clamp(line + ctx.px(2), line + ctx.px(12)) as i32;
+        let lines = if props.tab == 0 { &props.rows } else { &props.details };
+        if props.tab == 0 {
+            // Шапка: значок и имя.
+            let side = ctx.px(32);
+            let icon = Rect::new(x, y, side, side);
+            let kind = props.rows.iter().find(|(label, _)| *label == "Тип файла").map(|(_, value)| value.as_str()).unwrap_or("");
+            let art = file_kind(&props.name, kind.starts_with("Папка")).0;
+            draw_design_icon(&self.icons, s, icon, art);
+            paint::text_clipped(inner, s, Role::Strong, icon.right() + ctx.px(12) as i32, y + ctx.px(6) as i32, room - side - ctx.px(12), &props.name, p.ink);
+            y += side as i32 + ctx.px(16) as i32;
+        } else {
+            paint::text(inner, s, Role::Strong, x, y, "Владелец и права доступа", p.ink2);
             y += step;
         }
+        for (label, value) in lines {
+            if y + step > ok.y - ctx.px(8) as i32 {
+                break;
+            }
+            paint::text_clipped(inner, s, Role::Caption, x, y + ctx.px(2) as i32, label_w, label, p.ink4);
+            paint::text_clipped(inner, s, Role::Body, x + label_w as i32, y, room.saturating_sub(label_w), value, p.ink2);
+            y += step;
+        }
+        // Таблица прав: строки — кто, столбцы — что можно.
+        if let (1, Some(mode)) = (props.tab, props.mode) {
+            y += ctx.px(6) as i32;
+            let col_w = ctx.px(80) as i32;
+            for (index, head) in ["Чтение", "Запись", "Запуск"].iter().enumerate() {
+                paint::text(inner, s, Role::Caption, x + label_w as i32 + index as i32 * col_w, y, head, p.ink4);
+            }
+            y += step;
+            for (row, who) in ["Владелец", "Группа", "Остальные"].iter().enumerate() {
+                if y + step > ok.y {
+                    break;
+                }
+                paint::text(inner, s, Role::Body, x, y, who, p.ink2);
+                for column in 0..3 {
+                    let bit = 1u32 << (8 - (row * 3 + column));
+                    let bx = Rect::new(x + label_w as i32 + column as i32 * col_w, y + ctx.px(2) as i32, ctx.px(14), ctx.px(14));
+                    if mode & bit != 0 {
+                        draw::rounded(s, bx, ctx.px(3), p.acc, 255);
+                        glyphicon::draw(s, Icon::Check, bx.x, bx.y, bx.w, p.acc_ink, 255);
+                    } else {
+                        draw::rounded_stroke(s, bx, ctx.px(3), p.ink4, 255);
+                    }
+                }
+                y += step;
+            }
+            if y + step <= ok.y {
+                paint::text_clipped(inner, s, Role::Caption, x, y, (ok.x - x - ctx.px(8) as i32).max(0) as u32, "Этот раздел нужен тем, кто знает, зачем он нужен.", p.ink4);
+            }
+        }
+        paint::button(inner, s, ok, Weight::Primary, "ОК", false);
     }
 
     /// Плитки: значок и подпись, как значки на столе.
@@ -3218,8 +3432,13 @@ fn list_volumes() -> Vec<Row> {
     let text = core::str::from_utf8(&buffer[..(got as usize).min(buffer.len())]).unwrap_or("");
     text.lines()
         .filter_map(|line| {
-            let (point, kind) = line.split_once('\t')?;
-            Some(Row::volume(point, kind))
+            // `<точка>\t<ФС>[\t<всего>\t<свободно>]` (место — с 02.11).
+            let mut fields = line.split('\t');
+            let point = fields.next()?;
+            let kind = fields.next()?;
+            let total = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+            let free = fields.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+            Some(Row::volume(point, kind, total, free))
         })
         .collect()
 }
@@ -3287,6 +3506,77 @@ fn place_slots(ctx: Ctx, side: Rect, home: &str) -> Vec<PlaceSlot> {
 // ---------------------------------------------------------------------------
 // Файловая система
 // ---------------------------------------------------------------------------
+
+/// Программа, которой откроется файл: выбор человека (`open_with=` в
+/// `/etc/desktop.cfg`, «Всегда открывать этой программой»), иначе Блокнот для
+/// текста.
+fn opens_with(name: &str) -> Option<String> {
+    if let Some(command) = chosen_program(name) {
+        let program = command.split_whitespace().last().unwrap_or(&command);
+        return Some(match program.rsplit('/').next().unwrap_or(program) {
+            "notepad" => String::from("Блокнот"),
+            other => other.to_string(),
+        });
+    }
+    is_text(name).then(|| String::from("Блокнот"))
+}
+
+/// Число с пробелами между разрядами: «2 048».
+fn group_digits(value: u64) -> String {
+    let digits = format!("{value}");
+    let mut out = String::new();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// «23 октября 2026 г., 22:47».
+fn long_date(mtime: u32, offset: i32) -> String {
+    const MONTHS: [&str; 12] = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"];
+    let local = calendar::DateTime::from_unix(i64::from(mtime) + i64::from(offset) * 60);
+    let month = MONTHS.get(usize::from(local.month).saturating_sub(1)).copied().unwrap_or("");
+    format!("{} {month} {} г., {:02}:{:02}", local.day, local.year, local.hour, local.minute)
+}
+
+/// Имя по номеру из `/etc/passwd` (`/etc/group` для групп).
+fn name_of_id(file: &str, id: u32) -> String {
+    if id == 0 {
+        return String::from("root");
+    }
+    let text = read_small_limit(file, 64 * 1024).unwrap_or_default();
+    text.lines()
+        .find_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next()?;
+            let number: u32 = fields.nth(1)?.parse().ok()?;
+            (number == id).then(|| name.to_string())
+        })
+        .unwrap_or_else(|| format!("{id}"))
+}
+
+fn user_name(uid: u32) -> String {
+    name_of_id("/etc/passwd", uid)
+}
+
+fn group_name(gid: u32) -> String {
+    name_of_id("/etc/group", gid)
+}
+
+/// Права строкой, как у `ls -l`: «-rw-r--r--».
+fn rwx(mode: u32, directory: bool) -> String {
+    let mut out = String::from(if directory { "d" } else { "-" });
+    for shift in [6u32, 3, 0] {
+        let bits = (mode >> shift) & 7;
+        out.push(if bits & 4 != 0 { 'r' } else { '-' });
+        out.push(if bits & 2 != 0 { 'w' } else { '-' });
+        out.push(if bits & 1 != 0 { 'x' } else { '-' });
+    }
+    out
+}
 
 /// Свободное имя в папке для копии: «Отчёт.txt», иначе «Отчёт — копия.txt»,
 /// «Отчёт — копия (2).txt».
