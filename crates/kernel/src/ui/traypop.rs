@@ -1,8 +1,9 @@
-//! Всплывающие окна трея (фаза 72h-1, макет 05): раскладка, сеть, календарь.
+//! Всплывающие окна трея (фаза 72h-1, макет 05): раскладка, звук, сеть,
+//! календарь, быстрые настройки с уведомлениями (колокол, 02.11).
 //!
-//! Только то, что в системе есть. Звука без микшера и быстрых настроек
-//! (Wi-Fi, Bluetooth, «Не беспокоить») в макете больше, чем у машины, — их
-//! окон нет, пока за ними ничего не стоит.
+//! Чего у машины нет (Wi-Fi, Bluetooth, ночной свет, «В самолёте», яркость,
+//! батарея), стоит серым: правило дома — нереализованное показывать, а не
+//! прятать. Громкость — настоящая: отсчёты масштабирует `sound::feed`.
 //!
 //! Размеры из таблицы макета: скругление 8, поле 16, до панели 12; ячейка
 //! календаря 34, сегодня — круг акцента.
@@ -11,6 +12,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use mini_ui::glyphicon::{self, Icon};
+use mini_ui::iconset::{self, Fi};
 use mini_ui::paint::{self, Ctx};
 use mini_ui::typeface::Role;
 use mini_ui::{Color, Rect, Surface, draw, theme};
@@ -23,6 +25,8 @@ pub enum Kind {
     Layout,
     Network,
     Calendar,
+    Volume,
+    Quick,
 }
 
 /// Что делает строка окна.
@@ -32,6 +36,12 @@ pub enum Action {
     LanguageSettings,
     NetworkSettings,
     ClockSettings,
+    /// Громкость (0..=100) — щелчком по ползунку.
+    Volume(u8),
+    /// Выключить звук или вернуть прежний.
+    Mute,
+    /// «Параметры» (шестерня быстрых настроек).
+    Settings,
 }
 
 /// Открытое окно трея.
@@ -41,11 +51,13 @@ pub struct TrayPop {
     surface: Surface,
     /// Строки и кнопки в координатах экрана.
     rows: Vec<(Rect, Action)>,
+    /// Дорожка ползунка громкости в координатах экрана: щелчок — значение по x.
+    slider: Option<Rect>,
 }
 
 const PAD: u32 = 16;
-/// Ячейка календаря.
-const CELL: u32 = 40;
+/// Ячейка календаря (ширина 340 по макету).
+const CELL: u32 = 44;
 const CELL_H: u32 = 34;
 
 const MONTHS: [&str; 12] = [
@@ -75,7 +87,9 @@ impl TrayPop {
         let ctx = Ctx::scaled(scale);
         let px = |value: u32| value * scale;
         let (w, h) = match kind {
-            Kind::Layout => (px(220), px(PAD + 24 + 32 * 2 + 9 + 32 + 12)),
+            Kind::Layout => (px(180), px(PAD + 24 + 32 * 2 + 9 + 32 + 12)),
+            Kind::Volume => (px(300), px(PAD + 28 + 8 + 36 + 22 + PAD)),
+            Kind::Quick => (px(360), px(PAD + 28 + 40 + 12 + 28 + 64 * 2 + 8 + 12 + 36 * 2 + 12 + 40 + 8)),
             Kind::Network => (px(320), px(PAD + 28 + 8 + 52 + 16 + 32 + PAD)),
             Kind::Calendar => (px(CELL * 7 + PAD * 2), px(PAD + 28 + 18 + 12 + 24 + CELL_H * 6 + 8 + 32 + 12)),
         };
@@ -84,7 +98,7 @@ impl TrayPop {
         let p = ctx.palette;
         let fill = p.tb1.over(p.tb2.color);
         let surface = Surface::new(w, h, fill)?;
-        let mut pop = Self { kind, rect: Rect::new(x, y, w, h), surface, rows: Vec::new() };
+        let mut pop = Self { kind, rect: Rect::new(x, y, w, h), surface, rows: Vec::new(), slider: None };
         pop.redraw(scale);
         Some(pop)
     }
@@ -97,6 +111,14 @@ impl TrayPop {
     /// Строка под точкой экрана.
     #[must_use]
     pub fn hit(&self, x: i32, y: i32) -> Option<Action> {
+        if let Some(track) = self.slider {
+            // Ползунок ловит щелчок с запасом по высоте: дорожка в 4 точки.
+            let zone = Rect::new(track.x - 8, track.y - 12, track.w + 16, track.h + 24);
+            if zone.contains(x, y) {
+                let value = ((x - track.x).clamp(0, track.w as i32) * 100 / track.w.max(1) as i32) as u8;
+                return Some(Action::Volume(value));
+            }
+        }
         self.rows.iter().find(|(rect, _)| rect.contains(x, y)).map(|(_, action)| *action)
     }
 
@@ -111,10 +133,82 @@ impl TrayPop {
         draw::rounded_stroke(&mut self.surface, bounds, px(theme::R_WINDOW), p.line3.color, p.line3.alpha);
         let (ox, oy) = (self.rect.x, self.rect.y);
         let mut rows = Vec::new();
+        let mut slider = None;
         let s = &mut self.surface;
         let left = px(PAD) as i32;
         let inner_w = bounds.w - px(PAD * 2);
         match self.kind {
+            Kind::Volume => {
+                let mut y = px(PAD) as i32;
+                let head = Rect::new(left, y, inner_w, px(28));
+                paint::text(ctx, s, Role::Title, left, paint::baseline(ctx, Role::Title, head), "Звук", p.ink);
+                y += px(28 + 8) as i32;
+                let row = Rect::new(left, y, inner_w, px(36));
+                let present = crate::sound::present();
+                let track = volume_row(ctx, s, row, crate::sound::volume(), present, Fi::Volume);
+                if present {
+                    slider = Some(track.translate(ox, oy));
+                    rows.push((Rect::new(row.x, row.y, px(24), row.h).translate(ox, oy), Action::Mute));
+                }
+                let note = if present { "Динамики (встроенные)" } else { "Звуковой карты нет" };
+                paint::text(ctx, s, Role::Caption, left + px(32) as i32, row.bottom() + px(2) as i32, note, p.ink4);
+            }
+            Kind::Quick => {
+                let mut y = px(PAD) as i32;
+                // Уведомления — сверху: колокол открывает их вместе с
+                // быстрыми настройками.
+                let head = Rect::new(left, y, inner_w, px(28));
+                paint::text(ctx, s, Role::Title, left, paint::baseline(ctx, Role::Title, head), "Уведомления", p.ink);
+                y += px(28) as i32;
+                let empty = Rect::new(left, y, inner_w, px(40));
+                paint::text(ctx, s, Role::Body, left, paint::baseline(ctx, Role::Body, empty), "Нет новых уведомлений", p.ink4);
+                y += px(40 + 12) as i32;
+                draw::hline(s, left, y - px(6) as i32, inner_w, p.line2.color, p.line2.alpha);
+                let head = Rect::new(left, y, inner_w, px(28));
+                paint::text(ctx, s, Role::Strong, left, paint::baseline(ctx, Role::Strong, head), "Быстрые настройки", p.ink2);
+                y += px(28) as i32;
+                // Плитки 3×2 по 64: у машины нет ни одной из этих служб —
+                // все серые (правило дома).
+                let tiles = [
+                    (Fi::Wifi, "Wi-Fi"),
+                    (Fi::Bluetooth, "Bluetooth"),
+                    (Fi::DoNotDisturb, "Не беспокоить"),
+                    (Fi::NightLight, "Ночной свет"),
+                    (Fi::Airplane, "В самолёте"),
+                    (Fi::BatterySaver, "Экономия"),
+                ];
+                let gap = px(8);
+                let tile_w = (inner_w - gap * 2) / 3;
+                for (index, (icon, label)) in tiles.iter().enumerate() {
+                    let tile = Rect::new(left + ((index as u32 % 3) * (tile_w + gap)) as i32, y + ((index as u32 / 3) * (px(64) + gap)) as i32, tile_w, px(64));
+                    draw::rounded(s, tile, px(6), p.btn.over(fill), 255);
+                    draw::rounded_stroke(s, tile, px(6), p.btnline.color, p.btnline.alpha);
+                    let g = px(18);
+                    iconset::draw(s, *icon, tile.x + px(10) as i32, tile.y + px(10) as i32, g, p.ink5, 255);
+                    paint::text_clipped(ctx, s, Role::Label, tile.x + px(10) as i32, tile.bottom() - px(24) as i32, tile.w - px(14), label, p.ink5);
+                }
+                y += (px(64) * 2 + gap + px(12)) as i32;
+                // Яркость — серой (нет драйвера подсветки), звук — настоящий.
+                let row = Rect::new(left, y, inner_w, px(36));
+                volume_row(ctx, s, row, 70, false, Fi::Brightness);
+                y += px(36) as i32;
+                let row = Rect::new(left, y, inner_w, px(36));
+                let present = crate::sound::present();
+                let track = volume_row(ctx, s, row, crate::sound::volume(), present, Fi::Volume);
+                if present {
+                    slider = Some(track.translate(ox, oy));
+                }
+                y += px(36 + 12) as i32;
+                draw::hline(s, left, y - px(6) as i32, inner_w, p.line2.color, p.line2.alpha);
+                // Нижняя строка: питание и шестерня «Параметров».
+                let bottom = Rect::new(left, y, inner_w, px(40));
+                let g = px(18);
+                iconset::draw(s, Fi::Battery, left, bottom.y + (bottom.h as i32 - g as i32) / 2, g, p.ink5, 255);
+                paint::text(ctx, s, Role::Caption, left + px(28) as i32, paint::baseline(ctx, Role::Caption, bottom), "Питание от сети · батареи нет", p.ink4);
+                let gear = Rect::new(bottom.right() - px(32) as i32, bottom.y + px(4) as i32, px(32), px(32));
+                glyphicon::draw(s, Icon::Settings, gear.x + px(7) as i32, gear.y + px(7) as i32, px(18), p.ink2, 255);
+                rows.push((gear.translate(ox, oy), Action::Settings));
+            }
             Kind::Layout => {
                 let mut y = px(PAD) as i32 - px(4) as i32;
                 paint::text(ctx, s, Role::Caption, left, y + px(4) as i32, "Раскладка", p.ink4);
@@ -220,5 +314,32 @@ impl TrayPop {
             }
         }
         self.rows = rows;
+        self.slider = slider;
     }
+}
+
+/// Строка с ползунком (макет 05): значок, дорожка 4, ручка 20, число справа.
+/// `enabled: false` — серая, без ручки. Ответ — дорожка (координаты окна).
+fn volume_row(ctx: Ctx, s: &mut Surface, row: Rect, value: u8, enabled: bool, icon: Fi) -> Rect {
+    let p = ctx.palette;
+    let px = |v: u32| ctx.px(v);
+    let g = px(18);
+    let ink = if enabled { p.ink2 } else { p.ink5 };
+    let icon = if enabled && value == 0 && icon == Fi::Volume { Fi::VolumeOff } else { icon };
+    iconset::draw(s, icon, row.x, row.y + (row.h as i32 - g as i32) / 2, g, ink, 255);
+    let track = Rect::new(row.x + px(32) as i32, row.y + (row.h as i32 - px(4) as i32) / 2, row.w.saturating_sub(px(32 + 44)), px(4));
+    draw::rounded(s, track, px(2), p.line.color, p.line.alpha);
+    let fill = track.w * u32::from(value.min(100)) / 100;
+    if enabled {
+        if fill > 0 {
+            draw::rounded(s, Rect::new(track.x, track.y, fill, track.h), px(2), p.acc, 255);
+        }
+        let knob = px(20);
+        let kx = track.x + fill as i32 - knob as i32 / 2;
+        draw::rounded(s, Rect::new(kx, row.y + (row.h as i32 - knob as i32) / 2, knob, knob), knob / 2, Color::rgb(0xFF, 0xFF, 0xFF), 255);
+        draw::rounded(s, Rect::new(kx + px(6) as i32, row.y + (row.h as i32 - px(8) as i32) / 2, px(8), px(8)), px(4), p.acc, 255);
+    }
+    let text = alloc::format!("{value}");
+    paint::text_right(ctx, s, Role::Body, row.right(), paint::baseline(ctx, Role::Body, row), &text, ink);
+    track
 }

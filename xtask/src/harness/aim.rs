@@ -63,6 +63,8 @@ pub enum Aim {
     /// тянется до края плашки, и тридцать точек от правого края экрана — это
     /// ещё часы при любой их ширине.
     Tray,
+    /// Колокол трея: уведомления и быстрые настройки.
+    TrayBell,
     /// Кнопка окна номер `n` на панели задач (без подписей, 72b): «Пуск» 44,
     /// черта, затем кнопки 44 с шагом 48.
     TaskButton(i32),
@@ -319,7 +321,10 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         // Пустое место: середина экрана по ширине и треть по высоте — там нет
         // ни значков (они слева), ни панели (она внизу). Окна к этому моменту
         // сценарий обязан убрать сам.
-        Aim::Tray => (width - PANEL_INSET - 30, height - PANEL_INSET - PANEL_H / 2),
+        // Колокол — крайний справа в трее (02.11, макет 05).
+        Aim::TrayBell => (width - PANEL_INSET - 12, height - PANEL_INSET - PANEL_H / 2),
+        // Часы трея: правее них с 02.11 колокол (значок 14 и шаг 14).
+        Aim::Tray => (width - PANEL_INSET - 30 - 28, height - PANEL_INSET - PANEL_H / 2),
         Aim::TaskButton(n) => (PANEL_INSET + 79 + n * 48, height - PANEL_INSET - PANEL_H / 2),
         Aim::FilesRow(n) => {
             let rect = window(log, "Files")?;

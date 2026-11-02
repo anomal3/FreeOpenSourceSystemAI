@@ -2944,6 +2944,15 @@ pub const ALL: &[Scenario] = &[
             Step::Shot("13-calendar"),
             Step::Click,
             Step::Await("desktop     : tray popup closed", 15_000),
+            // Колокол (02.11, макет 05): уведомления и быстрые настройки —
+            // недоступное серым, громкость настоящая.
+            Step::Aim(Aim::TrayBell),
+            Step::Click,
+            Step::Await("desktop     : tray popup Quick opened", 15_000),
+            Step::Wait(1_000),
+            Step::Shot("13b-quick"),
+            Step::Click,
+            Step::Await("desktop     : tray popup closed", 15_000),
             Step::Aim(Aim::Icon(1)),
             Step::DoubleClick,
             Step::Await("desktop     : restored 'Terminal'", 15_000),

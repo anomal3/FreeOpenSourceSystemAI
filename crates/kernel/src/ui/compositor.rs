@@ -1688,6 +1688,15 @@ impl Compositor {
     }
 
     /// Обновить панель задач.
+    /// Перерисовать панель, даже если её содержимое не изменилось по
+    /// отпечатку (значок громкости, 02.11).
+    pub fn repaint_panel(&mut self, status: &Status) {
+        if let Some(panel) = self.panel.as_mut() {
+            panel.forget();
+        }
+        self.refresh_panel(status);
+    }
+
     pub fn refresh_panel(&mut self, status: &Status) {
         // Карточка «Система» перерисовывается, только когда её числа сменились:
         // аптайм меняется раз в секунду, а просят обновиться на каждое касание.

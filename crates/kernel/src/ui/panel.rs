@@ -39,6 +39,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use mini_ui::draw;
 use mini_ui::glyphicon::{self, Icon};
+use mini_ui::iconset::{self, Fi};
 use mini_ui::typeface::Role;
 use mini_ui::{Color, Rect, Surface};
 
@@ -319,8 +320,12 @@ pub enum NetState {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrayItem {
     Network,
+    /// Звук (02.11, макет 05).
+    Volume,
     Layout,
     Clock,
+    /// Колокол: уведомления и быстрые настройки (02.11, макет 05).
+    Bell,
 }
 
 /// Значки трея вместе с их местом на плашке.
@@ -767,7 +772,8 @@ impl Panel {
         let caption = ctx.face(Role::Caption);
         let clock_w = body.width(&clock).max(date.as_deref().map_or(0, |date| caption.width(date)));
         let _ = mono;
-        let mut status_w = glyph + step + body.width(lang) + step + clock_w;
+        // Сеть, звук, раскладка, часы, колокол (макет 05).
+        let mut status_w = (glyph + step) * 2 + body.width(lang) + step + clock_w + step + glyph;
         // Совсем узкий экран: показать всё нельзя, и тогда правого края нет
         // вовсе. Обрезанное наполовину число хуже отсутствующего — по нему не
         // понять, что именно обрезано.
@@ -875,6 +881,20 @@ impl Panel {
             ));
             x += (glyph + step) as i32;
 
+            // Звук: перечёркнутый динамик — карты нет или звук на нуле.
+            let quiet = !crate::sound::present() || crate::sound::volume() == 0;
+            iconset::draw(
+                &mut self.surface,
+                if quiet { Fi::VolumeOff } else { Fi::Volume },
+                x,
+                plate.y + (plate.h as i32 - glyph as i32) / 2,
+                glyph,
+                if crate::sound::present() { p.ink } else { p.ink3 },
+                255,
+            );
+            self.tray.push((TrayItem::Volume, Rect::new(x - half, plate.y, glyph + step, plate.h)));
+            x += (glyph + step) as i32;
+
             let width = paint::text(
                 ctx,
                 &mut self.surface,
@@ -900,8 +920,12 @@ impl Panel {
             }
             self.tray.push((
                 TrayItem::Clock,
-                Rect::new(x - half, plate.y, clock_w + m.plate_pad(), plate.h),
+                Rect::new(x - half, plate.y, clock_w + step, plate.h),
             ));
+            // Колокол — крайний справа, как в макете.
+            let bell_x = right + step as i32;
+            iconset::draw(&mut self.surface, Fi::Bell, bell_x, plate.y + (plate.h as i32 - glyph as i32) / 2, glyph, p.ink2, 255);
+            self.tray.push((TrayItem::Bell, Rect::new(bell_x - half, plate.y, glyph + step, plate.h)));
         }
 
         self.damage = self.surface.bounds();

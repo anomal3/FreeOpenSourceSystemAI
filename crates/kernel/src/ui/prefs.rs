@@ -82,6 +82,10 @@ pub fn adopt() {
     if let Some(places) = sysconf::value(text, "icon_places") {
         super::icons::set_places(places);
     }
+    // Громкость (02.11, трей).
+    if let Some(volume) = sysconf::value(text, "volume").and_then(|value| value.trim().parse::<u8>().ok()) {
+        crate::sound::set_volume(volume);
+    }
     // Программы для типов файлов (02.11, «Всегда открывать этой программой»).
     if let Some(list) = sysconf::value(text, "open_with") {
         *OPEN_WITH.lock() = alloc::string::String::from(list);
@@ -171,6 +175,11 @@ pub fn store_open_with(ext: &str, command: &str) -> Result<(), crate::vfs::VfsEr
     let list = sysconf::filetypes::with_choice(&OPEN_WITH.lock(), ext, command);
     *OPEN_WITH.lock() = list.clone();
     store_key("open_with", &list)
+}
+
+/// Запомнить громкость.
+pub fn store_volume(volume: u8) -> Result<(), crate::vfs::VfsError> {
+    store_key("volume", &alloc::format!("{volume}"))
 }
 
 /// Запомнить, что показывает панель.

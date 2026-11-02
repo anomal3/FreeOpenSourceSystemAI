@@ -3956,6 +3956,8 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
         TrayItem::Layout => traypop::Kind::Layout,
         TrayItem::Network => traypop::Kind::Network,
         TrayItem::Clock => traypop::Kind::Calendar,
+        TrayItem::Volume => traypop::Kind::Volume,
+        TrayItem::Bell => traypop::Kind::Quick,
     };
     let was = desktop.tray_pop_kind();
     desktop.close_tray_pop();
@@ -3965,9 +3967,36 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
     desktop.refresh_panel(status);
 }
 
+/// Громкость до «выключить звук» — к ней возвращает второй щелчок.
+static LAST_VOLUME: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(100);
+
 /// Щелчок при открытом окне трея. `true` — щелчок забран.
 fn press_tray_pop(desktop: &mut Compositor, x: i32, y: i32, status: &Status) -> bool {
     if let Some(action) = desktop.tray_pop_hit(x, y) {
+        // Громкость — окно остаётся открытым, перерисованным с новым значением.
+        if let traypop::Action::Volume(_) | traypop::Action::Mute = action {
+            let kind = desktop.tray_pop_kind();
+            let value = match action {
+                traypop::Action::Volume(value) => value,
+                _ => {
+                    // Выключить — запомнив прежнюю; включить — вернуть её.
+                    let now = crate::sound::volume();
+                    if now == 0 { LAST_VOLUME.load(Ordering::Relaxed).max(10) } else { LAST_VOLUME.store(now, Ordering::Relaxed); 0 }
+                }
+            };
+            crate::sound::set_volume(value);
+            if let Err(err) = prefs::store_volume(value) {
+                kprintln!("  desktop     : volume not saved: {err}");
+            }
+            kprintln!("  desktop     : volume {value}");
+            desktop.close_tray_pop();
+            if let Some(kind) = kind {
+                let item = if kind == traypop::Kind::Quick { TrayItem::Bell } else { TrayItem::Volume };
+                desktop.open_tray_pop(kind, item);
+            }
+            desktop.repaint_panel(status);
+            return true;
+        }
         desktop.close_tray_pop();
         match action {
             traypop::Action::Layout(layout) => {
@@ -3976,6 +4005,8 @@ fn press_tray_pop(desktop: &mut Compositor, x: i32, y: i32, status: &Status) -> 
             }
             traypop::Action::LanguageSettings | traypop::Action::ClockSettings => open_settings(desktop, Section::Time, status),
             traypop::Action::NetworkSettings => open_settings(desktop, Section::Network, status),
+            traypop::Action::Settings => open_settings(desktop, Section::Home, status),
+            traypop::Action::Volume(_) | traypop::Action::Mute => {}
         }
         return true;
     }

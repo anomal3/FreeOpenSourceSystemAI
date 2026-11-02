@@ -51,8 +51,43 @@ pub fn present() -> bool {
     virtio::snd::present() || hda::present()
 }
 
+/// Громкость, 0..=100 (трей, макет 05, 02.11). Регулятора у карт нет —
+/// отсчёты масштабируются здесь, по квадрату доли: на слух ровнее.
+static VOLUME: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(100);
+
+/// Текущая громкость.
+#[must_use]
+pub fn volume() -> u8 {
+    VOLUME.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Задать громкость (0..=100).
+pub fn set_volume(value: u8) {
+    VOLUME.store(value.min(100), core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Отдать отсчёты карте: ждёт места, хвост меньше периода копится.
 pub fn feed(bytes: &[u8]) -> Result<(), SoundError> {
+    let volume = u32::from(volume());
+    if volume >= 100 {
+        return feed_raw(bytes);
+    }
+    // Тише — копией по кускам: отсчёты программы не трогаются.
+    let factor = volume * volume; // из 10 000
+    let mut scaled = [0u8; PERIOD];
+    for chunk in bytes.chunks(PERIOD) {
+        let len = chunk.len() & !1;
+        for (out, pair) in scaled[..len].chunks_exact_mut(2).zip(chunk[..len].chunks_exact(2)) {
+            let sample = i32::from(i16::from_le_bytes([pair[0], pair[1]]));
+            out.copy_from_slice(&((sample * factor as i32 / 10_000) as i16).to_le_bytes());
+        }
+        scaled[len..chunk.len()].copy_from_slice(&chunk[len..]);
+        feed_raw(&scaled[..chunk.len()])?;
+    }
+    Ok(())
+}
+
+fn feed_raw(bytes: &[u8]) -> Result<(), SoundError> {
     if virtio::snd::present() {
         virtio::snd::feed(bytes).map_err(SoundError::Virtio)
     } else if hda::present() {
