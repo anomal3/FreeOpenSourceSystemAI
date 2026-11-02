@@ -82,6 +82,13 @@ pub trait App {
         false
     }
 
+    /// Шаг фоновой работы — на каждом витке цикла (~30 мс), а не раз в
+    /// период: копирование файлов в «Файлах» идёт кусками, и ход его виден.
+    /// `true` — перерисовать.
+    fn step(&mut self) -> bool {
+        false
+    }
+
     /// Щелчок левой кнопкой в точке окна.
     fn click(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
         false
@@ -257,6 +264,9 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
             }
         }
 
+        if app.step() {
+            dirty = true;
+        }
         let now = monotonic_ms();
         if now >= next {
             next = now + spec.period_ms;

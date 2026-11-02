@@ -11956,6 +11956,28 @@ pub const ALL: &[Scenario] = &[
             Step::Key("y"),
             Step::Await("files: deleted 'notes'", 15_000),
             Step::Await("files: /data/c4 has 0 entries", 15_000),
+            Step::Wait(1_000),
+            Step::Shot("04b-empty"),
+            // Копировать и вставить (02.11, макет 14): копия рядом —
+            // «Новая папка — копия»; Ctrl+A и Delete — обе разом.
+            Step::Aim(Aim::FilesBody),
+            Step::RightClick,
+            Step::Await("files: menu opened for the folder", 15_000),
+            Step::Key("ret"),
+            Step::Await("files: created 'Новая папка' in /data/c4", 15_000),
+            Step::Key("ctrl-c"),
+            Step::Await("files: copied 1 item(s)", 15_000),
+            Step::Key("ctrl-v"),
+            Step::Await("files: copying 1 item(s)", 15_000),
+            Step::Await("files: pasted 1 item(s) into /data/c4", 15_000),
+            Step::Wait(1_000),
+            Step::Shot("04c-pasted"),
+            Step::Key("ctrl-a"),
+            Step::Key("delete"),
+            Step::Wait(800),
+            Step::Key("y"),
+            Step::Await("files: deleted 'Новая папка — копия'", 15_000),
+            Step::Await("files: /data/c4 has 0 entries", 15_000),
             // Вверх до корня и дальше — на страницу томов, как из `C:\` в
             // «Этот компьютер». Плиткой.
             Step::Key("t"),

@@ -49,22 +49,24 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use mini_ui::glyphicon::{self, Icon};
+use mini_ui::iconset::{self, Fi};
 use mini_ui::kit::{self, Entry};
 use mini_ui::paint::{self, Ctx, RowState, Tone, Weight};
 use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface, draw, theme};
-use user_abi::{Dirent, KIND_DIRECTORY, Stat};
+use user_abi::{Dirent, KIND_DIRECTORY, Stat, WIN_MOD_ALT, WIN_MOD_CTRL, WIN_MOD_SHIFT};
 use user_progs::app::{self, App, Spec};
 use user_progs::{
     Args, SysInfo, WIN_KEY_DELETE, WIN_KEY_DOWN, WIN_KEY_END, WIN_KEY_HOME, WIN_KEY_LEFT,
     WIN_KEY_MENU, WIN_KEY_NAMED, WIN_KEY_PAGE_DOWN, WIN_KEY_PAGE_UP, WIN_KEY_RIGHT, WIN_KEY_UP,
     close, create, mkdir, monotonic_ms, mounts, open, open_write, println, read, readdir_raw, remove,
-    rename, spawn, stat, sysinfo, time_now, write,
+    clipboard_set, rename, spawn, stat, sysinfo, time_now, write,
 };
 
 /// Имя окна.
@@ -374,7 +376,7 @@ impl MenuItem {
             MenuItem::Open => "Открыть",
             MenuItem::Rename => "Переименовать",
             MenuItem::Delete => "Удалить",
-            MenuItem::CopyPath => "Копировать путь (функция запланирована)",
+            MenuItem::CopyPath => "Копировать путь",
             MenuItem::Properties => "Свойства",
             MenuItem::NewFolder => "Создать папку",
             MenuItem::NewTextFile => "Создать текстовый файл",
@@ -504,13 +506,94 @@ struct Files {
     /// Каталог корзины (`~/.local/share/Trash`, как у freedesktop; её же
     /// пополняет «Удалить» на столе).
     trash: String,
+    /// Сортировка: по чему и в обратную ли сторону (папки всегда сверху).
+    sort: SortKey,
+    descending: bool,
+    /// Показывать скрытые файлы (имя с точки).
+    hidden: bool,
+    /// Отмеченные строки — выделение нескольких (Shift+стрелки, Ctrl+A,
+    /// пробел). Пусто — действует выбранная строка `selected`.
+    picked: BTreeSet<usize>,
+    /// Выпавшее меню панели команд («Сортировка», «Вид») и его пункт.
+    pop: Option<(Command, usize)>,
+    /// Вырезанное или скопированное: полные пути и «вырезано ли».
+    clip: Option<(Vec<String>, bool)>,
+    /// Идущее копирование.
+    job: Option<CopyJob>,
 }
+
+/// По чему сортировать список.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortKey {
+    Name,
+    Date,
+    Kind,
+    Size,
+}
+
+impl SortKey {
+    const ALL: [SortKey; 4] = [SortKey::Name, SortKey::Date, SortKey::Kind, SortKey::Size];
+
+    const fn title(self) -> &'static str {
+        match self {
+            SortKey::Name => "Имя",
+            SortKey::Date => "Дата изменения",
+            SortKey::Kind => "Тип",
+            SortKey::Size => "Размер",
+        }
+    }
+
+    const fn tag(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Date => "date",
+            SortKey::Kind => "type",
+            SortKey::Size => "size",
+        }
+    }
+}
+
+/// Шаг копирования: завести папку или скопировать файл.
+enum Op {
+    Dir(String),
+    File { src: String, dst: String, size: u64 },
+}
+
+/// Копирование (или перенос между томами) кусками — по шагу на виток цикла
+/// окна ([`App::step`]): ход виден, «Пауза» и «Отмена» нажимаются.
+struct CopyJob {
+    ops: Vec<Op>,
+    next: usize,
+    /// Открытые файлы текущего шага: откуда и куда.
+    files: Option<(i64, i64)>,
+    total: u64,
+    done: u64,
+    started: u64,
+    paused: bool,
+    /// Перенос: что стереть, когда всё скопировано.
+    remove_after: Vec<String>,
+    items: usize,
+    from: String,
+    to: String,
+    current: String,
+    error: Option<String>,
+}
+
+/// Сколько байт копировать за виток цикла.
+const COPY_STEP: usize = 512 * 1024;
 
 impl Files {
     fn new(path: String, home: String) -> Self {
         let trash = format!("{home}/.local/share/Trash");
         let mut view = Self {
             trash,
+            sort: SortKey::Name,
+            descending: false,
+            hidden: false,
+            picked: BTreeSet::new(),
+            pop: None,
+            clip: None,
+            job: None,
             path,
             back: Vec::new(),
             forward: Vec::new(),
@@ -544,6 +627,7 @@ impl Files {
     fn reload(&mut self) {
         self.rows.clear();
         self.selected = 0;
+        self.picked.clear();
         self.dropped = 0;
         self.error = None;
 
@@ -565,12 +649,21 @@ impl Files {
                     rows
                 };
                 self.dropped = dropped;
-                // Каталоги наверх, дальше по имени: порядок записей в ext2 —
-                // это порядок вставки, то есть для человека случайный.
+                if !self.hidden {
+                    self.rows.retain(|row| !row.name.starts_with('.'));
+                }
+                // Каталоги наверх, дальше — как выбрано (по умолчанию по имени):
+                // порядок записей в ext2 — это порядок вставки, то есть для
+                // человека случайный.
+                let (key, descending) = (self.sort, self.descending);
                 self.rows.sort_by(|a, b| {
-                    b.directory
-                        .cmp(&a.directory)
-                        .then_with(|| a.name.cmp(&b.name))
+                    let order = match key {
+                        SortKey::Name => a.name.cmp(&b.name),
+                        SortKey::Date => a.mtime.cmp(&b.mtime).then_with(|| a.name.cmp(&b.name)),
+                        SortKey::Kind => file_kind(&a.name, a.directory).1.cmp(file_kind(&b.name, b.directory).1).then_with(|| a.name.cmp(&b.name)),
+                        SortKey::Size => a.size.cmp(&b.size).then_with(|| a.name.cmp(&b.name)),
+                    };
+                    b.directory.cmp(&a.directory).then(if descending { order.reverse() } else { order })
                 });
                 // Поиск (72g): остаются записи, в имени которых есть набранное.
                 if !self.query.is_empty() {
@@ -625,12 +718,18 @@ impl Files {
         }
     }
 
-    /// Кнопка панели команд (72g).
+    /// Кнопка панели команд (72g, макет 14).
     fn run_command(&mut self, command: Command) -> bool {
         let row = self.rows.get(self.selected).filter(|row| !row.is_volume()).map(|row| row.name.clone());
         match command {
             Command::NewFolder => {
                 self.create_new(true);
+            }
+            Command::Cut => return self.to_clip(true),
+            Command::Copy => return self.to_clip(false),
+            Command::Paste => return self.paste(),
+            Command::Sort | Command::View => {
+                self.pop = if self.pop.is_some_and(|(open, _)| open == command) { None } else { Some((command, 0)) };
             }
             Command::Rename => {
                 let Some(name) = row else { return false };
@@ -648,15 +747,255 @@ impl Files {
                     menu.mode = MenuMode::Confirm;
                 }
             }
-            Command::Properties => {
-                if self.rows.get(self.selected).is_some() {
-                    self.show_props(self.selected);
-                } else {
-                    self.show_folder_props();
+        }
+        true
+    }
+
+    /// Строки, к которым относится действие: отмеченные, иначе выбранная.
+    fn targets(&self) -> Vec<usize> {
+        if self.picked.is_empty() {
+            self.rows.get(self.selected).filter(|row| !row.is_volume()).map(|_| self.selected).into_iter().collect()
+        } else {
+            self.picked.iter().copied().filter(|index| *index < self.rows.len()).collect()
+        }
+    }
+
+    /// Вырезать или копировать выделенное — в буфер «Файлов» и путями в
+    /// общий буфер обмена стола (в Блокнот вставятся пути).
+    fn to_clip(&mut self, cut: bool) -> bool {
+        if self.on_computer() {
+            return false;
+        }
+        let paths: Vec<String> = self.targets().into_iter().map(|index| join(&self.path, &self.rows[index].name)).collect();
+        if paths.is_empty() {
+            return false;
+        }
+        let _ = clipboard_set(&paths.join("\n"));
+        println(&format!("files: {} {} item(s)", if cut { "cut" } else { "copied" }, paths.len()));
+        self.note = Some(format!("{}: объектов {}", if cut { "Вырезано" } else { "Скопировано" }, paths.len()));
+        self.clip = Some((paths, cut));
+        true
+    }
+
+    /// Вставить из буфера «Файлов» в открытую папку.
+    fn paste(&mut self) -> bool {
+        if self.on_computer() || self.job.is_some() {
+            return false;
+        }
+        let Some((paths, cut)) = self.clip.clone() else {
+            self.note = Some(String::from("Буфер пуст: сначала «Копировать» или «Вырезать»"));
+            return true;
+        };
+        let dir = self.path.clone();
+        let mut ops = Vec::new();
+        let mut remove_after = Vec::new();
+        let mut moved = 0usize;
+        for src in &paths {
+            let name = src.rsplit('/').next().unwrap_or(src).to_string();
+            if dir == *src || dir.starts_with(&format!("{src}/")) {
+                self.note = Some(format!("Нельзя вставить «{name}» в саму себя"));
+                return true;
+            }
+            // Перенос в ту же папку — ничего не делать; копия — «— копия».
+            if cut && parent_of(src) == dir {
+                continue;
+            }
+            let dst = unique_name(&dir, &name);
+            // Перенос на том же томе — переименование, мгновенно.
+            if cut && rename(src, &dst) >= 0 {
+                moved += 1;
+                continue;
+            }
+            expand(src, &dst, &mut ops, 0);
+            if cut {
+                remove_after.push(src.clone());
+            }
+        }
+        if cut {
+            self.clip = None;
+        }
+        if ops.is_empty() {
+            println(&format!("files: pasted {moved} item(s) into {dir}"));
+            self.note = Some(format!("Перенесено объектов: {moved}"));
+            self.reload();
+            return true;
+        }
+        let total = ops.iter().map(|op| if let Op::File { size, .. } = op { *size } else { 0 }).sum();
+        let home = self.home.clone();
+        let label = |path: &str| -> String { place_title(path, &home).rsplit('/').next().unwrap_or(path).to_string() };
+        let from = paths.first().map(|path| label(&parent_of(path))).unwrap_or_default();
+        let to = label(&dir);
+        println(&format!("files: copying {} item(s), {total} byte(s) into {dir}", paths.len()));
+        self.job = Some(CopyJob {
+            ops,
+            next: 0,
+            files: None,
+            total,
+            done: 0,
+            started: monotonic_ms(),
+            paused: false,
+            remove_after,
+            items: paths.len(),
+            from,
+            to,
+            current: String::new(),
+            error: None,
+        });
+        true
+    }
+
+    /// Шаг копирования. `true` — перерисовать.
+    fn copy_step(&mut self) -> bool {
+        let Some(job) = self.job.as_mut() else {
+            return false;
+        };
+        if job.paused || job.error.is_some() {
+            return false;
+        }
+        let mut budget = COPY_STEP;
+        let mut buffer = alloc::vec![0u8; 64 * 1024];
+        while budget > 0 {
+            let Some(op) = job.ops.get(job.next) else {
+                break;
+            };
+            match op {
+                Op::Dir(dst) => {
+                    let code = mkdir(dst, 0o755);
+                    if code < 0 && code != user_abi::ERR_EXISTS {
+                        job.error = Some(format!("Не создать папку {dst}: {}", error_text(code)));
+                        return true;
+                    }
+                    job.next += 1;
+                }
+                Op::File { src, dst, .. } => {
+                    let (from, to) = match job.files {
+                        Some(pair) => pair,
+                        None => {
+                            job.current = src.rsplit('/').next().unwrap_or(src).to_string();
+                            let from = open(src);
+                            if from < 0 {
+                                job.error = Some(format!("Не открыть {src}: {}", error_text(from)));
+                                return true;
+                            }
+                            let to = open_write(dst, true, true);
+                            if to < 0 {
+                                close(from);
+                                job.error = Some(format!("Не записать {dst}: {}", error_text(to)));
+                                return true;
+                            }
+                            job.files = Some((from, to));
+                            (from, to)
+                        }
+                    };
+                    let got = read(from, &mut buffer[..budget.min(64 * 1024)]);
+                    if got < 0 {
+                        job.error = Some(format!("Ошибка чтения {}: {}", job.current, error_text(got)));
+                        return true;
+                    }
+                    if got == 0 {
+                        close(from);
+                        close(to);
+                        job.files = None;
+                        job.next += 1;
+                        continue;
+                    }
+                    let mut written = 0usize;
+                    while written < got as usize {
+                        let step = write(to, &buffer[written..got as usize]);
+                        if step <= 0 {
+                            job.error = Some(format!("Ошибка записи {}: {}", job.current, error_text(step)));
+                            return true;
+                        }
+                        written += step as usize;
+                    }
+                    job.done += got as u64;
+                    budget = budget.saturating_sub(got as usize);
                 }
             }
         }
+        if job.next >= job.ops.len() {
+            let remove_after = core::mem::take(&mut job.remove_after);
+            let items = job.items;
+            let dir = self.path.clone();
+            for src in &remove_after {
+                remove_tree(src, 0);
+            }
+            self.job = None;
+            println(&format!("files: pasted {items} item(s) into {dir}"));
+            self.note = Some(format!("Готово: объектов {items}"));
+            self.reload();
+        }
         true
+    }
+
+    /// Остановить копирование: открытое закрыть, недописанный файл стереть.
+    fn cancel_copy(&mut self) {
+        if let Some(job) = self.job.take() {
+            if let Some((from, to)) = job.files {
+                close(from);
+                close(to);
+                if let Some(Op::File { dst, .. }) = job.ops.get(job.next) {
+                    remove(dst);
+                }
+            }
+            println("files: copying cancelled");
+            self.note = Some(String::from("Копирование отменено"));
+            self.reload();
+        }
+    }
+
+    /// Пункты выпавшего меню панели команд.
+    fn pop_entries(&self, command: Command) -> Vec<(String, u8)> {
+        let mark = |on: bool, text: &str| format!("{}{text}", if on { "● " } else { "   " });
+        let check = |on: bool, text: &str| format!("{}{text}", if on { "✓ " } else { "   " });
+        match command {
+            Command::Sort => {
+                let mut out: Vec<(String, u8)> = SortKey::ALL.iter().map(|key| (mark(*key == self.sort, key.title()), 0)).collect();
+                out.push((mark(!self.descending, "По возрастанию"), 1));
+                out.push((mark(self.descending, "По убыванию"), 1));
+                out
+            }
+            _ => alloc::vec![
+                (mark(!self.tiles, "Таблица"), 0),
+                (mark(self.tiles, "Плитка"), 0),
+                (check(!self.friendly, "Показывать системные файлы"), 1),
+                (check(self.hidden, "Показывать скрытые файлы"), 1),
+            ],
+        }
+    }
+
+    fn run_pop(&mut self, command: Command, index: usize) {
+        self.pop = None;
+        match (command, index) {
+            (Command::Sort, 0..=3) => self.set_sort(SortKey::ALL[index], self.descending),
+            (Command::Sort, 4) => self.set_sort(self.sort, false),
+            (Command::Sort, _) => self.set_sort(self.sort, true),
+            (_, 0 | 1) => {
+                self.tiles = index == 1;
+                println(&format!("files: view {}", if self.tiles { "tiles" } else { "table" }));
+            }
+            (_, 2) => {
+                self.friendly = !self.friendly;
+                println(&format!("files: system files {}", if self.friendly { "hidden" } else { "shown" }));
+                self.reload();
+            }
+            _ => {
+                self.hidden = !self.hidden;
+                println(&format!("files: hidden files {}", if self.hidden { "shown" } else { "hidden" }));
+                self.reload();
+            }
+        }
+    }
+
+    fn set_sort(&mut self, key: SortKey, descending: bool) {
+        let keep = self.rows.get(self.selected).map(|row| row.name.clone());
+        self.sort = key;
+        self.descending = descending;
+        self.reload();
+        if let Some(name) = keep {
+            self.selected = self.rows.iter().position(|row| row.name == name).unwrap_or(0);
+        }
+        println(&format!("files: sorted by {} {}", key.tag(), if descending { "desc" } else { "asc" }));
     }
 
     /// Обработать клавишу. `true` — картинку надо перерисовать.
@@ -1006,8 +1345,13 @@ impl Files {
             }
             MenuItem::CopyPath => {
                 self.close_menu();
-                println("files: copy path is planned, there is no clipboard yet");
-                self.note = Some(String::from("Копировать путь: функция запланирована, буфера обмена ещё нет"));
+                if let Some(row) = target.and_then(|index| self.rows.get(index)) {
+                    let path = if row.is_volume() { row.name.clone() } else { join(&self.path, &row.name) };
+                    if clipboard_set(&path) {
+                        println(&format!("files: path copied '{path}'"));
+                        self.note = Some(format!("Путь скопирован: {path}"));
+                    }
+                }
             }
             MenuItem::Properties => {
                 self.close_menu();
@@ -1197,13 +1541,25 @@ impl Files {
             }
             return;
         };
-        let Some(row) = self.rows.get(index) else {
-            self.close_menu();
-            return;
+        // Отмечено несколько — удаляются все отмеченные.
+        let names: Vec<String> = if self.picked.len() > 1 {
+            self.picked.iter().filter_map(|index| self.rows.get(*index)).map(|row| row.name.clone()).collect()
+        } else {
+            self.rows.get(index).map(|row| row.name.clone()).into_iter().collect()
         };
-        let name = row.name.clone();
-        let path = join(&self.path, &name);
         self.close_menu();
+        for name in names {
+            self.delete_named(&name);
+        }
+        let keep = self.selected.min(index);
+        self.reload();
+        self.selected = keep.min(self.rows.len().saturating_sub(1));
+    }
+
+    /// Удалить одну запись папки (в корзину или навсегда).
+    fn delete_named(&mut self, name: &str) {
+        let name = name.to_string();
+        let path = join(&self.path, &name);
         // В корзине «Удалить» стирает навсегда, вне её — переносит в
         // корзину. С тома, где корзины нет (другой диск, `rename` между
         // томами не бывает), — стирается, как раньше, и об этом сказано.
@@ -1232,9 +1588,6 @@ impl Files {
                 self.note = Some(format!("Удалено навсегда «{name}»"));
             }
         }
-        let keep = self.selected.min(index);
-        self.reload();
-        self.selected = keep.min(self.rows.len().saturating_sub(1));
     }
 
     /// Создать папку или пустой текстовый файл в текущем каталоге.
@@ -1419,6 +1772,67 @@ impl Files {
     /// изменении размера окна, и попасть в них будет можно только наугад.
     fn on_click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
         let plan = layout(ctx, area);
+
+        // Идёт копирование — его окно отвечает первым.
+        if self.job.is_some() {
+            let (card, pause, cancel) = Self::job_plan(ctx, &plan);
+            if pause.contains(x, y) {
+                if let Some(job) = self.job.as_mut() {
+                    job.paused = !job.paused;
+                    if job.error.is_some() {
+                        // После ошибки «Продолжить» — пропустить файл.
+                        job.error = None;
+                        job.files = None;
+                        job.next += 1;
+                    }
+                }
+                return true;
+            }
+            if cancel.contains(x, y) {
+                self.cancel_copy();
+                return true;
+            }
+            if card.contains(x, y) {
+                return false;
+            }
+        }
+        // Выпавшее меню «Сортировка» / «Вид».
+        if let Some((command, _, rect, items)) = self.pop_layout(ctx, area, &plan) {
+            let entries: Vec<Entry<'_>> = items.iter().map(|(title, group)| Entry { title, icon: None, danger: false, group: *group }).collect();
+            let hit = kit::menu_hit(ctx, rect, &entries, x, y);
+            drop(entries);
+            match hit {
+                Some(index) => self.run_pop(command, index),
+                None => {
+                    // Щелчок по той же кнопке закрывает, по другой — откроет её.
+                    self.pop = None;
+                    if let Some((other, _)) = plan.commands.iter().find(|(_, r)| r.contains(x, y)) {
+                        if *other != command {
+                            return self.run_command(*other);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        // Заголовок столбца — сортировка по нему; второй щелчок — обратно.
+        if !self.tiles && plan.header.contains(x, y) && !self.on_computer() && self.preview.is_none() && self.props.is_none() {
+            let size_right = plan.list.right() - ctx.px(16) as i32;
+            let type_x = size_right - ctx.px(80 + 140) as i32;
+            let date_x = type_x - ctx.px(135) as i32;
+            let key = if x >= size_right - ctx.px(80) as i32 {
+                SortKey::Size
+            } else if x >= type_x {
+                SortKey::Kind
+            } else if x >= date_x {
+                SortKey::Date
+            } else {
+                SortKey::Name
+            };
+            let descending = key == self.sort && !self.descending;
+            self.set_sort(key, descending);
+            return true;
+        }
 
         // Открытое меню получает щелчок первым: внутри — пункт, снаружи —
         // закрытие, и щелчок мимо на этом заканчивается. Так ведёт себя всякое
@@ -1669,6 +2083,79 @@ impl Files {
         }
         self.draw_status(surface, ctx, &plan);
         self.draw_menu(surface, ctx, area);
+        self.draw_pop(surface, ctx, area, &plan);
+        self.draw_job(surface, ctx, &plan);
+    }
+
+    /// Выпавшее меню «Сортировка» / «Вид»: где и какие пункты.
+    fn pop_layout(&self, ctx: Ctx, area: Rect, plan: &Plan) -> Option<(Command, usize, Rect, Vec<(String, u8)>)> {
+        let (command, selected) = self.pop?;
+        let button = plan.commands.iter().find(|(c, _)| *c == command)?.1;
+        let items = self.pop_entries(command);
+        let entries: Vec<Entry<'_>> = items.iter().map(|(title, group)| Entry { title, icon: None, danger: false, group: *group }).collect();
+        let size = kit::menu_size(ctx, &entries);
+        let rect = kit::place((button.x, button.bottom() + ctx.px(2) as i32), size, area);
+        Some((command, selected, rect, items))
+    }
+
+    fn draw_pop(&self, s: &mut Surface, ctx: Ctx, area: Rect, plan: &Plan) {
+        let Some((_, selected, rect, items)) = self.pop_layout(ctx, area, plan) else {
+            return;
+        };
+        let entries: Vec<Entry<'_>> = items.iter().map(|(title, group)| Entry { title, icon: None, danger: false, group: *group }).collect();
+        kit::draw_menu(ctx, s, rect, &entries, selected);
+    }
+
+    /// Окно копирования (макет 14): ход, скорость, сколько осталось.
+    fn job_plan(ctx: Ctx, plan: &Plan) -> (Rect, Rect, Rect) {
+        let area = plan.list.union(&plan.header);
+        let w = ctx.px(520).min(area.w.saturating_sub(ctx.px(24)));
+        let h = ctx.px(210);
+        let card = Rect::new(area.x + (area.w as i32 - w as i32) / 2, area.y + (area.h as i32 - h as i32) / 3, w, h);
+        let pad = ctx.px(20) as i32;
+        let bw = ctx.px(110);
+        let by = card.bottom() - pad - ctx.px(32) as i32;
+        let cancel = Rect::new(card.right() - pad - bw as i32, by, bw, ctx.px(32));
+        let pause = Rect::new(cancel.x - ctx.px(8) as i32 - bw as i32, by, bw, ctx.px(32));
+        (card, pause, cancel)
+    }
+
+    fn draw_job(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
+        let Some(job) = &self.job else {
+            return;
+        };
+        let p = ctx.palette;
+        let (card, pause, cancel) = Self::job_plan(ctx, plan);
+        let inner = kit::card(ctx, s, card);
+        let pad = ctx.px(20) as i32;
+        let percent = if job.total == 0 { 100 } else { job.done * 100 / job.total };
+        let x = card.x + pad;
+        let room = card.w - ctx.px(40);
+        let mut y = card.y + pad;
+        paint::text(inner, s, Role::Title, x, y, &format!("Копирование: {percent}%"), p.ink);
+        y += ctx.px(30) as i32;
+        let what = format!("Копирование {} элементов из «{}» в «{}»", job.items, job.from, job.to);
+        paint::text_clipped(inner, s, Role::Body, x, y, room, &what, p.ink2);
+        y += ctx.px(28) as i32;
+        let bar = Rect::new(x, y, room, ctx.px(10));
+        draw::rounded(s, bar, ctx.px(5), p.line.color, 255);
+        let fill = (u64::from(bar.w) * percent.min(100) / 100) as u32;
+        if fill > 0 {
+            draw::rounded(s, Rect::new(bar.x, bar.y, fill, bar.h), ctx.px(5), p.acc, 255);
+        }
+        y += ctx.px(20) as i32;
+        let seconds = monotonic_ms().saturating_sub(job.started).max(1);
+        let speed = job.done * 1000 / seconds;
+        let left = if speed == 0 { String::from("—") } else { format!("{} с", job.total.saturating_sub(job.done) / speed.max(1)) };
+        let facts = match &job.error {
+            Some(error) => error.clone(),
+            None => format!("Осталось {left} · {}/с · {} из {}", human_size(speed), human_size(job.done), human_size(job.total)),
+        };
+        paint::text_clipped(inner, s, Role::Caption, x, y, room, &facts, if job.error.is_some() { p.bad_ink } else { p.ink3 });
+        y += ctx.px(18) as i32;
+        paint::text_clipped(inner, s, Role::Caption, x, y, room, &format!("Сейчас: {}", job.current), p.ink4);
+        paint::button(inner, s, pause, Weight::Normal, if job.paused { "Продолжить" } else { "Пауза" }, false);
+        paint::button(inner, s, cancel, Weight::Normal, "Отмена", false);
     }
 
     /// Карточка свойств на месте списка.
@@ -2003,17 +2490,30 @@ impl Files {
             s.fill(row, ctx.flat(p.panel));
             draw::hline(s, row.x, row.bottom() - 1, row.w, p.line.color, p.line.alpha);
             let inner = ctx.on(theme::panel_bg());
+            let mut previous: Option<Command> = None;
             for (command, rect) in &plan.commands {
+                if previous.is_some_and(|before| before.group() != command.group()) {
+                    draw::vline(s, rect.x - ctx.px(7) as i32, rect.y + ctx.px(6) as i32, rect.h.saturating_sub(ctx.px(12)), p.line.color, p.line.alpha);
+                }
+                previous = Some(*command);
                 let (icon, label) = command.look();
+                let has_target = !self.targets().is_empty() && !self.on_computer();
                 let enabled = match command {
-                    Command::Rename | Command::Delete => self.rows.get(self.selected).is_some_and(|row| !row.is_volume()) && !self.on_computer(),
+                    Command::Rename | Command::Delete | Command::Cut | Command::Copy => has_target,
+                    Command::Paste => self.clip.is_some() && !self.on_computer(),
                     Command::NewFolder => !self.on_computer(),
                     _ => true,
                 };
+                if self.pop.is_some_and(|(open, _)| open == *command) {
+                    draw::rounded(s, *rect, ctx.px(theme::R_ROW), ctx.flat(p.btn), 255);
+                }
                 let ink = if enabled { p.ink2 } else { p.ink5 };
-                let glyph = ctx.px(14);
-                glyphicon::draw(s, icon, rect.x + ctx.px(8) as i32, rect.y + (rect.h as i32 - glyph as i32) / 2, glyph, ink, 255);
-                paint::text(inner, s, Role::Body, rect.x + ctx.px(28) as i32, paint::baseline(inner, Role::Body, *rect), label, ink);
+                let glyph = ctx.px(18);
+                let gx = if label.is_empty() { rect.x + (rect.w as i32 - glyph as i32) / 2 } else { rect.x + ctx.px(8) as i32 };
+                iconset::draw(s, icon, gx, rect.y + (rect.h as i32 - glyph as i32) / 2, glyph, ink, 255);
+                if !label.is_empty() {
+                    paint::text(inner, s, Role::Body, rect.x + ctx.px(32) as i32, paint::baseline(inner, Role::Body, *rect), label, ink);
+                }
             }
         }
     }
@@ -2073,12 +2573,15 @@ impl Files {
 
         if !plan.header.is_empty() {
             let y = paint::baseline(ctx, Role::Caption, plan.header);
-            paint::text(ctx, s, Role::Caption, plan.header.x + ctx.px(18) as i32, y, "Имя", p.ink4);
+            // Столбец сортировки — со стрелкой (↑ по возрастанию, ↓ по убыванию).
+            let arrow = if self.descending { " ↓" } else { " ↑" };
+            let title = |key: SortKey| if key == self.sort && !self.on_computer() { format!("{}{arrow}", key.title()) } else { String::from(key.title()) };
+            paint::text(ctx, s, Role::Caption, plan.header.x + ctx.px(18) as i32, y, &title(SortKey::Name), p.ink4);
             if wide {
-                paint::text(ctx, s, Role::Caption, date_x, y, "Дата изменения", p.ink4);
-                paint::text(ctx, s, Role::Caption, type_x, y, "Тип", p.ink4);
+                paint::text(ctx, s, Role::Caption, date_x, y, &title(SortKey::Date), p.ink4);
+                paint::text(ctx, s, Role::Caption, type_x, y, &title(SortKey::Kind), p.ink4);
             }
-            paint::text_right(ctx, s, Role::Caption, size_right, y, "Размер", p.ink4);
+            paint::text_right(ctx, s, Role::Caption, size_right, y, &title(SortKey::Size), p.ink4);
             draw::hline(
                 s,
                 plan.header.x + ctx.px(12) as i32,
@@ -2109,17 +2612,19 @@ impl Files {
             return;
         }
         if self.rows.is_empty() {
-            let rect = plan.row_rect(ctx, 0);
-            paint::text_clipped(
-                ctx,
-                s,
-                Role::Body,
-                rect.x + ctx.px(10) as i32,
-                paint::baseline(ctx, Role::Body, rect),
-                rect.w.saturating_sub(ctx.px(20)),
-                "Эта папка пуста",
-                p.ink4,
-            );
+            // Пустая папка (макет 14): по центру значок, надпись и подсказка.
+            let side = ctx.px(64);
+            let cx = plan.list.x + plan.list.w as i32 / 2;
+            let top = plan.list.y + plan.list.h as i32 / 3 - side as i32;
+            let icon = Rect::new(cx - side as i32 / 2, top.max(plan.list.y), side, side);
+            draw_design_icon(&self.icons, s, icon, "folder");
+            let title = "Эта папка пуста";
+            let hint = "Перетащите файлы сюда или нажмите «Создать»";
+            let y = icon.bottom() + ctx.px(14) as i32;
+            let tw = ctx.face(Role::Strong).width(title) as i32;
+            paint::text(ctx, s, Role::Strong, cx - tw / 2, y, title, p.ink2);
+            let hw = ctx.face(Role::Body).width(hint) as i32;
+            paint::text(ctx, s, Role::Body, cx - hw / 2, y + ctx.px(26) as i32, hint, p.ink4);
             return;
         }
 
@@ -2128,7 +2633,7 @@ impl Files {
         let first = self.first_visible(visible);
         for (offset, row) in self.rows.iter().skip(first).take(visible).enumerate() {
             let rect = plan.row_rect(ctx, offset);
-            let selected = first + offset == self.selected;
+            let selected = first + offset == self.selected || self.picked.contains(&(first + offset));
             let state = if selected { RowState::Selected } else { RowState::Idle };
             paint::row(ctx, s, rect, state);
 
@@ -2247,10 +2752,12 @@ impl Files {
         } else {
             // Как в Проводнике (72g): число объектов и выбранное с размером.
             let mut text = format!("{} объектов", self.rows.len());
-            if let Some(row) = self.rows.get(self.selected) {
-                text.push_str("  |  Выбрано: 1");
-                if !row.directory {
-                    text.push_str(&format!("  {}", human_size(row.size)));
+            let targets = self.targets();
+            if !targets.is_empty() {
+                text.push_str(&format!("  |  Выбрано: {}", targets.len()));
+                let bytes: u64 = targets.iter().filter_map(|index| self.rows.get(*index)).filter(|row| !row.directory).map(|row| row.size).sum();
+                if bytes > 0 {
+                    text.push_str(&format!("  {}", human_size(bytes)));
                 }
             }
             text
@@ -2442,14 +2949,21 @@ fn layout(ctx: Ctx, area: Rect) -> Plan {
         let face = ctx.face(Role::Body);
         let mut cx = area.x + pad as i32 - ctx.px(6) as i32;
         let cy = toolbar.bottom() + ctx.px(4) as i32;
-        for command in [Command::NewFolder, Command::Rename, Command::Delete, Command::Properties] {
-            let width = ctx.px(36) + face.width(command.look().1);
+        let mut group = 0;
+        for command in Command::ALL {
+            // Между группами — место под черту.
+            if command.group() != group {
+                group = command.group();
+                cx += ctx.px(13) as i32;
+            }
+            let label = command.look().1;
+            let width = if label.is_empty() { ctx.px(32) } else { ctx.px(40) + face.width(label) };
             let rect = Rect::new(cx, cy, width, command_h.saturating_sub(ctx.px(8)));
             if rect.right() > area.right() - pad as i32 {
                 break;
             }
             commands.push((command, rect));
-            cx += (width + ctx.px(4)) as i32;
+            cx += (width + ctx.px(2)) as i32;
         }
     }
 
@@ -2504,23 +3018,45 @@ fn layout(ctx: Ctx, area: Rect) -> Plan {
     }
 }
 
-/// Кнопки панели команд «Файлов» (72g, макет 14).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Кнопки панели команд «Файлов» (макет 14): «Создать» | вырезать,
+/// копировать, вставить, переименовать, удалить — значками | «Сортировка»,
+/// «Вид».
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Command {
     NewFolder,
+    Cut,
+    Copy,
+    Paste,
     Rename,
     Delete,
-    Properties,
+    Sort,
+    View,
 }
 
 impl Command {
-    /// Значок и подпись.
-    fn look(self) -> (Icon, &'static str) {
+    const ALL: [Command; 8] =
+        [Command::NewFolder, Command::Cut, Command::Copy, Command::Paste, Command::Rename, Command::Delete, Command::Sort, Command::View];
+
+    /// Значок и подпись (у кнопок-значков подписи нет — она в подсказке).
+    const fn look(self) -> (Fi, &'static str) {
         match self {
-            Command::NewFolder => (Icon::Folder, "Создать папку"),
-            Command::Rename => (Icon::File, "Переименовать"),
-            Command::Delete => (Icon::Close, "Удалить"),
-            Command::Properties => (Icon::Info, "Свойства"),
+            Command::NewFolder => (Fi::Plus, "Создать"),
+            Command::Cut => (Fi::Cut, ""),
+            Command::Copy => (Fi::Copy, ""),
+            Command::Paste => (Fi::Paste, ""),
+            Command::Rename => (Fi::Rename, ""),
+            Command::Delete => (Fi::Trash, ""),
+            Command::Sort => (Fi::List, "Сортировка"),
+            Command::View => (Fi::Apps, "Вид"),
+        }
+    }
+
+    /// Группа: между группами — черта.
+    const fn group(self) -> u8 {
+        match self {
+            Command::NewFolder => 0,
+            Command::Sort | Command::View => 2,
+            _ => 1,
         }
     }
 }
@@ -2597,21 +3133,27 @@ struct PlaceSlot {
 fn places(home: &str) -> Vec<(Option<&'static str>, String)> {
     // Как в Проводнике (72g, макет 14): дом и его папки, черта, «Этот
     // компьютер» и диски. Папка дома показывается, только если она есть.
+    // Макет 14: «Главная» | папки дома | «Этот компьютер», под ним диски
+    // (с отступом), «Корзина».
     let mut out = alloc::vec![(None, home.to_string())];
+    let mut first = true;
     for name in ["Desktop", "Downloads", "Documents", "Pictures", "Music", "Videos"] {
         let path = format!("{home}/{name}");
         let mut info = Stat::default();
         if stat(&path, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
-            out.push((None, path));
+            out.push((if first { Some("—") } else { None }, path));
+            first = false;
+        }
+    }
+    out.push((Some("—"), String::from(COMPUTER)));
+    out.push((None, String::from("/")));
+    for disk in ["/data", "/usb"] {
+        let mut info = Stat::default();
+        if stat(disk, &mut info) >= 0 && info.kind == KIND_DIRECTORY {
+            out.push((None, String::from(disk)));
         }
     }
     out.push((None, format!("{home}/.local/share/Trash/files")));
-    out.push((Some("—"), String::from(COMPUTER)));
-    out.push((None, String::from("/")));
-    let mut info = Stat::default();
-    if stat("/usb", &mut info) >= 0 && info.kind == KIND_DIRECTORY {
-        out.push((None, String::from("/usb")));
-    }
     out
 }
 
@@ -2624,6 +3166,7 @@ fn place_title<'a>(path: &'a str, home: &str) -> &'a str {
         _ if path == COMPUTER => "Этот компьютер",
         _ if path == "/" => "Системный диск",
         _ if path == "/usb" => "USB-накопитель",
+        _ if path == "/data" => "Данные",
         _ if path.ends_with("/.local/share/Trash/files") => "Корзина",
         "Desktop" => "Рабочий стол",
         "Downloads" => "Загрузки",
@@ -2644,6 +3187,7 @@ fn place_icon(path: &str, home: &str) -> &'static str {
         COMPUTER => "place-this-pc",
         "/" => "place-system-disk",
         "/usb" => "place-usb-stick",
+        "/data" => "place-local-disk",
         _ if path.ends_with("/.local/share/Trash/files") => {
             if dir_has_entries(path) { "place-trash-full" } else { "place-trash-empty" }
         }
@@ -2721,10 +3265,12 @@ fn place_slots(ctx: Ctx, side: Rect, home: &str) -> Vec<PlaceSlot> {
         } else {
             0
         };
+        // Диски — под «Этим компьютером», с отступом.
+        let indent = if matches!(path.as_str(), "/" | "/data" | "/usb") { ctx.px(16) } else { 0 };
         let rect = Rect::new(
-            side.x + padx as i32,
+            side.x + (padx + indent) as i32,
             y,
-            side.w.saturating_sub(padx * 2),
+            side.w.saturating_sub(padx * 2 + indent),
             row_h,
         );
         y += (row_h + gap) as i32;
@@ -2741,6 +3287,49 @@ fn place_slots(ctx: Ctx, side: Rect, home: &str) -> Vec<PlaceSlot> {
 // ---------------------------------------------------------------------------
 // Файловая система
 // ---------------------------------------------------------------------------
+
+/// Свободное имя в папке для копии: «Отчёт.txt», иначе «Отчёт — копия.txt»,
+/// «Отчёт — копия (2).txt».
+fn unique_name(dir: &str, name: &str) -> String {
+    let first = join(dir, name);
+    if !exists(&first) {
+        return first;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(at) if at > 0 => (&name[..at], &name[at..]),
+        _ => (name, ""),
+    };
+    for attempt in 1..1000u32 {
+        let candidate = if attempt == 1 { format!("{stem} — копия{ext}") } else { format!("{stem} — копия ({attempt}){ext}") };
+        let path = join(dir, &candidate);
+        if !exists(&path) {
+            return path;
+        }
+    }
+    first
+}
+
+/// Разложить копирование `src` в `dst` на шаги: папки — заведением и
+/// содержимым, файлы — с размером.
+fn expand(src: &str, dst: &str, ops: &mut Vec<Op>, depth: u32) {
+    let mut info = Stat::default();
+    if stat(src, &mut info) < 0 {
+        return;
+    }
+    if info.kind == KIND_DIRECTORY {
+        ops.push(Op::Dir(dst.to_string()));
+        if depth > 64 {
+            return;
+        }
+        if let Ok((rows, _)) = list_dir(src) {
+            for row in rows {
+                expand(&join(src, &row.name), &join(dst, &row.name), ops, depth + 1);
+            }
+        }
+    } else {
+        ops.push(Op::File { src: src.to_string(), dst: dst.to_string(), size: info.size });
+    }
+}
 
 /// Собрать путь к записи внутри каталога.
 fn join(dir: &str, name: &str) -> String {
@@ -3109,6 +3698,67 @@ impl App for Files {
 
     fn key(&mut self, code: u32) -> bool {
         self.on_key(code)
+    }
+
+    /// Сочетания (макет 14): Ctrl+X/C/V/A, Alt+Enter — свойства, Shift+стрелки
+    /// и пробел — отметить несколько. Остальное — [`Files::on_key`].
+    fn key_with(&mut self, code: u32, mods: i32, latin: u32) -> bool {
+        if let Some((command, selected)) = self.pop {
+            let count = self.pop_entries(command).len();
+            match code {
+                WIN_KEY_UP => self.pop = Some((command, selected.saturating_sub(1))),
+                WIN_KEY_DOWN => self.pop = Some((command, (selected + 1).min(count.saturating_sub(1)))),
+                ENTER => self.run_pop(command, selected),
+                _ => self.pop = None,
+            }
+            return true;
+        }
+        let busy = self.menu.is_some() || self.searching || self.preview.is_some() || self.props.is_some();
+        if !busy {
+            let letter = char::from_u32(latin).map(|ch| ch.to_ascii_lowercase());
+            if mods & WIN_MOD_CTRL != 0 {
+                match letter {
+                    Some('x') => return self.run_command(Command::Cut),
+                    Some('c') => return self.run_command(Command::Copy),
+                    Some('v') => return self.run_command(Command::Paste),
+                    Some('a') => {
+                        self.picked = (0..self.rows.len()).filter(|index| !self.rows[*index].is_volume()).collect();
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            if mods & WIN_MOD_ALT != 0 && code == ENTER {
+                if self.rows.get(self.selected).is_some() {
+                    self.show_props(self.selected);
+                } else {
+                    self.show_folder_props();
+                }
+                return true;
+            }
+            if mods & WIN_MOD_SHIFT != 0 && matches!(code, WIN_KEY_UP | WIN_KEY_DOWN) && !self.rows.is_empty() {
+                self.picked.insert(self.selected);
+                let changed = self.on_key(code);
+                self.picked.insert(self.selected);
+                return changed;
+            }
+            if code == u32::from(b' ') && !self.rows.is_empty() {
+                if !self.picked.remove(&self.selected) {
+                    self.picked.insert(self.selected);
+                }
+                return true;
+            }
+            // Стрелка без Shift снимает отметки — как в Проводнике.
+            if matches!(code, WIN_KEY_UP | WIN_KEY_DOWN | WIN_KEY_HOME | WIN_KEY_END) {
+                self.picked.clear();
+            }
+        }
+        self.on_key(code)
+    }
+
+    /// Копирование кусками — на каждом витке цикла окна.
+    fn step(&mut self) -> bool {
+        self.copy_step()
     }
 
     fn click(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
