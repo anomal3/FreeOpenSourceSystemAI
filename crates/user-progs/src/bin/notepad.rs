@@ -179,6 +179,10 @@ enum Cmd {
     SelectAll,
     LineNumbers,
     Font,
+    Find,
+    FindNext,
+    Replace,
+    Wrap,
     Lang(usize),
 }
 
@@ -247,7 +251,27 @@ struct Editor {
     home: String,
     font: TextFont,
     font_dialog: Option<FontDialog>,
+    /// Перенос по словам (Вид).
+    wrap: bool,
+    /// Экранные строки последней отрисовки: строка текста, кусок, верх.
+    screen_map: RefCell<Vec<(usize, usize, usize, i32)>>,
+    /// Панель «Найти» / «Заменить».
+    find: Option<FindBar>,
 }
+
+/// Панель поиска над текстом (Ctrl+F, Ctrl+H).
+struct FindBar {
+    what: String,
+    with: String,
+    /// С полем замены.
+    replace: bool,
+    /// Курсор в поле замены (иначе — в поле поиска).
+    in_with: bool,
+}
+
+/// Высота панели поиска.
+const FIND_H: u32 = 44;
+const F3: u32 = user_abi::WIN_KEY_F1 + 2;
 
 impl Editor {
     fn new(path: Option<&str>) -> Self {
@@ -277,6 +301,9 @@ impl Editor {
             home: home_dir(),
             font: TextFont { face: None, label: String::from(BUILTIN_FONT), path: None, size: 12 },
             font_dialog: None,
+            wrap: false,
+            screen_map: RefCell::new(Vec::new()),
+            find: None,
         };
         editor.load_font_settings();
         if let Some(path) = path {
@@ -772,7 +799,9 @@ impl Editor {
         } else if self.row >= self.top + rows {
             self.top = self.row + 1 - rows;
         }
-        if self.col < self.left {
+        if self.wrap {
+            self.left = 0;
+        } else if self.col < self.left {
             self.left = self.col;
         } else if self.col >= self.left + cols {
             self.left = self.col + 1 - cols;
@@ -801,9 +830,13 @@ impl Editor {
                 item("Вставить", "Ctrl+V", Cmd::Paste, 1),
                 item("Удалить", "Del", Cmd::Delete, 1),
                 item("Выделить всё", "Ctrl+A", Cmd::SelectAll, 2),
+                item("Найти…", "Ctrl+F", Cmd::Find, 3),
+                item("Найти далее", "F3", Cmd::FindNext, 3),
+                item("Заменить…", "Ctrl+H", Cmd::Replace, 3),
             ],
             Menu::View => vec![
                 item(if self.numbers { "✓ Номера строк" } else { "   Номера строк" }, "", Cmd::LineNumbers, 0),
+                item(if self.wrap { "✓ Перенос по словам" } else { "   Перенос по словам" }, "", Cmd::Wrap, 0),
                 item("Шрифт…", "", Cmd::Font, 1),
             ],
             Menu::Syntax => Lang::ALL
@@ -838,6 +871,24 @@ impl Editor {
             Cmd::SelectAll => self.select_all(),
             Cmd::LineNumbers => self.numbers = !self.numbers,
             Cmd::Font => self.open_font_dialog(),
+            Cmd::Find | Cmd::Replace => {
+                // Выделенное — сразу в поле поиска, как в Блокноте Windows.
+                let what = self.selected_text().filter(|text| !text.contains('\n')).or_else(|| self.find.as_ref().map(|bar| bar.what.clone())).unwrap_or_default();
+                let with = self.find.as_ref().map(|bar| bar.with.clone()).unwrap_or_default();
+                self.find = Some(FindBar { what, with, replace: cmd == Cmd::Replace, in_with: false });
+            }
+            Cmd::FindNext => {
+                if self.find.as_ref().is_some_and(|bar| !bar.what.is_empty()) {
+                    self.find_next();
+                } else {
+                    self.run(Cmd::Find);
+                }
+            }
+            Cmd::Wrap => {
+                self.wrap = !self.wrap;
+                self.left = 0;
+                println(&format!("notepad: wrap {}", if self.wrap { "on" } else { "off" }));
+            }
             Cmd::Lang(index) => self.set_lang(Lang::ALL[index]),
         }
         self.follow();
@@ -1052,6 +1103,225 @@ fn font_plan(ctx: Ctx, area: Rect) -> FontPlan {
     FontPlan { card, fonts, sizes, preview, ok, cancel }
 }
 
+impl Editor {
+    /// Высота панели поиска (ноль — закрыта).
+    fn find_h(&self, ctx: Ctx) -> u32 {
+        if self.find.is_some() { ctx.px(FIND_H) } else { 0 }
+    }
+
+    /// Клавиша панели поиска. `false` — не её (пусть разбирает текст).
+    fn find_key(&mut self, code: u32, mods: i32, latin: u32) -> bool {
+        let ctrl = mods & WIN_MOD_CTRL != 0;
+        if ctrl {
+            // Ctrl+F / Ctrl+H — переключить вид панели; остальное — тексту.
+            return matches!(char::from_u32(latin).map(|ch| ch.to_ascii_lowercase()), Some('f' | 'h')) && {
+                let replace = latin == u32::from(b'h');
+                if let Some(bar) = self.find.as_mut() {
+                    bar.replace = replace;
+                    bar.in_with = false;
+                }
+                true
+            };
+        }
+        let Some(bar) = self.find.as_mut() else {
+            return false;
+        };
+        let field = if bar.in_with { &mut bar.with } else { &mut bar.what };
+        match code {
+            ESCAPE => self.find = None,
+            TAB => {
+                if bar.replace {
+                    bar.in_with = !bar.in_with;
+                }
+            }
+            ENTER => {
+                if bar.in_with {
+                    self.replace_one();
+                } else {
+                    self.find_next();
+                }
+            }
+            BACKSPACE => {
+                field.pop();
+            }
+            code if code < 0x0100_0000 => match char::from_u32(code).filter(|ch| !ch.is_control()) {
+                Some(ch) if field.chars().count() < 200 => field.push(ch),
+                _ => return false,
+            },
+            _ => return false,
+        }
+        true
+    }
+
+    /// Найти следующее вхождение после каретки (без учёта регистра, по кругу).
+    fn find_next(&mut self) -> bool {
+        let Some(what) = self.find.as_ref().map(|bar| bar.what.to_lowercase()).filter(|what| !what.is_empty()) else {
+            return false;
+        };
+        let start = self.selection().map_or((self.row, self.col), |(_, end)| end);
+        let total = self.lines.len();
+        for step in 0..=total {
+            let row = (start.0 + step) % total;
+            let line: Vec<char> = self.lines[row].to_lowercase().chars().collect();
+            let pattern: Vec<char> = what.chars().collect();
+            let from = if step == 0 { start.1 } else { 0 };
+            let found = (from..line.len().saturating_sub(pattern.len()).saturating_add(1)).find(|at| line.get(*at..*at + pattern.len()) == Some(&pattern[..]));
+            if let Some(at) = found {
+                self.anchor = Some((row, at));
+                self.row = row;
+                self.col = at + pattern.len();
+                self.follow();
+                if self.row < self.top || self.row >= self.top + self.page_rows.get() {
+                    self.top = self.row.saturating_sub(self.page_rows.get() / 3);
+                }
+                println(&format!("notepad: found '{what}' at {}:{}", row + 1, at + 1));
+                return true;
+            }
+        }
+        println(&format!("notepad: '{what}' not found"));
+        self.note = Some(format!("«{what}» не найдено"));
+        false
+    }
+
+    /// Заменить найденное (выделенное) и перейти к следующему.
+    fn replace_one(&mut self) {
+        let Some((what, with)) = self.find.as_ref().map(|bar| (bar.what.to_lowercase(), bar.with.clone())) else {
+            return;
+        };
+        if self.selected_text().is_some_and(|text| text.to_lowercase() == what) {
+            self.checkpoint(EditKind::Other);
+            self.delete_selection();
+            self.insert_text(&with);
+            println("notepad: replaced 1");
+        }
+        self.find_next();
+    }
+
+    /// Заменить все вхождения.
+    fn replace_all(&mut self) {
+        let Some((what, with)) = self.find.as_ref().map(|bar| (bar.what.clone(), bar.with.clone())) else {
+            return;
+        };
+        if what.is_empty() {
+            return;
+        }
+        let lower = what.to_lowercase();
+        let pattern: Vec<char> = lower.chars().collect();
+        self.checkpoint(EditKind::Other);
+        let mut count = 0usize;
+        for line in &mut self.lines {
+            let chars: Vec<char> = line.chars().collect();
+            let low: Vec<char> = line.to_lowercase().chars().collect();
+            if low.len() != chars.len() {
+                continue;
+            }
+            let mut out = String::new();
+            let mut at = 0;
+            while at < chars.len() {
+                if low.get(at..at + pattern.len()) == Some(&pattern[..]) {
+                    out.push_str(&with);
+                    at += pattern.len();
+                    count += 1;
+                } else {
+                    out.push(chars[at]);
+                    at += 1;
+                }
+            }
+            *line = out;
+        }
+        if count > 0 {
+            self.dirty = true;
+            self.anchor = None;
+            self.move_caret(self.row, self.col, false);
+            self.touch(0);
+        }
+        println(&format!("notepad: replaced {count}"));
+        self.note = Some(format!("Заменено: {count}"));
+    }
+
+    /// Раскладка панели поиска: поле поиска, поле замены, кнопки.
+    fn find_plan(&self, ctx: Ctx, plan: &Plan) -> (Rect, Rect, Rect, [Rect; 3]) {
+        let bar = Rect::new(plan.text.x, plan.text.y, plan.text.w, ctx.px(FIND_H));
+        let pad = ctx.px(8) as i32;
+        let h = ctx.px(28);
+        let y = bar.y + (bar.h as i32 - h as i32) / 2;
+        let field_w = ctx.px(200);
+        let what = Rect::new(bar.x + pad, y, field_w, h);
+        let with = Rect::new(what.right() + pad, y, field_w, h);
+        let face = ctx.face(Role::Body);
+        let mut x = if self.find.as_ref().is_some_and(|f| f.replace) { with.right() + pad } else { what.right() + pad };
+        let mut buttons = [Rect::EMPTY; 3];
+        for (slot, label) in buttons.iter_mut().zip(["Найти далее", "Заменить", "Заменить все"]) {
+            let w = face.width(label) + ctx.px(20);
+            *slot = Rect::new(x, y, w, h);
+            x += w as i32 + ctx.px(4) as i32;
+        }
+        (bar, what, with, buttons)
+    }
+
+    fn draw_find(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
+        let Some(find) = &self.find else {
+            return;
+        };
+        let p = ctx.palette;
+        let (bar, what, with, buttons) = self.find_plan(ctx, plan);
+        s.fill(bar, ctx.flat(p.panel));
+        draw::hline(s, bar.x, bar.bottom() - 1, bar.w, p.line.color, p.line.alpha);
+        let inner = ctx.on(theme::panel_bg());
+        let fields: &[(Rect, &str, &str, bool)] = &[(what, &find.what, "Найти", !find.in_with), (with, &find.with, "Заменить на", find.in_with)];
+        for (index, (rect, text, hint, focused)) in fields.iter().enumerate() {
+            if index == 1 && !find.replace {
+                continue;
+            }
+            paint::sunk(inner, s, *rect, ctx.px(4));
+            if *focused {
+                draw::rounded_stroke(s, *rect, ctx.px(4), p.acc, 255);
+            }
+            let tx = rect.x + ctx.px(8) as i32;
+            let room = rect.w - ctx.px(16);
+            if text.is_empty() {
+                paint::text_clipped(inner, s, Role::Body, tx, paint::baseline(ctx, Role::Body, *rect), room, hint, p.ink5);
+            } else {
+                paint::text_clipped(inner, s, Role::Body, tx, paint::baseline(ctx, Role::Body, *rect), room, text, p.ink);
+            }
+            if *focused {
+                let w = ctx.face(Role::Body).width(text).min(room);
+                s.fill(Rect::new(tx + w as i32 + 1, rect.y + ctx.px(6) as i32, ctx.px(2), rect.h - ctx.px(12)), p.acc);
+            }
+        }
+        for (index, (rect, label)) in buttons.iter().zip(["Найти далее", "Заменить", "Заменить все"]).enumerate() {
+            if index > 0 && !find.replace {
+                continue;
+            }
+            paint::button(inner, s, *rect, if index == 0 { Weight::Primary } else { Weight::Normal }, label, false);
+        }
+    }
+
+    fn find_click(&mut self, ctx: Ctx, plan: &Plan, x: i32) -> bool {
+        let (_, what, with, buttons) = self.find_plan(ctx, plan);
+        let replace = self.find.as_ref().is_some_and(|bar| bar.replace);
+        if let Some(bar) = self.find.as_mut() {
+            if what.x <= x && x < what.right() {
+                bar.in_with = false;
+                return true;
+            }
+            if replace && with.x <= x && x < with.right() {
+                bar.in_with = true;
+                return true;
+            }
+        }
+        match buttons.iter().position(|rect| rect.x <= x && x < rect.right()) {
+            Some(0) => {
+                self.find_next();
+            }
+            Some(1) if replace => self.replace_one(),
+            Some(2) if replace => self.replace_all(),
+            _ => return false,
+        }
+        true
+    }
+}
+
 impl FileDialog {
     fn reload(&mut self) {
         self.entries = list_dir(&self.dir);
@@ -1257,20 +1527,52 @@ impl Editor {
         }
     }
 
-    /// Столбец под точкой `x` строки `row`.
-    fn col_at(&self, metrics: &TextMetrics, row: usize, x: i32) -> usize {
+    /// Куски строки по экранным строкам: без переноса — один от `left`; с
+    /// переносом — по ширине, разрыв по последнему пробелу.
+    fn segments(&self, metrics: &TextMetrics, line: &str, width: f32) -> Vec<(usize, usize)> {
+        let len = line.chars().count();
+        if !self.wrap {
+            return vec![(self.left.min(len), len)];
+        }
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut pen = 0.0f32;
+        let mut space = None;
+        for (col, ch) in line.chars().enumerate() {
+            let step = self.advance(metrics, ch);
+            if pen + step > width && col > start {
+                let cut = match space {
+                    Some(at) if at > start => at + 1,
+                    _ => col,
+                };
+                out.push((start, cut));
+                pen = line.chars().skip(cut).take(col - cut).map(|c| self.advance(metrics, c)).sum();
+                start = cut;
+                space = None;
+            }
+            if ch == ' ' {
+                space = Some(col);
+            }
+            pen += step;
+        }
+        out.push((start, len));
+        out
+    }
+
+    /// Столбец под точкой `x` в куске строки `row`, начинающемся с `from`.
+    fn col_at(&self, metrics: &TextMetrics, row: usize, from: usize, to: usize, x: i32) -> usize {
         let Some(line) = self.lines.get(row) else {
             return 0;
         };
         let mut pen = metrics.x as f32;
-        for (col, ch) in line.chars().enumerate().skip(self.left) {
+        for (col, ch) in line.chars().enumerate().skip(from).take(to.saturating_sub(from)) {
             let step = self.advance(metrics, ch);
             if (x as f32) < pen + step / 2.0 {
                 return col;
             }
             pen += step;
         }
-        line.chars().count()
+        to
     }
 
     fn draw_text(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
@@ -1283,78 +1585,95 @@ impl Editor {
         }
         let right = plan.text.right() - ctx.px(10) as i32;
         let clip = Rect::new(metrics.x, plan.text.y, (right - metrics.x).max(0) as u32, plan.text.h);
-        let rows = ((plan.text.h as i32 - ctx.px(12) as i32) / metrics.line_h).max(1) as usize;
+        let top_y = plan.text.y + ctx.px(6) as i32 + self.find_h(ctx) as i32;
+        let rows = ((plan.text.bottom() - top_y - ctx.px(6) as i32) / metrics.line_h).max(1) as usize;
         let cols = (((right - metrics.x).max(0) as f32) / metrics.zero_w).max(1.0) as usize;
         self.page_rows.set(rows);
         self.page_cols.set(cols);
-        let top_y = plan.text.y + ctx.px(6) as i32;
         let selection = self.selection();
         let busy = self.dialog.is_some() || self.ask_save.is_some() || self.font_dialog.is_some();
-        for offset in 0..rows {
-            let index = self.top + offset;
+        let width = (right - metrics.x).max(1) as f32;
+        let mut map = Vec::new();
+        let mut drawn = 0usize;
+        let mut index = self.top;
+        while drawn < rows {
             let Some(line) = self.lines.get(index) else {
                 break;
             };
-            let y = top_y + offset as i32 * metrics.line_h;
-            // Где начинается каждый показанный знак (и конец строки).
-            let mut pos: Vec<f32> = Vec::new();
-            let mut pen = metrics.x as f32;
-            for ch in line.chars().skip(self.left) {
-                pos.push(pen);
-                if pen > right as f32 {
+            let segments = self.segments(&metrics, line, width);
+            let last = segments.len().saturating_sub(1);
+            let len = line.chars().count();
+            for (number, (from_col, to_col)) in segments.iter().copied().enumerate() {
+                if drawn >= rows {
                     break;
                 }
-                pen += self.advance(&metrics, ch);
-            }
-            pos.push(pen);
-            let x_at = |col: usize| -> f32 {
-                let index = col.saturating_sub(self.left);
-                match pos.get(index) {
-                    Some(x) => *x,
-                    None => pos.last().copied().unwrap_or(metrics.x as f32) + (index + 1 - pos.len()) as f32 * metrics.zero_w,
-                }
-            };
-            if index == self.row && selection.is_none() {
-                draw::blend_rect(s, Rect::new(gutter.right(), y - 1, (plan.text.right() - gutter.right()).max(0) as u32, metrics.line_h as u32), p.hover1.color, p.hover1.alpha);
-            }
-            // Выделенное — подложкой акцента под знаками; перевод строки — ширина «0».
-            if let Some((start, end)) = selection {
-                if index >= start.0 && index <= end.0 {
-                    let from = if index == start.0 { start.1 } else { 0 };
-                    let len = line.chars().count();
-                    let to = if index == end.0 { end.1 } else { len };
-                    let x0 = x_at(from.max(self.left));
-                    let mut x1 = x_at(to.max(self.left));
-                    if index != end.0 {
-                        x1 += metrics.zero_w;
+                let y = top_y + drawn as i32 * metrics.line_h;
+                map.push((index, from_col, to_col, y));
+                drawn += 1;
+                // Где начинается каждый показанный знак куска (и его конец).
+                let mut pos: Vec<f32> = Vec::new();
+                let mut pen = metrics.x as f32;
+                for ch in line.chars().skip(from_col).take(to_col - from_col) {
+                    pos.push(pen);
+                    if pen > right as f32 {
+                        break;
                     }
-                    let x1 = x1.min(right as f32);
-                    if x1 > x0 {
-                        draw::blend_rect(s, Rect::new(x0 as i32, y - 1, (x1 - x0) as u32, metrics.line_h as u32), p.acc, 90);
+                    pen += self.advance(&metrics, ch);
+                }
+                pos.push(pen);
+                let x_at = |col: usize| -> f32 {
+                    let at = col.saturating_sub(from_col);
+                    match pos.get(at) {
+                        Some(x) => *x,
+                        None => pos.last().copied().unwrap_or(metrics.x as f32) + (at + 1 - pos.len()) as f32 * metrics.zero_w,
+                    }
+                };
+                if index == self.row && selection.is_none() {
+                    draw::blend_rect(s, Rect::new(gutter.right(), y - 1, (plan.text.right() - gutter.right()).max(0) as u32, metrics.line_h as u32), p.hover1.color, p.hover1.alpha);
+                }
+                // Выделенное — подложкой акцента; перевод строки — ширина «0».
+                if let Some((start, end)) = selection {
+                    if index >= start.0 && index <= end.0 {
+                        let from = if index == start.0 { start.1 } else { 0 };
+                        let to = if index == end.0 { end.1 } else { len };
+                        let (a, b) = (from.max(from_col), to.min(to_col));
+                        let mut x1 = if b >= a { x_at(b) } else { 0.0 };
+                        let x0 = x_at(a);
+                        if index != end.0 && number == last {
+                            x1 += metrics.zero_w;
+                        }
+                        let x1 = x1.min(right as f32);
+                        if b >= a && x1 > x0 {
+                            draw::blend_rect(s, Rect::new(x0 as i32, y - 1, (x1 - x0) as u32, metrics.line_h as u32), p.acc, 90);
+                        }
+                    }
+                }
+                if self.numbers && number == 0 {
+                    let label = format!("{}", index + 1);
+                    paint::text_right(ctx, s, Role::Mono, gutter.right() - ctx.px(8) as i32, y, &label, if index == self.row { p.ink2 } else { p.ink5 });
+                }
+                // По кускам подсветки — каждый своим цветом.
+                let mut state = self.state_at(index);
+                for (from, to, kind) in syntax::spans(self.lang, line, &mut state) {
+                    let (from, to) = (from.max(from_col), to.min(to_col));
+                    if from >= to {
+                        continue;
+                    }
+                    let piece: String = line.chars().skip(from).take(to - from).collect();
+                    self.draw_piece(s, ctx, &metrics, x_at(from), y, &piece, ink(ctx, kind), clip);
+                }
+                let here = index == self.row && self.col >= from_col && (self.col < to_col || (self.col == to_col && number == last));
+                if here && !busy {
+                    let cx = x_at(self.col) as i32;
+                    if cx <= right {
+                        s.fill(Rect::new(cx, y, ctx.px(2), (metrics.line_h - ctx.px(2) as i32).max(1) as u32), p.acc);
                     }
                 }
             }
-            if self.numbers {
-                let number = format!("{}", index + 1);
-                paint::text_right(ctx, s, Role::Mono, gutter.right() - ctx.px(8) as i32, y, &number, if index == self.row { p.ink2 } else { p.ink5 });
-            }
-            // По кускам подсветки — каждый своим цветом.
-            let mut state = self.state_at(index);
-            for (from, to, kind) in syntax::spans(self.lang, line, &mut state) {
-                let from = from.max(self.left);
-                if from >= to || from >= self.left + pos.len() {
-                    continue;
-                }
-                let piece: String = line.chars().skip(from).take(to - from).collect();
-                self.draw_piece(s, ctx, &metrics, x_at(from), y, &piece, ink(ctx, kind), clip);
-            }
-            if index == self.row && !busy && self.col >= self.left {
-                let cx = x_at(self.col) as i32;
-                if cx <= right {
-                    s.fill(Rect::new(cx, y, ctx.px(2), (metrics.line_h - ctx.px(2) as i32).max(1) as u32), p.acc);
-                }
-            }
+            index += 1;
         }
+        *self.screen_map.borrow_mut() = map;
+        self.draw_find(s, ctx, plan);
     }
 
     fn draw_menu_bar(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
@@ -1524,6 +1843,9 @@ impl App for Editor {
             }
             return true;
         }
+        if self.find.is_some() && self.menu.is_none() && self.lang_menu.is_none() && self.find_key(code, mods, latin) {
+            return true;
+        }
         if let Some((menu, selected)) = self.menu {
             let count = self.items(menu).len();
             let index = MENUS.iter().position(|(m, _)| *m == menu).unwrap_or(0);
@@ -1554,6 +1876,10 @@ impl App for Editor {
             }
             return true;
         }
+        if code == F3 {
+            self.run(Cmd::FindNext);
+            return true;
+        }
         // F10 — полоса меню, как в Windows.
         if code == F10 {
             self.menu = Some((Menu::File, 0));
@@ -1576,6 +1902,8 @@ impl App for Editor {
                 Some('c') => Some(Cmd::Copy),
                 Some('v') => Some(Cmd::Paste),
                 Some('a') => Some(Cmd::SelectAll),
+                Some('f') => Some(Cmd::Find),
+                Some('h') => Some(Cmd::Replace),
                 _ => None,
             };
             if let Some(cmd) = cmd {
@@ -1697,10 +2025,17 @@ impl App for Editor {
             self.lang_menu = Some(Lang::ALL.iter().position(|lang| *lang == self.lang).unwrap_or(0));
             return true;
         }
+        if self.find.is_some() && y < plan.text.y + self.find_h(ctx) as i32 && plan.text.contains(x, y) {
+            return self.find_click(ctx, &plan, x);
+        }
         if plan.text.contains(x, y) {
             let metrics = self.metrics(ctx, &plan);
-            let row = (self.top + ((y - plan.text.y - ctx.px(6) as i32).max(0) / metrics.line_h) as usize).min(self.lines.len() - 1);
-            let col = self.col_at(&metrics, row, x);
+            // Экранная строка под точкой — из раскладки последней отрисовки.
+            let hit = self.screen_map.borrow().iter().rev().find(|(_, _, _, top)| y >= *top).copied();
+            let (row, col) = match hit {
+                Some((row, from, to, _)) => (row, self.col_at(&metrics, row, from, to, x)),
+                None => (self.top, 0),
+            };
             self.move_caret(row, col, false);
             return true;
         }
