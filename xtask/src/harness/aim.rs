@@ -339,7 +339,8 @@ pub fn resolve(aim: Aim, log: &str) -> Result<(i32, i32)> {
         // строки по 37 точек.
         Aim::TaskRow(n) => {
             let rect = window(log, "Task Manager")?;
-            (rect.x + 400, rect.y + TITLE_H + 58 + 46 + 36 + n * 37 + 18)
+            // Шапка 56 (макет 17), заголовок таблицы 46, секция 36, строка 34.
+            (rect.x + 400, rect.y + TITLE_H + 56 + 46 + 36 + n * 34 + 17)
         }
         Aim::Program(title, x, y) => {
             let rect = window(log, title)?;

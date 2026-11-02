@@ -293,7 +293,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 59] = [
+const PROGRAMS: [(&CStr16, &str); 60] = [
     // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
     // но едет тем же путём — так он есть и на установленной системе.
     (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
@@ -354,6 +354,7 @@ const PROGRAMS: [(&CStr16, &str); 59] = [
     // Блокнот и калькулятор (фаза 70b).
     (cstr16!("\\FREEOS\\BIN\\NOTEPAD"), "notepad"),
     (cstr16!("\\FREEOS\\BIN\\CALC"), "calc"),
+    (cstr16!("\\FREEOS\\BIN\\STUCK"), "stuck"),
     // Своя среда .NET (веха v0.7c, фаза N2).
     (cstr16!("\\FREEOS\\BIN\\DOTNET"), "dotnet"),
     (cstr16!("\\FREEOS\\BIN\\WINSHOW"), "winshow"),

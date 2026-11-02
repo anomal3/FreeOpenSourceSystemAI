@@ -49,7 +49,7 @@ use mini_ui::glyphicon::{self, Icon};
 use mini_ui::typeface::Role;
 use mini_ui::{Rect, Surface};
 
-use mini_ui::paint::{self, Ctx, RowState, Tone};
+use mini_ui::paint::{self, Ctx, RowState};
 use mini_ui::theme;
 use crate::input::{KeyCode, KeyEvent};
 use crate::vfs::perm::Access;
@@ -78,7 +78,7 @@ const ICON_GAP: u32 = 10;
 /// Поле разделителя сверху и снизу.
 const SEP_PAD: u32 = 4;
 /// Подсказка под вопросом об удалении — она же задаёт наименьшую ширину меню.
-const CONFIRM_HINT: &str = "Y — удалить    N — оставить";
+const CONFIRM_HINT: &str = "Enter или Y — удалить    Esc или N — отмена";
 
 /// Что предлагает меню.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1191,10 +1191,9 @@ fn rows_height(ctx: Ctx, items: &[Action]) -> u32 {
 
 /// Высота карточки с вопросом об удалении.
 fn confirm_height(ctx: Ctx) -> u32 {
-    let chip = ctx.px(22);
-    let body = u32::from(ctx.face(Role::Body).line);
-    let hint = u32::from(ctx.face(Role::Caption).line);
-    ctx.px(CARD_PAD + 4) + chip + ctx.px(10) + body + ctx.px(10) + hint + ctx.px(CARD_PAD + 4)
+    let title = u32::from(ctx.face(Role::Strong).line);
+    let caption = u32::from(ctx.face(Role::Caption).line);
+    ctx.px(CARD_PAD + 4) + title + ctx.px(8) + caption * 2 + ctx.px(10) + caption + ctx.px(CARD_PAD + 4)
 }
 
 /// Ширина места под крестик в строке окна.
@@ -1292,15 +1291,20 @@ fn draw_confirm(ctx: Ctx, s: &mut Surface, card: Rect, name: &str, forever: bool
     let width = card.w.saturating_sub(pad * 2);
     let mut y = card.y + ctx.px(CARD_PAD + 4) as i32;
 
-    let (title, tone) = if forever { ("УДАЛИТЬ НАВСЕГДА", Tone::Bad) } else { ("В КОРЗИНУ", Tone::Warn) };
-    let chip = Rect::new(left, y, paint::chip_width(ctx, title), ctx.px(22));
-    paint::chip(ctx, s, chip, title, tone);
-    y += (chip.h + ctx.px(10)) as i32;
-
-    paint::text_clipped(ctx, s, Role::Body, left, y, width, name, p.ink2);
-    y += (u32::from(ctx.face(Role::Body).line) + ctx.px(10)) as i32;
-
-    paint::text_clipped(ctx, s, Role::Caption, left, y, width, CONFIRM_HINT, p.bad_ink);
+    // Макет 18: вопрос, пояснение, что будет; ответ — клавишей.
+    let (question, first, second) = if forever {
+        (alloc::format!("Стереть: {name}?"), "Удалённое из корзины стирается навсегда.", "Вернуть его будет нельзя.")
+    } else {
+        (alloc::format!("Удалить «{name}»?"), "Файл будет перемещён в корзину.", "Его можно восстановить, пока корзина не очищена.")
+    };
+    paint::text_clipped(ctx, s, Role::Strong, left, y, width, &question, p.ink);
+    y += (u32::from(ctx.face(Role::Strong).line) + ctx.px(8)) as i32;
+    for line in [first, second] {
+        paint::text_clipped(ctx, s, Role::Caption, left, y, width, line, p.ink3);
+        y += i32::from(ctx.face(Role::Caption).line);
+    }
+    y += ctx.px(10) as i32;
+    paint::text_clipped(ctx, s, Role::Caption, left, y, width, CONFIRM_HINT, if forever { p.bad_ink } else { p.acc_ink });
 }
 
 /// Каталог стола — там появляется всё, что создаётся его меню.

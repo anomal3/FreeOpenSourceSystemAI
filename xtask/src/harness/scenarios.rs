@@ -2218,8 +2218,9 @@ pub const ALL: &[Scenario] = &[
             // Пятьдесят две — `ctls` (фаза 65c), едет, только если собран mbedTLS.
             // Пятьдесят три — `curl` (фаза 65d), если собран `thirdparty`.
             // Пятьдесят четыре — `csound` (фаза 67f). Пятьдесят пять — `csdl`
-            // (фаза 68b), если собран SDL2 (`thirdparty`).
-            Step::Expect("/bin holds 57 programs"),
+            // (фаза 68b), если собран SDL2 (`thirdparty`). Пятьдесят восемь —
+            // `stuck` (02.11, проверка «Программа не отвечает»).
+            Step::Expect("/bin holds 58 programs"),
             // «Файлы» — четвёртая строка: «Терминал», «Параметры» и «О системе»
             // стоят первыми и в прежнем порядке, на них рассчитаны другие
             // сценарии. Программа из меню открывает своё окно и не поднимает
@@ -2956,6 +2957,24 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Icon(1)),
             Step::DoubleClick,
             Step::Await("desktop     : restored 'Terminal'", 15_000),
+            Step::Wait(1_000),
+            // «Программа не отвечает» (02.11, макет 18): `stuck` не читает
+            // события; крестик — просьба закрыться пролежала 10 с, стол
+            // спрашивает; «Завершить программу» снимает задачу.
+            Step::Line("run -b /bin/stuck"),
+            Step::Await("stuck: window shown, not reading events", 30_000),
+            Step::Wait(1_000),
+            Step::Aim(Aim::Close("Stuck")),
+            Step::Click,
+            Step::Await("desktop     : close requested of 'Stuck'", 15_000),
+            Step::Await("desktop     : 'Stuck' is not responding", 30_000),
+            Step::Wait(1_000),
+            Step::Shot("14-not-responding"),
+            Step::Key("left"),
+            Step::Key("ret"),
+            Step::Await("desktop     : ending the program that does not respond", 15_000),
+            Step::Await("it did not respond", 15_000),
+            Step::Await("desktop     : closed the window of ", 15_000),
             Step::Wait(1_000),
             Step::Type("exit"),
             Step::Key("ret"),
@@ -12140,10 +12159,12 @@ pub const ALL: &[Scenario] = &[
             Step::Await("taskmgr: selected #", 15_000),
             Step::Expect("'sysmon'"),
             Step::Key("delete"),
-            Step::Await("taskmgr: asked #", 15_000),
-            // Стол убирает окно раньше, чем ядро дописывает строку о снятии.
-            Step::Await("desktop     : closed the window of ", 15_000),
+            // Порядок трёх строк — гонка: стол убирает окно, бывает, раньше,
+            // чем диспетчер напишет «asked». Ждётся последняя, остальные —
+            // проверяются уже пришедшими.
             Step::Await("/bin/sysmon: killed by request", 15_000),
+            Step::Expect("taskmgr: asked #"),
+            Step::Expect("desktop     : closed the window of "),
             Step::Wait(2_500),
             Step::Shot("02-ended"),
             // Enter на первой строке — расположение файла самого диспетчера:

@@ -884,6 +884,13 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
         // Подтверждение встаёт по центру и заметно меньше остальных: это вопрос
         // с двумя кнопками, и окно размером с терминал выглядело бы как ещё одна
         // программа, а не как «система ждёт от вас ответа».
+        // «Программа не отвечает» — по макету 18: 480 на 230.
+        App::Hung => {
+            let scale = desktop.scale();
+            let w = (480 * scale).min(width);
+            let h = (230 * scale).min(work);
+            Rect::new(((width.saturating_sub(w)) / 2) as i32, ((work.saturating_sub(h)) / 2) as i32, w, h)
+        }
         // «Как открыть этот файл?» — по макету 18: 480 на 500.
         App::OpenWith => {
             let scale = desktop.scale();
@@ -939,7 +946,7 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
             Window::dialog(app, rect, scale, Dialog::Power { restart: app == App::Restart })
         }
         // Окну выбора программы нужен файл — его строит [`choose_program`].
-        App::OpenWith => None,
+        App::OpenWith | App::Hung => None,
         // Окно программы строится не здесь, и построить его столу нечем: ему
         // нужны кадры, которые выдаёт [`crate::user`]. Сюда приходят с меню и с
         // панели задач, а там окно программы к этому времени уже существует —
@@ -1579,8 +1586,17 @@ pub fn tick() {
         desktop.reload_icons_if_packages_changed();
         desktop.expire_toast();
         desktop.refresh_lock_clock();
+        watch_hung(desktop);
         desktop.present();
     });
+    // «Завершить программу» — вне замка стола: снятие задачи берёт свои.
+    let task = HUNG_KILL.swap(0, Ordering::Relaxed);
+    if task != 0 {
+        match crate::user::request_kill(crate::sched::TaskId::new(task)) {
+            Ok(()) => kprintln!("  desktop     : killed #{task}, it did not respond"),
+            Err(_) => kprintln!("  desktop     : #{task} could not be ended"),
+        }
+    }
 }
 
 /// Смена режима, заказанная не из «Параметров» — командой оболочки ядра
@@ -2974,6 +2990,32 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
 /// этом состоянии не будет. Поэтому здесь поднимается просьба, а гасит систему
 /// задача (см. [`crate::power`]).
 fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
+    if app == App::Hung {
+        let target = *HUNG.lock();
+        if desktop.close(app) {
+            kprintln!("  desktop     : closed '{}'", app.title());
+        }
+        if let Some(target) = target {
+            match answer {
+                // Завершить: снимает задачу [`tick`] — вне замка стола.
+                Answer::Confirm => {
+                    if let App::Program(task, _) = target {
+                        HUNG_KILL.store(task, Ordering::Relaxed);
+                    }
+                    kprintln!("  desktop     : ending the program that does not respond");
+                }
+                // Подождать — ещё столько же.
+                _ => {
+                    if let Some(window) = desktop.find(target) {
+                        window.close_asked = crate::time::uptime_ms();
+                    }
+                    kprintln!("  desktop     : waiting for the program");
+                }
+            }
+        }
+        *HUNG.lock() = None;
+        return;
+    }
     let choice = if app == App::OpenWith && answer == Answer::Open {
         desktop.find(app).and_then(|window| window.open_with_choice())
     } else {
@@ -3239,7 +3281,7 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
     // Диалог разбирает клавиши раньше остальных окон: набирать в нём нечего, а
     // ответ закрывает окно, и закрыть его может только стол.
     if let Some(app) = desktop.focused_app() {
-        if app == App::About || app == App::OpenWith || app.confirms_power().is_some() {
+        if app == App::About || app == App::OpenWith || app == App::Hung || app.confirms_power().is_some() {
             if event.pressed {
                 // `Y` и `N` у вопроса о питании остались с тех пор, когда кнопок
                 // не было: на них стоит стенд, а человеку они не мешают.
@@ -4275,7 +4317,66 @@ fn request_close(desktop: &mut Compositor, app: App) -> bool {
         return false;
     };
     window.push_event(WinEvent { kind: WIN_CLOSE, code: 0, x: 0, y: 0 });
+    // Время первой просьбы: пролежит непрочитанной — программа не отвечает.
+    if window.close_asked == 0 {
+        window.close_asked = crate::time::uptime_ms().max(1);
+    }
     true
+}
+
+/// Через сколько молчания на просьбу закрыться спросить «Завершить?».
+const HUNG_AFTER_MS: u64 = 10_000;
+
+/// Окно, о котором открыт вопрос «Программа не отвечает».
+static HUNG: SpinLock<Option<App>> = SpinLock::new(None);
+/// Задача, которую велено снять, — снимает [`tick`] вне замка стола.
+static HUNG_KILL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Найти окно, не прочитавшее просьбу закрыться за [`HUNG_AFTER_MS`], и
+/// спросить о нём (макет 18).
+fn watch_hung(desktop: &mut Compositor) {
+    let asked = *HUNG.lock();
+    if let Some(target) = asked {
+        // Программа очнулась и закрылась сама — вопрос больше не нужен.
+        if desktop.find(target).is_none() {
+            *HUNG.lock() = None;
+            if desktop.close(App::Hung) {
+                kprintln!("  desktop     : the program closed by itself");
+            }
+        }
+        return;
+    }
+    let now = crate::time::uptime_ms();
+    let mut found = None;
+    for app in desktop.program_apps() {
+        let Some(window) = desktop.find(app) else {
+            continue;
+        };
+        if window.close_asked == 0 {
+            continue;
+        }
+        if !window.close_pending() {
+            // Прочитала: отвечает (может спрашивать «Сохранить?»).
+            window.close_asked = 0;
+            continue;
+        }
+        if now.saturating_sub(window.close_asked) >= HUNG_AFTER_MS {
+            found = Some((app, now.saturating_sub(window.close_asked) / 1000));
+            break;
+        }
+    }
+    let Some((app, seconds)) = found else {
+        return;
+    };
+    let name = name_of(desktop, app);
+    let rect = layout(desktop, App::Hung);
+    let dialog = Dialog::NotResponding { name: name.clone(), seconds };
+    if let Some(window) = Window::dialog(App::Hung, rect, desktop.scale(), dialog) {
+        *HUNG.lock() = Some(app);
+        desktop.push(window);
+        kprintln!("  desktop     : '{name}' is not responding");
+        log_focus(desktop);
+    }
 }
 
 /// Завести задаче `task` окно номер `slot` поверх её поверхности.

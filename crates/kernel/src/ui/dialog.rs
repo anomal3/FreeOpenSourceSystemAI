@@ -50,6 +50,8 @@ pub enum Dialog {
     /// «Как открыть этот файл?» (макет 18): программы списком, флажок
     /// «Всегда открывать этой программой».
     OpenWith(OpenWith),
+    /// «Программа не отвечает» (макет 18): имя программы и сколько секунд.
+    NotResponding { name: String, seconds: u64 },
 }
 
 /// Выбор программы для файла.
@@ -120,7 +122,8 @@ impl DialogView {
         // У вопроса о питании выбрана «Отмена», а не «Выключить»: Enter, нажатый
         // по привычке в только что открывшемся окне, не должен гасить машину.
         let focus = match dialog {
-            Dialog::Power { .. } => 1,
+            // «Подождать» — по умолчанию: Enter по привычке не убивает программу.
+            Dialog::Power { .. } | Dialog::NotResponding { .. } => 1,
             Dialog::About(_) | Dialog::OpenWith(_) => 0,
         };
         Self { dialog, focus, answer: None }
@@ -130,14 +133,14 @@ impl DialogView {
     const fn count(&self) -> usize {
         match self.dialog {
             Dialog::About(_) => 1,
-            Dialog::Power { .. } | Dialog::OpenWith(_) => 2,
+            Dialog::Power { .. } | Dialog::OpenWith(_) | Dialog::NotResponding { .. } => 2,
         }
     }
 
     /// Ответ кнопки с этим номером.
     const fn answer_at(&self, index: usize) -> Answer {
         match (&self.dialog, index) {
-            (Dialog::Power { .. }, 0) => Answer::Confirm,
+            (Dialog::Power { .. } | Dialog::NotResponding { .. }, 0) => Answer::Confirm,
             (Dialog::OpenWith(_), 0) => Answer::Open,
             _ => Answer::Close,
         }
@@ -161,6 +164,10 @@ impl DialogView {
             Dialog::OpenWith(_) => [
                 Some((Answer::Open, Weight::Primary, "ОК")),
                 Some((Answer::Close, Weight::Normal, "Отмена")),
+            ],
+            Dialog::NotResponding { .. } => [
+                Some((Answer::Confirm, Weight::Danger, "Завершить программу")),
+                Some((Answer::Close, Weight::Primary, "Подождать")),
             ],
         };
         let pad = ctx.px(PAD);
@@ -270,6 +277,7 @@ impl DialogView {
         let (icon, tone) = match self.dialog {
             Dialog::About(_) | Dialog::OpenWith(_) => (Icon::Info, Tone::Accent),
             Dialog::Power { .. } => (Icon::Power, Tone::Bad),
+            Dialog::NotResponding { .. } => (Icon::Info, Tone::Warn),
         };
         let tile = Rect::new(area.x + pad, area.y + pad, ctx.px(TILE), ctx.px(TILE));
         // «О системе» — логотип FossAi на плитке (фаза 72a).
@@ -285,6 +293,13 @@ impl DialogView {
             Dialog::About(facts) => draw_about(ctx, s, x, &mut y, width, facts),
             Dialog::Power { restart } => draw_power(ctx, s, x, &mut y, width, *restart),
             Dialog::OpenWith(_) => {}
+            Dialog::NotResponding { name, seconds } => {
+                let p = ctx.palette;
+                paint::text(ctx, s, Role::Heading, x, y, "Программа не отвечает", p.ink);
+                y += line(ctx, Role::Heading) + ctx.px(8) as i32;
+                let text = format!("«{name}» не реагирует уже {seconds} секунд. Подождите или завершите программу — несохранённые данные могут пропасть.");
+                paragraph(ctx, s, Role::Body, x, &mut y, width, &text, p.ink3);
+            }
         }
         self.draw_buttons(s, area, ctx);
     }

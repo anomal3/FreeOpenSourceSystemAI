@@ -2608,13 +2608,16 @@ impl Files {
                 let question = match (menu.target, self.in_trash()) {
                     (None, _) => String::from("Очистить корзину? Всё в ней сотрётся навсегда"),
                     (Some(_), true) => format!("Удалить «{name}» навсегда?"),
-                    (Some(_), false) => format!("Переместить «{name}» в корзину?"),
+                    // Макет 18: вопрос «Удалить?», в корзину — главной кнопкой.
+                    (Some(_), false) if self.picked.len() > 1 => format!("Удалить {} объектов в корзину?", self.picked.len()),
+                    (Some(_), false) => format!("Удалить «{name}» в корзину?"),
                 };
+                let forever = menu.target.is_none() || self.in_trash();
                 paint::text_clipped(inner, s, Role::Body, x, y, room, &question, p.ink);
                 y += ctx.px(30) as i32;
                 let btn_w = ctx.px(120);
                 let btn_h = ctx.px(30);
-                paint::button(inner, s, Rect::new(x, y, btn_w, btn_h), Weight::Danger, "Удалить", false);
+                paint::button(inner, s, Rect::new(x, y, btn_w, btn_h), if forever { Weight::Danger } else { Weight::Primary }, "Удалить", false);
                 paint::button(
                     inner,
                     s,

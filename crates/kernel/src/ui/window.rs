@@ -71,6 +71,9 @@ pub enum App {
     Restart,
     /// «Как открыть этот файл?» — выбор программы для файла (02.11, макет 18).
     OpenWith,
+    /// «Программа не отвечает» (02.11, макет 18): просьба закрыться лежит
+    /// непрочитанной; «Завершить программу» или «Подождать».
+    Hung,
     /// Окно пользовательской программы (фаза 47a).
     ///
     /// Внутри — номер задачи, а **не** имя. Имя у такого окна своё, приезжает
@@ -134,6 +137,7 @@ impl App {
             App::Shutdown => "Выключение",
             App::Restart => "Перезагрузка",
             App::OpenWith => "Открыть с помощью",
+            App::Hung => "Программа не отвечает",
             // Запас, а не подпись: у окна программы есть собственное имя, и
             // берут его из окна ([`Window::caption`]), а не отсюда. Сюда
             // попадают, когда окна уже нет, — например, печатая в журнал о
@@ -176,6 +180,7 @@ impl App {
             App::Settings => Icon::Settings,
             App::Shutdown | App::Restart => Icon::Power,
             App::OpenWith => Icon::File,
+            App::Hung => Icon::Info,
             App::Program(..) => Icon::Package,
         }
     }
@@ -190,6 +195,7 @@ impl App {
             App::Shutdown => "Shut down",
             App::Restart => "Restart",
             App::OpenWith => "Open with",
+            App::Hung => "Not responding",
             // Имя программы в журнал печатает не это: оно приезжает из окна, а
             // здесь стоит родовое слово — на случай, когда окна уже нет.
             App::Program(..) => "Program",
@@ -206,6 +212,7 @@ impl App {
             App::Shutdown => "закрыть том и выключить",
             App::Restart => "закрыть том и запустить снова",
             App::OpenWith => "выбрать программу для файла",
+            App::Hung => "программа не отвечает",
             // В меню запуска окна программ не попадают: их открывает сама
             // программа, а не человек со стола. Строка здесь затем, что разбор
             // обязан быть полным.
@@ -361,6 +368,9 @@ pub struct Window {
     /// есть кнопка на панели и фокус; двигают и растягивают его по просьбе
     /// программы (`ui::begin_move`, `ui::begin_resize`).
     pub frameless: bool,
+    /// Когда программу попросили закрыться (мс со старта); ноль — не просили.
+    /// Просьба, пролежавшая в очереди непрочитанной, — признак зависания.
+    pub close_asked: u64,
     /// В поверхности есть прозрачные точки (альфа в старшем байте, цвет
     /// умножен на неё): стол смешивает окно с тем, что под ним, и углы не
     /// срезает — их рисует программа (окна Wayland: Rider, подсказки JBR).
@@ -535,6 +545,7 @@ impl Window {
             damage: Rect::EMPTY,
             raw_keys: false,
             frameless: false,
+            close_asked: 0,
             translucent: false,
             shaped: false,
             select_from: None,
@@ -1919,6 +1930,15 @@ impl Window {
         match &mut self.content {
             Content::Program(view) => Some(&mut view.pixels),
             _ => None,
+        }
+    }
+
+    /// Лежит ли в очереди непрочитанная просьба закрыться.
+    #[must_use]
+    pub fn close_pending(&self) -> bool {
+        match &self.content {
+            Content::Program(view) => view.events.iter().any(|event| event.kind == user_abi::WIN_CLOSE),
+            _ => false,
         }
     }
 

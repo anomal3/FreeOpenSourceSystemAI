@@ -749,6 +749,12 @@ impl Compositor {
             .collect()
     }
 
+    /// Окна программ (не окна ядра).
+    #[must_use]
+    pub fn program_apps(&self) -> Vec<App> {
+        self.windows.iter().map(|window| window.app).filter(|app| matches!(app, App::Program(..))).collect()
+    }
+
     /// Окна той же программы, что `app`, — в порядке кнопок панели (одна
     /// кнопка на программу, когда панель без подписей).
     #[must_use]
@@ -2119,6 +2125,7 @@ impl Compositor {
                     App::About => alloc::string::String::from("о системе"),
                     App::Shutdown | App::Restart => alloc::string::String::from("вопрос о питании"),
                     App::OpenWith => alloc::string::String::from("выбор программы"),
+                    App::Hung => alloc::string::String::from("программа не отвечает"),
                     App::Program(task, _) => alloc::format!("задача #{task}"),
                 },
                 age: tray::age_text(now.saturating_sub(window.minimized_at_ms)),

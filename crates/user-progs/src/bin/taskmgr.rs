@@ -71,12 +71,12 @@ const NEW_TASK: u32 = 'n' as u32;
 // группы.
 // ---------------------------------------------------------------------------
 
-const NAV_W: u32 = 210;
+const NAV_W: u32 = 220;
 const NAV_W_FOLDED: u32 = 56;
-const HEADER_H: u32 = 58;
+const HEADER_H: u32 = 56;
 const HEAD_H: u32 = 46;
 const GROUP_H: u32 = 36;
-const ROW_H: u32 = 37;
+const ROW_H: u32 = 34;
 const STATUS_H: u32 = 30;
 
 // ---------------------------------------------------------------------------
@@ -333,11 +333,11 @@ impl Plan {
         let pad = ctx.px(16) as i32;
         let bh = ctx.px(32);
         let by = header.y + (header.h as i32 - bh as i32) / 2;
-        let end_w = button_w(ctx, "Завершить задачу");
-        let run_w = button_w(ctx, "Запустить новую задачу");
+        let end_w = button_w(ctx, "Снять задачу");
+        let run_w = button_w(ctx, "Новая задача");
         let end_button = Rect::new(header.right() - pad - end_w as i32, by, end_w, bh);
         let run_button = Rect::new(end_button.x - ctx.px(10) as i32 - run_w as i32, by, run_w, bh);
-        let search_w = ctx.px(210);
+        let search_w = ctx.px(240);
         let search = Rect::new(run_button.x - ctx.px(10) as i32 - search_w as i32, by, search_w, bh);
         let burger = Rect::new(nav.x + ctx.px(8) as i32, nav.y + ctx.px(12) as i32, ctx.px(40), ctx.px(36));
         Self { nav, header, body, status, search, run_button, end_button, burger }
@@ -824,7 +824,7 @@ impl Manager {
             let tx = field.x + ctx.px(34) as i32;
             let room = (field.right() - tx - ctx.px(8) as i32).max(0) as u32;
             if self.query.is_empty() && !self.searching {
-                paint::text_clipped(ctx, s, Role::Body, tx, paint::baseline(ctx, Role::Body, field), room, "Введите имя", p.ink5);
+                paint::text_clipped(ctx, s, Role::Body, tx, paint::baseline(ctx, Role::Body, field), room, "Поиск процесса", p.ink5);
             } else {
                 paint::text_clipped(ctx, s, Role::Body, tx, paint::baseline(ctx, Role::Body, field), room, &self.query, p.ink);
                 if self.searching {
@@ -833,9 +833,10 @@ impl Manager {
                 }
             }
         }
-        icon_button(ctx, s, plan.run_button, Fi::Plus, "Запустить новую задачу", Weight::Normal);
+        icon_button(ctx, s, plan.run_button, Fi::Plus, "Новая задача", Weight::Normal);
         let can_end = self.selected_task().is_some_and(|task| task.kind != Kind::Kernel);
-        icon_button(ctx, s, plan.end_button, Fi::X, "Завершить задачу", if can_end { Weight::Normal } else { Weight::Ghost });
+        // Макет 17: «Снять задачу» — красная; у задачи ядра гаснет.
+        icon_button(ctx, s, plan.end_button, Fi::X, "Снять задачу", if can_end { Weight::Danger } else { Weight::Ghost });
     }
 
     fn draw_processes(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
