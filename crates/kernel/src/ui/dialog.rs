@@ -52,6 +52,8 @@ pub enum Dialog {
     OpenWith(OpenWith),
     /// «Программа не отвечает» (макет 18): имя программы и сколько секунд.
     NotResponding { name: String, seconds: u64 },
+    /// «Удалить «имя»?» (макет 18) — в корзину.
+    Delete { question: String },
 }
 
 /// Выбор программы для файла.
@@ -124,7 +126,7 @@ impl DialogView {
         let focus = match dialog {
             // «Подождать» — по умолчанию: Enter по привычке не убивает программу.
             Dialog::Power { .. } | Dialog::NotResponding { .. } => 1,
-            Dialog::About(_) | Dialog::OpenWith(_) => 0,
+            Dialog::About(_) | Dialog::OpenWith(_) | Dialog::Delete { .. } => 0,
         };
         Self { dialog, focus, answer: None }
     }
@@ -133,14 +135,14 @@ impl DialogView {
     const fn count(&self) -> usize {
         match self.dialog {
             Dialog::About(_) => 1,
-            Dialog::Power { .. } | Dialog::OpenWith(_) | Dialog::NotResponding { .. } => 2,
+            Dialog::Power { .. } | Dialog::OpenWith(_) | Dialog::NotResponding { .. } | Dialog::Delete { .. } => 2,
         }
     }
 
     /// Ответ кнопки с этим номером.
     const fn answer_at(&self, index: usize) -> Answer {
         match (&self.dialog, index) {
-            (Dialog::Power { .. } | Dialog::NotResponding { .. }, 0) => Answer::Confirm,
+            (Dialog::Power { .. } | Dialog::NotResponding { .. } | Dialog::Delete { .. }, 0) => Answer::Confirm,
             (Dialog::OpenWith(_), 0) => Answer::Open,
             _ => Answer::Close,
         }
@@ -168,6 +170,10 @@ impl DialogView {
             Dialog::NotResponding { .. } => [
                 Some((Answer::Confirm, Weight::Danger, "Завершить программу")),
                 Some((Answer::Close, Weight::Primary, "Подождать")),
+            ],
+            Dialog::Delete { .. } => [
+                Some((Answer::Confirm, Weight::Primary, "Удалить")),
+                Some((Answer::Close, Weight::Normal, "Отмена")),
             ],
         };
         let pad = ctx.px(PAD);
@@ -278,6 +284,7 @@ impl DialogView {
             Dialog::About(_) | Dialog::OpenWith(_) => (Icon::Info, Tone::Accent),
             Dialog::Power { .. } => (Icon::Power, Tone::Bad),
             Dialog::NotResponding { .. } => (Icon::Info, Tone::Warn),
+            Dialog::Delete { .. } => (Icon::Close, Tone::Accent),
         };
         let tile = Rect::new(area.x + pad, area.y + pad, ctx.px(TILE), ctx.px(TILE));
         // «О системе» — логотип FossAi на плитке (фаза 72a).
@@ -293,6 +300,12 @@ impl DialogView {
             Dialog::About(facts) => draw_about(ctx, s, x, &mut y, width, facts),
             Dialog::Power { restart } => draw_power(ctx, s, x, &mut y, width, *restart),
             Dialog::OpenWith(_) => {}
+            Dialog::Delete { question } => {
+                let p = ctx.palette;
+                paint::text(ctx, s, Role::Heading, x, y, question, p.ink);
+                y += line(ctx, Role::Heading) + ctx.px(8) as i32;
+                paragraph(ctx, s, Role::Body, x, &mut y, width, "Файл будет перемещён в корзину. Его можно будет восстановить, пока корзина не очищена.", p.ink3);
+            }
             Dialog::NotResponding { name, seconds } => {
                 let p = ctx.palette;
                 paint::text(ctx, s, Role::Heading, x, y, "Программа не отвечает", p.ink);

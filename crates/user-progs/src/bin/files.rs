@@ -529,6 +529,19 @@ struct Files {
     clip: Option<(Vec<String>, bool)>,
     /// Идущее копирование.
     job: Option<CopyJob>,
+    /// Перетаскивание строк мышью (02.11): откуда, где сейчас, куда бросить.
+    drag: Option<Drag>,
+}
+
+/// Строки, которые тянут мышью.
+struct Drag {
+    from: usize,
+    start: (i32, i32),
+    at: (i32, i32),
+    /// Сдвинулись дальше порога — это перетаскивание, а не щелчок.
+    active: bool,
+    /// Папка под указателем, куда отпустить: путь и где она на экране.
+    target: Option<(String, Rect)>,
 }
 
 /// По чему сортировать список.
@@ -603,6 +616,7 @@ impl Files {
             pop: None,
             clip: None,
             job: None,
+            drag: None,
             path,
             back: Vec::new(),
             forward: Vec::new(),
@@ -788,14 +802,22 @@ impl Files {
 
     /// Вставить из буфера «Файлов» в открытую папку.
     fn paste(&mut self) -> bool {
-        if self.on_computer() || self.job.is_some() {
+        if self.on_computer() {
+            return false;
+        }
+        let dir = self.path.clone();
+        self.paste_into(dir)
+    }
+
+    /// Вставить буфер «Файлов» в папку `dir`.
+    fn paste_into(&mut self, dir: String) -> bool {
+        if self.job.is_some() {
             return false;
         }
         let Some((paths, cut)) = self.clip.clone() else {
             self.note = Some(String::from("Буфер пуст: сначала «Копировать» или «Вырезать»"));
             return true;
         };
-        let dir = self.path.clone();
         let mut ops = Vec::new();
         let mut remove_after = Vec::new();
         let mut moved = 0usize;
@@ -1591,7 +1613,8 @@ impl Files {
                 return;
             }
             _ => {
-                let code = if self.in_trash() { remove_tree(&path, 0) } else { remove(&path) };
+                // Другой том (корзины нет) — стирается целиком, с содержимым.
+                let code = remove_tree(&path, 0);
                 if code < 0 {
                     println(&format!("files: delete of '{name}' failed: {code}"));
                     self.note = Some(format!("Не удалось удалить: {}", error_text(code)));
@@ -2007,7 +2030,97 @@ impl Files {
             return self.open_selected();
         }
         self.last_click = Some((index, now));
+        // Нажатие на строке — возможно, начало перетаскивания.
+        if !self.on_computer() && self.rows.get(index).is_some_and(|row| !row.is_volume()) {
+            self.drag = Some(Drag { from: index, start: (x, y), at: (x, y), active: false, target: None });
+        }
         true
+    }
+
+    /// Указатель с зажатой кнопкой: тянуть строку, подсветить папку под ним.
+    fn on_drag(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        if self.drag.is_none() {
+            return false;
+        }
+        let plan = layout(ctx, area);
+        // Куда бросить: папка в списке (не та, что тянут) или место слева.
+        let mut target = None;
+        if plan.list.contains(x, y) {
+            if let Some(index) = self.row_at(&plan, ctx, x, y) {
+                let dragged = self.drag.as_ref().map_or(usize::MAX, |drag| drag.from);
+                if index != dragged && !self.picked.contains(&index) && self.rows.get(index).is_some_and(|row| row.directory && !row.is_volume()) {
+                    let visible = plan.visible();
+                    let rect = if self.tiles { Rect::EMPTY } else { plan.row_rect(ctx, index.saturating_sub(self.first_visible(visible))) };
+                    target = Some((join(&self.path, &self.rows[index].name), rect));
+                }
+            }
+        } else if let Some(side) = plan.side.filter(|side| side.contains(x, y)) {
+            let inner = ctx.on(theme::panel_bg());
+            if let Some(slot) = place_slots(inner, side, &self.home).into_iter().find(|slot| slot.rect.contains(x, y)) {
+                if slot.path != COMPUTER && slot.path != self.path {
+                    target = Some((slot.path, slot.rect));
+                }
+            }
+        }
+        let Some(drag) = self.drag.as_mut() else {
+            return false;
+        };
+        drag.at = (x, y);
+        if !drag.active && ((x - drag.start.0).abs() > 8 || (y - drag.start.1).abs() > 8) {
+            drag.active = true;
+        }
+        drag.target = target;
+        drag.active
+    }
+
+    /// Отпустили: если тянули на папку — перенести туда.
+    fn on_release(&mut self) -> bool {
+        let Some(drag) = self.drag.take() else {
+            return false;
+        };
+        if !drag.active {
+            return false;
+        }
+        let Some((dir, _)) = drag.target else {
+            return true;
+        };
+        let mut indices = self.targets();
+        if !indices.contains(&drag.from) {
+            indices = alloc::vec![drag.from];
+        }
+        let paths: Vec<String> = indices.iter().filter_map(|index| self.rows.get(*index)).map(|row| join(&self.path, &row.name)).collect();
+        println(&format!("files: dropped {} item(s) on {dir}", paths.len()));
+        // Перенос — тем же путём, что «Вырезать» и «Вставить»; буфер человека
+        // при этом не трогается.
+        let saved = self.clip.replace((paths, true));
+        self.paste_into(dir);
+        if self.clip.is_none() {
+            self.clip = saved;
+        }
+        true
+    }
+
+    /// Что тянут — подпись у указателя и рамка папки, куда бросить.
+    fn draw_drag(&self, s: &mut Surface, ctx: Ctx) {
+        let Some(drag) = self.drag.as_ref().filter(|drag| drag.active) else {
+            return;
+        };
+        let p = ctx.palette;
+        if let Some((_, rect)) = &drag.target {
+            if !rect.is_empty() {
+                draw::rounded_stroke(s, *rect, ctx.px(theme::R_ROW), p.acc, 255);
+            }
+        }
+        let count = if self.picked.contains(&drag.from) { self.picked.len() } else { 1 };
+        let label = if count > 1 { format!("Объектов: {count}") } else { self.rows.get(drag.from).map(|row| row.name.clone()).unwrap_or_default() };
+        let label = match &drag.target {
+            Some((dir, _)) => format!("{label} → {}", dir.rsplit('/').next().unwrap_or(dir)),
+            None => label,
+        };
+        let w = ctx.face(Role::Body).width(&label) + ctx.px(20);
+        let chip = Rect::new(drag.at.0 + ctx.px(14) as i32, drag.at.1 + ctx.px(10) as i32, w, ctx.px(28));
+        let inner = kit::card(ctx, s, chip);
+        paint::text(inner, s, Role::Body, chip.x + ctx.px(10) as i32, paint::baseline(ctx, Role::Body, chip), &label, p.ink);
     }
 
     /// Правая кнопка: меню для строки под указателем или для каталога.
@@ -2152,6 +2265,7 @@ impl Files {
         self.draw_menu(surface, ctx, area);
         self.draw_pop(surface, ctx, area, &plan);
         self.draw_job(surface, ctx, &plan);
+        self.draw_drag(surface, ctx);
     }
 
     /// «Этот компьютер» (макет 14): плитки папок дома и карточки дисков.
@@ -4049,6 +4163,14 @@ impl App for Files {
             }
         }
         self.on_key(code)
+    }
+
+    fn drag(&mut self, area: Rect, ctx: Ctx, x: i32, y: i32) -> bool {
+        self.on_drag(area, ctx, x, y)
+    }
+
+    fn release(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
+        self.on_release()
     }
 
     /// Копирование кусками — на каждом витке цикла окна.

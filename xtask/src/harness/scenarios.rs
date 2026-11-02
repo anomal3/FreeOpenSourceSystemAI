@@ -4952,9 +4952,8 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : icons 6, 1 from /home/roman/Desktop", 15_000),
             Step::Line("ls /home/roman/Desktop"),
             Step::Await("Reports", 15_000),
-            // Удаление спрашивает подтверждения и переносит в корзину (02.11).
-            // Отвечает на вопрос клавиша, а не щелчок — пунктов в меню в этот
-            // момент не нарисовано.
+            // Удаление спрашивает окном «Удаление файла» (макет 18) и
+            // переносит в корзину; `y` — «Удалить».
             Step::Aim(Aim::Icon(5)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
@@ -4965,9 +4964,6 @@ pub const ALL: &[Scenario] = &[
             Step::Key("y"),
             Step::Await("desktop     : deleted '/home/roman/Desktop/Reports' to the trash as 'Reports'", 15_000),
             Step::Await("desktop     : icons 5, 0 from /home/roman/Desktop", 15_000),
-            Step::Aim(Aim::EmptyBelow),
-            Step::Click,
-            Step::Await("desktop     : context menu closed", 15_000),
             Step::Line("ls /home/roman/.local/share/Trash/info"),
             Step::Await("Reports.trashinfo", 15_000),
             // Меню корзины (она — пятый значок, последний из системных):
@@ -5037,9 +5033,6 @@ pub const ALL: &[Scenario] = &[
             Step::Key("y"),
             Step::Await("desktop     : deleted '/home/roman/Desktop/note.txt' to the trash", 15_000),
             Step::Await("desktop     : icons 5, 0 from /home/roman/Desktop", 15_000),
-            Step::Aim(Aim::EmptyBelow),
-            Step::Click,
-            Step::Await("desktop     : context menu closed", 15_000),
             Step::Aim(Aim::Icon(4)),
             Step::RightClick,
             Step::Await("desktop     : context menu at", 15_000),
@@ -12025,11 +12018,24 @@ pub const ALL: &[Scenario] = &[
             Step::Await("files: pasted 1 item(s) into /data/c4", 15_000),
             Step::Wait(1_000),
             Step::Shot("04c-pasted"),
+            // Перетащить копию (вторая строка) на папку (первая) — перенос
+            // внутрь, как в Проводнике.
+            Step::Aim(Aim::FilesRow(1)),
+            Step::Press,
+            Step::Move(0, -6),
+            Step::Move(0, -8),
+            Step::Aim(Aim::FilesRow(0)),
+            Step::Wait(500),
+            Step::Shot("04d-drag"),
+            Step::Release,
+            Step::Await("files: dropped 1 item(s) on /data/c4/Новая папка", 15_000),
+            Step::Await("files: pasted 1 item(s) into /data/c4/Новая папка", 15_000),
+            // Удаление на томе без корзины — целиком, с содержимым.
             Step::Key("ctrl-a"),
             Step::Key("delete"),
             Step::Wait(800),
             Step::Key("y"),
-            Step::Await("files: deleted 'Новая папка — копия'", 15_000),
+            Step::Await("files: deleted 'Новая папка'", 15_000),
             Step::Await("files: /data/c4 has 0 entries", 15_000),
             // Вверх до корня и дальше — на страницу томов, как из `C:\` в
             // «Этот компьютер». Плиткой.

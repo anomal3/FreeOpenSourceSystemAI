@@ -100,6 +100,16 @@ pub trait App {
         self.click(area, ctx, x, y)
     }
 
+    /// Указатель движется с зажатой левой кнопкой (перетаскивание).
+    fn drag(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
+        false
+    }
+
+    /// Левую кнопку отпустили (конец перетаскивания), точка — от угла окна.
+    fn release(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
+        false
+    }
+
     /// Щелчок правой кнопкой.
     fn click_right(&mut self, _area: Rect, _ctx: Ctx, _x: i32, _y: i32) -> bool {
         false
@@ -251,6 +261,8 @@ pub fn run<A: App>(spec: &Spec, info: &SysInfo, size: (u32, u32), make: impl FnO
                 }
                 WIN_POINTER => app.click_with(area, ctx, event.x, event.y, core::mem::take(&mut pointer_mods)),
                 WIN_WHEEL => app.wheel(event.x),
+                user_abi::WIN_MOVE if event.code & 1 != 0 => app.drag(area, ctx, event.x, event.y),
+                user_abi::WIN_RELEASE if event.code == 1 => app.release(area, ctx, event.x, event.y),
                 // Новый размер от стола: поверхность выдаётся заново, прежние
                 // пиксели после ответа недействительны.
                 WIN_RESIZE => {

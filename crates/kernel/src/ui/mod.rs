@@ -884,8 +884,8 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
         // Подтверждение встаёт по центру и заметно меньше остальных: это вопрос
         // с двумя кнопками, и окно размером с терминал выглядело бы как ещё одна
         // программа, а не как «система ждёт от вас ответа».
-        // «Программа не отвечает» — по макету 18: 480 на 230.
-        App::Hung => {
+        // «Программа не отвечает» и «Удаление файла» — по макету 18.
+        App::Hung | App::DeleteAsk => {
             let scale = desktop.scale();
             let w = (480 * scale).min(width);
             let h = (230 * scale).min(work);
@@ -946,7 +946,7 @@ fn build(desktop: &Compositor, app: App) -> Option<Window> {
             Window::dialog(app, rect, scale, Dialog::Power { restart: app == App::Restart })
         }
         // Окну выбора программы нужен файл — его строит [`choose_program`].
-        App::OpenWith | App::Hung => None,
+        App::OpenWith | App::Hung | App::DeleteAsk => None,
         // Окно программы строится не здесь, и построить его столу нечем: ему
         // нужны кадры, которые выдаёт [`crate::user`]. Сюда приходят с меню и с
         // панели задач, а там окно программы к этому времени уже существует —
@@ -3003,6 +3003,18 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
 /// этом состоянии не будет. Поэтому здесь поднимается просьба, а гасит систему
 /// задача (см. [`crate::power`]).
 fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
+    if app == App::DeleteAsk {
+        if desktop.close(app) {
+            kprintln!("  desktop     : closed '{}'", app.title());
+        }
+        let entries = core::mem::take(&mut *DELETE_PENDING.lock());
+        if answer == Answer::Confirm {
+            trash_entries(desktop, &entries);
+        } else {
+            kprintln!("  desktop     : delete cancelled");
+        }
+        return;
+    }
     if app == App::Hung {
         let target = *HUNG.lock();
         if desktop.close(app) {
@@ -3298,13 +3310,13 @@ fn route(desktop: &mut Compositor, event: KeyEvent, status: &Status) -> Option<K
     // Диалог разбирает клавиши раньше остальных окон: набирать в нём нечего, а
     // ответ закрывает окно, и закрыть его может только стол.
     if let Some(app) = desktop.focused_app() {
-        if app == App::About || app == App::OpenWith || app == App::Hung || app.confirms_power().is_some() {
+        if app == App::About || app == App::OpenWith || app == App::Hung || app == App::DeleteAsk || app.confirms_power().is_some() {
             if event.pressed {
                 // `Y` и `N` у вопроса о питании остались с тех пор, когда кнопок
                 // не было: на них стоит стенд, а человеку они не мешают.
                 let answer = match event.code {
-                    KeyCode::Y if app.confirms_power().is_some() => Some(Answer::Confirm),
-                    KeyCode::N if app.confirms_power().is_some() => Some(Answer::Close),
+                    KeyCode::Y if app.confirms_power().is_some() || app == App::DeleteAsk => Some(Answer::Confirm),
+                    KeyCode::N if app.confirms_power().is_some() || app == App::DeleteAsk => Some(Answer::Close),
                     code => desktop.focused_mut().and_then(|window| {
                         window.handle_key(code);
                         window.take_answer()
@@ -3803,15 +3815,28 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
             }
             None => desktop.context_note("nothing is selected"),
         },
+        // «Удалить» — окном «Удаление файла» (макет 18), а не в меню.
         context::Action::Delete => {
-            let entries = selected_entries(desktop);
-            match entries.as_slice() {
-                [] => match selected_entry(desktop) {
-                    Some((_, label)) => desktop.context_confirm(&label, false),
-                    None => desktop.context_note("nothing is selected"),
-                },
-                [(_, label)] => desktop.context_confirm(label, false),
-                many => desktop.context_confirm(&alloc::format!("{} объектов", many.len()), false),
+            let mut entries = selected_entries(desktop);
+            if entries.is_empty() {
+                entries.extend(selected_entry(desktop));
+            }
+            let question = match entries.as_slice() {
+                [] => {
+                    desktop.context_note("nothing is selected");
+                    return;
+                }
+                [(_, label)] => alloc::format!("Удалить «{label}»?"),
+                many => alloc::format!("Удалить объекты ({})?", many.len()),
+            };
+            desktop.close_context();
+            kprintln!("  desktop     : context menu closed");
+            *DELETE_PENDING.lock() = entries;
+            let rect = layout(desktop, App::DeleteAsk);
+            if let Some(window) = Window::dialog(App::DeleteAsk, rect, desktop.scale(), Dialog::Delete { question }) {
+                desktop.push(window);
+                kprintln!("  desktop     : opened '{}'", App::DeleteAsk.title());
+                log_focus(desktop);
             }
         }
         context::Action::EmptyTrash => match trash::usage() {
@@ -4205,29 +4230,7 @@ fn handle_context_key(desktop: &mut Compositor, event: KeyEvent, status: &Status
             if entries.is_empty() {
                 desktop.context_note("nothing is selected");
             }
-            let (mut deleted, mut last_error) = (0usize, None);
-            for (path, _) in &entries {
-                match trash::trash(path) {
-                    Ok(name) => {
-                        kprintln!("  desktop     : deleted '{path}' to the trash as '{name}'");
-                        deleted += 1;
-                    }
-                    Err(err) => {
-                        kprintln!("  desktop     : cannot delete '{path}': {err}");
-                        last_error = Some(err);
-                    }
-                }
-            }
-            match (deleted, last_error) {
-                (_, Some(err)) => desktop.context_note(&err),
-                (1, None) => desktop.context_note(&alloc::format!("deleted {}", entries[0].1)),
-                (n, None) if n > 1 => desktop.context_note(&alloc::format!("deleted {n} items")),
-                _ => {}
-            }
-            if deleted > 0 {
-                desktop.reload_icons();
-                log_icons(desktop);
-            }
+            trash_entries(desktop, &entries);
             desktop.present();
             true
         }
@@ -4264,6 +4267,36 @@ fn entry_facts(path: &str, label: &str) -> String {
             }
         }
         _ => alloc::format!("{label}: {path}"),
+    }
+}
+
+/// Что ждёт ответа окна «Удаление файла»: путь и подпись.
+static DELETE_PENDING: SpinLock<alloc::vec::Vec<(String, String)>> = SpinLock::new(alloc::vec::Vec::new());
+
+/// Перенести записи стола в корзину; ответ — в меню (если открыто) и журнал.
+fn trash_entries(desktop: &mut Compositor, entries: &[(String, String)]) {
+    let (mut deleted, mut last_error) = (0usize, None);
+    for (path, _) in entries {
+        match trash::trash(path) {
+            Ok(name) => {
+                kprintln!("  desktop     : deleted '{path}' to the trash as '{name}'");
+                deleted += 1;
+            }
+            Err(err) => {
+                kprintln!("  desktop     : cannot delete '{path}': {err}");
+                last_error = Some(err);
+            }
+        }
+    }
+    match (deleted, last_error) {
+        (_, Some(err)) => desktop.context_note(&err),
+        (1, None) => desktop.context_note(&alloc::format!("deleted {}", entries[0].1)),
+        (n, None) if n > 1 => desktop.context_note(&alloc::format!("deleted {n} items")),
+        _ => {}
+    }
+    if deleted > 0 {
+        desktop.reload_icons();
+        log_icons(desktop);
     }
 }
 

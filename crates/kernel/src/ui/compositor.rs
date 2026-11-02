@@ -2134,6 +2134,7 @@ impl Compositor {
                     App::Shutdown | App::Restart => alloc::string::String::from("вопрос о питании"),
                     App::OpenWith => alloc::string::String::from("выбор программы"),
                     App::Hung => alloc::string::String::from("программа не отвечает"),
+                    App::DeleteAsk => alloc::string::String::from("удаление"),
                     App::Program(task, _) => alloc::format!("задача #{task}"),
                 },
                 age: tray::age_text(now.saturating_sub(window.minimized_at_ms)),
@@ -4013,5 +4014,5 @@ fn uncovered(from: Rect, to: Rect) -> impl Iterator<Item = Rect> {
 
 /// Затемняет ли окно стол под собой: диалоги, которые ждут ответа (макет 18).
 fn dims(app: App) -> bool {
-    matches!(app, App::OpenWith | App::Hung | App::Shutdown | App::Restart)
+    matches!(app, App::OpenWith | App::Hung | App::DeleteAsk | App::Shutdown | App::Restart)
 }
