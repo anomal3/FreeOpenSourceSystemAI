@@ -1890,21 +1890,25 @@ fn tasks(ptr: usize, len: usize) -> i64 {
                 let name = path.rsplit('/').next().unwrap_or(task.name);
                 let pages = super::program_pages(task.slot).unwrap_or(0);
                 alloc::format!(
-                    "{}\t{name}\t{}\t{}\t{kind}\t{uid}\t{path}\t{}\t{pages}\n",
+                    "{}\t{name}\t{}\t{}\t{kind}\t{uid}\t{path}\t{}\t{pages}\t{}\t{}\n",
                     task.id.as_u32(),
                     task.state,
                     task.cpu_ms,
-                    task.switches
+                    task.switches,
+                    task.disk_bytes,
+                    task.net_bytes
                 )
             }
             // У задачи ядра своих страниц нет: стек и куча — ядерные.
             None => alloc::format!(
-                "{}\t{}\t{}\t{}\tkernel\t-\t\t{}\t-\n",
+                "{}\t{}\t{}\t{}\tkernel\t-\t\t{}\t-\t{}\t{}\n",
                 task.id.as_u32(),
                 task.name,
                 task.state,
                 task.cpu_ms,
-                task.switches
+                task.switches,
+                task.disk_bytes,
+                task.net_bytes
             ),
         };
         let bytes = line.as_bytes();

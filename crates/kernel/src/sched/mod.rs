@@ -722,6 +722,31 @@ pub fn current_slot() -> usize {
     SCHED.lock().current()
 }
 
+/// Приписать исполняющейся задаче `bytes` байт обмена с носителем.
+///
+/// Вызывать без замка планировщика на руках: он берётся здесь. Обмен с
+/// носителем длится миллисекунды, взятие замка рядом с ним незаметно.
+pub fn charge_disk(bytes: usize) {
+    let mut sched = SCHED.lock();
+    let current = sched.current();
+    if let Some(task) = sched.tasks[current].as_mut() {
+        task.disk_bytes = task.disk_bytes.saturating_add(bytes as u64);
+    }
+}
+
+/// Приписать исполняющейся задаче `bytes` байт сетевого обмена. Условие то
+/// же, что у [`charge_disk`]: замок планировщика не должен быть взят.
+pub fn charge_net(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let mut sched = SCHED.lock();
+    let current = sched.current();
+    if let Some(task) = sched.tasks[current].as_mut() {
+        task.net_bytes = task.net_bytes.saturating_add(bytes as u64);
+    }
+}
+
 /// Холостая ли это задача.
 ///
 /// Существует ради одного ответа, который система давала неверно: `tasks`
@@ -1635,6 +1660,9 @@ pub struct TaskFacts {
     pub daemon: bool,
     /// Сколько раз задачу ставили на процессор (фаза 69c, диспетчер задач).
     pub switches: u64,
+    /// См. [`task::Task::disk_bytes`] и [`task::Task::net_bytes`].
+    pub disk_bytes: u64,
+    pub net_bytes: u64,
 }
 
 /// Снимок всех задач — для `SYS_TASKS`.
@@ -1659,6 +1687,8 @@ pub fn snapshot() -> alloc::vec::Vec<TaskFacts> {
             cpu_ms: task.cpu_ms + running,
             daemon: task.daemon,
             switches: task.switches,
+            disk_bytes: task.disk_bytes,
+            net_bytes: task.net_bytes,
         });
     }
     out
@@ -1679,6 +1709,8 @@ struct Row {
     cpu_ms: u64,
     ran_since_ms: u64,
     longest_irq_wait_ms: u64,
+    disk_bytes: u64,
+    net_bytes: u64,
     stack: &'static str,
 }
 
@@ -1714,6 +1746,8 @@ pub fn dump() {
                 cpu_ms: entry.cpu_ms,
                 ran_since_ms: entry.ran_since_ms,
                 longest_irq_wait_ms: entry.longest_irq_wait_ms,
+                disk_bytes: entry.disk_bytes,
+                net_bytes: entry.net_bytes,
                 stack,
             });
         }
@@ -1751,6 +1785,11 @@ pub fn dump() {
             cpu_ms,
             stack
         );
+        // Обмен с носителем и сетью — тоже своей строкой и только у тех, у
+        // кого он был: те же числа, что в столбцах диспетчера задач.
+        if entry.disk_bytes != 0 || entry.net_bytes != 0 {
+            kprintln!("       disk {} KiB, network {} KiB", entry.disk_bytes / 1024, entry.net_bytes / 1024);
+        }
         // Чего ждёт — отдельной строкой под своей задачей, а не колонкой:
         // ширина у поводов разная, и втиснутые в таблицу они бы её разъехали.
         // Печатается только у заблокированных — у остальных ответа нет.

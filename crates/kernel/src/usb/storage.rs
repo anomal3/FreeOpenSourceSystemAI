@@ -440,6 +440,7 @@ impl disk::BlockDevice for UsbDisk {
         if lba + (buf.len() / sector) as u64 > self.sectors {
             return Err(disk::Error::OutOfRange);
         }
+        crate::sched::charge_disk(buf.len());
         let batch = self.batch();
         for (index, chunk) in buf.chunks_mut(batch * sector).enumerate() {
             let at = lba + (index * batch) as u64;
@@ -460,6 +461,7 @@ impl disk::BlockDevice for UsbDisk {
         if lba + (buf.len() / sector) as u64 > self.sectors {
             return Err(disk::Error::OutOfRange);
         }
+        crate::sched::charge_disk(buf.len());
         let batch = self.batch();
         for (index, chunk) in buf.chunks(batch * sector).enumerate() {
             let at = lba + (index * batch) as u64;

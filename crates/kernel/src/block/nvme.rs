@@ -906,6 +906,7 @@ impl disk::BlockDevice for Nvme {
         if lba + (buf.len() / self.block_size) as u64 > self.blocks {
             return Err(disk::Error::OutOfRange);
         }
+        crate::sched::charge_disk(buf.len());
         self.read_blocks(lba, buf).map_err(|err| {
             kprintln!("nvme: read at LBA {lba} failed: {err}");
             disk::Error::Io
@@ -916,6 +917,7 @@ impl disk::BlockDevice for Nvme {
         if lba + (buf.len() / self.block_size) as u64 > self.blocks {
             return Err(disk::Error::OutOfRange);
         }
+        crate::sched::charge_disk(buf.len());
         self.write_blocks(lba, buf).map_err(|err| {
             kprintln!("nvme: write at LBA {lba} failed: {err}");
             disk::Error::Io

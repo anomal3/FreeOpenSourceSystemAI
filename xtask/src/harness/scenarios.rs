@@ -12189,6 +12189,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("window      : 'Task Manager' at", 30_000),
             Step::Await("taskmgr: ", 15_000),
             Step::Await(" task(s): ", 15_000),
+            // Столбцы «Диск»/«Сеть» (02.11): ядро отдаёт счётчики, а не
+            // прочерки. Сколько задач их набрало — свойство машины: здесь
+            // программы живут в initrd и диска не трогают.
+            Step::Await("taskmgr: disk used by ", 15_000),
             Step::Wait(1_500),
             Step::Shot("01-processes"),
             // Программы стоят новыми сверху: первый — сам диспетчер, второй —
@@ -12316,6 +12320,10 @@ pub const ALL: &[Scenario] = &[
             Step::Await("no such file or directory", 30_000),
             Step::Line("cat /data/many/f1999"),
             Step::Await("file 1999", 30_000),
+            // Столбец «Диск» диспетчера (02.11): оболочка только что читала и
+            // писала том, и ядро обязано приписать эти байты ей.
+            Step::Line("tasks"),
+            Step::Await(" KiB, network ", 30_000),
 
             // Каталог: непустой не удаляется, опустевший — да.
             Step::Line("rm /data/dir/sub"),

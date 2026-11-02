@@ -400,6 +400,7 @@ impl disk::BlockDevice for VirtioBlk {
         if lba + (buf.len() / SECTOR_SIZE) as u64 > self.sectors {
             return Err(disk::Error::OutOfRange);
         }
+        crate::sched::charge_disk(buf.len());
         self.read_sectors(lba, buf).map_err(|err| {
             crate::kprintln!("virtio-blk: read at LBA {lba} failed: {err}");
             disk::Error::Io
@@ -410,6 +411,7 @@ impl disk::BlockDevice for VirtioBlk {
         if lba + (buf.len() / SECTOR_SIZE) as u64 > self.sectors {
             return Err(disk::Error::OutOfRange);
         }
+        crate::sched::charge_disk(buf.len());
         self.write_sectors(lba, buf).map_err(|err| {
             crate::kprintln!("virtio-blk: write at LBA {lba} failed: {err}");
             disk::Error::Io

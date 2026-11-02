@@ -665,6 +665,10 @@ pub fn socket_send(owner: TaskId, index: usize, data: &[u8]) -> Result<usize, Ne
     );
     send_ipv4(iface, destination, ipv4::PROTOCOL_UDP, &message[..len])?;
     iface.counters.udp_out += 1;
+    // Столбец «Сеть» диспетчера — уже без замка интерфейса: планировщик
+    // берёт свой.
+    drop(guard);
+    crate::sched::charge_net(data.len());
     Ok(data.len())
 }
 
@@ -672,7 +676,12 @@ pub fn socket_send(owner: TaskId, index: usize, data: &[u8]) -> Result<usize, Ne
 pub fn socket_recv(owner: TaskId, index: usize) -> Result<Option<socket::Received>, NetError> {
     let mut guard = INTERFACE.lock();
     let iface = guard.as_mut().ok_or(NetError::NoDevice)?;
-    iface.sockets.take(owner, index).map_err(NetError::Socket)
+    let taken = iface.sockets.take(owner, index).map_err(NetError::Socket)?;
+    drop(guard);
+    if let Some(received) = &taken {
+        crate::sched::charge_net(received.data.len());
+    }
+    Ok(taken)
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +801,8 @@ pub fn stream_send(owner: TaskId, index: usize, data: &[u8]) -> Result<usize, Ne
         taken
     };
     tcp_pump(iface, index);
+    drop(guard);
+    crate::sched::charge_net(taken);
     Ok(taken)
 }
 
@@ -850,6 +861,8 @@ pub fn stream_recv(owner: TaskId, index: usize, out: &mut [u8]) -> Result<usize,
         }
         tcp_pump(iface, index);
     }
+    drop(guard);
+    crate::sched::charge_net(taken);
     Ok(taken)
 }
 

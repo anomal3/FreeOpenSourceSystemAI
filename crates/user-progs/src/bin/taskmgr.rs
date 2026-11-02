@@ -22,8 +22,12 @@
 //!
 //! # Чего окно не умеет и говорит об этом
 //!
-//! Колонки «Диск» из макета нет: ядро не считает чтения и записи по задачам, и
-//! нули в ней были бы выдумкой. Запустить или остановить службу отсюда нельзя
+//! «Диск» и «Сеть» (с 02.11) — тоже разности: ядро отдаёт байты, которые
+//! задача за жизнь прочла и записала на носитель (на уровне драйвера, чтение
+//! из кэша не в счёт) и отдала/получила по UDP и TCP. Запись, которую позже
+//! сбросит фоновая задача, видна у неё, а не у программы.
+//!
+//! Запустить или остановить службу отсюда нельзя
 //! — её перезапустил бы `/bin/init`; раздел «Службы» говорит об этом словами.
 
 #![no_std]
@@ -78,6 +82,8 @@ const HEAD_H: u32 = 46;
 const GROUP_H: u32 = 36;
 const ROW_H: u32 = 34;
 const STATUS_H: u32 = 30;
+/// Столбцов в таблице процессов.
+const COLUMNS: usize = 6;
 
 // ---------------------------------------------------------------------------
 // Данные
@@ -128,12 +134,19 @@ struct Task {
     switches: Option<u64>,
     /// Страниц памяти программы.
     pages: Option<u64>,
+    /// Байт с носителем и по сети за жизнь задачи (с 02.11; у старого ядра
+    /// полей нет).
+    disk_bytes: Option<u64>,
+    net_bytes: Option<u64>,
     /// Доля процессора за последний промежуток, в десятых процента.
     cpu: u32,
+    /// Скорость обмена с носителем и по сети за последний промежуток, байт/с.
+    disk_rate: u64,
+    net_rate: u64,
 }
 
 impl Task {
-    /// `id\tимя\tсостояние\tмс\tрод\tuid\tпуть[\tпереключения\tстраницы]`.
+    /// `id\tимя\tсостояние\tмс\tрод\tuid\tпуть[\tпереключения\tстраницы[\tдиск\tсеть]]`.
     fn parse(line: &str) -> Option<Self> {
         let mut fields = line.split('\t');
         let id = fields.next()?.parse().ok()?;
@@ -149,7 +162,24 @@ impl Task {
         let path = fields.next().unwrap_or("").to_string();
         let switches = fields.next().and_then(|text| text.parse().ok());
         let pages = fields.next().and_then(|text| text.parse().ok());
-        Some(Self { id, name, state, cpu_ms, kind, uid, path, switches, pages, cpu: 0 })
+        let disk_bytes = fields.next().and_then(|text| text.parse().ok());
+        let net_bytes = fields.next().and_then(|text| text.parse().ok());
+        Some(Self {
+            id,
+            name,
+            state,
+            cpu_ms,
+            kind,
+            uid,
+            path,
+            switches,
+            pages,
+            disk_bytes,
+            net_bytes,
+            cpu: 0,
+            disk_rate: 0,
+            net_rate: 0,
+        })
     }
 
     /// Имя в таблице: у программы — путь, как в макете (`/bin/count`).
@@ -318,10 +348,17 @@ struct Plan {
     run_button: Rect,
     end_button: Rect,
     burger: Rect,
+    /// Разделы свёрнуты до значков — с учётом узкого окна.
+    folded: bool,
 }
 
 impl Plan {
     fn new(ctx: Ctx, area: Rect, folded: bool) -> Self {
+        // Узкое окно (экран 1024, телефон) сворачивает разделы до значков
+        // само, как Windows: иначе таблице процессов не остаётся места на
+        // имя. Кнопка «бургер» тогда, наоборот, раскрывает их.
+        let narrow = area.w < ctx.px(NAV_W + 352 + 40 + 200);
+        let folded = folded != narrow;
         let nav_w = ctx.px(if folded { NAV_W_FOLDED } else { NAV_W }).min(area.w / 3);
         let status_h = ctx.px(STATUS_H);
         let nav = Rect::new(area.x, area.y, nav_w, area.h.saturating_sub(status_h));
@@ -340,7 +377,7 @@ impl Plan {
         let search_w = ctx.px(240);
         let search = Rect::new(run_button.x - ctx.px(10) as i32 - search_w as i32, by, search_w, bh);
         let burger = Rect::new(nav.x + ctx.px(8) as i32, nav.y + ctx.px(12) as i32, ctx.px(40), ctx.px(36));
-        Self { nav, header, body, status, search, run_button, end_button, burger }
+        Self { nav, header, body, status, search, run_button, end_button, burger, folded }
     }
 
     /// Хватает ли шапке места на поле поиска.
@@ -364,12 +401,20 @@ fn button_w(ctx: Ctx, label: &str) -> u32 {
     ctx.face(Role::Body).width(label) + ctx.px(52)
 }
 
-/// Колонки таблицы процессов: имя, состояние, ЦП, память, переключения.
-fn process_columns(ctx: Ctx, body: Rect) -> [Rect; 5] {
+/// Колонки таблицы процессов: имя, состояние, ЦП, память, диск, сеть (макет
+/// 17; переключения — в «Подробностях»).
+fn process_columns(ctx: Ctx, body: Rect) -> [Rect; COLUMNS] {
     let right = body.right() - ctx.px(12) as i32;
-    let widths = [ctx.px(110), ctx.px(90), ctx.px(110), ctx.px(120)];
+    // Числа — по 92, как в макете; «ЦП» уже: больше «100%» там не бывает.
+    let mut widths = [ctx.px(100), ctx.px(64), ctx.px(92), ctx.px(92), ctx.px(104)];
+    // Узкому окну (экран 1024) не хватает места на имя: первым уходит
+    // «Состояние» — в макете его нет, а точка цвета остаётся у имени.
+    let numbers: u32 = widths[1..].iter().sum();
+    if body.w < numbers + widths[0] + ctx.px(16 + 180 + 12) {
+        widths[0] = 0;
+    }
     let mut x = right;
-    let mut cols = [Rect::new(0, 0, 0, 0); 5];
+    let mut cols = [Rect::new(0, 0, 0, 0); COLUMNS];
     for (index, width) in widths.iter().enumerate().rev() {
         x -= *width as i32;
         cols[index + 1] = Rect::new(x, body.y, *width, body.h);
@@ -387,8 +432,9 @@ struct Manager {
     section: Section,
     folded: bool,
     tasks: Vec<Task>,
-    /// Время на процессоре в прошлый раз — по номерам задач.
-    before: Vec<(u32, u64)>,
+    /// Время на процессоре, байты с носителем и по сети в прошлый раз — по
+    /// номерам задач.
+    before: Vec<(u32, u64, u64, u64)>,
     before_at: u64,
     cpus: usize,
     selected: Option<u32>,
@@ -454,13 +500,18 @@ impl Manager {
         let elapsed = now.saturating_sub(self.before_at);
         if self.before_at != 0 && elapsed > 0 {
             for task in &mut tasks {
-                if let Some((_, was)) = self.before.iter().find(|(id, _)| *id == task.id) {
+                if let Some((_, was, disk, net)) = self.before.iter().find(|(id, ..)| *id == task.id) {
                     let spent = task.cpu_ms.saturating_sub(*was);
                     task.cpu = (spent * 1000 / (elapsed * self.cpus as u64)).min(1000) as u32;
+                    task.disk_rate = task.disk_bytes.unwrap_or(0).saturating_sub(*disk) * 1000 / elapsed;
+                    task.net_rate = task.net_bytes.unwrap_or(0).saturating_sub(*net) * 1000 / elapsed;
                 }
             }
         }
-        self.before = tasks.iter().map(|task| (task.id, task.cpu_ms)).collect();
+        self.before = tasks
+            .iter()
+            .map(|task| (task.id, task.cpu_ms, task.disk_bytes.unwrap_or(0), task.net_bytes.unwrap_or(0)))
+            .collect();
         self.before_at = now;
 
         // Программы и службы — новые сверху; задачи ядра — по номеру. Сам
@@ -499,6 +550,11 @@ impl Manager {
         if summary != self.last_summary {
             println(&summary);
             self.last_summary = summary;
+            // Для стенда: столбцы «Диск»/«Сеть» живые, а не прочерки старого
+            // ядра.
+            let disk = self.tasks.iter().filter(|task| task.disk_bytes.is_some_and(|bytes| bytes > 0)).count();
+            let net = self.tasks.iter().filter(|task| task.net_bytes.is_some_and(|bytes| bytes > 0)).count();
+            println(&format!("taskmgr: disk used by {disk} task(s), network by {net}"));
         }
     }
 
@@ -796,7 +852,7 @@ impl Manager {
             let ink = if chosen { p.ink } else { p.ink2 };
             let icon_x = rect.x + ctx.px(12) as i32;
             iconset::draw(s, section.icon(), icon_x, rect.y + (rect.h - size) as i32 / 2, size, if chosen { p.acc } else { p.ink2 }, 255);
-            if !self.folded {
+            if !plan.folded {
                 let tx = icon_x + (size + ctx.px(12)) as i32;
                 let room = (rect.right() - tx - ctx.px(6) as i32).max(0) as u32;
                 paint::text_clipped(ctx, s, Role::Body, tx, paint::baseline(ctx, Role::Body, rect), room, section.title(), ink);
@@ -847,17 +903,22 @@ impl Manager {
         draw::hline(s, head.x, head.bottom() - 1, head.w, p.line.color, p.line.alpha);
         let total_cpu = self.cpu_total();
         let used = self.info.frames_total.saturating_sub(self.info.frames_free);
+        let known = |field: fn(&Task) -> Option<u64>| self.tasks.iter().any(|task| field(task).is_some());
         let totals = [
             String::new(),
             String::new(),
             percent_text(total_cpu),
             percent_text(u32::from(permille(used, self.info.frames_total))),
-            String::new(),
+            if known(|task| task.disk_bytes) { disk_rate_text(self.tasks.iter().map(|task| task.disk_rate).sum()) } else { String::new() },
+            if known(|task| task.net_bytes) { net_rate_text(self.tasks.iter().map(|task| task.net_rate).sum()) } else { String::new() },
         ];
-        let names = ["Имя", "Состояние", "ЦП", "Память", "Переключения"];
+        let names = ["Имя", "Состояние", "ЦП", "Память", "Диск", "Сеть"];
         let top = head.y + ctx.px(6) as i32;
         let bottom = head.bottom() - ctx.px(6) as i32 - line_h(ctx, Role::Caption);
         for (index, col) in cols.iter().enumerate() {
+            if col.w == 0 {
+                continue;
+            }
             let right_aligned = index >= 2;
             let name = names[index];
             if right_aligned {
@@ -914,7 +975,7 @@ impl Manager {
         }
     }
 
-    fn draw_task_row(&self, s: &mut Surface, ctx: Ctx, rect: Rect, cols: &[Rect; 5], task: &Task) {
+    fn draw_task_row(&self, s: &mut Surface, ctx: Ctx, rect: Rect, cols: &[Rect; COLUMNS], task: &Task) {
         let p = ctx.palette;
         let selected = Some(task.id) == self.selected;
         if selected {
@@ -945,7 +1006,9 @@ impl Manager {
         let tx = x0 + (g + ctx.px(10)) as i32;
         let room = (cols[0].right() - tx - ctx.px(8) as i32).max(0) as u32;
         let ink = if task.kind == Kind::Kernel && !selected { p.ink3 } else { p.ink };
-        paint::text_clipped(ctx, s, Role::Body, tx, paint::baseline(ctx, Role::Body, rect), room, task.label(), ink);
+        // Путь не влез — имя без каталога: «taskmgr» понятнее, чем «/bi…».
+        let label = if ctx.face(Role::Body).width(task.label()) > room { task.name.as_str() } else { task.label() };
+        paint::text_clipped(ctx, s, Role::Body, tx, paint::baseline(ctx, Role::Body, rect), room, label, ink);
 
         // Состояние: точка цвета и слово.
         let state_ink = match task.state.as_str() {
@@ -954,16 +1017,26 @@ impl Manager {
             _ => p.ink5,
         };
         let cy = rect.y + rect.h as i32 / 2;
-        draw::circle(s, cols[1].x + ctx.px(4) as i32, cy, ctx.px(3), state_ink, 255);
-        paint::text_clipped(ctx, s, Role::Body, cols[1].x + ctx.px(14) as i32, paint::baseline(ctx, Role::Body, rect), cols[1].w.saturating_sub(ctx.px(14)), task.state_title(), p.ink2);
+        if cols[1].w == 0 {
+            // Столбец убран узким окном: точка — перед значком.
+            draw::circle(s, cols[0].x + ctx.px(6) as i32, cy, ctx.px(3), state_ink, 255);
+        } else {
+            draw::circle(s, cols[1].x + ctx.px(4) as i32, cy, ctx.px(3), state_ink, 255);
+            paint::text_clipped(ctx, s, Role::Body, cols[1].x + ctx.px(14) as i32, paint::baseline(ctx, Role::Body, rect), cols[1].w.saturating_sub(ctx.px(14)), task.state_title(), p.ink2);
+        }
 
         let right = |col: Rect| col.right() - ctx.px(10) as i32;
         let base = paint::baseline(ctx, Role::Mono, rect);
         paint::text_right(ctx, s, Role::Mono, right(cols[2]), base, &percent_text(task.cpu), p.ink2);
         let memory = task.memory_bytes().map_or_else(|| String::from("—"), size_text);
         paint::text_right(ctx, s, Role::Mono, right(cols[3]), base, &memory, p.ink2);
-        let switches = task.switches.map_or_else(|| String::from("—"), group_digits);
-        paint::text_right(ctx, s, Role::Mono, right(cols[4]), base, &switches, p.ink3);
+        // Ноль — тусклее: в тихой таблице глаз должен цепляться за тех, кто
+        // пишет и качает.
+        let quiet = |rate: u64| if rate == 0 { p.ink4 } else { p.ink2 };
+        let disk = task.disk_bytes.map_or_else(|| String::from("—"), |_| disk_rate_text(task.disk_rate));
+        paint::text_right(ctx, s, Role::Mono, right(cols[4]), base, &disk, quiet(task.disk_rate));
+        let net = task.net_bytes.map_or_else(|| String::from("—"), |_| net_rate_text(task.net_rate));
+        paint::text_right(ctx, s, Role::Mono, right(cols[5]), base, &net, quiet(task.net_rate));
     }
 
     fn draw_performance(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
@@ -1132,13 +1205,14 @@ impl Manager {
                         self.user_name(task.uid),
                         percent_text(task.cpu),
                         format!("{} мс", group_digits(task.cpu_ms)),
+                        task.switches.map_or_else(|| String::from("—"), group_digits),
                         task.memory_bytes().map_or_else(|| String::from("—"), size_text),
                         if task.path.is_empty() { String::from("—") } else { task.path.clone() },
                     ],
                 )
             })
             .collect();
-        self.draw_table(s, ctx, plan, &["Имя", "ИД", "Состояние", "Пользователь", "ЦП", "Время ЦП", "Память", "Путь"], &[60, 90, 110, 60, 100, 90, 150], &rows, self.selected_index());
+        self.draw_table(s, ctx, plan, &["Имя", "ИД", "Состояние", "Пользователь", "ЦП", "Время ЦП", "Переключения", "Память", "Путь"], &[60, 90, 110, 60, 100, 110, 90, 150], &rows, self.selected_index());
     }
 
     fn draw_users(&self, s: &mut Surface, ctx: Ctx, plan: &Plan) {
@@ -1654,6 +1728,18 @@ fn size_text(bytes: u64) -> String {
         let tenths = kib * 10 / 1024;
         if tenths >= 100 { format!("{} МиБ", tenths / 10) } else { format!("{},{} МиБ", tenths / 10, tenths % 10) }
     }
+}
+
+/// «0,1 МБ/с», «12 МБ/с» — как в макете 17 (мегабайт здесь двоичный).
+fn disk_rate_text(bytes_per_s: u64) -> String {
+    let tenths = bytes_per_s * 10 / (1024 * 1024);
+    if tenths >= 100 { format!("{} МБ/с", tenths / 10) } else { format!("{},{} МБ/с", tenths / 10, tenths % 10) }
+}
+
+/// «2,1 Мбит/с» — сеть по обычаю в битах и десятичных мегабитах.
+fn net_rate_text(bytes_per_s: u64) -> String {
+    let tenths = bytes_per_s * 8 / 100_000;
+    if tenths >= 100 { format!("{} Мбит/с", tenths / 10) } else { format!("{},{} Мбит/с", tenths / 10, tenths % 10) }
 }
 
 /// «1 851» — разряды через пробел.
