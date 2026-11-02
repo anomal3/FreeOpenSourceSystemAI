@@ -326,7 +326,24 @@ fn open_close_menu(desktop: &mut Compositor, app: App, status: &Status) {
     let (x, y) = desktop.pointer_position();
     let button = desktop.button_of(app).unwrap_or(Rect::new(x, y, 1, 1));
     *GROUP.lock() = members;
-    desktop.open_context(button.x, button.y, &context::Action::ON_BUTTON);
+    // «Недавние» этой программы (макет 11) — над закреплением и закрытием.
+    let group = desktop.find(app).map(|window| window.group.clone()).unwrap_or_default();
+    let recent: alloc::vec::Vec<(String, String)> = RECENT
+        .lock()
+        .iter()
+        .filter(|(command, _)| !group.is_empty() && command.split_whitespace().any(|word| word == group))
+        .take(5)
+        .cloned()
+        .collect();
+    let mut items = alloc::vec::Vec::new();
+    if !recent.is_empty() {
+        items.push(context::Action::RecentHeader);
+        items.extend((0..recent.len()).map(|index| context::Action::Recent(index as u8)));
+    }
+    items.extend_from_slice(&context::Action::ON_BUTTON);
+    desktop.context_handlers(recent.iter().map(|(_, path)| (String::from(context::base_name(path)), path.clone())).collect());
+    *RECENT_MENU.lock() = recent;
+    desktop.open_context(button.x, button.y, &items);
     if single {
         desktop.context_set_off(alloc::vec![context::Action::CloseAll]);
     }
@@ -335,6 +352,24 @@ fn open_close_menu(desktop: &mut Compositor, app: App, status: &Status) {
         kprintln!("  desktop     : context menu at {},{} {}x{} for button", rect.x, rect.y, rect.w, rect.h);
     }
     desktop.refresh_panel(status);
+}
+
+/// Файлы, открытые столом (команда программы и путь), — новые первыми.
+static RECENT: SpinLock<alloc::vec::Vec<(String, String)>> = SpinLock::new(alloc::vec::Vec::new());
+/// «Недавние» открытого меню кнопки.
+static RECENT_MENU: SpinLock<alloc::vec::Vec<(String, String)>> = SpinLock::new(alloc::vec::Vec::new());
+
+/// Открыть файл программой и запомнить его в «Недавних».
+fn open_file(desktop: &mut Compositor, command: &str, path: &str) {
+    {
+        let mut recent = RECENT.lock();
+        recent.retain(|(c, p)| !(c == command && p == path));
+        if recent.try_reserve(1).is_ok() {
+            recent.insert(0, (String::from(command), String::from(path)));
+            recent.truncate(30);
+        }
+    }
+    start(desktop, &alloc::format!("{command} {path}"));
 }
 
 /// Закрыть окно так же, как его крестик: окно программы закрывает она сама.
@@ -3068,7 +3103,7 @@ fn answer_dialog(desktop: &mut Compositor, app: App, answer: Answer) {
                 Err(err) => kprintln!("  desktop     : cannot remember the program for .{ext}: {err}"),
             }
         }
-        start(desktop, &alloc::format!("{command} {path}"));
+        open_file(desktop, &command, &path);
     }
 }
 
@@ -3670,8 +3705,8 @@ fn open_icon(desktop: &mut Compositor, index: usize) {
             let chosen = prefs::open_with(&sysconf::filetypes::extension(name));
             let handlers = file_handlers(&path);
             match (chosen, handlers.len()) {
-                (Some(command), _) => start(desktop, &alloc::format!("{command} {path}")),
-                (None, 1) => start(desktop, &alloc::format!("{} {path}", handlers[0].1)),
+                (Some(command), _) => open_file(desktop, &command, &path),
+                (None, 1) => open_file(desktop, &handlers[0].1, &path),
                 (None, _) => choose_program(desktop, &path),
             }
         }
@@ -3756,7 +3791,16 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
     }
     match action {
         // Пункт с подменю ничего не делает сам: подменю открыл указатель.
-        context::Action::Submenu(_) => {}
+        context::Action::Submenu(_) | context::Action::RecentHeader => {}
+        context::Action::Recent(number) => {
+            desktop.close_context();
+            let chosen = RECENT_MENU.lock().get(usize::from(number)).cloned();
+            if let Some((command, path)) = chosen {
+                kprintln!("  desktop     : opening recent '{path}'");
+                open_file(desktop, &command, &path);
+            }
+            desktop.refresh_panel(status);
+        }
         context::Action::NewShortcut
         | context::Action::ViewLarge
         | context::Action::ViewMedium
@@ -3973,7 +4017,7 @@ fn context_action(desktop: &mut Compositor, action: context::Action, status: &St
         context::Action::OpenWith(number) => {
             desktop.close_context();
             if let (Some(command), Some((path, _))) = (desktop.context_handler(number), selected_entry(desktop)) {
-                start(desktop, &alloc::format!("{command} {path}"));
+                open_file(desktop, &command, &path);
             }
             desktop.refresh_panel(status);
         }

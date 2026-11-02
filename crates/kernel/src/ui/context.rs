@@ -136,6 +136,10 @@ pub enum Action {
     Properties,
     /// «Выбрать другую программу…» — окно «Как открыть этот файл?».
     ChooseProgram,
+    /// Заголовок «Недавние» в меню кнопки панели (макет 11) — серый.
+    RecentHeader,
+    /// Недавний файл номер `n` программы кнопки (подпись — в `handlers`).
+    Recent(u8),
     /// Пункт с подменю (›).
     Submenu(Sub),
     /// «Персонализация» — «Параметры» на разделе оформления.
@@ -172,7 +176,7 @@ pub enum Sub {
 
 impl Action {
     /// Все пункты, какие бывают, — по ним считается размер поверхности.
-    const ALL: [Action; 35] = [
+    const ALL: [Action; 36] = [
         Action::Open,
         Action::Rename,
         Action::Delete,
@@ -208,6 +212,7 @@ impl Action {
         Action::Compress,
         Action::Cut,
         Action::Copy,
+        Action::RecentHeader,
     ];
 
     /// Меню корзины (макет 12): открыть, очистить, свойства.
@@ -341,6 +346,8 @@ impl Action {
             Action::EmptyTrash => "Очистить корзину",
             Action::Properties => "Свойства",
             Action::ChooseProgram => "Выбрать другую программу…",
+            Action::RecentHeader => "Недавние",
+            Action::Recent(_) => "Недавний файл",
             Action::Submenu(Sub::View) => "Вид",
             Action::Submenu(Sub::Sort) => "Сортировка",
             Action::Submenu(Sub::New) => "Создать",
@@ -390,6 +397,7 @@ impl Action {
             Action::Compress => 9,
             Action::PinTaskbar | Action::PinStart => 10,
             Action::ChooseProgram => 11,
+            Action::RecentHeader | Action::Recent(_) => 13,
             Action::ViewLarge | Action::ViewMedium | Action::ViewSmall => 12,
             Action::SortName | Action::SortType | Action::SortDate => 12,
             Action::SwitchLayout => 3,
@@ -426,7 +434,8 @@ impl Action {
             Action::TaskManager => Some(Icon::Chart),
             Action::EmptyTrash => Some(Icon::Close),
             Action::Properties => Some(Icon::Info),
-            Action::ChooseProgram => None,
+            Action::ChooseProgram | Action::RecentHeader => None,
+            Action::Recent(_) => Some(Icon::File),
             Action::Submenu(Sub::View) => Some(Icon::Grid),
             Action::Submenu(Sub::Sort) => Some(Icon::ChevronDown),
             Action::Submenu(Sub::New) => Some(Icon::Folder),
@@ -493,6 +502,7 @@ impl Action {
                 | Action::Compress
                 | Action::Cut
                 | Action::Copy
+                | Action::RecentHeader
         )
     }
 }
@@ -750,7 +760,7 @@ impl ContextMenu {
     /// Подпись пункта: у «Открыть с помощью» — с именем программы.
     fn label(&self, action: Action) -> String {
         match action {
-            Action::OpenWith(index) | Action::Window(index) => match self.handlers.get(usize::from(index)) {
+            Action::OpenWith(index) | Action::Window(index) | Action::Recent(index) => match self.handlers.get(usize::from(index)) {
                 Some((name, _)) => name.clone(),
                 None => String::from(action.title()),
             },
