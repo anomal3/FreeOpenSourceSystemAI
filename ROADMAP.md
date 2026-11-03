@@ -11355,6 +11355,81 @@ WLAN (gen4m, окно `0x18000000`: владение `0x18007000`, готовн�
 `0x180C1140`, `WIFI_RAM_CODE` по кольцу DMA 3) — до списка сетей. Батарея: настоящая кривая OCV из профиля MTK, градусы по
 таблице термистора. Модем — снять `md1img`, CCCI, AT, `ATD`.
 
+## NetSurf — лёгкий браузер (начато 03.11)
+
+Зачем: «просто было что-то» в окне и на телефоне, пока большой браузер ждёт
+Wine (см. «Телефон», порядок Романа 03.11). Свой движок HTML/CSS, без
+JavaScript, ~5 МБ — влезает в бюджет телефона.
+
+**Сделано 03.11 (x86_64 и aarch64):**
+- `cargo xtask thirdparty --only netsurf` — архив `netsurf-all-3.11`
+  (хеш снят с архива, опубликованного нет), каждая библиотека — **своим**
+  `buildsystem` (`make install HOST=<триплет> PREFIX=<sysroot>`), браузер —
+  `make TARGET=framebuffer`. Рецепт — `xtask/src/netsurf.rs`, наше —
+  `ports/netsurf/`. Библиотеки: wapcaplet, parserutils, css, hubbub, dom,
+  nsbmp, nsgif, nsutils, utf8proc, nspsl, nsfb. Сеть — libcurl 8.23 + mbedTLS
+  из набора, PNG — libpng, BMP/GIF — свои. Без Duktape, OpenSSL, SVG, JPEG.
+- Окно: своя поверхность libnsfb на окнах стола (`ports/netsurf/libnsfb/
+  freeos.c`, тип `NSFB_SURFACE_FREEOS` — патч ставит её перед `ram`, и она
+  выбирается без `-f`). Кадр nsfb = поверхность окна, `update` = commit;
+  ввод — буква US + Shift/Ctrl/Alt отдельными нажатиями, колесо = кнопки 4/5,
+  размер окна меняется. Указатель рисует стол (свой у nsfb выключен). SDL не
+  нужен: libnsfb знает только SDL 1.2.
+- Пакет `netsurf-3.11.fpk` (только носитель, как игры; `NETSURF.FPK`):
+  `/opt/netsurf/bin/netsurf` + `share/netsurf` (css, страницы, Messages);
+  права `windows files net`. Размеры: программа 4 649 936 / 4 732 656 байт
+  (x86_64 / aarch64; `.text` 2,6 МБ, `.rodata` 1 МБ — таблицы utf8proc, PSL,
+  hubbub, шрифт), пакет 4 848 435 / 4 894 363 байт.
+- Сценарий `netsurf` (обе архитектуры, установленная система): пакет,
+  `file:///opt/netsurf/share/netsurf/welcome.html` (с PNG-логотипом), потом
+  `http://10.0.2.2:{site}/netsurf.html` с сайта стенда (стили, рамка,
+  таблица); ждёт «DOM to box conversion complete» из журнала `-v`, снимки
+  `netsurf-file`/`netsurf-http`, нет `about:query/fetcherror`. Проходит: x86_64
+  20 с, aarch64 23 с. Сначала `install` — иначе на диске старый `/media`.
+
+**Что мешало и как обошли:**
+- `make` 4.4 под Windows режет рецепт **через оболочку** на 8 КБ (без оболочки —
+  до 32 КБ, `ar` libcss 31 КБ проходит): компоновка NetSurf с `>` получала
+  полимени объектника. Патч: список объектников — `$(file >...)` в файл
+  ответов, обёртка раскрывает `@файл`.
+- **Обёртка `freeos-cc` уносила `-Wl,--whole-archive`/`--no-whole-archive` в
+  конец строки** — поверхности libnsfb (регистрация одними конструкторами) не
+  попадали в программу, NetSurf падал на NULL в `process_cmdline`. Исправлено
+  в наборе: ключи, зависящие от места, остаются среди архивов (+ тест).
+- **`iconv_open` picolibc отказывает всему**, даже UTF-8→UTF-8: hubbub не
+  создавал парсер, любая страница — «An unexpected error occurred» и петля
+  `about:query/fetcherror`. libparserutils — с `WITHOUT_ICONV_FILTER` (свои
+  кодеки). `utils/utf8.c` NetSurf по-прежнему зовёт `iconv` (сохранение,
+  формы в чужой кодировке) — там будут отказы.
+- Нет `scandir`/`fstatat` в libc — патч `utils/config.h` включает свои пути
+  NetSurf (`__freeos__`).
+- Инструменты сборки (convert_font, convert_image, split-messages) —
+  clang машины сборки; zlib/libpng для них собираются из исходников набора,
+  `getopt`/`getline` — `ports/netsurf/host/unistd.h`. buildsystem не узнаёт
+  наш `--version` → `toolchain=clang`. Ссылки в архиве (ресурсы фронтендов,
+  `res/throbber` → gtk) — копия с разрешением ссылок вручную.
+- libnslog не собран (flex/bison нет) — журнал NetSurf в stderr по `-v`.
+- `_POSIX_TIMERS` у picolibc спрятан — libnsutils берёт время из
+  `gettimeofday` (не монотонно, но назад не ходит).
+
+**Дальше:**
+1. HTTPS: проверить страницу `https://` со стенда (корни — `/etc/ca.pem`,
+   как у `curl`); `fetch_curl` без OpenSSL не показывает цепочку.
+2. Кириллица: ввод (nsfb знает только коды US — символ из `code` события
+   не доходит) и шрифт — встроенный растровый только латиница; FreeType +
+   DejaVu (`NETSURF_FB_FONTLIB=freetype`, freetype уже в наборе).
+3. Заголовок окна = `<title>` (у fb-фронтенда заголовков нет — нужен вызов
+   в libnsfb или фронтенде), значок в «Пуске» уже по `start=`.
+4. JPEG (libjpeg-turbo или IJG 9f — autotools), SVG (libsvgtiny).
+5. Телефон: пакет в `--lean`/RAM-диск (≈4,9 МБ) или на флешку; касания —
+   уже как мышь. Размер: `-Os` и выкинуть utf8proc (NFC ради IDN) — минус
+   ~1 МБ.
+6. `iconv` в picolibc (хотя бы UTF-8/Latin-1/UTF-16) — нужен не только
+   NetSurf.
+7. Отладочная сборка ядра x86_64 сейчас не собирается: `aes` (через `wpa`,
+   31e439c) — `rustc-LLVM ERROR: Do not know how to split the result of this
+   operator`; прогоны NetSurf шли с `-r`.
+
 ## Стабильность, порядок в файлах, оконный менеджер — ГЛАВНОЕ, записано 01.11
 
 Слово Романа (01.11): «я просил сделать систему стабильной, а у нас что ни сборка, то падение или баг»; «у Redox свой оконный менеджер, а у нас всё вперемешку — диск C, home, var, opt, всё доступно».
