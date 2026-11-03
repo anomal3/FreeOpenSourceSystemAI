@@ -2209,6 +2209,16 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         if VOLUME_DRAG.load(Ordering::Relaxed) {
             drag_volume(desktop, x, status);
         }
+        // Палец ведут по окну ядра — прокрутить его содержимое за пальцем.
+        let dragged = *CONTENT_DRAG.lock();
+        if let Some((app, last)) = dragged {
+            if y != last {
+                *CONTENT_DRAG.lock() = Some((app, y));
+                if desktop.find(app).is_some_and(|window| window.drag_scroll(y - last)) {
+                    desktop.present();
+                }
+            }
+        }
         // Палец, начавший с строки состояния, тянут вниз — выдвинуть шторку.
         let pull = SHADE_PULL.load(Ordering::Relaxed);
         if pull != 0 && y - (pull - 1) > mini_ui::paint::Ctx::scaled(desktop.scale()).px(40) as i32 {
@@ -2385,6 +2395,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     if event.released(Buttons::LEFT) {
         icon_gesture_end(desktop);
         SHADE_PULL.store(0, Ordering::Relaxed);
+        *CONTENT_DRAG.lock() = None;
         if SHADE_VOLUME_DRAG.swap(false, Ordering::Relaxed) {
             let value = crate::sound::volume();
             kprintln!("  desktop     : volume {value} % from the shade");
@@ -2582,6 +2593,13 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
     }
     // Куда пришёлся щелчок — для F2 (см. [`DESK_FOCUS`]).
     DESK_FOCUS.store(desktop.window_at(x, y).is_none() && desktop.panel_at(x, y).is_none(), Ordering::Relaxed);
+    // Телефон: палец, опущенный на окно ядра («Параметры»), дальше может
+    // его прокручивать (см. [`CONTENT_DRAG`]).
+    *CONTENT_DRAG.lock() = if theme::is_mobile() && !desktop.shade_open() {
+        desktop.window_under(x, y).map(|app| (app, y))
+    } else {
+        None
+    };
 
     // 0а. Шторка — поверх всего остального, и разбирается первой.
     //
@@ -4174,6 +4192,8 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
 static VOLUME_DRAG: AtomicBool = AtomicBool::new(false);
 /// Тянут полосу звука в шторке телефона (нажали на неё и не отпустили).
 static SHADE_VOLUME_DRAG: AtomicBool = AtomicBool::new(false);
+/// Палец на окне ядра (телефон): какое окно и где палец был в прошлый раз.
+static CONTENT_DRAG: crate::sync::SpinLock<Option<(App, i32)>> = crate::sync::SpinLock::new(None);
 /// Жест «потянуть шторку»: высота нажатия в строке состояния плюс один;
 /// ноль — жеста нет.
 static SHADE_PULL: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);

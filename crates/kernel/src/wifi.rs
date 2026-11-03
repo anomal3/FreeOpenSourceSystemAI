@@ -81,9 +81,17 @@ impl State {
 /// Найденные сети: имя и канал.
 #[must_use]
 pub fn networks() -> alloc::vec::Vec<(alloc::string::String, u8)> {
+    // Одно имя — одна строка: у сети бывает несколько точек доступа
+    // (MARK69 на аппарате — две), а человек выбирает сеть, а не точку.
     #[cfg(target_arch = "aarch64")]
     {
-        crate::arch::mtk_wlan::networks().into_iter().map(|net| (net.ssid, net.channel)).collect()
+        let mut out: alloc::vec::Vec<(alloc::string::String, u8)> = alloc::vec::Vec::new();
+        for net in crate::arch::mtk_wlan::networks() {
+            if net.ssid.is_empty() || !out.iter().any(|(ssid, _)| *ssid == net.ssid) {
+                out.push((net.ssid, net.channel));
+            }
+        }
+        out
     }
     #[cfg(not(target_arch = "aarch64"))]
     alloc::vec::Vec::new()

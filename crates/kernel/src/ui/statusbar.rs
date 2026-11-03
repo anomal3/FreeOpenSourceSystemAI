@@ -120,11 +120,13 @@ pub fn draw(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale: u32) 
         paint::text(ctx, back, Role::Mono, x, y, &text, p.ink);
         x -= ctx.px(9) as i32;
     }
-    // Wi-Fi включён — его значок (веер), левее батареи.
+    // Wi-Fi включён — его значок (веер), левее батареи. Тусклый: к сети мы
+    // ещё не подключаемся (Роман 03.11: «значок появился, хотя Wi-Fi не
+    // подключён, а просто включён»); ярким он станет с подключением.
     if matches!(crate::wifi::state(), crate::wifi::State::Ready | crate::wifi::State::Scanning) {
         let g = ctx.px(18);
         x -= g as i32;
-        mini_ui::iconset::draw(back, mini_ui::iconset::Fi::Wifi, x, mid - g as i32 / 2, g, p.ink, 255);
+        mini_ui::iconset::draw(back, mini_ui::iconset::Fi::Wifi, x, mid - g as i32 / 2, g, p.ink, 90);
         x -= ctx.px(9) as i32;
     }
 

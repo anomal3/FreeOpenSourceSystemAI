@@ -54,7 +54,10 @@ const RX_EVENT: u32 = 1;
 
 const TX_SLOTS: usize = 16;
 const RX_DATA_SLOTS: usize = 64;
-const RX_EVENT_SLOTS: usize = 16;
+/// Кольцо событий большое: кадры эфира при поиске идут сюда же, потоком,
+/// и на 16 местах (как у драйвера) прошивка переполняла его и вставала, если
+/// задача стола не успевала забирать (03.11: две сети вместо тринадцати).
+const RX_EVENT_SLOTS: usize = 128;
 const BUF: usize = 4096;
 
 /// Где лежит наша память DMA: дескрипторы и буферы колец. Ноль — нет.
@@ -292,7 +295,13 @@ fn receive(ring: u32, timeout_ms: u64) -> Result<Option<Vec<u8>>, &'static str> 
         if crate::time::uptime_ns().wrapping_sub(started) > timeout_ms * 1_000_000 {
             return Ok(None);
         }
-        crate::sched::sleep_ms(1);
+        // Короткие ожидания (поиск сетей) — без сна: квант планировщика
+        // длиннее, чем блок успевает заполнить кольцо.
+        if timeout_ms > 20 {
+            crate::sched::sleep_ms(1);
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -507,16 +516,40 @@ fn parse_beacon(packet: &[u8]) -> Option<Network> {
     Some(Network { ssid, bssid, channel })
 }
 
-/// Поиск сетей: активировать BSS, запросить поиск, собрать кадры до конца.
+/// BSS уже активирован (пустая команда и `BSS_ACTIVATE` — один раз).
+static ACTIVATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Поиск сетей: до двух проходов, если первый не дошёл до конца.
 pub fn scan() -> Result<Vec<String>, &'static str> {
+    if !ACTIVATED.swap(true, Ordering::Relaxed) {
+        // Пустая команда — драйвер шлёт её первой после готовности.
+        wifi_command(0x00, true, &[])?;
+        // Сеть AIS (клиент) на BSS 0 с локальным адресом.
+        let mut bss = [0u8; 12];
+        bss[1] = 1;
+        bss[4..10].copy_from_slice(&[0x02, 0xf0, 0x55, 0x41, 0x69, 0x01]);
+        wifi_command(0x11, true, &bss)?;
+    }
+    let mut found: Vec<Network> = Vec::new();
+    let mut done = false;
+    for _ in 0..2 {
+        done = scan_pass(&mut found)?;
+        if done {
+            break;
+        }
+    }
     let mut report = Vec::new();
-    // Пустая команда — драйвер шлёт её первой после готовности.
-    wifi_command(0x00, true, &[])?;
-    // Сеть AIS (клиент) на BSS 0 с локальным адресом.
-    let mut bss = [0u8; 12];
-    bss[1] = 1;
-    bss[4..10].copy_from_slice(&[0x02, 0xf0, 0x55, 0x41, 0x69, 0x01]);
-    wifi_command(0x11, true, &bss)?;
+    report.push(alloc::format!("{} network(s){}", found.len(), if done { "" } else { ", no scan-done event" }));
+    for net in found.iter().take(6) {
+        report.push(alloc::format!("{} ch {}", if net.ssid.is_empty() { "(hidden)" } else { &net.ssid }, net.channel));
+    }
+    found.sort_by_key(|net| net.channel);
+    *NETWORKS.lock() = found;
+    Ok(report)
+}
+
+/// Один проход поиска: запрос и сбор кадров до события конца или срока.
+fn scan_pass(found: &mut Vec<Network>) -> Result<bool, &'static str> {
     // CMD_SCAN_REQ_V2: активный, любой SSID, все каналы.
     let mut request = alloc::vec![0u8; 1188];
     let seq = next_seq();
@@ -527,7 +560,6 @@ pub fn scan() -> Result<Vec<String>, &'static str> {
     request[1112..1118].copy_from_slice(&[0xff; 6]);
     wifi_command(0x03, true, &request)?;
 
-    let mut found: Vec<Network> = Vec::new();
     let started = crate::time::uptime_ms();
     let mut done = false;
     let mut dumped = false;
@@ -564,12 +596,7 @@ pub fn scan() -> Result<Vec<String>, &'static str> {
             }
         }
     }
-    report.push(alloc::format!("{} network(s){}", found.len(), if done { "" } else { ", no scan-done event" }));
-    for net in found.iter().take(6) {
-        report.push(alloc::format!("{} ch {}", if net.ssid.is_empty() { "(hidden)" } else { &net.ssid }, net.channel));
-    }
-    *NETWORKS.lock() = found;
-    Ok(report)
+    Ok(done)
 }
 
 /// Прошивка WLAN запущена этим ядром и готова.

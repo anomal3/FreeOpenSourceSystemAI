@@ -1623,6 +1623,19 @@ impl Window {
         moved
     }
 
+    /// Прокрутка пальцем: содержимое за пальцем на `dy` точек (телефон).
+    /// `true` — сдвинулось и перерисовано.
+    pub fn drag_scroll(&mut self, dy: i32) -> bool {
+        let moved = match &mut self.content {
+            Content::Settings(view) => view.drag_scroll(dy),
+            _ => false,
+        };
+        if moved {
+            self.redraw_content();
+        }
+        moved
+    }
+
     /// Поднять вид терминала на `rows` строк прокрутки (отрицательное —
     /// опустить). `true`, если вид сдвинулся.
     pub fn term_scroll(&mut self, rows: i32) -> bool {

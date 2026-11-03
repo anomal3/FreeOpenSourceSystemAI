@@ -681,6 +681,17 @@ impl SettingsView {
         self.scroll != before
     }
 
+    /// Сдвинуть содержимое на `dy` точек экрана — палец тянут по странице
+    /// (03.11: на телефоне колеса нет, а список сетей длиннее окна).
+    /// Положительное — палец вниз, содержимое едет к началу.
+    pub fn drag_scroll(&mut self, dy: i32) -> bool {
+        let before = self.scroll;
+        let layout = self.layout();
+        self.scroll -= dy;
+        self.clamp_scroll(&layout);
+        self.scroll != before
+    }
+
     /// Разобрать клавишу. `ch` — символ, который она даёт в текущей раскладке.
     /// `true` — окно её использовало.
     pub fn handle(&mut self, code: KeyCode, ch: Option<char>) -> bool {
