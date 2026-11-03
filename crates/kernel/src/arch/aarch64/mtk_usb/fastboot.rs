@@ -868,6 +868,8 @@ impl Fastboot {
             }
             Some("boot") => mtk_consys::boot(),
             Some("wmt") => mtk_consys::wmt_init(),
+            Some("patch") => mtk_consys::wmt_patch(),
+            Some("cal") => mtk_consys::wmt_calibrate(),
             Some("up") => mtk_consys::bring_up(),
             Some(_) => Err("usage: oem consys [on | load [header bytes] | boot | wmt | up]"),
         };

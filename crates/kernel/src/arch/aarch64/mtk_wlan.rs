@@ -221,6 +221,11 @@ pub fn setup_dma() -> Result<Vec<String>, &'static str> {
     let on = 1 | (1 << 2) | (3 << 4) | (1 << 6) | (2 << 10) | (1 << 12) | (1 << 30);
     write(GLO_CFG, (cfg & !((3 << 4) | (3 << 10))) | on)?;
     write(DUMMY_CR, 0x13)?;
+    // `asicPdmaConfig`: о сбоях прошивки — прерыванием (маска битов 2..5),
+    // и защита сна при подтверждении APSRC.
+    write(PDMA + 0x1f4, 0x3c)?;
+    let slp = read(PDMA + 0x160)?;
+    write(PDMA + 0x160, slp | (1 << 4))?;
     let cfg = read(GLO_CFG)?;
     crate::kprintln!("  wlan        : rings at {phys:#x}, GLO_CFG {cfg:#x}");
     Ok(alloc::vec![alloc::format!("rings at {phys:#x} ({} KiB), GLO_CFG {cfg:08x}", DMA_SIZE / 1024)])

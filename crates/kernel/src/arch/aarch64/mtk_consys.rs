@@ -393,15 +393,77 @@ pub fn wmt_init() -> Result<alloc::vec::Vec<alloc::string::String>, &'static str
     Ok(report)
 }
 
+/// Патч процессора блока (`soc1_0_patch_mcu`) — командой WMT «PDA»
+/// (`mtk_wcn_soc_pda_patch_dwn`): его адрес в заголовке — `0x0001C000`,
+/// внутренняя память процессора, а не EMI, и копией в EMI его не положить.
+/// Команда `01 01 11 00 00 <адрес> <размер> <ключ 0> 2f 02 02 00` → `02 01 01
+/// 00 00`, затем без кадров STP: `<размер+12>` и восемь нулей, затем тело;
+/// после — сброс WMT.
+pub fn wmt_patch() -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
+    let path = alloc::format!("{FIRMWARE_DIR}/soc1_0_patch_mcu_1_1_hdr.bin");
+    let data = match crate::fs::read(&path, EMI_SIZE) {
+        Some(Ok((data, _))) => data,
+        _ => return Err("soc1_0_patch_mcu missing in /lib/firmware/connsys"),
+    };
+    if data.len() <= 48 || data.get(16..20) != Some(b"ALPS") {
+        return Err("patch has no MediaTek header");
+    }
+    let address = u32::from_le_bytes([data[0x18], data[0x19], data[0x1a], data[0x1b]]) & !0xff;
+    let body = &data[48..];
+    let size = body.len() as u32;
+    let mut command = alloc::vec![0x01, 0x01, 0x11, 0x00, 0x00];
+    command.extend_from_slice(&address.to_le_bytes());
+    command.extend_from_slice(&size.to_le_bytes());
+    command.extend_from_slice(&[0, 0, 0, 0, 0x2f, 0x02, 0x02, 0x00]);
+    let answer = wmt(&command)?;
+    if answer.get(..5) != Some(&[0x02, 0x01, 0x01, 0x00, 0x00]) {
+        crate::kprintln!("  consys      : PDA answer {:02x?}", &answer[..answer.len().min(16)]);
+        return Err("WMT refused the patch download");
+    }
+    let mut head = [0u8; 12];
+    head[0..4].copy_from_slice(&(size + 12).to_le_bytes());
+    btif_send(&head)?;
+    btif_send(body)?;
+    // Ответ на тело, если он есть, и сброс.
+    let tail = btif_receive(500).ok();
+    let reset = wmt(&[0x01, 0x07, 0x01, 0x00, 0x04])?;
+    crate::kprintln!("  consys      : patch {address:#x} {size} B sent, tail {:02x?}, reset {:02x?}", tail.as_deref().map(|t| &t[..t.len().min(8)]), &reset[..reset.len().min(5)]);
+    Ok(alloc::vec![
+        alloc::format!("patch {address:#x}, {size} B over BTIF"),
+        alloc::format!("after: {:02x?}", tail.as_deref().map(|t| &t[..t.len().min(8)])),
+        alloc::format!("wmt reset {:02x?}", &reset[..reset.len().min(5)]),
+    ])
+}
+
+/// Калибровка радиочасти (`01 14 01 00 01`) — драйвер шлёт её после опроса
+/// аналоговой микросхемы. Ответ длинный: таблица калибровки.
+pub fn wmt_calibrate() -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
+    let answer = wmt(&[0x01, 0x14, 0x01, 0x00, 0x01])?;
+    if answer.get(..2) != Some(&[0x02, 0x14]) {
+        return Err("RF calibration refused");
+    }
+    Ok(alloc::vec![alloc::format!("rf calibration ok, {} B", answer.len())])
+}
+
 /// Весь путь включения: питание, прошивки, процессор, начальный обмен.
 pub fn bring_up() -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
-    let mut report = power_on()?;
+    // Первое включение после загрузки на аппарате дважды не увидело версию
+    // блока даже за 200 мс, а повтор всей последовательности сразу проходил.
+    let mut report = match power_on() {
+        Ok(report) => report,
+        Err(err) => {
+            crate::kprintln!("  consys      : first power-on: {err}; trying once more");
+            power_on()?
+        }
+    };
     report.extend(load(48)?);
     report.extend(boot()?);
     if read(CONN_MCU_STATE)? != CONN_MCU_READY {
         return Err("CONNSYS processor did not start");
     }
     report.extend(wmt_init()?);
+    report.extend(wmt_patch()?);
+    report.extend(wmt_calibrate()?);
     Ok(report)
 }
 
