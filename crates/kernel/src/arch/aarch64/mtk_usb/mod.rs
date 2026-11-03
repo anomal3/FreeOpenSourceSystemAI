@@ -80,6 +80,9 @@ pub struct Report {
 ///
 /// Таблицы ядра активны; окна регистров отображаются здесь же.
 pub unsafe fn start(fdt: &Fdt<'_>) -> Option<Report> {
+    if let Some(bootargs) = fdt.find("/chosen").and_then(|chosen| chosen.property_str("bootargs")) {
+        gadget::set_serial(bootargs);
+    }
     let node = fdt
         .find("/usb0@11200000")
         .or_else(|| fdt.find_compatible("mediatek,mt6765-usb20"))?;

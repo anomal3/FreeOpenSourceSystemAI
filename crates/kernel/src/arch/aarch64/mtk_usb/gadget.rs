@@ -42,8 +42,43 @@ const EP_OUT: u8 = BULK;
 const VENDOR: u16 = 0x18d1;
 const PRODUCT: u16 = 0xd00d;
 
-/// Строки, на которые ссылаются дескрипторы. Порядок задаёт номера.
+/// Строки, на которые ссылаются дескрипторы. Порядок задаёт номера; третья
+/// (серийный номер) — запасная, см. [`set_serial`].
 const STRINGS: [&str; 3] = ["FossAi", "FossAi phone", "dandelion"];
+
+/// Серийный номер аппарата — тот, которым называется заводской fastboot
+/// (`androidboot.serialno` в строке запуска от LK).
+///
+/// Windows привязывает драйвер к паре «устройство + серийный номер»: с
+/// другим номером наше ядро было бы для неё новым устройством, и драйвер
+/// WinUSB с идентификатором Android пришлось бы ставить заново, с правами
+/// администратора (03.11 так и вышло — код 28 на `dandelion`). Под тем же
+/// номером ядру достаётся уже настроенный драйвер загрузчика.
+static SERIAL: crate::sync::SpinLock<([u8; 32], usize)> = crate::sync::SpinLock::new(([0; 32], 0));
+
+/// Серийный номер, которым называется гаджет.
+#[must_use]
+pub fn serial() -> alloc::string::String {
+    let slot = SERIAL.lock();
+    if slot.1 == 0 {
+        return alloc::string::String::from(STRINGS[2]);
+    }
+    alloc::string::String::from_utf8_lossy(&slot.0[..slot.1]).into_owned()
+}
+
+/// Взять серийный номер из строки запуска; без него остаётся `dandelion`.
+pub fn set_serial(bootargs: &str) {
+    let Some(serial) = bootargs
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("androidboot.serialno="))
+        .filter(|serial| !serial.is_empty() && serial.len() <= 32 && serial.bytes().all(|b| b.is_ascii_alphanumeric()))
+    else {
+        return;
+    };
+    let mut slot = SERIAL.lock();
+    slot.0[..serial.len()].copy_from_slice(serial.as_bytes());
+    slot.1 = serial.len();
+}
 
 /// Наибольший ответ на нулевой точке.
 ///
@@ -630,7 +665,11 @@ fn string_descriptor(number: u8, out: &mut [u8; REPLY_MAX]) -> Option<usize> {
         out[..4].copy_from_slice(&[4, 3, 0x09, 0x04]);
         return Some(4);
     }
-    let text = STRINGS.get(usize::from(number) - 1)?;
+    let serial = SERIAL.lock();
+    let text = match number {
+        3 if serial.1 != 0 => &serial.0[..serial.1],
+        _ => STRINGS.get(usize::from(number) - 1)?.as_bytes(),
+    };
     // Буква занимает две ячейки: договор требует UTF-16, и хотя все наши буквы
     // латинские, старший байт всё равно обязан быть.
     let len = 2 + text.len() * 2;
@@ -639,7 +678,7 @@ fn string_descriptor(number: u8, out: &mut [u8; REPLY_MAX]) -> Option<usize> {
     }
     out[0] = len as u8;
     out[1] = 3;
-    for (at, byte) in text.bytes().enumerate() {
+    for (at, byte) in text.iter().copied().enumerate() {
         out[2 + at * 2] = byte;
         out[3 + at * 2] = 0;
     }

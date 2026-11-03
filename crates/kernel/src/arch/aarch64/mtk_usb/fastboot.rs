@@ -899,7 +899,10 @@ impl Fastboot {
             "version" => self.respond(b"OKAY", "0.4"),
             "version-bootloader" => self.respond(b"OKAY", "freeos"),
             "product" => self.respond(b"OKAY", "freeos-dandelion"),
-            "serialno" => self.respond(b"OKAY", "dandelion"),
+            "serialno" => {
+                let serial = super::gadget::serial();
+                self.respond(b"OKAY", &serial);
+            }
             // Ноль — не заглушка, а отказ принимать образы: этому устройству
             // нечем и незачем их писать.
             "max-download-size" => self.respond(b"OKAY", "0"),
