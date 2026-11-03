@@ -148,7 +148,11 @@ fn join_task() {
             Ok(lines) => lines,
             Err(err) => {
                 crate::kprintln!("  wifi        : connect to '{ssid}' failed: {err}");
-                alloc::vec![alloc::format!("не подключиться к «{ssid}»: {err}")]
+                let mut lines = alloc::vec![alloc::format!("не подключиться к «{ssid}»: {err}")];
+                if let Some(status) = crate::arch::mtk_wlan::last_status() {
+                    lines.push(alloc::format!("код ответа точки доступа: {status}"));
+                }
+                lines
             }
         };
         *REPORT.lock() = lines;

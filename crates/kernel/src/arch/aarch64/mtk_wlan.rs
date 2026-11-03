@@ -756,6 +756,20 @@ fn mgmt_header(fc: u8, bssid: &[u8; 6]) -> Vec<u8> {
 /// Наборы скоростей b/g: 1, 2, 5.5, 11 (обязательные), 6, 9, 12, 18 и 24–54.
 const RATES: [u8; 8] = [0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24];
 const EXT_RATES: [u8; 4] = [0x30, 0x48, 0x60, 0x6c];
+/// HT Capabilities: 20 МГц, короткий интервал, SM PS выключен, MCS 0–7.
+const HT_CAP_IE: [u8; 28] = [
+    45, 26, 0x2c, 0x00, 0x03, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+/// WMM Information Element (станция, без U-APSD).
+const WMM_IE: [u8; 9] = [0xdd, 0x07, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00];
+/// Код отказа точки доступа при последней попытке — для «Параметров».
+static LAST_STATUS: SpinLock<Option<u16>> = SpinLock::new(None);
+
+/// Код отказа последней ассоциации, если он был.
+#[must_use]
+pub fn last_status() -> Option<u16> {
+    *LAST_STATUS.lock()
+}
 const RATE_MASK_ALL: u16 = 0x3fcf;
 const RATE_MASK_BASIC: u16 = 0x000f;
 
@@ -767,9 +781,11 @@ fn sta_rec(bssid: &[u8; 6], state: u8, aid: u16, need_response: bool) -> Result<
     rec[2..8].copy_from_slice(bssid);
     rec[8..10].copy_from_slice(&aid.to_le_bytes());
     rec[10..12].copy_from_slice(&10u16.to_le_bytes());
-    rec[13] = 0x03;
+    // b/g + HT (бит 4); QoS — HT без него не бывает.
+    rec[13] = 0x13;
     rec[14..16].copy_from_slice(&RATE_MASK_ALL.to_le_bytes());
     rec[16..18].copy_from_slice(&RATE_MASK_BASIC.to_le_bytes());
+    rec[18] = 1;
     rec[20] = state;
     rec[51] = u8::from(need_response);
     rec[54] = AP_WLAN;
@@ -793,7 +809,8 @@ fn bss_info(ssid: &str, bssid: &[u8; 6], channel: u8, secure: bool) -> Result<()
     info[52] = 1;
     info[53] = if secure { 7 } else { 0 };
     info[54] = if secure { 6 } else { 0 };
-    info[55] = 0x03;
+    info[55] = 0x13;
+    info[42] = 1; // QBSS
     info[58] = BMC_WLAN;
     info[69] = 1;
     info[70] = channel;
@@ -869,12 +886,18 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
     if secure {
         assoc.extend_from_slice(&wpa::RSN_IE);
     }
+    // HT (802.11n) и WMM: точки «только n» без них отказывают в ассоциации
+    // (03.11, MARK69 — отказ сразу после успешной аутентификации).
+    assoc.extend_from_slice(&HT_CAP_IE);
+    assoc.extend_from_slice(&WMM_IE);
     send_frame(mgmt_txd(assoc.len(), 0x00), &assoc)?;
     let answer = wait_mgmt(0x10, &bssid, 1000).ok_or("no association answer")?;
     let status = answer.get(26..28).map_or(0xffff, |b| u16::from_le_bytes([b[0], b[1]]));
     let aid = answer.get(28..30).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) & 0x3fff);
+    crate::kprintln!("  wlan        : association status {status}, aid {aid}");
     report.push(alloc::format!("assoc status {status}, aid {aid}"));
     if status != 0 {
+        *LAST_STATUS.lock() = Some(status);
         return Err("access point refused association");
     }
 
