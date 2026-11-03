@@ -304,7 +304,24 @@ pub fn build(options: &Options) -> Result<PathBuf> {
     let options = match (&options.ramdisk, options.lean) {
         (Some(ramdisk), true) => {
             let path = paths::build_dir().join("initrd-phone-lean.img");
-            let dropped = crate::initrd::lean_copy(ramdisk, &path, LEAN_SKIP)?;
+            // Прошивки блока связи (Wi-Fi/BT) — из `firmware/connsys/`, если
+            // они там есть: чужие, в хранилище их нет (`.gitignore`).
+            let mut extra = Vec::new();
+            let connsys = paths::workspace_root().join("firmware/connsys");
+            if let Ok(dir) = std::fs::read_dir(&connsys) {
+                for entry in dir.flatten() {
+                    if entry.path().is_file() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        extra.push((format!("lib/firmware/connsys/{name}"), std::fs::read(entry.path())?));
+                    }
+                }
+            }
+            if extra.is_empty() {
+                say!("прошивок блока связи нет в firmware/connsys/ — Wi-Fi на аппарате не загрузится");
+            } else {
+                say!("прошивки блока связи: {} файл(ов) в /lib/firmware/connsys", extra.len());
+            }
+            let dropped = crate::initrd::lean_copy(ramdisk, &path, LEAN_SKIP, &extra)?;
             say!("RAM-диск облегчён: {} МиБ выброшено ({})", dropped / (1024 * 1024), LEAN_SKIP.join(", "));
             lean = Options { ramdisk: Some(path), ..options.clone() };
             &lean

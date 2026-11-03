@@ -233,7 +233,7 @@ pub fn build_with(
 /// `skip`, и форматирует оставшееся тем же способом, что и полный образ:
 /// данные ложатся с начала тома, и хвост из нулей потом отрезается
 /// (`phone::trim_volume`). Возвращает, сколько байт выброшено.
-pub fn lean_copy(src: &Path, dst: &Path, skip: &[&str]) -> Result<u64> {
+pub fn lean_copy(src: &Path, dst: &Path, skip: &[&str], extra: &[(String, Vec<u8>)]) -> Result<u64> {
     let bytes = fs::read(src).with_context(|| format!("не удалось прочитать {}", src.display()))?;
     let volume = FileSystem::new(Cursor::new(bytes), FsOptions::new())
         .with_context(|| format!("{} — не том FAT", src.display()))?;
@@ -263,6 +263,17 @@ pub fn lean_copy(src: &Path, dst: &Path, skip: &[&str]) -> Result<u64> {
                 entries.push(Entry { rel, node: Node::File(data) });
             }
         }
+    }
+    // Добавки (чужие прошивки, которых нет в хранилище) — с каталогами по пути.
+    for (rel, data) in extra {
+        let mut prefix = String::new();
+        for part in rel.split('/').take(rel.split('/').count() - 1) {
+            prefix = if prefix.is_empty() { part.to_string() } else { format!("{prefix}/{part}") };
+            if !entries.iter().any(|entry| entry.rel == prefix) {
+                entries.push(Entry { rel: prefix.clone(), node: Node::Dir });
+            }
+        }
+        entries.push(Entry { rel: rel.clone(), node: Node::File(data.clone()) });
     }
     // Каталог раньше содержимого — как у `collect`: обход выше идёт стеком.
     entries.sort_by(|a, b| a.rel.cmp(&b.rel));

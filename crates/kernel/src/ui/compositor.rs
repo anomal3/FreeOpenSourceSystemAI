@@ -1720,7 +1720,13 @@ impl Compositor {
             self.mark(card);
         }
         if theme::is_mobile() {
-            let text = super::clock_or_uptime();
+            // Отпечаток строки — часы и батарея (03.11): заряд и зарядка
+            // меняются без смены минуты, и без этого значок оставался пустым
+            // до следующей.
+            let mut text = super::clock_or_uptime();
+            if let Some(state) = crate::battery::get() {
+                text.push_str(&alloc::format!(" {}{}", state.percent, if state.charger { "+" } else { "" }));
+            }
             if text != self.status_text {
                 self.status_text = text;
                 let bar = super::statusbar::bounds(self.screen.width(), self.scale);

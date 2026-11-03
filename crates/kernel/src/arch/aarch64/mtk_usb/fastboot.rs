@@ -215,6 +215,8 @@ impl Fastboot {
             self.pmic(rest);
         } else if text == "oem battery" {
             self.battery();
+        } else if text == "oem consys" || text.starts_with("oem consys ") {
+            self.consys(text.trim_start_matches("oem consys").trim());
         } else if let Some(rest) = text.strip_prefix("oem i2cw ") {
             self.i2c(rest, true);
         } else if let Some(rest) = text.strip_prefix("oem i2c ") {
@@ -826,6 +828,37 @@ impl Fastboot {
         }
         self.state = State::Lines { at: 0 };
         self.continue_lines(0);
+    }
+
+    /// `oem consys [on | load [заголовок] | boot]` — блок связи по шагам
+    /// (`mtk_consys`); без аргумента — сводка.
+    fn consys(&mut self, args: &str) {
+        use crate::arch::aarch64::mtk_consys;
+        let mut words = args.split_whitespace();
+        let result = match words.next() {
+            None => Ok(mtk_consys::status()),
+            Some("on") => mtk_consys::power_on(),
+            Some("load") => {
+                let header = words
+                    .next()
+                    .and_then(|text| text.parse::<usize>().ok())
+                    .unwrap_or(48);
+                mtk_consys::load(header)
+            }
+            Some("boot") => mtk_consys::boot(),
+            Some(_) => Err("usage: oem consys [on | load [header bytes] | boot]"),
+        };
+        match result {
+            Ok(lines) => {
+                self.line_count = 0;
+                for line in &lines {
+                    self.say(line.as_bytes());
+                }
+                self.state = State::Lines { at: 0 };
+                self.continue_lines(0);
+            }
+            Err(err) => self.respond(b"FAIL", err),
+        }
     }
 
     /// `oem i2c <база> <адрес> <регистр> [сколько]` — прочитать байты;
