@@ -184,6 +184,23 @@ pub use x86_64::input;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::input;
 
+/// Блок связи MediaTek (Wi-Fi) — для `crate::wifi` (03.11).
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::mtk_consys;
+
+/// Зажечь или погасить подсветку экрана, если машина это умеет (03.11).
+///
+/// Телефон MediaTek — выводом включения подсветки; у ПК подсветкой
+/// управляет монитор, а DPMS у нас нет — там ничего не делается.
+pub fn backlight(on: bool) {
+    #[cfg(target_arch = "aarch64")]
+    if aarch64::mtk::present() {
+        aarch64::mtk_regs::backlight(on);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = on;
+}
+
 /// Монотонный счётчик: время, которое идёт само, без участия прерываний.
 ///
 /// Обе реализации выставляют одно и то же: `counter()` — текущее значение,

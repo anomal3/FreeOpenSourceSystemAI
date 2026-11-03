@@ -115,8 +115,15 @@ pub fn spawn_input_services() {
     // Батарея — за микросхемой питания MediaTek (03.11). На машине без неё
     // задача после первого же отказа PMIC заканчивается сама.
     if mtk::present() {
+        // Блок связи MT6765 есть у каждой такой машины; включается по
+        // просьбе человека (шторка, «Параметры»), а не при загрузке.
+        crate::wifi::declare_present();
         if let Err(err) = crate::sched::spawn_daemon("battery", mtk_regs::battery_task) {
             crate::kprintln!("  spawn battery service failed: {err}");
+        }
+        // Кнопка питания: гасит экран и блокирует, будит обратно.
+        if let Err(err) = crate::sched::spawn_daemon("powerkey", mtk_regs::powerkey_task) {
+            crate::kprintln!("  spawn power key service failed: {err}");
         }
     }
 

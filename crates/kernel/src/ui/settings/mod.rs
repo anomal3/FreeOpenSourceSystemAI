@@ -363,6 +363,8 @@ enum Deed {
     Timezone(i32),
     NetDhcp,
     NetStatic,
+    /// Включить Wi-Fi (`crate::wifi::enable`, 03.11).
+    WifiOn,
     NetEdit(Field),
     NetApply,
     CheckDisks,
@@ -1061,6 +1063,11 @@ impl SettingsView {
                     Err(err) => Report::bad(format!("{text} не записан: {err}")),
                 });
                 self.request = Some(Request::Panel);
+            }
+            Deed::WifiOn => {
+                crate::wifi::enable();
+                kprintln!("  settings    : wi-fi enable requested");
+                self.report = Some(Report::ok(String::from("Wi-Fi включается — страница обновится сама")));
             }
             Deed::NetDhcp => {
                 self.report = Some(match crate::net::persist::forget() {

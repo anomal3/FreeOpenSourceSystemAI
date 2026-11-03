@@ -1594,6 +1594,17 @@ pub fn stats() -> (u64, u64, usize) {
 ///
 /// Зовётся из задачи, а не из обработчика прерывания, и иначе нельзя: и
 /// заливка, и пересборка кадра берут замок стола.
+/// Заблокировать стол (кнопка питания телефона, 03.11). `false` — стола нет.
+pub fn lock_now() -> bool {
+    with_desktop(|desktop| {
+        if !desktop.locked() {
+            desktop.lock_screen();
+            kprintln!("  desktop     : locked by the power button");
+        }
+    })
+    .is_some()
+}
+
 pub fn set_screen_off(off: bool) -> bool {
     let status = if off { None } else { Some(status_now()) };
     with_desktop(|desktop| {
@@ -1610,6 +1621,9 @@ pub fn set_screen_off(off: bool) -> bool {
     .is_some()
 }
 
+/// Какое состояние Wi-Fi стол показал последним (см. [`tick`]).
+static WIFI_SHOWN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 pub fn tick() {
     let status = status_now();
     let request = MODE_REQUEST.swap(0, core::sync::atomic::Ordering::Relaxed);
@@ -1622,6 +1636,15 @@ pub fn tick() {
         desktop.expire_toast();
         desktop.refresh_lock_clock();
         watch_hung(desktop);
+        // Wi-Fi включается отдельной задачей: сменилось состояние —
+        // перерисовать шторку и «Параметры», которые о нём говорят.
+        let wifi = crate::wifi::state() as u8;
+        if WIFI_SHOWN.swap(wifi, Ordering::Relaxed) != wifi {
+            desktop.refresh_shade();
+            if let Some(window) = desktop.find(App::Settings) {
+                window.refresh_settings();
+            }
+        }
         desktop.present();
     });
     // «Завершить программу» — вне замка стола: снятие задачи берёт свои.
@@ -2535,16 +2558,40 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
 
     // 0а. Шторка — поверх всего остального, и разбирается первой.
     //
-    // Открытая шторка съедает нажатие целиком: нажатие внутрь пока ничего не
-    // переключает (переключать нечего — см. `ui::shade`), а нажатие мимо её
-    // закрывает. Пропустить его дальше значило бы открыть окно под шторкой,
-    // которую человек всего лишь хотел убрать.
+    // Открытая шторка съедает нажатие целиком: нажатие мимо её закрывает
+    // (пропустить его дальше значило бы открыть окно под шторкой, которую
+    // человек всего лишь хотел убрать), нажатие внутрь — её плитки и полосы
+    // (03.11, см. `ui::shade::Action`).
     if desktop.shade_open() {
         if !desktop.shade_contains(x, y) {
             desktop.toggle_shade();
             kprintln!("  desktop     : shade closed");
             desktop.present();
+            return;
         }
+        match desktop.shade_press(x, y) {
+            Some(shade::Action::Close) => {
+                desktop.toggle_shade();
+                kprintln!("  desktop     : shade closed");
+            }
+            Some(shade::Action::Wifi) => {
+                desktop.toggle_shade();
+                kprintln!("  desktop     : shade -> wi-fi settings");
+                open_settings(desktop, Section::Network, status);
+            }
+            Some(shade::Action::Lock) => {
+                desktop.toggle_shade();
+                desktop.lock_screen();
+                kprintln!("  desktop     : locked from the shade");
+            }
+            Some(shade::Action::Volume(percent)) => {
+                crate::sound::set_volume(percent);
+                desktop.refresh_shade();
+                kprintln!("  desktop     : volume {percent} % from the shade");
+            }
+            None => {}
+        }
+        desktop.present();
         return;
     }
 
@@ -2819,6 +2866,8 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                     kprintln!("  desktop     : minimized list opened");
                 }
             }
+            // Трубка в доке телефона — номеронабиратель (03.11).
+            PanelHit::Missing("phone") => start(desktop, icons::PHONE_COMMAND),
             PanelHit::Missing(what) => {
                 kprintln!("  desktop     : {what} -- no program for it on this machine yet");
             }

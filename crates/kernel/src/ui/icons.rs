@@ -1196,6 +1196,9 @@ fn system_items() -> Vec<Item> {
 /// телефона и камеры в доке: раскладка — решение, а нажатие честно говорит,
 /// чего нет. «Пакеты» открывают «Параметры», где пакеты и живут; «Диски» —
 /// диспетчер устройств, где видны носители.
+/// Номеронабиратель — значок на главном экране и трубка в доке телефона.
+pub const PHONE_COMMAND: &str = "/bin/phone";
+
 fn mobile_items() -> Vec<Item> {
     let program = |icon, label: &str, command: &str| Item {
         kind: Kind::Program(icon),
@@ -1206,7 +1209,9 @@ fn mobile_items() -> Vec<Item> {
     let app = |app: App, label: &str| Item { kind: Kind::App(app), label: label.to_string(), path: None, shortcut: None };
     let missing = |what, icon, label: &str| Item { kind: Kind::Missing(what, icon), label: label.to_string(), path: None, shortcut: None };
     let mut out = Vec::new();
-    out.push(missing("phone", Icon::Display, "Телефон"));
+    // «Телефон» — номеронабиратель (03.11); звонить станет, когда появится
+    // модем, а набрать номер можно уже сейчас.
+    out.push(program(Icon::Phone, "Телефон", PHONE_COMMAND));
     out.push(app(App::Terminal, "Терминал"));
     out.push(app(App::Settings, "Настройки"));
     out.push(program(Icon::Folder, FILES_LABEL, FILES_COMMAND));

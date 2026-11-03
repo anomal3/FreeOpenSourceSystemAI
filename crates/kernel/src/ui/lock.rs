@@ -104,6 +104,12 @@ impl Lock {
             return Outcome::Power;
         }
         if self.phase == Phase::Clock {
+            // Учётная запись без пароля (живая система, телефон): касание
+            // открывает стол сразу — карточке с полем ждать нечего, а набрать
+            // Enter на телефоне с экрана блокировки нечем (03.11).
+            if crate::user::session::verify_password("").is_none() {
+                return Outcome::Unlock;
+            }
             self.phase = Phase::Password;
             return Outcome::Redraw;
         }

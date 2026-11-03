@@ -261,6 +261,133 @@ pub fn boot() -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
     Ok(report)
 }
 
+// ---------------------------------------------------------------------------
+// WMT по BTIF — разговор с прошивкой блока
+// ---------------------------------------------------------------------------
+//
+// Проверено на аппарате 03.11 побайтно (`oem poke`/`peek`), здесь — то же в
+// ядре. BTIF — последовательный порт внутри SoC; настраивается как у драйвера
+// MediaTek (`btif_plat.c: hal_btif_hw_init`), приём — опросом `LSR`. Первые
+// команды идут в кадре STP «MAND»: `80 40 <длина LE> 00`, пакет, `00 00`.
+
+const BTIF: u64 = 0x1100_c000;
+const BTIF_LSR: u64 = BTIF + 0x14;
+const LSR_DATA: u32 = 1 << 0;
+const LSR_THR_EMPTY: u32 = 1 << 5;
+
+fn btif_init() -> Result<(), &'static str> {
+    write(BTIF + 0x0c, 0)?; // FAKELCR: обычный режим
+    let handshake = read(BTIF + 0x6c)?;
+    write(BTIF + 0x6c, handshake | 1)?; // новый handshake
+    write(BTIF + 0x08, 2)?; // сбросить FIFO приёма
+    write(BTIF + 0x08, 4)?; // и передачи
+    write(BTIF + 0x60, 0x18)?; // TRI_LVL: TX 8, RX 1, без петли
+    write(BTIF + 0x4c, 4)?; // DMA_EN: опрос, AUTORST
+    Ok(())
+}
+
+fn btif_send(bytes: &[u8]) -> Result<(), &'static str> {
+    for byte in bytes {
+        let started = crate::time::uptime_ns();
+        while read(BTIF_LSR)? & LSR_THR_EMPTY == 0 {
+            if crate::time::uptime_ns().wrapping_sub(started) > 10_000_000 {
+                return Err("BTIF transmitter stuck");
+            }
+        }
+        write(BTIF, u32::from(*byte))?;
+    }
+    Ok(())
+}
+
+/// Принять кадр MAND: заголовок, длина, тело, два байта CRC. Вернуть тело.
+fn btif_receive(timeout_ms: u64) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    let started = crate::time::uptime_ns();
+    let mut frame = alloc::vec::Vec::new();
+    loop {
+        if read(BTIF_LSR)? & LSR_DATA != 0 {
+            let byte = (read(BTIF)? & 0xff) as u8;
+            // Кадр начинается с 0x80 — всё до него мусор (как у парсера STP).
+            if frame.is_empty() && byte != 0x80 {
+                continue;
+            }
+            frame.push(byte);
+            if frame.len() >= 4 {
+                let len = usize::from(frame[2]) | (usize::from(frame[1] & 0x0f) << 8);
+                if frame.len() == 4 + len + 2 {
+                    return Ok(frame[4..4 + len].to_vec());
+                }
+            }
+            continue;
+        }
+        if crate::time::uptime_ns().wrapping_sub(started) > timeout_ms * 1_000_000 {
+            return Err("CONNSYS firmware did not answer");
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Команда WMT в кадре MAND — и ответ на неё.
+fn wmt(packet: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    let mut frame = alloc::vec::Vec::with_capacity(packet.len() + 6);
+    frame.extend_from_slice(&[0x80, 0x40 | ((packet.len() >> 8) as u8 & 0x0f), packet.len() as u8, 0]);
+    frame.extend_from_slice(packet);
+    frame.extend_from_slice(&[0, 0]);
+    btif_send(&frame)?;
+    // У драйвера — 2 с до первого включения функций (`WMT_LIB_RX_TIMEOUT`).
+    btif_receive(2_000)
+}
+
+/// Прочитать регистр блока командой WMT (`01 08 10 00 02 01 00 01` +
+/// адрес + значение + маска).
+fn wmt_read(address: u32) -> Result<u32, &'static str> {
+    let mut packet = alloc::vec![0x01, 0x08, 0x10, 0x00, 0x02, 0x01, 0x00, 0x01];
+    packet.extend_from_slice(&address.to_le_bytes());
+    packet.extend_from_slice(&0u32.to_le_bytes());
+    packet.extend_from_slice(&0xffffu32.to_le_bytes());
+    let answer = wmt(&packet)?;
+    if answer.len() < 16 || answer[0] != 0x02 || answer[1] != 0x08 {
+        return Err("unexpected answer to a WMT register read");
+    }
+    Ok(u32::from_le_bytes([answer[12], answer[13], answer[14], answer[15]]))
+}
+
+/// Начальный обмен драйвера MediaTek: опознание, версии, сброс, номер чипа,
+/// аналоговая микросхема. Возвращает строки отчёта.
+pub fn wmt_init() -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
+    btif_init()?;
+    let mut report = alloc::vec::Vec::new();
+    let core_id = wmt_read(0x8000_0008)?;
+    let hw = wmt_read(0x8000_0000)?;
+    let fw = wmt_read(0x8000_0004)?;
+    report.push(alloc::format!("core {core_id:04x}, hw {hw:04x}, fw {fw:04x}"));
+    if wmt(&[0x01, 0x07, 0x01, 0x00, 0x04])?.get(..5) != Some(&[0x02, 0x07, 0x01, 0x00, 0x00]) {
+        return Err("WMT reset refused");
+    }
+    if wmt(&[0x01, 0x02, 0x05, 0x00, 0x11, 0x65, 0x67, 0x00, 0x00])?.get(..5) != Some(&[0x02, 0x02, 0x01, 0x00, 0x00]) {
+        return Err("WMT refused the chip id");
+    }
+    let adie = wmt(&[0x01, 0x02, 0x01, 0x00, 0x12])?;
+    let adie_id = match adie.get(7..9) {
+        Some(bytes) => u16::from_le_bytes([bytes[0], bytes[1]]),
+        None => 0,
+    };
+    report.push(alloc::format!("wmt reset ok, chip id set, a-die {adie_id:04x}"));
+    crate::kprintln!("  consys      : wmt up: core {core_id:#x}, hw {hw:#x}, a-die {adie_id:#x}");
+    Ok(report)
+}
+
+/// Весь путь включения: питание, прошивки, процессор, начальный обмен.
+pub fn bring_up() -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
+    let mut report = power_on()?;
+    report.extend(load(48)?);
+    report.extend(boot()?);
+    if read(CONN_MCU_STATE)? != CONN_MCU_READY {
+        return Err("CONNSYS processor did not start");
+    }
+    report.extend(wmt_init()?);
+    Ok(report)
+}
+
 /// Короткая сводка: домен, версия, состояние процессора, память.
 pub fn status() -> alloc::vec::Vec<alloc::string::String> {
     let mut report = alloc::vec::Vec::new();

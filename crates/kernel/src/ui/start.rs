@@ -70,7 +70,7 @@ const CATALOG: [Entry; 20] = [
     app("Монитор", "приложение · память и процессор", Icon::Chart, Tone::Muted, Target::Program("/bin/sysmon")),
     app("Задачи", "приложение · диспетчер задач", Icon::Service, Tone::Muted, Target::Program("/bin/taskmgr")),
     app("О системе", "приложение · версия и сборка", Icon::Info, Tone::Muted, Target::App(App::About)),
-    app("Телефон", "приложение · пока нет", Icon::Display, Tone::Accent, Target::Missing("phone")),
+    app("Телефон", "приложение · набор номера", Icon::Phone, Tone::Accent, Target::Program("/bin/phone")),
     app("Журнал", "приложение · пока нет", Icon::Log, Tone::Muted, Target::Missing("log")),
     app("Настройки → Экран", "раздел настроек", Icon::Settings, Tone::Muted, Target::App(App::Settings)),
     app("Настройки → Сеть", "раздел настроек", Icon::Settings, Tone::Muted, Target::App(App::Settings)),
@@ -86,7 +86,7 @@ const CATALOG: [Entry; 20] = [
 
 /// Закреплённые плитки — те, что в макете.
 const PINNED: [(&str, Icon, Tone, Target); 4] = [
-    ("Телефон", Icon::Display, Tone::Accent, Target::Missing("phone")),
+    ("Телефон", Icon::Phone, Tone::Accent, Target::Program("/bin/phone")),
     ("Терминал", Icon::Terminal, Tone::Ok, Target::App(App::Terminal)),
     ("Файлы", Icon::Folder, Tone::Muted, Target::Program("/bin/files")),
     ("Диски", Icon::Disk, Tone::Muted, Target::Program("/bin/devmgr")),

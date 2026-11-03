@@ -293,7 +293,7 @@ pub fn probe() -> Result<Payload, Error> {
 /// третьего раза не было, `xtask` теперь **читает этот файл** и сверяет список с
 /// `USER_PROGRAMS` по именам, а не по длине: см. `installer_ships_every_program`
 /// в `xtask/src/build.rs`.
-const PROGRAMS: [(&CStr16, &str); 61] = [
+const PROGRAMS: [(&CStr16, &str); 62] = [
     // vDSO программ Linux (01.11.2026): время без входа в ядро. Не программа,
     // но едет тем же путём — так он есть и на установленной системе.
     (cstr16!("\\FREEOS\\BIN\\VDSO"), "vdso"),
@@ -358,6 +358,8 @@ const PROGRAMS: [(&CStr16, &str); 61] = [
     // Файл больше 4 ГиБ на btrfs (02.11) — проверяется как раз на
     // установленной системе.
     (cstr16!("\\FREEOS\\BIN\\BIGFILE"), "bigfile"),
+    // Номеронабиратель (03.11): на телефоне — значок «Телефон» и трубка в доке.
+    (cstr16!("\\FREEOS\\BIN\\PHONE"), "phone"),
     // Своя среда .NET (веха v0.7c, фаза N2).
     (cstr16!("\\FREEOS\\BIN\\DOTNET"), "dotnet"),
     (cstr16!("\\FREEOS\\BIN\\WINSHOW"), "winshow"),

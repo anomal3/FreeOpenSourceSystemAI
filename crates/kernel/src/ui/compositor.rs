@@ -2520,14 +2520,48 @@ impl Compositor {
     ///
     /// `None` — шторки на этой машине нет (см. [`Shade::new`]).
     pub fn toggle_shade(&mut self) -> Option<bool> {
-        let rect = self.shade.as_ref()?.rect;
         let open = self.shade.as_mut()?.toggle();
-        // Закрытую шторку надо стереть: под ней стол и окна, которые никто не
-        // перерисовывал, — они не «изменились», но их снова видно.
-        if !open {
-            self.mark_layer(rect);
-        }
+        // Дальше её ведёт `advance_shade` кадр за кадром; первый кадр — сразу.
+        super::set_animating(true);
         Some(open)
+    }
+
+    /// Шаг выезда шторки: стереть прошлое место, пометить новое. Возвращает,
+    /// едет ли она ещё (тогда стол просит следующий кадр).
+    fn advance_shade(&mut self) -> bool {
+        let Some(shade) = self.shade.as_mut() else { return false };
+        if !shade.is_moving() {
+            return false;
+        }
+        let (was, now) = shade.advance(crate::time::uptime_ns());
+        let moving = shade.is_moving();
+        // Под прошлым местом — стол и окна, которые никто не перерисовывал:
+        // они не «изменились», но их снова видно. Тень шире самой шторки.
+        let pad = mini_ui::paint::Ctx::scaled(self.scale).px(24) as i32;
+        let grow = |rect: Rect| if rect.is_empty() { rect } else { Rect::new(rect.x - pad, rect.y - pad, rect.w + pad as u32 * 2, rect.h + pad as u32 * 2) };
+        self.mark_layer(grow(was));
+        self.mark_layer(grow(now));
+        moving
+    }
+
+    /// Нажатие в открытую шторку — что сделать (см. [`super::shade::Action`]).
+    pub fn shade_press(&mut self, x: i32, y: i32) -> Option<super::shade::Action> {
+        let shade = self.shade.as_mut()?;
+        let action = shade.press(x, y);
+        // «Не беспокоить» перерисовало шторку изнутри.
+        let damage = shade.take_damage();
+        if !damage.is_empty() {
+            let rect = damage.translate(shade.rect.x, shade.rect.y);
+            self.mark(rect);
+        }
+        action
+    }
+
+    /// Перерисовать открытую шторку (сменилась громкость, Wi-Fi).
+    pub fn refresh_shade(&mut self) {
+        if let Some(shade) = self.shade.as_mut() {
+            shade.refresh();
+        }
     }
 
     #[must_use]
@@ -3025,13 +3059,15 @@ impl Compositor {
     /// ради одного цвета незачем, а слои при этом остаются нетронутыми — им
     /// предстоит вернуться на экран такими же, какими были.
     ///
-    /// Чего это **не** делает, и это стоит знать: панель не гаснет. Погасить
-    /// подсветку — значит попросить об этом монитор (DPMS) или контроллер
-    /// панели, а ни того, ни другого у нас нет. Картинка чёрная, лампа горит.
+    /// С 03.11 на телефоне гаснет и подсветка (`arch::backlight` — вывод её
+    /// включения): Роман видел «чёрное окно с горящими пикселями». У ПК
+    /// подсветкой ведает монитор, DPMS у нас нет — там картинка чёрная, лампа
+    /// горит, как раньше.
     pub fn blank(&mut self) {
         self.screen.fill(self.screen.bounds(), Color::rgb(0, 0, 0));
         let all = self.screen.bounds();
         crate::display::flush(all.x, all.y, all.w, all.h);
+        crate::arch::backlight(false);
         if self.hw_cursor {
             let (x, y) = self.pointer.position();
             crate::display::cursor_visible(false, x, y);
@@ -3042,6 +3078,7 @@ impl Compositor {
     /// Зажечь обратно: весь экран объявляется изменившимся и собирается заново.
     pub fn unblank(&mut self) {
         self.blanked = false;
+        crate::arch::backlight(true);
         if self.hw_cursor {
             let (x, y) = self.pointer.position();
             crate::display::cursor_visible(true, x, y);
@@ -3073,6 +3110,7 @@ impl Compositor {
             crate::kprintln!("  keyboard    : {}", if shown { "shown" } else { "hidden" });
         }
         self.advance_flight();
+        let shade_moving = self.advance_shade();
         self.build_scene();
         // След пальца по клавиатуре и язык её подписей. Анимация идёт, пока
         // летит окно или тлеет след: оболочка будит стол по этому признаку.
@@ -3095,7 +3133,7 @@ impl Compositor {
         } else if let Some(was) = self.pointer.clear_busy() {
             self.mark(was);
         }
-        super::set_animating(self.flight.is_some() || trail || spinning);
+        super::set_animating(self.flight.is_some() || trail || spinning || shade_moving);
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
             return;
@@ -3433,11 +3471,13 @@ impl Compositor {
         // Шторка — поверх всего, включая док: она и открывается затем, чтобы
         // закрыть собой то, что под ней.
         if let Some(shade) = self.shade.as_ref() {
-            if shade.is_open() {
+            // Там, где она сейчас на пути выезда (`Shade::advance`).
+            let rect = shade.shown();
+            if shade.is_visible() && !rect.is_empty() {
                 // Скругление — как у самой шторки (макет, экран 02).
                 let r = mini_ui::paint::Ctx::scaled(self.scale).px(38);
-                self.drop_shadow(back, shade.rect, band, dy, r);
-                self.stack(back, shade.surface(), shade.rect, band, dy, r);
+                self.drop_shadow(back, rect, band, dy, r);
+                self.stack(back, shade.surface(), rect, band, dy, r);
             }
         }
         // Курсор — последним и без проверки пересечения: он мал, а обрезка

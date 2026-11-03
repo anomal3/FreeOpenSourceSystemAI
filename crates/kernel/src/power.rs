@@ -250,6 +250,29 @@ pub fn note_input() {
     LAST_INPUT_MS.store(crate::time::uptime_ms(), Ordering::Relaxed);
 }
 
+/// Кнопка питания телефона (03.11): горит экран — заблокировать и погасить
+/// вместе с подсветкой; погашен — зажечь, на экране блокировки.
+///
+/// Зовётся из задачи опроса кнопки (`mtk_regs::powerkey_task`), не из
+/// прерывания: и блокировка, и гашение берут замок стола.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub fn power_button() {
+    if SCREEN_OFF.load(Ordering::Relaxed) {
+        SCREEN_OFF.store(false, Ordering::Relaxed);
+        note_input();
+        crate::ui::set_screen_off(false);
+        crate::kprintln!("  power       : screen on by the power button");
+        return;
+    }
+    crate::ui::lock_now();
+    if crate::ui::set_screen_off(true) {
+        let last = LAST_INPUT_MS.load(Ordering::Relaxed);
+        SCREEN_OFF.store(true, Ordering::Relaxed);
+        BLANKED_AT.store(last, Ordering::Relaxed);
+        crate::kprintln!("  power       : screen off and locked by the power button");
+    }
+}
+
 /// Через сколько секунд бездействия гаснет экран; ноль — никогда.
 #[must_use]
 pub fn screen_off_after() -> u32 {

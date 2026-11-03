@@ -285,6 +285,55 @@ pub fn battery_task() {
 }
 
 // ---------------------------------------------------------------------------
+// Подсветка и кнопка питания (03.11)
+// ---------------------------------------------------------------------------
+//
+// Подсветкой `dandelion` управляет сама панель (команда DSI 0x51), а
+// драйвера DSI у нас нет; но у подсветки есть вывод включения — GPIO154
+// `LCD_BL_EN` (`dandelion.dws`, драйверы панелей Xiaomi): ноль гасит
+// преобразователь, единица зажигает. Проверено на аппарате: выход, стоит в
+// единице после загрузчика. Кнопка питания — `TOPSTATUS` (0x24) микросхемы
+// питания, бит 1 (`PMIC_PWRKEY_DEB`); отпущенная — 1.
+
+/// GPIO154: банк 4 (выводы 128–159), бит 26. `DOUT` банка, `+4` — установить,
+/// `+8` — сбросить.
+const GPIO_DOUT_BANK4: u64 = 0x1000_5140;
+const LCD_BL_EN: u32 = 1 << 26;
+
+/// Зажечь или погасить подсветку панели.
+pub fn backlight(on: bool) {
+    let address = if on { GPIO_DOUT_BANK4 + 4 } else { GPIO_DOUT_BANK4 + 8 };
+    if !write32(address, LCD_BL_EN) {
+        crate::kprintln!("  backlight   : GPIO window not mapped");
+    }
+}
+
+/// `TOPSTATUS` микросхемы питания и бит кнопки питания в нём.
+const TOPSTATUS: u16 = 0x0024;
+const PWRKEY_DEB: u16 = 1 << 1;
+
+/// Служба кнопки питания: опрос раз в 30 мс, нажатие — по смене уровня
+/// относительно того, что было при старте (кнопку при загрузке не держат).
+pub fn powerkey_task() {
+    let Ok(idle) = pmic_read(TOPSTATUS).map(|value| value & PWRKEY_DEB) else {
+        crate::kprintln!("  powerkey    : PMIC does not answer; power key not watched");
+        return;
+    };
+    crate::kprintln!("  powerkey    : watching TOPSTATUS bit 1, released = {}", idle != 0);
+    let mut down = false;
+    loop {
+        crate::sched::sleep_ms(30);
+        let Ok(value) = pmic_read(TOPSTATUS) else { continue };
+        let pressed = value & PWRKEY_DEB != idle;
+        if pressed && !down {
+            crate::kprintln!("  powerkey    : pressed");
+            crate::power::power_button();
+        }
+        down = pressed;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // «Войти в fastboot» — метка в часах PMIC
 // ---------------------------------------------------------------------------
 //

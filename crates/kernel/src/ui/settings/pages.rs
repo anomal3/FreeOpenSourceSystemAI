@@ -322,12 +322,36 @@ impl SettingsView {
 
     fn network(&self, pass: &mut Pass, x: i32, y: i32, w: u32) {
         let ctx = pass.ctx;
+        // Wi-Fi (03.11) — первым, если у машины есть что включать: на
+        // телефоне это единственная связь, и искать её ниже карты Ethernet,
+        // которой нет, человек не станет.
+        let wifi = crate::wifi::state();
+        let mut y = y;
+        if wifi != crate::wifi::State::Absent {
+            y = pass.group(x, y, w, "Wi-Fi");
+            let (desc, control, deed) = match wifi {
+                crate::wifi::State::Off => ("Блок связи выключен", Ctl::Button("Включить", Weight::Primary), Some(Deed::WifiOn)),
+                crate::wifi::State::Failed => ("Включить не вышло — подробности ниже", Ctl::Button("Ещё раз", Weight::Primary), Some(Deed::WifiOn)),
+                crate::wifi::State::Starting => ("Включается: питание, прошивки, процессор блока…", Ctl::Value("подождите"), None),
+                _ => ("Прошивка блока связи запущена и отвечает", Ctl::Value("включён"), None),
+            };
+            y = row(pass, x, y, w, Some(Fi::Globe), "Wi-Fi", desc, control, deed);
+            for line in crate::wifi::report() {
+                y = row(pass, x, y, w, None, &line, "", Ctl::Value(""), None);
+            }
+            if wifi == crate::wifi::State::FirmwareUp {
+                y = row(pass, x, y, w, Some(Fi::Search), "Сети поблизости", "Поиск сетей — следующий шаг драйвера", Ctl::Value("пока нет"), None);
+            }
+        }
         let Some(status) = crate::net::status() else {
+            if wifi != crate::wifi::State::Absent {
+                return;
+            }
             let y = row(pass, x, y, w, Some(Fi::Globe), "Сетевая карта", "Драйверы: virtio-net, e1000, atl1c", Ctl::Value("не найдена"), None);
             pass.note(x, y + ctx.px(4) as i32, w, "Адрес задавать нечему: раздел оживёт вместе с драйвером для вашей карты.");
             return;
         };
-        let mut y = pass.group(x, y, w, "Сейчас");
+        y = pass.group(x, y, w, "Сейчас");
         let mac = format!("{}", crate::net::eth::Display(status.mac));
         y = row(pass, x, y, w, Some(Fi::Globe), "Аппаратный адрес", "", Ctl::Mono(&mac), None);
         let address = if status.address.is_unspecified() {

@@ -9,17 +9,15 @@
 //! уведомления. На настольной машине то же самое живёт в трее и в «Параметрах»,
 //! и шторки там нет вовсе — она открывается жестом, которого мышью не сделать.
 //!
-//! # Почему переключатели ничего не переключают
+//! # Что нажимается (03.11)
 //!
-//! Потому что переключать пока нечего, и это сказано вслух прямо на плитке:
-//! у Wi-Fi написано «драйвера нет», у Bluetooth — «выключен». Плитка, которая
-//! нажимается и молча ничего не делает, хуже отсутствующей: человек решит, что
-//! сломалось. Плитка, честно называющая своё состояние, — это список работ,
-//! который видно с экрана.
-//!
-//! Яркость и звук показаны полосой без ручки по той же причине: панелью
-//! управляет загрузчик, регулятора у нас нет, и ползунок, который не двигается,
-//! означал бы поломку.
+//! Роман на телефоне: «шторка открывается без анимации и ни на что не
+//! реагирует». Теперь каждая плитка отвечает на нажатие — делом или честным
+//! ответом: Wi-Fi открывает свою страницу «Параметров» (там видно, что с
+//! блоком связи), «Не беспокоить» переключается, «Заблокировать» ставит
+//! экран блокировки, Bluetooth говорит на плитке, что драйвера нет. Полоса
+//! звука тянется пальцем; яркость — когда появится регулятор подсветки.
+//! Шторка выезжает сверху и уезжает обратно ([`OPEN_NS`]).
 //!
 //! # Как она устроена внутри
 //!
@@ -39,19 +37,46 @@ use mini_ui::{Color, Rect, Surface, draw};
 struct Tile {
     icon: Icon,
     label: &'static str,
-    note: &'static str,
-    /// Работает ли то, о чём плитка. Пока не работает ничего — но цвет
-    /// заведён сразу, чтобы включённая плитка не потребовала переделки.
+    note: alloc::string::String,
+    /// Включено ли то, о чём плитка: включённая залита акцентом.
     on: bool,
 }
 
+/// Что сделать по нажатию в шторку — решает стол, шторка только называет.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Плитка Wi-Fi: страница «Wi-Fi» в «Параметрах».
+    Wifi,
+    /// Плитка «Заблокировать».
+    Lock,
+    /// Полоса звука, новая громкость в процентах.
+    Volume(u8),
+    /// Нажатие в ручку внизу — закрыть шторку.
+    Close,
+}
+
+/// «Не беспокоить» — пока только состояние на плитке (уведомлений, которые
+/// оно глушило бы, у системы ещё нет).
+static DO_NOT_DISTURB: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Сколько выезжает шторка.
+pub const OPEN_NS: u64 = 220_000_000;
+
 /// Плитки в том порядке, в каком они стоят в макете.
-const TILES: [Tile; 4] = [
-    Tile { icon: Icon::Network, label: "Wi-Fi", note: "драйвера нет", on: false },
-    Tile { icon: Icon::Devices, label: "Bluetooth", note: "выключен", on: false },
-    Tile { icon: Icon::Clock, label: "Не беспокоить", note: "выключено", on: false },
-    Tile { icon: Icon::Log, label: "Отладка", note: "журнал по USB", on: true },
-];
+fn tiles() -> [Tile; 4] {
+    let quiet = DO_NOT_DISTURB.load(core::sync::atomic::Ordering::Relaxed);
+    [
+        Tile {
+            icon: Icon::Network,
+            label: "Wi-Fi",
+            note: crate::wifi::state().note().into(),
+            on: crate::wifi::state() == crate::wifi::State::FirmwareUp,
+        },
+        Tile { icon: Icon::Devices, label: "Bluetooth", note: "драйвера нет".into(), on: false },
+        Tile { icon: Icon::Clock, label: "Не беспокоить", note: if quiet { "включено" } else { "выключено" }.into(), on: quiet },
+        Tile { icon: Icon::Shield, label: "Заблокировать", note: "экран и вход".into(), on: false },
+    ]
+}
 
 /// Сколько плиток в ряду.
 const COLUMNS: u32 = 2;
@@ -69,6 +94,14 @@ pub struct Shade {
     scale: u32,
     open: bool,
     damage: Rect,
+    /// Идёт выезд или уход: когда начался и куда (`true` — открывается).
+    motion: Option<(u64, bool)>,
+    /// Где шторка была нарисована прошлым кадром — его надо стереть.
+    shown: Rect,
+    /// Места плиток и полос внутри поверхности — для нажатий.
+    tile_rects: [Rect; 4],
+    volume_rect: Rect,
+    handle_rect: Rect,
 }
 
 impl Shade {
@@ -97,12 +130,30 @@ impl Shade {
             scale,
             open: false,
             damage: Rect::EMPTY,
+            motion: None,
+            shown: Rect::EMPTY,
+            tile_rects: [Rect::EMPTY; 4],
+            volume_rect: Rect::EMPTY,
+            handle_rect: Rect::EMPTY,
         })
     }
 
+    /// Открыта ли (по смыслу: уезжающая — уже закрыта).
     #[must_use]
     pub const fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Видна ли на экране: открыта или ещё уезжает.
+    #[must_use]
+    pub const fn is_visible(&self) -> bool {
+        self.open || self.motion.is_some()
+    }
+
+    /// Идёт ли выезд или уход.
+    #[must_use]
+    pub const fn is_moving(&self) -> bool {
+        self.motion.is_some()
     }
 
     #[must_use]
@@ -116,17 +167,96 @@ impl Shade {
         if self.open {
             self.redraw();
         }
+        // Выезд продолжается с того места, где был: шторку, закрытую на
+        // полпути, не дёргает обратно на край.
+        let now = crate::time::uptime_ns();
+        let start = match self.motion {
+            Some((started, _)) => now.saturating_sub(OPEN_NS.saturating_sub(now.saturating_sub(started).min(OPEN_NS))),
+            None => now,
+        };
+        self.motion = Some((start, self.open));
         self.open
     }
 
     pub fn close(&mut self) {
-        self.open = false;
+        if self.open {
+            self.toggle();
+        }
+    }
+
+    /// Где шторка сейчас, с учётом выезда, и закончился ли он.
+    ///
+    /// Сглаживание — «плавно в начале и в конце» (smoothstep), как у полёта
+    /// окон; путь — от-за верхнего края до своего места.
+    pub fn advance(&mut self, now_ns: u64) -> (Rect, Rect) {
+        let was = self.shown;
+        let travel = self.rect.bottom().max(1);
+        let rect = match self.motion {
+            None if self.open => self.rect,
+            None => Rect::EMPTY,
+            Some((started, opening)) => {
+                let t = (now_ns.saturating_sub(started).min(OPEN_NS) * 1024 / OPEN_NS) as i64;
+                let eased = t * t * (3 * 1024 - 2 * t) / (1024 * 1024);
+                let shown = if opening { eased } else { 1024 - eased };
+                let dy = -(i64::from(travel) * (1024 - shown) / 1024) as i32;
+                if t >= 1024 {
+                    self.motion = None;
+                    if opening { self.rect } else { Rect::EMPTY }
+                } else {
+                    self.rect.translate(0, dy)
+                }
+            }
+        };
+        self.shown = rect;
+        (was, rect)
+    }
+
+    /// Где шторка нарисована сейчас.
+    #[must_use]
+    pub const fn shown(&self) -> Rect {
+        self.shown
     }
 
     /// Попадает ли точка экрана в шторку.
     #[must_use]
     pub fn contains(&self, x: i32, y: i32) -> bool {
         self.open && self.rect.contains(x, y)
+    }
+
+    /// Нажатие в открытую шторку: что сделать. Переключатели, которые
+    /// шторка ведёт сама («Не беспокоить»), переключаются здесь же.
+    pub fn press(&mut self, x: i32, y: i32) -> Option<Action> {
+        if !self.contains(x, y) {
+            return None;
+        }
+        let (x, y) = (x - self.rect.x, y - self.rect.y);
+        if self.handle_rect.contains(x, y) {
+            return Some(Action::Close);
+        }
+        if self.volume_rect.contains(x, y) {
+            let into = (x - self.volume_rect.x).clamp(0, self.volume_rect.w as i32) as u32;
+            let percent = (into * 100 + self.volume_rect.w / 2) / self.volume_rect.w.max(1);
+            return Some(Action::Volume(percent.min(100) as u8));
+        }
+        let hit = self.tile_rects.iter().position(|rect| rect.contains(x, y))?;
+        match hit {
+            0 => Some(Action::Wifi),
+            2 => {
+                DO_NOT_DISTURB.fetch_xor(true, core::sync::atomic::Ordering::Relaxed);
+                self.redraw();
+                None
+            }
+            3 => Some(Action::Lock),
+            // Bluetooth: драйвера нет, и это написано на самой плитке.
+            _ => None,
+        }
+    }
+
+    /// Перерисовать содержимое снаружи (громкость сменилась).
+    pub fn refresh(&mut self) {
+        if self.open {
+            self.redraw();
+        }
     }
 
     /// Забрать накопленные изменения.
@@ -165,7 +295,7 @@ impl Shade {
         let gap = ctx.px(9);
         let tile_w = (room.saturating_sub(gap * (COLUMNS - 1))) / COLUMNS;
         let tile_h = ctx.px(TILE_H);
-        for (index, tile) in TILES.iter().enumerate() {
+        for (index, tile) in tiles().iter().enumerate() {
             let column = index as u32 % COLUMNS;
             let row = index as u32 / COLUMNS;
             let rect = Rect::new(
@@ -175,13 +305,21 @@ impl Shade {
                 tile_h,
             );
             self.draw_tile(ctx, rect, tile);
+            self.tile_rects[index] = rect;
         }
         y += (tile_h * 2 + gap) as i32 + ctx.px(16) as i32;
 
-        // Полосы: яркость и звук. Без ручки — двигать их нечем.
-        for (label, icon, percent, accent) in [("Яркость", Icon::Sun, 72u32, true), ("Звук", Icon::Info, 30, false)] {
+        // Полосы: яркость и звук. Звук — настоящий (`crate::sound`) и
+        // тянется пальцем; яркость — когда будет регулятор подсветки.
+        let volume = u32::from(crate::sound::volume());
+        for (label, icon, percent, accent, live) in
+            [("Яркость", Icon::Sun, 100u32, true, false), ("Звук", Icon::Info, volume, false, true)]
+        {
             let rect = Rect::new(left, y, room, ctx.px(SLIDER_H));
             self.draw_slider(ctx, rect, label, icon, percent, accent);
+            if live {
+                self.volume_rect = rect;
+            }
             y += ctx.px(SLIDER_H + 10) as i32;
         }
         y += ctx.px(6) as i32;
@@ -198,6 +336,9 @@ impl Shade {
 
         let handle = Rect::new(card.w as i32 / 2 - ctx.px(22) as i32, y, ctx.px(44), ctx.px(4));
         draw::rounded(&mut self.surface, handle, handle.h / 2, p.ink6, 180);
+        // Ручку нажимают пальцем, а не попадают в четыре точки: поле — во всю
+        // ширину и до низа шторки.
+        self.handle_rect = Rect::new(0, y - ctx.px(14) as i32, card.w, (card.bottom() - y + ctx.px(14) as i32).max(0) as u32);
 
         self.damage = card;
     }
@@ -226,7 +367,7 @@ impl Shade {
         let top = rect.y + (rect.h as i32 - i32::from(title.line) - i32::from(small.line)) / 2;
         paint::text_clipped(ctx, &mut self.surface, Role::Title, text_x, top, room, tile.label, ink);
         let note_ink = if tile.on { ink } else { p.ink4 };
-        paint::text_clipped(ctx, &mut self.surface, Role::MonoSmall, text_x, top + i32::from(title.line), room, tile.note, note_ink);
+        paint::text_clipped(ctx, &mut self.surface, Role::MonoSmall, text_x, top + i32::from(title.line), room, &tile.note, note_ink);
     }
 
     /// Полоса: кнопка во всю ширину, внутри — заливка на долю и подпись.
