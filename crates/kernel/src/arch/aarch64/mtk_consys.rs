@@ -94,8 +94,51 @@ fn pmic_set(address: u16, set: u16, clear: u16) -> Result<(), &'static str> {
     pmic_write(address, (value & !clear) | set).map_err(|_| "PMIC does not answer")
 }
 
+/// Блок прошёл весь путь (`bring_up`): питание, прошивки, патч, калибровка.
+static UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Работает ли блок связи, включённый этим ядром.
+#[must_use]
+pub fn is_up() -> bool {
+    UP.load(Ordering::Relaxed)
+}
+
+/// Выключить домен блока: процессор в сброс, изоляция, такт, питание.
+///
+/// Нужно перед повторным включением: 03.11 включение поверх работающего
+/// блока оставило его процессор стоять на нуле, и прошивка больше не
+/// отвечала.
+fn power_off() -> Result<(), &'static str> {
+    let rgu = read(TOP_RGU_CONN)?;
+    write(TOP_RGU_CONN, (rgu & 0x00ff_ffff) | CONN_CPU_RESET | RGU_KEY)?;
+    let mut pwr = read(CONN_PWR_CON)?;
+    pwr &= !PWR_RST_B;
+    write(CONN_PWR_CON, pwr)?;
+    pwr |= PWR_ISO;
+    write(CONN_PWR_CON, pwr)?;
+    pwr |= PWR_CLK_DIS;
+    write(CONN_PWR_CON, pwr)?;
+    pwr &= !(PWR_ON | PWR_ON_2ND);
+    write(CONN_PWR_CON, pwr)?;
+    let started = crate::time::uptime_ns();
+    while read(PWR_STATUS)? & CONN_STATUS_BIT != 0 {
+        if crate::time::uptime_ns().wrapping_sub(started) > 50_000_000 {
+            return Err("CONN power domain did not go down");
+        }
+    }
+    UP.store(false, Ordering::Relaxed);
+    super::mtk_wlan::forget();
+    crate::kprintln!("  consys      : powered off for a clean start");
+    Ok(())
+}
+
 /// Включить блок: шаги 1–4 и память. Возвращает строки отчёта.
 pub fn power_on() -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
+    // Домен уже включён (прошлое включение, сбой) — сначала выключить.
+    if read(PWR_STATUS)? & CONN_STATUS_BIT != 0 {
+        power_off()?;
+        spin_us(1000);
+    }
     let mut report = alloc::vec::Vec::new();
     // Питание аналоговой половины от PMIC (`mt6765.c`, `upmu_hw.h`): VCN18,
     // VCN33 (обе ветви — и BT, и Wi-Fi), VCN28 под управлением блока.
@@ -464,6 +507,7 @@ pub fn bring_up() -> Result<alloc::vec::Vec<alloc::string::String>, &'static str
     report.extend(wmt_init()?);
     report.extend(wmt_patch()?);
     report.extend(wmt_calibrate()?);
+    UP.store(true, Ordering::Relaxed);
     Ok(report)
 }
 

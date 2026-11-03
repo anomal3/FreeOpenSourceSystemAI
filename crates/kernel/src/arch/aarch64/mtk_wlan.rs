@@ -572,10 +572,28 @@ pub fn scan() -> Result<Vec<String>, &'static str> {
     Ok(report)
 }
 
+/// Прошивка WLAN запущена этим ядром и готова.
+static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Готова ли прошивка WLAN.
+#[must_use]
+pub fn is_ready() -> bool {
+    READY.load(Ordering::Relaxed)
+}
+
+/// Блок связи выключен — прошивки WLAN больше нет (кольца остаются нашими).
+pub fn forget() {
+    READY.store(false, Ordering::Relaxed);
+}
+
 /// Весь путь после запущенного блока связи: владение, кольца, прошивка.
 pub fn bring_up() -> Result<Vec<String>, &'static str> {
+    if is_ready() {
+        return Ok(alloc::vec![String::from("Wi-Fi firmware already running")]);
+    }
     let mut report = own()?;
     report.extend(setup_dma()?);
     report.extend(firmware()?);
+    READY.store(true, Ordering::Relaxed);
     Ok(report)
 }

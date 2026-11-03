@@ -152,8 +152,11 @@ pub fn enable() {
 fn bring_up_task() {
     // Блок связи уже запущен (повторное нажатие после сбоя WLAN) — его
     // половину пути не повторять.
+    // Блок уже запущен этим ядром (в том числе командами `oem consys` по
+    // кабелю) — его не трогать: включение поверх работающего блока 03.11
+    // остановило его процессор.
     #[cfg(target_arch = "aarch64")]
-    let result = if state_was_up() {
+    let result = if state_was_up() || crate::arch::mtk_consys::is_up() {
         Ok(alloc::vec::Vec::new())
     } else {
         crate::arch::mtk_consys::bring_up()
