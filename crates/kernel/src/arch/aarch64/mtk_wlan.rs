@@ -479,10 +479,16 @@ fn parse_beacon(packet: &[u8]) -> Option<Network> {
     if packet[6] & 0x40 != 0 {
         off += 2;
     }
+    // Где начинается кадр 802.11 — по группам дескриптора; если там не
+    // beacon/probe-response, поискать его на ближних границах по 4 байта
+    // (раскладка групп у этой прошивки проверена только косвенно).
+    let looks = |at: usize| packet.get(at..).is_some_and(|f| f.len() >= 36 && matches!(f[0], 0x80 | 0x50) && f[1] == 0);
+    let off = if looks(off) {
+        off
+    } else {
+        (16..packet.len().min(128)).step_by(2).find(|at| looks(*at))?
+    };
     let frame = packet.get(off..)?;
-    if frame.len() < 36 || !matches!(frame[0], 0x80 | 0x50) {
-        return None;
-    }
     let mut bssid = [0u8; 6];
     bssid.copy_from_slice(&frame[16..22]);
     let mut ies = &frame[36..];
@@ -524,6 +530,7 @@ pub fn scan() -> Result<Vec<String>, &'static str> {
     let mut found: Vec<Network> = Vec::new();
     let started = crate::time::uptime_ms();
     let mut done = false;
+    let mut dumped = false;
     while crate::time::uptime_ms().saturating_sub(started) < 8000 && !done {
         while let Some(packet) = receive(RX_DATA, 5)? {
             if let Some(net) = parse_beacon(&packet) {
@@ -533,8 +540,24 @@ pub fn scan() -> Result<Vec<String>, &'static str> {
                 }
             }
         }
-        if let Some(event) = receive(RX_EVENT, 20)? {
-            if event.get(20) == Some(&0x0d) {
+        // На аппарате (03.11) кадры эфира приходят в кольцо событий, а не
+        // данных: тип пакета `0xE001` (кадр управления от прошивки), пятый
+        // байт — канал. Событие прошивки — тип `0xE000`, номер на 20-м байте.
+        while let Some(event) = receive(RX_EVENT, 20)? {
+            let kind = event.get(2..4).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+            if kind & 0xe00f == 0xe001 {
+                if let Some(net) = parse_beacon(&event) {
+                    if !found.iter().any(|known| known.bssid == net.bssid) {
+                        crate::kprintln!("  wlan        : '{}' ch {}", net.ssid, net.channel);
+                        found.push(net);
+                    }
+                } else if !dumped {
+                    dumped = true;
+                    for row in event[..event.len().min(96)].chunks(24) {
+                        crate::kprintln!("  wlan        : raw {row:02x?}");
+                    }
+                }
+            } else if kind == 0xe000 && event.get(20) == Some(&0x0d) {
                 done = true;
             } else {
                 crate::kprintln!("  wlan        : event {:02x?}", &event[..event.len().min(32)]);
