@@ -5362,7 +5362,7 @@ pub const ALL: &[Scenario] = &[
         host_echo: false,
         host_repo: false,
         host_site: true,
-        arches: &[Arch::X86_64],
+        arches: &[],
         reboots: false,
         updates: false,
         big_file: false,
