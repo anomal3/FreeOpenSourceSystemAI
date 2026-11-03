@@ -1622,7 +1622,7 @@ pub fn set_screen_off(off: bool) -> bool {
 }
 
 /// Какое состояние Wi-Fi стол показал последним (см. [`tick`]).
-static WIFI_SHOWN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static WIFI_SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 pub fn tick() {
     let status = status_now();
@@ -1638,7 +1638,7 @@ pub fn tick() {
         watch_hung(desktop);
         // Wi-Fi включается отдельной задачей: сменилось состояние —
         // перерисовать шторку и «Параметры», которые о нём говорят.
-        let wifi = crate::wifi::state() as u8;
+        let wifi = crate::wifi::generation();
         if WIFI_SHOWN.swap(wifi, Ordering::Relaxed) != wifi {
             desktop.refresh_shade();
             if let Some(window) = desktop.find(App::Settings) {

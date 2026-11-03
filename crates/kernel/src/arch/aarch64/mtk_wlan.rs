@@ -521,15 +521,8 @@ static ACTIVATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 
 /// Поиск сетей: до двух проходов, если первый не дошёл до конца.
 pub fn scan() -> Result<Vec<String>, &'static str> {
-    if !ACTIVATED.swap(true, Ordering::Relaxed) {
-        // Пустая команда — драйвер шлёт её первой после готовности.
-        wifi_command(0x00, true, &[])?;
-        // Сеть AIS (клиент) на BSS 0 с локальным адресом.
-        let mut bss = [0u8; 12];
-        bss[1] = 1;
-        bss[4..10].copy_from_slice(&[0x02, 0xf0, 0x55, 0x41, 0x69, 0x01]);
-        wifi_command(0x11, true, &bss)?;
-    }
+    // Пустая команда и сеть AIS (клиент) на BSS 0 — один раз.
+    activate()?;
     let mut found: Vec<Network> = Vec::new();
     let mut done = false;
     for _ in 0..2 {
@@ -597,6 +590,355 @@ fn scan_pass(found: &mut Vec<Network>) -> Result<bool, &'static str> {
         }
     }
     Ok(done)
+}
+
+// ---------------------------------------------------------------------------
+// Подключение к сети WPA2-PSK (03.11)
+// ---------------------------------------------------------------------------
+//
+// Порядок и поля — из gen4m (`saa_fsm.c`, `ais_fsm.c`, `cnm_mem.c`,
+// `nic.c: nicUpdateBss`, `wlan_oid.c: wlanoidSetAddKey`): право на канал
+// (CID 0x1C, событие 0x10), запись STA_REC о точке доступа (CID 0x13),
+// кадры аутентификации и ассоциации — по кольцу команд с 32-байтным TXD,
+// ответы — в кольце событий как кадры `0xE001`; затем BSS_INFO (0x12),
+// STA_REC в состоянии 3, четырёхсторонний обмен (крейт `wpa`) кадрами EAPOL
+// тем же кольцом, ключи — CID 0x07.
+
+/// Наш адрес (локально назначенный) — тот же, что в `BSS_ACTIVATE`.
+const OWN_MAC: [u8; 6] = [0x02, 0xf0, 0x55, 0x41, 0x69, 0x01];
+/// Место в таблице станций прошивки: точка доступа — 1, широковещательная
+/// запись BSS — 0 (её завёл `BSS_ACTIVATE`).
+const AP_STA_INDEX: u8 = 0;
+const AP_WLAN: u8 = 1;
+const BMC_WLAN: u8 = 0;
+
+/// Подключение: имя сети и что сделано — для «Параметров».
+static CONNECTED: SpinLock<Option<(String, [u8; 6])>> = SpinLock::new(None);
+
+/// К какой сети подключены.
+#[must_use]
+pub fn connected() -> Option<String> {
+    CONNECTED.lock().as_ref().map(|(ssid, _)| ssid.clone())
+}
+
+fn activate() -> Result<(), &'static str> {
+    if !ACTIVATED.swap(true, Ordering::Relaxed) {
+        wifi_command(0x00, true, &[])?;
+        let mut bss = [0u8; 12];
+        bss[1] = 1;
+        bss[4..10].copy_from_slice(&OWN_MAC);
+        bss[10] = BMC_WLAN;
+        wifi_command(0x11, true, &bss)?;
+    }
+    Ok(())
+}
+
+/// Событие прошивки `eid` (тип пакета `0xE000`), прочее — мимо, к сроку.
+fn wait_fw_event(eid: u8, timeout_ms: u64) -> Option<Vec<u8>> {
+    let started = crate::time::uptime_ms();
+    while crate::time::uptime_ms().saturating_sub(started) < timeout_ms {
+        let Ok(Some(event)) = receive(RX_EVENT, 50) else { continue };
+        let kind = event.get(2..4).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+        if kind == 0xe000 && event.get(20) == Some(&eid) {
+            return Some(event);
+        }
+    }
+    None
+}
+
+/// Начало кадра 802.11 в принятом пакете: по группам дескриптора, а если
+/// там не тот кадр — ближняя граница, где первый байт равен `fc`.
+fn frame_in(packet: &[u8], fc: u8) -> Option<&[u8]> {
+    let kind = u16::from_le_bytes([*packet.get(2)?, *packet.get(3)?]);
+    let groups = (kind >> 9) & 0xf;
+    let mut off = 16usize;
+    for (bit, len) in [(3u16, 16usize), (0, 16), (1, 8), (2, 24)] {
+        if groups & (1 << bit) != 0 {
+            off += len;
+        }
+    }
+    if packet.get(6).is_some_and(|b| b & 0x40 != 0) {
+        off += 2;
+    }
+    let fits = |at: usize| packet.get(at..at + 24).is_some_and(|f| f[0] == fc && f[1] == 0);
+    let at = if fits(off) { off } else { (16..packet.len().min(128)).step_by(2).find(|at| fits(*at))? };
+    packet.get(at..)
+}
+
+/// Ждать кадр управления `fc` от точки доступа `bssid`.
+fn wait_mgmt(fc: u8, bssid: &[u8; 6], timeout_ms: u64) -> Option<Vec<u8>> {
+    let started = crate::time::uptime_ms();
+    while crate::time::uptime_ms().saturating_sub(started) < timeout_ms {
+        let Ok(Some(packet)) = receive(RX_EVENT, 20) else { continue };
+        if let Some(frame) = frame_in(&packet, fc) {
+            if frame.get(10..16) == Some(bssid) {
+                return Some(frame.to_vec());
+            }
+        }
+    }
+    None
+}
+
+/// Кадр EAPOL в любом принятом пакете: после `88 8E` (Ethernet II или LLC)
+/// идёт заголовок 802.1X — версия 1 или 2, тип 3 (Key).
+fn eapol_in(packet: &[u8]) -> Option<&[u8]> {
+    let at = (0..packet.len().saturating_sub(4)).find(|i| {
+        packet[*i] == 0x88 && packet[*i + 1] == 0x8e && matches!(packet[*i + 2], 1 | 2) && packet[*i + 3] == 3
+    })?;
+    let body = &packet[at + 2..];
+    let len = 4 + usize::from(u16::from_be_bytes([*body.get(2)?, *body.get(3)?]));
+    body.get(..len)
+}
+
+/// Ждать EAPOL-Key от точки доступа — в обоих кольцах приёма.
+fn wait_eapol(timeout_ms: u64) -> Option<Vec<u8>> {
+    let started = crate::time::uptime_ms();
+    while crate::time::uptime_ms().saturating_sub(started) < timeout_ms {
+        for ring in [RX_DATA, RX_EVENT] {
+            if let Ok(Some(packet)) = receive(ring, 10) {
+                if let Some(eapol) = eapol_in(&packet) {
+                    return Some(eapol.to_vec());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// TXD для кадра управления: формат 802.11, очередь MCU, нижняя скорость.
+fn mgmt_txd(frame_len: usize, subtype: u8) -> [u8; 32] {
+    let mut txd = [0u8; 32];
+    txd[0..2].copy_from_slice(&((32 + frame_len) as u16).to_le_bytes());
+    txd[2] = 14;
+    txd[3] = 0x84;
+    txd[4] = AP_WLAN;
+    txd[5] = 0xcc;
+    txd[7] = 2;
+    txd[8] = subtype;
+    txd[11] = 0x80;
+    txd[12..14].copy_from_slice(&0xf000u16.to_le_bytes());
+    txd
+}
+
+/// TXD для кадра EAPOL: формат Ethernet II.
+fn eapol_txd(frame_len: usize) -> [u8; 32] {
+    let mut txd = [0u8; 32];
+    txd[0..2].copy_from_slice(&((32 + frame_len) as u16).to_le_bytes());
+    txd[2] = 8;
+    txd[3] = 0x84;
+    txd[4] = AP_WLAN;
+    txd[5] = 0x90;
+    txd[7] = 2;
+    txd[11] = 0x80;
+    txd[12..14].copy_from_slice(&0xf000u16.to_le_bytes());
+    txd
+}
+
+fn send_frame(txd: [u8; 32], frame: &[u8]) -> Result<(), &'static str> {
+    let mut packet = Vec::with_capacity(32 + frame.len());
+    packet.extend_from_slice(&txd);
+    packet.extend_from_slice(frame);
+    while packet.len() % 4 != 0 {
+        packet.push(0);
+    }
+    transmit(TX_CMD, &packet)
+}
+
+fn mgmt_header(fc: u8, bssid: &[u8; 6]) -> Vec<u8> {
+    let mut frame = alloc::vec![fc, 0, 0, 0];
+    frame.extend_from_slice(bssid);
+    frame.extend_from_slice(&OWN_MAC);
+    frame.extend_from_slice(bssid);
+    frame.extend_from_slice(&[0, 0]);
+    frame
+}
+
+/// Наборы скоростей b/g: 1, 2, 5.5, 11 (обязательные), 6, 9, 12, 18 и 24–54.
+const RATES: [u8; 8] = [0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24];
+const EXT_RATES: [u8; 4] = [0x30, 0x48, 0x60, 0x6c];
+const RATE_MASK_ALL: u16 = 0x3fcf;
+const RATE_MASK_BASIC: u16 = 0x000f;
+
+/// STA_REC точки доступа (CID 0x13, 136 байт): состояние 0/1/2 = 1/2/3.
+fn sta_rec(bssid: &[u8; 6], state: u8, aid: u16, need_response: bool) -> Result<(), &'static str> {
+    let mut rec = [0u8; 136];
+    rec[0] = AP_STA_INDEX;
+    rec[1] = 0x41;
+    rec[2..8].copy_from_slice(bssid);
+    rec[8..10].copy_from_slice(&aid.to_le_bytes());
+    rec[10..12].copy_from_slice(&10u16.to_le_bytes());
+    rec[13] = 0x03;
+    rec[14..16].copy_from_slice(&RATE_MASK_ALL.to_le_bytes());
+    rec[16..18].copy_from_slice(&RATE_MASK_BASIC.to_le_bytes());
+    rec[20] = state;
+    rec[51] = u8::from(need_response);
+    rec[54] = AP_WLAN;
+    rec[55] = 0xff;
+    rec[68] = 3;
+    wifi_command(0x13, true, &rec)?;
+    Ok(())
+}
+
+/// BSS_INFO после ассоциации (CID 0x12, 116 байт).
+fn bss_info(ssid: &str, bssid: &[u8; 6], channel: u8, secure: bool) -> Result<(), &'static str> {
+    let mut info = [0u8; 116];
+    info[1] = 0; // connected
+    let name = ssid.as_bytes();
+    info[3] = name.len().min(32) as u8;
+    info[4..4 + name.len().min(32)].copy_from_slice(&name[..name.len().min(32)]);
+    info[36..42].copy_from_slice(bssid);
+    info[44..46].copy_from_slice(&RATE_MASK_ALL.to_le_bytes());
+    info[46..48].copy_from_slice(&RATE_MASK_BASIC.to_le_bytes());
+    info[48] = AP_STA_INDEX;
+    info[52] = 1;
+    info[53] = if secure { 7 } else { 0 };
+    info[54] = if secure { 6 } else { 0 };
+    info[55] = 0x03;
+    info[58] = BMC_WLAN;
+    info[69] = 1;
+    info[70] = channel;
+    info[88] = 1;
+    info[89] = 1;
+    info[93] = 1;
+    wifi_command(0x12, true, &info)?;
+    Ok(())
+}
+
+/// Ключ в прошивку (CID 0x07, 64 байта): пара или группа, CCMP.
+fn add_key(peer: &[u8; 6], pairwise: bool, key_id: u8, key: &[u8]) -> Result<(), &'static str> {
+    let mut cmd = [0u8; 64];
+    cmd[0] = 1;
+    cmd[1] = u8::from(pairwise);
+    cmd[2] = u8::from(pairwise);
+    cmd[4..10].copy_from_slice(peer);
+    cmd[11] = 4; // CCMP
+    cmd[12] = key_id;
+    cmd[13] = key.len().min(32) as u8;
+    cmd[14] = if pairwise { AP_WLAN } else { BMC_WLAN };
+    cmd[16..16 + key.len().min(32)].copy_from_slice(&key[..key.len().min(32)]);
+    wifi_command(0x07, true, &cmd)?;
+    Ok(())
+}
+
+/// Подключиться к сети: `password` пустой — открытая сеть.
+pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> {
+    let net = networks().into_iter().find(|net| net.ssid == ssid).ok_or("network not in the last scan")?;
+    let (bssid, channel) = (net.bssid, net.channel);
+    let mut report = Vec::new();
+    activate()?;
+
+    // Право на канал точки доступа.
+    let mut privilege = [0u8; 24];
+    privilege[1] = 0x5a;
+    privilege[3] = channel;
+    privilege[5] = 1;
+    privilege[10] = 3;
+    privilege[12..16].copy_from_slice(&4000u32.to_le_bytes());
+    wifi_command(0x1c, true, &privilege)?;
+    let grant = wait_fw_event(0x10, 2000).ok_or("firmware did not grant the channel")?;
+    report.push(alloc::format!("channel {channel} granted ({:02x?})", grant.get(28..32)));
+
+    sta_rec(&bssid, 0, 0, false)?;
+
+    // Аутентификация, открытая система.
+    let mut auth = mgmt_header(0xb0, &bssid);
+    auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
+    send_frame(mgmt_txd(auth.len(), 0x0b), &auth)?;
+    let answer = wait_mgmt(0xb0, &bssid, 1000).ok_or("no authentication answer")?;
+    let status = answer.get(28..30).map_or(0xffff, |b| u16::from_le_bytes([b[0], b[1]]));
+    report.push(alloc::format!("auth status {status}"));
+    if status != 0 {
+        return Err("access point refused authentication");
+    }
+
+    // Ассоциация: SSID, скорости, RSN (для сети с паролем).
+    let secure = !password.is_empty();
+    let mut assoc = mgmt_header(0x00, &bssid);
+    let cap: u16 = 0x0001 | 0x0400 | if secure { 0x0010 } else { 0 };
+    assoc.extend_from_slice(&cap.to_le_bytes());
+    assoc.extend_from_slice(&10u16.to_le_bytes());
+    assoc.push(0);
+    assoc.push(ssid.len() as u8);
+    assoc.extend_from_slice(ssid.as_bytes());
+    assoc.push(1);
+    assoc.push(RATES.len() as u8);
+    assoc.extend_from_slice(&RATES);
+    assoc.push(50);
+    assoc.push(EXT_RATES.len() as u8);
+    assoc.extend_from_slice(&EXT_RATES);
+    if secure {
+        assoc.extend_from_slice(&wpa::RSN_IE);
+    }
+    send_frame(mgmt_txd(assoc.len(), 0x00), &assoc)?;
+    let answer = wait_mgmt(0x10, &bssid, 1000).ok_or("no association answer")?;
+    let status = answer.get(26..28).map_or(0xffff, |b| u16::from_le_bytes([b[0], b[1]]));
+    let aid = answer.get(28..30).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) & 0x3fff);
+    report.push(alloc::format!("assoc status {status}, aid {aid}"));
+    if status != 0 {
+        return Err("access point refused association");
+    }
+
+    bss_info(ssid, &bssid, channel, secure)?;
+    sta_rec(&bssid, 2, aid, true)?;
+    let _ = wait_fw_event(0x0c, 500);
+
+    if secure {
+        report.extend(handshake(ssid, password, &bssid)?);
+    }
+    // Канал больше не держим особо.
+    privilege[2] = 1;
+    let _ = wifi_command(0x1c, true, &privilege);
+    *CONNECTED.lock() = Some((String::from(ssid), bssid));
+    crate::kprintln!("  wlan        : connected to '{ssid}'");
+    report.push(alloc::format!("connected to {ssid}"));
+    Ok(report)
+}
+
+/// Четырёхсторонний обмен WPA2 и установка ключей.
+fn handshake(ssid: &str, password: &str, bssid: &[u8; 6]) -> Result<Vec<String>, &'static str> {
+    let mut report = Vec::new();
+    let pmk = wpa::pmk(password.as_bytes(), ssid.as_bytes());
+    let first = wait_eapol(3000).ok_or("no EAPOL message 1 from the access point")?;
+    let msg1 = wpa::parse(&first).ok_or("EAPOL message 1 does not parse")?;
+    let mut snonce = [0u8; 32];
+    crate::random::fill(&mut snonce);
+    let ptk = wpa::ptk(&pmk, bssid, &OWN_MAC, &msg1.nonce, &snonce);
+
+    let mut eapol = [0u8; 256];
+    let info2 = wpa::info::VERSION_HMAC_SHA1_AES | wpa::info::PAIRWISE | wpa::info::MIC;
+    let len = wpa::build(&mut eapol, info2, &msg1.replay, &snonce, &wpa::RSN_IE, &ptk.kck);
+    send_eapol(bssid, &eapol[..len])?;
+    report.push(String::from("eapol 2 sent"));
+
+    let third = wait_eapol(3000).ok_or("no EAPOL message 3 — wrong password?")?;
+    if !wpa::verify(&ptk.kck, &third) {
+        return Err("EAPOL message 3 MIC mismatch — wrong password");
+    }
+    let msg3 = wpa::parse(&third).ok_or("EAPOL message 3 does not parse")?;
+    let mut keys = [0u8; 256];
+    let plain = wpa::unwrap_key(&ptk.kek, msg3.data, &mut keys).ok_or("group key does not unwrap")?;
+    let (gtk_id, gtk) = wpa::find_gtk(&keys[..plain]).ok_or("no group key in message 3")?;
+    let gtk = gtk.to_vec();
+
+    let info4 = wpa::info::VERSION_HMAC_SHA1_AES | wpa::info::PAIRWISE | wpa::info::MIC | wpa::info::SECURE;
+    let len = wpa::build(&mut eapol, info4, &msg3.replay, &[0; 32], &[], &ptk.kck);
+    send_eapol(bssid, &eapol[..len])?;
+    report.push(String::from("eapol 4 sent"));
+
+    add_key(bssid, true, 0, &ptk.tk)?;
+    add_key(bssid, false, gtk_id, &gtk)?;
+    report.push(alloc::format!("keys installed (group key {gtk_id})"));
+    crate::kprintln!("  wlan        : WPA2 handshake done, group key {gtk_id}");
+    Ok(report)
+}
+
+fn send_eapol(bssid: &[u8; 6], eapol: &[u8]) -> Result<(), &'static str> {
+    let mut frame = Vec::with_capacity(14 + eapol.len());
+    frame.extend_from_slice(bssid);
+    frame.extend_from_slice(&OWN_MAC);
+    frame.extend_from_slice(&[0x88, 0x8e]);
+    frame.extend_from_slice(eapol);
+    send_frame(eapol_txd(frame.len()), &frame)
 }
 
 /// Прошивка WLAN запущена этим ядром и готова.

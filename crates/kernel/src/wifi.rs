@@ -97,16 +97,76 @@ pub fn networks() -> alloc::vec::Vec<(alloc::string::String, u8)> {
     alloc::vec::Vec::new()
 }
 
-/// Подключиться к сети по имени и паролю (пустой — открытая сеть).
-///
-/// Сторона драйвера — аутентификация, ассоциация, четырёхсторонний обмен
-/// ключами WPA2 — пишется сейчас (03.11); пока честный отказ.
+/// Сеть и пароль, к которым подключается задача `wifi-join`.
+static JOIN: crate::sync::SpinLock<Option<(alloc::string::String, alloc::string::String)>> = crate::sync::SpinLock::new(None);
+/// Идёт подключение.
+static JOINING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Подключиться к сети по имени и паролю (пустой — открытая сеть):
+/// отдельной задачей, отчёт — в [`report`], итог — [`connected`].
 pub fn connect(ssid: &str, password: &str) -> Result<(), &'static str> {
     if state() != State::Ready {
         return Err("Wi-Fi не включён");
     }
+    if JOINING.swap(true, Ordering::Relaxed) {
+        return Err("уже подключается");
+    }
+    *JOIN.lock() = Some((alloc::string::String::from(ssid), alloc::string::String::from(password)));
+    if crate::sched::spawn_daemon("wifi-join", join_task).is_err() {
+        JOINING.store(false, Ordering::Relaxed);
+        return Err("не удалось запустить подключение");
+    }
+    Ok(())
+}
+
+/// Идёт ли подключение.
+#[must_use]
+pub fn joining() -> bool {
+    JOINING.load(Ordering::Relaxed)
+}
+
+/// К какой сети подключены.
+#[must_use]
+pub fn connected() -> Option<alloc::string::String> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::mtk_wlan::connected()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    None
+}
+
+fn join_task() {
+    let Some((ssid, password)) = JOIN.lock().take() else {
+        JOINING.store(false, Ordering::Relaxed);
+        return;
+    };
+    #[cfg(target_arch = "aarch64")]
+    {
+        let result = crate::arch::mtk_wlan::connect(&ssid, &password);
+        let lines = match result {
+            Ok(lines) => lines,
+            Err(err) => {
+                crate::kprintln!("  wifi        : connect to '{ssid}' failed: {err}");
+                alloc::vec![alloc::format!("не подключиться к «{ssid}»: {err}")]
+            }
+        };
+        *REPORT.lock() = lines;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     let _ = (ssid, password);
-    Err("подключение к сетям — следующий шаг драйвера, ещё не готово")
+    JOINING.store(false, Ordering::Relaxed);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Счётчик перемен: стол перерисовывает шторку и «Параметры», когда он
+/// сдвинулся (состояние, отчёт, подключение).
+static GENERATION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Текущее значение счётчика перемен.
+#[must_use]
+pub fn generation() -> u32 {
+    GENERATION.load(Ordering::Relaxed)
 }
 
 /// Искать заново (кнопка «Обновить» в «Параметрах»).
@@ -137,6 +197,7 @@ pub fn state() -> State {
 
 fn set(state: State) {
     STATE.store(state.code(), Ordering::Relaxed);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Объявить оборудование (драйвер платформы при загрузке).

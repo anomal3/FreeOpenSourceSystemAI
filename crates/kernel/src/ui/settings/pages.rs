@@ -340,6 +340,15 @@ impl SettingsView {
             };
             y = row(pass, x, y, w, Some(Fi::Globe), "Wi-Fi", desc, control, deed);
             if wifi == crate::wifi::State::Ready {
+                if crate::wifi::joining() {
+                    y = row(pass, x, y, w, Some(Fi::Wifi), "Подключается…", "Аутентификация, ассоциация, обмен ключами WPA2", Ctl::Value(""), None);
+                } else if let Some(ssid) = crate::wifi::connected() {
+                    y = row(pass, x, y, w, Some(Fi::Wifi), &ssid, "Подключено", Ctl::Value("подключено"), None);
+                } else {
+                    for line in crate::wifi::report() {
+                        y = row(pass, x, y, w, None, &line, "", Ctl::Value(""), None);
+                    }
+                }
                 let networks = crate::wifi::networks();
                 y = pass.group(x, y, w, "Сети поблизости");
                 if networks.is_empty() {

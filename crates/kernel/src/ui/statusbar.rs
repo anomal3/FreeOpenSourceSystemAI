@@ -126,7 +126,8 @@ pub fn draw(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale: u32) 
     if matches!(crate::wifi::state(), crate::wifi::State::Ready | crate::wifi::State::Scanning) {
         let g = ctx.px(18);
         x -= g as i32;
-        mini_ui::iconset::draw(back, mini_ui::iconset::Fi::Wifi, x, mid - g as i32 / 2, g, p.ink, 90);
+        let alpha = if crate::wifi::connected().is_some() { 255 } else { 90 };
+        mini_ui::iconset::draw(back, mini_ui::iconset::Fi::Wifi, x, mid - g as i32 / 2, g, p.ink, alpha);
         x -= ctx.px(9) as i32;
     }
 
