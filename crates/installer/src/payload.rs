@@ -579,7 +579,7 @@ const DOTNET: [(&CStr16, &str); 3] = [
 ///
 /// Их отсутствие — не отказ: пакеты собирает `xtask`, и носитель, собранный без
 /// них, остаётся годным установочным носителем.
-const PACKAGES: [(&CStr16, &str); 12] = [
+const PACKAGES: [(&CStr16, &str); 13] = [
     (cstr16!("\\FREEOS\\PKG\\HELLO.FPK"), "hello-1.0.fpk"),
     (cstr16!("\\FREEOS\\PKG\\EXTRA.FPK"), "extra-1.0.fpk"),
     // Программа WinForms пакетом (фаза N8).
@@ -593,6 +593,8 @@ const PACKAGES: [(&CStr16, &str); 12] = [
     (cstr16!("\\FREEOS\\PKG\\FREEDOOM.FPK"), "freedoom-0.13.fpk"),
     // SDL Sopwith (фаза 68f) — тоже только если собран.
     (cstr16!("\\FREEOS\\PKG\\SOPWITH.FPK"), "sopwith-2.9.0.fpk"),
+    // NetSurf, лёгкий браузер (начато 03.11) — тоже только если собран.
+    (cstr16!("\\FREEOS\\PKG\\NETSURF.FPK"), "netsurf-3.11.fpk"),
     // llama.cpp с моделью stories15M (фаза 70d) — тоже только если собран.
     (cstr16!("\\FREEOS\\PKG\\LLAMA.FPK"), "llama-0.7.0.fpk"),
     // Корень программ Linux из пакетов Debian (фаза 71b) — тоже только если собран.

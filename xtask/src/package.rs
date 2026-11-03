@@ -147,6 +147,9 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
     if let Some(game) = sopwith(arch)? {
         samples.push(("sopwith-2.9.0.fpk", game));
     }
+    if let Some(browser) = netsurf(arch)? {
+        samples.push(("netsurf-3.11.fpk", browser));
+    }
     if let Some(llm) = llama(arch)? {
         samples.push(("llama-0.7.0.fpk", llm));
     }
@@ -187,8 +190,16 @@ pub fn build_samples(arch: Arch, release: bool) -> Result<Vec<Package>> {
 
 /// Пакеты игр: только на установочный носитель, не в RAM-диск живой системы.
 /// Там же llama.cpp (фаза 70d) — по той же причине: десятки мегабайт.
-pub const GAMES: [&str; 6] =
-    ["freedoom-0.13.fpk", "sopwith-2.9.0.fpk", "llama-0.7.0.fpk", "debian-12.fpk", "linuxweb-150.fpk", "jbr-25.fpk"];
+/// NetSurf (начато 03.11) — тоже: пять мегабайт, которые нужны не каждому.
+pub const GAMES: [&str; 7] = [
+    "freedoom-0.13.fpk",
+    "sopwith-2.9.0.fpk",
+    "netsurf-3.11.fpk",
+    "llama-0.7.0.fpk",
+    "debian-12.fpk",
+    "linuxweb-150.fpk",
+    "jbr-25.fpk",
+];
 
 /// llama.cpp пакетом (фаза 70d): программы llama.cpp, проверка библиотеки
 /// C++ (`cxxdemo`) и маленькая модель stories15M — чтобы было что запустить
@@ -266,6 +277,34 @@ fn sopwith(arch: Arch) -> Result<Option<Vec<u8>>> {
     let data = fs::read(&program).with_context(|| format!("не удалось прочитать {}", program.display()))?;
     game.file(&Entry { path: String::from("bin/sopwith"), mode: 0o755, uid: 0, gid: 0, data });
     Ok(Some(game.finish()))
+}
+
+/// NetSurf пакетом (начато 03.11): программа и её ресурсы (стили, страницы,
+/// сообщения). Ресурсы — в `share/netsurf`: туда смотрит путь, вшитый в
+/// программу (`/opt/netsurf/share/netsurf`).
+fn netsurf(arch: Arch) -> Result<Option<Vec<u8>>> {
+    let sysroot = crate::cbuild::sysroot(arch);
+    let program = sysroot.join("bin/netsurf");
+    let share = sysroot.join("share/netsurf");
+    if !program.is_file() || !share.join("Messages").is_file() {
+        say!("пакет netsurf пропущен: нет {} — собрать: cargo xtask thirdparty --only netsurf", program.display());
+        return Ok(None);
+    }
+    let mut browser = Builder::new(Kind::Package, "netsurf", "3.11");
+    browser.field("summary", "NetSurf, a small web browser (HTML, CSS, no JavaScript)");
+    browser.field("caption", "NetSurf");
+    browser.field("about", "лёгкий браузер без JavaScript");
+    browser.field("start", "/opt/netsurf/bin/netsurf");
+    // Окно, сеть — и файлы: настройки и куки он пишет в `~/.netsurf`.
+    browser.field("permissions", "windows files net");
+    let data = fs::read(&program).with_context(|| format!("не удалось прочитать {}", program.display()))?;
+    browser.file(&Entry { path: String::from("bin/netsurf"), mode: 0o755, uid: 0, gid: 0, data });
+    for name in crate::netsurf::resources() {
+        let path = share.join(name);
+        let data = fs::read(&path).with_context(|| format!("не удалось прочитать {}", path.display()))?;
+        browser.file(&Entry { path: format!("share/netsurf/{name}"), mode: 0o644, uid: 0, gid: 0, data });
+    }
+    Ok(Some(browser.finish()))
 }
 
 /// Пакет-драйвер учебной карты QEMU `edu`, подписанный рабочим ключом.

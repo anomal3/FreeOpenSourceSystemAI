@@ -120,6 +120,10 @@ enum How {
     /// Java (JetBrains Runtime 25) из дистрибутива Rider для Linux — см.
     /// [`crate::java`].
     Java,
+    /// NetSurf (начато 03.11): браузер и десяток его библиотек одним архивом,
+    /// каждая — своим `buildsystem`; поверхность окна и патчи — в
+    /// `ports/netsurf`. См. [`crate::netsurf`].
+    NetSurf,
 }
 
 /// Что распаковывать из архива LLVM для [`How::LlvmRuntimes`]: сборка
@@ -187,7 +191,7 @@ struct Project {
 /// проверка компилятора, `Makefile`, работа с файлами и с памятью, и никакой
 /// зависимости от Linux. Ровно тот класс проекта, ради которого набор и
 /// существует.
-const PROJECTS: [Project; 22] = [
+const PROJECTS: [Project; 23] = [
     Project {
         name: "zlib",
         version: "1.3.1",
@@ -552,6 +556,27 @@ const PROJECTS: [Project; 22] = [
         how: Autotools::plain(&["--with-hiscores-path="], &["AR={triple}-ar"]),
         installs: &["bin/sopwith"],
     },
+    // Лёгкий браузер (начато 03.11): NetSurf с фронтендом framebuffer на
+    // libnsfb, сеть — curl выше, PNG — libpng выше, BMP и GIF — свои
+    // библиотеки NetSurf. Без JavaScript. GPL-2.0 (браузер), MIT (библиотеки).
+    // Хеш опубликованного рядом нет — снят с архива 03.11.2026.
+    Project {
+        name: "netsurf",
+        version: "3.11",
+        url: "https://download.netsurf-browser.org/netsurf/releases/source-full/netsurf-all-3.11.tar.gz",
+        sha256: "4dea880ff3c2f698bfd62c982b259340f9abcd7f67e6c8eb2b32c61f71644b7b",
+        unpacked: "netsurf-all-3.11",
+        how: How::NetSurf,
+        installs: &[
+            "bin/netsurf",
+            "share/netsurf/Messages",
+            "share/netsurf/default.css",
+            "lib/libnsfb.a",
+            "lib/libcss.a",
+            "lib/libdom.a",
+            "lib/libhubbub.a",
+        ],
+    },
     // Данные для неё — Freedoom: Phase 1, свободная замена Doom (BSD). Хеш —
     // из подписанного `freedoom-0.13.0-CHECKSUM` рядом с архивом.
     Project {
@@ -793,6 +818,20 @@ fn fetch(project: &Project, refresh: bool) -> Result<PathBuf> {
     Ok(source)
 }
 
+/// Распакованные исходники другого проекта — для того, кто собирает из них
+/// своё (NetSurf берёт zlib и libpng для своих инструментов сборки).
+pub(crate) fn source_dir(name: &str) -> Result<PathBuf> {
+    let project = PROJECTS
+        .iter()
+        .find(|project| project.name == name)
+        .with_context(|| format!("нет чужого проекта «{name}»"))?;
+    let source = dir().join(project.unpacked);
+    if !source.is_dir() {
+        bail!("нет исходников {}\nСобрать: cargo xtask thirdparty --only {name}", source.display());
+    }
+    Ok(source)
+}
+
 /// Собрать один проект под одну архитектуру и установить его в sysroot.
 fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
     let sysroot = cbuild::sysroot(arch);
@@ -805,7 +844,9 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
     let _ = fs::remove_dir_all(&work);
     // CMake собирает вне дерева исходников: копия не нужна, каталог `work` —
     // только каталог сборки.
-    if matches!(project.how, How::LlvmRuntimes | How::LlamaCpp(_)) {
+    // NetSurf копирует дерево сам: в нём символические ссылки, которых
+    // `copy_tree` не видит (см. `crate::netsurf`).
+    if matches!(project.how, How::LlvmRuntimes | How::LlamaCpp(_) | How::NetSurf) {
         fs::create_dir_all(&work)?;
     } else {
         copy_tree(source, &work)?;
@@ -983,6 +1024,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
         // Файлы не собираются: их кладёт `build_all`, один раз на обе
         // архитектуры.
         How::Files(_) | How::Games(_) | How::Model | How::Debian | How::Chromium | How::Java => return Ok(()),
+        How::NetSurf => crate::netsurf::build(source, &work, arch)?,
         How::Doomgeneric => {
             let game = work.join("doomgeneric");
             // Список объектов — из его же `Makefile.sdl`, без трёх звуковых
@@ -1132,7 +1174,7 @@ fn build(project: &Project, source: &Path, arch: Arch) -> Result<()> {
 /// Через `sh -c`, а не разбором на аргументы: `./configure` — это скрипт, и
 /// запустить его напрямую на Windows нечем. Строка при этом наша, а не чужая:
 /// подстановок в неё не приходит.
-fn run_shell(dir: &Path, script: &str, what: &str) -> Result<()> {
+pub(crate) fn run_shell(dir: &Path, script: &str, what: &str) -> Result<()> {
     let sh = find_sh()?;
     let mut cmd = Command::new(sh);
     cmd.current_dir(dir).arg("-c").arg(script);
@@ -1199,13 +1241,29 @@ fn run_make(dir: &Path, args: &[&str], what: &str) -> Result<()> {
 
 /// `make`, у которого sh из Git не переписывает аргументы с приставками из
 /// `keep` (см. [`Autotools::keep_paths`]).
-fn run_make_keeping(dir: &Path, args: &[&str], keep: Option<&str>, what: &str) -> Result<()> {
+pub(crate) fn run_make_keeping(dir: &Path, args: &[&str], keep: Option<&str>, what: &str) -> Result<()> {
+    run_make_with(dir, args, keep, &[], what)
+}
+
+/// `make` с переменными окружения сверх обычных: проект, который дописывает
+/// `CFLAGS` окружения к своим, получает так ключ, не теряя своих (переменная
+/// командной строки `make` заменила бы их целиком).
+pub(crate) fn run_make_with(
+    dir: &Path,
+    args: &[&str],
+    keep: Option<&str>,
+    env: &[(&str, &str)],
+    what: &str,
+) -> Result<()> {
     let make = find_make()?;
     let mut cmd = Command::new(make);
     cmd.current_dir(dir).args(args);
     with_sdk_path(&mut cmd);
     if let Some(keep) = keep {
         cmd.env("MSYS2_ARG_CONV_EXCL", keep);
+    }
+    for (name, value) in env {
+        cmd.env(name, value);
     }
     run(cmd, what)
 }
@@ -1287,7 +1345,7 @@ fn replace_config_sub(work: &Path) -> Result<()> {
 ///
 /// Git стоит в `C:\Program Files`, и короткое имя каталога (`PROGRA~1`) — это
 /// тот же путь без пробела; косые — прямые, как их пишет `make`.
-fn make_shell() -> Result<String> {
+pub(crate) fn make_shell() -> Result<String> {
     let sh = find_sh()?;
     let text = sh.to_string_lossy().replace('\\', "/");
     Ok(text.replace("Program Files", "PROGRA~1"))
@@ -1329,7 +1387,7 @@ fn run(mut cmd: Command, what: &str) -> Result<()> {
 /// `--prefix=E:\build\toolchain` доехал бы до `Makefile` как `E:buildtoolchain`.
 /// Ошибка при этом не немедленная: она проявляется на `make install`, который
 /// бодро создаёт каталог с этим именем.
-fn to_posix(path: &Path) -> String {
+pub(crate) fn to_posix(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 

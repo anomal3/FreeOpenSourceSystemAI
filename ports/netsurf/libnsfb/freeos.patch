@@ -1,0 +1,23 @@
+diff -ru a/include/libnsfb.h b/include/libnsfb.h
+--- a/include/libnsfb.h	2026-11-03 19:11:29.294906013 +0000
++++ b/include/libnsfb.h	2026-11-03 19:11:29.892924697 +0000
+@@ -41,6 +41,7 @@
+     NSFB_SURFACE_VNC, /**< VNC surface */
+     NSFB_SURFACE_LINUX, /**< Linux framebuffer surface */
+     NSFB_SURFACE_ABLE, /**< ABLE framebuffer surface */
++    NSFB_SURFACE_FREEOS, /**< FreeOS desktop window surface */
+     NSFB_SURFACE_RAM, /**< RAM surface */
+     NSFB_SURFACE_COUNT, /**< The number of surface kinds */
+ };
+diff -ru a/src/surface/Makefile b/src/surface/Makefile
+--- a/src/surface/Makefile	2026-11-03 19:11:29.832922823 +0000
++++ b/src/surface/Makefile	2026-11-03 19:11:29.893924728 +0000
+@@ -1,7 +1,7 @@
+ # Sources
+ 
+ # Common surface code and heap based surface handler
+-SURFACE_HANDLER_yes := surface.c ram.c
++SURFACE_HANDLER_yes := surface.c ram.c freeos.c
+ 
+ # optional surface handlers
+ SURFACE_HANDLER_$(NSFB_SDL_AVAILABLE) += sdl.c

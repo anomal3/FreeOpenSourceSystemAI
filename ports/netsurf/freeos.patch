@@ -1,0 +1,36 @@
+diff -ru a/Makefile b/Makefile
+--- a/Makefile	2026-11-03 19:19:36.825251713 +0000
++++ b/Makefile	2026-11-03 19:19:37.173262727 +0000
+@@ -331,7 +331,8 @@
+ $(EXETARGET): $(OBJECTS) $(RESOURCES) $(MESSAGES) tools/linktrace-to-depfile.pl
+ 	$(VQ)echo "    LINK: $(EXETARGET)"
+ ifneq ($(TARGET),riscos)
+-	$(Q)$(CC) -o $(EXETARGET) $(OBJECTS) $(LDFLAGS) > $(DEPROOT)/link-raw.d
++	$(file >$(OBJROOT)/objects.rsp,$(OBJECTS))
++	$(Q)$(CC) -o $(EXETARGET) @$(OBJROOT)/objects.rsp $(LDFLAGS) > $(DEPROOT)/link-raw.d
+ else
+ 	@# RISC OS targets are a bit special: we need to convert ELF -> AIF
+   ifeq ($(SUBTARGET),-aof)
+diff -ru a/utils/config.h b/utils/config.h
+--- a/utils/config.h	2026-11-03 19:19:36.544242822 +0000
++++ b/utils/config.h	2026-11-03 19:19:37.107260638 +0000
+@@ -142,7 +142,8 @@
+ 
+ #define HAVE_SCANDIR
+ #if (defined(_WIN32) ||				\
+-     defined(__serenity__))
++     defined(__serenity__) ||			\
++     defined(__freeos__))
+ #undef HAVE_SCANDIR
+ #endif
+ 
+@@ -154,6 +155,9 @@
+ #undef HAVE_UNLINKAT
+ #undef HAVE_FSTATAT
+ #endif
++#if defined(__freeos__)
++#undef HAVE_FSTATAT
++#endif
+ 
+ #define HAVE_REGEX
+ #if (defined(__serenity__))
