@@ -1755,10 +1755,14 @@ pub const ALL: &[Scenario] = &[
             Step::Await("desktop     : minimize flight of 'Terminal': ", 15_000),
             Step::Wait(1500),
             Step::Shot("04-stack"),
-            // Шторка — нажатием на строку состояния, закрывается нажатием мимо.
+            // Шторка — жестом «потянуть сверху» (03.11: нажатие в строку
+            // состояния её больше не открывает), закрывается нажатием мимо.
             Step::Aim(Aim::Point(360, 40)),
-            Step::Click,
-            Step::Await("desktop     : shade opened", 15_000),
+            Step::Press,
+            Step::Aim(Aim::Point(360, 160)),
+            Step::Aim(Aim::Point(360, 300)),
+            Step::Release,
+            Step::Await("desktop     : shade pulled down", 15_000),
             Step::Wait(1000),
             Step::Shot("04b-shade"),
             Step::Aim(Aim::Point(360, 1300)),

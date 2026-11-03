@@ -1727,6 +1727,8 @@ impl Compositor {
             if let Some(state) = crate::battery::get() {
                 text.push_str(&alloc::format!(" {}{}", state.percent, if state.charger { "+" } else { "" }));
             }
+            // И Wi-Fi: значок появляется, когда он включился.
+            text.push_str(&alloc::format!(" w{}", crate::wifi::state() as u8));
             if text != self.status_text {
                 self.status_text = text;
                 let bar = super::statusbar::bounds(self.screen.width(), self.scale);

@@ -33,7 +33,7 @@ use mini_ui::glyphicon::{self, Icon};
 use mini_ui::paint::{self, Ctx};
 use mini_ui::theme;
 use mini_ui::typeface::Role;
-use mini_ui::{Rect, Surface};
+use mini_ui::{Color, Rect, Surface};
 
 /// Место, которое строка занимает наверху экрана.
 #[must_use]
@@ -103,10 +103,28 @@ pub fn draw(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale: u32) 
         let fill = Rect::new(body.x + gap as i32, body.y + gap as i32, fill_w, body.h.saturating_sub(gap * 2));
         let color = if state.charger { p.ok } else if state.percent < 15 { p.bad } else { p.ink };
         draw::rounded(back, fill, ctx.px(1), color, 255);
+        // На зарядке — молния поверх заливки (03.11, Роман: «на батарее
+        // должен быть значок, заряжается или нет»).
+        if state.charger {
+            let (cx, cy) = (body.x + body.w as i32 / 2, body.y + body.h as i32 / 2);
+            let h = (body.h as i32 * 3) / 8;
+            let w = ctx.px(1).max(1);
+            let dark = Color::rgb(0x10, 0x18, 0x28);
+            draw::line(back, (cx + h / 2, cy - h), (cx - h / 3, cy + h / 6), w + 1, dark, 255);
+            draw::line(back, (cx - h / 3, cy + h / 6), (cx + h / 3, cy - h / 6), w + 1, dark, 255);
+            draw::line(back, (cx + h / 3, cy - h / 6), (cx - h / 2, cy + h), w + 1, dark, 255);
+        }
         let text = alloc::format!("{}%", state.percent);
         let w = face.width(&text);
         x -= w as i32;
         paint::text(ctx, back, Role::Mono, x, y, &text, p.ink);
+        x -= ctx.px(9) as i32;
+    }
+    // Wi-Fi включён — его значок (веер), левее батареи.
+    if matches!(crate::wifi::state(), crate::wifi::State::Ready | crate::wifi::State::Scanning) {
+        let g = ctx.px(18);
+        x -= g as i32;
+        mini_ui::iconset::draw(back, mini_ui::iconset::Fi::Wifi, x, mid - g as i32 / 2, g, p.ink, 255);
         x -= ctx.px(9) as i32;
     }
 

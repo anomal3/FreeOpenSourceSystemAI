@@ -2209,6 +2209,15 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         if VOLUME_DRAG.load(Ordering::Relaxed) {
             drag_volume(desktop, x, status);
         }
+        // Палец, начавший с строки состояния, тянут вниз — выдвинуть шторку.
+        let pull = SHADE_PULL.load(Ordering::Relaxed);
+        if pull != 0 && y - (pull - 1) > mini_ui::paint::Ctx::scaled(desktop.scale()).px(40) as i32 {
+            SHADE_PULL.store(0, Ordering::Relaxed);
+            if !desktop.shade_open() && desktop.toggle_shade() == Some(true) {
+                kprintln!("  desktop     : shade pulled down");
+                desktop.present();
+            }
+        }
         // Полоса звука в шторке телефона тянется так же (03.11).
         if SHADE_VOLUME_DRAG.load(Ordering::Relaxed) {
             if let Some(percent) = desktop.shade_volume_at(x) {
@@ -2375,6 +2384,7 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
     if event.released(Buttons::LEFT) {
         icon_gesture_end(desktop);
+        SHADE_PULL.store(0, Ordering::Relaxed);
         if SHADE_VOLUME_DRAG.swap(false, Ordering::Relaxed) {
             let value = crate::sound::volume();
             kprintln!("  desktop     : volume {value} % from the shade");
@@ -2714,16 +2724,14 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         return;
     }
 
-    // 0б. Строка состояния открывает шторку. Жеста «потянуть сверху» у нас
-    // пока нет — жестов нет вовсе, — а нажатие в ту же полосу делает то же
-    // самое и доступно с первого дня.
+    // 0б. Шторка — только жестом «потянуть сверху» (03.11, Роман: «шторка
+    // сверху только по свайпу, а сейчас нажатие на батарею её открывает»).
+    // Нажатие в строку состояния запоминает начало жеста; открывает её
+    // протяжка вниз (см. [`SHADE_PULL`] в разборе движения).
     if theme::is_mobile() {
         let bar = statusbar::bounds(desktop.screen_width(), desktop.scale());
         if bar.contains(x, y) {
-            if desktop.toggle_shade() == Some(true) {
-                kprintln!("  desktop     : shade opened");
-                desktop.present();
-            }
+            SHADE_PULL.store(y + 1, Ordering::Relaxed);
             return;
         }
     }
@@ -4166,6 +4174,9 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
 static VOLUME_DRAG: AtomicBool = AtomicBool::new(false);
 /// Тянут полосу звука в шторке телефона (нажали на неё и не отпустили).
 static SHADE_VOLUME_DRAG: AtomicBool = AtomicBool::new(false);
+/// Жест «потянуть шторку»: высота нажатия в строке состояния плюс один;
+/// ноль — жеста нет.
+static SHADE_PULL: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
 /// Тянут ползунок громкости — значение за указателем; запоминается при
 /// отпускании.
