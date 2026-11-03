@@ -837,6 +837,13 @@ fn add_key(peer: &[u8; 6], pairwise: bool, key_id: u8, key: &[u8]) -> Result<(),
     Ok(())
 }
 
+/// Строка отчёта подключения — и в журнал: при ошибке отчёт не доходит до
+/// «Параметров», а шаг, на котором встали, нужен.
+fn note(report: &mut Vec<String>, line: String) {
+    crate::kprintln!("  wlan        : {line}");
+    report.push(line);
+}
+
 /// Подключиться к сети: `password` пустой — открытая сеть.
 pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> {
     let net = networks().into_iter().find(|net| net.ssid == ssid).ok_or("network not in the last scan")?;
@@ -853,7 +860,7 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
     privilege[12..16].copy_from_slice(&4000u32.to_le_bytes());
     wifi_command(0x1c, true, &privilege)?;
     let grant = wait_fw_event(0x10, 2000).ok_or("firmware did not grant the channel")?;
-    report.push(alloc::format!("channel {channel} granted ({:02x?})", grant.get(28..32)));
+    note(&mut report, alloc::format!("channel {channel} granted ({:02x?})", grant.get(28..32)));
 
     sta_rec(&bssid, 0, 0, false)?;
 
@@ -863,7 +870,7 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
     send_frame(mgmt_txd(auth.len(), 0x0b), &auth)?;
     let answer = wait_mgmt(0xb0, &bssid, 1000).ok_or("no authentication answer")?;
     let status = answer.get(28..30).map_or(0xffff, |b| u16::from_le_bytes([b[0], b[1]]));
-    report.push(alloc::format!("auth status {status}"));
+    note(&mut report, alloc::format!("auth status {status}"));
     if status != 0 {
         return Err("access point refused authentication");
     }
@@ -895,7 +902,7 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
     let status = answer.get(26..28).map_or(0xffff, |b| u16::from_le_bytes([b[0], b[1]]));
     let aid = answer.get(28..30).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) & 0x3fff);
     crate::kprintln!("  wlan        : association status {status}, aid {aid}");
-    report.push(alloc::format!("assoc status {status}, aid {aid}"));
+    note(&mut report, alloc::format!("assoc status {status}, aid {aid}"));
     if status != 0 {
         *LAST_STATUS.lock() = Some(status);
         return Err("access point refused association");
@@ -913,7 +920,7 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
     let _ = wifi_command(0x1c, true, &privilege);
     *CONNECTED.lock() = Some((String::from(ssid), bssid));
     crate::kprintln!("  wlan        : connected to '{ssid}'");
-    report.push(alloc::format!("connected to {ssid}"));
+    note(&mut report, alloc::format!("connected to {ssid}"));
     Ok(report)
 }
 
@@ -931,7 +938,7 @@ fn handshake(ssid: &str, password: &str, bssid: &[u8; 6]) -> Result<Vec<String>,
     let info2 = wpa::info::VERSION_HMAC_SHA1_AES | wpa::info::PAIRWISE | wpa::info::MIC;
     let len = wpa::build(&mut eapol, info2, &msg1.replay, &snonce, &wpa::RSN_IE, &ptk.kck);
     send_eapol(bssid, &eapol[..len])?;
-    report.push(String::from("eapol 2 sent"));
+    note(&mut report, String::from("eapol 2 sent"));
 
     let third = wait_eapol(3000).ok_or("no EAPOL message 3 — wrong password?")?;
     if !wpa::verify(&ptk.kck, &third) {
@@ -946,11 +953,11 @@ fn handshake(ssid: &str, password: &str, bssid: &[u8; 6]) -> Result<Vec<String>,
     let info4 = wpa::info::VERSION_HMAC_SHA1_AES | wpa::info::PAIRWISE | wpa::info::MIC | wpa::info::SECURE;
     let len = wpa::build(&mut eapol, info4, &msg3.replay, &[0; 32], &[], &ptk.kck);
     send_eapol(bssid, &eapol[..len])?;
-    report.push(String::from("eapol 4 sent"));
+    note(&mut report, String::from("eapol 4 sent"));
 
     add_key(bssid, true, 0, &ptk.tk)?;
     add_key(bssid, false, gtk_id, &gtk)?;
-    report.push(alloc::format!("keys installed (group key {gtk_id})"));
+    note(&mut report, alloc::format!("keys installed (group key {gtk_id})"));
     crate::kprintln!("  wlan        : WPA2 handshake done, group key {gtk_id}");
     Ok(report)
 }

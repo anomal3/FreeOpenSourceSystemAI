@@ -217,13 +217,20 @@ impl Fastboot {
             self.battery();
         } else if let Some(rest) = text.strip_prefix("oem wlan ") {
             use crate::arch::aarch64::mtk_wlan;
-            let result = match rest.trim() {
+            let mut words = rest.split_whitespace();
+            let first = words.next().unwrap_or("");
+            let result = match first {
+                // `oem wlan join <сеть> [пароль]` — имя без пробелов.
+                "join" => match words.next() {
+                    Some(ssid) => mtk_wlan::connect(ssid, words.next().unwrap_or("")),
+                    None => Err("usage: oem wlan join <ssid> [password]"),
+                },
                 "own" => mtk_wlan::own(),
                 "dma" => mtk_wlan::setup_dma(),
                 "fw" => mtk_wlan::firmware(),
                 "scan" => mtk_wlan::scan(),
                 "up" => mtk_wlan::bring_up(),
-                _ => Err("usage: oem wlan own | dma | fw | scan | up"),
+                _ => Err("usage: oem wlan own | dma | fw | scan | up | join <ssid> [password]"),
             };
             match result {
                 Ok(lines) => {

@@ -2396,6 +2396,15 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         icon_gesture_end(desktop);
         SHADE_PULL.store(0, Ordering::Relaxed);
         *CONTENT_DRAG.lock() = None;
+        // Отложенное нажатие «Параметров»: палец не ушёл — это нажатие.
+        let pending = PENDING_CLICK.lock().take();
+        if let Some((px, py)) = pending {
+            if (x - px).abs() < 12 && (y - py).abs() < 12 {
+                FORCE_CLICK.store(true, Ordering::Relaxed);
+                press(desktop, px, py, status, crate::time::uptime_ms());
+                FORCE_CLICK.store(false, Ordering::Relaxed);
+            }
+        }
         if SHADE_VOLUME_DRAG.swap(false, Ordering::Relaxed) {
             let value = crate::sound::volume();
             kprintln!("  desktop     : volume {value} % from the shade");
@@ -3078,6 +3087,13 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
                             y: local.1,
                         });
                         pressed = Some(window.app);
+                        false
+                    }
+                    // Телефон: в «Параметрах» нажатие — при отпускании и
+                    // только если палец не ушёл (03.11, Роман: «при скролле
+                    // задеваю сеть — и сразу пароль просит»).
+                    Some(window) if theme::is_mobile() && window.app == App::Settings && !FORCE_CLICK.load(Ordering::Relaxed) => {
+                        *PENDING_CLICK.lock() = Some((x, y));
                         false
                     }
                     Some(window) => {
@@ -4192,6 +4208,10 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
 static VOLUME_DRAG: AtomicBool = AtomicBool::new(false);
 /// Тянут полосу звука в шторке телефона (нажали на неё и не отпустили).
 static SHADE_VOLUME_DRAG: AtomicBool = AtomicBool::new(false);
+/// Нажатие в «Параметры» на телефоне, ждущее отпускания пальца.
+static PENDING_CLICK: crate::sync::SpinLock<Option<(i32, i32)>> = crate::sync::SpinLock::new(None);
+/// Сейчас разбирается отложенное нажатие — не откладывать его снова.
+static FORCE_CLICK: AtomicBool = AtomicBool::new(false);
 /// Палец на окне ядра (телефон): какое окно и где палец был в прошлый раз.
 static CONTENT_DRAG: crate::sync::SpinLock<Option<(App, i32)>> = crate::sync::SpinLock::new(None);
 /// Жест «потянуть шторку»: высота нажатия в строке состояния плюс один;
