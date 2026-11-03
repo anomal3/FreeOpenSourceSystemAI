@@ -1623,6 +1623,13 @@ impl Window {
         moved
     }
 
+    /// Ждёт ли окно текста (поле ввода в «Параметрах») — для экранной
+    /// клавиатуры телефона.
+    #[must_use]
+    pub fn wants_text(&self) -> bool {
+        matches!(&self.content, Content::Settings(view) if view.wants_text())
+    }
+
     /// Прокрутка пальцем: содержимое за пальцем на `dy` точек (телефон).
     /// `true` — сдвинулось и перерисовано.
     pub fn drag_scroll(&mut self, dy: i32) -> bool {

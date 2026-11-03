@@ -345,10 +345,18 @@ impl SettingsView {
                 if networks.is_empty() {
                     y = row(pass, x, y, w, Some(Fi::Search), "Сетей не найдено", "Нажмите «Обновить», чтобы искать ещё раз", Ctl::Value(""), None);
                 }
-                for (ssid, channel) in networks.iter().take(12) {
+                for (ssid, channel) in networks.iter().take(24) {
                     let name = if ssid.is_empty() { "(скрытая сеть)" } else { ssid.as_str() };
-                    let note = format!("канал {channel}");
-                    y = row(pass, x, y, w, Some(Fi::Globe), name, &note, Ctl::Value(""), None);
+                    let chosen = self.net.wifi_ssid.as_deref() == Some(ssid.as_str()) && !ssid.is_empty();
+                    let note = if chosen { format!("канал {channel} · введите пароль") } else { format!("канал {channel}") };
+                    // Скрытую сеть по имени не выбрать — имени у неё нет.
+                    let deed = (!ssid.is_empty()).then(|| Deed::WifiPick(ssid.clone()));
+                    let control = if ssid.is_empty() { Ctl::Value("") } else { Ctl::Nav };
+                    y = row(pass, x, y, w, Some(Fi::Wifi), name, &note, control, deed);
+                    if chosen {
+                        y = self.field_row(pass, x, y, w, Field::WifiPassword, "Пароль", "Пусто — открытая сеть без пароля");
+                        y = row(pass, x, y, w, None, "Подключиться", "", Ctl::Button("Подключиться", Weight::Primary), Some(Deed::WifiConnect));
+                    }
                 }
             } else {
                 for line in crate::wifi::report() {
@@ -414,7 +422,15 @@ impl SettingsView {
         let ty = rect.y + (h as i32 - both) / 2;
         pass.text(Role::Body, tx, ty, room, label, p.ink);
         pass.text(Role::Caption, tx, ty + line_h(ctx, Role::Body) + ctx.px(3) as i32, room, note, p.ink4);
-        text_field(pass, slot, self.net.text(field), self.net.editing == Some(field), focused);
+        // Пароль — звёздочками, по одной на знак (знака «•» в шрифте нет).
+        let dots;
+        let shown = if field == Field::WifiPassword {
+            dots = "*".repeat(self.net.text(field).chars().count());
+            dots.as_str()
+        } else {
+            self.net.text(field)
+        };
+        text_field(pass, slot, shown, self.net.editing == Some(field), focused);
         next
     }
 

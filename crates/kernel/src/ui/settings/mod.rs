@@ -367,6 +367,10 @@ enum Deed {
     WifiOn,
     /// Искать сети заново.
     WifiScan,
+    /// Выбрать сеть из списка — под ней поле пароля.
+    WifiPick(String),
+    /// Подключиться к выбранной сети.
+    WifiConnect,
     NetEdit(Field),
     NetApply,
     CheckDisks,
@@ -389,6 +393,8 @@ enum Deed {
 enum Field {
     Address,
     Gateway,
+    /// Пароль выбранной сети Wi-Fi (03.11) — любые знаки, показ точками.
+    WifiPassword,
 }
 
 /// Поля ввода раздела «Сеть».
@@ -401,6 +407,9 @@ struct NetDraft {
     gateway: String,
     /// В каком поле каретка. `None` — ни в каком.
     editing: Option<Field>,
+    /// Выбранная сеть Wi-Fi и набираемый к ней пароль.
+    wifi_ssid: Option<String>,
+    wifi_password: String,
 }
 
 impl NetDraft {
@@ -413,13 +422,14 @@ impl NetDraft {
             ),
             _ => (String::new(), String::new()),
         };
-        Self { address, gateway, editing: None }
+        Self { address, gateway, editing: None, wifi_ssid: None, wifi_password: String::new() }
     }
 
     fn text(&self, field: Field) -> &str {
         match field {
             Field::Address => &self.address,
             Field::Gateway => &self.gateway,
+            Field::WifiPassword => &self.wifi_password,
         }
     }
 
@@ -427,6 +437,7 @@ impl NetDraft {
         match field {
             Field::Address => &mut self.address,
             Field::Gateway => &mut self.gateway,
+            Field::WifiPassword => &mut self.wifi_password,
         }
     }
 }
@@ -695,6 +706,9 @@ impl SettingsView {
     /// Разобрать клавишу. `ch` — символ, который она даёт в текущей раскладке.
     /// `true` — окно её использовало.
     pub fn handle(&mut self, code: KeyCode, ch: Option<char>) -> bool {
+        if self.net.editing == Some(Field::WifiPassword) {
+            return self.type_password(code, ch);
+        }
         if let Some(field) = self.net.editing {
             if self.type_into(field, code) {
                 return true;
@@ -853,6 +867,51 @@ impl SettingsView {
             // Буквы полю не нужны и в поиск из поля не уходят.
             _ => crate::input::keymap::latin(code).is_some(),
         }
+    }
+
+    /// Набрать пароль Wi-Fi: любой печатный знак (пароль WPA2 — от 8 до 63
+    /// знаков ASCII), стирание, Enter — подключиться, Esc — бросить.
+    fn type_password(&mut self, code: KeyCode, ch: Option<char>) -> bool {
+        match code {
+            KeyCode::Backspace => {
+                self.net.wifi_password.pop();
+            }
+            KeyCode::Enter => {
+                self.net.editing = None;
+                self.wifi_connect();
+            }
+            KeyCode::Escape => {
+                self.net.editing = None;
+            }
+            _ => match ch {
+                Some(ch) if (' '..='~').contains(&ch) && self.net.wifi_password.len() < 63 => self.net.wifi_password.push(ch),
+                _ => return false,
+            },
+        }
+        self.report = None;
+        true
+    }
+
+    /// «Подключиться» к выбранной сети с набранным паролем.
+    fn wifi_connect(&mut self) {
+        let Some(ssid) = self.net.wifi_ssid.clone() else { return };
+        let password = core::mem::take(&mut self.net.wifi_password);
+        if !password.is_empty() && password.len() < 8 {
+            self.report = Some(Report::bad(String::from("пароль Wi-Fi — не короче 8 знаков")));
+            self.net.wifi_password = password;
+            return;
+        }
+        kprintln!("  settings    : wi-fi connect to '{ssid}' asked");
+        self.report = Some(match crate::wifi::connect(&ssid, &password) {
+            Ok(()) => Report::ok(format!("подключаюсь к «{ssid}»…")),
+            Err(err) => Report::bad(format!("к «{ssid}» не подключиться: {err}")),
+        });
+    }
+
+    /// Ждёт ли окно текста — показать ли на телефоне экранную клавиатуру.
+    #[must_use]
+    pub fn wants_text(&self) -> bool {
+        self.net.editing.is_some()
     }
 
     /// Щелчок по окну: координаты внутри поверхности окна.
@@ -1076,6 +1135,22 @@ impl SettingsView {
                     Err(err) => Report::bad(format!("{text} не записан: {err}")),
                 });
                 self.request = Some(Request::Panel);
+            }
+            Deed::WifiPick(ssid) => {
+                // Та же сеть — свернуть; другая — открыть её поле пароля.
+                if self.net.wifi_ssid.as_deref() == Some(ssid.as_str()) {
+                    self.net.wifi_ssid = None;
+                    self.net.editing = None;
+                } else {
+                    self.net.wifi_ssid = Some(ssid.clone());
+                    self.net.wifi_password.clear();
+                    self.net.editing = Some(Field::WifiPassword);
+                }
+                self.report = None;
+            }
+            Deed::WifiConnect => {
+                self.net.editing = None;
+                self.wifi_connect();
             }
             Deed::WifiScan => {
                 crate::wifi::rescan();

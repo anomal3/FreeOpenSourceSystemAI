@@ -97,6 +97,18 @@ pub fn networks() -> alloc::vec::Vec<(alloc::string::String, u8)> {
     alloc::vec::Vec::new()
 }
 
+/// Подключиться к сети по имени и паролю (пустой — открытая сеть).
+///
+/// Сторона драйвера — аутентификация, ассоциация, четырёхсторонний обмен
+/// ключами WPA2 — пишется сейчас (03.11); пока честный отказ.
+pub fn connect(ssid: &str, password: &str) -> Result<(), &'static str> {
+    if state() != State::Ready {
+        return Err("Wi-Fi не включён");
+    }
+    let _ = (ssid, password);
+    Err("подключение к сетям — следующий шаг драйвера, ещё не готово")
+}
+
 /// Искать заново (кнопка «Обновить» в «Параметрах»).
 pub fn rescan() {
     if state() != State::Ready {

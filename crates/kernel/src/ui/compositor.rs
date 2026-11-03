@@ -2265,7 +2265,10 @@ impl Compositor {
     /// строки терминала, то есть строка ввода, оказались бы под клавишами.
     pub fn sync_keyboard(&mut self) -> Option<bool> {
         let keyboard = self.keyboard.as_ref()?;
-        let want = self.focused_app() == Some(App::Terminal) || self.start_focused();
+        // И «Параметры» с открытым полем ввода — пароль Wi-Fi (03.11).
+        let settings_typing = self.focused_app() == Some(App::Settings)
+            && self.windows.iter().any(|window| window.app == App::Settings && window.wants_text());
+        let want = self.focused_app() == Some(App::Terminal) || self.start_focused() || settings_typing;
         if keyboard.is_visible() == want {
             return None;
         }
