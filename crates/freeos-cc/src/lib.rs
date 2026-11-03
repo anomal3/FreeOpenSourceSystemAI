@@ -375,7 +375,17 @@ pub fn parse_arguments(args: &[String]) -> (Mode, Invocation) {
         }
         if let Some(rest) = arg.strip_prefix("-Wl,") {
             for piece in rest.split(',') {
-                inv.link.push(piece.to_string());
+                // Ключ, который действует на архивы после себя, остаётся на
+                // своём месте среди них: `--whole-archive -lnsfb
+                // --no-whole-archive`, собранные в конец строки, не охватили
+                // бы ничего (NetSurf, 03.11: поверхности libnsfb, которые
+                // регистрируются одними конструкторами, не попадали в
+                // программу вовсе).
+                if ORDERED_LINK_FLAGS.contains(&piece) {
+                    inv.inputs.push(Input::Library(piece.to_string()));
+                } else {
+                    inv.link.push(piece.to_string());
+                }
             }
             continue;
         }
@@ -628,6 +638,21 @@ pub fn compile_command(target: Target, sysroot: &Path, clang: &Path, cxx: bool) 
     cmd
 }
 
+/// Ключи компоновщика, смысл которых зависит от места среди архивов и
+/// объектников: они действуют на то, что идёт после них.
+const ORDERED_LINK_FLAGS: [&str; 10] = [
+    "--whole-archive",
+    "--no-whole-archive",
+    "--start-group",
+    "--end-group",
+    "-Bstatic",
+    "-Bdynamic",
+    "--as-needed",
+    "--no-as-needed",
+    "--push-state",
+    "--pop-state",
+];
+
 /// Библиотеки набора, которые дописываются к любой компоновке.
 ///
 /// Порядок не произволен: сначала наш слой ОС (он зовёт libc), потом libc (она
@@ -727,6 +752,9 @@ fn compile_and_link(target: Target, args: &[String], cxx_tool: bool) -> Result<i
         for input in &inv.inputs {
             match input {
                 Input::Source(path) | Input::Object(path) => cmd.arg(path),
+                // Ключи компоновщика из `-Wl,` компилятору без компоновки не
+                // нужны, а clang принял бы их за свои.
+                Input::Library(flag) if !flag.starts_with("-l") => &mut cmd,
                 Input::Library(flag) => cmd.arg(flag),
             };
         }
@@ -913,6 +941,24 @@ mod tests {
                 Input::Library(String::from("-lm")),
             ]
         );
+    }
+
+    /// `--whole-archive` охватывает ровно те архивы, что стоят между ним и
+    /// `--no-whole-archive`, — значит, оба остаются на своих местах.
+    #[test]
+    fn whole_archive_keeps_its_place() {
+        let (_, inv) = parse_arguments(&words("a.o -Wl,--whole-archive -lnsfb -Wl,--no-whole-archive -lm -o app"));
+        assert_eq!(
+            inv.inputs,
+            vec![
+                Input::Object(String::from("a.o")),
+                Input::Library(String::from("--whole-archive")),
+                Input::Library(String::from("-lnsfb")),
+                Input::Library(String::from("--no-whole-archive")),
+                Input::Library(String::from("-lm")),
+            ]
+        );
+        assert!(inv.link.is_empty(), "ключ уехал в конец строки: {:?}", inv.link);
     }
 
     /// `-Wl,` разбирается по запятым, а `-L` уезжает компоновщику, а не clang'у.
