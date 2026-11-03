@@ -861,7 +861,12 @@ pub fn post_pointer(dx: i32, dy: i32, wheel: i32, buttons: Buttons) {
 /// Положить отчёт планшета в очередь: положение вместо приращения.
 ///
 /// Координаты — доли экрана, см. [`PointerEvent::absolute`].
-pub fn post_pointer_at(x: u16, y: u16, wheel: i32, buttons: Buttons) {
+///
+/// `false` — очередь была занята и событие не легло. Тачскрину это важно:
+/// потерянное отпускание оставляло кнопку «нажатой», и следующее касание
+/// приходило уже не нажатием, а протяжкой от прошлой точки. Узнав о потере,
+/// драйвер повторит событие следующим опросом.
+pub fn post_pointer_at(x: u16, y: u16, wheel: i32, buttons: Buttons) -> bool {
     enqueue_pointer(PointerEvent {
         dx: 0,
         dy: 0,
@@ -870,7 +875,7 @@ pub fn post_pointer_at(x: u16, y: u16, wheel: i32, buttons: Buttons) {
         buttons,
         changed: Buttons::NONE,
         at_ms: 0,
-    });
+    })
 }
 
 /// Общая часть обоих путей: состояние кнопок и место в очереди.
@@ -878,13 +883,16 @@ pub fn post_pointer_at(x: u16, y: u16, wheel: i32, buttons: Buttons) {
 /// При переполнении **сливается** движение: приращения складываются в последнее
 /// событие вместо того, чтобы потеряться. Курсор от этого не отстаёт и не
 /// перескакивает — в отличие от клавиатуры, где сложить два нажатия нельзя.
-fn enqueue_pointer(event: PointerEvent) {
+///
+/// `true` — событие учтено (в том числе слитым в последнее при переполнении),
+/// `false` — замок очереди был занят и событие потеряно целиком.
+fn enqueue_pointer(event: PointerEvent) -> bool {
     // См. [`post`]: отметка о событии не зависит от того, поместилось ли оно в
     // очередь.
     announce();
 
     let Some(mut queue) = POINTER.try_lock() else {
-        return;
+        return false;
     };
     queue.posted += 1;
     let changed = queue.buttons.difference(event.buttons);
@@ -906,12 +914,13 @@ fn enqueue_pointer(event: PointerEvent) {
         last.buttons = event.buttons;
         last.changed = Buttons(last.changed.0 | changed.0);
         queue.dropped += 1;
-        return;
+        return true;
     }
 
     let tail = (queue.head + queue.len) % POINTER_CAPACITY;
     queue.events[tail] = PointerEvent { changed, at_ms: crate::time::uptime_ms(), ..event };
     queue.len += 1;
+    true
 }
 
 /// Забрать следующее событие указателя.

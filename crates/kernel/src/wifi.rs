@@ -24,9 +24,19 @@ pub enum State {
     FirmwareUp,
     /// Включить не вышло.
     Failed,
+    /// Прошивка Wi-Fi запущена, идёт поиск сетей.
+    Scanning,
+    /// Поиск закончен — список сетей в [`networks`].
+    Ready,
 }
 
 static STATE: AtomicU8 = AtomicU8::new(0);
+/// Блок связи уже включён этим ядром (питание, прошивки, WMT).
+static CONSYS_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn state_was_up() -> bool {
+    CONSYS_UP.load(Ordering::Relaxed)
+}
 
 impl State {
     const fn code(self) -> u8 {
@@ -36,6 +46,8 @@ impl State {
             Self::Starting => 2,
             Self::FirmwareUp => 3,
             Self::Failed => 4,
+            Self::Scanning => 5,
+            Self::Ready => 6,
         }
     }
 
@@ -45,6 +57,8 @@ impl State {
             2 => Self::Starting,
             3 => Self::FirmwareUp,
             4 => Self::Failed,
+            5 => Self::Scanning,
+            6 => Self::Ready,
             _ => Self::Absent,
         }
     }
@@ -58,8 +72,41 @@ impl State {
             Self::Starting => "включается…",
             Self::FirmwareUp => "блок связи запущен",
             Self::Failed => "не включился",
+            Self::Scanning => "ищет сети…",
+            Self::Ready => "включён",
         }
     }
+}
+
+/// Найденные сети: имя и канал.
+#[must_use]
+pub fn networks() -> alloc::vec::Vec<(alloc::string::String, u8)> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::mtk_wlan::networks().into_iter().map(|net| (net.ssid, net.channel)).collect()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    alloc::vec::Vec::new()
+}
+
+/// Искать заново (кнопка «Обновить» в «Параметрах»).
+pub fn rescan() {
+    if state() != State::Ready {
+        return;
+    }
+    set(State::Scanning);
+    if crate::sched::spawn_daemon("wifi-scan", scan_task).is_err() {
+        set(State::Ready);
+    }
+}
+
+fn scan_task() {
+    #[cfg(target_arch = "aarch64")]
+    match crate::arch::mtk_wlan::scan() {
+        Ok(lines) => crate::kprintln!("  wifi        : scan: {}", lines.first().map_or("", |l| l.as_str())),
+        Err(err) => crate::kprintln!("  wifi        : scan failed: {err}"),
+    }
+    set(State::Ready);
 }
 
 /// Текущее состояние.
@@ -92,7 +139,7 @@ pub fn report() -> alloc::vec::Vec<alloc::string::String> {
 /// Включить: отдельной задачей — включение длится секунды, а стол ждать не
 /// должен. Повторное нажатие во время включения ничего не делает.
 pub fn enable() {
-    if matches!(state(), State::Absent | State::Starting | State::FirmwareUp) {
+    if matches!(state(), State::Absent | State::Starting | State::Scanning | State::Ready) {
         return;
     }
     set(State::Starting);
@@ -103,15 +150,38 @@ pub fn enable() {
 }
 
 fn bring_up_task() {
+    // Блок связи уже запущен (повторное нажатие после сбоя WLAN) — его
+    // половину пути не повторять.
     #[cfg(target_arch = "aarch64")]
-    let result = crate::arch::mtk_consys::bring_up();
+    let result = if state_was_up() {
+        Ok(alloc::vec::Vec::new())
+    } else {
+        crate::arch::mtk_consys::bring_up()
+    };
     #[cfg(not(target_arch = "aarch64"))]
     let result: Result<alloc::vec::Vec<alloc::string::String>, &'static str> = Err("no Wi-Fi hardware driver");
     match result {
-        Ok(lines) => {
+        Ok(mut lines) => {
             crate::kprintln!("  wifi        : connectivity firmware up");
-            *REPORT.lock() = lines;
+            CONSYS_UP.store(true, Ordering::Relaxed);
             set(State::FirmwareUp);
+            *REPORT.lock() = lines.clone();
+            // Вторая половина: сторона WLAN и поиск сетей.
+            #[cfg(target_arch = "aarch64")]
+            match crate::arch::mtk_wlan::bring_up() {
+                Ok(more) => {
+                    lines.extend(more);
+                    *REPORT.lock() = lines;
+                    set(State::Scanning);
+                    scan_task();
+                }
+                Err(err) => {
+                    crate::kprintln!("  wifi        : WLAN side failed: {err}");
+                    lines.push(alloc::string::String::from(err));
+                    *REPORT.lock() = lines;
+                    set(State::Failed);
+                }
+            }
         }
         Err(err) => {
             crate::kprintln!("  wifi        : bring-up failed: {err}");

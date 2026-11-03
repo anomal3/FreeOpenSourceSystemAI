@@ -365,6 +365,8 @@ enum Deed {
     NetStatic,
     /// Включить Wi-Fi (`crate::wifi::enable`, 03.11).
     WifiOn,
+    /// Искать сети заново.
+    WifiScan,
     NetEdit(Field),
     NetApply,
     CheckDisks,
@@ -1063,6 +1065,10 @@ impl SettingsView {
                     Err(err) => Report::bad(format!("{text} не записан: {err}")),
                 });
                 self.request = Some(Request::Panel);
+            }
+            Deed::WifiScan => {
+                crate::wifi::rescan();
+                self.report = Some(Report::ok(String::from("ищу сети — список обновится сам")));
             }
             Deed::WifiOn => {
                 crate::wifi::enable();

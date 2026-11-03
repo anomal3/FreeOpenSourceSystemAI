@@ -252,6 +252,16 @@ impl Shade {
         }
     }
 
+    /// Громкость под пальцем, который тянут по полосе звука (`x` — экран).
+    #[must_use]
+    pub fn volume_at(&self, x: i32) -> Option<u8> {
+        if !self.open || self.volume_rect.w == 0 {
+            return None;
+        }
+        let into = (x - self.rect.x - self.volume_rect.x).clamp(0, self.volume_rect.w as i32) as u32;
+        Some(((into * 100 + self.volume_rect.w / 2) / self.volume_rect.w).min(100) as u8)
+    }
+
     /// Перерисовать содержимое снаружи (громкость сменилась).
     pub fn refresh(&mut self) {
         if self.open {

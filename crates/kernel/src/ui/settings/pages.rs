@@ -332,15 +332,28 @@ impl SettingsView {
             let (desc, control, deed) = match wifi {
                 crate::wifi::State::Off => ("Блок связи выключен", Ctl::Button("Включить", Weight::Primary), Some(Deed::WifiOn)),
                 crate::wifi::State::Failed => ("Включить не вышло — подробности ниже", Ctl::Button("Ещё раз", Weight::Primary), Some(Deed::WifiOn)),
-                crate::wifi::State::Starting => ("Включается: питание, прошивки, процессор блока…", Ctl::Value("подождите"), None),
-                _ => ("Прошивка блока связи запущена и отвечает", Ctl::Value("включён"), None),
+                crate::wifi::State::Starting | crate::wifi::State::FirmwareUp => {
+                    ("Включается: питание, прошивки, процессоры блока…", Ctl::Value("подождите"), None)
+                }
+                crate::wifi::State::Scanning => ("Ищет сети поблизости…", Ctl::Value("поиск"), None),
+                _ => ("Прошивка Wi-Fi запущена", Ctl::Button("Обновить", Weight::Normal), Some(Deed::WifiScan)),
             };
             y = row(pass, x, y, w, Some(Fi::Globe), "Wi-Fi", desc, control, deed);
-            for line in crate::wifi::report() {
-                y = row(pass, x, y, w, None, &line, "", Ctl::Value(""), None);
-            }
-            if wifi == crate::wifi::State::FirmwareUp {
-                y = row(pass, x, y, w, Some(Fi::Search), "Сети поблизости", "Поиск сетей — следующий шаг драйвера", Ctl::Value("пока нет"), None);
+            if wifi == crate::wifi::State::Ready {
+                let networks = crate::wifi::networks();
+                y = pass.group(x, y, w, "Сети поблизости");
+                if networks.is_empty() {
+                    y = row(pass, x, y, w, Some(Fi::Search), "Сетей не найдено", "Нажмите «Обновить», чтобы искать ещё раз", Ctl::Value(""), None);
+                }
+                for (ssid, channel) in networks.iter().take(12) {
+                    let name = if ssid.is_empty() { "(скрытая сеть)" } else { ssid.as_str() };
+                    let note = format!("канал {channel}");
+                    y = row(pass, x, y, w, Some(Fi::Globe), name, &note, Ctl::Value(""), None);
+                }
+            } else {
+                for line in crate::wifi::report() {
+                    y = row(pass, x, y, w, None, &line, "", Ctl::Value(""), None);
+                }
             }
         }
         let Some(status) = crate::net::status() else {

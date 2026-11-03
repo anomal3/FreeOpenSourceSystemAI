@@ -215,6 +215,27 @@ impl Fastboot {
             self.pmic(rest);
         } else if text == "oem battery" {
             self.battery();
+        } else if let Some(rest) = text.strip_prefix("oem wlan ") {
+            use crate::arch::aarch64::mtk_wlan;
+            let result = match rest.trim() {
+                "own" => mtk_wlan::own(),
+                "dma" => mtk_wlan::setup_dma(),
+                "fw" => mtk_wlan::firmware(),
+                "scan" => mtk_wlan::scan(),
+                "up" => mtk_wlan::bring_up(),
+                _ => Err("usage: oem wlan own | dma | fw | scan | up"),
+            };
+            match result {
+                Ok(lines) => {
+                    self.line_count = 0;
+                    for line in &lines {
+                        self.say(line.as_bytes());
+                    }
+                    self.state = State::Lines { at: 0 };
+                    self.continue_lines(0);
+                }
+                Err(err) => self.respond(b"FAIL", err),
+            }
         } else if text == "oem consys" || text.starts_with("oem consys ") {
             self.consys(text.trim_start_matches("oem consys").trim());
         } else if let Some(rest) = text.strip_prefix("oem i2cw ") {

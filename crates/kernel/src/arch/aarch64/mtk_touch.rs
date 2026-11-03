@@ -102,14 +102,12 @@ struct SpiTouch {
     /// поиске, а восстанавливается перед каждым обменом.
     pad: u32,
     mode: u8,
-    /// Палец на экране. Нужно, чтобы отпускание уходило ровно один раз.
-    down: bool,
+    /// Палец: на экране ли, где, сколько опросов подряд его не видно.
+    finger: Finger,
     /// Сколько непустых отчётов уже напечатано.
     seen: u8,
     /// Проходов опроса с начала работы — чтобы печатать не чаще, чем изредка.
     ticks: u32,
-    /// Где палец был в последний раз, в долях экрана.
-    last: (u16, u16),
     /// Счётчики опроса. Живут здесь, а не в журнале, по прозаичной причине:
     /// опрос идёт сотнями раз в секунду, и печатать каждый проход — значит
     /// утопить журнал, ради которого делался USB. А спросить «сколько раз ты
@@ -963,10 +961,9 @@ unsafe fn interrogate(
         pins,
         pad,
         mode,
-        down: false,
+        finger: Finger::new(),
         seen: 0,
         ticks: 0,
-        last: (0, 0),
         polls: 0,
         stalled: 0,
         live: 0,
@@ -1364,39 +1361,129 @@ fn poll_spi_once() {
             );
         }
     }
-    if empty {
-        if touch.down {
-            touch.down = false;
-            if REPORTING.load(Ordering::Relaxed) != 0 {
-                post_pointer_at(touch.last.0, touch.last.1, 0, Buttons::NONE);
-            }
-        }
-        return;
-    }
+    let sample = if empty { Sample::Absent } else { parse_report(&report) };
+    // Выключенный показ (`oem treport 0`) по-прежнему ведёт состояние пальца,
+    // только наверх ничего не уходит — и потому считается «легло».
+    let reporting = REPORTING.load(Ordering::Relaxed) != 0;
+    touch.finger.step(sample, |gesture| !reporting || post_gesture(gesture));
+}
 
+/// Что сказал один отчёт Novatek о первом пальце.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sample {
+    /// Палец на экране, в точках панели.
+    At(u16, u16),
+    /// Пальца нет (или отчёт пуст).
+    Absent,
+    /// Отчёт есть, но верить ему нельзя (координата за краем панели): о пальце
+    /// он не говорит ничего — ни «здесь», ни «снят».
+    Unknown,
+}
+
+/// Разобрать первые шесть байт отчёта (см. [`poll_spi_once`]).
+fn parse_report(report: &[u8]) -> Sample {
     let identifier = report[0] >> 3;
     let state = report[0] & 0x07;
     if identifier == 0 || !(state == 0x01 || state == 0x02) {
-        if touch.down {
-            touch.down = false;
-            if REPORTING.load(Ordering::Relaxed) != 0 {
-                post_pointer_at(touch.last.0, touch.last.1, 0, Buttons::NONE);
-            }
-        }
-        return;
+        return Sample::Absent;
     }
-
     let x = (u16::from(report[1]) << 4) | u16::from(report[3] >> 4);
     let y = (u16::from(report[2]) << 4) | u16::from(report[3] & 0x0f);
     if x > SCREEN.0 || y > SCREEN.1 {
-        return; // панель врать умеет; за её краем щёлкать нечему
+        return Sample::Unknown; // панель врать умеет; за её краем щёлкать нечему
+    }
+    Sample::At(x, y)
+}
+
+/// Событие указателя, которое палец просит отправить. Точки — панели.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Gesture {
+    Press(u16, u16),
+    Move(u16, u16),
+    Release(u16, u16),
+}
+
+/// Отправить жест наверх. `false` — очередь была занята, повторить.
+fn post_gesture(gesture: Gesture) -> bool {
+    let (x, y, buttons) = match gesture {
+        Gesture::Press(x, y) | Gesture::Move(x, y) => (x, y, Buttons::LEFT),
+        Gesture::Release(x, y) => (x, y, Buttons::NONE),
+    };
+    let point = to_fractions(x, y);
+    post_pointer_at(point.0, point.1, 0, buttons)
+}
+
+/// Сколько опросов подряд пальца не должно быть видно, чтобы счесть его снятым.
+///
+/// Одного пустого отчёта мало. Опрос идёт без прерывания, вслепую к кадрам
+/// прошивки, и посреди протяжки изредка читается отчёт без пальца — нули или
+/// чужое состояние. Раньше каждый такой разрывал жест на «отпустили — нажали»:
+/// окно и полоса звука получали вместо протяжки череду отдельных нажатий.
+/// Два опроса — около двадцати миллисекунд при ста опросах в секунду: щелчок
+/// от этого не становится заметно медленнее, а одиночный пропуск жест не рвёт.
+const LIFT_MISSES: u8 = 2;
+
+/// Сдвиги меньше этого (в точках панели) не шлются: дрожь неподвижного пальца
+/// превращала бы каждое касание в микропротяжку и будила стол зря. Сдвиг
+/// считается от последней **отправленной** точки, так что медленная протяжка
+/// не теряется, а копится до порога.
+const JITTER: u16 = 2;
+
+/// Палец как конечный автомат: касание — нажатие в точке, движение с
+/// прижатым пальцем — перемещения с левой кнопкой, снятие — отпускание там,
+/// где палец был последний раз.
+///
+/// Состояние меняется только когда событие **легло** в очередь (`post`
+/// вернул `true`): потерянное нажатие или отпускание повторяется следующим
+/// опросом, а не оставляет кнопку в чужом состоянии. Без этого потерянное
+/// отпускание делало следующее касание протяжкой от прошлой точки.
+#[derive(Clone, Copy, Debug)]
+struct Finger {
+    down: bool,
+    /// Последняя отправленная точка, в точках панели.
+    last: (u16, u16),
+    /// Сколько опросов подряд пальца не видно.
+    misses: u8,
+}
+
+impl Finger {
+    const fn new() -> Self {
+        Self { down: false, last: (0, 0), misses: 0 }
     }
 
-    let point = to_fractions(x, y);
-    touch.down = true;
-    touch.last = point;
-    if REPORTING.load(Ordering::Relaxed) != 0 {
-        post_pointer_at(point.0, point.1, 0, Buttons::LEFT);
+    fn step(&mut self, sample: Sample, post: impl FnOnce(Gesture) -> bool) {
+        match sample {
+            Sample::Unknown => {}
+            Sample::At(x, y) => {
+                self.misses = 0;
+                if !self.down {
+                    if post(Gesture::Press(x, y)) {
+                        self.down = true;
+                        self.last = (x, y);
+                    }
+                    return;
+                }
+                if self.last.0.abs_diff(x) < JITTER && self.last.1.abs_diff(y) < JITTER {
+                    return;
+                }
+                if post(Gesture::Move(x, y)) {
+                    self.last = (x, y);
+                }
+            }
+            Sample::Absent => {
+                if !self.down {
+                    return;
+                }
+                self.misses = self.misses.saturating_add(1);
+                if self.misses < LIFT_MISSES {
+                    return;
+                }
+                if post(Gesture::Release(self.last.0, self.last.1)) {
+                    self.down = false;
+                    self.misses = 0;
+                }
+            }
+        }
     }
 }
 

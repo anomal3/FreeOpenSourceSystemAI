@@ -2564,6 +2564,12 @@ impl Compositor {
         }
     }
 
+    /// Громкость под пальцем на полосе звука шторки (протяжка).
+    #[must_use]
+    pub fn shade_volume_at(&self, x: i32) -> Option<u8> {
+        self.shade.as_ref()?.volume_at(x)
+    }
+
     #[must_use]
     pub fn shade_open(&self) -> bool {
         self.shade.as_ref().is_some_and(Shade::is_open)

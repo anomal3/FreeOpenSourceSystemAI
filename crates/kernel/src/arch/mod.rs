@@ -187,6 +187,8 @@ pub use aarch64::input;
 /// Блок связи MediaTek (Wi-Fi) — для `crate::wifi` (03.11).
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::mtk_consys;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::mtk_wlan;
 
 /// Зажечь или погасить подсветку экрана, если машина это умеет (03.11).
 ///

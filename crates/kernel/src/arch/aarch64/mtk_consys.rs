@@ -234,6 +234,23 @@ pub fn load(header: usize) -> Result<alloc::vec::Vec<alloc::string::String>, &'s
     Ok(report)
 }
 
+/// Записать данные в память блока по смещению (регионы EMI прошивки WLAN).
+pub fn emi_write(offset: usize, data: &[u8]) -> Result<(), &'static str> {
+    let emi = EMI.load(Ordering::Relaxed);
+    if emi == 0 {
+        return Err("power the block first: oem consys on");
+    }
+    if offset + data.len() > EMI_SIZE {
+        return Err("region does not fit the CONNSYS memory");
+    }
+    let base = crate::mm::frame::with(|frames| frames.access(crate::mm::PhysAddr::new(emi)).as_usize())
+        .ok_or("frame allocator not ready")?;
+    // SAFETY: границы проверены выше, память — наша.
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), (base + offset) as *mut u8, data.len()) };
+    clean_dcache(base + offset, data.len());
+    Ok(())
+}
+
 /// Отпустить процессор блока и дождаться слова готовности.
 pub fn boot() -> Result<alloc::vec::Vec<alloc::string::String>, &'static str> {
     if EMI.load(Ordering::Relaxed) == 0 {

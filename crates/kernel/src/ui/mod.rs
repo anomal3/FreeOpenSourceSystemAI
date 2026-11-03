@@ -2209,6 +2209,16 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         if VOLUME_DRAG.load(Ordering::Relaxed) {
             drag_volume(desktop, x, status);
         }
+        // Полоса звука в шторке телефона тянется так же (03.11).
+        if SHADE_VOLUME_DRAG.load(Ordering::Relaxed) {
+            if let Some(percent) = desktop.shade_volume_at(x) {
+                if percent != crate::sound::volume() {
+                    crate::sound::set_volume(percent);
+                    desktop.refresh_shade();
+                    desktop.present();
+                }
+            }
+        }
     }
     if dx != 0 || dy != 0 {
         hover(desktop, x, y, event.buttons, status);
@@ -2365,6 +2375,13 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
     }
     if event.released(Buttons::LEFT) {
         icon_gesture_end(desktop);
+        if SHADE_VOLUME_DRAG.swap(false, Ordering::Relaxed) {
+            let value = crate::sound::volume();
+            kprintln!("  desktop     : volume {value} % from the shade");
+            if let Err(err) = prefs::store_volume(value) {
+                kprintln!("  desktop     : volume not saved: {err}");
+            }
+        }
         if VOLUME_DRAG.swap(false, Ordering::Relaxed) {
             let value = crate::sound::volume();
             if let Err(err) = prefs::store_volume(value) {
@@ -2587,7 +2604,8 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
             Some(shade::Action::Volume(percent)) => {
                 crate::sound::set_volume(percent);
                 desktop.refresh_shade();
-                kprintln!("  desktop     : volume {percent} % from the shade");
+                // Дальше полосу тянут пальцем — до отпускания.
+                SHADE_VOLUME_DRAG.store(true, Ordering::Relaxed);
             }
             None => {}
         }
@@ -4146,6 +4164,8 @@ fn tray_click(desktop: &mut Compositor, item: TrayItem, status: &Status) {
 
 /// Ползунок громкости тянут: левую кнопку нажали на нём и держат.
 static VOLUME_DRAG: AtomicBool = AtomicBool::new(false);
+/// Тянут полосу звука в шторке телефона (нажали на неё и не отпустили).
+static SHADE_VOLUME_DRAG: AtomicBool = AtomicBool::new(false);
 
 /// Тянут ползунок громкости — значение за указателем; запоминается при
 /// отпускании.
