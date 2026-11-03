@@ -455,6 +455,11 @@ pub struct Network {
     pub ssid: String,
     pub bssid: [u8; 6],
     pub channel: u8,
+    /// Тело RSN IE точки доступа (без тега и длины); пусто — сеть открытая
+    /// или WPA1. По нему выбираются шифры в запросе ассоциации: MARK69
+    /// отказал с кодом 41 («не тот групповой шифр»), когда мы всегда
+    /// заявляли CCMP, а у неё группа — TKIP (смешанный WPA/WPA2).
+    pub rsn: Vec<u8>,
 }
 
 static NETWORKS: SpinLock<Vec<Network>> = SpinLock::new(Vec::new());
@@ -503,17 +508,19 @@ fn parse_beacon(packet: &[u8]) -> Option<Network> {
     let mut ies = &frame[36..];
     let mut ssid = String::new();
     let mut channel = packet[5];
+    let mut rsn = Vec::new();
     while ies.len() >= 2 {
         let (tag, len) = (ies[0], usize::from(ies[1]));
-        let body = ies.get(2..2 + len)?;
+        let Some(body) = ies.get(2..2 + len) else { break };
         match tag {
             0 => ssid = String::from_utf8_lossy(body).into_owned(),
             3 if len == 1 => channel = body[0],
+            48 => rsn = body.to_vec(),
             _ => {}
         }
         ies = &ies[2 + len..];
     }
-    Some(Network { ssid, bssid, channel })
+    Some(Network { ssid, bssid, channel, rsn })
 }
 
 /// BSS уже активирован (пустая команда и `BSS_ACTIVATE` — один раз).
@@ -822,13 +829,13 @@ fn bss_info(ssid: &str, bssid: &[u8; 6], channel: u8, secure: bool) -> Result<()
 }
 
 /// Ключ в прошивку (CID 0x07, 64 байта): пара или группа, CCMP.
-fn add_key(peer: &[u8; 6], pairwise: bool, key_id: u8, key: &[u8]) -> Result<(), &'static str> {
+fn add_key(peer: &[u8; 6], pairwise: bool, key_id: u8, algorithm: u8, key: &[u8]) -> Result<(), &'static str> {
     let mut cmd = [0u8; 64];
     cmd[0] = 1;
     cmd[1] = u8::from(pairwise);
     cmd[2] = u8::from(pairwise);
     cmd[4..10].copy_from_slice(peer);
-    cmd[11] = 4; // CCMP
+    cmd[11] = algorithm; // 4 — CCMP, 2 — TKIP
     cmd[12] = key_id;
     cmd[13] = key.len().min(32) as u8;
     cmd[14] = if pairwise { AP_WLAN } else { BMC_WLAN };
@@ -844,10 +851,50 @@ fn note(report: &mut Vec<String>, line: String) {
     report.push(line);
 }
 
+/// Шифр группы, как его понимает прошивка: номер алгоритма и длина ключа.
+#[derive(Clone, Copy)]
+struct GroupCipher {
+    algorithm: u8,
+    key_len: usize,
+}
+
+/// Наш RSN IE под точку доступа: её групповой шифр, личный CCMP, PSK.
+fn station_rsn(ap: &[u8]) -> Result<(Vec<u8>, GroupCipher), &'static str> {
+    if ap.len() < 8 {
+        // Описания нет — WPA2-PSK с CCMP, как было.
+        return Ok((wpa::RSN_IE.to_vec(), GroupCipher { algorithm: 4, key_len: 16 }));
+    }
+    let group = &ap[2..6];
+    let group_cipher = match group {
+        [0x00, 0x0f, 0xac, 0x04] => GroupCipher { algorithm: 4, key_len: 16 },
+        [0x00, 0x0f, 0xac, 0x02] => GroupCipher { algorithm: 2, key_len: 32 },
+        _ => return Err("group cipher of this network is not supported"),
+    };
+    let pairwise_count = usize::from(u16::from_le_bytes([ap[6], ap[7]]));
+    let pairwise = ap.get(8..8 + 4 * pairwise_count).ok_or("broken RSN element")?;
+    if !pairwise.chunks(4).any(|suite| suite == [0x00, 0x0f, 0xac, 0x04]) {
+        return Err("network offers no AES (CCMP) for the station");
+    }
+    let at = 8 + 4 * pairwise_count;
+    let akm_count = usize::from(u16::from_le_bytes([*ap.get(at).ok_or("broken RSN element")?, *ap.get(at + 1).ok_or("broken RSN element")?]));
+    let akms = ap.get(at + 2..at + 2 + 4 * akm_count).ok_or("broken RSN element")?;
+    if !akms.chunks(4).any(|suite| suite == [0x00, 0x0f, 0xac, 0x02]) {
+        return Err("network wants WPA3 or 802.1X, not a password (PSK)");
+    }
+    let mut ie = alloc::vec![0x30, 0x14, 0x01, 0x00];
+    ie.extend_from_slice(group);
+    ie.extend_from_slice(&[0x01, 0x00, 0x00, 0x0f, 0xac, 0x04]);
+    ie.extend_from_slice(&[0x01, 0x00, 0x00, 0x0f, 0xac, 0x02]);
+    ie.extend_from_slice(&[0x00, 0x00]);
+    Ok((ie, group_cipher))
+}
+
 /// Подключиться к сети: `password` пустой — открытая сеть.
 pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> {
     let net = networks().into_iter().find(|net| net.ssid == ssid).ok_or("network not in the last scan")?;
     let (bssid, channel) = (net.bssid, net.channel);
+    let secure = !password.is_empty();
+    let (rsn_ie, group) = if secure { station_rsn(&net.rsn)? } else { (Vec::new(), GroupCipher { algorithm: 0, key_len: 0 }) };
     let mut report = Vec::new();
     activate()?;
 
@@ -876,7 +923,6 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
     }
 
     // Ассоциация: SSID, скорости, RSN (для сети с паролем).
-    let secure = !password.is_empty();
     let mut assoc = mgmt_header(0x00, &bssid);
     let cap: u16 = 0x0001 | 0x0400 | if secure { 0x0010 } else { 0 };
     assoc.extend_from_slice(&cap.to_le_bytes());
@@ -890,9 +936,7 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
     assoc.push(50);
     assoc.push(EXT_RATES.len() as u8);
     assoc.extend_from_slice(&EXT_RATES);
-    if secure {
-        assoc.extend_from_slice(&wpa::RSN_IE);
-    }
+    assoc.extend_from_slice(&rsn_ie);
     // HT (802.11n) и WMM: точки «только n» без них отказывают в ассоциации
     // (03.11, MARK69 — отказ сразу после успешной аутентификации).
     assoc.extend_from_slice(&HT_CAP_IE);
@@ -913,7 +957,7 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
     let _ = wait_fw_event(0x0c, 500);
 
     if secure {
-        report.extend(handshake(ssid, password, &bssid)?);
+        report.extend(handshake(ssid, password, &bssid, &rsn_ie, group)?);
     }
     // Канал больше не держим особо.
     privilege[2] = 1;
@@ -925,7 +969,7 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
 }
 
 /// Четырёхсторонний обмен WPA2 и установка ключей.
-fn handshake(ssid: &str, password: &str, bssid: &[u8; 6]) -> Result<Vec<String>, &'static str> {
+fn handshake(ssid: &str, password: &str, bssid: &[u8; 6], rsn_ie: &[u8], group: GroupCipher) -> Result<Vec<String>, &'static str> {
     let mut report = Vec::new();
     let pmk = wpa::pmk(password.as_bytes(), ssid.as_bytes());
     let first = wait_eapol(3000).ok_or("no EAPOL message 1 from the access point")?;
@@ -936,7 +980,8 @@ fn handshake(ssid: &str, password: &str, bssid: &[u8; 6]) -> Result<Vec<String>,
 
     let mut eapol = [0u8; 256];
     let info2 = wpa::info::VERSION_HMAC_SHA1_AES | wpa::info::PAIRWISE | wpa::info::MIC;
-    let len = wpa::build(&mut eapol, info2, &msg1.replay, &snonce, &wpa::RSN_IE, &ptk.kck);
+    // Ключевые данные второго сообщения — ровно тот RSN, что в ассоциации.
+    let len = wpa::build(&mut eapol, info2, &msg1.replay, &snonce, rsn_ie, &ptk.kck);
     send_eapol(bssid, &eapol[..len])?;
     note(&mut report, String::from("eapol 2 sent"));
 
@@ -955,8 +1000,8 @@ fn handshake(ssid: &str, password: &str, bssid: &[u8; 6]) -> Result<Vec<String>,
     send_eapol(bssid, &eapol[..len])?;
     note(&mut report, String::from("eapol 4 sent"));
 
-    add_key(bssid, true, 0, &ptk.tk)?;
-    add_key(bssid, false, gtk_id, &gtk)?;
+    add_key(bssid, true, 0, 4, &ptk.tk)?;
+    add_key(bssid, false, gtk_id, group.algorithm, &gtk[..gtk.len().min(group.key_len)])?;
     note(&mut report, alloc::format!("keys installed (group key {gtk_id})"));
     crate::kprintln!("  wlan        : WPA2 handshake done, group key {gtk_id}");
     Ok(report)

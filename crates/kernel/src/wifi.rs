@@ -148,9 +148,9 @@ fn join_task() {
             Ok(lines) => lines,
             Err(err) => {
                 crate::kprintln!("  wifi        : connect to '{ssid}' failed: {err}");
-                let mut lines = alloc::vec![alloc::format!("не подключиться к «{ssid}»: {err}")];
+                let mut lines = alloc::vec![alloc::format!("Не подключиться к «{ssid}»: {}", human(err))];
                 if let Some(status) = crate::arch::mtk_wlan::last_status() {
-                    lines.push(alloc::format!("код ответа точки доступа: {status}"));
+                    lines.push(alloc::format!("Код ответа роутера: {status}"));
                 }
                 lines
             }
@@ -161,6 +161,25 @@ fn join_task() {
     let _ = (ssid, password);
     JOINING.store(false, Ordering::Relaxed);
     GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Причина отказа драйвера — словами для человека (Роман 03.11: «при
+/// включении Wi-Fi какие-то непонятные слова»).
+#[must_use]
+pub fn human(err: &str) -> &'static str {
+    match err {
+        "network not in the last scan" => "сети нет в последнем поиске — нажмите «Обновить»",
+        "firmware did not grant the channel" => "модуль Wi-Fi не отдал канал",
+        "no authentication answer" | "no association answer" => "роутер не ответил",
+        "access point refused authentication" | "access point refused association" => "роутер отказал",
+        "no EAPOL message 1 from the access point" => "роутер не начал обмен ключами",
+        "no EAPOL message 3 — wrong password?" | "EAPOL message 3 MIC mismatch — wrong password" => "неверный пароль",
+        "group cipher of this network is not supported" | "network offers no AES (CCMP) for the station" => {
+            "у сети шифрование, которое мы пока не умеем"
+        }
+        "network wants WPA3 or 802.1X, not a password (PSK)" => "сети нужен WPA3 или корпоративный вход",
+        _ => "ошибка драйвера Wi-Fi (подробности в журнале)",
+    }
 }
 
 /// Счётчик перемен: стол перерисовывает шторку и «Параметры», когда он
@@ -249,31 +268,30 @@ fn bring_up_task() {
     #[cfg(not(target_arch = "aarch64"))]
     let result: Result<alloc::vec::Vec<alloc::string::String>, &'static str> = Err("no Wi-Fi hardware driver");
     match result {
-        Ok(mut lines) => {
+        // Технические строки драйвера — только в журнал: в «Параметрах»
+        // человеку нужен итог, а не регистры.
+        Ok(_) => {
             crate::kprintln!("  wifi        : connectivity firmware up");
             CONSYS_UP.store(true, Ordering::Relaxed);
             set(State::FirmwareUp);
-            *REPORT.lock() = lines.clone();
+            REPORT.lock().clear();
             // Вторая половина: сторона WLAN и поиск сетей.
             #[cfg(target_arch = "aarch64")]
             match crate::arch::mtk_wlan::bring_up() {
-                Ok(more) => {
-                    lines.extend(more);
-                    *REPORT.lock() = lines;
+                Ok(_) => {
                     set(State::Scanning);
                     scan_task();
                 }
                 Err(err) => {
                     crate::kprintln!("  wifi        : WLAN side failed: {err}");
-                    lines.push(alloc::string::String::from(err));
-                    *REPORT.lock() = lines;
+                    *REPORT.lock() = alloc::vec![alloc::format!("Wi-Fi не запустился: {}", human(err))];
                     set(State::Failed);
                 }
             }
         }
         Err(err) => {
             crate::kprintln!("  wifi        : bring-up failed: {err}");
-            *REPORT.lock() = alloc::vec![alloc::string::String::from(err)];
+            *REPORT.lock() = alloc::vec![alloc::format!("Модуль Wi-Fi не запустился: {}", human(err))];
             set(State::Failed);
         }
     }
