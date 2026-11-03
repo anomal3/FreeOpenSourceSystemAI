@@ -19,17 +19,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aes"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
-dependencies = [
- "cfg-if",
- "cipher",
- "cpufeatures",
-]
-
-[[package]]
 name = "aml"
 version = "0.8.0"
 
@@ -667,6 +656,7 @@ dependencies = [
  "sysconf",
  "usb-hid",
  "user-abi",
+ "wpa",
 ]
 
 [[package]]
@@ -1360,7 +1350,6 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 name = "wpa"
 version = "0.8.0"
 dependencies = [
- "aes",
  "hmac",
  "pbkdf2",
  "sha1",

@@ -7,12 +7,12 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
-# Всё из набора RustCrypto, `no_std` и без кучи, — как `sha2` у ssh и tls.
+# Хэши из набора RustCrypto, `no_std` и без кучи, — как `sha2` у ssh и tls.
+# AES — свой (`src/aes.rs`): крейт `aes` ломал отладочную сборку ядра x86-64.
 [dependencies]
 sha1 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-aes = { version = "0.8", default-features = false }
 
 [lints]
 workspace = true

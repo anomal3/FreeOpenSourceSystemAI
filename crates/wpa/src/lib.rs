@@ -18,8 +18,8 @@
 
 #![no_std]
 
-use aes::Aes128;
-use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+mod aes;
+
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
@@ -97,7 +97,6 @@ pub fn unwrap_key(kek: &[u8; 16], wrapped: &[u8], out: &mut [u8]) -> Option<usiz
         return None;
     }
     let n = wrapped.len() / 8 - 1;
-    let cipher = Aes128::new(GenericArray::from_slice(kek));
     let mut a = [0u8; 8];
     a.copy_from_slice(&wrapped[..8]);
     out[..n * 8].copy_from_slice(&wrapped[8..]);
@@ -109,10 +108,9 @@ pub fn unwrap_key(kek: &[u8; 16], wrapped: &[u8], out: &mut [u8]) -> Option<usiz
                 block[k] = a[k] ^ byte;
             }
             block[8..].copy_from_slice(&out[(i - 1) * 8..i * 8]);
-            let mut ga = GenericArray::clone_from_slice(&block);
-            cipher.decrypt_block(&mut ga);
-            a.copy_from_slice(&ga[..8]);
-            out[(i - 1) * 8..i * 8].copy_from_slice(&ga[8..]);
+            aes::decrypt_block(kek, &mut block);
+            a.copy_from_slice(&block[..8]);
+            out[(i - 1) * 8..i * 8].copy_from_slice(&block[8..]);
         }
     }
     (a == [0xa6; 8]).then_some(n * 8)
