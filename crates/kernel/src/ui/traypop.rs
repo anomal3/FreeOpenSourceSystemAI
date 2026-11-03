@@ -246,9 +246,19 @@ impl TrayPop {
                 // Показания — от драйвера платформы (`crate::battery`, 03.11);
                 // их нет — честное «батареи нет».
                 let power = match crate::battery::get() {
-                    Some(state) if state.charging => alloc::format!("Батарея {} % · заряжается", state.percent),
-                    Some(state) if state.charger => alloc::format!("Батарея {} % · от сети", state.percent),
-                    Some(state) => alloc::format!("Батарея {} %", state.percent),
+                    Some(state) => {
+                        let how = if state.charging {
+                            " · заряжается"
+                        } else if state.charger {
+                            " · от сети"
+                        } else {
+                            ""
+                        };
+                        let heat = state
+                            .tenth_celsius
+                            .map_or_else(alloc::string::String::new, |t| alloc::format!(" · {} °C", (t + 5).div_euclid(10)));
+                        alloc::format!("Батарея {} %{how}{heat}", state.percent)
+                    }
                     None => alloc::string::String::from("Питание от сети · батареи нет"),
                 };
                 paint::text(ctx, s, Role::Caption, left + px(28) as i32, paint::baseline(ctx, Role::Caption, bottom), &power, p.ink4);

@@ -924,7 +924,19 @@ impl Fastboot {
         self.say(alloc::format!("pmic hwcid {:04x} swcid {:04x}", info.hwcid, info.swcid).as_bytes());
         self.say(alloc::format!("vbat {} mV (raw {:04x})", info.vbat_mv, info.vbat_raw).as_bytes());
         self.say(alloc::format!("battery {}, charger {}", if info.battery_present { "present" } else { "absent" }, if info.charger { "in" } else { "out" }).as_bytes());
-        self.say(alloc::format!("vcdt {} mV, ntc {} mV", info.vcdt_mv, info.temp_mv).as_bytes());
+        let celsius = crate::battery::tenth_celsius_from_ntc(info.temp_mv)
+            .map_or_else(|| alloc::string::String::from("?"), |t| alloc::format!("{}.{}", t / 10, (t % 10).abs()));
+        self.say(
+            alloc::format!(
+                "vbus {} mV (vcdt {}), ntc {} mV = {} C",
+                crate::battery::vbus_from_vcdt(info.vcdt_mv),
+                info.vcdt_mv,
+                info.temp_mv,
+                celsius
+            )
+            .as_bytes(),
+        );
+        self.say(alloc::format!("estimate {} %", crate::battery::percent_from_ocv(info.vbat_mv)).as_bytes());
         let ma = info.current_tenth_ma;
         self.say(alloc::format!("current {}{}.{} mA (raw {:04x})", if ma < 0 { "-" } else { "" }, ma.abs() / 10, ma.abs() % 10, info.current_raw).as_bytes());
         self.state = State::Lines { at: 0 };

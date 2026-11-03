@@ -266,6 +266,7 @@ pub fn battery_task() {
                     charger: info.charger,
                     charging: info.charger && info.current_tenth_ma > 0,
                     current_tenth_ma: info.current_tenth_ma,
+                    tenth_celsius: crate::battery::tenth_celsius_from_ntc(info.temp_mv),
                 };
                 if !logged {
                     crate::kprintln!("  battery     : {} mV, {} %, charger {}", state.millivolts, state.percent, state.charger);
