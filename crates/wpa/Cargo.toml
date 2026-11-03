@@ -1,0 +1,18 @@
+[package]
+name = "wpa"
+description = "WPA2-PSK (CCMP) station side: PMK/PTK derivation, EAPOL-Key 4-way handshake frames, GTK unwrap."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Всё из набора RustCrypto, `no_std` и без кучи, — как `sha2` у ssh и tls.
+[dependencies]
+sha1 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+aes = { version = "0.8", default-features = false }
+
+[lints]
+workspace = true

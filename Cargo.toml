@@ -31,6 +31,7 @@ members = [
     "crates/usb-hid",
     "crates/user-abi",
     "crates/user-progs",
+    "crates/wpa",
     "crates/x509",
 ]
 
