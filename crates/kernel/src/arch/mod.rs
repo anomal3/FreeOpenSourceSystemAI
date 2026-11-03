@@ -192,7 +192,7 @@ pub use aarch64::mtk_wlan;
 
 /// Зажечь или погасить подсветку экрана, если машина это умеет (03.11).
 ///
-/// Телефон MediaTek — выводом включения подсветки; у ПК подсветкой
+/// Телефон MediaTek — командой яркости панели; у ПК подсветкой
 /// управляет монитор, а DPMS у нас нет — там ничего не делается.
 pub fn backlight(on: bool) {
     #[cfg(target_arch = "aarch64")]
@@ -201,6 +201,16 @@ pub fn backlight(on: bool) {
     }
     #[cfg(not(target_arch = "aarch64"))]
     let _ = on;
+}
+
+/// Коротко прогудеть вибромотором (отклик клавиш), если он есть.
+pub fn vibrate(ms: u32) {
+    #[cfg(target_arch = "aarch64")]
+    if aarch64::mtk::present() {
+        aarch64::mtk_regs::vibrate(ms);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = ms;
 }
 
 /// Монотонный счётчик: время, которое идёт само, без участия прерываний.

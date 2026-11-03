@@ -224,7 +224,13 @@ pub struct Keyboard {
     repeat: Option<u64>,
     /// Когда был прошлый шаг времени (мс) — чтобы узнать пропуск.
     last_tick: u64,
+    /// Где нарисована увеличенная клавиша над пальцем (как у Android и iOS:
+    /// палец закрывает саму клавишу, и букву показывают выше).
+    preview: Option<Rect>,
 }
+
+/// Вибро на нажатие клавиши, мс: мотор ERM телефона короче не раскручивается.
+const HAPTIC_MS: u32 = 22;
 
 /// Заливка слоя, сведённая к непрозрачному цвету, — как у дока.
 fn bg() -> Color {
@@ -268,6 +274,7 @@ impl Keyboard {
             dicts: [None, None],
             repeat: None,
             last_tick: 0,
+            preview: None,
         };
         keyboard.layout();
         Some(keyboard)
@@ -290,6 +297,7 @@ impl Keyboard {
         }
         self.visible = visible;
         self.stroke = None;
+        self.hide_preview();
         if visible {
             if let Some(index) = self.pressed.take() {
                 self.redraw_key(index);
@@ -342,12 +350,17 @@ impl Keyboard {
         let index = self.keys.iter().position(|key| key.rect.contains(local.0, local.1))?;
         let key = self.keys[index];
         self.pressed = Some(index);
+        crate::arch::vibrate(HAPTIC_MS);
+        self.hide_preview();
         let now = crate::time::uptime_ms();
         if key.letter.is_some() || key.action == Action::Space {
             self.stroke = Some(Stroke { key: index, points: alloc::vec![Point::new(x, y)], at: now, popup: None });
             self.trail.clear();
             self.trail.push((Point::new(x, y), crate::time::uptime_ms()));
             self.redraw_key(index);
+            if key.letter.is_some() {
+                self.show_preview(index);
+            }
             return None;
         }
         // ⌫ сразу после слова жестом стирает слово целиком.
@@ -383,9 +396,70 @@ impl Keyboard {
                 self.layout();
                 self.redraw();
             }
+            Action::Char(_) => {
+                self.redraw_key(index);
+                self.show_preview(index);
+            }
             _ => self.redraw_key(index),
         }
         Some(action)
+    }
+
+    /// Показать над клавишей её знак крупно.
+    fn show_preview(&mut self, index: usize) {
+        let Some(key) = self.keys.get(index).copied() else {
+            return;
+        };
+        let ch = self.char_of(&key);
+        if ch == ' ' {
+            return;
+        }
+        let ctx = Ctx::scaled(self.scale).on(bg());
+        let p = ctx.palette;
+        let w = key.rect.w + ctx.px(12);
+        let h = key.rect.h + ctx.px(14);
+        let x = (key.rect.x + key.rect.w as i32 / 2 - w as i32 / 2).clamp(0, self.surface.width().saturating_sub(w) as i32);
+        let y = (key.rect.y - h as i32 - ctx.px(4) as i32).max(0);
+        let rect = Rect::new(x, y, w, h);
+        let radius = ctx.px(12);
+        draw::rounded(&mut self.surface, rect, radius, ctx.under, 255);
+        draw::rounded(&mut self.surface, rect, radius, p.btn.color, p.btn.alpha);
+        draw::rounded_stroke(&mut self.surface, rect, radius, p.accline.color, p.accline.alpha);
+        let mut buf = [0u8; 4];
+        let label = ch.encode_utf8(&mut buf);
+        let w = ctx.face(Role::Heading).width(label);
+        paint::text(ctx, &mut self.surface, Role::Heading, rect.x + (rect.w as i32 - w as i32) / 2, paint::baseline(ctx, Role::Heading, rect), label, p.ink);
+        self.damage = self.damage.union(&rect);
+        self.preview = Some(rect);
+    }
+
+    /// Убрать увеличенную клавишу: заливка ярусов и клавиши под ней — заново.
+    fn hide_preview(&mut self) {
+        let Some(rect) = self.preview.take() else {
+            return;
+        };
+        let card = self.surface.bounds();
+        // У краёв лежат скругление и обводка карточки — проще нарисовать всё.
+        if rect.x <= 0 || rect.y <= 0 || rect.x + rect.w as i32 >= card.w as i32 {
+            self.redraw();
+            return;
+        }
+        let ctx = Ctx::scaled(self.scale).on(bg());
+        let p = ctx.palette;
+        self.surface.fill(rect, ctx.under);
+        let panel = Rect::new(0, ctx.px(CHIPS_H) as i32, card.w, card.h.saturating_sub(ctx.px(CHIPS_H)));
+        let lower = rect.intersect(&panel);
+        if !lower.is_empty() {
+            draw::blend_rect(&mut self.surface, lower, p.panel.color, p.panel.alpha);
+        }
+        if rect.y < panel.y && rect.y + rect.h as i32 > panel.y {
+            draw::hline(&mut self.surface, rect.x, panel.y, rect.w, p.line2.color, p.line2.alpha);
+        }
+        self.damage = self.damage.union(&rect);
+        let under: Vec<usize> = (0..self.keys.len()).filter(|&i| !self.keys[i].rect.intersect(&rect).is_empty()).collect();
+        for index in under {
+            self.redraw_key(index);
+        }
     }
 
     /// Знак клавиши с учётом Shift.
@@ -426,6 +500,7 @@ impl Keyboard {
             let half = self.keys.get(index).map_or(0, |key| key.rect.w as i32 / 2);
             if (x - start.x).abs() + (y - start.y).abs() > half {
                 self.pressed = None;
+                self.hide_preview();
                 self.redraw_key(index);
             }
         }
@@ -446,6 +521,7 @@ impl Keyboard {
     /// Палец отпустили: снять подсветку и решить, чем было касание.
     pub fn release(&mut self) -> Release {
         self.repeat = None;
+        self.hide_preview();
         if let Some(index) = self.pressed.take() {
             self.redraw_key(index);
         }
@@ -633,6 +709,7 @@ impl Keyboard {
         crate::kprintln!("  keyboard    : alternates {:?}", chars);
         // Первый вариант — сама буква, выбран второй: ради него и держали.
         let popup = Popup { rect: Rect::new(x, y, w, h), chars, selected: 1 };
+        self.hide_preview();
         self.trail.clear();
         if let Some(index) = self.pressed.take() {
             self.redraw_key(index);
@@ -913,6 +990,7 @@ impl Keyboard {
         let card = self.surface.bounds();
         let round = ctx.px(34);
         self.surface.fill(card, ctx.under);
+        self.preview = None;
         // Панель клавиш — своей заливкой, под строкой быстрых команд, с чертой
         // между ними: в макете это два яруса одного окна.
         let panel = Rect::new(0, ctx.px(CHIPS_H) as i32, card.w, card.h.saturating_sub(ctx.px(CHIPS_H)));

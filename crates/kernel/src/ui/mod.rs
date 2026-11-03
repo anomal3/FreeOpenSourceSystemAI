@@ -2176,7 +2176,29 @@ fn icon_gesture_end(desktop: &mut Compositor) {
     }
 }
 
+/// Касание, разбудившее экран: до отпускания пальца оно только будит — как на
+/// смартфоне, тап по тёмному экрану не нажимает то, что под ним.
+static WAKE_TOUCH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Экран разбудил ввод (не кнопка питания): касание, что сейчас идёт,
+/// проглотить до отпускания.
+pub fn swallow_wake_touch() {
+    WAKE_TOUCH.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
+    if desktop.blanked() {
+        WAKE_TOUCH.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    if WAKE_TOUCH.load(core::sync::atomic::Ordering::Relaxed) {
+        if !event.buttons.contains(Buttons::LEFT) {
+            WAKE_TOUCH.store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some((x, y)) = event.absolute {
+            desktop.move_pointer_to(x, y);
+        }
+        return;
+    }
     // На сколько сдвинулся курсор. У мыши это приехало в отчёте, у планшета
     // приходится вычесть одно положение из другого: устройство сообщило точку,
     // а окно можно тащить только на разницу.

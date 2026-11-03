@@ -288,24 +288,62 @@ pub fn battery_task() {
 // Подсветка и кнопка питания (03.11)
 // ---------------------------------------------------------------------------
 //
-// Подсветкой `dandelion` управляет сама панель (команда DSI 0x51), а
-// драйвера DSI у нас нет; но у подсветки есть вывод включения — GPIO154
-// `LCD_BL_EN` (`dandelion.dws`, драйверы панелей Xiaomi): ноль гасит
-// преобразователь, единица зажигает. Проверено на аппарате: выход, стоит в
-// единице после загрузчика. Кнопка питания — `TOPSTATUS` (0x24) микросхемы
-// питания, бит 1 (`PMIC_PWRKEY_DEB`); отпущенная — 1.
+// Подсветкой `dandelion` управляет сама панель: команда DCS 0x51 (яркость,
+// 12 бит) задаёт ШИМ её вывода LEDPWM, а от него работает преобразователь
+// подсветки. Вывод GPIO154 `LCD_BL_EN` подсветку не гасит (Роман 03.11:
+// «пиксели горят чёрные»), `DISP_PWM` (0x1100E000) выключен. Команду панели
+// шлёт сам DSI0 без остановки видеопотока — «VM CMD»: загрузчик оставил в
+// `VM_CMD_CON` длинный пакет 0x39 на 3 байта, а в `VM_CMD_DATA0` —
+// `51 05 C1` (яркость 0x5C1); запуск — фронт бита 16 `DSI_START`.
+// Кнопка питания — `TOPSTATUS` (0x24) микросхемы питания, бит 1
+// (`PMIC_PWRKEY_DEB`); отпущенная — 1.
 
 /// GPIO154: банк 4 (выводы 128–159), бит 26. `DOUT` банка, `+4` — установить,
 /// `+8` — сбросить.
 const GPIO_DOUT_BANK4: u64 = 0x1000_5140;
 const LCD_BL_EN: u32 = 1 << 26;
 
+const DSI_START: u64 = 0x1401_4000;
+const DSI_START_BIT: u32 = 1 << 0;
+const VM_CMD_START: u32 = 1 << 16;
+const DSI_VM_CMD_CON: u64 = 0x1401_4130;
+const DSI_VM_CMD_DATA0: u64 = 0x1401_4134;
+/// `VM_CMD_EN | LONG_PKT | TS_VFP_EN`, тип 0x39 (DCS long write), 3 байта.
+const VM_CMD_DCS_LONG3: u32 = 0x0003_3923;
+
+/// Яркость, которую вернуть при пробуждении (по умолчанию — загрузчика).
+static BRIGHTNESS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x5C1);
+
+/// Послать панели DCS 0x51 с яркостью `level` (0..=0xFFF).
+fn panel_brightness(level: u32) -> bool {
+    let level = level.min(0xFFF);
+    let data = 0x51 | ((level >> 8) << 8) | ((level & 0xFF) << 16);
+    let Some(start) = read32(DSI_START) else { return false };
+    write32(DSI_VM_CMD_CON, VM_CMD_DCS_LONG3)
+        && write32(DSI_VM_CMD_DATA0, data)
+        && write32(DSI_START, (start | DSI_START_BIT) & !VM_CMD_START)
+        && write32(DSI_START, start | DSI_START_BIT | VM_CMD_START)
+}
+
 /// Зажечь или погасить подсветку панели.
 pub fn backlight(on: bool) {
-    let address = if on { GPIO_DOUT_BANK4 + 4 } else { GPIO_DOUT_BANK4 + 8 };
-    if !write32(address, LCD_BL_EN) {
-        crate::kprintln!("  backlight   : GPIO window not mapped");
+    if !on {
+        // Запомнить, какую яркость оставил загрузчик (или мы сами).
+        if let Some(data) = read32(DSI_VM_CMD_DATA0)
+            && data & 0xFF == 0x51
+        {
+            let level = ((data >> 8) & 0xFF) << 8 | ((data >> 16) & 0xFF);
+            if level != 0 {
+                BRIGHTNESS.store(level, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
+    let level = if on { BRIGHTNESS.load(core::sync::atomic::Ordering::Relaxed) } else { 0 };
+    if !panel_brightness(level) {
+        crate::kprintln!("  backlight   : DSI window not mapped");
+    }
+    let address = if on { GPIO_DOUT_BANK4 + 4 } else { GPIO_DOUT_BANK4 + 8 };
+    let _ = write32(address, LCD_BL_EN);
 }
 
 /// `TOPSTATUS` микросхемы питания и бит кнопки питания в нём.
@@ -314,6 +352,21 @@ const PWRKEY_DEB: u16 = 1 << 1;
 
 /// Служба кнопки питания: опрос раз в 30 мс, нажатие — по смене уровня
 /// относительно того, что было при старте (кнопку при загрузке не держат).
+/// Вибромотор — на LDO `VIBR` микросхемы питания: бит 0 `LDO_VIBR_CON0`
+/// включает, напряжение (`VIBR_ANA_CON0` = 0x900, 2,8 В) оставил загрузчик
+/// (`mt6357-regulator.c`). Проверено на аппарате 03.11.
+const LDO_VIBR_CON0: u16 = 0x1b08;
+/// Когда выключить мотор (мс от старта), 0 — не гудит. Гасит его
+/// [`powerkey_task`].
+static VIBRATE_UNTIL_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Коротко прогудеть мотором `ms` миллисекунд.
+pub fn vibrate(ms: u32) {
+    let until = crate::time::uptime_ms() + u64::from(ms.max(1));
+    VIBRATE_UNTIL_MS.store(until, core::sync::atomic::Ordering::Relaxed);
+    let _ = pmic_write(LDO_VIBR_CON0, 1);
+}
+
 pub fn powerkey_task() {
     let Ok(idle) = pmic_read(TOPSTATUS).map(|value| value & PWRKEY_DEB) else {
         crate::kprintln!("  powerkey    : PMIC does not answer; power key not watched");
@@ -322,7 +375,13 @@ pub fn powerkey_task() {
     crate::kprintln!("  powerkey    : watching TOPSTATUS bit 1, released = {}", idle != 0);
     let mut down = false;
     loop {
-        crate::sched::sleep_ms(30);
+        // Пока гудит мотор — шаг мельче: отклик клавиши длится десятки мс.
+        let until = VIBRATE_UNTIL_MS.load(core::sync::atomic::Ordering::Relaxed);
+        crate::sched::sleep_ms(if until != 0 { 5 } else { 30 });
+        if until != 0 && crate::time::uptime_ms() >= until {
+            VIBRATE_UNTIL_MS.store(0, core::sync::atomic::Ordering::Relaxed);
+            let _ = pmic_write(LDO_VIBR_CON0, 0);
+        }
         let Ok(value) = pmic_read(TOPSTATUS) else { continue };
         let pressed = value & PWRKEY_DEB != idle;
         if pressed && !down {

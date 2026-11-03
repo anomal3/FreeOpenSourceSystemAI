@@ -319,6 +319,7 @@ pub fn idle_tick() -> bool {
         // Ввод был — значит человек вернулся.
         let slept = last.saturating_sub(BLANKED_AT.load(Ordering::Relaxed)) / 1000;
         SCREEN_OFF.store(false, Ordering::Relaxed);
+        crate::ui::swallow_wake_touch();
         crate::ui::set_screen_off(false);
         crate::kprintln!("  power       : awake, the screen was off for {slept} s");
         return true;
