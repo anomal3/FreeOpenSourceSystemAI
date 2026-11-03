@@ -2669,6 +2669,26 @@ fn start_host_site() -> Result<(HostServer, u16)> {
                 )
                 .into_bytes()
             }
+            // Страница для NetSurf (начато 03.11): без скриптов, зато со
+            // стилями, которые видно на снимке, — цветной заголовок, рамка,
+            // таблица и ссылка. Не тот же `page.html`: тот проверяет
+            // JavaScript, которого у NetSurf нет.
+            "/netsurf.html" => {
+                let body = "<!DOCTYPE html><html><head><title>NetSurf on FossAi</title>\
+                    <style>body{background:#f4f1e8;font-family:sans-serif;margin:24px}\
+                    h1{color:#fff;background:#2b5797;padding:12px}\
+                    .box{border:4px solid #c0392b;padding:8px;width:60%}\
+                    td{border:1px solid #444;padding:4px 12px}th{background:#f1c40f}</style></head>\
+                    <body><h1>NetSurf on FossAi</h1>\
+                    <p class=\"box\">This page came over <b>HTTP</b> from the host and was laid out by NetSurf.</p>\
+                    <table><tr><th>engine</th><th>fetch</th></tr><tr><td>NetSurf 3.11</td><td>libcurl + mbedTLS</td></tr></table>\
+                    <p><a href=\"/hello.txt\">a link to hello.txt</a></p></body></html>\n";
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_bytes()
+            }
             "/stream.bin" => {
                 let length = scenarios::SITE_STREAM_BYTES;
                 let mut answer = format!(
