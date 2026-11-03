@@ -215,6 +215,10 @@ impl Fastboot {
             self.pmic(rest);
         } else if text == "oem battery" {
             self.battery();
+        } else if let Some(rest) = text.strip_prefix("oem i2cw ") {
+            self.i2c(rest, true);
+        } else if let Some(rest) = text.strip_prefix("oem i2c ") {
+            self.i2c(rest, false);
         } else if let Some(rest) = text.strip_prefix("oem tap ") {
             self.synth_tap(rest);
         } else if let Some(rest) = text.strip_prefix("oem drag ") {
@@ -819,6 +823,54 @@ impl Fastboot {
                 }
             }
             self.say(text.as_bytes());
+        }
+        self.state = State::Lines { at: 0 };
+        self.continue_lines(0);
+    }
+
+    /// `oem i2c <база> <адрес> <регистр> [сколько]` — прочитать байты;
+    /// `oem i2cw <база> <адрес> <регистр> <значение>` — записать байт.
+    /// База — окно контроллера (`I2C5` = `11016000`), адрес семибитный.
+    fn i2c(&mut self, args: &str, write: bool) {
+        use crate::arch::aarch64::mtk_regs;
+        let numbers: alloc::vec::Vec<u64> = args.split_whitespace().filter_map(mtk_regs::parse_number).collect();
+        let (Some(&base), Some(&address), Some(&register)) = (numbers.first(), numbers.get(1), numbers.get(2)) else {
+            self.respond(b"FAIL", "usage: oem i2c <base> <addr> <reg> [n] | oem i2cw <base> <addr> <reg> <val>");
+            return;
+        };
+        let (Ok(address), Ok(register)) = (u8::try_from(address), u8::try_from(register)) else {
+            self.respond(b"FAIL", "address and register are bytes");
+            return;
+        };
+        self.line_count = 0;
+        if write {
+            let Some(Ok(value)) = numbers.get(3).map(|value| u8::try_from(*value)) else {
+                self.respond(b"FAIL", "usage: oem i2cw <base> <addr> <reg> <val>");
+                return;
+            };
+            match mtk_regs::i2c_write(base, address, register, value) {
+                Ok(layout) => {
+                    crate::kprintln!("  i2c         : {base:#x} {address:#04x} [{register:#04x}] <- {value:#04x}");
+                    self.say(alloc::format!("{address:02x}[{register:02x}] <- {value:02x} ({layout})").as_bytes());
+                }
+                Err(err) => {
+                    self.respond(b"FAIL", &alloc::format!("i2c: {err:?}"));
+                    return;
+                }
+            }
+        } else {
+            let count = numbers.get(3).copied().unwrap_or(1).clamp(1, 32) as usize;
+            let mut bytes = [0u8; 32];
+            match mtk_regs::i2c_read(base, address, register, &mut bytes[..count]) {
+                Ok(layout) => {
+                    self.say(alloc::format!("{address:02x}[{register:02x}..] ({layout}):").as_bytes());
+                    self.say_bytes(&bytes[..count]);
+                }
+                Err(err) => {
+                    self.respond(b"FAIL", &alloc::format!("i2c: {err:?}"));
+                    return;
+                }
+            }
         }
         self.state = State::Lines { at: 0 };
         self.continue_lines(0);

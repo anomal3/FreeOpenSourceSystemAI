@@ -243,7 +243,15 @@ impl TrayPop {
                 let bottom = Rect::new(left, y, inner_w, px(40));
                 let g = px(18);
                 iconset::draw(s, Fi::Battery, left, bottom.y + (bottom.h as i32 - g as i32) / 2, g, p.ink5, 255);
-                paint::text(ctx, s, Role::Caption, left + px(28) as i32, paint::baseline(ctx, Role::Caption, bottom), "Питание от сети · батареи нет", p.ink4);
+                // Показания — от драйвера платформы (`crate::battery`, 03.11);
+                // их нет — честное «батареи нет».
+                let power = match crate::battery::get() {
+                    Some(state) if state.charging => alloc::format!("Батарея {} % · заряжается", state.percent),
+                    Some(state) if state.charger => alloc::format!("Батарея {} % · от сети", state.percent),
+                    Some(state) => alloc::format!("Батарея {} %", state.percent),
+                    None => alloc::string::String::from("Питание от сети · батареи нет"),
+                };
+                paint::text(ctx, s, Role::Caption, left + px(28) as i32, paint::baseline(ctx, Role::Caption, bottom), &power, p.ink4);
                 let gear = Rect::new(bottom.right() - px(32) as i32, bottom.y + px(4) as i32, px(32), px(32));
                 glyphicon::draw(s, Icon::Settings, gear.x + px(7) as i32, gear.y + px(7) as i32, px(18), p.ink2, 255);
                 rows.push((gear.translate(ox, oy), Action::Settings));

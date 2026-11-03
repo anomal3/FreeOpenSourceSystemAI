@@ -64,6 +64,7 @@ mod linux_path;
 mod mm;
 mod net;
 mod pci;
+mod battery;
 mod power;
 mod print;
 mod random;

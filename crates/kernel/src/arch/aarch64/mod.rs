@@ -111,6 +111,14 @@ pub fn spawn_input_services() {
         }
     }
 
+    // Батарея — за микросхемой питания MediaTek (03.11). На машине без неё
+    // задача после первого же отказа PMIC заканчивается сама.
+    if mtk::present() {
+        if let Err(err) = crate::sched::spawn_daemon("battery", mtk_regs::battery_task) {
+            crate::kprintln!("  spawn battery service failed: {err}");
+        }
+    }
+
     if !mtk_touch::present() {
         return;
     }

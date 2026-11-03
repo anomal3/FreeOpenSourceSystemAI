@@ -94,6 +94,21 @@ pub fn draw(back: &mut Surface, band: Rect, dy: i32, screen_w: u32, scale: u32) 
         draw::rounded_stroke(back, inset, radius.saturating_sub(ring), p.ink, 255);
     }
     x = body.x - ctx.px(9) as i32;
+    // С 03.11 у телефона есть показания (`crate::battery`): заливка по
+    // заряду и число слева. Зелёная — на зарядке, красная — ниже 15 %.
+    if let Some(state) = crate::battery::get() {
+        let gap = ctx.px(3);
+        let inner_w = body.w.saturating_sub(gap * 2);
+        let fill_w = (inner_w * u32::from(state.percent.min(100)) / 100).max(ctx.px(1));
+        let fill = Rect::new(body.x + gap as i32, body.y + gap as i32, fill_w, body.h.saturating_sub(gap * 2));
+        let color = if state.charger { p.ok } else if state.percent < 15 { p.bad } else { p.ink };
+        draw::rounded(back, fill, ctx.px(1), color, 255);
+        let text = alloc::format!("{}%", state.percent);
+        let w = face.width(&text);
+        x -= w as i32;
+        paint::text(ctx, back, Role::Mono, x, y, &text, p.ink);
+        x -= ctx.px(9) as i32;
+    }
 
     // Сеть: четыре полоски 3 шириной, высотой 5, 8, 11 и 14, по низу.
     let bottom = mid + ctx.px(14) as i32 / 2;

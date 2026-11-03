@@ -33,7 +33,7 @@ pub fn allowed(address: u64) -> bool {
 }
 
 /// Отобразить страницу с этим адресом как память устройства (один раз).
-fn map(address: u64) -> bool {
+pub fn map(address: u64) -> bool {
     let page = address & !0xfff;
     let mut mapped = MAPPED.lock();
     let (pages, count) = &mut *mapped;
@@ -249,6 +249,40 @@ pub fn battery() -> Result<Battery, PwrapError> {
     Ok(info)
 }
 
+/// Служба батареи: раз в десять секунд снять показания и отдать столу
+/// (`crate::battery`). Первый же отказ PMIC — машина не та, задача уходит.
+pub fn battery_task() {
+    let mut percent = None;
+    let mut logged = false;
+    loop {
+        match battery() {
+            Ok(info) if info.battery_present => {
+                let measured = crate::battery::percent_from_ocv(info.vbat_mv);
+                let smoothed = crate::battery::smooth(percent, measured);
+                percent = Some(smoothed);
+                let state = crate::battery::State {
+                    millivolts: info.vbat_mv,
+                    percent: smoothed,
+                    charger: info.charger,
+                    charging: info.charger && info.current_tenth_ma > 0,
+                    current_tenth_ma: info.current_tenth_ma,
+                };
+                if !logged {
+                    crate::kprintln!("  battery     : {} mV, {} %, charger {}", state.millivolts, state.percent, state.charger);
+                    logged = true;
+                }
+                crate::battery::set(state);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                crate::kprintln!("  battery     : PMIC does not answer ({err:?}); no battery shown");
+                return;
+            }
+        }
+        crate::sched::sleep_ms(10_000);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // «Войти в fastboot» — метка в часах PMIC
 // ---------------------------------------------------------------------------
@@ -292,6 +326,52 @@ pub fn mark_fastboot() -> Result<u16, PwrapError> {
     pmic_write(RTC_PDN1, pdn1 | RTC_PDN1_FAST_BOOT)?;
     rtc_commit()?;
     pmic_read(RTC_PDN1)
+}
+
+// ---------------------------------------------------------------------------
+// I²C по кабелю — зарядник и прочие микросхемы платы
+// ---------------------------------------------------------------------------
+
+/// Прочитать `out.len()` байт с регистра `register` устройства `address`
+/// (семибитный адрес) на контроллере I²C по `base`. Раскладку регистров
+/// контроллера перебирает так же, как проба тачскрина: у MT6765 она своя у
+/// разных шин, и узнать её можно только ответом.
+pub fn i2c_read(base: u64, address: u8, register: u8, out: &mut [u8]) -> Result<&'static str, super::mtk_i2c::Error> {
+    i2c_transfer(base, address, &[register], out)
+}
+
+/// Записать байт в регистр устройства на шине I²C.
+pub fn i2c_write(base: u64, address: u8, register: u8, value: u8) -> Result<&'static str, super::mtk_i2c::Error> {
+    i2c_transfer(base, address, &[register, value], &mut [])
+}
+
+static I2C_LOCK: SpinLock<()> = SpinLock::new(());
+
+fn i2c_transfer(
+    base: u64,
+    address: u8,
+    write: &[u8],
+    read: &mut [u8],
+) -> Result<&'static str, super::mtk_i2c::Error> {
+    use super::mtk_i2c::{Bus, Error, V1, V2};
+    if !allowed(base) || !map(base) {
+        return Err(Error::Timeout);
+    }
+    let _guard = I2C_LOCK.lock();
+    let mut last = Error::Timeout;
+    for layout in [V2, V1] {
+        // SAFETY: окно контроллера в окне регистров и отображено выше;
+        // обращения к шине отсюда идут под замком.
+        let bus = unsafe { Bus::new(base as usize, layout) };
+        // SAFETY: см. выше.
+        unsafe { bus.prepare() };
+        // SAFETY: см. выше.
+        match unsafe { bus.transfer(address, write, read) } {
+            Ok(()) => return Ok(layout.name),
+            Err(err) => last = err,
+        }
+    }
+    Err(last)
 }
 
 /// Число из текста: `0x…` или без префикса — шестнадцатеричное, как пишут

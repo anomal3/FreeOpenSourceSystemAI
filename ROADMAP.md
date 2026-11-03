@@ -11227,8 +11227,30 @@ GIC, `arch/aarch64/mtk_regs.rs`); `oem pmic <рег> [знач]`, `oem pmicd
 build\initrd-aarch64-debug.img --out build\phone-boot.img` (`--lean`
 выбрасывает Mono, .NET, проверочные программы и часть шрифтов: полный
 RAM-диск 54 МиБ при пределе ~25 вместе с ядром; выходит 22,8 МиБ).
-**На аппарате ещё не проверено:** на ПК не было драйвера для `18D1:D00D`
-(код 28) — Роман ставит WinUSB через Zadig.
+**Проверено на аппарате 03.11.** Драйвер: Zadig → WinUSB на `18D1:D00D`,
+затем `DeviceInterfaceGUIDs` = Android `{F72FE0D4-CBCB-407D-8814-9ED673D0DD6B}`
+(Zadig пишет случайный, `fastboot.exe` ищет этот; правка — с правами
+администратора). Гаджет берёт серийный номер загрузчика
+(`androidboot.serialno`), и Windows узнаёт его тем же устройством — второй
+драйвер не нужен. **Образ запускается не `fastboot boot`** (этот LK его
+молча пропускает и грузит MIUI), а `fastboot flash recovery` + `fastboot
+reboot recovery` + одно нажатие питания на предупреждении о подписи; до
+fastboot из MIUI — `adb reboot bootloader`. Образ — с деревом из
+заводского (`--dtb build\dandelion-stock.dtb`, вырезано из сентябрьского
+`bare-boot.img`). Первые числа: PMIC `HWCID 5730` (MT6357 E3), батарея
+4352 мВ (Android на кабеле — 4399–4403, 100 %, 5000 мА·ч), зарядка
+есть, ток −19,4 мА, VCDT 496 мВ до делителя, термистор 704 мВ.
+**CONNSYS вживую, `oem poke`:** CPU-сброс (`0x10007018` ← `0x88009000`),
+`CONN_PWR_CON` `0x1000632C`: ON, ON_2ND → `PWR_STATUS` бит 1 появился, CLK_DIS,
+ISO, RST_B; защита шины (`0x100012A4` ← `0x14000`, `0x2000`;
+`0x100012AC` ← `0x40000`) — и `0x180B1010` = `0x10020300`, ровно то, чего
+ждёт драйвер MediaTek; `0x18002000` = `0x8a00`, MCU стоит (`0x18002600` = 0).
+Прошивки — `firmware/connsys/` (не в хранилище): адреса в заголовках —
+`ram_mcu` +0, `patch_mcu` +0x1C000, `ram_bt` +0x80000, `ram_wifi` +0x140000
+от `0xF0000000` (окно EMI блока); `WIFI_RAM_CODE` зашифрован, его шлёт
+драйвер WLAN по DMA. Драйвер блока связи у Xiaomi вынесен из ядра; образец
+— Motorola `vendor-mediatek-kernel_modules-connectivity-{common,wlan-core-gen4m}`
+(ветка `android-10-release-qol`).
 
 Дальше: батарея в трее (значок и проценты по таблице OCV), зарядник
 bq2560x на I²C5 `0x6B`; Wi-Fi — питание CONNSYS, загрузка патча и RAM-кода
