@@ -224,6 +224,53 @@ pub fn build_with(
     Ok(image)
 }
 
+/// Облегчённая копия готового RAM-диска — для телефона (03.11).
+///
+/// Заводской загрузчик телефона берёт образ не длиннее блока подписи
+/// заводского recovery (`phone::STOCK_VBMETA_AT`, ~25 МиБ вместе с ядром), а
+/// полный RAM-диск к ноябрю занимает 54 МиБ: две пятых — Mono с библиотеками
+/// классов. Копия читает собранный том, пропускает пути, начинающиеся с
+/// `skip`, и форматирует оставшееся тем же способом, что и полный образ:
+/// данные ложатся с начала тома, и хвост из нулей потом отрезается
+/// (`phone::trim_volume`). Возвращает, сколько байт выброшено.
+pub fn lean_copy(src: &Path, dst: &Path, skip: &[&str]) -> Result<u64> {
+    let bytes = fs::read(src).with_context(|| format!("не удалось прочитать {}", src.display()))?;
+    let volume = FileSystem::new(Cursor::new(bytes), FsOptions::new())
+        .with_context(|| format!("{} — не том FAT", src.display()))?;
+    let mut entries = Vec::new();
+    let mut dropped = 0u64;
+    let mut pending = vec![(volume.root_dir(), String::new())];
+    while let Some((dir, prefix)) = pending.pop() {
+        let mut children: Vec<_> = dir.iter().filter_map(|entry| entry.ok()).collect();
+        children.sort_by_key(|entry| entry.file_name());
+        for entry in children {
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            if skip.iter().any(|skip| rel == *skip || rel.starts_with(&format!("{skip}/"))) {
+                dropped += entry.len();
+                continue;
+            }
+            if entry.is_dir() {
+                entries.push(Entry { rel: rel.clone(), node: Node::Dir });
+                pending.push((entry.to_dir(), rel));
+            } else {
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry.to_file(), &mut data)
+                    .with_context(|| format!("не удалось прочитать {rel} из {}", src.display()))?;
+                entries.push(Entry { rel, node: Node::File(data) });
+            }
+        }
+    }
+    // Каталог раньше содержимого — как у `collect`: обход выше идёт стеком.
+    entries.sort_by(|a, b| a.rel.cmp(&b.rel));
+    let image = format_image(&entries)?;
+    fs::write(dst, &image).with_context(|| format!("не удалось записать {}", dst.display()))?;
+    Ok(dropped)
+}
+
 /// Рекурсивно читает дерево `initrd/` в плоский список.
 ///
 /// Порядок обхода — «каталог раньше своего содержимого» и по алфавиту внутри

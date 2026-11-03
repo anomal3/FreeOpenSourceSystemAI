@@ -6,6 +6,7 @@ pub mod acpi;
 pub mod boot_mmu;
 pub mod mtk;
 pub mod mtk_i2c;
+pub mod mtk_regs;
 pub mod mtk_spi;
 pub mod mtk_usb;
 pub mod mtk_touch;

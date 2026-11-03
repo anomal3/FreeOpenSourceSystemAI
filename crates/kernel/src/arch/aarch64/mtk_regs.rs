@@ -1,0 +1,307 @@
+//! Регистры MediaTek по кабелю: прочитать и записать слово по физическому
+//! адресу (03.11).
+//!
+//! # Зачем
+//!
+//! Каждый опыт с железом телефона, зашитый в ядро, стоит сборки, прошивки и
+//! двух нажатий питания живым человеком (см. `fastboot.rs`, `oem t`). Батарея,
+//! зарядник и блок связи (Wi-Fi) — это десятки регистров, про которые сначала
+//! надо узнать, что в них лежит после загрузчика. `fastboot oem peek/poke`
+//! делают это на работающем ядре, без перезагрузки; в ядро уходит только то,
+//! что уже проверено так.
+//!
+//! # Чего здесь нельзя
+//!
+//! Только окно периферии SoC (`0x1000_0000..0x2000_0000`) и контроллер
+//! прерываний (`0x0c00_0000..0x0d00_0000`). Память здесь не читается и не
+//! пишется: ошибка в адресе DRAM портит ядро молча, а ошибка в адресе
+//! устройства в худшем случае роняет машину — это видно сразу.
+
+use crate::sync::SpinLock;
+
+/// Окна, в которых адрес считается регистром.
+const WINDOWS: [(u64, u64); 2] = [(0x1000_0000, 0x2000_0000), (0x0c00_0000, 0x0d00_0000)];
+
+/// Уже отображённые страницы: повторное отображение той же страницы ядро
+/// отвергает, а спрашивать один блок будут много раз.
+static MAPPED: SpinLock<([u64; 64], usize)> = SpinLock::new(([0; 64], 0));
+
+/// Лежит ли адрес в окне регистров и выровнен ли на слово.
+#[must_use]
+pub fn allowed(address: u64) -> bool {
+    address % 4 == 0 && WINDOWS.iter().any(|(start, end)| (*start..*end).contains(&address))
+}
+
+/// Отобразить страницу с этим адресом как память устройства (один раз).
+fn map(address: u64) -> bool {
+    let page = address & !0xfff;
+    let mut mapped = MAPPED.lock();
+    let (pages, count) = &mut *mapped;
+    if pages[..*count].contains(&page) {
+        return true;
+    }
+    if !super::mtk_touch::map_device_page(page) {
+        return false;
+    }
+    if *count < pages.len() {
+        pages[*count] = page;
+        *count += 1;
+    }
+    true
+}
+
+/// Прочитать слово регистра. `None` — адрес вне окна или не отобразился.
+#[must_use]
+pub fn read32(address: u64) -> Option<u32> {
+    if !allowed(address) || !map(address) {
+        return None;
+    }
+    // SAFETY: адрес в окне регистров SoC, страница отображена как память
+    // устройства; чтение volatile.
+    Some(unsafe { (address as *const u32).read_volatile() })
+}
+
+/// Записать слово регистра. `false` — адрес вне окна или не отобразился.
+pub fn write32(address: u64, value: u32) -> bool {
+    if !allowed(address) || !map(address) {
+        return false;
+    }
+    // SAFETY: как у [`read32`].
+    unsafe { (address as *mut u32).write_volatile(value) };
+    true
+}
+
+// ---------------------------------------------------------------------------
+// PWRAP — дверь к микросхеме питания MT6357
+// ---------------------------------------------------------------------------
+//
+// Микросхема питания (PMIC) не лежит на шине процессора: к ней ходят через
+// «обёртку» PWRAP, которая превращает запись слова в посылку по своей
+// последовательной линии. Батарея, зарядка, часы и признак «войти в fastboot»
+// живут в PMIC, поэтому без этой двери ни одного из них не достать.
+//
+// Числа — из открытого ядра Xiaomi для этого аппарата
+// (`drivers/misc/mediatek/pmic_wrap/mt6765/pwrap_hal.{h,c}`): канал WACS2,
+// команда `запись<<31 | (адрес>>1)<<16 | данные`, в ответе — данные в младших
+// шестнадцати битах и состояние автомата в битах 18:16. Инициализацию делает
+// загрузчик; ядро Xiaomi её тоже не повторяет, если `INIT_DONE2` уже стоит.
+
+/// Блок PWRAP у MT6765 (`mt6765.dts`, `pwrap@1000d000`).
+const PWRAP: u64 = 0x1000_d000;
+const WACS2_CMD: u64 = PWRAP + 0xc20;
+const WACS2_RDATA: u64 = PWRAP + 0xc24;
+const WACS2_VLDCLR: u64 = PWRAP + 0xc28;
+/// Состояния автомата WACS2 (биты 18:16 ответа).
+const FSM_IDLE: u32 = 0;
+const FSM_WFVLDCLR: u32 = 6;
+/// Бит «обёртка инициализирована» в слове ответа.
+const RDATA_INIT_DONE: u32 = 1 << 22;
+/// Сколько ждать автомат. Посылка к PMIC — микросекунды; миллисекунда
+/// означает «не ответит».
+const PWRAP_TIMEOUT_NS: u64 = 1_000_000;
+
+/// Почему PMIC не ответила.
+#[derive(Clone, Copy, Debug)]
+pub enum PwrapError {
+    /// Окно PWRAP не отобразилось.
+    Unmapped,
+    /// Загрузчик не включил обёртку.
+    NotInitialized,
+    /// Автомат не пришёл в нужное состояние вовремя.
+    Timeout,
+}
+
+static PWRAP_LOCK: SpinLock<()> = SpinLock::new(());
+
+fn fsm(rdata: u32) -> u32 {
+    (rdata >> 16) & 7
+}
+
+/// Дождаться состояния автомата; вернуть последнее прочитанное слово.
+fn wait_fsm(want: u32) -> Result<u32, PwrapError> {
+    let started = crate::time::uptime_ns();
+    loop {
+        let rdata = read32(WACS2_RDATA).ok_or(PwrapError::Unmapped)?;
+        if rdata & RDATA_INIT_DONE == 0 {
+            return Err(PwrapError::NotInitialized);
+        }
+        if fsm(rdata) == want {
+            return Ok(rdata);
+        }
+        // Прошлое чтение не забрали — забрать, иначе автомат не вернётся в
+        // покой никогда (так же делает `wait_for_state_ready_init` у Xiaomi).
+        if want == FSM_IDLE && fsm(rdata) == FSM_WFVLDCLR {
+            write32(WACS2_VLDCLR, 1);
+        }
+        if crate::time::uptime_ns().wrapping_sub(started) >= PWRAP_TIMEOUT_NS {
+            return Err(PwrapError::Timeout);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Прочитать шестнадцатибитный регистр PMIC по его адресу (как в
+/// `upmu_hw.h`: `HWCID` = `0x0008`).
+pub fn pmic_read(address: u16) -> Result<u16, PwrapError> {
+    let _guard = PWRAP_LOCK.lock();
+    wait_fsm(FSM_IDLE)?;
+    write32(WACS2_CMD, (u32::from(address >> 1)) << 16);
+    let rdata = wait_fsm(FSM_WFVLDCLR)?;
+    write32(WACS2_VLDCLR, 1);
+    Ok(rdata as u16)
+}
+
+/// Записать регистр PMIC. Подтверждения у записи нет: следующее обращение
+/// само дождётся, пока автомат освободится.
+pub fn pmic_write(address: u16, value: u16) -> Result<(), PwrapError> {
+    let _guard = PWRAP_LOCK.lock();
+    wait_fsm(FSM_IDLE)?;
+    write32(WACS2_CMD, 1 << 31 | (u32::from(address >> 1)) << 16 | u32::from(value));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Батарея: напряжение, температура, зарядка, ток — АЦП и счётчик MT6357
+// ---------------------------------------------------------------------------
+
+/// Опознание PMIC.
+pub const HWCID: u16 = 0x0008;
+pub const SWCID: u16 = 0x000a;
+/// Запрос измерения АЦП: бит на канал.
+const AUXADC_RQST0: u16 = 0x110e;
+/// Результаты: данные в младших битах, бит 15 — «готово».
+const AUXADC_ADC_BATADC: u16 = 0x10b6;
+const AUXADC_ADC_VCDT: u16 = 0x108c;
+const AUXADC_ADC_BAT_TEMP: u16 = 0x108e;
+const RQST_BATADC: u16 = 1 << 0;
+const RQST_VCDT: u16 = 1 << 2;
+const RQST_BAT_TEMP: u16 = 1 << 3;
+/// Зарядка подключена: `CHR_TOP_CON0`, бит 4 (`RGS_CHRDET`).
+const CHR_TOP_CON0: u16 = 0x0a88;
+/// Батарея на месте: `BATON_ANA_CON0`, бит 1 (`RGS_BATON_UNDET`, ноль — есть).
+const BATON_ANA_CON0: u16 = 0x0e08;
+/// Счётчик заряда: защёлка и текущий ток.
+const FGADC_CON1: u16 = 0x0d0a;
+const FGADC_CUR_CON0: u16 = 0x0d8a;
+
+/// Измерить канал АЦП: запросить, дождаться готовности, вернуть сырое число.
+fn auxadc(request: u16, result: u16, mask: u16) -> Result<u16, PwrapError> {
+    let current = pmic_read(AUXADC_RQST0)?;
+    pmic_write(AUXADC_RQST0, current | request)?;
+    let started = crate::time::uptime_ns();
+    loop {
+        let value = pmic_read(result)?;
+        if value & 0x8000 != 0 {
+            return Ok(value & mask);
+        }
+        // У Xiaomi — до 160 опросов по 100–200 мкс, то есть ~30 мс на
+        // 128 отсчётов канала батареи.
+        if crate::time::uptime_ns().wrapping_sub(started) >= 50_000_000 {
+            return Err(PwrapError::Timeout);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Что известно о батарее сейчас. Сырые числа — рядом с переведёнными:
+/// формулы взяты из ядра Xiaomi, а проверяются они только на аппарате.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Battery {
+    pub hwcid: u16,
+    pub swcid: u16,
+    /// Напряжение батареи: сырое (15 бит) и в мВ (`raw*3*1800 >> 15`).
+    pub vbat_raw: u16,
+    pub vbat_mv: u32,
+    /// Вход зарядки (VCDT, 12 бит, до делителя платы) в мВ.
+    pub vcdt_mv: u32,
+    /// Напряжение на термисторе батареи (12 бит) в мВ.
+    pub temp_mv: u32,
+    pub charger: bool,
+    pub battery_present: bool,
+    /// Ток по счётчику заряда, сырой (дополнительный код) и в десятых мА:
+    /// плюс — заряд, минус — разряд.
+    pub current_raw: u16,
+    pub current_tenth_ma: i32,
+}
+
+/// Снять показания батареи.
+pub fn battery() -> Result<Battery, PwrapError> {
+    let mut info = Battery { hwcid: pmic_read(HWCID)?, swcid: pmic_read(SWCID)?, ..Battery::default() };
+    info.vbat_raw = auxadc(RQST_BATADC, AUXADC_ADC_BATADC, 0x7fff)?;
+    info.vbat_mv = u32::from(info.vbat_raw) * 3 * 1800 >> 15;
+    info.vcdt_mv = u32::from(auxadc(RQST_VCDT, AUXADC_ADC_VCDT, 0x0fff)?) * 1800 >> 12;
+    info.temp_mv = u32::from(auxadc(RQST_BAT_TEMP, AUXADC_ADC_BAT_TEMP, 0x0fff)?) * 1800 >> 12;
+    info.charger = pmic_read(CHR_TOP_CON0)? & (1 << 4) != 0;
+    info.battery_present = pmic_read(BATON_ANA_CON0)? & (1 << 1) == 0;
+    // Защёлкнуть счётчик, прочитать ток, отпустить (`mt6357_gauge.c`).
+    pmic_write(FGADC_CON1, 0x0001)?;
+    let started = crate::time::uptime_ns();
+    while pmic_read(FGADC_CON1)? & 0x8000 == 0 {
+        if crate::time::uptime_ns().wrapping_sub(started) >= 10_000_000 {
+            return Err(PwrapError::Timeout);
+        }
+    }
+    info.current_raw = pmic_read(FGADC_CUR_CON0)?;
+    pmic_write(FGADC_CON1, 0x0008)?;
+    pmic_write(FGADC_CON1, 0x0000)?;
+    let raw = i32::from(info.current_raw as i16);
+    info.current_tenth_ma = (i64::from(raw) * 314_331 / 100_000) as i32;
+    Ok(info)
+}
+
+// ---------------------------------------------------------------------------
+// «Войти в fastboot» — метка в часах PMIC
+// ---------------------------------------------------------------------------
+//
+// Android на `reboot bootloader` ставит бит 13 (`RTC_PDN1_FAST_BOOT`) в
+// регистре часов `RTC_PDN1` и сбрасывает машину сторожевым таймером; LK,
+// увидев бит, открывает fastboot сам. Без этого каждый новый образ стоил
+// человеку зажатого питания (`mtk_rtc_common.c: rtc_mark_fast`).
+
+const RTC_BBPU: u16 = 0x0588;
+const RTC_PDN1: u16 = 0x05b4;
+const RTC_PROT: u16 = 0x05bc;
+const RTC_WRTGR: u16 = 0x05c2;
+const RTC_PDN1_FAST_BOOT: u16 = 1 << 13;
+/// Часы заняты переносом записи: `RTC_BBPU`, бит 6 (`CBUSY`).
+const RTC_CBUSY: u16 = 1 << 6;
+
+/// Перенести записанное в часы и дождаться, пока они закончат.
+fn rtc_commit() -> Result<(), PwrapError> {
+    pmic_write(RTC_WRTGR, 1)?;
+    let started = crate::time::uptime_ns();
+    while pmic_read(RTC_BBPU)? & RTC_CBUSY != 0 {
+        if crate::time::uptime_ns().wrapping_sub(started) >= 500_000_000 {
+            return Err(PwrapError::Timeout);
+        }
+    }
+    Ok(())
+}
+
+/// Поставить метку «следующая загрузка — в fastboot». Возвращает прочитанное
+/// после записи значение `RTC_PDN1`.
+pub fn mark_fastboot() -> Result<u16, PwrapError> {
+    // Снять защиту записи часов (`RTC_PROT`: 0x586A, 0x9136): `rtc_mark_fast`
+    // у Xiaomi этого не делает, но там часы к тому мигу уже открыты — у нас
+    // такой уверенности нет.
+    pmic_write(RTC_PROT, 0x586a)?;
+    rtc_commit()?;
+    pmic_write(RTC_PROT, 0x9136)?;
+    rtc_commit()?;
+    let pdn1 = pmic_read(RTC_PDN1)?;
+    pmic_write(RTC_PDN1, pdn1 | RTC_PDN1_FAST_BOOT)?;
+    rtc_commit()?;
+    pmic_read(RTC_PDN1)
+}
+
+/// Число из текста: `0x…` или без префикса — шестнадцатеричное, как пишут
+/// адреса регистров; десятичное — с префиксом `#`.
+#[must_use]
+pub fn parse_number(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if let Some(decimal) = text.strip_prefix('#') {
+        return decimal.parse().ok();
+    }
+    let hex = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")).unwrap_or(text);
+    u64::from_str_radix(&hex.replace('_', ""), 16).ok()
+}

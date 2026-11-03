@@ -205,6 +205,16 @@ impl Fastboot {
         } else if text == "oem touchdump" {
             self.state = State::Dump { offset: 0 };
             self.continue_dump(0);
+        } else if let Some(rest) = text.strip_prefix("oem peek ") {
+            self.peek(rest);
+        } else if let Some(rest) = text.strip_prefix("oem poke ") {
+            self.poke(rest);
+        } else if let Some(rest) = text.strip_prefix("oem pmicd ") {
+            self.pmic_dump(rest);
+        } else if let Some(rest) = text.strip_prefix("oem pmic ") {
+            self.pmic(rest);
+        } else if text == "oem battery" {
+            self.battery();
         } else if let Some(rest) = text.strip_prefix("oem tap ") {
             self.synth_tap(rest);
         } else if let Some(rest) = text.strip_prefix("oem drag ") {
@@ -271,16 +281,24 @@ impl Fastboot {
             let (at, until) = (klog::oldest(), klog::written());
             self.state = State::Log { at, until };
             self.continue_log(at, until);
-        } else if matches!(
-            text,
-            "reboot" | "reboot-bootloader" | "reboot-fastboot" | "oem reboot"
-        ) {
-            // Загрузчику нельзя сказать «открой fastboot»: это делается записью
-            // в служебный раздел, а памятью мы управлять не умеем. Поэтому
-            // машина уходит в обычную загрузку — оттуда её доводит `adb`. Имена
-            // с «-bootloader» приняты всё равно: человек наберёт привычное, и
-            // отказ на нём читался бы как неисправность, а не как разница между
-            // «перезагружусь» и «перезагружусь именно туда».
+        } else if matches!(text, "reboot-bootloader" | "reboot-fastboot") {
+            // С 03.11 — туда, куда просят: метка `RTC_PDN1_FAST_BOOT` в часах
+            // PMIC (так делает Android на `reboot bootloader`), и LK открывает
+            // fastboot сам, без зажатых кнопок. Не поставилась — отказ, а не
+            // перезагрузка в Android: человек должен знать, что жать придётся.
+            match crate::arch::aarch64::mtk_regs::mark_fastboot() {
+                Ok(pdn1) => {
+                    crate::kprintln!("  fastboot    : next boot into the bootloader, RTC_PDN1 {pdn1:#06x}");
+                    self.reboot_after_reply = true;
+                    self.respond(b"OKAY", "");
+                }
+                Err(err) => {
+                    let text = alloc::format!("cannot mark fastboot in the PMIC clock: {err:?}");
+                    self.respond(b"FAIL", &text);
+                }
+            }
+        } else if matches!(text, "reboot" | "oem reboot") {
+            // Обычная загрузка — в Android.
             self.reboot_after_reply = true;
             self.respond(b"OKAY", "");
         } else {
@@ -680,6 +698,152 @@ impl Fastboot {
             self.state = State::Idle;
             self.respond(b"OKAY", "");
         }
+    }
+
+    /// `oem peek <адрес> [слов]`: слова регистров по четыре в строке (до 32).
+    ///
+    /// Батарея, зарядник и блок связи — десятки регистров, про которые надо
+    /// сначала узнать, что в них оставил загрузчик; спрашивать их прошивкой
+    /// значило бы жать питание на каждый вопрос (см. `mtk_regs`).
+    fn peek(&mut self, args: &str) {
+        use crate::arch::aarch64::mtk_regs;
+        let mut words = args.split_whitespace();
+        let Some(address) = words.next().and_then(mtk_regs::parse_number) else {
+            self.respond(b"FAIL", "usage: oem peek <hex address> [words]");
+            return;
+        };
+        let count = words.next().and_then(mtk_regs::parse_number).unwrap_or(1).clamp(1, 32);
+        self.line_count = 0;
+        for row in 0..count.div_ceil(4) {
+            let at = address + row * 16;
+            let mut text = alloc::format!("{at:08x}:");
+            for column in 0..4u64.min(count - row * 4) {
+                match mtk_regs::read32(at + column * 4) {
+                    Some(value) => text.push_str(&alloc::format!(" {value:08x}")),
+                    None => {
+                        self.say(text.as_bytes());
+                        self.say(b"refused: not a register window or unaligned");
+                        self.state = State::Lines { at: 0 };
+                        self.continue_lines(0);
+                        return;
+                    }
+                }
+            }
+            self.say(text.as_bytes());
+        }
+        self.state = State::Lines { at: 0 };
+        self.continue_lines(0);
+    }
+
+    /// `oem poke <адрес> <значение>`: записать слово и прочитать обратно —
+    /// у многих регистров прочитанное не равно записанному, и это тоже ответ.
+    fn poke(&mut self, args: &str) {
+        use crate::arch::aarch64::mtk_regs;
+        let mut words = args.split_whitespace();
+        let (Some(address), Some(value)) = (
+            words.next().and_then(mtk_regs::parse_number),
+            words.next().and_then(mtk_regs::parse_number),
+        ) else {
+            self.respond(b"FAIL", "usage: oem poke <hex address> <hex value>");
+            return;
+        };
+        let Ok(value) = u32::try_from(value) else {
+            self.respond(b"FAIL", "value does not fit 32 bits");
+            return;
+        };
+        if !mtk_regs::write32(address, value) {
+            self.respond(b"FAIL", "refused: not a register window or unaligned");
+            return;
+        }
+        let back = mtk_regs::read32(address).unwrap_or(0);
+        crate::kprintln!("  regs        : poke {address:#010x} <- {value:#010x}, reads {back:#010x}");
+        self.line_count = 0;
+        self.say(alloc::format!("{address:08x} <- {value:08x}, reads {back:08x}").as_bytes());
+        self.state = State::Lines { at: 0 };
+        self.continue_lines(0);
+    }
+
+    /// `oem pmic <регистр> [значение]`: регистр микросхемы питания через PWRAP.
+    fn pmic(&mut self, args: &str) {
+        use crate::arch::aarch64::mtk_regs;
+        let mut words = args.split_whitespace();
+        let Some(Ok(address)) = words.next().and_then(mtk_regs::parse_number).map(u16::try_from) else {
+            self.respond(b"FAIL", "usage: oem pmic <hex register> [hex value]");
+            return;
+        };
+        let value = words.next().and_then(mtk_regs::parse_number);
+        self.line_count = 0;
+        if let Some(value) = value {
+            let Ok(value) = u16::try_from(value) else {
+                self.respond(b"FAIL", "value does not fit 16 bits");
+                return;
+            };
+            if let Err(err) = mtk_regs::pmic_write(address, value) {
+                self.respond(b"FAIL", &alloc::format!("pwrap: {err:?}"));
+                return;
+            }
+            crate::kprintln!("  pmic        : {address:#06x} <- {value:#06x}");
+        }
+        match mtk_regs::pmic_read(address) {
+            Ok(read) => self.say(alloc::format!("pmic {address:04x} = {read:04x}").as_bytes()),
+            Err(err) => {
+                self.respond(b"FAIL", &alloc::format!("pwrap: {err:?}"));
+                return;
+            }
+        }
+        self.state = State::Lines { at: 0 };
+        self.continue_lines(0);
+    }
+
+    /// `oem pmicd <регистр> [сколько]`: подряд идущие регистры PMIC (шаг 2),
+    /// по четыре в строке, до 32.
+    fn pmic_dump(&mut self, args: &str) {
+        use crate::arch::aarch64::mtk_regs;
+        let mut words = args.split_whitespace();
+        let Some(Ok(address)) = words.next().and_then(mtk_regs::parse_number).map(u16::try_from) else {
+            self.respond(b"FAIL", "usage: oem pmicd <hex register> [count]");
+            return;
+        };
+        let count = words.next().and_then(mtk_regs::parse_number).unwrap_or(8).clamp(1, 32) as u16;
+        self.line_count = 0;
+        for row in 0..count.div_ceil(4) {
+            let at = address.wrapping_add(row * 8);
+            let mut text = alloc::format!("{at:04x}:");
+            for column in 0..4u16.min(count - row * 4) {
+                match mtk_regs::pmic_read(at.wrapping_add(column * 2)) {
+                    Ok(value) => text.push_str(&alloc::format!(" {value:04x}")),
+                    Err(err) => {
+                        text.push_str(&alloc::format!(" {err:?}"));
+                        break;
+                    }
+                }
+            }
+            self.say(text.as_bytes());
+        }
+        self.state = State::Lines { at: 0 };
+        self.continue_lines(0);
+    }
+
+    /// `oem battery`: напряжение, зарядка, термистор, ток — сырые числа рядом
+    /// с переведёнными, чтобы сверять формулы на живом аппарате.
+    fn battery(&mut self) {
+        let info = match crate::arch::aarch64::mtk_regs::battery() {
+            Ok(info) => info,
+            Err(err) => {
+                self.respond(b"FAIL", &alloc::format!("pwrap: {err:?}"));
+                return;
+            }
+        };
+        crate::kprintln!("  battery     : {info:?}");
+        self.line_count = 0;
+        self.say(alloc::format!("pmic hwcid {:04x} swcid {:04x}", info.hwcid, info.swcid).as_bytes());
+        self.say(alloc::format!("vbat {} mV (raw {:04x})", info.vbat_mv, info.vbat_raw).as_bytes());
+        self.say(alloc::format!("battery {}, charger {}", if info.battery_present { "present" } else { "absent" }, if info.charger { "in" } else { "out" }).as_bytes());
+        self.say(alloc::format!("vcdt {} mV, ntc {} mV", info.vcdt_mv, info.temp_mv).as_bytes());
+        let ma = info.current_tenth_ma;
+        self.say(alloc::format!("current {}{}.{} mA (raw {:04x})", if ma < 0 { "-" } else { "" }, ma.abs() / 10, ma.abs() % 10, info.current_raw).as_bytes());
+        self.state = State::Lines { at: 0 };
+        self.continue_lines(0);
     }
 
     /// Сложить строку в ответ. Лишние молча отбрасываются: обрезанный ответ

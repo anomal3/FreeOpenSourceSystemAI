@@ -69,7 +69,7 @@ const DEFAULT_CMDLINE: &str = "bootopt=64S3,32N2,64N2";
 const MAGIC: &[u8; 8] = b"ANDROID!";
 
 /// Что делать: собрать образ или разобрать чужой.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Options {
     /// Версия заголовка. У аппарата на Android 10 и новее — 2; у машин постарше
     /// встречается 0. Загрузчик разбирает ту версию, под которую собран, и
@@ -103,6 +103,8 @@ pub struct Options {
     /// здесь — то, чем наш образ отличается от заводского сильнее всего.
     /// Содержимое не важно, важно, что часть есть и она не пуста.
     pub ramdisk: Option<PathBuf>,
+    /// Облегчить RAM-диск (см. [`LEAN_SKIP`]).
+    pub lean: bool,
     /// Держать аппарат живым после того, как всё сделано, — чтобы экран можно
     /// было разглядеть без спешки.
     pub keepalive: bool,
@@ -140,6 +142,7 @@ impl Default for Options {
             kernel: None,
             gzip: false,
             ramdisk: None,
+            lean: false,
             full_kernel: false,
             probe: false,
             keepalive: false,
@@ -254,6 +257,30 @@ fn trim_volume(mut bytes: Vec<u8>) -> Vec<u8> {
 }
 
 /// Собрать `boot-bare` и завернуть его в загрузочный образ.
+/// Что выбрасывает `--lean`: Mono и .NET с библиотеками классов (две пятых
+/// диска), проверочные программы, которым на телефоне делать нечего, и
+/// крупные необязательные шрифты Блокнота (Inter, JetBrains Mono и DejaVu
+/// Sans/Mono остаются; по умолчанию он пишет встроенным).
+const LEAN_SKIP: &[&str] = &[
+    "bin/mono",
+    "usr/lib/mono",
+    "bin/dotnet",
+    "usr/share/dotnet",
+    "bin/big",
+    "bin/cdraw",
+    "bin/curl",
+    "bin/ctls",
+    "bin/csdl",
+    "usr/share/fonts/dejavu",
+    "usr/share/fonts/fossai/NotoSans.ttf",
+    "usr/share/fonts/fossai/NotoSansMono.ttf",
+    "usr/share/fonts/fossai/DejaVuSerif.ttf",
+    "usr/share/fonts/fossai/FiraCode.ttf",
+    "usr/share/fonts/fossai/Hack-Regular.ttf",
+    "usr/share/fonts/fossai/IBMPlexMono-Regular.ttf",
+    "usr/share/fonts/fossai/SourceCodePro.ttf",
+];
+
 pub fn build(options: &Options) -> Result<PathBuf> {
     let kernel = match &options.kernel {
         Some(path) => {
@@ -269,6 +296,20 @@ pub fn build(options: &Options) -> Result<PathBuf> {
     let out = match &options.out {
         Some(path) => path.clone(),
         None => paths::build_dir().join("bare-boot.img"),
+    };
+
+    // Облегчённый RAM-диск: та же система без Mono и тяжёлых проверочных
+    // программ — полный к ноябрю 54 МиБ при пределе ~25 вместе с ядром.
+    let lean;
+    let options = match (&options.ramdisk, options.lean) {
+        (Some(ramdisk), true) => {
+            let path = paths::build_dir().join("initrd-phone-lean.img");
+            let dropped = crate::initrd::lean_copy(ramdisk, &path, LEAN_SKIP)?;
+            say!("RAM-диск облегчён: {} МиБ выброшено ({})", dropped / (1024 * 1024), LEAN_SKIP.join(", "));
+            lean = Options { ramdisk: Some(path), ..options.clone() };
+            &lean
+        }
+        _ => options,
     };
 
     let image = pack(&kernel, options)?;

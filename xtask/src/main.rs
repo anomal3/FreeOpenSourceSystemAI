@@ -469,6 +469,10 @@ struct PhoneArgs {
     /// Положить в образ RAM-диск — не для нас, а для загрузчика.
     #[arg(long)]
     ramdisk: Option<std::path::PathBuf>,
+    /// Облегчить RAM-диск из `--ramdisk`: без Mono и тяжёлых проверочных
+    /// программ — иначе образ не влезает в предел заводского загрузчика.
+    #[arg(long)]
+    lean: bool,
     /// Держать аппарат живым после работы — чтобы разглядеть экран без спешки.
     #[arg(long)]
     keepalive: bool,
@@ -880,6 +884,7 @@ fn real_main() -> Result<()> {
                 kernel: args.kernel,
                 gzip: args.gzip,
                 ramdisk: args.ramdisk,
+                lean: args.lean,
                 full_kernel: args.full_kernel,
                 probe: args.probe,
                 keepalive: args.keepalive,
