@@ -365,6 +365,8 @@ enum Deed {
     NetStatic,
     /// Включить Wi-Fi (`crate::wifi::enable`, 03.11).
     WifiOn,
+    /// Выключить Wi-Fi (04.11: включить было можно, выключить — нет).
+    WifiOff,
     /// Искать сети заново.
     WifiScan,
     /// Выбрать сеть из списка — под ней поле пароля.
@@ -1160,6 +1162,11 @@ impl SettingsView {
                 crate::wifi::enable();
                 kprintln!("  settings    : wi-fi enable requested");
                 self.report = Some(Report::ok(String::from("Wi-Fi включается — страница обновится сама")));
+            }
+            Deed::WifiOff => {
+                crate::wifi::disable();
+                kprintln!("  settings    : wi-fi disable requested");
+                self.report = Some(Report::ok(String::from("Wi-Fi выключен")));
             }
             Deed::NetDhcp => {
                 self.report = Some(match crate::net::persist::forget() {

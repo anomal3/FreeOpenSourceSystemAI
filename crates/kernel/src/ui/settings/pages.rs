@@ -329,16 +329,18 @@ impl SettingsView {
         let mut y = y;
         if wifi != crate::wifi::State::Absent {
             y = pass.group(x, y, w, "Wi-Fi");
-            let (desc, control, deed) = match wifi {
-                crate::wifi::State::Off => ("Блок связи выключен", Ctl::Button("Включить", Weight::Primary), Some(Deed::WifiOn)),
-                crate::wifi::State::Failed => ("Включить не вышло — подробности ниже", Ctl::Button("Ещё раз", Weight::Primary), Some(Deed::WifiOn)),
-                crate::wifi::State::Starting | crate::wifi::State::FirmwareUp => {
-                    ("Включается: питание, прошивки, процессоры блока…", Ctl::Value("подождите"), None)
-                }
-                crate::wifi::State::Scanning => ("Ищет сети поблизости…", Ctl::Value("поиск"), None),
-                _ => ("Прошивка Wi-Fi запущена", Ctl::Button("Обновить", Weight::Normal), Some(Deed::WifiScan)),
+            // Тумблер — как у телефонов: включён, пока блок не выключен.
+            let (desc, on, deed) = match wifi {
+                crate::wifi::State::Off => ("Выключен", false, Some(Deed::WifiOn)),
+                crate::wifi::State::Failed => ("Включить не вышло — подробности ниже; нажмите ещё раз", false, Some(Deed::WifiOn)),
+                crate::wifi::State::Starting | crate::wifi::State::FirmwareUp => ("Включается: питание, прошивки, процессоры блока…", true, None),
+                crate::wifi::State::Scanning => ("Ищет сети поблизости…", true, None),
+                _ => ("Включён", true, Some(Deed::WifiOff)),
             };
-            y = row(pass, x, y, w, Some(Fi::Globe), "Wi-Fi", desc, control, deed);
+            y = row(pass, x, y, w, Some(Fi::Globe), "Wi-Fi", desc, Ctl::Toggle(on), deed);
+            if wifi == crate::wifi::State::Ready && !crate::wifi::joining() {
+                y = row(pass, x, y, w, Some(Fi::Search), "Искать сети", "Обновить список поблизости", Ctl::Button("Обновить", Weight::Normal), Some(Deed::WifiScan));
+            }
             if wifi == crate::wifi::State::Ready {
                 if crate::wifi::joining() {
                     y = row(pass, x, y, w, Some(Fi::Wifi), "Подключается…", "Аутентификация, ассоциация, обмен ключами WPA2", Ctl::Value(""), None);

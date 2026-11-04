@@ -254,6 +254,23 @@ pub fn enable() {
     }
 }
 
+/// Выключить: связь рвётся, блок связи обесточивается. Во время включения
+/// или поиска — не трогать: там работает своя задача.
+pub fn disable() {
+    if !matches!(state(), State::Ready | State::FirmwareUp | State::Failed) || joining() {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::mtk_wlan::forget();
+        crate::arch::mtk_consys::shut_down();
+    }
+    CONSYS_UP.store(false, Ordering::Relaxed);
+    REPORT.lock().clear();
+    crate::kprintln!("  wifi        : switched off");
+    set(State::Off);
+}
+
 fn bring_up_task() {
     // Блок связи уже запущен (повторное нажатие после сбоя WLAN) — его
     // половину пути не повторять.

@@ -103,6 +103,15 @@ pub fn is_up() -> bool {
     UP.load(Ordering::Relaxed)
 }
 
+/// Выключить блок (Wi-Fi выключили в «Параметрах»): следующее включение
+/// пройдёт весь путь заново.
+pub fn shut_down() {
+    if let Err(err) = power_off() {
+        crate::kprintln!("  consys      : power off failed: {err}");
+    }
+    UP.store(false, Ordering::Relaxed);
+}
+
 /// Выключить домен блока: процессор в сброс, изоляция, такт, питание.
 ///
 /// Нужно перед повторным включением: 03.11 включение поверх работающего

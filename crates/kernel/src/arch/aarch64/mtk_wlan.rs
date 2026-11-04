@@ -701,6 +701,7 @@ fn frame_in(packet: &[u8], fc: u8) -> Option<&[u8]> {
 /// Ждать кадр управления `fc` от точки доступа `bssid`.
 fn wait_mgmt(fc: u8, bssid: &[u8; 6], timeout_ms: u64) -> Option<Vec<u8>> {
     let started = crate::time::uptime_ms();
+    let mut other = 0u32;
     while crate::time::uptime_ms().saturating_sub(started) < timeout_ms {
         let Ok(Some(packet)) = receive(RX_EVENT, 20) else { continue };
         if let Some(frame) = frame_in(&packet, fc) {
@@ -708,6 +709,16 @@ fn wait_mgmt(fc: u8, bssid: &[u8; 6], timeout_ms: u64) -> Option<Vec<u8>> {
                 return Some(frame.to_vec());
             }
         }
+        // Что пришло вместо ответа — в журнал (первые три): так видно,
+        // слышит ли радио эфир вообще.
+        other += 1;
+        if other <= 3 {
+            let kind = packet.get(2..4).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+            crate::kprintln!("  wlan        : not ours: type {kind:#06x}, {} B", packet.len());
+        }
+    }
+    if other > 3 {
+        crate::kprintln!("  wlan        : {other} packets, none from the access point");
     }
     None
 }
@@ -1030,10 +1041,20 @@ fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static st
     sta_rec(&bssid, 0, 0, false)?;
 
     // Аутентификация, открытая система.
+    // До четырёх попыток, как у wpa_supplicant: слабую точку первая часто
+    // не достаёт (04.11, MARK69 — «нет ответа» на одну попытку).
     let mut auth = mgmt_header(0xb0, &bssid);
     auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
-    send_frame(mgmt_txd(auth.len(), 0x0b), &auth)?;
-    let answer = wait_mgmt(0xb0, &bssid, 1000).ok_or("no authentication answer")?;
+    let mut answer = None;
+    for attempt in 0..4 {
+        send_frame(mgmt_txd(auth.len(), 0x0b), &auth)?;
+        answer = wait_mgmt(0xb0, &bssid, 500);
+        if answer.is_some() {
+            break;
+        }
+        crate::kprintln!("  wlan        : no auth answer, attempt {}", attempt + 1);
+    }
+    let answer = answer.ok_or("no authentication answer")?;
     let status = answer.get(28..30).map_or(0xffff, |b| u16::from_le_bytes([b[0], b[1]]));
     note(&mut report, alloc::format!("auth status {status}"));
     if status != 0 {
@@ -1059,8 +1080,15 @@ fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static st
     // (03.11, MARK69 — отказ сразу после успешной аутентификации).
     assoc.extend_from_slice(&HT_CAP_IE);
     assoc.extend_from_slice(&WMM_IE);
-    send_frame(mgmt_txd(assoc.len(), 0x00), &assoc)?;
-    let answer = wait_mgmt(0x10, &bssid, 1000).ok_or("no association answer")?;
+    let mut answer = None;
+    for _ in 0..3 {
+        send_frame(mgmt_txd(assoc.len(), 0x00), &assoc)?;
+        answer = wait_mgmt(0x10, &bssid, 600);
+        if answer.is_some() {
+            break;
+        }
+    }
+    let answer = answer.ok_or("no association answer")?;
     let status = answer.get(26..28).map_or(0xffff, |b| u16::from_le_bytes([b[0], b[1]]));
     let aid = answer.get(28..30).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]) & 0x3fff);
     crate::kprintln!("  wlan        : association status {status}, aid {aid}");
@@ -1179,6 +1207,9 @@ pub fn is_ready() -> bool {
 /// Блок связи выключен — прошивки WLAN больше нет (кольца остаются нашими).
 pub fn forget() {
     READY.store(false, Ordering::Relaxed);
+    ACTIVATED.store(false, Ordering::Relaxed);
+    *CONNECTED.lock() = None;
+    NETWORKS.lock().clear();
 }
 
 /// Весь путь после запущенного блока связи: владение, кольца, прошивка.
