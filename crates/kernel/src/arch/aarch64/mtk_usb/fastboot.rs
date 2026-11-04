@@ -877,6 +877,9 @@ impl Fastboot {
             Some("wmt") => mtk_consys::wmt_init(),
             Some("patch") => mtk_consys::wmt_patch(),
             Some("cal") => mtk_consys::wmt_calibrate(),
+            // Уже работающий блок (Wi-Fi включили в «Параметрах») не
+            // перезапускать: включение начинается с выключения, и связь рвалась.
+            Some("up") if mtk_consys::is_up() => Ok(alloc::vec![alloc::string::String::from("already up")]),
             Some("up") => mtk_consys::bring_up(),
             Some(_) => Err("usage: oem consys [on | load [header bytes] | boot | wmt | up]"),
         };

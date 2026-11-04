@@ -1132,24 +1132,46 @@ fn handshake(ssid: &str, password: &str, bssid: &[u8; 6], rsn_ie: &[u8], group: 
     let msg1 = wpa::parse(&first).ok_or("EAPOL message 1 does not parse")?;
     let mut snonce = [0u8; 32];
     crate::random::fill(&mut snonce);
-    let ptk = wpa::ptk(&pmk, bssid, &OWN_MAC, &msg1.nonce, &snonce);
-
-    // Ответы повторяют версию 802.1X и тип дескриптора точки.
+    // Ответы повторяют версию 802.1X, тип дескриптора и (у старого WPA)
+    // длину ключа из сообщения точки — как wpa_supplicant.
     let (version, descriptor) = (msg1.version, msg1.descriptor);
+    let key_length = if wpa1 { msg1.key_length } else { 0 };
     let mut eapol = [0u8; 256];
     let info2 = wpa::info::VERSION_HMAC_SHA1_AES | wpa::info::PAIRWISE | wpa::info::MIC;
-    // Ключевые данные второго сообщения — ровно тот RSN (WPA IE), что в ассоциации.
-    let len = wpa::build_as(&mut eapol, version, descriptor, info2, &msg1.replay, &snonce, rsn_ie, &ptk.kck);
-    send_eapol(bssid, &eapol[..len])?;
+    // Второе сообщение — на каждое первое: точка повторяет первое, если
+    // наш ответ не дошёл (04.11: TP-Link повторила его четыре раза, а мы
+    // ждали третье). Ключевые данные — ровно тот RSN (WPA IE), что в ассоциации.
+    let mut answer = |msg: &wpa::KeyFrame<'_>| -> Result<wpa::Ptk, &'static str> {
+        let ptk = wpa::ptk(&pmk, bssid, &OWN_MAC, &msg.nonce, &snonce);
+        let len = wpa::build_as(&mut eapol, version, descriptor, key_length, info2, &msg.replay, &snonce, rsn_ie, &ptk.kck);
+        send_eapol(bssid, &eapol[..len])?;
+        Ok(ptk)
+    };
+    let mut ptk = answer(&msg1)?;
     note(&mut report, String::from("eapol 2 sent"));
 
-    let third = wait_key(3000, true).ok_or("no EAPOL message 3 — wrong password?")?;
+    let started = crate::time::uptime_ms();
+    let third = loop {
+        let left = 6000u64.checked_sub(crate::time::uptime_ms().saturating_sub(started)).ok_or("no EAPOL message 3 — wrong password?")?;
+        let Some(frame) = wait_eapol(left.max(1)) else { return Err("no EAPOL message 3 — wrong password?") };
+        let Some(key) = wpa::parse(&frame) else { continue };
+        let pairwise = key.info & wpa::info::PAIRWISE != 0;
+        if pairwise && key.info & wpa::info::MIC == 0 {
+            crate::kprintln!("  wlan        : message 1 again, answering again");
+            ptk = answer(&key)?;
+            continue;
+        }
+        if pairwise {
+            break frame;
+        }
+    };
+    let mut eapol = [0u8; 256];
     if !wpa::verify(&ptk.kck, &third) {
         return Err("EAPOL message 3 MIC mismatch — wrong password");
     }
     let msg3 = wpa::parse(&third).ok_or("EAPOL message 3 does not parse")?;
     if wpa1 {
-        return handshake_wpa1(bssid, &ptk, &msg3.replay, group, version, report);
+        return handshake_wpa1(bssid, &ptk, &msg3.replay, group, version, key_length, report);
     }
     let mut keys = [0u8; 256];
     let plain = wpa::unwrap_key(&ptk.kek, msg3.data, &mut keys).ok_or("group key does not unwrap")?;
@@ -1157,7 +1179,7 @@ fn handshake(ssid: &str, password: &str, bssid: &[u8; 6], rsn_ie: &[u8], group: 
     let gtk = gtk.to_vec();
 
     let info4 = wpa::info::VERSION_HMAC_SHA1_AES | wpa::info::PAIRWISE | wpa::info::MIC | wpa::info::SECURE;
-    let len = wpa::build(&mut eapol, info4, &msg3.replay, &[0; 32], &[], &ptk.kck);
+    let len = wpa::build_as(&mut eapol, version, descriptor, 0, info4, &msg3.replay, &[0; 32], &[], &ptk.kck);
     send_eapol(bssid, &eapol[..len])?;
     note(&mut report, String::from("eapol 4 sent"));
 
@@ -1170,11 +1192,12 @@ fn handshake(ssid: &str, password: &str, bssid: &[u8; 6], rsn_ie: &[u8], group: 
 
 /// Старый WPA: третье сообщение без группового ключа, четвёртое без Secure,
 /// затем групповой обмен — ключ под AES Key Wrap, номер в битах 4–5.
-fn handshake_wpa1(bssid: &[u8; 6], ptk: &wpa::Ptk, replay3: &[u8; 8], group: GroupCipher, version: u8, mut report: Vec<String>) -> Result<Vec<String>, &'static str> {
+#[allow(clippy::too_many_arguments)]
+fn handshake_wpa1(bssid: &[u8; 6], ptk: &wpa::Ptk, replay3: &[u8; 8], group: GroupCipher, version: u8, key_length: u16, mut report: Vec<String>) -> Result<Vec<String>, &'static str> {
     use wpa::info;
     let mut eapol = [0u8; 256];
     let info4 = info::VERSION_HMAC_SHA1_AES | info::PAIRWISE | info::MIC;
-    let len = wpa::build_as(&mut eapol, version, wpa::DESC_WPA, info4, replay3, &[0; 32], &[], &ptk.kck);
+    let len = wpa::build_as(&mut eapol, version, wpa::DESC_WPA, key_length, info4, replay3, &[0; 32], &[], &ptk.kck);
     send_eapol(bssid, &eapol[..len])?;
     note(&mut report, String::from("eapol 4 sent (WPA)"));
     // Личный ключ — сразу: групповое сообщение уже идёт под ним.
@@ -1191,7 +1214,7 @@ fn handshake_wpa1(bssid: &[u8; 6], ptk: &wpa::Ptk, replay3: &[u8; 8], group: Gro
     let gtk = &keys[..plain.min(group.key_len)];
 
     let info2 = info::VERSION_HMAC_SHA1_AES | info::MIC | info::SECURE | (u16::from(gtk_id) << info::KEY_INDEX_SHIFT);
-    let len = wpa::build_as(&mut eapol, version, wpa::DESC_WPA, info2, &msg.replay, &[0; 32], &[], &ptk.kck);
+    let len = wpa::build_as(&mut eapol, version, wpa::DESC_WPA, msg.key_length, info2, &msg.replay, &[0; 32], &[], &ptk.kck);
     send_eapol(bssid, &eapol[..len])?;
     add_key(bssid, false, gtk_id, group.algorithm, gtk)?;
     note(&mut report, alloc::format!("keys installed (WPA, group key {gtk_id})"));

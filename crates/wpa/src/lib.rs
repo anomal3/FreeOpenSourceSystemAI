@@ -154,6 +154,8 @@ pub struct KeyFrame<'a> {
     pub version: u8,
     pub descriptor: u8,
     pub info: u16,
+    /// Длина ключа: старый WPA повторяет её в ответах, RSN ставит ноль.
+    pub key_length: u16,
     pub replay: [u8; 8],
     pub nonce: [u8; 32],
     pub mic: [u8; 16],
@@ -168,7 +170,7 @@ pub fn parse(eapol: &[u8]) -> Option<KeyFrame<'_>> {
     }
     let len = usize::from(u16::from_be_bytes([eapol[DATA_LEN], eapol[DATA_LEN + 1]]));
     let data = eapol.get(DATA..DATA + len)?;
-    let mut frame = KeyFrame { version: eapol[0], descriptor: eapol[4], info: u16::from_be_bytes([eapol[KEY_INFO], eapol[KEY_INFO + 1]]), replay: [0; 8], nonce: [0; 32], mic: [0; 16], data };
+    let mut frame = KeyFrame { version: eapol[0], descriptor: eapol[4], key_length: u16::from_be_bytes([eapol[7], eapol[8]]), info: u16::from_be_bytes([eapol[KEY_INFO], eapol[KEY_INFO + 1]]), replay: [0; 8], nonce: [0; 32], mic: [0; 16], data };
     frame.replay.copy_from_slice(&eapol[REPLAY..REPLAY + 8]);
     frame.nonce.copy_from_slice(&eapol[NONCE..NONCE + 32]);
     frame.mic.copy_from_slice(&eapol[MIC_AT..MIC_AT + 16]);
@@ -191,12 +193,12 @@ pub fn verify(kck: &[u8; 16], eapol: &[u8]) -> bool {
 
 /// Собрать ответ станции (сообщение 2 или 4) с подписью. Возвращает длину.
 pub fn build(out: &mut [u8], info: u16, replay: &[u8; 8], nonce: &[u8; 32], data: &[u8], kck: &[u8; 16]) -> usize {
-    build_as(out, 2, DESC_RSN, info, replay, nonce, data, kck)
+    build_as(out, 2, DESC_RSN, 0, info, replay, nonce, data, kck)
 }
 
 /// То же с версией 802.1X и типом дескриптора — как у точки доступа.
 #[allow(clippy::too_many_arguments)]
-pub fn build_as(out: &mut [u8], version: u8, descriptor: u8, info: u16, replay: &[u8; 8], nonce: &[u8; 32], data: &[u8], kck: &[u8; 16]) -> usize {
+pub fn build_as(out: &mut [u8], version: u8, descriptor: u8, key_length: u16, info: u16, replay: &[u8; 8], nonce: &[u8; 32], data: &[u8], kck: &[u8; 16]) -> usize {
     let len = DATA + data.len();
     out[..len].fill(0);
     out[0] = version;
@@ -204,6 +206,7 @@ pub fn build_as(out: &mut [u8], version: u8, descriptor: u8, info: u16, replay: 
     out[2..4].copy_from_slice(&((len - 4) as u16).to_be_bytes());
     out[4] = descriptor;
     out[KEY_INFO..KEY_INFO + 2].copy_from_slice(&info.to_be_bytes());
+    out[KEY_INFO + 2..KEY_INFO + 4].copy_from_slice(&key_length.to_be_bytes());
     out[REPLAY..REPLAY + 8].copy_from_slice(replay);
     out[NONCE..NONCE + 32].copy_from_slice(nonce);
     out[DATA_LEN..DATA_LEN + 2].copy_from_slice(&(data.len() as u16).to_be_bytes());
@@ -273,10 +276,10 @@ mod tests {
     fn wpa_frame_parses_with_its_descriptor() {
         let kck = [3u8; 16];
         let mut buf = [0u8; 256];
-        let len = build_as(&mut buf, 1, DESC_WPA, info::VERSION_HMAC_SHA1_AES | info::MIC, &[1; 8], &[0; 32], &[], &kck);
+        let len = build_as(&mut buf, 1, DESC_WPA, 16, info::VERSION_HMAC_SHA1_AES | info::MIC, &[1; 8], &[0; 32], &[], &kck);
         assert!(verify(&kck, &buf[..len]));
         let parsed = parse(&buf[..len]).unwrap();
-        assert_eq!((parsed.version, parsed.descriptor), (1, DESC_WPA));
+        assert_eq!((parsed.version, parsed.descriptor, parsed.key_length), (1, DESC_WPA, 16));
     }
 
     #[test]
