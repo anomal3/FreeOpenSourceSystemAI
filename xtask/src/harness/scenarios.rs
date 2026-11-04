@@ -1787,12 +1787,22 @@ pub const ALL: &[Scenario] = &[
             Step::Await("keyboard    : shown", 15_000),
             Step::Wait(1000),
             Step::Shot("06-restored"),
-            // «Пуск» с поиском: свернуть терминал, нажать «Поиск» (со стопкой в
-            // доке это плитка с лупой), набрать «pk» клавишами экранной
-            // клавиатуры и ↵ — открывается первое найденное.
-            Step::Aim(Aim::Point(570, 164)),
-            Step::Click,
+            // Домой — жестом (04.11, как у iPhone): палец у самого низа, под
+            // клавиатурой (полоска жеста 1560..1600), ведут вверх и отпускают.
+            // Окно уходит в стопку тем же полётом, что и кнопкой.
+            Step::Aim(Aim::Point(360, 1590)),
+            Step::Press,
+            Step::Aim(Aim::Point(360, 1520)),
+            Step::Aim(Aim::Point(360, 1440)),
+            Step::Release,
+            Step::Await("desktop     : minimized 'Terminal'", 15_000),
+            Step::Await("desktop     : home gesture, 1 app(s) minimized", 15_000),
             Step::Await("desktop     : minimize flight of 'Terminal': ", 15_000),
+            Step::Wait(1000),
+            Step::Shot("06b-home-gesture"),
+            // «Пуск» с поиском: нажать «Поиск» (со стопкой в доке это плитка с
+            // лупой), набрать «pk» клавишами экранной клавиатуры и ↵ —
+            // открывается первое найденное.
             Step::Wait(1000),
             Step::Aim(Aim::Point(508, 1495)),
             Step::Click,
@@ -1829,6 +1839,43 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Point(80, 264)),
             Step::Click,
             Step::Await("settings    : back to the list", 15_000),
+            // Жест вбок по полоске (04.11): вправо — к программе, ушедшей с
+            // экрана последней (терминал), влево — обратно. Без полёта и без
+            // дока между ними; клавиатура приходит и уходит с терминалом.
+            Step::Aim(Aim::Point(200, 1585)),
+            Step::Press,
+            Step::Aim(Aim::Point(300, 1585)),
+            Step::Aim(Aim::Point(420, 1585)),
+            Step::Release,
+            Step::Await("desktop     : switched back from 'Settings' to 'Terminal'", 15_000),
+            Step::Await("keyboard    : shown", 15_000),
+            Step::Wait(1000),
+            Step::Shot("08d-switched"),
+            Step::Aim(Aim::Point(520, 1590)),
+            Step::Press,
+            Step::Aim(Aim::Point(420, 1590)),
+            Step::Aim(Aim::Point(300, 1590)),
+            Step::Release,
+            Step::Await("desktop     : switched forward from 'Terminal' to 'Settings'", 15_000),
+            Step::Await("keyboard    : hidden", 15_000),
+            // Вверх и задержать — переключатель программ: «Параметры» уходят в
+            // стопку, над доком лист с обеими программами (первыми — ушедшие
+            // последними). Нажатие на карточку «Параметров» возвращает их.
+            Step::Aim(Aim::Point(360, 1590)),
+            Step::Press,
+            Step::Aim(Aim::Point(360, 1520)),
+            Step::Aim(Aim::Point(360, 1460)),
+            Step::Wait(900),
+            Step::Await("desktop     : gesture swipe up and hold", 15_000),
+            Step::Await("desktop     : app switcher opened with 2 app(s)", 15_000),
+            Step::Release,
+            Step::Wait(1000),
+            Step::Shot("08e-switcher"),
+            Step::Aim(Aim::Point(300, 996)),
+            Step::Click,
+            Step::Await("desktop     : restored 'Settings'", 15_000),
+            Step::Await("desktop     : restore flight of 'Settings': ", 15_000),
+            Step::Wait(800),
             Step::Aim(Aim::Point(642, 164)),
             Step::Click,
             Step::Await("desktop     : closed 'Settings'", 15_000),
@@ -1857,8 +1904,32 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Point(277, 941)),
             Step::Click,
             Step::Await("desktop     : started '/bin/dotnet /usr/share/dotnet/samples/gallery.dll'", 15_000),
-            Step::Wait(30_000),
+            // Ждётся окно, а не полминуты: через 20 с без ввода сеанс
+            // кончается, и жесты ниже было бы уже некому разбирать.
+            Step::Await("dotnet: window '", 60_000),
+            Step::Await("desktop     : open zoom of 'Program': ", 15_000),
+            Step::Wait(1500),
             Step::Shot("11-gallery"),
+            // Вверх выше двух пятых экрана — переключатель сразу, без
+            // задержки. Карточку витрины смахивают вверх — программа
+            // закрывается.
+            Step::Aim(Aim::Point(360, 1590)),
+            Step::Press,
+            Step::Aim(Aim::Point(360, 1200)),
+            Step::Aim(Aim::Point(360, 800)),
+            Step::Release,
+            Step::Await("desktop     : gesture swipe up past the switcher line", 15_000),
+            Step::Await("desktop     : app switcher opened with 2 app(s)", 15_000),
+            Step::Wait(1000),
+            Step::Shot("12-switcher-gallery"),
+            Step::Aim(Aim::Point(300, 996)),
+            Step::Press,
+            Step::Aim(Aim::Point(300, 900)),
+            Step::Aim(Aim::Point(300, 800)),
+            Step::Release,
+            Step::Await("swiped away", 15_000),
+            Step::Wait(2000),
+            Step::Shot("13-card-closed"),
         ],
     },
     Scenario {

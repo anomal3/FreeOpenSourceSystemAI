@@ -64,12 +64,19 @@ const ABOVE_BOTTOM: u32 = 100;
 /// с программой, пока окно свёрнуто», который человек задаёт первым.
 const NOTE: &str = "Свёрнутое окно не перерисовывается: задача остаётся в памяти, но композитор её не опрашивает.";
 
+/// То же место в переключателе программ (жест «вверх и задержать», 04.11):
+/// там человек пришёл выбирать, и ему нужно знать, как.
+const SWITCH_NOTE: &str = "Нажмите на карточку, чтобы открыть программу; смахните её вверх, чтобы закрыть.";
+
 pub struct Sheet {
     surface: Surface,
     pub rect: Rect,
     scale: u32,
     rows: Vec<(Rect, Rect, App)>,
     restore_all: Rect,
+    /// Переключатель программ, а не лист свёрнутых: другие заголовок и
+    /// пояснение, строки те же.
+    switcher: bool,
 }
 
 fn bg() -> Color {
@@ -79,8 +86,9 @@ fn bg() -> Color {
 
 impl Sheet {
     /// Собрать лист над доком. `None` — строк нет или не хватило памяти.
+    /// `switcher` — это переключатель программ (жест полоски, 04.11).
     #[must_use]
-    pub fn open(screen_w: u32, screen_h: u32, scale: u32, rows: &[Row]) -> Option<Self> {
+    pub fn open(screen_w: u32, screen_h: u32, scale: u32, rows: &[Row], switcher: bool) -> Option<Self> {
         if rows.is_empty() {
             return None;
         }
@@ -100,6 +108,7 @@ impl Sheet {
             scale,
             rows: Vec::new(),
             restore_all: Rect::EMPTY,
+            switcher,
         };
         sheet.draw(rows);
         Some(sheet)
@@ -147,7 +156,7 @@ impl Sheet {
 
         // Заголовок: имя, счётчик, «Развернуть все».
         let header = Rect::new(pad + ctx.px(4) as i32, y, inner_w.saturating_sub(ctx.px(8)), ctx.px(HEADER_H));
-        let title = "Свёрнутые программы";
+        let title = if self.switcher { "Открытые программы" } else { "Свёрнутые программы" };
         let title_w = paint::text(ctx, &mut self.surface, Role::Title, header.x, paint::baseline(ctx, Role::Title, header), title, p.ink);
         let count = alloc::format!("{}", rows.len());
         let mono = ctx.face(Role::MonoSmall);
@@ -251,7 +260,8 @@ impl Sheet {
         let area = note.shrink(ctx.px(12));
         let caption = ctx.face(Role::Caption);
         let mut line_y = area.y;
-        for line in wrap_px(NOTE, area.w, |text| caption.width(text)) {
+        let text = if self.switcher { SWITCH_NOTE } else { NOTE };
+        for line in wrap_px(text, area.w, |text| caption.width(text)) {
             paint::text(ctx, &mut self.surface, Role::Caption, area.x, line_y, line, p.ink4);
             line_y += i32::from(caption.line);
         }

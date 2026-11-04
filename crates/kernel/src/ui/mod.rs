@@ -54,6 +54,7 @@ pub mod pointer;
 pub mod prefs;
 pub mod settings;
 pub mod flight;
+pub mod gesture;
 pub mod home;
 pub mod keyboard;
 pub mod shade;
@@ -497,6 +498,129 @@ pub fn check_icon_hold(desktop: &mut Compositor) {
     kprintln!("  desktop     : icon lifted by a long press");
 }
 
+/// Палец на полоске жеста телефона (04.11, см. [`gesture`]): от нажатия у
+/// низа экрана до отпускания.
+static SWIPE: SpinLock<Option<gesture::Swipe>> = SpinLock::new(None);
+
+/// Палец на карточке переключателя (или строке листа свёрнутых): отпустили на
+/// месте — открыть программу, увели вверх — закрыть. Программа и `y` нажатия.
+static CARD: SpinLock<Option<(App, i32)>> = SpinLock::new(None);
+
+/// Ждут ли задержку пальца на полоске — стол тогда будит себя кадрами.
+pub fn gesture_holding() -> bool {
+    SWIPE.lock().is_some_and(|swipe| !swipe.done && swipe.rise() > 0)
+}
+
+/// Шаг `tick`: поднятый палец простоял [`gesture::HOLD_MS`] — переключатель.
+fn check_gesture_hold(desktop: &mut Compositor, status: &Status) {
+    let now = crate::time::uptime_ms();
+    let held = {
+        let mut swipe = SWIPE.lock();
+        match swipe.as_mut() {
+            Some(state) if state.held(now, desktop.scale()) => {
+                state.done = true;
+                true
+            }
+            _ => false,
+        }
+    };
+    if held {
+        kprintln!("  desktop     : gesture swipe up and hold");
+        open_switcher(desktop, status);
+    }
+}
+
+/// Домой: всё, что на экране, уходит в стопку дока полётом. Сворачивается
+/// снизу вверх, чтобы видимый полёт достался верхнему окну — тому, что
+/// человек и видел.
+fn go_home(desktop: &mut Compositor, status: &Status) -> usize {
+    let mut count = 0;
+    for app in desktop.front_apps() {
+        let name = name_of(desktop, app);
+        if desktop.minimize(app) {
+            kprintln!("  desktop     : minimized '{name}'");
+            count += 1;
+        }
+    }
+    log_focus(desktop);
+    desktop.refresh_panel(status);
+    count
+}
+
+/// Переключатель программ: программа на экране уходит в стопку, над доком
+/// встаёт лист со всеми открытыми.
+fn open_switcher(desktop: &mut Compositor, status: &Status) {
+    go_home(desktop, status);
+    let count = desktop.open_switcher();
+    if count > 0 {
+        kprintln!("  desktop     : app switcher opened with {count} app(s)");
+    }
+    desktop.refresh_panel(status);
+    desktop.present();
+}
+
+/// Жест вбок: соседняя программа встаёт на место той, что на экране.
+/// `previous` — вправо, к программе, ушедшей с экрана последней; влево — к
+/// самой давней, так листание идёт по кругу.
+fn switch_app(desktop: &mut Compositor, previous: bool, status: &Status) {
+    let Some(from) = desktop.front_apps().last().copied() else {
+        return;
+    };
+    let others = desktop.recent_minimized();
+    let to = if previous { others.first() } else { others.last() };
+    let Some(&to) = to else {
+        kprintln!("  desktop     : no other app to switch to");
+        return;
+    };
+    let (from_name, to_name) = (name_of(desktop, from), name_of(desktop, to));
+    if desktop.switch_to(from, to) {
+        kprintln!(
+            "  desktop     : switched {} from '{from_name}' to '{to_name}'",
+            if previous { "back" } else { "forward" }
+        );
+        log_focus(desktop);
+    }
+    desktop.refresh_panel(status);
+}
+
+/// Палец отпустили после жеста по полоске.
+fn gesture_end(desktop: &mut Compositor, swipe: gesture::Swipe, status: &Status) {
+    match swipe.outcome(desktop.screen_height(), desktop.scale()) {
+        gesture::Outcome::Home => {
+            let count = go_home(desktop, status);
+            kprintln!("  desktop     : home gesture, {count} app(s) minimized");
+        }
+        gesture::Outcome::Switcher => {
+            kprintln!("  desktop     : gesture swipe up past the switcher line");
+            open_switcher(desktop, status);
+        }
+        gesture::Outcome::Previous => switch_app(desktop, true, status),
+        gesture::Outcome::Next => switch_app(desktop, false, status),
+        gesture::Outcome::Nothing => {}
+    }
+}
+
+/// Отпустили карточку переключателя: на месте — открыть, увели вверх —
+/// закрыть программу.
+fn card_end(desktop: &mut Compositor, app: App, y0: i32, y: i32, status: &Status) {
+    desktop.close_tray();
+    let rise = mini_ui::paint::Ctx::scaled(desktop.scale()).px(gesture::CARD_RISE) as i32;
+    if y0 - y >= rise {
+        let name = name_of(desktop, app);
+        kprintln!("  desktop     : card of '{name}' swiped away");
+        if request_close(desktop, app) {
+            kprintln!("  desktop     : close requested of '{name}'");
+        } else if desktop.close(app) {
+            kprintln!("  desktop     : closed '{name}'");
+        }
+        log_focus(desktop);
+    } else {
+        launch(desktop, app);
+    }
+    desktop.refresh_panel(status);
+    desktop.present();
+}
+
 /// Последний щелчок был по столу (значку или пустому месту), а не по окну:
 /// F2 тогда переименовывает значок.
 static DESK_FOCUS: AtomicBool = AtomicBool::new(false);
@@ -894,7 +1018,9 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
     let work = desktop.work_bottom().max(1) as u32;
     let margin = width / 24;
 
-    // На телефоне окно занимает экран целиком — от строки состояния до дока.
+    // На телефоне окно занимает экран целиком — от строки состояния до
+    // полоски жеста у низа (04.11, как у iPhone): дока под программой нет,
+    // домой уводит жест (см. [`gesture`]).
     //
     // Не «так красивее»: окно в половину экрана на телефоне нельзя ни читать,
     // ни двигать. Двигать нечем — пальцем за полосу заголовка шириной в палец
@@ -905,7 +1031,8 @@ fn layout(desktop: &Compositor, app: App) -> Rect {
         let top = ctx.px(theme::M_STATUS_H + theme::M_INSET) as i32;
         let inset = ctx.px(theme::M_INSET);
         let w = width.saturating_sub(inset * 2).max(1);
-        let h = (work - top.max(0) as u32).max(1);
+        let work = desktop.app_bottom().max(1) as u32;
+        let h = work.saturating_sub(top.max(0) as u32).max(1);
         return Rect::new(inset as i32, top, w, h);
     }
 
@@ -1668,6 +1795,7 @@ pub fn tick() {
             change_mode(desktop, ((request >> 32) as u32, request as u32), &status);
         }
         desktop.refresh_panel(&status);
+        check_gesture_hold(desktop, &status);
         desktop.reload_icons_if_packages_changed();
         desktop.expire_toast();
         desktop.refresh_lock_clock();
@@ -2282,6 +2410,10 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         desktop.keyboard_stroke_to(x, y);
     }
     if (dx != 0 || dy != 0) && event.buttons.contains(Buttons::LEFT) {
+        // Палец ведут по полоске жеста — запомнить, где он и когда сдвинулся.
+        if let Some(swipe) = SWIPE.lock().as_mut() {
+            swipe.move_to(x, y, crate::time::uptime_ms());
+        }
         icon_gesture_to(desktop, x, y);
         if VOLUME_DRAG.load(Ordering::Relaxed) {
             drag_volume(desktop, x, status);
@@ -2470,6 +2602,17 @@ fn pointer_on(desktop: &mut Compositor, event: PointerEvent, status: &Status) {
         release_pointer(desktop, x, y, 2, status);
     }
     if event.released(Buttons::LEFT) {
+        // Жест по полоске и карточка переключателя — раньше прочего: нажатие,
+        // с которого они начались, дальше никуда не ходило.
+        let swipe = SWIPE.lock().take();
+        if let Some(mut swipe) = swipe {
+            swipe.move_to(x, y, crate::time::uptime_ms());
+            gesture_end(desktop, swipe, status);
+        }
+        let card = CARD.lock().take();
+        if let Some((app, y0)) = card {
+            card_end(desktop, app, y0, y, status);
+        }
         icon_gesture_end(desktop);
         SHADE_PULL.store(0, Ordering::Relaxed);
         *CONTENT_DRAG.lock() = None;
@@ -2788,6 +2931,12 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
     // то, что под ним.
     if desktop.tray_open() {
         match desktop.tray_hit(x, y) {
+            // Строка — карточка (04.11): что с ней делать, решает отпускание
+            // — на месте открыть, вверх смахнуть и закрыть (см. [`card_end`]).
+            Some(tray::Hit::Restore(app)) if theme::is_mobile() => {
+                *CARD.lock() = Some((app, y));
+                return;
+            }
             Some(tray::Hit::Restore(app)) => {
                 desktop.close_tray();
                 launch(desktop, app);
@@ -2816,6 +2965,19 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         }
         desktop.refresh_panel(status);
         desktop.present();
+        return;
+    }
+
+    // 0а-жест. Полоска жеста под программой телефона (04.11): нажатие у самого
+    // низа — начало жеста, и дальше не идёт; итог решает отпускание (см.
+    // [`gesture_end`]) или задержка пальца ([`check_gesture_hold`]). Раньше
+    // клавиатуры: её поле у низа — не клавиша, а полоса жеста под ней.
+    if desktop.app_in_front()
+        && !desktop.locked()
+        && gesture::in_zone(y, desktop.screen_height(), desktop.scale())
+    {
+        *SWIPE.lock() = Some(gesture::Swipe::new(x, y, crate::time::uptime_ms()));
+        *CONTENT_DRAG.lock() = None;
         return;
     }
 
@@ -4721,7 +4883,7 @@ pub fn open_window_framed(task: u32, slot: u32, title: &str, pixels: Surface, fr
         // отдавать ей окно, в котором её же рисунок наполовину под заголовком.
         let full_h = if framed { h.saturating_add(Window::title_height(scale)) } else { h };
         let screen = desktop.screen_width();
-        let work = desktop.work_bottom().max(1) as u32;
+        let work = desktop.app_bottom().max(1) as u32;
         let rect = Rect::new(
             ((screen.saturating_sub(w)) / 2) as i32,
             ((work.saturating_sub(full_h)) / 2) as i32,

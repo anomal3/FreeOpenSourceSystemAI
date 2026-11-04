@@ -179,6 +179,9 @@ pub struct Compositor {
     under_dirty: Rect,
     /// Текст часов, который нарисован в строке состояния.
     status_text: alloc::string::String,
+    /// Что внизу экрана телефона нарисовано последним: `true` — полоска
+    /// жеста (на экране программа), `false` — док (см. [`Self::app_in_front`]).
+    front_shown: bool,
     /// Окно, которое сейчас тащат за заголовок.
     ///
     /// Программа, а не индекс: порядок окон меняется при поднятии, и индекс,
@@ -332,6 +335,7 @@ impl Compositor {
             under_valid: false,
             under_dirty: Rect::EMPTY,
             status_text: alloc::string::String::new(),
+            front_shown: false,
             drag: None,
             drag_from: (0, 0),
             drag_resizes: false,
@@ -390,6 +394,80 @@ impl Compositor {
             Some(panel) => panel.rect.y,
             None => self.screen.height() as i32,
         }
+    }
+
+    /// Нижняя граница окон: на телефоне — над полоской жеста (окно во весь
+    /// экран, дока под ним нет, 04.11), на ПК — та же [`Self::work_bottom`].
+    pub fn app_bottom(&self) -> i32 {
+        if theme::is_mobile() && self.panel.is_some() {
+            self.screen.height() as i32 - super::gesture::bar_height(self.scale) as i32
+        } else {
+            self.work_bottom()
+        }
+    }
+
+    /// Программа на экране телефона: тогда внизу полоска жеста, а не док.
+    ///
+    /// Всплывающие окна не в счёт — они часть формы. Свёрнутое окно в полёте к
+    /// стопке уже свёрнуто, и док появляется в начале полёта: стопке есть куда
+    /// принять окно. Разворачиваемое — наоборот, в конце.
+    #[must_use]
+    pub fn app_in_front(&self) -> bool {
+        theme::is_mobile() && self.windows.iter().any(|window| !window.minimized && !window.popup)
+    }
+
+    /// Окна на экране (не свёрнутые и не всплывающие), снизу вверх.
+    #[must_use]
+    pub fn front_apps(&self) -> Vec<App> {
+        self.windows.iter().filter(|window| !window.minimized && !window.popup).map(|window| window.app).collect()
+    }
+
+    /// Свёрнутые окна, начиная со свёрнутого последним.
+    #[must_use]
+    pub fn recent_minimized(&self) -> Vec<App> {
+        let mut minimized: Vec<&Window> =
+            self.windows.iter().filter(|window| window.minimized && !window.popup).collect();
+        minimized.sort_by(|a, b| b.minimized_at_ms.cmp(&a.minimized_at_ms));
+        minimized.into_iter().map(|window| window.app).collect()
+    }
+
+    /// Сменить программу на экране без полёта: `from` уходит в стопку,
+    /// `to` встаёт на его место (жест вбок по полоске, 04.11).
+    ///
+    /// Без полёта намеренно: полёт в стопку и обратно показал бы док между
+    /// ними, а человек листает программы и дока не звал.
+    pub fn switch_to(&mut self, from: App, to: App) -> bool {
+        self.finish_flight();
+        let now = crate::time::uptime_ms();
+        if let Some(window) = self.find(from).filter(|window| !window.minimized) {
+            window.minimized = true;
+            window.minimized_at_ms = now;
+        }
+        let Some(index) = self.index_of(to) else {
+            return false;
+        };
+        let Some(window) = self.windows.get_mut(index) else {
+            return false;
+        };
+        window.minimized = false;
+        window.damage = Rect::new(0, 0, window.rect.w, window.rect.h);
+        self.raise(index);
+        self.invalidate_recent();
+        self.refresh_decorations();
+        self.mark(self.screen.bounds());
+        true
+    }
+
+    /// Док или полоска жеста — по тому, есть ли на экране программа.
+    /// Сменилось — пометить низ экрана.
+    fn sync_front(&mut self) {
+        let front = self.app_in_front();
+        if front == self.front_shown {
+            return;
+        }
+        self.front_shown = front;
+        let top = self.work_bottom().max(0);
+        self.mark(Rect::new(0, top, self.screen.width(), self.screen.height().saturating_sub(top as u32)));
     }
 
     pub const fn screen_width(&self) -> u32 {
@@ -941,7 +1019,7 @@ impl Compositor {
     /// Сдвинуть активное окно.
     pub fn move_focused(&mut self, dx: i32, dy: i32) {
         let width = self.screen.width();
-        let bottom = self.work_bottom();
+        let bottom = self.app_bottom();
         let Some(window) = self.windows.get_mut(self.focus) else {
             return;
         };
@@ -1391,7 +1469,8 @@ impl Compositor {
     #[must_use]
     pub fn panel_at(&self, x: i32, y: i32) -> Option<PanelHit> {
         // Под открытой клавиатурой дока нет — он спрятан, и нажимать его нельзя.
-        if self.keyboard_visible() {
+        // И под программой на телефоне: вместо дока там полоска жеста (04.11).
+        if self.keyboard_visible() || self.app_in_front() {
             return None;
         }
         let panel = self.panel.as_ref()?;
@@ -1465,7 +1544,7 @@ impl Compositor {
             return;
         };
         let width = self.screen.width();
-        let bottom = self.work_bottom();
+        let bottom = self.app_bottom();
         if self.drag_resizes {
             // Размер не меняется здесь, а запоминается: см. [`Self::pending_size`]
             // и [`Self::apply_pending_size`].
@@ -1588,7 +1667,7 @@ impl Compositor {
             return false;
         };
         let width = self.screen.width();
-        let bottom = self.work_bottom();
+        let bottom = self.app_bottom();
         let Some(window) = self.windows.get_mut(index) else {
             return false;
         };
@@ -2127,6 +2206,19 @@ impl Compositor {
             self.mark_layer(sheet.rect);
             return false;
         }
+        self.open_tray(false)
+    }
+
+    /// Открыть переключатель программ — тот же лист, другие слова (жест
+    /// полоски, 04.11). Окна к этому мигу уже свёрнуты. Сколько в нём строк;
+    /// ноль — не открылся.
+    pub fn open_switcher(&mut self) -> usize {
+        self.close_tray();
+        if self.open_tray(true) { self.recent_minimized().len() } else { 0 }
+    }
+
+    /// Собрать лист свёрнутых окон.
+    fn open_tray(&mut self, switcher: bool) -> bool {
         let now = crate::time::uptime_ms();
         let mut minimized: Vec<&Window> = self.windows.iter().filter(|window| window.minimized).collect();
         minimized.sort_by(|a, b| b.minimized_at_ms.cmp(&a.minimized_at_ms));
@@ -2148,7 +2240,7 @@ impl Compositor {
                 age: tray::age_text(now.saturating_sub(window.minimized_at_ms)),
             })
             .collect();
-        self.tray = Sheet::open(self.screen.width(), self.screen.height(), self.scale, &rows);
+        self.tray = Sheet::open(self.screen.width(), self.screen.height(), self.scale, &rows, switcher);
         match self.tray.as_ref() {
             Some(sheet) => {
                 let rect = sheet.rect;
@@ -2295,7 +2387,7 @@ impl Compositor {
         let bottom = if want {
             rect.y - mini_ui::paint::Ctx::scaled(self.scale).px(keyboard::GAP) as i32
         } else {
-            self.work_bottom()
+            self.app_bottom()
         };
         if let Some(index) = self.index_of(App::Terminal) {
             if let Some(window) = self.windows.get_mut(index).filter(|window| !window.minimized) {
@@ -2340,7 +2432,7 @@ impl Compositor {
             return;
         };
         let width = self.screen.width();
-        let bottom = self.work_bottom();
+        let bottom = self.app_bottom();
         let edges = self.resize_edges;
         let Some(index) = self.index_of(app) else {
             return;
@@ -2969,7 +3061,7 @@ impl Compositor {
     /// Окно, которому после этого не хватило рабочей области, поджимается к
     /// её низу: заголовок вырос, и нижняя кромка иначе ушла бы под панель.
     pub fn retitle_all(&mut self, status: &Status) {
-        let bottom = self.work_bottom();
+        let bottom = self.app_bottom();
         for window in self.windows.iter_mut() {
             window.retitle();
             let overflow = window.rect.bottom() - bottom;
@@ -3027,6 +3119,7 @@ impl Compositor {
         let bottom = self.work_bottom();
         self.icons.set_area(bottom);
         self.icons.reload();
+        let bottom = self.app_bottom();
         for window in self.windows.iter_mut() {
             let fit_w = window.rect.w.min(width);
             let fit_h = window.rect.h.min(bottom.max(1) as u32);
@@ -3151,7 +3244,12 @@ impl Compositor {
             self.mark(was);
         }
         super::check_icon_hold(self);
-        super::set_animating(self.flight.is_some() || trail || spinning || shade_moving || super::icon_holding());
+        self.sync_front();
+        // Палец держат на полоске жеста — задержку считает `ui::tick`, и
+        // будить его надо кадрами, как и долгое нажатие на значок.
+        super::set_animating(
+            self.flight.is_some() || trail || spinning || shade_moving || super::icon_holding() || super::gesture_holding(),
+        );
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
             return;
@@ -3408,7 +3506,17 @@ impl Compositor {
             }
             _ => false,
         };
-        if let Some(panel) = self.panel.as_ref().filter(|_| !keyboard_up) {
+        // Программа на экране телефона — вместо дока полоска жеста (04.11):
+        // светлая пилюля у самого низа, под клавиатурой, если та открыта.
+        let front = self.app_in_front();
+        if front {
+            let pill = super::gesture::pill(self.screen.width(), self.screen.height(), self.scale);
+            if !pill.intersect(&band).is_empty() {
+                let ink = theme::palette().ink;
+                draw::rounded(back, pill.translate(0, dy), pill.h / 2, ink, 220);
+            }
+        }
+        if let Some(panel) = self.panel.as_ref().filter(|_| !keyboard_up && !front) {
             // Полосы, которых док не задевает, отсекаются здесь, до всякой
             // работы. `stack` проверяет то же самое, но уже внутри — а нам
             // нужно знать, сколько раз он вызывается вхолостую: счётчик
