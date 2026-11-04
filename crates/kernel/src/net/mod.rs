@@ -613,6 +613,8 @@ pub fn configure_all(
     dns: Ipv4,
 ) -> Result<(), NetError> {
     configure(address, netmask, gateway)?;
+    // В журнал ядра: на телефоне адрес от DHCP видно только по кабелю.
+    crate::kprintln!("  network     : address {address}, gateway {gateway}, dns {dns}");
     if !dns.is_unspecified() {
         let mut guard = INTERFACE.lock();
         guard.as_mut().ok_or(NetError::NoDevice)?.dns = dns;

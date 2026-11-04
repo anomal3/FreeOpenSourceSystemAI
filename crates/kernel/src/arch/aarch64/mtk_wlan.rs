@@ -899,6 +899,21 @@ fn add_key(peer: &[u8; 6], pairwise: bool, key_id: u8, algorithm: u8, key: &[u8]
     Ok(())
 }
 
+/// Снять ключи прошлого сеанса (тот же CID 0x07, «убрать»): с ними в
+/// прошивке второе сообщение обмена уходило зашифрованным старым ключом, и
+/// точка его не понимала (04.11 — повторное подключение без перезагрузки).
+fn remove_keys(peer: &[u8; 6]) {
+    for (pairwise, key_id) in [(true, 0u8), (false, 1), (false, 2)] {
+        let mut cmd = [0u8; 64];
+        cmd[1] = u8::from(pairwise);
+        cmd[2] = u8::from(pairwise);
+        cmd[4..10].copy_from_slice(peer);
+        cmd[12] = key_id;
+        cmd[14] = if pairwise { AP_WLAN } else { BMC_WLAN };
+        let _ = wifi_command(0x07, true, &cmd);
+    }
+}
+
 /// Строка отчёта подключения — и в журнал: при ошибке отчёт не доходит до
 /// «Параметров», а шаг, на котором встали, нужен.
 fn note(report: &mut Vec<String>, line: String) {
@@ -980,7 +995,7 @@ fn station_wpa(ap: &[u8]) -> Result<(Vec<u8>, GroupCipher), &'static str> {
 /// одна — пробуем следующую.
 pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> {
     let _busy = Busy::take();
-    *CONNECTED.lock() = None;
+    disconnect();
     let mut candidates: Vec<Network> = networks().into_iter().filter(|net| net.ssid == ssid).collect();
     // Сначала точки с RSN (WPA2), потом со старым WPA.
     candidates.sort_by_key(|net| net.rsn.is_empty());
@@ -1038,6 +1053,8 @@ fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static st
     crate::kprintln!("  wlan        : our rsn {hex}");
     let mut report = Vec::new();
     activate()?;
+
+    remove_keys(&bssid);
 
     // Право на канал точки доступа.
     wifi_command(0x1c, true, &privilege(channel, false))?;
@@ -1299,7 +1316,7 @@ fn is_ours(da: &[u8]) -> bool {
 
 /// Кадр Ethernet из принятого пакета: уже Ethernet (после RXD) или 802.11
 /// с LLC/SNAP — тогда заголовок собирается заново.
-fn ethernet_in(packet: &[u8]) -> Option<Vec<u8>> {
+fn ethernet_in(packet: &[u8], bssid: &[u8; 6]) -> Option<Vec<u8>> {
     let kind = u16::from_le_bytes([*packet.get(2)?, *packet.get(3)?]);
     let groups = (kind >> 9) & 0xf;
     let mut off = 16usize;
@@ -1315,16 +1332,17 @@ fn ethernet_in(packet: &[u8]) -> Option<Vec<u8>> {
         if f.len() < 24 {
             continue;
         }
-        // 802.11, тип «данные», от точки (FromDS).
+        // 802.11, тип «данные», от нашей точки (FromDS, второй адрес —
+        // она): шифрованная рассылка соседней сети на том же канале — мимо.
         if f[0] & 0x0c == 0x08 && f[1] & 0x03 == 0x02 && is_ours(&f[4..10]) {
-            let mut hdr = 24 + if f[0] & 0x80 != 0 { 2 } else { 0 };
-            if f[1] & 0x40 != 0 {
-                hdr += 8; // заголовок CCMP, если блок его оставил
-            }
-            let llc = f.get(hdr..hdr + 8)?;
-            if llc[..6] != [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00] {
+            if f[10..16] != *bssid {
                 return None;
             }
+            // LLC — сразу за заголовком или за 8 байтами CCMP, если блок,
+            // расшифровав, их оставил.
+            let base = 24 + if f[0] & 0x80 != 0 { 2 } else { 0 };
+            const SNAP: [u8; 6] = [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00];
+            let hdr = [base, base + 8].into_iter().find(|at| f.get(*at..*at + 6) == Some(&SNAP[..]))?;
             let mut out = Vec::with_capacity(f.len() - hdr + 6);
             out.extend_from_slice(&f[4..10]); // DA
             out.extend_from_slice(&f[16..22]); // SA
@@ -1397,8 +1415,9 @@ impl crate::net::card::Card for Card {
         for ring in [RX_DATA, RX_EVENT] {
             // Кольцо событий — только пока есть что брать: события после
             // подключения стеку не нужны, но и копиться им незачем.
+            let Some((_, bssid)) = CONNECTED.lock().clone() else { return None };
             while let Ok(Some(packet)) = receive(ring, 0) {
-                match ethernet_in(&packet) {
+                match ethernet_in(&packet, &bssid) {
                     Some(ethernet) if ethernet.len() <= frame.len() && ethernet.len() >= 14 => {
                         if DUMPED.load(Ordering::Relaxed) < 2 {
                             dump(&packet, "data");
@@ -1410,7 +1429,10 @@ impl crate::net::card::Card for Card {
                     }
                     Some(_) => self.stats.rx_dropped += 1,
                     None => {
-                        if ring == RX_DATA {
+                        // В журнал — только кадры своей точки: чужие шифрованные
+                        // рассылки разбирать и не надо.
+                        let from_ours = packet.windows(6).any(|w| w == bssid);
+                        if ring == RX_DATA && from_ours {
                             self.stats.rx_dropped += 1;
                             dump(&packet, "not understood");
                         }
@@ -1444,6 +1466,7 @@ pub fn disconnect() {
     let mut deauth = mgmt_header(0xc0, &bssid);
     deauth.extend_from_slice(&3u16.to_le_bytes()); // «станция уходит»
     let _ = send_frame(mgmt_txd(deauth.len(), 0x0c), &deauth);
+    remove_keys(&bssid);
     *LINK.lock() = None;
     crate::kprintln!("  wlan        : disconnected");
 }
