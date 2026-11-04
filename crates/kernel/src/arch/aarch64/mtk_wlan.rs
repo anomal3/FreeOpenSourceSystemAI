@@ -738,6 +738,23 @@ fn wait_eapol(timeout_ms: u64) -> Option<Vec<u8>> {
     None
 }
 
+/// Ждать подписанное сообщение ключа: личного (`pairwise`) или группового.
+/// Повтор первого сообщения (без MIC) или третьего — пропускаются: иначе
+/// опоздавший повтор читался как «неверный пароль».
+fn wait_key(timeout_ms: u64, pairwise: bool) -> Option<Vec<u8>> {
+    let started = crate::time::uptime_ms();
+    loop {
+        let left = timeout_ms.checked_sub(crate::time::uptime_ms().saturating_sub(started))?;
+        let frame = wait_eapol(left.max(1))?;
+        let Some(key) = wpa::parse(&frame) else { continue };
+        let signed = key.info & wpa::info::MIC != 0;
+        if signed && (key.info & wpa::info::PAIRWISE != 0) == pairwise {
+            return Some(frame);
+        }
+        crate::kprintln!("  wlan        : skipped EAPOL-Key info {:#06x}", key.info);
+    }
+}
+
 /// TXD для кадра управления: формат 802.11, очередь MCU, нижняя скорость.
 fn mgmt_txd(frame_len: usize, subtype: u8) -> [u8; 32] {
     let mut txd = [0u8; 32];
@@ -914,13 +931,44 @@ fn station_rsn(ap: &[u8]) -> Result<(Vec<u8>, GroupCipher), &'static str> {
     Ok((ie, group_cipher))
 }
 
+/// Наш WPA IE (старый WPA) под точку: её групповой шифр, личный AES, PSK.
+/// `ap` — тело её WPA IE после OUI и типа.
+fn station_wpa(ap: &[u8]) -> Result<(Vec<u8>, GroupCipher), &'static str> {
+    const MS: [u8; 3] = [0x00, 0x50, 0xf2];
+    if ap.len() < 8 {
+        return Err("network has no WPA2 (RSN) element");
+    }
+    let group = &ap[2..6];
+    let group_cipher = match group {
+        [0x00, 0x50, 0xf2, 0x04] => GroupCipher { algorithm: 4, key_len: 16 },
+        [0x00, 0x50, 0xf2, 0x02] => GroupCipher { algorithm: 2, key_len: 32 },
+        _ => return Err("group cipher of this network is not supported"),
+    };
+    let pairwise_count = usize::from(u16::from_le_bytes([ap[6], ap[7]]));
+    let pairwise = ap.get(8..8 + 4 * pairwise_count).ok_or("broken RSN element")?;
+    if !pairwise.chunks(4).any(|suite| suite[..3] == MS && suite[3] == 4) {
+        return Err("network offers no AES (CCMP) for the station");
+    }
+    let at = 8 + 4 * pairwise_count;
+    let akm_count = usize::from(u16::from_le_bytes([*ap.get(at).ok_or("broken RSN element")?, *ap.get(at + 1).ok_or("broken RSN element")?]));
+    let akms = ap.get(at + 2..at + 2 + 4 * akm_count).ok_or("broken RSN element")?;
+    if !akms.chunks(4).any(|suite| suite[..3] == MS && suite[3] == 2) {
+        return Err("network wants WPA3 or 802.1X, not a password (PSK)");
+    }
+    let mut ie = alloc::vec![0xdd, 0x16, 0x00, 0x50, 0xf2, 0x01, 0x01, 0x00];
+    ie.extend_from_slice(group);
+    ie.extend_from_slice(&[0x01, 0x00, 0x00, 0x50, 0xf2, 0x04]);
+    ie.extend_from_slice(&[0x01, 0x00, 0x00, 0x50, 0xf2, 0x02]);
+    Ok((ie, group_cipher))
+}
+
 /// Подключиться к сети: `password` пустой — открытая сеть.
 ///
 /// У сети бывает несколько точек (MARK69 — две на одном канале): отказала
 /// одна — пробуем следующую.
 pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> {
     let mut candidates: Vec<Network> = networks().into_iter().filter(|net| net.ssid == ssid).collect();
-    // Сначала точки с RSN (WPA2): с ними мы умеем.
+    // Сначала точки с RSN (WPA2), потом со старым WPA.
     candidates.sort_by_key(|net| net.rsn.is_empty());
     let mut last = "network not in the last scan";
     for net in candidates.iter() {
@@ -957,7 +1005,15 @@ fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static st
     let ssid = net.ssid.as_str();
     let (bssid, channel) = (net.bssid, net.channel);
     let secure = !password.is_empty();
-    let (rsn_ie, group) = if secure { station_rsn(&net.rsn)? } else { (Vec::new(), GroupCipher { algorithm: 0, key_len: 0 }) };
+    // WPA2, если точка его объявляет; иначе — старый WPA (вторая MARK69).
+    let wpa1 = secure && net.rsn.is_empty() && !net.wpa.is_empty();
+    let (rsn_ie, group) = if !secure {
+        (Vec::new(), GroupCipher { algorithm: 0, key_len: 0 })
+    } else if wpa1 {
+        station_wpa(&net.wpa)?
+    } else {
+        station_rsn(&net.rsn)?
+    };
     let mut hex = String::new();
     for byte in rsn_ie.iter() {
         hex.push_str(&alloc::format!("{byte:02x}"));
@@ -1019,7 +1075,7 @@ fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static st
     let _ = wait_fw_event(0x0c, 500);
 
     if secure {
-        report.extend(handshake(ssid, password, &bssid, &rsn_ie, group)?);
+        report.extend(handshake(ssid, password, &bssid, &rsn_ie, group, wpa1)?);
     }
     *CONNECTED.lock() = Some((String::from(ssid), bssid));
     crate::kprintln!("  wlan        : connected to '{ssid}'");
@@ -1027,8 +1083,8 @@ fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static st
     Ok(report)
 }
 
-/// Четырёхсторонний обмен WPA2 и установка ключей.
-fn handshake(ssid: &str, password: &str, bssid: &[u8; 6], rsn_ie: &[u8], group: GroupCipher) -> Result<Vec<String>, &'static str> {
+/// Четырёхсторонний обмен WPA2 (или старого WPA — `wpa1`) и установка ключей.
+fn handshake(ssid: &str, password: &str, bssid: &[u8; 6], rsn_ie: &[u8], group: GroupCipher, wpa1: bool) -> Result<Vec<String>, &'static str> {
     let mut report = Vec::new();
     let pmk = wpa::pmk(password.as_bytes(), ssid.as_bytes());
     let first = wait_eapol(3000).ok_or("no EAPOL message 1 from the access point")?;
@@ -1037,18 +1093,23 @@ fn handshake(ssid: &str, password: &str, bssid: &[u8; 6], rsn_ie: &[u8], group: 
     crate::random::fill(&mut snonce);
     let ptk = wpa::ptk(&pmk, bssid, &OWN_MAC, &msg1.nonce, &snonce);
 
+    // Ответы повторяют версию 802.1X и тип дескриптора точки.
+    let (version, descriptor) = (msg1.version, msg1.descriptor);
     let mut eapol = [0u8; 256];
     let info2 = wpa::info::VERSION_HMAC_SHA1_AES | wpa::info::PAIRWISE | wpa::info::MIC;
-    // Ключевые данные второго сообщения — ровно тот RSN, что в ассоциации.
-    let len = wpa::build(&mut eapol, info2, &msg1.replay, &snonce, rsn_ie, &ptk.kck);
+    // Ключевые данные второго сообщения — ровно тот RSN (WPA IE), что в ассоциации.
+    let len = wpa::build_as(&mut eapol, version, descriptor, info2, &msg1.replay, &snonce, rsn_ie, &ptk.kck);
     send_eapol(bssid, &eapol[..len])?;
     note(&mut report, String::from("eapol 2 sent"));
 
-    let third = wait_eapol(3000).ok_or("no EAPOL message 3 — wrong password?")?;
+    let third = wait_key(3000, true).ok_or("no EAPOL message 3 — wrong password?")?;
     if !wpa::verify(&ptk.kck, &third) {
         return Err("EAPOL message 3 MIC mismatch — wrong password");
     }
     let msg3 = wpa::parse(&third).ok_or("EAPOL message 3 does not parse")?;
+    if wpa1 {
+        return handshake_wpa1(bssid, &ptk, &msg3.replay, group, version, report);
+    }
     let mut keys = [0u8; 256];
     let plain = wpa::unwrap_key(&ptk.kek, msg3.data, &mut keys).ok_or("group key does not unwrap")?;
     let (gtk_id, gtk) = wpa::find_gtk(&keys[..plain]).ok_or("no group key in message 3")?;
@@ -1063,6 +1124,37 @@ fn handshake(ssid: &str, password: &str, bssid: &[u8; 6], rsn_ie: &[u8], group: 
     add_key(bssid, false, gtk_id, group.algorithm, &gtk[..gtk.len().min(group.key_len)])?;
     note(&mut report, alloc::format!("keys installed (group key {gtk_id})"));
     crate::kprintln!("  wlan        : WPA2 handshake done, group key {gtk_id}");
+    Ok(report)
+}
+
+/// Старый WPA: третье сообщение без группового ключа, четвёртое без Secure,
+/// затем групповой обмен — ключ под AES Key Wrap, номер в битах 4–5.
+fn handshake_wpa1(bssid: &[u8; 6], ptk: &wpa::Ptk, replay3: &[u8; 8], group: GroupCipher, version: u8, mut report: Vec<String>) -> Result<Vec<String>, &'static str> {
+    use wpa::info;
+    let mut eapol = [0u8; 256];
+    let info4 = info::VERSION_HMAC_SHA1_AES | info::PAIRWISE | info::MIC;
+    let len = wpa::build_as(&mut eapol, version, wpa::DESC_WPA, info4, replay3, &[0; 32], &[], &ptk.kck);
+    send_eapol(bssid, &eapol[..len])?;
+    note(&mut report, String::from("eapol 4 sent (WPA)"));
+    // Личный ключ — сразу: групповое сообщение уже идёт под ним.
+    add_key(bssid, true, 0, 4, &ptk.tk)?;
+
+    let first = wait_key(3000, false).ok_or("no WPA group key message")?;
+    if !wpa::verify(&ptk.kck, &first) {
+        return Err("WPA group key message MIC mismatch");
+    }
+    let msg = wpa::parse(&first).ok_or("WPA group key message does not parse")?;
+    let gtk_id = ((msg.info >> info::KEY_INDEX_SHIFT) & 3) as u8;
+    let mut keys = [0u8; 64];
+    let plain = wpa::unwrap_key(&ptk.kek, msg.data, &mut keys).ok_or("group key does not unwrap")?;
+    let gtk = &keys[..plain.min(group.key_len)];
+
+    let info2 = info::VERSION_HMAC_SHA1_AES | info::MIC | info::SECURE | (u16::from(gtk_id) << info::KEY_INDEX_SHIFT);
+    let len = wpa::build_as(&mut eapol, version, wpa::DESC_WPA, info2, &msg.replay, &[0; 32], &[], &ptk.kck);
+    send_eapol(bssid, &eapol[..len])?;
+    add_key(bssid, false, gtk_id, group.algorithm, gtk)?;
+    note(&mut report, alloc::format!("keys installed (WPA, group key {gtk_id})"));
+    crate::kprintln!("  wlan        : WPA handshake done, group key {gtk_id}");
     Ok(report)
 }
 
