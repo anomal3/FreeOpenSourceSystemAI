@@ -46,13 +46,31 @@ const MAX_SCALE: u32 = 3;
 
 /// Значение ячейки «что на экране — неизвестно».
 ///
-/// Не может совпасть ни с одним символом: в буфер текста попадают только байты
-/// от 0x20 до 0x7E (см. `write_char_raw`), всё прочее заменяется вопросом.
-const UNKNOWN_CELL: u8 = 0xFF;
+/// Ячейка — символ в младшем байте и номер цвета в старшем. Не может совпасть
+/// ни с одной настоящей: символы — только от 0x20 до 0x7E (см.
+/// `write_char_raw`), цветов — [`PALETTE`] штук.
+const UNKNOWN_CELL: u16 = 0xFFFF;
 
 /// Цвета в виде (R, G, B); в пиксель они упаковываются с учётом `PixelFormat`.
-const BG: (u8, u8, u8) = (0x0A, 0x1C, 0x2E); // тёмно-синий фон ядра
+/// Фон — почти чёрный, тёмно-тёмно-синий (Роман 04.11: «не совсем чёрный»).
+const BG: (u8, u8, u8) = (0x04, 0x07, 0x12);
 const FG: (u8, u8, u8) = (0xD8, 0xE2, 0xEC); // светло-серый текст
+
+/// Цвета текста по номерам: обычный, «OK» зелёным, «FAIL» красным, тусклый
+/// (строки без тега), белый (надпись под логотипом).
+const PALETTE: [(u8, u8, u8); 5] = [FG, (0x3D, 0xD6, 0x5C), (0xF0, 0x4A, 0x4A), (0x7C, 0x8A, 0x9C), (0xFF, 0xFF, 0xFF)];
+const INK: u8 = 0;
+const INK_OK: u8 = 1;
+const INK_FAIL: u8 = 2;
+const INK_DIM: u8 = 3;
+const INK_WHITE: u8 = 4;
+
+/// Сколько этапов (`---- имя ----`) у обычной загрузки — по ним идёт полоса.
+const STAGES: u32 = 12;
+/// Логотип над полосой загрузки: тот же, что у «Пуска» (RGBA, `FIMG`).
+static LOGO: &[u8] = include_bytes!("../../../assets/logo/fossai-logo.fimg");
+/// Сколько знаков строки журнала копится до перевода строки.
+const LINE_MAX: usize = 200;
 
 /// Всё, что нужно, чтобы положить точки на экран, — и ничего больше.
 ///
@@ -70,8 +88,12 @@ struct Painter {
     stride: u32,
     /// Во сколько раз увеличен глиф — 8x8 на экране 1024+ читается плохо.
     scale: u32,
+    /// Верх текста: [`MARGIN`], а при заставке — середина экрана.
+    top: u32,
     fg: u32,
     bg: u32,
+    /// [`PALETTE`], упакованная под формат экрана.
+    inks: [u32; 5],
 }
 
 /// Текстовая консоль, рисующая глифы прямо в фреймбуфер.
@@ -85,7 +107,7 @@ pub struct Console {
     /// Теневая копия экрана: `rows * cols` символов в обычной памяти. `None` —
     /// кучи ещё нет, прокрутка недоступна. Буфер существует ровно затем, чтобы
     /// при сдвиге строк не читать фреймбуфер.
-    cells: Option<Vec<u8>>,
+    cells: Option<Vec<u16>>,
     /// Что сейчас **на экране**, ячейка в ячейку с [`Console::cells`].
     ///
     /// Два буфера вместо одного — это и есть разделение «чего мы хотим» и «что
@@ -93,7 +115,7 @@ pub struct Console {
     /// отдельно, уже с разрешёнными прерываниями. Разница между ними и есть
     /// работа, которую осталось сделать, — и она же переживает прокрутку сама
     /// собой: сдвиг строк в первом буфере это обычный `copy_within` в памяти.
-    painted: Option<Vec<u8>>,
+    painted: Option<Vec<u16>>,
     /// С какой ячейки продолжать поиск отличий.
     ///
     /// Без него каждый поиск начинался бы с нуля, и перерисовка экрана стоила
@@ -113,6 +135,21 @@ pub struct Console {
     /// «включён» с «на экране» значило бы оставлять след при каждом переводе
     /// строки.
     cursor_drawn: bool,
+    /// Строк на весь экран — столько ячеек у буферов, сколько бы строк ни было
+    /// видно сейчас (при заставке текст — только нижняя половина).
+    full_rows: u32,
+    /// Экран загрузки (04.11): сверху логотип, FOSSAI и полоса, снизу журнал
+    /// строками `[  OK  ]` / `[FAIL]`. Снимается паникой и вводом.
+    splash: bool,
+    /// Пройдено этапов загрузки — заполнение полосы.
+    stage: u32,
+    /// Верх полосы загрузки.
+    bar_y: u32,
+    format: PixelFormat,
+    /// Строка журнала, пока не пришёл её конец: при заставке строка
+    /// выводится целиком, уже разобранной.
+    line: [u8; LINE_MAX],
+    line_len: usize,
 }
 
 // SAFETY: единственное, что мешает вывести `Send` автоматически, — сырой
@@ -189,7 +226,9 @@ impl Painter {
         unsafe { self.base.add(offset).write_volatile(color) };
     }
 
-    fn draw_cell(&self, col: u32, row: u32, byte: u8) {
+    fn draw_cell(&self, col: u32, row: u32, cell: u16) {
+        let byte = (cell & 0x7f) as u8;
+        let fg = self.inks.get((cell >> 8) as usize).copied().unwrap_or(self.fg);
         // Ячейка — единица работы с фреймбуфером, и именно здесь машина глохнет.
         // Вывод идёт с запрещёнными прерываниями (см. [`crate::print::_print`]),
         // а прокрутка перерисовывает до тысячи ячеек: замерено — **663 мс** на
@@ -212,7 +251,7 @@ impl Painter {
         }
         let glyph = BASIC_LEGACY[byte as usize];
         let x0 = MARGIN + col * GLYPH_W * self.scale;
-        let y0 = MARGIN + row * GLYPH_H * self.scale;
+        let y0 = self.top + row * GLYPH_H * self.scale;
         let width = (GLYPH_W * self.scale) as usize;
         // Строка развёртки ячейки собирается в обычной памяти и уходит в
         // фреймбуфер одним отрезком. Так каждая точка шрифта превращается в
@@ -225,7 +264,7 @@ impl Painter {
                 // (формат унаследован от C-заголовка font8x8_basic.h), поэтому
                 // сдвигаем вправо на номер столбца, а не на 7 - столбец.
                 let lit = (bits >> gx) & 1 != 0;
-                let color = if lit { self.fg } else { self.bg };
+                let color = if lit { fg } else { self.bg };
                 for sx in 0..self.scale {
                     line[(gx * self.scale + sx) as usize] = color;
                 }
@@ -236,6 +275,130 @@ impl Painter {
             }
         }
     }
+}
+
+impl Painter {
+    /// Надпись крупным шрифтом с середины по `y`: `size` — масштаб глифа.
+    fn big_text(&self, y: u32, text: &[u8], size: u32, ink: u32) {
+        let advance = GLYPH_W * size + size; // буква и промежуток
+        let w = advance * text.len() as u32;
+        let x0 = self.width.saturating_sub(w) / 2;
+        for (index, byte) in text.iter().enumerate() {
+            let glyph = BASIC_LEGACY[*byte as usize & 0x7f];
+            for (gy, bits) in glyph.iter().copied().enumerate() {
+                for gx in 0..GLYPH_W {
+                    if (bits >> gx) & 1 != 0 {
+                        for sy in 0..size {
+                            self.fill_row(x0 + index as u32 * advance + gx * size, y + gy as u32 * size + sy, size, ink);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Логотип (`FIMG`: метка, ширина и высота по u16, RGBA) стороной `side`
+    /// с центром по ширине, верх — `y`. Без кучи: строка — на стеке.
+    fn logo(&self, y: u32, side: u32, bg: (u8, u8, u8), format: PixelFormat) {
+        if LOGO.len() < 8 || &LOGO[..4] != b"FIMG" {
+            return;
+        }
+        let w = u32::from(u16::from_le_bytes([LOGO[4], LOGO[5]]));
+        let h = u32::from(u16::from_le_bytes([LOGO[6], LOGO[7]]));
+        let side = side.min(512);
+        if w == 0 || h == 0 || LOGO.len() < 8 + (w * h * 4) as usize || side == 0 {
+            return;
+        }
+        let x0 = self.width.saturating_sub(side) / 2;
+        let mut line = [0u32; 512];
+        for ty in 0..side {
+            let sy = ty * h / side;
+            for tx in 0..side {
+                let sx = tx * w / side;
+                let at = 8 + ((sy * w + sx) * 4) as usize;
+                let (r, g, b, a) = (LOGO[at] as u32, LOGO[at + 1] as u32, LOGO[at + 2] as u32, LOGO[at + 3] as u32);
+                let mix = |c: u32, back: u8| ((c * a + back as u32 * (255 - a)) / 255) as u8;
+                line[tx as usize] = encode(format, (mix(r, bg.0), mix(g, bg.1), mix(b, bg.2)));
+            }
+            self.blit_row(x0, y + ty, &line[..side as usize]);
+        }
+    }
+
+    /// Полоса загрузки как у Windows XP: рамка и синие сегменты, `done` из
+    /// `total`.
+    fn progress(&self, y: u32, width: u32, height: u32, done: u32, total: u32, format: PixelFormat) {
+        let x0 = self.width.saturating_sub(width) / 2;
+        let frame = encode(format, (0x4A, 0x55, 0x68));
+        let track = encode(format, (0x0A, 0x10, 0x20));
+        self.fill_row(x0, y, width, frame);
+        self.fill_row(x0, y + height - 1, width, frame);
+        for row in 1..height - 1 {
+            self.put_pixel(x0, y + row, frame);
+            self.put_pixel(x0 + width - 1, y + row, frame);
+            self.fill_row(x0 + 1, y + row, width - 2, track);
+        }
+        let pad = (height / 5).max(2);
+        let seg_h = height.saturating_sub(pad * 2);
+        let seg_w = (seg_h * 2 / 3).max(3);
+        let gap = (seg_w / 3).max(1);
+        let inner = width.saturating_sub(pad * 2);
+        let segments = inner / (seg_w + gap);
+        let lit = (segments * done.min(total) / total.max(1)).min(segments);
+        for index in 0..lit {
+            let sx = x0 + pad + index * (seg_w + gap);
+            for row in 0..seg_h {
+                // Сверху светлее, к низу темнее — объём, как у XP.
+                let shade = 255 - (row * 110 / seg_h.max(1));
+                let color = encode(format, ((0x2E * shade / 255) as u8, (0x8C * shade / 255) as u8, (0xF5 * shade / 255) as u8));
+                self.fill_row(sx, y + pad + row, seg_w, color);
+            }
+        }
+    }
+}
+
+/// Как выглядит строка журнала на экране загрузки.
+enum Shape<'a> {
+    /// `---- имя ----` — новый этап: полоса делает шаг.
+    Stage,
+    /// `  тег : текст` — `[  OK  ]` или `[FAIL]`.
+    Tagged { tag: &'a [u8], text: &'a [u8], failed: bool },
+    /// Прочее — продолжение предыдущей строки, тусклым.
+    Plain(&'a [u8]),
+}
+
+/// Слова отказа в строке журнала (английские: так пишет ядро).
+const FAIL_WORDS: [&[u8]; 12] = [
+    b"fail", b"error", b"could not", b"did not", b"cannot", b"can't", b"unreachable", b"refused", b"panic", b"timed out", b"not respond",
+    b"broken",
+];
+
+fn shape(line: &[u8]) -> Shape<'_> {
+    let trimmed = trim(line);
+    if trimmed.starts_with(b"----") {
+        return Shape::Stage;
+    }
+    if line.starts_with(b"  ") {
+        if let Some(at) = line.windows(3).position(|w| w == b" : ").or_else(|| line.windows(2).position(|w| w == b": ")) {
+            let tag = trim(&line[..at]);
+            let text = trim(&line[(at + 2).min(line.len())..]);
+            // Тег — до 14 знаков, бывает и из двух слов (`serial in`).
+            if !tag.is_empty() && tag.len() <= 14 && tag.windows(2).all(|w| w != b"  ") {
+                let failed = FAIL_WORDS.iter().any(|word| contains_ci(text, word));
+                return Shape::Tagged { tag, text, failed };
+            }
+        }
+    }
+    Shape::Plain(trimmed)
+}
+
+fn trim(bytes: &[u8]) -> &[u8] {
+    let start = bytes.iter().position(|b| *b != b' ').unwrap_or(bytes.len());
+    let end = bytes.iter().rposition(|b| *b != b' ').map_or(start, |at| at + 1);
+    &bytes[start..end.max(start)]
+}
+
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w.iter().zip(needle).all(|(a, b)| a.to_ascii_lowercase() == *b))
 }
 
 impl Console {
@@ -284,8 +447,16 @@ impl Console {
                 height: fb.height,
                 stride: fb.stride,
                 scale,
+                top: MARGIN,
                 fg: encode(fb.format, FG),
                 bg: encode(fb.format, BG),
+                inks: [
+                    encode(fb.format, PALETTE[0]),
+                    encode(fb.format, PALETTE[1]),
+                    encode(fb.format, PALETTE[2]),
+                    encode(fb.format, PALETTE[3]),
+                    encode(fb.format, PALETTE[4]),
+                ],
             },
             cols,
             rows,
@@ -297,6 +468,13 @@ impl Console {
             stale: false,
             cursor: false,
             cursor_drawn: false,
+            full_rows: rows,
+            splash: false,
+            stage: 0,
+            bar_y: 0,
+            format: fb.format,
+            line: [0; LINE_MAX],
+            line_len: 0,
         };
         // Заливки здесь нет: её делает [`init`]. Консоль, заведённая после смены
         // режима ([`adopt`]), рисовать не вправе — экран в это время у стола.
@@ -321,17 +499,112 @@ impl Console {
         self.col = 0;
         self.row = 0;
         if let Some(cells) = self.cells.as_mut() {
-            cells.fill(b' ');
+            cells.fill(u16::from(b' '));
         }
         // Экран только что залит фоном, то есть на нём ровно пробелы: второй
         // буфер обязан сказать то же самое, иначе первая же покраска
         // перерисовала бы весь экран без нужды.
         if let Some(painted) = self.painted.as_mut() {
-            painted.fill(b' ');
+            painted.fill(u16::from(b' '));
         }
         self.paint_at = 0;
         self.stale = false;
         self.cursor_drawn = false;
+        // Очистка — это и конец заставки: паника и консоль для ввода пишут
+        // на весь экран обычным текстом.
+        self.splash = false;
+        self.line_len = 0;
+        self.fb.top = MARGIN;
+        self.rows = self.full_rows;
+    }
+
+    /// Нарисовать заставку и отвести журналу нижнюю половину экрана.
+    fn start_splash(&mut self) {
+        let (w, h) = (self.fb.width, self.fb.height);
+        let cell_h = GLYPH_H * self.fb.scale;
+        let side = (w.min(h) / 5).clamp(64, 256);
+        let title = (self.fb.scale * 3).max(3);
+        let title_h = GLYPH_H * title;
+        let (_, _, bar_h) = self.bar_geometry();
+        // Логотип, под ним FOSSAI, под ним полоса — одним блоком над
+        // серединой экрана; журнал — под серединой.
+        let block = side + side / 6 + title_h + cell_h * 2 + bar_h;
+        let logo_y = (h / 2).saturating_sub(block + cell_h);
+        self.fb.logo(logo_y, side, BG, self.format);
+        let title_y = logo_y + side + side / 6;
+        self.fb.big_text(title_y, b"FOSSAI", title, self.fb.inks[INK_WHITE as usize]);
+        self.bar_y = title_y + title_h + cell_h * 2;
+        self.splash = true;
+        self.stage = 0;
+        self.draw_progress();
+        // Журнал — ниже середины экрана и не выше её.
+        let top = (h / 2).max(self.bar_y + bar_h) + cell_h;
+        self.fb.top = top;
+        self.rows = (h.saturating_sub(top + MARGIN) / cell_h).clamp(1, self.full_rows);
+        self.row = 0;
+        self.col = 0;
+    }
+
+    fn bar_geometry(&self) -> (u32, u32, u32) {
+        let (w, h) = (self.fb.width, self.fb.height);
+        let _ = h;
+        let width = (w * 2 / 5).clamp(160, 520);
+        let height = (8 * self.fb.scale + 6).max(14);
+        (self.bar_y, width, height)
+    }
+
+    fn draw_progress(&self) {
+        let (y, width, height) = self.bar_geometry();
+        self.fb.progress(y, width, height, self.stage, STAGES, self.format);
+    }
+
+    /// Строка журнала пришла целиком: разобрать и положить в ячейки.
+    fn emit_line(&mut self) {
+        let mut line = [0u8; LINE_MAX];
+        let len = self.line_len;
+        line[..len].copy_from_slice(&self.line[..len]);
+        self.line_len = 0;
+        let mut put = |console: &mut Self, text: &[u8], ink: u8| {
+            for byte in text {
+                if console.col >= console.cols || console.row >= console.rows {
+                    return;
+                }
+                console.put_cell(console.col, console.row, (u16::from(ink) << 8) | u16::from(*byte));
+                console.col += 1;
+            }
+        };
+        match shape(&line[..len]) {
+            Shape::Stage => {
+                self.stage += 1;
+                self.draw_progress();
+                return;
+            }
+            Shape::Tagged { tag, text, failed } => {
+                put(self, b"[", INK);
+                if failed {
+                    put(self, b"FAIL", INK_FAIL);
+                } else {
+                    put(self, b"  OK  ", INK_OK);
+                }
+                put(self, b"] ", INK);
+                put(self, tag, INK);
+                put(self, b": ", INK);
+                put(self, text, INK);
+            }
+            Shape::Plain(text) => {
+                if text.is_empty() {
+                    return;
+                }
+                put(self, b"         ", INK);
+                put(self, text, INK_DIM);
+            }
+        }
+        // Остаток строки — пробелами: строка, ушедшая прокруткой, не оставляет хвоста.
+        while self.col < self.cols && self.row < self.rows {
+            self.put_cell(self.col, self.row, u16::from(b' '));
+            self.col += 1;
+        }
+        self.newline();
     }
 
     /// Выделить теневой буфер и включить прокрутку.
@@ -342,7 +615,7 @@ impl Console {
         if self.cells.is_some() {
             return true;
         }
-        let len = (self.rows as usize) * (self.cols as usize);
+        let len = (self.full_rows as usize) * (self.cols as usize);
         let mut cells = Vec::new();
         let mut painted = Vec::new();
         // `try_reserve_exact` вместо `vec![]`: отказ аллокатора обязан вернуться
@@ -350,12 +623,12 @@ impl Console {
         if cells.try_reserve_exact(len).is_err() || painted.try_reserve_exact(len).is_err() {
             return false;
         }
-        cells.resize(len, b' ');
+        cells.resize(len, u16::from(b' '));
         // «На экране» начинается с того же, с чего «хотим»: текст, напечатанный
         // до этого вызова, на экране есть, но ни одному из буферов не известен.
         // Считать его пробелами — ровно то, что делалось и раньше: он доживает
         // до первой прокрутки и исчезает вместе с ней.
-        painted.resize(len, b' ');
+        painted.resize(len, u16::from(b' '));
         self.cells = Some(cells);
         self.painted = Some(painted);
         self.paint_at = 0;
@@ -382,16 +655,18 @@ impl Console {
         let cols = self.cols as usize;
         let rows = self.rows as usize;
         let last = (rows - 1) * cols;
-        cells.copy_within(cols.., 0);
-        cells[last..].fill(b' ');
+        cells.copy_within(cols..rows * cols, 0);
+        cells[last..rows * cols].fill(u16::from(b' '));
 
         if self.stale {
             // На экране есть символы, которых не знает ни один буфер, — всё,
             // что напечатано до появления кучи. Сравнивать не с чем, поэтому
             // экран объявляется неизвестным целиком: покраска перерисует его
             // весь, ровно как делала прежняя прокрутка в этом же случае.
+            // Только видимые строки: остальные покраска не обходит, и
+            // «неизвестно» там осталось бы навсегда (04.11 — вечная покраска).
             if let Some(painted) = self.painted.as_mut() {
-                painted.fill(UNKNOWN_CELL);
+                painted[..rows * cols].fill(UNKNOWN_CELL);
             }
             self.stale = false;
         }
@@ -410,7 +685,7 @@ impl Console {
     /// намеренно: если между отметкой и рисованием кто-то напечатает в ту же
     /// ячейку другое, тексты снова разойдутся, и следующий проход это увидит.
     /// Обратный порядок потерял бы такую запись молча.
-    fn next_dirty(&mut self) -> Option<(u32, u32, u8)> {
+    fn next_dirty(&mut self) -> Option<(u32, u32, u16)> {
         let cols = self.cols as usize;
         let len = cols * self.rows as usize;
         let cells = self.cells.as_ref()?;
@@ -430,8 +705,9 @@ impl Console {
 
     /// Есть ли что красить.
     fn dirty(&self) -> bool {
+        let len = (self.cols as usize) * (self.rows as usize);
         match (self.cells.as_ref(), self.painted.as_ref()) {
-            (Some(cells), Some(painted)) => cells != painted,
+            (Some(cells), Some(painted)) => cells[..len] != painted[..len],
             _ => false,
         }
     }
@@ -445,12 +721,12 @@ impl Console {
     ///
     /// Буфера может не быть: до появления кучи (баннер, карта памяти) рисовать
     /// больше некому и нечем, и там символ уходит на экран сразу.
-    fn put_cell(&mut self, col: u32, row: u32, byte: u8) {
+    fn put_cell(&mut self, col: u32, row: u32, cell: u16) {
         let Some(cells) = self.cells.as_mut() else {
-            self.fb.draw_cell(col, row, byte);
+            self.fb.draw_cell(col, row, cell);
             return;
         };
-        cells[(row as usize) * (self.cols as usize) + (col as usize)] = byte;
+        cells[(row as usize) * (self.cols as usize) + (col as usize)] = cell;
     }
 
     fn newline(&mut self) {
@@ -480,7 +756,7 @@ impl Console {
             return;
         }
         while self.col < stop {
-            self.put_cell(self.col, self.row, b' ');
+            self.put_cell(self.col, self.row, u16::from(b' '));
             self.col += 1;
         }
     }
@@ -495,7 +771,7 @@ impl Console {
             return;
         }
         let x0 = MARGIN + self.col * GLYPH_W * self.fb.scale;
-        let y0 = MARGIN + (self.row + 1) * GLYPH_H * self.fb.scale - self.fb.scale;
+        let y0 = self.fb.top + (self.row + 1) * GLYPH_H * self.fb.scale - self.fb.scale;
         for y in 0..self.fb.scale {
             self.fb.fill_row(x0, y0 + y, GLYPH_W * self.fb.scale, self.fb.fg);
         }
@@ -524,7 +800,7 @@ impl Console {
             // это единственный вариант, не стирающий символ целиком.
             None => {
                 let x0 = MARGIN + self.col * GLYPH_W * self.fb.scale;
-                let y0 = MARGIN + (self.row + 1) * GLYPH_H * self.fb.scale - self.fb.scale;
+                let y0 = self.fb.top + (self.row + 1) * GLYPH_H * self.fb.scale - self.fb.scale;
                 for y in 0..self.fb.scale {
                     self.fb.fill_row(x0, y0 + y, GLYPH_W * self.fb.scale, self.fb.bg);
                 }
@@ -533,6 +809,20 @@ impl Console {
     }
 
     fn write_char_raw(&mut self, ch: char) {
+        if self.splash {
+            // Заставка: строка копится и выходит целиком, разобранной.
+            match ch {
+                '\n' => self.emit_line(),
+                '\r' => {}
+                _ if self.line_len < LINE_MAX => {
+                    let byte = if (0x20..0x7F).contains(&(ch as u32)) { ch as u8 } else if ch == '\t' { b' ' } else { b'?' };
+                    self.line[self.line_len] = byte;
+                    self.line_len += 1;
+                }
+                _ => {}
+            }
+            return;
+        }
         match ch {
             '\n' => {
                 self.newline();
@@ -567,7 +857,7 @@ impl Console {
         // Таблица покрывает только ASCII; всё остальное показываем как '?',
         // чтобы не молчать о потерянном символе.
         let byte = if (0x20..0x7F).contains(&(ch as u32)) { ch as u8 } else { b'?' };
-        self.put_cell(self.col, self.row, byte);
+        self.put_cell(self.col, self.row, u16::from(byte));
         self.col += 1;
     }
 }
@@ -620,6 +910,7 @@ pub fn init(fb: &Framebuffer) -> bool {
         return false;
     };
     console.clear();
+    console.start_splash();
     *CONSOLE.lock() = Some(console);
     READY.store(true, Ordering::Release);
     true
@@ -867,6 +1158,11 @@ pub fn set_cursor(visible: bool) {
         return;
     };
     if let Some(console) = console.as_mut() {
+        // Ждут ввода на консоли (безопасный режим, стол не поднялся) —
+        // заставка уходит, экран — обычному тексту.
+        if visible && console.splash {
+            console.clear();
+        }
         console.cursor = visible;
         if visible {
             console.draw_cursor();
