@@ -460,6 +460,9 @@ pub struct Network {
     /// отказал с кодом 41 («не тот групповой шифр»), когда мы всегда
     /// заявляли CCMP, а у неё группа — TKIP (смешанный WPA/WPA2).
     pub rsn: Vec<u8>,
+    /// Тело старого WPA IE (`dd .. 00 50 f2 01`); у второй точки MARK69 (04.11)
+    /// RSN нет — на ней, видимо, только WPA1.
+    pub wpa: Vec<u8>,
 }
 
 static NETWORKS: SpinLock<Vec<Network>> = SpinLock::new(Vec::new());
@@ -509,6 +512,7 @@ fn parse_beacon(packet: &[u8]) -> Option<Network> {
     let mut ssid = String::new();
     let mut channel = packet[5];
     let mut rsn = Vec::new();
+    let mut wpa = Vec::new();
     while ies.len() >= 2 {
         let (tag, len) = (ies[0], usize::from(ies[1]));
         let Some(body) = ies.get(2..2 + len) else { break };
@@ -516,11 +520,12 @@ fn parse_beacon(packet: &[u8]) -> Option<Network> {
             0 => ssid = String::from_utf8_lossy(body).into_owned(),
             3 if len == 1 => channel = body[0],
             48 => rsn = body.to_vec(),
+            221 if body.starts_with(&[0x00, 0x50, 0xf2, 0x01]) => wpa = body[4..].to_vec(),
             _ => {}
         }
         ies = &ies[2 + len..];
     }
-    Some(Network { ssid, bssid, channel, rsn })
+    Some(Network { ssid, bssid, channel, rsn, wpa })
 }
 
 /// Сеть в журнал: имя, канал, точка и её RSN — короткими строками (`oem
@@ -534,6 +539,13 @@ fn log_network(net: &Network) {
             hex.push_str(&alloc::format!("{byte:02x}"));
         }
         crate::kprintln!("  wlan        :   rsn {hex}");
+    }
+    for row in net.wpa.chunks(16) {
+        let mut hex = String::new();
+        for byte in row {
+            hex.push_str(&alloc::format!("{byte:02x}"));
+        }
+        crate::kprintln!("  wlan        :   wpa {hex}");
     }
 }
 
@@ -875,8 +887,7 @@ struct GroupCipher {
 /// Наш RSN IE под точку доступа: её групповой шифр, личный CCMP, PSK.
 fn station_rsn(ap: &[u8]) -> Result<(Vec<u8>, GroupCipher), &'static str> {
     if ap.len() < 8 {
-        // Описания нет — WPA2-PSK с CCMP, как было.
-        return Ok((wpa::RSN_IE.to_vec(), GroupCipher { algorithm: 4, key_len: 16 }));
+        return Err("network has no WPA2 (RSN) element");
     }
     let group = &ap[2..6];
     let group_cipher = match group {
@@ -908,11 +919,18 @@ fn station_rsn(ap: &[u8]) -> Result<(Vec<u8>, GroupCipher), &'static str> {
 /// У сети бывает несколько точек (MARK69 — две на одном канале): отказала
 /// одна — пробуем следующую.
 pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> {
-    let candidates: Vec<Network> = networks().into_iter().filter(|net| net.ssid == ssid).collect();
+    let mut candidates: Vec<Network> = networks().into_iter().filter(|net| net.ssid == ssid).collect();
+    // Сначала точки с RSN (WPA2): с ними мы умеем.
+    candidates.sort_by_key(|net| net.rsn.is_empty());
     let mut last = "network not in the last scan";
     for net in candidates.iter() {
         log_network(net);
-        match connect_bss(net, password) {
+        let result = connect_bss(net, password);
+        // Канал вернуть прошивке при любом исходе: невозвращённый держит её
+        // занятой, и следующая попытка получала «did not grant the channel»
+        // (04.11, после первого же отказа точки).
+        let _ = wifi_command(0x1c, true, &privilege(net.channel, true));
+        match result {
             Ok(report) => return Ok(report),
             Err(err) => {
                 crate::kprintln!("  wlan        : {err}");
@@ -921,6 +939,18 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
         }
     }
     Err(last)
+}
+
+/// `CH_PRIVILEGE`: взять канал на 4 с (`release` — вернуть).
+fn privilege(channel: u8, release: bool) -> [u8; 24] {
+    let mut privilege = [0u8; 24];
+    privilege[1] = 0x5a;
+    privilege[2] = u8::from(release);
+    privilege[3] = channel;
+    privilege[5] = 1;
+    privilege[10] = 3;
+    privilege[12..16].copy_from_slice(&4000u32.to_le_bytes());
+    privilege
 }
 
 fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static str> {
@@ -937,13 +967,7 @@ fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static st
     activate()?;
 
     // Право на канал точки доступа.
-    let mut privilege = [0u8; 24];
-    privilege[1] = 0x5a;
-    privilege[3] = channel;
-    privilege[5] = 1;
-    privilege[10] = 3;
-    privilege[12..16].copy_from_slice(&4000u32.to_le_bytes());
-    wifi_command(0x1c, true, &privilege)?;
+    wifi_command(0x1c, true, &privilege(channel, false))?;
     let grant = wait_fw_event(0x10, 2000).ok_or("firmware did not grant the channel")?;
     note(&mut report, alloc::format!("channel {channel} granted ({:02x?})", grant.get(28..32)));
 
@@ -997,9 +1021,6 @@ fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static st
     if secure {
         report.extend(handshake(ssid, password, &bssid, &rsn_ie, group)?);
     }
-    // Канал больше не держим особо.
-    privilege[2] = 1;
-    let _ = wifi_command(0x1c, true, &privilege);
     *CONNECTED.lock() = Some((String::from(ssid), bssid));
     crate::kprintln!("  wlan        : connected to '{ssid}'");
     note(&mut report, alloc::format!("connected to {ssid}"));

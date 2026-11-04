@@ -177,6 +177,7 @@ pub fn human(err: &str) -> &'static str {
         "group cipher of this network is not supported" | "network offers no AES (CCMP) for the station" => {
             "у сети шифрование, которое мы пока не умеем"
         }
+        "network has no WPA2 (RSN) element" => "у сети старый WPA — включите на роутере WPA2-PSK",
         "network wants WPA3 or 802.1X, not a password (PSK)" => "сети нужен WPA3 или корпоративный вход",
         _ => "ошибка драйвера Wi-Fi (подробности в журнале)",
     }
