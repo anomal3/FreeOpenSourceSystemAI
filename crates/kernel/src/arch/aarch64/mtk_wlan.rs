@@ -896,23 +896,37 @@ fn add_key(peer: &[u8; 6], pairwise: bool, key_id: u8, algorithm: u8, key: &[u8]
     cmd[14] = if pairwise { AP_WLAN } else { BMC_WLAN };
     cmd[16..16 + key.len().min(32)].copy_from_slice(&key[..key.len().min(32)]);
     wifi_command(0x07, true, &cmd)?;
+    if !pairwise {
+        *KEYS.lock() = Some(algorithm);
+    } else {
+        KEYS.lock().get_or_insert(4);
+    }
     Ok(())
 }
 
 /// Снять ключи прошлого сеанса (тот же CID 0x07, «убрать»): с ними в
 /// прошивке второе сообщение обмена уходило зашифрованным старым ключом, и
 /// точка его не понимала (04.11 — повторное подключение без перезагрузки).
+///
+/// Только если ключи ставили мы, и с тем алгоритмом, что ставили: команда
+/// «убрать» с нулевым алгоритмом 04.11 остановила прошивку (канал больше не
+/// выдавался, кольцо команд встало).
 fn remove_keys(peer: &[u8; 6]) {
-    for (pairwise, key_id) in [(true, 0u8), (false, 1), (false, 2)] {
+    let Some(group_algorithm) = KEYS.lock().take() else { return };
+    for (pairwise, key_id, algorithm) in [(true, 0u8, 4u8), (false, 1, group_algorithm), (false, 2, group_algorithm)] {
         let mut cmd = [0u8; 64];
         cmd[1] = u8::from(pairwise);
         cmd[2] = u8::from(pairwise);
         cmd[4..10].copy_from_slice(peer);
+        cmd[11] = algorithm;
         cmd[12] = key_id;
         cmd[14] = if pairwise { AP_WLAN } else { BMC_WLAN };
         let _ = wifi_command(0x07, true, &cmd);
     }
 }
+
+/// Ключи в прошивке: алгоритм группового (`None` — ключей нет).
+static KEYS: SpinLock<Option<u8>> = SpinLock::new(None);
 
 /// Строка отчёта подключения — и в журнал: при ошибке отчёт не доходит до
 /// «Параметров», а шаг, на котором встали, нужен.
@@ -1259,6 +1273,7 @@ pub fn is_ready() -> bool {
 
 /// Блок связи выключен — прошивки WLAN больше нет (кольца остаются нашими).
 pub fn forget() {
+    *KEYS.lock() = None;
     READY.store(false, Ordering::Relaxed);
     ACTIVATED.store(false, Ordering::Relaxed);
     *CONNECTED.lock() = None;

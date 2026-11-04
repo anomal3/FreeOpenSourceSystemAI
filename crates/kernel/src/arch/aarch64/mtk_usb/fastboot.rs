@@ -230,7 +230,16 @@ impl Fastboot {
                 "fw" => mtk_wlan::firmware(),
                 "scan" => mtk_wlan::scan(),
                 "up" => mtk_wlan::bring_up(),
-                _ => Err("usage: oem wlan own | dma | fw | scan | up | join <ssid> [password]"),
+                // Сбросить всё без перезагрузки телефона: связь, прошивку WLAN,
+                // питание блока; дальше — `oem consys up`, `oem wlan up`.
+                "off" => {
+                    crate::wifi::disable();
+                    mtk_wlan::disconnect();
+                    mtk_wlan::forget();
+                    crate::arch::aarch64::mtk_consys::shut_down();
+                    Ok(alloc::vec![alloc::string::String::from("Wi-Fi off, connectivity block powered down")])
+                }
+                _ => Err("usage: oem wlan own | dma | fw | scan | up | off | join <ssid> [password]"),
             };
             match result {
                 Ok(lines) => {
