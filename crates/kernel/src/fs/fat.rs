@@ -354,7 +354,19 @@ struct Volume {
     device: Box<dyn BlockDevice>,
     geometry: Geometry,
     cache: SpinLock<SectorCache>,
+    /// Где остановились прошлые чтения файлов: первый кластер файла, номер
+    /// кластера в цепочке и сам кластер (04.11).
+    ///
+    /// Без этого каждое чтение шло по цепочке от начала файла: программа в
+    /// 4,7 МиБ на RAM-диске с кластером 512 байт подгружалась страницами, и
+    /// страница в конце файла стоила девяти тысяч шагов по FAT — NetSurf на
+    /// телефоне запускался минуту и вешал систему. Том только для чтения:
+    /// цепочки не меняются, и подсказка не устаревает.
+    hints: SpinLock<[(u32, u64, u32); HINTS]>,
 }
+
+/// Сколько файлов помнят место последнего чтения.
+const HINTS: usize = 8;
 
 impl Volume {
     /// Прочитать подряд идущие секторы тома прямо в `buf`, мимо кеша.
@@ -510,12 +522,27 @@ impl Volume {
         }
 
         let cluster_bytes = u64::from(self.geometry.cluster_bytes);
-        let mut chain = self.chain(start_cluster)?;
-        for _ in 0..(offset / cluster_bytes) {
+        let target = offset / cluster_bytes;
+        // Начать с запомненного места, если оно не дальше нужного.
+        let hint = self.hints.lock().iter().copied().find(|(start, index, _)| *start == start_cluster && start_cluster != 0 && *index <= target);
+        let (mut chain, from) = match hint {
+            Some((_, index, cluster)) => (self.chain(cluster)?, index),
+            None => (self.chain(start_cluster)?, 0),
+        };
+        for _ in from..target {
             if chain.step()?.is_none() {
                 // Цепочка короче, чем обещает размер в записи каталога.
                 return Err(VfsError::Corrupt);
             }
+        }
+        if let Some(cluster) = chain.next {
+            let mut hints = self.hints.lock();
+            let slot = hints.iter().position(|(start, _, _)| *start == start_cluster).unwrap_or_else(|| {
+                // Самый старый — первый: сдвинуть и занять последний.
+                hints.rotate_left(1);
+                HINTS - 1
+            });
+            hints[slot] = (start_cluster, target, cluster);
         }
 
         let mut within = (offset % cluster_bytes) as usize;
@@ -886,7 +913,7 @@ impl Fat32 {
         let geometry = Geometry::parse(&boot, device.block_count())?;
         let cache = SectorCache::new(geometry.bytes_per_sector as usize)?;
 
-        Ok(Self { volume: Arc::new(Volume { device, geometry, cache: SpinLock::new(cache) }) })
+        Ok(Self { volume: Arc::new(Volume { device, geometry, cache: SpinLock::new(cache), hints: SpinLock::new([(0, 0, 0); HINTS]) }) })
     }
 
     /// Разобранная геометрия тома — для диагностики при загрузке.
