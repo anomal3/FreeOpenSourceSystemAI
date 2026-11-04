@@ -519,6 +519,28 @@ pub fn attach_usb(card: alloc::boxed::Box<dyn Card>) {
     }
 }
 
+/// Принять Wi-Fi телефона (04.11): занимает место петли или прежней
+/// USB-карты; адрес — заново, его спросит `/bin/dhcp`.
+pub fn attach_wifi(card: alloc::boxed::Box<dyn Card>) {
+    let mut interface = INTERFACE.lock();
+    match interface.as_mut() {
+        Some(iface) if iface.device.name() == LOOPBACK_NAME || iface.device.name().starts_with("usb-") => {
+            crate::kprintln!("  network     : {}, hardware address {}", card.name(), eth::Display(card.mac()));
+            iface.mac = card.mac();
+            iface.device = card;
+            iface.address = Ipv4::UNSPECIFIED;
+            iface.netmask = Ipv4::UNSPECIFIED;
+            iface.gateway = Ipv4::UNSPECIFIED;
+            PRESENT.store(true, core::sync::atomic::Ordering::Release);
+        }
+        Some(iface) => crate::kprintln!("  network     : {} stays; Wi-Fi is not used", iface.device.name()),
+        None => {
+            drop(interface);
+            start(card);
+        }
+    }
+}
+
 /// Есть ли в системе сетевая карта.
 pub fn is_present() -> bool {
     PRESENT.load(core::sync::atomic::Ordering::Acquire)

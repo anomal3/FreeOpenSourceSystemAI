@@ -3150,7 +3150,8 @@ impl Compositor {
         } else if let Some(was) = self.pointer.clear_busy() {
             self.mark(was);
         }
-        super::set_animating(self.flight.is_some() || trail || spinning || shade_moving);
+        super::check_icon_hold(self);
+        super::set_animating(self.flight.is_some() || trail || spinning || shade_moving || super::icon_holding());
         self.collect();
         if !self.damage_overflow && self.damage_count == 0 {
             return;

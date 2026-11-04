@@ -136,6 +136,94 @@ pub fn connected() -> Option<alloc::string::String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Запомненные сети (04.11)
+// ---------------------------------------------------------------------------
+//
+// Как у телефонов: сеть, к которой подключились, запоминается с паролем, и в
+// следующий раз пароль не спрашивают, а после поиска подключаются сами.
+// Файл `/etc/wifi.cfg`, строка на сеть: имя, табуляция, пароль (в имени Wi-Fi
+// бывают и пробелы, и `=`). Права `0600` — читает только root. На телефоне
+// `/etc` пока в RAM-диске: запомненное живёт до перезагрузки.
+
+const SAVED: &str = "wifi.cfg";
+
+/// Запомненные сети: имя и пароль.
+#[must_use]
+pub fn saved() -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
+    let text = crate::config::text(SAVED, 16 * 1024);
+    text.lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(ssid, password)| (alloc::string::String::from(ssid), alloc::string::String::from(password)))
+        .collect()
+}
+
+/// Пароль запомненной сети.
+#[must_use]
+pub fn saved_password(ssid: &str) -> Option<alloc::string::String> {
+    saved().into_iter().find(|(name, _)| name == ssid).map(|(_, password)| password)
+}
+
+fn store(list: &[(alloc::string::String, alloc::string::String)]) {
+    let mut text = alloc::string::String::new();
+    for (ssid, password) in list {
+        text.push_str(ssid);
+        text.push('\t');
+        text.push_str(password);
+        text.push('\n');
+    }
+    if let Err(err) = crate::config::write_private(SAVED, &text) {
+        crate::kprintln!("  wifi        : networks not saved: {err:?}");
+    }
+}
+
+fn remember(ssid: &str, password: &str) {
+    let mut list = saved();
+    list.retain(|(name, _)| name != ssid);
+    // Последняя удачная — первой: к ней и подключаться в первую очередь.
+    list.insert(0, (alloc::string::String::from(ssid), alloc::string::String::from(password)));
+    store(&list);
+}
+
+/// Забыть сеть («Забыть» в «Параметрах»); подключение к ней рвётся.
+pub fn forget(ssid: &str) {
+    let mut list = saved();
+    list.retain(|(name, _)| name != ssid);
+    store(&list);
+    #[cfg(target_arch = "aarch64")]
+    if connected().as_deref() == Some(ssid) {
+        crate::arch::mtk_wlan::disconnect();
+    }
+    crate::kprintln!("  wifi        : forgot '{ssid}'");
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Сведения о подключении — для «Параметров»: канал, защита, точка.
+#[must_use]
+pub fn link() -> Option<(u8, &'static str, [u8; 6])> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::arch::mtk_wlan::link()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    None
+}
+
+/// После поиска: не подключены — подключиться к запомненной сети, что видна.
+fn auto_join() {
+    if connected().is_some() || joining() {
+        return;
+    }
+    let visible = networks();
+    for (ssid, password) in saved() {
+        if visible.iter().any(|(name, _)| *name == ssid) {
+            crate::kprintln!("  wifi        : '{ssid}' is saved, joining");
+            let _ = connect(&ssid, &password);
+            return;
+        }
+    }
+}
+
 fn join_task() {
     let Some((ssid, password)) = JOIN.lock().take() else {
         JOINING.store(false, Ordering::Relaxed);
@@ -145,7 +233,10 @@ fn join_task() {
     {
         let result = crate::arch::mtk_wlan::connect(&ssid, &password);
         let lines = match result {
-            Ok(lines) => lines,
+            Ok(lines) => {
+                remember(&ssid, &password);
+                lines
+            }
             Err(err) => {
                 crate::kprintln!("  wifi        : connect to '{ssid}' failed: {err}");
                 let mut lines = alloc::vec![alloc::format!("Не подключиться к «{ssid}»: {}", human(err))];
@@ -211,6 +302,7 @@ fn scan_task() {
         Err(err) => crate::kprintln!("  wifi        : scan failed: {err}"),
     }
     set(State::Ready);
+    auto_join();
 }
 
 /// Текущее состояние.
@@ -262,6 +354,7 @@ pub fn disable() {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        crate::arch::mtk_wlan::disconnect();
         crate::arch::mtk_wlan::forget();
         crate::arch::mtk_consys::shut_down();
     }

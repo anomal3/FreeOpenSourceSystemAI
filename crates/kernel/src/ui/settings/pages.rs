@@ -345,7 +345,22 @@ impl SettingsView {
                 if crate::wifi::joining() {
                     y = row(pass, x, y, w, Some(Fi::Wifi), "Подключается…", "Аутентификация, ассоциация, обмен ключами WPA2", Ctl::Value(""), None);
                 } else if let Some(ssid) = crate::wifi::connected() {
-                    y = row(pass, x, y, w, Some(Fi::Wifi), &ssid, "Подключено", Ctl::Value("подключено"), None);
+                    // Как у смартфона: что за подключение и адрес — сразу под именем.
+                    let address = crate::net::status()
+                        .filter(|status| !status.address.is_unspecified())
+                        .map_or_else(|| String::from("адрес ещё не получен (DHCP)"), |status| format!("IP {}", status.address));
+                    y = row(pass, x, y, w, Some(Fi::Wifi), &ssid, &address, Ctl::Value("подключено"), None);
+                    if let Some((channel, security, bssid)) = crate::wifi::link() {
+                        let point = format!(
+                            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                            bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]
+                        );
+                        let band = format!("{channel} (2,4 ГГц)");
+                        y = row(pass, x, y, w, None, "Защита", "", Ctl::Value(security), None);
+                        y = row(pass, x, y, w, None, "Канал", "", Ctl::Value(&band), None);
+                        y = row(pass, x, y, w, None, "Точка доступа", "", Ctl::Mono(&point), None);
+                    }
+                    y = row(pass, x, y, w, None, "Забыть сеть", "Пароль сотрётся, подключение разорвётся", Ctl::Button("Забыть", Weight::Normal), Some(Deed::WifiForget(ssid.clone())));
                 } else {
                     for line in crate::wifi::report() {
                         y = row(pass, x, y, w, None, &line, "", Ctl::Value(""), None);
@@ -359,7 +374,16 @@ impl SettingsView {
                 for (ssid, channel) in networks.iter().take(24) {
                     let name = if ssid.is_empty() { "(скрытая сеть)" } else { ssid.as_str() };
                     let chosen = self.net.wifi_ssid.as_deref() == Some(ssid.as_str()) && !ssid.is_empty();
-                    let note = if chosen { format!("канал {channel} · введите пароль") } else { format!("канал {channel}") };
+                    let known = !ssid.is_empty() && crate::wifi::saved_password(ssid).is_some();
+                    let note = if chosen {
+                        format!("канал {channel} · введите пароль")
+                    } else if crate::wifi::connected().as_deref() == Some(ssid.as_str()) {
+                        format!("канал {channel} · подключено")
+                    } else if known {
+                        format!("канал {channel} · сохранена")
+                    } else {
+                        format!("канал {channel}")
+                    };
                     // Скрытую сеть по имени не выбрать — имени у неё нет.
                     let deed = (!ssid.is_empty()).then(|| Deed::WifiPick(ssid.clone()));
                     let control = if ssid.is_empty() { Ctl::Value("") } else { Ctl::Nav };

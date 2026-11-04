@@ -373,6 +373,8 @@ enum Deed {
     WifiPick(String),
     /// Подключиться к выбранной сети.
     WifiConnect,
+    /// Забыть сеть: пароль стереть, подключение разорвать.
+    WifiForget(String),
     NetEdit(Field),
     NetApply,
     CheckDisks,
@@ -1137,6 +1139,24 @@ impl SettingsView {
                     Err(err) => Report::bad(format!("{text} не записан: {err}")),
                 });
                 self.request = Some(Request::Panel);
+            }
+            Deed::WifiPick(ssid) if crate::wifi::connected().as_deref() == Some(ssid.as_str()) => {
+                self.report = Some(Report::ok(format!("уже подключено к «{ssid}»")));
+            }
+            Deed::WifiPick(ssid) if crate::wifi::saved_password(&ssid).is_some() => {
+                // Запомненная сеть — без пароля, как у телефонов.
+                let password = crate::wifi::saved_password(&ssid).unwrap_or_default();
+                self.net.wifi_ssid = None;
+                self.net.editing = None;
+                kprintln!("  settings    : wi-fi connect to saved '{ssid}'");
+                self.report = Some(match crate::wifi::connect(&ssid, &password) {
+                    Ok(()) => Report::ok(format!("подключаюсь к «{ssid}»…")),
+                    Err(err) => Report::bad(format!("к «{ssid}» не подключиться: {err}")),
+                });
+            }
+            Deed::WifiForget(ssid) => {
+                crate::wifi::forget(&ssid);
+                self.report = Some(Report::ok(format!("сеть «{ssid}» забыта")));
             }
             Deed::WifiPick(ssid) => {
                 // Та же сеть — свернуть; другая — открыть её поле пароля.

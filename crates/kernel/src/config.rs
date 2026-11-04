@@ -105,6 +105,15 @@ pub fn path(name: &str, source: Source) -> alloc::string::String {
 /// но существующим, и худшее, что из этого выходит, — пустая настройка, то есть
 /// возврат к эталону.
 pub fn write(name: &str, contents: &str) -> Result<(), crate::vfs::VfsError> {
+    write_mode(name, contents, 0o644)
+}
+
+/// То же для секретов (пароли Wi-Fi): `0600`, читает только root.
+pub fn write_private(name: &str, contents: &str) -> Result<(), crate::vfs::VfsError> {
+    write_mode(name, contents, 0o600)
+}
+
+fn write_mode(name: &str, contents: &str, mode: u16) -> Result<(), crate::vfs::VfsError> {
     use crate::vfs::perm::{Access, Credentials};
     use crate::vfs::VfsError;
 
@@ -118,7 +127,7 @@ pub fn write(name: &str, contents: &str) -> Result<(), crate::vfs::VfsError> {
             // `0644`: настройки читает всякий, меняет владелец. Те же права,
             // что ставит установщик, и не случайно — файл, появившийся из окна,
             // не должен отличаться от файла, приехавшего с носителем.
-            match fs::create_as(Credentials::ROOT, &full, 0o644) {
+            match fs::create_as(Credentials::ROOT, &full, mode) {
                 Some(result) => result?,
                 None => return Err(VfsError::NotFound),
             }
@@ -126,6 +135,11 @@ pub fn write(name: &str, contents: &str) -> Result<(), crate::vfs::VfsError> {
         Some(Err(err)) => return Err(err),
         None => return Err(VfsError::NotFound),
     };
+    // Права — и у файла, что уже был (секрет мог лечь когда-то с `0644`).
+    // Файловая система без `chmod` (RAM-диск) — не повод не записать.
+    if mode != 0o644 {
+        let _ = node.chmod(mode);
+    }
     node.write_at(0, contents.as_bytes())?;
     // Сброс сразу, а не когда-нибудь: настройка, которую человек только что
     // задал, обязана пережить выключение кнопкой, а не только команду

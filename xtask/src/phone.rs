@@ -151,38 +151,19 @@ impl Default for Options {
     }
 }
 
-/// Завернуть данные в gzip, ничего не сжимая.
+/// Сжать ядро в gzip.
 ///
-/// Формат deflate разрешает блоки «как есть»: байт признаков, длина, её
-/// дополнение, дальше сами данные. Распаковщик обязан их понимать — это часть
-/// формата, а не расширение, — и потому такой поток разбирает любой gzip.
-///
-/// Сжатия здесь нет намеренно. Нам нужна **оболочка**, потому что загрузчик
-/// умеет читать только её; экономить же на образе в сотню килобайт нечего, а
-/// настоящий упаковщик — это либо чужой крейт в дереве, либо своя реализация
-/// Хаффмана, и то и другое ради нуля пользы.
+/// До 04.11 здесь была только **оболочка** gzip с блоками «как есть»: казалось,
+/// экономить нечего. Но ядро — 9 МиБ из 25 допустимых, и без сжатия на
+/// телефон не помещался браузер. Загрузчик распаковывает заводское ядро —
+/// значит, и настоящий deflate (`flate2`, он уже есть у xtask). Заголовок —
+/// тот же, что был: метка, deflate, без флагов, время ноль, `02 03`.
 fn gzip(payload: &[u8]) -> Vec<u8> {
-    // Метка, метод (deflate), без флагов, время ноль. Два последних байта —
-    // те же, что в заводском образе: признаки упаковщика и код системы.
+    use std::io::Write as _;
     let mut out = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x02, 0x03];
-
-    // Длина блока хранится в двух байтах, поэтому по 64 КиБ без одного.
-    const BLOCK: usize = 65535;
-    let mut rest = payload;
-    loop {
-        let take = rest.len().min(BLOCK);
-        let (block, tail) = rest.split_at(take);
-        let last = tail.is_empty();
-        out.push(if last { 1 } else { 0 }); // BFINAL, тип 00 — «как есть»
-        out.extend_from_slice(&(take as u16).to_le_bytes());
-        out.extend_from_slice(&(!(take as u16)).to_le_bytes());
-        out.extend_from_slice(block);
-        if last {
-            break;
-        }
-        rest = tail;
-    }
-
+    let mut deflate = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+    deflate.write_all(payload).expect("deflate into memory does not fail");
+    out.extend_from_slice(&deflate.finish().expect("deflate into memory does not fail"));
     out.extend_from_slice(&crc32(payload).to_le_bytes());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out
@@ -315,6 +296,23 @@ pub fn build(options: &Options) -> Result<PathBuf> {
                         extra.push((format!("lib/firmware/connsys/{name}"), std::fs::read(entry.path())?));
                     }
                 }
+            }
+            // NetSurf (04.11) — из sysroot сборки, как ставит его пакет: в
+            // RAM-диск ПК он не входит (`GAMES` — только носитель установки), а
+            // носителя у телефона нет.
+            let sysroot = crate::cbuild::sysroot(crate::arch::Arch::Aarch64);
+            let browser = sysroot.join("bin/netsurf");
+            if browser.is_file() {
+                extra.push((String::from("opt/netsurf/bin/netsurf"), std::fs::read(&browser)?));
+                if let Ok(dir) = std::fs::read_dir(sysroot.join("share/netsurf")) {
+                    for entry in dir.flatten() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        extra.push((format!("opt/netsurf/share/netsurf/{name}"), std::fs::read(entry.path())?));
+                    }
+                }
+                say!("браузер NetSurf: /opt/netsurf/bin/netsurf");
+            } else {
+                say!("NetSurf не собран ({}) — браузера на телефоне не будет: cargo xtask thirdparty netsurf", browser.display());
             }
             if extra.is_empty() {
                 say!("прошивок блока связи нет в firmware/connsys/ — Wi-Fi на аппарате не загрузится");
@@ -975,9 +973,11 @@ mod tests {
             payload.len() as u32
         );
 
-        // Блоков должно получиться больше одного, иначе проверка не трогает
-        // самое хрупкое место — переход между ними.
-        assert!(payload.len() > 65535, "данные обязаны не влезать в один блок");
+        // Повторяющиеся данные сжимаются, а распаковщик возвращает их как были.
+        assert!(packed.len() < payload.len() / 4, "сжатие обязано сжимать");
+        let mut unpacked = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&packed[..]), &mut unpacked).unwrap();
+        assert_eq!(unpacked, payload);
 
         // И сама сумма — на опубликованном значении, а не на самой себе.
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);

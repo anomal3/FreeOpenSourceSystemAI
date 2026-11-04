@@ -1847,9 +1847,10 @@ pub const ALL: &[Scenario] = &[
             Step::Aim(Aim::Point(360, 300)),
             Step::Click,
             Step::Await("desktop     : power sheet closed", 15_000),
-            // Витрина образцов .NET — девятая плитка, первая в третьем ряду.
+            // Витрина образцов .NET — десятая плитка (с 04.11 вторым идёт
+            // «Браузер»), вторая в третьем ряду.
             Step::Wait(800),
-            Step::Aim(Aim::Point(111, 941)),
+            Step::Aim(Aim::Point(277, 941)),
             Step::Click,
             Step::Await("desktop     : started '/bin/dotnet /usr/share/dotnet/samples/gallery.dll'", 15_000),
             Step::Wait(30_000),

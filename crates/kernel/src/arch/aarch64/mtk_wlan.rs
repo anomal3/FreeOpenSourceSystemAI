@@ -554,6 +554,7 @@ static ACTIVATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 
 /// Поиск сетей: до двух проходов, если первый не дошёл до конца.
 pub fn scan() -> Result<Vec<String>, &'static str> {
+    let _busy = Busy::take();
     // Пустая команда и сеть AIS (клиент) на BSS 0 — один раз.
     activate()?;
     let mut found: Vec<Network> = Vec::new();
@@ -978,6 +979,8 @@ fn station_wpa(ap: &[u8]) -> Result<(Vec<u8>, GroupCipher), &'static str> {
 /// У сети бывает несколько точек (MARK69 — две на одном канале): отказала
 /// одна — пробуем следующую.
 pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> {
+    let _busy = Busy::take();
+    *CONNECTED.lock() = None;
     let mut candidates: Vec<Network> = networks().into_iter().filter(|net| net.ssid == ssid).collect();
     // Сначала точки с RSN (WPA2), потом со старым WPA.
     candidates.sort_by_key(|net| net.rsn.is_empty());
@@ -990,7 +993,10 @@ pub fn connect(ssid: &str, password: &str) -> Result<Vec<String>, &'static str> 
         // (04.11, после первого же отказа точки).
         let _ = wifi_command(0x1c, true, &privilege(net.channel, true));
         match result {
-            Ok(report) => return Ok(report),
+            Ok(report) => {
+                attach();
+                return Ok(report);
+            }
             Err(err) => {
                 crate::kprintln!("  wlan        : {err}");
                 last = err;
@@ -1106,6 +1112,13 @@ fn connect_bss(net: &Network, password: &str) -> Result<Vec<String>, &'static st
         report.extend(handshake(ssid, password, &bssid, &rsn_ie, group, wpa1)?);
     }
     *CONNECTED.lock() = Some((String::from(ssid), bssid));
+    let security = match (secure, wpa1) {
+        (false, _) => "открытая",
+        (true, true) => "WPA (AES)",
+        (true, false) if group.algorithm == 2 => "WPA2 (AES), группа TKIP",
+        (true, false) => "WPA2-Personal (AES)",
+    };
+    *LINK.lock() = Some((channel, security, bssid));
     crate::kprintln!("  wlan        : connected to '{ssid}'");
     note(&mut report, alloc::format!("connected to {ssid}"));
     Ok(report)
@@ -1222,4 +1235,201 @@ pub fn bring_up() -> Result<Vec<String>, &'static str> {
     report.extend(firmware()?);
     READY.store(true, Ordering::Relaxed);
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Карта для сетевого стека (04.11)
+// ---------------------------------------------------------------------------
+//
+// После подключения Wi-Fi становится обычной картой `net::Card`: кадры
+// Ethernet уходят тем же путём, что EAPOL (TXD «Ethernet II», кольцо команд
+// — прошивка сама строит 802.11 и шифрует ключом из `ADD_KEY`), а приходят
+// в кольцо данных — то ли уже кадром Ethernet (перевод заголовка в блоке),
+// то ли кадром 802.11 с LLC; [`ethernet_in`] понимает оба. Первые пакеты —
+// в журнал: раскладку RXD прошивки на аппарате видно только так.
+
+/// Радио занято поиском или подключением: карта кольца не трогает, иначе
+/// забирала бы у них ответы точки.
+static RADIO_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Сколько пакетов данных уже показано в журнале.
+static DUMPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Занять радио на время поиска или подключения.
+struct Busy;
+
+impl Busy {
+    fn take() -> Self {
+        RADIO_BUSY.store(true, Ordering::Relaxed);
+        Busy
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        RADIO_BUSY.store(false, Ordering::Relaxed);
+    }
+}
+
+fn is_ours(da: &[u8]) -> bool {
+    da == OWN_MAC || da[0] & 1 != 0
+}
+
+/// Кадр Ethernet из принятого пакета: уже Ethernet (после RXD) или 802.11
+/// с LLC/SNAP — тогда заголовок собирается заново.
+fn ethernet_in(packet: &[u8]) -> Option<Vec<u8>> {
+    let kind = u16::from_le_bytes([*packet.get(2)?, *packet.get(3)?]);
+    let groups = (kind >> 9) & 0xf;
+    let mut off = 16usize;
+    for (bit, len) in [(3u16, 16usize), (0, 16), (1, 8), (2, 24)] {
+        if groups & (1 << bit) != 0 {
+            off += len;
+        }
+    }
+    let byte_count = usize::from(u16::from_le_bytes([packet[0], packet[1]])).min(packet.len());
+    let packet = &packet[..byte_count.max(off)];
+    for at in [off, off + 2] {
+        let Some(f) = packet.get(at..) else { continue };
+        if f.len() < 24 {
+            continue;
+        }
+        // 802.11, тип «данные», от точки (FromDS).
+        if f[0] & 0x0c == 0x08 && f[1] & 0x03 == 0x02 && is_ours(&f[4..10]) {
+            let mut hdr = 24 + if f[0] & 0x80 != 0 { 2 } else { 0 };
+            if f[1] & 0x40 != 0 {
+                hdr += 8; // заголовок CCMP, если блок его оставил
+            }
+            let llc = f.get(hdr..hdr + 8)?;
+            if llc[..6] != [0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00] {
+                return None;
+            }
+            let mut out = Vec::with_capacity(f.len() - hdr + 6);
+            out.extend_from_slice(&f[4..10]); // DA
+            out.extend_from_slice(&f[16..22]); // SA
+            out.extend_from_slice(&f[hdr + 6..]);
+            return Some(out);
+        }
+        // Уже Ethernet: свой адрес и известный тип.
+        let ethertype = u16::from_be_bytes([f[12], f[13]]);
+        if is_ours(&f[0..6]) && matches!(ethertype, 0x0800 | 0x0806 | 0x86dd | 0x888e) {
+            return Some(f.to_vec());
+        }
+    }
+    None
+}
+
+fn dump(packet: &[u8], why: &str) {
+    if DUMPED.fetch_add(1, Ordering::Relaxed) >= 6 {
+        return;
+    }
+    crate::kprintln!("  wlan        : rx {why}, {} B", packet.len());
+    for row in packet[..packet.len().min(80)].chunks(16) {
+        let mut hex = String::new();
+        for byte in row {
+            hex.push_str(&alloc::format!("{byte:02x}"));
+        }
+        crate::kprintln!("  wlan        :   {hex}");
+    }
+}
+
+/// Wi-Fi как сетевая карта.
+pub struct Card {
+    stats: crate::net::card::Stats,
+}
+
+impl crate::net::card::Card for Card {
+    fn name(&self) -> &'static str {
+        "wifi"
+    }
+
+    fn mac(&self) -> [u8; 6] {
+        OWN_MAC
+    }
+
+    fn send(&mut self, frame: &[u8]) -> Result<(), crate::net::card::CardError> {
+        use crate::net::card::CardError;
+        if CONNECTED.lock().is_none() || !is_ready() {
+            self.stats.tx_dropped += 1;
+            return Err(CardError::Stopped);
+        }
+        if frame.len() > crate::net::card::FRAME_MAX {
+            return Err(CardError::TooLong(frame.len()));
+        }
+        match send_frame(eapol_txd(frame.len()), frame) {
+            Ok(()) => {
+                self.stats.tx_frames += 1;
+                self.stats.tx_bytes += frame.len() as u64;
+                Ok(())
+            }
+            Err(_) => {
+                self.stats.tx_dropped += 1;
+                Err(CardError::Busy)
+            }
+        }
+    }
+
+    fn receive(&mut self, frame: &mut [u8; crate::net::card::FRAME_MAX]) -> Option<usize> {
+        if RADIO_BUSY.load(Ordering::Relaxed) || !is_ready() {
+            return None;
+        }
+        for ring in [RX_DATA, RX_EVENT] {
+            // Кольцо событий — только пока есть что брать: события после
+            // подключения стеку не нужны, но и копиться им незачем.
+            while let Ok(Some(packet)) = receive(ring, 0) {
+                match ethernet_in(&packet) {
+                    Some(ethernet) if ethernet.len() <= frame.len() && ethernet.len() >= 14 => {
+                        if DUMPED.load(Ordering::Relaxed) < 2 {
+                            dump(&packet, "data");
+                        }
+                        frame[..ethernet.len()].copy_from_slice(&ethernet);
+                        self.stats.rx_frames += 1;
+                        self.stats.rx_bytes += ethernet.len() as u64;
+                        return Some(ethernet.len());
+                    }
+                    Some(_) => self.stats.rx_dropped += 1,
+                    None => {
+                        if ring == RX_DATA {
+                            self.stats.rx_dropped += 1;
+                            dump(&packet, "not understood");
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn stats(&self) -> crate::net::card::Stats {
+        self.stats
+    }
+}
+
+/// Канал, защита и точка нынешнего подключения.
+static LINK: SpinLock<Option<(u8, &'static str, [u8; 6])>> = SpinLock::new(None);
+
+/// Сведения о подключении.
+#[must_use]
+pub fn link() -> Option<(u8, &'static str, [u8; 6])> {
+    if CONNECTED.lock().is_none() {
+        return None;
+    }
+    *LINK.lock()
+}
+
+/// Разорвать подключение: точке — «деаутентификация», карта перестаёт слать.
+pub fn disconnect() {
+    let Some((_, bssid)) = CONNECTED.lock().take() else { return };
+    let mut deauth = mgmt_header(0xc0, &bssid);
+    deauth.extend_from_slice(&3u16.to_le_bytes()); // «станция уходит»
+    let _ = send_frame(mgmt_txd(deauth.len(), 0x0c), &deauth);
+    *LINK.lock() = None;
+    crate::kprintln!("  wlan        : disconnected");
+}
+
+/// Отдать Wi-Fi сетевому стеку (после подключения).
+pub fn attach() {
+    static ATTACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if ATTACHED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    crate::net::attach_wifi(alloc::boxed::Box::new(Card { stats: crate::net::card::Stats::default() }));
 }

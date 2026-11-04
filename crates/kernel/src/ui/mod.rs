@@ -461,6 +461,42 @@ static ICON_GESTURE: SpinLock<Option<IconGesture>> = SpinLock::new(None);
 /// С какого сдвига нажатие на значок становится переносом, а не щелчком.
 const CARRY_THRESHOLD: i32 = 4;
 
+/// Палец на значке телефона (04.11, как у Android): отпустили быстро —
+/// открыть; держат [`ICON_HOLD_MS`] не сдвигая — значок поднят (вибро) и
+/// идёт за пальцем; сдвинули раньше — это смахивание, значок не трогаем.
+#[derive(Clone, Copy)]
+struct IconHold {
+    index: usize,
+    x0: i32,
+    y0: i32,
+    at: u64,
+    lifted: bool,
+}
+
+static ICON_HOLD: SpinLock<Option<IconHold>> = SpinLock::new(None);
+const ICON_HOLD_MS: u64 = 450;
+/// Насколько палец может дрогнуть, пока ждут долгое нажатие.
+const ICON_HOLD_SLOP: i32 = 14;
+
+/// Ждут ли долгое нажатие — стол тогда будит себя кадрами.
+pub fn icon_holding() -> bool {
+    ICON_HOLD.lock().is_some_and(|hold| !hold.lifted)
+}
+
+/// Шаг кадра: палец продержали достаточно — поднять значок.
+pub fn check_icon_hold(desktop: &mut Compositor) {
+    let mut hold = ICON_HOLD.lock();
+    let Some(state) = hold.as_mut() else { return };
+    if state.lifted || crate::time::uptime_ms().saturating_sub(state.at) < ICON_HOLD_MS {
+        return;
+    }
+    state.lifted = true;
+    drop(hold);
+    crate::arch::vibrate(30);
+    desktop.lift_icons(0, 0);
+    kprintln!("  desktop     : icon lifted by a long press");
+}
+
 /// Последний щелчок был по столу (значку или пустому месту), а не по окну:
 /// F2 тогда переименовывает значок.
 static DESK_FOCUS: AtomicBool = AtomicBool::new(false);
@@ -1638,7 +1674,8 @@ pub fn tick() {
         watch_hung(desktop);
         // Wi-Fi включается отдельной задачей: сменилось состояние —
         // перерисовать шторку и «Параметры», которые о нём говорят.
-        let wifi = crate::wifi::generation();
+        // Адрес от DHCP — тоже повод: «Параметры» показывают IP подключения.
+        let wifi = crate::wifi::generation() ^ (u32::from(crate::net::has_address()) << 31);
         if WIFI_SHOWN.swap(wifi, Ordering::Relaxed) != wifi {
             desktop.refresh_shade();
             if let Some(window) = desktop.find(App::Settings) {
@@ -2125,6 +2162,16 @@ fn wheel(desktop: &mut Compositor, x: i32, y: i32, clicks: i32) {
 
 /// Левую кнопку, нажатую на столе, ведут: несут значки или тянут рамку.
 fn icon_gesture_to(desktop: &mut Compositor, x: i32, y: i32) {
+    let hold = *ICON_HOLD.lock();
+    if let Some(state) = hold {
+        if state.lifted {
+            desktop.lift_icons(x - state.x0, y - state.y0);
+        } else if (x - state.x0).abs() + (y - state.y0).abs() > ICON_HOLD_SLOP {
+            // Палец поехал раньше срока — смахивание, а не нажатие.
+            *ICON_HOLD.lock() = None;
+        }
+        return;
+    }
     let mut gesture = ICON_GESTURE.lock();
     match gesture.as_mut() {
         Some(IconGesture::Carry { x0, y0, moved }) => {
@@ -2155,6 +2202,14 @@ fn icon_gesture_to(desktop: &mut Compositor, x: i32, y: i32) {
 
 /// Левую кнопку отпустили: положить значки по сетке или убрать рамку.
 fn icon_gesture_end(desktop: &mut Compositor) {
+    if let Some(state) = ICON_HOLD.lock().take() {
+        if state.lifted {
+            desktop.drop_icons();
+        } else {
+            open_icon(desktop, state.index);
+        }
+        return;
+    }
     let Some(gesture) = ICON_GESTURE.lock().take() else {
         return;
     };
@@ -2990,7 +3045,12 @@ fn press(desktop: &mut Compositor, x: i32, y: i32, status: &Status, at_ms: u64) 
         if same && now.saturating_sub(last) > DOUBLE_CLICK_MS && now.saturating_sub(last) < 3_000 {
             kprintln!("  desktop     : second click on the icon after {} ms, not a double click", now.saturating_sub(last));
         }
-        if theme::is_mobile() || (same && now.saturating_sub(last) <= DOUBLE_CLICK_MS) {
+        if theme::is_mobile() {
+            // Открывает отпускание, а держание поднимает (см. [`IconHold`]).
+            *ICON_HOLD.lock() = Some(IconHold { index, x0: x, y0: y, at: now, lifted: false });
+            return;
+        }
+        if same && now.saturating_sub(last) <= DOUBLE_CLICK_MS {
             open_icon(desktop, index);
             desktop.refresh_panel(status);
         }
